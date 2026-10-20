@@ -491,7 +491,9 @@ def sc_escapee(model, n, req):
 
 GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody",
                "Steer me", "Cancel me", "Close me", "Stream fast", "Stream at 100",
-               "Say hello")
+               "Say hello", "Stall for", "Fail once")
+
+GUI_FAILED = set()  # (model, messages so far): turns that failed once
 
 GUI_LONG = """Done: **hello.txt** now greets *there*, and the command ran.
 
@@ -597,13 +599,29 @@ def sc_gui(model, n, req):
             yield S.data(chunk(model, {"content": f"w{i} "}))
         yield from finish(model)
     elif "Stream at 100" in prompt:
+        # Paragraphs of 40 tokens, as a model writes, for 40 s
         yield S.head()
         for i in range(4000):
-            yield from text(model, f"t{i} ")
+            yield from text(model, f"t{i}" + ("\n\n" if i % 40 == 39 else " "))
             yield S.sleep(0.01)
         yield from finish(model)
     elif "Say hello" in prompt:
         yield from answer(model, "Hello!")
+    elif "Stall for" in prompt:
+        # Nothing at all for 17 s: past the GUI's amber, short of the
+        # first-byte watchdog its configuration sets
+        yield S.sleep(17)
+        yield from answer(model, "Back after a long silence.")
+    elif "Fail once" in prompt:
+        key = (model, len(req.get("messages", [])))
+        with STATE.lock:
+            first = key not in GUI_FAILED
+            GUI_FAILED.add(key)
+        if first:
+            yield S.error(503, {"error": {"message": "busy, try again"}},
+                          {"Retry-After": "2"})
+        else:
+            yield from answer(model, "Worked on the second try.")
     else:
         yield from answer(model, "I do not know that prompt.")
 

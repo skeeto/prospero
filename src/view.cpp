@@ -935,6 +935,13 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
     } return 1;
 
     case EV_LIVE: {
+        // Sent every second while a request runs: only a change worth
+        // showing asks for frames, since the clocks have deadlines
+        i32  state    = v->state;
+        f64  tps      = v->tps;
+        i64  retryat  = v->retryat;
+        i64  lastdata = v->lastdata;
+        i64  watchat  = v->watchat;
         v->state = livestate(jsonstr(jsonget(j, "state")));
         Json *idle = jsonget(j, "idle_ms");
         if (idle->type == JSON_NUMBER) {
@@ -945,7 +952,12 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         Json *wd   = jsonget(j, "watchdog_ms");
         v->watchat = wd->type==JSON_NUMBER ? r->ts + jsonint(wd, 0) : 0;
         v->watchms = jsonint(jsonget(j, "watchdog_of"), 0);
-    } return 1;
+        i64 moved  = v->lastdata - lastdata;
+        i64 moved2 = v->watchat - watchat;
+        return state!=v->state || (i64)(tps*10)!=(i64)(v->tps*10) ||
+               retryat!=v->retryat || moved<-50 || moved>50 ||
+               moved2<-50 || moved2>50;
+    }
 
     case EV_PROGRESS:
         v->lastdata = r->ts;

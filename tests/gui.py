@@ -24,6 +24,7 @@ Windows console session): it prints the directories and waits.
 
 import argparse
 import difflib
+import json
 import os
 import random
 import shutil
@@ -60,13 +61,15 @@ def config(url, model):
         "# The GUI checklist's configuration\n"
         f"endpoint = fake\n"
         f"model = {model}\n"
+        "colour = blue  # unknown: the settings window lists the warning\n"
         "\n"
-        "# The fake provider\n"
+        "# The fake provider: a first byte may take longer than the GUI's\n"
+        "# 15 s amber\n"
         "[endpoint fake]\n"
         f"url = {url}/\n"
-        "first_byte_timeout = 10\n"
+        "first_byte_timeout = 25\n"
         "idle_timeout = 10\n"
-        "progress_timeout = 20\n"
+        "progress_timeout = 30\n"
         "connect_timeout = 2\n"
         "\n"
         "# Asks wait briefly\n"
@@ -122,10 +125,12 @@ def guipid(harness, state):
     return None
 
 
-def cputime(pid):
-    """Seconds of CPU the process has used, or None."""
+def cputime(pid, tid=None):
+    """Seconds of CPU the process (or on Linux one of its threads) has
+    used, or None."""
     try:
-        with open(f"/proc/{pid}/stat") as f:
+        path = f"/proc/{pid}/task/{tid}/stat" if tid else f"/proc/{pid}/stat"
+        with open(path) as f:
             fields = f.read().rsplit(")", 1)[1].split()
         return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
     except OSError:
@@ -138,6 +143,26 @@ def cputime(pid):
             secs = secs * 60 + float(part)
         return secs
     except (OSError, ValueError):
+        return None
+
+
+def mainthread(pid):
+    """Seconds of CPU the main (GUI) thread has used, or None: Linux
+    from /proc, macOS from ps -M, whose first thread is the main one."""
+    if sys.platform.startswith("linux"):
+        return cputime(pid, pid)
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(["ps", "-M", "-p", str(pid)], capture_output=True,
+                             text=True).stdout.splitlines()
+        f = out[1].split()
+        secs = 0.0
+        for t in (f[6], f[7]):  # STIME, UTIME as m:ss.cc
+            m, s = t.split(":")
+            secs += int(m) * 60 + float(s)
+        return secs
+    except (OSError, IndexError, ValueError):
         return None
 
 
@@ -163,6 +188,7 @@ class Meter:
         self.what = what
         self.t0 = time.monotonic()
         self.cpu0 = cputime(pid)
+        self.gui0 = mainthread(pid)
         self.sw0 = switches(pid)
         self.top = None
         if sys.platform == "darwin" and what == "idle":
@@ -178,6 +204,9 @@ class Meter:
         cpu1 = cputime(self.pid)
         if self.cpu0 is not None and cpu1 is not None:
             out.append(f"CPU {100 * (cpu1 - self.cpu0) / dt:.1f}% of a core")
+        gui1 = mainthread(self.pid) if self.gui0 is not None else None
+        if gui1 is not None:
+            out.append(f"GUI thread {100 * (gui1 - self.gui0) / dt:.1f}%")
         sw1 = switches(self.pid)
         if self.sw0 is not None and sw1 is not None:
             out.append(f"{sw1 - self.sw0} voluntary context switches")
@@ -257,6 +286,15 @@ class Local:
             return None, lines
         return p.returncode, lines
 
+    def popen(self, args, stdin=False):
+        return subprocess.Popen(
+            [self.harness] + args, cwd=self.path("work"),
+            stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+    def sessions(self, ini, state, work):
+        return makesessions(self, ini, state, work)
+
     def strays(self):
         left = strays(self.root)
         for line in left:
@@ -319,12 +357,23 @@ class Remote:
         deadline = time.monotonic() + timeout
         status = None
         lines = []
+        mark = None  # (pid, seconds of CPU, when) at a measurement's start
         while time.monotonic() < deadline:
-            time.sleep(3)
+            time.sleep(1 if self.args.mode in ("idle", "streamtest") else 3)
             text = self.h.read(self.path("run.log")) or ""
             lines = text.splitlines(keepends=True)
             for line in lines[seen:]:
                 sys.stdout.write(line)
+                if "drive: mark: " in line:
+                    pid = self.guipid()
+                    mark = (pid, self.cputime(pid), time.monotonic()) if pid else None
+                elif line.startswith("harness: rates: ") and mark:
+                    cpu1 = self.cputime(mark[0])
+                    if mark[1] is not None and cpu1 is not None:
+                        dt = time.monotonic() - mark[2]
+                        print(f"measured: CPU {100 * (cpu1 - mark[1]) / dt:.1f}% of a "
+                              f"core over {dt:.0f} s (polled: approximate)")
+                    mark = None
             sys.stdout.flush()
             seen = len(lines)
             done = [l for l in lines if l.startswith("done ")]
@@ -332,6 +381,33 @@ class Remote:
                 status = int(done[-1].split()[1])
                 break
         return status, [l for l in lines if not l.startswith("done ")]
+
+    def popen(self, args, stdin=False):
+        return self.h.popen(args, self.path("work"), stdin=stdin)
+
+    def sessions(self, ini, state, work):
+        return makesessions(self, ini, state, work)
+
+    def guipid(self):
+        ps = ("Get-CimInstance Win32_Process -Filter \\\"Name='harness.exe'\\\" | Where-Object "
+              f"{{ $_.CommandLine -like '*{win_root(self.root)}*' -and $_.CommandLine -like '* gui *' }} | "
+              "ForEach-Object { $_.ProcessId }")
+        r = self.h.ssh(f'powershell -NoProfile -Command "{ps}"')
+        pids = [int(x) for x in r.stdout.split() if x.isdigit()]
+        if not pids:
+            print(f"(no GUI process found: {r.stdout.strip()} {r.stderr.strip()})")
+        return pids[0] if pids else None
+
+    def cputime(self, pid):
+        # Through CIM, which reaches into the console session
+        ps = (f"Get-CimInstance Win32_Process -Filter \\\"ProcessId={pid}\\\" | "
+              "ForEach-Object { $_.KernelModeTime + $_.UserModeTime }")
+        r = self.h.ssh(f'powershell -NoProfile -Command "{ps}"')
+        try:
+            return int(r.stdout.strip()) / 1e7
+        except ValueError:
+            print(f"(no CPU time for {pid}: {r.stdout.strip()} {r.stderr.strip()})")
+            return None
 
     def strays(self):
         ps = ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "
@@ -348,6 +424,21 @@ class Remote:
             print(f"kept {self.args.host}:{self.root}")
         else:
             self.h.close()
+
+
+def makesessions(host, ini, state, work):
+    """Two sessions for the GUI to find: "Say hello." run and closed, and
+    "Hold me" held open by a headless engine, which is returned."""
+    p = host.popen(["run", "-C", work, "-c", ini, "--state", state, "Say hello."])
+    p.communicate(timeout=60)
+    holder = host.popen(["--headless", "--state", state, "-c", ini], stdin=True)
+    cmd = {"cmd": "new", "id": 1, "cwd": work, "prompt": "Hold me: say hello."}
+    holder.stdin.write(json.dumps(cmd) + "\n")
+    holder.stdin.flush()
+    for line in holder.stdout:
+        if '"ev":"turn.end"' in line:
+            break
+    return holder
 
 
 def win_root(path):
@@ -389,6 +480,10 @@ def main():
     else:
         before = config(host.url if args.host else url, model)
     host.write(ini, before)
+
+    holder = None
+    if args.mode == "drive":
+        holder = host.sessions(ini, state, work)
 
     guiargs = [f"--{args.mode}", "-c", ini, "--statedir", state, "--cwd", work,
                "--inbox-cap", str(args.inbox_cap)]
@@ -440,6 +535,13 @@ def main():
                 problems.append(f"the {name} command (pid {pid}) is still running")
             else:
                 print(f"{name}: pid {pid} gone")
+    if holder:
+        # Its input ends, so it stops
+        holder.stdin.close()
+        try:
+            holder.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            holder.kill()
     left = host.strays()
     if left:
         problems.append("processes left: " + "; ".join(left))

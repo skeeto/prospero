@@ -703,6 +703,7 @@ static void drawtranscript(Gui *g)
     ImGuiStyle &st = ImGui::GetStyle();
 
     if (gs->readonly) {
+        g->bannershown = 1;
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_AMBER));
         ImGui::TextWrapped("Read-only: another harness process has this "
                            "session open. Its changes show after it lets go "
@@ -778,7 +779,7 @@ static void drawtranscript(Gui *g)
 
     f64 want = scrolly;
     if (bottom) {
-        want = total - winh;
+        want = total + pad - winh;  // the scroll range's end, so it sticks
     } else if (anchor >= 0) {
         want = v->msgs[anchor].top + anchordy;
     }
@@ -786,7 +787,7 @@ static void drawtranscript(Gui *g)
         want = g->scrollto;  // a benchmark or a drag past the edge
         g->scrollto = -1;
     }
-    want = want>total-winh ? total-winh : want;
+    want = want>total+pad-winh ? total+pad-winh : want;
     want = want<0 ? 0 : want;
 
     ImGui::SetNextWindowContentSize(v2(0, (f32)total + pad));
@@ -1054,6 +1055,7 @@ static void drawstrip(Gui *g)
         i64 idle = nowms - v->lastdata;
         b32 red  = v->watchat && v->watchms && nowms >= v->watchat - v->watchms/4;
         if (idle >= AMBER_MS || red) {
+            g->ambershown = 1;
             schedat(&g->sched, now + (1000 - idle%1000)*1000 + 1000, DUE_CLOCK);
             Buf b(&a, 64);
             print(&b, "no data for ");
@@ -1077,6 +1079,7 @@ static void drawstrip(Gui *g)
         }
     }
     if (v->state==LIVE_BACKOFF && v->retryat) {
+        g->retryshown = 1;
         i64 secs = countdown(g, v->retryat, nowms);
         Buf b(&a, 48);
         print(&b, "retrying in ");
@@ -1196,6 +1199,9 @@ static void drawsessions(Gui *g)
         if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc))) {
             guiselect(g, s);
         }
+        ImVec2 r0 = ImGui::GetItemRectMin();
+        ImVec2 r1 = ImGui::GetItemRectMax();
+        s->row = {r0.x, r0.y, r1.x, r1.y};
         if (!other && s!=g->sess) {
             itemrect(g, RECT_OTHERSESS);
             other = 1;

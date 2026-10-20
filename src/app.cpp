@@ -218,6 +218,7 @@ struct GuiSession {
     Str          sid;
     View        *view;      // null until opened or created here
     ImGuiWindow *win;       // its transcript's child window, last frame
+    Rect         row;       // where the sidebar drew it last
     b32          stick;     // the transcript follows its bottom
     b32          readonly;  // another process holds it: replayed only
     b32          listed;    // in the latest sessions list
@@ -403,6 +404,10 @@ struct Gui {
     // Scripted checklist (--drive)
     Str                drivecwd;     // --cwd: where its sessions work
     b32                tracedrive;   // --trace-drive: log where presses land
+    GuiSession        *drivemain;    // the session it made
+    b32                ambershown;   // the strip went amber
+    b32                retryshown;   // the strip counted down to a retry
+    b32                bannershown;  // the read-only banner was drawn
     i32                drivewait;    // W_* condition it waits for
     i64                holduntil;    // µs: the inbox is left alone until
     b32                held;         // a wake came during the hold
@@ -1002,13 +1007,14 @@ static b32 guirecord(Gui *g, Str line)
 }
 
 // Records shown on content frames only: model output and tool output,
-// for the session shown.
+// and the liveness that comes with them, for the session shown.
 static b32 heldback(Gui *g, Str line)
 {
     Str head = takehead(line, line.len<160 ? line.len : 160);
     b32 kind = find(head, "\"ev\":\"delta\"")>=0 ||
                find(head, "\"ev\":\"tool.out\"")>=0 ||
-               find(head, "\"ev\":\"progress\"")>=0;
+               find(head, "\"ev\":\"progress\"")>=0 ||
+               find(head, "\"ev\":\"live\"")>=0;
     return kind && g->sess && linesid(line)==g->sess->sid;
 }
 
@@ -2253,6 +2259,7 @@ enum : i32 {
     OP_SUMMARY,   // log the checks so far
     OP_SHOT,      // with --shots DIR: the next frame as DIR/text.png
     OP_SHOWUSER,  // scroll to the user's message that starts with text
+    OP_MAIN,      // show the session the checklist made again
 };
 
 enum : i32 {
@@ -2281,6 +2288,7 @@ enum : i32 {
     T_CLOSECANCEL,
     T_OTHERSESS,   // the first session in the sidebar not shown
     T_TOPTEXT,     // near the transcript's top edge
+    T_SESSTITLE,   // the sidebar's session whose title starts with text
 };
 
 enum : i32 {
@@ -2329,6 +2337,11 @@ enum : i32 {
     CHK_E2ESTEER,
     CHK_E2EALLOWED,
     CHK_E2ETIMEOUT,
+    CHK_REPLAYED,
+    CHK_READONLY,
+    CHK_AMBER,
+    CHK_RETRYSHOWN,
+    CHK_DIAGS,
     CHK_COUNT,
 };
 
@@ -2356,6 +2369,10 @@ static Str chknames[] = {
     "the steer reached the agent, and the turn finished",
     "allowed by the user: the file was written outside",
     "denied at the deadline, and the agent read why",
+    "a closed session opened, its log replayed",
+    "a session held elsewhere opened read-only, with its banner",
+    "amber after 15 s without data", "a retry's countdown shown",
+    "configuration diagnostics listed with file and line",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -2371,12 +2388,15 @@ enum : i32 {
     W_CONFIGSET,  // a config.set was answered since OP_SNAPCFG
     W_FOREVER,    // never: the time runs out (the app should have quit)
     W_ALLIDLE,    // no session runs a turn
+    W_OPENED,     // the session shown is open, its replay applied
+    W_AMBER,      // the strip went amber
+    W_BACKOFF,    // the session shown backs off to retry
 };
 
 static Str waitnames[] = {
     "", "the engine", "the session", "the turn to end", "an ask",
     "a running tool", "the configuration", "the settings edit", "quitting",
-    "every turn to end",
+    "every turn to end", "the session to open", "amber", "a retry",
 };
 
 enum : i32 {
@@ -2543,6 +2563,20 @@ static DriveOp m3ops[] = {
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     {OP_CHECK, CHK_SESSION, 0, 0, 0, ""},
+    // Sessions made elsewhere (tests/gui.py): one closed, opened with
+    // its log replayed, and one another process holds, opened read-only
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Say hello."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_REPLAYED, 0, 0, 0, ""},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Hold me"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_READONLY, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "0-readonly"},
+    {OP_MAIN, 0, 0, 0, 500, ""},
     // Dragging the dock splitter
     {OP_MOVE, T_SPLITTER, 0, 0, 300, ""},
     {OP_DOWN, 0, 0, 0, 50, ""},
@@ -2603,6 +2637,19 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_DIFF, 0, 0, 0, ""},
     {OP_CHECK, CHK_LIVETAIL, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "1-tools"},
+    // The liveness strip: amber after 15 s without data, and a retry's
+    // countdown, drawn on deadlines alone
+    {OP_PROMPT, 0, 0, 0, 100, "Stall for a while."},
+    {OP_MARK, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_AMBER, 0, 0, 30000, ""},
+    {OP_IDLE, 0, 0, 0, 0, "15 s of waiting for the model"},
+    {OP_CHECK, CHK_AMBER, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "1-amber"},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Fail once."},
+    {OP_WAIT, W_BACKOFF, 0, 0, 15000, ""},
+    {OP_CHECK, CHK_RETRYSHOWN, 0, 0, 0, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     // The mouse wheel, drag-selecting past the edge, and copying code,
     // over what that turn made: from near the top, after scrolling up
     // past the long answer, so that the selection spans messages
@@ -2690,6 +2737,7 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_DIAGS, 0, 0, 0, ""},
     {OP_MOVE, T_SETTING, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 200, ""},
@@ -2831,7 +2879,7 @@ static DriveOp e2eops[] = {
 static DriveOp idleops[] = {
     {OP_MARK, 0, 0, 0, 10000, ""},  // startup settles
     {OP_MARK, 0, 0, 0, 60000, "idle"},
-    {OP_RATES, 0, 0, 0, 0, "idle 60 s"},
+    {OP_RATES, 0, 0, 0, 3000, "idle 60 s"},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
@@ -2844,7 +2892,7 @@ static DriveOp m3idleops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 60000, "idle"},
-    {OP_RATES, 0, 0, 0, 0, "idle 60 s with an idle session"},
+    {OP_RATES, 0, 0, 0, 3000, "idle 60 s with an idle session"},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
@@ -2852,7 +2900,7 @@ static DriveOp m3idleops[] = {
 static DriveOp streamops[] = {
     {OP_STREAM, 0, 100, 0, 3000, ""},
     {OP_MARK, 0, 0, 0, 30000, "streaming"},
-    {OP_RATES, 0, 0, 0, 0, "streaming 100 tok/s, 30 s"},
+    {OP_RATES, 0, 0, 0, 3000, "streaming 100 tok/s, 30 s"},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
@@ -2862,7 +2910,7 @@ static DriveOp m3streamops[] = {
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_PROMPT, 0, 0, 0, 3000, "Stream at 100 tokens per second."},
     {OP_MARK, 0, 0, 0, 30000, "streaming"},
-    {OP_RATES, 0, 0, 0, 0, "streaming 100 tok/s from the engine, 30 s"},
+    {OP_RATES, 0, 0, 0, 3000, "streaming 100 tok/s from the engine, 30 s"},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
@@ -2913,6 +2961,14 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_CLOSESTOP:   return rectcenter(g->rects[RECT_CLOSESTOP]);
     case T_CLOSECANCEL: return rectcenter(g->rects[RECT_CLOSECANCEL]);
     case T_OTHERSESS:   return rectcenter(g->rects[RECT_OTHERSESS]);
+    case T_SESSTITLE:
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            Str t = s->view && s->view->title.len ? s->view->title : s->title;
+            if (startswith(t, g->ops[g->drivepc-1].text)) {
+                return rectcenter(s->row);
+            }
+        }
+        return v2(-1, -1);
     case T_TOPTEXT: {
         Rect r = g->rects[RECT_TRANSCRIPT];
         return v2((r.x0+r.x1)/2, r.y0 + 24*g->scale);
@@ -3039,6 +3095,12 @@ static b32 drivewaitdone(Gui *g)
         return g->cfgsets>0 && !g->cfgset && !g->cfgget;
     case W_ALLIDLE:
         return !running(g);
+    case W_OPENED:
+        return g->sess && g->sess->view && !g->sess->openid && v->lastseq;
+    case W_AMBER:
+        return g->ambershown;
+    case W_BACKOFF:
+        return g->sess && v->state==LIVE_BACKOFF;
     }
     return 0;
 }
@@ -3204,7 +3266,9 @@ static b32 drivecheck(Gui *g, i32 chk)
         #endif
     }
     case CHK_ENGINE:   return g->engineok && !g->engineerr.len;
-    case CHK_SESSION:  return g->sess && g->sess->view && g->sess->view->cwd.len;
+    case CHK_SESSION:
+        g->drivemain = g->sess;
+        return g->sess && g->sess->view && g->sess->view->cwd.len;
     case CHK_NEWLINE: {
         Str p = promptstr(g);
         return endswith(p, "command.\n") && !v->busy;
@@ -3268,6 +3332,30 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_STILLBUSY:
         return v->busy && !g->quitting;
+    case CHK_REPLAYED: {
+        b32 user = 0, said = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            user |= v->msgs[i].role==VIEW_USER && v->msgs[i].text=="Say hello.";
+            said |= v->msgs[i].role==VIEW_ASSISTANT && v->msgs[i].text=="Hello!";
+        }
+        return user && said && g->sess && !g->sess->readonly && !v->busy;
+    }
+    case CHK_READONLY: {
+        b32 user = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            user |= v->msgs[i].role==VIEW_USER && startswith(v->msgs[i].text, "Hold me");
+        }
+        return user && g->sess && g->sess->readonly && v->readonly && g->bannershown;
+    }
+    case CHK_AMBER:
+        return g->ambershown;
+    case CHK_RETRYSHOWN:
+        return g->retryshown;
+    case CHK_DIAGS: {
+        Json *d = jsonget(g->cfg, "diags")->child;
+        return d && jsonstr(jsonget(d, "file")).len && jsonint(jsonget(d, "line"), 0)>0 &&
+               find(jsonstr(jsonget(d, "message")), "colour")>=0;
+    }
     case CHK_E2ECODE: {
         Arena a  = g->frame;
         b32   ok = 0;
@@ -3541,7 +3629,8 @@ static void drivestep(Gui *g)
         if (op->text.len) {
             // For a measurement outside, by the operating system
             Arena a = g->frame;
-            guilog(g, concat(&a, "drive: mark: ", op->text));
+            // Not in the Log window, which would make frames to show it
+            os_print(g->os, 2, concat(&a, concat(&a, "harness: drive: mark: ", op->text), "\n"));
         }
         break;
     case OP_STREAM:
@@ -3630,6 +3719,11 @@ static void drivestep(Gui *g)
         break;
     case OP_SUMMARY:
         drivesummary(g);
+        break;
+    case OP_MAIN:
+        if (g->drivemain) {
+            guiselect(g, g->drivemain);
+        }
         break;
     case OP_SHOWUSER: {
         View *v = g->view;
