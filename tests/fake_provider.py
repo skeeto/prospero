@@ -455,7 +455,7 @@ def sc_escapee(model, n, req):
 # The soak: mostly normal steps with 10% random faults
 
 SOAK_FAULTS = ["stall_head", "stall_mid", "drop", "503", "429", "malformed",
-               "error_event", "ping_wait"]
+               "error_event", "ping_wait", "stall_text", "drop_call"]
 
 
 def sc_soak(model, n, req):
@@ -482,6 +482,18 @@ def sc_soak(model, n, req):
         elif fault == "error_event":
             yield S.head()
             yield S.data({"error": {"code": 500, "message": "boom"}})
+        elif fault == "stall_text":
+            # Visible text, then silence: continued, never retried
+            yield S.head()
+            yield from text(model, "Working on step", 2)
+            yield S.stall(8)
+        elif fault == "drop_call":
+            # A call cut off mid-arguments: dropped, never run
+            yield S.head()
+            yield S.data(chunk(model, {"tool_calls": [{
+                "index": 0, "id": f"call_{n}_x", "type": "function",
+                "function": {"name": "shell", "arguments": '{"comm'}}]}))
+            yield S.drop()
         elif fault == "ping_wait":
             yield S.head()
             for _ in range(3):
