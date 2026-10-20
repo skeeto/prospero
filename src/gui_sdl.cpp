@@ -19,6 +19,7 @@
 using GlViewport   = void (*)(i32, i32, i32, i32);
 using GlClearColor = void (*)(f32, f32, f32, f32);
 using GlClear      = void (*)(u32);
+using GlReadPixels = void (*)(i32, i32, i32, i32, u32, u32, void *);
 
 struct GuiSdl {
     Gui          *gui;
@@ -30,6 +31,7 @@ struct GuiSdl {
     GlViewport    glviewport;
     GlClearColor  glclearcolor;
     GlClear       glclear;
+    GlReadPixels  glreadpixels;
 };
 
 static void os_wake(Os *os)
@@ -107,6 +109,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     p->glviewport   = (GlViewport)SDL_GL_GetProcAddress("glViewport");
     p->glclearcolor = (GlClearColor)SDL_GL_GetProcAddress("glClearColor");
     p->glclear      = (GlClear)SDL_GL_GetProcAddress("glClear");
+    p->glreadpixels = (GlReadPixels)SDL_GL_GetProcAddress("glReadPixels");
     if (!p->glviewport || !p->glclearcolor || !p->glclear) {
         return 0;
     }
@@ -217,6 +220,22 @@ static void os_guipresent(Os *os, b32 present)
         p->glclearcolor(0.08f, 0.08f, 0.09f, 1);
         p->glclear(0x4000);  // GL_COLOR_BUFFER_BIT
         ImGui_ImplOpenGL3_RenderDrawData(dd);
+        Gui *g = p->gui;
+        if (g->shotpath.len && p->glreadpixels) {
+            // The checklist's screenshot, bottom row first from GL
+            Arena a   = g->frame;
+            u8   *px  = allocbytes(&a, (iz)w*h*4);
+            u8   *top = allocbytes(&a, (iz)w*h*4);
+            p->glreadpixels(0, 0, w, h, 0x1908, 0x1401, px);  // RGBA, UNSIGNED_BYTE
+            for (i32 y = 0; y < h; y++) {
+                copybytes(top + (iz)y*w*4, px + (iz)(h-1-y)*w*4, (iz)w*4);
+            }
+            Str png = pngencode(&a, top, w, h);
+            if (!os_write(g->os, a, g->shotpath, png)) {
+                guilog(g, "could not write a screenshot");
+            }
+            g->shotpath = {};
+        }
         SDL_GL_SwapWindow(p->window);
     } else if (dd->Textures) {
         // Glyphs may have been added to the atlas even though the

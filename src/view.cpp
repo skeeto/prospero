@@ -467,8 +467,9 @@ static Str oneline(Arena *a, Str s)
     return more ? concat(a, clone(a, r), "\xe2\x80\xa6") : clone(a, r);
 }
 
-// What a call is about, from its arguments: the command or the path.
-static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args)
+// What a call is about, from its arguments: the command or the path, a
+// path inside the working directory relative to it.
+static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
 {
     Json *j   = jsonparse(&scratch, args).root;
     Str   cmd = jsonstr(jsonget(j, "command"));
@@ -476,6 +477,10 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args)
     if (name=="shell" && cmd.data) {
         return oneline(perm, cmd);
     } else if (p.data) {
+        if (cwd.len && p.len>cwd.len+1 && startswith(p, cwd) &&
+                (p[cwd.len]=='/' || p[cwd.len]=='\\')) {
+            p = cuthead(p, cwd.len+1);
+        }
         return oneline(perm, p);
     }
     return oneline(perm, args);
@@ -616,7 +621,7 @@ static i32 addcall(View *v, Arena scratch, Str id, Str name, Str args)
     t->call    = clone(&v->aux, id);
     t->name    = clone(&v->aux, name);
     t->args    = clone(&v->aux, args);
-    t->summary = toolsummary(&v->aux, scratch, name, args);
+    t->summary = toolsummary(&v->aux, scratch, name, args, v->cwd);
     t->status  = VTOOL_CALLED;
     v->msgs[i].tool      = t;
     v->msgs[i].collapsed = name=="read" || name=="write";

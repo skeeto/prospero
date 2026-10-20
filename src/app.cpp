@@ -130,6 +130,7 @@ enum : i32 {
     RECT_SETTING,
     RECT_CLOSESTOP,
     RECT_CLOSECANCEL,
+    RECT_OTHERSESS,
     RECT_COUNT,
 };
 
@@ -301,6 +302,7 @@ struct Gui {
 
     // Timers
     i64                lastmove;
+    u32                lasthover;  // ImGui's hovered item at the last frame
     i64                lastkey;
     i64                lastcontent;
     Arena              pendmem;    // deltas held back until a content frame
@@ -393,11 +395,14 @@ struct Gui {
     i32                benchn;
     i64                started;
     b32                trace;      // log every frame
+    Str                shotdir;    // --shots: where screenshots go
+    Str                shotpath;   // the next presented frame goes here
     i32                layoutstreak;
     f32                widthadj;   // benchmark: subtracted from the width
 
     // Scripted checklist (--drive)
     Str                drivecwd;     // --cwd: where its sessions work
+    b32                tracedrive;   // --trace-drive: log where presses land
     i32                drivewait;    // W_* condition it waits for
     i64                holduntil;    // µs: the inbox is left alone until
     b32                held;         // a wake came during the hold
@@ -559,6 +564,13 @@ static EvOut cmdopen(Gui *g, Buf *b, i32 cmd, GuiSession *s)
 
 static void fakecommand(Gui *g, Arena scratch, Str line);
 
+// Whether commands can go out: the window draws (Win32: from inside
+// os_guiopen) before the engine starts.
+static b32 engineup(Gui *g)
+{
+    return g->enginekind==ENGINE_FAKE || g->engine || g->proc;
+}
+
 // Finish a command and send it to the engine. The scratch must follow
 // the command's buffer.
 static void cmdsend(Gui *g, EvOut *w, Arena scratch)
@@ -566,10 +578,12 @@ static void cmdsend(Gui *g, EvOut *w, Arena scratch)
     Str line = evend(w);
     switch (g->enginekind) {
     case ENGINE_INPROC:
-        enginecmd(g->engine, cuttail(line, 1));
+        if (g->engine) {
+            enginecmd(g->engine, cuttail(line, 1));
+        }
         break;
     case ENGINE_SUBPROCESS:
-        if (!g->proc || !os_procwrite(g->os, g->proc, line)) {
+        if (g->proc && !os_procwrite(g->os, g->proc, line)) {
             g->engineerr = "the engine process stopped taking commands";
             scheddirty(&g->sched);
         }
@@ -606,7 +620,7 @@ static void guilist(Gui *g)
 
 static void guiconfigget(Gui *g)
 {
-    if (g->enginekind==ENGINE_FAKE || g->cfgget) {
+    if (g->enginekind==ENGINE_FAKE || g->cfgget || !engineup(g)) {
         return;
     }
     Arena a = newarena(g->cmdr);
@@ -2122,6 +2136,83 @@ static void benchframe(Gui *g, i64 cpu)
 }
 
 
+// Screenshots, for looking at what the checklist did: PNG with stored
+// (uncompressed) deflate blocks, which needs no compressor.
+
+static u32 crc32(u32 crc, u8 *p, iz len)
+{
+    crc = ~crc;
+    for (iz i = 0; i < len; i++) {
+        crc ^= p[i];
+        for (i32 k = 0; k < 8; k++) {
+            crc = crc>>1 ^ (0xedb88320u & (0u - (crc&1)));
+        }
+    }
+    return ~crc;
+}
+
+static void putbe32(Buf *b, u32 v)
+{
+    putbyte(b, (u8)(v>>24));
+    putbyte(b, (u8)(v>>16));
+    putbyte(b, (u8)(v>> 8));
+    putbyte(b, (u8)(v>> 0));
+}
+
+static void pngchunk(Buf *b, Str type, Str data)
+{
+    putbe32(b, (u32)data.len);
+    iz start = b->len;
+    print(b, type);
+    print(b, data);
+    putbe32(b, crc32(0, b->data+start, b->len-start));
+}
+
+// A PNG of w by h RGBA pixels, top row first.
+static Str pngencode(Arena *a, u8 *rgba, i32 w, i32 h)
+{
+    iz  row = (iz)w*4 + 1;  // with its filter byte, 0 (none)
+    iz  raw = row * h;
+    Buf z(a, raw + raw/65535*5 + 64);
+    putbyte(&z, 0x78);
+    putbyte(&z, 0x01);
+    u32 s1 = 1, s2 = 0;
+    iz  left = raw, y = 0, x = 0;  // x: position within the row
+    while (left > 0) {
+        iz n = left<65535 ? left : 65535;
+        left -= n;
+        putbyte(&z, (u8)!left);  // BFINAL, BTYPE 00
+        putbyte(&z, (u8)n);
+        putbyte(&z, (u8)(n>>8));
+        putbyte(&z, (u8)~n);
+        putbyte(&z, (u8)(~n>>8));
+        for (iz i = 0; i < n; i++) {
+            u8 c = x ? rgba[y*(iz)w*4 + x-1] : 0;
+            putbyte(&z, c);
+            s1 = (s1 + c) % 65521;
+            s2 = (s2 + s1) % 65521;
+            if (++x == row) {
+                x = 0;
+                y++;
+            }
+        }
+    }
+    putbe32(&z, s2<<16 | s1);
+
+    Buf b(a, z.len + 128);
+    print(&b, "\x89PNG\r\n\x1a\n");
+    u8 hdr[13] = {
+        (u8)(w>>24), (u8)(w>>16), (u8)(w>>8), (u8)w,
+        (u8)(h>>24), (u8)(h>>16), (u8)(h>>8), (u8)h,
+        8, 6, 0, 0, 0,  // 8-bit RGBA
+    };
+    pngchunk(&b, "IHDR", {hdr, countof(hdr)});
+    pngchunk(&b, "IDAT", finish(&z));
+    pngchunk(&b, "IEND", {});
+    return finish(&b);
+}
+
+
 // Scripted checklist (--drive): the staleness checklist from the plan,
 // driven by synthetic input through the platform's own event queue.
 // Each step's effect is checked against ImGui's state and the view
@@ -2160,6 +2251,8 @@ enum : i32 {
     OP_SNAPCFG,   // remember the configuration file
     OP_CLOSE,     // ask the window to close
     OP_SUMMARY,   // log the checks so far
+    OP_SHOT,      // with --shots DIR: the next frame as DIR/text.png
+    OP_SHOWUSER,  // scroll to the user's message that starts with text
 };
 
 enum : i32 {
@@ -2186,6 +2279,8 @@ enum : i32 {
     T_SETTING,     // the first endpoint's idle_timeout field
     T_CLOSESTOP,   // the close dialog's buttons
     T_CLOSECANCEL,
+    T_OTHERSESS,   // the first session in the sidebar not shown
+    T_TOPTEXT,     // near the transcript's top edge
 };
 
 enum : i32 {
@@ -2229,6 +2324,11 @@ enum : i32 {
     CHK_SETTING,
     CHK_CLOSEMODAL,
     CHK_STILLBUSY,
+    CHK_SWITCHED,
+    CHK_E2ECODE,
+    CHK_E2ESTEER,
+    CHK_E2EALLOWED,
+    CHK_E2ETIMEOUT,
     CHK_COUNT,
 };
 
@@ -2251,6 +2351,11 @@ static Str chknames[] = {
     "the small inbox overflowed", "the view matches a replay of the log",
     "a settings edit changed one line of the file, comments intact",
     "closing with a turn running asks first", "Cancel kept the turn running",
+    "switched back, the other session streaming on",
+    "the agent wrote the files and ran the test",
+    "the steer reached the agent, and the turn finished",
+    "allowed by the user: the file was written outside",
+    "denied at the deadline, and the agent read why",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -2265,11 +2370,13 @@ enum : i32 {
     W_CONFIG,     // the configuration is loaded, nothing in flight
     W_CONFIGSET,  // a config.set was answered since OP_SNAPCFG
     W_FOREVER,    // never: the time runs out (the app should have quit)
+    W_ALLIDLE,    // no session runs a turn
 };
 
 static Str waitnames[] = {
     "", "the engine", "the session", "the turn to end", "an ask",
     "a running tool", "the configuration", "the settings edit", "quitting",
+    "every turn to end",
 };
 
 enum : i32 {
@@ -2495,13 +2602,18 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_TOOLROWS, 0, 0, 0, ""},
     {OP_CHECK, CHK_DIFF, 0, 0, 0, ""},
     {OP_CHECK, CHK_LIVETAIL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "1-tools"},
     // The mouse wheel, drag-selecting past the edge, and copying code,
-    // over what that turn made
+    // over what that turn made: from near the top, after scrolling up
+    // past the long answer, so that the selection spans messages
     {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_WHEEL, 0, 0, 10, 50, ""},
+    {OP_WHEEL, 0, 0, 10, 50, ""},
     {OP_WHEEL, 0, 0, 10, 50, ""},
     {OP_WHEEL, 0, 0, 10, 800, ""},
     {OP_CHECK, CHK_SCROLLED, 0, 0, 0, ""},
-    {OP_MOVE, T_TRANSCRIPT, 0, -80, 100, ""},
+    {OP_SHOWUSER, 0, 0, 0, 500, "Run the tools"},
+    {OP_MOVE, T_TOPTEXT, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 100, ""},
     {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
     {OP_MOVE, T_BELOW, 0, 30, 1200, ""},
@@ -2520,6 +2632,7 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_ASK, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_ASKCARD, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "2-ask"},
     {OP_MOVE, T_ALLOW, 0, 0, 200, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -2545,6 +2658,17 @@ static DriveOp m3ops[] = {
     {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     {OP_CHECK, CHK_STEERED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "3-steer"},
+    // A second session streams while the first is shown again
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 500, "Stream slowly for a while."},
+    {OP_MOVE, T_OTHERSESS, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SWITCHED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "6-sessions"},
+    {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
     // Esc cancels a turn mid-tool
     {OP_PROMPT, 0, 0, 0, 100, "Cancel me: run a very slow command."},
     {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
@@ -2556,7 +2680,7 @@ static DriveOp m3ops[] = {
     // Records lost to a full inbox (--inbox-cap): held while a fast
     // stream fills it, then resynced from the log
     {OP_PROMPT, 0, 0, 0, 100, "Stream fast."},
-    {OP_HOLD, 0, 1500, 0, 1700, ""},
+    {OP_HOLD, 0, 3000, 0, 3200, ""},
     {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
     {OP_CHECK, CHK_OVERFLOWED, 0, 0, 0, ""},
     {OP_CHECK, CHK_RESYNC, 0, 0, 0, ""},
@@ -2574,6 +2698,7 @@ static DriveOp m3ops[] = {
     {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
     {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
     {OP_CHECK, CHK_SETTING, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "4-settings"},
     // Typing, then idle for 15 s: the caret blinks for 10 s, then stops
     {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -2594,6 +2719,7 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
     {OP_CLOSE, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "5-close"},
     {OP_MOVE, T_CLOSECANCEL, 0, 0, 200, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1000, ""},
@@ -2610,10 +2736,101 @@ static DriveOp m3ops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// End to end against a real model (--e2e, tests/gui.py --e2e): a coding
+// task, a steer, a cancel, an ask allowed and one left to time out, a
+// settings edit, and closing while a command runs. The model decides
+// the details, so the checks look for what any reasonable agent does.
+static DriveOp e2eops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_SESSION, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 1000,
+     "In this directory, write a Python module calc.py with a function "
+     "add(a, b) that returns their sum, and a test file test_calc.py that "
+     "imports it, checks add with assert statements and prints ok. Then "
+     "run python3 test_calc.py with the shell tool and tell me its output."},
+    {OP_WAIT, W_IDLE, 0, 0, 900000, ""},
+    {OP_CHECK, CHK_E2ECODE, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "e2e-1-code"},
+    // Steering while a command runs: read at the next step
+    {OP_PROMPT, 0, 0, 0, 100,
+     "Run the shell command: sleep 15. Then tell me a short joke about computers."},
+    {OP_WAIT, W_TOOL, 0, 0, 300000, ""},
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "Actually, skip the joke: reply with just the word DONE."},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 300000, ""},
+    {OP_CHECK, CHK_E2ESTEER, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "e2e-2-steer"},
+    // Cancelling mid-tool: the process tree goes (tests/gui.py checks)
+    {OP_PROMPT, 0, 0, 0, 100,
+     "Run exactly this shell command and wait for it: echo $$ > cancel.pid; sleep 120"},
+    {OP_WAIT, W_TOOL, 0, 0, 300000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_CANCELLED, 0, 0, 0, ""},
+    // An ask, allowed
+    {OP_PROMPT, 0, 0, 0, 100,
+     "Use the write tool to create the file ../e2e-allowed.txt containing "
+     "the word yes. Do not use the shell."},
+    {OP_WAIT, W_ASK, 0, 0, 300000, ""},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "e2e-3-ask"},
+    {OP_MOVE, T_ALLOW, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 300000, ""},
+    {OP_CHECK, CHK_E2EALLOWED, 0, 0, 0, ""},
+    // An ask nobody answers
+    {OP_PROMPT, 0, 0, 0, 100,
+     "Use the write tool to create the file ../e2e-denied.txt containing "
+     "the word no. Do not use the shell, and if the write is denied, do not "
+     "try again: just say DENIED."},
+    {OP_WAIT, W_ASK, 0, 0, 300000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 300000, ""},
+    {OP_CHECK, CHK_E2ETIMEOUT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "e2e-4-timeout"},
+    // A settings edit: one line of the file
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_SETTING, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "77"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_SETTING, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    // Closing while a command runs
+    {OP_PROMPT, 0, 0, 0, 100,
+     "Run exactly this shell command and wait for it: echo $$ > close.pid; sleep 120"},
+    {OP_WAIT, W_TOOL, 0, 0, 300000, ""},
+    {OP_CLOSE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_MOVE, T_CLOSESTOP, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_FOREVER, 0, 0, 10000, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // Idle: nothing for a minute after startup settles.
 static DriveOp idleops[] = {
     {OP_MARK, 0, 0, 0, 10000, ""},  // startup settles
-    {OP_MARK, 0, 0, 0, 60000, ""},
+    {OP_MARK, 0, 0, 0, 60000, "idle"},
     {OP_RATES, 0, 0, 0, 0, "idle 60 s"},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -2626,7 +2843,7 @@ static DriveOp m3idleops[] = {
     {OP_PROMPT, 0, 0, 0, 100, "Say hello."},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 10000, ""},
-    {OP_MARK, 0, 0, 0, 60000, ""},
+    {OP_MARK, 0, 0, 0, 60000, "idle"},
     {OP_RATES, 0, 0, 0, 0, "idle 60 s with an idle session"},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -2634,7 +2851,7 @@ static DriveOp m3idleops[] = {
 // Streaming at 100 tokens per second for 30 s.
 static DriveOp streamops[] = {
     {OP_STREAM, 0, 100, 0, 3000, ""},
-    {OP_MARK, 0, 0, 0, 30000, ""},
+    {OP_MARK, 0, 0, 0, 30000, "streaming"},
     {OP_RATES, 0, 0, 0, 0, "streaming 100 tok/s, 30 s"},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -2644,7 +2861,7 @@ static DriveOp m3streamops[] = {
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_PROMPT, 0, 0, 0, 3000, "Stream at 100 tokens per second."},
-    {OP_MARK, 0, 0, 0, 30000, ""},
+    {OP_MARK, 0, 0, 0, 30000, "streaming"},
     {OP_RATES, 0, 0, 0, 0, "streaming 100 tok/s from the engine, 30 s"},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -2695,6 +2912,11 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_SETTING:     return rectcenter(g->rects[RECT_SETTING]);
     case T_CLOSESTOP:   return rectcenter(g->rects[RECT_CLOSESTOP]);
     case T_CLOSECANCEL: return rectcenter(g->rects[RECT_CLOSECANCEL]);
+    case T_OTHERSESS:   return rectcenter(g->rects[RECT_OTHERSESS]);
+    case T_TOPTEXT: {
+        Rect r = g->rects[RECT_TRANSCRIPT];
+        return v2((r.x0+r.x1)/2, r.y0 + 24*g->scale);
+    }
     case T_EMPTY: {
         Rect r = g->rects[RECT_TOOLBAR];
         return v2(r.x1 - 40*g->scale, (r.y0+r.y1)/2);
@@ -2714,6 +2936,17 @@ static ImVec2 targetpos(Gui *g, i32 t)
     }
     }
     return v2(0, 0);
+}
+
+// Window sizes in the checklist are in ImGui's units, which are pixels
+// on Win32, at the display's scale, and points elsewhere.
+static f32 winscale(Gui *g)
+{
+    #ifdef _WIN32
+    return g->scale;
+    #else
+    return 1;
+    #endif
 }
 
 static b32 tooltipup()
@@ -2804,6 +3037,8 @@ static b32 drivewaitdone(Gui *g)
         return g->cfg && !g->cfgget;
     case W_CONFIGSET:
         return g->cfgsets>0 && !g->cfgset && !g->cfgget;
+    case W_ALLIDLE:
+        return !running(g);
     }
     return 0;
 }
@@ -2868,8 +3103,19 @@ static Str cfgfile(Gui *g, Arena *a)
     return g->cfgpath.len ? g->cfgpath : cfgdefault(g->os, a);
 }
 
-// The configuration file differs from the snapshot in one line only,
-// the edited one.
+static Slice<Str> splitlines(Arena *a, Str s)
+{
+    Slice<Str> r = {};
+    for (Str rest = s; rest.len;) {
+        Cut c = cut(rest, '\n');
+        r    = push(a, r, c.head);
+        rest = c.tail;
+    }
+    return r;
+}
+
+// The configuration file differs from the snapshot by one line, the
+// edited one, changed in place or added.
 static b32 checksetting(Gui *g)
 {
     Arena a  = g->frame;
@@ -2877,29 +3123,25 @@ static b32 checksetting(Gui *g)
     if (rd.err!=READ_OK || !g->cfgsnap.data) {
         return 0;
     }
-    i32 diff = 0;
-    b32 edit = 0;
-    Str x = g->cfgsnap, y = rd.data;
-    for (;;) {
-        Cut cx = cut(x, '\n');
-        Cut cy = cut(y, '\n');
-        if (cx.head != cy.head) {
-            diff++;
-            edit |= find(cy.head, "idle_timeout")>=0 && find(cy.head, "77")>=0;
-        }
-        if (!cx.ok || !cy.ok) {
-            diff += cx.ok != cy.ok;
-            break;
-        }
-        x = cx.tail;
-        y = cy.tail;
+    Slice<Str> x = splitlines(&a, g->cfgsnap);
+    Slice<Str> y = splitlines(&a, rd.data);
+    iz i = 0;
+    for (; i<x.len && i<y.len && x[i]==y[i]; i++) {}
+    b32 one = 0;
+    if (i<y.len && x.len==y.len) {
+        one = 1;  // changed in place: the rest the same
+        for (iz k = i+1; k < x.len; k++) one &= x[k] == y[k];
+    } else if (i<y.len && x.len+1==y.len) {
+        one = 1;  // added: the rest moved down by one
+        for (iz k = i; k < x.len; k++) one &= x[k] == y[k+1];
     }
-    Buf m(&a, 128);
-    print(&m, "drive: the settings edit changed ");
-    print(&m, (i64)diff);
-    print(&m, " lines");
+    b32 edit = i<y.len && find(y[i], "idle_timeout")>=0 && find(y[i], "77")>=0;
+    Buf m(&a, 256);
+    print(&m, "drive: the settings edit ");
+    print(&m, one ? Str("changed one line: ") : Str("changed more than one line, first: "));
+    print(&m, i<y.len ? y[i] : Str("(none)"));
     guilog(g, finish(&m));
-    return diff==1 && edit;
+    return one && edit;
 }
 
 static b32 drivecheck(Gui *g, i32 chk)
@@ -2921,7 +3163,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_TRANSCRIPTTAB: return tabselected("Transcript");
     case CHK_NAVWIN:        return c.NavWindowingTarget != 0;
     case CHK_NONAVWIN:      return !c.NavWindowingTarget && c.NavWindowingHighlightAlpha==0;
-    case CHK_RESIZED:       return (i32)c.IO.DisplaySize.x == 1100;
+    case CHK_RESIZED:       return (i32)c.IO.DisplaySize.x == (i32)(1100*winscale(g));
     case CHK_TYPED:         return promptstr(g) == "Hello, harness";
     case CHK_BLINKOFF:      return !c.IO.ConfigInputTextCursorBlink;
     case CHK_HISTORY:       return v->msgs.len >= 10000;
@@ -2952,7 +3194,7 @@ static b32 drivecheck(Gui *g, i32 chk)
         print(&b, " frames inside the loop, width now ");
         print(&b, (i64)c.IO.DisplaySize.x);
         guilog(g, finish(&b));
-        return g->modalframes>2 && (i32)c.IO.DisplaySize.x!=1280;
+        return g->modalframes>2 && (i32)c.IO.DisplaySize.x!=(i32)(1280*winscale(g));
         #else
         print(&b, "drive: simulated live-resize exposes: ");
         print(&b, g->modalframes);
@@ -3026,6 +3268,57 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_STILLBUSY:
         return v->busy && !g->quitting;
+    case CHK_E2ECODE: {
+        Arena a  = g->frame;
+        b32   ok = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewTool *t = v->msgs[i].tool;
+            ok |= v->msgs[i].role==VIEW_TOOL && t->name=="shell" &&
+                  t->status==VTOOL_OK && t->hasexit && !t->exit;
+        }
+        Str calc = join(&a, g->drivecwd, "calc.py");
+        Str test = join(&a, g->drivecwd, "test_calc.py");
+        return ok && !v->busy && os_stat(g->os, a, calc).type==STAT_FILE &&
+               os_stat(g->os, a, test).type==STAT_FILE;
+    }
+    case CHK_E2ESTEER: {
+        b32 steered = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            steered |= v->msgs[i].role==VIEW_USER && v->msgs[i].label.len &&
+                       startswith(v->msgs[i].text, "Actually");
+        }
+        ViewMsg *n = lastmsg(g, VIEW_NOTE);
+        return steered && !v->busy && (!n || !startswith(n->text, "The turn ended"));
+    }
+    case CHK_E2EALLOWED: {
+        // The agent may ask more (to read the file back), so any ask
+        Arena a       = g->frame;
+        b32   allowed = 0, wrote = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewTool *t = v->msgs[i].tool;
+            allowed |= v->msgs[i].role==VIEW_ASK && t->answer==VASK_ALLOWED && t->by=="user";
+            wrote   |= v->msgs[i].role==VIEW_TOOL && t->name=="write" && t->status==VTOOL_OK;
+        }
+        Str f = join(&a, g->drivecwd, "../e2e-allowed.txt");
+        return allowed && wrote && !v->busy && os_stat(g->os, a, f).type==STAT_FILE;
+    }
+    case CHK_E2ETIMEOUT: {
+        ViewMsg *k = lastmsg(g, VIEW_ASK);
+        ViewMsg *a = lastmsg(g, VIEW_ASSISTANT);
+        return k && k->tool->answer==VASK_DENIED && k->tool->by=="timeout" &&
+               a && a>k && !v->busy;
+    }
+    case CHK_SWITCHED: {
+        // The first session shown again while the second streams
+        b32 other = 0, first = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            other |= s!=g->sess && s->view && s->view->busy;
+        }
+        for (iz i = 0; i < v->msgs.len; i++) {
+            first |= v->msgs[i].role==VIEW_USER && startswith(v->msgs[i].text, "Run the tools");
+        }
+        return other && first && g->sess && !g->sess->view->busy;
+    }
     }
     return 0;
 }
@@ -3139,6 +3432,26 @@ static void drivestep(Gui *g)
         e.button = op->op==OP_RDOWN || op->op==OP_RUP;
         e.down   = op->op==OP_DOWN || op->op==OP_RDOWN;
         os_guiinject(g->os, &e);
+        if (e.down && g->tracedrive) {
+            // What the press lands on, as of the last frame
+            ImGuiContext &c = *GImGui;
+            Arena a = g->frame;
+            Buf   b(&a, 256);
+            print(&b, "drive: press at ");
+            print(&b, (i64)e.x);
+            putbyte(&b, ',');
+            print(&b, (i64)e.y);
+            print(&b, ", ImGui's mouse at ");
+            print(&b, (i64)c.IO.MousePos.x);
+            putbyte(&b, ',');
+            print(&b, (i64)c.IO.MousePos.y);
+            print(&b, " over ");
+            char const *w = c.HoveredWindow ? c.HoveredWindow->Name : "nothing";
+            print(&b, Str{(u8 *)w, (iz)__builtin_strlen(w)});
+            print(&b, ", item ");
+            printhex(&b, c.HoveredId, 8);
+            guilog(g, finish(&b));
+        }
         break;
     case OP_WHEEL:
         e.kind = GEV_WHEEL;
@@ -3183,8 +3496,8 @@ static void drivestep(Gui *g)
         break;
     case OP_RESIZE:
         e.kind = GEV_RESIZE;
-        e.x    = op->dx;
-        e.y    = op->dy;
+        e.x    = op->dx * winscale(g);
+        e.y    = op->dy * winscale(g);
         os_guiinject(g->os, &e);
         break;
     case OP_CLOSE:
@@ -3225,6 +3538,11 @@ static void drivestep(Gui *g)
         g->driveframes = g->total.frames;
         g->markcounts  = g->total;
         g->markat      = g->sched.now;
+        if (op->text.len) {
+            // For a measurement outside, by the operating system
+            Arena a = g->frame;
+            guilog(g, concat(&a, "drive: mark: ", op->text));
+        }
         break;
     case OP_STREAM:
         fakeint(g, FAKE_TPS, (i64)op->dx);
@@ -3313,6 +3631,24 @@ static void drivestep(Gui *g)
     case OP_SUMMARY:
         drivesummary(g);
         break;
+    case OP_SHOWUSER: {
+        View *v = g->view;
+        for (iz i = v->msgs.len-1; i >= 0; i--) {
+            if (v->msgs[i].role==VIEW_USER && startswith(v->msgs[i].text, op->text)) {
+                g->scrollto = v->msgs[i].top;
+                if (g->sess) g->sess->stick = 0;
+                scheddirty(&g->sched);
+                break;
+            }
+        }
+    } break;
+    case OP_SHOT:
+        if (g->shotdir.len) {
+            Str name = concat(&g->perm, op->text, ".png");
+            g->shotpath = join(&g->perm, g->shotdir, name);
+            schedforce(&g->sched);  // presented, so captured
+        }
+        break;
     case OP_QUIT:
         if (!g->quitting) {
             drivesummary(g);
@@ -3393,12 +3729,15 @@ static Str guiusage =
 "                 --fake, else M3's against tests/fake_provider.py\n"
 "  --cwd DIR      the checklist's working directory\n"
 "  --inbox-cap N  bytes per inbox buffer, small to force lost records\n"
+"  --shots DIR    the checklist saves screenshots there (SDL only)\n"
 "  --idle         measure a minute of idling, quit\n"
 "  --streamtest   measure 30 s of streaming at 100 tok/s, quit\n"
+"  --e2e          the checklist's end-to-end part against a real model\n"
 "  --probe        staleness probe on (default in debug builds)\n"
 "  --no-probe     staleness probe off\n"
 "  --aggressive   probe every second while idle\n"
 "  --trace        log every frame and why it ran\n"
+"  --trace-drive  log where the checklist's presses land\n"
 "  --quit-after S quit after S seconds\n";
 
 extern "C" void harness_imassert(char const *expr, char const *file, int line)
@@ -3515,7 +3854,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     probe = 0;
     #endif
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
-    b32 subprocess = 0, fake = 0;
+    b32 subprocess = 0, fake = 0, e2e = 0;
     i64 history = 0;
     i32 bench   = 0;
     for (i32 i = 1 + (nargs>1 && args[1]=="gui"); i < nargs; i++) {
@@ -3537,8 +3876,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             idle = 1;
         } else if (a == "--streamtest") {
             streamtest = 1;
+        } else if (a == "--e2e") {
+            e2e = probe = 1;
         } else if (a == "--trace") {
             g->trace = 1;
+        } else if (a == "--trace-drive") {
+            g->tracedrive = 1;
         } else if (a == "--probe") {
             probe = 1;
         } else if (a == "--no-probe") {
@@ -3556,6 +3899,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             g->drivecwd = cstrclone(&mem, args[++i]);
         } else if (a == "--inbox-cap") {
             g->inboxcap = optint(args, nargs, &i);
+        } else if (a=="--shots" && i+1<nargs) {
+            g->shotdir = args[++i];
         } else if (a == "--fake") {
             fake = 1;
         } else if (a == "--engine=subprocess") {
@@ -3572,9 +3917,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         return 1;
     }
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
-    if (drive || idle || streamtest) {
+    if (drive || idle || streamtest || e2e) {
         g->drive = 1;
-        if (drive) {
+        if (e2e) {
+            g->ops  = e2eops;
+            g->nops = countof(e2eops);
+        } else if (drive) {
             g->ops  = fake ? driveops : m3ops;
             g->nops = fake ? countof(driveops) : countof(m3ops);
         } else if (idle) {

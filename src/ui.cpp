@@ -249,13 +249,17 @@ static void uideadlines(Gui *g, Sched *s)
     ImGuiStyle   &st = c.Style;
     i64 now = s->now;
 
-    // Hover delays restart whenever the mouse moves.
-    if (io.MouseDelta.x!=0 || io.MouseDelta.y!=0) {
-        g->lastmove = now;
+    // Hover delays restart whenever the mouse moves, or whenever what is
+    // under it changes without moving it (a resize, a scroll): splitters
+    // light up after WINDOWS_RESIZE_FROM_EDGES_FEEDBACK_TIMER, 0.04 s.
+    if (io.MouseDelta.x!=0 || io.MouseDelta.y!=0 || c.HoveredId!=g->lasthover) {
+        g->lastmove  = now;
+        g->lasthover = c.HoveredId;
     }
     if (g->lastmove) {
         i64 slack = 20000;
         f32 delays[] = {
+            0.04f,
             st.HoverStationaryDelay,
             st.HoverStationaryDelay + st.HoverDelayShort,
             st.HoverStationaryDelay + st.HoverDelayNormal,
@@ -263,7 +267,7 @@ static void uideadlines(Gui *g, Sched *s)
         for (iz i = 0; i < countof(delays); i++) {
             i64 t = g->lastmove + (i64)(delays[i]*1e6f) + slack;
             if (t > now) {
-                schedat(s, t, i ? DUE_TOOLTIP : DUE_HOVER);
+                schedat(s, t, i>1 ? DUE_TOOLTIP : DUE_HOVER);
             }
         }
     }
@@ -578,9 +582,10 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
     f32       sz = p->size;
     if (cl) {
         // A triangle for whether the body shows
-        ImVec2 at = v2(p->x, p->y + sz*0.1f);
-        ImGui::RenderArrow(p->dl, at, C_DIM, m->collapsed ? ImGuiDir_Right : ImGuiDir_Down, 0.8f);
-        p->x += sz;
+        f32    fs = ImGui::GetFontSize();
+        ImVec2 at = v2(p->x, p->y + (sz - 0.7f*fs)/2);
+        ImGui::RenderArrow(p->dl, at, C_DIM, m->collapsed ? ImGuiDir_Right : ImGuiDir_Down, 0.7f);
+        p->x += fs;
     }
     u32 dim = fade(C_DIM, m->faded ? 0.5f : 1);
     switch (m->role) {
@@ -594,8 +599,7 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             pen(p, finish(&b), 0, C_ACTIVE);
             break;
         }
-        pen(p, t->summary, STYLE_CODE, rgba(200, 200, 205, 255));
-        pen(p, "  ", 0, dim);
+        // The outcome first, so that a long summary cannot hide it
         pen(p, vtoolnames[t->status], STYLE_BOLD, toolcolor(t->status));
         if (t->hasexit) {
             Buf b(&a, 32);
@@ -610,6 +614,8 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             pen(p, "  ", 0, dim);
             pen(p, duration(&a, t->ms), 0, dim);
         }
+        pen(p, "  ", 0, dim);
+        pen(p, t->summary, STYLE_CODE, rgba(200, 200, 205, 255));
     } break;
     case VIEW_THINK: {
         pen(p, "Reasoning", STYLE_BOLD, dim);
@@ -1176,6 +1182,7 @@ static void drawsessions(Gui *g)
         ImGui::SetItemTooltip("List the sessions again");
     }
     Slice<GuiSession *> list = sesslist(g, &a);
+    b32         other = 0;  // the checklist's first session not shown
     ImDrawList *dl    = ImGui::GetWindowDrawList();
     f32         lineh = ImGui::GetTextLineHeight();
     f32         small = g->fonts.size * 0.85f;
@@ -1188,6 +1195,10 @@ static void drawsessions(Gui *g)
         f32    w = ImGui::GetContentRegionAvail().x;
         if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc))) {
             guiselect(g, s);
+        }
+        if (!other && s!=g->sess) {
+            itemrect(g, RECT_OTHERSESS);
+            other = 1;
         }
         Str cwd = v && v->cwd.len ? v->cwd : s->cwd;
         ImGui::SetItemTooltip("%s\n%s", cstr0(&a, cwd), cstr0(&a, s->sid));
@@ -1481,11 +1492,15 @@ static void drawsettings(Gui *g)
                 ImGui::TextUnformatted(cstr0(&a, finish(&sb)));
             }
             ImGui::PushID(cstr0(&a, names[n]));
-            ImGuiTableFlags tf = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg;
+            ImGuiTableFlags tf = ImGuiTableFlags_RowBg;
             if (ImGui::BeginTable("##t", 3, tf)) {
-                ImGui::TableSetupColumn("key", ImGuiTableColumnFlags_WidthStretch, 1);
-                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 2);
-                ImGui::TableSetupColumn("from", ImGuiTableColumnFlags_WidthStretch, 1);
+                // Keys and provenance as wide as they need, the rest for
+                // values
+                f32 keyw  = ImGui::CalcTextSize("first_byte_timeout").x;
+                f32 fromw = ImGui::CalcTextSize("from harness.ini:999").x;
+                ImGui::TableSetupColumn("key", ImGuiTableColumnFlags_WidthFixed, keyw);
+                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("from", ImGuiTableColumnFlags_WidthFixed, fromw);
                 for (iz i = 0; i < g->cfgrows.len; i++) {
                     CfgRow *r = &g->cfgrows[i];
                     if (r->kind==kind && r->name==names[n]) {
@@ -1816,10 +1831,12 @@ static void dockwindows(Gui *g)
         ImGui::DockBuilderRemoveNode(id);
         ImGui::DockBuilderAddNode(id, ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(id, size);
+        // The first split is between the right column and the rest, of
+        // which the sessions take the left
         ImGuiID left = 0, rest = 0, right = 0, center = 0;
         ImGuiID top = 0, bottom = 0, rtop = 0, rbot = 0;
-        ImGui::DockBuilderSplitNode(id, ImGuiDir_Left, 0.18f, &left, &rest);
-        ImGui::DockBuilderSplitNode(rest, ImGuiDir_Right, 0.30f, &right, &center);
+        ImGui::DockBuilderSplitNode(id, ImGuiDir_Right, 0.28f, &right, &rest);
+        ImGui::DockBuilderSplitNode(rest, ImGuiDir_Left, 0.25f, &left, &center);
         ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.22f, &bottom, &top);
         ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.40f, &rbot, &rtop);
         ImGui::DockBuilderDockWindow("Sessions", left);

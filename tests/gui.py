@@ -23,6 +23,7 @@ Windows console session): it prints the directories and waits.
 """
 
 import argparse
+import difflib
 import os
 import random
 import shutil
@@ -35,6 +36,23 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fake_provider  # noqa: E402
+
+
+def e2econfig(url, model):
+    return (
+        "# The end-to-end checklist's configuration\n"
+        "endpoint = local\n"
+        f"model = {model}\n"
+        "\n"
+        "# The router\n"
+        "[endpoint local]\n"
+        f"url = {url}\n"
+        "idle_timeout = 120\n"
+        "\n"
+        "# Asks wait a little\n"
+        "[guard]\n"
+        "ask_timeout = 10\n"
+    )
 
 
 def config(url, model):
@@ -90,84 +108,309 @@ def strays(marker):
     return found
 
 
+def guipid(harness, state):
+    """The GUI process: the harness, not xvfb-run, not the engine."""
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
+                             text=True).stdout
+    except OSError:
+        return None
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if args.startswith(harness + " gui ") and state in args:
+            return int(pid)
+    return None
+
+
+def cputime(pid):
+    """Seconds of CPU the process has used, or None."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except OSError:
+        pass
+    try:
+        t = subprocess.run(["ps", "-o", "time=", "-p", str(pid)],
+                           capture_output=True, text=True).stdout.strip()
+        secs = 0.0
+        for part in t.split(":"):
+            secs = secs * 60 + float(part)
+        return secs
+    except (OSError, ValueError):
+        return None
+
+
+def switches(pid):
+    """Voluntary context switches of every thread (Linux), or None."""
+    total = 0
+    try:
+        for tid in os.listdir(f"/proc/{pid}/task"):
+            with open(f"/proc/{pid}/task/{tid}/status") as f:
+                for line in f:
+                    if line.startswith("voluntary_ctxt_switches"):
+                        total += int(line.split()[1])
+    except OSError:
+        return None
+    return total
+
+
+class Meter:
+    """The operating system's view of a measured interval."""
+
+    def __init__(self, pid, what):
+        self.pid = pid
+        self.what = what
+        self.t0 = time.monotonic()
+        self.cpu0 = cputime(pid)
+        self.sw0 = switches(pid)
+        self.top = None
+        if sys.platform == "darwin" and what == "idle":
+            # Idle wakeups, sampled across the minute
+            self.top = subprocess.Popen(
+                ["top", "-l", "2", "-s", "55", "-pid", str(pid),
+                 "-stats", "pid,idlew,cpu"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+    def report(self):
+        dt = time.monotonic() - self.t0
+        out = [f"{self.what}: {dt:.1f} s"]
+        cpu1 = cputime(self.pid)
+        if self.cpu0 is not None and cpu1 is not None:
+            out.append(f"CPU {100 * (cpu1 - self.cpu0) / dt:.1f}% of a core")
+        sw1 = switches(self.pid)
+        if self.sw0 is not None and sw1 is not None:
+            out.append(f"{sw1 - self.sw0} voluntary context switches")
+        if self.top:
+            try:
+                text = self.top.communicate(timeout=10)[0]
+                rows = [l.split() for l in text.splitlines()
+                        if l.strip().startswith(str(self.pid))]
+                if rows:
+                    out.append(f"top IDLEW {rows[-1][1]}")
+            except subprocess.TimeoutExpired:
+                self.top.kill()
+        return ", ".join(out)
+
+
+class Local:
+    """The GUI here, its directories in a temporary one."""
+
+    def __init__(self, args):
+        self.args = args
+        self.root = tempfile.mkdtemp(prefix="harness-gui-")
+        self.harness = os.path.abspath(args.harness)
+
+    def path(self, *parts):
+        return os.path.join(self.root, *parts)
+
+    def mkdir(self, path):
+        os.makedirs(path, exist_ok=True)
+
+    def write(self, path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    def read(self, path):
+        try:
+            with open(path) as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def alive(self, pid):
+        return alive(pid)
+
+    def run(self, guiargs, timeout):
+        """Run the GUI, echoing its log. Returns (status, lines)."""
+        cmd = [self.harness, "gui"] + guiargs
+        if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
+                and not os.environ.get("WAYLAND_DISPLAY"):
+            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
+        print(" ".join(cmd), flush=True)
+        p = subprocess.Popen(cmd, cwd=self.path("work"), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, start_new_session=True)
+        lines = []
+        meter = None
+        deadline = time.monotonic() + timeout
+        try:
+            for line in p.stdout:
+                lines.append(line)
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                if "drive: mark: " in line:
+                    pid = guipid(self.harness, self.path("state"))
+                    if pid:
+                        meter = Meter(pid, line.split("drive: mark: ")[1].strip())
+                elif line.startswith("harness: rates: ") and meter:
+                    print("measured: " + meter.report(), flush=True)
+                    meter = None
+                if time.monotonic() > deadline:
+                    break
+            p.wait(timeout=max(1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+        if p.poll() is None:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+            return None, lines
+        return p.returncode, lines
+
+    def strays(self):
+        left = strays(self.root)
+        for line in left:
+            try:
+                os.kill(int(line.split()[0]), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        return left
+
+    def close(self, keep):
+        if keep:
+            print(f"kept {self.root}")
+        else:
+            shutil.rmtree(self.root, ignore_errors=True)
+
+
+class Remote:
+    """The GUI on a Windows host, in its logged-in console session: a
+    scheduled task, since DXGI refuses session 0 (OpenSSH). The provider
+    stays here, reached through a reverse tunnel."""
+
+    def __init__(self, args, port):
+        import scenarios
+        self.args = args
+        rport = 20000 + random.randrange(20000)
+        self.h = scenarios.SshHost(args.host, args.harness, port, rport)
+        self.root = self.h.root
+        self.url = self.h.url
+        self.task = f"harness-gui-{random.randrange(1 << 32):08x}"
+
+    def path(self, *parts):
+        return "/".join((self.root,) + parts)
+
+    def mkdir(self, path):
+        self.h.mkdir(path)
+
+    def write(self, path, text):
+        self.h.write(path, text)
+
+    def read(self, path):
+        return self.h.read(path)
+
+    def alive(self, pid):
+        return self.h.alive(pid)
+
+    def run(self, guiargs, timeout):
+        win = lambda p: p.replace("/", "\\")
+        q = lambda a: '"' + win(a) + '"' if "/" in a or " " in a else a
+        bat = ("@echo off\r\ncd /d \"%~dp0\"\r\n" +
+               q(self.h.exe) + " gui " + " ".join(q(a) for a in guiargs) +
+               " > run.log 2>&1\r\necho done %errorlevel% >> run.log\r\n")
+        self.h.write(self.path("run.bat"), bat)
+        r = self.h.ssh(f'schtasks /create /tn {self.task} /tr "{win(self.path("run.bat"))}" '
+                       f'/sc once /st 23:59 /it /f')
+        if r.returncode:
+            raise RuntimeError("schtasks /create: " + r.stdout + r.stderr)
+        self.h.ssh(f"schtasks /run /tn {self.task}")
+        print(f"{self.args.host}: {bat.splitlines()[2]}", flush=True)
+        seen = 0
+        deadline = time.monotonic() + timeout
+        status = None
+        lines = []
+        while time.monotonic() < deadline:
+            time.sleep(3)
+            text = self.h.read(self.path("run.log")) or ""
+            lines = text.splitlines(keepends=True)
+            for line in lines[seen:]:
+                sys.stdout.write(line)
+            sys.stdout.flush()
+            seen = len(lines)
+            done = [l for l in lines if l.startswith("done ")]
+            if done:
+                status = int(done[-1].split()[1])
+                break
+        return status, [l for l in lines if not l.startswith("done ")]
+
+    def strays(self):
+        ps = ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "
+              f"'*{win_root(self.root)}*' }} | ForEach-Object {{ \"$($_.ProcessId) $($_.CommandLine)\" }}")
+        r = self.h.ssh(f'powershell -NoProfile -Command "{ps}"')
+        left = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        for line in left:
+            self.h.ssh(f"taskkill /F /PID {line.split()[0]}")
+        return left
+
+    def close(self, keep):
+        self.h.ssh(f"schtasks /delete /tn {self.task} /f")
+        if keep:
+            print(f"kept {self.args.host}:{self.root}")
+        else:
+            self.h.close()
+
+
+def win_root(path):
+    """The last part of a path, which names the run either way."""
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--harness", required=True)
+    ap.add_argument("--harness", required=True,
+                    help="the binary, or with --host the .exe on that host")
     ap.add_argument("--subprocess", action="store_true",
                     help="the engine as harness --headless")
-    ap.add_argument("--inbox-cap", type=int, default=65536,
+    ap.add_argument("--inbox-cap", type=int, default=32768,
                     help="the GUI's inbox, small to force lost records")
-    ap.add_argument("--mode", default="drive", choices=["drive", "idle", "streamtest"])
+    ap.add_argument("--mode", default="drive", choices=["drive", "idle", "streamtest", "e2e"])
+    ap.add_argument("--model", default="qwen-flash", help="with --mode e2e")
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--keep", action="store_true", help="keep the directories")
-    ap.add_argument("--serve", action="store_true",
-                    help="only run the provider and write the files")
-    ap.add_argument("--url", help="the provider's URL as the GUI reaches it")
+    ap.add_argument("--url", help="with --mode e2e: the router (default http://localhost/)")
+    ap.add_argument("--shots", help="save the checklist's screenshots here")
+    ap.add_argument("--host", help="run the GUI on this Windows host's console")
+    ap.add_argument("--trace", action="store_true", help="log where presses land")
     args = ap.parse_args()
 
     srv, url = fake_provider.start()
     nonce = f"{random.randrange(1 << 32):08x}"
     model = f"fake:gui:{nonce}"
     fake_provider.STATE.register(model)
-    root = tempfile.mkdtemp(prefix="harness-gui-")
-    work = os.path.join(root, "work")
-    state = os.path.join(root, "state")
-    ini = os.path.join(root, "harness.ini")
-    os.makedirs(work)
-    os.makedirs(state)
-    with open(os.path.join(work, "hello.txt"), "w") as f:
-        f.write("hello world\n")
-    with open(ini, "w") as f:
-        f.write(config(args.url or url, model))
-    before = open(ini).read()
+    host = Remote(args, srv.server_address[1]) if args.host else Local(args)
+    work = host.path("work")
+    state = host.path("state")
+    ini = host.path("harness.ini")
+    host.mkdir(work)
+    host.mkdir(state)
+    host.write(host.path("work", "hello.txt"), "hello world\n")
+    if args.mode == "e2e":
+        before = e2econfig(args.url or "http://localhost/", args.model)
+    else:
+        before = config(host.url if args.host else url, model)
+    host.write(ini, before)
 
-    if args.serve:
-        print(f"url {url}\nmodel {model}\nroot {root}", flush=True)
-        try:
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            pass
-        return 0
-
-    cmd = [os.path.abspath(args.harness), "gui", f"--{args.mode}",
-           "-c", ini, "--statedir", state, "--cwd", work,
-           "--inbox-cap", str(args.inbox_cap)]
+    guiargs = [f"--{args.mode}", "-c", ini, "--statedir", state, "--cwd", work,
+               "--inbox-cap", str(args.inbox_cap)]
     if args.subprocess:
-        cmd.append("--engine=subprocess")
-    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
-            and not os.environ.get("WAYLAND_DISPLAY"):
-        cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
+        guiargs.append("--engine=subprocess")
+    if args.trace:
+        guiargs.append("--trace-drive")
+    if args.shots and not args.host:
+        os.makedirs(args.shots, exist_ok=True)
+        guiargs += ["--shots", os.path.abspath(args.shots)]
 
-    print(" ".join(cmd), flush=True)
     t0 = time.monotonic()
-    p = subprocess.Popen(cmd, cwd=work, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, start_new_session=True)
-    lines = []
-    try:
-        deadline = t0 + args.timeout
-        for line in p.stdout:
-            lines.append(line)
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            if time.monotonic() > deadline:
-                break
-        p.wait(timeout=max(1, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        pass
-    if p.poll() is None:
-        os.killpg(p.pid, signal.SIGKILL)
-        p.wait()
-        print("FAIL: the harness did not exit in time")
-        return 1
+    status, lines = host.run(guiargs, args.timeout)
     dt = time.monotonic() - t0
 
     problems = []
-    if p.returncode != 0:
-        problems.append(f"exit status {p.returncode}")
+    if status is None:
+        problems.append("the harness did not exit in time")
+    elif status != 0:
+        problems.append(f"exit status {status}")
     out = "".join(lines)
-    if args.mode == "drive":
+    if args.mode in ("drive", "e2e"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")
@@ -177,41 +420,38 @@ def main():
                 problems.append("checklist: " + s.strip())
         if "STALE" in out:
             problems.append("stale frames reported")
-        after = open(ini).read()
-        changed = [(a, b) for a, b in zip(before.splitlines(), after.splitlines()) if a != b]
-        if len(before.splitlines()) != len(after.splitlines()) or len(changed) != 1:
-            problems.append(f"the configuration changed in {len(changed)} lines")
+        after = host.read(ini) or ""
+        diff = list(difflib.unified_diff(before.splitlines(), after.splitlines(),
+                                         lineterm="", n=0))
+        body = [l for l in diff if l[:1] in "+-" and l[:3] not in ("+++", "---")]
+        added = [l for l in body if l.startswith("+")]
+        if len(added) != 1 or len(body) > 2:
+            problems.append(f"the configuration diff is not one line: {body}")
         else:
-            print(f"configuration diff: {changed[0][0]!r} -> {changed[0][1]!r}")
+            print("configuration diff: " + " | ".join(body))
         # Gone: the cancelled command, and the one quitting stopped
         time.sleep(0.5)
         for name in ("cancel", "close"):
-            pid = readpid(os.path.join(work, f"{name}.pid"))
+            text = host.read(host.path("work", f"{name}.pid"))
+            pid = int(text.strip()) if text and text.strip().isdigit() else None
             if pid is None:
                 problems.append(f"no {name}.pid")
-            elif alive(pid):
+            elif host.alive(pid):
                 problems.append(f"the {name} command (pid {pid}) is still running")
             else:
                 print(f"{name}: pid {pid} gone")
-    left = strays(root)
+    left = host.strays()
     if left:
         problems.append("processes left: " + "; ".join(left))
-        for line in left:
-            try:
-                os.kill(int(line.split()[0]), signal.SIGKILL)
-            except (OSError, ValueError):
-                pass
 
     srv.shutdown()
-    if not args.keep:
-        shutil.rmtree(root, ignore_errors=True)
-    else:
-        print(f"kept {root}")
+    host.close(args.keep)
     if problems:
         for msg in problems:
             print("FAIL: " + msg)
         return 1
-    print(f"ok: {args.mode}{' (subprocess)' if args.subprocess else ''} in {dt:.1f} s")
+    where = f" on {args.host}" if args.host else ""
+    print(f"ok: {args.mode}{' (subprocess)' if args.subprocess else ''}{where} in {dt:.1f} s")
     return 0
 
 
