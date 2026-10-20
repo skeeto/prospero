@@ -815,6 +815,17 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->bytes   = jsonint(jsonget(j, "bytes"), 0);
         m->seq     = r->seq;
         toolbody(v, scratch, m, jsonstr(jsonget(j, "text")));
+        // A call ends its ask, which after a crash has no answer
+        for (iz i = v->msgs.len-1; i >= 0; i--) {
+            ViewMsg *k = &v->msgs[i];
+            if (k->role==VIEW_ASK && k->tool->call==call && k->tool->answer==VASK_PENDING) {
+                k->tool->answer = VASK_DENIED;
+                k->tool->by     = "interrupted";
+                k->ver++;
+                v->asks--;
+                v->topsdirty = 1;
+            }
+        }
         if (t->status != VTOOL_OK) {
             m->collapsed = 0;  // what went wrong
         } else if (t->name == "shell") {

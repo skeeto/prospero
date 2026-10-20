@@ -297,6 +297,21 @@ static void test_view(Test *t)
         expect(t, "view.deniedopen", istr(&a, v->msgs[0].collapsed), "0");
     }
 
+    // A crash while asking leaves no answer, and recovery ends the call:
+    // its end closes the card too
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"c4","name":"write","args":"{\"path\":\"../z\",\"content\":\"z\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"ask","req":"c4/ask","call":"c4","kind":"path",)"
+                    R"("tool":"write","path":"/x/z","detail":"outside","deadline":30000,"dflt":"deny"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"tool.end","call":"c4","status":"cancelled",)"
+                    R"("text":"Not run: the harness stopped before this call started."})");
+        ViewTool *k = v->msgs[1].tool;
+        expect(t, "view.askcrash", istr(&a, v->asks*100 + k->answer*10 + (k->by=="interrupted")), "21");
+    }
+
     // A successful write shows its content as added lines
     {
         Arena a = perm;

@@ -662,7 +662,8 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
                       t->by=="timeout" ? Str(": nobody answered in time") :
                       t->by=="steer"   ? Str(": you sent a message instead") :
                       t->by=="cancel"  ? Str(": the turn was cancelled") :
-                      t->by=="policy"  ? Str(": nobody could answer") : Str(""));
+                      t->by=="policy"  ? Str(": nobody could answer") :
+                      t->by=="interrupted" ? Str(": the harness stopped while asking") : Str(""));
             pen(p, finish(&c), STYLE_BOLD, ok ? C_OK : C_BAD);
         }
     } break;
