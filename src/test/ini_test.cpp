@@ -1248,10 +1248,239 @@ static void testinigraph(Test *t)
     expect(t, "graph.deep", istr(&a, deep > 5), "1");
 }
 
+// The writer: exact output for each kind of edit.
+static void testiniwrite(Test *t)
+{
+    static struct {
+        Str in, kind, name, key, value;
+        b32 rm;
+        Str want;
+        iz  line;
+        b32 changed;
+    } cases[] = {
+        // Set in place: only the value span changes
+        {"# c\n[endpoint local]\nurl = http://a/  # here\n",
+         "endpoint", "local", "url", "http://b/", 0,
+         "# c\n[endpoint local]\nurl = http://b/  # here\n", 3, 1},
+        {"[s]\n\tk\t=\t\"v\"\t# c\n", "s", "", "k", "w", 0,
+         "[s]\n\tk\t=\tw\t# c\n", 2, 1},
+        {"[s]\na = \"x\"\n", "s", "", "a", "x", 0, "[s]\na = \"x\"\n", 2, 0},
+        {"[s]\na = 1 # c\n", "s", "", "a", "", 0, "[s]\na =  # c\n", 2, 1},
+        {"[s]\na = 1\n", "s", "", "a", "  x # y ", 0,
+         "[s]\na = \"  x # y \"\n", 2, 1},
+        {"[s]\na = 1\n[t]\n[s]\na = 2\n", "s", "", "a", "3", 0,
+         "[s]\na = 1\n[t]\n[s]\na = 3\n", 5, 1},
+        {"\xef\xbb\xbf[s]\r\na = 1\r\n", "s", "", "a", "2", 0,
+         "\xef\xbb\xbf[s]\r\na = 2\r\n", 2, 1},
+        {"x = 1", "", "", "x", "2", 0, "x = 2", 1, 1},
+
+        // Add a key after the section's last key, indented alike
+        {"[s]\n  a = 1\n  # note\n\n[t]\n", "s", "", "b", "2", 0,
+         "[s]\n  a = 1\n  b = 2\n  # note\n\n[t]\n", 3, 1},
+        {"[s]\na = 1\n[t]\nb = 1\n[s]\nc = 1\n[u]\n", "s", "", "d", "1", 0,
+         "[s]\na = 1\n[t]\nb = 1\n[s]\nc = 1\nd = 1\n[u]\n", 7, 1},
+        {"[s]\n\n[t]\nx = 1\n", "s", "", "b", "2", 0,
+         "[s]\nb = 2\n\n[t]\nx = 1\n", 2, 1},
+        {"  [s] # c\n", "s", "", "b", "2", 0, "  [s] # c\n  b = 2\n", 2, 1},
+        {"[s]", "s", "", "b", "2", 0, "[s]\nb = 2\n", 2, 1},
+        {"[s]\r\na = 1\r\n", "s", "", "b", "2", 0,
+         "[s]\r\na = 1\r\nb = 2\r\n", 3, 1},
+
+        // Add a section at the end, after a blank line
+        {"a = 1\n", "endpoint", "x", "url", "http://h/", 0,
+         "a = 1\n\n[endpoint x]\nurl = http://h/\n", 4, 1},
+        {"[s]\nk = v\n\n", "t", "", "k", "1", 0,
+         "[s]\nk = v\n\n[t]\nk = 1\n", 5, 1},
+        {"[s]\nk = v", "t", "u", "k", "1", 0,
+         "[s]\nk = v\n\n[t u]\nk = 1\n", 5, 1},
+        {"", "guard", "", "roots", "/x; ~/y", 0,
+         "[guard]\nroots = /x; ~/y\n", 2, 1},
+        {"[a b c]\nk = 1\n", "a", "b", "k", "2", 0,
+         "[a b c]\nk = 1\n\n[a b]\nk = 2\n", 5, 1},
+        {"\xef\xbb\xbf# c\r\n", "s", "", "k", "1", 0,
+         "\xef\xbb\xbf# c\r\n\r\n[s]\r\nk = 1\r\n", 4, 1},
+
+        // Top-level keys: after the last top-level key or include, else
+        // before the comments leading into the first header
+        {"x = 1\ninclude = t.ini\n\n# about s\n[s]\n", "", "", "y", "2", 0,
+         "x = 1\ninclude = t.ini\ny = 2\n\n# about s\n[s]\n", 3, 1},
+        {"# header\n\n# about s\n[s]\nk = v\n", "", "", "y", "2", 0,
+         "# header\n\ny = 2\n\n# about s\n[s]\nk = v\n", 3, 1},
+        {"[s]\n", "", "", "y", "2", 0, "y = 2\n\n[s]\n", 1, 1},
+        {"# only comments\n", "", "", "y", "2", 0,
+         "# only comments\ny = 2\n", 2, 1},
+        {"", "", "", "y", "2", 0, "y = 2\n", 1, 1},
+
+        // Remove: every definition in the section, nothing else
+        {"[s]\na = 1 # c\nb = 2\n", "s", "", "a", {}, 1, "[s]\nb = 2\n", 0, 1},
+        {"[s]\na = 1\n[s]\na = 2\n[t]\na = 3\n", "s", "", "a", {}, 1,
+         "[s]\n[s]\n[t]\na = 3\n", 0, 1},
+        {"[s]\na = 1\nb = 2", "s", "", "b", {}, 1, "[s]\na = 1\n", 0, 1},
+        {"[s]\na = 1\n", "s", "", "z", {}, 1, "[s]\na = 1\n", 0, 0},
+        {"a = 1\n[s]\na = 2\n", "", "", "a", {}, 1, "[s]\na = 2\n", 0, 1},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        Arena    a   = t->perm;
+        Ini      ini = {};
+        IniFile *f   = iniparse(&ini, &a, "", cases[i].in);
+        Str      v   = cases[i].rm ? Str{} : cases[i].value;
+        IniEdit  e   = iniedit(&a, f, cases[i].kind, cases[i].name,
+                               cases[i].key, v);
+        Str name = concat(&a, cases[i].in, " => ");
+        name = concat(&a, name, cases[i].key);
+        expect(t, name, e.text, cases[i].want);
+        expect(t, concat(&a, name, " (line)"), istr(&a, e.line),
+               istr(&a, cases[i].line));
+        expect(t, concat(&a, name, " (changed)"), istr(&a, e.changed),
+               istr(&a, cases[i].changed));
+    }
+
+    // Refusals
+    static struct { Str kind, name, key, value; } bad[] = {
+        {"s", "", "a b", "1"},
+        {"s", "", "include", "1"},
+        {"s", "", "#a", "1"},
+        {"s", "", "a=b", "1"},
+        {"s", "", "", "1"},
+        {"s]", "", "a", "1"},
+        {"s", "x y", "a", "1"},
+        {"", "x", "a", "1"},
+        {"s", "", "a", "two\nlines"},
+    };
+    for (iz i = 0; i < countof(bad); i++) {
+        Arena    a   = t->perm;
+        Ini      ini = {};
+        IniFile *f   = iniparse(&ini, &a, "", "[s]\na = 1\n");
+        IniEdit  e   = iniedit(&a, f, bad[i].kind, bad[i].name, bad[i].key,
+                               bad[i].value);
+        Str name = concat(&a, "refuse ", bad[i].key);
+        expect(t, name, istr(&a, !e.text.data && e.err.len), "1");
+    }
+}
+
+// Line count of a text, as the parser counts after a BOM.
+static iz inilinecount(Str s)
+{
+    if (startswith(s, "\xef\xbb\xbf")) {
+        s = cuthead(s, 3);
+    }
+    iz n = 0;
+    for (iz i = 0; i < s.len; i++) {
+        n += s[i] == '\n';
+    }
+    return n + (s.len && s[s.len-1]!='\n');
+}
+
+// Every winning definition in a single-file Ini as "kind:name:key=value"
+// lines, skipping one key.
+static Str inidump(Arena *a, Ini *ini, Str kind, Str name, Str key)
+{
+    Buf b(a, 256);
+    for (IniSection *s = ini->sections; s; s = s->next) {
+        for (IniEntry *e = s->keys; e; e = e->next) {
+            if (s->kind==kind && s->name==name && e->key==key) {
+                continue;
+            }
+            print(&b, s->kind);
+            putbyte(&b, ':');
+            print(&b, s->name);
+            putbyte(&b, ':');
+            print(&b, e->key);
+            putbyte(&b, '=');
+            print(&b, e->value);
+            putbyte(&b, '\n');
+        }
+    }
+    return finish(&b);
+}
+
+// Random edits of random texts: the edited key takes the value (or is
+// gone), everything else keeps its value, no line becomes invalid, and
+// the line count changes only by what the edit adds or drops.
+static void testiniwriterandom(Test *t)
+{
+    static Str pieces[] = {
+        "k = 1\n", "j = \"2\" # c\n", "  k = 3\n", "[s]\n", "[s t]\n",
+        "  [t] # c\n", "[a b c]\n", "# c\n", "; c\n", "\n", "\r\n", "junk\n",
+        "include = x.ini\n", "k = 4", "[s]", "j=5\r\n",
+    };
+    static Str kinds[] = {"", "s", "s", "t", "u"};
+    static Str names[] = {"", "", "t"};
+    static Str keys[]  = {"k", "j", "new"};
+    static Str values[] = {"1", "v", "", " padded ", "x # y", "\"q\"", "#z"};
+    u64 rng = 7;
+    i32 bad = 0;
+    for (i32 n = 0; n < 20000; n++) {
+        Arena a = t->perm;
+        Buf   b(&a, 256);
+        iz    count = inirand(&rng) % 9;
+        // A BOM only leads: one mid-file means something else once an
+        // edit moves it to the start
+        if (!(inirand(&rng) % 8)) {
+            print(&b, "\xef\xbb\xbf");
+        }
+        for (iz i = 0; i < count; i++) {
+            print(&b, pieces[inirand(&rng) % countof(pieces)]);
+        }
+        Str src  = finish(&b);
+        Str kind = kinds[inirand(&rng) % countof(kinds)];
+        Str name = kind.len ? names[inirand(&rng) % countof(names)] : Str("");
+        Str key  = keys[inirand(&rng) % countof(keys)];
+        b32 rm   = !(inirand(&rng) % 4);
+        Str val  = rm ? Str{} : values[inirand(&rng) % countof(values)];
+
+        Ini      before = {};
+        IniFile *f      = iniparse(&before, &a, "", src);
+        iz       invalid0 = 0;
+        for (iz i = 0; i < f->lines.len; i++) {
+            invalid0 += f->lines[i].type == INI_INVALID;
+        }
+        IniEntry *old = inilookup(&before, kind, name, key);
+        IniEdit   e   = iniedit(&a, f, kind, name, key, val);
+
+        Ini      after = {};
+        IniFile *g     = iniparse(&after, &a, "", e.text);
+        iz       invalid1 = 0;
+        for (iz i = 0; i < g->lines.len; i++) {
+            invalid1 += g->lines[i].type == INI_INVALID;
+        }
+        IniEntry *now  = inilookup(&after, kind, name, key);
+        Str       why  = {};
+        iz        diff = inilinecount(e.text) - inilinecount(src);
+        if (!e.text.data) {
+            why = "failed";
+        } else if (rm ? now!=0 : !now || !(now->value==val)) {
+            why = "value";
+        } else if (!rm && (e.line<1 || e.line>g->lines.len ||
+                           &g->lines[e.line-1]!=now->line)) {
+            why = "line";
+        } else if (!(inidump(&a, &before, kind, name, key) ==
+                     inidump(&a, &after, kind, name, key))) {
+            why = "others";
+        } else if (invalid0 != invalid1) {
+            why = "invalid";
+        } else if (g->bom != f->bom) {
+            why = "bom";
+        } else if (e.changed != !(e.text == src)) {
+            why = "changed";
+        } else if (rm ? diff>0 : old ? diff!=0 : diff<1 || diff>3) {
+            why = "line count";
+        }
+        if (why.len && !bad++) {
+            expect(t, concat(&a, concat(&a, "random edit: ", why), src),
+                   e.text, "");
+        }
+    }
+    Arena a = t->perm;
+    expect(t, "edit.random.failures", istr(&a, bad), "0");
+}
+
 static void test_ini(Test *t)
 {
     testiniparse(t);
     testiniedit(t);
+    testiniwrite(t);
+    testiniwriterandom(t);
     testinilayers(t);
     testinipaths(t);
     testiniinclude(t);

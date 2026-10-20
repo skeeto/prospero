@@ -338,23 +338,6 @@ static Str defaultstate(Os *os, Arena *a)
     return join(a, join(a, home, ".local/state"), "harness");
 }
 
-static Str defaultconfig(Os *os, Arena *a)
-{
-    Str base = os_getenv(os, a, "XDG_CONFIG_HOME");
-    if (base.len) {
-        return join(a, join(a, base, "harness"), "harness.ini");
-    }
-    Str home = os_getenv(os, a, "HOME");
-    if (home.len) {
-        return join(a, join(a, home, ".config/harness"), "harness.ini");
-    }
-    Str appdata = os_getenv(os, a, "APPDATA");
-    if (appdata.len) {
-        return join(a, join(a, appdata, "harness"), "harness.ini");
-    }
-    return {};
-}
-
 static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 headless)
 {
     Cli c = {};
@@ -393,20 +376,22 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
         return 2;
     }
 
-    Ini *ini = alloc<Ini>(&perm);
-    Str  cfg = config.len ? config : defaultconfig(os, &perm);
-    if (cfg.len && (config.len || os_stat(os, scratch, cfg).type==STAT_FILE)) {
-        if (!iniload(ini, os, &perm, cfg) && config.len) {
-            os_print(os, 2, "harness: cannot read the configuration file\n");
-            return 2;
-        }
-        for (iz i = 0; i < ini->diags.len; i++) {
-            Buf b(&scratch, 256);
-            print(&b, "harness: ");
-            print(&b, ini->diags[i]);
-            putbyte(&b, '\n');
-            os_print(os, 2, finish(&b));
-        }
+    // An explicit file must exist; the default one is seeded on first run
+    Str     path = config.len ? config : cfgdefault(os, &perm);
+    Config *cfg  = newconfig(os, &perm, scratch, path, !config.len);
+    if (!cfg) {
+        os_print(os, 2, "harness: out of memory\n");
+        return 2;
+    } else if (config.len && !cfg->user) {
+        os_print(os, 2, "harness: cannot read the configuration file\n");
+        return 2;
+    }
+    for (iz i = 0; i < cfg->ini->diags.len; i++) {
+        Buf b(&scratch, 256);
+        print(&b, "harness: ");
+        print(&b, cfg->ini->diags[i]);
+        putbyte(&b, '\n');
+        os_print(os, 2, finish(&b));
     }
 
     c.statedir = state.len ? state : defaultstate(os, &perm);
@@ -418,7 +403,7 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 
     c.spare = os_reserve(os, sizeof(void *)==8 ? (iz)1<<32 : (iz)1<<27);
     c.out   = c.spare ? newmailbox(&perm, 4<<20, 0, 0) : 0;
-    c.e   = c.out ? newengine(os, &perm, ini, c.statedir, c.out) : 0;
+    c.e   = c.out ? newengine(os, &perm, cfg, c.statedir, c.out) : 0;
     if (!c.e || !enginestart(c.e)) {
         os_print(os, 2, "harness: cannot start the engine\n");
         return 2;

@@ -72,11 +72,12 @@ class LocalHost:
         except OSError:
             return None
 
-    def popen(self, args, cwd, stdin=False):
+    def popen(self, args, cwd, stdin=False, env=None):
         return subprocess.Popen(
             [self.harness] + args, cwd=cwd,
             stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=dict(os.environ, **env) if env else None,
             text=True, encoding="utf-8", errors="replace", bufsize=1)
 
     def alive(self, pid):
@@ -163,11 +164,14 @@ class SshHost:
             return None
         return base64.b64decode("".join(out.split())).decode("utf-8", "replace")
 
-    def popen(self, args, cwd, stdin=False):
+    def popen(self, args, cwd, stdin=False, env=None):
         def q(a):
             return '"' + a + '"' if (" " in a or not a) else a
         win = lambda p: p.replace("/", "\\")
-        cmd = f"cd /d {win(cwd)} && {win(self.exe)} " + " ".join(q(a) for a in args)
+        # cmd.exe keeps a blank before && in the value, hence the quotes
+        sets = "".join(f'set "{k}={v}"&& ' for k, v in (env or {}).items())
+        cmd = (f"{sets}cd /d {win(cwd)} && {win(self.exe)} " +
+               " ".join(q(a) for a in args))
         return subprocess.Popen(
             ["ssh", "-S", self.ctl, self.host, cmd],
             stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
@@ -238,20 +242,25 @@ class T:
         self.model = f"fake:{name}:{self.nonce}"
         fake_provider.STATE.register(self.model)
         base = host.join(host.root, f"{name}-{self.nonce}")
+        self.base = base
         self.work = host.join(base, "work")
         self.state = host.join(base, "state")
         self.config = host.join(base, "harness.ini")
         host.mkdir(self.work)
         host.mkdir(self.state)
-        # Endpoint settings, and with "_top" settings before any section
+        # Endpoint settings, with "_top" settings before any section and
+        # "_guard" settings in [guard]
         conf = dict(conf or {})
         top = conf.pop("_top", {})
+        guard = conf.pop("_guard", {})
         ini = {"first_byte_timeout": 5, "idle_timeout": 3,
                "progress_timeout": 6, "connect_timeout": 2}
         ini.update(conf)
         body = "".join(f"{k} = {v}\n" for k, v in top.items())
         body += f"[endpoint fake]\nurl = {host.url}/\n" + "".join(
             f"{k} = {v}\n" for k, v in ini.items())
+        if guard:
+            body += "[guard]\n" + "".join(f"{k} = {v}\n" for k, v in guard.items())
         host.write(self.config, body)
         self.notes = []
 
@@ -863,7 +872,7 @@ def ask_deny(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
-@scenario(conf={"_top": {"ask_timeout": 2}}, bound=10)
+@scenario(conf={"_guard": {"ask_timeout": 2}}, bound=10)
 def ask_timeout(t):
     h = t.headless()
     try:
@@ -999,6 +1008,136 @@ def quit_stop(t):
     end = h.all("turn.end", sid)
     t.check(end and end[-1]["why"] == "cancel", f"the turn ended: {end}")
     t.check(pids and t.gone(pids), f"its process is gone: {pids}")
+
+
+@scenario(bound=20)
+def config(t):
+    """config.get and config.set: one-line edits that keep comments, an
+    include never touched, refusals, and settings reaching a running
+    session, from an edit and from the file changing underneath."""
+    team = t.host.join(t.base, "team.ini")
+    shared = "# shared\n[model shared]\ntemperature = 0.1\n"
+    t.host.write(team, shared)
+    lines = ["# scenario settings", "include = team.ini", "",
+             "# the fake provider", "[endpoint fake]",
+             f"url = {t.host.url}/   # local", "first_byte_timeout = 5",
+             "idle_timeout = 3", "progress_timeout = 6", "connect_timeout = 2",
+             "colour = blue"]
+    t.host.write(t.config, "\n".join(lines) + "\n")
+    model = t.model.replace(":config:", ":plain:")
+    fake_provider.STATE.register(model)
+
+    def text():
+        return t.host.read(t.config).split("\n")[:-1]
+
+    h = t.headless()
+    try:
+        def call(cmd, **fields):
+            i = h.send(cmd, **fields)
+            return h.wait(lambda e: e.get("ev") == "reply" and e.get("id") == i)
+
+        def turn(prompt):
+            with h.cond:
+                done = sum(e.get("ev") == "turn.end" for e in h.events)
+            call("prompt", sid=sid, text=prompt)
+            deadline = time.monotonic() + 10
+            with h.cond:
+                while sum(e.get("ev") == "turn.end" for e in h.events) <= done:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise Failure("the turn did not end")
+                    h.cond.wait(left)
+            return fake_provider.STATE.log(model)[-1]["body"]
+
+        r = call("config.get")
+        t.check(r["ok"] == 1 and r["exists"] == 1, f"config.get: {r}")
+        t.check(r["path"].endswith("harness.ini") and len(r["files"]) == 2
+                and r["files"][1].endswith("team.ini"), f"files {r['files']}")
+        d = r["diags"]
+        t.check(len(d) == 1 and (d[0]["line"], d[0]["col"], d[0]["severity"])
+                == (11, 1, "warning") and "colour" in d[0]["message"],
+                f"diagnostics {d}")
+        got = {(s["kind"], s["name"], s["key"]): s for s in r["settings"]}
+        idle = got[("endpoint", "fake", "idle_timeout")]
+        t.check((idle["value"], idle["line"], idle["default"]) == ("3", 8, 0),
+                f"idle_timeout {idle}")
+        temp = got[("model", "shared", "temperature")]
+        t.check(temp["file"].endswith("team.ini") and temp["line"] == 3,
+                f"provenance {temp}")
+        key = got[("endpoint", "fake", "key")]
+        t.check(key["default"] == 1 and key["file"] == "", f"default {key}")
+        t.check(len(r["schema"]) >= 20 and len(r["kinds"]) == 5, "schema")
+
+        # One edit, one changed line
+        r = call("config.set", kind="endpoint", name="fake",
+                 key="idle_timeout", value="4")
+        t.check(r["ok"] == 1 and r["line"] == 8, f"config.set: {r}")
+        after = text()
+        diff = [i for i in range(len(lines)) if lines[i] != after[i]]
+        t.check(len(after) == len(lines) and diff == [7] and
+                after[7] == "idle_timeout = 4", f"one-line diff: {after}")
+
+        # Refusals change nothing
+        for fields, why in [({"key": "colour", "value": "red"}, "unknown key"),
+                            ({"key": "idle_timeout", "value": "soon"}, "seconds"),
+                            ({"key": "key", "value": "sk-plain"}, "env:NAME")]:
+            r = call("config.set", kind="endpoint", name="fake", **fields)
+            t.check(r["ok"] == 0 and why in r.get("err", ""), f"refusal: {r}")
+            t.check(len(r["diags"]) == 1, "diagnostics come with refusals")
+        t.check(text() == after, "refusals leave the file alone")
+
+        # A new section, then a session using it
+        r = call("config.set", kind="model", name=model, key="temperature",
+                 value="0.25")
+        t.check(r["ok"] == 1 and r["line"] == len(lines) + 3, f"new section {r}")
+        t.check(text()[len(lines):] == ["", f"[model {model}]",
+                                         "temperature = 0.25"], "appended")
+        r = call("new", cwd=t.work, model=model, endpoint="fake")
+        sid = r["sid"]
+        body = turn("one")
+        t.check(body.get("temperature") == 0.25, f"edited: {body}")
+
+        # Edited by hand while the session lives: the fingerprint changes
+        time.sleep(1.1)
+        edited = text()
+        edited[-1] = "temperature = 0.75   # by hand"
+        t.host.write(t.config, "\n".join(edited) + "\n")
+        time.sleep(1.1)
+        body = turn("two")
+        t.check(body.get("temperature") == 0.75, f"reloaded: {body}")
+
+        r = call("config.set", kind="model", name=model, key="temperature",
+                 value=None)
+        t.check(r["ok"] == 1 and r["line"] == 0, f"removed: {r}")
+        t.check(text() == edited[:-1], "the line is gone")
+        body = turn("three")
+        t.check("temperature" not in body, f"no temperature: {body}")
+        t.check(t.host.read(team) == shared, "the include is never edited")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def config_seed(t):
+    """Without a configuration file, the first run writes the seed byte for
+    byte, and it loads without a single diagnostic."""
+    xdg = t.host.join(t.base, "xdg")
+    p = t.host.popen(["--headless", "--state", t.state], t.work, stdin=True,
+                     env={"XDG_CONFIG_HOME": xdg})
+    out, err = p.communicate('{"cmd":"config.get","id":1}\n', timeout=10)
+    replies = [json.loads(x) for x in out.splitlines() if x.strip()]
+    r = next((e for e in replies if e.get("id") == 1), {})
+    seedpath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "assets", "harness.ini")
+    with open(seedpath, "rb") as f:
+        seed = f.read().decode()
+    written = t.host.read(t.host.join(xdg, "harness", "harness.ini"))
+    t.check(written == seed, "the seed is written unchanged")
+    t.check(r.get("ok") == 1 and r.get("diags") == [] and r.get("rev") == 1,
+            f"config.get {r} {err}")
+    t.check(r["path"].endswith("harness/harness.ini"), f"path {r['path']}")
+    t.check(p.returncode == 0, f"exit {p.returncode}: {err}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

@@ -34,7 +34,7 @@
 // frontend that can answer has it open, which the frontend declares with
 // attended:1 on new or open (and close ends). Unattended, an ask is
 // denied at once by policy. Attended, the session logs an ask with a
-// deadline (ask_timeout, 30 s by default) and waits in its own state,
+// deadline ([guard] ask_timeout, 30 s by default) and waits in its own state,
 // blocking nothing else: an answer resolves it, the deadline denies it,
 // and so does a steer, whose text the agent reads next. Every denial is
 // the call's tool result, explaining what to do instead. The log holds
@@ -68,7 +68,6 @@ enum : i64 {
     MODELS_MAX   = 8 << 20,
     LOG_MAX      = (i64)1 << 30,
     SSE_MAX      = 16 << 20,      // longest line or event of a stream
-    ASK_WAIT     = 30*SEC,        // default deadline of an attended ask
     QUIT_WAIT    = 5*SEC,         // for turns to end after quit
     LIVE_EVERY   = 1*SEC,         // live records while a request runs
     TITLE_MAX    = 60,            // code points
@@ -126,6 +125,7 @@ static struct {
 static_assert(countof(nudgeinfo) == N_COUNT);
 
 struct Endpoint {
+    Str name;       // its configured section, empty if none
     Str url;
     Str key;        // bearer token, empty if none
     i64 firstbyte;  // watchdogs, in ticks
@@ -241,7 +241,8 @@ struct Engine {
     Region     *replay;   // log copies for replays, which need two arenas
     Mailbox    *in;
     Mailbox    *out;
-    Ini        *ini;
+    Config     *cfg;
+    Ini        *ini;      // cfg->ini, until the next reload
     Str         statedir;
     Str         exedir;
     Str         home;     // for "~" in paths
@@ -556,7 +557,6 @@ static b32 startreq(Session *s, Arena scratch, Str method, Str url, Str body,
 
 static void endturn(Session *, Arena, Str why, Str err);
 static void prepare(Session *, Arena);
-static i64  seconds(Ini *, Str kind, Str name, Str key, i64 dflt);
 static void finalize(Session *, Arena);
 static void nexttool(Session *, Arena);
 
@@ -1191,7 +1191,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     k->opened      = os_ticks(e->os);
 
     b32 wait  = s->attended && !s->steered;
-    i64 delay = seconds(e->ini, "", "", "ask_timeout", ASK_WAIT);
+    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     {
         Str   why = guardwhy(&scratch, toolnames[tool], gp, s->guard.cwd);
         Buf   b(&scratch, 512 + why.len);
@@ -1708,34 +1708,20 @@ static Str newsid(Os *os, Arena *a)
     return finish(&b);
 }
 
-static i64 seconds(Ini *ini, Str kind, Str name, Str key, i64 dflt)
-{
-    Str v = iniget(ini, kind, name, key);
-    if (v.data) {
-        Float f = parsefloat(trim(v));
-        if (f.ok && f.val>0 && f.val<1e7) {
-            return (i64)(f.val * (f64)SEC);
-        }
-    }
-    return dflt;
-}
-
 // Resolve an endpoint by URL or by name. Settings come from the section
-// of that name, or the section whose url matches.
+// of that name, or the section whose url matches, over the schema's
+// defaults (config.cpp).
 static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
 {
-    Ini *ini  = e->ini;
-    Str  name = {};
-    Str  url  = which;
+    Config *cfg  = e->cfg;
+    Str     name = {};
+    Str     url  = which;
     if (!parseurl(which).ok) {
         name = which;
-        url  = iniget(ini, "endpoint", which, "url");
-        if (!url.data) {
-            return 0;
-        }
+        url  = trim(cfgget(cfg, "endpoint", which, "url", 0));
     } else {
-        for (IniSection *s = inifirst(ini, "endpoint"); s; s = ininext(s)) {
-            if (iniget(ini, "endpoint", s->name, "url") == url) {
+        for (IniSection *s = inifirst(e->ini, "endpoint"); s; s = ininext(s)) {
+            if (iniget(e->ini, "endpoint", s->name, "url") == url) {
                 name = s->name;
             }
         }
@@ -1745,19 +1731,13 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
         return 0;
     }
     b32 local = localhost(u.host);
+    ep->name      = clone(perm, name);
     ep->url       = clone(perm, url);
-    ep->firstbyte = seconds(ini, "endpoint", name, "first_byte_timeout",
-                            local ? 1800*SEC : 300*SEC);
-    ep->idle      = seconds(ini, "endpoint", name, "idle_timeout", 90*SEC);
-    ep->progress  = seconds(ini, "endpoint", name, "progress_timeout", 600*SEC);
-    ep->connectms = (i32)(seconds(ini, "endpoint", name, "connect_timeout",
-                                  local ? 5*SEC : 15*SEC) / MS);
-    Str key = iniget(ini, "endpoint", name, "key");
-    if (startswith(key, "env:")) {
-        ep->key = os_getenv(e->os, perm, trim(cuthead(key, 4)));
-    } else if (key.len) {
-        ep->key = clone(perm, trim(key));  // discouraged, but honored
-    }
+    ep->firstbyte = cfgms(cfg, "endpoint", name, "first_byte_timeout", local)*MS;
+    ep->idle      = cfgms(cfg, "endpoint", name, "idle_timeout", local)*MS;
+    ep->progress  = cfgms(cfg, "endpoint", name, "progress_timeout", local)*MS;
+    ep->connectms = (i32)cfgms(cfg, "endpoint", name, "connect_timeout", local);
+    ep->key       = cfgsecret(cfg, perm, "endpoint", name, "key");
     return 1;
 }
 
@@ -1767,21 +1747,18 @@ static void modelconf(Engine *e, Arena *perm, Str model, ModelConf *mc)
         "temperature", "top_p", "top_k", "min_p", "presence_penalty",
         "frequency_penalty", "repeat_penalty", "seed", "max_tokens",
     };
-    Ini *ini = e->ini;
-    mc->name      = clone(perm, model);
-    mc->reasoning = "reasoning_content";
-    Str r = trim(iniget(ini, "model", model, "reasoning"));
-    if (r.data) {
-        mc->reasoning = r=="none" || r=="never" ? Str{} : clone(perm, r);
-    }
+    Config *cfg = e->cfg;
+    mc->name = clone(perm, model);
+    Str r = trim(cfgget(cfg, "model", model, "reasoning", 0));
+    mc->reasoning = r=="none" || r=="never" ? Str{} : clone(perm, r);
     for (iz i = 0; i < countof(sampling); i++) {
-        Str v = trim(iniget(ini, "model", model, sampling[i]));
+        Str v = trim(cfgget(cfg, "model", model, sampling[i], 0));
         if (v.len && parsefloat(v).ok) {
             Extra x = {sampling[i], clone(perm, v)};
             mc->extras = push(perm, mc->extras, x);
         }
     }
-    Int ctx = parseint(trim(iniget(ini, "model", model, "context")));
+    Int ctx = parseint(trim(cfgget(cfg, "model", model, "context", 0)));
     mc->ctx = ctx.ok && ctx.val>0 ? ctx.val : 0;
 }
 
@@ -1833,11 +1810,11 @@ static Str lockpath(Arena *a, Session *s)
     return join(a, s->dir, "lock");
 }
 
-// Extra workspace roots from the configuration: "roots = A; B".
+// Extra workspace roots from the configuration: "[guard] roots = A; B".
 static Slice<Str> confroots(Engine *e, Arena *a)
 {
     Slice<Str> r = {};
-    for (Str rest = iniget(e->ini, "", "", "roots"); rest.len;) {
+    for (Str rest = cfgget(e->cfg, "guard", "", "roots", 0); rest.len;) {
         Cut c = cut(rest, ';');
         Str p = trim(c.head);
         if (p.len) r = push(a, r, clone(a, p));
@@ -2232,6 +2209,65 @@ static void cmdlist(Engine *e, Arena scratch, i64 id)
     reply(e, scratch, id, 1, {}, {});
 }
 
+// After the configuration reloads: each session takes up its endpoint's
+// and model's settings for its next request.
+static void reconfigure(Engine *e)
+{
+    e->ini = e->cfg->ini;
+    for (Session *s = e->sessions; s; s = s->next) {
+        Str      which = s->ep.name.len ? s->ep.name : s->ep.url;
+        Endpoint ep    = {};
+        if (endpointconf(e, &s->perm, which, &ep)) {
+            s->ep = ep;
+        }
+        ModelConf mc = {};
+        modelconf(e, &s->perm, s->model, &mc);
+        mc.llamacpp = s->mc.llamacpp;  // learned by discovery
+        mc.ctx      = mc.ctx ? mc.ctx : s->mc.ctx;
+        s->mc = mc;
+    }
+}
+
+// config.get and config.set, with the shapes in config.cpp.
+static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
+{
+    Config *c   = e->cfg;
+    CfgSet  r   = {};
+    i64     rev = c->rev;
+    if (cmd == CMD_CONFIGGET) {
+        r.ok = 1;
+        cfgpoll(c, scratch, 1);
+    } else {
+        Json *v     = jsonget(j, "value");
+        Str   value = v->type==JSON_STRING ? (v->str.data ? v->str : Str("")) :
+                      Str{};
+        if (v->type!=JSON_STRING && v->type!=JSON_NULL) {
+            r.err = "value must be a string, or null to remove the key";
+        } else {
+            r = cfgset(c, &scratch, jsonstr(jsonget(j, "kind")),
+                       jsonstr(jsonget(j, "name")), jsonstr(jsonget(j, "key")),
+                       value);
+        }
+    }
+    if (c->rev != rev) {
+        reconfigure(e);
+    }
+
+    Buf   b(&scratch, 1<<14);
+    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", r.ok);
+    if (!r.ok) {
+        putstrkey(&w.json, "err", r.err);
+    }
+    if (cmd == CMD_CONFIGGET) {
+        putcfg(&w.json, c);
+    } else {
+        putcfgset(&w.json, c, &r);
+    }
+    emit(e, evend(&w));
+}
+
 static b32 allidle(Engine *e)
 {
     for (Session *s = e->sessions; s; s = s->next) {
@@ -2297,7 +2333,7 @@ static void command(Engine *e, Arena scratch, Str line)
     } return;
     case CMD_CONFIGGET:
     case CMD_CONFIGSET:
-        reply(e, scratch, id, 0, "not implemented", {});
+        cmdconfig(e, scratch, id, cmd, j);
         return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});
@@ -2532,7 +2568,11 @@ static void enginethread(void *arg)
             mailwait(e->in, ms);
         }
 
+        // Records mean work: catch up with configuration edits first
         Mail m = mailtake(e->in);
+        if (m.len && cfgpoll(e->cfg, newarena(e->scratch), 0)) {
+            reconfigure(e);
+        }
         for (Record r; (r = mailnext(&m)).ok;) {
             onrecord(e, newarena(e->scratch), r);
         }
@@ -2605,13 +2645,17 @@ static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir, b32 win
     return te;
 }
 
-static Engine *newengine(Os *os, Arena *perm, Ini *ini, Str statedir, Mailbox *out)
+// An engine with its configuration (config.cpp), which from now on
+// belongs to the engine thread: frontends use config.get and config.set.
+static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
+                         Mailbox *out)
 {
     b32     big = sizeof(void *) == 8;
     Engine *e   = alloc<Engine>(perm);
     e->os       = os;
     e->out      = out;
-    e->ini      = ini;
+    e->cfg      = cfg;
+    e->ini      = cfg->ini;
     e->statedir = clone(perm, statedir);
     e->in       = newmailbox(perm, 4<<20, 0, 0);
     Region *r   = os_reserve(os, big ? (iz)1<<32 : (iz)1<<27);
