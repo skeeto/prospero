@@ -30,6 +30,8 @@ static void test_guard(Test *t)
         {"//srv/share/dir", "../x", "//srv/share/x"},
         {"//srv/share/dir", "../../..", "//srv/share/"},
         {"C:\\w", ".", "C:/w"},
+        {"C:/w", "//x", "//x"},
+        {"C:/w", "/\\a\\b", "//a/b"},
     };
     for (iz i = 0; i < countof(win); i++) {
         Str got = normpath(a, win[i].cwd, win[i].path, 1);

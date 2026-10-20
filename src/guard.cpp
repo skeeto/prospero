@@ -67,7 +67,7 @@ static Str normpath(Arena *a, Str cwd, Str path, b32 win)
     for (iz i = 0; i < root; i++) {
         putbyte(&b, issep(full[i], win) ? '/' : full[i]);
     }
-    if (win && root==3) {
+    if (win && root==3 && letter(full[0]) && full[1]==':') {
         b.data[0] = (u8)(full[0] & ~0x20);  // drive letters in upper case
     }
     Slice<iz> kept = {};  // length of b before each kept component
