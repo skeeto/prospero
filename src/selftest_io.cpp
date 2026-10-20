@@ -304,14 +304,17 @@ static void testoverhead(ProcTest *p, Arena scratch)
     Str    none[] = {"/harness-selftest/no-such-program"};
     Timing rt     = timespawn(p, scratch, {none, 1, 1}, {}, 21);
     reporttiming(os, scratch, "reaper overhead", rt);
-    #if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
-    b32 instrumented = 1;
+    // The target is for the executables people run: optimized, without
+    // sanitizers, which slow the reaper's start several times over
+    #if !defined(__OPTIMIZE__) || defined(__SANITIZE_THREAD__) || \
+            defined(__SANITIZE_ADDRESS__)
+    b32 measured = 0;
     #elif defined(__has_feature)
-    b32 instrumented = __has_feature(thread_sanitizer) || __has_feature(address_sanitizer);
+    b32 measured = !__has_feature(thread_sanitizer) && !__has_feature(address_sanitizer);
     #else
-    b32 instrumented = 0;
+    b32 measured = 1;
     #endif
-    if (!instrumented) {
+    if (measured) {
         check(t, rt.median>0 && rt.median<5000, "spawn overhead under 5 ms");
     }
 }
