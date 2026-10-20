@@ -1,0 +1,500 @@
+// Events tests: name tables, record encoding, and session logs over the
+// in-memory file system (torn tails, crash recovery, seq, replay)
+
+// Append a durable record with one payload field given as raw JSON.
+static Str addrec(EventLog *log, Arena *a, i32 ev, Str key, Str raw)
+{
+    Buf   b(a, 256);
+    EvOut w = logbegin(log, &b, ev);
+    if (key.data) {
+        putkey(&w.json, key);
+        putraw(&w.json, raw);
+    }
+    return logappend(log, &w);
+}
+
+// Whole file contents, or "(missing)".
+static Str vcontents(Os *os, Arena *a, Str path)
+{
+    Read r = os_read(os, a, path, 1<<20);
+    return r.err==READ_OK ? r.data : Str("(missing)");
+}
+
+static Str joinlines(Arena *a, Slice<Str> lines)
+{
+    Buf b(a, 256);
+    for (iz i = 0; i < lines.len; i++) {
+        print(&b, lines[i]);
+    }
+    return finish(&b);
+}
+
+// Summarize an opened log for comparison.
+static Str logshow(Arena *a, EventLog *log)
+{
+    Buf b(a, 64);
+    print(&b, "ok=");
+    print(&b, (i64)log->ok);
+    print(&b, " seq=");
+    print(&b, log->seq);
+    print(&b, " turn=");
+    print(&b, log->turn);
+    print(&b, " torn=");
+    print(&b, (i64)log->torn);
+    print(&b, " bad=");
+    print(&b, (i64)log->bad);
+    print(&b, " synth=");
+    print(&b, (i64)log->synth);
+    return finish(&b);
+}
+
+static void test_events(Test *t)
+{
+    Arena perm    = t->perm;
+    perm.end      = perm.beg + (perm.end - perm.beg)/2;
+    Arena scratch = t->perm;
+    scratch.beg   = perm.end;
+    Arena *a      = &perm;
+
+    // Name tables
+    {
+        Buf durable(a, 256);
+        Buf sync(a, 256);
+        for (i32 ev = 1; ev < EV_COUNT; ev++) {
+            expect(t, evname(ev), istr(a, evfind(evname(ev))), istr(a, ev));
+            if (evdurable(ev)) {
+                print(&durable, evname(ev));
+                putbyte(&durable, ' ');
+            }
+            if (evinfo[ev].sync) {
+                print(&sync, evname(ev));
+                putbyte(&sync, ' ');
+            }
+        }
+        expect(t, "durable events", finish(&durable),
+               "session title user turn attempt assistant tool.start "
+               "tool.end ask answer retry nudge turn.end note ");
+        expect(t, "synced events", finish(&sync), "tool.start ask answer turn.end ");
+        expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
+        expect(t, "empty event", istr(a, evfind("")), istr(a, EV_NONE));
+        for (i32 cmd = 1; cmd < CMD_COUNT; cmd++) {
+            Str name = cmdname(cmd);
+            expect(t, name, istr(a, cmdfind(name)), istr(a, cmd));
+        }
+        expect(t, "cmd config.set", istr(a, cmdfind("config.set")), istr(a, CMD_CONFIGSET));
+        expect(t, "unknown cmd", istr(a, cmdfind("Quit")), istr(a, CMD_NONE));
+    }
+
+    // Encoding: fixed header order, seq only when durable, one line each
+    {
+        Buf   b(a, 64);
+        EvOut w = evbegin(&b, "20261020-153012-7f3a", 17, 1760974212345, EV_TOOLSTART);
+        putkey(&w.json, "call");
+        putstr(&w.json, "c1");
+        putkey(&w.json, "name");
+        putstr(&w.json, "shell");
+        putkey(&w.json, "args");
+        putstr(&w.json, "{\"cmd\":\"ls\\n\"}");
+        putkey(&w.json, "cwd");
+        putstr(&w.json, "/tmp");
+        expect(t, "durable record", evend(&w),
+               "{\"sid\":\"20261020-153012-7f3a\",\"seq\":17,\"ts\":1760974212345,"
+               "\"ev\":\"tool.start\",\"call\":\"c1\",\"name\":\"shell\","
+               "\"args\":\"{\\\"cmd\\\":\\\"ls\\\\n\\\"}\",\"cwd\":\"/tmp\"}\n");
+
+        w = evbegin(&b, "s", 99, 5, EV_DELTA);
+        putkey(&w.json, "turn");
+        putint(&w.json, 1);
+        putkey(&w.json, "kind");
+        putstr(&w.json, "text");
+        putkey(&w.json, "text");
+        putstr(&w.json, "Hel\nlo\r\n");
+        expect(t, "transient record", evend(&w),
+               "{\"sid\":\"s\",\"ts\":5,\"ev\":\"delta\",\"turn\":1,"
+               "\"kind\":\"text\",\"text\":\"Hel\\nlo\\r\\n\"}\n");
+
+        w = evbegin(&b, {}, 0, 6, EV_REPLY);
+        putkey(&w.json, "id");
+        putint(&w.json, 3);
+        putkey(&w.json, "ok");
+        putint(&w.json, 0);
+        putkey(&w.json, "err");
+        putstr(&w.json, "no such session");
+        expect(t, "reply without sid", evend(&w),
+               "{\"ts\":6,\"ev\":\"reply\",\"id\":3,\"ok\":0,\"err\":\"no such session\"}\n");
+
+        w = evbegin(&b, "s", 4, 7, EV_ASSISTANT);
+        putkey(&w.json, "blocks");
+        putarray(&w.json);
+        putobject(&w.json);
+        putkey(&w.json, "t");
+        putstr(&w.json, "call");
+        putkey(&w.json, "args");
+        putstr(&w.json, "{\"a\": 1}");
+        putend(&w.json);
+        putend(&w.json);
+        putkey(&w.json, "usage");
+        putobject(&w.json);
+        putkey(&w.json, "in");
+        putint(&w.json, 10);
+        putend(&w.json);
+        Str line = evend(&w);
+        expect(t, "nested payload", line,
+               "{\"sid\":\"s\",\"seq\":4,\"ts\":7,\"ev\":\"assistant\",\"blocks\":"
+               "[{\"t\":\"call\",\"args\":\"{\\\"a\\\": 1}\"}],\"usage\":{\"in\":10}}\n");
+
+        w = cmdbegin(&b, CMD_PROMPT, 3);
+        putkey(&w.json, "sid");
+        putstr(&w.json, "s");
+        putkey(&w.json, "text");
+        putstr(&w.json, "hi");
+        expect(t, "command", evend(&w), "{\"cmd\":\"prompt\",\"id\":3,\"sid\":\"s\",\"text\":\"hi\"}\n");
+
+        // Records read back
+        EvRec r = evparse(a, line);
+        Buf   s(a, 64);
+        print(&s, r.sid);
+        putbyte(&s, ' ');
+        print(&s, r.seq);
+        putbyte(&s, ' ');
+        print(&s, r.ts);
+        putbyte(&s, ' ');
+        print(&s, evname(r.ev));
+        putbyte(&s, ' ');
+        print(&s, (i64)r.ok);
+        expect(t, "evparse", finish(&s), "s 4 7 assistant 1");
+        r = evparse(a, "[1]");
+        expect(t, "evparse array", istr(a, r.ok), "0");
+        r = evparse(a, "{\"ev\":\"nope\"}");
+        expect(t, "evparse unknown", istr(a, r.ok*10 + r.ev), "10");
+    }
+
+    // A new log, written through a crash, then recovered
+    {
+        Os *os = newos(a, 1<<20);
+        Str path = "state/sessions/s1/events.jsonl";
+        os->now = 1000000;
+        EventLog log = logopen(os, a, scratch, path, "s1", 1<<20);
+        expect(t, "new log", logshow(a, &log), "ok=1 seq=0 turn=0 torn=0 bad=0 synth=0");
+        expect(t, "new log file", vcontents(os, a, path), "");
+
+        Str line = addrec(&log, a, EV_SESSION, "cwd", "\"/w\"");
+        expect(t, "first record", line, "{\"sid\":\"s1\",\"seq\":1,\"ts\":1000,\"ev\":\"session\",\"cwd\":\"/w\"}\n");
+        expect(t, "first record file", vcontents(os, a, path), line);
+        addrec(&log, a, EV_TURN, "n", "1");
+        addrec(&log, a, EV_TOOLSTART, "call", "\"c1\"");
+        addrec(&log, a, EV_TOOLSTART, "call", "\"c\\\"2\"");
+        addrec(&log, a, EV_TOOLEND, "call", "\"c1\"");
+        expect(t, "seq after writes", istr(a, log.seq), "5");
+        logclose(&log);
+        expect(t, "closed append", istr(a, !addrec(&log, a, EV_NOTE, {}, {}).data), "1");
+
+        Str before =
+            "{\"sid\":\"s1\",\"seq\":1,\"ts\":1000,\"ev\":\"session\",\"cwd\":\"/w\"}\n"
+            "{\"sid\":\"s1\",\"seq\":2,\"ts\":1000,\"ev\":\"turn\",\"n\":1}\n"
+            "{\"sid\":\"s1\",\"seq\":3,\"ts\":1000,\"ev\":\"tool.start\",\"call\":\"c1\"}\n"
+            "{\"sid\":\"s1\",\"seq\":4,\"ts\":1000,\"ev\":\"tool.start\",\"call\":\"c\\\"2\"}\n"
+            "{\"sid\":\"s1\",\"seq\":5,\"ts\":1000,\"ev\":\"tool.end\",\"call\":\"c1\"}\n";
+        expect(t, "log before crash", vcontents(os, a, path), before);
+
+        // Restart: the open tool ends as unknown, the turn as interrupted
+        os->now = 2000000;
+        log = logopen(os, a, scratch, path, "s1", 1<<20);
+        expect(t, "recovered", logshow(a, &log), "ok=1 seq=7 turn=1 torn=0 bad=0 synth=2");
+        Str after = concat(a, before,
+            "{\"sid\":\"s1\",\"seq\":6,\"ts\":2000,\"ev\":\"tool.end\",\"call\":\"c\\\"2\","
+            "\"status\":\"unknown\",\"text\":\"outcome unknown: the harness stopped while this ran\"}\n"
+            "{\"sid\":\"s1\",\"seq\":7,\"ts\":2000,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"interrupted\"}\n");
+        expect(t, "log after recovery", vcontents(os, a, path), after);
+
+        // Sequence numbers continue, and recovery is idempotent
+        line = addrec(&log, a, EV_TURN, "n", "2");
+        expect(t, "seq continues", line, "{\"sid\":\"s1\",\"seq\":8,\"ts\":2000,\"ev\":\"turn\",\"n\":2}\n");
+        addrec(&log, a, EV_TURNEND, "turn", "2");
+        logclose(&log);
+        log = logopen(os, a, scratch, path, "s1", 1<<20);
+        expect(t, "reopen clean", logshow(a, &log), "ok=1 seq=9 turn=2 torn=0 bad=0 synth=0");
+        logclose(&log);
+        after = vcontents(os, a, path);
+
+        // Replay from a sequence number
+        Replay r = logreplay(os, a, scratch, path, "s1", 0, 1<<20);
+        expect(t, "replay all", joinlines(a, r.lines), after);
+        expect(t, "replay all last", istr(a, r.last), "9");
+        r = logreplay(os, a, scratch, path, "s1", 7, 1<<20);
+        expect(t, "replay from 7", joinlines(a, r.lines),
+               "{\"sid\":\"s1\",\"seq\":8,\"ts\":2000,\"ev\":\"turn\",\"n\":2}\n"
+               "{\"sid\":\"s1\",\"seq\":9,\"ts\":2000,\"ev\":\"turn.end\",\"turn\":2}\n");
+        r = logreplay(os, a, scratch, path, "s1", 9, 1<<20);
+        expect(t, "replay none", istr(a, r.ok*10 + r.lines.len), "10");
+        r = logreplay(os, a, scratch, path, "s2", 0, 1<<20);
+        expect(t, "replay other sid", istr(a, r.lines.len), "0");
+        r = logreplay(os, a, scratch, "nope/events.jsonl", "s1", 0, 1<<20);
+        expect(t, "replay missing", istr(a, r.ok*10 + r.lines.len), "10");
+        r = logreplay(os, a, scratch, path, "s1", 0, 100);
+        expect(t, "replay too big", istr(a, r.ok), "0");
+        log = logopen(os, a, scratch, path, "s1", 100);
+        expect(t, "open too big", istr(a, log.ok*10 + (log.fd>=0)), "0");
+    }
+
+    // A torn tail is cut back to the last complete line
+    {
+        Os  *os   = newos(a, 1<<20);
+        Str  path = "s2.jsonl";
+        Str  good =
+            "{\"sid\":\"s2\",\"seq\":1,\"ts\":0,\"ev\":\"session\"}\n"
+            "{\"sid\":\"s2\",\"seq\":2,\"ts\":0,\"ev\":\"title\",\"text\":\"x\"}\n";
+        Str  torn = "{\"sid\":\"s2\",\"seq\":3,\"ts\":0,\"ev\":\"ti";
+        os_write(os, scratch, path, concat(a, good, torn));
+
+        Replay r = logreplay(os, a, scratch, path, "s2", 0, 1<<20);
+        expect(t, "replay skips torn", joinlines(a, r.lines), good);
+        expect(t, "replay leaves torn", vcontents(os, a, path), concat(a, good, torn));
+
+        EventLog log = logopen(os, a, scratch, path, "s2", 1<<20);
+        expect(t, "torn open", logshow(a, &log), "ok=1 seq=2 turn=0 torn=35 bad=0 synth=0");
+        expect(t, "torn file", vcontents(os, a, path), good);
+        Str line = addrec(&log, a, EV_TITLE, "text", "\"y\"");
+        expect(t, "torn next", line, "{\"sid\":\"s2\",\"seq\":3,\"ts\":0,\"ev\":\"title\",\"text\":\"y\"}\n");
+        expect(t, "torn appended", vcontents(os, a, path), concat(a, good, line));
+        logclose(&log);
+
+        // Torn power-loss garbage with no newline at all
+        os_write(os, scratch, "s3.jsonl", Str("{\"sid\":\"s3\"\0\0\0\0"));
+        log = logopen(os, a, scratch, "s3.jsonl", "s3", 1<<20);
+        expect(t, "torn only", logshow(a, &log), "ok=1 seq=0 turn=0 torn=15 bad=0 synth=0");
+        expect(t, "torn only file", vcontents(os, a, "s3.jsonl"), "");
+        logclose(&log);
+    }
+
+    // Invalid lines are skipped, never trusted, and never deleted, while
+    // an unknown event (from a newer version) keeps its seq
+    {
+        Os  *os   = newos(a, 1<<20);
+        Str  path = "s4.jsonl";
+        Str  first  = "{\"sid\":\"s4\",\"seq\":1,\"ts\":0,\"ev\":\"session\"}\n";
+        Str  third  = "{\"sid\":\"s4\",\"seq\":3,\"ts\":0,\"ev\":\"title\",\"text\":\"t\"}\n";
+        Str  fourth = "{\"sid\":\"s4\",\"seq\":4,\"ts\":0,\"ev\":\"bogus\"}\n";
+        Str  data  = concat(a, first,
+            "garbage\n"
+            "\n"
+            "{\"sid\":\"other\",\"seq\":2,\"ts\":0,\"ev\":\"title\",\"text\":\"x\"}\n"
+            "{\"sid\":\"s4\",\"ts\":0,\"ev\":\"delta\",\"text\":\"x\"}\n"
+            "{\"sid\":\"s4\",\"seq\":1,\"ts\":0,\"ev\":\"title\",\"text\":\"dup\"}\n"
+            "{\"sid\":\"s4\",\"seq\":2,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"x\"\n");
+        data = concat(a, data, third);
+        data = concat(a, data, fourth);
+        os_write(os, scratch, path, data);
+
+        EventLog log = logopen(os, a, scratch, path, "s4", 1<<20);
+        expect(t, "bad lines", logshow(a, &log), "ok=1 seq=4 turn=0 torn=0 bad=6 synth=0");
+        expect(t, "bad lines kept", vcontents(os, a, path), data);
+        Replay r = logreplay(os, a, scratch, path, "s4", 0, 1<<20);
+        expect(t, "bad lines replay", joinlines(a, r.lines),
+               concat(a, concat(a, first, third), fourth));
+        expect(t, "bad lines next", addrec(&log, a, EV_NOTE, "level", "\"info\""),
+               "{\"sid\":\"s4\",\"seq\":5,\"ts\":0,\"ev\":\"note\",\"level\":\"info\"}\n");
+        logclose(&log);
+    }
+
+    // Records from a newer version end the log, so their numbers must
+    // not be reused, and replay passes them on for the GUI to ignore.
+    // An open turn still gets its end after them.
+    {
+        Os  *os   = newos(a, 1<<20);
+        Str  path = "s8.jsonl";
+        Str  done =
+            "{\"sid\":\"s8\",\"seq\":1,\"ts\":0,\"ev\":\"session\"}\n"
+            "{\"sid\":\"s8\",\"seq\":2,\"ts\":0,\"ev\":\"turn\",\"n\":1}\n"
+            "{\"sid\":\"s8\",\"seq\":3,\"ts\":0,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n";
+        Str  newer = "{\"sid\":\"s8\",\"seq\":4,\"ts\":0,\"ev\":\"compact\",\"n\":1}\n";
+        os_write(os, scratch, path, concat(a, done, newer));
+        EventLog log = logopen(os, a, scratch, path, "s8", 1<<20);
+        expect(t, "newer event", logshow(a, &log), "ok=1 seq=4 turn=1 torn=0 bad=0 synth=0");
+        Str line = addrec(&log, a, EV_NOTE, {}, {});
+        expect(t, "newer event next", line, "{\"sid\":\"s8\",\"seq\":5,\"ts\":0,\"ev\":\"note\"}\n");
+        Replay r = logreplay(os, a, scratch, path, "s8", 3, 1<<20);
+        expect(t, "newer event replay", joinlines(a, r.lines), concat(a, newer, line));
+        logclose(&log);
+
+        os_write(os, scratch, path,
+            "{\"sid\":\"s8\",\"seq\":1,\"ts\":0,\"ev\":\"turn\",\"n\":1}\n"
+            "{\"sid\":\"s8\",\"seq\":2,\"ts\":0,\"ev\":\"compact\"}\n"
+            "{\"sid\":\"s8\",\"seq\":3,\"ts\":0,\"ev\":\"delta\",\"text\":\"x\"}\n");
+        log = logopen(os, a, scratch, path, "s8", 1<<20);
+        expect(t, "newer event in turn", logshow(a, &log), "ok=1 seq=4 turn=1 torn=0 bad=0 synth=1");
+        r = logreplay(os, a, scratch, path, "s8", 3, 1<<20);
+        expect(t, "newer event in turn end", joinlines(a, r.lines),
+            "{\"sid\":\"s8\",\"seq\":4,\"ts\":0,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"interrupted\"}\n");
+        logclose(&log);
+    }
+
+    // A document as deep as the reader takes, logged inside a record,
+    // still makes a line that reads back: only its innermost array,
+    // which would nest too deeply, becomes null.
+    {
+        Os      *os   = newos(a, 1<<20);
+        Str      path = "s9.jsonl";
+        EventLog log  = logopen(os, a, scratch, path, "s9", 1<<20);
+        Str      deep = nested(a, 64, "[", "]");
+        JsonDoc  d    = jsonparse(a, deep);
+        Buf      b(a, 512);
+        EvOut    w = logbegin(&log, &b, EV_TOOLSTART);
+        putkey(&w.json, "call");
+        putstr(&w.json, "c1");
+        putkey(&w.json, "args");
+        putjson(&w.json, d.root);
+        Str line = logappend(&log, &w);
+        Str want = "{\"sid\":\"s9\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\","
+                   "\"call\":\"c1\",\"args\":";
+        want = concat(a, want, takehead(deep, 63));
+        want = concat(a, want, "null");
+        want = concat(a, want, cuthead(deep, 65));
+        want = concat(a, want, "}\n");
+        expect(t, "deep record", line, want);
+        logclose(&log);
+        log = logopen(os, a, scratch, path, "s9", 1<<20);
+        expect(t, "deep record reopen", logshow(a, &log), "ok=1 seq=2 turn=0 torn=0 bad=0 synth=1");
+        logclose(&log);
+    }
+
+    // With no log handle to be had, opening fails and leaves the file,
+    // torn tail and all, for a later attempt.
+    {
+        Os  *os   = newos(a, 1<<20);
+        Str  path = "s10.jsonl";
+        Str  data = "{\"sid\":\"s10\",\"seq\":1,\"ts\":0,\"ev\":\"turn\",\"n\":1}\n{\"sid";
+        os_write(os, scratch, path, data);
+        os->nlogs = countof(os->logs);
+        EventLog log = logopen(os, a, scratch, path, "s10", 1<<20);
+        expect(t, "no handle", logshow(a, &log), "ok=0 seq=0 turn=0 torn=0 bad=0 synth=0");
+        expect(t, "no handle fd", istr(a, log.fd), "-1");
+        expect(t, "no handle file", vcontents(os, a, path), data);
+        expect(t, "no handle append", istr(a, !addrec(&log, a, EV_NOTE, {}, {}).data), "1");
+        expect(t, "no handle file after", vcontents(os, a, path), data);
+    }
+
+    // Recovery cases: a tool outside any turn, finished turns, and a
+    // second turn left open
+    {
+        Os  *os   = newos(a, 1<<20);
+        os_write(os, scratch, "s5.jsonl",
+            "{\"sid\":\"s5\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n"
+            "{\"sid\":\"s5\",\"seq\":2,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"b\"}\n");
+        EventLog log = logopen(os, a, scratch, "s5.jsonl", "s5", 1<<20);
+        expect(t, "tools only", logshow(a, &log), "ok=1 seq=4 turn=0 torn=0 bad=0 synth=2");
+        Replay r = logreplay(os, a, scratch, "s5.jsonl", "s5", 2, 1<<20);
+        expect(t, "tools only order", joinlines(a, r.lines),
+            "{\"sid\":\"s5\",\"seq\":3,\"ts\":0,\"ev\":\"tool.end\",\"call\":\"a\","
+            "\"status\":\"unknown\",\"text\":\"outcome unknown: the harness stopped while this ran\"}\n"
+            "{\"sid\":\"s5\",\"seq\":4,\"ts\":0,\"ev\":\"tool.end\",\"call\":\"b\","
+            "\"status\":\"unknown\",\"text\":\"outcome unknown: the harness stopped while this ran\"}\n");
+        logclose(&log);
+
+        os_write(os, scratch, "s6.jsonl",
+            "{\"sid\":\"s6\",\"seq\":1,\"ts\":0,\"ev\":\"turn\",\"n\":1}\n"
+            "{\"sid\":\"s6\",\"seq\":2,\"ts\":0,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n"
+            "{\"sid\":\"s6\",\"seq\":3,\"ts\":0,\"ev\":\"turn\",\"n\":2}\n"
+            "{\"sid\":\"s6\",\"seq\":4,\"ts\":0,\"ev\":\"ask\",\"req\":1}\n");
+        log = logopen(os, a, scratch, "s6.jsonl", "s6", 1<<20);
+        expect(t, "second turn", logshow(a, &log), "ok=1 seq=5 turn=2 torn=0 bad=0 synth=1");
+        r = logreplay(os, a, scratch, "s6.jsonl", "s6", 4, 1<<20);
+        expect(t, "second turn end", joinlines(a, r.lines),
+            "{\"sid\":\"s6\",\"seq\":5,\"ts\":0,\"ev\":\"turn.end\",\"turn\":2,\"why\":\"interrupted\"}\n");
+        logclose(&log);
+
+        os_write(os, scratch, "s7.jsonl",
+            "{\"sid\":\"s7\",\"seq\":1,\"ts\":0,\"ev\":\"turn\",\"n\":1}\n"
+            "{\"sid\":\"s7\",\"seq\":2,\"ts\":0,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n");
+        log = logopen(os, a, scratch, "s7.jsonl", "s7", 1<<20);
+        expect(t, "finished turn", logshow(a, &log), "ok=1 seq=2 turn=1 torn=0 bad=0 synth=0");
+        logclose(&log);
+    }
+
+    // Faults (main_test.cpp failure hooks): truncation refused, as for
+    // an append-only file, ends the torn tail to be judged as a line
+    {
+        Os  *os   = newos(a, 1<<20);
+        Str  path = "s11.jsonl";
+        Str  good =
+            "{\"sid\":\"s11\",\"seq\":1,\"ts\":0,\"ev\":\"turn\",\"n\":1}\n"
+            "{\"sid\":\"s11\",\"seq\":2,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n"
+            "{\"sid\":\"s11\",\"seq\":3,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"b\"}\n";
+        Str  torn = "{\"sid\":\"s11\",\"seq\":4,\"ts\":0,\"ev\":\"tool.e";
+        Str  enda =
+            "{\"sid\":\"s11\",\"seq\":4,\"ts\":0,\"ev\":\"tool.end\",\"call\":\"a\","
+            "\"status\":\"unknown\",\"text\":\"outcome unknown: the harness stopped while this ran\"}\n";
+        Str  rest =
+            "{\"sid\":\"s11\",\"seq\":5,\"ts\":0,\"ev\":\"tool.end\",\"call\":\"b\","
+            "\"status\":\"unknown\",\"text\":\"outcome unknown: the harness stopped while this ran\"}\n"
+            "{\"sid\":\"s11\",\"seq\":6,\"ts\":0,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"interrupted\"}\n";
+        Str  done = concat(a, concat(a, good, enda), rest);
+
+        os_write(os, scratch, path, concat(a, good, torn));
+        os->failtrunc = 1;
+        EventLog log = logopen(os, a, scratch, path, "s11", 1<<20);
+        expect(t, "no truncate", logshow(a, &log), "ok=1 seq=6 turn=1 torn=0 bad=1 synth=3");
+        Str want = concat(a, concat(a, concat(a, good, torn), "\n"), cuthead(done, good.len));
+        expect(t, "no truncate file", vcontents(os, a, path), want);
+        logclose(&log);
+        log = logopen(os, a, scratch, path, "s11", 1<<20);
+        expect(t, "no truncate again", logshow(a, &log), "ok=1 seq=6 turn=1 torn=0 bad=1 synth=0");
+        logclose(&log);
+        os->failtrunc = 0;
+
+        // A write fails partway through recovery: the open fails, and the
+        // next finishes the job as if nothing had happened
+        os_write(os, scratch, path, concat(a, good, torn));
+        os->failwrites = 1;
+        os->writes     = 1;
+        log = logopen(os, a, scratch, path, "s11", 1<<20);
+        expect(t, "write fails", istr(a, log.ok*10 + (log.fd>=0)), "0");
+        expect(t, "write fails file", vcontents(os, a, path), concat(a, good, enda));
+        os->failwrites = 0;
+        log = logopen(os, a, scratch, path, "s11", 1<<20);
+        expect(t, "write fails redo", logshow(a, &log), "ok=1 seq=6 turn=1 torn=0 bad=0 synth=2");
+        expect(t, "write fails redo file", vcontents(os, a, path), done);
+        logclose(&log);
+    }
+
+    // Syncs follow the table, recovery syncs once at the end, and a
+    // failed sync fails the append or the open (the record stays written)
+    {
+        Os      *os  = newos(a, 1<<20);
+        EventLog log = logopen(os, a, scratch, "s12.jsonl", "s12", 1<<20);
+        Buf      b(a, 256);
+        for (i32 ev = 1; ev < EV_COUNT; ev++) {
+            if (evdurable(ev)) {
+                i32 before = os->syncs;
+                addrec(&log, a, ev, {}, {});
+                print(&b, evname(ev));
+                putbyte(&b, '=');
+                print(&b, (i64)(os->syncs - before));
+                putbyte(&b, ' ');
+            }
+        }
+        expect(t, "syncs", finish(&b),
+               "session=0 title=0 user=0 turn=0 attempt=0 assistant=0 "
+               "tool.start=1 tool.end=0 ask=1 answer=1 retry=0 nudge=0 "
+               "turn.end=1 note=0 ");
+        logclose(&log);
+
+        Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";
+        os_write(os, scratch, "s13.jsonl", start);
+        os->syncs = 0;
+        log = logopen(os, a, scratch, "s13.jsonl", "s13", 1<<20);
+        expect(t, "recovery syncs", istr(a, os->syncs), "1");
+        os->failsync = 1;
+        expect(t, "sync fails", istr(a, !addrec(&log, a, EV_ASK, {}, {}).data), "1");
+        expect(t, "sync fails seq", istr(a, log.seq), "3");
+        logclose(&log);
+
+        os_write(os, scratch, "s13.jsonl", start);
+        log = logopen(os, a, scratch, "s13.jsonl", "s13", 1<<20);
+        expect(t, "recovery sync fails", istr(a, log.ok*10 + (log.fd>=0)), "0");
+        os->failsync = 0;
+        log = logopen(os, a, scratch, "s13.jsonl", "s13", 1<<20);
+        expect(t, "recovery sync fails redo", logshow(a, &log), "ok=1 seq=2 turn=0 torn=0 bad=0 synth=0");
+        logclose(&log);
+    }
+}
