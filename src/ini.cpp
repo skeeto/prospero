@@ -52,6 +52,10 @@
 //
 // Every line is kept verbatim with the byte spans of its parts, so that
 // a writer can replace one value in place and preserve the rest exactly.
+// The writer (iniedit) edits one file's text: it sets a key by splicing
+// its value span, adds a key after the section's last one or a section
+// at the end, and removes a key by dropping its line. All other bytes
+// come through unchanged, so one edit is a one-line diff.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -923,4 +927,201 @@ static b32 printinivalue(Buf *b, Str v)
     }
     putbyte(b, '"');
     return 1;
+}
+
+
+// Editing
+//
+// Edits work on one file's lines, never on the layered result: the
+// caller picks the file (a user's own, never an include) and writes the
+// new text back. Lines not edited come through byte for byte, comments,
+// blanks, order, a BOM and CRLF included.
+
+struct IniEdit {
+    Str text;     // the whole new text, null on failure
+    Str err;
+    iz  line;     // 1-based line of the key in text, 0 once removed
+    b32 changed;  // text differs from the file's
+};
+
+// Whether a word can be a section kind or name, or with key set a key,
+// such that the edited text parses back to it.
+static b32 iniword(Str s, b32 key)
+{
+    if (!s.len) {
+        return 0;
+    }
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (whitespace(c) || c<0x20 || c==0x7f || c=='[' || c==']' ||
+                (key && c=='=')) {
+            return 0;
+        }
+    }
+    return !key || (s[0]!='#' && s[0]!=';' && !(s == "include"));
+}
+
+// The line terminator for new lines: the file's first one, else LF.
+static Str inieol(IniFile *f)
+{
+    for (iz i = 0; i < f->lines.len; i++) {
+        if (f->lines[i].eol.len) {
+            return f->lines[i].eol;
+        }
+    }
+    return "\n";
+}
+
+static Str iniindent(Str raw)
+{
+    iz i = 0;
+    for (; i<raw.len && whitespace(raw[i]); i++) {}
+    return takehead(raw, i);
+}
+
+static b32 iniin(IniLine *l, Str kind, Str name)
+{
+    IniSection *s = l->section;
+    return s && s->kind==kind && s->name==name;
+}
+
+// Set a key of section (kind, name) in one file's text to value, or
+// remove it given a null value, with everything in perm. The top level
+// is ("", "").
+//
+// - A key the file defines gets the new value in place of its last
+//   definition (the one in effect), unless that already decodes to it.
+// - A new key goes after the section's last key in the file, or after
+//   its header, with the same indentation. A new top-level key goes
+//   after the last top-level key or include, or else before the
+//   comments leading into the first section header, with a blank line
+//   after it.
+// - A new section goes at the end, after a blank line.
+// - Removing drops every definition of the key in the section.
+//
+// Values are quoted only when they need it (printinivalue), and new
+// lines end like the file's first line.
+static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
+                       Str key, Str value)
+{
+    IniEdit r   = {};
+    b32     top = !kind.len;
+    if (!iniword(key, 1) || (top ? name.len>0 : !iniword(kind, 0)) ||
+            (name.len && !iniword(name, 0))) {
+        r.err = "invalid section or key name";
+        return r;
+    }
+
+    Str enc = {};
+    if (value.data) {
+        Buf v(perm, value.len + 8);
+        if (!printinivalue(&v, value)) {
+            r.err = "a value cannot contain a newline";
+            return r;
+        }
+        enc = finish(&v);
+    }
+
+    iz n      = f->lines.len;
+    iz last   = -1;  // the definition in effect
+    iz anchor = -1;  // the line a new key follows
+    iz header = -1;  // the section's last header
+    iz first  = -1;  // the first line that starts any section
+    for (iz i = 0; i < n; i++) {
+        IniLine *l  = &f->lines[i];
+        b32      in = iniin(l, kind, name);
+        if (l->type==INI_KEY && in) {
+            anchor = i;
+            last   = l->key==key ? i : last;
+        } else if (l->type==INI_INCLUDE && top) {
+            anchor = i;
+        } else if (l->type==INI_SECTION && in) {
+            header = i;
+        }
+        if (first<0 && startswith(trimleft(l->raw), "[")) {
+            first = i;
+        }
+    }
+
+    Str eol  = inieol(f);
+    iz  at   = -1;  // insert before this line
+    b32 gap  = 0;   // a blank line after the inserted key
+    b32 drop = 0;   // remove the key's definitions
+    Buf add(perm, 64 + kind.len + name.len + key.len + enc.len);
+    if (!value.data) {
+        for (iz i = 0; i < n; i++) {
+            IniLine *l = &f->lines[i];
+            drop |= l->type==INI_KEY && iniin(l, kind, name) && l->key==key;
+        }
+        r.changed = drop;
+    } else if (last >= 0) {
+        r.line    = last + 1;
+        r.changed = !(f->lines[last].value == value);
+    } else if (anchor>=0 || header>=0) {
+        iz after = anchor>=0 ? anchor : header;
+        at = after + 1;
+        print(&add, iniindent(f->lines[after].raw));
+    } else if (top && first>=0) {
+        at  = first;
+        gap = 1;
+        for (; at>0 && f->lines[at-1].type==INI_COMMENT; at--) {}
+    } else if (top) {
+        at = n;
+    } else {
+        at = n;
+        if (n && f->lines[n-1].type!=INI_BLANK) {
+            print(&add, eol);
+        }
+        putbyte(&add, '[');
+        print(&add, kind);
+        if (name.len) {
+            putbyte(&add, ' ');
+            print(&add, name);
+        }
+        putbyte(&add, ']');
+        print(&add, eol);
+    }
+    if (at >= 0) {
+        // The inserted text holds whole lines: count those before the key
+        r.line = at + 1;
+        for (iz i = 0; i < add.len; i++) {
+            r.line += add.data[i] == '\n';
+        }
+        print(&add, key);
+        print(&add, " = ");
+        print(&add, enc);
+        print(&add, eol);
+        if (gap) {
+            print(&add, eol);
+        }
+        r.changed = 1;
+    }
+
+    Buf b(perm, 64);
+    if (f->bom) {
+        print(&b, "\xef\xbb\xbf");
+    }
+    for (iz i = 0; i < n; i++) {
+        IniLine *l = &f->lines[i];
+        if (i == at) {
+            print(&b, finish(&add));
+        }
+        if (drop && l->type==INI_KEY && iniin(l, kind, name) && l->key==key) {
+            continue;
+        }
+        if (i==last && value.data && r.changed) {
+            print(&b, takehead(l->raw, l->valbeg));
+            print(&b, enc);
+            print(&b, cuthead(l->raw, l->valend));
+        } else {
+            print(&b, l->raw);
+        }
+        // Only the last line may lack a terminator
+        print(&b, l->eol.len || at!=n ? l->eol : eol);
+    }
+    if (at == n) {
+        print(&b, finish(&add));
+    }
+    r.text = finish(&b);
+    return r;
 }

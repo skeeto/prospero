@@ -14,22 +14,24 @@ struct VFile {
     VFile *next;
     Str    path;
     Str    data;
+    i64    mtime;     // os_time when last written
     b32    exists;
     b32    isdir;
 };
 
 struct Os {
-    Arena  mem;       // file contents and names live here
-    VFile *files;
-    VFile *logs[16];  // log handles index this table
-    iz     nlogs;
-    i64    now;       // microseconds, advanced by tests
-    u64    rng;
-    i32    syncs;     // os_logsync calls
-    i32    writes;    // os_logwrite calls left while failwrites is set
-    b32    failwrites;
-    b32    failtrunc;
-    b32    failsync;
+    Arena      mem;       // file contents and names live here
+    VFile     *files;
+    VFile     *logs[16];  // log handles index this table
+    iz         nlogs;
+    Slice<Str> env;       // "NAME=value" entries for os_getenv
+    i64        now;       // microseconds, advanced by tests
+    u64        rng;
+    i32        syncs;     // os_logsync calls
+    i32        writes;    // os_logwrite calls left while failwrites is set
+    b32        failwrites;
+    b32        failtrunc;
+    b32        failsync;
 };
 
 static VFile *vfind(Os *os, Str path, b32 create)
@@ -109,6 +111,7 @@ static b32 os_write(Os *os, Arena, Str path, Str data)
 {
     VFile *f = vfind(os, path, 1);
     f->data   = clone(&os->mem, data);
+    f->mtime  = os_time(os);
     f->exists = 1;
     f->isdir  = 0;
     return 1;
@@ -150,8 +153,9 @@ static Stat os_stat(Os *os, Arena, Str path)
     Stat   s = {};
     VFile *f = vfind(os, path, 0);
     if (f && f->exists) {
-        s.type = f->isdir ? STAT_DIR : STAT_FILE;
-        s.size = f->data.len;
+        s.type  = f->isdir ? STAT_DIR : STAT_FILE;
+        s.size  = f->data.len;
+        s.mtime = f->mtime;
     }
     return s;
 }
@@ -185,7 +189,16 @@ static b32 os_print(Os *, i32 fd, Str s)
     return fwrite(s.data, 1, (uz)s.len, fd==1 ? stdout : stderr) == (uz)s.len;
 }
 
-static Str os_getenv(Os *, Arena *, Str) { return {}; }
+static Str os_getenv(Os *os, Arena *a, Str name)
+{
+    for (iz i = 0; i < os->env.len; i++) {
+        Cut c = cut(os->env[i], '=');
+        if (c.head == name) {
+            return clone(a, c.tail);
+        }
+    }
+    return {};
+}
 static Str os_exepath(Os *, Arena *) { return "harness"; }
 
 static b32  os_thread(Os *, void (*)(void *), void *) { return 0; }
@@ -336,6 +349,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/provider_test.cpp"
 #include "test/tools_test.cpp"
 #include "test/guard_test.cpp"
+#include "test/config_test.cpp"
 #if HARNESS_GUI
 #  include "sched.cpp"
 #  include "highlight.cpp"
@@ -366,6 +380,7 @@ int main()
     test_provider(&t);
     test_tools(&t);
     test_guard(&t);
+    test_config(&t);
     #if HARNESS_GUI
     test_sched(&t);
     test_highlight(&t);

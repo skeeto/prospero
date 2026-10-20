@@ -54,6 +54,11 @@ target_link_options(harness_core_flags INTERFACE
 
 check_linker_flag(CXX -nostdlib++ HARNESS_HAS_NOSTDLIBXX)
 
+# The core embeds the seed configuration with #embed (config.cpp), which
+# not every compiler lists as a dependency.
+set_property(SOURCE src/main_posix.cpp src/main_win32.cpp src/main_test.cpp
+  APPEND PROPERTY OBJECT_DEPENDS ${PROJECT_SOURCE_DIR}/assets/harness.ini)
+
 if(HARNESS_GUI)
   include(FetchGui)
 endif()
