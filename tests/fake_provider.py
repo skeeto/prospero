@@ -448,7 +448,7 @@ def sc_ask(model, n, req):
         yield from answer(model, "Finished after the answer.")
 
 
-sc_ask_allow = sc_ask_deny = sc_ask_timeout = sc_ask_steer = sc_ask
+sc_ask_allow = sc_ask_deny = sc_ask_timeout = sc_ask_steer = sc_ask_close = sc_ask
 
 
 def sc_readonly(model, n, req):

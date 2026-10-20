@@ -2153,15 +2153,20 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
     if (from < 0) {
         from = first==I64MAX ? s->log.seq : first;
     }
-    Json *att = jsonget(j, "attended");
-    if (att->type != JSON_MISSING) {
-        s->attended = jsonflag(att, 0);
-    }
     Str    path  = join(&scratch, s->dir, "events.jsonl");
     Arena  lines = newarena(e->replay);
     Replay rp    = logreplay(e->os, &lines, scratch, path, s->sid, from, LOG_MAX);
     for (iz i = 0; i < rp.lines.len; i++) {
         emit(e, rp.lines[i]);
+    }
+    Json *att = jsonget(j, "attended");
+    if (att->type != JSON_MISSING) {
+        s->attended = jsonflag(att, 0);
+        if (!s->attended && s->state==S_ASK) {
+            // Nobody is left to answer
+            resolve(s, scratch, 0, DENY_POLICY, "the session is no longer attended");
+            nexttool(s, scratch);
+        }
     }
 
     Buf   b(&scratch, 256);

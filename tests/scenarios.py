@@ -913,6 +913,22 @@ def ask_steer(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=10)
+def ask_close(t):
+    h = t.headless()
+    try:
+        sid, ask = asked(t, h)
+        h.call("close", sid=sid)
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"the turn goes on unattended: {end}")
+        ans = h.all("answer", sid)[0]
+        t.check(ans["decision"] == "deny" and ans["by"] == "policy", f"answer {ans}")
+        t.check(t.file("inside.txt") == "inside", "the agent wrote inside instead")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=15)
 def readonly(t):
     a = t.headless()
