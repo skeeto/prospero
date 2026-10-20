@@ -215,38 +215,73 @@ static void testladder(ProcTest *p, Arena scratch)
     say(os, "kill ladder done");
 }
 
-// Spawn n times and time each until exit, best and mean in ticks.
-static void timespawn(ProcTest *p, Arena scratch, Slice<Str> argv, Str cmdline,
-                      i32 n, i64 *best, i64 *mean)
+static b32 i64less(i64 *a, i64 *b)
 {
-    Os *os  = p->os;
-    i64 sum = 0;
-    *best = I64MAX;
+    return *a < *b;
+}
+
+struct Timing {
+    i64 best;
+    i64 median;
+    i64 mean;
+};
+
+// Spawn n times and time each until exit, in ticks. The median shrugs
+// off the outliers of a machine that is busy with other work.
+static Timing timespawn(ProcTest *p, Arena scratch, Slice<Str> argv,
+                        Str cmdline, i32 n)
+{
+    Os     *os  = p->os;
+    i64     sum = 0;
+    Timing  r   = {};
+    i64    *dts = alloc<i64>(&scratch, n);
     for (i32 i = 0; i < n; i++) {
         Spawn sp = {};
         sp.argv     = argv;
         sp.cmdline  = cmdline;
         sp.cwd      = p->dir;
         sp.env      = p->env;
-        sp.outpath  = join(&scratch, p->dir, "spawn.log");
+        // A fresh file each time, as tool calls get: truncating one just
+        // written makes ext4 flush it, which costs milliseconds on an SD card
+        Buf name(&scratch, 32);
+        print(&name, "spawn");
+        print(&name, (i64)i);
+        print(&name, ".log");
+        sp.outpath  = join(&scratch, p->dir, finish(&name));
         sp.maxbytes = 1<<20;
         sp.mbox     = p->mb;
         sp.id       = ++p->id;
         i64   t0 = os_ticks(os);
         Proc *pr = os_spawn(os, &sp, scratch);
         if (!pr) {
-            *best = *mean = 0;
-            return;
+            return {};
         }
         ProcWatch w = {};
         procwatch(os, p->mb, p->id, &w, 5000);
-        i64 dt = w.exitat - t0;
-        *best = dt<*best ? dt : *best;
-        sum  += dt;
+        dts[i] = w.exitat - t0;
+        sum   += dts[i];
         os_kill(os, pr, 1);
         os_procfree(os, pr);
     }
-    *mean = sum / n;
+    sort(dts, n, i64less, scratch);
+    r.best   = dts[0];
+    r.median = dts[n/2];
+    r.mean   = sum / n;
+    return r;
+}
+
+static void reporttiming(Os *os, Arena scratch, Str what, Timing t)
+{
+    Buf b(&scratch, 128);
+    print(&b, what);
+    print(&b, ": best ");
+    printfloat(&b, millis(t.best), 2);
+    print(&b, " ms, median ");
+    printfloat(&b, millis(t.median), 2);
+    print(&b, " ms, mean ");
+    printfloat(&b, millis(t.mean), 2);
+    print(&b, " ms");
+    say(os, finish(&b));
 }
 
 // The cost of spawning through the platform: a program that exits at
@@ -254,24 +289,21 @@ static void timespawn(ProcTest *p, Arena scratch, Slice<Str> argv, Str cmdline,
 // start, the failed exec, the status report) without any tool.
 static void testoverhead(ProcTest *p, Arena scratch)
 {
-    Selftest *t = p->t;
+    Selftest *t  = p->t;
     Os       *os = p->os;
-    i64       best, mean;
 
-    ShellCmd sc   = shellcmd(&scratch, &p->te, "exit 0");
-    Str      tr[] = {"true"};
+    ShellCmd   sc   = shellcmd(&scratch, &p->te, "exit 0");
+    Str        tr[] = {"true"};
     Slice<Str> argv = HOST_WINDOWS ? sc.argv : Slice<Str>{tr, 1, 1};
-    timespawn(p, scratch, argv, sc.cmdline, 20, &best, &mean);
-    report(os, scratch, "spawn to exit of true: best", millis(best), 2, " ms");
-    report(os, scratch, "spawn to exit of true: mean", millis(mean), 2, " ms");
+    Timing     tt   = timespawn(p, scratch, argv, sc.cmdline, 21);
+    reporttiming(os, scratch, "spawn to exit of true", tt);
     if (HOST_WINDOWS) {
         return;
     }
 
-    Str none[] = {"/harness-selftest/no-such-program"};
-    timespawn(p, scratch, {none, 1, 1}, {}, 20, &best, &mean);
-    report(os, scratch, "reaper overhead: best", millis(best), 2, " ms");
-    report(os, scratch, "reaper overhead: mean", millis(mean), 2, " ms");
+    Str    none[] = {"/harness-selftest/no-such-program"};
+    Timing rt     = timespawn(p, scratch, {none, 1, 1}, {}, 21);
+    reporttiming(os, scratch, "reaper overhead", rt);
     #if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
     b32 instrumented = 1;
     #elif defined(__has_feature)
@@ -280,7 +312,7 @@ static void testoverhead(ProcTest *p, Arena scratch)
     b32 instrumented = 0;
     #endif
     if (!instrumented) {
-        check(t, mean>0 && mean<5000, "spawn overhead under 5 ms");
+        check(t, rt.median>0 && rt.median<5000, "spawn overhead under 5 ms");
     }
 }
 

@@ -928,20 +928,29 @@ static void closeall(i32 *fds, iz n)
     }
 }
 
-// Signal state for a child: defaults restored and nothing blocked, since
-// spawning threads block every signal and the harness ignores SIGPIPE.
-static void childsignals(posix_spawnattr_t *attr, short flags)
+// Signal state for a child: nothing blocked, since spawning threads
+// block every signal. Handlers reset on exec by themselves, and only
+// ignored signals carry over, so only those need SETSIGDEF: none for a
+// reaper, which sets up its own, and for a tool the four its reaper
+// ignores. Restoring every signal costs a sigaction call each in the
+// child, a noticeable part of a spawn on a slow machine.
+static void childsignals(posix_spawnattr_t *attr, short flags, b32 tool)
 {
-    sigset_t none, all;
+    sigset_t none, ignored;
     sigemptyset(&none);
-    sigfillset(&all);
-    sigdelset(&all, SIGKILL);
-    sigdelset(&all, SIGSTOP);
+    sigemptyset(&ignored);
+    sigaddset(&ignored, SIGTERM);
+    sigaddset(&ignored, SIGINT);
+    sigaddset(&ignored, SIGHUP);
+    sigaddset(&ignored, SIGPIPE);
     posix_spawnattr_init(attr);
     posix_spawnattr_setsigmask(attr, &none);
-    posix_spawnattr_setsigdefault(attr, &all);
-    posix_spawnattr_setflags(attr, (short)(flags|POSIX_SPAWN_SETSIGMASK|
-                                         POSIX_SPAWN_SETSIGDEF));
+    flags |= POSIX_SPAWN_SETSIGMASK;
+    if (tool) {
+        posix_spawnattr_setsigdefault(attr, &ignored);
+        flags |= POSIX_SPAWN_SETSIGDEF;
+    }
+    posix_spawnattr_setflags(attr, flags);
 }
 
 static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
@@ -993,7 +1002,7 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
     #ifdef __APPLE__
     flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
     #endif
-    childsignals(&attr, flags);
+    childsignals(&attr, flags, 0);
     pid_t pid = 0;
     i32   err = null<0 || out[1]<0 || st[1]<0 ? EMFILE :
                 posix_spawn(&pid, os->exe, &fa, &attr, argv, envp);
@@ -1148,7 +1157,7 @@ static void reapstatus(i32 code, i32 sig)
         posix_spawn_file_actions_addinherit_np(&fa, fd);
     }
     #endif
-    childsignals(&attr, flags);
+    childsignals(&attr, flags, 1);
     pid_t pid = 0;
     i32   err = posix_spawnp(&pid, argv[3], &fa, &attr, argv+3, environ);
     if (err) {

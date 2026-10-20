@@ -691,6 +691,7 @@ def models():
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 256  # the default 5 refuses parallel scenarios
 
 
 def start(host="127.0.0.1", port=0):

@@ -1040,9 +1040,24 @@ static b32 startshell(Session *s, Arena scratch, Args *args)
     Block   *c  = &s->calls[s->callidx];
     ShellRun sh = {};
     sh.timeout = args->timeout>0 ? args->timeout : SHELL_DEFAULT;
-    sh.rel     = clone(&s->perm, concat(&scratch, concat(&scratch, "out/", c->id), ".log"));
-    sh.spill   = clone(&s->perm, join(&scratch, s->dir, sh.rel));
     sh.start   = os_ticks(e->os);
+    // out/<call>.log, unless a model reused the call id in this session
+    for (i32 n = 1;; n++) {
+        Buf rel(&scratch, 128);
+        print(&rel, "out/");
+        print(&rel, c->id);
+        if (n > 1) {
+            putbyte(&rel, '-');
+            print(&rel, (i64)n);
+        }
+        print(&rel, ".log");
+        Str path = join(&scratch, s->dir, finish(&rel));
+        if (os_stat(e->os, scratch, path).type == STAT_MISSING) {
+            sh.rel   = clone(&s->perm, finish(&rel));
+            sh.spill = clone(&s->perm, path);
+            break;
+        }
+    }
     s->sh = sh;
 
     ShellCmd sc = shellcmd(&scratch, &s->te, args->command);
