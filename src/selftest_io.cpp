@@ -215,39 +215,63 @@ static void testladder(ProcTest *p, Arena scratch)
     say(os, "kill ladder done");
 }
 
-static void testoverhead(ProcTest *p, Arena scratch)
+// Spawn n times and time each until exit, best and mean in ticks.
+static void timespawn(ProcTest *p, Arena scratch, Slice<Str> argv, Str cmdline,
+                      i32 n, i64 *best, i64 *mean)
 {
-    Selftest *t   = p->t;
-    Os       *os  = p->os;
-    Str       out = join(&scratch, p->dir, "true.log");
-    i64       best = I64MAX;
-    i64       sum  = 0;
-    i32       n    = 20;
+    Os *os  = p->os;
+    i64 sum = 0;
+    *best = I64MAX;
     for (i32 i = 0; i < n; i++) {
-        Spawn    sp     = {};
-        ShellCmd sc     = shellcmd(&scratch, &p->te, "exit 0");
-        Str      argv[] = {"true"};
-        sp.argv     = HOST_WINDOWS ? sc.argv : Slice<Str>{argv, 1, 1};
-        sp.cmdline  = sc.cmdline;
+        Spawn sp = {};
+        sp.argv     = argv;
+        sp.cmdline  = cmdline;
         sp.cwd      = p->dir;
         sp.env      = p->env;
-        sp.outpath  = out;
+        sp.outpath  = join(&scratch, p->dir, "spawn.log");
         sp.maxbytes = 1<<20;
         sp.mbox     = p->mb;
         sp.id       = ++p->id;
         i64   t0 = os_ticks(os);
         Proc *pr = os_spawn(os, &sp, scratch);
-        if (!pr) break;
+        if (!pr) {
+            *best = *mean = 0;
+            return;
+        }
         ProcWatch w = {};
         procwatch(os, p->mb, p->id, &w, 5000);
         i64 dt = w.exitat - t0;
-        best = dt<best ? dt : best;
-        sum += dt;
+        *best = dt<*best ? dt : *best;
+        sum  += dt;
         os_kill(os, pr, 1);
         os_procfree(os, pr);
     }
+    *mean = sum / n;
+}
+
+// The cost of spawning through the platform: a program that exits at
+// once, and on POSIX a missing one, which times the reaper alone (its
+// start, the failed exec, the status report) without any tool.
+static void testoverhead(ProcTest *p, Arena scratch)
+{
+    Selftest *t = p->t;
+    Os       *os = p->os;
+    i64       best, mean;
+
+    ShellCmd sc   = shellcmd(&scratch, &p->te, "exit 0");
+    Str      tr[] = {"true"};
+    Slice<Str> argv = HOST_WINDOWS ? sc.argv : Slice<Str>{tr, 1, 1};
+    timespawn(p, scratch, argv, sc.cmdline, 20, &best, &mean);
     report(os, scratch, "spawn to exit of true: best", millis(best), 2, " ms");
-    report(os, scratch, "spawn to exit of true: mean", millis(sum/n), 2, " ms");
+    report(os, scratch, "spawn to exit of true: mean", millis(mean), 2, " ms");
+    if (HOST_WINDOWS) {
+        return;
+    }
+
+    Str none[] = {"/harness-selftest/no-such-program"};
+    timespawn(p, scratch, {none, 1, 1}, {}, 20, &best, &mean);
+    report(os, scratch, "reaper overhead: best", millis(best), 2, " ms");
+    report(os, scratch, "reaper overhead: mean", millis(mean), 2, " ms");
     #if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
     b32 instrumented = 1;
     #elif defined(__has_feature)
@@ -255,8 +279,8 @@ static void testoverhead(ProcTest *p, Arena scratch)
     #else
     b32 instrumented = 0;
     #endif
-    if (!HOST_WINDOWS && !instrumented) {
-        check(t, sum/n < 5000, "spawn overhead under 5 ms");
+    if (!instrumented) {
+        check(t, mean>0 && mean<5000, "spawn overhead under 5 ms");
     }
 }
 

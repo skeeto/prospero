@@ -202,6 +202,7 @@ struct Engine {
     Slice<Str>  env;      // inherited environment
     Session    *sessions;
     Map<i64>   *trained;  // n_ctx_train by "url model", learned when loaded
+    Slice<Str>  learned;  // its keys, in order, for saving
     u64         nextid;
     b32         quitting;
 };
@@ -535,6 +536,43 @@ static void discover(Session *s, Arena scratch)
     setstate(s, S_DISCOVER);
 }
 
+// Trained context sizes survive restarts in state/models.json, so that a
+// model seen loaded once is judged right while it is unloaded.
+static Str modelspath(Arena *a, Engine *e)
+{
+    return join(a, e->statedir, "models.json");
+}
+
+static void loadtrained(Engine *e, Arena scratch)
+{
+    Read    rd = os_read(e->os, &scratch, modelspath(&scratch, e), 1<<20);
+    JsonDoc d  = jsonparse(&scratch, rd.data);
+    for (Json *m = d.root->child; d.root->type==JSON_OBJECT && m; m = m->next) {
+        i64 v = jsonint(m, 0);
+        if (v > 0) {
+            Str key = clone(&e->perm, m->key);
+            *upsert(&e->trained, key, &e->perm) = v;
+            e->learned = push(&e->perm, e->learned, key);
+        }
+    }
+}
+
+static void savetrained(Engine *e, Arena scratch)
+{
+    Buf     b(&scratch, 1024);
+    JsonOut w = {&b};
+    putobject(&w);
+    for (iz i = 0; i < e->learned.len; i++) {
+        putkey(&w, e->learned[i]);
+        putint(&w, *upsert(&e->trained, e->learned[i], (Arena *)0));
+    }
+    putend(&w);
+    putbyte(&b, '\n');
+    Str data = finish(&b);
+    Str path = modelspath(&scratch, e);
+    os_write(e->os, scratch, path, data);
+}
+
 static void discovered(Session *s, Arena scratch, b32 ok)
 {
     Engine *e = s->e;
@@ -546,8 +584,14 @@ static void discovered(Session *s, Arena scratch, b32 ok)
         if (mi.found) {
             s->info        = mi;
             s->mc.llamacpp = mi.llamacpp;
-            if (mi.trained && !cached) {
-                *upsert(&e->trained, clone(&e->perm, key), &e->perm) = mi.trained;
+            if (mi.trained && mi.trained!=trained) {
+                if (!cached) {
+                    key    = clone(&e->perm, key);
+                    cached = upsert(&e->trained, key, &e->perm);
+                    e->learned = push(&e->perm, e->learned, key);
+                }
+                *cached = mi.trained;
+                savetrained(e, scratch);
             }
             if (!s->mc.ctx || mi.learned) {
                 // A configured limit holds until a server reports one
@@ -1102,11 +1146,12 @@ static b32 runtool(Session *s, Arena scratch)
             toolend(s, scratch, "denied", why, 0, 0, {}, 0);
             return 1;
         }
-        ToolOut o = {};
+        ToolOut o    = {};
+        Str     ncwd = normpath(&scratch, s->cwd, ".", s->te.windows);  // as g.path
         switch (tool) {
-        case TOOL_READ:  o = toolread(e->os, &scratch, s->cwd, g.path, &args);  break;
-        case TOOL_WRITE: o = toolwrite(e->os, &scratch, s->cwd, g.path, &args); break;
-        case TOOL_EDIT:  o = tooledit(e->os, &scratch, s->cwd, g.path, &args);  break;
+        case TOOL_READ:  o = toolread(e->os, &scratch, ncwd, g.path, &args);  break;
+        case TOOL_WRITE: o = toolwrite(e->os, &scratch, ncwd, g.path, &args); break;
+        case TOOL_EDIT:  o = tooledit(e->os, &scratch, ncwd, g.path, &args);  break;
         }
         toolend(s, scratch, o.ok ? Str("ok") : Str("error"), o.text, 0, 0, {}, 0);
         return 1;
@@ -1185,6 +1230,12 @@ static void finalize(Session *s, Arena scratch)
     Str      fr = p->finish.data ? p->finish : Str("stop");
     addassistant(s, scratch, f.blocks, fr, p->hasusage ? &p->usage : 0);
     setstate(s, S_IDLE);
+
+    // The router has just loaded the model, if it was not loaded: its
+    // listing now reports the context, so look again before the next step
+    if (s->info.llamacpp && !s->info.learned) {
+        s->discovered = 0;
+    }
 
     b32 visible = trim(finish(&p->text)).len > 0;
     if (!f.ncalls) {
@@ -2073,7 +2124,7 @@ static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir, b32 win
         }
     }
     Str root = os_getenv(os, &scratch, "SystemRoot");
-    Str cmd  = join(&scratch, root.len ? root : Str("C:\\Windows"), "System32\\cmd.exe");
+    Str cmd  = concat(&scratch, root.len ? root : Str("C:\\Windows"), "\\System32\\cmd.exe");
     te.shell     = clone(perm, cmd);
     te.shellkind = SHELL_CMD;
     return te;
@@ -2098,7 +2149,8 @@ static Engine *newengine(Os *os, Arena *perm, Ini *ini, Str statedir, Mailbox *o
     Str exe    = os_exepath(os, &e->perm);
     e->exedir  = parentdir(exe);
     e->te      = findshell(os, &e->perm, newarena(e->scratch), e->exedir, HOST_WINDOWS);
-    e->env = os_environ(os, &e->perm);
+    e->env     = os_environ(os, &e->perm);
+    loadtrained(e, newarena(e->scratch));
     return e;
 }
 

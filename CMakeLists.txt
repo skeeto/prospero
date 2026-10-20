@@ -69,6 +69,13 @@ else()
   target_compile_options(httpedge PRIVATE -fno-exceptions)
   add_executable(harness src/main_posix.cpp)
   target_link_libraries(harness PRIVATE httpedge Threads::Threads)
+  # Every tool process starts under a reaper, this executable, so its
+  # startup is on the critical path: loading libstdc++ dynamically costs
+  # a millisecond or two per tool on a Raspberry Pi.
+  check_linker_flag(CXX -static-libstdc++ HARNESS_HAS_STATICXX)
+  if(HARNESS_HAS_STATICXX AND NOT APPLE)
+    target_link_options(harness PRIVATE -static-libstdc++ -static-libgcc)
+  endif()
 endif()
 target_link_libraries(harness PRIVATE harness_core_flags)
 set_target_properties(harness PROPERTIES OUTPUT_NAME ${HARNESS_NAME})
@@ -82,4 +89,12 @@ if(NOT CMAKE_CROSSCOMPILING)
   endif()
   add_test(NAME unit COMMAND harness_test)
   add_test(NAME selftest COMMAND harness --selftest)
+  # The engine end to end against tests/fake_provider.py
+  find_program(UV uv)
+  if(UV)
+    add_test(NAME scenarios COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios.py --harness $<TARGET_FILE:harness>)
+    add_test(NAME cleanup COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/cleanup.py --harness $<TARGET_FILE:harness>)
+  endif()
 endif()

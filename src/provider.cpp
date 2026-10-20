@@ -585,7 +585,8 @@ static Chunk applychunk(Partial *p, Json *j, Arena *scratch)
         p->usage.in   = jsonint(jsonget(u, "prompt_tokens"), 0);
         p->usage.out  = jsonint(jsonget(u, "completion_tokens"), 0);
         Json *details = jsonget(u, "prompt_tokens_details");
-        p->usage.cached = jsonint(jsonget(details, "cached_tokens"), 0);
+        Json *hit     = jsonget(u, "prompt_cache_hit_tokens");  // DeepSeek
+        p->usage.cached = jsonint(jsonget(details, "cached_tokens"), jsonint(hit, 0));
     }
     Json *t = jsonget(j, "timings");
     if (t->type == JSON_OBJECT) {
