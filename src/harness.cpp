@@ -134,10 +134,45 @@ static b32     os_logsync(Os *, iz log);  // flush to stable storage
 static b32     os_logtrunc(Os *, iz log, i64 len);  // drop a torn tail
 static void    os_logclose(Os *, iz log);
 
+// (M2) Read up to max bytes of a regular file starting at off. The size
+// is that of the whole file, and data is short only at its end.
+static Read    os_readat(Os *, Arena *, Str path, i64 off, iz max);
+// (M2) The environment as "NAME=value" entries.
+static Slice<Str> os_environ(Os *, Arena *);
+// (M2) Read standard input: bytes read, 0 at its end, -1 on error.
+static iz      os_stdin(Os *, u8 *buf, iz len);
+
+// (M2) Records that processes and HTTP requests post to their mailbox,
+// with the Spawn or HttpReq id. A payload starts with its integers,
+// native-endian and unaligned, then any text.
+enum : u32 {
+    PROC_TAIL = 1,  // i64 total, then the latest output (4 KiB, <=20 Hz)
+    PROC_LIMIT,     // i64 total: maxbytes reached, output no longer kept
+    PROC_EXIT,      // i32 code, i32 signal (POSIX, else 0): it exited
+    PROC_EOF,       // i64 total: every writer closed the output
+    HTTP_HEAD,      // i32 status, then raw "Name: value\r\n" header lines
+    HTTP_BODY,      // response body bytes, in order
+    HTTP_DONE,      // i32 error (HTTP_OK or HTTP_E*), then a description
+};
+
+enum : i32 {
+    HTTP_OK,
+    HTTP_ECANCEL,   // os_httpcancel
+    HTTP_ECONNECT,  // could not connect (includes TLS failures)
+    HTTP_EIO,       // the connection failed after connecting
+    HTTP_ETOOBIG,   // the response passed maxbytes
+    HTTP_EURL,      // the URL could not be used
+};
+
 // (M2) Child processes: null stdin, merged stdout and stderr pumped into
 // outpath, in a kill-on-close job (Windows) or under a reaper (POSIX).
+// Records: PROC_TAIL may be dropped when the mailbox is full; PROC_EXIT
+// and PROC_EOF arrive exactly once each, in either order, and PROC_LIMIT
+// at most once. A process that escapes and holds the output open delays
+// PROC_EOF indefinitely, so callers bound their wait for it.
 struct Spawn {
     Slice<Str> argv;
+    Str        cmdline;   // Windows: used verbatim instead of quoting argv
     Str        cwd;
     Slice<Str> env;       // complete environment, "NAME=value"
     Str        outpath;   // receives merged output
@@ -145,22 +180,32 @@ struct Spawn {
     Mailbox   *mbox;      // receives process records
     u64        id;
 };
+// Null on failure, explained by os_lasterr. The process is not waited
+// for, and its records may arrive before this returns.
 static Proc   *os_spawn(Os *, Spawn *, Arena scratch);
+// Soft: SIGTERM to the process group (Windows: same as hard, for now).
+// Hard: SIGKILL to the group, or terminate the job: the whole tree.
 static void    os_kill(Os *, Proc *, b32 hard);
+// Drop the caller's reference. Kills nothing by itself on POSIX, but on
+// Windows closing the last reference closes the job, killing the tree.
 static void    os_procfree(Os *, Proc *);
 
-// (M2) HTTP requests, each on its own thread, posting records to mbox.
-// No retries at this layer.
+// (M2) HTTP requests, each on its own thread, posting records to mbox:
+// HTTP_HEAD once if a response arrives, then HTTP_BODY, then always one
+// HTTP_DONE. Body records wait for room in the mailbox. Redirects are
+// not followed. No retries at this layer.
 struct HttpReq {
     Str      method;
     Str      url;
     Str      headers;    // "Name: value\r\n" lines
     Str      body;
     i32      connectms;
+    i32      readms;     // longest wait for data, 0 for no limit
     i64      maxbytes;   // response limit
     Mailbox *mbox;
     u64      id;
 };
+// Null on failure, explained by os_lasterr.
 static Http   *os_http(Os *, HttpReq *, Arena scratch);
 static void    os_httpcancel(Os *, Http *);  // any thread, prompt
 static void    os_httpfree(Os *, Http *);
@@ -197,14 +242,24 @@ static Arena newarena(Region *r)
 #include "ini.cpp"
 #include "mailbox.cpp"
 #include "events.cpp"
+#include "provider.cpp"
+#include "tools.cpp"
+#include "guard.cpp"
+#include "engine.cpp"
+#include "cli.cpp"
 #include "selftest.cpp"
+#include "selftest_io.cpp"
 
 
 static Str usage =
 "usage: harness [options]\n"
-"  --version   print the version and exit\n"
-"  --selftest  run the platform integration tests\n"
-"  -h          print this message\n";
+"       harness run [options] PROMPT\n"
+"       harness --headless [options]\n"
+"  --version         print the version and exit\n"
+"  --selftest [URL]  run the platform integration tests, with HTTP\n"
+"                    tests against a fake provider at URL\n"
+"  -h                print this message\n"
+"Run \"harness run\" without arguments for its options.\n";
 
 static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
 {
@@ -215,13 +270,21 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
         return 2;
     }
 
+    if (nargs>1 && args[1]=="run") {
+        return climain(os, perm, scratch, args, nargs, 0);
+    } else if (nargs>1 && args[1]=="--headless") {
+        return climain(os, perm, scratch, args, nargs, 1);
+    }
+
     for (i32 i = 1; i < nargs; i++) {
         Str a = args[i];
         if (a == "--version") {
             os_print(os, 1, "harness " HARNESS_VERSION "\n");
             return 0;
         } else if (a == "--selftest") {
-            return selftest(os, &perm, scratch);
+            Str url = i+1<nargs ? args[i+1] : Str{};
+            i32 r   = url.len ? 0 : selftest(os, &perm, scratch);
+            return r | selftestio(os, &perm, scratch, url);
         } else if (a == "-h" || a == "--help") {
             os_print(os, 1, usage);
             return 0;

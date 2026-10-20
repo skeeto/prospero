@@ -247,6 +247,35 @@ static void os_logclose(Os *os, iz log)
     os->logs[log] = 0;
 }
 
+static Read os_readat(Os *os, Arena *a, Str path, i64 off, iz max)
+{
+    Read r = os_read(os, a, path, I64MAX>>1);
+    if (!r.err) {
+        Str d = r.data;
+        d = off<d.len ? cuthead(d, (iz)off) : cuthead(d, d.len);
+        r.data = d.len>max ? takehead(d, max) : d;
+    }
+    return r;
+}
+
+static Str os_realpath(Os *os, Arena *a, Str path)
+{
+    VFile *f = vfind(os, path, 0);
+    return f && f->exists ? clone(a, path) : Str{};
+}
+
+// No processes, HTTP, or standard input: the engine is tested end to
+// end by tests/scenarios.py against the real platforms.
+static Slice<Str> os_environ(Os *, Arena *) { return {}; }
+static iz    os_stdin(Os *, u8 *, iz) { return 0; }
+static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
+static void  os_kill(Os *, Proc *, b32) {}
+static void  os_procfree(Os *, Proc *) {}
+static Http *os_http(Os *, HttpReq *, Arena) { return 0; }
+static void  os_httpcancel(Os *, Http *) {}
+static void  os_httpfree(Os *, Http *) {}
+static Str   os_lasterr(Os *, Arena *) { return "not supported in tests"; }
+
 // A fresh test platform with its own storage carved from the arena.
 static Os *newos(Arena *a, iz cap)
 {
