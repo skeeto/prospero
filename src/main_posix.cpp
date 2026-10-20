@@ -21,13 +21,24 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#if HARNESS_GUI
+#  include <SDL3/SDL.h>
+#  include "imgui.h"
+#  include "imgui_internal.h"
+#  include "imgui_impl_sdl3.h"
+#  include "imgui_impl_opengl3.h"
+#  include "misc/freetype/imgui_freetype.h"
+#  include "md4c.h"
+#endif
 #include "harness.cpp"
 
 #ifdef __APPLE__
 extern "C" int _NSGetExecutablePath(char *, u32 *);
 #endif
 
-struct Os {};
+struct Os {
+    void *gui;  // GUI builds: the window's platform state (gui_sdl.cpp)
+};
 
 enum : iz {
     IOMAX        = (iz)1 << 30,  // per call: macOS fails past INT_MAX
@@ -623,6 +634,12 @@ static void os_logclose(Os *, iz log)
 }
 
 
+#if HARNESS_GUI
+#  include "app.cpp"
+#  include "gui_sdl.cpp"
+#endif
+
+
 int main(int argc, char **argv)
 {
     Os      os  = {};
@@ -639,5 +656,10 @@ int main(int argc, char **argv)
         args[i].data = (u8 *)argv[i];
         while (args[i].data[args[i].len]) args[i].len++;
     }
+    #if HARNESS_GUI
+    if (guiwanted(args, argc)) {
+        return gui_main(&os, a, args, argc);
+    }
+    #endif
     return app_main(&os, a, args, argc);
 }

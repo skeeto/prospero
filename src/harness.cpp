@@ -177,6 +177,63 @@ static void    os_busy(Os *, i32 state);
 
 // (M1) GUI builds: wake the GUI loop from any thread, coalesced.
 static void    os_wake(Os *);
+#if HARNESS_GUI
+// The platform owns the window, the renderer and the event loop. The
+// core (app.cpp) decides when to draw (sched.cpp) and what (ui.cpp).
+// The platform calls back into the core: gui_input after giving an
+// input event to ImGui, gui_wake after clearing the wake flag,
+// gui_force for resizes and exposes, gui_scale for DPI changes,
+// gui_minimized, gui_modal around OS modal loops, and gui_frame to draw
+// from inside them.
+struct Gui;
+// Open the main window with ImGui's platform and renderer backends.
+// Returns 0 on failure.
+static b32     os_guiopen(Os *, Gui *, Str title);
+// Wait up to us microseconds (forever if negative) for an event, then
+// dispatch every pending one. Returns 0 once the user quits.
+static b32     os_guiwait(Os *, i64 us);
+// Begin a frame in the backends, before ImGui::NewFrame.
+static void    os_guinewframe(Os *);
+// Render the frame's draw data and present it; or, when not presenting,
+// only apply its texture updates.
+static void    os_guipresent(Os *, b32 present);
+// The display's refresh period in microseconds.
+static i64     os_guirefresh(Os *);
+static void    os_guiclose(Os *);
+
+// Synthetic input for the scripted checklist (gui --drive), posted to
+// the window's own event queue so that it takes the path real input
+// takes. Coordinates are in ImGui's units; GEV_RESIZE resizes the window
+// to x by y.
+enum {
+    GEV_MOVE,
+    GEV_BUTTON,  // button 0 left, 1 right
+    GEV_WHEEL,   // y notches, positive up
+    GEV_KEY,     // key GKEY_*, with ctrl held if set
+    GEV_TEXT,
+    GEV_RESIZE,
+    GEV_MODALSIZE,  // a modal resize: Win32 by keyboard, x steps wider;
+                    // SDL as x of the exposes a live resize sends
+    GEV_DPI,        // Win32: the window moved to a monitor of x DPI
+};
+enum {
+    GKEY_TAB,
+    GKEY_CTRL,
+    GKEY_ESCAPE,
+    GKEY_ENTER,
+    GKEY_C,
+};
+struct GuiEvent {
+    i32 kind;
+    f32 x, y;
+    i32 button;
+    b32 down;
+    i32 key;
+    b32 ctrl;
+    Str text;  // must outlive the event's dispatch
+};
+static void    os_guiinject(Os *, GuiEvent *);
+#endif
 
 
 // A growable arena over a reservation, or a null arena given null.

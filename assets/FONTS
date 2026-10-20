@@ -1,0 +1,13 @@
+Embedded fonts, decompressed unchanged from dcmake's src/*_font.hpp:
+
+Roboto-Medium.ttf
+    Roboto Medium, version 2.001152 (2014)
+    Copyright 2011 Google Inc. All Rights Reserved.
+    Apache License, Version 2.0
+    https://github.com/googlefonts/roboto-2
+
+JetBrainsMono-Regular.ttf
+    JetBrains Mono Regular
+    Copyright 2020 The JetBrains Mono Project Authors
+    SIL Open Font License, Version 1.1
+    https://github.com/JetBrains/JetBrainsMono

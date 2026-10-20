@@ -1,0 +1,645 @@
+// GUI platform for Windows: Win32 and Direct3D 11
+//
+// This file has two halves. Compiled on its own with HARNESS_GUIEDGE,
+// it is the edge translation unit: windows.h, D3D11, ImGui's Win32 and
+// DX11 backends, the window procedure, and the embedded manifest, all
+// behind extern "C" functions. Included by main_win32.cpp, it is the
+// other side: the GUI's os_* functions, calling those. So main_win32.cpp
+// stays free of headers, and the headless build stays free of the CRT.
+//
+// The window procedure renders from inside Windows' modal loops: a
+// resize renders at once from WM_SIZE, and a timer armed while a move,
+// resize or menu loop runs keeps owed frames and deadlines going.
+// Wakes arrive as a posted message, which those loops dispatch too, so
+// streaming continues during a drag.
+//
+// This is free and unencumbered software released into the public domain.
+
+// Shared by both halves: the core's callbacks, called on the GUI thread.
+struct W32Hooks {
+    void  *gui;
+    void (*input)(void *gui, int kind);   // an input message went to ImGui
+    void (*wake)(void *gui);              // the wake flag was cleared
+    void (*force)(void *gui);             // must present: resize, expose
+    void (*tick)(void *gui);              // draw a frame if one is due
+    void (*frame)(void *gui);             // draw a frame now
+    void (*scale)(void *gui, float);      // the DPI scale changed
+    void (*minimized)(void *gui, int);
+    void (*modal)(void *gui, int);        // a modal loop began or ended
+    int    drive;                         // scripted: never take focus
+};
+
+// Input kinds, as app.cpp numbers them (INPUT_*)
+enum {
+    W32IN_MOVE, W32IN_BUTTON, W32IN_WHEEL, W32IN_KEY, W32IN_TEXT,
+    W32IN_FOCUS, W32IN_WINDOW, W32IN_OTHER,
+};
+
+extern "C" void     *w32gui_open(W32Hooks *, unsigned short const *title);
+extern "C" void      w32gui_show(void *);
+extern "C" int       w32gui_wait(void *, long long us);
+extern "C" void      w32gui_wake(void *);
+extern "C" void      w32gui_newframe(void *);
+extern "C" void      w32gui_present(void *, int present);
+extern "C" long long w32gui_refresh(void *);
+extern "C" void      w32gui_inject(void *, int kind, float x, float y,
+                                   int button, int down, int key, int ctrl,
+                                   unsigned short const *text);
+extern "C" void      w32gui_close(void *);
+
+
+#if HARNESS_GUIEDGE
+
+#include <windows.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx11.h"
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+
+// Resources: the manifest (per-monitor DPI awareness v2, common
+// controls v6, the Windows versions it targets), from assets/ by the
+// assembler's include path (-Wa,-I, set by CMake). The pattern is
+// gzip's platform/gui_windows.c.
+__asm__(
+    "    .section .rsrc,\"dr\"\n"
+    "    .p2align 2\n"
+    ".Lroot: .long 0, 0\n"
+    "    .short 0, 0, 0, 1\n"
+    "    .long 24, 0x80000000 + (.Lmans - .Lroot)\n"    // RT_MANIFEST
+    ".Lmans: .long 0, 0\n"
+    "    .short 0, 0, 0, 1\n"
+    "    .long 1, 0x80000000 + (.Lmanid - .Lroot)\n"
+    ".Lmanid: .long 0, 0\n"
+    "    .short 0, 0, 0, 1\n"
+    "    .long 0x409, .Lmandata - .Lroot\n"
+    ".Lmandata:\n"
+    "    .rva .Lman\n"
+    "    .long .Lmanend - .Lman, 0, 0\n"
+    "    .p2align 3\n"
+    ".Lman: .incbin \"assets/harness.manifest\"\n"
+    ".Lmanend:\n"
+    "    .text\n"
+);
+
+enum {
+    WM_APP_WAKE = WM_APP + 1,
+    TIMER_MODAL = 1,
+};
+
+struct W32Gui {
+    W32Hooks                hooks;
+    HWND                    hwnd;
+    HANDLE                  timer;       // high-resolution waitable timer
+    ID3D11Device           *device;
+    ID3D11DeviceContext    *context;
+    IDXGISwapChain         *swapchain;
+    ID3D11RenderTargetView *rtv;
+    LONG                    wakeflag;    // a wake message is queued
+    int                     occluded;
+    int                     inmodal;     // inside a move, size or menu loop
+    int                     width, height;
+};
+
+static void makertv(W32Gui *w)
+{
+    ID3D11Texture2D *back = 0;
+    w->swapchain->GetBuffer(0, IID_PPV_ARGS(&back));
+    if (back) {
+        w->device->CreateRenderTargetView(back, 0, &w->rtv);
+        back->Release();
+    }
+}
+
+static void resize(W32Gui *w, int width, int height)
+{
+    if (!w->swapchain || width<=0 || height<=0) {
+        return;
+    }
+    if (width==w->width && height==w->height) {
+        return;
+    }
+    if (w->rtv) {
+        w->rtv->Release();
+        w->rtv = 0;
+    }
+    w->swapchain->ResizeBuffers(0, (UINT)width, (UINT)height, DXGI_FORMAT_UNKNOWN, 0);
+    makertv(w);
+    w->width  = width;
+    w->height = height;
+}
+
+static int inputkind(UINT msg)
+{
+    switch (msg) {
+    case WM_MOUSEMOVE:
+    case WM_NCMOUSEMOVE:
+        return W32IN_MOVE;
+    case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK: case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK: case WM_MBUTTONUP:
+    case WM_XBUTTONDOWN: case WM_XBUTTONDBLCLK: case WM_XBUTTONUP:
+        return W32IN_BUTTON;
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+        return W32IN_WHEEL;
+    case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+        return W32IN_KEY;
+    case WM_CHAR:
+        return W32IN_TEXT;
+    case WM_SETFOCUS: case WM_KILLFOCUS: case WM_MOUSELEAVE:
+    case WM_NCMOUSELEAVE:
+        return W32IN_FOCUS;
+    case WM_INPUTLANGCHANGE: case WM_DEVICECHANGE: case WM_SETTINGCHANGE:
+        return W32IN_OTHER;
+    }
+    return -1;
+}
+
+static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    W32Gui *w = (W32Gui *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!w) {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    W32Hooks *h = &w->hooks;
+
+    // Scripted input must not be undone by the real pointer, which is
+    // somewhere else entirely.
+    if (h->drive && (msg==WM_MOUSELEAVE || msg==WM_NCMOUSELEAVE)) {
+        return 0;
+    }
+    if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) {
+        return 1;
+    }
+    int kind = inputkind(msg);
+    if (kind >= 0) {
+        h->input(h->gui, kind);
+    }
+
+    switch (msg) {
+    case WM_APP_WAKE:
+        // Cleared before draining: a post during the drain wakes again.
+        InterlockedExchange(&w->wakeflag, 0);
+        h->wake(h->gui);
+        return 0;
+
+    case WM_SIZE:
+        if (wp == SIZE_MINIMIZED) {
+            h->minimized(h->gui, 1);
+            return 0;
+        }
+        resize(w, LOWORD(lp), HIWORD(lp));
+        h->minimized(h->gui, 0);
+        h->force(h->gui);
+        h->frame(h->gui);  // at once, even inside a modal resize
+        return 0;
+
+    case WM_ENTERSIZEMOVE:
+    case WM_ENTERMENULOOP:
+        w->inmodal = 1;
+        h->modal(h->gui, 1);
+        SetTimer(hwnd, TIMER_MODAL, 10, 0);
+        return 0;
+    case WM_EXITSIZEMOVE:
+    case WM_EXITMENULOOP:
+        w->inmodal = 0;
+        h->modal(h->gui, 0);
+        KillTimer(hwnd, TIMER_MODAL);
+        return 0;
+    case WM_TIMER:
+        if (wp == TIMER_MODAL) {
+            h->tick(h->gui);
+            return 0;
+        }
+        break;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        EndPaint(hwnd, &ps);
+        w->occluded = 0;
+        h->minimized(h->gui, 0);
+        h->force(h->gui);
+        if (w->inmodal) {
+            h->frame(h->gui);
+        }
+    } return 0;
+
+    case WM_ACTIVATE:
+        if (LOWORD(wp) != WA_INACTIVE && w->occluded) {
+            w->occluded = 0;
+            h->minimized(h->gui, 0);
+            h->force(h->gui);
+        }
+        break;
+
+    case WM_DPICHANGED: {
+        RECT *r = (RECT *)lp;
+        SetWindowPos(hwnd, 0, r->left, r->top, r->right-r->left,
+                     r->bottom-r->top, SWP_NOZORDER|SWP_NOACTIVATE);
+        h->scale(h->gui, (float)HIWORD(wp) / 96.0f);
+        h->force(h->gui);
+    } return 0;
+
+    case WM_SYSKEYDOWN:
+        // No menu loop for F10 or Alt, but Alt+F4 still closes.
+        if (wp != VK_F4) {
+            return 0;
+        }
+        break;
+    case WM_SYSCOMMAND:
+        if ((wp & 0xfff0) == SC_KEYMENU) {
+            return 0;
+        }
+        break;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static int makedevice(W32Gui *w, D3D_DRIVER_TYPE type)
+{
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferCount       = 2;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage       = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow      = w->hwnd;
+    sd.SampleDesc.Count  = 1;
+    sd.Windowed          = TRUE;
+    sd.SwapEffect        = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0};
+    D3D_FEATURE_LEVEL got;
+    HRESULT r = D3D11CreateDeviceAndSwapChain(
+        0, type, 0, 0, levels, 2, D3D11_SDK_VERSION, &sd, &w->swapchain,
+        &w->device, &got, &w->context
+    );
+    if (r == DXGI_ERROR_INVALID_CALL) {
+        // Before Windows 10: no flip discard, so the classic model.
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        r = D3D11CreateDeviceAndSwapChain(
+            0, type, 0, 0, levels, 2, D3D11_SDK_VERSION, &sd, &w->swapchain,
+            &w->device, &got, &w->context
+        );
+    }
+    return r == S_OK;
+}
+
+extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
+{
+    W32Gui *w = (W32Gui *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(W32Gui));
+    if (!w) {
+        return 0;
+    }
+    w->hooks = *hooks;
+    // A high-resolution timer waits precisely without raising the
+    // system timer rate (Windows 10 1803+); otherwise a plain one.
+    w->timer = CreateWaitableTimerExW(0, 0, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                      TIMER_ALL_ACCESS);
+    if (!w->timer) {
+        w->timer = CreateWaitableTimerW(0, 0, 0);
+    }
+
+    HINSTANCE   inst = GetModuleHandleW(0);
+    WNDCLASSEXW wc   = {};
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_CLASSDC;
+    wc.lpfnWndProc   = wndproc;
+    wc.hInstance     = inst;
+    wc.hCursor       = LoadCursorW(0, (LPCWSTR)IDC_ARROW);
+    wc.lpszClassName = L"harness";
+    RegisterClassExW(&wc);
+
+    w->hwnd = CreateWindowExW(
+        0, L"harness", (LPCWSTR)title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+        CW_USEDEFAULT, 1280, 800, 0, 0, inst, 0
+    );
+    if (!w->hwnd) {
+        return 0;
+    }
+    float scale = ImGui_ImplWin32_GetDpiScaleForHwnd(w->hwnd);
+    RECT  r     = {0, 0, (LONG)(1280*scale), (LONG)(800*scale)};
+    AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, 0, 0);
+    SetWindowPos(w->hwnd, 0, 0, 0, r.right-r.left, r.bottom-r.top,
+                 SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+
+    // Hardware, else WARP: a VM or a remote session may have no GPU.
+    if (!makedevice(w, D3D_DRIVER_TYPE_HARDWARE) &&
+            !makedevice(w, D3D_DRIVER_TYPE_WARP)) {
+        DestroyWindow(w->hwnd);
+        return 0;
+    }
+    IDXGIFactory *factory = 0;
+    if (SUCCEEDED(w->swapchain->GetParent(IID_PPV_ARGS(&factory)))) {
+        factory->MakeWindowAssociation(w->hwnd, DXGI_MWA_NO_ALT_ENTER);
+        factory->Release();
+    }
+    makertv(w);
+    RECT cr;
+    GetClientRect(w->hwnd, &cr);
+    w->width  = cr.right;
+    w->height = cr.bottom;
+
+    ImGui_ImplWin32_Init(w->hwnd);
+    ImGui_ImplDX11_Init(w->device, w->context);
+    hooks->scale(hooks->gui, scale);
+
+    SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, (LONG_PTR)w);
+    return w;
+}
+
+// Separate from opening, since showing sends WM_SIZE, which draws, which
+// needs the core to know this window.
+extern "C" void w32gui_show(void *p)
+{
+    W32Gui *w = (W32Gui *)p;
+    ShowWindow(w->hwnd, w->hooks.drive ? SW_SHOWNOACTIVATE : SW_SHOWDEFAULT);
+}
+
+extern "C" int w32gui_wait(void *p, long long us)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (us < 0) {
+        MsgWaitForMultipleObjectsEx(0, 0, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    } else if (us > 0) {
+        LARGE_INTEGER due;
+        due.QuadPart = -us * 10;  // relative, in 100 ns units
+        SetWaitableTimer(w->timer, &due, 0, 0, 0, 0);
+        MsgWaitForMultipleObjectsEx(1, &w->timer, INFINITE, QS_ALLINPUT,
+                                    MWMO_INPUTAVAILABLE);
+    }
+    MSG m;
+    while (PeekMessageW(&m, 0, 0, 0, PM_REMOVE)) {
+        if (m.message == WM_QUIT) {
+            return 0;
+        }
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    return 1;
+}
+
+extern "C" void w32gui_wake(void *p)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (!InterlockedExchange(&w->wakeflag, 1)) {
+        PostMessageW(w->hwnd, WM_APP_WAKE, 0, 0);
+    }
+}
+
+extern "C" void w32gui_newframe(void *)
+{
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+}
+
+extern "C" void w32gui_present(void *p, int present)
+{
+    W32Gui     *w  = (W32Gui *)p;
+    ImDrawData *dd = ImGui::GetDrawData();
+    if (!present) {
+        // Atlas growth must reach the GPU even when the picture holds.
+        for (int i = 0; dd->Textures && i < dd->Textures->Size; i++) {
+            ImTextureData *tex = (*dd->Textures)[i];
+            if (tex->Status != ImTextureStatus_OK) {
+                ImGui_ImplDX11_UpdateTexture(tex);
+            }
+        }
+        return;
+    }
+    float clear[4] = {0.08f, 0.08f, 0.09f, 1};
+    w->context->OMSetRenderTargets(1, &w->rtv, 0);
+    w->context->ClearRenderTargetView(w->rtv, clear);
+    ImGui_ImplDX11_RenderDrawData(dd);
+    HRESULT r = w->swapchain->Present(1, 0);
+    if (r == DXGI_STATUS_OCCLUDED) {
+        // Nothing shows: rest until painted or activated again.
+        w->occluded = 1;
+        w->hooks.minimized(w->hooks.gui, 1);
+    }
+}
+
+extern "C" long long w32gui_refresh(void *p)
+{
+    W32Gui *w = (W32Gui *)p;
+    HDC dc = GetDC(w->hwnd);
+    int hz = GetDeviceCaps(dc, VREFRESH);
+    ReleaseDC(w->hwnd, dc);
+    return 1000000 / (hz>1 ? hz : 60);
+}
+
+// Arrow keys for a modal size loop, paced like a hand on the keyboard,
+// so the loop runs long enough for its timer and wakes to matter.
+struct ModalSteer {
+    HWND hwnd;
+    int  steps;
+};
+
+static DWORD WINAPI steermodal(void *arg)
+{
+    ModalSteer *s = (ModalSteer *)arg;
+    Sleep(100);
+    PostMessageW(s->hwnd, WM_KEYDOWN, VK_RIGHT, 1);  // picks the right edge
+    for (int i = 0; i < s->steps; i++) {
+        Sleep(60);
+        PostMessageW(s->hwnd, WM_KEYDOWN, VK_RIGHT, 1);
+    }
+    Sleep(60);
+    PostMessageW(s->hwnd, WM_KEYDOWN, VK_RETURN, 1);
+    return 0;
+}
+
+extern "C" void w32gui_inject(void *p, int kind, float x, float y,
+                              int button, int down, int key, int ctrl,
+                              unsigned short const *text)
+{
+    W32Gui *w  = (W32Gui *)p;
+    LPARAM  xy = MAKELPARAM((int)x, (int)y);
+    switch (kind) {
+    case 0:  // move
+        PostMessageW(w->hwnd, WM_MOUSEMOVE, 0, xy);
+        break;
+    case 1: {  // button
+        UINT m = button ? (down ? WM_RBUTTONDOWN : WM_RBUTTONUP)
+                        : (down ? WM_LBUTTONDOWN : WM_LBUTTONUP);
+        PostMessageW(w->hwnd, m, down ? (button ? MK_RBUTTON : MK_LBUTTON) : 0, xy);
+    } break;
+    case 2: {  // wheel
+        POINT pt = {(LONG)x, 0};
+        ClientToScreen(w->hwnd, &pt);
+        PostMessageW(w->hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, (short)(y*WHEEL_DELTA)),
+                     MAKELPARAM(pt.x, pt.y));
+    } break;
+    case 3: {  // key: the backend reads modifiers from the key state
+        static WORD const vks[] = {VK_TAB, VK_CONTROL, VK_ESCAPE, VK_RETURN, 'C'};
+        BYTE state[256];
+        GetKeyboardState(state);
+        state[VK_CONTROL] = state[VK_LCONTROL] = ctrl ? 0x80 : 0;
+        if (vks[key] != VK_CONTROL) {
+            state[vks[key]] = down ? 0x80 : 0;
+        }
+        SetKeyboardState(state);
+        WORD   vk   = vks[key]==VK_CONTROL ? VK_LCONTROL : vks[key];
+        UINT   scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        LPARAM l    = 1 | (LPARAM)scan<<16 | (down ? 0 : (LPARAM)3<<30);
+        PostMessageW(w->hwnd, down ? WM_KEYDOWN : WM_KEYUP, vks[key], l);
+    } break;
+    case 4:  // text
+        for (int i = 0; text && text[i]; i++) {
+            PostMessageW(w->hwnd, WM_CHAR, text[i], 1);
+        }
+        break;
+    case 5: {  // resize the client area
+        RECT r = {0, 0, (LONG)x, (LONG)y};
+        AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, 0, 0);
+        SetWindowPos(w->hwnd, 0, 0, 0, r.right-r.left, r.bottom-r.top,
+                     SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+    } break;
+    case 6: {  // the system's modal size loop, steered by arrow keys
+        PostMessageW(w->hwnd, WM_SYSCOMMAND, SC_SIZE, 0);
+        static ModalSteer steer;
+        steer.hwnd  = w->hwnd;
+        steer.steps = (int)x;
+        HANDLE t = CreateThread(0, 0, steermodal, &steer, 0, 0);
+        if (t) CloseHandle(t);
+    } break;
+    case 7: {  // as if moved to a monitor of x DPI, keeping the window size
+        RECT r;
+        GetWindowRect(w->hwnd, &r);
+        WPARAM dpi = (WPARAM)x;
+        SendMessageW(w->hwnd, WM_DPICHANGED, MAKEWPARAM(dpi, dpi), (LPARAM)&r);
+    } break;
+    }
+}
+
+extern "C" void w32gui_close(void *p)
+{
+    W32Gui *w = (W32Gui *)p;
+    SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, 0);
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    if (w->rtv)       w->rtv->Release();
+    if (w->swapchain) w->swapchain->Release();
+    if (w->context)   w->context->Release();
+    if (w->device)    w->device->Release();
+    DestroyWindow(w->hwnd);
+    UnregisterClassW(L"harness", GetModuleHandleW(0));
+}
+
+// CRT startup lands here (-municode), and the core takes over.
+extern "C" void harness_main();
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
+{
+    harness_main();
+    return 0;
+}
+
+
+#else  // the core's side, included by main_win32.cpp
+
+
+static_assert((i32)W32IN_MOVE==(i32)INPUT_MOVE && (i32)W32IN_OTHER==(i32)INPUT_OTHER);
+static_assert(GEV_MOVE==0 && GEV_RESIZE==5 && GEV_MODALSIZE==6 && GEV_DPI==7);
+
+W32(i32, GetCurrentThreadId());
+
+static void hookinput(void *g, int kind) { gui_input((Gui *)g, kind); }
+static void hookwake(void *g)            { gui_wake((Gui *)g); }
+static void hookforce(void *g)           { gui_force((Gui *)g); }
+static void hookframe(void *g)           { gui_frame((Gui *)g); }
+static void hookscale(void *g, float s)  { gui_scale((Gui *)g, s); }
+static void hookminimized(void *g, int m){ gui_minimized((Gui *)g, m); }
+static void hookmodal(void *g, int m)    { gui_modal((Gui *)g, m); }
+
+static void hooktick(void *p)
+{
+    Gui *g = (Gui *)p;
+    g->sched.now = os_ticks(g->os);
+    if (scheddue(&g->sched)) {
+        gui_frame(g);
+    }
+}
+
+static void os_wake(Os *os)
+{
+    if (os->gui) {
+        w32gui_wake(os->gui);
+    }
+}
+
+static b32 os_guiopen(Os *os, Gui *g, Str title)
+{
+    W32Hooks h = {};
+    h.gui       = g;
+    h.input     = hookinput;
+    h.wake      = hookwake;
+    h.force     = hookforce;
+    h.tick      = hooktick;
+    h.frame     = hookframe;
+    h.scale     = hookscale;
+    h.minimized = hookminimized;
+    h.modal     = hookmodal;
+    h.drive     = g->drive;
+    Arena t = g->frame;
+    os->gui = w32gui_open(&h, (unsigned short *)towide(&t, title).data);
+    if (!os->gui) {
+        return 0;
+    }
+    w32gui_show(os->gui);
+    if (g->drive) {
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: GUI thread ");
+        print(&b, (i64)GetCurrentThreadId());
+        guilog(g, finish(&b));
+    }
+    return 1;
+}
+
+static b32 os_guiwait(Os *os, i64 us)
+{
+    return w32gui_wait(os->gui, us);
+}
+
+static void os_guinewframe(Os *os)
+{
+    w32gui_newframe(os->gui);
+}
+
+static void os_guipresent(Os *os, b32 present)
+{
+    w32gui_present(os->gui, present);
+}
+
+static i64 os_guirefresh(Os *os)
+{
+    return w32gui_refresh(os->gui);
+}
+
+static void os_guiinject(Os *os, GuiEvent *e)
+{
+    Arena a = {};
+    u8    buf[256];
+    a.beg = (byte *)buf;
+    a.end = (byte *)buf + countof(buf);
+    unsigned short *text = 0;
+    if (e->text.len) {
+        text = (unsigned short *)towide(&a, e->text).data;
+    }
+    w32gui_inject(os->gui, e->kind, e->x, e->y, e->button, e->down, e->key,
+                  e->ctrl, text);
+}
+
+static void os_guiclose(Os *os)
+{
+    w32gui_close(os->gui);
+    os->gui = 0;
+}
+
+#endif

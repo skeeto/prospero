@@ -11,6 +11,12 @@
 // at the system call.
 //
 // This is free and unencumbered software released into the public domain.
+#if HARNESS_GUI
+#  include "imgui.h"
+#  include "imgui_internal.h"
+#  include "misc/freetype/imgui_freetype.h"
+#  include "md4c.h"
+#endif
 #include "harness.cpp"
 #include "wide.cpp"
 
@@ -174,8 +180,8 @@ W32(b32,    WriteConsoleW(uz, c16 *, i32, i32 *, uz));
 W32(b32,    WriteFile(uz, u8 *, i32, i32 *, Overlapped *));
 
 // GCC emits calls to these even without a CRT. Defining them keeps
-// msvcrt.dll out of the imports.
-#if defined(__x86_64__) || defined(__i386__)
+// msvcrt.dll out of the imports. GUI builds have the CRT's.
+#if !HARNESS_GUI && (defined(__x86_64__) || defined(__i386__))
 extern "C" void *memcpy(void *dst, void const *src, uz len)
 {
     void *r = dst;
@@ -215,7 +221,8 @@ extern "C" i32 memcmp(void const *a, void const *b, uz len)
 #endif
 
 struct Os {
-    i64 freq;  // performance counter ticks per second
+    i64   freq;  // performance counter ticks per second
+    void *gui;   // GUI builds: the window's platform state (gui_win32.cpp)
 };
 
 enum : iz {
@@ -869,8 +876,19 @@ static void os_logclose(Os *, iz log)
 }
 
 
+#if HARNESS_GUI
+#  include "app.cpp"
+#  include "gui_win32.cpp"
+#endif
+
+
+#if HARNESS_GUI
+// GUI builds start in the CRT, whose wWinMain (gui_win32.cpp) calls this.
+extern "C" void harness_main()
+#else
 extern "C" __attribute((force_align_arg_pointer))
 void mainCRTStartup()
+#endif
 {
     Os os = {};
     QueryPerformanceFrequency(&os.freq);
@@ -887,5 +905,10 @@ void mainCRTStartup()
     for (; cmd[len]; len++) {}
     Slice<Str> args = splitcmdline(&a, fromwide(&a, cmd, len));
 
+    #if HARNESS_GUI
+    if (guiwanted(args.data, (i32)args.len)) {
+        ExitProcess(gui_main(&os, a, args.data, (i32)args.len));
+    }
+    #endif
     ExitProcess(app_main(&os, a, args.data, (i32)args.len));
 }

@@ -11,6 +11,7 @@ include(CheckLinkerFlag)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 set(HARNESS_NAME harness CACHE STRING "Executable name")
+option(HARNESS_GUI "Build the GUI (OFF: the headless engine only)" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -53,7 +54,27 @@ target_link_options(harness_core_flags INTERFACE
 
 check_linker_flag(CXX -nostdlib++ HARNESS_HAS_NOSTDLIBXX)
 
-if(WIN32)
+if(HARNESS_GUI)
+  include(FetchGui)
+endif()
+
+if(WIN32 AND HARNESS_GUI)
+  # The GUI build has CRT startup, since FreeType, md4c and ImGui need a
+  # CRT, though the core still never calls it. windows.h, D3D11 and the
+  # ImGui Win32 backends stay in the gui_win32.cpp edge, which embeds
+  # the manifest (assets/, through -Wa,-I).
+  add_library(harness_gui OBJECT src/gui_win32.cpp)
+  target_link_libraries(harness_gui PRIVATE imgui)
+  target_compile_definitions(harness_gui PRIVATE HARNESS_GUIEDGE=1)
+  target_compile_options(harness_gui PRIVATE
+    -fno-exceptions -fno-rtti -Wa,-I${PROJECT_SOURCE_DIR}
+  )
+  add_executable(harness WIN32 src/main_win32.cpp)
+  target_link_libraries(harness PRIVATE
+    harness_gui imgui md4c kernel32 advapi32
+  )
+  target_link_options(harness PRIVATE -static -municode)
+elseif(WIN32)
   # CRT-free: system DLLs only. Static libgcc keeps its helpers (e.g.
   # 64-bit division on i686) from adding a DLL dependency.
   add_executable(harness src/main_win32.cpp)
@@ -63,17 +84,41 @@ else()
   find_package(Threads REQUIRED)
   add_executable(harness src/main_posix.cpp)
   target_link_libraries(harness PRIVATE Threads::Threads)
+  if(HARNESS_GUI)
+    target_link_libraries(harness PRIVATE imgui md4c)
+  endif()
   if(HARNESS_HAS_NOSTDLIBXX)
     target_link_options(harness PRIVATE -nostdlib++)
   endif()
 endif()
 target_link_libraries(harness PRIVATE harness_core_flags)
+if(HARNESS_GUI)
+  target_compile_definitions(harness PRIVATE HARNESS_GUI=1)
+endif()
+if(APPLE AND HARNESS_GUI)
+  # The same binary, also wrapped as an application bundle, which macOS
+  # wants for a window of its own in the Dock and app switcher.
+  add_custom_command(TARGET harness POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory Harness.app/Contents/MacOS
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${PROJECT_SOURCE_DIR}/assets/Info.plist Harness.app/Contents/Info.plist
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:harness> Harness.app/Contents/MacOS/harness
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    VERBATIM
+  )
+endif()
 set_target_properties(harness PROPERTIES OUTPUT_NAME ${HARNESS_NAME})
 
 if(NOT CMAKE_CROSSCOMPILING)
   enable_testing()
   add_executable(harness_test src/main_test.cpp)
   target_link_libraries(harness_test PRIVATE harness_core_flags)
+  if(HARNESS_GUI)
+    # The GUI's pure modules: scheduler, markdown, layout, view model.
+    target_link_libraries(harness_test PRIVATE md4c)
+    target_compile_definitions(harness_test PRIVATE HARNESS_GUI=1)
+  endif()
   if(HARNESS_HAS_NOSTDLIBXX)
     target_link_options(harness_test PRIVATE -nostdlib++)
   endif()

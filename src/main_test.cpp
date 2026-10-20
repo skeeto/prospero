@@ -4,6 +4,9 @@
 // This is free and unencumbered software released into the public domain.
 #include <stdio.h>
 #include <stdlib.h>
+#if HARNESS_GUI
+#  include "md4c.h"
+#endif
 #include "harness.cpp"
 #include "wide.cpp"
 
@@ -301,6 +304,18 @@ static Str istr(Arena *a, i64 v)
 #include "test/ini_test.cpp"
 #include "test/mailbox_test.cpp"
 #include "test/events_test.cpp"
+#if HARNESS_GUI
+#  include "sched.cpp"
+#  include "highlight.cpp"
+#  include "doc.cpp"
+#  include "layout.cpp"
+#  include "view.cpp"
+#  include "test/sched_test.cpp"
+#  include "test/highlight_test.cpp"
+#  include "test/doc_test.cpp"
+#  include "test/layout_test.cpp"
+#  include "test/view_test.cpp"
+#endif
 
 int main()
 {
@@ -316,6 +331,13 @@ int main()
     test_ini(&t);
     test_mailbox(&t);
     test_events(&t);
+    #if HARNESS_GUI
+    test_sched(&t);
+    test_highlight(&t);
+    test_doc(&t);
+    test_layout(&t);
+    test_view(&t);
+    #endif
 
     fprintf(stderr, "%d tests, %d failed\n", t.run, t.failed);
     return t.failed ? 1 : 0;
