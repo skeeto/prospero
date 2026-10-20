@@ -161,7 +161,6 @@ enum : i32 {
     HTTP_ECONNECT,  // could not connect (includes TLS failures)
     HTTP_EIO,       // the connection failed after connecting
     HTTP_ETOOBIG,   // the response passed maxbytes
-    HTTP_EURL,      // the URL could not be used
 };
 
 // (M2) Child processes: null stdin, merged stdout and stderr pumped into
