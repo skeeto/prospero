@@ -248,7 +248,14 @@ static void testoverhead(ProcTest *p, Arena scratch)
     }
     report(os, scratch, "spawn to exit of true: best", millis(best), 2, " ms");
     report(os, scratch, "spawn to exit of true: mean", millis(sum/n), 2, " ms");
-    if (!HOST_WINDOWS) {
+    #if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+    b32 instrumented = 1;
+    #elif defined(__has_feature)
+    b32 instrumented = __has_feature(thread_sanitizer) || __has_feature(address_sanitizer);
+    #else
+    b32 instrumented = 0;
+    #endif
+    if (!HOST_WINDOWS && !instrumented) {
         check(t, sum/n < 5000, "spawn overhead under 5 ms");
     }
 }

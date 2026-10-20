@@ -292,7 +292,9 @@ static void stdinthread(void *arg)
             skip  = 0;
             start = i + 1;
         }
-        __builtin_memmove(buf, buf+start, (uz)(len-start));
+        for (iz i = start; i < len; i++) {
+            buf[i-start] = buf[i];  // the partial line to the front
+        }
         len -= start;
         if (len == cap) {
             len  = 0;

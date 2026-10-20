@@ -273,10 +273,12 @@ static Repair repairargs(Arena *a, Str raw)
         return r;
     }
 
+    Str body = esc.len && esc[esc.len-1]=='}' ? cuttail(esc, 1) : esc;
     Str tries[] = {
         concat(a, esc, "}"),
         concat(a, esc, "]}"),
         concat(a, esc, "}}"),
+        concat(a, body, "]}"),
         cuttail(esc, 1),
     };
     for (iz i = 0; i < countof(tries); i++) {
@@ -942,7 +944,7 @@ static i64 retryafter(Str headers, i64 nowms)
 }
 
 // Backoff before retry n (from 1): min(500 ms * 2^(n-1), 8 s), scaled by
-// a factor in [0.75, 1) from rnd.
+// a factor in [0.75, 1] from rnd.
 static i64 backoffms(i32 n, u64 rnd)
 {
     i64 base = n>=5 ? 8000 : (i64)500<<(n-1);
@@ -1102,7 +1104,9 @@ static iz cyclefeed(Cycle *c, Str text)
     for (iz i = 0; i < text.len; i++) {
         if (c->len == CYCLE_TAIL) {
             iz drop = CYCLE_TAIL/2;
-            __builtin_memmove(c->buf, c->buf+drop, (uz)(CYCLE_TAIL-drop));
+            for (iz k = drop; k < CYCLE_TAIL; k++) {
+                c->buf[k-drop] = c->buf[k];
+            }
             c->len -= drop;
         }
         c->buf[c->len++] = text[i];

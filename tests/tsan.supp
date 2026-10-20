@@ -1,0 +1,12 @@
+# ThreadSanitizer suppressions for the harness
+#   TSAN_OPTIONS=suppressions=tests/tsan.supp ./build-tsan/harness ...
+#
+# macOS recycles a finished detached thread's pthread block, where errno
+# lives, for the next new thread, and TSan does not reset that range when
+# the new thread starts, so errno accesses in two unrelated threads look
+# like a race. os_signal saves and restores errno (it runs in signal
+# handlers too) and os_wait reads it after failed calls, so they are the
+# ones reported. They touch nothing else shared but the event's
+# descriptors, which never change after os_eventinit.
+race:os_signal
+race:os_wait

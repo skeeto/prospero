@@ -1017,7 +1017,7 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
         errno = ENOMEM;
         return 0;
     }
-    __builtin_memset(p, 0, offsetof(Proc, tail));
+    __builtin_memset(p, 0, __builtin_offsetof(Proc, tail));
     os_lockinit(&p->lock);
     p->refs     = 3;
     p->pid      = pid;
@@ -1350,7 +1350,7 @@ static Http *os_http(Os *os, HttpReq *req, Arena scratch)
         errno = ENOMEM;
         return 0;
     }
-    __builtin_memset(h, 0, sizeof(Http));
+    new (h) Http();
     u8 *p = (u8 *)(h + 1);
     h->origin = (char *)p;
     copybytes(p, origin.data, origin.len);

@@ -118,7 +118,7 @@ class SshHost:
         subprocess.run(["ssh", "-M", "-S", self.ctl, "-fN", "-o", "ExitOnForwardFailure=yes",
                         "-R", f"{rport}:127.0.0.1:{port}", host], check=True)
         self.url = f"http://127.0.0.1:{rport}"
-        tmp = self.sh("cd \"$TMP\" && pwd -W").strip()
+        tmp = self.sh("echo \"$TMP\"").strip()
         self.root = f"{tmp}/harness-scen-{random.randrange(1 << 32):08x}"
         self.sh(f"mkdir -p {self.root} && cp $HOME/w64devkit/bin/busybox.exe "
                 f"{self.root}/busybox.exe && cp {shlex.quote(harness)} {self.root}/harness.exe")
@@ -284,6 +284,8 @@ class T:
         finally:
             killer.cancel()
         err = p.stderr.read()
+        if "ThreadSanitizer" in err or "AddressSanitizer" in err:
+            raise Failure("sanitizer report:\n" + err[:4000])
         return Result(p.returncode, lines, err, time.monotonic() - t0)
 
     def headless(self):
@@ -378,6 +380,9 @@ class Headless:
             self.p.kill()
             self.p.wait()
         self.reader.join(2)
+        err = self.p.stderr.read()
+        if "ThreadSanitizer" in err or "AddressSanitizer" in err:
+            raise Failure("sanitizer report:\n" + err[:4000])
         return self.p.returncode
 
 

@@ -27,22 +27,25 @@ static b32 issep(u8 c, b32 win)
 }
 
 // Length of the root of a path, 0 if relative: "/", "C:/", "//h/s/".
+// On Windows, "\x" is rooted but has no root of its own: it takes the
+// working directory's drive.
 static iz pathroot(Str p, b32 win)
 {
-    if (win) {
-        if (p.len>=3 && letter(p[0]) && p[1]==':' && issep(p[2], 1)) {
-            return 3;
-        }
-        if (p.len>=2 && issep(p[0], 1) && issep(p[1], 1)) {
-            iz i = 2;
-            for (i32 parts = 0; parts < 2; parts++) {
-                for (; i<p.len && !issep(p[i], 1); i++) {}
-                i += i < p.len;
-            }
-            return i;
-        }
+    if (!win) {
+        return p.len && p[0]=='/';
     }
-    return p.len && issep(p[0], win) ? 1 : 0;
+    if (p.len>=3 && letter(p[0]) && p[1]==':' && issep(p[2], 1)) {
+        return 3;
+    }
+    if (p.len>=2 && issep(p[0], 1) && issep(p[1], 1)) {
+        iz i = 2;
+        for (i32 parts = 0; parts < 2; parts++) {
+            for (; i<p.len && !issep(p[i], 1); i++) {}
+            i += i < p.len;
+        }
+        return i;
+    }
+    return 0;
 }
 
 // Absolute, with "." and ".." folded and '/' separators. The working

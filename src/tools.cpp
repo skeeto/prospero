@@ -520,19 +520,51 @@ static Slice<Dirent *> sortedlist(Os *os, Arena *a, Str dir)
     return r;
 }
 
-// "File not found" with up to three similar names from its directory.
+// Edit distance ignoring ASCII case, or limit+1 once past limit.
+static iz distance(Arena scratch, Str x, Str y, iz limit)
+{
+    if (x.len-y.len>limit || y.len-x.len>limit) {
+        return limit + 1;
+    }
+    iz *row = alloc<iz>(&scratch, y.len+1);
+    for (iz j = 0; j <= y.len; j++) {
+        row[j] = j;
+    }
+    for (iz i = 1; i <= x.len; i++) {
+        iz diag = row[0];
+        iz best = row[0] = i;
+        for (iz j = 1; j <= y.len; j++) {
+            iz up   = row[j];
+            iz cost = lowercase(x[i-1]) != lowercase(y[j-1]);
+            iz v    = diag + cost;
+            v = up+1<v ? up+1 : v;
+            v = row[j-1]+1<v ? row[j-1]+1 : v;
+            row[j] = v;
+            diag   = up;
+            best   = v<best ? v : best;
+        }
+        if (best > limit) {
+            return limit + 1;
+        }
+    }
+    return row[y.len];
+}
+
+// "File not found" with up to three similar names from its directory:
+// close in spelling, or one name a prefix of the other.
 static Str notfound(Os *os, Arena *a, Str cwd, Str path)
 {
-    Str want = basename(path);
-    Str dir  = showpath(cwd, parentdir(path));
+    Str want  = basename(path);
+    Str dir   = parentdir(path);
+    iz  limit = want.len/4 > 1 ? want.len/4 : 1;
     Slice<Str> like = {};
-    Slice<Dirent *> ents = sortedlist(os, a, parentdir(path));
+    Slice<Dirent *> ents = sortedlist(os, a, dir);
     for (iz i = 0; i<ents.len && like.len<3; i++) {
         Str name = ents[i]->name;
-        if (equalfold(name, want) ||
-                (want.len>=3 && (startswith(name, want) || endswith(name, want))) ||
+        if (distance(*a, name, want, limit) <= limit ||
+                (want.len>=3 && startswith(name, want)) ||
                 (name.len>=3 && startswith(want, name))) {
-            like = push(a, like, join(a, dir, name));
+            like = push(a, like, showpath(cwd, join(a, dir, name)));
         }
     }
 
@@ -628,7 +660,7 @@ static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args)
 
     iz total  = countlines(data);
     iz first  = args->offset ? (iz)args->offset : 1;
-    iz limit  = args->limit && args->limit<READ_LINES ? (iz)args->limit : READ_LINES;
+    iz limit  = args->limit && args->limit<READ_LINES ? (iz)args->limit : (iz)READ_LINES;
     if (first > total) {
         Buf b(a, 160);
         print(&b, "The file has only ");

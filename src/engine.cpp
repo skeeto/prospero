@@ -199,7 +199,7 @@ struct Engine {
     Str         statedir;
     Str         exedir;
     ToolEnv     te;
-    Slice<Str>  environ;
+    Slice<Str>  env;      // inherited environment
     Session    *sessions;
     Map<i64>   *trained;  // n_ctx_train by "url model", learned when loaded
     u64         nextid;
@@ -1006,7 +1006,7 @@ static b32 startshell(Session *s, Arena scratch, Args *args)
     sp.argv     = sc.argv;
     sp.cmdline  = sc.cmdline;
     sp.cwd      = s->cwd;
-    sp.env      = shellenv(&scratch, e->environ, s->te.windows);
+    sp.env      = shellenv(&scratch, e->env, s->te.windows);
     sp.outpath  = s->sh.spill;
     sp.maxbytes = SHELL_OUTMAX;
     sp.mbox     = e->in;
@@ -2098,7 +2098,7 @@ static Engine *newengine(Os *os, Arena *perm, Ini *ini, Str statedir, Mailbox *o
     Str exe    = os_exepath(os, &e->perm);
     e->exedir  = parentdir(exe);
     e->te      = findshell(os, &e->perm, newarena(e->scratch), e->exedir, HOST_WINDOWS);
-    e->environ = os_environ(os, &e->perm);
+    e->env = os_environ(os, &e->perm);
     return e;
 }
 

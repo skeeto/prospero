@@ -2,8 +2,14 @@
 // $ cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain-Mingw64.cmake
 // $ c++ -std=c++20 -nostartfiles -o harness.exe src/main_win32.cpp -ladvapi32
 //
-// Imports only kernel32.dll and advapi32.dll (RtlGenRandom), with
-// nothing newer than Windows XP, so the XP engine builds from this file.
+// Imports only kernel32.dll, advapi32.dll (RtlGenRandom), and winhttp.dll,
+// with nothing newer than Windows XP except the automatic proxy, which is
+// tried first, so the XP engine builds from this file.
+//
+// Each tool process runs in its own job object that kills the whole tree
+// when its last handle closes, which includes this process dying by any
+// means. HTTP goes through WinHTTP in synchronous mode, one thread per
+// request, cancelled by closing the request handle from another thread.
 //
 // Paths are UTF-8 with either separator. Each is made absolute and
 // extended-length (\\?\) before use, so MAX_PATH never applies. A path
@@ -55,6 +61,38 @@ enum : i32 {
     STACK_SIZE_PARAM_IS_A_RESERVATION = 0x10000,
     STD_ERROR_HANDLE                  = -12,
     WAIT_OBJECT_0                     = 0,
+    // Processes
+    CREATE_NEW_PROCESS_GROUP          = 0x00000200,
+    CREATE_NO_WINDOW                  = 0x08000000,
+    CREATE_SUSPENDED                  = 0x00000004,
+    CREATE_UNICODE_ENVIRONMENT        = 0x00000400,
+    CREATE_ALWAYS                     = 2,
+    ERROR_BROKEN_PIPE                 = 109,
+    ERROR_NOT_ENOUGH_MEMORY           = 8,
+    FORMAT_MESSAGE_FROM_HMODULE       = 0x00000800,
+    FORMAT_MESSAGE_FROM_SYSTEM        = 0x00001000,
+    FORMAT_MESSAGE_IGNORE_INSERTS     = 0x00000200,
+    HANDLE_FLAG_INHERIT               = 1,
+    HEAP_ZERO_MEMORY                  = 8,
+    JOB_KILL_ON_JOB_CLOSE             = 0x2000,
+    JOB_DIE_ON_UNHANDLED_EXCEPTION    = 0x400,
+    JobObjectExtendedLimitInformation = 9,
+    SEM_FAILCRITICALERRORS            = 0x0001,
+    SEM_NOGPFAULTERRORBOX             = 0x0002,
+    SEM_NOOPENFILEERRORBOX            = 0x8000,
+    STARTF_USESTDHANDLES              = 0x100,
+    STD_INPUT_HANDLE                  = -10,
+    // WinHTTP
+    ERROR_WINHTTP_OPERATION_CANCELLED = 12017,
+    WINHTTP_ACCESS_TYPE_AUTOMATIC     = 4,
+    WINHTTP_ACCESS_TYPE_DEFAULT       = 0,
+    WINHTTP_ACCESS_TYPE_NO_PROXY      = 1,
+    WINHTTP_FLAG_SECURE               = 0x00800000,
+    WINHTTP_OPTION_PROXY              = 38,
+    WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT = 7,
+    WINHTTP_QUERY_FLAG_NUMBER         = 0x20000000,
+    WINHTTP_QUERY_RAW_HEADERS_CRLF    = 22,
+    WINHTTP_QUERY_STATUS_CODE         = 19,
 };
 
 enum : uz {
@@ -125,6 +163,52 @@ static_assert(sizeof(CriticalSection) == (sizeof(uz)==8 ? 40 : 24));
 static_assert(sizeof(CriticalSection) <= sizeof(Lock));
 static_assert(alignof(CriticalSection) <= alignof(Lock));
 
+struct StartupInfo {  // STARTUPINFOW
+    i32  cb;
+    c16 *reserved;
+    c16 *desktop;
+    c16 *title;
+    i32  x, y, xsize, ysize, xchars, ychars, fill;
+    i32  flags;
+    c16  show;
+    c16  reserved2;
+    u8  *reserved3;
+    uz   input;
+    uz   output;
+    uz   error;
+};
+
+struct ProcessInfo {  // PROCESS_INFORMATION
+    uz  process;
+    uz  thread;
+    i32 pid;
+    i32 tid;
+};
+
+struct JobLimits {  // JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    i64 proctime;
+    i64 jobtime;
+    u32 flags;
+    uz  minws;
+    uz  maxws;
+    u32 activeprocs;
+    uz  affinity;
+    u32 priority;
+    u32 scheduling;
+    u64 io[6];
+    uz  procmem;
+    uz  jobmem;
+    uz  peakprocmem;
+    uz  peakjobmem;
+};
+static_assert(sizeof(JobLimits) == (sizeof(uz)==8 ? 144 : 112));
+
+struct ProxyInfo {  // WINHTTP_PROXY_INFO
+    u32  access;
+    c16 *proxy;
+    c16 *bypass;
+};
+
 #define W32(r, p) extern "C" __declspec(dllimport) r __stdcall p noexcept
 W32(b32,    CloseHandle(uz));
 W32(b32,    CreateDirectoryW(c16 *, uz));
@@ -172,6 +256,33 @@ W32(b32,    VirtualFree(uz, iz, i32));
 W32(i32,    WaitForSingleObject(uz, i32));
 W32(b32,    WriteConsoleW(uz, c16 *, i32, i32 *, uz));
 W32(b32,    WriteFile(uz, u8 *, i32, i32 *, Overlapped *));
+W32(b32,    AssignProcessToJobObject(uz, uz));
+W32(uz,     CreateJobObjectW(uz, c16 *));
+W32(b32,    CreatePipe(uz *, uz *, uz, i32));
+W32(b32,    CreateProcessW(c16 *, c16 *, uz, uz, b32, i32, c16 *, c16 *,
+                           StartupInfo *, ProcessInfo *));
+W32(i32,    FormatMessageW(i32, uz, i32, i32, c16 *, i32, uz));
+W32(b32,    FreeEnvironmentStringsW(c16 *));
+W32(c16 *,  GetEnvironmentStringsW());
+W32(b32,    GetExitCodeProcess(uz, i32 *));
+W32(uz,     GetModuleHandleW(c16 *));
+W32(i32,    ResumeThread(uz));
+W32(i32,    SetErrorMode(i32));
+W32(b32,    SetHandleInformation(uz, i32, i32));
+W32(b32,    SetInformationJobObject(uz, i32, void *, i32));
+W32(b32,    TerminateJobObject(uz, i32));
+W32(b32,    TerminateProcess(uz, i32));
+W32(b32,    WinHttpCloseHandle(uz));
+W32(uz,     WinHttpConnect(uz, c16 *, c16, i32));  // INTERNET_PORT
+W32(uz,     WinHttpOpen(c16 *, i32, c16 *, c16 *, i32));
+W32(uz,     WinHttpOpenRequest(uz, c16 *, c16 *, c16 *, c16 *, c16 **, i32));
+W32(b32,    WinHttpQueryHeaders(uz, i32, c16 *, void *, i32 *, i32 *));
+W32(b32,    WinHttpQueryDataAvailable(uz, i32 *));
+W32(b32,    WinHttpReadData(uz, u8 *, i32, i32 *));
+W32(b32,    WinHttpReceiveResponse(uz, uz));
+W32(b32,    WinHttpSendRequest(uz, c16 *, i32, void *, i32, i32, uz));
+W32(b32,    WinHttpSetOption(uz, i32, void *, i32));
+W32(b32,    WinHttpSetTimeouts(uz, i32, i32, i32, i32));
 
 // GCC emits calls to these even without a CRT. Defining them keeps
 // msvcrt.dll out of the imports.
@@ -180,6 +291,20 @@ extern "C" void *memcpy(void *dst, void const *src, uz len)
 {
     void *r = dst;
     __asm volatile ("rep movsb" : "+D"(dst), "+S"(src), "+c"(len) : : "memory");
+    return r;
+}
+
+extern "C" void *memmove(void *dst, void const *src, uz len)
+{
+    void *r = dst;
+    if ((uz)dst-(uz)src >= len) {  // forward is safe
+        __asm volatile ("rep movsb" : "+D"(dst), "+S"(src), "+c"(len) : : "memory");
+    } else {
+        dst = (u8 *)dst + len - 1;
+        src = (u8 *)src + len - 1;
+        __asm volatile ("std; rep movsb; cld"
+                        : "+D"(dst), "+S"(src), "+c"(len) : : "memory");
+    }
     return r;
 }
 
@@ -215,7 +340,8 @@ extern "C" i32 memcmp(void const *a, void const *b, uz len)
 #endif
 
 struct Os {
-    i64 freq;  // performance counter ticks per second
+    i64             freq;   // performance counter ticks per second
+    CriticalSection spawn;  // held while child handles are inheritable
 };
 
 enum : iz {
@@ -869,11 +995,687 @@ static void os_logclose(Os *, iz log)
 }
 
 
+// More files and the environment
+
+static Read os_readat(Os *, Arena *a, Str path, i64 off, iz max)
+{
+    Read r = {};
+    if (hasnul(path) || off<0 || max<0) {
+        r.err = READ_NOTFOUND;
+        return r;
+    }
+    Arena tmp = *a;
+    uz    h   = CreateFileW(
+        widepath(&tmp, path).data, GENERIC_READ, FILE_SHARE_ALL, 0,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0
+    );
+    if (h == INVALID_HANDLE_VALUE) {
+        r.err = notfound(GetLastError()) ? READ_NOTFOUND : READ_IO;
+        return r;
+    }
+    i64 size = 0;
+    if (GetFileType(h)!=FILE_TYPE_DISK || !GetFileSizeEx(h, &size)) {
+        CloseHandle(h);
+        r.err = READ_NOTFILE;
+        return r;
+    }
+    r.size = size;
+    i64 avail = size>off ? size-off : 0;
+    iz  want  = avail<max ? (iz)avail : max;
+    if (want && !SetFilePointerEx(h, off, 0, FILE_BEGIN)) {
+        CloseHandle(h);
+        r.err = READ_IO;
+        return r;
+    }
+
+    Str data = {allocbytes(a, want), 0};
+    while (data.len < want) {
+        i32 len = chunk(want - data.len);
+        if (!ReadFile(h, data.data+data.len, len, &len, 0)) {
+            CloseHandle(h);
+            r.err = READ_IO;
+            return r;
+        } else if (!len) {
+            break;
+        }
+        data.len += len;
+    }
+    CloseHandle(h);
+    a->beg = (byte *)(data.data + data.len);
+    r.data = data;
+    return r;
+}
+
+static Slice<Str> os_environ(Os *, Arena *a)
+{
+    Slice<Str> r   = {};
+    c16       *env = GetEnvironmentStringsW();
+    if (!env) {
+        return r;
+    }
+    for (c16 *p = env; *p;) {
+        iz len = 0;
+        for (; p[len]; len++) {}
+        r = push(a, r, fromwide(a, p, len));
+        p += len + 1;
+    }
+    FreeEnvironmentStringsW(env);
+    return r;
+}
+
+static iz os_stdin(Os *, u8 *buf, iz len)
+{
+    i32 n = 0;
+    if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), buf, chunk(len), &n, 0)) {
+        return GetLastError()==ERROR_BROKEN_PIPE ? 0 : -1;
+    }
+    return n;
+}
+
+// Absolute, but symlinks are not resolved: lexical, as GetFullPathNameW.
+static Str os_realpath(Os *, Arena *a, Str path)
+{
+    if (hasnul(path)) {
+        return {};
+    }
+    Arena tmp = *a;
+    c16  *rel = towide(&tmp, path).data;
+    i32   cap = GetFullPathNameW(rel, 0, 0, 0);
+    if (cap <= 0) {
+        return {};
+    }
+    c16 *buf = alloc<c16>(&tmp, cap);
+    i32  len = GetFullPathNameW(rel, cap, buf, 0);
+    if (!len || len>=cap || GetFileAttributesW(buf)==INVALID_FILE_ATTRIBUTES) {
+        return {};
+    }
+    for (; len>3 && (buf[len-1]=='\\' || buf[len-1]=='/'); len--) {}
+    u8   *out = allocbytes(a, 3*(iz)len);  // after tmp's use, so a copy
+    Arena o   = {(byte *)out, (byte *)out + 3*(iz)len};
+    Str   r   = fromwide(&o, buf, len);
+    a->beg = (byte *)(r.data + r.len);
+    return r;
+}
+
+static Str os_lasterr(Os *, Arena *a)
+{
+    i32 err = GetLastError();
+    c16 buf[512];
+    i32 flags = FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS;
+    uz  mod   = 0;
+    if (err>=12000 && err<12200) {
+        mod    = GetModuleHandleW((c16 *)u"winhttp.dll");
+        flags |= mod ? FORMAT_MESSAGE_FROM_HMODULE : 0;
+    }
+    i32 len = FormatMessageW(flags, mod, err, 0, buf, countof(buf), 0);
+    for (; len>0 && (buf[len-1]=='\r' || buf[len-1]=='\n' || buf[len-1]=='.'); len--) {}
+    if (len <= 0) {
+        Buf b(a, 32);
+        print(&b, "error ");
+        print(&b, (i64)err);
+        return finish(&b);
+    }
+    return fromwide(a, buf, len);
+}
+
+
+// Processes
+//
+// Each spawn gets a job set to kill every process in it when its last
+// handle closes, and to die on an unhandled exception rather than show
+// a dialog. The child starts suspended, joins the job, then resumes, so
+// it cannot start anything outside it first. Its standard handles (NUL
+// for input, one pipe for output and errors) are inheritable only
+// inside the spawn lock, so no other spawn picks them up.
+//
+// Each Proc has a reader thread, pumping output into the file, and a
+// waiter thread on the process handle. Both hold references, as does
+// the engine until os_procfree. The job closes with the last one,
+// killing whatever is left.
+
+enum : iz {
+    PROC_TAILMAX = 1<<12,
+    PROC_BUFLEN  = 1<<16,
+};
+
+struct Proc {
+    i32      refs;      // atomic
+    uz       job;
+    uz       process;   // owned by the waiter until the end
+    uz       pipe;      // output read end, owned by the reader
+    uz       file;      // the output file, owned by the reader
+    Mailbox *mbox;
+    u64      id;
+    i64      maxbytes;
+    i64      total;     // reader only
+    iz       tailpos;   // reader only
+    u8       tail[PROC_TAILMAX];
+    u8       msg[8+PROC_TAILMAX];
+    u8       buf[PROC_BUFLEN];
+};
+
+static void procrelease(Proc *p)
+{
+    if (!__atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL)) {
+        CloseHandle(p->job);
+        CloseHandle(p->process);
+        HeapFree(GetProcessHeap(), 0, p);
+    }
+}
+
+static void put64(u8 *dst, i64 v)
+{
+    __builtin_memcpy(dst, &v, 8);
+}
+
+static void put32(u8 *dst, i32 v)
+{
+    __builtin_memcpy(dst, &v, 4);
+}
+
+static void procreader(void *arg)
+{
+    Proc *p    = (Proc *)arg;
+    i64   last = 0;
+    b32   kept = 1;  // still writing to the file
+    Os    os   = {};
+    QueryPerformanceFrequency(&os.freq);
+    for (;;) {
+        i32 n = 0;
+        if (!ReadFile(p->pipe, p->buf, PROC_BUFLEN, &n, 0) || !n) {
+            break;
+        }
+        if (kept) {
+            iz keep = n;
+            if (p->total+n > p->maxbytes) {
+                keep = (iz)(p->maxbytes - p->total);
+                kept = 0;
+            }
+            writeall(p->file, {p->buf, keep});
+            if (!kept) {
+                u8 msg[8];
+                put64(msg, p->total + keep);
+                mailpost(p->mbox, PROC_LIMIT, p->id, {msg, 8}, 1);
+            }
+        }
+        p->total += n;
+
+        for (iz i = n<PROC_TAILMAX ? 0 : n-PROC_TAILMAX; i < n; i++) {
+            p->tail[p->tailpos++ & (PROC_TAILMAX-1)] = p->buf[i];
+        }
+        i64 now = os_ticks(&os);
+        if (now-last >= 50000) {
+            last = now;
+            iz len = p->total<PROC_TAILMAX ? (iz)p->total : PROC_TAILMAX;
+            put64(p->msg, p->total);
+            for (iz i = 0; i < len; i++) {
+                p->msg[8+i] = p->tail[(p->tailpos - len + i) & (PROC_TAILMAX-1)];
+            }
+            mailpost(p->mbox, PROC_TAIL, p->id, {p->msg, 8+len}, 0);
+        }
+    }
+    CloseHandle(p->pipe);
+    CloseHandle(p->file);
+    u8 msg[8];
+    put64(msg, p->total);
+    mailpost(p->mbox, PROC_EOF, p->id, {msg, 8}, 1);
+    procrelease(p);
+}
+
+static void procwaiter(void *arg)
+{
+    Proc *p    = (Proc *)arg;
+    i32   code = -1;
+    WaitForSingleObject(p->process, INFINITE);
+    GetExitCodeProcess(p->process, &code);
+    u8 msg[8];
+    put32(msg, code);
+    put32(msg+4, 0);
+    mailpost(p->mbox, PROC_EXIT, p->id, {msg, 8}, 1);
+    procrelease(p);
+}
+
+static b32 envless(Str *a, Str *b)
+{
+    // Sorted by name, ignoring case, as CreateProcess expects
+    for (iz i = 0;; i++) {
+        u8 x = i<a->len && (*a)[i]!='=' ? lowercase((*a)[i]) : 0;
+        u8 y = i<b->len && (*b)[i]!='=' ? lowercase((*b)[i]) : 0;
+        if (x != y) return x < y;
+        if (!x) return 0;
+    }
+}
+
+// A double-null-terminated UTF-16 environment block.
+static c16 *envblock(Arena *a, Slice<Str> env)
+{
+    Str *sorted = alloc<Str>(a, env.len);
+    for (iz i = 0; i < env.len; i++) {
+        sorted[i] = env[i];
+    }
+    sort(sorted, env.len, envless, *a);
+    iz units = 2;
+    for (iz i = 0; i < env.len; i++) {
+        units += 2*sorted[i].len + 1;  // UTF-16 is never longer
+    }
+    c16 *block = alloc<c16>(a, units);
+    iz   len   = 0;
+    for (iz i = 0; i < env.len; i++) {
+        Str e = sorted[i];
+        if (!e.len || hasnul(e)) continue;
+        for (iz k = 0; k < e.len;) {
+            len += utf16encode(block+len, utf8decode(e, &k));
+        }
+        block[len++] = 0;
+    }
+    block[len++] = 0;
+    block[len]   = 0;
+    return block;
+}
+
+static void closeall(uz *hs, iz n)
+{
+    for (iz i = 0; i < n; i++) {
+        if (hs[i] && hs[i]!=INVALID_HANDLE_VALUE) {
+            CloseHandle(hs[i]);
+        }
+    }
+}
+
+static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
+{
+    if (!sp->argv.len || hasnul(sp->cwd) || hasnul(sp->outpath)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    Str  line = sp->cmdline.len ? sp->cmdline : quoteargv(&scratch, sp->argv);
+    c16 *cmd  = towide(&scratch, line).data;
+    c16 *cwd  = towide(&scratch, sp->cwd).data;  // not \\?\, which cmd rejects
+    c16 *env  = envblock(&scratch, sp->env);
+    c16 *out  = widepath(&scratch, sp->outpath).data;
+
+    uz job  = CreateJobObjectW(0, 0);
+    uz nul  = CreateFileW((c16 *)u"NUL", GENERIC_READ|GENERIC_WRITE, FILE_SHARE_ALL,
+                          0, OPEN_EXISTING, 0, 0);
+    uz file = CreateFileW(out, GENERIC_WRITE, FILE_SHARE_ALL, 0, CREATE_ALWAYS,
+                          FILE_ATTRIBUTE_NORMAL, 0);
+    uz pr = 0, pw = 0;
+    b32 ok = job && nul!=INVALID_HANDLE_VALUE && file!=INVALID_HANDLE_VALUE &&
+             CreatePipe(&pr, &pw, 0, 1<<16);
+    if (ok) {
+        JobLimits lim = {};
+        lim.flags = JOB_KILL_ON_JOB_CLOSE | JOB_DIE_ON_UNHANDLED_EXCEPTION;
+        ok = SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                     &lim, sizeof(lim));
+    }
+    if (!ok) {
+        i32 err = GetLastError();
+        uz hs[] = {job, nul, file, pr, pw};
+        closeall(hs, countof(hs));
+        SetLastError(err);
+        return 0;
+    }
+
+    ProcessInfo pi = {};
+    StartupInfo si = {};
+    si.cb     = sizeof(si);
+    si.flags  = STARTF_USESTDHANDLES;
+    si.input  = nul;
+    si.output = pw;
+    si.error  = pw;
+    i32 flags = CREATE_SUSPENDED | CREATE_NO_WINDOW |
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP;
+    EnterCriticalSection(&os->spawn);
+    SetHandleInformation(nul, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation(pw, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    ok = CreateProcessW(0, cmd, 0, 0, 1, flags, env, cwd, &si, &pi);
+    i32 err = GetLastError();
+    CloseHandle(nul);
+    CloseHandle(pw);
+    LeaveCriticalSection(&os->spawn);
+    if (!ok) {
+        uz hs[] = {job, file, pr};
+        closeall(hs, countof(hs));
+        SetLastError(err);
+        return 0;
+    }
+    if (!AssignProcessToJobObject(job, pi.process)) {
+        err = GetLastError();
+        TerminateProcess(pi.process, 1);
+        uz hs[] = {pi.thread, pi.process, job, file, pr};
+        closeall(hs, countof(hs));
+        SetLastError(err);
+        return 0;
+    }
+    ResumeThread(pi.thread);
+    CloseHandle(pi.thread);
+
+    uz    heap = GetProcessHeap();
+    Proc *p    = (Proc *)HeapAlloc(heap, HEAP_ZERO_MEMORY, sizeof(Proc));
+    if (!p) {
+        TerminateJobObject(job, 1);
+        uz hs[] = {pi.process, job, file, pr};
+        closeall(hs, countof(hs));
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    p->refs     = 3;
+    p->job      = job;
+    p->process  = pi.process;
+    p->pipe     = pr;
+    p->file     = file;
+    p->mbox     = sp->mbox;
+    p->id       = sp->id;
+    p->maxbytes = sp->maxbytes;
+    if (!os_thread(os, procreader, p)) {
+        TerminateJobObject(job, 1);
+        uz hs[] = {pi.process, job, file, pr};
+        closeall(hs, countof(hs));
+        HeapFree(heap, 0, p);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    if (!os_thread(os, procwaiter, p)) {
+        TerminateJobObject(job, 1);  // the reader then finishes
+        procrelease(p);  // the waiter's
+        procrelease(p);  // the caller's
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    return p;
+}
+
+// Soft and hard alike until a soft stop (CTRL_BREAK) arrives in M4.
+static void os_kill(Os *, Proc *p, b32)
+{
+    TerminateJobObject(p->job, 1);
+}
+
+static void os_procfree(Os *, Proc *p)
+{
+    procrelease(p);
+}
+
+
+// HTTP: WinHTTP, synchronous, one thread per request
+//
+// A cancel closes the request handle, which makes the worker's blocked
+// call fail. The worker checks under the lock before each call, so it
+// does not start a call on a handle a cancel already closed, though a
+// close can always land just after the check, which WinHTTP tolerates.
+
+struct Http {
+    i32      refs;      // atomic: the engine and the worker
+    Lock     lock;
+    uz       request;   // under lock, 0 once closed
+    b32      cancelled; // under lock
+    Mailbox *mbox;
+    u64      id;
+    i64      maxbytes;
+    c16     *host;
+    c16     *path;
+    c16     *method;
+    c16     *headers;
+    Str      body;
+    i32      port;
+    i32      connectms;
+    i32      readms;
+    b32      secure;
+    b32      direct;    // never through a proxy
+};
+
+static void httprelease(Http *h)
+{
+    if (!__atomic_sub_fetch(&h->refs, 1, __ATOMIC_ACQ_REL)) {
+        HeapFree(GetProcessHeap(), 0, h);
+    }
+}
+
+static b32 httplive(Http *h)
+{
+    os_lock(&h->lock);
+    b32 live = !h->cancelled;
+    os_unlock(&h->lock);
+    return live;
+}
+
+static void httpdone(Http *h, i32 err, Str text)
+{
+    u8  msg[260];
+    iz  len = text.len<256 ? text.len : 256;
+    put32(msg, err);
+    copybytes(msg+4, text.data, len);
+    mailpost(h->mbox, HTTP_DONE, h->id, {msg, 4+len}, 1);
+}
+
+// The worker's error: a cancel, or the WinHTTP error text.
+static void httpfail(Http *h, i32 err, u8 *scratch, iz cap)
+{
+    i32 code = GetLastError();
+    if (!httplive(h) || code==ERROR_WINHTTP_OPERATION_CANCELLED) {
+        httpdone(h, HTTP_ECANCEL, "cancelled");
+        return;
+    }
+    Arena a  = {(byte *)scratch, (byte *)scratch + cap};
+    Os    os = {};
+    SetLastError(code);
+    httpdone(h, err, os_lasterr(&os, &a));
+}
+
+static void httpworker(void *arg)
+{
+    Http *h       = (Http *)arg;
+    uz    session = 0;
+    uz    connect = 0;
+    uz    request = 0;
+    u8   *mem     = (u8 *)HeapAlloc(GetProcessHeap(), 0, 1<<16);
+
+    if (!mem) {
+        httpdone(h, HTTP_EIO, "out of memory");
+        httprelease(h);
+        return;
+    }
+
+    c16 *agent = (c16 *)u"harness/" HARNESS_VERSION;
+    session = WinHttpOpen(agent, WINHTTP_ACCESS_TYPE_AUTOMATIC, 0, 0, 0);
+    if (!session) {
+        // Before Windows 8.1: proxy settings from netsh winhttp
+        session = WinHttpOpen(agent, WINHTTP_ACCESS_TYPE_DEFAULT, 0, 0, 0);
+    }
+    if (!session) {
+        httpfail(h, HTTP_ECONNECT, mem, 1<<16);
+        goto done;
+    }
+    WinHttpSetTimeouts(session, 0, h->connectms, 60000, h->readms);
+    connect = WinHttpConnect(session, h->host, (c16)h->port, 0);
+    if (!connect) {
+        httpfail(h, HTTP_ECONNECT, mem, 1<<16);
+        goto done;
+    }
+    request = WinHttpOpenRequest(connect, h->method, h->path, 0, 0, 0,
+                                 h->secure ? WINHTTP_FLAG_SECURE : 0);
+    if (!request) {
+        httpfail(h, HTTP_ECONNECT, mem, 1<<16);
+        goto done;
+    }
+    os_lock(&h->lock);
+    if (h->cancelled) {
+        os_unlock(&h->lock);
+        WinHttpCloseHandle(request);
+        request = 0;
+        httpdone(h, HTTP_ECANCEL, "cancelled");
+        goto done;
+    }
+    h->request = request;
+    os_unlock(&h->lock);
+
+    if (h->direct) {
+        ProxyInfo none = {WINHTTP_ACCESS_TYPE_NO_PROXY, 0, 0};
+        WinHttpSetOption(request, WINHTTP_OPTION_PROXY, &none, sizeof(none));
+    }
+    {
+        // Waiting for the head belongs to the engine's watchdogs
+        i32 wait = h->readms ? h->readms : 0x7fffffff;
+        WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT,
+                         &wait, sizeof(wait));
+    }
+
+    if (!httplive(h) ||
+            !WinHttpSendRequest(request, h->headers, -1, h->body.data,
+                                (i32)h->body.len, (i32)h->body.len, 0)) {
+        httpfail(h, HTTP_ECONNECT, mem, 1<<16);
+        goto done;
+    }
+    if (!httplive(h) || !WinHttpReceiveResponse(request, 0)) {
+        httpfail(h, HTTP_EIO, mem, 1<<16);
+        goto done;
+    }
+
+    {
+        i32 status = 0;
+        i32 size   = sizeof(status);
+        WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,
+                            0, &status, &size, 0);
+        c16 *wide = (c16 *)mem;
+        i32  hlen = 1<<16;  // in bytes
+        iz   n    = 0;
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF, 0,
+                                wide, &hlen, 0)) {
+            n = hlen / 2;
+        }
+        u8 *msg = (u8 *)HeapAlloc(GetProcessHeap(), 0, (uz)(4 + 3*n));
+        if (!msg) {
+            httpdone(h, HTTP_EIO, "out of memory");
+            goto done;
+        }
+        Arena c   = {(byte *)msg + 4, (byte *)msg + 4 + 3*n};
+        Str   raw = fromwide(&c, wide, n);
+        put32(msg, status);
+        mailpost(h->mbox, HTTP_HEAD, h->id, {msg, 4+raw.len}, 1);
+        HeapFree(GetProcessHeap(), 0, msg);
+    }
+
+    // A synchronous read waits to fill its buffer, so ask what is ready
+    // first (waiting for at least a byte), then read only that much.
+    for (i64 got = 0;;) {
+        i32 avail = 0;
+        i32 n     = 0;
+        if (!httplive(h) || !WinHttpQueryDataAvailable(request, &avail)) {
+            httpfail(h, HTTP_EIO, mem, 1<<16);
+            goto done;
+        } else if (!avail) {
+            break;
+        }
+        avail = avail<(1<<16) ? avail : 1<<16;
+        if (!httplive(h) || !WinHttpReadData(request, mem, avail, &n)) {
+            httpfail(h, HTTP_EIO, mem, 1<<16);
+            goto done;
+        } else if (!n) {
+            break;
+        }
+        if (n > h->maxbytes-got) {
+            httpdone(h, HTTP_ETOOBIG, "response too large");
+            goto done;
+        }
+        got += n;
+        mailpost(h->mbox, HTTP_BODY, h->id, {mem, n}, 1);
+    }
+    httpdone(h, HTTP_OK, {});
+
+  done:
+    os_lock(&h->lock);
+    if (h->request) {
+        WinHttpCloseHandle(h->request);
+        h->request = 0;
+    }
+    os_unlock(&h->lock);
+    if (connect) WinHttpCloseHandle(connect);
+    if (session) WinHttpCloseHandle(session);
+    HeapFree(GetProcessHeap(), 0, mem);
+    httprelease(h);
+}
+
+static Http *os_http(Os *os, HttpReq *req, Arena scratch)
+{
+    Url u = parseurl(req->url);
+    if (!u.ok || hasnul(req->method) || hasnul(u.path) || hasnul(req->headers)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    Str host = u.host;
+    if (host.len>=2 && host[0]=='[') {
+        host = cuthead(cuttail(host, 1), 1);
+    }
+    Str16 whost    = towide(&scratch, host);
+    Str16 wpath    = towide(&scratch, u.path);
+    Str16 wmethod  = towide(&scratch, req->method);
+    Str16 wheaders = towide(&scratch, req->headers);
+
+    // One block: the record, then the strings
+    iz units = whost.len + wpath.len + wmethod.len + wheaders.len + 4;
+    iz size  = (iz)sizeof(Http) + units*2 + req->body.len + 8;
+    Http *h  = (Http *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
+    if (!h) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    c16 *w = (c16 *)(h + 1);
+    Str16 parts[] = {whost, wpath, wmethod, wheaders};
+    c16 **dst[]   = {&h->host, &h->path, &h->method, &h->headers};
+    for (iz i = 0; i < countof(parts); i++) {
+        *dst[i] = w;
+        copybytes(w, parts[i].data, parts[i].len*2);
+        w += parts[i].len;
+        *w++ = 0;
+    }
+    u8 *body = (u8 *)w;
+    copybytes(body, req->body.data, req->body.len);
+    h->body      = {body, req->body.len};
+    h->refs      = 2;
+    h->mbox      = req->mbox;
+    h->id        = req->id;
+    h->maxbytes  = req->maxbytes;
+    h->port      = u.port;
+    h->connectms = req->connectms;
+    h->readms    = req->readms;
+    h->secure    = u.scheme == "https";
+    h->direct    = localhost(u.host);
+    os_lockinit(&h->lock);
+    if (!os_thread(os, httpworker, h)) {
+        HeapFree(GetProcessHeap(), 0, h);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    return h;
+}
+
+static void os_httpcancel(Os *, Http *h)
+{
+    os_lock(&h->lock);
+    h->cancelled = 1;
+    if (h->request) {
+        WinHttpCloseHandle(h->request);
+        h->request = 0;
+    }
+    os_unlock(&h->lock);
+}
+
+static void os_httpfree(Os *, Http *h)
+{
+    httprelease(h);
+}
+
+
 extern "C" __attribute((force_align_arg_pointer))
 void mainCRTStartup()
 {
     Os os = {};
     QueryPerformanceFrequency(&os.freq);
+    InitializeCriticalSectionAndSpinCount(&os.spawn, 4000);
+
+    // No dialogs from a crashing child, or from a missing disk
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
+                 SEM_NOOPENFILEERRORBOX);
 
     iz      cap = sizeof(void *)==8 ? (iz)1<<34 : (iz)1<<28;
     Region *r   = os_reserve(&os, cap);
