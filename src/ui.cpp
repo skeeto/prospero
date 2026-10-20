@@ -32,6 +32,16 @@ static void text(Str s)
     ImGui::TextUnformatted(s.cdata, s.cdata+s.len);
 }
 
+// Push an ID made from a string, which may be empty.
+static void pushstr(Str s)
+{
+    if (s.len) {
+        ImGui::PushID(s.cdata, s.cdata+s.len);
+    } else {
+        ImGui::PushID("##empty");
+    }
+}
+
 // Remember where the last item went, for the scripted checklist.
 static void itemrect(Gui *g, i32 which)
 {
@@ -286,6 +296,13 @@ static u32 rgba(i32 r, i32 g, i32 b, i32 a)
     return IM_COL32(r, g, b, a);
 }
 
+// A color at a fraction of its opacity.
+static u32 fade(u32 col, f32 alpha)
+{
+    u32 a = (u32)((f32)(col >> IM_COL32_A_SHIFT & 0xff) * alpha);
+    return (col & ~IM_COL32_A_MASK) | a<<IM_COL32_A_SHIFT;
+}
+
 static u32 hlcolor(i32 cls)
 {
     switch (cls) {
@@ -326,8 +343,45 @@ static Str rolename(i32 role)
     case VIEW_THINK:     return "Reasoning";
     case VIEW_TOOL:      return "Tool";
     case VIEW_NOTE:      return "Note";
+    case VIEW_ASK:       return "Permission";
     }
     return "";
+}
+
+// Colors for states
+enum : u32 {
+    C_DIM    = IM_COL32(140, 150, 170, 255),
+    C_OK     = IM_COL32(110, 200, 120, 255),
+    C_BAD    = IM_COL32(235, 100, 100, 255),
+    C_AMBER  = IM_COL32(235, 180, 80, 255),
+    C_ACTIVE = IM_COL32(110, 170, 240, 255),
+};
+
+static u32 toolcolor(i32 status)
+{
+    switch (status) {
+    case VTOOL_OK:        return C_OK;
+    case VTOOL_ERROR:
+    case VTOOL_TIMEOUT:
+    case VTOOL_UNKNOWN:   return C_BAD;
+    case VTOOL_DENIED:
+    case VTOOL_ASKING:    return C_AMBER;
+    case VTOOL_RUNNING:
+    case VTOOL_STREAMING: return C_ACTIVE;
+    }
+    return C_DIM;
+}
+
+static u32 livecolor(i32 state)
+{
+    switch (state) {
+    case LIVE_IDLE:
+    case LIVE_CLOSED:  return C_DIM;
+    case LIVE_ASK:
+    case LIVE_BACKOFF: return C_AMBER;
+    case LIVE_ERROR:   return C_BAD;
+    }
+    return C_ACTIVE;
 }
 
 enum : i32 {
@@ -340,10 +394,10 @@ enum : i32 {
 // Draw one placed block of a message whose content starts at origin.
 static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
                       Doc *d, i32 msg, Placed *p, ImVec2 origin, Range sel,
-                      f32 cliptop, f32 clipbot)
+                      f32 cliptop, f32 clipbot, f32 alpha)
 {
     BlockLayout *bl     = p->bl;
-    DocBlock       *b      = &d->blocks[p->block];
+    DocBlock    *b      = &d->blocks[p->block];
     Piece       *pieces = d->pieces.data + b->piece0;
     f32          ox     = origin.x;
     f32          oy     = origin.y + p->y;
@@ -356,28 +410,28 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
         switch (dc->kind) {
         case DECO_CODEBG:
             sp->SetCurrentChannel(dl, CH_BG);
-            dl->AddRectFilled(a, z, rgba(30, 30, 34, 255), 4*g->scale);
+            dl->AddRectFilled(a, z, fade(rgba(30, 30, 34, 255), alpha), 4*g->scale);
             break;
         case DECO_HEADERBG:
             sp->SetCurrentChannel(dl, CH_BG);
-            dl->AddRectFilled(a, z, rgba(45, 45, 52, 255));
+            dl->AddRectFilled(a, z, fade(rgba(45, 45, 52, 255), alpha));
             break;
         case DECO_QUOTE:
             sp->SetCurrentChannel(dl, CH_TEXT);
-            dl->AddRectFilled(a, z, rgba(90, 90, 100, 255));
+            dl->AddRectFilled(a, z, fade(rgba(90, 90, 100, 255), alpha));
             break;
         case DECO_RULE:
         case DECO_GRID:
             sp->SetCurrentChannel(dl, CH_TEXT);
             dl->AddRectFilled(a, v2(z.x>a.x+1 ? z.x : a.x+1, z.y>a.y+1 ? z.y : a.y+1),
-                              rgba(80, 80, 88, 255));
+                              fade(rgba(80, 80, 88, 255), alpha));
             break;
         case DECO_MARKER: {
             sp->SetCurrentChannel(dl, CH_TEXT);
             ImFontBaked *bk = stylebaked(f, 0);
             ImVec2 at = v2(ox+dc->x, oy+dc->y - bk->Ascent);
             dl->AddText(stylefont(f, 0), stylesize(f, 0), at,
-                        rgba(160, 160, 170, 255), dc->text.cdata,
+                        fade(rgba(160, 160, 170, 255), alpha), dc->text.cdata,
                         dc->text.cdata+dc->text.len);
         } break;
         }
@@ -417,7 +471,7 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
             ImVec2       at  = v2(ox + r->x, ly + l->base - bk->Ascent);
             char const  *beg = pc->text.cdata + r->b0;
             char const  *end = pc->text.cdata + r->b1;
-            u32          col = piececolor(pc);
+            u32          col = fade(piececolor(pc), alpha);
             sp->SetCurrentChannel(dl, CH_TEXT);
             dl->AddText(stylefont(f, pc->style), stylesize(f, pc->style), at,
                         col, beg, end);
@@ -446,12 +500,219 @@ static void copymessage(Gui *g, i32 msg)
     ImGui::SetClipboardText(cstr0(&a, g->view->msgs[msg].text));
 }
 
-// The transcript: virtualized messages with selection across them.
+// Text drawn left to right along a line, clipped at its right end.
+struct Pen {
+    ImDrawList *dl;
+    Fonts      *f;
+    f32         x, y;
+    f32         right;
+    f32         size;
+};
+
+static void pen(Pen *p, Str s, i32 style, u32 col)
+{
+    if (!s.len || p->x>=p->right) {
+        return;
+    }
+    ImFont *font = stylefont(p->f, style);
+    ImVec4  clip = ImVec4(p->x, p->y, p->right, p->y + p->size*2);
+    p->dl->AddText(font, p->size, v2(p->x, p->y), col, s.cdata, s.cdata+s.len, 0, &clip);
+    p->x += font->CalcTextSizeA(p->size, 1e9f, 0, s.cdata, s.cdata+s.len).x;
+}
+
+// Milliseconds as "850 ms", "1.2 s" or "3 min 5 s".
+static Str duration(Arena *a, i64 ms)
+{
+    Buf b(a, 32);
+    if (ms < 1000) {
+        print(&b, ms);
+        print(&b, " ms");
+    } else if (ms < 60000) {
+        printfloat(&b, (f64)ms/1000, 1);
+        print(&b, " s");
+    } else {
+        print(&b, ms/60000);
+        print(&b, " min ");
+        print(&b, ms/1000%60);
+        print(&b, " s");
+    }
+    return finish(&b);
+}
+
+static Str bytesize(Arena *a, i64 n)
+{
+    Buf b(a, 32);
+    if (n < 1024) {
+        print(&b, n);
+        print(&b, " B");
+    } else if (n < (i64)1<<20) {
+        printfloat(&b, (f64)n/1024, 1);
+        print(&b, " KiB");
+    } else {
+        printfloat(&b, (f64)n/(1<<20), 1);
+        print(&b, " MiB");
+    }
+    return finish(&b);
+}
+
+// Whole seconds left until an epoch-ms time, rounded up, and a deadline
+// at the next change of that number, only while it is drawn.
+static i64 countdown(Gui *g, i64 at, i64 nowms)
+{
+    i64 left = at - nowms;
+    if (left <= 0) {
+        return 0;
+    }
+    i64 secs = (left + 999) / 1000;
+    i64 next = left - (secs - 1)*1000;  // ms until secs drops
+    schedat(&g->sched, g->sched.now + next*1000 + 1000, DUE_CLOCK);
+    return secs;
+}
+
+// A message's header line: who, or what a tool did, or an ask's state.
+static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
+{
+    Arena     a  = g->frame;
+    ViewTool *t  = m->tool;
+    b32       cl = m->role==VIEW_TOOL || m->role==VIEW_THINK;
+    f32       sz = p->size;
+    if (cl) {
+        // A triangle for whether the body shows
+        ImVec2 at = v2(p->x, p->y + sz*0.1f);
+        ImGui::RenderArrow(p->dl, at, C_DIM, m->collapsed ? ImGuiDir_Right : ImGuiDir_Down, 0.8f);
+        p->x += sz;
+    }
+    u32 dim = fade(C_DIM, m->faded ? 0.5f : 1);
+    switch (m->role) {
+    case VIEW_TOOL: {
+        pen(p, t->name.len ? t->name : Str("call"), STYLE_BOLD, dim);
+        pen(p, "  ", 0, dim);
+        if (t->status == VTOOL_STREAMING) {
+            Buf b(&a, 64);
+            print(&b, "writing arguments, ");
+            print(&b, bytesize(&a, t->args.len));
+            pen(p, finish(&b), 0, C_ACTIVE);
+            break;
+        }
+        pen(p, t->summary, STYLE_CODE, rgba(200, 200, 205, 255));
+        pen(p, "  ", 0, dim);
+        pen(p, vtoolnames[t->status], STYLE_BOLD, toolcolor(t->status));
+        if (t->hasexit) {
+            Buf b(&a, 32);
+            print(&b, "  exit ");
+            print(&b, (i64)t->exit);
+            pen(p, finish(&b), 0, t->exit ? C_BAD : dim);
+        }
+        if (t->status==VTOOL_RUNNING && t->outbytes) {
+            pen(p, "  ", 0, dim);
+            pen(p, bytesize(&a, t->outbytes), 0, dim);
+        } else if (t->status>=VTOOL_OK) {
+            pen(p, "  ", 0, dim);
+            pen(p, duration(&a, t->ms), 0, dim);
+        }
+    } break;
+    case VIEW_THINK: {
+        pen(p, "Reasoning", STYLE_BOLD, dim);
+        if (m->collapsed) {
+            Buf b(&a, 32);
+            print(&b, "  ");
+            print(&b, m->nl + 1);
+            print(&b, m->nl ? Str(" lines") : Str(" line"));
+            pen(p, finish(&b), 0, dim);
+        }
+    } break;
+    case VIEW_ASK: {
+        Buf b(&a, 256);
+        print(&b, t->tool);
+        print(&b, " ");
+        print(&b, t->path);
+        pen(p, "Allow ", STYLE_BOLD, C_AMBER);
+        pen(p, finish(&b), STYLE_CODE, rgba(200, 200, 205, 255));
+        pen(p, "?  ", STYLE_BOLD, C_AMBER);
+        if (t->answer == VASK_PENDING) {
+            if (v->readonly) {
+                pen(p, "waiting in another process", 0, dim);
+                break;
+            }
+            i64 secs = countdown(g, t->deadline, nowms);
+            Buf c(&a, 64);
+            if (secs) {
+                print(&c, "denied in ");
+                print(&c, secs);
+                print(&c, " s unless allowed");
+            } else {
+                print(&c, "denying");
+            }
+            pen(p, finish(&c), 0, C_AMBER);
+        } else {
+            b32 ok = t->answer == VASK_ALLOWED;
+            Buf c(&a, 256);
+            print(&c, ok ? Str("allowed") : Str("denied"));
+            print(&c, t->by=="user"    ? Str(" by you") :
+                      t->by=="timeout" ? Str(": nobody answered in time") :
+                      t->by=="steer"   ? Str(": you sent a message instead") :
+                      t->by=="cancel"  ? Str(": the turn was cancelled") :
+                      t->by=="policy"  ? Str(": nobody could answer") : Str(""));
+            pen(p, finish(&c), STYLE_BOLD, ok ? C_OK : C_BAD);
+        }
+    } break;
+    default:
+        pen(p, m->label.len ? m->label : rolename(m->role), STYLE_BOLD, dim);
+    }
+}
+
+// An open ask's buttons, below its text.
+static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
+{
+    ViewTool *t = m->tool;
+    Arena     a = g->frame;
+    if (ImGui::Button("Allow")) {
+        guianswer(g, s, t->req, 1, {});
+    }
+    if (latest) itemrect(g, RECT_ALLOW);
+    ImGui::SetItemTooltip("Let the %s go ahead", t->tool.len ? cstr0(&a, t->tool) : "tool");
+    ImGui::SameLine();
+    if (ImGui::Button("Deny")) {
+        guianswer(g, s, t->req, 0, {});
+    }
+    if (latest) itemrect(g, RECT_DENY);
+    ImGui::SetItemTooltip("The agent reads why and tries something else");
+    ImGui::SameLine();
+    if (ImGui::Button("Deny with note...")) {
+        g->denyreq  = t->req;
+        g->denysess = s;
+        g->denynote[0] = 0;
+        g->opendeny = 1;
+    }
+    ImGui::SetItemTooltip("Deny, telling the agent what to do instead");
+}
+
+// The transcript of the session shown: virtualized messages with
+// selection across them, tool rows and ask cards.
 static void drawtranscript(Gui *g)
 {
+    GuiSession *gs = g->sess ? g->sess : &g->nosession;
     View       *v  = g->view;
     f32         sc = g->scale;
     ImGuiStyle &st = ImGui::GetStyle();
+
+    if (gs->readonly) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_AMBER));
+        ImGui::TextWrapped("Read-only: another harness process has this "
+                           "session open. Its changes show after it lets go "
+                           "and the session is opened again.");
+        ImGui::PopStyleColor();
+        if (ImGui::Button("Open again")) {
+            guiopen(g, gs);
+        }
+        ImGui::SetItemTooltip("Take the session over, if the other process has let go");
+    }
+    if (g->engineerr.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_BAD));
+        Arena a = g->frame;
+        ImGui::TextWrapped("The engine is unavailable: %s", cstr0(&a, g->engineerr));
+        ImGui::PopStyleColor();
+    }
 
     // Layout comes first, before the child window begins, so that its
     // content size and scroll take effect this very frame: a scroll set
@@ -464,8 +725,14 @@ static void drawtranscript(Gui *g)
     width = (f32)(i32)(width<50*sc ? 50*sc : width);
     FontMetrics fm    = fontmetrics(&g->fonts, 0);
     f32         charw = fontadvance(&g->fonts, 0, 'n');
-    f32         head  = pad/4 + fm.lineh;  // the role line
-    v->extra = head + pad*3/4;
+    f32         head  = pad/4 + fm.lineh;  // the header line
+    f32         extra = head + pad*3/4;
+    f32         foot  = ImGui::GetFrameHeight() + pad/2;
+    if (v->extra!=extra || v->foot!=foot) {
+        v->topsdirty = 1;
+    }
+    v->extra = extra;
+    v->foot  = foot;
     v->gap   = 6*sc;
 
     if (width != g->lastwidth) {
@@ -475,9 +742,9 @@ static void drawtranscript(Gui *g)
 
     // Where the view is: last frame's scroll, or where the wheel just
     // sent it.
-    ImGuiWindow *last    = g->transcriptwin;
+    ImGuiWindow *last    = gs->win;
     f32          scrolly = 0;
-    b32          bottom  = g->stick;
+    b32          bottom  = gs->stick;
     if (last) {
         scrolly = last->Scroll.y;
         if (last->ScrollTarget.y < FLT_MAX) {
@@ -520,54 +787,20 @@ static void drawtranscript(Gui *g)
     if ((f32)want != scrolly) {
         ImGui::SetNextWindowScroll(v2(-1, (f32)want));
     }
+    pushstr(gs->sid);
     ImGui::BeginChild("##transcript", v2(0, 0), 0,
                       ImGuiWindowFlags_AlwaysVerticalScrollbar);
-    g->transcriptwin = ImGui::GetCurrentWindow();
+    gs->win = ImGui::GetCurrentWindow();
     ImVec2 wpos = ImGui::GetWindowPos();
     scrolly = ImGui::GetScrollY();
+    f32 top = wpos.y;
+    f32 bot = wpos.y + winh;
 
-    // Drawing
-    ImDrawList        *dl = ImGui::GetWindowDrawList();
-    ImDrawListSplitter *sp = &g->splitter;
-    sp->Split(dl, CH_COUNT);
-    Range sel  = selrange(&v->sel);
-    f32   top  = wpos.y;
-    f32   bot  = wpos.y + winh;
-    i32   d0   = viewfind(v, scrolly);
-    i32   d1   = viewfind(v, scrolly + winh);
-    for (i32 i = d0; i>=0 && i <= d1; i++) {
-        ViewMsg       *m  = &v->msgs[i];
-        MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
-        Doc       *d  = msgdoc(v, i);
-        f32 y = wpos.y + (f32)(m->top - scrolly);
-        f32 x = wpos.x + pad;
-
-        // Role line, and a background for the user's messages.
-        if (m->role == VIEW_USER) {
-            sp->SetCurrentChannel(dl, CH_BG);
-            dl->AddRectFilled(v2(wpos.x+pad/2, y), v2(wpos.x+pad*1.5f+width, y+v->extra+m->h),
-                              rgba(40, 44, 52, 255), 6*sc);
-        }
-        sp->SetCurrentChannel(dl, CH_TEXT);
-        Str name = rolename(m->role);
-        dl->AddText(stylefont(&g->fonts, STYLE_BOLD), g->fonts.size*0.85f,
-                    v2(x, y + pad/4), rgba(140, 150, 170, 255),
-                    name.cdata, name.cdata+name.len);
-        ImVec2 origin = v2(x, y + head);
-        for (iz k = 0; k < ml->blocks.len; k++) {
-            Placed *p = &ml->blocks[k];
-            if (origin.y+p->y > bot || origin.y+p->y+p->bl->h < top) {
-                continue;
-            }
-            drawblock(g, dl, sp, d, i, p, origin, sel, top, bot);
-        }
-    }
-    sp->Merge(dl);
-
-    // Mouse: an invisible button over the visible area.
+    // Mouse: an invisible button over the visible area, which the
+    // headers' toggles and the asks' buttons, made later, overlap.
     ImGui::SetCursorScreenPos(wpos);
     ImGui::SetNextItemAllowOverlap();
-    ImGui::InvisibleButton("##text", v2(ImGui::GetWindowWidth() - ImGui::GetStyle().ScrollbarSize, winh),
+    ImGui::InvisibleButton("##text", v2(ImGui::GetWindowWidth() - st.ScrollbarSize, winh),
                            ImGuiButtonFlags_MouseButtonLeft|ImGuiButtonFlags_MouseButtonRight);
     itemrect(g, RECT_TRANSCRIPT);
     ImGuiIO &io = ImGui::GetIO();
@@ -586,12 +819,12 @@ static void drawtranscript(Gui *g)
         f64 cy = scrolly + (my - wpos.y);
         i32 i  = viewfind(v, cy);
         if (i >= 0) {
-            ViewMsg       *m  = &v->msgs[i];
+            ViewMsg   *m  = &v->msgs[i];
             MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
             f32 ly = (f32)(cy - m->top - head);
             at.msg = i;
-            at.off = ly<0 ? 0 : msghit(&g->measure, msgdoc(v, i), ml,
-                                       io.MousePos.x - wpos.x - pad, ly);
+            at.off = ly<0 || m->collapsed ? 0 :
+                     msghit(&g->measure, msgdoc(v, i), ml, io.MousePos.x - wpos.x - pad, ly);
             if (ly > m->h) at.off = (i32)m->text.len;
             hit = 1;
         }
@@ -646,6 +879,78 @@ static void drawtranscript(Gui *g)
         ImGui::EndPopup();
     }
 
+    // Drawing
+    ImDrawList         *dl    = ImGui::GetWindowDrawList();
+    ImDrawListSplitter *sp    = &g->splitter;
+    Range               sel   = selrange(&v->sel);
+    i64                 nowms = os_time(g->os);
+    i32                 d0    = viewfind(v, scrolly);
+    i32                 d1    = viewfind(v, scrolly + winh);
+    i32                 lastask = -1;
+    for (iz i = v->msgs.len-1; i >= 0; i--) {
+        if (v->msgs[i].role==VIEW_ASK && v->msgs[i].tool->answer==VASK_PENDING) {
+            lastask = (i32)i;
+            break;
+        }
+    }
+    sp->Split(dl, CH_COUNT);
+    for (i32 i = d0; i>=0 && i <= d1; i++) {
+        ViewMsg   *m     = &v->msgs[i];
+        MsgLayout *ml    = msglayout(v, i, &g->measure, width, sc);
+        f32        y     = wpos.y + (f32)(m->top - scrolly);
+        f32        x     = wpos.x + pad;
+        f32        alpha = m->faded ? 0.45f : 1;
+        f32        mfoot = msgfoot(v, m);
+        ImVec2     box0  = v2(wpos.x+pad/2, y);
+        ImVec2     box1  = v2(wpos.x+pad*1.5f+width, y+v->extra+m->h+mfoot);
+
+        // Backgrounds: the user's messages, tool rows, ask cards
+        sp->SetCurrentChannel(dl, CH_BG);
+        if (m->role == VIEW_USER) {
+            dl->AddRectFilled(box0, box1, rgba(40, 44, 52, 255), 6*sc);
+        } else if (m->role == VIEW_TOOL) {
+            dl->AddRectFilled(box0, box1, fade(rgba(34, 36, 40, 255), alpha), 4*sc);
+            dl->AddRectFilled(box0, v2(box0.x+3*sc, box1.y), fade(toolcolor(m->tool->status), alpha*0.8f));
+        } else if (m->role == VIEW_ASK) {
+            b32 open = m->tool->answer == VASK_PENDING;
+            dl->AddRectFilled(box0, box1, rgba(48, 42, 30, 255), 6*sc);
+            dl->AddRect(box0, box1, open ? (u32)C_AMBER : fade(C_AMBER, 0.4f), 6*sc, 1.5f*sc);
+        }
+
+        sp->SetCurrentChannel(dl, CH_TEXT);
+        Pen p = {dl, &g->fonts, x, y + pad/4, x + width, g->fonts.size*0.85f};
+        drawheader(g, &p, v, m, nowms);
+        ImVec2 origin = v2(x, y + head);
+        if (!m->collapsed) {
+            Doc *d = msgdoc(v, i);
+            for (iz k = 0; k < ml->blocks.len; k++) {
+                Placed *pl = &ml->blocks[k];
+                if (origin.y+pl->y > bot || origin.y+pl->y+pl->bl->h < top) {
+                    continue;
+                }
+                drawblock(g, dl, sp, d, i, pl, origin, sel, top, bot, alpha);
+            }
+        }
+
+        ImGui::PushID(i);
+        if (m->role==VIEW_TOOL || m->role==VIEW_THINK) {
+            // The header toggles the body
+            ImGui::SetCursorScreenPos(v2(x, y));
+            if (ImGui::InvisibleButton("##toggle", v2(width, head))) {
+                togglemsg(v, i);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            }
+        }
+        if (mfoot > 0) {
+            ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
+            drawaskbuttons(g, gs, m, i==lastask);
+        }
+        ImGui::PopID();
+    }
+    sp->Merge(dl);
+
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
         if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_A)) {
             selall(v);
@@ -658,35 +963,563 @@ static void drawtranscript(Gui *g)
         }
     }
 
-    g->stick = scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh;
+    gs->stick = scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh;
     ImGui::EndChild();
+    ImGui::PopID();
+
+    if (g->opendeny) {
+        ImGui::OpenPopup("##denynote");
+        g->opendeny = 0;
+    }
+    if (ImGui::BeginPopup("##denynote")) {
+        ImGui::TextUnformatted("Deny, and tell the agent:");
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        ImGui::SetNextItemWidth(360*sc);
+        b32 go = ImGui::InputText("##note", g->denynote, FIELD_MAX,
+                                  ImGuiInputTextFlags_EnterReturnsTrue);
+        go |= ImGui::Button("Deny");
+        if (go) {
+            Str note = {(u8 *)g->denynote, (iz)__builtin_strlen(g->denynote)};
+            guianswer(g, g->denysess, g->denyreq, 0, trim(note));
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 }
 
 
-// Prompt
+// Liveness strip and prompt
+
+// What the session is doing, how fast, and how long since the model sent
+// anything: one line, whose clocks ask for frames only while shown.
+static void drawstrip(Gui *g)
+{
+    View *v  = g->view;
+    f32   sc = g->scale;
+    if (!g->sess) {
+        ImGui::TextDisabled("No session: start one with New session.");
+        return;
+    }
+    Arena a     = g->frame;
+    i64   nowms = os_time(g->os);
+    i64   now   = g->sched.now;
+    b32   req   = v->state==LIVE_DISCOVER || v->state==LIVE_WAITING ||
+                  v->state==LIVE_STREAMING || v->state==LIVE_ERROR;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(livecolor(v->state)));
+    ImGui::TextUnformatted(cstr0(&a, v->busy && v->state==LIVE_IDLE ? Str("working")
+                                                                     : livenames[v->state]));
+    ImGui::PopStyleColor();
+
+    if (v->busy && v->turnts) {
+        // The turn's clock, once a second
+        i64 el = nowms - v->turnts;
+        el = el<0 ? 0 : el;
+        schedat(&g->sched, now + (1000 - el%1000)*1000 + 1000, DUE_CLOCK);
+        Buf b(&a, 32);
+        print(&b, el/1000);
+        print(&b, " s");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+    }
+    if (req && v->tps > 0) {
+        Buf b(&a, 32);
+        printfloat(&b, v->tps, 1);
+        print(&b, " tok/s");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+    }
+    if (req && v->ptotal>0 && v->pdone<v->ptotal) {
+        ImGui::SameLine();
+        f32 frac = (f32)v->pdone / (f32)v->ptotal;
+        Buf b(&a, 48);
+        print(&b, "reading the prompt ");
+        print(&b, (i64)(frac*100));
+        putbyte(&b, '%');
+        ImGui::ProgressBar(frac, v2(160*sc, 0), cstr0(&a, finish(&b)));
+    }
+    if (req && v->lastdata) {
+        // Amber after AMBER_MS without data, red near the watchdog
+        i64 idle = nowms - v->lastdata;
+        b32 red  = v->watchat && v->watchms && nowms >= v->watchat - v->watchms/4;
+        if (idle >= AMBER_MS || red) {
+            schedat(&g->sched, now + (1000 - idle%1000)*1000 + 1000, DUE_CLOCK);
+            Buf b(&a, 64);
+            print(&b, "no data for ");
+            print(&b, idle/1000);
+            print(&b, " s");
+            if (red && v->watchat>nowms) {
+                print(&b, ", giving up in ");
+                print(&b, (v->watchat - nowms + 999)/1000);
+                print(&b, " s");
+            }
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(red ? C_BAD : C_AMBER));
+            ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+            ImGui::PopStyleColor();
+        } else {
+            schedat(&g->sched, now + (AMBER_MS - idle)*1000 + 1000, DUE_CLOCK);
+        }
+        if (v->watchat && v->watchms && !red) {
+            i64 redat = v->watchat - v->watchms/4;
+            schedat(&g->sched, now + (redat - nowms)*1000 + 1000, DUE_CLOCK);
+        }
+    }
+    if (v->state==LIVE_BACKOFF && v->retryat) {
+        i64 secs = countdown(g, v->retryat, nowms);
+        Buf b(&a, 48);
+        print(&b, "retrying in ");
+        print(&b, secs);
+        print(&b, " s");
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_AMBER));
+        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+        ImGui::PopStyleColor();
+    }
+    if (v->asks) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_AMBER));
+        ImGui::TextUnformatted("waiting for your answer above");
+        ImGui::PopStyleColor();
+    }
+}
 
 static void drawprompt(Gui *g)
 {
+    f32  sc   = g->scale;
+    View *v   = g->view;
+    b32  can  = g->sess && g->sess->view && !g->sess->readonly && !g->quitting;
+    drawstrip(g);
+
+    // Esc cancels the turn, ahead of the prompt box, which would otherwise
+    // take it to undo the typing
+    if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+            ImGui::Shortcut(ImGuiKey_Escape, ImGuiInputFlags_RouteGlobal|ImGuiInputFlags_RouteOverActive)) {
+        guicancel(g, g->sess);
+    }
+
     ImGuiInputTextFlags flags = ImGuiInputTextFlags_WordWrap |
                                 ImGuiInputTextFlags_EnterReturnsTrue |
                                 ImGuiInputTextFlags_CtrlEnterForNewLine;
-    f32 bw = 80*g->scale;
+    f32 bw = 80*sc;
     ImVec2 size = v2(ImGui::GetContentRegionAvail().x - bw - ImGui::GetStyle().ItemSpacing.x,
                      ImGui::GetContentRegionAvail().y);
     b32 send = ImGui::InputTextMultiline("##prompt", g->prompt, PROMPT_MAX, size, flags);
     itemrect(g, RECT_PROMPT);
     ImGui::SameLine();
-    send |= ImGui::Button("Send", v2(bw, 0));
-    ImGui::SetItemTooltip("Send the prompt to the fake agent (Enter; Ctrl+Enter for a new line)");
-    if (send) {
-        Str p = {(u8 *)g->prompt, 0};
-        while (p.data[p.len]) p.len++;
+    ImGui::BeginGroup();
+    ImGui::BeginDisabled(!can);
+    send |= ImGui::Button(v->busy ? "Steer" : "Send", v2(bw, 0));
+    ImGui::SetItemTooltip(v->busy ? "Send to the running turn: the agent reads it at its next step (Enter)"
+                                  : "Send the prompt (Enter; Shift+Enter for a new line)");
+    if (v->busy) {
+        if (ImGui::Button("Stop", v2(bw, 0))) {
+            guicancel(g, g->sess);
+        }
+        ImGui::SetItemTooltip("Cancel the turn, killing any command it runs (Esc)");
+    }
+    ImGui::EndDisabled();
+    ImGui::EndGroup();
+    if (send && can) {
+        Str p = {(u8 *)g->prompt, (iz)__builtin_strlen(g->prompt)};
         p = trim(p);
         if (p.len) {
-            fakecmd(g, FAKE_PROMPT, p);
+            guiprompt(g, p);
             g->prompt[0] = 0;
         }
         ImGui::SetKeyboardFocusHere(-1);
+    }
+}
+
+
+// Sessions
+
+static Str sesstitle(GuiSession *s)
+{
+    Str t = s->view && s->view->title.len ? s->view->title : s->title;
+    return t.len ? t : Str("(untitled)");
+}
+
+static b32 sidafter(GuiSession **a, GuiSession **b)
+{
+    return compare((*a)->sid, (*b)->sid) > 0;
+}
+
+// The sessions, newest first, made or opened here and listed.
+static Slice<GuiSession *> sesslist(Gui *g, Arena *a)
+{
+    Slice<GuiSession *> r = {};
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->view || s->listed) {
+            r = push(a, r, s);
+        }
+    }
+    if (r.len) {
+        sort(r.data, r.len, sidafter, *a);
+    }
+    return r;
+}
+
+static void drawsessions(Gui *g)
+{
+    f32   sc = g->scale;
+    Arena a  = g->frame;
+    if (g->enginekind != ENGINE_FAKE) {
+        if (ImGui::SmallButton("Refresh")) {
+            guilist(g);
+        }
+        ImGui::SetItemTooltip("List the sessions again");
+    }
+    Slice<GuiSession *> list = sesslist(g, &a);
+    ImDrawList *dl    = ImGui::GetWindowDrawList();
+    f32         lineh = ImGui::GetTextLineHeight();
+    f32         small = g->fonts.size * 0.85f;
+    for (iz i = 0; i < list.len; i++) {
+        GuiSession *s     = list[i];
+        View       *v     = s->view;
+        i32         state = v ? v->state : s->state;
+        pushstr(s->sid);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        f32    w = ImGui::GetContentRegionAvail().x;
+        if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc))) {
+            guiselect(g, s);
+        }
+        Str cwd = v && v->cwd.len ? v->cwd : s->cwd;
+        ImGui::SetItemTooltip("%s\n%s", cstr0(&a, cwd), cstr0(&a, s->sid));
+        Pen t = {dl, &g->fonts, p.x + 4*sc, p.y + 2*sc, p.x + w, g->fonts.size};
+        pen(&t, sesstitle(s), 0, rgba(222, 222, 222, 255));
+        Pen b = {dl, &g->fonts, p.x + 4*sc, p.y + 2*sc + lineh, p.x + w, small};
+        if (s->readonly || (!v && s->locked)) {
+            pen(&b, "read-only", STYLE_BOLD, C_AMBER);
+        } else if (v && v->asks) {
+            pen(&b, "needs an answer", STYLE_BOLD, C_AMBER);
+        } else {
+            Str name = v && v->busy && state==LIVE_IDLE ? Str("working") : livenames[state];
+            pen(&b, name, STYLE_BOLD, livecolor(state));
+        }
+        pen(&b, "  ", 0, C_DIM);
+        pen(&b, cwd, 0, C_DIM);
+        ImGui::PopID();
+    }
+    if (!list.len) {
+        ImGui::TextDisabled("No sessions yet.");
+    }
+}
+
+// The new session dialog: a working directory, typed or from those of
+// earlier sessions, and a model, by default the configured one.
+static void drawnew(Gui *g)
+{
+    f32 sc = g->scale;
+    if (g->opennew) {
+        ImGui::OpenPopup("New session");
+        g->opennew = 0;
+    }
+    ImGui::SetNextWindowSize(v2(560*sc, 0));
+    if (!ImGui::BeginPopupModal("New session", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    Arena a = g->frame;
+    ImGui::TextUnformatted("Working directory");
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::IsWindowAppearing()) {
+        ImGui::SetKeyboardFocusHere();
+    }
+    ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, ImGuiInputTextFlags_AutoSelectAll);
+    itemrect(g, RECT_NEWCWD);
+
+    // Recent directories, newest first
+    Slice<GuiSession *> list   = sesslist(g, &a);
+    Slice<Str>          recent = {};
+    for (iz i = 0; i<list.len && recent.len<8; i++) {
+        Str cwd = list[i]->view && list[i]->view->cwd.len ? list[i]->view->cwd : list[i]->cwd;
+        b32 dup = !cwd.len;
+        for (iz k = 0; !dup && k < recent.len; k++) {
+            dup = recent[k] == cwd;
+        }
+        if (!dup) {
+            recent = push(&a, recent, cwd);
+        }
+    }
+    if (recent.len) {
+        ImGui::TextDisabled("Recent");
+        for (iz i = 0; i < recent.len; i++) {
+            ImGui::PushID((i32)i);
+            if (ImGui::Selectable(cstr0(&a, recent[i]))) {
+                iz n = recent[i].len<FIELD_MAX ? recent[i].len : FIELD_MAX-1;
+                copybytes(g->newcwd, recent[i].data, n);
+                g->newcwd[n] = 0;
+            }
+            ImGui::PopID();
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Model");
+    ImGui::SetNextItemWidth(-1);
+    Str dflt = {};
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (!r->kind.len && r->key=="model") {
+            dflt = r->value;
+        }
+    }
+    char const *hint = dflt.len ? cstr0(&a, concat(&a, "configured: ", dflt)) : "the model's name";
+    ImGui::InputTextWithHint("##model", hint, g->newmodel, FIELD_MAX);
+    if (g->newerr.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_BAD));
+        ImGui::TextWrapped("%s", cstr0(&a, g->newerr));
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+    b32 create = ImGui::Button("Create", v2(120*sc, 0));
+    itemrect(g, RECT_NEWCREATE);
+    if (create) {
+        Str cwd   = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
+        Str model = trim({(u8 *)g->newmodel, (iz)__builtin_strlen(g->newmodel)});
+        guinew(g, cwd, model);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", v2(120*sc, 0))) {
+        g->newerr = {};
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+// Closing the window with turns running asks first.
+static void drawclose(Gui *g)
+{
+    f32 sc = g->scale;
+    if (g->closereq) {
+        g->closereq = 0;
+        if (!g->quitting && !running(g)) {
+            startquit(g);
+        } else if (!g->quitting) {
+            ImGui::OpenPopup("Quit harness?");
+        }
+    }
+    if (!ImGui::BeginPopupModal("Quit harness?", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    Arena a = g->frame;
+    if (g->quitting) {
+        ImGui::TextUnformatted("Stopping the running sessions...");
+    } else {
+        i32 n = running(g);
+        Buf b(&a, 128);
+        print(&b, "Stop ");
+        print(&b, (i64)n);
+        print(&b, n==1 ? Str(" running session and quit") : Str(" running sessions and quit"));
+        Str label = finish(&b);
+        ImGui::TextUnformatted(n ? "Turns are still running. Quitting stops them, and kills their commands."
+                                 : "Nothing is running any more.");
+        b32 stop = ImGui::Button(cstr0(&a, n ? label : Str("Quit")));
+        itemrect(g, RECT_CLOSESTOP);
+        if (stop) {
+            startquit(g);
+        }
+        ImGui::SameLine();
+        b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0));
+        itemrect(g, RECT_CLOSECANCEL);
+        if (cancel) {
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::EndPopup();
+}
+
+
+// Settings
+
+// "harness.ini:12" from a path and line.
+static Str provenance(Arena *a, CfgRow *r)
+{
+    if (r->isdflt || !r->file.len) {
+        return "default";
+    }
+    Str name = r->file;
+    for (iz i = name.len-1; i >= 0; i--) {
+        if (name[i]=='/' || name[i]=='\\') {
+            name = cuthead(name, i+1);
+            break;
+        }
+    }
+    Buf b(a, 64);
+    print(&b, "from ");
+    print(&b, name);
+    putbyte(&b, ':');
+    print(&b, r->line);
+    return finish(&b);
+}
+
+static void drawcfgrow(Gui *g, CfgRow *r, b32 target)
+{
+    Arena a = g->frame;
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted(cstr0(&a, r->key));
+    ImGui::SetItemTooltip("%s\n(%s, default %s)", cstr0(&a, r->desc), cstr0(&a, r->type),
+                          r->dflt.len ? cstr0(&a, r->dflt) : "none");
+    ImGui::TableNextColumn();
+    ImGui::SetNextItemWidth(-1);
+    Str hint = r->isdflt ? r->value : Str{};
+    ImGui::PushID(r);
+    b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, FIELD_MAX,
+                                         ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
+    if (target) {
+        itemrect(g, RECT_SETTING);
+    }
+    if (enter || ImGui::IsItemDeactivatedAfterEdit()) {
+        Str v = trim({(u8 *)r->buf, (iz)__builtin_strlen(r->buf)});
+        Str was = r->isdflt ? Str{} : r->value;
+        if (v != was) {
+            guiconfigset(g, r->kind, r->name, r->key, v.len ? v : Str{});
+        }
+    }
+    ImGui::PopID();
+    ImGui::TableNextColumn();
+    if (!r->valid) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_BAD));
+        ImGui::TextUnformatted("invalid: default used");
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::TextDisabled("%s", cstr0(&a, provenance(&a, r)));
+    }
+}
+
+static void drawsettings(Gui *g)
+{
+    Arena a = g->frame;
+    if (g->enginekind == ENGINE_FAKE) {
+        ImGui::TextDisabled("No engine: the fake agent has no settings.");
+        return;
+    }
+    if (ImGui::IsWindowAppearing() || (!g->cfg && !g->cfgget)) {
+        guiconfigget(g);  // the file may have changed by hand
+    }
+    if (!g->cfg) {
+        ImGui::TextDisabled("Loading...");
+        return;
+    }
+    Json *j    = g->cfg;
+    Str   path = jsonstr(jsonget(j, "path"));
+    ImGui::TextDisabled("Edits go to %s", path.len ? cstr0(&a, path) : "(no file)");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reload")) {
+        guiconfigget(g);
+    }
+    if (g->cfgstatus.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(g->cfgok ? C_OK : C_BAD));
+        ImGui::TextWrapped("%s", cstr0(&a, g->cfgstatus));
+        ImGui::PopStyleColor();
+    }
+
+    // Diagnostics, with where each is
+    Json *diags = jsonget(j, "diags");
+    if (jsonlen(diags) && ImGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (Json *d = diags->child; d; d = d->next) {
+            Str sev  = jsonstr(jsonget(d, "severity"));
+            Buf b(&a, 256);
+            print(&b, jsonstr(jsonget(d, "file")));
+            putbyte(&b, ':');
+            print(&b, jsonint(jsonget(d, "line"), 0));
+            putbyte(&b, ':');
+            print(&b, jsonint(jsonget(d, "col"), 0));
+            print(&b, ": ");
+            print(&b, sev);
+            print(&b, ": ");
+            print(&b, jsonstr(jsonget(d, "message")));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(sev=="error" ? C_BAD : C_AMBER));
+            ImGui::TextWrapped("%s", cstr0(&a, finish(&b)));
+            ImGui::PopStyleColor();
+        }
+    }
+
+    // A section per kind, a table per section
+    b32 first = 1;  // the first endpoint's idle_timeout is the checklist's
+    for (Json *k = jsonget(j, "kinds")->child; k; k = k->next) {
+        Str kind  = jsonstr(jsonget(k, "kind"));
+        b32 named = jsonint(jsonget(k, "named"), 0) != 0;
+        Str desc  = jsonstr(jsonget(k, "desc"));
+        Buf hb(&a, 128);
+        print(&hb, kind.len ? kind : Str("general"));
+        print(&hb, ": ");
+        print(&hb, desc);
+        ImGui::PushID(cstr0(&a, kind));
+        if (!ImGui::CollapsingHeader(cstr0(&a, finish(&hb)), ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::PopID();
+            continue;
+        }
+        // Each section's rows, in order of first appearance
+        Slice<Str> names = {};
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            b32 seen = r->kind != kind;
+            for (iz n = 0; !seen && n < names.len; n++) {
+                seen = names[n] == r->name;
+            }
+            if (!seen) {
+                names = push(&a, names, r->name);
+            }
+        }
+        for (iz n = 0; n < names.len; n++) {
+            if (named) {
+                Buf sb(&a, 64);
+                putbyte(&sb, '[');
+                print(&sb, kind);
+                putbyte(&sb, ' ');
+                print(&sb, names[n]);
+                putbyte(&sb, ']');
+                ImGui::TextUnformatted(cstr0(&a, finish(&sb)));
+            }
+            ImGui::PushID(cstr0(&a, names[n]));
+            ImGuiTableFlags tf = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg;
+            if (ImGui::BeginTable("##t", 3, tf)) {
+                ImGui::TableSetupColumn("key", ImGuiTableColumnFlags_WidthStretch, 1);
+                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 2);
+                ImGui::TableSetupColumn("from", ImGuiTableColumnFlags_WidthStretch, 1);
+                for (iz i = 0; i < g->cfgrows.len; i++) {
+                    CfgRow *r = &g->cfgrows[i];
+                    if (r->kind==kind && r->name==names[n]) {
+                        b32 target = first && kind=="endpoint" && r->key=="idle_timeout";
+                        drawcfgrow(g, r, target);
+                    }
+                }
+                ImGui::EndTable();
+            }
+            ImGui::PopID();
+            first &= kind != "endpoint";
+        }
+        if (named) {
+            // A new section: named, with its first key set
+            ImGui::SetNextItemWidth(160*g->scale);
+            ImGui::InputTextWithHint("##add", "name", g->addname, FIELD_MAX);
+            ImGui::SameLine();
+            Buf ab(&a, 64);
+            print(&ab, "Add ");
+            print(&ab, kind);
+            if (ImGui::Button(cstr0(&a, finish(&ab)))) {
+                Str name = trim({(u8 *)g->addname, (iz)__builtin_strlen(g->addname)});
+                Str key  = kind=="endpoint" ? Str("url") :
+                           kind=="model"    ? Str("reasoning") : Str("tools");
+                Str val  = kind=="endpoint" ? Str("http://localhost/") :
+                           kind=="model"    ? Str("reasoning_content") :
+                           Str("read write edit shell");
+                if (name.len) {
+                    guiconfigset(g, kind, name, key, val);
+                    g->addname[0] = 0;
+                }
+            }
+        }
+        ImGui::PopID();
     }
 }
 
@@ -779,6 +1612,10 @@ static void drawmetrics(Gui *g)
     print(&b, (i64)g->view->msgs.len);
     print(&b, "  deltas ");
     print(&b, g->view->deltas);
+    print(&b, "  overflows ");
+    print(&b, g->overflows);
+    print(&b, "  resyncs ");
+    print(&b, g->resyncs);
     if (g->view->overflow) {
         print(&b, "  OVERFLOW");
     }
@@ -805,10 +1642,17 @@ static void drawlog(Gui *g)
 static void drawhelp(Gui *)
 {
     ImGui::TextWrapped(
-        "GUI spike (M1). The transcript is fed by a fake agent thread "
-        "through the real mailbox and wake path. Drag to select across "
-        "messages; double-click selects a word, triple-click a block, "
-        "Shift-click extends. Right-click for copy options.");
+        "Each session is a conversation with the agent in one working "
+        "directory. Enter sends, Shift+Enter starts a new line, and "
+        "sending while the agent works steers it. Esc or Stop cancels "
+        "the turn. Tool rows and reasoning open and close with a click on "
+        "their header. When a tool asks to leave the workspace, answer "
+        "on its card before the countdown ends, or it is denied.");
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "Drag to select across messages; double-click selects a word, "
+        "triple-click a block, Shift-click extends. Right-click for copy "
+        "options.");
     ImGui::Spacing();
     ImGui::BulletText("Roboto: Copyright 2011 Google (Apache 2.0)");
     ImGui::BulletText("JetBrains Mono: Copyright 2020 JetBrains (OFL 1.1)");
@@ -817,7 +1661,7 @@ static void drawhelp(Gui *)
 
 // Toolbar, dock space, and windows
 
-static void drawtoolbar(Gui *g)
+static void drawfaketools(Gui *g)
 {
     f32 sc = g->scale;
     b32 prompt = ImGui::Button(g->view->busy ? "Stop" : "Prompt");
@@ -859,13 +1703,31 @@ static void drawtoolbar(Gui *g)
         fakeint(g, FAKE_HISTORY, 10000);
     }
     ImGui::SetItemTooltip("Load 10,000 messages (about 5 MB) of history");
+}
+
+static void drawtoolbar(Gui *g)
+{
+    f32 sc = g->scale;
+    if (g->enginekind == ENGINE_FAKE) {
+        drawfaketools(g);
+    } else {
+        ImGui::BeginDisabled(!g->engineok || g->quitting);
+        b32 add = ImGui::Button("New session");
+        itemrect(g, RECT_NEWBTN);
+        if (add) {
+            g->opennew = 1;
+            g->newerr  = {};
+        }
+        ImGui::SetItemTooltip("Start a session in a working directory");
+        ImGui::EndDisabled();
+    }
     ImGui::SameLine();
     b32 menu = ImGui::Button("Menu");
     itemrect(g, RECT_MENU);
     if (menu) {
         ImGui::OpenPopup("##menu");
     }
-    ImGui::SetItemTooltip("A popup, for testing");
+    ImGui::SetItemTooltip("Layout and other options");
     if (ImGui::BeginPopup("##menu")) {
         bool demo = g->showdemo;
         if (ImGui::MenuItem("Show demo window", 0, &demo)) {
@@ -874,10 +1736,15 @@ static void drawtoolbar(Gui *g)
         if (ImGui::MenuItem("Reset layout")) {
             g->resetpending = 1;
         }
-        b32 modal = ImGui::MenuItem("Modal dialog...");
-        itemrect(g, RECT_MODALITEM);
-        if (modal) {
-            g->openmodal = 1;
+        if (g->enginekind == ENGINE_FAKE) {
+            b32 modal = ImGui::MenuItem("Modal dialog...");
+            itemrect(g, RECT_MODALITEM);
+            if (modal) {
+                g->openmodal = 1;
+            }
+        }
+        if (ImGui::MenuItem("Quit")) {
+            gui_close(g);
         }
         ImGui::EndPopup();
     }
@@ -894,19 +1761,19 @@ static void drawtoolbar(Gui *g)
         }
         ImGui::EndPopup();
     }
+    drawnew(g);
+    drawclose(g);
 
-    // The elapsed clock of a running turn ticks once a second, and asks
-    // for exactly those frames.
-    if (g->view->busy) {
-        i64 now = g->sched.now;
-        i64 el  = now - g->turnstart;
-        ImGui::SameLine();
+    if (g->engineerr.len) {
         Arena a = g->frame;
-        Buf   b(&a, 32);
-        print(&b, el/1000000);
-        print(&b, " s");
-        text(finish(&b));
-        schedat(&g->sched, g->turnstart + (el/1000000 + 1)*1000000, DUE_CLOCK);
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_BAD));
+        ImGui::TextUnformatted(cstr0(&a, g->engineerr));
+        ImGui::PopStyleColor();
+    } else if (g->lasterr.len) {
+        Arena a = g->frame;
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", cstr0(&a, g->lasterr));
     }
 }
 
@@ -949,20 +1816,28 @@ static void dockwindows(Gui *g)
         ImGui::DockBuilderRemoveNode(id);
         ImGui::DockBuilderAddNode(id, ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(id, size);
-        ImGuiID left = 0, right = 0, top = 0, bottom = 0, rtop = 0, rbot = 0;
-        ImGui::DockBuilderSplitNode(id, ImGuiDir_Right, 0.30f, &right, &left);
-        ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.18f, &bottom, &top);
-        ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.45f, &rbot, &rtop);
+        ImGuiID left = 0, rest = 0, right = 0, center = 0;
+        ImGuiID top = 0, bottom = 0, rtop = 0, rbot = 0;
+        ImGui::DockBuilderSplitNode(id, ImGuiDir_Left, 0.18f, &left, &rest);
+        ImGui::DockBuilderSplitNode(rest, ImGuiDir_Right, 0.30f, &right, &center);
+        ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.22f, &bottom, &top);
+        ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.40f, &rbot, &rtop);
+        ImGui::DockBuilderDockWindow("Sessions", left);
         ImGui::DockBuilderDockWindow("Help", top);
         ImGui::DockBuilderDockWindow("Transcript", top);
         ImGui::DockBuilderDockWindow("Prompt", bottom);
         ImGui::DockBuilderDockWindow("Metrics", rtop);
+        ImGui::DockBuilderDockWindow("Settings", rtop);
         ImGui::DockBuilderDockWindow("Log", rbot);
         ImGui::DockBuilderFinish(id);
     }
     ImGui::DockSpace(id, v2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
     ImGui::End();
 
+    if (ImGui::Begin("Sessions")) {
+        drawsessions(g);
+    }
+    ImGui::End();
     // Submitted first, so that it is the tab selected in its dock node.
     if (ImGui::Begin("Transcript")) {
         drawtranscript(g);
@@ -979,6 +1854,10 @@ static void dockwindows(Gui *g)
     g->metricsshown = ImGui::Begin("Metrics");
     if (g->metricsshown) {
         drawmetrics(g);
+    }
+    ImGui::End();
+    if (ImGui::Begin("Settings")) {
+        drawsettings(g);
     }
     ImGui::End();
     if (ImGui::Begin("Log")) {

@@ -26,6 +26,7 @@ struct W32Hooks {
     void (*scale)(void *gui, float);      // the DPI scale changed
     void (*minimized)(void *gui, int);
     void (*modal)(void *gui, int);        // a modal loop began or ended
+    void (*close)(void *gui);             // the user asks to close it
     int    drive;                         // scripted: never take focus
 };
 
@@ -44,7 +45,7 @@ extern "C" void      w32gui_present(void *, int present);
 extern "C" long long w32gui_refresh(void *);
 extern "C" void      w32gui_inject(void *, int kind, float x, float y,
                                    int button, int down, int key, int ctrl,
-                                   unsigned short const *text);
+                                   int shift, unsigned short const *text);
 extern "C" void      w32gui_close(void *);
 
 
@@ -256,6 +257,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
 
+    case WM_CLOSE:
+        // A request the core may decline: it closes the window itself
+        h->close(h->gui);
+        return 0;
+
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -456,7 +462,7 @@ static DWORD WINAPI steermodal(void *arg)
 
 extern "C" void w32gui_inject(void *p, int kind, float x, float y,
                               int button, int down, int key, int ctrl,
-                              unsigned short const *text)
+                              int shift, unsigned short const *text)
 {
     W32Gui *w  = (W32Gui *)p;
     LPARAM  xy = MAKELPARAM((int)x, (int)y);
@@ -476,15 +482,19 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
                      MAKELPARAM(pt.x, pt.y));
     } break;
     case 3: {  // key: the backend reads modifiers from the key state
-        static WORD const vks[] = {VK_TAB, VK_CONTROL, VK_ESCAPE, VK_RETURN, 'C'};
+        static WORD const vks[] = {
+            VK_TAB, VK_CONTROL, VK_ESCAPE, VK_RETURN, 'C', VK_SHIFT, 'A',
+        };
         BYTE state[256];
         GetKeyboardState(state);
         state[VK_CONTROL] = state[VK_LCONTROL] = ctrl ? 0x80 : 0;
-        if (vks[key] != VK_CONTROL) {
+        state[VK_SHIFT]   = state[VK_LSHIFT]   = shift ? 0x80 : 0;
+        if (vks[key]!=VK_CONTROL && vks[key]!=VK_SHIFT) {
             state[vks[key]] = down ? 0x80 : 0;
         }
         SetKeyboardState(state);
-        WORD   vk   = vks[key]==VK_CONTROL ? VK_LCONTROL : vks[key];
+        WORD   vk   = vks[key]==VK_CONTROL ? VK_LCONTROL :
+                      vks[key]==VK_SHIFT   ? VK_LSHIFT   : vks[key];
         UINT   scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
         LPARAM l    = 1 | (LPARAM)scan<<16 | (down ? 0 : (LPARAM)3<<30);
         PostMessageW(w->hwnd, down ? WM_KEYDOWN : WM_KEYUP, vks[key], l);
@@ -514,6 +524,9 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         WPARAM dpi = (WPARAM)x;
         SendMessageW(w->hwnd, WM_DPICHANGED, MAKEWPARAM(dpi, dpi), (LPARAM)&r);
     } break;
+    case 8:  // close, as from the title bar
+        PostMessageW(w->hwnd, WM_CLOSE, 0, 0);
+        break;
     }
 }
 
@@ -545,7 +558,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
 
 static_assert((i32)W32IN_MOVE==(i32)INPUT_MOVE && (i32)W32IN_OTHER==(i32)INPUT_OTHER);
-static_assert(GEV_MOVE==0 && GEV_RESIZE==5 && GEV_MODALSIZE==6 && GEV_DPI==7);
+static_assert(GEV_MOVE==0 && GEV_RESIZE==5 && GEV_MODALSIZE==6 && GEV_DPI==7 &&
+              GEV_CLOSE==8);
 
 W32(i32, GetCurrentThreadId());
 
@@ -556,6 +570,7 @@ static void hookframe(void *g)           { gui_frame((Gui *)g); }
 static void hookscale(void *g, float s)  { gui_scale((Gui *)g, s); }
 static void hookminimized(void *g, int m){ gui_minimized((Gui *)g, m); }
 static void hookmodal(void *g, int m)    { gui_modal((Gui *)g, m); }
+static void hookclose(void *g)           { gui_close((Gui *)g); }
 
 static void hooktick(void *p)
 {
@@ -585,6 +600,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     h.scale     = hookscale;
     h.minimized = hookminimized;
     h.modal     = hookmodal;
+    h.close     = hookclose;
     h.drive     = g->drive;
     Arena t = g->frame;
     os->gui = w32gui_open(&h, (unsigned short *)towide(&t, title).data);
@@ -625,7 +641,7 @@ static i64 os_guirefresh(Os *os)
 static void os_guiinject(Os *os, GuiEvent *e)
 {
     Arena a = {};
-    u8    buf[256];
+    u8    buf[1024];
     a.beg = (byte *)buf;
     a.end = (byte *)buf + countof(buf);
     unsigned short *text = 0;
@@ -633,7 +649,7 @@ static void os_guiinject(Os *os, GuiEvent *e)
         text = (unsigned short *)towide(&a, e->text).data;
     }
     w32gui_inject(os->gui, e->kind, e->x, e->y, e->button, e->down, e->key,
-                  e->ctrl, text);
+                  e->ctrl, e->shift, text);
 }
 
 static void os_guiclose(Os *os)

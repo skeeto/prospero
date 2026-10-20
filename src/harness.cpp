@@ -252,14 +252,16 @@ static void    os_wake(Os *);
 // The platform calls back into the core: gui_input after giving an
 // input event to ImGui, gui_wake after clearing the wake flag,
 // gui_force for resizes and exposes, gui_scale for DPI changes,
-// gui_minimized, gui_modal around OS modal loops, and gui_frame to draw
-// from inside them.
+// gui_minimized, gui_modal around OS modal loops, gui_frame to draw
+// from inside them, and gui_close when the user asks to close the
+// window or quit, which the core may decline: the window stays until
+// os_guiclose.
 struct Gui;
 // Open the main window with ImGui's platform and renderer backends.
 // Returns 0 on failure.
 static b32     os_guiopen(Os *, Gui *, Str title);
 // Wait up to us microseconds (forever if negative) for an event, then
-// dispatch every pending one. Returns 0 once the user quits.
+// dispatch every pending one. Returns 0 if the window is gone.
 static b32     os_guiwait(Os *, i64 us);
 // Begin a frame in the backends, before ImGui::NewFrame.
 static void    os_guinewframe(Os *);
@@ -284,6 +286,7 @@ enum {
     GEV_MODALSIZE,  // a modal resize: Win32 by keyboard, x steps wider;
                     // SDL as x of the exposes a live resize sends
     GEV_DPI,        // Win32: the window moved to a monitor of x DPI
+    GEV_CLOSE,      // the user asks to close the window
 };
 enum {
     GKEY_TAB,
@@ -291,6 +294,8 @@ enum {
     GKEY_ESCAPE,
     GKEY_ENTER,
     GKEY_C,
+    GKEY_SHIFT,
+    GKEY_A,
 };
 struct GuiEvent {
     i32 kind;
@@ -298,8 +303,9 @@ struct GuiEvent {
     i32 button;
     b32 down;
     i32 key;
-    b32 ctrl;
-    Str text;  // must outlive the event's dispatch
+    b32 ctrl;   // held with the key
+    b32 shift;
+    Str text;   // null-terminated, and must outlive the event's dispatch
 };
 static void    os_guiinject(Os *, GuiEvent *);
 #endif

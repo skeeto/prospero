@@ -2,20 +2,30 @@
 
 static View *testview(Arena *a)
 {
-    Os *os = newos(a, 1<<12);
-    iz  mb = (iz)1<<20;
-    return newview(a, os_reserve(os, 16*mb), os_reserve(os, 16*mb),
-                   os_reserve(os, 64*mb), 32*mb);
+    Os        *os = newos(a, 1<<12);
+    iz         mb = (iz)1<<20;
+    ViewCache *c  = newviewcache(a, os_reserve(os, 64*mb), 32*mb);
+    return newview(a, c, os_reserve(os, 16*mb), os_reserve(os, 16*mb),
+                   os_reserve(os, 16*mb));
 }
 
 static Str msgsshow(Arena *a, View *v)
 {
     Buf b(a, 256);
-    static char const roles[] = "UATXN";
+    static char const roles[] = "UATXNK";
     for (iz i = 0; i < v->msgs.len; i++) {
         ViewMsg *m = &v->msgs[i];
         putbyte(&b, (u8)roles[m->role]);
         if (!m->seq) putbyte(&b, '~');
+        if (m->role == VIEW_TOOL) {
+            putbyte(&b, '[');
+            print(&b, m->tool->name);
+            putbyte(&b, ' ');
+            print(&b, m->tool->summary);
+            putbyte(&b, ' ');
+            print(&b, vtoolnames[m->tool->status]);
+            putbyte(&b, ']');
+        }
         putbyte(&b, ':');
         print(&b, m->text);
         putbyte(&b, ';');
@@ -60,12 +70,12 @@ static void test_view(Test *t)
                     R"("blocks":[{"t":"think","text":"hm"},{"t":"text","text":"Hello"},)"
                     R"({"t":"call","id":"c1","name":"read","args":"{\"path\":\"x\"}"}]})");
         expect(t, "view.committed", msgsshow(&a, v),
-               "U:hi;T:hm;A:Hello;X:read {\"path\":\"x\"};");
+               "U:hi;T:hm;A:Hello;X[read x called]:;");
         // The committed texts take the provisional ones' place
-        expect(t, "view.reclaimed", istr(&a, v->text.beg - prov), "24");
+        expect(t, "view.reclaimed", istr(&a, v->text.beg - prov), "7");
         apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"turn.end","turn":1,"why":"done"})");
         expect(t, "view.idle", istr(&a, v->busy), "0");
-        b32 changed = apply(v, a, R"({"sid":"s","ts":0,"ev":"progress","turn":1})");
+        b32 changed = apply(v, a, R"({"ts":0,"ev":"hello","proto":0})");
         expect(t, "view.unchanged", istr(&a, changed), "0");
         changed = apply(v, a, "not json");
         expect(t, "view.garbage", istr(&a, changed), "0");
@@ -94,9 +104,10 @@ static void test_view(Test *t)
         apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"kind":"text","text":"partial"})");
         selset(v, 0, 0, 1, 7);
         apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"turn.end","turn":1,"why":"cancel"})");
-        expect(t, "view.dropped", msgsshow(&a, v), "U:q;");
+        expect(t, "view.dropped", msgsshow(&a, v), "U:q;N:Cancelled.;");
+        // The cancel's note took the dropped message's place
         Range r = selrange(&v->sel);
-        expect(t, "view.clamped", istr(&a, r.end.msg*100 + r.end.off), "1");
+        expect(t, "view.clamped", istr(&a, r.end.msg*100 + r.end.off), "107");
     }
 
     // Tops: prefix sums of heights (estimated until measured) plus the
@@ -217,5 +228,195 @@ static void test_view(Test *t)
         selset(v, 0, 3, 0, (i32)find(md, "quoted")+3);
         expect(t, "view.mdall", copysel(v, &a, COPY_MARKDOWN),
                "# Head\n\nSome **bold** text.\n\n```sh\necho hi\n```\n\n> quoted");
+    }
+    // Tool rows: arguments streaming, the committed calls, a running
+    // command's output, its end with the output file, and an edit's diff
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        v->dir  = "/st/sessions/s";
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w","model":"m","endpoint":"e"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"user","text":"go","via":"prompt"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":1000,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":1000,"ev":"attempt","turn":1,"n":1})");
+        apply(v, a, R"({"sid":"s","ts":1100,"ev":"delta","turn":1,"attempt":1,"block":0,"kind":"args","id":"c1","name":"shell","text":"{\"com"})");
+        expect(t, "view.argsprov", msgsshow(&a, v), "U:go;X~[shell  streaming]:;");
+        expect(t, "view.lastdata", istr(&a, v->lastdata), "1100");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"c1","name":"shell","args":"{\"command\":\"make test\\nmore\"}"},)"
+                    R"({"t":"call","id":"c2","name":"edit","args":"{\"path\":\"a.c\",\"old_string\":\"x\\ny\",\"new_string\":\"z\"}"}]})");
+        expect(t, "view.calls", msgsshow(&a, v),
+               "U:go;X[shell make test\xe2\x80\xa6 called]:;X[edit a.c called]:;");
+        b32 stale = apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"attempt":1,"block":0,"kind":"text","text":"late"})");
+        expect(t, "view.staledelta", istr(&a, stale), "0");
+        apply(v, a, R"({"sid":"s","seq":6,"ts":2000,"ev":"tool.start","call":"c1","name":"shell","args":"{}","cwd":"/w"})");
+        apply(v, a, R"({"sid":"s","ts":2500,"ev":"tool.out","call":"c1","tail":"line 1\n","bytes":7})");
+        expect(t, "view.running", msgsshow(&a, v),
+               "U:go;X[shell make test\xe2\x80\xa6 running]:line 1\n;X[edit a.c called]:;");
+        apply(v, a, R"({"sid":"s","seq":7,"ts":3200,"ev":"tool.end","call":"c1","status":"ok","exit":0,"text":"ok\n","spill":"out/c1.log","bytes":3,"ms":1200})");
+        ViewTool *sh = v->msgs[1].tool;
+        expect(t, "view.shellend", v->msgs[1].text,
+               "ok\n\nFull output: /st/sessions/s/out/c1.log (3 bytes)");
+        expect(t, "view.shellexit", istr(&a, sh->hasexit*10000 + sh->exit*1000 + sh->ms), "11200");
+        b32 late = apply(v, a, R"({"sid":"s","ts":0,"ev":"tool.out","call":"c1","tail":"late","bytes":9})");
+        expect(t, "view.lateout", istr(&a, late), "0");
+        apply(v, a, R"({"sid":"s","seq":8,"ts":0,"ev":"tool.start","call":"c2","name":"edit","args":"{}","cwd":"/w"})");
+        apply(v, a, R"({"sid":"s","seq":9,"ts":0,"ev":"tool.end","call":"c2","status":"ok","text":"Edited a.c: replaced 1 match at line 12.","ms":5})");
+        expect(t, "view.diff", v->msgs[2].text,
+               "```diff\n--- a.c\n+++ a.c\n@@ -12,2 +12,1 @@\n-x\n-y\n+z\n```\n");
+        expect(t, "view.diffmd", istr(&a, v->msgs[2].md*10 + v->msgs[2].collapsed), "10");
+        apply(v, a, R"({"sid":"s","seq":10,"ts":0,"ev":"turn.end","turn":1,"why":"done"})");
+        expect(t, "view.done", istr(&a, v->busy*10 + v->state), "0");
+    }
+
+    // Asks: a card while pending, with room for its buttons, resolved
+    // by the answer; the call's row waits meanwhile
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        v->foot = 30;
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"c3","name":"write","args":"{\"path\":\"../y\",\"content\":\"a\\nb\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"ask","req":"c3/ask","call":"c3","kind":"path",)"
+                    R"("tool":"write","path":"/x/y","detail":"outside","hint":"/w/y","deadline":30000,"dflt":"deny"})");
+        expect(t, "view.ask", msgsshow(&a, v),
+               "X[write ../y asking]:;K:outside\nNearest path inside the workspace: /w/y;");
+        expect(t, "view.asks", istr(&a, v->asks), "1");
+        expect(t, "view.askfoot", istr(&a, (i64)msgfoot(v, &v->msgs[1])), "30");
+        v->readonly = 1;
+        expect(t, "view.askro", istr(&a, (i64)msgfoot(v, &v->msgs[1])), "0");
+        v->readonly = 0;
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"answer","req":"c3/ask","decision":"deny","by":"timeout","note":"n"})");
+        ViewTool *k = v->msgs[1].tool;
+        expect(t, "view.answer", istr(&a, v->asks*100 + k->answer*10 + (k->by=="timeout")), "21");
+        expect(t, "view.answered", istr(&a, (i64)msgfoot(v, &v->msgs[1])), "0");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"tool.start","call":"c3","name":"write","args":"{}","cwd":"/w"})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"tool.end","call":"c3","status":"denied","text":"Denied.","ms":30001})");
+        expect(t, "view.denied", msgsshow(&a, v),
+               "X[write ../y denied]:Denied.;K:outside\nNearest path inside the workspace: /w/y;");
+        expect(t, "view.deniedopen", istr(&a, v->msgs[0].collapsed), "0");
+    }
+
+    // A successful write shows its content as added lines
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"w","name":"write","args":"{\"path\":\"n.txt\",\"content\":\"a ```` b\\nc\\n\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"tool.end","call":"w","status":"ok","text":"Created n.txt.","ms":1})");
+        expect(t, "view.writediff", v->msgs[0].text,
+               "`````diff\n--- /dev/null\n+++ n.txt\n@@ -0,0 +1,2 @@\n+a ```` b\n+c\n`````\n");
+    }
+
+    // Order: a record applied once, a gap marks the view lost and is not
+    // applied, and a replay may skip numbers
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"note","text":"two"})");
+        expect(t, "view.gap", istr(&a, v->lost*100 + v->lastseq*10 + v->msgs.len), "100");
+        v->lost = 0;
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"note","text":"one"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"note","text":"two"})");
+        b32 dup = apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"note","text":"two"})");
+        expect(t, "view.dup", istr(&a, dup*100 + v->lastseq*10 + v->msgs.len), "22");
+        v->loose = 1;
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"note","text":"five"})");
+        expect(t, "view.loose", istr(&a, v->lost*100 + v->lastseq*10 + v->msgs.len), "53");
+    }
+
+    // A failed attempt's text fades, then the next attempt drops it;
+    // liveness comes from live and progress records
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":5000,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"attempt","turn":1,"n":1})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"attempt":1,"block":0,"kind":"think","text":"hm"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"retry","turn":1,"attempt":1,"class":"transient","status":503,"delay_ms":1500,"msg":"busy"})");
+        expect(t, "view.faded", istr(&a, v->msgs[0].faded*10 + v->msgs[0].prov), "11");
+        expect(t, "view.retrynote", v->msgs[1].text,
+               "Attempt 1 failed (transient, HTTP 503): busy. Retrying in 1.5 s.");
+        apply(v, a, R"({"sid":"s","ts":9000,"ev":"live","state":"backoff","retry_at":10500})");
+        expect(t, "view.backoff", istr(&a, v->state*100000 + v->retryat), "510500");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"attempt","turn":1,"n":2})");
+        expect(t, "view.dropfaded", msgsshow(&a, v),
+               "N:Attempt 1 failed (transient, HTTP 503): busy. Retrying in 1.5 s.;");
+        apply(v, a, R"({"sid":"s","ts":12000,"ev":"live","state":"waiting","idle_ms":700,"tps":0,"watchdog_ms":29300,"watchdog_of":30000})");
+        expect(t, "view.live", istr(&a, v->lastdata*1000000 + v->watchat), "11300041300");
+        apply(v, a, R"({"sid":"s","ts":12500,"ev":"progress","turn":1,"done":40,"total":100,"cached":0})");
+        expect(t, "view.progress", istr(&a, v->pdone*1000 + v->ptotal), "40100");
+        expect(t, "view.turnts", istr(&a, v->turnts), "5000");
+    }
+
+    // Records lost to a full mailbox come back from the log: a view fed
+    // through a tiny mailbox, resynced from the durable records written
+    // so far whenever it overflowed, ends as one fed everything.
+    {
+        Arena a = perm;
+        Buf   lb(&a, 1<<14);
+        print(&lb, R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w","model":"m","endpoint":"e"})" "\n");
+        print(&lb, R"({"sid":"s","seq":2,"ts":0,"ev":"user","text":"go","via":"prompt"})" "\n");
+        print(&lb, R"({"sid":"s","seq":3,"ts":0,"ev":"title","text":"go"})" "\n");
+        print(&lb, R"({"sid":"s","seq":4,"ts":0,"ev":"turn","n":1})" "\n");
+        print(&lb, R"({"sid":"s","seq":5,"ts":0,"ev":"attempt","turn":1,"n":1})" "\n");
+        for (i32 i = 0; i < 12; i++) {
+            print(&lb, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"attempt":1,"block":0,"kind":"text","text":"word "})" "\n");
+        }
+        print(&lb, R"({"sid":"s","seq":6,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                   R"({"t":"text","text":"word word"},{"t":"call","id":"c","name":"shell","args":"{\"command\":\"ls\"}"}]})" "\n");
+        print(&lb, R"({"sid":"s","seq":7,"ts":0,"ev":"tool.start","call":"c","name":"shell","args":"{}","cwd":"/w"})" "\n");
+        for (i32 i = 0; i < 6; i++) {
+            print(&lb, R"({"sid":"s","ts":0,"ev":"tool.out","call":"c","tail":"a\nb\n","bytes":4})" "\n");
+        }
+        print(&lb, R"({"sid":"s","seq":8,"ts":0,"ev":"tool.end","call":"c","status":"ok","exit":0,"text":"a\nb\n","spill":"out/c.log","bytes":4,"ms":3})" "\n");
+        print(&lb, R"({"sid":"s","seq":9,"ts":0,"ev":"attempt","turn":1,"n":2})" "\n");
+        print(&lb, R"({"sid":"s","seq":10,"ts":0,"ev":"assistant","turn":1,"attempt":2,"blocks":[{"t":"text","text":"done"}]})" "\n");
+        print(&lb, R"({"sid":"s","seq":11,"ts":0,"ev":"turn.end","turn":1,"why":"done"})" "\n");
+        Slice<Str> lines = {};
+        for (Str rest = finish(&lb); rest.len;) {
+            Cut c = cut(rest, '\n');
+            lines = push(&a, lines, c.head);
+            rest  = c.tail;
+        }
+
+        View *want = testview(&a);
+        for (iz i = 0; i < lines.len; i++) {
+            apply(want, a, lines[i]);
+        }
+
+        View    *got  = testview(&a);
+        Mailbox *mb   = newmailbox(&a, 400, 0, 0);
+        i32      lost = 0;
+        for (iz i = 0; i < lines.len; i++) {
+            mailpost(mb, MAIL_OUT, 0, lines[i], 0);
+            if (i%5!=4 && i!=lines.len-1) {
+                continue;
+            }
+            Mail m = mailtake(mb);
+            for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
+                apply(got, a, r.data);
+            }
+            if (m.overflow || got->lost) {
+                // The log: the durable records written by now
+                lost++;
+                got->loose = 1;
+                for (iz k = 0; k <= i; k++) {
+                    Arena tmp = a;
+                    EvRec rec = evparse(&tmp, lines[k]);
+                    if (rec.seq > got->lastseq) {
+                        viewrecord(got, tmp, &rec);
+                    }
+                }
+                got->loose = 0;
+                got->lost  = 0;
+            }
+        }
+        Buf x(&a, 1<<12);
+        Buf y(&a, 1<<12);
+        viewdump(&x, got);
+        viewdump(&y, want);
+        expect(t, "view.resync", finish(&x), finish(&y));
+        expect(t, "view.overflowed", istr(&a, lost>0), "1");
     }
 }

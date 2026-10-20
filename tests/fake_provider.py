@@ -485,6 +485,129 @@ def sc_escapee(model, n, req):
         yield from answer(model, "Escapee done.")
 
 
+# The GUI's checklist (harness gui --drive, run by tests/gui.py): the
+# prompt that began the turn picks the reply, and the step is how many
+# responses the turn has had so far.
+
+GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody",
+               "Steer me", "Cancel me", "Close me", "Stream fast", "Stream at 100",
+               "Say hello")
+
+GUI_LONG = """Done: **hello.txt** now greets *there*, and the command ran.
+
+## What changed
+
+1. Read `hello.txt`, which said hello to the world.
+2. Replaced `world` with `there`.
+3. Ran a slow loop that printed six lines.
+
+| step | tool  | result |
+|------|-------|--------|
+| 1    | read  | ok     |
+| 2    | edit  | ok     |
+| 3    | shell | ok     |
+
+Here is the kind of code an editor mangles, with tabs and trailing spaces:
+
+```c
+static int sum(int *a, int n)
+{
+\tint r = 0;\x20\x20
+\tfor (int i = 0; i < n; i++) {
+\t\tr += a[i];\x20\x20
+\t}
+\treturn r;
+}
+```
+
+""" + "".join(f"- Note {i}: the transcript scrolls, selects and copies this line.\n"
+              for i in range(60)) + """
+> That is all, for now.
+"""
+
+
+def gui_turn(req):
+    """The prompt that began this turn, its step, and the messages since."""
+    msgs = req.get("messages", [])
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i]
+        c = m.get("content") or ""
+        if m.get("role") == "user" and isinstance(c, str) and \
+                any(k in c for k in GUI_PROMPTS):
+            after = msgs[i+1:]
+            step = sum(1 for x in after if x.get("role") == "assistant")
+            return c, step, after
+    return "", 0, []
+
+
+def sc_gui(model, n, req):
+    prompt, step, after = gui_turn(req)
+    last = after[-1] if after else {}
+    if "Stream slowly" in prompt:
+        yield S.head()
+        for i in range(300):
+            yield from text(model, f"slow{i} ")
+            yield S.sleep(0.01)
+        yield from finish(model)
+    elif "Run the tools" in prompt:
+        if step == 0:
+            yield from tool(model, n, "read", {"path": "hello.txt"})
+        elif step == 1:
+            yield from tool(model, n, "edit", {"path": "hello.txt",
+                                               "old_string": "world",
+                                               "new_string": "there"})
+        elif step == 2:
+            cmd = "for i in 1 2 3 4 5 6; do echo line $i; sleep 0.4; done"
+            yield from tool(model, n, "shell", {"command": cmd})
+        else:
+            yield from answer(model, GUI_LONG, pieces=40)
+    elif "be allowed" in prompt:
+        if step == 0:
+            yield from tool(model, n, "write", {"path": "../gui-allowed.txt",
+                                                "content": "allowed\n"})
+        elif last.get("content", "").startswith(("Created", "Replaced")):
+            yield from answer(model, "Written outside, as allowed.")
+        else:
+            yield from answer(model, "Not written: " + last.get("content", ""))
+    elif "wait for nobody" in prompt:
+        if step == 0:
+            yield from tool(model, n, "write", {"path": "../gui-timeout.txt",
+                                                "content": "timeout\n"})
+        elif step == 1:
+            yield from tool(model, n, "write", {"path": "inside.txt",
+                                                "content": "inside\n"})
+        else:
+            yield from answer(model, "Denied, so I wrote inside.txt, inside the workspace.")
+    elif "Steer me" in prompt:
+        if step == 0:
+            yield from tool(model, n, "shell", {"command": "sleep 3"})
+        else:
+            steer = [m.get("content", "") for m in after if m.get("role") == "user"]
+            yield from answer(model, "Steered: " + steer[-1] if steer else "Not steered.")
+    elif "Cancel me" in prompt or "Close me" in prompt:
+        name = "cancel" if "Cancel" in prompt else "close"
+        if step == 0:
+            cmd = f"echo $$ > {name}.pid; sleep 60"
+            yield from tool(model, n, "shell", {"command": cmd})
+        else:
+            yield from answer(model, "Should not be reached.")
+    elif "Stream fast" in prompt:
+        yield S.head()
+        for i in range(3000):
+            yield S.data(chunk(model, {"content": f"w{i} "}))
+        yield from finish(model)
+    elif "Stream at 100" in prompt:
+        yield S.head()
+        for i in range(4000):
+            yield from text(model, f"t{i} ")
+            yield S.sleep(0.01)
+        yield from finish(model)
+    elif "Say hello" in prompt:
+        yield from answer(model, "Hello!")
+    else:
+        yield from answer(model, "I do not know that prompt.")
+
+
 # The soak: mostly normal steps with 10% random faults
 
 SOAK_FAULTS = ["stall_head", "stall_mid", "drop", "503", "429", "malformed",

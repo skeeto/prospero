@@ -142,18 +142,19 @@ static i32 inputkind(SDL_Event *e)
          ? INPUT_WINDOW : INPUT_OTHER;
 }
 
-// Returns 0 when the user quits.
-static b32 dispatch(GuiSdl *p, SDL_Event *e)
+// Closing and quitting are requests the core may decline.
+static void dispatch(GuiSdl *p, SDL_Event *e)
 {
     Gui *g = p->gui;
     if (e->type == p->wakeevent) {
         takewake(p);
-        return 1;
+        return;
     }
     switch (e->type) {
     case SDL_EVENT_QUIT:
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-        return 0;
+        gui_close(g);
+        return;
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
     case SDL_EVENT_WINDOW_EXPOSED:
@@ -184,7 +185,6 @@ static b32 dispatch(GuiSdl *p, SDL_Event *e)
     } else {
         g->woke |= WOKE_OTHER;
     }
-    return 1;
 }
 
 static b32 os_guiwait(Os *os, i64 us)
@@ -195,9 +195,7 @@ static b32 os_guiwait(Os *os, i64 us)
         return 1;  // timed out
     }
     do {
-        if (!dispatch(p, &e)) {
-            return 0;
-        }
+        dispatch(p, &e);
     } while (SDL_PollEvent(&e));
     return 1;
 }
@@ -277,12 +275,15 @@ static void os_guiinject(Os *os, GuiEvent *ge)
             {SDLK_ESCAPE, SDL_SCANCODE_ESCAPE},
             {SDLK_RETURN, SDL_SCANCODE_RETURN},
             {SDLK_C,      SDL_SCANCODE_C},
+            {SDLK_LSHIFT, SDL_SCANCODE_LSHIFT},
+            {SDLK_A,      SDL_SCANCODE_A},
         };
         e.type         = ge->down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
         e.key.windowID = id;
         e.key.key      = keys[ge->key].key;
         e.key.scancode = keys[ge->key].scan;
-        e.key.mod      = ge->ctrl ? SDL_KMOD_LCTRL : SDL_KMOD_NONE;
+        e.key.mod      = (SDL_Keymod)((ge->ctrl ? SDL_KMOD_LCTRL : 0) |
+                                      (ge->shift ? SDL_KMOD_LSHIFT : 0));
         e.key.down     = ge->down;
     } break;
     case GEV_TEXT:
@@ -306,6 +307,10 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         return;
     case GEV_DPI:
         return;  // a new scale needs another monitor
+    case GEV_CLOSE:
+        e.type            = SDL_EVENT_WINDOW_CLOSE_REQUESTED;
+        e.window.windowID = id;
+        break;
     }
     e.common.timestamp = SDL_GetTicksNS();
     SDL_PushEvent(&e);

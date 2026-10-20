@@ -359,6 +359,24 @@ static void live(Session *s)
         putintkey(&w.json, "idle_ms", (now - s->lastbyte)/MS);
         putkey(&w.json, "tps");
         putfloat(&w.json, (f64)tps10(s) / 10);
+        // The watchdog nearest to firing, and its length, so that a
+        // frontend can warn before it fires
+        i64 at = 0, of = 0;
+        i64 lens[] = {
+            s->state==S_DISCOVER ? 15*SEC : s->ep.firstbyte,
+            s->ep.idle,
+            s->ep.progress,
+        };
+        for (i32 t = T_FIRSTBYTE; t <= T_PROGRESS; t++) {
+            if (s->timers[t] && (!at || s->timers[t]<at)) {
+                at = s->timers[t];
+                of = lens[t - T_FIRSTBYTE];
+            }
+        }
+        if (at) {
+            putintkey(&w.json, "watchdog_ms", (at>now ? at-now : 0)/MS);
+            putintkey(&w.json, "watchdog_of", of/MS);
+        }
     } else if (s->state == S_BACKOFF) {
         i64 left = s->timers[T_BACKOFF] - now;
         putintkey(&w.json, "retry_at", os_time(os) + left/MS);
