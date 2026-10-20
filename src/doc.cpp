@@ -20,13 +20,13 @@
 // This is free and unencumbered software released into the public domain.
 
 enum : i32 {
-    BLOCK_PARA,
-    BLOCK_HEADING,
-    BLOCK_CODE,
-    BLOCK_ITEM,   // text of a tight list item, outside any paragraph
-    BLOCK_HR,
-    BLOCK_CELL,   // a table cell
-    BLOCK_PLAIN,  // a line of plain text, not markdown
+    DOC_PARA,
+    DOC_HEADING,
+    DOC_CODE,
+    DOC_ITEM,   // text of a tight list item, outside any paragraph
+    DOC_HR,
+    DOC_CELL,   // a table cell
+    DOC_PLAIN,  // a line of plain text, not markdown
 };
 
 enum : i32 {
@@ -62,7 +62,7 @@ struct Piece {
     i32 link;   // index into Doc.links, -1 if none
 };
 
-struct Block {
+struct DocBlock {
     i32 off0, off1;   // source range covered by its pieces
     i32 piece0;
     i32 npiece;
@@ -83,7 +83,7 @@ struct Block {
 
 struct Doc {
     Str          src;
-    Slice<Block> blocks;
+    Slice<DocBlock> blocks;
     Slice<Piece> pieces;
     Slice<Str>   links;
     i32          ntables;
@@ -168,7 +168,7 @@ static i32 lineend(Str src, i32 off)
 static i32 openblock(DocParse *p, i32 type)
 {
     Doc  *d = p->doc;
-    Block b = {};
+    DocBlock b = {};
     b.type   = type;
     b.piece0 = (i32)d->pieces.len;
     b.off0   = b.off1 = p->lastoff;
@@ -197,9 +197,9 @@ static void addpiece(DocParse *p, Piece pc)
     Doc *d = p->doc;
     if (p->cur < 0) {
         // Text outside any leaf: a tight list item's, or stray.
-        openblock(p, p->items ? BLOCK_ITEM : BLOCK_PARA);
+        openblock(p, p->items ? DOC_ITEM : DOC_PARA);
     }
-    Block *b = &d->blocks[p->cur];
+    DocBlock *b = &d->blocks[p->cur];
     if (!b->npiece) {
         b->off0 = pc.off;
     }
@@ -298,7 +298,7 @@ static int mdtext(MD_TEXTTYPE type, MD_CHAR const *text, MD_SIZE size, void *ud)
     u8       *s = (u8 *)text;
     Piece    pc = {};
     pc.style = curstyle(p);
-    if (p->cur>=0 && p->doc->blocks[p->cur].type==BLOCK_HEADING) {
+    if (p->cur>=0 && p->doc->blocks[p->cur].type==DOC_HEADING) {
         pc.style |= p->doc->blocks[p->cur].level << STYLE_HSHIFT;
     }
     pc.link  = p->link;
@@ -328,7 +328,7 @@ static int mdtext(MD_TEXTTYPE type, MD_CHAR const *text, MD_SIZE size, void *ud)
         pc.text = decodeentity(p->perm, pc.text);
         break;
     case MD_TEXT_CODE:
-        if (p->cur<0 || p->doc->blocks[p->cur].type!=BLOCK_CODE) {
+        if (p->cur<0 || p->doc->blocks[p->cur].type!=DOC_CODE) {
             break;
         }
         if (pc.flags&PIECE_SYNTH && size && text[0]==' ') {
@@ -343,7 +343,7 @@ static int mdtext(MD_TEXTTYPE type, MD_CHAR const *text, MD_SIZE size, void *ud)
             Piece raw = pc;
             if (rawindent(p, pc.off, p->indentcols, &raw)) {
                 Doc   *d = p->doc;
-                Block *b = &d->blocks[p->cur];
+                DocBlock *b = &d->blocks[p->cur];
                 b->npiece    -= (i32)(d->pieces.len - p->indent0);
                 d->pieces.len = p->indent0;
                 addpiece(p, raw);
@@ -365,7 +365,7 @@ static int mdtext(MD_TEXTTYPE type, MD_CHAR const *text, MD_SIZE size, void *ud)
 }
 
 // Split the code block's pieces at the highlighter's token boundaries.
-static void highlightblock(DocParse *p, Block *b)
+static void highlightblock(DocParse *p, DocBlock *b)
 {
     Doc *d     = p->doc;
     iz   total = 0;
@@ -445,12 +445,12 @@ static void closeblock(DocParse *p)
         return;
     }
     Doc   *d = p->doc;
-    Block *b = &d->blocks[p->cur];
-    if (b->type==BLOCK_CODE && b->npiece) {
+    DocBlock *b = &d->blocks[p->cur];
+    if (b->type==DOC_CODE && b->npiece) {
         highlightblock(p, b);
     }
     p->indent0 = -1;
-    if (!b->npiece && (b->type==BLOCK_HR || b->type==BLOCK_CODE)) {
+    if (!b->npiece && (b->type==DOC_HR || b->type==DOC_CODE)) {
         b->off0    = nextline({p->base, p->size}, b->off0);
         b->off1    = lineend({p->base, p->size}, b->off0);
         p->lastoff = b->off1;
@@ -508,23 +508,23 @@ static int mdenter(MD_BLOCKTYPE type, void *detail, void *ud)
         }
     } break;
     case MD_BLOCK_HR:
-        openblock(p, BLOCK_HR);
+        openblock(p, DOC_HR);
         break;
     case MD_BLOCK_H: {
         MD_BLOCK_H_DETAIL *h = (MD_BLOCK_H_DETAIL *)detail;
-        i32 b = openblock(p, BLOCK_HEADING);
+        i32 b = openblock(p, DOC_HEADING);
         p->doc->blocks[b].level = (i32)h->level;
     } break;
     case MD_BLOCK_CODE: {
         MD_BLOCK_CODE_DETAIL *c = (MD_BLOCK_CODE_DETAIL *)detail;
-        i32    i = openblock(p, BLOCK_CODE);
-        Block *b = &p->doc->blocks[i];
+        i32    i = openblock(p, DOC_CODE);
+        DocBlock *b = &p->doc->blocks[i];
         b->fence = c->fence_char != 0;
         b->lang  = clone(p->perm, {(u8 *)c->lang.text, (iz)c->lang.size});
         p->code++;
     } break;
     case MD_BLOCK_P:
-        openblock(p, BLOCK_PARA);
+        openblock(p, DOC_PARA);
         break;
     case MD_BLOCK_TABLE:
         p->table = p->doc->ntables++;
@@ -540,8 +540,8 @@ static int mdenter(MD_BLOCKTYPE type, void *detail, void *ud)
         p->col++;
         p->header = type == MD_BLOCK_TH;
         p->align  = td->align==MD_ALIGN_CENTER ? 1 : td->align==MD_ALIGN_RIGHT ? 2 : 0;
-        i32    i = openblock(p, BLOCK_CELL);
-        Block *b = &p->doc->blocks[i];
+        i32    i = openblock(p, DOC_CELL);
+        DocBlock *b = &p->doc->blocks[i];
         b->table = p->table;
         b->row   = p->row;
         b->col   = p->col;
@@ -570,7 +570,7 @@ static int mdleave(MD_BLOCKTYPE type, void *, void *ud)
     case MD_BLOCK_LI:
         if (p->pending) {
             // An empty item still shows its marker.
-            openblock(p, BLOCK_ITEM);
+            openblock(p, DOC_ITEM);
         }
         closeblock(p);
         p->items--;
@@ -660,7 +660,7 @@ static Doc *parseplain(Arena *perm, Str src, i32 style)
         Cut c = cut(rest, '\n');
         i32 off = (i32)(rest.data - src.data);
         p.lastoff = off;
-        openblock(&p, BLOCK_PLAIN);
+        openblock(&p, DOC_PLAIN);
         if (c.head.len) {
             Piece pc = {};
             pc.off   = off;

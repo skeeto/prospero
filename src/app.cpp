@@ -29,7 +29,7 @@ enum : i64 {
 enum : iz {
     PROMPT_MAX = 1<<16,
     BENCH_MAX  = 4096,
-    LOG_MAX    = 200,     // lines kept in the Log window
+    GUILOG_MAX = 200,     // lines kept in the Log window
     INBOX_CAP  = 1<<21,   // bytes per inbox buffer
 };
 
@@ -316,7 +316,7 @@ static void guilog(Gui *g, Str msg)
     if (g->logfd >= 0) {
         os_logwrite(g->os, g->logfd, finish(&b));
     }
-    if (g->logs.len >= LOG_MAX) {
+    if (g->logs.len >= GUILOG_MAX) {
         for (iz i = 1; i < g->logs.len; i++) {
             g->logs[i-1] = g->logs[i];
         }
@@ -1277,7 +1277,7 @@ static void benchframe(Gui *g, i64 cpu)
         if (g->benchstep++ > 2) {
             benchsample(g, cpu);
         }
-        Msg *last  = &v->msgs[v->msgs.len-1];
+        ViewMsg *last  = &v->msgs[v->msgs.len-1];
         f64  total = last->top + last->h;
         f64  y     = (f64)g->benchstep * 400 * g->scale;
         if (y > total || g->benchstep > 3000) {
@@ -1676,8 +1676,8 @@ static void selectcode(Gui *g)
     for (i32 i = 0; i < v->msgs.len; i++) {
         Doc *d = msgdoc(v, i);
         for (i32 k = 0; k < d->blocks.len; k++) {
-            Block *b = &d->blocks[k];
-            if (b->type!=BLOCK_CODE || !b->npiece) continue;
+            DocBlock *b = &d->blocks[k];
+            if (b->type!=DOC_CODE || !b->npiece) continue;
             Buf code(&g->perm, 256);
             for (i32 j = 0; j < b->npiece; j++) {
                 print(&code, d->pieces[b->piece0+j].text);

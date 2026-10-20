@@ -250,6 +250,35 @@ static void os_logclose(Os *os, iz log)
     os->logs[log] = 0;
 }
 
+static Read os_readat(Os *os, Arena *a, Str path, i64 off, iz max)
+{
+    Read r = os_read(os, a, path, I64MAX>>1);
+    if (!r.err) {
+        Str d = r.data;
+        d = off<d.len ? cuthead(d, (iz)off) : cuthead(d, d.len);
+        r.data = d.len>max ? takehead(d, max) : d;
+    }
+    return r;
+}
+
+static Str os_realpath(Os *os, Arena *a, Str path)
+{
+    VFile *f = vfind(os, path, 0);
+    return f && f->exists ? clone(a, path) : Str{};
+}
+
+// No processes, HTTP, or standard input: the engine is tested end to
+// end by tests/scenarios.py against the real platforms.
+static Slice<Str> os_environ(Os *, Arena *) { return {}; }
+static iz    os_stdin(Os *, u8 *, iz) { return 0; }
+static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
+static void  os_kill(Os *, Proc *, b32) {}
+static void  os_procfree(Os *, Proc *) {}
+static Http *os_http(Os *, HttpReq *, Arena) { return 0; }
+static void  os_httpcancel(Os *, Http *) {}
+static void  os_httpfree(Os *, Http *) {}
+static Str   os_lasterr(Os *, Arena *) { return "not supported in tests"; }
+
 // A fresh test platform with its own storage carved from the arena.
 static Os *newos(Arena *a, iz cap)
 {
@@ -304,6 +333,9 @@ static Str istr(Arena *a, i64 v)
 #include "test/ini_test.cpp"
 #include "test/mailbox_test.cpp"
 #include "test/events_test.cpp"
+#include "test/provider_test.cpp"
+#include "test/tools_test.cpp"
+#include "test/guard_test.cpp"
 #if HARNESS_GUI
 #  include "sched.cpp"
 #  include "highlight.cpp"
@@ -331,6 +363,9 @@ int main()
     test_ini(&t);
     test_mailbox(&t);
     test_events(&t);
+    test_provider(&t);
+    test_tools(&t);
+    test_guard(&t);
     #if HARNESS_GUI
     test_sched(&t);
     test_highlight(&t);

@@ -24,14 +24,14 @@
 // This is free and unencumbered software released into the public domain.
 
 enum : i32 {
-    ROLE_USER,
-    ROLE_ASSISTANT,
-    ROLE_THINK,
-    ROLE_TOOL,
-    ROLE_NOTE,
+    VIEW_USER,
+    VIEW_ASSISTANT,
+    VIEW_THINK,
+    VIEW_TOOL,
+    VIEW_NOTE,
 };
 
-struct Msg {
+struct ViewMsg {
     Str       text;       // source, in the text arena
     i32       role;
     i32       turn;
@@ -78,9 +78,9 @@ struct View {
     byte        *cachebase;
     iz           cachemax;   // reset the cache past this many bytes
     i32          gen;
-    Slice<Msg>   msgs;
+    Slice<ViewMsg>   msgs;
     i32          stream;     // the provisional message, -1 if none
-    i32          streamkind; // its delta kind: ROLE_ASSISTANT or ROLE_THINK
+    i32          streamkind; // its delta kind: VIEW_ASSISTANT or VIEW_THINK
     i32          prov;       // first provisional message, -1 if none
     byte        *provtext;   // text arena position when it began
     b32          provmixed;  // others were added after it began
@@ -141,7 +141,7 @@ static i64 countnl(Str s)
 
 static i32 addmsg(View *v, i32 role, Str text)
 {
-    Msg m = {};
+    ViewMsg m = {};
     m.role = role;
     m.turn = v->turn;
     m.text = clone(&v->text, text);
@@ -165,7 +165,7 @@ static void viewdelta(View *v, i32 role, Str text)
             v->provtext  = v->text.beg;
             v->provmixed = 0;
         }
-        Msg m = {};
+        ViewMsg m = {};
         m.role = role;
         m.turn = v->turn;
         m.prov = 1;
@@ -173,7 +173,7 @@ static void viewdelta(View *v, i32 role, Str text)
         v->stream     = (i32)v->msgs.len - 1;
         v->streamkind = role;
     }
-    Msg *m = &v->msgs[v->stream];
+    ViewMsg *m = &v->msgs[v->stream];
     m->text = concat(&v->text, m->text, text);
     m->nl  += countnl(text);
     m->ver++;
@@ -239,7 +239,7 @@ static b32 viewapply(View *v, Arena scratch, Str line)
     switch (r.ev) {
     case EV_USER:
         dropprov(v);
-        addmsg(v, ROLE_USER, jsonstr(jsonget(j, "text")));
+        addmsg(v, VIEW_USER, jsonstr(jsonget(j, "text")));
         v->msgs[v->msgs.len-1].seq = r.seq;
         return 1;
 
@@ -250,7 +250,7 @@ static b32 viewapply(View *v, Arena scratch, Str line)
 
     case EV_DELTA: {
         Str kind = jsonstr(jsonget(j, "kind"));
-        i32 role = kind=="think" ? ROLE_THINK : ROLE_ASSISTANT;
+        i32 role = kind=="think" ? VIEW_THINK : VIEW_ASSISTANT;
         if (kind == "args") {
             return 0;  // tool arguments stream invisibly until M3
         }
@@ -263,16 +263,16 @@ static b32 viewapply(View *v, Arena scratch, Str line)
         for (Json *b = blocks->child; b; b = b->next) {
             Str t = jsonstr(jsonget(b, "t"));
             if (t == "think") {
-                addmsg(v, ROLE_THINK, jsonstr(jsonget(b, "text")));
+                addmsg(v, VIEW_THINK, jsonstr(jsonget(b, "text")));
             } else if (t == "text") {
-                addmsg(v, ROLE_ASSISTANT, jsonstr(jsonget(b, "text")));
+                addmsg(v, VIEW_ASSISTANT, jsonstr(jsonget(b, "text")));
             } else if (t == "call") {
                 Arena tmp = scratch;
                 Buf   buf(&tmp, 256);
                 print(&buf, jsonstr(jsonget(b, "name")));
                 putbyte(&buf, ' ');
                 print(&buf, jsonstr(jsonget(b, "args")));
-                addmsg(v, ROLE_TOOL, finish(&buf));
+                addmsg(v, VIEW_TOOL, finish(&buf));
             } else {
                 continue;
             }
@@ -286,12 +286,12 @@ static b32 viewapply(View *v, Arena scratch, Str line)
         if (!text.len) {
             return 0;
         }
-        addmsg(v, ROLE_TOOL, text);
+        addmsg(v, VIEW_TOOL, text);
         v->msgs[v->msgs.len-1].seq = r.seq;
     } return 1;
 
     case EV_NOTE:
-        addmsg(v, ROLE_NOTE, jsonstr(jsonget(j, "text")));
+        addmsg(v, VIEW_NOTE, jsonstr(jsonget(j, "text")));
         v->msgs[v->msgs.len-1].seq = r.seq;
         return 1;
 
@@ -313,17 +313,17 @@ static b32 viewapply(View *v, Arena scratch, Str line)
 
 static Doc *msgdoc(View *v, i32 i)
 {
-    Msg *m = &v->msgs[i];
+    ViewMsg *m = &v->msgs[i];
     if (m->doc && m->docver==m->ver && m->docgen==v->gen) {
         return m->doc;
     }
     switch (m->role) {
-    case ROLE_USER:
-    case ROLE_TOOL:
-        m->doc = parseplain(&v->cache, m->text, m->role==ROLE_TOOL ? STYLE_CODE : 0);
+    case VIEW_USER:
+    case VIEW_TOOL:
+        m->doc = parseplain(&v->cache, m->text, m->role==VIEW_TOOL ? STYLE_CODE : 0);
         break;
-    case ROLE_THINK:
-    case ROLE_NOTE:
+    case VIEW_THINK:
+    case VIEW_NOTE:
         m->doc = parseplain(&v->cache, m->text, STYLE_DIM);
         break;
     default:
@@ -337,7 +337,7 @@ static Doc *msgdoc(View *v, i32 i)
 // Lay out message i at the width, updating its height.
 static MsgLayout *msglayout(View *v, i32 i, Measure *ms, f32 width, f32 scale)
 {
-    Msg *m = &v->msgs[i];
+    ViewMsg *m = &v->msgs[i];
     if (m->layoutver!=m->ver || m->layoutgen!=v->gen || m->layoutw!=width ||
             !m->measured) {
         Doc *d = msgdoc(v, i);
@@ -357,7 +357,7 @@ static MsgLayout *msglayout(View *v, i32 i, Measure *ms, f32 width, f32 scale)
 
 // Height estimate for a message not yet laid out: its lines, plus its
 // bytes wrapped at a typical character width.
-static f32 estimate(Msg *m, f32 width, f32 charw, f32 lineh)
+static f32 estimate(ViewMsg *m, f32 width, f32 charw, f32 lineh)
 {
     i64 perline = width>charw ? (i64)(width/charw) : 1;
     i64 lines   = m->nl + 1 + m->text.len/perline;
@@ -370,7 +370,7 @@ static f64 viewtops(View *v, f32 width, f32 charw, f32 lineh)
     if (v->topsdirty) {
         f64 y = 0;
         for (iz i = 0; i < v->msgs.len; i++) {
-            Msg *m = &v->msgs[i];
+            ViewMsg *m = &v->msgs[i];
             if (!m->measured || m->layoutw!=width) {
                 m->measured = 0;
                 m->h = estimate(m, width, charw, lineh);
@@ -383,7 +383,7 @@ static f64 viewtops(View *v, f32 width, f32 charw, f32 lineh)
     if (!v->msgs.len) {
         return 0;
     }
-    Msg *last = &v->msgs[v->msgs.len-1];
+    ViewMsg *last = &v->msgs[v->msgs.len-1];
     return last->top + v->extra + last->h;
 }
 
@@ -577,13 +577,13 @@ static Str piececlip(Piece *p, i32 s, i32 e)
 }
 
 // What goes between two blocks in copied text.
-static Str blocksep(Block *prev, Block *b)
+static Str blocksep(DocBlock *prev, DocBlock *b)
 {
-    if (prev->type==BLOCK_CELL && b->type==BLOCK_CELL && prev->table==b->table) {
+    if (prev->type==DOC_CELL && b->type==DOC_CELL && prev->table==b->table) {
         return prev->row==b->row ? Str("\t") : Str("\n");
-    } else if (prev->type==BLOCK_PLAIN && b->type==BLOCK_PLAIN) {
+    } else if (prev->type==DOC_PLAIN && b->type==DOC_PLAIN) {
         return "\n";
-    } else if (b->type==BLOCK_ITEM && (prev->type==BLOCK_ITEM || prev->depth)) {
+    } else if (b->type==DOC_ITEM && (prev->type==DOC_ITEM || prev->depth)) {
         return "\n";
     }
     return "\n\n";
@@ -593,9 +593,9 @@ static Str blocksep(Block *prev, Block *b)
 // byte-exact, with list markers and block separators restored.
 static void copytext(Buf *b, Doc *d, i32 s, i32 e)
 {
-    Block *prev = 0;
+    DocBlock *prev = 0;
     for (iz i = 0; i < d->blocks.len; i++) {
-        Block *k = &d->blocks[i];
+        DocBlock *k = &d->blocks[i];
         if (k->off1<s || k->off0>e) {
             continue;
         }
@@ -621,7 +621,7 @@ static void copytext(Buf *b, Doc *d, i32 s, i32 e)
             }
             any = 1;
         }
-        if (k->type==BLOCK_HR && starts) {
+        if (k->type==DOC_HR && starts) {
             print(b, "---");
             any = 1;
         }
@@ -665,9 +665,9 @@ static b32 fenceline(Str line)
 static Range32 blocklines(Doc *d, iz i)
 {
     Str    src = d->src;
-    Block *k   = &d->blocks[i];
+    DocBlock *k   = &d->blocks[i];
     Range32 r  = {linestart(src, k->off0), lineend(src, k->off1)};
-    if (k->type==BLOCK_CODE && k->fence) {
+    if (k->type==DOC_CODE && k->fence) {
         if (k->npiece && r.beg>0) {
             r.beg = linestart(src, r.beg-1);  // the opening fence
         }
@@ -714,7 +714,7 @@ static Str copysel(View *v, Arena *perm, i32 how)
     }
     Buf b(perm, 1<<12);
     for (i32 i = r.beg.msg; i <= r.end.msg; i++) {
-        Msg *m = &v->msgs[i];
+        ViewMsg *m = &v->msgs[i];
         i32  s = i==r.beg.msg ? r.beg.off : 0;
         i32  e = i==r.end.msg ? r.end.off : (i32)m->text.len;
         if (i > r.beg.msg) {

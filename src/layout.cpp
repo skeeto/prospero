@@ -284,7 +284,7 @@ static void adddeco(Wrap *w, i32 kind, f32 x, f32 y, f32 dw, f32 dh, Str text)
     w->bl->decos = push(w->perm, w->bl->decos, d);
 }
 
-static Str markertext(Arena *perm, Block *b)
+static Str markertext(Arena *perm, DocBlock *b)
 {
     if (b->task) {
         return b->task==2 ? Str("\xe2\x98\x91") : Str("\xe2\x98\x90");  // ☑ ☐
@@ -299,7 +299,7 @@ static Str markertext(Arena *perm, Block *b)
 }
 
 // Left edge of a block's text: list and quote indentation.
-static f32 blockindent(Spacing *sp, Block *b)
+static f32 blockindent(Spacing *sp, DocBlock *b)
 {
     return (f32)b->depth*sp->indent + (f32)b->quote*sp->quote;
 }
@@ -321,7 +321,7 @@ static Wrap newwrap(Arena *perm, Measure *m, BlockLayout *bl, Piece *pieces)
 static BlockLayout *layoutblock(Arena *perm, Measure *m, Doc *d, i32 bi,
                                 f32 width, f32 scale)
 {
-    Block       *b  = &d->blocks[bi];
+    DocBlock       *b  = &d->blocks[bi];
     BlockLayout *bl = alloc<BlockLayout>(perm);
     bl->hash    = b->hash;
     bl->width   = width;
@@ -339,7 +339,7 @@ static BlockLayout *layoutblock(Arena *perm, Measure *m, Doc *d, i32 bi,
     w.x     = x0;
     w.width = w0;
 
-    if (b->type == BLOCK_CODE) {
+    if (b->type == DOC_CODE) {
         w.code   = 1;
         w.x0    += sp.pad;
         w.x      = w.x0;
@@ -350,7 +350,7 @@ static BlockLayout *layoutblock(Arena *perm, Measure *m, Doc *d, i32 bi,
         w.ascent = f.ascent;
     }
 
-    if (b->type == BLOCK_HR) {
+    if (b->type == DOC_HR) {
         f32 h = sp.em;
         adddeco(&w, DECO_RULE, x0, h/2 - 1, w0, 2, "");
         bl->h = h;
@@ -363,7 +363,7 @@ static BlockLayout *layoutblock(Arena *perm, Measure *m, Doc *d, i32 bi,
     }
 
     f32 h = w.y;
-    if (b->type == BLOCK_CODE) {
+    if (b->type == DOC_CODE) {
         h += sp.pad;
         adddeco(&w, DECO_CODEBG, x0, 0, w0, h, "");
     }
@@ -392,11 +392,11 @@ struct TableShape {
 static TableShape tableshape(Doc *d, i32 bi)
 {
     TableShape r     = {};
-    Block     *first = &d->blocks[bi];
+    DocBlock     *first = &d->blocks[bi];
     Hash64     h     = {};
     for (; bi+r.n < d->blocks.len; r.n++) {
-        Block *c = &d->blocks[bi+r.n];
-        if (c->type!=BLOCK_CELL || c->table!=first->table) break;
+        DocBlock *c = &d->blocks[bi+r.n];
+        if (c->type!=DOC_CELL || c->table!=first->table) break;
         r.ncols = c->col+1>r.ncols ? c->col+1 : r.ncols;
         r.nrows = c->row+1>r.nrows ? c->row+1 : r.nrows;
         hashword(&h, c->hash);
@@ -409,7 +409,7 @@ static TableShape tableshape(Doc *d, i32 bi)
 static BlockLayout *layouttable(Arena *perm, Measure *m, Doc *d, i32 bi,
                                 f32 width, f32 scale)
 {
-    Block     *first = &d->blocks[bi];
+    DocBlock     *first = &d->blocks[bi];
     TableShape ts    = tableshape(d, bi);
     i32        n     = ts.n;
     i32        ncols = ts.ncols;
@@ -430,7 +430,7 @@ static BlockLayout *layouttable(Arena *perm, Measure *m, Doc *d, i32 bi,
     // Natural column widths: each cell on one line.
     f32 *natural = alloc<f32>(perm, ncols);
     for (i32 i = 0; i < n; i++) {
-        Block *c  = &d->blocks[bi+i];
+        DocBlock *c  = &d->blocks[bi+i];
         f32    cw = 2*sp.pad;
         for (i32 k = 0; k < c->npiece; k++) {
             Piece *pc = &d->pieces[c->piece0+k];
@@ -459,7 +459,7 @@ static BlockLayout *layouttable(Arena *perm, Measure *m, Doc *d, i32 bi,
     for (i32 r = 0; r < nrows; r++) {
         f32 rowh = 0;
         for (; i<n && d->blocks[bi+i].row==r; i++) {
-            Block *c = &d->blocks[bi+i];
+            DocBlock *c = &d->blocks[bi+i];
             w.x0    = colx[c->col] + sp.pad;
             w.x     = w.x0;
             w.width = colx[c->col+1] - colx[c->col] - 2*sp.pad;
@@ -522,8 +522,8 @@ static u64 layoutkey(u64 hash, f32 width, f32 scale)
 static BlockLayout *getlayout(LayoutCache **cache, Arena *perm, Measure *m,
                               Doc *d, i32 bi, f32 width, f32 scale)
 {
-    Block *b    = &d->blocks[bi];
-    u64    hash = b->type==BLOCK_CELL ? tableshape(d, bi).hash : b->hash;
+    DocBlock *b    = &d->blocks[bi];
+    u64    hash = b->type==DOC_CELL ? tableshape(d, bi).hash : b->hash;
     u64    key  = layoutkey(hash, width, scale);
     LayoutCache **slot = cache;
     for (u64 h = key; *slot; h <<= 2) {
@@ -532,7 +532,7 @@ static BlockLayout *getlayout(LayoutCache **cache, Arena *perm, Measure *m,
         }
         slot = &(*slot)->child[h>>62];
     }
-    BlockLayout *bl = b->type==BLOCK_CELL
+    BlockLayout *bl = b->type==DOC_CELL
         ? layouttable(perm, m, d, bi, width, scale)
         : layoutblock(perm, m, d, bi, width, scale);
     *slot = alloc<LayoutCache>(perm);
@@ -556,13 +556,13 @@ struct MsgLayout {
     f32           h;
 };
 
-static f32 blockgap(Spacing *sp, Block *prev, Block *b)
+static f32 blockgap(Spacing *sp, DocBlock *prev, DocBlock *b)
 {
-    if (prev->type==BLOCK_PLAIN && b->type==BLOCK_PLAIN) {
+    if (prev->type==DOC_PLAIN && b->type==DOC_PLAIN) {
         return 0;
-    } else if (b->type==BLOCK_ITEM && (prev->type==BLOCK_ITEM || prev->depth<b->depth)) {
+    } else if (b->type==DOC_ITEM && (prev->type==DOC_ITEM || prev->depth<b->depth)) {
         return sp->tight;
-    } else if (b->type == BLOCK_HEADING) {
+    } else if (b->type == DOC_HEADING) {
         return 1.2f * sp->gap;
     }
     return sp->gap;
@@ -698,7 +698,7 @@ static i32 linehit(BlockLayout *bl, f32 x, f32 y)
 static i32 blockhit(Measure *m, Doc *d, Placed *p, f32 x, f32 y)
 {
     BlockLayout *bl     = p->bl;
-    Block       *b      = &d->blocks[p->block];
+    DocBlock       *b      = &d->blocks[p->block];
     Piece       *pieces = d->pieces.data + b->piece0;
     i32          li     = linehit(bl, x, y - p->y);
     if (li < 0) {

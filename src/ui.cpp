@@ -321,11 +321,11 @@ static u32 piececolor(Piece *p)
 static Str rolename(i32 role)
 {
     switch (role) {
-    case ROLE_USER:      return "You";
-    case ROLE_ASSISTANT: return "Agent";
-    case ROLE_THINK:     return "Reasoning";
-    case ROLE_TOOL:      return "Tool";
-    case ROLE_NOTE:      return "Note";
+    case VIEW_USER:      return "You";
+    case VIEW_ASSISTANT: return "Agent";
+    case VIEW_THINK:     return "Reasoning";
+    case VIEW_TOOL:      return "Tool";
+    case VIEW_NOTE:      return "Note";
     }
     return "";
 }
@@ -343,7 +343,7 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
                       f32 cliptop, f32 clipbot)
 {
     BlockLayout *bl     = p->bl;
-    Block       *b      = &d->blocks[p->block];
+    DocBlock       *b      = &d->blocks[p->block];
     Piece       *pieces = d->pieces.data + b->piece0;
     f32          ox     = origin.x;
     f32          oy     = origin.y + p->y;
@@ -536,14 +536,14 @@ static void drawtranscript(Gui *g)
     i32   d0   = viewfind(v, scrolly);
     i32   d1   = viewfind(v, scrolly + winh);
     for (i32 i = d0; i>=0 && i <= d1; i++) {
-        Msg       *m  = &v->msgs[i];
+        ViewMsg       *m  = &v->msgs[i];
         MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
         Doc       *d  = msgdoc(v, i);
         f32 y = wpos.y + (f32)(m->top - scrolly);
         f32 x = wpos.x + pad;
 
         // Role line, and a background for the user's messages.
-        if (m->role == ROLE_USER) {
+        if (m->role == VIEW_USER) {
             sp->SetCurrentChannel(dl, CH_BG);
             dl->AddRectFilled(v2(wpos.x+pad/2, y), v2(wpos.x+pad*1.5f+width, y+v->extra+m->h),
                               rgba(40, 44, 52, 255), 6*sc);
@@ -586,7 +586,7 @@ static void drawtranscript(Gui *g)
         f64 cy = scrolly + (my - wpos.y);
         i32 i  = viewfind(v, cy);
         if (i >= 0) {
-            Msg       *m  = &v->msgs[i];
+            ViewMsg       *m  = &v->msgs[i];
             MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
             f32 ly = (f32)(cy - m->top - head);
             at.msg = i;

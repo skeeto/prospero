@@ -10,10 +10,10 @@ static Str docshow(Arena *a, Doc *d)
 {
     Buf b(a, 256);
     for (iz i = 0; i < d->blocks.len; i++) {
-        Block *k = &d->blocks[i];
+        DocBlock *k = &d->blocks[i];
         static char const types[] = "PHCIRTL";
         putbyte(&b, (u8)types[k->type]);
-        if (k->type == BLOCK_HEADING) print(&b, (i64)k->level);
+        if (k->type == DOC_HEADING) print(&b, (i64)k->level);
         if (k->depth) { print(&b, " d"); print(&b, (i64)k->depth); }
         if (k->quote) { print(&b, " q"); print(&b, (i64)k->quote); }
         if (k->item) {
@@ -27,7 +27,7 @@ static Str docshow(Arena *a, Doc *d)
         }
         if (k->task) print(&b, k->task==2 ? Str(" [x]") : Str(" [ ]"));
         if (k->lang.len) { print(&b, " lang="); print(&b, k->lang); }
-        if (k->type == BLOCK_CELL) {
+        if (k->type == DOC_CELL) {
             print(&b, " t");  print(&b, (i64)k->table);
             print(&b, "r");   print(&b, (i64)k->row);
             print(&b, "c");   print(&b, (i64)k->col);
@@ -69,7 +69,7 @@ static Str docshow(Arena *a, Doc *d)
 static Str doccode(Arena *a, Doc *d, iz block)
 {
     Buf    b(a, 64);
-    Block *k = &d->blocks[block];
+    DocBlock *k = &d->blocks[block];
     for (i32 j = 0; j < k->npiece; j++) {
         print(&b, d->pieces[k->piece0+j].text);
     }
@@ -82,7 +82,7 @@ static Str doccheck(Arena *a, Doc *d)
 {
     Str src = d->src;
     for (iz i = 0; i < d->blocks.len; i++) {
-        Block *k = &d->blocks[i];
+        DocBlock *k = &d->blocks[i];
         if (k->off0<0 || k->off0>k->off1 || k->off1>src.len) {
             return concat(a, "block range ", istr(a, i));
         }
@@ -182,7 +182,7 @@ static void test_doc(Test *t)
             Doc *d = parsedoc(&a, cases[i].src, 0);
             iz   c = -1;
             for (iz k = 0; k < d->blocks.len && c<0; k++) {
-                if (d->blocks[k].type == BLOCK_CODE) c = k;
+                if (d->blocks[k].type == DOC_CODE) c = k;
             }
             Str name = concat(&a, "doc.exact", istr(&a, i));
             expect(t, name, c<0 ? Str("(no code)") : doccode(&a, d, c), cases[i].code);

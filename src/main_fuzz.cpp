@@ -1,10 +1,13 @@
 // AFL++ fuzz layer: the JSON reader and writer, or with -DFUZZ_EVENTS the
-// session log's open, recovery, and replay over a one-file stub platform
+// session log's open, recovery, and replay over a one-file stub platform,
+// or with -DFUZZ_PROVIDER the engine's parsers of untrusted text
 //   $ afl-clang-fast++ -std=c++20 -fno-exceptions -fno-rtti -g3 \
 //         -fsanitize=address,undefined -fsanitize-trap=undefined \
 //         -o fuzzjson src/main_fuzz.cpp
 //   $ mkdir i && printf '{"a":[1,"\\u00e9",null]}' >i/doc
 //   $ afl-fuzz -i i -o o ./fuzzjson
+//
+// Likewise with -DFUZZ_EVENTS or -DFUZZ_PROVIDER for the other targets.
 //
 // JSON: an input either fails at an offset inside it, or parses to a root
 // spanning the input less surrounding whitespace, and writes canonical
@@ -17,6 +20,13 @@
 // nothing to repair or recover. All of this holds as well when the log
 // refuses truncation, and when writes fail partway through recovery, a
 // later open leaves the same file as an undisturbed one would have.
+//
+// Provider: a stream, chunked at points the input picks, accumulates
+// into blocks whose request encoding always parses; repaired arguments
+// sent back are always an object; cleaned output holds no escape or
+// carriage return; normalized paths are rooted, free of "." and ".."
+// and stable under renormalizing; edit matches are ordered spans inside
+// the text; and URL, discovery, error and cycle parsing never fault.
 //
 // Without AFL++ it runs one input from standard input.
 //
@@ -124,6 +134,18 @@ static b32 os_logtrunc(Os *os, iz, i64 len)
 }
 
 static void os_logclose(Os *, iz) {}
+
+static Read os_readat(Os *, Arena *, Str, i64, iz) { return {{}, 0, READ_NOTFOUND}; }
+static Slice<Str> os_environ(Os *, Arena *) { return {}; }
+static iz    os_stdin(Os *, u8 *, iz) { return 0; }
+static Str   os_realpath(Os *, Arena *, Str) { return {}; }
+static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
+static void  os_kill(Os *, Proc *, b32) {}
+static void  os_procfree(Os *, Proc *) {}
+static Http *os_http(Os *, HttpReq *, Arena) { return 0; }
+static void  os_httpcancel(Os *, Http *) {}
+static void  os_httpfree(Os *, Http *) {}
+static Str   os_lasterr(Os *, Arena *) { return {}; }
 
 
 // Valid UTF-8 without surrogates or raw control characters.
@@ -292,6 +314,126 @@ static void fuzzevents(Arena a, Str src)
     }
 }
 
+// Provider
+
+static void fuzzpaths(Arena a, Str src, b32 win)
+{
+    Str cwd = win ? Str("C:/w") : Str("/w");
+    Str p   = normpath(&a, cwd, src, win);
+    iz  r   = pathroot(p, win);
+    assert(r > 0);
+    for (Str rest = cuthead(p, r); rest.len;) {
+        Cut c = cut(rest, '/');
+        assert(c.head.len && c.head!="." && c.head!="..");
+        rest = c.tail;
+    }
+    assert(normpath(&a, cwd, p, win) == p);
+}
+
+static void fuzzspans(Str hay, Slice<Span> m)
+{
+    iz last = 0;
+    for (iz i = 0; i < m.len; i++) {
+        assert(m[i].beg>=last && m[i].beg<=m[i].end && m[i].end<=hay.len);
+        last = m[i].end;
+    }
+}
+
+static void fuzzprovider(Arena a, Str src)
+{
+    // The stream, cut where the input's own bytes say. The tokenizer and
+    // the partial response grow in their own half of the arena, while
+    // each chunk's events and parses use the other, reset per chunk.
+    Arena own = a;
+    own.end   = own.beg + (a.end - a.beg)/2;
+    Arena scr = a;
+    scr.beg   = own.end;
+    Partial *p   = newpartial(&own);
+    Sse      sse = newsse(&own, 1<<12);
+    for (Str rest = src; rest.len;) {
+        iz  n   = 1 + rest[0]%23;
+        Str got = takehead(rest, n<rest.len ? n : rest.len);
+        rest = cuthead(rest, got.len);
+        Arena t = scr;
+        Slice<SseEvent> evs = ssefeed(&sse, got, &t);
+        for (iz i = 0; i < evs.len; i++) {
+            JsonDoc d = jsonparse(&t, evs[i].data);
+            if (d.ok) {
+                Chunk c = applychunk(p, d.root, &t);
+                for (iz k = 0; k < c.deltas.len; k++) {
+                    assert(c.deltas[k].block>=0 && c.deltas[k].block<p->nblocks);
+                }
+            }
+        }
+    }
+    a = scr;
+    for (b32 complete = 0; complete < 2; complete++) {
+        Finished f = finishpartial(&a, p, complete, 1, 1);
+        assert(f.blocks.len <= p->nblocks);
+        for (iz i = 0; i < f.blocks.len; i++) {
+            Block *b = &f.blocks[i];
+            if (b->type != BLOCK_CALL) continue;
+            assert(b->id.len);
+            for (iz k = 0; k < b->id.len; k++) {
+                assert(alnum(b->id[k]) || b->id[k]=='_' || b->id[k]=='-');
+            }
+            for (iz k = 0; k < i; k++) {
+                assert(f.blocks[k].type!=BLOCK_CALL || f.blocks[k].id!=b->id);
+            }
+        }
+        ModelConf mc = {};
+        mc.name      = "m";
+        mc.reasoning = "reasoning_content";
+        Msg m = {};
+        m.role   = ROLE_ASSISTANT;
+        m.blocks = f.blocks;
+        ChatReq req = {};
+        req.mc      = &mc;
+        req.history = {&m, 1, 1};
+        Arena tmp = a;
+        tmp.beg  += (tmp.end - tmp.beg)/2;
+        Str body  = encodechat(&a, tmp, &req);
+        assert(jsonparse(&a, body).ok);
+    }
+
+    // Arguments sent back
+    Str     wire = wireargs(&a, src);
+    JsonDoc d    = jsonparse(&a, wire);
+    assert(d.ok && d.root->type==JSON_OBJECT);
+
+    // Output
+    Str clean = cleanoutput(&a, src);
+    assert(clean.len <= src.len);
+    for (iz i = 0; i < clean.len; i++) {
+        assert(clean[i]!=0x1b && clean[i]!='\r');
+    }
+
+    // Paths, without NULs (which name nothing)
+    if (!cut(src, 0).ok) {
+        fuzzpaths(a, src, 0);
+        fuzzpaths(a, src, 1);
+    }
+
+    // Edits: the haystack before the first newline-pair, the rest needle
+    iz  sep    = find(src, "\n\n");
+    Str hay    = sep<0 ? src : takehead(src, sep);
+    Str needle = sep<0 ? Str("a") : cuthead(src, sep+2);
+    if (needle.len) {
+        fuzzspans(hay, matchexact(&a, hay, needle));
+        fuzzspans(hay, matchlines(&a, hay, needle));
+        fuzzspans(hay, matchnorm(&a, hay, needle));
+    }
+
+    Url u = parseurl(src);
+    assert(!u.ok || (u.host.len && u.port>0 && u.port<65536 && u.path.len && u.path[0]=='/'));
+    parsemodels(a, src, "m", 0);
+    classify(500, src);
+    retryafter(src, 0);
+    errormessage(&a, src);
+    Cycle *c = alloc<Cycle>(&a);
+    cyclefeed(c, src);
+}
+
 __AFL_FUZZ_INIT();
 
 int main()
@@ -314,6 +456,8 @@ int main()
         Arena a = {mem, mem+cap};
         #if FUZZ_EVENTS
         fuzzevents(a, {src, len});
+        #elif FUZZ_PROVIDER
+        fuzzprovider(a, {src, len});
         #else
         fuzzjson(a, {src, len});
         #endif

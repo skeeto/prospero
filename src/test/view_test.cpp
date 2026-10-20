@@ -13,7 +13,7 @@ static Str msgsshow(Arena *a, View *v)
     Buf b(a, 256);
     static char const roles[] = "UATXN";
     for (iz i = 0; i < v->msgs.len; i++) {
-        Msg *m = &v->msgs[i];
+        ViewMsg *m = &v->msgs[i];
         putbyte(&b, (u8)roles[m->role]);
         if (!m->seq) putbyte(&b, '~');
         putbyte(&b, ':');
@@ -106,9 +106,9 @@ static void test_view(Test *t)
         View *v = testview(&a);
         v->extra = 10;
         v->gap   = 5;
-        addmsg(v, ROLE_USER, "short");                 // 1 line
-        addmsg(v, ROLE_ASSISTANT, "x\ny\nz");          // 3 lines
-        addmsg(v, ROLE_ASSISTANT, "0123456789abcde");  // 2 lines at 10/line
+        addmsg(v, VIEW_USER, "short");                 // 1 line
+        addmsg(v, VIEW_ASSISTANT, "x\ny\nz");          // 3 lines
+        addmsg(v, VIEW_ASSISTANT, "0123456789abcde");  // 2 lines at 10/line
         f64 total = viewtops(v, 100, 10, 20);
         Buf b(&a, 64);
         for (iz i = 0; i < v->msgs.len; i++) {
@@ -129,7 +129,7 @@ static void test_view(Test *t)
         Arena   a = perm;
         View   *v = testview(&a);
         Measure m = fixedmeasure();
-        addmsg(v, ROLE_ASSISTANT, "# Big\n\ntext");
+        addmsg(v, VIEW_ASSISTANT, "# Big\n\ntext");
         viewtops(v, 200, 10, 20);
         f32 est = v->msgs[0].h;
         msglayout(v, 0, &m, 200, 1);
@@ -142,7 +142,7 @@ static void test_view(Test *t)
     {
         Arena a = perm;
         View *v = testview(&a);
-        addmsg(v, ROLE_ASSISTANT, "alpha beta_2 γδ.\n\nsecond para");
+        addmsg(v, VIEW_ASSISTANT, "alpha beta_2 γδ.\n\nsecond para");
         Range w = wordat(v, {0, 8});
         expect(t, "view.word", istr(&a, w.beg.off*100 + w.end.off), "612");
         w = wordat(v, {0, 13});  // inside "γδ"
@@ -174,8 +174,8 @@ static void test_view(Test *t)
             "- one\n- two\n\n"
             "```c\nint\tx;  \n```\n\n"
             "| a | b |\n|---|---|\n| 1 | 2 |\n";
-        addmsg(v, ROLE_ASSISTANT, md);
-        addmsg(v, ROLE_USER, "user line 1\nline 2");
+        addmsg(v, VIEW_ASSISTANT, md);
+        addmsg(v, VIEW_USER, "user line 1\nline 2");
         selset(v, 0, 0, 1, 6);
         expect(t, "view.copytext", copysel(v, &a, COPY_TEXT),
                "Some bold & text\nwrapped.\n\n- one\n- two\n\nint\tx;  \n\n"
@@ -205,7 +205,7 @@ static void test_view(Test *t)
         Arena a  = perm;
         View *v  = testview(&a);
         Str   md = "# Head\n\nSome **bold** text.\n\n```sh\necho hi\n```\n\n> quoted\n";
-        addmsg(v, ROLE_ASSISTANT, md);
+        addmsg(v, VIEW_ASSISTANT, md);
         i32 b0 = (i32)find(md, "**bold");
         selset(v, 0, b0, 0, b0+8);
         expect(t, "view.mdinner", copysel(v, &a, COPY_MARKDOWN), "**bold**");

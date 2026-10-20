@@ -71,7 +71,7 @@ if(WIN32 AND HARNESS_GUI)
   )
   add_executable(harness WIN32 src/main_win32.cpp)
   target_link_libraries(harness PRIVATE
-    harness_gui imgui md4c kernel32 advapi32
+    harness_gui imgui md4c kernel32 advapi32 winhttp
   )
   target_link_options(harness PRIVATE -static -municode)
 elseif(WIN32)
@@ -79,16 +79,26 @@ elseif(WIN32)
   # 64-bit division on i686) from adding a DLL dependency.
   add_executable(harness src/main_win32.cpp)
   target_link_options(harness PRIVATE -nostartfiles -static-libgcc)
-  target_link_libraries(harness PRIVATE kernel32 advapi32)
+  target_link_libraries(harness PRIVATE kernel32 advapi32 winhttp)
 else()
+  # HTTP goes through the httpedge object, the one translation unit
+  # with the C++ standard library (and so libc++/libstdc++ at link).
+  include(FetchNet)
   find_package(Threads REQUIRED)
+  add_library(httpedge OBJECT src/http_httplib.cpp)
+  target_link_libraries(httpedge PUBLIC httpnet)
+  target_compile_options(httpedge PRIVATE -fno-exceptions)
   add_executable(harness src/main_posix.cpp)
-  target_link_libraries(harness PRIVATE Threads::Threads)
+  target_link_libraries(harness PRIVATE httpedge Threads::Threads)
   if(HARNESS_GUI)
     target_link_libraries(harness PRIVATE imgui md4c)
   endif()
-  if(HARNESS_HAS_NOSTDLIBXX)
-    target_link_options(harness PRIVATE -nostdlib++)
+  # Every tool process starts under a reaper, this executable, so its
+  # startup is on the critical path: loading libstdc++ dynamically costs
+  # a millisecond or two per tool on a Raspberry Pi.
+  check_linker_flag(CXX -static-libstdc++ HARNESS_HAS_STATICXX)
+  if(HARNESS_HAS_STATICXX AND NOT APPLE)
+    target_link_options(harness PRIVATE -static-libstdc++ -static-libgcc)
   endif()
 endif()
 target_link_libraries(harness PRIVATE harness_core_flags)
@@ -124,4 +134,12 @@ if(NOT CMAKE_CROSSCOMPILING)
   endif()
   add_test(NAME unit COMMAND harness_test)
   add_test(NAME selftest COMMAND harness --selftest)
+  # The engine end to end against tests/fake_provider.py
+  find_program(UV uv)
+  if(UV)
+    add_test(NAME scenarios COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios.py --harness $<TARGET_FILE:harness>)
+    add_test(NAME cleanup COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/cleanup.py --harness $<TARGET_FILE:harness>)
+  endif()
 endif()
