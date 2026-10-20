@@ -252,6 +252,8 @@ struct CfgRow {
     b32   isdflt;
     b32   valid;
     char *buf;     // the field, FIELD_MAX bytes
+    b32   sent;    // an edit went out, until the next config.get
+    Str   sentval;
 };
 
 struct DriveOp;
@@ -471,6 +473,7 @@ static void fakeint(Gui *g, u32 type, i64 v)
 {
     mailpost(g->outbox, type, (u64)v, "", 1);
 }
+
 
 // The engine connection: commands out, records in
 
@@ -3751,6 +3754,7 @@ static void drivestep(Gui *g)
         break;
     }
 }
+
 
 // Setup
 

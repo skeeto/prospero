@@ -1,5 +1,7 @@
-// ImGui user interface: the transcript widget, the prompt, the dock
-// layout, the metrics overlay, and the scheduler's view of ImGui
+// ImGui user interface: the transcript widget with its tool rows and ask
+// cards, the sessions sidebar, the liveness strip and the prompt, the
+// settings window, the new session and close dialogs, the dock layout,
+// the metrics overlay, and the scheduler's view of ImGui
 //
 // All ImDrawList code lives here, since its signatures shift between
 // ImGui releases. uiscan and uideadlines read ImGui's internals after
@@ -8,7 +10,9 @@
 //
 // Nothing here may make a frame differ from the last without declaring
 // why: a value drawn from the clock needs a deadline for when it next
-// changes, or the staleness probe reports it.
+// changes, or the staleness probe reports it. The strip's clocks and an
+// ask's countdown declare theirs only while drawn, so a session out of
+// sight costs no frames.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -1395,9 +1399,12 @@ static void drawcfgrow(Gui *g, CfgRow *r, b32 target)
         itemrect(g, RECT_SETTING);
     }
     if (enter || ImGui::IsItemDeactivatedAfterEdit()) {
-        Str v = trim({(u8 *)r->buf, (iz)__builtin_strlen(r->buf)});
+        // Enter both returns and deactivates: send each edit once
+        Str v   = trim({(u8 *)r->buf, (iz)__builtin_strlen(r->buf)});
         Str was = r->isdflt ? Str{} : r->value;
-        if (v != was) {
+        if (v!=was && !(r->sent && v==r->sentval)) {
+            r->sent    = 1;
+            r->sentval = clone(&g->cfgmem, v);
             guiconfigset(g, r->kind, r->name, r->key, v.len ? v : Str{});
         }
     }
