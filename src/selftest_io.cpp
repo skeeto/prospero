@@ -17,7 +17,18 @@ struct ProcWatch {
     i64 eofat;
     b32 limit;
     i32 tails;
+    i64 data;    // PROC_DATA bytes, and their hash in order
+    u64 hash;
+    Buf keep;    // PROC_DATA bytes, if given room
 };
+
+static u64 hashmore(u64 h, Str s)
+{
+    for (iz i = 0; i < s.len; i++) {
+        h = (h ^ s[i]) * 1111111111111111111u;
+    }
+    return h;
+}
 
 // Collect records for one process until it exited and its output closed,
 // or until ms pass. Returns 1 if both happened.
@@ -42,6 +53,11 @@ static b32 procwatch(Os *os, Mailbox *mb, u64 id, ProcWatch *w, i32 ms)
                              w->signal = get32(cuthead(r.data, 4));          break;
             case PROC_EOF:   w->eofat = now;
                              w->total = get64(r.data);                       break;
+            case PROC_DATA:  w->data += r.data.len;
+                             w->hash  = hashmore(w->hash, r.data);
+                             if (w->keep.a && w->keep.len+r.data.len<=w->keep.cap) {
+                                 print(&w->keep, r.data);
+                             }                                               break;
             }
         }
     }
@@ -319,6 +335,167 @@ static void testoverhead(ProcTest *p, Arena scratch)
     }
 }
 
+static Proc *spawnio(ProcTest *p, Arena scratch, Slice<Str> argv, Str cmdline,
+                     Str errpath)
+{
+    Spawn sp = {};
+    sp.argv    = argv;
+    sp.cmdline = cmdline;
+    sp.cwd     = p->dir;
+    sp.env     = p->env;
+    sp.outpath = errpath;
+    sp.mbox    = p->mb;
+    sp.id      = ++p->id;
+    return os_spawnio(p->os, &sp, scratch);
+}
+
+// Bidirectional children: input through the writer thread, which never
+// holds up the caller, output as records, errors in their own file.
+static void testspawnio(ProcTest *p, Arena scratch)
+{
+    Selftest *t  = p->t;
+    Os       *os = p->os;
+
+    // cat: everything written comes back, in order, once input closes
+    Str      errs = join(&scratch, p->dir, "io.err");
+    ShellCmd sc   = shellcmd(&scratch, &p->te, "cat; echo done 1>&2");
+    Proc    *pr   = spawnio(p, scratch, sc.argv, sc.cmdline, errs);
+    if (!check(t, pr!=0, "os_spawnio of cat")) {
+        say(os, os_lasterr(os, &scratch));
+        return;
+    }
+    iz  block = 1<<16;
+    u8 *buf   = allocbytes(&scratch, block);
+    u64 want  = 0;
+    i64 t0    = os_ticks(os);
+    b32 ok    = 1;
+    for (i32 n = 0; n < 128; n++) {
+        for (iz i = 0; i < block; i++) {
+            buf[i] = (u8)(n*7 + i*13 + (i>>8));
+        }
+        want = hashmore(want, {buf, block});
+        ok &= os_procwrite(os, pr, {buf, block});
+    }
+    i64 dt = os_ticks(os) - t0;
+    ok &= os_procwrite(os, pr, {});
+    check(t, ok, "os_procwrite queues 8 MiB, then the close");
+    check(t, dt < 1000000, "os_procwrite never waits on the child");
+    check(t, !os_procwrite(os, pr, "late"), "os_procwrite after the close fails");
+    ProcWatch w = {};
+    check(t, procwatch(os, p->mb, p->id, &w, 30000), "cat sees EOF and exits");
+    check(t, w.code==0 && w.data==(i64)128*block && w.total==w.data,
+          "8 MiB come back as PROC_DATA");
+    check(t, w.hash == want, "in order and intact");
+    os_kill(os, pr, 1);
+    os_procfree(os, pr);
+    Read rd = os_read(os, &scratch, errs, 1<<10);
+    check(t, cleanoutput(&scratch, rd.data)=="done\n", "errors go to their file");
+    report(os, scratch, "8 MiB through cat in", millis(os_ticks(os)-t0), 0, " ms");
+
+    // A child that does not read: input breaks once it exits
+    sc = shellcmd(&scratch, &p->te, "exit 0");
+    pr = spawnio(p, scratch, sc.argv, sc.cmdline, {});
+    if (!check(t, pr!=0, "os_spawnio of a child that does not read")) return;
+    ProcWatch x = {};
+    check(t, procwatch(os, p->mb, p->id, &x, 5000), "it exits");
+    b32 broke = 0;
+    for (i32 n = 0; n<200 && !broke; n++) {
+        broke = !os_procwrite(os, pr, {buf, block});
+        mailwait(p->mb, 10);
+    }
+    check(t, broke, "writing to a child gone fails soon");
+    os_kill(os, pr, 1);
+    os_procfree(os, pr);
+
+    // The engine itself, headless, as the GUI's --engine=subprocess runs it
+    Str exe = os_exepath(os, &scratch);
+    Str st  = join(&scratch, p->dir, "engine-state");
+    Str argv[] = {exe, "--headless", "--state", st};
+    pr = spawnio(p, scratch, {argv, countof(argv), countof(argv)}, {}, {});
+    if (!check(t, pr!=0, "os_spawnio of harness --headless")) return;
+    os_procwrite(os, pr, "{\"cmd\":\"hello\",\"proto\":0,\"id\":1}\n");
+    os_procwrite(os, pr, "{\"cmd\":\"quit\",\"mode\":\"stop\",\"id\":2}\n");
+    ProcWatch e = {};
+    e.keep = Buf(&scratch, 1<<16);
+    check(t, procwatch(os, p->mb, p->id, &e, 10000), "the engine answers and quits");
+    Str got = finish(&e.keep);
+    check(t, e.code==0, "the engine exits cleanly");
+    check(t, find(got, "\"ev\":\"hello\"")>0, "the engine says hello");
+    check(t, find(got, "\"ev\":\"reply\",\"id\":2,\"ok\":1")>0, "the engine replies to quit");
+    os_kill(os, pr, 1);
+    os_procfree(os, pr);
+    say(os, "spawnio done");
+}
+
+// Real paths, and the guard on the real file system: a link inside the
+// workspace that leads out is caught. The shell makes the links: ln -s,
+// or on Windows junctions through cmd (symlinks need a privilege).
+static void testrealpaths(ProcTest *p, Arena scratch)
+{
+    Selftest *t   = p->t;
+    Os       *os  = p->os;
+    b32       win = HOST_WINDOWS;
+    Str       ws  = join(&scratch, p->dir, "ws");
+    Str       sub = join(&scratch, ws, "sub");
+    Str       out = join(&scratch, p->dir, "outside");
+    Str       sec = join(&scratch, out, "secret");
+    os_mkdirs(os, scratch, sub);
+    os_mkdirs(os, scratch, out);
+    os_write(os, scratch, sec, "x");
+    Str cmd = win ?
+        Str("cd ws && cmd /c mklink /J link '..\\outside' && cmd /c mklink /J inner sub") :
+        Str("cd ws && ln -s ../outside link && ln -s sub inner && ln -s nowhere dangling");
+    Str   log = join(&scratch, p->dir, "links.log");
+    Proc *pr  = spawnsh(p, scratch, cmd, log, 1<<16);
+    ProcWatch w = {};
+    if (!check(t, pr && procwatch(os, p->mb, p->id, &w, 10000) && !w.code,
+               "links made by the shell")) {
+        say(os, os_read(os, &scratch, log, 1<<12).data);
+        if (pr) os_procfree(os, pr);
+        return;
+    }
+    os_kill(os, pr, 1);
+    os_procfree(os, pr);
+
+    Str wsreal  = os_realpath(os, &scratch, ws);
+    Str outreal = os_realpath(os, &scratch, out);
+    Str secret  = os_realpath(os, &scratch, join(&scratch, ws, "link/secret"));
+    check(t, wsreal.len && outreal.len, "os_realpath of directories");
+    check(t, secret.data && normpath(&scratch, outreal, secret, win)==
+                            normpath(&scratch, outreal, "secret", win),
+          "os_realpath follows a link");
+    Str inner = os_realpath(os, &scratch, join(&scratch, ws, "inner"));
+    check(t, inner.data && normpath(&scratch, wsreal, inner, win)==
+                           normpath(&scratch, wsreal, "sub", win),
+          "os_realpath follows a link within");
+    check(t, !os_realpath(os, &scratch, join(&scratch, ws, "missing")).data,
+          "os_realpath of a missing path is null");
+    if (!win) {
+        check(t, !os_realpath(os, &scratch, join(&scratch, ws, "dangling")).data,
+              "os_realpath of a dangling link is null");
+    }
+
+    Guard     g  = newguard(os, &scratch, wsreal, {}, {}, {}, win);
+    GuardPath gp = guardpath(os, &scratch, &g, "link/secret", 1);
+    check(t, !gp.inside && gp.diverged, "the guard catches a link leading out");
+    gp = guardpath(os, &scratch, &g, "link/new.txt", 0);
+    check(t, !gp.inside && gp.diverged, "the guard catches a new file through it");
+    gp = guardpath(os, &scratch, &g, "inner/new.txt", 0);
+    check(t, gp.inside, "the guard allows a link within");
+    gp = guardpath(os, &scratch, &g, "../outside/secret", 1);
+    check(t, !gp.inside && !gp.diverged, "the guard denies a path outside");
+    GuardHint h = guardhint(os, &scratch, &g, gp.path, 1, 0);
+    check(t, !h.path.data, "no hint where nothing matches");
+
+    // The directory listing skips links, so they go first
+    Str links[] = {"link", "inner", "dangling"};
+    for (iz i = 0; i < countof(links); i++) {
+        Str link = join(&scratch, ws, links[i]);
+        os_remove(os, scratch, link);
+    }
+    say(os, "real paths done");
+}
+
 static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
 {
     Os       *os = t->os;
@@ -346,6 +523,8 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     testholder(p, scratch);
     testladder(p, scratch);
     testoverhead(p, scratch);
+    testspawnio(p, scratch);
+    testrealpaths(p, scratch);
 }
 
 
@@ -473,6 +652,31 @@ static void testhttp(Selftest *t, Arena *perm, Arena scratch, Str base)
     say(os, "http done");
 }
 
+// Session locks exclude even within one process, since each lock is its
+// own open file (flock) or handle (sharing).
+static void testlocks(Selftest *t, Arena scratch, Str dir)
+{
+    Os *os   = t->os;
+    Str path = join(&scratch, dir, "lock");
+    check(t, !os_lockheld(os, scratch, path), "a missing lock file is not held");
+    iz lock = os_lockfile(os, scratch, path);
+    check(t, lock >= 0, "os_lockfile takes a lock");
+    check(t, os_lockheld(os, scratch, path), "os_lockheld sees it");
+    i64 t0 = os_ticks(os);
+    check(t, os_lockfile(os, scratch, path) < 0, "a second lock fails");
+    check(t, os_ticks(os)-t0 < 100000, "and fails at once");
+    if (lock >= 0) {
+        os_unlockfile(os, lock);
+    }
+    check(t, !os_lockheld(os, scratch, path), "os_unlockfile releases it");
+    lock = os_lockfile(os, scratch, path);
+    check(t, lock >= 0, "the lock is taken again");
+    if (lock >= 0) {
+        os_unlockfile(os, lock);
+    }
+    say(os, "locks done");
+}
+
 static i32 selftestio(Os *os, Arena *perm, Arena scratch, Str url)
 {
     Selftest t = {};
@@ -489,6 +693,7 @@ static i32 selftestio(Os *os, Arena *perm, Arena scratch, Str url)
     check(&t, real.len>0, "os_realpath of a directory");
     if (real.len) dir = real;
 
+    testlocks(&t, a, dir);
     testprocs(&t, perm, a, dir);
     if (url.len) {
         testhttp(&t, perm, a, url);

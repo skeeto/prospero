@@ -29,6 +29,22 @@
 //   whatever a command leaves behind is killed when it completes.
 // - Budgets: a note at 200 steps, the end of the turn at 300.
 //
+// Asks: a call the guard will not allow by itself (a path outside the
+// workspace) needs the user's approval. A session is attended while a
+// frontend that can answer has it open, which the frontend declares with
+// attended:1 on new or open (and close ends). Unattended, an ask is
+// denied at once by policy. Attended, the session logs an ask with a
+// deadline (ask_timeout, 30 s by default) and waits in its own state,
+// blocking nothing else: an answer resolves it, the deadline denies it,
+// and so does a steer, whose text the agent reads next. Every denial is
+// the call's tool result, explaining what to do instead. The log holds
+// ask and answer before the call's tool.start, so a crash while asking
+// leaves a call that never started rather than an unknown outcome.
+//
+// Locks: each session's directory has a lock file, held while a process
+// has the session open. A second process opens it read-only: it replays
+// and lists, but refuses anything that would write.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : u32 {
@@ -52,6 +68,10 @@ enum : i64 {
     MODELS_MAX   = 8 << 20,
     LOG_MAX      = (i64)1 << 30,
     SSE_MAX      = 16 << 20,      // longest line or event of a stream
+    ASK_WAIT     = 30*SEC,        // default deadline of an attended ask
+    QUIT_WAIT    = 5*SEC,         // for turns to end after quit
+    LIVE_EVERY   = 1*SEC,         // live records while a request runs
+    TITLE_MAX    = 60,            // code points
 };
 
 enum : i32 {
@@ -62,10 +82,12 @@ enum : i32 {
     S_ERRBODY,   // reading an error response
     S_BACKOFF,   // waiting to retry
     S_TOOL,      // a command is running
+    S_ASK,       // waiting for the user to answer an ask
 };
 
 static Str statenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
+    "ask",
 };
 
 enum : i32 {
@@ -77,6 +99,8 @@ enum : i32 {
     T_TOOL,
     T_KILL,
     T_DRAIN,
+    T_ASK,
+    T_LIVE,
     T_COUNT,
 };
 
@@ -126,6 +150,15 @@ struct ShellRun {
     b32  limited;
 };
 
+// An ask waiting for the user, or recently resolved.
+struct Ask {
+    Str       req;
+    i32       tool;
+    GuardPath gp;
+    GuardHint hint;
+    i64       opened;   // ticks
+};
+
 struct Session {
     Session     *next;
     Engine      *e;
@@ -136,7 +169,9 @@ struct Session {
     Str          dir;       // state/sessions/<sid>
     Str          outdir;    // dir/out
     Str          cwd;
+    Slice<Str>   roots;     // extra workspace roots
     Str          model;
+    Str          title;
     Endpoint     ep;
     ModelConf    mc;
     ModelInfo    info;
@@ -144,10 +179,19 @@ struct Session {
     Str          system;
     Str          tools;
     ToolEnv      te;
+    Guard        guard;
     EventLog     log;
+    iz           lock;       // os_lockfile handle, -1 if not held
+    b32          readonly;   // another process holds the lock
+    b32          attended;   // a frontend that can answer asks has it open
     Slice<Msg>   history;
     i32          state;
     i64          timers[T_COUNT];
+    // Liveness of the current request, in ticks
+    i64          lastbyte;   // any byte, or prompt progress
+    i64          firstout;   // the first output token
+    i64          lastout;
+    i64          tokens;     // chunks with output: about one token each
     // The turn
     i64          turn;
     i64          steps;
@@ -165,6 +209,8 @@ struct Session {
     i64          added;      // bytes added to the history since
     Slice<Str>   queued;     // prompts waiting for the turn to end
     Slice<Str>   steers;     // input for the next step
+    Ask          ask;        // with S_ASK
+    b32          steered;    // asks this step yield to a steer
     // The current request
     Http        *http;
     u64          httpid;
@@ -198,6 +244,7 @@ struct Engine {
     Ini        *ini;
     Str         statedir;
     Str         exedir;
+    Str         home;     // for "~" in paths
     ToolEnv     te;
     Slice<Str>  env;      // inherited environment
     Session    *sessions;
@@ -205,6 +252,7 @@ struct Engine {
     Slice<Str>  learned;  // its keys, in order, for saving
     u64         nextid;
     b32         quitting;
+    i64         quitby;   // ticks: stop waiting for turns to end
 };
 
 
@@ -269,17 +317,50 @@ static void note(Session *s, Arena scratch, Str level, Str text)
     ssend(s, &w);
 }
 
+static void arm(Session *s, i32 t, i64 delay)
+{
+    s->timers[t] = os_ticks(s->e->os) + delay;
+}
+
+static void disarm(Session *s, i32 t)
+{
+    s->timers[t] = 0;
+}
+
+// While a request runs, the frontend hears how it goes every second.
+static b32 requesting(i32 state)
+{
+    return state==S_DISCOVER || state==S_HEAD || state==S_STREAM ||
+           state==S_ERRBODY;
+}
+
+// Output tokens per second, tenths: from the first token to the latest.
+static i64 tps10(Session *s)
+{
+    i64 dt = s->lastout - s->firstout;
+    if (s->tokens<2 || dt<=0) {
+        return 0;
+    }
+    return (s->tokens - 1)*10*SEC / dt;
+}
+
 // The state for the frontend. Small and bounded, so it needs no scratch.
 static void live(Session *s)
 {
     byte  mem[512];
-    Arena a = {mem, mem+countof(mem)};
+    Arena a   = {mem, mem+countof(mem)};
     Buf   b(&a, 384);
-    EvOut w = sbegin(s, &b, EV_LIVE);
+    Os   *os  = s->e->os;
+    i64   now = os_ticks(os);
+    EvOut w   = sbegin(s, &b, EV_LIVE);
     putstrkey(&w.json, "state", statenames[s->state]);
-    if (s->state == S_BACKOFF) {
-        i64 left = s->timers[T_BACKOFF] - os_ticks(s->e->os);
-        putintkey(&w.json, "retry_at", os_time(s->e->os) + left/MS);
+    if (requesting(s->state)) {
+        putintkey(&w.json, "idle_ms", (now - s->lastbyte)/MS);
+        putkey(&w.json, "tps");
+        putfloat(&w.json, (f64)tps10(s) / 10);
+    } else if (s->state == S_BACKOFF) {
+        i64 left = s->timers[T_BACKOFF] - now;
+        putintkey(&w.json, "retry_at", os_time(os) + left/MS);
     }
     ssend(s, &w);
 }
@@ -289,17 +370,12 @@ static void setstate(Session *s, i32 state)
     if (s->state != state) {
         s->state = state;
         live(s);
+        if (requesting(state)) {
+            arm(s, T_LIVE, LIVE_EVERY);
+        } else {
+            disarm(s, T_LIVE);
+        }
     }
-}
-
-static void arm(Session *s, i32 t, i64 delay)
-{
-    s->timers[t] = os_ticks(s->e->os) + delay;
-}
-
-static void disarm(Session *s, i32 t)
-{
-    s->timers[t] = 0;
 }
 
 
@@ -466,6 +542,10 @@ static b32 startreq(Session *s, Arena scratch, Str method, Str url, Str body,
     s->body     = Buf(&s->attempt, 1<<12);
     s->plain    = 0;
     s->sent     = os_ticks(e->os);
+    s->lastbyte = s->sent;
+    s->firstout = 0;
+    s->lastout  = 0;
+    s->tokens   = 0;
     s->http     = os_http(e->os, &r, scratch);
     if (!s->http) {
         s->httpid = 0;
@@ -476,6 +556,7 @@ static b32 startreq(Session *s, Arena scratch, Str method, Str url, Str body,
 
 static void endturn(Session *, Arena, Str why, Str err);
 static void prepare(Session *, Arena);
+static i64  seconds(Ini *, Str kind, Str name, Str key, i64 dflt);
 static void finalize(Session *, Arena);
 static void nexttool(Session *, Arena);
 
@@ -516,7 +597,8 @@ static void sendchat(Session *s, Arena scratch)
 
     if (!startreq(s, scratch, "POST", url, body, "text/event-stream", 0)) {
         Str err = os_lasterr(e->os, &scratch);
-        endturn(s, scratch, "error", concat(&scratch, "cannot start a request: ", err));
+        err = concat(&scratch, "cannot start a request: ", err);
+        endturn(s, scratch, "error", err);
         return;
     }
     arm(s, T_FIRSTBYTE, s->ep.firstbyte);
@@ -613,6 +695,7 @@ static void runcalls(Session *s, Arena scratch, Slice<Block> blocks)
         }
     }
     s->callidx = 0;
+    s->steered = 0;
     nexttool(s, scratch);
 }
 
@@ -767,6 +850,9 @@ static b32 onchunk(Session *s, Arena scratch, Json *j)
     }
     if (c.content) {
         arm(s, T_PROGRESS, s->ep.progress);
+        s->lastout  = os_ticks(s->e->os);
+        s->firstout = s->firstout ? s->firstout : s->lastout;
+        s->tokens++;
     }
     for (iz i = 0; i < c.deltas.len; i++) {
         Delta *d = &c.deltas[i];
@@ -803,8 +889,9 @@ static void onhead(Session *s, i32 status, Str headers)
         return;
     }
     disarm(s, T_FIRSTBYTE);
-    s->status  = status;
-    s->headers = clone(&s->attempt, headers);
+    s->lastbyte = os_ticks(s->e->os);
+    s->status   = status;
+    s->headers  = clone(&s->attempt, headers);
     if (status == 200) {
         Str type = headervalue(headers, "content-type");
         s->plain = type.len && !contains(type, "event-stream");
@@ -819,6 +906,7 @@ static void onhead(Session *s, i32 status, Str headers)
 
 static void onbody(Session *s, Arena scratch, Str data)
 {
+    s->lastbyte = os_ticks(s->e->os);
     switch (s->state) {
     case S_DISCOVER:
         if (s->body.len+data.len <= MODELS_MAX) print(&s->body, data);
@@ -1006,32 +1094,128 @@ static void toolstart(Session *s, Arena scratch)
     s->callstart = os_ticks(s->e->os);
 }
 
-// An unattended ask: logged, then denied at once by policy.
-static void askdeny(Session *s, Arena scratch, Str kind, Str detail)
+// A file tool on a path the guard allowed, or the user did.
+static void runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
 {
-    Engine *e  = s->e;
-    Str     id = s->calls[s->callidx].id;
-    Str     rq = concat(&scratch, id, "/ask");
+    Engine *e    = s->e;
+    ToolOut o    = {};
+    Str     ncwd = s->guard.cwd;  // as normalized paths
+    switch (tool) {
+    case TOOL_READ:  o = toolread(e->os, &scratch, ncwd, path, args);  break;
+    case TOOL_WRITE: o = toolwrite(e->os, &scratch, ncwd, path, args); break;
+    case TOOL_EDIT:  o = tooledit(e->os, &scratch, ncwd, path, args);  break;
+    }
+    toolend(s, scratch, o.ok ? Str("ok") : Str("error"), o.text, 0, 0, {}, 0);
+}
+
+static Str bynames[] = {"policy", "user", "timeout", "steer", "cancel"};
+static_assert(countof(bynames) == DENY_COUNT);
+
+// Resolve the current call's ask: log the answer, then run the call, or
+// end it with the denial as its result. The caller moves on to the next
+// call (nexttool).
+static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note)
+{
+    Engine *e = s->e;
+    Ask    *k = &s->ask;
+    Block  *c = &s->calls[s->callidx];
+    i64     t = os_ticks(e->os);
+    disarm(s, T_ASK);
+    if (s->state == S_ASK) {
+        setstate(s, S_IDLE);
+    }
+
+    Str why = note;
+    if (!why.len) {
+        switch (by) {
+        case DENY_POLICY:  why = "unattended: nobody can answer";       break;
+        case DENY_TIMEOUT: why = "nobody answered before the deadline"; break;
+        case DENY_STEER:   why = "the user sent a message instead";     break;
+        case DENY_CANCEL:  why = "the turn was cancelled";              break;
+        }
+    }
     {
-        Buf   b(&scratch, 512 + detail.len);
+        Buf   b(&scratch, 512 + why.len);
+        EvOut w = sbegin(s, &b, EV_ANSWER);
+        putstrkey(&w.json, "req", k->req);
+        putstrkey(&w.json, "decision", allow ? Str("allow") : Str("deny"));
+        putstrkey(&w.json, "by", bynames[by]);
+        putstrkey(&w.json, "note", why);
+        ssend(s, &w);
+    }
+
+    toolstart(s, scratch);
+    if (allow) {
+        Args args = parseargs(&scratch, k->tool, c->args);
+        runfile(s, scratch, k->tool, k->gp.path, &args);
+        return;
+    } else if (by == DENY_CANCEL) {
+        toolend(s, scratch, "cancelled", "Not run: the user cancelled the turn.",
+                0, 0, {}, 0);
+        return;
+    }
+    GuardDenial d = {};
+    d.tool = toolnames[k->tool];
+    d.gp   = k->gp;
+    d.cwd  = s->guard.cwd;
+    d.hint = k->hint;
+    d.by   = by;
+    d.note = note;
+    d.wait = (t - k->opened + SEC/2) / SEC;
+    Str text = guarddenial(&scratch, &d);
+    toolend(s, scratch, "denied", text, 0, 0, {}, 0);
+}
+
+// A call the guard does not allow by itself. The user is asked if
+// attending, and otherwise it is denied at once. Returns 1 if the call
+// finished, 0 if the session now waits for an answer.
+static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
+{
+    Engine   *e    = s->e;
+    Block    *c    = &s->calls[s->callidx];
+    b32       read = tool == TOOL_READ;
+    GuardHint h    = {};
+    if (!gp->diverged) {
+        h = guardhint(e->os, &scratch, &s->guard, gp->path, read, tool==TOOL_WRITE);
+    }
+
+    Ask *k = &s->ask;
+    *k = {};
+    k->req         = clone(&s->perm, concat(&scratch, c->id, "/ask"));
+    k->tool        = tool;
+    k->gp.path     = clone(&s->perm, gp->path);
+    k->gp.real     = gp->real.data ? clone(&s->perm, gp->real) : Str{};
+    k->gp.diverged = gp->diverged;
+    k->hint.path   = h.path.data ? clone(&s->perm, h.path) : Str{};
+    k->hint.exists = h.exists;
+    k->opened      = os_ticks(e->os);
+
+    b32 wait  = s->attended && !s->steered;
+    i64 delay = seconds(e->ini, "", "", "ask_timeout", ASK_WAIT);
+    {
+        Str   why = guardwhy(&scratch, toolnames[tool], gp, s->guard.cwd);
+        Buf   b(&scratch, 512 + why.len);
         EvOut w = sbegin(s, &b, EV_ASK);
-        putstrkey(&w.json, "req", rq);
-        putstrkey(&w.json, "call", id);
-        putstrkey(&w.json, "kind", kind);
-        putstrkey(&w.json, "detail", detail);
-        putintkey(&w.json, "deadline", os_time(e->os));
+        putstrkey(&w.json, "req", k->req);
+        putstrkey(&w.json, "call", c->id);
+        putstrkey(&w.json, "kind", "path");
+        putstrkey(&w.json, "tool", toolnames[tool]);
+        putstrkey(&w.json, "path", gp->path);
+        putstrkey(&w.json, "detail", why);
+        if (h.path.data) {
+            putstrkey(&w.json, "hint", h.path);
+        }
+        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
-    {
-        Buf   b(&scratch, 512);
-        EvOut w = sbegin(s, &b, EV_ANSWER);
-        putstrkey(&w.json, "req", rq);
-        putstrkey(&w.json, "decision", "deny");
-        putstrkey(&w.json, "by", "policy");
-        putstrkey(&w.json, "note", "unattended: nobody can answer");
-        ssend(s, &w);
+    if (!wait) {
+        resolve(s, scratch, 0, s->steered ? DENY_STEER : DENY_POLICY, {});
+        return 1;
     }
+    arm(s, T_ASK, delay);
+    setstate(s, S_ASK);
+    return 0;
 }
 
 static b32 startshell(Session *s, Arena scratch, Args *args)
@@ -1113,13 +1297,31 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled)
             s->sh.rel, n);
 }
 
-// Run one call. Returns 1 if it finished, 0 if it goes on (a command).
+// Run one call. Returns 1 if it finished, 0 if it goes on (a command, or
+// an ask waiting for the user).
 static b32 runtool(Session *s, Arena scratch)
 {
-    Engine *e = s->e;
-    Block  *c = &s->calls[s->callidx];
-    toolstart(s, scratch);
+    Engine *e    = s->e;
+    Block  *c    = &s->calls[s->callidx];
+    i32     tool = toolfind(c->name);
+    Args    args = {};
+    if (tool != TOOL_NONE) {
+        args = parseargs(&scratch, tool, c->args);
+    }
 
+    // The guard comes first: a path it questions is asked about before
+    // the call starts
+    if (!s->blocked && tool!=TOOL_NONE && tool!=TOOL_SHELL && !args.issues.len) {
+        GuardPath g = guardpath(e->os, &scratch, &s->guard, args.path, tool==TOOL_READ);
+        if (!g.inside) {
+            return askcall(s, scratch, tool, &g);
+        }
+        toolstart(s, scratch);
+        runfile(s, scratch, tool, g.path, &args);
+        return 1;
+    }
+
+    toolstart(s, scratch);
     if (s->blocked) {
         Buf b(&scratch, 512);
         print(&b, "This exact set of tool calls was already made 4 times in "
@@ -1133,13 +1335,11 @@ static b32 runtool(Session *s, Arena scratch)
         return 1;
     }
 
-    i32 tool = toolfind(c->name);
     if (tool == TOOL_NONE) {
         Str text = unknowntool(&scratch, c->name);
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
         return 1;
     }
-    Args args = parseargs(&scratch, tool, c->args);
     if (args.issues.len) {
         Str text = argserror(&scratch, c->name, c->args, &args);
         if (s->lengthcut && s->callidx==s->calls.len-1) {
@@ -1149,26 +1349,6 @@ static b32 runtool(Session *s, Arena scratch)
                           "edits.");
         }
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
-        return 1;
-    }
-
-    if (tool != TOOL_SHELL) {
-        GuardPath g = guardpath(&scratch, s->cwd, s->outdir, args.path,
-                                tool==TOOL_READ, s->te.windows);
-        if (!g.inside) {
-            Str why = guarddenial(&scratch, s->cwd, g.path, toolnames[tool]);
-            askdeny(s, scratch, "path", g.path);
-            toolend(s, scratch, "denied", why, 0, 0, {}, 0);
-            return 1;
-        }
-        ToolOut o    = {};
-        Str     ncwd = normpath(&scratch, s->cwd, ".", s->te.windows);  // as g.path
-        switch (tool) {
-        case TOOL_READ:  o = toolread(e->os, &scratch, ncwd, g.path, &args);  break;
-        case TOOL_WRITE: o = toolwrite(e->os, &scratch, ncwd, g.path, &args); break;
-        case TOOL_EDIT:  o = tooledit(e->os, &scratch, ncwd, g.path, &args);  break;
-        }
-        toolend(s, scratch, o.ok ? Str("ok") : Str("error"), o.text, 0, 0, {}, 0);
         return 1;
     }
 
@@ -1335,10 +1515,70 @@ static void prepare(Session *s, Arena scratch)
     sendchat(s, scratch);
 }
 
+// A session's title from its first prompt: one line, each run of
+// whitespace a single space, cut near TITLE_MAX code points on a word
+// boundary (unless that would lose half of it) with an ellipsis.
+static Str maketitle(Arena *a, Str text)
+{
+    Buf b(a, 4*TITLE_MAX + 8);
+    iz  n     = 0;   // code points so far
+    iz  sp    = -1;  // b.len at the last space
+    iz  spn   = 0;   // n there
+    b32 space = 0;
+    b32 more  = 0;
+    for (iz i = 0; i < text.len;) {
+        iz  start = i;
+        i32 c     = utf8decode(text, &i);
+        if (c<0x20 || c==' ' || c==0x7f || c==0xa0) {
+            space = b.len > 0;
+            continue;
+        }
+        if (n+space+1 > TITLE_MAX) {
+            more = 1;
+            break;
+        }
+        if (space) {
+            sp    = b.len;
+            spn   = n;
+            space = 0;
+            putbyte(&b, ' ');
+            n++;
+        }
+        print(&b, span(text.data+start, text.data+i));
+        n++;
+    }
+    if (more) {
+        if (!space && sp>=0 && spn>=TITLE_MAX/2) {
+            b.len = sp;  // within a word: back to its start
+        }
+        print(&b, "\xe2\x80\xa6");  // ellipsis
+    }
+    return finish(&b);
+}
+
+static void settitle(Session *s, Arena scratch, Str title)
+{
+    if (!title.len) {
+        return;
+    }
+    s->title = clone(&s->perm, title);
+    Buf   b(&scratch, 128 + title.len);
+    EvOut w = sbegin(s, &b, EV_TITLE);
+    putstrkey(&w.json, "text", title);
+    ssend(s, &w);
+    // For listing sessions without reading their logs
+    Str path = join(&scratch, s->dir, "title");
+    os_write(s->e->os, scratch, path, s->title);
+}
+
 static void startturn(Session *s, Arena scratch, Str text, Str via)
 {
     s->cancelled = 0;
     adduser(s, scratch, text, via);
+    if (!s->title.len) {
+        Str title = maketitle(&scratch, text);
+        settitle(s, scratch, title);
+    }
     s->turn++;
     {
         Arena a = scratch;
@@ -1406,6 +1646,10 @@ static void cancelturn(Session *s, Arena scratch)
     case S_TOOL:
         finishshell(s, scratch, 1);
         nexttool(s, scratch);  // the rest are not run, then the turn ends
+        return;
+    case S_ASK:
+        resolve(s, scratch, 0, DENY_CANCEL, {});
+        nexttool(s, scratch);
         return;
     case S_HEAD:
     case S_STREAM:
@@ -1561,15 +1805,80 @@ static Session *newsession(Engine *e, Arena scratch, Str sid)
     s->dir     = clone(&s->perm, dir);
     s->outdir  = clone(&s->perm, join(&scratch, dir, "out"));
     s->te      = e->te;
+    s->log.fd  = -1;
+    s->lock    = -1;
     return s;
+}
+
+// Forget a session, listed or not, releasing its lock and memory.
+static void dropsession(Engine *e, Session *s)
+{
+    for (Session **p = &e->sessions; *p; p = &(*p)->next) {
+        if (*p == s) {
+            *p = s->next;
+            break;
+        }
+    }
+    logclose(&s->log);
+    if (s->lock >= 0) {
+        os_unlockfile(e->os, s->lock);
+    }
+    Region *r1 = s->perm.region;
+    os_release(e->os, s->aregion);
+    os_release(e->os, r1);  // holds s itself
+}
+
+static Str lockpath(Arena *a, Session *s)
+{
+    return join(a, s->dir, "lock");
+}
+
+// Extra workspace roots from the configuration: "roots = A; B".
+static Slice<Str> confroots(Engine *e, Arena *a)
+{
+    Slice<Str> r = {};
+    for (Str rest = iniget(e->ini, "", "", "roots"); rest.len;) {
+        Cut c = cut(rest, ';');
+        Str p = trim(c.head);
+        if (p.len) r = push(a, r, clone(a, p));
+        rest = c.tail;
+    }
+    return r;
 }
 
 static void sessionready(Session *s)
 {
+    Engine    *e     = s->e;
+    Slice<Str> roots = {};
+    Slice<Str> conf  = confroots(e, &s->perm);
+    for (iz i = 0; i < s->roots.len; i++) {
+        roots = push(&s->perm, roots, s->roots[i]);
+    }
+    for (iz i = 0; i < conf.len; i++) {
+        roots = push(&s->perm, roots, conf[i]);
+    }
     s->system = systemprompt(&s->perm, s->cwd, &s->te);
     s->tools  = tooljson(&s->perm, &s->te);
-    s->next   = s->e->sessions;
-    s->e->sessions = s;
+    s->guard  = newguard(e->os, &s->perm, s->cwd, e->home, roots, s->dir,
+                         s->te.windows);
+    // Tell the agent about the other places it may work
+    Buf b(&s->perm, 256);
+    for (iz i = 1; i < s->guard.roots.len; i++) {
+        GuardRoot *t = &s->guard.roots[i];
+        if (!t->read) {
+            print(&b, "\n- ");
+            print(&b, t->lex);
+        }
+    }
+    if (b.len) {
+        Str list  = finish(&b);
+        s->system = concat(&s->perm, s->system,
+                           "\n\nBesides the working directory, the file "
+                           "tools may also use these directories:");
+        s->system = concat(&s->perm, s->system, list);
+    }
+    s->next = e->sessions;
+    e->sessions = s;
 }
 
 
@@ -1587,6 +1896,12 @@ static void reply(Engine *e, Arena scratch, i64 id, b32 ok, Str err, Str sid)
     emit(e, evend(&w));
 }
 
+// A flag in a command: true or false, or a number, nonzero for true.
+static b32 jsonflag(Json *j, b32 dflt)
+{
+    return j->type==JSON_BOOL ? j->boolean : jsonint(j, dflt)!=0;
+}
+
 static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str cwd   = jsonstr(jsonget(j, "cwd"));
@@ -1594,6 +1909,13 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     Str which = jsonstr(jsonget(j, "endpoint"));
     if (!which.len) which = iniget(e->ini, "", "", "endpoint");
     if (!model.len) model = iniget(e->ini, "", "", "model");
+    Slice<Str> roots = {};
+    for (Json *r = jsonget(j, "roots")->child; r; r = r->next) {
+        Str root = jsonstr(r);
+        if (root.len) {
+            roots = push(&scratch, roots, root);
+        }
+    }
 
     Str real = cwd.len ? os_realpath(e->os, &scratch, cwd) : Str{};
     if (!real.len || os_stat(e->os, scratch, real).type!=STAT_DIR) {
@@ -1615,18 +1937,31 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "out of memory", {});
         return;
     }
-    s->cwd   = clone(&s->perm, real);
-    s->model = clone(&s->perm, model);
+    s->cwd      = clone(&s->perm, real);
+    s->model    = clone(&s->perm, model);
+    s->attended = jsonflag(jsonget(j, "attended"), 0);
+    for (iz i = 0; i < roots.len; i++) {
+        s->roots = push(&s->perm, s->roots, clone(&s->perm, roots[i]));
+    }
     endpointconf(e, &s->perm, which, &s->ep);
     modelconf(e, &s->perm, model, &s->mc);
 
     if (!os_mkdirs(e->os, scratch, s->outdir)) {
+        dropsession(e, s);
         reply(e, scratch, id, 0, "cannot create the session directory", {});
+        return;
+    }
+    Str lock = lockpath(&scratch, s);
+    s->lock = os_lockfile(e->os, scratch, lock);
+    if (s->lock < 0) {
+        dropsession(e, s);
+        reply(e, scratch, id, 0, "cannot lock the new session", {});
         return;
     }
     Str path = join(&scratch, s->dir, "events.jsonl");
     s->log = logopen(e->os, &s->perm, scratch, path, s->sid, LOG_MAX);
     if (!s->log.ok) {
+        dropsession(e, s);
         reply(e, scratch, id, 0, "cannot open the session log", {});
         return;
     }
@@ -1642,6 +1977,14 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         putstrkey(&w.json, "role", "");
         putstrkey(&w.json, "model", s->model);
         putstrkey(&w.json, "endpoint", s->ep.url);
+        if (s->roots.len) {
+            putkey(&w.json, "roots");
+            putarray(&w.json);
+            for (iz i = 0; i < s->roots.len; i++) {
+                putstr(&w.json, s->roots[i]);
+            }
+            putend(&w.json);
+        }
         ssend(s, &w);
     }
     reply(e, scratch, id, 1, {}, s->sid);
@@ -1655,6 +1998,8 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 // Rebuild a session from its log: the history, the turn count, and the
 // closing of anything a crash left open (logopen), plus results for
 // calls that never started. *firstnew is the seq before any repairs.
+// When another process holds the session's lock, it is only read, and
+// so neither repaired nor written later (readonly).
 static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                             Str which, i64 *firstnew)
 {
@@ -1667,14 +2012,24 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
     if (!s) {
         return 0;
     }
-    s->log = logopen(e->os, &s->perm, scratch, path, s->sid, LOG_MAX);
-    if (!s->log.ok) {
-        return 0;
+    Str lock = lockpath(&scratch, s);
+    s->lock     = os_lockfile(e->os, scratch, lock);
+    s->readonly = s->lock < 0;
+    if (!s->readonly) {
+        s->log = logopen(e->os, &s->perm, scratch, path, s->sid, LOG_MAX);
+        if (!s->log.ok) {
+            dropsession(e, s);
+            return 0;
+        }
+        *firstnew = s->log.seq - s->log.synth;
     }
-    *firstnew = s->log.seq - s->log.synth;
 
     Arena  lines = newarena(e->replay);
     Replay rp    = logreplay(e->os, &lines, scratch, path, s->sid, 0, LOG_MAX);
+    if (s->readonly) {
+        s->log.seq = rp.last;
+        *firstnew  = rp.last;
+    }
     Str storedmodel = {};
     Str storedurl   = {};
     for (iz i = 0; i < rp.lines.len; i++) {
@@ -1687,6 +2042,13 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->cwd      = clone(&s->perm, jsonstr(jsonget(j, "cwd")));
             storedmodel = clone(&s->perm, jsonstr(jsonget(j, "model")));
             storedurl   = clone(&s->perm, jsonstr(jsonget(j, "endpoint")));
+            for (Json *k = jsonget(j, "roots")->child; k; k = k->next) {
+                Str root = clone(&s->perm, jsonstr(k));
+                s->roots = push(&s->perm, s->roots, root);
+            }
+            break;
+        case EV_TITLE:
+            s->title = clone(&s->perm, jsonstr(jsonget(j, "text")));
             break;
         case EV_TURN:
             s->turn = jsonint(jsonget(j, "n"), s->turn);
@@ -1721,14 +2083,19 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         }
     }
     if (!s->cwd.len) {
+        dropsession(e, s);
         return 0;
     }
     s->model = model.len ? clone(&s->perm, model) : storedmodel;
     if (!endpointconf(e, &s->perm, which.len ? which : storedurl, &s->ep)) {
+        dropsession(e, s);
         return 0;
     }
     modelconf(e, &s->perm, s->model, &s->mc);
     sessionready(s);
+    if (s->readonly) {
+        return s;
+    }
 
     // Calls of the last assistant message that never got a result
     iz last = -1;
@@ -1763,6 +2130,13 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
     i64      from  = jsonint(jsonget(j, "from"), 0);
     Session *s     = findsession(e, sid);
     i64      first = I64MAX;
+    if (s && s->readonly) {
+        Str lock = lockpath(&scratch, s);
+        if (!os_lockheld(e->os, scratch, lock)) {
+            dropsession(e, s);  // the other process let go: open it for real
+            s = 0;
+        }
+    }
     if (!s) {
         if (!sid.len || cut(sid, '/').ok || cut(sid, '\\').ok || sid[0]=='.') {
             reply(e, scratch, id, 0, "invalid session id", {});
@@ -1779,37 +2153,56 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
     if (from < 0) {
         from = first==I64MAX ? s->log.seq : first;
     }
+    Json *att = jsonget(j, "attended");
+    if (att->type != JSON_MISSING) {
+        s->attended = jsonflag(att, 0);
+    }
     Str    path  = join(&scratch, s->dir, "events.jsonl");
     Arena  lines = newarena(e->replay);
     Replay rp    = logreplay(e->os, &lines, scratch, path, s->sid, from, LOG_MAX);
     for (iz i = 0; i < rp.lines.len; i++) {
         emit(e, rp.lines[i]);
     }
-    reply(e, scratch, id, 1, {}, s->sid);
+
+    Buf   b(&scratch, 256);
+    EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putintkey(&w.json, "readonly", s->readonly);
+    emit(e, evend(&w));
+    live(s);  // the state of a session that was open already
 }
 
 static void cmdlist(Engine *e, Arena scratch, i64 id)
 {
     struct Entry {
         Str sid;
+        Str title;
         Str cwd;
         Str model;
         i64 mtime;
+        b32 locked;  // open in another process
     };
     Slice<Entry> list = {};
     Str dir = join(&scratch, e->statedir, "sessions");
     for (Dirent *d = os_list(e->os, &scratch, dir); d; d = d->next) {
         if (!d->isdir) continue;
-        Str   path = join(&scratch, join(&scratch, dir, d->name), "events.jsonl");
+        Str   sdir = join(&scratch, dir, d->name);
+        Str   path = join(&scratch, sdir, "events.jsonl");
         Read  rd   = os_readat(e->os, &scratch, path, 0, 4096);
         Cut   line = cut(rd.data, '\n');
         EvRec r    = evparse(&scratch, line.head);
         if (!line.ok || r.ev!=EV_SESSION) continue;
+        Session *s     = findsession(e, d->name);
+        Str      title = join(&scratch, sdir, "title");
+        Str      lock  = join(&scratch, sdir, "lock");
         Entry en = {};
-        en.sid   = d->name;
-        en.cwd   = jsonstr(jsonget(r.root, "cwd"));
-        en.model = jsonstr(jsonget(r.root, "model"));
-        en.mtime = d->mtime;
+        en.sid    = d->name;
+        en.title  = os_read(e->os, &scratch, title, 1024).data;
+        en.cwd    = jsonstr(jsonget(r.root, "cwd"));
+        en.model  = jsonstr(jsonget(r.root, "model"));
+        en.mtime  = d->mtime;
+        en.locked = (!s || s->readonly) && os_lockheld(e->os, scratch, lock);
         list = push(&scratch, list, en);
     }
 
@@ -1821,10 +2214,12 @@ static void cmdlist(Engine *e, Arena scratch, i64 id)
         Session *live = findsession(e, list[i].sid);
         putobject(&w.json);
         putstrkey(&w.json, "sid", list[i].sid);
+        putstrkey(&w.json, "title", list[i].title);
         putstrkey(&w.json, "cwd", list[i].cwd);
         putstrkey(&w.json, "model", list[i].model);
         putstrkey(&w.json, "state", live ? statenames[live->state] : Str("closed"));
         putintkey(&w.json, "mtime", list[i].mtime);
+        putintkey(&w.json, "locked", list[i].locked);
         putend(&w.json);
     }
     putend(&w.json);
@@ -1878,13 +2273,23 @@ static void command(Engine *e, Arena scratch, Str line)
     case CMD_OPEN:
         cmdopen(e, scratch, id, j);
         return;
-    case CMD_QUIT:
-        e->quitting = 1;
+    case CMD_QUIT: {
+        // Stop: cancel every turn, killing their tools, then wait a
+        // while for each to end (enginethread) before stopping
+        Str mode = jsonstr(jsonget(j, "mode"));
+        if (mode.len && mode!="stop") {
+            reply(e, scratch, id, 0, "unknown quit mode: only \"stop\" exists", {});
+            return;
+        }
+        if (!e->quitting) {
+            e->quitting = 1;
+            e->quitby   = os_ticks(e->os) + QUIT_WAIT;
+        }
         for (Session *t = e->sessions; t; t = t->next) {
             cancelturn(t, scratch);
         }
         reply(e, scratch, id, 1, {}, {});
-        return;
+    } return;
     case CMD_CONFIGGET:
     case CMD_CONFIGSET:
         reply(e, scratch, id, 0, "not implemented", {});
@@ -1897,10 +2302,20 @@ static void command(Engine *e, Arena scratch, Str line)
     if (!s) {
         reply(e, scratch, id, 0, "no such open session", sid);
         return;
+    } else if (s->readonly && cmd!=CMD_CLOSE) {
+        reply(e, scratch, id, 0, "read-only: another process has this "
+              "session open; open it again once that one has closed it", sid);
+        return;
     }
     switch (cmd) {
     case CMD_CLOSE:
+        // Nobody is left to answer asks
         reply(e, scratch, id, 1, {}, sid);
+        s->attended = 0;
+        if (s->state == S_ASK) {
+            resolve(s, scratch, 0, DENY_POLICY, "the user closed the session");
+            nexttool(s, scratch);
+        }
         return;
     case CMD_PROMPT:
     case CMD_STEER:
@@ -1914,16 +2329,37 @@ static void command(Engine *e, Arena scratch, Str line)
         } else if (cmd == CMD_PROMPT) {
             s->queued = push(&s->perm, s->queued, clone(&s->perm, text));
         } else {
+            // Read at the next step; a pending ask yields to it, as do
+            // any more asks in this step
             s->steers = push(&s->perm, s->steers, clone(&s->perm, text));
+            if (s->state == S_ASK) {
+                s->steered = 1;
+                resolve(s, scratch, 0, DENY_STEER, {});
+                nexttool(s, scratch);
+            }
         }
         return;
     case CMD_CANCEL:
         reply(e, scratch, id, 1, {}, sid);
         cancelturn(s, scratch);
         return;
-    case CMD_ANSWER:
-        reply(e, scratch, id, 0, "nothing is waiting for an answer", sid);
-        return;
+    case CMD_ANSWER: {
+        Str req      = jsonstr(jsonget(j, "req"));
+        Str decision = jsonstr(jsonget(j, "decision"));
+        if (s->state != S_ASK) {
+            reply(e, scratch, id, 0, "nothing is waiting for an answer", sid);
+        } else if (req != s->ask.req) {
+            Str err = concat(&scratch, "no such request: the one waiting is ", s->ask.req);
+            reply(e, scratch, id, 0, err, sid);
+        } else if (decision!="allow" && decision!="deny") {
+            reply(e, scratch, id, 0, "decision must be \"allow\" or \"deny\"", sid);
+        } else {
+            reply(e, scratch, id, 1, {}, sid);
+            Str note = jsonstr(jsonget(j, "note"));
+            resolve(s, scratch, decision=="allow", DENY_USER, note);
+            nexttool(s, scratch);
+        }
+    } return;
     }
 }
 
@@ -1962,7 +2398,7 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         return;
     }
 
-    b32      proc = r.type>=PROC_TAIL && r.type<=PROC_EOF;
+    b32      proc = r.type>=PROC_TAIL && r.type<=PROC_DATA;
     Session *s    = sessionbyid(e, r.id, proc);
     if (!s) {
         return;  // a request or process already given up on
@@ -2026,16 +2462,21 @@ static void ontimer(Session *s, Arena scratch, i32 t)
             discovered(s, scratch, 0);
             return;
         }
+        // Messages are complete before scratch is passed on, which copies
+        // it: an argument allocated in it alongside would be overwritten
         msg = concat(&scratch, "no response within ", secstr(&scratch, s->ep.firstbyte));
-        fail(s, scratch, CLASS_TRANSIENT, 0, concat(&scratch, msg, " s"), -1);
+        msg = concat(&scratch, msg, " s");
+        fail(s, scratch, CLASS_TRANSIENT, 0, msg, -1);
         return;
     case T_IDLE:
         msg = concat(&scratch, "no data for ", secstr(&scratch, s->ep.idle));
-        fail(s, scratch, CLASS_TRANSIENT, 0, concat(&scratch, msg, " s"), -1);
+        msg = concat(&scratch, msg, " s");
+        fail(s, scratch, CLASS_TRANSIENT, 0, msg, -1);
         return;
     case T_PROGRESS:
         msg = concat(&scratch, "no progress for ", secstr(&scratch, s->ep.progress));
-        fail(s, scratch, CLASS_TRANSIENT, 0, concat(&scratch, msg, " s"), -1);
+        msg = concat(&scratch, msg, " s");
+        fail(s, scratch, CLASS_TRANSIENT, 0, msg, -1);
         return;
     case T_GRACE:
         finalize(s, scratch);
@@ -2055,6 +2496,14 @@ static void ontimer(Session *s, Arena scratch, i32 t)
         finishshell(s, scratch, 0);
         nexttool(s, scratch);
         return;
+    case T_ASK:
+        resolve(s, scratch, 0, DENY_TIMEOUT, {});
+        nexttool(s, scratch);
+        return;
+    case T_LIVE:
+        live(s);
+        arm(s, T_LIVE, LIVE_EVERY);
+        return;
     }
 }
 
@@ -2063,7 +2512,7 @@ static void enginethread(void *arg)
     Engine *e = (Engine *)arg;
     for (;;) {
         i64 now  = os_ticks(e->os);
-        i64 next = I64MAX;
+        i64 next = e->quitting ? e->quitby : I64MAX;
         for (Session *s = e->sessions; s; s = s->next) {
             for (i32 t = 0; t < T_COUNT; t++) {
                 if (s->timers[t] && s->timers[t]<next) next = s->timers[t];
@@ -2093,9 +2542,15 @@ static void enginethread(void *arg)
             }
         }
 
-        if (e->quitting && allidle(e)) {
+        // Cancelling ends turns at once, but should a turn linger, the
+        // engine stops anyway once the wait is over
+        if (e->quitting && (allidle(e) || now>=e->quitby)) {
             for (Session *s = e->sessions; s; s = s->next) {
                 logclose(&s->log);
+                if (s->lock >= 0) {
+                    os_unlockfile(e->os, s->lock);
+                    s->lock = -1;
+                }
             }
             mailpost(e->out, MAIL_QUIT, 0, {}, 1);
             return;
@@ -2165,6 +2620,10 @@ static Engine *newengine(Os *os, Arena *perm, Ini *ini, Str statedir, Mailbox *o
     e->exedir  = parentdir(exe);
     e->te      = findshell(os, &e->perm, newarena(e->scratch), e->exedir, HOST_WINDOWS);
     e->env     = os_environ(os, &e->perm);
+    e->home    = os_getenv(os, &e->perm, "HOME");
+    if (HOST_WINDOWS && !e->home.len) {
+        e->home = os_getenv(os, &e->perm, "USERPROFILE");
+    }
     loadtrained(e, newarena(e->scratch));
     return e;
 }

@@ -243,10 +243,14 @@ class T:
         self.config = host.join(base, "harness.ini")
         host.mkdir(self.work)
         host.mkdir(self.state)
+        # Endpoint settings, and with "_top" settings before any section
+        conf = dict(conf or {})
+        top = conf.pop("_top", {})
         ini = {"first_byte_timeout": 5, "idle_timeout": 3,
                "progress_timeout": 6, "connect_timeout": 2}
-        ini.update(conf or {})
-        body = f"[endpoint fake]\nurl = {host.url}/\n" + "".join(
+        ini.update(conf)
+        body = "".join(f"{k} = {v}\n" for k, v in top.items())
+        body += f"[endpoint fake]\nurl = {host.url}/\n" + "".join(
             f"{k} = {v}\n" for k, v in ini.items())
         host.write(self.config, body)
         self.notes = []
@@ -369,6 +373,31 @@ class Headless:
                     raise Failure(f"timed out waiting; saw {compact([e.get('ev') for e in self.events])}")
                 self.cond.wait(left)
 
+    def call(self, cmd, timeout=20, **fields):
+        """Send a command and wait for its reply."""
+        i = self.send(cmd, **fields)
+        return self.wait(lambda e: e.get("ev") == "reply" and e.get("id") == i, timeout)
+
+    def all(self, ev, sid=None):
+        with self.cond:
+            return [e for e in self.events
+                    if e.get("ev") == ev and (sid is None or e.get("sid") == sid)]
+
+    def names(self, sid):
+        with self.cond:
+            return [e.get("ev") for e in self.events if e.get("sid") == sid]
+
+    def exit(self, timeout=10):
+        """Wait for the process to end by itself (after a quit)."""
+        try:
+            self.p.wait(timeout)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+            raise Failure("the harness did not exit")
+        self.reader.join(2)
+        return self.p.returncode
+
     def close(self, timeout=10):
         try:
             self.p.stdin.close()
@@ -411,7 +440,8 @@ def scenario(conf=None, bound=30, posix=False):
 def plain(t):
     r = t.run()
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
-    t.seq(r, ["session", "user", "turn", "attempt", "assistant", "turn.end"])
+    t.seq(r, ["session", "user", "title", "turn", "attempt", "assistant", "turn.end"])
+    t.check(r.last("title").get("text") == "go", f"titled: {r.last('title')}")
     t.check(r.last("turn.end").get("why") == "done", "the turn ends done")
     t.check(r.text() == "Hello! This is a plain answer.", f"text {r.text()!r}")
     t.check(not r.all("retry"), "no retries")
@@ -727,11 +757,17 @@ def cancel(t):
         h.send("prompt", sid=sid, text="stream")
         h.wait(lambda e: e.get("ev") == "delta")
         time.sleep(0.5)
+        h.wait(lambda e: e.get("ev") == "live" and e.get("tps", 0) > 0, 5)
         h.send("cancel", sid=sid)
         end = h.wait(lambda e: e.get("ev") == "turn.end")
         t.check(end["why"] == "cancel", f"cancelled while streaming: {end}")
         a = [e for e in h.events if e.get("ev") == "assistant"]
         t.check(a and a[-1]["finish"] == "cancelled", "the partial text is kept")
+        lives = [e for e in h.all("live", sid) if e.get("state") == "streaming"]
+        t.check(len(lives) >= 2 and all("idle_ms" in e and "tps" in e for e in lives),
+                f"live while streaming, every second: {lives}")
+        tps = max(e["tps"] for e in lives)
+        t.check(5 <= tps <= 15, f"about 10 tokens per second: {tps}")
 
         # Then during a tool, in a second session
         model = t.model.replace(":cancel:", ":cancel_tool:")
@@ -753,6 +789,200 @@ def cancel(t):
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
+
+
+def asked(t, h, prompt="write outside"):
+    """An attended session whose agent asks to write outside: (sid, ask)."""
+    sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+    h.send("prompt", sid=sid, text=prompt)
+    ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+    t.check(ask.get("kind") == "path" and ask.get("dflt") == "deny" and
+            ask.get("tool") == "write" and ask.get("path", "").endswith("asked.txt"),
+            f"the ask: {ask}")
+    t.check("outside the working directory" in ask.get("detail", ""), f"detail: {ask}")
+    h.wait(lambda e: e.get("ev") == "live" and e.get("state") == "ask" and e.get("sid") == sid)
+    t.check(not h.all("tool.start", sid), "nothing starts while asking")
+    return sid, ask
+
+
+def outside_file(t):
+    return t.host.read(t.host.join(t.work, "..", "asked.txt"))
+
+
+@scenario(bound=10)
+def ask_allow(t):
+    h = t.headless()
+    try:
+        sid, ask = asked(t, h)
+        t.check(29000 <= ask["deadline"] - ask["ts"] <= 31000, f"a 30 s deadline: {ask}")
+        r = h.call("answer", sid=sid, req=ask["req"], decision="allow", note="ok")
+        t.check(r.get("ok") == 1, f"answer accepted: {r}")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"the turn ends done: {end}")
+        names = [n for n in h.names(sid) if n in ("ask", "answer", "tool.start", "tool.end")]
+        t.check(names == ["ask", "answer", "tool.start", "tool.end"], f"order {names}")
+        ans = h.all("answer", sid)[0]
+        t.check(ans["decision"] == "allow" and ans["by"] == "user" and ans["note"] == "ok",
+                f"answer {ans}")
+        te = h.all("tool.end", sid)[0]
+        t.check(te["status"] == "ok", f"the write ran: {te}")
+        t.check(outside_file(t) == "outside", "the file was written outside")
+        r = h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        t.check(r.get("ok") == 0 and "nothing is waiting" in r.get("err", ""),
+                f"a late answer is refused: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def ask_deny(t):
+    h = t.headless()
+    try:
+        sid, ask = asked(t, h)
+        r = h.call("answer", sid=sid, req="nope", decision="deny")
+        t.check(r.get("ok") == 0 and "no such request" in r.get("err", ""), f"wrong req: {r}")
+        r = h.call("answer", sid=sid, req=ask["req"], decision="maybe")
+        t.check(r.get("ok") == 0, f"bad decision refused: {r}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny", note="keep it inside")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"a denial does not end the turn: {end}")
+        ans = h.all("answer", sid)[0]
+        t.check(ans["decision"] == "deny" and ans["by"] == "user", f"answer {ans}")
+        st = [e["status"] for e in h.all("tool.end", sid)]
+        t.check(st == ["denied", "ok"], f"denied, then the agent went on: {st}")
+        deny = h.all("tool.end", sid)[0]["text"]
+        t.check("denied by the user" in deny and "keep it inside" in deny, f"why: {deny}")
+        t.check(outside_file(t) is None, "nothing written outside")
+        t.check(t.file("inside.txt") == "inside", "the agent wrote inside instead")
+        msgs = t.requests()[1]["body"]["messages"]
+        t.check(msgs[-1].get("role") == "tool" and "keep it inside" in msgs[-1].get("content", ""),
+                "the agent read the denial")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_top": {"ask_timeout": 2}}, bound=10)
+def ask_timeout(t):
+    h = t.headless()
+    try:
+        sid, ask = asked(t, h)
+        t.check(1900 <= ask["deadline"] - ask["ts"] <= 2100, f"the configured deadline: {ask}")
+        t0 = time.monotonic()
+        ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == sid, 10)
+        waited = time.monotonic() - t0
+        t.check(ans["decision"] == "deny" and ans["by"] == "timeout", f"answer {ans}")
+        t.check(1.5 <= waited <= 4, f"denied at the deadline: {waited:.1f} s")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"the turn goes on: {end}")
+        deny = h.all("tool.end", sid)[0]
+        t.check(deny["status"] == "denied" and "nobody answered within 2 seconds" in deny["text"],
+                f"why: {deny}")
+        t.check(t.file("inside.txt") == "inside", "the agent wrote inside instead")
+        r = h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        t.check(r.get("ok") == 0, f"an answer after the deadline is refused: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def ask_steer(t):
+    h = t.headless()
+    try:
+        sid, ask = asked(t, h)
+        h.call("steer", sid=sid, text="no, put it in steered.txt")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"the turn goes on: {end}")
+        ans = h.all("answer", sid)[0]
+        t.check(ans["decision"] == "deny" and ans["by"] == "steer", f"answer {ans}")
+        deny = h.all("tool.end", sid)[0]
+        t.check(deny["status"] == "denied" and "sent a new message" in deny["text"],
+                f"why: {deny}")
+        users = [e for e in h.all("user", sid) if e.get("via") == "steer"]
+        t.check(users and users[0]["text"] == "no, put it in steered.txt", "the steer is logged")
+        msgs = t.requests()[1]["body"]["messages"]
+        t.check(msgs[-2].get("role") == "tool" and msgs[-1].get("role") == "user" and
+                msgs[-1].get("content") == "no, put it in steered.txt",
+                "the agent reads the denial, then the steer")
+        t.check(t.file("steered.txt") == "no, put it in steered.txt", "and acts on it")
+        t.check(outside_file(t) is None, "nothing written outside")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def readonly(t):
+    a = t.headless()
+    b = None
+    try:
+        sid = a.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        a.send("prompt", sid=sid, text="first question for the title")
+        a.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        title = a.all("title", sid)
+        t.check(title and title[0]["text"] == "first question for the title", f"title {title}")
+
+        # A second process, while the first holds the session
+        b = t.headless()
+        b.call("list")
+        entry = [s for s in b.all("sessions")[-1]["list"] if s["sid"] == sid]
+        t.check(entry and entry[0]["locked"] == 1 and
+                entry[0]["title"] == "first question for the title", f"listed {entry}")
+        r = b.call("open", sid=sid)
+        t.check(r.get("ok") == 1 and r.get("readonly") == 1, f"opened read-only: {r}")
+        seen = [e.get("seq") for e in b.events if e.get("sid") == sid and e.get("seq")]
+        logged = [e.get("seq") for e in a.events if e.get("sid") == sid and e.get("seq")]
+        t.check(seen == logged, f"the replay is the log: {seen} vs {logged}")
+        r = b.call("prompt", sid=sid, text="second")
+        t.check(r.get("ok") == 0 and "read-only" in r.get("err", ""), f"refused: {r}")
+        for cmd in ("steer", "cancel", "answer"):
+            r = b.call(cmd, sid=sid, text="x", req="x", decision="deny")
+            t.check(r.get("ok") == 0 and "read-only" in r.get("err", ""), f"{cmd} refused: {r}")
+
+        # Once the first lets go, the session opens for real
+        t.check(a.close() == 0, "the first exits")
+        b.call("list")
+        entry = [s for s in b.all("sessions")[-1]["list"] if s["sid"] == sid]
+        t.check(entry and entry[0]["locked"] == 0, f"unlocked: {entry}")
+        r = b.call("open", sid=sid)
+        t.check(r.get("ok") == 1 and r.get("readonly") == 0, f"opened for writing: {r}")
+        r = b.call("prompt", sid=sid, text="second")
+        t.check(r.get("ok") == 1, f"prompt accepted: {r}")
+        end = b.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid
+                     and e.get("turn") == 2)
+        t.check(end["why"] == "done", f"the second turn: {end}")
+        t.check(len({e["seq"] for e in b.all("title", sid)}) == 1, "the title is set once")
+    finally:
+        a.close()
+        if b:
+            rc = b.close()
+            t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def quit_stop(t):
+    h = t.headless()
+    sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+    h.send("prompt", sid=sid, text="run something long")
+    h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not t.pids("quitpid"):
+        time.sleep(0.05)
+    pids = t.pids("quitpid")
+    t0 = time.monotonic()
+    r = h.call("quit", mode="stop")
+    t.check(r.get("ok") == 1, f"quit accepted: {r}")
+    rc = h.exit(10)
+    dt = time.monotonic() - t0
+    t.check(rc == 0, f"exit {rc}")
+    t.check(dt < 3, f"quit within bounds: {dt:.1f} s")
+    te = h.all("tool.end", sid)
+    t.check(te and te[-1]["status"] == "cancelled", f"the tool was cancelled: {te}")
+    end = h.all("turn.end", sid)
+    t.check(end and end[-1]["why"] == "cancel", f"the turn ended: {end}")
+    t.check(pids and t.gone(pids), f"its process is gone: {pids}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

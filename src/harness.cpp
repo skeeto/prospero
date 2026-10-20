@@ -150,6 +150,7 @@ enum : u32 {
     PROC_LIMIT,     // i64 total: maxbytes reached, output no longer kept
     PROC_EXIT,      // i32 code, i32 signal (POSIX, else 0): it exited
     PROC_EOF,       // i64 total: every writer closed the output
+    PROC_DATA,      // (M3) os_spawnio: standard output bytes, in order
     HTTP_HEAD,      // i32 status, then raw "Name: value\r\n" header lines
     HTTP_BODY,      // response body bytes, in order
     HTTP_DONE,      // i32 error (HTTP_OK or HTTP_E*), then a description
@@ -211,11 +212,35 @@ static void    os_httpfree(Os *, Http *);
 // Description of the last platform error on this thread.
 static Str     os_lasterr(Os *, Arena *);
 
-// (M3) Guard, bidirectional children, session locks, desktop.
-static Str     os_realpath(Os *, Arena *, Str path);  // null if missing
+// (M3) Absolute path with every symlink resolved (Windows: links and
+// junctions, where the system can tell; else only made absolute). Null
+// if missing, including a link to something missing.
+static Str     os_realpath(Os *, Arena *, Str path);
+
+// (M3) A child to talk to (the engine as a subprocess, later ssh), set
+// up like os_spawn but with pipes for standard input and output. Its
+// output arrives as PROC_DATA records, which wait for room in the
+// mailbox and are never dropped, then PROC_EOF; standard error goes to
+// outpath, or nowhere if empty; maxbytes is unused. PROC_EXIT arrives
+// as with os_spawn.
 static Proc   *os_spawnio(Os *, Spawn *, Arena scratch);
+// (M3) Queue bytes for the child's standard input, written in order by
+// a thread of the platform's, so this never waits on the child. A null
+// string closes its input once everything before it is written, as does
+// os_procfree. Returns 0 if the input is closed or broken (the child
+// stopped reading), or too much is queued already.
 static b32     os_procwrite(Os *, Proc *, Str);
-static b32     os_lockfile(Os *, Arena, Str path);
+
+// (M3) Session locks: an exclusive lock on a file, created if missing,
+// held until os_unlockfile or until the process ends, by any means. The
+// handle is -1 if another process holds it, or the file cannot be had.
+// os_lockheld tests without taking it, and the lock taken in a race with
+// such a test is waited for briefly, so that a test never makes a lock
+// fail.
+static iz      os_lockfile(Os *, Arena, Str path);
+static void    os_unlockfile(Os *, iz lock);
+static b32     os_lockheld(Os *, Arena, Str path);
+
 static b32     os_openurl(Os *, Arena, Str url);
 static void    os_busy(Os *, i32 state);
 

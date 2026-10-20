@@ -7,7 +7,12 @@
 // Both drive the engine thread exactly as the GUI will: commands in,
 // records out. "run" prints each record as a JSONL line, or readable
 // text with --pretty, and exits when the turn ends: 0 when done, 1 on
-// error, 3 at the step budget, 130 when cancelled, 2 for usage errors.
+// error, 3 at the step budget, 130 when cancelled, 2 for usage errors
+// (including a session open read-only, in use by another process).
+// Nobody answers asks in a run, so they are denied by policy. Over
+// --headless, a frontend that answers them opens sessions attended
+// (attended:1 on new and open), as the GUI's --engine=subprocess will;
+// when its input ends, the engine stops as for quit.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -162,12 +167,24 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         print(&b, jsonstr(jsonget(j, "text")));
         print(&b, "]\n");
         break;
-    case EV_ANSWER:
+    case EV_ASK:
         prettyline(c);
-        print(&b, "[denied: ");
-        print(&b, jsonstr(jsonget(j, "note")));
+        print(&b, "[asking: ");
+        print(&b, jsonstr(jsonget(j, "detail")));
         print(&b, "]\n");
         break;
+    case EV_ANSWER: {
+        prettyline(c);
+        Str note = jsonstr(jsonget(j, "note"));
+        print(&b, jsonstr(jsonget(j, "decision"))=="allow" ? Str("[allowed by ")
+                                                           : Str("[denied by "));
+        print(&b, jsonstr(jsonget(j, "by")));
+        if (note.len) {
+            print(&b, ": ");
+            print(&b, note);
+        }
+        print(&b, "]\n");
+    } break;
     case EV_TURNEND: {
         prettyline(c);
         Str err = jsonstr(jsonget(j, "err"));

@@ -140,8 +140,13 @@ static Slice<Str> os_environ(Os *, Arena *) { return {}; }
 static iz    os_stdin(Os *, u8 *, iz) { return 0; }
 static Str   os_realpath(Os *, Arena *, Str) { return {}; }
 static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
+static Proc *os_spawnio(Os *, Spawn *, Arena) { return 0; }
+static b32   os_procwrite(Os *, Proc *, Str) { return 0; }
 static void  os_kill(Os *, Proc *, b32) {}
 static void  os_procfree(Os *, Proc *) {}
+static iz    os_lockfile(Os *, Arena, Str) { return -1; }
+static void  os_unlockfile(Os *, iz) {}
+static b32   os_lockheld(Os *, Arena, Str) { return 0; }
 static Http *os_http(Os *, HttpReq *, Arena) { return 0; }
 static void  os_httpcancel(Os *, Http *) {}
 static void  os_httpfree(Os *, Http *) {}

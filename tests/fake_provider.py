@@ -429,6 +429,39 @@ def sc_cancel_tool(model, n, req):
         yield from answer(model, "Should not be reached.")
 
 
+def sc_ask(model, n, req):
+    # A write outside the workspace, which needs the user's approval,
+    # then a reaction to the answer: done if allowed, inside instead if
+    # denied, and as told if the user steered instead of answering
+    msgs = req.get("messages", [])
+    last = msgs[-1] if msgs else {}
+    if n == 0:
+        yield from tool(model, n, "write", {"path": "../asked.txt", "content": "outside"})
+    elif n == 1 and last.get("role") == "user":
+        yield from tool(model, n, "write", {"path": "steered.txt",
+                                            "content": last.get("content", "")})
+    elif n == 1 and last.get("content", "").startswith(("Created", "Replaced")):
+        yield from answer(model, "Written outside, as allowed.")
+    elif n == 1:
+        yield from tool(model, n, "write", {"path": "inside.txt", "content": "inside"})
+    else:
+        yield from answer(model, "Finished after the answer.")
+
+
+sc_ask_allow = sc_ask_deny = sc_ask_timeout = sc_ask_steer = sc_ask
+
+
+def sc_readonly(model, n, req):
+    yield from answer(model, f"Answer number {n}.")
+
+
+def sc_quit_stop(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "shell", {"command": "echo $$ > quitpid; sleep 30"})
+    else:
+        yield from answer(model, "Should not be reached.")
+
+
 def sc_tree(model, n, req):
     # Three levels, each recording its pid, all sleeping: for cleanup.py
     if n == 0:

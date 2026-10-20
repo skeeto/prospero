@@ -262,6 +262,9 @@ W32(b32,    VirtualFree(uz, iz, i32));
 W32(i32,    WaitForSingleObject(uz, i32));
 W32(b32,    WriteConsoleW(uz, c16 *, i32, i32 *, uz));
 W32(b32,    WriteFile(uz, u8 *, i32, i32 *, Overlapped *));
+W32(void,   DeleteCriticalSection(CriticalSection *));
+W32(void *, GetProcAddress(uz, char *));
+W32(void,   Sleep(i32));
 W32(b32,    AssignProcessToJobObject(uz, uz));
 W32(uz,     CreateJobObjectW(uz, c16 *));
 W32(b32,    CreatePipe(uz *, uz *, uz, i32));
@@ -349,6 +352,8 @@ struct Os {
     i64             freq;   // performance counter ticks per second
     CriticalSection spawn;  // held while child handles are inheritable
     void           *gui;    // GUI builds: the window's state (gui_win32.cpp)
+    // GetFinalPathNameByHandleW, from Vista on, else null
+    u32 (__stdcall *finalpath)(uz, c16 *, u32, u32);
 };
 
 enum : iz {
@@ -1079,8 +1084,11 @@ static iz os_stdin(Os *, u8 *buf, iz len)
     return n;
 }
 
-// Absolute, but symlinks are not resolved: lexical, as GetFullPathNameW.
-static Str os_realpath(Os *, Arena *a, Str path)
+// Links and junctions are resolved by opening the path, which follows
+// them, then asking the handle for its name (Vista and later). Where
+// that cannot be done, the path is only made absolute, as by
+// GetFullPathNameW. Results drop the \\?\ prefix: "C:\x", "\\h\s\x".
+static Str os_realpath(Os *os, Arena *a, Str path)
 {
     if (hasnul(path)) {
         return {};
@@ -1091,17 +1099,102 @@ static Str os_realpath(Os *, Arena *a, Str path)
     if (cap <= 0) {
         return {};
     }
-    c16 *buf = alloc<c16>(&tmp, cap);
-    i32  len = GetFullPathNameW(rel, cap, buf, 0);
-    if (!len || len>=cap || GetFileAttributesW(buf)==INVALID_FILE_ATTRIBUTES) {
+    c16 *buf  = alloc<c16>(&tmp, cap);
+    i32  len  = GetFullPathNameW(rel, cap, buf, 0);
+    c16 *full = widepath(&tmp, path).data;
+    if (!len || len>=cap || GetFileAttributesW(full)==INVALID_FILE_ATTRIBUTES) {
         return {};
     }
+
+    uz h = CreateFileW(
+        full, 0, FILE_SHARE_ALL, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0
+    );
+    if (h == INVALID_HANDLE_VALUE) {
+        if (notfound(GetLastError())) {
+            return {};  // a link to something missing
+        }
+    } else if (os->finalpath) {
+        u32  need = os->finalpath(h, 0, 0, 0);  // with terminator
+        c16 *fin  = need ? alloc<c16>(&tmp, need) : 0;
+        u32  got  = fin ? os->finalpath(h, fin, need, 0) : 0;
+        if (got && got<need) {
+            buf = fin;
+            len = (i32)got;
+            if (len>=8 && buf[2]=='?' && (buf[4]|0x20)=='u' &&
+                    (buf[5]|0x20)=='n' && (buf[6]|0x20)=='c' && buf[7]=='\\') {
+                buf += 6;  // \\?\UNC\h\s as \\h\s
+                len -= 6;
+                buf[0] = '\\';
+            } else if (len>=4 && buf[2]=='?') {
+                buf += 4;  // \\?\C:\x as C:\x
+                len -= 4;
+            }
+        }
+    }
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+    }
     for (; len>3 && (buf[len-1]=='\\' || buf[len-1]=='/'); len--) {}
-    u8   *out = allocbytes(a, 3*(iz)len);  // after tmp's use, so a copy
-    Arena o   = {(byte *)out, (byte *)out + 3*(iz)len};
-    Str   r   = fromwide(&o, buf, len);
-    a->beg = (byte *)(r.data + r.len);
-    return r;
+
+    // Converted behind the scratch, then moved down to the front
+    Str r = fromwide(&tmp, buf, len);
+    u8 *out = allocbytes(a, r.len);
+    __builtin_memmove(out, r.data, (uz)r.len);
+    return {out, r.len};
+}
+
+// Session locks: the file held open with no sharing, which the system
+// closes when the process ends. A test opens it for reading with full
+// sharing, so a lock that fails where such an open succeeds met only a
+// test, and tries again.
+static iz os_lockfile(Os *, Arena scratch, Str path)
+{
+    if (hasnul(path)) {
+        return -1;
+    }
+    c16 *p = widepath(&scratch, path).data;
+    for (i32 n = 0; n < 200; n++) {
+        uz h = CreateFileW(
+            p, GENERIC_READ|GENERIC_WRITE, 0, 0, OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, 0
+        );
+        if (h != INVALID_HANDLE_VALUE) {
+            return (iz)h;
+        } else if (GetLastError() != ERROR_SHARING_VIOLATION) {
+            return -1;
+        }
+        uz t = CreateFileW(
+            p, GENERIC_READ, FILE_SHARE_ALL, 0, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, 0
+        );
+        if (t == INVALID_HANDLE_VALUE) {
+            return -1;  // held for real
+        }
+        CloseHandle(t);
+        Sleep(1);
+    }
+    return -1;
+}
+
+static void os_unlockfile(Os *, iz lock)
+{
+    CloseHandle((uz)lock);
+}
+
+static b32 os_lockheld(Os *, Arena scratch, Str path)
+{
+    if (hasnul(path)) {
+        return 0;
+    }
+    uz h = CreateFileW(
+        widepath(&scratch, path).data, GENERIC_READ, FILE_SHARE_ALL, 0,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0
+    );
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+        return 0;
+    }
+    return GetLastError() == ERROR_SHARING_VIOLATION;
 }
 
 static Str os_lasterr(Os *, Arena *a)
@@ -1138,27 +1231,46 @@ static Str os_lasterr(Os *, Arena *a)
 // Each Proc has a reader thread, pumping output into the file, and a
 // waiter thread on the process handle. Both hold references, as does
 // the engine until os_procfree. The job closes with the last one,
-// killing whatever is left.
+// killing whatever is left. A child from os_spawnio has a pipe for its
+// standard input and a writer thread feeding it from a queue, with a
+// reference of its own; its reader passes output on as records instead
+// of into a file, and its errors go into the file directly.
 
 enum : iz {
-    PROC_TAILMAX = 1<<12,
-    PROC_BUFLEN  = 1<<16,
+    PROC_TAILMAX  = 1<<12,
+    PROC_BUFLEN   = 1<<16,
+    PROC_QUEUEMAX = (iz)64 << 20,  // bytes waiting for a child's input
+};
+
+struct ProcChunk {  // queued input, its bytes following
+    ProcChunk *next;
+    iz         len;
 };
 
 struct Proc {
-    i32      refs;      // atomic
-    uz       job;
-    uz       process;   // owned by the waiter until the end
-    uz       pipe;      // output read end, owned by the reader
-    uz       file;      // the output file, owned by the reader
-    Mailbox *mbox;
-    u64      id;
-    i64      maxbytes;
-    i64      total;     // reader only
-    iz       tailpos;   // reader only
-    u8       tail[PROC_TAILMAX];
-    u8       msg[8+PROC_TAILMAX];
-    u8       buf[PROC_BUFLEN];
+    i32        refs;      // atomic
+    uz         job;
+    uz         process;   // owned by the waiter until the end
+    uz         pipe;      // output read end, owned by the reader
+    uz         file;      // the output file, owned by the reader
+    Mailbox   *mbox;
+    u64        id;
+    i64        maxbytes;
+    i64        total;     // reader only
+    iz         tailpos;   // reader only
+    // os_spawnio
+    b32        io;
+    Lock       lock;
+    uz         input;     // input pipe write end, owned by the writer
+    Event      wake;      // for the writer
+    ProcChunk *head;      // under lock: the input queue
+    ProcChunk *last;      // under lock
+    iz         queued;    // under lock: bytes in the queue
+    b32        closing;   // under lock: close the input after the queue
+    b32        broken;    // under lock: the input is closed
+    u8         tail[PROC_TAILMAX];
+    u8         msg[8+PROC_TAILMAX];
+    u8         buf[PROC_BUFLEN];
 };
 
 static void procrelease(Proc *p)
@@ -1166,6 +1278,9 @@ static void procrelease(Proc *p)
     if (!__atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL)) {
         CloseHandle(p->job);
         CloseHandle(p->process);
+        if (p->io) {
+            DeleteCriticalSection((CriticalSection *)p->lock.opaque);
+        }
         HeapFree(GetProcessHeap(), 0, p);
     }
 }
@@ -1229,6 +1344,83 @@ static void procreader(void *arg)
     procrelease(p);
 }
 
+// The reader of a child from os_spawnio: output as records, in order,
+// waiting for room in the mailbox.
+static void procpipe(void *arg)
+{
+    Proc *p   = (Proc *)arg;
+    iz    max = mailmax(p->mbox);
+    for (;;) {
+        i32 n = 0;
+        if (!ReadFile(p->pipe, p->buf, PROC_BUFLEN, &n, 0) || !n) {
+            break;
+        }
+        for (iz off = 0; off < n; off += max) {
+            iz len = n-off<max ? n-off : max;
+            mailpost(p->mbox, PROC_DATA, p->id, {p->buf+off, len}, 1);
+        }
+        p->total += n;
+    }
+    CloseHandle(p->pipe);
+    u8 msg[8];
+    put64(msg, p->total);
+    mailpost(p->mbox, PROC_EOF, p->id, {msg, 8}, 1);
+    procrelease(p);
+}
+
+static void freequeue(Proc *p)  // under lock
+{
+    for (ProcChunk *c = p->head; c;) {
+        ProcChunk *next = c->next;
+        HeapFree(GetProcessHeap(), 0, c);
+        c = next;
+    }
+    p->head   = 0;
+    p->last   = 0;
+    p->queued = 0;
+}
+
+// Feed queued input to the child until told to close it, or until the
+// child stops reading (a broken pipe). Signals to wake it come only
+// under the lock while neither closing nor broken, so once it sees
+// either, nobody touches its event again and it may close it.
+static void procwriter(void *arg)
+{
+    Proc *p = (Proc *)arg;
+    for (;;) {
+        os_lock(&p->lock);
+        ProcChunk *c = p->head;
+        if (c) {
+            p->head = c->next;
+            p->last = p->head ? p->last : 0;
+        }
+        b32 done = !c && p->closing;
+        os_unlock(&p->lock);
+        if (done) {
+            break;
+        } else if (!c) {
+            os_wait(&p->wake, -1);
+            continue;
+        }
+
+        b32 ok = writeall(p->input, {(u8 *)(c + 1), c->len});
+        os_lock(&p->lock);
+        p->queued -= c->len;
+        if (!ok) {
+            p->broken = 1;
+            freequeue(p);
+        }
+        os_unlock(&p->lock);
+        HeapFree(GetProcessHeap(), 0, c);
+        if (!ok) {
+            break;
+        }
+    }
+    CloseHandle(p->input);
+    CloseHandle((uz)p->wake.h[0]);
+    procrelease(p);
+}
+
 static void procwaiter(void *arg)
 {
     Proc *p    = (Proc *)arg;
@@ -1289,7 +1481,10 @@ static void closeall(uz *hs, iz n)
     }
 }
 
-static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
+// Spawn into a new job. With io, input is a pipe from the writer
+// thread, errors go to outpath (or NUL) directly, and the reader passes
+// output on as records instead of into the file.
+static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
 {
     if (!sp->argv.len || hasnul(sp->cwd) || hasnul(sp->outpath)) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -1301,24 +1496,32 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
     c16 *env  = envblock(&scratch, sp->env);
     c16 *out  = widepath(&scratch, sp->outpath).data;
 
-    uz job  = CreateJobObjectW(0, 0);
-    uz nul  = CreateFileW((c16 *)u"NUL", GENERIC_READ|GENERIC_WRITE, FILE_SHARE_ALL,
-                          0, OPEN_EXISTING, 0, 0);
-    uz file = CreateFileW(out, GENERIC_WRITE, FILE_SHARE_ALL, 0, CREATE_ALWAYS,
-                          FILE_ATTRIBUTE_NORMAL, 0);
-    uz pr = 0, pw = 0;
-    b32 ok = job && nul!=INVALID_HANDLE_VALUE && file!=INVALID_HANDLE_VALUE &&
-             CreatePipe(&pr, &pw, 0, 1<<16);
+    uz  job  = CreateJobObjectW(0, 0);
+    uz  nul  = CreateFileW((c16 *)u"NUL", GENERIC_READ|GENERIC_WRITE, FILE_SHARE_ALL,
+                           0, OPEN_EXISTING, 0, 0);
+    uz  file = 0;
+    b32 ok   = job && nul!=INVALID_HANDLE_VALUE;
+    if (ok && (!io || sp->outpath.len)) {
+        file = CreateFileW(out, GENERIC_WRITE, FILE_SHARE_ALL, 0, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, 0);
+        ok   = file != INVALID_HANDLE_VALUE;
+    }
+    uz    pr = 0, pw = 0, ir = 0, iw = 0;
+    Event wake = {};
+    ok = ok && CreatePipe(&pr, &pw, 0, 1<<16) &&
+         (!io || (CreatePipe(&ir, &iw, 0, 1<<16) && os_eventinit(&wake)));
     if (ok) {
         JobLimits lim = {};
         lim.flags = JOB_KILL_ON_JOB_CLOSE | JOB_DIE_ON_UNHANDLED_EXCEPTION;
         ok = SetInformationJobObject(job, JobObjectExtendedLimitInformation,
                                      &lim, sizeof(lim));
     }
+    uz mine[] = {job, file, pr, iw, (uz)wake.h[0]};  // kept if all goes well
     if (!ok) {
         i32 err = GetLastError();
-        uz hs[] = {job, nul, file, pr, pw};
+        uz hs[] = {nul, pw, ir};
         closeall(hs, countof(hs));
+        closeall(mine, countof(mine));
         SetLastError(err);
         return 0;
     }
@@ -1327,30 +1530,35 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
     StartupInfo si = {};
     si.cb     = sizeof(si);
     si.flags  = STARTF_USESTDHANDLES;
-    si.input  = nul;
+    si.input  = io ? ir : nul;
     si.output = pw;
-    si.error  = pw;
+    si.error  = !io ? pw : file ? file : nul;
     i32 flags = CREATE_SUSPENDED | CREATE_NO_WINDOW |
                 CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP;
     EnterCriticalSection(&os->spawn);
-    SetHandleInformation(nul, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-    SetHandleInformation(pw, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation(si.input, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation(si.output, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation(si.error, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     ok = CreateProcessW(0, cmd, 0, 0, 1, flags, env, cwd, &si, &pi);
     i32 err = GetLastError();
-    CloseHandle(nul);
-    CloseHandle(pw);
+    uz child[] = {nul, pw, ir, io ? file : 0};
+    closeall(child, countof(child));
     LeaveCriticalSection(&os->spawn);
+    if (io) {
+        file    = 0;
+        mine[1] = 0;
+    }
     if (!ok) {
-        uz hs[] = {job, file, pr};
-        closeall(hs, countof(hs));
+        closeall(mine, countof(mine));
         SetLastError(err);
         return 0;
     }
     if (!AssignProcessToJobObject(job, pi.process)) {
         err = GetLastError();
         TerminateProcess(pi.process, 1);
-        uz hs[] = {pi.thread, pi.process, job, file, pr};
+        uz hs[] = {pi.thread, pi.process};
         closeall(hs, countof(hs));
+        closeall(mine, countof(mine));
         SetLastError(err);
         return 0;
     }
@@ -1361,12 +1569,12 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
     Proc *p    = (Proc *)HeapAlloc(heap, HEAP_ZERO_MEMORY, sizeof(Proc));
     if (!p) {
         TerminateJobObject(job, 1);
-        uz hs[] = {pi.process, job, file, pr};
-        closeall(hs, countof(hs));
+        CloseHandle(pi.process);
+        closeall(mine, countof(mine));
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     }
-    p->refs     = 3;
+    p->refs     = io ? 4 : 3;
     p->job      = job;
     p->process  = pi.process;
     p->pipe     = pr;
@@ -1374,22 +1582,90 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
     p->mbox     = sp->mbox;
     p->id       = sp->id;
     p->maxbytes = sp->maxbytes;
-    if (!os_thread(os, procreader, p)) {
+    p->io       = io;
+    p->input    = iw;
+    p->wake     = wake;
+    if (io) {
+        os_lockinit(&p->lock);
+    }
+    if (!os_thread(os, io ? procpipe : procreader, p)) {
         TerminateJobObject(job, 1);
-        uz hs[] = {pi.process, job, file, pr};
-        closeall(hs, countof(hs));
+        CloseHandle(pi.process);
+        closeall(mine, countof(mine));
+        if (io) {
+            DeleteCriticalSection((CriticalSection *)p->lock.opaque);
+        }
         HeapFree(heap, 0, p);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     }
+    uz input[] = {iw, (uz)wake.h[0]};
     if (!os_thread(os, procwaiter, p)) {
         TerminateJobObject(job, 1);  // the reader then finishes
+        closeall(input, countof(input));
+        if (io) procrelease(p);  // the writer's
         procrelease(p);  // the waiter's
         procrelease(p);  // the caller's
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     }
+    if (io && !os_thread(os, procwriter, p)) {
+        TerminateJobObject(job, 1);  // the reader and waiter then finish
+        closeall(input, countof(input));
+        procrelease(p);  // the writer's
+        procrelease(p);  // the caller's
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
     return p;
+}
+
+static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
+{
+    return spawnproc(os, sp, scratch, 0);
+}
+
+static Proc *os_spawnio(Os *os, Spawn *sp, Arena scratch)
+{
+    return spawnproc(os, sp, scratch, 1);
+}
+
+static b32 os_procwrite(Os *, Proc *p, Str data)
+{
+    if (!p->io || data.len>PROC_QUEUEMAX) {
+        return 0;
+    }
+    uz         heap = GetProcessHeap();
+    ProcChunk *c    = 0;
+    if (data.len) {
+        c = (ProcChunk *)HeapAlloc(heap, 0, (iz)sizeof(ProcChunk) + data.len);
+        if (!c) {
+            return 0;
+        }
+        c->next = 0;
+        c->len  = data.len;
+        copybytes(c+1, data.data, data.len);
+    }
+
+    os_lock(&p->lock);
+    b32 ok = !p->closing && !p->broken && data.len<=PROC_QUEUEMAX-p->queued;
+    if (ok && c) {
+        *(p->last ? &p->last->next : &p->head) = c;
+        p->last    = c;
+        p->queued += c->len;
+        c = 0;
+    }
+    if (ok && !data.data) {
+        p->closing = 1;
+    }
+    if (ok) {
+        os_signal(&p->wake);
+    }
+    os_unlock(&p->lock);
+    if (c) {
+        HeapFree(heap, 0, c);  // not queued
+    }
+    return ok;
 }
 
 // Soft and hard alike until a soft stop (CTRL_BREAK) arrives in M4.
@@ -1398,8 +1674,11 @@ static void os_kill(Os *, Proc *p, b32)
     TerminateJobObject(p->job, 1);
 }
 
-static void os_procfree(Os *, Proc *p)
+static void os_procfree(Os *os, Proc *p)
 {
+    if (p->io) {
+        os_procwrite(os, p, {});  // close the input after the queue
+    }
     procrelease(p);
 }
 
@@ -1690,6 +1969,9 @@ void mainCRTStartup()
     Os os = {};
     QueryPerformanceFrequency(&os.freq);
     InitializeCriticalSectionAndSpinCount(&os.spawn, 4000);
+    uz kernel32  = GetModuleHandleW((c16 *)u"kernel32.dll");
+    os.finalpath = (u32 (__stdcall *)(uz, c16 *, u32, u32))
+                   GetProcAddress(kernel32, (char *)"GetFinalPathNameByHandleW");
 
     // No dialogs from a crashing child, or from a missing disk
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |

@@ -18,9 +18,17 @@ struct VFile {
     b32    isdir;
 };
 
+struct VLink {
+    VLink *next;
+    Str    from;  // absolute
+    Str    to;    // absolute
+};
+
 struct Os {
     Arena  mem;       // file contents and names live here
     VFile *files;
+    VLink *links;     // symlinks, followed by os_realpath only
+    Str    locks[16]; // held lock files, by os_lockfile handle
     VFile *logs[16];  // log handles index this table
     iz     nlogs;
     i64    now;       // microseconds, advanced by tests
@@ -261,10 +269,65 @@ static Read os_readat(Os *os, Arena *a, Str path, i64 off, iz max)
     return r;
 }
 
+// A symlink at from, to an absolute target.
+static void vlink(Os *os, Str from, Str to)
+{
+    VLink *l = alloc<VLink>(&os->mem);
+    l->from  = clone(&os->mem, from);
+    l->to    = clone(&os->mem, to);
+    l->next  = os->links;
+    os->links = l;
+}
+
+// Paths are taken as given, except that links are followed wherever one
+// covers a leading part of the path. Windows paths in tests use '/'.
 static Str os_realpath(Os *os, Arena *a, Str path)
 {
-    VFile *f = vfind(os, path, 0);
-    return f && f->exists ? clone(a, path) : Str{};
+    for (i32 hops = 0; hops < 40; hops++) {
+        VLink *l = os->links;
+        for (; l; l = l->next) {
+            Str f = l->from;
+            if (startswith(path, f) && (path.len==f.len || path[f.len]=='/')) {
+                break;
+            }
+        }
+        if (!l) {
+            VFile *f = vfind(os, path, 0);
+            return f && f->exists ? clone(a, path) : Str{};
+        }
+        path = concat(a, l->to, cuthead(path, l->from.len));
+    }
+    return {};
+}
+
+static iz os_lockfile(Os *os, Arena, Str path)
+{
+    iz slot = -1;
+    for (iz i = countof(os->locks)-1; i >= 0; i--) {
+        if (os->locks[i].data && os->locks[i]==path) {
+            return -1;
+        }
+        slot = os->locks[i].data ? slot : i;
+    }
+    if (slot >= 0) {
+        os->locks[slot] = clone(&os->mem, path);
+    }
+    return slot;
+}
+
+static void os_unlockfile(Os *os, iz lock)
+{
+    os->locks[lock] = {};
+}
+
+static b32 os_lockheld(Os *os, Arena, Str path)
+{
+    for (iz i = 0; i < countof(os->locks); i++) {
+        if (os->locks[i].data && os->locks[i]==path) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // No processes, HTTP, or standard input: the engine is tested end to
@@ -272,6 +335,8 @@ static Str os_realpath(Os *os, Arena *a, Str path)
 static Slice<Str> os_environ(Os *, Arena *) { return {}; }
 static iz    os_stdin(Os *, u8 *, iz) { return 0; }
 static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
+static Proc *os_spawnio(Os *, Spawn *, Arena) { return 0; }
+static b32   os_procwrite(Os *, Proc *, Str) { return 0; }
 static void  os_kill(Os *, Proc *, b32) {}
 static void  os_procfree(Os *, Proc *) {}
 static Http *os_http(Os *, HttpReq *, Arena) { return 0; }
@@ -336,6 +401,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/provider_test.cpp"
 #include "test/tools_test.cpp"
 #include "test/guard_test.cpp"
+#include "test/engine_test.cpp"
 #if HARNESS_GUI
 #  include "sched.cpp"
 #  include "highlight.cpp"
@@ -366,6 +432,7 @@ int main()
     test_provider(&t);
     test_tools(&t);
     test_guard(&t);
+    test_engine(&t);
     #if HARNESS_GUI
     test_sched(&t);
     test_highlight(&t);

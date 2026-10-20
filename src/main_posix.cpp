@@ -22,6 +22,7 @@
 #include <stdio.h>  // rename
 #include <stdlib.h>
 #include <string.h>  // strerror_r
+#include <sys/file.h>  // flock
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/stat.h>
@@ -736,6 +737,55 @@ static Str os_realpath(Os *, Arena *a, Str path)
     return clone(a, r);
 }
 
+// Session locks: flock, which the kernel releases when the descriptor
+// closes, as it does when the process dies. The descriptor is
+// close-on-exec, so no child inherits the lock. A test takes a shared
+// lock for a moment, so an exclusive lock that fails where a shared one
+// succeeds met only a test, and tries again.
+static iz os_lockfile(Os *, Arena scratch, Str path)
+{
+    if (hasnul(path)) {
+        return -1;
+    }
+    i32 fd = open(cstr(&scratch, path), O_RDWR|O_CREAT|O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+    for (i32 n = 0; n < 200; n++) {
+        if (!flock(fd, LOCK_EX|LOCK_NB)) {
+            return fd;
+        } else if (errno == EINTR) {
+            continue;
+        } else if (errno!=EWOULDBLOCK || flock(fd, LOCK_SH|LOCK_NB)) {
+            break;  // held for real
+        }
+        flock(fd, LOCK_UN);
+        struct timespec ts = {0, 1000000};
+        nanosleep(&ts, 0);
+    }
+    close(fd);
+    return -1;
+}
+
+static void os_unlockfile(Os *, iz lock)
+{
+    close((i32)lock);
+}
+
+static b32 os_lockheld(Os *, Arena scratch, Str path)
+{
+    if (hasnul(path)) {
+        return 0;
+    }
+    i32 fd = open(cstr(&scratch, path), O_RDONLY|O_CLOEXEC);
+    if (fd < 0) {
+        return 0;  // no file, no lock
+    }
+    b32 held = flock(fd, LOCK_SH|LOCK_NB) && errno==EWOULDBLOCK;
+    close(fd);  // releasing the test's own lock
+    return held;
+}
+
 // strerror_r returns int (XSI) or char * (GNU), depending on the libc.
 static char *errtext(i32, char *buf, i32 r)
 {
@@ -762,8 +812,9 @@ static Str os_lasterr(Os *, Arena *a)
 //
 // A tool runs under a reaper, this executable started as
 //   harness --reap CWD ARGV...
-// with null stdin, the output pipe on fds 1 and 2, the lifeline on fd 3,
-// and a status pipe on fd 4. The reaper leads a new session and process
+// with null stdin (or an input pipe), the output pipe on fds 1 and 2 (or
+// fd 1, with errors to a file), the lifeline on fd 3, and a status pipe
+// on fd 4. The reaper leads a new session and process
 // group and starts the tool in it, then reports the tool's exit status
 // on fd 4 and stays alive, so that the group id, its own pid, cannot be
 // reused until the harness kills the whole group (os_kill) and reaps
@@ -774,29 +825,48 @@ static Str os_lasterr(Os *, Arena *a)
 //
 // Each Proc has a reader thread, pumping output into the file, and a
 // waiter thread, reading the status and then reaping the reaper. Both
-// hold references, as does the engine until os_procfree.
+// hold references, as does the engine until os_procfree. A child from
+// os_spawnio has its standard input on fd 0 instead of null, and a
+// writer thread feeding it from a queue, with a reference of its own;
+// its reader passes output on as records instead of into a file, and
+// its errors go into the file directly.
 
 enum : iz {
-    PROC_TAILMAX = 1<<12,
-    PROC_BUFLEN  = 1<<16,
+    PROC_TAILMAX  = 1<<12,
+    PROC_BUFLEN   = 1<<16,
+    PROC_QUEUEMAX = (iz)64 << 20,  // bytes waiting for a child's input
+};
+
+struct ProcChunk {  // queued input, its bytes following
+    ProcChunk *next;
+    iz         len;
 };
 
 struct Proc {
-    Lock     lock;
-    i32      refs;      // atomic
-    i32      pid;       // the reaper, leader of the process group
-    b32      reaped;    // under lock: pid may be reused
-    Mailbox *mbox;
-    u64      id;
-    i32      outfd;     // output pipe read end, owned by the reader
-    i32      statfd;    // status pipe read end, owned by the waiter
-    i32      filefd;    // the output file, owned by the reader
-    i64      maxbytes;
-    i64      total;     // reader only
-    iz       tailpos;   // reader only: next write in the tail ring
-    u8       tail[PROC_TAILMAX];
-    u8       msg[8+PROC_TAILMAX];
-    u8       buf[PROC_BUFLEN];
+    Lock       lock;
+    i32        refs;      // atomic
+    i32        pid;       // the reaper, leader of the process group
+    b32        reaped;    // under lock: pid may be reused
+    Mailbox   *mbox;
+    u64        id;
+    i32        outfd;     // output pipe read end, owned by the reader
+    i32        statfd;    // status pipe read end, owned by the waiter
+    i32        filefd;    // the output file, owned by the reader
+    i64        maxbytes;
+    i64        total;     // reader only
+    iz         tailpos;   // reader only: next write in the tail ring
+    // os_spawnio
+    b32        io;
+    i32        infd;      // input pipe write end, owned by the writer
+    Event      wake;      // for the writer
+    ProcChunk *head;      // under lock: the input queue
+    ProcChunk *last;      // under lock
+    iz         queued;    // under lock: bytes in the queue
+    b32        closing;   // under lock: close the input after the queue
+    b32        broken;    // under lock: the input is closed
+    u8         tail[PROC_TAILMAX];
+    u8         msg[8+PROC_TAILMAX];
+    u8         buf[PROC_BUFLEN];
 };
 
 static void procrelease(Proc *p)
@@ -864,6 +934,86 @@ static void procreader(void *arg)
     u8 msg[8];
     put64(msg, p->total);
     mailpost(p->mbox, PROC_EOF, p->id, {msg, 8}, 1);
+    procrelease(p);
+}
+
+// The reader of a child from os_spawnio: output as records, in order,
+// waiting for room in the mailbox.
+static void procpipe(void *arg)
+{
+    Proc *p   = (Proc *)arg;
+    iz    max = mailmax(p->mbox);
+    for (;;) {
+        iz n = read(p->outfd, p->buf, PROC_BUFLEN);
+        if (n<0 && errno==EINTR) {
+            continue;
+        } else if (n <= 0) {
+            break;
+        }
+        for (iz off = 0; off < n; off += max) {
+            iz len = n-off<max ? n-off : max;
+            mailpost(p->mbox, PROC_DATA, p->id, {p->buf+off, len}, 1);
+        }
+        p->total += n;
+    }
+    close(p->outfd);
+    u8 msg[8];
+    put64(msg, p->total);
+    mailpost(p->mbox, PROC_EOF, p->id, {msg, 8}, 1);
+    procrelease(p);
+}
+
+static void freequeue(Proc *p)  // under lock
+{
+    for (ProcChunk *c = p->head; c;) {
+        ProcChunk *next = c->next;
+        free(c);
+        c = next;
+    }
+    p->head   = 0;
+    p->last   = 0;
+    p->queued = 0;
+}
+
+// Feed queued input to the child until told to close it, or until the
+// child stops reading (EPIPE). Signals to wake it come only under the
+// lock while neither closing nor broken, so once it sees either, nobody
+// touches its event again and it may close it.
+static void procwriter(void *arg)
+{
+    Proc *p = (Proc *)arg;
+    for (;;) {
+        os_lock(&p->lock);
+        ProcChunk *c = p->head;
+        if (c) {
+            p->head = c->next;
+            p->last = p->head ? p->last : 0;
+        }
+        b32 done = !c && p->closing;
+        os_unlock(&p->lock);
+        if (done) {
+            break;
+        } else if (!c) {
+            os_wait(&p->wake, -1);
+            continue;
+        }
+
+        b32 ok = writeall(p->infd, {(u8 *)(c + 1), c->len});
+        os_lock(&p->lock);
+        p->queued -= c->len;
+        if (!ok) {
+            p->broken = 1;
+            freequeue(p);
+        }
+        os_unlock(&p->lock);
+        free(c);
+        if (!ok) {
+            break;
+        }
+    }
+    close(p->infd);
+    close((i32)p->wake.h[0]);
+    close((i32)p->wake.h[1]);
     procrelease(p);
 }
 
@@ -963,22 +1113,35 @@ static void childsignals(posix_spawnattr_t *attr, short flags, b32 tool)
     posix_spawnattr_setflags(attr, flags);
 }
 
-static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
+// Spawn under a reaper. With io, input is a pipe from the writer
+// thread, errors go to outpath (or /dev/null) directly, and the reader
+// passes output on as records instead of into the file.
+static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
 {
     if (!sp->argv.len || hasnul(sp->cwd) || hasnul(sp->outpath)) {
         errno = EINVAL;
         return 0;
     }
 
-    // Child-side descriptors: null, output write end, status write end
-    i32 out[2] = {-1, -1};
-    i32 st[2]  = {-1, -1};
-    i32 null   = open("/dev/null", O_RDWR|O_CLOEXEC);
-    i32 file   = open(cstr(&scratch, sp->outpath),
-                      O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0644);
-    if (null<0 || file<0 || !cloexecpipe(out) || !cloexecpipe(st)) {
+    // Child-side descriptors: input (null, or a pipe's read end), output
+    // write end, errors (the same, or the file), status write end
+    i32   in[2]  = {-1, -1};
+    i32   out[2] = {-1, -1};
+    i32   st[2]  = {-1, -1};
+    Event wake   = {{-1, -1}};
+    i32   null   = open("/dev/null", O_RDWR|O_CLOEXEC);
+    i32   file   = -1;
+    b32   ok     = null >= 0;
+    if (ok && (!io || sp->outpath.len)) {
+        file = open(cstr(&scratch, sp->outpath),
+                    O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0644);
+        ok   = file >= 0;
+    }
+    ok = ok && cloexecpipe(out) && cloexecpipe(st) &&
+         (!io || (cloexecpipe(in) && os_eventinit(&wake)));
+    if (!ok) {
         i32 save = errno;
-        i32 fds[] = {null, file, out[0], out[1], st[0], st[1]};
+        i32 fds[] = {null, file, in[0], in[1], out[0], out[1], st[0], st[1]};
         closeall(fds, countof(fds));
         errno = save;
         return 0;
@@ -986,6 +1149,12 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
     null   = highfd(null);
     out[1] = highfd(out[1]);
     st[1]  = highfd(st[1]);
+    if (io) {
+        in[0] = highfd(in[0]);
+        file  = highfd(file);
+    }
+    i32 fd0 = io ? in[0] : null;
+    i32 fd2 = !io ? out[1] : sp->outpath.len ? file : null;
 
     iz     argc = 3 + sp->argv.len;
     char **argv = alloc<char *>(&scratch, argc+1);
@@ -1002,9 +1171,9 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
 
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, null, 0);
+    posix_spawn_file_actions_adddup2(&fa, fd0, 0);
     posix_spawn_file_actions_adddup2(&fa, out[1], 1);
-    posix_spawn_file_actions_adddup2(&fa, out[1], 2);
+    posix_spawn_file_actions_adddup2(&fa, fd2, 2);
     posix_spawn_file_actions_adddup2(&fa, os->lifer, 3);
     posix_spawn_file_actions_adddup2(&fa, st[1], 4);
     posix_spawnattr_t attr;
@@ -1014,15 +1183,16 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
     #endif
     childsignals(&attr, flags, 0);
     pid_t pid = 0;
-    i32   err = null<0 || out[1]<0 || st[1]<0 ? EMFILE :
+    i32   err = fd0<0 || out[1]<0 || fd2<0 || st[1]<0 ? EMFILE :
                 posix_spawn(&pid, os->exe, &fa, &attr, argv, envp);
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&attr);
-    i32 child[] = {null, out[1], st[1]};
+    i32 child[] = {null, out[1], st[1], in[0], io ? file : -1};
     closeall(child, countof(child));
+    file = io ? -1 : file;
+    i32 mine[] = {file, out[0], st[0], in[1], (i32)wake.h[0], (i32)wake.h[1]};
     if (err) {
-        i32 fds[] = {file, out[0], st[0]};
-        closeall(fds, countof(fds));
+        closeall(mine, countof(mine));
         errno = err;
         return 0;
     }
@@ -1031,14 +1201,13 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
     if (!p) {
         kill(-pid, SIGKILL);
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
-        i32 fds[] = {file, out[0], st[0]};
-        closeall(fds, countof(fds));
+        closeall(mine, countof(mine));
         errno = ENOMEM;
         return 0;
     }
     __builtin_memset(p, 0, __builtin_offsetof(Proc, tail));
     os_lockinit(&p->lock);
-    p->refs     = 3;
+    p->refs     = io ? 4 : 3;
     p->pid      = pid;
     p->mbox     = sp->mbox;
     p->id       = sp->id;
@@ -1046,28 +1215,86 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
     p->statfd   = st[0];
     p->filefd   = file;
     p->maxbytes = sp->maxbytes;
+    p->io       = io;
+    p->infd     = in[1];
+    p->wake     = wake;
 
-    if (!os_thread(os, procreader, p)) {
+    if (!os_thread(os, io ? procpipe : procreader, p)) {
         kill(-pid, SIGKILL);
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
-        i32 fds[] = {file, out[0], st[0]};
-        closeall(fds, countof(fds));
+        closeall(mine, countof(mine));
         pthread_mutex_destroy((pthread_mutex_t *)p->lock.opaque);
         free(p);
         errno = EAGAIN;
         return 0;
     }
+    i32 input[] = {in[1], (i32)wake.h[0], (i32)wake.h[1]};
     if (!os_thread(os, procwaiter, p)) {
         // The reader finishes once the group is dead
         kill(-pid, SIGKILL);
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
         close(st[0]);
+        closeall(input, countof(input));
+        if (io) procrelease(p);  // the writer's
         procrelease(p);  // the waiter's
         procrelease(p);  // the caller's
         errno = EAGAIN;
         return 0;
     }
+    if (io && !os_thread(os, procwriter, p)) {
+        kill(-pid, SIGKILL);  // the reader and waiter then finish
+        closeall(input, countof(input));
+        procrelease(p);  // the writer's
+        procrelease(p);  // the caller's
+        errno = EAGAIN;
+        return 0;
+    }
     return p;
+}
+
+static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
+{
+    return spawnproc(os, sp, scratch, 0);
+}
+
+static Proc *os_spawnio(Os *os, Spawn *sp, Arena scratch)
+{
+    return spawnproc(os, sp, scratch, 1);
+}
+
+static b32 os_procwrite(Os *, Proc *p, Str data)
+{
+    if (!p->io || data.len>PROC_QUEUEMAX) {
+        return 0;
+    }
+    ProcChunk *c = 0;
+    if (data.len) {
+        c = (ProcChunk *)malloc(sizeof(ProcChunk) + (uz)data.len);
+        if (!c) {
+            return 0;
+        }
+        c->next = 0;
+        c->len  = data.len;
+        copybytes(c+1, data.data, data.len);
+    }
+
+    os_lock(&p->lock);
+    b32 ok = !p->closing && !p->broken && data.len<=PROC_QUEUEMAX-p->queued;
+    if (ok && c) {
+        *(p->last ? &p->last->next : &p->head) = c;
+        p->last    = c;
+        p->queued += c->len;
+        c = 0;
+    }
+    if (ok && !data.data) {
+        p->closing = 1;
+    }
+    if (ok) {
+        os_signal(&p->wake);
+    }
+    os_unlock(&p->lock);
+    free(c);  // unless queued
+    return ok;
 }
 
 static void os_kill(Os *, Proc *p, b32 hard)
@@ -1079,8 +1306,11 @@ static void os_kill(Os *, Proc *p, b32 hard)
     os_unlock(&p->lock);
 }
 
-static void os_procfree(Os *, Proc *p)
+static void os_procfree(Os *os, Proc *p)
 {
+    if (p->io) {
+        os_procwrite(os, p, {});  // close the input after the queue
+    }
     procrelease(p);
 }
 
@@ -1177,8 +1407,10 @@ static void reapstatus(i32 code, i32 sig)
         _exit(2);
     }
 
-    // Only the tool's tree holds the output now
+    // Only the tool's tree holds its standard descriptors now, so that
+    // its input reads EOF, and its output closes, with the tool alone
     i32 null = open("/dev/null", O_RDWR|O_CLOEXEC);
+    dup2(null, 0);
     dup2(null, 1);
     dup2(null, 2);
 
