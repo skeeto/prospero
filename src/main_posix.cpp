@@ -25,8 +25,10 @@
 #include <sys/file.h>  // flock
 #include <sys/mman.h>
 #include <sys/random.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1775,6 +1777,580 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
         reapchildren(&r);
     }
     reapsweep(&r);
+}
+
+
+// Local endpoints: AF_UNIX stream sockets
+//
+// A host's socket lives in its state directory's run directory, which
+// only its owner may enter, and that is the whole of the access control.
+// Where that path is too long for a socket address (about 100 bytes),
+// the address goes through a link /tmp/harness-UID-HASH to the run
+// directory instead, which must be this user's and point there.
+//
+// Each Conn has a reader thread, posting what arrives, and a writer
+// thread, draining the queue, each with a reference, as has the owner
+// until os_connclose. Breaking a connection shuts its socket down, which
+// ends a blocked read or write at once; the descriptor closes with the
+// last reference. A listener's thread polls its socket and a stop event.
+
+enum : iz {
+    CONN_BUFLEN   = 1<<16,
+    CONN_QUEUEMAX = (iz)64 << 20,  // bytes waiting to be written
+    SOCK_PATHMAX  = 100,           // sun_path: 104 bytes on macOS
+};
+
+struct ConnChunk {  // queued output, its bytes following
+    ConnChunk *next;
+    iz         len;
+};
+
+struct Conn {
+    Lock       lock;
+    i32        refs;     // atomic
+    i32        fd;
+    Mailbox   *mbox;
+    u64        id;
+    Event      wake;     // for the writer
+    ConnChunk *head;     // under lock: the output queue
+    ConnChunk *last;     // under lock
+    iz         queued;   // under lock: bytes in the queue
+    b32        closing;  // under lock: end the output after the queue
+    b32        broken;   // under lock: the output failed, or was dropped
+    u8         buf[CONN_BUFLEN];
+};
+
+struct Listener {
+    i32                refs;   // atomic: the owner, the thread
+    i32                fd;
+    Event              stop;
+    Mailbox           *mbox;
+    u64                nextid;
+    struct sockaddr_un addr;   // as given, through any link
+};
+
+static void connrelease(Conn *c)
+{
+    if (!__atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL)) {
+        close(c->fd);
+        close((i32)c->wake.h[0]);
+        close((i32)c->wake.h[1]);
+        pthread_mutex_destroy((pthread_mutex_t *)c->lock.opaque);
+        free(c);
+    }
+}
+
+static void connfreequeue(Conn *c)  // under lock
+{
+    for (ConnChunk *k = c->head; k;) {
+        ConnChunk *next = k->next;
+        free(k);
+        k = next;
+    }
+    c->head   = 0;
+    c->last   = 0;
+    c->queued = 0;
+}
+
+static void connreader(void *arg)
+{
+    Conn *c   = (Conn *)arg;
+    iz    max = mailmax(c->mbox);
+    for (;;) {
+        iz n = read(c->fd, c->buf, CONN_BUFLEN);
+        if (n<0 && errno==EINTR) {
+            continue;
+        } else if (n <= 0) {
+            break;
+        }
+        for (iz off = 0; off < n; off += max) {
+            iz len = n-off<max ? n-off : max;
+            mailpost(c->mbox, CONN_DATA, c->id, {c->buf+off, len}, 1);
+        }
+    }
+    mailpost(c->mbox, CONN_EOF, c->id, {}, 1);
+    connrelease(c);
+}
+
+static void connwriter(void *arg)
+{
+    Conn *c  = (Conn *)arg;
+    b32   ok = 1;
+    for (;;) {
+        os_lock(&c->lock);
+        ConnChunk *k = c->head;
+        if (k) {
+            c->head = k->next;
+            c->last = c->head ? c->last : 0;
+        }
+        b32 done = !k && (c->closing || c->broken);
+        ok = !c->broken;
+        os_unlock(&c->lock);
+        if (done) {
+            break;
+        } else if (!k) {
+            os_wait(&c->wake, -1);
+            continue;
+        }
+
+        ok = writeall(c->fd, {(u8 *)(k + 1), k->len});
+        os_lock(&c->lock);
+        c->queued -= k->len;
+        if (!ok) {
+            c->broken = 1;
+            connfreequeue(c);
+        }
+        os_unlock(&c->lock);
+        free(k);
+        if (!ok) {
+            break;
+        }
+    }
+    if (ok) {
+        shutdown(c->fd, SHUT_WR);  // the peer reads the end
+    }
+    connrelease(c);
+}
+
+// A connection on a connected socket, its threads started. Announced, it
+// is posted as CONN_NEW first, before any record of its own; should its
+// threads then fail to start, its CONN_EOF follows at once, and the
+// owner has a connection that is over. Otherwise null on failure, the
+// socket closed.
+static Conn *newconn(Os *os, i32 fd, Mailbox *mbox, u64 id, b32 announce)
+{
+    Conn *c = (Conn *)malloc(sizeof(Conn));
+    if (!c) {
+        close(fd);
+        errno = ENOMEM;
+        return 0;
+    }
+    __builtin_memset(c, 0, __builtin_offsetof(Conn, buf));
+    if (!os_eventinit(&c->wake)) {
+        close(fd);
+        free(c);
+        return 0;
+    }
+    os_lockinit(&c->lock);
+    c->refs = 3;
+    c->fd   = fd;
+    c->mbox = mbox;
+    c->id   = id;
+    if (announce) {
+        mailpost(mbox, CONN_NEW, id, {(u8 *)&c, sizeof(c)}, 1);
+    }
+    b32 reader = os_thread(os, connreader, c);
+    b32 writer = reader && os_thread(os, connwriter, c);
+    if (writer) {
+        return c;
+    }
+    __atomic_sub_fetch(&c->refs, 2-reader, __ATOMIC_ACQ_REL);  // not started
+    os_lock(&c->lock);
+    c->broken = 1;
+    os_unlock(&c->lock);
+    shutdown(fd, SHUT_RDWR);  // a reader that started ends, with CONN_EOF
+    if (announce && !reader) {
+        mailpost(mbox, CONN_EOF, id, {}, 1);
+    }
+    if (announce) {
+        return c;
+    }
+    connrelease(c);
+    errno = EAGAIN;
+    return 0;
+}
+
+static b32 os_connwrite(Os *, Conn *c, Str data)
+{
+    if (data.len > CONN_QUEUEMAX) {
+        return 0;
+    }
+    ConnChunk *k = 0;
+    if (data.len) {
+        k = (ConnChunk *)malloc(sizeof(ConnChunk) + (uz)data.len);
+        if (!k) {
+            return 0;
+        }
+        k->next = 0;
+        k->len  = data.len;
+        copybytes(k+1, data.data, data.len);
+    }
+
+    os_lock(&c->lock);
+    b32 ok = !c->closing && !c->broken && data.len<=CONN_QUEUEMAX-c->queued;
+    if (ok && k) {
+        *(c->last ? &c->last->next : &c->head) = k;
+        c->last    = k;
+        c->queued += k->len;
+        k = 0;
+    }
+    if (ok && !data.data) {
+        c->closing = 1;
+    }
+    if (ok) {
+        os_signal(&c->wake);
+    }
+    os_unlock(&c->lock);
+    free(k);  // unless queued
+    return ok;
+}
+
+static void os_connclose(Os *, Conn *c)
+{
+    os_lock(&c->lock);
+    c->broken = 1;
+    connfreequeue(c);
+    os_signal(&c->wake);
+    os_unlock(&c->lock);
+    shutdown(c->fd, SHUT_RDWR);  // ends the reader, and any write
+    connrelease(c);
+}
+
+// An address for a socket path, or 0 if it cannot be one.
+static b32 sockaddr(struct sockaddr_un *sa, Str path)
+{
+    *sa = {};
+    sa->sun_family = AF_UNIX;
+    if (path.len>=(iz)sizeof(sa->sun_path) || hasnul(path)) {
+        errno = ENAMETOOLONG;
+        return 0;
+    }
+    copybytes(sa->sun_path, path.data, path.len);
+    return 1;
+}
+
+static i32 cloexecsocket()
+{
+    i32 fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        #ifdef SO_NOSIGPIPE
+        i32 one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        #endif
+    }
+    return fd;
+}
+
+// The directory exists, is this user's alone, and is no link.
+static b32 privatedir(char *path)
+{
+    if (mkdir(path, 0700) && errno!=EEXIST) {
+        return 0;
+    }
+    struct stat st;
+    if (lstat(path, &st)) {
+        return 0;
+    } else if (!S_ISDIR(st.st_mode) || st.st_uid!=geteuid()) {
+        errno = EACCES;
+        return 0;
+    }
+    return !(st.st_mode & 077) || !chmod(path, 0700);
+}
+
+static Str os_endpoint(Os *, Arena *a, Str statedir, Str name)
+{
+    if (hasnul(statedir) || hasnul(name)) {
+        errno = EINVAL;
+        return {};
+    }
+    Arena tmp  = *a;
+    char *real = (char *)allocbytes(&tmp, 4096);  // PATH_MAX
+    if (!realpath(cstr(&tmp, statedir), real)) {
+        return {};
+    }
+    Str dir = {(u8 *)real, 0};
+    while (dir.data[dir.len]) dir.len++;
+    Str run = concat(&tmp, dir, "/run");
+    if (!privatedir(cstr(&tmp, run))) {
+        return {};
+    }
+    Str file = concat(&tmp, concat(&tmp, Str("/"), name), ".sock");
+    if (run.len+file.len <= SOCK_PATHMAX) {
+        Str r = clone(a, run);
+        return concat(a, r, file);
+    }
+
+    // Too long for an address: through a link of this user's
+    Buf b(&tmp, 64);
+    print(&b, "/tmp/harness-");
+    print(&b, (i64)geteuid());
+    putbyte(&b, '-');
+    printhex(&b, hash(run), 16);
+    Str   link  = finish(&b);
+    char *clink = cstr(&tmp, link);
+    char *crun  = cstr(&tmp, run);
+    struct stat st;
+    if (lstat(clink, &st)) {
+        if (errno!=ENOENT || (symlink(crun, clink) && errno!=EEXIST)) {
+            return {};  // else made meanwhile: check it as any other
+        }
+    }
+    char got[4096];
+    iz   len = 0;
+    errno = 0;
+    if (lstat(clink, &st) || !S_ISLNK(st.st_mode) || st.st_uid!=geteuid() ||
+            (len = readlink(clink, got, sizeof(got)))<0 ||
+            !(Str{(u8 *)got, len} == run)) {
+        errno = errno ? errno : EACCES;
+        return {};
+    }
+    Str r = clone(a, link);
+    return concat(a, r, file);
+}
+
+static void listenrelease(Listener *l)
+{
+    if (!__atomic_sub_fetch(&l->refs, 1, __ATOMIC_ACQ_REL)) {
+        close(l->fd);
+        close((i32)l->stop.h[0]);
+        close((i32)l->stop.h[1]);
+        free(l);
+    }
+}
+
+static void listenthread(void *arg)
+{
+    Listener *l  = (Listener *)arg;
+    Os        os = {};
+    for (;;) {
+        struct pollfd fds[2] = {};
+        fds[0].fd     = l->fd;
+        fds[0].events = POLLIN;
+        fds[1].fd     = (i32)l->stop.h[0];
+        fds[1].events = POLLIN;
+        if (poll(fds, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        } else if (fds[1].revents) {
+            break;
+        } else if (!fds[0].revents) {
+            continue;
+        }
+        i32 fd = accept(l->fd, 0, 0);
+        if (fd < 0) {
+            if (errno==EINTR || errno==ECONNABORTED || errno==EAGAIN) {
+                continue;
+            } else if (errno==EMFILE || errno==ENFILE) {
+                struct timespec ts = {0, 100000000};
+                nanosleep(&ts, 0);  // until descriptors free up
+                continue;
+            }
+            break;
+        }
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        #ifdef SO_NOSIGPIPE
+        i32 one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        #endif
+        newconn(&os, fd, l->mbox, ++l->nextid, 1);
+    }
+    listenrelease(l);
+}
+
+static Listener *os_listen(Os *os, Arena, Str endpoint, Mailbox *mbox)
+{
+    struct sockaddr_un sa;
+    if (!sockaddr(&sa, endpoint)) {
+        return 0;
+    }
+    i32 fd = cloexecsocket();
+    if (fd < 0) {
+        return 0;
+    }
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa))) {
+        // A socket left by a process that died refuses: replace it
+        i32 probe = errno==EADDRINUSE ? cloexecsocket() : -1;
+        b32 stale = probe>=0 && connect(probe, (struct sockaddr *)&sa, sizeof(sa)) &&
+                    (errno==ECONNREFUSED || errno==ENOENT);
+        if (probe >= 0) {
+            close(probe);
+        }
+        if (!stale || (unlink(sa.sun_path) && errno!=ENOENT) ||
+                bind(fd, (struct sockaddr *)&sa, sizeof(sa))) {
+            i32 save = stale ? errno : EADDRINUSE;
+            close(fd);
+            errno = save;
+            return 0;
+        }
+    }
+    chmod(sa.sun_path, 0600);
+    Listener *l = (Listener *)malloc(sizeof(Listener));
+    if (listen(fd, 64) || !l || !os_eventinit(&l->stop)) {
+        i32 save = l ? errno : ENOMEM;
+        unlink(sa.sun_path);
+        close(fd);
+        free(l);
+        errno = save;
+        return 0;
+    }
+    l->refs   = 2;
+    l->fd     = fd;
+    l->addr   = sa;
+    l->mbox   = mbox;
+    l->nextid = 0;
+    if (!os_thread(os, listenthread, l)) {
+        unlink(sa.sun_path);
+        l->refs = 1;
+        listenrelease(l);
+        errno = EAGAIN;
+        return 0;
+    }
+    return l;
+}
+
+// The socket file goes first, so that nobody new finds this listener,
+// and with it any link in /tmp that led there (os_endpoint).
+static void os_unlisten(Os *, Listener *l)
+{
+    struct sockaddr_un sa = l->addr;
+    if (sa.sun_path[0]) {
+        unlink(sa.sun_path);
+        char *path  = sa.sun_path;
+        Str   tmp   = "/tmp/harness-";
+        iz    slash = 0;
+        for (iz i = 0; path[i]; i++) {
+            slash = path[i]=='/' ? i : slash;
+        }
+        struct stat st;
+        if (slash>tmp.len && !__builtin_memcmp(path, tmp.data, (uz)tmp.len)) {
+            path[slash] = 0;
+            if (!lstat(path, &st) && S_ISLNK(st.st_mode) && st.st_uid==geteuid()) {
+                unlink(path);
+            }
+        }
+    }
+    os_signal(&l->stop);
+    listenrelease(l);
+}
+
+static Conn *os_connect(Os *os, Arena, Str endpoint, Mailbox *mbox, u64 id)
+{
+    struct sockaddr_un sa;
+    if (!sockaddr(&sa, endpoint)) {
+        return 0;
+    }
+    i32 fd = cloexecsocket();
+    if (fd < 0) {
+        return 0;
+    }
+    while (connect(fd, (struct sockaddr *)&sa, sizeof(sa))) {
+        if (errno != EINTR) {
+            i32 save = errno;
+            close(fd);
+            errno = save;
+            return 0;
+        }
+    }
+    return newconn(os, fd, mbox, id, 0);
+}
+
+static b32 os_listening(Os *, Arena, Str endpoint)
+{
+    struct sockaddr_un sa;
+    if (!sockaddr(&sa, endpoint)) {
+        return 0;
+    }
+    i32 fd = cloexecsocket();
+    b32 ok = fd>=0 && !connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (fd >= 0) {
+        close(fd);
+    }
+    return ok;
+}
+
+static i32 os_pid(Os *)
+{
+    return (i32)getpid();
+}
+
+// Two forks with a new session between them, so that the program is
+// nobody's child here, and outside this terminal's session and process
+// group. The children do only what is safe after a fork in a process
+// with threads, with everything prepared before it. The middle child
+// passes back the grandchild's pid, and the grandchild errno should exec
+// fail, through a close-on-exec pipe that closes when exec succeeds.
+static Detached os_detach(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Str errpath)
+{
+    Detached r = {};
+    if (!argv.len || hasnul(cwd) || hasnul(errpath)) {
+        errno = EINVAL;
+        return r;
+    }
+    for (iz i = 0; i < argv.len; i++) {
+        if (hasnul(argv[i])) {
+            errno = EINVAL;
+            return r;
+        }
+    }
+    char **cargv = alloc<char *>(&scratch, argv.len+1);
+    cargv[0] = os->exe;  // this executable, whatever argv[0] says
+    for (iz i = 1; i < argv.len; i++) {
+        cargv[i] = cstr(&scratch, argv[i]);
+    }
+    char *ccwd = cstr(&scratch, cwd);
+    char *cerr = cstr(&scratch, errpath);
+    i32   p[2];
+    if (!cloexecpipe(p)) {
+        return r;
+    }
+
+    pid_t mid = fork();
+    if (mid < 0) {
+        i32 save = errno;
+        close(p[0]);
+        close(p[1]);
+        errno = save;
+        return r;
+    } else if (!mid) {
+        setsid();
+        pid_t pid = fork();
+        if (pid) {
+            i32 v[2] = {pid, pid<0 ? errno : 0};
+            while (write(p[1], v, sizeof(v))<0 && errno==EINTR) {}
+            _exit(0);
+        }
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, 0);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        i32 null = open("/dev/null", O_RDWR);
+        i32 err  = open(cerr, O_WRONLY|O_CREAT|O_APPEND, 0600);
+        dup2(null, 0);
+        dup2(null, 1);
+        dup2(err>=0 ? err : null, 2);
+        if (chdir(ccwd)) {
+            // It starts where this process is, then
+        }
+        execv(cargv[0], cargv);
+        i32 v[2] = {0, errno};
+        while (write(p[1], v, sizeof(v))<0 && errno==EINTR) {}
+        _exit(127);
+    }
+    close(p[1]);
+    while (waitpid(mid, 0, 0)<0 && errno==EINTR) {}
+
+    // The pid from the middle child, then an exec failure, if any
+    i32 v[4] = {};
+    iz  got  = 0;
+    for (;;) {
+        iz n = read(p[0], (u8 *)v+got, sizeof(v)-(uz)got);
+        if (n<0 && errno==EINTR) continue;
+        if (n <= 0) break;
+        got += n;
+    }
+    close(p[0]);
+    if (got<8 || v[0]<=0) {
+        errno = got>=8 && v[1] ? v[1] : ECHILD;
+        return r;
+    } else if (got >= 16) {
+        errno = v[3] ? v[3] : ENOEXEC;
+        return r;
+    }
+    r.pid = v[0];
+    return r;
 }
 
 

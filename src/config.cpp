@@ -57,15 +57,15 @@
 // exists says whether that file was read, rev counts loads, and files
 // lists every file read, in load order. Settings list every schema key
 // of the top level and of the unnamed kinds ([guard], [tools],
-// [instructions] and [ui]), and of each named [endpoint], [model] and
-// [role] section that exists, in schema order. A value is
-// the one in effect as written, or its default ("default":1, with file
-// "" and line 0, or where the key is set empty); "valid":0 marks one
-// ignored for its default. An endpoint's timeouts default by whether
-// its URL is local (the schema's "local" defaults). A plaintext secret
-// is reported as "(hidden)", so no reply ever carries one. The schema's
-// types are string, int, number, seconds, bool, enum, url, secret
-// (env:NAME), list (words of choices) and paths (separated by ;).
+// [instructions], [ui] and [host]), and of each named [endpoint],
+// [model], [role] and [remote] section that exists, in schema order. A
+// value is the one in effect as written, or its default ("default":1,
+// with file "" and line 0, or where the key is set empty); "valid":0
+// marks one ignored for its default. An endpoint's timeouts default by
+// whether its URL is local (the schema's "local" defaults). A plaintext
+// secret is reported as "(hidden)", so no reply ever carries one. The
+// schema's types are string, int, number, seconds, bool, enum, url,
+// secret (env:NAME), list (words of choices) and paths (separated by ;).
 //
 // In config.set, kind and name "" (or absent) are the top level, and a
 // null value removes the key. The reply's line is where the key now is
@@ -131,6 +131,8 @@ static CfgKind cfgkinds[] = {
     {"tools",    0, "Background jobs, stopping commands, and search"},
     {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
     {"ui",       0, "How the GUI looks"},
+    {"host",     0, "The engine as a background host (harness serve)"},
+    {"remote",   1, "An engine on another machine, reached over ssh"},
 };
 
 struct CfgKey {
@@ -260,6 +262,22 @@ static CfgKey cfgschema[] = {
 
     {"ui", "theme", CFG_ENUM, "system", {}, "system dark light", "ui",
      "Colors: dark, light, or system to follow the operating system"},
+
+    {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
+     "Seconds a host waits with no client connected and nothing running, "
+     "then exits"},
+    {"host", "grace", CFG_SECONDS, "10800", {}, {}, "host",
+     "Seconds a host keeps the place of a client whose connection broke, "
+     "its records kept for when it comes back"},
+
+    {"remote", "ssh", CFG_STRING, "", {}, {}, "remote",
+     "Where ssh reaches the machine: [user@]host, or a Host of ~/.ssh/config"},
+    {"remote", "path", CFG_STRING, "harness", {}, {}, "remote",
+     "The harness executable there, a path or a name on its PATH"},
+    {"remote", "state", CFG_STRING, "", {}, {}, "remote",
+     "The state directory there, by default its own"},
+    {"remote", "config", CFG_STRING, "", {}, {}, "remote",
+     "The configuration file there, by default its own"},
 };
 
 // Value judgments

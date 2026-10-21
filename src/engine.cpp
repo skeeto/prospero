@@ -6184,6 +6184,28 @@ static void command(Engine *e, Arena scratch, Str line)
     case CMD_CONFIGSET:
         cmdconfig(e, scratch, id, cmd, j);
         return;
+    case CMD_STATUS: {
+        // What runs: turns (asks and queued requests included) and
+        // commands, those being stopped too, over every open session
+        i64 open = 0, turns = 0, jobs = 0;
+        for (Session *t = e->sessions; t; t = t->next) {
+            open++;
+            turns += busy(t);
+            for (Job *jb = t->jobs; jb; jb = jb->next) {
+                jobs += jb->state != JOB_DONE;
+            }
+        }
+        Arena a = scratch;
+        Buf   b(&a, 256);
+        EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+        putintkey(&w.json, "id", id);
+        putintkey(&w.json, "ok", 1);
+        putintkey(&w.json, "open", open);
+        putintkey(&w.json, "parked", e->parked.len);
+        putintkey(&w.json, "turns", turns);
+        putintkey(&w.json, "jobs", jobs);
+        emit(e, evend(&w));
+    } return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});
         return;
