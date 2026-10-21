@@ -336,6 +336,52 @@ static void testoverhead(ProcTest *p, Arena scratch)
     }
 }
 
+// macOS: a tool answers to its reaper, which then sweeps whatever does,
+// only if the harness answers for itself, as an app; otherwise to what
+// the harness answers to, Terminal or sshd, whose privacy grants it then
+// keeps (reap.cpp). Elsewhere there is no such thing.
+static void testresponsible(ProcTest *p, Arena scratch)
+{
+    Selftest *t    = p->t;
+    Os       *os   = p->os;
+    i32       self = os_pid(os);
+    i32       resp = os_responsible(os, self);
+    if (!resp) {
+        return;
+    }
+    Str   out = join(&scratch, p->dir, "responsible.log");
+    Proc *pr  = spawnsh(p, scratch, "echo $$ $PPID; exec sleep 10", out, 1<<10);
+    if (!check(t, pr!=0, "os_spawn to ask of responsibility")) return;
+
+    // The tool's pid and its reaper's, while it lives
+    ProcWatch w        = {};
+    Cut       line     = {};
+    i64       deadline = os_ticks(os) + 5000000;
+    while (!line.ok && !w.exitat && os_ticks(os)<deadline) {
+        procwatch(os, p->mb, p->id, &w, 20);
+        line = cut(os_read(os, &scratch, out, 1<<10).data, '\n');
+    }
+    Cut pids   = cut(line.head, ' ');
+    Int tool   = parseint(pids.head);
+    Int reaper = parseint(pids.tail);
+    if (check(t, line.ok && tool.ok && reaper.ok, "a tool tells its pid and its reaper's")) {
+        i32 rt = os_responsible(os, (i32)tool.val);
+        i32 rr = os_responsible(os, (i32)reaper.val);
+        if (resp == self) {
+            check(t, rr==reaper.val && rt==reaper.val,
+                  "a reaper answers for itself and its tool, the harness for itself");
+            say(os, "responsibility: each reaper answers for its tool");
+        } else {
+            check(t, rr==resp && rt==resp,
+                  "a reaper and its tool answer to what the harness answers to");
+            say(os, "responsibility: tools answer to what the harness answers to");
+        }
+    }
+    os_kill(os, pr, 1);
+    check(t, procwatch(os, p->mb, p->id, &w, 5000), "the tool is killed");
+    os_procfree(os, pr);
+}
+
 static Proc *spawnio(ProcTest *p, Arena scratch, Slice<Str> argv, Str cmdline,
                      Str errpath)
 {
@@ -533,6 +579,7 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     testholder(p, scratch);
     testladder(p, scratch);
     testoverhead(p, scratch);
+    testresponsible(p, scratch);
     testspawnio(p, scratch);
     testrealpaths(p, scratch);
 }

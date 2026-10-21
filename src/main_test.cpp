@@ -382,6 +382,7 @@ static b32   os_connwrite(Os *, Conn *, Str) { return 0; }
 static void  os_connclose(Os *, Conn *) {}
 static Detached os_detach(Os *, Arena, Slice<Str>, Str, Str) { return {}; }
 static i32   os_pid(Os *) { return 1; }
+static i32   os_responsible(Os *, i32) { return 0; }
 
 // A route's response, all of it posted before this returns, so the
 // mailbox must hold it. Without a route the request does not start.

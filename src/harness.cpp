@@ -300,6 +300,11 @@ struct Detached {
 static Detached  os_detach(Os *, Arena scratch, Slice<Str> argv, Str cwd, Str errpath);
 // (M5) This process's id.
 static i32       os_pid(Os *);
+// macOS: the pid of the process responsible for pid, which TCC charges
+// with its privacy access: its own for an app, else what started it, as
+// Terminal. 0 elsewhere, or if unknown. (The selftest checks reapers by
+// it: see reap.cpp.)
+static i32       os_responsible(Os *, i32 pid);
 
 // (M1) GUI builds: wake the GUI loop from any thread, coalesced.
 static void    os_wake(Os *);

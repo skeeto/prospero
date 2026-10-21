@@ -1081,6 +1081,15 @@ def sc_doublefork(model, n, req):
         yield from answer(model, "Daemonized.")
 
 
+def sc_script(model, n, req):
+    # Whatever the test wrote into script.sh, in the work directory: for
+    # cleanup.py's cases that need paths of this machine's
+    if n == 0:
+        yield from tool(model, n, "shell", {"command": "sh script.sh", "timeout": 120})
+    else:
+        yield from answer(model, "Script done.")
+
+
 def sc_groupfork(model, n, req):
     # Like doublefork, but into a process group of its own, which keeps
     # it in the reaper's session, where the sweep finds it on macOS too

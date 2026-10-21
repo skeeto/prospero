@@ -59,6 +59,7 @@ import pids as P  # noqa: E402
 
 class LocalHost:
     windows = os.name == "nt"
+    prefix = []  # what starts the harness, as cleanup.py's disclaim.py
 
     def __init__(self, harness, url):
         self.harness = os.path.abspath(harness)
@@ -102,7 +103,7 @@ class LocalHost:
 
     def popen(self, args, cwd, stdin=False, env=None):
         return subprocess.Popen(
-            [self.harness] + args, cwd=cwd,
+            self.prefix + [self.harness] + args, cwd=cwd,
             stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=dict(os.environ, **env) if env else None,

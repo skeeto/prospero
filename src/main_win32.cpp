@@ -2486,6 +2486,11 @@ static i32 os_pid(Os *)
     return GetCurrentProcessId();
 }
 
+static i32 os_responsible(Os *, i32)
+{
+    return 0;  // no such thing here
+}
+
 // No console, a process group of its own, and out of this process's job,
 // unless the job forbids that (ERROR_ACCESS_DENIED), as an ssh session's
 // may: then in the job, attached. Its standard handles are inheritable

@@ -119,6 +119,133 @@ static void test_reap(Test *t)
                istr(a, reapmine(&tool, self, 0, 1)), "1");
     }
 
+    // macOS: reapers are disclaimed only for a harness that answers for
+    // itself, an app; never from Terminal, under sshd, or nested
+    {
+        expect(t, "reapdisclaim, an app", istr(a, reapdisclaim(4242, 4242)), "1");
+        expect(t, "reapdisclaim, under Terminal", istr(a, reapdisclaim(4242, 500)), "0");
+        expect(t, "reapdisclaim, under a reaper", istr(a, reapdisclaim(4242, 4100)), "0");
+        expect(t, "reapdisclaim, unknown", istr(a, reapdisclaim(4242, 0)), "0");
+        expect(t, "reapdisclaim, no answer", istr(a, reapdisclaim(4242, -1)), "0");
+        expect(t, "reapdisclaim pid 0", istr(a, reapdisclaim(0, 0)), "0");
+        expect(t, "reapdisclaim pid 1", istr(a, reapdisclaim(1, 1)), "0");
+        expect(t, "reapdisclaim pid -1", istr(a, reapdisclaim(-1, -1)), "0");
+    }
+
+    // The id a reaper's sweep looks for: its own, if told and true
+    {
+        u64 me = 9001;
+        expect(t, "reaprespid", istr(a, (i64)reaprespid(1, 4242, 4242, me)), "9001");
+        expect(t, "reaprespid, not told", istr(a, (i64)reaprespid(0, 4242, 4242, me)), "0");
+        // Told, but the disclaim did not take: Terminal's id is not its own
+        expect(t, "reaprespid, not its own", istr(a, (i64)reaprespid(1, 4242, 500, me)), "0");
+        expect(t, "reaprespid, unknown", istr(a, (i64)reaprespid(1, 4242, 0, me)), "0");
+        expect(t, "reaprespid, no id", istr(a, (i64)reaprespid(1, 4242, 4242, 0)), "0");
+        expect(t, "reaprespid, failed id",
+               istr(a, (i64)reaprespid(1, 4242, 4242, (u64)-1)), "0");
+        expect(t, "reaprespid pid 1", istr(a, (i64)reaprespid(1, 1, 1, me)), "0");
+    }
+
+    // The set of the tool's unique ids: sorted, the oldest dropped
+    {
+        u64 ids[4] = {};
+        iz  len    = 0;
+        len = reapaddid(ids, len, 4, 30);
+        len = reapaddid(ids, len, 4, 10);
+        len = reapaddid(ids, len, 4, 20);
+        len = reapaddid(ids, len, 4, 20);
+        len = reapaddid(ids, len, 4, 0);
+        Buf b(a, 64);
+        for (iz i = 0; i < len; i++) {
+            print(&b, (i64)ids[i]);
+            putbyte(&b, ' ');
+        }
+        expect(t, "reapaddid", finish(&b), "10 20 30 ");
+        len = reapaddid(ids, len, 4, 40);
+        len = reapaddid(ids, len, 4, 25);  // full: 10 goes
+        len = reapaddid(ids, len, 4, 5);   // older than all kept
+        b = Buf(a, 64);
+        for (iz i = 0; i < len; i++) {
+            print(&b, (i64)ids[i]);
+            putbyte(&b, ' ');
+        }
+        expect(t, "reapaddid, full", finish(&b), "20 25 30 40 ");
+        expect(t, "reaphasid", istr(a, reaphasid(ids, len, 25)), "1");
+        expect(t, "reaphasid, dropped", istr(a, reaphasid(ids, len, 10)), "0");
+        expect(t, "reaphasid, never", istr(a, reaphasid(ids, len, 26)), "0");
+        expect(t, "reaphasid, zero", istr(a, reaphasid(ids, len, 0)), "0");
+        expect(t, "reaphasid, empty", istr(a, reaphasid(ids, 0, 20)), "0");
+        u64 none[1] = {};
+        expect(t, "reapaddid, no room", istr(a, reapaddid(none, 0, 0, 7)), "0");
+    }
+
+    // What a scan finds of the tool's by origin. The reaper (unique id
+    // 100) started the tool (101), which forked 102, gone, which forked
+    // 103, orphaned to launchd; 103 forked 104. A chain of short-lived
+    // parents never seen (105, 106, gone) left 107. 108 disclaimed itself
+    // after a parent never seen. The rest are not the tool's: Terminal's
+    // shell (50), with 51 under it, a process that disclaimed, and
+    // launchd (1), whose parent the kernel is (0).
+    {
+        ReapProc procs[] = {
+            //pid  ppid pg sid start uniq puniq resp
+            {4243, 4242, 0, 0, 1, 101, 100, 100},  // the tool
+            {4250, 1,    0, 0, 1, 103, 102, 100},  // a double fork's
+            {4251, 4250, 0, 0, 1, 104, 103, 100},  // its child
+            {4260, 1,    0, 0, 1, 107, 106, 100},  // after a chain
+            {4270, 1,    0, 0, 1, 108, 106, 108},  // disclaimed itself
+            {600,  1,    0, 0, 1, 50,  40,  50},   // Terminal's shell
+            {601,  600,  0, 0, 1, 51,  50,  50},
+            {602,  1,    0, 0, 1, 52,  0,   0},    // nothing known
+            {1,    0,    0, 0, 1, 1,   0,   1},    // launchd
+        };
+        iz n = countof(procs);
+        for (i32 disclaimed = 0; disclaimed < 2; disclaimed++) {
+            u64 ids[16] = {};
+            u8  mine[countof(procs)] = {};
+            iz  len = 0;
+            len = reapaddid(ids, len, countof(ids), 100);  // the reaper
+            len = reapaddid(ids, len, countof(ids), 102);  // seen, gone since
+            len = reaporigin(procs, n, mine, ids, len, countof(ids),
+                             disclaimed ? 100 : 0);
+            Buf b(a, 64);
+            for (iz i = 0; i < n; i++) {
+                if (mine[i]) {
+                    print(&b, (i64)procs[i].pid);
+                    putbyte(&b, ' ');
+                }
+            }
+            if (disclaimed) {
+                expect(t, "reaporigin, responsible", finish(&b),
+                       "4243 4250 4251 4260 ");
+            } else {
+                expect(t, "reaporigin, by parents", finish(&b), "4243 4250 4251 ");
+            }
+            expect(t, "reaporigin adds what it found",
+                   istr(a, reaphasid(ids, len, 104)), "1");
+            expect(t, "reaporigin adds nothing else",
+                   istr(a, reaphasid(ids, len, 50) || reaphasid(ids, len, 52) ||
+                           reaphasid(ids, len, 1)), "0");
+        }
+
+        // What was marked already (by parent links) leads to its orphans
+        u64 ids[4] = {};
+        u8  mine[countof(procs)] = {};
+        mine[0] = 1;  // the tool, by its parent, the reaper
+        iz len = reaporigin(procs, n, mine, ids, 0, countof(ids), 0);
+        expect(t, "reaporigin from a marked process", istr(a, len), "1");
+        expect(t, "reaporigin, nothing else",
+               istr(a, mine[1] || mine[3] || mine[5]), "0");
+        // Without any id or responsibility, nothing at all
+        u8 none[countof(procs)] = {};
+        reaporigin(procs, n, none, ids, 0, countof(ids), 0);
+        b32 any = 0;
+        for (iz i = 0; i < n; i++) {
+            any |= none[i];
+        }
+        expect(t, "reaporigin of nothing", istr(a, any), "0");
+    }
+
     // /proc/PID/stat lines
     {
         Str tail = " 0 -1 4194304 92 0 0 0 0 0 0 0 20 0 1 0 123456 5582848 192 "

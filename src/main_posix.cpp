@@ -33,8 +33,10 @@
 #include <time.h>
 #include <unistd.h>
 #ifdef __APPLE__
+#  include <dlfcn.h>       // dlsym, for the responsibility functions
 #  include <libproc.h>     // proc_listpids, proc_pidinfo
-#  include <sys/sysctl.h>  // KERN_PROC_SESSION
+#  include <sys/event.h>   // EVFILT_PROC
+#  include <sys/sysctl.h>  // KERN_PROC_UID
 #endif
 #ifdef __linux__
 #  include <sys/prctl.h>   // PR_SET_CHILD_SUBREAPER
@@ -57,11 +59,39 @@ extern "C" int _NSGetExecutablePath(char *, u32 *);
 
 extern char **environ;
 
+// macOS: responsibility (reap.cpp), private but long stable, in
+// libquarantine, which every process loads with libSystem: LLDB and
+// Chromium use it the same way. Looked up at run time, and any missing
+// means none of it. Null elsewhere.
+struct Resp {
+    i32 (*pidfor)(i32);                         // its responsible's pid
+    u64 (*uniqfor)(i32);                        // its responsible's unique id
+    i32 (*disclaim)(posix_spawnattr_t *, i32);  // spawn as its own
+};
+
+static Resp respspi()
+{
+    Resp r = {};
+    #ifdef __APPLE__
+    void *pidfor   = dlsym(RTLD_DEFAULT, "responsibility_get_pid_responsible_for_pid");
+    void *uniqfor  = dlsym(RTLD_DEFAULT, "responsibility_get_uniqueid_responsible_for_pid");
+    void *disclaim = dlsym(RTLD_DEFAULT, "responsibility_spawnattrs_setdisclaim");
+    if (pidfor && uniqfor && disclaim) {
+        r.pidfor   = (i32 (*)(i32))pidfor;
+        r.uniqfor  = (u64 (*)(i32))uniqfor;
+        r.disclaim = (i32 (*)(posix_spawnattr_t *, i32))disclaim;
+    }
+    #endif
+    return r;
+}
+
 struct Os {
-    i32   lifer;  // lifeline read end: every reaper's fd 3
-    i32   lifew;  // its write end, held open until this process dies
-    char *exe;    // this executable, for starting reapers
-    void *gui;    // GUI builds: the window's platform state (gui_sdl.cpp)
+    i32   lifer;     // lifeline read end: every reaper's fd 3
+    i32   lifew;     // its write end, held open until this process dies
+    char *exe;       // this executable, for starting reapers
+    void *gui;       // GUI builds: the window's platform state (gui_sdl.cpp)
+    Resp  resp;      // macOS: responsibility, if there
+    b32   disclaim;  // macOS: spawn reapers disclaimed (reapdisclaim)
 };
 
 enum : iz {
@@ -838,10 +868,19 @@ static Str os_lasterr(Os *, Arena *a)
 // covers the processes that left the group (setsid, setpgid). On Linux
 // the reaper is a child subreaper, so such escapees become its children
 // once their parents die, and the sweep finds the whole tree through
-// /proc. On macOS it records the tool's descendants every 250 ms, pid
-// and start time, and the sweep kills those still alive as recorded,
-// with whatever is left in its session: an escapee whose parent dies
-// within one interval of its leaving can still get away.
+// /proc. On macOS it records the tool's descendants, pid, start time
+// and unique id, every 250 ms and as soon as one it watches forks
+// (EVFILT_PROC), and the sweep kills those still alive as recorded,
+// whatever is left in its session, and what a scan of every process
+// finds by origin (reaporigin): orphans of the processes recorded,
+// which keep their parents' unique ids, and when the reaper was spawned
+// disclaimed, as "harness --reap-disclaimed", whatever it answers for
+// as the responsible process of the tool's tree. A reaper is disclaimed
+// only when the harness answers for itself, as an app does, so that no
+// tool loses the privacy grants it would have had (reap.cpp). What
+// still gets away: a process that disclaims itself, one that launchd
+// starts for the tool (XPC, open), and without responsibility, an
+// orphan whose parents were all gone before the reaper saw them.
 //
 // Each Proc has a reader thread, pumping output into the file, and a
 // waiter thread, reading the status and then reaping the reaper. Both
@@ -1207,7 +1246,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     iz     argc = 3 + sp->argv.len;
     char **argv = alloc<char *>(&scratch, argc+1);
     argv[0] = os->exe;
-    argv[1] = (char *)"--reap";
+    argv[1] = os->disclaim ? (char *)"--reap-disclaimed" : (char *)"--reap";
     argv[2] = cstr(&scratch, sp->cwd);
     for (iz i = 0; i < sp->argv.len; i++) {
         argv[3+i] = cstr(&scratch, sp->argv[i]);
@@ -1230,6 +1269,9 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
     #endif
     childsignals(&attr, flags, 0);
+    if (os->disclaim) {
+        os->resp.disclaim(&attr, 1);
+    }
     pid_t pid = 0;
     i32   err = fd0<0 || out[1]<0 || fd2<0 || st[1]<0 ? EMFILE :
                 posix_spawn(&pid, os->exe, &fa, &attr, argv, envp);
@@ -1423,6 +1465,7 @@ static void reapstatus(i32 code, i32 sig)
 enum : iz {
     REAP_PROCS = 1<<15,  // processes on the system, as much as is looked at
     REAP_SEEN  = 1<<12,  // descendants recorded (macOS)
+    REAP_IDS   = 1<<14,  // unique ids of the tool's processes kept (macOS)
 };
 
 struct Reaper {
@@ -1432,6 +1475,12 @@ struct Reaper {
     b32      reported;  // the tool's status went out on fd 4
     ReapProc seen[REAP_SEEN];
     iz       nseen;
+    // macOS
+    Resp     spi;
+    u64      resp;           // the responsible id to sweep for, or 0 (reaprespid)
+    i32      kq;             // the forks of what is recorded, or -1
+    u64      ids[REAP_IDS];  // the tool's processes', alive or gone (reapaddid)
+    iz       nids;
 };
 
 static void reapnap(i64 ms)
@@ -1594,8 +1643,23 @@ static iz reapsignal(Reaper *r, i32 sig)
 }
 
 static void reapsnapshot(Reaper *) {}
+static void reapforks(Reaper *) {}
 
 #elif defined(__APPLE__)
+// proc_pidinfo's PROC_PIDUNIQIDENTIFIERINFO, from xnu's
+// proc_info_private.h, which the SDK leaves out
+enum : i32 { PIDUNIQINFO = 17 };
+
+struct UniqInfo {
+    u8  uuid[16];
+    u64 uniq;         // p_uniqueid
+    u64 puniq;        // p_puniqueid, of the parent that forked it
+    i32 idversion;
+    i32 origversion;  // p_orig_ppidversion
+    u64 reserved[2];
+};
+static_assert(sizeof(UniqInfo) == 56);
+
 // Start time in microseconds of a live process, or 0 if gone, a zombie,
 // or not to be seen.
 static i64 reapstart(i32 pid)
@@ -1608,6 +1672,30 @@ static i64 reapstart(i32 pid)
     return (i64)bi.pbi_start_tvsec*1000000 + (i64)bi.pbi_start_tvusec;
 }
 
+// A live process, its parent, group, start time and unique ids (reap.cpp),
+// and with resp its responsible process's, or a zero pid if gone, a
+// zombie, or not to be seen.
+static ReapProc reapinfo(Reaper *r, i32 pid, b32 resp)
+{
+    ReapProc            p  = {};
+    struct proc_bsdinfo bi = {};
+    UniqInfo            u  = {};
+    if (!signalable(pid) ||
+            proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, PROC_PIDTBSDINFO_SIZE) !=
+                PROC_PIDTBSDINFO_SIZE || bi.pbi_status==SZOMB ||
+            proc_pidinfo(pid, PIDUNIQINFO, 0, &u, sizeof(u)) != (i32)sizeof(u)) {
+        return p;
+    }
+    p.pid   = pid;
+    p.ppid  = (i32)bi.pbi_ppid;
+    p.pgrp  = (i32)bi.pbi_pgid;
+    p.start = (i64)bi.pbi_start_tvsec*1000000 + (i64)bi.pbi_start_tvusec;
+    p.uniq  = u.uniq;
+    p.puniq = u.puniq;
+    p.resp  = resp ? r->spi.uniqfor(pid) : 0;
+    return p;
+}
+
 static b32 reapknown(Reaper *r, i32 pid)
 {
     for (iz i = 0; i < r->nseen; i++) {
@@ -1618,14 +1706,46 @@ static b32 reapknown(Reaper *r, i32 pid)
     return 0;
 }
 
-// Record the descendants of the reaper and of every descendant seen
-// before, which may have left for launchd, by pid and start time. Those
-// gone since are forgotten first, so that the table holds only the live
-// (a dead parent's later children cannot be found through it anyway),
-// and a pid used again is recorded again.
-static void reapsnapshot(Reaper *r)
+// Watch a process recorded for its forks, to list its children at once,
+// before a short-lived one can fork in turn and be gone unseen, as the
+// middle of a double fork is. A watch ends with its process.
+static void reapwatch(Reaper *r, i32 pid)
+{
+    struct kevent ev = {};
+    EV_SET(&ev, (uz)pid, EVFILT_PROC, EV_ADD, NOTE_FORK, 0, 0);
+    if (r->kq >= 0) {
+        kevent(r->kq, &ev, 1, 0, 0, 0);  // fails for one gone already
+    }
+}
+
+// Record the children of a process that are not recorded yet, with
+// their ids among the tool's, and watch them.
+static void reaplist(Reaper *r, i32 parent)
 {
     static i32 kids[4096];
+    i32 bytes = proc_listpids(PROC_PPID_ONLY, (u32)parent, kids, sizeof(kids));
+    for (iz i = 0; i < bytes/(iz)sizeof(i32); i++) {
+        i32 pid = kids[i];
+        if (!signalable(pid) || reapknown(r, pid) || r->nseen==REAP_SEEN) {
+            continue;
+        }
+        ReapProc p = reapinfo(r, pid, 0);
+        if (p.pid) {
+            r->seen[r->nseen++] = p;
+            r->nids = reapaddid(r->ids, r->nids, REAP_IDS, p.uniq);
+            reapwatch(r, pid);
+        }
+    }
+}
+
+// Record the descendants of the reaper and of every descendant seen
+// before, which may have left for launchd, by pid, start time and
+// unique id. Those gone since are forgotten first, so that the table
+// holds only the live (a dead parent's later children cannot be found
+// through it anyway), and a pid used again is recorded again, but their
+// ids stay among the tool's, for their orphans.
+static void reapsnapshot(Reaper *r)
+{
     iz live = 0;
     for (iz i = 0; i < r->nseen; i++) {
         ReapProc *p = &r->seen[i];
@@ -1634,31 +1754,42 @@ static void reapsnapshot(Reaper *r)
         }
     }
     r->nseen = live;
-    for (iz at = -1; at < r->nseen; at++) {
-        i32 parent = at<0 ? r->self : r->seen[at].pid;
-        i32 bytes  = proc_listpids(PROC_PPID_ONLY, (u32)parent, kids, sizeof(kids));
-        for (iz i = 0; i < bytes/(iz)sizeof(i32); i++) {
-            i32 pid = kids[i];
-            if (!signalable(pid) || reapknown(r, pid) || r->nseen==REAP_SEEN) {
-                continue;
+    reaplist(r, r->self);
+    for (iz at = 0; at < r->nseen; at++) {
+        reaplist(r, r->seen[at].pid);
+    }
+}
+
+// The forks of the processes watched (reapwatch): list the children of
+// each that forked, and theirs in turn, as they are found.
+static void reapforks(Reaper *r)
+{
+    struct kevent   evs[64];
+    struct timespec now = {};
+    for (;;) {
+        i32 n = kevent(r->kq, 0, 0, evs, (i32)countof(evs), &now);
+        for (i32 i = 0; i < n; i++) {
+            if (evs[i].fflags & NOTE_FORK) {
+                iz at = r->nseen;
+                reaplist(r, (i32)evs[i].ident);
+                for (; at < r->nseen; at++) {
+                    reaplist(r, r->seen[at].pid);
+                }
             }
-            i64 start = reapstart(pid);
-            if (start) {
-                ReapProc p = {};
-                p.pid   = pid;
-                p.ppid  = parent;
-                p.start = start;
-                r->seen[r->nseen++] = p;
-            }
+        }
+        if (n < countof(evs)) {
+            return;
         }
     }
 }
 
-// Signal what came from the tool: the descendants recorded, and what is
-// left in the reaper's session, if it leads one, each only while its
-// start time is still the one recorded, or listed. The session's are
-// found among this user's processes by getsid, since the kernel has no
-// KERN_PROC_SESSION to ask (ENOENT), and only descendants can be in it.
+// Signal what came from the tool: the descendants recorded; what a scan
+// of every process finds of the tool's by origin (reaporigin), recorded
+// in turn; and what is left in the reaper's session, if it leads one.
+// Each only while its start time is still the one recorded, or listed.
+// The session's are found among this user's processes by getsid, since
+// the kernel has no KERN_PROC_SESSION to ask (ENOENT), and only
+// descendants can be in it.
 static iz reapsignal(Reaper *r, i32 sig)
 {
     reapsnapshot(r);
@@ -1671,6 +1802,35 @@ static iz reapsignal(Reaper *r, i32 sig)
             count++;
         } else {
             p->start = 0;  // gone for good
+        }
+    }
+
+    static i32      pids[REAP_PROCS];
+    static ReapProc procs[REAP_PROCS];
+    static u8       mine[REAP_PROCS];
+    i32 total = proc_listallpids(pids, (i32)sizeof(pids));
+    iz  n     = 0;
+    for (i32 i = 0; i < total; i++) {
+        if (pids[i]==r->self || reapknown(r, pids[i])) {
+            continue;  // signaled above, if anything
+        }
+        ReapProc p = reapinfo(r, pids[i], r->resp!=0);
+        if (p.pid) {
+            mine[n]    = 0;
+            procs[n++] = p;
+        }
+    }
+    r->nids = reaporigin(procs, n, mine, r->ids, r->nids, REAP_IDS, r->resp);
+    for (iz i = 0; i < n; i++) {
+        ReapProc *p = &procs[i];
+        if (mine[i] && reapmine(p, r->self, r->group, 1) &&
+                reapstart(p->pid)==p->start) {
+            sendsignal(p->pid, sig, 0);
+            count++;
+            if (r->nseen < REAP_SEEN) {
+                r->seen[r->nseen++] = *p;
+                reapwatch(r, p->pid);
+            }
         }
     }
 
@@ -1706,6 +1866,7 @@ static iz reapsignal(Reaper *r, i32 sig)
 
 #else
 static void reapsnapshot(Reaper *) {}
+static void reapforks(Reaper *) {}
 static iz   reapsignal(Reaper *, i32) { return 0; }
 #endif
 
@@ -1784,6 +1945,21 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
         _exit(2);
     }
 
+    // macOS: the ids of the tool's processes start from the reaper's
+    // own, and the sweep looks for what answers to it, if it was spawned
+    // disclaimed (--reap-disclaimed) and that took (reaprespid)
+    r.kq = -1;
+    #ifdef __APPLE__
+    if (!__builtin_strcmp(argv[1], "--reap-disclaimed")) {
+        r.spi = respspi();
+    }
+    u64 uniq = reapinfo(&r, r.self, 0).uniq;
+    i32 resp = r.spi.pidfor ? r.spi.pidfor(r.self) : 0;
+    r.resp = reaprespid(r.spi.pidfor!=0, r.self, resp, uniq);
+    r.nids = reapaddid(r.ids, r.nids, REAP_IDS, uniq);
+    r.kq   = kqueue();
+    #endif
+
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawnattr_t attr;
@@ -1812,22 +1988,35 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
     dup2(null, 2);
 
     r.tool = pid;
+    reapsnapshot(&r);  // the tool, watched from now on
     #ifdef __APPLE__
-    i32 every = 250;  // ms between snapshots of the tree
+    i64 every = 250000;  // µs between snapshots of the tree
     #else
-    i32 every = -1;
+    i64 every = -1;
     #endif
+    i64 due = monotonic() + every;
     for (;;) {
-        struct pollfd fds[2] = {};
+        struct pollfd fds[3] = {};
         fds[0].fd     = 3;
         fds[0].events = POLLIN;
         fds[1].fd     = chld[0];
         fds[1].events = POLLIN;
-        i32 n = poll(fds, 2, every);
+        fds[2].fd     = r.kq;  // ignored if -1
+        fds[2].events = POLLIN;
+        i32 ms = -1;
+        if (every > 0) {
+            i64 left = due - monotonic();
+            ms = left>0 ? (i32)((left + 999)/1000) : 0;
+        }
+        i32 n = poll(fds, 3, ms);
         u8  drain[64];
         while (read(chld[0], drain, sizeof(drain)) > 0) {}
         reapchildren(&r);
-        reapsnapshot(&r);
+        reapforks(&r);
+        if (every>0 && monotonic()>=due) {
+            reapsnapshot(&r);
+            due = monotonic() + every;
+        }
         if (reapasked) {
             reapsweep(&r);
         }
@@ -2337,6 +2526,11 @@ static i32 os_pid(Os *)
     return (i32)getpid();
 }
 
+static i32 os_responsible(Os *os, i32 pid)
+{
+    return os->resp.pidfor && signalable(pid) ? os->resp.pidfor(pid) : 0;
+}
+
 // Two forks with a new session between them, so that the program is
 // nobody's child here, and outside this terminal's session and process
 // group. The children do only what is safe after a fork in a process
@@ -2629,7 +2823,8 @@ static void os_httpfree(Os *, Http *h)
 
 int main(int argc, char **argv)
 {
-    if (argc>1 && !__builtin_strcmp(argv[1], "--reap")) {
+    if (argc>1 && (!__builtin_strcmp(argv[1], "--reap") ||
+                   !__builtin_strcmp(argv[1], "--reap-disclaimed"))) {
         reap(argc, argv);
     }
 
@@ -2647,6 +2842,11 @@ int main(int argc, char **argv)
     }
     os.lifer = life[0];
     os.lifew = life[1];
+
+    // macOS: disclaimed reapers only for a harness that answers for
+    // itself, decided once, for every tool alike (reap.cpp)
+    os.resp     = respspi();
+    os.disclaim = os.resp.pidfor && reapdisclaim(getpid(), os.resp.pidfor(getpid()));
 
     iz      cap = sizeof(void *)==8 ? (iz)1<<34 : (iz)1<<28;
     Region *r   = os_reserve(&os, cap);
