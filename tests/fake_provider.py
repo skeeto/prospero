@@ -490,6 +490,23 @@ def sc_todo(model, n, req):
         yield from answer(model, "All done.")
 
 
+def sc_todo_job(model, n, req):
+    # Waiting for a job with items left: no nudge, since the job's end
+    # brings the agent back
+    if n == 0:
+        yield from tool(model, n, "todo_write",
+                        {"todos": [{"content": "run it", "status": "in_progress"}]})
+    elif n == 1:
+        yield from tool(model, n, "shell", {"command": "sleep 1", "background": True})
+    elif n == 2:
+        yield from answer(model, "Waiting for the job.")
+    elif n == 3:
+        yield from tool(model, n, "todo_write",
+                        {"todos": [{"content": "run it", "status": "done"}]})
+    else:
+        yield from answer(model, "It ran.")
+
+
 def sc_todo_cap(model, n, req):
     # Never finishing the list: three nudges, then the turn ends anyway
     if n == 0:

@@ -337,58 +337,61 @@ static RxNode *rxatom(RxParser *p)
     return n;
 }
 
+struct RxCount {
+    i32 min;
+    i32 max;  // -1 for no limit
+    b32 ok;
+};
+
 // A {n}, {n,} or {n,m} quantifier at p->i, consumed if valid.
-static b32 rxcount(RxParser *p, i32 *min, i32 *max)
+static RxCount rxcount(RxParser *p)
 {
-    Str s = p->s;
-    iz  i = p->i + 1;
-    i64 n = 0, m = 0;
-    iz  start = i;
+    RxCount r = {};
+    Str     s = p->s;
+    iz      i = p->i + 1;
+    i64     n = 0;
+    i64     m = 0;
+    iz      start = i;
     for (; i<s.len && digit(s[i]) && n<=RX_REPMAX; i++) n = n*10 + s[i]-'0';
-    if (i == start) return 0;
+    if (i == start) return r;
     m = n;
     if (i<s.len && s[i]==',') {
-        i++;
-        iz mstart = i;
+        iz mstart = ++i;
         m = 0;
         for (; i<s.len && digit(s[i]) && m<=RX_REPMAX; i++) m = m*10 + s[i]-'0';
         if (i == mstart) m = -1;
     }
-    if (i>=s.len || s[i]!='}') return 0;
-    if (n>RX_REPMAX || m>RX_REPMAX) {
+    if (i>=s.len || s[i]!='}') {
+        return r;
+    } else if (n>RX_REPMAX || m>RX_REPMAX) {
         rxerror(p, "a repetition count is over 1000");
-        return 0;
-    }
-    if (m>=0 && m<n) {
+        return r;
+    } else if (m>=0 && m<n) {
         rxerror(p, "in {n,m}, m is less than n");
-        return 0;
+        return r;
     }
-    p->i = i + 1;
-    *min = (i32)n;
-    *max = (i32)m;
-    return 1;
+    p->i  = i + 1;
+    r.min = (i32)n;
+    r.max = (i32)m;
+    r.ok  = 1;
+    return r;
 }
 
 static RxNode *rxrep(RxParser *p)
 {
     RxNode *n = rxatom(p);
     while (n && p->i<p->s.len) {
-        u8  c   = p->s[p->i];
-        i32 min = 0, max = 0;
-        if (c == '*') {
-            min = 0, max = -1;
-            p->i++;
-        } else if (c == '+') {
-            min = 1, max = -1;
-            p->i++;
-        } else if (c == '?') {
-            min = 0, max = 1;
-            p->i++;
-        } else if (c!='{' || !rxcount(p, &min, &max)) {
-            break;
+        RxCount k = {};
+        switch (p->s[p->i]) {
+        case '*': k = {0, -1, 1}; p->i++; break;
+        case '+': k = {1, -1, 1}; p->i++; break;
+        case '?': k = {0,  1, 1}; p->i++; break;
+        case '{': k = rxcount(p);         break;
         }
-        if (n->kind==RXN_BOL || n->kind==RXN_EOL || n->kind==RXN_WORD ||
-                n->kind==RXN_NWORD) {
+        if (!k.ok) {
+            break;
+        } else if (n->kind==RXN_BOL || n->kind==RXN_EOL || n->kind==RXN_WORD ||
+                   n->kind==RXN_NWORD) {
             rxerror(p, "an anchor cannot be repeated");
             return 0;
         }
@@ -396,8 +399,8 @@ static RxNode *rxrep(RxParser *p)
             p->i++;  // lazy and possessive forms match the same lines
         }
         RxNode *r = rxnode(p, RXN_REP, n, 0);
-        r->min = min;
-        r->max = max;
+        r->min = k.min;
+        r->max = k.max;
         n = r;
     }
     return n;

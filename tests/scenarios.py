@@ -1153,6 +1153,18 @@ def todo(t):
 
 
 @scenario(bound=10)
+def todo_job(t):
+    """Ending a turn to wait for a background job is not nudged about
+    the todo list: the job's end starts the next turn."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(not r.all("nudge"), f"no nudges: {r.all('nudge')}")
+    turns = r.all("turn")
+    t.check(len(turns) == 2 and turns[1].get("via") == "job", f"turns {turns}")
+    t.check(r.text().endswith("It ran."), f"text {r.text()!r}")
+
+
+@scenario(bound=10)
 def todo_cap(t):
     """Never finishing the list: three nudges, then the turn ends."""
     r = t.run()

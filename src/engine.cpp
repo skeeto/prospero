@@ -2213,8 +2213,8 @@ static void tooljobout(Session *s, Arena scratch, Args *args)
     print(&b, " bytes of output in ");
     print(&b, j->rel);
     if (!jl.count) {
-        print(&b, jl.before ? Str(": nothing at that line, past the end.")
-                            : Str(": no output yet."));
+        print(&b, jl.before ? Str(": nothing at that line, past the end.\n")
+                            : Str(": no output yet.\n"));
     } else if (mode == JOBLINES_TAIL) {
         print(&b, jl.before ? Str(", its last lines:\n") : Str(", all of it:\n"));
     } else {
@@ -2445,11 +2445,12 @@ static void tooltodo(Session *s, Arena scratch, Args *args)
 }
 
 // At the end of a turn: items left undone are a reason to go on. Returns
-// 1 if the agent was nudged, and the next step began.
+// 1 if the agent was nudged, and the next step began. An agent waiting
+// for a background job is not: the job's end brings it back.
 static b32 todonudge(Session *s, Arena scratch)
 {
     Str left = todoleft(&scratch, s->todos);
-    if (!left.data) {
+    if (!left.data || (jobsrunning(s) && canresume(s))) {
         return 0;
     }
     Buf b(&scratch, 256 + left.len);

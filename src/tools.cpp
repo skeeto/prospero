@@ -283,7 +283,8 @@ static Str tooljson(Arena *a, ToolEnv *te)
             "item in_progress when you start it, keeping only one so, and "
             "done as soon as it is. Remove items that no longer apply. If "
             "you end your turn with items not done, you are reminded of "
-            "them. Skip the list for simple tasks.",
+            "them, unless a background job is still running: then you are "
+            "told when it ends. Skip the list for simple tasks.",
             {
                 {"todos", "array", "The complete list, in order", 1, todoitem},
             },
