@@ -131,6 +131,8 @@ enum : i32 {
     RECT_CLOSESTOP,
     RECT_CLOSECANCEL,
     RECT_OTHERSESS,
+    RECT_ADDNAME,
+    RECT_ADDBTN,
     RECT_COUNT,
 };
 
@@ -414,6 +416,7 @@ struct Gui {
     b32                ambershown;   // the strip went amber
     b32                retryshown;   // the strip counted down to a retry
     b32                bannershown;  // the read-only banner was drawn
+    b32                roclock;      // a read-only view's turn had a clock
     i32                drivewait;    // W_* condition it waits for
     i64                holduntil;    // µs: the inbox is left alone until
     b32                held;         // a wake came during the hold
@@ -2393,6 +2396,8 @@ enum : i32 {
     T_OTHERSESS,   // the first session in the sidebar not shown
     T_TOPTEXT,     // near the transcript's top edge
     T_SESSTITLE,   // the sidebar's session whose title starts with text
+    T_ADDNAME,     // the new endpoint's name field
+    T_ADDBTN,      // "Add endpoint"
 };
 
 enum : i32 {
@@ -2446,6 +2451,8 @@ enum : i32 {
     CHK_AMBER,
     CHK_RETRYSHOWN,
     CHK_DIAGS,
+    CHK_ADDEXISTS,
+    CHK_ROQUIET,
     CHK_COUNT,
 };
 
@@ -2477,6 +2484,8 @@ static Str chknames[] = {
     "a session held elsewhere opened read-only, with its banner",
     "amber after 15 s without data", "a retry's countdown shown",
     "configuration diagnostics listed with file and line",
+    "adding a section that exists changed nothing",
+    "a read-only session's turn runs elsewhere, with no clock here",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -2679,6 +2688,8 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
     {OP_CHECK, CHK_READONLY, 0, 0, 0, ""},
+    {OP_MARK, 0, 0, 0, 2500, ""},
+    {OP_CHECK, CHK_ROQUIET, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "0-readonly"},
     {OP_MAIN, 0, 0, 0, 500, ""},
     // Dragging the dock splitter
@@ -2866,6 +2877,18 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
     {OP_CHECK, CHK_SETTING, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "4-settings"},
+    // Adding a section that exists leaves it alone (the file keeps its
+    // one-line diff, which tests/gui.py checks). Its row is further down.
+    {OP_MOVE, T_SETTING, 0, 0, 100, ""},
+    {OP_WHEEL, 0, 0, -3, 500, ""},
+    {OP_MOVE, T_ADDNAME, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "fake"},
+    {OP_MOVE, T_ADDBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_ADDEXISTS, 0, 0, 0, ""},
     // Typing, then idle for 15 s: the caret blinks for 10 s, then stops
     {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -3080,6 +3103,8 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_ALLOW:       return rectcenter(g->rects[RECT_ALLOW]);
     case T_DENY:        return rectcenter(g->rects[RECT_DENY]);
     case T_SETTING:     return rectcenter(g->rects[RECT_SETTING]);
+    case T_ADDNAME:     return rectcenter(g->rects[RECT_ADDNAME]);
+    case T_ADDBTN:      return rectcenter(g->rects[RECT_ADDBTN]);
     case T_CLOSESTOP:   return rectcenter(g->rects[RECT_CLOSESTOP]);
     case T_CLOSECANCEL: return rectcenter(g->rects[RECT_CLOSECANCEL]);
     case T_OTHERSESS:   return rectcenter(g->rects[RECT_OTHERSESS]);
@@ -3473,6 +3498,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->ambershown;
     case CHK_RETRYSHOWN:
         return g->retryshown;
+    case CHK_ADDEXISTS:
+        return find(g->cfgstatus, "already exists")>=0 && !g->cfgset;
+    case CHK_ROQUIET:
+        return g->sess && g->sess->readonly && v->busy && !g->roclock;
     case CHK_DIAGS: {
         Json *d = jsonget(g->cfg, "diags")->child;
         return d && jsonstr(jsonget(d, "file")).len && jsonint(jsonget(d, "line"), 0)>0 &&

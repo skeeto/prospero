@@ -1047,6 +1047,7 @@ static void drawstrip(Gui *g)
         ImGui::TextDisabled("in another process, as of its log when opened");
     } else if (v->busy && v->turnts) {
         // The turn's clock, once a second
+        g->roclock |= g->sess->readonly;
         i64 el = nowms - v->turnts;
         el = el<0 ? 0 : el;
         schedat(&g->sched, now + (1000 - el%1000)*1000 + 1000, DUE_CLOCK);
@@ -1543,11 +1544,18 @@ static void drawsettings(Gui *g)
             // A new section: named, with its first key set
             ImGui::SetNextItemWidth(160*g->scale);
             ImGui::InputTextWithHint("##add", "name", g->addname, FIELD_MAX);
+            if (kind == "endpoint") {
+                itemrect(g, RECT_ADDNAME);
+            }
             ImGui::SameLine();
             Buf ab(&a, 64);
             print(&ab, "Add ");
             print(&ab, kind);
-            if (ImGui::Button(cstr0(&a, finish(&ab)))) {
+            b32 add = ImGui::Button(cstr0(&a, finish(&ab)));
+            if (kind == "endpoint") {
+                itemrect(g, RECT_ADDBTN);
+            }
+            if (add) {
                 Str name = trim({(u8 *)g->addname, (iz)__builtin_strlen(g->addname)});
                 Str key  = kind=="endpoint" ? Str("url") :
                            kind=="model"    ? Str("reasoning") : Str("tools");

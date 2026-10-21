@@ -252,14 +252,15 @@ class Local:
     def alive(self, pid):
         return alive(pid)
 
-    def run(self, guiargs, timeout):
-        """Run the GUI, echoing its log. Returns (status, lines)."""
+    def run(self, guiargs, timeout, cwd=None):
+        """Run the GUI, echoing its log, in cwd (default the working
+        directory). Returns (status, lines)."""
         cmd = [self.harness, "gui"] + guiargs
         if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
                 and not os.environ.get("WAYLAND_DISPLAY"):
             cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
         print(" ".join(cmd), flush=True)
-        p = subprocess.Popen(cmd, cwd=self.path("work"), stdin=subprocess.DEVNULL,
+        p = subprocess.Popen(cmd, cwd=cwd or self.path("work"), stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, start_new_session=True)
         lines = []
@@ -350,7 +351,7 @@ class Remote:
     def alive(self, pid):
         return self.h.alive(pid)
 
-    def run(self, guiargs, timeout):
+    def run(self, guiargs, timeout, cwd=None):
         win = lambda p: p.replace("/", "\\")
         q = lambda a: '"' + win(a) + '"' if "/" in a or " " in a else a
         bat = ("@echo off\r\ncd /d \"%~dp0\"\r\n" +
@@ -438,9 +439,10 @@ class Remote:
 
 def makesessions(host, ini, state, work):
     """Two sessions for the GUI to find: "Say hello." run and closed, and
-    "Hold me" held open by a headless engine, which is returned. The
-    second's record of 5 MiB is too big for any mailbox, the holder's
-    own too, so its turn's end may show only in its log."""
+    "Hold me" held open by a headless engine, which is returned, its
+    turn running a command until the holder quits. Its record of 5 MiB
+    is too big for any mailbox, the holder's own too, so the command's
+    start may show only in its log."""
     p = host.popen(["run", "-C", work, "-c", ini, "--state", state, "Say hello."])
     p.communicate(timeout=60)
     holder = host.popen(["--headless", "--state", state, "-c", ini], stdin=True)
@@ -451,12 +453,12 @@ def makesessions(host, ini, state, work):
     for line in holder.stdout:
         if sid is None and '"ev":"reply"' in line:
             sid = json.loads(line).get("sid")
-        if '"ev":"turn.end"' in line:
+        if '"ev":"tool.start"' in line:
             break
         if '"ev":"overflow"' in line and sid:
             log = host.path("state", "sessions", sid, "events.jsonl")
             deadline = time.monotonic() + 60
-            while time.monotonic() < deadline and '"ev":"turn.end"' not in (host.read(log) or ""):
+            while time.monotonic() < deadline and '"ev":"tool.start"' not in (host.read(log) or ""):
                 time.sleep(0.5)
             break
     # Its output must keep flowing, or it would block writing it
@@ -548,8 +550,15 @@ def main():
     if args.mode == "drive":
         holder = host.sessions(ini, state, work)
 
-    guiargs = [f"--{args.mode}", "-c", ini, "--statedir", state, "--cwd", work,
-               "--inbox-cap", str(args.inbox_cap)]
+    paths = [ini, state, work]
+    guicwd = None
+    if args.mode == "drive" and not args.host:
+        # Relative to the GUI's directory, which the engine process (in
+        # the state directory) does not share
+        guicwd = host.root
+        paths = [os.path.relpath(p, guicwd) for p in paths]
+    guiargs = [f"--{args.mode}", "-c", paths[0], "--statedir", paths[1],
+               "--cwd", paths[2], "--inbox-cap", str(args.inbox_cap)]
     if args.subprocess:
         guiargs.append("--engine=subprocess")
     if args.trace:
@@ -559,7 +568,7 @@ def main():
         guiargs += ["--shots", os.path.abspath(args.shots)]
 
     t0 = time.monotonic()
-    status, lines = host.run(guiargs, args.timeout)
+    status, lines = host.run(guiargs, args.timeout, guicwd)
     dt = time.monotonic() - t0
 
     problems = []

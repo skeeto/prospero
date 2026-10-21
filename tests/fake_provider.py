@@ -667,16 +667,21 @@ def sc_gui(model, n, req):
         yield from finish(model)
     elif "Say hello" in prompt:
         yield from answer(model, "Hello!")
-    elif "Hold me" in prompt:
+    elif "Hold me" in prompt and step == 0:
         # Reasoning of 5 MiB, never repeating itself, collapsed once
         # committed: its record is too big for any mailbox on the way to
-        # the GUI, so opening the session overflows and resyncs
+        # the GUI, so opening the session overflows and resyncs. Then a
+        # command that runs until the holder quits, so that the GUI shows
+        # a turn running in another process.
         yield S.head()
         for i in range(50):
             part = "".join(f"r{i}x{j} " for j in range(12000))
             yield S.data(chunk(model, {"reasoning_content": part}))
         yield from text(model, "Holding.")
-        yield from finish(model)
+        yield from call(model, 0, f"call_{n}", "shell", {"command": "sleep 600"})
+        yield from finish(model, "tool_calls")
+    elif "Hold me" in prompt:
+        yield from answer(model, "Let go.")
     elif "Stall for" in prompt:
         # Nothing at all for 17 s: past the GUI's amber, short of the
         # first-byte watchdog its configuration sets
