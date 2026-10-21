@@ -56,8 +56,9 @@
 // In config.get, path is where edits go ("" if there is no location),
 // exists says whether that file was read, rev counts loads, and files
 // lists every file read, in load order. Settings list every schema key
-// of the top level and of [guard], and of each named [endpoint],
-// [model] and [role] section that exists, in schema order. A value is
+// of the top level and of the unnamed kinds ([guard], [tools] and
+// [instructions]), and of each named [endpoint], [model] and [role]
+// section that exists, in schema order. A value is
 // the one in effect as written, or its default ("default":1, with file
 // "" and line 0, or where the key is set empty); "valid":0 marks one
 // ignored for its default. An endpoint's timeouts default by whether
@@ -127,6 +128,8 @@ static CfgKind cfgkinds[] = {
     {"model",    1, "Settings for one model, named as its endpoint lists it"},
     {"role",     1, "Instructions, a model and tools for one kind of work"},
     {"guard",    0, "Where the file tools may go without asking"},
+    {"tools",    0, "Background jobs, stopping commands, and search"},
+    {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
 };
 
 struct CfgKey {
@@ -216,14 +219,34 @@ static CfgKey cfgschema[] = {
      "Endpoint for the role, by default the top-level one"},
     {"role", "model", CFG_STRING, "", {}, {}, "role",
      "Model for the role, by default the top-level one"},
-    {"role", "tools", CFG_LIST, "read write edit shell", {},
-     "read write edit shell", "role", "Tools the role may use"},
+    {"role", "tools", CFG_LIST,
+     "read write edit shell grep glob todo_write jobs job_output job_kill", {},
+     "read write edit shell grep glob todo_write jobs job_output job_kill",
+     "role", "Tools the role may use"},
 
     {"guard", "roots", CFG_PATHS, "", {}, {}, "guard",
      "More directories the file tools may use, separated by ;"},
     {"guard", "ask_timeout", CFG_SECONDS, "30", {}, {}, "guard",
      "Seconds to wait for an answer when a tool asks to leave the roots, "
      "then deny"},
+
+    {"tools", "job_timeout", CFG_SECONDS, "1800", {}, {}, "tools",
+     "Seconds a background job may run, unless the agent asks for less "
+     "or more"},
+    {"tools", "job_timeout_max", CFG_SECONDS, "7200", {}, {}, "tools",
+     "Most seconds the agent may ask for a background job to run"},
+    {"tools", "auto_resume", CFG_INT, "5", {}, {}, "tools",
+     "Turns a session may start by itself in an hour, to report background "
+     "jobs that ended while it was idle; 0 for none"},
+    {"tools", "stop_grace", CFG_SECONDS, "", {}, {}, "tools",
+     "Seconds between asking a command to stop (SIGTERM, or CTRL_BREAK on "
+     "Windows) and killing it (default: 2, or 3 on Windows)"},
+    {"tools", "use_rg", CFG_BOOL, "true", {}, {}, "tools",
+     "Search with ripgrep (rg on PATH) when found, else the built-in search"},
+
+    {"instructions", "files", CFG_STRING, "AGENTS.md CLAUDE.md", {}, {},
+     "instructions", "File names to load from each directory, the first "
+     "found in each, separated by blanks"},
 };
 
 // Value judgments
@@ -591,7 +614,8 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniLine *l)
     if (!k) {
         print(&b, "unknown section kind \"");
         print(&b, l->key);
-        print(&b, "\", expected endpoint, model, role or guard");
+        print(&b, "\", expected endpoint, model, role, guard, tools or "
+                  "instructions");
     } else if (unnamed) {
         print(&b, "a section needs a name, as in [");
         print(&b, l->key);

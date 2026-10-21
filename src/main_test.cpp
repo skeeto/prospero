@@ -151,6 +151,7 @@ static Dirent *os_list(Os *os, Arena *a, Str path)
         d->name  = clone(a, name);
         d->size  = f->data.len;
         d->isdir = f->isdir;
+        d->mtime = f->mtime;
         d->next  = head;
         head = d;
     }
@@ -418,6 +419,8 @@ static Str istr(Arena *a, i64 v)
 #include "test/guard_test.cpp"
 #include "test/admit_test.cpp"
 #include "test/compact_test.cpp"
+#include "test/search_test.cpp"
+#include "test/instructions_test.cpp"
 #include "test/engine_test.cpp"
 #include "test/config_test.cpp"
 #if HARNESS_GUI
@@ -452,6 +455,8 @@ int main()
     test_guard(&t);
     test_admit(&t);
     test_compact(&t);
+    test_search(&t);
+    test_instructions(&t);
     test_engine(&t);
     test_config(&t);
     #if HARNESS_GUI

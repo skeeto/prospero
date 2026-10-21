@@ -73,8 +73,9 @@ static void test_events(Test *t)
         }
         expect(t, "durable events", finish(&durable),
                "session title user turn attempt assistant tool.start "
-               "tool.end ask answer retry nudge turn.end note compact ");
-        expect(t, "synced events", finish(&sync), "tool.start ask answer turn.end ");
+               "tool.end ask answer retry nudge turn.end note compact job.start "
+               "job.end todo snap rewind instructions notice ");
+        expect(t, "synced events", finish(&sync), "tool.start ask answer turn.end rewind ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
         expect(t, "empty event", istr(a, evfind("")), istr(a, EV_NONE));
         for (i32 cmd = 1; cmd < CMD_COUNT; cmd++) {
@@ -552,7 +553,8 @@ static void test_events(Test *t)
         expect(t, "syncs", finish(&b),
                "session=0 title=0 user=0 turn=0 attempt=0 assistant=0 "
                "tool.start=1 tool.end=0 ask=1 answer=1 retry=0 nudge=0 "
-               "turn.end=1 note=0 compact=0 ");
+               "turn.end=1 note=0 compact=0 job.start=0 job.end=0 todo=0 snap=0 "
+               "rewind=1 instructions=0 notice=0 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";
@@ -571,6 +573,27 @@ static void test_events(Test *t)
         os->failsync = 0;
         log = logopen(os, a, scratch, "s13.jsonl", "s13", 1<<20);
         expect(t, "recovery sync fails redo", logshow(a, &log), "ok=1 seq=2 turn=0 torn=0 bad=0 synth=0");
+        logclose(&log);
+    }
+
+    // Background jobs open at a crash end as unknown, before the turn
+    {
+        Os *os = newos(a, 1<<20);
+        Str before =
+            "{\"sid\":\"s15\",\"seq\":1,\"ts\":0,\"ev\":\"session\",\"cwd\":\"/w\"}\n"
+            "{\"sid\":\"s15\",\"seq\":2,\"ts\":0,\"ev\":\"job.start\",\"job\":1,\"call\":\"a\"}\n"
+            "{\"sid\":\"s15\",\"seq\":3,\"ts\":0,\"ev\":\"job.start\",\"job\":2,\"call\":\"b\"}\n"
+            "{\"sid\":\"s15\",\"seq\":4,\"ts\":0,\"ev\":\"turn\",\"n\":1}\n"
+            "{\"sid\":\"s15\",\"seq\":5,\"ts\":0,\"ev\":\"job.end\",\"job\":1,\"call\":\"a\","
+            "\"status\":\"exited\"}\n";
+        os_write(os, scratch, "s15.jsonl", before);
+        EventLog log = logopen(os, a, scratch, "s15.jsonl", "s15", 1<<20);
+        expect(t, "jobs recovered", logshow(a, &log), "ok=1 seq=7 turn=1 torn=0 bad=0 synth=2");
+        expect(t, "jobs recovered log", vcontents(os, a, "s15.jsonl"), concat(a, before,
+            "{\"sid\":\"s15\",\"seq\":6,\"ts\":0,\"ev\":\"job.end\",\"job\":2,\"call\":\"b\","
+            "\"status\":\"unknown\",\"text\":\"the harness stopped while this job ran, "
+            "which stopped the job too\"}\n"
+            "{\"sid\":\"s15\",\"seq\":7,\"ts\":0,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"interrupted\"}\n"));
         logclose(&log);
     }
 }

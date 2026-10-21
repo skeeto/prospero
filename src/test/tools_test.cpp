@@ -111,6 +111,41 @@ static void test_tools(Test *t)
         expect(t, "shell default timeout", argsshow(a, TOOL_SHELL, "{\"command\":\"ls\"}"), "ls -1");
         expect(t, "shell clamped", argsshow(a, TOOL_SHELL, "{\"command\":\"ls\",\"timeout\":7200}"),
                "ls 600");
+        expect(t, "job timeout", argsshow(a, TOOL_SHELL, "{\"command\":\"ls\",\"timeout\":7200,"
+                                                          "\"background\":true}"), "ls 7200");
+        expect(t, "job clamped", argsshow(a, TOOL_SHELL, "{\"command\":\"ls\",\"timeout\":9999,"
+                                                          "\"background\":\"yes\"}"), "ls 7200");
+        expect(t, "grep pattern", argsshow(a, TOOL_GREP, "{\"pattern\":\"\"}"),
+               "pattern: must not be empty; ");
+        expect(t, "grep no pattern", argsshow(a, TOOL_GREP, "{\"path\":\"x\"}"),
+               "pattern: required string is missing; ");
+        {
+            Args g = parseargs(a, TOOL_GREP, "{\"pattern\":\"a\",\"path\":\"\","
+                                             "\"ignore_case\":1,\"literal\":\"true\"}");
+            expect(t, "grep args", istr(a, !g.issues.len && !g.path.data && g.ignorecase &&
+                                           g.literal), "1");
+        }
+        expect(t, "glob pattern", argsshow(a, TOOL_GLOB, "{\"pattern\":\" \"}"),
+               "pattern: must not be empty; ");
+        expect(t, "todo missing", argsshow(a, TOOL_TODO, "{}"), "todos: required array is missing; ");
+        expect(t, "todo not array", argsshow(a, TOOL_TODO, "{\"todos\":5}"),
+               "todos: must be an array of {content, status} objects; ");
+        expect(t, "todo bad items",
+               argsshow(a, TOOL_TODO, "{\"todos\":[{\"content\":\"\",\"status\":\"done\"},"
+                                      "{\"content\":\"x\",\"status\":\"later\"},7]}"),
+               "todos[0]: content must be a non-empty string; todos[1]: status must be "
+               "pending, in_progress or done; todos[2]: must be an object with content and "
+               "status; ");
+        {
+            Args d = parseargs(a, TOOL_TODO, "{\"todos\":\"[{\\\"content\\\":\\\"x\\\","
+                                             "\\\"status\\\":\\\"completed\\\"}]\"}");
+            expect(t, "todo as a string", istr(a, d.todos.len*10 + d.todos[0].status), "12");
+        }
+        expect(t, "job_output job", argsshow(a, TOOL_JOBOUT, "{\"from\":\"middle\",\"lines\":9999}"),
+               "job: a job number is required; lines: must be 1 to 2000; from: must be head "
+               "or tail; ");
+        expect(t, "job_kill job", argsshow(a, TOOL_JOBKILL, "{\"job\":\"x\"}"),
+               "job: must be an integer; job: a job number is required; ");
         expect(t, "shell zero rejected",
                istr(a, startswith(argsshow(a, TOOL_SHELL, "{\"command\":\"ls\",\"timeout\":0}"),
                                   "timeout: 0 is not allowed")), "1");
@@ -231,13 +266,107 @@ static void test_tools(Test *t)
         }
         expect(t, "env windows", istr(a, !gitdir && drive && utf8), "1");
 
-        ToolEnv te = {"C:\\bb\\busybox.exe", SHELL_BUSYBOX, 1};
+        ToolEnv te = {};
+        te.shell     = "C:\\bb\\busybox.exe";
+        te.shellkind = SHELL_BUSYBOX;
+        te.windows   = 1;
         ShellCmd c = shellcmd(a, &te, "ls -l");
         expect(t, "busybox argv", istr(a, c.argv.len==4 && c.argv[1]=="sh" && c.argv[3]=="ls -l"), "1");
-        te = {"C:\\Windows\\System32\\cmd.exe", SHELL_CMD, 1};
+        te.shell     = "C:\\Windows\\System32\\cmd.exe";
+        te.shellkind = SHELL_CMD;
         c = shellcmd(a, &te, "dir \"a b\" & echo %X%");
         expect(t, "cmd line", c.cmdline,
                "\"C:\\Windows\\System32\\cmd.exe\" /d /s /c \"dir \"a b\" & echo %X%\"");
         expect(t, "cmd description", istr(a, find(shelldesc(a, &te), "No POSIX shell")>0), "1");
+        te.jobtimeout = 90;
+        te.jobmax     = 3600;
+        Str desc = shelldesc(a, &te);
+        expect(t, "job limits described", istr(a, find(desc, "stopped after 90 seconds")>0 &&
+               find(desc, "at most 60 minutes")>0), "1");
+    }
+
+    // Tools JSON: byte-stable, and valid
+    {
+        ToolEnv te = {};
+        te.shell = "/bin/sh";
+        Str     j1 = tooljson(a, &te);
+        Str     j2 = tooljson(a, &te);
+        JsonDoc d  = jsonparse(a, j1);
+        expect(t, "tooljson stable", istr(a, j1 == j2), "1");
+        expect(t, "tooljson valid", istr(a, d.ok*100 + jsonlen(d.root)), istr(a, 100+TOOL_COUNT));
+        Json *todo = jsonget(jsonget(jsonat(d.root, TOOL_TODO), "function"), "parameters");
+        Json *item = jsonget(jsonget(jsonget(todo, "properties"), "todos"), "items");
+        expect(t, "todo schema", jsonstr(jsonget(item, "type")), "object");
+    }
+
+    // Todo lists
+    {
+        Slice<TodoItem> old = {}, now = {};
+        TodoItem x = {"write", TODO_ACTIVE}, y = {"test", TODO_PENDING};
+        old = push(a, old, x);
+        old = push(a, old, y);
+        expect(t, "todoshow", todoshow(a, old),
+               "Todo list, 0 of 2 done:\n[>] write (in progress)\n[ ] test\n");
+        expect(t, "todoleft", todoleft(a, old), "[>] write\n[ ] test\n");
+        expect(t, "todoshow empty", todoshow(a, now), "The todo list is empty now.");
+        expect(t, "todo same", istr(a, todoprogress(old, old)), "0");
+        x.status = TODO_DONE;
+        y.status = TODO_ACTIVE;
+        now = push(a, now, x);
+        now = push(a, now, y);
+        expect(t, "todo progress", istr(a, todoprogress(old, now)), "1");
+        expect(t, "todo left none", istr(a, !todoleft(a, Slice<TodoItem>{}).data), "1");
+        Slice<TodoItem> fewer = {};
+        fewer = push(a, fewer, old[0]);
+        expect(t, "todo fewer", istr(a, todoprogress(old, fewer)), "1");
+        Slice<TodoItem> swapped = {};
+        TodoItem z = {"test", TODO_ACTIVE}, w = {"write", TODO_PENDING};
+        swapped = push(a, swapped, w);
+        swapped = push(a, swapped, z);
+        expect(t, "todo new active", istr(a, todoprogress(old, swapped)), "1");
+    }
+
+    // Job output
+    {
+        Os *os = newos(a, 1<<20);
+        Buf b(a, 1024);
+        for (i32 i = 1; i <= 30; i++) {
+            print(&b, "line ");
+            print(&b, (i64)i);
+            print(&b, i==5 ? Str("\x1b[1mbold\x1b[0m\r\n") : Str("\n"));
+        }
+        os_write(os, *a, "/s/out.log", finish(&b));
+        JobLines jl = joblines(os, a, "/s/out.log", JOBLINES_TAIL, 2, 0);
+        expect(t, "joblines tail", jl.text, "line 29\nline 30\n");
+        expect(t, "joblines tail more", istr(a, jl.before*10 + jl.after), "10");
+        jl = joblines(os, a, "/s/out.log", JOBLINES_HEAD, 2, 0);
+        expect(t, "joblines head", jl.text, "line 1\nline 2\n");
+        expect(t, "joblines head more", istr(a, jl.first*100 + jl.before*10 + jl.after), "101");
+        jl = joblines(os, a, "/s/out.log", JOBLINES_AT, 2, 5);
+        expect(t, "joblines at", jl.text, "line 5bold\nline 6\n");
+        expect(t, "joblines at first", istr(a, jl.first), "5");
+        jl = joblines(os, a, "/s/out.log", JOBLINES_AT, 2, 99);
+        expect(t, "joblines past", istr(a, jl.count*10 + jl.before), "1");
+        jl = joblines(os, a, "/s/none.log", JOBLINES_TAIL, 2, 0);
+        expect(t, "joblines none", istr(a, jl.count + jl.text.len), "0");
+
+        Str tail = jobtail(os, a, "/s/out.log");
+        expect(t, "jobtail", istr(a, startswith(tail, "line 11\n") &&
+               endswith(tail, "line 30\n")), "1");
+
+        ShellEnd e = {};
+        e.job     = 3;
+        e.timeout = 120;
+        ToolOut o = shellresult(os, a, "/s/none.log", &e);
+        expect(t, "moved to a job", o.text, "[still running after 2 minutes, so it "
+               "continues in the background as job 3. You will be told when it ends: "
+               "do not poll it or wait for it. Use job_output to read more of its "
+               "output, and job_kill to stop it]");
+        e = {};
+        e.timedout = 1;
+        e.nojob    = 1;
+        e.timeout  = 5;
+        o = shellresult(os, a, "/s/none.log", &e);
+        expect(t, "no room for a job", istr(a, find(o.text, "too many background jobs")>0), "1");
     }
 }

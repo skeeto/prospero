@@ -24,9 +24,15 @@
 // - Nudges, each with a cap and a counter reset by progress (a tool
 //   that succeeded): continue, empty, length, loop, and the tool-call
 //   loop guard (the same set of calls 5 steps in a row is not run).
+//   The todo nudges (todo items left at the end of a turn, many changes
+//   without the list changing) reset only as the list moves along.
 // - Tools: denials and invalid calls are tool results, never the end
-//   of a turn. Shell commands time out with TERM, 2 s, then KILL, and
-//   whatever a command leaves behind is killed when it completes.
+//   of a turn. A command still running at its timeout moves to the
+//   background as a job, which has a limit of its own; whatever a
+//   command leaves behind is killed when it completes. A job's end is
+//   told to the agent at its next request, and an idle session starts
+//   a turn for it, a few times an hour at most. Stopping a command asks
+//   first (TERM, or CTRL_BREAK), then kills after a grace period.
 // - Budgets: a note at 200 steps, the end of the turn at 300.
 //
 // Unattended runs must not get stuck, nor give up early, so:
@@ -128,6 +134,7 @@ enum : i32 {
     T_ASK,
     T_LIVE,
     T_ADMIT,     // admitted while queued: send at once
+    T_JOBS,      // the next deadline of a background job
     T_COUNT,
 };
 
@@ -138,6 +145,9 @@ enum : i32 {
     N_LOOP,      // a text cycle
     N_GUARD,     // the same calls 5 times
     N_STOP,      // a final response that announced more work
+    // Reset only by todo progress and new input, not by tool progress
+    N_TODO,      // the turn ends with todo items not done
+    N_REMIND,    // many changes without a todo update
     N_COUNT,
 };
 
@@ -151,6 +161,8 @@ static struct {
     {"loop",     3},
     {"guard",    2},
     {"stop",     3},
+    {"todo",     3},
+    {"todo_reminder", 2},
 };
 static_assert(countof(nudgeinfo) == N_COUNT);
 
@@ -169,6 +181,96 @@ enum : i32 {
     CTL_NONE,     // why reasoning was asked to end
     CTL_LOOP,
     CTL_BUDGET,
+};
+
+enum : i64 {
+    TODO_REMIND = 12,  // mutating calls without a todo update
+};
+
+// Something for the agent to read before its next request: a job that
+// ended, files rewound, instructions for a directory.
+struct Notice {
+    Str kind;  // "job", "rewind", "instructions"
+    Str text;
+    i64 job;   // for "job"
+};
+
+enum : i32 {
+    JOB_RUN,   // running
+    JOB_STOP,  // asked to stop: the kill follows at killat
+    JOB_DONE,
+};
+
+enum : i32 {
+    JOBEND_EXIT,     // it ended by itself
+    JOBEND_TIMEOUT,  // stopped at its deadline
+    JOBEND_KILLED,   // by job_kill or job.kill
+    JOBEND_CLOSED,   // the session closed, or the engine stopped
+    JOBEND_LIMIT,    // too much output
+    JOBEND_LOST,     // the harness stopped while it ran (logopen)
+    JOBEND_COUNT,
+};
+
+static Str jobendnames[] = {
+    "exited", "timeout", "killed", "closed", "limit", "unknown",
+};
+static_assert(countof(jobendnames) == JOBEND_COUNT);
+
+// A command in the background: one moved there at its timeout, one
+// started with background, or a cancelled command being stopped
+// (hidden: never shown to the agent, nor logged).
+struct Job {
+    Job  *next;
+    i64   n;         // number within the session, from 1
+    Str   call;
+    Str   command;
+    Str   spill;     // absolute
+    Str   rel;       // relative to the session directory
+    Proc *proc;
+    u64   procid;
+    i64   start;     // ticks
+    i64   deadline;  // ticks: stopped then
+    i64   killat;    // ticks: killed then, once stopping
+    i64   drainat;   // ticks: done waiting for its output, once exited
+    i64   total;
+    i32   code;
+    i32   signal;
+    i32   state;     // JOB_*
+    i32   why;       // JOBEND_*
+    b32   exited;
+    b32   eof;
+    b32   hidden;
+    b32   quiet;     // the agent stopped it: no notice
+    b32   cut;       // processes it left held its output
+    i64   ran;       // ticks it ran, once done
+};
+
+// The original of a file the harness changed, kept as snap/<n> in the
+// session directory, for rewind.
+struct Snap {
+    i64 n;
+    i64 seq;      // of the snap record
+    i64 turn;
+    Str call;
+    Str path;     // absolute and normalized, as the tool used it
+    Str before;   // hash of the original, empty if the file was absent
+    Str after;    // hash of what the harness wrote
+    b32 existed;
+    b32 undone;   // rewound already
+};
+
+// Where a call started, for rewinding to it.
+struct CallMark {
+    Str call;
+    i64 seq;
+    i64 turn;
+};
+
+// An instruction file loaded into the session, and how it was then.
+struct InstrStamp {
+    Str path;
+    i64 size;
+    i64 mtime;
 };
 
 struct Endpoint {
@@ -195,6 +297,13 @@ struct ShellRun {
     b32  eof;
     b32  timedout;
     b32  limited;
+    b32  nojob;     // timed out with too many jobs to move it to one
+    i32  tool;      // TOOL_SHELL, or TOOL_GREP or TOOL_GLOB searching
+    Str  command;   // the shell's
+    Str  root;      // a search's directory, normalized
+    Str  pattern;   // a search's, as given
+    Str  glob;      // grep's file filter, or glob's pattern
+    b32  fold;      // grep ignore_case
 };
 
 // An ask waiting for the user, or recently resolved.
@@ -321,6 +430,25 @@ struct Session {
     i32          ctlstatus;
     Buf          ctlbody;
     b32          noctl;      // the endpoint cannot: cancel instead
+    // Background jobs, and what the agent hears between requests
+    Job         *jobs;       // newest first
+    i64          njobs;      // numbers given so far
+    Slice<i64>   resumed;    // ticks of turns started for jobs, for the cap
+    b32          wake;       // a job ended: start a turn if idle
+    b32          closed;     // the frontend closed it: no jobs, no resumes
+    Slice<Notice> notices;   // delivered at the next request
+    // The todo list
+    Slice<TodoItem> todos;
+    i32          mutations;  // mutating calls since the list changed
+    // Snapshots for rewind
+    Slice<Snap>  snaps;
+    Slice<CallMark> marks;
+    i64          nsnap;      // snap files made so far
+    // Instruction files
+    Str          instr;      // their text in the system prompt, or null
+    Slice<InstrStamp> instrfiles;  // every file loaded, lazily too
+    Instructions instrpend;  // those loaded at the start, to log
+    b32          instrlog;   // that record is still to log
 };
 
 // Engine functions take scratch by value, so that whatever a caller has
@@ -337,6 +465,7 @@ struct Engine {
     Str         statedir;
     Str         exedir;
     Str         home;     // for "~" in paths
+    Str         global;   // the user's own instruction file
     ToolEnv     te;
     Slice<Str>  env;      // inherited environment
     Session    *sessions;
@@ -603,11 +732,49 @@ static b32 nudge(Session *s, Arena scratch, i32 kind, Str text)
     return 1;
 }
 
-static void resetnudges(Session *s)
+// Reset the nudge counters on progress: all of them for new input, but
+// for tool progress not those about the todo list, which only its own
+// progress resets.
+static void resetnudges(Session *s, b32 all = 0)
 {
-    for (i32 i = 0; i < N_COUNT; i++) {
+    for (i32 i = 0; i < (all ? N_COUNT : N_TODO); i++) {
         s->nudges[i] = 0;
     }
+}
+
+// Queue a notice for the agent's next request. The text is copied.
+static void notify(Session *s, Str kind, Str text, i64 job)
+{
+    Notice n = {};
+    n.kind = kind;
+    n.text = clone(&s->perm, text);
+    n.job  = job;
+    s->notices = push(&s->perm, s->notices, n);
+}
+
+// Give the agent the notices queued since its last request, each a
+// message of its own and a durable record, so that a session opened
+// again sends the same history.
+static void deliver(Session *s, Arena scratch)
+{
+    for (iz i = 0; i < s->notices.len; i++) {
+        Notice *n = &s->notices[i];
+        Arena   a = scratch;
+        Buf     b(&a, 256 + n->text.len);
+        EvOut   w = sbegin(s, &b, EV_NOTICE);
+        putstrkey(&w.json, "kind", n->kind);
+        if (n->job) {
+            putintkey(&w.json, "job", n->job);
+        }
+        putstrkey(&w.json, "text", n->text);
+        ssend(s, &w);
+
+        Msg m = {};
+        m.role = ROLE_USER;
+        m.text = n->text;
+        addmsg(s, m);
+    }
+    s->notices = {};
 }
 
 
@@ -989,6 +1156,10 @@ static void finalize(Session *, Arena);
 static void nexttool(Session *, Arena);
 static void sendcompact(Session *, Arena);
 static void compact(Session *, Arena, i64 enough, i64 goal, b32 overflow);
+static void beginturn(Session *, Arena, Str via);
+static b32  busy(Session *);
+static i32  get32(Str);
+static i64  get64(Str);
 
 static void resetattempt(Session *s)
 {
@@ -1812,8 +1983,10 @@ static u64 callsethash(Arena scratch, Slice<Block> calls)
     return sum;
 }
 
+// End the current call. A command moved to the background names its
+// job.
 static void toolend(Session *s, Arena scratch, Str status, Str text,
-                    i32 code, b32 hascode, Str spill, i64 bytes)
+                    i32 code, b32 hascode, Str spill, i64 bytes, i64 job = 0)
 {
     Engine *e = s->e;
     Block  *c = &s->calls[s->callidx];
@@ -1829,6 +2002,9 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
         putstrkey(&w.json, "spill", spill);
         putintkey(&w.json, "bytes", bytes);
     }
+    if (job) {
+        putintkey(&w.json, "job", job);
+    }
     putintkey(&w.json, "ms", (os_ticks(e->os) - s->callstart)/MS);
     ssend(s, &w);
 
@@ -1838,7 +2014,11 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     m.text   = clone(&s->perm, text);
     m.spill  = spill.len ? clone(&s->perm, spill) : Str{};
     addmsg(s, m);
-    s->progressed |= status == "ok";
+    b32 done = status=="ok" || status=="background";
+    s->progressed |= done;
+    if (done && toolmutates(toolfind(c->name))) {
+        s->mutations++;
+    }
     s->callidx++;
 }
 
@@ -1853,20 +2033,268 @@ static void toolstart(Session *s, Arena scratch)
     putstrkey(&w.json, "cwd", s->cwd);
     ssend(s, &w);
     s->callstart = os_ticks(s->e->os);
+    CallMark k = {c->id, s->log.seq, s->turn};
+    s->marks = push(&s->perm, s->marks, k);
 }
 
-// A file tool on a path the guard allowed, or the user did.
-static void runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
+
+// Snapshots and rewind
+//
+// Before write or edit changes a file, the harness keeps its original as
+// snap/<n> in the session directory, or nothing when the file did not
+// exist, and once the change is made it logs a snap record with hashes
+// of the bytes before and after. A rewind (cmdrewind) puts back, newest
+// first, every file changed at or after a call or a turn, but only
+// where the file still holds what the harness wrote: anything else has
+// changed it since, which is a conflict, left alone unless forced.
+// Commands change files too, and those changes are not tracked.
+
+struct SnapPre {
+    i64 n;        // 0 if nothing can be undone
+    u64 before;   // hash of the original
+    b32 existed;
+};
+
+static Str hashstr(Arena *a, u64 h)
 {
+    Buf b(a, 16);
+    printhex(&b, h, 16);
+    return finish(&b);
+}
+
+static Str snapname(Arena *a, i64 n)
+{
+    Buf b(a, 32);
+    print(&b, "snap/");
+    print(&b, n);
+    return finish(&b);
+}
+
+static SnapPre snapbefore(Session *s, Arena scratch, Str path)
+{
+    SnapPre r  = {};
+    Os     *os = s->e->os;
+    Read    rd = os_read(os, &scratch, path, (iz)FILE_MAX);
+    if (rd.err == READ_NOTFOUND) {
+        r.n = ++s->nsnap;
+        return r;
+    } else if (rd.err) {
+        return r;  // a directory, or too big: the tool fails as well
+    }
+    i64 n    = s->nsnap + 1;
+    Str dir  = join(&scratch, s->dir, "snap");
+    Str file = join(&scratch, s->dir, snapname(&scratch, n));
+    if (!os_mkdirs(os, scratch, dir) || !os_write(os, scratch, file, rd.data)) {
+        return r;
+    }
+    s->nsnap  = n;
+    r.n       = n;
+    r.before  = hash(rd.data);
+    r.existed = 1;
+    return r;
+}
+
+// After the tool: log the change it made (wrote), or drop the copy.
+static void snapafter(Session *s, Arena scratch, Str path, SnapPre *pre, Str wrote)
+{
+    Os *os   = s->e->os;
+    Str name = snapname(&scratch, pre->n);
+    if (!pre->n) {
+        return;
+    } else if (!wrote.data) {
+        if (pre->existed) {
+            Str file = join(&scratch, s->dir, name);
+            os_remove(os, scratch, file);
+        }
+        return;
+    }
+    Block *c      = &s->calls[s->callidx];
+    Str    before = pre->existed ? hashstr(&scratch, pre->before) : Str("");
+    Str    after  = hashstr(&scratch, hash(wrote));
+    {
+        Arena a = scratch;
+        Buf   b(&a, 512 + path.len);
+        EvOut w = sbegin(s, &b, EV_SNAP);
+        putstrkey(&w.json, "call", c->id);
+        putstrkey(&w.json, "path", path);
+        putstrkey(&w.json, "snap", name);
+        putintkey(&w.json, "existed", pre->existed);
+        putstrkey(&w.json, "hash_before", before);
+        putstrkey(&w.json, "hash_after", after);
+        ssend(s, &w);
+    }
+    Snap sn = {};
+    sn.n       = pre->n;
+    sn.seq     = s->log.seq;
+    sn.turn    = s->turn;
+    sn.call    = c->id;
+    sn.path    = clone(&s->perm, path);
+    sn.before  = clone(&s->perm, before);
+    sn.after   = clone(&s->perm, after);
+    sn.existed = pre->existed;
+    s->snaps = push(&s->perm, s->snaps, sn);
+}
+
+
+// Instruction files (instructions.cpp)
+
+static Slice<Str> instrlist(Session *s, Arena *a)
+{
+    return instrnames(a, cfgget(s->e->cfg, "instructions", "", "files", 0));
+}
+
+static void instrstamp(Session *s, Slice<InstrFile> files)
+{
+    for (iz i = 0; i < files.len; i++) {
+        InstrStamp k = {};
+        k.path  = clone(&s->perm, files[i].path);
+        k.size  = files[i].size;
+        k.mtime = files[i].mtime;
+        s->instrfiles = push(&s->perm, s->instrfiles, k);
+    }
+}
+
+// The durable record of instruction files loaded: at the start (why
+// "start", with the text that went into the system prompt), for a
+// directory below the working directory ("nested"), or after a change
+// ("changed").
+static void loginstr(Session *s, Arena scratch, Slice<InstrFile> files,
+                     Slice<Str> skipped, Str why, Str text)
+{
+    Buf   b(&scratch, 1024 + text.len);
+    EvOut w = sbegin(s, &b, EV_INSTRUCTIONS);
+    putstrkey(&w.json, "why", why);
+    putkey(&w.json, "files");
+    putarray(&w.json);
+    for (iz i = 0; i < files.len; i++) {
+        putobject(&w.json);
+        putstrkey(&w.json, "path", files[i].path);
+        putintkey(&w.json, "bytes", files[i].size);
+        putintkey(&w.json, "mtime", files[i].mtime);
+        if (files[i].importer.data) {
+            putstrkey(&w.json, "importer", files[i].importer);
+        }
+        putend(&w.json);
+    }
+    putend(&w.json);
+    if (skipped.len) {
+        putkey(&w.json, "skipped");
+        putarray(&w.json);
+        for (iz i = 0; i < skipped.len; i++) {
+            putstr(&w.json, skipped[i]);
+        }
+        putend(&w.json);
+    }
+    if (text.data) {
+        putstrkey(&w.json, "text", text);
+    }
+    ssend(s, &w);
+}
+
+// The instructions of directories between the working directory and a
+// file a tool worked on, not loaded yet, for the next request.
+static void instrlazy(Session *s, Arena scratch, Str path)
+{
+    Engine    *e      = s->e;
+    Slice<Str> loaded = {};
+    for (iz i = 0; i < s->instrfiles.len; i++) {
+        loaded = push(&scratch, loaded, s->instrfiles[i].path);
+    }
+    Slice<Str>   names = instrlist(s, &scratch);
+    Instructions in    = instrnested(e->os, &scratch, s->guard.cwd, path, names,
+                                     loaded, e->home, s->te.windows);
+    if (!in.files.len) {
+        return;
+    }
+    Str dir = normpath(&scratch, in.files[0].path, "..", s->te.windows);
+    Buf b(&scratch, 256 + in.text.len);
+    print(&b, "Instructions for the files under ");
+    print(&b, showpath(s->guard.cwd, dir));
+    print(&b, " apply from now on. Follow them when you work there:");
+    print(&b, in.text);
+    Str text = finish(&b);
+    loginstr(s, scratch, in.files, in.skipped, "nested", {});
+    instrstamp(s, in.files);
+    notify(s, "instructions", text, 0);
+}
+
+// Loaded instruction files that changed since: their new text, for the
+// next request, since the system prompt stays as it was.
+static void instrcheck(Session *s, Arena scratch)
+{
+    Os              *os      = s->e->os;
+    Slice<InstrFile> changed = {};
+    Buf              b(&scratch, 1024);
+    for (iz i = 0; i < s->instrfiles.len; i++) {
+        InstrStamp *k    = &s->instrfiles[i];
+        Stat        st   = os_stat(os, scratch, k->path);
+        b32         file = st.type == STAT_FILE;
+        if (file ? st.size==k->size && st.mtime==k->mtime : k->mtime<0) {
+            continue;  // as it was, or gone and told so
+        }
+        k->size  = file ? st.size : 0;
+        k->mtime = file ? st.mtime : -1;
+        InstrFile f = {};
+        f.path  = k->path;
+        f.size  = st.size;
+        f.mtime = st.mtime;
+        changed = push(&scratch, changed, f);
+        print(&b, "\n\n## ");
+        print(&b, k->path);
+        Read rd = st.type==STAT_FILE ? os_readat(os, &scratch, k->path, 0, (iz)INSTR_MAX)
+                                     : Read{};
+        if (st.type!=STAT_FILE || rd.err) {
+            print(&b, "\n\nThis file is gone: its instructions no longer apply.");
+        } else {
+            print(&b, " (new version)\n\n");
+            print(&b, trimright(rd.data));
+        }
+    }
+    if (!changed.len) {
+        return;
+    }
+    Str  body = finish(&b);
+    Buf  t(&scratch, 256 + body.len);
+    print(&t, "Instruction files changed since you read them. Follow them "
+              "as they are now:");
+    print(&t, body);
+    Str text = finish(&t);
+    loginstr(s, scratch, changed, {}, "changed", {});
+    notify(s, "instructions", text, 0);
+}
+
+
+// Searches (search.cpp) and file tools
+
+static b32 startsearch(Session *, Arena, i32 tool, Str path, Args *);
+
+// A path tool on a path the guard allowed, or the user did. Returns 1
+// if the call finished, 0 if it goes on (a search).
+static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
+{
+    if (tool==TOOL_GREP || tool==TOOL_GLOB) {
+        return startsearch(s, scratch, tool, path, args);
+    }
     Engine *e    = s->e;
     ToolOut o    = {};
     Str     ncwd = s->guard.cwd;  // as normalized paths
+    SnapPre pre  = {};
+    if (tool==TOOL_WRITE || tool==TOOL_EDIT) {
+        pre = snapbefore(s, scratch, path);
+    }
     switch (tool) {
     case TOOL_READ:  o = toolread(e->os, &scratch, ncwd, path, args);  break;
     case TOOL_WRITE: o = toolwrite(e->os, &scratch, ncwd, path, args); break;
     case TOOL_EDIT:  o = tooledit(e->os, &scratch, ncwd, path, args);  break;
     }
+    if (tool==TOOL_WRITE || tool==TOOL_EDIT) {
+        snapafter(s, scratch, path, &pre, o.wrote);
+    }
+    if (o.ok) {
+        instrlazy(s, scratch, path);
+    }
     toolend(s, scratch, o.ok ? Str("ok") : Str("error"), o.text, 0, 0, {}, 0);
+    return 1;
 }
 
 static Str bynames[] = {"policy", "user", "timeout", "steer", "cancel"};
@@ -1934,7 +2362,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
 {
     Engine   *e    = s->e;
     Block    *c    = &s->calls[s->callidx];
-    b32       read = tool == TOOL_READ;
+    b32       read = toolreads(tool);
     GuardHint h    = {};
     if (!gp->diverged) {
         h = guardhint(e->os, &scratch, &s->guard, gp->path, read, tool==TOOL_WRITE);
@@ -1986,50 +2414,697 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     return 0;
 }
 
+// out/<call>.log for a call's output, unless a model reused the call id
+// in this session: the absolute path, and in rel the path relative to
+// the session directory, both in the session's arena.
+static Str spillfile(Session *s, Arena scratch, Str id, Str *rel)
+{
+    for (i32 n = 1;; n++) {
+        Arena a = scratch;
+        Buf   b(&a, 128);
+        print(&b, "out/");
+        print(&b, id);
+        if (n > 1) {
+            putbyte(&b, '-');
+            print(&b, (i64)n);
+        }
+        print(&b, ".log");
+        Str r    = finish(&b);
+        Str path = join(&a, s->dir, r);
+        if (os_stat(s->e->os, a, path).type == STAT_MISSING) {
+            *rel = clone(&s->perm, r);
+            return clone(&s->perm, path);
+        }
+    }
+}
+
+// Spawn a process for the current call, its output into spill.
+static Proc *spawncall(Session *s, Arena scratch, Slice<Str> argv, Str cmdline,
+                       Str cwd, Str spill, i64 maxbytes, u64 *id)
+{
+    Engine *e  = s->e;
+    Spawn   sp = {};
+    sp.argv     = argv;
+    sp.cmdline  = cmdline;
+    sp.cwd      = cwd;
+    sp.env      = shellenv(&scratch, e->env, s->te.windows);
+    sp.outpath  = spill;
+    sp.maxbytes = maxbytes;
+    sp.mbox     = e->in;
+    sp.id       = *id = ++e->nextid;
+    Proc *p = os_spawn(e->os, &sp, scratch);
+    if (!p) {
+        *id = 0;
+    }
+    return p;
+}
+
+// A duration for people: "45 s", "3 min 12 s", "2 h 5 min".
+static void printelapsed(Buf *b, i64 ticks)
+{
+    i64 secs = (ticks + SEC/2) / SEC;
+    if (secs < 60) {
+        print(b, secs);
+        print(b, " s");
+    } else if (secs < 3600) {
+        print(b, secs/60);
+        print(b, " min ");
+        print(b, secs%60);
+        print(b, " s");
+    } else {
+        print(b, secs/3600);
+        print(b, " h ");
+        print(b, secs/60%60);
+        print(b, " min");
+    }
+}
+
+
+// Background jobs
+//
+// A job is a command left running: one still running at its timeout,
+// or one started with background. It keeps its process and its output
+// file while the session goes on. It runs until it exits, or until its
+// deadline (the [tools] job_timeout unless the agent asked for another,
+// up to job_timeout_max), when it is stopped as a cancelled command is:
+// asked to stop (os_kill soft), then killed when the grace period is
+// over ([tools] stop_grace). Its end is logged (job.end) and told to
+// the agent at its next request, as a notice; a session that is idle
+// then starts a turn for it by itself, at most [tools] auto_resume
+// times an hour. Closing a session stops its jobs; quitting kills them.
+// A cancelled command is stopped the same way, as a hidden job.
+
+static i64 stopgrace(Engine *e)
+{
+    if (trim(cfgget(e->cfg, "tools", "", "stop_grace", 0)).len) {
+        return cfgms(e->cfg, "tools", "", "stop_grace", 0) * MS;
+    }
+    return HOST_WINDOWS ? 3*SEC : 2*SEC;
+}
+
+static Job *jobfind(Session *s, i64 n)
+{
+    for (Job *j = s->jobs; j; j = j->next) {
+        if (j->n==n && !j->hidden) {
+            return j;
+        }
+    }
+    return 0;
+}
+
+static i32 jobsrunning(Session *s)
+{
+    i32 n = 0;
+    for (Job *j = s->jobs; j; j = j->next) {
+        n += j->state!=JOB_DONE && !j->hidden;
+    }
+    return n;
+}
+
+// Arm T_JOBS for the nearest of the jobs' deadlines.
+static void jobarm(Session *s)
+{
+    i64 at = 0;
+    for (Job *j = s->jobs; j; j = j->next) {
+        i64 t = j->state==JOB_DONE ? 0          :
+                j->drainat         ? j->drainat :
+                j->state==JOB_STOP ? j->killat  :
+                                     j->deadline;
+        if (t && (!at || t<at)) {
+            at = t;
+        }
+    }
+    s->timers[T_JOBS] = at;
+}
+
+static Job *newjob(Session *s, Arena scratch, Str call, Str command, Proc *proc,
+                   u64 procid, Str spill, Str rel, i64 start, i64 timeout, b32 hidden)
+{
+    Os  *os = s->e->os;
+    Job *j  = alloc<Job>(&s->perm);
+    j->n        = hidden ? 0 : ++s->njobs;
+    j->call     = clone(&s->perm, call);
+    j->command  = clone(&s->perm, command);
+    j->spill    = spill;
+    j->rel      = rel;
+    j->proc     = proc;
+    j->procid   = procid;
+    j->start    = start;
+    j->deadline = start + timeout*SEC;
+    j->hidden   = hidden;
+    j->next     = s->jobs;
+    s->jobs     = j;
+    if (!hidden) {
+        i64   now = os_ticks(os);
+        Buf   b(&scratch, 512 + command.len);
+        EvOut w = sbegin(s, &b, EV_JOBSTART);
+        putintkey(&w.json, "job", j->n);
+        putstrkey(&w.json, "call", call);
+        putstrkey(&w.json, "command", command);
+        putstrkey(&w.json, "spill", rel);
+        putintkey(&w.json, "deadline", os_time(os) + (j->deadline - now)/MS);
+        ssend(s, &w);
+    }
+    jobarm(s);
+    return j;
+}
+
+// Ask a running job to stop, and kill it when the grace period is over.
+static void jobstop(Session *s, Job *j, i32 why)
+{
+    if (j->state != JOB_RUN) {
+        return;
+    }
+    os_kill(s->e->os, j->proc, 0);
+    j->state  = JOB_STOP;
+    j->why    = why;
+    j->killat = os_ticks(s->e->os) + stopgrace(s->e);
+    jobarm(s);
+}
+
+static b32 canresume(Session *s)
+{
+    Engine *e   = s->e;
+    i64     cap = parseint(trim(cfgget(e->cfg, "tools", "", "auto_resume", 0))).val;
+    i64     now = os_ticks(e->os);
+    i64     n   = 0;
+    for (iz i = 0; i < s->resumed.len; i++) {
+        n += now - s->resumed[i] < 3600*SEC;
+    }
+    return !e->quitting && !s->readonly && !s->closed && n<cap;
+}
+
+// Start a turn to give the agent its notices, a session left idle.
+static void autoresume(Session *s, Arena scratch)
+{
+    s->resumed = push(&s->perm, s->resumed, os_ticks(s->e->os));
+    s->wake    = 0;
+    beginturn(s, scratch, "job");
+}
+
+static Str jobnotice(Session *s, Arena *a, Job *j, i64 bytes)
+{
+    Os *os = s->e->os;
+    Buf b(a, 1024);
+    print(&b, "Background job ");
+    print(&b, j->n);
+    print(&b, " ended: ");
+    switch (j->why) {
+    case JOBEND_EXIT:
+        if (j->signal) {
+            print(&b, "it was killed by signal ");
+            print(&b, (i64)j->signal);
+        } else {
+            print(&b, "it exited with code ");
+            print(&b, (i64)j->code);
+        }
+        break;
+    case JOBEND_TIMEOUT:
+        print(&b, "it was stopped at its time limit");
+        break;
+    case JOBEND_KILLED:
+        print(&b, "the user stopped it");
+        break;
+    case JOBEND_CLOSED:
+        print(&b, "the session closed");
+        break;
+    case JOBEND_LIMIT:
+        print(&b, "it was killed for writing over 1 GiB of output");
+        break;
+    case JOBEND_LOST:
+        print(&b, "the harness stopped while it ran, which stopped it too");
+        break;
+    }
+    if (j->ran) {  // unknown for a job lost in a crash
+        print(&b, ", after ");
+        printelapsed(&b, j->ran);
+    }
+    print(&b, ".\nCommand: ");
+    print(&b, j->command);
+    print(&b, "\nOutput: ");
+    print(&b, bytes);
+    print(&b, " bytes, in ");
+    print(&b, j->rel);
+    Str tail = jobtail(os, a, j->spill);
+    if (tail.len) {
+        print(&b, "; job_output reads more. It ends with:\n");
+        print(&b, tail);
+        if (tail[tail.len-1] != '\n') putbyte(&b, '\n');
+    } else {
+        print(&b, ".\n");
+    }
+    if (j->cut) {
+        print(&b, "[processes it started kept its output open, so they "
+                  "were killed]\n");
+    }
+    return finish(&b);
+}
+
+// A job is over: kill what it left, log its end, and tell the agent.
+static void jobend(Session *s, Arena scratch, Job *j)
+{
+    Os *os = s->e->os;
+    if (j->proc) {
+        os_kill(os, j->proc, 1);
+        os_procfree(os, j->proc);
+        j->proc = 0;
+    }
+    j->procid  = 0;
+    j->state   = JOB_DONE;
+    j->drainat = 0;
+    j->ran     = os_ticks(os) - j->start;
+    jobarm(s);
+    if (j->hidden) {
+        for (Job **p = &s->jobs; *p; p = &(*p)->next) {
+            if (*p == j) {
+                *p = j->next;
+                break;
+            }
+        }
+        return;
+    }
+
+    Stat st     = os_stat(os, scratch, j->spill);
+    i64  bytes  = st.size>j->total ? st.size : j->total;
+    b32  tell   = !j->quiet;
+    b32  resume = tell && !busy(s) && canresume(s);
+    {
+        Arena a = scratch;
+        Buf   b(&a, 512);
+        EvOut w = sbegin(s, &b, EV_JOBEND);
+        putintkey(&w.json, "job", j->n);
+        putstrkey(&w.json, "call", j->call);
+        putstrkey(&w.json, "status", jobendnames[j->why]);
+        if (j->why==JOBEND_EXIT && !j->signal) {
+            putintkey(&w.json, "exit", j->code);
+        } else if (j->signal) {
+            putintkey(&w.json, "signal", j->signal);
+        }
+        putintkey(&w.json, "bytes", bytes);
+        putstrkey(&w.json, "spill", j->rel);
+        putintkey(&w.json, "ms", j->ran/MS);
+        putintkey(&w.json, "notice", tell);
+        putintkey(&w.json, "resume", resume);
+        ssend(s, &w);
+    }
+    if (!tell) {
+        return;
+    }
+    Str text = jobnotice(s, &scratch, j, bytes);
+    notify(s, "job", text, j->n);
+    s->wake = 1;
+    if (resume) {
+        autoresume(s, scratch);
+    } else if (!busy(s) && !s->closed && !s->e->quitting) {
+        note(s, scratch, "info", "a background job ended while this "
+             "session already resumed by itself as often as allowed "
+             "([tools] auto_resume); the agent hears of it at the next prompt");
+    }
+}
+
+static void jobrecord(Session *s, Arena scratch, Job *j, Record r)
+{
+    Os *os = s->e->os;
+    switch (r.type) {
+    case PROC_TAIL:
+        if (!j->hidden) {
+            Str   tail = cleanoutput(&scratch, utf8tail(cuthead(r.data, 8), 4096));
+            Buf   b(&scratch, 256 + tail.len);
+            EvOut w = sbegin(s, &b, EV_JOBOUT);
+            putintkey(&w.json, "job", j->n);
+            putstrkey(&w.json, "call", j->call);
+            putstrkey(&w.json, "tail", tail);
+            putintkey(&w.json, "bytes", get64(r.data));
+            ssend(s, &w);
+        }
+        return;
+    case PROC_LIMIT:
+        if (j->state == JOB_RUN) {
+            j->why = JOBEND_LIMIT;
+        }
+        j->state   = JOB_STOP;
+        j->killat  = 0;
+        j->drainat = os_ticks(os) + DRAIN;
+        os_kill(os, j->proc, 1);
+        jobarm(s);
+        return;
+    case PROC_EXIT:
+        j->exited = 1;
+        j->code   = get32(r.data);
+        j->signal = get32(cuthead(r.data, 4));
+        if (j->eof) {
+            jobend(s, scratch, j);
+        } else if (!j->drainat) {
+            j->drainat = os_ticks(os) + DRAIN;
+            jobarm(s);
+        }
+        return;
+    case PROC_EOF:
+        j->eof   = 1;
+        j->total = get64(r.data);
+        if (j->exited) {
+            jobend(s, scratch, j);
+        }
+        return;
+    }
+}
+
+// T_JOBS: deadlines, kills after the grace period, and drains given up.
+static void jobtick(Session *s, Arena scratch)
+{
+    i64 now = os_ticks(s->e->os);
+    for (Job *j = s->jobs, *next = 0; j; j = next) {
+        next = j->next;
+        if (j->state == JOB_DONE) {
+            continue;
+        } else if (j->drainat && now>=j->drainat) {
+            j->cut = j->exited && !j->eof;
+            jobend(s, scratch, j);
+        } else if (j->state==JOB_STOP && j->killat && now>=j->killat) {
+            os_kill(s->e->os, j->proc, 1);
+            j->killat  = 0;
+            j->drainat = now + DRAIN;
+        } else if (j->state==JOB_RUN && now>=j->deadline) {
+            jobstop(s, j, JOBEND_TIMEOUT);
+        }
+    }
+    jobarm(s);
+}
+
+// Stop every job: asking first, as for a closed session, or at once,
+// as when the engine quits.
+static void stopjobs(Session *s, Arena scratch, b32 hard)
+{
+    for (Job *j = s->jobs, *next = 0; j; j = next) {
+        next = j->next;
+        if (j->state == JOB_DONE) {
+            continue;
+        }
+        j->quiet = 1;  // nobody to tell
+        if (j->state == JOB_RUN) {
+            j->why = JOBEND_CLOSED;
+        }
+        if (hard) {
+            jobend(s, scratch, j);
+        } else {
+            jobstop(s, j, JOBEND_CLOSED);
+        }
+    }
+}
+
+static Session *jobbyproc(Engine *e, u64 id, Job **job)
+{
+    for (Session *s = e->sessions; id && s; s = s->next) {
+        for (Job *j = s->jobs; j; j = j->next) {
+            if (j->procid == id) {
+                *job = j;
+                return s;
+            }
+        }
+    }
+    return 0;
+}
+
+// shell with background: start a job, and end the call at once.
+static void startjob(Session *s, Arena scratch, Args *args)
+{
+    Engine *e = s->e;
+    Block  *c = &s->calls[s->callidx];
+    if (jobsrunning(s) >= JOB_RUNNING) {
+        toolend(s, scratch, "error", "Not started: 16 background jobs are "
+                "running already. Stop jobs you no longer need with "
+                "job_kill, or wait to be told that they ended.", 0, 0, {}, 0);
+        return;
+    }
+    i64 timeout = s->te.jobtimeout;
+    if (args->timeout > 0) {
+        timeout = args->timeout<s->te.jobmax ? args->timeout : s->te.jobmax;
+    }
+    Str      rel   = {};
+    Str      spill = spillfile(s, scratch, c->id, &rel);
+    ShellCmd sc    = shellcmd(&scratch, &s->te, args->command);
+    u64      id    = 0;
+    Proc    *p     = spawncall(s, scratch, sc.argv, sc.cmdline, s->cwd, spill,
+                               SHELL_OUTMAX, &id);
+    if (!p) {
+        Str err  = os_lasterr(e->os, &scratch);
+        Str text = concat(&scratch, "The shell could not be started: ", err);
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        return;
+    }
+    Job *j = newjob(s, scratch, c->id, args->command, p, id, spill, rel,
+                    os_ticks(e->os), timeout, 0);
+    Buf b(&scratch, 512);
+    print(&b, "Started background job ");
+    print(&b, j->n);
+    print(&b, ". It may run for ");
+    printduration(&b, timeout);
+    print(&b, ". You will be told when it ends, with the end of its "
+              "output: do not poll it or wait for it, but go on with other "
+              "work, or end your turn if there is nothing else to do. Use "
+              "job_output to read its output so far, and job_kill to stop "
+              "it.");
+    Str text = finish(&b);
+    toolend(s, scratch, "ok", text, 0, 0, rel, 0, j->n);
+}
+
+// A foreground command still running at its timeout becomes a job.
+static void movetojob(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    Block  *c = &s->calls[s->callidx];
+    disarm(s, T_TOOL);
+    disarm(s, T_KILL);
+    disarm(s, T_DRAIN);
+    Job *j = newjob(s, scratch, c->id, s->sh.command, s->proc, s->procid,
+                    s->sh.spill, s->sh.rel, s->sh.start, s->te.jobtimeout, 0);
+    s->proc   = 0;
+    s->procid = 0;
+    setstate(s, S_IDLE);
+
+    ShellEnd end = {};
+    end.job     = j->n;
+    end.timeout = s->sh.timeout;
+    ToolOut o  = shellresult(e->os, &scratch, s->sh.spill, &end);
+    Stat    st = os_stat(e->os, scratch, s->sh.spill);
+    toolend(s, scratch, "background", o.text, 0, 0, s->sh.rel, st.size, j->n);
+}
+
+static void tooljobs(Session *s, Arena scratch)
+{
+    Os *os  = s->e->os;
+    i64 now = os_ticks(os);
+    Buf b(&scratch, 1024);
+    Slice<Job *> list = {};
+    for (Job *j = s->jobs; j; j = j->next) {
+        if (!j->hidden) {
+            list = push(&scratch, list, j);
+        }
+    }
+    if (!list.len) {
+        toolend(s, scratch, "ok", "No background jobs have run in this "
+                "session.", 0, 0, {}, 0);
+        return;
+    }
+    print(&b, "Background jobs, oldest first:\n");
+    for (iz i = list.len-1; i >= 0; i--) {
+        Job *j = list[i];
+        Stat st = os_stat(os, scratch, j->spill);
+        print(&b, "- job ");
+        print(&b, j->n);
+        print(&b, ": ");
+        switch (j->state) {
+        case JOB_RUN:
+            print(&b, "running for ");
+            printelapsed(&b, now - j->start);
+            print(&b, " (stopped at its limit in ");
+            printelapsed(&b, j->deadline>now ? j->deadline-now : 0);
+            putbyte(&b, ')');
+            break;
+        case JOB_STOP:
+            print(&b, "stopping");
+            break;
+        case JOB_DONE:
+            if (j->why==JOBEND_EXIT && !j->signal) {
+                print(&b, "exited with code ");
+                print(&b, (i64)j->code);
+            } else {
+                print(&b, "ended (");
+                print(&b, jobendnames[j->why]);
+                putbyte(&b, ')');
+            }
+            break;
+        }
+        print(&b, ", ");
+        print(&b, st.size);
+        print(&b, " bytes of output: ");
+        print(&b, j->command.len>200 ? utf8head(j->command, 200) : j->command);
+        putbyte(&b, '\n');
+    }
+    print(&b, "You are told when each job ends: there is no need to check.");
+    Str text = finish(&b);
+    toolend(s, scratch, "ok", text, 0, 0, {}, 0);
+}
+
+static Str nosuchjob(Arena *a, Session *s, i64 n)
+{
+    Buf b(a, 128);
+    print(&b, "There is no job ");
+    print(&b, n);
+    print(&b, s->njobs ? Str(": call jobs to list them.")
+                       : Str(": no background jobs have run in this session."));
+    return finish(&b);
+}
+
+static void tooljobout(Session *s, Arena scratch, Args *args)
+{
+    Os  *os = s->e->os;
+    Job *j  = jobfind(s, args->job);
+    if (!j) {
+        Str text = nosuchjob(&scratch, s, args->job);
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        return;
+    }
+    i64      n    = args->lines ? args->lines : JOBOUT_LINES;
+    i32      mode = args->offset   ? JOBLINES_AT   :
+                    args->from=="head" ? JOBLINES_HEAD : JOBLINES_TAIL;
+    JobLines jl   = joblines(os, &scratch, j->spill, mode, n, args->offset);
+    Stat     st   = os_stat(os, scratch, j->spill);
+    Buf      b(&scratch, 512 + jl.text.len);
+    print(&b, "Job ");
+    print(&b, j->n);
+    print(&b, j->state==JOB_DONE ? Str(" (ended)") : Str(" (still running)"));
+    print(&b, ", ");
+    print(&b, st.size);
+    print(&b, " bytes of output in ");
+    print(&b, j->rel);
+    if (!jl.count) {
+        print(&b, jl.before ? Str(": nothing at that line, past the end.\n")
+                            : Str(": no output yet.\n"));
+    } else if (mode == JOBLINES_TAIL) {
+        print(&b, jl.before ? Str(", its last lines:\n") : Str(", all of it:\n"));
+    } else {
+        print(&b, ", lines ");
+        print(&b, jl.first);
+        putbyte(&b, '-');
+        print(&b, jl.first + jl.count - 1);
+        print(&b, ":\n");
+    }
+    print(&b, jl.text);
+    if (jl.count && jl.after && mode!=JOBLINES_TAIL) {
+        print(&b, "[more follows: call job_output with offset=");
+        print(&b, jl.first + jl.count);
+        print(&b, "]\n");
+    }
+    if (j->state != JOB_DONE) {
+        print(&b, "[you are told when the job ends: do not poll it]");
+    }
+    Str text = finish(&b);
+    toolend(s, scratch, "ok", text, 0, 0, {}, 0);
+}
+
+static void tooljobkill(Session *s, Arena scratch, Args *args)
+{
+    Job *j = jobfind(s, args->job);
+    if (!j) {
+        Str text = nosuchjob(&scratch, s, args->job);
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        return;
+    }
+    Buf b(&scratch, 256);
+    print(&b, "Job ");
+    print(&b, j->n);
+    if (j->state == JOB_DONE) {
+        print(&b, " had already ended.");
+    } else if (j->state == JOB_STOP) {
+        print(&b, " is stopping already.");
+        j->quiet = 1;
+    } else {
+        j->quiet = 1;
+        jobstop(s, j, JOBEND_KILLED);
+        print(&b, " was asked to stop, and is killed in a few seconds if it "
+                  "has not. Its end will not be reported again.");
+    }
+    Str text = finish(&b);
+    toolend(s, scratch, "ok", text, 0, 0, {}, 0);
+}
+
+
+// Commands and searches in the foreground
+
 static b32 startshell(Session *s, Arena scratch, Args *args)
 {
     Engine  *e  = s->e;
     Block   *c  = &s->calls[s->callidx];
     ShellRun sh = {};
+    sh.tool    = TOOL_SHELL;
     sh.timeout = args->timeout>0 ? args->timeout : SHELL_DEFAULT;
     sh.start   = os_ticks(e->os);
-    // out/<call>.log, unless a model reused the call id in this session
-    for (i32 n = 1;; n++) {
-        Buf rel(&scratch, 128);
-        print(&rel, "out/");
-        print(&rel, c->id);
-        if (n > 1) {
-            putbyte(&rel, '-');
-            print(&rel, (i64)n);
-        }
-        print(&rel, ".log");
-        Str path = join(&scratch, s->dir, finish(&rel));
-        if (os_stat(e->os, scratch, path).type == STAT_MISSING) {
-            sh.rel   = clone(&s->perm, finish(&rel));
-            sh.spill = clone(&s->perm, path);
-            break;
-        }
-    }
+    sh.command = clone(&s->perm, args->command);
+    sh.spill   = spillfile(s, scratch, c->id, &sh.rel);
     s->sh = sh;
 
     ShellCmd sc = shellcmd(&scratch, &s->te, args->command);
-    Spawn    sp = {};
-    sp.argv     = sc.argv;
-    sp.cmdline  = sc.cmdline;
-    sp.cwd      = s->cwd;
-    sp.env      = shellenv(&scratch, e->env, s->te.windows);
-    sp.outpath  = s->sh.spill;
-    sp.maxbytes = SHELL_OUTMAX;
-    sp.mbox     = e->in;
-    sp.id       = s->procid = ++e->nextid;
-    s->proc = os_spawn(e->os, &sp, scratch);
+    s->proc = spawncall(s, scratch, sc.argv, sc.cmdline, s->cwd, s->sh.spill,
+                        SHELL_OUTMAX, &s->procid);
     if (!s->proc) {
-        s->procid = 0;
         return 0;
     }
     arm(s, T_TOOL, s->sh.timeout*SEC);
     setstate(s, S_TOOL);
     return 1;
+}
+
+// grep or glob on a path the guard allowed. Returns 1 if the call
+// finished (it could not start), 0 if the search runs.
+static b32 startsearch(Session *s, Arena scratch, i32 tool, Str path, Args *args)
+{
+    Engine *e      = s->e;
+    Stat    st     = os_stat(e->os, scratch, path);
+    Str     root   = path;
+    Str     target = ".";
+    if (st.type == STAT_MISSING) {
+        Str text = notfound(e->os, &scratch, s->guard.cwd, path);
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        return 1;
+    } else if (st.type==STAT_FILE && tool==TOOL_GLOB) {
+        toolend(s, scratch, "error", "That path is a file, but glob searches "
+                "a directory: give the directory, or read the file.",
+                0, 0, {}, 0);
+        return 1;
+    } else if (st.type == STAT_FILE) {
+        root   = normpath(&scratch, path, "..", s->te.windows);
+        target = basename(path);
+    } else if (st.type != STAT_DIR) {
+        toolend(s, scratch, "error", "That path is neither a file nor a "
+                "directory, so it cannot be searched.", 0, 0, {}, 0);
+        return 1;
+    }
+
+    Block   *c  = &s->calls[s->callidx];
+    ShellRun sh = {};
+    sh.tool    = tool;
+    sh.timeout = SEARCH_TIMEOUT;
+    sh.start   = os_ticks(e->os);
+    sh.root    = clone(&s->perm, root);
+    sh.pattern = clone(&s->perm, args->pattern);
+    sh.glob    = clone(&s->perm, tool==TOOL_GLOB ? args->pattern : args->glob);
+    sh.fold    = args->ignorecase;
+    sh.spill   = spillfile(s, scratch, c->id, &sh.rel);
+    s->sh = sh;
+
+    Slice<Str> argv = searchargv(&scratch, &s->te, tool, path, target, args);
+    i64        max  = tool==TOOL_GLOB ? SEARCH_GLOBMAX : SEARCH_OUTMAX;
+    s->proc = spawncall(s, scratch, argv, {}, root, s->sh.spill, max, &s->procid);
+    if (!s->proc) {
+        Str err  = os_lasterr(e->os, &scratch);
+        Str text = concat(&scratch, "The search could not be started: ", err);
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        return 1;
+    }
+    arm(s, T_TOOL, s->sh.timeout*SEC);
+    setstate(s, S_TOOL);
+    return 0;
 }
 
 static void finishshell(Session *s, Arena scratch, b32 cancelled)
@@ -2038,13 +3113,40 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled)
     disarm(s, T_TOOL);
     disarm(s, T_KILL);
     disarm(s, T_DRAIN);
-    if (s->proc) {
+    if (s->proc && cancelled && !e->quitting) {
+        // Stopped as a job is, asked first, while the turn goes on
+        Job *j = newjob(s, scratch, {}, {}, s->proc, s->procid, s->sh.spill,
+                        s->sh.rel, os_ticks(e->os), 0, 1);
+        jobstop(s, j, JOBEND_KILLED);
+    } else if (s->proc) {
         os_kill(e->os, s->proc, 1);  // whatever it left behind
         os_procfree(e->os, s->proc);
-        s->proc = 0;
     }
+    s->proc   = 0;
     s->procid = 0;
     setstate(s, S_IDLE);
+
+    Stat st = os_stat(e->os, scratch, s->sh.spill);
+    i64  n  = st.size>s->sh.total ? st.size : s->sh.total;
+    if (s->sh.tool != TOOL_SHELL) {
+        SearchEnd se = {};
+        se.tool       = s->sh.tool;
+        se.code       = s->sh.code;
+        se.signaled   = s->sh.signal || s->sh.code<0;
+        se.limited    = s->sh.limited;
+        se.timedout   = s->sh.timedout;
+        se.cancelled  = cancelled;
+        se.root       = s->sh.root;
+        se.cwd        = s->guard.cwd;
+        se.pattern    = s->sh.pattern;
+        se.glob       = s->sh.glob;
+        se.ignorecase = s->sh.fold;
+        se.windows    = s->te.windows;
+        ToolOut o = searchresult(e->os, &scratch, s->sh.spill, &se);
+        Str status = cancelled ? Str("cancelled") : o.ok ? Str("ok") : Str("error");
+        toolend(s, scratch, status, o.text, 0, 0, s->sh.rel, n);
+        return;
+    }
 
     ShellEnd end  = {};
     end.code      = s->sh.code;
@@ -2055,18 +3157,98 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled)
     end.cut       = s->sh.exited && !s->sh.eof && !cancelled;
     end.cancelled = cancelled;
     end.timeout   = s->sh.timeout;
+    end.nojob     = s->sh.nojob;
     ToolOut o = shellresult(e->os, &scratch, s->sh.spill, &end);
     Str status = cancelled    ? Str("cancelled") :
                  end.timedout ? Str("timeout")   :
                  o.ok         ? Str("ok")        : Str("error");
-    Stat st = os_stat(e->os, scratch, s->sh.spill);
-    i64  n  = st.size>s->sh.total ? st.size : s->sh.total;
     toolend(s, scratch, status, o.text, end.code, !cancelled && !end.timedout,
             s->sh.rel, n);
 }
 
-// Run one call. Returns 1 if it finished, 0 if it goes on (a command, or
-// an ask waiting for the user).
+
+// todo_write, and the nudges that keep a list honest
+
+static void tooltodo(Session *s, Arena scratch, Args *args)
+{
+    Block          *c     = &s->calls[s->callidx];
+    Slice<TodoItem> items = {};
+    i32             active = 0;
+    for (iz i = 0; i < args->todos.len; i++) {
+        TodoItem t = args->todos[i];
+        t.content = clone(&s->perm, t.content);
+        items  = push(&s->perm, items, t);
+        active += t.status == TODO_ACTIVE;
+    }
+    if (todoprogress(s->todos, items)) {
+        s->nudges[N_TODO] = 0;
+    }
+    s->todos     = items;
+    s->mutations = 0;
+    {
+        Arena a = scratch;
+        Buf   b(&a, 1024);
+        EvOut w = sbegin(s, &b, EV_TODO);
+        putstrkey(&w.json, "call", c->id);
+        putkey(&w.json, "items");
+        putarray(&w.json);
+        for (iz i = 0; i < items.len; i++) {
+            putobject(&w.json);
+            putstrkey(&w.json, "content", items[i].content);
+            putstrkey(&w.json, "status", todonames[items[i].status]);
+            putend(&w.json);
+        }
+        putend(&w.json);
+        ssend(s, &w);
+    }
+    Str text = todoshow(&scratch, items);
+    if (active > 1) {
+        text = concat(&scratch, text, "Note: more than one item is in "
+                      "progress. Finish one at a time, marking each done as "
+                      "soon as it is.");
+    }
+    toolend(s, scratch, "ok", text, 0, 0, {}, 0);
+}
+
+// At the end of a turn: items left undone are a reason to go on. Returns
+// 1 if the agent was nudged, and the next step began. An agent waiting
+// for a background job is not: the job's end brings it back.
+static b32 todonudge(Session *s, Arena scratch)
+{
+    Str left = todoleft(&scratch, s->todos);
+    if (!left.data || (jobsrunning(s) && canresume(s))) {
+        return 0;
+    }
+    Buf b(&scratch, 256 + left.len);
+    print(&b, "Your todo list still has items that are not done:\n");
+    print(&b, left);
+    print(&b, "Continue with them now. If some are finished already, or "
+              "will not be done, update the list with todo_write first, "
+              "then end your turn.");
+    Str text = finish(&b);
+    if (!nudge(s, scratch, N_TODO, text)) {
+        return 0;
+    }
+    prepare(s, scratch);
+    return 1;
+}
+
+// After a step: many changes without the list changing is a sign that
+// it has gone stale.
+static void todoremind(Session *s, Arena scratch)
+{
+    if (!s->todos.len || s->mutations<TODO_REMIND) {
+        return;
+    }
+    s->mutations = 0;
+    nudge(s, scratch, N_REMIND, "You have made 12 changes since your todo "
+          "list last changed. Update it with todo_write, so that it shows "
+          "what is done and what comes next.");
+}
+
+
+// Run one call. Returns 1 if it finished, 0 if it goes on (a command or
+// a search, or an ask waiting for the user).
 static b32 runtool(Session *s, Arena scratch)
 {
     Engine *e    = s->e;
@@ -2078,15 +3260,16 @@ static b32 runtool(Session *s, Arena scratch)
     }
 
     // The guard comes first: a path it questions is asked about before
-    // the call starts
-    if (!s->blocked && tool!=TOOL_NONE && tool!=TOOL_SHELL && !args.issues.len) {
-        GuardPath g = guardpath(e->os, &scratch, &s->guard, args.path, tool==TOOL_READ);
+    // the call starts. A search without a path searches the working
+    // directory.
+    if (!s->blocked && tool!=TOOL_NONE && toolhaspath(tool) && !args.issues.len) {
+        Str       want = args.path.data ? args.path : Str(".");
+        GuardPath g    = guardpath(e->os, &scratch, &s->guard, want, toolreads(tool));
         if (!g.inside) {
             return askcall(s, scratch, tool, &g);
         }
         toolstart(s, scratch);
-        runfile(s, scratch, tool, g.path, &args);
-        return 1;
+        return runfile(s, scratch, tool, g.path, &args);
     }
 
     toolstart(s, scratch);
@@ -2120,6 +3303,16 @@ static b32 runtool(Session *s, Arena scratch)
         return 1;
     }
 
+    switch (tool) {
+    case TOOL_TODO:    tooltodo(s, scratch, &args);    return 1;
+    case TOOL_JOBS:    tooljobs(s, scratch);           return 1;
+    case TOOL_JOBOUT:  tooljobout(s, scratch, &args);  return 1;
+    case TOOL_JOBKILL: tooljobkill(s, scratch, &args); return 1;
+    }
+    if (args.background) {
+        startjob(s, scratch, &args);
+        return 1;
+    }
     if (!startshell(s, scratch, &args)) {
         Str err  = os_lasterr(e->os, &scratch);
         Str text = concat(&scratch, "The shell could not be started: ", err);
@@ -2161,6 +3354,7 @@ static void toolsdone(Session *s, Arena scratch)
             return;
         }
     }
+    todoremind(s, scratch);
     prepare(s, scratch);
 }
 
@@ -2168,6 +3362,9 @@ static void nexttool(Session *s, Arena scratch)
 {
     while (s->callidx < s->calls.len) {
         Arena a = scratch;
+        if (s->state == S_TOOL) {
+            return;  // a call already runs (one an answer allowed)
+        }
         if (s->cancelled) {
             toolstart(s, a);
             toolend(s, a, "cancelled", "Not run: the user cancelled the turn.",
@@ -2511,7 +3708,7 @@ static void finalize(Session *s, Arena scratch)
                 return;
             }
             prepare(s, scratch);
-        } else {
+        } else if (!todonudge(s, scratch)) {
             endturn(s, scratch, "done", {});
         }
         return;
@@ -2542,6 +3739,8 @@ static void prepare(Session *s, Arena scratch)
         endturn(s, scratch, "cancel", {});
         return;
     }
+    deliver(s, scratch);
+    s->wake = 0;
 
     s->steps++;
     s->retries = 0;
@@ -2616,6 +3815,32 @@ static void settitle(Session *s, Arena scratch, Str title)
     os_write(s->e->os, scratch, path, s->title);
 }
 
+// Begin a turn, after its user input if any: via names what began it
+// without input ("job": notices of background jobs), else is null.
+static void beginturn(Session *s, Arena scratch, Str via)
+{
+    s->cancelled = 0;
+    s->turn++;
+    {
+        Arena a = scratch;
+        Buf   b(&a, 128);
+        EvOut w = sbegin(s, &b, EV_TURN);
+        putintkey(&w.json, "n", s->turn);
+        if (via.len) {
+            putstrkey(&w.json, "via", via);
+        }
+        ssend(s, &w);
+    }
+    s->steps      = 0;
+    s->attempts   = 0;
+    s->setrepeat  = 0;
+    s->lastset    = 0;
+    s->discovered = s->info.learned || (s->info.found && !s->info.llamacpp);
+    resetnudges(s, 1);
+    instrcheck(s, scratch);
+    prepare(s, scratch);
+}
+
 static void startturn(Session *s, Arena scratch, Str text, Str via)
 {
     s->cancelled = 0;
@@ -2624,21 +3849,7 @@ static void startturn(Session *s, Arena scratch, Str text, Str via)
         Str title = maketitle(&scratch, text);
         settitle(s, scratch, title);
     }
-    s->turn++;
-    {
-        Arena a = scratch;
-        Buf   b(&a, 128);
-        EvOut w = sbegin(s, &b, EV_TURN);
-        putintkey(&w.json, "n", s->turn);
-        ssend(s, &w);
-    }
-    s->steps      = 0;
-    s->attempts   = 0;
-    s->setrepeat  = 0;
-    s->lastset    = 0;
-    s->discovered = s->info.learned || (s->info.found && !s->info.llamacpp);
-    resetnudges(s);
-    prepare(s, scratch);
+    beginturn(s, scratch, {});
 }
 
 static void endturn(Session *s, Arena scratch, Str why, Str err)
@@ -2650,7 +3861,9 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
         pump(s->e, s->point);
     }
     for (i32 t = 0; t < T_COUNT; t++) {
-        disarm(s, t);
+        if (t != T_JOBS) {
+            disarm(s, t);  // jobs outlive turns
+        }
     }
     s->part     = 0;
     s->purpose  = REQ_CHAT;
@@ -2658,6 +3871,9 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     s->slowing  = 0;
     s->slowfrom = 0;
     s->slown    = 0;
+    // A job that ended after the turn's last request starts the next
+    b32 resume = !s->steers.len && !s->queued.len && !s->closed && s->wake &&
+                 s->notices.len && canresume(s);
     {
         Arena a = scratch;
         Buf   b(&a, 256 + err.len);
@@ -2666,6 +3882,9 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
         putstrkey(&w.json, "why", why);
         if (err.len) {
             putstrkey(&w.json, "err", err);
+        }
+        if (resume) {
+            putintkey(&w.json, "resume", 1);
         }
         ssend(s, &w);
     }
@@ -2682,6 +3901,10 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
         s->queued.len--;
         s->queued.cap--;
         startturn(s, scratch, next, "queue");
+    } else if (s->closed) {
+        stopjobs(s, scratch, 0);  // started after the session closed
+    } else if (resume) {
+        autoresume(s, scratch);
     }
 }
 
@@ -2884,9 +4107,62 @@ static Guard sessionguard(Session *s, Arena *perm)
     return newguard(e->os, perm, s->cwd, e->home, roots, s->dir, s->te.windows);
 }
 
-static void sessionready(Session *s)
+// The job limits the session's tools describe, from the configuration.
+static void jobconf(Session *s)
+{
+    Config *cfg = s->e->cfg;
+    i64     dft = cfgms(cfg, "tools", "", "job_timeout", 0) / 1000;
+    i64     max = cfgms(cfg, "tools", "", "job_timeout_max", 0) / 1000;
+    max = max<1 ? 1 : max;
+    s->te.jobmax     = max;
+    s->te.jobtimeout = dft<1 ? 1 : dft>max ? max : dft;
+}
+
+// Discover the session's instruction files, unless its log told which
+// already (loadsession). The record of them waits for the session's own
+// record to be in place (instrlogstart).
+static void instrstart(Session *s, Arena scratch)
 {
     Engine *e = s->e;
+    if (s->instr.data) {
+        return;
+    }
+    Str          cwd   = normpath(&scratch, s->cwd, ".", s->te.windows);
+    Slice<Str>   names = instrlist(s, &scratch);
+    Instructions in    = instructions(e->os, &scratch, cwd, e->global, names,
+                                      e->home, s->te.windows);
+    s->instr = in.text.data ? clone(&s->perm, in.text) : Str{(u8 *)"", 0};
+    instrstamp(s, in.files);
+
+    Instructions *p = &s->instrpend;
+    *p = {};
+    for (iz i = 0; i < in.files.len; i++) {
+        InstrFile f = in.files[i];
+        f.text     = {};
+        f.path     = clone(&s->perm, f.path);
+        f.importer = f.importer.data ? clone(&s->perm, f.importer) : Str{};
+        p->files   = push(&s->perm, p->files, f);
+    }
+    for (iz i = 0; i < in.skipped.len; i++) {
+        p->skipped = push(&s->perm, p->skipped, clone(&s->perm, in.skipped[i]));
+    }
+    s->instrlog = 1;
+}
+
+static void instrlogstart(Session *s, Arena scratch)
+{
+    if (s->instrlog && !s->readonly) {
+        s->instrlog = 0;
+        loginstr(s, scratch, s->instrpend.files, s->instrpend.skipped,
+                 "start", s->instr);
+    }
+}
+
+static void sessionready(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    jobconf(s);
+    instrstart(s, scratch);
     s->home      = s->ep.name.len ? s->ep.name : s->ep.url;
     s->homemodel = s->model;
     s->system    = systemprompt(&s->perm, s->cwd, &s->te);
@@ -2907,6 +4183,14 @@ static void sessionready(Session *s)
                            "\n\nBesides the working directory, the file "
                            "tools may also use these directories:");
         s->system = concat(&s->perm, s->system, list);
+    }
+    if (s->instr.len) {
+        s->system = concat(&s->perm, s->system,
+                           "\n\n# Instructions\n\nThe user and the project "
+                           "gave these instructions. Follow them; where they "
+                           "disagree, a file in a deeper directory wins over "
+                           "those above it.");
+        s->system = concat(&s->perm, s->system, s->instr);
     }
     s->next = e->sessions;
     e->sessions = s;
@@ -2996,7 +4280,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "cannot open the session log", {});
         return;
     }
-    sessionready(s);
+    sessionready(s, scratch);
 
     {
         Arena a = scratch;
@@ -3018,11 +4302,152 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         }
         ssend(s, &w);
     }
+    instrlogstart(s, scratch);
     reply(e, scratch, id, 1, {}, s->sid);
 
     Str prompt = jsonstr(jsonget(j, "prompt"));
     if (prompt.len) {
         startturn(s, scratch, prompt, "prompt");
+    }
+}
+
+// What the tools keep of a session, from one record of its log: where
+// calls started, jobs, the todo list, snapshots, instruction files, and
+// the notices the agent read.
+static void replaytools(Session *s, Arena scratch, EvRec *r)
+{
+    Json *j    = r->root;
+    Str   call = jsonstr(jsonget(j, "call"));
+    switch (r->ev) {
+    case EV_TOOLSTART: {
+        CallMark k = {clone(&s->perm, call), r->seq, s->turn};
+        s->marks = push(&s->perm, s->marks, k);
+    } break;
+
+    case EV_JOBSTART: {
+        Job *jb = alloc<Job>(&s->perm);
+        jb->n       = jsonint(jsonget(j, "job"), 0);
+        jb->call    = clone(&s->perm, call);
+        jb->command = clone(&s->perm, jsonstr(jsonget(j, "command")));
+        jb->rel     = clone(&s->perm, jsonstr(jsonget(j, "spill")));
+        jb->spill   = clone(&s->perm, join(&scratch, s->dir, jb->rel));
+        jb->state   = JOB_RUN;  // until its end
+        jb->quiet   = 1;        // nothing to tell before its end
+        jb->next    = s->jobs;
+        s->jobs     = jb;
+        s->njobs    = jb->n>s->njobs ? jb->n : s->njobs;
+    } break;
+
+    case EV_JOBEND: {
+        Job *jb = jobfind(s, jsonint(jsonget(j, "job"), 0));
+        if (!jb) break;
+        Str st = jsonstr(jsonget(j, "status"));
+        jb->state  = JOB_DONE;
+        jb->why    = JOBEND_LOST;
+        for (i32 k = 0; k < JOBEND_COUNT; k++) {
+            jb->why = jobendnames[k]==st ? k : jb->why;
+        }
+        jb->code   = (i32)jsonint(jsonget(j, "exit"), 0);
+        jb->signal = (i32)jsonint(jsonget(j, "signal"), 0);
+        jb->total  = jsonint(jsonget(j, "bytes"), 0);
+        jb->ran    = jsonint(jsonget(j, "ms"), 0) * MS;
+        jb->quiet  = !jsonflag(jsonget(j, "notice"), 1);
+    } break;
+
+    case EV_NOTICE: {
+        Msg m = {};
+        m.role = ROLE_USER;
+        m.text = clone(&s->perm, jsonstr(jsonget(j, "text")));
+        addmsg(s, m);
+        Job *jb = jobfind(s, jsonint(jsonget(j, "job"), 0));
+        if (jb && jsonstr(jsonget(j, "kind"))=="job") {
+            jb->quiet = 1;
+        }
+    } break;
+
+    case EV_TODO: {
+        s->todos = {};
+        for (Json *k = jsonget(j, "items")->child; k; k = k->next) {
+            TodoItem t = {};
+            t.content = clone(&s->perm, jsonstr(jsonget(k, "content")));
+            t.status  = todostatus(jsonstr(jsonget(k, "status")));
+            t.status  = t.status<0 ? TODO_PENDING : t.status;
+            s->todos  = push(&s->perm, s->todos, t);
+        }
+    } break;
+
+    case EV_SNAP: {
+        Snap sn = {};
+        Str  name = jsonstr(jsonget(j, "snap"));
+        sn.n       = parseint(cuthead(name, startswith(name, "snap/") ? 5 : 0)).val;
+        sn.seq     = r->seq;
+        sn.turn    = s->turn;
+        sn.call    = clone(&s->perm, call);
+        sn.path    = clone(&s->perm, jsonstr(jsonget(j, "path")));
+        sn.before  = clone(&s->perm, jsonstr(jsonget(j, "hash_before")));
+        sn.after   = clone(&s->perm, jsonstr(jsonget(j, "hash_after")));
+        sn.existed = jsonflag(jsonget(j, "existed"), 0);
+        s->snaps   = push(&s->perm, s->snaps, sn);
+        s->nsnap   = sn.n>s->nsnap ? sn.n : s->nsnap;
+    } break;
+
+    case EV_REWIND:
+        for (Json *k = jsonget(j, "undone")->child; k; k = k->next) {
+            Str name = jsonstr(k);
+            for (iz i = 0; i < s->snaps.len; i++) {
+                if (snapname(&scratch, s->snaps[i].n) == name) {
+                    s->snaps[i].undone = 1;
+                }
+            }
+        }
+        break;
+
+    case EV_INSTRUCTIONS: {
+        Str why = jsonstr(jsonget(j, "why"));
+        if (why == "start") {
+            s->instr = clone(&s->perm, jsonstr(jsonget(j, "text")));
+            s->instr.data = s->instr.data ? s->instr.data : (u8 *)"";
+        }
+        for (Json *k = jsonget(j, "files")->child; k; k = k->next) {
+            Str         path = jsonstr(jsonget(k, "path"));
+            InstrStamp *at   = 0;
+            for (iz i = 0; i < s->instrfiles.len; i++) {
+                at = s->instrfiles[i].path==path ? &s->instrfiles[i] : at;
+            }
+            if (!at) {
+                InstrStamp n = {clone(&s->perm, path), 0, 0};
+                s->instrfiles = push(&s->perm, s->instrfiles, n);
+                at = &s->instrfiles[s->instrfiles.len-1];
+            }
+            at->size  = jsonint(jsonget(k, "bytes"), 0);
+            at->mtime = jsonint(jsonget(k, "mtime"), 0);
+        }
+    } break;
+    }
+}
+
+// After replaying a log: jobs whose end the agent never heard of are
+// told at its next request. Any still open were in another process, and
+// are over for this one.
+static void replayjobs(Session *s, Arena scratch)
+{
+    Slice<Job *> untold = {};
+    for (Job *j = s->jobs; j; j = j->next) {
+        if (j->state != JOB_DONE) {
+            j->state = JOB_DONE;
+            j->why   = JOBEND_LOST;
+            j->quiet = 0;
+        }
+        if (!j->quiet) {
+            untold = push(&scratch, untold, j);
+        }
+    }
+    for (iz i = untold.len-1; i >= 0; i--) {  // oldest first
+        Job  *j  = untold[i];
+        Arena a  = scratch;
+        Str  text = jobnotice(s, &a, j, j->total);
+        notify(s, "job", text, j->n);
+        j->quiet = 1;
     }
 }
 
@@ -3129,6 +4554,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             addmsg(s, m);
             break;
         }
+        replaytools(s, t, &r);
     }
     if (!s->cwd.len) {
         dropsession(e, s);
@@ -3140,7 +4566,9 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         return 0;
     }
     modelconf(e, &s->perm, s->model, &s->mc);
-    sessionready(s);
+    replayjobs(s, scratch);
+    sessionready(s, scratch);
+    instrlogstart(s, scratch);
     return s;
 }
 
@@ -3256,6 +4684,7 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
         }
     }
     sendsnapshot(s, scratch);
+    s->closed = 0;
 
     Buf   b(&scratch, 256);
     EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
@@ -3264,6 +4693,181 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
     putintkey(&w.json, "readonly", s->readonly);
     emit(e, evend(&w));
     live(s);  // the state of a session that was open already
+}
+
+struct RewindFile {
+    Str path;
+    Str result;  // restored, removed, unchanged, conflict, failed
+};
+
+// rewind {sid, to, force}: put back, newest first, the files that write
+// and edit changed at or after a call (to: its id) or a turn (to: its
+// number), unless something else changed them since, which is a
+// conflict, left alone unless forced. Logs a rewind record and tells
+// the agent at its next request.
+static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
+{
+    Os  *os    = e->os;
+    Json *to   = jsonget(j, "to");
+    b32  force = jsonflag(jsonget(j, "force"), 0);
+    i64  seq0  = -1;   // snaps after this record
+    i64  turn0 = -1;   // or from this turn on
+    Str  label = {};
+    if (busy(s)) {
+        reply(e, scratch, id, 0, "the session is busy: cancel its turn first", s->sid);
+        return;
+    } else if (to->type == JSON_STRING) {
+        for (iz i = 0; i<s->marks.len && seq0<0; i++) {
+            seq0 = s->marks[i].call==to->str ? s->marks[i].seq : seq0;
+        }
+        if (seq0 < 0) {
+            reply(e, scratch, id, 0, "no call with that id in this session", s->sid);
+            return;
+        }
+        label = concat(&scratch, "before call ", to->str);
+    } else if (to->type == JSON_NUMBER) {
+        turn0 = jsonint(to, -1);
+        if (turn0<1 || turn0>s->turn) {
+            reply(e, scratch, id, 0, "no turn with that number in this session", s->sid);
+            return;
+        }
+        Buf b(&scratch, 32);
+        print(&b, "to the start of turn ");
+        print(&b, turn0);
+        label = finish(&b);
+    } else {
+        reply(e, scratch, id, 0, "to must be a call id or a turn number", s->sid);
+        return;
+    }
+
+    Slice<RewindFile> files  = {};
+    Slice<Str>        undone = {};
+    for (iz i = s->snaps.len-1; i >= 0; i--) {
+        Snap *sn = &s->snaps[i];
+        if (sn->undone || (turn0>=0 ? sn->turn<turn0 : sn->seq<=seq0)) {
+            continue;
+        }
+        // One result for each file: its oldest change decides, unless a
+        // newer one found a conflict
+        RewindFile *f = 0;
+        for (iz k = 0; k<files.len && !f; k++) {
+            f = files[k].path==sn->path ? &files[k] : 0;
+        }
+        if (f && f->result=="conflict") {
+            continue;
+        }
+        Arena a   = scratch;
+        Read  cur = os_read(os, &a, sn->path, (iz)FILE_MAX);
+        Str   now = cur.err==READ_NOTFOUND ? Str("") :
+                    cur.err                ? Str("?") : hashstr(&a, hash(cur.data));
+        Str   result = {};
+        if (now == sn->before) {
+            result = "unchanged";  // as it was already
+        } else if (!force && now!=sn->after) {
+            result = "conflict";
+        } else if (sn->existed) {
+            Str  name = snapname(&a, sn->n);
+            Str  file = join(&a, s->dir, name);
+            Read old  = os_read(os, &a, file, (iz)FILE_MAX);
+            Str  dir  = normpath(&a, sn->path, "..", s->te.windows);
+            b32  ok   = !old.err;
+            if (ok && os_stat(os, a, dir).type!=STAT_DIR) {
+                ok = os_mkdirs(os, a, dir);
+            }
+            ok = ok && os_write(os, a, sn->path, old.data);
+            result = ok ? Str("restored") : Str("failed");
+        } else {
+            b32 ok = cur.err==READ_NOTFOUND || os_remove(os, a, sn->path);
+            result = ok ? Str("removed") : Str("failed");
+        }
+        if (result!="conflict" && result!="failed") {
+            sn->undone = 1;
+            undone = push(&scratch, undone, snapname(&scratch, sn->n));
+        }
+        if (f) {
+            f->result = result;
+        } else {
+            RewindFile n = {sn->path, result};
+            files = push(&scratch, files, n);
+        }
+    }
+
+    Str note = "Changes made by shell commands are not tracked, so they "
+               "were not undone.";
+    if (files.len) {
+        Buf   b(&scratch, 1024);
+        EvOut w = sbegin(s, &b, EV_REWIND);
+        putkey(&w.json, "to");
+        putjson(&w.json, to);
+        putintkey(&w.json, "force", force);
+        putkey(&w.json, "files");
+        putarray(&w.json);
+        for (iz i = 0; i < files.len; i++) {
+            putobject(&w.json);
+            putstrkey(&w.json, "path", files[i].path);
+            putstrkey(&w.json, "result", files[i].result);
+            putend(&w.json);
+        }
+        putend(&w.json);
+        putkey(&w.json, "undone");
+        putarray(&w.json);
+        for (iz i = 0; i < undone.len; i++) {
+            putstr(&w.json, undone[i]);
+        }
+        putend(&w.json);
+        putstrkey(&w.json, "note", note);
+        ssend(s, &w);
+
+        // What the agent reads at its next request
+        static struct {
+            Str result;
+            Str head;
+        } const groups[] = {
+            {"restored",  "Put back as they were: "},
+            {"removed",   "Removed, since they did not exist then: "},
+            {"unchanged", "Already as they were: "},
+            {"conflict",  "Left as they are, since something else changed "
+                          "them after the harness did: "},
+            {"failed",    "Could not be put back: "},
+        };
+        Buf t(&scratch, 1024);
+        print(&t, "The user rewound the files the harness changed, ");
+        print(&t, label);
+        print(&t, ".");
+        for (iz g = 0; g < countof(groups); g++) {
+            iz n = 0;
+            for (iz i = 0; i < files.len; i++) {
+                if (files[i].result != groups[g].result) continue;
+                print(&t, n++ ? Str(", ") : Str("\n"));
+                if (n == 1) print(&t, groups[g].head);
+                print(&t, showpath(s->guard.cwd, files[i].path));
+            }
+        }
+        print(&t, "\nChanges made by shell commands were not undone. Read "
+                  "files again before you edit them.");
+        Str text = finish(&t);
+        notify(s, "rewind", text, 0);
+    } else {
+        note = "Nothing to rewind: write and edit changed no files at or "
+               "after that point. Changes made by shell commands are not "
+               "tracked.";
+    }
+
+    Buf   b(&scratch, 1024);
+    EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putkey(&w.json, "files");
+    putarray(&w.json);
+    for (iz i = 0; i < files.len; i++) {
+        putobject(&w.json);
+        putstrkey(&w.json, "path", files[i].path);
+        putstrkey(&w.json, "result", files[i].result);
+        putend(&w.json);
+    }
+    putend(&w.json);
+    putstrkey(&w.json, "note", note);
+    emit(e, evend(&w));
 }
 
 static void cmdlist(Engine *e, Arena scratch, i64 id)
@@ -3313,6 +4917,7 @@ static void cmdlist(Engine *e, Arena scratch, i64 id)
         putstrkey(&w.json, "state", live ? statenames[live->state] : Str("closed"));
         putintkey(&w.json, "mtime", list[i].mtime);
         putintkey(&w.json, "locked", list[i].locked);
+        putintkey(&w.json, "jobs", live ? jobsrunning(live) : 0);
         putend(&w.json);
     }
     putend(&w.json);
@@ -3414,6 +5019,7 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_PROMPT:
         case CMD_STEER:
         case CMD_ANSWER:
+        case CMD_REWIND:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -3454,6 +5060,7 @@ static void command(Engine *e, Arena scratch, Str line)
         }
         for (Session *t = e->sessions; t; t = t->next) {
             cancelturn(t, scratch);
+            stopjobs(t, scratch, 1);
         }
         reply(e, scratch, id, 1, {}, {});
     } return;
@@ -3476,14 +5083,30 @@ static void command(Engine *e, Arena scratch, Str line)
     }
     switch (cmd) {
     case CMD_CLOSE:
-        // Nobody is left to answer asks
+        // Nobody is left to answer asks, nor to need background jobs
         reply(e, scratch, id, 1, {}, sid);
         s->attended = 0;
+        if (!s->readonly) {
+            s->closed = 1;
+            stopjobs(s, scratch, 0);
+        }
         if (s->state == S_ASK) {
             resolve(s, scratch, 0, DENY_POLICY, "the user closed the session");
             nexttool(s, scratch);
         }
         return;
+    case CMD_REWIND:
+        cmdrewind(e, s, scratch, id, j);
+        return;
+    case CMD_JOBKILL: {
+        Job *jb = jobfind(s, jsonint(jsonget(j, "job"), 0));
+        if (!jb) {
+            reply(e, scratch, id, 0, "no such job in this session", sid);
+            return;
+        }
+        reply(e, scratch, id, 1, {}, sid);
+        jobstop(s, jb, JOBEND_KILLED);  // the agent is told as it ends
+    } return;
     case CMD_PROMPT:
     case CMD_STEER:
         if (!text.len) {
@@ -3555,8 +5178,16 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         return;
     }
 
-    b32      proc = r.type>=PROC_TAIL && r.type<=PROC_DATA;
-    Session *s    = sessionbyid(e, r.id, proc);
+    b32 proc = r.type>=PROC_TAIL && r.type<=PROC_DATA;
+    if (proc) {
+        Job     *j  = 0;
+        Session *js = jobbyproc(e, r.id, &j);
+        if (js) {
+            jobrecord(js, scratch, j, r);
+            return;
+        }
+    }
+    Session *s = sessionbyid(e, r.id, proc);
     if (!s) {
         return;  // a request or process already given up on
     }
@@ -3652,12 +5283,30 @@ static void ontimer(Session *s, Arena scratch, i32 t)
         sendreq(s, scratch);
         return;
     case T_TOOL:
+        if (s->sh.tool != TOOL_SHELL) {
+            // A search out of time: keep what it found
+            s->sh.timedout = 1;
+            os_kill(e->os, s->proc, 1);
+            arm(s, T_DRAIN, DRAIN);
+            return;
+        } else if (s->sh.exited) {
+            return;  // done, and draining its output already
+        } else if (jobsrunning(s) < JOB_RUNNING) {
+            movetojob(s, scratch);
+            nexttool(s, scratch);
+            return;
+        }
+        // No room for another job: stopped like a cancelled command
         s->sh.timedout = 1;
+        s->sh.nojob    = 1;
         os_kill(e->os, s->proc, 0);
-        arm(s, T_KILL, KILLWAIT);
+        arm(s, T_KILL, stopgrace(e));
         return;
     case T_KILL:
         os_kill(e->os, s->proc, 1);
+        return;
+    case T_JOBS:
+        jobtick(s, scratch);
         return;
     case T_DRAIN:
         finishshell(s, scratch, 0);
@@ -3779,6 +5428,25 @@ static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir, b32 win
     return te;
 }
 
+// An executable on PATH, by its file name, or null.
+static Str findpath(Os *os, Arena *perm, Arena scratch, Str name, b32 win)
+{
+    Str path = os_getenv(os, &scratch, "PATH");
+    for (Str rest = path; rest.len;) {
+        Cut c = cut(rest, win ? ';' : ':');
+        rest = c.tail;
+        if (!c.head.len) {
+            continue;
+        }
+        Arena a = scratch;
+        Str   p = join(&a, c.head, name);
+        if (os_stat(os, a, p).type == STAT_FILE) {
+            return clone(perm, p);
+        }
+    }
+    return {};
+}
+
 // An engine with its configuration (config.cpp), which from now on
 // belongs to the engine thread: frontends use config.get and config.set.
 static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
@@ -3802,10 +5470,20 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     Str exe    = os_exepath(os, &e->perm);
     e->exedir  = parentdir(exe);
     e->te      = findshell(os, &e->perm, newarena(e->scratch), e->exedir, HOST_WINDOWS);
+    e->te.exe  = exe;
     e->env     = os_environ(os, &e->perm);
     e->home    = os_getenv(os, &e->perm, "HOME");
     if (HOST_WINDOWS && !e->home.len) {
         e->home = os_getenv(os, &e->perm, "USERPROFILE");
+    }
+    if (cfgbool(trim(cfgget(cfg, "tools", "", "use_rg", 0))) != 0) {
+        Str rg = HOST_WINDOWS ? Str("rg.exe") : Str("rg");
+        e->te.rg = findpath(os, &e->perm, newarena(e->scratch), rg, HOST_WINDOWS);
+    }
+    // The user's own instructions, next to the configuration
+    Str conf = cfgdefault(os, &e->perm);
+    if (conf.len) {
+        e->global = normpath(&e->perm, parentdir(conf), "AGENTS.md", HOST_WINDOWS);
     }
     loadtrained(e, newarena(e->scratch));
     // Tests shorten minutes of slow retries to milliseconds

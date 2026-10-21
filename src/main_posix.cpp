@@ -30,6 +30,13 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#  include <libproc.h>     // proc_listpids, proc_pidinfo
+#  include <sys/sysctl.h>  // KERN_PROC_SESSION
+#endif
+#ifdef __linux__
+#  include <sys/prctl.h>   // PR_SET_CHILD_SUBREAPER
+#endif
 #if HARNESS_GUI
 #  include <SDL3/SDL.h>
 #  include "imgui.h"
@@ -817,11 +824,21 @@ static Str os_lasterr(Os *, Arena *a)
 // on fd 4. The reaper leads a new session and process
 // group and starts the tool in it, then reports the tool's exit status
 // on fd 4 and stays alive, so that the group id, its own pid, cannot be
-// reused until the harness kills the whole group (os_kill) and reaps
-// it. Every reaper shares the lifeline, whose write end only the harness
-// holds: when the harness dies, by any means, the lifeline reads EOF and
-// each reaper kills its group, TERM and then KILL 2 s later. A process
-// that leaves the group (setsid, setpgid) escapes all of this.
+// reused until the tree is gone. Every reaper shares the lifeline, whose
+// write end only the harness holds: when the harness dies, by any means,
+// the lifeline reads EOF and each reaper ends its tree, TERM and then
+// KILL 2 s later.
+//
+// A hard kill (os_kill) asks the reaper, with SIGUSR1, to sweep: it
+// kills every process it can find that came from the tool, round after
+// round until none is left, then its group with itself in it. That
+// covers the processes that left the group (setsid, setpgid). On Linux
+// the reaper is a child subreaper, so such escapees become its children
+// once their parents die, and the sweep finds the whole tree through
+// /proc. On macOS it records the tool's descendants every 250 ms, pid
+// and start time, and the sweep kills those still alive as recorded,
+// with whatever is left in its session: an escapee whose parent dies
+// within one interval of its leaving can still get away.
 //
 // Each Proc has a reader thread, pumping output into the file, and a
 // waiter thread, reading the status and then reaping the reaper. Both
@@ -1300,8 +1317,18 @@ static b32 os_procwrite(Os *, Proc *p, Str data)
 static void os_kill(Os *, Proc *p, b32 hard)
 {
     os_lock(&p->lock);
-    if (!p->reaped) {
-        kill(-p->pid, hard ? SIGKILL : SIGTERM);
+    if (!p->reaped && !hard) {
+        kill(-p->pid, SIGTERM);  // the reaper ignores it
+    } else if (!p->reaped) {
+        // The reaper sweeps, unless it is dead already: then its group
+        // goes as before, its pid still held, unreaped
+        siginfo_t si = {};
+        if (waitid(P_PID, (id_t)p->pid, &si, WEXITED|WNOHANG|WNOWAIT) || si.si_pid) {
+            kill(-p->pid, SIGKILL);
+        } else {
+            kill(p->pid, SIGUSR1);
+            kill(p->pid, SIGCONT);  // should something have stopped it
+        }
     }
     os_unlock(&p->lock);
 }
@@ -1314,8 +1341,10 @@ static void os_procfree(Os *os, Proc *p)
     procrelease(p);
 }
 
-// Reaper only: the SIGCHLD self-pipe's write end.
-static i32 reapchld = -1;
+// Reaper only: the self-pipe's write end, for SIGCHLD and SIGUSR1, and
+// whether a sweep was asked for. The reaper is single-threaded.
+static i32          reapchld = -1;
+static volatile i32 reapasked;
 
 static void onchld(int)
 {
@@ -1323,6 +1352,12 @@ static void onchld(int)
     u8  b    = 0;
     while (write(reapchld, &b, 1)<0 && errno==EINTR) {}
     errno = save;
+}
+
+static void onsweep(int sig)
+{
+    reapasked = 1;
+    onchld(sig);
 }
 
 static void reapsay(char const *what, char const *arg)
@@ -1346,6 +1381,279 @@ static void reapstatus(i32 code, i32 sig)
     close(4);
 }
 
+enum : iz {
+    REAP_PROCS = 1<<15,  // processes on the system, as much as is looked at
+    REAP_SEEN  = 1<<12,  // descendants recorded (macOS)
+};
+
+struct ReapProc {
+    i32 pid;
+    i32 ppid;
+    i32 pgrp;
+    i32 sid;
+    i64 start;  // macOS: start time, microseconds
+};
+
+struct Reaper {
+    i32      self;
+    i32      tool;
+    b32      reported;  // the tool's status went out on fd 4
+    ReapProc seen[REAP_SEEN];
+    iz       nseen;
+};
+
+static void reapnap(i64 ms)
+{
+    struct timespec ts = {(time_t)(ms/1000), (long)(ms%1000*1000000)};
+    while (nanosleep(&ts, &ts)) {}
+}
+
+// Collect exited children: the tool, whose status is reported once, and
+// on Linux the orphans that came to the subreaper.
+static void reapchildren(Reaper *r)
+{
+    for (;;) {
+        i32 status = 0;
+        i32 pid    = waitpid(-1, &status, WNOHANG);
+        if (pid <= 0) {
+            return;
+        } else if (pid==r->tool && !r->reported) {
+            r->reported = 1;
+            if (WIFSIGNALED(status)) {
+                reapstatus(-1, WTERMSIG(status));
+            } else {
+                reapstatus(WEXITSTATUS(status), 0);
+            }
+        }
+    }
+}
+
+#if defined(__linux__)
+// Every live process, from /proc: pid, parent, group and session.
+static iz reapscan(ReapProc *out, iz cap)
+{
+    DIR *d = opendir("/proc");
+    if (!d) {
+        return 0;
+    }
+    iz n = 0;
+    for (struct dirent *e; n<cap && (e = readdir(d));) {
+        if (e->d_name[0]<'1' || e->d_name[0]>'9') {
+            continue;
+        }
+        char path[64] = "/proc/";
+        iz   len      = 6;
+        for (iz i = 0; e->d_name[i] && len<48; i++) {
+            path[len++] = e->d_name[i];
+        }
+        copybytes(path+len, (void *)"/stat", 6);
+        i32 fd = open(path, O_RDONLY|O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+        char buf[512];
+        iz   got = read(fd, buf, sizeof(buf)-1);
+        close(fd);
+        if (got <= 0) {
+            continue;
+        }
+        // "pid (comm) state ppid pgrp session ...", comm may hold anything
+        Str s     = {(u8 *)buf, got};
+        iz  paren = -1;
+        for (iz i = 0; i < s.len; i++) {
+            paren = s[i]==')' ? i : paren;
+        }
+        if (paren<0 || paren+2>=s.len) {
+            continue;
+        }
+        u8  state = s[paren+2];
+        i64 f[3]  = {};
+        iz  i     = paren + 3;
+        for (i32 k = 0; k < 3; k++) {
+            for (; i<s.len && s[i]==' '; i++) {}
+            iz j = i;
+            for (; j<s.len && digit(s[j]); j++) {}
+            f[k] = parseint(span(s.data+i, s.data+j)).val;
+            i = j;
+        }
+        Int pid = parseint(Str{(u8 *)e->d_name, (iz)__builtin_strlen(e->d_name)});
+        if (!pid.ok || state=='Z' || state=='X') {
+            continue;
+        }
+        ReapProc p = {};
+        p.pid  = (i32)pid.val;
+        p.ppid = (i32)f[0];
+        p.pgrp = (i32)f[1];
+        p.sid  = (i32)f[2];
+        out[n++] = p;
+    }
+    closedir(d);
+    return n;
+}
+
+static b32 ppidless(ReapProc *a, ReapProc *b)
+{
+    return a->ppid < b->ppid;
+}
+
+// Signal what came from the tool: the reaper's descendants, everything
+// orphaned having come to it, and anything left in its session. Returns
+// how many were signaled.
+static iz reapsignal(Reaper *r, i32 sig)
+{
+    static ReapProc procs[REAP_PROCS];
+    static ReapProc tmp[REAP_PROCS+1];
+    static u8       mine[REAP_PROCS];
+    static i32      queue[REAP_PROCS];
+    iz n = reapscan(procs, REAP_PROCS);
+
+    // Breadth first from the reaper, children found by parent
+    Arena a = {(byte *)tmp, (byte *)(tmp + REAP_PROCS + 1)};
+    sort(procs, n, ppidless, a);
+    for (iz i = 0; i < n; i++) {
+        mine[i] = 0;
+    }
+    iz head = 0, tail = 0;
+    queue[tail++] = r->self;
+    while (head < tail) {
+        i32 parent = queue[head++];
+        iz  lo = 0, hi = n;
+        while (lo < hi) {
+            iz mid = lo + (hi-lo)/2;
+            if (procs[mid].ppid < parent) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        for (iz i = lo; i<n && procs[i].ppid==parent && tail<REAP_PROCS; i++) {
+            if (!mine[i]) {
+                mine[i] = 1;
+                queue[tail++] = procs[i].pid;
+            }
+        }
+    }
+
+    iz count = 0;
+    for (iz i = 0; i < n; i++) {
+        if (procs[i].pid!=r->self && (mine[i] || procs[i].sid==r->self)) {
+            kill(procs[i].pid, sig);
+            count++;
+        }
+    }
+    return count;
+}
+
+static void reapsnapshot(Reaper *) {}
+
+#elif defined(__APPLE__)
+// Start time in microseconds of a live process, or 0 if gone, a zombie,
+// or not to be seen.
+static i64 reapstart(i32 pid)
+{
+    struct proc_bsdinfo bi = {};
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, PROC_PIDTBSDINFO_SIZE) !=
+            PROC_PIDTBSDINFO_SIZE || bi.pbi_status==SZOMB) {
+        return 0;
+    }
+    return (i64)bi.pbi_start_tvsec*1000000 + (i64)bi.pbi_start_tvusec;
+}
+
+static b32 reapknown(Reaper *r, i32 pid)
+{
+    for (iz i = 0; i < r->nseen; i++) {
+        if (r->seen[i].pid == pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Record the descendants of the reaper and of every descendant seen
+// before, which may have left for launchd, by pid and start time.
+static void reapsnapshot(Reaper *r)
+{
+    static i32 kids[4096];
+    for (iz at = -1; at < r->nseen; at++) {
+        i32 parent = at<0 ? r->self : r->seen[at].pid;
+        if (at>=0 && reapstart(parent)!=r->seen[at].start) {
+            continue;  // gone, or its pid used again
+        }
+        i32 bytes = proc_listpids(PROC_PPID_ONLY, (u32)parent, kids, sizeof(kids));
+        for (iz i = 0; i < bytes/(iz)sizeof(i32); i++) {
+            i32 pid = kids[i];
+            if (pid<=0 || reapknown(r, pid) || r->nseen==REAP_SEEN) {
+                continue;
+            }
+            i64 start = reapstart(pid);
+            if (start) {
+                ReapProc p = {};
+                p.pid   = pid;
+                p.ppid  = parent;
+                p.start = start;
+                r->seen[r->nseen++] = p;
+            }
+        }
+    }
+}
+
+// Signal what came from the tool: the descendants recorded, still the
+// same processes, and whatever is left in the reaper's session.
+static iz reapsignal(Reaper *r, i32 sig)
+{
+    reapsnapshot(r);
+    iz count = 0;
+    for (iz i = 0; i < r->nseen; i++) {
+        ReapProc *p = &r->seen[i];
+        if (p->start && reapstart(p->pid)==p->start) {
+            kill(p->pid, sig);
+            count++;
+        } else {
+            p->start = 0;  // gone for good
+        }
+    }
+
+    i32 mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_SESSION, r->self};
+    uz  len    = 0;
+    if (sysctl(mib, 4, 0, &len, 0, 0) || !len) {
+        return count;
+    }
+    len += len/2;  // room for growth since
+    struct kinfo_proc *kp = (struct kinfo_proc *)malloc(len);
+    if (kp && !sysctl(mib, 4, kp, &len, 0, 0)) {
+        for (iz i = 0; i < (iz)(len/sizeof(*kp)); i++) {
+            i32 pid = kp[i].kp_proc.p_pid;
+            if (pid!=r->self && kp[i].kp_proc.p_stat!=SZOMB) {
+                kill(pid, sig);
+                count++;
+            }
+        }
+    }
+    free(kp);
+    return count;
+}
+
+#else
+static void reapsnapshot(Reaper *) {}
+static iz   reapsignal(Reaper *, i32) { return 0; }
+#endif
+
+// Kill everything that came from the tool, round after round, until a
+// round finds nothing left: processes forked meanwhile are found in the
+// next. Then the group, the reaper with it. Never returns.
+[[noreturn]] static void reapsweep(Reaper *r)
+{
+    for (i32 round = 0; round < 50; round++) {
+        reapchildren(r);
+        if (!reapsignal(r, SIGKILL)) {
+            break;
+        }
+        reapnap(10);
+    }
+    kill(0, SIGKILL);
+    _exit(1);
+}
+
 // The reaper process: see "Processes" above. Never returns.
 [[noreturn]] static void reap(i32 argc, char **argv)
 {
@@ -1358,6 +1666,9 @@ static void reapstatus(i32 code, i32 sig)
     fcntl(4, F_SETFD, FD_CLOEXEC);
     #if defined(__linux__) && defined(SYS_close_range)
     syscall(SYS_close_range, 5u, ~0u, 4u);  // CLOSE_RANGE_CLOEXEC
+    #endif
+    #ifdef __linux__
+    prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);  // escapees come here
     #endif
 
     if (argc < 4) {
@@ -1380,6 +1691,9 @@ static void reapstatus(i32 code, i32 sig)
     sa.sa_handler = onchld;
     sa.sa_flags   = SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa, 0);
+    sa.sa_handler = onsweep;
+    sa.sa_flags   = 0;
+    sigaction(SIGUSR1, &sa, 0);  // before there is anything to sweep
 
     if (chdir(argv[2])) {
         reapsay("cannot change directory to", argv[2]);
@@ -1414,43 +1728,45 @@ static void reapstatus(i32 code, i32 sig)
     dup2(null, 1);
     dup2(null, 2);
 
-    b32 exited = 0;
+    static Reaper r;  // large, and the reaper has only this one
+    r.self = getpid();
+    r.tool = pid;
+    #ifdef __APPLE__
+    i32 every = 250;  // ms between snapshots of the tree
+    #else
+    i32 every = -1;
+    #endif
     for (;;) {
         struct pollfd fds[2] = {};
         fds[0].fd     = 3;
         fds[0].events = POLLIN;
-        fds[1].fd     = exited ? -1 : chld[0];
+        fds[1].fd     = chld[0];
         fds[1].events = POLLIN;
-        if (poll(fds, 2, -1) < 0) {
-            continue;  // EINTR from SIGCHLD
+        i32 n = poll(fds, 2, every);
+        u8  drain[64];
+        while (read(chld[0], drain, sizeof(drain)) > 0) {}
+        reapchildren(&r);
+        reapsnapshot(&r);
+        if (reapasked) {
+            reapsweep(&r);
         }
-        if (fds[0].revents) {
+        if (n>0 && fds[0].revents) {
             u8 b;
-            iz n = read(3, &b, 1);
-            if (n==0 || (n<0 && errno!=EINTR && errno!=EAGAIN)) {
+            iz got = read(3, &b, 1);
+            if (got==0 || (got<0 && errno!=EINTR && errno!=EAGAIN)) {
                 break;  // the harness is gone
-            }
-        }
-        if (!exited) {
-            u8 drain[64];
-            while (read(chld[0], drain, sizeof(drain)) > 0) {}
-            i32 status = 0;
-            if (waitpid(pid, &status, WNOHANG) == pid) {
-                exited = 1;
-                if (WIFSIGNALED(status)) {
-                    reapstatus(-1, WTERMSIG(status));
-                } else {
-                    reapstatus(WEXITSTATUS(status), 0);
-                }
             }
         }
     }
 
+    // Ask everything to stop, then sweep
     kill(0, SIGTERM);
-    struct timespec ts = {2, 0};
-    while (nanosleep(&ts, &ts)) {}
-    kill(0, SIGKILL);
-    _exit(1);
+    reapsignal(&r, SIGTERM);
+    for (i32 i = 0; i < 200; i++) {
+        reapnap(10);
+        reapchildren(&r);
+    }
+    reapsweep(&r);
 }
 
 

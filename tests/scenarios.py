@@ -72,6 +72,19 @@ class LocalHost:
         except OSError:
             return None
 
+    def touch(self, path, mtime):
+        os.utime(path, (mtime, mtime))
+
+    def bulk(self, base, files, mtimes=None):
+        """Write many files under base at once: {relative path: data},
+        with {relative path: modification time} for some."""
+        for rel, data in files.items():
+            path = os.path.join(base, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self.write(path, data)
+        for rel, t in (mtimes or {}).items():
+            self.touch(os.path.join(base, *rel.split("/")), t)
+
     def popen(self, args, cwd, stdin=False, env=None):
         return subprocess.Popen(
             [self.harness] + args, cwd=cwd,
@@ -164,6 +177,29 @@ class SshHost:
             return None
         return base64.b64decode("".join(out.split())).decode("utf-8", "replace")
 
+    def touch(self, path, mtime):
+        self.sh(f"touch -d @{int(mtime)} {shlex.quote(path)}")
+
+    def bulk(self, base, files, mtimes=None):
+        lines = []
+        for rel, data in files.items():
+            if isinstance(data, str):
+                data = data.encode()
+            path = shlex.quote(f"{base}/{rel}")
+            b = base64.b64encode(data).decode()
+            lines.append(f"mkdir -p $(dirname {path}) && echo {b} | base64 -d > {path}")
+        for rel, t in (mtimes or {}).items():
+            lines.append(f"touch -d @{int(t)} {shlex.quote(f'{base}/{rel}')}")
+        # In pieces: cmd.exe takes command lines of 8191 characters at most
+        piece = []
+        for line in lines + [None]:
+            if line is None or sum(len(x) + 1 for x in piece) + len(line) > 4000:
+                if piece:
+                    self.sh("\n".join(piece))
+                piece = []
+            if line is not None:
+                piece.append(line)
+
     def popen(self, args, cwd, stdin=False, env=None):
         def q(a):
             return '"' + a + '"' if (" " in a or not a) else a
@@ -254,21 +290,22 @@ class T:
         host.mkdir(self.work)
         host.mkdir(self.state)
         # Endpoint settings, with "_top" settings before any section,
-        # "_guard" settings in [guard], "_path" after the endpoint's URL,
-        # and "_extra" as more sections, where {model} and {model2} are
-        # the scenario's model names
+        # "_path" after the endpoint's URL, "_extra" as more sections,
+        # where {model} and {model2} are the scenario's model names, and
+        # any other "_name" as the section [name] ("_guard" in [guard],
+        # "_tools" in [tools] and so on)
         top = conf.pop("_top", {})
-        guard = conf.pop("_guard", {})
         path = conf.pop("_path", "")
         extra = conf.pop("_extra", "")
+        sections = {k[1:]: conf.pop(k) for k in list(conf) if k.startswith("_")}
         ini = {"first_byte_timeout": 5, "idle_timeout": 3,
                "progress_timeout": 6, "connect_timeout": 2}
         ini.update(conf)
         body = "".join(f"{k} = {v}\n" for k, v in top.items())
         body += f"[endpoint fake]\nurl = {host.url}/{path}\n" + "".join(
             f"{k} = {v}\n" for k, v in ini.items())
-        if guard:
-            body += "[guard]\n" + "".join(f"{k} = {v}\n" for k, v in guard.items())
+        for name, settings in sections.items():
+            body += f"[{name}]\n" + "".join(f"{k} = {v}\n" for k, v in settings.items())
         body += extra.format(model=self.model, model2=self.model2)
         host.write(self.config, body)
         self.notes = []
@@ -311,8 +348,8 @@ class T:
             raise Failure("sanitizer report:\n" + err[:4000])
         return Result(p.returncode, lines, err, time.monotonic() - t0)
 
-    def headless(self):
-        return Headless(self)
+    def headless(self, env=None):
+        return Headless(self, env)
 
     def file(self, rel):
         return self.host.read(self.host.join(self.work, rel))
@@ -356,9 +393,9 @@ class T:
 
 
 class Headless:
-    def __init__(self, t):
+    def __init__(self, t, env=None):
         self.t = t
-        self.p = t.host.popen(["--headless"] + t.args(), t.work, stdin=True)
+        self.p = t.host.popen(["--headless"] + t.args(), t.work, stdin=True, env=env)
         self.events = []
         self.cond = threading.Condition()
         self.reader = threading.Thread(target=self.read, daemon=True)
@@ -701,17 +738,569 @@ def length_think(t):
     t.check(r.all("assistant")[0]["finish"] == "length", "the stop is recorded")
 
 
-@scenario(bound=10)
+@scenario(conf={"_tools": {"job_timeout": 3}}, bound=15)
 def shell_timeout(t):
+    """A command still running at its timeout moves to the background as
+    a job; at the job's limit it is stopped, which starts a turn to tell
+    the agent, and run exits after that turn."""
     r = t.run()
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     end = r.all("tool.end")[0]
-    t.check(end["status"] == "timeout" and "timed out after 1 seconds" in end["text"],
-            f"timed out: {end}")
-    t.check(end["ms"] < 4500, f"TERM then KILL within bounds: {end['ms']} ms")
+    t.check(end["status"] == "background" and end.get("job") == 1 and
+            "first" in end["text"] and "background as job 1" in end["text"],
+            f"moved to the background: {end}")
+    t.check(end["ms"] < 2500, f"returned at its timeout: {end['ms']} ms")
+    js = r.last("job.start")
+    t.check(js.get("job") == 1 and js.get("call") == end["call"] and
+            js.get("spill") == end.get("spill"), f"job.start {js}")
+    je = r.last("job.end")
+    t.check(je.get("status") == "timeout" and je.get("resume") == 1 and
+            je.get("notice") == 1, f"job.end {je}")
+    t.seq(r, ["tool.end", "assistant", "turn.end", "job.end", "turn", "notice",
+              "attempt", "assistant", "turn.end"])
+    turns = r.all("turn")
+    t.check(len(turns) == 2 and turns[1].get("via") == "job", f"turns {turns}")
+    notice = r.last("notice")
+    t.check(notice.get("kind") == "job" and notice.get("job") == 1 and
+            "stopped at its time limit" in notice.get("text", "") and
+            "first" in notice.get("text", ""), f"notice {notice}")
+    msgs = t.requests()[-1]["body"]["messages"]
+    t.check(msgs[-1]["role"] == "user" and
+            msgs[-1]["content"].startswith("Background job 1 ended"),
+            f"the agent is told: {msgs[-1]}")
     pids = t.pids("pid1") + t.pids("pid2")
     t.check(len(pids) == 2, f"pids recorded: {pids}")
     t.check(t.gone(pids), f"the tree is gone: {pids}")
+    t.check(r.elapsed < 10, f"stopped at the job limit: {r.elapsed:.1f} s")
+
+
+@scenario(bound=10)
+def job_notice(t):
+    """A job started with background ends after the turn: its end starts
+    a turn by itself, with the end of its output."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "ok" and end.get("job") == 1 and
+            end["text"].startswith("Started background job 1"), f"started: {end}")
+    t.seq(r, ["job.start", "tool.end", "assistant", "turn.end", "job.end", "turn",
+              "notice", "attempt", "assistant", "turn.end"])
+    first = r.all("turn.end")[0]
+    t.check(not first.get("resume"), f"the job still ran at the turn's end: {first}")
+    je = r.last("job.end")
+    t.check(je.get("status") == "exited" and je.get("exit") == 0 and je.get("resume") == 1,
+            f"job.end {je}")
+    text = r.last("notice").get("text", "")
+    t.check("exited with code 0" in text and "done-42" in text, f"notice {text!r}")
+    t.check("Saw: Background job 1 ended: it exited with code 0" in r.text(),
+            f"text {r.text()!r}")
+
+
+@scenario(bound=10)
+def job_tools(t):
+    """jobs, job_output and job_kill; a job the agent stops is not
+    reported to it again."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    st = [e["status"] for e in ends]
+    t.check(st == ["ok", "ok", "ok", "error", "ok"], f"statuses {st}")
+    t.check("job 1: running for" in ends[1]["text"] and "jobpid" in ends[1]["text"],
+            f"jobs: {ends[1]['text']}")
+    out = ends[2]["text"]
+    t.check("lines 1-2:\nline1\nline2\n" in out and "offset=3" in out, f"job_output: {out!r}")
+    t.check("There is no job 7" in ends[3]["text"], f"no such job: {ends[3]['text']}")
+    t.check("asked to stop" in ends[4]["text"], f"job_kill: {ends[4]['text']}")
+    je = r.last("job.end")
+    t.check(je.get("status") == "killed" and je.get("notice") == 0 and
+            not je.get("resume"), f"job.end {je}")
+    t.check(not r.all("notice") and len(r.all("turn")) == 1, "nothing more to tell")
+    t.check(t.gone(t.pids("jobpid")), "the job's process is gone")
+
+
+@scenario(bound=10)
+def job_busy(t):
+    """A job that ends while its turn still runs is told at the next step
+    of that turn."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.seq(r, ["job.start", "tool.end", "job.end", "tool.end", "notice", "attempt",
+              "assistant", "turn.end"])
+    t.check(len(r.all("turn")) == 1, "one turn")
+    t.check(not r.last("job.end").get("resume"), "no turn of its own")
+    t.check("Saw: Background job 1 ended: it exited with code 0" in r.text(),
+            f"text {r.text()!r}")
+
+
+@scenario(conf={"_tools": {"stop_grace": 5}}, bound=15)
+def soft_stop(t):
+    """Cancelling asks the command to stop (SIGTERM, or CTRL_BREAK on
+    Windows), which ends it long before the kill would."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not t.pids("softpid"):
+            time.sleep(0.05)
+        pids = t.pids("softpid")
+        t0 = time.monotonic()
+        h.call("cancel", sid=sid)
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "cancel", f"cancelled: {end}")
+        t.check(time.monotonic() - t0 < 1, "the turn ends at once")
+        t.check(pids and t.gone(pids, within=3.0), f"gone before the kill: {pids}")
+        dt = time.monotonic() - t0
+        t.check(dt < 4, f"stopped by the soft stop: {dt:.1f} s")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_tools": {"stop_grace": 1}}, bound=10, posix=True)
+def stop_grace(t):
+    """A command that ignores SIGTERM is killed when the grace period is
+    over."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not t.pids("gracepid"):
+            time.sleep(0.05)
+        pids = t.pids("gracepid")
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        h.call("cancel", sid=sid)
+        time.sleep(0.6)
+        t.check(pids and t.host.alive(pids[0]), "it survives the TERM")
+        t.check(t.gone(pids, within=3.0), f"killed after the grace: {pids}")
+        dt = time.monotonic() - t0
+        t.check(0.9 < dt < 3, f"at the grace period: {dt:.1f} s")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=25)
+def crash_job(t):
+    """A job dies with the harness; opening the session again closes it
+    as unknown, and the agent hears of it at the next prompt."""
+    state = {}
+
+    def watch(ev, p):
+        if ev.get("ev") != "job.start":
+            return False
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not t.pids("jobpid"):
+            time.sleep(0.05)
+        state["pids"] = t.pids("jobpid")
+        ppid = t.pids("jobppid")
+        if t.host.windows and ppid:
+            t.host.killhard(p, ppid[0])
+        else:
+            t.host.killhard(p)
+        return True
+
+    t.put("jobppid", "")
+    r1 = t.run(watch=watch)
+    sid = r1.events[0].get("sid")
+    t.check(state.get("pids") and t.gone(state["pids"]), "the job died with the harness")
+    r2 = t.run("continue", resume=sid)
+    t.check(r2.rc == 0, f"exit {r2.rc}: {r2.stderr}")
+    je = r2.all("job.end")
+    t.check(je and je[0].get("status") == "unknown", f"closed as unknown: {je}")
+    t.seq(r2, ["job.end", "user", "turn", "notice", "attempt", "assistant", "turn.end"])
+    t.check("the harness stopped while it ran" in r2.last("notice").get("text", ""),
+            f"notice {r2.last('notice')}")
+
+
+@scenario(bound=15)
+def job_cmds(t):
+    """job.kill from the frontend stops a job, of which the agent is
+    told; closing the session stops the rest, quietly."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (t.pids("job1pid") and t.pids("job2pid")):
+            time.sleep(0.05)
+        p1, p2 = t.pids("job1pid"), t.pids("job2pid")
+        t.check(len(h.all("job.start", sid)) == 2, "two jobs")
+        r = h.call("list")
+        entry = [s for s in h.all("sessions")[-1]["list"] if s["sid"] == sid]
+        t.check(entry and entry[0].get("jobs") == 2, f"listed with its jobs: {entry}")
+
+        r = h.call("job.kill", sid=sid, job=1)
+        t.check(r.get("ok") == 1, f"job.kill {r}")
+        je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("job") == 1)
+        t.check(je["status"] == "killed" and je.get("notice") == 1 and je.get("resume") == 1,
+                f"job 1 ended {je}")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 2)
+        n = h.all("notice", sid)
+        t.check(n and "the user stopped it" in n[-1]["text"], f"told: {n}")
+        t.check(t.gone(p1), "job 1's process is gone")
+        r = h.call("job.kill", sid=sid, job=9)
+        t.check(r.get("ok") == 0, f"no job 9: {r}")
+
+        h.call("close", sid=sid)
+        je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("job") == 2)
+        t.check(je["status"] == "closed" and je.get("notice") == 0, f"job 2 ended {je}")
+        t.check(t.gone(p2), "job 2's process is gone")
+        time.sleep(0.3)
+        t.check(len(h.all("turn", sid)) == 2, "no turn after closing")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def job_quit(t):
+    """Quitting kills the jobs."""
+    h = t.headless()
+    model = t.model.replace(":job_quit:", ":job_cmds:")
+    fake_provider.STATE.register(model)
+    sid = h.call("new", cwd=t.work, model=model, endpoint="fake")["sid"]
+    h.send("prompt", sid=sid, text="go")
+    h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (t.pids("job1pid") and t.pids("job2pid")):
+        time.sleep(0.05)
+    pids = t.pids("job1pid") + t.pids("job2pid")
+    rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    t.check(len(pids) == 2 and t.gone(pids), f"the jobs are gone: {pids}")
+
+
+@scenario(conf={"_tools": {"auto_resume": 1}}, bound=15)
+def resume_cap(t):
+    """Turns a session starts by itself are capped: past the cap, the
+    end of a job waits for the next prompt."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("job") == 1)
+        t.check(je.get("resume") == 1, f"the first resumes: {je}")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 2)
+        je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("job") == 2)
+        t.check(not je.get("resume"), f"the second does not: {je}")
+        note = h.wait(lambda e: e.get("ev") == "note" and e.get("sid") == sid)
+        t.check("auto_resume" in note["text"], f"note {note}")
+        time.sleep(0.3)
+        t.check(len(h.all("turn", sid)) == 2, "no third turn by itself")
+        h.send("prompt", sid=sid, text="what happened?")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 3)
+        last = t.requests()[-1]["body"]["messages"]
+        t.check("Background job 2 ended" in last[-1]["content"] and
+                last[-2]["content"] == "what happened?", f"told at the prompt: {last[-2:]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def rewind_reopen(t):
+    """Snapshots survive the process: a session opened again rewinds what
+    the last one changed."""
+    model = t.model.replace(":rewind_reopen:", ":rewind:")
+    fake_provider.STATE.register(model)
+    r = t.run("first", extra=["-m", model])
+    t.check(r.rc == 0 and t.file("a.txt") == "two\n" and t.file("b.txt") == "new\n",
+            f"written: {r.rc} {r.stderr}")
+    sid = r.events[0]["sid"]
+    h = t.headless()
+    try:
+        o = h.call("open", sid=sid, **{"from": 0})
+        t.check(o.get("ok") == 1, f"opened {o}")
+        rr = h.call("rewind", sid=sid, to=1)
+        got = [(os.path.basename(f["path"]), f["result"]) for f in rr.get("files", [])]
+        t.check(got == [("b.txt", "removed"), ("a.txt", "removed")], f"rewound {rr}")
+        t.check(t.file("a.txt") is None and t.file("b.txt") is None, "both gone")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def instructions_changed(t):
+    """An instruction file changed between turns: the agent gets its new
+    text as a note, and the system prompt stays as it was."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("AGENTS.md", "Rule one.\n")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="first")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.put("AGENTS.md", "Rule two, longer.\n")
+        t.host.touch(t.host.join(t.work, "AGENTS.md"), time.time() + 10)
+        h.send("prompt", sid=sid, text="second")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 2)
+        reqs = [x["body"]["messages"] for x in t.requests()]
+        t.check(reqs[0][0]["content"] == reqs[1][0]["content"] and
+                "Rule one." in reqs[0][0]["content"], "the system prompt stays")
+        last = reqs[1][-1]["content"]
+        t.check(last.startswith("Instruction files changed") and "Rule two, longer." in last,
+                f"told: {last!r}")
+        ins = h.all("instructions", sid)
+        t.check([i["why"] for i in ins] == ["start", "changed"], f"records {ins}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+SEARCH_FILES = {
+    ".gitignore": "ignored/\n*.log\n",
+    "src/a.c": "int main(void)\n{\n    // TODO: fix\n}\n",
+    "src/b.h": "void hello(void);\n",
+    "src/c.c": "static int helper(void) { return 0; }\n",
+    "ignored/x.c": "int main(void) {}\n",
+    "trace.log": "main(\n",
+    "deep/a/b/n.txt": "needle\n",
+}
+
+SEARCH_WANT = [
+    ("ok", "src/a.c:1: int main(void)\n"),
+    ("ok", "src/a.c:3:     // TODO: fix\n"),
+    ("ok", "src/b.h:1: void hello(void);\n"),
+    ("error", "The search failed"),
+    ("ok", "No lines match a+b in the working directory."),
+    ("ok", "src/a.c\nsrc/c.c\n"),
+    ("ok", "src/a.c\nsrc/c.c\nsrc/b.h\n"),
+    ("ok", "No files match *.nothing in the working directory."),
+    ("ok", "deep/a/b/n.txt:1: needle\n"),
+    ("denied", ""),
+]
+
+
+def searchsetup(t):
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    files = dict(SEARCH_FILES)
+    files["bin.dat"] = b"int main(\0\0\n"
+    files["../outside"] = "x outside\n"
+    # Newest first: a.c, then c.c, then b.h
+    now = time.time()
+    times = {rel: now - age for rel, age in [("src/a.c", 10), ("src/c.c", 20),
+                                             ("src/b.h", 30)]}
+    t.host.bulk(t.work, files, times)
+
+
+def searchcheck(t, r):
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check(len(ends) == len(SEARCH_WANT), f"steps {compact(r.names())}")
+    for i, (e, (status, want)) in enumerate(zip(ends, SEARCH_WANT)):
+        t.check(e["status"] == status, f"step {i}: status {e['status']}: {e['text']}")
+        if status == "ok":
+            t.check(e["text"].startswith(want) if want.endswith(".") else e["text"] == want,
+                    f"step {i}: {e['text']!r}, want {want!r}")
+        else:
+            t.check(want in e["text"], f"step {i}: {e['text']!r}, want {want!r}")
+        t.check(not e.get("spill") or e["spill"].startswith("out/"), "spilled")
+
+
+@scenario(bound=15)
+def search(t):
+    """grep and glob through ripgrep where it is found: .gitignore and
+    binary files skipped, globs as .gitignore takes them, newest first."""
+    searchsetup(t)
+    searchcheck(t, t.run())
+
+
+@scenario(conf={"_tools": {"use_rg": "false"}}, bound=15)
+def search_builtin(t):
+    """The same searches through the built-in walker, with the same
+    results."""
+    searchsetup(t)
+    searchcheck(t, t.run())
+
+
+def manysetup(t):
+    now = time.time()
+    files = {f"f{i:03}.txt": "line\n" for i in range(150)}
+    times = {f"f{i:03}.txt": now - 1000 + i for i in range(150)}
+    t.host.bulk(t.work, files, times)
+
+
+def manycheck(t, r):
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    g, f = r.all("tool.end")[:2]
+    lines = g["text"].splitlines()
+    t.check(len(lines) == 101 and lines[0] == "f000.txt:1: line" and
+            lines[99] == "f099.txt:1: line" and "there are more" in lines[100],
+            f"grep: {lines[:2]} ... {lines[-2:]}")
+    lines = f["text"].splitlines()
+    t.check(len(lines) == 101 and lines[0] == "f149.txt" and lines[99] == "f050.txt" and
+            "there are more" in lines[100], f"glob: {lines[:2]} ... {lines[-2:]}")
+
+
+@scenario(bound=15)
+def search_many(t):
+    """Results stop at 100, saying that there are more."""
+    manysetup(t)
+    manycheck(t, t.run())
+
+
+@scenario(conf={"_tools": {"use_rg": "false"}}, bound=15)
+def search_many_builtin(t):
+    manysetup(t)
+    manycheck(t, t.run())
+
+
+@scenario(bound=10)
+def todo(t):
+    """A turn that ends with todo items left is nudged to go on; the list
+    given as a JSON string is taken too."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    kinds = [n["kind"] for n in r.all("nudge")]
+    t.check(kinds == ["todo"], f"nudges {kinds}")
+    text = r.last("nudge")["text"]
+    t.check("[>] write it" in text and "[ ] test it" in text, f"nudge {text!r}")
+    todos = r.all("todo")
+    t.check(len(todos) == 2 and all(i["status"] == "done" for i in todos[1]["items"]),
+            f"todo records {todos}")
+    ends = r.all("tool.end")
+    t.check(ends[0]["text"].startswith("Todo list, 0 of 2 done") and
+            ends[1]["text"].startswith("Todo list, 2 of 2 done"), "the lists shown")
+    t.check(r.last("turn.end").get("why") == "done", "the turn ends")
+
+
+@scenario(bound=10)
+def todo_job(t):
+    """Ending a turn to wait for a background job is not nudged about
+    the todo list: the job's end starts the next turn."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(not r.all("nudge"), f"no nudges: {r.all('nudge')}")
+    turns = r.all("turn")
+    t.check(len(turns) == 2 and turns[1].get("via") == "job", f"turns {turns}")
+    t.check(r.text().endswith("It ran."), f"text {r.text()!r}")
+
+
+@scenario(bound=10)
+def todo_cap(t):
+    """Never finishing the list: three nudges, then the turn ends."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    kinds = [n["kind"] for n in r.all("nudge")]
+    t.check(kinds == ["todo"] * 3, f"nudges {kinds}")
+    t.check(r.last("turn.end").get("why") == "done", "the turn ends anyway")
+
+
+@scenario(bound=15)
+def todo_remind(t):
+    """Twelve changes without the list changing: one reminder."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    kinds = [n["kind"] for n in r.all("nudge")]
+    t.check(kinds == ["todo_reminder"], f"nudges {kinds}")
+    names = r.names()
+    at = names.index("nudge")
+    t.check(sum(1 for e in r.events[:at] if e.get("ev") == "tool.end") == 13,
+            "after the twelfth change")
+
+
+@scenario(bound=20)
+def rewind(t):
+    """rewind puts back what write and edit changed, newest first, and
+    leaves alone a file changed since, unless forced; the agent hears of
+    it at its next request."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+
+        def turn(text, n):
+            h.send("prompt", sid=sid, text=text)
+            h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid
+                   and e.get("turn") == n)
+
+        turn("first", 1)
+        t.check(t.file("a.txt") == "two\n" and t.file("b.txt") == "new\n", "written")
+        snaps = h.all("snap", sid)
+        t.check([(s["snap"], s["existed"]) for s in snaps] ==
+                [("snap/1", 0), ("snap/2", 1), ("snap/3", 0)], f"snaps {snaps}")
+        t.check(snaps[1]["hash_before"] and snaps[0]["hash_before"] == "", "hashes")
+
+        r = h.call("rewind", sid=sid, to="call_1")
+        got = [(os.path.basename(f["path"]), f["result"]) for f in r.get("files", [])]
+        t.check(r.get("ok") == 1 and got == [("b.txt", "removed"), ("a.txt", "restored")],
+                f"rewound: {r}")
+        t.check("shell commands" in r.get("note", ""), f"note {r.get('note')}")
+        t.check(t.file("a.txt") == "one\n" and t.file("b.txt") is None, "files put back")
+        rw = h.all("rewind", sid)[-1]
+        t.check(rw.get("undone") == ["snap/3", "snap/2"] and rw.get("to") == "call_1",
+                f"rewind record {rw}")
+        r = h.call("rewind", sid=sid, to="call_1")
+        t.check(r.get("ok") == 1 and r.get("files") == [], f"nothing left: {r}")
+
+        turn("second", 2)
+        notes = [m for m in t.requests()[-2]["body"]["messages"] if m.get("role") == "user"]
+        t.check(notes[-1]["content"].startswith("The user rewound the files") and
+                "a.txt" in notes[-1]["content"], f"the agent is told: {notes[-1]}")
+        t.check(t.file("c.txt") == "made in turn 2\n", "c.txt written")
+        t.put("c.txt", "changed by hand\n")
+        r = h.call("rewind", sid=sid, to=2)
+        got = [(os.path.basename(f["path"]), f["result"]) for f in r.get("files", [])]
+        t.check(got == [("c.txt", "conflict")], f"conflict: {r}")
+        t.check(t.file("c.txt") == "changed by hand\n", "left alone")
+        r = h.call("rewind", sid=sid, to=2, force=1)
+        got = [(os.path.basename(f["path"]), f["result"]) for f in r.get("files", [])]
+        t.check(got == [("c.txt", "removed")] and t.file("c.txt") is None, f"forced: {r}")
+
+        for to, why in [(9, "no turn"), ("call_x", "no call"), (None, "call id or a turn")]:
+            r = h.call("rewind", sid=sid, to=to)
+            t.check(r.get("ok") == 0 and why in r.get("err", ""), f"refused: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def instructions(t):
+    """AGENTS.md from the user and from the repository root down, with
+    imports, in the system prompt; a subdirectory's when the agent
+    works there, as a note."""
+    xdg = t.host.join(t.base, "xdg")
+    t.host.mkdir(t.host.join(xdg, "harness"))
+    t.host.write(t.host.join(xdg, "harness", "AGENTS.md"), "Global rule: be brief.\n")
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("AGENTS.md", "Root rule: use tabs.\nSee @docs/style.md, not "
+          "`@docs/nope.md`, nor @../outside.md.\n")
+    t.put("CLAUDE.md", "Not loaded: AGENTS.md comes first.\n")
+    t.host.mkdir(t.host.join(t.work, "docs"))
+    t.put("docs/style.md", "Style rule: short names.\n")
+    t.put("docs/nope.md", "Should not load.\n")
+    t.host.write(t.host.join(t.base, "outside.md"), "Outside rule.\n")
+    t.host.mkdir(t.host.join(t.work, "pkg"))
+    t.put("pkg/CLAUDE.md", "Pkg rule: no globals.\n")
+    t.put("pkg/x.txt", "hello\n")
+
+    r = t.run(env={"XDG_CONFIG_HOME": xdg})
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    reqs = [x["body"]["messages"] for x in t.requests()]
+    system = reqs[0][0]["content"]
+    for want in ("Global rule", "Root rule", "Style rule"):
+        t.check(want in system, f"{want} in the system prompt")
+    for unwanted in ("Should not load", "Outside rule", "Not loaded", "Pkg rule"):
+        t.check(unwanted not in system, f"{unwanted} not in the system prompt")
+    t.check(all(m[0]["content"] == system for m in reqs), "the system prompt stays")
+    ins = r.all("instructions")
+    t.check(len(ins) == 2 and ins[0]["why"] == "start" and ins[1]["why"] == "nested",
+            f"records {ins}")
+    names = [os.path.basename(f["path"]) for f in ins[0]["files"]]
+    t.check(names == ["AGENTS.md", "AGENTS.md", "style.md"], f"loaded {names}")
+    t.check(any(s.endswith("outside.md") for s in ins[0].get("skipped", [])), "skipped")
+    t.check([os.path.basename(f["path"]) for f in ins[1]["files"]] == ["CLAUDE.md"],
+            f"nested {ins[1]}")
+    t.check(reqs[1][-1]["role"] == "user" and "Pkg rule" in reqs[1][-1]["content"],
+            f"told at the next request: {reqs[1][-1]}")
+    t.check(sum("Pkg rule" in (m.get("content") or "") for m in reqs[2]) == 1, "once")
 
 
 @scenario(bound=10)
@@ -1095,7 +1684,7 @@ def config(t):
                 f"provenance {temp}")
         key = got[("endpoint", "fake", "key")]
         t.check(key["default"] == 1 and key["file"] == "", f"default {key}")
-        t.check(len(r["schema"]) >= 20 and len(r["kinds"]) == 5, "schema")
+        t.check(len(r["schema"]) >= 20 and len(r["kinds"]) == 7, "schema")
 
         # One edit, one changed line
         r = call("config.set", kind="endpoint", name="fake",
