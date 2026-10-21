@@ -178,6 +178,7 @@ struct MetricsSnap {
     i64    runaway;
     i64    frameus;
     i64    maxframeus;
+    i64    maxwakeus;   // records applied outside frames
     i64    layoutus;
     i64    deadline;    // relative to the snapshot, I64MAX if none
     i32    duewhy;
@@ -251,7 +252,8 @@ struct CfgRow {
     i64   line;
     b32   isdflt;
     b32   valid;
-    char *buf;     // the field, FIELD_MAX bytes
+    char *buf;     // the field: the value, then FIELD_MAX bytes to spare
+    iz    cap;
     b32   sent;    // an edit went out, until the next config.get
     Str   sentval;
 };
@@ -285,6 +287,7 @@ struct Gui {
     i64                runaway;
     i64                frameus;
     i64                maxframeus;
+    i64                maxwakeus;  // the longest gui_wake
     i64                layoutus;
     MetricsSnap        snap;
     u32                cause;      // WOKE_* since the last frame
@@ -329,6 +332,7 @@ struct Gui {
     i64                quitby;     // µs: exit then regardless
     b32                closereq;   // the user asked to close the window
     i64                overflows;  // times records were lost
+    b32                reissuing;  // replies may be lost: send again
     i64                resyncs;
     Region            *replayr;    // log copies for resyncs
     Region            *cmdr;       // commands being written
@@ -436,6 +440,7 @@ struct Gui {
     i64                modalframes;  // drawn from inside modal loops
     DriveOp           *ops;          // the script
     i32                nops;
+    b32                minclose;     // ask to close once minimized
     Counts             markcounts;   // totals at the last OP_MARK
     i64                markat;
 };
@@ -752,6 +757,9 @@ static void guianswer(Gui *g, GuiSession *s, Str req, b32 allow, Str note)
 // Sessions whose turns would be stopped by quitting.
 static i32 running(Gui *g)
 {
+    if (g->enginegone) {
+        return 0;  // nothing can run
+    }
     i32 n = 0;
     for (GuiSession *s = g->sessions; s; s = s->next) {
         n += s->view && !s->readonly && (s->view->busy || s->view->asks);
@@ -810,10 +818,12 @@ static void loadcfg(Gui *g, Str line)
                 r.desc = jsonstr(jsonget(k, "desc"));
             }
         }
-        // Defaults show as hints, not values: an edit writes a value
-        r.buf = alloc<char>(a, FIELD_MAX);
+        // Defaults show as hints, not values: an edit writes a value. The
+        // field holds the whole value, which an edit sends back whole.
         Str v = r.isdflt ? Str{} : r.value;
-        copybytes(r.buf, v.data, v.len<FIELD_MAX ? v.len : FIELD_MAX-1);
+        r.cap = v.len + FIELD_MAX;
+        r.buf = alloc<char>(a, r.cap);
+        copybytes(r.buf, v.data, v.len);
         g->cfgrows = push(a, g->cfgrows, r);
     }
 }
@@ -943,6 +953,32 @@ static Str linesid(Str line)
     return cut(rest, '"').head;
 }
 
+// The engine stopped by itself: no view will hear of its turn ending,
+// or of its asks, so none runs any more, and nothing waits for them.
+static void enginestopped(Gui *g)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        View *v = s->view;
+        s->state = LIVE_CLOSED;
+        if (!v) {
+            continue;
+        }
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewMsg *m = &v->msgs[i];
+            if (m->role==VIEW_ASK && m->tool->answer==VASK_PENDING) {
+                m->tool->answer = VASK_DENIED;
+                m->tool->by     = "interrupted";
+                m->ver++;
+            }
+        }
+        v->busy      = 0;
+        v->asks      = 0;
+        v->state     = LIVE_CLOSED;
+        v->topsdirty = 1;
+    }
+    scheddirty(&g->sched);
+}
+
 // Apply one record from the engine. Returns 1 if what shows changed.
 static b32 guirecord(Gui *g, Str line)
 {
@@ -963,7 +999,9 @@ static b32 guirecord(Gui *g, Str line)
         return 1;
     case EV_OVERFLOW:
         if (!r.sid.len) {
-            g->overflows++;  // the engine process lost records
+            // The engine process lost records, replies among them
+            g->overflows++;
+            g->reissuing = 1;
             for (GuiSession *s = g->sessions; s; s = s->next) {
                 if (s->view) s->view->lost = 1;
             }
@@ -990,6 +1028,11 @@ static b32 guirecord(Gui *g, Str line)
     i32   state = v->state;
     i32   asks  = v->asks;
     b32   busy  = v->busy;
+    if (r.seq && v->lost) {
+        // The resync brings it, in order: applied now, in a replay's
+        // loose order, it would move lastseq past the records lost
+        return 0;
+    }
     if (r.ev==EV_TOOLOUT) {
         i32 i = findcall(v, jsonstr(jsonget(r.root, "call")));
         g->tailseen += i>=0 && v->msgs[i].tool->status==VTOOL_RUNNING;
@@ -1074,14 +1117,20 @@ static b32 procdata(Gui *g, Str data)
 
 // Records went missing for a session: apply the rest of its log, from
 // the last record its view has. Deltas and output lost with them are
-// only provisional, and their commits are in the log.
+// only provisional, and their commits are in the log. Reading starts
+// where the last resync ended, as everything lost since lies beyond
+// it, so that one with nothing to bring costs nothing.
 static void resync(Gui *g, GuiSession *s)
 {
     View  *v     = s->view;
     Arena  a     = g->frame;
     Arena  lines = newarena(g->replayr);
     Str    path  = join(&a, sessdir(g, &a, s->sid), "events.jsonl");
-    Replay rp    = logreplay(g->os, &lines, a, path, s->sid, v->lastseq, LOG_MAX);
+    Replay rp    = logreplayat(g->os, &lines, a, path, s->sid, v->lastseq,
+                               v->logoff, LOG_MAX);
+    if (rp.ok) {
+        v->logoff = rp.end;
+    }
     b32    loose = v->loose;
     v->loose = 1;
     for (iz i = 0; i < rp.lines.len; i++) {
@@ -1553,14 +1602,13 @@ static void gui_input(Gui *g, i32 kind)
 
 static b32 drivewaitdone(Gui *g);
 
-// The wake flag was cleared: drain every record from the engine. Deltas
-// and tool output for the session shown are held back for the next
-// content frame, which shows them at most STREAM_PERIOD apart however
-// many frames run between; anything else applies at once, after the
-// records held back before it. Lost records come back from the logs.
-static void gui_wake(Gui *g)
+// Drain every record from the engine. Deltas and tool output for the
+// session shown are held back for the next content frame, which shows
+// them at most STREAM_PERIOD apart however many frames run between;
+// anything else applies at once, after the records held back before it.
+// Lost records come back from the logs.
+static void drainmail(Gui *g, i64 now)
 {
-    i64 now = os_ticks(g->os);
     g->woke |= WOKE_MAIL;
     if (g->holduntil > now) {
         g->held = 1;  // the checklist lets the inbox fill up
@@ -1568,8 +1616,9 @@ static void gui_wake(Gui *g)
     }
     g->held = 0;
 
-    Mail m     = mailtake(g->inbox);
-    b32  other = 0;
+    Mail m       = mailtake(g->inbox);
+    b32  other   = 0;
+    b32  stopped = 0;
     for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
         switch (r.type) {
         case MAIL_OUT:
@@ -1580,6 +1629,7 @@ static void gui_wake(Gui *g)
             break;
         case MAIL_QUIT:
         case PROC_EXIT:
+            stopped |= !g->enginegone;
             g->enginegone = 1;
             other = 1;
             break;
@@ -1591,10 +1641,10 @@ static void gui_wake(Gui *g)
         other = 1;
     } else if (m.overflow) {
         g->overflows++;
+        g->reissuing = 1;
         for (GuiSession *s = g->sessions; s; s = s->next) {
             if (s->view) s->view->lost = 1;
         }
-        reissue(g);
     }
     for (GuiSession *s = g->sessions; s; s = s->next) {
         if (s->view && s->view->lost && g->enginekind!=ENGINE_FAKE) {
@@ -1603,6 +1653,11 @@ static void gui_wake(Gui *g)
             other = 1;
         }
     }
+    if (g->reissuing) {
+        // After the resyncs, so that an open asks only for what is new
+        g->reissuing = 0;
+        reissue(g);
+    }
 
     if (g->enginegone) {
         if (g->quitting) {
@@ -1610,6 +1665,9 @@ static void gui_wake(Gui *g)
         } else if (!g->engineerr.len) {
             g->engineerr = "the engine stopped";
         }
+    }
+    if (stopped && !g->quitting) {
+        enginestopped(g);
     }
     if (g->drive && g->drivewait && drivewaitdone(g)) {
         other = 1;
@@ -1627,11 +1685,34 @@ static void gui_wake(Gui *g)
     }
 }
 
-// The user asked to close the window, or to quit: with turns running,
-// the UI asks first (ui.cpp).
+// The wake flag was cleared: drain the mail, timed, since its work
+// happens outside any frame.
+static void gui_wake(Gui *g)
+{
+    i64 now = os_ticks(g->os);
+    drainmail(g, now);
+    i64 us = os_ticks(g->os) - now;
+    if (us > g->maxwakeus) {
+        g->maxwakeus = us;
+        g->unsnapped = 1;
+    }
+}
+
+// The user asked to close the window, or to quit: at once with nothing
+// running, which needs no frame (the window may be minimized, or quit
+// from the Dock while covered). Otherwise the UI asks first (ui.cpp),
+// in a window brought back for it.
 static void gui_close(Gui *g)
 {
+    if (!g->quitting && !running(g)) {
+        startquit(g);
+        return;
+    }
     g->closereq = 1;
+    if (!g->quitting) {
+        os_guiraise(g->os);
+        schedminimize(&g->sched, 0);  // to draw the dialog regardless
+    }
     scheddirty(&g->sched);
 }
 
@@ -1645,6 +1726,13 @@ static void gui_force(Gui *g)
 static void gui_minimized(Gui *g, b32 minimized)
 {
     schedminimize(&g->sched, minimized);
+    if (minimized && g->minclose) {
+        g->minclose = 0;
+        guilog(g, "drive: minimized, asking to close");
+        GuiEvent e = {};
+        e.kind = GEV_CLOSE;
+        os_guiinject(g->os, &e);
+    }
 }
 
 // The OS runs a modal loop (Win32 move, resize, menu), from which the
@@ -1718,6 +1806,7 @@ static void snapshot(Gui *g)
     m->runaway    = g->runaway;
     m->frameus    = g->frameus;
     m->maxframeus = g->maxframeus;
+    m->maxwakeus  = g->maxwakeus;
     m->layoutus   = g->layoutus;
     m->deadline   = g->lastdeadline==I64MAX ? I64MAX : g->lastdeadline - s->now;
     m->duewhy     = g->lastduewhy;
@@ -2016,8 +2105,18 @@ static void gui_run(Gui *g)
     while (!g->quit) {
         s->now  = os_ticks(g->os);
         i64 t   = schedtimeout(s);
+        if (g->quitting) {
+            // Frames may not come (minimized), but the grace still ends
+            i64 left = g->quitby - s->now;
+            left = left>0 ? left : 0;
+            t    = t<0 || t>left ? left : t;
+        }
         g->woke = 0;
         if (!os_guiwait(g->os, t)) {
+            break;
+        }
+        if (g->quitting && os_ticks(g->os)>=g->quitby) {
+            g->quit = 1;  // the engine did not stop in time
             break;
         }
         s->now = os_ticks(g->os);
@@ -2263,6 +2362,8 @@ enum : i32 {
     OP_SHOT,      // with --shots DIR: the next frame as DIR/text.png
     OP_SHOWUSER,  // scroll to the user's message that starts with text
     OP_MAIN,      // show the session the checklist made again
+    OP_MINCLOSE,  // minimize the window, then ask it to close once it is
+    OP_MINCLOSED, // ask to close now if the window never minimized
 };
 
 enum : i32 {
@@ -2719,9 +2820,24 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_SWITCHED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "6-sessions"},
     {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
-    // Esc cancels a turn mid-tool
+    // Esc abandons an edit in a settings field, leaving the turn alone,
+    // and from the session's own windows cancels the turn mid-tool
     {OP_PROMPT, 0, 0, 0, 100, "Cancel me: run a very slow command."},
     {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
+    {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_SETTING, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "7"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_STILLBUSY, 0, 0, 0, ""},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
@@ -2776,7 +2892,10 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     {OP_CHECK, CHK_STILLBUSY, 0, 0, 0, ""},
-    {OP_CLOSE, 0, 0, 0, 1000, ""},
+    // Again, minimized: the window comes back for the dialog (no frame
+    // runs while minimized, and the checklist would wait forever)
+    {OP_MINCLOSE, 0, 0, 0, 3000, ""},
+    {OP_MINCLOSED, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
@@ -3728,6 +3847,20 @@ static void drivestep(Gui *g)
             guiselect(g, g->drivemain);
         }
         break;
+    case OP_MINCLOSE:
+        g->minclose = 1;  // gui_minimized asks to close
+        e.kind = GEV_MINIMIZE;
+        os_guiinject(g->os, &e);
+        break;
+    case OP_MINCLOSED:
+        if (g->minclose) {
+            // No window manager to minimize it (Xvfb)
+            guilog(g, "drive: the window did not minimize: closing anyway");
+            g->minclose = 0;
+            e.kind = GEV_CLOSE;
+            os_guiinject(g->os, &e);
+        }
+        break;
     case OP_SHOWUSER: {
         View *v = g->view;
         for (iz i = v->msgs.len-1; i >= 0; i--) {
@@ -4065,6 +4198,21 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->benchtimes = alloc<i64>(&g->perm, BENCH_MAX);
     g->pending    = Buf(&g->pendmem, 1<<12);
 
+    // Paths as given, made absolute here: the engine process runs in the
+    // state directory, where relative ones would name other places
+    Str here = os_realpath(os, &g->perm, ".");
+    if (here.len) {
+        if (g->cfgpath.len) {
+            g->cfgpath = normpath(&g->perm, here, g->cfgpath, HOST_WINDOWS);
+        }
+        if (g->statedir.len) {
+            g->statedir = normpath(&g->perm, here, g->statedir, HOST_WINDOWS);
+        }
+        if (g->drivecwd.len) {
+            Str cwd = normpath(&g->perm, here, g->drivecwd, HOST_WINDOWS);
+            g->drivecwd = cstrclone(&g->perm, cwd);
+        }
+    }
     if (!g->statedir.len) {
         g->statedir = defaultstate(os, &g->perm);
     }
@@ -4202,6 +4350,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         print(&b, g->resyncs);
         print(&b, ", max frame ");
         printfloat(&b, (f64)g->maxframeus/1000, 2);
+        print(&b, " ms, max wake ");
+        printfloat(&b, (f64)g->maxwakeus/1000, 2);
         print(&b, " ms");
         guilog(g, finish(&b));
     }

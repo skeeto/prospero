@@ -286,6 +286,9 @@ struct StdinReader {
     Arena   a;
 };
 
+// Commands from standard input, one per line. A line longer than the
+// buffer is refused by the id at its start, since every command must
+// get a reply, and the rest of it skipped.
 static void stdinthread(void *arg)
 {
     StdinReader *r   = (StdinReader *)arg;
@@ -314,6 +317,9 @@ static void stdinthread(void *arg)
         }
         len -= start;
         if (len == cap) {
+            if (!skip) {
+                enginetoolong(r->e, cmdlineid({buf, len}));
+            }
             len  = 0;
             skip = 1;
         }

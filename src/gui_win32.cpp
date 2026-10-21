@@ -43,6 +43,7 @@ extern "C" void      w32gui_wake(void *);
 extern "C" void      w32gui_newframe(void *);
 extern "C" void      w32gui_present(void *, int present);
 extern "C" long long w32gui_refresh(void *);
+extern "C" void      w32gui_raise(void *);
 extern "C" void      w32gui_inject(void *, int kind, float x, float y,
                                    int button, int down, int key, int ctrl,
                                    int shift, unsigned short const *text);
@@ -527,6 +528,20 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
     case 8:  // close, as from the title bar
         PostMessageW(w->hwnd, WM_CLOSE, 0, 0);
         break;
+    case 9:  // minimize, as from the title bar or the taskbar
+        ShowWindow(w->hwnd, SW_SHOWMINNOACTIVE);
+        break;
+    }
+}
+
+extern "C" void w32gui_raise(void *p)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (IsIconic(w->hwnd) || !IsWindowVisible(w->hwnd)) {
+        ShowWindow(w->hwnd, w->hooks.drive ? SW_SHOWNOACTIVATE : SW_RESTORE);
+    }
+    if (!w->hooks.drive) {
+        SetForegroundWindow(w->hwnd);
     }
 }
 
@@ -559,7 +574,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
 static_assert((i32)W32IN_MOVE==(i32)INPUT_MOVE && (i32)W32IN_OTHER==(i32)INPUT_OTHER);
 static_assert(GEV_MOVE==0 && GEV_RESIZE==5 && GEV_MODALSIZE==6 && GEV_DPI==7 &&
-              GEV_CLOSE==8);
+              GEV_CLOSE==8 && GEV_MINIMIZE==9);
 
 W32(i32, GetCurrentThreadId());
 
@@ -650,6 +665,11 @@ static void os_guiinject(Os *os, GuiEvent *e)
     }
     w32gui_inject(os->gui, e->kind, e->x, e->y, e->button, e->down, e->key,
                   e->ctrl, e->shift, text);
+}
+
+static void os_guiraise(Os *os)
+{
+    w32gui_raise(os->gui);
 }
 
 static void os_guiclose(Os *os)

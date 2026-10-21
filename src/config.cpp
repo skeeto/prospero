@@ -59,18 +59,20 @@
 // of the top level and of [guard], and of each named [endpoint],
 // [model] and [role] section that exists, in schema order. A value is
 // the one in effect as written, or its default ("default":1, with file
-// "" and line 0); "valid":0 marks one ignored for its default. An
-// endpoint's timeouts default by whether its URL is local (the schema's
-// "local" defaults). A plaintext secret is reported as "(hidden)", so
-// no reply ever carries one. The schema's types are string, int,
-// number, seconds, bool, enum, url, secret (env:NAME), list (words of
-// choices) and paths (separated by ;).
+// "" and line 0, or where the key is set empty); "valid":0 marks one
+// ignored for its default. An endpoint's timeouts default by whether
+// its URL is local (the schema's "local" defaults). A plaintext secret
+// is reported as "(hidden)", so no reply ever carries one. The schema's
+// types are string, int, number, seconds, bool, enum, url, secret
+// (env:NAME), list (words of choices) and paths (separated by ;).
 //
 // In config.set, kind and name "" (or absent) are the top level, and a
 // null value removes the key. The reply's line is where the key now is
 // in the user's file (0 after a removal). A value invalid for its type,
-// or a plaintext secret, is refused before anything is written. Both
-// replies carry the diagnostics of the configuration as now loaded.
+// or a plaintext secret, is refused before anything is written, and an
+// edit whose value is not the one in effect afterward fails, saying
+// which file decides. Both replies carry the diagnostics of the
+// configuration as now loaded.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -487,38 +489,19 @@ static Str cfgsecret(Config *c, Arena *perm, Str kind, Str name, Str key)
     return v.len ? clone(perm, v) : Str{};
 }
 
-// The words of a list setting (CFG_LIST), in perm.
-static Slice<Str> cfgwords(Config *c, Arena *perm, Str kind, Str name,
-                           Str key)
+// The paths of a paths setting (CFG_PATHS), with a leading ~ replaced by
+// the home directory when one is known, in perm.
+static Slice<Str> cfgpaths(Config *c, Arena *perm, Str kind, Str name,
+                           Str key, Str home)
 {
     Slice<Str> r = {};
-    for (Str rest = cfgget(c, kind, name, key, 0); rest.len;) {
-        Str w = cfgnextword(&rest);
-        if (w.len) {
-            r = push(perm, r, clone(perm, w));
-        }
-    }
-    return r;
-}
-
-// The paths of a paths setting (CFG_PATHS), with a leading ~ replaced by
-// the home directory, in perm.
-static Slice<Str> cfgpaths(Config *c, Arena *perm, Str kind, Str name,
-                           Str key)
-{
-    Slice<Str> r    = {};
-    Str        home = {};
     for (Str rest = cfgget(c, kind, name, key, 0); rest.len;) {
         Cut cp = cut(rest, ';');
         Str p  = trim(cp.head);
         rest = cp.tail;
         if (!p.len) {
             continue;
-        } else if (cfgtilde(p)) {
-            if (!home.data) {
-                home = os_getenv(c->os, perm, "HOME");
-                home = home.len ? home : os_getenv(c->os, perm, "USERPROFILE");
-            }
+        } else if (cfgtilde(p) && home.len) {
             p = concat(perm, home, cuthead(p, 1));
         } else {
             p = clone(perm, p);
@@ -816,13 +799,23 @@ static void cfgload(Config *c, Arena scratch)
     }
 }
 
+// Where writes to the user's file go: through a symbolic link to its
+// target (dotfiles managers link it), since replacing the file would
+// replace the link instead.
+static Str cfgdest(Config *c, Arena *a)
+{
+    Str real = os_realpath(c->os, a, c->path);
+    return real.len ? real : c->path;
+}
+
 // Write the seed file where the user's file is missing. Returns 0 on
 // failure, with c->note explaining.
 static b32 cfgwriteseed(Config *c, Arena scratch)
 {
-    Str dir = inidir(c->path);
+    Str dst = cfgdest(c, &scratch);
+    Str dir = inidir(dst);
     if ((dir.len && !os_mkdirs(c->os, scratch, dir)) ||
-            !os_write(c->os, scratch, c->path, cfgseed())) {
+            !os_write(c->os, scratch, dst, cfgseed())) {
         c->note = "cannot write the initial configuration file here";
         return 0;
     }
@@ -893,7 +886,11 @@ struct CfgSet {
 // Set a key in the user's file, or remove it given a null value, then
 // replace the file atomically and reload. Kind and name "" are the top
 // level. Unknown keys, values bad for their type, and plaintext secrets
-// are refused. Results and temporaries go in perm.
+// are refused. A top-level key that an include after it overrides is
+// moved below the includes, so that it wins. It fails if the value in
+// effect afterward is not the edit: a removal that leaves a value from
+// an include, when the user's file did not set it. Results and
+// temporaries go in perm.
 static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
                      Str value)
 {
@@ -922,8 +919,18 @@ static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
         return r;
     }
 
-    // Edit the file as it is now
+    // Edit the file as it is now. The fingerprint misses a change of the
+    // same size within one mtime tick, so compare the text itself.
     cfgpoll(c, *perm, 1);
+    if (c->user) {
+        Arena t  = *perm;
+        Read  rd = os_read(c->os, &t, c->path, INI_MAXBYTES);
+        Buf   b(&t, rd.data.len + 1);
+        printinifile(&b, c->user);
+        if (rd.err || !(rd.data == finish(&b))) {
+            cfgload(c, *perm);
+        }
+    }
     IniFile *f = c->user;
     if (!f) {
         if (os_stat(c->os, *perm, c->path).type != STAT_MISSING) {
@@ -933,15 +940,22 @@ static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
         Ini *fresh = alloc<Ini>(perm);
         f = iniparse(fresh, perm, c->path, c->seed ? cfgseed() : Str(""));
     }
-    IniEdit e = iniedit(perm, f, kind, name, key, value);
+    // The user's own definition, overridden by an include
+    IniEntry *was  = c->user ? inilookup(c->ini, kind, name, key) : 0;
+    b32       move = 0;
+    for (IniEntry *o = was ? was->older : 0; o && was->file!=f; o = o->older) {
+        move |= o->file == f;
+    }
+    IniEdit e = iniedit(perm, f, kind, name, key, value, move);
     if (!e.text.data) {
         r.err = e.err;
         return r;
     }
     if (e.changed || !c->user) {
-        Str dir = inidir(c->path);
+        Str dst = cfgdest(c, perm);
+        Str dir = inidir(dst);
         if ((dir.len && !os_mkdirs(c->os, *perm, dir)) ||
-                !os_write(c->os, *perm, c->path, e.text)) {
+                !os_write(c->os, *perm, dst, e.text)) {
             r.err = concat(perm, "cannot write ", c->path);
             return r;
         }
@@ -949,24 +963,36 @@ static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
     }
     cfgload(c, *perm);
     r.line = e.line;
-    r.ok   = 1;
+
+    // What is in effect now: the edit, unless another file decides. A
+    // removal of the user's own setting may reveal an include's, as it
+    // should, but one of a setting only an include makes did nothing.
+    IniEntry *now = inilookup(c->ini, kind, name, key);
+    b32       won = !now || e.changed;
+    if (value.data) {
+        won = now && now->file==c->user && now->line->num==e.line;
+    }
+    if (!won) {
+        Buf b(perm, 128);
+        if (!now) {
+            print(&b, "saved, but the file did not read back");
+        } else {
+            print(&b, value.data ? Str("saved, but ") : Str("nothing to remove: "));
+            print(&b, now->file->path);
+            putbyte(&b, ':');
+            print(&b, now->line->num);
+            print(&b, value.data ? Str(" sets it too, and wins")
+                                 : Str(" sets it, not this file"));
+        }
+        r.err = finish(&b);
+        return r;
+    }
+    r.ok = 1;
     return r;
 }
 
 
 // Protocol replies
-
-static void putfield(JsonOut *w, Str key, Str v)
-{
-    putkey(w, key);
-    putstr(w, v);
-}
-
-static void putfield(JsonOut *w, Str key, i64 v)
-{
-    putkey(w, key);
-    putint(w, v);
-}
 
 static void putcfgdiags(JsonOut *w, Config *c)
 {
@@ -975,12 +1001,12 @@ static void putcfgdiags(JsonOut *w, Config *c)
     for (iz i = 0; i < c->ini->diags.len; i++) {
         IniDiag d = c->ini->diags[i];
         putobject(w);
-        putfield(w, "file", d.file);
-        putfield(w, "line", (i64)d.line);
-        putfield(w, "col", (i64)d.col);
-        putfield(w, "severity", d.severity==INI_ERROR ? Str("error")
-                                                       : Str("warning"));
-        putfield(w, "message", d.msg);
+        putstrkey(w, "file", d.file);
+        putintkey(w, "line", (i64)d.line);
+        putintkey(w, "col", (i64)d.col);
+        putstrkey(w, "severity", d.severity==INI_ERROR ? Str("error")
+                                                        : Str("warning"));
+        putstrkey(w, "message", d.msg);
         putend(w);
     }
     putend(w);
@@ -999,26 +1025,28 @@ static void putcfgsection(JsonOut *w, Config *c, Str kind, Str name)
         if (!(k->kind == kind)) {
             continue;
         }
-        IniEntry *e     = inilookup(c->ini, kind, name, k->key);
-        Str       value = local && k->local.data ? k->local : k->dflt;
-        b32       valid = 1;
-        if (e) {
+        IniEntry *e      = inilookup(c->ini, kind, name, k->key);
+        Str       value  = local && k->local.data ? k->local : k->dflt;
+        b32       valid  = 1;
+        b32       isdflt = 1;  // unset, or set empty
+        if (e && trim(e->value).len) {
             Str v = trim(e->value);
-            value = e->value;
-            valid = cfgjudge(k, v, e->file!=c->user) != CFG_BAD;
-            if (k->type==CFG_SECRET && v.len && !startswith(v, "env:")) {
+            value  = e->value;
+            valid  = cfgjudge(k, v, e->file!=c->user) != CFG_BAD;
+            isdflt = 0;
+            if (k->type==CFG_SECRET && !startswith(v, "env:")) {
                 value = "(hidden)";
             }
         }
         putobject(w);
-        putfield(w, "kind", kind);
-        putfield(w, "name", name);
-        putfield(w, "key", k->key);
-        putfield(w, "value", value);
-        putfield(w, "file", e ? e->file->path : Str(""));
-        putfield(w, "line", e ? (i64)e->line->num : 0);
-        putfield(w, "default", (i64)!e);
-        putfield(w, "valid", (i64)valid);
+        putstrkey(w, "kind", kind);
+        putstrkey(w, "name", name);
+        putstrkey(w, "key", k->key);
+        putstrkey(w, "value", value);
+        putstrkey(w, "file", e ? e->file->path : Str(""));
+        putintkey(w, "line", e ? (i64)e->line->num : 0);
+        putintkey(w, "default", (i64)isdflt);
+        putintkey(w, "valid", (i64)valid);
         putend(w);
     }
 }
@@ -1026,9 +1054,9 @@ static void putcfgsection(JsonOut *w, Config *c, Str kind, Str name)
 // The payload of a config.get reply, after its id and ok.
 static void putcfg(JsonOut *w, Config *c)
 {
-    putfield(w, "path", c->path.len ? c->path : Str(""));
-    putfield(w, "exists", (i64)(c->user != 0));
-    putfield(w, "rev", c->rev);
+    putstrkey(w, "path", c->path.len ? c->path : Str(""));
+    putintkey(w, "exists", (i64)(c->user != 0));
+    putintkey(w, "rev", c->rev);
 
     putkey(w, "files");
     putarray(w);
@@ -1058,11 +1086,11 @@ static void putcfg(JsonOut *w, Config *c)
     for (iz i = 0; i < countof(cfgschema); i++) {
         CfgKey *k = &cfgschema[i];
         putobject(w);
-        putfield(w, "kind", k->kind);
-        putfield(w, "key", k->key);
-        putfield(w, "type", cfgtypenames[k->type]);
-        putfield(w, "default", k->dflt);
-        putfield(w, "local", k->local.data ? k->local : k->dflt);
+        putstrkey(w, "kind", k->kind);
+        putstrkey(w, "key", k->key);
+        putstrkey(w, "type", cfgtypenames[k->type]);
+        putstrkey(w, "default", k->dflt);
+        putstrkey(w, "local", k->local.data ? k->local : k->dflt);
         putkey(w, "choices");
         putarray(w);
         for (Str rest = k->choices; rest.len;) {
@@ -1072,8 +1100,8 @@ static void putcfg(JsonOut *w, Config *c)
             }
         }
         putend(w);
-        putfield(w, "group", k->group);
-        putfield(w, "desc", k->desc);
+        putstrkey(w, "group", k->group);
+        putstrkey(w, "desc", k->desc);
         putend(w);
     }
     putend(w);
@@ -1082,9 +1110,9 @@ static void putcfg(JsonOut *w, Config *c)
     putarray(w);
     for (iz i = 0; i < countof(cfgkinds); i++) {
         putobject(w);
-        putfield(w, "kind", cfgkinds[i].kind);
-        putfield(w, "named", (i64)cfgkinds[i].named);
-        putfield(w, "desc", cfgkinds[i].desc);
+        putstrkey(w, "kind", cfgkinds[i].kind);
+        putintkey(w, "named", (i64)cfgkinds[i].named);
+        putstrkey(w, "desc", cfgkinds[i].desc);
         putend(w);
     }
     putend(w);
@@ -1095,8 +1123,8 @@ static void putcfg(JsonOut *w, Config *c)
 // The payload of a config.set reply, after its id, ok and err.
 static void putcfgset(JsonOut *w, Config *c, CfgSet *r)
 {
-    putfield(w, "path", c->path.len ? c->path : Str(""));
-    putfield(w, "line", (i64)r->line);
-    putfield(w, "rev", c->rev);
+    putstrkey(w, "path", c->path.len ? c->path : Str(""));
+    putintkey(w, "line", (i64)r->line);
+    putintkey(w, "rev", c->rev);
     putcfgdiags(w, c);
 }

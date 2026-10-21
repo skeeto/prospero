@@ -997,10 +997,21 @@ def quit_stop(t):
         time.sleep(0.05)
     pids = t.pids("quitpid")
     t0 = time.monotonic()
-    r = h.call("quit", mode="stop")
-    t.check(r.get("ok") == 1, f"quit accepted: {r}")
+    # A prompt right behind the quit, in the same write, starts nothing
+    qid, late = h.id + 1, h.id + 2
+    h.id += 2
+    h.p.stdin.write(json.dumps({"cmd": "quit", "mode": "stop", "id": qid}) + "\n" +
+                    json.dumps({"cmd": "prompt", "id": late, "sid": sid,
+                                "text": "too late"}) + "\n")
+    h.p.stdin.flush()
     rc = h.exit(10)
     dt = time.monotonic() - t0
+    r = [e for e in h.events if e.get("ev") == "reply" and e.get("id") == qid]
+    t.check(r and r[0].get("ok") == 1, f"quit accepted: {r}")
+    r = [e for e in h.events if e.get("ev") == "reply" and e.get("id") == late]
+    t.check(not r or (r[0].get("ok") == 0 and "stopping" in r[0].get("err", "")),
+            f"the late prompt is refused: {r}")
+    t.check(not [e for e in h.all("turn", sid) if e.get("n") == 2], "no turn after quit")
     t.check(rc == 0, f"exit {rc}")
     t.check(dt < 3, f"quit within bounds: {dt:.1f} s")
     te = h.all("tool.end", sid)
@@ -1138,6 +1149,191 @@ def config_seed(t):
             f"config.get {r} {err}")
     t.check(r["path"].endswith("harness/harness.ini"), f"path {r['path']}")
     t.check(p.returncode == 0, f"exit {p.returncode}: {err}")
+
+
+@scenario(bound=10)
+def long_path(t):
+    """Made-up paths cost bounded work: one of 64 KiB is refused as an
+    invalid argument, and one of 252 names outside is denied with a hint,
+    each within a second of the response."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    asst = r.all("assistant")
+    ends = r.all("tool.end")
+    t.check(len(asst) == 3 and len(ends) == 2, f"steps {compact(r.names())}")
+    t.check(ends[0]["status"] == "error" and "too long" in ends[0]["text"],
+            f"refused: {ends[0]['text'][:200]}")
+    t.check(ends[1]["status"] == "denied" and "x.txt" in ends[1]["text"],
+            f"denied: {ends[1]['text'][:300]}")
+    for a, e in zip(asst, ends):
+        t.check(e["ts"] - a["ts"] < 1000, f"judged in {e['ts'] - a['ts']} ms")
+    t.check(len(r.all("ask")) == 1, "only the valid path is asked about")
+
+
+@scenario(bound=15)
+def steer_tool(t):
+    """A steer sent while a command runs answers an ask later in the same
+    step at once, by steer, rather than at its deadline."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        t0 = time.monotonic()
+        h.call("steer", sid=sid, text="no, put it in steered.txt")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        t.check(ask["deadline"] - ask["ts"] < 100, f"no wait for an answer: {ask}")
+        ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == sid)
+        waited = time.monotonic() - t0
+        t.check(ans["by"] == "steer" and ans["decision"] == "deny", f"answer {ans}")
+        t.check(waited < 5, f"answered right after the command: {waited:.1f} s")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"the turn goes on: {end}")
+        st = [e["status"] for e in h.all("tool.end", sid)]
+        t.check(st == ["ok", "denied", "ok"], f"statuses {st}")
+        t.check(t.file("steered.txt") == "no, put it in steered.txt", "the steer is acted on")
+        t.check(outside_file(t) is None, "nothing written outside")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def crash_ask(t):
+    """The harness dies while asking: the next open closes the call in
+    the order a live session would, answer, tool.start, tool.end, and
+    only then the turn."""
+    a = t.headless()
+    try:
+        sid = a.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        a.send("prompt", sid=sid, text="go")
+        a.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        if t.host.windows:
+            t.host.killhard(a.p, t.pids("harnesspid")[0])
+        else:
+            t.host.killhard(a.p)
+        a.p.wait()
+    finally:
+        a.close()
+    b = t.headless()
+    try:
+        r = b.call("open", sid=sid, attended=1, **{"from": 0})
+        t.check(r.get("ok") == 1 and r.get("readonly") == 0, f"opened: {r}")
+        log = [e for e in b.events if e.get("sid") == sid and e.get("seq")]
+        tail = [(e["ev"], e.get("by") or e.get("status") or e.get("why"))
+                for e in log[-6:]]
+        t.check(tail == [("assistant", None), ("ask", None), ("answer", "cancel"),
+                         ("tool.start", None), ("tool.end", "cancelled"),
+                         ("turn.end", "interrupted")], f"repaired: {tail}")
+        t.check([e["seq"] for e in log] == list(range(1, len(log) + 1)), "in order")
+        b.call("prompt", sid=sid, text="go on")
+        end = b.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid
+                     and e.get("why") != "interrupted")
+        t.check(end["why"] == "done", f"the next turn: {end}")
+    finally:
+        rc = b.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def snapshot(t):
+    """Opening a session again while it streams sends a snapshot of the
+    response so far, which with the deltas after it makes the response."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "delta" and "word5 " in e.get("text", ""))
+        with h.cond:
+            seq = max(e.get("seq", 0) for e in h.events if e.get("sid") == sid)
+        oid = h.send("open", sid=sid, **{"from": seq})
+        h.wait(lambda e: e.get("ev") == "reply" and e.get("id") == oid)
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        with h.cond:
+            events = [e for e in h.events if e.get("sid") == sid or e.get("id") == oid]
+        at = next(i for i, e in enumerate(events) if e.get("ev") == "snapshot")
+        reply = next(i for i, e in enumerate(events) if e.get("id") == oid)
+        t.check(at < reply, "the snapshot comes before the reply")
+        snap = events[at]
+        asst = next(e for e in events if e.get("ev") == "assistant")
+        t.check((snap["turn"], snap["attempt"]) == (asst["turn"], asst["attempt"]),
+                f"the snapshot's response: {snap}")
+        got = {}
+        for b in snap["blocks"]:
+            got[b["block"]] = [b["kind"], b["text"]]
+        for e in events[at + 1:]:
+            if e.get("ev") == "delta" and e.get("attempt") == snap["attempt"]:
+                got.setdefault(e["block"], [e["kind"], ""])[1] += e["text"]
+        want = {}
+        for i, b in enumerate(asst["blocks"]):
+            kind = {"think": "think", "text": "text", "call": "args"}[b["t"]]
+            want[i] = [kind, b.get("args") if b["t"] == "call" else b["text"]]
+        t.check(got == want, f"snapshot and deltas {got} vs committed {want}")
+        t.check(any(b["kind"] == "text" and b["text"] for b in snap["blocks"]),
+                "the snapshot holds text")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def long_command(t):
+    """A command line too long to take still gets its reply, an error,
+    and the next command is answered as usual."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = h.call("prompt", sid=sid, text="x" * (2 << 20))
+        t.check(r.get("ok") == 0 and "too long" in r.get("err", ""), f"refused: {r}")
+        r = h.call("list")
+        t.check(r.get("ok") == 1, f"the next command: {r}")
+        t.check(not h.all("turn", sid), "no turn started")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def config_roots(t):
+    """[guard] roots set while a session is open reach it: a write there
+    no longer asks."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        r = h.call("config.set", kind="guard", name="", key="roots", value=t.base)
+        t.check(r.get("ok") == 1, f"config.set: {r}")
+        h.send("prompt", sid=sid, text="write outside")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"the turn: {end}")
+        t.check(not h.all("ask", sid), f"no ask: {h.all('ask', sid)}")
+        st = [e["status"] for e in h.all("tool.end", sid)]
+        t.check(st == ["ok"], f"written: {st}")
+        t.check(outside_file(t) == "outside", "the file is in the new root")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10, posix=True)
+def config_link(t):
+    """config.set edits the file a symlinked configuration points to, and
+    the link stays a link."""
+    dot = t.host.join(t.base, "dotfiles")
+    t.host.mkdir(dot)
+    target = t.host.join(dot, "harness.ini")
+    os.rename(t.config, target)
+    os.symlink(target, t.config)
+    h = t.headless()
+    try:
+        r = h.call("config.set", kind="endpoint", name="fake", key="idle_timeout",
+                   value="77")
+        t.check(r.get("ok") == 1, f"config.set: {r}")
+        t.check(os.path.islink(t.config), "the link is still a link")
+        t.check("idle_timeout = 77" in t.host.read(target), "the target has the edit")
+        t.check(r.get("path") == t.config, f"the path as given: {r.get('path')}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

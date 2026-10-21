@@ -146,6 +146,20 @@ static void test_guard(Test *t)
     expect(t, "realpath of a missing name",
            realpathof(os, a, "/w/new.txt", 0), "/w/new.txt");
     expect(t, "realpath of nothing", realpathof(os, a, "/nope/x", 0), Str{});
+    {
+        // A made-up path hundreds of names deep costs few lookups
+        Buf deep(a, 1024);
+        print(&deep, "/w");
+        for (i32 i = 0; i < 300; i++) {
+            print(&deep, "/d");
+        }
+        Str path = finish(&deep);
+        os->realpaths = 0;
+        expect(t, "realpath of a deep missing path",
+               realpathof(os, a, path, 0), path);
+        expect(t, "realpath of a deep missing path (lookups)",
+               istr(a, os->realpaths <= 20), "1");
+    }
 
     Str   extra[] = {"/x/extra", "/tmp/w2", "/missing/root"};
     Guard g = newguard(os, a, "/w", "/home/u", {extra, countof(extra), countof(extra)},
@@ -204,6 +218,38 @@ static void test_guard(Test *t)
         GuardHint h = guardhint(os, a, &g, hints[i].path, hints[i].read, hints[i].create);
         Str got = concat(a, h.path, h.path.data ? (h.exists ? Str(" +") : Str(" -")) : Str(" "));
         expect(t, concat(a, "hint ", hints[i].path), got, hints[i].want);
+    }
+
+    // Hints keep at most HINT_PARTS trailing names, so a long path costs
+    // a bounded number of lookups
+    os_write(os, *a, "/w/2/3/4/5/6/7/8/f", "data");
+    os_write(os, *a, "/w/1/2/3/4/5/6/7/8/g", "data");
+    {
+        GuardHint h = guardhint(os, a, &g, "/q/2/3/4/5/6/7/8/f", 1, 0);
+        expect(t, "hint of eight names", h.path, "/w/2/3/4/5/6/7/8/f");
+        h = guardhint(os, a, &g, "/q/1/2/3/4/5/6/7/8/g", 1, 0);
+        expect(t, "hint of nine names", h.path, Str{});
+
+        Buf deep(a, 1024);
+        print(&deep, "/q");
+        for (i32 i = 0; i < 300; i++) {
+            print(&deep, "/a");
+        }
+        print(&deep, "/src/x.c");
+        os->realpaths = 0;
+        h = guardhint(os, a, &g, finish(&deep), 1, 1);
+        expect(t, "hint of a deep path", h.path, "/w/src/x.c");
+        expect(t, "hint of a deep path (lookups)", istr(a, os->realpaths <= 20), "1");
+        Buf miss(a, 1024);
+        print(&miss, "/q");
+        for (i32 i = 0; i < 300; i++) {
+            print(&miss, "/a");
+        }
+        print(&miss, "/none.txt");
+        os->realpaths = 0;
+        h = guardhint(os, a, &g, finish(&miss), 0, 1);
+        expect(t, "hint of a deep new file", h.path, "/w/none.txt");
+        expect(t, "hint of a deep new file (lookups)", istr(a, os->realpaths <= 20), "1");
     }
 
     // Windows: drives, case, prefixes, and the trailing dots

@@ -36,10 +36,12 @@
 // denied at once by policy. Attended, the session logs an ask with a
 // deadline ([guard] ask_timeout, 30 s by default) and waits in its own state,
 // blocking nothing else: an answer resolves it, the deadline denies it,
-// and so does a steer, whose text the agent reads next. Every denial is
-// the call's tool result, explaining what to do instead. The log holds
-// ask and answer before the call's tool.start, so a crash while asking
-// leaves a call that never started rather than an unknown outcome.
+// and so does a steer, whose text the agent reads next (as does any ask
+// while a steer waits for the next step). Every denial is the call's
+// tool result, explaining what to do instead. The log holds ask and
+// answer before the call's tool.start, so a crash while asking leaves a
+// call that never started rather than an unknown outcome, which the
+// next open closes in order: answer, tool.start, tool.end (logopen).
 //
 // Locks: each session's directory has a lock file, held while a process
 // has the session open. A second process opens it read-only: it replays
@@ -51,6 +53,7 @@ enum : u32 {
     MAIL_CMD  = 100,  // frontend to engine: one protocol command line
     MAIL_OUT,         // engine to frontend: one protocol record line
     MAIL_QUIT,        // engine to frontend: the engine has stopped
+    MAIL_TOOLONG,     // frontend to engine: a command too long, by its id
 };
 
 enum : i64 {
@@ -71,6 +74,7 @@ enum : i64 {
     QUIT_WAIT    = 5*SEC,         // for turns to end after quit
     LIVE_EVERY   = 1*SEC,         // live records while a request runs
     TITLE_MAX    = 60,            // code points
+    SNAPSHOT_MAX = 256 << 10,     // bytes of text in a snapshot
 };
 
 enum : i32 {
@@ -208,9 +212,8 @@ struct Session {
     i64          used;       // tokens in the last request and response
     i64          added;      // bytes added to the history since
     Slice<Str>   queued;     // prompts waiting for the turn to end
-    Slice<Str>   steers;     // input for the next step
+    Slice<Str>   steers;     // input for the next step: asks yield to it
     Ask          ask;        // with S_ASK
-    b32          steered;    // asks this step yield to a steer
     // The current request
     Http        *http;
     u64          httpid;
@@ -295,18 +298,6 @@ static Str secstr(Arena *a, i64 ticks)
     Buf b(a, 24);
     printfloat(&b, (f64)ticks/(f64)SEC, 1);
     return finish(&b);
-}
-
-static void putstrkey(JsonOut *w, Str key, Str v)
-{
-    putkey(w, key);
-    putstr(w, v);
-}
-
-static void putintkey(JsonOut *w, Str key, i64 v)
-{
-    putkey(w, key);
-    putint(w, v);
 }
 
 static void note(Session *s, Arena scratch, Str level, Str text)
@@ -713,7 +704,6 @@ static void runcalls(Session *s, Arena scratch, Slice<Block> blocks)
         }
     }
     s->callidx = 0;
-    s->steered = 0;
     nexttool(s, scratch);
 }
 
@@ -1208,7 +1198,10 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     k->hint.exists = h.exists;
     k->opened      = os_ticks(e->os);
 
-    b32 wait  = s->attended && !s->steered;
+    // A steer waiting for the next step answers this ask too: the user
+    // has already said what to do instead
+    b32 steer = s->steers.len > 0;
+    b32 wait  = s->attended && !steer;
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     {
         Str   why = guardwhy(&scratch, toolnames[tool], gp, s->guard.cwd);
@@ -1228,7 +1221,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, s->steered ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
         return 1;
     }
     arm(s, T_ASK, delay);
@@ -1754,7 +1747,8 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     ep->firstbyte = cfgms(cfg, "endpoint", name, "first_byte_timeout", local)*MS;
     ep->idle      = cfgms(cfg, "endpoint", name, "idle_timeout", local)*MS;
     ep->progress  = cfgms(cfg, "endpoint", name, "progress_timeout", local)*MS;
-    ep->connectms = (i32)cfgms(cfg, "endpoint", name, "connect_timeout", local);
+    i64 connect   = cfgms(cfg, "endpoint", name, "connect_timeout", local);
+    ep->connectms = (i32)(connect<0x7fffffff ? connect : 0x7fffffff);
     ep->key       = cfgsecret(cfg, perm, "endpoint", name, "key");
     return 1;
 }
@@ -1828,34 +1822,28 @@ static Str lockpath(Arena *a, Session *s)
     return join(a, s->dir, "lock");
 }
 
-// Extra workspace roots from the configuration: "[guard] roots = A; B".
-static Slice<Str> confroots(Engine *e, Arena *a)
+// The session's workspace: its working directory, its own extra roots,
+// and those of the configuration ("[guard] roots = A; B").
+static Guard sessionguard(Session *s, Arena *perm)
 {
-    Slice<Str> r = {};
-    for (Str rest = cfgget(e->cfg, "guard", "", "roots", 0); rest.len;) {
-        Cut c = cut(rest, ';');
-        Str p = trim(c.head);
-        if (p.len) r = push(a, r, clone(a, p));
-        rest = c.tail;
+    Engine    *e     = s->e;
+    Slice<Str> roots = {};
+    Slice<Str> conf  = cfgpaths(e->cfg, perm, "guard", "", "roots", e->home);
+    for (iz i = 0; i < s->roots.len; i++) {
+        roots = push(perm, roots, s->roots[i]);
     }
-    return r;
+    for (iz i = 0; i < conf.len; i++) {
+        roots = push(perm, roots, conf[i]);
+    }
+    return newguard(e->os, perm, s->cwd, e->home, roots, s->dir, s->te.windows);
 }
 
 static void sessionready(Session *s)
 {
-    Engine    *e     = s->e;
-    Slice<Str> roots = {};
-    Slice<Str> conf  = confroots(e, &s->perm);
-    for (iz i = 0; i < s->roots.len; i++) {
-        roots = push(&s->perm, roots, s->roots[i]);
-    }
-    for (iz i = 0; i < conf.len; i++) {
-        roots = push(&s->perm, roots, conf[i]);
-    }
+    Engine *e = s->e;
     s->system = systemprompt(&s->perm, s->cwd, &s->te);
     s->tools  = tooljson(&s->perm, &s->te);
-    s->guard  = newguard(e->os, &s->perm, s->cwd, e->home, roots, s->dir,
-                         s->te.windows);
+    s->guard  = sessionguard(s, &s->perm);
     // Tell the agent about the other places it may work
     Buf b(&s->perm, 256);
     for (iz i = 1; i < s->guard.roots.len; i++) {
@@ -1991,7 +1979,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 }
 
 // Rebuild a session from its log: the history, the turn count, and the
-// closing of anything a crash left open (logopen), plus results for
+// closing of anything a crash left open (logopen), including results for
 // calls that never started. *firstnew is the seq before any repairs.
 // When another process holds the session's lock, it is only read, and
 // so neither repaired nor written later (readonly).
@@ -2088,35 +2076,72 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
     }
     modelconf(e, &s->perm, s->model, &s->mc);
     sessionready(s);
-    if (s->readonly) {
-        return s;
-    }
-
-    // Calls of the last assistant message that never got a result
-    iz last = -1;
-    for (iz i = 0; i < s->history.len; i++) {
-        last = s->history[i].role==ROLE_ASSISTANT ? i : last;
-    }
-    Slice<Block> blocks = last>=0 ? s->history[last].blocks : Slice<Block>{};
-    for (iz i = 0; i < blocks.len; i++) {
-        if (blocks[i].type != BLOCK_CALL) continue;
-        b32 answered = 0;
-        for (iz k = last+1; k < s->history.len; k++) {
-            Msg *h = &s->history[k];
-            answered |= h->role==ROLE_TOOL && h->callid==blocks[i].id;
-        }
-        if (!answered) {
-            s->calls     = {};
-            s->calls     = push(&s->perm, s->calls, blocks[i]);
-            s->callidx   = 0;
-            s->callstart = os_ticks(e->os);
-            toolend(s, scratch, "cancelled", "Not run: the harness stopped "
-                    "before this call started.", 0, 0, {}, 0);
-        }
-    }
-    s->calls   = {};
-    s->callidx = 0;
     return s;
+}
+
+// What streamed of the current response so far, for a frontend opening
+// the session mid-stream: each block as one delta would carry all of it,
+// in order, which the deltas that follow extend. A text longer than its
+// share of the budget keeps its end, and says how much was cut. The
+// budget leaves the record well inside the frontend's mailbox even with
+// every byte escaped, so that it never overflows by itself.
+static void sendsnapshot(Session *s, Arena scratch)
+{
+    Partial *p = s->part;
+    if (!p || !requesting(s->state)) {
+        return;
+    }
+    iz budget = mailmax(s->e->out) / 8;
+    budget = budget<SNAPSHOT_MAX ? budget : SNAPSHOT_MAX;
+    iz share = budget / (p->nblocks>0 ? p->nblocks : 1);
+
+    Buf   b(&scratch, 1024 + budget);
+    EvOut w = sbegin(s, &b, EV_SNAPSHOT);
+    putintkey(&w.json, "turn", s->turn);
+    putintkey(&w.json, "attempt", s->attempts);
+    putkey(&w.json, "blocks");
+    putarray(&w.json);
+    for (i32 i = 0; i < p->nblocks; i++) {
+        Str       kind = {};
+        Str       text = {};
+        PartCall *c    = 0;
+        if (i == p->thinkblock) {
+            kind = "think";
+            text = finish(&p->think);
+        } else if (i == p->textblock) {
+            kind = "text";
+            text = finish(&p->text);
+        } else {
+            for (iz k = 0; k < p->calls.len; k++) {
+                c = p->calls[k].block==i ? &p->calls[k] : c;
+            }
+            if (!c) {
+                continue;
+            }
+            kind = "args";
+            text = finish(&c->args);
+        }
+        iz cut = 0;
+        if (text.len > share) {
+            cut = text.len - share;
+            for (; cut<text.len && (text[cut]&0xc0)==0x80; cut++) {}
+            text = cuthead(text, cut);
+        }
+        putobject(&w.json);
+        putintkey(&w.json, "block", i);
+        putstrkey(&w.json, "kind", kind);
+        if (c) {
+            putstrkey(&w.json, "id", finish(&c->id));
+            putstrkey(&w.json, "name", finish(&c->name));
+        }
+        putstrkey(&w.json, "text", text);
+        if (cut) {
+            putintkey(&w.json, "cut", cut);
+        }
+        putend(&w.json);
+    }
+    putend(&w.json);
+    ssend(s, &w);
 }
 
 static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
@@ -2163,6 +2188,7 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
             nexttool(s, scratch);
         }
     }
+    sendsnapshot(s, scratch);
 
     Buf   b(&scratch, 256);
     EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
@@ -2228,11 +2254,14 @@ static void cmdlist(Engine *e, Arena scratch, i64 id)
 }
 
 // After the configuration reloads: each session takes up its endpoint's
-// and model's settings for its next request.
+// and model's settings for its next request, and the guard's roots for
+// its next call. The system prompt stays as it was, byte for byte, to
+// keep the prompt cache: it names only the roots the session began with.
 static void reconfigure(Engine *e)
 {
     e->ini = e->cfg->ini;
     for (Session *s = e->sessions; s; s = s->next) {
+        s->guard = sessionguard(s, &s->perm);
         Str      which = s->ep.name.len ? s->ep.name : s->ep.url;
         Endpoint ep    = {};
         if (endpointconf(e, &s->perm, which, &ep)) {
@@ -2310,6 +2339,18 @@ static void command(Engine *e, Arena scratch, Str line)
     Str      sid  = jsonstr(jsonget(j, "sid"));
     Str      text = jsonstr(jsonget(j, "text"));
     Session *s    = sid.len ? findsession(e, sid) : 0;
+    if (e->quitting) {
+        // Nothing new starts once stopping, so that the engine can stop
+        switch (cmd) {
+        case CMD_NEW:
+        case CMD_OPEN:
+        case CMD_PROMPT:
+        case CMD_STEER:
+        case CMD_ANSWER:
+            reply(e, scratch, id, 0, "the engine is stopping", sid);
+            return;
+        }
+    }
     switch (cmd) {
     case CMD_HELLO: {
         Arena a = scratch;
@@ -2389,10 +2430,9 @@ static void command(Engine *e, Arena scratch, Str line)
             s->queued = push(&s->perm, s->queued, clone(&s->perm, text));
         } else {
             // Read at the next step; a pending ask yields to it, as do
-            // any more asks in this step
+            // any more asks before then (askcall)
             s->steers = push(&s->perm, s->steers, clone(&s->perm, text));
             if (s->state == S_ASK) {
-                s->steered = 1;
                 resolve(s, scratch, 0, DENY_STEER, {});
                 nexttool(s, scratch);
             }
@@ -2454,6 +2494,9 @@ static void onrecord(Engine *e, Arena scratch, Record r)
 {
     if (r.type == MAIL_CMD) {
         command(e, scratch, r.data);
+        return;
+    } else if (r.type == MAIL_TOOLONG) {
+        reply(e, scratch, (i64)r.id, 0, "command too long", {});
         return;
     }
 
@@ -2700,8 +2743,75 @@ static b32 enginestart(Engine *e)
     return os_thread(e->os, enginethread, e);
 }
 
-// Post a command line from any thread.
-static void enginecmd(Engine *e, Str line)
+// The id of a command, read without parsing it whole: the number of its
+// top-level "id" key, or 0. A prefix of a line too long to take will do,
+// if the id comes early enough.
+static i64 cmdlineid(Str line)
 {
-    mailpost(e->in, MAIL_CMD, 0, line, 1);
+    iz i = 0;
+    for (; i<line.len && whitespace(line[i]); i++) {}
+    if (i==line.len || line[i]!='{') {
+        return 0;
+    }
+    for (i++;;) {
+        for (; i<line.len && whitespace(line[i]); i++) {}
+        if (i==line.len || line[i]!='"') {
+            return 0;
+        }
+        iz k = ++i;
+        for (; i<line.len && line[i]!='"'; i += line[i]=='\\' ? 2 : 1) {}
+        if (i >= line.len) {
+            return 0;
+        }
+        Str key = span(line.data+k, line.data+i);
+        for (i++; i<line.len && whitespace(line[i]); i++) {}
+        if (i==line.len || line[i]!=':') {
+            return 0;
+        }
+        for (i++; i<line.len && whitespace(line[i]); i++) {}
+        if (key == "id") {
+            iz j = i;
+            for (; j<line.len && (digit(line[j]) || line[j]=='-'); j++) {}
+            Int n = parseint(span(line.data+i, line.data+j));
+            return n.ok ? n.val : 0;
+        }
+
+        // Skip the value, through any strings and containers in it
+        for (i32 depth = 0; i < line.len; i++) {
+            u8 c = line[i];
+            if (c == '"') {
+                for (i++; i<line.len && line[i]!='"'; i += line[i]=='\\' ? 2 : 1) {}
+                if (i >= line.len) {
+                    return 0;
+                }
+            } else if (c=='{' || c=='[') {
+                depth++;
+            } else if ((c=='}' || c==']') && depth) {
+                depth--;
+            } else if ((c==',' || c=='}') && !depth) {
+                break;
+            }
+        }
+        if (i==line.len || line[i]!=',') {
+            return 0;
+        }
+        i++;
+    }
+}
+
+// Refuse a command too long to take, by its id: the engine replies.
+static void enginetoolong(Engine *e, i64 id)
+{
+    mailpost(e->in, MAIL_TOOLONG, (u64)id, {}, 1);
+}
+
+// Post a command line from any thread. One too long for the mailbox is
+// refused in its place, and then this returns 0.
+static b32 enginecmd(Engine *e, Str line)
+{
+    if (line.len > mailmax(e->in)) {
+        enginetoolong(e, cmdlineid(line));
+        return 0;
+    }
+    return mailpost(e->in, MAIL_CMD, 0, line, 1);
 }

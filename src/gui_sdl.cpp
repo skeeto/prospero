@@ -14,6 +14,12 @@
 // looked up through SDL rather than linked, so that one Linux binary
 // still starts without display libraries.
 //
+// SIGINT and SIGTERM (Ctrl+C in a terminal, a logout) ask to close the
+// window, as quitting from the Dock does. main blocks them before any
+// thread starts, and one thread takes them with sigwait and pushes a
+// quit event, which wakes the loop: SDL's own handlers only set a flag
+// for the next event pump, which an idle loop never runs.
+//
 // This is free and unencumbered software released into the public domain.
 
 using GlViewport   = void (*)(i32, i32, i32, i32);
@@ -41,6 +47,22 @@ static void os_wake(Os *os)
         SDL_Event e = {};
         e.type = p->wakeevent;
         SDL_PushEvent(&e);
+    }
+}
+
+static void sigthread(void *)
+{
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    for (;;) {
+        int sig = 0;
+        if (!sigwait(&set, &sig)) {
+            SDL_Event e = {};
+            e.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&e);
+        }
     }
 }
 
@@ -79,6 +101,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     GuiSdl *p = alloc<GuiSdl>(&g->perm);
     p->gui = g;
     SDL_SetHint(SDL_HINT_POLL_SENTINEL, "0");
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");  // sigthread's job
     if (g->drive) {
         // Synthetic input must not compete with the real mouse, which
         // the backend reads directly while the window has focus.
@@ -122,6 +145,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     os->gui = p;  // before any thread can wake it
     SDL_AddEventWatch(sdlwatch, p);
     SDL_ShowWindow(p->window);
+    os_thread(os, sigthread, 0);
     return 1;
 }
 
@@ -249,6 +273,21 @@ static void os_guipresent(Os *os, b32 present)
     }
 }
 
+static void os_guiraise(Os *os)
+{
+    GuiSdl         *p = (GuiSdl *)os->gui;
+    SDL_WindowFlags f = SDL_GetWindowFlags(p->window);
+    if (f & SDL_WINDOW_HIDDEN) {
+        SDL_ShowWindow(p->window);
+    }
+    if (f & SDL_WINDOW_MINIMIZED) {
+        SDL_RestoreWindow(p->window);
+    }
+    if (!p->gui->drive) {
+        SDL_RaiseWindow(p->window);
+    }
+}
+
 static i64 os_guirefresh(Os *os)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
@@ -330,6 +369,9 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         e.type            = SDL_EVENT_WINDOW_CLOSE_REQUESTED;
         e.window.windowID = id;
         break;
+    case GEV_MINIMIZE:
+        SDL_MinimizeWindow(p->window);
+        return;
     }
     e.common.timestamp = SDL_GetTicksNS();
     SDL_PushEvent(&e);

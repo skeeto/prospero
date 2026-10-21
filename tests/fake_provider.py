@@ -449,6 +449,7 @@ def sc_ask(model, n, req):
 
 
 sc_ask_allow = sc_ask_deny = sc_ask_timeout = sc_ask_steer = sc_ask_close = sc_ask
+sc_config_roots = sc_ask
 
 
 def sc_readonly(model, n, req):
@@ -459,7 +460,66 @@ def sc_quit_stop(model, n, req):
     if n == 0:
         yield from tool(model, n, "shell", {"command": "echo $$ > quitpid; sleep 30"})
     else:
-        yield from answer(model, "Should not be reached.")
+        # A turn started after quit would hold the engine up
+        yield S.head()
+        yield S.stall(30)
+
+
+def sc_long_path(model, n, req):
+    # Paths an agent made up: one far too long, refused as an invalid
+    # argument, then a long one outside the workspace, denied with a hint
+    if n == 0:
+        path = "/nonexistent-root/" + "a/" * 32768 + "x.txt"
+        yield from tool(model, n, "write", {"path": path, "content": "x"})
+    elif n == 1:
+        path = "/nonexistent-root/" + "a/" * 250 + "x.txt"
+        yield from tool(model, n, "write", {"path": path, "content": "x"})
+    else:
+        yield from answer(model, "Gave up on those paths.")
+
+
+def sc_steer_tool(model, n, req):
+    # One step: a command, then a write outside that asks; the user steers
+    # while the command runs, and the agent does what the steer says
+    msgs = req.get("messages", [])
+    last = msgs[-1] if msgs else {}
+    if n == 0:
+        yield S.head()
+        yield from call(model, 0, "call_a", "shell", {"command": "sleep 2"})
+        yield from call(model, 1, "call_b", "write", {"path": "../asked.txt",
+                                                      "content": "outside"})
+        yield from finish(model, "tool_calls")
+    elif last.get("role") == "user":
+        yield from tool(model, n, "write", {"path": "steered.txt",
+                                            "content": last.get("content", "")})
+    else:
+        yield from answer(model, "Done as steered.")
+
+
+def sc_crash_ask(model, n, req):
+    # The harness's pid (on Windows, the shell's parent), then a write
+    # outside, which asks, and the harness dies while asking
+    if n == 0:
+        yield from tool(model, n, "shell", {"command": "echo $PPID > harnesspid"})
+    elif n == 1:
+        yield from tool(model, n, "write", {"path": "../asked.txt", "content": "outside"})
+    else:
+        yield from answer(model, "After the crash.")
+
+
+def sc_snapshot(model, n, req):
+    # Slow enough to open the session again mid-stream, with every kind
+    # of block
+    if n == 0:
+        yield S.head()
+        yield from think(model, "Thinking it over. ", 3)
+        for i in range(40):
+            yield from text(model, f"word{i} ")
+            yield S.sleep(0.05)
+        yield from call(model, 0, "call_s", "read", {"path": "nothing.txt"}, 4)
+        yield from finish(model, "tool_calls")
+    else:
+        yield from answer(model, "Done.")
 
 
 def sc_tree(model, n, req):
@@ -491,7 +551,7 @@ def sc_escapee(model, n, req):
 
 GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody",
                "Steer me", "Cancel me", "Close me", "Stream fast", "Stream at 100",
-               "Say hello", "Stall for", "Fail once")
+               "Say hello", "Stall for", "Fail once", "Hold me")
 
 GUI_FAILED = set()  # (model, messages so far): turns that failed once
 
@@ -607,6 +667,16 @@ def sc_gui(model, n, req):
         yield from finish(model)
     elif "Say hello" in prompt:
         yield from answer(model, "Hello!")
+    elif "Hold me" in prompt:
+        # Reasoning of 5 MiB, never repeating itself, collapsed once
+        # committed: its record is too big for any mailbox on the way to
+        # the GUI, so opening the session overflows and resyncs
+        yield S.head()
+        for i in range(50):
+            part = "".join(f"r{i}x{j} " for j in range(12000))
+            yield S.data(chunk(model, {"reasoning_content": part}))
+        yield from text(model, "Holding.")
+        yield from finish(model)
     elif "Stall for" in prompt:
         # Nothing at all for 17 s: past the GUI's amber, short of the
         # first-byte watchdog its configuration sets

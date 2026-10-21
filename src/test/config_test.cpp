@@ -313,13 +313,10 @@ static void testcfgvalidate(Test *t)
     expect(t, "secret.user", s1, "sk-plain");
     expect(t, "secret.shared", s2.data ? s2 : Str("(null)"), "(null)");
     expect(t, "secret.unset", s3.data ? s3 : Str("(null)"), "(null)");
-    expect(t, "paths", showlist(&a, cfgpaths(c, &a, "guard", "", "roots")),
+    expect(t, "paths", showlist(&a, cfgpaths(c, &a, "guard", "", "roots", "/home/u")),
            "rel/path|/home/u/ok|/abs");
-    expect(t, "words", showlist(&a, cfgwords(c, &a, "role", "r", "tools")),
-           "read|fly");
-    expect(t, "words.default",
-           showlist(&a, cfgwords(c, &a, "role", "none", "tools")),
-           "read|write|edit|shell");
+    expect(t, "paths.nohome", showlist(&a, cfgpaths(c, &a, "guard", "", "roots", "")),
+           "rel/path|~/ok|/abs");
     cfgfree(c);
 
     // The reader's limit on diagnostics per file holds for the schema's
@@ -484,6 +481,52 @@ static void testcfgset(Test *t)
         expect(t, concat(&a, "missing ", p), cfgfile(v.os, p), want);
         expect(t, concat(&a, "missing.ok ", p), istr(&a, r.ok), "1");
         expect(t, concat(&a, "missing.diags ", p), inidiags(&a, m->ini), "");
+        cfgfree(m);
+    }
+
+    // Includes: a top-level setting an include overrides moves below it,
+    // and removing what only an include sets says so
+    {
+        os_write(v.os, a, "/i/team.ini", "model = team-model\n"
+                 "[endpoint team]\nurl = http://t/\nidle_timeout = 5\n");
+        os_write(v.os, a, "/i/h.ini", "model = mine\ninclude = team.ini\n");
+        Arena   tmp = v.scratch;
+        Config *m   = newconfig(v.os, &a, tmp, "/i/h.ini", 0);
+        expect(t, "include.before", cfgget(m, "", "", "model", 0), "team-model");
+        CfgSet  r   = cfgset(m, &tmp, "", "", "model", "new-model");
+        expect(t, "include.set", istr(&a, r.ok*10 + r.line), "12");
+        expect(t, "include.set.text", cfgfile(v.os, "/i/h.ini"),
+               "include = team.ini\nmodel = new-model\n");
+        expect(t, "include.set.value", cfgget(m, "", "", "model", 0), "new-model");
+
+        tmp = v.scratch;
+        r = cfgset(m, &tmp, "", "", "model", {});
+        expect(t, "include.remove", istr(&a, r.ok), "1");
+        expect(t, "include.remove.value", cfgget(m, "", "", "model", 0), "team-model");
+        tmp = v.scratch;
+        r = cfgset(m, &tmp, "", "", "model", {});
+        expect(t, "include.remove.again", r.err,
+               "nothing to remove: /i/team.ini:1 sets it, not this file");
+        tmp = v.scratch;
+        r = cfgset(m, &tmp, "endpoint", "team", "idle_timeout", {});
+        expect(t, "include.remove.section", r.err,
+               "nothing to remove: /i/team.ini:4 sets it, not this file");
+        expect(t, "include.untouched", cfgfile(v.os, "/i/team.ini"),
+               "model = team-model\n[endpoint team]\nurl = http://t/\nidle_timeout = 5\n");
+        cfgfree(m);
+    }
+
+    // A hand edit of the same size within the same mtime tick is not
+    // lost to an edit made from the last load
+    {
+        os_write(v.os, a, "/t/h.ini", "[endpoint local]\nurl = http://l/\nidle_timeout = 90\n");
+        Arena   tmp = v.scratch;
+        Config *m   = newconfig(v.os, &a, tmp, "/t/h.ini", 0);
+        os_write(v.os, a, "/t/h.ini", "[endpoint local]\nurl = http://l/\nidle_timeout = 60\n");
+        CfgSet  r   = cfgset(m, &tmp, "endpoint", "local", "connect_timeout", "3");
+        expect(t, "tick.ok", istr(&a, r.ok), "1");
+        expect(t, "tick.text", cfgfile(v.os, "/t/h.ini"),
+               "[endpoint local]\nurl = http://l/\nidle_timeout = 60\nconnect_timeout = 3\n");
         cfgfree(m);
     }
 }
@@ -679,6 +722,29 @@ static void testcfgjson(Test *t)
         "{\"file\":\"/c/h.ini\",\"line\":5,\"col\":7,\"severity\":\"warning\","
         "\"message\":\"environment variable KEY is not set\"}]}");
     cfgfree(c);
+
+    // A key set empty means its default: shown as the default, from
+    // where it is set
+    os_write(v.os, a, "/e/h.ini", "[endpoint local]\nurl = http://localhost/\n"
+             "idle_timeout =   # fill in later\n");
+    c = newconfig(v.os, &a, v.scratch, "/e/h.ini", 0);
+    d = jsonparse(&a, cfgjson(&a, c, 0));
+    Json *idle = 0;
+    for (Json *s = jsonget(d.root, "settings")->child; s; s = s->next) {
+        if (jsonstr(jsonget(s, "key")) == "idle_timeout") {
+            idle = s;
+        }
+    }
+    Buf eb(&a, 128);
+    print(&eb, jsonstr(jsonget(idle, "value")));
+    putbyte(&eb, ' ');
+    print(&eb, jsonint(jsonget(idle, "default"), -1));
+    putbyte(&eb, ' ');
+    print(&eb, jsonstr(jsonget(idle, "file")));
+    putbyte(&eb, ':');
+    print(&eb, jsonint(jsonget(idle, "line"), -1));
+    expect(t, "json.empty", finish(&eb), "90 1 /e/h.ini:3");
+    cfgfree(c);
 }
 
 // The engine resolves endpoints and models through the configuration,
@@ -693,6 +759,9 @@ static void testcfgengine(Test *t)
              "url = http://localhost:8080/\n"
              "idle_timeout = 7\n"
              "key = env:LOCALKEY\n"
+             "[endpoint slow]\n"
+             "url = http://slow.example/\n"
+             "connect_timeout = 3000000\n"
              "[model m]\n"
              "reasoning = none\n"
              "temperature = 0.5\n"
@@ -712,6 +781,8 @@ static void testcfgengine(Test *t)
         {"https://remote.example/",
          " https://remote.example/ 300 90 600 15000 "},
         {"http://192.168.1.5/", " http://192.168.1.5/ 1800 90 600 5000 "},
+        // Valid seconds, but more milliseconds than an i32 holds
+        {"slow", "slow http://slow.example/ 300 90 600 2147483647 "},
         {"nope", "(none)"},
     };
     for (iz i = 0; i < countof(eps); i++) {

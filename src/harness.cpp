@@ -270,6 +270,9 @@ static void    os_guinewframe(Os *);
 static void    os_guipresent(Os *, b32 present);
 // The display's refresh period in microseconds.
 static i64     os_guirefresh(Os *);
+// Bring the window back for the user: restored if minimized, and raised
+// unless scripted (it would take the user's focus).
+static void    os_guiraise(Os *);
 static void    os_guiclose(Os *);
 
 // Synthetic input for the scripted checklist (gui --drive), posted to
@@ -287,6 +290,7 @@ enum {
                     // SDL as x of the exposes a live resize sends
     GEV_DPI,        // Win32: the window moved to a monitor of x DPI
     GEV_CLOSE,      // the user asks to close the window
+    GEV_MINIMIZE,   // the window is minimized
 };
 enum {
     GKEY_TAB,

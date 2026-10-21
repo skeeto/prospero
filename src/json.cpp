@@ -836,3 +836,16 @@ static void putjson(JsonOut *w, Json *j)
         putend(w);
     }
 }
+
+// A key and its value.
+static void putstrkey(JsonOut *w, Str key, Str v)
+{
+    putkey(w, key);
+    putstr(w, v);
+}
+
+static void putintkey(JsonOut *w, Str key, i64 v)
+{
+    putkey(w, key);
+    putint(w, v);
+}

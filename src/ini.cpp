@@ -991,6 +991,9 @@ static b32 iniin(IniLine *l, Str kind, Str name)
 //
 // - A key the file defines gets the new value in place of its last
 //   definition (the one in effect), unless that already decodes to it.
+//   With move, its definitions go instead, and it is added anew as a
+//   new key is, which for the top level is after the includes: where it
+//   wins over an include that also defines it.
 // - A new key goes after the section's last key in the file, or after
 //   its header, with the same indentation. A new top-level key goes
 //   after the last top-level key or include, or else before the
@@ -1002,7 +1005,7 @@ static b32 iniin(IniLine *l, Str kind, Str name)
 // Values are quoted only when they need it (printinivalue), and new
 // lines end like the file's first line.
 static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
-                       Str key, Str value)
+                       Str key, Str value, b32 move = 0)
 {
     IniEdit r   = {};
     b32     top = !kind.len;
@@ -1048,6 +1051,10 @@ static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
     b32 gap  = 0;   // a blank line after the inserted key
     b32 drop = 0;   // remove the key's definitions
     Buf add(perm, 64 + kind.len + name.len + key.len + enc.len);
+    if (value.data && move && last>=0) {
+        drop = 1;
+        last = -1;
+    }
     if (!value.data) {
         for (iz i = 0; i < n; i++) {
             IniLine *l = &f->lines[i];
@@ -1082,10 +1089,15 @@ static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
         print(&add, eol);
     }
     if (at >= 0) {
-        // The inserted text holds whole lines: count those before the key
+        // The inserted text holds whole lines: count those before the key,
+        // and those dropped before it
         r.line = at + 1;
         for (iz i = 0; i < add.len; i++) {
             r.line += add.data[i] == '\n';
+        }
+        for (iz i = 0; drop && i < at; i++) {
+            IniLine *l = &f->lines[i];
+            r.line -= l->type==INI_KEY && iniin(l, kind, name) && l->key==key;
         }
         print(&add, key);
         print(&add, " = ");
@@ -1110,9 +1122,21 @@ static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
             continue;
         }
         if (i==last && value.data && r.changed) {
-            print(&b, takehead(l->raw, l->valbeg));
+            // An empty value's span sits right before a trailing comment,
+            // and maybe right after "=": keep the value apart from both
+            Str head = takehead(l->raw, l->valbeg);
+            Str rest = cuthead(l->raw, l->valend);
+            b32 was  = l->valbeg < l->valend;
+            print(&b, head);
+            if (!was && enc.len && head.len>=2 && head[head.len-1]=='=' &&
+                    whitespace(head[head.len-2])) {
+                putbyte(&b, ' ');  // "a =" becomes "a = x", not "a =x"
+            }
             print(&b, enc);
-            print(&b, cuthead(l->raw, l->valend));
+            if (enc.len && rest.len && !whitespace(rest[0])) {
+                putbyte(&b, ' ');
+            }
+            print(&b, rest);
         } else {
             print(&b, l->raw);
         }

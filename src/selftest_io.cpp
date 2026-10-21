@@ -407,10 +407,14 @@ static void testspawnio(ProcTest *p, Arena scratch)
     os_kill(os, pr, 1);
     os_procfree(os, pr);
 
-    // The engine itself, headless, as the GUI's --engine=subprocess runs it
+    // The engine itself, headless, as the GUI's --engine=subprocess runs
+    // it, with a configuration file of its own: by default it would read
+    // the user's, and seed it on first run
     Str exe = os_exepath(os, &scratch);
     Str st  = join(&scratch, p->dir, "engine-state");
-    Str argv[] = {exe, "--headless", "--state", st};
+    Str ini = join(&scratch, p->dir, "engine.ini");
+    os_write(os, scratch, ini, "# selftest: defaults only\n");
+    Str argv[] = {exe, "--headless", "--state", st, "-c", ini};
     pr = spawnio(p, scratch, {argv, countof(argv), countof(argv)}, {}, {});
     if (!check(t, pr!=0, "os_spawnio of harness --headless")) return;
     os_procwrite(os, pr, "{\"cmd\":\"hello\",\"proto\":0,\"id\":1}\n");

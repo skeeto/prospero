@@ -16,6 +16,7 @@ by quitting are gone, with no engine process left behind.
   uv run tests/gui.py --harness build/harness [--subprocess] [--inbox-cap N]
   uv run tests/gui.py --harness build/harness --mode idle      (60 s)
   uv run tests/gui.py --harness build/harness --mode streamtest
+  uv run tests/gui.py --harness build/harness --mode signals   (POSIX)
 
 On Linux without a display it runs under xvfb-run. --serve only runs the
 provider and writes the configuration, for a GUI started elsewhere (a
@@ -32,6 +33,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 sys.dont_write_bytecode = True
@@ -263,6 +265,9 @@ class Local:
         lines = []
         meter = None
         deadline = time.monotonic() + timeout
+        # A GUI that hangs prints nothing more: end it at the deadline
+        killer = threading.Timer(timeout + 5, lambda: os.killpg(p.pid, signal.SIGKILL))
+        killer.start()
         try:
             for line in p.stdout:
                 lines.append(line)
@@ -280,8 +285,13 @@ class Local:
             p.wait(timeout=max(1, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             pass
-        if p.poll() is None:
-            os.killpg(p.pid, signal.SIGKILL)
+        finally:
+            killer.cancel()
+        if p.poll() is None or p.returncode == -signal.SIGKILL:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
             p.wait()
             return None, lines
         return p.returncode, lines
@@ -446,6 +456,43 @@ def win_root(path):
     return path.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def signals(args):
+    """An idle GUI, with no deadline left to wake it, quits at once on
+    SIGTERM and on SIGINT (Ctrl+C in its terminal). POSIX only."""
+    problems = []
+    harness = os.path.abspath(args.harness)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        root = tempfile.mkdtemp(prefix="harness-sig-")
+        state = os.path.join(root, "state")
+        cmd = [harness, "gui", "--fake", "--statedir", state]
+        if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
+                and not os.environ.get("WAYLAND_DISPLAY"):
+            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
+        env = dict(os.environ, SDL_WINDOW_ACTIVATE_WHEN_SHOWN="0")
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+        time.sleep(8)  # past the probe and the layout's save: idle
+        pid = guipid(harness, state)
+        if not pid:
+            problems.append(f"{sig.name}: no GUI process")
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+            continue
+        t0 = time.monotonic()
+        os.kill(pid, sig)
+        try:
+            p.wait(timeout=5)
+            print(f"{sig.name}: the idle GUI quit in {time.monotonic() - t0:.1f} s")
+        except subprocess.TimeoutExpired:
+            problems.append(f"{sig.name}: still running 5 s after the signal")
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+        shutil.rmtree(root, ignore_errors=True)
+    for msg in problems:
+        print("FAIL: " + msg)
+    return 1 if problems else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--harness", required=True,
@@ -454,7 +501,8 @@ def main():
                     help="the engine as harness --headless")
     ap.add_argument("--inbox-cap", type=int, default=32768,
                     help="the GUI's inbox, small to force lost records")
-    ap.add_argument("--mode", default="drive", choices=["drive", "idle", "streamtest", "e2e"])
+    ap.add_argument("--mode", default="drive",
+                    choices=["drive", "idle", "streamtest", "e2e", "signals"])
     ap.add_argument("--model", default="qwen-flash", help="with --mode e2e")
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--keep", action="store_true", help="keep the directories")
@@ -463,6 +511,8 @@ def main():
     ap.add_argument("--host", help="run the GUI on this Windows host's console")
     ap.add_argument("--trace", action="store_true", help="log where presses land")
     args = ap.parse_args()
+    if args.mode == "signals":
+        return signals(args)
 
     srv, url = fake_provider.start()
     nonce = f"{random.randrange(1 << 32):08x}"

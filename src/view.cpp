@@ -209,6 +209,7 @@ struct View {
 
     // Ordering
     i64             lastseq;    // the last durable record applied
+    i64             logoff;     // where the last resync's reading ended
     b32             lost;       // records went missing: resync from the log
     b32             loose;      // a replay: seq may skip numbers
     i32             doneturn;   // the last committed response:
@@ -382,15 +383,37 @@ static void viewargs(View *v, i32 block, Str id, Str name, Str text)
 }
 
 // Drop the provisional messages, which a committed record replaces.
-// Their text is reclaimed unless other messages came in between.
+// Their text is reclaimed unless other messages came in between. A
+// selection's positions in messages that stay move with them. Those in
+// provisional messages stay put for the commit to come, whose messages
+// take their places, unless other messages came between: then nothing
+// will, and the selection goes. Either way a position may now lie past
+// the end, so callers clamp the selection once done (clampsel).
 static void dropprov(View *v)
 {
     if (v->prov >= 0) {
+        Sel *s     = &v->sel;
+        Pos *ps[]  = {&s->anchor, &s->anchor1, &s->focus};
+        b32  mixed = 0;
+        b32  inprov = 0;
+        for (iz i = v->prov; i < v->msgs.len; i++) {
+            mixed |= !v->msgs[i].prov;
+            for (iz k = 0; k < countof(ps); k++) {
+                inprov |= v->msgs[i].prov && ps[k]->msg==i;
+            }
+        }
+        if (s->active && mixed && inprov) {
+            *s = {};
+        }
         iz n = v->prov;
         for (iz i = v->prov; i < v->msgs.len; i++) {
-            if (!v->msgs[i].prov) {
-                v->msgs[n++] = v->msgs[i];
+            if (v->msgs[i].prov) {
+                continue;
             }
+            for (iz k = 0; s->active && k < countof(ps); k++) {
+                ps[k]->msg = ps[k]->msg==i ? (i32)n : ps[k]->msg;
+            }
+            v->msgs[n++] = v->msgs[i];
         }
         v->msgs.len = n;
         if (!v->provmixed) {
@@ -705,6 +728,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->msgs[i].seq   = r->seq;
         v->msgs[i].label = via=="steer" ? Str("You (steering)") :
                            via=="queue" ? Str("You (queued)") : Str{};
+        clampsel(v);
     } return 1;
 
     case EV_TURN:
@@ -717,6 +741,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
 
     case EV_ATTEMPT:
         dropprov(v);  // a failed attempt's, shown faded until now
+        clampsel(v);
         v->attempt = (i32)jsonint(jsonget(j, "n"), v->attempt+1);
         v->pdone   = v->ptotal = 0;
         return 1;
@@ -736,6 +761,32 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         } else {
             viewdelta(v, kind=="think" ? VIEW_THINK : VIEW_ASSISTANT, text);
         }
+    } return 1;
+
+    case EV_SNAPSHOT: {
+        // What streamed before this view listened (an open mid-stream):
+        // it replaces whatever is provisional, and later deltas extend it
+        i32 turn    = (i32)jsonint(jsonget(j, "turn"), 0);
+        i32 attempt = (i32)jsonint(jsonget(j, "attempt"), 0);
+        if (turn<v->doneturn || (turn==v->doneturn && attempt<=v->doneattempt)) {
+            return 0;  // committed already
+        }
+        dropprov(v);
+        v->lastdata = r->ts;
+        for (Json *b = jsonget(j, "blocks")->child; b; b = b->next) {
+            Str kind = jsonstr(jsonget(b, "kind"));
+            Str text = jsonstr(jsonget(b, "text"));
+            if (jsonint(jsonget(b, "cut"), 0)) {
+                text = concat(&scratch, "\xe2\x80\xa6", text);  // ellipsis
+            }
+            if (kind == "args") {
+                viewargs(v, (i32)jsonint(jsonget(b, "block"), 0),
+                         jsonstr(jsonget(b, "id")), jsonstr(jsonget(b, "name")), text);
+            } else {
+                viewdelta(v, kind=="think" ? VIEW_THINK : VIEW_ASSISTANT, text);
+            }
+        }
+        clampsel(v);
     } return 1;
 
     case EV_ASSISTANT: {
@@ -859,6 +910,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         if (c >= 0) {
             v->msgs[c].tool->status = VTOOL_ASKING;
         }
+        clampsel(v);
     } return 1;
 
     case EV_ANSWER: {

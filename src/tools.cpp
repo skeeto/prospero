@@ -30,6 +30,8 @@ enum : i64 {
     SHELL_OUTMAX   = (i64)1 << 30,    // output kept in the spill file
     SHELL_HEAD     = 20 << 10,        // inline excerpt
     SHELL_TAIL     = 30 << 10,
+    PATH_BYTES     = 4096,            // longest path argument
+    PATH_PARTS     = 256,             // most components in one
 };
 
 enum : i32 {
@@ -354,6 +356,16 @@ static Args parseargs(Arena *a, i32 tool, Str raw)
     }
     if (r.path.data && !r.path.len) {
         issue(a, &r, "path", "must not be empty");
+    } else if (r.path.len > PATH_BYTES) {
+        issue(a, &r, "path", "too long: at most 4096 bytes");
+    } else if (r.path.len) {
+        iz parts = 1;
+        for (iz i = 0; i < r.path.len; i++) {
+            parts += r.path[i]=='/' || r.path[i]=='\\';
+        }
+        if (parts > PATH_PARTS) {
+            issue(a, &r, "path", "too many components: at most 256");
+        }
     }
     return r;
 }

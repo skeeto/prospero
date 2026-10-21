@@ -281,13 +281,37 @@ static void logclose(EventLog *log)
     }
 }
 
+// An ask without an answer yet, while reading a log.
+struct LogAsk {
+    Str req;   // raw JSON text, as in the log
+    Str call;
+};
+
+// Remove a raw call id from a list, if there.
+static void logforget(Slice<Str> *list, Str call)
+{
+    for (iz i = 0; i < list->len; i++) {
+        if ((*list)[i] == call) {
+            for (iz j = i+1; j < list->len; j++) {
+                (*list)[j-1] = (*list)[j];
+            }
+            list->len--;
+            return;
+        }
+    }
+}
+
 // Open a session log for appending, creating it if missing. A torn final
 // line is truncated away, or ended with a newline if the log cannot be
 // truncated. Lines that are not records of this session in increasing
-// seq order are skipped (and counted). Then every tool.start without a
-// tool.end gets tool.end{status:"unknown"}, and an open turn gets
-// turn.end{why:"interrupted"}. Reading needs max bytes of scratch at
-// most (a larger log fails), plus parsing space for one line.
+// seq order are skipped (and counted). Then whatever a crash left open
+// is closed, in the order a running session would have logged it:
+// every tool.start without a tool.end gets tool.end{status:"unknown"};
+// each call of the last assistant record that never started gets the
+// answer to its ask if one was pending (denied, by "cancel"), then
+// tool.start and tool.end{status:"cancelled"}; and last, an open turn
+// gets turn.end{why:"interrupted"}. Reading needs max bytes of scratch
+// at most (a larger log fails), plus parsing space for one line.
 static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
                         Str sid, iz max)
 {
@@ -321,11 +345,16 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
         }
     }
 
-    // Track open tools by the raw text of their call ids (the writer's
-    // escaping is canonical), which points into data and so outlives the
-    // parse of each line.
-    Slice<Str> tools    = {};
-    b32        turnopen = 0;
+    // Track open tools, asks and results by the raw text of their ids
+    // (the writer's escaping is canonical), and the last assistant record
+    // by its line, all of which point into data and so outlive the parse
+    // of each line. Each push follows the last use of that line's parse.
+    Slice<Str>    tools    = {};  // started, not ended
+    Slice<Str>    ended    = {};  // since the last assistant record
+    Slice<LogAsk> asks     = {};  // not answered
+    Str           asst     = {};  // the last assistant record
+    Str           cwd      = {};  // raw, from the session record
+    b32           turnopen = 0;
     for (Str rest = data; rest.len;) {
         Cut c = cut(rest, '\n');
         rest = c.tail;
@@ -340,7 +369,13 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
 
         Json *id   = jsonget(rec.root, "call");
         Str   call = id->type==JSON_STRING ? id->raw : Str{};
+        Json *rq   = jsonget(rec.root, "req");
+        Str   req  = rq->type==JSON_STRING ? rq->raw : Str{};
         switch (rec.ev) {
+        case EV_SESSION: {
+            Json *dir = jsonget(rec.root, "cwd");
+            cwd = dir->type==JSON_STRING ? dir->raw : Str{};
+        } break;
         case EV_TURN:
             r.turn   = jsonint(jsonget(rec.root, "n"), r.turn);
             turnopen = 1;
@@ -348,22 +383,59 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
         case EV_TURNEND:
             turnopen = 0;
             break;
+        case EV_ASSISTANT:
+            asst      = c.head;
+            ended.len = 0;
+            break;
         case EV_TOOLSTART:
             if (call.data) {
                 tools = push(&scratch, tools, call);  // tmp is dead now
             }
             break;
         case EV_TOOLEND:
-            for (iz i = 0; i < tools.len; i++) {
-                if (tools[i] == call) {
-                    for (iz j = i+1; j < tools.len; j++) {
-                        tools[j-1] = tools[j];
-                    }
-                    tools.len--;
+            logforget(&tools, call);
+            if (call.data) {
+                ended = push(&scratch, ended, call);
+            }
+            break;
+        case EV_ASK:
+            if (req.data && call.data) {
+                LogAsk k = {req, call};
+                asks = push(&scratch, asks, k);
+            }
+            break;
+        case EV_ANSWER:
+            for (iz i = 0; i < asks.len; i++) {
+                if (asks[i].req == req) {
+                    asks[i] = asks[asks.len-1];
+                    asks.len--;
                     break;
                 }
             }
             break;
+        }
+    }
+
+    // The calls of the last assistant record that never started
+    Slice<Json *> unstarted = {};
+    if (asst.data) {
+        EvRec rec = evparse(&scratch, asst);
+        for (Json *k = jsonget(rec.root, "blocks")->child; k; k = k->next) {
+            Json *cid  = jsonget(k, "id");
+            Str   call = cid->type==JSON_STRING ? cid->raw : Str{};
+            if (jsonstr(jsonget(k, "t"))!="call" || !call.data) {
+                continue;
+            }
+            b32 seen = 0;
+            for (iz i = 0; i<tools.len && !seen; i++) {
+                seen = tools[i] == call;
+            }
+            for (iz i = 0; i<ended.len && !seen; i++) {
+                seen = ended[i] == call;
+            }
+            if (!seen) {
+                unstarted = push(&scratch, unstarted, k);
+            }
         }
     }
 
@@ -377,6 +449,65 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
         putstr(&w.json, "unknown");
         putkey(&w.json, "text");
         putstr(&w.json, "outcome unknown: the harness stopped while this ran");
+        if (!logappend(&r, &w).data) {
+            logclose(&r);
+            return r;
+        }
+        r.synth++;
+    }
+
+    for (iz i = 0; i < unstarted.len; i++) {
+        Json *k    = unstarted[i];
+        Str   call = jsonget(k, "id")->raw;
+        for (iz n = 0; n < asks.len; n++) {
+            if (!(asks[n].call == call)) {
+                continue;
+            }
+            b.len = 0;
+            EvOut w = logbegin(&r, &b, EV_ANSWER);
+            putkey(&w.json, "req");
+            putraw(&w.json, asks[n].req);
+            putkey(&w.json, "decision");
+            putstr(&w.json, "deny");
+            putkey(&w.json, "by");
+            putstr(&w.json, "cancel");
+            putkey(&w.json, "note");
+            putstr(&w.json, "the harness stopped while asking");
+            if (!logappend(&r, &w).data) {
+                logclose(&r);
+                return r;
+            }
+            r.synth++;
+        }
+
+        b.len = 0;
+        EvOut w = logbegin(&r, &b, EV_TOOLSTART);
+        putkey(&w.json, "call");
+        putraw(&w.json, call);
+        putkey(&w.json, "name");
+        putstr(&w.json, jsonstr(jsonget(k, "name")));
+        putkey(&w.json, "args");
+        putstr(&w.json, jsonstr(jsonget(k, "args")));
+        putkey(&w.json, "cwd");
+        if (cwd.data) {
+            putraw(&w.json, cwd);
+        } else {
+            putstr(&w.json, "");
+        }
+        if (!logappend(&r, &w).data) {
+            logclose(&r);
+            return r;
+        }
+        r.synth++;
+
+        b.len = 0;
+        w = logbegin(&r, &b, EV_TOOLEND);
+        putkey(&w.json, "call");
+        putraw(&w.json, call);
+        putkey(&w.json, "status");
+        putstr(&w.json, "cancelled");
+        putkey(&w.json, "text");
+        putstr(&w.json, "Not run: the harness stopped before this call started.");
         if (!logappend(&r, &w).data) {
             logclose(&r);
             return r;
@@ -408,19 +539,24 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
 struct Replay {
     Slice<Str> lines;  // each a complete record with its newline
     i64        last;   // seq of the last valid record, 0 if none
+    i64        end;    // file offset past the last complete line
     b32        ok;
 };
 
 // Read the durable records with seq > from, as logopen would accept
 // them, without modifying the log: a torn tail and invalid lines are
 // skipped, while unknown events pass through for the GUI to ignore. A
-// missing log replays nothing. Lines point into a copy of the file in
-// perm; scratch parses one line at a time.
-static Replay logreplay(Os *os, Arena *perm, Arena scratch, Str path,
-                        Str sid, i64 from, iz max)
+// missing log replays nothing. Reading starts at byte off, which must
+// begin a line (a previous replay's end): the log only grows, so a
+// reader that keeps up reads only what is new. Lines point into a copy
+// of what was read in perm; scratch parses one line at a time.
+static Replay logreplayat(Os *os, Arena *perm, Arena scratch, Str path,
+                          Str sid, i64 from, i64 off, iz max)
 {
     Replay r  = {};
-    Read   rd = os_read(os, perm, path, max);
+    Read   rd = off ? os_readat(os, perm, path, off, max)
+                    : os_read(os, perm, path, max);
+    r.end = off;
     if (rd.err == READ_NOTFOUND) {
         r.ok = 1;
         return r;
@@ -433,7 +569,8 @@ static Replay logreplay(Os *os, Arena *perm, Arena scratch, Str path,
         if (!c.ok) {
             break;  // end, or a torn tail
         }
-        rest = c.tail;
+        rest   = c.tail;
+        r.end += c.head.len + 1;
 
         Arena tmp = scratch;
         EvRec rec = evparse(&tmp, c.head);
@@ -448,4 +585,10 @@ static Replay logreplay(Os *os, Arena *perm, Arena scratch, Str path,
     }
     r.ok = 1;
     return r;
+}
+
+static Replay logreplay(Os *os, Arena *perm, Arena scratch, Str path,
+                        Str sid, i64 from, iz max)
+{
+    return logreplayat(os, perm, scratch, path, sid, from, 0, max);
 }

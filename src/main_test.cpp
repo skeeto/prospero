@@ -36,6 +36,7 @@ struct Os {
     i64        now;       // microseconds, advanced by tests
     u64        rng;
     i32        syncs;     // os_logsync calls
+    i32        realpaths; // os_realpath calls
     i32        writes;    // os_logwrite calls left while failwrites is set
     b32        failwrites;
     b32        failtrunc;
@@ -296,6 +297,7 @@ static void vlink(Os *os, Str from, Str to)
 // covers a leading part of the path. Windows paths in tests use '/'.
 static Str os_realpath(Os *os, Arena *a, Str path)
 {
+    os->realpaths++;
     for (i32 hops = 0; hops < 40; hops++) {
         VLink *l = os->links;
         for (; l; l = l->next) {

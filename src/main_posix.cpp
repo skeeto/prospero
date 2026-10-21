@@ -1697,6 +1697,12 @@ int main(int argc, char **argv)
     }
     #if HARNESS_GUI
     if (guiwanted(args, argc)) {
+        // For sigthread (gui_sdl.cpp) alone: every thread inherits this
+        sigset_t quit;
+        sigemptyset(&quit);
+        sigaddset(&quit, SIGINT);
+        sigaddset(&quit, SIGTERM);
+        pthread_sigmask(SIG_BLOCK, &quit, 0);
         return gui_main(&os, a, args, argc);
     }
     #endif

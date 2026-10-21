@@ -192,27 +192,56 @@ static Str expandhome(Arena *a, Str path, Str home, b32 win)
 
 // The real path of a normalized one: symlinks resolved through the
 // deepest ancestor that exists, then the missing rest appended. Null if
-// not even the root resolves.
+// not even the root resolves. The deepest few ancestors are tried one
+// by one, since the answer is usually among them, and then the rest by
+// binary search, as an ancestor resolves only if its own ancestors do:
+// however deep a path the agent makes up, the lookups stay few.
 static Str realpathof(Os *os, Arena *a, Str path, b32 win)
 {
-    iz root = pathroot(path, win);
-    for (iz end = path.len;;) {
-        Str real = os_realpath(os, a, takehead(path, end));
-        if (real.data) {
-            Str rest = cuthead(path, end);
-            if (rest.len && !issep(rest[0], win) && real.len &&
-                    !issep(real[real.len-1], win)) {
-                real = concat(a, real, "/");
-            }
-            return normpath(a, takehead(path, root), concat(a, real, rest), win);
+    // Where each ancestor ends, from the root down to the path itself
+    iz        root = pathroot(path, win);
+    Slice<iz> ends = {};
+    ends = push(a, ends, root);
+    for (iz i = root; i < path.len; i++) {
+        if (path[i] == '/') {
+            ends = push(a, ends, i);
         }
-        if (end <= root) {
-            return {};
-        }
-        iz i = end;
-        for (; i>root && path[i-1]!='/'; i--) {}
-        end = i>root ? i-1 : root;
     }
+    if (path.len > root) {
+        ends = push(a, ends, path.len);
+    }
+
+    Str real = {};
+    iz  lo   = -1;        // ends[lo] resolves
+    iz  hi   = ends.len;  // ends[hi] does not
+    for (i32 n = 0; n<8 && hi-lo>1; n++) {
+        Str r = os_realpath(os, a, takehead(path, ends[hi-1]));
+        if (r.data) {
+            lo   = hi - 1;
+            real = r;
+        } else {
+            hi--;
+        }
+    }
+    while (hi-lo > 1) {
+        iz  mid = lo + (hi-lo)/2;
+        Str r   = os_realpath(os, a, takehead(path, ends[mid]));
+        if (r.data) {
+            lo   = mid;
+            real = r;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < 0) {
+        return {};
+    }
+    Str rest = cuthead(path, ends[lo]);
+    if (rest.len && !issep(rest[0], win) && real.len &&
+            !issep(real[real.len-1], win)) {
+        real = concat(a, real, "/");
+    }
+    return normpath(a, takehead(path, root), concat(a, real, rest), win);
 }
 
 struct GuardRoot {
@@ -307,31 +336,43 @@ struct GuardHint {
     b32 exists;  // names something now, rather than a likely place
 };
 
+enum : i32 {
+    HINT_PARTS = 8,  // trailing components a hint keeps, at most
+};
+
 // The path inside the workspace that the agent likely meant: the
-// longest trailing part of path that exists under a root. Failing
-// that, when the tool creates files, the longest whose directory
-// exists there, which is at least the file name in the root itself.
+// longest trailing part of path, of at most HINT_PARTS components, that
+// exists under a root. Failing that, when the tool creates files, the
+// longest whose directory exists there, which is at least the file name
+// in the root itself. A candidate costs a stat, and the full judgment
+// only once it matches, so the work is bounded however long the path.
 static GuardHint guardhint(Os *os, Arena *a, Guard *g, Str path, b32 read,
                            b32 create)
 {
-    GuardHint r   = {};
-    Str       rel = cuthead(path, pathroot(path, g->win));
+    GuardHint r     = {};
+    Str       rel   = cuthead(path, pathroot(path, g->win));
+    iz        first = rel.len;  // where the trailing components begin
+    for (i32 n = 0; n<HINT_PARTS && first>0; n++) {
+        for (first--; first>0 && rel[first-1]!='/'; first--) {}
+    }
     for (i32 pass = 0; pass < 1+create; pass++) {
-        for (iz i = 0; i < rel.len;) {
+        for (iz i = first; i < rel.len;) {
             Str suffix = cuthead(rel, i);
             for (iz k = 0; k < g->roots.len; k++) {
                 GuardRoot *t = &g->roots[k];
                 if (t->read && !read) {
                     continue;
                 }
-                Str       cand = normpath(a, t->lex, suffix, g->win);
-                GuardPath gp   = guardpath(os, a, g, cand, read);
-                if (cand==path || !gp.inside) {
+                Str cand = normpath(a, t->lex, suffix, g->win);
+                if (cand==path || !within(t->lex, cand, g->win)) {
                     continue;
                 }
                 Str probe = pass ? normpath(a, cand, "..", g->win) : cand;
                 i32 type  = os_stat(os, *a, probe).type;
-                if (pass ? type==STAT_DIR : type!=STAT_MISSING) {
+                if (pass ? type!=STAT_DIR : type==STAT_MISSING) {
+                    continue;
+                }
+                if (guardpath(os, a, g, cand, read).inside) {
                     r.path   = cand;
                     r.exists = !pass;
                     return r;

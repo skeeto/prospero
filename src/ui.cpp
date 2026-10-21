@@ -1008,6 +1008,18 @@ static void drawtranscript(Gui *g)
 
 // Liveness strip and prompt
 
+// Esc cancels the shown session's turn, from inside the windows about
+// the session while one has focus: there it goes ahead of the prompt
+// box, which would otherwise take it to undo the typing, while a field
+// elsewhere (Settings) keeps Esc to abandon its edit.
+static void escapecancel(Gui *g)
+{
+    if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+            ImGui::Shortcut(ImGuiKey_Escape, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
+        guicancel(g, g->sess);
+    }
+}
+
 // What the session is doing, how fast, and how long since the model sent
 // anything: one line, whose clocks ask for frames only while shown.
 static void drawstrip(Gui *g)
@@ -1028,7 +1040,12 @@ static void drawstrip(Gui *g)
                                                                      : livenames[v->state]));
     ImGui::PopStyleColor();
 
-    if (v->busy && v->turnts) {
+    if (v->busy && g->sess->readonly) {
+        // Its records go to the other process: nothing here would see
+        // the turn end, so no clock counts on forever
+        ImGui::SameLine();
+        ImGui::TextDisabled("in another process, as of its log when opened");
+    } else if (v->busy && v->turnts) {
         // The turn's clock, once a second
         i64 el = nowms - v->turnts;
         el = el<0 ? 0 : el;
@@ -1109,13 +1126,7 @@ static void drawprompt(Gui *g)
     View *v   = g->view;
     b32  can  = g->sess && g->sess->view && !g->sess->readonly && !g->quitting;
     drawstrip(g);
-
-    // Esc cancels the turn, ahead of the prompt box, which would otherwise
-    // take it to undo the typing
-    if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
-            ImGui::Shortcut(ImGuiKey_Escape, ImGuiInputFlags_RouteGlobal|ImGuiInputFlags_RouteOverActive)) {
-        guicancel(g, g->sess);
-    }
+    escapecancel(g);
 
     ImGuiInputTextFlags flags = ImGuiInputTextFlags_WordWrap |
                                 ImGuiInputTextFlags_EnterReturnsTrue |
@@ -1361,10 +1372,11 @@ static void drawclose(Gui *g)
 
 // Settings
 
-// "harness.ini:12" from a path and line.
+// "from harness.ini:12" from a path and line, or "default", which is
+// "default, empty at harness.ini:12" when set empty.
 static Str provenance(Arena *a, CfgRow *r)
 {
-    if (r->isdflt || !r->file.len) {
+    if (!r->file.len) {
         return "default";
     }
     Str name = r->file;
@@ -1375,7 +1387,7 @@ static Str provenance(Arena *a, CfgRow *r)
         }
     }
     Buf b(a, 64);
-    print(&b, "from ");
+    print(&b, r->isdflt ? Str("default, empty at ") : Str("from "));
     print(&b, name);
     putbyte(&b, ':');
     print(&b, r->line);
@@ -1394,7 +1406,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, b32 target)
     ImGui::SetNextItemWidth(-1);
     Str hint = r->isdflt ? r->value : Str{};
     ImGui::PushID(r);
-    b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, FIELD_MAX,
+    b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
                                          ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
     if (target) {
         itemrect(g, RECT_SETTING);
@@ -1542,7 +1554,21 @@ static void drawsettings(Gui *g)
                 Str val  = kind=="endpoint" ? Str("http://localhost/") :
                            kind=="model"    ? Str("reasoning_content") :
                            Str("read write edit shell");
-                if (name.len) {
+                b32 exists = 0;
+                for (iz i = 0; i < names.len; i++) {
+                    exists |= names[i] == name;
+                }
+                if (exists) {
+                    // Its first key would be overwritten: leave it be
+                    Buf eb(&a, 128);
+                    print(&eb, "[");
+                    print(&eb, kind);
+                    putbyte(&eb, ' ');
+                    print(&eb, name);
+                    print(&eb, "] already exists");
+                    g->cfgstatus = clone(&g->perm, finish(&eb));
+                    g->cfgok     = 0;
+                } else if (name.len) {
                     guiconfigset(g, kind, name, key, val);
                     g->addname[0] = 0;
                 }
@@ -1583,6 +1609,8 @@ static void drawmetrics(Gui *g)
     print(&b, m->frameus);
     print(&b, " us  max ");
     print(&b, m->maxframeus);
+    print(&b, " us  wake max ");
+    print(&b, m->maxwakeus);
     print(&b, " us  layout ");
     print(&b, m->layoutus);
     print(&b, " us");
@@ -1866,11 +1894,13 @@ static void dockwindows(Gui *g)
     ImGui::End();
 
     if (ImGui::Begin("Sessions")) {
+        escapecancel(g);
         drawsessions(g);
     }
     ImGui::End();
     // Submitted first, so that it is the tab selected in its dock node.
     if (ImGui::Begin("Transcript")) {
+        escapecancel(g);
         drawtranscript(g);
     }
     ImGui::End();

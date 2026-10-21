@@ -364,6 +364,57 @@ static void test_view(Test *t)
         expect(t, "view.turnts", istr(&a, v->turnts), "5000");
     }
 
+    // A selection survives the next attempt dropping a failed one's text:
+    // positions in the messages after it move with them, and one in the
+    // dropped text goes, so copying never reaches past the messages
+    for (i32 where = 0; where < 2; where++) {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"hi"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"attempt","turn":1,"n":1})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"attempt":1,"block":0,"kind":"text","text":"partial answer"})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"retry","turn":1,"attempt":1,"class":"transient","status":503,"delay_ms":1500,"msg":"busy"})");
+        expect(t, "view.retrysel.before", msgsshow(&a, v),
+               "U:hi;A~:partial answer;N:Attempt 1 failed (transient, HTTP 503): busy. Retrying in 1.5 s.;");
+        if (where) {
+            selset(v, 1, 0, 1, 7);  // in the failed text
+        } else {
+            selset(v, 2, 0, 2, 9);  // in the retry note
+        }
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"attempt","turn":1,"n":2})");
+        expect(t, "view.retrysel.after", istr(&a, v->msgs.len), "2");
+        Str got = copysel(v, &a, COPY_TEXT);
+        expect(t, where ? Str("view.retrysel.dropped") : Str("view.retrysel.moved"),
+               got.data ? got : Str("(none)"), where ? Str("(none)") : Str("Attempt 1"));
+    }
+
+    // Opening mid-stream: a snapshot replaces what was provisional, the
+    // deltas after it extend it, and the commit replaces it all
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"hi"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"attempt","turn":1,"n":1})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"attempt":1,"block":1,"kind":"text","text":"Hel"})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"snapshot","turn":1,"attempt":1,"blocks":[)"
+                    R"({"block":0,"kind":"think","text":"hmm"},{"block":1,"kind":"text","text":"Hello"},)"
+                    R"({"block":2,"kind":"args","id":"c1","name":"read","text":"{\"pa"}]})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"attempt":1,"block":2,"kind":"args","text":"th\":\"x\"}"})");
+        expect(t, "view.snapshot", msgsshow(&a, v), "U:hi;T~:hmm;A~:Hello;X~[read  streaming]:;");
+        i32 last = (i32)v->msgs.len - 1;
+        expect(t, "view.snapshot.args", v->msgs[last].tool->args, "{\"path\":\"x\"}");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"snapshot","turn":1,"attempt":1,"blocks":[)"
+                    R"({"block":1,"kind":"text","text":"llo, world","cut":3}]})");
+        expect(t, "view.snapshot.cut", msgsshow(&a, v), "U:hi;A~:\xe2\x80\xa6llo, world;");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"assistant","turn":1,"attempt":1,)"
+                    R"("blocks":[{"t":"text","text":"Hello, world"}]})");
+        b32 stale = apply(v, a, R"({"sid":"s","ts":0,"ev":"snapshot","turn":1,"attempt":1,"blocks":[]})");
+        expect(t, "view.snapshot.stale", istr(&a, stale), "0");
+        expect(t, "view.snapshot.done", msgsshow(&a, v), "U:hi;A:Hello, world;");
+    }
+
     // Records lost to a full mailbox come back from the log: a view fed
     // through a tiny mailbox, resynced from the durable records written
     // so far whenever it overflowed, ends as one fed everything.

@@ -73,6 +73,33 @@ static void test_tools(Test *t)
                "path: required string is missing; ");
         expect(t, "read empty path", argsshow(a, TOOL_READ, "{\"path\":\"\"}"),
                "path: must not be empty; ");
+        {
+            // Paths are bounded, before the guard ever looks at them
+            Buf b(a, 1<<14);
+            print(&b, "{\"path\":\"");
+            for (i32 i = 0; i < 255; i++) {
+                print(&b, "a/");
+            }
+            print(&b, "f\"}");
+            Str ok = finish(&b);
+            expect(t, "path of 256 names", istr(a, argsshow(a, TOOL_READ, ok).len > 500), "1");
+            Buf c(a, 1<<14);
+            print(&c, "{\"path\":\"");
+            for (i32 i = 0; i < 128; i++) {
+                print(&c, "a/b\\\\");
+            }
+            print(&c, "f\"}");
+            expect(t, "path of 257 names", argsshow(a, TOOL_READ, finish(&c)),
+                   "path: too many components: at most 256; ");
+            Buf d(a, 1<<14);
+            print(&d, "{\"path\":\"");
+            for (i32 i = 0; i < 4097; i++) {
+                putbyte(&d, 'x');
+            }
+            print(&d, "\"}");
+            expect(t, "path of 4097 bytes", argsshow(a, TOOL_WRITE, finish(&d)),
+                   "content: required string is missing; path: too long: at most 4096 bytes; ");
+        }
         expect(t, "read extra keys ignored", argsshow(a, TOOL_READ, "{\"path\":\"x\",\"why\":1}"),
                "x 0 0");
         expect(t, "edit bool coercions",

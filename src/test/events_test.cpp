@@ -233,6 +233,22 @@ static void test_events(Test *t)
         expect(t, "replay missing", istr(a, r.ok*10 + r.lines.len), "10");
         r = logreplay(os, a, scratch, path, "s1", 0, 100);
         expect(t, "replay too big", istr(a, r.ok), "0");
+
+        // From where a replay ended: only what came since, never a torn
+        // line, which a later replay reads once it is whole
+        r = logreplay(os, a, scratch, path, "s1", 0, 1<<20);
+        expect(t, "replay end", istr(a, r.end), istr(a, after.len));
+        Str more = "{\"sid\":\"s1\",\"seq\":10,\"ts\":3000,\"ev\":\"note\",\"text\":\"n\"}\n";
+        Str torn = "{\"sid\":\"s1\",\"seq\":11,\"ts\":3000,\"ev\":\"no";
+        os_write(os, scratch, path, concat(a, concat(a, after, more), torn));
+        Replay r2 = logreplayat(os, a, scratch, path, "s1", 9, r.end, 1<<20);
+        expect(t, "replay at", joinlines(a, r2.lines), more);
+        expect(t, "replay at end", istr(a, r2.end), istr(a, after.len + more.len));
+        Str rest = "te\",\"text\":\"m\"}\n";
+        os_write(os, scratch, path, concat(a, concat(a, concat(a, after, more), torn), rest));
+        Replay r3 = logreplayat(os, a, scratch, path, "s1", 10, r2.end, 1<<20);
+        expect(t, "replay at whole", joinlines(a, r3.lines), concat(a, torn, rest));
+        os_write(os, scratch, path, after);
         log = logopen(os, a, scratch, path, "s1", 100);
         expect(t, "open too big", istr(a, log.ok*10 + (log.fd>=0)), "0");
     }
@@ -454,6 +470,66 @@ static void test_events(Test *t)
         log = logopen(os, a, scratch, path, "s11", 1<<20);
         expect(t, "write fails redo", logshow(a, &log), "ok=1 seq=6 turn=1 torn=0 bad=0 synth=2");
         expect(t, "write fails redo file", vcontents(os, a, path), done);
+        logclose(&log);
+    }
+
+    // Calls that never started, one of them asking: each is closed in the
+    // order a live session logs it, before the turn ends
+    {
+        Os  *os   = newos(a, 1<<20);
+        Str  path = "s14.jsonl";
+        Str  head = "{\"sid\":\"s14\",\"seq\":1,\"ts\":0,\"ev\":\"session\",\"cwd\":\"/w\"}\n"
+                    "{\"sid\":\"s14\",\"seq\":2,\"ts\":0,\"ev\":\"turn\",\"n\":1}\n";
+        Str  asst = "{\"sid\":\"s14\",\"seq\":3,\"ts\":0,\"ev\":\"assistant\",\"blocks\":["
+                    "{\"t\":\"text\",\"text\":\"hi\"},"
+                    "{\"t\":\"call\",\"id\":\"c1\",\"name\":\"write\",\"args\":\"{\\\"path\\\":\\\"../x\\\"}\"},"
+                    "{\"t\":\"call\",\"id\":\"c2\",\"name\":\"read\",\"args\":\"{}\"}]}\n";
+        Str  ask  = "{\"sid\":\"s14\",\"seq\":4,\"ts\":0,\"ev\":\"ask\",\"req\":\"c1/ask\",\"call\":\"c1\"}\n";
+        Str  log0 = concat(a, concat(a, head, asst), ask);
+        os_write(os, scratch, path, log0);
+        EventLog log = logopen(os, a, scratch, path, "s14", 1<<20);
+        expect(t, "asking repaired", logshow(a, &log), "ok=1 seq=10 turn=1 torn=0 bad=0 synth=6");
+        expect(t, "asking repaired file", vcontents(os, a, path), concat(a, log0,
+            "{\"sid\":\"s14\",\"seq\":5,\"ts\":0,\"ev\":\"answer\",\"req\":\"c1/ask\",\"decision\":\"deny\","
+            "\"by\":\"cancel\",\"note\":\"the harness stopped while asking\"}\n"
+            "{\"sid\":\"s14\",\"seq\":6,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"c1\",\"name\":\"write\","
+            "\"args\":\"{\\\"path\\\":\\\"../x\\\"}\",\"cwd\":\"/w\"}\n"
+            "{\"sid\":\"s14\",\"seq\":7,\"ts\":0,\"ev\":\"tool.end\",\"call\":\"c1\",\"status\":\"cancelled\","
+            "\"text\":\"Not run: the harness stopped before this call started.\"}\n"
+            "{\"sid\":\"s14\",\"seq\":8,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"c2\",\"name\":\"read\","
+            "\"args\":\"{}\",\"cwd\":\"/w\"}\n"
+            "{\"sid\":\"s14\",\"seq\":9,\"ts\":0,\"ev\":\"tool.end\",\"call\":\"c2\",\"status\":\"cancelled\","
+            "\"text\":\"Not run: the harness stopped before this call started.\"}\n"
+            "{\"sid\":\"s14\",\"seq\":10,\"ts\":0,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"interrupted\"}\n"));
+        logclose(&log);
+        log = logopen(os, a, scratch, path, "s14", 1<<20);
+        expect(t, "asking repaired once", logshow(a, &log), "ok=1 seq=10 turn=1 torn=0 bad=0 synth=0");
+        logclose(&log);
+
+        // An answered ask, a finished call, one cut off, one not begun
+        Str more =
+            "{\"sid\":\"s14\",\"seq\":11,\"ts\":0,\"ev\":\"turn\",\"n\":2}\n"
+            "{\"sid\":\"s14\",\"seq\":12,\"ts\":0,\"ev\":\"assistant\",\"blocks\":["
+            "{\"t\":\"call\",\"id\":\"d1\",\"name\":\"write\",\"args\":\"{}\"},"
+            "{\"t\":\"call\",\"id\":\"d2\",\"name\":\"shell\",\"args\":\"{}\"},"
+            "{\"t\":\"call\",\"id\":\"d3\",\"name\":\"read\",\"args\":\"{}\"}]}\n"
+            "{\"sid\":\"s14\",\"seq\":13,\"ts\":0,\"ev\":\"ask\",\"req\":\"d1/ask\",\"call\":\"d1\"}\n"
+            "{\"sid\":\"s14\",\"seq\":14,\"ts\":0,\"ev\":\"answer\",\"req\":\"d1/ask\",\"decision\":\"allow\"}\n"
+            "{\"sid\":\"s14\",\"seq\":15,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"d1\"}\n"
+            "{\"sid\":\"s14\",\"seq\":16,\"ts\":0,\"ev\":\"tool.end\",\"call\":\"d1\",\"status\":\"ok\"}\n"
+            "{\"sid\":\"s14\",\"seq\":17,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"d2\"}\n";
+        Str log1 = concat(a, vcontents(os, a, path), more);
+        os_write(os, scratch, path, log1);
+        log = logopen(os, a, scratch, path, "s14", 1<<20);
+        expect(t, "cut off repaired", logshow(a, &log), "ok=1 seq=21 turn=2 torn=0 bad=0 synth=4");
+        expect(t, "cut off repaired file", vcontents(os, a, path), concat(a, log1,
+            "{\"sid\":\"s14\",\"seq\":18,\"ts\":0,\"ev\":\"tool.end\",\"call\":\"d2\",\"status\":\"unknown\","
+            "\"text\":\"outcome unknown: the harness stopped while this ran\"}\n"
+            "{\"sid\":\"s14\",\"seq\":19,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"d3\",\"name\":\"read\","
+            "\"args\":\"{}\",\"cwd\":\"/w\"}\n"
+            "{\"sid\":\"s14\",\"seq\":20,\"ts\":0,\"ev\":\"tool.end\",\"call\":\"d3\",\"status\":\"cancelled\","
+            "\"text\":\"Not run: the harness stopped before this call started.\"}\n"
+            "{\"sid\":\"s14\",\"seq\":21,\"ts\":0,\"ev\":\"turn.end\",\"turn\":2,\"why\":\"interrupted\"}\n"));
         logclose(&log);
     }
 

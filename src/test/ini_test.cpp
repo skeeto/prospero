@@ -1266,6 +1266,13 @@ static void testiniwrite(Test *t)
          "[s]\n\tk\t=\tw\t# c\n", 2, 1},
         {"[s]\na = \"x\"\n", "s", "", "a", "x", 0, "[s]\na = \"x\"\n", 2, 0},
         {"[s]\na = 1 # c\n", "s", "", "a", "", 0, "[s]\na =  # c\n", 2, 1},
+        // An empty value takes one apart from a comment and from "="
+        {"[s]\na = # c\n", "s", "", "a", "1", 0, "[s]\na = 1 # c\n", 2, 1},
+        {"[s]\na =\t#\n", "s", "", "a", "1", 0, "[s]\na =\t1 #\n", 2, 1},
+        {"[s]\na =\n", "s", "", "a", "x", 0, "[s]\na = x\n", 2, 1},
+        {"[s]\na=\n", "s", "", "a", "x", 0, "[s]\na=x\n", 2, 1},
+        {"a =   # fill in later\n", "", "", "a", "120", 0,
+         "a =   120 # fill in later\n", 1, 1},
         {"[s]\na = 1\n", "s", "", "a", "  x # y ", 0,
          "[s]\na = \"  x # y \"\n", 2, 1},
         {"[s]\na = 1\n[t]\n[s]\na = 2\n", "s", "", "a", "3", 0,
@@ -1403,6 +1410,9 @@ static void testiniwriterandom(Test *t)
         "k = 1\n", "j = \"2\" # c\n", "  k = 3\n", "[s]\n", "[s t]\n",
         "  [t] # c\n", "[a b c]\n", "# c\n", "; c\n", "\n", "\r\n", "junk\n",
         "include = x.ini\n", "k = 4", "[s]", "j=5\r\n",
+        // Empty values, next to trailing comments or not
+        "k = # c\n", "j =\t#\n", "k =\n", "k=\"\" # c\n", "new = 1 #c\n",
+        "j=\n",
     };
     static Str kinds[] = {"", "s", "s", "t", "u"};
     static Str names[] = {"", "", "t"};
