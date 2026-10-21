@@ -345,6 +345,7 @@ static Arena newarena(Region *r)
 #include "ini.cpp"
 #include "mailbox.cpp"
 #include "events.cpp"
+#include "frame.cpp"
 #include "provider.cpp"
 #include "edit.cpp"
 #include "tools.cpp"

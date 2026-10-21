@@ -1,13 +1,15 @@
 // AFL++ fuzz layer: the JSON reader and writer, or with -DFUZZ_EVENTS the
 // session log's open, recovery, and replay over a one-file stub platform,
-// or with -DFUZZ_PROVIDER the engine's parsers of untrusted text
+// or with -DFUZZ_PROVIDER the engine's parsers of untrusted text, or with
+// -DFUZZ_FRAMES the framing of remote links (frame.cpp)
 //   $ afl-clang-fast++ -std=c++20 -fno-exceptions -fno-rtti -g3 \
 //         -fsanitize=address,undefined -fsanitize-trap=undefined \
 //         -o fuzzjson src/main_fuzz.cpp
 //   $ mkdir i && printf '{"a":[1,"\\u00e9",null]}' >i/doc
 //   $ afl-fuzz -i i -o o ./fuzzjson
 //
-// Likewise with -DFUZZ_EVENTS or -DFUZZ_PROVIDER for the other targets.
+// Likewise with -DFUZZ_EVENTS, -DFUZZ_PROVIDER or -DFUZZ_FRAMES for the
+// other targets.
 //
 // JSON: an input either fails at an offset inside it, or parses to a root
 // spanning the input less surrounding whitespace, and writes canonical
@@ -455,6 +457,121 @@ static void fuzzprovider(Arena a, Str src)
     cyclefeed(c, src);
 }
 
+// Frames, two ways. First the input as a stream from a peer, cut where
+// its bytes say, into a decoder and a link up and running: whatever it
+// holds, the decoder takes only whole, valid frames, nothing after it
+// breaks, and what the link writes back decodes cleanly. Then the
+// input's lines sent over a link whose streams break where its bytes
+// say, losing what was in flight: the other side gets every line once,
+// in order.
+static void fuzzframes(Arena a, Str src)
+{
+    // A hostile peer
+    {
+        Arena    t = a;
+        FrameDec d = newframedec(&t, 1<<10);
+        Link     l = newlink(&t, 1, 1<<12, 16);
+        linkconnect(&l, 0);
+        FrameIn  hello = {};
+        u8       tok[FRAME_TOKEN] = {0, 0, 0, 0, 0, 0, 0, 2};
+        hello.type    = FRAME_REPLAY;
+        hello.id      = 1;
+        hello.payload = {tok, FRAME_TOKEN};
+        assert(linkframe(&l, &hello, 0) == LINK_READY);
+        linksend(&l, "x");
+        i64 now = 0;
+        b32 bad = 0;
+        for (Str rest = src; rest.len;) {
+            iz  n  = 1 + rest[0]%31;
+            Str in = takehead(rest, n<rest.len ? n : rest.len);
+            rest = cuthead(rest, in.len);
+            for (FrameIn f; (f = framenext(&d, &in)).ok;) {
+                assert(!bad);
+                assert(f.type==FRAME_REGULAR || f.type==FRAME_ACK ||
+                       f.type==FRAME_KEEPALIVE || f.type==FRAME_REPLAY ||
+                       f.type==FRAME_DISCONNECT);
+                assert(f.payload.len <= 1<<10);
+                i32 ev = linkframe(&l, &f, now += 1000000);
+                assert(ev>=LINK_NONE && ev<=LINK_BROKEN);
+                linksend(&l, f.payload);
+                linktick(&l, now);
+            }
+            bad |= d.bad;
+            assert(!d.bad || !in.len || framenext(&d, &in).ok==0);
+
+            // What it writes back is well formed
+            Arena    u   = t;
+            Str      out = linkout(&l, &u, now);
+            FrameDec e   = newframedec(&u, 1<<12);
+            while (framenext(&e, &out).ok) {}
+            assert(!e.bad && !out.len && !e.len);
+        }
+    }
+
+    // Lines over breaking streams
+    {
+        Arena t = a;
+        Link  x = newlink(&t, 0x11, 1<<14, 1<<10);
+        Link  y = newlink(&t, 0x22, 1<<14, 1<<10);
+        Slice<Str> lines = {};
+        for (Str rest = src; rest.len;) {
+            Cut c = cut(rest, '\n');
+            lines = push(&t, lines, c.head);
+            rest  = c.tail;
+        }
+        Buf got(&t, src.len + 64);
+        iz  sent = 0, cutat = 0;
+        i64 now  = 0;
+        b32 done = 0;  // nothing left to say on either side
+        for (i32 stream = 0; stream < 64; stream++) {
+            FrameDec dx = newframedec(&t, 1<<14);  // what the links take
+            FrameDec dy = newframedec(&t, 1<<14);
+            linkconnect(&x, now);
+            linkconnect(&y, now);
+            for (; sent<lines.len && linksend(&x, lines[sent]); sent++) {}
+            // Run until the stream breaks after so many bytes
+            iz budget = src.len ? 1 + src[cutat++ % src.len]*7 : 1<<20;
+            b32 quiet = 0;
+            for (i32 round = 0; round < 100 && budget>0 && !quiet; round++) {
+                now += 3000000;
+                linktick(&x, now);
+                linktick(&y, now);
+                Arena u   = t;
+                Str   ox  = linkout(&x, &u, now);
+                Str   oy  = linkout(&y, &u, now);
+                quiet = !ox.len && !oy.len && sent==lines.len;
+                ox = takehead(ox, ox.len<budget ? ox.len : budget);
+                budget -= ox.len;
+                for (FrameIn f; (f = framenext(&dy, &ox)).ok;) {
+                    if (linkframe(&y, &f, now) == LINK_DATA) {
+                        print(&got, f.payload);
+                        putbyte(&got, '\n');
+                    }
+                }
+                for (FrameIn f; (f = framenext(&dx, &oy)).ok;) {
+                    linkframe(&x, &f, now);
+                }
+                assert(!dx.bad && !dy.bad);
+                for (; sent<lines.len && linksend(&x, lines[sent]); sent++) {}
+            }
+            if (quiet) {
+                done = 1;
+                break;
+            }
+        }
+        // Everything sent arrived once, in order
+        Buf want(&t, src.len + 64);
+        for (iz i = 0; i < sent; i++) {
+            print(&want, lines[i]);
+            putbyte(&want, '\n');
+        }
+        Str g = finish(&got);
+        Str w = finish(&want);
+        assert(g.len <= w.len && takehead(w, g.len)==g);
+        assert(!done || g==w);
+    }
+}
+
 __AFL_FUZZ_INIT();
 
 int main()
@@ -479,6 +596,8 @@ int main()
         fuzzevents(a, {src, len});
         #elif FUZZ_PROVIDER
         fuzzprovider(a, {src, len});
+        #elif FUZZ_FRAMES
+        fuzzframes(a, {src, len});
         #else
         fuzzjson(a, {src, len});
         #endif
