@@ -153,6 +153,21 @@ static Str apiurl(Arena *a, Str base, Str name)
     return finish(&b);
 }
 
+// The URL of name at the server's root, beside /v1/: given "http://h/"
+// or "http://h/v1", "http://h/props".
+static Str rooturl(Arena *a, Str base, Str name)
+{
+    for (; base.len && base[base.len-1]=='/'; base.len--) {}
+    if (endswith(base, "/v1")) {
+        base.len -= 3;
+    }
+    Buf b(a, base.len + name.len + 8);
+    print(&b, base);
+    putbyte(&b, '/');
+    print(&b, name);
+    return finish(&b);
+}
+
 
 // The canonical transcript
 
@@ -181,6 +196,9 @@ struct Msg {
     Str          text;    // user and tool messages
     Slice<Block> blocks;  // assistant messages
     Str          callid;  // tool messages
+    Str          spill;   // tool messages: the full output, relative to
+                          // the session's directory, if one was kept
+    i64          seq;     // of the record it came from, 0 if none
 };
 
 struct Usage {
@@ -326,8 +344,10 @@ struct ModelConf {
     Str          name;       // as sent in requests
     Str          reasoning;  // field to send reasoning back in, empty: never
     Slice<Extra> extras;     // sampling parameters, only if configured
-    b32          llamacpp;   // llama.cpp extras (return_progress)
+    b32          llamacpp;   // llama.cpp extras (return_progress,
+                             // reasoning_control)
     i64          ctx;        // context limit in tokens, 0 if unknown
+    i64          thinkmax;   // reasoning budget in tokens, 0 for none
 };
 
 struct ChatReq {
@@ -440,7 +460,10 @@ static Str encodechat(Arena *a, Arena tmp, ChatReq *r)
     putbool(&w, 1);
     putend(&w);
     if (r->mc->llamacpp) {
+        // Prefill progress, and the means to end reasoning early
         putkey(&w, "return_progress");
+        putbool(&w, 1);
+        putkey(&w, "reasoning_control");
         putbool(&w, 1);
     }
     for (iz i = 0; i < r->mc->extras.len; i++) {
@@ -476,6 +499,7 @@ struct Partial {
     i32             nblocks;
     Slice<PartCall> calls;
     Str             finish;      // finish_reason, null until one arrives
+    Str             id;          // the completion's, null until one arrives
     Usage           usage;
     b32             hasusage;
     b32             done;        // [DONE]
@@ -569,6 +593,12 @@ static Chunk applychunk(Partial *p, Json *j, Arena *scratch)
         r.errcode = (i32)jsonint(jsonget(err, "code"), 0);
         if (!r.error.len) r.error = "error event without a message";
         return r;
+    }
+
+    // llama.cpp ends reasoning early given this id (reasoning_end)
+    Str id = jsonstr(jsonget(j, "id"));
+    if (id.len && !p->id.data) {
+        p->id = clone(p->a, id);
     }
 
     Json *pp = jsonget(j, "prompt_progress");
@@ -769,9 +799,10 @@ enum : i32 {
     CLASS_TRANSIENT,      // retry with backoff, or continue
     CLASS_DETERMINISTIC,  // the same request fails the same way
     CLASS_OVERFLOW,       // the context is full
-    CLASS_FATAL,          // credentials, permissions, spending
+    CLASS_FATAL,          // credentials, permissions
     CLASS_LOOP,           // the model is repeating itself
     CLASS_CANCEL,         // the user stopped it
+    CLASS_LIMIT,          // a usage limit: spending, quota
 };
 
 static Str classname(i32 c)
@@ -782,19 +813,25 @@ static Str classname(i32 c)
     case CLASS_OVERFLOW:      return "overflow";
     case CLASS_FATAL:         return "fatal";
     case CLASS_LOOP:          return "loop";
+    case CLASS_LIMIT:         return "limit";
     }
     return "cancel";
 }
 
-// Case-insensitive substring search over ASCII.
-static b32 contains(Str s, Str needle)
+// Where a case-insensitive ASCII substring begins, or -1.
+static iz findfold(Str s, Str needle)
 {
     for (iz i = 0; i+needle.len <= s.len; i++) {
         if (equalfold(Str{s.data+i, needle.len}, needle)) {
-            return 1;
+            return i;
         }
     }
-    return 0;
+    return -1;
+}
+
+static b32 contains(Str s, Str needle)
+{
+    return findfold(s, needle) >= 0;
 }
 
 // The message of an error response body: {"error":{"message":..}},
@@ -844,21 +881,81 @@ static i32 classify(i32 status, Str text)
             return CLASS_OVERFLOW;
         }
     }
-    if (contains(text, "enforced_spend_limit") || contains(text, "insufficient_quota")) {
-        return CLASS_FATAL;
+    static Str const limits[] = {
+        "enforced_spend_limit",
+        "insufficient_quota",
+        "exceeded your current quota",
+        "quota exceeded",
+        "usage limit",
+    };
+    for (iz i = 0; i < countof(limits); i++) {
+        if (contains(text, limits[i])) {
+            return CLASS_LIMIT;
+        }
     }
     switch (status) {
     case 0:  // mid-stream
     case 408: case 409: case 425: case 429:
     case 500: case 502: case 503: case 504: case 529:
         return CLASS_TRANSIENT;
-    case 401: case 402: case 403:
+    case 402:
+        return CLASS_LIMIT;
+    case 401: case 403:
         return CLASS_FATAL;
     }
     if (status>=500 && status<600) {
         return CLASS_TRANSIENT;
     }
     return CLASS_DETERMINISTIC;
+}
+
+// The whole number just after a phrase in text, or 0.
+static i64 numberafter(Str text, Str phrase)
+{
+    iz at = findfold(text, phrase);
+    if (at < 0) {
+        return 0;
+    }
+    iz i = at + phrase.len;
+    for (; i<text.len && text[i]==' '; i++) {}
+    iz j = i;
+    for (; j<text.len && j-i<12 && digit(text[j]); j++) {}
+    Int n = parseint(span(text.data+i, text.data+j));
+    return n.ok && n.val>0 ? n.val : 0;
+}
+
+struct Overflow {
+    i64 prompt;  // tokens in the rejected request, 0 if not said
+    i64 ctx;     // the context limit, 0 if not said
+};
+
+// The sizes an overflow error reports: llama.cpp's n_prompt_tokens and
+// n_ctx, or OpenAI's and vLLM's "maximum context length is N tokens"
+// with "(N in the messages".
+static Overflow overflowsizes(Arena scratch, Str body)
+{
+    Overflow r = {};
+    JsonDoc  d = jsonparse(&scratch, body);
+    Json    *e = jsonget(d.root, "error");
+    e = e->type==JSON_OBJECT ? e : d.root;
+    r.prompt = jsonint(jsonget(e, "n_prompt_tokens"), 0);
+    r.ctx    = jsonint(jsonget(e, "n_ctx"), 0);
+    if (!r.ctx) {
+        r.ctx = numberafter(body, "maximum context length is");
+    }
+    if (!r.prompt) {
+        Str m  = errormessage(&scratch, body);
+        iz  at = findfold(m, " in the messages");
+        iz  i  = at;
+        for (; i>0 && digit(m[i-1]); i--) {}
+        if (at>0 && i<at && i>0 && m[i-1]=='(') {
+            Int n = parseint(span(m.data+i, m.data+at));
+            r.prompt = n.ok ? n.val : 0;
+        }
+    }
+    r.prompt = r.prompt>0 ? r.prompt : 0;
+    r.ctx    = r.ctx>0 ? r.ctx : 0;
+    return r;
 }
 
 static Str headervalue(Str headers, Str name)
@@ -972,6 +1069,7 @@ struct ModelInfo {
     b32 learned;   // ctx came from a loaded model's metadata
     i64 ctx;       // context limit, 0 if unknown
     i64 trained;   // n_ctx_train, scaled, 0 if unknown
+    i32 slots;     // --parallel, the server's total_slots, 0 if unknown
 };
 
 static Str argvalue(Json *args, Str name)
@@ -994,18 +1092,11 @@ static b32 hasarg(Json *args, Str name)
     return 0;
 }
 
-// Read a /v1/models listing for one model. trained is a cached
+// Read one model's entry of a /v1/models listing. trained is a cached
 // n_ctx_train from an earlier listing, 0 if never seen.
-static ModelInfo parsemodels(Arena scratch, Str body, Str model, i64 trained)
+static ModelInfo modelinfo(Json *m, i64 trained)
 {
     ModelInfo r = {};
-    JsonDoc   d = jsonparse(&scratch, body);
-    Json     *m = (Json *)&jsonmissing;
-    for (Json *e = jsonget(d.root, "data")->child; e; e = e->next) {
-        if (jsonstr(jsonget(e, "id")) == model) {
-            m = e;
-        }
-    }
     if (m->type != JSON_OBJECT) {
         return r;
     }
@@ -1016,6 +1107,9 @@ static ModelInfo parsemodels(Arena scratch, Str body, Str model, i64 trained)
     Str   owner  = jsonstr(jsonget(m, "owned_by"));
     r.llamacpp = owner=="llamacpp" || args->type==JSON_ARRAY;
     r.loaded   = jsonstr(jsonget(status, "value")) == "loaded";
+    Int np = parseint(argvalue(args, "--parallel"));
+    if (!np.ok) np = parseint(argvalue(args, "-np"));
+    r.slots = np.ok && np.val>0 ? (i32)(np.val<1024 ? np.val : 1024) : 0;
 
     // Rope scaling stretches the trained context
     f64 scale = 1;
@@ -1043,8 +1137,6 @@ static ModelInfo parsemodels(Arena scratch, Str body, Str model, i64 trained)
     if (!size.ok) size = parseint(argvalue(args, "-c"));
     if (size.ok && size.val>0) {
         i64 per = size.val;
-        Int np  = parseint(argvalue(args, "--parallel"));
-        if (!np.ok) np = parseint(argvalue(args, "-np"));
         if (!hasarg(args, "--kv-unified") && !hasarg(args, "-kvu") &&
                 np.ok && np.val>1) {
             per = size.val / np.val;
@@ -1052,6 +1144,19 @@ static ModelInfo parsemodels(Arena scratch, Str body, Str model, i64 trained)
         r.ctx = trained>0 && trained<per ? trained : per;
     }
     return r;
+}
+
+// Read a /v1/models listing for one model, as modelinfo.
+static ModelInfo parsemodels(Arena scratch, Str body, Str model, i64 trained)
+{
+    JsonDoc d = jsonparse(&scratch, body);
+    Json   *m = (Json *)&jsonmissing;
+    for (Json *e = jsonget(d.root, "data")->child; e; e = e->next) {
+        if (jsonstr(jsonget(e, "id")) == model) {
+            m = e;
+        }
+    }
+    return modelinfo(m, trained);
 }
 
 
@@ -1119,4 +1224,109 @@ static iz cyclefeed(Cycle *c, Str text)
         }
     }
     return -1;
+}
+
+
+// Unexpected stops
+//
+// A model sometimes ends its turn with a promise instead of the work,
+// "Let me run the tests now." and no tool call. A final response is
+// taken to announce work it never did when its text ends with a colon,
+// or when its last sentence holds one of stopphrases, unless it also
+// holds one of stopexcepts or is a question. Words match whole, in any
+// ASCII case, with a typographic apostrophe taken as a plain one. The
+// lists are data: a phrase missing here only lets a turn end early, as
+// before, while one too eager costs a needless reminder, so the
+// exceptions err toward letting a turn end.
+
+static Str const stopphrases[] = {
+    "let me", "let's",
+    "i'll now", "i will now", "now i'll", "now i will",
+    "next, i'll", "next i'll", "next, i will", "next i will", "i'll next",
+    "i'm going to", "i am going to", "i'm about to",
+    "i'll start", "i'll begin", "i'll proceed", "i will proceed",
+    "i'll go ahead", "i'll continue", "i will continue", "proceeding to",
+    "i'll run", "i will run", "i'll check", "i will check",
+    "i'll look", "i'll read", "i'll write", "i'll create", "i'll add",
+    "i'll update", "i'll fix", "i'll implement", "i'll edit",
+    "i'll make", "i'll try", "i'll test", "i'll verify",
+};
+
+static Str const stopexcepts[] = {
+    "let me know", "if", "unless", "when you", "once you", "would you",
+    "want me to", "shall i", "should i", "do you want", "feel free",
+};
+
+// Whether a lowercase phrase occurs in s with word boundaries around it.
+static b32 hasphrase(Str s, Str phrase)
+{
+    for (iz i = 0; i+phrase.len <= s.len; i++) {
+        if (Str{s.data+i, phrase.len} != phrase) {
+            continue;
+        }
+        iz  e      = i + phrase.len;
+        b32 before = i==0 || (!alnum(s[i-1]) && s[i-1]!='\'');
+        b32 after  = e==s.len || !alnum(s[e]);
+        if (before && after) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static b32 announces(Str text)
+{
+    Str t = trim(text);
+    if (!t.len) {
+        return 0;
+    } else if (t[t.len-1] == ':') {
+        return 1;
+    }
+
+    // Back over the closing punctuation and markup of the last sentence,
+    // then to the end of the one before: a terminator followed by a
+    // blank, so that "main.c" stays whole
+    iz end = t.len;
+    for (; end > 0; end--) {
+        u8 c = t[end-1];
+        if (c == '?') {
+            return 0;  // a question for the user
+        } else if (c!='.' && c!='!' && c!='*' && c!='_' && c!='`' &&
+                   c!=')' && c!='"' && c!='\'' && !whitespace(c)) {
+            break;
+        }
+    }
+    iz beg = end;
+    for (; beg > 0; beg--) {
+        u8 c = t[beg-1];
+        if (c=='\n' || ((c=='.' || c=='!' || c=='?') && beg<end &&
+                        whitespace(t[beg]))) {
+            break;
+        }
+    }
+
+    // Lowercase, with U+2019 as an apostrophe, the last 512 bytes at most
+    u8 buf[512];
+    iz len = 0;
+    iz i   = end-beg>countof(buf) ? end-countof(buf) : beg;
+    for (; i<end && len<countof(buf); i++) {
+        if (i+2<end && t[i]==0xe2 && t[i+1]==0x80 && t[i+2]==0x99) {
+            buf[len++] = '\'';
+            i += 2;
+        } else {
+            buf[len++] = lowercase(t[i]);
+        }
+    }
+    Str last = {buf, len};
+    for (iz k = 0; k < countof(stopexcepts); k++) {
+        if (hasphrase(last, stopexcepts[k])) {
+            return 0;
+        }
+    }
+    for (iz k = 0; k < countof(stopphrases); k++) {
+        if (hasphrase(last, stopphrases[k])) {
+            return 1;
+        }
+    }
+    return 0;
 }

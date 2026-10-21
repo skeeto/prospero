@@ -15,12 +15,24 @@ an event stream, sleep, ping, drop the connection, and so on.
 Responses use chunked transfer encoding, like llama.cpp, so that a dropped
 connection is a transport error rather than a short body.
 
+A compaction request (its system prompt is the summarizer's) is counted
+apart, as model "M#compact", and answered by the scenario's function
+named SCENARIO_compact if there is one, else with a short summary.
+
 Other endpoints:
   GET  /v1/models                   registered models, as a llama.cpp router
+  GET  /props                       404, except under /routerN/ (below)
+  POST /v1/chat/completions/control reasoning_end for a stream that asks
+                                    for it (wants_end), else no success
   GET  /fake/requests?model=M       requests received for M, with times
   GET  /fake/bytes?n=N              N bytes of zeros
   GET|POST /fake/stall              read the request, then never answer
   GET|POST /fake/stallbody          answer 200, send 16 bytes, then stall
+
+Under a path prefix /routerN/, every endpoint above is served as a
+llama.cpp router with --models-max N: /routerN/props reports role
+"router" and max_instances N, and the most different models ever in
+flight at once there is kept (GET /fake/router?prefix=routerN).
 
 Run it alone with:  uv run tests/fake_provider.py [--port N]
 """
@@ -40,8 +52,12 @@ class State:
     def __init__(self):
         self.lock = threading.Lock()
         self.counts = {}    # model -> requests so far
-        self.requests = {}  # model -> [{"t": seconds, "body": request}]
+        self.requests = {}  # model -> [{"t": seconds, "end": seconds, "body": request}]
         self.models = {}    # model -> listing overrides
+        self.streams = {}   # completion id -> Event, set by reasoning_end
+        self.controls = []  # control requests, in order
+        self.active = {}    # prefix -> {model: requests in flight}
+        self.peak = {}      # prefix -> most different models in flight
         self.stop = threading.Event()
 
     def register(self, model, **listing):
@@ -53,12 +69,34 @@ class State:
             n = self.counts.get(model, 0)
             self.counts[model] = n + 1
             self.requests.setdefault(model, []).append(
-                {"t": time.monotonic(), "body": body})
+                {"t": time.monotonic(), "end": None, "body": body})
             return n
+
+    def finished(self, model, n):
+        with self.lock:
+            self.requests[model][n]["end"] = time.monotonic()
 
     def log(self, model):
         with self.lock:
             return list(self.requests.get(model, []))
+
+    def begin(self, prefix, model):
+        with self.lock:
+            act = self.active.setdefault(prefix, {})
+            act[model] = act.get(model, 0) + 1
+            busy = sum(1 for v in act.values() if v)
+            self.peak[prefix] = max(self.peak.get(prefix, 0), busy)
+
+    def end(self, prefix, model):
+        with self.lock:
+            self.active[prefix][model] -= 1
+
+    def wants_end(self, cid):
+        """Register a stream that reasoning_end may end; returns its Event."""
+        ev = threading.Event()
+        with self.lock:
+            self.streams[cid] = ev
+        return ev
 
 
 STATE = State()
@@ -178,6 +216,50 @@ def last_tool_result(req):
         if m.get("role") == "tool":
             return m.get("content", "")
     return ""
+
+
+def ptok(req):
+    """A realistic prompt_tokens for a request: 4 bytes a token."""
+    return len(json.dumps(req)) // 4
+
+
+def real_finish(model, req, reason="stop"):
+    yield from finish(model, reason, prompt=ptok(req))
+
+
+def real_answer(model, req, s):
+    yield S.head()
+    yield from text(model, s, 3)
+    yield from real_finish(model, req)
+
+
+def real_tool(model, req, n, name, args):
+    yield S.head()
+    yield from call(model, 0, f"call_{n}", name, args, 2)
+    yield from real_finish(model, req, "tool_calls")
+
+
+def idchunk(cid, model, delta, finish=None):
+    c = chunk(model, delta, finish)
+    c["id"] = cid
+    return c
+
+
+COMPACT_MARK = "You summarize a coding session"
+
+
+def is_compaction(req):
+    msgs = req.get("messages", [])
+    return bool(msgs) and msgs[0].get("role") == "system" and \
+        str(msgs[0].get("content", "")).startswith(COMPACT_MARK)
+
+
+def compact_default(model, n, req):
+    yield S.head()
+    yield from text(model, f"## Goal\nRead the files.\n\n## Progress\n### Done\n"
+                           f"Read the early files. SUMMARY-{n}\n\n## Next steps\n"
+                           f"Read the rest.", 3)
+    yield from finish(model, prompt=ptok(req))
 
 
 # Scenarios: fn(model, n, request) -> generator of actions
@@ -545,6 +627,163 @@ def sc_escapee(model, n, req):
         yield from answer(model, "Escapee done.")
 
 
+# M4: compaction, admission, slow retries, fallbacks, reasoning_end,
+# unexpected stops. Usage reports here are realistic (ptok), since the
+# harness calibrates its estimates by them.
+
+def sc_compaction(model, n, req):
+    # Big reads in a small window, until it compacts, then an answer
+    if n < 8:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n}.txt"})
+    else:
+        yield from real_answer(model, req, "All files read.")
+
+
+def sc_compact_guard(model, n, req):
+    yield from sc_compaction(model, n, req)
+
+
+def sc_compact_guard_compact(model, n, req):
+    # A summary far too long to leave any room
+    yield S.head()
+    for i in range(40):
+        yield from text(model, "".join(f"Detail {i}.{j}: file f{j}.txt has line "
+                                       f"{i*j} of the data. " for j in range(40)))
+    yield from finish(model, prompt=ptok(req))
+
+
+def sc_compact_prune(model, n, req):
+    # Big outputs in a big window: pruning old ones is enough
+    if n < 10:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n}.txt"})
+    else:
+        yield from real_answer(model, req, "Pruned and done.")
+
+
+def sc_overflow_compact(model, n, req):
+    # Rejected as too long once, after some reads
+    if n < 4:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n}.txt"})
+    elif n == 4:
+        p = ptok(req)
+        yield S.error(400, {"error": {
+            "code": 400, "type": "exceed_context_size_error",
+            "message": f"request ({p} tokens) exceeds the available context "
+                       f"size ({p * 9 // 10} tokens), try increasing it",
+            "n_prompt_tokens": p, "n_ctx": p * 9 // 10}})
+    else:
+        yield from real_answer(model, req, "Fits now.")
+
+
+def sc_queue(model, n, req):
+    # Two seconds of streaming, while another model waits its turn
+    yield S.head()
+    for i in range(20):
+        yield from text(model, f"slow{i} ")
+        yield S.sleep(0.1)
+    yield from finish(model)
+
+
+def sc_queue_b(model, n, req):
+    yield from answer(model, "The other model answered.")
+
+
+def sc_slow_retry(model, n, req):
+    # Two rounds of quick retries fail, then it works
+    if n < 22:
+        yield S.error(503, {"error": {"code": 503, "message": "down for now"}})
+    else:
+        yield from answer(model, "Up again.")
+
+
+def sc_slow_budget(model, n, req):
+    yield S.error(503, {"error": {"code": 503, "message": "down for good"}})
+
+
+def sc_fallback(model, n, req):
+    # The primary: down for its quick retries, then fine
+    if n < 11:
+        yield S.error(503, {"error": {"code": 503, "message": "primary down"}})
+    else:
+        yield from answer(model, "Back on the primary.")
+
+
+def sc_fallback_b(model, n, req):
+    # The fallback: one step, slow enough for the primary's cooldown
+    if n == 0:
+        yield from tool(model, n, "shell", {"command": "sleep 1; echo fb"})
+    else:
+        yield from answer(model, "Still on the fallback.")
+
+
+def sc_limit(model, n, req):
+    # A spending limit: straight to the fallback
+    yield S.error(429, {"error": {"type": "insufficient_quota",
+                                  "message": "You exceeded your current quota"}})
+
+
+def sc_limit_b(model, n, req):
+    yield from answer(model, "The fallback answered.")
+
+
+def think_until_ended(model, cid, ended, repeat):
+    """Reasoning, looping or not, until reasoning_end, then an answer."""
+    for i in range(400):
+        if ended.is_set():
+            break
+        t = "Should I check the file again? " if repeat else f"Step {i}: weigh option {i * 7}. "
+        yield S.data(idchunk(cid, model, {"reasoning_content": t}))
+        yield S.sleep(0.01)
+    yield S.data(idchunk(cid, model, {"content": "The answer is 42."}))
+    yield S.data(idchunk(cid, model, {}, "stop"))
+    yield S.done()
+
+
+def sc_reasoning_end(model, n, req):
+    if n == 0:
+        cid = f"chatcmpl-{model}-{n}"
+        ended = STATE.wants_end(cid)
+        yield S.head()
+        yield from think_until_ended(model, cid, ended, True)
+    else:
+        yield from answer(model, "Second attempt.")
+
+
+def sc_reasoning_budget(model, n, req):
+    if n == 0:
+        cid = f"chatcmpl-{model}-{n}"
+        ended = STATE.wants_end(cid)
+        yield S.head()
+        yield from think_until_ended(model, cid, ended, False)
+    else:
+        yield from answer(model, "Second attempt.")
+
+
+sc_reasoning_404 = sc_reasoning_end
+
+NO_CONTROL = ("reasoning_404",)
+
+
+STOP_LINES = ["Let me run the tests now.", "Next, I will check the output:",
+              "I'll now run the build.", "**I'm going to fix it.**"]
+
+
+def sc_stop_nudge(model, n, req):
+    yield from answer(model, "Looked at it. " + STOP_LINES[n % len(STOP_LINES)])
+
+
+def sc_stop_progress(model, n, req):
+    if n == 0:
+        yield from answer(model, "Let me look at the file.")
+    elif n == 1:
+        yield from tool(model, n, "read", {"path": "hello.txt"})
+    elif n == 2:
+        yield from answer(model, "It says hello. Now I’ll check the rest:")
+    else:
+        yield from answer(model, "All done; the file says hello. Let me know "
+                                 "if you need more.")
+
+
 # The GUI's checklist (harness gui --drive, run by tests/gui.py): the
 # prompt that began the turn picks the reply, and the step is how many
 # responses the turn has had so far.
@@ -814,11 +1053,26 @@ class Handler(BaseHTTPRequestHandler):
     def wait(self, seconds):
         STATE.stop.wait(seconds)
 
-    def do_GET(self):
+    def route(self):
+        """The path without a /routerN/ prefix, and the prefix ("" if none)."""
         url = urllib.parse.urlparse(self.path)
+        parts = url.path.split("/", 2)
+        if len(parts) > 2 and parts[1].startswith("router") and parts[1][6:].isdigit():
+            return url, "/" + parts[2], parts[1]
+        return url, url.path, ""
+
+    def do_GET(self):
+        url, path, prefix = self.route()
         q = urllib.parse.parse_qs(url.query)
-        if url.path in ("/v1/models", "/models"):
+        if path in ("/v1/models", "/models"):
             self.send_json(200, models())
+        elif path == "/props" and prefix:
+            self.send_json(200, {"role": "router", "max_instances": int(prefix[6:]),
+                                 "models_autoload": True})
+        elif path == "/fake/router":
+            with STATE.lock:
+                peak = STATE.peak.get(q.get("prefix", [""])[0], 0)
+            self.send_json(200, {"peak": peak})
         elif url.path == "/fake/requests":
             self.send_json(200, STATE.log(q.get("model", [""])[0]))
         elif url.path == "/fake/bytes":
@@ -851,12 +1105,15 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def do_POST(self):
-        url = urllib.parse.urlparse(self.path)
+        url, path, prefix = self.route()
         raw = self.body()
         if url.path in ("/fake/stall", "/fake/stallbody"):
             self.stall(url.path)
             return
-        if url.path not in ("/v1/chat/completions", "/chat/completions"):
+        if path == "/v1/chat/completions/control":
+            self.control(raw)
+            return
+        if path not in ("/v1/chat/completions", "/chat/completions"):
             self.send_json(404, {"error": {"message": "not found"}})
             return
         try:
@@ -866,12 +1123,42 @@ class Handler(BaseHTTPRequestHandler):
             return
         model = req.get("model", "")
         parts = model.split(":")
-        fn = SCENARIOS.get(parts[1]) if len(parts) > 1 and parts[0] == "fake" else None
+        name = parts[1] if len(parts) > 1 and parts[0] == "fake" else ""
+        fn = SCENARIOS.get(name)
         if not fn:
             self.send_json(404, {"error": {"message": f"unknown model {model}"}})
             return
-        n = STATE.take(model, req)
-        self.perform(fn(model, n, req))
+        key = model
+        if is_compaction(req):
+            key = model + "#compact"
+            fn = SCENARIOS.get(name + "_compact", compact_default)
+        n = STATE.take(key, req)
+        STATE.begin(prefix, model)
+        try:
+            self.perform(fn(model, n, req))
+        finally:
+            STATE.end(prefix, model)
+            STATE.finished(key, n)
+
+    def control(self, raw):
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = {}
+        with STATE.lock:
+            STATE.controls.append(body)
+            ended = STATE.streams.get(body.get("id"))
+        name = (body.get("model") or "").split(":")[1:2]
+        if name and name[0] in NO_CONTROL:
+            self.send_json(404, {"error": {"message": "File Not Found"}})
+        elif body.get("action") != "reasoning_end":
+            self.send_json(400, {"error": {"message": "unknown control action"}})
+        elif ended:
+            ended.set()
+            self.send_json(200, {"success": True})
+        else:
+            self.send_json(200, {"success": False,
+                                 "message": "no active completion for this id"})
 
     def perform(self, actions):
         chunked = False

@@ -73,7 +73,7 @@ static void test_events(Test *t)
         }
         expect(t, "durable events", finish(&durable),
                "session title user turn attempt assistant tool.start "
-               "tool.end ask answer retry nudge turn.end note ");
+               "tool.end ask answer retry nudge turn.end note compact ");
         expect(t, "synced events", finish(&sync), "tool.start ask answer turn.end ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
         expect(t, "empty event", istr(a, evfind("")), istr(a, EV_NONE));
@@ -323,7 +323,7 @@ static void test_events(Test *t)
             "{\"sid\":\"s8\",\"seq\":1,\"ts\":0,\"ev\":\"session\"}\n"
             "{\"sid\":\"s8\",\"seq\":2,\"ts\":0,\"ev\":\"turn\",\"n\":1}\n"
             "{\"sid\":\"s8\",\"seq\":3,\"ts\":0,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n";
-        Str  newer = "{\"sid\":\"s8\",\"seq\":4,\"ts\":0,\"ev\":\"compact\",\"n\":1}\n";
+        Str  newer = "{\"sid\":\"s8\",\"seq\":4,\"ts\":0,\"ev\":\"later\",\"n\":1}\n";
         os_write(os, scratch, path, concat(a, done, newer));
         EventLog log = logopen(os, a, scratch, path, "s8", 1<<20);
         expect(t, "newer event", logshow(a, &log), "ok=1 seq=4 turn=1 torn=0 bad=0 synth=0");
@@ -335,7 +335,7 @@ static void test_events(Test *t)
 
         os_write(os, scratch, path,
             "{\"sid\":\"s8\",\"seq\":1,\"ts\":0,\"ev\":\"turn\",\"n\":1}\n"
-            "{\"sid\":\"s8\",\"seq\":2,\"ts\":0,\"ev\":\"compact\"}\n"
+            "{\"sid\":\"s8\",\"seq\":2,\"ts\":0,\"ev\":\"later\"}\n"
             "{\"sid\":\"s8\",\"seq\":3,\"ts\":0,\"ev\":\"delta\",\"text\":\"x\"}\n");
         log = logopen(os, a, scratch, path, "s8", 1<<20);
         expect(t, "newer event in turn", logshow(a, &log), "ok=1 seq=4 turn=1 torn=0 bad=0 synth=1");
@@ -552,7 +552,7 @@ static void test_events(Test *t)
         expect(t, "syncs", finish(&b),
                "session=0 title=0 user=0 turn=0 attempt=0 assistant=0 "
                "tool.start=1 tool.end=0 ask=1 answer=1 retry=0 nudge=0 "
-               "turn.end=1 note=0 ");
+               "turn.end=1 note=0 compact=0 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";

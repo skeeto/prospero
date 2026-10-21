@@ -29,6 +29,28 @@
 //   whatever a command leaves behind is killed when it completes.
 // - Budgets: a note at 200 steps, the end of the turn at 300.
 //
+// Unattended runs must not get stuck, nor give up early, so:
+//
+// - Context: before each step, a prompt estimated past the model's
+//   threshold is compacted (compact.cpp), and so is one the server
+//   rejects as too long, retried at 70%, 50%, then 35% of its size. A
+//   compaction that leaves the prompt above 80% of the threshold ends
+//   the turn rather than compact again and again.
+// - Admission: requests wait their turn at their endpoint (admit.cpp),
+//   in state "queued", under its limits: requests, different models (a
+//   llama.cpp router's max_instances, asked of its /props), and each
+//   model's slots.
+// - Slow retries and fallbacks: when the quick retries are spent, or a
+//   usage limit is hit, the model's fallbacks are tried in turn, each
+//   with its own quick retries, and the primary again after a cooldown.
+//   Past the end of that chain, slow retries wait minutes ([endpoint]
+//   slow_retry) for up to a budget, starting over from the primary.
+// - reasoning_end: reasoning that loops, or runs past [model]
+//   reasoning_budget, is ended early on llama.cpp by its control
+//   endpoint, and elsewhere cut off as a loop.
+// - Unexpected stops: a final response that announces work it did not
+//   do ("Let me run the tests.") is nudged to continue (provider.cpp).
+//
 // Asks: a call the guard will not allow by itself (a path outside the
 // workspace) needs the user's approval. A session is attended while a
 // frontend that can answer has it open, which the frontend declares with
@@ -86,11 +108,12 @@ enum : i32 {
     S_BACKOFF,   // waiting to retry
     S_TOOL,      // a command is running
     S_ASK,       // waiting for the user to answer an ask
+    S_QUEUED,    // waiting for its turn at the endpoint
 };
 
 static Str statenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask",
+    "ask", "queued",
 };
 
 enum : i32 {
@@ -104,6 +127,7 @@ enum : i32 {
     T_DRAIN,
     T_ASK,
     T_LIVE,
+    T_ADMIT,     // admitted while queued: send at once
     T_COUNT,
 };
 
@@ -113,6 +137,7 @@ enum : i32 {
     N_LENGTH,    // stopped at the length limit
     N_LOOP,      // a text cycle
     N_GUARD,     // the same calls 5 times
+    N_STOP,      // a final response that announced more work
     N_COUNT,
 };
 
@@ -125,8 +150,26 @@ static struct {
     {"length",   3},
     {"loop",     3},
     {"guard",    2},
+    {"stop",     3},
 };
 static_assert(countof(nudgeinfo) == N_COUNT);
+
+enum : i32 {
+    REQ_CHAT,     // what a request is for: a step of the turn
+    REQ_COMPACT,  // a summary of older messages
+};
+
+enum : i32 {
+    SLOT_NONE,    // a session's place at its endpoint
+    SLOT_WAIT,
+    SLOT_HELD,
+};
+
+enum : i32 {
+    CTL_NONE,     // why reasoning was asked to end
+    CTL_LOOP,
+    CTL_BUDGET,
+};
 
 struct Endpoint {
     Str name;       // its configured section, empty if none
@@ -161,6 +204,22 @@ struct Ask {
     GuardPath gp;
     GuardHint hint;
     i64       opened;   // ticks
+};
+
+// A summary compaction under way (REQ_COMPACT).
+struct Compact {
+    Endpoint  ep;        // the compactor
+    Str       model;
+    ModelConf mc;
+    i64       goal;      // tokens the prompt must come to, at most
+    b32       overflow;  // the server rejected the prompt: no guard
+    i64       before;    // tokens, estimated
+    iz        start;     // history[start, cut) is summarized
+    iz        cut;
+    i32       shrink;    // the summarizer rejected its input so often
+    iz        inbytes;   // of the conversation in the last request
+    iz        rejected;  // of the first one rejected, 0 if none
+    i64       began;     // ticks
 };
 
 struct Session {
@@ -209,8 +268,6 @@ struct Session {
     b32          contnext;   // nudge to continue after the tools
     b32          lengthcut;  // the response stopped at the length limit
     b32          cancelled;
-    i64          used;       // tokens in the last request and response
-    i64          added;      // bytes added to the history since
     Slice<Str>   queued;     // prompts waiting for the turn to end
     Slice<Str>   steers;     // input for the next step: asks yield to it
     Ask          ask;        // with S_ASK
@@ -225,7 +282,7 @@ struct Session {
     Sse          sse;
     Partial     *part;
     Cycle       *cycles;     // [0] text, [1] reasoning
-    iz           cycleat;    // where the text to keep ends, after a cycle
+    iz           cycleat;    // where the text to keep ends after a cycle, or -1
     // Tools
     Slice<Block> calls;
     iz           callidx;
@@ -233,6 +290,37 @@ struct Session {
     Proc        *proc;
     u64          procid;
     ShellRun     sh;
+    // The context: its size, and compaction
+    i32          purpose;    // REQ_*: what the current request is for
+    i64          bytes;      // of the history, as estimates count them
+    Rate         rate;       // tokens to bytes, the server's last count
+    i64          sentbytes;  // of the prompt of the chat request sent
+    i64          sentest;    // its tokens, estimated
+    Str          summary;    // the latest compaction's, empty if none
+    Compact      cp;         // with REQ_COMPACT
+    i32          overflows;  // this step's prompts rejected as too long
+    i64          ovsize;     // tokens of the first, 0 if none
+    Overflow     ovinfo;     // the sizes the latest rejection gave
+    // Admission at the endpoint
+    AdmPoint    *point;      // with a slot
+    i32          slot;       // SLOT_*
+    Str          slotmodel;
+    u64          admid;      // the session's id in queues
+    // Fallbacks and slow retries
+    Str          home;       // the primary endpoint (name or URL)
+    Str          homemodel;  // and model
+    i32          target;     // 0 for the primary, else 1 + fallback index
+    i64          homeat;     // ticks: the primary may be tried again
+    i64          slowfrom;   // ticks: the slow retries began, 0 if none
+    i32          slown;      // slow waits so far
+    b32          slowing;    // waiting slowly: start over from the primary
+    // Ending reasoning early (llama.cpp's reasoning_end)
+    i32          ctlwhy;     // CTL_*, for this attempt
+    Http        *ctl;
+    u64          ctlid;
+    i32          ctlstatus;
+    Buf          ctlbody;
+    b32          noctl;      // the endpoint cannot: cancel instead
 };
 
 // Engine functions take scratch by value, so that whatever a caller has
@@ -254,9 +342,14 @@ struct Engine {
     Session    *sessions;
     Map<i64>   *trained;  // n_ctx_train by "url model", learned when loaded
     Slice<Str>  learned;  // its keys, in order, for saving
+    Map<i64>   *kinds;    // by "url model": 1 if llama.cpp's, + slots<<1
     u64         nextid;
     b32         quitting;
     i64         quitby;   // ticks: stop waiting for turns to end
+    Adm         adm;      // the queues at each endpoint
+    i64         admat;    // ticks: admit again then, 0 if never
+    i64         minute;   // ticks of a minute of slow retries (a test
+                          // hook, HARNESS_TEST_MINUTE_MS, shortens it)
 };
 
 
@@ -336,6 +429,12 @@ static i64 tps10(Session *s)
     return (s->tokens - 1)*10*SEC / dt;
 }
 
+// The endpoint of the current request.
+static Endpoint *reqep(Session *s)
+{
+    return s->purpose==REQ_COMPACT ? &s->cp.ep : &s->ep;
+}
+
 // The state for the frontend. Small and bounded, so it needs no scratch.
 static void live(Session *s)
 {
@@ -345,8 +444,10 @@ static void live(Session *s)
     Os   *os  = s->e->os;
     i64   now = os_ticks(os);
     EvOut w   = sbegin(s, &b, EV_LIVE);
-    putstrkey(&w.json, "state", statenames[s->state]);
+    b32   cp  = s->purpose==REQ_COMPACT && requesting(s->state);
+    putstrkey(&w.json, "state", cp ? Str("compacting") : statenames[s->state]);
     if (requesting(s->state)) {
+        Endpoint *ep = reqep(s);
         putintkey(&w.json, "idle_ms", (now - s->lastbyte)/MS);
         putkey(&w.json, "tps");
         putfloat(&w.json, (f64)tps10(s) / 10);
@@ -354,9 +455,9 @@ static void live(Session *s)
         // frontend can warn before it fires
         i64 at = 0, of = 0;
         i64 lens[] = {
-            s->state==S_DISCOVER ? 15*SEC : s->ep.firstbyte,
-            s->ep.idle,
-            s->ep.progress,
+            s->state==S_DISCOVER ? 15*SEC : ep->firstbyte,
+            ep->idle,
+            ep->progress,
         };
         for (i32 t = T_FIRSTBYTE; t <= T_PROGRESS; t++) {
             if (s->timers[t] && (!at || s->timers[t]<at)) {
@@ -371,6 +472,9 @@ static void live(Session *s)
     } else if (s->state == S_BACKOFF) {
         i64 left = s->timers[T_BACKOFF] - now;
         putintkey(&w.json, "retry_at", os_time(os) + left/MS);
+    } else if (s->state==S_QUEUED && s->point) {
+        putintkey(&w.json, "queue_pos", admpos(s->point, s->admid));
+        putintkey(&w.json, "queue_len", admlen(s->point));
     }
     ssend(s, &w);
 }
@@ -391,13 +495,18 @@ static void setstate(Session *s, i32 state)
 
 // History
 
+// Append a message, by default of the record just logged.
 static void addmsg(Session *s, Msg m)
 {
+    m.seq = m.seq ? m.seq : s->log.seq;
     s->history = push(&s->perm, s->history, m);
-    s->added += m.text.len;
-    for (iz i = 0; i < m.blocks.len; i++) {
-        s->added += m.blocks[i].text.len + m.blocks[i].args.len;
-    }
+    s->bytes  += msgbytes(&m);
+}
+
+// The next prompt's size in tokens, estimated.
+static i64 estimate(Session *s)
+{
+    return tokensof(s->rate, s->system.len + s->tools.len + s->bytes);
 }
 
 static void adduser(Session *s, Arena scratch, Str text, Str via)
@@ -453,9 +562,10 @@ static void addassistant(Session *s, Arena scratch, Slice<Block> blocks,
     m.role   = ROLE_ASSISTANT;
     m.blocks = blocks;
     addmsg(s, m);
-    if (u && u->in) {
-        s->used  = u->in + u->out;
-        s->added = 0;
+    if (u && u->in && s->sentbytes) {
+        // The server's count calibrates the estimates
+        s->rate.tokens = u->in;
+        s->rate.bytes  = s->sentbytes;
     }
 }
 
@@ -501,6 +611,328 @@ static void resetnudges(Session *s)
 }
 
 
+// Worker records
+
+static i32 get32(Str s)
+{
+    i32 v = 0;
+    if (s.len >= 4) __builtin_memcpy(&v, s.data, 4);
+    return v;
+}
+
+static i64 get64(Str s)
+{
+    i64 v = 0;
+    if (s.len >= 8) __builtin_memcpy(&v, s.data, 8);
+    return v;
+}
+
+
+// Admission (admit.cpp)
+
+static Session *sessionbyadm(Engine *e, u64 id)
+{
+    for (Session *s = e->sessions; s; s = s->next) {
+        if (s->admid == id) {
+            return s;
+        }
+    }
+    return 0;
+}
+
+// Admit what may go now at an endpoint: each session admitted sends from
+// its T_ADMIT, and those still waiting hear their new places. Then find
+// when time alone may admit more, at any endpoint.
+static void pump(Engine *e, AdmPoint *p)
+{
+    i64 now   = os_ticks(e->os);
+    b32 moved = 0;
+    for (u64 id; (id = admgo(p, &e->perm, now));) {
+        Session *s = sessionbyadm(e, id);
+        assert(s && s->slot==SLOT_WAIT && s->point==p);
+        s->slot = SLOT_HELD;
+        arm(s, T_ADMIT, 0);
+        moved = 1;
+    }
+    for (Session *s = e->sessions; moved && s; s = s->next) {
+        if (s->point==p && s->slot==SLOT_WAIT && s->state==S_QUEUED) {
+            live(s);
+        }
+    }
+    e->admat = 0;
+    for (AdmPoint *q = e->adm.points; q; q = q->next) {
+        i64 t = admnext(q, now);
+        e->admat = t && (!e->admat || t<e->admat) ? t : e->admat;
+    }
+}
+
+// Give up the session's place at its endpoint: a request ended, with
+// linger if the turn goes on, or a wait was abandoned.
+static void release(Session *s, b32 linger)
+{
+    if (s->slot == SLOT_NONE) {
+        return;
+    }
+    Engine *e = s->e;
+    if (s->slot == SLOT_HELD) {
+        admdone(s->point, s->slotmodel, os_ticks(e->os), linger);
+    } else {
+        admleave(s->point, s->admid);
+    }
+    s->slot = SLOT_NONE;
+    disarm(s, T_ADMIT);
+    pump(e, s->point);
+}
+
+static Str authheaders(Arena *a, Endpoint *ep, Str accept)
+{
+    Buf b(a, 256);
+    print(&b, "Content-Type: application/json\r\n");
+    print(&b, "Accept: ");
+    print(&b, accept);
+    print(&b, "\r\nUser-Agent: harness/" HARNESS_VERSION "\r\n");
+    if (ep->key.len) {
+        print(&b, "Authorization: Bearer ");
+        print(&b, ep->key);
+        print(&b, "\r\n");
+    }
+    return finish(&b);
+}
+
+// Ask an endpoint about its capacity, once: a llama.cpp router's /props,
+// without a model, which loads nothing, gives its max_instances, and a
+// single server's gives its total_slots.
+static void probe(Engine *e, AdmPoint *p, Endpoint *ep, Arena scratch)
+{
+    HttpReq r = {};
+    r.method    = "GET";
+    r.url       = rooturl(&scratch, p->url, "props");
+    r.headers   = authheaders(&scratch, ep, "application/json");
+    r.connectms = ep->connectms;
+    r.readms    = 5000;
+    r.maxbytes  = 1 << 20;
+    r.mbox      = e->in;
+    r.id        = p->probeid = ++e->nextid;
+    p->probe    = PROBE_RUNNING;
+    p->status   = 0;
+    p->body     = Buf(&e->perm, 1<<10);
+    p->http     = os_http(e->os, &r, scratch);
+    if (!p->http) {
+        p->probe   = PROBE_DONE;
+        p->probeid = 0;
+    }
+}
+
+// The limits at an endpoint: as configured, else as learned. Until the
+// probe answers, one counted model at a time.
+static void pointlimits(AdmPoint *p)
+{
+    p->maxmodels = p->cfgmodels ? p->cfgmodels :
+                   p->probe==PROBE_RUNNING ? 1 : p->models;
+}
+
+// A record of an endpoint's probe. Returns 0 if it is not one.
+static b32 onprobe(Engine *e, Arena scratch, Record r)
+{
+    AdmPoint *p = 0;
+    for (AdmPoint *q = e->adm.points; r.id && q; q = q->next) {
+        p = q->probeid==r.id ? q : p;
+    }
+    if (!p) {
+        return 0;
+    }
+    switch (r.type) {
+    case HTTP_HEAD:
+        p->status = get32(r.data);
+        break;
+    case HTTP_BODY:
+        if (p->body.len+r.data.len <= 1<<20) print(&p->body, r.data);
+        break;
+    case HTTP_DONE: {
+        os_httpfree(e->os, p->http);
+        p->http    = 0;
+        p->probeid = 0;
+        p->probe   = PROBE_DONE;
+        JsonDoc d  = jsonparse(&scratch, finish(&p->body));
+        i64     mi = jsonint(jsonget(d.root, "max_instances"), 0);
+        i64     ts = jsonint(jsonget(d.root, "total_slots"), 0);
+        b32     rt = jsonstr(jsonget(d.root, "role")) == "router";
+        if (p->status == 200) {
+            p->models = rt && mi>0 ? (i32)(mi<1024 ? mi : 1024) : 0;
+            p->slots  = ts>0 ? (i32)(ts<1024 ? ts : 1024) : 0;
+        }
+        pointlimits(p);
+        pump(e, p);
+    } break;
+    }
+    return 1;
+}
+
+static i32 confint(Config *cfg, Str kind, Str name, Str key)
+{
+    Int v = parseint(trim(cfgget(cfg, kind, name, key, 0)));
+    return v.ok && v.val>0 ? (i32)(v.val<1000000 ? v.val : 1000000) : 0;
+}
+
+static Str kindkey(Arena *a, Str url, Str model)
+{
+    return concat(a, concat(a, url, " "), model);
+}
+
+// Wait for the current request's turn at its endpoint. Returns 1 if it
+// may go now; otherwise the session waits, queued, for its T_ADMIT.
+static b32 admit(Session *s, Arena scratch)
+{
+    Engine   *e     = s->e;
+    Config   *cfg   = e->cfg;
+    Endpoint *ep    = reqep(s);
+    Str       model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
+    AdmPoint *p     = admpoint(&e->adm, &e->perm, ep->url);
+    assert(s->slot == SLOT_NONE);
+
+    // What the endpoint's listing says of the model: the session's own
+    // from its discovery, any other from the last listing seen
+    ModelInfo mi = {};
+    if (model==s->model && ep->url==s->ep.url) {
+        mi = s->info;
+    } else {
+        i64 *k = upsert(&e->kinds, kindkey(&scratch, ep->url, model), (Arena *)0);
+        mi.llamacpp = k && (*k&1);
+        mi.slots    = k ? (i32)(*k>>1) : 0;
+    }
+    p->maxreq    = confint(cfg, "endpoint", ep->name, "max_concurrent");
+    p->cfgmodels = confint(cfg, "endpoint", ep->name, "max_models");
+    if (!p->cfgmodels && mi.llamacpp && p->probe==PROBE_NONE) {
+        probe(e, p, ep, scratch);
+    }
+    pointlimits(p);
+    i32 cap = confint(cfg, "model", model, "max_concurrent");
+    cap = cap ? cap : mi.slots ? mi.slots : p->slots ? p->slots : 4;
+
+    s->admid     = s->admid ? s->admid : ++e->nextid;
+    s->point     = p;
+    s->slot      = SLOT_WAIT;
+    s->slotmodel = model;
+    admenqueue(p, &e->perm, s->admid, model, cap, mi.llamacpp || p->cfgmodels,
+               os_ticks(e->os));
+    pump(e, p);
+    if (s->slot == SLOT_HELD) {
+        disarm(s, T_ADMIT);  // it goes now
+        return 1;
+    }
+    return 0;
+}
+
+
+// Ending reasoning early: llama.cpp's reasoning_end
+
+static void fail(Session *, Arena, i32 cls, i32 status, Str msg, i64 retryms);
+
+static void stopctl(Session *s)
+{
+    if (s->ctl) {
+        os_httpcancel(s->e->os, s->ctl);
+        os_httpfree(s->e->os, s->ctl);
+        s->ctl = 0;
+    }
+    s->ctlid = 0;
+}
+
+static ModelConf *reqmc(Session *s)
+{
+    return s->purpose==REQ_COMPACT ? &s->cp.mc : &s->mc;
+}
+
+// Ask llama.cpp to end the response's reasoning now, so that the model
+// answers instead, rather than cancel it. Where that cannot be done, or
+// was tried already, the attempt fails as a loop. Returns 0 if it did.
+static b32 endreasoning(Session *s, Arena scratch, i32 why)
+{
+    Engine   *e   = s->e;
+    Endpoint *ep  = reqep(s);
+    Str       msg = why==CTL_BUDGET ? Str("the reasoning ran past its budget")
+                                    : Str("the model's reasoning repeated itself");
+    b32       can = reqmc(s)->llamacpp && !s->noctl && s->part->id.len;
+    if (s->ctlwhy || !can) {
+        s->ctlwhy = why;
+        fail(s, scratch, CLASS_LOOP, 0, msg, -1);
+        return 0;
+    }
+
+    Buf     b(&scratch, 256);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "id", s->part->id);
+    putstrkey(&w, "action", "reasoning_end");
+    putstrkey(&w, "model", reqmc(s)->name);
+    putend(&w);
+    Str body = finish(&b);
+
+    HttpReq r = {};
+    r.method    = "POST";
+    r.url       = apiurl(&scratch, ep->url, "chat/completions/control");
+    r.headers   = authheaders(&scratch, ep, "application/json");
+    r.body      = body;
+    r.connectms = ep->connectms;
+    r.readms    = 10000;
+    r.maxbytes  = 64 << 10;
+    r.mbox      = e->in;
+    r.id        = s->ctlid = ++e->nextid;
+    s->ctlwhy    = why;
+    s->ctlstatus = 0;
+    s->ctlbody   = Buf(&s->attempt, 256);
+    s->ctl       = os_http(e->os, &r, scratch);
+    if (!s->ctl) {
+        s->ctlid = 0;
+        fail(s, scratch, CLASS_LOOP, 0, msg, -1);
+        return 0;
+    }
+    Str text = concat(&scratch, msg, ": asked the server to end it (reasoning_end)");
+    note(s, scratch, "info", text);
+    return 1;
+}
+
+// A record of a reasoning_end request. Returns 0 if it is not one.
+static b32 onctl(Engine *e, Arena scratch, Record r)
+{
+    Session *s = 0;
+    for (Session *t = e->sessions; r.id && t; t = t->next) {
+        s = t->ctlid==r.id ? t : s;
+    }
+    if (!s) {
+        return 0;
+    }
+    switch (r.type) {
+    case HTTP_HEAD:
+        s->ctlstatus = get32(r.data);
+        break;
+    case HTTP_BODY:
+        if (s->ctlbody.len+r.data.len <= 4<<10) print(&s->ctlbody, r.data);
+        break;
+    case HTTP_DONE: {
+        stopctl(s);
+        Str     body = finish(&s->ctlbody);
+        JsonDoc d    = jsonparse(&scratch, body);
+        Json   *ok   = jsonget(d.root, "success");
+        if (s->ctlstatus==200 && ok->type==JSON_BOOL && ok->boolean) {
+            break;  // the model answers next
+        } else if (s->ctlstatus==200 && contains(body, "no active completion")) {
+            break;  // it ended meanwhile
+        }
+        // Not supported here: cancel this time, and from now on
+        s->noctl = 1;
+        if (s->state==S_STREAM && s->part) {
+            Str msg = s->ctlwhy==CTL_BUDGET ?
+                Str("the reasoning ran past its budget, and the server cannot end it") :
+                Str("the model's reasoning repeated itself, and the server cannot end it");
+            fail(s, scratch, CLASS_LOOP, 0, msg, -1);
+        }
+    } break;
+    }
+    return 1;
+}
+
+
 // Requests
 
 static void stopreq(Session *s)
@@ -511,38 +943,25 @@ static void stopreq(Session *s)
         s->http = 0;
     }
     s->httpid = 0;
+    stopctl(s);
+    release(s, 1);
     disarm(s, T_FIRSTBYTE);
     disarm(s, T_IDLE);
     disarm(s, T_PROGRESS);
     disarm(s, T_GRACE);
 }
 
-static Str authheaders(Arena *a, Session *s, Str accept)
-{
-    Buf b(a, 256);
-    print(&b, "Content-Type: application/json\r\n");
-    print(&b, "Accept: ");
-    print(&b, accept);
-    print(&b, "\r\nUser-Agent: harness/" HARNESS_VERSION "\r\n");
-    if (s->ep.key.len) {
-        print(&b, "Authorization: Bearer ");
-        print(&b, s->ep.key);
-        print(&b, "\r\n");
-    }
-    return finish(&b);
-}
-
 // Start a request whose records go to this session. 0 on failure.
-static b32 startreq(Session *s, Arena scratch, Str method, Str url, Str body,
-                    Str accept, i32 readms)
+static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
+                    Str url, Str body, Str accept, i32 readms)
 {
     Engine *e = s->e;
     HttpReq r = {};
     r.method    = method;
     r.url       = url;
-    r.headers   = authheaders(&scratch, s, accept);
+    r.headers   = authheaders(&scratch, ep, accept);
     r.body      = body;
-    r.connectms = s->ep.connectms;
+    r.connectms = ep->connectms;
     r.readms    = readms;
     r.maxbytes  = RESPONSE_MAX;
     r.mbox      = e->in;
@@ -568,10 +987,23 @@ static void endturn(Session *, Arena, Str why, Str err);
 static void prepare(Session *, Arena);
 static void finalize(Session *, Arena);
 static void nexttool(Session *, Arena);
+static void sendcompact(Session *, Arena);
+static void compact(Session *, Arena, i64 enough, i64 goal, b32 overflow);
 
 static void resetattempt(Session *s)
 {
     s->attempt = newarena(s->aregion);
+}
+
+// A new attempt's response state, in its fresh arena.
+static void newattempt(Session *s)
+{
+    resetattempt(s);
+    s->part    = newpartial(&s->attempt);
+    s->sse     = newsse(&s->attempt, SSE_MAX);
+    s->cycles  = alloc<Cycle>(&s->attempt, 2);
+    s->cycleat = -1;
+    s->ctlwhy  = CTL_NONE;
 }
 
 static void sendchat(Session *s, Arena scratch)
@@ -589,22 +1021,20 @@ static void sendchat(Session *s, Arena scratch)
         ssend(s, &w);
     }
 
-    resetattempt(s);
-    s->part    = newpartial(&s->attempt);
-    s->sse     = newsse(&s->attempt, SSE_MAX);
-    s->cycles  = alloc<Cycle>(&s->attempt, 2);
-    s->cycleat = 0;
+    newattempt(s);
 
     // The body goes into the attempt arena, temporaries into scratch
     ChatReq req = {};
-    req.mc      = &s->mc;
-    req.system  = s->system;
-    req.tools   = s->tools;
-    req.history = s->history;
-    Str body    = encodechat(&s->attempt, scratch, &req);
-    Str url     = apiurl(&scratch, s->ep.url, "chat/completions");
+    req.mc       = &s->mc;
+    req.system   = s->system;
+    req.tools    = s->tools;
+    req.history  = s->history;
+    Str body     = encodechat(&s->attempt, scratch, &req);
+    Str url      = apiurl(&scratch, s->ep.url, "chat/completions");
+    s->sentbytes = s->system.len + s->tools.len + s->bytes;
+    s->sentest   = estimate(s);
 
-    if (!startreq(s, scratch, "POST", url, body, "text/event-stream", 0)) {
+    if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0)) {
         Str err = os_lasterr(e->os, &scratch);
         err = concat(&scratch, "cannot start a request: ", err);
         endturn(s, scratch, "error", err);
@@ -614,13 +1044,52 @@ static void sendchat(Session *s, Arena scratch)
     setstate(s, S_HEAD);
 }
 
+static void sendreq(Session *s, Arena scratch)
+{
+    if (s->purpose == REQ_COMPACT) {
+        sendcompact(s, scratch);
+    } else {
+        sendchat(s, scratch);
+    }
+}
+
+// Send the current request once it is admitted at its endpoint.
+static void request(Session *s, Arena scratch)
+{
+    if (!admit(s, scratch)) {
+        setstate(s, S_QUEUED);
+        return;
+    }
+    sendreq(s, scratch);
+}
+
+static void discover(Session *, Arena);
+
+// Carry on toward the step's request: the model's listing first, then
+// room in the context, then its turn at the endpoint.
+static void proceed(Session *s, Arena scratch)
+{
+    if (!s->discovered) {
+        discover(s, scratch);
+        return;
+    }
+    if (s->purpose==REQ_CHAT && s->mc.ctx) {
+        i64 at = compactat(s->mc.ctx);
+        if (estimate(s) >= at) {
+            compact(s, scratch, at, at*4/5, 0);
+            return;
+        }
+    }
+    request(s, scratch);
+}
+
 static void discover(Session *s, Arena scratch)
 {
     Str url = apiurl(&scratch, s->ep.url, "models");
     resetattempt(s);
     s->discovered = 1;
-    if (!startreq(s, scratch, "GET", url, {}, "application/json", 10000)) {
-        sendchat(s, scratch);
+    if (!startreq(s, scratch, &s->ep, "GET", url, {}, "application/json", 10000)) {
+        proceed(s, scratch);
         return;
     }
     arm(s, T_FIRSTBYTE, 15*SEC);
@@ -664,10 +1133,29 @@ static void savetrained(Engine *e, Arena scratch)
     os_write(e->os, scratch, path, data);
 }
 
+// Note what a listing says of every model, for requests to models other
+// than a session's own (a compactor).
+static void notekinds(Engine *e, Arena scratch, Str url, Str body)
+{
+    JsonDoc d = jsonparse(&scratch, body);
+    for (Json *m = jsonget(d.root, "data")->child; m; m = m->next) {
+        Str id = jsonstr(jsonget(m, "id"));
+        if (id.len) {
+            ModelInfo mi = modelinfo(m, 0);
+            Arena     t  = scratch;
+            Str       k  = kindkey(&t, url, id);
+            i64      *v  = upsert(&e->kinds, k, (Arena *)0);
+            v = v ? v : upsert(&e->kinds, clone(&e->perm, k), &e->perm);
+            *v = (i64)mi.llamacpp | (i64)mi.slots<<1;
+        }
+    }
+}
+
 static void discovered(Session *s, Arena scratch, b32 ok)
 {
     Engine *e = s->e;
     if (ok && s->status==200) {
+        notekinds(e, scratch, s->ep.url, finish(&s->body));
         Str  key     = concat(&scratch, concat(&scratch, s->ep.url, " "), s->model);
         i64 *cached  = upsert(&e->trained, key, (Arena *)0);
         i64  trained = cached ? *cached : 0;
@@ -691,7 +1179,7 @@ static void discovered(Session *s, Arena scratch, b32 ok)
         }
     }
     stopreq(s);
-    sendchat(s, scratch);
+    proceed(s, scratch);
 }
 
 // Run the complete calls of a committed message.
@@ -707,12 +1195,256 @@ static void runcalls(Session *s, Arena scratch, Slice<Block> blocks)
     nexttool(s, scratch);
 }
 
-// Fail the current attempt. Transient failures back off and retry while
-// nothing visible has streamed, and otherwise commit what streamed and
-// ask the agent to continue. retryms is the server's wish, -1 if none.
-static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 retryms)
+// Retries and fallbacks
+
+static b32  endpointconf(Engine *, Arena *, Str which, Endpoint *);
+static void modelconf(Engine *, Arena *, Str model, ModelConf *);
+
+// Ticks of slow waiting and cooldowns, as the test hook has them.
+static i64 scaled(Engine *e, i64 ticks)
+{
+    return (i64)((f64)ticks * (f64)e->minute / (f64)(60*SEC));
+}
+
+enum : i32 {
+    RETRY_QUICK,   // backing off a little
+    RETRY_SLOW,    // minutes
+    RETRY_SWITCH,  // to a fallback, at once
+};
+
+// A retry record: its target (endpoint and model) is the next attempt's.
+static void retryevent(Session *s, Arena scratch, i32 kind, i32 cls,
+                       i32 status, i64 delayms, Str msg)
+{
+    Str   model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
+    Buf   b(&scratch, 512 + msg.len);
+    EvOut w = sbegin(s, &b, EV_RETRY);
+    putintkey(&w.json, "turn", s->turn);
+    putintkey(&w.json, "attempt", s->attempts);
+    putstrkey(&w.json, "class", classname(cls));
+    putintkey(&w.json, "status", status);
+    putintkey(&w.json, "delay_ms", delayms);
+    putstrkey(&w.json, "msg", msg);
+    putstrkey(&w.json, "endpoint", reqep(s)->url);
+    putstrkey(&w.json, "model", model);
+    if (kind == RETRY_SLOW) {
+        putintkey(&w.json, "slow", 1);
+    } else if (kind == RETRY_SWITCH) {
+        putintkey(&w.json, "fallback", s->target);
+    }
+    if (s->purpose == REQ_COMPACT) {
+        putintkey(&w.json, "compact", 1);
+    }
+    ssend(s, &w);
+}
+
+// Back off and retry, while quick retries are left. Returns 0 once they
+// are spent. retryms is the server's wish, -1 if none.
+static b32 quickretry(Session *s, Arena scratch, i32 cls, i32 status, Str msg,
+                      i64 retryms)
 {
     Engine *e = s->e;
+    if (s->retries >= RETRY_MAX) {
+        return 0;
+    }
+    i64 delay = scaled(e, backoffms(++s->retries, os_random(e->os)));
+    delay = retryms>delay ? retryms : delay;
+    retryevent(s, scratch, RETRY_QUICK, cls, status, delay, msg);
+    arm(s, T_BACKOFF, delay*MS);
+    setstate(s, S_BACKOFF);
+    return 1;
+}
+
+// Once quick retries are spent and no fallback is left, wait minutes at
+// a time, as [endpoint] slow_retry says (the last wait repeating), then
+// start over from the primary, until [endpoint] slow_retry_budget is
+// spent; a request that succeeds resets it. The server's own wish is
+// honored if longer. Returns 0 past the budget.
+static b32 slowwait(Session *s, Arena scratch, i32 cls, i32 status, Str msg,
+                    i64 retryms)
+{
+    Engine *e    = s->e;
+    Str     name = reqep(s)->name;
+    i64     now  = os_ticks(e->os);
+    i64     wait = 60*SEC;
+    i32     n    = 0;
+    Str     list = cfgget(e->cfg, "endpoint", name, "slow_retry", 0);
+    for (Str rest = list; rest.len;) {
+        Float f = parsefloat(cfgnextword(&rest));
+        if (f.ok && f.val>0) {
+            wait = (i64)(f.val * (f64)SEC);
+            if (n++ == s->slown) break;
+        }
+    }
+    wait = scaled(e, wait);
+    wait = retryms*MS>wait ? retryms*MS : wait;  // the server's clock
+    i64 budget = scaled(e, cfgms(e->cfg, "endpoint", name, "slow_retry_budget", 0)*MS);
+    s->slowfrom = s->slowfrom ? s->slowfrom : now;
+    if (now+wait-s->slowfrom > budget) {
+        return 0;
+    }
+    s->slown++;
+    s->retries = 0;  // quick ones again after the wait
+    s->slowing = 1;
+    retryevent(s, scratch, RETRY_SLOW, cls, status, wait/MS, msg);
+    arm(s, T_BACKOFF, wait);
+    setstate(s, S_BACKOFF);
+    return 1;
+}
+
+// Make an endpoint (name or URL) and model the target of the session's
+// next requests, whose listing is read again first.
+static b32 usetarget(Session *s, Str which, Str model)
+{
+    Engine  *e  = s->e;
+    Endpoint ep = {};
+    if (!endpointconf(e, &s->perm, which, &ep)) {
+        return 0;
+    }
+    ModelConf mc = {};
+    s->ep    = ep;
+    s->model = clone(&s->perm, model);
+    modelconf(e, &s->perm, s->model, &mc);
+    s->mc         = mc;
+    s->info       = {};
+    s->discovered = 0;
+    s->retries    = 0;
+    return 1;
+}
+
+// A fallback is MODEL, at the primary's endpoint, or ENDPOINT/MODEL with
+// ENDPOINT a configured name.
+static b32 usefallback(Session *s, Str spec)
+{
+    Cut c = cut(spec, '/');
+    if (c.ok && c.tail.len &&
+            trim(cfgget(s->e->cfg, "endpoint", c.head, "url", 0)).len) {
+        return usetarget(s, c.head, c.tail);
+    }
+    return usetarget(s, s->home, spec);
+}
+
+// Move on to the next of the primary's fallbacks ([model] fallback), if
+// one is left, which gets quick retries of its own. Leaving the primary
+// starts its cooldown. Returns 0 at the end of the chain.
+static b32 nexttarget(Session *s, Arena scratch, i32 cls, i32 status, Str msg)
+{
+    Engine    *e     = s->e;
+    Str        list  = cfgget(e->cfg, "model", s->homemodel, "fallback", 0);
+    Slice<Str> chain = {};
+    for (Str rest = list; rest.len;) {
+        Str w = cfgnextword(&rest);
+        if (w.len) chain = push(&scratch, chain, w);
+    }
+    for (iz i = s->target; i < chain.len; i++) {
+        if (!usefallback(s, chain[i])) {
+            continue;  // names nothing usable
+        }
+        if (!s->target) {
+            i64 cool  = cfgms(e->cfg, "model", s->homemodel, "fallback_cooldown", 0);
+            s->homeat = os_ticks(e->os) + scaled(e, cool*MS);
+        }
+        s->target = (i32)i + 1;
+        retryevent(s, scratch, RETRY_SWITCH, cls, status, 0, msg);
+        return 1;
+    }
+    return 0;
+}
+
+// Back to the primary model from a fallback.
+static void gohome(Session *s, Arena scratch, Str why)
+{
+    if (!s->target) {
+        return;
+    }
+    Str from = s->model;
+    if (!usetarget(s, s->home, s->homemodel)) {
+        return;  // its endpoint left the configuration
+    }
+    s->target = 0;
+    Buf b(&scratch, 256 + from.len + why.len);
+    print(&b, "trying the primary model, ");
+    print(&b, s->model);
+    print(&b, ", again after ");
+    print(&b, from);
+    print(&b, ": ");
+    print(&b, why);
+    Str text = finish(&b);
+    note(s, scratch, "info", text);
+}
+
+// The server rejected the prompt as too long: compact to 70% of its
+// size, then 50%, then 35%, retrying the step after each, then give up.
+// The server's numbers correct the estimates and the window.
+static void overflowed(Session *s, Arena scratch, Str msg)
+{
+    static i32 const pct[] = {70, 50, 35};
+    Overflow o = s->ovinfo;
+    s->ovinfo = {};
+    if (o.ctx>0 && (!s->mc.ctx || o.ctx<s->mc.ctx)) {
+        s->mc.ctx = o.ctx;
+    }
+    if (o.prompt>0 && s->sentbytes>0) {
+        s->rate.tokens = o.prompt;
+        s->rate.bytes  = s->sentbytes;
+    }
+    i64 size  = o.prompt>0 ? o.prompt : s->sentest;
+    s->ovsize = s->ovsize ? s->ovsize : size;
+    if (s->overflows >= countof(pct)) {
+        Str err = concat(&scratch, "overflow: still too long after compacting "
+                         "3 times: ", msg);
+        endturn(s, scratch, "error", err);
+        return;
+    }
+    i64 goal = s->ovsize * pct[s->overflows++] / 100;
+    if (s->mc.ctx) {
+        i64 most = compactat(s->mc.ctx) * 4/5;
+        goal = goal<most ? goal : most;
+    }
+    compact(s, scratch, goal, goal, 1);
+}
+
+// A summary request failed: transient failures retry as any request
+// does, quickly then slowly; a summarizer that finds its input too long
+// gets the newest 70%, then 50%, then 35% of it; the rest end the turn.
+static void failcompact(Session *s, Arena scratch, i32 cls, i32 status,
+                        Str msg, i64 retryms)
+{
+    stopreq(s);
+    s->part = 0;
+    if (cls==CLASS_OVERFLOW && s->cp.shrink<3) {
+        s->cp.rejected = s->cp.rejected ? s->cp.rejected : s->cp.inbytes;
+        s->cp.shrink++;
+        retryevent(s, scratch, RETRY_QUICK, cls, status, 0, msg);
+        request(s, scratch);
+        return;
+    }
+    b32 again = cls==CLASS_TRANSIENT || cls==CLASS_LOOP;
+    b32 later = retryms > RETRY_WAIT/MS;
+    if (again && !later && quickretry(s, scratch, cls, status, msg, retryms)) {
+        return;
+    } else if (again && slowwait(s, scratch, cls, status, msg, later ? retryms : -1)) {
+        return;
+    }
+    Buf b(&scratch, 64 + msg.len);
+    print(&b, "compaction failed: ");
+    print(&b, classname(cls));
+    print(&b, ": ");
+    print(&b, msg);
+    Str err = finish(&b);
+    endturn(s, scratch, "error", err);
+}
+
+// Fail the current attempt. Transient failures back off and retry while
+// nothing visible has streamed, and otherwise commit what streamed and
+// ask the agent to continue. Once quick retries are spent, fallbacks and
+// slow retries follow (above). retryms is the server's wish, -1 if none.
+static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 retryms)
+{
+    if (s->purpose == REQ_COMPACT) {
+        failcompact(s, scratch, cls, status, msg, retryms);
+        return;
+    }
     stopreq(s);
     Partial *p       = s->part;
     b32      visible = p && committed(p);
@@ -721,7 +1453,7 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
     if ((cls==CLASS_TRANSIENT || cls==CLASS_LOOP) && visible) {
         // Keep what streamed: the cycle cut away, an incomplete call
         // dropped, complete calls run as usual
-        if (cls == CLASS_LOOP) {
+        if (cls==CLASS_LOOP && s->cycleat>=0) {
             p->text.len = s->cycleat<p->text.len ? s->cycleat : p->text.len;
         }
         Finished f = finishpartial(&s->perm, p, 0, s->turn, s->steps);
@@ -750,48 +1482,37 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
 
     if (cls == CLASS_LOOP) {
         // Nothing visible: only reasoning looped, so it is discarded
-        Str text = "Your reasoning started repeating itself, so it was cut "
-                   "off. Stop deliberating: issue one concrete tool call, or "
-                   "give your final answer.";
+        Str text = s->ctlwhy==CTL_BUDGET ?
+            Str("Your reasoning ran past its budget, so it was cut off. Stop "
+                "deliberating: issue one concrete tool call, or give your "
+                "final answer.") :
+            Str("Your reasoning started repeating itself, so it was cut "
+                "off. Stop deliberating: issue one concrete tool call, or "
+                "give your final answer.");
         if (!nudge(s, scratch, N_LOOP, text)) {
             endturn(s, scratch, "error", "the model kept repeating itself");
             return;
         }
         prepare(s, scratch);
         return;
+    } else if (cls == CLASS_OVERFLOW) {
+        overflowed(s, scratch, msg);
+        return;
     }
 
-    if (cls == CLASS_TRANSIENT) {
-        if (s->retries >= RETRY_MAX) {
-            Str err = concat(&scratch, "gave up after 10 retries: ", msg);
-            endturn(s, scratch, "error", err);
-            return;
-        }
-        if (retryms > RETRY_WAIT/MS) {
-            Buf b(&scratch, 256 + msg.len);
-            print(&b, "the server asked to wait ");
-            print(&b, retryms/1000);
-            print(&b, " s, longer than the 300 s limit: ");
-            print(&b, msg);
-            Str err = finish(&b);
-            endturn(s, scratch, "error", err);
-            return;
-        }
-        i64 delay = backoffms(++s->retries, os_random(e->os));
-        delay = retryms>delay ? retryms : delay;
-
-        Buf   b(&scratch, 256 + msg.len);
-        EvOut w = sbegin(s, &b, EV_RETRY);
-        putintkey(&w.json, "turn", s->turn);
-        putintkey(&w.json, "attempt", s->attempts);
-        putstrkey(&w.json, "class", classname(cls));
-        putintkey(&w.json, "status", status);
-        putintkey(&w.json, "delay_ms", delay);
-        putstrkey(&w.json, "msg", msg);
-        ssend(s, &w);
-
-        arm(s, T_BACKOFF, delay*MS);
-        setstate(s, S_BACKOFF);
+    // A wait longer than quick retries honor is a usage limit, as is a
+    // spending or quota error. A missing model (404) is unavailable.
+    b32 later = cls==CLASS_TRANSIENT && retryms>RETRY_WAIT/MS;
+    b32 gone  = cls==CLASS_DETERMINISTIC && status==404;
+    if (cls==CLASS_TRANSIENT && !later &&
+            quickretry(s, scratch, cls, status, msg, retryms)) {
+        return;
+    } else if ((cls==CLASS_TRANSIENT || cls==CLASS_LIMIT || gone) &&
+               nexttarget(s, scratch, cls, status, msg)) {
+        proceed(s, scratch);
+        return;
+    } else if (cls==CLASS_TRANSIENT &&
+               slowwait(s, scratch, cls, status, msg, later ? retryms : -1)) {
         return;
     }
 
@@ -804,9 +1525,21 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
             addassistant(s, scratch, f.blocks, "error", 0);
         }
     }
-    Buf b(&scratch, 64 + msg.len);
-    print(&b, classname(cls));
-    print(&b, ": ");
+    Buf b(&scratch, 256 + msg.len);
+    if (later) {
+        print(&b, "the server asked to wait ");
+        print(&b, retryms/1000);
+        print(&b, " s, longer than slow retries may: ");
+    } else if (cls == CLASS_TRANSIENT) {
+        print(&b, "gave up after ");
+        print(&b, (i64)s->slown);
+        print(&b, " slow retries over ");
+        print(&b, (os_ticks(s->e->os) - s->slowfrom)/SEC);
+        print(&b, " s: ");
+    } else {
+        print(&b, classname(cls));
+        print(&b, ": ");
+    }
     print(&b, msg);
     Str err = finish(&b);
     endturn(s, scratch, "error", err);
@@ -852,35 +1585,51 @@ static b32 onchunk(Session *s, Arena scratch, Json *j)
         fail(s, scratch, classify(c.errcode, c.error), c.errcode, c.error, -1);
         return 0;
     }
+    Endpoint *ep = reqep(s);
     if (c.prefill) {
-        arm(s, T_PROGRESS, s->ep.progress);
+        arm(s, T_PROGRESS, ep->progress);
         emitprogress(s, scratch, &c);
     }
     if (c.content) {
-        arm(s, T_PROGRESS, s->ep.progress);
+        arm(s, T_PROGRESS, ep->progress);
         s->lastout  = os_ticks(s->e->os);
         s->firstout = s->firstout ? s->firstout : s->lastout;
         s->tokens++;
     }
     for (iz i = 0; i < c.deltas.len; i++) {
         Delta *d = &c.deltas[i];
-        emitdelta(s, scratch, d);
+        if (s->purpose == REQ_CHAT) {
+            emitdelta(s, scratch, d);  // a summary is not the agent's
+        }
         if (d->kind == DELTA_ARGS) {
             continue;
         }
         Cycle *cy  = &s->cycles[d->kind==DELTA_THINK];
         iz     hit = cyclefeed(cy, d->text);
-        if (hit >= 0) {
-            // Keep the text through the first occurrence of the unit
-            s->cycleat = s->part->text.len;
-            if (d->kind == DELTA_TEXT) {
-                iz end = s->part->text.len - d->text.len + hit;
-                s->cycleat = end - (cy->reps-1)*cy->unit;
-                s->cycleat = s->cycleat<0 ? 0 : s->cycleat;
+        if (hit>=0 && d->kind==DELTA_THINK) {
+            // Looping reasoning is ended early if possible, and else it
+            // goes, while the text is kept through the first occurrence
+            // of its unit
+            *cy = {};
+            if (!endreasoning(s, scratch, CTL_LOOP)) {
+                return 0;
             }
+        } else if (hit >= 0) {
+            iz end = s->part->text.len - d->text.len + hit;
+            s->cycleat = end - (cy->reps-1)*cy->unit;
+            s->cycleat = s->cycleat<0 ? 0 : s->cycleat;
             fail(s, scratch, CLASS_LOOP, 0, "the model repeated itself", -1);
             return 0;
         }
+    }
+
+    // Reasoning past its budget is ended likewise, and cut off should
+    // it run on to twice the budget regardless
+    i64 most = reqmc(s)->thinkmax;
+    i64 used = tokensof(s->rate, s->part->think.len);
+    if (most && used>most && (!s->ctlwhy || used>2*most) &&
+            !endreasoning(s, scratch, CTL_BUDGET)) {
+        return 0;
     }
     if (s->part->finish.data && !s->timers[T_GRACE]) {
         arm(s, T_GRACE, GRACE);
@@ -903,11 +1652,11 @@ static void onhead(Session *s, i32 status, Str headers)
     if (status == 200) {
         Str type = headervalue(headers, "content-type");
         s->plain = type.len && !contains(type, "event-stream");
-        arm(s, T_IDLE, s->ep.idle);
-        arm(s, T_PROGRESS, s->ep.progress);
+        arm(s, T_IDLE, reqep(s)->idle);
+        arm(s, T_PROGRESS, reqep(s)->progress);
         setstate(s, S_STREAM);
     } else {
-        arm(s, T_IDLE, s->ep.idle);
+        arm(s, T_IDLE, reqep(s)->idle);
         setstate(s, S_ERRBODY);
     }
 }
@@ -921,7 +1670,7 @@ static void onbody(Session *s, Arena scratch, Str data)
         return;
     case S_ERRBODY:
         if (s->body.len+data.len <= ERRBODY_MAX) print(&s->body, data);
-        arm(s, T_IDLE, s->ep.idle);
+        arm(s, T_IDLE, reqep(s)->idle);
         return;
     case S_STREAM:
         break;
@@ -929,7 +1678,7 @@ static void onbody(Session *s, Arena scratch, Str data)
         return;
     }
 
-    arm(s, T_IDLE, s->ep.idle);
+    arm(s, T_IDLE, reqep(s)->idle);
     if (s->plain) {
         print(&s->body, data);
         return;
@@ -983,6 +1732,9 @@ static void ondone(Session *s, Arena scratch, i32 err, Str text)
         Str body = finish(&s->body);
         Str msg  = errormessage(&scratch, body);
         i32 cls  = classify(s->status, body);
+        if (cls == CLASS_OVERFLOW) {
+            s->ovinfo = overflowsizes(scratch, body);
+        }
         Buf b(&scratch, 64 + msg.len);
         print(&b, "HTTP ");
         print(&b, (i64)s->status);
@@ -1084,6 +1836,7 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     m.role   = ROLE_TOOL;
     m.callid = c->id;
     m.text   = clone(&s->perm, text);
+    m.spill  = spill.len ? clone(&s->perm, spill) : Str{};
     addmsg(s, m);
     s->progressed |= status == "ok";
     s->callidx++;
@@ -1203,6 +1956,11 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     b32 steer = s->steers.len > 0;
     b32 wait  = s->attended && !steer;
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    if (wait) {
+        // The deadline runs from now: the record's fsync, which a slow
+        // disk may draw out, must not extend it
+        arm(s, T_ASK, delay);
+    }
     {
         Str   why = guardwhy(&scratch, toolnames[tool], gp, s->guard.cwd);
         Buf   b(&scratch, 512 + why.len);
@@ -1224,7 +1982,6 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
         resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
         return 1;
     }
-    arm(s, T_ASK, delay);
     setstate(s, S_ASK);
     return 0;
 }
@@ -1425,13 +2182,288 @@ static void nexttool(Session *s, Arena scratch)
 }
 
 
+// Compaction (compact.cpp)
+
+static void countbytes(Session *s)
+{
+    s->bytes = 0;
+    for (iz i = 0; i < s->history.len; i++) {
+        s->bytes += msgbytes(&s->history[i]);
+    }
+}
+
+// Replace the history before cutseq by a checkpoint with the summary,
+// numbered seq, as compacting does, and replaying its record.
+static void summarize(Session *s, Str summary, i64 cutseq, i64 seq)
+{
+    Msg ck = {};
+    ck.role = ROLE_USER;
+    ck.text = checkpoint(&s->perm, summary);
+    ck.seq  = seq;
+    Slice<Msg> h = {};
+    h = push(&s->perm, h, ck);
+    for (iz i = 0; i < s->history.len; i++) {
+        if (s->history[i].seq >= cutseq) {
+            h = push(&s->perm, h, s->history[i]);
+        }
+    }
+    s->history = h;
+    s->summary = summary;
+    countbytes(s);
+}
+
+// Replace a tool result's text, as pruning does.
+static void elide(Session *s, i64 seq, Str text)
+{
+    for (iz i = 0; i < s->history.len; i++) {
+        Msg *m = &s->history[i];
+        if (m->seq==seq && m->role==ROLE_TOOL) {
+            m->text = text;
+        }
+    }
+}
+
+// Where a pruned result's full output is: the command's spill file, or
+// for any other tool a file of the result itself, written now, in the
+// session's out/ directory. Null if none could be had.
+static Str fulloutput(Session *s, Arena *a, Arena scratch, Msg *m)
+{
+    Engine *e = s->e;
+    if (m->spill.len) {
+        return join(a, s->dir, m->spill);
+    }
+    for (i32 n = 1; n <= 100; n++) {
+        Buf rel(&scratch, 128);
+        print(&rel, "out/");
+        print(&rel, m->callid.len ? m->callid : Str("result"));
+        if (n > 1) {
+            putbyte(&rel, '-');
+            print(&rel, (i64)n);
+        }
+        print(&rel, ".log");
+        Str path = join(&scratch, s->dir, finish(&rel));
+        if (os_stat(e->os, scratch, path).type == STAT_MISSING) {
+            return os_write(e->os, scratch, path, m->text) ? clone(a, path) : Str{};
+        }
+    }
+    return {};
+}
+
+static void compactevent(Session *s, EvOut *w, Str kind, b32 overflow,
+                         i64 before)
+{
+    putintkey(&w->json, "turn", s->turn);
+    putstrkey(&w->json, "kind", kind);
+    putstrkey(&w->json, "why", overflow ? Str("overflow") : Str("threshold"));
+    putintkey(&w->json, "before", before);
+    putintkey(&w->json, "after", estimate(s));
+}
+
+// Elide old tool outputs (pickprune), logging which, so that a replay
+// elides them alike. Returns 1 if it did.
+static b32 prune(Session *s, Arena scratch, b32 overflow)
+{
+    Prune pr = pickprune(&scratch, s->history, s->rate);
+    if (!pr.idx.len) {
+        return 0;
+    }
+    i64        before = estimate(s);
+    Slice<iz>  done   = {};
+    for (iz i = 0; i < pr.idx.len; i++) {
+        Msg *m    = &s->history[pr.idx[i]];
+        Str  path = fulloutput(s, &s->perm, scratch, m);
+        if (path.len) {
+            m->text = elision(&s->perm, tokensof(s->rate, m->text.len), path);
+            done    = push(&scratch, done, pr.idx[i]);
+        }
+    }
+    if (!done.len) {
+        return 0;
+    }
+    countbytes(s);
+
+    Buf   b(&scratch, 256 + 256*done.len);
+    EvOut w = sbegin(s, &b, EV_COMPACT);
+    compactevent(s, &w, "prune", overflow, before);
+    putkey(&w.json, "elided");
+    putarray(&w.json);
+    for (iz i = 0; i < done.len; i++) {
+        Msg *m = &s->history[done[i]];
+        putobject(&w.json);
+        putintkey(&w.json, "seq", m->seq);
+        putstrkey(&w.json, "text", m->text);
+        putend(&w.json);
+    }
+    putend(&w.json);
+    ssend(s, &w);
+    return 1;
+}
+
+// The compactor: [model] compactor, MODEL at the session's endpoint or
+// ENDPOINT/MODEL, else the session's own model.
+static void compactor(Session *s, Arena scratch, Compact *cp)
+{
+    Engine *e     = s->e;
+    Str     spec  = trim(cfgget(e->cfg, "model", s->model, "compactor", 0));
+    Str     which = s->ep.name.len ? s->ep.name : s->ep.url;
+    Str     model = spec.len ? spec : s->model;
+    Cut     c     = cut(spec, '/');
+    if (c.ok && c.tail.len && trim(cfgget(e->cfg, "endpoint", c.head, "url", 0)).len) {
+        which = c.head;
+        model = c.tail;
+    }
+    if (!endpointconf(e, &s->perm, which, &cp->ep)) {
+        cp->ep = s->ep;
+        model  = s->model;
+    }
+    cp->model = clone(&s->perm, model);
+    if (cp->model==s->model && cp->ep.url==s->ep.url) {
+        cp->mc = s->mc;  // with what discovery learned
+        return;
+    }
+    modelconf(e, &s->perm, cp->model, &cp->mc);
+    i64 *k = upsert(&e->kinds, kindkey(&scratch, cp->ep.url, cp->model), (Arena *)0);
+    cp->mc.llamacpp = k && (*k&1);
+}
+
+// Make room in the context: prune old tool outputs, and if the prompt
+// is still not under enough tokens, summarize the older messages so
+// that it comes to goal. The step goes on (proceed) once there is room,
+// or else the turn ends saying why.
+static void compact(Session *s, Arena scratch, i64 enough, i64 goal, b32 overflow)
+{
+    Engine *e = s->e;
+    if (prune(s, scratch, overflow) && estimate(s)<enough) {
+        proceed(s, scratch);
+        return;
+    }
+
+    // What stays verbatim: the newest messages, up to what the goal
+    // leaves after the fixed prompt and the summary
+    i64 before = estimate(s);
+    iz  start  = s->summary.len ? 1 : 0;
+    i64 fixed  = tokensof(s->rate, s->system.len + s->tools.len);
+    i64 keep   = goal - fixed - sumbudget(goal);
+    keep = keep<COMPACT_KEEP ? keep : COMPACT_KEEP;
+    iz  kept   = keep>0 ? cutpoint(s->history, start, s->rate, keep) : s->history.len;
+    if (fixed+512>=goal || kept<=start) {
+        Buf b(&scratch, 256);
+        print(&b, overflow ? Str("overflow: the") : Str("the"));
+        print(&b, " conversation, about ");
+        print(&b, before);
+        print(&b, " tokens, must come under ");
+        print(&b, goal);
+        print(&b, ", and compacting cannot make that much room");
+        Str err = finish(&b);
+        endturn(s, scratch, "error", err);
+        return;
+    }
+
+    Compact cp = {};
+    compactor(s, scratch, &cp);
+    cp.goal     = goal;
+    cp.overflow = overflow;
+    cp.before   = before;
+    cp.start    = start;
+    cp.cut      = kept;
+    cp.began    = os_ticks(e->os);
+    s->cp       = cp;
+    s->purpose  = REQ_COMPACT;
+    s->retries  = 0;
+    request(s, scratch);
+}
+
+static void sendcompact(Session *s, Arena scratch)
+{
+    static i32 const pct[] = {70, 50, 35};
+    Compact *cp    = &s->cp;
+    iz       limit = cp->shrink ? cp->rejected*pct[cp->shrink-1]/100 : 0;
+    newattempt(s);
+
+    // The request goes into the attempt arena, temporaries into scratch
+    Str prev  = summarytext(s->summary);
+    Str convo = transcript(&s->attempt, scratch, s->history, cp->start,
+                           cp->cut, limit);
+    i64 words = sumbudget(cp->goal) * 3/4;
+    Str body  = encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words);
+    Str url   = apiurl(&scratch, cp->ep.url, "chat/completions");
+    cp->inbytes = convo.len;
+    if (!startreq(s, scratch, &cp->ep, "POST", url, body, "text/event-stream", 0)) {
+        Str err = os_lasterr(s->e->os, &scratch);
+        err = concat(&scratch, "cannot start a request: ", err);
+        endturn(s, scratch, "error", err);
+        return;
+    }
+    arm(s, T_FIRSTBYTE, cp->ep.firstbyte);
+    setstate(s, S_HEAD);
+}
+
+// The summary arrived: rebuild the history around it, log it, and carry
+// on with the step, unless the prompt is still above the goal after a
+// compaction at the threshold (the progress guard): compacting again
+// would make no headway, so the turn ends instead.
+static void compacted(Session *s, Arena scratch, Partial *p)
+{
+    Engine *e    = s->e;
+    Compact cp   = s->cp;
+    Str     text = trim(summarytext(trim(finish(&p->text))));
+    if (!text.len) {
+        failcompact(s, scratch, CLASS_TRANSIENT, 0, "the summary was empty", -1);
+        return;
+    }
+    iz most = bytesof(s->rate, COMPACT_SUMMAX);
+    text = text.len>most ? utf8head(text, most) : text;
+    Files f = summaryfiles(&scratch, s->summary);
+    f = addfiles(&scratch, f, s->history, cp.start, cp.cut);
+    Str summary = withfiles(&s->perm, text, f);
+    i64 cutseq  = cp.cut<s->history.len ? s->history[cp.cut].seq : s->log.seq+1;
+    summarize(s, summary, cutseq, s->log.seq+1);
+
+    Buf   b(&scratch, 512 + summary.len*2);
+    EvOut w = sbegin(s, &b, EV_COMPACT);
+    compactevent(s, &w, "summary", cp.overflow, cp.before);
+    putintkey(&w.json, "cutseq", cutseq);
+    putstrkey(&w.json, "summary", summary);
+    putstrkey(&w.json, "endpoint", cp.ep.url);
+    putstrkey(&w.json, "model", cp.model);
+    putintkey(&w.json, "ms", (os_ticks(e->os) - cp.began)/MS);
+    ssend(s, &w);
+    s->purpose = REQ_CHAT;
+    s->cp      = {};
+    setstate(s, S_IDLE);
+
+    i64 after = estimate(s);
+    if (!cp.overflow && after>cp.goal) {
+        Buf t(&scratch, 512);
+        print(&t, "Compacting left the conversation at about ");
+        print(&t, after);
+        print(&t, " tokens, above 80% of the ");
+        print(&t, compactat(s->mc.ctx));
+        print(&t, " tokens at which it compacts, so the turn ends here "
+                  "rather than compact over and over. Start a new session, "
+                  "or use a model with a larger context.");
+        Str why = finish(&t);
+        note(s, scratch, "error", why);
+        endturn(s, scratch, "error", "compacting did not make enough room");
+        return;
+    }
+    proceed(s, scratch);
+}
+
+
 // Steps and turns
 
 static void finalize(Session *s, Arena scratch)
 {
     Partial *p = s->part;
     stopreq(s);
-    s->part = 0;
+    s->part     = 0;
+    s->slowfrom = 0;  // a response: the outage, if any, is over
+    s->slown    = 0;
+    if (s->purpose == REQ_COMPACT) {
+        compacted(s, scratch, p);
+        return;
+    }
     Finished f  = finishpartial(&s->perm, p, 1, s->turn, s->steps);
     Str      fr = p->finish.data ? p->finish : Str("stop");
     addassistant(s, scratch, f.blocks, fr, p->hasusage ? &p->usage : 0);
@@ -1462,6 +2494,20 @@ static void finalize(Session *s, Arena scratch)
                        "a tool, or reply with your answer.";
             if (!nudge(s, scratch, N_EMPTY, text)) {
                 endturn(s, scratch, "error", "the model kept returning empty responses");
+                return;
+            }
+            prepare(s, scratch);
+        } else if (announces(finish(&p->text))) {
+            // It said it would go on, but stopped: remind it, a few
+            // times, and past that let the turn end as it chose
+            Str text = "Your response says you will continue, but it ended "
+                       "without a tool call, so nothing was done. If there is "
+                       "more to do, do it now with a tool call; if the task "
+                       "is finished, give your final answer.";
+            if (!nudge(s, scratch, N_STOP, text)) {
+                note(s, scratch, "warn", "the agent kept announcing work it "
+                     "did not do, so its turn ends here");
+                endturn(s, scratch, "done", {});
                 return;
             }
             prepare(s, scratch);
@@ -1506,24 +2552,12 @@ static void prepare(Session *s, Arena scratch)
         return;
     }
 
-    i64 estimate = s->used + s->added/4;
-    if (s->mc.ctx && estimate>s->mc.ctx) {
-        Buf b(&scratch, 160);
-        print(&b, "the conversation (about ");
-        print(&b, estimate);
-        print(&b, " tokens) no longer fits the model's context of ");
-        print(&b, s->mc.ctx);
-        print(&b, " tokens");
-        Str err = finish(&b);
-        endturn(s, scratch, "error", err);
-        return;
+    s->overflows = 0;
+    s->ovsize    = 0;
+    if (s->target && os_ticks(s->e->os)>=s->homeat) {
+        gohome(s, scratch, "its cooldown is over");
     }
-
-    if (!s->discovered) {
-        discover(s, scratch);
-        return;
-    }
-    sendchat(s, scratch);
+    proceed(s, scratch);
 }
 
 // A session's title from its first prompt: one line, each run of
@@ -1609,11 +2643,21 @@ static void startturn(Session *s, Arena scratch, Str text, Str via)
 
 static void endturn(Session *s, Arena scratch, Str why, Str err)
 {
+    release(s, 0);
     stopreq(s);
+    if (s->point) {
+        admcool(s->point, s->slotmodel);  // no next step to keep it for
+        pump(s->e, s->point);
+    }
     for (i32 t = 0; t < T_COUNT; t++) {
         disarm(s, t);
     }
-    s->part = 0;
+    s->part     = 0;
+    s->purpose  = REQ_CHAT;
+    s->cp       = {};
+    s->slowing  = 0;
+    s->slowfrom = 0;
+    s->slown    = 0;
     {
         Arena a = scratch;
         Buf   b(&a, 256 + err.len);
@@ -1665,7 +2709,7 @@ static void cancelturn(Session *s, Arena scratch)
     case S_HEAD:
     case S_STREAM:
     case S_ERRBODY:
-        if (s->part && committed(s->part)) {
+        if (s->purpose==REQ_CHAT && s->part && committed(s->part)) {
             s->part->calls = {};
             Finished f = finishpartial(&s->perm, s->part, 1, s->turn, s->steps);
             if (f.blocks.len) {
@@ -1772,6 +2816,8 @@ static void modelconf(Engine *e, Arena *perm, Str model, ModelConf *mc)
     }
     Int ctx = parseint(trim(cfgget(cfg, "model", model, "context", 0)));
     mc->ctx = ctx.ok && ctx.val>0 ? ctx.val : 0;
+    Int rb  = parseint(trim(cfgget(cfg, "model", model, "reasoning_budget", 0)));
+    mc->thinkmax = rb.ok && rb.val>0 ? rb.val : 0;
 }
 
 static Session *newsession(Engine *e, Arena scratch, Str sid)
@@ -1841,7 +2887,9 @@ static Guard sessionguard(Session *s, Arena *perm)
 static void sessionready(Session *s)
 {
     Engine *e = s->e;
-    s->system = systemprompt(&s->perm, s->cwd, &s->te);
+    s->home      = s->ep.name.len ? s->ep.name : s->ep.url;
+    s->homemodel = s->model;
+    s->system    = systemprompt(&s->perm, s->cwd, &s->te);
     s->tools  = tooljson(&s->perm, &s->te);
     s->guard  = sessionguard(s, &s->perm);
     // Tell the agent about the other places it may work
@@ -2040,9 +3088,24 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         case EV_NUDGE:
             m.role = ROLE_USER;
             m.text = clone(&s->perm, jsonstr(jsonget(j, "text")));
+            m.seq  = r.seq;
             addmsg(s, m);
             break;
+        case EV_COMPACT: {
+            // As compacting rewrote the history then
+            for (Json *x = jsonget(j, "elided")->child; x; x = x->next) {
+                Str text = clone(&s->perm, jsonstr(jsonget(x, "text")));
+                elide(s, jsonint(jsonget(x, "seq"), 0), text);
+            }
+            Json *sum = jsonget(j, "summary");
+            if (sum->type == JSON_STRING) {
+                Str summary = clone(&s->perm, jsonstr(sum));
+                summarize(s, summary, jsonint(jsonget(j, "cutseq"), 0), r.seq);
+            }
+            countbytes(s);
+        } break;
         case EV_ASSISTANT:
+            m.seq  = r.seq;
             m.role = ROLE_ASSISTANT;
             for (Json *k = jsonget(j, "blocks")->child; k; k = k->next) {
                 Block b = {};
@@ -2061,6 +3124,8 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             m.role   = ROLE_TOOL;
             m.callid = clone(&s->perm, jsonstr(jsonget(j, "call")));
             m.text   = clone(&s->perm, jsonstr(jsonget(j, "text")));
+            m.spill  = clone(&s->perm, jsonstr(jsonget(j, "spill")));
+            m.seq    = r.seq;
             addmsg(s, m);
             break;
         }
@@ -2088,7 +3153,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
 static void sendsnapshot(Session *s, Arena scratch)
 {
     Partial *p = s->part;
-    if (!p || !requesting(s->state)) {
+    if (!p || !requesting(s->state) || s->purpose!=REQ_CHAT) {
         return;
     }
     iz budget = mailmax(s->e->out) / 8;
@@ -2478,20 +3543,6 @@ static Session *sessionbyid(Engine *e, u64 id, b32 proc)
     return 0;
 }
 
-static i32 get32(Str s)
-{
-    i32 v = 0;
-    if (s.len >= 4) __builtin_memcpy(&v, s.data, 4);
-    return v;
-}
-
-static i64 get64(Str s)
-{
-    i64 v = 0;
-    if (s.len >= 8) __builtin_memcpy(&v, s.data, 8);
-    return v;
-}
-
 static void onrecord(Engine *e, Arena scratch, Record r)
 {
     if (r.type == MAIL_CMD) {
@@ -2499,6 +3550,8 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         return;
     } else if (r.type == MAIL_TOOLONG) {
         reply(e, scratch, (i64)r.id, 0, "command too long", {});
+        return;
+    } else if (onprobe(e, scratch, r) || onctl(e, scratch, r)) {
         return;
     }
 
@@ -2568,17 +3621,17 @@ static void ontimer(Session *s, Arena scratch, i32 t)
         }
         // Messages are complete before scratch is passed on, which copies
         // it: an argument allocated in it alongside would be overwritten
-        msg = concat(&scratch, "no response within ", secstr(&scratch, s->ep.firstbyte));
+        msg = concat(&scratch, "no response within ", secstr(&scratch, reqep(s)->firstbyte));
         msg = concat(&scratch, msg, " s");
         fail(s, scratch, CLASS_TRANSIENT, 0, msg, -1);
         return;
     case T_IDLE:
-        msg = concat(&scratch, "no data for ", secstr(&scratch, s->ep.idle));
+        msg = concat(&scratch, "no data for ", secstr(&scratch, reqep(s)->idle));
         msg = concat(&scratch, msg, " s");
         fail(s, scratch, CLASS_TRANSIENT, 0, msg, -1);
         return;
     case T_PROGRESS:
-        msg = concat(&scratch, "no progress for ", secstr(&scratch, s->ep.progress));
+        msg = concat(&scratch, "no progress for ", secstr(&scratch, reqep(s)->progress));
         msg = concat(&scratch, msg, " s");
         fail(s, scratch, CLASS_TRANSIENT, 0, msg, -1);
         return;
@@ -2586,7 +3639,17 @@ static void ontimer(Session *s, Arena scratch, i32 t)
         finalize(s, scratch);
         return;
     case T_BACKOFF:
-        sendchat(s, scratch);
+        if (s->slowing) {
+            // After a slow wait, start over from the primary
+            s->slowing = 0;
+            gohome(s, scratch, "a slow retry");
+            proceed(s, scratch);
+        } else {
+            request(s, scratch);
+        }
+        return;
+    case T_ADMIT:
+        sendreq(s, scratch);
         return;
     case T_TOOL:
         s->sh.timedout = 1;
@@ -2617,6 +3680,7 @@ static void enginethread(void *arg)
     for (;;) {
         i64 now  = os_ticks(e->os);
         i64 next = e->quitting ? e->quitby : I64MAX;
+        next = e->admat && e->admat<next ? e->admat : next;
         for (Session *s = e->sessions; s; s = s->next) {
             for (i32 t = 0; t < T_COUNT; t++) {
                 if (s->timers[t] && s->timers[t]<next) next = s->timers[t];
@@ -2647,6 +3711,13 @@ static void enginethread(void *arg)
                     s->timers[t] = 0;
                     ontimer(s, newarena(e->scratch), t);
                 }
+            }
+        }
+        if (e->admat && e->admat<=now) {
+            // Time alone lets a queued request go
+            e->admat = 0;
+            for (AdmPoint *p = e->adm.points; p; p = p->next) {
+                pump(e, p);
             }
         }
 
@@ -2737,6 +3808,9 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
         e->home = os_getenv(os, &e->perm, "USERPROFILE");
     }
     loadtrained(e, newarena(e->scratch));
+    // Tests shorten minutes of slow retries to milliseconds
+    Int minute = parseint(os_getenv(os, &e->perm, "HARNESS_TEST_MINUTE_MS"));
+    e->minute  = minute.ok && minute.val>0 && minute.val<=60000 ? minute.val*MS : 60*SEC;
     return e;
 }
 

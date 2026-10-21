@@ -102,7 +102,9 @@ static void test_provider(Test *t)
             {404, "", CLASS_DETERMINISTIC},
             {408, "", CLASS_TRANSIENT},
             {429, "slow down", CLASS_TRANSIENT},
-            {429, "{\"error\":{\"details\":{\"error_code\":\"enforced_spend_limit_reached\"}}}", CLASS_FATAL},
+            {429, "{\"error\":{\"details\":{\"error_code\":\"enforced_spend_limit_reached\"}}}", CLASS_LIMIT},
+            {429, "You exceeded your current quota", CLASS_LIMIT},
+            {402, "", CLASS_LIMIT},
             {502, "", CLASS_TRANSIENT},
             {503, "Loading model", CLASS_TRANSIENT},
             {529, "overloaded", CLASS_TRANSIENT},
@@ -192,6 +194,64 @@ static void test_provider(Test *t)
         expect(t, "models missing", istr(a, m.found), "0");
         m = parsemodels(*a, "not json", "gemma", 0);
         expect(t, "models garbage", istr(a, m.found), "0");
+
+        // Slots, the concurrency the scheduler allows a model
+        expect(t, "models slots", istr(a, parsemodels(*a, loaded, "gemma", 0).slots), "8");
+        expect(t, "models slots -np", istr(a, parsemodels(*a, loaded, "split", 0).slots), "4");
+        expect(t, "models slots unknown", istr(a, parsemodels(*a, loaded, "yarn", 0).slots), "0");
+    }
+
+    // Overflow errors: the sizes they report
+    {
+        struct { Str body; i64 prompt, ctx; } cases[] = {
+            {"{\"error\":{\"code\":400,\"type\":\"exceed_context_size_error\","
+             "\"message\":\"request (40000 tokens) exceeds the available context "
+             "size (32768 tokens)\",\"n_prompt_tokens\":40000,\"n_ctx\":32768}}",
+             40000, 32768},
+            {"{\"error\":{\"message\":\"This model's maximum context length is "
+             "8192 tokens. However, you requested 9000 tokens (8000 in the "
+             "messages, 1000 in the completion).\"}}", 8000, 8192},
+            {"maximum context length is 4096 tokens", 0, 4096},
+            {"prompt is too long", 0, 0},
+            {"", 0, 0},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Overflow o = overflowsizes(*a, cases[i].body);
+            Str got  = concat(a, concat(a, istr(a, o.prompt), " "), istr(a, o.ctx));
+            Str want = concat(a, concat(a, istr(a, cases[i].prompt), " "),
+                              istr(a, cases[i].ctx));
+            expect(t, concat(a, "overflowsizes ", cases[i].body), got, want);
+        }
+        expect(t, "rooturl", rooturl(a, "http://h/v1/", "props"), "http://h/props");
+        expect(t, "rooturl path", rooturl(a, "http://h/r1/", "props"), "http://h/r1/props");
+    }
+
+    // Unexpected stops: final responses that announce work, and some
+    // that only sound like it
+    {
+        struct { Str text; b32 want; } cases[] = {
+            {"Let me run the tests now.", 1},
+            {"Looked at it. Next, I will check the output:", 1},
+            {"Done with the parser.\n\nI'll now run the build.", 1},
+            {"**I'm going to fix it.**", 1},
+            {"It says hello. Now I\xe2\x80\x99ll check the rest", 1},
+            {"Let me check main.c now.", 1},
+            {"The config is wrong. Let's fix it.", 1},
+            {"Here is the plan:", 1},
+            {"Hello! This is a plain answer.", 0},
+            {"All done. Let me know if you need more.", 0},
+            {"Should I run the tests?", 0},
+            {"If you want, I'll run the benchmarks.", 0},
+            {"I'll run it once you confirm", 0},
+            {"The outlet media server works.", 0},
+            {"Let me run the tests.\n\nAll 12 tests pass.", 0},
+            {"", 0},
+            {"   ", 0},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            expect(t, concat(a, "announces ", cases[i].text),
+                   istr(a, announces(cases[i].text)), istr(a, cases[i].want));
+        }
     }
 
     // Arguments
@@ -338,9 +398,11 @@ static void test_provider(Test *t)
         Extra x = {"temperature", "0.7"};
         mc.extras = {&x, 1, 1};
         Str three = encodechat(a, tmp, &r);
-        expect(t, "no reasoning sent back", istr(a, find(three, "reasoning")), "-1");
+        expect(t, "no reasoning sent back",
+               istr(a, find(three, "reasoning_content")), "-1");
         expect(t, "llama.cpp and sampling extras",
-               istr(a, endswith(three, ",\"return_progress\":true,\"temperature\":0.7}")), "1");
+               istr(a, endswith(three, ",\"return_progress\":true,"
+                                "\"reasoning_control\":true,\"temperature\":0.7}")), "1");
     }
 
     // Cycles

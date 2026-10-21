@@ -337,6 +337,8 @@ static Arena newarena(Region *r)
 #include "tools.cpp"
 #include "guard.cpp"
 #include "config.cpp"
+#include "admit.cpp"
+#include "compact.cpp"
 #include "engine.cpp"
 #include "cli.cpp"
 #include "selftest.cpp"
