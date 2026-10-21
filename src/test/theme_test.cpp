@@ -58,6 +58,7 @@ static void test_theme(Test *t)
         P(text, userbg), P(dim, userbg), P(link, userbg), P(code, userbg),
         P(codetext, codebg), P(text, headerbg), P(text, sel),
         P(text, toolbg), P(dim, toolbg), P(summary, toolbg),
+        P(code, toolbg), P(link, toolbg), P(summary, panel),
         P(text, askbg), P(dim, askbg), P(summary, askbg),
         P(ok, panel), P(bad, panel), P(amber, panel), P(active, panel),
         P(ok, toolbg), P(bad, toolbg), P(amber, toolbg), P(active, toolbg),

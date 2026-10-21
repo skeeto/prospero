@@ -12,7 +12,7 @@ static View *testview(Arena *a)
 static Str msgsshow(Arena *a, View *v)
 {
     Buf b(a, 256);
-    static char const roles[] = "UATXNK";
+    static char const roles[] = "UATXNKCR";
     for (iz i = 0; i < v->msgs.len; i++) {
         ViewMsg *m = &v->msgs[i];
         putbyte(&b, (u8)roles[m->role]);
@@ -531,5 +531,233 @@ static void test_view(Test *t)
         viewdump(&y, want);
         expect(t, "view.resync", finish(&x), finish(&y));
         expect(t, "view.overflowed", istr(&a, lost>0), "1");
+    }
+}
+
+// The M4 records: the panels' todo list, jobs, snapshots and rewinds,
+// instruction files; cards for compactions and rewinds; notices; turns
+// a session began by itself; the liveness of queues, subagents and
+// fallbacks.
+static void test_viewpanels(Test *t)
+{
+    Arena perm = t->perm;
+
+    // A subagent's session record, and its todo list replaced whole,
+    // its row folded with counts, the list as a string of JSON too
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"k","seq":1,"ts":0,"ev":"session","cwd":"/w","role":"explore",)"
+                    R"("model":"m","endpoint":"u","parent":"p","call":"c7","depth":1,)"
+                    R"("tools":["read","grep"],"prompt":"Look."})");
+        expect(t, "panels.parent", concat(&a, concat(&a, v->parent, " "), v->pcall), "p c7");
+        expect(t, "panels.tools", v->tools, "read grep");
+        expect(t, "panels.depth", istr(&a, v->depth), "1");
+        apply(v, a, R"({"sid":"k","seq":2,"ts":0,"ev":"assistant","turn":1,"attempt":1,)"
+                    R"("blocks":[{"t":"call","id":"c1","name":"todo_write","args":)"
+                    R"("{\"todos\":\"[{\\\"content\\\":\\\"a\\\",\\\"status\\\":\\\"done\\\"},)"
+                    R"({\\\"content\\\":\\\"b\\\",\\\"status\\\":\\\"in_progress\\\"}]\"}"}]})");
+        expect(t, "panels.todorow", msgsshow(&a, v),
+               "X[todo_write 2 items, 1 done, 1 in progress called]:;");
+        expect(t, "panels.todofolded", istr(&a, v->msgs[0].collapsed), "1");
+        apply(v, a, R"({"sid":"k","seq":3,"ts":0,"ev":"todo","call":"c1","items":[)"
+                    R"({"content":"a","status":"done"},{"content":"b","status":"in_progress"},)"
+                    R"({"content":"c","status":"pending"}]})");
+        Buf b(&a, 64);
+        for (iz i = 0; i < v->todos.len; i++) {
+            print(&b, v->todos[i].content);
+            print(&b, (i64)v->todos[i].status);
+        }
+        expect(t, "panels.todo", finish(&b), "a2b1c0");
+        apply(v, a, R"({"sid":"k","seq":4,"ts":0,"ev":"todo","call":"c2","items":[]})");
+        expect(t, "panels.todoempty", istr(&a, v->todos.len), "0");
+    }
+
+    // Jobs: started, their output, ended; the row names its job, and
+    // a stopped engine leaves none running
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"assistant","turn":1,"attempt":1,)"
+                    R"("blocks":[{"t":"call","id":"c1","name":"shell","args":"{\"command\":\"x\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"tool.start","call":"c1","name":"shell","args":"{}"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":1000,"ev":"job.start","job":1,"call":"c1",)"
+                    R"("command":"make\nmore","spill":"out/c1.log","deadline":9000})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"tool.end","call":"c1","status":"ok",)"
+                    R"("text":"Started background job 1.","job":1,"ms":3})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"job.start","job":2,"call":"c2",)"
+                    R"("command":"b","spill":"out/c1b.log","deadline":9000})");
+        b32 out = apply(v, a, R"({"sid":"s","ts":0,"ev":"job.out","job":1,"call":"c1","tail":"one\ntwo\n","bytes":8})");
+        ViewJob *j = findjob(v, 1);
+        expect(t, "panels.jobout", concat(&a, istr(&a, out), Str{j->tail, j->taillen}), "1one\ntwo\n");
+        expect(t, "panels.jobsummary", j->summary, "make\xe2\x80\xa6");
+        expect(t, "panels.jobrun", istr(&a, v->jobsrun), "2");
+        expect(t, "panels.jobrow", istr(&a, v->msgs[0].tool->job*10 + v->msgs[0].collapsed), "11");
+        apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"job.end","job":1,"call":"c1","status":"exited",)"
+                    R"("exit":0,"bytes":8,"spill":"out/c1.log","ms":500,"notice":1,"resume":0})");
+        out = apply(v, a, R"({"sid":"s","ts":0,"ev":"job.out","job":1,"call":"c1","tail":"late","bytes":9})");
+        expect(t, "panels.jobended", concat(&a, istr(&a, out), vjobnames[j->status]), "0exited");
+        expect(t, "panels.jobexit", istr(&a, j->hasexit*10 + j->exit + j->ms), "510");
+        viewstopped(v);
+        expect(t, "panels.jobstopped", vjobnames[findjob(v, 2)->status], "unknown");
+        expect(t, "panels.jobnone", istr(&a, v->jobsrun), "0");
+    }
+
+    // Snapshots and rewinds: the files a rewind would put back, by call
+    // and by turn, then a rewind's card, its conflicts, and the undone
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w","model":"m"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"user","text":"go","via":"prompt"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"turn","n":1})");
+        expect(t, "panels.startsturn", istr(&a, v->msgs[0].startsturn), "1");
+        char const *calls[] = {
+            R"({"sid":"s","seq":4,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+            R"({"t":"call","id":"w1","name":"write","args":"{\"path\":\"/w/a\"}"},)"
+            R"({"t":"call","id":"e1","name":"edit","args":"{\"path\":\"/w/a\"}"},)"
+            R"({"t":"call","id":"w2","name":"write","args":"{\"path\":\"/w/b\"}"}]})",
+            R"({"sid":"s","seq":5,"ts":0,"ev":"tool.start","call":"w1","name":"write","args":"{}"})",
+            R"({"sid":"s","seq":6,"ts":0,"ev":"snap","call":"w1","path":"/w/a","snap":"snap/1","existed":0})",
+            R"({"sid":"s","seq":7,"ts":0,"ev":"tool.end","call":"w1","status":"ok","text":"Created."})",
+            R"({"sid":"s","seq":8,"ts":0,"ev":"tool.start","call":"e1","name":"edit","args":"{}"})",
+            R"({"sid":"s","seq":9,"ts":0,"ev":"snap","call":"e1","path":"/w/a","snap":"snap/2","existed":1})",
+            R"({"sid":"s","seq":10,"ts":0,"ev":"tool.end","call":"e1","status":"error","text":"x"})",
+            R"({"sid":"s","seq":11,"ts":0,"ev":"tool.start","call":"w2","name":"write","args":"{}"})",
+            R"({"sid":"s","seq":12,"ts":0,"ev":"snap","call":"w2","path":"/w/b","snap":"snap/3","existed":1})",
+            R"({"sid":"s","seq":13,"ts":0,"ev":"tool.end","call":"w2","status":"ok","text":"Replaced."})",
+            R"({"sid":"s","seq":14,"ts":0,"ev":"turn.end","turn":1,"why":"done"})",
+        };
+        for (iz i = 0; i < countof(calls); i++) {
+            Str line = {(u8 *)calls[i], (iz)__builtin_strlen(calls[i])};
+            apply(v, a, line);
+        }
+        Slice<ViewSnap> s = rewindset(v, &a, "e1", 0);
+        Buf b(&a, 64);
+        for (iz i = 0; i < s.len; i++) {
+            print(&b, s[i].path);
+            print(&b, (i64)s[i].existed);
+        }
+        expect(t, "panels.rewindcall", finish(&b), "/w/b1/w/a1");
+        s = rewindset(v, &a, {}, 1);
+        b.len = 0;
+        for (iz i = 0; i < s.len; i++) {
+            print(&b, s[i].path);
+            print(&b, (i64)s[i].existed);
+        }
+        expect(t, "panels.rewindturn", finish(&b), "/w/b1/w/a0");
+        expect(t, "panels.turnrewinds", istr(&a, turnrewinds(v, 1)*10 + turnrewinds(v, 2)), "10");
+        apply(v, a, R"({"sid":"s","seq":15,"ts":0,"ev":"rewind","to":"w2","force":0,)"
+                    R"("files":[{"path":"/w/b","result":"conflict"}],"undone":[],"note":"n"})");
+        ViewMsg *c = &v->msgs[v->msgs.len-1];
+        expect(t, "panels.rewindcard", concat(&a, c->card->to, istr(&a, c->card->conflicts)), "w21");
+        expect(t, "panels.rewindtext", c->text,
+               "- `b`: **conflict**, left as it is: something else changed it after "
+               "the harness did\n\n*n*\n");
+        v->foot = 10;
+        expect(t, "panels.rewindfoot", istr(&a, (i64)msgfoot(v, c)), "10");
+        apply(v, a, R"({"sid":"s","seq":16,"ts":0,"ev":"rewind","to":1,"force":1,)"
+                    R"("files":[{"path":"/w/b","result":"restored"},{"path":"/w/a","result":"removed"}],)"
+                    R"("undone":["snap/3","snap/2","snap/1"],"note":""})");
+        c = &v->msgs[v->msgs.len-1];
+        expect(t, "panels.forced", istr(&a, c->card->turn*100 + c->card->count*10 + c->card->force), "121");
+        expect(t, "panels.oldcard", istr(&a, (i64)msgfoot(v, &v->msgs[v->msgs.len-2])), "0");
+        expect(t, "panels.undone", istr(&a, rowsnap(v, v->msgs[1].tool)->undone), "1");
+        expect(t, "panels.nothing", istr(&a, rewindset(v, &a, {}, 1).len + turnrewinds(v, 1)), "0");
+    }
+
+    // Compactions as cards: a pruning that marks the rows it elided, and
+    // a summary of the messages before its cut
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"go"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"assistant","turn":1,"attempt":1,)"
+                    R"("blocks":[{"t":"call","id":"r1","name":"read","args":"{\"path\":\"f\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"tool.start","call":"r1","name":"read","args":"{}"})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"tool.end","call":"r1","status":"ok","text":"x"})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"compact","turn":1,"kind":"prune","why":"threshold",)"
+                    R"("before":900,"after":400,"elided":[{"seq":4,"text":"[output elided: 9 tokens]"}]})");
+        ViewMsg *c = &v->msgs[v->msgs.len-1];
+        expect(t, "panels.prune", c->text, "- **read** `f`: `[output elided: 9 tokens]`\n");
+        expect(t, "panels.elided", istr(&a, v->msgs[1].tool->elided + c->collapsed*10 + c->fold*100), "111");
+        apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"compact","turn":1,"kind":"summary","why":"overflow",)"
+                    R"("before":500,"after":100,"cutseq":5,"summary":"## Goal\nGo.","model":"m","ms":7})");
+        c = &v->msgs[v->msgs.len-1];
+        expect(t, "panels.summary", concat(&a, c->text, istr(&a, c->card->count)), "## Goal\nGo.2");
+        expect(t, "panels.cut", concat(&a, c->card->why, istr(&a, v->cutseq)), "overflow5");
+    }
+
+    // A turn the session began by itself, its notice folded; liveness
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w","model":"m"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1,"via":"job"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"notice","kind":"job","job":3,"text":"Job 3 ended."})");
+        expect(t, "panels.resumed", msgsshow(&a, v),
+               "N:A background job ended, so the agent went on without a prompt.;N:Job 3 ended.;");
+        expect(t, "panels.resumeturn", istr(&a, v->msgs[0].startsturn), "1");
+        expect(t, "panels.notice", concat(&a, v->msgs[1].label, istr(&a, v->msgs[1].collapsed)),
+               "To the agent: job 3 ended1");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"user","text":"wait","via":"steer"})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"turn","n":2})");
+        expect(t, "panels.steerturn", istr(&a, v->msgs[2].startsturn), "0");
+        b32 ch = apply(v, a, R"({"sid":"s","ts":0,"ev":"live","state":"queued","queue_pos":2,"queue_len":3})");
+        expect(t, "panels.queued", istr(&a, ch*1000 + v->state*100 + v->queuepos*10 + v->queuelen),
+               istr(&a, 1000 + LIVE_QUEUED*100 + 23));
+        ch = apply(v, a, R"({"sid":"s","ts":0,"ev":"live","state":"queued","queue_pos":1,"queue_len":3})");
+        expect(t, "panels.queuemoved", istr(&a, ch), "1");
+        ch = apply(v, a, R"({"sid":"s","ts":0,"ev":"live","state":"task","tasks":2})");
+        expect(t, "panels.tasks", istr(&a, ch*100 + v->state*10 + v->tasks), istr(&a, 100 + LIVE_TASK*10 + 2));
+        expect(t, "panels.compacting", istr(&a, livestate("compacting")), istr(&a, LIVE_COMPACTING));
+        apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"retry","turn":2,"attempt":1,"class":"limit",)"
+                    R"("status":429,"delay_ms":0,"msg":"quota","endpoint":"u","model":"fb","fallback":1})");
+        expect(t, "panels.fallback", concat(&a, v->retrymodel, istr(&a, v->fallback)), "fb1");
+        expect(t, "panels.fallbacknote", v->msgs[v->msgs.len-1].text,
+               "Attempt 1 failed (limit, HTTP 429): quota. Switching to fallback 1, fb.");
+        apply(v, a, R"({"sid":"s","seq":7,"ts":0,"ev":"retry","turn":2,"attempt":2,"class":"transient",)"
+                    R"("status":503,"delay_ms":90000,"msg":"busy","endpoint":"u","model":"fb","slow":1})");
+        expect(t, "panels.slow", v->msgs[v->msgs.len-1].text,
+               "Attempt 2 failed (transient, HTTP 503): busy. Waiting 1 min 30 s before "
+               "trying again (a slow retry), with fb.");
+        expect(t, "panels.stillfb", istr(&a, v->fallback*10 + v->retryslow), "11");
+        apply(v, a, R"({"sid":"s","seq":8,"ts":0,"ev":"retry","turn":2,"attempt":3,"class":"transient",)"
+                    R"("status":503,"delay_ms":500,"msg":"busy","endpoint":"u","model":"m"})");
+        expect(t, "panels.primary", istr(&a, v->fallback), "0");
+    }
+
+    // Instruction files, each once as last told; a task's report as
+    // markdown, its subagent named; a command moved to the background
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"instructions","why":"start","files":[)"
+                    R"({"path":"/w/AGENTS.md","bytes":10,"mtime":1},)"
+                    R"({"path":"/w/x.md","bytes":5,"mtime":1,"importer":"/w/AGENTS.md"}],"text":"T"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"instructions","why":"changed","files":[)"
+                    R"({"path":"/w/AGENTS.md","bytes":12,"mtime":2}],"skipped":["/w/y.md"]})");
+        Buf b(&a, 128);
+        for (iz i = 0; i < v->instr.len; i++) {
+            print(&b, v->instr[i].path);
+            putbyte(&b, ' ');
+            print(&b, v->instr[i].why);
+            putbyte(&b, ' ');
+            print(&b, v->instr[i].bytes);
+            putbyte(&b, ';');
+        }
+        expect(t, "panels.instr", finish(&b), "/w/AGENTS.md changed 12;/w/x.md start 5;");
+        expect(t, "panels.instrtext", concat(&a, v->instrtext, v->skipped[0]), "T/w/y.md");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"t1","name":"task","args":"{\"description\":\"Look\"}"},)"
+                    R"({"t":"call","id":"s1","name":"shell","args":"{\"command\":\"sleep 9\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"tool.end","call":"t1","status":"ok",)"
+                    R"("text":"**Found** it.","child":"kid","ms":5})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"tool.end","call":"s1","status":"background",)"
+                    R"("text":"so far","job":4,"ms":5})");
+        expect(t, "panels.task", msgsshow(&a, v),
+               "X[task Look ok]:**Found** it.;X[shell sleep 9 background]:so far;");
+        expect(t, "panels.taskmd", concat(&a, v->msgs[0].tool->child, istr(&a, v->msgs[0].md)), "kid1");
+        expect(t, "panels.background", istr(&a, v->msgs[1].tool->job*10 + v->msgs[1].collapsed), "40");
     }
 }
