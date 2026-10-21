@@ -1,15 +1,21 @@
 // ImGui user interface: the transcript widget with its tool rows, ask
 // cards and compaction and rewind cards, the session's bar and info, the
-// sessions sidebar with subagents under their parents, the todo list and
-// background jobs panels, the liveness strip and the prompt, the settings
-// window, the new session, rewind and close dialogs, the dock layout,
-// the metrics overlay, the theme's colors, and the scheduler's view of
-// ImGui
+// sessions sidebar with subagents under their parents and each host's
+// sessions under it, the todo list and background jobs panels, the
+// liveness strip and the prompt, the settings window, the Hosts panel,
+// the Output window, the new session, rewind and close dialogs, the
+// dock layout, the metrics overlay, the theme's colors, and the
+// scheduler's view of ImGui
 //
 // Tool rows carry an action at the right of their header: Undo on a
 // write's or edit's (a rewind from its call on), Rewind to here on the
-// message that began a turn, and a link to a task's subagent. A rewind
-// asks first, listing the files as the view's snapshots predict them.
+// message that began a turn, a link to a task's subagent, and Output on
+// a call with a spill file, which the Output window shows as its host
+// gives it. A rewind asks first, listing the files as the view's
+// snapshots predict them.
+//
+// A host's countdown to its next try, like the strip's clocks, declares
+// its deadline only while drawn.
 //
 // All ImDrawList code lives here, since its signatures shift between
 // ImGui releases. uiscan and uideadlines read ImGui's internals after
@@ -894,16 +900,27 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
 static GuiSession *taskchild(Gui *g, GuiSession *parent, ViewTool *t)
 {
     if (t->child.len) {
-        GuiSession *c = findsess(g, t->child);
+        GuiSession *c = findsess(g, parent->host, t->child);
         if (c) return c;
     }
     for (GuiSession *s = g->sessions; s; s = s->next) {
         View *k = s->view;
-        if (k && t->call.len && k->parent==parent->sid && k->pcall==t->call) {
+        if (k && t->call.len && s->host==parent->host && k->parent==parent->sid &&
+                k->pcall==t->call) {
             return s;
         }
     }
     return 0;
+}
+
+// Whether a session's host takes commands: the engine while it runs and
+// this process does not host, or another host while connected.
+static b32 hostlive(Gui *g, GuiSession *s)
+{
+    if (s->host->kind == GH_ENGINE) {
+        return !g->enginegone && !g->host && g->enginekind!=ENGINE_FAKE;
+    }
+    return s->host->r && !s->host->closing;
 }
 
 // Whether the files of a session can be rewound now: shown here, its
@@ -911,7 +928,7 @@ static GuiSession *taskchild(Gui *g, GuiSession *parent, ViewTool *t)
 static b32 canrewind(Gui *g, GuiSession *s)
 {
     return s && s==g->sess && s->view && !s->readonly && !s->view->busy &&
-           !g->enginegone && !g->quitting && g->enginekind!=ENGINE_FAKE;
+           hostlive(g, s) && !g->quitting;
 }
 
 enum : i32 {
@@ -919,6 +936,7 @@ enum : i32 {
     ACT_UNDO,     // put back a write's or edit's file, and later ones
     ACT_REWIND,   // put back the files to the start of a turn
     ACT_OPEN,     // show a task's subagent
+    ACT_OUTPUT,   // show a call's whole output (its spill file)
 };
 
 struct MsgAction {
@@ -946,6 +964,9 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
         if (sn && !sn->undone && canrewind(g, s)) {
             r.kind  = ACT_UNDO;
             r.label = "Undo";
+        } else if (s && t->spill.len && t->status>=VTOOL_OK && hostlive(g, s)) {
+            r.kind  = ACT_OUTPUT;
+            r.label = "Output";
         }
     } else if (m->startsturn && canrewind(g, s) && turnrewinds(v, m->startsturn)) {
         r.kind  = ACT_REWIND;
@@ -989,6 +1010,11 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
         ImGui::SetItemTooltip("Put back every file write and edit changed from "
                               "this turn on");
         if (go) askrewind(g, s, {}, m->startsturn, 0);
+        break;
+    case ACT_OUTPUT:
+        itemrect(g, RECT_OUTPUT);
+        ImGui::SetItemTooltip("Show the whole output, from its host");
+        if (go) showfile(g, s, t->spill);
         break;
     }
 }
@@ -1085,8 +1111,11 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
             inforow("Tools", v->tools);
         }
         if (v->parent.len) {
-            GuiSession *p = findsess(g, v->parent);
+            GuiSession *p = findsess(g, s->host, v->parent);
             inforow("Parent", p ? sesstitle(p) : v->parent);
+        }
+        if (s->host->kind != GH_ENGINE) {
+            inforow("Host", hostlabel(g, &a, s->host));
         }
         ImGui::EndTable();
     }
@@ -1140,13 +1169,13 @@ static void drawsessbar(Gui *g)
     f32         infow = ImGui::CalcTextSize("Info").x + 2*st.FramePadding.x;
     f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - infow;
     if (v->parent.len) {
-        GuiSession *p = findsess(g, v->parent);
+        GuiSession *p = findsess(g, s->host, v->parent);
         ImGui::TextDisabled(v->role.len ? "Subagent (%s) of" : "Subagent%s of",
                             cstr0(&a, v->role));
         ImGui::SameLine();
         Str title = shorten(&a, p ? sesstitle(p) : v->parent, 60);
         if (ImGui::TextLink(cstr0(&a, title))) {
-            guiselect(g, p ? p : addsess(g, v->parent));
+            guiselect(g, p ? p : addsess(g, s->host, v->parent));
         }
         itemrect(g, RECT_PARENTLINK);
         ImGui::SetItemTooltip("Back to the session that started this subagent");
@@ -1716,7 +1745,7 @@ static void drawprompt(Gui *g)
     f32  sc   = g->scale;
     View *v   = g->view;
     b32  can  = g->sess && g->sess->view && !g->sess->readonly && !g->quitting &&
-                !g->enginegone;
+                (hostlive(g, g->sess) || g->enginekind==ENGINE_FAKE);
     drawstrip(g);
     escapecancel(g);
 
@@ -1791,13 +1820,29 @@ static void sessplace(SessTree *t, GuiSession *s, i32 depth)
     }
 }
 
-// The sessions made or opened here and listed, newest first, but each
-// subagent's under its parent's, oldest first, with its depth there.
+static Slice<GuiSession *> hostsessions(Gui *g, Arena *a, GuiHost *h);
+
+// The sessions made or opened here and listed, host by host, each
+// host's newest first, but each subagent's under its parent's, oldest
+// first, with its depth there.
 static Slice<GuiSession *> sesslist(Gui *g, Arena *a)
+{
+    Slice<GuiSession *> r = {};
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        Slice<GuiSession *> l = hostsessions(g, a, h);
+        for (iz i = 0; i < l.len; i++) {
+            r = push(a, r, l[i]);
+        }
+    }
+    return r;
+}
+
+// The sessions of one host, in the sidebar's order.
+static Slice<GuiSession *> hostsessions(Gui *g, Arena *a, GuiHost *h)
 {
     Slice<GuiSession *> all = {};
     for (GuiSession *s = g->sessions; s; s = s->next) {
-        if (s->view || s->listed) {
+        if (s->host==h && (s->view || s->listed)) {
             all = push(a, all, s);
             s->depth = -1;  // not placed yet
         }
@@ -1848,25 +1893,74 @@ static Slice<GuiSession *> sesslist(Gui *g, Arena *a)
     return t.out;
 }
 
+static u32 hostcolor(Gui *g, GuiHost *h)
+{
+    if (h->kind == GH_ENGINE) {
+        return g->enginegone ? g->pal->bad : g->pal->ok;
+    }
+    switch (h->state) {
+    case RS_UP:         return g->pal->ok;
+    case RS_CONNECTING:
+    case RS_DOWN:       return g->pal->amber;
+    case RS_FAILED:     return g->pal->bad;
+    }
+    return g->pal->dim;
+}
+
+// A host's line above its sessions in the sidebar: a dot in the color of
+// its connection, its name, and how it is, a countdown while down.
+static void drawhosthead(Gui *g, Arena a, GuiHost *h, i64 nowms)
+{
+    f32         sc    = g->scale;
+    ImDrawList *dl    = ImGui::GetWindowDrawList();
+    f32         lineh = ImGui::GetTextLineHeight();
+    ImVec2      p     = ImGui::GetCursorScreenPos();
+    f32         w     = ImGui::GetContentRegionAvail().x;
+    i64         left  = h->state==RS_DOWN ? countdown(g, h->retryat, nowms) : 0;
+    g->downshown |= h->state==RS_DOWN && left>0;
+    drawdot(dl, v2(p.x + 4*sc, p.y + lineh/2), 3.5f*sc, hostcolor(g, h));
+    Pen t = {dl, &g->fonts, p.x + 13*sc, p.y, p.x + w, g->fonts.size};
+    pen(&t, hostlabel(g, &a, h), STYLE_BOLD, g->pal->text);
+    pen(&t, "  ", 0, g->pal->dim);
+    pen(&t, hoststatus(g, &a, h, left), 0, hostcolor(g, h)==g->pal->ok ? g->pal->dim
+                                                                     : hostcolor(g, h));
+    ImGui::Dummy(v2(w, lineh + 2*sc));
+    if (h->msg.len && h->state!=RS_UP) {
+        ImGui::SetItemTooltip("%s", cstr0(&a, h->msg));
+    }
+}
+
 static void drawsessions(Gui *g)
 {
     f32   sc = g->scale;
     Arena a  = g->frame;
+    i64   nowms = os_time(g->os);
     if (g->enginekind != ENGINE_FAKE) {
         if (ImGui::SmallButton("Refresh")) {
-            guilist(g);
+            guilistall(g);
         }
         ImGui::SetItemTooltip("List the sessions again");
+    }
+    // Heads for each host when there is more than one to show
+    b32 heads = 0;
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        heads |= h->kind!=GH_ENGINE;
     }
     Slice<GuiSession *> list = sesslist(g, &a);
     b32         other = 0;  // the checklist's first session not shown
     ImDrawList *dl    = ImGui::GetWindowDrawList();
     f32         lineh = ImGui::GetTextLineHeight();
     f32         small = g->fonts.size * 0.85f;
+    GuiHost    *head  = 0;
     for (iz i = 0; i < list.len; i++) {
         GuiSession *s     = list[i];
         View       *v     = s->view;
         i32         state = v ? v->state : s->state;
+        if (heads && s->host!=head) {
+            head = s->host;
+            if (i) ImGui::Spacing();
+            drawhosthead(g, a, head, nowms);
+        }
         pushstr(s->sid);
         ImVec2 p = ImGui::GetCursorScreenPos();
         f32    w = ImGui::GetContentRegionAvail().x;
@@ -1899,7 +1993,17 @@ static void drawsessions(Gui *g)
             pen(&b, v->role, 0, g->pal->dim);
             pen(&b, "  ", 0, g->pal->dim);
         }
-        if (ro) {
+        if (s->host->kind == GH_LOCAL) {
+            pen(&b, "background", STYLE_BOLD, g->pal->active);
+            pen(&b, "  ", 0, g->pal->dim);
+            g->bgbadge += s == g->sess;
+        }
+        if (s->host->kind!=GH_ENGINE && !s->host->up) {
+            // Its link comes back by itself, or not at all
+            b32 back = s->host->r && !s->host->closing;
+            pen(&b, back ? Str("reconnecting") : Str("disconnected"), STYLE_BOLD,
+                back ? g->pal->amber : g->pal->dim);
+        } else if (ro) {
             pen(&b, "read-only", STYLE_BOLD, g->pal->amber);
         } else if (asks) {
             pen(&b, "needs an answer", STYLE_BOLD, g->pal->amber);
@@ -1928,6 +2032,17 @@ static void drawsessions(Gui *g)
         pen(&b, "  ", 0, g->pal->dim);
         pen(&b, cwd, 0, g->pal->dim);
         ImGui::PopID();
+    }
+    // Remote hosts with nothing to show yet, but how they are
+    for (GuiHost *h = g->hosts; heads && h; h = h->next) {
+        b32 any = 0;
+        for (iz i = 0; i < list.len; i++) {
+            any |= list[i]->host == h;
+        }
+        if (!any && h->kind==GH_REMOTE && h->state!=RS_CLOSED) {
+            ImGui::Spacing();
+            drawhosthead(g, a, h, nowms);
+        }
     }
     if (!list.len) {
         ImGui::TextDisabled("No sessions yet.");
@@ -2023,7 +2138,7 @@ static void drawjobs(Gui *g)
     i64         nowms = os_time(g->os);
     ImGuiStyle &st    = ImGui::GetStyle();
     f32         killw = ImGui::CalcTextSize("Stopping...").x + 2*st.FramePadding.x;
-    b32         can   = !g->sess->readonly && !g->enginegone && !g->quitting;
+    b32         can   = !g->sess->readonly && hostlive(g, g->sess) && !g->quitting;
     b32         first = 1;
     for (iz i = v->jobs.len-1; i >= 0; i--) {
         ViewJob *j = &v->jobs[i];
@@ -2115,7 +2230,44 @@ static void drawnew(Gui *g)
         return;
     }
     Arena a = g->frame;
+
+    // Where it runs, when there is a choice: its directory is there
+    GuiHost *host  = g->newhost && hostready(g, g->newhost) ? g->newhost : g->main;
+    i32      ready = 0;
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        ready += hostready(g, h);
+    }
+    if (ready > 1) {
+        ImGui::TextUnformatted("Host");
+        ImGui::SetNextItemWidth(-1);
+        ImVec2 at = ImGui::GetCursorScreenPos();
+        if (ImGui::BeginCombo("##host", cstr0(&a, hostlabel(g, &a, host)))) {
+            i32 n = 0;
+            for (GuiHost *h = g->hosts; h; h = h->next) {
+                if (!hostready(g, h)) continue;
+                ImGui::PushID(h);
+                if (ImGui::Selectable(cstr0(&a, hostlabel(g, &a, h)), h==host)) {
+                    g->newhost = h;
+                }
+                if (n < 4) {
+                    itemrect(g, RECT_HOST0 + n);
+                    g->hostitems[n] = h;
+                }
+                n++;
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        f32 w = ImGui::GetContentRegionAvail().x;
+        g->rects[RECT_HOSTCOMBO] = {at.x, at.y, at.x+w, at.y+ImGui::GetFrameHeight()};
+        ImGui::Spacing();
+    }
+
     ImGui::TextUnformatted("Working directory");
+    if (host->kind == GH_REMOTE) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("on %s", cstr0(&a, host->name));
+    }
     ImGui::SetNextItemWidth(-1);
     if (ImGui::IsWindowAppearing()) {
         ImGui::SetKeyboardFocusHere();
@@ -2123,12 +2275,12 @@ static void drawnew(Gui *g)
     ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, ImGuiInputTextFlags_AutoSelectAll);
     itemrect(g, RECT_NEWCWD);
 
-    // Recent directories, newest first
+    // Recent directories there, newest first
     Slice<GuiSession *> list   = sesslist(g, &a);
     Slice<Str>          recent = {};
     for (iz i = 0; i<list.len && recent.len<8; i++) {
         Str cwd = list[i]->view && list[i]->view->cwd.len ? list[i]->view->cwd : list[i]->cwd;
-        b32 dup = !cwd.len;
+        b32 dup = !cwd.len || list[i]->host!=host;
         for (iz k = 0; !dup && k < recent.len; k++) {
             dup = recent[k] == cwd;
         }
@@ -2159,7 +2311,8 @@ static void drawnew(Gui *g)
             dflt = r->value;
         }
     }
-    char const *hint = dflt.len ? cstr0(&a, concat(&a, "configured: ", dflt)) : "the model's name";
+    char const *hint = host->kind==GH_REMOTE ? "as configured there" :
+                       dflt.len ? cstr0(&a, concat(&a, "configured: ", dflt)) : "the model's name";
     ImGui::InputTextWithHint("##model", hint, g->newmodel, FIELD_MAX);
     if (g->newerr.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
@@ -2173,7 +2326,7 @@ static void drawnew(Gui *g)
     if (create) {
         Str cwd   = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
         Str model = trim({(u8 *)g->newmodel, (iz)__builtin_strlen(g->newmodel)});
-        guinew(g, cwd, model);
+        guinew(g, host, cwd, model);
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
@@ -2184,15 +2337,19 @@ static void drawnew(Gui *g)
     ImGui::EndPopup();
 }
 
-// Closing the window with turns running asks first.
+// Closing the window with turns running asks first: stop them and quit,
+// or keep them running in the background, this process a host of them
+// with no window. Sessions at work on other hosts run on either way.
 static void drawclose(Gui *g)
 {
     f32 sc = g->scale;
     if (g->closereq) {
         g->closereq = 0;
-        if (!g->quitting && !running(g)) {
+        if (!g->quitting && !running(g) && !elsewhere(g)) {
             startquit(g);
         } else if (!g->quitting) {
+            g->hosterr = {};
+            g->whynobg = clone(&g->perm, cannothost(g));
             ImGui::OpenPopup("Quit harness?");
         }
     }
@@ -2200,21 +2357,57 @@ static void drawclose(Gui *g)
         return;
     }
     Arena a = g->frame;
-    if (g->quitting) {
+    if (g->host && !g->shedreq) {
+        // Open as the window went to the background: nothing to ask now
+        ImGui::CloseCurrentPopup();
+    } else if (g->quitting) {
         ImGui::TextUnformatted("Stopping the running sessions...");
+    } else if (g->shedreq) {
+        ImGui::TextUnformatted("Going to the background...");
     } else {
         i32 n = running(g);
+        i32 m = elsewhere(g);
         Buf b(&a, 128);
         print(&b, "Stop ");
         print(&b, (i64)n);
-        print(&b, n==1 ? Str(" running session and quit") : Str(" running sessions and quit"));
+        print(&b, n==1 ? Str(" session and quit") : Str(" sessions and quit"));
         Str label = finish(&b);
-        ImGui::TextUnformatted(n ? "Turns are still running. Quitting stops them, and kills their commands."
-                                 : "Nothing is running any more.");
+        if (n) {
+            ImGui::TextUnformatted("Turns are still running. Quitting stops them, and kills "
+                                   "their commands; in the background they go on, with no "
+                                   "window.");
+        } else {
+            ImGui::TextUnformatted("Nothing is running here any more.");
+        }
+        if (m) {
+            Buf e(&a, 128);
+            print(&e, (i64)m);
+            print(&e, m==1 ? Str(" session at work on another host keeps running")
+                           : Str(" sessions at work on other hosts keep running"));
+            print(&e, ", remote or in the background, whatever happens here.");
+            ImGui::TextUnformatted(cstr0(&a, finish(&e)));
+            g->elseshown = 1;
+        }
         b32 stop = ImGui::Button(cstr0(&a, n ? label : Str("Quit")));
         itemrect(g, RECT_CLOSESTOP);
         if (stop) {
             startquit(g);
+        }
+        if (n) {
+            ImGui::SameLine();
+            ImGui::BeginDisabled(g->whynobg.len != 0);
+            b32 bg = ImGui::Button("Keep running in background");
+            ImGui::EndDisabled();
+            itemrect(g, RECT_CLOSEBG);
+            if (g->whynobg.len) {
+                ImGui::SetItemTooltip("Not here: %s", cstr0(&a, g->whynobg));
+            } else {
+                ImGui::SetItemTooltip("Close the window, and keep this process running its "
+                                      "sessions, unattended, with a tray icon to bring it back");
+            }
+            if (bg) {
+                shedlater(g, 1);
+            }
         }
         ImGui::SameLine();
         b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0));
@@ -2222,8 +2415,233 @@ static void drawclose(Gui *g)
         if (cancel) {
             ImGui::CloseCurrentPopup();
         }
+        if (g->hosterr.len) {
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+            ImGui::TextWrapped("%s", cstr0(&a, g->hosterr));
+            ImGui::PopStyleColor();
+        }
     }
     ImGui::EndPopup();
+}
+
+// The Output window: a file of a session's directory, as its host gave
+// it, in parts, the next on demand.
+static void drawoutput(Gui *g)
+{
+    Arena    a = g->frame;
+    OutFile *o = &g->out;
+    if (!o->s) {
+        ImGui::TextDisabled("Nothing to show: a tool row's Output shows its output here.");
+        return;
+    }
+    Buf b(&a, 256);
+    print(&b, o->path);
+    print(&b, " of ");
+    print(&b, sesstitle(o->s));
+    if (o->s->host->kind != GH_ENGINE) {
+        print(&b, ", on ");
+        print(&b, hostlabel(g, &a, o->s->host));
+    }
+    if (o->size) {
+        print(&b, ": ");
+        print(&b, bytesize(&a, o->size));
+    }
+    ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+    if (o->more) {
+        ImGui::SameLine();
+        ImGui::BeginDisabled(o->id != 0);
+        if (ImGui::SmallButton("More")) {
+            guifile(g);
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("The next part of it");
+    }
+    if (o->err.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextWrapped("%s", cstr0(&a, o->err));
+        ImGui::PopStyleColor();
+    } else if (o->id && !o->text.len) {
+        ImGui::TextDisabled("Loading...");
+    }
+    ImGui::BeginChild("##out", v2(0, 0), ImGuiChildFlags_Borders);
+    ImGui::PushFont(g->fonts.mono, 0);
+    Str t = finish(&o->text);
+    if (t.len) {
+        ImGui::TextUnformatted((char *)t.data, (char *)t.data + t.len);
+        g->outshown = 1;
+    }
+    ImGui::PopFont();
+    ImGui::EndChild();
+}
+
+// Hosts
+
+// This process's engine, the background hosts on this machine, and the
+// remote ones of the configuration: how each is, connecting and leaving
+// them, and a new remote added to the configuration.
+static void drawhosts(Gui *g)
+{
+    Arena a     = g->frame;
+    f32   sc    = g->scale;
+    i64   nowms = os_time(g->os);
+    if (g->enginekind == ENGINE_FAKE) {
+        ImGui::TextDisabled("No engine: the fake agent has no hosts.");
+        return;
+    }
+    if (ImGui::SmallButton("Look again")) {
+        findhosts(g, a);
+        guiconfigget(g);
+    }
+    ImGui::SetItemTooltip("Find background hosts again, and read the remotes from the configuration");
+
+    // This process
+    ImGui::SeparatorText("This computer");
+    Buf tb(&a, 256);
+    if (g->host) {
+        print(&tb, "This process runs its sessions in the background, as process ");
+        print(&tb, (i64)os_pid(g->os));
+        print(&tb, ", at ");
+        print(&tb, g->host->endpoint);
+    } else {
+        print(&tb, "The engine runs ");
+        print(&tb, g->enginekind==ENGINE_INPROC ? Str("in this process: ")
+                                                : Str("as a process of its own: "));
+        print(&tb, hoststatus(g, &a, g->hosts, 0));
+    }
+    ImGui::TextWrapped("%s", cstr0(&a, finish(&tb)));
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        if (h->kind!=GH_LOCAL || h->own) continue;
+        ImGui::PushID(h);
+        ImGui::Bullet();
+        Buf b(&a, 128);
+        print(&b, hostlabel(g, &a, h));
+        print(&b, ": ");
+        print(&b, hoststatus(g, &a, h, 0));
+        if (h->started) {
+            print(&b, ", started ");
+            printcfgage(&b, nowms - h->started);
+            print(&b, " ago");
+        }
+        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!h->up);
+        if (ImGui::SmallButton("Stop")) {
+            Arena c = newarena(g->cmdr);
+            Buf   cb(&c, 128);
+            EvOut w = cmdopen(g, &cb, CMD_QUIT, 0, h);
+            putkey(&w.json, "mode");
+            putstr(&w.json, "stop");
+            cmdsend(g, &w, c);
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Stop its sessions' work, and the host");
+        ImGui::PopID();
+    }
+
+    // Remotes, as configured
+    ImGui::SeparatorText("Remote hosts");
+    Slice<Str> names = {};
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        b32 seen = r->kind != "remote";
+        for (iz n = 0; !seen && n < names.len; n++) {
+            seen = names[n] == r->name;
+        }
+        if (!seen) {
+            names = push(&a, names, r->name);
+        }
+    }
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        b32 seen = h->kind != GH_REMOTE;
+        for (iz n = 0; !seen && n < names.len; n++) {
+            seen = names[n] == h->name;
+        }
+        if (!seen) {
+            names = push(&a, names, h->name);  // gone from the file since
+        }
+    }
+    if (!names.len) {
+        ImGui::TextDisabled("None yet: add one below.");
+    }
+    for (iz n = 0; n < names.len; n++) {
+        GuiHost *h    = findhost(g, GH_REMOTE, names[n]);
+        b32      live = h && h->r && !h->closing;
+        i64      left = h && h->state==RS_DOWN ? countdown(g, h->retryat, nowms) : 0;
+        ImGui::PushID(cstr0(&a, names[n]));
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        f32    lh = ImGui::GetTextLineHeight();
+        drawdot(ImGui::GetWindowDrawList(), v2(p.x + 4*sc, p.y + lh/2 + ImGui::GetStyle().FramePadding.y),
+                3.5f*sc, h ? hostcolor(g, h) : g->pal->dim);
+        ImGui::Dummy(v2(10*sc, 0));
+        ImGui::SameLine();
+        Buf b(&a, 128);
+        print(&b, h ? hostlabel(g, &a, h) : names[n]);
+        print(&b, ": ");
+        print(&b, h ? hoststatus(g, &a, h, left) : Str("not connected"));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+        ImGui::SameLine();
+        b32 click = ImGui::SmallButton(live ? "Disconnect" : "Connect");
+        if (n < 2) {
+            itemrect(g, RECT_CONNECT + (i32)n);  // the first two, for the checklist
+        }
+        ImGui::SetItemTooltip(live ? "Leave it: its sessions run on there"
+                                   : "Connect over ssh, starting a host there if none runs");
+        if (click && live) {
+            hostclose(g, h);
+        } else if (click) {
+            remoteconnect(g, a, names[n]);
+        }
+        if (h && h->msg.len && h->state!=RS_UP) {
+            ImGui::PushStyleColor(ImGuiCol_Text, h->state==RS_FAILED ? g->pal->bad : g->pal->amber);
+            ImGui::TextWrapped("%s", cstr0(&a, h->msg));
+            ImGui::PopStyleColor();
+            g->failshown |= h->state == RS_FAILED;
+        }
+        ImGui::PopID();
+    }
+
+    // A new one, which the configuration keeps
+    ImGui::SeparatorText("Add a remote host");
+    ImGui::SetNextItemWidth(120*sc);
+    ImGui::InputTextWithHint("##remname", "name", g->remname, FIELD_MAX);
+    itemrect(g, RECT_REMNAME);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(200*sc);
+    ImGui::InputTextWithHint("##remssh", "ssh destination", g->remssh, FIELD_MAX);
+    itemrect(g, RECT_REMSSH);
+    ImGui::SetItemTooltip("user@host, or a host from ~/.ssh/config");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##rempath", "harness there (optional)", g->rempath, FIELD_MAX);
+    b32 add = ImGui::Button("Add remote");
+    itemrect(g, RECT_REMADD);
+    if (add) {
+        Str name = trim({(u8 *)g->remname, (iz)__builtin_strlen(g->remname)});
+        Str ssh  = trim({(u8 *)g->remssh, (iz)__builtin_strlen(g->remssh)});
+        Str path = trim({(u8 *)g->rempath, (iz)__builtin_strlen(g->rempath)});
+        if (!name.len || !ssh.len) {
+            g->remstatus = "A remote needs a name and an ssh destination";
+            g->remok     = 0;
+        } else if (ssh[0] == '-') {
+            g->remstatus = "An ssh destination cannot begin with -";
+            g->remok     = 0;
+        } else {
+            guiconfigset(g, "remote", name, "ssh", ssh);
+            if (path.len) {
+                guiconfigset(g, "remote", name, "path", path);
+            }
+            g->remstatus = clone(&g->perm, concat(&a, concat(&a, "Added [remote ", name), "]"));
+            g->remok     = 1;
+            g->remname[0] = g->remssh[0] = g->rempath[0] = 0;
+        }
+    }
+    if (g->remstatus.len) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, g->remok ? g->pal->ok : g->pal->bad);
+        ImGui::TextWrapped("%s", cstr0(&a, g->remstatus));
+        ImGui::PopStyleColor();
+    }
 }
 
 
@@ -2350,10 +2768,26 @@ static void drawsettings(Gui *g)
     }
     Json *j    = g->cfg;
     Str   path = jsonstr(jsonget(j, "path"));
+    ImGui::PushTextWrapPos(0);
     ImGui::TextDisabled("Edits go to %s", path.len ? cstr0(&a, path) : "(no file)");
-    ImGui::SameLine();
+    ImGui::PopTextWrapPos();
     if (ImGui::SmallButton("Reload")) {
         guiconfigget(g);
+    }
+    i32 urls = (i32)jsonlen(jsonget(j, "includes"));
+    if (urls) {
+        // Fetching each URL include again, which the reply waits for
+        ImGui::SameLine();
+        ImGui::BeginDisabled(g->cfgrefresh != 0);
+        b32 refresh = ImGui::SmallButton(g->cfgrefresh ? "Fetching..." : "Refresh includes");
+        itemrect(g, RECT_REFRESHINC);
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Fetch the %d URL include%s again, rather than wait for the "
+                              "next scheduled fetch", urls, urls==1 ? "" : "s");
+        if (refresh) {
+            g->cfgget = 0;  // this one is the answer that counts
+            guiconfigget(g, 1);
+        }
     }
     if (g->cfgstatus.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->cfgok ? g->pal->ok : g->pal->bad);
@@ -2469,11 +2903,13 @@ static void drawsettings(Gui *g)
             }
             if (add) {
                 Str name = trim({(u8 *)g->addname, (iz)__builtin_strlen(g->addname)});
+                // Its first key: a remote's ssh is an alias of its name
                 Str key  = kind=="endpoint" ? Str("url") :
-                           kind=="model"    ? Str("reasoning") : Str("tools");
+                           kind=="model"    ? Str("reasoning") :
+                           kind=="remote"   ? Str("ssh") : Str("tools");
                 Str val  = kind=="endpoint" ? Str("http://localhost/") :
                            kind=="model"    ? Str("reasoning_content") :
-                           Str("read write edit shell");
+                           kind=="remote"   ? name : Str("read write edit shell");
                 b32 exists = 0;
                 for (iz i = 0; i < names.len; i++) {
                     exists |= names[i] == name;
@@ -2821,6 +3257,7 @@ static void dockwindows(Gui *g)
         ImGui::DockBuilderDockWindow("Transcript", top);
         ImGui::DockBuilderDockWindow("Prompt", bottom);
         ImGui::DockBuilderDockWindow("Metrics", rtop);
+        ImGui::DockBuilderDockWindow("Hosts", rtop);
         ImGui::DockBuilderDockWindow("Settings", rtop);
         ImGui::DockBuilderDockWindow("Jobs", rbot);
         ImGui::DockBuilderDockWindow("Log", rbot);
@@ -2867,6 +3304,28 @@ static void dockwindows(Gui *g)
         drawsettings(g);
     }
     ImGui::End();
+    // Windows that a layout saved before them lacks join a neighbor
+    near = saveddock("Settings");
+    if (near) {
+        ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+    }
+    if (ImGui::Begin("Hosts")) {
+        drawhosts(g);
+    }
+    ImGui::End();
+    if (g->outopen) {
+        bool open = 1;
+        if (g->outfocus) {
+            g->outfocus = 0;
+            ImGui::SetNextWindowFocus();
+        }
+        ImGui::SetNextWindowSize(v2(720*g->scale, 480*g->scale), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Output", &open)) {
+            drawoutput(g);
+        }
+        ImGui::End();
+        g->outopen = open;
+    }
     // The tab selected in its node, rather than the log: a node selects
     // the window focused last, which a new window is as it appears, so
     // Jobs is focused once, the frame after its windows first appear

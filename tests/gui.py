@@ -323,9 +323,9 @@ class Local:
     def alive(self, pid):
         return alive(pid)
 
-    def run(self, guiargs, timeout, cwd=None):
-        """Run the GUI, echoing its log, in cwd (default the working
-        directory). Returns (status, lines)."""
+    def run(self, guiargs, timeout, cwd=None, tag="", env=None):
+        """Run the GUI, echoing its log (each line after tag, if any), in
+        cwd (default the working directory). Returns (status, lines)."""
         cmd = [self.harness, "gui"] + guiargs
         if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
                 and not os.environ.get("WAYLAND_DISPLAY"):
@@ -333,17 +333,19 @@ class Local:
         print(" ".join(cmd), flush=True)
         p = subprocess.Popen(cmd, cwd=cwd or self.path("work"), stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, start_new_session=True)
+                             text=True, start_new_session=True,
+                             env=dict(os.environ, **(env or {})))
         lines = []
         meter = None
         deadline = time.monotonic() + timeout
-        # A GUI that hangs prints nothing more: end it at the deadline
+        # A GUI that hangs prints nothing more: end it at the deadline. Its
+        # group is the new session started for it here.
         killer = threading.Timer(timeout + 5, lambda: os.killpg(p.pid, signal.SIGKILL))
         killer.start()
         try:
             for line in p.stdout:
                 lines.append(line)
-                sys.stdout.write(line)
+                sys.stdout.write(tag + line)
                 sys.stdout.flush()
                 if "drive: mark: " in line:
                     pid = guipid(self.harness, self.path("state"))
@@ -373,6 +375,12 @@ class Local:
             [self.harness] + args, cwd=self.path("work"),
             stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+    def listdir(self, path):
+        try:
+            return os.listdir(path)
+        except OSError:
+            return []
 
     def sessions(self, ini, state, work):
         return makesessions(self, ini, state, work)
@@ -406,6 +414,7 @@ class Remote:
         self.root = self.h.root
         self.url = self.h.url
         self.task = f"harness-gui-{random.randrange(1 << 32):08x}"
+        self.tasks = []
 
     def path(self, *parts):
         return "/".join((self.root,) + parts)
@@ -422,19 +431,23 @@ class Remote:
     def alive(self, pid):
         return self.h.alive(pid)
 
-    def run(self, guiargs, timeout, cwd=None):
+    def run(self, guiargs, timeout, cwd=None, tag="", env=None):
         win = lambda p: p.replace("/", "\\")
         q = lambda a: '"' + win(a) + '"' if "/" in a or " " in a else a
-        bat = ("@echo off\r\ncd /d \"%~dp0\"\r\n" +
+        name = "run" + tag.strip(" :[]")
+        task = self.task + tag.strip(" :[]")
+        sets = "".join(f"set {k}={win(v)}\r\n" for k, v in (env or {}).items())
+        bat = ("@echo off\r\ncd /d \"%~dp0\"\r\n" + sets +
                q(self.h.exe) + " gui " + " ".join(q(a) for a in guiargs) +
-               " > run.log 2>&1\r\necho done %errorlevel% >> run.log\r\n")
-        self.h.write(self.path("run.bat"), bat)
-        r = self.h.ssh(f'schtasks /create /tn {self.task} /tr "{win(self.path("run.bat"))}" '
+               f" > {name}.log 2>&1\r\necho done %errorlevel% >> {name}.log\r\n")
+        self.h.write(self.path(name + ".bat"), bat)
+        self.tasks.append(task)
+        r = self.h.ssh(f'schtasks /create /tn {task} /tr "{win(self.path(name + ".bat"))}" '
                        f'/sc once /st 23:59 /it /f')
         if r.returncode:
             raise RuntimeError("schtasks /create: " + r.stdout + r.stderr)
-        self.h.ssh(f"schtasks /run /tn {self.task}")
-        print(f"{self.args.host}: {bat.splitlines()[2]}", flush=True)
+        self.h.ssh(f"schtasks /run /tn {task}")
+        print(f"{self.args.host}: {bat.splitlines()[-3]}", flush=True)
         seen = 0
         deadline = time.monotonic() + timeout
         status = None
@@ -442,10 +455,10 @@ class Remote:
         mark = None  # (pid, seconds of CPU, when) at a measurement's start
         while time.monotonic() < deadline:
             time.sleep(1 if self.args.mode in ("idle", "streamtest") else 3)
-            text = self.h.read(self.path("run.log")) or ""
+            text = self.h.read(self.path(name + ".log")) or ""
             lines = text.splitlines(keepends=True)
             for line in lines[seen:]:
-                sys.stdout.write(line)
+                sys.stdout.write(tag + line)
                 if "drive: mark: " in line:
                     pid = self.guipid()
                     mark = (pid, self.cputime(pid), time.monotonic()) if pid else None
@@ -466,6 +479,10 @@ class Remote:
 
     def popen(self, args, stdin=False):
         return self.h.popen(args, self.path("work"), stdin=stdin)
+
+    def listdir(self, path):
+        out = self.h.sh(f"ls {path} 2>/dev/null || true", check=False)
+        return out.split()
 
     def sessions(self, ini, state, work):
         return makesessions(self, ini, state, work)
@@ -501,7 +518,8 @@ class Remote:
         return left
 
     def close(self, keep):
-        self.h.ssh(f"schtasks /delete /tn {self.task} /f")
+        for task in self.tasks:
+            self.h.ssh(f"schtasks /delete /tn {task} /f")
         if keep:
             print(f"kept {self.args.host}:{self.root}")
         else:
@@ -579,6 +597,265 @@ def signals(args):
     return 1 if problems else 0
 
 
+def summaryproblems(status, lines, who):
+    """What is wrong with a checklist's run: its exit, its summary, stale
+    frames."""
+    problems = []
+    if status is None:
+        problems.append(f"{who}: the harness did not exit in time")
+    elif status != 0:
+        problems.append(f"{who}: exit status {status}")
+    summary = [l for l in lines if "drive:" in l and " checks, " in l]
+    if not summary:
+        problems.append(f"{who}: no checklist summary")
+    elif " 0 failed" not in summary[-1] or " 0 stale" not in summary[-1]:
+        problems.append(f"{who}: checklist: " + summary[-1].strip())
+    if "STALE" in "".join(lines):
+        problems.append(f"{who}: stale frames reported")
+    return problems
+
+
+def waitfor(pred, timeout, step=0.5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        r = pred()
+        if r:
+            return r
+        time.sleep(step)
+    return None
+
+
+def sessionlog(host, state, needle):
+    """The text of the session log in state that holds needle, if any."""
+    for sid in host.listdir(host.path("state", "sessions")):
+        text = host.read(host.path("state", "sessions", sid, "events.jsonl")) or ""
+        if needle in text:
+            return text
+    return None
+
+
+def background(args, host, guiargs, guicwd):
+    """--mode background: the first window keeps its turn running in the
+    background and goes; the turn ends with no window; a second window
+    finds the host (and passes over a stale registration), shows the
+    session and prompts it, and quits; then the first comes back from the
+    tray, starts another turn, goes again, stops it from the tray, and
+    its process ends after its idle time. Returns problems and both
+    logs."""
+    problems = []
+    first = {}
+    # Long enough to go on between the second window and the first's
+    # return, short enough to end it all soon after
+    t = threading.Thread(target=lambda: first.update(r=host.run(
+        ["--background", "--host-idle", "20"] + guiargs, args.timeout, guicwd,
+        tag="[1] ")))
+    t.start()
+    lines2 = []
+    stale = host.path("state", "hosts", "99999999.ini")
+    if not waitfor(lambda: host.read(host.path("work", "bg-ready")), 120, 1):
+        problems.append("the first window never went to the background")
+    else:
+        regs = host.listdir(host.path("state", "hosts"))
+        print(f"registered hosts: {regs}", flush=True)
+        if not regs:
+            problems.append("no host registered")
+        # The turn goes on, and ends, with no window
+        done = waitfor(lambda: '"ev":"turn.end"' in (sessionlog(
+            host, "state", "Stream in the background") or ""), 60, 1)
+        if not done:
+            problems.append("the turn did not end in the background")
+        else:
+            print("the turn ended in the background", flush=True)
+        # A registration whose host is long gone, which must hold up nothing
+        dead = host.path("state", "run", "dead.sock") if not isinstance(host, Remote) \
+            else "\\\\.\\pipe\\harness-test-dead-host"
+        host.write(stale, f"pid = 99999999\nendpoint = {dead}\nversion = 0.0.0\n"
+                          f"proto = 0\nstarted = 1\n")
+        status2, lines2 = host.run(["--attach"] + guiargs, args.timeout, guicwd, tag="[2] ")
+        problems += summaryproblems(status2, lines2, "the second window")
+        if host.read(stale) is not None:
+            problems.append("the stale registration is still there")
+    host.write(host.path("work", "open-now"), "go\n")
+    t.join(args.timeout + 60)
+    status1, lines1 = first.get("r", (None, []))
+    problems += summaryproblems(status1, lines1, "the first window")
+    if status1 is not None and host.listdir(host.path("state", "hosts")):
+        problems.append("a host is still registered after the first window quit")
+    text = sessionlog(host, "state", "Stream in the background") or ""
+    if '"via":"prompt"' not in text or text.count('"ev":"turn.end"') != 2:
+        problems.append("the log lacks the turn or the second window's prompt")
+    later = sessionlog(host, "state", "Stream slowly for a while") or ""
+    if '"why":"cancel"' not in later:
+        problems.append("the tray's Stop all did not stop the later turn")
+    return problems, lines1 + lines2
+
+
+def lanaddress(host):
+    """This machine's address on the way to host."""
+    import socket
+    addr = socket.getaddrinfo(host, 22, socket.AF_INET)[0][4][0]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((addr, 9))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+FAKESSH = ("#!/bin/sh\n"
+           "# ssh, as far as the harness uses it: the command, here\n"
+           "while [ $# -gt 1 ]; do\n"
+           "  case \"$1\" in -o) shift 2;; -*) shift;; *) shift; break;; esac\n"
+           "done\n"
+           "exec sh -c \"$1\"\n")
+
+# The same for Windows, built there with w64devkit: the remote command
+# is a command line of its own, run as is with standard I/O inherited.
+FAKESSH_C = r"""
+#include <windows.h>
+#include <shellapi.h>
+#include <wchar.h>
+int main(void)
+{
+    int       argc = 0;
+    wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    int       i    = 1;
+    for (; i < argc-1; i++) {
+        if (!wcscmp(argv[i], L"-o")) {
+            i++;
+        } else if (argv[i][0] != L'-') {
+            break;  // the destination
+        }
+    }
+    if (i+1 >= argc) {
+        return 255;
+    }
+    STARTUPINFOW        si = {sizeof(si)};
+    PROCESS_INFORMATION pi;
+    si.dwFlags    = STARTF_USESTDHANDLES;
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    if (!CreateProcessW(0, argv[i+1], 0, 0, TRUE, 0, 0, 0, &si, &pi)) {
+        return 255;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 255;
+    GetExitCodeProcess(pi.hProcess, &code);
+    return (int)code;
+}
+"""
+
+
+class Far:
+    """The remote host of --mode remote: over real ssh (--ssh), with the
+    harness built there, or this machine itself through a fake ssh, its
+    host started here for the test. Either way, in directories of its own
+    that go at the end."""
+
+    def __init__(self, args, host, url, model, nonce):
+        self.args = args
+        self.host = host
+        self.local = not args.ssh
+        self.windows = isinstance(host, Remote)
+        self.server = None
+        if self.local:
+            self.root = host.path("far")
+            self.harness = host.h.exe if self.windows else host.harness
+        else:
+            self.root = f"{args.remote_root}/gui-{nonce}"
+            self.harness = args.remote_harness
+        self.state = self.root + "/state"
+        self.work = self.root + "/work"
+        self.config = self.root + "/harness.ini"
+        cfg = config(url, model) + "\n# Its host goes soon after its last client\n" \
+                                   "[host]\nidle_exit = 5\n"
+        if self.local:
+            host.mkdir(self.work)
+            host.mkdir(self.state)
+            host.write(self.config, cfg)
+            host.write(self.work + "/hello.txt", "hello world\n")
+            if self.windows:
+                self.ssh = host.path("fakessh.exe")
+                host.write(host.path("fakessh.c"), FAKESSH_C)
+                host.h.sh(f"cd {host.root} && gcc -O2 -o fakessh.exe fakessh.c -lshell32")
+            else:
+                self.ssh = os.path.join(host.root, "fakessh")
+                host.write(self.ssh, FAKESSH)
+                os.chmod(self.ssh, 0o755)
+            # The host first, here: started through the fake ssh, it would
+            # descend from the GUI's reaper (Linux: a subreaper), or stay
+            # in its job (Windows), and go with the stream dropped
+            serve = ["serve", "--state", self.state, "-c", self.config, "--idle", "600"]
+            if self.windows:
+                self.server = host.popen(serve)
+            else:
+                self.server = subprocess.Popen(
+                    [self.harness] + serve, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)
+        else:
+            self.sh(f"mkdir -p {self.work} {self.state} && "
+                    f"echo 'hello world' > {self.work}/hello.txt")
+            b = cfg.replace("'", "")
+            self.sh(f"cat > {self.config} <<'EOF'\n{b}EOF\n")
+
+    def sh(self, script):
+        return subprocess.run(["ssh", "-o", "BatchMode=yes", self.args.ssh, script],
+                              capture_output=True, text=True, timeout=120).stdout
+
+    def section(self):
+        dest = "here" if self.local else self.args.ssh
+        return (f"\n# The checklist's remote host\n[remote r]\nssh = {dest}\n"
+                f"path = {self.harness}\nstate = {self.state}\nconfig = {self.config}\n"
+                f"\n# One that fails: ssh would take its destination for an option\n"
+                f"[remote bad]\nssh = -oProxyCommand=false\n")
+
+    def env(self):
+        return {"HARNESS_TEST_SSH": self.ssh} if self.local else {}
+
+    def hosts(self):
+        """The hosts running for its state directory, as JSONL lines."""
+        if self.local:
+            r = subprocess.run([self.harness, "hosts", "--state", self.state],
+                               capture_output=True, text=True)
+            return [l for l in r.stdout.splitlines() if l.strip()]
+        out = self.sh(f"{self.harness} hosts --state {self.state}")
+        return [l for l in out.splitlines() if l.strip()]
+
+    def close(self, keep):
+        """Over ssh, its host, left by the GUI, runs on until its idle
+        exit: wait for that, and say if it did not. Here, the host started
+        for the test stops with it."""
+        problems = []
+        if not self.local and waitfor(lambda: not self.hosts(), 40, 2) is None:
+            problems.append(f"the remote host still runs: {self.hosts()}")
+        if self.server and self.windows:
+            # Told to quit, through a client of its own
+            c = self.host.popen(["connect", "--local", "--state", self.state,
+                                 "-c", self.config], stdin=True)
+            c.stdin.write('{"cmd":"quit","id":1}\n')
+            c.stdin.flush()
+            try:
+                c.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                c.kill()
+            try:
+                self.server.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                problems.append("the host started for the test did not quit")
+                self.server.kill()
+        elif self.server and self.server.poll() is None:
+            self.server.terminate()  # ours: started above
+            self.server.wait(timeout=10)
+        if not keep and not self.windows:
+            if self.local:
+                shutil.rmtree(self.root, ignore_errors=True)
+            else:
+                self.sh(f"rm -rf {self.root}")
+        return problems
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--harness", required=True,
@@ -591,7 +868,12 @@ def main():
                          "measures how fast a history arrives)")
     ap.add_argument("--mode", default="drive",
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
-                             "settings", "enginestop", "bench"])
+                             "settings", "enginestop", "bench", "background", "remote"])
+    ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
+                                  "(default: this machine, through a fake ssh)")
+    ap.add_argument("--remote-harness", help="with --ssh: the harness built there")
+    ap.add_argument("--remote-root", default="/tmp",
+                    help="with --ssh: where its directories go there")
     ap.add_argument("--model", default="qwen-flash", help="with --mode e2e")
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--keep", action="store_true", help="keep the directories")
@@ -605,7 +887,11 @@ def main():
     if args.mode == "signals":
         return signals(args)
 
-    srv, url = fake_provider.start()
+    if args.mode == "remote" and args.ssh and not args.remote_harness:
+        ap.error("--ssh needs --remote-harness")
+    # A remote host over ssh reaches the provider on this machine's address
+    bind = lanaddress(args.ssh) if args.mode == "remote" and args.ssh else "127.0.0.1"
+    srv, url = fake_provider.start(bind)
     nonce = f"{random.randrange(1 << 32):08x}"
     model = f"fake:gui:{nonce}"
     fake_provider.STATE.register(model)
@@ -637,6 +923,12 @@ def main():
         bigfiles(host, "big-", 10, 512)
     else:
         before = config(curl, model)
+    far = None
+    if args.mode == "remote":
+        far = Far(args, host, curl, model, nonce)
+        # An include by URL, to fetch again from the settings window
+        head, _, rest = before.partition("\n")
+        before = f"{head}\ninclude = {curl}/fake/include.ini\n{rest}" + far.section()
     host.write(ini, before)
 
     holder = None
@@ -650,10 +942,13 @@ def main():
         # the state directory) does not share
         guicwd = host.root
         paths = [os.path.relpath(p, guicwd) for p in paths]
-    guiargs = [f"--{args.mode}", "-c", paths[0], "--statedir", paths[1],
-               "--cwd", paths[2]]
-    if args.inbox_cap or args.mode != "bench":
+    guiargs = ["-c", paths[0], "--statedir", paths[1], "--cwd", paths[2]]
+    if args.mode != "background":
+        guiargs.insert(0, f"--{args.mode}")  # it runs two checklists
+    if args.inbox_cap or args.mode not in ("bench", "background"):
         guiargs += ["--inbox-cap", str(args.inbox_cap or 32768)]
+    if far:
+        guiargs += ["--rcwd", far.work]
     if args.subprocess:
         guiargs.append("--engine=subprocess")
     if args.trace:
@@ -665,15 +960,29 @@ def main():
         guiargs += ["--shots", os.path.abspath(args.shots)]
 
     t0 = time.monotonic()
-    status, lines = host.run(guiargs, args.timeout, guicwd)
+    problems = []
+    if args.mode == "background":
+        problems, lines = background(args, host, guiargs, guicwd)
+        status = 0
+    else:
+        status, lines = host.run(guiargs, args.timeout, guicwd,
+                                 env=far.env() if far else None)
     dt = time.monotonic() - t0
 
-    problems = []
     if status is None:
         problems.append("the harness did not exit in time")
     elif status != 0:
         problems.append(f"exit status {status}")
     out = "".join(lines)
+    if args.mode == "remote":
+        problems += summaryproblems(status, lines, "the window")
+        with fake_provider.STATE.lock:
+            fetched = fake_provider.STATE.includes
+        if fetched < 2:
+            problems.append(f"the URL include was fetched {fetched} times, not again")
+        else:
+            print(f"the URL include was fetched {fetched} times")
+        problems += far.close(args.keep)
     if args.mode in ("drive", "e2e", "settings", "enginestop"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:

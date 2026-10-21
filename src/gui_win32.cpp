@@ -11,7 +11,11 @@
 // resize renders at once from WM_SIZE, and a timer armed while a move,
 // resize or menu loop runs keeps owed frames and deadlines going.
 // Wakes arrive as a posted message, which those loops dispatch too, so
-// streaming continues during a drag.
+// streaming continues during a drag. They go to a hidden window of
+// their own, which outlives the main window when it goes (w32gui_shed)
+// as the program runs on in the background, and which takes the tray
+// icon's notifications (Shell_NotifyIconW): a click opens the window
+// again, and its menu stops all or quits.
 //
 // The system's theme is the registry's AppsUseLightTheme, read again
 // when WM_SETTINGCHANGE names "ImmersiveColorSet". The title bar takes
@@ -34,6 +38,7 @@ struct W32Hooks {
     void (*modal)(void *gui, int);        // a modal loop began or ended
     void (*close)(void *gui);             // the user asks to close it
     void (*systheme)(void *gui, int dark);// the system's theme changed
+    void (*tray)(void *gui, int item);    // a pick from the tray's menu
     int    drive;                         // scripted: never take focus
 };
 
@@ -57,6 +62,10 @@ extern "C" void      w32gui_inject(void *, int kind, float x, float y,
 extern "C" int       w32gui_systheme(void *);  // 1 if apps should be dark
 extern "C" int       w32gui_theme(void *, int dark);  // the title bar's
 extern "C" void      w32gui_close(void *);
+extern "C" void      w32gui_shed(void *);      // the window goes, the loop stays
+extern "C" int       w32gui_reopen(void *, unsigned short const *title);
+extern "C" int       w32gui_trayopen(void *, unsigned short const *tip);
+extern "C" void      w32gui_trayclose(void *);
 
 
 #if HARNESS_GUIEDGE
@@ -98,12 +107,18 @@ __asm__(
 
 enum {
     WM_APP_WAKE = WM_APP + 1,
+    WM_APP_TRAY,              // the tray icon's notifications
     TIMER_MODAL = 1,
+    TRAY_ID     = 1,
+    TRAY_CMD    = 100,        // + the TRAY_* item, as a menu command
 };
 
 struct W32Gui {
     W32Hooks                hooks;
-    HWND                    hwnd;
+    HWND                    hwnd;        // null while shed
+    HWND                    msgwin;      // hidden, for wakes and the tray
+    NOTIFYICONDATAW         nid;
+    int                     trayon;
     HANDLE                  timer;       // high-resolution waitable timer
     ID3D11Device           *device;
     ID3D11DeviceContext    *context;
@@ -212,12 +227,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     switch (msg) {
-    case WM_APP_WAKE:
-        // Cleared before draining: a post during the drain wakes again.
-        InterlockedExchange(&w->wakeflag, 0);
-        h->wake(h->gui);
-        return 0;
-
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED) {
             h->minimized(h->gui, 1);
@@ -306,6 +315,52 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// The hidden window's: wakes, which come here whether or not the main
+// window exists, and the tray icon's clicks and menu.
+static LRESULT CALLBACK msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    W32Gui *w = (W32Gui *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!w) {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    W32Hooks *h = &w->hooks;
+    switch (msg) {
+    case WM_APP_WAKE:
+        // Cleared before draining: a post during the drain wakes again.
+        InterlockedExchange(&w->wakeflag, 0);
+        h->wake(h->gui);
+        return 0;
+    case WM_APP_TRAY:
+        switch (LOWORD(lp)) {
+        case WM_LBUTTONUP:
+            h->tray(h->gui, 0);  // TRAY_OPEN
+            return 0;
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU: {
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, TRAY_CMD+0, L"Open harness");
+            AppendMenuW(m, MF_STRING, TRAY_CMD+1, L"Stop all sessions");
+            AppendMenuW(m, MF_SEPARATOR, 0, 0);
+            AppendMenuW(m, MF_STRING, TRAY_CMD+2, L"Quit harness");
+            POINT pt;
+            GetCursorPos(&pt);
+            SetForegroundWindow(hwnd);  // so that the menu goes away
+            TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, 0);
+            PostMessageW(hwnd, WM_NULL, 0, 0);
+            DestroyMenu(m);
+        } return 0;
+        }
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wp)>=TRAY_CMD && LOWORD(wp)<TRAY_CMD+3) {
+            h->tray(h->gui, LOWORD(wp) - TRAY_CMD);
+            return 0;
+        }
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 static int makedevice(W32Gui *w, D3D_DRIVER_TYPE type)
 {
     DXGI_SWAP_CHAIN_DESC sd = {};
@@ -333,6 +388,8 @@ static int makedevice(W32Gui *w, D3D_DRIVER_TYPE type)
     return r == S_OK;
 }
 
+static int makewindow(W32Gui *w, unsigned short const *title);
+
 extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
 {
     W32Gui *w = (W32Gui *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(W32Gui));
@@ -359,6 +416,32 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
     wc.lpszClassName = L"harness";
     RegisterClassExW(&wc);
 
+    // A top-level window never shown, rather than a message-only one,
+    // since a tray icon's menu needs a window that can be in front
+    WNDCLASSEXW mc   = {};
+    mc.cbSize        = sizeof(mc);
+    mc.lpfnWndProc   = msgproc;
+    mc.hInstance     = inst;
+    mc.lpszClassName = L"harness-msg";
+    RegisterClassExW(&mc);
+    w->msgwin = CreateWindowExW(0, L"harness-msg", L"harness", WS_OVERLAPPED,
+                                0, 0, 0, 0, 0, 0, inst, 0);
+    if (!w->msgwin) {
+        return 0;
+    }
+    SetWindowLongPtrW(w->msgwin, GWLP_USERDATA, (LONG_PTR)w);
+    return makewindow(w, title) ? w : 0;
+}
+
+// The main window, its device, and ImGui's backends for them, which
+// w32gui_shed takes down again.
+static int makewindow(W32Gui *w, unsigned short const *title)
+{
+    W32Hooks *hooks = &w->hooks;
+    HINSTANCE inst  = GetModuleHandleW(0);
+    w->framedark = -1;
+    w->width     = 0;
+    w->height    = 0;
     w->hwnd = CreateWindowExW(
         0, L"harness", (LPCWSTR)title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
         CW_USEDEFAULT, 1280, 800, 0, 0, inst, 0
@@ -376,6 +459,7 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
     if (!makedevice(w, D3D_DRIVER_TYPE_HARDWARE) &&
             !makedevice(w, D3D_DRIVER_TYPE_WARP)) {
         DestroyWindow(w->hwnd);
+        w->hwnd = 0;
         return 0;
     }
     IDXGIFactory *factory = 0;
@@ -394,7 +478,69 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
     hooks->scale(hooks->gui, scale);
 
     SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, (LONG_PTR)w);
-    return w;
+    return 1;
+}
+
+// The main window goes, with its device and backends, and without the
+// quit message its destruction would post: wakes and the tray go on
+// through the hidden window.
+extern "C" void w32gui_shed(void *p)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (!w->hwnd) {
+        return;
+    }
+    SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, 0);
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    if (w->rtv)       w->rtv->Release();
+    if (w->swapchain) w->swapchain->Release();
+    if (w->context)   w->context->Release();
+    if (w->device)    w->device->Release();
+    w->rtv       = 0;
+    w->swapchain = 0;
+    w->context   = 0;
+    w->device    = 0;
+    DestroyWindow(w->hwnd);
+    w->hwnd     = 0;
+    w->occluded = 0;
+    w->inmodal  = 0;
+}
+
+extern "C" int w32gui_reopen(void *p, unsigned short const *title)
+{
+    W32Gui *w = (W32Gui *)p;
+    return w->hwnd || makewindow(w, title);
+}
+
+extern "C" int w32gui_trayopen(void *p, unsigned short const *tip)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (w->trayon) {
+        return 1;
+    }
+    NOTIFYICONDATAW *n = &w->nid;
+    *n = {};
+    n->cbSize           = sizeof(*n);
+    n->hWnd             = w->msgwin;
+    n->uID              = TRAY_ID;
+    n->uFlags           = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    n->uCallbackMessage = WM_APP_TRAY;
+    n->hIcon            = LoadIconW(0, (LPCWSTR)IDI_APPLICATION);
+    for (int i = 0; tip && tip[i] && i<(int)(sizeof(n->szTip)/2)-1; i++) {
+        n->szTip[i] = tip[i];
+    }
+    w->trayon = Shell_NotifyIconW(NIM_ADD, n) != 0;
+    return w->trayon;
+}
+
+extern "C" void w32gui_trayclose(void *p)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (w->trayon) {
+        Shell_NotifyIconW(NIM_DELETE, &w->nid);
+        w->trayon = 0;
+    }
 }
 
 // Separate from opening, since showing sends WM_SIZE, which draws, which
@@ -432,7 +578,7 @@ extern "C" void w32gui_wake(void *p)
 {
     W32Gui *w = (W32Gui *)p;
     if (!InterlockedExchange(&w->wakeflag, 1)) {
-        PostMessageW(w->hwnd, WM_APP_WAKE, 0, 0);
+        PostMessageW(w->msgwin, WM_APP_WAKE, 0, 0);
     }
 }
 
@@ -474,6 +620,9 @@ extern "C" void w32gui_present(void *p, int present, unsigned clear)
 extern "C" long long w32gui_refresh(void *p)
 {
     W32Gui *w = (W32Gui *)p;
+    if (!w->hwnd) {
+        return 1000000 / 60;
+    }
     HDC dc = GetDC(w->hwnd);
     int hz = GetDeviceCaps(dc, VREFRESH);
     ReleaseDC(w->hwnd, dc);
@@ -513,6 +662,12 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
 {
     W32Gui *w  = (W32Gui *)p;
     LPARAM  xy = MAKELPARAM((int)x, (int)y);
+    if (kind == 11) {  // a tray menu pick, tray or not, window or not
+        PostMessageW(w->msgwin, WM_COMMAND, TRAY_CMD + (int)x, 0);
+        return;
+    } else if (!w->hwnd) {
+        return;
+    }
     switch (kind) {
     case 0:  // move
         PostMessageW(w->hwnd, WM_MOUSEMOVE, 0, xy);
@@ -591,6 +746,9 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
 extern "C" void w32gui_raise(void *p)
 {
     W32Gui *w = (W32Gui *)p;
+    if (!w->hwnd) {
+        return;
+    }
     if (IsIconic(w->hwnd) || !IsWindowVisible(w->hwnd)) {
         ShowWindow(w->hwnd, w->hooks.drive ? SW_SHOWNOACTIVATE : SW_RESTORE);
     }
@@ -607,7 +765,9 @@ extern "C" int w32gui_systheme(void *p)
 extern "C" int w32gui_theme(void *p, int dark)
 {
     W32Gui *w = (W32Gui *)p;
-    if (w->framedark == dark) {
+    if (!w->hwnd) {
+        return 0;
+    } else if (w->framedark == dark) {
         return 1;
     }
     BOOL    v = dark;
@@ -630,15 +790,12 @@ extern "C" int w32gui_theme(void *p, int dark)
 extern "C" void w32gui_close(void *p)
 {
     W32Gui *w = (W32Gui *)p;
-    SetWindowLongPtrW(w->hwnd, GWLP_USERDATA, 0);
-    ImGui_ImplDX11_Shutdown();
-    ImGui_ImplWin32_Shutdown();
-    if (w->rtv)       w->rtv->Release();
-    if (w->swapchain) w->swapchain->Release();
-    if (w->context)   w->context->Release();
-    if (w->device)    w->device->Release();
-    DestroyWindow(w->hwnd);
+    w32gui_shed(w);
+    w32gui_trayclose(w);
+    SetWindowLongPtrW(w->msgwin, GWLP_USERDATA, 0);
+    DestroyWindow(w->msgwin);
     UnregisterClassW(L"harness", GetModuleHandleW(0));
+    UnregisterClassW(L"harness-msg", GetModuleHandleW(0));
 }
 
 // CRT startup lands here (-municode), and the core takes over.
@@ -656,7 +813,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
 static_assert((i32)W32IN_MOVE==(i32)INPUT_MOVE && (i32)W32IN_OTHER==(i32)INPUT_OTHER);
 static_assert(GEV_MOVE==0 && GEV_RESIZE==5 && GEV_MODALSIZE==6 && GEV_DPI==7 &&
-              GEV_CLOSE==8 && GEV_MINIMIZE==9 && GEV_SYSTHEME==10);
+              GEV_CLOSE==8 && GEV_MINIMIZE==9 && GEV_SYSTHEME==10 && GEV_TRAY==11);
+static_assert(TRAY_OPEN==0 && TRAY_STOPALL==1 && TRAY_QUIT==2);
 
 W32(i32, GetCurrentThreadId());
 
@@ -669,6 +827,7 @@ static void hookminimized(void *g, int m){ gui_minimized((Gui *)g, m); }
 static void hookmodal(void *g, int m)    { gui_modal((Gui *)g, m); }
 static void hookclose(void *g)           { gui_close((Gui *)g); }
 static void hooksystheme(void *g, int d) { gui_systheme((Gui *)g, d); }
+static void hooktray(void *g, int item)  { gui_tray((Gui *)g, item); }
 
 static void hooktick(void *p)
 {
@@ -688,6 +847,17 @@ static void os_wake(Os *os)
 
 static b32 os_guiopen(Os *os, Gui *g, Str title)
 {
+    Arena t = g->frame;
+    unsigned short *wtitle = (unsigned short *)towide(&t, title).data;
+    if (os->gui) {
+        // Again, after os_guished
+        if (!w32gui_reopen(os->gui, wtitle)) {
+            return 0;
+        }
+        gui_systheme(g, w32gui_systheme(os->gui));
+        w32gui_show(os->gui);
+        return 1;
+    }
     W32Hooks h = {};
     h.gui       = g;
     h.input     = hookinput;
@@ -700,9 +870,9 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     h.modal     = hookmodal;
     h.close     = hookclose;
     h.systheme  = hooksystheme;
+    h.tray      = hooktray;
     h.drive     = g->drive;
-    Arena t = g->frame;
-    os->gui = w32gui_open(&h, (unsigned short *)towide(&t, title).data);
+    os->gui = w32gui_open(&h, wtitle);
     if (!os->gui) {
         return 0;
     }
@@ -766,6 +936,25 @@ static void os_guiclose(Os *os)
 {
     w32gui_close(os->gui);
     os->gui = 0;
+}
+
+static void os_guished(Os *os)
+{
+    w32gui_shed(os->gui);
+}
+
+static b32 os_trayopen(Os *os, Str tip)
+{
+    u8    buf[512];
+    Arena a = {};
+    a.beg = (byte *)buf;
+    a.end = (byte *)buf + countof(buf);
+    return w32gui_trayopen(os->gui, (unsigned short *)towide(&a, tip).data);
+}
+
+static void os_trayclose(Os *os)
+{
+    w32gui_trayclose(os->gui);
 }
 
 #endif

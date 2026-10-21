@@ -20,6 +20,13 @@
 // quit event, which wakes the loop: SDL's own handlers only set a flag
 // for the next event pump, which an idle loop never runs.
 //
+// The window may go while the program runs on (os_guished), keeping
+// SDL and its event loop for wakes and a tray icon (macOS: the menu
+// bar; Linux: a status notifier, through appindicator loaded at run
+// time, or none), whose menu picks arrive as events of our own; a window
+// comes back through os_guiopen. While only the icon is left, the app
+// has no Dock icon on macOS (an accessory app).
+//
 // SDL reports the system's theme (macOS: the app's effective appearance;
 // Linux: the desktop portal's color-scheme, unknown without one, taken
 // as dark) and its changes as events. On macOS the window's frame takes
@@ -66,11 +73,21 @@ using GlClearColor = void (*)(f32, f32, f32, f32);
 using GlClear      = void (*)(u32);
 using GlReadPixels = void (*)(i32, i32, i32, i32, u32, u32, void *);
 
+struct GuiSdl;
+
+struct TrayItem {
+    GuiSdl *p;
+    i32     item;  // TRAY_*
+};
+
 struct GuiSdl {
     Gui          *gui;
-    SDL_Window   *window;
+    SDL_Window   *window;      // null while shed (os_guished)
     SDL_GLContext gl;
+    SDL_Tray     *tray;
+    TrayItem      items[3];
     u32           wakeevent;
+    u32           trayevent;   // a tray menu pick: code is the TRAY_* item
     i32           wakeflag;    // atomic: a wake event is queued
     b32           inwatch;     // drawing from the event watch
     i32           framedark;   // the frame's theme: -1 unset, 0 light, 1 dark
@@ -284,15 +301,42 @@ static bool SDLCALL sdlwatch(void *ud, SDL_Event *e)
     return 1;
 }
 
+static b32 sdlwindow(Os *, Gui *, GuiSdl *, Str title);
+
+#ifdef __APPLE__
+// Whether the app shows in the Dock and the app switcher: not while
+// only its menu bar icon is left (an accessory app).
+static void dockicon(b32 show)
+{
+    using Get = void *(*)(void *, void *);
+    using Set = void  (*)(void *, void *, i64);
+    void *cls = objc_getClass("NSApplication");
+    void *app = cls ? ((Get)(void *)objc_msgSend)(cls, sel_registerName("sharedApplication")) : 0;
+    if (app) {
+        ((Set)(void *)objc_msgSend)(app, sel_registerName("setActivationPolicy:"), show ? 0 : 1);
+    }
+}
+#endif
+
 static b32 os_guiopen(Os *os, Gui *g, Str title)
 {
-    GuiSdl *p = alloc<GuiSdl>(&g->perm);
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (p) {
+        #ifdef __APPLE__
+        dockicon(1);
+        #endif
+        p->framedark = -1;
+        return sdlwindow(os, g, p, title);
+    }
+    p = alloc<GuiSdl>(&g->perm);
     p->gui = g;
     SDL_SetHint(SDL_HINT_POLL_SENTINEL, "0");
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");  // sigthread's job
     // A click that activates the window also reaches what it lands on,
     // as on Windows, rather than being swallowed by the activation.
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
+    // The window may go while a tray icon keeps the program running
+    SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
     if (g->drive) {
         // Synthetic input must not compete with the real mouse, which
         // the backend reads directly while the window has focus.
@@ -301,6 +345,23 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         return 0;
     }
+    p->wakeevent = SDL_RegisterEvents(2);
+    p->trayevent = p->wakeevent + 1;
+    p->framedark = -1;
+    if (!sdlwindow(os, g, p, title)) {
+        return 0;
+    }
+    os_thread(os, sigthread, 0);
+    #ifdef __linux__
+    portalwatch(os, &g->perm, p);
+    #endif
+    return 1;
+}
+
+// The window, its GL context, and ImGui's backends for them, which
+// os_guished takes down again.
+static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
+{
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -316,6 +377,8 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     }
     p->gl = SDL_GL_CreateContext(p->window);
     if (!p->gl) {
+        SDL_DestroyWindow(p->window);
+        p->window = 0;
         return 0;
     }
     SDL_GL_MakeCurrent(p->window, p->gl);
@@ -329,10 +392,11 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     p->glclear      = (GlClear)SDL_GL_GetProcAddress("glClear");
     p->glreadpixels = (GlReadPixels)SDL_GL_GetProcAddress("glReadPixels");
     if (!p->glviewport || !p->glclearcolor || !p->glclear) {
+        SDL_GL_DestroyContext(p->gl);
+        SDL_DestroyWindow(p->window);
+        p->window = 0;
         return 0;
     }
-    p->wakeevent = SDL_RegisterEvents(1);
-    p->framedark = -1;
     #ifdef __APPLE__
     g->clickthrough = firstmouse(p->window);
     #else
@@ -347,10 +411,6 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     gui_systheme(g, sysdark(p));  // the frame takes it before it shows
     SDL_AddEventWatch(sdlwatch, p);
     SDL_ShowWindow(p->window);
-    os_thread(os, sigthread, 0);
-    #ifdef __linux__
-    portalwatch(os, &g->perm, p);
-    #endif
     return 1;
 }
 
@@ -381,10 +441,23 @@ static void dispatch(GuiSdl *p, SDL_Event *e)
     if (e->type == p->wakeevent) {
         takewake(p);
         return;
+    } else if (e->type == p->trayevent) {
+        gui_tray(g, e->user.code);
+        return;
+    } else if (!p->window) {
+        // Shed: what is left is quitting (a signal, a logout)
+        if (e->type == SDL_EVENT_QUIT) {
+            gui_close(g);
+        }
+        return;
     }
     switch (e->type) {
     case SDL_EVENT_QUIT:
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+        if (g->drive) {
+            guilog(g, e->type==SDL_EVENT_QUIT ? Str("drive: SDL quit event")
+                                              : Str("drive: SDL close event"));
+        }
         gui_close(g);
         return;
     case SDL_EVENT_SYSTEM_THEME_CHANGED:
@@ -484,7 +557,10 @@ static void os_guipresent(Os *os, b32 present, u32 clear)
 
 static void os_guiraise(Os *os)
 {
-    GuiSdl         *p = (GuiSdl *)os->gui;
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p || !p->window) {
+        return;
+    }
     SDL_WindowFlags f = SDL_GetWindowFlags(p->window);
     if (f & SDL_WINDOW_HIDDEN) {
         SDL_ShowWindow(p->window);
@@ -509,7 +585,16 @@ static void os_guiinject(Os *os, GuiEvent *ge)
 {
     GuiSdl   *p  = (GuiSdl *)os->gui;
     SDL_Event e  = {};
-    u32       id = SDL_GetWindowID(p->window);
+    if (ge->kind == GEV_TRAY) {
+        // As a pick from its menu sends it, tray or not
+        e.type      = p->trayevent;
+        e.user.code = (i32)ge->x;
+        SDL_PushEvent(&e);
+        return;
+    } else if (!p->window) {
+        return;
+    }
+    u32 id = SDL_GetWindowID(p->window);
     switch (ge->kind) {
     case GEV_MOVE:
         e.type            = SDL_EVENT_MOUSE_MOTION;
@@ -595,7 +680,7 @@ static void os_guiinject(Os *os, GuiEvent *ge)
 static b32 os_guitheme(Os *os, b32 dark)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
-    if (!p) {
+    if (!p || !p->window) {
         return 0;
     }
     #ifdef __APPLE__
@@ -623,14 +708,106 @@ static b32 os_guitheme(Os *os, b32 dark)
     #endif
 }
 
-static void os_guiclose(Os *os)
+static void os_guished(Os *os)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p || !p->window) {
+        return;
+    }
     SDL_RemoveEventWatch(sdlwatch, p);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     SDL_GL_DestroyContext(p->gl);
     SDL_DestroyWindow(p->window);
+    p->window = 0;
+    p->gl     = 0;
+    #ifdef __APPLE__
+    if (p->tray) {
+        dockicon(0);  // the menu bar icon is the way back
+    }
+    #endif
+}
+
+// A pick from the tray icon's menu, through the queue: it may come from
+// inside the system's menu loop.
+static void SDLCALL traypick(void *ud, SDL_TrayEntry *)
+{
+    TrayItem *t = (TrayItem *)ud;
+    SDL_Event e = {};
+    e.type      = t->p->trayevent;
+    e.user.code = t->item;
+    SDL_PushEvent(&e);
+}
+
+// A blue round icon of n by n pixels, for the tray: an SDL surface of
+// its own, which the tray copies.
+static SDL_Surface *trayicon(i32 n)
+{
+    SDL_Surface *s = SDL_CreateSurface(n, n, SDL_PIXELFORMAT_RGBA32);
+    if (!s) {
+        return 0;
+    }
+    f32 c = (f32)n/2;
+    for (i32 y = 0; y < n; y++) {
+        u8 *row = (u8 *)s->pixels + (iz)y*s->pitch;
+        for (i32 x = 0; x < n; x++) {
+            f32 dx = (f32)x + 0.5f - c, dy = (f32)y + 0.5f - c;
+            f32 d  = c - 1 - __builtin_sqrtf(dx*dx + dy*dy);  // inside if > 0
+            f32 a  = d>1 ? 1 : d<0 ? 0 : d;
+            row[4*x+0] = 0x2f;
+            row[4*x+1] = 0x6f;
+            row[4*x+2] = 0xd0;
+            row[4*x+3] = (u8)(a*255);
+        }
+    }
+    return s;
+}
+
+static b32 os_trayopen(Os *os, Str tip)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p || p->tray) {
+        return p && p->tray;
+    }
+    Arena        a    = p->gui->frame;
+    SDL_Surface *icon = trayicon(32);
+    p->tray = SDL_CreateTray(icon, cstr0(&a, tip));
+    SDL_DestroySurface(icon);
+    SDL_TrayMenu *menu = p->tray ? SDL_CreateTrayMenu(p->tray) : 0;
+    if (!menu) {
+        char const *why = SDL_GetError();
+        guilog(p->gui, concat(&a, "no tray icon: ", {(u8 *)why, (iz)__builtin_strlen(why)}));
+        if (p->tray) {
+            SDL_DestroyTray(p->tray);
+            p->tray = 0;
+        }
+        return 0;
+    }
+    static char const *labels[] = {"Open harness", "Stop all sessions", "Quit harness"};
+    for (i32 i = 0; i < countof(labels); i++) {
+        p->items[i].p    = p;
+        p->items[i].item = i;
+        SDL_TrayEntry *e = SDL_InsertTrayEntryAt(menu, -1, labels[i], SDL_TRAYENTRY_BUTTON);
+        if (e) {
+            SDL_SetTrayEntryCallback(e, traypick, &p->items[i]);
+        }
+    }
+    return 1;
+}
+
+static void os_trayclose(Os *os)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (p && p->tray) {
+        SDL_DestroyTray(p->tray);
+        p->tray = 0;
+    }
+}
+
+static void os_guiclose(Os *os)
+{
+    os_guished(os);
+    os_trayclose(os);
     os->gui = 0;
     SDL_Quit();
 }

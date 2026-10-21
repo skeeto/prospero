@@ -61,6 +61,7 @@ class State:
         self.controls = []  # control requests, in order
         self.active = {}    # prefix -> {model: requests in flight}
         self.peak = {}      # prefix -> most different models in flight
+        self.includes = 0   # fetches of /fake/include.ini
         self.stop = threading.Event()
 
     def register(self, model, **listing):
@@ -1380,7 +1381,8 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Start subagents", "Report as a subagent", "Plan it with a todo list",
                "Start background jobs", "Start a subagent that asks",
                "Write outside as a subagent", "Make undoable changes",
-               "Read the big files", "Fail over")
+               "Read the big files", "Fail over", "Stream in the background",
+               "Stream for the link")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -1455,7 +1457,22 @@ def gui_turn(req):
 def sc_gui(model, n, req):
     prompt, step, after = gui_turn(req)
     last = after[-1] if after else {}
-    if "Stream slowly" in prompt:
+    if "Stream in the background" in prompt:
+        # About 8 s: the window goes partway through, and the rest
+        # streams to nobody but the log
+        yield S.head()
+        for i in range(400):
+            yield from text(model, f"bg{i} ")
+            yield S.sleep(0.02)
+        yield from finish(model)
+    elif "Stream for the link" in prompt:
+        # About 9 s, long enough for a link to drop and come back
+        yield S.head()
+        for i in range(300):
+            yield from text(model, f"link{i} ")
+            yield S.sleep(0.03)
+        yield from finish(model)
+    elif "Stream slowly" in prompt:
         yield S.head()
         for i in range(300):
             yield from text(model, f"slow{i} ")
@@ -2117,6 +2134,16 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
         elif url.path in ("/fake/stall", "/fake/stallbody"):
             self.stall(url.path)
+        elif url.path == "/fake/include.ini":
+            # A configuration to include by URL, counting its fetches
+            with STATE.lock:
+                STATE.includes += 1
+            body = b"# Included by URL\n[role included]\nprompt = From a URL include.\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_json(404, {"error": {"message": "not found"}})
 

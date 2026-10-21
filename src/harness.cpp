@@ -313,10 +313,11 @@ static void    os_wake(Os *);
 // from inside them, gui_systheme with the system's theme preference
 // (dark or light) as the window opens and whenever it changes, and
 // gui_close when the user asks to close the window or quit, which the
-// core may decline: the window stays until os_guiclose.
+// core may decline: the window stays until os_guiclose. gui_tray tells
+// of a pick from the tray icon's menu (TRAY_*).
 struct Gui;
-// Open the main window with ImGui's platform and renderer backends.
-// Returns 0 on failure.
+// Open the main window with ImGui's platform and renderer backends, or
+// open it again after os_guished. Returns 0 on failure.
 static b32     os_guiopen(Os *, Gui *, Str title);
 // Wait up to us microseconds (forever if negative) for an event, then
 // dispatch every pending one. Returns 0 if the window is gone.
@@ -336,7 +337,22 @@ static void    os_guiraise(Os *);
 // theme, where the platform can: Windows 10 1809 and later, and macOS.
 // Returns 0 where it cannot, and before the window exists.
 static b32     os_guitheme(Os *, b32 dark);
+// Close the window, and everything with it.
 static void    os_guiclose(Os *);
+// (M5) Shed the window and its renderer, keeping the event loop, which
+// os_guiwait goes on running, wakes included, for the tray icon and
+// until os_guiopen opens a window again or os_guiclose ends it all.
+static void    os_guished(Os *);
+// (M5) A tray icon (Windows' notification area, macOS's menu bar, a
+// Linux desktop's status notifier) with a menu of the TRAY_* items,
+// and the tip shown over it. Returns 0 where there is none to be had.
+enum {
+    TRAY_OPEN,     // bring the window back
+    TRAY_STOPALL,  // stop every session's work
+    TRAY_QUIT,     // stop everything, and exit
+};
+static b32     os_trayopen(Os *, Str tip);
+static void    os_trayclose(Os *);
 
 // Synthetic input for the scripted checklist (gui --drive), posted to
 // the window's own event queue so that it takes the path real input
@@ -356,6 +372,8 @@ enum {
     GEV_MINIMIZE,   // the window is minimized
     GEV_SYSTHEME,   // the system's theme turns dark (x 1) or light (x 0),
                     // or back to what it really is (x -1)
+    GEV_TRAY,       // the tray icon's menu item x (TRAY_*) is picked,
+                    // tray or not, window or not
 };
 enum {
     GKEY_TAB,

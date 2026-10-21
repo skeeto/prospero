@@ -61,8 +61,10 @@ if(NOT WIN32)
     URL_HASH SHA256=9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
     SYSTEM
   )
-  # Video and events only. X11, Wayland and GL stay dlopened, so one
-  # Linux binary still runs headless where no display libraries exist.
+  # Video and events only, and the tray icon of a GUI kept running in the
+  # background. X11, Wayland, GL and the Linux tray's libraries
+  # (appindicator, GTK) stay dlopened, so one Linux binary still runs
+  # headless where no display libraries exist.
   set(SDL_SHARED        OFF CACHE BOOL "" FORCE)
   set(SDL_STATIC        ON  CACHE BOOL "" FORCE)
   set(SDL_TEST_LIBRARY  OFF CACHE BOOL "" FORCE)
@@ -78,7 +80,7 @@ if(NOT WIN32)
   set(SDL_HIDAPI        OFF CACHE BOOL "" FORCE)
   set(SDL_POWER         OFF CACHE BOOL "" FORCE)
   set(SDL_SENSOR        OFF CACHE BOOL "" FORCE)
-  set(SDL_TRAY          OFF CACHE BOOL "" FORCE)
+  set(SDL_TRAY          ON  CACHE BOOL "" FORCE)
   set(SDL_VULKAN        OFF CACHE BOOL "" FORCE)
   set(SDL_KMSDRM        OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(SDL3)

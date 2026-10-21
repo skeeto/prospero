@@ -23,6 +23,22 @@
 // come back from the session's log, which the GUI reads itself and
 // applies from the last record it has (resync).
 //
+// Besides its engine, the GUI reaches hosts (host.cpp) through the
+// client library (remote.cpp), each with an inbox of its own: the
+// background hosts its state directory registers, found at startup,
+// and remote ones over ssh, as [remote NAME] sets them up, connected
+// from the Hosts panel. Their sessions are listed under them, and work
+// as the engine's do, but their files are never read here: a link that
+// breaks catches up through the library, which opens them again from
+// where their views are, and a spill file comes through the file
+// command. A background host shares the state directory, so the engine
+// lists its sessions too, as held elsewhere: they are the host's while
+// it holds them, and the engine's again once it lets them go.
+//
+// Closing the window with turns running may keep them running instead
+// of stopping them: this process becomes a host of its engine, in
+// place, with no window and a tray icon (Background hosting, below).
+//
 // The theme is [ui] theme: read from the configuration before the
 // window opens, so that it opens in it, then from each config.get
 // reply, and picked in the settings window, where it applies at once.
@@ -155,6 +171,19 @@ enum : i32 {
     RECT_FORCE,      // the latest rewind card's Rewind anyway
     RECT_INFOBTN,    // the session's Info
     RECT_COMPACTHDR, // the latest compaction card's header
+    RECT_CLOSEBG,    // the close dialog's Keep running in background
+    RECT_HOSTCOMBO,  // the new session's host, and its first choices
+    RECT_HOST0,
+    RECT_HOST1,
+    RECT_HOST2,
+    RECT_HOST3,
+    RECT_CONNECT,    // the Hosts panel's first remote: Connect or Disconnect
+    RECT_CONNECT2,   // and its second's
+    RECT_REMNAME,    // its new remote's fields and Add
+    RECT_REMSSH,
+    RECT_REMADD,
+    RECT_OUTPUT,     // the latest tool row's Output
+    RECT_REFRESHINC, // the settings window's Refresh includes
     RECT_THEME0,     // the theme's choices in its open list
     RECT_COUNT = RECT_THEME0 + THEME_COUNT,
 };
@@ -238,9 +267,40 @@ struct Fake {
     byte    *turnbase;
 };
 
+// Where sessions run: this process's engine, always first, and hosts
+// reached through the client library (remote.cpp): background hosts on
+// this machine, at the endpoints their registrations name, and remote
+// ones over ssh, as [remote NAME] sections set them up.
+enum : i32 {
+    GH_ENGINE,  // this process's engine, or its process (--engine)
+    GH_LOCAL,   // a host on this machine
+    GH_REMOTE,  // a [remote NAME] over ssh
+};
+
+struct GuiHost {
+    GuiHost *next;
+    i32      kind;
+    Str      name;      // a remote's name, a local host's pid; "" for the engine
+    Remote  *r;         // GH_LOCAL and GH_REMOTE while connected, else null
+    Mailbox *inbox;     // its records, which wake the GUI
+    i32      state;     // RS_*, from its "remote" records
+    Str      msg;       // why it is down, or failed
+    i64      retryat;   // epoch ms: it tries again then, while down
+    b32      up;        // it answered hello
+    b32      closing;   // asked to close: its records are let go
+    b32      own;       // this process's own host, after the window came back
+    i64      pid;       // GH_LOCAL: the host's process
+    i64      started;   // GH_LOCAL: epoch ms
+    Str      endpoint;  // GH_LOCAL
+    Str      regpath;   // GH_LOCAL: its registration, removed once it is gone
+    i64      opens;     // times its link was made, for the checklist
+    i64      downs;     // times it went down
+};
+
 // A session the GUI knows: listed by the engine, or opened here.
 struct GuiSession {
     GuiSession  *next;
+    GuiHost     *host;      // where it runs
     Str          sid;
     View        *view;      // null until opened or created here
     ImGuiWindow *win;       // its transcript's child window, last frame
@@ -266,6 +326,22 @@ struct Request {
     i64         id;
     i32         cmd;
     GuiSession *s;
+    GuiHost    *h;   // where it went
+};
+
+// A file of a session's directory, as the file command brings it in
+// parts: a spill file shown in the Output window.
+struct OutFile {
+    GuiSession *s;
+    Str         path;   // relative to the session's directory
+    Buf         text;
+    i64         off;    // where the next part begins
+    i64         size;
+    b32         more;
+    i64         id;     // the command in flight, 0 if none
+    Str         err;
+    Arena       mem;
+    byte       *base;
 };
 
 // One setting in the settings window, from config.get.
@@ -383,6 +459,7 @@ struct Gui {
     Buf                line;
     Str                cfgpath;    // -c FILE, else null for the default
     i64                nextid;
+    GuiHost           *cmdhost;    // where the command being written goes
     Request            reqs[REQ_MAX];
     b32                engineok;   // it said hello
     b32                enginegone; // it stopped
@@ -403,6 +480,34 @@ struct Gui {
     GuiSession        *sess;       // the session shown, or null
     GuiSession         nosession;  // the empty view and its scroll state
     Str                lasterr;    // the latest command error
+
+    // Hosts
+    GuiHost           *hosts;      // the engine's first, then the others
+    GuiHost           *spare;      // hosts gone, to make over
+    GuiHost           *main;       // where the configuration is, and new
+                                   // sessions by default: the engine's, or
+                                   // this process's own host once its
+                                   // window comes back
+    GuiHost           *pendhost;   // whose records are held back
+    Host              *host;       // this process as a host, else null
+    i32                hostdone;   // atomic: that host has stopped
+    b32                bg;         // the window is gone, the host runs on
+    i32                shedreq;    // between frames: 1 the window goes,
+                                   // 2 to the background
+    i64                hostidle;   // ticks: --host-idle, else [host] idle_exit
+    b32                trayup;     // a tray icon brings the window back
+    Str                hosterr;    // why this process could not host
+    Str                whynobg;    // why it cannot, as the close dialog opened
+    i32                hostfound;  // background hosts found at startup
+    char              *remname;    // the Hosts panel's new remote
+    char              *remssh;
+    char              *rempath;
+    Str                remstatus;  // and how adding it went
+    b32                remok;
+    GuiHost           *newhost;    // the new session's host
+    OutFile            out;        // the Output window's file
+    b32                outopen;
+    b32                outfocus;   // brought to the front next frame
 
     // Transcript
     f32                lastwidth;
@@ -432,6 +537,8 @@ struct Gui {
     Slice<CfgRow>      cfgrows;
     char              *addname;    // a new section's name
     i64                cfgget;     // config.get in flight, 0 if none
+    i64                cfgrefresh; // and its id if it refreshes includes
+    i64                cfgrefreshed; // config.get {refresh} replies so far
     i64                cfgset;     // config.set in flight, 0 if none
     i64                cfgsets;    // config.set replies so far
     Str                cfgstatus;  // the latest config.set outcome
@@ -502,6 +609,14 @@ struct Gui {
     i32                jobsshown;    // jobs the jobs panel drew
     i32                infoshown;    // instruction files the info listed
     i32                infoagents;   // of them AGENTS.md
+    i32                bgbadge;      // the session shown was badged background
+    b32                outshown;     // the Output window showed text
+    b32                downshown;    // a host's countdown to its next try
+    b32                elseshown;    // closing said what runs on elsewhere
+    b32                failshown;    // the Hosts panel said why one failed
+    GuiHost           *hostitems[4]; // the new session's host list, as drawn
+    i64                deltamark;    // the shown session's deltas, as marked
+    Str                driverwd;     // --rcwd: the remote one
     b32                kidlinkshown; // a task row asked to answer its subagent
     i64                rewsent;      // rewinds sent
     i32                drivewait;    // W_* condition it waits for
@@ -579,19 +694,33 @@ static void wakegui(void *ctx)
     os_wake((Os *)ctx);
 }
 
-static GuiSession *findsess(Gui *g, Str sid)
+// A session of a host.
+static GuiSession *findsess(Gui *g, GuiHost *h, Str sid)
 {
     for (GuiSession *s = g->sessions; s; s = s->next) {
-        if (s->sid == sid) {
+        if (s->host==h && s->sid==sid) {
             return s;
         }
     }
     return 0;
 }
 
-static GuiSession *addsess(Gui *g, Str sid)
+// A session of any host on this machine, which share its state
+// directory: the engine's, or a background host's.
+static GuiSession *findlocal(Gui *g, Str sid)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->host->kind!=GH_REMOTE && s->sid==sid) {
+            return s;
+        }
+    }
+    return 0;
+}
+
+static GuiSession *addsess(Gui *g, GuiHost *h, Str sid)
 {
     GuiSession *s = alloc<GuiSession>(&g->perm);
+    s->host  = h;
     s->sid   = clone(&g->perm, sid);
     s->stick = 1;
     s->state = LIVE_CLOSED;
@@ -606,14 +735,17 @@ static Str sessdir(Gui *g, Arena *a, Str sid)
     return join(a, join(a, g->statedir, "sessions"), sid);
 }
 
-// A session's view model, made on first use, which its records fill.
+// A session's view model, made on first use, which its records fill. A
+// remote session's files are elsewhere, named relative to its directory.
 static View *sessview(Gui *g, GuiSession *s)
 {
     if (!s->view) {
         iz mb = (iz)1 << 20;
         s->view = newview(&g->perm, g->vcache, os_reserve(g->os, 1024*mb),
                           os_reserve(g->os, 256*mb), os_reserve(g->os, 256*mb));
-        s->view->dir = sessdir(g, &g->perm, s->sid);
+        if (s->host->kind != GH_REMOTE) {
+            s->view->dir = sessdir(g, &g->perm, s->sid);
+        }
     }
     return s->view;
 }
@@ -627,7 +759,7 @@ static void setcur(Gui *g, GuiSession *s)
 }
 
 // Remember a command until its reply, in place of the oldest if full.
-static void request(Gui *g, i64 id, i32 cmd, GuiSession *s)
+static void request(Gui *g, i64 id, i32 cmd, GuiSession *s, GuiHost *h)
 {
     Request *slot = &g->reqs[0];
     for (i32 i = 1; i < REQ_MAX; i++) {
@@ -638,6 +770,7 @@ static void request(Gui *g, i64 id, i32 cmd, GuiSession *s)
     slot->id  = id;
     slot->cmd = cmd;
     slot->s   = s;
+    slot->h   = h;
 }
 
 static Request takereq(Gui *g, i64 id)
@@ -653,9 +786,10 @@ static Request takereq(Gui *g, i64 id)
     return r;
 }
 
-// Begin a command for a session (or none) awaiting a reply. Its id is
-// g->nextid. Finish it with cmdsend.
-static EvOut cmdopen(Gui *g, Buf *b, i32 cmd, GuiSession *s)
+// Begin a command for a session, else for a host (the main one if
+// null), awaiting a reply. Its id is g->nextid. Finish it with cmdsend,
+// before beginning another.
+static EvOut cmdopen(Gui *g, Buf *b, i32 cmd, GuiSession *s, GuiHost *h = 0)
 {
     i64   id = ++g->nextid;
     EvOut w  = cmdbegin(b, cmd, id);
@@ -663,7 +797,8 @@ static EvOut cmdopen(Gui *g, Buf *b, i32 cmd, GuiSession *s)
         putkey(&w.json, "sid");
         putstr(&w.json, s->sid);
     }
-    request(g, id, cmd, s);
+    g->cmdhost = s ? s->host : h ? h : g->main;
+    request(g, id, cmd, s, g->cmdhost);
     return w;
 }
 
@@ -673,17 +808,39 @@ static void fakecommand(Gui *g, Arena scratch, Str line);
 // os_guiopen) before the engine starts.
 static b32 engineup(Gui *g)
 {
-    return g->enginekind==ENGINE_FAKE || g->engine || g->proc;
+    return g->enginekind==ENGINE_FAKE || g->engine || g->proc || g->main->kind!=GH_ENGINE;
 }
 
-// Finish a command and send it to the engine. The scratch must follow
-// the command's buffer.
+// A reply to a command that could not go out, as its host would give
+// one, taken with its host's records.
+static void cmdfail(Gui *g, GuiHost *h, Arena scratch, i64 id, Str err)
+{
+    Buf   b(&scratch, 256 + err.len);
+    EvOut w = evbegin(&b, {}, 0, os_time(g->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 0);
+    putstrkey(&w.json, "err", err);
+    mailpost(h->inbox, MAIL_OUT, 0, evend(&w), 0);
+}
+
+// Finish a command and send it to its host (cmdopen). The scratch must
+// follow the command's buffer.
 static void cmdsend(Gui *g, EvOut *w, Arena scratch)
 {
-    Str line = evend(w);
+    Str      line = evend(w);
+    GuiHost *h    = g->cmdhost;
+    if (h->kind != GH_ENGINE) {
+        // The library holds it while the host has not answered hello
+        if (!h->r || h->closing) {
+            cmdfail(g, h, scratch, g->nextid, "not connected to the host");
+        } else if (!remotetry(h->r, cuttail(line, 1))) {
+            cmdfail(g, h, scratch, g->nextid, "too much is waiting to go to the host");
+        }
+        return;
+    }
     switch (g->enginekind) {
     case ENGINE_INPROC:
-        if (g->engine) {
+        if (g->engine && !g->host) {
             enginecmd(g->engine, cuttail(line, 1));
         }
         break;
@@ -711,19 +868,29 @@ static void guihello(Gui *g)
     cmdsend(g, &w, a);
 }
 
-// Ask for the sessions list, which arrives as a sessions record.
-static void guilist(Gui *g)
+// Ask a host (the main one if null) for its sessions, which arrive as a
+// sessions record.
+static void guilist(Gui *g, GuiHost *h = 0)
 {
-    if (g->enginekind == ENGINE_FAKE) {
+    h = h ? h : g->main;
+    if (g->enginekind==ENGINE_FAKE || (h->kind!=GH_ENGINE && !h->up)) {
         return;
     }
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 64);
-    EvOut w = cmdopen(g, &b, CMD_LIST, 0);
+    EvOut w = cmdopen(g, &b, CMD_LIST, 0, h);
     cmdsend(g, &w, a);
 }
 
-static void guiconfigget(Gui *g)
+// Every host's sessions.
+static void guilistall(Gui *g)
+{
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        guilist(g, h);
+    }
+}
+
+static void guiconfigget(Gui *g, b32 refresh = 0)
 {
     if (g->enginekind==ENGINE_FAKE || g->cfgget || !engineup(g)) {
         return;
@@ -731,6 +898,11 @@ static void guiconfigget(Gui *g)
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 64);
     EvOut w = cmdopen(g, &b, CMD_CONFIGGET, 0);
+    if (refresh) {
+        putkey(&w.json, "refresh");
+        putint(&w.json, 1);
+        g->cfgrefresh = g->nextid;
+    }
     g->cfgget = g->nextid;
     cmdsend(g, &w, a);
 }
@@ -783,13 +955,87 @@ static void guiselect(Gui *g, GuiSession *s)
     setcur(g, s);
 }
 
+// No more records of a session: its host may close it, unless another
+// of its clients has it open.
+static void guiclose(Gui *g, GuiSession *s)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_CLOSE, s);
+    cmdsend(g, &w, a);
+}
+
+// Ask for the next part of the Output window's file, if any.
+static void guifile(Gui *g)
+{
+    OutFile *o = &g->out;
+    if (!o->s || o->id || (o->off && !o->more)) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + o->path.len);
+    EvOut w = cmdopen(g, &b, CMD_FILE, o->s);
+    putkey(&w.json, "path");
+    putstr(&w.json, o->path);
+    putkey(&w.json, "off");
+    putint(&w.json, o->off);
+    o->id = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// Show a file of a session's directory in the Output window, taken
+// through its host, which may be on another machine.
+static void showfile(Gui *g, GuiSession *s, Str path)
+{
+    OutFile *o = &g->out;
+    if (!o->base) {
+        o->mem  = newarena(os_reserve(g->os, (iz)1<<28));
+        o->base = o->mem.beg;
+    }
+    o->mem.beg = o->base;
+    o->s       = s;
+    o->path    = clone(&o->mem, path);
+    o->text    = Buf(&o->mem, 1<<16);
+    o->off     = 0;
+    o->size    = 0;
+    o->more    = 0;
+    o->id      = 0;
+    o->err      = {};
+    g->outopen  = 1;
+    g->outfocus = 1;
+    guifile(g);
+    scheddirty(&g->sched);
+}
+
+// A part of the Output window's file arrived. The window keeps 64 MiB at
+// most, and asks for more only when told to.
+static void onfile(Gui *g, Json *j, b32 ok, Str err)
+{
+    OutFile *o = &g->out;
+    o->id = 0;
+    if (!ok) {
+        o->err = clone(&o->mem, err.len ? err : Str("cannot read the file"));
+        return;
+    }
+    Str text = jsonstr(jsonget(j, "text"));
+    if (o->text.len+text.len > (iz)64<<20) {
+        o->more = 0;
+        o->err  = "too long to show more";
+        return;
+    }
+    print(&o->text, text);
+    o->off  = jsonint(jsonget(j, "off"), o->off);
+    o->size = jsonint(jsonget(j, "size"), 0);
+    o->more = jsonint(jsonget(j, "more"), 0) != 0;
+}
+
 // A new session in cwd, with the given model or the configured one,
 // and a role ([role NAME]), if named.
-static void guinew(Gui *g, Str cwd, Str model, Str role = {})
+static void guinew(Gui *g, GuiHost *h, Str cwd, Str model, Str role = {})
 {
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 512 + cwd.len + model.len + role.len);
-    EvOut w = cmdopen(g, &b, CMD_NEW, 0);
+    EvOut w = cmdopen(g, &b, CMD_NEW, 0, h);
     putkey(&w.json, "cwd");
     putstr(&w.json, cwd);
     if (model.len) {
@@ -888,21 +1134,65 @@ static void guijobkill(Gui *g, GuiSession *s, i64 job)
     cmdsend(g, &w, a);
 }
 
-// Sessions whose turns would be stopped by quitting.
+// Whether a session is at work: a turn, or an ask.
+static b32 sessbusy(GuiSession *s)
+{
+    return s->view && !s->readonly && (s->view->busy || s->view->asks);
+}
+
+// Sessions whose turns would be stopped by quitting: this process's
+// engine's, while it is not a host.
 static i32 running(Gui *g)
 {
-    if (g->enginegone) {
-        return 0;  // nothing can run
+    if (g->enginegone || g->host) {
+        return 0;  // nothing can run, or it runs on regardless
     }
     i32 n = 0;
     for (GuiSession *s = g->sessions; s; s = s->next) {
-        n += s->view && !s->readonly && (s->view->busy || s->view->asks);
+        n += s->host->kind==GH_ENGINE && sessbusy(s);
     }
     return n;
 }
 
-// Stop every turn, which kills their tools, then exit once the engine
-// has stopped, or after QUIT_GRACE regardless.
+// Sessions at work elsewhere, which closing the window leaves running:
+// on background hosts, this process's own included, and remote ones.
+static i32 elsewhere(Gui *g)
+{
+    i32 n = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        n += s->host->kind!=GH_ENGINE && s->host->up && sessbusy(s);
+    }
+    return n;
+}
+
+// Say goodbye to every host reached through the library: each forgets
+// this client, and its sessions run on without it. Their records are
+// let go until each confirms (MAIL_QUIT).
+static void closehosts(Gui *g)
+{
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        if (h->r && !h->closing) {
+            h->closing = 1;
+            remoteclose(h->r);
+        }
+    }
+}
+
+// Whether quitting may end: this process's engine stopped, and every
+// host said goodbye to.
+static b32 quitdone(Gui *g)
+{
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        if (h->r) {
+            return 0;
+        }
+    }
+    return g->host ? __atomic_load_n(&g->hostdone, __ATOMIC_ACQUIRE) : g->enginegone;
+}
+
+// Stop every turn of this process's engine, which kills their tools,
+// leave the other hosts, then exit once all that is done, or after
+// QUIT_GRACE regardless. Sessions on the other hosts run on.
 static void startquit(Gui *g)
 {
     if (g->quitting) {
@@ -910,16 +1200,16 @@ static void startquit(Gui *g)
     }
     g->quitting = 1;
     g->quitby   = os_ticks(g->os) + QUIT_GRACE;
-    if (g->enginegone) {
-        g->quit = 1;
-        return;
+    closehosts(g);
+    if (!g->enginegone && !g->host) {
+        Arena a = newarena(g->cmdr);
+        Buf   b(&a, 128);
+        EvOut w = cmdopen(g, &b, CMD_QUIT, 0, g->hosts);
+        putkey(&w.json, "mode");
+        putstr(&w.json, "stop");
+        cmdsend(g, &w, a);
     }
-    Arena a = newarena(g->cmdr);
-    Buf   b(&a, 128);
-    EvOut w = cmdopen(g, &b, CMD_QUIT, 0);
-    putkey(&w.json, "mode");
-    putstr(&w.json, "stop");
-    cmdsend(g, &w, a);
+    g->quit = quitdone(g);
     scheddirty(&g->sched);
 }
 
@@ -974,18 +1264,66 @@ static void loadcfg(Gui *g, Str line)
     }
 }
 
-static void onsessions(Gui *g, Json *j)
+static void guiopen(Gui *, GuiSession *);
+static void guiclose(Gui *, GuiSession *);
+
+// A session moves to another host on this machine, which shares the
+// state directory: one a background host holds, or one it let go. A
+// view goes on from where it is, opened there. Not one open here for
+// writing, which no other process can hold.
+static void movesess(Gui *g, GuiSession *s, GuiHost *to)
 {
+    if (s->host==to || (s->view && !s->readonly && s->host->up)) {
+        return;
+    }
+    if (s->view && s->host->up) {
+        guiclose(g, s);  // read-only here: no more of it
+    }
+    s->host     = to;
+    s->readonly = 0;
+    s->locked   = 0;
+    s->openid   = 0;
+    if (s->view) {
+        s->view->readonly = 0;
+        guiopen(g, s);
+    }
+    scheddirty(&g->sched);
+}
+
+// The sessions a host lists. A background host of another process lists
+// every session of the state directory it shares with the engine here,
+// but only those it holds (not closed there) are its own, and they leave
+// the engine's list, where they are held elsewhere; those it lets go
+// come back to the engine.
+static void onsessions(Gui *g, GuiHost *h, Json *j)
+{
+    b32 shared = h->kind==GH_LOCAL && !h->own && g->enginekind!=ENGINE_FAKE;
     for (GuiSession *s = g->sessions; s; s = s->next) {
-        s->listed = 0;
+        s->listed &= s->host != h;
     }
     for (Json *e = jsonget(j, "list")->child; e; e = e->next) {
-        Str sid = jsonstr(jsonget(e, "sid"));
-        if (!sid.len) {
+        Str sid   = jsonstr(jsonget(e, "sid"));
+        Str state = jsonstr(jsonget(e, "state"));
+        if (!sid.len || (shared && state=="closed")) {
             continue;
         }
-        GuiSession *s = findsess(g, sid);
-        s = s ? s : addsess(g, sid);
+        GuiSession *s = findsess(g, h, sid);
+        if (!s && h->kind==GH_ENGINE) {
+            GuiSession *o = findlocal(g, sid);
+            if (o && o->host->kind==GH_LOCAL && !o->host->own) {
+                continue;  // a background host's
+            }
+        } else if (!s && shared) {
+            s = findsess(g, g->hosts, sid);
+            if (s) {
+                movesess(g, s, h);
+                s = s->host==h ? s : 0;
+            }
+            if (!s && findlocal(g, sid)) {
+                continue;  // open here for writing: not really held there
+            }
+        }
+        s = s ? s : addsess(g, h, sid);
         Str title  = jsonstr(jsonget(e, "title"));
         Str cwd    = jsonstr(jsonget(e, "cwd"));
         Str model  = jsonstr(jsonget(e, "model"));
@@ -997,21 +1335,37 @@ static void onsessions(Gui *g, Json *j)
         s->mtime  = jsonint(jsonget(e, "mtime"), 0);
         s->jobs   = jsonint(jsonget(e, "jobs"), 0);
         s->locked = jsonint(jsonget(e, "locked"), 0) != 0;
-        s->state  = livestate(jsonstr(jsonget(e, "state")));
+        s->state  = livestate(state);
         s->listed = 1;
+    }
+    if (shared) {
+        // What it no longer holds is the engine's again
+        b32 back = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            if (s->host==h && !s->listed && !s->openid) {
+                movesess(g, s, g->hosts);
+                back = 1;
+            }
+        }
+        if (back) {
+            guilist(g, g->hosts);
+        }
     }
 }
 
-static void onreply(Gui *g, Arena scratch, EvRec *r, Str line)
+static void onfile(Gui *, Json *, b32 ok, Str err);
+
+static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 {
     Json   *j   = r->root;
     i64     id  = jsonint(jsonget(j, "id"), 0);
     b32     ok  = jsonint(jsonget(j, "ok"), 0) != 0;
     Str     err = jsonstr(jsonget(j, "err"));
-    Request q   = takereq(g, id);
+    Request q   = takereq(g, id);  // ids are unique across hosts
     switch (q.cmd) {
     case CMD_HELLO:
         g->engineok = 1;
+        h->up       = 1;
         return;
 
     case CMD_NEW: {
@@ -1023,12 +1377,18 @@ static void onreply(Gui *g, Arena scratch, EvRec *r, Str line)
             g->opennew = 1;
             return;
         }
-        GuiSession *s = findsess(g, r->sid);
-        s = s ? s : addsess(g, r->sid);
+        GuiSession *s = findsess(g, h, r->sid);
+        s = s ? s : addsess(g, h, r->sid);
         sessview(g, s);
         setcur(g, s);
-        guilist(g);
+        guilist(g, h);
     } return;
+
+    case CMD_FILE:
+        if (id == g->out.id) {
+            onfile(g, j, ok, err);
+        }
+        return;
 
     case CMD_OPEN: {
         GuiSession *s = q.s;
@@ -1078,6 +1438,12 @@ static void onreply(Gui *g, Arena scratch, EvRec *r, Str line)
         if (g->cfgget == id) {
             g->cfgget = 0;
         }
+        if (g->cfgrefresh == id) {
+            g->cfgrefresh = 0;
+            g->cfgrefreshed++;
+            g->cfgstatus = ok ? Str("Includes fetched again") : clone(&g->perm, err);
+            g->cfgok     = ok;
+        }
         if (ok) {
             loadcfg(g, line);
         }
@@ -1125,21 +1491,26 @@ static Str linesid(Str line)
     return cut(rest, '"').head;
 }
 
-// The engine stopped by itself: no view will hear of its turn ending,
-// or of its asks, so none runs any more, and nothing waits for them.
+// The engine stopped by itself: no view of its sessions will hear of its
+// turn ending, or of its asks, so none runs any more, and nothing waits
+// for them.
 static void enginestopped(Gui *g)
 {
     for (GuiSession *s = g->sessions; s; s = s->next) {
-        s->state = LIVE_CLOSED;
-        if (s->view) {
-            viewstopped(s->view);
+        if (s->host->kind == GH_ENGINE) {
+            s->state = LIVE_CLOSED;
+            if (s->view) {
+                viewstopped(s->view);
+            }
         }
     }
     scheddirty(&g->sched);
 }
 
-// Apply one record from the engine. Returns 1 if what shows changed.
-static b32 guirecord(Gui *g, Str line)
+static void onremote(Gui *, GuiHost *, Arena, EvRec *);
+
+// Apply one record from a host. Returns 1 if what shows changed.
+static b32 guirecord(Gui *g, GuiHost *h, Str line)
 {
     Arena a  = g->frame;
     i64   t0 = g->histreq ? os_ticks(g->os) : 0;
@@ -1152,21 +1523,27 @@ static b32 guirecord(Gui *g, Str line)
     }
     switch (r.ev) {
     case EV_REPLY:
-        onreply(g, a, &r, line);
+        onreply(g, h, a, &r, line);
         return 1;
     case EV_HELLO:
-        g->engineok = 1;
+        if (h->kind == GH_ENGINE) {
+            g->engineok = 1;
+            h->up       = 1;
+        }
         return 1;
     case EV_SESSIONS:
-        onsessions(g, r.root);
+        onsessions(g, h, r.root);
+        return 1;
+    case EV_REMOTE:
+        onremote(g, h, a, &r);
         return 1;
     case EV_OVERFLOW:
-        if (!r.sid.len) {
+        if (!r.sid.len && h->kind==GH_ENGINE) {
             // The engine process lost records, replies among them
             g->overflows++;
             g->reissuing = 1;
             for (GuiSession *s = g->sessions; s; s = s->next) {
-                if (s->view) s->view->lost = 1;
+                if (s->view && s->host==h) s->view->lost = 1;
             }
             return 1;
         }
@@ -1175,13 +1552,13 @@ static b32 guirecord(Gui *g, Str line)
         return 0;
     }
 
-    GuiSession *s = findsess(g, r.sid);
+    GuiSession *s = findsess(g, h, r.sid);
     if (!s || !s->view) {
         if (!r.seq) {
             return 0;  // not shown here
         }
         // A session made here, or records that outran its reply
-        s = s ? s : addsess(g, r.sid);
+        s = s ? s : addsess(g, h, r.sid);
         sessview(g, s);
         if (!g->sess && g->enginekind!=ENGINE_FAKE) {
             setcur(g, s);
@@ -1227,9 +1604,9 @@ static b32 guirecord(Gui *g, Str line)
 
 // Records shown on content frames only: model output and tool output,
 // and the liveness that comes with them, for the session shown.
-static b32 heldback(Gui *g, Str line)
+static b32 heldback(Gui *g, GuiHost *h, Str line)
 {
-    if (!g->sess) {
+    if (!g->sess || g->sess->host!=h) {
         return 0;
     }
     // The event's name follows sid, seq and ts, near the start
@@ -1244,33 +1621,37 @@ static b32 heldback(Gui *g, Str line)
     return kind && linesid(line)==g->sess->sid;
 }
 
-// Apply the held-back records.
+// Apply the held-back records, all of one host's.
 static void flushdeltas(Gui *g)
 {
     for (Str rest = finish(&g->pending); rest.len;) {
         Cut c = cut(rest, '\n');
-        guirecord(g, c.head);
+        guirecord(g, g->pendhost, c.head);
         rest = c.tail;
     }
     g->pendmem.beg = g->pendbase;
     g->pending     = Buf(&g->pendmem, 1<<12);
 }
 
-// One record line from the engine: held back, or applied after those
-// held back before it. Returns 1 if what shows changed at once.
-static b32 takeline(Gui *g, Str line)
+// One record line from a host: held back, or applied after those held
+// back before it. Returns 1 if what shows changed at once.
+static b32 takeline(Gui *g, GuiHost *h, Str line)
 {
     for (; line.len && (line[line.len-1]=='\n' || line[line.len-1]=='\r'); line.len--) {}
     if (!line.len) {
         return 0;
     }
-    if (heldback(g, line)) {
+    if (heldback(g, h, line)) {
+        if (g->pendhost != h) {
+            flushdeltas(g);  // another session's, shown before
+            g->pendhost = h;
+        }
         print(&g->pending, line);
         putbyte(&g->pending, '\n');
         return 0;
     }
     flushdeltas(g);
-    return guirecord(g, line);
+    return guirecord(g, h, line);
 }
 
 // Output of the engine process: whole lines are records.
@@ -1284,7 +1665,7 @@ static b32 procdata(Gui *g, Str data)
         if (!c.ok) {
             break;
         }
-        other |= takeline(g, c.head);
+        other |= takeline(g, g->hosts, c.head);
         rest = c.tail;
     }
     iz off = rest.data - g->line.data;
@@ -1321,27 +1702,544 @@ static void resync(Gui *g, GuiSession *s)
     g->resyncs++;
 }
 
-// After lost records: the commands whose replies may be gone, sent
-// again where that is harmless.
+// After lost records: the engine's commands whose replies may be gone,
+// sent again where that is harmless. The library never loses records
+// of the other hosts.
 static void reissue(Gui *g)
 {
-    Request old[REQ_MAX];
+    GuiHost *e = g->hosts;
+    Request  old[REQ_MAX];
     for (i32 i = 0; i < REQ_MAX; i++) {
         old[i] = g->reqs[i];
-        g->reqs[i] = {};
+        if (old[i].h == e) {
+            g->reqs[i] = {};
+        }
     }
     for (i32 i = 0; i < REQ_MAX; i++) {
         Request q = old[i];
-        if (!q.id) {
+        if (!q.id || q.h!=e) {
             continue;
         }
         switch (q.cmd) {
         case CMD_HELLO:     guihello(g);    break;
-        case CMD_LIST:      guilist(g);     break;
+        case CMD_LIST:      guilist(g, e);  break;
         case CMD_CONFIGGET: g->cfgget = 0; guiconfigget(g); break;
         case CMD_OPEN:      if (q.s && q.s->openid==q.id) guiopen(g, q.s); break;
-        case CMD_NEW:       g->newid = 0; guilist(g); break;  // it shows there
+        case CMD_NEW:       g->newid = 0; guilist(g, e); break;  // it shows there
+        case CMD_FILE:      if (g->out.id == q.id) g->out.id = 0; break;
         }
+    }
+}
+
+
+
+// Hosts besides the engine: found, connected, lost
+//
+// Each has its own inbox, which the library fills without ever losing a
+// record (it waits for room), and which is big enough for any record a
+// link can carry: so these views never resync from a log, which may be
+// on another machine anyway. A host gone or closed takes its sessions
+// with it, except that a background host's go back to the engine, as
+// they are in its state directory.
+
+enum : iz {
+    HOST_MAILCAP = FRAME_MAX + ((iz)1<<16),
+};
+
+// A host, made anew, or one gone before made over (its inbox kept: the
+// library posts nothing more to it after MAIL_QUIT, and the inboxes
+// are large).
+static GuiHost *addhost(Gui *g, i32 kind, Str name)
+{
+    GuiHost *h = 0;
+    if (kind!=GH_ENGINE && g->spare) {
+        h = g->spare;
+        g->spare = h->next;
+        Mailbox *inbox = h->inbox;
+        *h = {};
+        h->inbox = inbox;
+    } else {
+        h = alloc<GuiHost>(&g->perm);
+    }
+    h->kind  = kind;
+    h->name  = clone(&g->perm, name);
+    h->state = RS_CLOSED;
+    if (kind!=GH_ENGINE && !h->inbox) {
+        h->inbox = newmailbox(&g->perm, HOST_MAILCAP, wakegui, g->os);
+    }
+    GuiHost **p = &g->hosts;
+    for (; *p; p = &(*p)->next) {}
+    *p = h;
+    return h;
+}
+
+static GuiHost *findhost(Gui *g, i32 kind, Str name)
+{
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        if (h->kind==kind && h->name==name) {
+            return h;
+        }
+    }
+    return 0;
+}
+
+// Reach a host through the library. Sessions viewed here open again,
+// from where their views are, once it answers hello.
+static b32 hostconnect(Gui *g, GuiHost *h, RemoteConf *rc)
+{
+    if (h->r || !h->inbox) {
+        return h->r != 0;
+    }
+    // Its own memory, as connections come and go (its reservations are
+    // never let go: the library's thread may outlive its MAIL_QUIT)
+    Arena   ra = newarena(os_reserve(g->os, (iz)1<<22));
+    Remote *r  = ra.beg ? newremote(g->os, &ra, rc, h->inbox) : 0;
+    if (!r || !remotego(r)) {
+        h->state = RS_FAILED;
+        h->msg   = "cannot start the connection";
+        return 0;
+    }
+    h->r       = r;
+    h->state   = RS_CONNECTING;
+    h->msg     = {};
+    h->up      = 0;
+    h->closing = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->host==h && s->view) {
+            guiopen(g, s);
+        }
+    }
+    scheddirty(&g->sched);
+    return 1;
+}
+
+// A setting of a [remote NAME] section, from the latest config.get.
+static Str remoteset(Gui *g, Str name, Str key)
+{
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind=="remote" && r->name==name && r->key==key && !r->isdflt) {
+            return r->value;
+        }
+    }
+    return {};
+}
+
+// Connect to a [remote NAME] over ssh, as its section says. The ssh
+// program is "ssh", or HARNESS_TEST_SSH (a test hook).
+static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name)
+{
+    GuiHost *h = findhost(g, GH_REMOTE, name);
+    h = h ? h : addhost(g, GH_REMOTE, name);
+    if (h->r) {
+        return h;
+    }
+    RemoteConf rc = {};
+    rc.name       = name;
+    rc.ssh        = remoteset(g, name, "ssh");
+    rc.path       = remoteset(g, name, "path");
+    rc.state      = remoteset(g, name, "state");
+    rc.rconfig    = remoteset(g, name, "config");
+    rc.program    = os_getenv(g->os, &scratch, "HARNESS_TEST_SSH");
+    rc.localstate = g->statedir;
+    if (!rc.ssh.len) {
+        h->state = RS_FAILED;
+        h->msg   = "no ssh destination: set ssh in its section";
+        return h;
+    }
+    hostconnect(g, h, &rc);
+    return h;
+}
+
+// Leave a host: it forgets this client, and its sessions run on.
+static void hostclose(Gui *g, GuiHost *h)
+{
+    if (h->r && !h->closing) {
+        h->closing = 1;
+        remoteclose(h->r);
+        scheddirty(&g->sched);
+    }
+}
+
+// The background hosts of the state directory, as registered, but not
+// this process's: each one reached at its endpoint. One that cannot be
+// reached is gone (onhostgone), so that a stale registration costs a
+// moment on the library's thread and never holds up the window.
+static void findhosts(Gui *g, Arena a)
+{
+    i64 pid = os_pid(g->os);
+    for (HostEntry *e = hostentries(g->os, &a, g->statedir); e; e = e->next) {
+        if (e->pid==pid || !e->endpoint.len || e->proto!=HOST_PROTO) {
+            continue;
+        }
+        Buf b(&a, 32);
+        print(&b, e->pid);
+        Str      name = finish(&b);
+        GuiHost *h    = findhost(g, GH_LOCAL, name);
+        if (h) {
+            continue;
+        }
+        h = addhost(g, GH_LOCAL, name);
+        h->pid      = e->pid;
+        h->started  = e->started;
+        h->endpoint = clone(&g->perm, e->endpoint);
+        h->regpath  = clone(&g->perm, e->path);
+        RemoteConf rc = {};
+        rc.name       = "background";
+        rc.endpoint   = e->endpoint;
+        rc.localstate = g->statedir;
+        hostconnect(g, h, &rc);
+        g->hostfound++;
+    }
+}
+
+// A host's connection changed: connecting, up, down until a retry,
+// failed or closed, as the library says.
+static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
+{
+    Str state = jsonstr(jsonget(r->root, "state"));
+    Str msg   = jsonstr(jsonget(r->root, "msg"));
+    i32 was   = h->state;
+    for (i32 i = 0; i < countof(remotestates); i++) {
+        h->state = remotestates[i]==state ? i : h->state;
+    }
+    h->msg     = h->msg==msg ? h->msg : clone(&g->perm, msg);
+    h->retryat = r->ts + jsonint(jsonget(r->root, "retry_ms"), 0);
+    h->up      = h->state == RS_UP;
+    h->downs  += h->state==RS_DOWN && was!=RS_DOWN;
+    if (h->up && was!=RS_UP) {
+        h->opens++;
+        guilist(g, h);
+    }
+    if (msg.len && h->state!=RS_UP) {
+        Buf b(&a, 128 + msg.len);
+        print(&b, h->kind==GH_REMOTE ? Str("remote ") : Str("background host "));
+        print(&b, h->name);
+        print(&b, ": ");
+        print(&b, state);
+        print(&b, ": ");
+        print(&b, msg);
+        guilog(g, finish(&b));
+    }
+}
+
+// A host's connection ended (MAIL_QUIT). A background host's sessions
+// go back to the engine, and the host goes; a remote one stays listed,
+// to connect again.
+static void onhostend(Gui *g, GuiHost *h)
+{
+    h->r       = 0;
+    h->up      = 0;
+    h->closing = 0;
+    h->state   = h->state==RS_FAILED ? RS_FAILED : RS_CLOSED;
+    if (h->kind!=GH_LOCAL || h->own) {
+        scheddirty(&g->sched);
+        return;
+    }
+    if (!h->opens && h->regpath.len) {
+        os_remove(g->os, g->frame, h->regpath);  // stale: nobody there
+    }
+    b32 any = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->host == h) {
+            s->listed = 0;
+            movesess(g, s, g->hosts);
+            any = 1;
+        }
+    }
+    for (GuiHost **p = &g->hosts; *p; p = &(*p)->next) {
+        if (*p == h) {
+            *p = h->next;
+            break;
+        }
+    }
+    h->next  = g->spare;
+    g->spare = h;
+    if (g->newhost == h) {
+        g->newhost = 0;
+    }
+    for (i32 i = 0; i < countof(g->hostitems); i++) {
+        g->hostitems[i] = g->hostitems[i]==h ? 0 : g->hostitems[i];
+    }
+    if (any) {
+        guilist(g, g->hosts);
+    }
+    scheddirty(&g->sched);
+}
+
+// A host's name, as the window shows it.
+static Str hostlabel(Gui *g, Arena *a, GuiHost *h)
+{
+    Buf b(a, 64 + h->name.len);
+    switch (h->kind) {
+    case GH_ENGINE:
+        print(&b, "This computer");
+        break;
+    case GH_LOCAL:
+        print(&b, h->own ? Str("This process, in the background") : Str("In the background, process "));
+        if (!h->own) {
+            print(&b, h->name);
+        }
+        break;
+    case GH_REMOTE: {
+        Str ssh = remoteset(g, h->name, "ssh");
+        print(&b, h->name);
+        if (ssh.len && ssh!=h->name) {
+            print(&b, " (");
+            print(&b, ssh);
+            putbyte(&b, ')');
+        }
+    } break;
+    }
+    return finish(&b);
+}
+
+// Whether new sessions can go to a host now.
+static b32 hostready(Gui *g, GuiHost *h)
+{
+    if (h->kind == GH_ENGINE) {
+        return !g->host && g->engineok && !g->enginegone;
+    }
+    return h->up && !h->closing;
+}
+
+// How a host is, in a few words, with left the seconds until its next
+// try when it is down.
+static Str hoststatus(Gui *g, Arena *a, GuiHost *h, i64 left)
+{
+    switch (h->kind==GH_ENGINE ? -1 : h->state) {
+    case -1:            return g->enginegone ? Str("stopped") : Str("running");
+    case RS_CONNECTING: return "connecting";
+    case RS_UP:         return "connected";
+    case RS_DOWN: {
+        Buf b(a, 64);
+        print(&b, "reconnecting in ");
+        print(&b, left);
+        print(&b, " s");
+        return finish(&b);
+    }
+    case RS_FAILED:     return "failed";
+    }
+    return "not connected";
+}
+
+
+
+// Background hosting
+//
+// "Keep running in background" makes this process a host of its own
+// engine (host.cpp), in place: the engine's records, which came to the
+// GUI's inbox, go to a host thread from then on, which listens at the
+// state directory's endpoint and is registered there, so that a window
+// that comes later, in this process or another, finds its sessions.
+// Nothing moves, as the engine stays where it was. The window and its
+// renderer go, and a tray icon, where the system has one, offers the
+// window again, a stop of every session's work, and quitting. Nobody
+// attends the sessions from then on, so an ask is denied by policy at
+// once, until a window opens them attended again. The host ends as
+// "harness serve" does, after [host] idle_exit with no client and
+// nothing running, and this process with it. A window that comes back
+// here is a client of the host like any other, through its endpoint, so
+// that closing it leaves the host as it was.
+
+static void saveini(Gui *, b32 last);
+static void gui_close(Gui *);
+
+static Str hostlockpath(Arena *a, Str statedir)
+{
+    Str run = join(a, statedir, "run");
+    return concat(a, join(a, run, hostname(a, HOST_PROTO)), ".lock");
+}
+
+// Why this process cannot keep its sessions running in the background,
+// or null if it can.
+static Str cannothost(Gui *g)
+{
+    Arena a = g->frame;
+    if (g->host) {
+        return {};
+    } else if (g->enginekind != ENGINE_INPROC) {
+        return "the engine runs as a process of its own (--engine)";
+    } else if (!g->engine || g->enginegone) {
+        return "the engine has stopped";
+    } else if (os_lockheld(g->os, a, hostlockpath(&a, g->statedir))) {
+        return "another process already runs a background host for this "
+               "state directory";
+    }
+    return {};
+}
+
+static void hostthread(void *arg)
+{
+    Gui *g = (Gui *)arg;
+    hostrun(g->host);
+    __atomic_store_n(&g->hostdone, 1, __ATOMIC_RELEASE);
+    os_wake(g->os);
+}
+
+// The window goes, and the tray icon stays, if there is one. Never from
+// inside a frame (shedlater).
+static void shed(Gui *g)
+{
+    if (g->bg) {
+        return;
+    }
+    saveini(g, 0);
+    flushdeltas(g);
+    g->bg = 1;
+    os_guished(g->os);
+    if (!g->trayup) {
+        g->trayup = os_trayopen(g->os, "harness: sessions running in the background");
+    }
+    guilog(g, g->trayup ? Str("the window is gone; the tray icon brings it back")
+                        : Str("the window is gone; there is no tray here to bring it back"));
+}
+
+// Keep this process's sessions running with no window: become a host,
+// then go. Returns 0 if that cannot be, saying why in the log.
+static b32 gobackground(Gui *g)
+{
+    Str why = cannothost(g);
+    if (!why.len) {
+        HostConf hc = {};
+        hc.cfg      = g->config;
+        hc.statedir = g->statedir;
+        hc.e        = g->engine;
+        hc.inbox    = g->inbox;
+        hc.idle     = g->hostidle ? g->hostidle : hostticks(g->config, "idle_exit");
+        hc.firstid  = g->nextid + (1<<20);
+        hc.held     = -1;
+        Arena hp = newarena(os_reserve(g->os, (iz)1<<30));
+        g->host  = hp.beg ? newhost(g->os, &hp, g->frame, &hc, &why) : 0;
+        why      = g->host ? Str{} : why.len ? why : Str("out of memory");
+    }
+    if (why.len) {
+        g->hosterr = clone(&g->perm, concat(&g->frame, "cannot keep running: ", why));
+        guilog(g, g->hosterr);
+        return 0;
+    }
+
+    // What the host needs to know, and nobody attends the sessions now
+    Host *h = g->host;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        View *v = s->view;
+        if (s->host==g->hosts && v && !s->readonly) {
+            hostseed(h, s->sid, v->parent, v->busy || v->asks);
+            hostpoke(h, g->frame, s->sid, 0);
+        }
+    }
+    mailnotify(g->inbox, 0, 0);  // the host's from now on
+    if (!os_thread(g->os, hostthread, g)) {
+        guilog(g, "cannot start the host's thread: quitting");
+        g->quit = 1;
+        return 0;
+    }
+    closehosts(g);  // the others forget this window
+    Arena a = g->frame;
+    Buf   b(&a, 128);
+    print(&b, "running in the background as host ");
+    print(&b, (i64)os_pid(g->os));
+    print(&b, ", at ");
+    print(&b, h->endpoint);
+    guilog(g, finish(&b));
+    shed(g);
+    return 1;
+}
+
+// Bring the window back, in a process that hosts: a client of its own
+// host, as another process's window would be, its views taking up from
+// where they were.
+static void reopen(Gui *g)
+{
+    if (!g->bg) {
+        os_guiraise(g->os);
+        return;
+    }
+    if (!os_guiopen(g->os, g, "harness")) {
+        guilog(g, "cannot open a window");
+        return;
+    }
+    g->bg = 0;
+    g->sched.pace = os_guirefresh(g->os);
+    schedforce(&g->sched);
+
+    Arena    a   = g->frame;
+    Buf      b(&a, 32);
+    print(&b, (i64)os_pid(g->os));
+    GuiHost *own = findhost(g, GH_LOCAL, finish(&b));
+    if (!own) {
+        own = addhost(g, GH_LOCAL, finish(&b));
+        own->own      = 1;
+        own->pid      = os_pid(g->os);
+        own->endpoint = clone(&g->perm, g->host->endpoint);
+    }
+    g->main = own;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->host == g->hosts) {
+            s->host = own;  // the engine's, through the host now
+        }
+    }
+    RemoteConf rc = {};
+    rc.name       = "background";
+    rc.endpoint   = own->endpoint;
+    rc.localstate = g->statedir;
+    hostconnect(g, own, &rc);
+    guiconfigget(g);
+    os_guiraise(g->os);  // in front, as asked for from the tray
+    guilog(g, "the window is back");
+}
+
+// Ask for the window to go once the frame drawing now is done: to the
+// background (bg set), or, in a process hosting already, just away.
+static void shedlater(Gui *g, b32 bg)
+{
+    g->shedreq = bg ? 2 : 1;
+    scheddirty(&g->sched);
+}
+
+// What shedlater asked for, between frames.
+static void shednow(Gui *g)
+{
+    i32 req = g->shedreq;
+    g->shedreq = 0;
+    if (req == 2) {
+        gobackground(g);
+    } else if (req==1 && g->host) {
+        closehosts(g);  // its own included: they forget this window
+        shed(g);
+    }
+}
+
+// A pick from the tray icon's menu (or the checklist's, as if).
+static void gui_tray(Gui *g, i32 item)
+{
+    switch (item) {
+    case TRAY_OPEN:
+        if (g->host) {
+            reopen(g);
+        } else {
+            os_guiraise(g->os);
+        }
+        break;
+    case TRAY_STOPALL:
+        if (g->host) {
+            guilog(g, "stopping every session's work, as the tray asked");
+            hoststop(g->host, 0);
+        }
+        break;
+    case TRAY_QUIT:
+        if (g->host && !g->quitting) {
+            // The host stops its engine, as quit does (5 s for turns to
+            // end), says goodbye (2 s), then this process ends
+            guilog(g, "quitting, as the tray asked");
+            g->quitting = 1;
+            g->quitby   = os_ticks(g->os) + 2*QUIT_GRACE;
+            hoststop(g->host, 1);
+            closehosts(g);
+        } else if (!g->host) {
+            gui_close(g);
+        }
+        break;
     }
 }
 
@@ -1814,38 +2712,63 @@ static void drainmail(Gui *g, i64 now)
     }
     g->held = 0;
 
-    Mail m       = mailtake(g->inbox);
-    b32  other   = 0;
-    b32  stopped = 0;
-    for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
-        switch (r.type) {
-        case MAIL_OUT:
-            other |= takeline(g, r.data);
-            break;
-        case PROC_DATA:
-            other |= procdata(g, r.data);
-            break;
-        case MAIL_QUIT:
-        case PROC_EXIT:
-            stopped |= !g->enginegone;
-            g->enginegone = 1;
+    // The engine's, while this process has it to itself
+    b32 other   = 0;
+    b32 stopped = 0;
+    if (!g->host) {
+        Mail m = mailtake(g->inbox);
+        for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
+            switch (r.type) {
+            case MAIL_OUT:
+                other |= takeline(g, g->hosts, r.data);
+                break;
+            case PROC_DATA:
+                other |= procdata(g, r.data);
+                break;
+            case MAIL_QUIT:
+            case PROC_EXIT:
+                stopped |= !g->enginegone;
+                g->enginegone = 1;
+                other = 1;
+                break;
+            }
+        }
+        if (m.overflow && g->enginekind==ENGINE_FAKE) {
+            g->view->overflow = 1;
             other = 1;
-            break;
+        } else if (m.overflow) {
+            g->overflows++;
+            g->reissuing = 1;
+            for (GuiSession *s = g->sessions; s; s = s->next) {
+                if (s->view && s->host==g->hosts) s->view->lost = 1;
+            }
         }
     }
 
-    if (m.overflow && g->enginekind==ENGINE_FAKE) {
-        g->view->overflow = 1;
-        other = 1;
-    } else if (m.overflow) {
-        g->overflows++;
-        g->reissuing = 1;
-        for (GuiSession *s = g->sessions; s; s = s->next) {
-            if (s->view) s->view->lost = 1;
+    // The other hosts': let go while closing, or in the background
+    for (GuiHost *h = g->hosts, *next; h; h = next) {
+        next = h->next;
+        if (!h->inbox) {
+            continue;
+        }
+        Mail m   = mailtake(h->inbox);
+        b32  end = 0;
+        for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
+            if (r.type == MAIL_QUIT) {
+                end = 1;
+            } else if (r.type==MAIL_OUT && !h->closing && !g->bg) {
+                other |= takeline(g, h, r.data);
+            }
+        }
+        if (end) {
+            flushdeltas(g);
+            onhostend(g, h);
+            other = 1;
         }
     }
+
     for (GuiSession *s = g->sessions; s; s = s->next) {
-        if (s->view && s->view->lost && g->enginekind!=ENGINE_FAKE) {
+        if (s->view && s->view->lost && s->host==g->hosts && g->enginekind!=ENGINE_FAKE) {
             flushdeltas(g);
             resync(g, s);
             other = 1;
@@ -1857,12 +2780,11 @@ static void drainmail(Gui *g, i64 now)
         reissue(g);
     }
 
-    if (g->enginegone) {
-        if (g->quitting) {
-            g->quit = 1;
-        } else if (!g->engineerr.len) {
-            g->engineerr = "the engine stopped";
-        }
+    if (g->enginegone && !g->quitting && !g->engineerr.len) {
+        g->engineerr = "the engine stopped";
+    }
+    if (g->quitting && quitdone(g)) {
+        g->quit = 1;
     }
     if (g->enginegone && !g->quitting && (stopped || other)) {
         // Its last output may come after its exit, since Windows reads
@@ -1916,9 +2838,21 @@ static void gui_wake(Gui *g)
 // running, which needs no frame (the window may be minimized, or quit
 // from the Dock while covered). Otherwise the UI asks first (ui.cpp),
 // in a window brought back for it.
+//
+// In a process that hosts, the window just goes, and the host runs on;
+// with no window, as from a signal or a logout, everything stops as the
+// tray's Quit stops it. Sessions at work on other hosts (remote, or in
+// the background) run on whatever happens, and the dialog says so.
 static void gui_close(Gui *g)
 {
-    if (!g->quitting && !running(g)) {
+    if (g->bg) {
+        gui_tray(g, TRAY_QUIT);
+        return;
+    } else if (g->host) {
+        shedlater(g, 0);
+        return;
+    }
+    if (!g->quitting && !running(g) && !elsewhere(g)) {
         startquit(g);
         return;
     }
@@ -2415,11 +3349,53 @@ static void gui_frame(Gui *g)
     }
 }
 
+// With no window: wait for the tray, a wake, or the checklist's next
+// step, which runs without frames.
+static void bgwait(Gui *g)
+{
+    Sched *s = &g->sched;
+    s->now = os_ticks(g->os);
+    i64 t = -1;
+    if (g->drive && g->driveat!=I64MAX) {
+        t = g->driveat>s->now ? g->driveat-s->now : 0;
+        if (g->drivewait && t>200000) {
+            t = 200000;  // nothing wakes a wait without frames: look again
+        }
+    }
+    if (g->quitting) {
+        i64 left = g->quitby>s->now ? g->quitby-s->now : 0;
+        t = t<0 || t>left ? left : t;
+    }
+    if (!os_guiwait(g->os, t)) {
+        g->quit = 1;
+        return;
+    }
+    s->now = os_ticks(g->os);
+    if (g->quitting && s->now>=g->quitby) {
+        g->quit = 1;  // the host did not stop in time
+        return;
+    }
+    while (g->bg && g->drive && !g->quit &&
+           (s->now>=g->driveat || (g->drivewait && drivewaitdone(g)))) {
+        drivestep(g);
+    }
+}
+
 // The loop: wait, dispatch everything, then decide.
 static void gui_run(Gui *g)
 {
     Sched *s = &g->sched;
     while (!g->quit) {
+        if (__atomic_load_n(&g->hostdone, __ATOMIC_ACQUIRE)) {
+            g->quit = 1;  // the host stopped, and this process with it
+            break;
+        } else if (g->shedreq) {
+            shednow(g);
+            continue;
+        } else if (g->bg) {
+            bgwait(g);
+            continue;
+        }
         s->now  = os_ticks(g->os);
         i64 t   = schedtimeout(s);
         if (g->quitting) {
@@ -2726,6 +3702,10 @@ enum : i32 {
     OP_KILLENGINE,// the engine process dies (--engine=subprocess)
     OP_REVEAL,    // scroll the settings window to the RECT_* target
     OP_TOUCH,     // write over a file in --cwd, as something else would
+    OP_TRAY,      // pick the tray icon's menu item dx (TRAY_*)
+    OP_DROPLINK,  // break the shown session's host's stream (remotedrop)
+    OP_TEXTRCWD,  // type the --rcwd directory, the remote one
+    OP_MARKDELTAS,// remember the deltas the shown session has had
 };
 
 enum : i32 {
@@ -2771,6 +3751,14 @@ enum : i32 {
     T_COMPACTHDR,  // the latest compaction card's header
     T_JOBSTAB,
     T_LOGTAB,
+    T_CLOSEBG,     // the close dialog's Keep running in background
+    T_HOSTSTAB,
+    T_CONNECT,     // the Hosts panel's first remote's Connect or Disconnect
+    T_CONNECT2,    // and its second's
+    T_HOSTCOMBO,   // the new session's host
+    T_HOSTITEM,    // the host named by text, in that list once open
+    T_OUTPUT,      // the latest tool row's Output
+    T_REFRESHINC,  // the settings' Refresh includes
 };
 
 enum : i32 {
@@ -2858,6 +3846,23 @@ enum : i32 {
     CHK_JOBSTAB,
     CHK_JOBSDRAWN,
     CHK_JOBSQUIET,
+    CHK_CLOSEBG,
+    CHK_SHED,
+    CHK_REOPENED,
+    CHK_BGDONE,
+    CHK_BGLISTED,
+    CHK_BGSESSION,
+    CHK_BGPROMPT,
+    CHK_REMOTEUP,
+    CHK_REMOTESESSION,
+    CHK_REMOTEDOWN,
+    CHK_REMOTEOK,
+    CHK_OUTPUT,
+    CHK_REMOTECLOSED,
+    CHK_REFRESHED,
+    CHK_OWNNEW,
+    CHK_CLOSEREMOTE,
+    CHK_REMOTEFAILED,
     CHK_COUNT,
 };
 
@@ -2922,6 +3927,23 @@ static Str chknames[] = {
     "a new layout shows the Jobs tab",
     "a job's output drawn a few times a second, the Jobs tab shown",
     "no frames for a job's output, the Jobs tab hidden",
+    "closing offers to keep the turn running in the background",
+    "the window is gone, and this process hosts its engine, registered",
+    "the tray's Open brought the window back, a client of its own host",
+    "the turn finished in the background, its whole answer shown",
+    "a new window found the background host and listed its session",
+    "the background session opened, badged, its finished turn shown",
+    "a prompt to the background session was answered through its host",
+    "the remote host is connected",
+    "a new session on the remote host, in its directory there",
+    "the dropped link showed reconnecting, counting down",
+    "reconnected: the answer whole, each delta once",
+    "a call's whole output, read through its host, in the Output window",
+    "disconnected: the remote's sessions say so",
+    "the URL includes were fetched again",
+    "a new session went to this process's own host",
+    "closing says the remote turn keeps running there",
+    "a remote that cannot work failed, saying why",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -2950,6 +3972,17 @@ enum : i32 {
     W_REWOUND,    // every rewind sent has its card
     W_COMPACTING, // it runs a summary request
     W_QUEUED,     // it waits in the endpoint's line
+    W_STREAMING,  // it streams a response
+    W_SHED,       // the window is gone
+    W_REOPENED,   // the window is back, its own host connected, the
+                  // session shown open again
+    W_BGHOST,     // a background host is connected, with sessions
+    W_REMOTEUP,   // the first remote host is connected
+    W_REMOTEDOWN, // and down, waiting to try again
+    W_REMOTECLOSED, // and closed
+    W_OUTPUT,     // the Output window's file came
+    W_FILE,       // the file named by text exists in --cwd
+    W_REFRESHED,  // a config.get {refresh} was answered
 };
 
 static Str waitnames[] = {
@@ -2958,9 +3991,12 @@ static Str waitnames[] = {
     "every turn to end", "the session to open", "amber", "a retry",
     "the engine to stop", "two subagents at work", "a subagent's ask",
     "a todo item in progress", "a reply", "the jobs", "a rewind",
-    "a compaction", "the endpoint's line",
+    "a compaction", "the endpoint's line", "streaming", "the window to go",
+    "the window to come back", "a background host", "the remote host",
+    "the link to drop", "the remote to close", "the output", "a file",
+    "the includes",
 };
-static_assert(countof(waitnames) == W_QUEUED+1);
+static_assert(countof(waitnames) == W_REFRESHED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -3759,6 +4795,218 @@ static DriveOp stopops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// M5, keeping a turn running in the background (--background,
+// tests/gui.py --mode background): the window goes partway through a
+// streaming turn, and this process hosts its engine. The checklist goes
+// on without frames until tests/gui.py, having run a second window
+// (attachops) against the host, writes open-now; then the tray's Open
+// brings the window back, a client of its own host, showing the turn
+// finished. A new session there starts a turn, and closing the window
+// leaves the host and the turn running; the tray's Stop all stops the
+// turn, and the host, with nothing to do, ends this process after its
+// idle time (--host-idle). Light first, then dark.
+static DriveOp bgops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_SYSTHEME, 0, 0, 0, 1000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_SESSION, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Stream in the background."},
+    {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 800, ""},
+    {OP_CLOSE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_CLOSEBG, 0, 0, 0, ""},
+    {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "bg-1-close"},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    {OP_MOVE, T_CLOSEBG, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SHED, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_SHED, 0, 0, 0, ""},
+    // No window: tests/gui.py looks on, then says when to come back
+    {OP_TOUCH, 0, 0, 0, 0, "bg-ready"},
+    {OP_WAIT, W_FILE, 0, 0, 180000, "open-now"},
+    {OP_TRAY, 0, TRAY_OPEN, 0, 500, ""},
+    {OP_WAIT, W_REOPENED, 0, 0, 15000, ""},
+    {OP_SYSTHEME, 0, 1, 0, 0, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 15000, ""},
+    {OP_MARK, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_REOPENED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_BGDONE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "bg-3-reopened"},
+    {OP_TRAY, 0, TRAY_OPEN, 0, 1000, ""},  // shown already: raised
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_IDLE, 0, 0, 0, 0, "idle 3 s, the window back"},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, -1, 0, 500, ""},
+    // A new session goes to the host, this window being its client
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_OWNNEW, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Stream slowly for a while."},
+    {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    // Closing the window of a host: it goes, the host and the turn stay,
+    // until the tray stops it all; then the host has nothing to do, and
+    // ends after its idle time (tests/gui.py gives it 20 s), as does this
+    // process
+    {OP_CLOSE, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SHED, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_SHED, 0, 0, 0, ""},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_TRAY, 0, TRAY_STOPALL, 0, 0, ""},
+    {OP_WAIT, W_FOREVER, 0, 0, 60000, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
+// M5, a second window while the first runs in the background (--attach,
+// tests/gui.py --mode background): it finds the host at startup, lists
+// its session, badged, opens it with the turn finished, and prompts it
+// through the host. Dark first, then light.
+static DriveOp attachops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_SYSTHEME, 0, 1, 0, 0, ""},
+    {OP_WAIT, W_BGHOST, 0, 0, 15000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_BGLISTED, 0, 0, 0, ""},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Stream in the background"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_BGSESSION, 0, 0, 0, ""},
+    {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "bg-2-attached"},
+    {OP_SYSTHEME, 0, 0, 0, 1000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Say hello."},
+    {OP_WAIT, W_SAID, 0, 0, 15000, "Hello!"},
+    {OP_CHECK, CHK_BGPROMPT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_IDLE, 0, 0, 0, 0, "idle 3 s, attached"},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, -1, 0, 300, ""},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
+// M5, a remote host (--remote, tests/gui.py --mode remote): connected
+// from the Hosts panel, a session made there through the dialog in its
+// directory there, its stream's link dropped and taken up again, a
+// call's output read through it, URL includes fetched again, then
+// disconnected. Light, then dark.
+static DriveOp remoteops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_SYSTHEME, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_CONNECT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_REMOTEUP, 0, 0, 90000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_REMOTEUP, 0, 0, 0, ""},
+    // One whose destination ssh would take for an option fails, saying why
+    {OP_MOVE, T_CONNECT2, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_REMOTEFAILED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "remote-1-hosts"},
+    // A session there, through the dialog
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_MOVE, T_HOSTCOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_HOSTITEM, 0, 0, 100, "r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
+    {OP_TEXTRCWD, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_REMOTESESSION, 0, 0, 0, ""},
+    // Its stream's link dropped in the middle, and taken up again
+    {OP_MARKDELTAS, 0, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Stream for the link."},
+    {OP_WAIT, W_STREAMING, 0, 0, 30000, ""},
+    {OP_MARK, 0, 0, 0, 1500, ""},
+    {OP_DROPLINK, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_REMOTEDOWN, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_REMOTEDOWN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 0, "remote-2-down"},
+    {OP_WAIT, W_REMOTEUP, 0, 0, 60000, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_REMOTEOK, 0, 0, 0, ""},
+    {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, 1, 0, 1000, ""},
+    // Tools there, and a call's whole output through the host
+    {OP_PROMPT, 0, 0, 0, 100, "Run the tools: read, edit, then a slow shell command."},
+    {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    {OP_CHECK, CHK_TOOLROWS, 0, 0, 0, ""},
+    {OP_SHOWUSER, 0, 0, 0, 500, "Run the tools"},
+    {OP_MOVE, T_OUTPUT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_OUTPUT, 0, 0, 30000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_OUTPUT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "remote-3-output"},
+    // URL includes, fetched again from the settings window
+    {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_MOVE, T_REFRESHINC, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_REFRESHED, 0, 0, 40000, ""},
+    {OP_CHECK, CHK_REFRESHED, 0, 0, 0, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_IDLE, 0, 0, 0, 0, "idle 3 s, connected"},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    // Closing while a turn runs there says that it runs on; Cancel stays
+    {OP_PROMPT, 0, 0, 0, 100, "Stream slowly for a while."},
+    {OP_WAIT, W_STREAMING, 0, 0, 30000, ""},
+    {OP_CLOSE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_CLOSEREMOTE, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "remote-4-close"},
+    {OP_MOVE, T_CLOSECANCEL, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    // Left: its sessions run on there
+    {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_CONNECT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_REMOTECLOSED, 0, 0, 15000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_REMOTECLOSED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "remote-5-closed"},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, -1, 0, 300, ""},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // Idle: nothing for a minute after startup settles.
 static DriveOp idleops[] = {
     {OP_MARK, 0, 0, 0, 10000, ""},  // startup settles
@@ -3884,6 +5132,21 @@ static ImVec2 targetpos(Gui *g, i32 t)
         ImGuiDockNode *l = n->ChildNodes[0];
         return v2(l->Pos.x + l->Size.x + 1, l->Pos.y + l->Size.y/2);
     }
+    case T_CLOSEBG:       return rectcenter(g->rects[RECT_CLOSEBG]);
+    case T_CONNECT:       return rectcenter(g->rects[RECT_CONNECT]);
+    case T_CONNECT2:      return rectcenter(g->rects[RECT_CONNECT2]);
+    case T_HOSTCOMBO:     return rectcenter(g->rects[RECT_HOSTCOMBO]);
+    case T_OUTPUT:        return rectcenter(g->rects[RECT_OUTPUT]);
+    case T_REFRESHINC:    return rectcenter(g->rects[RECT_REFRESHINC]);
+    case T_HOSTITEM:
+        for (i32 i = 0; i < countof(g->hostitems); i++) {
+            GuiHost *h = g->hostitems[i];
+            if (h && h->name==g->ops[g->drivepc-1].text) {
+                return rectcenter(g->rects[RECT_HOST0+i]);
+            }
+        }
+        return v2(-1, -1);
+    case T_HOSTSTAB:      return tabcenter("Hosts");
     case T_HELPTAB:       return tabcenter("Help");
     case T_TRANSCRIPTTAB: return tabcenter("Transcript");
     case T_SETTINGSTAB:   return tabcenter("Settings");
@@ -4005,10 +5268,57 @@ static i32 countrole(View *v, i32 role)
     return n;
 }
 
+// The first host of a kind, another process's when local.
+static GuiHost *drivehost(Gui *g, i32 kind)
+{
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        if (h->kind==kind && !h->own) {
+            return h;
+        }
+    }
+    return 0;
+}
+
 static b32 drivewaitdone(Gui *g)
 {
     View *v = g->view;
     switch (g->drivewait) {
+    case W_STREAMING:
+        return g->sess && v->state==LIVE_STREAMING && v->deltas>0;
+    case W_SHED:
+        return g->bg;
+    case W_REOPENED:
+        return !g->bg && g->main->own && g->main->up && g->sess &&
+               g->sess->host==g->main && !g->sess->openid;
+    case W_BGHOST: {
+        GuiHost *h = drivehost(g, GH_LOCAL);
+        b32      any = 0;
+        for (GuiSession *s = g->sessions; h && s; s = s->next) {
+            any |= s->host==h && s->listed;
+        }
+        return h && h->up && any;
+    }
+    case W_REMOTEUP: {
+        GuiHost *h = drivehost(g, GH_REMOTE);
+        return h && h->up;
+    }
+    case W_REMOTEDOWN: {
+        GuiHost *h = drivehost(g, GH_REMOTE);
+        return h && h->state==RS_DOWN;
+    }
+    case W_REMOTECLOSED: {
+        GuiHost *h = drivehost(g, GH_REMOTE);
+        return h && !h->r && h->state==RS_CLOSED;
+    }
+    case W_OUTPUT:
+        return g->out.s && !g->out.id && (g->out.text.len || g->out.err.len);
+    case W_FILE: {
+        Arena a = g->frame;
+        Str   f = join(&a, g->drivecwd, g->ops[g->drivepc-1].text);
+        return os_stat(g->os, a, f).type == STAT_FILE;
+    }
+    case W_REFRESHED:
+        return g->cfgrefreshed>0 && !g->cfgrefresh;
     case W_ENGINE:
         return g->engineok;
     case W_SESSION:
@@ -4598,6 +5908,131 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->queuedshown && v->state==LIVE_QUEUED && v->queuepos==1;
     case CHK_FALLBACK:
         return g->fallbackshown && find(v->retrymodel, "guifail_b")>=0;
+    case CHK_CLOSEBG: {
+        Rect r = g->rects[RECT_CLOSEBG];
+        return r.x1>r.x0 && !g->whynobg.len && running(g)==1;
+    }
+    case CHK_SHED: {
+        // Registered, listening, and nothing drawn any more
+        Arena a   = g->frame;
+        i64   pid = os_pid(g->os);
+        b32   reg = 0;
+        for (HostEntry *e = g->host ? hostentries(g->os, &a, g->statedir) : 0; e; e = e->next) {
+            reg |= e->pid==pid && e->endpoint==g->host->endpoint;
+        }
+        b32 listening = g->host && os_listening(g->os, a, g->host->endpoint);
+        Buf b(&a, 128);
+        print(&b, "drive: shed, host ");
+        print(&b, reg ? Str("registered") : Str("not registered"));
+        print(&b, listening ? Str(" and listening") : Str(", not listening"));
+        print(&b, g->trayup ? Str(", with a tray icon") : Str(", with no tray icon"));
+        guilog(g, finish(&b));
+        return g->bg && reg && listening;
+    }
+    case CHK_REOPENED:
+        return !g->bg && g->main->own && g->main->up && g->sess &&
+               g->sess->host==g->main && !g->sess->readonly;
+    case CHK_BGDONE:
+    case CHK_BGSESSION: {
+        // The whole answer, streamed partly to nobody, in order, once
+        // (the first window: then the second window's turn, too)
+        ViewMsg *m = 0;
+        for (iz i = v->msgs.len-1; i >= 0; i--) {
+            m = v->msgs[i].role==VIEW_ASSISTANT && !v->msgs[i].prov ? &v->msgs[i] : m;
+        }
+        ViewMsg *z     = lastmsg(g, VIEW_ASSISTANT);
+        i32      n     = chk==CHK_BGDONE ? 2 : 1;
+        b32      whole = m && startswith(m->text, "bg0 bg1 ") && endswith(m->text, "bg399 ") &&
+                         countrole(v, VIEW_ASSISTANT)==n && (n==1 || z->text=="Hello!");
+        Arena a = g->frame;
+        Buf   b(&a, 256);
+        print(&b, "drive: ");
+        print(&b, (i64)countrole(v, VIEW_ASSISTANT));
+        print(&b, " answers, the last of ");
+        print(&b, m ? m->text.len : (iz)0);
+        print(&b, " bytes, ending ");
+        print(&b, m ? taketail(m->text, m->text.len<16 ? m->text.len : 16) : Str("-"));
+        print(&b, v->busy ? Str("; busy, on ") : Str("; idle, on "));
+        print(&b, g->sess ? hostlabel(g, &a, g->sess->host) : Str("no session"));
+        guilog(g, finish(&b));
+        if (chk == CHK_BGDONE) {
+            return whole && !v->busy && g->sess && g->sess->host==g->main;
+        }
+        return whole && !v->busy && g->sess && g->sess->host->kind==GH_LOCAL &&
+               !g->sess->readonly && g->bgbadge>0;
+    }
+    case CHK_BGLISTED: {
+        GuiHost *h = drivehost(g, GH_LOCAL);
+        b32      listed = 0, engine = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            b32 bg = s->listed && startswith(s->title, "Stream in the background");
+            listed |= bg && s->host==h;
+            engine |= bg && s->host->kind==GH_ENGINE;
+        }
+        return h && listed && !engine;
+    }
+    case CHK_BGPROMPT:
+        return g->sess && g->sess->host->kind==GH_LOCAL && !v->busy &&
+               countrole(v, VIEW_ASSISTANT)==2;
+    case CHK_REMOTEUP: {
+        GuiHost *h = drivehost(g, GH_REMOTE);
+        return h && h->up && h->opens==1;
+    }
+    case CHK_REMOTESESSION:
+        // (the directory as given, or its real path there: /private/var)
+        return g->sess && g->sess->host->kind==GH_REMOTE && g->driverwd.len &&
+               endswith(v->cwd, g->driverwd) && !g->sess->readonly;
+    case CHK_REMOTEDOWN:
+        return g->downshown;
+    case CHK_REMOTEOK: {
+        // The answer whole, and the deltas once each: as many bytes as
+        // it has, though the link dropped in the middle of them
+        GuiHost *h = drivehost(g, GH_REMOTE);
+        ViewMsg *m = lastmsg(g, VIEW_ASSISTANT);
+        i64      d = v->deltabytes - g->deltamark;
+        Arena    a = g->frame;
+        Buf      b(&a, 128);
+        print(&b, "drive: ");
+        print(&b, d);
+        print(&b, " bytes of deltas for an answer of ");
+        print(&b, m ? m->text.len : (iz)0);
+        print(&b, "; the link went down ");
+        print(&b, h ? h->downs : 0);
+        print(&b, " times, up ");
+        print(&b, h ? h->opens : 0);
+        guilog(g, finish(&b));
+        return h && h->up && h->downs>=1 && h->opens>=2 && m && !v->lost &&
+               startswith(m->text, "link0 link1 ") && endswith(m->text, "link299 ") &&
+               d==m->text.len && !v->busy;
+    }
+    case CHK_OUTPUT:
+        return g->outshown && g->out.s==g->sess && g->sess->host->kind!=GH_ENGINE &&
+               find(finish(&g->out.text), "line 6")>=0 && !g->out.err.len;
+    case CHK_REMOTECLOSED: {
+        GuiHost *h = drivehost(g, GH_REMOTE);
+        b32      any = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            any |= s->host==h && s->view;
+        }
+        return h && !h->r && !h->up && any;
+    }
+    case CHK_OWNNEW:
+        return g->sess && g->main->own && g->sess->host==g->main && v->cwd.len &&
+               !g->sess->readonly;
+    case CHK_REMOTEFAILED: {
+        GuiHost *h = findhost(g, GH_REMOTE, "bad");
+        return h && h->state==RS_FAILED && !h->r && g->failshown &&
+               find(h->msg, "cannot begin with -")>=0;
+    }
+    case CHK_CLOSEREMOTE: {
+        ImGuiWindow *w = ImGui::GetTopMostPopupModal();
+        return w && !running(g) && elsewhere(g)==1 && g->elseshown;
+    }
+    case CHK_REFRESHED: {
+        Json *inc = jsonget(g->cfg, "includes")->child;
+        return g->cfgrefreshed>0 && g->cfgok && inc && jsonint(jsonget(inc, "fetched"), 0)>0 &&
+               !jsonstr(jsonget(inc, "error")).len;
+    }
     }
     return 0;
 }
@@ -4844,7 +6279,7 @@ static void drivestep(Gui *g)
         fakecmd(g, FAKE_STOP, "");
         break;
     case OP_NEWSESSION:
-        guinew(g, g->drivecwd, {}, op->text);  // in a role, if named
+        guinew(g, g->main, g->drivecwd, {}, op->text);  // in a role, if named
         break;
     case OP_TOUCH: {
         Arena a = g->frame;
@@ -4980,6 +6415,29 @@ static void drivestep(Gui *g)
         g->reveal = op->target;
         scheddirty(&g->sched);
         break;
+    case OP_TRAY:
+        e.kind = GEV_TRAY;
+        e.x    = op->dx;
+        os_guiinject(g->os, &e);
+        break;
+    case OP_DROPLINK:
+        if (g->sess && g->sess->host->r) {
+            guilog(g, "drive: dropping the link to the session's host");
+            remotedrop(g->sess->host->r);
+        } else {
+            guilog(g, "drive: FAIL no link to drop");
+            g->drivechecks++;
+            g->drivefails++;
+        }
+        break;
+    case OP_TEXTRCWD:
+        e.kind = GEV_TEXT;
+        e.text = g->driverwd;  // null-terminated, from the command line
+        os_guiinject(g->os, &e);
+        break;
+    case OP_MARKDELTAS:
+        g->deltamark = g->view->deltabytes;
+        break;
     case OP_SHOT:
         if (g->shotdir.len) {
             Str name = concat(&g->perm, op->text, ".png");
@@ -5074,6 +6532,13 @@ static Str guiusage =
 "  --e2e          the checklist's end-to-end part against a real model\n"
 "  --settings     the settings window's checklist, screenshots of each theme\n"
 "  --enginestop   the engine process dies mid-turn (implies subprocess)\n"
+"  --background   M5's checklist: keep a turn running in the background,\n"
+"                 then come back from the tray (tests/gui.py drives it)\n"
+"  --attach       a second window while one runs in the background\n"
+"  --remote       a remote host, [remote r], its link dropped mid-turn\n"
+"  --rcwd DIR     the remote checklist's working directory there\n"
+"  --host-idle S  in the background, exit S seconds after the last\n"
+"                 session ends with no window (default: [host] idle_exit)\n"
 "  --probe        staleness probe on (default in debug builds)\n"
 "  --no-probe     staleness probe off\n"
 "  --aggressive   probe every second while idle\n"
@@ -5223,6 +6688,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     #endif
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
+    b32 background = 0, attach = 0, remote = 0;
     i64 history = 0;
     i32 bench   = 0;
     for (i32 i = 1 + (nargs>1 && args[1]=="gui"); i < nargs; i++) {
@@ -5250,6 +6716,14 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             settings = probe = 1;
         } else if (a == "--enginestop") {
             enginestop = subprocess = probe = 1;
+        } else if (a == "--background") {
+            background = probe = 1;
+        } else if (a == "--attach") {
+            attach = probe = 1;
+        } else if (a == "--remote") {
+            remote = probe = 1;
+        } else if (a=="--rcwd" && i+1<nargs) {
+            g->driverwd = cstrclone(&mem, args[++i]);
         } else if (a == "--trace") {
             g->trace = 1;
         } else if (a == "--trace-drive") {
@@ -5279,6 +6753,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             subprocess = 1;
         } else if (a == "--engine=inproc") {
             subprocess = 0;
+        } else if (a == "--host-idle") {
+            i64 s = optint(args, nargs, &i);
+            g->hostidle = s>0 ? s*1000000 : 0;
         } else {
             os_print(os, 2, guiusage);
             return 1;
@@ -5289,11 +6766,21 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         return 1;
     }
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
-    if (drive || idle || streamtest || e2e || settings || enginestop) {
+    if (drive || idle || streamtest || e2e || settings || enginestop ||
+            background || attach || remote) {
         g->drive = 1;
         if (e2e) {
             g->ops  = e2eops;
             g->nops = countof(e2eops);
+        } else if (background) {
+            g->ops  = bgops;
+            g->nops = countof(bgops);
+        } else if (attach) {
+            g->ops  = attachops;
+            g->nops = countof(attachops);
+        } else if (remote) {
+            g->ops  = remoteops;
+            g->nops = countof(remoteops);
         } else if (settings) {
             g->ops  = settingsops;
             g->nops = countof(settingsops);
@@ -5342,6 +6829,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->newmodel   = alloc<char>(&g->perm, FIELD_MAX);
     g->denynote   = alloc<char>(&g->perm, FIELD_MAX);
     g->addname    = alloc<char>(&g->perm, FIELD_MAX);
+    g->remname    = alloc<char>(&g->perm, FIELD_MAX);
+    g->remssh     = alloc<char>(&g->perm, FIELD_MAX);
+    g->rempath    = alloc<char>(&g->perm, FIELD_MAX);
+    g->hosts      = addhost(g, GH_ENGINE, "");
+    g->main       = g->hosts;
+    g->pendhost   = g->hosts;
     g->benchtimes = alloc<i64>(&g->perm, BENCH_MAX);
     g->pending    = Buf(&g->pendmem, 1<<12);
 
@@ -5399,7 +6892,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             os_print(os, 2, "harness: out of memory\n");
             return 2;
         }
-        GuiSession *s = addsess(g, f->sid);
+        GuiSession *s = addsess(g, g->hosts, f->sid);
         View       *v = sessview(g, s);
         v->title = "Fake agent";
         v->cwd   = "(none)";
@@ -5460,6 +6953,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         guihello(g);
         guilist(g);
         guiconfigget(g);
+    }
+    if (!fake) {
+        findhosts(g, g->frame);  // background hosts of the state directory
     }
     if (history) {
         g->histreq = os_ticks(os);
