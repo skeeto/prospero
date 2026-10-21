@@ -528,6 +528,8 @@ struct Engine {
     i64         minute;   // ticks of a minute of slow retries (a test
                           // hook, HARNESS_TEST_MINUTE_MS, shortens it)
     Slice<Parked> parked; // sessions parked, revived by their next command
+    i64         cfgwait[8];  // config.get {refresh} ids awaiting fetches
+    i32         ncfgwait;
 };
 
 
@@ -6063,7 +6065,59 @@ static void reconfigure(Engine *e)
     }
 }
 
-// config.get and config.set, with the shapes in config.cpp.
+// Reply to config.get or config.set with the configuration as loaded.
+static void replyconfig(Engine *e, Arena scratch, i64 id, i32 cmd, CfgSet *r)
+{
+    Config *c = e->cfg;
+    Buf     b(&scratch, 1<<14);
+    EvOut   w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", r->ok);
+    if (!r->ok) {
+        putstrkey(&w.json, "err", r->err);
+    }
+    if (cmd == CMD_CONFIGGET) {
+        putcfg(&w.json, c);
+    } else {
+        putcfgset(&w.json, c, r);
+    }
+    emit(e, evend(&w));
+}
+
+// Answer the config.get {refresh} commands waiting for fetches, once
+// none is under way or due.
+static void configwaiters(Engine *e, Arena scratch)
+{
+    if (!e->ncfgwait || cfgbusy(e->cfg)) {
+        return;
+    }
+    for (i32 i = 0; i < e->ncfgwait; i++) {
+        CfgSet r = {};
+        r.ok = 1;
+        replyconfig(e, scratch, e->cfgwait[i], CMD_CONFIGGET, &r);
+    }
+    e->ncfgwait = 0;
+}
+
+// A record of a URL include's fetch (config.cpp). Returns 0 if it is
+// not one.
+static b32 onconfig(Engine *e, Arena scratch, Record r)
+{
+    i64 rev = e->cfg->rev;
+    if (!cfgrecord(e->cfg, scratch, r)) {
+        return 0;
+    }
+    if (e->cfg->rev != rev) {
+        reconfigure(e);
+    }
+    configwaiters(e, scratch);
+    return 1;
+}
+
+// config.get and config.set, with the shapes in config.cpp. With
+// refresh, config.get fetches every URL include anew, and its reply
+// waits for the fetches to end (30 s at most), unless 8 such replies
+// wait already, when it comes at once.
 static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
 {
     Config *c   = e->cfg;
@@ -6072,6 +6126,16 @@ static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
     if (cmd == CMD_CONFIGGET) {
         r.ok = 1;
         cfgpoll(c, scratch, 1);
+        if (jsonflag(jsonget(j, "refresh"), 0)) {
+            cfgrefresh(c, scratch, 1);
+            if (cfgbusy(c) && e->ncfgwait<countof(e->cfgwait)) {
+                e->cfgwait[e->ncfgwait++] = id;
+                if (c->rev != rev) {
+                    reconfigure(e);
+                }
+                return;
+            }
+        }
     } else {
         Json *v     = jsonget(j, "value");
         Str   value = v->type==JSON_STRING ? (v->str.data ? v->str : Str("")) :
@@ -6087,20 +6151,7 @@ static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
     if (c->rev != rev) {
         reconfigure(e);
     }
-
-    Buf   b(&scratch, 1<<14);
-    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
-    putintkey(&w.json, "id", id);
-    putintkey(&w.json, "ok", r.ok);
-    if (!r.ok) {
-        putstrkey(&w.json, "err", r.err);
-    }
-    if (cmd == CMD_CONFIGGET) {
-        putcfg(&w.json, c);
-    } else {
-        putcfgset(&w.json, c, &r);
-    }
-    emit(e, evend(&w));
+    replyconfig(e, scratch, id, cmd, &r);
 }
 
 static b32 allidle(Engine *e)
@@ -6295,7 +6346,8 @@ static void onrecord(Engine *e, Arena scratch, Record r)
     } else if (r.type == MAIL_TOOLONG) {
         reply(e, scratch, (i64)r.id, 0, "command too long", {});
         return;
-    } else if (onprobe(e, scratch, r) || onctl(e, scratch, r)) {
+    } else if (onconfig(e, scratch, r) || onprobe(e, scratch, r) ||
+               onctl(e, scratch, r)) {
         return;
     }
 
@@ -6459,10 +6511,12 @@ static void ontimer(Session *s, Arena scratch, i32 t)
 static void enginethread(void *arg)
 {
     Engine *e = (Engine *)arg;
+    cfgrefresh(e->cfg, newarena(e->scratch), 0);  // what loaded from a cache
     for (;;) {
         i64 now  = os_ticks(e->os);
         i64 next = e->quitting ? e->quitby : I64MAX;
         next = e->admat && e->admat<next ? e->admat : next;
+        next = cfgnext(e->cfg)<next ? cfgnext(e->cfg) : next;
         for (Session *s = e->sessions; s; s = s->next) {
             for (i32 t = 0; t < T_COUNT; t++) {
                 if (s->timers[t] && s->timers[t]<next) next = s->timers[t];
@@ -6501,6 +6555,14 @@ static void enginethread(void *arg)
             for (AdmPoint *p = e->adm.points; p; p = p->next) {
                 pump(e, p);
             }
+        }
+        if (cfgnext(e->cfg) <= now) {
+            i64 rev = e->cfg->rev;
+            cfgtimeout(e->cfg, newarena(e->scratch));
+            if (e->cfg->rev != rev) {
+                reconfigure(e);
+            }
+            configwaiters(e, newarena(e->scratch));
         }
         for (Session **p = &e->sessions; *p;) {
             Session *s = *p;
@@ -6637,6 +6699,8 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     // Tests shorten minutes of slow retries to milliseconds
     Int minute = parseint(os_getenv(os, &e->perm, "HARNESS_TEST_MINUTE_MS"));
     e->minute  = minute.ok && minute.val>0 && minute.val<=60000 ? minute.val*MS : 60*SEC;
+    // URL includes refresh in the background now, every ten minutes
+    cfgattach(cfg, e->in, 10*e->minute);
     return e;
 }
 

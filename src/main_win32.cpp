@@ -97,7 +97,9 @@ enum : i32 {
     WINHTTP_ACCESS_TYPE_AUTOMATIC     = 4,
     WINHTTP_ACCESS_TYPE_DEFAULT       = 0,
     WINHTTP_ACCESS_TYPE_NO_PROXY      = 1,
+    WINHTTP_DISABLE_REDIRECTS         = 2,
     WINHTTP_FLAG_SECURE               = 0x00800000,
+    WINHTTP_OPTION_DISABLE_FEATURE    = 63,
     WINHTTP_OPTION_PROXY              = 38,
     WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT = 7,
     WINHTTP_QUERY_FLAG_NUMBER         = 0x20000000,
@@ -1875,6 +1877,10 @@ static void httpworker(void *arg)
         i32 wait = h->readms ? h->readms : 0x7fffffff;
         WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT,
                          &wait, sizeof(wait));
+        // Redirects are the caller's, as on other platforms
+        i32 off = WINHTTP_DISABLE_REDIRECTS;
+        WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE,
+                         &off, sizeof(off));
     }
 
     if (!httplive(h) ||

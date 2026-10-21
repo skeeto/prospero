@@ -146,5 +146,8 @@ if(NOT CMAKE_CROSSCOMPILING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios.py --harness $<TARGET_FILE:harness>)
     add_test(NAME cleanup COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/cleanup.py --harness $<TARGET_FILE:harness>)
+    # URL includes in the configuration, against a fake web server
+    add_test(NAME includes COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/includes.py --harness $<TARGET_FILE:harness>)
   endif()
 endif()

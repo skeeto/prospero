@@ -541,9 +541,11 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
         return 2;
     }
 
-    // An explicit file must exist; the default one is seeded on first run
+    // An explicit file must exist; the default one is seeded on first run.
+    // URL includes not yet cached are fetched now, briefly.
+    c.statedir = state.len ? state : defaultstate(os, &perm);
     Str     path = config.len ? config : cfgdefault(os, &perm);
-    Config *cfg  = newconfig(os, &perm, scratch, path, !config.len);
+    Config *cfg  = newconfig(os, &perm, scratch, path, !config.len, c.statedir, 1);
     if (!cfg) {
         os_print(os, 2, "harness: out of memory\n");
         return 2;
@@ -559,7 +561,6 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
         os_print(os, 2, finish(&b));
     }
 
-    c.statedir = state.len ? state : defaultstate(os, &perm);
     Str sessions = join(&perm, c.statedir, "sessions");
     if (!os_mkdirs(os, scratch, sessions)) {
         os_print(os, 2, "harness: cannot create the state directory\n");
