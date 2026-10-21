@@ -438,16 +438,29 @@ class Remote:
 
 def makesessions(host, ini, state, work):
     """Two sessions for the GUI to find: "Say hello." run and closed, and
-    "Hold me" held open by a headless engine, which is returned."""
+    "Hold me" held open by a headless engine, which is returned. The
+    second's record of 5 MiB is too big for any mailbox, the holder's
+    own too, so its turn's end may show only in its log."""
     p = host.popen(["run", "-C", work, "-c", ini, "--state", state, "Say hello."])
     p.communicate(timeout=60)
     holder = host.popen(["--headless", "--state", state, "-c", ini], stdin=True)
     cmd = {"cmd": "new", "id": 1, "cwd": work, "prompt": "Hold me: say hello."}
     holder.stdin.write(json.dumps(cmd) + "\n")
     holder.stdin.flush()
+    sid = None
     for line in holder.stdout:
+        if sid is None and '"ev":"reply"' in line:
+            sid = json.loads(line).get("sid")
         if '"ev":"turn.end"' in line:
             break
+        if '"ev":"overflow"' in line and sid:
+            log = host.path("state", "sessions", sid, "events.jsonl")
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and '"ev":"turn.end"' not in (host.read(log) or ""):
+                time.sleep(0.5)
+            break
+    # Its output must keep flowing, or it would block writing it
+    threading.Thread(target=lambda: [None for _ in holder.stdout], daemon=True).start()
     return holder
 
 

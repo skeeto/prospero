@@ -2092,7 +2092,9 @@ static void sendsnapshot(Session *s, Arena scratch)
         return;
     }
     iz budget = mailmax(s->e->out) / 8;
-    budget = budget<SNAPSHOT_MAX ? budget : SNAPSHOT_MAX;
+    if (budget > SNAPSHOT_MAX) {
+        budget = SNAPSHOT_MAX;
+    }
     iz share = budget / (p->nblocks>0 ? p->nblocks : 1);
 
     Buf   b(&scratch, 1024 + budget);
