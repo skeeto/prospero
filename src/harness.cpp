@@ -412,6 +412,7 @@ static Arena newarena(Region *r)
 #include "engine.cpp"
 #include "cli.cpp"
 #include "host.cpp"
+#include "deploy.cpp"
 #include "remote.cpp"
 #include "selftest.cpp"
 #include "selftest_io.cpp"
@@ -425,6 +426,7 @@ static Str usage =
 "       harness attach [--reconnect] [options]\n"
 "       harness hosts [--state DIR]\n"
 "       harness connect NAME | --ssh DEST | --local [options]\n"
+"       harness deploy NAME|DEST [--force] [options]\n"
 "  --version         print the version and exit\n"
 "  --selftest [URL]  run the platform integration tests, with HTTP\n"
 "                    tests against a fake provider at URL\n"
@@ -455,6 +457,8 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
         return hostsmain(os, perm, scratch, args, nargs);
     } else if (nargs>1 && args[1]=="connect") {
         return connectmain(os, perm, scratch, args, nargs);
+    } else if (nargs>1 && args[1]=="deploy") {
+        return deploymain(os, perm, scratch, args, nargs);
     }
 
     for (i32 i = 1; i < nargs; i++) {

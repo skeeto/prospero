@@ -499,6 +499,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/instructions_test.cpp"
 #include "test/config_test.cpp"
 #include "test/engine_test.cpp"  // after config's test platform
+#include "test/deploy_test.cpp"
 #if HARNESS_GUI
 #  include "sched.cpp"
 #  include "highlight.cpp"
@@ -539,6 +540,7 @@ int main()
     test_instructions(&t);
     test_engine(&t);
     test_config(&t);
+    test_deploy(&t);
     #if HARNESS_GUI
     test_sched(&t);
     test_highlight(&t);
