@@ -1,12 +1,17 @@
 // ImGui user interface: the transcript widget with its tool rows and ask
 // cards, the sessions sidebar, the liveness strip and the prompt, the
 // settings window, the new session and close dialogs, the dock layout,
-// the metrics overlay, and the scheduler's view of ImGui
+// the metrics overlay, the theme's colors, and the scheduler's view of
+// ImGui
 //
 // All ImDrawList code lives here, since its signatures shift between
 // ImGui releases. uiscan and uideadlines read ImGui's internals after
 // each frame to tell the scheduler what it is waiting on, and drawhash
 // fingerprints the frame's draw data.
+//
+// Every color comes from the palette in effect (g->pal, theme.cpp), and
+// ImGui's own from its stock style for the palette with a few replaced
+// (themestyle). A change of theme recolors both at once.
 //
 // Nothing here may make a frame differ from the last without declaring
 // why: a value drawn from the clock needs a deadline for when it next
@@ -297,12 +302,56 @@ static void uideadlines(Gui *g, Sched *s)
 }
 
 
-// Transcript
+// Themes
 
-static u32 rgba(i32 r, i32 g, i32 b, i32 a)
+// ImGui's colors for a palette: its stock dark or light style, with the
+// palette's panels, text, fields, selected rows and bars.
+static void themestyle(ImGuiStyle *st, Palette *p)
 {
-    return IM_COL32(r, g, b, a);
+    if (p->dark) {
+        ImGui::StyleColorsDark(st);
+    } else {
+        ImGui::StyleColorsLight(st);
+    }
+    ImVec4 *c = st->Colors;
+    c[ImGuiCol_WindowBg]      = ImGui::ColorConvertU32ToFloat4(p->panel);
+    c[ImGuiCol_Text]          = ImGui::ColorConvertU32ToFloat4(p->paneltext);
+    c[ImGuiCol_TextDisabled]  = ImGui::ColorConvertU32ToFloat4(p->paneldim);
+    c[ImGuiCol_FrameBg]       = ImGui::ColorConvertU32ToFloat4(p->frame);
+    c[ImGuiCol_Header]        = ImGui::ColorConvertU32ToFloat4(p->selrow);
+    c[ImGuiCol_PlotHistogram] = ImGui::ColorConvertU32ToFloat4(p->bar);
 }
+
+// Put the theme in effect: the one configured, or the system's. A change
+// recolors everything in one presented frame, and the window's frame
+// follows where the platform can make it do so; no change, no frame.
+static void applytheme(Gui *g)
+{
+    Palette *p = themepalette(g->themeset, g->sysdark);
+    if (p == g->pal) {
+        return;
+    }
+    g->pal = p;
+    themestyle(&g->basestyle, p);  // where a new DPI scale starts
+    ImGuiStyle &st = ImGui::GetStyle();
+    for (i32 i = 0; i < ImGuiCol_COUNT; i++) {
+        st.Colors[i] = g->basestyle.Colors[i];
+    }
+    g->titleok = os_guitheme(g->os, p->dark);
+    g->woke |= WOKE_FORCE;
+    schedforce(&g->sched);
+}
+
+// The configured theme: THEME_*, or -1 for an unknown name, which means
+// the system's.
+static void settheme(Gui *g, i32 theme)
+{
+    g->themeset = theme<0 ? THEME_SYSTEM : theme;
+    applytheme(g);
+}
+
+
+// Transcript
 
 // A color at a fraction of its opacity.
 static u32 fade(u32 col, f32 alpha)
@@ -311,36 +360,21 @@ static u32 fade(u32 col, f32 alpha)
     return (col & ~IM_COL32_A_MASK) | a<<IM_COL32_A_SHIFT;
 }
 
-static u32 hlcolor(i32 cls)
-{
-    switch (cls) {
-    case HL_COMMENT:  return rgba(118, 160, 115, 255);
-    case HL_KEYWORD:  return rgba(198, 140, 228, 255);
-    case HL_TYPE:     return rgba(86, 182, 194, 255);
-    case HL_STRING:   return rgba(214, 157, 133, 255);
-    case HL_NUMBER:   return rgba(181, 206, 168, 255);
-    case HL_PREPROC:  return rgba(197, 134, 192, 255);
-    case HL_VAR:      return rgba(156, 220, 254, 255);
-    case HL_FUNC:     return rgba(220, 220, 170, 255);
-    case HL_INSERTED: return rgba(120, 200, 120, 255);
-    case HL_DELETED:  return rgba(230, 110, 110, 255);
-    case HL_HEADING:  return rgba(150, 170, 230, 255);
-    }
-    return rgba(212, 212, 212, 255);
-}
-
-static u32 piececolor(Piece *p)
+// A piece's color, in a code block or elsewhere.
+static u32 piececolor(Palette *pal, Piece *p, b32 codeblock)
 {
     if (p->hl) {
-        return hlcolor(p->hl);
+        return pal->hl[p->hl];
+    } else if (codeblock) {
+        return pal->codetext;
     } else if (p->style & STYLE_LINK) {
-        return rgba(100, 160, 240, 255);
+        return pal->link;
     } else if (p->style & STYLE_DIM) {
-        return rgba(150, 150, 150, 255);
+        return pal->reasoning;
     } else if (p->style & STYLE_CODE) {
-        return rgba(225, 190, 140, 255);
+        return pal->code;
     }
-    return rgba(222, 222, 222, 255);
+    return pal->text;
 }
 
 static Str rolename(i32 role)
@@ -356,40 +390,31 @@ static Str rolename(i32 role)
     return "";
 }
 
-// Colors for states
-enum : u32 {
-    C_DIM    = IM_COL32(140, 150, 170, 255),
-    C_OK     = IM_COL32(110, 200, 120, 255),
-    C_BAD    = IM_COL32(235, 100, 100, 255),
-    C_AMBER  = IM_COL32(235, 180, 80, 255),
-    C_ACTIVE = IM_COL32(110, 170, 240, 255),
-};
-
-static u32 toolcolor(i32 status)
+static u32 toolcolor(Palette *p, i32 status)
 {
     switch (status) {
-    case VTOOL_OK:        return C_OK;
+    case VTOOL_OK:        return p->ok;
     case VTOOL_ERROR:
     case VTOOL_TIMEOUT:
-    case VTOOL_UNKNOWN:   return C_BAD;
+    case VTOOL_UNKNOWN:   return p->bad;
     case VTOOL_DENIED:
-    case VTOOL_ASKING:    return C_AMBER;
+    case VTOOL_ASKING:    return p->amber;
     case VTOOL_RUNNING:
-    case VTOOL_STREAMING: return C_ACTIVE;
+    case VTOOL_STREAMING: return p->active;
     }
-    return C_DIM;
+    return p->dim;
 }
 
-static u32 livecolor(i32 state)
+static u32 livecolor(Palette *p, i32 state)
 {
     switch (state) {
     case LIVE_IDLE:
-    case LIVE_CLOSED:  return C_DIM;
+    case LIVE_CLOSED:  return p->dim;
     case LIVE_ASK:
-    case LIVE_BACKOFF: return C_AMBER;
-    case LIVE_ERROR:   return C_BAD;
+    case LIVE_BACKOFF: return p->amber;
+    case LIVE_ERROR:   return p->bad;
     }
-    return C_ACTIVE;
+    return p->active;
 }
 
 enum : i32 {
@@ -410,6 +435,8 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
     f32          ox     = origin.x;
     f32          oy     = origin.y + p->y;
     Fonts       *f      = &g->fonts;
+    Palette     *pal    = g->pal;
+    b32          code   = b->type == DOC_CODE;
 
     for (iz i = 0; i < bl->decos.len; i++) {
         Deco *dc = &bl->decos[i];
@@ -418,28 +445,28 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
         switch (dc->kind) {
         case DECO_CODEBG:
             sp->SetCurrentChannel(dl, CH_BG);
-            dl->AddRectFilled(a, z, fade(rgba(30, 30, 34, 255), alpha), 4*g->scale);
+            dl->AddRectFilled(a, z, fade(pal->codebg, alpha), 4*g->scale);
             break;
         case DECO_HEADERBG:
             sp->SetCurrentChannel(dl, CH_BG);
-            dl->AddRectFilled(a, z, fade(rgba(45, 45, 52, 255), alpha));
+            dl->AddRectFilled(a, z, fade(pal->headerbg, alpha));
             break;
         case DECO_QUOTE:
             sp->SetCurrentChannel(dl, CH_TEXT);
-            dl->AddRectFilled(a, z, fade(rgba(90, 90, 100, 255), alpha));
+            dl->AddRectFilled(a, z, fade(pal->quote, alpha));
             break;
         case DECO_RULE:
         case DECO_GRID:
             sp->SetCurrentChannel(dl, CH_TEXT);
             dl->AddRectFilled(a, v2(z.x>a.x+1 ? z.x : a.x+1, z.y>a.y+1 ? z.y : a.y+1),
-                              fade(rgba(80, 80, 88, 255), alpha));
+                              fade(pal->rule, alpha));
             break;
         case DECO_MARKER: {
             sp->SetCurrentChannel(dl, CH_TEXT);
             ImFontBaked *bk = stylebaked(f, 0);
             ImVec2 at = v2(ox+dc->x, oy+dc->y - bk->Ascent);
             dl->AddText(stylefont(f, 0), stylesize(f, 0), at,
-                        fade(rgba(160, 160, 170, 255), alpha), dc->text.cdata,
+                        fade(pal->marker, alpha), dc->text.cdata,
                         dc->text.cdata+dc->text.len);
         } break;
         }
@@ -468,8 +495,7 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
                         x1 = r->x + (r->w>0 ? r->w : 4*g->scale);
                     }
                     sp->SetCurrentChannel(dl, CH_SEL);
-                    dl->AddRectFilled(v2(ox+x0, ly), v2(ox+x1, ly+l->h),
-                                      rgba(38, 79, 120, 255));
+                    dl->AddRectFilled(v2(ox+x0, ly), v2(ox+x1, ly+l->h), pal->sel);
                 }
             }
             if (r->flags & RUN_NODRAW) {
@@ -479,7 +505,7 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
             ImVec2       at  = v2(ox + r->x, ly + l->base - bk->Ascent);
             char const  *beg = pc->text.cdata + r->b0;
             char const  *end = pc->text.cdata + r->b1;
-            u32          col = fade(piececolor(pc), alpha);
+            u32          col = fade(piececolor(pal, pc, code), alpha);
             sp->SetCurrentChannel(dl, CH_TEXT);
             dl->AddText(stylefont(f, pc->style), stylesize(f, pc->style), at,
                         col, beg, end);
@@ -580,18 +606,19 @@ static i64 countdown(Gui *g, i64 at, i64 nowms)
 // A message's header line: who, or what a tool did, or an ask's state.
 static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
 {
-    Arena     a  = g->frame;
-    ViewTool *t  = m->tool;
-    b32       cl = m->role==VIEW_TOOL || m->role==VIEW_THINK;
-    f32       sz = p->size;
+    Arena     a   = g->frame;
+    ViewTool *t   = m->tool;
+    b32       cl  = m->role==VIEW_TOOL || m->role==VIEW_THINK;
+    f32       sz  = p->size;
+    Palette  *pal = g->pal;
     if (cl) {
         // A triangle for whether the body shows
         f32    fs = ImGui::GetFontSize();
         ImVec2 at = v2(p->x, p->y + (sz - 0.7f*fs)/2);
-        ImGui::RenderArrow(p->dl, at, C_DIM, m->collapsed ? ImGuiDir_Right : ImGuiDir_Down, 0.7f);
+        ImGui::RenderArrow(p->dl, at, pal->dim, m->collapsed ? ImGuiDir_Right : ImGuiDir_Down, 0.7f);
         p->x += fs;
     }
-    u32 dim = fade(C_DIM, m->faded ? 0.5f : 1);
+    u32 dim = fade(pal->dim, m->faded ? 0.5f : 1);
     switch (m->role) {
     case VIEW_TOOL: {
         pen(p, t->name.len ? t->name : Str("call"), STYLE_BOLD, dim);
@@ -600,26 +627,26 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             Buf b(&a, 64);
             print(&b, "writing arguments, ");
             print(&b, bytesize(&a, t->args.len));
-            pen(p, finish(&b), 0, C_ACTIVE);
+            pen(p, finish(&b), 0, pal->active);
             break;
         }
         // The outcome first, so that a long summary cannot hide it
-        pen(p, vtoolnames[t->status], STYLE_BOLD, toolcolor(t->status));
+        pen(p, vtoolnames[t->status], STYLE_BOLD, toolcolor(pal, t->status));
         if (t->hasexit) {
             Buf b(&a, 32);
             print(&b, "  exit ");
             print(&b, (i64)t->exit);
-            pen(p, finish(&b), 0, t->exit ? C_BAD : dim);
+            pen(p, finish(&b), 0, t->exit ? pal->bad : dim);
         }
         if (t->status==VTOOL_RUNNING && t->outbytes) {
             pen(p, "  ", 0, dim);
             pen(p, bytesize(&a, t->outbytes), 0, dim);
-        } else if (t->status>=VTOOL_OK) {
+        } else if (t->status>=VTOOL_OK && (t->ms || t->status!=VTOOL_UNKNOWN)) {
             pen(p, "  ", 0, dim);
             pen(p, duration(&a, t->ms), 0, dim);
         }
         pen(p, "  ", 0, dim);
-        pen(p, t->summary, STYLE_CODE, rgba(200, 200, 205, 255));
+        pen(p, t->summary, STYLE_CODE, pal->summary);
     } break;
     case VIEW_THINK: {
         pen(p, "Reasoning", STYLE_BOLD, dim);
@@ -636,9 +663,9 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         print(&b, t->tool);
         print(&b, " ");
         print(&b, t->path);
-        pen(p, "Allow ", STYLE_BOLD, C_AMBER);
-        pen(p, finish(&b), STYLE_CODE, rgba(200, 200, 205, 255));
-        pen(p, "?  ", STYLE_BOLD, C_AMBER);
+        pen(p, "Allow ", STYLE_BOLD, pal->amber);
+        pen(p, finish(&b), STYLE_CODE, pal->summary);
+        pen(p, "?  ", STYLE_BOLD, pal->amber);
         if (t->answer == VASK_PENDING) {
             if (v->readonly) {
                 pen(p, "waiting in another process", 0, dim);
@@ -653,7 +680,7 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             } else {
                 print(&c, "denying");
             }
-            pen(p, finish(&c), 0, C_AMBER);
+            pen(p, finish(&c), 0, pal->amber);
         } else {
             b32 ok = t->answer == VASK_ALLOWED;
             Buf c(&a, 256);
@@ -663,8 +690,9 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
                       t->by=="steer"   ? Str(": you sent a message instead") :
                       t->by=="cancel"  ? Str(": the turn was cancelled") :
                       t->by=="policy"  ? Str(": nobody could answer") :
-                      t->by=="interrupted" ? Str(": the harness stopped while asking") : Str(""));
-            pen(p, finish(&c), STYLE_BOLD, ok ? C_OK : C_BAD);
+                      t->by=="interrupted" ? Str(": the harness stopped while asking") :
+                      t->by=="stopped" ? Str(": the engine stopped") : Str(""));
+            pen(p, finish(&c), STYLE_BOLD, ok ? pal->ok : pal->bad);
         }
     } break;
     default:
@@ -709,7 +737,7 @@ static void drawtranscript(Gui *g)
 
     if (gs->readonly) {
         g->bannershown = 1;
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_AMBER));
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
         ImGui::TextWrapped("Read-only: another harness process has this "
                            "session open. Its changes show after it lets go "
                            "and the session is opened again.");
@@ -720,7 +748,7 @@ static void drawtranscript(Gui *g)
         ImGui::SetItemTooltip("Take the session over, if the other process has let go");
     }
     if (g->engineerr.len) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_BAD));
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
         Arena a = g->frame;
         ImGui::TextWrapped("The engine is unavailable: %s", cstr0(&a, g->engineerr));
         ImGui::PopStyleColor();
@@ -919,14 +947,14 @@ static void drawtranscript(Gui *g)
         // Backgrounds: the user's messages, tool rows, ask cards
         sp->SetCurrentChannel(dl, CH_BG);
         if (m->role == VIEW_USER) {
-            dl->AddRectFilled(box0, box1, rgba(40, 44, 52, 255), 6*sc);
+            dl->AddRectFilled(box0, box1, g->pal->userbg, 6*sc);
         } else if (m->role == VIEW_TOOL) {
-            dl->AddRectFilled(box0, box1, fade(rgba(34, 36, 40, 255), alpha), 4*sc);
-            dl->AddRectFilled(box0, v2(box0.x+3*sc, box1.y), fade(toolcolor(m->tool->status), alpha*0.8f));
+            dl->AddRectFilled(box0, box1, fade(g->pal->toolbg, alpha), 4*sc);
+            dl->AddRectFilled(box0, v2(box0.x+3*sc, box1.y), fade(toolcolor(g->pal, m->tool->status), alpha*0.8f));
         } else if (m->role == VIEW_ASK) {
             b32 open = m->tool->answer == VASK_PENDING;
-            dl->AddRectFilled(box0, box1, rgba(48, 42, 30, 255), 6*sc);
-            dl->AddRect(box0, box1, open ? (u32)C_AMBER : fade(C_AMBER, 0.4f), 6*sc, 1.5f*sc);
+            dl->AddRectFilled(box0, box1, g->pal->askbg, 6*sc);
+            dl->AddRect(box0, box1, open ? g->pal->amber : fade(g->pal->amber, 0.4f), 6*sc, 1.5f*sc);
         }
 
         sp->SetCurrentChannel(dl, CH_TEXT);
@@ -1035,7 +1063,7 @@ static void drawstrip(Gui *g)
     i64   now   = g->sched.now;
     b32   req   = v->state==LIVE_DISCOVER || v->state==LIVE_WAITING ||
                   v->state==LIVE_STREAMING || v->state==LIVE_ERROR;
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(livecolor(v->state)));
+    ImGui::PushStyleColor(ImGuiCol_Text, livecolor(g->pal, v->state));
     ImGui::TextUnformatted(cstr0(&a, v->busy && v->state==LIVE_IDLE ? Str("working")
                                                                      : livenames[v->state]));
     ImGui::PopStyleColor();
@@ -1090,7 +1118,7 @@ static void drawstrip(Gui *g)
                 print(&b, " s");
             }
             ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(red ? C_BAD : C_AMBER));
+            ImGui::PushStyleColor(ImGuiCol_Text, red ? g->pal->bad : g->pal->amber);
             ImGui::TextUnformatted(cstr0(&a, finish(&b)));
             ImGui::PopStyleColor();
         } else {
@@ -1109,13 +1137,13 @@ static void drawstrip(Gui *g)
         print(&b, secs);
         print(&b, " s");
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_AMBER));
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
         ImGui::TextUnformatted(cstr0(&a, finish(&b)));
         ImGui::PopStyleColor();
     }
     if (v->asks) {
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_AMBER));
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
         ImGui::TextUnformatted("waiting for your answer above");
         ImGui::PopStyleColor();
     }
@@ -1125,7 +1153,8 @@ static void drawprompt(Gui *g)
 {
     f32  sc   = g->scale;
     View *v   = g->view;
-    b32  can  = g->sess && g->sess->view && !g->sess->readonly && !g->quitting;
+    b32  can  = g->sess && g->sess->view && !g->sess->readonly && !g->quitting &&
+                !g->enginegone;
     drawstrip(g);
     escapecancel(g);
 
@@ -1226,18 +1255,18 @@ static void drawsessions(Gui *g)
         Str cwd = v && v->cwd.len ? v->cwd : s->cwd;
         ImGui::SetItemTooltip("%s\n%s", cstr0(&a, cwd), cstr0(&a, s->sid));
         Pen t = {dl, &g->fonts, p.x + 4*sc, p.y + 2*sc, p.x + w, g->fonts.size};
-        pen(&t, sesstitle(s), 0, rgba(222, 222, 222, 255));
+        pen(&t, sesstitle(s), 0, g->pal->text);
         Pen b = {dl, &g->fonts, p.x + 4*sc, p.y + 2*sc + lineh, p.x + w, small};
         if (s->readonly || (!v && s->locked)) {
-            pen(&b, "read-only", STYLE_BOLD, C_AMBER);
+            pen(&b, "read-only", STYLE_BOLD, g->pal->amber);
         } else if (v && v->asks) {
-            pen(&b, "needs an answer", STYLE_BOLD, C_AMBER);
+            pen(&b, "needs an answer", STYLE_BOLD, g->pal->amber);
         } else {
             Str name = v && v->busy && state==LIVE_IDLE ? Str("working") : livenames[state];
-            pen(&b, name, STYLE_BOLD, livecolor(state));
+            pen(&b, name, STYLE_BOLD, livecolor(g->pal, state));
         }
-        pen(&b, "  ", 0, C_DIM);
-        pen(&b, cwd, 0, C_DIM);
+        pen(&b, "  ", 0, g->pal->dim);
+        pen(&b, cwd, 0, g->pal->dim);
         ImGui::PopID();
     }
     if (!list.len) {
@@ -1306,7 +1335,7 @@ static void drawnew(Gui *g)
     char const *hint = dflt.len ? cstr0(&a, concat(&a, "configured: ", dflt)) : "the model's name";
     ImGui::InputTextWithHint("##model", hint, g->newmodel, FIELD_MAX);
     if (g->newerr.len) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_BAD));
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
         ImGui::TextWrapped("%s", cstr0(&a, g->newerr));
         ImGui::PopStyleColor();
     }
@@ -1395,7 +1424,10 @@ static Str provenance(Arena *a, CfgRow *r)
     return finish(&b);
 }
 
-static void drawcfgrow(Gui *g, CfgRow *r, b32 target)
+// A setting's row: its key, its value to edit, where it is set. Enums
+// are picked from their choices; the rest are typed. The checklist's
+// target row records its field's rectangle (RECT_*, or -1 for none).
+static void drawcfgrow(Gui *g, CfgRow *r, i32 target)
 {
     Arena a = g->frame;
     ImGui::TableNextRow();
@@ -1405,27 +1437,62 @@ static void drawcfgrow(Gui *g, CfgRow *r, b32 target)
                           r->dflt.len ? cstr0(&a, r->dflt) : "none");
     ImGui::TableNextColumn();
     ImGui::SetNextItemWidth(-1);
-    Str hint = r->isdflt ? r->value : Str{};
     ImGui::PushID(r);
-    b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
-                                         ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
-    if (target) {
-        itemrect(g, RECT_SETTING);
-    }
-    if (enter || ImGui::IsItemDeactivatedAfterEdit()) {
-        // Enter both returns and deactivates: send each edit once
-        Str v   = trim({(u8 *)r->buf, (iz)__builtin_strlen(r->buf)});
-        Str was = r->isdflt ? Str{} : r->value;
-        if (v!=was && !(r->sent && v==r->sentval)) {
-            r->sent    = 1;
-            r->sentval = clone(&g->cfgmem, v);
-            guiconfigset(g, r->kind, r->name, r->key, v.len ? v : Str{});
+    if (r->choices.len) {
+        // A pick goes out at once; the theme even before the file has it
+        b32    theme = r->kind=="ui" && r->key=="theme";
+        ImVec2 at    = ImGui::GetCursorScreenPos();
+        Str    pick  = {};
+        if (ImGui::BeginCombo("##v", cstr0(&a, r->value))) {
+            for (iz i = 0; i < r->choices.len; i++) {
+                Str c = r->choices[i];
+                if (ImGui::Selectable(cstr0(&a, c), c==r->value)) {
+                    pick = c;
+                }
+                if (theme && i<THEME_COUNT) {
+                    itemrect(g, RECT_THEME0+(i32)i);
+                }
+            }
+            ImGui::EndCombo();
         }
+        if (target >= 0) {
+            f32 w = ImGui::GetContentRegionAvail().x;
+            g->rects[target] = {at.x, at.y, at.x+w, at.y+ImGui::GetFrameHeight()};
+        }
+        if (pick.len && pick!=r->value && !(r->sent && pick==r->sentval)) {
+            if (theme) {
+                settheme(g, themeparse(pick));
+            }
+            r->sent    = 1;
+            r->sentval = clone(&g->cfgmem, pick);
+            guiconfigset(g, r->kind, r->name, r->key, pick);
+        }
+    } else {
+        Str hint  = r->isdflt ? r->value : Str{};
+        b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
+                                             ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
+        if (target >= 0) {
+            itemrect(g, target);
+        }
+        if (enter || ImGui::IsItemDeactivatedAfterEdit()) {
+            // Enter both returns and deactivates: send each edit once
+            Str v   = trim({(u8 *)r->buf, (iz)__builtin_strlen(r->buf)});
+            Str was = r->isdflt ? Str{} : r->value;
+            if (v!=was && !(r->sent && v==r->sentval)) {
+                r->sent    = 1;
+                r->sentval = clone(&g->cfgmem, v);
+                guiconfigset(g, r->kind, r->name, r->key, v.len ? v : Str{});
+            }
+        }
+    }
+    if (target>=0 && target==g->reveal) {
+        ImGui::SetScrollHereY(0.5f);  // for the checklist, which aims here
+        g->reveal = -1;
     }
     ImGui::PopID();
     ImGui::TableNextColumn();
     if (!r->valid) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_BAD));
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
         ImGui::TextUnformatted("invalid: default used");
         ImGui::PopStyleColor();
     } else {
@@ -1455,7 +1522,7 @@ static void drawsettings(Gui *g)
         guiconfigget(g);
     }
     if (g->cfgstatus.len) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(g->cfgok ? C_OK : C_BAD));
+        ImGui::PushStyleColor(ImGuiCol_Text, g->cfgok ? g->pal->ok : g->pal->bad);
         ImGui::TextWrapped("%s", cstr0(&a, g->cfgstatus));
         ImGui::PopStyleColor();
     }
@@ -1475,7 +1542,7 @@ static void drawsettings(Gui *g)
             print(&b, sev);
             print(&b, ": ");
             print(&b, jsonstr(jsonget(d, "message")));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(sev=="error" ? C_BAD : C_AMBER));
+            ImGui::PushStyleColor(ImGuiCol_Text, sev=="error" ? g->pal->bad : g->pal->amber);
             ImGui::TextWrapped("%s", cstr0(&a, finish(&b)));
             ImGui::PopStyleColor();
         }
@@ -1531,7 +1598,14 @@ static void drawsettings(Gui *g)
                 for (iz i = 0; i < g->cfgrows.len; i++) {
                     CfgRow *r = &g->cfgrows[i];
                     if (r->kind==kind && r->name==names[n]) {
-                        b32 target = first && kind=="endpoint" && r->key=="idle_timeout";
+                        i32 target = -1;
+                        if (first && kind=="endpoint" && r->key=="idle_timeout") {
+                            target = RECT_SETTING;
+                        } else if (kind=="ui" && r->key=="theme") {
+                            target = RECT_THEMECOMBO;
+                        } else if (r->value.len >= FIELD_MAX) {
+                            target = RECT_LONGFIELD;  // more than the slack
+                        }
                         drawcfgrow(g, r, target);
                     }
                 }
@@ -1665,7 +1739,7 @@ static void drawmetrics(Gui *g)
     print(&b, "  runaway ");
     print(&b, m->runaway);
     if (m->stale) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.4f, 0.3f, 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->stale);
     }
     text(finish(&b));
     if (m->stale) {
@@ -1832,7 +1906,7 @@ static void drawtoolbar(Gui *g)
     if (g->engineerr.len) {
         Arena a = g->frame;
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(C_BAD));
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
         ImGui::TextUnformatted(cstr0(&a, g->engineerr));
         ImGui::PopStyleColor();
     } else if (g->lasterr.len) {

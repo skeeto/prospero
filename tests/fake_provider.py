@@ -551,7 +551,26 @@ def sc_escapee(model, n, req):
 
 GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody",
                "Steer me", "Cancel me", "Close me", "Stream fast", "Stream at 100",
-               "Say hello", "Stall for", "Fail once", "Hold me")
+               "Say hello", "Stall for", "Fail once", "Hold me", "Show the themes")
+
+# Most of what the transcript draws, for screenshots of each theme
+GUI_THEMES = """## Before the edit
+
+The greeting in `hello.txt` is **plain**, and the [README](https://example.com/)
+says *nothing* about it. A ~~quick~~ careful fix:
+
+```c
+// Greet someone by name
+static int greet(char const *name)
+{
+    int n = printf("hello, %s\\n", name);  /* bytes written */
+    return n < 0 ? -1 : 0;
+}
+```
+
+> Edits outside the workspace ask first.
+
+"""
 
 GUI_FAILED = set()  # (model, messages so far): turns that failed once
 
@@ -682,6 +701,22 @@ def sc_gui(model, n, req):
         yield from finish(model, "tool_calls")
     elif "Hold me" in prompt:
         yield from answer(model, "Let go.")
+    elif "Show the themes" in prompt:
+        # Reasoning, markdown with code, an edit (a diff), then a write
+        # outside that asks, which the checklist answers
+        if step == 0:
+            yield S.head()
+            yield from think(model, "Change the greeting, then ask to write\nthe note outside.")
+            yield from text(model, GUI_THEMES, pieces=4)
+            yield from call(model, 0, f"call_{n}", "edit", {"path": "hello.txt",
+                                                            "old_string": "world",
+                                                            "new_string": "there"})
+            yield from finish(model, "tool_calls")
+        elif step == 1:
+            yield from tool(model, n, "write", {"path": "../gui-themes.txt",
+                                                "content": "themes\n"})
+        else:
+            yield from answer(model, "Left outside alone.")
     elif "Stall for" in prompt:
         # Nothing at all for 17 s: past the GUI's amber, short of the
         # first-byte watchdog its configuration sets

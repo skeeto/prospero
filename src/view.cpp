@@ -276,10 +276,21 @@ static void cachereset(ViewCache *c, b32 force)
     }
 }
 
+// Newlines in s, eight bytes at a time: a history's texts are megabytes,
+// and debug builds are slow at them a byte at a time. Under the xor a
+// newline is a zero byte, and exactly the zero bytes keep a high bit.
 static i64 countnl(Str s)
 {
-    i64 n = 0;
-    for (iz i = 0; i < s.len; i++) {
+    u64 lo = 0x7f7f7f7f7f7f7f7fu;
+    i64 n  = 0;
+    iz  i  = 0;
+    for (; s.len-i >= 8; i += 8) {
+        u64 w = 0;
+        __builtin_memcpy(&w, s.data+i, 8);
+        w ^= 0x0a0a0a0a0a0a0a0au;
+        n += __builtin_popcountll(~(((w & lo) + lo) | w | lo));
+    }
+    for (; i < s.len; i++) {
         n += s.data[i] == '\n';
     }
     return n;
@@ -1040,6 +1051,33 @@ static b32 viewapply(View *v, Arena scratch, Str line)
 {
     EvRec r = evparse(&scratch, line);
     return viewrecord(v, scratch, &r);
+}
+
+// The engine stopped (its process died) without ending the session's
+// turn, so no record will end it, its calls or its asks: nothing runs
+// any more. Calls under way end as unknown, as a log's recovery has
+// them, open asks as denied by the stop, and streamed text fades.
+static void viewstopped(View *v)
+{
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg  *m = &v->msgs[i];
+        ViewTool *t = m->tool;
+        if (m->role==VIEW_ASK && t->answer==VASK_PENDING) {
+            t->answer = VASK_DENIED;
+            t->by     = "stopped";
+            m->ver++;
+        } else if (m->role==VIEW_TOOL && !m->prov &&
+                   (t->status==VTOOL_CALLED || t->status==VTOOL_ASKING ||
+                    t->status==VTOOL_RUNNING)) {
+            t->status = VTOOL_UNKNOWN;
+            m->ver++;
+        }
+    }
+    fadeprov(v);
+    v->busy      = 0;
+    v->asks      = 0;
+    v->state     = LIVE_CLOSED;
+    v->topsdirty = 1;
 }
 
 

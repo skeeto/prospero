@@ -1077,7 +1077,9 @@ def config(t):
                 f"provenance {temp}")
         key = got[("endpoint", "fake", "key")]
         t.check(key["default"] == 1 and key["file"] == "", f"default {key}")
-        t.check(len(r["schema"]) >= 20 and len(r["kinds"]) == 5, "schema")
+        kinds = {k["kind"] for k in r["kinds"]}
+        t.check(len(r["schema"]) >= 20 and
+                {"", "endpoint", "model", "role", "guard", "ui"} <= kinds, "schema")
 
         # One edit, one changed line
         r = call("config.set", kind="endpoint", name="fake",

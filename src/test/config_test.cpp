@@ -267,7 +267,7 @@ static void testcfgvalidate(Test *t)
         "/c/harness.ini:20:9: warning: unknown value \"fly\", expected any "
         "of: read, write, edit, shell\n"
         "/c/harness.ini:21:2: warning: unknown section kind \"provider\", "
-        "expected endpoint, model, role or guard\n"
+        "expected endpoint, model, role, guard or ui\n"
         "/c/harness.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "
@@ -682,7 +682,8 @@ static void testcfgjson(Test *t)
         "model/m/seed=*\n"
         "model/m/max_tokens=*\n"
         "guard//roots=*\n"
-        "guard//ask_timeout=30*\n");
+        "guard//ask_timeout=30*\n"
+        "ui//theme=system*\n");
 
     Json *schema = jsonget(j, "schema");
     expect(t, "json.schema", istr(&a, jsonlen(schema)),

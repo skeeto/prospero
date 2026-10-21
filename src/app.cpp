@@ -23,6 +23,13 @@
 // come back from the session's log, which the GUI reads itself and
 // applies from the last record it has (resync).
 //
+// The theme is [ui] theme: read from the configuration before the
+// window opens, so that it opens in it, then from each config.get
+// reply, and picked in the settings window, where it applies at once.
+// "system" follows what the platform reports (gui_systheme). The layout
+// file is written by a thread of its own (Saver), since a write that is
+// to survive a crash waits on the disk for longer than a frame.
+//
 // This is free and unencumbered software released into the public domain.
 
 #include "sched.cpp"
@@ -30,6 +37,7 @@
 #include "doc.cpp"
 #include "layout.cpp"
 #include "view.cpp"
+#include "theme.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -133,7 +141,10 @@ enum : i32 {
     RECT_OTHERSESS,
     RECT_ADDNAME,
     RECT_ADDBTN,
-    RECT_COUNT,
+    RECT_THEMECOMBO,
+    RECT_LONGFIELD,  // a setting's field holding more than its slack
+    RECT_THEME0,     // the theme's choices in its open list
+    RECT_COUNT = RECT_THEME0 + THEME_COUNT,
 };
 
 struct Rect {
@@ -243,21 +254,40 @@ struct Request {
 
 // One setting in the settings window, from config.get.
 struct CfgRow {
-    Str   kind;
-    Str   name;
-    Str   key;
-    Str   type;
-    Str   value;   // as in effect
-    Str   dflt;
-    Str   desc;
-    Str   file;    // where it is set, null for its default
-    i64   line;
-    b32   isdflt;
-    b32   valid;
-    char *buf;     // the field: the value, then FIELD_MAX bytes to spare
-    iz    cap;
-    b32   sent;    // an edit went out, until the next config.get
-    Str   sentval;
+    Str        kind;
+    Str        name;
+    Str        key;
+    Str        type;
+    Str        value;    // as in effect
+    Str        dflt;
+    Str        desc;
+    Str        file;     // where it is set, null for its default
+    i64        line;
+    b32        isdflt;
+    b32        valid;
+    Slice<Str> choices;  // an enum's, to pick from a list
+    char      *buf;      // the field: the value, then FIELD_MAX bytes to spare
+    iz         cap;
+    b32        sent;     // an edit went out, until the next config.get
+    Str        sentval;
+};
+
+// The layout file's writer, on a thread of its own: a write that is to
+// survive a crash waits for the disk, tens of milliseconds on an SD card
+// or a busy one, which no frame can spare. Layouts arrive in a mailbox,
+// and the latest in each take is written. The last, as the GUI closes,
+// is waited for.
+enum : u32 {
+    SAVE_LAYOUT = 1,
+    SAVE_LAST,
+};
+
+struct Saver {
+    Os      *os;
+    Mailbox *in;
+    Str      path;
+    Arena    scratch;
+    Event    done;     // the last layout is written
 };
 
 struct DriveOp;
@@ -278,6 +308,11 @@ struct Gui {
     f32                scale;      // DPI content scale
     b32                mac;
     b32                quit;
+    Palette           *pal;        // the theme in effect
+    i32                themeset;   // THEME_*, from [ui] theme
+    b32                sysdark;    // the system prefers dark
+    b32                titleok;    // the window's frame follows the theme
+    b32                clickthrough; // an activating click reaches the UI
 
     // Loop and metrics
     u32                woke;
@@ -320,6 +355,7 @@ struct Gui {
     // The engine
     i32                enginekind; // ENGINE_*
     Engine            *engine;     // in this process
+    Config            *config;     // its configuration, read before it starts
     Proc              *proc;       // or in a child process
     Arena              linemem;    // its output's partial line
     byte              *linebase;
@@ -388,6 +424,7 @@ struct Gui {
     // Files and log
     Str                statedir;
     Str                inipath;
+    Saver             *saver;      // writes inipath, or null: written here
     iz                 logfd;
     Slice<Str>         logs;
 
@@ -395,12 +432,23 @@ struct Gui {
     i64                quitat;     // µs, 0 if none
     i64                histreq;    // when history was requested
     b32                histdone;   // the history's last record arrived
+    i64                histwakeus; // the GUI's own work on it: applying
+    i64                histwakes;  // its records in this many wakes,
+    i64                histparseus;  // parsing them, of that
+    i64                histframeus;  // and drawing frames meanwhile
+    i64                histframes;
     i32                bench;      // benchmark phase, 0 if none
     i32                benchstep;
     i64                benchmax;
     i64                benchsum;
     i64               *benchtimes;   // BENCH_MAX frame times
     i64                benchlaid;
+    i64                benchseg[3];  // this frame: new frame, UI, render (µs)
+    i64                benchlaid1;   // messages laid out in this frame
+    i32                benchglyphs;  // glyphs packed into the atlas in it
+    i32                benchtex;     // its texture's width then, and before
+    i32                benchtex0;
+    i64                benchsave;    // µs saving the layout in it
     i32                benchn;
     i64                started;
     b32                trace;      // log every frame
@@ -446,6 +494,8 @@ struct Gui {
     b32                minclose;     // ask to close once minimized
     Counts             markcounts;   // totals at the last OP_MARK
     i64                markat;
+    i32                reveal;       // RECT_* the settings scroll to, or -1
+    Str                longval;      // the long setting before its edit
 };
 
 // Log to standard error, the log file, and the Log window, which then
@@ -795,7 +845,10 @@ static void startquit(Gui *g)
 
 // Records from the engine
 
-// The settings window's rows, from a config.get reply line.
+static void settheme(Gui *, i32);
+
+// The settings window's rows, from a config.get reply line, and the
+// theme they set.
 static void loadcfg(Gui *g, Str line)
 {
     g->cfgmem.beg = g->cfgbase;
@@ -819,7 +872,15 @@ static void loadcfg(Gui *g, Str line)
                 r.type = jsonstr(jsonget(k, "type"));
                 r.dflt = jsonstr(jsonget(k, "default"));
                 r.desc = jsonstr(jsonget(k, "desc"));
+                if (r.type == "enum") {
+                    for (Json *c = jsonget(k, "choices")->child; c; c = c->next) {
+                        r.choices = push(a, r.choices, jsonstr(c));
+                    }
+                }
             }
+        }
+        if (r.kind=="ui" && r.key=="theme") {
+            settheme(g, themeparse(r.value));
         }
         // Defaults show as hints, not values: an edit writes a value. The
         // field holds the whole value, which an edit sends back whole.
@@ -961,23 +1022,10 @@ static Str linesid(Str line)
 static void enginestopped(Gui *g)
 {
     for (GuiSession *s = g->sessions; s; s = s->next) {
-        View *v = s->view;
         s->state = LIVE_CLOSED;
-        if (!v) {
-            continue;
+        if (s->view) {
+            viewstopped(s->view);
         }
-        for (iz i = 0; i < v->msgs.len; i++) {
-            ViewMsg *m = &v->msgs[i];
-            if (m->role==VIEW_ASK && m->tool->answer==VASK_PENDING) {
-                m->tool->answer = VASK_DENIED;
-                m->tool->by     = "interrupted";
-                m->ver++;
-            }
-        }
-        v->busy      = 0;
-        v->asks      = 0;
-        v->state     = LIVE_CLOSED;
-        v->topsdirty = 1;
     }
     scheddirty(&g->sched);
 }
@@ -985,8 +1033,12 @@ static void enginestopped(Gui *g)
 // Apply one record from the engine. Returns 1 if what shows changed.
 static b32 guirecord(Gui *g, Str line)
 {
-    Arena a = g->frame;
-    EvRec r = evparse(&a, line);
+    Arena a  = g->frame;
+    i64   t0 = g->histreq ? os_ticks(g->os) : 0;
+    EvRec r  = evparse(&a, line);
+    if (g->histreq) {
+        g->histparseus += os_ticks(g->os) - t0;
+    }
     if (!r.ok) {
         return 0;
     }
@@ -1059,12 +1111,19 @@ static b32 guirecord(Gui *g, Str line)
 // and the liveness that comes with them, for the session shown.
 static b32 heldback(Gui *g, Str line)
 {
+    if (!g->sess) {
+        return 0;
+    }
+    // The event's name follows sid, seq and ts, near the start
     Str head = takehead(line, line.len<160 ? line.len : 160);
-    b32 kind = find(head, "\"ev\":\"delta\"")>=0 ||
-               find(head, "\"ev\":\"tool.out\"")>=0 ||
-               find(head, "\"ev\":\"progress\"")>=0 ||
-               find(head, "\"ev\":\"live\"")>=0;
-    return kind && g->sess && linesid(line)==g->sess->sid;
+    iz  at   = find(head, "\"ev\":\"");
+    if (at < 0) {
+        return 0;
+    }
+    Str ev   = cuthead(head, at+6);
+    b32 kind = startswith(ev, "delta\"") || startswith(ev, "tool.out\"") ||
+               startswith(ev, "progress\"") || startswith(ev, "live\"");
+    return kind && linesid(line)==g->sess->sid;
 }
 
 // Apply the held-back records.
@@ -1473,8 +1532,12 @@ static void fakestep(Fake *f, i64 now)
     }
 }
 
+// Post n messages of history, and report the time spent making them,
+// apart from the time spent waiting for room in the GUI's inbox.
 static void fakehistory(Fake *f, i64 n)
 {
+    i64 t0   = os_ticks(f->os);
+    i64 wait = 0;
     for (i64 i = 0; i < n; i++) {
         Arena t = f->turnmem;
         Str   s = i%2 ? fakereply(f, &t, 300 + (iz)(fakerand(f)%1200))
@@ -1501,7 +1564,21 @@ static void fakehistory(Fake *f, i64 n)
             putkey(&w.json, "text");
             putstr(&w.json, s);
         }
+        i64 t1 = os_ticks(f->os);
         fakesend(f, &w, 1);
+        wait += os_ticks(f->os) - t1;
+    }
+    {
+        Arena t = f->turnmem;
+        Buf   b(&t, 128);
+        print(&b, "harness: fake: ");
+        print(&b, n);
+        print(&b, " messages made in ");
+        printfloat(&b, (f64)(os_ticks(f->os) - t0 - wait)/1000, 1);
+        print(&b, " ms, and ");
+        printfloat(&b, (f64)wait/1000, 1);
+        print(&b, " ms waiting for the GUI's inbox\n");
+        os_print(f->os, 2, finish(&b));
     }
     Arena t = f->turnmem;
     Buf   b(&t, 256);
@@ -1699,6 +1776,10 @@ static void gui_wake(Gui *g)
         g->maxwakeus = us;
         g->unsnapped = 1;
     }
+    if (g->histreq) {
+        g->histwakeus += us;
+        g->histwakes++;
+    }
 }
 
 // The user asked to close the window, or to quit: at once with nothing
@@ -1765,6 +1846,15 @@ static void gui_scale(Gui *g, f32 scale)
     schedforce(&g->sched);
 }
 
+// The system's theme preference, as the window opens and whenever it
+// changes. The frame is set each time, so that a new window's is too.
+static void gui_systheme(Gui *g, b32 dark)
+{
+    g->sysdark = dark;
+    applytheme(g);
+    g->titleok = os_guitheme(g->os, g->pal->dark);
+}
+
 // Frames
 
 static Str statepath(Gui *g, Str name)
@@ -1772,7 +1862,47 @@ static Str statepath(Gui *g, Str name)
     return join(&g->perm, g->statedir, name);
 }
 
-static void saveini(Gui *g)
+static void savermain(void *arg)
+{
+    Saver *s = (Saver *)arg;
+    for (;;) {
+        mailwait(s->in, -1);
+        Mail   m    = mailtake(s->in);
+        Record save = {};
+        b32    last = 0;
+        for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
+            save  = r;
+            last |= r.type == SAVE_LAST;
+        }
+        if (save.ok && !os_write(s->os, s->scratch, s->path, save.data)) {
+            os_print(s->os, 2, "harness: could not save the layout\n");
+        }
+        if (last) {
+            os_signal(&s->done);
+            return;
+        }
+    }
+}
+
+// A writer for the layout file, or null if it cannot start.
+static Saver *newsaver(Os *os, Arena *perm, Str path)
+{
+    Saver *s = alloc<Saver>(perm);
+    s->os      = os;
+    s->path    = path;
+    s->in      = newmailbox(perm, 1<<20, 0, 0);
+    s->scratch = newarena(os_reserve(os, 64<<20));
+    if (!s->in || !s->scratch.beg || !os_eventinit(&s->done) ||
+            !os_thread(os, savermain, s)) {
+        return 0;
+    }
+    return s;
+}
+
+// Save the layout: through the saver, or here without one, or when it
+// is too big for the saver's mailbox. As the GUI closes (last), wait
+// for it to be written.
+static void saveini(Gui *g, b32 last)
 {
     if (!g->inipath.len) {
         return;
@@ -1780,7 +1910,12 @@ static void saveini(Gui *g)
     uz   len = 0;
     char const *ini = ImGui::SaveIniSettingsToMemory(&len);
     Str  data = {(u8 *)ini, (iz)len};
-    if (!os_write(g->os, g->frame, g->inipath, data)) {
+    Saver *s  = g->saver;
+    if (s && mailpost(s->in, last ? SAVE_LAST : SAVE_LAYOUT, 0, data, 1)) {
+        if (last && !os_wait(&s->done, 5000)) {
+            guilog(g, "the layout is not saved yet");
+        }
+    } else if (!os_write(g->os, g->frame, g->inipath, data)) {
         guilog(g, "could not save the layout");
     }
     g->lastsave = os_ticks(g->os);
@@ -1991,6 +2126,14 @@ static void gui_frame(Gui *g)
         io.ConfigInputTextCursorBlink = 0;
     }
 
+    // Where the time goes, for the benchmark's slow frames: glyphs new to
+    // the atlas are rasterized as the UI asks for them, and a full atlas
+    // grows, repacked
+    ImFontAtlas *atlas  = io.Fonts;
+    i32          packed = atlas->Builder ? atlas->Builder->RectsPackedCount : 0;
+    i64          laid   = g->view->laidout;
+    g->benchtex0 = atlas->TexData ? atlas->TexData->Width : 0;
+
     os_guinewframe(g->os);
     if (g->drive && g->drivemoved) {
         // The backend reads the real mouse when the window has focus and
@@ -1998,8 +2141,17 @@ static void gui_frame(Gui *g)
         io.AddMousePosEvent(g->drivex, g->drivey);
     }
     ImGui::NewFrame();
+    i64 t1 = os_ticks(g->os);
     dockwindows(g);
+    i64 t2 = os_ticks(g->os);
     ImGui::Render();
+    i64 t3 = os_ticks(g->os);
+    g->benchseg[0]  = t1 - t0;
+    g->benchseg[1]  = t2 - t1;
+    g->benchseg[2]  = t3 - t2;
+    g->benchlaid1   = g->view->laidout - laid;
+    g->benchglyphs  = (atlas->Builder ? atlas->Builder->RectsPackedCount : 0) - packed;
+    g->benchtex     = atlas->TexData ? atlas->TexData->Width : 0;
     u32 busy = uiscan();
     // A window whose content size never settles would keep this busy
     // forever: after a few frames, leave it to the hash.
@@ -2023,8 +2175,11 @@ static void gui_frame(Gui *g)
     if (g->pending.len) {
         schedat(s, g->lastcontent+STREAM_PERIOD, DUE_STREAM);
     }
+    g->benchsave = 0;
     if (io.WantSaveIniSettings) {
-        saveini(g);
+        i64 t = os_ticks(g->os);
+        saveini(g, 0);
+        g->benchsave = os_ticks(g->os) - t;
     }
 
     ImDrawData *dd   = ImGui::GetDrawData();
@@ -2036,7 +2191,7 @@ static void gui_frame(Gui *g)
         traceframe(g, f, busy);
     }
     i64 cpu = os_ticks(g->os) - t0;
-    os_guipresent(g->os, f.present);
+    os_guipresent(g->os, f.present, g->pal->clear);
 
     // Bookkeeping, none of which changes this frame's picture.
     rollsecond(g, s->now);
@@ -2063,14 +2218,34 @@ static void gui_frame(Gui *g)
     if (g->bench) {
         benchframe(g, cpu);
     }
+    if (g->histreq) {
+        g->histframeus += cpu;
+        g->histframes++;
+    }
     if (g->histdone) {
+        // The fake agent makes the history on its own thread meanwhile,
+        // and reports that time itself: the GUI's share is its own
         Arena a = g->frame;
-        Buf   b(&a, 128);
+        Buf   b(&a, 256);
         print(&b, "history: ");
         print(&b, (i64)g->view->msgs.len);
         print(&b, " messages, first frame ");
         printfloat(&b, (f64)(os_ticks(g->os) - g->histreq)/1000, 1);
-        print(&b, " ms after the request");
+        print(&b, " ms after the request; the GUI's own work ");
+        printfloat(&b, (f64)(g->histwakeus + g->histframeus)/1000, 1);
+        print(&b, " ms: applying the records ");
+        printfloat(&b, (f64)g->histwakeus/1000, 1);
+        print(&b, " ms (parsing ");
+        printfloat(&b, (f64)g->histparseus/1000, 1);
+        print(&b, " ms) in ");
+        print(&b, g->histwakes);
+        print(&b, " wakes, ");
+        print(&b, g->histframes);
+        print(&b, " frames ");
+        printfloat(&b, (f64)g->histframeus/1000, 1);
+        print(&b, " ms, this one ");
+        printfloat(&b, (f64)cpu/1000, 1);
+        print(&b, " ms");
         guilog(g, finish(&b));
         g->histdone = 0;
         g->histreq  = 0;
@@ -2202,6 +2377,44 @@ static void benchsample(Gui *g, i64 cpu)
     }
     g->benchsum += cpu;
     g->benchmax  = cpu>g->benchmax ? cpu : g->benchmax;
+
+    // The anatomy of a frame over the scroll budget
+    #ifdef NDEBUG
+    i64 slow = 4000;
+    #else
+    i64 slow = 12000;
+    #endif
+    if (cpu >= slow) {
+        Arena a = g->frame;
+        Buf   b(&a, 256);
+        print(&b, "bench: slow frame ");
+        print(&b, (i64)g->benchn);
+        print(&b, ": ");
+        printfloat(&b, (f64)cpu/1000, 2);
+        print(&b, " ms: new frame ");
+        printfloat(&b, (f64)g->benchseg[0]/1000, 2);
+        print(&b, ", UI ");
+        printfloat(&b, (f64)g->benchseg[1]/1000, 2);
+        print(&b, " (layout ");
+        printfloat(&b, (f64)g->layoutus/1000, 2);
+        print(&b, " for ");
+        print(&b, g->benchlaid1);
+        print(&b, " messages), render ");
+        printfloat(&b, (f64)g->benchseg[2]/1000, 2);
+        if (g->benchsave) {
+            print(&b, ", saving the layout ");
+            printfloat(&b, (f64)g->benchsave/1000, 2);
+        }
+        print(&b, "; ");
+        print(&b, (i64)g->benchglyphs);
+        print(&b, " glyphs new to the atlas");
+        if (g->benchtex != g->benchtex0) {
+            print(&b, ", which grew to ");
+            print(&b, (i64)g->benchtex);
+            print(&b, " wide");
+        }
+        guilog(g, finish(&b));
+    }
 }
 
 static void benchframe(Gui *g, i64 cpu)
@@ -2367,6 +2580,9 @@ enum : i32 {
     OP_MAIN,      // show the session the checklist made again
     OP_MINCLOSE,  // minimize the window, then ask it to close once it is
     OP_MINCLOSED, // ask to close now if the window never minimized
+    OP_SYSTHEME,  // the system's theme: dx 1 dark, 0 light, -1 its own
+    OP_KILLENGINE,// the engine process dies (--engine=subprocess)
+    OP_REVEAL,    // scroll the settings window to the RECT_* target
 };
 
 enum : i32 {
@@ -2398,6 +2614,9 @@ enum : i32 {
     T_SESSTITLE,   // the sidebar's session whose title starts with text
     T_ADDNAME,     // the new endpoint's name field
     T_ADDBTN,      // "Add endpoint"
+    T_THEMECOMBO,  // the theme's list in the settings window
+    T_THEMEITEM,   // the theme named by text, in that list once open
+    T_LONGFIELD,   // a setting's field holding more than its slack
 };
 
 enum : i32 {
@@ -2453,6 +2672,14 @@ enum : i32 {
     CHK_DIAGS,
     CHK_ADDEXISTS,
     CHK_ROQUIET,
+    CHK_LIGHT,
+    CHK_DARK,
+    CHK_THEMEQUIET,
+    CHK_TITLEBAR,
+    CHK_LONGFIELD,
+    CHK_LONGEDIT,
+    CHK_ENGINESTOPPED,
+    CHK_CLICKTHROUGH,
     CHK_COUNT,
 };
 
@@ -2486,6 +2713,13 @@ static Str chknames[] = {
     "configuration diagnostics listed with file and line",
     "adding a section that exists changed nothing",
     "a read-only session's turn runs elsewhere, with no clock here",
+    "the light theme is in effect", "the dark theme is in effect",
+    "the theme changed in a few frames, then none",
+    "the window's frame follows the theme",
+    "a setting longer than a field's slack is in its field whole",
+    "the long setting, edited, was saved whole",
+    "the engine died: nothing runs or waits, no ask stays open",
+    "a click that activates the window also reaches what it lands on",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -2504,12 +2738,14 @@ enum : i32 {
     W_OPENED,     // the session shown is open, its replay applied
     W_AMBER,      // the strip went amber
     W_BACKOFF,    // the session shown backs off to retry
+    W_GONE,       // the engine stopped
 };
 
 static Str waitnames[] = {
     "", "the engine", "the session", "the turn to end", "an ask",
     "a running tool", "the configuration", "the settings edit", "quitting",
     "every turn to end", "the session to open", "amber", "a retry",
+    "the engine to stop",
 };
 
 enum : i32 {
@@ -2528,6 +2764,7 @@ struct DriveOp {
 static DriveOp driveops[] = {
     {OP_MARK, 0, 0, 0, 1500, ""},
     {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
+    {OP_CHECK, CHK_CLICKTHROUGH, 0, 0, 0, ""},
     // Tooltip on a toolbar button, appearing with no event at all
     {OP_MOVE, T_PROMPTBTN, 0, 0, 1000, ""},
     {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
@@ -2567,6 +2804,26 @@ static DriveOp driveops[] = {
     // The drag changed the layout, which is saved 5 s later with no
     // event at all
     {OP_CHECK, CHK_SAVED, 0, 0, 0, ""},
+    // The system's theme turns light, dark and light again, while
+    // nothing else is pending, so that it changes at least twice either
+    // way: the theme follows in a few frames, then none, and so does the
+    // window's frame. The checks' log lines settle before the next.
+    {OP_MARK, 0, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_THEMEQUIET, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLEBAR, 0, 0, 1000, ""},
+    {OP_MARK, 0, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, 1, 0, 2000, ""},
+    {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
+    {OP_CHECK, CHK_THEMEQUIET, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLEBAR, 0, 0, 1000, ""},
+    {OP_MARK, 0, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_THEMEQUIET, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLEBAR, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, -1, 0, 1000, ""},  // the system's own again
     // Switching tabs
     {OP_MOVE, T_HELPTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -2648,6 +2905,7 @@ static DriveOp m3ops[] = {
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_ENGINE, 0, 0, 0, ""},
     {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
+    {OP_CHECK, CHK_CLICKTHROUGH, 0, 0, 0, ""},
     // Tooltip on a toolbar button, appearing with no event at all
     {OP_MOVE, T_NEWBTN, 0, 0, 1000, ""},
     {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
@@ -2703,6 +2961,26 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 6500, ""},
     {OP_CHECK, CHK_SPLIT, 0, 0, 0, ""},
     {OP_CHECK, CHK_SAVED, 0, 0, 0, ""},
+    // The system's theme turns light, dark and light again, while
+    // nothing else is pending, so that it changes at least twice either
+    // way: the theme follows in a few frames, then none, and so does the
+    // window's frame. The checks' log lines settle before the next.
+    {OP_MARK, 0, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_THEMEQUIET, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLEBAR, 0, 0, 1000, ""},
+    {OP_MARK, 0, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, 1, 0, 2000, ""},
+    {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
+    {OP_CHECK, CHK_THEMEQUIET, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLEBAR, 0, 0, 1000, ""},
+    {OP_MARK, 0, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_THEMEQUIET, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLEBAR, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, -1, 0, 1000, ""},  // the system's own again
     // Switching tabs
     {OP_MOVE, T_HELPTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -3020,6 +3298,104 @@ static DriveOp e2eops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// The settings window (--settings, tests/gui.py --mode settings), over a
+// transcript of most of what it can show: reasoning, markdown and code,
+// a diff, an open ask, the strip waiting for an answer. A value longer
+// than a field's slack is edited whole, and the theme is picked from its
+// list, dark and then light, with a screenshot of each (--shots).
+static DriveOp settingsops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Show the themes."},
+    {OP_WAIT, W_ASK, 0, 0, 10000, ""},
+    {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    // The long value: whole in its field, and whole once edited there
+    {OP_REVEAL, RECT_LONGFIELD, 0, 0, 500, ""},
+    {OP_CHECK, CHK_LONGFIELD, 0, 0, 0, ""},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_LONGFIELD, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_KEYDOWN, 0, GKEY_END, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_END, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 200, "!"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_LONGEDIT, 0, 0, 0, ""},
+    // The theme, dark, then light
+    {OP_REVEAL, RECT_THEMECOMBO, 0, 0, 500, ""},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_THEMECOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_THEMEITEM, 0, 0, 100, "dark"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_SHOT, 0, 0, 0, 500, "dark"},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_THEMECOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_THEMEITEM, 0, 0, 100, "light"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLEBAR, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_SHOT, 0, 0, 0, 500, "light"},
+    // A configured theme stays when the system's changes: no frames
+    {OP_MARK, 0, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, 1, 0, 1000, ""},
+    {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_THEMEQUIET, 0, 0, 0, ""},
+    {OP_SYSTHEME, 0, -1, 0, 300, ""},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    // Deny the ask, and quit
+    {OP_MOVE, T_DENY, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
+// The engine process dies (--enginestop, tests/gui.py --mode enginestop)
+// with a command running in one session and an ask open in another: no
+// record ends either turn, and the views must stop counting them, so
+// that closing quits at once.
+static DriveOp stopops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Close me: run a very slow command."},
+    {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Write outside the workspace, ask, and wait for nobody."},
+    {OP_WAIT, W_ASK, 0, 0, 10000, ""},
+    {OP_KILLENGINE, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_GONE, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_ENGINESTOPPED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "stopped"},
+    {OP_MARK, 0, 0, 0, 2000, ""},
+    {OP_IDLE, 0, 0, 0, 0, "2 s after the engine stopped"},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_CLOSE, 0, 0, 0, 0, ""},  // nothing runs: it quits at once
+    {OP_WAIT, W_FOREVER, 0, 0, 5000, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // Idle: nothing for a minute after startup settles.
 static DriveOp idleops[] = {
     {OP_MARK, 0, 0, 0, 10000, ""},  // startup settles
@@ -3108,6 +3484,12 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_CLOSESTOP:   return rectcenter(g->rects[RECT_CLOSESTOP]);
     case T_CLOSECANCEL: return rectcenter(g->rects[RECT_CLOSECANCEL]);
     case T_OTHERSESS:   return rectcenter(g->rects[RECT_OTHERSESS]);
+    case T_THEMECOMBO:  return rectcenter(g->rects[RECT_THEMECOMBO]);
+    case T_LONGFIELD:   return rectcenter(g->rects[RECT_LONGFIELD]);
+    case T_THEMEITEM: {
+        i32 i = themeparse(g->ops[g->drivepc-1].text);
+        return i<0 ? v2(-1, -1) : rectcenter(g->rects[RECT_THEME0+i]);
+    }
     case T_SESSTITLE:
         for (GuiSession *s = g->sessions; s; s = s->next) {
             Str t = s->view && s->view->title.len ? s->view->title : s->title;
@@ -3248,6 +3630,8 @@ static b32 drivewaitdone(Gui *g)
         return g->ambershown;
     case W_BACKOFF:
         return g->sess && v->state==LIVE_BACKOFF;
+    case W_GONE:
+        return g->enginegone;
     }
     return 0;
 }
@@ -3351,6 +3735,24 @@ static b32 checksetting(Gui *g)
     print(&m, i<y.len ? y[i] : Str("(none)"));
     guilog(g, finish(&m));
     return one && edit;
+}
+
+// Whether the theme in effect is the palette's, ImGui's colors too.
+static b32 themeshown(Gui *g, Palette *p)
+{
+    ImVec4 bg = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
+    return g->pal==p && ImGui::ColorConvertFloat4ToU32(bg)==p->panel;
+}
+
+// The settings row whose value is longer than a field's slack, or null.
+static CfgRow *longrow(Gui *g)
+{
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        if (g->cfgrows[i].value.len >= FIELD_MAX) {
+            return &g->cfgrows[i];
+        }
+    }
+    return 0;
 }
 
 static b32 drivecheck(Gui *g, i32 chk)
@@ -3546,6 +3948,57 @@ static b32 drivecheck(Gui *g, i32 chk)
         ViewMsg *a = lastmsg(g, VIEW_ASSISTANT);
         return k && k->tool->answer==VASK_DENIED && k->tool->by=="timeout" &&
                a && a>k && !v->busy;
+    }
+    case CHK_LIGHT: return themeshown(g, &themelight);
+    case CHK_DARK:  return themeshown(g, &themedark);
+    case CHK_THEMEQUIET: {
+        // Two frames recolor (docked windows take their background a
+        // frame late), one settles; with the probe's, the overlay's new
+        // numbers, the script's own and those after an input (Windows
+        // counts a settings broadcast as one), under ten in a second or
+        // two, where rendering on would be sixty a second
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        i64   n = g->total.frames - g->driveframes;
+        print(&b, "drive: ");
+        print(&b, n);
+        print(&b, " frames since the theme changed");
+        guilog(g, finish(&b));
+        return n <= 20;
+    }
+    case CHK_TITLEBAR:
+        return g->titleok;
+    case CHK_CLICKTHROUGH:
+        return g->clickthrough;
+    case CHK_LONGFIELD: {
+        CfgRow *r = longrow(g);
+        if (!r) {
+            return 0;
+        }
+        Str field = {(u8 *)r->buf, (iz)__builtin_strlen(r->buf)};
+        g->longval = clone(&g->perm, r->value);
+        return field==r->value && r->cap>=r->value.len+FIELD_MAX;
+    }
+    case CHK_LONGEDIT: {
+        CfgRow *r = longrow(g);
+        Arena   a = g->frame;
+        return r && g->longval.len && r->file.len &&
+               r->value==concat(&a, g->longval, "!");
+    }
+    case CHK_ENGINESTOPPED: {
+        b32 ok = g->enginegone && !running(g), unknown = 0, denied = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            View *sv = s->view;
+            if (!sv) continue;
+            ok &= !sv->busy && !sv->asks && sv->state==LIVE_CLOSED;
+            for (iz i = 0; i < sv->msgs.len; i++) {
+                ViewTool *t = sv->msgs[i].tool;
+                i32       r = sv->msgs[i].role;
+                unknown |= r==VIEW_TOOL && t->name=="shell" && t->status==VTOOL_UNKNOWN;
+                denied  |= r==VIEW_ASK && t->answer==VASK_DENIED && t->by=="stopped";
+            }
+        }
+        return ok && unknown && denied;
     }
     case CHK_SWITCHED: {
         // The first session shown again while the second streams
@@ -3756,6 +4209,18 @@ static void drivestep(Gui *g)
             guilog(g, "drive: skip the overflow check (the engine is a process)");
             break;
         }
+        #if !defined(_WIN32) && !defined(__APPLE__)
+        if (op->target == CHK_TITLEBAR) {
+            guilog(g, "drive: skip the window frame check (the window manager draws it)");
+            break;
+        }
+        #endif
+        #ifdef _WIN32
+        if (op->target == CHK_CLICKTHROUGH) {
+            guilog(g, "drive: skip the click-through check (Windows passes the click on)");
+            break;
+        }
+        #endif
         b32 ok = drivecheck(g, op->target);
         g->drivechecks++;
         g->drivefails += !ok;
@@ -3901,6 +4366,25 @@ static void drivestep(Gui *g)
             }
         }
     } break;
+    case OP_SYSTHEME:
+        e.kind = GEV_SYSTHEME;
+        e.x    = op->dx;
+        os_guiinject(g->os, &e);
+        break;
+    case OP_KILLENGINE:
+        if (g->proc) {
+            guilog(g, "drive: killing the engine process");
+            os_kill(g->os, g->proc, 1);
+        } else {
+            guilog(g, "drive: FAIL no engine process to kill");
+            g->drivechecks++;
+            g->drivefails++;
+        }
+        break;
+    case OP_REVEAL:
+        g->reveal = op->target;
+        scheddirty(&g->sched);
+        break;
     case OP_SHOT:
         if (g->shotdir.len) {
             Str name = concat(&g->perm, op->text, ".png");
@@ -3993,6 +4477,8 @@ static Str guiusage =
 "  --idle         measure a minute of idling, quit\n"
 "  --streamtest   measure 30 s of streaming at 100 tok/s, quit\n"
 "  --e2e          the checklist's end-to-end part against a real model\n"
+"  --settings     the settings window's checklist, screenshots of each theme\n"
+"  --enginestop   the engine process dies mid-turn (implies subprocess)\n"
 "  --probe        staleness probe on (default in debug builds)\n"
 "  --no-probe     staleness probe off\n"
 "  --aggressive   probe every second while idle\n"
@@ -4034,12 +4520,36 @@ static Str cstrclone(Arena *a, Str s)
     return r;
 }
 
+// The configuration, read before the window opens so that it opens in
+// the theme set there: the in-process engine's own, which it takes over
+// when it starts, or a reading of the same file for an engine process.
+// The fake agent has none.
+static void readconfig(Gui *g, Arena scratch)
+{
+    if (g->enginekind == ENGINE_FAKE) {
+        return;
+    }
+    Os     *os   = g->os;
+    b32     own  = g->enginekind == ENGINE_INPROC;
+    Str     path = g->cfgpath.len ? g->cfgpath : cfgdefault(os, &g->perm);
+    Config *cfg  = newconfig(os, &g->perm, scratch, path, own && !g->cfgpath.len);
+    if (!cfg) {
+        return;
+    }
+    i32 theme = themeparse(cfgget(cfg, "ui", "", "theme", 0));
+    g->themeset = theme<0 ? THEME_SYSTEM : theme;
+    if (own) {
+        g->config = cfg;
+    } else {
+        cfgfree(cfg);
+    }
+}
+
 // The engine on its own thread, with the configuration it owns.
 static b32 startinproc(Gui *g, Arena scratch)
 {
-    Os     *os   = g->os;
-    Str     path = g->cfgpath.len ? g->cfgpath : cfgdefault(os, &g->perm);
-    Config *cfg  = newconfig(os, &g->perm, scratch, path, !g->cfgpath.len);
+    Os     *os  = g->os;
+    Config *cfg = g->config;
     if (!cfg) {
         g->engineerr = "out of memory";
         return 0;
@@ -4104,6 +4614,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->second   = g->started;
     g->tps      = 100;
     g->inboxcap = INBOX_CAP;
+    g->reveal   = -1;
     g->firstlayout = 1;
     #ifdef __APPLE__
     g->mac = 1;
@@ -4114,7 +4625,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     probe = 0;
     #endif
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
-    b32 subprocess = 0, fake = 0, e2e = 0;
+    b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     i64 history = 0;
     i32 bench   = 0;
     for (i32 i = 1 + (nargs>1 && args[1]=="gui"); i < nargs; i++) {
@@ -4138,6 +4649,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             streamtest = 1;
         } else if (a == "--e2e") {
             e2e = probe = 1;
+        } else if (a == "--settings") {
+            settings = probe = 1;
+        } else if (a == "--enginestop") {
+            enginestop = subprocess = probe = 1;
         } else if (a == "--trace") {
             g->trace = 1;
         } else if (a == "--trace-drive") {
@@ -4177,11 +4692,17 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         return 1;
     }
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
-    if (drive || idle || streamtest || e2e) {
+    if (drive || idle || streamtest || e2e || settings || enginestop) {
         g->drive = 1;
         if (e2e) {
             g->ops  = e2eops;
             g->nops = countof(e2eops);
+        } else if (settings) {
+            g->ops  = settingsops;
+            g->nops = countof(settingsops);
+        } else if (enginestop) {
+            g->ops  = stopops;
+            g->nops = countof(stopops);
         } else if (drive) {
             g->ops  = fake ? driveops : m3ops;
             g->nops = fake ? countof(driveops) : countof(m3ops);
@@ -4249,6 +4770,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     if (g->statedir.len && os_mkdirs(os, g->frame, sessions)) {
         g->inipath = statepath(g, "imgui.ini");
         g->logfd   = os_logopen(os, g->frame, statepath(g, "gui.log"));
+        g->saver   = newsaver(os, &g->perm, g->inipath);
     }
     if (g->drivecwd.len) {
         Str cwd = g->drivecwd;
@@ -4288,6 +4810,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         setcur(g, s);
     }
 
+    readconfig(g, g->frame);
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
@@ -4295,8 +4819,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     io.IniFilename  = 0;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_DockingEnable;
     io.ConfigErrorRecoveryEnableAssert = 0;
-    ImGui::StyleColorsDark();
     g->basestyle = ImGui::GetStyle();
+    g->sysdark   = 1;  // until the window opens and the platform says
+    applytheme(g);
     loadfonts(g);
 
     if (g->inipath.len) {
@@ -4350,7 +4875,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
 
     gui_run(g);
 
-    saveini(g);
+    saveini(g, 1);
     if (!g->quitting && !g->enginegone) {
         startquit(g);  // the window went without asking: stop anyway
     }

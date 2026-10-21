@@ -56,7 +56,7 @@
 // In config.get, path is where edits go ("" if there is no location),
 // exists says whether that file was read, rev counts loads, and files
 // lists every file read, in load order. Settings list every schema key
-// of the top level and of [guard], and of each named [endpoint],
+// of the top level, of [guard] and of [ui], and of each named [endpoint],
 // [model] and [role] section that exists, in schema order. A value is
 // the one in effect as written, or its default ("default":1, with file
 // "" and line 0, or where the key is set empty); "valid":0 marks one
@@ -126,6 +126,7 @@ static CfgKind cfgkinds[] = {
     {"model",    1, "Settings for one model, named as its endpoint lists it"},
     {"role",     1, "Instructions, a model and tools for one kind of work"},
     {"guard",    0, "Where the file tools may go without asking"},
+    {"ui",       0, "How the GUI looks"},
 };
 
 struct CfgKey {
@@ -199,6 +200,9 @@ static CfgKey cfgschema[] = {
     {"guard", "ask_timeout", CFG_SECONDS, "30", {}, {}, "guard",
      "Seconds to wait for an answer when a tool asks to leave the roots, "
      "then deny"},
+
+    {"ui", "theme", CFG_ENUM, "system", {}, "system dark light", "ui",
+     "Colors: dark, light, or system to follow the operating system"},
 };
 
 // Value judgments
@@ -556,7 +560,7 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniLine *l)
     if (!k) {
         print(&b, "unknown section kind \"");
         print(&b, l->key);
-        print(&b, "\", expected endpoint, model, role or guard");
+        print(&b, "\", expected endpoint, model, role, guard or ui");
     } else if (unnamed) {
         print(&b, "a section needs a name, as in [");
         print(&b, l->key);
