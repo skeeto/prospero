@@ -1002,11 +1002,12 @@ struct Walk {
     Buf        *out;
     Slice<Found> newest;   // glob: kept newest first, at most limit
     Arena      *keep;      // for newest
+    b32         hold;      // keep output in out, never printed (tests)
 };
 
 static void walkflush(Walk *w)
 {
-    if (w->out->len) {
+    if (w->out->len && !w->hold) {
         os_print(w->os, 1, finish(w->out));
         w->out->len = 0;
     }
@@ -1143,6 +1144,70 @@ static Ignore *ignoreparents(Os *os, Arena *a, Str root, b32 win)
     return chain;
 }
 
+struct SearchOpts {
+    i32 mode;     // SEARCH_GREP or SEARCH_GLOB
+    Str root;     // absolute: a directory, or a file for grep
+    Str pattern;
+    Str glob;     // grep: only files that match
+    b32 fold;
+    b32 literal;
+    iz  limit;    // results, at most
+    b32 win;      // Windows paths
+};
+
+// Run a search with the walker, its output in ripgrep's form into out,
+// which is printed as it fills unless held. Returns the problem with a
+// pattern that does not compile, else null; *found counts results.
+static Str searchrun(Os *os, Arena *perm, Arena scratch, SearchOpts *o,
+                     Buf *out, b32 hold, iz *found)
+{
+    Walk w = {};
+    w.os    = os;
+    w.mode  = o->mode;
+    w.limit = o->limit>0 ? o->limit : SEARCH_RESULTS+1;
+    w.keep  = perm;
+    w.out   = out;
+    w.hold  = hold;
+    w.fold  = o->fold;
+    Str root = normpath(perm, o->root, ".", o->win);
+    if (w.mode == SEARCH_GLOB) {
+        w.globs = globexpand(perm, o->pattern);
+    } else {
+        if (o->glob.len) {
+            w.globs = globexpand(perm, o->glob);
+        }
+        if (o->literal) {
+            Str p = o->pattern;
+            w.literal = w.fold ? Str{lowerstr(perm, p), p.len} : p;
+        } else {
+            Regex *rx = alloc<Regex>(perm);
+            *rx = rxcompile(perm, o->pattern, w.fold);
+            if (rx->err.data) {
+                return rx->err;
+            }
+            w.rx   = rxrun(perm, rx);
+            w.need = rx->lit;
+        }
+    }
+
+    Ignore *chain = ignoreparents(os, perm, root, o->win);
+    Stat    st    = os_stat(os, scratch, root);
+    if (st.type==STAT_FILE && w.mode==SEARCH_GREP) {
+        walkgrep(&w, scratch, root, basename(root));
+    } else {
+        walkdir(&w, scratch, chain, root, {}, 0);
+    }
+    if (w.mode == SEARCH_GLOB) {
+        for (iz i = 0; i < w.newest.len; i++) {
+            print(out, w.newest[i].rel);
+            putbyte(out, 0);
+        }
+    }
+    walkflush(&w);
+    *found = w.found;
+    return {};
+}
+
 // harness --search grep|glob ROOT PATTERN [-i] [-F] [-g GLOB] [-m MAX]
 // Exits 0 with results, 1 without, 2 for a bad pattern (explained on
 // standard error) or bad usage.
@@ -1153,72 +1218,39 @@ static i32 searchmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
                         "[-i] [-F] [-g GLOB] [-m MAX]\n");
         return 2;
     }
-    Walk w = {};
-    w.os    = os;
-    w.mode  = args[2]=="grep" ? SEARCH_GREP : SEARCH_GLOB;
-    w.limit = SEARCH_RESULTS + 1;
-    w.keep  = &perm;
-    Str root    = normpath(&perm, args[3], ".", HOST_WINDOWS);
-    Str pattern = args[4];
-    b32 literal = 0;
-    Str glob    = {};
+    SearchOpts o = {};
+    o.mode    = args[2]=="grep" ? SEARCH_GREP : SEARCH_GLOB;
+    o.win     = HOST_WINDOWS;
+    o.root    = args[3];
+    o.pattern = args[4];
     for (i32 i = 5; i < nargs; i++) {
         if (args[i] == "-i") {
-            w.fold = 1;
+            o.fold = 1;
         } else if (args[i] == "-F") {
-            literal = 1;
+            o.literal = 1;
         } else if (args[i]=="-g" && i+1<nargs) {
-            glob = args[++i];
+            o.glob = args[++i];
         } else if (args[i]=="-m" && i+1<nargs) {
             Int n = parseint(args[++i]);
-            w.limit = n.ok && n.val>0 ? (iz)n.val : w.limit;
+            o.limit = n.ok && n.val>0 ? (iz)n.val : 0;
         } else {
             os_print(os, 2, "harness --search: unknown option\n");
             return 2;
         }
     }
 
-    if (w.mode == SEARCH_GLOB) {
-        w.globs = globexpand(&perm, pattern);
-    } else {
-        if (glob.len) {
-            w.globs = globexpand(&perm, glob);
-        }
-        if (literal) {
-            w.literal = w.fold ? Str{lowerstr(&perm, pattern), pattern.len} : pattern;
-        } else {
-            Regex *rx = alloc<Regex>(&perm);
-            *rx = rxcompile(&perm, pattern, w.fold);
-            if (rx->err.data) {
-                Buf b(&scratch, 256);
-                print(&b, "regex parse error: ");
-                print(&b, rx->err);
-                putbyte(&b, '\n');
-                os_print(os, 2, finish(&b));
-                return 2;
-            }
-            w.rx   = rxrun(&perm, rx);
-            w.need = rx->lit;
-        }
-    }
-
     Buf out(&perm, 1<<16);
-    w.out = &out;
-    Ignore *chain = ignoreparents(os, &perm, root, HOST_WINDOWS);
-    Stat    st    = os_stat(os, scratch, root);
-    if (st.type == STAT_FILE && w.mode == SEARCH_GREP) {
-        walkgrep(&w, scratch, root, basename(root));
-    } else {
-        walkdir(&w, scratch, chain, root, {}, 0);
+    iz  found = 0;
+    Str err   = searchrun(os, &perm, scratch, &o, &out, 0, &found);
+    if (err.data) {
+        Buf b(&scratch, 256);
+        print(&b, "regex parse error: ");
+        print(&b, err);
+        putbyte(&b, '\n');
+        os_print(os, 2, finish(&b));
+        return 2;
     }
-    if (w.mode == SEARCH_GLOB) {
-        for (iz i = 0; i < w.newest.len; i++) {
-            print(&out, w.newest[i].rel);
-            putbyte(&out, 0);
-        }
-    }
-    walkflush(&w);
-    return w.found ? 0 : 1;
+    return found ? 0 : 1;
 }
 
 

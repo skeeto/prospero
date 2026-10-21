@@ -1481,7 +1481,7 @@ static void instrcheck(Session *s, Arena scratch)
         changed = push(&scratch, changed, f);
         print(&b, "\n\n## ");
         print(&b, k->path);
-        Read rd = st.type==STAT_FILE ? os_read(os, &scratch, k->path, (iz)INSTR_MAX)
+        Read rd = st.type==STAT_FILE ? os_readat(os, &scratch, k->path, 0, (iz)INSTR_MAX)
                                      : Read{};
         if (st.type!=STAT_FILE || rd.err) {
             print(&b, "\n\nThis file is gone: its instructions no longer apply.");

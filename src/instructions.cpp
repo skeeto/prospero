@@ -187,7 +187,7 @@ static void instrload(Os *os, Arena *a, Instructions *r, Str path,
     if (st.type != STAT_FILE) {
         return;
     }
-    Read rd = os_read(os, a, path, (iz)INSTR_MAX);
+    Read rd = os_readat(os, a, path, 0, (iz)INSTR_MAX+1);  // more is cut
     if (rd.err) {
         return;
     }

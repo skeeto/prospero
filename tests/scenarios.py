@@ -75,6 +75,16 @@ class LocalHost:
     def touch(self, path, mtime):
         os.utime(path, (mtime, mtime))
 
+    def bulk(self, base, files, mtimes=None):
+        """Write many files under base at once: {relative path: data},
+        with {relative path: modification time} for some."""
+        for rel, data in files.items():
+            path = os.path.join(base, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self.write(path, data)
+        for rel, t in (mtimes or {}).items():
+            self.touch(os.path.join(base, *rel.split("/")), t)
+
     def popen(self, args, cwd, stdin=False, env=None):
         return subprocess.Popen(
             [self.harness] + args, cwd=cwd,
@@ -169,6 +179,26 @@ class SshHost:
 
     def touch(self, path, mtime):
         self.sh(f"touch -d @{int(mtime)} {shlex.quote(path)}")
+
+    def bulk(self, base, files, mtimes=None):
+        lines = []
+        for rel, data in files.items():
+            if isinstance(data, str):
+                data = data.encode()
+            path = shlex.quote(f"{base}/{rel}")
+            b = base64.b64encode(data).decode()
+            lines.append(f"mkdir -p $(dirname {path}) && echo {b} | base64 -d > {path}")
+        for rel, t in (mtimes or {}).items():
+            lines.append(f"touch -d @{int(t)} {shlex.quote(f'{base}/{rel}')}")
+        # In pieces: cmd.exe takes command lines of 8191 characters at most
+        piece = []
+        for line in lines + [None]:
+            if line is None or sum(len(x) + 1 for x in piece) + len(line) > 4000:
+                if piece:
+                    self.sh("\n".join(piece))
+                piece = []
+            if line is not None:
+                piece.append(line)
 
     def popen(self, args, cwd, stdin=False, env=None):
         def q(a):
@@ -868,6 +898,143 @@ def crash_job(t):
             f"notice {r2.last('notice')}")
 
 
+@scenario(bound=15)
+def job_cmds(t):
+    """job.kill from the frontend stops a job, of which the agent is
+    told; closing the session stops the rest, quietly."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (t.pids("job1pid") and t.pids("job2pid")):
+            time.sleep(0.05)
+        p1, p2 = t.pids("job1pid"), t.pids("job2pid")
+        t.check(len(h.all("job.start", sid)) == 2, "two jobs")
+        r = h.call("list")
+        entry = [s for s in h.all("sessions")[-1]["list"] if s["sid"] == sid]
+        t.check(entry and entry[0].get("jobs") == 2, f"listed with its jobs: {entry}")
+
+        r = h.call("job.kill", sid=sid, job=1)
+        t.check(r.get("ok") == 1, f"job.kill {r}")
+        je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("job") == 1)
+        t.check(je["status"] == "killed" and je.get("notice") == 1 and je.get("resume") == 1,
+                f"job 1 ended {je}")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 2)
+        n = h.all("notice", sid)
+        t.check(n and "the user stopped it" in n[-1]["text"], f"told: {n}")
+        t.check(t.gone(p1), "job 1's process is gone")
+        r = h.call("job.kill", sid=sid, job=9)
+        t.check(r.get("ok") == 0, f"no job 9: {r}")
+
+        h.call("close", sid=sid)
+        je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("job") == 2)
+        t.check(je["status"] == "closed" and je.get("notice") == 0, f"job 2 ended {je}")
+        t.check(t.gone(p2), "job 2's process is gone")
+        time.sleep(0.3)
+        t.check(len(h.all("turn", sid)) == 2, "no turn after closing")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def job_quit(t):
+    """Quitting kills the jobs."""
+    h = t.headless()
+    model = t.model.replace(":job_quit:", ":job_cmds:")
+    fake_provider.STATE.register(model)
+    sid = h.call("new", cwd=t.work, model=model, endpoint="fake")["sid"]
+    h.send("prompt", sid=sid, text="go")
+    h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (t.pids("job1pid") and t.pids("job2pid")):
+        time.sleep(0.05)
+    pids = t.pids("job1pid") + t.pids("job2pid")
+    rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    t.check(len(pids) == 2 and t.gone(pids), f"the jobs are gone: {pids}")
+
+
+@scenario(conf={"_tools": {"auto_resume": 1}}, bound=15)
+def resume_cap(t):
+    """Turns a session starts by itself are capped: past the cap, the
+    end of a job waits for the next prompt."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("job") == 1)
+        t.check(je.get("resume") == 1, f"the first resumes: {je}")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 2)
+        je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("job") == 2)
+        t.check(not je.get("resume"), f"the second does not: {je}")
+        note = h.wait(lambda e: e.get("ev") == "note" and e.get("sid") == sid)
+        t.check("auto_resume" in note["text"], f"note {note}")
+        time.sleep(0.3)
+        t.check(len(h.all("turn", sid)) == 2, "no third turn by itself")
+        h.send("prompt", sid=sid, text="what happened?")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 3)
+        last = t.requests()[-1]["body"]["messages"]
+        t.check("Background job 2 ended" in last[-1]["content"] and
+                last[-2]["content"] == "what happened?", f"told at the prompt: {last[-2:]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def rewind_reopen(t):
+    """Snapshots survive the process: a session opened again rewinds what
+    the last one changed."""
+    model = t.model.replace(":rewind_reopen:", ":rewind:")
+    fake_provider.STATE.register(model)
+    r = t.run("first", extra=["-m", model])
+    t.check(r.rc == 0 and t.file("a.txt") == "two\n" and t.file("b.txt") == "new\n",
+            f"written: {r.rc} {r.stderr}")
+    sid = r.events[0]["sid"]
+    h = t.headless()
+    try:
+        o = h.call("open", sid=sid, **{"from": 0})
+        t.check(o.get("ok") == 1, f"opened {o}")
+        rr = h.call("rewind", sid=sid, to=1)
+        got = [(os.path.basename(f["path"]), f["result"]) for f in rr.get("files", [])]
+        t.check(got == [("b.txt", "removed"), ("a.txt", "removed")], f"rewound {rr}")
+        t.check(t.file("a.txt") is None and t.file("b.txt") is None, "both gone")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def instructions_changed(t):
+    """An instruction file changed between turns: the agent gets its new
+    text as a note, and the system prompt stays as it was."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("AGENTS.md", "Rule one.\n")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="first")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.put("AGENTS.md", "Rule two, longer.\n")
+        t.host.touch(t.host.join(t.work, "AGENTS.md"), time.time() + 10)
+        h.send("prompt", sid=sid, text="second")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 2)
+        reqs = [x["body"]["messages"] for x in t.requests()]
+        t.check(reqs[0][0]["content"] == reqs[1][0]["content"] and
+                "Rule one." in reqs[0][0]["content"], "the system prompt stays")
+        last = reqs[1][-1]["content"]
+        t.check(last.startswith("Instruction files changed") and "Rule two, longer." in last,
+                f"told: {last!r}")
+        ins = h.all("instructions", sid)
+        t.check([i["why"] for i in ins] == ["start", "changed"], f"records {ins}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 SEARCH_FILES = {
     ".gitignore": "ignored/\n*.log\n",
     "src/a.c": "int main(void)\n{\n    // TODO: fix\n}\n",
@@ -894,17 +1061,14 @@ SEARCH_WANT = [
 
 def searchsetup(t):
     t.host.mkdir(t.host.join(t.work, ".git"))
-    for i, (rel, text) in enumerate(SEARCH_FILES.items()):
-        parts = rel.split("/")
-        if len(parts) > 1:
-            t.host.mkdir(t.host.join(t.work, *parts[:-1]))
-        t.put(rel, text)
-    t.host.write(t.host.join(t.work, "bin.dat"), b"int main(\0\0\n")
-    t.host.write(t.host.join(t.base, "outside"), "x outside\n")
+    files = dict(SEARCH_FILES)
+    files["bin.dat"] = b"int main(\0\0\n"
+    files["../outside"] = "x outside\n"
     # Newest first: a.c, then c.c, then b.h
     now = time.time()
-    for rel, age in [("src/a.c", 10), ("src/c.c", 20), ("src/b.h", 30)]:
-        t.host.touch(t.host.join(t.work, rel), now - age)
+    times = {rel: now - age for rel, age in [("src/a.c", 10), ("src/c.c", 20),
+                                             ("src/b.h", 30)]}
+    t.host.bulk(t.work, files, times)
 
 
 def searchcheck(t, r):
@@ -939,10 +1103,9 @@ def search_builtin(t):
 
 def manysetup(t):
     now = time.time()
-    for i in range(150):
-        rel = f"f{i:03}.txt"
-        t.put(rel, "line\n")
-        t.host.touch(t.host.join(t.work, rel), now - 1000 + i)
+    files = {f"f{i:03}.txt": "line\n" for i in range(150)}
+    times = {f"f{i:03}.txt": now - 1000 + i for i in range(150)}
+    t.host.bulk(t.work, files, times)
 
 
 def manycheck(t, r):

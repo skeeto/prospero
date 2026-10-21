@@ -45,6 +45,7 @@ enum : i32 {
     FILE_FLAG_BACKUP_SEMANTICS        = 0x02000000,
     FILE_SHARE_ALL                    = 7,
     FILE_TYPE_DISK                    = 1,
+    FILE_TYPE_CHAR                    = 2,
     FIND_FIRST_EX_LARGE_FETCH         = 2,
     FindExInfoBasic                   = 1,
     FindExInfoStandard                = 0,
@@ -88,6 +89,9 @@ enum : i32 {
     SEM_NOOPENFILEERRORBOX            = 0x8000,
     STARTF_USESTDHANDLES              = 0x100,
     STD_INPUT_HANDLE                  = -10,
+    STD_OUTPUT_HANDLE                 = -11,
+    ATTACH_PARENT_PROCESS             = -1,
+    CTRL_BREAK_EVENT                  = 1,
     // WinHTTP
     ERROR_WINHTTP_OPERATION_CANCELLED = 12017,
     WINHTTP_ACCESS_TYPE_AUTOMATIC     = 4,
@@ -265,6 +269,11 @@ W32(b32,    WriteFile(uz, u8 *, i32, i32 *, Overlapped *));
 W32(void,   DeleteCriticalSection(CriticalSection *));
 W32(void *, GetProcAddress(uz, char *));
 W32(void,   Sleep(i32));
+W32(b32,    AttachConsole(i32));
+W32(b32,    FreeConsole());
+W32(b32,    GenerateConsoleCtrlEvent(i32, i32));
+W32(b32,    SetConsoleCtrlHandler(uz, b32));
+W32(b32,    SetStdHandle(i32, uz));
 W32(b32,    AssignProcessToJobObject(uz, uz));
 W32(uz,     CreateJobObjectW(uz, c16 *));
 W32(b32,    CreatePipe(uz *, uz *, uz, i32));
@@ -351,6 +360,9 @@ extern "C" i32 memcmp(void const *a, void const *b, uz len)
 struct Os {
     i64             freq;   // performance counter ticks per second
     CriticalSection spawn;  // held while child handles are inheritable
+    CriticalSection console;  // held while attached to a child's console
+    uz              std[3];   // standard handles, as at startup
+    b32             stdinread;  // os_stdin was called: a reader may block
     void           *gui;    // GUI builds: the window's state (gui_win32.cpp)
     // GetFinalPathNameByHandleW, from Vista on, else null
     u32 (__stdcall *finalpath)(uz, c16 *, u32, u32);
@@ -797,15 +809,9 @@ static b32 os_remove(Os *, Arena scratch, Str path)
            RemoveDirectoryW(p);
 }
 
-static b32 os_print(Os *, i32 fd, Str s)
+// Consoles display UTF-16 correctly regardless of code page.
+static b32 writeconsole(uz h, Str s)
 {
-    uz  h    = GetStdHandle(-10 - fd);
-    i32 mode = 0;
-    if (!GetConsoleMode(h, &mode)) {
-        return writeall(h, s);
-    }
-
-    // Consoles display UTF-16 correctly regardless of code page.
     c16 buf[512];
     i32 len = 0;
     for (iz i = 0; i < s.len;) {
@@ -819,6 +825,24 @@ static b32 os_print(Os *, i32 fd, Str s)
         }
     }
     return 1;
+}
+
+// Standard handles come from startup, since stopping a child (ctrlbreak)
+// changes those of the process for a moment.
+static b32 os_print(Os *os, i32 fd, Str s)
+{
+    uz h = os->std[fd];
+    if (GetFileType(h) != FILE_TYPE_CHAR) {
+        return writeall(h, s);
+    }
+    // A console, which this process leaves for a moment to stop a child,
+    // and whose handle it then replaces
+    EnterCriticalSection(&os->console);
+    h = os->std[fd];
+    i32 mode = 0;
+    b32 ok   = GetConsoleMode(h, &mode) ? writeconsole(h, s) : writeall(h, s);
+    LeaveCriticalSection(&os->console);
+    return ok;
 }
 
 
@@ -1075,10 +1099,11 @@ static Slice<Str> os_environ(Os *, Arena *a)
     return r;
 }
 
-static iz os_stdin(Os *, u8 *buf, iz len)
+static iz os_stdin(Os *os, u8 *buf, iz len)
 {
+    __atomic_store_n(&os->stdinread, 1, __ATOMIC_RELAXED);
     i32 n = 0;
-    if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), buf, chunk(len), &n, 0)) {
+    if (!ReadFile(os->std[0], buf, chunk(len), &n, 0)) {
         return GetLastError()==ERROR_BROKEN_PIPE ? 0 : -1;
     }
     return n;
@@ -1250,6 +1275,7 @@ struct ProcChunk {  // queued input, its bytes following
 struct Proc {
     i32        refs;      // atomic
     uz         job;
+    i32        pid;       // the root, leader of its console process group
     uz         process;   // owned by the waiter until the end
     uz         pipe;      // output read end, owned by the reader
     uz         file;      // the output file, owned by the reader
@@ -1576,6 +1602,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     }
     p->refs     = io ? 4 : 3;
     p->job      = job;
+    p->pid      = pi.pid;
     p->process  = pi.process;
     p->pipe     = pr;
     p->file     = file;
@@ -1668,10 +1695,54 @@ static b32 os_procwrite(Os *, Proc *p, Str data)
     return ok;
 }
 
-// Soft and hard alike until a soft stop (CTRL_BREAK) arrives in M4.
-static void os_kill(Os *, Proc *p, b32)
+// The soft stop: CTRL_BREAK to the child's process group, every process
+// in it that shares the console the child has (CREATE_NO_WINDOW gave it
+// a hidden one). Only a process attached to that console may send it,
+// and a process attaches to one console at a time, so this one leaves
+// its own, if any, under a lock, for the child's, then comes back.
+// Attaching sets the process's standard handles to the console's, so
+// they are put back after, a console's opened anew (leaving it spoiled
+// the old ones). A console being read for input (os_stdin) would break,
+// so then the kill that follows the grace period has to do.
+static void ctrlbreak(Os *os, Proc *p)
 {
-    TerminateJobObject(p->job, 1);
+    i32 mode = 0;
+    if (__atomic_load_n(&os->stdinread, __ATOMIC_RELAXED) &&
+            GetConsoleMode(os->std[0], &mode)) {
+        return;
+    }
+    EnterCriticalSection(&os->console);
+    b32 con[3] = {};
+    for (i32 fd = 0; fd < 3; fd++) {
+        con[fd] = GetConsoleMode(os->std[fd], &mode);
+    }
+    b32 had = FreeConsole();
+    if (AttachConsole(p->pid)) {
+        SetConsoleCtrlHandler(0, 1);  // should it come here, ignore it
+        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, p->pid);
+        FreeConsole();
+        SetConsoleCtrlHandler(0, 0);
+    }
+    b32 back = had && AttachConsole(ATTACH_PARENT_PROCESS);
+    for (i32 fd = 0; fd < 3; fd++) {
+        if (con[fd] && back) {
+            c16 *name = fd ? (c16 *)u"CONOUT$" : (c16 *)u"CONIN$";
+            uz   h    = CreateFileW(name, GENERIC_READ|GENERIC_WRITE,
+                                    FILE_SHARE_ALL, 0, OPEN_EXISTING, 0, 0);
+            os->std[fd] = h!=INVALID_HANDLE_VALUE ? h : os->std[fd];
+        }
+        SetStdHandle(-10 - fd, os->std[fd]);
+    }
+    LeaveCriticalSection(&os->console);
+}
+
+static void os_kill(Os *os, Proc *p, b32 hard)
+{
+    if (hard) {
+        TerminateJobObject(p->job, 1);
+    } else {
+        ctrlbreak(os, p);
+    }
 }
 
 static void os_procfree(Os *os, Proc *p)
@@ -1969,6 +2040,10 @@ void mainCRTStartup()
     Os os = {};
     QueryPerformanceFrequency(&os.freq);
     InitializeCriticalSectionAndSpinCount(&os.spawn, 4000);
+    InitializeCriticalSectionAndSpinCount(&os.console, 4000);
+    for (i32 fd = 0; fd < 3; fd++) {
+        os.std[fd] = GetStdHandle(-10 - fd);
+    }
     uz kernel32  = GetModuleHandleW((c16 *)u"kernel32.dll");
     os.finalpath = (u32 (__stdcall *)(uz, c16 *, u32, u32))
                    GetProcAddress(kernel32, (char *)"GetFinalPathNameByHandleW");

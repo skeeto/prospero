@@ -210,7 +210,7 @@ static void testladder(ProcTest *p, Arena scratch)
     os_procfree(os, pr);
 
     if (HOST_WINDOWS) {
-        say(os, "kill ladder done (soft is hard on Windows)");
+        say(os, "kill ladder done (soft is CTRL_BREAK on Windows)");
         return;
     }
 

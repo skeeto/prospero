@@ -539,6 +539,37 @@ def sc_rewind(model, n, req):
         yield from answer(model, "Files written.")
 
 
+def sc_job_cmds(model, n, req):
+    # Two jobs in one step; the user stops one, and closing stops the other
+    if n == 0:
+        yield S.head()
+        yield from call(model, 0, "call_a", "shell", {
+            "command": "echo $$ > job1pid; sleep 30", "background": True})
+        yield from call(model, 1, "call_b", "shell", {
+            "command": "echo $$ > job2pid; sleep 30", "background": True})
+        yield from finish(model, "tool_calls")
+    elif n == 1:
+        yield from answer(model, "Started two.")
+    else:
+        yield from answer(model, "Saw: " + last_user(req)[:60])
+
+
+def sc_resume_cap(model, n, req):
+    if n == 0:
+        yield S.head()
+        yield from call(model, 0, "call_a", "shell", {
+            "command": "sleep 1; echo first", "background": True})
+        yield from call(model, 1, "call_b", "shell", {
+            "command": "sleep 2.5; echo second", "background": True})
+        yield from finish(model, "tool_calls")
+    else:
+        yield from answer(model, "Saw: " + last_user(req)[:60])
+
+
+def sc_instructions_changed(model, n, req):
+    yield from answer(model, f"Answer number {n}.")
+
+
 def sc_soft_stop(model, n, req):
     if n == 0:
         yield from tool(model, n, "shell", {"command": "echo $$ > softpid; sleep 30"})
