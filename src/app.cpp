@@ -279,6 +279,7 @@ struct CfgRow {
     Str        desc;
     Str        file;     // where it is set, null for its default
     i64        line;
+    i64        fetched;  // a URL file's copy, Unix epoch ms, else 0
     b32        isdflt;
     b32        valid;
     Slice<Str> choices;  // an enum's, to pick from a list
@@ -939,14 +940,15 @@ static void loadcfg(Gui *g, Str line)
     Json *schema = jsonget(j, "schema");
     for (Json *s = jsonget(j, "settings")->child; s; s = s->next) {
         CfgRow r = {};
-        r.kind   = jsonstr(jsonget(s, "kind"));
-        r.name   = jsonstr(jsonget(s, "name"));
-        r.key    = jsonstr(jsonget(s, "key"));
-        r.value  = jsonstr(jsonget(s, "value"));
-        r.file   = jsonstr(jsonget(s, "file"));
-        r.line   = jsonint(jsonget(s, "line"), 0);
-        r.isdflt = jsonint(jsonget(s, "default"), 0) != 0;
-        r.valid  = jsonint(jsonget(s, "valid"), 1) != 0;
+        r.kind    = jsonstr(jsonget(s, "kind"));
+        r.name    = jsonstr(jsonget(s, "name"));
+        r.key     = jsonstr(jsonget(s, "key"));
+        r.value   = jsonstr(jsonget(s, "value"));
+        r.file    = jsonstr(jsonget(s, "file"));
+        r.line    = jsonint(jsonget(s, "line"), 0);
+        r.fetched = jsonint(jsonget(s, "fetched"), 0);
+        r.isdflt  = jsonint(jsonget(s, "default"), 0) != 0;
+        r.valid   = jsonint(jsonget(s, "valid"), 1) != 0;
         for (Json *k = schema->child; k; k = k->next) {
             if (jsonstr(jsonget(k, "kind"))==r.kind && jsonstr(jsonget(k, "key"))==r.key) {
                 r.type = jsonstr(jsonget(k, "type"));
@@ -5116,7 +5118,8 @@ static Str cstrclone(Arena *a, Str s)
 // The configuration, read before the window opens so that it opens in
 // the theme set there: the in-process engine's own, which it takes over
 // when it starts, or a reading of the same file for an engine process.
-// The fake agent has none.
+// The former fetches URL includes not yet cached (30 s at most), the
+// latter leaves that to the engine. The fake agent has none.
 static void readconfig(Gui *g, Arena scratch)
 {
     if (g->enginekind == ENGINE_FAKE) {
@@ -5125,7 +5128,8 @@ static void readconfig(Gui *g, Arena scratch)
     Os     *os   = g->os;
     b32     own  = g->enginekind == ENGINE_INPROC;
     Str     path = g->cfgpath.len ? g->cfgpath : cfgdefault(os, &g->perm);
-    Config *cfg  = newconfig(os, &g->perm, scratch, path, own && !g->cfgpath.len);
+    Config *cfg  = newconfig(os, &g->perm, scratch, path, own && !g->cfgpath.len,
+                             g->statedir, own);
     if (!cfg) {
         return;
     }

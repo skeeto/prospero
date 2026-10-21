@@ -861,8 +861,352 @@ static void testcfgengine(Test *t)
     cfgfree(c);
 }
 
+// Run a live Config's fetches to their ends, as the engine does.
+static void cfgdrain(Config *c, Arena scratch)
+{
+    for (i32 i = 0; i<100 && cfgbusy(c); i++) {
+        Mail m = mailtake(c->mbox);
+        for (Record r; (r = mailnext(&m)).ok;) {
+            cfgrecord(c, scratch, r);
+        }
+        cfgtimeout(c, scratch);
+    }
+}
+
+static Str cfgcached(Arena *a, Os *os, Str url)
+{
+    return cfgfile(os, concat(a, "/s/includes/", cfgsha256(a, url)));
+}
+
+// The includes of a config.get, one per line: url fetched fetching
+// error.
+static Str cfgshowincludes(Arena *a, Config *c)
+{
+    JsonDoc d = jsonparse(a, cfgjson(a, c, 0));
+    Buf     b(a, 256);
+    for (Json *i = jsonget(d.root, "includes")->child; i; i = i->next) {
+        print(&b, b.len ? Str("\n") : Str(""));
+        print(&b, jsonstr(jsonget(i, "url")));
+        putbyte(&b, ' ');
+        print(&b, jsonint(jsonget(i, "fetched"), -1));
+        putbyte(&b, ' ');
+        print(&b, jsonint(jsonget(i, "fetching"), -1));
+        putbyte(&b, ' ');
+        print(&b, jsonstr(jsonget(i, "error")));
+    }
+    return finish(&b);
+}
+
+static void testcfgsha256(Test *t)
+{
+    Arena a = t->perm;
+    Str   m = {allocbytes(&a, 1000000), 1000000};
+    for (iz i = 0; i < m.len; i++) {
+        m[i] = 'a';
+    }
+    static struct { Str in, want; } cases[] = {
+        {"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        expect(t, concat(&a, "sha256 ", cases[i].in),
+               cfgsha256(&a, cases[i].in), cases[i].want);
+    }
+    static struct { iz len; Str want; } as[] = {
+        {55, "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"},
+        {56, "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"},
+        {64, "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"},
+        {1000000, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"},
+    };
+    for (iz i = 0; i < countof(as); i++) {
+        expect(t, concat(&a, "sha256 a*", istr(&a, as[i].len)),
+               cfgsha256(&a, takehead(m, as[i].len)), as[i].want);
+    }
+
+    static struct { i64 ms; Str want; } ages[] = {
+        {-5, "0 seconds"}, {999, "0 seconds"}, {1000, "1 second"},
+        {59999, "59 seconds"}, {60000, "1 minute"}, {7199999, "1 hour"},
+        {7200000, "2 hours"}, {86400000, "1 day"}, {10*86400000ll, "10 days"},
+    };
+    for (iz i = 0; i < countof(ages); i++) {
+        Buf b(&a, 32);
+        printcfgage(&b, ages[i].ms);
+        expect(t, concat(&a, "age ", ages[i].want), finish(&b), ages[i].want);
+    }
+}
+
+// URL includes: fetched at startup, cached, refreshed with conditional
+// requests, used offline with their age, pinned, redirected and capped.
+static void testcfgurls(Test *t)
+{
+    Arena  a  = t->perm;
+    CfgEnv v  = newcfgenv(&a);
+    Os    *os = v.os;
+    i64    s  = 1000000;  // a second of os_ticks
+    os->now = 1000*s;
+    Str url  = "https://team.example/h.ini";
+    Str more = "https://team.example/more.ini";
+    Str team = "include = more.ini\n"
+               "[endpoint team]\n"
+               "url = https://team.example/v1\n"
+               "key = sk-plaintext\n";
+    Str lm   = "Last-Modified: Wed, 21 Oct 2026 07:28:00 GMT\r\n";
+    VRoute *r1 = vroute(os, url, 200, lm, team);
+    VRoute *r2 = vroute(os, more, 200, "", "model = team-model\n");
+    r1->etag = "\"v1\"";
+    r2->etag = "\"m1\"";
+    VRoute *routes = os->routes;
+    Str user = "include = HTTPS://Team.example/./h.ini\n"
+               "[endpoint local]\n"
+               "url = http://localhost/\n";
+    os_write(os, a, "/c/h.ini", user);
+    Str secret = "https://team.example/h.ini:4:7: error: a plaintext secret "
+                 "in an included file is ignored: write env:NAME and set the "
+                 "variable";
+
+    // First run: fetched while starting, the nested include too
+    Config *c = newconfig(os, &a, v.scratch, "/c/h.ini", 0, "/s", 1);
+    expect(t, "url.requests", istr(&a, os->requests), "2");
+    expect(t, "url.model", cfgget(c, "", "", "model", 0), "team-model");
+    expect(t, "url.team", cfgget(c, "endpoint", "team", "url", 0),
+           "https://team.example/v1");
+    expect(t, "url.diags", inidiags(&a, c->ini), secret);
+    {
+        Slice<Str> files = {};
+        for (IniFile *f = c->ini->files; f; f = f->next) {
+            files = push(&a, files, f->path);
+        }
+        expect(t, "url.files", showlist(&a, files), concat(&a,
+               "/c/h.ini|https://team.example/h.ini|", more));
+    }
+    expect(t, "url.cache", cfgcached(&a, os, url), concat(&a,
+           "harness include 1\nurl https://team.example/h.ini\n"
+           "fetched 1000000\netag \"v1\"\n"
+           "modified Wed, 21 Oct 2026 07:28:00 GMT\n\n", team));
+    expect(t, "url.cachename", cfgsha256(&a, url),
+           "e0f300c06ecf61a441d54e8044994313844a27de962dafcf38176916c5e44bd6");
+    expect(t, "url.includes", cfgshowincludes(&a, c),
+           "https://team.example/h.ini 1000000 0 \n"
+           "https://team.example/more.ini 1000000 0 ");
+    {
+        // Provenance: the URL, and when its copy was fetched
+        JsonDoc d = jsonparse(&a, cfgjson(&a, c, 0));
+        Str     got = {};
+        for (Json *e = jsonget(d.root, "settings")->child; e; e = e->next) {
+            if (jsonstr(jsonget(e, "name"))=="team" &&
+                    jsonstr(jsonget(e, "key"))=="url") {
+                Buf b(&a, 128);
+                print(&b, jsonstr(jsonget(e, "file")));
+                putbyte(&b, ':');
+                print(&b, jsonint(jsonget(e, "line"), -1));
+                putbyte(&b, ' ');
+                print(&b, jsonint(jsonget(e, "fetched"), -1));
+                got = finish(&b);
+            }
+        }
+        expect(t, "url.provenance", got, "https://team.example/h.ini:3 1000000");
+    }
+    cfgfree(c);
+
+    // Later runs load from the cache at once, then refresh in the
+    // background with conditional requests
+    os->now += 60*s;
+    c = newconfig(os, &a, v.scratch, "/c/h.ini", 0, "/s", 1);
+    expect(t, "cached.requests", istr(&a, os->requests), "2");
+    expect(t, "cached.model", cfgget(c, "", "", "model", 0), "team-model");
+    expect(t, "cached.diags", inidiags(&a, c->ini), secret);
+    Mailbox *mb = newmailbox(&a, 1<<20, 0, 0);
+    cfgattach(c, mb, CFG_REFRESH);
+    i64 rev = c->rev;
+    cfgrefresh(c, v.scratch, 0);
+    expect(t, "refresh.busy", istr(&a, cfgbusy(c)), "1");
+    cfgdrain(c, v.scratch);
+    expect(t, "refresh.requests", istr(&a, os->requests), "4");
+    expect(t, "refresh.conditional",
+           istr(&a, find(os->request, "If-None-Match: \"m1\"\r\n") >= 0), "1");
+    expect(t, "refresh.unchanged", istr(&a, c->rev - rev), "0");
+    expect(t, "refresh.fetched",
+           istr(&a, find(cfgcached(&a, os, url), "\nfetched 1060000\n")>0), "1");
+    expect(t, "refresh.includes", cfgshowincludes(&a, c),
+           "https://team.example/h.ini 1060000 0 \n"
+           "https://team.example/more.ini 1060000 0 ");
+
+    // Each at most every interval, unless forced
+    cfgrefresh(c, v.scratch, 0);
+    cfgdrain(c, v.scratch);
+    expect(t, "interval.none", istr(&a, os->requests), "4");
+    os->now += CFG_REFRESH;
+    cfgpoll(c, v.scratch, 0);
+    cfgdrain(c, v.scratch);
+    expect(t, "interval.due", istr(&a, os->requests), "6");
+    cfgrefresh(c, v.scratch, 1);
+    cfgdrain(c, v.scratch);
+    expect(t, "interval.forced", istr(&a, os->requests), "8");
+
+    // Offline: the cached copies, with a warning of their age
+    os->routes = 0;
+    os->now += 3*3600*s;
+    cfgrefresh(c, v.scratch, 1);
+    cfgdrain(c, v.scratch);
+    expect(t, "offline.model", cfgget(c, "", "", "model", 0), "team-model");
+    expect(t, "offline.diags", inidiags(&a, c->ini), concat(&a,
+           "/c/h.ini:1:11: warning: cannot fetch https://team.example/h.ini "
+           "(not supported in tests); using the copy fetched 3 hours ago\n"
+           "https://team.example/h.ini:1:11: warning: cannot fetch "
+           "https://team.example/more.ini (not supported in tests); using "
+           "the copy fetched 3 hours ago\n", secret));
+    expect(t, "offline.includes", cfgshowincludes(&a, c),
+           "https://team.example/h.ini 1660000 0 not supported in tests\n"
+           "https://team.example/more.ini 1660000 0 not supported in tests");
+    os->routes = routes;
+    cfgrefresh(c, v.scratch, 1);
+    cfgdrain(c, v.scratch);
+    expect(t, "online.diags", inidiags(&a, c->ini), secret);
+
+    // A pin the cached copy does not match: fetched afresh, which does
+    // not match either, so the include is skipped, and the cache kept
+    Str zeros = "0000000000000000000000000000000000000000000000000000000000000000";
+    Str sha   = cfgsha256(&a, team);
+    Str copy  = cfgcached(&a, os, url);
+    os_write(os, a, "/c/h.ini", concat(&a, concat(&a,
+             "include = https://team.example/h.ini sha256=", zeros), "\n"));
+    i32 before = os->requests;
+    cfgpoll(c, v.scratch, 1);
+    cfgdrain(c, v.scratch);
+    expect(t, "pin.requests", istr(&a, os->requests - before), "1");
+    expect(t, "pin.unconditional",
+           istr(&a, find(os->request, "If-None-Match") < 0), "1");
+    expect(t, "pin.diags", inidiags(&a, c->ini), concat(&a, concat(&a,
+           "/c/h.ini:1:11: error: https://team.example/h.ini does not match "
+           "its pin: its sha256 is ", sha), ", include skipped"));
+    expect(t, "pin.model", cfgget(c, "", "", "model", 0), "");
+    expect(t, "pin.cache", cfgcached(&a, os, url), copy);
+
+    // The right pin: the cached copy, with no fetch
+    before = os->requests;
+    os->now += s;  // a new mtime: the edit is the same size
+    os_write(os, a, "/c/h.ini", concat(&a, concat(&a,
+             "include = https://team.example/h.ini sha256=", sha), "\n"));
+    cfgpoll(c, v.scratch, 1);
+    cfgdrain(c, v.scratch);
+    expect(t, "pinned.requests", istr(&a, os->requests - before), "0");
+    expect(t, "pinned.diags", inidiags(&a, c->ini), secret);
+    expect(t, "pinned.model", cfgget(c, "", "", "model", 0), "team-model");
+
+    // The server's text changes under the pin: an error, and the copy
+    // that matches stays in use
+    Str evil = "[endpoint team]\nurl = https://evil.example/\n";
+    r1->body = evil;
+    r1->etag = "\"v2\"";
+    cfgrefresh(c, v.scratch, 1);
+    cfgdrain(c, v.scratch);
+    expect(t, "pinbad.diags", inidiags(&a, c->ini), concat(&a, concat(&a,
+           "/c/h.ini:1:11: error: https://team.example/h.ini does not match "
+           "its pin: its sha256 is ", cfgsha256(&a, evil)),
+           concat(&a, "; using the copy fetched 1 second ago\n", secret)));
+    expect(t, "pinbad.url", cfgget(c, "endpoint", "team", "url", 0),
+           "https://team.example/v1");
+    expect(t, "pinbad.cache", istr(&a, find(cfgcached(&a, os, url), team)>0), "1");
+    expect(t, "pinbad.text", istr(&a, find(cfgcached(&a, os, url), evil)), "-1");
+    cfgfree(c);
+    r1->body = team;
+    r1->etag = "\"v1\"";
+
+    // Redirects: five are followed, relative or not; six are too many,
+    // and https never goes to http
+    Str hops[][2] = {
+        {"https://r.example/0", "/1"},
+        {"https://r.example/1", "https://r.example/2"},
+        {"https://r.example/2", "3"},
+        {"https://r.example/3", "//r.example/4"},
+        {"https://r.example/4", "./5?x"},
+        {"https://r.example/s", "/0"},
+        {"https://r.example/down", "http://r.example/5?x"},
+    };
+    i32 codes[] = {302, 301, 307, 308, 303, 302, 302};
+    for (iz i = 0; i < countof(hops); i++) {
+        Str loc = concat(&a, concat(&a, "Location: ", hops[i][1]), "\r\n");
+        vroute(os, hops[i][0], codes[i], loc, "moved\n");
+    }
+    vroute(os, "https://r.example/5?x", 200, "", "model = redirected\n");
+    static struct { Str url, want; } redirects[] = {
+        {"https://r.example/0", "redirected "},
+        {"https://r.example/s", " /c/r.ini:1:11: warning: cannot fetch "
+         "https://r.example/s (more than 5 redirects), include skipped"},
+        {"https://r.example/down", " /c/r.ini:1:11: warning: cannot fetch "
+         "https://r.example/down (redirected from https to http), include "
+         "skipped"},
+    };
+    for (iz i = 0; i < countof(redirects); i++) {
+        os_write(os, a, "/c/r.ini", concat(&a, concat(&a, "include = ",
+                 redirects[i].url), "\n"));
+        Config *r = newconfig(os, &a, v.scratch, "/c/r.ini", 0, "/s", 1);
+        Str got = concat(&a, concat(&a, cfgget(r, "", "", "model", 0), " "),
+                         inidiags(&a, r->ini));
+        expect(t, concat(&a, "redirect ", redirects[i].url), got,
+               redirects[i].want);
+        cfgfree(r);
+    }
+
+    // Failures with no cached copy skip the include
+    iz  big  = CFG_FETCHMAX + 1;
+    Str huge = {allocbytes(&a, big), big};
+    for (iz i = 0; i < big; i++) {
+        huge[i] = '\n';
+    }
+    vroute(os, "https://f.example/big", 200, "", huge);
+    vroute(os, "https://f.example/gone", 404, "", "not found\n");
+    vroute(os, "https://f.example/reset", 200, "", {})->err = HTTP_EIO;
+    static struct { Str url, why; } fails[] = {
+        {"https://f.example/big", "larger than 1 MiB"},
+        {"https://f.example/gone", "HTTP 404"},
+        {"https://f.example/reset", "refused"},
+        {"https://f.example/none", "not supported in tests"},
+    };
+    for (iz i = 0; i < countof(fails); i++) {
+        os_write(os, a, "/c/f.ini", concat(&a, concat(&a, "include = ",
+                 fails[i].url), "\n"));
+        Config *f = newconfig(os, &a, v.scratch, "/c/f.ini", 0, "/s", 1);
+        Str want = concat(&a, "/c/f.ini:1:11: warning: cannot fetch ",
+                          fails[i].url);
+        want = concat(&a, want, concat(&a, " (", fails[i].why));
+        want = concat(&a, want, "), include skipped");
+        expect(t, concat(&a, "fail ", fails[i].url), inidiags(&a, f->ini), want);
+        expect(t, concat(&a, "fail.cache ", fails[i].url),
+               cfgcached(&a, os, fails[i].url), "(missing)");
+        cfgfree(f);
+    }
+
+    // Without fetching, cached copies only; without a state directory,
+    // no URL includes
+    os_write(os, a, "/c/n.ini", "include = https://team.example/more.ini\n"
+             "include = https://team.example/new.ini\n");
+    before = os->requests;
+    c = newconfig(os, &a, v.scratch, "/c/n.ini", 0, "/s", 0);
+    expect(t, "nonet.requests", istr(&a, os->requests - before), "0");
+    expect(t, "nonet.model", cfgget(c, "", "", "model", 0), "team-model");
+    expect(t, "nonet.diags", inidiags(&a, c->ini),
+           "/c/n.ini:2:11: warning: https://team.example/new.ini is not "
+           "fetched yet, include skipped");
+    cfgattach(c, mb, CFG_REFRESH);
+    cfgrefresh(c, v.scratch, 1);
+    expect(t, "nonet.attach", istr(&a, os->requests - before), "0");
+    cfgfree(c);
+    c = newconfig(os, &a, v.scratch, "/c/n.ini", 0, {}, 1);
+    expect(t, "nostate.diags", inidiags(&a, c->ini),
+           "/c/n.ini:1:11: warning: cannot include "
+           "https://team.example/more.ini (no state directory for a cache)\n"
+           "/c/n.ini:2:11: warning: cannot include "
+           "https://team.example/new.ini (no state directory for a cache)");
+    cfgfree(c);
+}
+
 static void test_config(Test *t)
 {
+    testcfgsha256(t);
+    testcfgurls(t);
     testcfgschema(t);
     testcfgdefault(t);
     testcfgseed(t);

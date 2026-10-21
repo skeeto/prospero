@@ -38,6 +38,18 @@
 // section, "include" is an error rather than a key, so no section can
 // use it.
 //
+// URL includes: "include = https://host/team.ini", optionally pinned
+// with "include = URL sha256=HEX" (64 hex digits). The URL is the
+// included file's path, so diagnostics and provenance name it, and an
+// include inside it resolves against it as a URL reference (RFC 3986):
+// "base.ini", "../x.ini", "/x.ini" and "//host/x.ini" all name URLs, so
+// a file from the web can include only more of the web, never a local
+// file. Only http and https are taken, compared after lowercasing the
+// scheme and host and dropping a fragment and dot segments, which the
+// cycle check uses. This reader never fetches: the loader supplies the
+// text through a hook (Ini.fetch), along with a diagnostic for the
+// include line, and decides about caching, pins and timeouts.
+//
 // Layering: a later definition of a key overrides an earlier one in load
 // order (an include's definitions land where the include line is), and
 // each value keeps the file and line that defined it. Defining a key
@@ -149,6 +161,13 @@ struct IniDiag {
     Str msg;
 };
 
+// The text of a URL include, from the loader's hook.
+struct IniSource {
+    Str data;      // null to skip the include
+    Str msg;       // a diagnostic for the include line, or null
+    i32 severity;  // of msg
+};
+
 // A layered configuration. The zero value is empty and ready to use.
 struct Ini {
     IniFile        *files;        // in order of opening
@@ -160,6 +179,12 @@ struct Ini {
     Map<b32>       *seen;         // diagnostics recorded, for dropping repeats
     i32             nfiles;
     iz              nbytes;       // counted against INI_MAXBYTES
+
+    // The text of a URL include, as canonical (iniurlclean), with its
+    // pin as 64 lowercase hex digits or null. Null: URL includes are
+    // skipped with a warning.
+    IniSource     (*fetch)(void *ctx, Arena *perm, Str url, Str pin);
+    void           *fetchctx;
 };
 
 struct IniParser {
@@ -364,6 +389,146 @@ static b32 iniurl(Str s)
 {
     return (s.len>=7 && equalfold(takehead(s, 7), "http://")) ||
            (s.len>=8 && equalfold(takehead(s, 8), "https://"));
+}
+
+
+// URLs
+
+// Length of a reference's scheme with its colon ("http:"), or 0 if it
+// has none, so that it is relative.
+static iz inischeme(Str s)
+{
+    if (!s.len || !letter(s[0])) {
+        return 0;
+    }
+    for (iz i = 1; i < s.len; i++) {
+        u8 c = s[i];
+        if (c == ':') {
+            return i + 1;
+        } else if (!alnum(c) && c!='+' && c!='-' && c!='.') {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+// Append an absolute URL path with its "." and ".." segments removed
+// (RFC 3986, 5.2.4). Empty segments stay, and ".." stops at the root.
+static void printinipath(Buf *b, Str path)
+{
+    iz root = b->len;
+    for (iz i = 0; i < path.len;) {
+        iz beg = i + (path[i] == '/');
+        iz end = beg;
+        for (; end<path.len && path[end]!='/'; end++) {}
+        Str seg  = span(path.data+beg, path.data+end);
+        b32 last = end == path.len;
+        if (seg==".." || seg==".") {
+            if (seg == "..") {
+                for (; b->len>root && b->data[b->len-1]!='/'; b->len--) {}
+                b->len -= b->len > root;
+            }
+            if (last) {
+                putbyte(b, '/');
+            }
+        } else {
+            putbyte(b, '/');
+            print(b, seg);
+        }
+        i = end;
+    }
+    if (b->len == root) {
+        putbyte(b, '/');
+    }
+}
+
+// An absolute http or https URL in canonical form: scheme and host in
+// lowercase, a path of at least "/" without dot segments, any query as
+// written, and no fragment. Null if it is not such a URL.
+static Str iniurlclean(Arena *perm, Str url)
+{
+    url = cut(url, '#').head;
+    if (!iniurl(url)) {
+        return {};
+    }
+    iz  sep  = find(url, "://");
+    Str rest = cuthead(url, sep+3);
+    iz  end  = 0;
+    for (; end<rest.len && rest[end]!='/' && rest[end]!='?'; end++) {}
+    Str auth = takehead(rest, end);
+    Cut path = cut(cuthead(rest, end), '?');
+    if (!auth.len || cut(auth, '@').ok || auth[0]==':') {
+        return {};  // no host, or credentials
+    }
+
+    Buf b(perm, url.len + 2);
+    for (iz i = 0; i < sep+3+end; i++) {
+        putbyte(&b, lowercase(url[i]));
+    }
+    printinipath(&b, path.head);
+    if (path.ok) {
+        putbyte(&b, '?');
+        print(&b, path.tail);
+    }
+    Str r = finish(&b);
+    for (iz i = 0; i < r.len; i++) {
+        if (r[i]<=' ' || r[i]==0x7f || r[i]=='\\') {
+            return {};
+        }
+    }
+    return r;
+}
+
+// Resolve a reference against a canonical base URL (iniurlclean), as
+// RFC 3986 does, into canonical form. Null if the result is not an http
+// or https URL.
+static Str iniurlresolve(Arena *perm, Str base, Str ref)
+{
+    ref = cut(ref, '#').head;
+    if (inischeme(ref)) {
+        return iniurlclean(perm, ref);
+    } else if (!ref.len) {
+        return base;  // a fragment alone
+    }
+    iz  sep  = find(base, "://");
+    Str rest = cuthead(base, sep+3);
+    iz  end  = 0;
+    for (; end<rest.len && rest[end]!='/' && rest[end]!='?'; end++) {}
+    Str scheme = takehead(base, sep+1);         // "https:"
+    Str origin = takehead(base, sep+3+end);     // "https://host"
+    Str path   = cut(cuthead(rest, end), '?').head;
+
+    Str url = {};
+    if (startswith(ref, "//")) {
+        url = concat(perm, scheme, ref);
+    } else if (startswith(ref, "/")) {
+        url = concat(perm, origin, ref);
+    } else if (startswith(ref, "?")) {
+        url = concat(perm, concat(perm, origin, path), ref);
+    } else {
+        iz dir = path.len;
+        for (; dir>0 && path[dir-1]!='/'; dir--) {}
+        url = concat(perm, origin, takehead(path, dir));
+        url = concat(perm, url, ref);
+    }
+    return iniurlclean(perm, url);
+}
+
+// A pin, "sha256=HEX", as 64 lowercase hex digits, or null.
+static Str inipin(Arena *perm, Str s)
+{
+    if (s.len!=7+64 || !startswith(s, "sha256=")) {
+        return {};
+    }
+    Str r = clone(perm, cuthead(s, 7));
+    for (iz i = 0; i < r.len; i++) {
+        u8 c = lowercase(r[i]);
+        if (!digit(c) && (c<'a' || c>'f')) {
+            return {};
+        }
+        r[i] = c;
+    }
+    return r;
 }
 
 
@@ -669,6 +834,115 @@ static IniFile *ininewfile(Ini *ini, Arena *perm, Str path, Str src)
 
 static void iniparsefile(Ini *, Os *, Arena *, IniFile *);
 
+// Whether an include of path (a file's, or a URL) may be followed from
+// the current file: not a cycle, nor too deep, nor too many files.
+// Otherwise it reports why.
+static b32 inifollow(IniParser *p, IniLine *l, Str path)
+{
+    // Messages are formatted only when they will be kept
+    IniFile *f   = p->file;
+    Str      msg = {};
+    for (IniFile *a = f; a; a = a->parent) {
+        if (a->path == path) {
+            if (!inimuted(p)) {
+                msg = concat(p->perm, "include cycle: ", path);
+            }
+            inireport(p, INI_WARNING, l->valbeg, msg);
+            return 0;
+        }
+    }
+
+    if (f->depth == INI_MAXDEPTH) {
+        if (!inimuted(p)) {
+            Buf b(p->perm, 48);
+            print(&b, "includes nested deeper than ");
+            print(&b, (i64)INI_MAXDEPTH);
+            msg = finish(&b);
+        }
+        inireport(p, INI_WARNING, l->valbeg, msg);
+        return 0;
+    } else if (p->ini->nfiles >= INI_MAXFILES) {
+        if (!inimuted(p)) {
+            Buf b(p->perm, 48);
+            print(&b, "more than ");
+            print(&b, (i64)INI_MAXFILES);
+            print(&b, " configuration files");
+            msg = finish(&b);
+        }
+        inireport(p, INI_WARNING, l->valbeg, msg);
+        return 0;
+    }
+    return 1;
+}
+
+// Parse included text as a file under the current one.
+static void iniopen(IniParser *p, IniLine *l, Str path, Str src)
+{
+    IniFile *f   = p->file;
+    IniFile *inc = ininewfile(p->ini, p->perm, path, src);
+    inc->parent = f;
+    inc->via    = l;
+    inc->depth  = f->depth + 1;
+    iniparsefile(p->ini, p->os, p->perm, inc);
+}
+
+// An include of a URL: one written as a URL, or any include in a file
+// that came from a URL, which is a reference against it. A pin may
+// follow the URL.
+static void iniweb(IniParser *p, IniLine *l)
+{
+    IniFile *f   = p->file;
+    Str      v   = l->value;
+    iz       i   = 0;
+    for (; i<v.len && !whitespace(v[i]); i++) {}
+    Str      ref = takehead(v, i);
+    Str      opt = trim(cuthead(v, i));
+    Str      pin = {};
+    if (opt.len) {
+        pin = inipin(p->perm, opt);
+        if (!pin.data) {
+            Str msg = "expected sha256= and 64 hex digits after the URL, "
+                      "include ignored";
+            l->type = INI_INVALID;
+            inireport(p, INI_ERROR, l->valbeg, msg);
+            return;
+        }
+    }
+    Str url = iniurl(f->path) ? iniurlresolve(p->perm, f->path, ref)
+                              : iniurlclean(p->perm, ref);
+    if (!url.data) {
+        Str msg = "expected an http:// or https:// URL, include ignored";
+        l->type = INI_INVALID;
+        inireport(p, INI_ERROR, l->valbeg, msg);
+        return;
+    } else if (!p->os || !inifollow(p, l, url)) {
+        return;
+    } else if (!p->ini->fetch) {
+        inireport(p, INI_WARNING, l->valbeg, "URL includes are not read here");
+        return;
+    }
+
+    IniSource s = p->ini->fetch(p->ini->fetchctx, p->perm, url, pin);
+    if (s.msg.data) {
+        inireport(p, s.severity, l->valbeg, s.msg);
+    }
+    if (!s.data.data) {
+        return;
+    } else if (s.data.len > inibudget(p->ini)) {
+        Str msg = {};
+        if (!inimuted(p)) {
+            Buf b(p->perm, 64 + url.len);
+            print(&b, "cannot read include ");
+            print(&b, url);
+            printinireason(&b, READ_TOOBIG);
+            msg = finish(&b);
+        }
+        inireport(p, INI_WARNING, l->valbeg, msg);
+        return;
+    }
+    iniopen(p, l, url, s.data);
+}
+
 static void iniinclude(IniParser *p, IniLine *l)
 {
     if (!p->top) {
@@ -683,9 +957,9 @@ static void iniinclude(IniParser *p, IniLine *l)
     }
     l->type = INI_INCLUDE;
 
-    if (iniurl(l->value)) {
-        Str msg = "URL includes are not supported yet";
-        inireport(p, INI_WARNING, l->valbeg, msg);
+    IniFile *f = p->file;
+    if (iniurl(l->value) || iniurl(f->path)) {
+        iniweb(p, l);
         return;
     } else if (inidevice(l->value)) {
         inireport(p, INI_WARNING, l->valbeg, "device paths are not supported");
@@ -694,43 +968,14 @@ static void iniinclude(IniParser *p, IniLine *l)
         return;  // text only
     }
 
-    // Messages are formatted only when they will be kept
-    IniFile *f    = p->file;
-    Str      path = inipath(p->perm, inidir(f->path), l->value);
-    Str      msg  = {};
-    for (IniFile *a = f; a; a = a->parent) {
-        if (a->path == path) {
-            if (!inimuted(p)) {
-                msg = concat(p->perm, "include cycle: ", path);
-            }
-            inireport(p, INI_WARNING, l->valbeg, msg);
-            return;
-        }
-    }
-
-    if (f->depth == INI_MAXDEPTH) {
-        if (!inimuted(p)) {
-            Buf b(p->perm, 48);
-            print(&b, "includes nested deeper than ");
-            print(&b, (i64)INI_MAXDEPTH);
-            msg = finish(&b);
-        }
-        inireport(p, INI_WARNING, l->valbeg, msg);
-        return;
-    } else if (p->ini->nfiles >= INI_MAXFILES) {
-        if (!inimuted(p)) {
-            Buf b(p->perm, 48);
-            print(&b, "more than ");
-            print(&b, (i64)INI_MAXFILES);
-            print(&b, " configuration files");
-            msg = finish(&b);
-        }
-        inireport(p, INI_WARNING, l->valbeg, msg);
+    Str path = inipath(p->perm, inidir(f->path), l->value);
+    if (!inifollow(p, l, path)) {
         return;
     }
 
     Read r = os_read(p->os, p->perm, path, inibudget(p->ini));
     if (r.err) {
+        Str msg = {};
         if (!inimuted(p)) {
             Buf b(p->perm, 64);
             print(&b, "cannot read include ");
@@ -741,11 +986,7 @@ static void iniinclude(IniParser *p, IniLine *l)
         inireport(p, INI_WARNING, l->valbeg, msg);
         return;
     }
-    IniFile *inc = ininewfile(p->ini, p->perm, path, r.data);
-    inc->parent = f;
-    inc->via    = l;
-    inc->depth  = f->depth + 1;
-    iniparsefile(p->ini, p->os, p->perm, inc);
+    iniopen(p, l, path, r.data);
 }
 
 // A key line whose first non-blank byte is raw[beg].

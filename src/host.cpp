@@ -1274,7 +1274,8 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         os_print(os, 2, "harness: --idle must be a number of seconds above 0\n");
         return 2;
     }
-    Config *cfg = cliconfig(os, &perm, scratch, config);
+    Str     statedir = state.len ? state : defaultstate(os, &perm);
+    Config *cfg      = cliconfig(os, &perm, scratch, config, statedir);
     if (!cfg) {
         return 2;
     }
@@ -1283,7 +1284,7 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     h->os       = os;
     h->cfg      = cfg;
     h->proto    = HOST_PROTO;
-    h->statedir = state.len ? state : defaultstate(os, &perm);
+    h->statedir = statedir;
     Str run = join(&perm, h->statedir, "run");
     Str sessions = join(&perm, h->statedir, "sessions");
     if (!os_mkdirs(os, scratch, sessions) || !os_mkdirs(os, scratch, run)) {

@@ -28,6 +28,33 @@
 // that changes. A load builds a new Ini in the other of two regions,
 // so whatever outlives a load must be copied before the next one.
 //
+// URL includes ("include = https://host/team.ini", or with a pin,
+// "include = URL sha256=HEX") load from a cache, <state>/includes/<the
+// URL's SHA-256 in hex>, which holds the URL, the fetch time, the ETag
+// and Last-Modified validators, then the text. A load never touches the
+// network; fetches fill the cache, and a fetch that changes what a load
+// would see reloads:
+//
+// - At startup (newconfig with fetch), a URL with no usable cached copy
+//   is fetched while the caller waits, 30 s at most for all of them,
+//   nested includes too. One with a copy loads from it, and the engine
+//   refreshes it in the background once it starts.
+// - While running, a URL is fetched again at most every 10 minutes,
+//   when the engine has work, and at once on config.get {refresh:1},
+//   whose reply waits for the fetches. Refreshes are conditional GETs.
+// - A fetch connects within 10 s, ends within 30 s, follows at most 5
+//   redirects (never from https to http), and takes at most 1 MiB. Up
+//   to 4 run at once. A failure keeps the cached copy, with a warning at
+//   the include line saying why and how old the copy is; with no copy,
+//   the include is skipped with a warning.
+// - A pin is the SHA-256 of the text. A fetched text that does not match
+//   is an error and is ignored, never cached, so a cached copy that does
+//   match stays in use; a cached copy that does not match is never used.
+//
+// Nothing a configuration says runs a command, and an included file's
+// plaintext secrets are ignored, so a shared file, local or from the
+// web, can at most point the harness at endpoints and models.
+//
 // Protocol, as engine.cpp answers it ("..." elides values):
 //
 //   {"cmd":"config.get","id":N}
@@ -43,8 +70,14 @@
 //               "local":"","choices":[],"group":"endpoint",
 //               "desc":"..."}, ...],
 //    "kinds":[{"kind":"endpoint","named":1,"desc":"..."}, ...],
+//    "includes":[{"url":"https://team.example/h.ini","pin":"",
+//                 "sha256":"...","fetched":T,"fetching":0,
+//                 "error":""}, ...],
 //    "diags":[{"file":"...","line":7,"col":1,"severity":"warning",
 //              "message":"..."}, ...]}
+//
+//   {"cmd":"config.get","id":N,"refresh":1}
+//   (the same reply, once every URL include is fetched afresh)
 //
 //   {"cmd":"config.set","id":N,"kind":"endpoint","name":"local",
 //    "key":"idle_timeout","value":"120"}
@@ -61,11 +94,16 @@
 // [model], [role] and [remote] section that exists, in schema order. A
 // value is the one in effect as written, or its default ("default":1,
 // with file "" and line 0, or where the key is set empty); "valid":0
-// marks one ignored for its default. An endpoint's timeouts default by
-// whether its URL is local (the schema's "local" defaults). A plaintext
-// secret is reported as "(hidden)", so no reply ever carries one. The
-// schema's types are string, int, number, seconds, bool, enum, url,
-// secret (env:NAME), list (words of choices) and paths (separated by ;).
+// marks one ignored for its default. A file may be a URL, and then the
+// setting also has "fetched", when its cached copy was fetched (Unix
+// epoch ms). Includes list the URL includes of the load: the pin
+// written, the SHA-256 of the copy in use, when it was fetched (0 for no
+// copy), whether a fetch is under way or due, and why the latest one
+// failed ("" if it did not). An endpoint's timeouts default by whether
+// its URL is local (the schema's "local" defaults). A plaintext secret
+// is reported as "(hidden)", so no reply ever carries one. The schema's
+// types are string, int, number, seconds, bool, enum, url, secret
+// (env:NAME), list (words of choices) and paths (separated by ;).
 //
 // In config.set, kind and name "" (or absent) are the top level, and a
 // null value removes the key. The reply's line is where the key now is
@@ -288,7 +326,76 @@ enum : i32 {
 };
 
 enum : i64 {
-    CFG_POLL = 1000000,  // os_ticks between checks for changed files
+    CFG_POLL      = 1000000,      // os_ticks between checks for changed files
+    CFG_FETCHTIME = 30*1000000,   // os_ticks a fetch may take, redirects too
+    CFG_REFRESH   = 600*1000000,  // os_ticks between refreshes, by default
+    CFG_GRACE     = 2*1000000,    // os_ticks for a cancelled fetch to end
+};
+
+enum {
+    CFG_FETCHMAX  = 1 << 20,  // bytes of a fetched include
+    CFG_CONNECTMS = 10000,
+    CFG_REDIRECTS = 5,
+    CFG_FETCHES   = 4,        // fetches at once
+};
+
+// How a Config may use the network for URL includes.
+enum : i32 {
+    CFG_NETNONE,  // never: cached copies only
+    CFG_NETWAIT,  // at startup: fetch what has no copy, and wait for it
+    CFG_NETLIVE,  // in the engine: fetch in the background, and refresh
+};
+
+struct CfgSlot;
+
+// A URL included in some load, kept for the Config's lifetime.
+struct CfgUrl {
+    CfgUrl  *next;
+    Str      url;        // canonical (iniurlclean)
+    CfgSlot *slot;       // its fetch under way, or null
+    i64      seen;       // the rev of the latest load that included it
+    i64      attempted;  // os_ticks when its latest fetch started
+    i64      failedat;   // os_time of its latest fetch, if that failed
+    i64      fetched;    // os_time of the copy in use, 0 if none
+    Str      want;       // the pin in the latest load, or null
+    Str      pin;        // the pin its latest fetch checked, or null
+    Str      sha;        // SHA-256 of its cached copy, or null
+    b32      tried;      // a fetch started since the Config was made
+    b32      due;        // to fetch when a slot is free
+    b32      cached;     // the latest load used a cached copy
+    b32      pinbad;     // its latest fetch failed its pin
+    iz       errlen;
+    u8       err[240];   // why its latest fetch failed, if it did
+};
+
+// A fetch under way, which may follow redirects.
+struct CfgSlot {
+    CfgUrl *u;           // null when free
+    Http   *http;        // null if the request could not start
+    u64     id;
+    i64     began;       // os_ticks
+    i64     deadline;    // os_ticks: cancelled then
+    i64     cutoff;      // os_ticks it ran until cancelled, 0 if not
+    i32     redirects;
+    i32     status;
+    Str     pin;         // to check, in pinbuf
+    u8      pinbuf[64];
+    Str     at;          // the URL requested, after redirects, in atbuf
+    u8      atbuf[2048];
+    Str     oldetag;     // validators of the cached copy, if usable
+    u8      oldetagbuf[256];
+    Str     oldmod;
+    u8      oldmodbuf[64];
+    Str     etag;        // the response's validators
+    u8      etagbuf[256];
+    Str     mod;
+    u8      modbuf[64];
+    Str     location;    // a redirect's, in locbuf; null if missing or long
+    u8      locbuf[2048];
+    Str     err;         // why the request could not start, in errbuf
+    u8      errbuf[256];
+    u8     *body;        // CFG_FETCHMAX bytes
+    iz      len;
 };
 
 struct Config {
@@ -304,6 +411,20 @@ struct Config {
     u64         stamp;       // fingerprint at the last load, 0 to reload
     i64         polled;      // os_ticks of the last check
     i64         rev;         // loads so far
+
+    // URL includes
+    Str         cache;       // <state>/includes, null for none
+    i32         net;         // CFG_NETNONE, CFG_NETWAIT or CFG_NETLIVE
+    Mailbox    *mbox;        // for the fetches' records
+    Region     *keepregion;  // backs keep
+    Arena       keep;        // URLs and slots, for the Config's lifetime
+    CfgUrl     *urls;        // in order of first inclusion
+    CfgUrl     *lasturl;
+    CfgSlot    *slots;       // CFG_FETCHES, made with the first fetch
+    u64         nextid;
+    i64         every;       // os_ticks between refreshes while live
+    i64         waitby;      // os_ticks: no fetch at startup goes past it
+    i64         loading;     // the rev of the load under way
 };
 
 
@@ -811,6 +932,710 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
 }
 
 
+// SHA-256, for pins and cache file names
+
+static u32 cfgrotr(u32 x, i32 n)
+{
+    return x>>n | x<<(32 - n);
+}
+
+static void cfgshablock(u32 *h, u8 *p)
+{
+    static u32 const k[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b,
+        0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
+        0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7,
+        0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152,
+        0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
+        0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
+        0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f,
+        0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    };
+    u32 w[64];
+    for (i32 i = 0; i < 16; i++) {
+        w[i] = (u32)p[4*i]<<24 | (u32)p[4*i+1]<<16 | (u32)p[4*i+2]<<8 |
+               (u32)p[4*i+3];
+    }
+    for (i32 i = 16; i < 64; i++) {
+        u32 s0 = cfgrotr(w[i-15], 7) ^ cfgrotr(w[i-15], 18) ^ w[i-15]>>3;
+        u32 s1 = cfgrotr(w[i-2], 17) ^ cfgrotr(w[i-2], 19) ^ w[i-2]>>10;
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+
+    u32 v[8];  // a through h
+    for (i32 i = 0; i < 8; i++) {
+        v[i] = h[i];
+    }
+    for (i32 i = 0; i < 64; i++) {
+        u32 a  = v[0];
+        u32 e  = v[4];
+        u32 s1 = cfgrotr(e, 6) ^ cfgrotr(e, 11) ^ cfgrotr(e, 25);
+        u32 ch = (e & v[5]) ^ (~e & v[6]);
+        u32 t1 = v[7] + s1 + ch + k[i] + w[i];
+        u32 s0 = cfgrotr(a, 2) ^ cfgrotr(a, 13) ^ cfgrotr(a, 22);
+        u32 mj = (a & v[1]) ^ (a & v[2]) ^ (v[1] & v[2]);
+        for (i32 j = 7; j > 0; j--) {
+            v[j] = v[j-1];
+        }
+        v[4] += t1;
+        v[0]  = t1 + s0 + mj;
+    }
+    for (i32 i = 0; i < 8; i++) {
+        h[i] += v[i];
+    }
+}
+
+// SHA-256 of s, as 64 lowercase hex digits.
+static Str cfgsha256(Arena *perm, Str s)
+{
+    u32 h[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    };
+    iz full = s.len - s.len%64;
+    for (iz i = 0; i < full; i += 64) {
+        cfgshablock(h, s.data+i);
+    }
+    u8 tail[128] = {};
+    iz rest = s.len - full;
+    iz n    = rest<56 ? 64 : 128;
+    copybytes(tail, s.data+full, rest);
+    tail[rest] = 0x80;
+    u64 bits = (u64)s.len * 8;
+    for (i32 i = 0; i < 8; i++) {
+        tail[n-1-i] = (u8)(bits >> (8*i));
+    }
+    for (iz i = 0; i < n; i += 64) {
+        cfgshablock(h, tail+i);
+    }
+
+    Buf b(perm, 64);
+    for (i32 i = 0; i < 8; i++) {
+        printhex(&b, h[i], 8);
+    }
+    return finish(&b);
+}
+
+
+// URL includes
+//
+// The reader asks for an include's text through cfgsource, which reads
+// the cache only. Fetches run in slots, each request on a platform
+// thread posting to the Config's mailbox: its own at startup, where
+// newconfig waits on it (cfgwait), then the engine's (cfgattach), whose
+// thread hands over the records (cfgrecord) and wakes for deadlines
+// (cfgnext, cfgtimeout). A fetch that ends with something new for a
+// load reloads, and every load marks what is due and starts it, so
+// nested includes follow their parents.
+
+static i32  get32(Str);
+static void cfgload(Config *, Arena);
+
+// An age in milliseconds as "5 seconds", "1 minute", "3 hours" or "2
+// days": whole units, the largest that fits.
+static void printcfgage(Buf *b, i64 ms)
+{
+    static Str const names[] = {"second", "minute", "hour", "day"};
+    static i64 const sizes[] = {1000, 60*1000, 3600*1000, 86400*1000};
+    i32 u = 3;
+    for (; u>0 && ms<sizes[u]; u--) {}
+    i64 n = (ms<0 ? 0 : ms) / sizes[u];
+    print(b, n);
+    putbyte(b, ' ');
+    print(b, names[u]);
+    if (n != 1) {
+        putbyte(b, 's');
+    }
+}
+
+// A cached copy, as stored: "harness include 1", then "key value" lines
+// for url, fetched (Unix epoch ms), and the etag and modified validators
+// when the server gave them, a blank line, and the text.
+struct CfgCache {
+    Str url;
+    Str etag;
+    Str mod;
+    Str body;
+    i64 fetched;
+    b32 ok;
+};
+
+static Str cfgcachepath(Config *c, Arena *a, Str url)
+{
+    return join(a, c->cache, cfgsha256(a, url));
+}
+
+// The cached copy of a URL, if the cache has a well-formed one.
+static CfgCache cfgreadcache(Config *c, Arena *perm, Str url)
+{
+    CfgCache r = {};
+    if (!c->cache.len) {
+        return r;
+    }
+    Str  path = cfgcachepath(c, perm, url);
+    Read rd   = os_read(c->os, perm, path, CFG_FETCHMAX + (1<<14));
+    if (rd.err) {
+        return r;
+    }
+    Cut line = cut(rd.data, '\n');
+    if (!(line.head == "harness include 1")) {
+        return r;
+    }
+    for (;;) {
+        line = cut(line.tail, '\n');
+        if (!line.ok) {
+            return r;  // no blank line: cut short
+        } else if (!line.head.len) {
+            break;
+        }
+        Cut kv = cut(line.head, ' ');
+        if (kv.head == "url") {
+            r.url = kv.tail;
+        } else if (kv.head == "fetched") {
+            r.fetched = parseint(kv.tail).val;
+        } else if (kv.head == "etag") {
+            r.etag = kv.tail;
+        } else if (kv.head == "modified") {
+            r.mod = kv.tail;
+        }
+    }
+    r.body = line.tail.data ? line.tail : Str("");
+    r.ok   = r.url==url && r.body.len<=CFG_FETCHMAX;
+    return r;
+}
+
+// Replace a URL's cached copy atomically.
+static b32 cfgwritecache(Config *c, Arena scratch, CfgCache *k)
+{
+    iz  cap = 256 + k->url.len + k->etag.len + k->mod.len + k->body.len;
+    Buf b(&scratch, cap);
+    print(&b, "harness include 1\nurl ");
+    print(&b, k->url);
+    print(&b, "\nfetched ");
+    print(&b, k->fetched);
+    if (k->etag.len) {
+        print(&b, "\netag ");
+        print(&b, k->etag);
+    }
+    if (k->mod.len) {
+        print(&b, "\nmodified ");
+        print(&b, k->mod);
+    }
+    print(&b, "\n\n");
+    print(&b, k->body);
+    Str text = finish(&b);
+    Str path = cfgcachepath(c, &scratch, k->url);
+    return os_mkdirs(c->os, scratch, c->cache) &&
+           os_write(c->os, scratch, path, text);
+}
+
+// A URL's record, or with add a new one at the end. Null if there is
+// none, or no room.
+static CfgUrl *cfgurl(Config *c, Str url, b32 add)
+{
+    for (CfgUrl *u = c->urls; u; u = u->next) {
+        if (u->url == url) {
+            return u;
+        }
+    }
+    if (!add || !fits(&c->keep, (iz)sizeof(CfgUrl) + url.len + 64)) {
+        return 0;
+    }
+    CfgUrl *u = alloc<CfgUrl>(&c->keep);
+    u->url = clone(&c->keep, url);
+    if (c->lasturl) {
+        c->lasturl->next = u;
+    } else {
+        c->urls = u;
+    }
+    c->lasturl = u;
+    return u;
+}
+
+// Keep a copy of s, a pin or a hash, in *dst unless it is there already.
+static void cfgkeep(Config *c, Str *dst, Str s)
+{
+    if (*dst == s && !dst->data==!s.data) {
+        return;
+    } else if (!s.data) {
+        *dst = {};
+    } else if (fits(&c->keep, s.len)) {
+        *dst = clone(&c->keep, s);
+    }
+}
+
+// Copy s into a slot's buffer of cap bytes as *dst, or set *dst null
+// and return 0 if it is empty or too long.
+static b32 cfghold(Str *dst, u8 *buf, iz cap, Str s)
+{
+    *dst = {};
+    if (!s.len || s.len>cap) {
+        return 0;
+    }
+    copybytes(buf, s.data, s.len);
+    *dst = {buf, s.len};
+    return 1;
+}
+
+// The text of a URL include for the reader (Ini.fetch): its cached copy
+// if there is one, and it matches the pin, with a diagnostic if the
+// latest fetch failed; otherwise none, saying why.
+static IniSource cfgsource(void *ctx, Arena *perm, Str url, Str pin)
+{
+    Config   *c = (Config *)ctx;
+    IniSource r = {};
+    r.severity  = INI_WARNING;
+    CfgUrl   *u = c->cache.len ? cfgurl(c, url, 1) : 0;
+    if (!u) {
+        Buf b(perm, 64 + url.len);
+        print(&b, "cannot include ");
+        print(&b, url);
+        print(&b, c->cache.len ? Str(" (too many URLs)")
+                               : Str(" (no state directory for a cache)"));
+        r.msg = finish(&b);
+        return r;
+    }
+    u->seen = c->loading;
+    cfgkeep(c, &u->want, pin);
+
+    CfgCache k   = cfgreadcache(c, perm, url);
+    Str      sha = k.ok ? cfgsha256(perm, k.body) : Str{};
+    b32      use = k.ok && (!pin.data || sha==pin);
+    u->cached  = use;
+    u->fetched = use ? k.fetched : 0;
+    cfgkeep(c, &u->sha, use ? sha : Str{});
+
+    // A failure since the copy was fetched (by this process or another),
+    // unless against another pin
+    b32 failed = u->errlen && (!use || u->failedat>=k.fetched) &&
+                 (!u->pinbad || u->pin==pin);
+    Buf b(perm, 256 + url.len);
+    if (failed && u->pinbad) {
+        r.severity = INI_ERROR;
+        print(&b, url);
+        print(&b, " does not match its pin: ");
+        print(&b, Str{u->err, u->errlen});
+    } else if (failed) {
+        print(&b, "cannot fetch ");
+        print(&b, url);
+        print(&b, " (");
+        print(&b, Str{u->err, u->errlen});
+        putbyte(&b, ')');
+    } else if (!use && k.ok) {
+        print(&b, "the cached copy of ");
+        print(&b, url);
+        print(&b, " does not match its pin");
+    } else if (!use) {
+        print(&b, url);
+        print(&b, " is not fetched yet");
+    }
+    if (b.len && use) {
+        print(&b, "; using the copy fetched ");
+        printcfgage(&b, os_time(c->os) - k.fetched);
+        print(&b, " ago");
+    } else if (b.len) {
+        print(&b, ", include skipped");
+    }
+    r.msg  = b.len ? finish(&b) : Str{};
+    r.data = use ? k.body : Str{};
+    return r;
+}
+
+// A free slot, made with the first fetch, or null.
+static CfgSlot *cfgfreeslot(Config *c)
+{
+    if (!c->slots) {
+        iz need = CFG_FETCHES*((iz)sizeof(CfgSlot) + CFG_FETCHMAX + 64);
+        if (!fits(&c->keep, need)) {
+            return 0;
+        }
+        c->slots = alloc<CfgSlot>(&c->keep, CFG_FETCHES);
+        for (i32 i = 0; i < CFG_FETCHES; i++) {
+            c->slots[i].body = allocbytes(&c->keep, CFG_FETCHMAX);
+        }
+    }
+    for (i32 i = 0; i < CFG_FETCHES; i++) {
+        if (!c->slots[i].u) {
+            return &c->slots[i];
+        }
+    }
+    return 0;
+}
+
+// Request a slot's URL (at), or should the request not start, arrange
+// for it to fail at the next cfgtimeout.
+static void cfgsend(Config *c, CfgSlot *s, Arena scratch)
+{
+    i64 now  = os_ticks(c->os);
+    i64 left = (s->deadline - now) / 1000;
+    i64 most = CFG_CONNECTMS;
+    Buf h(&scratch, 1024);
+    print(&h, "User-Agent: harness/" HARNESS_VERSION "\r\nAccept: */*\r\n");
+    if (s->oldetag.len) {
+        print(&h, "If-None-Match: ");
+        print(&h, s->oldetag);
+        print(&h, "\r\n");
+    }
+    if (s->oldmod.len) {
+        print(&h, "If-Modified-Since: ");
+        print(&h, s->oldmod);
+        print(&h, "\r\n");
+    }
+
+    HttpReq r = {};
+    r.method    = "GET";
+    r.url       = s->at;
+    r.headers   = finish(&h);
+    r.connectms = (i32)(left<1 ? 1 : left<most ? left : most);
+    r.readms    = 0;  // the deadline covers it
+    r.maxbytes  = CFG_FETCHMAX;
+    r.mbox      = c->mbox;
+    r.id        = s->id = (u64)1<<63 | ++c->nextid;
+    s->status   = 0;
+    s->len      = 0;
+    s->etag     = {};
+    s->mod      = {};
+    s->location = {};
+    s->http     = os_http(c->os, &r, scratch);
+    if (!s->http) {
+        Str why = os_lasterr(c->os, &scratch);
+        why = takehead(why, why.len<countof(s->errbuf) ? why.len : countof(s->errbuf));
+        cfghold(&s->err, s->errbuf, countof(s->errbuf), why);
+        s->deadline = now;
+    }
+}
+
+// Start fetching a URL in a free slot. The validators of a cached copy
+// make it conditional, if the copy would be used.
+static void cfgstart(Config *c, CfgSlot *s, CfgUrl *u, Arena scratch)
+{
+    i64 now = os_ticks(c->os);
+    s->u         = u;
+    s->http      = 0;
+    s->began     = now;
+    s->deadline  = now + CFG_FETCHTIME;
+    s->cutoff    = 0;
+    s->redirects = 0;
+    s->oldetag   = {};
+    s->oldmod    = {};
+    s->err       = {};
+    if (c->net==CFG_NETWAIT && c->waitby<s->deadline) {
+        s->deadline = c->waitby;
+    }
+    u->slot      = s;
+    u->due       = 0;
+    u->tried     = 1;
+    u->attempted = now;
+    cfgkeep(c, &u->pin, u->want);
+    cfghold(&s->pin, s->pinbuf, countof(s->pinbuf), u->want);
+
+    CfgCache k = cfgreadcache(c, &scratch, u->url);
+    if (k.ok && (!s->pin.len || cfgsha256(&scratch, k.body)==s->pin)) {
+        cfghold(&s->oldetag, s->oldetagbuf, countof(s->oldetagbuf), k.etag);
+        cfghold(&s->oldmod, s->oldmodbuf, countof(s->oldmodbuf), k.mod);
+    }
+    if (!cfghold(&s->at, s->atbuf, countof(s->atbuf), u->url)) {
+        cfghold(&s->err, s->errbuf, countof(s->errbuf), "URL too long");
+        s->deadline = now;
+        return;
+    }
+    cfgsend(c, s, scratch);
+}
+
+// Start due fetches while slots are free, and at startup only until
+// the wait is over.
+static void cfgpump(Config *c, Arena scratch)
+{
+    for (CfgUrl *u = c->urls; u; u = u->next) {
+        if (!u->due || u->slot) {
+            continue;
+        } else if (u->seen != c->rev) {
+            u->due = 0;  // no longer included
+            continue;
+        } else if (c->net==CFG_NETWAIT && os_ticks(c->os)>=c->waitby) {
+            return;
+        }
+        CfgSlot *s = cfgfreeslot(c);
+        if (!s && !c->slots) {
+            u->due = 0;  // no memory for fetches
+            continue;
+        } else if (!s) {
+            return;
+        }
+        cfgstart(c, s, u, scratch);
+    }
+}
+
+// Mark the current load's URL includes due for a fetch, then start what
+// slots allow. Due: one not fetched since the Config was made, or one
+// without a usable copy whose pin changed since its last fetch; while
+// live, also every one with force, and each once its interval is over;
+// at startup, only those without a usable copy. Without the network or
+// a cache, nothing is.
+static void cfgrefresh(Config *c, Arena scratch, b32 force)
+{
+    if (c->net==CFG_NETNONE || !c->cache.len) {
+        return;
+    }
+    i64 now = os_ticks(c->os);
+    for (CfgUrl *u = c->urls; u; u = u->next) {
+        if (u->seen!=c->rev || u->slot) {
+            continue;
+        }
+        b32 due = !u->tried || (!u->cached && !(u->want==u->pin));
+        if (c->net == CFG_NETLIVE) {
+            due |= force || now-u->attempted>=c->every;
+        } else {
+            due &= !u->cached;
+        }
+        u->due |= due;
+    }
+    cfgpump(c, scratch);
+}
+
+// End a slot's request: follow a redirect, or record the outcome, free
+// the slot, start what is due, and reload if a load would see anything
+// new: other text, a failure that began or ended, or a pin newly met.
+static void cfgdone(Config *c, CfgSlot *s, Arena scratch, i32 err, Str text)
+{
+    CfgUrl *u       = s->u;
+    i64     now     = os_time(c->os);
+    i32     st      = s->status;
+    b32     moved   = st==301 || st==302 || st==303 || st==307 || st==308;
+    Str     why     = {};  // null on success
+    Str     sha     = {};  // of new text
+    b32     pinbad  = 0;
+    if (s->http) {
+        os_httpfree(c->os, s->http);
+        s->http = 0;
+    }
+
+    if (s->cutoff) {
+        Buf b(&scratch, 64);
+        print(&b, "timed out after ");
+        printcfgage(&b, (s->cutoff + 500000)/1000000*1000);
+        why = finish(&b);
+    } else if (err == HTTP_ETOOBIG) {
+        why = "larger than 1 MiB";
+    } else if (err != HTTP_OK) {
+        why = trim(text).len ? trim(text) : Str("the connection failed");
+    } else if (moved) {
+        Str next = {};
+        if (s->location.len) {
+            next = iniurlresolve(&scratch, s->at, s->location);
+        }
+        if (s->redirects == CFG_REDIRECTS) {
+            why = "more than 5 redirects";
+        } else if (!next.data) {
+            why = "redirected without an http or https URL";
+        } else if (startswith(s->at, "https:") && startswith(next, "http:")) {
+            why = "redirected from https to http";
+        } else if (!cfghold(&s->at, s->atbuf, countof(s->atbuf), next)) {
+            why = "redirected to a URL too long";
+        } else {
+            s->redirects++;
+            cfgsend(c, s, scratch);
+            return;
+        }
+    } else if (st==304 && (s->oldetag.len || s->oldmod.len)) {
+        CfgCache k = cfgreadcache(c, &scratch, u->url);
+        k.fetched = now;
+        k.etag    = s->etag.len ? s->etag : k.etag;
+        k.mod     = s->mod.len ? s->mod : k.mod;
+        if (!k.ok) {
+            why = "not modified, but its cached copy is gone";
+        } else if (!cfgwritecache(c, scratch, &k)) {
+            why = "cannot write its cached copy";
+        }
+    } else if (st == 200) {
+        Str body = {s->body, s->len};
+        sha = cfgsha256(&scratch, body);
+        if (s->pin.len && !(sha == s->pin)) {
+            why    = concat(&scratch, "its sha256 is ", sha);
+            pinbad = 1;
+        } else {
+            CfgCache k = {};
+            k.url     = u->url;
+            k.etag    = s->etag;
+            k.mod     = s->mod;
+            k.body    = body;
+            k.fetched = now;
+            if (!cfgwritecache(c, scratch, &k)) {
+                why = "cannot write its cached copy";
+            }
+        }
+    } else {
+        Buf b(&scratch, 32);
+        print(&b, "HTTP ");
+        print(&b, (i64)st);
+        why = finish(&b);
+    }
+
+    Str olderr = clone(&scratch, {u->err, u->errlen});
+    b32 oldpin = u->pinbad;
+    b32 reload = 0;
+    if (why.data) {
+        why = takehead(why, why.len<countof(u->err) ? why.len : countof(u->err));
+        copybytes(u->err, why.data, why.len);
+        u->errlen   = why.len;
+        u->failedat = now;
+        u->pinbad   = pinbad;
+    } else {
+        reload      = !u->cached || (sha.data && !(sha == u->sha));
+        u->errlen   = 0;
+        u->failedat = 0;
+        u->pinbad   = 0;
+        u->fetched  = now;
+        if (sha.data) {
+            cfgkeep(c, &u->sha, sha);
+        }
+    }
+    reload |= !(olderr == Str{u->err, u->errlen}) || oldpin!=u->pinbad;
+    s->u    = 0;
+    u->slot = 0;
+    cfgpump(c, scratch);
+    if (reload) {
+        cfgload(c, scratch);
+    }
+}
+
+// Take a record of a fetch from the Config's mailbox. Returns 0 if it
+// is not one, by its id. Ending a fetch may reload.
+static b32 cfgrecord(Config *c, Arena scratch, Record r)
+{
+    if (!(r.id >> 63)) {
+        return 0;
+    }
+    CfgSlot *s = 0;
+    for (i32 i = 0; c->slots && i < CFG_FETCHES; i++) {
+        CfgSlot *t = &c->slots[i];
+        s = t->u && t->http && t->id==r.id ? t : s;
+    }
+    if (!s) {
+        return 1;  // of a request given up on
+    }
+
+    switch (r.type) {
+    case HTTP_HEAD: {
+        Str head = cuthead(r.data, 4);
+        s->status = get32(r.data);
+        for (Str rest = head; rest.len;) {
+            Cut line = cut(rest, '\n');
+            Cut kv   = cut(line.head, ':');
+            Str name = trim(kv.head);
+            Str v    = trim(kv.tail);
+            rest = line.tail;
+            if (!kv.ok) {
+                continue;  // WinHTTP's status line
+            } else if (equalfold(name, "location")) {
+                cfghold(&s->location, s->locbuf, countof(s->locbuf), v);
+            } else if (equalfold(name, "etag")) {
+                cfghold(&s->etag, s->etagbuf, countof(s->etagbuf), v);
+            } else if (equalfold(name, "last-modified")) {
+                cfghold(&s->mod, s->modbuf, countof(s->modbuf), v);
+            }
+        }
+    } break;
+    case HTTP_BODY:
+        if (s->status==200 && r.data.len<=CFG_FETCHMAX-s->len) {
+            copybytes(s->body+s->len, r.data.data, r.data.len);
+            s->len += r.data.len;
+        }
+        break;
+    case HTTP_DONE:
+        cfgdone(c, s, scratch, get32(r.data), cuthead(r.data, 4));
+        break;
+    }
+    return 1;
+}
+
+// The earliest deadline of the fetches under way in os_ticks, or I64MAX
+// if none is.
+static i64 cfgnext(Config *c)
+{
+    i64 r = I64MAX;
+    for (i32 i = 0; c->slots && i < CFG_FETCHES; i++) {
+        CfgSlot *s = &c->slots[i];
+        r = s->u && s->deadline<r ? s->deadline : r;
+    }
+    return r;
+}
+
+// Cancel fetches at their deadlines, and end those that could not
+// start, or whose cancel went unanswered.
+static void cfgtimeout(Config *c, Arena scratch)
+{
+    for (i32 i = 0; c->slots && i < CFG_FETCHES; i++) {
+        CfgSlot *s   = &c->slots[i];
+        i64      now = os_ticks(c->os);
+        if (!s->u || s->deadline>now) {
+            continue;
+        } else if (!s->http) {
+            cfgdone(c, s, scratch, HTTP_ECONNECT, s->err);
+        } else if (!s->cutoff) {
+            s->cutoff   = now>s->began ? now-s->began : 1;
+            s->deadline = now + CFG_GRACE;
+            os_httpcancel(c->os, s->http);
+        } else {
+            cfgdone(c, s, scratch, HTTP_ECANCEL, {});
+        }
+    }
+}
+
+// Whether fetches are under way or due.
+static b32 cfgbusy(Config *c)
+{
+    if (cfgnext(c) != I64MAX) {
+        return 1;
+    }
+    for (CfgUrl *u = c->urls; u; u = u->next) {
+        if (u->due && u->seen==c->rev) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// At startup: wait for the fetches the first load started, and those
+// the loads they cause start, none past waitby.
+static void cfgwait(Config *c, Arena scratch)
+{
+    for (;;) {
+        i64 next = cfgnext(c);
+        if (next == I64MAX) {
+            return;
+        }
+        i64 wait = (next - os_ticks(c->os) + 999) / 1000;
+        if (wait > 0) {
+            mailwait(c->mbox, (i32)(wait<60000 ? wait : 60000));
+        }
+        Mail m = mailtake(c->mbox);
+        for (Record r; (r = mailnext(&m)).ok;) {
+            cfgrecord(c, scratch, r);
+        }
+        cfgtimeout(c, scratch);
+    }
+}
+
+// Hand fetching to the engine: records go to its mailbox, which it
+// gives to cfgrecord, and refreshes run in the background, each URL's
+// at most once every interval but on demand. A Config made without
+// fetching stays without.
+static void cfgattach(Config *c, Mailbox *mbox, i64 every)
+{
+    if (c->net != CFG_NETNONE) {
+        c->net   = CFG_NETLIVE;
+        c->mbox  = mbox;
+        c->every = every>0 ? every : CFG_REFRESH;
+    }
+}
+
+
 // Loading
 
 // The default location of the user's file, or null if there is none:
@@ -856,6 +1681,9 @@ static void cfgload(Config *c, Arena scratch)
     Ini     *ini  = alloc<Ini>(&a);
     IniFile *user = 0;
     Stat     pre  = {};
+    ini->fetch    = cfgsource;
+    ini->fetchctx = c;
+    c->loading    = c->rev + 1;
     if (c->path.len) {
         pre  = os_stat(c->os, scratch, c->path);
         user = iniload(ini, c->os, &a, c->path);
@@ -870,13 +1698,14 @@ static void cfgload(Config *c, Arena scratch)
     cfgvalidate(c, ini, user, &a);
 
     // The files to watch: the user's, and every include target, read
-    // or not, so that creating a missing one counts as a change
+    // or not, so that creating a missing one counts as a change. URLs
+    // are watched by refreshing them.
     Slice<Str> watch = {};
     if (c->path.len) {
         watch = push(&a, watch, c->path);
     }
     for (IniFile *f = ini->files; f; f = f->next) {
-        for (iz i = 0; i < f->lines.len; i++) {
+        for (iz i = 0; i<f->lines.len && !iniurl(f->path); i++) {
             IniLine *l = &f->lines[i];
             if (l->type==INI_INCLUDE && !iniurl(l->value) &&
                     !inidevice(l->value)) {
@@ -901,6 +1730,7 @@ static void cfgload(Config *c, Arena scratch)
             c->stamp = 0;
         }
     }
+    cfgrefresh(c, scratch, 0);
 }
 
 // Where writes to the user's file go: through a symbolic link to its
@@ -930,8 +1760,13 @@ static b32 cfgwriteseed(Config *c, Arena scratch)
 // seed, a missing file is first created from the seed. Bad or missing
 // files are diagnostics, never failures: null means only that memory
 // could not be reserved. The Config belongs to one thread at a time.
+//
+// URL includes are cached under statedir, and without one are skipped.
+// With fetch, those with no cached copy are fetched before this returns,
+// which takes 30 s at most, and cfgattach later hands fetching over to
+// the engine. Without, only cached copies are used.
 static Config *newconfig(Os *os, Arena *perm, Arena scratch, Str path,
-                         b32 seed)
+                         b32 seed, Str statedir = {}, b32 fetch = 0)
 {
     b32     big = sizeof(void *) == 8;
     iz      cap = big ? (iz)1<<28 : (iz)1<<26;
@@ -940,30 +1775,52 @@ static Config *newconfig(Os *os, Arena *perm, Arena scratch, Str path,
     c->seed       = seed;
     c->regions[0] = os_reserve(os, cap);
     c->regions[1] = os_reserve(os, cap);
-    if (!c->regions[0] || !c->regions[1]) {
+    c->keepregion = os_reserve(os, (iz)1<<24);
+    if (!c->regions[0] || !c->regions[1] || !c->keepregion) {
         if (c->regions[0]) os_release(os, c->regions[0]);
         if (c->regions[1]) os_release(os, c->regions[1]);
+        if (c->keepregion) os_release(os, c->keepregion);
         return 0;
     }
+    c->keep = newarena(c->keepregion);
     if (path.len) {
         c->path = inipath(perm, {}, path);
+    }
+    if (statedir.len) {
+        c->cache = join(perm, statedir, "includes");
+    }
+    if (fetch && c->cache.len) {
+        c->mbox   = newmailbox(perm, 1<<17, 0, 0);
+        c->net    = c->mbox ? CFG_NETWAIT : CFG_NETNONE;
+        c->waitby = os_ticks(os) + CFG_FETCHTIME;
     }
     if (seed && c->path.len &&
             os_stat(os, scratch, c->path).type==STAT_MISSING) {
         cfgwriteseed(c, scratch);
     }
     cfgload(c, scratch);
+    if (c->net == CFG_NETWAIT) {
+        cfgwait(c, scratch);
+    }
     return c;
 }
 
 static void cfgfree(Config *c)
 {
+    for (i32 i = 0; c->slots && i < CFG_FETCHES; i++) {
+        if (c->slots[i].http) {
+            os_httpcancel(c->os, c->slots[i].http);
+            os_httpfree(c->os, c->slots[i].http);
+        }
+    }
     os_release(c->os, c->regions[0]);
     os_release(c->os, c->regions[1]);
+    os_release(c->os, c->keepregion);
 }
 
 // Reload if any watched file changed since the last load, checking at
-// most once a second unless forced. Returns 1 after a reload.
+// most once a second unless forced, and start any URL refreshes due.
+// Returns 1 after a reload.
 static b32 cfgpoll(Config *c, Arena scratch, b32 force)
 {
     i64 now = os_ticks(c->os);
@@ -972,6 +1829,7 @@ static b32 cfgpoll(Config *c, Arena scratch, b32 force)
     }
     c->polled = now;
     if (c->stamp && cfgfingerprint(c->os, c->watch, scratch)==c->stamp) {
+        cfgrefresh(c, scratch, 0);
         return 0;
     }
     cfgload(c, scratch);
@@ -1151,8 +2009,33 @@ static void putcfgsection(JsonOut *w, Config *c, Str kind, Str name)
         putintkey(w, "line", e ? (i64)e->line->num : 0);
         putintkey(w, "default", (i64)isdflt);
         putintkey(w, "valid", (i64)valid);
+        CfgUrl *u = e && iniurl(e->file->path) ? cfgurl(c, e->file->path, 0) : 0;
+        if (u) {
+            putintkey(w, "fetched", u->fetched);
+        }
         putend(w);
     }
+}
+
+// The URL includes of the current load.
+static void putcfgincludes(JsonOut *w, Config *c)
+{
+    putkey(w, "includes");
+    putarray(w);
+    for (CfgUrl *u = c->urls; u; u = u->next) {
+        if (u->seen != c->rev) {
+            continue;
+        }
+        putobject(w);
+        putstrkey(w, "url", u->url);
+        putstrkey(w, "pin", u->want.data ? u->want : Str(""));
+        putstrkey(w, "sha256", u->sha.data ? u->sha : Str(""));
+        putintkey(w, "fetched", u->fetched);
+        putintkey(w, "fetching", (i64)(u->slot || u->due));
+        putstrkey(w, "error", Str{u->err, u->errlen});
+        putend(w);
+    }
+    putend(w);
 }
 
 // The payload of a config.get reply, after its id and ok.
@@ -1221,6 +2104,7 @@ static void putcfg(JsonOut *w, Config *c)
     }
     putend(w);
 
+    putcfgincludes(w, c);
     putcfgdiags(w, c);
 }
 

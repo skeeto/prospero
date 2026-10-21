@@ -2230,14 +2230,15 @@ static void drawclose(Gui *g)
 // Settings
 
 // "from harness.ini:12" from a path and line, or "default", which is
-// "default, empty at harness.ini:12" when set empty.
-static Str provenance(Arena *a, CfgRow *r)
+// "default, empty at harness.ini:12" when set empty. A URL include is
+// named in full, with the age of its copy as of now (Unix epoch ms).
+static Str provenance(Arena *a, CfgRow *r, i64 now)
 {
     if (!r->file.len) {
         return "default";
     }
     Str name = r->file;
-    for (iz i = name.len-1; i >= 0; i--) {
+    for (iz i = iniurl(name) ? -1 : name.len-1; i >= 0; i--) {
         if (name[i]=='/' || name[i]=='\\') {
             name = cuthead(name, i+1);
             break;
@@ -2248,6 +2249,11 @@ static Str provenance(Arena *a, CfgRow *r)
     print(&b, name);
     putbyte(&b, ':');
     print(&b, r->line);
+    if (r->fetched) {
+        print(&b, ", fetched ");
+        printcfgage(&b, now - r->fetched);
+        print(&b, " ago");
+    }
     return finish(&b);
 }
 
@@ -2323,7 +2329,8 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target)
         ImGui::TextUnformatted("invalid: default used");
         ImGui::PopStyleColor();
     } else {
-        ImGui::TextDisabled("%s", cstr0(&a, provenance(&a, r)));
+        Str from = provenance(&a, r, os_time(g->os));
+        ImGui::TextDisabled("%s", cstr0(&a, from));
     }
 }
 

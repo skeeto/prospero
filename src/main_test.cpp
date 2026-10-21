@@ -25,10 +25,24 @@ struct VLink {
     Str    to;    // absolute
 };
 
+// A canned HTTP response, for a GET of its URL.
+struct VRoute {
+    VRoute *next;
+    Str     url;
+    i32     status;
+    Str     headers;  // "Name: value\r\n" lines
+    Str     body;
+    Str     etag;     // sent, and a request with it gets 304
+    i32     err;      // HTTP_OK, or a failure after connecting
+};
+
 struct Os {
     Arena      mem;       // file contents and names live here
     VFile     *files;
     VLink     *links;     // symlinks, followed by os_realpath only
+    VRoute    *routes;    // HTTP responses by URL
+    Str        request;   // the headers of the latest HTTP request
+    i32        requests;  // os_http calls
     Str        locks[16]; // held lock files, by os_lockfile handle
     VFile     *logs[16];  // log handles index this table
     iz         nlogs;
@@ -346,8 +360,8 @@ static b32 os_lockheld(Os *os, Arena, Str path)
     return 0;
 }
 
-// No processes, HTTP, or standard input: the engine is tested end to
-// end by tests/scenarios.py against the real platforms.
+// No processes or standard input: the engine is tested end to end by
+// tests/scenarios.py against the real platforms.
 static Slice<Str> os_environ(Os *, Arena *) { return {}; }
 static iz    os_stdin(Os *, u8 *, iz) { return 0; }
 static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
@@ -355,7 +369,6 @@ static Proc *os_spawnio(Os *, Spawn *, Arena) { return 0; }
 static b32   os_procwrite(Os *, Proc *, Str) { return 0; }
 static void  os_kill(Os *, Proc *, b32) {}
 static void  os_procfree(Os *, Proc *) {}
-static Http *os_http(Os *, HttpReq *, Arena) { return 0; }
 static void  os_httpcancel(Os *, Http *) {}
 static void  os_httpfree(Os *, Http *) {}
 static Str   os_lasterr(Os *, Arena *) { return "not supported in tests"; }
@@ -368,6 +381,58 @@ static b32   os_connwrite(Os *, Conn *, Str) { return 0; }
 static void  os_connclose(Os *, Conn *) {}
 static Detached os_detach(Os *, Arena, Slice<Str>, Str, Str) { return {}; }
 static i32   os_pid(Os *) { return 1; }
+
+// A route's response, all of it posted before this returns, so the
+// mailbox must hold it. Without a route the request does not start.
+static Http *os_http(Os *os, HttpReq *req, Arena)
+{
+    os->requests++;
+    os->request = clone(&os->mem, req->headers);
+    VRoute *v = os->routes;
+    for (; v && !(v->url==req->url); v = v->next) {}
+    if (!v) {
+        return 0;
+    }
+
+    i32 err = v->err;
+    if (!err) {
+        b32 same = v->etag.len && find(req->headers, concat(&os->mem,
+                       concat(&os->mem, "If-None-Match: ", v->etag), "\r\n"))>=0;
+        i32 status = same ? 304 : v->status;
+        Buf h(&os->mem, 64 + v->headers.len + v->etag.len);
+        print(&h, Str{(u8 *)&status, 4});
+        print(&h, v->headers);
+        if (v->etag.len) {
+            print(&h, "ETag: ");
+            print(&h, v->etag);
+            print(&h, "\r\n");
+        }
+        mailpost(req->mbox, HTTP_HEAD, req->id, finish(&h), 1);
+        if (!same && v->body.len>req->maxbytes) {
+            err = HTTP_ETOOBIG;
+        } else if (!same && v->body.len) {
+            mailpost(req->mbox, HTTP_BODY, req->id, v->body, 1);
+        }
+    }
+    Buf d(&os->mem, 32);
+    print(&d, Str{(u8 *)&err, 4});
+    print(&d, err ? Str("refused") : Str(""));
+    mailpost(req->mbox, HTTP_DONE, req->id, finish(&d), 1);
+    return (Http *)v;
+}
+
+// Route GETs of url to a response.
+static VRoute *vroute(Os *os, Str url, i32 status, Str headers, Str body)
+{
+    VRoute *v = alloc<VRoute>(&os->mem);
+    v->url     = clone(&os->mem, url);
+    v->status  = status;
+    v->headers = clone(&os->mem, headers);
+    v->body    = body;
+    v->next    = os->routes;
+    os->routes = v;
+    return v;
+}
 
 // A fresh test platform with its own storage carved from the arena.
 static Os *newos(Arena *a, iz cap)
