@@ -154,6 +154,9 @@ enum : u32 {
     HTTP_HEAD,      // i32 status, then raw "Name: value\r\n" header lines
     HTTP_BODY,      // response body bytes, in order
     HTTP_DONE,      // i32 error (HTTP_OK or HTTP_E*), then a description
+    CONN_NEW,       // (M5) os_listen: a Conn pointer, a connection made
+    CONN_DATA,      // (M5) bytes a connection received, in order
+    CONN_EOF,       // (M5) the connection's input ended or broke
 };
 
 enum : i32 {
@@ -246,6 +249,57 @@ static b32     os_lockheld(Os *, Arena, Str path);
 
 static b32     os_openurl(Os *, Arena, Str url);
 static void    os_busy(Os *, i32 state);
+
+// (M5) Local endpoints: byte streams between processes of one user on
+// one machine, an AF_UNIX socket (POSIX) or a named pipe (Windows) that
+// nobody else may reach, nor anyone over the network. A connection works
+// as os_spawnio's child does: what it receives arrives as CONN_DATA
+// records, which wait for room in the mailbox and are never dropped,
+// then one CONN_EOF, and os_connwrite queues bytes that a thread of the
+// platform's writes in order, so that the caller never waits.
+struct Conn;
+struct Listener;
+// Where the host of a state directory listens, under the given name,
+// with the place made ready: a socket in its run directory, which only
+// the owner may enter (through a short link in /tmp where that path is
+// too long for a socket), or a pipe name for this user and directory.
+// Null on failure, explained by os_lasterr.
+static Str       os_endpoint(Os *, Arena *, Str statedir, Str name);
+// Listen at an endpoint that no live process holds. Each connection made
+// to it is posted as a CONN_NEW record whose payload is the Conn pointer,
+// with a fresh id that its CONN_DATA and CONN_EOF records then carry.
+// The caller owns a reference to each. Null on failure, explained by
+// os_lasterr, as when another process holds the endpoint.
+static Listener *os_listen(Os *, Arena scratch, Str endpoint, Mailbox *);
+// Stop listening, and free the endpoint for another process.
+static void      os_unlisten(Os *, Listener *);
+// Connect to an endpoint, with records carrying id. Null if nobody
+// listens there, or on failure (os_lasterr).
+static Conn     *os_connect(Os *, Arena scratch, Str endpoint, Mailbox *, u64 id);
+// Whether a process listens at the endpoint: connect, and hang up.
+static b32       os_listening(Os *, Arena scratch, Str endpoint);
+// Queue bytes for the connection, as os_procwrite: a null string ends
+// the output once the queue is written. Returns 0 if the output is
+// closed or broken, or too much is queued already.
+static b32       os_connwrite(Os *, Conn *, Str);
+// Break the connection at once, dropping whatever is queued, and drop
+// the caller's reference. Its CONN_EOF follows, if not posted already.
+static void      os_connclose(Os *, Conn *);
+
+// (M5) Start a program detached from this process and from whatever
+// would stop it with this one: in a session of its own between two
+// forks (POSIX), or with no console, in a process group of its own and
+// outside any job (Windows). Its input and output are null, and its
+// errors are appended to errpath. Should this process's job forbid
+// breaking away (an ssh session's), it starts in the job, attached. The
+// pid is 0 on failure, explained by os_lasterr.
+struct Detached {
+    i32 pid;
+    b32 attached;  // still in this process's job, and ending with it
+};
+static Detached  os_detach(Os *, Arena scratch, Slice<Str> argv, Str cwd, Str errpath);
+// (M5) This process's id.
+static i32       os_pid(Os *);
 
 // (M1) GUI builds: wake the GUI loop from any thread, coalesced.
 static void    os_wake(Os *);
@@ -345,6 +399,7 @@ static Arena newarena(Region *r)
 #include "ini.cpp"
 #include "mailbox.cpp"
 #include "events.cpp"
+#include "frame.cpp"
 #include "provider.cpp"
 #include "edit.cpp"
 #include "tools.cpp"
@@ -356,6 +411,8 @@ static Arena newarena(Region *r)
 #include "compact.cpp"
 #include "engine.cpp"
 #include "cli.cpp"
+#include "host.cpp"
+#include "remote.cpp"
 #include "selftest.cpp"
 #include "selftest_io.cpp"
 
@@ -364,6 +421,10 @@ static Str usage =
 "usage: harness [options]\n"
 "       harness run [options] PROMPT\n"
 "       harness --headless [options]\n"
+"       harness serve [options]\n"
+"       harness attach [--reconnect] [options]\n"
+"       harness hosts [--state DIR]\n"
+"       harness connect NAME | --ssh DEST | --local [options]\n"
 "  --version         print the version and exit\n"
 "  --selftest [URL]  run the platform integration tests, with HTTP\n"
 "                    tests against a fake provider at URL\n"
@@ -385,6 +446,14 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
         return climain(os, perm, scratch, args, nargs, 1);
     } else if (nargs>1 && args[1]=="--search") {
         return searchmain(os, perm, scratch, args, nargs);  // grep and glob
+    } else if (nargs>1 && args[1]=="serve") {
+        return servemain(os, perm, scratch, args, nargs);
+    } else if (nargs>1 && args[1]=="attach") {
+        return attachmain(os, perm, scratch, args, nargs);
+    } else if (nargs>1 && args[1]=="hosts") {
+        return hostsmain(os, perm, scratch, args, nargs);
+    } else if (nargs>1 && args[1]=="connect") {
+        return connectmain(os, perm, scratch, args, nargs);
     }
 
     for (i32 i = 1; i < nargs; i++) {

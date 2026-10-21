@@ -359,6 +359,15 @@ static Http *os_http(Os *, HttpReq *, Arena) { return 0; }
 static void  os_httpcancel(Os *, Http *) {}
 static void  os_httpfree(Os *, Http *) {}
 static Str   os_lasterr(Os *, Arena *) { return "not supported in tests"; }
+static Str   os_endpoint(Os *, Arena *, Str, Str) { return {}; }
+static Listener *os_listen(Os *, Arena, Str, Mailbox *) { return 0; }
+static void  os_unlisten(Os *, Listener *) {}
+static Conn *os_connect(Os *, Arena, Str, Mailbox *, u64) { return 0; }
+static b32   os_listening(Os *, Arena, Str) { return 0; }
+static b32   os_connwrite(Os *, Conn *, Str) { return 0; }
+static void  os_connclose(Os *, Conn *) {}
+static Detached os_detach(Os *, Arena, Slice<Str>, Str, Str) { return {}; }
+static i32   os_pid(Os *) { return 1; }
 
 // A fresh test platform with its own storage carved from the arena.
 static Os *newos(Arena *a, iz cap)
@@ -414,6 +423,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/ini_test.cpp"
 #include "test/mailbox_test.cpp"
 #include "test/events_test.cpp"
+#include "test/frame_test.cpp"
 #include "test/provider_test.cpp"
 #include "test/edit_test.cpp"
 #include "test/tools_test.cpp"
@@ -453,6 +463,7 @@ int main()
     test_ini(&t);
     test_mailbox(&t);
     test_events(&t);
+    test_frame(&t);
     test_provider(&t);
     test_edit(&t);
     test_tools(&t);

@@ -501,6 +501,30 @@ static Str defaultstate(Os *os, Arena *a)
     return join(a, join(a, home, ".local/state"), "harness");
 }
 
+// The configuration, its diagnostics reported on standard error: an
+// explicit file must exist, and the default one is seeded on first run.
+// Null on failure, reported.
+static Config *cliconfig(Os *os, Arena *perm, Arena scratch, Str config)
+{
+    Str     path = config.len ? config : cfgdefault(os, perm);
+    Config *cfg  = newconfig(os, perm, scratch, path, !config.len);
+    if (!cfg) {
+        os_print(os, 2, "harness: out of memory\n");
+        return 0;
+    } else if (config.len && !cfg->user) {
+        os_print(os, 2, "harness: cannot read the configuration file\n");
+        return 0;
+    }
+    for (iz i = 0; i < cfg->ini->diags.len; i++) {
+        Buf b(&scratch, 256);
+        print(&b, "harness: ");
+        print(&b, cfg->ini->diags[i]);
+        putbyte(&b, '\n');
+        os_print(os, 2, finish(&b));
+    }
+    return cfg;
+}
+
 static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 headless)
 {
     Cli c = {};
@@ -541,22 +565,9 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
         return 2;
     }
 
-    // An explicit file must exist; the default one is seeded on first run
-    Str     path = config.len ? config : cfgdefault(os, &perm);
-    Config *cfg  = newconfig(os, &perm, scratch, path, !config.len);
+    Config *cfg = cliconfig(os, &perm, scratch, config);
     if (!cfg) {
-        os_print(os, 2, "harness: out of memory\n");
         return 2;
-    } else if (config.len && !cfg->user) {
-        os_print(os, 2, "harness: cannot read the configuration file\n");
-        return 2;
-    }
-    for (iz i = 0; i < cfg->ini->diags.len; i++) {
-        Buf b(&scratch, 256);
-        print(&b, "harness: ");
-        print(&b, cfg->ini->diags[i]);
-        putbyte(&b, '\n');
-        os_print(os, 2, finish(&b));
     }
 
     c.statedir = state.len ? state : defaultstate(os, &perm);

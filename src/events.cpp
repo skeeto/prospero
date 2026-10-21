@@ -52,6 +52,7 @@ enum : i32 {
     EV_HELLO,
     EV_REPLY,
     EV_JOBOUT,
+    EV_REMOTE,  // (M5) a client library's connection to its host
     EV_COUNT,
 };
 
@@ -96,6 +97,7 @@ static EvInfo evinfo[] = {
     {"hello",      0, 0},
     {"reply",      0, 0},
     {"job.out",    0, 0},
+    {"remote",     0, 0},
 };
 static_assert(countof(evinfo) == EV_COUNT);
 
@@ -115,13 +117,14 @@ enum : i32 {
     CMD_QUIT,
     CMD_REWIND,
     CMD_JOBKILL,
+    CMD_STATUS,  // (M5) whether anything runs: for a host's idle exit
     CMD_COUNT,
 };
 
 static Str cmdnames[] = {
     "", "hello", "list", "new", "open", "close", "prompt", "steer",
     "cancel", "answer", "config.get", "config.set", "quit", "rewind",
-    "job.kill",
+    "job.kill", "status",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 

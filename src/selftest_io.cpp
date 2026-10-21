@@ -681,6 +681,136 @@ static void testlocks(Selftest *t, Arena scratch, Str dir)
     say(os, "locks done");
 }
 
+// Local endpoints: a listener, connections both ways, ends and breaks.
+
+struct ConnWatch {
+    Conn *c;       // a connection accepted, from CONN_NEW
+    u64   id;
+    Buf   got;     // its data, in order
+    b32   eof;
+};
+
+// Collect records for one connection until the condition holds or ms
+// pass. Returns 1 if it held. Another connection's records are dropped.
+static b32 connwatch(Os *os, Mailbox *mb, ConnWatch *w, i32 ms, b32 (*done)(ConnWatch *))
+{
+    i64 deadline = os_ticks(os) + (i64)ms*1000;
+    while (!done(w)) {
+        i64 left = deadline - os_ticks(os);
+        if (left <= 0) {
+            return 0;
+        }
+        mailwait(mb, (i32)(left/1000 + 1));
+        Mail m = mailtake(mb);
+        for (Record r; (r = mailnext(&m)).ok;) {
+            if (r.type==CONN_NEW && !w->c) {
+                copybytes(&w->c, r.data.data, sizeof(w->c));
+                w->id = r.id;
+            } else if (r.type==CONN_DATA && r.id==w->id) {
+                print(&w->got, r.data);
+            } else if (r.type==CONN_EOF && r.id==w->id) {
+                w->eof = 1;
+            }
+        }
+    }
+    return 1;
+}
+
+static b32 hasconn(ConnWatch *w) { return w->c != 0; }
+static b32 has10(ConnWatch *w)   { return w->got.len >= 10; }
+static b32 haseof(ConnWatch *w)  { return w->eof; }
+
+static void testendpoints(Selftest *t, Arena *perm, Arena scratch, Str dir)
+{
+    Os *os    = t->os;
+    Str state = join(&scratch, dir, "state-with-a-long-name-to-go-through-a-link");
+    os_mkdirs(os, scratch, state);
+    Str ep = os_endpoint(os, &scratch, state, "selftest");
+    if (!check(t, ep.len>0, "os_endpoint")) {
+        return;
+    }
+    Str again = os_endpoint(os, &scratch, state, "selftest");
+    check(t, ep==again, "os_endpoint is stable");
+    check(t, !os_listening(os, scratch, ep), "nobody listens yet");
+
+    Mailbox  *sm = newmailbox(perm, 1<<16, 0, 0);   // the server's
+    Mailbox  *cm = newmailbox(perm, 1<<16, 0, 0);   // the client's
+    check(t, !os_connect(os, scratch, ep, cm, 1), "os_connect fails with nobody there");
+    Listener *l  = os_listen(os, scratch, ep, sm);
+    if (!check(t, l!=0, "os_listen")) {
+        return;
+    }
+    ConnWatch *sw = alloc<ConnWatch>(perm, 2);
+    ConnWatch *cw = alloc<ConnWatch>(perm);
+    for (i32 i = 0; i < 2; i++) {
+        sw[i].got = Buf(perm, 1<<21);
+    }
+    cw->got = Buf(perm, 1<<21);
+
+    // Data both ways, a megabyte from the server, then its end
+    Conn *c = os_connect(os, scratch, ep, cm, 7);
+    cw->c  = c;
+    cw->id = 7;
+    if (!check(t, c!=0, "os_connect")) {
+        os_unlisten(os, l);
+        return;
+    }
+    check(t, connwatch(os, sm, sw, 5000, hasconn), "the server accepts it");
+    os_connwrite(os, c, "0123456789");
+    check(t, connwatch(os, sm, sw, 5000, has10), "the server reads it");
+    check(t, sw[0].got.len==10 && Str{sw[0].got.data, 10}=="0123456789",
+          "in order and whole");
+    Str mega = {allocbytes(&scratch, 1<<20), 1<<20};
+    for (iz i = 0; i < mega.len; i++) {
+        mega[i] = (u8)(i * 7);
+    }
+    os_connwrite(os, sw[0].c, takehead(mega, 1000));
+    os_connwrite(os, sw[0].c, cuthead(mega, 1000));
+    os_connwrite(os, sw[0].c, {});  // the end, after the queue
+    check(t, connwatch(os, cm, cw, 10000, haseof), "the client reads to the end");
+    check(t, finish(&cw->got)==mega, "a megabyte, intact");
+    check(t, !os_connwrite(os, sw[0].c, "x"), "nothing more after the end");
+    os_connclose(os, c);
+    os_connclose(os, sw[0].c);
+
+    // A client breaking its connection ends the server's
+    c = os_connect(os, scratch, ep, cm, 8);
+    check(t, connwatch(os, sm, sw+1, 5000, hasconn), "another is accepted");
+    if (c) {
+        os_connclose(os, c);
+    }
+    check(t, connwatch(os, sm, sw+1, 5000, haseof), "its break is seen");
+    if (sw[1].c) {
+        os_connclose(os, sw[1].c);
+    }
+
+    // Probes, which the listener may or may not see, then the end
+    check(t, os_listening(os, scratch, ep), "os_listening sees the listener");
+    check(t, !os_listen(os, scratch, ep, sm), "a second listener is refused");
+    os_unlisten(os, l);
+    i64 t0 = os_ticks(os);
+    b32 gone = 0;
+    while (!(gone = !os_listening(os, scratch, ep)) && os_ticks(os)-t0<2000000) {
+        mailwait(sm, 10);
+    }
+    check(t, gone, "os_unlisten frees the endpoint");
+    ep = os_endpoint(os, &scratch, state, "selftest");  // its link went too
+    Mail m = mailtake(sm);
+    for (Record r; (r = mailnext(&m)).ok;) {
+        if (r.type == CONN_NEW) {
+            Conn *p = 0;
+            copybytes(&p, r.data.data, sizeof(p));
+            os_connclose(os, p);
+        }
+    }
+    l = os_listen(os, scratch, ep, sm);
+    check(t, l!=0, "which another may take");
+    if (l) {
+        os_unlisten(os, l);
+    }
+    say(os, "endpoints done");
+}
+
 static i32 selftestio(Os *os, Arena *perm, Arena scratch, Str url)
 {
     Selftest t = {};
@@ -698,6 +828,7 @@ static i32 selftestio(Os *os, Arena *perm, Arena scratch, Str url)
     if (real.len) dir = real;
 
     testlocks(&t, a, dir);
+    testendpoints(&t, perm, a, dir);
     testprocs(&t, perm, a, dir);
     if (url.len) {
         testhttp(&t, perm, a, url);
