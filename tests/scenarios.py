@@ -451,9 +451,11 @@ def compact(names):
 SCENARIOS = {}
 
 
-def scenario(conf=None, bound=30, posix=False):
+def scenario(conf=None, bound=30, posix=False, alone=False):
+    """alone: a heavy scenario (big files, a stream of requests), run by
+    itself after the rest, so that it slows no timed one on a small host."""
     def deco(fn):
-        SCENARIOS[fn.__name__] = (fn, conf, bound, posix)
+        SCENARIOS[fn.__name__] = (fn, conf, bound, posix, alone)
         return fn
     return deco
 
@@ -1381,7 +1383,7 @@ def checkpointed(msgs):
 SMALL = {"_listing": {"meta": {"n_ctx": 24000, "n_ctx_train": 262144}}}
 
 
-@scenario(conf=SMALL, bound=25)
+@scenario(conf=SMALL, bound=25, alone=True)
 def compaction(t):
     """A small window: the older reads are summarized, the newest stay
     verbatim, the turn carries on, and a resumed session replays the
@@ -1434,7 +1436,7 @@ def compaction(t):
             f"then the rest: {again[len(last):]}")
 
 
-@scenario(conf=SMALL, bound=20)
+@scenario(conf=SMALL, bound=20, alone=True)
 def compact_guard(t):
     """A summary that leaves too little room ends the turn, rather than
     compact again and again."""
@@ -1452,7 +1454,7 @@ def compact_guard(t):
 
 
 @scenario(conf={"_listing": {"meta": {"n_ctx": 100000, "n_ctx_train": 262144}}},
-          bound=20)
+          bound=20, alone=True)
 def compact_prune(t):
     """Old tool outputs give way to a line saying where they are, with
     no summary, and the newest 40k tokens of output stay."""
@@ -1479,7 +1481,7 @@ def compact_prune(t):
     t.check(r.text() == "Pruned and done.", f"text {r.text()!r}")
 
 
-@scenario(bound=20)
+@scenario(bound=20, alone=True)
 def overflow_compact(t):
     """The server rejects a prompt as too long: compact to 70% of it,
     then retry the step."""
@@ -1547,7 +1549,7 @@ def slow_retry(t):
     t.check(r.text() == "Up again.", f"text {r.text()!r}")
 
 
-@scenario(bound=25)
+@scenario(bound=25, alone=True)
 def slow_budget(t):
     """The default schedule, 1 2 5 10 15 15... minutes, until the 2 hour
     budget is spent (here, scaled)."""
@@ -1670,7 +1672,7 @@ SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")
 
 
 def runone(host, name, verbose):
-    fn, conf, bound, posix = SCENARIOS[name]
+    fn, conf, bound, posix, alone = SCENARIOS[name]
     if posix and host.windows:
         return name, "skip", 0.0, "POSIX only"
     t0 = time.monotonic()
@@ -1767,15 +1769,21 @@ def main():
                 return 2
         jobs = args.j or (2 if args.host else 8)
         failed = 0
+
+        def report(name, status, dt, why):
+            print(f"{status:4} {name:18} {dt:6.1f} s  {why.splitlines()[0] if why else ''}")
+            if args.v and why and status == "FAIL":
+                print("     " + why.replace("\n", "\n     "))
+            return status == "FAIL"
+
+        together = [n for n in names if not SCENARIOS[n][4]]
+        alone = [n for n in names if SCENARIOS[n][4]]
         with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
-            futs = [ex.submit(runone, host, n, args.v) for n in names]
+            futs = [ex.submit(runone, host, n, args.v) for n in together]
             for f in futs:
-                name, status, dt, why = f.result()
-                print(f"{status:4} {name:18} {dt:6.1f} s  {why.splitlines()[0] if why else ''}")
-                if status == "FAIL":
-                    failed += 1
-                    if args.v and why:
-                        print("     " + why.replace("\n", "\n     "))
+                failed += report(*f.result())
+        for n in alone:
+            failed += report(*runone(host, n, args.v))
         print(f"{len(names) - failed}/{len(names)} scenarios passed")
         return 1 if failed else 0
     finally:
