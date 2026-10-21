@@ -434,7 +434,8 @@ static Str usage =
 static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
 {
     Arena perm    = mem;
-    Arena scratch = newarena(os_reserve(os, (iz)1<<30));
+    iz    cap     = sizeof(void *)==8 ? (iz)1<<30 : (iz)1<<27;  // 32-bit: XP
+    Arena scratch = newarena(os_reserve(os, cap));
     if (!scratch.beg) {
         os_print(os, 2, "harness: out of memory\n");
         return 2;

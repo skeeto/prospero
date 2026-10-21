@@ -47,6 +47,11 @@ else()
     set(HARNESS_TRAP -fsanitize=undefined -fsanitize-undefined-trap-on-error)
   endif()
 endif()
+if(HARNESS_TRAP AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(i.86|x86)$")
+  # The i386 ABI aligns 8-byte integers to 4 on the stack, and so does
+  # GCC, whose alignment check then demands 8 of its own locals.
+  list(APPEND HARNESS_TRAP -fno-sanitize=alignment)
+endif()
 target_compile_options(harness_core_flags INTERFACE
   "$<$<CONFIG:Debug>:-g3;${HARNESS_TRAP}>")
 target_link_options(harness_core_flags INTERFACE
@@ -125,6 +130,15 @@ if(APPLE AND HARNESS_GUI)
 endif()
 set_target_properties(harness PROPERTIES OUTPUT_NAME ${HARNESS_NAME})
 
+find_program(UV uv)
+if(WIN32 AND NOT HARNESS_GUI AND UV)
+  # The headless engine, the XP engine as an i686 build, imports only
+  # what Windows XP SP3 exports. A host check, so cross builds run it.
+  enable_testing()
+  add_test(NAME imports COMMAND ${UV} run
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/imports.py $<TARGET_FILE:harness>)
+endif()
+
 if(NOT CMAKE_CROSSCOMPILING)
   enable_testing()
   add_executable(harness_test src/main_test.cpp)
@@ -140,7 +154,6 @@ if(NOT CMAKE_CROSSCOMPILING)
   add_test(NAME unit COMMAND harness_test)
   add_test(NAME selftest COMMAND harness --selftest)
   # The engine end to end against tests/fake_provider.py
-  find_program(UV uv)
   if(UV)
     add_test(NAME scenarios COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios.py --harness $<TARGET_FILE:harness>)

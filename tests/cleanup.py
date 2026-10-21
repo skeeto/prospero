@@ -19,6 +19,7 @@ checks that the snapshots forget the dead. Survivors are killed afterward.
 
   uv run tests/cleanup.py --harness build/harness
   uv run tests/cleanup.py --harness PATH --host biron.local
+  uv run tests/cleanup.py --harness PATH --xp 192.168.1.106
 """
 
 import argparse
@@ -68,11 +69,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--harness", required=True)
     ap.add_argument("--host", help="a Windows host to run on over ssh")
+    ap.add_argument("--xp", help="a Windows XP host to run on over ssh")
     args = ap.parse_args()
 
-    srv, url = fake_provider.start()
+    if args.xp:
+        srv, url = fake_provider.start(scenarios.lanaddress(args.xp))
+    else:
+        srv, url = fake_provider.start()
     port = srv.server_address[1]
-    if args.host:
+    if args.xp:
+        host = scenarios.XpHost(args.xp, args.harness, url)
+    elif args.host:
         host = scenarios.SshHost(args.host, args.harness, port, 20000 + port % 20000)
     else:
         host = scenarios.LocalHost(args.harness, url)

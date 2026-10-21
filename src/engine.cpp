@@ -3914,7 +3914,7 @@ static void compacted(Session *s, Arena scratch, Partial *p)
         failcompact(s, scratch, CLASS_TRANSIENT, 0, "the summary was empty", -1);
         return;
     }
-    iz most = bytesof(s->rate, COMPACT_SUMMAX);
+    iz most = (iz)bytesof(s->rate, COMPACT_SUMMAX);
     text = text.len>most ? utf8head(text, most) : text;
     Files f = summaryfiles(&scratch, s->summary);
     f = addfiles(&scratch, f, s->history, cp.start, cp.cut);
@@ -4381,8 +4381,8 @@ static Session *newsession(Engine *e, Arena scratch, Str sid)
 {
     Os     *os  = e->os;
     b32     big = sizeof(void *) == 8;
-    Region *r1  = os_reserve(os, big ? (iz)1<<32 : (iz)1<<26);
-    Region *r2  = os_reserve(os, big ? (iz)1<<30 : (iz)1<<26);
+    Region *r1  = os_reserve(os, (iz)1<<(big ? 32 : 26));
+    Region *r2  = os_reserve(os, (iz)1<<(big ? 30 : 26));
     if (!r1 || !r2) {
         return 0;
     }
@@ -6630,9 +6630,9 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     e->ini      = cfg->ini;
     e->statedir = clone(perm, statedir);
     e->in       = newmailbox(perm, 4<<20, 0, 0);
-    Region *r   = os_reserve(os, big ? (iz)1<<32 : (iz)1<<27);
-    e->scratch  = os_reserve(os, big ? (iz)1<<32 : (iz)1<<27);
-    e->replay   = os_reserve(os, big ? (iz)1<<32 : (iz)1<<27);
+    Region *r   = os_reserve(os, (iz)1<<(big ? 32 : 27));
+    e->scratch  = os_reserve(os, (iz)1<<(big ? 32 : 27));
+    e->replay   = os_reserve(os, (iz)1<<(big ? 32 : 27));
     if (!e->in || !r || !e->scratch || !e->replay) {
         return 0;
     }

@@ -379,7 +379,7 @@ static Str summarytext(Str summary)
 static Slice<Str> addfile(Arena *a, Slice<Str> list, Str path)
 {
     Slice<Str> r = {};
-    iz first = list.len>=COMPACT_FILES ? list.len-COMPACT_FILES+1 : 0;
+    iz first = list.len>=COMPACT_FILES ? list.len-(iz)COMPACT_FILES+1 : 0;
     for (iz i = first; i < list.len; i++) {
         if (list[i] != path) {
             r = push(a, r, list[i]);
