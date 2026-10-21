@@ -411,6 +411,8 @@ static Arena newarena(Region *r)
 #include "compact.cpp"
 #include "engine.cpp"
 #include "cli.cpp"
+#include "host.cpp"
+#include "remote.cpp"
 #include "selftest.cpp"
 #include "selftest_io.cpp"
 
@@ -419,6 +421,10 @@ static Str usage =
 "usage: harness [options]\n"
 "       harness run [options] PROMPT\n"
 "       harness --headless [options]\n"
+"       harness serve [options]\n"
+"       harness attach [--reconnect] [options]\n"
+"       harness hosts [--state DIR]\n"
+"       harness connect NAME | --ssh DEST | --local [options]\n"
 "  --version         print the version and exit\n"
 "  --selftest [URL]  run the platform integration tests, with HTTP\n"
 "                    tests against a fake provider at URL\n"
@@ -440,6 +446,14 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
         return climain(os, perm, scratch, args, nargs, 1);
     } else if (nargs>1 && args[1]=="--search") {
         return searchmain(os, perm, scratch, args, nargs);  // grep and glob
+    } else if (nargs>1 && args[1]=="serve") {
+        return servemain(os, perm, scratch, args, nargs);
+    } else if (nargs>1 && args[1]=="attach") {
+        return attachmain(os, perm, scratch, args, nargs);
+    } else if (nargs>1 && args[1]=="hosts") {
+        return hostsmain(os, perm, scratch, args, nargs);
+    } else if (nargs>1 && args[1]=="connect") {
+        return connectmain(os, perm, scratch, args, nargs);
     }
 
     for (i32 i = 1; i < nargs; i++) {

@@ -708,7 +708,9 @@ static void testcfgjson(Test *t)
         "tools//use_rg=true*\n"
         "tools//task_budget=200*\n"
         "instructions//files=AGENTS.md CLAUDE.md*\n"
-        "ui//theme=system*\n");
+        "ui//theme=system*\n"
+        "host//idle_exit=600*\n"
+        "host//grace=10800*\n");
 
     Json *schema = jsonget(j, "schema");
     expect(t, "json.schema", istr(&a, jsonlen(schema)),

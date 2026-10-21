@@ -146,5 +146,8 @@ if(NOT CMAKE_CROSSCOMPILING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios.py --harness $<TARGET_FILE:harness>)
     add_test(NAME cleanup COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/cleanup.py --harness $<TARGET_FILE:harness>)
+    # Hosts and their clients on this machine (the ssh ones take --ssh)
+    add_test(NAME remote COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/remote.py --harness $<TARGET_FILE:harness>)
   endif()
 endif()
