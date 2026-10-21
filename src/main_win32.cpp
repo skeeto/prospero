@@ -1754,6 +1754,687 @@ static void os_procfree(Os *os, Proc *p)
 }
 
 
+// Local endpoints: named pipes
+//
+// A host's pipe is \\.\pipe\harness-SID-HASH-NAME: SID the user's, HASH
+// that of the state directory's full path, case folded. Its DACL allows
+// this user alone, since the default DACL grants Everyone read access.
+// A pipe also takes clients over SMB, which PIPE_REJECT_REMOTE_CLIENTS
+// refuses from Vista on (on XP, where it is refused and left out, such
+// a client needs this user's own credentials). Denying network logons
+// (S-1-5-2) in the DACL instead would lock out the user's own ssh
+// sessions, whose tokens carry that group. The first instance is
+// created with FILE_FLAG_FIRST_PIPE_INSTANCE, which fails if another
+// process holds the name, and the listener keeps an instance waiting at
+// all times, making the next before it hands over a connected one.
+// Clients connect at identification level only, so that a pipe server
+// cannot act as them. Everything else here dates from XP.
+//
+// I/O is overlapped, with an event for each direction, so that a pending
+// read never holds up a write, and a manual-reset stop event that ends
+// either wait. The waiting thread then cancels its own I/O (CancelIo,
+// as XP has nothing finer) and waits for it to finish, so that the
+// handle closes, with the last reference, only once nothing uses it.
+// A pipe has no half close: ending the output once the queue is written
+// stops the whole connection, which the peer sees as the end once it
+// has read what came before.
+
+enum : i32 {
+    CREATE_BREAKAWAY_FROM_JOB     = 0x01000000,
+    DETACHED_PROCESS              = 0x00000008,
+    ERROR_ACCESS_DENIED           = 5,
+    ERROR_IO_PENDING              = 997,
+    ERROR_PIPE_BUSY               = 231,
+    ERROR_PIPE_CONNECTED          = 535,
+    FILE_APPEND_DATA              = 4,
+    FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000,
+    FILE_FLAG_OVERLAPPED          = 0x40000000,
+    PIPE_ACCESS_DUPLEX            = 3,
+    PIPE_REJECT_REMOTE_CLIENTS    = 8,
+    PIPE_UNLIMITED_INSTANCES      = 255,
+    SECURITY_IDENTIFICATION       = 1 << 16,
+    SECURITY_SQOS_PRESENT         = 0x00100000,
+    SYNCHRONIZE                   = 0x00100000,
+    TOKEN_QUERY                   = 8,
+    TokenUser                     = 1,
+};
+
+enum : i32 {
+    EXTENDED_STARTUPINFO_PRESENT  = 0x00080000,
+};
+
+enum : uz {
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002,
+};
+
+struct StartupInfoEx {  // STARTUPINFOEXW
+    StartupInfo si;
+    void       *attrs;
+};
+
+// Vista's attribute lists, looked up at run time
+using InitAttrs   = b32  (__stdcall *)(void *, i32, i32, uz *);
+using UpdateAttr  = b32  (__stdcall *)(void *, i32, uz, void *, uz, void *, uz *);
+using DeleteAttrs = void (__stdcall *)(void *);
+
+struct SecurityAttributes {  // SECURITY_ATTRIBUTES
+    i32   len;
+    void *descriptor;
+    b32   inherit;
+};
+static_assert(sizeof(SecurityAttributes) == (sizeof(uz)==8 ? 24 : 12));
+
+W32(b32,    CancelIo(uz));
+W32(b32,    ConnectNamedPipe(uz, Overlapped *));
+W32(uz,     CreateNamedPipeW(c16 *, i32, i32, i32, i32, i32, i32, SecurityAttributes *));
+W32(uz,     GetCurrentProcess());
+W32(i32,    GetCurrentProcessId());
+W32(b32,    GetOverlappedResult(uz, Overlapped *, i32 *, b32));
+W32(void *, LocalFree(void *));
+W32(b32,    ResetEvent(uz));
+W32(i32,    WaitForMultipleObjects(i32, uz *, b32, i32));
+W32(b32,    WaitNamedPipeW(c16 *, i32));
+W32(b32,    ConvertSidToStringSidW(void *, c16 **));
+W32(b32,    ConvertStringSecurityDescriptorToSecurityDescriptorW(c16 *, i32, void **,
+                                                                 i32 *));
+W32(b32,    GetTokenInformation(uz, i32, void *, i32, i32 *));
+W32(b32,    OpenProcessToken(uz, i32, uz *));
+
+enum : iz {
+    CONN_BUFLEN   = 1<<16,
+    CONN_QUEUEMAX = (iz)64 << 20,  // bytes waiting to be written
+};
+
+struct ConnChunk {  // queued output, its bytes following
+    ConnChunk *next;
+    iz         len;
+};
+
+struct Conn {
+    i32        refs;     // atomic: the owner, the reader, the writer
+    i32        hrefs;    // atomic: the reader and the writer, for h
+    uz         h;
+    uz         stop;     // manual reset: the connection is over
+    uz         rev;      // the reader's
+    uz         wev;      // the writer's
+    Mailbox   *mbox;
+    u64        id;
+    Lock       lock;
+    Event      wake;     // for the writer
+    ConnChunk *head;     // under lock: the output queue
+    ConnChunk *last;     // under lock
+    iz         queued;   // under lock: bytes in the queue
+    b32        closing;  // under lock: end the connection after the queue
+    b32        broken;   // under lock: the output failed, or was dropped
+    u8         buf[CONN_BUFLEN];
+};
+
+struct Listener {
+    i32      refs;   // atomic: the owner, the thread
+    uz       pipe;   // the instance waiting for a client
+    uz       stop;
+    uz       ev;
+    c16     *name;
+    void    *sd;     // the security descriptor (LocalAlloc)
+    Mailbox *mbox;
+    u64      nextid;
+};
+
+// A thread is done with the pipe: the last closes it, so that the peer
+// sees the end even while the owner holds on to the Conn.
+static void connunpipe(Conn *c)
+{
+    if (!__atomic_sub_fetch(&c->hrefs, 1, __ATOMIC_ACQ_REL)) {
+        CloseHandle(c->h);
+    }
+}
+
+static void connrelease(Conn *c)
+{
+    if (!__atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL)) {
+        uz hs[] = {c->hrefs ? c->h : 0, c->stop, c->rev, c->wev, (uz)c->wake.h[0]};
+        closeall(hs, countof(hs));
+        DeleteCriticalSection((CriticalSection *)c->lock.opaque);
+        HeapFree(GetProcessHeap(), 0, c);
+    }
+}
+
+static void connfreequeue(Conn *c)  // under lock
+{
+    for (ConnChunk *k = c->head; k;) {
+        ConnChunk *next = k->next;
+        HeapFree(GetProcessHeap(), 0, k);
+        k = next;
+    }
+    c->head   = 0;
+    c->last   = 0;
+    c->queued = 0;
+}
+
+// One overlapped read or write, waiting for it or for stop. Returns the
+// bytes moved, or -1 on failure or stop, when it is cancelled and done.
+static i32 pipeio(uz h, uz ev, uz stop, u8 *buf, i32 len, b32 write)
+{
+    Overlapped ov = {};
+    ov.event = ev;
+    ResetEvent(ev);
+    i32 n  = 0;
+    b32 ok = write ? WriteFile(h, buf, len, &n, &ov) : ReadFile(h, buf, len, &n, &ov);
+    if (!ok && GetLastError()!=ERROR_IO_PENDING) {
+        return -1;
+    }
+    uz  hs[] = {ev, stop};
+    i32 w    = WaitForMultipleObjects(2, hs, 0, INFINITE);
+    if (w != WAIT_OBJECT_0) {
+        CancelIo(h);
+        GetOverlappedResult(h, &ov, &n, 1);
+        return -1;
+    }
+    return GetOverlappedResult(h, &ov, &n, 0) ? n : -1;
+}
+
+static void connreader(void *arg)
+{
+    Conn *c   = (Conn *)arg;
+    iz    max = mailmax(c->mbox);
+    for (;;) {
+        i32 n = pipeio(c->h, c->rev, c->stop, c->buf, CONN_BUFLEN, 0);
+        if (n < 0) {
+            break;
+        }
+        for (iz off = 0; off < n; off += max) {
+            iz len = n-off<max ? n-off : max;
+            mailpost(c->mbox, CONN_DATA, c->id, {c->buf+off, len}, 1);
+        }
+    }
+    SetEvent(c->stop);  // the writer has nobody to write to
+    connunpipe(c);
+    mailpost(c->mbox, CONN_EOF, c->id, {}, 1);
+    connrelease(c);
+}
+
+static void connwriter(void *arg)
+{
+    Conn *c = (Conn *)arg;
+    for (;;) {
+        os_lock(&c->lock);
+        ConnChunk *k = c->head;
+        if (k) {
+            c->head = k->next;
+            c->last = c->head ? c->last : 0;
+        }
+        b32 done = !k && (c->closing || c->broken);
+        os_unlock(&c->lock);
+        if (done) {
+            break;
+        } else if (!k) {
+            uz hs[] = {(uz)c->wake.h[0], c->stop};
+            WaitForMultipleObjects(2, hs, 0, INFINITE);
+            if (WaitForSingleObject(c->stop, 0) == WAIT_OBJECT_0) {
+                os_lock(&c->lock);
+                c->broken = 1;
+                connfreequeue(c);
+                os_unlock(&c->lock);
+            }
+            continue;
+        }
+
+        b32 ok = 1;
+        for (iz off = 0; ok && off<k->len;) {
+            i32 n = pipeio(c->h, c->wev, c->stop, (u8 *)(k+1)+off, chunk(k->len-off), 1);
+            ok   = n > 0;
+            off += n;
+        }
+        os_lock(&c->lock);
+        c->queued -= k->len;
+        if (!ok) {
+            c->broken = 1;
+            connfreequeue(c);
+        }
+        os_unlock(&c->lock);
+        HeapFree(GetProcessHeap(), 0, k);
+    }
+    SetEvent(c->stop);  // written, or broken: the connection is over
+    connunpipe(c);
+    connrelease(c);
+}
+
+// A connection on a connected pipe handle, its threads started.
+// Announced, it is posted as CONN_NEW first, before any record of its
+// own; should its threads then fail to start, its CONN_EOF follows at
+// once, and the owner has a connection that is over. Otherwise null on
+// failure, the handle closed.
+static Conn *newconn(Os *os, uz h, Mailbox *mbox, u64 id, b32 announce)
+{
+    uz    heap = GetProcessHeap();
+    Conn *c    = (Conn *)HeapAlloc(heap, HEAP_ZERO_MEMORY, sizeof(Conn));
+    if (!c) {
+        CloseHandle(h);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    c->h     = h;
+    c->stop  = CreateEventW(0, 1, 0, 0);
+    c->rev   = CreateEventW(0, 1, 0, 0);
+    c->wev   = CreateEventW(0, 1, 0, 0);
+    c->mbox  = mbox;
+    c->id    = id;
+    c->refs  = 1;
+    c->hrefs = 1;  // closing h with the Conn, until the threads take it
+    os_lockinit(&c->lock);
+    if (!c->stop || !c->rev || !c->wev || !os_eventinit(&c->wake)) {
+        connrelease(c);
+        return 0;
+    }
+    c->refs  = 3;
+    c->hrefs = 2;
+    if (announce) {
+        mailpost(mbox, CONN_NEW, id, {(u8 *)&c, sizeof(c)}, 1);
+    }
+    b32 reader = os_thread(os, connreader, c);
+    b32 writer = reader && os_thread(os, connwriter, c);
+    if (writer) {
+        return c;
+    }
+    __atomic_sub_fetch(&c->refs, 2-reader, __ATOMIC_ACQ_REL);  // not started
+    os_lock(&c->lock);
+    c->broken = 1;
+    os_unlock(&c->lock);
+    SetEvent(c->stop);  // a reader that started ends, with CONN_EOF
+    connunpipe(c);      // the writer's
+    if (!reader) {
+        connunpipe(c);
+    }
+    if (announce && !reader) {
+        mailpost(mbox, CONN_EOF, id, {}, 1);
+    }
+    if (announce) {
+        return c;
+    }
+    connrelease(c);
+    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+    return 0;
+}
+
+static b32 os_connwrite(Os *, Conn *c, Str data)
+{
+    if (data.len > CONN_QUEUEMAX) {
+        return 0;
+    }
+    uz         heap = GetProcessHeap();
+    ConnChunk *k    = 0;
+    if (data.len) {
+        k = (ConnChunk *)HeapAlloc(heap, 0, (iz)sizeof(ConnChunk) + data.len);
+        if (!k) {
+            return 0;
+        }
+        k->next = 0;
+        k->len  = data.len;
+        copybytes(k+1, data.data, data.len);
+    }
+
+    os_lock(&c->lock);
+    b32 ok = !c->closing && !c->broken && data.len<=CONN_QUEUEMAX-c->queued;
+    if (ok && k) {
+        *(c->last ? &c->last->next : &c->head) = k;
+        c->last    = k;
+        c->queued += k->len;
+        k = 0;
+    }
+    if (ok && !data.data) {
+        c->closing = 1;
+    }
+    if (ok) {
+        os_signal(&c->wake);
+    }
+    os_unlock(&c->lock);
+    if (k) {
+        HeapFree(heap, 0, k);  // not queued
+    }
+    return ok;
+}
+
+static void os_connclose(Os *, Conn *c)
+{
+    os_lock(&c->lock);
+    c->broken = 1;
+    connfreequeue(c);
+    os_unlock(&c->lock);
+    SetEvent(c->stop);  // ends any wait, read or write
+    connrelease(c);
+}
+
+// The user's SID as a string, in the arena, or null.
+static Str usersid(Arena *a)
+{
+    uz tok = 0;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        return {};
+    }
+    void *buf = alloc<uz>(a, 64);  // TOKEN_USER and its SID
+    i32   len = 0;
+    b32   ok  = GetTokenInformation(tok, TokenUser, buf, 64*(i32)sizeof(uz), &len);
+    CloseHandle(tok);
+    c16 *s = 0;
+    if (!ok || !ConvertSidToStringSidW(*(void **)buf, &s)) {
+        return {};
+    }
+    iz n = 0;
+    for (; s[n]; n++) {}
+    Str r = fromwide(a, s, n);
+    LocalFree(s);
+    return r;
+}
+
+static Str os_endpoint(Os *, Arena *a, Str statedir, Str name)
+{
+    if (hasnul(statedir) || hasnul(name)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return {};
+    }
+    Arena tmp  = *a;
+    Str16 full = widepath(&tmp, statedir);
+    u64   h    = 0x100;
+    for (iz i = 0; i < full.len; i++) {
+        c16 c = full.data[i];
+        c = c>='A' && c<='Z' ? (c16)(c + 32) : c=='/' ? (c16)'\\' : c;
+        h ^= c;
+        h *= 1111111111111111111u;
+    }
+    Str sid = usersid(&tmp);
+    if (!sid.len) {
+        return {};
+    }
+    Buf b(a, 128 + sid.len + name.len);
+    print(&b, "\\\\.\\pipe\\harness-");
+    print(&b, sid);
+    putbyte(&b, '-');
+    printhex(&b, h, 16);
+    putbyte(&b, '-');
+    print(&b, name);
+    return finish(&b);
+}
+
+// A new instance of a listener's pipe, the first of its name or not.
+static uz pipeinstance(Listener *l, b32 first)
+{
+    SecurityAttributes sa = {};
+    sa.len        = sizeof(sa);
+    sa.descriptor = l->sd;
+    i32 open = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
+               (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0);
+    for (i32 mode = PIPE_REJECT_REMOTE_CLIENTS;; mode = 0) {
+        uz h = CreateNamedPipeW(l->name, open, mode, PIPE_UNLIMITED_INSTANCES,
+                                CONN_BUFLEN, CONN_BUFLEN, 0, &sa);
+        if (h!=INVALID_HANDLE_VALUE || !mode || GetLastError()!=ERROR_INVALID_PARAMETER) {
+            return h;  // else XP: without the Vista flag
+        }
+    }
+}
+
+static void listenrelease(Listener *l)
+{
+    if (!__atomic_sub_fetch(&l->refs, 1, __ATOMIC_ACQ_REL)) {
+        uz hs[] = {l->pipe, l->stop, l->ev};
+        closeall(hs, countof(hs));
+        LocalFree(l->sd);
+        HeapFree(GetProcessHeap(), 0, l->name);
+        HeapFree(GetProcessHeap(), 0, l);
+    }
+}
+
+static void listenthread(void *arg)
+{
+    Listener *l  = (Listener *)arg;
+    Os        os = {};
+    while (WaitForSingleObject(l->stop, 0) != WAIT_OBJECT_0) {
+        if (l->pipe == INVALID_HANDLE_VALUE) {
+            l->pipe = pipeinstance(l, 0);
+            if (l->pipe == INVALID_HANDLE_VALUE) {
+                WaitForSingleObject(l->stop, 100);  // until handles free up
+                continue;
+            }
+        }
+        Overlapped ov = {};
+        ov.event = l->ev;
+        ResetEvent(l->ev);
+        b32 connected = ConnectNamedPipe(l->pipe, &ov);
+        i32 err       = connected ? 0 : GetLastError();
+        if (err == ERROR_IO_PENDING) {
+            uz  hs[] = {l->ev, l->stop};
+            i32 w    = WaitForMultipleObjects(2, hs, 0, INFINITE);
+            i32 n    = 0;
+            if (w != WAIT_OBJECT_0) {
+                CancelIo(l->pipe);
+                GetOverlappedResult(l->pipe, &ov, &n, 1);
+                break;
+            }
+            connected = GetOverlappedResult(l->pipe, &ov, &n, 0);
+        } else {
+            connected = connected || err==ERROR_PIPE_CONNECTED;
+        }
+        if (!connected) {
+            CloseHandle(l->pipe);  // a client that came and went
+            l->pipe = INVALID_HANDLE_VALUE;
+            continue;
+        }
+
+        // The next instance waits before this one goes
+        uz h = l->pipe;
+        l->pipe = pipeinstance(l, 0);
+        newconn(&os, h, l->mbox, ++l->nextid, 1);
+    }
+    listenrelease(l);
+}
+
+static Listener *os_listen(Os *os, Arena scratch, Str endpoint, Mailbox *mbox)
+{
+    if (hasnul(endpoint)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    Str sid = usersid(&scratch);
+    if (!sid.len) {
+        return 0;
+    }
+    Buf sddl(&scratch, 128 + sid.len);
+    print(&sddl, "D:P(A;;GA;;;");
+    print(&sddl, sid);
+    print(&sddl, ")");
+    void *sd = 0;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            towide(&scratch, finish(&sddl)).data, 1, &sd, 0)) {
+        return 0;
+    }
+
+    uz        heap = GetProcessHeap();
+    Listener *l    = (Listener *)HeapAlloc(heap, HEAP_ZERO_MEMORY, sizeof(Listener));
+    Str16     name = towide(&scratch, endpoint);
+    c16      *copy = (c16 *)HeapAlloc(heap, 0, (name.len+1)*(iz)sizeof(c16));
+    if (!l || !copy) {
+        if (l) HeapFree(heap, 0, l);
+        if (copy) HeapFree(heap, 0, copy);
+        LocalFree(sd);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    copybytes(copy, name.data, (name.len+1)*(iz)sizeof(c16));
+    l->refs   = 1;
+    l->name   = copy;
+    l->sd     = sd;
+    l->mbox   = mbox;
+    l->stop   = CreateEventW(0, 1, 0, 0);
+    l->ev     = CreateEventW(0, 1, 0, 0);
+    l->pipe   = pipeinstance(l, 1);  // fails if another process has it
+    if (l->pipe==INVALID_HANDLE_VALUE || !l->stop || !l->ev) {
+        i32 err = GetLastError();
+        listenrelease(l);
+        SetLastError(err);
+        return 0;
+    }
+    l->refs = 2;
+    if (!os_thread(os, listenthread, l)) {
+        l->refs = 1;
+        listenrelease(l);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    return l;
+}
+
+static void os_unlisten(Os *, Listener *l)
+{
+    SetEvent(l->stop);
+    listenrelease(l);
+}
+
+// Open the client end of a pipe, waiting a moment while every instance
+// is busy. INVALID_HANDLE_VALUE if nobody listens.
+static uz pipeopen(Arena scratch, Str endpoint)
+{
+    if (hasnul(endpoint)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    c16 *name = towide(&scratch, endpoint).data;
+    for (i32 tries = 0;; tries++) {
+        uz h = CreateFileW(name, GENERIC_READ|GENERIC_WRITE, 0, 0, OPEN_EXISTING,
+                           FILE_FLAG_OVERLAPPED|SECURITY_SQOS_PRESENT|
+                           SECURITY_IDENTIFICATION, 0);
+        if (h!=INVALID_HANDLE_VALUE || GetLastError()!=ERROR_PIPE_BUSY || tries==20) {
+            return h;
+        }
+        WaitNamedPipeW(name, 250);
+    }
+}
+
+static Conn *os_connect(Os *os, Arena scratch, Str endpoint, Mailbox *mbox, u64 id)
+{
+    uz h = pipeopen(scratch, endpoint);
+    return h==INVALID_HANDLE_VALUE ? 0 : newconn(os, h, mbox, id, 0);
+}
+
+static b32 os_listening(Os *, Arena scratch, Str endpoint)
+{
+    uz h = pipeopen(scratch, endpoint);
+    if (h == INVALID_HANDLE_VALUE) {
+        return GetLastError() == ERROR_PIPE_BUSY;
+    }
+    CloseHandle(h);
+    return 1;
+}
+
+static i32 os_pid(Os *)
+{
+    return GetCurrentProcessId();
+}
+
+// No console, a process group of its own, and out of this process's job,
+// unless the job forbids that (ERROR_ACCESS_DENIED), as an ssh session's
+// may: then in the job, attached. Its standard handles are inheritable
+// only inside the spawn lock, as for os_spawn, and from Vista on they
+// are all it inherits (PROC_THREAD_ATTRIBUTE_HANDLE_LIST): an ssh
+// session hands its programs inheritable handles besides their standard
+// ones, and a host holding any of them would hold the session open for
+// as long as it runs. On XP it inherits those, but not this process's
+// standard handles.
+static Detached os_detach(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Str errpath)
+{
+    Detached r = {};
+    if (!argv.len || hasnul(cwd) || hasnul(errpath)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return r;
+    }
+    Str exe = os_exepath(os, &scratch);
+    if (exe.len) {
+        Slice<Str> args = {};
+        args = push(&scratch, args, exe);  // this executable, whatever argv[0]
+        for (iz i = 1; i < argv.len; i++) {
+            args = push(&scratch, args, argv[i]);
+        }
+        argv = args;
+    }
+    c16 *cmd = towide(&scratch, quoteargv(&scratch, argv)).data;
+    c16 *dir = towide(&scratch, cwd).data;
+    uz   nul = CreateFileW((c16 *)u"NUL", GENERIC_READ|GENERIC_WRITE, FILE_SHARE_ALL,
+                           0, OPEN_EXISTING, 0, 0);
+    uz   err = CreateFileW(widepath(&scratch, errpath).data, FILE_APPEND_DATA|SYNCHRONIZE,
+                           FILE_SHARE_ALL, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (nul == INVALID_HANDLE_VALUE) {
+        if (err != INVALID_HANDLE_VALUE) CloseHandle(err);
+        return r;
+    }
+    err = err!=INVALID_HANDLE_VALUE ? err : nul;
+
+    ProcessInfo   pi  = {};
+    StartupInfoEx six = {};
+    StartupInfo  *si  = &six.si;
+    si->cb     = sizeof(*si);
+    si->flags  = STARTF_USESTDHANDLES;
+    si->input  = nul;
+    si->output = nul;
+    si->error  = err;
+    i32 flags = CREATE_NEW_PROCESS_GROUP;
+    flags |= DETACHED_PROCESS;
+    flags |= CREATE_BREAKAWAY_FROM_JOB;
+
+    uz          k32    = GetModuleHandleW((c16 *)u"kernel32.dll");
+    InitAttrs   init   = (InitAttrs)
+        GetProcAddress(k32, (char *)"InitializeProcThreadAttributeList");
+    UpdateAttr  update = (UpdateAttr)
+        GetProcAddress(k32, (char *)"UpdateProcThreadAttribute");
+    DeleteAttrs del    = (DeleteAttrs)
+        GetProcAddress(k32, (char *)"DeleteProcThreadAttributeList");
+    uz          list[] = {nul, err};
+    uz          size   = 0;
+    if (init && update && del && !init(0, 1, 0, &size) && size) {
+        void *attrs = alloc<uz>(&scratch, (iz)(size/sizeof(uz) + 1));
+        if (init(attrs, 1, 0, &size)) {
+            uz n = err!=nul ? 2 : 1;
+            if (update(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, list,
+                       n*sizeof(uz), 0, 0)) {
+                six.attrs = attrs;
+                si->cb    = sizeof(six);
+                flags    |= EXTENDED_STARTUPINFO_PRESENT;
+            } else {
+                del(attrs);
+            }
+        }
+    }
+
+    EnterCriticalSection(&os->spawn);
+    for (i32 fd = 0; fd < 3; fd++) {
+        // This process's own, an ssh session's pipes perhaps, which an
+        // heir would hold open, and the session with them, for good
+        SetHandleInformation(os->std[fd], HANDLE_FLAG_INHERIT, 0);
+    }
+    SetHandleInformation(nul, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation(err, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    b32 ok = CreateProcessW(0, cmd, 0, 0, 1, flags, 0, dir, si, &pi);
+    if (!ok && GetLastError()==ERROR_ACCESS_DENIED) {
+        flags &= ~CREATE_BREAKAWAY_FROM_JOB;
+        ok = CreateProcessW(0, cmd, 0, 0, 1, flags, 0, dir, si, &pi);
+        r.attached = ok;
+    }
+    i32 e = GetLastError();
+    uz  hs[] = {nul, err!=nul ? err : 0};
+    closeall(hs, countof(hs));
+    LeaveCriticalSection(&os->spawn);
+    if (six.attrs) {
+        del(six.attrs);
+    }
+    if (!ok) {
+        SetLastError(e);
+        r.attached = 0;
+        return r;
+    }
+    CloseHandle(pi.thread);
+    CloseHandle(pi.process);
+    r.pid = pi.pid;
+    return r;
+}
+
+
 // HTTP: WinHTTP, synchronous, one thread per request
 //
 // A cancel closes the request handle, which makes the worker's blocked
