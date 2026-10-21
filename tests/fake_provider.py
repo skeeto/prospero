@@ -1270,7 +1270,12 @@ def sc_task_long_b(model, n, req):
 GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody",
                "Steer me", "Cancel me", "Close me", "Stream fast", "Stream at 100",
                "Say hello", "Stall for", "Fail once", "Hold me", "Show the themes",
-               "Start subagents", "Report as a subagent")
+               "Start subagents", "Report as a subagent", "Plan it with a todo list",
+               "Start background jobs", "Start a subagent that asks",
+               "Write outside as a subagent", "Make undoable changes",
+               "Read the big files", "Fail over")
+
+GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
 # Most of what the transcript draws, for screenshots of each theme
 GUI_THEMES = """## Before the edit
@@ -1413,7 +1418,65 @@ def sc_gui(model, n, req):
         else:
             yield from answer(model, "Both subagents reported.")
     elif "Report as a subagent" in prompt:
+        # Slow enough for the parent's strip to count them at work
+        yield S.sleep(1.5)
         yield from answer(model, "Subagent report: " + prompt[-4:])
+    elif "Plan it with a todo list" in prompt:
+        # The list as it goes: one item at a time in progress, a pause
+        # in the middle for the checklist to look, then all done
+        if step < 3:
+            items = [{"content": c, "status": "done" if i < step else
+                      "in_progress" if i == step else "pending"}
+                     for i, c in enumerate(GUI_TODO)]
+            if step == 1:
+                yield S.sleep(2)
+            yield from tool(model, n, "todo_write", {"todos": items})
+        elif step == 3:
+            items = [{"content": c, "status": "done"} for c in GUI_TODO]
+            yield from tool(model, n, "todo_write", {"todos": items})
+        else:
+            yield from answer(model, "Planned and done.")
+    elif "Start background jobs" in prompt:
+        # A quick job, and one that ticks, then runs until killed; the
+        # kill's notice brings the agent back by itself
+        if step == 0:
+            yield S.head()
+            yield from call(model, 0, f"call_{n}_a", "shell", {
+                "command": "echo quick job", "background": True})
+            yield from call(model, 1, f"call_{n}_b", "shell", {
+                "command": "echo $$ > job.pid; for i in 1 2 3; do echo tick $i; "
+                           "sleep 0.2; done; sleep 60", "background": True})
+            yield from finish(model, "tool_calls")
+        elif step == 1:
+            yield from answer(model, "Started two jobs.")
+        else:
+            seen = [m.get("content", "") for m in after if m.get("role") == "user"]
+            killed = any("the user stopped it" in c for c in seen)
+            yield from answer(model, "The second job was killed." if killed
+                              else "A job ended.")
+    elif "Start a subagent that asks" in prompt:
+        if step == 0:
+            yield from tool(model, n, "task", {"description": "Ask first",
+                                               "prompt": "Write outside as a subagent."})
+        else:
+            yield from answer(model, "The subagent said: " + tool_results(req)[0][:60])
+    elif "Write outside as a subagent" in prompt:
+        if step == 0:
+            yield from tool(model, n, "write", {"path": "../gui-child.txt",
+                                                "content": "from a subagent\n"})
+        else:
+            res = tool_results(req)[0]
+            yield from answer(model, "Child wrote it." if res.startswith("Created")
+                              else "Child was refused.")
+    elif "Make undoable changes" in prompt:
+        steps = [("write", {"path": "undo-a.txt", "content": "one\n"}),
+                 ("edit", {"path": "undo-a.txt", "old_string": "one", "new_string": "two"}),
+                 ("write", {"path": "undo-b.txt", "content": "new\n"})]
+        if step < len(steps):
+            name, args = steps[step]
+            yield from tool(model, n, name, args)
+        else:
+            yield from answer(model, "Made three changes.")
     elif "Hold me" in prompt and step == 0:
         # Reasoning of 5 MiB, never repeating itself, collapsed once
         # committed: its record is too big for any mailbox on the way to
@@ -1462,6 +1525,54 @@ def sc_gui(model, n, req):
             yield from answer(model, "Worked on the second try.")
     else:
         yield from answer(model, "I do not know that prompt.")
+
+
+def sc_gui_b(model, n, req):
+    # The queue's rival, another model at the same router
+    yield from sc_gui(model, n, req)
+
+
+def sc_gui_small(model, n, req):
+    # Big reads in a small window: a summary, slow enough for the strip
+    # to show it
+    k = n  # requests: a summary drops the earlier steps
+    if k < 8:
+        yield from real_tool(model, req, n, "read", {"path": f"small-f{k}.txt"})
+    else:
+        yield from real_answer(model, req, "All files read.")
+
+
+def sc_gui_small_compact(model, n, req):
+    yield S.sleep(1.5)
+    yield from compact_default(model, n, req)
+
+
+def sc_gui_prune(model, n, req):
+    # Big outputs in a big window: the old ones are elided
+    k = n
+    if k < 10:
+        yield from real_tool(model, req, n, "read", {"path": f"big-f{k}.txt"})
+    else:
+        yield from real_answer(model, req, "Pruned and done.")
+
+
+def sc_guifail(model, n, req):
+    # A spending limit: straight to the fallback
+    yield S.error(429, {"error": {"type": "insufficient_quota",
+                                  "message": "You exceeded your current quota"}})
+
+
+def sc_guifail_b(model, n, req):
+    # The fallback: busy once, for a countdown on it, then fine
+    key = (model, len(req.get("messages", [])))
+    with STATE.lock:
+        first = key not in GUI_FAILED
+        GUI_FAILED.add(key)
+    if first:
+        yield S.error(503, {"error": {"message": "the fallback is busy"}},
+                      {"Retry-After": "3"})
+    else:
+        yield from answer(model, "The fallback answered.")
 
 
 # The soak: mostly normal steps with 10% random faults

@@ -1,8 +1,15 @@
-// ImGui user interface: the transcript widget with its tool rows and ask
-// cards, the sessions sidebar, the liveness strip and the prompt, the
-// settings window, the new session and close dialogs, the dock layout,
+// ImGui user interface: the transcript widget with its tool rows, ask
+// cards and compaction and rewind cards, the session's bar and info, the
+// sessions sidebar with subagents under their parents, the todo list and
+// background jobs panels, the liveness strip and the prompt, the settings
+// window, the new session, rewind and close dialogs, the dock layout,
 // the metrics overlay, the theme's colors, and the scheduler's view of
 // ImGui
+//
+// Tool rows carry an action at the right of their header: Undo on a
+// write's or edit's (a rewind from its call on), Rewind to here on the
+// message that began a turn, and a link to a task's subagent. A rewind
+// asks first, listing the files as the view's snapshots predict them.
 //
 // All ImDrawList code lives here, since its signatures shift between
 // ImGui releases. uiscan and uideadlines read ImGui's internals after
@@ -320,6 +327,8 @@ static void themestyle(ImGuiStyle *st, Palette *p)
     c[ImGuiCol_FrameBg]       = ImGui::ColorConvertU32ToFloat4(p->frame);
     c[ImGuiCol_Header]        = ImGui::ColorConvertU32ToFloat4(p->selrow);
     c[ImGuiCol_PlotHistogram] = ImGui::ColorConvertU32ToFloat4(p->bar);
+    c[ImGuiCol_TextLink]      = ImGui::ColorConvertU32ToFloat4(p->link);
+    c[ImGuiCol_PopupBg]       = ImGui::ColorConvertU32ToFloat4(p->panel);
 }
 
 // Put the theme in effect: the one configured, or the system's. A change
@@ -393,14 +402,15 @@ static Str rolename(i32 role)
 static u32 toolcolor(Palette *p, i32 status)
 {
     switch (status) {
-    case VTOOL_OK:        return p->ok;
+    case VTOOL_OK:         return p->ok;
     case VTOOL_ERROR:
     case VTOOL_TIMEOUT:
-    case VTOOL_UNKNOWN:   return p->bad;
+    case VTOOL_UNKNOWN:    return p->bad;
     case VTOOL_DENIED:
-    case VTOOL_ASKING:    return p->amber;
+    case VTOOL_ASKING:     return p->amber;
     case VTOOL_RUNNING:
-    case VTOOL_STREAMING: return p->active;
+    case VTOOL_STREAMING:
+    case VTOOL_BACKGROUND: return p->active;
     }
     return p->dim;
 }
@@ -411,10 +421,76 @@ static u32 livecolor(Palette *p, i32 state)
     case LIVE_IDLE:
     case LIVE_CLOSED:  return p->dim;
     case LIVE_ASK:
+    case LIVE_QUEUED:
     case LIVE_BACKOFF: return p->amber;
     case LIVE_ERROR:   return p->bad;
     }
     return p->active;
+}
+
+static u32 jobcolor(Palette *p, ViewJob *j)
+{
+    switch (j->status) {
+    case VJOB_RUNNING: return p->active;
+    case VJOB_EXITED:  return j->hasexit && !j->exit ? p->ok : p->bad;
+    case VJOB_KILLED:
+    case VJOB_CLOSED:  return p->amber;
+    }
+    return p->bad;
+}
+
+// What a session is doing, in a word or two: "working" for a turn
+// between states, "subagents" while its own wait for them.
+static Str livelabel(View *v, i32 state)
+{
+    if (v && v->busy && state==LIVE_IDLE) {
+        return "working";
+    }
+    return state==LIVE_TASK ? Str("subagents") : livenames[state];
+}
+
+// A whole number with thousands separated: 12,345.
+static void printgrouped(Buf *b, i64 n)
+{
+    if (n < 0) {
+        putbyte(b, '-');
+        n = -n;
+    }
+    u8 digits[24];
+    i32 len = 0;
+    do {
+        digits[len++] = (u8)('0' + n%10);
+        n /= 10;
+    } while (n);
+    for (i32 i = len-1; i >= 0; i--) {
+        putbyte(b, digits[i]);
+        if (i && i%3==0) putbyte(b, ',');
+    }
+}
+
+// Seconds as "45 s" or "4 min 5 s".
+static Str secstext(Arena *a, i64 secs)
+{
+    Buf b(a, 32);
+    if (secs >= 60) {
+        print(&b, secs/60);
+        print(&b, " min");
+        if (secs % 60) {
+            putbyte(&b, ' ');
+            print(&b, secs%60);
+            print(&b, " s");
+        }
+    } else {
+        print(&b, secs);
+        print(&b, " s");
+    }
+    return finish(&b);
+}
+
+// A state's badge: a dot in its color.
+static void drawdot(ImDrawList *dl, ImVec2 c, f32 r, u32 col)
+{
+    dl->AddCircleFilled(c, r, col, 12);
 }
 
 enum : i32 {
@@ -603,12 +679,14 @@ static i64 countdown(Gui *g, i64 at, i64 nowms)
     return secs;
 }
 
+static GuiSession *taskchild(Gui *, GuiSession *, ViewTool *);
+
 // A message's header line: who, or what a tool did, or an ask's state.
 static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
 {
     Arena     a   = g->frame;
     ViewTool *t   = m->tool;
-    b32       cl  = m->role==VIEW_TOOL || m->role==VIEW_THINK;
+    b32       cl  = m->fold || m->role==VIEW_TOOL || m->role==VIEW_THINK;
     f32       sz  = p->size;
     Palette  *pal = g->pal;
     if (cl) {
@@ -645,8 +723,98 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             pen(p, "  ", 0, dim);
             pen(p, duration(&a, t->ms), 0, dim);
         }
+        // What became of it since: its job, its change undone, its
+        // output no longer shown to the agent
+        if (t->job) {
+            Buf b(&a, 32);
+            print(&b, "  job ");
+            print(&b, t->job);
+            pen(p, finish(&b), STYLE_BOLD, pal->active);
+        }
+        ViewSnap *sn = rowsnap(v, t);
+        if (sn && sn->undone) {
+            pen(p, "  undone", STYLE_BOLD, pal->amber);
+        }
+        if (t->elided) {
+            pen(p, "  elided", STYLE_BOLD, dim);
+        }
+        if (t->name=="task" && g->sess) {
+            GuiSession *k = taskchild(g, g->sess, t);
+            if (k && k->view && k->view->asks) {
+                pen(p, "  needs an answer", STYLE_BOLD, pal->amber);
+            }
+        }
         pen(p, "  ", 0, dim);
         pen(p, t->summary, STYLE_CODE, pal->summary);
+    } break;
+    case VIEW_COMPACT: {
+        ViewCard *c = m->card;
+        Buf b(&a, 128);
+        pen(p, "Compacted", STYLE_BOLD, dim);
+        print(&b, "  ");
+        printgrouped(&b, c->before);
+        print(&b, " to ");
+        printgrouped(&b, c->after);
+        print(&b, " tokens");
+        pen(p, finish(&b), STYLE_BOLD, pal->active);
+        b.len = 0;
+        if (c->kind == "summary") {
+            print(&b, "  summary of ");
+            print(&b, (i64)c->count);
+            print(&b, c->count==1 ? Str(" message") : Str(" messages"));
+            if (c->model.len) {
+                print(&b, " by ");
+                print(&b, c->model);
+            }
+            if (c->ms) {
+                print(&b, " in ");
+                print(&b, duration(&a, c->ms));
+            }
+        } else {
+            print(&b, "  ");
+            print(&b, (i64)c->count);
+            print(&b, c->count==1 ? Str(" old output elided") : Str(" old outputs elided"));
+        }
+        if (c->why == "overflow") {
+            print(&b, ", as the server found it too long");
+        }
+        pen(p, finish(&b), 0, dim);
+    } break;
+    case VIEW_REWIND: {
+        ViewCard *c = m->card;
+        Buf b(&a, 128);
+        if (c->to.len) {
+            i32 k = findcall(v, c->to);
+            pen(p, "Undone from ", STYLE_BOLD, dim);
+            if (k >= 0) {
+                ViewTool *u = v->msgs[k].tool;
+                print(&b, u->name);
+                putbyte(&b, ' ');
+                print(&b, u->summary);
+            } else {
+                print(&b, c->to);
+            }
+            pen(p, finish(&b), STYLE_CODE, pal->summary);
+        } else {
+            print(&b, "Rewound to the start of turn ");
+            print(&b, (i64)c->turn);
+            pen(p, finish(&b), STYLE_BOLD, dim);
+        }
+        b.len = 0;
+        print(&b, ":  ");
+        print(&b, (i64)c->count);
+        print(&b, c->count==1 ? Str(" file") : Str(" files"));
+        pen(p, finish(&b), 0, dim);
+        if (c->conflicts) {
+            b.len = 0;
+            print(&b, ", ");
+            print(&b, (i64)c->conflicts);
+            print(&b, c->conflicts==1 ? Str(" conflict") : Str(" conflicts"));
+            pen(p, finish(&b), STYLE_BOLD, pal->amber);
+        }
+        if (c->force) {
+            pen(p, ", forced", 0, dim);
+        }
     } break;
     case VIEW_THINK: {
         pen(p, "Reasoning", STYLE_BOLD, dim);
@@ -700,6 +868,126 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
     }
 }
 
+// A task's subagent: named by its report, or found by its parent and
+// call while it works.
+static GuiSession *taskchild(Gui *g, GuiSession *parent, ViewTool *t)
+{
+    if (t->child.len) {
+        GuiSession *c = findsess(g, t->child);
+        if (c) return c;
+    }
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        View *k = s->view;
+        if (k && t->call.len && k->parent==parent->sid && k->pcall==t->call) {
+            return s;
+        }
+    }
+    return 0;
+}
+
+// Whether the files of a session can be rewound now: shown here, its
+// own, and between turns, as the engine requires.
+static b32 canrewind(Gui *g, GuiSession *s)
+{
+    return s && s==g->sess && s->view && !s->readonly && !s->view->busy &&
+           !g->enginegone && !g->quitting && g->enginekind!=ENGINE_FAKE;
+}
+
+enum : i32 {
+    ACT_NONE,
+    ACT_UNDO,     // put back a write's or edit's file, and later ones
+    ACT_REWIND,   // put back the files to the start of a turn
+    ACT_OPEN,     // show a task's subagent
+};
+
+struct MsgAction {
+    i32         kind;
+    char const *label;
+    f32         w;
+    b32         amber;  // it waits for the user
+    GuiSession *child;
+};
+
+// The action at the right of a message's header, if any.
+static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
+{
+    MsgAction r = {};
+    ViewTool *t = m->tool;
+    if (m->role==VIEW_TOOL && t->name=="task" && s) {
+        r.child = taskchild(g, s, t);
+        if (r.child) {
+            r.amber = r.child->view && r.child->view->asks;
+            r.kind  = ACT_OPEN;
+            r.label = r.amber ? "Answer the subagent" : "Open subagent";
+        }
+    } else if (m->role == VIEW_TOOL) {
+        ViewSnap *sn = rowsnap(v, t);
+        if (sn && !sn->undone && canrewind(g, s)) {
+            r.kind  = ACT_UNDO;
+            r.label = "Undo";
+        }
+    } else if (m->startsturn && canrewind(g, s) && turnrewinds(v, m->startsturn)) {
+        r.kind  = ACT_REWIND;
+        r.label = "Rewind to here";
+    }
+    if (r.kind) {
+        r.w = ImGui::CalcTextSize(r.label).x + 2*ImGui::GetStyle().FramePadding.x;
+    }
+    return r;
+}
+
+// Ask before rewinding: the confirmation lists the files (drawrewind).
+static void askrewind(Gui *g, GuiSession *s, Str call, i32 turn, b32 force)
+{
+    g->rewsess    = s;
+    g->rewcall    = call.len ? clone(&g->perm, call) : Str{};
+    g->rewturn    = turn;
+    g->rewforce   = force;
+    g->openrewind = 1;
+}
+
+static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
+{
+    ViewTool *t = m->tool;
+    g->kidlinkshown |= act->amber;
+    b32 go = ImGui::SmallButton(act->label);
+    switch (act->kind) {
+    case ACT_OPEN:
+        itemrect(g, RECT_TASKLINK);
+        ImGui::SetItemTooltip("Show the subagent's own transcript");
+        if (go) guiselect(g, act->child);
+        break;
+    case ACT_UNDO:
+        itemrect(g, RECT_UNDO);
+        ImGui::SetItemTooltip("Put back the file as it was before this call, and "
+                              "every file changed after it");
+        if (go) askrewind(g, s, t->call, 0, 0);
+        break;
+    case ACT_REWIND:
+        itemrect(g, RECT_REWINDTURN);
+        ImGui::SetItemTooltip("Put back every file write and edit changed from "
+                              "this turn on");
+        if (go) askrewind(g, s, {}, m->startsturn, 0);
+        break;
+    }
+}
+
+// The latest rewind's button, when it left files alone.
+static void drawforce(Gui *g, GuiSession *s, ViewMsg *m)
+{
+    ViewCard *c = m->card;
+    ImGui::BeginDisabled(!canrewind(g, s));
+    b32 go = ImGui::Button("Rewind anyway...");
+    itemrect(g, RECT_FORCE);
+    ImGui::SetItemTooltip("Put these files back too, overwriting what changed them since");
+    ImGui::EndDisabled();
+    if (go) {
+        askrewind(g, s, c->to, c->turn, 1);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("overwrites the changes made since");
+}
+
 // An open ask's buttons, below its text.
 static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
 {
@@ -726,6 +1014,203 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
     ImGui::SetItemTooltip("Deny, telling the agent what to do instead");
 }
 
+// At most n bytes of s, cut on a UTF-8 boundary, with an ellipsis when
+// cut.
+static Str shorten(Arena *a, Str s, iz n)
+{
+    if (s.len <= n) {
+        return s;
+    }
+    for (; n>0 && (s[n]&0xc0)==0x80; n--) {}
+    return concat(a, clone(a, takehead(s, n)), "\xe2\x80\xa6");
+}
+
+static Str sesstitle(GuiSession *);
+
+// Where the last item ends, in window coordinates with a spacing after
+// it, for an item right-aligned on its line only if it fits there.
+static f32 rightof()
+{
+    f32 x = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;
+    return x + ImGui::GetStyle().ItemSpacing.x;
+}
+
+static void inforow(char const *key, Str value)
+{
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextDisabled("%s", key);
+    ImGui::TableNextColumn();
+    text(value.len ? value : Str("(none)"));
+}
+
+// The session's details: what it is, where it works, which model and
+// role, and the instruction files the agent was given.
+static void drawinfo(Gui *g, GuiSession *s, View *v)
+{
+    Arena a  = g->frame;
+    f32   sc = g->scale;
+    ImGui::PushTextWrapPos(560*sc);
+    if (ImGui::BeginTable("##info", 2, ImGuiTableFlags_SizingFixedFit)) {
+        inforow("Session", s->sid);
+        inforow("Title", sesstitle(s));
+        inforow("Directory", v->cwd);
+        inforow("Model", v->model);
+        inforow("Endpoint", v->endpoint);
+        if (v->role.len) {
+            inforow("Role", v->role);
+        }
+        if (v->tools.len) {
+            inforow("Tools", v->tools);
+        }
+        if (v->parent.len) {
+            GuiSession *p = findsess(g, v->parent);
+            inforow("Parent", p ? sesstitle(p) : v->parent);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::Separator();
+    ImGui::TextUnformatted("Instruction files");
+    if (!v->instr.len) {
+        ImGui::TextDisabled("None: no AGENTS.md or CLAUDE.md applies here.");
+    }
+    i32 agents = 0;
+    for (iz i = 0; i < v->instr.len; i++) {
+        ViewInstr *in = &v->instr[i];
+        Buf b(&a, 256);
+        print(&b, bytesize(&a, in->bytes));
+        print(&b, in->why=="nested"  ? Str(", for a directory the agent worked in") :
+                  in->why=="changed" ? Str(", changed since the session began") :
+                  Str(", from the start"));
+        if (in->importer.len) {
+            print(&b, ", imported by ");
+            print(&b, showpath(v, in->importer));
+        }
+        ImGui::Bullet();
+        text(showpath(v, in->path));
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        agents += endswith(in->path, "AGENTS.md");
+    }
+    for (iz i = 0; i < v->skipped.len; i++) {
+        ImGui::TextDisabled("Not loaded: %s", cstr0(&a, showpath(v, v->skipped[i])));
+    }
+    if (v->instrtext.len) {
+        if (ImGui::SmallButton("Copy what the agent was given")) {
+            ImGui::SetClipboardText(cstr0(&a, v->instrtext));
+        }
+    }
+    ImGui::PopTextWrapPos();
+    g->infoshown = (i32)v->instr.len;
+    g->infoagents = agents;
+}
+
+// A line above the transcript: the session, or a subagent's parent to
+// go back to, and the session's details in a popup.
+static void drawsessbar(Gui *g)
+{
+    GuiSession *s = g->sess;
+    View       *v = g->view;
+    if (!s || !s->view) {
+        return;
+    }
+    Arena       a     = g->frame;
+    ImGuiStyle &st    = ImGui::GetStyle();
+    f32         infow = ImGui::CalcTextSize("Info").x + 2*st.FramePadding.x;
+    f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - infow;
+    if (v->parent.len) {
+        GuiSession *p = findsess(g, v->parent);
+        ImGui::TextDisabled(v->role.len ? "Subagent (%s) of" : "Subagent%s of",
+                            cstr0(&a, v->role));
+        ImGui::SameLine();
+        Str title = shorten(&a, p ? sesstitle(p) : v->parent, 60);
+        if (ImGui::TextLink(cstr0(&a, title))) {
+            guiselect(g, p ? p : addsess(g, v->parent));
+        }
+        itemrect(g, RECT_PARENTLINK);
+        ImGui::SetItemTooltip("Back to the session that started this subagent");
+    } else {
+        Buf b(&a, 256);
+        print(&b, shorten(&a, sesstitle(s), 60));
+        if (v->model.len) {
+            print(&b, "  \xc2\xb7  ");  // a middle dot
+            print(&b, v->model);
+        }
+        if (v->role.len) {
+            print(&b, "  \xc2\xb7  role ");
+            print(&b, v->role);
+        }
+        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+    }
+    ImGui::SameLine(right > rightof() ? right : 0);
+    if (ImGui::SmallButton("Info")) {
+        ImGui::OpenPopup("##sessinfo");
+    }
+    itemrect(g, RECT_INFOBTN);
+    ImGui::SetItemTooltip("The session's model, role and instruction files");
+    if (ImGui::BeginPopup("##sessinfo")) {
+        drawinfo(g, s, v);
+        ImGui::EndPopup();
+    }
+}
+
+// Before a rewind: the files it would put back, newest first, and how.
+static void drawrewind(Gui *g)
+{
+    f32 sc = g->scale;
+    if (g->openrewind) {
+        ImGui::OpenPopup("Rewind files?");
+        g->openrewind = 0;
+    }
+    ImGui::SetNextWindowSize(v2(560*sc, 0));
+    if (!ImGui::BeginPopupModal("Rewind files?", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    Arena       a  = g->frame;
+    GuiSession *s  = g->rewsess;
+    View       *v  = s && s->view ? s->view : g->view;
+    Slice<ViewSnap> set = rewindset(v, &a, g->rewcall, g->rewturn);
+    ImGui::PushTextWrapPos(0);
+    if (g->rewcall.len) {
+        ImGui::TextUnformatted("Undo this change, and every later change by write and edit:");
+    } else {
+        ImGui::Text("Put back the files changed by write and edit from turn %d on:", g->rewturn);
+    }
+    for (iz i = 0; i < set.len; i++) {
+        ImGui::Bullet();
+        text(showpath(v, set[i].path));
+        ImGui::SameLine();
+        ImGui::TextDisabled(set[i].existed ? "put back as it was" : "removed, as it did not exist then");
+    }
+    if (!set.len) {
+        ImGui::TextDisabled("Nothing is left to rewind there.");
+    }
+    if (g->rewforce) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+        ImGui::TextUnformatted("Files changed since by something else are overwritten too.");
+        ImGui::PopStyleColor();
+    }
+    ImGui::TextDisabled("Changes made by shell commands are not undone. The agent "
+                        "is told what was put back.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    ImGui::BeginDisabled(!set.len || !canrewind(g, s));
+    b32 go = ImGui::Button(g->rewforce ? "Rewind anyway" : "Rewind", v2(140*sc, 0));
+    itemrect(g, RECT_REWINDOK);
+    ImGui::EndDisabled();
+    if (go) {
+        guirewind(g, s, g->rewcall, g->rewturn, g->rewforce);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0));
+    itemrect(g, RECT_REWINDCANCEL);
+    if (cancel) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 // The transcript of the session shown: virtualized messages with
 // selection across them, tool rows and ask cards.
 static void drawtranscript(Gui *g)
@@ -735,6 +1220,7 @@ static void drawtranscript(Gui *g)
     f32         sc = g->scale;
     ImGuiStyle &st = ImGui::GetStyle();
 
+    drawsessbar(g);
     if (gs->readonly) {
         g->bannershown = 1;
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
@@ -933,6 +1419,10 @@ static void drawtranscript(Gui *g)
             break;
         }
     }
+    i32 latest[] = {RECT_TASKLINK, RECT_UNDO, RECT_REWINDTURN, RECT_FORCE, RECT_COMPACTHDR};
+    for (iz i = 0; i < countof(latest); i++) {
+        g->rects[latest[i]] = {};  // the latest drawn, or none
+    }
     sp->Split(dl, CH_COUNT);
     for (i32 i = d0; i>=0 && i <= d1; i++) {
         ViewMsg   *m     = &v->msgs[i];
@@ -955,10 +1445,17 @@ static void drawtranscript(Gui *g)
             b32 open = m->tool->answer == VASK_PENDING;
             dl->AddRectFilled(box0, box1, g->pal->askbg, 6*sc);
             dl->AddRect(box0, box1, open ? g->pal->amber : fade(g->pal->amber, 0.4f), 6*sc, 1.5f*sc);
+        } else if (m->role==VIEW_COMPACT || m->role==VIEW_REWIND) {
+            u32 bar = m->role==VIEW_COMPACT ? g->pal->active :
+                      m->card->conflicts    ? g->pal->amber : g->pal->ok;
+            dl->AddRectFilled(box0, box1, g->pal->toolbg, 4*sc);
+            dl->AddRectFilled(box0, v2(box0.x+3*sc, box1.y), fade(bar, 0.8f));
         }
 
         sp->SetCurrentChannel(dl, CH_TEXT);
-        Pen p = {dl, &g->fonts, x, y + pad/4, x + width, g->fonts.size*0.85f};
+        MsgAction act = msgaction(g, g->sess, v, m);
+        f32       actw = act.kind ? act.w + 8*sc : 0;
+        Pen p = {dl, &g->fonts, x, y + pad/4, x + width - actw, g->fonts.size*0.85f};
         drawheader(g, &p, v, m, nowms);
         ImVec2 origin = v2(x, y + head);
         if (!m->collapsed) {
@@ -973,19 +1470,29 @@ static void drawtranscript(Gui *g)
         }
 
         ImGui::PushID(i);
-        if (m->role==VIEW_TOOL || m->role==VIEW_THINK) {
-            // The header toggles the body
+        if (m->fold || m->role==VIEW_TOOL || m->role==VIEW_THINK) {
+            // The header toggles the body, but for its action
             ImGui::SetCursorScreenPos(v2(x, y));
-            if (ImGui::InvisibleButton("##toggle", v2(width, head))) {
+            if (ImGui::InvisibleButton("##toggle", v2(width - actw, head))) {
                 togglemsg(v, i);
+            }
+            if (m->role == VIEW_COMPACT) {
+                itemrect(g, RECT_COMPACTHDR);
             }
             if (ImGui::IsItemHovered()) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
             }
         }
-        if (mfoot > 0) {
+        if (act.kind) {
+            ImGui::SetCursorScreenPos(v2(x + width - act.w, y + pad/4));
+            drawaction(g, gs, m, &act);
+        }
+        if (mfoot>0 && m->role==VIEW_ASK) {
             ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
             drawaskbuttons(g, gs, m, i==lastask);
+        } else if (mfoot > 0) {
+            ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
+            drawforce(g, gs, m);
         }
         ImGui::PopID();
     }
@@ -1031,6 +1538,7 @@ static void drawtranscript(Gui *g)
         }
         ImGui::EndPopup();
     }
+    drawrewind(g);
 }
 
 
@@ -1062,10 +1570,10 @@ static void drawstrip(Gui *g)
     i64   nowms = os_time(g->os);
     i64   now   = g->sched.now;
     b32   req   = v->state==LIVE_DISCOVER || v->state==LIVE_WAITING ||
-                  v->state==LIVE_STREAMING || v->state==LIVE_ERROR;
+                  v->state==LIVE_STREAMING || v->state==LIVE_ERROR ||
+                  v->state==LIVE_COMPACTING;
     ImGui::PushStyleColor(ImGuiCol_Text, livecolor(g->pal, v->state));
-    ImGui::TextUnformatted(cstr0(&a, v->busy && v->state==LIVE_IDLE ? Str("working")
-                                                                     : livenames[v->state]));
+    ImGui::TextUnformatted(cstr0(&a, livelabel(v, v->state)));
     ImGui::PopStyleColor();
 
     if (v->busy && g->sess->readonly) {
@@ -1084,6 +1592,32 @@ static void drawstrip(Gui *g)
         print(&b, " s");
         ImGui::SameLine();
         ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+    }
+    if (v->state == LIVE_QUEUED) {
+        // Its place in the endpoint's line, which live records update
+        g->queuedshown = 1;
+        Buf b(&a, 96);
+        print(&b, "waiting for the endpoint");
+        if (v->queuepos) {
+            print(&b, ": ");
+            print(&b, (i64)v->queuepos);
+            print(&b, " of ");
+            print(&b, (i64)(v->queuelen>v->queuepos ? v->queuelen : v->queuepos));
+            print(&b, " in line");
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+    } else if (v->state == LIVE_TASK) {
+        g->taskshown = v->tasks;
+        Buf b(&a, 64);
+        print(&b, (i64)v->tasks);
+        print(&b, v->tasks==1 ? Str(" subagent at work") : Str(" subagents at work"));
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+    } else if (v->state == LIVE_COMPACTING) {
+        g->compactingshown = 1;
+        ImGui::SameLine();
+        ImGui::TextDisabled("summarizing the conversation to make room");
     }
     if (req && v->tps > 0) {
         Buf b(&a, 32);
@@ -1130,12 +1664,19 @@ static void drawstrip(Gui *g)
         }
     }
     if (v->state==LIVE_BACKOFF && v->retryat) {
+        // The next attempt's model, if not the session's: a fallback's
         g->retryshown = 1;
         i64 secs = countdown(g, v->retryat, nowms);
-        Buf b(&a, 48);
-        print(&b, "retrying in ");
-        print(&b, secs);
-        print(&b, " s");
+        Str left = secstext(&a, secs);
+        Buf b(&a, 128 + v->retrymodel.len);
+        print(&b, v->retryslow ? Str("slow retry in ") : Str("retrying in "));
+        print(&b, left);
+        b32 other = v->retrymodel.len && v->retrymodel!=v->model;
+        if (other) {
+            print(&b, v->fallback ? Str(" on fallback ") : Str(" with "));
+            print(&b, v->retrymodel);
+            g->fallbackshown |= v->fallback > 0;
+        }
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
         ImGui::TextUnformatted(cstr0(&a, finish(&b)));
@@ -1267,6 +1808,22 @@ static Slice<GuiSession *> sesslist(Gui *g, Arena *a)
     for (iz i = 0; i < all.len; i++) {
         sessplace(&t, all[i], 0);  // in a cycle of parents
     }
+
+    // A parent shows that a subagent below it needs an answer
+    for (iz i = 0; i < all.len; i++) {
+        all[i]->kidask = 0;
+    }
+    for (iz i = 0; i < all.len; i++) {
+        GuiSession *s = all[i];
+        if (!s->view || !s->view->asks) continue;
+        for (i32 n = 0; n < 8; n++) {
+            Str          p  = sessparent(s);
+            GuiSession **up = p.len ? upsert(&bysid, p, (Arena *)0) : 0;
+            if (!up || *up==all[i]) break;
+            s = *up;
+            s->kidask = 1;
+        }
+    }
     return t.out;
 }
 
@@ -1305,6 +1862,15 @@ static void drawsessions(Gui *g)
         Str cwd = v && v->cwd.len ? v->cwd : s->cwd;
         ImGui::SetItemTooltip("%s\n%s", cstr0(&a, cwd), cstr0(&a, s->sid));
         f32 x = p.x + 4*sc + (f32)s->depth*14*sc;  // a subagent under its parent
+
+        // A dot in the color of its state, amber when it, or a subagent
+        // below it, waits for the user
+        b32 ro    = s->readonly || (!v && s->locked);
+        b32 asks  = v && v->asks;
+        u32 color = ro || asks || s->kidask ? g->pal->amber : livecolor(g->pal, state);
+        drawdot(dl, v2(x + 4*sc, p.y + 2*sc + lineh/2), 3.5f*sc, color);
+        x += 13*sc;
+
         Pen t = {dl, &g->fonts, x, p.y + 2*sc, p.x + w, g->fonts.size};
         pen(&t, sesstitle(s), 0, g->pal->text);
         Pen b = {dl, &g->fonts, x, p.y + 2*sc + lineh, p.x + w, small};
@@ -1312,13 +1878,31 @@ static void drawsessions(Gui *g)
             pen(&b, v->role, 0, g->pal->dim);
             pen(&b, "  ", 0, g->pal->dim);
         }
-        if (s->readonly || (!v && s->locked)) {
+        if (ro) {
             pen(&b, "read-only", STYLE_BOLD, g->pal->amber);
-        } else if (v && v->asks) {
+        } else if (asks) {
             pen(&b, "needs an answer", STYLE_BOLD, g->pal->amber);
+        } else if (s->kidask) {
+            pen(&b, "a subagent needs an answer", STYLE_BOLD, g->pal->amber);
+            g->kidaskshown |= s == g->sess;
         } else {
-            Str name = v && v->busy && state==LIVE_IDLE ? Str("working") : livenames[state];
-            pen(&b, name, STYLE_BOLD, livecolor(g->pal, state));
+            pen(&b, livelabel(v, state), STYLE_BOLD, livecolor(g->pal, state));
+            if (v && state==LIVE_QUEUED && v->queuepos) {
+                Buf q(&a, 32);
+                print(&q, " ");
+                print(&q, (i64)v->queuepos);
+                print(&q, " of ");
+                print(&q, (i64)(v->queuelen>v->queuepos ? v->queuelen : v->queuepos));
+                pen(&b, finish(&q), 0, g->pal->dim);
+            }
+        }
+        i64 jobs = v ? v->jobsrun : s->jobs;
+        if (jobs) {
+            Buf q(&a, 32);
+            print(&q, "  ");
+            print(&q, jobs);
+            print(&q, jobs==1 ? Str(" job") : Str(" jobs"));
+            pen(&b, finish(&q), STYLE_BOLD, g->pal->active);
         }
         pen(&b, "  ", 0, g->pal->dim);
         pen(&b, cwd, 0, g->pal->dim);
@@ -1326,6 +1910,173 @@ static void drawsessions(Gui *g)
     }
     if (!list.len) {
         ImGui::TextDisabled("No sessions yet.");
+    }
+}
+
+// Todo list and background jobs, of the session shown
+
+// The agent's todo list, as it last wrote it: a mark for each item's
+// state, then the item, wrapped.
+static void drawtodo(Gui *g)
+{
+    View *v = g->view;
+    g->todoshown = 0;
+    if (!g->sess || !v->todos.len) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("No todo list. The agent keeps one for longer tasks.");
+        ImGui::PopTextWrapPos();
+        return;
+    }
+    Palette    *pal  = g->pal;
+    f32         sc   = g->scale;
+    ImDrawList *dl   = ImGui::GetWindowDrawList();
+    f32         lh   = ImGui::GetTextLineHeight();
+    f32         r    = lh*0.28f;
+    i32         done = 0;
+    for (iz i = 0; i < v->todos.len; i++) {
+        done += v->todos[i].status == VTODO_DONE;
+    }
+    ImGui::TextDisabled("%d of %d done", done, (i32)v->todos.len);
+    ImVec2 top = ImGui::GetCursorScreenPos();
+    ImGui::PushTextWrapPos(0);
+    for (iz i = 0; i < v->todos.len; i++) {
+        ViewTodo *t   = &v->todos[i];
+        ImVec2    p   = ImGui::GetCursorScreenPos();
+        ImVec2    c   = v2(p.x + lh*0.5f, p.y + lh*0.5f);
+        u32       col = pal->paneltext;
+        switch (t->status) {
+        case VTODO_PENDING:
+            dl->AddCircle(c, r, pal->dim, 12, 1.5f*sc);
+            break;
+        case VTODO_ACTIVE:
+            dl->AddCircle(c, r, pal->active, 12, 1.5f*sc);
+            dl->AddCircleFilled(c, r*0.55f, pal->active, 12);
+            col = pal->active;
+            break;
+        case VTODO_DONE: {
+            ImVec2 pts[] = {v2(c.x-r, c.y), v2(c.x-r*0.25f, c.y+r*0.75f), v2(c.x+r, c.y-r*0.8f)};
+            dl->AddPolyline(pts, countof(pts), pal->ok, 2*sc);
+            col = pal->paneldim;
+        } break;
+        }
+        ImGui::Dummy(v2(lh*1.2f, lh));
+        ImGui::SameLine(0, 0);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        text(t->content);
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+    ImVec2 end = ImGui::GetCursorScreenPos();
+    g->rects[RECT_TODO] = {top.x, top.y, top.x+ImGui::GetContentRegionAvail().x, end.y};
+    g->todoshown = (i32)v->todos.len;
+}
+
+// The last n lines of s.
+static Str lastlines(Str s, i32 n)
+{
+    for (; s.len && (s[s.len-1]=='\n' || s[s.len-1]=='\r'); s.len--) {}
+    iz i = s.len;
+    for (i32 k = 0; i > 0; i--) {
+        if (s[i-1]=='\n' && ++k==n) break;
+    }
+    return cuthead(s, i);
+}
+
+static void guijobkill(Gui *, GuiSession *, i64);
+
+// The session's background jobs, newest first: state, number, how long,
+// a Kill button while it runs, its command, and its output's end. A
+// running job's clock asks for a frame a second, only while shown.
+static void drawjobs(Gui *g)
+{
+    View *v = g->view;
+    g->jobsshown = 0;
+    if (!g->sess || !v->jobs.len) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("No background jobs. Commands the agent runs in the "
+                            "background, or that outlast their timeout, show here.");
+        ImGui::PopTextWrapPos();
+        return;
+    }
+    Arena       a     = g->frame;
+    i64         nowms = os_time(g->os);
+    ImGuiStyle &st    = ImGui::GetStyle();
+    f32         killw = ImGui::CalcTextSize("Stopping...").x + 2*st.FramePadding.x;
+    b32         can   = !g->sess->readonly && !g->enginegone && !g->quitting;
+    b32         first = 1;
+    for (iz i = v->jobs.len-1; i >= 0; i--) {
+        ViewJob *j = &v->jobs[i];
+        ImGui::PushID((i32)i);
+        Buf b(&a, 64);
+        switch (j->status) {
+        case VJOB_EXITED:
+            print(&b, "exited ");
+            print(&b, (i64)j->exit);
+            break;
+        case VJOB_KILLED:
+            print(&b, j->signal ? Str("killed, signal ") : Str("killed"));
+            if (j->signal) print(&b, (i64)j->signal);
+            break;
+        default:
+            print(&b, vjobnames[j->status]);
+        }
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushStyleColor(ImGuiCol_Text, jobcolor(g->pal, j));
+        text(finish(&b));
+        ImGui::PopStyleColor();
+        b.len = 0;
+        print(&b, "job ");
+        print(&b, j->n);
+        print(&b, "  ");
+        if (j->status == VJOB_RUNNING) {
+            i64 el = nowms - j->start;
+            el = el<0 ? 0 : el;
+            schedat(&g->sched, g->sched.now + (1000 - el%1000)*1000 + 1000, DUE_CLOCK);
+            print(&b, secstext(&a, el/1000));
+        } else if (j->ms) {
+            print(&b, duration(&a, j->ms));
+        }
+        if (j->bytes) {
+            print(&b, "  ");
+            print(&b, bytesize(&a, j->bytes));
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        if (j->status==VJOB_RUNNING && can) {
+            f32 right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - killw;
+            ImGui::SameLine(right > rightof() ? right : 0);
+            ImGui::BeginDisabled(j->killing);
+            b32 kill = ImGui::Button(j->killing ? "Stopping..." : "Kill", v2(killw, 0));
+            ImGui::EndDisabled();
+            if (first) {
+                itemrect(g, RECT_JOBKILL);
+                first = 0;
+            }
+            ImGui::SetItemTooltip("Stop the job (and what it started); the agent is told");
+            if (kill) {
+                j->killing = 1;
+                guijobkill(g, g->sess, j->n);
+            }
+        }
+
+        ImGui::PushFont(g->fonts.mono, 0);
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->summary);
+        text(j->summary);
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered() && j->spill.len) {
+            Str full = v->dir.len ? join(&a, v->dir, j->spill) : j->spill;
+            ImGui::SetItemTooltip("%s\nFull output: %s", cstr0(&a, j->command), cstr0(&a, full));
+        }
+        Str tail = lastlines({j->tail, j->taillen}, 4);
+        if (tail.len) {
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->paneldim);
+            text(tail);
+            ImGui::PopStyleColor();
+        }
+        ImGui::PopFont();
+        ImGui::Separator();
+        ImGui::PopID();
+        g->jobsshown++;
     }
 }
 
@@ -1675,6 +2426,10 @@ static void drawsettings(Gui *g)
             ImGui::InputTextWithHint("##add", "name", g->addname, FIELD_MAX);
             if (kind == "endpoint") {
                 itemrect(g, RECT_ADDNAME);
+                if (g->reveal == RECT_ADDNAME) {
+                    ImGui::SetScrollHereY(0.5f);  // for the checklist
+                    g->reveal = -1;
+                }
             }
             ImGui::SameLine();
             Buf ab(&a, 64);
@@ -1971,6 +2726,18 @@ static void drawtoolbar(Gui *g)
     }
 }
 
+// The dock node a window is in, or was in when the layout was saved;
+// 0 if neither.
+static ImGuiID saveddock(char const *name)
+{
+    ImGuiWindow *w = ImGui::FindWindowByName(name);
+    if (w) {
+        return w->DockId;
+    }
+    ImGuiWindowSettings *s = ImGui::FindWindowSettingsByID(ImHashStr(name));
+    return s ? s->DockId : 0;
+}
+
 static void dockwindows(Gui *g)
 {
     ImGuiViewport *vp = ImGui::GetMainViewport();
@@ -2014,16 +2781,20 @@ static void dockwindows(Gui *g)
         // which the sessions take the left
         ImGuiID left = 0, rest = 0, right = 0, center = 0;
         ImGuiID top = 0, bottom = 0, rtop = 0, rbot = 0;
+        ImGuiID ltop = 0, lbot = 0;
         ImGui::DockBuilderSplitNode(id, ImGuiDir_Right, 0.28f, &right, &rest);
         ImGui::DockBuilderSplitNode(rest, ImGuiDir_Left, 0.25f, &left, &center);
         ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.22f, &bottom, &top);
         ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.40f, &rbot, &rtop);
-        ImGui::DockBuilderDockWindow("Sessions", left);
+        ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.35f, &lbot, &ltop);
+        ImGui::DockBuilderDockWindow("Sessions", ltop);
+        ImGui::DockBuilderDockWindow("Todo", lbot);
         ImGui::DockBuilderDockWindow("Help", top);
         ImGui::DockBuilderDockWindow("Transcript", top);
         ImGui::DockBuilderDockWindow("Prompt", bottom);
         ImGui::DockBuilderDockWindow("Metrics", rtop);
         ImGui::DockBuilderDockWindow("Settings", rtop);
+        ImGui::DockBuilderDockWindow("Jobs", rbot);
         ImGui::DockBuilderDockWindow("Log", rbot);
         ImGui::DockBuilderFinish(id);
     }
@@ -2033,6 +2804,15 @@ static void dockwindows(Gui *g)
     if (ImGui::Begin("Sessions")) {
         escapecancel(g);
         drawsessions(g);
+    }
+    ImGui::End();
+    // Windows that a layout saved before them lacks join a neighbor
+    ImGuiID near = saveddock("Sessions");
+    if (near) {
+        ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+    }
+    if (ImGui::Begin("Todo")) {
+        drawtodo(g);
     }
     ImGui::End();
     // Submitted first, so that it is the tab selected in its dock node.
@@ -2056,6 +2836,15 @@ static void dockwindows(Gui *g)
     ImGui::End();
     if (ImGui::Begin("Settings")) {
         drawsettings(g);
+    }
+    ImGui::End();
+    // Submitted before the log, so that it is the tab selected
+    near = saveddock("Log");
+    if (near) {
+        ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+    }
+    if (ImGui::Begin("Jobs")) {
+        drawjobs(g);
     }
     ImGui::End();
     if (ImGui::Begin("Log")) {

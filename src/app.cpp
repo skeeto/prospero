@@ -143,6 +143,17 @@ enum : i32 {
     RECT_ADDBTN,
     RECT_THEMECOMBO,
     RECT_LONGFIELD,  // a setting's field holding more than its slack
+    RECT_TODO,       // the todo list's items
+    RECT_JOBKILL,    // the newest running job's Kill
+    RECT_TASKLINK,   // the latest task row's subagent link
+    RECT_PARENTLINK, // a subagent's link to its parent
+    RECT_UNDO,       // the latest Undo on a tool row
+    RECT_REWINDTURN, // the latest Rewind to here
+    RECT_REWINDOK,   // the rewind confirmation's buttons
+    RECT_REWINDCANCEL,
+    RECT_FORCE,      // the latest rewind card's Rewind anyway
+    RECT_INFOBTN,    // the session's Info
+    RECT_COMPACTHDR, // the latest compaction card's header
     RECT_THEME0,     // the theme's choices in its open list
     RECT_COUNT = RECT_THEME0 + THEME_COUNT,
 };
@@ -243,8 +254,10 @@ struct GuiSession {
     Str          model;
     Str          parent;    // a subagent's, from the list until opened
     i64          mtime;
+    i64          jobs;      // running background jobs, from the list
     i64          openid;    // the open in flight, 0 if none
     i32          depth;     // under its parent in the sidebar, this frame
+    b32          kidask;    // a subagent below it needs an answer, this frame
 };
 
 // A command awaiting its reply.
@@ -401,6 +414,12 @@ struct Gui {
     Str                denyreq;
     GuiSession        *denysess;
     b32                opendeny;
+    b32                openrewind; // the rewind confirmation, for
+    GuiSession        *rewsess;
+    Str                rewcall;    // a call's change and those after, or
+    i32                rewturn;    // a turn's on
+    b32                rewforce;   // conflicts overwritten
+    i64                rewindid;   // rewind in flight, 0 if none
     Arena              cfgmem;     // the latest config.get, reset for each
     byte              *cfgbase;
     Json              *cfg;        // its reply, null until one arrives
@@ -467,6 +486,17 @@ struct Gui {
     b32                retryshown;   // the strip counted down to a retry
     b32                bannershown;  // the read-only banner was drawn
     b32                roclock;      // a read-only view's turn had a clock
+    b32                queuedshown;  // the strip showed the line's position
+    i32                taskshown;    // and how many subagents work
+    b32                compactingshown;
+    b32                fallbackshown;  // a retry on a fallback model
+    b32                kidaskshown;  // the sidebar: a subagent needs an answer
+    i32                todoshown;    // items the todo list drew
+    i32                jobsshown;    // jobs the jobs panel drew
+    i32                infoshown;    // instruction files the info listed
+    i32                infoagents;   // of them AGENTS.md
+    b32                kidlinkshown; // a task row asked to answer its subagent
+    i64                rewsent;      // rewinds sent
     i32                drivewait;    // W_* condition it waits for
     i64                holduntil;    // µs: the inbox is left alone until
     b32                held;         // a wake came during the hold
@@ -746,17 +776,22 @@ static void guiselect(Gui *g, GuiSession *s)
     setcur(g, s);
 }
 
-// A new session in cwd, with the given model or the configured one.
-static void guinew(Gui *g, Str cwd, Str model)
+// A new session in cwd, with the given model or the configured one,
+// and a role ([role NAME]), if named.
+static void guinew(Gui *g, Str cwd, Str model, Str role = {})
 {
     Arena a = newarena(g->cmdr);
-    Buf   b(&a, 512 + cwd.len + model.len);
+    Buf   b(&a, 512 + cwd.len + model.len + role.len);
     EvOut w = cmdopen(g, &b, CMD_NEW, 0);
     putkey(&w.json, "cwd");
     putstr(&w.json, cwd);
     if (model.len) {
         putkey(&w.json, "model");
         putstr(&w.json, model);
+    }
+    if (role.len) {
+        putkey(&w.json, "role");
+        putstr(&w.json, role);
     }
     putkey(&w.json, "attended");
     putint(&w.json, 1);
@@ -806,6 +841,43 @@ static void guianswer(Gui *g, GuiSession *s, Str req, b32 allow, Str note)
         putkey(&w.json, "note");
         putstr(&w.json, note);
     }
+    cmdsend(g, &w, a);
+}
+
+// Put back the files write and edit changed: from a call's on (call),
+// or from a turn's on, overwriting conflicts if forced. A rewind record
+// tells how each went.
+static void guirewind(Gui *g, GuiSession *s, Str call, i32 turn, b32 force)
+{
+    if (!s || !s->view) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + call.len);
+    EvOut w = cmdopen(g, &b, CMD_REWIND, s);
+    putkey(&w.json, "to");
+    if (call.len) {
+        putstr(&w.json, call);
+    } else {
+        putint(&w.json, turn);
+    }
+    if (force) {
+        putkey(&w.json, "force");
+        putint(&w.json, 1);
+    }
+    g->rewindid = g->nextid;
+    g->rewsent++;
+    cmdsend(g, &w, a);
+}
+
+// Stop a background job; its end tells the agent.
+static void guijobkill(Gui *g, GuiSession *s, i64 job)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_JOBKILL, s);
+    putkey(&w.json, "job");
+    putint(&w.json, job);
     cmdsend(g, &w, a);
 }
 
@@ -915,6 +987,7 @@ static void onsessions(Gui *g, Json *j)
         s->model  = s->model==model   ? s->model  : clone(&g->perm, model);
         s->parent = s->parent==parent ? s->parent : clone(&g->perm, parent);
         s->mtime  = jsonint(jsonget(e, "mtime"), 0);
+        s->jobs   = jsonint(jsonget(e, "jobs"), 0);
         s->locked = jsonint(jsonget(e, "locked"), 0) != 0;
         s->state  = livestate(jsonstr(jsonget(e, "state")));
         s->listed = 1;
@@ -969,6 +1042,29 @@ static void onreply(Gui *g, Arena scratch, EvRec *r, Str line)
             s->view->topsdirty = 1;  // no buttons on its asks
         }
     } return;
+
+    case CMD_REWIND: {
+        if (g->rewindid == id) {
+            g->rewindid = 0;
+        }
+        // A rewind that changed nothing has no record: its note says so
+        Str note = jsonstr(jsonget(j, "note"));
+        if (!ok || !jsonlen(jsonget(j, "files"))) {
+            g->lasterr = clone(&g->perm, ok ? note : err);
+            guilog(g, g->lasterr);
+        }
+    } return;
+
+    case CMD_JOBKILL:
+        if (!ok) {
+            GuiSession *s = q.s;
+            for (iz i = 0; s && s->view && i<s->view->jobs.len; i++) {
+                s->view->jobs[i].killing = 0;
+            }
+            g->lasterr = clone(&g->perm, err);
+            guilog(g, g->lasterr);
+        }
+        return;
 
     case CMD_CONFIGGET:
         if (g->cfgget == id) {
@@ -1087,6 +1183,8 @@ static b32 guirecord(Gui *g, Str line)
     i32   state = v->state;
     i32   asks  = v->asks;
     b32   busy  = v->busy;
+    i32   jobs  = v->jobsrun;
+    i32   qpos  = v->queuepos;
     if (r.seq && v->lost) {
         // The resync brings it, in order: applied now, in a replay's
         // loose order, it would move lastseq past the records lost
@@ -1101,9 +1199,10 @@ static b32 guirecord(Gui *g, Str line)
         s->stick = 1;  // an ask needs seeing: scroll to it
     }
     if (s != g->sess) {
-        // Only the sidebar shows it
+        // Only the sidebar shows it, and the rows of its parent's tasks
         return state!=v->state || asks!=v->asks || busy!=v->busy ||
-               r.ev==EV_TITLE || r.ev==EV_SESSION;
+               jobs!=v->jobsrun || qpos!=v->queuepos ||
+               r.ev==EV_TITLE || r.ev==EV_SESSION || r.ev==EV_TOOLEND;
     }
     if (g->histreq && r.ev==EV_NOTE && find(line, "history loaded")>=0) {
         g->histdone = 1;
@@ -1126,7 +1225,8 @@ static b32 heldback(Gui *g, Str line)
     }
     Str ev   = cuthead(head, at+6);
     b32 kind = startswith(ev, "delta\"") || startswith(ev, "tool.out\"") ||
-               startswith(ev, "progress\"") || startswith(ev, "live\"");
+               startswith(ev, "progress\"") || startswith(ev, "live\"") ||
+               startswith(ev, "job.out\"");
     return kind && linesid(line)==g->sess->sid;
 }
 
@@ -1750,7 +1850,12 @@ static void drainmail(Gui *g, i64 now)
             g->engineerr = "the engine stopped";
         }
     }
-    if (stopped && !g->quitting) {
+    if (g->enginegone && !g->quitting && (stopped || other)) {
+        // Its last output may come after its exit, since Windows reads
+        // the pipe and waits for the process on threads of their own,
+        // and records held back for a content frame may be older still:
+        // whatever they bring, nothing runs any more
+        flushdeltas(g);
         enginestopped(g);
     }
     if (g->drive && g->drivewait && drivewaitdone(g)) {
@@ -2548,7 +2653,10 @@ static Str pngencode(Arena *a, u8 *rgba, i32 w, i32 h)
 // counted during waits. With the fake agent (--fake) it is M1's list;
 // with an engine, M3's adds sessions, tool rows, asks, steering,
 // cancelling, lost records, a settings edit and closing, against
-// tests/fake_provider.py's "gui" scenario (tests/gui.py runs it).
+// tests/fake_provider.py's "gui" scenario (tests/gui.py runs it), and
+// M4's: subagents and their asks, the todo list, background jobs, undo
+// and rewind with a conflict, the session's info, compactions, a queue
+// and a fallback, half in the light theme and half in the dark.
 
 enum : i32 {
     OP_MOVE,      // move to a target, offset by (dx, dy)
@@ -2587,6 +2695,7 @@ enum : i32 {
     OP_SYSTHEME,  // the system's theme: dx 1 dark, 0 light, -1 its own
     OP_KILLENGINE,// the engine process dies (--engine=subprocess)
     OP_REVEAL,    // scroll the settings window to the RECT_* target
+    OP_TOUCH,     // write over a file in --cwd, as something else would
 };
 
 enum : i32 {
@@ -2621,6 +2730,16 @@ enum : i32 {
     T_THEMECOMBO,  // the theme's list in the settings window
     T_THEMEITEM,   // the theme named by text, in that list once open
     T_LONGFIELD,   // a setting's field holding more than its slack
+    T_TASKLINK,    // the latest task row's subagent link
+    T_PARENTLINK,  // a subagent's link back to its parent
+    T_UNDO,        // the latest Undo on a tool row
+    T_REWINDTURN,  // the latest Rewind to here
+    T_REWINDOK,    // the rewind confirmation's Rewind
+    T_FORCE,       // the latest rewind card's Rewind anyway
+    T_JOBKILL,     // the newest running job's Kill
+    T_INFOBTN,     // the session's Info
+    T_COMPACTHDR,  // the latest compaction card's header
+    T_JOBSTAB,
 };
 
 enum : i32 {
@@ -2685,6 +2804,26 @@ enum : i32 {
     CHK_ENGINESTOPPED,
     CHK_CLICKTHROUGH,
     CHK_NESTED,
+    CHK_TASKSTATE,
+    CHK_CHILDSHOWN,
+    CHK_PARENTSHOWN,
+    CHK_KIDASK,
+    CHK_KIDALLOWED,
+    CHK_TODOACTIVE,
+    CHK_TODODONE,
+    CHK_JOBS,
+    CHK_JOBKILLED,
+    CHK_REWINDASK,
+    CHK_UNDONE,
+    CHK_CONFLICT,
+    CHK_FORCED,
+    CHK_COMPACTING,
+    CHK_SUMMARY,
+    CHK_COMPACTOPEN,
+    CHK_PRUNE,
+    CHK_INFO,
+    CHK_QUEUED,
+    CHK_FALLBACK,
     CHK_COUNT,
 };
 
@@ -2726,6 +2865,26 @@ static Str chknames[] = {
     "the engine died: nothing runs or waits, no ask stays open",
     "a click that activates the window also reaches what it lands on",
     "two subagents reported, listed under their parent",
+    "the parent's strip counted its subagents at work",
+    "the task row's link showed the subagent's transcript",
+    "the subagent's link went back to its parent",
+    "a subagent's ask marked its parent's row and task",
+    "the subagent's ask, answered from its card, let it write",
+    "the todo list showed an item in progress, the rest pending",
+    "the todo list showed every item done",
+    "the jobs panel: one exited, one running with its output",
+    "killed from the panel, the job's end brought the agent back",
+    "the rewind confirmation listed the file",
+    "undone: the file is gone, its row says so, a card lists it",
+    "rewinding a turn left a changed file alone, as a conflict",
+    "forced, the rewind put the file back",
+    "the strip showed a compaction running",
+    "a summary's card with its token counts",
+    "the compaction card opened to its summary",
+    "a pruning's card listed the elided outputs, their rows marked",
+    "the session's info listed its instruction file",
+    "a session queued behind another model, with its place in line",
+    "a retry's countdown named the fallback model",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -2745,14 +2904,26 @@ enum : i32 {
     W_AMBER,      // the strip went amber
     W_BACKOFF,    // the session shown backs off to retry
     W_GONE,       // the engine stopped
+    W_TASKS,      // the session shown waits for two subagents
+    W_KIDASK,     // a subagent of the session shown asks
+    W_TODO,       // its todo list's first item is in progress
+    W_SAID,       // its turn ended, its last reply starting with text
+    W_JOBS,       // it is idle, its first job ended, its second runs
+                  // with its output at "tick 3"
+    W_REWOUND,    // every rewind sent has its card
+    W_COMPACTING, // it runs a summary request
+    W_QUEUED,     // it waits in the endpoint's line
 };
 
 static Str waitnames[] = {
     "", "the engine", "the session", "the turn to end", "an ask",
     "a running tool", "the configuration", "the settings edit", "quitting",
     "every turn to end", "the session to open", "amber", "a retry",
-    "the engine to stop",
+    "the engine to stop", "two subagents at work", "a subagent's ask",
+    "a todo item in progress", "a reply", "the jobs", "a rewind",
+    "a compaction", "the endpoint's line",
 };
+static_assert(countof(waitnames) == W_QUEUED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -3115,11 +3286,146 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_SWITCHED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "6-sessions"},
     {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
-    // Two subagents, under their parent in the sidebar
-    {OP_PROMPT, 0, 0, 0, 1000, "Start subagents."},
+    // M4, in the light theme first. Two subagents, counted at work in
+    // their parent's strip, then listed under it; the parent's task row
+    // shows one, and the subagent's own link goes back
+    {OP_SYSTHEME, 0, 0, 0, 1000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Start subagents."},
+    {OP_WAIT, W_TASKS, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TASKSTATE, 0, 0, 0, ""},
     {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
     {OP_CHECK, CHK_NESTED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "7-subagents"},
+    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CHILDSHOWN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "8-subagent"},
+    {OP_MOVE, T_PARENTLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
+    // A subagent asks: its parent's row and task row say so, and the
+    // task row leads to its card, answered before the deadline
+    {OP_PROMPT, 0, 0, 0, 0, "Start a subagent that asks."},
+    {OP_WAIT, W_KIDASK, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_KIDASK, 0, 0, 0, ""},
+    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_WAIT, W_ASK, 0, 0, 2000, ""},
+    {OP_MOVE, T_ALLOW, 0, 0, 150, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MAIN, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_ALLIDLE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_KIDALLOWED, 0, 0, 0, ""},
+    // The todo list as the agent works through it
+    {OP_PROMPT, 0, 0, 0, 0, "Plan it with a todo list."},
+    {OP_WAIT, W_TODO, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_TODOACTIVE, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "9-todo"},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "Planned and done."},
+    {OP_CHECK, CHK_TODODONE, 0, 0, 0, ""},
+    // Background jobs: one done, one ticking, killed from the panel,
+    // whose end brings the agent back by itself
+    {OP_MOVE, T_JOBSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Start background jobs."},
+    {OP_WAIT, W_JOBS, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_JOBS, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "10-jobs"},
+    {OP_MOVE, T_JOBKILL, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "The second job was killed."},
+    {OP_CHECK, CHK_JOBKILLED, 0, 0, 0, ""},
+    // Then dark. The latest write undone from its row, the turn rewound
+    // into a conflict with a change made outside, then forced
+    {OP_SYSTHEME, 0, 1, 0, 1000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Make undoable changes."},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "Made three changes."},
+    {OP_MOVE, T_UNDO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_REWINDASK, 0, 0, 0, "undo-b.txt"},
+    {OP_SHOT, 0, 0, 0, 300, "11-undo"},
+    {OP_MOVE, T_REWINDOK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_REWOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_UNDONE, 0, 0, 0, ""},
+    {OP_TOUCH, 0, 0, 0, 300, "undo-a.txt"},
+    {OP_MOVE, T_REWINDTURN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_REWINDASK, 0, 0, 0, "undo-a.txt"},
+    {OP_MOVE, T_REWINDOK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_REWOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_CONFLICT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "12-conflict"},
+    {OP_MOVE, T_FORCE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_REWINDASK, 0, 0, 0, "undo-a.txt"},
+    {OP_MOVE, T_REWINDOK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_REWOUND, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_FORCED, 0, 0, 0, ""},
+    // The session's info: its instruction file
+    {OP_MOVE, T_INFOBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_INFO, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "13-info"},
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
+    // Compaction: a summary in a small window, the strip saying so as it
+    // runs, its card opened; then old outputs elided in a big one
+    {OP_NEWSESSION, 0, 0, 0, 0, "small"},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Read the big files."},
+    {OP_WAIT, W_COMPACTING, 0, 0, 15000, ""},
+    {OP_CHECK, CHK_COMPACTING, 0, 0, 0, ""},
+    {OP_WAIT, W_SAID, 0, 0, 15000, "All files read."},
+    {OP_CHECK, CHK_SUMMARY, 0, 0, 0, ""},
+    {OP_MOVE, T_COMPACTHDR, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 600, ""},
+    {OP_CHECK, CHK_COMPACTOPEN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "14-compact"},
+    {OP_NEWSESSION, 0, 0, 0, 0, "prune"},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Read the big files."},
+    {OP_WAIT, W_SAID, 0, 0, 15000, "Pruned and done."},
+    {OP_CHECK, CHK_PRUNE, 0, 0, 0, ""},
+    // Liveness: queued behind another model at a router of one, then a
+    // limit's fallback counting down to its retry
+    {OP_NEWSESSION, 0, 0, 0, 0, "lead"},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 300, "Stream slowly for a while."},
+    {OP_NEWSESSION, 0, 0, 0, 0, "rival"},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Say hello."},
+    {OP_WAIT, W_QUEUED, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_QUEUED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "15-queued"},
+    {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 0, "failover"},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Fail over."},
+    {OP_WAIT, W_BACKOFF, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_FALLBACK, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "16-fallback"},
+    {OP_WAIT, W_SAID, 0, 0, 15000, "The fallback answered."},
+    {OP_SYSTHEME, 0, -1, 0, 500, ""},
+    {OP_MAIN, 0, 0, 0, 500, ""},
     // Esc abandons an edit in a settings field, leaving the turn alone,
     // and from the session's own windows cancels the turn mid-tool
     {OP_PROMPT, 0, 0, 0, 100, "Cancel me: run a very slow command."},
@@ -3168,8 +3474,7 @@ static DriveOp m3ops[] = {
     {OP_SHOT, 0, 0, 0, 300, "4-settings"},
     // Adding a section that exists leaves it alone (the file keeps its
     // one-line diff, which tests/gui.py checks). Its row is further down.
-    {OP_MOVE, T_SETTING, 0, 0, 100, ""},
-    {OP_WHEEL, 0, 0, -3, 500, ""},
+    {OP_REVEAL, RECT_ADDNAME, 0, 0, 500, ""},
     {OP_MOVE, T_ADDNAME, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 200, ""},
@@ -3497,6 +3802,15 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_OTHERSESS:   return rectcenter(g->rects[RECT_OTHERSESS]);
     case T_THEMECOMBO:  return rectcenter(g->rects[RECT_THEMECOMBO]);
     case T_LONGFIELD:   return rectcenter(g->rects[RECT_LONGFIELD]);
+    case T_TASKLINK:    return rectcenter(g->rects[RECT_TASKLINK]);
+    case T_PARENTLINK:  return rectcenter(g->rects[RECT_PARENTLINK]);
+    case T_UNDO:        return rectcenter(g->rects[RECT_UNDO]);
+    case T_REWINDTURN:  return rectcenter(g->rects[RECT_REWINDTURN]);
+    case T_REWINDOK:    return rectcenter(g->rects[RECT_REWINDOK]);
+    case T_FORCE:       return rectcenter(g->rects[RECT_FORCE]);
+    case T_JOBKILL:     return rectcenter(g->rects[RECT_JOBKILL]);
+    case T_INFOBTN:     return rectcenter(g->rects[RECT_INFOBTN]);
+    case T_COMPACTHDR:  return rectcenter(g->rects[RECT_COMPACTHDR]);
     case T_THEMEITEM: {
         i32 i = themeparse(g->ops[g->drivepc-1].text);
         return i<0 ? v2(-1, -1) : rectcenter(g->rects[RECT_THEME0+i]);
@@ -3526,6 +3840,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_HELPTAB:       return tabcenter("Help");
     case T_TRANSCRIPTTAB: return tabcenter("Transcript");
     case T_SETTINGSTAB:   return tabcenter("Settings");
+    case T_JOBSTAB:       return tabcenter("Jobs");
     case T_BELOW: {
         Rect r = g->rects[RECT_TRANSCRIPT];
         return v2((r.x0+r.x1)/2, r.y1);
@@ -3607,6 +3922,41 @@ static ViewMsg *lasttoolmsg(Gui *g, Str name)
     return 0;
 }
 
+// A subagent of the session shown, the latest made, that asks if any
+// does; null if none.
+static GuiSession *drivekid(Gui *g, b32 asking)
+{
+    GuiSession *r = 0;
+    for (GuiSession *s = g->sessions; g->sess && s; s = s->next) {
+        View *k = s->view;
+        if (k && k->parent==g->sess->sid && (!asking || k->asks) &&
+                (!r || compare(s->sid, r->sid)>0)) {
+            r = s;
+        }
+    }
+    return r;
+}
+
+// The latest message of a role in a view, or null.
+static ViewMsg *lastof(View *v, i32 role)
+{
+    for (iz i = v->msgs.len-1; i >= 0; i--) {
+        if (v->msgs[i].role==role && !v->msgs[i].prov) {
+            return &v->msgs[i];
+        }
+    }
+    return 0;
+}
+
+static i32 countrole(View *v, i32 role)
+{
+    i32 n = 0;
+    for (iz i = 0; i < v->msgs.len; i++) {
+        n += v->msgs[i].role == role;
+    }
+    return n;
+}
+
 static b32 drivewaitdone(Gui *g)
 {
     View *v = g->view;
@@ -3643,6 +3993,28 @@ static b32 drivewaitdone(Gui *g)
         return g->sess && v->state==LIVE_BACKOFF;
     case W_GONE:
         return g->enginegone;
+    case W_TASKS:
+        return g->sess && v->state==LIVE_TASK && v->tasks==2;
+    case W_KIDASK:
+        return drivekid(g, 1) != 0;
+    case W_TODO:
+        return v->todos.len==3 && v->todos[0].status==VTODO_ACTIVE;
+    case W_SAID: {
+        ViewMsg *m = lastof(v, VIEW_ASSISTANT);
+        return g->sess && !v->busy && m && startswith(m->text, g->ops[g->drivepc-1].text);
+    }
+    case W_JOBS: {
+        // The first may end after the turn, which then resumes for it
+        ViewJob *a = findjob(v, 1), *b = findjob(v, 2);
+        return g->sess && !v->busy && a && a->status!=VJOB_RUNNING && b &&
+               b->status==VJOB_RUNNING && find({b->tail, b->taillen}, "tick 3")>=0;
+    }
+    case W_REWOUND:
+        return !g->rewindid && countrole(v, VIEW_REWIND)>=g->rewsent;
+    case W_COMPACTING:
+        return g->sess && v->state==LIVE_COMPACTING;
+    case W_QUEUED:
+        return g->sess && v->state==LIVE_QUEUED;
     }
     return 0;
 }
@@ -4042,6 +4414,117 @@ static b32 drivecheck(Gui *g, i32 chk)
         return reported==2 && v->msgs.len &&
                endswith(v->msgs[v->msgs.len-1].text, "Both subagents reported.");
     }
+    case CHK_TASKSTATE:
+        return g->taskshown == 2;
+    case CHK_CHILDSHOWN: {
+        b32 task = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            task |= v->msgs[i].role==VIEW_USER &&
+                    startswith(v->msgs[i].text, "Report as a subagent");
+        }
+        return g->drivemain && g->sess!=g->drivemain && v->parent==g->drivemain->sid &&
+               task && g->rects[RECT_PARENTLINK].x1>0;
+    }
+    case CHK_PARENTSHOWN:
+        return g->sess && g->sess==g->drivemain;
+    case CHK_KIDASK:
+        return g->kidaskshown && g->kidlinkshown && g->rects[RECT_TASKLINK].x1>0;
+    case CHK_KIDALLOWED: {
+        Arena       a = g->frame;
+        GuiSession *k = drivekid(g, 0);
+        ViewMsg    *q = k ? lastof(k->view, VIEW_ASK) : 0;
+        ViewMsg    *m = lastof(v, VIEW_ASSISTANT);
+        Str         f = join(&a, g->drivecwd, "../gui-child.txt");
+        return q && q->tool->answer==VASK_ALLOWED && q->tool->by=="user" &&
+               m && find(m->text, "Child wrote it")>=0 &&
+               os_stat(g->os, a, f).type==STAT_FILE;
+    }
+    case CHK_TODOACTIVE:
+        return g->todoshown==3 && v->todos[0].status==VTODO_ACTIVE &&
+               v->todos[1].status==VTODO_PENDING && v->todos[2].status==VTODO_PENDING;
+    case CHK_TODODONE: {
+        b32 done = v->todos.len == 3;
+        for (iz i = 0; done && i < v->todos.len; i++) {
+            done = v->todos[i].status == VTODO_DONE;
+        }
+        return done && g->todoshown==3;
+    }
+    case CHK_JOBS: {
+        ViewJob *a = findjob(v, 1), *b = findjob(v, 2);
+        return v->jobs.len==2 && a && b && a->status==VJOB_EXITED && a->hasexit &&
+               !a->exit && b->status==VJOB_RUNNING && v->jobsrun==1 &&
+               g->jobsshown==2 && g->rects[RECT_JOBKILL].x1>0;
+    }
+    case CHK_JOBKILLED: {
+        ViewJob *b = findjob(v, 2);
+        ViewMsg *n = lastof(v, VIEW_NOTE);
+        b32 resumed = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            resumed |= v->msgs[i].role==VIEW_NOTE && v->msgs[i].startsturn;
+        }
+        return b && b->status==VJOB_KILLED && !v->jobsrun && resumed &&
+               n && startswith(n->label, "To the agent: job");
+    }
+    case CHK_REWINDASK: {
+        Arena           a   = g->frame;
+        ImGuiWindow    *w   = ImGui::GetTopMostPopupModal();
+        GuiSession     *s   = g->rewsess;
+        Slice<ViewSnap> set = s && s->view ? rewindset(s->view, &a, g->rewcall, g->rewturn) : Slice<ViewSnap>{};
+        b32 open = w && find({(u8 *)w->Name, (iz)__builtin_strlen(w->Name)}, "Rewind")>=0;
+        return open && set.len==1 && endswith(set[0].path, g->ops[g->drivepc-1].text) &&
+               g->rects[RECT_REWINDOK].x1>0;
+    }
+    case CHK_UNDONE: {
+        Arena     a = g->frame;
+        ViewMsg  *c = lastof(v, VIEW_REWIND);
+        ViewTool *t = lasttool(g, "write");
+        ViewSnap *n = rowsnap(v, t);
+        Str       f = join(&a, g->drivecwd, "undo-b.txt");
+        return c && c->card->count==1 && !c->card->conflicts && find(c->text, "removed")>=0 &&
+               n && n->undone && endswith(n->path, "undo-b.txt") &&
+               os_stat(g->os, a, f).type==STAT_MISSING;
+    }
+    case CHK_CONFLICT: {
+        Arena    a  = g->frame;
+        ViewMsg *c  = lastof(v, VIEW_REWIND);
+        Read     rd = os_read(g->os, &a, join(&a, g->drivecwd, "undo-a.txt"), 1<<10);
+        return c && c->card->conflicts==1 && c->card->turn && c->card->latest &&
+               rd.err==READ_OK && rd.data=="changed elsewhere\n" &&
+               g->rects[RECT_FORCE].x1>0;
+    }
+    case CHK_FORCED: {
+        Arena    a = g->frame;
+        ViewMsg *c = lastof(v, VIEW_REWIND);
+        Str      f = join(&a, g->drivecwd, "undo-a.txt");
+        return c && c->card->force && !c->card->conflicts && find(c->text, "removed")>=0 &&
+               os_stat(g->os, a, f).type==STAT_MISSING;
+    }
+    case CHK_COMPACTING:
+        return g->compactingshown;
+    case CHK_SUMMARY: {
+        ViewMsg *m = lastof(v, VIEW_COMPACT);
+        return m && m->card->kind=="summary" && m->card->before>m->card->after &&
+               m->card->count>0 && find(m->text, "SUMMARY-")>=0 &&
+               g->rects[RECT_COMPACTHDR].x1>0;
+    }
+    case CHK_COMPACTOPEN: {
+        ViewMsg *m = lastof(v, VIEW_COMPACT);
+        return m && !m->collapsed && m->measured && m->h>0;
+    }
+    case CHK_PRUNE: {
+        ViewMsg *m = lastof(v, VIEW_COMPACT);
+        i32 elided = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            elided += v->msgs[i].role==VIEW_TOOL && v->msgs[i].tool->elided;
+        }
+        return m && m->card->kind=="prune" && m->card->count>=3 && elided==m->card->count;
+    }
+    case CHK_INFO:
+        return c.OpenPopupStack.Size>0 && g->infoshown>=1 && g->infoagents>=1;
+    case CHK_QUEUED:
+        return g->queuedshown && v->state==LIVE_QUEUED && v->queuepos==1;
+    case CHK_FALLBACK:
+        return g->fallbackshown && find(v->retrymodel, "guifail_b")>=0;
     }
     return 0;
 }
@@ -4288,8 +4771,16 @@ static void drivestep(Gui *g)
         fakecmd(g, FAKE_STOP, "");
         break;
     case OP_NEWSESSION:
-        guinew(g, g->drivecwd, {});
+        guinew(g, g->drivecwd, {}, op->text);  // in a role, if named
         break;
+    case OP_TOUCH: {
+        Arena a = g->frame;
+        if (!os_write(g->os, a, join(&a, g->drivecwd, op->text), "changed elsewhere\n")) {
+            guilog(g, "drive: FAIL could not change the file");
+            g->drivechecks++;
+            g->drivefails++;
+        }
+    } break;
     case OP_PROMPT:
         guiprompt(g, op->text);
         break;

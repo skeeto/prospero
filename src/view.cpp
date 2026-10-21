@@ -36,6 +36,13 @@
 // lexicographically, so it spans messages and survives relayout and
 // streaming. Copying turns it back into text or markdown.
 //
+// Besides its transcript a view keeps what the panels beside it show:
+// the agent's todo list, the session's background jobs with the latest
+// of their output, the files write and edit changed (snapshots), which
+// a rewind puts back, and the instruction files loaded. Compactions and
+// rewinds are cards in the transcript, and notices the agent read are
+// folded notes, so that the user sees what the agent was told.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i32 {
@@ -45,6 +52,8 @@ enum : i32 {
     VIEW_TOOL,
     VIEW_NOTE,
     VIEW_ASK,
+    VIEW_COMPACT,  // a compaction's card
+    VIEW_REWIND,   // a rewind's card
 };
 
 // Tool rows
@@ -59,14 +68,39 @@ enum : i32 {
     VTOOL_TIMEOUT,
     VTOOL_CANCELLED,
     VTOOL_UNKNOWN,
+    VTOOL_BACKGROUND,  // a command moved to the background, as a job
     VTOOL_COUNT,
 };
 
 static Str vtoolnames[] = {
     "called", "streaming", "asking", "running", "ok", "error", "denied",
-    "timeout", "cancelled", "unknown",
+    "timeout", "cancelled", "unknown", "background",
 };
 static_assert(countof(vtoolnames) == VTOOL_COUNT);
+
+// Background jobs, as job.end has them
+enum : i32 {
+    VJOB_RUNNING,
+    VJOB_EXITED,
+    VJOB_TIMEOUT,
+    VJOB_KILLED,
+    VJOB_CLOSED,
+    VJOB_LIMIT,
+    VJOB_UNKNOWN,
+    VJOB_COUNT,
+};
+
+static Str vjobnames[] = {
+    "running", "exited", "timeout", "killed", "closed", "limit", "unknown",
+};
+static_assert(countof(vjobnames) == VJOB_COUNT);
+
+// Todo items
+enum : i32 {
+    VTODO_PENDING,
+    VTODO_ACTIVE,
+    VTODO_DONE,
+};
 
 // Asks
 enum : i32 {
@@ -85,13 +119,16 @@ enum : i32 {
     LIVE_BACKOFF,
     LIVE_TOOL,
     LIVE_ASK,
+    LIVE_QUEUED,      // waiting for its turn at the endpoint
+    LIVE_TASK,        // waiting for its subagents
+    LIVE_COMPACTING,  // a summary request runs
     LIVE_CLOSED,
     LIVE_COUNT,
 };
 
 static Str livenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "closed",
+    "ask", "queued", "task", "compacting", "closed",
 };
 static_assert(countof(livenames) == LIVE_COUNT);
 
@@ -111,12 +148,17 @@ struct ViewTool {
     i32  exit;
     b32  hasexit;
     i64  start;     // epoch ms of tool.start
+    i64  startseq;  // tool.start's record, which a rewind to it follows
     i64  ms;        // its duration, once ended
     Str  spill;     // the full output, relative to the session directory
     i64  bytes;
     i64  outbytes;  // output so far, while running
     u8  *tail;      // the live output, a buffer reused for each tool.out
     iz   tailcap;
+    i64  job;       // the background job it started, 0 if none
+    Str  child;     // a task's subagent, once it reported
+    i32  snap;      // the file it changed: index+1 in the view's snaps
+    b32  elided;    // pruned: the agent sees only where its output is
     // Asks
     Str  req;
     Str  tool;      // the tool that asked
@@ -127,6 +169,67 @@ struct ViewTool {
     i32  answer;    // VASK_*
     Str  by;
     Str  note;
+};
+
+// A compaction (kind "summary" or "prune") or a rewind, as a card.
+struct ViewCard {
+    Str  kind;       // summary, prune, rewind
+    Str  why;        // threshold or overflow
+    i64  before;     // tokens, estimated
+    i64  after;
+    Str  model;      // the summary's
+    i64  ms;
+    i32  count;      // messages summarized, outputs elided, files rewound
+    i32  conflicts;  // files a rewind left alone
+    Str  to;         // a rewind's point: a call id, or else
+    i32  turn;       // the start of this turn
+    b32  force;
+    b32  latest;     // the latest rewind, which may be forced
+};
+
+// A background job (shell with background, or moved there at its timeout).
+struct ViewJob {
+    i64  n;
+    Str  call;
+    Str  command;
+    Str  summary;   // its first line
+    Str  spill;     // the full output, relative to the session directory
+    i64  start;     // epoch ms
+    i64  deadline;  // epoch ms: the job limit stops it then
+    i32  status;    // VJOB_*
+    i32  exit;
+    b32  hasexit;
+    i32  signal;
+    i64  bytes;
+    i64  ms;        // how long it ran, once ended
+    u8  *tail;      // the latest output, a buffer reused for each job.out
+    iz   taillen;
+    iz   tailcap;
+    b32  killing;   // a kill was asked for
+};
+
+struct ViewTodo {
+    Str content;
+    i32 status;     // VTODO_*
+};
+
+// A file that write or edit changed, whose original a rewind restores.
+struct ViewSnap {
+    Str  call;
+    Str  path;      // absolute
+    Str  name;      // "snap/N", as a rewind's undone list names it
+    i64  seq;
+    i32  turn;
+    b32  existed;   // else a rewind removes it
+    b32  undone;
+};
+
+// An instruction file the agent was given.
+struct ViewInstr {
+    Str why;        // start, nested, changed
+    Str path;
+    i64 bytes;
+    Str importer;   // the file that imported it, if any
 };
 
 struct ViewMsg {
@@ -140,9 +243,12 @@ struct ViewMsg {
     b32       prov;       // provisional: streamed, not yet committed
     b32       faded;      // provisional text of a failed attempt
     b32       collapsed;  // only the header shows
+    b32       fold;       // its header shows and hides the rest
     b32       md;         // markdown, not plain text
+    i32       startsturn; // the turn this message began, 0 if none
     Str       label;      // the header, if not the role's name
     ViewTool *tool;       // tool rows and asks
+    ViewCard *card;       // compactions and rewinds
     f64       top;        // prefix sum of heights above, with gaps
     f32       h;          // content height: measured, or estimated
     b32       measured;   // h is from a layout at the current width
@@ -222,6 +328,10 @@ struct View {
     Str             endpoint;
     Str             role;
     Str             parent;     // a subagent's parent session, else empty
+    Str             pcall;      // and the parent's task call
+    i32             depth;
+    Str             tools;      // those offered, if restricted: blank separated
+    Str             roleprompt;
     i32             turn;
     i32             attempt;
     b32             busy;       // a turn is running
@@ -239,6 +349,22 @@ struct View {
     i64             pdone;      // prompt processing, tokens of total
     i64             ptotal;
     i64             outts;      // the last tool.out
+    i32             queuepos;   // queued: the place in line, of
+    i32             queuelen;
+    i32             tasks;      // subagents still at work
+    Str             retrymodel; // the next attempt's model, from a retry
+    b32             retryslow;  // minutes-long waits
+    i32             fallback;   // switched to this fallback (1-based)
+
+    // Beside the transcript
+    Slice<ViewTodo>  todos;     // the latest list
+    Slice<ViewJob>   jobs;      // by number
+    i32              jobsrun;   // running
+    Slice<ViewSnap>  snaps;     // in order
+    Slice<ViewInstr> instr;     // instruction files, by path
+    Slice<Str>       skipped;   // instruction files not loaded
+    Str              instrtext; // what went into the system prompt
+    i64              cutseq;    // records before it are summarized
 };
 
 static ViewCache *newviewcache(Arena *perm, Region *r, iz max)
@@ -513,6 +639,29 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
     Str   desc = jsonstr(jsonget(j, "description"));
     if (name=="shell" && cmd.data) {
         return oneline(perm, cmd);
+    } else if (name == "todo_write") {
+        // The list may come as a string holding JSON
+        Json *t = jsonget(j, "todos");
+        if (t->type == JSON_STRING) {
+            t = jsonparse(&scratch, t->str).root;
+        }
+        i64 n = 0, done = 0, active = 0;
+        for (Json *e = t->child; e; e = e->next, n++) {
+            Str st = jsonstr(jsonget(e, "status"));
+            done   += st == "done";
+            active += st == "in_progress";
+        }
+        Buf b(perm, 64);
+        print(&b, n);
+        print(&b, n==1 ? Str(" item, ") : Str(" items, "));
+        print(&b, done);
+        print(&b, " done");
+        if (active) {
+            print(&b, ", ");
+            print(&b, active);
+            print(&b, " in progress");
+        }
+        return finish(&b);
     } else if (name=="task" && desc.len) {
         return oneline(perm, desc);
     } else if (p.data) {
@@ -652,6 +801,106 @@ static i32 findask(View *v, Str req)
     return -1;
 }
 
+static ViewJob *findjob(View *v, i64 n)
+{
+    for (iz i = v->jobs.len-1; i >= 0; i--) {
+        if (v->jobs[i].n == n) {
+            return &v->jobs[i];
+        }
+    }
+    return 0;
+}
+
+static i32 vjobstatus(Str s)
+{
+    for (i32 i = 0; i < VJOB_COUNT; i++) {
+        if (vjobnames[i] == s) {
+            return i;
+        }
+    }
+    return VJOB_UNKNOWN;
+}
+
+// A path as the user thinks of it: relative to the working directory
+// when inside it.
+static Str showpath(View *v, Str p)
+{
+    Str cwd = v->cwd;
+    if (cwd.len && p.len>cwd.len+1 && startswith(p, cwd) &&
+            (p[cwd.len]=='/' || p[cwd.len]=='\\')) {
+        return cuthead(p, cwd.len+1);
+    }
+    return p;
+}
+
+// A markdown code span holding s, whatever backticks it has.
+static void codespan(Buf *b, Str s)
+{
+    iz ticks = backticks(s) + 1;
+    b32 pad  = ticks > 1;
+    for (iz i = 0; i < ticks; i++) putbyte(b, '`');
+    if (pad) putbyte(b, ' ');
+    for (iz i = 0; i < s.len; i++) {
+        putbyte(b, s[i]=='\n' ? ' ' : s[i]);
+    }
+    if (pad) putbyte(b, ' ');
+    for (iz i = 0; i < ticks; i++) putbyte(b, '`');
+}
+
+// The snapshots a rewind would put back, newest first, one per file:
+// those after a call's start (to a call), or from a turn on (else),
+// that no rewind undid yet. Each path's oldest snapshot in range says
+// whether the file is restored or removed.
+static Slice<ViewSnap> rewindset(View *v, Arena *a, Str call, i32 turn)
+{
+    i64 seq0 = -1;
+    if (call.len) {
+        i32 i = findcall(v, call);
+        if (i < 0) {
+            return {};
+        }
+        seq0 = v->msgs[i].tool->startseq;
+    }
+    Slice<ViewSnap> r = {};
+    for (iz i = v->snaps.len-1; i >= 0; i--) {
+        ViewSnap *s = &v->snaps[i];
+        if (s->undone || (call.len ? s->seq<=seq0 : s->turn<turn)) {
+            continue;
+        }
+        b32 dup = 0;
+        for (iz k = 0; k < r.len; k++) {
+            if (r[k].path == s->path) {
+                r[k] = *s;  // an older change of the same file decides
+                dup  = 1;
+            }
+        }
+        if (!dup) {
+            r = push(a, r, *s);
+        }
+    }
+    return r;
+}
+
+// Whether a rewind from a turn on would change any file.
+static b32 turnrewinds(View *v, i32 turn)
+{
+    for (iz i = v->snaps.len-1; i >= 0; i--) {
+        if (!v->snaps[i].undone && v->snaps[i].turn>=turn) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The snapshot of the file a tool row changed, or null.
+static ViewSnap *rowsnap(View *v, ViewTool *t)
+{
+    if (!t || t->snap<=0 || t->snap>v->snaps.len) {
+        return 0;
+    }
+    return &v->snaps[t->snap-1];
+}
+
 // A committed call's row.
 static i32 addcall(View *v, Arena scratch, Str id, Str name, Str args)
 {
@@ -663,7 +912,7 @@ static i32 addcall(View *v, Arena scratch, Str id, Str name, Str args)
     t->summary = toolsummary(&v->aux, scratch, name, args, v->cwd);
     t->status  = VTOOL_CALLED;
     v->msgs[i].tool      = t;
-    v->msgs[i].collapsed = name=="read" || name=="write";
+    v->msgs[i].collapsed = name=="read" || name=="write" || name=="todo_write";
     return i;
 }
 
@@ -678,6 +927,10 @@ static void toolbody(View *v, Arena scratch, ViewMsg *m, Str text)
             settext(v, m, diff, 1);
             return;
         }
+    }
+    if (t->name=="task" && t->status==VTOOL_OK && !t->spill.len) {
+        settext(v, m, text, 1);
+        return;
     }
     if (t->spill.len) {
         Buf b(&scratch, text.len + 256);
@@ -730,6 +983,17 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->endpoint = clone(&v->aux, jsonstr(jsonget(j, "endpoint")));
         v->role     = clone(&v->aux, jsonstr(jsonget(j, "role")));
         v->parent   = clone(&v->aux, jsonstr(jsonget(j, "parent")));
+        v->pcall    = clone(&v->aux, jsonstr(jsonget(j, "call")));
+        v->depth    = (i32)jsonint(jsonget(j, "depth"), 0);
+        v->roleprompt = clone(&v->aux, jsonstr(jsonget(j, "prompt")));
+        {
+            Buf b(&scratch, 256);
+            for (Json *t = jsonget(j, "tools")->child; t; t = t->next) {
+                if (b.len) putbyte(&b, ' ');
+                print(&b, jsonstr(t));
+            }
+            v->tools = clone(&v->aux, finish(&b));
+        }
         if (v->state == LIVE_CLOSED) {
             v->state = LIVE_IDLE;
         }
@@ -750,13 +1014,28 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         clampsel(v);
     } return 1;
 
-    case EV_TURN:
+    case EV_TURN: {
         v->turn    = (i32)jsonint(jsonget(j, "n"), v->turn+1);
         v->attempt = 0;
         v->busy    = 1;
         v->turnts  = r->ts;
         v->pdone   = v->ptotal = 0;
-        return 1;
+        // The message that began it: a prompt just before, or, for a
+        // turn the session began by itself, a note saying why
+        Str via = jsonstr(jsonget(j, "via"));
+        if (via == "job") {
+            i32 i = addmsg(v, VIEW_NOTE, "A background job ended, so the "
+                           "agent went on without a prompt.");
+            v->msgs[i].seq        = r->seq;
+            v->msgs[i].label      = "Resumed by itself";
+            v->msgs[i].startsturn = v->turn;
+        } else if (v->msgs.len) {
+            ViewMsg *m = &v->msgs[v->msgs.len-1];
+            if (m->role==VIEW_USER && !m->startsturn && m->label!="You (steering)") {
+                m->startsturn = v->turn;
+            }
+        }
+    } return 1;
 
     case EV_ATTEMPT:
         dropprov(v);  // a failed attempt's, shown faded until now
@@ -842,8 +1121,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             v->msgs[i].seq = r->seq;
         }
         ViewMsg *m = &v->msgs[i];
-        m->tool->status = VTOOL_RUNNING;
-        m->tool->start  = r->ts;
+        m->tool->status   = VTOOL_RUNNING;
+        m->tool->start    = r->ts;
+        m->tool->startseq = r->seq;
         m->ver++;
     } return 1;
 
@@ -883,6 +1163,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->ms      = jsonint(jsonget(j, "ms"), 0);
         t->spill   = clone(&v->aux, jsonstr(jsonget(j, "spill")));
         t->bytes   = jsonint(jsonget(j, "bytes"), 0);
+        t->job     = jsonint(jsonget(j, "job"), t->job);
+        t->child   = clone(&v->aux, jsonstr(jsonget(j, "child")));
         m->seq     = r->seq;
         toolbody(v, scratch, m, jsonstr(jsonget(j, "text")));
         // A call ends its ask, which after a crash has no answer
@@ -898,6 +1180,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         }
         if (t->status != VTOOL_OK) {
             m->collapsed = 0;  // what went wrong
+        } else if (t->job) {
+            m->collapsed = 1;  // started in the background: the panel has it
         } else if (t->name == "shell") {
             m->collapsed = m->nl > 24;
         }
@@ -951,10 +1235,18 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
     } return 1;
 
     case EV_RETRY: {
+        // The model named is the next attempt's: a fallback's after a
+        // switch, and until the primary is tried again
         fadeprov(v);
-        Arena a = scratch;
+        Arena a     = scratch;
         Buf   b(&a, 256);
         i64   delay = jsonint(jsonget(j, "delay_ms"), 0);
+        Str   model = jsonstr(jsonget(j, "model"));
+        i32   fb    = (i32)jsonint(jsonget(j, "fallback"), 0);
+        b32   slow  = jsonint(jsonget(j, "slow"), 0) != 0;
+        v->retrymodel = model==v->retrymodel ? v->retrymodel : clone(&v->aux, model);
+        v->retryslow  = slow;
+        v->fallback   = fb ? fb : model==v->model ? 0 : v->fallback;
         print(&b, "Attempt ");
         print(&b, jsonint(jsonget(j, "attempt"), 0));
         print(&b, " failed (");
@@ -966,12 +1258,36 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         }
         print(&b, "): ");
         print(&b, jsonstr(jsonget(j, "msg")));
-        print(&b, ". Retrying in ");
-        printfloat(&b, (f64)delay/1000, 1);
-        print(&b, " s.");
+        if (fb) {
+            print(&b, ". Switching to fallback ");
+            print(&b, (i64)fb);
+            print(&b, ", ");
+            print(&b, model);
+            print(&b, ".");
+        } else {
+            print(&b, slow ? Str(". Waiting ") : Str(". Retrying in "));
+            if (delay < 60000) {
+                printfloat(&b, (f64)delay/1000, 1);
+                print(&b, " s");
+            } else {
+                print(&b, delay/60000);
+                print(&b, " min");
+                if (delay/1000%60) {
+                    putbyte(&b, ' ');
+                    print(&b, delay/1000%60);
+                    print(&b, " s");
+                }
+            }
+            print(&b, slow ? Str(" before trying again (a slow retry)") : Str(""));
+            if (model.len && model!=v->model) {
+                print(&b, ", with ");
+                print(&b, model);
+            }
+            putbyte(&b, '.');
+        }
         i32 i = addmsg(v, VIEW_NOTE, finish(&b));
         v->msgs[i].seq   = r->seq;
-        v->msgs[i].label = "Retry";
+        v->msgs[i].label = fb ? Str("Fallback") : Str("Retry");
     } return 1;
 
     case EV_NUDGE: {
@@ -987,6 +1303,252 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->msgs[i].seq   = r->seq;
         v->msgs[i].label = level=="warn"  ? Str("Warning") :
                            level=="error" ? Str("Error") : Str{};
+    } return 1;
+
+    case EV_NOTICE: {
+        // A message the agent reads, folded: what it was told
+        Str      kind = jsonstr(jsonget(j, "kind"));
+        i64      job  = jsonint(jsonget(j, "job"), 0);
+        i32      i    = addmsg(v, VIEW_NOTE, jsonstr(jsonget(j, "text")));
+        ViewMsg *m    = &v->msgs[i];
+        m->seq       = r->seq;
+        m->fold      = 1;
+        m->collapsed = 1;
+        if (kind=="job" && job) {
+            Buf b(&v->aux, 48);
+            print(&b, "To the agent: job ");
+            print(&b, job);
+            print(&b, " ended");
+            m->label = finish(&b);
+        } else {
+            m->label = kind=="rewind"       ? Str("To the agent: files rewound") :
+                       kind=="instructions" ? Str("To the agent: instruction files") :
+                       kind=="budget"       ? Str("To the agent: wrap up") :
+                       Str("To the agent");
+        }
+    } return 1;
+
+    case EV_COMPACT: {
+        // A card: the summary, or which outputs the agent no longer sees
+        Str       kind = jsonstr(jsonget(j, "kind"));
+        ViewCard *c    = alloc<ViewCard>(&v->aux);
+        c->kind   = kind=="summary" ? Str("summary") : Str("prune");
+        c->why    = jsonstr(jsonget(j, "why"))=="overflow" ? Str("overflow") : Str("threshold");
+        c->before = jsonint(jsonget(j, "before"), 0);
+        c->after  = jsonint(jsonget(j, "after"), 0);
+        c->model  = clone(&v->aux, jsonstr(jsonget(j, "model")));
+        c->ms     = jsonint(jsonget(j, "ms"), 0);
+        Str text  = {};
+        if (kind == "summary") {
+            i64 cut = jsonint(jsonget(j, "cutseq"), v->cutseq);
+            for (iz i = 0; i < v->msgs.len; i++) {
+                ViewMsg *m    = &v->msgs[i];
+                b32      talk = m->role==VIEW_USER || m->role==VIEW_ASSISTANT ||
+                                m->role==VIEW_THINK || m->role==VIEW_TOOL;
+                c->count += talk && m->seq>=v->cutseq && m->seq<cut && m->seq;
+            }
+            v->cutseq = cut>v->cutseq ? cut : v->cutseq;
+            text = jsonstr(jsonget(j, "summary"));
+        } else {
+            Buf b(&scratch, 1024);
+            for (Json *e = jsonget(j, "elided")->child; e; e = e->next) {
+                i64       seq  = jsonint(jsonget(e, "seq"), 0);
+                Str       what = jsonstr(jsonget(e, "text"));
+                ViewTool *t    = 0;
+                for (iz i = v->msgs.len-1; i>=0 && !t; i--) {
+                    ViewMsg *m = &v->msgs[i];
+                    t = m->role==VIEW_TOOL && m->seq==seq ? m->tool : 0;
+                }
+                print(&b, "- ");
+                if (t) {
+                    t->elided = 1;
+                    print(&b, "**");
+                    print(&b, t->name.len ? t->name : Str("call"));
+                    print(&b, "** ");
+                    codespan(&b, t->summary);
+                    print(&b, ": ");
+                }
+                codespan(&b, what);
+                putbyte(&b, '\n');
+                c->count++;
+            }
+            text = finish(&b);
+        }
+        i32      i = addmsg(v, VIEW_COMPACT, text);
+        ViewMsg *m = &v->msgs[i];
+        m->seq       = r->seq;
+        m->md        = 1;
+        m->card      = c;
+        m->fold      = 1;
+        m->collapsed = 1;
+        v->topsdirty = 1;
+    } return 1;
+
+    case EV_TODO: {
+        Json     *items = jsonget(j, "items");
+        iz        n     = jsonlen(items);
+        ViewTodo *t     = alloc<ViewTodo>(&v->aux, n);
+        iz        k     = 0;
+        for (Json *e = items->child; e && k<n; e = e->next, k++) {
+            Str st = jsonstr(jsonget(e, "status"));
+            t[k].content = clone(&v->aux, jsonstr(jsonget(e, "content")));
+            t[k].status  = st=="done"        ? VTODO_DONE   :
+                           st=="in_progress" ? VTODO_ACTIVE : VTODO_PENDING;
+        }
+        v->todos.data = t;
+        v->todos.len  = v->todos.cap = k;
+    } return 1;
+
+    case EV_JOBSTART: {
+        ViewJob jb = {};
+        jb.n        = jsonint(jsonget(j, "job"), 0);
+        jb.call     = clone(&v->aux, jsonstr(jsonget(j, "call")));
+        jb.command  = clone(&v->aux, jsonstr(jsonget(j, "command")));
+        jb.summary  = oneline(&v->aux, jb.command);
+        jb.spill    = clone(&v->aux, jsonstr(jsonget(j, "spill")));
+        jb.start    = r->ts;
+        jb.deadline = jsonint(jsonget(j, "deadline"), 0);
+        jb.status   = VJOB_RUNNING;
+        v->jobs = push(&v->aux, v->jobs, jb);
+        v->jobsrun++;
+        i32 i = findcall(v, jb.call);
+        if (i >= 0) {
+            v->msgs[i].tool->job = jb.n;
+        }
+    } return 1;
+
+    case EV_JOBOUT: {
+        ViewJob *jb = findjob(v, jsonint(jsonget(j, "job"), 0));
+        if (!jb || jb->status!=VJOB_RUNNING) {
+            return 0;  // ended already
+        }
+        Str tail = jsonstr(jsonget(j, "tail"));
+        if (tail.len > jb->tailcap) {
+            jb->tailcap = tail.len>4096 ? tail.len : 4096;
+            jb->tail    = allocbytes(&v->aux, jb->tailcap);
+        }
+        copybytes(jb->tail, tail.data, tail.len);
+        jb->taillen = tail.len;
+        jb->bytes   = jsonint(jsonget(j, "bytes"), jb->bytes);
+    } return 1;
+
+    case EV_JOBEND: {
+        i64      n  = jsonint(jsonget(j, "job"), 0);
+        ViewJob *jb = findjob(v, n);
+        if (!jb) {
+            ViewJob nj = {};  // its start before what this view saw
+            nj.n    = n;
+            nj.call = clone(&v->aux, jsonstr(jsonget(j, "call")));
+            v->jobs = push(&v->aux, v->jobs, nj);
+            jb = &v->jobs[v->jobs.len-1];
+        } else if (jb->status == VJOB_RUNNING) {
+            v->jobsrun--;
+        }
+        Json *ex = jsonget(j, "exit");
+        jb->status  = vjobstatus(jsonstr(jsonget(j, "status")));
+        jb->hasexit = ex->type == JSON_NUMBER;
+        jb->exit    = (i32)jsonint(ex, 0);
+        jb->signal  = (i32)jsonint(jsonget(j, "signal"), 0);
+        jb->bytes   = jsonint(jsonget(j, "bytes"), jb->bytes);
+        jb->ms      = jsonint(jsonget(j, "ms"), 0);
+        jb->killing = 0;
+        Str spill = jsonstr(jsonget(j, "spill"));
+        jb->spill = spill.len ? clone(&v->aux, spill) : jb->spill;
+    } return 1;
+
+    case EV_SNAP: {
+        ViewSnap sn = {};
+        sn.call    = clone(&v->aux, jsonstr(jsonget(j, "call")));
+        sn.path    = clone(&v->aux, jsonstr(jsonget(j, "path")));
+        sn.name    = clone(&v->aux, jsonstr(jsonget(j, "snap")));
+        sn.existed = jsonint(jsonget(j, "existed"), 0) != 0;
+        sn.seq     = r->seq;
+        sn.turn    = v->turn;
+        v->snaps = push(&v->aux, v->snaps, sn);
+        i32 i = findcall(v, sn.call);
+        if (i >= 0) {
+            v->msgs[i].tool->snap = (i32)v->snaps.len;
+        }
+    } return 1;
+
+    case EV_REWIND: {
+        // The files it put back are undone, and a card says how each
+        // went, with what it left alone
+        for (Json *u = jsonget(j, "undone")->child; u; u = u->next) {
+            Str name = jsonstr(u);
+            for (iz k = 0; k < v->snaps.len; k++) {
+                v->snaps[k].undone |= v->snaps[k].name == name;
+            }
+        }
+        for (iz k = 0; k < v->msgs.len; k++) {
+            if (v->msgs[k].role==VIEW_REWIND && v->msgs[k].card->latest) {
+                v->msgs[k].card->latest = 0;
+                v->topsdirty = 1;  // no more buttons on it
+            }
+        }
+        ViewCard *c  = alloc<ViewCard>(&v->aux);
+        Json     *to = jsonget(j, "to");
+        c->kind  = "rewind";
+        c->force = jsonint(jsonget(j, "force"), 0) != 0;
+        if (to->type == JSON_STRING) {
+            c->to = clone(&v->aux, to->str);
+        } else {
+            c->turn = (i32)jsonint(to, 0);
+        }
+        Buf b(&scratch, 1024);
+        for (Json *f = jsonget(j, "files")->child; f; f = f->next) {
+            Str res = jsonstr(jsonget(f, "result"));
+            print(&b, "- ");
+            codespan(&b, showpath(v, jsonstr(jsonget(f, "path"))));
+            print(&b, res=="restored"  ? Str(": put back as it was") :
+                      res=="removed"   ? Str(": removed, as it did not exist then") :
+                      res=="unchanged" ? Str(": already as it was") :
+                      res=="conflict"  ? Str(": **conflict**, left as it is: something "
+                                             "else changed it after the harness did") :
+                      Str(": **failed**, could not be put back"));
+            putbyte(&b, '\n');
+            c->conflicts += res == "conflict";
+            c->count++;
+        }
+        Str note = trim(jsonstr(jsonget(j, "note")));
+        if (note.len) {
+            print(&b, "\n*");  // a footnote
+            print(&b, note);
+            print(&b, "*\n");
+        }
+        c->latest = 1;
+        i32 i = addmsg(v, VIEW_REWIND, finish(&b));
+        v->msgs[i].seq  = r->seq;
+        v->msgs[i].md   = 1;
+        v->msgs[i].card = c;
+    } return 1;
+
+    case EV_INSTRUCTIONS: {
+        // Each file once, as last told
+        Str why = clone(&v->aux, jsonstr(jsonget(j, "why")));
+        for (Json *f = jsonget(j, "files")->child; f; f = f->next) {
+            Str        path = jsonstr(jsonget(f, "path"));
+            ViewInstr *in   = 0;
+            for (iz k = 0; k<v->instr.len && !in; k++) {
+                in = v->instr[k].path==path ? &v->instr[k] : 0;
+            }
+            if (!in) {
+                ViewInstr n = {};
+                n.path  = clone(&v->aux, path);
+                v->instr = push(&v->aux, v->instr, n);
+                in = &v->instr[v->instr.len-1];
+            }
+            in->why      = why;
+            in->bytes    = jsonint(jsonget(f, "bytes"), 0);
+            in->importer = clone(&v->aux, jsonstr(jsonget(f, "importer")));
+        }
+        for (Json *s = jsonget(j, "skipped")->child; s; s = s->next) {
+            v->skipped = push(&v->aux, v->skipped, clone(&v->aux, jsonstr(s)));
+        }
+        Str text = jsonstr(jsonget(j, "text"));
+        if (text.data) {
+            v->instrtext = clone(&v->aux, text);
+        }
     } return 1;
 
     case EV_TURNEND: {
@@ -1024,7 +1586,13 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         i64  retryat  = v->retryat;
         i64  lastdata = v->lastdata;
         i64  watchat  = v->watchat;
-        v->state = livestate(jsonstr(jsonget(j, "state")));
+        i32  qpos     = v->queuepos;
+        i32  qlen     = v->queuelen;
+        i32  tasks    = v->tasks;
+        v->state    = livestate(jsonstr(jsonget(j, "state")));
+        v->queuepos = (i32)jsonint(jsonget(j, "queue_pos"), 0);
+        v->queuelen = (i32)jsonint(jsonget(j, "queue_len"), 0);
+        v->tasks    = (i32)jsonint(jsonget(j, "tasks"), 0);
         Json *idle = jsonget(j, "idle_ms");
         if (idle->type == JSON_NUMBER) {
             v->lastdata = r->ts - jsonint(idle, 0);
@@ -1038,7 +1606,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         i64 moved2 = v->watchat - watchat;
         return state!=v->state || (i64)(tps*10)!=(i64)(v->tps*10) ||
                retryat!=v->retryat || moved<-50 || moved>50 ||
-               moved2<-50 || moved2>50;
+               moved2<-50 || moved2>50 || qpos!=v->queuepos ||
+               qlen!=v->queuelen || tasks!=v->tasks;
     }
 
     case EV_PROGRESS:
@@ -1081,7 +1650,14 @@ static void viewstopped(View *v)
             m->ver++;
         }
     }
+    for (iz i = 0; i < v->jobs.len; i++) {
+        if (v->jobs[i].status == VJOB_RUNNING) {
+            v->jobs[i].status  = VJOB_UNKNOWN;  // its engine took it along
+            v->jobs[i].killing = 0;
+        }
+    }
     fadeprov(v);
+    v->jobsrun   = 0;
     v->busy      = 0;
     v->asks      = 0;
     v->state     = LIVE_CLOSED;
@@ -1119,11 +1695,13 @@ static Doc *msgdoc(View *v, i32 i)
     return m->doc;
 }
 
-// Below a message's content: an open ask's buttons.
+// Below a message's content: an open ask's buttons, or the latest
+// rewind's, when it left files alone.
 static f32 msgfoot(View *v, ViewMsg *m)
 {
-    b32 open = m->role==VIEW_ASK && m->tool->answer==VASK_PENDING && !v->readonly;
-    return open ? v->foot : 0;
+    b32 ask   = m->role==VIEW_ASK && m->tool->answer==VASK_PENDING;
+    b32 force = m->role==VIEW_REWIND && m->card->latest && m->card->conflicts;
+    return (ask || force) && !v->readonly ? v->foot : 0;
 }
 
 // Lay out message i at the width, updating its height. A collapsed
@@ -1578,4 +2156,28 @@ static void viewdump(Buf *b, View *v)
     print(b, " title ");
     print(b, v->title);
     putbyte(b, '\n');
+    for (iz i = 0; i < v->todos.len; i++) {
+        print(b, "todo ");
+        print(b, (i64)v->todos[i].status);
+        putbyte(b, ' ');
+        print(b, v->todos[i].content);
+        putbyte(b, '\n');
+    }
+    for (iz i = 0; i < v->jobs.len; i++) {
+        print(b, "job ");
+        print(b, v->jobs[i].n);
+        putbyte(b, ' ');
+        print(b, vjobnames[v->jobs[i].status]);
+        putbyte(b, '\n');
+    }
+    for (iz i = 0; i < v->snaps.len; i++) {
+        print(b, "snap ");
+        print(b, v->snaps[i].name);
+        print(b, v->snaps[i].undone ? Str(" undone\n") : Str("\n"));
+    }
+    for (iz i = 0; i < v->instr.len; i++) {
+        print(b, "instructions ");
+        print(b, v->instr[i].path);
+        putbyte(b, '\n');
+    }
 }

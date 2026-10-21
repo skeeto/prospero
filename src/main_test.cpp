@@ -467,6 +467,7 @@ int main()
     test_doc(&t);
     test_layout(&t);
     test_view(&t);
+    test_viewpanels(&t);
     test_theme(&t);
     #endif
 

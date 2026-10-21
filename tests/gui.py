@@ -94,6 +94,63 @@ def config(url, model, ask=3, extra=""):
     ) + extra
 
 
+def m4config(url, nonce):
+    """The M4 part of the checklist's configuration: a router of one
+    model for the queue, roles for sessions on other models (small and
+    big windows to compact, and one whose limit sends it to a fallback)."""
+    return (
+        "\n# A router that loads one model at a time\n"
+        "[endpoint q]\n"
+        f"url = {url}/router1-gui/\n"
+        "first_byte_timeout = 25\n"
+        "idle_timeout = 10\n"
+        "connect_timeout = 2\n"
+        "\n"
+        "# Two models there, the second queued behind the first\n"
+        "[role lead]\n"
+        f"model = fake:gui:{nonce}\n"
+        "endpoint = q\n"
+        "\n"
+        "[role rival]\n"
+        f"model = fake:gui_b:{nonce}\n"
+        "endpoint = q\n"
+        "\n"
+        "# Windows small enough to compact in\n"
+        "[role small]\n"
+        f"model = fake:gui_small:{nonce}\n"
+        "\n"
+        "[role prune]\n"
+        f"model = fake:gui_prune:{nonce}\n"
+        "\n"
+        "# Over its limit at once: the fallback takes over\n"
+        "[role failover]\n"
+        f"model = fake:guifail:{nonce}\n"
+        "\n"
+        f"[model fake:guifail:{nonce}]\n"
+        f"fallback = fake:guifail_b:{nonce}\n"
+    )
+
+
+M4MODELS = {"gui_b": {}, "guifail": {}, "guifail_b": {},
+            "gui_small": {"meta": {"n_ctx": 24000, "n_ctx_train": 262144}},
+            "gui_prune": {"meta": {"n_ctx": 100000, "n_ctx_train": 262144}}}
+
+
+def bigfiles(host, prefix, n, lines):
+    """Files PREFIXf0.txt.. of about 78 bytes a line, made on the host
+    (a Windows command line is too short to carry them)."""
+    fill = "abcdefghij" * 6
+    if isinstance(host, Remote):
+        host.h.sh("".join(
+            f"awk 'BEGIN {{ for (j = 0; j < {lines}; j++) "
+            f"printf \"file {i} line %d: {fill}\\n\", j }}' > "
+            f"{host.path('work', f'{prefix}f{i}.txt')}\n" for i in range(n)))
+        return
+    for i in range(n):
+        host.write(host.path("work", f"{prefix}f{i}.txt"),
+                   "".join(f"file {i} line {j}: {fill}\n" for j in range(lines)))
+
+
 def alive(pid):
     try:
         os.kill(pid, 0)
@@ -550,6 +607,8 @@ def main():
     nonce = f"{random.randrange(1 << 32):08x}"
     model = f"fake:gui:{nonce}"
     fake_provider.STATE.register(model)
+    for name, listing in M4MODELS.items():
+        fake_provider.STATE.register(f"fake:{name}:{nonce}", **listing)
     host = Remote(args, srv.server_address[1]) if args.host else Local(args)
     work = host.path("work")
     state = host.path("state")
@@ -568,6 +627,12 @@ def main():
                         f"\n# A long value\n[role long]\nprompt = {LONG_PROMPT}\n")
     elif args.mode == "enginestop":
         before = config(curl, model, 60)
+    elif args.mode == "drive" and not args.fake:
+        before = config(curl, model, extra=m4config(curl, nonce))
+        # Instruction files for the info popup, and files to compact over
+        host.write(host.path("work", "AGENTS.md"), "# Checklist rules\n\nKeep it short.\n")
+        bigfiles(host, "small-", 8, 160)
+        bigfiles(host, "big-", 10, 512)
     else:
         before = config(curl, model)
     host.write(ini, before)
@@ -651,9 +716,11 @@ def main():
             problems.append(f"the configuration diff is not one line: {body}")
         else:
             print("configuration diff: " + " | ".join(body))
-        # Gone: the cancelled command, and the one quitting stopped
+        # Gone: the cancelled command, the one quitting stopped, and the
+        # job killed from its panel
         time.sleep(0.5)
-        for name in ("cancel", "close"):
+        names = ("cancel", "close") + (("job",) if args.mode == "drive" else ())
+        for name in names:
             text = host.read(host.path("work", f"{name}.pid"))
             pid = int(text.strip()) if text and text.strip().isdigit() else None
             if pid is None:
