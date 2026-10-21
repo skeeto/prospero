@@ -1237,10 +1237,30 @@ def sc_task_ask_b(model, n, req):
 
 
 sc_task_unattended = sc_task_ask
+sc_task_close = sc_task_ask
 
 
 def sc_task_unattended_b(model, n, req):
     yield from sc_task_ask_b(model, n, req)
+
+
+def sc_task_close_b(model, n, req):
+    yield from sc_task_ask_b(model, n, req)
+
+
+def sc_task_long(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Say a lot",
+                                           "prompt": "Report at length.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, "Heard it.")
+
+
+def sc_task_long_b(model, n, req):
+    # A report of 60 KiB in 2000 lines
+    body = "".join(f"Finding {i:04d}: {'x' * 20}\n" for i in range(2000))
+    yield from answer(model, body, pieces=20)
 
 
 # The GUI's checklist (harness gui --drive, run by tests/gui.py): the

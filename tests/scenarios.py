@@ -2553,6 +2553,56 @@ def task_ask(t):
 
 
 @scenario(bound=15)
+def task_close(t):
+    """A frontend that closes the parent leaves its subagent unattended:
+    the ask waiting is denied, and the subagent goes on."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ask = h.wait(lambda e: e.get("ev") == "ask")
+        t.check(ask["sid"] != sid, f"the subagent asks: {ask}")
+        h.call("close", sid=sid)
+        ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == ask["sid"])
+        t.check(ans["by"] == "policy" and ans["decision"] == "deny" and
+                "no longer attended" in ans["note"], f"denied: {ans}")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"the parent ends {end}")
+        te = h.all("tool.end", sid)
+        t.check(te and te[0]["text"] == "The child was refused.", f"report {te}")
+        t.check(outside_file(t) is None, "nothing written outside")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def task_long(t):
+    """A report over 50 KiB is cut in the result, which says where all of
+    it is: a file in the parent's session the agent may read."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    full = "".join(f"Finding {i:04d}: {'x' * 20}\n" for i in range(2000)).strip()
+    te = r.all("tool.end", own)[0]
+    t.check(te["status"] == "ok" and te.get("child") == kids[0]["sid"], f"the call {te['status']}")
+    t.check(te["text"].startswith(full[:51200]) and len(te["text"]) < 52 * 1024,
+            f"cut: {len(te['text'])} bytes")
+    path = t.host.join(t.state, "sessions", own, *te["spill"].split("/"))
+    said = te["text"].replace("\\", "/")
+    t.check("All of it is in " in said and f"{own}/{te['spill']}" in said,
+            f"says where: {te['text'][-300:]!r}")
+    t.check(te["bytes"] == len(full), f"bytes {te['bytes']}")
+    t.check(t.host.read(path) == full, "the whole report kept")
+    line = full[:51200].count("\n") + 1
+    t.check(te["text"].endswith(f"where this part ends at line {line}.]"),
+            f"its line: {te['text'][-80:]!r}")
+    msgs = t.requests()[1]["body"]["messages"]
+    t.check(msgs[-1]["role"] == "tool" and msgs[-1]["content"] == te["text"],
+            "the agent read the cut report")
+
+
+@scenario(bound=15)
 def task_unattended(t):
     """Unattended, a subagent's ask is denied by policy, and it goes on."""
     r = t.run()
