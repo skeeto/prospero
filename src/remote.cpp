@@ -49,6 +49,19 @@
 // other (a background host, as registered): none is started, and once
 // it cannot be reached, it is gone and the remote ends, closed.
 //
+// The harness there is the one configured (path), else the engine
+// "harness deploy" put there for this protocol (deploy.cpp records it),
+// else "harness" on its PATH. When that one is missing (the shell finds
+// no such program) or cannot attach (another protocol, or too old),
+// deploying one helps: a remote that may deploy (deploy, as with
+// "connect --deploy" or [remote NAME] deploy = auto) does so once,
+// saying goodbye first to a host of another protocol, its "deploy"
+// records passing to the frontend while the state is deploying, and
+// then connects to the engine deployed. Otherwise it fails, and the
+// failed record's "deploy" says why deploying would help, missing or
+// mismatch, so that a frontend can offer it: a new remote that may
+// deploy. Deploying never stops a host that runs there (deploy.cpp).
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i64 {
@@ -65,17 +78,30 @@ enum : u32 {
     REMOTE_CLOSE = 300,  // frontend to the remote thread: remoteclose
     REMOTE_FINISH,       // remotefinish
     REMOTE_DROP,         // and remotedrop, a test hook
+    REMOTE_DEPLOYED,     // a deployment's outcome: 1 and the path, or 0 and why
 };
 
 enum : i32 {
     RS_CONNECTING,  // a stream is starting, or waiting for its host
     RS_UP,          // the host answered hello
     RS_DOWN,        // waiting to try again
+    RS_DEPLOYING,   // deploying an engine there, then connecting
     RS_FAILED,      // given up for good
     RS_CLOSED,      // ended by remoteclose or quit
 };
 
-static Str remotestates[] = {"connecting", "up", "down", "failed", "closed"};
+static Str remotestates[] = {
+    "connecting", "up", "down", "deploying", "failed", "closed",
+};
+
+// Why deploying an engine would help
+enum : i32 {
+    NEED_NONE,
+    NEED_MISSING,   // the shell there found no such program
+    NEED_MISMATCH,  // one of another protocol, or one that cannot attach
+};
+
+static Str remoteneeds[] = {"", "missing", "mismatch"};
 
 struct RemoteConf {
     Str name;      // the remote's name, in the sessions list
@@ -90,6 +116,9 @@ struct RemoteConf {
     Str endpoint;  // this machine's host at this endpoint, and no other:
                    // none is started, and once it cannot be reached the
                    // remote ends (closed), as the host is gone
+    Str scp;       // for deploying: scp itself, "scp" if empty
+    Str engines;   // for deploying: the engines, if not next to this program
+    b32 deploy;    // deploy an engine when the one there is missing or another
 };
 
 // A session the frontend opened, or has records of.
@@ -136,6 +165,12 @@ struct Remote {
     Buf               held;     // the frontend's commands before hello
     i64               nextown;  // the library's own ids: -1, -2, ...
     Str               why;      // the last trouble, for the frontend
+    Str               version;  // the host's
+    i32               need;     // NEED_*: why deploying would help
+    b32               deploying;
+    b32               deployed; // tried once: never again
+    b32               redeploy; // deploy once this stream ends
+    i32               cancel;   // stops a deployment (atomic)
 };
 
 static void remoteemit(Remote *r, Str line)
@@ -155,6 +190,12 @@ static void remotestatus(Remote *r, Arena scratch, i32 state, Str msg, i64 retry
     }
     if (retry >= 0) {
         putintkey(&w.json, "retry_ms", retry/MS);
+    }
+    if (state==RS_UP && r->version.len) {
+        putstrkey(&w.json, "version", r->version);
+    }
+    if (state==RS_FAILED && r->need) {
+        putstrkey(&w.json, "deploy", remoteneeds[r->need]);
     }
     remoteemit(r, evend(&w));
 }
@@ -333,8 +374,14 @@ static b32 remotestart(Remote *r, Arena scratch)
         return 1;
     }
 
+    // The harness there: configured, or deployed for this protocol
+    Str path = r->conf.path;
+    if (!path.len) {
+        DeployRec dr = deployrecord(os, &scratch, r->conf.localstate, r->conf.ssh);
+        path = dr.ok && dr.proto==HOST_PROTO ? dr.path : Str("harness");
+    }
     Buf cmd(&scratch, 256);
-    b32 ok = remotearg(&cmd, r->conf.path.len ? r->conf.path : Str("harness"));
+    b32 ok = remotearg(&cmd, path);
     print(&cmd, " attach");
     if (!r->fresh) {
         print(&cmd, " --reconnect");
@@ -360,16 +407,14 @@ static b32 remotestart(Remote *r, Arena scratch)
         r->why = clone(&r->perm, "an ssh destination cannot begin with -");
         return 0;
     }
-    Str opts[] = {
-        "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
-        "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-        "-o", "EscapeChar=none",
-    };
     Slice<Str> argv = {};
     argv = push(&scratch, argv, r->conf.program.len ? r->conf.program : Str("ssh"));
-    for (iz i = 0; i < countof(opts); i++) {
-        argv = push(&scratch, argv, opts[i]);
+    argv = push(&scratch, argv, Str("-T"));
+    for (iz i = 0; i < countof(deployopts); i++) {
+        argv = push(&scratch, argv, deployopts[i]);
     }
+    argv = push(&scratch, argv, Str("-o"));
+    argv = push(&scratch, argv, Str("EscapeChar=none"));
     argv = push(&scratch, argv, r->conf.ssh);
     argv = push(&scratch, argv, cuthead(finish(&cmd), 1));
 
@@ -428,6 +473,7 @@ static void remotestop(Remote *r, b32 kill)
 static void remoteend(Remote *r, Arena scratch, i32 state, Str why)
 {
     remotestop(r, 1);
+    __atomic_store_n(&r->cancel, 1, __ATOMIC_RELEASE);
     if (r->state != state) {
         remotestatus(r, scratch, state, why, -1);  // else told already
     }
@@ -452,6 +498,105 @@ static void remoteend(Remote *r, Arena scratch, i32 state, Str why)
     r->done = 1;
 }
 
+// Deploying
+
+// A deployment on a thread of its own, so that the remote thread goes
+// on: its records come through the remote's mailbox as MAIL_OUT, then
+// its outcome as REMOTE_DEPLOYED.
+struct RemoteDeploy {
+    Remote    *r;
+    DeployConf conf;
+    Region    *perm;     // kept: a child may post to its mailbox late
+    Region    *scratch;
+};
+
+static void remotedeploythread(void *arg)
+{
+    RemoteDeploy *rd      = (RemoteDeploy *)arg;
+    Remote       *r       = rd->r;
+    Arena         perm    = newarena(rd->perm);
+    Arena         scratch = newarena(rd->scratch);
+    Deployed      d       = deploy(r->os, &perm, scratch, &rd->conf);
+    Buf b(&perm, 16 + d.path.len + d.err.len);
+    putbyte(&b, (u8)d.ok);
+    print(&b, d.ok ? d.path : d.err);
+    os_release(r->os, rd->scratch);
+    mailpost(r->in, REMOTE_DEPLOYED, 0, finish(&b), 0);
+}
+
+// Deploy an engine there, once, then connect to it.
+static void remotedeploy(Remote *r, Arena scratch, Str why)
+{
+    Os           *os = r->os;
+    RemoteDeploy *rd = alloc<RemoteDeploy>(&r->perm);
+    rd->r               = r;
+    rd->conf.name       = r->conf.name;
+    rd->conf.ssh        = r->conf.ssh;
+    rd->conf.program    = r->conf.program;
+    rd->conf.scp        = r->conf.scp;
+    rd->conf.engines    = r->conf.engines;
+    rd->conf.localstate = r->conf.localstate;
+    rd->conf.notes      = r->in;
+    rd->conf.cancel     = &r->cancel;
+    rd->perm            = os_reserve(os, (iz)1<<24);
+    rd->scratch         = os_reserve(os, 3*DEPLOY_MAXSIZE);
+    r->deployed = 1;
+    if (!rd->perm || !rd->scratch || !os_thread(os, remotedeploythread, rd)) {
+        if (rd->perm) os_release(os, rd->perm);
+        if (rd->scratch) os_release(os, rd->scratch);
+        r->why = clone(&r->perm, "cannot start deploying an engine: out of memory");
+        remoteend(r, scratch, RS_FAILED, r->why);
+        return;
+    }
+    r->deploying = 1;
+    Str msg = concat(&scratch, "deploying an engine: ", why);
+    remotestatus(r, scratch, RS_DEPLOYING, msg, -1);
+}
+
+// What ssh's errors say when the engine there is missing (the shell
+// found no such program, in sh or cmd.exe), or cannot attach (another
+// platform's, or a harness too old to know attach, its usage printed).
+// Not when ssh itself could not run here (the reaper's 127).
+static i32 remoteneed(Str log, i32 code)
+{
+    if (find(log, "harness: cannot run ") >= 0) {
+        return NEED_NONE;
+    } else if (code==127 ||
+            find(log, "is not recognized as an internal or external command")>=0 ||
+            find(log, "cannot find the path specified")>=0) {
+        return NEED_MISSING;
+    } else if (code==126 || ((code==1 || code==2) && find(log, "usage: harness")>=0)) {
+        return NEED_MISMATCH;
+    }
+    return NEED_NONE;
+}
+
+// The engine there is missing or cannot attach: deploy one when this
+// remote may and has not yet, else the end, saying what would help.
+static void remoteneeded(Remote *r, Arena scratch, i32 need, Str said)
+{
+    remotestop(r, 1);
+    r->need = need;
+    Buf b(&scratch, 256 + said.len);
+    print(&b, need==NEED_MISSING ? Str("no engine on ") : Str("the engine on "));
+    print(&b, r->conf.name);
+    print(&b, need==NEED_MISSING ? Str("") : Str(" cannot attach"));
+    if (said.len) {
+        print(&b, " (");
+        print(&b, said);
+        print(&b, ")");
+    }
+    if (r->conf.deploy && !r->deployed) {
+        remotedeploy(r, scratch, finish(&b));
+        return;
+    }
+    print(&b, ": deploy one with \"harness deploy ");
+    print(&b, r->conf.name);
+    print(&b, "\"");
+    r->why = clone(&r->perm, finish(&b));
+    remoteend(r, scratch, RS_FAILED, r->why);
+}
+
 // The stream ended (code: how ssh exited, else -1): try again, at once
 // when the host is gone, after a while otherwise, or not at all when
 // closing, or when the remote has never worked after a few tries.
@@ -462,6 +607,13 @@ static void remotedown(Remote *r, Arena scratch, Str why, i32 code)
     r->wanthello = 0;
     if (r->state == RS_FAILED) {
         remoteend(r, scratch, RS_FAILED, r->why);  // why it failed, told
+        return;
+    } else if (r->redeploy && !r->quitting) {
+        // A host of another protocol: goodbye said, deploy one of ours
+        r->redeploy = 0;
+        r->closing  = 0;
+        r->closeby  = 0;
+        remotedeploy(r, scratch, r->why);
         return;
     }
     r->why = clone(&r->perm, why);
@@ -574,6 +726,9 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
         }
         r->wanthello = 0;
         if (jsonint(jsonget(rec.root, "proto"), -1) != HOST_PROTO) {
+            // Goodbye, then the end, or deploying one of this protocol,
+            // which starts beside that host (one per protocol)
+            b32 ssh = r->conf.ssh.len && !r->conf.path.len;
             Buf b(&scratch, 256);
             print(&b, "the harness on ");
             print(&b, r->conf.name);
@@ -585,12 +740,24 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
             print(&b, (i64)HOST_PROTO);
             print(&b, " (version " HARNESS_VERSION "): install a matching "
                       "version there");
-            r->why     = clone(&r->perm, finish(&b));
-            r->closing = 1;
-            r->closeby = os_ticks(r->os) + REMOTE_CLOSEWAIT;
+            if (ssh) {
+                print(&b, ", as \"harness deploy ");
+                print(&b, r->conf.name);
+                print(&b, "\" does");
+            }
+            r->why      = clone(&r->perm, finish(&b));
+            r->need     = ssh ? NEED_MISMATCH : NEED_NONE;
+            r->closing  = 1;
+            r->closeby  = os_ticks(r->os) + REMOTE_CLOSEWAIT;
+            r->redeploy = ssh && r->conf.deploy && !r->deployed;
             linkbye(&r->link);
-            remotestatus(r, scratch, RS_FAILED, r->why, -1);
+            if (!r->redeploy) {
+                remotestatus(r, scratch, RS_FAILED, r->why, -1);
+            }
             return;
+        }
+        if (jsonstr(jsonget(rec.root, "version")) != r->version) {
+            r->version = clone(&r->perm, jsonstr(jsonget(rec.root, "version")));
         }
         r->hellook = 1;
         for (Str rest = finish(&r->held); rest.len;) {
@@ -741,7 +908,7 @@ static void remotethread(void *arg)
         b32   nap     = 1;
 
         // A stream, when it is time for one
-        if (!r->live && now>=r->retryat) {
+        if (!r->live && !r->deploying && now>=r->retryat) {
             remotestatus(r, scratch, RS_CONNECTING, {}, -1);
             if (!remotestart(r, scratch)) {
                 remotedown(r, scratch, r->why, -1);
@@ -751,7 +918,8 @@ static void remotethread(void *arg)
             nap = 0;  // starting it may have napped on the mailbox
         }
 
-        i64 next = r->live ? linkdeadline(&r->link) : r->retryat;
+        i64 next = r->live      ? linkdeadline(&r->link) :
+                   r->deploying ? now + 3600*SEC : r->retryat;
         next = r->closeby && r->closeby<next ? r->closeby : next;
         next = r->drainby && r->drainby<next ? r->drainby : next;
         i32 ms = 0;
@@ -794,11 +962,35 @@ static void remotethread(void *arg)
                 break;
             case PROC_EXIT:
                 if (rec.id==r->tid && r->live) {
-                    i32 code = get32(rec.data);
-                    Str why = code==HOST_NOSERVER ? Str("the host was gone")
-                                                  : remoteexit(r, &a, code);
-                    remotedown(r, a, why, code);
+                    i32  code = get32(rec.data);
+                    Str  why  = code==HOST_NOSERVER ? Str("the host was gone")
+                                                    : remoteexit(r, &a, code);
+                    Read log  = os_read(os, &a, remotelog(r, &a), 1<<16);
+                    b32  ours = !r->conf.path.len && !r->closing && !r->quitting;
+                    i32  need = ours ? remoteneed(log.data, code) : NEED_NONE;
+                    if (need) {
+                        remoteneeded(r, a, need, remotesshsaid(r, &a));
+                    } else {
+                        remotedown(r, a, why, code);
+                    }
                 }
+                break;
+            case REMOTE_DEPLOYED:
+                r->deploying = 0;
+                if (rec.data.len && rec.data[0]) {
+                    r->need     = NEED_NONE;
+                    r->fresh    = 1;  // starting a host of the new engine
+                    r->tries    = 0;
+                    r->backoffs = 0;
+                    r->retryat  = os_ticks(os);
+                } else {
+                    Str err = cuthead(rec.data, rec.data.len>0);
+                    r->why = concat(&r->perm, "cannot deploy an engine: ", err);
+                    remoteend(r, a, RS_FAILED, r->why);
+                }
+                break;
+            case MAIL_OUT:
+                remoteemit(r, rec.data);  // a deployment's progress
                 break;
             case CONN_EOF:
                 if (rec.id==r->tid && r->live) {
@@ -857,6 +1049,9 @@ static Remote *newremote(Os *os, Arena *perm, RemoteConf *conf, Mailbox *out)
     r->conf.config     = clone(&r->perm, conf->config);
     r->conf.idle       = clone(&r->perm, conf->idle);
     r->conf.endpoint   = clone(&r->perm, conf->endpoint);
+    r->conf.scp        = clone(&r->perm, conf->scp);
+    r->conf.engines    = clone(&r->perm, conf->engines);
+    r->conf.deploy     = conf->deploy;
     if (!r->conf.name.len) {
         r->conf.name = "local";
     }
@@ -919,6 +1114,11 @@ static Str connectusage =
 "  --remote-state DIR  its state directory there\n"
 "  --remote-config F   its configuration file there\n"
 "  --ssh-program PROG  ssh itself (default: ssh)\n"
+"  --deploy            deploy an engine there if it has none, or one of\n"
+"                      another protocol (as harness deploy)\n"
+"  --engines DIR       the engines to deploy (default: engines next to\n"
+"                      this program)\n"
+"  --scp-program PROG  scp itself, for deploying (default: scp)\n"
 "  -c FILE             configuration file\n"
 "  --state DIR         session storage directory here\n"
 "  --idle SECS         idle exit of a host started\n";
@@ -981,6 +1181,12 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             rc.rconfig = args[++i];
         } else if (a=="--ssh-program" && more) {
             rc.program = args[++i];
+        } else if (a=="--scp-program" && more) {
+            rc.scp = args[++i];
+        } else if (a=="--engines" && more) {
+            rc.engines = args[++i];
+        } else if (a == "--deploy") {
+            rc.deploy = 1;
         } else if (a=="-c" && more) {
             config = args[++i];
         } else if (a=="--state" && more) {
@@ -1015,11 +1221,12 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             return 2;
         }
         rc.ssh   = rc.ssh.len ? rc.ssh : dest;
-        rc.path  = rc.path.len ? rc.path : cfgget(cfg, "remote", name, "path", 0);
+        rc.path  = rc.path.len ? rc.path : cfgown(cfg, "remote", name, "path");
         rc.state = rc.state.len ? rc.state : cfgget(cfg, "remote", name, "state", 0);
         rc.rconfig = rc.rconfig.len ? rc.rconfig
                                     : cfgget(cfg, "remote", name, "config", 0);
         rc.name  = name;
+        rc.deploy |= cfgget(cfg, "remote", name, "deploy", 0) == "auto";
     }
     rc.config = config;
     if (!os_mkdirs(os, scratch, rc.localstate)) {

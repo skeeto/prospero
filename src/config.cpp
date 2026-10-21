@@ -311,11 +311,15 @@ static CfgKey cfgschema[] = {
     {"remote", "ssh", CFG_STRING, "", {}, {}, "remote",
      "Where ssh reaches the machine: [user@]host, or a Host of ~/.ssh/config"},
     {"remote", "path", CFG_STRING, "harness", {}, {}, "remote",
-     "The harness executable there, a path or a name on its PATH"},
+     "The harness executable there, a path or a name on its PATH; unset, "
+     "the engine harness deploy put there, else harness"},
     {"remote", "state", CFG_STRING, "", {}, {}, "remote",
      "The state directory there, by default its own"},
     {"remote", "config", CFG_STRING, "", {}, {}, "remote",
      "The configuration file there, by default its own"},
+    {"remote", "deploy", CFG_ENUM, "ask", {}, "ask auto", "remote",
+     "When the machine has no engine, or one of another protocol: ask "
+     "before deploying one, or deploy it unasked (auto)"},
 };
 
 // Value judgments

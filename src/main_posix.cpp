@@ -1364,11 +1364,12 @@ static void onsweep(int sig)
 
 static void reapsay(char const *what, char const *arg)
 {
-    Str parts[] = {"harness: ", {}, {}, ": ", {}, "\n"};
+    Str parts[] = {"harness: ", {}, " ", {}, ": ", {}, "\n"};
     parts[1] = {(u8 *)what, (iz)__builtin_strlen(what)};
-    parts[2] = {(u8 *)arg, (iz)__builtin_strlen(arg)};
+    parts[3] = {(u8 *)arg, (iz)__builtin_strlen(arg)};
+    parts[2] = parts[3].len ? parts[2] : Str{};
     char const *err = strerror(errno);  // single-threaded here
-    parts[4] = {(u8 *)err, (iz)__builtin_strlen(err)};
+    parts[5] = {(u8 *)err, (iz)__builtin_strlen(err)};
     for (iz i = 0; i < countof(parts); i++) {
         writeall(2, parts[i]);
     }

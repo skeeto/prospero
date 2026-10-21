@@ -12,6 +12,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 set(HARNESS_NAME harness CACHE STRING "Executable name")
 option(HARNESS_GUI "Build the GUI (OFF: the headless engine only)" ON)
+option(HARNESS_STATIC "Link fully statically (Linux: deployed engines)" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -110,6 +111,11 @@ else()
   if(HARNESS_HAS_STATICXX AND NOT APPLE)
     target_link_options(harness PRIVATE -static-libstdc++ -static-libgcc)
   endif()
+  if(HARNESS_STATIC AND NOT APPLE)
+    # An engine deployed to other machines (tools/engines.py) cannot
+    # know their C library, so it brings its own.
+    target_link_options(harness PRIVATE -static)
+  endif()
 endif()
 target_link_libraries(harness PRIVATE harness_core_flags)
 if(HARNESS_GUI)
@@ -165,5 +171,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     # URL includes in the configuration, against a fake web server
     add_test(NAME includes COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/includes.py --harness $<TARGET_FILE:harness>)
+    # Deploying engines through a fake ssh and scp (a real host: --ssh)
+    add_test(NAME deploy COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/deploy.py --harness $<TARGET_FILE:harness>)
   endif()
 endif()

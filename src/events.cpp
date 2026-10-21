@@ -53,6 +53,7 @@ enum : i32 {
     EV_REPLY,
     EV_JOBOUT,
     EV_REMOTE,  // (M5) a client library's connection to its host
+    EV_DEPLOY,  // (M5) progress deploying an engine to a remote machine
     EV_COUNT,
 };
 
@@ -98,6 +99,7 @@ static EvInfo evinfo[] = {
     {"reply",      0, 0},
     {"job.out",    0, 0},
     {"remote",     0, 0},
+    {"deploy",     0, 0},
 };
 static_assert(countof(evinfo) == EV_COUNT);
 

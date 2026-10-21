@@ -1901,7 +1901,8 @@ static u32 hostcolor(Gui *g, GuiHost *h)
     switch (h->state) {
     case RS_UP:         return g->pal->ok;
     case RS_CONNECTING:
-    case RS_DOWN:       return g->pal->amber;
+    case RS_DOWN:
+    case RS_DEPLOYING:  return g->pal->amber;
     case RS_FAILED:     return g->pal->bad;
     }
     return g->pal->dim;

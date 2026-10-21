@@ -1842,6 +1842,7 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name)
     rc.rconfig    = remoteset(g, name, "config");
     rc.program    = os_getenv(g->os, &scratch, "HARNESS_TEST_SSH");
     rc.localstate = g->statedir;
+    rc.deploy     = remoteset(g, name, "deploy") == "auto";
     if (!rc.ssh.len) {
         h->state = RS_FAILED;
         h->msg   = "no ssh destination: set ssh in its section";
@@ -2018,6 +2019,7 @@ static Str hoststatus(Gui *g, Arena *a, GuiHost *h, i64 left)
         print(&b, " s");
         return finish(&b);
     }
+    case RS_DEPLOYING:  return "deploying an engine";
     case RS_FAILED:     return "failed";
     }
     return "not connected";
