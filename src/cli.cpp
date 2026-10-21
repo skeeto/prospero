@@ -503,11 +503,14 @@ static Str defaultstate(Os *os, Arena *a)
 
 // The configuration, its diagnostics reported on standard error: an
 // explicit file must exist, and the default one is seeded on first run.
-// Null on failure, reported.
-static Config *cliconfig(Os *os, Arena *perm, Arena scratch, Str config)
+// With fetch, URL includes with no cached copy are fetched first, which
+// takes 30 s at most; otherwise only cached copies are used. Null on
+// failure, reported.
+static Config *cliconfig(Os *os, Arena *perm, Arena scratch, Str config,
+                         Str statedir, b32 fetch)
 {
     Str     path = config.len ? config : cfgdefault(os, perm);
-    Config *cfg  = newconfig(os, perm, scratch, path, !config.len);
+    Config *cfg  = newconfig(os, perm, scratch, path, !config.len, statedir, fetch);
     if (!cfg) {
         os_print(os, 2, "harness: out of memory\n");
         return 0;
@@ -565,12 +568,13 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
         return 2;
     }
 
-    Config *cfg = cliconfig(os, &perm, scratch, config);
+    // URL includes not yet cached are fetched now, briefly
+    c.statedir  = state.len ? state : defaultstate(os, &perm);
+    Config *cfg = cliconfig(os, &perm, scratch, config, c.statedir, 1);
     if (!cfg) {
         return 2;
     }
 
-    c.statedir = state.len ? state : defaultstate(os, &perm);
     Str sessions = join(&perm, c.statedir, "sessions");
     if (!os_mkdirs(os, scratch, sessions)) {
         os_print(os, 2, "harness: cannot create the state directory\n");

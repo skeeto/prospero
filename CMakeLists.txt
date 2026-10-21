@@ -162,5 +162,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     # Hosts and their clients on this machine (the ssh ones take --ssh)
     add_test(NAME remote COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/remote.py --harness $<TARGET_FILE:harness>)
+    # URL includes in the configuration, against a fake web server
+    add_test(NAME includes COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/includes.py --harness $<TARGET_FILE:harness>)
   endif()
 endif()

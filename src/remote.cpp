@@ -915,7 +915,9 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         os_print(os, 2, connectusage);
         return 2;
     }
-    Config *cfg = cliconfig(os, &perm, scratch, config);
+    // Only cached copies of URL includes: connect runs no engine here
+    rc.localstate = state.len ? state : defaultstate(os, &perm);
+    Config *cfg   = cliconfig(os, &perm, scratch, config, rc.localstate, 0);
     if (!cfg) {
         return 2;
     }
@@ -932,8 +934,7 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
                                     : cfgget(cfg, "remote", name, "config", 0);
         rc.name  = name;
     }
-    rc.localstate = state.len ? state : defaultstate(os, &perm);
-    rc.config     = config;
+    rc.config = config;
     if (!os_mkdirs(os, scratch, rc.localstate)) {
         Str err = os_lasterr(os, &scratch);
         hostsay(os, scratch, "cannot create the state directory", err);

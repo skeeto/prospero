@@ -251,10 +251,20 @@ static void testiniparse(Test *t)
         {"[a b c]\ninclude = x", "! !",
          "1:6: error: expected [kind] or [kind name], section ignored\n"
          "2:1: error: include must come before the first section"},
-        {"include = https://example.com/t.ini", "@<https://example.com/t.ini>",
-         "1:11: warning: URL includes are not supported yet"},
-        {"include = HTTP://x", "@<HTTP://x>",
-         "1:11: warning: URL includes are not supported yet"},
+        {"include = https://example.com/t.ini", "@<https://example.com/t.ini>", ""},
+        {"include = HTTP://x", "@<HTTP://x>", ""},
+        {"include = https://h/t.ini   sha256=0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF # c",
+         "@<https://h/t.ini   sha256=0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF>", ""},
+        {"include = https://h/t.ini sha256=0123", "!",
+         "1:11: error: expected sha256= and 64 hex digits after the URL, "
+         "include ignored"},
+        {"include = https://h/t.ini md5=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "!",
+         "1:11: error: expected sha256= and 64 hex digits after the URL, "
+         "include ignored"},
+        {"include = https://", "!",
+         "1:11: error: expected an http:// or https:// URL, include ignored"},
+        {"include = https://user@h/t.ini", "!",
+         "1:11: error: expected an http:// or https:// URL, include ignored"},
         {"include = //./pipe/x", "@<//./pipe/x>",
          "1:11: warning: device paths are not supported"},
         {"include = \\\\?\\C:\\x.ini", "@<\\\\?\\C:\\x.ini>",
@@ -672,7 +682,7 @@ static void testiniinclude(Test *t)
                "cannot read include /m/nope.ini (not found)\n"
                "/m/root.ini:2:11: warning: "
                "cannot read include /m/dir (not a file)\n"
-               "/m/root.ini:3:11: warning: URL includes are not supported yet");
+               "/m/root.ini:3:11: warning: URL includes are not read here");
         expect(t, "missing.lines", inishow(&a, f),
                "@<nope.ini> @<dir> @<https://example.com/x.ini> x=<1>");
         expect(t, "missing.x", iniget(&ini, "", "", "x"), "1");
@@ -1485,8 +1495,222 @@ static void testiniwriterandom(Test *t)
     expect(t, "edit.random.failures", istr(&a, bad), "0");
 }
 
+// URL includes from a table, as a loader's hook gives them, recording
+// what was asked for: "URL" or "URL pin", separated by "|".
+struct IniWeb {
+    Str  urls[8];
+    Str  texts[8];
+    i32  n;
+    Buf  asked;
+};
+
+static IniSource iniwebfetch(void *ctx, Arena *perm, Str url, Str pin)
+{
+    IniWeb   *w = (IniWeb *)ctx;
+    IniSource r = {};
+    print(&w->asked, w->asked.len ? Str("|") : Str(""));
+    print(&w->asked, url);
+    if (pin.data) {
+        putbyte(&w->asked, ' ');
+        print(&w->asked, pin);
+    }
+    for (i32 i = 0; i < w->n; i++) {
+        if (w->urls[i] == url) {
+            r.data = w->texts[i];
+            return r;
+        }
+    }
+    r.msg      = concat(perm, "no such page ", url);
+    r.severity = INI_WARNING;
+    return r;
+}
+
+static void testiniurls(Test *t)
+{
+    Arena a = t->perm;
+
+    static struct { Str in, want; } cleans[] = {
+        {"HTTPS://Example.COM", "https://example.com/"},
+        {"http://h/a/./b/../c?x=1&y=/../#frag", "http://h/a/c?x=1&y=/../"},
+        {"http://h:8080/A/", "http://h:8080/A/"},
+        {"http://h?q", "http://h/?q"},
+        {"http://h/../../x", "http://h/x"},
+        {"http://h/a/..", "http://h/"},
+        {"http://h/a/b/..", "http://h/a/"},
+        {"http://h//a/./", "http://h//a/"},
+        {"http://[::1]:80/x", "http://[::1]:80/x"},
+        {"ftp://h/x", "(null)"},
+        {"http://", "(null)"},
+        {"http:///x", "(null)"},
+        {"http://u:p@h/", "(null)"},
+        {"http://h/a b", "(null)"},
+        {"http://h/a\\b", "(null)"},
+        {"team.ini", "(null)"},
+    };
+    for (iz i = 0; i < countof(cleans); i++) {
+        Str got = iniurlclean(&a, cleans[i].in);
+        expect(t, concat(&a, "urlclean ", cleans[i].in),
+               got.data ? got : Str("(null)"), cleans[i].want);
+    }
+
+    // RFC 3986, 5.4, without fragments, which are dropped
+    static struct { Str ref, want; } refs[] = {
+        {"g", "http://a/b/c/g"},
+        {"./g", "http://a/b/c/g"},
+        {"g/", "http://a/b/c/g/"},
+        {"/g", "http://a/g"},
+        {"//g", "http://g/"},
+        {"?y", "http://a/b/c/d;p?y"},
+        {"g?y", "http://a/b/c/g?y"},
+        {"#s", "http://a/b/c/d;p?q"},
+        {"g#s", "http://a/b/c/g"},
+        {"g;x", "http://a/b/c/g;x"},
+        {".", "http://a/b/c/"},
+        {"./", "http://a/b/c/"},
+        {"..", "http://a/b/"},
+        {"../", "http://a/b/"},
+        {"../g", "http://a/b/g"},
+        {"../..", "http://a/"},
+        {"../../", "http://a/"},
+        {"../../g", "http://a/g"},
+        {"../../../g", "http://a/g"},
+        {"/./g", "http://a/g"},
+        {"/../g", "http://a/g"},
+        {"g.", "http://a/b/c/g."},
+        {".g", "http://a/b/c/.g"},
+        {"g..", "http://a/b/c/g.."},
+        {"./../g", "http://a/b/g"},
+        {"./g/.", "http://a/b/c/g/"},
+        {"g/./h", "http://a/b/c/g/h"},
+        {"g/../h", "http://a/b/c/h"},
+        {"HTTPS://Other/x.ini", "https://other/x.ini"},
+        {"file:///etc/passwd", "(null)"},
+        {"C:/x.ini", "(null)"},
+        {"a b.ini", "(null)"},
+    };
+    for (iz i = 0; i < countof(refs); i++) {
+        Str got = iniurlresolve(&a, "http://a/b/c/d;p?q", refs[i].ref);
+        expect(t, concat(&a, "urlresolve ", refs[i].ref),
+               got.data ? got : Str("(null)"), refs[i].want);
+    }
+
+    // Random references resolve to canonical URLs, or to none: cleaning
+    // again changes nothing, and no path segment is "." or ".."
+    {
+        static Str const parts[] = {
+            "a", "b/", "/", ".", "..", "./", "../", "?q/../", "#f", "//h",
+            ":", "http:", "HTTPS://H", "%2e", "\\", " ", "@", "", ";p",
+        };
+        u64 rng = 1;
+        i32 bad = 0;
+        for (i32 n = 0; n < 20000; n++) {
+            Arena tmp = a;
+            Buf   ref(&tmp, 64);
+            for (iz k = inirand(&rng)%8; k > 0; k--) {
+                print(&ref, parts[inirand(&rng) % countof(parts)]);
+            }
+            Str got = iniurlresolve(&tmp, "http://h/x/y?z", finish(&ref));
+            if (!got.data) {
+                continue;
+            }
+            b32 ok   = iniurlclean(&tmp, got) == got;
+            Str path = cut(cuthead(got, find(got, "://")+3), '?').head;
+            path = cuthead(path, cut(path, '/').head.len);  // after the host
+            for (Str rest = path; rest.len;) {
+                Cut c = cut(rest, '/');
+                ok &= !(c.head==".") && !(c.head=="..");
+                rest = c.tail;
+            }
+            if (!ok && !bad++) {
+                expect(t, "urlresolve.random", got, finish(&ref));
+            }
+        }
+        expect(t, "urlresolve.random.bad", istr(&a, bad), "0");
+    }
+
+    // Includes in a file from the web are references to more of the web
+    Os    *os  = newos(&a, 1<<16);
+    Str    pin = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    IniWeb w   = {};
+    w.asked = Buf(&a, 1024);
+    os_write(os, a, "/w/root.ini",
+        "include = HTTPS://H/team/./a.ini#top\n"
+        "mine = 1\n");
+    Str pages[][2] = {
+        {"https://h/team/a.ini",
+         "include = b.ini\n"
+         "include = ../c.ini sha256=00112233445566778899AABBCCDDEEFF"
+         "00112233445566778899aabbccddeeff\n"
+         "include = //other/d.ini\n"
+         "include = /etc/passwd\n"
+         "include = a.ini\n"
+         "include = C:\\x.ini\n"
+         "from = a\n"
+         "[endpoint t]\n"
+         "url = http://t/\n"},
+        {"https://h/team/b.ini", "from = b\n"},
+        {"https://h/c.ini", "from = c\n"},
+        {"https://other/d.ini", "include = a.ini\nfrom = d\n"},
+    };
+    for (iz i = 0; i < countof(pages); i++) {
+        w.urls[w.n]    = pages[i][0];
+        w.texts[w.n++] = pages[i][1];
+    }
+    {
+        Ini ini = {};
+        ini.fetch    = iniwebfetch;
+        ini.fetchctx = &w;
+        iniload(&ini, os, &a, "/w/root.ini");
+        expect(t, "web.files", inishowfiles(&a, &ini),
+               "/w/root.ini@0 "
+               "https://h/team/a.ini<-/w/root.ini:1@1 "
+               "https://h/team/b.ini<-https://h/team/a.ini:1@2 "
+               "https://h/c.ini<-https://h/team/a.ini:2@2 "
+               "https://other/d.ini<-https://h/team/a.ini:3@2");
+        expect(t, "web.diags", inidiags(&a, &ini),
+               "https://other/d.ini:1:11: warning: no such page "
+               "https://other/a.ini\n"
+               "https://h/team/a.ini:4:11: warning: no such page "
+               "https://h/etc/passwd\n"
+               "https://h/team/a.ini:5:11: warning: include cycle: "
+               "https://h/team/a.ini\n"
+               "https://h/team/a.ini:6:11: error: expected an http:// or "
+               "https:// URL, include ignored");
+        expect(t, "web.asked", finish(&w.asked), concat(&a,
+               "https://h/team/a.ini|https://h/team/b.ini|https://h/c.ini ",
+               concat(&a, pin, "|https://other/d.ini|https://other/a.ini|"
+                               "https://h/etc/passwd")));
+        expect(t, "web.from", inihistory(&a, &ini, "", "", "from"),
+               "https://h/team/a.ini:7 https://other/d.ini:2 "
+               "https://h/c.ini:1 https://h/team/b.ini:1");
+        expect(t, "web.url", inihistory(&a, &ini, "endpoint", "t", "url"),
+               "https://h/team/a.ini:9");
+    }
+
+    // Text past the budget is refused like a file's
+    {
+        Ini ini = {};
+        IniWeb big = {};
+        big.asked    = Buf(&a, 64);
+        big.urls[0]  = "http://h/big.ini";
+        big.texts[0] = {allocbytes(&a, INI_MAXBYTES), INI_MAXBYTES};
+        for (iz i = 0; i < INI_MAXBYTES; i++) {
+            big.texts[0][i] = '\n';
+        }
+        big.n        = 1;
+        ini.fetch    = iniwebfetch;
+        ini.fetchctx = &big;
+        os_write(os, a, "/w/big.ini", "include = http://h/big.ini\n");
+        iniload(&ini, os, &a, "/w/big.ini");
+        expect(t, "web.big", inidiags(&a, &ini),
+               "/w/big.ini:1:11: warning: cannot read include "
+               "http://h/big.ini (over the 1 MiB configuration limit)");
+    }
+}
+
 static void test_ini(Test *t)
 {
+    testiniurls(t);
     testiniparse(t);
     testiniedit(t);
     testiniwrite(t);
