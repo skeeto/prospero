@@ -54,8 +54,11 @@ import pids as P  # noqa: E402
 # A host kills by pid only what pids.py lets through, checked again on
 # the host, in the command that kills, to be a process of the run's:
 # here one of this user's started since the host was made; on Windows
-# one whose command line names the run's own directory; on XP, which
-# shows less, one of this user's that is, or descends from, harness.exe.
+# one whose command line names the run's own directory, through a handle
+# held from the check to the kill; on XP, which shows less, one of this
+# user's whose own line shows the run's own copy of the harness, by its
+# name unique to the run, or the run's directory. Never by an ancestor:
+# Windows does not reparent, so a dead creator's pid may be anyone's.
 
 class LocalHost:
     windows = os.name == "nt"
@@ -229,13 +232,23 @@ class SshHost:
 
     def killpid(self, pid):
         """Kill a process by a pid from a file, if its command line names
-        the run's own directory, as the harness's and its tools' do."""
+        the run's own directory, as the harness's and its tools' do. One
+        PowerShell checks and kills through one handle, which it opens
+        first and which holds the pid for that process meanwhile: the
+        command line it checks is that process's (the creation time it
+        reports, the handle's), and Kill() uses that handle."""
         name = self.root.rsplit("/", 1)[-1]
-        ps = (f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId={P.arg(pid)}'; "
-              f"if ($p -and $p.CommandLine -like '*{name}*') {{ exit 0 }} else {{ exit 1 }}")
-        r = self.ssh(f'powershell -NoProfile -Command "{ps}" && taskkill /F /PID {P.arg(pid)}')
+        n = P.arg(pid)
+        ps = ("$ErrorActionPreference = 'Stop'; try { "
+              f"$p = Get-Process -Id {n}; $null = $p.Handle; "
+              f"$c = Get-CimInstance Win32_Process -Filter 'ProcessId={n}'; "
+              f"if ($c -and $c.CommandLine -like '*{name}*' -and "
+              "[Math]::Abs(($c.CreationDate - $p.StartTime).TotalSeconds) -lt 0.1) "
+              "{ $p.Kill(); exit 0 } else { exit 1 } } catch { exit 2 }")
+        r = self.ssh(f'powershell -NoProfile -Command "{ps}"')
         if r.returncode:
-            print(f"     kill: refused or failed for pid {pid}: {r.stdout.strip()} "
+            why = "refused" if r.returncode == 1 else "failed"
+            print(f"     kill: {why} for pid {pid}: {r.stdout.strip()} "
                   f"{r.stderr.strip()}", flush=True)
 
 
@@ -252,11 +265,15 @@ class XpHost(SshHost):
         self.harness = harness
         self.url = url
         tmp = self.sh("echo \"$TMP\"").strip()
-        self.root = f"{tmp}/harness-scen-{random.randrange(1 << 32):08x}"
+        run = f"{random.randrange(1 << 32):08x}"
+        self.root = f"{tmp}/harness-scen-{run}"
+        # A name of the run's own, which no other run's harness, nor any
+        # engine of the user's, has
+        self.exename = f"h-{run}.exe"
         self.sh(f"mkdir -p {self.root} && "
                 f"cp \"$HOME/w64devkit/bin/busybox.exe\" {self.root}/busybox.exe && "
-                f"cp {shlex.quote(harness)} {self.root}/harness.exe")
-        self.exe = f"{self.root}/harness.exe"
+                f"cp {shlex.quote(harness)} {self.root}/{self.exename}")
+        self.exe = f"{self.root}/{self.exename}"
 
     def close(self):
         self.sh(cleanroot(self.root), check=False)
@@ -297,23 +314,18 @@ class XpHost(SshHost):
 
     def killpid(self, pid):
         """Kill a process by a pid from a file, if busybox's ps shows it
-        to be this user's, and it or a parent within a few to be a
-        harness.exe, or to have the run's own directory in its command
-        line. (Here ps shows command lines of busybox's processes alone,
-        and paths of none.) No taskkill: busybox kill (TerminateProcess)."""
+        to be this user's, with the run's own copy of the harness (its
+        unique name) or the run's directory in its own line: not a parent
+        of it, whose pid could be another process's by now. (Here ps shows
+        command lines of busybox's processes alone, and paths of none, so
+        the tools' own processes are refused, and die with the harness's
+        job instead.) No taskkill: busybox kill (TerminateProcess)."""
         name = self.root.rsplit("/", 1)[-1]
         r = self.ssh("sh -s", input=f"""pid={P.arg(pid)}
-ps -o pid,ppid,user,comm,args | awk -v p="$pid" -v r={shlex.quote(name)} -v me="$(id -un)" '
-NR > 1 {{ up[$1] = $2; who[$1] = $3; comm[$1] = $4; line[$1] = $0 }}
-END {{
-    if (!(p in line) || who[p] != me) exit 1
-    q = p
-    for (i = 0; i < 8 && (q in line); i++) {{
-        if (comm[q] == "harness.exe" || index(line[q], r)) exit 0
-        q = up[q]
-    }}
-    exit 1
-}}' && kill -9 "$pid"
+ps -o pid,user,comm,args | awk -v p="$pid" -v exe={shlex.quote(self.exename)} \\
+    -v r={shlex.quote(name)} -v me="$(id -un)" '
+NR > 1 && $1 == p && $2 == me && ($3 == exe || index($0, r)) {{ ok = 1 }}
+END {{ exit ok ? 0 : 1 }}' && kill -9 "$pid"
 """)
         if r.returncode:
             print(f"     kill: refused or failed for pid {pid}: {r.stderr.strip()}",

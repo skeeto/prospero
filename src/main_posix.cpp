@@ -1114,10 +1114,18 @@ static void procwaiter(void *arg)
     }
     close(p->statfd);
 
-    // The reaper lives until the group is killed
+    // The reaper lives until the group is killed. Wait for its death
+    // without reaping it, then reap it under the lock, as reaped is set,
+    // so that os_kill, under the lock, sees reaped unset only while the
+    // reaper's pid is still held, by it or by its zombie.
+    siginfo_t si = {};
+    i32       r  = 0;
+    while ((r = waitid(P_PID, (id_t)p->pid, &si, WEXITED|WNOWAIT))<0 && errno==EINTR) {}
     i32 status = 0;
-    while (waitpid(p->pid, &status, 0)<0 && errno==EINTR) {}
     os_lock(&p->lock);
+    if (!r) {
+        while (waitpid(p->pid, &status, 0)<0 && errno==EINTR) {}  // at once
+    }
     p->reaped = 1;
     os_unlock(&p->lock);
 
@@ -1194,10 +1202,21 @@ static void childsignals(posix_spawnattr_t *attr, short flags, b32 tool)
 // Undo a spawn: kill the reaper, which then starts nothing more, and
 // its group, which holds the tool if it was started. The group alone
 // would miss a reaper yet to call setsid, and leave it to run the tool.
-static void spawnkill(i32 pid)
+// Only while its pid is held: before its waiter starts (no Proc), this
+// thread reaps it afterward, and once it has a waiter, which reaps it
+// under the Proc's lock, only while not reaped.
+static void spawnkill(i32 pid, Proc *p)
 {
-    sendsignal(pid, SIGKILL, 0);
-    sendsignal(pid, SIGKILL, 1);
+    if (p) {
+        os_lock(&p->lock);
+    }
+    if (!p || !p->reaped) {
+        sendsignal(pid, SIGKILL, 0);
+        sendsignal(pid, SIGKILL, 1);
+    }
+    if (p) {
+        os_unlock(&p->lock);
+    }
 }
 
 // Spawn under a reaper. With io, input is a pipe from the writer
@@ -1289,7 +1308,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
 
     Proc *p = (Proc *)malloc(sizeof(Proc));
     if (!p) {
-        spawnkill(pid);
+        spawnkill(pid, 0);
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
         closeall(mine, countof(mine));
         errno = ENOMEM;
@@ -1310,7 +1329,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     p->wake     = wake;
 
     if (!os_thread(os, io ? procpipe : procreader, p)) {
-        spawnkill(pid);
+        spawnkill(pid, 0);
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
         closeall(mine, countof(mine));
         pthread_mutex_destroy((pthread_mutex_t *)p->lock.opaque);
@@ -1321,7 +1340,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     i32 input[] = {in[1], (i32)wake.h[0], (i32)wake.h[1]};
     if (!os_thread(os, procwaiter, p)) {
         // The reader finishes once the group is dead
-        spawnkill(pid);
+        spawnkill(pid, 0);  // no waiter
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
         close(st[0]);
         closeall(input, countof(input));
@@ -1332,7 +1351,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
         return 0;
     }
     if (io && !os_thread(os, procwriter, p)) {
-        spawnkill(pid);  // the reader and waiter then finish
+        spawnkill(pid, p);  // the reader and waiter then finish
         closeall(input, countof(input));
         procrelease(p);  // the writer's
         procrelease(p);  // the caller's
@@ -1388,27 +1407,29 @@ static b32 os_procwrite(Os *, Proc *p, Str data)
 }
 
 // Nothing for a Proc without a reaper's pid, or once the reaper is
-// reaped and its pid free for another process (reapkill).
+// reaped and its pid free for another process (reapkill). The waiter
+// reaps it under the lock, so under the lock here its pid is held while
+// reaped is unset.
 static void os_kill(Os *, Proc *p, b32 hard)
 {
     os_lock(&p->lock);
-    switch (reapkill(p->pid, p->reaped, hard)) {
-    case REAPKILL_NONE:
-        break;
+    i32 act = reapkill(p->pid, p->reaped, hard);
+    if (act == REAPKILL_HARD) {
+        siginfo_t si = {};
+        i32       r  = waitid(P_PID, (id_t)p->pid, &si, WEXITED|WNOHANG|WNOWAIT);
+        act = reaphard(!r, si.si_pid);
+    }
+    switch (act) {
     case REAPKILL_TERM:
         sendsignal(p->pid, SIGTERM, 1);  // the reaper ignores it
         break;
-    case REAPKILL_HARD: {
-        // The reaper sweeps, unless it is dead already: then its group
-        // goes as before, its pid still held, unreaped
-        siginfo_t si = {};
-        if (waitid(P_PID, (id_t)p->pid, &si, WEXITED|WNOHANG|WNOWAIT) || si.si_pid) {
-            sendsignal(p->pid, SIGKILL, 1);
-        } else {
-            sendsignal(p->pid, SIGUSR1, 0);
-            sendsignal(p->pid, SIGCONT, 0);  // should something have stopped it
-        }
-    } break;
+    case REAPKILL_SWEEP:
+        sendsignal(p->pid, SIGUSR1, 0);
+        sendsignal(p->pid, SIGCONT, 0);  // should something have stopped it
+        break;
+    case REAPKILL_GROUP:
+        sendsignal(p->pid, SIGKILL, 1);  // the zombie holds the group's id
+        break;
     }
     os_unlock(&p->lock);
 }

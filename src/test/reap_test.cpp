@@ -73,6 +73,17 @@ static void test_reap(Test *t)
                istr(a, REAPKILL_TERM));
         expect(t, "os_kill hard", istr(a, reapkill(4242, 0, 1)),
                istr(a, REAPKILL_HARD));
+
+        // Then by waitid(WNOHANG|WNOWAIT): alive, dead and unreaped, or
+        // already reaped (ECHILD), when its pid may be another's
+        expect(t, "os_kill hard, alive", istr(a, reaphard(1, 0)),
+               istr(a, REAPKILL_SWEEP));
+        expect(t, "os_kill hard, dead", istr(a, reaphard(1, 4242)),
+               istr(a, REAPKILL_GROUP));
+        expect(t, "os_kill hard, reaped", istr(a, reaphard(0, 0)),
+               istr(a, REAPKILL_NONE));
+        expect(t, "os_kill hard, reaped, a stale pid", istr(a, reaphard(0, 4242)),
+               istr(a, REAPKILL_NONE));
     }
 
     // The reaper's own group: only one setsid gave it

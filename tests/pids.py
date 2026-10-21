@@ -117,9 +117,16 @@ def signal_ours(pid, sig, owned, what="pid"):
 def signal_group(proc, sig):
     """Signal the process group that proc, a Popen of the test's own
     started with start_new_session=True, leads: by the pid from the
-    spawn, which no other process gets while anything of the group
-    lives."""
+    spawn, and only while proc is not reaped (its returncode unset),
+    since until then no other process can have its pid, nor a group its
+    id. Once reaped, the group may be gone and its id another's: then
+    nothing. Returns whether it signaled. (Another thread of the test
+    reaping proc meanwhile, as Popen.send_signal allows too, could still
+    race this.)"""
+    if proc.returncode is not None:
+        return False
     os.killpg(checked(proc.pid, "group"), sig)
+    return True
 
 
 def selftest():
@@ -142,6 +149,7 @@ def selftest():
 
     class Fake:
         pid = 0
+        returncode = None
     sent = []
     real = os.kill, os.killpg
     os.kill = lambda pid, sig: sent.append(("kill", pid, sig))
@@ -167,7 +175,11 @@ def selftest():
             pass
         signal_ours(4242, 9, lambda p: True)
         Fake.pid = 4243
-        signal_group(Fake, 9)
+        assert signal_group(Fake, 9)
+        # Reaped, so its pid and group id may be another's by now
+        for code in (0, 1, -9):
+            Fake.returncode = code
+            assert not signal_group(Fake, 9), f"signal_group of a reaped proc ({code})"
     finally:
         os.kill, os.killpg = real
     assert sent == [("kill", 4242, 9), ("killpg", 4243, 9)], sent

@@ -27,11 +27,14 @@ static b32 signalable(i64 id)
     return id>1 && id<=0x7fffffff;
 }
 
-// What os_kill does to a tool's reaper, by its pid.
+// What os_kill does to a tool's reaper, by its pid, under the lock that
+// its waiter reaps it under, so that its pid is held while not reaped.
 enum : i32 {
-    REAPKILL_NONE,  // nothing: no reaper, or reaped, its pid free for reuse
-    REAPKILL_TERM,  // soft: TERM to its group, which the reaper ignores
-    REAPKILL_HARD,  // the reaper sweeps, or its group goes if it is dead
+    REAPKILL_NONE,   // nothing: no reaper, or reaped, its pid free for reuse
+    REAPKILL_TERM,   // soft: TERM to its group, which the reaper ignores
+    REAPKILL_HARD,   // hard: ask whether the reaper lives (reaphard)
+    REAPKILL_SWEEP,  // it lives, and sweeps when asked
+    REAPKILL_GROUP,  // it died, unreaped: KILL to the group it left
 };
 
 static i32 reapkill(i64 pid, b32 reaped, b32 hard)
@@ -40,6 +43,20 @@ static i32 reapkill(i64 pid, b32 reaped, b32 hard)
         return REAPKILL_NONE;
     }
     return hard ? REAPKILL_HARD : REAPKILL_TERM;
+}
+
+// The hard kill of an unreaped reaper, by what waitid(WNOHANG|WNOWAIT)
+// said of it: whether the call succeeded, and the pid it reported, 0 if
+// the reaper lives. A dead reaper not yet reaped still holds its pid,
+// and with it the id of its group, where what is left of the tree gets
+// KILL. A failed call (ECHILD) means the pid may be another's by now:
+// nothing then, rather than a group named by a stale id.
+static i32 reaphard(b32 waited, i64 sipid)
+{
+    if (!waited) {
+        return REAPKILL_NONE;
+    }
+    return sipid ? REAPKILL_GROUP : REAPKILL_SWEEP;
 }
 
 // The group a reaper may signal as its own, by its pid, group and

@@ -359,7 +359,9 @@ class Local:
         meter = None
         deadline = time.monotonic() + timeout
         # A GUI that hangs prints nothing more: end it at the deadline. Its
-        # group is the new session started for it here.
+        # group is the new session started for it here, signaled only
+        # while p is not reaped, as the wait below may have done already
+        # (signal_group checks)
         killer = threading.Timer(timeout + 5, lambda: P.signal_group(p, signal.SIGKILL))
         killer.start()
         try:
@@ -381,13 +383,16 @@ class Local:
             pass
         finally:
             killer.cancel()
-        if p.poll() is None or p.returncode == -signal.SIGKILL:
+        if p.poll() is None:
+            # Still running past the deadline: its group, unreaped
             try:
                 P.signal_group(p, signal.SIGKILL)
             except OSError:
                 pass
             p.wait()
             return None, lines
+        if p.returncode == -signal.SIGKILL:
+            return None, lines  # the timer's, which killed the whole group
         return p.returncode, lines
 
     def popen(self, args, stdin=False):
