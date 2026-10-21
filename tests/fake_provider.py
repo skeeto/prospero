@@ -34,7 +34,8 @@ llama.cpp router with --models-max N: /routerN/props reports role
 "router" and max_instances N, and the most different models ever in
 flight at once there is kept (GET /fake/router?prefix=routerN). A
 prefix /routerN-TAG/ is a router of its own, for scenarios that run at
-the same time.
+the same time, and /routerN-TAG-flaky/ one that answers its first /props
+with a 503, as a router still starting does.
 
 Run it alone with:  uv run tests/fake_provider.py [--port N]
 """
@@ -92,6 +93,13 @@ class State:
     def end(self, prefix, model):
         with self.lock:
             self.active[prefix][model] -= 1
+
+    def probed(self, prefix):
+        """Whether /props was asked at this prefix before (and now it is)."""
+        with self.lock:
+            seen = self.counts.get("props " + prefix, 0)
+            self.counts["props " + prefix] = seen + 1
+            return seen > 0
 
     def wants_end(self, cid):
         """Register a stream that reasoning_end may end; returns its Event."""
@@ -1030,6 +1038,20 @@ def sc_escapee_end(model, n, req):
         yield from answer(model, "Left one behind.")
 
 
+def sc_escapee_many(model, n, req):
+    # Thousands of descendants come and go, more than macOS's reaper
+    # once kept, then an escapee is left behind
+    if n == 0:
+        cmd = ("for k in $(seq 40); do for i in $(seq 120); do sleep 0.4 & done; "
+               "wait; done; "
+               "perl -e 'use POSIX; setsid(); open(F, \">>tree.pids\"); "
+               "print F \"$$\\n\"; close F; sleep 300' >/dev/null 2>&1 & "
+               "sleep 1; echo left")
+        yield from tool(model, n, "shell", {"command": cmd, "timeout": 600})
+    else:
+        yield from answer(model, "Left one behind.")
+
+
 def sc_doublefork(model, n, req):
     # A daemon: fork, setsid, fork again, its parents gone at once
     if n == 0:
@@ -1505,7 +1527,7 @@ def sc_gui(model, n, req):
         else:
             yield from answer(model, "Planned and done.")
     elif "Start background jobs" in prompt:
-        # A quick job, and one that ticks, then runs until killed; the
+        # A quick job, and one that ticks, then prints until killed; the
         # kill's notice brings the agent back by itself
         if step == 0:
             yield S.head()
@@ -1513,7 +1535,8 @@ def sc_gui(model, n, req):
                 "command": "echo quick job", "background": True})
             yield from call(model, 1, f"call_{n}_b", "shell", {
                 "command": "echo $$ > job.pid; for i in 1 2 3; do echo tick $i; "
-                           "sleep 0.2; done; sleep 60", "background": True})
+                           "sleep 0.2; done; while :; do echo more; sleep 0.05; done",
+                "background": True})
             yield from finish(model, "tool_calls")
         elif step == 1:
             yield from answer(model, "Started two jobs.")
@@ -1720,6 +1743,283 @@ def sc_soak(model, n, req):
         yield from finish(model, "tool_calls")
 
 
+# M4 review: the engine
+
+def sc_task_closewait(model, n, req):
+    # A task whose subagent waits for its background job
+    if step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Waiter",
+                                           "prompt": "Start a job and wait.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, "Parent heard: " + " / ".join(tool_results(req)))
+
+
+def sc_task_closewait_b(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "shell", {"command": "sleep 30", "background": True})
+    else:
+        yield from answer(model, "Waiting for my job.")
+
+
+sc_task_killwait = sc_task_closewait
+
+
+def sc_task_killwait_b(model, n, req):
+    # Starts a job that ignores TERM, stops it, and ends while it is
+    # still stopping
+    if step(req) == 0:
+        yield from tool(model, n, "shell", {"command": "trap '' TERM; sleep 30",
+                                            "background": True})
+    elif step(req) == 1:
+        yield from tool(model, n, "job_kill", {"job": 1})
+    else:
+        yield from answer(model, "Stopped my job; done.")
+
+
+def sc_fallback_limit(model, n, req):
+    # The primary is down for its quick retries, then back
+    if n < 11:
+        yield S.error(503, {"error": {"code": 503, "message": "primary down"}})
+    else:
+        yield from answer(model, "Back on the primary.")
+
+
+def sc_fallback_limit_b(model, n, req):
+    # The fallback is out of credit
+    yield S.error(402, {"error": {"message": "payment required: add credit"}})
+
+
+sc_slow_target = sc_fallback_limit
+
+
+def sc_slow_target_b(model, n, req):
+    yield S.error(503, {"error": {"code": 503, "message": "fallback down"}})
+
+
+KVPOOL = {"lock": threading.Lock(), "inflight": {}, "full": {}}
+
+
+def sc_kv_full(model, n, req):
+    # A KV pool shared by the slots, with room for one context: while two
+    # requests run at once, every one in flight fails, as llama.cpp does
+    with KVPOOL["lock"]:
+        k = KVPOOL["inflight"].get(model, 0) + 1
+        KVPOOL["inflight"][model] = k
+        if k >= 2:
+            KVPOOL["full"][model] = True
+    try:
+        yield S.head()
+        for i in range(10):
+            yield S.sleep(0.1)
+            with KVPOOL["lock"]:
+                full = KVPOOL["full"].get(model)
+            if full:
+                yield S.data({"error": {"code": 500, "type": "server_error",
+                                        "message": "Context size has been exceeded."}})
+                return
+            yield from text(model, f"w{i} ")
+        yield from finish(model)
+    finally:
+        with KVPOOL["lock"]:
+            KVPOOL["inflight"][model] -= 1
+            if not KVPOOL["inflight"][model]:
+                KVPOOL["full"][model] = False
+
+
+def sc_compact_notice(model, n, req):
+    # A job whose notice comes early, then reads that compact a small
+    # window, then an answer
+    if n == 0:
+        yield from real_tool(model, req, n, "shell", {"command": "echo bg-out",
+                                                      "background": True})
+    elif n == 1:
+        yield from real_tool(model, req, n, "shell", {"command": "sleep 1"})
+    elif n < 10:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n-2}.txt"})
+    else:
+        yield from real_answer(model, req, "All read.")
+
+
+def sc_rate_reopen(model, n, req):
+    # A tokenizer of 8 bytes a token: the window has room to spare
+    p = len(json.dumps(req)) // 8
+    if n < 7:
+        yield S.head()
+        yield from call(model, 0, f"call_{n}", "read", {"path": f"f{n}.txt"}, 2)
+        yield from finish(model, "tool_calls", prompt=p)
+    else:
+        yield S.head()
+        yield from text(model, f"Answer {n}.")
+        yield from finish(model, prompt=p)
+
+
+def sc_revive_prefix(model, n, req):
+    yield from answer(model, f"Answer {n}.")
+
+
+def sc_queue_linger(model, n, req):
+    if task_prompt(req) == "slowtool":
+        if step(req) == 0:
+            yield S.head()
+            yield S.sleep(0.5)
+            yield from call(model, 0, f"call_{n}", "shell", {"command": "sleep 2"}, 2)
+            yield from finish(model, "tool_calls")
+        else:
+            yield from answer(model, "C done.")
+    else:
+        yield S.head()
+        yield S.sleep(1.0)
+        yield from text(model, "A done.")
+        yield from finish(model)
+
+
+def sc_queue_linger_b(model, n, req):
+    yield from answer(model, "B done.")
+
+
+def sc_queue_remote(model, n, req):
+    yield S.head()
+    for i in range(20):
+        yield from text(model, f"a{i} ")
+        yield S.sleep(0.1)
+    yield from finish(model)
+
+
+def sc_queue_remote_b(model, n, req):
+    yield from answer(model, "B done.")
+
+
+def sc_queue_remote_c(model, n, req):
+    yield from answer(model, "Remote done.")
+
+
+def sc_queue_probe(model, n, req):
+    # Streams long enough that two would overlap
+    yield S.head()
+    for i in range(15):
+        yield from text(model, f"a{i} ")
+        yield S.sleep(0.1)
+    yield from finish(model)
+
+
+sc_queue_probe_b = sc_queue_probe
+
+
+def sc_queue_leave(model, n, req):
+    yield from sc_queue(model, n, req)
+
+
+def sc_queue_leave_b(model, n, req):
+    yield from answer(model, "B answered.")
+
+
+sc_queue_leave_c = sc_queue_leave_b
+
+
+# M4 review: the tools
+
+def tool_id(model, cid, name, args):
+    yield S.head()
+    yield from call(model, 0, cid, name, args, 2)
+    yield from finish(model, "tool_calls")
+
+
+def sc_rewind_dupid(model, n, req):
+    # A model that gives every call the same id
+    if n == 0:
+        yield from tool_id(model, "dup", "write", {"path": "a.txt", "content": "A\n"})
+    elif n == 1:
+        yield from tool_id(model, "dup", "write", {"path": "b.txt", "content": "B\n"})
+    else:
+        yield from answer(model, "Wrote both.")
+
+
+def sc_rewind_partial(model, n, req):
+    prompt = last_user(req)
+    if step(req) and req["messages"][-1].get("role") == "tool":
+        yield from answer(model, "Done.")
+    elif "second" in prompt:
+        yield from tool(model, n, "edit", {"path": "f.txt", "old_string": "ext",
+                                           "new_string": "ext2"})
+    elif "first" in prompt:
+        yield from tool(model, n, "write", {"path": "f.txt", "content": "one\n"})
+    else:
+        yield from answer(model, "Done.")
+
+
+def sc_patch_twice(model, n, req):
+    # One file named twice, spelled two ways
+    patch = ("*** Begin Patch\n"
+             "*** Update File: f.txt\n@@\n-one\n+ONE\n"
+             "*** Update File: ./f.txt\n@@\n-three\n+THREE\n"
+             "*** End Patch\n")
+    if n == 0:
+        yield from tool(model, n, "edit", {"patch": patch})
+    else:
+        yield from answer(model, "Patched.")
+
+
+def sc_job_eof(model, n, req):
+    # A command that closed its output, still running at its timeout
+    if n == 0:
+        yield from tool(model, n, "shell", {"command": "echo hi; exec >/dev/null 2>&1; "
+                                                       "sleep 3", "timeout": 1})
+    elif n == 1:
+        yield from answer(model, "In the background.")
+    else:
+        yield from answer(model, "Saw it.")
+
+
+def sc_instructions_link(model, n, req):
+    yield from answer(model, "ok")
+
+
+def sc_glob_many(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "glob", {"pattern": "**/*.special"})
+    else:
+        yield from answer(model, "Globbed.")
+
+
+def sc_grep_unreadable(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "grep", {"pattern": "missing_symbol"})
+    else:
+        yield from answer(model, "Searched.")
+
+
+def sc_edit_hashlong(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "read", {"path": "data.js"})
+    elif n == 1:
+        res = last_tool_result(req)
+        head, body = res.split("\n", 1)
+        tag = head.strip("[]").split("#")[1]
+        line1 = body.split("\n", 1)[0].split("\t", 1)[1]
+        shown = line1.replace("... [line truncated]", "")
+        yield from tool(model, n, "edit", {
+            "path": "data.js", "tag": tag,
+            "edits": [{"op": "replace", "line": 1,
+                       "text": shown.replace("var", "const", 1) + "\n"}]})
+    else:
+        yield from answer(model, "Changed var to const.")
+
+
+sc_pretty_fallback = sc_slow_target
+sc_pretty_fallback_b = sc_slow_target_b
+
+
+def sc_pretty(model, n, req):
+    # A retry, a compaction of a small window, then an answer
+    if n == 0:
+        yield S.error(503, {"error": {"code": 503, "message": "busy a moment"}})
+    elif n < 9:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n-1}.txt"})
+    else:
+        yield from real_answer(model, req, "Pretty done.")
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 
@@ -1771,6 +2071,10 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(url.query)
         if path in ("/v1/models", "/models"):
             self.send_json(200, models())
+        elif path == "/props" and prefix.endswith("-flaky") and \
+                not STATE.probed(prefix):
+            # A router still starting: its first answer is no answer
+            self.send_json(503, {"error": {"code": 503, "message": "Loading model"}})
         elif path == "/props" and prefix:
             self.send_json(200, {"role": "router",
                                  "max_instances": int(prefix[6:].split("-")[0]),

@@ -335,7 +335,7 @@ static void fuzzpaths(Arena a, Str src, b32 win)
     assert(normpath(&a, cwd, p, win) == p);
 }
 
-static void fuzzspans(Str hay, Slice<Span> m)
+static void fuzzspans(Str hay, Slice<EditSpan> m)
 {
     iz last = 0;
     for (iz i = 0; i < m.len; i++) {

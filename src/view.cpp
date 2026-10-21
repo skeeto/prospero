@@ -1570,9 +1570,12 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                       res=="unchanged" ? Str(": already as it was") :
                       res=="conflict"  ? Str(": **conflict**, left as it is: something "
                                              "else changed it after the harness did") :
+                      res=="partial"   ? Str(": put back **in part**, to before the later "
+                                             "changes: something else changed it in "
+                                             "between, so the earlier ones stay") :
                       Str(": **failed**, could not be put back"));
             putbyte(&b, '\n');
-            c->conflicts += res == "conflict";
+            c->conflicts += res=="conflict" || res=="partial";
             c->count++;
         }
         Str note = trim(jsonstr(jsonget(j, "note")));

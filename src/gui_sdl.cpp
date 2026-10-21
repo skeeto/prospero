@@ -24,9 +24,17 @@
 // Linux: the desktop portal's color-scheme, unknown without one, taken
 // as dark) and its changes as events. On macOS the window's frame takes
 // the theme in effect through its NSWindow's appearance, set through
-// the Objective-C runtime; elsewhere the window manager draws it.
+// the Objective-C runtime; elsewhere the window manager draws it. On
+// Linux, SDL reads the portal's signal only when its event loop runs,
+// and an idle loop waits on the display connection alone, so a thread
+// of ours watches for the signal on a D-Bus connection of its own
+// (libdbus, loaded as SDL loads it) and brings the change in at once.
 //
 // This is free and unencumbered software released into the public domain.
+
+#ifdef __linux__
+#  include <dlfcn.h>
+#endif
 
 #ifdef __APPLE__
 // The Objective-C runtime and AppKit's appearance names, declared by
@@ -68,6 +76,8 @@ struct GuiSdl {
     i32           framedark;   // the frame's theme: -1 unset, 0 light, 1 dark
     i32           drivetheme;  // the checklist's system theme: 1 light,
                                // 2 dark, 0 the real one
+    i32           portal;      // atomic: the portal's latest, as drivetheme,
+                               // 0 if it said nothing yet (Linux)
     GlViewport    glviewport;
     GlClearColor  glclearcolor;
     GlClear       glclear;
@@ -103,11 +113,146 @@ static void sigthread(void *)
 // Whether the system prefers dark, or the checklist pretends it does.
 static b32 sysdark(GuiSdl *p)
 {
+    i32 portal = __atomic_load_n(&p->portal, __ATOMIC_ACQUIRE);
     if (p->drivetheme) {
         return p->drivetheme == 2;
+    } else if (portal) {
+        return portal == 2;
     }
     return SDL_GetSystemTheme() != SDL_SYSTEM_THEME_LIGHT;
 }
+
+#ifdef __linux__
+// libdbus, as much as the portal watch needs, declared by hand
+using DbusInit     = u32   (*)();
+using DbusGet      = void *(*)(i32, void *);
+using DbusExit     = void  (*)(void *, u32);
+using DbusMatch    = void  (*)(void *, char const *, void *);
+using DbusRead     = u32   (*)(void *, i32);
+using DbusPop      = void *(*)(void *);
+using DbusIsSignal = u32   (*)(void *, char const *, char const *);
+using DbusIterInit = u32   (*)(void *, void *);
+using DbusIterNext = u32   (*)(void *);
+using DbusIterType = i32   (*)(void *);
+using DbusIterSub  = void  (*)(void *, void *);
+using DbusIterGet  = void  (*)(void *, void *);
+using DbusUnref    = void  (*)(void *);
+using DbusFlush    = void  (*)(void *);
+
+struct DbusIter {
+    void *opaque[16];  // a DBusMessageIter, 72 bytes on 64-bit hosts
+};
+
+struct Portal {
+    GuiSdl      *p;
+    DbusGet      get;
+    DbusExit     exitondisc;
+    DbusMatch    match;
+    DbusRead     read;
+    DbusPop      pop;
+    DbusIsSignal issignal;
+    DbusIterInit iterinit;
+    DbusIterNext iternext;
+    DbusIterType itertype;
+    DbusIterSub  itersub;
+    DbusIterGet  iterget;
+    DbusUnref    unref;
+    DbusFlush    flush;
+};
+
+// The color-scheme of a SettingChanged signal: 1 dark, 2 light, 0 no
+// preference, or -1 if it is not that setting.
+static i32 portalscheme(Portal *d, void *msg)
+{
+    static char const *const want[] = {"org.freedesktop.appearance", "color-scheme"};
+    DbusIter it = {};
+    if (!d->iterinit(msg, &it)) {
+        return -1;
+    }
+    for (i32 i = 0; i < 2; i++) {
+        char const *s = 0;
+        if (d->itertype(&it) != 's') {
+            return -1;
+        }
+        d->iterget(&it, &s);
+        if (!s || __builtin_strcmp(s, want[i]) || !d->iternext(&it)) {
+            return -1;
+        }
+    }
+    DbusIter v = {};
+    if (d->itertype(&it) != 'v') {
+        return -1;
+    }
+    d->itersub(&it, &v);
+    u32 scheme = 0;
+    if (d->itertype(&v) != 'u') {
+        return -1;
+    }
+    d->iterget(&v, &scheme);
+    return (i32)scheme;
+}
+
+static void portalthread(void *arg)
+{
+    Portal *d    = (Portal *)arg;
+    void   *conn = d->get(0, 0);  // the session bus, privately
+    if (!conn) {
+        return;  // no session bus: no portal to follow
+    }
+    d->exitondisc(conn, 0);  // the bus going away is no reason to exit
+    d->match(conn, "type='signal',interface='org.freedesktop.portal.Settings',"
+                   "member='SettingChanged',arg0='org.freedesktop.appearance',"
+                   "arg1='color-scheme'", 0);
+    d->flush(conn);
+    while (d->read(conn, -1)) {
+        for (void *m; (m = d->pop(conn));) {
+            i32 scheme = -1;
+            if (d->issignal(m, "org.freedesktop.portal.Settings", "SettingChanged")) {
+                scheme = portalscheme(d, m);
+            }
+            d->unref(m);
+            if (scheme >= 0) {
+                __atomic_store_n(&d->p->portal, scheme==2 ? 1 : 2, __ATOMIC_RELEASE);
+                SDL_Event e = {};
+                e.type = SDL_EVENT_SYSTEM_THEME_CHANGED;
+                e.common.timestamp = SDL_GetTicksNS();
+                SDL_PushEvent(&e);
+            }
+        }
+    }
+}
+
+// Start the portal watch, if libdbus is there to watch with.
+static void portalwatch(Os *os, Arena *perm, GuiSdl *p)
+{
+    void *h = dlopen("libdbus-1.so.3", RTLD_NOW|RTLD_LOCAL);
+    if (!h) {
+        return;
+    }
+    Portal  *d    = alloc<Portal>(perm);
+    DbusInit init = (DbusInit)dlsym(h, "dbus_threads_init_default");
+    d->p          = p;
+    d->get        = (DbusGet)dlsym(h, "dbus_bus_get_private");
+    d->exitondisc = (DbusExit)dlsym(h, "dbus_connection_set_exit_on_disconnect");
+    d->match      = (DbusMatch)dlsym(h, "dbus_bus_add_match");
+    d->read       = (DbusRead)dlsym(h, "dbus_connection_read_write");
+    d->pop        = (DbusPop)dlsym(h, "dbus_connection_pop_message");
+    d->issignal   = (DbusIsSignal)dlsym(h, "dbus_message_is_signal");
+    d->iterinit   = (DbusIterInit)dlsym(h, "dbus_message_iter_init");
+    d->iternext   = (DbusIterNext)dlsym(h, "dbus_message_iter_next");
+    d->itertype   = (DbusIterType)dlsym(h, "dbus_message_iter_get_arg_type");
+    d->itersub    = (DbusIterSub)dlsym(h, "dbus_message_iter_recurse");
+    d->iterget    = (DbusIterGet)dlsym(h, "dbus_message_iter_get_basic");
+    d->unref      = (DbusUnref)dlsym(h, "dbus_message_unref");
+    d->flush      = (DbusFlush)dlsym(h, "dbus_connection_flush");
+    b32 ok = init && d->get && d->exitondisc && d->match && d->read && d->pop &&
+             d->issignal && d->iterinit && d->iternext && d->itertype &&
+             d->itersub && d->iterget && d->unref && d->flush;
+    if (ok && init()) {
+        os_thread(os, portalthread, d);
+    }
+}
+#endif
 
 static f32 contentscale(SDL_Window *w)
 {
@@ -203,6 +348,9 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     SDL_AddEventWatch(sdlwatch, p);
     SDL_ShowWindow(p->window);
     os_thread(os, sigthread, 0);
+    #ifdef __linux__
+    portalwatch(os, &g->perm, p);
+    #endif
     return 1;
 }
 

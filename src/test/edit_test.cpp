@@ -54,10 +54,10 @@ static void test_edit(Test *t)
     // Text as lines, written back byte for byte
     {
         Str  data = "\xef\xbb\xbf" "a\r\nb\nc";
-        Text tx   = splittext(a, data);
+        EditText tx = splittext(a, data);
         expect(t, "splittext", istr(a, tx.lines.len*100 + tx.crlf*10 + tx.final), "310");
         expect(t, "jointext", jointext(a, &tx, tx.lines), data);
-        Text e = splittext(a, "");
+        EditText e = splittext(a, "");
         expect(t, "splittext empty", istr(a, e.lines.len*10 + e.final), "1");
         Slice<Str> g = givenlines(a, "x\r\ny\n");
         expect(t, "givenlines", concat(a, concat(a, g[0], "|"), g[1]), "x|y");
@@ -161,8 +161,8 @@ static void test_edit(Test *t)
     {
         Slice<Str> old = givenlines(a, "a\nb\nc\n");
         Slice<Str> now = givenlines(a, "a\nB\nc\nd\n");
-        Text tx = splittext(a, "  a \n  b\n  c\t\n");
-        Indent in = {"", "  "};
+        EditText tx = splittext(a, "  a \n  b\n  c\t\n");
+        EditIndent in = {"", "  "};
         Slice<Str> k = keeplines(a, &tx, 0, old, now, in);
         expect(t, "keeplines", jointext(a, &tx, k), "  a \n  B\n  c\t\n  d\n");
     }
@@ -321,5 +321,76 @@ static void test_edit(Test *t)
                                      "+    a = 5\n@@ def f():\n-    b = 2\n+    b = 6\n*** End Patch");
         expect(t, "hunk order", istr(a, startswith(order, "!hunk 2 of f.c") &&
                                         find(order, "was not found after line 7")>0), "1");
+
+        // Two places fit a hunk without an @@ line: refused, as replace
+        // refuses old_string; an @@ line picks one
+        Str two = "int f(void)\n{\n    return 0;\n}\nint g(void)\n{\n    return 0;\n}\n";
+        Str amb = patchrun(a, two, "*** Begin Patch\n*** Update File: f.c\n@@\n-    return 0;\n"
+                                   "+    return 1;\n*** End Patch");
+        expect(t, "hunk ambiguous", istr(a, startswith(amb, "!hunk 1 of f.c (patch line 3): its kept "
+                                                       "and removed lines appear at 2 places (lines "
+                                                       "3, 7)") && find(amb, "The places:\n1. line 3")>0),
+               "1");
+        expect(t, "hunk ambiguous @@", patchrun(a, two, "*** Begin Patch\n*** Update File: f.c\n"
+                                                        "@@ int g(void)\n-    return 0;\n+    return 1;\n"
+                                                        "*** End Patch"),
+               "int f(void)\n{\n    return 0;\n}\nint g(void)\n{\n    return 1;\n}\n");
+        expect(t, "hunk after ambiguous", patchrun(a, two, "*** Begin Patch\n*** Update File: f.c\n"
+                                                           "@@ int f(void)\n-    return 0;\n+    return 2;\n"
+                                                           "@@\n-    return 0;\n+    return 3;\n*** End Patch"),
+               "int f(void)\n{\n    return 2;\n}\nint g(void)\n{\n    return 3;\n}\n");
+        // An end of file hunk inside the hunk before it is refused, not
+        // spliced over it (found by review: c was duplicated)
+        Str eof = patchrun(a, "a\nb\nc\n", "*** Begin Patch\n*** Update File: f.c\n@@\n-b\n+B\n c\n"
+                                           "@@\n-c\n+C\n*** End of File\n*** End Patch");
+        expect(t, "hunk eof overlap", istr(a, startswith(eof, "!hunk 2 of f.c")), "1");
+    }
+
+    // read cuts a line past READ_LINEMAX, so hashline cannot replace it,
+    // which would lose the rest; it may delete it (found by review)
+    {
+        Buf lb(a, 4096);
+        print(&lb, "var t = [");
+        for (i32 i = 0; i < 600; i++) print(&lb, "1234,");
+        print(&lb, "];\nshort\n");
+        Str      src   = finish(&lb);
+        Str      tag   = filetag(a, src);
+        HashEdit e1[]  = {hedit(HASH_REPLACE, 1, 2, "const t = [1234];\n")};
+        Str      got   = hashrun(a, src, tag, e1, 1);
+        expect(t, "hash long line", istr(a, startswith(got, "!Nothing was changed in f.c:\n- edit "
+                                                       "1: line 1 is 3011 bytes long")), "1");
+        HashEdit e2[]  = {hedit(HASH_DELETE, 1, 1, {})};
+        expect(t, "hash long delete", hashrun(a, src, tag, e2, 1), "short\n");
+        HashEdit e3[]  = {hedit(HASH_REPLACE, 2, 2, "long enough\n")};
+        expect(t, "hash beside long", istr(a, endswith(hashrun(a, src, tag, e3, 1), "];\nlong enough\n")),
+               "1");
+    }
+
+    // Fuzzy matching has a budget of work, since it runs on the engine
+    // thread: past it, old_string is simply not found (found by review:
+    // 20 s for 200 random lines against 20000)
+    {
+        Arena s   = *a;
+        u64   rng = 1;
+        Buf   f(&s, 2<<20);
+        for (i32 i = 0; i < 20000; i++) {
+            for (i32 k = 0; k < 70; k++) {
+                rng = rng*0x9e3779b97f4a7c15u + 1;
+                putbyte(&f, (u8)('a' + (rng>>59)%26));
+            }
+            putbyte(&f, '\n');
+        }
+        Str data = finish(&f);
+        Buf o(&s, 1<<16);
+        for (i32 i = 0; i < 200; i++) {
+            for (i32 k = 0; k < 70; k++) {
+                rng = rng*0x9e3779b97f4a7c15u + 1;
+                putbyte(&o, (u8)('a' + (rng>>59)%26));
+            }
+            putbyte(&o, '\n');
+        }
+        Str got = rep(&s, data, finish(&o), "x\n", 0);
+        expect(t, "fuzzy budget", istr(a, startswith(got, "!old_string was not found in f.c, so "
+                                                     "nothing was changed. Read")), "1");
     }
 }

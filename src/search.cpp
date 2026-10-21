@@ -14,9 +14,11 @@
 // files (a NUL in the first 8 KiB), files over FILE_MAX, and whatever
 // the .gitignore files of the enclosing repository exclude. Ripgrep
 // does the same with --hidden, except that a -g glob would override the
-// ignore rules there: so glob filters a list of every file (newest
-// first) itself, and grep with a glob filter uses ripgrep only for a
-// glob without a slash, given as a file type.
+// ignore rules there: so glob and grep use ripgrep only for a glob
+// without a slash (once a leading "**/" is dropped), given as a file
+// type, which matches names at any depth and keeps the rules, and the
+// walker for any other. Ripgrep exits 2 when it could not read some of
+// the files, which is a failed search only with a message.
 //
 // Globs follow .gitignore: one without a slash matches a name at any
 // depth; one with a slash matches the path from the search directory,
@@ -884,23 +886,23 @@ static b32 globmatch(Slice<Str> globs, Str path)
 
 // .gitignore
 
-struct IgnoreRule {
+struct GitIgnoreRule {
     Slice<Str> globs;   // expanded alternatives
     b32        neg;     // !pattern: include again
     b32        dironly; // pattern/: directories only
 };
 
-struct Ignore {
-    Ignore           *next;   // the enclosing directory's, or null
-    Str               dir;    // absolute, where the file is
-    Slice<IgnoreRule> rules;
+struct GitIgnore {
+    GitIgnore           *next;   // the enclosing directory's, or null
+    Str                  dir;    // absolute, where the file is
+    Slice<GitIgnoreRule> rules;
 };
 
 // A .gitignore's rules. Patterns with a slash anywhere but at the end
 // are anchored to the file's directory, as globone takes them.
-static Slice<IgnoreRule> ignoreparse(Arena *a, Str text)
+static Slice<GitIgnoreRule> ignoreparse(Arena *a, Str text)
 {
-    Slice<IgnoreRule> r = {};
+    Slice<GitIgnoreRule> r = {};
     for (Str rest = text; rest.len;) {
         Cut c = cut(rest, '\n');
         rest = c.tail;
@@ -909,7 +911,7 @@ static Slice<IgnoreRule> ignoreparse(Arena *a, Str text)
         // Trailing blanks go, unless quoted by a backslash
         while (l.len && l[l.len-1]==' ' && !(l.len>1 && l[l.len-2]=='\\')) l.len--;
         if (!l.len || l[0]=='#') continue;
-        IgnoreRule rule = {};
+        GitIgnoreRule rule = {};
         if (l[0] == '!') {
             rule.neg = 1;
             l = cuthead(l, 1);
@@ -936,14 +938,14 @@ static Slice<IgnoreRule> ignoreparse(Arena *a, Str text)
 
 // Whether the files of the ignore chain exclude a path (absolute), the
 // innermost file deciding, and within a file, its last matching rule.
-static b32 ignored(Ignore *chain, Str path, b32 isdir)
+static b32 ignored(GitIgnore *chain, Str path, b32 isdir)
 {
-    for (Ignore *f = chain; f; f = f->next) {
+    for (GitIgnore *f = chain; f; f = f->next) {
         if (!startswith(path, f->dir) || path.len<=f->dir.len) continue;
         iz  skip = f->dir.len + (f->dir[f->dir.len-1] != '/');
         Str rel  = cuthead(path, skip);
         for (iz i = f->rules.len-1; i >= 0; i--) {
-            IgnoreRule *r = &f->rules[i];
+            GitIgnoreRule *r = &f->rules[i];
             if ((!r->dironly || isdir) && globmatch(r->globs, rel)) {
                 return !r->neg;
             }
@@ -953,13 +955,13 @@ static b32 ignored(Ignore *chain, Str path, b32 isdir)
 }
 
 // Load a directory's .gitignore onto the chain, if it has one.
-static Ignore *ignoreload(Os *os, Arena *a, Ignore *chain, Str dir)
+static GitIgnore *ignoreload(Os *os, Arena *a, GitIgnore *chain, Str dir)
 {
     Read rd = os_read(os, a, join(a, dir, ".gitignore"), 1<<20);
     if (rd.err || !rd.data.len) {
         return chain;
     }
-    Ignore *f = alloc<Ignore>(a);
+    GitIgnore *f = alloc<GitIgnore>(a);
     f->next  = chain;
     f->dir   = dir;
     f->rules = ignoreparse(a, rd.data);
@@ -974,28 +976,28 @@ enum : i32 {
     SEARCH_GLOB,
 };
 
-struct Found {  // a glob result
+struct SearchFound {  // a glob result
     Str rel;
     i64 mtime;
 };
 
-struct Walk {
-    Os         *os;
-    i32         mode;
-    RxRun       rx;
-    Str         literal;   // grep -F (lower case when folding)
-    b32         fold;
-    Str         need;      // what a line must contain, if anything
-    Slice<Str>  globs;     // grep: the files to search, if any
-    iz          limit;     // results to print, then stop
-    iz          found;
-    Buf        *out;
-    Slice<Found> newest;   // glob: kept newest first, at most limit
-    Arena      *keep;      // for newest
-    b32         hold;      // keep output in out, never printed (tests)
+struct SearchWalk {
+    Os                *os;
+    i32                mode;
+    RxRun              rx;
+    Str                literal;  // grep -F (lower case when folding)
+    b32                fold;
+    Str                need;     // what a line must contain, if anything
+    Slice<Str>         globs;    // grep: the files to search, if any
+    iz                 limit;    // results to print, then stop
+    iz                 found;
+    Buf               *out;
+    Slice<SearchFound> newest;   // glob: kept newest first, at most limit
+    Arena             *keep;     // for newest
+    b32                hold;     // keep output in out, never printed (tests)
 };
 
-static void walkflush(Walk *w)
+static void walkflush(SearchWalk *w)
 {
     if (w->out->len && !w->hold) {
         os_print(w->os, 1, finish(w->out));
@@ -1003,7 +1005,7 @@ static void walkflush(Walk *w)
     }
 }
 
-static b32 walkline(Walk *w, Str line)
+static b32 walkline(SearchWalk *w, Str line)
 {
     if (w->literal.len) {
         return w->fold ? findfold(line, w->literal)>=0 : find(line, w->literal)>=0;
@@ -1015,7 +1017,7 @@ static b32 walkline(Walk *w, Str line)
     return rxmatch(&w->rx, line);
 }
 
-static void walkgrep(Walk *w, Arena scratch, Str path, Str rel)
+static void walkgrep(SearchWalk *w, Arena scratch, Str path, Str rel)
 {
     Read rd = os_read(w->os, &scratch, path, (iz)FILE_MAX);
     if (rd.err || !rd.data.len) return;
@@ -1051,28 +1053,29 @@ static void walkgrep(Walk *w, Arena scratch, Str path, Str rel)
     walkflush(w);
 }
 
-static void walkglob(Walk *w, Str rel, i64 mtime)
+static void walkglob(SearchWalk *w, Str rel, i64 mtime)
 {
     w->found++;
     // Insert by mtime, newest first, keeping at most limit
-    Slice<Found> *n = &w->newest;
+    Slice<SearchFound> *n = &w->newest;
     if (n->len==w->limit && (!n->len || (*n)[n->len-1].mtime>=mtime)) {
         return;
     }
-    Found f = {clone(w->keep, rel), mtime};
+    SearchFound f = {clone(w->keep, rel), mtime};
     if (n->len < w->limit) {
         *n = push(w->keep, *n, f);
     } else {
         (*n)[n->len-1] = f;
     }
     for (iz i = n->len-1; i>0 && (*n)[i-1].mtime<(*n)[i].mtime; i--) {
-        Found t = (*n)[i-1];
+        SearchFound t = (*n)[i-1];
         (*n)[i-1] = (*n)[i];
         (*n)[i]   = t;
     }
 }
 
-static void walkdir(Walk *w, Arena scratch, Ignore *chain, Str dir, Str rel, i32 depth)
+static void walkdir(SearchWalk *w, Arena scratch, GitIgnore *chain, Str dir,
+                    Str rel, i32 depth)
 {
     if (depth > 128 || (w->mode==SEARCH_GREP && w->found>=w->limit)) {
         return;
@@ -1107,7 +1110,7 @@ static void walkdir(Walk *w, Arena scratch, Ignore *chain, Str dir, Str rel, i32
 
 // The .gitignore files above the search directory, out to the root of
 // the repository holding it, if any: as ripgrep reads them.
-static Ignore *ignoreparents(Os *os, Arena *a, Str root, b32 win)
+static GitIgnore *ignoreparents(Os *os, Arena *a, Str root, b32 win)
 {
     Slice<Str> dirs = {};
     Str        top  = {};
@@ -1122,7 +1125,7 @@ static Ignore *ignoreparents(Os *os, Arena *a, Str root, b32 win)
         dirs = push(a, dirs, up);
         d = up;
     }
-    Ignore *chain = 0;
+    GitIgnore *chain = 0;
     if (!top.data) {
         return chain;  // not in a repository: only files below count
     }
@@ -1151,7 +1154,7 @@ struct SearchOpts {
 static Str searchrun(Os *os, Arena *perm, Arena scratch, SearchOpts *o,
                      Buf *out, b32 hold, iz *found)
 {
-    Walk w = {};
+    SearchWalk w = {};
     w.os    = os;
     w.mode  = o->mode;
     w.limit = o->limit>0 ? o->limit : SEARCH_RESULTS+1;
@@ -1180,7 +1183,7 @@ static Str searchrun(Os *os, Arena *perm, Arena scratch, SearchOpts *o,
         }
     }
 
-    Ignore *chain = ignoreparents(os, perm, root, o->win);
+    GitIgnore *chain = ignoreparents(os, perm, root, o->win);
     Stat    st    = os_stat(os, scratch, root);
     if (st.type==STAT_FILE && w.mode==SEARCH_GREP) {
         walkgrep(&w, scratch, root, basename(root));
@@ -1253,12 +1256,19 @@ static i32 searchmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 static Slice<Str> searchargv(Arena *a, ToolEnv *te, i32 tool, Str path,
                              Str target, Args *args)
 {
-    Slice<Str> v = {};
-    b32 slash = 0;
-    for (iz i = 0; i < args->glob.len; i++) {
-        slash |= args->glob[i] == '/';
+    // ripgrep filters by a glob given as a file type, which matches names
+    // at any depth and keeps the ignore rules, so it takes only globs
+    // without a slash, here once a leading "**/" is gone
+    Slice<Str> v    = {};
+    Str        glob = tool==TOOL_GLOB ? args->pattern : args->glob;
+    while (startswith(glob, "**/") && glob.len>3) {
+        glob = cuthead(glob, 3);
     }
-    b32 rg = te->rg.len && !(tool==TOOL_GREP && slash);
+    b32 slash = 0;
+    for (iz i = 0; i < glob.len; i++) {
+        slash |= glob[i] == '/';
+    }
+    b32 rg = te->rg.len && !slash;
     if (!rg) {
         v = push(a, v, te->exe);
         v = push(a, v, Str("--search"));
@@ -1286,11 +1296,16 @@ static Slice<Str> searchargv(Arena *a, ToolEnv *te, i32 tool, Str path,
         v = push(a, v, Str("/"));
     }
     if (tool == TOOL_GLOB) {
-        // Every file, newest first, which the engine filters itself:
-        // a -g glob would include ignored files
+        // The files that match, newest first (a -g glob would include
+        // ignored files), which the engine filters again by the whole
+        // pattern
         v = push(a, v, Str("--files"));
         v = push(a, v, Str("--sortr"));
         v = push(a, v, Str("modified"));
+        v = push(a, v, Str("--type-add"));
+        v = push(a, v, concat(a, "harness:", glob));
+        v = push(a, v, Str("--type"));
+        v = push(a, v, Str("harness"));
     } else {
         static Str const grep[] = {
             "--sort", "path", "--line-number", "--no-heading",
@@ -1302,10 +1317,9 @@ static Slice<Str> searchargv(Arena *a, ToolEnv *te, i32 tool, Str path,
         }
         if (args->ignorecase) v = push(a, v, Str("--ignore-case"));
         if (args->literal)    v = push(a, v, Str("--fixed-strings"));
-        if (args->glob.len) {
-            // As a file type, which unlike -g keeps the ignore rules
+        if (glob.len) {
             v = push(a, v, Str("--type-add"));
-            v = push(a, v, concat(a, "harness:", args->glob));
+            v = push(a, v, concat(a, "harness:", glob));
             v = push(a, v, Str("--type"));
             v = push(a, v, Str("harness"));
         }
@@ -1439,10 +1453,15 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
         }
     }
 
+    // Exit status 2 is a failed search only with a message, as of a bad
+    // pattern: ripgrep exits 2, silently, when it could not read some
+    // file or directory, though it searched the rest
+    Str msg     = trim(cleanoutput(a, finish(&diag)));
+    b32 unread  = e->code>=2 && !e->signaled && !e->timedout && !msg.len;
+    b32 listcut = e->tool==TOOL_GLOB && e->limited;
     if (e->cancelled) {
         print(&b, "[cancelled by the user]");
-    } else if (!shown && e->code>=2 && !e->signaled && !e->timedout) {
-        Str msg = trim(cleanoutput(a, finish(&diag)));
+    } else if (!shown && e->code>=2 && !e->signaled && !e->timedout && msg.len) {
         b.len = 0;
         print(&b, "The search failed, so there are no results");
         print(&b, msg.len ? Str(": ") : Str("."));
@@ -1451,6 +1470,16 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
             print(&b, "\nFix the pattern, or set literal to true to search "
                       "for it as plain text.");
         }
+    } else if (!shown && listcut) {
+        // The newest files only were listed: the older were not checked
+        print(&b, "No files matching ");
+        print(&b, e->glob);
+        print(&b, " were found among the newest files in ");
+        print(&b, where);
+        print(&b, ", but there are so many that the list was cut at 8 MiB, "
+                  "and older files were not checked. Search a smaller "
+                  "directory, or narrow the pattern.");
+        r.ok = 1;
     } else if (!shown) {
         if (e->tool == TOOL_GREP) {
             print(&b, "No lines match ");
@@ -1474,6 +1503,9 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
             print(&b, e->tool==TOOL_GREP ? Str("[the first 100 matching lines; ")
                                          : Str("[the newest 100 files; "));
             print(&b, "there are more: narrow the pattern or the path]");
+        } else if (listcut) {
+            print(&b, "[so many files that the list was cut at 8 MiB, and "
+                      "older files were not checked: narrow the path]");
         }
         if (files.len) {
             // As read would show them, so that an edit can follow
@@ -1505,6 +1537,11 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
             putbyte(&b, '\n');
         }
         r.ok = 1;
+    }
+    if (unread && !e->cancelled) {
+        if (b.len && b.data[b.len-1]!='\n') putbyte(&b, '\n');
+        print(&b, "[some files or directories could not be read, so they "
+                  "were not searched]");
     }
     if (e->timedout) {
         if (b.len && b.data[b.len-1]!='\n') putbyte(&b, '\n');

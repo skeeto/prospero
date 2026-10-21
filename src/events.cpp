@@ -40,6 +40,7 @@ enum : i32 {
     EV_REWIND,
     EV_INSTRUCTIONS,
     EV_NOTICE,
+    EV_PREFIX,
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -84,6 +85,7 @@ static EvInfo evinfo[] = {
     {"rewind",     1, 1},  // files were changed back
     {"instructions", 1, 0},
     {"notice",     1, 0},
+    {"prefix",     1, 0},  // what every request of the session begins with
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},

@@ -441,7 +441,9 @@ def cmd_report(args):
     models = sorted({r["model"] for r in recs}, key=lambda m: (m != "large", m))
     formats = [f for f in ("replace", "patch", "hashline") if any(r["format"] == f for r in recs)]
 
-    print("| model | format | runs | success | tool calls | edit calls | failed edits "
+    # As RESULTS.md has it: tool calls, reads, tokens and wall time are
+    # means per run, failed edits totals per cell
+    print("| model | format | runs | success | tool calls | reads | failed edits "
           "| tokens in | tokens out | wall s |")
     print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
     for m in models:
@@ -451,8 +453,8 @@ def cmd_report(args):
                 continue
             ok = sum(r["ok"] for r in rs)
             print(f"| {m} | {fmt} | {len(rs)} | {100 * ok / len(rs):.1f}% ({ok}) "
-                  f"| {mean(r['calls'] for r in rs):.1f} | {mean(r['edits'] for r in rs):.1f} "
-                  f"| {mean(r['edit_errors'] for r in rs):.2f} "
+                  f"| {mean(r['calls'] for r in rs):.1f} | {mean(r['reads'] for r in rs):.2f} "
+                  f"| {sum(r['edit_errors'] for r in rs)} "
                   f"| {mean(r['in'] for r in rs):,.0f} | {mean(r['out'] for r in rs):,.0f} "
                   f"| {mean(r['wall'] for r in rs):.0f} |")
     print()

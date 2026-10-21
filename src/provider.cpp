@@ -700,9 +700,12 @@ static b32 committed(Partial *p)
     return trim(finish(&p->text)).len || p->calls.len;
 }
 
-// Call ids are kept as the server sent them, but must exist, be unique
-// in the message, and be safe as file names: [A-Za-z0-9_-]{1,64}.
-static Str callid(Arena *a, Str id, i64 turn, i64 step, iz n, Slice<Block> prior)
+// Call ids are kept as the server sent them, but must exist, be safe as
+// file names ([A-Za-z0-9_-]{1,64}), and be unique in the session, unlike
+// an earlier call's of the message (prior) or of the session (used),
+// since rewinds, spill files and frontends go by them.
+static Str callid(Arena *a, Str id, i64 turn, i64 step, iz n, Slice<Block> prior,
+                  Slice<Str> used)
 {
     Buf b(a, 72);
     for (iz i = 0; i<id.len && b.len<64; i++) {
@@ -724,6 +727,9 @@ static Str callid(Arena *a, Str id, i64 turn, i64 step, iz n, Slice<Block> prior
         for (iz i = 0; i < prior.len; i++) {
             taken |= prior[i].type==BLOCK_CALL && prior[i].id==r;
         }
+        for (iz i = 0; i<used.len && !taken; i++) {
+            taken = used[i] == r;
+        }
         if (!taken) {
             return r;
         }
@@ -743,9 +749,10 @@ struct Finished {
 
 // Turn the partial response into message blocks in perm. With complete
 // set, every call is complete; otherwise only those followed by another
-// call are known to be, and the last is dropped as incomplete.
+// call are known to be, and the last is dropped as incomplete. Call ids
+// differ from those used before in the session.
 static Finished finishpartial(Arena *perm, Partial *p, b32 complete,
-                              i64 turn, i64 step)
+                              i64 turn, i64 step, Slice<Str> used = {})
 {
     Finished r = {};
     iz       nblocks = p->nblocks;
@@ -785,7 +792,8 @@ static Finished finishpartial(Arena *perm, Partial *p, b32 complete,
             for (iz k = 0; k < p->calls.len; k++) {
                 c = p->calls[k].block==i ? &p->calls[k] : c;
             }
-            b.id = callid(perm, finish(&c->id), turn, step, r.ncalls, r.blocks);
+            b.id = callid(perm, finish(&c->id), turn, step, r.ncalls, r.blocks,
+                          used);
             r.ncalls++;
         }
         r.blocks = push(perm, r.blocks, b);

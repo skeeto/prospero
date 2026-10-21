@@ -14,7 +14,8 @@ and still the reaper's sweep must find it: after a crash, and when its
 command ends normally. A daemon that detaches through a double fork is
 found by the Linux subreaper; on macOS, where only snapshots of the tree
 taken every 250 ms can see it, it may escape: an expected failure there,
-reported as XFAIL. Survivors are killed afterward.
+reported as XFAIL. An escapee after thousands of short-lived processes
+checks that the snapshots forget the dead. Survivors are killed afterward.
 
   uv run tests/cleanup.py --harness build/harness
   uv run tests/cleanup.py --harness PATH --host biron.local
@@ -124,10 +125,11 @@ def main():
 
             # Escapees left behind by commands that end normally
             for name, xfail in [("escapee_end", False),
+                                ("escapee_many", False),
                                 ("doublefork", sys.platform == "darwin")]:
                 t = scenarios.T(host, name, None)
                 t.put("tree.pids", "")
-                r = t.run(timeout=30)
+                r = t.run(timeout=90)
                 pids = t.pids("tree.pids")
                 if r.rc != 0 or len(pids) != 1:
                     print(f"FAIL {name}: exit {r.rc}, pids {pids}: {r.stderr}")

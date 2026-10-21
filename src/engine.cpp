@@ -449,6 +449,9 @@ struct Session {
     i32          slot;       // SLOT_*
     Str          slotmodel;
     u64          admid;      // the session's id in queues
+    i32          admepoch;   // its lane's epoch when admitted (admshrink)
+    i32          qpos;       // its place in line as last told, and the
+    i32          qlen;       // line's length then
     // Fallbacks and slow retries
     Str          home;       // the primary endpoint (name or URL)
     Str          homemodel;  // and model
@@ -648,8 +651,10 @@ static void live(Session *s)
         i64 left = s->timers[T_BACKOFF] - now;
         putintkey(&w.json, "retry_at", os_time(os) + left/MS);
     } else if (s->state==S_QUEUED && s->point) {
-        putintkey(&w.json, "queue_pos", admpos(s->point, s->admid));
-        putintkey(&w.json, "queue_len", admlen(s->point));
+        s->qpos = admpos(s->point, s->admid);
+        s->qlen = admlen(s->point);
+        putintkey(&w.json, "queue_pos", s->qpos);
+        putintkey(&w.json, "queue_len", s->qlen);
     } else if (s->state == S_TASK) {
         i64 n = 0;
         for (iz i = 0; i < s->tasks.len; i++) {
@@ -746,6 +751,11 @@ static void addassistant(Session *s, Arena scratch, Slice<Block> blocks,
         putintkey(&w.json, "in", u->in);
         putintkey(&w.json, "out", u->out);
         putintkey(&w.json, "cached", u->cached);
+        if (s->sentbytes) {
+            // The prompt's bytes as estimates count them: with in, the
+            // calibration a session opened again starts from
+            putintkey(&w.json, "bytes", s->sentbytes);
+        }
         putend(&w.json);
     }
     putintkey(&w.json, "ms", (os_ticks(s->e->os) - s->sent)/MS);
@@ -861,6 +871,8 @@ static i64 get64(Str s)
 
 // Admission (admit.cpp)
 
+static i64 scaled(Engine *, i64 ticks);
+
 static Session *sessionbyadm(Engine *e, u64 id)
 {
     for (Session *s = e->sessions; s; s = s->next) {
@@ -872,21 +884,22 @@ static Session *sessionbyadm(Engine *e, u64 id)
 }
 
 // Admit what may go now at an endpoint: each session admitted sends from
-// its T_ADMIT, and those still waiting hear their new places. Then find
-// when time alone may admit more, at any endpoint.
+// its T_ADMIT, and those still waiting hear of any change in their places,
+// as some went, or left, or joined the line. Then find when time alone
+// may admit more, at any endpoint.
 static void pump(Engine *e, AdmPoint *p)
 {
-    i64 now   = os_ticks(e->os);
-    b32 moved = 0;
+    i64 now = os_ticks(e->os);
     for (u64 id; (id = admgo(p, &e->perm, now));) {
         Session *s = sessionbyadm(e, id);
         assert(s && s->slot==SLOT_WAIT && s->point==p);
-        s->slot = SLOT_HELD;
+        s->slot     = SLOT_HELD;
+        s->admepoch = admlane(p, 0, s->slotmodel)->epoch;
         arm(s, T_ADMIT, 0);
-        moved = 1;
     }
-    for (Session *s = e->sessions; moved && s; s = s->next) {
-        if (s->point==p && s->slot==SLOT_WAIT && s->state==S_QUEUED) {
+    for (Session *s = e->sessions; s; s = s->next) {
+        if (s->point==p && s->slot==SLOT_WAIT && s->state==S_QUEUED &&
+                (admpos(p, s->admid)!=s->qpos || admlen(p)!=s->qlen)) {
             live(s);
         }
     }
@@ -906,7 +919,8 @@ static void release(Session *s, b32 linger)
     }
     Engine *e = s->e;
     if (s->slot == SLOT_HELD) {
-        admdone(s->point, s->slotmodel, os_ticks(e->os), linger);
+        admdone(s->point, s->slotmodel, os_ticks(e->os), linger,
+                scaled(e, ADM_CALM));
     } else {
         admleave(s->point, s->admid);
     }
@@ -949,13 +963,15 @@ static void probe(Engine *e, AdmPoint *p, Endpoint *ep, Arena scratch)
     p->body     = Buf(&e->perm, 1<<10);
     p->http     = os_http(e->os, &r, scratch);
     if (!p->http) {
-        p->probe   = PROBE_DONE;
+        p->probe   = PROBE_NONE;  // ask again at the next request
         p->probeid = 0;
+        p->models  = 1;
     }
 }
 
 // The limits at an endpoint: as configured, else as learned. Until the
-// probe answers, one counted model at a time.
+// probe answers, one counted model at a time, and so too while it has
+// only failed: no answer is no reason to load models side by side.
 static void pointlimits(AdmPoint *p)
 {
     p->maxmodels = p->cfgmodels ? p->cfgmodels :
@@ -991,6 +1007,14 @@ static b32 onprobe(Engine *e, Arena scratch, Record r)
         if (p->status == 200) {
             p->models = rt && mi>0 ? (i32)(mi<1024 ? mi : 1024) : 0;
             p->slots  = ts>0 ? (i32)(ts<1024 ? ts : 1024) : 0;
+        } else if (!p->status || p->status==429 || p->status>=500) {
+            // No answer (a router still starting, a timeout): one model
+            // at a time, and ask again at the next request. Any other
+            // status is an answer, from a server that is no router.
+            p->probe  = PROBE_NONE;
+            p->models = 1;
+        } else {
+            p->models = 0;
         }
         pointlimits(p);
         pump(e, p);
@@ -1022,9 +1046,10 @@ static b32 admit(Session *s, Arena scratch)
     assert(s->slot == SLOT_NONE);
 
     // What the endpoint's listing says of the model: the session's own
-    // from its discovery, any other from the last listing seen
+    // from its discovery, any other, or one its discovery missed, from
+    // the last listing seen
     ModelInfo mi = {};
-    if (model==s->model && ep->url==s->ep.url) {
+    if (model==s->model && ep->url==s->ep.url && s->info.found) {
         mi = s->info;
     } else {
         i64 *k = upsert(&e->kinds, kindkey(&scratch, ep->url, model), (Arena *)0);
@@ -1229,6 +1254,17 @@ static void taskcancel(Session *, Arena);
 static void taskcheck(Session *, Arena, Str why, Str err);
 static b32  taskbudget(Session *, Arena);
 static i64  parkafter(Engine *);
+
+// The ids of the session's calls so far, which a new call's must not
+// repeat (finishpartial).
+static Slice<Str> usedids(Session *s, Arena *a)
+{
+    Slice<Str> r = {};
+    for (iz i = 0; i < s->marks.len; i++) {
+        r = push(a, r, s->marks[i].call);
+    }
+    return r;
+}
 
 static void resetattempt(Session *s)
 {
@@ -1495,6 +1531,8 @@ static b32 quickretry(Session *s, Arena scratch, i32 cls, i32 status, Str msg,
     return 1;
 }
 
+static void gohome(Session *, Arena, Str why);
+
 // Once quick retries are spent and no fallback is left, wait minutes at
 // a time, as [endpoint] slow_retry says (the last wait repeating), then
 // start over from the primary, until [endpoint] slow_retry_budget is
@@ -1526,6 +1564,9 @@ static b32 slowwait(Session *s, Arena scratch, i32 cls, i32 status, Str msg,
     s->slown++;
     s->retries = 0;  // quick ones again after the wait
     s->slowing = 1;
+    if (s->purpose == REQ_CHAT) {
+        gohome(s, scratch, "a slow retry");  // the record names the target
+    }
     retryevent(s, scratch, RETRY_SLOW, cls, status, wait/MS, msg);
     arm(s, T_BACKOFF, wait);
     setstate(s, S_BACKOFF);
@@ -1681,6 +1722,25 @@ static void failcompact(Session *s, Arena scratch, i32 cls, i32 status,
 // slow retries follow (above). retryms is the server's wish, -1 if none.
 static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 retryms)
 {
+    if (s->slot==SLOT_HELD && contains(msg, "Context size has been exceeded")) {
+        // llama.cpp's KV pool, shared by its slots, is full: it failed
+        // every request in flight, which would fail again together
+        Engine *e    = s->e;
+        i64     now  = os_ticks(e->os);
+        i32     most = admshrink(s->point, s->slotmodel, s->admepoch, now,
+                                 scaled(e, ADM_CALM));
+        if (most) {
+            Buf b(&scratch, 256 + s->slotmodel.len);
+            print(&b, "the server's memory for contexts is full: ");
+            print(&b, (i64)most);
+            print(&b, most==1 ? Str(" request") : Str(" requests"));
+            print(&b, " at once to ");
+            print(&b, s->slotmodel);
+            print(&b, " from now on, and one more for each 5 minutes "
+                      "without this error");
+            note(s, scratch, "warn", finish(&b));
+        }
+    }
     if (s->purpose == REQ_COMPACT) {
         failcompact(s, scratch, cls, status, msg, retryms);
         return;
@@ -1696,7 +1756,8 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
         if (cls==CLASS_LOOP && s->cycleat>=0) {
             p->text.len = s->cycleat<p->text.len ? s->cycleat : p->text.len;
         }
-        Finished f = finishpartial(&s->perm, p, 0, s->turn, s->steps);
+        Slice<Str> used = usedids(s, &scratch);
+        Finished   f    = finishpartial(&s->perm, p, 0, s->turn, s->steps, used);
         addassistant(s, scratch, f.blocks, "interrupted", 0);
         i32 kind = cls==CLASS_LOOP ? N_LOOP : N_CONTINUE;
         Str text = cls==CLASS_LOOP ?
@@ -1742,8 +1803,12 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
 
     // A wait longer than quick retries honor is a usage limit, as is a
     // spending or quota error. A missing model (404) is unavailable.
+    // Past the end of the chain, a fallback's own limit or absence is no
+    // reason to stop: the slow wait starts over from the primary, which
+    // the session left perhaps only for a passing outage.
     b32 later = cls==CLASS_TRANSIENT && retryms>RETRY_WAIT/MS;
     b32 gone  = cls==CLASS_DETERMINISTIC && status==404;
+    b32 away  = s->target && (cls==CLASS_LIMIT || gone);
     if (cls==CLASS_TRANSIENT && !later &&
             quickretry(s, scratch, cls, status, msg, retryms)) {
         return;
@@ -1751,7 +1816,7 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
                nexttarget(s, scratch, cls, status, msg)) {
         proceed(s, scratch);
         return;
-    } else if (cls==CLASS_TRANSIENT &&
+    } else if ((cls==CLASS_TRANSIENT || away) &&
                slowwait(s, scratch, cls, status, msg, later ? retryms : -1)) {
         return;
     }
@@ -1760,7 +1825,8 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
     // results that will never come
     if (visible) {
         p->calls = {};
-        Finished f = finishpartial(&s->perm, p, 1, s->turn, s->steps);
+        Slice<Str> used = usedids(s, &scratch);
+        Finished   f    = finishpartial(&s->perm, p, 1, s->turn, s->steps, used);
         if (f.blocks.len) {
             addassistant(s, scratch, f.blocks, "error", 0);
         }
@@ -2301,8 +2367,10 @@ static void instrlazy(Session *s, Arena scratch, Str path)
 // next request, since the system prompt stays as it was.
 static void instrcheck(Session *s, Arena scratch)
 {
-    Os              *os      = s->e->os;
+    Engine          *e       = s->e;
+    Os              *os      = e->os;
     Slice<InstrFile> changed = {};
+    Str              root    = {};
     Buf              b(&scratch, 1024);
     for (iz i = 0; i < s->instrfiles.len; i++) {
         InstrStamp *k    = &s->instrfiles[i];
@@ -2310,6 +2378,19 @@ static void instrcheck(Session *s, Arena scratch)
         b32         file = st.type == STAT_FILE;
         if (file ? st.size==k->size && st.mtime==k->mtime : k->mtime<0) {
             continue;  // as it was, or gone and told so
+        }
+        if (file && k->path!=e->global) {
+            // A project's file that now leads out of it is gone as one
+            b32 win = s->te.windows;
+            root = root.data ? root : instrroot(os, &scratch, s->guard.cwd, win);
+            if (within(root, k->path, win) &&
+                    !instrinside(os, scratch, root, k->path, win)) {
+                if (k->mtime < 0) {
+                    continue;  // and told so
+                }
+                st   = {};
+                file = 0;
+            }
         }
         k->size  = file ? st.size : 0;
         k->mtime = file ? st.mtime : -1;
@@ -2395,7 +2476,7 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
         toolend(s, scratch, "denied", text, 0, 0, {}, 0);
         return;
     }
-    PatchPlan plan = planpatch(e->os, &scratch, s->guard.cwd, p);
+    PatchPlan plan = planpatch(e->os, &scratch, s->guard.cwd, p, s->te.windows);
     if (!plan.ok) {
         toolend(s, scratch, "error", plan.text, 0, 0, {}, 0);
         return;
@@ -2884,6 +2965,9 @@ static void jobend(Session *s, Arena scratch, Job *j)
         ssend(s, &w);
     }
     if (!tell) {
+        // A subagent waiting for its jobs still reports once none runs:
+        // its last one killed, or all stopped as its session closed
+        taskcheck(s, scratch, "done", {});
         return;
     }
     Str text = jobnotice(s, &scratch, j, bytes);
@@ -3045,6 +3129,24 @@ static void startjob(Session *s, Arena scratch, Args *args)
     toolend(s, scratch, "ok", text, 0, 0, rel, 0, j->n);
 }
 
+// A job made of the current command takes over what is known of its
+// output and its exit, so that it ends as the command would have.
+static void jobadopt(Session *s, Job *j)
+{
+    j->eof    = s->sh.eof;
+    j->total  = s->sh.total;
+    j->exited = s->sh.exited;
+    j->code   = s->sh.code;
+    j->signal = s->sh.signal;
+    if (s->sh.limited && j->state==JOB_RUN) {
+        // Killed already for its output, as jobrecord has it
+        j->why     = JOBEND_LIMIT;
+        j->state   = JOB_STOP;
+        j->drainat = os_ticks(s->e->os) + DRAIN;
+        jobarm(s);
+    }
+}
+
 // A foreground command still running at its timeout becomes a job.
 static void movetojob(Session *s, Arena scratch)
 {
@@ -3055,6 +3157,7 @@ static void movetojob(Session *s, Arena scratch)
     disarm(s, T_DRAIN);
     Job *j = newjob(s, scratch, c->id, s->sh.command, s->proc, s->procid,
                     s->sh.spill, s->sh.rel, s->sh.start, s->te.jobtimeout, 0);
+    jobadopt(s, j);
     s->proc   = 0;
     s->procid = 0;
     setstate(s, S_IDLE);
@@ -3294,6 +3397,7 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled)
         // Stopped as a job is, asked first, while the turn goes on
         Job *j = newjob(s, scratch, {}, {}, s->proc, s->procid, s->sh.spill,
                         s->sh.rel, os_ticks(e->os), 0, 1);
+        jobadopt(s, j);
         jobstop(s, j, JOBEND_KILLED);
     } else if (s->proc) {
         os_kill(e->os, s->proc, 1);  // whatever it left behind
@@ -3863,8 +3967,9 @@ static void finalize(Session *s, Arena scratch)
         compacted(s, scratch, p);
         return;
     }
-    Finished f  = finishpartial(&s->perm, p, 1, s->turn, s->steps);
-    Str      fr = p->finish.data ? p->finish : Str("stop");
+    Slice<Str> used = usedids(s, &scratch);
+    Finished   f    = finishpartial(&s->perm, p, 1, s->turn, s->steps, used);
+    Str        fr   = p->finish.data ? p->finish : Str("stop");
     addassistant(s, scratch, f.blocks, fr, p->hasusage ? &p->usage : 0);
     setstate(s, S_IDLE);
 
@@ -4056,14 +4161,29 @@ static void startturn(Session *s, Arena scratch, Str text, Str via)
     beginturn(s, scratch, {});
 }
 
+// The session needs its model at its endpoint no longer: let it stop
+// lingering, unless another session's turn runs on it between requests
+// (a tool), since a lane's linger is shared by every session on it.
+static void cool(Session *s)
+{
+    if (!s->point) {
+        return;
+    }
+    for (Session *t = s->e->sessions; t; t = t->next) {
+        if (t!=s && t->point==s->point && t->slotmodel==s->slotmodel &&
+                t->slot==SLOT_NONE && t->state!=S_TASK && busy(t)) {
+            return;
+        }
+    }
+    admcool(s->point, s->slotmodel);
+    pump(s->e, s->point);
+}
+
 static void endturn(Session *s, Arena scratch, Str why, Str err)
 {
     release(s, 0);
     stopreq(s);
-    if (s->point) {
-        admcool(s->point, s->slotmodel);  // no next step to keep it for
-        pump(s->e, s->point);
-    }
+    cool(s);  // no next step to keep it for
     for (i32 t = 0; t < T_COUNT; t++) {
         if (t != T_JOBS) {
             disarm(s, t);  // jobs outlive turns
@@ -4145,7 +4265,9 @@ static void cancelturn(Session *s, Arena scratch)
     case S_ERRBODY:
         if (s->purpose==REQ_CHAT && s->part && committed(s->part)) {
             s->part->calls = {};
-            Finished f = finishpartial(&s->perm, s->part, 1, s->turn, s->steps);
+            Slice<Str> used = usedids(s, &scratch);
+            Finished   f    = finishpartial(&s->perm, s->part, 1, s->turn,
+                                            s->steps, used);
             if (f.blocks.len) {
                 addassistant(s, scratch, f.blocks, "cancelled", 0);
             }
@@ -4372,19 +4494,18 @@ static void instrlogstart(Session *s, Arena scratch)
 
 static void taskroles(Engine *, Arena *, Arena, ToolEnv *);
 
-static void sessionready(Session *s, Arena scratch)
+// What every request of the session begins with, the system prompt and
+// the tools, built from the session and the configuration as they are
+// now, and the job limits the tools describe.
+static void buildprefix(Session *s, Arena scratch)
 {
     Engine *e = s->e;
     jobconf(s);
-    instrstart(s, scratch);
     if (tooloffered(&s->te, TOOL_TASK)) {
         taskroles(e, &s->perm, scratch, &s->te);
     }
-    s->home      = s->ep.name.len ? s->ep.name : s->ep.url;
-    s->homemodel = s->model;
-    s->system    = systemprompt(&s->perm, s->cwd, &s->te);
-    s->tools     = tooljson(&s->perm, &s->te);
-    s->guard     = sessionguard(s, &s->perm);
+    s->system = systemprompt(&s->perm, s->cwd, &s->te);
+    s->tools  = tooljson(&s->perm, &s->te);
     if (s->rolepr.len) {
         s->system = concat(&s->perm, s->system, "\n\n# Your role: ");
         s->system = concat(&s->perm, s->system, s->role);
@@ -4424,6 +4545,37 @@ static void sessionready(Session *s, Arena scratch)
                            "disagree, a file in a deeper directory wins over "
                            "those above it.");
         s->system = concat(&s->perm, s->system, s->instr);
+    }
+}
+
+// The prefix's durable record, so that the session opened again, or
+// revived from parking, sends it byte for byte whatever the configuration
+// says then: only a compaction may break the prompt cache.
+static void logprefix(Session *s, Arena scratch)
+{
+    if (s->readonly) {
+        return;
+    }
+    Buf   b(&scratch, 1024 + 2*(s->system.len + s->tools.len));
+    EvOut w = sbegin(s, &b, EV_PREFIX);
+    putstrkey(&w.json, "system", s->system);
+    putstrkey(&w.json, "tools", s->tools);
+    putintkey(&w.json, "job_timeout", s->te.jobtimeout);
+    putintkey(&w.json, "job_timeout_max", s->te.jobmax);
+    ssend(s, &w);
+}
+
+// Join a session to the engine: its workspace, and its prefix unless its
+// log held one (loadsession), with its job limits.
+static void sessionready(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    instrstart(s, scratch);
+    s->home      = s->ep.name.len ? s->ep.name : s->ep.url;
+    s->homemodel = s->model;
+    s->guard     = sessionguard(s, &s->perm);
+    if (!s->system.data) {
+        buildprefix(s, scratch);
     }
     s->next = e->sessions;
     e->sessions = s;
@@ -4475,7 +4627,8 @@ static Str opensession(Session *s, Arena scratch)
 // The session record, always seq 1. A role's prompt and tools are kept
 // in it, a subagent's parent, and the edit tool's format unless it is
 // replace, so that the session is the same when it is opened again,
-// whatever the configuration says then.
+// whatever the configuration says then; its prefix record (logprefix),
+// after its instructions, keeps the system prompt and tools likewise.
 static void logsession(Session *s, Arena scratch)
 {
     Buf   b(&scratch, 1024 + s->rolepr.len);
@@ -4730,6 +4883,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     sessionready(s, scratch);
     logsession(s, scratch);
     instrlogstart(s, scratch);
+    logprefix(s, scratch);
     // Complete before scratch is passed on, which copies it
     Str title = maketitle(&scratch, args->desc.len ? args->desc : args->prompt);
     settitle(s, scratch, title);
@@ -4745,11 +4899,7 @@ static void starttasks(Session *s, Arena scratch)
     iz      end = s->callidx;
     for (; end<s->calls.len && s->calls[end].name=="task"; end++) {}
 
-    // The next step waits for every report: its model need not linger
-    if (s->point) {
-        admcool(s->point, s->slotmodel);
-        pump(e, s->point);
-    }
+    cool(s);  // the next step waits for every report
     s->tasks = {};
     for (iz k = s->callidx; k < end; k++) {
         Arena a = scratch;
@@ -5148,6 +5298,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     sessionready(s, scratch);
     logsession(s, scratch);
     instrlogstart(s, scratch);
+    logprefix(s, scratch);
     reply(e, scratch, id, 1, {}, s->sid);
 
     Str prompt = jsonstr(jsonget(j, "prompt"));
@@ -5203,6 +5354,7 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
         Msg m = {};
         m.role = ROLE_USER;
         m.text = clone(&s->perm, jsonstr(jsonget(j, "text")));
+        m.seq  = r->seq;  // a later compaction's cut keeps it or not
         addmsg(s, m);
         Job *jb = jobfind(s, jsonint(jsonget(j, "job"), 0));
         if (jb && jsonstr(jsonget(j, "kind"))=="job") {
@@ -5339,6 +5491,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
     }
     Str storedmodel = {};
     Str storedurl   = {};
+    b32 prefixed    = 0;
     for (iz i = 0; i < rp.lines.len; i++) {
         Arena t = scratch;
         EvRec r = evparse(&t, rp.lines[i]);
@@ -5413,6 +5566,16 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 m.blocks = push(&s->perm, m.blocks, b);
             }
             addmsg(s, m);
+            {
+                // The estimates as the server last calibrated them
+                Json *u     = jsonget(j, "usage");
+                i64   in    = jsonint(jsonget(u, "in"), 0);
+                i64   bytes = jsonint(jsonget(u, "bytes"), 0);
+                if (in>0 && bytes>0) {
+                    s->rate.tokens = in;
+                    s->rate.bytes  = bytes;
+                }
+            }
             break;
         case EV_TOOLEND:
             m.role   = ROLE_TOOL;
@@ -5422,8 +5585,20 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             m.seq    = r.seq;
             addmsg(s, m);
             break;
+        case EV_PREFIX:
+            // As it began, rather than as the configuration has it now
+            s->system        = clone(&s->perm, jsonstr(jsonget(j, "system")));
+            s->tools         = clone(&s->perm, jsonstr(jsonget(j, "tools")));
+            s->te.jobtimeout = jsonint(jsonget(j, "job_timeout"), 0);
+            s->te.jobmax     = jsonint(jsonget(j, "job_timeout_max"), 0);
+            s->system.data   = s->system.data ? s->system.data : (u8 *)"";
+            prefixed         = 1;
+            break;
         }
         replaytools(s, t, &r);
+    }
+    if (prefixed && (s->te.jobtimeout<1 || s->te.jobmax<1)) {
+        jobconf(s);  // a record without them
     }
     if (!s->cwd.len) {
         dropsession(e, s);
@@ -5438,6 +5613,9 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
     replayjobs(s, scratch);
     sessionready(s, scratch);
     instrlogstart(s, scratch);
+    if (!prefixed) {
+        logprefix(s, scratch);  // a log from before prefix records
+    }
     return s;
 }
 
@@ -5564,7 +5742,8 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
 
 struct RewindFile {
     Str path;
-    Str result;  // restored, removed, unchanged, conflict, failed
+    Str result;  // restored, removed, unchanged, conflict, partial, failed
+    b32 wrote;   // this rewind changed the file
 };
 
 // rewind {sid, to, force}: put back, newest first, the files that write
@@ -5584,7 +5763,9 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "the session is busy: cancel its turn first", s->sid);
         return;
     } else if (to->type == JSON_STRING) {
-        for (iz i = 0; i<s->marks.len && seq0<0; i++) {
+        // Newest first, as frontends find a call, should an old log have
+        // a model's id more than once
+        for (iz i = s->marks.len-1; i>=0 && seq0<0; i--) {
             seq0 = s->marks[i].call==to->str ? s->marks[i].seq : seq0;
         }
         if (seq0 < 0) {
@@ -5615,12 +5796,14 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
             continue;
         }
         // One result for each file: its oldest change decides, unless a
-        // newer one found a conflict
+        // newer one found a conflict or failed, which stops it there. A
+        // conflict after newer changes were put back is a partial rewind.
         RewindFile *f = 0;
         for (iz k = 0; k<files.len && !f; k++) {
             f = files[k].path==sn->path ? &files[k] : 0;
         }
-        if (f && f->result=="conflict") {
+        if (f && (f->result=="conflict" || f->result=="partial" ||
+                  f->result=="failed")) {
             continue;
         }
         Arena a   = scratch;
@@ -5647,15 +5830,19 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
             b32 ok = cur.err==READ_NOTFOUND || os_remove(os, a, sn->path);
             result = ok ? Str("removed") : Str("failed");
         }
+        b32 wrote = result=="restored" || result=="removed";
         if (result!="conflict" && result!="failed") {
             sn->undone = 1;
             undone = push(&scratch, undone, snapname(&scratch, sn->n));
         }
-        if (f) {
-            f->result = result;
-        } else {
-            RewindFile n = {sn->path, result};
+        if (!f) {
+            RewindFile n = {sn->path, result, wrote};
             files = push(&scratch, files, n);
+        } else if (f->wrote && (result=="conflict" || result=="failed")) {
+            f->result = "partial";
+        } else {
+            f->result = result;
+            f->wrote |= wrote;
         }
     }
 
@@ -5695,6 +5882,9 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
             {"unchanged", "Already as they were: "},
             {"conflict",  "Left as they are, since something else changed "
                           "them after the harness did: "},
+            {"partial",   "Put back only to before the later changes, since "
+                          "something else changed them in between, so the "
+                          "earlier changes were kept: "},
             {"failed",    "Could not be put back: "},
         };
         Buf t(&scratch, 1024);

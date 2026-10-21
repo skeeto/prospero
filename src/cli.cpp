@@ -41,6 +41,7 @@ struct Cli {
     Mailbox *out;
     Str      statedir;
     Str      sid;
+    Str      model;     // the session's own, for --pretty
     b32      pretty;
     b32      headless;
     b32      quitting;
@@ -52,7 +53,7 @@ struct Cli {
     Str      prompt;    // for --resume
     i32      block;     // the delta block printed last, -1 if none
     b32      midline;   // pretty output does not end in a newline
-    Arena    keep;      // for the session id
+    Arena    keep;      // for the session id and model
     Region  *spare;     // log copies for resyncs
 };
 
@@ -109,12 +110,30 @@ static void prettyexcerpt(Cli *c, Arena scratch, Str text)
     os_print(c->os, 1, finish(&b));
 }
 
+// A wait for people: "750 ms", "45 s", "15 min".
+static void prettywait(Buf *b, i64 ms)
+{
+    if (ms < 10000) {
+        print(b, ms);
+        print(b, " ms");
+    } else if (ms < 120000) {
+        print(b, (ms + 500)/1000);
+        print(b, " s");
+    } else {
+        print(b, (ms + 30000)/60000);
+        print(b, " min");
+    }
+}
+
 static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
 {
     Os   *os = c->os;
     Json *j  = r->root;
     Buf   b(&scratch, 1024);
     switch (r->ev) {
+    case EV_SESSION:
+        c->model = clone(&c->keep, jsonstr(jsonget(j, "model")));
+        return;
     case EV_USER:
         prettyline(c);
         print(&b, "> ");
@@ -168,14 +187,54 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
                  jsonstr(jsonget(j, "status"))), "]\n"));
         prettyexcerpt(c, scratch, jsonstr(jsonget(j, "text")));
         return;
-    case EV_RETRY:
+    case EV_RETRY: {
+        // A retry names its target, the next attempt's: a switch to a
+        // fallback, or a wait for the same model or the primary
         prettyline(c);
-        print(&b, "[retry in ");
-        print(&b, jsonint(jsonget(j, "delay_ms"), 0));
-        print(&b, " ms: ");
+        Str model = jsonstr(jsonget(j, "model"));
+        i64 fall  = jsonint(jsonget(j, "fallback"), 0);
+        b32 slow  = jsonflag(jsonget(j, "slow"), 0);
+        print(&b, jsonflag(jsonget(j, "compact"), 0) ? Str("[compaction: ")
+                                                      : Str("["));
+        if (fall) {
+            print(&b, "switching to fallback ");
+            print(&b, fall);
+            print(&b, ", ");
+            print(&b, model);
+        } else {
+            print(&b, slow ? Str("slow retry in ") : Str("retry in "));
+            prettywait(&b, jsonint(jsonget(j, "delay_ms"), 0));
+            if (model.len && (slow || model!=c->model)) {
+                print(&b, " on ");
+                print(&b, model);
+            }
+        }
+        print(&b, ": ");
         print(&b, jsonstr(jsonget(j, "msg")));
         print(&b, "]\n");
-        break;
+    } break;
+    case EV_COMPACT: {
+        prettyline(c);
+        print(&b, "[compacted: ");
+        if (jsonstr(jsonget(j, "kind")) == "summary") {
+            print(&b, "older messages summarized by ");
+            print(&b, jsonstr(jsonget(j, "model")));
+        } else {
+            i64 n = jsonlen(jsonget(j, "elided"));
+            print(&b, n);
+            print(&b, n==1 ? Str(" old tool output elided")
+                           : Str(" old tool outputs elided"));
+        }
+        print(&b, ", about ");
+        print(&b, jsonint(jsonget(j, "before"), 0));
+        print(&b, " -> ");
+        print(&b, jsonint(jsonget(j, "after"), 0));
+        print(&b, " tokens");
+        if (jsonstr(jsonget(j, "why")) == "overflow") {
+            print(&b, ", since the server found the prompt too long");
+        }
+        print(&b, "]\n");
+    } break;
     case EV_NUDGE:
         prettyline(c);
         print(&b, "[nudge: ");
@@ -267,6 +326,9 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         print(&b, " files]\n");
         break;
     case EV_INSTRUCTIONS:
+        if (!jsonlen(jsonget(j, "files"))) {
+            return;  // none were found
+        }
         prettyline(c);
         print(&b, "[instructions:");
         for (Json *k = jsonget(j, "files")->child; k; k = k->next) {

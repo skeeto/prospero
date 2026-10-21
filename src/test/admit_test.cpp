@@ -96,6 +96,49 @@ static void test_admit(Test *t)
         expect(t, "maxreq.next", admgostr(a, q, 1), "6");
     }
 
+    // An uncounted model passes a waiter blocked on a model place, even
+    // past its patience, but not under a request limit
+    {
+        Adm       adm = {};
+        AdmPoint *p   = admpoint(&adm, a, "http://r/");
+        p->maxmodels = 1;
+        admenqueue(p, a, 1, "A", 4, 1, 0);
+        expect(t, "remote.first", admgostr(a, p, 0), "1");
+        admenqueue(p, a, 2, "B", 4, 1, 0);
+        admenqueue(p, a, 3, "remote", 4, 0, ADM_PATIENCE);
+        expect(t, "remote passes", admgostr(a, p, ADM_PATIENCE), "3");
+        admenqueue(p, a, 4, "remote", 4, 0, ADM_PATIENCE);
+        p->maxreq = 8;
+        expect(t, "remote waits under maxreq", admgostr(a, p, ADM_PATIENCE), "0");
+    }
+
+    // A full KV pool halves a model's concurrency, once per event, then
+    // it rises by one each calm period
+    {
+        Adm       adm = {};
+        AdmPoint *p   = admpoint(&adm, a, "http://r/");
+        for (u64 id = 1; id <= 4; id++) {
+            admenqueue(p, a, id, "A", 8, 1, 0);
+            admgo(p, a, 0);
+        }
+        i32 epoch = admlane(p, 0, "A")->epoch;
+        expect(t, "kv.shrink", istr(a, admshrink(p, "A", epoch, 1*S, 10*S)), "2");
+        admdone(p, "A", 1*S, 0);
+        expect(t, "kv.same event", istr(a, admshrink(p, "A", epoch, 1*S, 10*S)), "0");
+        admdone(p, "A", 1*S, 0);
+        admdone(p, "A", 1*S, 0);
+        admdone(p, "A", 1*S, 0);
+        for (u64 id = 5; id <= 7; id++) {
+            admenqueue(p, a, id, "A", 8, 1, 2*S);
+        }
+        expect(t, "kv.first", admgostr(a, p, 2*S), "5");
+        expect(t, "kv.second", admgostr(a, p, 2*S), "6");
+        expect(t, "kv.limited", admgostr(a, p, 2*S), "0");
+        admdone(p, "A", 12*S, 0, 10*S);  // calm: one more at once
+        expect(t, "kv.rises", istr(a, admlane(p, 0, "A")->most), "3");
+        expect(t, "kv.third", admgostr(a, p, 12*S), "7");
+    }
+
     // Leaving the queue, and no limits at all
     {
         Adm       adm = {};

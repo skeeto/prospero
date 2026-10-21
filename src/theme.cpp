@@ -8,8 +8,10 @@
 // and the metrics overlay's alarm. It also holds the few of ImGui's own
 // colors that the stock styles get wrong here, which ui.cpp lays over
 // ImGui's dark or light style: the panels' background and text, dimmed
-// text (hints, disabled labels) that still reads on a field, a selected
-// row and progress bars. Colors are packed as ImGui packs them (IM_COL32,
+// text (hints, disabled labels) that still reads on a field, rows
+// selected, hovered and pressed, buttons, and progress bars. Selected
+// text has a color of its own, since no one color of the transcript's
+// reads on every background, the selection's among them. Colors are packed as ImGui packs them (IM_COL32,
 // red in the low byte, alpha in the high), so this file needs no ImGui,
 // and the unit tests check that every text color reads against the
 // backgrounds it is drawn on, by the WCAG's measure: a contrast ratio of
@@ -40,6 +42,11 @@ struct Palette {
     u32 paneldim;   // disabled text and hints
     u32 frame;      // fields, opaque
     u32 selrow;     // a selected row (the sidebar's session), opaque
+    u32 rowhover;   // a row under the mouse, and pressed, opaque
+    u32 rowpress;
+    u32 btn;        // buttons: at rest, under the mouse, pressed
+    u32 btnhover;
+    u32 btnpress;
     u32 bar;        // progress bars, under paneltext
     // The transcript, on panel
     u32 text;
@@ -53,7 +60,8 @@ struct Palette {
     u32 quote;      // a quote's bar
     u32 rule;       // rules and table grids
     u32 marker;     // list bullets and numbers
-    u32 sel;        // selected text
+    u32 sel;        // selected text's background
+    u32 seltext;    // selected text, whatever its color otherwise
     u32 userbg;     // the user's messages
     u32 toolbg;     // tool rows
     u32 askbg;      // ask cards
@@ -80,6 +88,11 @@ static Palette themedark = {
     .paneldim  = rgb(153, 153, 153),
     .frame     = rgb( 30,  47,  74),
     .selrow    = rgb( 32,  58,  89),
+    .rowhover  = rgb( 28,  46,  70),
+    .rowpress  = rgb( 36,  54,  80),
+    .btn       = rgb( 36,  69, 110),
+    .btnhover  = rgb( 46,  88, 140),
+    .btnpress  = rgb( 30,  62, 104),
     .bar       = rgb( 52,  96, 170),
     .text      = rgb(222, 222, 222),
     .dim       = rgb(160, 170, 190),
@@ -93,6 +106,7 @@ static Palette themedark = {
     .rule      = rgb( 80,  80,  88),
     .marker    = rgb(160, 160, 170),
     .sel       = rgb( 38,  79, 120),
+    .seltext   = rgb(255, 255, 255),
     .userbg    = rgb( 40,  44,  52),
     .toolbg    = rgb( 34,  36,  40),
     .askbg     = rgb( 48,  42,  30),
@@ -126,6 +140,11 @@ static Palette themelight = {
     .paneldim  = rgb( 98,  98,  98),
     .frame     = rgb(255, 255, 255),
     .selrow    = rgb(186, 212, 243),
+    .rowhover  = rgb(206, 224, 246),
+    .rowpress  = rgb(190, 212, 240),
+    .btn       = rgb(176, 206, 244),
+    .btnhover  = rgb(150, 190, 244),
+    .btnpress  = rgb(124, 172, 236),
     .bar       = rgb(150, 190, 240),
     .text      = rgb( 32,  33,  36),
     .dim       = rgb( 80,  88, 100),
@@ -139,6 +158,7 @@ static Palette themelight = {
     .rule      = rgb(196, 199, 206),
     .marker    = rgb( 90,  94, 104),
     .sel       = rgb(180, 213, 255),
+    .seltext   = rgb(  0,   0,   0),
     .userbg    = rgb(221, 229, 241),
     .toolbg    = rgb(230, 231, 234),
     .askbg     = rgb(252, 243, 220),

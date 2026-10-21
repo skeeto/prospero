@@ -1570,16 +1570,24 @@ static b32 reapknown(Reaper *r, i32 pid)
 }
 
 // Record the descendants of the reaper and of every descendant seen
-// before, which may have left for launchd, by pid and start time.
+// before, which may have left for launchd, by pid and start time. Those
+// gone since are forgotten first, so that the table holds only the live
+// (a dead parent's later children cannot be found through it anyway),
+// and a pid used again is recorded again.
 static void reapsnapshot(Reaper *r)
 {
     static i32 kids[4096];
+    iz live = 0;
+    for (iz i = 0; i < r->nseen; i++) {
+        ReapProc *p = &r->seen[i];
+        if (p->start && reapstart(p->pid)==p->start) {
+            r->seen[live++] = *p;
+        }
+    }
+    r->nseen = live;
     for (iz at = -1; at < r->nseen; at++) {
         i32 parent = at<0 ? r->self : r->seen[at].pid;
-        if (at>=0 && reapstart(parent)!=r->seen[at].start) {
-            continue;  // gone, or its pid used again
-        }
-        i32 bytes = proc_listpids(PROC_PPID_ONLY, (u32)parent, kids, sizeof(kids));
+        i32 bytes  = proc_listpids(PROC_PPID_ONLY, (u32)parent, kids, sizeof(kids));
         for (iz i = 0; i < bytes/(iz)sizeof(i32); i++) {
             i32 pid = kids[i];
             if (pid<=0 || reapknown(r, pid) || r->nseen==REAP_SEEN) {

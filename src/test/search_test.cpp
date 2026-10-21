@@ -215,11 +215,11 @@ static void test_search(Test *t)
     // .gitignore rules: the last match wins, and deeper files win
     {
         Arena   tmp  = *a;
-        Ignore *root = alloc<Ignore>(&tmp);
+        GitIgnore *root = alloc<GitIgnore>(&tmp);
         root->dir   = "/r";
         root->rules = ignoreparse(&tmp, "# comment\n*.log\n!keep.log\nbuild/\n"
                                         "/top.txt\ndocs/*.tmp\n\\#hash\n  \n");
-        Ignore *sub = alloc<Ignore>(&tmp);
+        GitIgnore *sub = alloc<GitIgnore>(&tmp);
         sub->dir   = "/r/sub";
         sub->next  = root;
         sub->rules = ignoreparse(&tmp, "!*.log\n");
@@ -345,5 +345,57 @@ static void test_search(Test *t)
         os_write(os, *a, "/s/win.log", Str{(u8 *)".\\x\\a.c\0", 8});
         o = searchresult(os, a, "/s/win.log", &e);
         expect(t, "result windows", o.text, "x/a.c\n");
+        e.windows = 0;
+        e.root    = "/w";
+        e.cwd     = "/w";
+
+        // A listing cut short checked only the newest files
+        e.limited = 1;
+        o = searchresult(os, a, "/s/glob.log", &e);
+        expect(t, "result glob cut", o.text, "x/a.c\nc.c\n[so many files that "
+               "the list was cut at 8 MiB, and older files were not checked: "
+               "narrow the path]");
+        e.glob = "*.zip";
+        o = searchresult(os, a, "/s/glob.log", &e);
+        expect(t, "result glob cut none", istr(a, o.ok*10 + startswith(o.text,
+               "No files matching *.zip were found among the newest files")), "11");
+        e.limited = 0;
+
+        // ripgrep's silent 2: some files could not be read, not a failure
+        e.tool = TOOL_GREP;
+        e.code = 2;
+        o = searchresult(os, a, "/s/none.log", &e);
+        expect(t, "result unreadable", o.text, "No lines match x in the working "
+               "directory. The search is case-sensitive: set ignore_case to true "
+               "to match letters in either case.\n[some files or directories "
+               "could not be read, so they were not searched]");
+        expect(t, "result unreadable ok", istr(a, o.ok), "1");
+    }
+
+    // ripgrep takes the globs without a slash, as file types, but a
+    // leading **/ is no slash; the walker takes the others
+    {
+        ToolEnv te = {};
+        te.rg  = "rg";
+        te.exe = "harness";
+        Args g = {};
+        g.pattern = "**/*.{c,h}";
+        Slice<Str> v = searchargv(a, &te, TOOL_GLOB, "/w", ".", &g);
+        Buf b(a, 256);
+        for (iz i = 0; i < v.len; i++) {
+            print(&b, i ? Str(" ") : Str(""));
+            print(&b, v[i]);
+        }
+        expect(t, "argv glob rg", finish(&b), "rg --no-config --hidden --glob "
+               "!.git --no-messages --null --color never --files --sortr "
+               "modified --type-add harness:*.{c,h} --type harness -- .");
+        g.pattern = "src/**/*.c";
+        v = searchargv(a, &te, TOOL_GLOB, "/w", ".", &g);
+        expect(t, "argv glob walker", v[0], "harness");
+        Args q = {};
+        q.pattern = "x";
+        q.glob    = "**/*.c";
+        v = searchargv(a, &te, TOOL_GREP, "/w", ".", &q);
+        expect(t, "argv grep type", istr(a, v[0]=="rg" && v[v.len-7]=="harness:*.c"), "1");
     }
 }

@@ -326,6 +326,12 @@ static void themestyle(ImGuiStyle *st, Palette *p)
     c[ImGuiCol_TextDisabled]  = ImGui::ColorConvertU32ToFloat4(p->paneldim);
     c[ImGuiCol_FrameBg]       = ImGui::ColorConvertU32ToFloat4(p->frame);
     c[ImGuiCol_Header]        = ImGui::ColorConvertU32ToFloat4(p->selrow);
+    c[ImGuiCol_HeaderHovered] = ImGui::ColorConvertU32ToFloat4(p->rowhover);
+    c[ImGuiCol_HeaderActive]  = ImGui::ColorConvertU32ToFloat4(p->rowpress);
+    c[ImGuiCol_TabHovered]    = ImGui::ColorConvertU32ToFloat4(p->rowhover);
+    c[ImGuiCol_Button]        = ImGui::ColorConvertU32ToFloat4(p->btn);
+    c[ImGuiCol_ButtonHovered] = ImGui::ColorConvertU32ToFloat4(p->btnhover);
+    c[ImGuiCol_ButtonActive]  = ImGui::ColorConvertU32ToFloat4(p->btnpress);
     c[ImGuiCol_PlotHistogram] = ImGui::ColorConvertU32ToFloat4(p->bar);
     c[ImGuiCol_TextLink]      = ImGui::ColorConvertU32ToFloat4(p->link);
     c[ImGuiCol_PopupBg]       = ImGui::ColorConvertU32ToFloat4(p->panel);
@@ -560,12 +566,13 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
         for (i32 k = 0; k < l->nrun; k++) {
             Run   *r  = &bl->runs[l->run0+k];
             Piece *pc = &pieces[r->piece];
+            f32    x0 = 0, x1 = 0;  // the run's selected part, if any
             if (selected) {
                 i32 rb = runbeg(pieces, r), re = runend(pieces, r);
                 b32 synth = rb == re;
                 if ((!synth && rb<s1 && re>s0) || (synth && rb>=s0 && rb<s1)) {
-                    f32 x0 = runx(&g->measure, pieces, r, s0);
-                    f32 x1 = runx(&g->measure, pieces, r, s1);
+                    x0 = runx(&g->measure, pieces, r, s0);
+                    x1 = runx(&g->measure, pieces, r, s1);
                     if (synth) {
                         x0 = r->x;
                         x1 = r->x + (r->w>0 ? r->w : 4*g->scale);
@@ -577,14 +584,28 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
             if (r->flags & RUN_NODRAW) {
                 continue;
             }
-            ImFontBaked *bk  = stylebaked(f, pc->style);
-            ImVec2       at  = v2(ox + r->x, ly + l->base - bk->Ascent);
-            char const  *beg = pc->text.cdata + r->b0;
-            char const  *end = pc->text.cdata + r->b1;
-            u32          col = fade(piececolor(pal, pc, code), alpha);
+            ImFontBaked *bk   = stylebaked(f, pc->style);
+            ImVec2       at   = v2(ox + r->x, ly + l->base - bk->Ascent);
+            char const  *beg  = pc->text.cdata + r->b0;
+            char const  *end  = pc->text.cdata + r->b1;
+            u32          col  = fade(piececolor(pal, pc, code), alpha);
+            ImFont      *font = stylefont(f, pc->style);
+            f32          size = stylesize(f, pc->style);
             sp->SetCurrentChannel(dl, CH_TEXT);
-            dl->AddText(stylefont(f, pc->style), stylesize(f, pc->style), at,
-                        col, beg, end);
+            if (x1 > x0) {
+                // The selected part in a color of its own, which reads on
+                // the selection, as the run's own color may not: the run
+                // drawn in pieces, each clipped to its part
+                f32    top = ly - l->h, bot = ly + 2*l->h;
+                ImVec4 lo  = ImVec4(ox+r->x-l->h, top, ox+x0, bot);
+                ImVec4 mid = ImVec4(ox+x0, top, ox+x1, bot);
+                ImVec4 hi  = ImVec4(ox+x1, top, ox+r->x+r->w+l->h, bot);
+                dl->AddText(font, size, at, col, beg, end, 0, &lo);
+                dl->AddText(font, size, at, fade(pal->seltext, alpha), beg, end, 0, &mid);
+                dl->AddText(font, size, at, col, beg, end, 0, &hi);
+            } else {
+                dl->AddText(font, size, at, col, beg, end);
+            }
             if (pc->style & (STYLE_STRIKE|STYLE_LINK)) {
                 f32 y = pc->style&STYLE_STRIKE ? ly + l->base - bk->Ascent*0.35f
                                                : ly + l->base + 1;
@@ -2797,6 +2818,7 @@ static void dockwindows(Gui *g)
         ImGui::DockBuilderDockWindow("Jobs", rbot);
         ImGui::DockBuilderDockWindow("Log", rbot);
         ImGui::DockBuilderFinish(id);
+        g->jobsfocus = 2;
     }
     ImGui::DockSpace(id, v2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
     ImGui::End();
@@ -2838,12 +2860,18 @@ static void dockwindows(Gui *g)
         drawsettings(g);
     }
     ImGui::End();
-    // Submitted before the log, so that it is the tab selected
+    // The tab selected in its node, rather than the log: a node selects
+    // the window focused last, which a new window is as it appears, so
+    // Jobs is focused once, the frame after its windows first appear
     near = saveddock("Log");
     if (near) {
         ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
     }
-    if (ImGui::Begin("Jobs")) {
+    if (g->jobsfocus && !--g->jobsfocus) {
+        ImGui::SetNextWindowFocus();
+    }
+    g->jobsvisible = ImGui::Begin("Jobs");
+    if (g->jobsvisible) {
         drawjobs(g);
     }
     ImGui::End();

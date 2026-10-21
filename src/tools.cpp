@@ -39,7 +39,6 @@ static_assert(countof(toolnames) == TOOL_COUNT);
 enum : i64 {
     READ_LINES     = 2000,
     READ_BYTES     = 50 << 10,
-    READ_LINEMAX   = 2000,
     FILE_MAX       = (i64)64 << 20,   // largest file read or edited
     SHELL_DEFAULT  = 120,             // seconds
     SHELL_MAX      = 600,
@@ -1494,12 +1493,41 @@ static Str patchfailed(Arena *a, Str why)
 
 // Check a parsed patch against the files, whose absolute paths the
 // caller gave in each file's file and fileto, and work out every change
-// before any is made.
-static PatchPlan planpatch(Os *os, Arena *a, Str cwd, Patch *p)
+// before any is made. With win, paths differing in case are one file.
+static PatchPlan planpatch(Os *os, Arena *a, Str cwd, Patch *p, b32 win = 0)
 {
     PatchPlan r = {};
-    Buf       done(a, 256);
-    Buf       notes(a, 256);
+
+    // Each change is worked out from the file as it is, so a file named
+    // twice, if spelled two ways (f.txt and ./f.txt), would lose the
+    // first section's changes to the second's
+    for (iz i = 0; i < p->files.len; i++) {
+        PatchFile *f = &p->files[i];
+        for (iz k = 0; k < i; k++) {
+            PatchFile *o = &p->files[k];
+            Str        n[] = {f->file, f->fileto};
+            Str        m[] = {o->file, o->fileto};
+            b32        dup = 0;
+            for (i32 x = 0; x < 2; x++) {
+                for (i32 y = 0; y < 2; y++) {
+                    dup |= n[x].len && (win ? equalfold(n[x], m[y]) : n[x]==m[y]);
+                }
+            }
+            if (dup) {
+                Buf b(a, 256);
+                print(&b, "a file appears twice, as ");
+                print(&b, o->path);
+                print(&b, " and as ");
+                print(&b, f->path);
+                print(&b, ": give each file one section, with all its hunks");
+                r.text = patchfailed(a, patcherr(a, f->at, finish(&b)));
+                return r;
+            }
+        }
+    }
+
+    Buf done(a, 256);
+    Buf notes(a, 256);
     for (iz i = 0; i < p->files.len; i++) {
         PatchFile *f    = &p->files[i];
         Str        show = showpath(cwd, f->file);

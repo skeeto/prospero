@@ -56,7 +56,7 @@ static void test_theme(Test *t)
         P(text, panel), P(dim, panel), P(reasoning, panel), P(link, panel),
         P(code, panel), P(marker, panel), P(stale, panel),
         P(text, userbg), P(dim, userbg), P(link, userbg), P(code, userbg),
-        P(codetext, codebg), P(text, headerbg), P(text, sel),
+        P(codetext, codebg), P(text, headerbg), P(seltext, sel),
         P(text, toolbg), P(dim, toolbg), P(summary, toolbg),
         P(code, toolbg), P(link, toolbg), P(summary, panel),
         P(text, askbg), P(dim, askbg), P(summary, askbg),
@@ -65,6 +65,14 @@ static void test_theme(Test *t)
         P(ok, askbg), P(bad, askbg), P(amber, askbg),
         P(text, selrow), P(dim, selrow), P(ok, selrow), P(bad, selrow),
         P(amber, selrow), P(active, selrow),
+        // A row under the mouse, or pressed, shows what a selected one
+        // does; a tab under the mouse, or a button, shows paneltext
+        P(text, rowhover), P(dim, rowhover), P(ok, rowhover),
+        P(bad, rowhover), P(amber, rowhover), P(active, rowhover),
+        P(text, rowpress), P(dim, rowpress), P(ok, rowpress),
+        P(bad, rowpress), P(amber, rowpress), P(active, rowpress),
+        P(paneltext, rowhover), P(paneltext, btn), P(paneltext, btnhover),
+        P(paneltext, btnpress),
         #undef P
     };
     Palette *pals[] = {&themedark, &themelight};

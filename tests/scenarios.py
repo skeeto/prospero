@@ -2302,7 +2302,8 @@ def task_parallel(t):
             == r.last("assistant", own)["blocks"][0]["text"], "the parent read both")
 
     firsts = first_steps(t.requests(t.model2))
-    t.check(len(firsts) == 2, f"two conversations {len(firsts)}")
+    t.check(len(firsts) == 2, f"two conversations {len(firsts)}, retries "
+            f"{[(e.get('sid'), e.get('msg')) for e in r.all('retry')]}")
     t.check(firsts[1]["t"] < firsts[0]["end"], "the subagents ran side by side")
     parent = t.requests()
     t.check(all(q["t"] >= parent[0]["end"] - 0.05 for q in t.requests(t.model2)) and
@@ -2689,6 +2690,485 @@ def edit_hashline(t):
     edit = [x for x in tools if x["function"]["name"] == "edit"][0]
     t.check(sorted(edit["function"]["parameters"]["properties"]) == ["edits", "path", "tag"],
             f"kept {edit['function']['parameters']['properties'].keys()}")
+
+
+# M4 review: the engine
+
+@scenario(bound=20)
+def task_closewait(t):
+    """A subagent waits for its background job, and a frontend closes the
+    subagent's session: it reports all the same, and the parent goes on."""
+    h = t.headless()
+    try:
+        p = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=p, text="go")
+        kid = h.wait(lambda e: e.get("ev") == "session" and e.get("parent") == p)["sid"]
+        h.wait(lambda e: e.get("sid") == kid and e.get("ev") == "turn.end")
+        time.sleep(0.3)
+        h.call("close", sid=kid)
+        end = h.wait(lambda e: e.get("sid") == p and e.get("ev") == "turn.end",
+                     timeout=10)
+        t.check(end["why"] == "done", f"parent: {end}")
+        res = [e for e in h.all("tool.end", p)]
+        t.check(res and res[0]["status"] == "ok" and
+                "Waiting for my job." in res[0]["text"], f"the report: {res}")
+    finally:
+        h.call("quit")
+        h.close()
+
+
+@scenario(conf={"_tools": {"stop_grace": 1}}, bound=15, posix=True)
+def task_killwait(t):
+    """A subagent stops its job, which ignores TERM, and ends its turn
+    while the job is still stopping: once the job is gone, it reports."""
+    r = t.run(timeout=14)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')}")
+    t.check("Stopped my job; done." in r.text(), f"the parent heard: {r.text()!r}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nfallback = {model2}\n"}, bound=15)
+def fallback_limit(t):
+    """The primary is down a while, and its fallback is out of credit: the
+    slow retries go back to the primary rather than end the turn."""
+    r = t.run(env=MINUTE)
+    end = r.last("turn.end")
+    t.check(r.rc == 0 and end.get("why") == "done",
+            f"exit {r.rc}, turn end {end}, retries "
+            f"{[(e['class'], e.get('fallback'), e.get('slow')) for e in r.all('retry')][-4:]}")
+    rt = r.all("retry")
+    t.check(any(e.get("slow") and e.get("model") == t.model for e in rt),
+            f"a slow retry on the primary: {rt[-2:]}")
+    t.check(r.text() == "Back on the primary.", f"text {r.text()!r}")
+
+
+@scenario(bound=30)
+def kv_full(t):
+    """Two sessions on one model whose KV pool holds one context: the
+    first error from the full pool halves the model's concurrency, so
+    both turns end well, rather than fail together again and again."""
+    h = t.headless(env=MINUTE)
+    try:
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        b = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=a, text="go")
+        h.send("prompt", sid=b, text="go")
+        ends = [h.wait(lambda e: e.get("sid") == s and e.get("ev") == "turn.end",
+                       timeout=25) for s in (a, b)]
+    finally:
+        h.close()
+    n = len(t.requests())
+    t.check(all(e["why"] == "done" for e in ends) and n <= 4,
+            f"{n} requests; ends {[(e['why'], e.get('err', '')[:60]) for e in ends]}")
+    notes = [x["text"] for x in h.all("note") if "memory for contexts" in x.get("text", "")]
+    t.check(len(notes) == 1 and "1 request at once" in notes[0], f"noted once: {notes}")
+
+
+@scenario(conf=SMALL, bound=30, alone=True)
+def compact_notice(t):
+    """A job's notice before a compaction's cut: the session opened again
+    rebuilds the history the live one had, without the notice."""
+    bigfiles(t, 8, 160)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    cps = [c for c in r.all("compact") if c["kind"] == "summary"]
+    t.check(len(cps) >= 1, f"a summary: {r.all('compact')}")
+    notices = r.all("notice")
+    t.check(notices and notices[0]["seq"] < cps[0]["cutseq"],
+            f"the notice before the cut: {[x['seq'] for x in notices]}, "
+            f"cut at {cps[0]['cutseq']}")
+    reqs = t.requests()
+    last = chat(reqs[-1])
+    sid = r.events[0].get("sid")
+    r2 = t.run("again", resume=sid)
+    t.check(r2.rc == 0, f"resume exit {r2.rc}: {r2.stderr}")
+    again = chat(t.requests()[len(reqs)])
+    roles = lambda ms: [(m["role"], str(m.get("content"))[:40]) for m in ms]
+    t.check(again[:len(last)] == last,
+            f"the replay differs:\n live {roles(last)[:4]}\n replay {roles(again)[:4]}")
+
+
+@scenario(conf=SMALL, bound=30, alone=True)
+def rate_reopen(t):
+    """The server counts 8 bytes a token, so the session is far below its
+    threshold: opened again, it keeps that calibration, and does not
+    compact as if a token were 4 bytes."""
+    bigfiles(t, 7, 160)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(not r.all("compact"), f"no compaction live: {r.all('compact')}")
+    t.check(all(e["usage"].get("bytes", 0) > 0 for e in r.all("assistant")),
+            "usage records the prompt's bytes")
+    sid = r.events[0].get("sid")
+    r2 = t.run("again", resume=sid)
+    t.check(r2.rc == 0, f"resume exit {r2.rc}: {r2.stderr}")
+    t.check(not r2.all("compact"), f"compacted on reopening: "
+            f"{[(c['kind'], c['before'], c['after']) for c in r2.all('compact')]}")
+
+
+@scenario(bound=20)
+def revive_prefix(t):
+    """A session revived from parking, or opened again, after the
+    configuration changed sends the same prefix as before: its log holds
+    it, and only a compaction may break the prompt cache."""
+    h = t.headless(env=PARK)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="first question")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        r = h.call("config.set", kind="guard", name="", key="roots", value=t.base)
+        t.check(r.get("ok") == 1, f"config.set: {r}")
+        r = h.call("config.set", kind="tools", name="", key="job_timeout", value="7")
+        t.check(r.get("ok") == 1, f"config.set: {r}")
+
+        def entry():
+            h.call("list")
+            return [e for e in h.all("sessions")[-1]["list"] if e["sid"] == sid][0]
+        deadline = time.monotonic() + 5
+        while not entry().get("parked") and time.monotonic() < deadline:
+            time.sleep(0.2)
+        t.check(entry().get("parked") == 1, "parked")
+        h.send("prompt", sid=sid, text="second question")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and
+               e.get("turn") == 2)
+    finally:
+        h.close()
+    t.check(len(h.all("prefix", sid)) == 1, f"one prefix record: {len(h.all('prefix', sid))}")
+    r = t.run("third question", resume=sid)
+    t.check(r.rc == 0, f"resume exit {r.rc}: {r.stderr}")
+    t.check(not r.all("prefix"), "no second prefix record")
+    reqs = t.requests()
+    t.check(len(reqs) == 3, f"three requests: {len(reqs)}")
+    for k in (1, 2):
+        for part in ("messages", "tools"):
+            a, b = reqs[0]["body"][part], reqs[k]["body"][part]
+            if part == "messages":
+                a, b = a[0], b[0]
+            t.check(a == b, f"request {k}'s {part} changed: {str(b)[-120:]!r}")
+
+
+@scenario(conf={"_path": "router1-linger/"}, bound=20)
+def queue_linger(t):
+    """Two sessions on model a, one on b, at a router of one model: the end
+    of A's turn leaves C's model lingering while C runs a tool, so that b
+    does not evict it mid-turn."""
+    h = t.headless()
+    try:
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        c = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        b = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        h.send("prompt", sid=c, text="slowtool")
+        h.wait(lambda e: e.get("sid") == c and e.get("ev") == "live" and
+               e.get("state") == "waiting")
+        h.send("prompt", sid=a, text="quick")
+        h.wait(lambda e: e.get("sid") == a and e.get("ev") == "live" and
+               e.get("state") == "waiting")
+        h.send("prompt", sid=b, text="other")
+        h.wait(lambda e: e.get("sid") == b and e.get("ev") == "live" and
+               e.get("state") == "queued")
+        for s in (a, b, c):
+            end = h.wait(lambda e: e.get("sid") == s and e.get("ev") == "turn.end")
+            t.check(end["why"] == "done", f"{s}: {end}")
+    finally:
+        h.close()
+    one = t.requests()
+    two = t.requests(t.model2)
+    csecond = [x for x in one if any(m.get("role") == "tool"
+                                     for m in x["body"]["messages"])]
+    t.check(len(csecond) == 1 and len(two) == 1, f"requests {len(one)} {len(two)}")
+    t.check(two[0]["t"] >= csecond[0]["t"],
+            f"b went at {two[0]['t'] - one[0]['t']:.2f} s, before C's second step "
+            f"at {csecond[0]['t'] - one[0]['t']:.2f} s, while C's model lingered")
+
+
+@scenario(conf={"_path": "router1-remote/"}, bound=20)
+def queue_remote(t):
+    """A router of one model: a remote model that it only relays takes no
+    model place, so it does not wait behind a local model's swap."""
+    remote = f"fake:queue_remote_c:{t.nonce}"
+    fake_provider.STATE.register(remote, owned_by="remote", status={"value": "loaded"})
+    h = t.headless()
+    try:
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        b = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        c = h.call("new", cwd=t.work, model=remote, endpoint="fake")["sid"]
+        h.send("prompt", sid=a, text="go")
+        h.wait(lambda e: e.get("sid") == a and e.get("ev") == "live" and
+               e.get("state") == "streaming")
+        h.send("prompt", sid=b, text="go")
+        h.wait(lambda e: e.get("sid") == b and e.get("ev") == "live" and
+               e.get("state") == "queued")
+        h.send("prompt", sid=c, text="go")
+        for s in (a, b, c):
+            h.wait(lambda e: e.get("sid") == s and e.get("ev") == "turn.end")
+    finally:
+        h.close()
+    one = t.requests()
+    rem = t.requests(remote)
+    t.check(rem and rem[0]["t"] < one[0]["end"],
+            f"the remote model waited {rem[0]['t'] - one[0]['t']:.2f} s, until the "
+            f"local model's turn ended at {one[0]['end'] - one[0]['t']:.2f} s")
+
+
+@scenario(conf={"_path": "router1-probe-flaky/"}, bound=20)
+def queue_probe(t):
+    """A router of one model whose first /props fails, as one starting
+    up: still one model at a time, and the next request asks again."""
+    h = t.headless()
+    try:
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        b = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        h.send("prompt", sid=a, text="go")
+        h.wait(lambda e: e.get("sid") == a and e.get("ev") == "live" and
+               e.get("state") == "streaming")
+        time.sleep(0.3)
+        h.send("prompt", sid=b, text="go")
+        for s in (a, b):
+            end = h.wait(lambda e: e.get("sid") == s and e.get("ev") == "turn.end")
+            t.check(end["why"] == "done", f"{s}: {end}")
+    finally:
+        h.close()
+    with fake_provider.STATE.lock:
+        peak = fake_provider.STATE.peak.get("router1-probe-flaky")
+        asked = fake_provider.STATE.counts.get("props router1-probe-flaky", 0)
+    t.check(peak == 1, f"models at once: {peak}")
+    t.check(asked >= 2, f"asked again: {asked}")
+
+
+@scenario(conf={"_path": "router1-leave/"}, bound=20)
+def queue_leave(t):
+    """Sessions waiting in line hear of every change in their places: one
+    joining behind them, and one ahead of them leaving the line."""
+    third = f"fake:queue_leave_c:{t.nonce}"
+    fake_provider.STATE.register(third)
+    h = t.headless()
+    try:
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        b = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        c = h.call("new", cwd=t.work, model=third, endpoint="fake")["sid"]
+        h.send("prompt", sid=a, text="go")
+        h.wait(lambda e: e.get("sid") == a and e.get("ev") == "live" and
+               e.get("state") == "streaming")
+        h.send("prompt", sid=b, text="go")
+        h.wait(lambda e: e.get("sid") == b and e.get("ev") == "live" and
+               e.get("state") == "queued")
+        h.send("prompt", sid=c, text="go")
+        h.wait(lambda e: e.get("sid") == c and e.get("ev") == "live" and
+               e.get("state") == "queued")
+        h.wait(lambda e: e.get("sid") == b and e.get("ev") == "live" and
+               e.get("queue_len") == 2, timeout=5)
+        h.call("cancel", sid=b)
+        h.wait(lambda e: e.get("sid") == c and e.get("ev") == "live" and
+               e.get("state") == "queued" and e.get("queue_pos") == 1, timeout=5)
+        for s in (a, c):
+            end = h.wait(lambda e: e.get("sid") == s and e.get("ev") == "turn.end")
+            t.check(end["why"] == "done", f"{s}: {end}")
+    finally:
+        h.close()
+    places = [(e.get("queue_pos"), e.get("queue_len")) for e in h.all("live", c)
+              if e.get("state") == "queued"]
+    t.check(places == [(2, 2), (1, 1)], f"c was told {places}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nfallback = {model2}\n"}, bound=15)
+def slow_target(t):
+    """A slow retry names the next attempt's target: the primary, since
+    the chain starts over from it after a slow wait."""
+    r = t.run(env=MINUTE)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')}")
+    slow = [e for e in r.all("retry") if e.get("slow")]
+    t.check(slow, "a slow retry")
+    i = next(k for k, e in enumerate(r.events) if e is slow[0])
+    nxt = next(e for e in r.events[i:] if e.get("ev") == "attempt")
+    t.check(slow[0]["model"] == nxt["model"] == t.model,
+            f"the slow retry names {slow[0]['model'][-20:]}, "
+            f"the next attempt is on {nxt['model'][-20:]}")
+
+
+# M4 review: the tools
+
+@scenario(bound=15)
+def rewind_dupid(t):
+    """A model that gives every call the same id: each call still gets an
+    id of its own in the session, so that rewinding to the later one, as
+    the GUI's Undo on its row does, leaves the earlier one's file."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        starts = [e["call"] for e in h.all("tool.start", sid)]
+        t.check(len(starts) == 2 and starts[0] == "dup" and starts[1] != "dup",
+                f"call ids {starts}")
+        r = h.call("rewind", sid=sid, to=starts[1])
+        got = [(os.path.basename(f["path"]), f["result"]) for f in r.get("files", [])]
+        t.check(got == [("b.txt", "removed")], f"rewound {got}")
+        t.check(t.file("a.txt") == "A\n" and t.file("b.txt") is None,
+                f"a.txt {t.file('a.txt')!r}, b.txt {t.file('b.txt')!r}")
+    finally:
+        h.close()
+
+
+@scenario(bound=15)
+def rewind_partial(t):
+    """A file the harness wrote, then someone else changed, then the
+    harness edited: rewinding past both puts back the later change only,
+    and says so, rather than call it a conflict left as it was."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+
+        def turn(text, n):
+            h.send("prompt", sid=sid, text=text)
+            h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid
+                   and e.get("turn") == n)
+        turn("first", 1)
+        t.put("f.txt", "ext\n")
+        turn("second", 2)
+        t.check(t.file("f.txt") == "ext2\n", f"edited: {t.file('f.txt')!r}")
+        r = h.call("rewind", sid=sid, to=1)
+        got = [(os.path.basename(f["path"]), f["result"]) for f in r.get("files", [])]
+        t.check(got == [("f.txt", "partial")], f"rewound {got}")
+        t.check(t.file("f.txt") == "ext\n", f"put back in part: {t.file('f.txt')!r}")
+        turn("third", 3)
+        note = [x for x in h.all("notice", sid) if x.get("kind") == "rewind"]
+        t.check(note and "only to before the later changes" in note[-1]["text"],
+                f"the agent is told: {note[-1]['text'] if note else None!r}")
+    finally:
+        h.close()
+
+
+@scenario(conf={"_extra": "[model {model}]\nedit_format = patch\n"}, bound=10)
+def patch_twice(t):
+    """A patch that names one file twice, spelled two ways, is refused
+    rather than lose the first section's changes."""
+    t.put("f.txt", "one\ntwo\nthree\n")
+    r = t.run()
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "error" and "a file appears twice" in end["text"],
+            f"tool.end {end['status']}: {end['text'][:160]!r}")
+    t.check(t.file("f.txt") == "one\ntwo\nthree\n", f"unchanged: {t.file('f.txt')!r}")
+
+
+@scenario(bound=15)
+def job_eof(t):
+    """A command that closed its output and is still running at its
+    timeout: its job ends when it exits, without the wait for output
+    that only leftovers holding the pipe would explain."""
+    r = t.run()
+    je = r.last("job.end")
+    note = r.last("notice").get("text", "")
+    t.check(je.get("status") == "exited" and je.get("ms", 0) < 4500,
+            f"job.end {je}")
+    t.check("kept its output open" not in note, f"the notice: {note[-160:]!r}")
+
+
+@scenario(bound=10, posix=True)
+def instructions_link(t):
+    """An instruction file that imports, through a symlink, a file from
+    outside the project: refused, as any import from outside is."""
+    secret = t.host.join(t.base, "secret.txt")
+    t.host.write(secret, "SECRET-TOKEN-1234\n")
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("AGENTS.md", "Follow @docs/style.md please.\n")
+    t.host.mkdir(t.host.join(t.work, "docs"))
+    os.symlink("../../secret.txt", t.host.join(t.work, "docs", "style.md"))
+    os.symlink("../secret.txt", t.host.join(t.work, "CLAUDE.md"))
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    sysmsg = t.requests()[0]["body"]["messages"][0]["content"]
+    ins = r.last("instructions")
+    t.check("SECRET-TOKEN-1234" not in sysmsg,
+            "a file outside the project reached the system prompt through a symlink")
+    t.check([os.path.basename(f["path"]) for f in ins.get("files", [])] == ["AGENTS.md"] and
+            any(s.endswith("docs/style.md") for s in ins.get("skipped", [])),
+            f"files {ins.get('files')}, skipped {ins.get('skipped')}")
+
+
+@scenario(bound=60, posix=True, alone=True)
+def glob_many(t):
+    """A tree whose list of files passes 8 MiB: glob still finds an old
+    file, since only the files that match are listed."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    name = "x" * 180
+    for d in range(50):
+        dd = t.host.join(t.work, f"dir{d:03d}")
+        os.makedirs(dd, exist_ok=True)
+        for f in range(1000):
+            open(os.path.join(dd, f"{name}{f:05d}.txt"), "w").close()
+    old = t.host.join(t.work, "zzz")
+    os.makedirs(old)
+    p = os.path.join(old, "target.special")
+    open(p, "w").close()
+    os.utime(p, (time.time() - 86400, time.time() - 86400))
+    r = t.run(timeout=50)
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "ok" and "zzz/target.special" in end["text"],
+            f"glob: {end['status']}: {end['text'][:200]!r}")
+
+
+@scenario(bound=15, posix=True)
+def grep_unreadable(t):
+    """A directory that cannot be read (ripgrep exits 2 for it, silently)
+    makes no failed search of a valid pattern."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("main.c", "int main(void) { return 0; }\n")
+    d = t.host.join(t.work, "pgdata")
+    t.host.mkdir(d)
+    t.host.write(t.host.join(d, "x"), "x\n")
+    os.chmod(d, 0)
+    try:
+        r = t.run()
+    finally:
+        os.chmod(d, 0o755)
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "ok" and end["text"].startswith("No lines match"),
+            f"grep: {end['status']}: {end['text']!r}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nedit_format = hashline\n"}, bound=10)
+def edit_hashlong(t):
+    """A hashline replace of a line that read cut short is refused, since
+    it would lose the rest of the line."""
+    long = "var table = [" + ",".join(str(i) for i in range(900)) + "];"
+    t.put("data.js", long + "\nconsole.log(table.length);\n")
+    r = t.run()
+    ends = r.all("tool.end")
+    t.check(ends[1]["status"] == "error" and "bytes long" in ends[1]["text"],
+            f"edit: {ends[1]['status']}: {ends[1]['text'][:200]!r}")
+    t.check(t.file("data.js").split("\n")[0] == long, "the line is whole")
+
+
+def rawlines(r):
+    return [e["raw"] for e in r.events if e.get("ev") == "?"]
+
+
+@scenario(conf=SMALL, bound=30, alone=True)
+def pretty(t):
+    """--pretty tells of retries and compactions, and of instruction files
+    only when there are some."""
+    bigfiles(t, 8, 160)
+    r = t.run(extra=("--pretty",))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    out = rawlines(r)
+    t.check(any(x.startswith("[retry in ") and "HTTP 503: busy a moment" in x
+                for x in out), f"the retry: {out[:6]}")
+    cps = [x for x in out if x.startswith("[compacted: ")]
+    t.check(len(cps) == 1 and "summarized by " + t.model in cps[0] and " -> " in cps[0],
+            f"the compaction: {cps}")
+    t.check(not any(x.startswith("[instructions") for x in out),
+            f"no empty instructions line: {out[:4]}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nfallback = {model2}\n"}, bound=15)
+def pretty_fallback(t):
+    """--pretty names a fallback switched to, and a slow retry's target."""
+    r = t.run(extra=("--pretty",), env=MINUTE)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    out = rawlines(r)
+    t.check(any(x.startswith(f"[switching to fallback 1, {t.model2}: ") for x in out),
+            f"the switch: {[x for x in out if 'fallback' in x][:2]}")
+    t.check(any(x.startswith("[slow retry in ") and f" on {t.model}: " in x
+                for x in out), f"the slow retry: {[x for x in out if 'slow' in x][:2]}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

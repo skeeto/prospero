@@ -680,6 +680,15 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.oldcard", istr(&a, (i64)msgfoot(v, &v->msgs[v->msgs.len-2])), "0");
         expect(t, "panels.undone", istr(&a, rowsnap(v, v->msgs[1].tool)->undone), "1");
         expect(t, "panels.nothing", istr(&a, rewindset(v, &a, {}, 1).len + turnrewinds(v, 1)), "0");
+        // Put back in part: a later change undone, an earlier one kept
+        // for a change made in between, which forcing would undo
+        apply(v, a, R"({"sid":"s","seq":17,"ts":0,"ev":"rewind","to":1,"force":0,)"
+                    R"("files":[{"path":"/w/b","result":"partial"}],"undone":[],"note":""})");
+        c = &v->msgs[v->msgs.len-1];
+        expect(t, "panels.partial", c->text, "- `b`: put back **in part**, to before the "
+               "later changes: something else changed it in between, so the earlier "
+               "ones stay\n");
+        expect(t, "panels.partialforce", istr(&a, c->card->conflicts), "1");
     }
 
     // Compactions as cards: a pruning that marks the rows it elided, and

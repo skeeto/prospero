@@ -41,6 +41,7 @@
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
+    JOBS_PERIOD   = 250000,      // µs between frames showing job output
     CARET_STOP    = 10000000,    // µs after the last key: stop blinking
 };
 
@@ -326,6 +327,7 @@ struct Gui {
     Palette           *pal;        // the theme in effect
     i32                themeset;   // THEME_*, from [ui] theme
     b32                sysdark;    // the system prefers dark
+    b32                syshas;     // the platform said so once
     b32                titleok;    // the window's frame follows the theme
     b32                clickthrough; // an activating click reaches the UI
 
@@ -363,6 +365,9 @@ struct Gui {
     u32                lasthover;  // ImGui's hovered item at the last frame
     i64                lastkey;
     i64                lastcontent;
+    b32                jobsvisible;  // the Jobs window drew last frame
+    b32                jobsdirty;    // job output it has not shown
+    i64                lastjobs;     // when it last showed new output
     Arena              pendmem;    // deltas held back until a content frame
     byte              *pendbase;
     Buf                pending;    // their records, one per line
@@ -438,6 +443,7 @@ struct Gui {
     b32                pauses;
     b32                showdemo;
     b32                firstlayout;
+    i32                jobsfocus;  // frames until the Jobs tab is selected
     b32                resetpending;
     b32                resetlayout;
     b32                openmodal;
@@ -1198,6 +1204,13 @@ static b32 guirecord(Gui *g, Str line)
     if (r.ev==EV_ASK && changed) {
         s->stick = 1;  // an ask needs seeing: scroll to it
     }
+    if (r.ev == EV_JOBOUT) {
+        // Applied, so that the Jobs window is current once shown, but
+        // drawn only while it shows, and a few times a second at most:
+        // a job may print for hours with nobody watching (drainmail)
+        g->jobsdirty |= changed && s==g->sess && g->jobsvisible;
+        return 0;
+    }
     if (s != g->sess) {
         // Only the sidebar shows it, and the rows of its parent's tasks
         return state!=v->state || asks!=v->asks || busy!=v->busy ||
@@ -1225,8 +1238,7 @@ static b32 heldback(Gui *g, Str line)
     }
     Str ev   = cuthead(head, at+6);
     b32 kind = startswith(ev, "delta\"") || startswith(ev, "tool.out\"") ||
-               startswith(ev, "progress\"") || startswith(ev, "live\"") ||
-               startswith(ev, "job.out\"");
+               startswith(ev, "progress\"") || startswith(ev, "live\"");
     return kind && linesid(line)==g->sess->sid;
 }
 
@@ -1872,6 +1884,13 @@ static void drainmail(Gui *g, i64 now)
             schedat(s, g->lastcontent+STREAM_PERIOD, DUE_STREAM);
         }
     }
+    if (g->jobsdirty) {
+        if (now-g->lastjobs >= JOBS_PERIOD) {
+            scheddirty(s);
+        } else {
+            schedat(s, g->lastjobs+JOBS_PERIOD, DUE_STREAM);
+        }
+    }
 }
 
 // The wake flag was cleared: drain the mail, timed, since its work
@@ -1959,6 +1978,11 @@ static void gui_scale(Gui *g, f32 scale)
 // changes. The frame is set each time, so that a new window's is too.
 static void gui_systheme(Gui *g, b32 dark)
 {
+    if (g->syshas && g->sysdark!=dark) {
+        guilog(g, dark ? Str("the system's theme changed to dark")
+                       : Str("the system's theme changed to light"));
+    }
+    g->syshas  = 1;
     g->sysdark = dark;
     applytheme(g);
     g->titleok = os_guitheme(g->os, g->pal->dark);
@@ -2229,6 +2253,10 @@ static void gui_frame(Gui *g)
     if (g->pending.len && s->now-g->lastcontent>=STREAM_PERIOD) {
         flushdeltas(g);
         g->lastcontent = s->now;
+    }
+    if (g->jobsdirty) {
+        g->jobsdirty = 0;  // this frame shows it
+        g->lastjobs  = s->now;
     }
     ImGuiIO &io = ImGui::GetIO();
     if (s->now-g->lastkey >= CARET_STOP) {
@@ -2740,6 +2768,7 @@ enum : i32 {
     T_INFOBTN,     // the session's Info
     T_COMPACTHDR,  // the latest compaction card's header
     T_JOBSTAB,
+    T_LOGTAB,
 };
 
 enum : i32 {
@@ -2824,6 +2853,9 @@ enum : i32 {
     CHK_INFO,
     CHK_QUEUED,
     CHK_FALLBACK,
+    CHK_JOBSTAB,
+    CHK_JOBSDRAWN,
+    CHK_JOBSQUIET,
     CHK_COUNT,
 };
 
@@ -2885,6 +2917,9 @@ static Str chknames[] = {
     "the session's info listed its instruction file",
     "a session queued behind another model, with its place in line",
     "a retry's countdown named the fallback model",
+    "a new layout shows the Jobs tab",
+    "a job's output drawn a few times a second, the Jobs tab shown",
+    "no frames for a job's output, the Jobs tab hidden",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -3082,6 +3117,7 @@ static DriveOp m3ops[] = {
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_ENGINE, 0, 0, 0, ""},
     {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
+    {OP_CHECK, CHK_JOBSTAB, 0, 0, 0, ""},
     {OP_CHECK, CHK_CLICKTHROUGH, 0, 0, 0, ""},
     // Tooltip on a toolbar button, appearing with no event at all
     {OP_MOVE, T_NEWBTN, 0, 0, 1000, ""},
@@ -3327,15 +3363,24 @@ static DriveOp m3ops[] = {
     {OP_SHOT, 0, 0, 0, 300, "9-todo"},
     {OP_WAIT, W_SAID, 0, 0, 10000, "Planned and done."},
     {OP_CHECK, CHK_TODODONE, 0, 0, 0, ""},
-    // Background jobs: one done, one ticking, killed from the panel,
-    // whose end brings the agent back by itself
-    {OP_MOVE, T_JOBSTAB, 0, 0, 100, ""},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 300, ""},
+    // Background jobs: one done, one printing, its output drawn only
+    // while the Jobs tab shows it, and a few times a second at most,
+    // then killed from the panel, whose end brings the agent back by
+    // itself
     {OP_PROMPT, 0, 0, 0, 0, "Start background jobs."},
     {OP_WAIT, W_JOBS, 0, 0, 10000, ""},
     {OP_CHECK, CHK_JOBS, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "10-jobs"},
+    {OP_MARK, 0, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_JOBSDRAWN, 0, 0, 0, ""},
+    {OP_MOVE, T_LOGTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_MARK, 0, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_JOBSQUIET, 0, 0, 0, ""},
+    {OP_MOVE, T_JOBSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_MOVE, T_JOBKILL, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -3841,6 +3886,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_TRANSCRIPTTAB: return tabcenter("Transcript");
     case T_SETTINGSTAB:   return tabcenter("Settings");
     case T_JOBSTAB:       return tabcenter("Jobs");
+    case T_LOGTAB:        return tabcenter("Log");
     case T_BELOW: {
         Rect r = g->rects[RECT_TRANSCRIPT];
         return v2((r.x0+r.x1)/2, r.y1);
@@ -4155,6 +4201,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_HELPTAB:       return tabselected("Help");
     case CHK_TRANSCRIPTTAB: return tabselected("Transcript");
+    case CHK_JOBSTAB:       return tabselected("Jobs") && g->jobsvisible;
     case CHK_NAVWIN:        return c.NavWindowingTarget != 0;
     case CHK_NONAVWIN:      return !c.NavWindowingTarget && c.NavWindowingHighlightAlpha==0;
     case CHK_RESIZED:       return (i32)c.IO.DisplaySize.x == (i32)(1100*winscale(g));
@@ -4448,6 +4495,30 @@ static b32 drivecheck(Gui *g, i32 chk)
             done = v->todos[i].status == VTODO_DONE;
         }
         return done && g->todoshown==3;
+    }
+    case CHK_JOBSDRAWN:
+    case CHK_JOBSQUIET: {
+        // Shown, a frame and its settling (three at most) for each
+        // JOBS_PERIOD, rather than 30 a second; hidden, none. The
+        // metrics, if shown, count each second in a few more.
+        i64   n     = g->total.frames - g->driveframes;
+        i64   us    = g->sched.now - g->markat;
+        i64   other = (g->metricsshown ? 4*us/1000000 : 0) + 2;
+        b32   show  = chk == CHK_JOBSDRAWN;
+        Arena a     = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drive: frames while a job prints, the Jobs tab ");
+        print(&b, show ? Str("shown: ") : Str("hidden: "));
+        print(&b, n);
+        print(&b, " in ");
+        printfloat(&b, (f64)us/1e6, 1);
+        print(&b, " s");
+        guilog(g, finish(&b));
+        if (show) {
+            return tabselected("Jobs") && g->jobsvisible && n>0 &&
+                   n<=3*us/JOBS_PERIOD + other;
+        }
+        return !g->jobsvisible && n<=other;
     }
     case CHK_JOBS: {
         ViewJob *a = findjob(v, 1), *b = findjob(v, 2);

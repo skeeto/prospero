@@ -74,6 +74,7 @@ enum : i64 {
     FUZZ_CHARS    = 6,       // old text needed, in normal form
     FUZZ_LINES    = 20000,   // largest file compared by edit distance
     FUZZ_WANT     = 200,     // most lines of old text so compared
+    FUZZ_WORK     = 50000000,// edit distance cells, at most, in one search
     EDIT_PREVIEWS = 5,       // places shown
     EDIT_PREVIEWW = 80,      // bytes of a line shown in one
     EDIT_KEEPMAX  = 1 << 20, // largest table for finding shared lines
@@ -81,6 +82,7 @@ enum : i64 {
     EDIT_LOOSEMAX = 8 << 20, // largest file matched loosely
     EDIT_LINESMAX = 16 << 20,// largest file edited by line (patch, hashline)
     HASH_EDITS    = 100,     // edits in one hashline call
+    READ_LINEMAX  = 2000,    // bytes of a line read shows, cutting the rest
 };
 
 
@@ -188,7 +190,7 @@ static iz distance(Arena scratch, Str x, Str y, iz limit, b32 fold)
 
 // A file's text as lines, each without its newline but keeping a CR
 // before it, so that lines left alone are written back byte for byte.
-struct Text {
+struct EditText {
     Str        bom;
     Slice<Str> lines;
     Str        tail;   // the last line, if no newline ends it
@@ -196,9 +198,9 @@ struct Text {
     b32        final;  // the last line ends in a newline
 };
 
-static Text splittext(Arena *a, Str data)
+static EditText splittext(Arena *a, Str data)
 {
-    Text r = {};
+    EditText r = {};
     if (startswith(data, "\xef\xbb\xbf")) {
         r.bom = takehead(data, 3);
         data  = cuthead(data, 3);
@@ -221,7 +223,7 @@ static Text splittext(Arena *a, Str data)
 // The text again, with lines changed. The old last line, if no newline
 // ended it, gains the file's ending when lines follow it now; a new
 // last line stays without one, as the old one was.
-static Str jointext(Arena *a, Text *t, Slice<Str> lines)
+static Str jointext(Arena *a, EditText *t, Slice<Str> lines)
 {
     iz size = t->bom.len;
     for (iz i = 0; i < lines.len; i++) {
@@ -244,7 +246,7 @@ static Str jointext(Arena *a, Text *t, Slice<Str> lines)
 
 // A line the agent gave, to add to the file: with a CR if lines there
 // end in CRLF.
-static Str addline(Arena *a, Text *t, Str line)
+static Str addline(Arena *a, EditText *t, Str line)
 {
     return t->crlf ? concat(a, line, "\r") : line;
 }
@@ -360,18 +362,18 @@ static Slice<Str> normlines(Arena *a, Slice<Str> lines, i32 rung)
 
 // Finding text
 
-struct Span {
+struct EditSpan {
     iz beg;
     iz end;
 };
 
-static Slice<Span> matchexact(Arena *a, Str hay, Str needle)
+static Slice<EditSpan> matchexact(Arena *a, Str hay, Str needle)
 {
-    Slice<Span> r = {};
+    Slice<EditSpan> r = {};
     for (iz off = 0; off+needle.len <= hay.len;) {
         iz i = find(cuthead(hay, off), needle);
         if (i < 0) break;
-        Span s = {off+i, off+i+needle.len};
+        EditSpan s = {off+i, off+i+needle.len};
         r = push(a, r, s);
         off = s.end;
     }
@@ -379,9 +381,9 @@ static Slice<Span> matchexact(Arena *a, Str hay, Str needle)
 }
 
 // Code points compared after normcp; spans are bytes of hay.
-static Slice<Span> matchnorm(Arena *a, Str hay, Str needle)
+static Slice<EditSpan> matchnorm(Arena *a, Str hay, Str needle)
 {
-    Slice<Span> r = {};
+    Slice<EditSpan> r = {};
     if (!needle.len) return r;
     for (iz beg = 0; beg < hay.len;) {
         iz i = beg, j = 0;
@@ -394,7 +396,7 @@ static Slice<Span> matchnorm(Arena *a, Str hay, Str needle)
             j = jj;
         }
         if (j == needle.len) {
-            Span s = {beg, i};
+            EditSpan s = {beg, i};
             r = push(a, r, s);
             beg = i;
             continue;
@@ -408,9 +410,9 @@ static Slice<Span> matchnorm(Arena *a, Str hay, Str needle)
 
 // Runs of have's lines equal to want's, not overlapping, as line
 // numbers from 0, end exclusive.
-static Slice<Span> matchrun(Arena *a, Slice<Str> have, Slice<Str> want)
+static Slice<EditSpan> matchrun(Arena *a, Slice<Str> have, Slice<Str> want)
 {
-    Slice<Span> r = {};
+    Slice<EditSpan> r = {};
     if (!want.len) {
         return r;
     }
@@ -421,7 +423,7 @@ static Slice<Span> matchrun(Arena *a, Slice<Str> have, Slice<Str> want)
             i++;
             continue;
         }
-        Span s = {i, i+want.len};
+        EditSpan s = {i, i+want.len};
         r = push(a, r, s);
         i += want.len;
     }
@@ -439,30 +441,45 @@ static b32 blanklines(Slice<Str> lines)
 }
 
 // A run of lines and how alike it is to the text looked for.
-struct Near {
+struct EditNear {
     iz  beg;    // lines from 0, end exclusive
     iz  end;
     i64 score;  // thousandths alike
 };
 
-static b32 nearless(Near *a, Near *b)
+static b32 nearless(EditNear *a, EditNear *b)
 {
     return a->score > b->score;
 }
 
 // How alike a run of have's lines from at is to want's, in thousandths:
 // one less their edit distance over the longer one's length, each line
-// counting one more for its break. Returns 0 once below least.
+// counting one more for its break. Returns 0 once below least, and -1
+// once the work left (edit distance cells) is spent.
 static i64 alike(Arena scratch, Slice<Str> have, iz at, Slice<Str> want,
-                 i64 wlen, i64 hlen, i64 least)
+                 i64 wlen, i64 hlen, i64 least, i64 *work)
 {
     i64 total = wlen>hlen ? wlen : hlen;
     i64 limit = total * (1000 - least) / 1000;
     if (wlen-hlen>limit || hlen-wlen>limit) {
         return 0;
     }
+    // Lines of different lengths are at least that far apart: a cheap
+    // bound that rules out most places before any distance is computed
     i64 d = 0;
     for (iz k = 0; k < want.len; k++) {
+        i64 dl = have[at+k].len - want[k].len;
+        d += dl<0 ? -dl : dl;
+        if (d > limit) {
+            return 0;
+        }
+    }
+    d = 0;
+    for (iz k = 0; k < want.len; k++) {
+        *work -= (i64)have[at+k].len * want[k].len;
+        if (*work < 0) {
+            return -1;
+        }
         d += distance(scratch, have[at+k], want[k], (iz)(limit-d), 0);
         if (d > limit) {
             return 0;
@@ -475,10 +492,12 @@ static i64 alike(Arena scratch, Slice<Str> have, iz at, Slice<Str> want,
 // alike, best first, leaving out any that overlap a better one: enough
 // to show, and one more to tell whether the best is clearly so. Both are
 // lines in the normal form RUNG_NORM. Nothing when want is too short to
-// tell, or either is too long to compare.
-static Slice<Near> nearby(Arena *a, Slice<Str> have, Slice<Str> want, i64 least)
+// tell, or either is too long to compare, or the comparisons would take
+// too long (FUZZ_WORK), since they run on the engine thread.
+static Slice<EditNear> nearby(Arena *a, Slice<Str> have, Slice<Str> want,
+                              i64 least)
 {
-    Slice<Near> r = {};
+    Slice<EditNear> r = {};
     i64 wlen = 0;
     for (iz k = 0; k < want.len; k++) {
         wlen += want[k].len + 1;
@@ -488,19 +507,23 @@ static Slice<Near> nearby(Arena *a, Slice<Str> have, Slice<Str> want, i64 least)
         return r;
     }
     r.cap  = EDIT_PREVIEWS + 1;
-    r.data = alloc<Near>(a, r.cap);
+    r.data = alloc<EditNear>(a, r.cap);
 
     Arena scratch = *a;
     i64  *sums    = alloc<i64>(&scratch, have.len+1);  // line lengths so far
     for (iz i = 0; i < have.len; i++) {
         sums[i+1] = sums[i] + have[i].len + 1;
     }
-    Slice<Near> all = {};
+    Slice<EditNear> all  = {};
+    i64         work = FUZZ_WORK;
     for (iz i = 0; i+want.len <= have.len; i++) {
         i64 hlen  = sums[i+want.len] - sums[i];
-        i64 score = alike(scratch, have, i, want, wlen, hlen, least);
-        if (score >= least) {
-            Near n = {i, i+want.len, score};
+        i64 score = alike(scratch, have, i, want, wlen, hlen, least, &work);
+        if (score < 0) {
+            r.len = 0;
+            return r;  // too much to compare: nothing is guessed
+        } else if (score >= least) {
+            EditNear n = {i, i+want.len, score};
             all = push(&scratch, all, n);
         }
     }
@@ -525,16 +548,16 @@ static Slice<Near> nearby(Arena *a, Slice<Str> have, Slice<Str> want, i64 least)
 // old lines with something on them have, the same on both sides if that
 // ties, else the first. A vote, because one line can mislead: a patch's
 // kept line that lost its marker space looks indented one space less.
-struct Indent {
+struct EditIndent {
     Str from;
     Str to;
 };
 
-static Indent indentpair(Slice<Str> old, Slice<Str> file, iz at)
+static EditIndent indentpair(Slice<Str> old, Slice<Str> file, iz at)
 {
-    Indent r    = {};
-    iz     best = 0;
-    iz     m    = old.len<200 ? old.len : 200;  // enough voters
+    EditIndent r    = {};
+    iz         best = 0;
+    iz         m    = old.len<200 ? old.len : 200;  // enough voters
     for (iz k = 0; k < m; k++) {
         if (!trim(old[k]).len) continue;
         Str from = indentof(old[k]);
@@ -554,7 +577,7 @@ static Indent indentpair(Slice<Str> old, Slice<Str> file, iz at)
     return r;
 }
 
-static Str reindent(Arena *a, Str line, Indent in)
+static Str reindent(Arena *a, Str line, EditIndent in)
 {
     if (in.from==in.to || !startswith(line, in.from) || !trim(line).len) {
         return line;
@@ -566,8 +589,8 @@ static Str reindent(Arena *a, Str line, Indent in)
 // loosely: lines old and now have in common (their longest common
 // subsequence) stay as the file has them, the rest of now is added,
 // indented as the file is, and the rest of old's lines go.
-static Slice<Str> keeplines(Arena *a, Text *t, iz at, Slice<Str> old,
-                            Slice<Str> now, Indent in)
+static Slice<Str> keeplines(Arena *a, EditText *t, iz at, Slice<Str> old,
+                            Slice<Str> now, EditIndent in)
 {
     iz  n    = old.len;
     iz  m    = now.len;
@@ -633,10 +656,10 @@ static void numbered(Buf *b, iz n, Str line, iz width)
 // Places in a file, numbered, each as its lines with one more around
 // it, of its own only the first three and the last: lines are from 0,
 // end exclusive. With scores, each says how alike it is.
-static void previews(Buf *b, Text *t, Slice<Span> at, Slice<i64> scores)
+static void previews(Buf *b, EditText *t, Slice<EditSpan> at, Slice<i64> scores)
 {
     for (iz i = 0; i<at.len && i<EDIT_PREVIEWS; i++) {
-        Span s = at[i];
+        EditSpan s = at[i];
         print(b, (i64)i+1);
         print(b, s.end-s.beg>1 ? Str(". lines ") : Str(". line "));
         print(b, (i64)s.beg+1);
@@ -668,16 +691,16 @@ static void previews(Buf *b, Text *t, Slice<Span> at, Slice<i64> scores)
 }
 
 // Byte spans, in order, as the lines they cover.
-static Slice<Span> spanlines(Arena *a, Str data, Slice<Span> m)
+static Slice<EditSpan> spanlines(Arena *a, Str data, Slice<EditSpan> m)
 {
-    Slice<Span> r    = {};
-    iz          line = 0;  // newlines before off
-    iz          off  = 0;
+    Slice<EditSpan> r    = {};
+    iz              line = 0;  // newlines before off
+    iz              off  = 0;
     for (iz i = 0; i < m.len; i++) {
         for (; off < m[i].beg; off++) {
             line += data[off] == '\n';
         }
-        Span s = {line, line+1};
+        EditSpan s = {line, line+1};
         for (iz k = m[i].beg; k < m[i].end-1; k++) {
             s.end += data[k] == '\n';
         }
@@ -720,7 +743,7 @@ static Str rungnote(i32 rung)
     return "";
 }
 
-static Str ambiguous(Arena *a, Text *t, Str show, Slice<Span> at)
+static Str ambiguous(Arena *a, EditText *t, Str show, Slice<EditSpan> at)
 {
     Buf b(a, 1024);
     print(&b, "old_string matches ");
@@ -741,7 +764,7 @@ static Str ambiguous(Arena *a, Text *t, Str show, Slice<Span> at)
 }
 
 // Splice new text over byte spans.
-static Str splice(Arena *a, Str bom, Str data, Slice<Span> m, Str newstr)
+static Str splice(Arena *a, Str bom, Str data, Slice<EditSpan> m, Str newstr)
 {
     iz grow = 0;
     for (iz i = 0; i < m.len; i++) {
@@ -775,8 +798,8 @@ static Str replaced(Arena *a, Str show, iz n, iz line, Str note)
 
 // The file's lines with each run in m, which want matched loosely,
 // replaced by now as keeplines does, indented as the file is if indent.
-static Slice<Str> relines(Arena *a, Text *t, Slice<Span> m, Slice<Str> want,
-                          Slice<Str> now, b32 indent)
+static Slice<Str> relines(Arena *a, EditText *t, Slice<EditSpan> m,
+                          Slice<Str> want, Slice<Str> now, b32 indent)
 {
     Slice<Str> out  = {};
     iz         last = 0;
@@ -784,7 +807,8 @@ static Slice<Str> relines(Arena *a, Text *t, Slice<Span> m, Slice<Str> want,
         for (iz k = last; k < m[i].beg; k++) {
             out = push(a, out, t->lines[k]);
         }
-        Indent     in   = indent ? indentpair(want, t->lines, m[i].beg) : Indent{};
+        EditIndent in   = indent ? indentpair(want, t->lines, m[i].beg)
+                                 : EditIndent{};
         Slice<Str> kept = keeplines(a, t, m[i].beg, want, now, in);
         for (iz k = 0; k < kept.len; k++) {
             out = push(a, out, kept[k]);
@@ -813,9 +837,9 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
         oldstr = lfcrlf(a, oldstr);
         newstr = lfcrlf(a, newstr);
     }
-    Text t     = splittext(a, data);
-    t.bom      = bom;
-    b32  loose = data.len <= EDIT_LOOSEMAX;
+    EditText t     = splittext(a, data);
+    t.bom          = bom;
+    b32      loose = data.len <= EDIT_LOOSEMAX;
 
     // Whole lines, compared loosely. When old_string does not end in a
     // newline, the newline after the lines it matched stays, as it would
@@ -829,8 +853,8 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
     for (i32 rung = RUNG_EXACT; rung <= RUNG_NORM; rung++) {
         // The bytes, exactly or in normal form, may be part of a line
         if (rung==RUNG_EXACT || (rung==RUNG_NORM && loose)) {
-            Slice<Span> m = rung ? matchnorm(a, data, oldstr)
-                                 : matchexact(a, data, oldstr);
+            Slice<EditSpan> m = rung ? matchnorm(a, data, oldstr)
+                                     : matchexact(a, data, oldstr);
             if (m.len>1 && !all) {
                 r.text = ambiguous(a, &t, show, spanlines(a, data, m));
                 return r;
@@ -843,9 +867,9 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
         if (rung==RUNG_EXACT || !loose || blanklines(want)) {
             continue;
         }
-        Slice<Str>  have  = normlines(a, t.lines, rung);
-        Slice<Str>  wantn = normlines(a, want, rung);
-        Slice<Span> m     = matchrun(a, have, wantn);
+        Slice<Str>      have  = normlines(a, t.lines, rung);
+        Slice<Str>      wantn = normlines(a, want, rung);
+        Slice<EditSpan> m     = matchrun(a, have, wantn);
         if (m.len>1 && !all) {
             r.text = ambiguous(a, &t, show, m);
             return r;
@@ -858,7 +882,7 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
     }
 
     // By edit distance: used only when clearly the place meant
-    Slice<Near> near = {};
+    Slice<EditNear> near = {};
     if (loose) {
         Slice<Str> have  = normlines(a, t.lines, RUNG_FUZZY);
         Slice<Str> wantn = normlines(a, want, RUNG_FUZZY);
@@ -866,9 +890,9 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
     }
     if (!all && near.len && near[0].score>=FUZZ_WIN &&
             (near.len==1 || near[0].score-near[1].score>=FUZZ_LEAD)) {
-        Near        w   = near[0];
-        Slice<Span> one = {};
-        Span        s   = {w.beg, w.end};
+        EditNear        w   = near[0];
+        Slice<EditSpan> one = {};
+        EditSpan        s   = {w.beg, w.end};
         one = push(a, one, s);
         Slice<Str> out = relines(a, &t, one, want, now, 1);
         r.data = jointext(a, &t, out);
@@ -904,10 +928,10 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
                       : Str(", and the places that come close are not "
                             "clearly the one meant"));
         print(&b, ", so nothing was changed. The closest:\n");
-        Slice<Span> at     = {};
-        Slice<i64>  scores = {};
+        Slice<EditSpan> at     = {};
+        Slice<i64>      scores = {};
         for (iz i = 0; i < close; i++) {
-            Span s = {near[i].beg, near[i].end};
+            EditSpan s = {near[i].beg, near[i].end};
             at     = push(a, at, s);
             scores = push(a, scores, near[i].score);
         }
@@ -1010,14 +1034,14 @@ static Str tagof(Str tag)
 // The lines of a file after hashline edits, and where each edit's own
 // lines went among them.
 struct HashOut {
-    Slice<Str>  out;
-    Slice<Span> done;
+    Slice<Str>      out;
+    Slice<EditSpan> done;
 };
 
-static void hashput(Arena *a, Text *t, HashOut *w, Str text)
+static void hashput(Arena *a, EditText *t, HashOut *w, Str text)
 {
     Slice<Str> add = givenlines(a, text);
-    Span       s   = {w->out.len, 0};
+    EditSpan   s   = {w->out.len, 0};
     for (iz i = 0; i < add.len; i++) {
         w->out = push(a, w->out, addline(a, t, add[i]));
     }
@@ -1045,10 +1069,10 @@ static EditOut edithash(Arena *a, Str data, Str show, Str tag, Slice<HashEdit> e
         return r;
     }
 
-    Text t = splittext(a, data);
-    iz   n = t.lines.len;
-    Buf  e(a, 256);
-    iz   issues = 0;
+    EditText t = splittext(a, data);
+    iz       n = t.lines.len;
+    Buf      e(a, 256);
+    iz       issues = 0;
     Slice<HashEdit *> ranges = {};
     Slice<HashEdit *> inserts = {};
     for (iz i = 0; i < edits.len; i++) {
@@ -1076,6 +1100,26 @@ static EditOut edithash(Arena *a, Str data, Str show, Str tag, Slice<HashEdit> e
                 inserts = push(a, inserts, h);
             } else {
                 ranges = push(a, ranges, h);
+            }
+        }
+        // read cut a line this long, so its replacement, as the agent
+        // writes it from what it saw, would lose the rest of the line
+        for (i64 k = h->line; !bad && h->op==HASH_REPLACE && k<=h->end; k++) {
+            iz len = bare(t.lines[(iz)k-1]).len;
+            if (len>READ_LINEMAX && issues++<5) {
+                print(&e, "- edit ");
+                print(&e, (i64)i+1);
+                print(&e, ": line ");
+                print(&e, k);
+                print(&e, " is ");
+                print(&e, (i64)len);
+                print(&e, " bytes long, and read showed only its first ");
+                print(&e, (i64)READ_LINEMAX);
+                print(&e, ", so replacing it would lose the rest: change "
+                          "that line with the shell instead (sed, for "
+                          "example), or delete it and insert all of its "
+                          "new text\n");
+                break;
             }
         }
     }
@@ -1142,8 +1186,8 @@ static EditOut edithash(Arena *a, Str data, Str show, Str tag, Slice<HashEdit> e
             hashput(a, &t, &w, inserts[q]->text);
         }
     }
-    Slice<Str>  out  = w.out;
-    Slice<Span> done = w.done;
+    Slice<Str>      out  = w.out;
+    Slice<EditSpan> done = w.done;
     Str result = jointext(a, &t, out);
     if (result == data) {
         Buf b(a, 128);
@@ -1458,21 +1502,22 @@ static Slice<Str> patchpaths(Arena *a, Str text)
     return r;
 }
 
-struct Seek {
+struct PatchSeek {
     iz  at;    // the line, from 0, or -1 if not found
     i32 rung;  // the pass that found it
 };
 
 // Where want's lines first appear in have's at or after from, by the
 // first of OpenCode's passes that finds them anywhere. Only the last
-// place is tried for the end of the file.
-static Seek seeklines(Arena scratch, Slice<Str> have, iz from, Slice<Str> want, b32 eof)
+// place is tried for the end of the file, and only if not before from.
+static PatchSeek seeklines(Arena scratch, Slice<Str> have, iz from,
+                           Slice<Str> want, b32 eof)
 {
     static i32 const passes[] = {RUNG_EXACT, RUNG_RTRIM, RUNG_TRIM, RUNG_NORM};
-    Seek r = {-1, 0};
-    iz   n = have.len - want.len;
-    iz   i = eof ? n : from;
-    if (n<0 || i<0) {
+    PatchSeek r = {-1, 0};
+    iz        n = have.len - want.len;
+    iz        i = eof ? n : from;
+    if (n<0 || i<0 || i<from) {
         return r;
     }
     for (iz p = 0; p < countof(passes); p++) {
@@ -1494,7 +1539,7 @@ static Seek seeklines(Arena scratch, Slice<Str> have, iz from, Slice<Str> want, 
     return r;
 }
 
-struct Splice {
+struct PatchSplice {
     iz         at;     // file lines from 0
     iz         len;    // lines replaced
     Slice<Str> lines;  // their replacement
@@ -1502,7 +1547,7 @@ struct Splice {
     i32        rung;
 };
 
-static b32 spliceless(Splice *a, Splice *b)
+static b32 spliceless(PatchSplice *a, PatchSplice *b)
 {
     return a->at < b->at;
 }
@@ -1512,17 +1557,17 @@ static b32 spliceless(Splice *a, Splice *b)
 // and why not.
 static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
 {
-    EditOut       r      = {};
-    Text          t      = splittext(a, data);
-    Slice<Splice> sp     = {};
-    iz            cursor = 0;
+    EditOut            r      = {};
+    EditText           t      = splittext(a, data);
+    Slice<PatchSplice> sp     = {};
+    iz                 cursor = 0;
     for (iz hi = 0; hi < f->hunks.len; hi++) {
         PatchHunk *h     = &f->hunks[hi];
         iz         ctxat = -1;  // the line @@ found
         if (h->ctx.data) {
             Slice<Str> one = {};
             one = push(a, one, h->ctx);
-            Seek s = seeklines(*a, t.lines, cursor, one, 0);
+            PatchSeek s = seeklines(*a, t.lines, cursor, one, 0);
             if (s.at < 0) {
                 Buf b(a, 256);
                 print(&b, "hunk ");
@@ -1553,7 +1598,7 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
             if (pl->kind != '+') old = push(a, old, pl->text);
             if (pl->kind != '-') now = push(a, now, pl->text);
         }
-        Splice x = {};
+        PatchSplice x = {};
         x.hunk = (i32)hi;
         if (!old.len) {
             // Only added lines: after the line @@ found, else at the end
@@ -1568,7 +1613,7 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
         // The line after @@ comes before the hunk, but some agents give
         // the hunk's own first line there, so that is tried last
         Slice<PatchLine> hl = h->lines;
-        Seek             s  = seeklines(*a, t.lines, cursor, old, h->eof);
+        PatchSeek        s  = seeklines(*a, t.lines, cursor, old, h->eof);
         if (s.at<0 && ctxat>=0) {
             s = seeklines(*a, t.lines, ctxat, old, h->eof);
         }
@@ -1603,9 +1648,9 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
             }
             print(&b, ". They must be lines of the file, in order, copied "
                       "exactly.");
-            Slice<Str>  have = normlines(a, t.lines, RUNG_FUZZY);
-            Slice<Str>  want = normlines(a, old, RUNG_FUZZY);
-            Slice<Near> near = nearby(a, have, want, FUZZ_SUGGEST);
+            Slice<Str>      have = normlines(a, t.lines, RUNG_FUZZY);
+            Slice<Str>      want = normlines(a, old, RUNG_FUZZY);
+            Slice<EditNear> near = nearby(a, have, want, FUZZ_SUGGEST);
             if (near.len) {
                 print(&b, " The closest text, ");
                 print(&b, near[0].score/10);
@@ -1620,8 +1665,50 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
             return r;
         }
 
+        // Without an @@ line to place it, a hunk must fit one place only,
+        // as the replace format's old_string must: nothing is guessed
+        if (!h->ctx.data && !h->eof) {
+            Slice<Str>      rest = {t.lines.data+cursor, t.lines.len-cursor, 0};
+            Slice<EditSpan> at   = matchrun(a, normlines(a, rest, s.rung),
+                                            normlines(a, old, s.rung));
+            if (at.len > 1) {
+                for (iz k = 0; k < at.len; k++) {
+                    at[k].beg += cursor;
+                    at[k].end += cursor;
+                }
+                Buf b(a, 1024);
+                print(&b, "hunk ");
+                print(&b, (i64)hi+1);
+                print(&b, " of ");
+                print(&b, show);
+                print(&b, " (patch line ");
+                print(&b, h->at);
+                print(&b, "): its kept and removed lines appear at ");
+                print(&b, (i64)at.len);
+                print(&b, " places");
+                if (cursor) {
+                    print(&b, " after line ");
+                    print(&b, (i64)cursor);
+                }
+                print(&b, " (lines");
+                for (iz k = 0; k<at.len && k<10; k++) {
+                    print(&b, k ? Str(", ") : Str(" "));
+                    print(&b, (i64)at[k].beg+1);
+                }
+                print(&b, at.len>10 ? Str(", ...") : Str(""));
+                print(&b, "), so it is not clear which one is meant. Give "
+                          "the hunk an @@ line naming a line just before the "
+                          "place meant, such as the first line of its "
+                          "function, or more context lines. The places:\n");
+                previews(&b, &t, at, {});
+                r.text = finish(&b);
+                return r;
+            }
+        }
+
         // Kept lines stay as the file has them
-        Indent in = s.rung>=RUNG_TRIM ? indentpair(old, t.lines, s.at) : Indent{};
+        EditIndent in = s.rung>=RUNG_TRIM ? indentpair(old, t.lines, s.at)
+                                          : EditIndent{};
         x.at   = s.at;
         x.len  = old.len;
         x.rung = s.rung;
@@ -1639,6 +1726,25 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
     }
 
     sort(sp.data, sp.len, spliceless, *a);
+    for (iz i = 1; i < sp.len; i++) {
+        PatchSplice *p = &sp[i-1], *x = &sp[i];
+        if (x->at < p->at+p->len) {
+            // Two hunks claim the same lines: refused, never spliced
+            Buf b(a, 256);
+            print(&b, "hunks ");
+            print(&b, (i64)(p->hunk<x->hunk ? p->hunk : x->hunk) + 1);
+            print(&b, " and ");
+            print(&b, (i64)(p->hunk<x->hunk ? x->hunk : p->hunk) + 1);
+            print(&b, " of ");
+            print(&b, show);
+            print(&b, " change the same lines, from line ");
+            print(&b, (i64)x->at+1);
+            print(&b, ". Make them one hunk, or give each its own lines, in "
+                      "the order of the file.");
+            r.text = finish(&b);
+            return r;
+        }
+    }
     Slice<Str> out  = {};
     iz         last = 0;
     Buf        note(a, 256);

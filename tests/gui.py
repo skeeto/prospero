@@ -585,8 +585,10 @@ def main():
                     help="the binary, or with --host the .exe on that host")
     ap.add_argument("--subprocess", action="store_true",
                     help="the engine as harness --headless")
-    ap.add_argument("--inbox-cap", type=int, default=32768,
-                    help="the GUI's inbox, small to force lost records")
+    ap.add_argument("--inbox-cap", type=int,
+                    help="the GUI's inbox, small to force lost records (default "
+                         "32768, but the GUI's own for --mode bench, which "
+                         "measures how fast a history arrives)")
     ap.add_argument("--mode", default="drive",
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench"])
@@ -649,7 +651,9 @@ def main():
         guicwd = host.root
         paths = [os.path.relpath(p, guicwd) for p in paths]
     guiargs = [f"--{args.mode}", "-c", paths[0], "--statedir", paths[1],
-               "--cwd", paths[2], "--inbox-cap", str(args.inbox_cap)]
+               "--cwd", paths[2]]
+    if args.inbox_cap or args.mode != "bench":
+        guiargs += ["--inbox-cap", str(args.inbox_cap or 32768)]
     if args.subprocess:
         guiargs.append("--engine=subprocess")
     if args.trace:

@@ -10,9 +10,10 @@
 //
 // A file may import others with @path, relative to itself or with ~ for
 // the home directory, through at most 5 hops, each file once, and never
-// from inside a code span or fenced code. A project's files import only
-// from within the project, so that a repository cannot have the user's
-// other files sent to the model; the user's own file imports anything.
+// from inside a code span or fenced code. A project's files, and what
+// they import, must lie within the project with symlinks resolved, so
+// that a repository cannot have the user's other files sent to the
+// model; the user's own file imports anything.
 // The whole text is capped at 64 KiB, cut at a line, with a note.
 //
 // Files in directories below the working directory load later, when a
@@ -175,8 +176,22 @@ static b32 instrhas(Instructions *r, Str path)
     return 0;
 }
 
-// Load a file and, after it, what it imports. Imports must lie inside
-// that directory, unless it is empty.
+// Whether a file inside a directory, as its path says, is inside it for
+// real, rather than a symlink to somewhere else.
+static b32 instrinside(Os *os, Arena scratch, Str inside, Str path, b32 win)
+{
+    Str real = os_realpath(os, &scratch, path);
+    Str top  = os_realpath(os, &scratch, inside);
+    if (!real.data) {
+        return 0;
+    }
+    real = normpath(&scratch, path, real, win);
+    top  = top.data ? normpath(&scratch, inside, top, win) : inside;
+    return within(top, real, win);
+}
+
+// Load a file and, after it, what it imports. The file and its imports
+// must lie inside that directory, symlinks resolved, unless it is empty.
 static void instrload(Os *os, Arena *a, Instructions *r, Str path,
                       Str importer, Str inside, Str home, i32 hops, b32 win)
 {
@@ -185,6 +200,9 @@ static void instrload(Os *os, Arena *a, Instructions *r, Str path,
     }
     Stat st = os_stat(os, *a, path);
     if (st.type != STAT_FILE) {
+        return;
+    } else if (inside.len && !instrinside(os, *a, inside, path, win)) {
+        r->skipped = push(a, r->skipped, path);
         return;
     }
     Read rd = os_readat(os, a, path, 0, (iz)INSTR_MAX+1);  // more is cut
