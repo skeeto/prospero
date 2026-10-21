@@ -1205,19 +1205,69 @@ static b32 sidafter(GuiSession **a, GuiSession **b)
     return compare((*a)->sid, (*b)->sid) > 0;
 }
 
-// The sessions, newest first, made or opened here and listed.
+static Str sessparent(GuiSession *s)
+{
+    return s->view && s->view->parent.len ? s->view->parent : s->parent;
+}
+
+struct SessTree {
+    Map<Slice<GuiSession *>> *kids;  // by parent sid, oldest first
+    Slice<GuiSession *>       out;
+    Arena                    *a;
+};
+
+static void sessplace(SessTree *t, GuiSession *s, i32 depth)
+{
+    if (s->depth >= 0) {
+        return;
+    }
+    s->depth = depth;
+    t->out   = push(t->a, t->out, s);
+    Slice<GuiSession *> *k = upsert(&t->kids, s->sid, (Arena *)0);
+    for (iz i = 0; k && i<k->len && depth<8; i++) {
+        sessplace(t, (*k)[i], depth+1);
+    }
+}
+
+// The sessions made or opened here and listed, newest first, but each
+// subagent's under its parent's, oldest first, with its depth there.
 static Slice<GuiSession *> sesslist(Gui *g, Arena *a)
 {
-    Slice<GuiSession *> r = {};
+    Slice<GuiSession *> all = {};
     for (GuiSession *s = g->sessions; s; s = s->next) {
         if (s->view || s->listed) {
-            r = push(a, r, s);
+            all = push(a, all, s);
+            s->depth = -1;  // not placed yet
         }
     }
-    if (r.len) {
-        sort(r.data, r.len, sidafter, *a);
+    if (!all.len) {
+        return all;
     }
-    return r;
+    sort(all.data, all.len, sidafter, *a);
+
+    SessTree t = {};
+    t.a = a;
+    Map<GuiSession *> *bysid = 0;
+    for (iz i = 0; i < all.len; i++) {
+        *upsert(&bysid, all[i]->sid, a) = all[i];
+    }
+    for (iz i = all.len-1; i >= 0; i--) {
+        Str p = sessparent(all[i]);
+        if (p.len && upsert(&bysid, p, (Arena *)0)) {
+            Slice<GuiSession *> *k = upsert(&t.kids, p, a);
+            *k = push(a, *k, all[i]);
+        }
+    }
+    for (iz i = 0; i < all.len; i++) {
+        Str p = sessparent(all[i]);
+        if (!p.len || !upsert(&bysid, p, (Arena *)0)) {
+            sessplace(&t, all[i], 0);
+        }
+    }
+    for (iz i = 0; i < all.len; i++) {
+        sessplace(&t, all[i], 0);  // in a cycle of parents
+    }
+    return t.out;
 }
 
 static void drawsessions(Gui *g)
@@ -1254,9 +1304,14 @@ static void drawsessions(Gui *g)
         }
         Str cwd = v && v->cwd.len ? v->cwd : s->cwd;
         ImGui::SetItemTooltip("%s\n%s", cstr0(&a, cwd), cstr0(&a, s->sid));
-        Pen t = {dl, &g->fonts, p.x + 4*sc, p.y + 2*sc, p.x + w, g->fonts.size};
+        f32 x = p.x + 4*sc + (f32)s->depth*14*sc;  // a subagent under its parent
+        Pen t = {dl, &g->fonts, x, p.y + 2*sc, p.x + w, g->fonts.size};
         pen(&t, sesstitle(s), 0, g->pal->text);
-        Pen b = {dl, &g->fonts, p.x + 4*sc, p.y + 2*sc + lineh, p.x + w, small};
+        Pen b = {dl, &g->fonts, x, p.y + 2*sc + lineh, p.x + w, small};
+        if (s->depth && v && v->role.len) {
+            pen(&b, v->role, 0, g->pal->dim);
+            pen(&b, "  ", 0, g->pal->dim);
+        }
         if (s->readonly || (!v && s->locked)) {
             pen(&b, "read-only", STYLE_BOLD, g->pal->amber);
         } else if (v && v->asks) {

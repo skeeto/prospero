@@ -421,8 +421,8 @@ static Str istr(Arena *a, i64 v)
 #include "test/compact_test.cpp"
 #include "test/search_test.cpp"
 #include "test/instructions_test.cpp"
-#include "test/engine_test.cpp"
 #include "test/config_test.cpp"
+#include "test/engine_test.cpp"  // after config's test platform
 #if HARNESS_GUI
 #  include "sched.cpp"
 #  include "highlight.cpp"

@@ -214,15 +214,17 @@ static CfgKey cfgschema[] = {
     {"model", "max_tokens", CFG_INT, "", {}, {}, "sampling",
      "Most tokens in one response, sent only when set"},
 
+    {"role", "description", CFG_STRING, "", {}, {}, "role",
+     "What the role is for, for an agent choosing one for a subagent"},
     {"role", "prompt", CFG_STRING, "", {}, {}, "role",
      "Instructions added to the system prompt"},
     {"role", "endpoint", CFG_STRING, "", {}, {}, "role",
-     "Endpoint for the role, by default the top-level one"},
+     "Endpoint for the role, by default the session's, or a subagent's parent's"},
     {"role", "model", CFG_STRING, "", {}, {}, "role",
-     "Model for the role, by default the top-level one"},
+     "Model for the role, by default the session's, or a subagent's parent's"},
     {"role", "tools", CFG_LIST,
-     "read write edit shell grep glob todo_write jobs job_output job_kill", {},
-     "read write edit shell grep glob todo_write jobs job_output job_kill",
+     "read write edit shell grep glob todo_write jobs job_output job_kill task", {},
+     "read write edit shell grep glob todo_write jobs job_output job_kill task",
      "role", "Tools the role may use"},
 
     {"guard", "roots", CFG_PATHS, "", {}, {}, "guard",
@@ -244,6 +246,9 @@ static CfgKey cfgschema[] = {
      "Windows) and killing it (default: 2, or 3 on Windows)"},
     {"tools", "use_rg", CFG_BOOL, "true", {}, {}, "tools",
      "Search with ripgrep (rg on PATH) when found, else the built-in search"},
+    {"tools", "task_budget", CFG_INT, "200", {}, {}, "tools",
+     "Model requests a subagent may make before it is told to wrap up and "
+     "report; it is stopped at half as many again"},
 
     {"instructions", "files", CFG_STRING, "AGENTS.md CLAUDE.md", {}, {},
      "instructions", "File names to load from each directory, the first "
@@ -528,6 +533,20 @@ static Str cfgget(Config *c, Str kind, Str name, Str key, b32 local)
     if (!e || !trim(e->value).len ||
             cfgjudge(k, e->value, e->file!=c->user)==CFG_BAD) {
         return dflt;
+    }
+    return e->value;
+}
+
+// A named section's setting only where a file sets it, and validly for
+// a schema key: null when unset, empty or bad, for a caller with
+// defaults of its own (a built-in role's).
+static Str cfgown(Config *c, Str kind, Str name, Str key)
+{
+    CfgKey   *k = cfgkey(kind, key);
+    IniEntry *e = name.len ? inilookup(c->ini, kind, name, key) : 0;
+    if (!e || !trim(e->value).len ||
+            (k && cfgjudge(k, e->value, e->file!=c->user)==CFG_BAD)) {
+        return {};
     }
     return e->value;
 }

@@ -32,7 +32,9 @@ Other endpoints:
 Under a path prefix /routerN/, every endpoint above is served as a
 llama.cpp router with --models-max N: /routerN/props reports role
 "router" and max_instances N, and the most different models ever in
-flight at once there is kept (GET /fake/router?prefix=routerN).
+flight at once there is kept (GET /fake/router?prefix=routerN). A
+prefix /routerN-TAG/ is a router of its own, for scenarios that run at
+the same time.
 
 Run it alone with:  uv run tests/fake_provider.py [--port N]
 """
@@ -1039,13 +1041,216 @@ def sc_doublefork(model, n, req):
         yield from answer(model, "Daemonized.")
 
 
+# Subagents and roles. Several conversations share a model here, so a
+# script goes by the conversation (its system prompt, its first user
+# message, the tools it offers) and by its step within it, rather than
+# by the request count.
+
+def system_of(req):
+    msgs = req.get("messages", [])
+    return str(msgs[0].get("content", "")) if msgs and msgs[0].get("role") == "system" else ""
+
+
+def task_prompt(req):
+    """The first user message: a subagent's task."""
+    for m in req.get("messages", []):
+        if m.get("role") == "user":
+            return str(m.get("content", ""))
+    return ""
+
+
+def step(req):
+    """Responses so far in this conversation."""
+    return sum(1 for m in req.get("messages", []) if m.get("role") == "assistant")
+
+
+def tool_names(req):
+    return [t.get("function", {}).get("name") for t in req.get("tools", [])]
+
+
+def tool_results(req):
+    """The results of the last response's calls, in order."""
+    out = []
+    for m in reversed(req.get("messages", [])):
+        if m.get("role") != "tool":
+            break
+        out.insert(0, str(m.get("content", "")))
+    return out
+
+
+def calls(model, n, items, say=None, reason="tool_calls"):
+    """Several calls in one response, [(name, args)], after some text."""
+    yield S.head()
+    if say:
+        yield from text(model, say)
+    for i, (name, args) in enumerate(items):
+        yield from call(model, i, f"call_{n}_{i}", name, args, 2)
+    yield from finish(model, reason)
+
+
+def second(model):
+    """The model of the same run for scenario NAME_b."""
+    parts = model.split(":")
+    parts[1] += "_b"
+    return ":".join(parts)
+
+
+def sc_task_parallel(model, n, req):
+    if step(req) == 0:
+        b = second(model)
+        yield from calls(model, n, [
+            ("task", {"description": "Count a", "prompt": "Look at a.txt.", "model": b}),
+            ("task", {"description": "Count b", "prompt": "Look at b.txt.", "model": b})])
+    else:
+        yield from answer(model, "Both reported: " + " / ".join(tool_results(req)))
+
+
+def sc_task_parallel_b(model, n, req):
+    # Two subagents at once: the first response of each is slow enough
+    # for the other's to start meanwhile
+    which = "a.txt" if "a.txt" in task_prompt(req) else "b.txt"
+    if step(req) == 0:
+        yield S.head()
+        yield S.sleep(0.6)
+        yield from call(model, 0, f"call_{which}", "read", {"path": which})
+        yield from finish(model, "tool_calls")
+    else:
+        lines = len(tool_results(req)[0].strip().splitlines())
+        yield from answer(model, f"Report: {which} has {lines} lines.")
+
+
+def sc_task_depth(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Level 1",
+                                           "prompt": "Level 1: go deeper.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, "Top heard: " + tool_results(req)[0])
+
+
+def sc_task_depth_b(model, n, req):
+    # A subagent (offered task) and its own subagent (not offered it)
+    k = step(req)
+    if "task" in tool_names(req):
+        if k == 0:
+            yield from tool(model, n, "task", {"description": "Level 2",
+                                               "prompt": "Level 2: go deeper still.",
+                                               "model": model})
+        else:
+            yield from answer(model, "Level 1 heard: " + tool_results(req)[0])
+    elif k == 0:
+        yield from tool(model, n, "task", {"description": "Level 3",
+                                           "prompt": "Level 3: too deep."})
+    else:
+        refused = "refused" if "not available" in tool_results(req)[0] else "ran"
+        yield from answer(model, f"Level 2 done; its task was {refused}.")
+
+
+def sc_task_budget(model, n, req):
+    if step(req) == 0:
+        b = second(model)
+        yield from calls(model, n, [
+            ("task", {"description": "Obey", "prompt": "You are obedient.", "model": b}),
+            ("task", {"description": "Defy", "prompt": "You are stubborn.", "model": b})])
+    else:
+        yield from answer(model, "Budgets kept.")
+
+
+def sc_task_budget_b(model, n, req):
+    # Both work without end; the obedient one reports once told to wrap up
+    k = step(req)
+    told = any("Wrap up now" in str(m.get("content", ""))
+               for m in req.get("messages", []) if m.get("role") == "user")
+    if told and "obedient" in task_prompt(req):
+        yield from answer(model, "Obedient final report.")
+    else:
+        yield from calls(model, n, [("read", {"path": "hello.txt", "offset": k + 1})],
+                         say=f"Working on step {k}.")
+
+
+def sc_task_cancel(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Sleep",
+                                           "prompt": "Sleep a long time.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, "Not reached.")
+
+
+def sc_task_cancel_b(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "shell", {"command": "echo $$ >> tree.pids; exec sleep 30",
+                                            "timeout": 60})
+    else:
+        yield from answer(model, "Slept.")
+
+
+def sc_role_tools(model, n, req):
+    sysp = system_of(req)
+    k = step(req)
+    if "# Your role: reader" in sysp:
+        if k == 0:
+            yield from tool(model, n, "write", {"path": "x.txt", "content": "no"})
+        else:
+            yield from answer(model, "Reader done.")
+    elif "# Your role: explore" in sysp:
+        if k == 0:
+            yield from tool(model, n, "shell", {"command": "echo hi > shell.txt"})
+        else:
+            yield from answer(model, "Explore report: " + tool_results(req)[0][:60])
+    elif k == 0:
+        yield from calls(model, n, [
+            ("task", {"description": "Explore", "prompt": "Explore it.", "role": "explore"}),
+            ("task", {"description": "Fast", "prompt": "Be fast.", "role": "fast"}),
+            ("task", {"description": "Nope", "prompt": "No such role.", "role": "nope"})])
+    else:
+        yield from answer(model, "Parent heard: " + " / ".join(tool_results(req)))
+
+
+def sc_role_tools_b(model, n, req):
+    yield from answer(model, "Fast report.")
+
+
+def sc_park_revive(model, n, req):
+    if step(req) == 0:
+        yield from answer(model, "First answer.")
+    else:
+        yield from answer(model, "Second answer.")
+
+
+def sc_task_ask(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Write outside",
+                                           "prompt": "Write the file outside.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, "Parent heard: " + tool_results(req)[0])
+
+
+def sc_task_ask_b(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "write", {"path": "../asked.txt",
+                                            "content": "from the child"})
+    else:
+        status = "wrote it" if tool_results(req)[0].startswith("Created") else "was refused"
+        yield from answer(model, f"The child {status}.")
+
+
+sc_task_unattended = sc_task_ask
+
+
+def sc_task_unattended_b(model, n, req):
+    yield from sc_task_ask_b(model, n, req)
+
+
 # The GUI's checklist (harness gui --drive, run by tests/gui.py): the
 # prompt that began the turn picks the reply, and the step is how many
 # responses the turn has had so far.
 
 GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody",
                "Steer me", "Cancel me", "Close me", "Stream fast", "Stream at 100",
-               "Say hello", "Stall for", "Fail once", "Hold me", "Show the themes")
+               "Say hello", "Stall for", "Fail once", "Hold me", "Show the themes",
+               "Start subagents", "Report as a subagent")
 
 # Most of what the transcript draws, for screenshots of each theme
 GUI_THEMES = """## Before the edit
@@ -1180,6 +1385,15 @@ def sc_gui(model, n, req):
         yield from finish(model)
     elif "Say hello" in prompt:
         yield from answer(model, "Hello!")
+    elif "Start subagents" in prompt:
+        if step == 0:
+            yield from calls(model, n, [
+                ("task", {"description": "First look", "prompt": "Report as a subagent: one."}),
+                ("task", {"description": "Second look", "prompt": "Report as a subagent: two."})])
+        else:
+            yield from answer(model, "Both subagents reported.")
+    elif "Report as a subagent" in prompt:
+        yield from answer(model, "Subagent report: " + prompt[-4:])
     elif "Hold me" in prompt and step == 0:
         # Reasoning of 5 MiB, never repeating itself, collapsed once
         # committed: its record is too big for any mailbox on the way to
@@ -1344,10 +1558,12 @@ class Handler(BaseHTTPRequestHandler):
         STATE.stop.wait(seconds)
 
     def route(self):
-        """The path without a /routerN/ prefix, and the prefix ("" if none)."""
+        """The path without a /routerN/ or /routerN-TAG/ prefix, and the
+        prefix ("" if none)."""
         url = urllib.parse.urlparse(self.path)
         parts = url.path.split("/", 2)
-        if len(parts) > 2 and parts[1].startswith("router") and parts[1][6:].isdigit():
+        if len(parts) > 2 and parts[1].startswith("router") and \
+                parts[1][6:].split("-")[0].isdigit():
             return url, "/" + parts[2], parts[1]
         return url, url.path, ""
 
@@ -1357,7 +1573,8 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/v1/models", "/models"):
             self.send_json(200, models())
         elif path == "/props" and prefix:
-            self.send_json(200, {"role": "router", "max_instances": int(prefix[6:]),
+            self.send_json(200, {"role": "router",
+                                 "max_instances": int(prefix[6:].split("-")[0]),
                                  "models_autoload": True})
         elif path == "/fake/router":
             with STATE.lock:

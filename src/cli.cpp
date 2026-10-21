@@ -16,7 +16,9 @@
 // Nobody answers asks in a run, so they are denied by policy. Over
 // --headless, a frontend that answers them opens sessions attended
 // (attended:1 on new and open), as the GUI's --engine=subprocess will;
-// when its input ends, the engine stops as for quit.
+// when its input ends, the engine stops as for quit. A run prints the
+// records of its subagents' sessions too, as JSONL, but --pretty shows
+// only its own session's.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -28,6 +30,7 @@ static Str cliusage =
 "  -C DIR        working directory (default: the current one)\n"
 "  -e ENDPOINT   endpoint URL or configured name\n"
 "  -m MODEL      model name\n"
+"  -r ROLE       role, a [role] in the configuration (run only)\n"
 "  -c FILE       configuration file\n"
 "  --state DIR   session storage directory\n"
 "  --pretty      readable output instead of JSONL (run only)\n";
@@ -140,6 +143,7 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         Str     name = jsonstr(jsonget(j, "name"));
         Repair  rp   = repairargs(&scratch, jsonstr(jsonget(j, "args")));
         Str     what = name=="shell" ? jsonstr(jsonget(rp.root, "command")) :
+                       name=="task"  ? jsonstr(jsonget(rp.root, "description")) :
                        jsonstr(jsonget(rp.root, "path"));
         print(&b, "$ ");
         print(&b, name);
@@ -285,10 +289,10 @@ static void clirecord(Cli *c, Arena scratch, Str line)
         }
         c->lastseq = r.seq;
     }
-    if (c->pretty) {
-        prettyrecord(c, t, &r);
-    } else {
+    if (!c->pretty) {
         os_print(c->os, 1, line);
+    } else if (c->headless || !r.sid.len || !c->sid.len || r.sid==c->sid) {
+        prettyrecord(c, t, &r);  // not a subagent's
     }
     if (c->headless) {
         return;
@@ -432,7 +436,7 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
     c.block    = -1;
 
     Str dir = {}, endpoint = {}, model = {}, config = {}, state = {}, resume = {};
-    Str prompt = {};
+    Str prompt = {}, role = {};
     for (i32 i = 2; i < nargs; i++) {
         Str a = args[i];
         b32 more = i+1 < nargs;
@@ -442,6 +446,8 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
             endpoint = args[++i];
         } else if (a=="-m" && more) {
             model = args[++i];
+        } else if (a=="-r" && more && !headless) {
+            role = args[++i];
         } else if (a=="-c" && more) {
             config = args[++i];
         } else if (a=="--state" && more) {
@@ -534,6 +540,10 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
         putstr(&w.json, model);
         putkey(&w.json, "endpoint");
         putstr(&w.json, endpoint);
+        if (role.len) {
+            putkey(&w.json, "role");
+            putstr(&w.json, role);
+        }
         putkey(&w.json, "prompt");
         putstr(&w.json, prompt);
         enginecmd(c.e, cuttail(evend(&w), 1));

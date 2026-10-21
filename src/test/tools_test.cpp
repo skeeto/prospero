@@ -162,9 +162,37 @@ static void test_tools(Test *t)
         Str  err = argserror(a, "read", "{}", &bad);
         expect(t, "argserror says how", istr(a, find(err, "Invalid arguments for tool \"read\"")==0 &&
                                                 find(err, "call the tool again")>0), "1");
-        expect(t, "unknown tool alias", istr(a, find(unknowntool(a, "functions.bash"),
+        expect(t, "unknown tool alias", istr(a, find(unknowntool(a, "functions.bash", 0),
                                                      "Did you mean \"shell\"")>0), "1");
-        expect(t, "unknown tool plain", istr(a, find(unknowntool(a, "frobnicate"), "Did you")), "-1");
+        expect(t, "unknown tool plain", istr(a, find(unknowntool(a, "frobnicate", 0), "Did you")), "-1");
+
+        // A role's tools: the rest are unknown, and never suggested
+        u32 deny = tooldeny("read, grep  glob fly");
+        expect(t, "tooldeny", istr(a, deny), istr(a, (((u32)1<<TOOL_COUNT) - 1) &
+               ~((u32)1<<TOOL_READ | (u32)1<<TOOL_GREP | (u32)1<<TOOL_GLOB)));
+        expect(t, "tooldeny all", istr(a, tooldeny("read write edit shell grep glob "
+               "todo_write jobs job_output job_kill task")), "0");
+        expect(t, "tooldeny none", istr(a, tooldeny("")), istr(a, ((u32)1<<TOOL_COUNT) - 1));
+        expect(t, "unknown for the role", unknowntool(a, "write", deny),
+               "The tool \"write\" is not available in this session, so nothing "
+               "was run. The tools are: read, grep, glob.");
+        expect(t, "no alias outside the role", unknowntool(a, "bash", deny),
+               "No tool named \"bash\" is available, so nothing was run. The "
+               "tools are: read, grep, glob.");
+
+        // task: description is forgiven, the prompt is not
+        Args ta = parseargs(a, TOOL_TASK, "{\"description\":\" Find it \","
+                            "\"prompt\":\"Find the parser\",\"role\":\"explore\","
+                            "\"model\":\"\"}");
+        expect(t, "task args", concat(a, concat(a, concat(a, ta.desc, "|"), ta.prompt),
+               concat(a, concat(a, "|", ta.role), concat(a, "|", istr(a, !ta.model.data)))),
+               "Find it|Find the parser|explore|1");
+        expect(t, "task no issues", istr(a, ta.issues.len), "0");
+        Args tb = parseargs(a, TOOL_TASK, "{\"prompt\":\"  \"}");
+        expect(t, "task empty prompt", istr(a, tb.issues.len), "1");
+        Args tc = parseargs(a, TOOL_TASK, "{\"description\":\"x\"}");
+        expect(t, "task no prompt", tc.issues.len ? tc.issues[0] : Str{},
+               "prompt: required string is missing");
     }
 
     // Output cleaning
@@ -297,6 +325,27 @@ static void test_tools(Test *t)
         Json *todo = jsonget(jsonget(jsonat(d.root, TOOL_TODO), "function"), "parameters");
         Json *item = jsonget(jsonget(jsonget(todo, "properties"), "todos"), "items");
         expect(t, "todo schema", jsonstr(jsonget(item, "type")), "object");
+
+        // A role's tools only, and the task tool's roles
+        te.deny     = tooldeny("read glob task");
+        te.roles    = "\n- explore: reads";
+        te.roleenum = "\"enum\":[\"explore\",\"general\"]";
+        JsonDoc r   = jsonparse(a, tooljson(a, &te));
+        Buf     names(a, 128);
+        for (Json *f = r.root->child; f; f = f->next) {
+            print(&names, jsonstr(jsonget(jsonget(f, "function"), "name")));
+            putbyte(&names, ' ');
+        }
+        expect(t, "tooljson for a role", istr(a, r.ok), "1");
+        expect(t, "tooljson role tools", finish(&names), "read glob task ");
+        Json *task = jsonget(jsonat(r.root, 2), "function");
+        Json *role = jsonget(jsonget(jsonget(task, "parameters"), "properties"), "role");
+        expect(t, "task roles enum", istr(a, jsonlen(jsonget(role, "enum"))), "2");
+        expect(t, "task roles described", istr(a, find(jsonstr(jsonget(task, "description")),
+               "Roles:\n- explore: reads")>0), "1");
+        Str sys = systemprompt(a, "/w", &te);
+        expect(t, "system prompt for a role", istr(a, find(sys, "grep and glob")<0 &&
+               find(sys, "todo_write")<0 && find(sys, "subagents")>0), "1");
     }
 
     // Todo lists

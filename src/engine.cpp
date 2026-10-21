@@ -56,6 +56,12 @@
 //   endpoint, and elsewhere cut off as a loop.
 // - Unexpected stops: a final response that announces work it did not
 //   do ("Let me run the tests.") is nudged to continue (provider.cpp).
+// - Subagents: the task tool runs a task in a session of its own, under
+//   a role, concurrently with the rest, and its report is the call's
+//   result. A subagent has a budget of requests, may go two levels
+//   deep, and is cancelled with its parent (see "Roles and subagents").
+// - Parking: a session idle for 7 minutes gives up its memory, and its
+//   next command revives it from its log (see "Idle parking").
 //
 // Asks: a call the guard will not allow by itself (a path outside the
 // workspace) needs the user's approval. A session is attended while a
@@ -103,6 +109,8 @@ enum : i64 {
     LIVE_EVERY   = 1*SEC,         // live records while a request runs
     TITLE_MAX    = 60,            // code points
     SNAPSHOT_MAX = 256 << 10,     // bytes of text in a snapshot
+    PARK_IDLE    = 7*60*SEC,      // idle this long, a session is parked
+    TASK_SOFT    = 200,           // a subagent's requests, by default
 };
 
 enum : i32 {
@@ -115,11 +123,12 @@ enum : i32 {
     S_TOOL,      // a command is running
     S_ASK,       // waiting for the user to answer an ask
     S_QUEUED,    // waiting for its turn at the endpoint
+    S_TASK,      // waiting for subagents to report
 };
 
 static Str statenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "queued",
+    "ask", "queued", "task",
 };
 
 enum : i32 {
@@ -135,6 +144,8 @@ enum : i32 {
     T_LIVE,
     T_ADMIT,     // admitted while queued: send at once
     T_JOBS,      // the next deadline of a background job
+    T_TASK,      // a subagent reported: end the calls that may end
+    T_PARK,      // idle so long: free its memory
     T_COUNT,
 };
 
@@ -271,6 +282,29 @@ struct InstrStamp {
     Str path;
     i64 size;
     i64 mtime;
+};
+
+// A task call and its subagent, while the calls of its response run.
+struct TaskRun {
+    iz  call;    // index into the session's calls
+    Str child;   // the subagent's sid, null if none started
+    i64 start;   // ticks
+    b32 done;    // reported: the result is below
+    Str status;  // of the call's tool.end
+    Str text;
+    Str spill;   // the whole report, when the text was cut
+    i64 bytes;
+};
+
+// A session parked while idle (park): what its log does not hold, for
+// its revival.
+struct Parked {
+    Str sid;
+    Str model;
+    Str which;     // its endpoint, by name or URL
+    iz  lock;      // still held, -1 if none
+    b32 attended;
+    b32 closed;
 };
 
 struct Endpoint {
@@ -449,6 +483,17 @@ struct Session {
     Slice<InstrStamp> instrfiles;  // every file loaded, lazily too
     Instructions instrpend;  // those loaded at the start, to log
     b32          instrlog;   // that record is still to log
+    // Roles and subagents
+    Str          role;       // the role's name, empty if none
+    Str          rolepr;     // its prompt, in the system prompt
+    i32          depth;      // 0 for a session of the user's
+    Str          psid;       // a subagent's parent, else empty
+    Str          pcall;      // and the call that started it
+    Session     *parent;     // the parent, while both are in memory
+    b32          intask;     // the parent waits for this one's report
+    i64          treqs;      // requests made for the task
+    Slice<TaskRun> tasks;    // the subagents of the calls running
+    b32          parkme;     // idle long enough: park it (enginethread)
 };
 
 // Engine functions take scratch by value, so that whatever a caller has
@@ -479,6 +524,7 @@ struct Engine {
     i64         admat;    // ticks: admit again then, 0 if never
     i64         minute;   // ticks of a minute of slow retries (a test
                           // hook, HARNESS_TEST_MINUTE_MS, shortens it)
+    Slice<Parked> parked; // sessions parked, revived by their next command
 };
 
 
@@ -604,6 +650,12 @@ static void live(Session *s)
     } else if (s->state==S_QUEUED && s->point) {
         putintkey(&w.json, "queue_pos", admpos(s->point, s->admid));
         putintkey(&w.json, "queue_len", admlen(s->point));
+    } else if (s->state == S_TASK) {
+        i64 n = 0;
+        for (iz i = 0; i < s->tasks.len; i++) {
+            n += !s->tasks[i].done;
+        }
+        putintkey(&w.json, "tasks", n);  // subagents still at work
     }
     ssend(s, &w);
 }
@@ -619,6 +671,18 @@ static void setstate(Session *s, i32 state)
             disarm(s, T_LIVE);
         }
     }
+}
+
+// Whether a frontend can answer the session's asks: one that has it
+// open attended, or has one of its ancestors so, for a subagent's.
+static b32 attending(Session *s)
+{
+    for (i32 n = 0; s && n<=TASK_DEPTH; s = s->parent, n++) {
+        if (s->attended) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 
@@ -1160,6 +1224,11 @@ static void beginturn(Session *, Arena, Str via);
 static b32  busy(Session *);
 static i32  get32(Str);
 static i64  get64(Str);
+static void starttasks(Session *, Arena);
+static void taskcancel(Session *, Arena);
+static void taskcheck(Session *, Arena, Str why, Str err);
+static b32  taskbudget(Session *, Arena);
+static i64  parkafter(Engine *);
 
 static void resetattempt(Session *s)
 {
@@ -1984,9 +2053,10 @@ static u64 callsethash(Arena scratch, Slice<Block> calls)
 }
 
 // End the current call. A command moved to the background names its
-// job.
+// job, and a task its subagent's session.
 static void toolend(Session *s, Arena scratch, Str status, Str text,
-                    i32 code, b32 hascode, Str spill, i64 bytes, i64 job = 0)
+                    i32 code, b32 hascode, Str spill, i64 bytes, i64 job = 0,
+                    Str child = {})
 {
     Engine *e = s->e;
     Block  *c = &s->calls[s->callidx];
@@ -2005,6 +2075,9 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     if (job) {
         putintkey(&w.json, "job", job);
     }
+    if (child.len) {
+        putstrkey(&w.json, "child", child);
+    }
     putintkey(&w.json, "ms", (os_ticks(e->os) - s->callstart)/MS);
     ssend(s, &w);
 
@@ -2022,9 +2095,9 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     s->callidx++;
 }
 
-static void toolstart(Session *s, Arena scratch)
+static void toolstartat(Session *s, Arena scratch, iz k)
 {
-    Block *c = &s->calls[s->callidx];
+    Block *c = &s->calls[k];
     Buf    b(&scratch, 512 + c->args.len);
     EvOut  w = sbegin(s, &b, EV_TOOLSTART);
     putstrkey(&w.json, "call", c->id);
@@ -2033,8 +2106,13 @@ static void toolstart(Session *s, Arena scratch)
     putstrkey(&w.json, "cwd", s->cwd);
     ssend(s, &w);
     s->callstart = os_ticks(s->e->os);
-    CallMark k = {c->id, s->log.seq, s->turn};
-    s->marks = push(&s->perm, s->marks, k);
+    CallMark m = {c->id, s->log.seq, s->turn};
+    s->marks = push(&s->perm, s->marks, m);
+}
+
+static void toolstart(Session *s, Arena scratch)
+{
+    toolstartat(s, scratch, s->callidx);
 }
 
 
@@ -2382,7 +2460,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     // A steer waiting for the next step answers this ask too: the user
     // has already said what to do instead
     b32 steer = s->steers.len > 0;
-    b32 wait  = s->attended && !steer;
+    b32 wait  = attending(s) && !steer;
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait) {
         // The deadline runs from now: the record's fsync, which a slow
@@ -2720,6 +2798,7 @@ static void jobend(Session *s, Arena scratch, Job *j)
              "session already resumed by itself as often as allowed "
              "([tools] auto_resume); the agent hears of it at the next prompt");
     }
+    taskcheck(s, scratch, "done", {});  // a subagent waiting for its jobs
 }
 
 static void jobrecord(Session *s, Arena scratch, Job *j, Record r)
@@ -3255,7 +3334,9 @@ static b32 runtool(Session *s, Arena scratch)
     Block  *c    = &s->calls[s->callidx];
     i32     tool = toolfind(c->name);
     Args    args = {};
-    if (tool != TOOL_NONE) {
+    if (!tooloffered(&s->te, tool)) {
+        tool = TOOL_NONE;  // one the role leaves out is unknown
+    } else {
         args = parseargs(&scratch, tool, c->args);
     }
 
@@ -3287,7 +3368,7 @@ static b32 runtool(Session *s, Arena scratch)
     }
 
     if (tool == TOOL_NONE) {
-        Str text = unknowntool(&scratch, c->name);
+        Str text = unknowntool(&scratch, c->name, s->te.deny);
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
         return 1;
     }
@@ -3308,6 +3389,7 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_JOBS:    tooljobs(s, scratch);           return 1;
     case TOOL_JOBOUT:  tooljobout(s, scratch, &args);  return 1;
     case TOOL_JOBKILL: tooljobkill(s, scratch, &args); return 1;
+    case TOOL_TASK:    assert(0);  // starttasks has these
     }
     if (args.background) {
         startjob(s, scratch, &args);
@@ -3362,7 +3444,7 @@ static void nexttool(Session *s, Arena scratch)
 {
     while (s->callidx < s->calls.len) {
         Arena a = scratch;
-        if (s->state == S_TOOL) {
+        if (s->state==S_TOOL || s->state==S_TASK) {
             return;  // a call already runs (one an answer allowed)
         }
         if (s->cancelled) {
@@ -3370,6 +3452,11 @@ static void nexttool(Session *s, Arena scratch)
             toolend(s, a, "cancelled", "Not run: the user cancelled the turn.",
                     0, 0, {}, 0);
             continue;
+        }
+        if (s->calls[s->callidx].name=="task" && !s->blocked &&
+                tooloffered(&s->te, TOOL_TASK)) {
+            starttasks(s, a);  // they end as their subagents report
+            return;
         }
         if (!runtool(s, a)) {
             return;  // a command is running
@@ -3738,6 +3825,8 @@ static void prepare(Session *s, Arena scratch)
     if (s->cancelled) {
         endturn(s, scratch, "cancel", {});
         return;
+    } else if (s->intask && !taskbudget(s, scratch)) {
+        return;
     }
     deliver(s, scratch);
     s->wake = 0;
@@ -3906,6 +3995,10 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     } else if (resume) {
         autoresume(s, scratch);
     }
+    if (!busy(s)) {
+        arm(s, T_PARK, parkafter(s->e));
+    }
+    taskcheck(s, scratch, why, err);
 }
 
 static b32 busy(Session *s)
@@ -3929,6 +4022,9 @@ static void cancelturn(Session *s, Arena scratch)
         resolve(s, scratch, 0, DENY_CANCEL, {});
         nexttool(s, scratch);
         return;
+    case S_TASK:
+        taskcancel(s, scratch);
+        return;  // the calls end as the subagents report, then the turn
     case S_HEAD:
     case S_STREAM:
     case S_ERRBODY:
@@ -4158,16 +4254,37 @@ static void instrlogstart(Session *s, Arena scratch)
     }
 }
 
+static void taskroles(Engine *, Arena *, Arena, ToolEnv *);
+
 static void sessionready(Session *s, Arena scratch)
 {
     Engine *e = s->e;
     jobconf(s);
     instrstart(s, scratch);
+    if (tooloffered(&s->te, TOOL_TASK)) {
+        taskroles(e, &s->perm, scratch, &s->te);
+    }
     s->home      = s->ep.name.len ? s->ep.name : s->ep.url;
     s->homemodel = s->model;
     s->system    = systemprompt(&s->perm, s->cwd, &s->te);
-    s->tools  = tooljson(&s->perm, &s->te);
-    s->guard  = sessionguard(s, &s->perm);
+    s->tools     = tooljson(&s->perm, &s->te);
+    s->guard     = sessionguard(s, &s->perm);
+    if (s->rolepr.len) {
+        s->system = concat(&s->perm, s->system, "\n\n# Your role: ");
+        s->system = concat(&s->perm, s->system, s->role);
+        s->system = concat(&s->perm, s->system, "\n\n");
+        s->system = concat(&s->perm, s->system, s->rolepr);
+    }
+    if (s->depth) {
+        s->system = concat(&s->perm, s->system,
+            "\n\n# Subagent\n\nYou are a subagent: another agent gave you "
+            "the task in the first message, and waits for your report, "
+            "which is your final response. It sees nothing else of your "
+            "work, and it cannot answer questions, so do not ask any. Do "
+            "the task, then report what you did and found: the facts, file "
+            "paths and details it needs, and anything you could not do. "
+            "When you are told to wrap up, finish at once with your report.");
+    }
     // Tell the agent about the other places it may work
     Buf b(&s->perm, 256);
     for (iz i = 1; i < s->guard.roots.len; i++) {
@@ -4194,6 +4311,631 @@ static void sessionready(Session *s, Arena scratch)
     }
     s->next = e->sessions;
     e->sessions = s;
+
+    // Subagents and their parents, as far as both are in memory
+    s->parent = s->psid.len ? findsession(e, s->psid) : 0;
+    for (Session *t = s->next; t; t = t->next) {
+        t->parent = t->psid==s->sid ? s : t->parent;
+    }
+    arm(s, T_PARK, parkafter(e));
+}
+
+// A new session id, unlike any other in the state directory: two made
+// in the same second differ only by chance.
+static Str freshsid(Engine *e, Arena *a)
+{
+    Str dir = join(a, e->statedir, "sessions");
+    for (i32 i = 0;; i++) {
+        Str sid  = newsid(e->os, a);
+        Str path = join(a, dir, sid);
+        if (i==16 || (os_stat(e->os, *a, path).type==STAT_MISSING &&
+                      !findsession(e, sid))) {
+            return sid;  // after 16 tries, the random source is broken
+        }
+    }
+}
+
+// Make a new session's directory, lock it and open its log. Returns why
+// it could not, or null.
+static Str opensession(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    if (!os_mkdirs(e->os, scratch, s->outdir)) {
+        return "cannot create the session directory";
+    }
+    Str lock = lockpath(&scratch, s);
+    s->lock = os_lockfile(e->os, scratch, lock);
+    if (s->lock < 0) {
+        return "cannot lock the new session";
+    }
+    Str path = join(&scratch, s->dir, "events.jsonl");
+    s->log = logopen(e->os, &s->perm, scratch, path, s->sid, LOG_MAX);
+    if (!s->log.ok) {
+        return "cannot open the session log";
+    }
+    return {};
+}
+
+// The session record, always seq 1. A role's prompt and tools are kept
+// in it, and a subagent's parent, so that the session is the same when
+// it is opened again, whatever the configuration says then.
+static void logsession(Session *s, Arena scratch)
+{
+    Buf   b(&scratch, 1024 + s->rolepr.len);
+    EvOut w = sbegin(s, &b, EV_SESSION);
+    putintkey(&w.json, "proto", 0);
+    putstrkey(&w.json, "version", HARNESS_VERSION);
+    putstrkey(&w.json, "cwd", s->cwd);
+    putstrkey(&w.json, "role", s->role);
+    putstrkey(&w.json, "model", s->model);
+    putstrkey(&w.json, "endpoint", s->ep.url);
+    if (s->roots.len) {
+        putkey(&w.json, "roots");
+        putarray(&w.json);
+        for (iz i = 0; i < s->roots.len; i++) {
+            putstr(&w.json, s->roots[i]);
+        }
+        putend(&w.json);
+    }
+    if (s->psid.len) {
+        putstrkey(&w.json, "parent", s->psid);
+        putstrkey(&w.json, "call", s->pcall);
+        putintkey(&w.json, "depth", s->depth);
+    }
+    if (s->te.deny) {
+        putkey(&w.json, "tools");
+        putarray(&w.json);
+        for (i32 t = 0; t < TOOL_COUNT; t++) {
+            if (tooloffered(&s->te, t)) {
+                putstr(&w.json, toolnames[t]);
+            }
+        }
+        putend(&w.json);
+    }
+    if (s->rolepr.len) {
+        putstrkey(&w.json, "prompt", s->rolepr);
+    }
+    ssend(s, &w);
+}
+
+
+// Roles and subagents
+//
+// A role ([role NAME]) is a prompt, a model, an endpoint and a set of
+// tools for one kind of work. A session started with one (new {role})
+// has the prompt in its system prompt and offers only the role's tools,
+// a call to another being an unknown tool's. The roles explore and
+// general are built in, as defaults for whatever a section of the same
+// name leaves out.
+//
+// The task tool starts a subagent: a session of its own in this engine,
+// whose turn runs the task's prompt under a role (general unless one is
+// named), with the role's model, else the parent's. Its requests wait
+// their turn at their endpoint with everyone's (admit.cpp). The task
+// calls of a response that come in a row start at once (starttasks),
+// and end in order as their subagents report (taskflush). A report is
+// the subagent's last response: the end of its turn, and of any turns
+// its background jobs start by ending while it waits for them. Cancelling
+// the parent cancels its subagents. A subagent is attended while its
+// parent is: its asks reach the frontend as any session's, and else its
+// policy denies them. A subagent may start subagents too, but theirs
+// (TASK_DEPTH) get no task tool. At [tools] task_budget requests it is
+// told to wrap up, and at half as many again it is stopped, and reports
+// what it last said.
+
+struct Role {
+    Str name;
+    Str desc;
+    Str prompt;
+    Str model;     // empty for the session's own, or the parent's
+    Str endpoint;
+    u32 deny;      // tools not offered
+    b32 ok;
+};
+
+static struct {
+    Str name;
+    Str desc;
+    Str prompt;
+    Str tools;     // null for every tool
+} builtinroles[] = {
+    {
+        "explore",
+        "Finds and reads code to answer a question, and reports what it "
+        "found; it cannot change files or run commands",
+        "Explore the code to answer the question you were given: find what "
+        "is relevant with grep and glob, read it, and report what you "
+        "found, with file paths and line numbers. You can only read: you "
+        "cannot change files or run commands.",
+        "read grep glob",
+    },
+    {
+        "general",
+        "Does any task, with every tool",
+        "",
+        {},
+    },
+};
+
+// A role by name: a [role NAME] section's settings, over a built-in
+// role's for the keys the section leaves out. Not ok if there is no
+// such role. The strings may be the configuration's, until it reloads.
+static Role findrole(Engine *e, Str name)
+{
+    Role r = {};
+    i32  b = -1;
+    for (i32 i = 0; i < countof(builtinroles); i++) {
+        b = builtinroles[i].name==name ? i : b;
+    }
+    if (!name.len || (b<0 && !inisection(e->ini, "role", name))) {
+        return r;
+    }
+    Config *c     = e->cfg;
+    Str     desc  = cfgown(c, "role", name, "description");
+    Str     pr    = cfgown(c, "role", name, "prompt");
+    Str     tools = cfgown(c, "role", name, "tools");
+    if (!tools.data) {
+        tools = b>=0 && builtinroles[b].tools.data ? builtinroles[b].tools
+                                                   : cfgget(c, "role", name, "tools", 0);
+    }
+    r.name     = name;
+    r.desc     = desc.data ? trim(desc) : b>=0 ? builtinroles[b].desc : Str{};
+    r.prompt   = pr.data ? trim(pr) : b>=0 ? builtinroles[b].prompt : Str{};
+    r.model    = trim(cfgget(c, "role", name, "model", 0));
+    r.endpoint = trim(cfgget(c, "role", name, "endpoint", 0));
+    r.deny     = tooldeny(tools);
+    r.ok       = 1;
+    return r;
+}
+
+// The roles a task may give, for the task tool's description and its
+// enum: the built-in ones, then the configuration's in its order.
+static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
+{
+    Slice<Str> names = {};
+    for (i32 i = 0; i < countof(builtinroles); i++) {
+        names = push(&scratch, names, builtinroles[i].name);
+    }
+    for (IniSection *s = inifirst(e->ini, "role"); s; s = ininext(s)) {
+        b32 seen = !s->name.len;
+        for (iz i = 0; i < names.len; i++) {
+            seen |= names[i] == s->name;
+        }
+        if (!seen) {
+            names = push(&scratch, names, s->name);
+        }
+    }
+
+    Buf text(&scratch, 1024);
+    for (iz i = 0; i < names.len; i++) {
+        Role r = findrole(e, names[i]);
+        print(&text, "\n- ");
+        print(&text, r.name);
+        print(&text, ": ");
+        print(&text, r.desc.len ? utf8head(r.desc, 300) : Str("(no description)"));
+        if (!r.deny) {
+            print(&text, " (every tool)");
+            continue;
+        }
+        print(&text, " (tools:");
+        b32 any = 0;
+        for (i32 t = 0; t < TOOL_COUNT; t++) {
+            if (!(r.deny>>t & 1)) {
+                print(&text, any ? Str(", ") : Str(" "));
+                print(&text, toolnames[t]);
+                any = 1;
+            }
+        }
+        print(&text, any ? Str(")") : Str(" none)"));
+    }
+    te->roles = clone(perm, finish(&text));
+
+    Buf     en(&scratch, 256);
+    JsonOut w = {&en};
+    print(&en, "\"enum\":");
+    putarray(&w);
+    for (iz i = 0; i < names.len; i++) {
+        putstr(&w, names[i]);
+    }
+    putend(&w);
+    te->roleenum = clone(perm, finish(&en));
+}
+
+// The session for task call k, its turn not begun. Null if it cannot be
+// made, with why in *err, in the parent's arena.
+static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
+{
+    Engine *e    = p->e;
+    Block  *c    = &p->calls[k];
+    Str     name = args->role.len ? args->role : Str("general");
+    Role    r    = findrole(e, name);
+    if (!r.ok) {
+        Buf b(&p->perm, 256);
+        print(&b, "No role is named \"");
+        print(&b, name);
+        print(&b, "\", so no subagent was started. Give one of the roles "
+                  "that the task tool lists, or none for general.");
+        *err = finish(&b);
+        return 0;
+    }
+
+    // An explicit model, else the role's, else the parent's own: at the
+    // role's endpoint, else the parent's, unless it is ENDPOINT/MODEL
+    Str model = args->model.len ? args->model :
+                r.model.len     ? r.model     : p->homemodel;
+    Str which = r.endpoint.len ? r.endpoint : p->home;
+    Cut em    = cut(args->model, '/');
+    if (args->model.len && em.ok && em.tail.len &&
+            trim(cfgget(e->cfg, "endpoint", em.head, "url", 0)).len) {
+        which = em.head;
+        model = em.tail;
+    }
+    Endpoint probe = {};
+    if (!endpointconf(e, &scratch, which, &probe)) {
+        Buf b(&p->perm, 256);
+        print(&b, "No subagent was started: its endpoint, \"");
+        print(&b, which);
+        print(&b, "\", is neither a URL nor a configured endpoint.");
+        *err = finish(&b);
+        return 0;
+    }
+
+    Str      sid = freshsid(e, &scratch);
+    Session *s   = newsession(e, scratch, sid);
+    if (!s) {
+        *err = "No subagent was started: the harness is out of memory.";
+        return 0;
+    }
+    s->cwd = clone(&s->perm, p->cwd);
+    for (iz i = 0; i < p->roots.len; i++) {
+        s->roots = push(&s->perm, s->roots, clone(&s->perm, p->roots[i]));
+    }
+    s->model = clone(&s->perm, model);
+    endpointconf(e, &s->perm, which, &s->ep);
+    modelconf(e, &s->perm, s->model, &s->mc);
+    s->role    = clone(&s->perm, r.name);
+    s->rolepr  = clone(&s->perm, r.prompt);
+    s->depth   = p->depth + 1;
+    s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0);
+    s->psid    = clone(&s->perm, p->sid);
+    s->pcall   = clone(&s->perm, c->id);
+    s->intask  = 1;
+    Str why = opensession(s, scratch);
+    if (why.data) {
+        dropsession(e, s);
+        *err = concat(&p->perm, "No subagent was started: ", why);
+        return 0;
+    }
+    sessionready(s, scratch);
+    logsession(s, scratch);
+    instrlogstart(s, scratch);
+    // Complete before scratch is passed on, which copies it
+    Str title = maketitle(&scratch, args->desc.len ? args->desc : args->prompt);
+    settitle(s, scratch, title);
+    return s;
+}
+
+// Start the subagents of the task calls from the current one on, up to
+// the first other call: each in a session of its own, all at once. Each
+// call is logged as starting before its subagent exists.
+static void starttasks(Session *s, Arena scratch)
+{
+    Engine *e   = s->e;
+    iz      end = s->callidx;
+    for (; end<s->calls.len && s->calls[end].name=="task"; end++) {}
+
+    // The next step waits for every report: its model need not linger
+    if (s->point) {
+        admcool(s->point, s->slotmodel);
+        pump(e, s->point);
+    }
+    s->tasks = {};
+    for (iz k = s->callidx; k < end; k++) {
+        Arena a = scratch;
+        toolstartat(s, a, k);
+        TaskRun t = {};
+        t.call  = k;
+        t.start = os_ticks(e->os);
+        Args     args = parseargs(&a, TOOL_TASK, s->calls[k].args);
+        Session *c    = 0;
+        if (args.issues.len) {
+            t.text = argserror(&s->perm, "task", s->calls[k].args, &args);
+        } else if (k-s->callidx >= TASK_BATCH) {
+            t.text = "Not started: one response may start at most 16 "
+                     "subagents. Start the rest once these have reported.";
+        } else {
+            c = newchild(s, a, k, &args, &t.text);
+        }
+        if (c) {
+            t.child = clone(&s->perm, c->sid);
+        } else {
+            t.done   = 1;
+            t.status = "error";
+        }
+        s->tasks = push(&s->perm, s->tasks, t);
+        if (c) {
+            startturn(c, a, args.prompt, "task");
+        }
+    }
+    setstate(s, S_TASK);
+    arm(s, T_TASK, 0);  // calls that started nothing end now
+}
+
+// A session's last response with text in it: a subagent's report.
+static Str lastreport(Session *s, Arena *a)
+{
+    for (iz i = s->history.len-1; i >= 0; i--) {
+        Msg *m   = &s->history[i];
+        b32  any = 0;
+        for (iz k = 0; m->role==ROLE_ASSISTANT && k<m->blocks.len; k++) {
+            any |= m->blocks[k].type==BLOCK_TEXT && trim(m->blocks[k].text).len;
+        }
+        if (!any) {
+            continue;
+        }
+        Buf b(a, 1024);
+        for (iz k = 0; k < m->blocks.len; k++) {
+            if (m->blocks[k].type == BLOCK_TEXT) {
+                print(&b, m->blocks[k].text);
+            }
+        }
+        return trim(finish(&b));
+    }
+    return {};
+}
+
+// A subagent is done with its task: its report goes to the parent's
+// call, which ends once the calls before it have (taskflush). why and
+// err are as its last turn ended.
+static void taskreport(Session *c, Arena scratch, Str why, Str err)
+{
+    c->intask = 0;
+    Session *p = c->parent;
+    TaskRun *t = 0;
+    for (iz i = 0; p && i<p->tasks.len; i++) {
+        t = p->tasks[i].child==c->sid ? &p->tasks[i] : t;
+    }
+    if (!t || t->done) {
+        return;  // its parent stopped waiting (cancelled, or quit)
+    }
+
+    Str report = lastreport(c, &scratch);
+    Buf b(&scratch, 512 + report.len + err.len);
+    t->status = "ok";
+    if (why == "done") {
+        print(&b, report.len ? report : Str("The subagent ended its turn "
+                                            "without a report."));
+    } else if (why == "cancel") {
+        t->status = "cancelled";
+        print(&b, "The subagent was cancelled before it finished.");
+    } else if (why == "budget") {
+        t->status = "error";
+        print(&b, "The subagent was stopped before it finished, at the end "
+                  "of its budget of ");
+        print(&b, c->treqs - 1);
+        print(&b, " model requests.");
+    } else {
+        t->status = "error";
+        print(&b, "The subagent stopped before it finished, on an error: ");
+        print(&b, err.len ? err : why);
+    }
+    if (why!="done" && report.len) {
+        print(&b, " What it said last:\n\n");
+        print(&b, report);
+    }
+    Str text = finish(&b);
+
+    if (text.len > TASK_REPORT) {
+        // All of it in a file the agent may read, and the start inline
+        Engine *e    = p->e;
+        Str     rel  = {};
+        Str     path = spillfile(p, scratch, p->calls[t->call].id, &rel);
+        Str     head = utf8head(text, TASK_REPORT);
+        Buf     in(&scratch, head.len + 256 + path.len);
+        print(&in, head);
+        if (os_write(e->os, scratch, path, text)) {
+            t->spill = rel;
+            t->bytes = text.len;
+            print(&in, "\n\n[The report goes on: it was cut here at 50 KiB. "
+                       "All of it is in ");
+            print(&in, path);
+            print(&in, ", where this part ends at line ");
+            print(&in, countlines(head));
+            print(&in, ".]");
+        } else {
+            print(&in, "\n\n[The report goes on, but it was cut here at "
+                       "50 KiB.]");
+        }
+        text = finish(&in);
+    }
+    t->text = clone(&p->perm, text);
+    t->done = 1;
+    arm(p, T_TASK, 0);
+    live(p);  // one fewer at work
+}
+
+// A subagent's turn ended: its task did too, unless it ended well with
+// background jobs running, whose ends will start the next turn. Once it
+// reports, any jobs it left are stopped.
+static void taskcheck(Session *s, Arena scratch, Str why, Str err)
+{
+    if (!s->intask || busy(s)) {
+        return;
+    } else if (why=="done" && jobsrunning(s) && canresume(s)) {
+        return;
+    }
+    stopjobs(s, scratch, s->e->quitting);
+    taskreport(s, scratch, why, err);
+}
+
+// End the task calls whose subagents have reported, in order, and once
+// they all have, go on with the calls after them.
+static void taskflush(Session *s, Arena scratch)
+{
+    if (s->state != S_TASK) {
+        return;
+    }
+    while (s->callidx < s->calls.len) {
+        iz i = s->callidx - s->tasks[0].call;
+        if (i >= s->tasks.len || !s->tasks[i].done) {
+            break;
+        }
+        Arena    a = scratch;
+        TaskRun *t = &s->tasks[i];
+        s->callstart = t->start;
+        toolend(s, a, t->status, t->text, 0, 0, t->spill, t->bytes, 0, t->child);
+    }
+    for (iz i = 0; i < s->tasks.len; i++) {
+        if (!s->tasks[i].done) {
+            return;
+        }
+    }
+    s->tasks = {};
+    setstate(s, S_IDLE);
+    nexttool(s, scratch);
+}
+
+// Cancel the subagents still at work: each reports at once, and their
+// calls end as they do.
+static void taskcancel(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    for (iz i = 0; i < s->tasks.len; i++) {
+        Session *c = s->tasks[i].done ? 0 : findsession(e, s->tasks[i].child);
+        if (!c) {
+            continue;
+        }
+        Arena a = scratch;
+        cancelturn(c, a);
+        if (c->intask && !busy(c)) {
+            // It waited for its background jobs
+            stopjobs(c, a, e->quitting);
+            taskreport(c, a, "cancel", {});
+        }
+    }
+}
+
+// Count a subagent's request against its budget: a notice to wrap up at
+// [tools] task_budget, then at half as many again the end of its turn.
+// Returns 0 if the turn ended.
+static b32 taskbudget(Session *s, Arena scratch)
+{
+    i64 soft = confint(s->e->cfg, "tools", "", "task_budget");
+    soft = soft ? soft : TASK_SOFT;
+    i64 hard = soft + soft/2;
+    if (++s->treqs > hard) {
+        Buf b(&scratch, 128);
+        print(&b, "the subagent reached its budget of ");
+        print(&b, hard);
+        print(&b, " model requests");
+        Str err = finish(&b);
+        endturn(s, scratch, "budget", err);
+        return 0;
+    } else if (s->treqs == soft) {
+        Buf b(&scratch, 512);
+        print(&b, "You have made ");
+        print(&b, soft);
+        print(&b, " model requests on this task, its budget. Wrap up now: "
+                  "start nothing new, and give your final report, with what "
+                  "you did, what you found, and what is left undone. After ");
+        print(&b, hard - soft);
+        print(&b, " more requests you will be stopped, and only what you "
+                  "said last reaches the agent that is waiting for you.");
+        notify(s, "budget", finish(&b), 0);
+    }
+    return 1;
+}
+
+
+// Idle parking
+//
+// A session idle for PARK_IDLE (7 minutes) gives up its memory: it is
+// forgotten but for what its log does not hold (Parked), still holding
+// its lock, and the next command that names it revives it from its log.
+// One with something going on in the background, a job, a notice to
+// deliver or a report to make, is not parked.
+
+static Session *loadsession(Engine *, Arena, Str sid, Str model, Str which,
+                            i64 *firstnew, iz held);
+
+static i64 parkafter(Engine *e)
+{
+    return scaled(e, PARK_IDLE);
+}
+
+static b32 parkable(Session *s)
+{
+    for (Job *j = s->jobs; j; j = j->next) {
+        if (j->state != JOB_DONE) {
+            return 0;
+        }
+    }
+    return !busy(s) && !s->intask && !s->notices.len && !s->queued.len &&
+           !s->steers.len && !s->http && !s->ctl && s->slot==SLOT_NONE &&
+           !s->e->quitting;
+}
+
+static void park(Engine *e, Session *s)
+{
+    Parked k = {};
+    k.sid      = clone(&e->perm, s->sid);
+    k.model    = clone(&e->perm, s->homemodel);
+    k.which    = clone(&e->perm, s->home);
+    k.lock     = s->lock;
+    k.attended = s->attended;
+    k.closed   = s->closed;
+    e->parked  = push(&e->perm, e->parked, k);
+    s->lock    = -1;  // kept for its revival
+    for (Session *t = e->sessions; t; t = t->next) {
+        t->parent = t->parent==s ? 0 : t->parent;
+    }
+    dropsession(e, s);
+}
+
+static iz parkedat(Engine *e, Str sid)
+{
+    for (iz i = 0; i < e->parked.len; i++) {
+        if (e->parked[i].sid == sid) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Bring a parked session back from its log, as it was, or with another
+// model or endpoint if given. Null if it is not parked, or its log is
+// gone. *firstnew is as loadsession has it.
+static Session *revive(Engine *e, Arena scratch, Str sid, Str model,
+                       Str which, i64 *firstnew)
+{
+    iz at = parkedat(e, sid);
+    if (at < 0) {
+        return 0;
+    }
+    Parked k = e->parked[at];
+    e->parked[at] = e->parked[e->parked.len-1];
+    e->parked.len--;
+    model = model.len ? model : k.model;
+    which = which.len ? which : k.which;
+    Session *s = loadsession(e, scratch, sid, model, which, firstnew, k.lock);
+    if (s) {
+        s->attended = k.attended;
+        s->closed   = k.closed;
+    }
+    return s;
+}
+
+// Asks that nobody can answer any more, as a frontend let go of a
+// session or an ancestor of it: denied by policy.
+static void unattend(Engine *e, Arena scratch)
+{
+    for (Session *t = e->sessions; t; t = t->next) {
+        if (t->state==S_ASK && !attending(t)) {
+            Arena a = scratch;
+            resolve(t, a, 0, DENY_POLICY, "the session is no longer attended");
+            nexttool(t, a);
+        }
+    }
 }
 
 
@@ -4217,11 +4959,22 @@ static b32 jsonflag(Json *j, b32 dflt)
     return j->type==JSON_BOOL ? j->boolean : jsonint(j, dflt)!=0;
 }
 
+// new {cwd, model?, endpoint?, role?, roots?, attended?, prompt?}: the
+// model and endpoint given, else the role's, else the configuration's.
 static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 {
-    Str cwd   = jsonstr(jsonget(j, "cwd"));
-    Str model = jsonstr(jsonget(j, "model"));
-    Str which = jsonstr(jsonget(j, "endpoint"));
+    Str  cwd   = jsonstr(jsonget(j, "cwd"));
+    Str  model = jsonstr(jsonget(j, "model"));
+    Str  which = jsonstr(jsonget(j, "endpoint"));
+    Str  name  = jsonstr(jsonget(j, "role"));
+    Role role  = name.len ? findrole(e, name) : Role{};
+    if (name.len && !role.ok) {
+        Str err = concat(&scratch, "no such role: ", name);
+        reply(e, scratch, id, 0, err, {});
+        return;
+    }
+    if (!which.len) which = role.endpoint;
+    if (!model.len) model = role.model;
     if (!which.len) which = iniget(e->ini, "", "", "endpoint");
     if (!model.len) model = iniget(e->ini, "", "", "model");
     Slice<Str> roots = {};
@@ -4246,7 +4999,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     }
 
-    Str      sid = newsid(e->os, &scratch);
+    Str      sid = freshsid(e, &scratch);
     Session *s   = newsession(e, scratch, sid);
     if (!s) {
         reply(e, scratch, id, 0, "out of memory", {});
@@ -4255,53 +5008,23 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->cwd      = clone(&s->perm, real);
     s->model    = clone(&s->perm, model);
     s->attended = jsonflag(jsonget(j, "attended"), 0);
+    s->role     = clone(&s->perm, role.name);
+    s->rolepr   = clone(&s->perm, role.prompt);
+    s->te.deny  = role.deny;
     for (iz i = 0; i < roots.len; i++) {
         s->roots = push(&s->perm, s->roots, clone(&s->perm, roots[i]));
     }
     endpointconf(e, &s->perm, which, &s->ep);
     modelconf(e, &s->perm, model, &s->mc);
 
-    if (!os_mkdirs(e->os, scratch, s->outdir)) {
+    Str why = opensession(s, scratch);
+    if (why.data) {
         dropsession(e, s);
-        reply(e, scratch, id, 0, "cannot create the session directory", {});
-        return;
-    }
-    Str lock = lockpath(&scratch, s);
-    s->lock = os_lockfile(e->os, scratch, lock);
-    if (s->lock < 0) {
-        dropsession(e, s);
-        reply(e, scratch, id, 0, "cannot lock the new session", {});
-        return;
-    }
-    Str path = join(&scratch, s->dir, "events.jsonl");
-    s->log = logopen(e->os, &s->perm, scratch, path, s->sid, LOG_MAX);
-    if (!s->log.ok) {
-        dropsession(e, s);
-        reply(e, scratch, id, 0, "cannot open the session log", {});
+        reply(e, scratch, id, 0, why, {});
         return;
     }
     sessionready(s, scratch);
-
-    {
-        Arena a = scratch;
-        Buf   b(&a, 512);
-        EvOut w = sbegin(s, &b, EV_SESSION);
-        putintkey(&w.json, "proto", 0);
-        putstrkey(&w.json, "version", HARNESS_VERSION);
-        putstrkey(&w.json, "cwd", s->cwd);
-        putstrkey(&w.json, "role", "");
-        putstrkey(&w.json, "model", s->model);
-        putstrkey(&w.json, "endpoint", s->ep.url);
-        if (s->roots.len) {
-            putkey(&w.json, "roots");
-            putarray(&w.json);
-            for (iz i = 0; i < s->roots.len; i++) {
-                putstr(&w.json, s->roots[i]);
-            }
-            putend(&w.json);
-        }
-        ssend(s, &w);
-    }
+    logsession(s, scratch);
     instrlogstart(s, scratch);
     reply(e, scratch, id, 1, {}, s->sid);
 
@@ -4455,21 +5178,27 @@ static void replayjobs(Session *s, Arena scratch)
 // closing of anything a crash left open (logopen), including results for
 // calls that never started. *firstnew is the seq before any repairs.
 // When another process holds the session's lock, it is only read, and
-// so neither repaired nor written later (readonly).
+// so neither repaired nor written later (readonly). A parked session's
+// lock is held already: held, else -1.
 static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
-                            Str which, i64 *firstnew)
+                            Str which, i64 *firstnew, iz held)
 {
-    Str dir  = join(&scratch, join(&scratch, e->statedir, "sessions"), sid);
-    Str path = join(&scratch, dir, "events.jsonl");
-    if (os_stat(e->os, scratch, path).type != STAT_FILE) {
+    Str      dir  = join(&scratch, join(&scratch, e->statedir, "sessions"), sid);
+    Str      path = join(&scratch, dir, "events.jsonl");
+    Session *s    = 0;
+    if (os_stat(e->os, scratch, path).type != STAT_FILE ||
+            !(s = newsession(e, scratch, sid))) {
+        if (held >= 0) {
+            os_unlockfile(e->os, held);
+        }
         return 0;
     }
-    Session *s = newsession(e, scratch, sid);
-    if (!s) {
-        return 0;
+    if (held >= 0) {
+        s->lock = held;
+    } else {
+        Str lock = lockpath(&scratch, s);
+        s->lock = os_lockfile(e->os, scratch, lock);
     }
-    Str lock = lockpath(&scratch, s);
-    s->lock     = os_lockfile(e->os, scratch, lock);
     s->readonly = s->lock < 0;
     if (!s->readonly) {
         s->log = logopen(e->os, &s->perm, scratch, path, s->sid, LOG_MAX);
@@ -4494,7 +5223,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         Json *j = r.root;
         Msg   m = {};
         switch (r.ev) {
-        case EV_SESSION:
+        case EV_SESSION: {
             s->cwd      = clone(&s->perm, jsonstr(jsonget(j, "cwd")));
             storedmodel = clone(&s->perm, jsonstr(jsonget(j, "model")));
             storedurl   = clone(&s->perm, jsonstr(jsonget(j, "endpoint")));
@@ -4502,7 +5231,23 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 Str root = clone(&s->perm, jsonstr(k));
                 s->roots = push(&s->perm, s->roots, root);
             }
-            break;
+            // Its role and place among subagents, as it began
+            s->role   = clone(&s->perm, jsonstr(jsonget(j, "role")));
+            s->rolepr = clone(&s->perm, jsonstr(jsonget(j, "prompt")));
+            s->psid   = clone(&s->perm, jsonstr(jsonget(j, "parent")));
+            s->pcall  = clone(&s->perm, jsonstr(jsonget(j, "call")));
+            i64 depth = jsonint(jsonget(j, "depth"), 0);
+            s->depth  = (i32)(depth<0 ? 0 : depth>TASK_DEPTH ? TASK_DEPTH : depth);
+            Json *tools = jsonget(j, "tools");
+            if (tools->type == JSON_ARRAY) {
+                u32 have = 0;
+                for (Json *k = tools->child; k; k = k->next) {
+                    i32 tool = toolfind(jsonstr(k));
+                    have |= tool==TOOL_NONE ? 0 : (u32)1<<tool;
+                }
+                s->te.deny = (((u32)1<<TOOL_COUNT) - 1) & ~have;
+            }
+        } break;
         case EV_TITLE:
             s->title = clone(&s->perm, jsonstr(jsonget(j, "text")));
             break;
@@ -4657,8 +5402,10 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
             reply(e, scratch, id, 0, "invalid session id", {});
             return;
         }
-        s = loadsession(e, scratch, sid, jsonstr(jsonget(j, "model")),
-                        jsonstr(jsonget(j, "endpoint")), &first);
+        Str model = jsonstr(jsonget(j, "model"));
+        Str which = jsonstr(jsonget(j, "endpoint"));
+        s = parkedat(e, sid)>=0 ? revive(e, scratch, sid, model, which, &first)
+                                : loadsession(e, scratch, sid, model, which, &first, -1);
         if (!s) {
             reply(e, scratch, id, 0, "cannot open the session", sid);
             return;
@@ -4677,11 +5424,7 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
     Json *att = jsonget(j, "attended");
     if (att->type != JSON_MISSING) {
         s->attended = jsonflag(att, 0);
-        if (!s->attended && s->state==S_ASK) {
-            // Nobody is left to answer
-            resolve(s, scratch, 0, DENY_POLICY, "the session is no longer attended");
-            nexttool(s, scratch);
-        }
+        unattend(e, scratch);  // nobody is left to answer it, or its subagents
     }
     sendsnapshot(s, scratch);
     s->closed = 0;
@@ -4870,17 +5613,63 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     emit(e, evend(&w));
 }
 
+// A session as the sessions list shows it.
+struct ListEntry {
+    Str       sid;
+    Str       title;
+    Str       cwd;
+    Str       model;
+    Str       parent;  // a subagent's, else empty
+    i64       mtime;
+    b32       locked;  // open in another process
+    b32       parked;
+    b32       shown;
+    Slice<iz> kids;    // its subagents, oldest first
+};
+
+static b32 listbefore(ListEntry *a, ListEntry *b)
+{
+    return compare(a->sid, b->sid) < 0;
+}
+
+// An entry, then its subagents under it, each with its depth there.
+static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 depth)
+{
+    ListEntry *en = &list[i];
+    if (en->shown) {
+        return;
+    }
+    en->shown = 1;
+    Session *live = findsession(e, en->sid);
+    Str      state = live ? statenames[live->state] : en->parked ? Str("idle")
+                                                                 : Str("closed");
+    putobject(w);
+    putstrkey(w, "sid", en->sid);
+    putstrkey(w, "title", en->title);
+    putstrkey(w, "cwd", en->cwd);
+    putstrkey(w, "model", en->model);
+    putstrkey(w, "state", state);
+    putintkey(w, "mtime", en->mtime);
+    putintkey(w, "locked", en->locked);
+    putintkey(w, "jobs", live ? jobsrunning(live) : 0);
+    if (en->parent.len) {
+        putstrkey(w, "parent", en->parent);
+        putintkey(w, "depth", depth);
+    }
+    if (en->parked) {
+        putintkey(w, "parked", 1);
+    }
+    putend(w);
+    for (iz k = 0; k<en->kids.len && depth<=TASK_DEPTH+8; k++) {
+        listput(e, w, list, en->kids[k], depth+1);
+    }
+}
+
+// The sessions in the state directory, newest first, but a subagent's
+// under its parent, oldest first: in the order a sidebar shows them.
 static void cmdlist(Engine *e, Arena scratch, i64 id)
 {
-    struct Entry {
-        Str sid;
-        Str title;
-        Str cwd;
-        Str model;
-        i64 mtime;
-        b32 locked;  // open in another process
-    };
-    Slice<Entry> list = {};
+    Slice<ListEntry> list = {};
     Str dir = join(&scratch, e->statedir, "sessions");
     for (Dirent *d = os_list(e->os, &scratch, dir); d; d = d->next) {
         if (!d->isdir) continue;
@@ -4890,35 +5679,48 @@ static void cmdlist(Engine *e, Arena scratch, i64 id)
         Cut   line = cut(rd.data, '\n');
         EvRec r    = evparse(&scratch, line.head);
         if (!line.ok || r.ev!=EV_SESSION) continue;
-        Session *s     = findsession(e, d->name);
-        Str      title = join(&scratch, sdir, "title");
-        Str      lock  = join(&scratch, sdir, "lock");
-        Entry en = {};
+        Session  *s     = findsession(e, d->name);
+        Str       title = join(&scratch, sdir, "title");
+        Str       lock  = join(&scratch, sdir, "lock");
+        ListEntry en    = {};
         en.sid    = d->name;
         en.title  = os_read(e->os, &scratch, title, 1024).data;
         en.cwd    = jsonstr(jsonget(r.root, "cwd"));
         en.model  = jsonstr(jsonget(r.root, "model"));
+        en.parent = jsonstr(jsonget(r.root, "parent"));
         en.mtime  = d->mtime;
-        en.locked = (!s || s->readonly) && os_lockheld(e->os, scratch, lock);
+        en.parked = !s && parkedat(e, d->name)>=0;  // its lock is ours
+        en.locked = (!s || s->readonly) && !en.parked &&
+                    os_lockheld(e->os, scratch, lock);
         list = push(&scratch, list, en);
+    }
+
+    // Each subagent under its parent, if listed
+    sort(list.data, list.len, listbefore, scratch);
+    Map<iz> *bysid = 0;
+    for (iz i = 0; i < list.len; i++) {
+        *upsert(&bysid, list[i].sid, &scratch) = i;
+    }
+    for (iz i = 0; i < list.len; i++) {
+        iz *p = list[i].parent.len ? upsert(&bysid, list[i].parent, (Arena *)0) : 0;
+        if (p && *p!=i) {
+            list[*p].kids = push(&scratch, list[*p].kids, i);
+        } else {
+            list[i].parent = {};  // shown as any session
+        }
     }
 
     Buf   b(&scratch, 4096);
     EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_SESSIONS);
     putkey(&w.json, "list");
     putarray(&w.json);
-    for (iz i = 0; i < list.len; i++) {
-        Session *live = findsession(e, list[i].sid);
-        putobject(&w.json);
-        putstrkey(&w.json, "sid", list[i].sid);
-        putstrkey(&w.json, "title", list[i].title);
-        putstrkey(&w.json, "cwd", list[i].cwd);
-        putstrkey(&w.json, "model", list[i].model);
-        putstrkey(&w.json, "state", live ? statenames[live->state] : Str("closed"));
-        putintkey(&w.json, "mtime", list[i].mtime);
-        putintkey(&w.json, "locked", list[i].locked);
-        putintkey(&w.json, "jobs", live ? jobsrunning(live) : 0);
-        putend(&w.json);
+    for (iz i = list.len-1; i >= 0; i--) {
+        if (!list[i].parent.len) {
+            listput(e, &w.json, list, i, 0);
+        }
+    }
+    for (iz i = list.len-1; i >= 0; i--) {
+        listput(e, &w.json, list, i, 0);  // in a cycle of parents
     }
     putend(&w.json);
     emit(e, evend(&w));
@@ -5073,6 +5875,10 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     }
 
+    if (!s && sid.len && !e->quitting) {
+        i64 first = 0;
+        s = revive(e, scratch, sid, {}, {}, &first);  // a parked session
+    }
     if (!s) {
         reply(e, scratch, id, 0, "no such open session", sid);
         return;
@@ -5090,10 +5896,11 @@ static void command(Engine *e, Arena scratch, Str line)
             s->closed = 1;
             stopjobs(s, scratch, 0);
         }
-        if (s->state == S_ASK) {
+        if (s->state==S_ASK && !attending(s)) {
             resolve(s, scratch, 0, DENY_POLICY, "the user closed the session");
             nexttool(s, scratch);
         }
+        unattend(e, scratch);  // its subagents' asks
         return;
     case CMD_REWIND:
         cmdrewind(e, s, scratch, id, j);
@@ -5320,6 +6127,18 @@ static void ontimer(Session *s, Arena scratch, i32 t)
         live(s);
         arm(s, T_LIVE, LIVE_EVERY);
         return;
+    case T_TASK:
+        taskflush(s, scratch);
+        return;
+    case T_PARK:
+        if (busy(s)) {
+            return;  // its turn's end arms it again
+        } else if (!parkable(s)) {
+            arm(s, T_PARK, parkafter(e));
+        } else {
+            s->parkme = 1;  // parked outside the loop over sessions
+        }
+        return;
     }
 }
 
@@ -5369,6 +6188,15 @@ static void enginethread(void *arg)
                 pump(e, p);
             }
         }
+        for (Session **p = &e->sessions; *p;) {
+            Session *s = *p;
+            if (s->parkme && parkable(s)) {
+                park(e, s);  // unlinks it: *p is the next
+            } else {
+                s->parkme = 0;
+                p = &s->next;
+            }
+        }
 
         // Cancelling ends turns at once, but should a turn linger, the
         // engine stops anyway once the wait is over
@@ -5380,6 +6208,12 @@ static void enginethread(void *arg)
                     s->lock = -1;
                 }
             }
+            for (iz i = 0; i < e->parked.len; i++) {
+                if (e->parked[i].lock >= 0) {
+                    os_unlockfile(e->os, e->parked[i].lock);
+                }
+            }
+            e->parked = {};
             mailpost(e->out, MAIL_QUIT, 0, {}, 1);
             return;
         }

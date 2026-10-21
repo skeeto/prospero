@@ -220,6 +220,8 @@ struct View {
     Str             cwd;
     Str             model;
     Str             endpoint;
+    Str             role;
+    Str             parent;     // a subagent's parent session, else empty
     i32             turn;
     i32             attempt;
     b32             busy;       // a turn is running
@@ -505,11 +507,14 @@ static Str oneline(Arena *a, Str s)
 // path inside the working directory relative to it.
 static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
 {
-    Json *j   = jsonparse(&scratch, args).root;
-    Str   cmd = jsonstr(jsonget(j, "command"));
-    Str   p   = jsonstr(jsonget(j, "path"));
+    Json *j    = jsonparse(&scratch, args).root;
+    Str   cmd  = jsonstr(jsonget(j, "command"));
+    Str   p    = jsonstr(jsonget(j, "path"));
+    Str   desc = jsonstr(jsonget(j, "description"));
     if (name=="shell" && cmd.data) {
         return oneline(perm, cmd);
+    } else if (name=="task" && desc.len) {
+        return oneline(perm, desc);
     } else if (p.data) {
         if (cwd.len && p.len>cwd.len+1 && startswith(p, cwd) &&
                 (p[cwd.len]=='/' || p[cwd.len]=='\\')) {
@@ -723,6 +728,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->cwd      = clone(&v->aux, jsonstr(jsonget(j, "cwd")));
         v->model    = clone(&v->aux, jsonstr(jsonget(j, "model")));
         v->endpoint = clone(&v->aux, jsonstr(jsonget(j, "endpoint")));
+        v->role     = clone(&v->aux, jsonstr(jsonget(j, "role")));
+        v->parent   = clone(&v->aux, jsonstr(jsonget(j, "parent")));
         if (v->state == LIVE_CLOSED) {
             v->state = LIVE_IDLE;
         }
@@ -738,7 +745,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         i32 i   = addmsg(v, VIEW_USER, jsonstr(jsonget(j, "text")));
         v->msgs[i].seq   = r->seq;
         v->msgs[i].label = via=="steer" ? Str("You (steering)") :
-                           via=="queue" ? Str("You (queued)") : Str{};
+                           via=="queue" ? Str("You (queued)") :
+                           via=="task"  ? Str("Task from the parent agent") : Str{};
         clampsel(v);
     } return 1;
 

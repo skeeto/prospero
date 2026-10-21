@@ -269,7 +269,7 @@ static void testcfgvalidate(Test *t)
         "ignored\n"
         "/c/harness.ini:20:9: warning: unknown value \"fly\", expected any "
         "of: read, write, edit, shell, grep, glob, todo_write, jobs, "
-        "job_output, job_kill\n"
+        "job_output, job_kill, task\n"
         "/c/harness.ini:21:2: warning: unknown section kind \"provider\", "
         "expected endpoint, model, role, guard, tools, instructions or ui\n"
         "/c/harness.ini:23:8: warning: [guard] takes no name, or its "
@@ -705,6 +705,7 @@ static void testcfgjson(Test *t)
         "tools//auto_resume=5*\n"
         "tools//stop_grace=*\n"
         "tools//use_rg=true*\n"
+        "tools//task_budget=200*\n"
         "instructions//files=AGENTS.md CLAUDE.md*\n"
         "ui//theme=system*\n");
 
@@ -719,7 +720,7 @@ static void testcfgjson(Test *t)
     expect(t, "json.schema.local", jsonstr(jsonget(ft, "local")), "1800");
     iz    ti    = cfgkey("role", "tools") - cfgschema;
     Json *tools = jsonget(jsonat(schema, ti), "choices");
-    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "10");
+    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "11");
     expect(t, "json.kinds", istr(&a, jsonlen(jsonget(j, "kinds"))),
            istr(&a, countof(cfgkinds)));
 

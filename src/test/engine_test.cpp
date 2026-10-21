@@ -1,8 +1,114 @@
 // Engine tests: the pure parts (the turn machine itself runs end to end
 // in tests/scenarios.py)
 
+// Roles: a section over a built-in role, a role of the configuration's
+// own, and the task tool's list of them.
+static void testroles(Test *t)
+{
+    Arena   a = t->perm;
+    CfgEnv  v = newcfgenv(&a);
+    os_write(v.os, a, "/r/h.ini",
+             "[role explore]\nmodel = small\n"
+             "[role reader]\ndescription = Reads\nprompt = Only read.\n"
+             "tools = read, glob\nendpoint = fast\n"
+             "[role open]\n");
+    Engine *e = alloc<Engine>(&a);
+    e->os  = v.os;
+    e->cfg = newconfig(v.os, &a, v.scratch, "/r/h.ini", 0);
+    e->ini = e->cfg->ini;
+
+    Role ex = findrole(e, "explore");
+    expect(t, "explore over the built-in", concat(&a, concat(&a, ex.model, "|"),
+           istr(&a, ex.deny==tooldeny("read grep glob"))), "small|1");
+    expect(t, "explore keeps its prompt", istr(&a, startswith(ex.prompt, "Explore the code")), "1");
+    Role rd = findrole(e, "reader");
+    expect(t, "reader", concat(&a, concat(&a, rd.desc, "|"), concat(&a, rd.prompt,
+           concat(&a, "|", rd.endpoint))), "Reads|Only read.|fast");
+    expect(t, "reader tools", istr(&a, rd.deny==tooldeny("read glob")), "1");
+    Role op = findrole(e, "open");
+    expect(t, "a section's default tools", istr(&a, op.ok*10 + (op.deny==0)), "11");
+    expect(t, "general", istr(&a, findrole(e, "general").deny), "0");
+    expect(t, "no such role", istr(&a, findrole(e, "nope").ok), "0");
+    expect(t, "no empty role", istr(&a, findrole(e, "").ok), "0");
+
+    ToolEnv te = {};
+    taskroles(e, &a, v.scratch, &te);
+    expect(t, "task roles", te.roles,
+           "\n- explore: Finds and reads code to answer a question, and reports "
+           "what it found; it cannot change files or run commands (tools: read, "
+           "grep, glob)\n- general: Does any task, with every tool (every tool)\n"
+           "- reader: Reads (tools: read, glob)\n- open: (no description) (every tool)");
+    expect(t, "task role enum", te.roleenum,
+           "\"enum\":[\"explore\",\"general\",\"reader\",\"open\"]");
+}
+
+// The sessions list: newest first, each subagent under its parent, and
+// a parked session idle, its lock its own.
+static void testlist(Test *t)
+{
+    Arena   a = t->perm;
+    CfgEnv  v = newcfgenv(&a);
+    Engine *e = alloc<Engine>(&a);
+    e->os       = v.os;
+    e->out      = newmailbox(&a, 1<<16, 0, 0);
+    e->statedir = "/s";
+    struct { Str sid; Str parent; } made[] = {
+        {"20260101-000000-aaaa", {}},
+        {"20260101-000001-bbbb", "20260101-000000-aaaa"},
+        {"20260101-000002-cccc", {}},
+        {"20260101-000003-dddd", "20260101-000001-bbbb"},
+        {"20260101-000004-eeee", "20260101-000000-aaaa"},
+        {"20260101-000005-ffff", "20260101-999999-gone"},
+    };
+    for (iz i = 0; i < countof(made); i++) {
+        Buf b(&a, 256);
+        print(&b, "{\"sid\":\"");
+        print(&b, made[i].sid);
+        print(&b, "\",\"seq\":1,\"ts\":0,\"ev\":\"session\",\"cwd\":\"/w\"");
+        if (made[i].parent.len) {
+            print(&b, ",\"parent\":\"");
+            print(&b, made[i].parent);
+            putbyte(&b, '"');
+        }
+        print(&b, "}\n");
+        Str dir = concat(&a, "/s/sessions/", made[i].sid);
+        os_mkdirs(v.os, a, dir);
+        os_write(v.os, a, concat(&a, dir, "/events.jsonl"), finish(&b));
+    }
+    Parked k = {};
+    k.sid  = "20260101-000002-cccc";
+    k.lock = os_lockfile(v.os, a, "/s/sessions/20260101-000002-cccc/lock");
+    e->parked = push(&a, e->parked, k);
+
+    cmdlist(e, v.scratch, 1);
+    Buf  got(&a, 1024);
+    Mail m = mailtake(e->out);
+    for (Record r; (r = mailnext(&m)).ok;) {
+        EvRec rec = evparse(&a, r.data);
+        for (Json *x = jsonget(rec.root, "list")->child; x; x = x->next) {
+            print(&got, cuthead(jsonstr(jsonget(x, "sid")), 16));
+            putbyte(&got, ':');
+            print(&got, jsonint(jsonget(x, "depth"), 0));
+            putbyte(&got, ':');
+            print(&got, jsonstr(jsonget(x, "state")));
+            if (jsonint(jsonget(x, "parked"), 0)) {
+                print(&got, ":parked");
+            }
+            if (jsonint(jsonget(x, "locked"), 0)) {
+                print(&got, ":locked");
+            }
+            putbyte(&got, ' ');
+        }
+    }
+    expect(t, "sessions list", finish(&got),
+           "ffff:0:closed cccc:0:idle:parked aaaa:0:closed bbbb:1:closed "
+           "dddd:2:closed eeee:1:closed ");
+}
+
 static void test_engine(Test *t)
 {
+    testroles(t);
+    testlist(t);
     Arena *a = &t->perm;
 
     Str long60 = "Refactor the parser so that it handles nested quotes and "

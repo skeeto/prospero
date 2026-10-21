@@ -1,5 +1,5 @@
 // Tools: read, write, edit, shell, grep, glob, todo_write, jobs,
-// job_output, job_kill
+// job_output, job_kill, task
 //
 // Every call ends in exactly one result the agent reads. Invalid calls
 // are never executed, and their results say how to fix them. File tools
@@ -9,6 +9,8 @@
 // timeout moves to the background as a job (engine.cpp), whose end is
 // reported to the agent later. grep and glob run as processes too:
 // ripgrep when it is found, else this same executable (search.cpp).
+// task starts a subagent, a session of its own (engine.cpp). A role may
+// offer fewer tools, and a call to one it does not is an unknown tool.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -24,12 +26,13 @@ enum : i32 {
     TOOL_JOBS,
     TOOL_JOBOUT,
     TOOL_JOBKILL,
+    TOOL_TASK,
     TOOL_COUNT,
 };
 
 static Str toolnames[] = {
     "read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
-    "job_output", "job_kill",
+    "job_output", "job_kill", "task",
 };
 static_assert(countof(toolnames) == TOOL_COUNT);
 
@@ -57,6 +60,10 @@ enum : i64 {
     TODO_TEXTMAX   = 500,             // bytes of one item
     PATH_BYTES     = 4096,            // longest path argument
     PATH_PARTS     = 256,             // most components in one
+    TASK_DEPTH     = 2,               // a session this deep starts no subagents
+    TASK_BATCH     = 16,              // subagents one response may start
+    TASK_REPORT    = 50 << 10,        // bytes of a subagent's report shown
+    TASK_PROMPT    = 256 << 10,       // longest task prompt
 };
 
 enum : i32 {
@@ -74,6 +81,9 @@ struct ToolEnv {
     Str exe;         // this executable, for the built-in search
     i64 jobtimeout;  // seconds a job may run, unless asked otherwise
     i64 jobmax;      // seconds a job may be asked to run
+    u32 deny;        // tools not offered (a role's), as bits 1<<TOOL_*
+    Str roles;       // the roles task may give, a line for each
+    Str roleenum;    // their names, as a JSON schema's enum member
 };
 
 static i32 toolfind(Str name)
@@ -84,6 +94,29 @@ static i32 toolfind(Str name)
         }
     }
     return TOOL_NONE;
+}
+
+// Whether a session offers a tool: one its role does not is unknown.
+static b32 tooloffered(ToolEnv *te, i32 tool)
+{
+    return tool!=TOOL_NONE && !(te->deny>>tool & 1);
+}
+
+// The tools a list names, separated by blanks or commas, as the bits of
+// those it does not name. Unknown names are left out (config.cpp warns).
+static u32 tooldeny(Str list)
+{
+    u32 have = 0;
+    for (Str rest = list; rest.len;) {
+        iz i = 0;
+        for (; i<rest.len && (whitespace(rest[i]) || rest[i]==','); i++) {}
+        rest = cuthead(rest, i);
+        for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
+        i32 t = toolfind(takehead(rest, i));
+        have |= t==TOOL_NONE ? 0 : (u32)1<<t;
+        rest  = cuthead(rest, i);
+    }
+    return (((u32)1<<TOOL_COUNT) - 1) & ~have;
 }
 
 // Tools that change files or run commands, for the todo reminder.
@@ -165,7 +198,28 @@ static Str shelldesc(Arena *a, ToolEnv *te)
     return finish(&b);
 }
 
-// The tools array of a request.
+static Str taskdesc(Arena *a, ToolEnv *te)
+{
+    Buf b(a, 1024 + te->roles.len);
+    print(&b, "Start a subagent: another agent that does a task by itself, "
+              "in a session of its own with a fresh context, and reports "
+              "back. Its final response, its report, is this call's result: "
+              "ask in the prompt for what you need to hear. Use it for a "
+              "part of a large task that stands on its own, or for a broad "
+              "search through much code, to keep your own context small; "
+              "not for a step you could take with one or two calls. Several "
+              "task calls in one response run at the same time. It works in "
+              "the same directory and files as you, so do not give two "
+              "subagents, or a subagent and yourself, the same files to "
+              "change at once.");
+    if (te->roles.len) {
+        print(&b, " Roles:");
+        print(&b, te->roles);
+    }
+    return finish(&b);
+}
+
+// The tools array of a request: those the session offers.
 static Str tooljson(Arena *a, ToolEnv *te)
 {
     Buf     b(a, 8192);
@@ -318,12 +372,30 @@ static Str tooljson(Arena *a, ToolEnv *te)
                 {"job", "integer", "The job number", 1, {}},
             },
         },
+        {
+            "task",
+            taskdesc(a, te),
+            {
+                {"description", "string", "What the subagent will do, in a "
+                 "few words, shown to the user", 1, {}},
+                {"prompt", "string", "The whole task: the goal, what you "
+                 "know that it needs (files, names, facts), and what to "
+                 "report. The subagent sees nothing of this conversation.", 1, {}},
+                {"role", "string", "The subagent's role (default: general)", 0,
+                 te->roleenum},
+                {"model", "string", "A model for it instead of the role's, "
+                 "only when asked for one (default: the role's, else yours)", 0, {}},
+            },
+        },
     };
     static_assert(countof(defs) == TOOL_COUNT);
 
     putarray(&w);
     for (iz i = 0; i < countof(defs); i++) {
         Def *d = &defs[i];
+        if (!tooloffered(te, (i32)i)) {
+            continue;
+        }
         putobject(&w);
         putkey(&w, "type");
         putstr(&w, "function");
@@ -383,9 +455,19 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te)
         "cannot answer questions: make reasonable assumptions and state "
         "them.\n\n"
         "Guidelines:\n"
-        "- Read files before editing them, and keep edits small and exact.\n"
-        "- Find code with the grep and glob tools rather than the shell.\n"
-        "- For a task of several steps, keep a todo list with todo_write.\n"
+        "- Read files before editing them, and keep edits small and exact.\n");
+    if (tooloffered(te, TOOL_GREP) && tooloffered(te, TOOL_GLOB)) {
+        print(&b, "- Find code with the grep and glob tools rather than the shell.\n");
+    }
+    if (tooloffered(te, TOOL_TODO)) {
+        print(&b, "- For a task of several steps, keep a todo list with todo_write.\n");
+    }
+    if (tooloffered(te, TOOL_TASK)) {
+        print(&b, "- For a large task with parts that stand on their own, or a "
+                  "broad search through much code, you may start subagents "
+                  "with task; several run at once.\n");
+    }
+    print(&b,
         "- Stay inside the working directory; access outside it is denied.\n"
         "- When a tool returns an error, read it, fix the call, and go on. "
         "Never repeat a call that failed in the same way.\n"
@@ -428,6 +510,10 @@ struct Args {
     Str             pattern;
     Str             glob;
     Str             from;       // job_output: "head" or "tail"
+    Str             desc;       // task: what the subagent does, in brief
+    Str             prompt;
+    Str             role;       // null if absent
+    Str             model;
     i64             offset;     // 0 if absent
     i64             limit;      // 0 if absent
     i64             timeout;    // -1 if absent
@@ -681,6 +767,23 @@ static Args parseargs(Arena *a, i32 tool, Str raw)
             issue(a, &r, "job", "a job number is required");
         }
         break;
+    case TOOL_TASK:
+        // A missing description is forgiven: it is only for showing
+        r.desc   = trim(argstr(a, &r, j, "description", 0));
+        r.prompt = argstr(a, &r, j, "prompt", 1);
+        r.role   = trim(argstr(a, &r, j, "role", 0));
+        r.model  = trim(argstr(a, &r, j, "model", 0));
+        r.role   = r.role.len ? r.role : Str{};
+        r.model  = r.model.len ? r.model : Str{};
+        if (r.prompt.data && !trim(r.prompt).len) {
+            issue(a, &r, "prompt", "must not be empty");
+        } else if (r.prompt.len > TASK_PROMPT) {
+            issue(a, &r, "prompt", "too long: at most 256 KiB");
+        }
+        if (r.desc.len > 1024) {
+            issue(a, &r, "description", "too long: a few words will do");
+        }
+        break;
     }
     if (r.path.data && !r.path.len) {
         issue(a, &r, "path", "must not be empty");
@@ -717,7 +820,9 @@ static Str argserror(Arena *a, Str name, Str raw, Args *r)
     return finish(&b);
 }
 
-static Str unknowntool(Arena *a, Str name)
+// The result of a call to a tool the session does not offer: one that
+// does not exist, or one its role leaves out (deny).
+static Str unknowntool(Arena *a, Str name, u32 deny)
 {
     static Str const aliases[][2] = {
         {"bash", "shell"}, {"sh", "shell"}, {"run", "shell"},
@@ -731,22 +836,37 @@ static Str unknowntool(Arena *a, Str name)
         {"list_files", "glob"}, {"ls", "glob"}, {"todo", "todo_write"},
         {"todowrite", "todo_write"}, {"update_todos", "todo_write"},
         {"bashoutput", "job_output"}, {"killshell", "job_kill"},
-        {"kill", "job_kill"},
+        {"kill", "job_kill"}, {"agent", "task"}, {"subagent", "task"},
+        {"dispatch_agent", "task"}, {"delegate", "task"},
     };
+    ToolEnv te = {};
+    te.deny = deny;
     Buf b(a, 256);
-    print(&b, "No tool named \"");
-    print(&b, name);
-    print(&b, "\" is available, so nothing was run. The tools are:");
+    if (toolfind(name) != TOOL_NONE) {
+        print(&b, "The tool \"");
+        print(&b, name);
+        print(&b, "\" is not available in this session, so nothing was "
+                  "run. The tools are:");
+    } else {
+        print(&b, "No tool named \"");
+        print(&b, name);
+        print(&b, "\" is available, so nothing was run. The tools are:");
+    }
+    b32 first = 1;
     for (i32 i = 0; i < TOOL_COUNT; i++) {
-        print(&b, i ? Str(", ") : Str(" "));
-        print(&b, toolnames[i]);
+        if (tooloffered(&te, i)) {
+            print(&b, first ? Str(" ") : Str(", "));
+            print(&b, toolnames[i]);
+            first = 0;
+        }
     }
     putbyte(&b, '.');
     for (iz i = 0; i < countof(aliases); i++) {
         Str n = name;
         Cut c = cut(n, '.');  // namespaced, as in "functions.bash"
         if (c.ok) n = c.tail;
-        if (equalfold(n, aliases[i][0])) {
+        if (equalfold(n, aliases[i][0]) &&
+                tooloffered(&te, toolfind(aliases[i][1]))) {
             print(&b, " Did you mean \"");
             print(&b, aliases[i][1]);
             print(&b, "\"?");

@@ -247,12 +247,19 @@ class Result:
     def names(self):
         return [e.get("ev") for e in self.events]
 
-    def all(self, ev):
-        return [e for e in self.events if e.get("ev") == ev]
+    def all(self, ev, sid=None):
+        return [e for e in self.events
+                if e.get("ev") == ev and (sid is None or e.get("sid") == sid)]
 
-    def last(self, ev):
-        found = self.all(ev)
+    def last(self, ev, sid=None):
+        found = self.all(ev, sid)
         return found[-1] if found else {}
+
+    def sessions(self):
+        """The run's own session id, and its subagents' session records."""
+        own = [e for e in self.all("session") if not e.get("parent")]
+        kids = [e for e in self.all("session") if e.get("parent")]
+        return (own[0]["sid"] if own else None), kids
 
     def text(self):
         """Visible text of every committed assistant message, joined."""
@@ -2258,6 +2265,304 @@ def stop_progress(t):
             f"nudges {[(n['kind'], n['n']) for n in ns]}")
     t.check(len(t.requests()) == 4 and r.last("turn.end").get("why") == "done",
             "done after four")
+
+
+# Subagents and roles
+
+def first_steps(reqs):
+    """Each conversation's first request, from a model's request log."""
+    return [q for q in reqs if fake_provider.step(q["body"]) == 0]
+
+
+@scenario(conf={"_path": "router1-task/"}, bound=20)
+def task_parallel(t):
+    """Two task calls in one response run at once, on a router that loads
+    one model at a time: the parent's model rests while they run. Their
+    reports end the calls in order, and the sessions list shows them
+    under their parent."""
+    t.put("a.txt", "1\n2\n3\n")
+    t.put("b.txt", "1\n2\n")
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    t.check(len(kids) == 2, f"two subagents: {kids}")
+    calls = [c["id"] for c in r.all("assistant", own)[0]["blocks"] if c["t"] == "call"]
+    t.check(sorted(k["call"] for k in kids) == sorted(calls), f"their calls {kids}")
+    t.check(all(k["parent"] == own and k["depth"] == 1 and k["role"] == "general" and
+                k["model"] == t.model2 for k in kids), f"records {kids}")
+    ends = r.all("tool.end", own)
+    t.check([e["status"] for e in ends] == ["ok", "ok"], f"statuses {ends}")
+    t.check([e["call"] for e in ends] == calls, "in call order")
+    t.check([e["text"] for e in ends] == ["Report: a.txt has 3 lines.",
+                                          "Report: b.txt has 2 lines."], f"reports {ends}")
+    bysid = {k["sid"]: k["call"] for k in kids}
+    t.check(all(bysid.get(e.get("child")) == e["call"] for e in ends), "each names its child")
+    t.check(r.last("turn.end", own).get("why") == "done", "the parent ends done")
+    t.check("Both reported: Report: a.txt has 3 lines. / Report: b.txt has 2 lines."
+            == r.last("assistant", own)["blocks"][0]["text"], "the parent read both")
+
+    firsts = first_steps(t.requests(t.model2))
+    t.check(len(firsts) == 2, f"two conversations {len(firsts)}")
+    t.check(firsts[1]["t"] < firsts[0]["end"], "the subagents ran side by side")
+    parent = t.requests()
+    t.check(all(q["t"] >= parent[0]["end"] - 0.05 for q in t.requests(t.model2)) and
+            parent[1]["t"] >= max(q["end"] for q in t.requests(t.model2)) - 0.05,
+            "the parent's model rested meanwhile")
+    with fake_provider.STATE.lock:
+        peak = fake_provider.STATE.peak.get("router1-task")
+    t.check(peak == 1, f"one model at a time: {peak}")
+
+    # The list: each subagent under its parent
+    h = t.headless()
+    try:
+        h.call("list")
+        listing = h.wait(lambda e: e.get("ev") == "sessions")["list"]
+    finally:
+        h.close()
+    order = [(e["sid"], e.get("parent"), e.get("depth")) for e in listing]
+    kidsids = sorted(k["sid"] for k in kids)
+    t.check(order == [(own, None, None)] + [(k, own, 1) for k in kidsids],
+            f"the list {order}")
+
+
+@scenario(bound=20)
+def task_depth(t):
+    """A subagent may start one of its own, but that one gets no task
+    tool, and a call to it anyway is refused."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    t.check(sorted(k["depth"] for k in kids) == [1, 2], f"depths {kids}")
+    one = [k for k in kids if k["depth"] == 1][0]
+    two = [k for k in kids if k["depth"] == 2][0]
+    t.check(one["parent"] == own and two["parent"] == one["sid"], "parents")
+    t.check("tools" not in one and "task" not in two.get("tools", ["task"]) and
+            "read" in two["tools"], f"tools {one} {two}")
+    deep = [q["body"] for q in t.requests(t.model2)]
+    t.check(any("task" in fake_provider.tool_names(q) for q in deep) and
+            any("task" not in fake_provider.tool_names(q) for q in deep),
+            "offered at depth 1, not at depth 2")
+    refused = r.all("tool.end", two["sid"])
+    t.check(len(refused) == 1 and refused[0]["status"] == "error" and
+            "not available in this session" in refused[0]["text"], f"refused {refused}")
+    t.check(r.last("assistant", own)["blocks"][0]["text"] ==
+            "Top heard: Level 1 heard: Level 2 done; its task was refused.",
+            f"reports {r.last('assistant', own)}")
+
+
+@scenario(conf={"_tools": {"task_budget": 4}}, bound=20)
+def task_budget(t):
+    """At its budget a subagent is told to wrap up; one that does reports
+    as usual, and one that goes on is stopped at half as many again,
+    reporting what it said last."""
+    t.put("hello.txt", "".join(f"line {i}\n" for i in range(10)))
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    t.check(len(kids) == 2, f"two subagents {kids}")
+    reqs = t.requests(t.model2)
+    obey = [q for q in reqs if "obedient" in fake_provider.task_prompt(q["body"])]
+    defy = [q for q in reqs if "stubborn" in fake_provider.task_prompt(q["body"])]
+    t.check(len(obey) == 4 and len(defy) == 6, f"requests {len(obey)} {len(defy)}")
+    wrap = [m for m in obey[3]["body"]["messages"] if "Wrap up now" in str(m.get("content"))]
+    t.check(len(wrap) == 1, "the fourth request carries the notice")
+    for k in kids:
+        notes = [n for n in r.all("notice", k["sid"]) if n.get("kind") == "budget"]
+        t.check(len(notes) == 1, f"one wrap-up notice: {notes}")
+    ends = r.all("tool.end", own)
+    t.check([e["status"] for e in ends] == ["ok", "error"], f"statuses {ends}")
+    t.check(ends[0]["text"] == "Obedient final report.", f"obeyed {ends[0]}")
+    t.check("budget of 6 model requests" in ends[1]["text"] and
+            ends[1]["text"].endswith("Working on step 5."), f"stopped {ends[1]['text']!r}")
+    stub = [k["sid"] for k in kids if k["call"] == ends[1]["call"]][0]
+    t.check(r.last("turn.end", stub).get("why") == "budget", "its turn ended at the budget")
+    t.check(r.last("turn.end", own).get("why") == "done", "the parent goes on")
+
+
+@scenario(bound=20)
+def task_cancel(t):
+    """Cancelling the parent cancels its subagent, killing its command,
+    and the parent's call ends cancelled."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        kid = h.wait(lambda e: e.get("ev") == "session" and e.get("parent") == sid)
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == kid["sid"])
+        deadline = time.monotonic() + 10
+        while not t.pids("tree.pids") and time.monotonic() < deadline:
+            time.sleep(0.1)
+        pids = t.pids("tree.pids")
+        t.check(pids, "the subagent's command started")
+        live = h.wait(lambda e: e.get("ev") == "live" and e.get("sid") == sid and
+                      e.get("state") == "task")
+        t.check(live.get("tasks") == 1, f"one at work: {live}")
+        t0 = time.monotonic()
+        h.call("cancel", sid=sid)
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "cancel", f"the parent's turn {end}")
+        t.check(time.monotonic() - t0 < 5, "at once")
+        kend = h.all("turn.end", kid["sid"])
+        t.check(kend and kend[-1]["why"] == "cancel", f"the subagent's turn {kend}")
+        te = h.all("tool.end", sid)
+        t.check(len(te) == 1 and te[0]["status"] == "cancelled" and
+                "cancelled" in te[0]["text"], f"the call {te}")
+        t.check(t.gone(pids), f"the command is gone: {pids}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+ROLES = """[role reader]
+description = Reads files
+prompt = You only read files. ROLE-MARK
+tools = read glob
+[role fast]
+model = {model2}
+"""
+
+
+@scenario(conf={"_extra": ROLES}, bound=20)
+def role_tools(t):
+    """A role's prompt is in the system prompt and only its tools are
+    offered, others refused; a task names a role, a built-in or the
+    configuration's, with its model."""
+    r = t.run(extra=["-r", "reader"])
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, _ = r.sessions()
+    rec = r.all("session", own)[0]
+    t.check(rec["role"] == "reader" and rec["tools"] == ["read", "glob"] and
+            rec["prompt"] == "You only read files. ROLE-MARK", f"record {rec}")
+    first = [q["body"] for q in t.requests() if "# Your role: reader" in
+             fake_provider.system_of(q["body"])][0]
+    t.check(fake_provider.tool_names(first) == ["read", "glob"],
+            f"offered {fake_provider.tool_names(first)}")
+    t.check("ROLE-MARK" in fake_provider.system_of(first), "the role's prompt")
+    te = r.all("tool.end", own)
+    t.check(te and te[0]["status"] == "error" and "not available" in te[0]["text"],
+            f"write refused {te}")
+    t.check(t.file("x.txt") is None, "nothing written")
+
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    roles = sorted(k["role"] for k in kids)
+    t.check(roles == ["explore", "fast"], f"roles {roles}")
+    ex = [k for k in kids if k["role"] == "explore"][0]
+    fast = [k for k in kids if k["role"] == "fast"][0]
+    t.check(ex["tools"] == ["read", "grep", "glob"] and ex["model"] == t.model, f"explore {ex}")
+    t.check(fast["model"] == t.model2 and "tools" not in fast, f"fast {fast}")
+    exreq = [q["body"] for q in t.requests() if "# Your role: explore" in
+             fake_provider.system_of(q["body"])]
+    t.check(exreq and fake_provider.tool_names(exreq[0]) == ["read", "grep", "glob"],
+            "explore's tools")
+    t.check(t.file("shell.txt") is None, "explore ran no command")
+    ends = r.all("tool.end", own)
+    t.check([e["status"] for e in ends] == ["ok", "ok", "error"], f"statuses {ends}")
+    t.check(ends[0]["text"].startswith("Explore report: The tool \"shell\" is not "
+                                       "available"), f"explore {ends[0]['text']!r}")
+    t.check(ends[1]["text"] == "Fast report.", f"fast {ends[1]}")
+    t.check("No role is named \"nope\"" in ends[2]["text"] and "child" not in ends[2],
+            f"nope {ends[2]}")
+
+
+PARK = {"HARNESS_TEST_MINUTE_MS": "20"}  # parked after 140 ms idle
+
+
+@scenario(bound=20)
+def park_revive(t):
+    """An idle session is parked, keeping its lock, and the next command
+    revives it from its log as it was."""
+    h = t.headless(env=PARK)
+    other = None
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="first question")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+
+        def entry():
+            h.call("list")  # its reply follows the list
+            return [e for e in h.all("sessions")[-1]["list"] if e["sid"] == sid][0]
+
+        deadline = time.monotonic() + 5
+        while not entry().get("parked") and time.monotonic() < deadline:
+            time.sleep(0.2)
+        en = entry()
+        t.check(en.get("parked") == 1 and en["state"] == "idle" and en["locked"] == 0,
+                f"parked: {en}")
+
+        # Its lock is still held: another process gets it read-only
+        other = t.headless()
+        r = other.call("open", sid=sid, attended=1)
+        t.check(r.get("ok") == 1 and r.get("readonly") == 1, f"read-only elsewhere: {r}")
+        other.close()
+        other = None
+
+        h.send("prompt", sid=sid, text="second question")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and
+                     e.get("turn") == 2)
+        t.check(end["why"] == "done", f"the second turn {end}")
+        msgs = t.requests()[1]["body"]["messages"]
+        said = [(m["role"], m.get("content")) for m in msgs if m["role"] != "system"]
+        t.check(said == [("user", "first question"), ("assistant", "First answer."),
+                         ("user", "second question")], f"the history {said}")
+        seqs = [e["seq"] for e in h.events if e.get("sid") == sid and "seq" in e]
+        t.check(seqs == list(range(1, len(seqs) + 1)), f"seq in order: {seqs}")
+        t.check(len(h.all("title", sid)) == 1, "titled once")
+
+        # Parked again, then opened: replayed from where asked
+        deadline = time.monotonic() + 5
+        while not entry().get("parked") and time.monotonic() < deadline:
+            time.sleep(0.2)
+        n = len(h.events)
+        r = h.call("open", sid=sid, attended=1, **{"from": seqs[-1] - 2})
+        t.check(r.get("ok") == 1 and r.get("readonly") == 0, f"open {r}")
+        again = [e for e in h.events[n:] if e.get("sid") == sid and "seq" in e]
+        t.check([e["seq"] for e in again] == seqs[-2:], f"replayed {again}")
+    finally:
+        if other:
+            other.close()
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def task_ask(t):
+    """A subagent's ask reaches the frontend that attends its parent,
+    which answers it as any session's."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ask = h.wait(lambda e: e.get("ev") == "ask")
+        kid = [e for e in h.all("session") if e["sid"] == ask["sid"]]
+        t.check(kid and kid[0].get("parent") == sid, f"the subagent asks: {ask}")
+        t.check(ask["deadline"] - ask["ts"] >= 29000, f"with a deadline: {ask}")
+        r = h.call("answer", sid=ask["sid"], req=ask["req"], decision="allow")
+        t.check(r.get("ok") == 1, f"answered {r}")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"the parent ends {end}")
+        ans = h.all("answer", ask["sid"])
+        t.check(ans and ans[0]["by"] == "user" and ans[0]["decision"] == "allow", f"{ans}")
+        t.check(outside_file(t) == "from the child", "written outside")
+        te = h.all("tool.end", sid)
+        t.check(te and te[0]["text"] == "The child wrote it.", f"report {te}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def task_unattended(t):
+    """Unattended, a subagent's ask is denied by policy, and it goes on."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    ans = r.all("answer", kids[0]["sid"])
+    t.check(ans and ans[0]["by"] == "policy" and ans[0]["decision"] == "deny", f"{ans}")
+    t.check(outside_file(t) is None, "nothing written outside")
+    t.check(r.last("tool.end", own).get("text") == "The child was refused.",
+            f"report {r.last('tool.end', own)}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

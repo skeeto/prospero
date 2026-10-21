@@ -241,8 +241,10 @@ struct GuiSession {
     Str          title;     // from the list until opened
     Str          cwd;
     Str          model;
+    Str          parent;    // a subagent's, from the list until opened
     i64          mtime;
     i64          openid;    // the open in flight, 0 if none
+    i32          depth;     // under its parent in the sidebar, this frame
 };
 
 // A command awaiting its reply.
@@ -904,12 +906,14 @@ static void onsessions(Gui *g, Json *j)
         }
         GuiSession *s = findsess(g, sid);
         s = s ? s : addsess(g, sid);
-        Str title = jsonstr(jsonget(e, "title"));
-        Str cwd   = jsonstr(jsonget(e, "cwd"));
-        Str model = jsonstr(jsonget(e, "model"));
-        s->title  = s->title==title ? s->title : clone(&g->perm, title);
-        s->cwd    = s->cwd==cwd     ? s->cwd   : clone(&g->perm, cwd);
-        s->model  = s->model==model ? s->model : clone(&g->perm, model);
+        Str title  = jsonstr(jsonget(e, "title"));
+        Str cwd    = jsonstr(jsonget(e, "cwd"));
+        Str model  = jsonstr(jsonget(e, "model"));
+        Str parent = jsonstr(jsonget(e, "parent"));
+        s->title  = s->title==title   ? s->title  : clone(&g->perm, title);
+        s->cwd    = s->cwd==cwd       ? s->cwd    : clone(&g->perm, cwd);
+        s->model  = s->model==model   ? s->model  : clone(&g->perm, model);
+        s->parent = s->parent==parent ? s->parent : clone(&g->perm, parent);
         s->mtime  = jsonint(jsonget(e, "mtime"), 0);
         s->locked = jsonint(jsonget(e, "locked"), 0) != 0;
         s->state  = livestate(jsonstr(jsonget(e, "state")));
@@ -2680,6 +2684,7 @@ enum : i32 {
     CHK_LONGEDIT,
     CHK_ENGINESTOPPED,
     CHK_CLICKTHROUGH,
+    CHK_NESTED,
     CHK_COUNT,
 };
 
@@ -2720,6 +2725,7 @@ static Str chknames[] = {
     "the long setting, edited, was saved whole",
     "the engine died: nothing runs or waits, no ask stays open",
     "a click that activates the window also reaches what it lands on",
+    "two subagents reported, listed under their parent",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -3109,6 +3115,11 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_SWITCHED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "6-sessions"},
     {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
+    // Two subagents, under their parent in the sidebar
+    {OP_PROMPT, 0, 0, 0, 1000, "Start subagents."},
+    {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_NESTED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "7-subagents"},
     // Esc abandons an edit in a settings field, leaving the turn alone,
     // and from the session's own windows cancels the turn mid-tool
     {OP_PROMPT, 0, 0, 0, 100, "Cancel me: run a very slow command."},
@@ -4010,6 +4021,26 @@ static b32 drivecheck(Gui *g, i32 chk)
             first |= v->msgs[i].role==VIEW_USER && startswith(v->msgs[i].text, "Run the tools");
         }
         return other && first && g->sess && !g->sess->view->busy;
+    }
+    case CHK_NESTED: {
+        // The sidebar: the session shown, then its two subagents
+        Arena               a    = g->frame;
+        Slice<GuiSession *> list = sesslist(g, &a);
+        iz                  at   = -1;
+        for (iz i = 0; i < list.len; i++) {
+            at = list[i]==g->sess ? i : at;
+        }
+        if (at<0 || at+2>=list.len) {
+            return 0;
+        }
+        i32 reported = 0;
+        for (iz i = at+1; i <= at+2; i++) {
+            View *k = list[i]->view;
+            reported += list[i]->depth==1 && k && k->parent==g->sess->sid &&
+                        !k->busy && k->msgs.len>=2;
+        }
+        return reported==2 && v->msgs.len &&
+               endswith(v->msgs[v->msgs.len-1].text, "Both subagents reported.");
     }
     }
     return 0;
