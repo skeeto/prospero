@@ -2615,6 +2615,82 @@ def task_unattended(t):
             f"report {r.last('tool.end', own)}")
 
 
+@scenario(conf={"_extra": "[model {model}]\nedit_format = patch\n"}, bound=15)
+def edit_patch(t):
+    """edit_format patch: an apply_patch envelope changes, adds and
+    deletes files at once, each snapshotted, so that rewind puts all of
+    them back; a hunk that does not match changes nothing, and a file
+    outside the working directory is asked about."""
+    t.put("hello.txt", "greet\nhello\nworld\n")
+    t.put("old.txt", "bye\n")
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(r.text().endswith("Patched."), f"text {r.text()!r}")
+    t.check(r.events[0].get("edit_format") == "patch", f"session {r.events[0]}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "error", "denied"],
+            f"statuses {[(e['status'], e['text'][:80]) for e in ends]}")
+    t.check(ends[0]["text"] == "Applied the patch: updated hello.txt, added sub/new.txt, "
+            "deleted old.txt.", f"result {ends[0]['text']!r}")
+    t.check(ends[1]["text"].startswith("The patch was not applied, and no file was changed: "
+                                       "hunk 1 of hello.txt"), f"error {ends[1]['text']!r}")
+    t.check(t.file("hello.txt") == "greet\nhello\nthere\n" and
+            t.file("sub/new.txt") == "fresh\n" and t.file("old.txt") is None,
+            f"files {t.file('hello.txt')!r} {t.file('sub/new.txt')!r} {t.file('old.txt')!r}")
+    t.check(outside_file(t) is None, "nothing written outside")
+    ans = r.all("answer")
+    t.check(ans and ans[0]["by"] == "policy", f"asked and denied: {ans}")
+    snaps = r.all("snap")
+    t.check([(os.path.basename(s["path"]), s["existed"], s["hash_after"] == "") for s in snaps] ==
+            [("hello.txt", 1, False), ("new.txt", 0, False), ("old.txt", 1, True)],
+            f"snaps {snaps}")
+
+    sid = r.events[0]["sid"]
+    h = t.headless()
+    try:
+        o = h.call("open", sid=sid, **{"from": 0})
+        t.check(o.get("ok") == 1, f"opened {o}")
+        rr = h.call("rewind", sid=sid, to=1)
+        got = [(os.path.basename(f["path"]), f["result"]) for f in rr.get("files", [])]
+        t.check(got == [("old.txt", "restored"), ("new.txt", "removed"),
+                        ("hello.txt", "restored")], f"rewound {rr}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    t.check(t.file("hello.txt") == "greet\nhello\nworld\n" and t.file("old.txt") == "bye\n" and
+            t.file("sub/new.txt") is None, "all put back")
+
+
+@scenario(conf={"_extra": "[model {model}]\nedit_format = hashline\n"}, bound=15)
+def edit_hashline(t):
+    """edit_format hashline: read shows a tag, edits by line number check
+    it, and a session opened again keeps its format whatever the
+    configuration says by then."""
+    t.put("list.txt", "one\ntwo\nthree\nfour\n")
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(r.text().endswith("Edited by line."), f"text {r.text()!r}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok", "error", "ok", "ok", "ok"],
+            f"statuses {[(e['status'], e['text'][:80]) for e in ends]}")
+    t.check(ends[0]["text"].startswith("[list.txt#") and "     1\tone\n" in ends[0]["text"],
+            f"read {ends[0]['text']!r}")
+    t.check("does not match list.txt" in ends[2]["text"], f"stale {ends[2]['text']!r}")
+    t.check("Tags for edit: [list.txt#" in ends[4]["text"], f"grep {ends[4]['text']!r}")
+    t.check(t.file("list.txt") == "zero\none\ntwo\nthree\nend\n", f"file {t.file('list.txt')!r}")
+    t.check(r.events[0].get("edit_format") == "hashline", f"session {r.events[0]}")
+
+    # The format stays with the session
+    sid = r.events[0]["sid"]
+    t.host.write(t.config, t.host.read(t.config).replace("edit_format = hashline", ""))
+    r2 = t.run("again", resume=sid)
+    t.check(r2.rc == 0, f"resumed: {r2.rc} {r2.stderr}")
+    tools = t.requests()[-1]["body"]["tools"]
+    edit = [x for x in tools if x["function"]["name"] == "edit"][0]
+    t.check(sorted(edit["function"]["parameters"]["properties"]) == ["edits", "path", "tag"],
+            f"kept {edit['function']['parameters']['properties'].keys()}")
+
+
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")
 
 

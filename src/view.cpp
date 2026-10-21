@@ -633,10 +633,11 @@ static Str oneline(Arena *a, Str s)
 // path inside the working directory relative to it.
 static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
 {
-    Json *j    = jsonparse(&scratch, args).root;
-    Str   cmd  = jsonstr(jsonget(j, "command"));
-    Str   p    = jsonstr(jsonget(j, "path"));
-    Str   desc = jsonstr(jsonget(j, "description"));
+    Json *j     = jsonparse(&scratch, args).root;
+    Str   cmd   = jsonstr(jsonget(j, "command"));
+    Str   p     = jsonstr(jsonget(j, "path"));
+    Str   desc  = jsonstr(jsonget(j, "description"));
+    Json *patch = jsonget(j, "patch");
     if (name=="shell" && cmd.data) {
         return oneline(perm, cmd);
     } else if (name == "todo_write") {
@@ -664,6 +665,15 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
         return finish(&b);
     } else if (name=="task" && desc.len) {
         return oneline(perm, desc);
+    } else if (name=="edit" && patch->type==JSON_STRING) {
+        // The files the patch names, as it names them
+        Slice<Str> paths = patchpaths(&scratch, patch->str);
+        Buf        b(&scratch, 256);
+        for (iz i = 0; i < paths.len; i++) {
+            print(&b, i ? Str(", ") : Str(""));
+            print(&b, paths[i]);
+        }
+        return oneline(perm, paths.len ? finish(&b) : Str("patch"));
     } else if (p.data) {
         if (cwd.len && p.len>cwd.len+1 && startswith(p, cwd) &&
                 (p[cwd.len]=='/' || p[cwd.len]=='\\')) {
@@ -714,10 +724,65 @@ static i64 linecount(Str s)
 // temporaries are left in the arena too.
 static Str tooldiff(Arena *a, Str name, Str args, Str result)
 {
-    Json *j    = jsonparse(a, args).root;
-    Str   path = jsonstr(jsonget(j, "path"));
+    Json *j     = jsonparse(a, args).root;
+    Str   path  = jsonstr(jsonget(j, "path"));
+    Json *patch = jsonget(j, "patch");
+    Json *edits = jsonget(j, "edits");
     Buf   d(a, 1<<12);
-    if (name == "edit") {
+    if (name=="edit" && patch->type==JSON_STRING) {
+        // An apply_patch envelope (edit_format patch): its file headers
+        // as a unified diff's, its hunks as they are
+        for (Str rest = patch->str; rest.len;) {
+            Cut c  = cut(rest, '\n');
+            Str l  = c.head.len && c.head[c.head.len-1]=='\r' ? cuttail(c.head, 1) : c.head;
+            Str hd = trim(l);
+            rest = c.tail;
+            if (hd=="*** Begin Patch" || hd=="*** End Patch" || hd=="*** End of File") {
+                continue;
+            } else if (startswith(hd, "*** Update File:")) {
+                Str p = trim(cuthead(hd, 16));
+                print(&d, "--- ");
+                print(&d, p);
+                print(&d, "\n+++ ");
+                print(&d, p);
+            } else if (startswith(hd, "*** Add File:")) {
+                print(&d, "--- /dev/null\n+++ ");
+                print(&d, trim(cuthead(hd, 13)));
+            } else if (startswith(hd, "*** Delete File:")) {
+                print(&d, "--- ");
+                print(&d, trim(cuthead(hd, 16)));
+                print(&d, "\n+++ /dev/null");
+            } else if (startswith(hd, "*** Move to:")) {
+                print(&d, "rename to ");
+                print(&d, trim(cuthead(hd, 12)));
+            } else {
+                print(&d, l);
+            }
+            putbyte(&d, '\n');
+        }
+    } else if (name=="edit" && edits->type==JSON_ARRAY) {
+        // Line edits (edit_format hashline): what each puts where
+        print(&d, "--- ");
+        print(&d, path);
+        print(&d, "\n+++ ");
+        print(&d, path);
+        putbyte(&d, '\n');
+        for (Json *e = edits->child; e; e = e->next) {
+            Str op   = jsonstr(jsonget(e, "op"));
+            i64 line = jsonint(jsonget(e, "line"), 0);
+            i64 end  = jsonint(jsonget(e, "end"), line);
+            print(&d, "@@ ");
+            print(&d, op);
+            print(&d, op=="insert" ? Str(" after line ") : Str(" lines "));
+            print(&d, line);
+            if (op!="insert" && end!=line) {
+                putbyte(&d, '-');
+                print(&d, end);
+            }
+            print(&d, " @@\n");
+            difflines(&d, '+', jsonstr(jsonget(e, "text")));
+        }
+    } else if (name == "edit") {
         Str olds = jsonstr(jsonget(j, "old_string"));
         Str news = jsonstr(jsonget(j, "new_string"));
         iz  at   = find(result, "line ");

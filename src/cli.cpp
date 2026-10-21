@@ -145,6 +145,17 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         Str     what = name=="shell" ? jsonstr(jsonget(rp.root, "command")) :
                        name=="task"  ? jsonstr(jsonget(rp.root, "description")) :
                        jsonstr(jsonget(rp.root, "path"));
+        Json   *pt   = jsonget(rp.root, "patch");
+        if (name=="edit" && pt->type==JSON_STRING) {
+            // A patch names its files inside
+            Slice<Str> paths = patchpaths(&scratch, pt->str);
+            Buf        p(&scratch, 256);
+            for (iz i = 0; i < paths.len; i++) {
+                print(&p, i ? Str(", ") : Str(""));
+                print(&p, paths[i]);
+            }
+            what = finish(&p);
+        }
         print(&b, "$ ");
         print(&b, name);
         print(&b, ": ");

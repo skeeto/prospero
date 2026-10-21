@@ -346,6 +346,7 @@ static Arena newarena(Region *r)
 #include "mailbox.cpp"
 #include "events.cpp"
 #include "provider.cpp"
+#include "edit.cpp"
 #include "tools.cpp"
 #include "guard.cpp"
 #include "search.cpp"

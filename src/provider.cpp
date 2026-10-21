@@ -348,6 +348,7 @@ struct ModelConf {
                              // reasoning_control)
     i64          ctx;        // context limit in tokens, 0 if unknown
     i64          thinkmax;   // reasoning budget in tokens, 0 for none
+    i32          edit;       // the edit tool's format, EDIT_* (edit.cpp)
 };
 
 struct ChatReq {

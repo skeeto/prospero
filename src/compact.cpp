@@ -418,9 +418,17 @@ static Files addfiles(Arena *a, Files f, Slice<Msg> h, iz beg, iz end)
             if (b->type!=BLOCK_CALL || (!r && b->name!="write" && b->name!="edit")) {
                 continue;
             }
-            Repair rp   = repairargs(a, b->args);
-            Str    path = jsonstr(jsonget(rp.root, "path"));
-            if (!path.len || cut(path, '\n').ok) {
+            Repair rp    = repairargs(a, b->args);
+            Str    path  = jsonstr(jsonget(rp.root, "path"));
+            Json  *patch = jsonget(rp.root, "patch");
+            if (!r && patch->type==JSON_STRING) {
+                // An edit as a patch, which names its files inside
+                Slice<Str> paths = patchpaths(a, patch->str);
+                for (iz p = 0; p < paths.len; p++) {
+                    f.wrote = addfile(a, f.wrote, clone(a, paths[p]));
+                }
+                continue;
+            } else if (!path.len || cut(path, '\n').ok) {
                 continue;
             } else if (r) {
                 f.read = addfile(a, f.read, clone(a, path));

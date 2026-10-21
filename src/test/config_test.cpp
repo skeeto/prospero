@@ -688,6 +688,7 @@ static void testcfgjson(Test *t)
         "model/m/fallback=*\n"
         "model/m/fallback_cooldown=600*\n"
         "model/m/reasoning_budget=*\n"
+        "model/m/edit_format=replace*\n"
         "model/m/max_concurrent=*\n"
         "model/m/temperature=*\n"
         "model/m/top_p=*\n"

@@ -54,6 +54,7 @@ enum : i64 {
     SEARCH_RESULTS = 100,             // lines or files shown
     SEARCH_TIMEOUT = 30,              // seconds
     SEARCH_LINEMAX = 300,             // bytes of a matching line shown
+    SEARCH_TAGS    = 20,              // files whose tags grep lists (hashline)
     SEARCH_OUTMAX  = 256 << 10,       // search output kept, then killed
     SEARCH_GLOBMAX = (i64)8 << 20,    // ripgrep listing every file
     TODO_ITEMS     = 50,
@@ -84,6 +85,7 @@ struct ToolEnv {
     u32 deny;        // tools not offered (a role's), as bits 1<<TOOL_*
     Str roles;       // the roles task may give, a line for each
     Str roleenum;    // their names, as a JSON schema's enum member
+    i32 edit;        // EDIT_*: the edit tool's format (edit.cpp)
 };
 
 static i32 toolfind(Str name)
@@ -390,6 +392,75 @@ static Str tooljson(Arena *a, ToolEnv *te)
     };
     static_assert(countof(defs) == TOOL_COUNT);
 
+    // The edit tool has the format the session's model takes best
+    Str hashitem =
+        "\"items\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":"
+        "\"string\",\"enum\":[\"replace\",\"insert\",\"delete\"]},\"line\":{"
+        "\"type\":\"integer\",\"description\":\"The first line to replace or "
+        "delete; for insert, the line to insert after, 0 for the top\"},"
+        "\"end\":{\"type\":\"integer\",\"description\":\"The last line to "
+        "replace or delete (default: line)\"},\"text\":{\"type\":\"string\","
+        "\"description\":\"For replace and insert: the new lines, without "
+        "line numbers, indented as the file is; an empty string for none\"}},"
+        "\"required\":[\"op\",\"line\"],\"additionalProperties\":false}";
+    Def editdefs[] = {
+        defs[TOOL_EDIT],
+        {
+            "edit",
+            "Change files with a patch, which is applied whole or not at all. "
+            "Example:\n\n"
+            "*** Begin Patch\n"
+            "*** Update File: src/app.py\n"
+            "@@ def greet(name):\n"
+            "-    print(\"Hi\")\n"
+            "+    print(\"Hello, \" + name)\n"
+            "*** End Patch\n\n"
+            "Each file has a section: *** Add File: PATH, followed by the new "
+            "file's lines, each starting with +; *** Delete File: PATH; or "
+            "*** Update File: PATH, optionally followed by *** Move to: "
+            "NEWPATH, then its changes in hunks. A hunk starts with @@, "
+            "optionally followed by a line of the file that comes before the "
+            "change, such as the first line of its function, to say where it "
+            "is. In a hunk, each line starts with a space for a line that "
+            "stays, - for a line removed, or + for a line added. Copy kept "
+            "and removed lines exactly from the file, indentation included, "
+            "with 3 lines kept before and after each change, more if those "
+            "are not unique. Hunks go in file order. Do not write line "
+            "numbers. Paths are relative to the working directory. Line "
+            "endings and any byte order mark are kept.",
+            {
+                {"patch", "string", "The whole patch, from *** Begin Patch to "
+                 "*** End Patch", 1, {}},
+            },
+        },
+        {
+            "edit",
+            "Change a file by its line numbers. read shows a file under a "
+            "header [PATH#TAG], where TAG identifies its content, and numbers "
+            "its lines; grep lists the tags of the files it found as well. "
+            "Give that tag and a list of edits, each naming lines "
+            "by their numbers in that read: replace lines line through end "
+            "with text, insert text after line (0 for the top of the file), "
+            "or delete lines line through end. Line numbers always mean the "
+            "file as read showed it, before any of these edits, and the edits "
+            "must not overlap. If the file changed since you read it, its tag "
+            "no longer matches, and nothing is changed: read it again. The "
+            "result shows the new tag and the changed lines with their new "
+            "numbers. Line endings and any byte order mark are kept. To "
+            "create a file, use write.",
+            {
+                {"path", "string", "File path, relative to the working directory or absolute", 1, {}},
+                {"tag", "string", "The TAG of the file's [PATH#TAG] header, from "
+                 "the read or edit that showed it last", 1, {}},
+                {"edits", "array", "The changes, made together", 1, hashitem},
+            },
+        },
+    };
+    static_assert(countof(editdefs) == EDIT_COUNT);
+    if (te->edit>=0 && te->edit<EDIT_COUNT) {
+        defs[TOOL_EDIT] = editdefs[te->edit];
+    }
+
     putarray(&w);
     for (iz i = 0; i < countof(defs); i++) {
         Def *d = &defs[i];
@@ -524,6 +595,9 @@ struct Args {
     b32             ignorecase;
     b32             literal;
     Slice<TodoItem> todos;
+    Str             tag;        // edit as hashline: the file's tag as read
+    Slice<HashEdit> hedits;
+    Patch           patch;      // edit as patch
     Slice<Str>      issues;
     Str             repaired;   // what repairargs fixed, if anything
 };
@@ -662,7 +736,108 @@ static Slice<TodoItem> argtodos(Arena *a, Args *r, Json *root)
     return items;
 }
 
-static Args parseargs(Arena *a, i32 tool, Str raw)
+// A hashline edit's op by name, forgiving the usual synonyms; -1 if
+// unknown.
+static i32 hashop(Str s)
+{
+    static struct {
+        Str name;
+        i32 op;
+    } const names[] = {
+        {"replace", HASH_REPLACE}, {"set", HASH_REPLACE},
+        {"change", HASH_REPLACE}, {"put", HASH_REPLACE},
+        {"insert", HASH_INSERT}, {"insert_after", HASH_INSERT},
+        {"add", HASH_INSERT}, {"append", HASH_INSERT},
+        {"delete", HASH_DELETE}, {"remove", HASH_DELETE},
+        {"del", HASH_DELETE}, {"rem", HASH_DELETE},
+    };
+    s = trim(s);
+    for (iz i = 0; i < countof(names); i++) {
+        if (equalfold(s, names[i].name)) {
+            return names[i].op;
+        }
+    }
+    return -1;
+}
+
+// A hashline edit's list: an array of {op, line, end, text}, or such
+// an array encoded as a string, or one such object alone.
+static Slice<HashEdit> arghedits(Arena *a, Args *r, Json *root)
+{
+    Slice<HashEdit> edits = {};
+    Json *v = jsonget(root, "edits");
+    if (v->type == JSON_STRING) {
+        JsonDoc d = jsonparse(a, trim(v->str));
+        v = d.ok ? d.root : v;
+    }
+    if (v->type==JSON_MISSING || v->type==JSON_NULL) {
+        issue(a, r, "edits", "required array is missing");
+        return edits;
+    } else if (v->type == JSON_OBJECT) {
+        Json *one = alloc<Json>(a);
+        *one       = *v;
+        one->next  = 0;
+        Json *list = alloc<Json>(a);
+        list->type  = JSON_ARRAY;
+        list->child = one;
+        list->len   = 1;
+        v = list;
+    } else if (v->type == JSON_STRING) {
+        issue(a, r, "edits", "must be an array of {op, line, end, text} objects, "
+                             "not a string (this one is not even valid JSON)");
+        return edits;
+    } else if (v->type != JSON_ARRAY) {
+        issue(a, r, "edits", "must be an array of {op, line, end, text} objects");
+        return edits;
+    }
+    iz n = 0;
+    for (Json *e = v->child; e; e = e->next, n++) {
+        Buf at(a, 32);
+        print(&at, "edits[");
+        print(&at, (i64)n);
+        putbyte(&at, ']');
+        Str where = finish(&at);
+        if (e->type != JSON_OBJECT) {
+            issue(a, r, where, "must be an object with op, line and text");
+            continue;
+        }
+        Args     sub = {};
+        HashEdit h   = {};
+        h.op   = hashop(jsonstr(jsonget(e, "op")));
+        h.line = argint(a, &sub, e, "line", -1);
+        h.end  = argint(a, &sub, e, "end", -1);
+        h.text = argstr(a, &sub, e, "text", 0);
+        if (!h.text.data) {
+            h.text = argstr(a, &sub, e, "content", 0);
+        }
+        h.end = h.end<0 ? h.line : h.end;
+        if (sub.issues.len) {
+            issue(a, r, where, sub.issues[0]);
+        } else if (h.op < 0) {
+            issue(a, r, where, "op must be replace, insert or delete");
+        } else if (h.line < (h.op==HASH_INSERT ? 0 : 1)) {
+            issue(a, r, where, h.op==HASH_INSERT
+                  ? Str("line must be 0 or more: the line to insert after")
+                  : Str("line must be 1 or more: lines are numbered from 1"));
+        } else if (h.op!=HASH_INSERT && h.end<h.line) {
+            issue(a, r, where, "end must not be before line");
+        } else if (h.op!=HASH_DELETE && !h.text.data) {
+            issue(a, r, where, "text is required for replace and insert");
+        } else {
+            edits = push(a, edits, h);
+        }
+    }
+    if (!n) {
+        issue(a, r, "edits", "must hold at least one edit");
+    } else if (n > HASH_EDITS) {
+        issue(a, r, "edits", "too many: at most 100 in one call");
+    }
+    return edits;
+}
+
+// Arguments for a tool, edit's as the session's format (EDIT_*) takes
+// them.
+static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
 {
     Args   r  = {};
     r.timeout = -1;
@@ -686,10 +861,29 @@ static Args parseargs(Arena *a, i32 tool, Str raw)
         r.content = argstr(a, &r, j, "content", 1);
         break;
     case TOOL_EDIT:
-        r.path       = argstr(a, &r, j, "path", 1);
-        r.oldstr     = argstr(a, &r, j, "old_string", 1);
-        r.newstr     = argstr(a, &r, j, "new_string", 1);
-        r.replaceall = argbool(a, &r, j, "replace_all");
+        if (edit == EDIT_PATCH) {
+            // Under the names other harnesses use for it too
+            Str text = argstr(a, &r, j, "patch", 0);
+            text = text.data ? text : argstr(a, &r, j, "input", 0);
+            text = text.data ? text : argstr(a, &r, j, "patchText", 0);
+            if (!text.data && !r.issues.len) {
+                issue(a, &r, "patch", "required string is missing");
+            } else if (text.data) {
+                r.patch = parsepatch(a, text);
+                if (r.patch.err.data) {
+                    issue(a, &r, "patch", concat(a, "not a valid patch: ", r.patch.err));
+                }
+            }
+        } else if (edit == EDIT_HASHLINE) {
+            r.path   = argstr(a, &r, j, "path", 1);
+            r.tag    = argstr(a, &r, j, "tag", 1);
+            r.hedits = arghedits(a, &r, j);
+        } else {
+            r.path       = argstr(a, &r, j, "path", 1);
+            r.oldstr     = argstr(a, &r, j, "old_string", 1);
+            r.newstr     = argstr(a, &r, j, "new_string", 1);
+            r.replaceall = argbool(a, &r, j, "replace_all");
+        }
         break;
     case TOOL_SHELL: {
         r.command    = argstr(a, &r, j, "command", 1);
@@ -879,36 +1073,6 @@ static Str unknowntool(Arena *a, Str name, u32 deny)
 
 // Text
 
-static iz countlines(Str s)
-{
-    iz n = 0;
-    for (iz i = 0; i < s.len; i++) {
-        n += s[i] == '\n';
-    }
-    return n + (s.len && s[s.len-1]!='\n');
-}
-
-// Cut at most max bytes, backing up to a UTF-8 boundary.
-static Str utf8head(Str s, iz max)
-{
-    if (s.len <= max) {
-        return s;
-    }
-    iz n = max;
-    for (; n>0 && (s[n]&0xc0)==0x80; n--) {}
-    return takehead(s, n);
-}
-
-static Str utf8tail(Str s, iz max)
-{
-    if (s.len <= max) {
-        return s;
-    }
-    iz n = s.len - max;
-    for (; n<s.len && (s[n]&0xc0)==0x80; n++) {}
-    return cuthead(s, n);
-}
-
 // Remove ANSI escape sequences and resolve carriage returns the way a
 // terminal shows them: within a line, text after the last CR wins. A
 // CR before LF is a line ending and simply dropped.
@@ -990,36 +1154,6 @@ static Slice<Dirent *> sortedlist(Os *os, Arena *a, Str dir)
     return r;
 }
 
-// Edit distance ignoring ASCII case, or limit+1 once past limit.
-static iz distance(Arena scratch, Str x, Str y, iz limit)
-{
-    if (x.len-y.len>limit || y.len-x.len>limit) {
-        return limit + 1;
-    }
-    iz *row = alloc<iz>(&scratch, y.len+1);
-    for (iz j = 0; j <= y.len; j++) {
-        row[j] = j;
-    }
-    for (iz i = 1; i <= x.len; i++) {
-        iz diag = row[0];
-        iz best = row[0] = i;
-        for (iz j = 1; j <= y.len; j++) {
-            iz up   = row[j];
-            iz cost = lowercase(x[i-1]) != lowercase(y[j-1]);
-            iz v    = diag + cost;
-            v = up+1<v ? up+1 : v;
-            v = row[j-1]+1<v ? row[j-1]+1 : v;
-            row[j] = v;
-            diag   = up;
-            best   = v<best ? v : best;
-        }
-        if (best > limit) {
-            return limit + 1;
-        }
-    }
-    return row[y.len];
-}
-
 // "File not found" with up to three similar names from its directory:
 // close in spelling, or one name a prefix of the other.
 static Str notfound(Os *os, Arena *a, Str cwd, Str path)
@@ -1031,7 +1165,7 @@ static Str notfound(Os *os, Arena *a, Str cwd, Str path)
     Slice<Dirent *> ents = sortedlist(os, a, dir);
     for (iz i = 0; i<ents.len && like.len<3; i++) {
         Str name = ents[i]->name;
-        if (distance(*a, name, want, limit) <= limit ||
+        if (distance(*a, name, want, limit, 1) <= limit ||
                 (want.len>=3 && startswith(name, want)) ||
                 (name.len>=3 && startswith(want, name))) {
             like = push(a, like, showpath(cwd, join(a, dir, name)));
@@ -1080,7 +1214,8 @@ struct ToolOut {
     b32 ok;     // the call did what was asked
 };
 
-static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args)
+// Read a file, under its [PATH#TAG] header if tagged (hashline edits).
+static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args, b32 tagged)
 {
     ToolOut r  = {};
     Stat    st = os_stat(os, *a, path);
@@ -1120,11 +1255,21 @@ static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args)
             return r;
         }
     }
+    Str head = {};
+    if (tagged) {
+        Buf h(a, 64 + path.len);
+        putbyte(&h, '[');
+        print(&h, showpath(cwd, path));
+        putbyte(&h, '#');
+        print(&h, filetag(a, data));
+        print(&h, "]\n");
+        head = finish(&h);
+    }
     if (startswith(data, "\xef\xbb\xbf")) {
         data = cuthead(data, 3);
     }
     if (!data.len) {
-        r.text = "(empty file)";
+        r.text = concat(a, head, "(empty file)");
         r.ok   = 1;
         return r;
     }
@@ -1145,6 +1290,7 @@ static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args)
     }
 
     Buf b(a, 4096);
+    print(&b, head);
     iz  line = 1;
     iz  last = first - 1;
     b32 full = 0;
@@ -1230,140 +1376,32 @@ static ToolOut toolwrite(Os *os, Arena *a, Str cwd, Str path, Args *args)
 }
 
 
-// edit
-//
-// Matching tries, in order: the exact bytes; whole lines compared with
-// trailing whitespace ignored; and code points compared after mapping
-// typographic quotes, dashes and spaces to ASCII. The first rule that
-// matches anything decides.
+// edit (edit.cpp has the formats)
 
-struct Span {
-    iz beg;
-    iz end;
+// The file of an edit, read, or why it cannot be edited.
+struct EditFile {
+    Str data;
+    Str err;  // null if read
 };
 
-static Slice<Span> matchexact(Arena *a, Str hay, Str needle)
+static EditFile editfile(Os *os, Arena *a, Str cwd, Str path, iz max)
 {
-    Slice<Span> r = {};
-    for (iz off = 0; off+needle.len <= hay.len;) {
-        iz i = find(cuthead(hay, off), needle);
-        if (i < 0) break;
-        Span s = {off+i, off+i+needle.len};
-        r = push(a, r, s);
-        off = s.end;
+    EditFile r  = {};
+    Read     rd = os_read(os, a, path, (iz)FILE_MAX);
+    if (rd.err == READ_NOTFOUND) {
+        r.err = notfound(os, a, cwd, path);
+    } else if (rd.err==READ_TOOBIG || (!rd.err && rd.data.len>max)) {
+        r.err = "The file is too large to edit with this tool. Use the "
+                "shell to change it (sed, a script).";
+    } else if (rd.err) {
+        r.err = "The file could not be read.";
+    } else {
+        r.data = rd.data.data ? rd.data : Str{(u8 *)"", 0};
     }
     return r;
 }
 
-static Str rtrimline(Str s)
-{
-    for (; s.len && (s[s.len-1]==' ' || s[s.len-1]=='\t' || s[s.len-1]=='\r'); s.len--) {}
-    return s;
-}
-
-// Whole lines, ignoring trailing whitespace. A needle ending in a
-// newline covers the newline of its last line too.
-static Slice<Span> matchlines(Arena *a, Str hay, Str needle)
-{
-    Slice<Span> r = {};
-    b32 nl = needle.len && needle[needle.len-1]=='\n';
-    if (nl) needle.len--;
-    Slice<Str> want = {};
-    for (Str rest = needle;;) {
-        Cut c = cut(rest, '\n');
-        want = push(a, want, rtrimline(c.head));
-        if (!c.ok) break;
-        rest = c.tail;
-    }
-
-    Slice<Span> lines = {};  // each line without its newline
-    for (iz off = 0; off < hay.len;) {
-        Cut  c = cut(cuthead(hay, off), '\n');
-        Span s = {off, off+c.head.len};
-        lines = push(a, lines, s);
-        off = s.end + c.ok;
-    }
-    for (iz i = 0; i+want.len <= lines.len;) {
-        b32 ok = 1;
-        for (iz k = 0; ok && k<want.len; k++) {
-            Span l = lines[i+k];
-            ok = rtrimline(Str{hay.data+l.beg, l.end-l.beg}) == want[k];
-        }
-        if (!ok) {
-            i++;
-            continue;
-        }
-        Span s = {lines[i].beg, lines[i+want.len-1].end};
-        if (nl && s.end<hay.len) s.end++;
-        r = push(a, r, s);
-        i += want.len;
-    }
-    return r;
-}
-
-static i32 normcp(i32 c)
-{
-    switch (c) {
-    case 0x2018: case 0x2019: case 0x201a: case 0x201b: case 0x2032:
-        return '\'';
-    case 0x201c: case 0x201d: case 0x201e: case 0x201f: case 0x2033:
-        return '"';
-    case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014:
-    case 0x2015: case 0x2212:
-        return '-';
-    case 0x00a0: case 0x2007: case 0x202f:
-        return ' ';
-    }
-    return c>=0x2000 && c<=0x200a ? ' ' : c;
-}
-
-// Code points compared after normcp; spans are bytes of hay.
-static Slice<Span> matchnorm(Arena *a, Str hay, Str needle)
-{
-    Slice<Span> r = {};
-    if (!needle.len) return r;
-    for (iz beg = 0; beg < hay.len;) {
-        iz i = beg, j = 0;
-        while (i<hay.len && j<needle.len) {
-            iz ii = i, jj = j;
-            if (normcp(utf8decode(hay, &ii)) != normcp(utf8decode(needle, &jj))) {
-                break;
-            }
-            i = ii;
-            j = jj;
-        }
-        if (j == needle.len) {
-            Span s = {beg, i};
-            r = push(a, r, s);
-            beg = i;
-            continue;
-        }
-        iz next = beg;
-        utf8decode(hay, &next);
-        beg = next;
-    }
-    return r;
-}
-
-static iz lineat(Str s, iz off)
-{
-    iz n = 1;
-    for (iz i = 0; i < off; i++) {
-        n += s[i] == '\n';
-    }
-    return n;
-}
-
-static Str lfcrlf(Arena *a, Str s)
-{
-    Buf b(a, s.len + 64);
-    for (iz i = 0; i < s.len; i++) {
-        if (s[i]=='\n' && (!i || s[i-1]!='\r')) putbyte(&b, '\r');
-        putbyte(&b, s[i]);
-    }
-    return finish(&b);
-}
-
+// edit in the replace format.
 static ToolOut tooledit(Os *os, Arena *a, Str cwd, Str path, Args *args)
 {
     ToolOut r    = {};
@@ -1375,123 +1413,173 @@ static ToolOut tooledit(Os *os, Arena *a, Str cwd, Str path, Args *args)
                  "and its replacement in new_string.";
         return r;
     }
-    Read rd = os_read(os, a, path, (iz)FILE_MAX);
-    if (rd.err==READ_NOTFOUND && !args->oldstr.len) {
+    if (!args->oldstr.len && os_stat(os, *a, path).type==STAT_MISSING) {
         Args w = *args;  // a new file
         w.content = args->newstr;
         return toolwrite(os, a, cwd, path, &w);
     }
-    if (rd.err == READ_NOTFOUND) {
-        r.text = notfound(os, a, cwd, path);
+    EditFile f = editfile(os, a, cwd, path, (iz)FILE_MAX);
+    if (f.err.data) {
+        r.text = f.err;
         return r;
-    } else if (rd.err == READ_TOOBIG) {
-        r.text = "The file is too large to edit with this tool.";
-        return r;
-    } else if (rd.err) {
-        r.text = "The file could not be read.";
-        return r;
-    }
-    if (!args->oldstr.len) {
+    } else if (!args->oldstr.len) {
         r.text = "old_string is empty. Give the exact text to replace; to "
                  "replace the whole file, use write.";
         return r;
     }
-
-    Str data = rd.data;
-    Str bom  = {};
-    if (startswith(data, "\xef\xbb\xbf")) {
-        bom  = takehead(data, 3);
-        data = cuthead(data, 3);
-    }
-    Str oldstr = args->oldstr;
-    Str newstr = args->newstr;
-    if (find(data, "\r\n")>=0 && find(oldstr, "\r")<0) {
-        oldstr = lfcrlf(a, oldstr);
-        newstr = lfcrlf(a, newstr);
-    }
-
-    Slice<Span> m = matchexact(a, data, oldstr);
-    Str how = {};
-    if (!m.len) {
-        m   = matchlines(a, data, oldstr);
-        how = " (matched ignoring trailing whitespace)";
-    }
-    if (!m.len) {
-        m   = matchnorm(a, data, oldstr);
-        how = " (matched with typographic quotes and dashes as ASCII)";
-    }
-
-    if (!m.len) {
-        Buf b(a, 512);
-        print(&b, "old_string was not found in ");
-        print(&b, show);
-        print(&b, ", so nothing was changed.");
-        Str first = trim(cut(args->oldstr, '\n').head);
-        if (first.len >= 4) {
-            for (Str rest = data; rest.len;) {
-                Cut c = cut(rest, '\n');
-                if (trim(c.head) == first) {
-                    print(&b, " Its first line matches line ");
-                    print(&b, (i64)lineat(data, c.head.data - data.data));
-                    print(&b, ", but the following lines differ.");
-                    break;
-                }
-                rest = c.tail;
-            }
-        }
-        print(&b, " Read the file again and copy the text exactly, without "
-                  "line numbers.");
-        r.text = finish(&b);
+    EditOut e = editreplace(a, f.data, show, args->oldstr, args->newstr,
+                            args->replaceall);
+    if (!e.data.data) {
+        r.text = e.text;
         return r;
-    }
-    if (m.len>1 && !args->replaceall) {
-        Buf b(a, 256);
-        print(&b, "old_string matches ");
-        print(&b, (i64)m.len);
-        print(&b, " places in ");
-        print(&b, show);
-        print(&b, " (lines");
-        for (iz i = 0; i<m.len && i<10; i++) {
-            print(&b, i ? Str(", ") : Str(" "));
-            print(&b, (i64)lineat(data, m[i].beg));
-        }
-        print(&b, "), so nothing was changed. Include more surrounding lines "
-                  "to make it unique, or set replace_all to true.");
-        r.text = finish(&b);
-        return r;
-    }
-
-    iz  grow = 0;
-    for (iz i = 0; i < m.len; i++) {
-        grow += newstr.len - (m[i].end - m[i].beg);
-    }
-    Buf out(a, data.len + bom.len + (grow>0 ? grow : 0) + 64);
-    print(&out, bom);
-    iz last = 0;
-    for (iz i = 0; i < m.len; i++) {
-        print(&out, span(data.data+last, data.data+m[i].beg));
-        print(&out, newstr);
-        last = m[i].end;
-    }
-    print(&out, cuthead(data, last));
-    Str edited = finish(&out);
-    if (!os_write(os, *a, path, edited)) {
+    } else if (!os_write(os, *a, path, e.data)) {
         r.text = "The file could not be written.";
         return r;
     }
-
-    Buf b(a, 256);
-    print(&b, "Edited ");
-    print(&b, show);
-    print(&b, ": replaced ");
-    print(&b, (i64)m.len);
-    print(&b, m.len==1 ? Str(" match at line ") : Str(" matches, the first at line "));
-    print(&b, (i64)lineat(data, m[0].beg));
-    print(&b, how);
-    putbyte(&b, '.');
-    r.text  = finish(&b);
-    r.wrote = edited;
+    r.text  = e.text;
+    r.wrote = e.data;
     r.ok    = 1;
+    return r;
+}
+
+// edit in the hashline format.
+static ToolOut toolhash(Os *os, Arena *a, Str cwd, Str path, Args *args)
+{
+    ToolOut  r = {};
+    EditFile f = editfile(os, a, cwd, path, (iz)EDIT_LINESMAX);
+    if (f.err.data) {
+        r.text = f.err;
+        if (startswith(f.err, "File not found")) {
+            r.text = concat(a, r.text, " To create a file, use write.");
+        }
+        return r;
+    }
+    EditOut e = edithash(a, f.data, showpath(cwd, path), args->tag, args->hedits);
+    if (!e.data.data) {
+        r.text = e.text;
+        return r;
+    } else if (!os_write(os, *a, path, e.data)) {
+        r.text = "The file could not be written.";
+        return r;
+    }
+    r.text  = e.text;
+    r.wrote = e.data;
+    r.ok    = 1;
+    return r;
+}
+
+// A file a patch changes: its new content, or null data if it goes.
+struct FileChange {
+    Str path;  // absolute
+    Str data;
+};
+
+struct PatchPlan {
+    Slice<FileChange> changes;
+    Str               text;  // what was done, or why nothing can be
+    b32               ok;
+};
+
+static Str patchfailed(Arena *a, Str why)
+{
+    Buf b(a, 256 + why.len);
+    print(&b, "The patch was not applied, and no file was changed: ");
+    print(&b, why);
+    if (why.len && why[why.len-1]!='\n') {
+        print(&b, why[why.len-1]=='.' ? Str(" ") : Str(". "));
+    }
+    print(&b, "Fix the patch and send all of it again.");
+    return finish(&b);
+}
+
+// Check a parsed patch against the files, whose absolute paths the
+// caller gave in each file's file and fileto, and work out every change
+// before any is made.
+static PatchPlan planpatch(Os *os, Arena *a, Str cwd, Patch *p)
+{
+    PatchPlan r = {};
+    Buf       done(a, 256);
+    Buf       notes(a, 256);
+    for (iz i = 0; i < p->files.len; i++) {
+        PatchFile *f    = &p->files[i];
+        Str        show = showpath(cwd, f->file);
+        FileChange c    = {};
+        c.path = f->file;
+        print(&done, i ? Str(", ") : Str(""));
+        switch (f->op) {
+        case PATCH_ADD: {
+            Stat st = os_stat(os, *a, f->file);
+            if (st.type == STAT_DIR) {
+                r.text = patchfailed(a, concat(a, show, " is a directory"));
+                return r;
+            }
+            c.data = f->content.data ? f->content : Str{(u8 *)"", 0};
+            r.changes = push(a, r.changes, c);
+            print(&done, st.type==STAT_FILE ? Str("replaced ") : Str("added "));
+            print(&done, show);
+        } break;
+
+        case PATCH_DELETE: {
+            Stat st = os_stat(os, *a, f->file);
+            if (st.type != STAT_FILE) {
+                Str why = st.type==STAT_MISSING ? notfound(os, a, cwd, f->file)
+                                                : concat(a, show, " is not a file");
+                r.text = patchfailed(a, concat(a, "*** Delete File: ", why));
+                return r;
+            }
+            r.changes = push(a, r.changes, c);
+            print(&done, "deleted ");
+            print(&done, show);
+        } break;
+
+        case PATCH_UPDATE: {
+            EditFile ef = editfile(os, a, cwd, f->file, (iz)EDIT_LINESMAX);
+            if (ef.err.data) {
+                r.text = patchfailed(a, concat(a, "*** Update File: ", ef.err));
+                return r;
+            }
+            EditOut e = patchupdate(a, ef.data, show, f);
+            if (!e.data.data) {
+                r.text = patchfailed(a, e.text);
+                return r;
+            }
+            if (f->fileto.len && f->fileto!=f->file) {
+                FileChange to = {f->fileto, e.data};
+                r.changes = push(a, r.changes, to);
+                r.changes = push(a, r.changes, c);  // the old path goes
+                print(&done, "moved ");
+                print(&done, show);
+                print(&done, " to ");
+                print(&done, showpath(cwd, f->fileto));
+            } else {
+                c.data = e.data;
+                r.changes = push(a, r.changes, c);
+                print(&done, "updated ");
+                print(&done, show);
+            }
+            if (f->hunks.len > 1) {
+                print(&done, " (");
+                print(&done, (i64)f->hunks.len);
+                print(&done, " hunks)");
+            }
+            if (e.text.len) {
+                print(&notes, " In ");
+                print(&notes, show);
+                putbyte(&notes, ':');
+                print(&notes, e.text);
+            }
+        } break;
+        }
+    }
+    Str d = finish(&done);
+    Str n = finish(&notes);
+    Buf b(a, 64 + d.len + n.len);
+    print(&b, "Applied the patch: ");
+    print(&b, d);
+    putbyte(&b, '.');
+    print(&b, n);
+    r.text = finish(&b);
+    r.ok   = 1;
     return r;
 }
 

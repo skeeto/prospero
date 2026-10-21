@@ -304,6 +304,15 @@ static void test_search(Test *t)
         ToolOut o = searchresult(os, a, "/s/out.log", &e);
         expect(t, "result grep", o.text, "src/a.c:1: int main(void)\nsrc/b.h:7: x\n");
 
+        // For hashline edits, the files' tags; one gone is left out
+        os_write(os, *a, "/w/src/a.c", "int main(void)\n");
+        e.tagged = 1;
+        o = searchresult(os, a, "/s/out.log", &e);
+        expect(t, "result grep tagged", o.text, concat(a, concat(a,
+               "src/a.c:1: int main(void)\nsrc/b.h:7: x\nTags for edit: [src/a.c#",
+               filetag(a, "int main(void)\n")), "]\n"));
+        e.tagged = 0;
+
         e.root = "/w/sub";
         o = searchresult(os, a, "/s/out.log", &e);
         expect(t, "result grep sub", o.text,

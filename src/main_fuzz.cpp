@@ -425,9 +425,25 @@ static void fuzzprovider(Arena a, Str src)
     Str needle = sep<0 ? Str("a") : cuthead(src, sep+2);
     if (needle.len) {
         fuzzspans(hay, matchexact(&a, hay, needle));
-        fuzzspans(hay, matchlines(&a, hay, needle));
         fuzzspans(hay, matchnorm(&a, hay, needle));
+        // Every rule of the ladder ends in a change or a reason
+        EditOut o = editreplace(&a, hay, "f", needle, "x\n", 0);
+        assert(o.data.data || o.text.len);
+        o = editreplace(&a, hay, "f", needle, needle, 1);
+        assert(o.data.data || o.text.len);
     }
+
+    // Patches: parsed or refused, and applied or refused, to the text
+    Patch pt = parsepatch(&a, src);
+    assert(pt.err.data || pt.files.len);
+    for (iz i = 0; i<pt.files.len && !pt.err.data; i++) {
+        if (pt.files[i].op == PATCH_UPDATE) {
+            EditOut o = patchupdate(&a, hay, "f", &pt.files[i]);
+            assert(o.data.data || o.text.len);
+        }
+    }
+    Str tag = filetag(&a, src);
+    assert(tag.len == 4);
 
     Url u = parseurl(src);
     assert(!u.ok || (u.host.len && u.port>0 && u.port<65536 && u.path.len && u.path[0]=='/'));
