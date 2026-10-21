@@ -37,7 +37,9 @@ target_compile_definitions(harness_core_flags INTERFACE
   HARNESS_VERSION="${PROJECT_VERSION}"
 )
 
-# Debug builds trap on undefined behavior, which includes failed asserts.
+# Debug builds trap on undefined behavior, which includes failed asserts,
+# and optimize the core a little (-Og), for speed nearer Release's on
+# slow machines, at some cost in a debugger.
 set(HARNESS_TRAP "")
 check_cxx_compiler_flag(-fsanitize-trap HARNESS_HAS_TRAP)
 if(HARNESS_HAS_TRAP)
@@ -54,7 +56,7 @@ if(HARNESS_TRAP AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(i.86|x86)$")
   list(APPEND HARNESS_TRAP -fno-sanitize=alignment)
 endif()
 target_compile_options(harness_core_flags INTERFACE
-  "$<$<CONFIG:Debug>:-g3;${HARNESS_TRAP}>")
+  "$<$<CONFIG:Debug>:-g3;-Og;${HARNESS_TRAP}>")
 target_link_options(harness_core_flags INTERFACE
   "$<$<CONFIG:Debug>:${HARNESS_TRAP}>")
 

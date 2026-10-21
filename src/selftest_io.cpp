@@ -321,9 +321,10 @@ static void testoverhead(ProcTest *p, Arena scratch)
     Timing rt     = timespawn(p, scratch, {none, 1, 1}, {}, 21);
     reporttiming(os, scratch, "reaper overhead", rt);
     // The target is for the executables people run: optimized, without
-    // sanitizers, which slow the reaper's start several times over
-    #if !defined(__OPTIMIZE__) || defined(__SANITIZE_THREAD__) || \
-            defined(__SANITIZE_ADDRESS__)
+    // sanitizers, which slow the reaper's start several times over, so
+    // not Debug builds (no NDEBUG), whose -Og is optimized too
+    #if !defined(__OPTIMIZE__) || !defined(NDEBUG) || \
+            defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
     b32 measured = 0;
     #elif defined(__has_feature)
     b32 measured = !__has_feature(thread_sanitizer) && !__has_feature(address_sanitizer);
