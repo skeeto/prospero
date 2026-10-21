@@ -78,6 +78,12 @@ enum : i32 {
     HOST_CMDS = 4096,  // commands awaiting replies, at most
 };
 
+// Records other threads post to a host's inbox (hoststop)
+enum : u32 {
+    HOST_STOPALL = 400,  // stop every turn and job, and run on
+    HOST_QUITALL,        // stop the engine, and so the host
+};
+
 static Str hostname(Arena *a, i32 proto)
 {
     Buf b(a, 16);
@@ -280,6 +286,7 @@ struct Host {
     Str             endpoint;
     Str             regpath;
     Listener       *listener;
+    iz              held;      // the lock that makes it the only host here
     HostConn       *conns;
     HostClient     *clients;
     HostClient     *dead;      // dropped this round, to release
@@ -1182,6 +1189,16 @@ static i32 hostloop(Host *h)
             case MAIL_QUIT:
                 stopped = 1;
                 break;
+            case HOST_STOPALL:
+                hostown(h, scratch, CMD_STOP, HOSTCMD_QUIET, {}, -1, -1);
+                break;
+            case HOST_QUITALL:
+                if (!h->quitting) {
+                    hostsay(os, scratch, "asked to stop");
+                    hostown(h, scratch, CMD_QUIT, HOSTCMD_QUIET, {}, -1, -1);
+                    h->quitting = 1;
+                }
+                break;
             case CONN_NEW: {
                 Conn *c = 0;
                 copybytes(&c, r.data.data, sizeof(c));
@@ -1252,6 +1269,142 @@ static i64 hostticks(Config *cfg, Str key)
     return cfgms(cfg, "host", "", key, 0) * MS;
 }
 
+// Take the lock that makes the host of a state directory the only one:
+// its handle, or -1 if another process holds it.
+static iz hostlock(Os *os, Arena *perm, Arena scratch, Str statedir)
+{
+    Str run = join(perm, statedir, "run");
+    if (!os_mkdirs(os, scratch, run)) {
+        return -1;
+    }
+    Str lock = concat(perm, join(perm, run, hostname(perm, HOST_PROTO)), ".lock");
+    return os_lockfile(os, scratch, lock);
+}
+
+// A host for an engine that runs already, whose records arrive in its
+// inbox, which has no notify hook: given the lock (hostlock, else -1 to
+// take it here), the endpoint, the listener and the registration. The
+// host's commands to the engine take ids above firstid, and so above
+// those of whoever had the engine before, whose late replies are then
+// never taken for the host's. The host owns perm from then on: nothing
+// else may allocate there. Null on failure, with why in *err, and the
+// lock let go.
+struct HostConf {
+    Config  *cfg;
+    Str      statedir;
+    Engine  *e;
+    Mailbox *inbox;
+    i64      idle;     // ticks
+    i64      firstid;
+    iz       held;     // the lock, or -1
+};
+
+static Host *newhost(Os *os, Arena *perm, Arena scratch, HostConf *hc, Str *err)
+{
+    Host *h = alloc<Host>(perm);
+    h->os       = os;
+    h->cfg      = hc->cfg;
+    h->proto    = HOST_PROTO;
+    h->statedir = hc->statedir;
+    h->e        = hc->e;
+    h->inbox    = hc->inbox;
+    h->nextid   = hc->firstid>0 ? hc->firstid : 0;
+    h->held     = hc->held>=0 ? hc->held : hostlock(os, perm, scratch, h->statedir);
+    if (h->held < 0) {
+        *err = concat(perm, "a host already runs for this state directory: ", h->statedir);
+        return 0;
+    }
+    // Test hooks: another protocol, to test a mismatch, and a small
+    // queue per client, to test one that falls behind
+    Int proto = parseint(os_getenv(os, &scratch, "HARNESS_TEST_PROTO"));
+    Int keep  = parseint(os_getenv(os, &scratch, "HARNESS_TEST_KEEPMAX"));
+    h->proto   = proto.ok ? (i32)proto.val : h->proto;
+    h->keepmax = HOST_KEEPMAX;
+    if (keep.ok && keep.val>=1<<10 && keep.val<=HOST_KEEPMAX) {
+        h->keepmax = (iz)keep.val;
+    }
+
+    Str why = {};
+    h->endpoint = os_endpoint(os, perm, h->statedir, hostname(perm, HOST_PROTO));
+    h->scratch  = os_reserve(os, HOST_SCRATCH);
+    h->cmds     = alloc<HostCmd>(perm, HOST_CMDS);
+    h->idle     = hc->idle;
+    h->grace    = hostticks(h->cfg, "grace");
+    h->busyat   = os_ticks(os);
+    if (!h->endpoint.len) {
+        why = concat(perm, "cannot make a place for the endpoint: ", os_lasterr(os, &scratch));
+    } else if (!h->scratch) {
+        why = "out of memory";
+    } else if (!(h->listener = os_listen(os, scratch, h->endpoint, h->inbox))) {
+        why = concat(perm, "cannot listen: ", os_lasterr(os, &scratch));
+    }
+    if (why.len) {
+        *err = why;
+        os_unlockfile(os, h->held);
+        return 0;
+    }
+
+    // Registered, after clearing out what is stale: anything with this
+    // endpoint (whose lock is held here), or that nobody answers
+    Str dir = hostsdir(perm, h->statedir);
+    os_mkdirs(os, scratch, dir);
+    for (HostEntry *e = hostentries(os, &scratch, h->statedir); e; e = e->next) {
+        Arena a = scratch;
+        if (e->endpoint==h->endpoint || !os_listening(os, a, e->endpoint)) {
+            os_remove(os, a, e->path);
+        }
+    }
+    i64 pid = os_pid(os);
+    Buf b(&scratch, 64);
+    print(&b, pid);
+    print(&b, ".ini");
+    h->regpath = join(perm, dir, finish(&b));
+    Str entry = hostentry(&scratch, pid, h->endpoint, os_time(os), HOST_PROTO);
+    os_write(os, scratch, h->regpath, entry);
+
+    b = Buf(&scratch, 256);
+    print(&b, "host ");
+    print(&b, pid);
+    print(&b, " listening at ");
+    print(&b, h->endpoint);
+    hostsay(os, scratch, finish(&b));
+    h->perm = *perm;  // for session names, from now on
+    return h;
+}
+
+// What a host knows of a session before it starts, from whoever had its
+// engine before: a subagent's parent, and whether it is at work. Only
+// before hostrun, on the thread that will run it.
+static void hostseed(Host *h, Str sid, Str parent, b32 busy)
+{
+    HostSess *ss = hostsess(h, sid);
+    ss->busy = busy;
+    if (validsid(parent) && !ss->parent.len) {
+        ss->parent = clone(&h->perm, parent);
+    }
+}
+
+// From any thread: stop every turn and job, the host running on (quit
+// clear), or stop the engine, and with it the host (quit set).
+static void hoststop(Host *h, b32 quit)
+{
+    mailpost(h->inbox, quit ? HOST_QUITALL : HOST_STOPALL, 0, {}, 1);
+}
+
+// Run a host until its engine stops, then take down its place: the
+// listener, the registration and the lock.
+static i32 hostrun(Host *h)
+{
+    Os   *os      = h->os;
+    i32   r       = hostloop(h);
+    Arena scratch = newarena(h->scratch);
+    os_unlisten(os, h->listener);
+    os_remove(os, scratch, h->regpath);
+    os_unlockfile(os, h->held);
+    hostsay(os, scratch, "host stopped");
+    return r;
+}
+
 static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 {
     Str config = {}, state = {}, idle = {};
@@ -1280,94 +1433,29 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         return 2;
     }
 
-    Host *h = alloc<Host>(&perm);
-    h->os       = os;
-    h->cfg      = cfg;
-    h->proto    = HOST_PROTO;
-    h->statedir = statedir;
-    Str run = join(&perm, h->statedir, "run");
-    Str sessions = join(&perm, h->statedir, "sessions");
-    if (!os_mkdirs(os, scratch, sessions) || !os_mkdirs(os, scratch, run)) {
-        Str err = os_lasterr(os, &scratch);
-        hostsay(os, scratch, "cannot create the state directory", err);
-        return 2;
-    }
-    // Test hooks: another protocol, to test a mismatch, and a small
-    // queue per client, to test one that falls behind
-    Int proto = parseint(os_getenv(os, &perm, "HARNESS_TEST_PROTO"));
-    Int keep  = parseint(os_getenv(os, &perm, "HARNESS_TEST_KEEPMAX"));
-    h->proto   = proto.ok ? (i32)proto.val : h->proto;
-    h->keepmax = HOST_KEEPMAX;
-    if (keep.ok && keep.val>=1<<10 && keep.val<=HOST_KEEPMAX) {
-        h->keepmax = (iz)keep.val;
-    }
-
-    Str name = hostname(&perm, HOST_PROTO);
-    Str lock = concat(&perm, join(&perm, run, name), ".lock");
-    iz  held = os_lockfile(os, scratch, lock);
-    if (held < 0) {
-        hostsay(os, scratch, "a host already runs for this state directory", h->statedir);
+    // The lock first, so that a second host never starts an engine
+    HostConf hc = {};
+    hc.cfg      = cfg;
+    hc.statedir = statedir;
+    hc.held     = hostlock(os, &perm, scratch, statedir);
+    if (hc.held < 0) {
+        hostsay(os, scratch, "a host already runs for this state directory", statedir);
         return 1;
     }
-    h->endpoint = os_endpoint(os, &perm, h->statedir, name);
-    if (!h->endpoint.len) {
-        Str err = os_lasterr(os, &scratch);
-        hostsay(os, scratch, "cannot make a place for the endpoint", err);
-        return 1;
-    }
-
-    h->inbox   = newmailbox(&perm, HOST_INBOX, 0, 0);
-    h->scratch = os_reserve(os, HOST_SCRATCH);
-    h->cmds    = alloc<HostCmd>(&perm, HOST_CMDS);
-    h->idle    = idle.len ? (i64)(secs.val*(f64)SEC) : hostticks(cfg, "idle_exit");
-    h->grace   = hostticks(cfg, "grace");
-    h->busyat  = os_ticks(os);
-    h->e       = h->inbox && h->scratch ?
-                 newengine(os, &perm, cfg, h->statedir, h->inbox) : 0;
-    if (!h->e || !enginestart(h->e)) {
+    hc.inbox = newmailbox(&perm, HOST_INBOX, 0, 0);
+    hc.idle  = idle.len ? (i64)(secs.val*(f64)SEC) : hostticks(cfg, "idle_exit");
+    hc.e     = hc.inbox ? newengine(os, &perm, cfg, statedir, hc.inbox) : 0;
+    if (!hc.e || !enginestart(hc.e)) {
         hostsay(os, scratch, "cannot start the engine");
         return 2;
     }
-    h->perm = perm;  // for session names, from now on
-
-    h->listener = os_listen(os, scratch, h->endpoint, h->inbox);
-    if (!h->listener) {
-        Str err = os_lasterr(os, &scratch);
-        hostsay(os, scratch, "cannot listen", err);
+    Str   err = {};
+    Host *h   = newhost(os, &perm, scratch, &hc, &err);
+    if (!h) {
+        hostsay(os, scratch, err);
         return 1;
     }
-
-    // Registered, after clearing out what is stale: anything with this
-    // endpoint (whose lock is held here), or that nobody answers
-    Str dir = hostsdir(&h->perm, h->statedir);
-    os_mkdirs(os, scratch, dir);
-    for (HostEntry *e = hostentries(os, &scratch, h->statedir); e; e = e->next) {
-        Arena a = scratch;
-        if (e->endpoint==h->endpoint || !os_listening(os, a, e->endpoint)) {
-            os_remove(os, a, e->path);
-        }
-    }
-    i64 pid = os_pid(os);
-    Buf b(&scratch, 64);
-    print(&b, pid);
-    print(&b, ".ini");
-    h->regpath = join(&h->perm, dir, finish(&b));
-    Str entry = hostentry(&scratch, pid, h->endpoint, os_time(os), HOST_PROTO);
-    os_write(os, scratch, h->regpath, entry);
-
-    b = Buf(&scratch, 256);
-    print(&b, "host ");
-    print(&b, pid);
-    print(&b, " listening at ");
-    print(&b, h->endpoint);
-    hostsay(os, scratch, finish(&b));
-
-    i32 r = hostloop(h);
-    os_unlisten(os, h->listener);
-    os_remove(os, scratch, h->regpath);
-    os_unlockfile(os, held);
-    hostsay(os, scratch, "host stopped");
-    return r;
+    return hostrun(h);
 }
 
 

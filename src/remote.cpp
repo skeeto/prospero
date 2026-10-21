@@ -55,6 +55,7 @@ static i64 remotebackoff[] = {1*SEC, 2*SEC, 5*SEC, 10*SEC, 30*SEC};
 
 enum : u32 {
     REMOTE_CLOSE = 300,  // frontend to the remote thread: remoteclose
+    REMOTE_DROP,         // and remotedrop, a test hook
 };
 
 enum : i32 {
@@ -77,6 +78,9 @@ struct RemoteConf {
     Str localstate;  // here: for ssh's errors, or the host of --local
     Str config;    // --local: the configuration of a host started here
     Str idle;      // --idle for a host started (tests)
+    Str endpoint;  // this machine's host at this endpoint, and no other:
+                   // none is started, and once it cannot be reached the
+                   // remote ends (closed), as the host is gone
 };
 
 // A session the frontend opened, or has records of.
@@ -115,6 +119,7 @@ struct Remote {
     b32               quitting;
     b32               done;     // MAIL_QUIT posted: the thread ends
     b32               shut;     // the stream's input was ended
+    b32               gone;     // its endpoint's host cannot be reached
     Slice<RemoteSess> sess;
     Slice<i64>        pending;  // the frontend's commands awaiting replies
     Slice<i64>        newids;   // of those, new commands: the sid to track
@@ -282,7 +287,17 @@ static b32 remotestart(Remote *r, Arena scratch)
     r->dec.bad = 0;
     i64 now = os_ticks(os);
 
-    if (!r->conf.ssh.len) {
+    if (r->conf.endpoint.len) {
+        r->conn = os_connect(os, scratch, r->conf.endpoint, r->in, r->tid);
+        if (!r->conn) {
+            r->gone = 1;
+            r->why  = clone(&r->perm, "the host is gone");
+            return 0;
+        }
+        r->live = 1;
+        linkconnect(&r->link, now);
+        return 1;
+    } else if (!r->conf.ssh.len) {
         Str state    = r->conf.localstate;
         Str run      = join(&scratch, state, "run");
         Str name     = hostname(&scratch, HOST_PROTO);
@@ -329,6 +344,10 @@ static b32 remotestart(Remote *r, Arena scratch)
     if (!ok) {
         r->why = clone(&r->perm, "a path for the remote machine has a quote, $, `, % "
                                  "or a control character, which its shell cannot take");
+        return 0;
+    } else if (r->conf.ssh[0] == '-') {
+        // ssh would take it for an option, which may run a command here
+        r->why = clone(&r->perm, "an ssh destination cannot begin with -");
         return 0;
     }
     Str opts[] = {
@@ -441,6 +460,9 @@ static void remotedown(Remote *r, Arena scratch, Str why, i32 code)
         return;
     } else if (r->quitting) {
         remoteend(r, scratch, RS_CLOSED, "the host stopped");
+        return;
+    } else if (r->gone) {
+        remoteend(r, scratch, RS_CLOSED, r->why);  // nobody to try again
         return;
     }
     b32 now = code == HOST_NOSERVER;
@@ -732,6 +754,11 @@ static void remotethread(void *arg)
                     linkbye(&r->link);
                 }
                 break;
+            case REMOTE_DROP:
+                if (r->live && !r->closing) {
+                    remotedown(r, a, "the stream was dropped (a test)", -1);
+                }
+                break;
             case PROC_DATA:
             case CONN_DATA:
                 if (rec.id==r->tid && r->live) {
@@ -796,6 +823,7 @@ static Remote *newremote(Os *os, Arena *perm, RemoteConf *conf, Mailbox *out)
     r->conf.localstate = clone(&r->perm, conf->localstate);
     r->conf.config     = clone(&r->perm, conf->config);
     r->conf.idle       = clone(&r->perm, conf->idle);
+    r->conf.endpoint   = clone(&r->perm, conf->endpoint);
     if (!r->conf.name.len) {
         r->conf.name = "local";
     }
@@ -813,10 +841,24 @@ static b32 remotecmd(Remote *r, Str line)
     return line.len<=mailmax(r->in) && mailpost(r->in, MAIL_CMD, 0, line, 1);
 }
 
+// The same without waiting, for a frontend whose own thread takes the
+// remote's records: 0 if the remote's mailbox is full.
+static b32 remotetry(Remote *r, Str line)
+{
+    return line.len<=mailmax(r->in) && mailpost(r->in, MAIL_CMD, 0, line, 0);
+}
+
 // End the link: the host forgets this client, MAIL_QUIT follows.
 static void remoteclose(Remote *r)
 {
     mailpost(r->in, REMOTE_CLOSE, 0, {}, 1);
+}
+
+// A test hook: break the stream, killing ssh, as a network would, so
+// that the link comes back over another.
+static void remotedrop(Remote *r)
+{
+    mailpost(r->in, REMOTE_DROP, 0, {}, 1);
 }
 
 
@@ -826,9 +868,11 @@ static Str connectusage =
 "usage: harness connect NAME [options]\n"
 "       harness connect --ssh DEST [options]\n"
 "       harness connect --local [options]\n"
+"       harness connect --endpoint EP [options]\n"
 "Protocol v0 on standard I/O, as harness --headless, with the engine\n"
-"a host on another machine ([remote NAME], or --ssh), or on this one.\n"
-"When standard input ends, the link ends: the host runs on.\n"
+"a host on another machine ([remote NAME], or --ssh), or on this one\n"
+"(starting one if none runs, or only the one at EP, as harness hosts\n"
+"lists it). When standard input ends, the link ends: the host runs on.\n"
 "options:\n"
 "  --ssh DEST          ssh destination: [user@]host\n"
 "  --path PATH         the harness there (default: harness)\n"
@@ -904,6 +948,8 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             rc.idle = args[++i];
         } else if (a == "--local") {
             local = 1;
+        } else if (a=="--endpoint" && more) {
+            rc.endpoint = args[++i];
         } else if (!name.len && a.len && a[0]!='-') {
             name = a;
         } else {
@@ -911,7 +957,7 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             return 2;
         }
     }
-    if (local == (rc.ssh.len || name.len)) {
+    if (local + (rc.ssh.len || name.len) + (rc.endpoint.len>0) != 1) {
         os_print(os, 2, connectusage);
         return 2;
     }

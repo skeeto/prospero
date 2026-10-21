@@ -9,7 +9,9 @@
 // The consumer is woken through the ready event, or through a notify
 // hook in its place (the GUI wakes with os_wake). Only the first record
 // or drop after a take wakes it, so it must take everything after each
-// wake.
+// wake. Another consumer may take over, by the other means (mailnotify):
+// the GUI's inbox goes to a host thread when its engine is kept running
+// in the background.
 //
 // A producer either waits for room (backpressure: HTTP body chunks) or
 // never blocks and drops the record when the buffer is full (engine
@@ -83,16 +85,36 @@ static Mailbox *newmailbox(Arena *perm, iz cap,
     return m;
 }
 
+// Hand the consumer's side to another kind of consumer: a notify hook in
+// place of the ready event, or none for mailwait. The ready event is
+// signaled after, as a record posted before the change may have notified
+// the old consumer instead, so that the new one takes a look at once.
+static void mailnotify(Mailbox *m, void (*notify)(void *), void *ctx)
+{
+    os_lock(&m->lock);
+    m->notify = notify;
+    m->ctx    = ctx;
+    os_unlock(&m->lock);
+    os_signal(&m->ready);
+}
+
 // The largest payload a record may carry.
 static iz mailmax(Mailbox *m)
 {
     return m->cap - MAIL_HEADER;
 }
 
-static void mailwake(Mailbox *m)
+// How to wake the consumer, read under the lock, since mailnotify may
+// change it, and used once the lock is let go.
+struct MailWake {
+    void (*notify)(void *);
+    void  *ctx;
+};
+
+static void mailwake(Mailbox *m, MailWake w)
 {
-    if (m->notify) {
-        m->notify(m->ctx);
+    if (w.notify) {
+        w.notify(w.ctx);
     } else {
         os_signal(&m->ready);
     }
@@ -108,11 +130,12 @@ static b32 mailpost(Mailbox *m, u32 type, u64 id, Str data, b32 block)
     if (data.len > mailmax(m)) {
         // Into an empty mailbox, no record will wake the consumer, which
         // must still learn of the drop.
-        b32 wake = !m->len && !m->overflow;
+        b32      wake = !m->len && !m->overflow;
+        MailWake how  = {m->notify, m->ctx};
         m->overflow = 1;
         os_unlock(&m->lock);
         if (wake) {
-            mailwake(m);
+            mailwake(m, how);
         }
         return 0;
     }
@@ -147,13 +170,14 @@ static b32 mailpost(Mailbox *m, u32 type, u64 id, Str data, b32 block)
     for (iz i = MAIL_HEADER+data.len; i < need; i++) {
         dst[i] = 0;
     }
-    b32 wake = !m->len && !m->overflow;
-    b32 pass = waited && m->waiting;  // the take woke only one of them
+    b32      wake = !m->len && !m->overflow;
+    b32      pass = waited && m->waiting;  // the take woke only one of them
+    MailWake how  = {m->notify, m->ctx};
     m->len += need;
     os_unlock(&m->lock);
 
     if (wake) {
-        mailwake(m);
+        mailwake(m, how);
     }
     if (pass) {
         os_signal(&m->space);

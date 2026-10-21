@@ -257,4 +257,22 @@ static void test_mailbox(Test *t)
         putbyte(&b, '0' + (u8)mailwait(m, 0));
         expect(t, "mail.notify", finish(&b), "112 0");
     }
+
+    // Another consumer takes over (the GUI's inbox, given to a host
+    // thread): records the old one was notified of, and never took, are
+    // the new one's at once, and later ones signal it
+    {
+        i32      count = 0;
+        Mailbox *m     = newmailbox(&a, 256, wakecount, &count);
+        Buf b(&a, 16);
+        mailpost(m, 1, 0, "a", 0);
+        mailnotify(m, 0, 0);
+        putbyte(&b, '0' + (u8)mailwait(m, 0));
+        putbyte(&b, '0' + (u8)mailwait(m, 0));
+        print(&b, mailshow(&a, mailtake(m)));
+        mailpost(m, 2, 0, "b", 0);
+        print(&b, (i64)count);
+        putbyte(&b, '0' + (u8)mailwait(m, 0));
+        expect(t, "mail.handover", finish(&b), "101/0:a;11");
+    }
 }

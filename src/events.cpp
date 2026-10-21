@@ -118,13 +118,15 @@ enum : i32 {
     CMD_REWIND,
     CMD_JOBKILL,
     CMD_STATUS,  // (M5) whether anything runs: for a host's idle exit
+    CMD_STOP,    // (M5) stop every turn and job, running on
+    CMD_FILE,    // (M5) part of a file in a session's directory
     CMD_COUNT,
 };
 
 static Str cmdnames[] = {
     "", "hello", "list", "new", "open", "close", "prompt", "steer",
     "cancel", "answer", "config.get", "config.set", "quit", "rewind",
-    "job.kill", "status",
+    "job.kill", "status", "stop", "file",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 

@@ -109,6 +109,7 @@ enum : i64 {
     LIVE_EVERY   = 1*SEC,         // live records while a request runs
     TITLE_MAX    = 60,            // code points
     SNAPSHOT_MAX = 256 << 10,     // bytes of text in a snapshot
+    FILECMD_MAX  = 1 << 20,       // bytes of a file a file command gives
     PARK_IDLE    = 7*60*SEC,      // idle this long, a session is parked
     TASK_SOFT    = 200,           // a subagent's requests, by default
 };
@@ -5929,6 +5930,68 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     emit(e, evend(&w));
 }
 
+// file {sid, path, off?, max?}: part of a file in the session's
+// directory, for a frontend that cannot read it there, as on another
+// machine: a spill file, out/N.log. The path is relative, and it and
+// what it resolves to stay inside the directory. From off (0), up to max
+// bytes, or FILECMD_MAX, or less where the frontend's mailbox could not
+// take the reply. The reply has the text, cleaned as tool output is and
+// cut on a UTF-8 boundary, off where the next part begins, the file's
+// size, and more:1 if there is more after it.
+static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
+{
+    Os *os   = e->os;
+    Str path = jsonstr(jsonget(j, "path"));
+    i64 off  = jsonint(jsonget(j, "off"), 0);
+    i64 max  = jsonint(jsonget(j, "max"), FILECMD_MAX);
+    iz  most = mailmax(e->out) / 8;  // every byte may be escaped
+    most = most<(iz)FILECMD_MAX ? most : (iz)FILECMD_MAX;
+    max  = max<1 || max>most ? most : max;
+
+    // Plain names below the directory: no root, drive, "..", or NUL
+    b32 bad = !path.len || off<0 || path[0]=='/' || path[0]=='\\' ||
+              cut(path, 0).ok || cut(path, ':').ok;
+    for (Str rest = path; !bad && rest.len;) {
+        iz i = 0;
+        for (; i<rest.len && rest[i]!='/' && rest[i]!='\\'; i++) {}
+        bad  = takehead(rest, i) == "..";
+        rest = cuthead(rest, i + (i<rest.len));
+    }
+    Str dir  = bad ? Str{} : os_realpath(os, &scratch, s->dir);
+    Str real = dir.data ? os_realpath(os, &scratch, join(&scratch, s->dir, path)) : Str{};
+    if (!real.data || !within(normpath(&scratch, dir, ".", HOST_WINDOWS),
+                              normpath(&scratch, dir, real, HOST_WINDOWS), HOST_WINDOWS)) {
+        reply(e, scratch, id, 0, "no such file in the session's directory", s->sid);
+        return;
+    }
+    Read rd = os_readat(os, &scratch, real, off, (iz)max);
+    if (rd.err != READ_OK) {
+        reply(e, scratch, id, 0, rd.err==READ_NOTFOUND ? Str("no such file")
+                                                       : Str("cannot read the file"), s->sid);
+        return;
+    }
+    Str data = rd.data;
+    b32 more = off+data.len < rd.size;
+    if (more) {
+        // Before any character at the end, which may be cut short
+        iz i = data.len - 1;
+        for (; i>0 && data.len-i<4 && (data[i]&0xc0)==0x80; i--) {}
+        data.len = i>0 && data[i]>=0x80 ? i : data.len;
+    }
+
+    Str   text = cleanoutput(&scratch, data);
+    Buf   b(&scratch, 256 + 6*text.len);
+    EvOut w = evbegin(&b, s->sid, 0, os_time(os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "path", path);
+    putstrkey(&w.json, "text", text);
+    putintkey(&w.json, "off", off + data.len);
+    putintkey(&w.json, "size", rd.size);
+    putintkey(&w.json, "more", more);
+    emit(e, evend(&w));
+}
+
 // A session as the sessions list shows it.
 struct ListEntry {
     Str       sid;
@@ -6257,6 +6320,14 @@ static void command(Engine *e, Arena scratch, Str line)
         putintkey(&w.json, "jobs", jobs);
         emit(e, evend(&w));
     } return;
+    case CMD_STOP:
+        // As quit does, but running on: a background host's "Stop all"
+        for (Session *t = e->sessions; t; t = t->next) {
+            cancelturn(t, scratch);
+            stopjobs(t, scratch, 0);
+        }
+        reply(e, scratch, id, 1, {}, {});
+        return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});
         return;
@@ -6269,12 +6340,15 @@ static void command(Engine *e, Arena scratch, Str line)
     if (!s) {
         reply(e, scratch, id, 0, "no such open session", sid);
         return;
-    } else if (s->readonly && cmd!=CMD_CLOSE) {
+    } else if (s->readonly && cmd!=CMD_CLOSE && cmd!=CMD_FILE) {
         reply(e, scratch, id, 0, "read-only: another process has this "
               "session open; open it again once that one has closed it", sid);
         return;
     }
     switch (cmd) {
+    case CMD_FILE:
+        cmdfile(e, s, scratch, id, j);
+        return;
     case CMD_CLOSE:
         // Nobody is left to answer asks, nor to need background jobs
         reply(e, scratch, id, 1, {}, sid);

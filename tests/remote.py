@@ -842,6 +842,94 @@ def version_mismatch(t):
     t.check(fails, "a failed record")
 
 
+@scenario
+def file_cmd(t):
+    """The file command: a call's spill file through the host, in parts,
+    and nothing outside the session's directory, a link out included."""
+    c = Client(t)
+    s = c.attach()
+    c.call("hello")
+    r = c.call("new", cwd=t.work, prompt="go", model=t.model("remote_tool"), attended=1)
+    sid = r["sid"]
+    end = s.wait(lambda r: r.get("ev") == "tool.end" and r.get("sid") == sid,
+                 what="the tool")
+    spill = end.get("spill")
+    t.check(spill, f"a spill file: {end}")
+    f = c.call("file", sid=sid, path=spill)
+    t.check(f.get("ok") == 1 and f.get("text") == "hi\n" and f.get("more") == 0 and
+            f.get("size") == 3 and f.get("off") == 3, f"the whole file: {f}")
+    p = c.call("file", sid=sid, path=spill, off=1, max=1)
+    t.check(p.get("ok") == 1 and p.get("text") == "i" and p.get("more") == 1 and
+            p.get("off") == 2, f"a part: {p}")
+    sdir = os.path.join(t.state, "sessions", sid)
+    os.symlink(t.config, os.path.join(sdir, "out", "link.ini"))
+    for bad in ("../../harness.ini", "/etc/hosts", "out/../../" + sid + "/events.jsonl",
+                "out/link.ini", "", "C:x", "out\\..\\..\\x"):
+        x = c.call("file", sid=sid, path=bad)
+        t.check(x.get("ok") == 0, f"refused {bad!r}: {x}")
+    e = c.call("file", sid=sid, path="events.jsonl", max=64)
+    t.check(e.get("ok") == 1 and e.get("more") == 1 and e.get("off") == 64 and
+            e.get("text", "").startswith('{"sid":"' + sid), f"its log, in part: {e}")
+    s.disconnect()
+
+
+@scenario
+def stop_cmd(t):
+    """The stop command, as the tray's "Stop all": the turn ends, and the
+    engine runs on."""
+    c = Client(t)
+    s = c.attach()
+    c.call("hello")
+    r = c.call("new", cwd=t.work, prompt="go", attended=1)
+    sid = r["sid"]
+    s.wait(lambda r: r.get("ev") == "delta" and r.get("sid") == sid, what="a delta")
+    x = c.call("stop")
+    t.check(x.get("ok") == 1, f"stop: {x}")
+    end = s.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                 what="turn.end")
+    t.check(end.get("why") == "cancel", f"turn.end {end}")
+    st = c.call("status")
+    t.check(st.get("ok") == 1 and st.get("turns") == 0, f"status after: {st}")
+    p = c.call("prompt", sid=sid, text="again")
+    t.check(p.get("ok") == 1, f"a prompt after: {p}")
+    s.wait(lambda r: r.get("ev") == "turn.end" and r.get("turn") == 2, timeout=30,
+           what="turn 2")
+    s.disconnect()
+
+
+@scenario
+def connect_endpoint(t):
+    """The client library at a registered endpoint, as the GUI reaches a
+    background host: it starts no host, and once the host is gone it
+    ends, closed, rather than try forever."""
+    a = Client(t)
+    sa = a.attach()
+    a.call("hello")
+    hosts = subprocess.run([t.harness, "hosts", "--state", t.state],
+                           capture_output=True, text=True).stdout.splitlines()
+    t.check(len(hosts) == 1, f"one host: {hosts}")
+    ep = json.loads(hosts[0])["endpoint"]
+    c = connect(t, ["--endpoint", ep, "--state", os.path.join(t.root, "local")])
+    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
+    r = c.call("new", cwd=t.work, prompt="go", attended=1)
+    t.check(r.get("ok") == 1, f"new: {r}")
+    c.wait(lambda r: r.get("ev") == "turn.end", what="turn.end")
+    q = a.call("quit")
+    t.check(q.get("ok") == 1, f"quit: {q}")
+    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "closed",
+           what="closed", timeout=30)
+    closed = [r for r in c.records if r.get("ev") == "remote" and r.get("state") == "closed"]
+    t.check("gone" in closed[-1].get("msg", "") or "stopped" in closed[-1].get("msg", ""),
+            f"why: {closed[-1]}")
+    try:
+        rc = c.p.wait(10)
+    except subprocess.TimeoutExpired:
+        raise Failure("connect did not end with its host")
+    t.check(rc == 0, f"connect exit {rc}")
+    t.check(not t.hostpids(), "no host started")
+    sa.disconnect()
+
+
 def fakessh(t):
     """An ssh that runs the command here, recording its pid."""
     path = os.path.join(t.root, "fakessh")
