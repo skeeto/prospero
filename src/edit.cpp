@@ -818,7 +818,8 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
     for (i32 rung = RUNG_EXACT; rung <= RUNG_NORM; rung++) {
         // The bytes, exactly or in normal form, may be part of a line
         if (rung==RUNG_EXACT || (rung==RUNG_NORM && loose)) {
-            Slice<Span> m = rung ? matchnorm(a, data, oldstr) : matchexact(a, data, oldstr);
+            Slice<Span> m = rung ? matchnorm(a, data, oldstr)
+                                 : matchexact(a, data, oldstr);
             if (m.len>1 && !all) {
                 r.text = ambiguous(a, &t, show, spanlines(a, data, m));
                 return r;
@@ -995,6 +996,24 @@ static Str tagof(Str tag)
     return tag;
 }
 
+// The lines of a file after hashline edits, and where each edit's own
+// lines went among them.
+struct HashOut {
+    Slice<Str>  out;
+    Slice<Span> done;
+};
+
+static void hashput(Arena *a, Text *t, HashOut *w, Str text)
+{
+    Slice<Str> add = givenlines(a, text);
+    Span       s   = {w->out.len, 0};
+    for (iz i = 0; i < add.len; i++) {
+        w->out = push(a, w->out, addline(a, t, add[i]));
+    }
+    s.end   = w->out.len;
+    w->done = push(a, w->done, s);
+}
+
 // Apply line edits to a file's content (data), named show, whose tag
 // the agent read as tag.
 static EditOut edithash(Arena *a, Str data, Str show, Str tag, Slice<HashEdit> edits)
@@ -1092,41 +1111,28 @@ static EditOut edithash(Arena *a, Str data, Str show, Str tag, Slice<HashEdit> e
     }
 
     // Walk the file once, in order of position
-    Slice<Str>  out  = {};
-    Slice<Span> done = {};  // the lines each edit left, in out
-    iz          q    = 0;   // next insert
+    HashOut w = {};
+    iz      q = 0;  // next insert
     for (; q<inserts.len && inserts[q]->line==0; q++) {
-        Span s = {out.len, 0};
-        Slice<Str> add = givenlines(a, inserts[q]->text);
-        for (iz k = 0; k < add.len; k++) out = push(a, out, addline(a, &t, add[k]));
-        s.end = out.len;
-        done = push(a, done, s);
+        hashput(a, &t, &w, inserts[q]->text);
     }
     for (iz i = 1, k = 0; i <= n;) {
         iz last = i;  // the line after which inserts go
         if (k<ranges.len && ranges[k]->line==i) {
             HashEdit *h = ranges[k++];
-            Span      s = {out.len, 0};
-            if (h->op == HASH_REPLACE) {
-                Slice<Str> add = givenlines(a, h->text);
-                for (iz j = 0; j < add.len; j++) out = push(a, out, addline(a, &t, add[j]));
-            }
-            s.end = out.len;
-            done  = push(a, done, s);
-            last  = (iz)h->end;
-            i     = (iz)h->end + 1;
+            hashput(a, &t, &w, h->op==HASH_REPLACE ? h->text : Str{});
+            last = (iz)h->end;
+            i    = (iz)h->end + 1;
         } else {
-            out = push(a, out, t.lines[i-1]);
+            w.out = push(a, w.out, t.lines[i-1]);
             i++;
         }
         for (; q<inserts.len && inserts[q]->line==last; q++) {
-            Span s = {out.len, 0};
-            Slice<Str> add = givenlines(a, inserts[q]->text);
-            for (iz j = 0; j < add.len; j++) out = push(a, out, addline(a, &t, add[j]));
-            s.end = out.len;
-            done  = push(a, done, s);
+            hashput(a, &t, &w, inserts[q]->text);
         }
     }
+    Slice<Str>  out  = w.out;
+    Slice<Span> done = w.done;
     Str result = jointext(a, &t, out);
     if (result == data) {
         Buf b(a, 128);
@@ -1301,7 +1307,8 @@ static Patch parsepatch(Arena *a, Str text)
                 path = trim(cuthead(hd, 16));
             } else if (startswith(hd, "*** Move to:")) {
                 if (!f || f->op!=PATCH_UPDATE || f->hunks.len || f->to.data) {
-                    r.err = patcherr(a, at, "*** Move to must follow its *** Update File line");
+                    r.err = patcherr(a, at, "*** Move to must follow its "
+                                     "*** Update File line");
                     return r;
                 }
                 f->to = trim(cuthead(hd, 12));
@@ -1601,8 +1608,9 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
             switch (hl[k].kind) {
             case ' ': x.lines = push(a, x.lines, t.lines[j++]); break;
             case '-': j++; break;
-            case '+': x.lines = push(a, x.lines, addline(a, &t, reindent(a, hl[k].text, in)));
-                      break;
+            case '+':
+                x.lines = push(a, x.lines, addline(a, &t, reindent(a, hl[k].text, in)));
+                break;
             }
         }
         sp     = push(a, sp, x);
