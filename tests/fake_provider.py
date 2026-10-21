@@ -1320,6 +1320,13 @@ def sc_edit_hashline(model, n, req):
         tag = edited.split("[list.txt#", 1)[1].split("]", 1)[0]
         yield from tool(model, n, "edit", {"path": "list.txt", "tag": tag, "edits": [
             {"op": "insert", "line": 4, "text": "end\n"}]})
+    elif k == 4:
+        yield from tool(model, n, "grep", {"pattern": "TWO"})
+    elif k == 5:
+        # The tag grep lists works too
+        tag = res[0].split("[list.txt#", 1)[1].split("]", 1)[0]
+        yield from tool(model, n, "edit", {"path": "list.txt", "tag": tag, "edits": [
+            {"op": "replace", "line": 3, "text": "two"}]})
     else:
         yield from answer(model, "Edited by line.")
 

@@ -54,6 +54,7 @@ enum : i64 {
     SEARCH_RESULTS = 100,             // lines or files shown
     SEARCH_TIMEOUT = 30,              // seconds
     SEARCH_LINEMAX = 300,             // bytes of a matching line shown
+    SEARCH_TAGS    = 20,              // files whose tags grep lists (hashline)
     SEARCH_OUTMAX  = 256 << 10,       // search output kept, then killed
     SEARCH_GLOBMAX = (i64)8 << 20,    // ripgrep listing every file
     TODO_ITEMS     = 50,
@@ -436,7 +437,8 @@ static Str tooljson(Arena *a, ToolEnv *te)
             "edit",
             "Change a file by its line numbers. read shows a file under a "
             "header [PATH#TAG], where TAG identifies its content, and numbers "
-            "its lines. Give that tag and a list of edits, each naming lines "
+            "its lines; grep lists the tags of the files it found as well. "
+            "Give that tag and a list of edits, each naming lines "
             "by their numbers in that read: replace lines line through end "
             "with text, insert text after line (0 for the top of the file), "
             "or delete lines line through end. Line numbers always mean the "

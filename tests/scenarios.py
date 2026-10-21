@@ -2671,12 +2671,13 @@ def edit_hashline(t):
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     t.check(r.text().endswith("Edited by line."), f"text {r.text()!r}")
     ends = r.all("tool.end")
-    t.check([e["status"] for e in ends] == ["ok", "ok", "error", "ok"],
+    t.check([e["status"] for e in ends] == ["ok", "ok", "error", "ok", "ok", "ok"],
             f"statuses {[(e['status'], e['text'][:80]) for e in ends]}")
     t.check(ends[0]["text"].startswith("[list.txt#") and "     1\tone\n" in ends[0]["text"],
             f"read {ends[0]['text']!r}")
     t.check("does not match list.txt" in ends[2]["text"], f"stale {ends[2]['text']!r}")
-    t.check(t.file("list.txt") == "zero\none\nTWO\nthree\nend\n", f"file {t.file('list.txt')!r}")
+    t.check("Tags for edit: [list.txt#" in ends[4]["text"], f"grep {ends[4]['text']!r}")
+    t.check(t.file("list.txt") == "zero\none\ntwo\nthree\nend\n", f"file {t.file('list.txt')!r}")
     t.check(r.events[0].get("edit_format") == "hashline", f"session {r.events[0]}")
 
     # The format stays with the session

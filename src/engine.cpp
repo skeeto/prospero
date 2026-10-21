@@ -3319,6 +3319,7 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled)
         se.glob       = s->sh.glob;
         se.ignorecase = s->sh.fold;
         se.windows    = s->te.windows;
+        se.tagged     = s->te.edit == EDIT_HASHLINE;
         ToolOut o = searchresult(e->os, &scratch, s->sh.spill, &se);
         Str status = cancelled ? Str("cancelled") : o.ok ? Str("ok") : Str("error");
         toolend(s, scratch, status, o.text, 0, 0, s->sh.rel, n);

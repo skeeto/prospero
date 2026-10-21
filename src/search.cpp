@@ -1330,6 +1330,7 @@ struct SearchEnd {
     Str glob;       // glob: the pattern
     b32 ignorecase;
     b32 windows;
+    b32 tagged;     // grep lists the tags of its files (hashline edits)
 };
 
 // A result path as the agent sees it: relative to the working directory
@@ -1363,6 +1364,7 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
     iz         shown = 0;
     iz         total = 0;
     Slice<Str> globs = e->tool==TOOL_GLOB ? globexpand(a, e->glob) : Slice<Str>{};
+    Slice<Str> files = {};  // grep's, shown, for their tags
     if (e->tool == TOOL_GREP) {
         for (Str rest = data; rest.len;) {
             Cut c = cut(rest, '\n');
@@ -1388,13 +1390,18 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
             if (text.len > SEARCH_LINEMAX+32) {
                 text = concat(a, utf8head(text, SEARCH_LINEMAX), " [...]");
             }
-            print(&b, searchpath(a, e, p.head));
+            Str path = searchpath(a, e, p.head);
+            print(&b, path);
             putbyte(&b, ':');
             print(&b, n.head);
             print(&b, ": ");
             print(&b, text);
             putbyte(&b, '\n');
             shown++;
+            if (e->tagged && files.len<SEARCH_TAGS &&
+                    (!files.len || files[files.len-1]!=path)) {
+                files = push(a, files, path);
+            }
         }
     } else {
         for (Str rest = data; rest.len;) {
@@ -1467,6 +1474,35 @@ static ToolOut searchresult(Os *os, Arena *a, Str spill, SearchEnd *e)
             print(&b, e->tool==TOOL_GREP ? Str("[the first 100 matching lines; ")
                                          : Str("[the newest 100 files; "));
             print(&b, "there are more: narrow the pattern or the path]");
+        }
+        if (files.len) {
+            // As read would show them, so that an edit can follow
+            if (b.len && b.data[b.len-1]!='\n') putbyte(&b, '\n');
+            print(&b, "Tags for edit:");
+            for (iz i = 0; i < files.len; i++) {
+                // The file is read into the free space past b, which b
+                // may grow into, so the tag is copied out first
+                u8  tag[4];
+                b32 ok = 0;
+                {
+                    Arena t   = *a;
+                    Str   abs = normpath(&t, e->cwd, files[i], e->windows);
+                    Read  rd  = os_read(os, &t, abs, (iz)EDIT_LINESMAX);
+                    if (!rd.err) {
+                        Str s = filetag(&t, rd.data);
+                        copybytes(tag, s.data, 4);
+                        ok = 1;
+                    }
+                }
+                if (ok) {
+                    print(&b, " [");
+                    print(&b, files[i]);
+                    putbyte(&b, '#');
+                    print(&b, Str{tag, 4});
+                    putbyte(&b, ']');
+                }
+            }
+            putbyte(&b, '\n');
         }
         r.ok = 1;
     }
