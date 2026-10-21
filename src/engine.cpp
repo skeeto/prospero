@@ -24,9 +24,15 @@
 // - Nudges, each with a cap and a counter reset by progress (a tool
 //   that succeeded): continue, empty, length, loop, and the tool-call
 //   loop guard (the same set of calls 5 steps in a row is not run).
+//   The todo nudges (todo items left at the end of a turn, many changes
+//   without the list changing) reset only as the list moves along.
 // - Tools: denials and invalid calls are tool results, never the end
-//   of a turn. Shell commands time out with TERM, 2 s, then KILL, and
-//   whatever a command leaves behind is killed when it completes.
+//   of a turn. A command still running at its timeout moves to the
+//   background as a job, which has a limit of its own; whatever a
+//   command leaves behind is killed when it completes. A job's end is
+//   told to the agent at its next request, and an idle session starts
+//   a turn for it, a few times an hour at most. Stopping a command asks
+//   first (TERM, or CTRL_BREAK), then kills after a grace period.
 // - Budgets: a note at 200 steps, the end of the turn at 300.
 //
 // Asks: a call the guard will not allow by itself (a path outside the
@@ -1467,13 +1473,14 @@ static void instrcheck(Session *s, Arena scratch)
     Slice<InstrFile> changed = {};
     Buf              b(&scratch, 1024);
     for (iz i = 0; i < s->instrfiles.len; i++) {
-        InstrStamp *k  = &s->instrfiles[i];
-        Stat        st = os_stat(os, scratch, k->path);
-        if (st.type==STAT_FILE && st.size==k->size && st.mtime==k->mtime) {
-            continue;
+        InstrStamp *k    = &s->instrfiles[i];
+        Stat        st   = os_stat(os, scratch, k->path);
+        b32         file = st.type == STAT_FILE;
+        if (file ? st.size==k->size && st.mtime==k->mtime : k->mtime<0) {
+            continue;  // as it was, or gone and told so
         }
-        k->size  = st.size;
-        k->mtime = st.mtime;
+        k->size  = file ? st.size : 0;
+        k->mtime = file ? st.mtime : -1;
         InstrFile f = {};
         f.path  = k->path;
         f.size  = st.size;
@@ -1762,9 +1769,9 @@ static void jobarm(Session *s)
 {
     i64 at = 0;
     for (Job *j = s->jobs; j; j = j->next) {
-        i64 t = j->state==JOB_DONE ? 0       :
+        i64 t = j->state==JOB_DONE ? 0          :
                 j->drainat         ? j->drainat :
-                j->state==JOB_STOP ? j->killat :
+                j->state==JOB_STOP ? j->killat  :
                                      j->deadline;
         if (t && (!at || t<at)) {
             at = t;
@@ -1871,8 +1878,10 @@ static Str jobnotice(Session *s, Arena *a, Job *j, i64 bytes)
         print(&b, "the harness stopped while it ran, which stopped it too");
         break;
     }
-    print(&b, ", after ");
-    printelapsed(&b, j->ran);
+    if (j->ran) {  // unknown for a job lost in a crash
+        print(&b, ", after ");
+        printelapsed(&b, j->ran);
+    }
     print(&b, ".\nCommand: ");
     print(&b, j->command);
     print(&b, "\nOutput: ");
