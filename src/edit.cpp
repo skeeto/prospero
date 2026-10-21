@@ -306,13 +306,16 @@ static Str uncomment(Str s)
 }
 
 // Trimmed, with normcp applied and each run of blanks as one space.
+// Other code points keep their bytes, invalid UTF-8 included.
 static Str normtext(Arena *a, Str s)
 {
     s = trim(s);
     Buf b(a, s.len);
     b32 blank = 0;
     for (iz i = 0; i < s.len;) {
-        i32 c = normcp(utf8decode(s, &i));
+        iz  at = i;
+        i32 cp = utf8decode(s, &i);
+        i32 c  = normcp(cp);
         if (c==' ' || c=='\t') {
             blank = 1;
             continue;
@@ -321,8 +324,11 @@ static Str normtext(Arena *a, Str s)
             putbyte(&b, ' ');
             blank = 0;
         }
-        u8 tmp[4];
-        print(&b, Str{tmp, utf8encode(tmp, c)});
+        if (c != cp) {
+            putbyte(&b, (u8)c);  // normcp maps only to ASCII
+        } else {
+            print(&b, span(s.data+at, s.data+i));
+        }
     }
     return finish(&b);
 }
@@ -1483,7 +1489,8 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
     Slice<Splice> sp     = {};
     iz            cursor = 0;
     for (iz hi = 0; hi < f->hunks.len; hi++) {
-        PatchHunk *h = &f->hunks[hi];
+        PatchHunk *h     = &f->hunks[hi];
+        iz         ctxat = -1;  // the line @@ found
         if (h->ctx.data) {
             Slice<Str> one = {};
             one = push(a, one, h->ctx);
@@ -1508,6 +1515,7 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
                 r.text = finish(&b);
                 return r;
             }
+            ctxat  = s.at;
             cursor = s.at + 1;
         }
 
@@ -1529,8 +1537,13 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
             continue;
         }
 
-        Slice<PatchLine> hl   = h->lines;
-        Seek             s    = seeklines(*a, t.lines, cursor, old, h->eof);
+        // The line after @@ comes before the hunk, but some agents give
+        // the hunk's own first line there, so that is tried last
+        Slice<PatchLine> hl = h->lines;
+        Seek             s  = seeklines(*a, t.lines, cursor, old, h->eof);
+        if (s.at<0 && ctxat>=0) {
+            s = seeklines(*a, t.lines, ctxat, old, h->eof);
+        }
         if (s.at<0 && old.len>1 && !old[old.len-1].len) {
             // A last kept empty line may stand for the file's final
             // newline (as in Codex)
@@ -1545,7 +1558,7 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
                     break;
                 }
             }
-            s = seeklines(*a, t.lines, cursor, old, h->eof);
+            s = seeklines(*a, t.lines, ctxat>=0 ? ctxat : cursor, old, h->eof);
         }
         if (s.at < 0) {
             Buf b(a, 1024);

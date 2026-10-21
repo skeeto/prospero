@@ -63,6 +63,9 @@ static void test_edit(Test *t)
         expect(t, "givenlines", concat(a, concat(a, g[0], "|"), g[1]), "x|y");
         expect(t, "givenlines empty", istr(a, givenlines(a, "").len*10 + givenlines(a, "\n").len), "1");
         expect(t, "normtext", normtext(a, "  \xe2\x80\x9cx\xe2\x80\x9d \t\xe2\x80\x94  y "), "\"x\" - y");
+        // Invalid UTF-8 (found by AFL): kept as its bytes, never encoded
+        expect(t, "normtext invalid", normtext(a, "a \xff\xbd\xbd\xbd  \xc3"), "a \xff\xbd\xbd\xbd \xc3");
+        expect(t, "rep invalid", rep(a, "\xff\xbd\xbd\xbd x\n", "\xff\xbd\xbd\xbd  x", "y", 0), "y\n");
         expect(t, "uncomment", uncomment("// # x = 1; */"), "x = 1;");
         expect(t, "distance", istr(a, distance(*a, "kitten", "sitting", 10, 0)), "3");
         expect(t, "distance limit", istr(a, distance(*a, "kitten", "sitting", 2, 0)), "3");
@@ -298,6 +301,10 @@ static void test_edit(Test *t)
                                    "+    a = 2\n*** End Patch");
         expect(t, "hunk ctx missing", istr(a, startswith(ctx, "!hunk 1 of f.c (patch line 3): the line "
                                                          "after @@, \"def h():\", was not found")), "1");
+        // The line to change given after @@ as well (seen from qwen-flash)
+        expect(t, "hunk at its @@", patchrun(a, src, "*** Begin Patch\n*** Update File: f.c\n"
+                                                     "@@     b = 2\n-    b = 2\n+    b = 3\n*** End Patch"),
+               "def f():\n    a = 1\n    b = 3\n    return a\n\ndef g():\n    a = 1\n    return a\n");
         Str order = patchrun(a, src, "*** Begin Patch\n*** Update File: f.c\n@@ def g():\n-    a = 1\n"
                                      "+    a = 5\n@@ def f():\n-    b = 2\n+    b = 6\n*** End Patch");
         expect(t, "hunk order", istr(a, startswith(order, "!hunk 2 of f.c") &&

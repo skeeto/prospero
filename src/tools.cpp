@@ -780,6 +780,10 @@ static Slice<HashEdit> arghedits(Arena *a, Args *r, Json *root)
         list->child = one;
         list->len   = 1;
         v = list;
+    } else if (v->type == JSON_STRING) {
+        issue(a, r, "edits", "must be an array of {op, line, end, text} objects, "
+                             "not a string (this one is not even valid JSON)");
+        return edits;
     } else if (v->type != JSON_ARRAY) {
         issue(a, r, "edits", "must be an array of {op, line, end, text} objects");
         return edits;
