@@ -3,8 +3,13 @@
 // $ c++ -std=c++20 -nostartfiles -o harness.exe src/main_win32.cpp -ladvapi32
 //
 // Imports only kernel32.dll, advapi32.dll (RtlGenRandom), and winhttp.dll,
-// with nothing newer than Windows XP except the automatic proxy, which is
-// tried first, so the XP engine builds from this file.
+// with nothing newer than Windows XP SP3, so the XP engine, an i686 build
+// with HARNESS_GUI off, comes from this file too. tests/imports.py checks
+// the imports against XP's own export lists. Newer functions are looked
+// up at run time (GetProcAddress), and newer options tried first with a
+// fallback (the automatic proxy). On XP, https cannot work, since its
+// WinHTTP has no TLS 1.2, and tools leave the harness's own job when it
+// has one, since jobs do not nest there (jobcheck).
 //
 // Each tool process runs in its own job object that kills the whole tree
 // when its last handle closes, which includes this process dying by any
@@ -103,6 +108,13 @@ enum : i32 {
     WINHTTP_QUERY_FLAG_NUMBER         = 0x20000000,
     WINHTTP_QUERY_RAW_HEADERS_CRLF    = 22,
     WINHTTP_QUERY_STATUS_CODE         = 19,
+    // Windows XP compatibility
+    CREATE_BREAKAWAY_FROM_JOB         = 0x01000000,
+    ERROR_NOTLS12                     = 0x20000001,  // ours (bit 29)
+    JOB_BREAKAWAY_OK                  = 0x800,
+    JOB_SILENT_BREAKAWAY_OK           = 0x1000,
+    WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 = 0x800,
+    WINHTTP_OPTION_SECURE_PROTOCOLS   = 84,
 };
 
 enum : uz {
@@ -301,6 +313,11 @@ W32(b32,    WinHttpReceiveResponse(uz, uz));
 W32(b32,    WinHttpSendRequest(uz, c16 *, i32, void *, i32, i32, uz));
 W32(b32,    WinHttpSetOption(uz, i32, void *, i32));
 W32(b32,    WinHttpSetTimeouts(uz, i32, i32, i32, i32));
+// Windows XP compatibility
+W32(uz,     GetCurrentProcess());
+W32(u32,    GetVersion());
+W32(b32,    IsProcessInJob(uz, uz, b32 *));
+W32(b32,    QueryInformationJobObject(uz, i32, void *, i32, i32 *));
 
 // GCC emits calls to these even without a CRT. Defining them keeps
 // msvcrt.dll out of the imports. GUI builds have the CRT's.
@@ -366,6 +383,10 @@ struct Os {
     void           *gui;    // GUI builds: the window's state (gui_win32.cpp)
     // GetFinalPathNameByHandleW, from Vista on, else null
     u32 (__stdcall *finalpath)(uz, c16 *, u32, u32);
+    i32             breakaway;  // a creation flag: tools leave our job
+    b32             jobless;    // tools run without jobs (jobcheck)
+    i32             warned;     // atomic: jobless was reported
+    i32             tls12;      // atomic: WinHTTP has TLS 1.2 (1) or not (-1)
 };
 
 enum : iz {
@@ -1225,6 +1246,11 @@ static b32 os_lockheld(Os *, Arena scratch, Str path)
 static Str os_lasterr(Os *, Arena *a)
 {
     i32 err = GetLastError();
+    if (err == ERROR_NOTLS12) {
+        return "this system's WinHTTP has no TLS 1.2 (Windows XP), which "
+               "https endpoints need: use a plain http:// endpoint, such as "
+               "a server on the LAN";
+    }
     c16 buf[512];
     i32 flags = FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS;
     uz  mod   = 0;
@@ -1260,6 +1286,15 @@ static Str os_lasterr(Os *, Arena *a)
 // standard input and a writer thread feeding it from a queue, with a
 // reference of its own; its reader passes output on as records instead
 // of into a file, and its errors go into the file directly.
+//
+// Before Windows 8 jobs do not nest: a process in a job, such as one an
+// SSH server started, cannot put its children in jobs of their own
+// (jobcheck). Where its job lets children leave, each tool leaves it for
+// its own. That beats relaunching the harness outside the job (the
+// user's sshd's escapejob): the harness stays in the job it started in,
+// so it still ends with that session, and its tools with it. Where the
+// job keeps its children, tools run without jobs, with a warning: a hard
+// kill ends only the tool's own process, and nothing ends it with ours.
 
 enum : iz {
     PROC_TAILMAX  = 1<<12,
@@ -1299,10 +1334,59 @@ struct Proc {
     u8         buf[PROC_BUFLEN];
 };
 
+// How tools get jobs, decided once at startup: Windows 8 and later nest
+// them; before, a process in a job needs its children to leave it.
+static void jobcheck(Os *os)
+{
+    u32 ver   = GetVersion();
+    u32 major = ver & 0xff;
+    u32 minor = ver>>8 & 0xff;
+    b32 injob = 0;
+    if (major>6 || (major==6 && minor>=2)) {
+        return;
+    } else if (!IsProcessInJob(GetCurrentProcess(), 0, &injob) || !injob) {
+        return;
+    }
+    JobLimits lim = {};  // a null handle asks about our own job
+    if (QueryInformationJobObject(0, JobObjectExtendedLimitInformation,
+                                  &lim, sizeof(lim), 0)) {
+        if (lim.flags & JOB_SILENT_BREAKAWAY_OK) {
+            return;  // children are outside it already
+        } else if (lim.flags & JOB_BREAKAWAY_OK) {
+            os->breakaway = CREATE_BREAKAWAY_FROM_JOB;
+            return;
+        }
+    }
+    os->jobless = 1;
+}
+
+// Said once, at the first tool run without a job.
+static void joblesswarn(Os *os)
+{
+    if (!__atomic_exchange_n(&os->warned, 1, __ATOMIC_RELAXED)) {
+        os_print(os, 2, "harness: warning: this process is in a job that "
+                        "keeps its children, and before Windows 8 jobs do "
+                        "not nest, so tools run without jobs: a tool's own "
+                        "children may outlive it\n");
+    }
+}
+
+// Kill the whole tree, or without a job only the process itself.
+static void killproc(uz job, uz process)
+{
+    if (job) {
+        TerminateJobObject(job, 1);
+    } else {
+        TerminateProcess(process, 1);
+    }
+}
+
 static void procrelease(Proc *p)
 {
     if (!__atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL)) {
-        CloseHandle(p->job);
+        if (p->job) {
+            CloseHandle(p->job);
+        }
         CloseHandle(p->process);
         if (p->io) {
             DeleteCriticalSection((CriticalSection *)p->lock.opaque);
@@ -1522,11 +1606,11 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     c16 *env  = envblock(&scratch, sp->env);
     c16 *out  = widepath(&scratch, sp->outpath).data;
 
-    uz  job  = CreateJobObjectW(0, 0);
+    uz  job  = os->jobless ? 0 : CreateJobObjectW(0, 0);
     uz  nul  = CreateFileW((c16 *)u"NUL", GENERIC_READ|GENERIC_WRITE, FILE_SHARE_ALL,
                            0, OPEN_EXISTING, 0, 0);
     uz  file = 0;
-    b32 ok   = job && nul!=INVALID_HANDLE_VALUE;
+    b32 ok   = (job || os->jobless) && nul!=INVALID_HANDLE_VALUE;
     if (ok && (!io || sp->outpath.len)) {
         file = CreateFileW(out, GENERIC_WRITE, FILE_SHARE_ALL, 0, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, 0);
@@ -1536,7 +1620,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     Event wake = {};
     ok = ok && CreatePipe(&pr, &pw, 0, 1<<16) &&
          (!io || (CreatePipe(&ir, &iw, 0, 1<<16) && os_eventinit(&wake)));
-    if (ok) {
+    if (ok && job) {
         JobLimits lim = {};
         lim.flags = JOB_KILL_ON_JOB_CLOSE | JOB_DIE_ON_UNHANDLED_EXCEPTION;
         ok = SetInformationJobObject(job, JobObjectExtendedLimitInformation,
@@ -1560,7 +1644,8 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     si.output = pw;
     si.error  = !io ? pw : file ? file : nul;
     i32 flags = CREATE_SUSPENDED | CREATE_NO_WINDOW |
-                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP;
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP |
+                os->breakaway;
     EnterCriticalSection(&os->spawn);
     SetHandleInformation(si.input, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     SetHandleInformation(si.output, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
@@ -1579,7 +1664,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
         SetLastError(err);
         return 0;
     }
-    if (!AssignProcessToJobObject(job, pi.process)) {
+    if (job && !AssignProcessToJobObject(job, pi.process)) {
         err = GetLastError();
         TerminateProcess(pi.process, 1);
         uz hs[] = {pi.thread, pi.process};
@@ -1587,6 +1672,8 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
         closeall(mine, countof(mine));
         SetLastError(err);
         return 0;
+    } else if (!job) {
+        joblesswarn(os);
     }
     ResumeThread(pi.thread);
     CloseHandle(pi.thread);
@@ -1594,7 +1681,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     uz    heap = GetProcessHeap();
     Proc *p    = (Proc *)HeapAlloc(heap, HEAP_ZERO_MEMORY, sizeof(Proc));
     if (!p) {
-        TerminateJobObject(job, 1);
+        killproc(job, pi.process);
         CloseHandle(pi.process);
         closeall(mine, countof(mine));
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
@@ -1616,7 +1703,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
         os_lockinit(&p->lock);
     }
     if (!os_thread(os, io ? procpipe : procreader, p)) {
-        TerminateJobObject(job, 1);
+        killproc(job, pi.process);
         CloseHandle(pi.process);
         closeall(mine, countof(mine));
         if (io) {
@@ -1628,7 +1715,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     }
     uz input[] = {iw, (uz)wake.h[0]};
     if (!os_thread(os, procwaiter, p)) {
-        TerminateJobObject(job, 1);  // the reader then finishes
+        killproc(job, pi.process);  // the reader then finishes
         closeall(input, countof(input));
         if (io) procrelease(p);  // the writer's
         procrelease(p);  // the waiter's
@@ -1637,7 +1724,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
         return 0;
     }
     if (io && !os_thread(os, procwriter, p)) {
-        TerminateJobObject(job, 1);  // the reader and waiter then finish
+        killproc(job, pi.process);  // the reader and waiter then finish
         closeall(input, countof(input));
         procrelease(p);  // the writer's
         procrelease(p);  // the caller's
@@ -1739,7 +1826,7 @@ static void ctrlbreak(Os *os, Proc *p)
 static void os_kill(Os *os, Proc *p, b32 hard)
 {
     if (hard) {
-        TerminateJobObject(p->job, 1);
+        killproc(p->job, p->process);
     } else {
         ctrlbreak(os, p);
     }
@@ -1780,7 +1867,6 @@ static void os_procfree(Os *os, Proc *p)
 // has read what came before.
 
 enum : i32 {
-    CREATE_BREAKAWAY_FROM_JOB     = 0x01000000,
     DETACHED_PROCESS              = 0x00000008,
     ERROR_ACCESS_DENIED           = 5,
     ERROR_IO_PENDING              = 997,
@@ -2633,11 +2719,37 @@ static void httpworker(void *arg)
     httprelease(h);
 }
 
+// Whether WinHTTP can do TLS 1.2, which every https endpoint worth
+// reaching requires. XP's cannot, and rejects even being asked for it,
+// so https there fails at once with a clear error (ERROR_NOTLS12)
+// rather than in a handshake after the connect. Asked once, of a
+// session of its own, which no request then inherits.
+static b32 hastls12(Os *os)
+{
+    i32 r = __atomic_load_n(&os->tls12, __ATOMIC_RELAXED);
+    if (!r) {
+        i32 tls = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+        uz  s   = WinHttpOpen((c16 *)u"harness", WINHTTP_ACCESS_TYPE_DEFAULT, 0, 0, 0);
+        b32 no  = s && !WinHttpSetOption(s, WINHTTP_OPTION_SECURE_PROTOCOLS,
+                                         &tls, sizeof(tls)) &&
+                  GetLastError()==ERROR_INVALID_PARAMETER;
+        if (s) {
+            WinHttpCloseHandle(s);
+        }
+        r = no ? -1 : 1;
+        __atomic_store_n(&os->tls12, r, __ATOMIC_RELAXED);
+    }
+    return r > 0;
+}
+
 static Http *os_http(Os *os, HttpReq *req, Arena scratch)
 {
     Url u = parseurl(req->url);
     if (!u.ok || hasnul(req->method) || hasnul(u.path) || hasnul(req->headers)) {
         SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    } else if (u.scheme=="https" && !hastls12(os)) {
+        SetLastError(ERROR_NOTLS12);
         return 0;
     }
     Str host = u.host;
@@ -2728,12 +2840,15 @@ void mainCRTStartup()
     uz kernel32  = GetModuleHandleW((c16 *)u"kernel32.dll");
     os.finalpath = (u32 (__stdcall *)(uz, c16 *, u32, u32))
                    GetProcAddress(kernel32, (char *)"GetFinalPathNameByHandleW");
+    jobcheck(&os);
 
     // No dialogs from a crashing child, or from a missing disk
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
                  SEM_NOOPENFILEERRORBOX);
 
-    iz      cap = sizeof(void *)==8 ? (iz)1<<34 : (iz)1<<28;
+    // A 32-bit process has 2 GiB of address space, which XP fragments
+    // into pieces of at most 1 GiB: every reservation is small there.
+    iz      cap = sizeof(void *)==8 ? (iz)1<<34 : (iz)1<<26;
     Region *r   = os_reserve(&os, cap);
     if (!r) {
         os_oom();

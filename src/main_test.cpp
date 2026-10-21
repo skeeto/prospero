@@ -275,7 +275,7 @@ static void os_logclose(Os *os, iz log)
 
 static Read os_readat(Os *os, Arena *a, Str path, i64 off, iz max)
 {
-    Read r = os_read(os, a, path, I64MAX>>1);
+    Read r = os_read(os, a, path, (iz)((uz)-1 >> 1));
     if (!r.err) {
         Str d = r.data;
         d = off<d.len ? cuthead(d, (iz)off) : cuthead(d, d.len);

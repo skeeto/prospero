@@ -18,6 +18,12 @@ With --host, the fake provider runs here and the harness runs on the
 Windows host over ssh, reaching the provider through a reverse tunnel;
 PATH is the harness.exe already on that host. busybox.exe is copied next
 to it from the host's w64devkit, which is how the harness finds its shell.
+
+  uv run tests/scenarios.py --harness 'C:/DOCUME~1/u/LOCALS~1/Temp/harness.exe' \\
+      --xp 192.168.1.106 [NAME ...]
+
+With --xp, the same for Windows XP running the user's own sshd: no
+tunnel, so the provider listens on this machine's LAN address instead.
 """
 
 import argparse
@@ -29,6 +35,7 @@ import random
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -139,7 +146,7 @@ class SshHost:
         self.exe = f"{self.root}/harness.exe"
 
     def close(self):
-        self.sh(f"cd / && rm -rf {self.root}")
+        self.sh(cleanroot(self.root))
         subprocess.run(["ssh", "-S", self.ctl, "-O", "exit", self.host],
                        capture_output=True)
 
@@ -226,6 +233,85 @@ class SshHost:
 
     def killpid(self, pid):
         self.ssh(f"taskkill /F /PID {pid}")
+
+
+class XpHost(SshHost):
+    """Windows XP over the user's own sshd, whose commands run in busybox
+    sh. It takes one channel per connection and forwards no ports, and
+    XP's firewall blocks a new program's listening, so the harness there
+    connects out to the fake provider on this machine's LAN address.
+    Each command is a connection of its own, retried when the link (Wi-Fi,
+    which stalls now and then) drops it."""
+
+    def __init__(self, host, harness, url):
+        self.host = host
+        self.harness = harness
+        self.url = url
+        tmp = self.sh("echo \"$TMP\"").strip()
+        self.root = f"{tmp}/harness-scen-{random.randrange(1 << 32):08x}"
+        self.sh(f"mkdir -p {self.root} && "
+                f"cp \"$HOME/w64devkit/bin/busybox.exe\" {self.root}/busybox.exe && "
+                f"cp {shlex.quote(harness)} {self.root}/harness.exe")
+        self.exe = f"{self.root}/harness.exe"
+
+    def close(self):
+        self.sh(cleanroot(self.root), check=False)
+
+    def ssh(self, command, input=None, **kw):
+        for attempt in range(4):
+            r = subprocess.run(["ssh", "-o", "ConnectTimeout=30", self.host, command],
+                               input=input, capture_output=True, text=True, **kw)
+            if r.returncode != 255 or attempt == 3:
+                return r
+            time.sleep(2 + 3*attempt)
+
+    def sh(self, script, check=True):
+        r = self.ssh("sh -s", input=script)
+        if check and r.returncode:
+            raise RuntimeError(f"remote script failed: {script[:2000]}\n{r.stderr}")
+        return r.stdout
+
+    def popen(self, args, cwd, stdin=False, env=None):
+        sets = "".join(f"{k}={shlex.quote(v)} " for k, v in (env or {}).items())
+        cmd = (f"cd {shlex.quote(cwd)} && {sets}{shlex.quote(self.exe)} " +
+               " ".join(shlex.quote(a) for a in args))
+        return subprocess.Popen(
+            ["ssh", "-o", "ConnectTimeout=30", self.host, cmd],
+            stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", bufsize=1)
+
+    def alive(self, pid):
+        r = self.ssh(f"tasklist /FI \"PID eq {pid}\" /NH")
+        return any(line.split()[1:2] == [str(pid)] for line in r.stdout.splitlines())
+
+    def killhard(self, proc, pid=None):
+        if pid:
+            self.killpid(pid)
+        else:
+            proc.kill()
+
+    def killpid(self, pid):
+        # No taskkill here: busybox kill, which calls TerminateProcess
+        self.ssh(f"kill -9 {pid}")
+
+
+def cleanroot(root):
+    """A script removing a Windows host's scenario root. cmd's rd, unlike
+    busybox rm, removes paths past MAX_PATH and names outside the ANSI
+    code page (deep_unicode), through a \\\\?\\ path."""
+    win = "\\\\?\\" + root.replace("/", "\\")
+    return f"cd / && cmd /c 'rd /s /q {win}'; rm -rf {root}"
+
+
+def lanaddress(host):
+    """This machine's address on the network that reaches host."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((socket.gethostbyname(host), 9))
+        return s.getsockname()[0]
+    finally:
+        s.close()
 
 
 # Running the harness
@@ -1787,6 +1873,21 @@ def long_path(t):
     t.check(len(r.all("ask")) == 1, "only the valid path is asked about")
 
 
+@scenario(bound=10)
+def deep_unicode(t):
+    """A file past MAX_PATH under directories named beyond Latin-1 is
+    written, edited, read and found, judged inside the workspace."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok"] * 4,
+            f"statuses {[(e['status'], e.get('text', '')[:200]) for e in ends]}")
+    t.check(not r.all("ask"), "no ask: the path is inside")
+    t.check("deeper €" in ends[2].get("text", ""), f"read: {ends[2].get('text')}")
+    leaf = fake_provider.DEEP.rsplit("/", 2)[-2]
+    t.check(leaf in ends[3].get("text", ""), f"glob: {ends[3].get('text', '')[:400]}")
+
+
 @scenario(bound=15)
 def steer_tool(t):
     """A steer sent while a command runs answers an ask later in the same
@@ -3248,6 +3349,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--harness", required=True, help="the harness binary")
     ap.add_argument("--host", help="run the harness on this Windows host over ssh")
+    ap.add_argument("--xp", help="run the harness on this Windows XP host over "
+                    "ssh, reaching the provider at this machine's LAN address")
     ap.add_argument("-j", type=int, default=0, help="scenarios at once")
     ap.add_argument("--soak", type=float, help="soak for this many minutes")
     ap.add_argument("--workers", type=int, default=4, help="soak sessions at once")
@@ -3255,9 +3358,15 @@ def main():
     ap.add_argument("names", nargs="*")
     args = ap.parse_args()
 
-    srv, url = fake_provider.start()
+    if args.xp:
+        lan = lanaddress(args.xp)
+        srv, url = fake_provider.start(lan)
+    else:
+        srv, url = fake_provider.start()
     port = srv.server_address[1]
-    if args.host:
+    if args.xp:
+        host = XpHost(args.xp, args.harness, url)
+    elif args.host:
         host = SshHost(args.host, args.harness, port, 20000 + port % 20000)
     else:
         host = LocalHost(args.harness, url)
@@ -3270,7 +3379,7 @@ def main():
             if n not in SCENARIOS:
                 print(f"unknown scenario {n}; known: {' '.join(SCENARIOS)}")
                 return 2
-        jobs = args.j or (2 if args.host else 8)
+        jobs = args.j or (2 if args.host or args.xp else 8)
         failed = 0
 
         def report(name, status, dt, why):
