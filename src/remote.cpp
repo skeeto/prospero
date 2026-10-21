@@ -3,6 +3,7 @@
 //   harness connect NAME [options]            a [remote NAME] host
 //   harness connect --ssh DEST [options]      a host over ssh
 //   harness connect --local [options]         this machine's host
+//   harness connect --endpoint EP [options]   the one at EP, if it runs
 //
 // A Remote speaks to an engine host (host.cpp) as the in-process engine
 // would to its frontend: protocol v0 commands in (remotecmd), records
@@ -39,8 +40,14 @@
 // try), failed or closed, with msg saying why.
 //
 // remoteclose ends the link with a disconnect frame: the host forgets
-// this client, and its sessions run on without it. A quit command stops
-// the host's engine as it would a local one.
+// this client, and its sessions run on without it. remotefinish does so
+// once every command sent is answered (30 s at most), as connect does
+// when its input ends. A quit command stops the host's engine as it
+// would a local one.
+//
+// A remote may be one host of this machine, at its endpoint and no
+// other (a background host, as registered): none is started, and once
+// it cannot be reached, it is gone and the remote ends, closed.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -49,12 +56,14 @@ enum : i64 {
     REMOTE_KEEPCOUNT = 1 << 12,
     REMOTE_TRIES     = 3,              // failures, never up, before giving up
     REMOTE_CLOSEWAIT = 3*SEC,          // for the stream to end after a goodbye
+    REMOTE_DRAINWAIT = 30*SEC,         // closing: for replies still to come
 };
 
 static i64 remotebackoff[] = {1*SEC, 2*SEC, 5*SEC, 10*SEC, 30*SEC};
 
 enum : u32 {
     REMOTE_CLOSE = 300,  // frontend to the remote thread: remoteclose
+    REMOTE_FINISH,       // remotefinish
     REMOTE_DROP,         // and remotedrop, a test hook
 };
 
@@ -110,6 +119,7 @@ struct Remote {
     i32               backoffs; // waits since the link was last up
     i64               retryat;  // ticks: try again then
     i64               closeby;  // ticks: give up waiting for the end
+    i64               drainby;  // ticks: closing once commands are answered
     b32               fresh;    // no host known: start one (no --reconnect)
     b32               everup;
     b32               hellook;  // this host's hello matched
@@ -706,6 +716,20 @@ static void remoteflush(Remote *r, Arena scratch, i64 now)
     }
 }
 
+// End the link as remoteclose asked: at once without a stream, else
+// with a goodbye, and then the stream's end.
+static void remoteleave(Remote *r, Arena scratch)
+{
+    r->drainby = 0;
+    if (!r->live) {
+        remoteend(r, scratch, RS_CLOSED, {});
+    } else if (!r->closing) {
+        r->closing = 1;
+        r->closeby = os_ticks(r->os) + REMOTE_CLOSEWAIT;
+        linkbye(&r->link);
+    }
+}
+
 static void remotethread(void *arg)
 {
     Remote *r  = (Remote *)arg;
@@ -729,6 +753,7 @@ static void remotethread(void *arg)
 
         i64 next = r->live ? linkdeadline(&r->link) : r->retryat;
         next = r->closeby && r->closeby<next ? r->closeby : next;
+        next = r->drainby && r->drainby<next ? r->drainby : next;
         i32 ms = 0;
         if (next>now && nap) {
             i64 wait = (next - now + MS - 1) / MS;
@@ -745,14 +770,16 @@ static void remotethread(void *arg)
             case MAIL_CMD:
                 remotecommand(r, a, rec.data);
                 break;
-            case REMOTE_CLOSE:
-                if (!r->live) {
-                    remoteend(r, a, RS_CLOSED, {});
-                } else if (!r->closing) {
-                    r->closing = 1;
-                    r->closeby = os_ticks(os) + REMOTE_CLOSEWAIT;
-                    linkbye(&r->link);
+            case REMOTE_FINISH:
+                if ((r->held.len || r->pending.len) && !r->drainby && !r->closing) {
+                    // Commands to send yet, or replies to come: first those
+                    r->drainby = os_ticks(os) + REMOTE_DRAINWAIT;
+                    break;
                 }
+                remoteleave(r, a);
+                break;
+            case REMOTE_CLOSE:
+                remoteleave(r, a);
                 break;
             case REMOTE_DROP:
                 if (r->live && !r->closing) {
@@ -785,6 +812,12 @@ static void remotethread(void *arg)
         }
 
         now = os_ticks(os);
+        if (r->drainby && (now>=r->drainby || (!r->held.len && !r->pending.len))) {
+            remoteleave(r, scratch);
+            if (r->done) {
+                break;
+            }
+        }
         if (r->live && !linktick(&r->link, now)) {
             remotedown(r, scratch, "the link went silent", -1);
         } else if (r->live && r->closeby && now>=r->closeby) {
@@ -854,6 +887,13 @@ static void remoteclose(Remote *r)
     mailpost(r->in, REMOTE_CLOSE, 0, {}, 1);
 }
 
+// The same once every command sent is answered, or after 30 s: the end
+// of a frontend's commands, as of standard input (harness connect).
+static void remotefinish(Remote *r)
+{
+    mailpost(r->in, REMOTE_FINISH, 0, {}, 1);
+}
+
 // A test hook: break the stream, killing ssh, as a network would, so
 // that the link comes back over another.
 static void remotedrop(Remote *r)
@@ -889,7 +929,8 @@ struct ConnectIn {
     Arena   a;
 };
 
-// Commands from standard input, one per line, then the end of the link.
+// Commands from standard input, one per line, then the end of the link,
+// once they are answered.
 static void connectstdin(void *arg)
 {
     ConnectIn *c   = (ConnectIn *)arg;
@@ -919,7 +960,7 @@ static void connectstdin(void *arg)
             len = 0;  // a line too long to take: dropped
         }
     }
-    remoteclose(c->r);
+    remotefinish(c->r);
 }
 
 static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)

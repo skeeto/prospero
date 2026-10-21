@@ -51,6 +51,13 @@
 // quit always does. Its errors and notes go to run/host.log, which a
 // host starting when it is past 1 MiB starts over.
 //
+// A GUI whose window closes with "Keep running in background" becomes a
+// host in place (newhost, then hostrun on a thread of its own): its
+// engine runs on as it was, its records, which the window took, going
+// to the host from then on, and the host's ids starting above the
+// window's. Another thread may ask the host to stop every turn and job
+// or to quit (hoststop), as a tray icon's menu does.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i64 {

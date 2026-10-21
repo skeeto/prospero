@@ -898,6 +898,37 @@ def stop_cmd(t):
 
 
 @scenario
+def connect_piped(t):
+    """Commands piped to connect, its input ending at once: each is sent
+    and answered before the link ends, a quit included."""
+    a = Client(t)
+    a.attach()
+    a.call("hello")
+    a.stream.disconnect()
+    cmds = '{"cmd":"list","id":1}\n{"cmd":"quit","id":2}\n'
+    p = subprocess.run([t.harness, "connect", "--local", "--state", t.state, "-c", t.config],
+                       input=cmds, capture_output=True, text=True, timeout=60, env=t.env)
+    replies = {}
+    for line in p.stdout.splitlines():
+        r = json.loads(line)
+        if r.get("ev") == "reply":
+            replies[r["id"]] = r
+    t.check(p.returncode == 0, f"connect exit {p.returncode}: {p.stderr}")
+    t.check(replies.get(1, {}).get("ok") == 1 and replies.get(2, {}).get("ok") == 1,
+            f"both answered: {replies}")
+    t.check(waitgone(t), f"the host quit: {t.hostpids()}")
+
+
+def waitgone(t, within=15.0):
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        if not t.hostpids():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+@scenario
 def connect_endpoint(t):
     """The client library at a registered endpoint, as the GUI reaches a
     background host: it starts no host, and once the host is gone it
