@@ -240,7 +240,12 @@ class T:
         self.name = name
         self.nonce = f"{random.randrange(1 << 32):08x}"
         self.model = f"fake:{name}:{self.nonce}"
-        fake_provider.STATE.register(self.model)
+        # A second model, for scenarios of two: scenario NAME_b
+        self.model2 = f"fake:{name}_b:{self.nonce}"
+        conf = dict(conf or {})
+        listing = conf.pop("_listing", {})
+        fake_provider.STATE.register(self.model, **listing)
+        fake_provider.STATE.register(self.model2, **listing)
         base = host.join(host.root, f"{name}-{self.nonce}")
         self.base = base
         self.work = host.join(base, "work")
@@ -248,19 +253,23 @@ class T:
         self.config = host.join(base, "harness.ini")
         host.mkdir(self.work)
         host.mkdir(self.state)
-        # Endpoint settings, with "_top" settings before any section and
-        # "_guard" settings in [guard]
-        conf = dict(conf or {})
+        # Endpoint settings, with "_top" settings before any section,
+        # "_guard" settings in [guard], "_path" after the endpoint's URL,
+        # and "_extra" as more sections, where {model} and {model2} are
+        # the scenario's model names
         top = conf.pop("_top", {})
         guard = conf.pop("_guard", {})
+        path = conf.pop("_path", "")
+        extra = conf.pop("_extra", "")
         ini = {"first_byte_timeout": 5, "idle_timeout": 3,
                "progress_timeout": 6, "connect_timeout": 2}
         ini.update(conf)
         body = "".join(f"{k} = {v}\n" for k, v in top.items())
-        body += f"[endpoint fake]\nurl = {host.url}/\n" + "".join(
+        body += f"[endpoint fake]\nurl = {host.url}/{path}\n" + "".join(
             f"{k} = {v}\n" for k, v in ini.items())
         if guard:
             body += "[guard]\n" + "".join(f"{k} = {v}\n" for k, v in guard.items())
+        body += extra.format(model=self.model, model2=self.model2)
         host.write(self.config, body)
         self.notes = []
 
@@ -268,14 +277,15 @@ class T:
         return ["-C", self.work, "--state", self.state, "-c", self.config,
                 "-e", "fake", "-m", self.model] + list(extra)
 
-    def run(self, prompt="go", extra=(), timeout=60, resume=None, watch=None):
+    def run(self, prompt="go", extra=(), timeout=60, resume=None, watch=None,
+            env=None):
         args = ["run"] + self.args(extra)
         if resume:
             args += ["--resume", resume]
         if prompt:
             args.append(prompt)
         t0 = time.monotonic()
-        p = self.host.popen(args, self.work)
+        p = self.host.popen(args, self.work, env=env)
         lines = []
         killer = threading.Timer(timeout, p.kill)
         killer.start()
@@ -310,8 +320,11 @@ class T:
     def put(self, rel, data):
         self.host.write(self.host.join(self.work, rel), data)
 
-    def requests(self):
-        return fake_provider.STATE.log(self.model)
+    def requests(self, model=None):
+        return fake_provider.STATE.log(model or self.model)
+
+    def compactions(self):
+        return fake_provider.STATE.log(self.model + "#compact")
 
     def check(self, cond, msg):
         if not cond:
@@ -438,9 +451,11 @@ def compact(names):
 SCENARIOS = {}
 
 
-def scenario(conf=None, bound=30, posix=False):
+def scenario(conf=None, bound=30, posix=False, alone=False):
+    """alone: a heavy scenario (big files, a stream of requests), run by
+    itself after the rest, so that it slows no timed one on a small host."""
     def deco(fn):
-        SCENARIOS[fn.__name__] = (fn, conf, bound, posix)
+        SCENARIOS[fn.__name__] = (fn, conf, bound, posix, alone)
         return fn
     return deco
 
@@ -556,7 +571,7 @@ def retry_after_2(t):
             "the second request came 2 s later")
 
 
-@scenario(bound=5)
+@scenario(conf={"slow_retry_budget": 600}, bound=5)
 def retry_after_3600(t):
     r = t.run()
     t.check(r.rc == 1, f"exit {r.rc}")
@@ -600,11 +615,14 @@ def midstream_error(t):
 
 @scenario(bound=5)
 def overflow(t):
+    # A lone prompt too long, by the server's count: nothing to compact
     r = t.run()
     t.check(r.rc == 1, f"exit {r.rc}")
     end = r.last("turn.end")
     t.check(end.get("err", "").startswith("overflow"), f"classified as overflow: {end}")
+    t.check("compacting cannot" in end.get("err", ""), f"explained: {end}")
     t.check(len(t.requests()) == 1, "not retried")
+    t.check(not t.compactions(), "nothing to summarize")
 
 
 @scenario(bound=8)
@@ -1336,11 +1354,325 @@ def config_link(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+# M4: compaction, admission, slow retries and fallbacks, reasoning_end,
+# unexpected stops
+
+def bigfiles(t, n, lines):
+    """Files f0.txt.. of about 78 bytes a line, each different, made on
+    the host (a Windows command line is too short to carry them)."""
+    fill = "abcdefghij" * 6
+    if isinstance(t.host, SshHost):
+        t.host.sh("".join(
+            f"awk 'BEGIN {{ for (j = 0; j < {lines}; j++) "
+            f"printf \"file {i} line %d: {fill}\\n\", j }}' > "
+            f"{shlex.quote(t.host.join(t.work, f'f{i}.txt'))}\n" for i in range(n)))
+        return
+    for i in range(n):
+        t.put(f"f{i}.txt", "".join(f"file {i} line {j}: {fill}\n"
+                                   for j in range(lines)))
+
+
+def chat(req):
+    return req["body"]["messages"]
+
+
+def checkpointed(msgs):
+    return len(msgs) > 1 and "<conversation-checkpoint>" in str(msgs[1].get("content"))
+
+
+SMALL = {"_listing": {"meta": {"n_ctx": 24000, "n_ctx_train": 262144}}}
+
+
+@scenario(conf=SMALL, bound=25, alone=True)
+def compaction(t):
+    """A small window: the older reads are summarized, the newest stay
+    verbatim, the turn carries on, and a resumed session replays the
+    compaction to the same prompt."""
+    bigfiles(t, 8, 160)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(r.text() == "All files read.", f"text {r.text()!r}")
+    cps = r.all("compact")
+    t.check(len(cps) == 1 and cps[0]["kind"] == "summary", f"one summary: {cps}")
+    cp = cps[0]
+    t.check(cp["why"] == "threshold" and cp["after"] < cp["before"], f"sizes: {cp}")
+    t.check("SUMMARY-0" in cp["summary"] and "- read f0.txt" in cp["summary"],
+            f"summary with files: {cp['summary']!r}")
+
+    # The summarizer's request: text only, the template, the old messages
+    sreq = t.compactions()
+    t.check(len(sreq) == 1, f"one summary request: {len(sreq)}")
+    body = sreq[0]["body"]
+    t.check("tools" not in body, "no tools offered")
+    user = body["messages"][1]["content"]
+    for want in ("do not call tools", "## Goal", "## Constraints and preferences",
+                 "### In progress", "## Critical context", "<conversation>",
+                 "[tool call: read]", "file 0 line 1"):
+        t.check(want in user, f"summarizer input has {want!r}")
+    t.check("file 7 line" not in user, "the newest are not summarized")
+
+    # The checkpoint, then the newest messages verbatim
+    reqs = t.requests()
+    k = next(i for i, x in enumerate(reqs) if checkpointed(chat(x)))
+    post, prev = chat(reqs[k]), chat(reqs[k - 1])
+    t.check(f"<summary>\n{cp['summary']}\n</summary>" in post[1]["content"],
+            "the checkpoint holds the summary")
+    tail = post[2:]
+    t.check(len(tail) >= 4 and tail[0]["role"] == "assistant" and
+            tail[-1]["role"] == "tool", f"cut at a call: {[m['role'] for m in tail]}")
+    t.check(tail[:-2] == prev[len(prev) - len(tail) + 2:], "kept verbatim")
+    for a, b in zip(reqs[k:], reqs[k + 1:]):
+        t.check(chat(b)[:len(chat(a))] == chat(a), "the prefix is stable again")
+
+    # Resumed: the replayed history is the live one
+    sid = r.events[0].get("sid")
+    last = chat(reqs[-1])
+    r2 = t.run("again", resume=sid)
+    t.check(r2.rc == 0, f"resume exit {r2.rc}: {r2.stderr}")
+    again = chat(t.requests()[len(reqs)])
+    t.check(again[:len(last)] == last, "the replay rebuilds the compacted history")
+    t.check(again[len(last):] == [{"role": "assistant", "content": "All files read."},
+                                  {"role": "user", "content": "again"}],
+            f"then the rest: {again[len(last):]}")
+
+
+@scenario(conf=SMALL, bound=20, alone=True)
+def compact_guard(t):
+    """A summary that leaves too little room ends the turn, rather than
+    compact again and again."""
+    bigfiles(t, 8, 160)
+    r = t.run()
+    t.check(r.rc == 1, f"exit {r.rc}: {r.stderr}")
+    t.check(len(r.all("compact")) == 1, f"compacted once: {r.all('compact')}")
+    notes = [n["text"] for n in r.all("note") if "above 80%" in n.get("text", "")]
+    t.check(notes, f"explained: {[n['text'] for n in r.all('note')]}")
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "enough room" in end.get("err", ""),
+            f"turn end: {end}")
+    reqs = t.requests()
+    t.check(not any(checkpointed(chat(x)) for x in reqs), "no request after it")
+
+
+@scenario(conf={"_listing": {"meta": {"n_ctx": 100000, "n_ctx_train": 262144}}},
+          bound=20, alone=True)
+def compact_prune(t):
+    """Old tool outputs give way to a line saying where they are, with
+    no summary, and the newest 40k tokens of output stay."""
+    bigfiles(t, 10, 512)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    cps = r.all("compact")
+    t.check(len(cps) == 1 and cps[0]["kind"] == "prune", f"one prune: {cps}")
+    el = cps[0]["elided"]
+    t.check(len(el) >= 3, f"several elided: {len(el)}")
+    t.check(not t.compactions(), "no summary")
+    text = el[0]["text"]
+    t.check(text.startswith("[output elided: ") and "out/" in text, f"elision: {text}")
+    path = text.split("full output in ", 1)[1].rstrip("]")
+    full = t.host.read(path)
+    t.check(full and "file " in full and " line 0: " in full, f"the output is kept in {path}")
+    reqs = t.requests()
+    k = next(i for i, x in enumerate(reqs)
+             if any(str(m.get("content", "")).startswith("[output elided")
+                    for m in chat(x)))
+    tools = [m for m in chat(reqs[k]) if m.get("role") == "tool"]
+    t.check(not tools[-1]["content"].startswith("[output elided"),
+            "the newest output stays")
+    t.check(r.text() == "Pruned and done.", f"text {r.text()!r}")
+
+
+@scenario(bound=20, alone=True)
+def overflow_compact(t):
+    """The server rejects a prompt as too long: compact to 70% of it,
+    then retry the step."""
+    bigfiles(t, 4, 100)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    cps = r.all("compact")
+    t.check(cps and cps[-1]["why"] == "overflow", f"compacted for it: {cps}")
+    reqs = t.requests()
+    t.check(len(reqs) == 6, f"the step retried once: {len(reqs)}")
+    t.check(len(json.dumps(chat(reqs[5]))) < len(json.dumps(chat(reqs[4]))),
+            "the retry is smaller")
+    t.check(checkpointed(chat(reqs[5])), "with a checkpoint")
+    t.check(r.text() == "Fits now.", f"text {r.text()!r}")
+
+
+@scenario(conf={"_path": "router1/"}, bound=20)
+def queue(t):
+    """A router with --models-max 1: a session on another model waits its
+    turn, queued, while one on the same model joins the first."""
+    h = t.headless()
+    try:
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        b = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        c = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=a, text="go")
+        h.wait(lambda e: e.get("sid") == a and e.get("ev") == "live" and
+               e.get("state") == "streaming")
+        h.send("prompt", sid=b, text="go")
+        q = h.wait(lambda e: e.get("sid") == b and e.get("ev") == "live" and
+                   e.get("state") == "queued")
+        t.check(q.get("queue_pos") == 1 and q.get("queue_len") == 1, f"queued: {q}")
+        h.send("prompt", sid=c, text="go")
+        for s in (a, b, c):
+            end = h.wait(lambda e: e.get("sid") == s and e.get("ev") == "turn.end")
+            t.check(end["why"] == "done", f"{s}: {end}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    one = t.requests()
+    two = t.requests(t.model2)
+    t.check(len(one) == 2 and len(two) == 1, f"requests {len(one)} {len(two)}")
+    t.check(one[1]["t"] < one[0]["end"], "the same model ran side by side")
+    t.check(two[0]["t"] >= max(x["end"] for x in one) - 0.05,
+            "the other model waited for both")
+    with fake_provider.STATE.lock:
+        peak = fake_provider.STATE.peak.get("router1")
+    t.check(peak == 1, f"one model at a time: {peak}")
+
+
+MINUTE = {"HARNESS_TEST_MINUTE_MS": "60"}  # a minute in 60 ms
+
+
+@scenario(bound=15)
+def slow_retry(t):
+    """After the quick retries, slow ones wait minutes (here, scaled),
+    with the quick ones again after each."""
+    r = t.run(env=MINUTE)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    slow = [e["delay_ms"] for e in r.all("retry") if e.get("slow")]
+    quick = [e for e in r.all("retry") if not e.get("slow")]
+    t.check(slow == [60, 120], f"slow delays {slow}")
+    t.check(len(quick) == 20, f"quick retries {len(quick)}")
+    t.check(all(e.get("model") == t.model for e in r.all("retry")), "the model named")
+    t.check(r.text() == "Up again.", f"text {r.text()!r}")
+
+
+@scenario(bound=25, alone=True)
+def slow_budget(t):
+    """The default schedule, 1 2 5 10 15 15... minutes, until the 2 hour
+    budget is spent (here, scaled)."""
+    r = t.run(env=MINUTE)
+    t.check(r.rc == 1, f"exit {r.rc}: {r.stderr}")
+    slow = [e["delay_ms"] for e in r.all("retry") if e.get("slow")]
+    t.check(slow[:5] == [60, 120, 300, 600, 900] and set(slow[5:]) <= {900},
+            f"the schedule {slow}")
+    # Quick retries take time too, more of it over a tunnel to Windows
+    t.check(sum(slow) <= 7200 and len(slow) >= 6, f"the budget {slow}")
+    end = r.last("turn.end")
+    t.check("gave up after" in end.get("err", ""), f"turn end {end}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nfallback = {model2}\n"}, bound=15)
+def fallback(t):
+    """Quick retries spent, the fallback takes over, and after the
+    cooldown (scaled) the primary is tried again."""
+    r = t.run(env=MINUTE)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    sw = [e for e in r.all("retry") if e.get("fallback")]
+    t.check(len(sw) == 1 and sw[0]["model"] == t.model2, f"switched: {sw}")
+    models = [e["model"] for e in r.all("attempt")]
+    t.check(models == [t.model] * 11 + [t.model2, t.model], f"attempts {models}")
+    t.check(any("trying the primary model" in n.get("text", "") for n in r.all("note")),
+            "the return is noted")
+    t.check([e["status"] for e in r.all("tool.end")] == ["ok"], "the fallback worked")
+    t.check(r.text() == "Back on the primary.", f"text {r.text()!r}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nfallback = fake/{model2}\n"}, bound=8)
+def limit(t):
+    """A usage limit goes straight to the fallback, here given as
+    ENDPOINT/MODEL."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    rt = r.all("retry")
+    t.check(len(rt) == 1 and rt[0]["class"] == "limit" and rt[0]["fallback"] == 1,
+            f"retries {rt}")
+    t.check(len(t.requests()) == 1, "no quick retries")
+    t.check(r.text() == "The fallback answered.", f"text {r.text()!r}")
+
+
+def controls(t):
+    with fake_provider.STATE.lock:
+        return [c for c in fake_provider.STATE.controls if c.get("model") == t.model]
+
+
+@scenario(bound=10)
+def reasoning_end(t):
+    """Looping reasoning on llama.cpp is ended early, and the model
+    answers in the same response."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(t.requests()[0]["body"].get("reasoning_control") is True,
+            "reasoning_control sent")
+    cs = controls(t)
+    t.check(len(cs) == 1 and cs[0] == {"id": f"chatcmpl-{t.model}-0",
+                                       "action": "reasoning_end", "model": t.model},
+            f"control {cs}")
+    t.check(not r.all("nudge") and len(t.requests()) == 1, "no cancel, no retry")
+    t.check(any("reasoning_end" in n.get("text", "") for n in r.all("note")), "noted")
+    t.check(r.text() == "The answer is 42.", f"text {r.text()!r}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nreasoning_budget = 100\n"}, bound=10)
+def reasoning_budget(t):
+    """Reasoning past [model] reasoning_budget is ended likewise."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    cs = controls(t)
+    t.check(len(cs) == 1, f"control {cs}")
+    asst = r.all("assistant")[0]
+    think = "".join(b.get("text", "") for b in asst["blocks"] if b["t"] == "think")
+    t.check(400 <= len(think) < 2000, f"reasoning cut near its budget: {len(think)}")
+    t.check(any("budget" in n.get("text", "") for n in r.all("note")), "noted")
+    t.check(r.text() == "The answer is 42.", f"text {r.text()!r}")
+
+
+@scenario(bound=10)
+def reasoning_404(t):
+    """Where the server has no control endpoint, looping reasoning is
+    cut off as before."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(len(controls(t)) == 1, "tried once")
+    t.check([n["kind"] for n in r.all("nudge")] == ["loop"], f"nudges {r.all('nudge')}")
+    t.check(len(t.requests()) == 2, "then a new attempt")
+    t.check(r.text() == "Second attempt.", f"text {r.text()!r}")
+
+
+@scenario(bound=8)
+def stop_nudge(t):
+    """A final response that announces work is nudged to go on, three
+    times at most, and then the turn ends as the agent chose."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check([n["kind"] for n in r.all("nudge")] == ["stop"] * 3,
+            f"nudges {[n['kind'] for n in r.all('nudge')]}")
+    t.check(len(t.requests()) == 4, f"requests {len(t.requests())}")
+    t.check(r.last("turn.end").get("why") == "done", "ends done")
+    t.check(any("announcing" in n.get("text", "") for n in r.all("note")), "noted")
+
+
+@scenario(bound=8)
+def stop_progress(t):
+    """The count starts over after a tool succeeds, and a closing offer
+    ("Let me know...") is no announcement."""
+    t.put("hello.txt", "hello\n")
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ns = r.all("nudge")
+    t.check([(n["kind"], n["n"]) for n in ns] == [("stop", 1), ("stop", 1)],
+            f"nudges {[(n['kind'], n['n']) for n in ns]}")
+    t.check(len(t.requests()) == 4 and r.last("turn.end").get("why") == "done",
+            "done after four")
+
+
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")
 
 
 def runone(host, name, verbose):
-    fn, conf, bound, posix = SCENARIOS[name]
+    fn, conf, bound, posix, alone = SCENARIOS[name]
     if posix and host.windows:
         return name, "skip", 0.0, "POSIX only"
     t0 = time.monotonic()
@@ -1437,15 +1769,21 @@ def main():
                 return 2
         jobs = args.j or (2 if args.host else 8)
         failed = 0
+
+        def report(name, status, dt, why):
+            print(f"{status:4} {name:18} {dt:6.1f} s  {why.splitlines()[0] if why else ''}")
+            if args.v and why and status == "FAIL":
+                print("     " + why.replace("\n", "\n     "))
+            return status == "FAIL"
+
+        together = [n for n in names if not SCENARIOS[n][4]]
+        alone = [n for n in names if SCENARIOS[n][4]]
         with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
-            futs = [ex.submit(runone, host, n, args.v) for n in names]
+            futs = [ex.submit(runone, host, n, args.v) for n in together]
             for f in futs:
-                name, status, dt, why = f.result()
-                print(f"{status:4} {name:18} {dt:6.1f} s  {why.splitlines()[0] if why else ''}")
-                if status == "FAIL":
-                    failed += 1
-                    if args.v and why:
-                        print("     " + why.replace("\n", "\n     "))
+                failed += report(*f.result())
+        for n in alone:
+            failed += report(*runone(host, n, args.v))
         print(f"{len(names) - failed}/{len(names)} scenarios passed")
         return 1 if failed else 0
     finally:

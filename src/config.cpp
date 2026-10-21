@@ -104,12 +104,13 @@ enum : i32 {
     CFG_SECRET,   // env:NAME
     CFG_LIST,     // words from the choices, separated by blanks or commas
     CFG_PATHS,    // absolute or ~ paths, separated by ;
+    CFG_TIMES,    // seconds, each above 0, separated by blanks
     CFG_NTYPES,
 };
 
 static Str cfgtypenames[] = {
     "string", "int", "number", "seconds", "bool", "enum", "url", "secret",
-    "list", "paths",
+    "list", "paths", "times",
 };
 static_assert(countof(cfgtypenames) == CFG_NTYPES);
 
@@ -159,6 +160,16 @@ static CfgKey cfgschema[] = {
      "counting as data"},
     {"endpoint", "progress_timeout", CFG_SECONDS, "600", {}, {}, "timeouts",
      "Seconds without new output or prompt progress"},
+    {"endpoint", "slow_retry", CFG_TIMES, "60 120 300 600 900", {}, {},
+     "retries", "Seconds between slow retries once quick ones fail, the "
+     "last repeating"},
+    {"endpoint", "slow_retry_budget", CFG_SECONDS, "7200", {}, {}, "retries",
+     "Seconds of slow retries before a turn gives up"},
+    {"endpoint", "max_concurrent", CFG_INT, "", {}, {}, "capacity",
+     "Most requests in flight at once, by default no limit"},
+    {"endpoint", "max_models", CFG_INT, "", {}, {}, "capacity",
+     "Most different models in flight at once, by default a llama.cpp "
+     "router's max_instances"},
 
     {"model", "reasoning", CFG_ENUM, "reasoning_content", {},
      "reasoning_content reasoning reasoning_text none", "model",
@@ -166,6 +177,20 @@ static CfgKey cfgschema[] = {
      "or none"},
     {"model", "context", CFG_INT, "", {}, {}, "model",
      "Context limit in tokens, for a server that does not report it"},
+    {"model", "compactor", CFG_STRING, "", {}, {}, "model",
+     "Model that summarizes long conversations, MODEL or ENDPOINT/MODEL, "
+     "by default this one"},
+    {"model", "fallback", CFG_STRING, "", {}, {}, "model",
+     "Models to use in turn when this one fails or hits a usage limit, "
+     "each MODEL or ENDPOINT/MODEL"},
+    {"model", "fallback_cooldown", CFG_SECONDS, "600", {}, {}, "model",
+     "Seconds on a fallback before this model is tried again"},
+    {"model", "reasoning_budget", CFG_INT, "", {}, {}, "model",
+     "Most reasoning tokens in a response before the model is told to "
+     "answer"},
+    {"model", "max_concurrent", CFG_INT, "", {}, {}, "capacity",
+     "Most requests for this model at once, by default the server's "
+     "slots, else 4"},
     {"model", "temperature", CFG_NUMBER, "", {}, {}, "sampling",
      "Sampling temperature, sent only when set"},
     {"model", "top_p", CFG_NUMBER, "", {}, {}, "sampling",
@@ -350,6 +375,15 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
             }
         }
         return CFG_OK;
+    case CFG_TIMES:
+        for (Str rest = v; rest.len;) {
+            Str   w = cfgnextword(&rest);
+            Float f = parsefloat(w);
+            if (w.len && (!f.ok || f.val<=0 || f.val>=1e7)) {
+                return CFG_BAD;
+            }
+        }
+        return CFG_OK;
     }
     return CFG_OK;
 }
@@ -363,6 +397,7 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     case CFG_INT:     print(&b, "expected a whole number");             break;
     case CFG_NUMBER:  print(&b, "expected a number");                   break;
     case CFG_SECONDS: print(&b, "expected seconds, a number above 0");  break;
+    case CFG_TIMES:   print(&b, "expected seconds, numbers above 0");   break;
     case CFG_BOOL:    print(&b, "expected true or false");              break;
     case CFG_URL:
         print(&b, "expected a URL starting with http:// or https://");

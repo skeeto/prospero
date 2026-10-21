@@ -71,6 +71,9 @@ static void testcfgschema(Test *t)
         {"endpoint", "idle_timeout", "1e7", CFG_BAD, 0},
         {"endpoint", "idle_timeout", " 30 ", CFG_OK, 0},
         {"endpoint", "idle_timeout", "30s", CFG_BAD, 0},
+        {"endpoint", "slow_retry", "60 120, 0.5", CFG_OK, 0},
+        {"endpoint", "slow_retry", "60 x", CFG_BAD, 0},
+        {"endpoint", "slow_retry", "60 0", CFG_BAD, 0},
         {"endpoint", "key", "env:API_KEY", CFG_OK, 1},
         {"endpoint", "key", "env:", CFG_BAD, 0},
         {"endpoint", "key", "env:1X", CFG_BAD, 0},
@@ -664,14 +667,27 @@ static void testcfgjson(Test *t)
         "endpoint/team/first_byte_timeout=300*\n"
         "endpoint/team/idle_timeout=90*\n"
         "endpoint/team/progress_timeout=600*\n"
+        "endpoint/team/slow_retry=60 120 300 600 900*\n"
+        "endpoint/team/slow_retry_budget=7200*\n"
+        "endpoint/team/max_concurrent=*\n"
+        "endpoint/team/max_models=*\n"
         "endpoint/local/url=http://127.0.0.1:8080/@/c/h.ini:3\n"
         "endpoint/local/key=env:KEY@/c/h.ini:5\n"
         "endpoint/local/connect_timeout=5*\n"
         "endpoint/local/first_byte_timeout=1800*\n"
         "endpoint/local/idle_timeout=30@/c/h.ini:4\n"
         "endpoint/local/progress_timeout=600*\n"
+        "endpoint/local/slow_retry=60 120 300 600 900*\n"
+        "endpoint/local/slow_retry_budget=7200*\n"
+        "endpoint/local/max_concurrent=*\n"
+        "endpoint/local/max_models=*\n"
         "model/m/reasoning=reasoning_content*\n"
         "model/m/context=*\n"
+        "model/m/compactor=*\n"
+        "model/m/fallback=*\n"
+        "model/m/fallback_cooldown=600*\n"
+        "model/m/reasoning_budget=*\n"
+        "model/m/max_concurrent=*\n"
         "model/m/temperature=*\n"
         "model/m/top_p=*\n"
         "model/m/top_k=many@/c/h.ini:7!\n"

@@ -32,6 +32,7 @@ enum : i32 {
     EV_NUDGE,
     EV_TURNEND,
     EV_NOTE,
+    EV_COMPACT,
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -67,6 +68,7 @@ static EvInfo evinfo[] = {
     {"nudge",      1, 0},
     {"turn.end",   1, 1},
     {"note",       1, 0},
+    {"compact",    1, 0},
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},

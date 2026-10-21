@@ -205,6 +205,8 @@ static iz find(Str s, Str needle)  // -1 if not found
 {
     if (!needle.len) {
         return 0;
+    } else if (needle.len > s.len) {
+        return -1;  // and no pointer before the start
     }
     u8 *last = s.data + s.len - needle.len;
     for (u8 *p = s.data; p <= last; p++) {
