@@ -107,6 +107,32 @@ static u8 jsonunescape(u8 c)  // for the single-character escapes
     return c;  // " \ /
 }
 
+// Eight bytes at a time, for the plain runs of long strings, which debug
+// builds are slow at a byte at a time. Each test is exact per byte, with
+// no carries between bytes: the high bit of each byte that is zero.
+static u64 jsonzero8(u64 w)
+{
+    u64 lo = 0x7f7f7f7f7f7f7f7fu;
+    return ~(((w & lo) + lo) | w | lo);
+}
+
+static u64 jsonload8(u8 *p)
+{
+    u64 w = 0;
+    __builtin_memcpy(&w, p, 8);
+    return w;
+}
+
+// Whether any of eight bytes ends a plain run: a control character, a
+// quote or a backslash.
+static b32 jsonspecial8(u64 w)
+{
+    u64 ctl = ~(((w & 0x7f7f7f7f7f7f7f7fu) + 0x6060606060606060u) | w);  // < 0x20
+    u64 hi  = 0x8080808080808080u;
+    return ((ctl & hi) | jsonzero8(w ^ 0x2222222222222222u) |
+            jsonzero8(w ^ 0x5c5c5c5c5c5c5c5cu)) != 0;
+}
+
 // Parse the string whose opening quote is at the current offset. Without
 // escapes the result points into the source. Null on error.
 static Str jsonstring(JsonParser *p)
@@ -116,6 +142,11 @@ static Str jsonstring(JsonParser *p)
     iz  i   = beg;
     b32 esc = 0;
     for (;;) {
+        // A plain run: by words, then bytes up to whatever ends it
+        for (; s.len-i>=8 && !jsonspecial8(jsonload8(s.data+i)); i += 8) {}
+        for (u8 *d = s.data+i, *end = s.data+s.len; d < end; d++, i++) {
+            if (*d<0x20 || *d=='"' || *d=='\\') break;
+        }
         if (i == s.len) {
             jsonerror(p, i, "unterminated string");
             return {};
@@ -163,11 +194,16 @@ static Str jsonstring(JsonParser *p)
     // Escapes only shrink, so the raw length is enough.
     Str r = {allocbytes(p->perm, raw.len), 0};
     for (iz k = 0; k < raw.len;) {
-        u8 c = raw[k];
-        if (c != '\\') {
-            r.data[r.len++] = c;
-            k++;
-            continue;
+        // Plain bytes up to the next escape, copied at once
+        iz  end = k;
+        u64 bs  = 0x5c5c5c5c5c5c5c5cu;
+        for (; raw.len-end>=8 && !jsonzero8(jsonload8(raw.data+end)^bs); end += 8) {}
+        for (; end<raw.len && raw.data[end]!='\\'; end++) {}
+        copybytes(r.data+r.len, raw.data+k, end-k);
+        r.len += end - k;
+        k = end;
+        if (k == raw.len) {
+            break;
         }
 
         u8 e = raw[k+1];

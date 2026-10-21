@@ -271,7 +271,7 @@ static void testcfgvalidate(Test *t)
         "of: read, write, edit, shell, grep, glob, todo_write, jobs, "
         "job_output, job_kill\n"
         "/c/harness.ini:21:2: warning: unknown section kind \"provider\", "
-        "expected endpoint, model, role, guard, tools or instructions\n"
+        "expected endpoint, model, role, guard, tools, instructions or ui\n"
         "/c/harness.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "
@@ -705,7 +705,8 @@ static void testcfgjson(Test *t)
         "tools//auto_resume=5*\n"
         "tools//stop_grace=*\n"
         "tools//use_rg=true*\n"
-        "instructions//files=AGENTS.md CLAUDE.md*\n");
+        "instructions//files=AGENTS.md CLAUDE.md*\n"
+        "ui//theme=system*\n");
 
     Json *schema = jsonget(j, "schema");
     expect(t, "json.schema", istr(&a, jsonlen(schema)),

@@ -17,6 +17,16 @@ by quitting are gone, with no engine process left behind.
   uv run tests/gui.py --harness build/harness --mode idle      (60 s)
   uv run tests/gui.py --harness build/harness --mode streamtest
   uv run tests/gui.py --harness build/harness --mode signals   (POSIX)
+  uv run tests/gui.py --harness build/harness --mode settings [--shots DIR]
+  uv run tests/gui.py --harness build/harness --mode enginestop
+  uv run tests/gui.py --harness build/harness --fake [--mode idle]   (M1's)
+  uv run tests/gui.py --harness build/harness --mode bench   (M1's scale)
+
+The settings mode edits a value longer than a field's slack and picks
+the theme, dark then light, from its list over a transcript that shows
+most of what one can (screenshots of each with --shots). The enginestop
+mode kills the engine process mid-turn and mid-ask: the GUI must stop
+counting either, and quit at once when closed.
 
 On Linux without a display it runs under xvfb-run. --serve only runs the
 provider and writes the configuration, for a GUI started elsewhere (a
@@ -58,7 +68,11 @@ def e2econfig(url, model):
     )
 
 
-def config(url, model):
+# A value longer than a settings field's slack of 1024 bytes
+LONG_PROMPT = " ".join(f"Rule {i}: keep every change small and tested." for i in range(40))
+
+
+def config(url, model, ask=3, extra=""):
     return (
         "# The GUI checklist's configuration\n"
         f"endpoint = fake\n"
@@ -76,8 +90,8 @@ def config(url, model):
         "\n"
         "# Asks wait briefly\n"
         "[guard]\n"
-        "ask_timeout = 3\n"
-    )
+        f"ask_timeout = {ask}\n"
+    ) + extra
 
 
 def alive(pid):
@@ -517,7 +531,8 @@ def main():
     ap.add_argument("--inbox-cap", type=int, default=32768,
                     help="the GUI's inbox, small to force lost records")
     ap.add_argument("--mode", default="drive",
-                    choices=["drive", "idle", "streamtest", "e2e", "signals"])
+                    choices=["drive", "idle", "streamtest", "e2e", "signals",
+                             "settings", "enginestop", "bench"])
     ap.add_argument("--model", default="qwen-flash", help="with --mode e2e")
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--keep", action="store_true", help="keep the directories")
@@ -525,6 +540,8 @@ def main():
     ap.add_argument("--shots", help="save the checklist's screenshots here")
     ap.add_argument("--host", help="run the GUI on this Windows host's console")
     ap.add_argument("--trace", action="store_true", help="log where presses land")
+    ap.add_argument("--fake", action="store_true",
+                    help="the fake agent, no engine: M1's checklist and measurements")
     args = ap.parse_args()
     if args.mode == "signals":
         return signals(args)
@@ -540,14 +557,23 @@ def main():
     host.mkdir(work)
     host.mkdir(state)
     host.write(host.path("work", "hello.txt"), "hello world\n")
+    if args.mode == "enginestop":
+        args.subprocess = True  # the GUI's --enginestop implies it
+    curl = host.url if args.host else url
     if args.mode == "e2e":
         before = e2econfig(args.url or "http://localhost/", args.model)
+    elif args.mode == "settings":
+        # Asks wait out the screenshots; a role holds the long value
+        before = config(curl, model, 120,
+                        f"\n# A long value\n[role long]\nprompt = {LONG_PROMPT}\n")
+    elif args.mode == "enginestop":
+        before = config(curl, model, 60)
     else:
-        before = config(host.url if args.host else url, model)
+        before = config(curl, model)
     host.write(ini, before)
 
     holder = None
-    if args.mode == "drive":
+    if args.mode == "drive" and not args.fake:
         holder = host.sessions(ini, state, work)
 
     paths = [ini, state, work]
@@ -563,6 +589,8 @@ def main():
         guiargs.append("--engine=subprocess")
     if args.trace:
         guiargs.append("--trace-drive")
+    if args.fake:
+        guiargs.append("--fake")
     if args.shots and not args.host:
         os.makedirs(args.shots, exist_ok=True)
         guiargs += ["--shots", os.path.abspath(args.shots)]
@@ -577,7 +605,7 @@ def main():
     elif status != 0:
         problems.append(f"exit status {status}")
     out = "".join(lines)
-    if args.mode in ("drive", "e2e"):
+    if args.mode in ("drive", "e2e", "settings", "enginestop"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")
@@ -587,6 +615,33 @@ def main():
                 problems.append("checklist: " + s.strip())
         if "STALE" in out:
             problems.append("stale frames reported")
+    if args.mode == "settings":
+        after = host.read(ini) or ""
+        if f"prompt = {LONG_PROMPT}!\n" not in after:
+            problems.append("the long value was not saved whole with its edit")
+        if "[ui]\ntheme = light\n" not in after:
+            problems.append("the theme was not saved as light under [ui]")
+        rest = after.replace(f"prompt = {LONG_PROMPT}!\n", f"prompt = {LONG_PROMPT}\n")
+        rest = rest.replace("\n[ui]\ntheme = light\n", "")
+        if rest != before:
+            problems.append("the configuration changed more than the two edits")
+        else:
+            print("configuration: the long value and the theme, nothing else")
+        if args.shots and not args.host:
+            for name in ("dark", "light"):
+                if not os.path.exists(os.path.join(args.shots, name + ".png")):
+                    problems.append(f"no {name}.png")
+    if args.mode == "enginestop":
+        time.sleep(0.5)
+        text = host.read(host.path("work", "close.pid"))
+        pid = int(text.strip()) if text and text.strip().isdigit() else None
+        if pid is None:
+            problems.append("no close.pid")
+        elif host.alive(pid):
+            problems.append(f"the command (pid {pid}) outlived its engine")
+        else:
+            print(f"close: pid {pid} gone with the engine")
+    if args.mode in ("drive", "e2e") and not args.fake:
         after = host.read(ini) or ""
         diff = list(difflib.unified_diff(before.splitlines(), after.splitlines(),
                                          lineterm="", n=0))

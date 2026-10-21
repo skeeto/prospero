@@ -56,9 +56,9 @@
 // In config.get, path is where edits go ("" if there is no location),
 // exists says whether that file was read, rev counts loads, and files
 // lists every file read, in load order. Settings list every schema key
-// of the top level and of the unnamed kinds ([guard], [tools] and
-// [instructions]), and of each named [endpoint], [model] and [role]
-// section that exists, in schema order. A value is
+// of the top level and of the unnamed kinds ([guard], [tools],
+// [instructions] and [ui]), and of each named [endpoint], [model] and
+// [role] section that exists, in schema order. A value is
 // the one in effect as written, or its default ("default":1, with file
 // "" and line 0, or where the key is set empty); "valid":0 marks one
 // ignored for its default. An endpoint's timeouts default by whether
@@ -130,6 +130,7 @@ static CfgKind cfgkinds[] = {
     {"guard",    0, "Where the file tools may go without asking"},
     {"tools",    0, "Background jobs, stopping commands, and search"},
     {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
+    {"ui",       0, "How the GUI looks"},
 };
 
 struct CfgKey {
@@ -247,6 +248,9 @@ static CfgKey cfgschema[] = {
     {"instructions", "files", CFG_STRING, "AGENTS.md CLAUDE.md", {}, {},
      "instructions", "File names to load from each directory, the first "
      "found in each, separated by blanks"},
+
+    {"ui", "theme", CFG_ENUM, "system", {}, "system dark light", "ui",
+     "Colors: dark, light, or system to follow the operating system"},
 };
 
 // Value judgments
@@ -614,8 +618,8 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniLine *l)
     if (!k) {
         print(&b, "unknown section kind \"");
         print(&b, l->key);
-        print(&b, "\", expected endpoint, model, role, guard, tools or "
-                  "instructions");
+        print(&b, "\", expected endpoint, model, role, guard, tools, "
+                  "instructions or ui");
     } else if (unnamed) {
         print(&b, "a section needs a name, as in [");
         print(&b, l->key);

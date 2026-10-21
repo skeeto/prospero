@@ -13,6 +13,12 @@
 // Wakes arrive as a posted message, which those loops dispatch too, so
 // streaming continues during a drag.
 //
+// The system's theme is the registry's AppsUseLightTheme, read again
+// when WM_SETTINGCHANGE names "ImmersiveColorSet". The title bar takes
+// the theme in effect through DWM (DWMWA_USE_IMMERSIVE_DARK_MODE, 20,
+// or 19 before Windows 10 20H1); Windows 10 repaints it only when the
+// window's activation changes, so that is restated.
+//
 // This is free and unencumbered software released into the public domain.
 
 // Shared by both halves: the core's callbacks, called on the GUI thread.
@@ -27,6 +33,7 @@ struct W32Hooks {
     void (*minimized)(void *gui, int);
     void (*modal)(void *gui, int);        // a modal loop began or ended
     void (*close)(void *gui);             // the user asks to close it
+    void (*systheme)(void *gui, int dark);// the system's theme changed
     int    drive;                         // scripted: never take focus
 };
 
@@ -41,18 +48,21 @@ extern "C" void      w32gui_show(void *);
 extern "C" int       w32gui_wait(void *, long long us);
 extern "C" void      w32gui_wake(void *);
 extern "C" void      w32gui_newframe(void *);
-extern "C" void      w32gui_present(void *, int present);
+extern "C" void      w32gui_present(void *, int present, unsigned clear);
 extern "C" long long w32gui_refresh(void *);
 extern "C" void      w32gui_raise(void *);
 extern "C" void      w32gui_inject(void *, int kind, float x, float y,
                                    int button, int down, int key, int ctrl,
                                    int shift, unsigned short const *text);
+extern "C" int       w32gui_systheme(void *);  // 1 if apps should be dark
+extern "C" int       w32gui_theme(void *, int dark);  // the title bar's
 extern "C" void      w32gui_close(void *);
 
 
 #if HARNESS_GUIEDGE
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include "imgui.h"
@@ -103,7 +113,27 @@ struct W32Gui {
     int                     occluded;
     int                     inmodal;     // inside a move, size or menu loop
     int                     width, height;
+    int                     framedark;   // the title bar: -1 unset, 0, 1
+    int                     drivetheme;  // the checklist's system theme:
+                                         // 1 light, 2 dark, 0 the real one
 };
+
+// Whether apps should be dark, as Settings > Personalization > Colors
+// says, or as the checklist pretends. Light where unset, as before
+// Windows 10 1809.
+static int systemdark(W32Gui *w)
+{
+    if (w->drivetheme) {
+        return w->drivetheme == 2;
+    }
+    DWORD v = 1, n = sizeof(v);
+    LSTATUS r = RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme", RRF_RT_REG_DWORD, 0, &v, &n
+    );
+    return r==ERROR_SUCCESS && v==0;
+}
 
 static void makertv(W32Gui *w)
 {
@@ -246,6 +276,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         h->force(h->gui);
     } return 0;
 
+    case WM_SETTINGCHANGE:
+        if (lp && !lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet")) {
+            h->systheme(h->gui, systemdark(w));
+        }
+        break;
+
     case WM_SYSKEYDOWN:
         // No menu loop for F10 or Alt, but Alt+F4 still closes.
         if (wp != VK_F4) {
@@ -303,7 +339,8 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
     if (!w) {
         return 0;
     }
-    w->hooks = *hooks;
+    w->hooks     = *hooks;
+    w->framedark = -1;
     // A high-resolution timer waits precisely without raising the
     // system timer rate (Windows 10 1803+); otherwise a plain one.
     w->timer = CreateWaitableTimerExW(0, 0, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -405,7 +442,7 @@ extern "C" void w32gui_newframe(void *)
     ImGui_ImplWin32_NewFrame();
 }
 
-extern "C" void w32gui_present(void *p, int present)
+extern "C" void w32gui_present(void *p, int present, unsigned clear)
 {
     W32Gui     *w  = (W32Gui *)p;
     ImDrawData *dd = ImGui::GetDrawData();
@@ -419,9 +456,12 @@ extern "C" void w32gui_present(void *p, int present)
         }
         return;
     }
-    float clear[4] = {0.08f, 0.08f, 0.09f, 1};
+    float rgba[4] = {
+        (float)(clear&255)/255, (float)(clear>>8&255)/255,
+        (float)(clear>>16&255)/255, 1,
+    };
     w->context->OMSetRenderTargets(1, &w->rtv, 0);
-    w->context->ClearRenderTargetView(w->rtv, clear);
+    w->context->ClearRenderTargetView(w->rtv, rgba);
     ImGui_ImplDX11_RenderDrawData(dd);
     HRESULT r = w->swapchain->Present(1, 0);
     if (r == DXGI_STATUS_OCCLUDED) {
@@ -461,6 +501,12 @@ static DWORD WINAPI steermodal(void *arg)
     return 0;
 }
 
+static DWORD WINAPI announcetheme(void *hwnd)
+{
+    SendMessageW((HWND)hwnd, WM_SETTINGCHANGE, 0, (LPARAM)L"ImmersiveColorSet");
+    return 0;
+}
+
 extern "C" void w32gui_inject(void *p, int kind, float x, float y,
                               int button, int down, int key, int ctrl,
                               int shift, unsigned short const *text)
@@ -485,6 +531,7 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
     case 3: {  // key: the backend reads modifiers from the key state
         static WORD const vks[] = {
             VK_TAB, VK_CONTROL, VK_ESCAPE, VK_RETURN, 'C', VK_SHIFT, 'A',
+            VK_END,
         };
         BYTE state[256];
         GetKeyboardState(state);
@@ -531,6 +578,13 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
     case 9:  // minimize, as from the title bar or the taskbar
         ShowWindow(w->hwnd, SW_SHOWMINNOACTIVE);
         break;
+    case 10: {  // the system's theme changes, as Settings announces it
+        // Sent from another thread, as the broadcast is: a pointer in a
+        // system message cannot be posted
+        w->drivetheme = x<0 ? 0 : x>0 ? 2 : 1;
+        HANDLE t = CreateThread(0, 0, announcetheme, w->hwnd, 0, 0);
+        if (t) CloseHandle(t);
+    } break;
     }
 }
 
@@ -543,6 +597,34 @@ extern "C" void w32gui_raise(void *p)
     if (!w->hooks.drive) {
         SetForegroundWindow(w->hwnd);
     }
+}
+
+extern "C" int w32gui_systheme(void *p)
+{
+    return systemdark((W32Gui *)p);
+}
+
+extern "C" int w32gui_theme(void *p, int dark)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (w->framedark == dark) {
+        return 1;
+    }
+    BOOL    v = dark;
+    HRESULT r = DwmSetWindowAttribute(w->hwnd, 20, &v, sizeof(v));
+    if (FAILED(r)) {
+        r = DwmSetWindowAttribute(w->hwnd, 19, &v, sizeof(v));
+    }
+    if (FAILED(r)) {
+        return 0;
+    }
+    if (w->framedark>=0 && IsWindowVisible(w->hwnd)) {
+        BOOL active = GetActiveWindow() == w->hwnd;
+        SendMessageW(w->hwnd, WM_NCACTIVATE, !active, 0);
+        SendMessageW(w->hwnd, WM_NCACTIVATE, active, 0);
+    }
+    w->framedark = dark;
+    return 1;
 }
 
 extern "C" void w32gui_close(void *p)
@@ -574,7 +656,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
 static_assert((i32)W32IN_MOVE==(i32)INPUT_MOVE && (i32)W32IN_OTHER==(i32)INPUT_OTHER);
 static_assert(GEV_MOVE==0 && GEV_RESIZE==5 && GEV_MODALSIZE==6 && GEV_DPI==7 &&
-              GEV_CLOSE==8 && GEV_MINIMIZE==9);
+              GEV_CLOSE==8 && GEV_MINIMIZE==9 && GEV_SYSTHEME==10);
 
 W32(i32, GetCurrentThreadId());
 
@@ -586,6 +668,7 @@ static void hookscale(void *g, float s)  { gui_scale((Gui *)g, s); }
 static void hookminimized(void *g, int m){ gui_minimized((Gui *)g, m); }
 static void hookmodal(void *g, int m)    { gui_modal((Gui *)g, m); }
 static void hookclose(void *g)           { gui_close((Gui *)g); }
+static void hooksystheme(void *g, int d) { gui_systheme((Gui *)g, d); }
 
 static void hooktick(void *p)
 {
@@ -616,12 +699,14 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     h.minimized = hookminimized;
     h.modal     = hookmodal;
     h.close     = hookclose;
+    h.systheme  = hooksystheme;
     h.drive     = g->drive;
     Arena t = g->frame;
     os->gui = w32gui_open(&h, (unsigned short *)towide(&t, title).data);
     if (!os->gui) {
         return 0;
     }
+    gui_systheme(g, w32gui_systheme(os->gui));  // the title bar before it shows
     w32gui_show(os->gui);
     if (g->drive) {
         Arena a = g->frame;
@@ -643,9 +728,9 @@ static void os_guinewframe(Os *os)
     w32gui_newframe(os->gui);
 }
 
-static void os_guipresent(Os *os, b32 present)
+static void os_guipresent(Os *os, b32 present, u32 clear)
 {
-    w32gui_present(os->gui, present);
+    w32gui_present(os->gui, present, clear);
 }
 
 static i64 os_guirefresh(Os *os)
@@ -670,6 +755,11 @@ static void os_guiinject(Os *os, GuiEvent *e)
 static void os_guiraise(Os *os)
 {
     w32gui_raise(os->gui);
+}
+
+static b32 os_guitheme(Os *os, b32 dark)
+{
+    return os->gui ? w32gui_theme(os->gui, dark) : 0;
 }
 
 static void os_guiclose(Os *os)

@@ -20,7 +20,38 @@
 // quit event, which wakes the loop: SDL's own handlers only set a flag
 // for the next event pump, which an idle loop never runs.
 //
+// SDL reports the system's theme (macOS: the app's effective appearance;
+// Linux: the desktop portal's color-scheme, unknown without one, taken
+// as dark) and its changes as events. On macOS the window's frame takes
+// the theme in effect through its NSWindow's appearance, set through
+// the Objective-C runtime; elsewhere the window manager draws it.
+//
 // This is free and unencumbered software released into the public domain.
+
+#ifdef __APPLE__
+// The Objective-C runtime and AppKit's appearance names, declared by
+// hand: enough to set a window's appearance (macOS 10.14+) from C++.
+extern "C" void *objc_getClass(char const *);
+extern "C" void *sel_registerName(char const *);
+extern "C" void  objc_msgSend();
+extern "C" void *NSAppearanceNameAqua;      // NSString *
+extern "C" void *NSAppearanceNameDarkAqua;
+
+// Whether the window's view takes the click that activates it, as the
+// click-through hint makes SDL answer AppKit.
+static b32 firstmouse(SDL_Window *w)
+{
+    SDL_PropertiesID props = SDL_GetWindowProperties(w);
+    void *win = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0);
+    if (!win) {
+        return 0;
+    }
+    using Get  = void *(*)(void *, void *);
+    using Test = bool (*)(void *, void *, void *);
+    void *view = ((Get)(void *)objc_msgSend)(win, sel_registerName("contentView"));
+    return view && ((Test)(void *)objc_msgSend)(view, sel_registerName("acceptsFirstMouse:"), 0);
+}
+#endif
 
 using GlViewport   = void (*)(i32, i32, i32, i32);
 using GlClearColor = void (*)(f32, f32, f32, f32);
@@ -34,6 +65,9 @@ struct GuiSdl {
     u32           wakeevent;
     i32           wakeflag;    // atomic: a wake event is queued
     b32           inwatch;     // drawing from the event watch
+    i32           framedark;   // the frame's theme: -1 unset, 0 light, 1 dark
+    i32           drivetheme;  // the checklist's system theme: 1 light,
+                               // 2 dark, 0 the real one
     GlViewport    glviewport;
     GlClearColor  glclearcolor;
     GlClear       glclear;
@@ -64,6 +98,15 @@ static void sigthread(void *)
             SDL_PushEvent(&e);
         }
     }
+}
+
+// Whether the system prefers dark, or the checklist pretends it does.
+static b32 sysdark(GuiSdl *p)
+{
+    if (p->drivetheme) {
+        return p->drivetheme == 2;
+    }
+    return SDL_GetSystemTheme() != SDL_SYSTEM_THEME_LIGHT;
 }
 
 static f32 contentscale(SDL_Window *w)
@@ -102,6 +145,9 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     p->gui = g;
     SDL_SetHint(SDL_HINT_POLL_SENTINEL, "0");
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");  // sigthread's job
+    // A click that activates the window also reaches what it lands on,
+    // as on Windows, rather than being swallowed by the activation.
+    SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     if (g->drive) {
         // Synthetic input must not compete with the real mouse, which
         // the backend reads directly while the window has focus.
@@ -128,7 +174,11 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
         return 0;
     }
     SDL_GL_MakeCurrent(p->window, p->gl);
-    SDL_GL_SetSwapInterval(1);
+    // The scheduler paces frames to the display. SDL's own vsync on macOS
+    // waits in each swap for a display link tick, which never comes while
+    // the display is off (a locked screen): the GUI would hang there, and
+    // not even quit on SIGTERM.
+    SDL_GL_SetSwapInterval(0);
     p->glviewport   = (GlViewport)SDL_GL_GetProcAddress("glViewport");
     p->glclearcolor = (GlClearColor)SDL_GL_GetProcAddress("glClearColor");
     p->glclear      = (GlClear)SDL_GL_GetProcAddress("glClear");
@@ -137,12 +187,19 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
         return 0;
     }
     p->wakeevent = SDL_RegisterEvents(1);
+    p->framedark = -1;
+    #ifdef __APPLE__
+    g->clickthrough = firstmouse(p->window);
+    #else
+    g->clickthrough = SDL_GetHintBoolean(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, 0);
+    #endif
 
     ImGui_ImplSDL3_InitForOpenGL(p->window, p->gl);
     ImGui_ImplOpenGL3_Init("#version 150");
     gui_scale(g, contentscale(p->window));
 
     os->gui = p;  // before any thread can wake it
+    gui_systheme(g, sysdark(p));  // the frame takes it before it shows
     SDL_AddEventWatch(sdlwatch, p);
     SDL_ShowWindow(p->window);
     os_thread(os, sigthread, 0);
@@ -181,6 +238,9 @@ static void dispatch(GuiSdl *p, SDL_Event *e)
     case SDL_EVENT_QUIT:
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
         gui_close(g);
+        return;
+    case SDL_EVENT_SYSTEM_THEME_CHANGED:
+        gui_systheme(g, sysdark(p));
         return;
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -233,7 +293,7 @@ static void os_guinewframe(Os *)
     ImGui_ImplSDL3_NewFrame();
 }
 
-static void os_guipresent(Os *os, b32 present)
+static void os_guipresent(Os *os, b32 present, u32 clear)
 {
     GuiSdl     *p  = (GuiSdl *)os->gui;
     ImDrawData *dd = ImGui::GetDrawData();
@@ -241,7 +301,8 @@ static void os_guipresent(Os *os, b32 present)
         i32 w = 0, h = 0;
         SDL_GetWindowSizeInPixels(p->window, &w, &h);
         p->glviewport(0, 0, w, h);
-        p->glclearcolor(0.08f, 0.08f, 0.09f, 1);
+        p->glclearcolor((f32)(clear&255)/255, (f32)(clear>>8&255)/255,
+                        (f32)(clear>>16&255)/255, 1);
         p->glclear(0x4000);  // GL_COLOR_BUFFER_BIT
         ImGui_ImplOpenGL3_RenderDrawData(dd);
         Gui *g = p->gui;
@@ -335,6 +396,7 @@ static void os_guiinject(Os *os, GuiEvent *ge)
             {SDLK_C,      SDL_SCANCODE_C},
             {SDLK_LSHIFT, SDL_SCANCODE_LSHIFT},
             {SDLK_A,      SDL_SCANCODE_A},
+            {SDLK_END,    SDL_SCANCODE_END},
         };
         e.type         = ge->down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
         e.key.windowID = id;
@@ -372,9 +434,45 @@ static void os_guiinject(Os *os, GuiEvent *ge)
     case GEV_MINIMIZE:
         SDL_MinimizeWindow(p->window);
         return;
+    case GEV_SYSTHEME:
+        // As SDL reports a change, which the pretense then answers
+        p->drivetheme = ge->x<0 ? 0 : ge->x>0 ? 2 : 1;
+        e.type = SDL_EVENT_SYSTEM_THEME_CHANGED;
+        break;
     }
     e.common.timestamp = SDL_GetTicksNS();
     SDL_PushEvent(&e);
+}
+
+static b32 os_guitheme(Os *os, b32 dark)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p) {
+        return 0;
+    }
+    #ifdef __APPLE__
+    if (p->framedark == dark) {
+        return 1;
+    }
+    SDL_PropertiesID props = SDL_GetWindowProperties(p->window);
+    void *win = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, 0);
+    void *cls = objc_getClass("NSAppearance");
+    if (!win || !cls) {
+        return 0;
+    }
+    using Send = void *(*)(void *, void *, void *);
+    Send  send = (Send)(void *)objc_msgSend;
+    void *name = dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua;
+    void *look = send(cls, sel_registerName("appearanceNamed:"), name);
+    if (!look) {
+        return 0;
+    }
+    send(win, sel_registerName("setAppearance:"), look);
+    p->framedark = dark;
+    return 1;
+    #else
+    return 0;  // the window manager's
+    #endif
 }
 
 static void os_guiclose(Os *os)

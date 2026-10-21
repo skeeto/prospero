@@ -256,9 +256,10 @@ static void    os_wake(Os *);
 // input event to ImGui, gui_wake after clearing the wake flag,
 // gui_force for resizes and exposes, gui_scale for DPI changes,
 // gui_minimized, gui_modal around OS modal loops, gui_frame to draw
-// from inside them, and gui_close when the user asks to close the
-// window or quit, which the core may decline: the window stays until
-// os_guiclose.
+// from inside them, gui_systheme with the system's theme preference
+// (dark or light) as the window opens and whenever it changes, and
+// gui_close when the user asks to close the window or quit, which the
+// core may decline: the window stays until os_guiclose.
 struct Gui;
 // Open the main window with ImGui's platform and renderer backends.
 // Returns 0 on failure.
@@ -268,14 +269,19 @@ static b32     os_guiopen(Os *, Gui *, Str title);
 static b32     os_guiwait(Os *, i64 us);
 // Begin a frame in the backends, before ImGui::NewFrame.
 static void    os_guinewframe(Os *);
-// Render the frame's draw data and present it; or, when not presenting,
-// only apply its texture updates.
-static void    os_guipresent(Os *, b32 present);
+// Render the frame's draw data over the clear color (packed as IM_COL32)
+// and present it; or, when not presenting, only apply its texture
+// updates.
+static void    os_guipresent(Os *, b32 present, u32 clear);
 // The display's refresh period in microseconds.
 static i64     os_guirefresh(Os *);
 // Bring the window back for the user: restored if minimized, and raised
 // unless scripted (it would take the user's focus).
 static void    os_guiraise(Os *);
+// Make the window's frame (its title bar) dark or light to match the
+// theme, where the platform can: Windows 10 1809 and later, and macOS.
+// Returns 0 where it cannot, and before the window exists.
+static b32     os_guitheme(Os *, b32 dark);
 static void    os_guiclose(Os *);
 
 // Synthetic input for the scripted checklist (gui --drive), posted to
@@ -294,6 +300,8 @@ enum {
     GEV_DPI,        // Win32: the window moved to a monitor of x DPI
     GEV_CLOSE,      // the user asks to close the window
     GEV_MINIMIZE,   // the window is minimized
+    GEV_SYSTHEME,   // the system's theme turns dark (x 1) or light (x 0),
+                    // or back to what it really is (x -1)
 };
 enum {
     GKEY_TAB,
@@ -303,6 +311,7 @@ enum {
     GKEY_C,
     GKEY_SHIFT,
     GKEY_A,
+    GKEY_END,
 };
 struct GuiEvent {
     i32 kind;

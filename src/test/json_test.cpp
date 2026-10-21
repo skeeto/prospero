@@ -525,6 +525,43 @@ static void test_json(Test *t)
         expect(t, decoded[i].in, got, decoded[i].want);
     }
 
+    // Strings are scanned eight bytes at a time: escapes, quotes and
+    // control characters at every offset and alignment come back exactly,
+    // and a raw control character is found where it is.
+    {
+        u8  pick[] = {'a', ' ', '"', '\\', '\n', 0x01, 0x1f, 0x7f, '/', 0x5c, '!'};
+        u64 rng    = 1;
+        i32 wrong  = 0;
+        for (i32 n = 0; n < 4000; n++) {
+            Arena tmp = a;
+            u8    raw[48];
+            iz    len = n % 49;
+            for (iz i = 0; i < len; i++) {
+                rng    = rng*0x3243f6a8885a308du + 1;
+                raw[i] = pick[(rng>>33) % countof(pick)];
+            }
+            Buf b(&tmp, 256);
+            for (i32 k = 0; k < n%8; k++) putbyte(&b, ' ');
+            printjsonstr(&b, {raw, len});
+            Str got = jsonstr(jsonparse(&tmp, finish(&b)).root);
+            wrong += !(got == Str{raw, len});
+        }
+        expect(t, "strings by words", istr(&a, wrong), "0");
+
+        wrong = 0;
+        for (i32 n = 0; n < 24; n++) {
+            Arena tmp = a;
+            Buf   b(&tmp, 64);
+            putbyte(&b, '"');
+            for (i32 k = 0; k < n; k++) putbyte(&b, 'x');
+            putbyte(&b, 0x01);
+            print(&b, "xxxxxxxxxx\"");
+            JsonDoc r = jsonparse(&tmp, finish(&b));
+            wrong += r.ok || r.off!=n+1;
+        }
+        expect(t, "control by words", istr(&a, wrong), "0");
+    }
+
     // Error positions and messages
     struct { Str in, want; } errs[] = {
         {"", "error at 0: unexpected end of input"},

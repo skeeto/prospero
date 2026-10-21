@@ -51,6 +51,27 @@ static void test_view(Test *t)
 {
     Arena perm = t->perm;
 
+    // Newlines counted eight bytes at a time agree with a byte at a time,
+    // whatever bytes surround them
+    {
+        Arena a      = perm;
+        u64   rng    = 1;
+        i32   wrong  = 0;
+        u8    pick[] = {'\n', 0x0b, 0x09, 0x8a, 0x00, 0xff, 'a', 0x7f};
+        for (i32 n = 0; n < 4000; n++) {
+            u8  buf[40];
+            iz  len  = n % 41;
+            i64 want = 0;
+            for (iz i = 0; i < len; i++) {
+                rng    = rng*0x3243f6a8885a308du + 1;
+                buf[i] = pick[rng>>61];
+                want  += buf[i] == '\n';
+            }
+            wrong += countnl({buf, len}) != want;
+        }
+        expect(t, "view.countnl", istr(&a, wrong), "0");
+    }
+
     // A turn: deltas grow provisional messages, which the committed
     // record replaces, reclaiming their text
     {
@@ -310,6 +331,32 @@ static void test_view(Test *t)
                     R"("text":"Not run: the harness stopped before this call started."})");
         ViewTool *k = v->msgs[1].tool;
         expect(t, "view.askcrash", istr(&a, v->asks*100 + k->answer*10 + (k->by=="interrupted")), "21");
+    }
+
+    // The engine stops mid-turn, with no records to end it: a command
+    // running, an ask open, text streaming. Nothing counts as running
+    // or waiting any more.
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"go","via":"prompt"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"c1","name":"shell","args":"{\"command\":\"sleep 60\"}"},)"
+                    R"({"t":"call","id":"c2","name":"write","args":"{\"path\":\"../y\",\"content\":\"y\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"tool.start","call":"c1","name":"shell","args":"{}","cwd":"/w"})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"ask","req":"c2/ask","call":"c2","kind":"path",)"
+                    R"("tool":"write","path":"/x/y","detail":"outside","deadline":30000,"dflt":"deny"})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"live","state":"tool"})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"attempt":2,"kind":"text","text":"so"})");
+        expect(t, "view.running2", istr(&a, v->busy*10 + v->asks), "11");
+        viewstopped(v);
+        expect(t, "view.stopped", msgsshow(&a, v),
+               "U:go;X[shell sleep 60 unknown]:;X[write ../y unknown]:;K:outside;A~:so;");
+        ViewTool *k = v->msgs[3].tool;
+        expect(t, "view.stoppedask", istr(&a, k->answer*10 + (k->by=="stopped")), "21");
+        expect(t, "view.stoppedidle", istr(&a, v->busy*100 + v->asks*10 + (v->state==LIVE_CLOSED)), "1");
+        expect(t, "view.stoppedfade", istr(&a, v->msgs[4].faded*10 + (v->stream<0)), "11");
     }
 
     // A successful write shows its content as added lines

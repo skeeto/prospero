@@ -429,11 +429,13 @@ static Str istr(Arena *a, i64 v)
 #  include "doc.cpp"
 #  include "layout.cpp"
 #  include "view.cpp"
+#  include "theme.cpp"
 #  include "test/sched_test.cpp"
 #  include "test/highlight_test.cpp"
 #  include "test/doc_test.cpp"
 #  include "test/layout_test.cpp"
 #  include "test/view_test.cpp"
+#  include "test/theme_test.cpp"
 #endif
 
 int main()
@@ -465,6 +467,7 @@ int main()
     test_doc(&t);
     test_layout(&t);
     test_view(&t);
+    test_theme(&t);
     #endif
 
     fprintf(stderr, "%d tests, %d failed\n", t.run, t.failed);
