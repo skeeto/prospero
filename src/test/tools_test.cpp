@@ -231,10 +231,14 @@ static void test_tools(Test *t)
         }
         expect(t, "env windows", istr(a, !gitdir && drive && utf8), "1");
 
-        ToolEnv te = {"C:\\bb\\busybox.exe", SHELL_BUSYBOX, 1};
+        ToolEnv te = {};
+        te.shell     = "C:\\bb\\busybox.exe";
+        te.shellkind = SHELL_BUSYBOX;
+        te.windows   = 1;
         ShellCmd c = shellcmd(a, &te, "ls -l");
         expect(t, "busybox argv", istr(a, c.argv.len==4 && c.argv[1]=="sh" && c.argv[3]=="ls -l"), "1");
-        te = {"C:\\Windows\\System32\\cmd.exe", SHELL_CMD, 1};
+        te.shell     = "C:\\Windows\\System32\\cmd.exe";
+        te.shellkind = SHELL_CMD;
         c = shellcmd(a, &te, "dir \"a b\" & echo %X%");
         expect(t, "cmd line", c.cmdline,
                "\"C:\\Windows\\System32\\cmd.exe\" /d /s /c \"dir \"a b\" & echo %X%\"");

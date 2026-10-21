@@ -73,8 +73,9 @@ static void test_events(Test *t)
         }
         expect(t, "durable events", finish(&durable),
                "session title user turn attempt assistant tool.start "
-               "tool.end ask answer retry nudge turn.end note ");
-        expect(t, "synced events", finish(&sync), "tool.start ask answer turn.end ");
+               "tool.end ask answer retry nudge turn.end note job.start job.end "
+               "todo snap rewind instructions notice ");
+        expect(t, "synced events", finish(&sync), "tool.start ask answer turn.end rewind ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
         expect(t, "empty event", istr(a, evfind("")), istr(a, EV_NONE));
         for (i32 cmd = 1; cmd < CMD_COUNT; cmd++) {
@@ -552,7 +553,8 @@ static void test_events(Test *t)
         expect(t, "syncs", finish(&b),
                "session=0 title=0 user=0 turn=0 attempt=0 assistant=0 "
                "tool.start=1 tool.end=0 ask=1 answer=1 retry=0 nudge=0 "
-               "turn.end=1 note=0 ");
+               "turn.end=1 note=0 job.start=0 job.end=0 todo=0 snap=0 rewind=1 "
+               "instructions=0 notice=0 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";

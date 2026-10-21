@@ -32,6 +32,13 @@ enum : i32 {
     EV_NUDGE,
     EV_TURNEND,
     EV_NOTE,
+    EV_JOBSTART,
+    EV_JOBEND,
+    EV_TODO,
+    EV_SNAP,
+    EV_REWIND,
+    EV_INSTRUCTIONS,
+    EV_NOTICE,
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -42,6 +49,7 @@ enum : i32 {
     EV_OVERFLOW,
     EV_HELLO,
     EV_REPLY,
+    EV_JOBOUT,
     EV_COUNT,
 };
 
@@ -67,6 +75,13 @@ static EvInfo evinfo[] = {
     {"nudge",      1, 0},
     {"turn.end",   1, 1},
     {"note",       1, 0},
+    {"job.start",  1, 0},
+    {"job.end",    1, 0},
+    {"todo",       1, 0},
+    {"snap",       1, 0},
+    {"rewind",     1, 1},  // files were changed back
+    {"instructions", 1, 0},
+    {"notice",     1, 0},
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -76,6 +91,7 @@ static EvInfo evinfo[] = {
     {"overflow",   0, 0},
     {"hello",      0, 0},
     {"reply",      0, 0},
+    {"job.out",    0, 0},
 };
 static_assert(countof(evinfo) == EV_COUNT);
 
@@ -93,12 +109,15 @@ enum : i32 {
     CMD_CONFIGGET,
     CMD_CONFIGSET,
     CMD_QUIT,
+    CMD_REWIND,
+    CMD_JOBKILL,
     CMD_COUNT,
 };
 
 static Str cmdnames[] = {
     "", "hello", "list", "new", "open", "close", "prompt", "steer",
-    "cancel", "answer", "config.get", "config.set", "quit",
+    "cancel", "answer", "config.get", "config.set", "quit", "rewind",
+    "job.kill",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -309,8 +328,9 @@ static void logforget(Slice<Str> *list, Str call)
 // every tool.start without a tool.end gets tool.end{status:"unknown"};
 // each call of the last assistant record that never started gets the
 // answer to its ask if one was pending (denied, by "cancel"), then
-// tool.start and tool.end{status:"cancelled"}; and last, an open turn
-// gets turn.end{why:"interrupted"}. Reading needs max bytes of scratch
+// tool.start and tool.end{status:"cancelled"}; every job.start without
+// a job.end gets job.end{status:"unknown"}; and last, an open turn gets
+// turn.end{why:"interrupted"}. Reading needs max bytes of scratch
 // at most (a larger log fails), plus parsing space for one line.
 static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
                         Str sid, iz max)
@@ -352,6 +372,7 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
     Slice<Str>    tools    = {};  // started, not ended
     Slice<Str>    ended    = {};  // since the last assistant record
     Slice<LogAsk> asks     = {};  // not answered
+    Slice<LogAsk> jobs     = {};  // started, not ended: {job, call}
     Str           asst     = {};  // the last assistant record
     Str           cwd      = {};  // raw, from the session record
     b32           turnopen = 0;
@@ -413,6 +434,25 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
                 }
             }
             break;
+        case EV_JOBSTART: {
+            Json *n = jsonget(rec.root, "job");
+            if (n->type==JSON_NUMBER && call.data) {
+                LogAsk k = {n->raw, call};
+                jobs = push(&scratch, jobs, k);
+            }
+        } break;
+        case EV_JOBEND: {
+            Str n = jsonget(rec.root, "job")->raw;
+            for (iz i = 0; i < jobs.len; i++) {
+                if (jobs[i].req == n) {
+                    for (iz k = i+1; k < jobs.len; k++) {
+                        jobs[k-1] = jobs[k];
+                    }
+                    jobs.len--;
+                    break;
+                }
+            }
+        } break;
         }
     }
 
@@ -508,6 +548,27 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
         putstr(&w.json, "cancelled");
         putkey(&w.json, "text");
         putstr(&w.json, "Not run: the harness stopped before this call started.");
+        if (!logappend(&r, &w).data) {
+            logclose(&r);
+            return r;
+        }
+        r.synth++;
+    }
+
+    // Background jobs died with the harness, by the same means as its
+    // tools: their reapers' lifeline, or their job objects closing
+    for (iz i = 0; i < jobs.len; i++) {
+        b.len = 0;
+        EvOut w = logbegin(&r, &b, EV_JOBEND);
+        putkey(&w.json, "job");
+        putraw(&w.json, jobs[i].req);
+        putkey(&w.json, "call");
+        putraw(&w.json, jobs[i].call);
+        putkey(&w.json, "status");
+        putstr(&w.json, "unknown");
+        putkey(&w.json, "text");
+        putstr(&w.json, "the harness stopped while this job ran, which "
+                        "stopped the job too");
         if (!logappend(&r, &w).data) {
             logclose(&r);
             return r;

@@ -183,8 +183,11 @@ struct Spawn {
 // Null on failure, explained by os_lasterr. The process is not waited
 // for, and its records may arrive before this returns.
 static Proc   *os_spawn(Os *, Spawn *, Arena scratch);
-// Soft: SIGTERM to the process group (Windows: same as hard, for now).
-// Hard: SIGKILL to the group, or terminate the job: the whole tree.
+// Soft: asks the tree to stop, SIGTERM to the process group (POSIX) or
+// CTRL_BREAK to the console process group (Windows), which a process
+// may ignore. Hard: kills the whole tree, including on POSIX whatever
+// left the group (the reaper's sweep), or terminates the job. Prompt:
+// neither waits for the processes.
 static void    os_kill(Os *, Proc *, b32 hard);
 // Drop the caller's reference. Kills nothing by itself on POSIX, but on
 // Windows closing the last reference closes the job, killing the tree.
@@ -336,6 +339,8 @@ static Arena newarena(Region *r)
 #include "provider.cpp"
 #include "tools.cpp"
 #include "guard.cpp"
+#include "search.cpp"
+#include "instructions.cpp"
 #include "config.cpp"
 #include "engine.cpp"
 #include "cli.cpp"
@@ -366,6 +371,8 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
         return climain(os, perm, scratch, args, nargs, 0);
     } else if (nargs>1 && args[1]=="--headless") {
         return climain(os, perm, scratch, args, nargs, 1);
+    } else if (nargs>1 && args[1]=="--search") {
+        return searchmain(os, perm, scratch, args, nargs);  // grep and glob
     }
 
     for (i32 i = 1; i < nargs; i++) {

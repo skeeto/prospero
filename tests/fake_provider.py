@@ -382,11 +382,196 @@ def sc_length_think(model, n, req):
 
 
 def sc_shell_timeout(model, n, req):
+    # Still running at its timeout: a job, stopped at the job limit, which
+    # starts a turn of its own to tell of it
     if n == 0:
-        cmd = "echo $$ > pid1; sleep 30 & echo $! > pid2; wait"
+        cmd = "echo $$ > pid1; echo first; sleep 30 & echo $! > pid2; wait"
         yield from tool(model, n, "shell", {"command": cmd, "timeout": 1})
+    elif n == 1:
+        yield from answer(model, "It runs in the background.")
     else:
-        yield from answer(model, "The command timed out.")
+        yield from answer(model, "The job was stopped.")
+
+
+def last_user(req):
+    for m in reversed(req.get("messages", [])):
+        if m.get("role") == "user":
+            return m.get("content", "")
+    return ""
+
+
+def sc_job_notice(model, n, req):
+    # A background job, then the end of the turn; its end starts the next
+    if n == 0:
+        cmd = "sleep 1; echo done-$((40+2))"
+        yield from tool(model, n, "shell", {"command": cmd, "background": True})
+    elif n == 1:
+        yield from answer(model, "Waiting for the job.")
+    else:
+        yield from answer(model, "Saw: " + last_user(req)[:60])
+
+
+def sc_job_tools(model, n, req):
+    if n == 0:
+        cmd = "echo $$ > jobpid; for i in 1 2 3; do echo line$i; done; sleep 30"
+        yield from tool(model, n, "shell", {"command": cmd, "background": True})
+    elif n == 1:
+        yield S.sleep(0.5)  # for its output to arrive
+        yield from tool(model, n, "jobs", {})
+    elif n == 2:
+        yield from tool(model, n, "job_output", {"job": 1, "from": "head", "lines": 2})
+    elif n == 3:
+        yield from tool(model, n, "job_output", {"job": 7})
+    elif n == 4:
+        yield from tool(model, n, "job_kill", {"job": 1})
+    else:
+        yield from answer(model, "Killed the job.")
+
+
+def sc_job_busy(model, n, req):
+    # A job that ends while the turn still runs: told at the next step
+    if n == 0:
+        yield from tool(model, n, "shell", {"command": "echo quick", "background": True})
+    elif n == 1:
+        yield from tool(model, n, "shell", {"command": "sleep 1"})
+    else:
+        yield from answer(model, "Saw: " + last_user(req)[:60])
+
+
+SEARCH_STEPS = [
+    ("grep", {"pattern": "ma.n\\(", "glob": "*.c"}),
+    ("grep", {"pattern": "\\bTODO\\b", "ignore_case": True}),
+    ("grep", {"pattern": "hello", "path": "src/b.h"}),
+    ("grep", {"pattern": "(unclosed"}),
+    ("grep", {"pattern": "a+b", "literal": True}),
+    ("glob", {"pattern": "**/*.c"}),
+    ("glob", {"pattern": "src/*.{c,h}"}),
+    ("glob", {"pattern": "*.nothing"}),
+    ("grep", {"pattern": "needle", "glob": "deep/**/*.txt"}),
+    ("grep", {"pattern": "^x", "path": "../outside"}),
+]
+
+
+def sc_search(model, n, req):
+    if n < len(SEARCH_STEPS):
+        name, args = SEARCH_STEPS[n]
+        yield from tool(model, n, name, args)
+    else:
+        yield from answer(model, "Searched.")
+
+
+sc_search_builtin = sc_search
+
+
+def sc_search_many(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "grep", {"pattern": "line"})
+    elif n == 1:
+        yield from tool(model, n, "glob", {"pattern": "*.txt"})
+    else:
+        yield from answer(model, "Many.")
+
+
+sc_search_many_builtin = sc_search_many
+
+
+def sc_todo(model, n, req):
+    # A list, an early end (nudged), then the list finished
+    items = [{"content": "write it", "status": "in_progress"},
+             {"content": "test it", "status": "pending"}]
+    if n == 0:
+        yield from tool(model, n, "todo_write", {"todos": items})
+    elif n == 1:
+        yield from answer(model, "Wrote it.")
+    elif n == 2:
+        done = [dict(i, status="done") for i in items]
+        yield from tool(model, n, "todo_write", {"todos": json.dumps(done)})
+    else:
+        yield from answer(model, "All done.")
+
+
+def sc_todo_cap(model, n, req):
+    # Never finishing the list: three nudges, then the turn ends anyway
+    if n == 0:
+        yield from tool(model, n, "todo_write",
+                        {"todos": [{"content": "never", "status": "pending"}]})
+    else:
+        yield from answer(model, f"Stopping, attempt {n}.")
+
+
+def sc_todo_remind(model, n, req):
+    # Twelve changes without touching the list: one reminder
+    if n == 0:
+        yield from tool(model, n, "todo_write",
+                        {"todos": [{"content": "many files", "status": "in_progress"}]})
+    elif n <= 13:
+        yield from tool(model, n, "write", {"path": f"f{n}.txt", "content": f"{n}\n"})
+    elif n == 14:
+        yield from tool(model, n, "todo_write",
+                        {"todos": [{"content": "many files", "status": "done"}]})
+    else:
+        yield from answer(model, "Wrote many files.")
+
+
+def sc_rewind(model, n, req):
+    # Turn 1: a write, an edit, a new file; turn 2: one more file. The
+    # prompt is the last user message that is not a notice.
+    prompt = ""
+    k = 0  # steps since the prompt
+    for m in reversed(req.get("messages", [])):
+        c = m.get("content") or ""
+        if m.get("role") == "user" and not c.startswith("The user rewound"):
+            prompt = c
+            break
+        k += m.get("role") == "assistant"
+    if "second" in prompt:
+        steps = [("write", {"path": "c.txt", "content": "made in turn 2\n"})]
+        base = 4
+    else:
+        steps = [("write", {"path": "a.txt", "content": "one\n"}),
+                 ("edit", {"path": "a.txt", "old_string": "one", "new_string": "two"}),
+                 ("write", {"path": "b.txt", "content": "new\n"})]
+        base = 0
+    if k < len(steps):
+        name, args = steps[k]
+        yield from tool(model, base + k, name, args)
+    else:
+        yield from answer(model, "Files written.")
+
+
+def sc_soft_stop(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "shell", {"command": "echo $$ > softpid; sleep 30"})
+    else:
+        yield from answer(model, "Should not be reached.")
+
+
+def sc_stop_grace(model, n, req):
+    # Ignores TERM: only the kill after the grace period ends it
+    if n == 0:
+        cmd = "trap '' TERM; echo $$ > gracepid; while :; do sleep 0.1; done"
+        yield from tool(model, n, "shell", {"command": cmd})
+    else:
+        yield from answer(model, "Should not be reached.")
+
+
+def sc_crash_job(model, n, req):
+    if n == 0:
+        cmd = "echo $PPID > jobppid; echo $$ > jobpid; sleep 30"
+        yield from tool(model, n, "shell", {"command": cmd, "background": True})
+    elif n == 1:
+        yield from answer(model, "Started it.")
+    else:
+        yield from answer(model, "Saw: " + last_user(req)[:80])
+
+
+def sc_instructions(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "read", {"path": "pkg/x.txt"})
+    elif n == 1:
+        yield from tool(model, n, "read", {"path": "pkg/x.txt", "offset": 1})
+    else:
+        yield from answer(model, "Read.")
 
 
 def sc_grandchild(model, n, req):
@@ -543,6 +728,28 @@ def sc_escapee(model, n, req):
         yield from tool(model, n, "shell", {"command": cmd, "timeout": 600})
     else:
         yield from answer(model, "Escapee done.")
+
+
+def sc_escapee_end(model, n, req):
+    # A command that ends normally, leaving a setsid escapee behind
+    if n == 0:
+        cmd = ("perl -e 'use POSIX; setsid(); open(F, \">>tree.pids\"); "
+               "print F \"$$\\n\"; close F; sleep 300' >/dev/null 2>&1 & "
+               "sleep 1; echo left")
+        yield from tool(model, n, "shell", {"command": cmd})
+    else:
+        yield from answer(model, "Left one behind.")
+
+
+def sc_doublefork(model, n, req):
+    # A daemon: fork, setsid, fork again, its parents gone at once
+    if n == 0:
+        cmd = ("perl -e 'use POSIX; exit if fork; setsid(); exit if fork; "
+               "open(F, \">>tree.pids\"); print F \"$$\\n\"; close F; "
+               "sleep 300' >/dev/null 2>&1; sleep 0.5; echo forked")
+        yield from tool(model, n, "shell", {"command": cmd})
+    else:
+        yield from answer(model, "Daemonized.")
 
 
 # The GUI's checklist (harness gui --drive, run by tests/gui.py): the

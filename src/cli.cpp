@@ -9,6 +9,10 @@
 // text with --pretty, and exits when the turn ends: 0 when done, 1 on
 // error, 3 at the step budget, 130 when cancelled, 2 for usage errors
 // (including a session open read-only, in use by another process).
+// While background jobs run after a turn that is done, it waits for
+// them, through the turns the engine starts by itself to report them,
+// and exits with the last turn's code once no job runs and no turn
+// follows; quitting kills any job left.
 // Nobody answers asks in a run, so they are denied by policy. Over
 // --headless, a frontend that answers them opens sessions attended
 // (attended:1 on new and open), as the GUI's --engine=subprocess will;
@@ -39,6 +43,8 @@ struct Cli {
     b32      quitting;
     i64      lastseq;   // the last durable record printed
     i32      exitcode;
+    i32      jobs;      // background jobs running
+    b32      turning;   // a turn runs, or one follows
     i64      openid;
     Str      prompt;    // for --resume
     i32      block;     // the delta block printed last, -1 if none
@@ -198,6 +204,62 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         }
         print(&b, "]\n");
     } break;
+    case EV_JOBSTART:
+        prettyline(c);
+        print(&b, "[job ");
+        print(&b, jsonint(jsonget(j, "job"), 0));
+        print(&b, " started: ");
+        print(&b, jsonstr(jsonget(j, "command")));
+        print(&b, "]\n");
+        break;
+    case EV_JOBEND: {
+        prettyline(c);
+        Json *code = jsonget(j, "exit");
+        print(&b, "[job ");
+        print(&b, jsonint(jsonget(j, "job"), 0));
+        print(&b, " ended: ");
+        print(&b, jsonstr(jsonget(j, "status")));
+        if (code->type == JSON_NUMBER) {
+            print(&b, ", exit code ");
+            print(&b, jsonint(code, 0));
+        }
+        print(&b, "]\n");
+    } break;
+    case EV_TODO: {
+        prettyline(c);
+        i64 n = 0, done = 0;
+        for (Json *k = jsonget(j, "items")->child; k; k = k->next, n++) {
+            done += jsonstr(jsonget(k, "status")) == "done";
+        }
+        print(&b, "[todo: ");
+        print(&b, done);
+        print(&b, " of ");
+        print(&b, n);
+        print(&b, " done]\n");
+    } break;
+    case EV_NOTICE:
+        prettyline(c);
+        print(&b, "[notice: ");
+        print(&b, jsonstr(jsonget(j, "kind")));
+        print(&b, "]\n");
+        os_print(os, 1, finish(&b));
+        prettyexcerpt(c, scratch, jsonstr(jsonget(j, "text")));
+        return;
+    case EV_REWIND:
+        prettyline(c);
+        print(&b, "[rewound ");
+        print(&b, jsonlen(jsonget(j, "files")));
+        print(&b, " files]\n");
+        break;
+    case EV_INSTRUCTIONS:
+        prettyline(c);
+        print(&b, "[instructions:");
+        for (Json *k = jsonget(j, "files")->child; k; k = k->next) {
+            putbyte(&b, ' ');
+            print(&b, jsonstr(jsonget(k, "path")));
+        }
+        print(&b, "]\n");
+        break;
     default:
         return;
     }
@@ -253,9 +315,27 @@ static void clirecord(Cli *c, Arena scratch, Str line)
                 cliquit(c, t);
             }
         }
-    } else if (r.ev==EV_TURNEND && r.sid==c->sid) {
-        c->exitcode = exitcodefor(jsonstr(jsonget(j, "why")));
-        cliquit(c, t);
+    } else if (r.sid != c->sid) {
+        return;
+    } else if (r.ev == EV_TURN) {
+        c->turning = 1;
+    } else if (r.ev == EV_JOBSTART) {
+        c->jobs++;
+    } else if (r.ev == EV_JOBEND) {
+        c->jobs    = c->jobs>0 ? c->jobs-1 : 0;
+        c->turning = c->turning || jsonflag(jsonget(j, "resume"), 0);
+        if (!c->jobs && !c->turning) {
+            cliquit(c, t);
+        }
+    } else if (r.ev == EV_TURNEND) {
+        // After a turn that went well, a turn the engine starts next to
+        // report jobs is waited for, as are jobs still running
+        Str why = jsonstr(jsonget(j, "why"));
+        c->exitcode = exitcodefor(why);
+        c->turning  = jsonflag(jsonget(j, "resume"), 0);
+        if (why!="done" || (!c->jobs && !c->turning)) {
+            cliquit(c, t);
+        }
     }
 }
 

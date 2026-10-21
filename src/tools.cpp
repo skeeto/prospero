@@ -1,10 +1,14 @@
-// Tools: read, write, edit, shell
+// Tools: read, write, edit, shell, grep, glob, todo_write, jobs,
+// job_output, job_kill
 //
 // Every call ends in exactly one result the agent reads. Invalid calls
 // are never executed, and their results say how to fix them. File tools
 // run synchronously on the engine thread; the shell runs a fresh "sh -c"
 // per call under the platform's process layer, with null stdin, pipes,
-// and a non-interactive environment.
+// and a non-interactive environment. A command still running at its
+// timeout moves to the background as a job (engine.cpp), whose end is
+// reported to the agent later. grep and glob run as processes too:
+// ripgrep when it is found, else this same executable (search.cpp).
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -14,10 +18,19 @@ enum : i32 {
     TOOL_WRITE,
     TOOL_EDIT,
     TOOL_SHELL,
+    TOOL_GREP,
+    TOOL_GLOB,
+    TOOL_TODO,
+    TOOL_JOBS,
+    TOOL_JOBOUT,
+    TOOL_JOBKILL,
     TOOL_COUNT,
 };
 
-static Str toolnames[] = {"read", "write", "edit", "shell"};
+static Str toolnames[] = {
+    "read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
+    "job_output", "job_kill",
+};
 static_assert(countof(toolnames) == TOOL_COUNT);
 
 enum : i64 {
@@ -30,6 +43,18 @@ enum : i64 {
     SHELL_OUTMAX   = (i64)1 << 30,    // output kept in the spill file
     SHELL_HEAD     = 20 << 10,        // inline excerpt
     SHELL_TAIL     = 30 << 10,
+    JOB_DEFAULT    = 1800,            // seconds a job may run
+    JOB_MAX        = 7200,
+    JOB_RUNNING    = 16,              // jobs at once, per session
+    JOB_NOTICE     = 2 << 10,         // output tail in an end notice
+    JOBOUT_LINES   = 100,
+    SEARCH_RESULTS = 100,             // lines or files shown
+    SEARCH_TIMEOUT = 30,              // seconds
+    SEARCH_LINEMAX = 300,             // bytes of a matching line shown
+    SEARCH_OUTMAX  = 256 << 10,       // search output kept, then killed
+    SEARCH_GLOBMAX = (i64)8 << 20,    // ripgrep listing every file
+    TODO_ITEMS     = 50,
+    TODO_TEXTMAX   = 500,             // bytes of one item
     PATH_BYTES     = 4096,            // longest path argument
     PATH_PARTS     = 256,             // most components in one
 };
@@ -42,9 +67,13 @@ enum : i32 {
 
 // What the tools need to know about where they run.
 struct ToolEnv {
-    Str shell;      // absolute path of the shell executable
+    Str shell;       // absolute path of the shell executable
     i32 shellkind;
-    b32 windows;    // path rules and the environment's case
+    b32 windows;     // path rules and the environment's case
+    Str rg;          // ripgrep's absolute path, empty if not used
+    Str exe;         // this executable, for the built-in search
+    i64 jobtimeout;  // seconds a job may run, unless asked otherwise
+    i64 jobmax;      // seconds a job may be asked to run
 };
 
 static i32 toolfind(Str name)
@@ -57,12 +86,45 @@ static i32 toolfind(Str name)
     return TOOL_NONE;
 }
 
+// Tools that change files or run commands, for the todo reminder.
+static b32 toolmutates(i32 tool)
+{
+    return tool==TOOL_WRITE || tool==TOOL_EDIT || tool==TOOL_SHELL;
+}
+
+// Tools with a path argument for the guard to judge.
+static b32 toolhaspath(i32 tool)
+{
+    return tool==TOOL_READ || tool==TOOL_WRITE || tool==TOOL_EDIT ||
+           tool==TOOL_GREP || tool==TOOL_GLOB;
+}
+
+// Of those, the ones that only read there.
+static b32 toolreads(i32 tool)
+{
+    return tool==TOOL_READ || tool==TOOL_GREP || tool==TOOL_GLOB;
+}
+
 
 // Prompts and schemas, byte-stable for the life of a session
 
+// A whole number of minutes as such, else seconds.
+static void printduration(Buf *b, i64 secs)
+{
+    if (secs<60 || secs%60) {
+        print(b, secs);
+        print(b, secs==1 ? Str(" second") : Str(" seconds"));
+    } else {
+        print(b, secs/60);
+        print(b, secs==60 ? Str(" minute") : Str(" minutes"));
+    }
+}
+
 static Str shelldesc(Arena *a, ToolEnv *te)
 {
-    Buf b(a, 512);
+    i64 job = te->jobtimeout ? te->jobtimeout : JOB_DEFAULT;
+    i64 max = te->jobmax ? te->jobmax : JOB_MAX;
+    Buf b(a, 1024);
     switch (te->shellkind) {
     case SHELL_SH:
         print(&b, "Run a command with ");
@@ -84,16 +146,29 @@ static Str shelldesc(Arena *a, ToolEnv *te)
               "input is empty and there is no terminal: use non-interactive "
               "flags. GIT_EDITOR is true, so commit with -m. Output (stdout "
               "and stderr together) is cut to its first 20 KiB and last "
-              "30 KiB, with the full text saved to a file. The command is "
-              "killed after timeout seconds (default 120, at most 600), and "
-              "any processes it leaves running are killed when it ends.");
+              "30 KiB, with the full text saved to a file. A command still "
+              "running after timeout seconds (default 120, at most 600) is "
+              "not killed: it moves to the background as a job and keeps "
+              "running, and the result shows its output so far and the job "
+              "number. Set background to true to start a job at once, for "
+              "servers, watchers and long builds. A job is stopped after ");
+    printduration(&b, job);
+    print(&b, ", or after its timeout (at most ");
+    printduration(&b, max);
+    print(&b, ") when started with background. When a job ends you are "
+              "told in your next message, with the end of its output: do "
+              "not poll it, check on it, or sleep waiting for it. Use "
+              "job_output to read more of its output and job_kill to stop "
+              "it. Any processes a command leaves running are killed when "
+              "it ends, unless it is a job. Files changed by commands are "
+              "not tracked, so the user cannot undo those changes.");
     return finish(&b);
 }
 
 // The tools array of a request.
 static Str tooljson(Arena *a, ToolEnv *te)
 {
-    Buf     b(a, 4096);
+    Buf     b(a, 8192);
     JsonOut w = {&b};
 
     struct Param {
@@ -101,12 +176,19 @@ static Str tooljson(Arena *a, ToolEnv *te)
         Str  type;
         Str  desc;
         b32  required;
+        Str  more;  // further schema members, as raw JSON
     };
     struct Def {
         Str   name;
         Str   desc;
-        Param params[4];
+        Param params[5];
     };
+    Str todoitem =
+        "\"items\":{\"type\":\"object\",\"properties\":{\"content\":{"
+        "\"type\":\"string\",\"description\":\"What to do, in a few "
+        "words\"},\"status\":{\"type\":\"string\",\"enum\":[\"pending\","
+        "\"in_progress\",\"done\"]}},\"required\":[\"content\",\"status\"],"
+        "\"additionalProperties\":false}";
     Def defs[] = {
         {
             "read",
@@ -114,9 +196,9 @@ static Str tooljson(Arena *a, ToolEnv *te)
             "with its number and a tab. Long files are shown 2000 lines at "
             "a time; use offset to continue. A directory lists its entries.",
             {
-                {"path", "string", "File path, relative to the working directory or absolute", 1},
-                {"offset", "integer", "First line to show, from 1", 0},
-                {"limit", "integer", "Number of lines to show, at most 2000", 0},
+                {"path", "string", "File path, relative to the working directory or absolute", 1, {}},
+                {"offset", "integer", "First line to show, from 1", 0, {}},
+                {"limit", "integer", "Number of lines to show, at most 2000", 0, {}},
             },
         },
         {
@@ -124,8 +206,8 @@ static Str tooljson(Arena *a, ToolEnv *te)
             "Create or replace a whole file with the given content, creating "
             "missing directories. Prefer edit for changes to existing files.",
             {
-                {"path", "string", "File path, relative to the working directory or absolute", 1},
-                {"content", "string", "The complete new file content", 1},
+                {"path", "string", "File path, relative to the working directory or absolute", 1, {}},
+                {"content", "string", "The complete new file content", 1, {}},
             },
         },
         {
@@ -136,18 +218,103 @@ static Str tooljson(Arena *a, ToolEnv *te)
             "replace_all is true: include enough surrounding lines to make "
             "it unique. Line endings and any byte order mark are kept.",
             {
-                {"path", "string", "File path, relative to the working directory or absolute", 1},
-                {"old_string", "string", "The exact text to replace", 1},
-                {"new_string", "string", "The replacement text", 1},
-                {"replace_all", "boolean", "Replace every match instead of exactly one", 0},
+                {"path", "string", "File path, relative to the working directory or absolute", 1, {}},
+                {"old_string", "string", "The exact text to replace", 1, {}},
+                {"new_string", "string", "The replacement text", 1, {}},
+                {"replace_all", "boolean", "Replace every match instead of exactly one", 0, {}},
             },
         },
         {
             "shell",
             shelldesc(a, te),
             {
-                {"command", "string", "The command to run", 1},
-                {"timeout", "integer", "Seconds before the command is killed, 1 to 600 (default 120)", 0},
+                {"command", "string", "The command to run", 1, {}},
+                {"timeout", "integer", "Seconds to wait before the command "
+                 "moves to the background, 1 to 600 (default 120); with "
+                 "background, seconds the job may run", 0, {}},
+                {"background", "boolean", "Start the command as a background "
+                 "job and return at once", 0, {}},
+            },
+        },
+        {
+            "grep",
+            "Search the contents of files for a regular expression, line "
+            "by line, under the working directory or path, skipping binary "
+            "files and files that .gitignore excludes. Each result is "
+            "\"path:line: text\", with paths relative to the working "
+            "directory, at most 100 lines of 300 bytes each. Patterns may "
+            "use literal text, . (any character), [classes] and [^negated "
+            "classes], \\d \\w \\s and their negations \\D \\W \\S, \\b (a "
+            "word boundary), ^ and $ (the start and end of a line), * + ? "
+            "and {n,m}, | and (groups); put a backslash before any other "
+            "special character, or set literal to true. Use this instead "
+            "of grep or rg in the shell.",
+            {
+                {"pattern", "string", "The regular expression to find", 1, {}},
+                {"path", "string", "Directory or file to search (default: "
+                 "the working directory)", 0, {}},
+                {"glob", "string", "Only search files that match this glob, "
+                 "as the glob tool takes it: *.c, or src/**/*.ts", 0, {}},
+                {"ignore_case", "boolean", "Match letters in either case", 0, {}},
+                {"literal", "boolean", "Find pattern as plain text", 0, {}},
+            },
+        },
+        {
+            "glob",
+            "Find files by name under the working directory or path, "
+            "skipping files that .gitignore excludes. A pattern without a "
+            "slash matches file names at any depth (*.c); one with a slash "
+            "matches paths from the search directory (src/*.c), where ** "
+            "matches any number of directories (src/**/test_*.py) and "
+            "{a,b} either alternative. Results are paths relative to the "
+            "working directory, newest first, at most 100. Use this "
+            "instead of find or ls -R in the shell.",
+            {
+                {"pattern", "string", "The glob to match", 1, {}},
+                {"path", "string", "Directory to search (default: the "
+                 "working directory)", 0, {}},
+            },
+        },
+        {
+            "todo_write",
+            "Keep a todo list for a task of three or more steps: give the "
+            "whole list each time, replacing the one before. Each item has "
+            "content and a status: pending, in_progress or done. Mark an "
+            "item in_progress when you start it, keeping only one so, and "
+            "done as soon as it is. Remove items that no longer apply. If "
+            "you end your turn with items not done, you are reminded of "
+            "them. Skip the list for simple tasks.",
+            {
+                {"todos", "array", "The complete list, in order", 1, todoitem},
+            },
+        },
+        {
+            "jobs",
+            "List this session's background jobs, each with its number, "
+            "state, running time, output size and command. You are told "
+            "when a job ends, so do not call this to wait for one.",
+            {},
+        },
+        {
+            "job_output",
+            "Read the output of a background job, cleaned of terminal "
+            "codes: its last lines by default, or its first lines, or the "
+            "lines from offset on. A job may still be running; you are "
+            "told when it ends, so do not poll it.",
+            {
+                {"job", "integer", "The job number", 1, {}},
+                {"lines", "integer", "How many lines, at most 2000 (default 100)", 0, {}},
+                {"from", "string", "head or tail (default tail)", 0,
+                 "\"enum\":[\"head\",\"tail\"]"},
+                {"offset", "integer", "First line to show, from 1, instead of from", 0, {}},
+            },
+        },
+        {
+            "job_kill",
+            "Stop a background job and every process it started: first "
+            "asking them to stop, then by force a few seconds later.",
+            {
+                {"job", "integer", "The job number", 1, {}},
             },
         },
     };
@@ -179,6 +346,10 @@ static Str tooljson(Arena *a, ToolEnv *te)
             putstr(&w, p->type);
             putkey(&w, "description");
             putstr(&w, p->desc);
+            if (p->more.len) {
+                putbyte(&b, ',');  // members following the last
+                print(&b, p->more);
+            }
             putend(&w);
         }
         putend(&w);
@@ -212,6 +383,8 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te)
         "them.\n\n"
         "Guidelines:\n"
         "- Read files before editing them, and keep edits small and exact.\n"
+        "- Find code with the grep and glob tools rather than the shell.\n"
+        "- For a task of several steps, keep a todo list with todo_write.\n"
         "- Stay inside the working directory; access outside it is denied.\n"
         "- When a tool returns an error, read it, fix the call, and go on. "
         "Never repeat a call that failed in the same way.\n"
@@ -232,18 +405,40 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te)
 // numeric strings become numbers, "true"/"false"/"yes"/"no"/1/0 become
 // booleans, and null means absent. Unknown keys are ignored.
 
+enum : i32 {
+    TODO_PENDING,
+    TODO_ACTIVE,
+    TODO_DONE,
+};
+
+static Str todonames[] = {"pending", "in_progress", "done"};
+
+struct TodoItem {
+    Str content;
+    i32 status;  // TODO_*
+};
+
 struct Args {
-    Str        path;
-    Str        content;
-    Str        oldstr;
-    Str        newstr;
-    Str        command;
-    i64        offset;    // 0 if absent
-    i64        limit;     // 0 if absent
-    i64        timeout;   // -1 if absent
-    b32        replaceall;
-    Slice<Str> issues;
-    Str        repaired;  // what repairargs fixed, if anything
+    Str             path;
+    Str             content;
+    Str             oldstr;
+    Str             newstr;
+    Str             command;
+    Str             pattern;
+    Str             glob;
+    Str             from;       // job_output: "head" or "tail"
+    i64             offset;     // 0 if absent
+    i64             limit;      // 0 if absent
+    i64             timeout;    // -1 if absent
+    i64             job;
+    i64             lines;      // 0 if absent
+    b32             replaceall;
+    b32             background;
+    b32             ignorecase;
+    b32             literal;
+    Slice<TodoItem> todos;
+    Slice<Str>      issues;
+    Str             repaired;   // what repairargs fixed, if anything
 };
 
 static void issue(Arena *a, Args *r, Str key, Str msg)
@@ -309,6 +504,77 @@ static b32 argbool(Arena *a, Args *r, Json *root, Str key)
     return 0;
 }
 
+// A todo status by name, forgiving the usual synonyms; -1 if unknown.
+static i32 todostatus(Str s)
+{
+    static struct {
+        Str name;
+        i32 status;
+    } const names[] = {
+        {"pending", TODO_PENDING}, {"todo", TODO_PENDING},
+        {"open", TODO_PENDING}, {"not_started", TODO_PENDING},
+        {"in_progress", TODO_ACTIVE}, {"in-progress", TODO_ACTIVE},
+        {"inprogress", TODO_ACTIVE}, {"active", TODO_ACTIVE},
+        {"doing", TODO_ACTIVE}, {"started", TODO_ACTIVE},
+        {"done", TODO_DONE}, {"completed", TODO_DONE},
+        {"complete", TODO_DONE}, {"finished", TODO_DONE},
+    };
+    s = trim(s);
+    for (iz i = 0; i < countof(names); i++) {
+        if (equalfold(s, names[i].name)) {
+            return names[i].status;
+        }
+    }
+    return -1;
+}
+
+// The todo list: an array of {content, status}, or such an array
+// encoded as a string, which some models send.
+static Slice<TodoItem> argtodos(Arena *a, Args *r, Json *root)
+{
+    Slice<TodoItem> items = {};
+    Json *v = jsonget(root, "todos");
+    if (v->type == JSON_STRING) {
+        JsonDoc d = jsonparse(a, trim(v->str));
+        v = d.ok ? d.root : v;
+    }
+    if (v->type==JSON_MISSING || v->type==JSON_NULL) {
+        issue(a, r, "todos", "required array is missing");
+        return items;
+    } else if (v->type != JSON_ARRAY) {
+        issue(a, r, "todos", "must be an array of {content, status} objects");
+        return items;
+    }
+    iz n = 0;
+    for (Json *e = v->child; e; e = e->next, n++) {
+        Buf at(a, 32);
+        print(&at, "todos[");
+        print(&at, (i64)n);
+        putbyte(&at, ']');
+        Str where = finish(&at);
+        if (e->type != JSON_OBJECT) {
+            issue(a, r, where, "must be an object with content and status");
+            continue;
+        }
+        Str c  = trim(jsonstr(jsonget(e, "content")));
+        i32 st = todostatus(jsonstr(jsonget(e, "status")));
+        if (!c.len) {
+            issue(a, r, where, "content must be a non-empty string");
+        } else if (c.len > TODO_TEXTMAX) {
+            issue(a, r, where, "content is too long: at most 500 bytes");
+        } else if (st < 0) {
+            issue(a, r, where, "status must be pending, in_progress or done");
+        } else {
+            TodoItem t = {c, st};
+            items = push(a, items, t);
+        }
+    }
+    if (n > TODO_ITEMS) {
+        issue(a, r, "todos", "too many items: at most 50");
+    }
+    return items;
+}
+
 static Args parseargs(Arena *a, i32 tool, Str raw)
 {
     Args   r  = {};
@@ -338,19 +604,80 @@ static Args parseargs(Arena *a, i32 tool, Str raw)
         r.newstr     = argstr(a, &r, j, "new_string", 1);
         r.replaceall = argbool(a, &r, j, "replace_all");
         break;
-    case TOOL_SHELL:
-        r.command = argstr(a, &r, j, "command", 1);
-        r.timeout = argint(a, &r, j, "timeout", -1);
+    case TOOL_SHELL: {
+        r.command    = argstr(a, &r, j, "command", 1);
+        r.timeout    = argint(a, &r, j, "timeout", -1);
+        r.background = argbool(a, &r, j, "background");
+        i64 max = r.background ? JOB_MAX : SHELL_MAX;
         if (r.command.data && !trim(r.command).len) {
             issue(a, &r, "command", "must not be empty");
         }
         if (r.timeout == 0) {
             issue(a, &r, "timeout", "0 is not allowed: give 1 to 600 seconds, "
                                     "or leave it out for the default of 120");
-        } else if (r.timeout>SHELL_MAX) {
-            r.timeout = SHELL_MAX;  // clamped, not refused
+        } else if (r.timeout > max) {
+            r.timeout = max;  // clamped, not refused
         } else if (r.timeout < -1) {
             issue(a, &r, "timeout", "must be 1 to 600 seconds");
+        }
+    } break;
+    case TOOL_GREP:
+        r.pattern    = argstr(a, &r, j, "pattern", 1);
+        r.path       = argstr(a, &r, j, "path", 0);
+        r.glob       = argstr(a, &r, j, "glob", 0);
+        r.ignorecase = argbool(a, &r, j, "ignore_case");
+        r.literal    = argbool(a, &r, j, "literal");
+        if (r.pattern.data && !r.pattern.len) {
+            issue(a, &r, "pattern", "must not be empty");
+        } else if (r.pattern.len > 4096) {
+            issue(a, &r, "pattern", "too long: at most 4096 bytes");
+        }
+        if (r.glob.len > 1024) {
+            issue(a, &r, "glob", "too long: at most 1024 bytes");
+        }
+        if (r.path.data && !r.path.len) {
+            r.path = {};  // the working directory
+        }
+        break;
+    case TOOL_GLOB:
+        r.pattern = argstr(a, &r, j, "pattern", 1);
+        r.path    = argstr(a, &r, j, "path", 0);
+        if (r.pattern.data && !trim(r.pattern).len) {
+            issue(a, &r, "pattern", "must not be empty");
+        } else if (r.pattern.len > 1024) {
+            issue(a, &r, "pattern", "too long: at most 1024 bytes");
+        }
+        if (r.path.data && !r.path.len) {
+            r.path = {};
+        }
+        break;
+    case TOOL_TODO:
+        r.todos = argtodos(a, &r, j);
+        break;
+    case TOOL_JOBS:
+        break;
+    case TOOL_JOBOUT:
+        r.job    = argint(a, &r, j, "job", -1);
+        r.lines  = argint(a, &r, j, "lines", 0);
+        r.offset = argint(a, &r, j, "offset", 0);
+        r.from   = argstr(a, &r, j, "from", 0);
+        if (r.job < 0) {
+            issue(a, &r, "job", "a job number is required");
+        }
+        if (r.lines<0 || r.lines>READ_LINES) {
+            issue(a, &r, "lines", "must be 1 to 2000");
+        }
+        if (r.offset < 0) {
+            issue(a, &r, "offset", "must be 1 or more");
+        }
+        if (r.from.data && r.from!="head" && r.from!="tail") {
+            issue(a, &r, "from", "must be head or tail");
+        }
+        break;
+    case TOOL_JOBKILL:
+        r.job = argint(a, &r, j, "job", -1);
+        if (r.job < 0) {
+            issue(a, &r, "job", "a job number is required");
         }
         break;
     }
@@ -398,12 +725,22 @@ static Str unknowntool(Arena *a, Str name)
         {"read_file", "read"}, {"create", "write"}, {"write_file", "write"},
         {"str_replace", "edit"}, {"replace", "edit"}, {"patch", "edit"},
         {"edit_file", "edit"}, {"apply_patch", "edit"},
+        {"search", "grep"}, {"rg", "grep"}, {"ripgrep", "grep"},
+        {"search_files", "grep"}, {"find", "glob"}, {"find_files", "glob"},
+        {"list_files", "glob"}, {"ls", "glob"}, {"todo", "todo_write"},
+        {"todowrite", "todo_write"}, {"update_todos", "todo_write"},
+        {"bashoutput", "job_output"}, {"killshell", "job_kill"},
+        {"kill", "job_kill"},
     };
     Buf b(a, 256);
     print(&b, "No tool named \"");
     print(&b, name);
-    print(&b, "\" is available, so nothing was run. The tools are: read, "
-              "write, edit, shell.");
+    print(&b, "\" is available, so nothing was run. The tools are:");
+    for (i32 i = 0; i < TOOL_COUNT; i++) {
+        print(&b, i ? Str(", ") : Str(" "));
+        print(&b, toolnames[i]);
+    }
+    putbyte(&b, '.');
     for (iz i = 0; i < countof(aliases); i++) {
         Str n = name;
         Cut c = cut(n, '.');  // namespaced, as in "functions.bash"
@@ -617,8 +954,9 @@ static Str listdir(Os *os, Arena *a, Str cwd, Str path)
 }
 
 struct ToolOut {
-    Str text;  // what the agent sees
-    b32 ok;    // the call did what was asked
+    Str text;   // what the agent sees
+    Str wrote;  // the file's new content, if the tool changed it
+    b32 ok;     // the call did what was asked
 };
 
 static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args)
@@ -764,8 +1102,9 @@ static ToolOut toolwrite(Os *os, Arena *a, Str cwd, Str path, Args *args)
     print(&b, " bytes, ");
     print(&b, (i64)countlines(args->content));
     print(&b, " lines).");
-    r.text = finish(&b);
-    r.ok   = 1;
+    r.text  = finish(&b);
+    r.wrote = args->content.data ? args->content : Str{(u8 *)"", 0};
+    r.ok    = 1;
     return r;
 }
 
@@ -1029,8 +1368,9 @@ static ToolOut tooledit(Os *os, Arena *a, Str cwd, Str path, Args *args)
     print(&b, (i64)lineat(data, m[0].beg));
     print(&b, how);
     putbyte(&b, '.');
-    r.text = finish(&b);
-    r.ok   = 1;
+    r.text  = finish(&b);
+    r.wrote = edited;
+    r.ok    = 1;
     return r;
 }
 
@@ -1169,6 +1509,8 @@ struct ShellEnd {
     b32  cut;       // the drain was cut off: descendants held the output
     b32  cancelled;
     i64  timeout;   // seconds
+    i64  job;       // moved to the background as this job, or 0
+    b32  nojob;     // timed out, but too many jobs ran to move it
 };
 
 // What the agent sees of a finished command: an excerpt of the cleaned
@@ -1204,11 +1546,24 @@ static ToolOut shellresult(Os *os, Arena *a, Str spill, ShellEnd *e)
 
     if (e->cancelled) {
         print(&b, "[cancelled by the user: the command was killed]");
+    } else if (e->job) {
+        print(&b, "[still running after ");
+        printduration(&b, e->timeout);
+        print(&b, ", so it continues in the background as job ");
+        print(&b, e->job);
+        print(&b, ". You will be told when it ends: do not poll it or wait "
+                  "for it. Use job_output to read more of its output, and "
+                  "job_kill to stop it]");
+        r.ok = 1;
     } else if (e->timedout) {
         print(&b, "[timed out after ");
         print(&b, e->timeout);
-        print(&b, " seconds: the command was killed. Run long jobs with a "
-                  "larger timeout, or in smaller steps]");
+        print(&b, " seconds: the command was killed");
+        print(&b, e->nojob ? Str(", since too many background jobs are "
+                                 "running to start another. Stop jobs you "
+                                 "no longer need with job_kill]")
+                           : Str(". Run long jobs with a larger timeout, or "
+                                 "in smaller steps]"));
     } else if (e->limited) {
         print(&b, "[the output passed 1 GiB, so the command was killed]");
     } else if (e->signal) {
@@ -1227,4 +1582,197 @@ static ToolOut shellresult(Os *os, Arena *a, Str spill, ShellEnd *e)
     }
     r.text = finish(&b);
     return r;
+}
+
+
+// todo_write
+
+static Str todoshow(Arena *a, Slice<TodoItem> items)
+{
+    if (!items.len) {
+        return "The todo list is empty now.";
+    }
+    iz done = 0;
+    for (iz i = 0; i < items.len; i++) {
+        done += items[i].status == TODO_DONE;
+    }
+    Buf b(a, 256);
+    print(&b, "Todo list, ");
+    print(&b, (i64)done);
+    print(&b, " of ");
+    print(&b, (i64)items.len);
+    print(&b, " done:\n");
+    for (iz i = 0; i < items.len; i++) {
+        switch (items[i].status) {
+        case TODO_PENDING: print(&b, "[ ] "); break;
+        case TODO_ACTIVE:  print(&b, "[>] "); break;
+        case TODO_DONE:    print(&b, "[x] "); break;
+        }
+        print(&b, items[i].content);
+        if (items[i].status == TODO_ACTIVE) {
+            print(&b, " (in progress)");
+        }
+        putbyte(&b, '\n');
+    }
+    return finish(&b);
+}
+
+// Items not done yet, as todoshow lists them, or null if none.
+static Str todoleft(Arena *a, Slice<TodoItem> items)
+{
+    Buf b(a, 256);
+    for (iz i = 0; i < items.len; i++) {
+        if (items[i].status != TODO_DONE) {
+            print(&b, items[i].status==TODO_ACTIVE ? Str("[>] ") : Str("[ ] "));
+            print(&b, items[i].content);
+            putbyte(&b, '\n');
+        }
+    }
+    return b.len ? finish(&b) : Str{};
+}
+
+// Whether a new list moves the work along: more done, fewer left to do,
+// or another item in progress.
+static b32 todoprogress(Slice<TodoItem> old, Slice<TodoItem> now)
+{
+    iz od = 0, ol = 0, nd = 0, nl = 0;
+    for (iz i = 0; i < old.len; i++) {
+        od += old[i].status == TODO_DONE;
+        ol += old[i].status != TODO_DONE;
+    }
+    for (iz i = 0; i < now.len; i++) {
+        nd += now[i].status == TODO_DONE;
+        nl += now[i].status != TODO_DONE;
+    }
+    if (nd>od || nl<ol) {
+        return 1;
+    }
+    for (iz i = 0; i < now.len; i++) {
+        if (now[i].status != TODO_ACTIVE) {
+            continue;
+        }
+        b32 was = 0;
+        for (iz k = 0; k<old.len && !was; k++) {
+            was = old[k].status==TODO_ACTIVE && old[k].content==now[i].content;
+        }
+        if (!was) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+
+// Background job output
+
+enum : i32 {
+    JOBLINES_TAIL,
+    JOBLINES_HEAD,
+    JOBLINES_AT,     // from a line number
+};
+
+struct JobLines {
+    Str text;   // cleaned lines, each ending in a newline
+    i64 first;  // line number of the first, or 0 if unknown (tail)
+    i64 count;  // lines in text
+    b32 before; // lines precede these
+    b32 after;  // lines follow these
+};
+
+// Up to n lines of output, cleaned, from a spill file: the last ones,
+// the first ones, or those from line at (counting from 1). Reads at
+// most a window of 64 KiB, except that finding a line number scans the
+// file up to it, a megabyte at a time.
+static JobLines joblines(Os *os, Arena *a, Str spill, i32 mode, i64 n, i64 at)
+{
+    JobLines r      = {};
+    iz       window = 64 << 10;
+    i64      size   = os_stat(os, *a, spill).size;
+    i64      off    = 0;
+    i64      line   = 1;  // the line at off
+    if (mode == JOBLINES_TAIL) {
+        off = size>window ? size-window : 0;
+    } else if (mode == JOBLINES_AT) {
+        Arena t = *a;
+        while (line<at && off<size) {
+            Arena c  = t;
+            Read  rd = os_readat(os, &c, spill, off, 1<<20);
+            if (rd.err || !rd.data.len) break;
+            iz i = 0;
+            for (; i<rd.data.len && line<at; i++) {
+                line += rd.data[i] == '\n';
+            }
+            off += i;
+        }
+        if (line < at) {
+            r.first  = at;
+            r.before = size > 0;
+            return r;  // past the end
+        }
+    }
+    Read rd    = os_readat(os, a, spill, off, window);
+    Str  data  = rd.err ? Str{} : rd.data;
+    b32  early = off+data.len < size;  // the window ends first
+    if (off && mode==JOBLINES_TAIL) {
+        // Start at a whole line
+        Cut c = cut(data, '\n');
+        data = c.ok ? c.tail : data;
+    }
+    if (early) {
+        // End at a whole line
+        iz end = data.len;
+        for (; end>0 && data[end-1]!='\n'; end--) {}
+        data = end ? takehead(data, end) : data;
+    }
+
+    Slice<Str> lines = {};
+    for (Str rest = cleanoutput(a, data); rest.len;) {
+        Cut c = cut(rest, '\n');
+        lines = push(a, lines, c.head);
+        rest  = c.tail;
+    }
+    iz from = 0;
+    iz to   = lines.len;
+    if (mode == JOBLINES_TAIL) {
+        from = lines.len>n ? lines.len-(iz)n : 0;
+    } else {
+        to = lines.len>n ? (iz)n : lines.len;
+    }
+    Buf b(a, 4096);
+    for (iz i = from; i < to; i++) {
+        Str l = lines[i];
+        print(&b, l.len>READ_LINEMAX ? utf8head(l, READ_LINEMAX) : l);
+        putbyte(&b, '\n');
+        if (b.len > READ_BYTES) {
+            to = i + 1;
+            break;
+        }
+    }
+    r.text   = finish(&b);
+    r.count  = to - from;
+    r.first  = mode==JOBLINES_TAIL ? 0 : line;
+    r.before = off>0 || from>0;
+    r.after  = early || to<lines.len;
+    return r;
+}
+
+// The end of a job's output for its end notice: about the last 2 KiB,
+// in whole lines.
+static Str jobtail(Os *os, Arena *a, Str spill)
+{
+    i64 size = os_stat(os, *a, spill).size;
+    i64 off  = size>JOB_NOTICE ? size-JOB_NOTICE : 0;
+    Read rd  = os_readat(os, a, spill, off, JOB_NOTICE);
+    Str  s   = rd.err ? Str{} : rd.data;
+    if (off) {
+        Cut c = cut(s, '\n');
+        s = c.ok ? c.tail : s;
+    }
+    s = cleanoutput(a, s);
+    // At most the last 20 lines
+    iz i = s.len - (s.len && s[s.len-1]=='\n');
+    for (i32 lines = 0; i > 0; i--) {
+        if (s[i-1]=='\n' && ++lines==20) break;
+    }
+    return cuthead(s, i);
 }

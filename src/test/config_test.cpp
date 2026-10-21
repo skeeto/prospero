@@ -265,9 +265,10 @@ static void testcfgvalidate(Test *t)
         "/c/harness.ini:18:9: error: expected a whole number, so this is "
         "ignored\n"
         "/c/harness.ini:20:9: warning: unknown value \"fly\", expected any "
-        "of: read, write, edit, shell\n"
+        "of: read, write, edit, shell, grep, glob, todo_write, jobs, "
+        "job_output, job_kill\n"
         "/c/harness.ini:21:2: warning: unknown section kind \"provider\", "
-        "expected endpoint, model, role or guard\n"
+        "expected endpoint, model, role, guard, tools or instructions\n"
         "/c/harness.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "
@@ -682,7 +683,13 @@ static void testcfgjson(Test *t)
         "model/m/seed=*\n"
         "model/m/max_tokens=*\n"
         "guard//roots=*\n"
-        "guard//ask_timeout=30*\n");
+        "guard//ask_timeout=30*\n"
+        "tools//job_timeout=1800*\n"
+        "tools//job_timeout_max=7200*\n"
+        "tools//auto_resume=5*\n"
+        "tools//stop_grace=*\n"
+        "tools//use_rg=true*\n"
+        "instructions//files=AGENTS.md CLAUDE.md*\n");
 
     Json *schema = jsonget(j, "schema");
     expect(t, "json.schema", istr(&a, jsonlen(schema)),
@@ -695,7 +702,7 @@ static void testcfgjson(Test *t)
     expect(t, "json.schema.local", jsonstr(jsonget(ft, "local")), "1800");
     iz    ti    = cfgkey("role", "tools") - cfgschema;
     Json *tools = jsonget(jsonat(schema, ti), "choices");
-    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "4");
+    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "10");
     expect(t, "json.kinds", istr(&a, jsonlen(jsonget(j, "kinds"))),
            istr(&a, countof(cfgkinds)));
 

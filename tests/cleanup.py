@@ -3,15 +3,18 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Crash cleanup: kill the harness hard while a tool runs a process tree.
+"""Process cleanup: crashes, and processes that escape their group.
 
 A shell tool starts three levels of processes, each recording its pid.
 Then the harness is killed with SIGKILL (POSIX) or taskkill /F (Windows),
 so nothing in the harness gets to clean up: the reapers' lifeline (POSIX)
 or the kill-on-close jobs (Windows) must take every process down within
-5 s. A process that calls setsid() leaves its process group, which no
-POSIX mechanism here can follow until M4: that case is an expected
-failure, reported as XFAIL, and its process is killed afterward.
+5 s. On POSIX, a process that calls setsid() leaves its process group,
+and still the reaper's sweep must find it: after a crash, and when its
+command ends normally. A daemon that detaches through a double fork is
+found by the Linux subreaper; on macOS, where only snapshots of the tree
+taken every 250 ms can see it, it may escape: an expected failure there,
+reported as XFAIL. Survivors are killed afterward.
 
   uv run tests/cleanup.py --harness build/harness
   uv run tests/cleanup.py --harness PATH --host biron.local
@@ -97,22 +100,49 @@ def main():
 
         if not host.windows and shutil.which("perl"):
             t = scenarios.T(host, "escapee", None)
-            pids, hpid, _, err = killtree(t, "escapee", 2)
+            pids, hpid, killed, err = killtree(t, "escapee", 2)
             if err or len(pids) != 2:
                 print(f"FAIL escapee: {err or pids}")
                 failed += 1
             else:
                 group, escapee = pids[0], pids[1]
-                t.gone([group], within=5.0)
+                gone = t.gone([group, escapee], within=5.0)
+                dt = time.monotonic() - killed
                 if host.alive(group):
                     print(f"FAIL escapee: the group member {group} survived")
                     failed += 1
-                elif host.alive(escapee):
-                    print(f"XFAIL escapee: pid {escapee} left its group with "
-                          f"setsid and survived (expected until M4)")
-                    host.killpid(escapee)
+                elif not gone:
+                    print(f"FAIL escapee: pid {escapee} left its group with "
+                          f"setsid and survived")
+                    failed += 1
                 else:
-                    print("ok   escapee: even the setsid escapee is gone")
+                    print(f"ok   escapee: the setsid escapee {escapee} is gone "
+                          f"within {dt:.2f} s")
+                for p in [group, escapee]:
+                    if host.alive(p):
+                        host.killpid(p)
+
+            # Escapees left behind by commands that end normally
+            for name, xfail in [("escapee_end", False),
+                                ("doublefork", sys.platform == "darwin")]:
+                t = scenarios.T(host, name, None)
+                t.put("tree.pids", "")
+                r = t.run(timeout=30)
+                pids = t.pids("tree.pids")
+                if r.rc != 0 or len(pids) != 1:
+                    print(f"FAIL {name}: exit {r.rc}, pids {pids}: {r.stderr}")
+                    failed += 1
+                    continue
+                if t.gone(pids, within=5.0):
+                    print(f"ok   {name}: pid {pids[0]} is gone after the command")
+                elif xfail:
+                    print(f"XFAIL {name}: pid {pids[0]} detached before a "
+                          f"snapshot saw it (a known hole on macOS)")
+                    host.killpid(pids[0])
+                else:
+                    print(f"FAIL {name}: pid {pids[0]} survived its command")
+                    failed += 1
+                    host.killpid(pids[0])
     finally:
         fake_provider.STATE.stop.set()
         host.close()
