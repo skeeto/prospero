@@ -38,6 +38,7 @@ import difflib
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -182,6 +183,31 @@ def strays(marker):
         if marker in args and int(pid) != os.getpid():
             found.append(line.strip())
     return found
+
+
+def ours(pid, marker):
+    """Whether pid, a plain integer above 1, is a process of this user's
+    whose command line names marker (the run's own directory), checked
+    right before it is signaled."""
+    if type(pid) is not int or pid <= 1:
+        return False
+    out = subprocess.run(["ps", "-ww", "-o", "uid=,args=", "-p", str(pid)],
+                         capture_output=True, text=True).stdout.strip()
+    uid, _, args = out.partition(" ")
+    return uid == str(os.getuid()) and marker in args
+
+
+def docktype(pid):
+    """macOS: how the Dock takes a process, as lsappinfo says: Foreground
+    (in the Dock and the app switcher), UIElement (not), or None."""
+    asn = subprocess.run(["lsappinfo", "find", f"pid={pid}"], capture_output=True,
+                         text=True).stdout.strip()
+    if not asn:
+        return None
+    info = subprocess.run(["lsappinfo", "info", asn], capture_output=True,
+                          text=True).stdout
+    m = re.search(r'type="(\w+)"', info)
+    return m.group(1) if m else None
 
 
 def guipid(harness, state):
@@ -389,9 +415,14 @@ class Local:
         left = strays(self.root)
         for line in left:
             try:
-                os.kill(int(line.split()[0]), signal.SIGKILL)
-            except (OSError, ValueError):
-                pass
+                pid = int(line.split()[0])
+            except ValueError:
+                continue
+            if ours(pid, self.root):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
         return left
 
     def close(self, keep):
@@ -655,6 +686,19 @@ def background(args, host, guiargs, guicwd):
     if not waitfor(lambda: host.read(host.path("work", "bg-ready")), 120, 1):
         problems.append("the first window never went to the background")
     else:
+        if sys.platform == "darwin" and isinstance(host, Local):
+            # Its window gone, the process leaves the Dock: the menu bar's
+            # icon is the way back
+            pid = guipid(host.harness, host.path("state"))
+            kind = None
+            for _ in range(15):
+                kind = docktype(pid) if pid else "no process"
+                if kind == "UIElement":
+                    break
+                time.sleep(0.2)
+            print(f"the first window's process, in the background: {kind}", flush=True)
+            if kind != "UIElement":
+                problems.append(f"the first window's process is still in the Dock ({kind})")
         regs = host.listdir(host.path("state", "hosts"))
         print(f"registered hosts: {regs}", flush=True)
         if not regs:
@@ -671,7 +715,10 @@ def background(args, host, guiargs, guicwd):
             else "\\\\.\\pipe\\harness-test-dead-host"
         host.write(stale, f"pid = 99999999\nendpoint = {dead}\nversion = 0.0.0\n"
                           f"proto = 0\nstarted = 1\n")
-        status2, lines2 = host.run(["--attach"] + guiargs, args.timeout, guicwd, tag="[2] ")
+        # Probing every second while idle, so that a clock drawn with no
+        # deadline (a host's age, say) is caught for sure
+        status2, lines2 = host.run(["--attach", "--aggressive"] + guiargs, args.timeout,
+                                   guicwd, tag="[2] ")
         problems += summaryproblems(status2, lines2, "the second window")
         if host.read(stale) is not None:
             problems.append("the stale registration is still there")
@@ -801,6 +848,13 @@ class Far:
             self.sh(f"cat > {self.config} <<'EOF'\n{b}EOF\n")
 
     def sh(self, script):
+        """A script there: its login shell's, else (--ssh-windows, whose
+        login shell is cmd.exe) w64devkit's sh, reading it."""
+        if self.args.ssh_windows:
+            script = 'export PATH="$HOME/w64devkit/bin:$PATH"\n' + script + "\n"
+            return subprocess.run(["ssh", "-o", "BatchMode=yes", self.args.ssh,
+                                   "w64devkit\\bin\\sh.exe -l -s"], input=script,
+                                  capture_output=True, text=True, timeout=120).stdout
         return subprocess.run(["ssh", "-o", "BatchMode=yes", self.args.ssh, script],
                               capture_output=True, text=True, timeout=120).stdout
 
@@ -820,7 +874,7 @@ class Far:
             r = subprocess.run([self.harness, "hosts", "--state", self.state],
                                capture_output=True, text=True)
             return [l for l in r.stdout.splitlines() if l.strip()]
-        out = self.sh(f"{self.harness} hosts --state {self.state}")
+        out = self.sh(f"'{self.harness}' hosts --state '{self.state}'")
         return [l for l in out.splitlines() if l.strip()]
 
     def close(self, keep):
@@ -874,6 +928,9 @@ def main():
     ap.add_argument("--remote-harness", help="with --ssh: the harness built there")
     ap.add_argument("--remote-root", default="/tmp",
                     help="with --ssh: where its directories go there")
+    ap.add_argument("--ssh-windows", action="store_true",
+                    help="with --ssh: a Windows host whose login shell is cmd.exe, "
+                         "with w64devkit for the test's scripts")
     ap.add_argument("--model", default="qwen-flash", help="with --mode e2e")
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--keep", action="store_true", help="keep the directories")

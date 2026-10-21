@@ -706,6 +706,17 @@ static i64 countdown(Gui *g, i64 at, i64 nowms)
     return secs;
 }
 
+// An age in milliseconds, as printcfgage prints it, and a deadline at
+// the next change of the number printed, only while it is drawn.
+static void printage(Gui *g, Buf *b, i64 ms)
+{
+    ms = ms<0 ? 0 : ms;
+    i64 unit = ms<60*1000 ? 1000 : ms<3600*1000 ? 60*1000 :
+               ms<86400*1000 ? 3600*1000 : 86400*1000;
+    printcfgage(b, ms);
+    schedat(&g->sched, g->sched.now + (unit - ms%unit)*1000 + 1000, DUE_CLOCK);
+}
+
 static GuiSession *taskchild(Gui *, GuiSession *, ViewTool *);
 
 // A message's header line: who, or what a tool did, or an ask's state.
@@ -2520,7 +2531,7 @@ static void drawhosts(Gui *g)
         print(&b, hoststatus(g, &a, h, 0));
         if (h->started) {
             print(&b, ", started ");
-            printcfgage(&b, nowms - h->started);
+            printage(g, &b, nowms - h->started);
             print(&b, " ago");
         }
         ImGui::TextUnformatted(cstr0(&a, finish(&b)));
@@ -2565,9 +2576,10 @@ static void drawhosts(Gui *g)
         ImGui::TextDisabled("None yet: add one below.");
     }
     for (iz n = 0; n < names.len; n++) {
-        GuiHost *h    = findhost(g, GH_REMOTE, names[n]);
-        b32      live = h && h->r && !h->closing;
-        i64      left = h && h->state==RS_DOWN ? countdown(g, h->retryat, nowms) : 0;
+        GuiHost *h       = findhost(g, GH_REMOTE, names[n]);
+        b32      live    = h && h->r && !h->closing;
+        b32      closing = h && h->r && h->closing;
+        i64      left    = h && h->state==RS_DOWN ? countdown(g, h->retryat, nowms) : 0;
         ImGui::PushID(cstr0(&a, names[n]));
         ImVec2 p = ImGui::GetCursorScreenPos();
         f32    lh = ImGui::GetTextLineHeight();
@@ -2582,12 +2594,15 @@ static void drawhosts(Gui *g)
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(cstr0(&a, finish(&b)));
         ImGui::SameLine();
+        ImGui::BeginDisabled(closing && h->reconnect);
         b32 click = ImGui::SmallButton(live ? "Disconnect" : "Connect");
+        ImGui::EndDisabled();
         if (n < 2) {
             itemrect(g, RECT_CONNECT + (i32)n);  // the first two, for the checklist
         }
-        ImGui::SetItemTooltip(live ? "Leave it: its sessions run on there"
-                                   : "Connect over ssh, starting a host there if none runs");
+        ImGui::SetItemTooltip(live ? "Leave it: its sessions run on there" :
+                              closing ? "Connect again once it has let go" :
+                                        "Connect over ssh, starting a host there if none runs");
         if (click && live) {
             hostclose(g, h);
         } else if (click) {
@@ -2651,7 +2666,7 @@ static void drawhosts(Gui *g)
 // "from harness.ini:12" from a path and line, or "default", which is
 // "default, empty at harness.ini:12" when set empty. A URL include is
 // named in full, with the age of its copy as of now (Unix epoch ms).
-static Str provenance(Arena *a, CfgRow *r, i64 now)
+static Str provenance(Gui *g, Arena *a, CfgRow *r, i64 now)
 {
     if (!r->file.len) {
         return "default";
@@ -2670,7 +2685,7 @@ static Str provenance(Arena *a, CfgRow *r, i64 now)
     print(&b, r->line);
     if (r->fetched) {
         print(&b, ", fetched ");
-        printcfgage(&b, now - r->fetched);
+        printage(g, &b, now - r->fetched);
         print(&b, " ago");
     }
     return finish(&b);
@@ -2748,7 +2763,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target)
         ImGui::TextUnformatted("invalid: default used");
         ImGui::PopStyleColor();
     } else {
-        Str from = provenance(&a, r, os_time(g->os));
+        Str from = provenance(g, &a, r, os_time(g->os));
         ImGui::TextDisabled("%s", cstr0(&a, from));
     }
 }

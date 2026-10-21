@@ -719,6 +719,148 @@ def garbage(t):
     s.disconnect()
 
 
+@scenario
+def close_subagents(t):
+    """Closing a session whose subagents the host gave this client too:
+    the close is answered, and the host and the client go on."""
+    for name, text in (("a.txt", "1\n2\n3\n"), ("b.txt", "1\n2\n")):
+        with open(os.path.join(t.work, name), "w") as f:
+            f.write(text)
+    c = Client(t)
+    s = c.attach()
+    c.call("hello")
+    r = c.call("new", cwd=t.work, prompt="go", model=t.model("task_parallel"), attended=1)
+    t.check(r.get("ok") == 1, f"new: {r}")
+    sid = r["sid"]
+    s.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid, timeout=60,
+           what="the parent's turn.end")
+    kids = {r["sid"] for r in c.all() if r.get("ev") == "session" and r.get("parent") == sid}
+    t.check(len(kids) == 2, f"the subagents' records came: {kids}")
+    pid = t.hostpids()[0]
+    x = c.call("close", sid=sid)
+    t.check(x.get("ok") == 1, f"close: {x}")
+    t.check(not gone(pid, 0.5), "the host lives on")
+    o = c.call("open", sid=sid, **{"from": 0})
+    t.check(o.get("ok") == 1, f"open again: {o}")
+    s.disconnect()
+
+
+class Raw:
+    """attach's standard I/O, frames written by hand: regular frames that
+    acknowledge nothing (ack 0), so that the host keeps all it sends."""
+
+    def __init__(self, t, env):
+        self.p = subprocess.Popen([t.harness, "attach", "--state", t.state, "-c", t.config],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, env=env)
+        self.frames = []
+        self.cond = threading.Condition()
+        self.closed = False
+        self.nextid = 1
+        threading.Thread(target=self.read, daemon=True).start()
+        self.write(HEAD.pack(REPLAY, 1, 0, 8) + struct.pack(">Q", random.getrandbits(64) | 1))
+
+    def read(self):
+        f = self.p.stdout
+        while True:
+            h = f.read(13)
+            if len(h) < 13:
+                break
+            typ, fid, ack, n = HEAD.unpack(h)
+            data = f.read(n)
+            with self.cond:
+                self.frames.append((typ, data))
+                self.cond.notify_all()
+        with self.cond:
+            self.closed = True
+            self.cond.notify_all()
+
+    def write(self, data):
+        try:
+            self.p.stdin.write(data)
+            self.p.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def regular(self, obj):
+        data = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
+        self.nextid += 1
+        return HEAD.pack(REGULAR, self.nextid - 1, 0, len(data)) + data
+
+    def wait(self, n, timeout=10):
+        """The regular frames once there are n, or all there are."""
+        deadline = time.monotonic() + timeout
+        with self.cond:
+            while True:
+                regs = [d for typ, d in self.frames if typ == REGULAR]
+                left = deadline - time.monotonic()
+                if len(regs) >= n or self.closed or left <= 0:
+                    return regs
+                self.cond.wait(left)
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.p.wait(10)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+
+
+@scenario
+def behind_drop(t):
+    """A client with no room left on its link for even a reply, whose
+    command (a hello in two pieces, gathered in the stream's buffer)
+    meets that: dropped, as too far behind, while the host goes on."""
+    keep = 4096
+    env = dict(t.env, HARNESS_TEST_KEEPMAX=str(keep))
+    r = Raw(t, env)
+    try:
+        r.write(r.regular({"cmd": "hello", "id": 1, "proto": 0}))
+        regs = r.wait(2)
+        t.check(len(regs) == 2, f"hello: {regs}")
+        hello = 13 + len([d for d in regs if b'"ev":"hello"' in d][0])
+        pid = t.hostpids()[0]
+        # Fill its queue with replies to closes of no session, until less
+        # room is left than the hello record needs
+        r.write(r.regular({"cmd": "close", "id": 2, "sid": "a"}))
+        regs = r.wait(3)
+        base = 13 + len(regs[-1]) - 1
+        room = keep - sum(13 + len(d) for d in regs)
+        cid = 2
+        while room >= hello:
+            k = max(1, min(room - (hello - 1) - base, 60))
+            if base + k > room:
+                break
+            cid += 1
+            r.write(r.regular({"cmd": "close", "id": cid, "sid": "a" * k}))
+            regs = r.wait(len(regs) + 1)
+            room = keep - sum(13 + len(d) for d in regs)
+        t.check(room < hello, f"room left {room}, the hello needs {hello}")
+        frame = r.regular({"cmd": "hello", "id": cid + 1, "proto": 0})
+        r.write(frame[:20])
+        time.sleep(0.5)
+        r.write(frame[20:])
+        deadline = time.monotonic() + 10
+        log = ""
+        while "fell too far behind" not in log and time.monotonic() < deadline:
+            time.sleep(0.2)
+            with open(os.path.join(t.state, "run", "host.log")) as f:
+                log = f.read()
+        t.check("fell too far behind" in log, f"dropped: {log[-300:]!r}")
+        t.check(not gone(pid, 0.5), "the host lives on")
+        c = Client(t)
+        s = c.attach(reconnect=True, env=env)
+        x = c.call("hello")
+        t.check(x.get("ok") == 1, f"another client's hello: {x}")
+        s.disconnect()
+    finally:
+        r.close()
+
+
 def connect(t, args, env=None):
     p = subprocess.Popen([t.harness, "connect"] + args, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -822,6 +964,54 @@ def connect_local(t):
     t.check(rc == 0, f"connect exit {rc}")
     newpid = t.hostpids()
     t.check(newpid and newpid[0] != pid, "a new host runs on")
+
+
+@scenario
+def remote_option(t):
+    """A remote's path that ssh would take for an option: ignored from an
+    included file, and from the user's own quoted, after --, so that a
+    real ssh (to a name that never resolves) runs nothing here."""
+    local = os.path.join(t.root, "local")
+    inc = os.path.join(t.root, "team.ini")
+    with open(inc, "w") as f:
+        f.write("[remote team]\npath = -oProxyCommand=/usr/bin/touch\n")
+    for own in ("", "path = -oProxyCommand=/usr/bin/touch\n"):
+        with open(t.config, "w") as f:
+            f.write(f"include = {inc}\n[remote team]\nssh = example.invalid\n" + own)
+        p = subprocess.run([t.harness, "connect", "team", "-c", t.config, "--state", local],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=60)
+        t.check(not os.path.exists(os.path.join(local, "attach")),
+                f"ssh ran a command here ({own.strip() or 'included'}): {p.stderr!r}")
+        if not own:
+            t.check("[remote] setting in an included file is ignored" in p.stderr,
+                    f"the include's path is an error: {p.stderr!r}")
+
+
+@scenario
+def restart_unattended(t):
+    """A session made unattended (new without attended), then its host
+    restarted under the client library: opened again on the new host,
+    it is still unattended, so an ask there is denied at once."""
+    t.write_config(t.args.url, "[guard]\nask_timeout = 60\n")
+    c = connect(t, ["--local", "--state", t.state, "-c", t.config])
+    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
+    r = c.call("new", cwd=t.work, model=t.model("ask"))
+    t.check(r.get("ok") == 1, f"new: {r}")
+    sid = r["sid"]
+    pid = t.hostpids()[0]
+    signal_ours(pid, signal.SIGKILL, t.ownhost, "host")
+    t.check(gone(pid), "killed")
+    c.wait(lambda r: ups(c) >= 2, what="up again", timeout=40)
+    p = c.call("prompt", sid=sid, text="write outside")
+    t.check(p.get("ok") == 1, f"prompt: {p}")
+    a = c.wait(lambda r: r.get("ev") == "answer" and r.get("sid") == sid, what="the answer",
+               timeout=20)
+    t.check(a.get("decision") == "deny" and a.get("by") == "policy", f"answer: {a}")
+    c.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid, what="turn.end")
+    x = c.call("quit")
+    t.check(x.get("ok") == 1, f"quit: {x}")
+    t.check(c.close() == 0, "connect exits 0")
 
 
 @scenario
@@ -1018,6 +1208,142 @@ def connect_reconnect(t):
     t.check(want and deltatext(c.records, sid) == want,
             f"deltas {deltatext(c.records, sid)!r} != {want!r}")
     t.check(c.close() == 0, "connect exits 0")
+
+
+def slowssh(t, slow, delay):
+    """A fake ssh, as fakessh's, whose invocation number slow (from 1)
+    first sleeps, with what the client writes waiting in its input."""
+    path = os.path.join(t.root, "slowssh")
+    count = os.path.join(t.root, "ssh.count")
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\n"
+                f"n=$(cat {shlex.quote(count)} 2>/dev/null || echo 0)\n"
+                "n=$((n+1))\n"
+                f"echo $n > {shlex.quote(count)}\n"
+                "while [ $# -gt 1 ]; do\n"
+                "  case \"$1\" in -o) shift 2;; -*) shift;; *) shift; break;; esac\n"
+                "done\n"
+                f"if [ $n -eq {slow} ]; then sleep {delay}; fi\n"
+                "exec sh -c \"$1\"\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+def ups(c):
+    return len([r for r in c.records if r.get("ev") == "remote" and r.get("state") == "up"])
+
+
+@scenario
+def connect_slowstart(t):
+    """The host quits under the client library, and the stream starting
+    the next one takes over 5 s to come up, the library's replay request
+    waiting in it: the link comes up on that stream, as nothing else
+    went before the new host's own request."""
+    first = Client(t)
+    first.attach()
+    first.call("hello")
+    first.stream.disconnect()
+    prog = slowssh(t, 2, 6)
+    c = connect(t, ["--ssh", "here", "--ssh-program", prog, "--path", t.harness,
+                    "--remote-state", t.state, "--remote-config", t.config,
+                    "--state", os.path.join(t.root, "local")])
+    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
+    r = c.call("new", cwd=t.work, prompt="go", attended=1)
+    t.check(r.get("ok") == 1, f"new: {r}")
+    sid = r["sid"]
+    c.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid, what="turn.end")
+    q = Client(t)
+    q.attach(reconnect=True)
+    q.call("hello")
+    q.call("quit")
+    q.stream.close()
+    t0 = time.monotonic()
+    c.wait(lambda r: ups(c) >= 2, what="up again", timeout=40)
+    dt = time.monotonic() - t0
+    downs = [r.get("msg") for r in c.records if r.get("ev") == "remote"
+             and r.get("state") == "down"]
+    t.check(len(downs) == 1, f"down once, for the quit: {downs}")
+    t.check(dt < 20, f"up again after {dt:.1f} s")
+    p = c.call("prompt", sid=sid, text="more")
+    t.check(p.get("ok") == 1, f"a prompt on the new host: {p}")
+    c.wait(lambda r: r.get("ev") == "turn.end" and r.get("turn") == 2, what="turn 2")
+    x = c.call("quit")
+    t.check(x.get("ok") == 1, f"quit: {x}")
+    t.check(c.close() == 0, "connect exits 0")
+
+
+THROTTLE = r'''
+# A fake ssh: runs the command here, passing its output on at RATE
+# bytes a second, its input straight through.
+import subprocess, sys, time
+args = sys.argv[1:]
+while len(args) > 1:
+    if args[0] == "-o":
+        args = args[2:]
+    elif args[0].startswith("-"):
+        args = args[1:]
+    else:
+        args = args[1:]
+        break
+p = subprocess.Popen(["sh", "-c", args[0]], stdout=subprocess.PIPE)
+out = sys.stdout.buffer
+t0 = time.monotonic()
+sent = 0
+while True:
+    data = p.stdout.read1(4096)
+    if not data:
+        break
+    for i in range(0, len(data), 1024):
+        piece = data[i:i+1024]
+        sent += len(piece)
+        wait = t0 + sent/RATE - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            out.write(piece)
+            out.flush()
+        except OSError:
+            sys.exit(1)
+sys.exit(p.wait())
+'''
+
+
+@scenario
+def slow_link(t):
+    """A link that carries 40 KB/s, and a reply (the file command's, of
+    1 MB) that takes it 26 s to bring, longer than a silent stream is
+    given: its bytes, still arriving, keep the stream, and it comes."""
+    first = Client(t)
+    first.attach()
+    first.call("hello")
+    first.stream.disconnect()
+    prog = os.path.join(t.root, "slowssh")
+    with open(prog, "w") as f:
+        f.write(f"#!{sys.executable}\n" + THROTTLE.replace("RATE", "40000"))
+    os.chmod(prog, 0o755)
+    c = connect(t, ["--ssh", "here", "--ssh-program", prog, "--path", t.harness,
+                    "--remote-state", t.state, "--remote-config", t.config,
+                    "--state", os.path.join(t.root, "local")])
+    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
+    r = c.call("new", cwd=t.work, prompt="go", attended=1)
+    sid = r["sid"]
+    c.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid, what="turn.end")
+    line = "x" * 99 + "\n"
+    size = (1 << 20) - 4096
+    with open(os.path.join(t.state, "sessions", sid, "big.txt"), "w") as f:
+        f.write(line * (size // len(line)))
+    t0 = time.monotonic()
+    got = c.call("file", sid=sid, path="big.txt", timeout=60)
+    dt = time.monotonic() - t0
+    t.check(got.get("ok") == 1 and len(got.get("text", "")) == size // len(line) * len(line),
+            f"the file: {got.get('ok')} {len(got.get('text', ''))} {got.get('err')}")
+    t.check(dt > 21, f"slow enough to matter: {dt:.1f} s")
+    downs = [r.get("msg") for r in c.records if r.get("ev") == "remote"
+             and r.get("state") == "down"]
+    t.check(not downs, f"never down: {downs}")
+    x = c.call("quit", timeout=60)
+    t.check(x.get("ok") == 1, f"quit: {x}")
+    t.check(c.close(timeout=60) == 0, "connect exits 0")
 
 
 # Over real ssh

@@ -20,7 +20,8 @@
 // the layer above catches up by other means, open{sid,from} replays
 // from the session logs. A receiver acknowledges at least every 2 s or
 // 50 frames, a sender with nothing to say sends a keepalive every 5 s,
-// and a stream that brings nothing for 20 s is dead.
+// and a stream that brings no bytes for 20 s is dead: a large frame
+// still arriving keeps it alive (linkheard), however slow the link.
 //
 // On each new stream both sides first send REPLAY, a replay request:
 // its id is the first frame the sender still keeps, its ack the last
@@ -32,9 +33,13 @@
 // forgot this client: what was kept for the old one is dropped unsent,
 // since the new one never saw what came before it, and numbering goes
 // on from the replay request's id. Either way the layer above catches
-// up from the logs. DISCONNECT ends the link for good. Anything
-// malformed breaks the stream (LINK_BROKEN), which its owner then
-// closes, to be replaced.
+// up from the logs. Until the peer's replay request comes, a side sends
+// nothing but its own, and a goodbye: its acknowledgements would count
+// in numbers the peer, if new, does not share. For the same reason a
+// replay request acknowledging frames never sent counts another
+// instance's, and drops nothing. DISCONNECT ends the link for good.
+// Anything malformed breaks the stream (LINK_BROKEN), which its owner
+// then closes, to be replaced.
 //
 // Nothing here does I/O or reads a clock: callers feed in the bytes
 // received and the time, and write out what linkout gives them.
@@ -220,7 +225,7 @@ struct Link {
     i64  oweby;       // ticks: acknowledge by then, if owed
     u64  peer;        // the peer's token, 0 until its first request
     i64  sentat;      // ticks of the last bytes written
-    i64  heardat;     // ticks of the last frame received
+    i64  heardat;     // ticks of the last bytes received
 };
 
 static Link newlink(Arena *perm, u64 token, iz keepmax, i32 keepcount)
@@ -314,10 +319,19 @@ static void linkforget(Link *l)
     l->nextid = l->firstid;
 }
 
+// Bytes arrived on the current stream, a whole frame or not: it lives.
+static void linkheard(Link *l, i64 now)
+{
+    l->heardat = now;
+}
+
 // Take one frame received on the current stream, which begins with the
 // peer's replay request. Its acknowledgement counts only from a peer
 // known before: a first or new instance numbers this side's frames
-// from nothing.
+// from nothing. A known peer's may count those of this side's previous
+// instance, a host that started over, which never reached it: past
+// what this one sent, it drops nothing, and the peer goes LINK_FRESH on
+// this side's request.
 static i32 linkframe(Link *l, FrameIn *f, i64 now)
 {
     l->heardat = now;
@@ -334,18 +348,23 @@ static i32 linkframe(Link *l, FrameIn *f, i64 now)
             if (r == LINK_FRESH) {
                 linkforget(l);
             }
-        } else if (!linktrim(l, f->ack)) {
-            return LINK_BROKEN;
-        } else if ((i32)(f->id - (l->recvd+1)) > 0) {
-            l->recvd = f->id - 1;
-            r = LINK_LOST;
+        } else {
+            linktrim(l, f->ack);  // nothing if another instance's
+            if ((i32)(f->id - (l->recvd+1)) > 0) {
+                l->recvd = f->id - 1;
+                r = LINK_LOST;
+            }
         }
         l->peer  = token;
         l->ready = 1;
         l->qsent = l->qhead;  // everything kept goes again
         return r;
     }
-    if (!l->ready || !linktrim(l, f->ack)) {
+    if (!l->ready) {
+        return LINK_BROKEN;
+    } else if (f->type == FRAME_DISCONNECT) {
+        return LINK_BYE;  // whatever it acknowledges: that is moot now
+    } else if (!linktrim(l, f->ack)) {
         return LINK_BROKEN;
     }
     switch (f->type) {
@@ -366,22 +385,21 @@ static i32 linkframe(Link *l, FrameIn *f, i64 now)
     case FRAME_ACK:
     case FRAME_KEEPALIVE:
         return LINK_NONE;
-    case FRAME_DISCONNECT:
-        return LINK_BYE;
     }
     return LINK_BROKEN;
 }
 
 // Queue the control frames now due: an acknowledgement owed, or a
-// keepalive after silence. Returns 0 if the stream is dead, having
-// brought nothing for LINK_DEAD.
+// keepalive after silence, once the peer's replay request came. Returns
+// 0 if the stream is dead, having brought nothing for LINK_DEAD.
 static b32 linktick(Link *l, i64 now)
 {
     if (now-l->heardat >= LINK_DEAD) {
         return 0;
+    } else if (l->ready) {
+        l->wantack  |= l->owed && now>=l->oweby;
+        l->wantkeep |= now-l->sentat >= LINK_KEEPALIVE;
     }
-    l->wantack  |= l->owed && now>=l->oweby;
-    l->wantkeep |= now-l->sentat >= LINK_KEEPALIVE;
     return 1;
 }
 
@@ -389,6 +407,9 @@ static b32 linktick(Link *l, i64 now)
 static i64 linkdeadline(Link *l)
 {
     i64 r = l->heardat + LINK_DEAD;
+    if (!l->ready) {
+        return r;  // nothing to send before the peer's request
+    }
     i64 k = l->sentat + LINK_KEEPALIVE;
     r = k<r ? k : r;
     if (l->owed && l->oweby<r) {
@@ -400,12 +421,13 @@ static i64 linkdeadline(Link *l)
 // Whether linkout has anything to write.
 static b32 linkpending(Link *l)
 {
-    return l->wantreplay || l->wantack || l->wantkeep || l->wantbye ||
-           (l->ready && l->qsent<l->qtail);
+    return l->wantreplay || l->wantbye ||
+           (l->ready && (l->wantack || l->wantkeep || l->qsent<l->qtail));
 }
 
 // The bytes to write to the current stream now, in order, each frame
-// acknowledging all received so far. Empty if nothing is due.
+// acknowledging all received so far. Empty if nothing is due. Before
+// the peer's replay request, only this side's and a goodbye.
 static Str linkout(Link *l, Arena *a, i64 now)
 {
     if (!linkpending(l)) {
@@ -430,11 +452,11 @@ static Str linkout(Link *l, Arena *a, i64 now)
         }
         l->qsent = l->qtail;
     }
-    if (l->wantack && !kept && !l->wantreplay) {
+    if (l->ready && l->wantack && !kept && !l->wantreplay) {
         u8 p[FRAME_HEAD];
         framehead(p, FRAME_ACK, 0, l->recvd, 0);
         print(&b, {p, countof(p)});
-    } else if (l->wantkeep && !b.len) {
+    } else if (l->ready && l->wantkeep && !b.len) {
         u8 p[FRAME_HEAD];
         framehead(p, FRAME_KEEPALIVE, 0, l->recvd, 0);
         print(&b, {p, countof(p)});

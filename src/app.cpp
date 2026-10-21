@@ -288,6 +288,7 @@ struct GuiHost {
     i64      retryat;   // epoch ms: it tries again then, while down
     b32      up;        // it answered hello
     b32      closing;   // asked to close: its records are let go
+    b32      reconnect; // asked to connect while closing: once it has ended
     b32      own;       // this process's own host, after the window came back
     i64      pid;       // GH_LOCAL: the host's process
     i64      started;   // GH_LOCAL: epoch ms
@@ -1171,6 +1172,7 @@ static i32 elsewhere(Gui *g)
 static void closehosts(Gui *g)
 {
     for (GuiHost *h = g->hosts; h; h = h->next) {
+        h->reconnect = 0;  // asked for before, and wanted no more
         if (h->r && !h->closing) {
             h->closing = 1;
             remoteclose(h->r);
@@ -1784,10 +1786,15 @@ static GuiHost *findhost(Gui *g, i32 kind, Str name)
 }
 
 // Reach a host through the library. Sessions viewed here open again,
-// from where their views are, once it answers hello.
+// from where their views are, once it answers hello. A host still
+// closing is reached again once that ends (onhostend, hostagain).
 static b32 hostconnect(Gui *g, GuiHost *h, RemoteConf *rc)
 {
-    if (h->r || !h->inbox) {
+    if (h->r && h->closing) {
+        h->reconnect = 1;
+        scheddirty(&g->sched);
+        return 1;
+    } else if (h->r || !h->inbox) {
         return h->r != 0;
     }
     // Its own memory, as connections come and go (its reservations are
@@ -1813,16 +1820,31 @@ static b32 hostconnect(Gui *g, GuiHost *h, RemoteConf *rc)
     return 1;
 }
 
-// A setting of a [remote NAME] section, from the latest config.get.
+// A setting of a [remote NAME] section, from the latest config.get: not
+// one ignored, as any is in an included file (config.cpp).
 static Str remoteset(Gui *g, Str name, Str key)
 {
     for (iz i = 0; i < g->cfgrows.len; i++) {
         CfgRow *r = &g->cfgrows[i];
-        if (r->kind=="remote" && r->name==name && r->key==key && !r->isdflt) {
+        if (r->kind=="remote" && r->name==name && r->key==key && !r->isdflt &&
+                r->valid) {
             return r->value;
         }
     }
     return {};
+}
+
+// Whether a [remote NAME] setting is written, but ignored.
+static b32 remoteignored(Gui *g, Str name, Str key)
+{
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind=="remote" && r->name==name && r->key==key && !r->isdflt &&
+                !r->valid) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // Connect to a [remote NAME] over ssh, as its section says. The ssh
@@ -1831,7 +1853,7 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name)
 {
     GuiHost *h = findhost(g, GH_REMOTE, name);
     h = h ? h : addhost(g, GH_REMOTE, name);
-    if (h->r) {
+    if (h->r && !h->closing) {
         return h;
     }
     RemoteConf rc = {};
@@ -1843,7 +1865,12 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name)
     rc.program    = os_getenv(g->os, &scratch, "HARNESS_TEST_SSH");
     rc.localstate = g->statedir;
     rc.deploy     = remoteset(g, name, "deploy") == "auto";
-    if (!rc.ssh.len) {
+    if (!rc.ssh.len && remoteignored(g, name, "ssh")) {
+        h->state = RS_FAILED;
+        h->msg   = "its ssh is set in an included file, which cannot choose "
+                   "what runs where: set it in your own file";
+        return h;
+    } else if (!rc.ssh.len) {
         h->state = RS_FAILED;
         h->msg   = "no ssh destination: set ssh in its section";
         return h;
@@ -1924,16 +1951,36 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
     }
 }
 
+// Connect again to a host reached before: a remote as its section says,
+// this process's own host at its endpoint.
+static void hostagain(Gui *g, GuiHost *h)
+{
+    if (h->kind == GH_REMOTE) {
+        remoteconnect(g, g->frame, h->name);
+        return;
+    }
+    RemoteConf rc = {};
+    rc.name       = "background";
+    rc.endpoint   = h->endpoint;
+    rc.localstate = g->statedir;
+    hostconnect(g, h, &rc);
+}
+
 // A host's connection ended (MAIL_QUIT). A background host's sessions
 // go back to the engine, and the host goes; a remote one stays listed,
-// to connect again.
+// to connect again, at once if asked meanwhile.
 static void onhostend(Gui *g, GuiHost *h)
 {
-    h->r       = 0;
-    h->up      = 0;
-    h->closing = 0;
-    h->state   = h->state==RS_FAILED ? RS_FAILED : RS_CLOSED;
+    b32 again = h->reconnect;
+    h->r         = 0;
+    h->up        = 0;
+    h->closing   = 0;
+    h->reconnect = 0;
+    h->state     = h->state==RS_FAILED ? RS_FAILED : RS_CLOSED;
     if (h->kind!=GH_LOCAL || h->own) {
+        if (again) {
+            hostagain(g, h);  // asked for while it was closing
+        }
         scheddirty(&g->sched);
         return;
     }
@@ -2008,6 +2055,10 @@ static b32 hostready(Gui *g, GuiHost *h)
 // try when it is down.
 static Str hoststatus(Gui *g, Arena *a, GuiHost *h, i64 left)
 {
+    if (h->kind!=GH_ENGINE && h->r && h->closing) {
+        return h->reconnect ? Str("disconnecting, then connecting again")
+                            : Str("disconnecting");
+    }
     switch (h->kind==GH_ENGINE ? -1 : h->state) {
     case -1:            return g->enginegone ? Str("stopped") : Str("running");
     case RS_CONNECTING: return "connecting";
@@ -2089,10 +2140,12 @@ static void shed(Gui *g)
     saveini(g, 0);
     flushdeltas(g);
     g->bg = 1;
-    os_guished(g->os);
+    // The tray first, for the window's going to hide the Dock's icon
+    // too (macOS): the tray's icon is the way back
     if (!g->trayup) {
         g->trayup = os_trayopen(g->os, "harness: sessions running in the background");
     }
+    os_guished(g->os);
     guilog(g, g->trayup ? Str("the window is gone; the tray icon brings it back")
                         : Str("the window is gone; there is no tray here to bring it back"));
 }
@@ -4874,6 +4927,16 @@ static DriveOp attachops[] = {
     {OP_WAIT, W_BGHOST, 0, 0, 15000, ""},
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_BGLISTED, 0, 0, 0, ""},
+    // The Hosts tab, whose background host's age counts on by itself
+    {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_IDLE, 0, 0, 0, 0, "idle 3 s, the hosts shown"},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Stream in the background"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -5498,6 +5561,31 @@ static CfgRow *longrow(Gui *g)
     return 0;
 }
 
+// Whether a path ends with the last two components of another, a slash
+// matching a backslash: what the host spells above them may differ (a
+// real path, Windows backslashes, XP's long names for 8.3 ones).
+static b32 pathendswith(Str path, Str tail)
+{
+    for (iz i = tail.len-1, n = 0; i >= 0; i--) {
+        if ((tail[i]=='/' || tail[i]=='\\') && ++n==2) {
+            tail = cuthead(tail, i);
+            break;
+        }
+    }
+    if (tail.len > path.len) {
+        return 0;
+    }
+    Str end = taketail(path, tail.len);
+    for (iz i = 0; i < tail.len; i++) {
+        u8 a = end[i]=='\\' ? (u8)'/' : end[i];
+        u8 b = tail[i]=='\\' ? (u8)'/' : tail[i];
+        if (a != b) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static b32 drivecheck(Gui *g, i32 chk)
 {
     ImGuiContext &c = *GImGui;
@@ -5981,9 +6069,9 @@ static b32 drivecheck(Gui *g, i32 chk)
         return h && h->up && h->opens==1;
     }
     case CHK_REMOTESESSION:
-        // (the directory as given, or its real path there: /private/var)
+        // (the directory as given, as far as the host spells it alike)
         return g->sess && g->sess->host->kind==GH_REMOTE && g->driverwd.len &&
-               endswith(v->cwd, g->driverwd) && !g->sess->readonly;
+               pathendswith(v->cwd, g->driverwd) && !g->sess->readonly;
     case CHK_REMOTEDOWN:
         return g->downshown;
     case CHK_REMOTEOK: {
@@ -6596,7 +6684,7 @@ static void readconfig(Gui *g, Arena scratch)
     b32     own  = g->enginekind == ENGINE_INPROC;
     Str     path = g->cfgpath.len ? g->cfgpath : cfgdefault(os, &g->perm);
     Config *cfg  = newconfig(os, &g->perm, scratch, path, own && !g->cfgpath.len,
-                             g->statedir, own);
+                             g->statedir, own ? CFG_NETWAIT : CFG_NETNONE);
     if (!cfg) {
         return;
     }

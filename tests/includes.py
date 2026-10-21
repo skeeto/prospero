@@ -14,10 +14,14 @@ so a case also checks what was asked (conditional or not, how often).
 
   uv run tests/includes.py --harness build/harness [NAME ...]
   uv run tests/includes.py --harness PATH --host biron.local   (Windows)
+  uv run tests/includes.py --harness PATH --xp 192.168.1.106   (XP)
 
 With --host, the server runs here and the harness on the Windows host
 over ssh, reaching the server through a reverse tunnel, as in
-scenarios.py; PATH is the harness.exe already on that host.
+scenarios.py; PATH is the harness.exe already on that host. With --xp,
+the same for Windows XP and the user's own sshd, which forwards no
+ports: the server listens on this machine's LAN address, over plain
+http, as XP's WinHTTP has no TLS 1.2.
 """
 
 import argparse
@@ -38,7 +42,7 @@ import traceback
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from scenarios import Failure, LocalHost, SshHost  # noqa: E402
+from scenarios import Failure, LocalHost, SshHost, XpHost, lanaddress  # noqa: E402
 
 
 # The web server
@@ -57,8 +61,8 @@ class Web(http.server.ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128  # cases at once, each fetching several
 
-    def __init__(self):
-        super().__init__(("127.0.0.1", 0), Handler)
+    def __init__(self, bind="127.0.0.1"):
+        super().__init__((bind, 0), Handler)
         self.pages = {}
         self.log = {}
         self.lock = threading.Lock()
@@ -599,6 +603,92 @@ def interval(t):
         t.same(r.get("If-None-Match"), '"v1"', "conditional")
 
 
+@case()
+def remote_shared(t):
+    """An included file's [remote] section chooses nothing: what runs and
+    where (ssh, path, state, config, deploy) counts only from the user's
+    own file, and each such line of the include is an error."""
+    lines = [("ssh", "evil.example"), ("path", "-oProxyCommand=/usr/bin/touch"),
+             ("state", "/tmp/x"), ("config", "/tmp/y.ini"), ("deploy", "auto")]
+    t.page("team.ini", body="[remote team]\n" + "".join(f"{k} = {v}\n" for k, v in lines))
+    url = f"{t.url}/team.ini"
+    t.write(f"include = {url}\n[remote team]\nssh = example.invalid\n")
+    c = t.run()
+    why = ("a [remote] setting in an included file is ignored, since it chooses "
+           "what runs where: set it in your own file")
+    t.same(c.diags(), [f"{url}:{i+2}:{len(k)+4}: error: {why}" for i, (k, _) in
+                       enumerate(lines)], "diagnostics")
+    s = c.setting("remote", "team", "ssh")
+    t.same((s["value"], s["file"], s["valid"]), ("example.invalid", t.config, 1), "ssh")
+    for k, _ in lines[1:]:
+        s = c.setting("remote", "team", k)
+        t.same((s["file"], s["valid"]), (url, 0), k)
+
+
+@case(bound=40)
+def serve_nowait(t):
+    """A host never waits for a URL include with no cached copy: with its
+    server stalled, a host started by connect --local answers at once, as
+    the one host process, which fetches it in the background."""
+    t.page("slow.ini", body=TEAM, stall=60)
+    url = f"{t.url}/slow.ini"
+    t.write(f"include = {url}\n")
+    p = t.host.popen(["connect", "--local", "-c", t.config, "--state", t.state,
+                      "--idle", "60"], t.base, stdin=True)
+    q = queue.Queue()
+
+    def read():
+        for line in p.stdout:
+            try:
+                q.put(json.loads(line))
+            except ValueError:
+                pass
+        q.put(None)
+    threading.Thread(target=read, daemon=True).start()
+
+    def wait(pred, timeout, what):
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise Failure(f"no {what} in {timeout} s")
+            try:
+                r = q.get(timeout=left)
+            except queue.Empty:
+                continue
+            if r is None:
+                raise Failure(f"connect ended: {p.stderr.read()[:1000]}")
+            if r.get("ev") == "remote" and r.get("state") == "down":
+                raise Failure(f"down: {r.get('msg')}")
+            if pred(r):
+                return r
+
+    t0 = time.monotonic()
+    try:
+        wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", 15, "up")
+        dt = time.monotonic() - t0
+        t.check(dt < 8, f"up after {dt:.1f} s")
+        p.stdin.write('{"cmd":"config.get","id":1}\n')
+        p.stdin.flush()
+        r = wait(lambda r: r.get("ev") == "reply" and r.get("id") == 1, 15, "config.get")
+        i = [x for x in r.get("includes", []) if x["url"] == url]
+        t.check(i and i[0]["fetching"] == 1 and not i[0]["fetched"], f"include {i}")
+        p.stdin.write('{"cmd":"quit","id":2}\n')
+        p.stdin.flush()
+        wait(lambda r: r.get("ev") == "reply" and r.get("id") == 2, 15, "quit")
+    finally:
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+        try:
+            p.wait(30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+    t.same(len(t.requests("slow.ini")), 1, "one fetch, by the one host")
+
+
 def runone(host, web, name):
     fn, bound = CASES[name]
     t0 = time.monotonic()
@@ -618,6 +708,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--harness", required=True, help="the harness binary")
     ap.add_argument("--host", help="run the harness on this Windows host over ssh")
+    ap.add_argument("--xp", help="run the harness on this Windows XP host over ssh")
     ap.add_argument("-j", type=int, default=0, help="cases at once")
     ap.add_argument("-v", action="store_true")
     ap.add_argument("names", nargs="*")
@@ -628,10 +719,13 @@ def main():
         if n not in CASES:
             print(f"unknown case {n}; known: {' '.join(CASES)}")
             return 2
-    web = Web()
+    lan = lanaddress(args.xp) if args.xp else None
+    web = Web(lan or "127.0.0.1")
     threading.Thread(target=web.serve_forever, daemon=True).start()
     port = web.server_address[1]
-    if args.host:
+    if args.xp:
+        host = XpHost(args.xp, args.harness, f"http://{lan}:{port}")
+    elif args.host:
         host = SshHost(args.host, args.harness, port, 20000 + port % 20000)
     else:
         host = LocalHost(args.harness, f"http://127.0.0.1:{port}")

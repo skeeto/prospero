@@ -530,6 +530,7 @@ int main()
     test_mailbox(&t);
     test_events(&t);
     test_frame(&t);
+    test_remoteask(&t);
     test_provider(&t);
     test_edit(&t);
     test_tools(&t);

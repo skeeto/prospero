@@ -119,6 +119,7 @@ struct W32Gui {
     HWND                    msgwin;      // hidden, for wakes and the tray
     NOTIFYICONDATAW         nid;
     int                     trayon;
+    UINT                    taskbarmsg;  // Explorer started (again): add the icon
     HANDLE                  timer;       // high-resolution waitable timer
     ID3D11Device           *device;
     ID3D11DeviceContext    *context;
@@ -324,6 +325,13 @@ static LRESULT CALLBACK msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     W32Hooks *h = &w->hooks;
+    if (msg && msg==w->taskbarmsg) {
+        // Explorer started over, and lost every icon: this one again
+        if (w->trayon) {
+            Shell_NotifyIconW(NIM_ADD, &w->nid);
+        }
+        return 0;
+    }
     switch (msg) {
     case WM_APP_WAKE:
         // Cleared before draining: a post during the drain wakes again.
@@ -396,8 +404,9 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
     if (!w) {
         return 0;
     }
-    w->hooks     = *hooks;
-    w->framedark = -1;
+    w->hooks      = *hooks;
+    w->framedark  = -1;
+    w->taskbarmsg = RegisterWindowMessageW(L"TaskbarCreated");
     // A high-resolution timer waits precisely without raising the
     // system timer rate (Windows 10 1803+); otherwise a plain one.
     w->timer = CreateWaitableTimerExW(0, 0, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,

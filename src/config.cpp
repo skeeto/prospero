@@ -17,7 +17,8 @@
 // key, section kind or enum value is a warning. Secrets are references,
 // key = env:NAME, resolved when used. A plaintext secret in the user's
 // own file is used, with a warning; in an included (shared) file it is
-// an error and ignored.
+// an error and ignored, as is any setting of a [remote] section, which
+// chooses a program to run and where (ssh, path, state, config, deploy).
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -35,10 +36,13 @@
 // network; fetches fill the cache, and a fetch that changes what a load
 // would see reloads:
 //
-// - At startup (newconfig with fetch), a URL with no usable cached copy
-//   is fetched while the caller waits, 30 s at most for all of them,
+// - At startup (newconfig with CFG_NETWAIT), a URL with no usable cached
+//   copy is fetched while the caller waits, 30 s at most for all of them,
 //   nested includes too. One with a copy loads from it, and the engine
-//   refreshes it in the background once it starts.
+//   refreshes it in the background once it starts. A host (harness serve,
+//   CFG_NETLATER) never waits, as whoever started it waits for it to
+//   listen: it loads what is cached, and its engine fetches the rest in
+//   the background, to apply once it arrives.
 // - While running, a URL is fetched again at most every 10 minutes,
 //   when the engine has work, and at once on config.get {refresh:1},
 //   whose reply waits for the fetches. Refreshes are conditional GETs.
@@ -51,7 +55,8 @@
 //   is an error and is ignored, never cached, so a cached copy that does
 //   match stays in use; a cached copy that does not match is never used.
 //
-// Nothing a configuration says runs a command, and an included file's
+// Nothing a configuration says runs a command but a [remote] section of
+// the user's own file, and an included file's [remote] settings and
 // plaintext secrets are ignored, so a shared file, local or from the
 // web, can at most point the harness at endpoints and models.
 //
@@ -348,6 +353,7 @@ enum : i32 {
     CFG_NETNONE,  // never: cached copies only
     CFG_NETWAIT,  // at startup: fetch what has no copy, and wait for it
     CFG_NETLIVE,  // in the engine: fetch in the background, and refresh
+    CFG_NETLATER, // at startup: cached copies only, then as CFG_NETLIVE
 };
 
 struct CfgSlot;
@@ -513,6 +519,8 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     v = trim(v);
     if (!v.len) {
         return CFG_OK;
+    } else if (shared && k->kind=="remote") {
+        return CFG_BAD;  // what runs on the user's machines, and where
     }
     switch (k->type) {
     case CFG_STRING:
@@ -571,6 +579,10 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
 static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
 {
     v = trim(v);
+    if (shared && k->kind=="remote") {
+        return "a [remote] setting in an included file is ignored, since it "
+               "chooses what runs where: set it in your own file";
+    }
     Buf b(a, 128);
     switch (k->type) {
     case CFG_INT:     print(&b, "expected a whole number");             break;
@@ -1383,7 +1395,7 @@ static void cfgpump(Config *c, Arena scratch)
 // a cache, nothing is.
 static void cfgrefresh(Config *c, Arena scratch, b32 force)
 {
-    if (c->net==CFG_NETNONE || !c->cache.len) {
+    if (c->net==CFG_NETNONE || c->net==CFG_NETLATER || !c->cache.len) {
         return;
     }
     i64 now = os_ticks(c->os);
@@ -1766,11 +1778,12 @@ static b32 cfgwriteseed(Config *c, Arena scratch)
 // could not be reserved. The Config belongs to one thread at a time.
 //
 // URL includes are cached under statedir, and without one are skipped.
-// With fetch, those with no cached copy are fetched before this returns,
-// which takes 30 s at most, and cfgattach later hands fetching over to
-// the engine. Without, only cached copies are used.
+// With net CFG_NETWAIT, those with no cached copy are fetched before
+// this returns, which takes 30 s at most, and cfgattach later hands
+// fetching over to the engine. With CFG_NETLATER only cached copies are
+// used until then, and with CFG_NETNONE ever.
 static Config *newconfig(Os *os, Arena *perm, Arena scratch, Str path,
-                         b32 seed, Str statedir = {}, b32 fetch = 0)
+                         b32 seed, Str statedir = {}, i32 net = CFG_NETNONE)
 {
     b32     big = sizeof(void *) == 8;
     iz      cap = big ? (iz)1<<28 : (iz)1<<26;
@@ -1793,10 +1806,12 @@ static Config *newconfig(Os *os, Arena *perm, Arena scratch, Str path,
     if (statedir.len) {
         c->cache = join(perm, statedir, "includes");
     }
-    if (fetch && c->cache.len) {
+    if (net==CFG_NETWAIT && c->cache.len) {
         c->mbox   = newmailbox(perm, 1<<17, 0, 0);
         c->net    = c->mbox ? CFG_NETWAIT : CFG_NETNONE;
         c->waitby = os_ticks(os) + CFG_FETCHTIME;
+    } else if (net==CFG_NETLATER && c->cache.len) {
+        c->net = CFG_NETLATER;  // cfgattach makes it live
     }
     if (seed && c->path.len &&
             os_stat(os, scratch, c->path).type==STAT_MISSING) {

@@ -225,6 +225,16 @@ static Record mailnext(Mail *m)
     return r;
 }
 
+// Wake the consumer without a record, for news it finds elsewhere, from
+// any thread, never waiting for room.
+static void mailpoke(Mailbox *m)
+{
+    os_lock(&m->lock);
+    MailWake how = {m->notify, m->ctx};
+    os_unlock(&m->lock);
+    mailwake(m, how);
+}
+
 // Wait up to ms milliseconds (forever if negative) for records or a drop
 // without taking them. Returns 1 if woken. Not for mailboxes with a
 // notify hook.

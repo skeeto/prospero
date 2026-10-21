@@ -22,7 +22,8 @@
 //    for that platform.
 // 3. Prepare ~/.harness there (mode 0700), learning what is already at
 //    the engine's place, .harness/engine-PROTO-VERSION-OS-ARCH[.exe]:
-//    the same engine means nothing to upload.
+//    the same engine means nothing to upload. With no tool there to
+//    compute a SHA-256 (below), deploying fails at once, for good.
 // 4. Upload with scp to that name plus ".part", again after a dropped
 //    link (the XP laptop's Wi-Fi stalls), and verify its SHA-256 there
 //    (sha256sum, shasum -a 256 or openssl; certutil -hashfile in cmd).
@@ -291,8 +292,8 @@ static Str deployhash(Arena *a, Str out)
 // Commands there
 
 enum : i32 {
-    DEPLOY_PREPARE,  // make ~/.harness, and hash what is at the place
-    DEPLOY_VERIFY,   // hash the upload
+    DEPLOY_PREPARE,  // make ~/.harness, find a hash tool, hash what is there
+    DEPLOY_VERIFY,   // hash the upload, or say nohash
     DEPLOY_INSTALL,  // rename it into place, then run it
     DEPLOY_RUN,      // run what is there
     DEPLOY_REMOVE,   // remove what does not run
@@ -314,6 +315,8 @@ static Str deploycmd(Arena *a, i32 shell, i32 step, Str path, i64 stamp)
     case DEPLOY_PREPARE:
         if (sh) {
             print(&b, "mkdir -p .harness && chmod 700 .harness && echo ready; "
+                      "{ command -v sha256sum || command -v shasum || "
+                      "command -v openssl; } >/dev/null 2>&1 || echo nohash; "
                       "if [ -f ");
             print(&b, p);
             print(&b, " ]; then echo have; { sha256sum ");
@@ -325,7 +328,8 @@ static Str deploycmd(Arena *a, i32 shell, i32 step, Str path, i64 stamp)
             print(&b, "; } 2>/dev/null; fi");
         } else {
             print(&b, "(if not exist .harness mkdir .harness) & "
-                      "(if exist .harness echo ready) & (if exist ");
+                      "(if exist .harness echo ready) & "
+                      "(where certutil >nul 2>&1 || echo nohash) & (if exist ");
             print(&b, p);
             print(&b, " (echo have & certutil -hashfile ");
             print(&b, p);
@@ -342,7 +346,7 @@ static Str deploycmd(Arena *a, i32 shell, i32 step, Str path, i64 stamp)
             print(&b, p);
             print(&b, ".part || openssl dgst -sha256 -r ");
             print(&b, p);
-            print(&b, ".part; } 2>/dev/null");
+            print(&b, ".part || echo nohash; } 2>/dev/null");
         } else {
             print(&b, "certutil -hashfile ");
             print(&b, p);
@@ -612,6 +616,19 @@ static DeployRun deployrun(Deploy *d, Arena *a, Slice<Str> argv, i64 timeout)
     return r;
 }
 
+// Whether a line of a child's output is just this word.
+static b32 hasline(Str out, Str word)
+{
+    for (Str rest = out; rest.len;) {
+        Cut l = cut(rest, '\n');
+        rest = l.tail;
+        if (trim(l.head) == word) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // The last line of a child's errors, else of its output, for messages.
 static Str deploysaid(DeployRun *r)
 {
@@ -647,6 +664,7 @@ static DeployRun deployssh(Deploy *d, Arena *a, Str step, Str command)
         for (iz i = 0; i < countof(deployopts); i++) {
             argv = push(a, argv, deployopts[i]);
         }
+        argv = push(a, argv, Str("--"));  // no options after it (remote.cpp)
         argv = push(a, argv, c->ssh);
         argv = push(a, argv, command);
         DeployRun r = deployrun(d, a, argv, DEPLOY_STEPTIME);
@@ -763,6 +781,8 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
         }
         return deployfail(&d, perm, scratch, finish(&b));
     }
+    Str  full = os_realpath(os, &scratch, local);  // for scp, which runs elsewhere
+    local = full.len ? full : local;
     Str  sha  = cfgsha256(&scratch, eng.data);
     Str  sums = concat(&scratch, local, ".sha256");
     Read want = os_read(os, &scratch, sums, 1<<12);
@@ -798,16 +818,11 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     print(&b, pf.shell==DEPLOY_CMD ? Str("; cmd.exe") : Str(""));
     print(&b, ")");
     deploynote(&d, scratch, "probe", finish(&b));
-    Str       cmd   = deploycmd(&scratch, pf.shell, DEPLOY_PREPARE, rpath, stamp);
-    DeployRun prep  = deployssh(&d, &scratch, "probe", cmd);
-    b32       ready = 0;
-    b32       have  = 0;
-    for (Str rest = prep.out; rest.len;) {
-        Cut l = cut(rest, '\n');
-        rest  = l.tail;
-        ready |= trim(l.head) == "ready";
-        have  |= trim(l.head) == "have";
-    }
+    Str       cmd    = deploycmd(&scratch, pf.shell, DEPLOY_PREPARE, rpath, stamp);
+    DeployRun prep   = deployssh(&d, &scratch, "probe", cmd);
+    b32       ready  = hasline(prep.out, "ready");
+    b32       have   = hasline(prep.out, "have");
+    b32       nohash = hasline(prep.out, "nohash");
     Str there = have ? deployhash(&scratch, prep.out) : Str{};
     if (deploycancelled(&d)) {
         return deployfail(&d, perm, scratch, "cancelled");
@@ -818,7 +833,7 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
         print(&b, ": ");
         print(&b, deploysaid(&prep));
         return deployfail(&d, perm, scratch, finish(&b));
-    } else if (have && !there.len) {
+    } else if (nohash || (have && !there.len)) {
         b = Buf(&scratch, 256);
         print(&b, "cannot compute a SHA-256 on ");
         print(&b, name);
@@ -858,6 +873,7 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
         for (iz i = 0; i < countof(deployopts); i++) {
             argv = push(&a, argv, deployopts[i]);
         }
+        argv = push(&a, argv, Str("--"));
         argv = push(&a, argv, local);
         Str dest = concat(&a, conf->ssh, ":");
         argv = push(&a, argv, concat(&a, dest, upath));
@@ -887,6 +903,12 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
             Str       got = deployhash(&a, v.out);
             if (got == sha) {
                 break;
+            } else if (!got.len && hasline(v.out, "nohash")) {
+                b = Buf(&a, 256);
+                print(&b, "cannot compute a SHA-256 on ");
+                print(&b, name);
+                print(&b, ": no sha256sum, shasum or openssl");
+                return deployfail(&d, perm, a, finish(&b));
             } else if (got.len) {
                 why = concat(&a, "the upload arrived damaged, its SHA-256 ", got);
             } else if (v.code == 0) {
@@ -1024,7 +1046,7 @@ static i32 deploymain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     }
     // Only cached copies of URL includes: deploy runs no engine here
     dc.localstate = state.len ? state : defaultstate(os, &perm);
-    Config *cfg   = cliconfig(os, &perm, scratch, config, dc.localstate, 0);
+    Config *cfg   = cliconfig(os, &perm, scratch, config, dc.localstate, CFG_NETNONE);
     if (!cfg) {
         return 2;
     }

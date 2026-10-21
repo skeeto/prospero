@@ -1,6 +1,7 @@
 // FrameIn tests: the header codec at every split point, rejected headers,
 // and two links over in-memory streams that break, lose bytes, deliver
-// twice, restart, and run into their limits.
+// twice, restart, come up slowly, and run into their limits; and the
+// client library's requests, which never wait.
 
 // Encode one frame.
 static Str frameof(Arena *a, u8 type, u32 id, u32 ack, Str payload)
@@ -484,6 +485,68 @@ static void test_frame(Test *t)
         expect(t, "fresh.broken", istr(&tmp, x->events[LINK_BROKEN] + y->events[LINK_BROKEN]), "0");
     }
 
+    // A stream slow to come up: before the peer's replay request a side
+    // writes only its own, and a goodbye, however long it waits, so that
+    // nothing acknowledges in numbers a new peer does not share; bytes
+    // of a frame still arriving keep the stream alive
+    {
+        Arena tmp = a;
+        FrameSide *x = alloc<FrameSide>(&tmp);
+        FrameSide *y = alloc<FrameSide>(&tmp);
+        sidesinit(&tmp, x, 0x1111, 1<<12, 64);
+        sidesinit(&tmp, y, 0x2222, 1<<12, 64);
+        sidesconnect(x, y, 0);
+        sendlines(&tmp, &y->link, 1, 3);
+        sidesrun(&tmp, x, y, 1000, 0);  // x owes an acknowledgement
+        sidesconnect(x, y, 10);
+        Str req = linkout(&x->link, &tmp, 10);
+        expect(t, "slow.request", istr(&tmp, req.len), istr(&tmp, FRAME_HEAD+FRAME_TOKEN));
+        i64 later = 10 + LINK_KEEPALIVE + LINK_ACKTIME;
+        expect(t, "slow.alive", istr(&tmp, linktick(&x->link, later)), "1");
+        expect(t, "slow.quiet", istr(&tmp, linkpending(&x->link)), "0");
+        expect(t, "slow.nothing", linkout(&x->link, &tmp, later), "");
+        expect(t, "slow.deadline", istr(&tmp, linkdeadline(&x->link)), istr(&tmp, 10+LINK_DEAD));
+        linkheard(&x->link, 10+LINK_DEAD-1);
+        expect(t, "slow.heard", istr(&tmp, linktick(&x->link, 10+LINK_DEAD)), "1");
+        linkbye(&x->link);
+        expect(t, "slow.bye", linkout(&x->link, &tmp, later),
+               frameof(&tmp, FRAME_DISCONNECT, 0, 3, ""));
+    }
+
+    // A peer that started over (a new token) and took this side's replay
+    // request on a stream that broke before its own came, while this side
+    // waited past a keepalive: the same request on the next stream, which
+    // acknowledges the old peer's frames, breaks nothing, and this side
+    // finds the new one
+    {
+        Arena tmp = a;
+        FrameSide *x = alloc<FrameSide>(&tmp);
+        FrameSide *y = alloc<FrameSide>(&tmp);
+        sidesinit(&tmp, x, 0x1111, 1<<12, 64);
+        sidesinit(&tmp, y, 0x2222, 1<<12, 64);
+        sidesconnect(x, y, 0);
+        sendlines(&tmp, &y->link, 1, 30);
+        sidesrun(&tmp, x, y, 1000, 0);
+        sidesinit(&tmp, y, 0x3333, 1<<12, 64);
+        sidesconnect(x, y, 1);
+        sidesflush(&tmp, x, y, 1);
+        linktick(&x->link, 1+LINK_KEEPALIVE);
+        sidesflush(&tmp, x, y, 1+LINK_KEEPALIVE);
+        sidesdeliver(x, y, 1000, 1+LINK_KEEPALIVE);  // y's request is lost
+        expect(t, "restart.first", istr(&tmp, y->events[LINK_READY]*10 + y->events[LINK_BROKEN]), "10");
+        x->got.len = 0;
+        sidesconnect(x, y, 2);
+        sidesrun(&tmp, x, y, 1000, 2);
+        expect(t, "restart.ready", istr(&tmp, y->events[LINK_READY]), "2");
+        expect(t, "restart.fresh", istr(&tmp, x->events[LINK_FRESH]), "1");
+        sendlines(&tmp, &x->link, 1, 2);
+        sendlines(&tmp, &y->link, 1, 2);
+        sidesrun(&tmp, x, y, 1000, 2);
+        expect(t, "restart.xtoy", finish(&y->got), numlines(&tmp, 1, 2));
+        expect(t, "restart.ytox", finish(&x->got), numlines(&tmp, 1, 2));
+        expect(t, "restart.broken", istr(&tmp, x->events[LINK_BROKEN] + y->events[LINK_BROKEN]), "0");
+    }
+
     // The ring of kept frames wraps around its end, over and over, a
     // frame's header and payload split anywhere across it
     {
@@ -531,4 +594,20 @@ static void test_frame(Test *t)
         expect(t, "wrap.kept", istr(&tmp, x->link.qcount), "0");
         expect(t, "wrap.recvd", istr(&tmp, y->link.recvd), "2");
     }
+}
+
+// The client library's requests from a frontend's thread never wait,
+// though the remote's mailbox be full: a bit each, and a wake.
+static void test_remoteask(Test *t)
+{
+    Arena  a = t->perm;
+    Remote r = {};
+    r.in = newmailbox(&a, 64, 0, 0);
+    mailpost(r.in, MAIL_CMD, 0, "{\"cmd\":\"list\",\"id\":1,\"x\":\"..\"}", 1);
+    mailwait(r.in, 0);
+    expect(t, "ask.full", istr(&a, mailpost(r.in, MAIL_CMD, 0, "{}", 0)), "0");
+    remoteclose(&r);
+    remotedrop(&r);
+    expect(t, "ask.bits", istr(&a, r.asked), istr(&a, REMOTE_CLOSE|REMOTE_DROP));
+    expect(t, "ask.woken", istr(&a, mailwait(r.in, 0)), "1");
 }

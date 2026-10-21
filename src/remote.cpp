@@ -12,7 +12,10 @@
 // has now: ssh running "PATH attach" on the remote machine, with
 //
 //   ssh -T -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15
-//       -o ServerAliveCountMax=3 -o EscapeChar=none HOST 'PATH attach'
+//       -o ServerAliveCountMax=3 -o EscapeChar=none -- HOST 'PATH attach'
+//
+// where -- ends ssh's options for good: without it, ssh reads options
+// again after HOST, and a PATH like -oProxyCommand=... would run here.
 //
 // spawned through os_spawnio, or for this machine's own host a local
 // connection (os_connect), starting the host when none runs. A stream
@@ -42,8 +45,10 @@
 // remoteclose ends the link with a disconnect frame: the host forgets
 // this client, and its sessions run on without it. remotefinish does so
 // once every command sent is answered (30 s at most), as connect does
-// when its input ends. A quit command stops the host's engine as it
-// would a local one.
+// when its input ends. Neither waits, whatever the remote's thread is
+// doing: each sets a bit the thread takes before its next take of the
+// mailbox, so that commands posted before it are handled before it. A
+// quit command stops the host's engine as it would a local one.
 //
 // A remote may be one host of this machine, at its endpoint and no
 // other (a background host, as registered): none is started, and once
@@ -75,10 +80,14 @@ enum : i64 {
 static i64 remotebackoff[] = {1*SEC, 2*SEC, 5*SEC, 10*SEC, 30*SEC};
 
 enum : u32 {
-    REMOTE_CLOSE = 300,  // frontend to the remote thread: remoteclose
-    REMOTE_FINISH,       // remotefinish
-    REMOTE_DROP,         // and remotedrop, a test hook
-    REMOTE_DEPLOYED,     // a deployment's outcome: 1 and the path, or 0 and why
+    REMOTE_DEPLOYED = 300,  // a deployment's outcome: 1 and the path, or 0 and why
+};
+
+// What another thread asks of the remote's (remoteask), as bits
+enum : i32 {
+    REMOTE_CLOSE  = 1 << 0,  // remoteclose
+    REMOTE_FINISH = 1 << 1,  // remotefinish
+    REMOTE_DROP   = 1 << 2,  // remotedrop, a test hook
 };
 
 enum : i32 {
@@ -121,6 +130,12 @@ struct RemoteConf {
     b32 deploy;    // deploy an engine when the one there is missing or another
 };
 
+// A new command awaiting its reply, which names the session made.
+struct RemoteNew {
+    i64 id;
+    b32 attended;  // as the command asked, for opening it again
+};
+
 // A session the frontend opened, or has records of.
 struct RemoteSess {
     Str  sid;
@@ -161,7 +176,7 @@ struct Remote {
     b32               gone;     // its endpoint's host cannot be reached
     Slice<RemoteSess> sess;
     Slice<i64>        pending;  // the frontend's commands awaiting replies
-    Slice<i64>        newids;   // of those, new commands: the sid to track
+    Slice<RemoteNew>  news;     // of those, new commands: the sid to track
     Buf               held;     // the frontend's commands before hello
     i64               nextown;  // the library's own ids: -1, -2, ...
     Str               why;      // the last trouble, for the frontend
@@ -171,6 +186,7 @@ struct Remote {
     b32               deployed; // tried once: never again
     b32               redeploy; // deploy once this stream ends
     i32               cancel;   // stops a deployment (atomic)
+    i32               asked;    // REMOTE_CLOSE and others (atomic)
 };
 
 static void remoteemit(Remote *r, Str line)
@@ -227,16 +243,6 @@ static void dropid(Slice<i64> *ids, i64 id)
     }
 }
 
-static b32 hasid(Slice<i64> ids, i64 id)
-{
-    for (iz i = 0; i < ids.len; i++) {
-        if (ids[i] == id) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 // A reply to the frontend, made here.
 static void remotereply(Remote *r, Arena scratch, i64 id, Str err)
 {
@@ -260,7 +266,10 @@ static b32 remotesend(Remote *r, Arena scratch, Str ln)
     if (d.ok && id) {
         r->pending = push(&r->perm, r->pending, id);
         if (cmdfind(jsonstr(jsonget(d.root, "cmd"))) == CMD_NEW) {
-            r->newids = push(&r->perm, r->newids, id);
+            RemoteNew n = {};
+            n.id       = id;
+            n.attended = jsonflag(jsonget(d.root, "attended"), 0);
+            r->news    = push(&r->perm, r->news, n);
         }
     }
     return 1;
@@ -292,18 +301,22 @@ static void remoteown(Remote *r, Arena scratch, i32 cmd, Str sid, i64 from, i32 
 
 // An argument of the remote command, for the remote machine's shell: as
 // it is when plain, else in double quotes, which sh and cmd.exe both
-// take. Returns 0 for what neither takes literally inside them: quotes,
-// $, `, % and control characters.
+// take, a backslash included (sh drops one unquoted, as on the XP
+// laptop's busybox), and a leading - too. Returns 0 for what they do not
+// both take literally inside them: quotes, $, `, %, control characters,
+// and a backslash before another or at the end (a UNC path, say).
 static b32 remotearg(Buf *b, Str s)
 {
-    b32 plain = s.len > 0;
+    b32 plain = s.len>0 && s[0]!='-';
     for (iz i = 0; i < s.len; i++) {
         u8 c = s[i];
         if (c<0x20 || c==0x7f || c=='"' || c=='$' || c=='`' || c=='%') {
             return 0;
+        } else if (c=='\\' && (i+1==s.len || s[i+1]=='\\')) {
+            return 0;
         }
-        plain &= alnum(c) || c=='/' || c=='\\' || c=='.' || c=='-' ||
-                 c=='_' || c==':' || c=='~' || c=='+' || c==',' || c=='=';
+        plain &= alnum(c) || c=='/' || c=='.' || c=='-' || c=='_' ||
+                 c==':' || c=='~' || c=='+' || c==',' || c=='=';
     }
     putbyte(b, ' ');
     if (!plain) putbyte(b, '"');
@@ -399,8 +412,9 @@ static b32 remotestart(Remote *r, Arena scratch)
         ok &= remotearg(&cmd, r->conf.idle);
     }
     if (!ok) {
-        r->why = clone(&r->perm, "a path for the remote machine has a quote, $, `, % "
-                                 "or a control character, which its shell cannot take");
+        r->why = clone(&r->perm, "a path for the remote machine has a quote, $, `, %, "
+                                 "a control character, or a backslash doubled or at "
+                                 "its end, which its shell cannot take");
         return 0;
     } else if (r->conf.ssh[0] == '-') {
         // ssh would take it for an option, which may run a command here
@@ -415,6 +429,7 @@ static b32 remotestart(Remote *r, Arena scratch)
     }
     argv = push(&scratch, argv, Str("-o"));
     argv = push(&scratch, argv, Str("EscapeChar=none"));
+    argv = push(&scratch, argv, Str("--"));
     argv = push(&scratch, argv, r->conf.ssh);
     argv = push(&scratch, argv, cuthead(finish(&cmd), 1));
 
@@ -657,7 +672,7 @@ static void remoteup(Remote *r, Arena scratch, i32 ev)
                         "the remote host started over: this may not have run");
         }
         r->pending.len = 0;
-        r->newids.len  = 0;
+        r->news.len    = 0;
     }
     if (!r->hellook || catchup || !r->everup) {
         remoteown(r, scratch, CMD_HELLO, {}, -1, -1);
@@ -779,13 +794,19 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
             return;  // the library's own
         }
         dropid(&r->pending, id);
-        if (hasid(r->newids, id)) {
-            dropid(&r->newids, id);
+        for (iz i = 0; i < r->news.len; i++) {
+            RemoteNew n = r->news[i];
+            if (n.id != id) {
+                continue;
+            }
+            r->news[i] = r->news[r->news.len-1];
+            r->news.len--;
             if (jsonint(jsonget(rec.root, "ok"), 0) && rec.sid.len) {
                 RemoteSess *s = remotesess(r, rec.sid, 1);
                 s->open     = 1;
-                s->attended = 1;
+                s->attended = n.attended;
             }
+            break;
         }
     } break;
     case EV_SESSIONS: {
@@ -821,6 +842,9 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
 static void remoteframes(Remote *r, Arena scratch, Str data)
 {
     i64 now = os_ticks(r->os);
+    if (data.len) {
+        linkheard(&r->link, now);  // a frame in pieces counts too
+    }
     for (FrameIn f; (f = framenext(&r->dec, &data)).ok;) {
         Arena a  = scratch;
         i32   ev = linkframe(&r->link, &f, now);
@@ -931,28 +955,15 @@ static void remotethread(void *arg)
             mailwait(r->in, ms);
         }
 
-        Mail m = mailtake(r->in);
+        // What was asked before this take: the commands posted first
+        // are in it, to be handled first
+        i32  asked = __atomic_exchange_n(&r->asked, 0, __ATOMIC_ACQUIRE);
+        Mail m     = mailtake(r->in);
         for (Record rec; !r->done && (rec = mailnext(&m)).ok;) {
             Arena a = scratch;
             switch (rec.type) {
             case MAIL_CMD:
                 remotecommand(r, a, rec.data);
-                break;
-            case REMOTE_FINISH:
-                if ((r->held.len || r->pending.len) && !r->drainby && !r->closing) {
-                    // Commands to send yet, or replies to come: first those
-                    r->drainby = os_ticks(os) + REMOTE_DRAINWAIT;
-                    break;
-                }
-                remoteleave(r, a);
-                break;
-            case REMOTE_CLOSE:
-                remoteleave(r, a);
-                break;
-            case REMOTE_DROP:
-                if (r->live && !r->closing) {
-                    remotedown(r, a, "the stream was dropped (a test)", -1);
-                }
                 break;
             case PROC_DATA:
             case CONN_DATA:
@@ -997,6 +1008,21 @@ static void remotethread(void *arg)
                     remotedown(r, a, "the host closed the connection", -1);
                 }
                 break;
+            }
+        }
+        if (!r->done && (asked & REMOTE_DROP) && r->live && !r->closing) {
+            remotedown(r, scratch, "the stream was dropped (a test)", -1);
+        }
+        if (r->done) {
+            break;
+        } else if (asked & REMOTE_CLOSE) {
+            remoteleave(r, scratch);
+        } else if (asked & REMOTE_FINISH) {
+            if ((r->held.len || r->pending.len) && !r->drainby && !r->closing) {
+                // Commands to send yet, or replies to come: first those
+                r->drainby = os_ticks(os) + REMOTE_DRAINWAIT;
+            } else {
+                remoteleave(r, scratch);
             }
         }
         if (r->done) {
@@ -1076,24 +1102,33 @@ static b32 remotetry(Remote *r, Str line)
     return line.len<=mailmax(r->in) && mailpost(r->in, MAIL_CMD, 0, line, 0);
 }
 
+// Ask the remote's thread for something, from any thread, never
+// waiting: the thread may itself be waiting for room in the frontend's
+// mailbox, which the frontend's thread empties.
+static void remoteask(Remote *r, i32 what)
+{
+    __atomic_fetch_or(&r->asked, what, __ATOMIC_RELEASE);
+    mailpoke(r->in);
+}
+
 // End the link: the host forgets this client, MAIL_QUIT follows.
 static void remoteclose(Remote *r)
 {
-    mailpost(r->in, REMOTE_CLOSE, 0, {}, 1);
+    remoteask(r, REMOTE_CLOSE);
 }
 
 // The same once every command sent is answered, or after 30 s: the end
 // of a frontend's commands, as of standard input (harness connect).
 static void remotefinish(Remote *r)
 {
-    mailpost(r->in, REMOTE_FINISH, 0, {}, 1);
+    remoteask(r, REMOTE_FINISH);
 }
 
 // A test hook: break the stream, killing ssh, as a network would, so
 // that the link comes back over another.
 static void remotedrop(Remote *r)
 {
-    mailpost(r->in, REMOTE_DROP, 0, {}, 1);
+    remoteask(r, REMOTE_DROP);
 }
 
 
@@ -1210,7 +1245,7 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     }
     // Only cached copies of URL includes: connect runs no engine here
     rc.localstate = state.len ? state : defaultstate(os, &perm);
-    Config *cfg   = cliconfig(os, &perm, scratch, config, rc.localstate, 0);
+    Config *cfg   = cliconfig(os, &perm, scratch, config, rc.localstate, CFG_NETNONE);
     if (!cfg) {
         return 2;
     }

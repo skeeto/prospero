@@ -503,14 +503,14 @@ static Str defaultstate(Os *os, Arena *a)
 
 // The configuration, its diagnostics reported on standard error: an
 // explicit file must exist, and the default one is seeded on first run.
-// With fetch, URL includes with no cached copy are fetched first, which
-// takes 30 s at most; otherwise only cached copies are used. Null on
+// URL includes as net says (newconfig): with CFG_NETWAIT, those with no
+// cached copy are fetched first, which takes 30 s at most. Null on
 // failure, reported.
 static Config *cliconfig(Os *os, Arena *perm, Arena scratch, Str config,
-                         Str statedir, b32 fetch)
+                         Str statedir, i32 net)
 {
     Str     path = config.len ? config : cfgdefault(os, perm);
-    Config *cfg  = newconfig(os, perm, scratch, path, !config.len, statedir, fetch);
+    Config *cfg  = newconfig(os, perm, scratch, path, !config.len, statedir, net);
     if (!cfg) {
         os_print(os, 2, "harness: out of memory\n");
         return 0;
@@ -570,7 +570,7 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 
     // URL includes not yet cached are fetched now, briefly
     c.statedir  = state.len ? state : defaultstate(os, &perm);
-    Config *cfg = cliconfig(os, &perm, scratch, config, c.statedir, 1);
+    Config *cfg = cliconfig(os, &perm, scratch, config, c.statedir, CFG_NETWAIT);
     if (!cfg) {
         return 2;
     }

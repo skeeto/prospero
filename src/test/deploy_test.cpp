@@ -1,6 +1,7 @@
 // Deploy tests: telling platforms and shells from probe output, reading
 // hashes as each tool prints them, the commands in each shell's dialect,
-// the deployment records, and what ssh's end says about the engine there.
+// the deployment records, what ssh's end says about the engine there,
+// and how the remote command's arguments go to its shell.
 
 static Str showplatform(Arena *a, Str out)
 {
@@ -91,6 +92,8 @@ static void test_deploy(Test *t)
         Str w  = ".harness\\engine-0-1.2.3-windows-x86_64.exe";
         expect(t, "deploy.cmd.sh.prepare", deploycmd(&a, DEPLOY_SH, DEPLOY_PREPARE, p, 7),
                "sh -c 'mkdir -p .harness && chmod 700 .harness && echo ready; "
+               "{ command -v sha256sum || command -v shasum || command -v openssl; } "
+               ">/dev/null 2>&1 || echo nohash; "
                "if [ -f .harness/engine-0-1.2.3-linux-aarch64 ]; then echo have; "
                "{ sha256sum .harness/engine-0-1.2.3-linux-aarch64 || "
                "shasum -a 256 .harness/engine-0-1.2.3-linux-aarch64 || "
@@ -100,8 +103,8 @@ static void test_deploy(Test *t)
                "sh -c 'chmod 755 .harness/engine-0-1.2.3-linux-aarch64.part && "
                "{ sha256sum .harness/engine-0-1.2.3-linux-aarch64.part || "
                "shasum -a 256 .harness/engine-0-1.2.3-linux-aarch64.part || "
-               "openssl dgst -sha256 -r .harness/engine-0-1.2.3-linux-aarch64.part; } "
-               "2>/dev/null'");
+               "openssl dgst -sha256 -r .harness/engine-0-1.2.3-linux-aarch64.part || "
+               "echo nohash; } 2>/dev/null'");
         expect(t, "deploy.cmd.sh.install", deploycmd(&a, DEPLOY_SH, DEPLOY_INSTALL, p, 7),
                "sh -c '{ mv -f .harness/engine-0-1.2.3-linux-aarch64.part "
                ".harness/engine-0-1.2.3-linux-aarch64 2>/dev/null || "
@@ -117,6 +120,7 @@ static void test_deploy(Test *t)
                "sh -c 'rm -f .harness/engine-0-1.2.3-linux-aarch64'");
         expect(t, "deploy.cmd.cmd.prepare", deploycmd(&a, DEPLOY_CMD, DEPLOY_PREPARE, w, 7),
                "(if not exist .harness mkdir .harness) & (if exist .harness echo ready) & "
+               "(where certutil >nul 2>&1 || echo nohash) & "
                "(if exist .harness\\engine-0-1.2.3-windows-x86_64.exe (echo have & "
                "certutil -hashfile .harness\\engine-0-1.2.3-windows-x86_64.exe SHA256))");
         expect(t, "deploy.cmd.cmd.verify", deploycmd(&a, DEPLOY_CMD, DEPLOY_VERIFY, w, 7),
@@ -179,5 +183,35 @@ static void test_deploy(Test *t)
         print(&name, (i64)i);
         i32 got = remoteneed(needs[i].log, needs[i].code);
         expect(t, finish(&name), remoteneeds[got], remoteneeds[needs[i].want]);
+    }
+
+    // Arguments of the remote command: plain, else quoted for sh and
+    // cmd.exe alike, a backslash and a leading - included, or refused
+    struct { Str arg; Str want; } args[] = {
+        {"harness", " harness"},
+        {".harness/engine-0-1.2.3-linux-aarch64", " .harness/engine-0-1.2.3-linux-aarch64"},
+        {"~/bin/harness", " ~/bin/harness"},
+        {"C:/tools/harness.exe", " C:/tools/harness.exe"},
+        {"C:\\tools\\harness.exe", " \"C:\\tools\\harness.exe\""},
+        {".harness\\engine-0-1.2.3-windows-x86_64.exe",
+         " \".harness\\engine-0-1.2.3-windows-x86_64.exe\""},
+        {"/opt/my harness/h", " \"/opt/my harness/h\""},
+        {"-oProxyCommand=/usr/bin/touch", " \"-oProxyCommand=/usr/bin/touch\""},
+        {"", " \"\""},
+        {"\\\\srv\\share\\h.exe", "refused"},
+        {"C:\\dir\\", "refused"},
+        {"a\"b", "refused"},
+        {"$HOME/h", "refused"},
+        {"%USERPROFILE%\\h", "refused"},
+        {"a`b`", "refused"},
+    };
+    for (iz i = 0; i < countof(args); i++) {
+        Arena tmp = a;
+        Buf   name(&tmp, 32);
+        print(&name, "deploy.remotearg.");
+        print(&name, (i64)i);
+        Buf b(&tmp, 64);
+        Str got = remotearg(&b, args[i].arg) ? finish(&b) : Str("refused");
+        expect(t, finish(&name), got, args[i].want);
     }
 }

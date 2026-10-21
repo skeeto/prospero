@@ -275,4 +275,26 @@ static void test_mailbox(Test *t)
         putbyte(&b, '0' + (u8)mailwait(m, 0));
         expect(t, "mail.handover", finish(&b), "101/0:a;11");
     }
+
+    // A poke wakes the consumer with no record, a full mailbox and all,
+    // through the event or the hook
+    {
+        Mailbox *m = newmailbox(&a, 64, 0, 0);
+        Buf b(&a, 16);
+        mailpost(m, 1, 0, "0123456789abcdef0123456789abcdef", 0);
+        mailwait(m, 0);
+        putbyte(&b, '0' + (u8)mailpost(m, 1, 0, "x", 0));
+        mailpoke(m);
+        putbyte(&b, '0' + (u8)mailwait(m, 0));
+        putbyte(&b, '0' + (u8)mailwait(m, 0));
+        mailtake(m);
+        mailpoke(m);
+        putbyte(&b, '0' + (u8)mailwait(m, 0));
+        print(&b, mailshow(&a, mailtake(m)));
+        i32      count = 0;
+        Mailbox *n     = newmailbox(&a, 64, wakecount, &count);
+        mailpoke(n);
+        print(&b, (i64)count);
+        expect(t, "mail.poke", finish(&b), "01011");
+    }
 }

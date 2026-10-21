@@ -12,7 +12,9 @@
 // attach", which bridges its standard I/O to the endpoint, starting a
 // host when none runs. Attach starts the host detached (os_detach), so
 // that it outlives the ssh session, its errors in run/host.log, and
-// waits up to 10 s for it to listen. With --reconnect it starts nothing:
+// waits up to 10 s for it to listen: a host takes its lock before all
+// else, and never waits for URL includes not yet cached (config.cpp),
+// which its engine fetches meanwhile. With --reconnect it starts nothing:
 // exit status 90 says that no host runs, so the client knows that what
 // it had there is gone. Anyone who finds a registered host unreachable
 // removes its registration.
@@ -297,6 +299,7 @@ struct Host {
     HostConn       *conns;
     HostClient     *clients;
     HostClient     *dead;      // dropped this round, to release
+    HostConn       *deadconns; // ended this round, to release
     Map<HostSess>  *sess;
     HostCmd        *cmds;      // a ring of HOST_CMDS
     i32             cmdhead;
@@ -367,7 +370,7 @@ static HostSub *hostsub(HostClient *c, Str sid, i64 from, b32 attended)
     return s;
 }
 
-static void hostunsub(Host *, HostClient *, Str sid);
+static void hostunsub(Host *, HostClient *, Arena scratch, Str sid);
 
 // Whether any client attends the session.
 static b32 hostattended(Host *h, Str sid)
@@ -483,16 +486,16 @@ static b32 hostput(HostClient *c, Str line, iz reserve)
     return linkroom(&c->link)-(FRAME_HEAD+line.len)>=reserve && linksend(&c->link, line);
 }
 
-static void hostdrop(Host *, HostClient *);
+static void hostdrop(Host *, HostClient *, Arena scratch);
 
 // A line a client must get: a reply. A client with no room left even
-// for that is hopelessly behind, and loses its place.
-static void hostmust(Host *h, HostClient *c, Str line)
+// for that is hopelessly behind, and loses its place. The scratch is
+// what the caller has left free: below it may be the command at hand.
+static void hostmust(Host *h, HostClient *c, Arena scratch, Str line)
 {
     if (!c->gone && !hostput(c, line, 0)) {
-        hostsay(h->os, newarena(h->scratch),
-                "a client fell too far behind, so it starts over");
-        hostdrop(h, c);
+        hostsay(h->os, scratch, "a client fell too far behind, so it starts over");
+        hostdrop(h, c, scratch);
     }
 }
 
@@ -506,7 +509,8 @@ static void hostreply(Host *h, HostClient *c, Arena scratch, i64 id, b32 ok,
     if (err.len) {
         putstrkey(&w.json, "err", err);
     }
-    hostmust(h, c, evend(&w));
+    Str line = evend(&w);
+    hostmust(h, c, scratch, line);
 }
 
 // An engine reply with the client's id in place of the host's.
@@ -549,6 +553,8 @@ static HostClient *newclient(Host *h, u64 token)
     return c;
 }
 
+// A stream ends. Its memory goes at the end of the round (hostreap), as
+// the command at hand may lie in its decoder's buffer.
 static void connfree(Host *h, HostConn *hc)
 {
     for (HostConn **p = &h->conns; *p; p = &(*p)->next) {
@@ -562,12 +568,13 @@ static void connfree(Host *h, HostConn *hc)
         hc->client->lostat = os_ticks(h->os);
     }
     os_connclose(h->os, hc->c);
-    os_release(h->os, hc->region);
+    hc->next     = h->deadconns;
+    h->deadconns = hc;
 }
 
 // A client leaves for good: what it opened stays open, but unattended
 // unless another client attends it.
-static void hostdrop(Host *h, HostClient *c)
+static void hostdrop(Host *h, HostClient *c, Arena scratch)
 {
     if (c->gone) {
         return;
@@ -576,13 +583,13 @@ static void hostdrop(Host *h, HostClient *c)
     if (c->conn) {
         connfree(h, c->conn);
     }
-    Arena scratch = newarena(h->scratch);
     while (c->subs) {
-        Str sid = clone(&scratch, c->subs->sid);
-        b32 att = c->subs->attended;
-        hostunsub(h, c, sid);
+        Arena a   = scratch;
+        Str   sid = clone(&a, c->subs->sid);
+        b32   att = c->subs->attended;
+        hostunsub(h, c, a, sid);
         if (att && !hostattended(h, sid)) {
-            hostpoke(h, scratch, sid, 0);
+            hostpoke(h, a, sid, 0);
         }
     }
     for (i32 i = 0; i < h->cmdlen; i++) {
@@ -601,7 +608,8 @@ static void hostdrop(Host *h, HostClient *c)
     h->dead = c;
 }
 
-// Release the clients dropped this round, now that nothing holds them.
+// Release the clients and streams dropped this round, now that nothing
+// holds them.
 static void hostreap(Host *h)
 {
     while (h->dead) {
@@ -609,10 +617,15 @@ static void hostreap(Host *h)
         h->dead = c->next;
         os_release(h->os, c->region);
     }
+    while (h->deadconns) {
+        HostConn *hc = h->deadconns;
+        h->deadconns = hc->next;
+        os_release(h->os, hc->region);
+    }
 }
 
 // Remove a client's subscription, and those to the subagents under it.
-static void hostunsub(Host *h, HostClient *c, Str sid)
+static void hostunsub(Host *h, HostClient *c, Arena scratch, Str sid)
 {
     for (HostSub **p = &c->subs; *p; p = &(*p)->next) {
         HostSub *s = *p;
@@ -628,8 +641,9 @@ static void hostunsub(Host *h, HostClient *c, Str sid)
         for (HostSub *s = c->subs; s; s = s->next) {
             HostSess *ss = upsert(&h->sess, s->sid, (Arena *)0);
             if (ss && ss->parent==sid) {
-                Arena a = newarena(h->scratch);
-                hostunsub(h, c, clone(&a, s->sid));
+                Arena a   = scratch;
+                Str   kid = clone(&a, s->sid);  // its memory is reused
+                hostunsub(h, c, a, kid);
                 again = 1;
                 break;
             }
@@ -654,7 +668,11 @@ static void hosthello(Host *h, HostClient *c, Arena scratch, i64 id, Json *j)
     putstr(&w.json, "host");
     putend(&w.json);
     putintkey(&w.json, "pid", (i64)os_pid(h->os));
-    hostmust(h, c, evend(&w));
+    Str line = evend(&w);
+    hostmust(h, c, scratch, line);
+    if (c->gone) {
+        return;  // too far behind for even that: dropped
+    }
 
     i64 proto = jsonint(jsonget(j, "proto"), h->proto);
     Str err   = {};
@@ -719,7 +737,7 @@ static void hostcommand(Host *h, HostClient *c, Arena scratch, Str line)
             return;
         }
         b32 att = s->attended;
-        hostunsub(h, c, sid);
+        hostunsub(h, c, scratch, sid);
         if (hostopened(h, sid)) {
             // Others have it open: it stays so
             hostreply(h, c, scratch, cid, 1, {}, sid);
@@ -778,7 +796,7 @@ static b32 hostroute(HostClient *c, HostSub *s, EvRec *r, Str line)
     return 0;
 }
 
-static void hostquiet(Host *h, i64 now, b32 status);
+static void hostquiet(Host *h, Arena scratch, i64 now, b32 status);
 
 static void hostreplied(Host *h, Arena scratch, EvRec *r, Str line)
 {
@@ -815,7 +833,7 @@ static void hostreplied(Host *h, Arena scratch, EvRec *r, Str line)
             if (turns || jobs) {
                 h->busyat = now;
             }
-            hostquiet(h, now, 1);
+            hostquiet(h, scratch, now, 1);
         } return;
         case HOSTCMD_QUIET:
             return;
@@ -829,7 +847,8 @@ static void hostreplied(Host *h, Arena scratch, EvRec *r, Str line)
         } else if (ok && q.cmd==CMD_NEW && validsid(r->sid)) {
             hostsub(c, r->sid, 0, q.attended);
         }
-        hostmust(h, c, hostreid(&scratch, r->root, q.cid));
+        Str out = hostreid(&scratch, r->root, q.cid);
+        hostmust(h, c, scratch, out);
         return;
     }
 }
@@ -846,7 +865,7 @@ static void hostrecord(Host *h, Arena scratch, Str line)
         // The sessions list: the asker's, the command at the front
         HostCmd *q = h->cmdlen ? hostcmdat(h, 0) : 0;
         if (q && q->client) {
-            hostmust(h, q->client, line);
+            hostmust(h, q->client, scratch, line);
         }
         return;
     }
@@ -996,6 +1015,9 @@ static HostClient *findclient(Host *h, u64 token)
 static void hostframes(Host *h, HostConn *hc, Arena scratch, Str data)
 {
     i64 now = os_ticks(h->os);
+    if (hc->client && data.len) {
+        linkheard(&hc->client->link, now);  // a frame in pieces counts too
+    }
     for (FrameIn f; (f = framenext(&hc->dec, &data)).ok;) {
         HostClient *c = hc->client;
         if (!c) {
@@ -1029,7 +1051,7 @@ static void hostframes(Host *h, HostConn *hc, Arena scratch, Str data)
             }
             break;
         case LINK_BYE:
-            hostdrop(h, c);
+            hostdrop(h, c, scratch);
             return;
         case LINK_BROKEN:
             connfree(h, hc);
@@ -1061,7 +1083,7 @@ static void hostflush(Host *h, Arena scratch, i64 now)
 // No client connected and nothing run for idle_exit: stop. While quiet,
 // the engine's status is taken every HOST_CHECK, and once more at the
 // deadline, and only a status just taken (status set) stops the host.
-static void hostquiet(Host *h, i64 now, b32 status)
+static void hostquiet(Host *h, Arena scratch, i64 now, b32 status)
 {
     b32 any = 0;
     for (HostConn *hc = h->conns; hc && !any; hc = hc->next) {
@@ -1077,7 +1099,6 @@ static void hostquiet(Host *h, i64 now, b32 status)
     }
     i64 since = h->quietat>h->busyat ? h->quietat : h->busyat;
     if (status && now-since>=h->idle) {
-        Arena scratch = newarena(h->scratch);
         hostsay(h->os, scratch, "idle, so exiting");
         hostown(h, scratch, CMD_QUIT, HOSTCMD_QUIET, {}, -1, -1);
         h->quitting = 1;
@@ -1117,7 +1138,7 @@ static void hosttimers(Host *h, i64 now)
     for (HostClient *c = h->clients, *next; c; c = next) {
         next = c->next;
         if (!c->conn && now-c->lostat>=h->grace) {
-            hostdrop(h, c);
+            hostdrop(h, c, newarena(h->scratch));
         }
     }
     if (h->checkat && now>=h->checkat && !h->quitting) {
@@ -1162,7 +1183,7 @@ static void hostbye(Host *h)
 static i32 hostloop(Host *h)
 {
     Os *os = h->os;
-    hostquiet(h, os_ticks(os), 0);
+    hostquiet(h, newarena(h->scratch), os_ticks(os), 0);
     for (;;) {
         i64 now  = os_ticks(os);
         i64 next = hostdeadline(h);
@@ -1248,7 +1269,7 @@ static i32 hostloop(Host *h)
                 }
             }
         }
-        hostquiet(h, now, 0);
+        hostquiet(h, newarena(h->scratch), now, 0);
         if (stopped) {
             hostbye(h);
             hostreap(h);
@@ -1434,21 +1455,24 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         os_print(os, 2, "harness: --idle must be a number of seconds above 0\n");
         return 2;
     }
-    Str     statedir = state.len ? state : defaultstate(os, &perm);
-    Config *cfg      = cliconfig(os, &perm, scratch, config, statedir, 1);
-    if (!cfg) {
-        return 2;
-    }
-
-    // The lock first, so that a second host never starts an engine
-    HostConf hc = {};
-    hc.cfg      = cfg;
+    // The lock first, so that a second host never starts an engine, nor
+    // even reads the configuration
+    Str      statedir = state.len ? state : defaultstate(os, &perm);
+    HostConf hc       = {};
     hc.statedir = statedir;
     hc.held     = hostlock(os, &perm, scratch, statedir);
     if (hc.held < 0) {
         hostsay(os, scratch, "a host already runs for this state directory", statedir);
         return 1;
     }
+
+    // URL includes without a cached copy come later, from the engine:
+    // whoever started this host waits only so long for it to listen
+    Config *cfg = cliconfig(os, &perm, scratch, config, statedir, CFG_NETLATER);
+    if (!cfg) {
+        return 2;
+    }
+    hc.cfg = cfg;
     hc.inbox = newmailbox(&perm, HOST_INBOX, 0, 0);
     hc.idle  = idle.len ? (i64)(secs.val*(f64)SEC) : hostticks(cfg, "idle_exit");
     hc.e     = hc.inbox ? newengine(os, &perm, cfg, statedir, hc.inbox) : 0;
@@ -1519,14 +1543,24 @@ static HostStart hoststart(Os *os, Arena *perm, Arena scratch, Str statedir,
     }
     r.attached = d.attached;
 
-    for (i64 until = os_ticks(os) + HOST_READY; os_ticks(os) < until;) {
+    for (i64 until = os_ticks(os) + HOST_READY;;) {
         mailwait(mb, 20);  // nothing posts yet: a nap
         r.c = os_connect(os, scratch, endpoint, mb, id);
         if (r.c) {
             return r;
+        } else if (os_ticks(os) >= until) {
+            break;
         }
     }
-    r.err = concat(perm, "the host did not start: see ", log);
+    // What the last try said (another user's pipe there, say), and why
+    // the host itself gave up, in its log
+    Str why = os_lasterr(os, &scratch);
+    Buf b(perm, 128 + why.len + log.len);
+    print(&b, "the host did not start (connecting: ");
+    print(&b, why);
+    print(&b, "): see ");
+    print(&b, log);
+    r.err = finish(&b);
     return r;
 }
 

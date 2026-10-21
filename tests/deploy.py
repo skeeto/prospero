@@ -59,7 +59,8 @@ def scenario(fn):
 
 FAKESSH = r"""#!/bin/sh
 # ssh here: the command runs in $FAKEHOME, as a remote shell's would in
-# the home directory; FAKEUNAME makes the probe's uname say otherwise
+# the home directory; FAKEUNAME makes the probe's uname say otherwise,
+# and FAKEPATH is the only PATH there
 echo "$*" >> "$FAKELOG/ssh.log"
 while [ $# -gt 1 ]; do
   case "$1" in -o) shift 2;; -*) shift;; *) shift; break;; esac
@@ -68,7 +69,11 @@ if [ -n "$FAKEUNAME" ] && [ "${1#uname}" != "$1" ]; then
   printf '%s\n%%OS%%\n' "$FAKEUNAME"
   exit 0
 fi
-cd "$FAKEHOME" && exec sh -c "$1"
+if [ -n "$FAKEPATH" ]; then
+  PATH="$FAKEPATH"
+  export PATH
+fi
+cd "$FAKEHOME" && exec /bin/sh -c "$1"
 """
 
 FAKESCP = r"""#!/bin/sh
@@ -303,6 +308,40 @@ def no_engine(t):
 
 
 @scenario
+def relative_engines(t):
+    """An engines directory given relative to where deploy runs, which is
+    not where scp runs."""
+    src = t.engine()
+    argv = [t.harness, "deploy", "here", "--ssh-program", t.ssh, "--scp-program", t.scp,
+            "--engines", "engines", "--state", t.local]
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=t.env,
+                       cwd=t.root)
+    t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    t.check(sha256(t.deployed()) == sha256(src), "the engine is there")
+
+
+@scenario
+def no_hash(t):
+    """No tool there to compute a SHA-256: deploying fails at once, for
+    good, before uploading anything."""
+    t.engine()
+    bindir = os.path.join(t.root, "bin")
+    os.makedirs(bindir)
+    for tool in ("sh", "uname", "mkdir", "chmod", "mv", "rm", "cat"):
+        for d in ("/bin", "/usr/bin"):
+            if os.path.exists(os.path.join(d, tool)):
+                os.symlink(os.path.join(d, tool), os.path.join(bindir, tool))
+                break
+    start = time.monotonic()
+    p = t.deploy(env=dict(t.env, FAKEPATH=bindir))
+    t.check(p.returncode == 1, f"exit {p.returncode}: {p.stderr}")
+    t.check("cannot compute a SHA-256 on here: no sha256sum, shasum or openssl"
+            in p.stderr, f"stderr {p.stderr}")
+    t.check(t.scps() == 0, f"{t.scps()} uploads")
+    t.check(time.monotonic() - start < 20, "not at once")
+
+
+@scenario
 def dash_dest(t):
     """An ssh destination that ssh and scp would take for an option, as
     connect refuses it: refused before either runs."""
@@ -498,7 +537,10 @@ def real(t):
         up = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up",
                     what="up", timeout=120)
         t.check(up.get("version") == t.version, f"up {up}")
-        t.check(f"{rec.get('path')} attach" in t.sshlog(), f"ssh ran {t.sshlog()!r}")
+        # The path as the remote shell takes it: in quotes, with a backslash
+        path = rec.get("path")
+        t.check(f"{path} attach" in t.sshlog() or f'"{path}" attach' in t.sshlog(),
+                f"ssh ran {t.sshlog()!r}")
         r = c.call("new", cwd=a.remote_work, prompt="go", model=t.model("remote_tool"),
                    attended=1, timeout=120)
         t.check(r.get("ok") == 1, f"new: {r}")

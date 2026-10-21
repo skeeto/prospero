@@ -113,6 +113,8 @@ enum : i32 {
     // Windows XP compatibility
     CREATE_BREAKAWAY_FROM_JOB         = 0x01000000,
     ERROR_NOTLS12                     = 0x20000001,  // ours (bit 29)
+    ERROR_PIPEOWNER                   = 0x20000002,  // ours
+    ERROR_PIPETAKEN                   = 0x20000003,  // ours
     JOB_BREAKAWAY_OK                  = 0x800,
     JOB_SILENT_BREAKAWAY_OK           = 0x1000,
     WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 = 0x800,
@@ -256,6 +258,7 @@ W32(b32,    GetFileInformationByHandle(uz, FileInfo *));
 W32(b32,    GetFileSizeEx(uz, i64 *));
 W32(i32,    GetFileType(uz));
 W32(i32,    GetFullPathNameW(c16 *, i32, c16 *, c16 **));
+W32(i32,    GetLongPathNameW(c16 *, c16 *, i32));
 W32(i32,    GetLastError());
 W32(i32,    GetModuleFileNameW(uz, c16 *, i32));
 W32(uz,     GetProcessHeap());
@@ -1134,8 +1137,9 @@ static iz os_stdin(Os *os, u8 *buf, iz len)
 
 // Links and junctions are resolved by opening the path, which follows
 // them, then asking the handle for its name (Vista and later). Where
-// that cannot be done, the path is only made absolute, as by
-// GetFullPathNameW. Results drop the \\?\ prefix: "C:\x", "\\h\s\x".
+// that cannot be done (XP), the path is made absolute, as by
+// GetFullPathNameW, with its short (8.3) names spelled out. Results drop
+// the \\?\ prefix: "C:\x", "\\h\s\x".
 static Str os_realpath(Os *os, Arena *a, Str path)
 {
     if (hasnul(path)) {
@@ -1154,7 +1158,8 @@ static Str os_realpath(Os *os, Arena *a, Str path)
         return {};
     }
 
-    uz h = CreateFileW(
+    b32 final = 0;
+    uz  h     = CreateFileW(
         full, 0, FILE_SHARE_ALL, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0
     );
     if (h == INVALID_HANDLE_VALUE) {
@@ -1166,8 +1171,9 @@ static Str os_realpath(Os *os, Arena *a, Str path)
         c16 *fin  = need ? alloc<c16>(&tmp, need) : 0;
         u32  got  = fin ? os->finalpath(h, fin, need, 0) : 0;
         if (got && got<need) {
-            buf = fin;
-            len = (i32)got;
+            final = 1;
+            buf   = fin;
+            len   = (i32)got;
             if (len>=8 && buf[2]=='?' && (buf[4]|0x20)=='u' &&
                     (buf[5]|0x20)=='n' && (buf[6]|0x20)=='c' && buf[7]=='\\') {
                 buf += 6;  // \\?\UNC\h\s as \\h\s
@@ -1181,6 +1187,15 @@ static Str os_realpath(Os *os, Arena *a, Str path)
     }
     if (h != INVALID_HANDLE_VALUE) {
         CloseHandle(h);
+    }
+    if (!final) {
+        i32  need = GetLongPathNameW(buf, 0, 0);  // with terminator
+        c16 *lng  = need>0 ? alloc<c16>(&tmp, need) : 0;
+        i32  got  = lng ? GetLongPathNameW(buf, lng, need) : 0;
+        if (got>0 && got<need) {
+            buf = lng;
+            len = got;
+        }
     }
     for (; len>3 && (buf[len-1]=='\\' || buf[len-1]=='/'); len--) {}
 
@@ -1252,6 +1267,12 @@ static Str os_lasterr(Os *, Arena *a)
         return "this system's WinHTTP has no TLS 1.2 (Windows XP), which "
                "https endpoints need: use a plain http:// endpoint, such as "
                "a server on the LAN";
+    } else if (err == ERROR_PIPEOWNER) {
+        return "another user owns the pipe where this user's host would be, "
+               "so it may be posing as the host: nothing goes to it";
+    } else if (err == ERROR_PIPETAKEN) {
+        return "another process has the pipe where this host would listen: "
+               "if no host of this user's runs, it may be posing as one";
     }
     c16 buf[512];
     i32 flags = FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS;
@@ -1846,8 +1867,12 @@ static void os_procfree(Os *os, Proc *p)
 // Local endpoints: named pipes
 //
 // A host's pipe is \\.\pipe\harness-SID-HASH-NAME: SID the user's, HASH
-// that of the state directory's full path, case folded. Its DACL allows
-// this user alone, since the default DACL grants Everyone read access.
+// that of the state directory's real path (os_realpath, so that every
+// spelling of it names one pipe), case folded. Its owner is this user,
+// and its DACL allows this user alone, since the default DACL grants
+// Everyone read access. Anyone may compute the name, and take it while
+// no host runs, so a client checks the owner of what it reaches, and
+// talks only to a pipe of this user's (ERROR_PIPEOWNER otherwise).
 // A pipe also takes clients over SMB, which PIPE_REJECT_REMOTE_CLIENTS
 // refuses from Vista on (on XP, where it is refused and left out, such
 // a client needs this user's own credentials). Denying network logons
@@ -1877,11 +1902,13 @@ enum : i32 {
     FILE_APPEND_DATA              = 4,
     FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000,
     FILE_FLAG_OVERLAPPED          = 0x40000000,
+    OWNER_SECURITY_INFORMATION    = 1,
     PIPE_ACCESS_DUPLEX            = 3,
     PIPE_REJECT_REMOTE_CLIENTS    = 8,
     PIPE_UNLIMITED_INSTANCES      = 255,
     SECURITY_IDENTIFICATION       = 1 << 16,
     SECURITY_SQOS_PRESENT         = 0x00100000,
+    SE_KERNEL_OBJECT              = 6,
     SYNCHRONIZE                   = 0x00100000,
     TOKEN_QUERY                   = 8,
     TokenUser                     = 1,
@@ -1923,6 +1950,8 @@ W32(b32,    ResetEvent(uz));
 W32(i32,    WaitForMultipleObjects(i32, uz *, b32, i32));
 W32(b32,    WaitNamedPipeW(c16 *, i32));
 W32(b32,    ConvertSidToStringSidW(void *, c16 **));
+W32(b32,    EqualSid(void *, void *));
+W32(i32,    GetSecurityInfo(uz, i32, i32, void **, void **, void **, void **, void **));
 W32(b32,    ConvertStringSecurityDescriptorToSecurityDescriptorW(c16 *, i32, void **,
                                                                  i32 *));
 W32(b32,    GetTokenInformation(uz, i32, void *, i32, i32 *));
@@ -2192,19 +2221,26 @@ static void os_connclose(Os *, Conn *c)
     connrelease(c);
 }
 
-// The user's SID as a string, in the arena, or null.
-static Str usersid(Arena *a)
+// The user's SID, in the arena, or null.
+static void *tokenuser(Arena *a)
 {
     uz tok = 0;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
-        return {};
+        return 0;
     }
     void *buf = alloc<uz>(a, 64);  // TOKEN_USER and its SID
     i32   len = 0;
     b32   ok  = GetTokenInformation(tok, TokenUser, buf, 64*(i32)sizeof(uz), &len);
     CloseHandle(tok);
-    c16 *s = 0;
-    if (!ok || !ConvertSidToStringSidW(*(void **)buf, &s)) {
+    return ok ? *(void **)buf : 0;
+}
+
+// The user's SID as a string, in the arena, or null.
+static Str usersid(Arena *a)
+{
+    void *sid = tokenuser(a);
+    c16  *s   = 0;
+    if (!sid || !ConvertSidToStringSidW(sid, &s)) {
         return {};
     }
     iz n = 0;
@@ -2214,14 +2250,17 @@ static Str usersid(Arena *a)
     return r;
 }
 
-static Str os_endpoint(Os *, Arena *a, Str statedir, Str name)
+static Str os_endpoint(Os *os, Arena *a, Str statedir, Str name)
 {
     if (hasnul(statedir) || hasnul(name)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return {};
     }
+    // The directory as it is, so that each spelling of it names one
+    // pipe, as on POSIX; as written while it does not exist
     Arena tmp  = *a;
-    Str16 full = widepath(&tmp, statedir);
+    Str   real = os_realpath(os, &tmp, statedir);
+    Str16 full = widepath(&tmp, real.len ? real : statedir);
     u64   h    = 0x100;
     for (iz i = 0; i < full.len; i++) {
         c16 c = full.data[i];
@@ -2325,7 +2364,9 @@ static Listener *os_listen(Os *os, Arena scratch, Str endpoint, Mailbox *mbox)
     if (!sid.len) {
         return 0;
     }
-    Buf sddl(&scratch, 128 + sid.len);
+    Buf sddl(&scratch, 128 + 2*sid.len);
+    print(&sddl, "O:");
+    print(&sddl, sid);
     print(&sddl, "D:P(A;;GA;;;");
     print(&sddl, sid);
     print(&sddl, ")");
@@ -2357,7 +2398,8 @@ static Listener *os_listen(Os *os, Arena scratch, Str endpoint, Mailbox *mbox)
     if (l->pipe==INVALID_HANDLE_VALUE || !l->stop || !l->ev) {
         i32 err = GetLastError();
         listenrelease(l);
-        SetLastError(err);
+        b32 taken = err==ERROR_ACCESS_DENIED || err==ERROR_PIPE_BUSY;
+        SetLastError(taken ? ERROR_PIPETAKEN : err);
         return 0;
     }
     l->refs = 2;
@@ -2376,8 +2418,24 @@ static void os_unlisten(Os *, Listener *l)
     listenrelease(l);
 }
 
-// Open the client end of a pipe, waiting a moment while every instance
-// is busy. INVALID_HANDLE_VALUE if nobody listens.
+// Whether this user owns the pipe whose client end is h.
+static b32 pipemine(Arena scratch, uz h)
+{
+    void *owner = 0;
+    void *sd    = 0;
+    if (GetSecurityInfo(h, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION,
+                        &owner, 0, 0, 0, &sd)) {
+        return 0;
+    }
+    void *sid = tokenuser(&scratch);
+    b32   r   = owner && sid && EqualSid(owner, sid);
+    LocalFree(sd);
+    return r;
+}
+
+// Open the client end of a pipe of this user's, waiting a moment while
+// every instance is busy. INVALID_HANDLE_VALUE if nobody listens, or if
+// another user does (ERROR_PIPEOWNER).
 static uz pipeopen(Arena scratch, Str endpoint)
 {
     if (hasnul(endpoint)) {
@@ -2389,7 +2447,11 @@ static uz pipeopen(Arena scratch, Str endpoint)
         uz h = CreateFileW(name, GENERIC_READ|GENERIC_WRITE, 0, 0, OPEN_EXISTING,
                            FILE_FLAG_OVERLAPPED|SECURITY_SQOS_PRESENT|
                            SECURITY_IDENTIFICATION, 0);
-        if (h!=INVALID_HANDLE_VALUE || GetLastError()!=ERROR_PIPE_BUSY || tries==20) {
+        if (h!=INVALID_HANDLE_VALUE && !pipemine(scratch, h)) {
+            CloseHandle(h);
+            SetLastError(ERROR_PIPEOWNER);
+            return INVALID_HANDLE_VALUE;
+        } else if (h!=INVALID_HANDLE_VALUE || GetLastError()!=ERROR_PIPE_BUSY || tries==20) {
             return h;
         }
         WaitNamedPipeW(name, 250);
