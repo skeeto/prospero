@@ -1814,10 +1814,17 @@ static b32 os_procwrite(Os *, Proc *p, Str data)
 // they are put back after, a console's opened anew (leaving it spoiled
 // the old ones). A console being read for input (os_stdin) would break,
 // so then the kill that follows the grace period has to do.
+//
+// This is the one signal here sent by id rather than by handle, and the
+// pid names the child alone: its process handle, held until the Proc is
+// freed, keeps the pid from being reused, and a group id of 0 would mean
+// every process on the console, so a Proc without a pid sends nothing.
 static void ctrlbreak(Os *os, Proc *p)
 {
     i32 mode = 0;
-    if (__atomic_load_n(&os->stdinread, __ATOMIC_RELAXED) &&
+    if (p->pid <= 0) {
+        return;
+    } else if (__atomic_load_n(&os->stdinread, __ATOMIC_RELAXED) &&
             GetConsoleMode(os->std[0], &mode)) {
         return;
     }

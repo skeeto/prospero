@@ -46,9 +46,16 @@ import traceback
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fake_provider  # noqa: E402
+import pids as P  # noqa: E402
 
 
 # Hosts: where the harness runs
+#
+# A host kills by pid only what pids.py lets through, checked again on
+# the host, in the command that kills, to be a process of the run's:
+# here one of this user's started since the host was made; on Windows
+# one whose command line names the run's own directory; on XP, which
+# shows less, one of this user's that is, or descends from, harness.exe.
 
 class LocalHost:
     windows = os.name == "nt"
@@ -57,6 +64,7 @@ class LocalHost:
         self.harness = os.path.abspath(harness)
         self.url = url
         self.root = tempfile.mkdtemp(prefix="harness-scen-")
+        self.t0 = time.time()
 
     def close(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -101,31 +109,18 @@ class LocalHost:
             text=True, encoding="utf-8", errors="replace", bufsize=1)
 
     def alive(self, pid):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        # A zombie still answers: look at its state
-        try:
-            out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
-                                 capture_output=True, text=True).stdout
-            return bool(out.strip()) and not out.strip().startswith("Z")
-        except OSError:
-            return True
+        return P.alive(pid)
 
     def killhard(self, proc, pid=None):
-        if pid:
-            os.kill(pid, signal.SIGKILL)
-        else:
-            proc.kill()
+        # Here proc is the harness itself, whatever pid a file gives
+        proc.kill()
 
     def killpid(self, pid):
+        """Kill a leftover process by a pid from a file, if it is ours."""
         try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
+            P.signal_ours(pid, signal.SIGKILL, P.since(self.t0))
+        except (OSError, P.Refused) as e:
+            print(f"     kill: {e}", flush=True)
 
 
 class SshHost:
@@ -222,17 +217,25 @@ class SshHost:
             text=True, encoding="utf-8", errors="replace", bufsize=1)
 
     def alive(self, pid):
-        r = self.ssh(f"tasklist /FI \"PID eq {pid}\" /NH")
+        r = self.ssh(f"tasklist /FI \"PID eq {P.arg(pid)}\" /NH")
         return str(pid) in r.stdout
 
     def killhard(self, proc, pid=None):
         if pid:
-            self.ssh(f"taskkill /F /PID {pid}")
+            self.killpid(pid)
         else:
             proc.kill()
 
     def killpid(self, pid):
-        self.ssh(f"taskkill /F /PID {pid}")
+        """Kill a process by a pid from a file, if its command line names
+        the run's own directory, as the harness's and its tools' do."""
+        name = self.root.rsplit("/", 1)[-1]
+        ps = (f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId={P.arg(pid)}'; "
+              f"if ($p -and $p.CommandLine -like '*{name}*') {{ exit 0 }} else {{ exit 1 }}")
+        r = self.ssh(f'powershell -NoProfile -Command "{ps}" && taskkill /F /PID {P.arg(pid)}')
+        if r.returncode:
+            print(f"     kill: refused or failed for pid {pid}: {r.stdout.strip()} "
+                  f"{r.stderr.strip()}", flush=True)
 
 
 class XpHost(SshHost):
@@ -282,7 +285,7 @@ class XpHost(SshHost):
             text=True, encoding="utf-8", errors="replace", bufsize=1)
 
     def alive(self, pid):
-        r = self.ssh(f"tasklist /FI \"PID eq {pid}\" /NH")
+        r = self.ssh(f"tasklist /FI \"PID eq {P.arg(pid)}\" /NH")
         return any(line.split()[1:2] == [str(pid)] for line in r.stdout.splitlines())
 
     def killhard(self, proc, pid=None):
@@ -292,8 +295,28 @@ class XpHost(SshHost):
             proc.kill()
 
     def killpid(self, pid):
-        # No taskkill here: busybox kill, which calls TerminateProcess
-        self.ssh(f"kill -9 {pid}")
+        """Kill a process by a pid from a file, if busybox's ps shows it
+        to be this user's, and it or a parent within a few to be a
+        harness.exe, or to have the run's own directory in its command
+        line. (Here ps shows command lines of busybox's processes alone,
+        and paths of none.) No taskkill: busybox kill (TerminateProcess)."""
+        name = self.root.rsplit("/", 1)[-1]
+        r = self.ssh("sh -s", input=f"""pid={P.arg(pid)}
+ps -o pid,ppid,user,comm,args | awk -v p="$pid" -v r={shlex.quote(name)} -v me="$(id -un)" '
+NR > 1 {{ up[$1] = $2; who[$1] = $3; comm[$1] = $4; line[$1] = $0 }}
+END {{
+    if (!(p in line) || who[p] != me) exit 1
+    q = p
+    for (i = 0; i < 8 && (q in line); i++) {{
+        if (comm[q] == "harness.exe" || index(line[q], r)) exit 0
+        q = up[q]
+    }}
+    exit 1
+}}' && kill -9 "$pid"
+""")
+        if r.returncode:
+            print(f"     kill: refused or failed for pid {pid}: {r.stderr.strip()}",
+                  flush=True)
 
 
 def cleanroot(root):
@@ -472,8 +495,8 @@ class T:
                           f"in {compact(got)}")
 
     def pids(self, rel):
-        text = self.file(rel) or ""
-        return [int(x) for x in text.split() if x.strip().isdigit()]
+        """The pids in a file of the work directory, one per line."""
+        return P.parse(self.file(rel))
 
     def gone(self, pids, within=5.0):
         deadline = time.monotonic() + within

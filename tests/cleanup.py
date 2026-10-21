@@ -14,8 +14,11 @@ and still the reaper's sweep must find it: after a crash, and when its
 command ends normally. A daemon that detaches through a double fork is
 found by the Linux subreaper; on macOS, where only snapshots of the tree
 taken every 250 ms can see it, it may escape: an expected failure there,
-reported as XFAIL. An escapee after thousands of short-lived processes
-checks that the snapshots forget the dead. Survivors are killed afterward.
+reported as XFAIL. The same daemon in a group of its own, instead of a
+session, stays in the reaper's session, where the sweep finds it on
+macOS too. An escapee after thousands of short-lived processes checks
+that the snapshots forget the dead. Survivors are killed afterward, by
+pids read one per line and confirmed to be ours first (pids.py).
 
   uv run tests/cleanup.py --harness build/harness
   uv run tests/cleanup.py --harness PATH --host biron.local
@@ -133,7 +136,8 @@ def main():
             # Escapees left behind by commands that end normally
             for name, xfail in [("escapee_end", False),
                                 ("escapee_many", False),
-                                ("doublefork", sys.platform == "darwin")]:
+                                ("doublefork", sys.platform == "darwin"),
+                                ("groupfork", False)]:
                 t = scenarios.T(host, name, None)
                 t.put("tree.pids", "")
                 r = t.run(timeout=90)

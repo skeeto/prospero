@@ -49,6 +49,7 @@
 #  include "md4c.h"
 #endif
 #include "harness.cpp"
+#include "reap.cpp"
 
 #ifdef __APPLE__
 extern "C" int _NSGetExecutablePath(char *, u32 *);
@@ -849,6 +850,25 @@ static Str os_lasterr(Os *, Arena *a)
 // writer thread feeding it from a queue, with a reference of its own;
 // its reader passes output on as records instead of into a file, and
 // its errors go into the file directly.
+//
+// Every signal goes out through sendsignal, which refuses a pid or a
+// group id that would reach more than meant (reap.cpp). A reaper signals
+// its own group only if setsid made it the group's leader.
+
+// Signal one process, or with group one process group, by its positive
+// id: never the caller's own group (0), every process (-1), or init.
+// Debug builds trap on such an id; others refuse it (EINVAL).
+static b32 sendsignal(i64 id, i32 sig, b32 group)
+{
+    if (!signalable(id)) {
+        #ifndef NDEBUG
+        __builtin_trap();
+        #endif
+        errno = EINVAL;
+        return 0;
+    }
+    return group ? !killpg((pid_t)id, sig) : !kill((pid_t)id, sig);
+}
 
 enum : iz {
     PROC_TAILMAX  = 1<<12,
@@ -1132,6 +1152,15 @@ static void childsignals(posix_spawnattr_t *attr, short flags, b32 tool)
     posix_spawnattr_setflags(attr, flags);
 }
 
+// Undo a spawn: kill the reaper, which then starts nothing more, and
+// its group, which holds the tool if it was started. The group alone
+// would miss a reaper yet to call setsid, and leave it to run the tool.
+static void spawnkill(i32 pid)
+{
+    sendsignal(pid, SIGKILL, 0);
+    sendsignal(pid, SIGKILL, 1);
+}
+
 // Spawn under a reaper. With io, input is a pipe from the writer
 // thread, errors go to outpath (or /dev/null) directly, and the reader
 // passes output on as records instead of into the file.
@@ -1218,7 +1247,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
 
     Proc *p = (Proc *)malloc(sizeof(Proc));
     if (!p) {
-        kill(-pid, SIGKILL);
+        spawnkill(pid);
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
         closeall(mine, countof(mine));
         errno = ENOMEM;
@@ -1239,7 +1268,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     p->wake     = wake;
 
     if (!os_thread(os, io ? procpipe : procreader, p)) {
-        kill(-pid, SIGKILL);
+        spawnkill(pid);
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
         closeall(mine, countof(mine));
         pthread_mutex_destroy((pthread_mutex_t *)p->lock.opaque);
@@ -1250,7 +1279,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     i32 input[] = {in[1], (i32)wake.h[0], (i32)wake.h[1]};
     if (!os_thread(os, procwaiter, p)) {
         // The reader finishes once the group is dead
-        kill(-pid, SIGKILL);
+        spawnkill(pid);
         while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
         close(st[0]);
         closeall(input, countof(input));
@@ -1261,7 +1290,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
         return 0;
     }
     if (io && !os_thread(os, procwriter, p)) {
-        kill(-pid, SIGKILL);  // the reader and waiter then finish
+        spawnkill(pid);  // the reader and waiter then finish
         closeall(input, countof(input));
         procrelease(p);  // the writer's
         procrelease(p);  // the caller's
@@ -1316,21 +1345,28 @@ static b32 os_procwrite(Os *, Proc *p, Str data)
     return ok;
 }
 
+// Nothing for a Proc without a reaper's pid, or once the reaper is
+// reaped and its pid free for another process (reapkill).
 static void os_kill(Os *, Proc *p, b32 hard)
 {
     os_lock(&p->lock);
-    if (!p->reaped && !hard) {
-        kill(-p->pid, SIGTERM);  // the reaper ignores it
-    } else if (!p->reaped) {
+    switch (reapkill(p->pid, p->reaped, hard)) {
+    case REAPKILL_NONE:
+        break;
+    case REAPKILL_TERM:
+        sendsignal(p->pid, SIGTERM, 1);  // the reaper ignores it
+        break;
+    case REAPKILL_HARD: {
         // The reaper sweeps, unless it is dead already: then its group
         // goes as before, its pid still held, unreaped
         siginfo_t si = {};
         if (waitid(P_PID, (id_t)p->pid, &si, WEXITED|WNOHANG|WNOWAIT) || si.si_pid) {
-            kill(-p->pid, SIGKILL);
+            sendsignal(p->pid, SIGKILL, 1);
         } else {
-            kill(p->pid, SIGUSR1);
-            kill(p->pid, SIGCONT);  // should something have stopped it
+            sendsignal(p->pid, SIGUSR1, 0);
+            sendsignal(p->pid, SIGCONT, 0);  // should something have stopped it
         }
+    } break;
     }
     os_unlock(&p->lock);
 }
@@ -1389,16 +1425,9 @@ enum : iz {
     REAP_SEEN  = 1<<12,  // descendants recorded (macOS)
 };
 
-struct ReapProc {
-    i32 pid;
-    i32 ppid;
-    i32 pgrp;
-    i32 sid;
-    i64 start;  // macOS: start time, microseconds
-};
-
 struct Reaper {
     i32      self;
+    i32      group;     // its own group, to signal at the end, or 0 (reapgroup)
     i32      tool;
     b32      reported;  // the tool's status went out on fd 4
     ReapProc seen[REAP_SEEN];
@@ -1432,7 +1461,40 @@ static void reapchildren(Reaper *r)
 }
 
 #if defined(__linux__)
-// Every live process, from /proc: pid, parent, group and session.
+// One live process from /proc, its pid, parent, group, session and start
+// time (reapstat), or a zero pid if gone, a zombie, or not to signal.
+static ReapProc reapproc(i64 pid)
+{
+    ReapProc r = {};
+    if (!signalable(pid)) {
+        return r;
+    }
+    char path[32] = "/proc/";
+    char digits[16];
+    iz   len = 6;
+    iz   n   = 0;
+    for (i64 v = pid; v; v /= 10) {
+        digits[n++] = (char)('0' + v%10);
+    }
+    while (n) {
+        path[len++] = digits[--n];
+    }
+    copybytes(path+len, (void *)"/stat", 6);
+    i32 fd = open(path, O_RDONLY|O_CLOEXEC);
+    if (fd < 0) {
+        return r;
+    }
+    char buf[512];
+    iz   got = read(fd, buf, sizeof(buf));
+    close(fd);
+    if (got <= 0) {
+        return r;
+    }
+    r = reapstat({(u8 *)buf, got});
+    return r.pid==pid ? r : ReapProc{};
+}
+
+// Every live process, from /proc.
 static iz reapscan(ReapProc *out, iz cap)
 {
     DIR *d = opendir("/proc");
@@ -1441,57 +1503,41 @@ static iz reapscan(ReapProc *out, iz cap)
     }
     iz n = 0;
     for (struct dirent *e; n<cap && (e = readdir(d));) {
-        if (e->d_name[0]<'1' || e->d_name[0]>'9') {
-            continue;
-        }
-        char path[64] = "/proc/";
-        iz   len      = 6;
-        for (iz i = 0; e->d_name[i] && len<48; i++) {
-            path[len++] = e->d_name[i];
-        }
-        copybytes(path+len, (void *)"/stat", 6);
-        i32 fd = open(path, O_RDONLY|O_CLOEXEC);
-        if (fd < 0) {
-            continue;
-        }
-        char buf[512];
-        iz   got = read(fd, buf, sizeof(buf)-1);
-        close(fd);
-        if (got <= 0) {
-            continue;
-        }
-        // "pid (comm) state ppid pgrp session ...", comm may hold anything
-        Str s     = {(u8 *)buf, got};
-        iz  paren = -1;
-        for (iz i = 0; i < s.len; i++) {
-            paren = s[i]==')' ? i : paren;
-        }
-        if (paren<0 || paren+2>=s.len) {
-            continue;
-        }
-        u8  state = s[paren+2];
-        i64 f[3]  = {};
-        iz  i     = paren + 3;
-        for (i32 k = 0; k < 3; k++) {
-            for (; i<s.len && s[i]==' '; i++) {}
-            iz j = i;
-            for (; j<s.len && digit(s[j]); j++) {}
-            f[k] = parseint(span(s.data+i, s.data+j)).val;
-            i = j;
-        }
         Int pid = parseint(Str{(u8 *)e->d_name, (iz)__builtin_strlen(e->d_name)});
-        if (!pid.ok || state=='Z' || state=='X') {
-            continue;
+        if (pid.ok) {
+            ReapProc p = reapproc(pid.val);
+            if (p.pid) {
+                out[n++] = p;
+            }
         }
-        ReapProc p = {};
-        p.pid  = (i32)pid.val;
-        p.ppid = (i32)f[0];
-        p.pgrp = (i32)f[1];
-        p.sid  = (i32)f[2];
-        out[n++] = p;
     }
     closedir(d);
     return n;
+}
+
+// Signal a process a scan found, if it is still the one found: the same
+// start time, read again after a pidfd takes hold of it, where the
+// kernel has them, so that no other process given its pid meanwhile can
+// get the signal; else just before the kill, which leaves a moment.
+static void reapsignalone(ReapProc *p, i32 sig)
+{
+    #if defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+    i32 fd = (i32)syscall(SYS_pidfd_open, p->pid, 0u);
+    if (fd<0 && errno==ESRCH) {
+        return;  // gone
+    } else if (fd >= 0) {
+        ReapProc now = reapproc(p->pid);
+        if (now.pid && now.start==p->start) {
+            syscall(SYS_pidfd_send_signal, fd, sig, (siginfo_t *)0, 0u);
+        }
+        close(fd);
+        return;
+    }
+    #endif
+    ReapProc now = reapproc(p->pid);
+    if (now.pid && now.start==p->start) {
+        sendsignal(p->pid, sig, 0);
+    }
 }
 
 static b32 ppidless(ReapProc *a, ReapProc *b)
@@ -1500,8 +1546,8 @@ static b32 ppidless(ReapProc *a, ReapProc *b)
 }
 
 // Signal what came from the tool: the reaper's descendants, everything
-// orphaned having come to it, and anything left in its session. Returns
-// how many were signaled.
+// orphaned having come to it, and anything left in its session, if it
+// leads one. Returns how many were found to signal.
 static iz reapsignal(Reaper *r, i32 sig)
 {
     static ReapProc procs[REAP_PROCS];
@@ -1539,8 +1585,8 @@ static iz reapsignal(Reaper *r, i32 sig)
 
     iz count = 0;
     for (iz i = 0; i < n; i++) {
-        if (procs[i].pid!=r->self && (mine[i] || procs[i].sid==r->self)) {
-            kill(procs[i].pid, sig);
+        if (reapmine(&procs[i], r->self, r->group, mine[i])) {
+            reapsignalone(&procs[i], sig);
             count++;
         }
     }
@@ -1593,7 +1639,7 @@ static void reapsnapshot(Reaper *r)
         i32 bytes  = proc_listpids(PROC_PPID_ONLY, (u32)parent, kids, sizeof(kids));
         for (iz i = 0; i < bytes/(iz)sizeof(i32); i++) {
             i32 pid = kids[i];
-            if (pid<=0 || reapknown(r, pid) || r->nseen==REAP_SEEN) {
+            if (!signalable(pid) || reapknown(r, pid) || r->nseen==REAP_SEEN) {
                 continue;
             }
             i64 start = reapstart(pid);
@@ -1608,23 +1654,30 @@ static void reapsnapshot(Reaper *r)
     }
 }
 
-// Signal what came from the tool: the descendants recorded, still the
-// same processes, and whatever is left in the reaper's session.
+// Signal what came from the tool: the descendants recorded, and what is
+// left in the reaper's session, if it leads one, each only while its
+// start time is still the one recorded, or listed. The session's are
+// found among this user's processes by getsid, since the kernel has no
+// KERN_PROC_SESSION to ask (ENOENT), and only descendants can be in it.
 static iz reapsignal(Reaper *r, i32 sig)
 {
     reapsnapshot(r);
     iz count = 0;
     for (iz i = 0; i < r->nseen; i++) {
         ReapProc *p = &r->seen[i];
-        if (p->start && reapstart(p->pid)==p->start) {
-            kill(p->pid, sig);
+        if (p->start && reapstart(p->pid)==p->start &&
+                reapmine(p, r->self, r->group, 1)) {
+            sendsignal(p->pid, sig, 0);
             count++;
         } else {
             p->start = 0;  // gone for good
         }
     }
 
-    i32 mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_SESSION, r->self};
+    if (!r->group) {
+        return count;
+    }
+    i32 mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_UID, (i32)getuid()};
     uz  len    = 0;
     if (sysctl(mib, 4, 0, &len, 0, 0) || !len) {
         return count;
@@ -1633,9 +1686,16 @@ static iz reapsignal(Reaper *r, i32 sig)
     struct kinfo_proc *kp = (struct kinfo_proc *)malloc(len);
     if (kp && !sysctl(mib, 4, kp, &len, 0, 0)) {
         for (iz i = 0; i < (iz)(len/sizeof(*kp)); i++) {
-            i32 pid = kp[i].kp_proc.p_pid;
-            if (pid!=r->self && kp[i].kp_proc.p_stat!=SZOMB) {
-                kill(pid, sig);
+            struct extern_proc *e = &kp[i].kp_proc;
+            ReapProc p = {};
+            p.pid   = e->p_pid;
+            p.start = (i64)e->p_starttime.tv_sec*1000000 + e->p_starttime.tv_usec;
+            if (e->p_stat==SZOMB || !signalable(p.pid)) {
+                continue;
+            }
+            p.sid = getsid(p.pid);
+            if (reapmine(&p, r->self, r->group, 0) && reapstart(p.pid)==p.start) {
+                sendsignal(p.pid, sig, 0);
                 count++;
             }
         }
@@ -1651,7 +1711,8 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
 
 // Kill everything that came from the tool, round after round, until a
 // round finds nothing left: processes forked meanwhile are found in the
-// next. Then the group, the reaper with it. Never returns.
+// next. Then its group, the reaper with it, if the group is its own.
+// Never returns.
 [[noreturn]] static void reapsweep(Reaper *r)
 {
     for (i32 round = 0; round < 50; round++) {
@@ -1661,14 +1722,25 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
         }
         reapnap(10);
     }
-    kill(0, SIGKILL);
+    if (r->group) {
+        sendsignal(r->group, SIGKILL, 1);
+    }
     _exit(1);
 }
 
 // The reaper process: see "Processes" above. Never returns.
 [[noreturn]] static void reap(i32 argc, char **argv)
 {
-    setsid();
+    // A session of its own, and so a group: the one it may signal. Should
+    // setsid fail, it is still in its parent's group, which it must never
+    // signal, so then it kills only the processes it finds of the tool's.
+    static Reaper r;  // large, and the reaper has only this one
+    r.self  = getpid();
+    i32 sid = setsid();
+    r.group = reapgroup(r.self, getpgrp(), sid<0 ? getsid(0) : sid);
+    if (!r.group) {
+        reapsay("cannot lead a session of its own", "");
+    }
     signal(SIGTERM, SIG_IGN);
     signal(SIGINT,  SIG_IGN);
     signal(SIGHUP,  SIG_IGN);
@@ -1739,8 +1811,6 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
     dup2(null, 1);
     dup2(null, 2);
 
-    static Reaper r;  // large, and the reaper has only this one
-    r.self = getpid();
     r.tool = pid;
     #ifdef __APPLE__
     i32 every = 250;  // ms between snapshots of the tree
@@ -1771,7 +1841,9 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
     }
 
     // Ask everything to stop, then sweep
-    kill(0, SIGTERM);
+    if (r.group) {
+        sendsignal(r.group, SIGTERM, 1);
+    }
     reapsignal(&r, SIGTERM);
     for (i32 i = 0; i < 200; i++) {
         reapnap(10);

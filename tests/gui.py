@@ -50,6 +50,7 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fake_provider  # noqa: E402
+import pids as P  # noqa: E402
 
 
 def e2econfig(url, model):
@@ -153,21 +154,12 @@ def bigfiles(host, prefix, n, lines):
 
 
 def alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return P.alive(pid)
 
 
 def readpid(path):
-    try:
-        with open(path) as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
-        return None
+    found = P.read(path)
+    return found[-1] if found else None
 
 
 def strays(marker):
@@ -189,7 +181,9 @@ def ours(pid, marker):
     """Whether pid, a plain integer above 1, is a process of this user's
     whose command line names marker (the run's own directory), checked
     right before it is signaled."""
-    if type(pid) is not int or pid <= 1:
+    try:
+        P.checked(pid)
+    except P.Refused:
         return False
     out = subprocess.run(["ps", "-ww", "-o", "uid=,args=", "-p", str(pid)],
                          capture_output=True, text=True).stdout.strip()
@@ -366,7 +360,7 @@ class Local:
         deadline = time.monotonic() + timeout
         # A GUI that hangs prints nothing more: end it at the deadline. Its
         # group is the new session started for it here.
-        killer = threading.Timer(timeout + 5, lambda: os.killpg(p.pid, signal.SIGKILL))
+        killer = threading.Timer(timeout + 5, lambda: P.signal_group(p, signal.SIGKILL))
         killer.start()
         try:
             for line in p.stdout:
@@ -389,7 +383,7 @@ class Local:
             killer.cancel()
         if p.poll() is None or p.returncode == -signal.SIGKILL:
             try:
-                os.killpg(p.pid, signal.SIGKILL)
+                P.signal_group(p, signal.SIGKILL)
             except OSError:
                 pass
             p.wait()
@@ -414,14 +408,11 @@ class Local:
     def strays(self):
         left = strays(self.root)
         for line in left:
-            try:
-                pid = int(line.split()[0])
-            except ValueError:
-                continue
-            if ours(pid, self.root):
+            found = P.parse(line.split()[0])
+            if found:
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
+                    P.signal_ours(found[0], signal.SIGKILL, lambda q: ours(q, self.root))
+                except (OSError, P.Refused):
                     pass
         return left
 
@@ -545,7 +536,8 @@ class Remote:
         r = self.h.ssh(f'powershell -NoProfile -Command "{ps}"')
         left = [l.strip() for l in r.stdout.splitlines() if l.strip()]
         for line in left:
-            self.h.ssh(f"taskkill /F /PID {line.split()[0]}")
+            for pid in P.parse(line.split()[0]):
+                self.h.killpid(pid)  # if still a process of the run's
         return left
 
     def close(self, keep):
@@ -610,17 +602,17 @@ def signals(args):
         pid = guipid(harness, state)
         if not pid:
             problems.append(f"{sig.name}: no GUI process")
-            os.killpg(p.pid, signal.SIGKILL)
+            P.signal_group(p, signal.SIGKILL)
             p.wait()
             continue
         t0 = time.monotonic()
-        os.kill(pid, sig)
+        P.signal_ours(pid, sig, lambda q: ours(q, state), "GUI")
         try:
             p.wait(timeout=5)
             print(f"{sig.name}: the idle GUI quit in {time.monotonic() - t0:.1f} s")
         except subprocess.TimeoutExpired:
             problems.append(f"{sig.name}: still running 5 s after the signal")
-            os.killpg(p.pid, signal.SIGKILL)
+            P.signal_group(p, signal.SIGKILL)
             p.wait()
         shutil.rmtree(root, ignore_errors=True)
     for msg in problems:
@@ -1068,8 +1060,8 @@ def main():
                     problems.append(f"no {name}.png")
     if args.mode == "enginestop":
         time.sleep(0.5)
-        text = host.read(host.path("work", "close.pid"))
-        pid = int(text.strip()) if text and text.strip().isdigit() else None
+        found = P.parse(host.read(host.path("work", "close.pid")))
+        pid = found[-1] if found else None
         if pid is None:
             problems.append("no close.pid")
         elif host.alive(pid):
@@ -1091,8 +1083,8 @@ def main():
         time.sleep(0.5)
         names = ("cancel", "close") + (("job",) if args.mode == "drive" else ())
         for name in names:
-            text = host.read(host.path("work", f"{name}.pid"))
-            pid = int(text.strip()) if text and text.strip().isdigit() else None
+            found = P.parse(host.read(host.path("work", f"{name}.pid")))
+            pid = found[-1] if found else None
             if pid is None:
                 problems.append(f"no {name}.pid")
             elif host.alive(pid):

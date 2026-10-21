@@ -1081,6 +1081,18 @@ def sc_doublefork(model, n, req):
         yield from answer(model, "Daemonized.")
 
 
+def sc_groupfork(model, n, req):
+    # Like doublefork, but into a process group of its own, which keeps
+    # it in the reaper's session, where the sweep finds it on macOS too
+    if n == 0:
+        cmd = ("perl -e 'use POSIX; exit if fork; setpgid(0, 0); exit if fork; "
+               "open(F, \">>tree.pids\"); print F \"$$\\n\"; close F; "
+               "sleep 300' >/dev/null 2>&1; sleep 0.5; echo forked")
+        yield from tool(model, n, "shell", {"command": cmd})
+    else:
+        yield from answer(model, "Forked into a group of its own.")
+
+
 # Subagents and roles. Several conversations share a model here, so a
 # script goes by the conversation (its system prompt, its first user
 # message, the tools it offers) and by its step within it, rather than

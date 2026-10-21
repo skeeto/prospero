@@ -50,6 +50,7 @@ import traceback
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fake_provider  # noqa: E402
+import pids as P  # noqa: E402
 from fake_provider import S, chunk, finish  # noqa: E402
 
 
@@ -445,11 +446,7 @@ def scenario(fn):
     return fn
 
 
-def psfield(pid, field):
-    """One ps field of a process, or "" if there is no such process."""
-    out = subprocess.run(["ps", "-ww", "-o", f"{field}=", "-p", str(pid)],
-                         capture_output=True, text=True).stdout
-    return out.strip()
+psfield = P.psfield
 
 
 def grandchild(pid, root):
@@ -458,7 +455,7 @@ def grandchild(pid, root):
     try:
         parent = int(psfield(pid, "ppid"))
         return parent > 1 and int(psfield(parent, "ppid")) == root
-    except ValueError:
+    except (ValueError, P.Refused):
         return False
 
 
@@ -466,28 +463,20 @@ def signal_ours(pid, sig, owned, what):
     """Signal a pid that came back from output or a file rather than from
     a spawn of our own: only a plain integer above 1 that owned(pid)
     confirms, right before the signal, to be a process of ours."""
-    if type(pid) is not int or pid <= 1:
-        raise Failure(f"refusing to signal {what} {pid!r}")
-    if not owned(pid):
-        raise Failure(f"refusing to signal {what} {pid}: not ours")
-    os.kill(pid, sig)
+    try:
+        P.signal_ours(pid, sig, owned, what)
+    except P.Refused as e:
+        raise Failure(str(e))
 
 
 def gone(pid, within=10.0):
-    if type(pid) is not int or pid <= 1:
-        raise Failure(f"not a pid to watch: {pid!r}")
+    try:
+        P.checked(pid, "pid to watch")
+    except P.Refused as e:
+        raise Failure(str(e))
     deadline = time.monotonic() + within
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)  # no signal: whether it exists
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            return False
-        # A zombie still answers
-        st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
-                            capture_output=True, text=True).stdout.strip()
-        if not st or st.startswith("Z"):
+        if not P.alive(pid):  # a zombie counts as gone
             return True
         time.sleep(0.1)
     return False
@@ -1167,11 +1156,8 @@ def fakessh(t):
 
 
 def sshpids(path):
-    try:
-        with open(path) as f:
-            return [int(x) for x in f.read().split()]
-    except OSError:
-        return []
+    """The pids the fake ssh wrote, one per line."""
+    return P.read(path)
 
 
 @scenario

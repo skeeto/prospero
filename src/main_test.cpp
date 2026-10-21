@@ -9,6 +9,7 @@
 #endif
 #include "harness.cpp"
 #include "wide.cpp"
+#include "reap.cpp"
 
 struct VFile {
     VFile *next;
@@ -483,6 +484,7 @@ static Str istr(Arena *a, i64 v)
 
 #include "test/base_test.cpp"
 #include "test/wide_test.cpp"
+#include "test/reap_test.cpp"
 #include "test/json_test.cpp"
 #include "test/sse_test.cpp"
 #include "test/ini_test.cpp"
@@ -524,6 +526,7 @@ int main()
 
     test_base(&t);
     test_wide(&t);
+    test_reap(&t);
     test_json(&t);
     test_sse(&t);
     test_ini(&t);
