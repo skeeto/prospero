@@ -803,6 +803,23 @@ def sc_long_path(model, n, req):
         yield from answer(model, "Gave up on those paths.")
 
 
+# A path inside the workspace past MAX_PATH, through directories with
+# names beyond Latin-1 (\\?\ paths and UTF-16 on Windows, XP included)
+DEEP = "/".join(f"ünïcødé-€-日本-{i}-" + "x" * 40
+                for i in range(6)) + "/f.txt"
+
+
+def sc_deep_unicode(model, n, req):
+    steps = [("write", {"path": DEEP, "content": "deep €\n"}),
+             ("edit", {"path": DEEP, "old_string": "deep", "new_string": "deeper"}),
+             ("read", {"path": DEEP}),
+             ("glob", {"pattern": "**/f.txt"})]
+    if n < len(steps):
+        yield from tool(model, n, *steps[n])
+    else:
+        yield from answer(model, "Wrote, edited and found it.")
+
+
 def sc_steer_tool(model, n, req):
     # One step: a command, then a write outside that asks; the user steers
     # while the command runs, and the agent does what the steer says

@@ -452,8 +452,13 @@ static void testrealpaths(ProcTest *p, Arena scratch)
     Str   log = join(&scratch, p->dir, "links.log");
     Proc *pr  = spawnsh(p, scratch, cmd, log, 1<<16);
     ProcWatch w = {};
-    if (!check(t, pr && procwatch(os, p->mb, p->id, &w, 10000) && !w.code,
-               "links made by the shell")) {
+    b32 made = pr && procwatch(os, p->mb, p->id, &w, 10000) && !w.code;
+    if (!made && win && find(os_read(os, &scratch, log, 1<<12).data, "'mklink'")>=0) {
+        // Windows XP: no mklink, and no way to resolve a junction either
+        say(os, "no mklink (Windows XP): real paths skipped");
+        if (pr) os_procfree(os, pr);
+        return;
+    } else if (!check(t, made, "links made by the shell")) {
         say(os, os_read(os, &scratch, log, 1<<12).data);
         if (pr) os_procfree(os, pr);
         return;
@@ -575,11 +580,26 @@ static void testhttp(Selftest *t, Arena *perm, Arena scratch, Str base)
     u64      id = 1000;
     if (!check(t, mb!=0, "newmailbox")) return;
 
-    // Throughput: 100 MiB of body
+    // Throughput: 100 MiB of body over loopback, else 8 MiB, since the
+    // provider may be across a slow network (Windows XP: no listening)
     {
+        Url u = parseurl(base);
+        u8  ip[4];
+        b32 loop = equalfold(u.host, "localhost") || u.host=="[::1]" ||
+                   (ipv4(u.host, ip) && ip[0]==127);
+        i64 mib  = loop ? 100 : 8;
+        Buf url(&scratch, base.len + 64);
+        print(&url, base);
+        print(&url, "/fake/bytes?n=");
+        print(&url, mib<<20);
+        Buf what(&scratch, 64);
+        print(&what, mib);
+        print(&what, " MiB");
+        Str size = finish(&what);
+
         HttpReq r = {};
         r.method    = "GET";
-        r.url       = concat(&scratch, base, "/fake/bytes?n=104857600");
+        r.url       = finish(&url);
         r.connectms = 5000;
         r.maxbytes  = (i64)200 << 20;
         r.mbox      = mb;
@@ -588,12 +608,14 @@ static void testhttp(Selftest *t, Arena *perm, Arena scratch, Str base)
         Http *h  = os_http(os, &r, scratch);
         if (check(t, h!=0, "os_http")) {
             HttpWatch w = {};
-            check(t, httpwatch(os, mb, id, &w, 60000, &scratch), "100 MiB arrives");
+            check(t, httpwatch(os, mb, id, &w, 60000, &scratch),
+                  concat(&scratch, size, " arrives"));
             i64 dt = os_ticks(os) - t0;
-            check(t, w.status==200 && !w.err && w.bytes==(i64)100<<20,
-                  "100 MiB body intact");
+            check(t, w.status==200 && !w.err && w.bytes==mib<<20,
+                  concat(&scratch, size, " body intact"));
             os_httpfree(os, h);
-            report(os, scratch, "100 MiB over HTTP in", millis(dt), 0, " ms");
+            Str label = concat(&scratch, size, " over HTTP in");
+            report(os, scratch, label, millis(dt), 0, " ms");
         }
     }
 
