@@ -102,8 +102,12 @@ static void test_edit(Test *t)
         expect(t, "lines no newline", rep(a, "a\nb  \nc\n", "b\nc", "", 0), "a\n\n");
         expect(t, "lines newline", rep(a, "a\nb  \nc\nd\n", "b\nc\n", "", 0), "a\nd\n");
         // CRLF files get CRLF lines, and keep their BOM
+        // (one line indented alike, one not: a tie, so as given)
         expect(t, "crlf added", rep(a, "\xef\xbb\xbf" "a\r\n  b\r\nc\r\n", "a\nb \n", "a\nB\nB2\n", 0),
-               "\xef\xbb\xbf" "a\r\n  B\r\n  B2\r\nc\r\n");
+               "\xef\xbb\xbf" "a\r\nB\r\nB2\r\nc\r\n");
+        expect(t, "crlf reindented", rep(a, "\xef\xbb\xbf" "a\r\n  b\r\n  c\r\n", "b\nc \n",
+                                         "b\nB2\nc\n", 0),
+               "\xef\xbb\xbf" "a\r\n  b\r\n  B2\r\n  c\r\n");
     }
 
     // Ambiguity is shown, never guessed
@@ -237,7 +241,10 @@ static void test_edit(Test *t)
                                 "*** End of File\n*** End Patch\n```");
         expect(t, "patch fence", q.err, Str{});
         expect(t, "patch no ctx", istr(a, !q.files[0].hunks[0].ctx.data && q.files[0].hunks[0].eof), "1");
-        expect(t, "patch no begin", parsepatch(a, "*** Update File: a\n-x\n").err,
+        Patch ne = parsepatch(a, "\n*** Update File: a\n-x\n+y\n\n```\n");
+        expect(t, "patch no envelope", concat(a, ne.err, istr(a, ne.files.len ?
+               ne.files[0].hunks[0].lines.len : -1)), "2");
+        expect(t, "patch no begin", parsepatch(a, "x = 1\n-x\n").err,
                "it does not start with a line \"*** Begin Patch\"");
         expect(t, "patch no end", parsepatch(a, "*** Begin Patch\n*** Update File: a\n-x\n").err,
                "it does not end with a line \"*** End Patch\"");
@@ -301,6 +308,11 @@ static void test_edit(Test *t)
                                    "+    a = 2\n*** End Patch");
         expect(t, "hunk ctx missing", istr(a, startswith(ctx, "!hunk 1 of f.c (patch line 3): the line "
                                                          "after @@, \"def h():\", was not found")), "1");
+        // A kept line that lost its marker space looks indented one less:
+        // the line added keeps its own indentation (seen from qwen)
+        expect(t, "hunk lost space", patchrun(a, "  a\n  b\n  c\n", "*** Begin Patch\n"
+                                                 "*** Update File: f.c\n@@\n   a\n+  x\n  b\n*** End Patch"),
+               "  a\n  x\n  b\n  c\n");
         // The line to change given after @@ as well (seen from qwen-flash)
         expect(t, "hunk at its @@", patchrun(a, src, "*** Begin Patch\n*** Update File: f.c\n"
                                                      "@@     b = 2\n-    b = 2\n+    b = 3\n*** End Patch"),

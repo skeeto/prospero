@@ -521,8 +521,10 @@ static Slice<Near> nearby(Arena *a, Slice<Str> have, Slice<Str> want, i64 least)
 // Changing lines
 
 // The indentation of old text as the agent gave it (from) and as the
-// file has it (to), from the first line of old text indented otherwise
-// than the file's, for the lines the agent adds.
+// file has it (to), for the lines the agent adds: the pair most of the
+// old lines with something on them have, the same on both sides if that
+// ties, else the first. A vote, because one line can mislead: a patch's
+// kept line that lost its marker space looks indented one space less.
 struct Indent {
     Str from;
     Str to;
@@ -530,14 +532,23 @@ struct Indent {
 
 static Indent indentpair(Slice<Str> old, Slice<Str> file, iz at)
 {
-    Indent r = {};
-    for (iz k = 0; k < old.len; k++) {
+    Indent r    = {};
+    iz     best = 0;
+    iz     m    = old.len<200 ? old.len : 200;  // enough voters
+    for (iz k = 0; k < m; k++) {
+        if (!trim(old[k]).len) continue;
         Str from = indentof(old[k]);
         Str to   = indentof(bare(file[at+k]));
-        if (trim(old[k]).len && from!=to) {
+        iz  n    = 0;
+        for (iz j = 0; j < m; j++) {
+            n += trim(old[j]).len && indentof(old[j])==from &&
+                 indentof(bare(file[at+j]))==to;
+        }
+        b32 same = from == to;
+        if (n>best || (n==best && same && r.from!=r.to)) {
             r.from = from;
             r.to   = to;
-            break;
+            best   = n;
         }
     }
     return r;
@@ -1273,8 +1284,18 @@ static Patch parsepatch(Arena *a, Str text)
         end = l=="*** End Patch" ? i : end;
     }
     if (beg < 0) {
-        r.err = "it does not start with a line \"*** Begin Patch\"";
-        return r;
+        // Without the envelope: forgiven when a file's header comes first
+        iz first = 0, last = lines.len;
+        for (; first<lines.len && patchwrap(lines[first]); first++) {}
+        for (; last>first && patchwrap(lines[last-1]); last--) {}
+        Str hd = first<lines.len ? trim(lines[first]) : Str{};
+        if (!startswith(hd, "*** Add File:") && !startswith(hd, "*** Delete File:") &&
+                !startswith(hd, "*** Update File:")) {
+            r.err = "it does not start with a line \"*** Begin Patch\"";
+            return r;
+        }
+        beg = first - 1;
+        end = end>first ? end : last;
     } else if (end < beg) {
         r.err = "it does not end with a line \"*** End Patch\"";
         return r;
