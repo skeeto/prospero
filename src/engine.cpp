@@ -2172,14 +2172,15 @@ static SnapPre snapbefore(Session *s, Arena scratch, Str path)
     return r;
 }
 
-// After the tool: log the change it made (wrote), or drop the copy.
-static void snapafter(Session *s, Arena scratch, Str path, SnapPre *pre, Str wrote)
+// After the tool: log the change it made (wrote, or the file is gone),
+// or drop the copy.
+static void snapafter(Session *s, Arena scratch, Str path, SnapPre *pre, Str wrote, b32 gone)
 {
     Os *os   = s->e->os;
     Str name = snapname(&scratch, pre->n);
     if (!pre->n) {
         return;
-    } else if (!wrote.data) {
+    } else if (!wrote.data && !gone) {
         if (pre->existed) {
             Str file = join(&scratch, s->dir, name);
             os_remove(os, scratch, file);
@@ -2188,7 +2189,7 @@ static void snapafter(Session *s, Arena scratch, Str path, SnapPre *pre, Str wro
     }
     Block *c      = &s->calls[s->callidx];
     Str    before = pre->existed ? hashstr(&scratch, pre->before) : Str("");
-    Str    after  = hashstr(&scratch, hash(wrote));
+    Str    after  = gone ? Str("") : hashstr(&scratch, hash(wrote));
     {
         Arena a = scratch;
         Buf   b(&a, 512 + path.len);
@@ -2346,6 +2347,96 @@ static void instrcheck(Session *s, Arena scratch)
 
 static b32 startsearch(Session *, Arena, i32 tool, Str path, Args *);
 
+// The files a patch names, judged by the guard: those outside the roots,
+// unless the user allowed one, to be asked about (out), and at most one
+// such (many is set).
+struct PatchGuard {
+    GuardPath out;
+    b32       many;
+};
+
+static PatchGuard patchguard(Session *s, Arena *a, Patch *p, Str allowed)
+{
+    PatchGuard r = {};
+    for (iz i = 0; i < p->files.len; i++) {
+        PatchFile *f = &p->files[i];
+        for (i32 k = 0; k < 2; k++) {
+            Str want = k ? f->to : f->path;
+            if (!want.data) continue;
+            GuardPath g = guardpath(s->e->os, a, &s->guard, want, 0);
+            if (k) {
+                f->fileto = g.path;
+            } else {
+                f->file = g.path;
+            }
+            if (g.inside || g.path==allowed || g.path==r.out.path) {
+                continue;
+            } else if (r.out.path.data) {
+                r.many = 1;
+            }
+            r.out = g;
+        }
+    }
+    return r;
+}
+
+// edit as a patch: change, with snapshots, every file the patch names,
+// all inside the roots but the one the user may have allowed. Each
+// change is worked out before any is made.
+static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
+{
+    Engine    *e  = s->e;
+    Patch     *p  = &args->patch;
+    PatchGuard pg = patchguard(s, &scratch, p, allowed);
+    if (pg.out.path.data) {
+        Str text = concat(&scratch, "Not run: the patch changes a file "
+                          "outside the working directory that was not "
+                          "allowed: ", pg.out.path);
+        toolend(s, scratch, "denied", text, 0, 0, {}, 0);
+        return;
+    }
+    PatchPlan plan = planpatch(e->os, &scratch, s->guard.cwd, p);
+    if (!plan.ok) {
+        toolend(s, scratch, "error", plan.text, 0, 0, {}, 0);
+        return;
+    }
+    iz made = 0;
+    for (; made < plan.changes.len; made++) {
+        FileChange *c   = &plan.changes[made];
+        SnapPre     pre = snapbefore(s, scratch, c->path);
+        b32         ok  = 0;
+        if (c->data.data) {
+            Str dir = parentdir(c->path);
+            ok = (!dir.len || os_stat(e->os, scratch, dir).type==STAT_DIR ||
+                  os_mkdirs(e->os, scratch, dir)) &&
+                 os_write(e->os, scratch, c->path, c->data);
+        } else {
+            ok = os_remove(e->os, scratch, c->path);
+        }
+        snapafter(s, scratch, c->path, &pre, ok ? c->data : Str{}, ok && !c->data.data);
+        if (!ok) {
+            break;
+        }
+        instrlazy(s, scratch, c->path);
+    }
+    if (made < plan.changes.len) {
+        Buf b(&scratch, 512);
+        print(&b, "The patch was applied only in part: ");
+        print(&b, showpath(s->guard.cwd, plan.changes[made].path));
+        print(&b, plan.changes[made].data.data ? Str(" could not be written")
+                                               : Str(" could not be removed"));
+        print(&b, made ? Str(", after these were changed: ") : Str(", and nothing else was changed."));
+        for (iz i = 0; i < made; i++) {
+            print(&b, i ? Str(", ") : Str(""));
+            print(&b, showpath(s->guard.cwd, plan.changes[i].path));
+        }
+        print(&b, made ? Str(". Read them before you go on.") : Str(""));
+        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+        return;
+    }
+    toolend(s, scratch, "ok", plan.text, 0, 0, {}, 0);
+}
+
 // A path tool on a path the guard allowed, or the user did. Returns 1
 // if the call finished, 0 if it goes on (a search).
 static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
@@ -2357,16 +2448,23 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     ToolOut o    = {};
     Str     ncwd = s->guard.cwd;  // as normalized paths
     SnapPre pre  = {};
+    b32     hl   = s->te.edit == EDIT_HASHLINE;
+    if (tool==TOOL_EDIT && s->te.edit==EDIT_PATCH) {
+        runpatch(s, scratch, args, path);
+        return 1;
+    }
     if (tool==TOOL_WRITE || tool==TOOL_EDIT) {
         pre = snapbefore(s, scratch, path);
     }
     switch (tool) {
-    case TOOL_READ:  o = toolread(e->os, &scratch, ncwd, path, args);  break;
-    case TOOL_WRITE: o = toolwrite(e->os, &scratch, ncwd, path, args); break;
-    case TOOL_EDIT:  o = tooledit(e->os, &scratch, ncwd, path, args);  break;
+    case TOOL_READ:  o = toolread(e->os, &scratch, ncwd, path, args, hl); break;
+    case TOOL_WRITE: o = toolwrite(e->os, &scratch, ncwd, path, args);    break;
+    case TOOL_EDIT:  o = hl ? toolhash(e->os, &scratch, ncwd, path, args)
+                            : tooledit(e->os, &scratch, ncwd, path, args);
+                     break;
     }
     if (tool==TOOL_WRITE || tool==TOOL_EDIT) {
-        snapafter(s, scratch, path, &pre, o.wrote);
+        snapafter(s, scratch, path, &pre, o.wrote, 0);
     }
     if (o.ok) {
         instrlazy(s, scratch, path);
@@ -2413,7 +2511,7 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note)
 
     toolstart(s, scratch);
     if (allow) {
-        Args args = parseargs(&scratch, k->tool, c->args);
+        Args args = parseargs(&scratch, k->tool, c->args, s->te.edit);
         runfile(s, scratch, k->tool, k->gp.path, &args);
         return;
     } else if (by == DENY_CANCEL) {
@@ -3337,12 +3435,28 @@ static b32 runtool(Session *s, Arena scratch)
     if (!tooloffered(&s->te, tool)) {
         tool = TOOL_NONE;  // one the role leaves out is unknown
     } else {
-        args = parseargs(&scratch, tool, c->args);
+        args = parseargs(&scratch, tool, c->args, s->te.edit);
     }
 
     // The guard comes first: a path it questions is asked about before
     // the call starts. A search without a path searches the working
-    // directory.
+    // directory. A patch may change files outside the roots only when it
+    // names one such file, which is asked about.
+    if (!s->blocked && tool==TOOL_EDIT && s->te.edit==EDIT_PATCH && !args.issues.len) {
+        PatchGuard pg = patchguard(s, &scratch, &args.patch, {});
+        if (pg.many) {
+            toolstart(s, scratch);
+            toolend(s, scratch, "denied", "Not run: the patch changes more than "
+                    "one file outside the working directory. Change each of "
+                    "them with a patch of its own, so that each can be "
+                    "allowed.", 0, 0, {}, 0);
+            return 1;
+        } else if (pg.out.path.data) {
+            return askcall(s, scratch, tool, &pg.out);
+        }
+        toolstart(s, scratch);
+        return runfile(s, scratch, tool, s->guard.cwd, &args);
+    }
     if (!s->blocked && tool!=TOOL_NONE && toolhaspath(tool) && !args.issues.len) {
         Str       want = args.path.data ? args.path : Str(".");
         GuardPath g    = guardpath(e->os, &scratch, &s->guard, want, toolreads(tool));
@@ -4137,6 +4251,7 @@ static void modelconf(Engine *e, Arena *perm, Str model, ModelConf *mc)
     mc->ctx = ctx.ok && ctx.val>0 ? ctx.val : 0;
     Int rb  = parseint(trim(cfgget(cfg, "model", model, "reasoning_budget", 0)));
     mc->thinkmax = rb.ok && rb.val>0 ? rb.val : 0;
+    mc->edit     = editformat(cfgget(cfg, "model", model, "edit_format", 0));
 }
 
 static Session *newsession(Engine *e, Arena scratch, Str sid)
@@ -4357,8 +4472,9 @@ static Str opensession(Session *s, Arena scratch)
 }
 
 // The session record, always seq 1. A role's prompt and tools are kept
-// in it, and a subagent's parent, so that the session is the same when
-// it is opened again, whatever the configuration says then.
+// in it, a subagent's parent, and the edit tool's format unless it is
+// replace, so that the session is the same when it is opened again,
+// whatever the configuration says then.
 static void logsession(Session *s, Arena scratch)
 {
     Buf   b(&scratch, 1024 + s->rolepr.len);
@@ -4394,6 +4510,9 @@ static void logsession(Session *s, Arena scratch)
     }
     if (s->rolepr.len) {
         putstrkey(&w.json, "prompt", s->rolepr);
+    }
+    if (s->te.edit != EDIT_REPLACE) {
+        putstrkey(&w.json, "edit_format", editnames[s->te.edit]);
     }
     ssend(s, &w);
 }
@@ -4593,6 +4712,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->model = clone(&s->perm, model);
     endpointconf(e, &s->perm, which, &s->ep);
     modelconf(e, &s->perm, s->model, &s->mc);
+    s->te.edit = s->mc.edit;
     s->role    = clone(&s->perm, r.name);
     s->rolepr  = clone(&s->perm, r.prompt);
     s->depth   = p->depth + 1;
@@ -4636,7 +4756,7 @@ static void starttasks(Session *s, Arena scratch)
         TaskRun t = {};
         t.call  = k;
         t.start = os_ticks(e->os);
-        Args     args = parseargs(&a, TOOL_TASK, s->calls[k].args);
+        Args     args = parseargs(&a, TOOL_TASK, s->calls[k].args, s->te.edit);
         Session *c    = 0;
         if (args.issues.len) {
             t.text = argserror(&s->perm, "task", s->calls[k].args, &args);
@@ -5016,6 +5136,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     }
     endpointconf(e, &s->perm, which, &s->ep);
     modelconf(e, &s->perm, model, &s->mc);
+    s->te.edit = s->mc.edit;
 
     Str why = opensession(s, scratch);
     if (why.data) {
@@ -5247,6 +5368,8 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 }
                 s->te.deny = (((u32)1<<TOOL_COUNT) - 1) & ~have;
             }
+            // Its edit format as it began: absent, the first one
+            s->te.edit = editformat(jsonstr(jsonget(j, "edit_format")));
         } break;
         case EV_TITLE:
             s->title = clone(&s->perm, jsonstr(jsonget(j, "text")));

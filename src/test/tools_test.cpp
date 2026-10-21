@@ -3,7 +3,7 @@
 
 static Str argsshow(Arena *a, i32 tool, Str raw)
 {
-    Args r = parseargs(a, tool, raw);
+    Args r = parseargs(a, tool, raw, EDIT_REPLACE);
     Buf  b(a, 256);
     for (iz i = 0; i < r.issues.len; i++) {
         print(&b, r.issues[i]);
@@ -121,7 +121,7 @@ static void test_tools(Test *t)
                "pattern: required string is missing; ");
         {
             Args g = parseargs(a, TOOL_GREP, "{\"pattern\":\"a\",\"path\":\"\","
-                                             "\"ignore_case\":1,\"literal\":\"true\"}");
+                                             "\"ignore_case\":1,\"literal\":\"true\"}", EDIT_REPLACE);
             expect(t, "grep args", istr(a, !g.issues.len && !g.path.data && g.ignorecase &&
                                            g.literal), "1");
         }
@@ -138,7 +138,7 @@ static void test_tools(Test *t)
                "status; ");
         {
             Args d = parseargs(a, TOOL_TODO, "{\"todos\":\"[{\\\"content\\\":\\\"x\\\","
-                                             "\\\"status\\\":\\\"completed\\\"}]\"}");
+                                             "\\\"status\\\":\\\"completed\\\"}]\"}", EDIT_REPLACE);
             expect(t, "todo as a string", istr(a, d.todos.len*10 + d.todos[0].status), "12");
         }
         expect(t, "job_output job", argsshow(a, TOOL_JOBOUT, "{\"from\":\"middle\",\"lines\":9999}"),
@@ -158,7 +158,7 @@ static void test_tools(Test *t)
         expect(t, "not an object", argsshow(a, TOOL_WRITE, "[1]"),
                "the arguments are not a valid JSON object; ");
 
-        Args bad = parseargs(a, TOOL_READ, "{}");
+        Args bad = parseargs(a, TOOL_READ, "{}", EDIT_REPLACE);
         Str  err = argserror(a, "read", "{}", &bad);
         expect(t, "argserror says how", istr(a, find(err, "Invalid arguments for tool \"read\"")==0 &&
                                                 find(err, "call the tool again")>0), "1");
@@ -183,14 +183,14 @@ static void test_tools(Test *t)
         // task: description is forgiven, the prompt is not
         Args ta = parseargs(a, TOOL_TASK, "{\"description\":\" Find it \","
                             "\"prompt\":\"Find the parser\",\"role\":\"explore\","
-                            "\"model\":\"\"}");
+                            "\"model\":\"\"}", EDIT_REPLACE);
         expect(t, "task args", concat(a, concat(a, concat(a, ta.desc, "|"), ta.prompt),
                concat(a, concat(a, "|", ta.role), concat(a, "|", istr(a, !ta.model.data)))),
                "Find it|Find the parser|explore|1");
         expect(t, "task no issues", istr(a, ta.issues.len), "0");
-        Args tb = parseargs(a, TOOL_TASK, "{\"prompt\":\"  \"}");
+        Args tb = parseargs(a, TOOL_TASK, "{\"prompt\":\"  \"}", EDIT_REPLACE);
         expect(t, "task empty prompt", istr(a, tb.issues.len), "1");
-        Args tc = parseargs(a, TOOL_TASK, "{\"description\":\"x\"}");
+        Args tc = parseargs(a, TOOL_TASK, "{\"description\":\"x\"}", EDIT_REPLACE);
         expect(t, "task no prompt", tc.issues.len ? tc.issues[0] : Str{},
                "prompt: required string is missing");
     }
@@ -238,27 +238,27 @@ static void test_tools(Test *t)
 
         Args r = {};
         os_write(os, *a, "/w/r.txt", "first\r\nsecond\nthird");
-        ToolOut o = toolread(os, a, "/w", "/w/r.txt", &r);
+        ToolOut o = toolread(os, a, "/w", "/w/r.txt", &r, 0);
         expect(t, "read numbered", o.text, "     1\tfirst\n     2\tsecond\n     3\tthird\n");
         r.offset = 2;
         r.limit  = 1;
-        o = toolread(os, a, "/w", "/w/r.txt", &r);
+        o = toolread(os, a, "/w", "/w/r.txt", &r, 0);
         expect(t, "read window", o.text,
                "     2\tsecond\n[Showing lines 2-2 of 3. To read more, call read with offset=3.]\n");
         r.offset = 9;
-        o = toolread(os, a, "/w", "/w/r.txt", &r);
+        o = toolread(os, a, "/w", "/w/r.txt", &r, 0);
         expect(t, "read past the end", o.text, "The file has only 3 lines, so offset 9 is past its end.");
         Args none = {};
         os_write(os, *a, "/w/bin", Str{(u8 *)"a\0b", 3});
-        o = toolread(os, a, "/w", "/w/bin", &none);
+        o = toolread(os, a, "/w", "/w/bin", &none, 0);
         expect(t, "read binary", istr(a, !o.ok && startswith(o.text, "This is a binary file")), "1");
         Buf longline(a, 5000);
         for (i32 i = 0; i < 2500; i++) putbyte(&longline, 'x');
         os_write(os, *a, "/w/long.txt", finish(&longline));
-        o = toolread(os, a, "/w", "/w/long.txt", &none);
+        o = toolread(os, a, "/w", "/w/long.txt", &none, 0);
         expect(t, "read long line", istr(a, endswith(o.text, "... [line truncated]\n")), "1");
         os_write(os, *a, "/w/note.txt", "x");
-        o = toolread(os, a, "/w", "/w/nope.txt", &none);
+        o = toolread(os, a, "/w", "/w/nope.txt", &none, 0);
         expect(t, "read suggests", o.text, "File not found: nope.txt. Did you mean: note.txt");
 
         Args w = {};
@@ -266,6 +266,76 @@ static void test_tools(Test *t)
         w.content = "a\nb\n";
         o = toolwrite(os, a, "/w", w.path, &w);
         expect(t, "write", o.text, "Created sub/dir/out.txt (4 bytes, 2 lines).");
+
+        // hashline: read shows the tag, and edit checks it
+        os_write(os, *a, "/w/h.txt", "one\ntwo\n");
+        Str tag = filetag(a, "one\ntwo\n");
+        o = toolread(os, a, "/w", "/w/h.txt", &none, 1);
+        expect(t, "read tagged", o.text, concat(a, concat(a, "[h.txt#", tag),
+                                                "]\n     1\tone\n     2\ttwo\n"));
+        os_write(os, *a, "/w/e.txt", "");
+        o = toolread(os, a, "/w", "/w/e.txt", &none, 1);
+        expect(t, "read tagged empty", o.text, concat(a, concat(a, "[e.txt#", filetag(a, "")),
+                                                      "]\n(empty file)"));
+        Str  hraw = concat(a, concat(a, "{\"path\":\"h.txt\",\"tag\":\"", tag),
+                           "\",\"edits\":[{\"op\":\"replace\",\"line\":2,\"text\":\"TWO\"}]}");
+        Args h    = parseargs(a, TOOL_EDIT, hraw, EDIT_HASHLINE);
+        expect(t, "hashline args", istr(a, h.issues.len*10 + h.hedits.len), "1");
+        o = toolhash(os, a, "/w", "/w/h.txt", &h);
+        expect(t, "hashline edit", concat(a, istr(a, o.ok), vread(os, a, "/w/h.txt")), "1one\nTWO\n");
+        o = toolhash(os, a, "/w", "/w/h.txt", &h);
+        expect(t, "hashline stale", istr(a, !o.ok && find(o.text, "does not match h.txt")>0), "1");
+        o = toolhash(os, a, "/w", "/w/nope.txt", &h);
+        expect(t, "hashline missing", istr(a, endswith(o.text, "To create a file, use write.")), "1");
+        Args hb = parseargs(a, TOOL_EDIT, "{\"path\":\"h\",\"tag\":\"x\",\"edits\":["
+                            "{\"op\":\"move\",\"line\":1},{\"op\":\"insert\",\"line\":-1,\"text\":\"\"},"
+                            "{\"op\":\"replace\",\"line\":3,\"end\":2,\"text\":\"\"},"
+                            "{\"op\":\"insert\",\"line\":1}]}", EDIT_HASHLINE);
+        expect(t, "hashline bad args", argserror(a, "edit", "{}", &hb),
+               "Invalid arguments for tool \"edit\", so it was not run:\n"
+               "- edits[0]: op must be replace, insert or delete\n"
+               "- edits[1]: line must be 0 or more: the line to insert after\n"
+               "- edits[2]: end must not be before line\n"
+               "- edits[3]: text is required for replace and insert\n"
+               "Arguments received: {}\nUpdate the arguments and call the tool again.");
+        Args hc = parseargs(a, TOOL_EDIT, "{\"path\":\"h\",\"tag\":\"x\",\"edits\":"
+                            "\"{\\\"op\\\":\\\"delete\\\",\\\"line\\\":\\\"2\\\"}\"}", EDIT_HASHLINE);
+        expect(t, "hashline forgiving", istr(a, hc.issues.len*100 + hc.hedits.len*10 +
+                                             hc.hedits[0].end), "12");
+
+        // patch: every file is worked out before any changes
+        os_write(os, *a, "/w/p.c", "int x = 1;\nint y = 2;\n");
+        os_write(os, *a, "/w/gone.c", "bye\n");
+        Args pa = parseargs(a, TOOL_EDIT, "{\"patch\":\"*** Begin Patch\\n*** Update File: p.c\\n"
+                            "*** Move to: q.c\\n@@\\n int x = 1;\\n-int y = 2;\\n+int y = 3;\\n"
+                            "*** Delete File: gone.c\\n*** Add File: new/n.c\\n+fresh\\n"
+                            "*** End Patch\"}", EDIT_PATCH);
+        expect(t, "patch args", istr(a, pa.issues.len*10 + pa.patch.files.len), "3");
+        Str files[][2] = {{"/w/p.c", "/w/q.c"}, {"/w/gone.c", {}}, {"/w/new/n.c", {}}};
+        for (iz i = 0; i < countof(files); i++) {
+            pa.patch.files[i].file   = files[i][0];
+            pa.patch.files[i].fileto = files[i][1];
+        }
+        PatchPlan plan = planpatch(os, a, "/w", &pa.patch);
+        expect(t, "patch plan", plan.text, "Applied the patch: moved p.c to q.c, deleted gone.c, "
+                                           "added new/n.c.");
+        expect(t, "patch changes", istr(a, plan.changes.len), "4");
+        expect(t, "patch move to", plan.changes[0].data, "int x = 1;\nint y = 3;\n");
+        expect(t, "patch move from", istr(a, plan.changes[1].path=="/w/p.c" &&
+                                             !plan.changes[1].data.data), "1");
+        expect(t, "patch nothing yet", vread(os, a, "/w/p.c"), "int x = 1;\nint y = 2;\n");
+        pa.patch.files[1].file = "/w/none.c";
+        plan = planpatch(os, a, "/w", &pa.patch);
+        expect(t, "patch all or nothing", istr(a, !plan.ok &&
+                                                  startswith(plan.text, "The patch was not applied, "
+                                                  "and no file was changed: *** Delete File: File "
+                                                  "not found: none.c")), "1");
+        Args pb = parseargs(a, TOOL_EDIT, "{\"input\":\"*** Begin Patch\\n*** End Patch\"}", EDIT_PATCH);
+        expect(t, "patch bad args", pb.issues.len ? pb.issues[0] : Str{},
+               "patch: not a valid patch: it changes no files");
+        Args pc = parseargs(a, TOOL_EDIT, "{\"path\":\"x\"}", EDIT_PATCH);
+        expect(t, "patch missing", pc.issues.len ? pc.issues[0] : Str{},
+               "patch: required string is missing");
     }
 
     // The shell
@@ -325,6 +395,33 @@ static void test_tools(Test *t)
         Json *todo = jsonget(jsonget(jsonat(d.root, TOOL_TODO), "function"), "parameters");
         Json *item = jsonget(jsonget(jsonget(todo, "properties"), "todos"), "items");
         expect(t, "todo schema", jsonstr(jsonget(item, "type")), "object");
+
+        // The edit tool in each format: its own parameters
+        static Str const want[] = {
+            "path old_string new_string replace_all ", "patch ", "path tag edits ",
+        };
+        for (i32 f = 0; f < EDIT_COUNT; f++) {
+            ToolEnv ef = te;
+            ef.edit = f;
+            JsonDoc e  = jsonparse(a, tooljson(a, &ef));
+            Json   *pp = jsonget(jsonget(jsonget(jsonat(e.root, TOOL_EDIT), "function"),
+                                         "parameters"), "properties");
+            Buf ps(a, 64);
+            for (Json *p = pp->child; p; p = p->next) {
+                print(&ps, p->key);
+                putbyte(&ps, ' ');
+            }
+            expect(t, "edit schema", concat(a, istr(a, e.ok), finish(&ps)), concat(a, "1", want[f]));
+        }
+        {
+            ToolEnv ef = te;
+            ef.edit = EDIT_HASHLINE;
+            JsonDoc e  = jsonparse(a, tooljson(a, &ef));
+            Json   *ed = jsonget(jsonget(jsonget(jsonget(jsonat(e.root, TOOL_EDIT), "function"),
+                                         "parameters"), "properties"), "edits");
+            Json   *op = jsonget(jsonget(jsonget(ed, "items"), "properties"), "op");
+            expect(t, "hashline ops", istr(a, jsonlen(jsonget(op, "enum"))), "3");
+        }
 
         // A role's tools only, and the task tool's roles
         te.deny     = tooldeny("read glob task");

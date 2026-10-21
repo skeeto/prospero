@@ -192,6 +192,10 @@ static CfgKey cfgschema[] = {
     {"model", "reasoning_budget", CFG_INT, "", {}, {}, "model",
      "Most reasoning tokens in a response before the model is told to "
      "answer"},
+    {"model", "edit_format", CFG_ENUM, "replace", {}, "replace patch hashline",
+     "model", "How the model's edit tool changes files: replace (old and "
+     "new text), patch (an apply_patch envelope) or hashline (line "
+     "numbers checked against a tag that read shows)"},
     {"model", "max_concurrent", CFG_INT, "", {}, {}, "capacity",
      "Most requests for this model at once, by default the server's "
      "slots, else 4"},

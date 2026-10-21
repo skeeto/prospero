@@ -72,6 +72,22 @@ static void test_view(Test *t)
         expect(t, "view.countnl", istr(&a, wrong), "0");
     }
 
+    // Edits in the patch and hashline formats: summaries and diffs
+    {
+        Arena a     = perm;
+        Str   patch = "{\"patch\":\"*** Begin Patch\\n*** Update File: a.c\\n@@ f\\n-x\\n+y\\n"
+                      "*** Delete File: b.c\\n*** End Patch\"}";
+        expect(t, "view.patch summary", toolsummary(&a, a, "edit", patch, "/w"), "a.c, b.c");
+        expect(t, "view.patch diff", tooldiff(&a, "edit", patch, "ok"),
+               "```diff\n--- a.c\n+++ a.c\n@@ f\n-x\n+y\n--- b.c\n+++ /dev/null\n```\n");
+        Str lines = "{\"path\":\"a.c\",\"tag\":\"AB12\",\"edits\":[{\"op\":\"replace\",\"line\":2,"
+                    "\"end\":3,\"text\":\"z\\n\"},{\"op\":\"insert\",\"line\":0,\"text\":\"t\"},"
+                    "{\"op\":\"delete\",\"line\":9}]}";
+        expect(t, "view.hashline diff", tooldiff(&a, "edit", lines, "ok"),
+               "```diff\n--- a.c\n+++ a.c\n@@ replace lines 2-3 @@\n+z\n@@ insert after line 0 @@\n"
+               "+t\n@@ delete lines 9 @@\n```\n");
+    }
+
     // A turn: deltas grow provisional messages, which the committed
     // record replaces, reclaiming their text
     {

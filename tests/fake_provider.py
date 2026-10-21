@@ -1263,6 +1263,67 @@ def sc_task_long_b(model, n, req):
     yield from answer(model, body, pieces=20)
 
 
+# Edit formats ([model] edit_format): the agent writes edits as the
+# edit tool's schema says, which the first check of each confirms
+
+def edit_params(req):
+    for t in req.get("tools", []):
+        f = t.get("function", {})
+        if f.get("name") == "edit":
+            return sorted(f.get("parameters", {}).get("properties", {}))
+    return []
+
+
+def sc_edit_patch(model, n, req):
+    k = step(req)
+    if k == 0 and edit_params(req) != ["patch"]:
+        yield from answer(model, f"wrong schema {edit_params(req)}")
+    elif k == 0:
+        # A heredoc around it, kept lines without their space: forgiven
+        yield from tool(model, n, "edit", {"patch":
+            "cat <<'EOF'\n*** Begin Patch\n*** Update File: hello.txt\n@@ greet\n"
+            "hello\n-world\n+there\n*** Add File: sub/new.txt\n+fresh\n"
+            "*** Delete File: old.txt\n*** End Patch\nEOF\n"})
+    elif k == 1:
+        yield from tool(model, n, "edit", {"patch":
+            "*** Begin Patch\n*** Update File: hello.txt\n-nothing like this\n+x\n*** End Patch"})
+    elif k == 2:
+        yield from tool(model, n, "edit", {"patch":
+            "*** Begin Patch\n*** Add File: ../asked.txt\n+no\n*** End Patch"})
+    else:
+        yield from answer(model, "Patched.")
+
+
+def sc_edit_hashline(model, n, req):
+    k = step(req)
+    res = tool_results(req)
+    if k == 0 and edit_params(req) != ["edits", "path", "tag"]:
+        yield from answer(model, f"wrong schema {edit_params(req)}")
+    elif k == 0:
+        yield from tool(model, n, "read", {"path": "list.txt"})
+    elif k == 1:
+        # The tag from the header read showed: [list.txt#TAG]
+        tag = res[0].split("#", 1)[1].split("]", 1)[0]
+        yield from tool(model, n, "edit", {"path": "list.txt", "tag": tag, "edits": [
+            {"op": "replace", "line": 2, "text": "TWO"},
+            {"op": "insert", "line": 0, "text": "zero"},
+            {"op": "delete", "line": 4}]})
+    elif k == 2:
+        # The tag of the first read again: stale now
+        first = [m for m in req["messages"] if m.get("role") == "tool"][0]["content"]
+        tag = first.split("#", 1)[1].split("]", 1)[0]
+        yield from tool(model, n, "edit", {"path": "list.txt", "tag": tag, "edits": [
+            {"op": "delete", "line": 1}]})
+    elif k == 3:
+        # The new tag from the edit's result works
+        edited = [m for m in req["messages"] if m.get("role") == "tool"][1]["content"]
+        tag = edited.split("[list.txt#", 1)[1].split("]", 1)[0]
+        yield from tool(model, n, "edit", {"path": "list.txt", "tag": tag, "edits": [
+            {"op": "insert", "line": 4, "text": "end\n"}]})
+    else:
+        yield from answer(model, "Edited by line.")
+
+
 # The GUI's checklist (harness gui --drive, run by tests/gui.py): the
 # prompt that began the turn picks the reply, and the step is how many
 # responses the turn has had so far.
