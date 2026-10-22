@@ -62,6 +62,16 @@ target_link_options(prospero_core_flags INTERFACE
 
 check_linker_flag(CXX -nostdlib++ PROSPERO_HAS_NOSTDLIBXX)
 
+# __FILE__, which ImGui's assertions log even in Release (src/imconfig.h),
+# names files relative to the source tree, dependencies' too, so that no
+# build directory is left in a program, and the same sources build the
+# same program wherever they are unpacked.
+check_cxx_compiler_flag(-fmacro-prefix-map=a=b PROSPERO_HAS_PREFIXMAP)
+if(PROSPERO_HAS_PREFIXMAP)
+  add_compile_options(
+    "$<$<COMPILE_LANGUAGE:C,CXX>:-fmacro-prefix-map=${PROJECT_SOURCE_DIR}/=>")
+endif()
+
 # The core embeds the seed configuration with #embed (config.cpp), which
 # not every compiler lists as a dependency.
 set_property(SOURCE src/main_posix.cpp src/main_win32.cpp src/main_test.cpp
@@ -120,6 +130,12 @@ else()
   endif()
 endif()
 target_link_libraries(prospero PRIVATE prospero_core_flags)
+if(WIN32)
+  # A zero PE timestamp, as w64devkit's ld writes by default, rather than
+  # the link time, so the same sources link the same program with any
+  # GNU toolchain. Releases check it (tools/pecheck.py).
+  target_link_options(prospero PRIVATE -Wl,--no-insert-timestamp)
+endif()
 if(PROSPERO_GUI)
   target_compile_definitions(prospero PRIVATE PROSPERO_GUI=1)
 endif()

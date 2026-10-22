@@ -28,9 +28,12 @@ FetchContent_Declare(md4c
   SOURCE_SUBDIR _none  # only md4c.c is wanted, not its CMake project
 )
 
+# Savannah sometimes answers 504, so SourceForge's copy, the same file,
+# is tried next.
 fetch_content_bundled(freetype freetype)
 FetchContent_Declare(freetype
   URL https://download.savannah.gnu.org/releases/freetype/freetype-2.15.0.tar.xz
+      https://downloads.sourceforge.net/project/freetype/freetype2/2.15.0/freetype-2.15.0.tar.xz
   URL_HASH SHA256=93cd47eb719c325107f2d3cf087d06299e944c3b48a40b55537302304dea1dd5
   SYSTEM
 )
