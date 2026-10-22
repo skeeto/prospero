@@ -2,7 +2,7 @@
 //
 // A host (host.cpp) and its clients (remote.cpp) exchange protocol v0
 // lines over a byte stream that may break at any moment and be replaced
-// by another: ssh's standard I/O, bridged by "harness attach" to the
+// by another: ssh's standard I/O, bridged by "prospero attach" to the
 // host's local endpoint, or that endpoint itself. The framing, after VS
 // Code's PersistentProtocol, makes the replacement seamless: nothing is
 // lost, nothing arrives twice, and the order holds.

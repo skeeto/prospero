@@ -1,10 +1,10 @@
 // Win32 platform layer: no CRT and no headers
 // $ cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain-Mingw64.cmake
-// $ c++ -std=c++20 -nostartfiles -o harness.exe src/main_win32.cpp -ladvapi32
+// $ c++ -std=c++20 -nostartfiles -o prospero.exe src/main_win32.cpp -ladvapi32
 //
 // Imports only kernel32.dll, advapi32.dll (RtlGenRandom), and winhttp.dll,
 // with nothing newer than Windows XP SP3, so the XP engine, an i686 build
-// with HARNESS_GUI off, comes from this file too. tests/imports.py checks
+// with PROSPERO_GUI off, comes from this file too. tests/imports.py checks
 // the imports against XP's own export lists. Newer functions are looked
 // up at run time (GetProcAddress), and newer options tried first with a
 // fallback (the automatic proxy). On XP, https cannot work, since its
@@ -22,13 +22,13 @@
 // at the system call.
 //
 // This is free and unencumbered software released into the public domain.
-#if HARNESS_GUI
+#if PROSPERO_GUI
 #  include "imgui.h"
 #  include "imgui_internal.h"
 #  include "misc/freetype/imgui_freetype.h"
 #  include "md4c.h"
 #endif
-#include "harness.cpp"
+#include "prospero.cpp"
 #include "wide.cpp"
 
 enum : i32 {
@@ -326,7 +326,7 @@ W32(b32,    QueryInformationJobObject(uz, i32, void *, i32, i32 *));
 
 // GCC emits calls to these even without a CRT. Defining them keeps
 // msvcrt.dll out of the imports. GUI builds have the CRT's.
-#if !HARNESS_GUI && (defined(__x86_64__) || defined(__i386__))
+#if !PROSPERO_GUI && (defined(__x86_64__) || defined(__i386__))
 extern "C" void *memcpy(void *dst, void const *src, uz len)
 {
     void *r = dst;
@@ -450,7 +450,7 @@ static Str16 widepath(Arena *a, Str path)
 
 [[noreturn]] static void os_oom()
 {
-    writeall(GetStdHandle(STD_ERROR_HANDLE), "harness: out of memory\n");
+    writeall(GetStdHandle(STD_ERROR_HANDLE), "prospero: out of memory\n");
     ExitProcess(2);
 }
 
@@ -1388,7 +1388,7 @@ static void jobcheck(Os *os)
 static void joblesswarn(Os *os)
 {
     if (!__atomic_exchange_n(&os->warned, 1, __ATOMIC_RELAXED)) {
-        os_print(os, 2, "harness: warning: this process is in a job that "
+        os_print(os, 2, "prospero: warning: this process is in a job that "
                         "keeps its children, and before Windows 8 jobs do "
                         "not nest, so tools run without jobs: a tool's own "
                         "children may outlive it\n");
@@ -1874,7 +1874,7 @@ static void os_procfree(Os *os, Proc *p)
 
 // Local endpoints: named pipes
 //
-// A host's pipe is \\.\pipe\harness-SID-HASH-NAME: SID the user's, HASH
+// A host's pipe is \\.\pipe\prospero-SID-HASH-NAME: SID the user's, HASH
 // that of the state directory's real path (os_realpath, so that every
 // spelling of it names one pipe), case folded. Its owner is this user,
 // and its DACL allows this user alone, since the default DACL grants
@@ -2281,7 +2281,7 @@ static Str os_endpoint(Os *os, Arena *a, Str statedir, Str name)
         return {};
     }
     Buf b(a, 128 + sid.len + name.len);
-    print(&b, "\\\\.\\pipe\\harness-");
+    print(&b, "\\\\.\\pipe\\prospero-");
     print(&b, sid);
     putbyte(&b, '-');
     printhex(&b, h, 16);
@@ -2677,7 +2677,7 @@ static void httpworker(void *arg)
         return;
     }
 
-    c16 *agent = (c16 *)u"harness/" HARNESS_VERSION;
+    c16 *agent = (c16 *)u"prospero/" PROSPERO_VERSION;
     session = WinHttpOpen(agent, WINHTTP_ACCESS_TYPE_AUTOMATIC, 0, 0, 0);
     if (!session) {
         // Before Windows 8.1: proxy settings from netsh winhttp
@@ -2810,7 +2810,7 @@ static b32 hastls12(Os *os)
     i32 r = __atomic_load_n(&os->tls12, __ATOMIC_RELAXED);
     if (!r) {
         i32 tls = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-        uz  s   = WinHttpOpen((c16 *)u"harness", WINHTTP_ACCESS_TYPE_DEFAULT, 0, 0, 0);
+        uz  s   = WinHttpOpen((c16 *)u"prospero", WINHTTP_ACCESS_TYPE_DEFAULT, 0, 0, 0);
         b32 no  = s && !WinHttpSetOption(s, WINHTTP_OPTION_SECURE_PROTOCOLS,
                                          &tls, sizeof(tls)) &&
                   GetLastError()==ERROR_INVALID_PARAMETER;
@@ -2897,15 +2897,15 @@ static void os_httpfree(Os *, Http *h)
 }
 
 
-#if HARNESS_GUI
+#if PROSPERO_GUI
 #  include "app.cpp"
 #  include "gui_win32.cpp"
 #endif
 
 
-#if HARNESS_GUI
+#if PROSPERO_GUI
 // GUI builds start in the CRT, whose wWinMain (gui_win32.cpp) calls this.
-extern "C" void harness_main()
+extern "C" void prospero_main()
 #else
 extern "C" __attribute((force_align_arg_pointer))
 void mainCRTStartup()
@@ -2941,7 +2941,7 @@ void mainCRTStartup()
     for (; cmd[len]; len++) {}
     Slice<Str> args = splitcmdline(&a, fromwide(&a, cmd, len));
 
-    #if HARNESS_GUI
+    #if PROSPERO_GUI
     if (guiwanted(args.data, (i32)args.len)) {
         ExitProcess(gui_main(&os, a, args.data, (i32)args.len));
     }

@@ -1,6 +1,6 @@
 // Platform integration tests for processes and HTTP
-// $ harness --selftest            (processes, after the M0 tests)
-// $ harness --selftest URL        (processes and HTTP, against
+// $ prospero --selftest            (processes, after the M0 tests)
+// $ prospero --selftest URL        (processes and HTTP, against
 //                                  tests/fake_provider.py at URL)
 //
 // Processes run through the agent's shell (findshell): /bin/sh, or
@@ -113,7 +113,7 @@ static void testspawn(ProcTest *p, Arena scratch)
 
     // A missing program is reported, not hung on
     Spawn sp = {};
-    Str argv[] = {"harness-no-such-program-x9"};
+    Str argv[] = {"prospero-no-such-program-x9"};
     sp.argv     = {argv, 1, 1};
     sp.cwd      = p->dir;
     sp.env      = p->env;
@@ -369,7 +369,7 @@ static void testoverhead(ProcTest *p, Arena scratch)
         return;
     }
 
-    Str    none[] = {"/harness-selftest/no-such-program"};
+    Str    none[] = {"/prospero-selftest/no-such-program"};
     Timing rt     = timespawn(p, scratch, {none, 1, 1}, {}, 21);
     reporttiming(os, scratch, "reaper overhead", rt);
     // The target, 5 ms, is for the executables people run: optimized,
@@ -523,7 +523,7 @@ static void testspawnio(ProcTest *p, Arena scratch)
     os_write(os, scratch, ini, "# selftest: defaults only\n");
     Str argv[] = {exe, "--headless", "--state", st, "-c", ini};
     pr = spawnio(p, scratch, {argv, countof(argv), countof(argv)}, {}, {});
-    if (!check(t, pr!=0, "os_spawnio of harness --headless")) return;
+    if (!check(t, pr!=0, "os_spawnio of prospero --headless")) return;
     os_procwrite(os, pr, "{\"cmd\":\"hello\",\"proto\":0,\"id\":1}\n");
     os_procwrite(os, pr, "{\"cmd\":\"quit\",\"mode\":\"stop\",\"id\":2}\n");
     ProcWatch e = {};
@@ -949,7 +949,7 @@ static i32 selftestio(Os *os, Arena *perm, Arena scratch, Str url)
 
     Arena a = scratch;
     Buf   name(&a, 64);
-    print(&name, "harness-selftest-io-");
+    print(&name, "prospero-selftest-io-");
     printhex(&name, os_random(os), 16);
     Str dir = join(&a, tempdir(os, &a), finish(&name));
     check(&t, os_mkdirs(os, a, dir), "os_mkdirs for the process tests");

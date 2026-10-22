@@ -32,7 +32,7 @@ the smallest fix, leaving the rest of the file as it is. So the task is
 mostly the edit itself: finding the line, then changing it exactly,
 whitespace included, in the format the model was given.
 
-Each run is a fresh `harness run` in a directory that holds only the
+Each run is a fresh `prospero run` in a directory that holds only the
 mutated file, under the role `bench`: the tools read, edit, grep and
 glob, and no shell or write, so that every change goes through the edit
 tool. A run succeeds when the file is byte for byte the original
@@ -55,7 +55,7 @@ the formats. The fixes after it, prompted by these runs, are under
 
 Reproduce with:
 
-    uv run tests/bench/editbench.py run --harness build/harness \
+    uv run tests/bench/editbench.py run --prospero build/prospero \
         --models large,qwen-flash,qwen --count 40 --runs 2 --jobs 6 \
         --out results.jsonl
     uv run tests/bench/editbench.py report --out results.jsonl
@@ -114,7 +114,7 @@ What tells the formats apart is the cost of the same success:
 
 ## Choice
 
-The seed configuration (assets/harness.ini) sets `edit_format =
+The seed configuration (assets/prospero.ini) sets `edit_format =
 hashline` for `large` and `qwen-flash`, as reliable as the others here
 with fewer calls, tokens and seconds, and `replace` for `qwen`, which
 was as cheap with replace and never failed an edit with it (40 runs a

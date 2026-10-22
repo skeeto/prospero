@@ -125,10 +125,10 @@ static void testcfgschema(Test *t)
 static void testcfgdefault(Test *t)
 {
     static struct { Str env[2]; Str want; } cases[] = {
-        {{"XDG_CONFIG_HOME=/x", "HOME=/h"}, "/x/harness/harness.ini"},
-        {{"HOME=/h", "APPDATA=C:\\A"}, "/h/.config/harness/harness.ini"},
-        {{"APPDATA=C:\\A", {}}, "C:\\A/harness/harness.ini"},
-        {{"XDG_CONFIG_HOME=", "HOME=/h"}, "/h/.config/harness/harness.ini"},
+        {{"XDG_CONFIG_HOME=/x", "HOME=/h"}, "/x/prospero/prospero.ini"},
+        {{"HOME=/h", "APPDATA=C:\\A"}, "/h/.config/prospero/prospero.ini"},
+        {{"APPDATA=C:\\A", {}}, "C:\\A/prospero/prospero.ini"},
+        {{"XDG_CONFIG_HOME=", "HOME=/h"}, "/h/.config/prospero/prospero.ini"},
         {{{}, {}}, "(null)"},
     };
     for (iz i = 0; i < countof(cases); i++) {
@@ -150,7 +150,7 @@ static void testcfgdefault(Test *t)
     addenv(v.os, &a, "APPDATA=C:\\Users\\u\\AppData\\Roaming");
     Config *c = newconfig(v.os, &a, v.scratch, cfgdefault(v.os, &a), 1);
     expect(t, "default.normalized", c->path,
-           "C:/Users/u/AppData/Roaming/harness/harness.ini");
+           "C:/Users/u/AppData/Roaming/prospero/prospero.ini");
     expect(t, "default.seeded", cfgfile(v.os, c->path), cfgseed());
     cfgfree(c);
 }
@@ -164,9 +164,9 @@ static void testcfgseed(Test *t)
     addenv(v.os, &a, "HOME=/home/u");
     Str     path = cfgdefault(v.os, &a);
     Config *c    = newconfig(v.os, &a, v.scratch, path, 1);
-    expect(t, "seed.path", c->path, "/home/u/.config/harness/harness.ini");
+    expect(t, "seed.path", c->path, "/home/u/.config/prospero/prospero.ini");
     expect(t, "seed.written", cfgfile(v.os, c->path), cfgseed());
-    Stat dir = os_stat(v.os, a, "/home/u/.config/harness");
+    Stat dir = os_stat(v.os, a, "/home/u/.config/prospero");
     expect(t, "seed.dir", istr(&a, dir.type), istr(&a, STAT_DIR));
     expect(t, "seed.diags", inidiags(&a, c->ini), "");
     expect(t, "seed.exists", istr(&a, c->user != 0), "1");
@@ -217,7 +217,7 @@ static void testcfgvalidate(Test *t)
     Arena  a = t->perm;
     CfgEnv v = newcfgenv(&a);
     addenv(v.os, &a, "HOME=/home/u");
-    os_write(v.os, a, "/c/harness.ini",
+    os_write(v.os, a, "/c/prospero.ini",
         "endpoint = local\n"                    // 1
         "include = team.ini\n"
         "model = m\n"
@@ -249,38 +249,38 @@ static void testcfgvalidate(Test *t)
         "key = sk-team-plain\n"
         "connect_timeout = 3\n"                 // 5
         "url2 = x\n");
-    Config *c = newconfig(v.os, &a, v.scratch, "/c/harness.ini", 0);
+    Config *c = newconfig(v.os, &a, v.scratch, "/c/prospero.ini", 0);
     expect(t, "validate.diags", inidiags(&a, c->ini),
-        "/c/harness.ini:4:1: warning: unknown key \"color\" at the top level\n"
-        "/c/harness.ini:7:16: error: expected seconds, a number above 0, so "
+        "/c/prospero.ini:4:1: warning: unknown key \"color\" at the top level\n"
+        "/c/prospero.ini:7:16: error: expected seconds, a number above 0, so "
         "the default applies\n"
-        "/c/harness.ini:8:1: warning: unknown key \"idle_timout\" in "
+        "/c/prospero.ini:8:1: warning: unknown key \"idle_timout\" in "
         "[endpoint]; did you mean idle_timeout?\n"
-        "/c/harness.ini:9:7: warning: a plaintext secret: write env:NAME and "
+        "/c/prospero.ini:9:7: warning: a plaintext secret: write env:NAME and "
         "set the variable, so that this file can be shared\n"
-        "/c/harness.ini:10:2: warning: endpoint broken has no url\n"
-        "/c/harness.ini:12:2: warning: a section needs a name, as in "
+        "/c/prospero.ini:10:2: warning: endpoint broken has no url\n"
+        "/c/prospero.ini:12:2: warning: a section needs a name, as in "
         "[endpoint NAME], or its settings are unused\n"
-        "/c/harness.ini:15:9: warning: relative path \"rel/path\": use an "
+        "/c/prospero.ini:15:9: warning: relative path \"rel/path\": use an "
         "absolute path or one starting with ~\n"
-        "/c/harness.ini:17:13: warning: unknown value \"thoughts\", expected "
+        "/c/prospero.ini:17:13: warning: unknown value \"thoughts\", expected "
         "one of: reasoning_content, reasoning, reasoning_text, none\n"
-        "/c/harness.ini:18:9: error: expected a whole number, so this is "
+        "/c/prospero.ini:18:9: error: expected a whole number, so this is "
         "ignored\n"
-        "/c/harness.ini:20:9: warning: unknown value \"fly\", expected any "
+        "/c/prospero.ini:20:9: warning: unknown value \"fly\", expected any "
         "of: read, write, edit, shell, grep, glob, todo_write, jobs, "
         "job_output, job_kill, task\n"
-        "/c/harness.ini:21:2: warning: unknown section kind \"provider\", "
+        "/c/prospero.ini:21:2: warning: unknown section kind \"provider\", "
         "expected endpoint, model, role, guard, tools, instructions or ui\n"
-        "/c/harness.ini:23:8: warning: [guard] takes no name, or its "
+        "/c/prospero.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "
         "ignored: write env:NAME and set the variable\n"
         "/c/team.ini:6:1: warning: unknown key \"url2\" in [endpoint]; did "
         "you mean url?\n"
-        "/c/harness.ini:1:1: warning: overridden by /c/team.ini:1, included "
+        "/c/prospero.ini:1:1: warning: overridden by /c/team.ini:1, included "
         "after this line\n"
-        "/c/harness.ini:11:7: warning: environment variable MISSING_VAR is "
+        "/c/prospero.ini:11:7: warning: environment variable MISSING_VAR is "
         "not set");
 
     // Values in effect
@@ -377,14 +377,14 @@ static void testcfgset(Test *t)
     CfgEnv v = newcfgenv(&a);
     Str    team = "[endpoint team]\nurl = https://team.example/\n";
     os_write(v.os, a, "/c/team.ini", team);
-    os_write(v.os, a, "/c/harness.ini",
+    os_write(v.os, a, "/c/prospero.ini",
         "# My settings\n"
         "include = team.ini\n"
         "\n"
         "[endpoint local]\n"
         "url = http://localhost:8080/   # llama.cpp\n"
         "idle_timeout = 90\n");
-    Config *c = newconfig(v.os, &a, v.scratch, "/c/harness.ini", 0);
+    Config *c = newconfig(v.os, &a, v.scratch, "/c/prospero.ini", 0);
     expect(t, "set.clean", inidiags(&a, c->ini), "");
 
     static struct { Str kind, name, key, value; b32 rm; iz line; } edits[] = {
@@ -410,7 +410,7 @@ static void testcfgset(Test *t)
                edits[i].rm ? cfgkey(edits[i].kind, edits[i].key)->dflt
                            : edits[i].value);
     }
-    expect(t, "set.text", cfgfile(v.os, "/c/harness.ini"),
+    expect(t, "set.text", cfgfile(v.os, "/c/prospero.ini"),
         "# My settings\n"
         "include = team.ini\n"
         "model = qwen\n"
@@ -429,7 +429,7 @@ static void testcfgset(Test *t)
     expect(t, "set.diags", inidiags(&a, c->ini), "");
 
     // Refusals leave the file alone
-    Str before = cfgfile(v.os, "/c/harness.ini");
+    Str before = cfgfile(v.os, "/c/prospero.ini");
     static struct { Str kind, name, key, value, err; } bad[] = {
         {"endpoint", "local", "colour", "x", "unknown key"},
         {"endpoint", "local", "idle_timeout", "soon",
@@ -453,13 +453,13 @@ static void testcfgset(Test *t)
         expect(t, concat(&a, "refuse ", bad[i].key), r.err, bad[i].err);
         expect(t, concat(&a, "refuse.ok ", bad[i].key), istr(&a, r.ok), "0");
     }
-    expect(t, "refuse.file", cfgfile(v.os, "/c/harness.ini"), before);
+    expect(t, "refuse.file", cfgfile(v.os, "/c/prospero.ini"), before);
 
     // Setting what is already there writes nothing, but reloads
     i64 rev = c->rev;
     {
         Arena  tmp = v.scratch;
-        VFile *f   = vfind(v.os, "/c/harness.ini", 0);
+        VFile *f   = vfind(v.os, "/c/prospero.ini", 0);
         Str    old = f->data;
         CfgSet r   = cfgset(c, &tmp, "", "", "model", "qwen");
         expect(t, "same.ok", istr(&a, r.ok && r.line==3), "1");
@@ -471,7 +471,7 @@ static void testcfgset(Test *t)
     // A missing file starts from the seed, or from nothing without it
     for (i32 seed = 0; seed < 2; seed++) {
         Arena   tmp = v.scratch;
-        Str     p   = seed ? Str("/s/harness.ini") : Str("/n/harness.ini");
+        Str     p   = seed ? Str("/s/prospero.ini") : Str("/n/prospero.ini");
         Config *m   = newconfig(v.os, &a, tmp, p, seed);
         os_remove(v.os, a, p);
         CfgSet  r   = cfgset(m, &tmp, "", "", "model", "m");
@@ -982,7 +982,7 @@ static void testcfgurls(Test *t)
                "/c/h.ini|https://team.example/h.ini|", more));
     }
     expect(t, "url.cache", cfgcached(&a, os, url), concat(&a,
-           "harness include 1\nurl https://team.example/h.ini\n"
+           "prospero include 1\nurl https://team.example/h.ini\n"
            "fetched 1000000\netag \"v1\"\n"
            "modified Wed, 21 Oct 2026 07:28:00 GMT\n\n", team));
     expect(t, "url.cachename", cfgsha256(&a, url),

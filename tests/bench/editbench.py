@@ -9,14 +9,14 @@ Each task takes a real source file (some of this repository's src/*.cpp,
 and the Python and JavaScript fixtures here), applies one mutation to it
 (an operator swapped, a literal changed, an identifier renamed at one
 site, a line deleted, a line duplicated, or two arguments swapped), and
-asks the agent, through "harness run", to fix the bug that one sentence
+asks the agent, through "prospero run", to fix the bug that one sentence
 describes. The run succeeds when the file is byte for byte the original
 afterward. The agent gets only read, edit, grep and glob (role "bench"),
 so that every change goes through the edit tool, in the format that
 [model] edit_format selects.
 
   uv run tests/bench/editbench.py tasks [--count 40] [--seed 1]
-  uv run tests/bench/editbench.py run --harness build/harness \\
+  uv run tests/bench/editbench.py run --prospero build/prospero \\
       --models large,qwen-flash --formats replace,patch,hashline \\
       --count 40 --runs 2 --jobs 4 --out results.jsonl
   uv run tests/bench/editbench.py report --out results.jsonl
@@ -314,10 +314,10 @@ def run_one(args, root, task, model, fmt, run):
     target = os.path.join(work, task["path"])
     with open(target, "wb") as f:
         f.write(task["mutated"].encode("utf-8"))
-    config = os.path.join(base, "harness.ini")
+    config = os.path.join(base, "prospero.ini")
     with open(config, "w") as f:
         f.write(CONFIG.format(url=args.endpoint, model=model, format=fmt))
-    cmd = [os.path.abspath(args.harness), "run", "-C", work, "--state", state,
+    cmd = [os.path.abspath(args.prospero), "run", "-C", work, "--state", state,
            "-c", config, "-e", "bench", "-m", model, "-r", "bench", prompt_of(task)]
     t0 = time.monotonic()
     timed_out = False
@@ -507,7 +507,7 @@ def main():
     for a in (t, r):
         a.add_argument("--count", type=int, default=40)
         a.add_argument("--seed", type=int, default=1)
-    r.add_argument("--harness", required=True)
+    r.add_argument("--prospero", required=True)
     r.add_argument("--models", default="large,qwen-flash")
     r.add_argument("--formats", default="replace,patch,hashline")
     r.add_argument("--runs", type=int, default=2)

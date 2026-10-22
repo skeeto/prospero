@@ -30,7 +30,7 @@ So there the cases run three times: as the tests run, where whatever
 runs them is responsible for the harness; with the harness started
 disclaimed (disclaim.py), checked by asking, with the identity its tools
 then answer to; and disclaimed with a test hook that leaves
-responsibility alone to find the daemons (HARNESS_TEST_REAP=noorigin).
+responsibility alone to find the daemons (PROSPERO_TEST_REAP=noorigin).
 Expected failures (XFAIL): as the tests run, a daemon that exec'd after
 its parents were gone, before the reaper saw it, as on a busy machine
 it may, though never all of several, and never one whose parent
@@ -45,9 +45,9 @@ reads a place that privacy protects.
 Survivors are killed afterward, by pids read one per line and
 confirmed to be ours first (pids.py).
 
-  uv run tests/cleanup.py --harness build/harness
-  uv run tests/cleanup.py --harness PATH --host WINHOST
-  uv run tests/cleanup.py --harness PATH --xp XPHOST
+  uv run tests/cleanup.py --prospero build/prospero
+  uv run tests/cleanup.py --prospero PATH --host WINHOST
+  uv run tests/cleanup.py --prospero PATH --xp XPHOST
 """
 
 import argparse
@@ -80,12 +80,12 @@ def killtree(t, script, want):
             time.sleep(0.05)
         state["pids"] = t.pids("tree.pids")
         if t.host.windows:
-            # The first shell's parent is harness.exe itself
+            # The first shell's parent is prospero.exe itself
             ppid = t.pids("tree.ppid")
-            state["harness"] = ppid[0] if ppid else None
-            t.host.killhard(p, state["harness"])
+            state["prospero"] = ppid[0] if ppid else None
+            t.host.killhard(p, state["prospero"])
         else:
-            state["harness"] = p.pid
+            state["prospero"] = p.pid
             t.host.killhard(p)
         state["killed"] = time.monotonic()
         return True
@@ -94,7 +94,7 @@ def killtree(t, script, want):
     r = t.run(script, watch=watch, timeout=60)
     if "killed" not in state:
         return [], None, 0, f"the tool never started: {scenarios.compact(r.names())}"
-    return state["pids"], state.get("harness"), state["killed"], None
+    return state["pids"], state.get("prospero"), state["killed"], None
 
 
 def crashes(host, mode):
@@ -207,7 +207,7 @@ def cases():
 
 # Disclaimed, with the test hook that leaves responsibility alone to
 # find what leaves the tree: these must all be found by it
-NOORIGIN = {"HARNESS_TEST_REAP": "noorigin"}
+NOORIGIN = {"PROSPERO_TEST_REAP": "noorigin"}
 BYRESPONSIBILITY = ("doublefork", "chain", "rapid", "linger", "nested")
 
 
@@ -233,7 +233,7 @@ def nested(t, host):
     args = ["run", "-C", inner, "--state", host.join(t.base, "inner-state"),
             "-c", t.config, "-e", "fake", "-m", model, "go"]
     t.put("script.sh", "echo $PPID >outer.reaper\n" +
-          " ".join(shlex.quote(a) for a in [host.harness] + args) +
+          " ".join(shlex.quote(a) for a in [host.prospero] + args) +
           " >inner.out 2>&1\necho inner exit $?\n")
     return "outer.reaper", "inner.reaper"
 
@@ -253,7 +253,7 @@ def responsibility(t, files, disclaimed):
             if all(pids):
                 break
             time.sleep(0.05)
-        seen["harness"] = (p.pid, disclaim.responsible(p.pid))
+        seen["prospero"] = (p.pid, disclaim.responsible(p.pid))
         for f in files:
             pid = (t.pids(f) or [0])[0]
             seen[f] = (pid, disclaim.responsible(pid) if pid else 0)
@@ -276,7 +276,7 @@ def identity(host, disclaimed, mode):
     t.put("script.sh", "echo $PPID >reaper.pid; echo $$ >tool.pid; sleep 3; echo done\n")
     watch, seen = responsibility(t, ["reaper.pid", "tool.pid"], disclaimed)
     r = t.run(watch=watch, timeout=60)
-    hpid, hresp = seen.get("harness", (0, 0))
+    hpid, hresp = seen.get("prospero", (0, 0))
     reaper, rresp = seen.get("reaper.pid", (0, 0))
     tool, tresp = seen.get("tool.pid", (0, 0))
     problems = []
@@ -287,7 +287,7 @@ def identity(host, disclaimed, mode):
             problems.append(f"the harness {hpid} answers to {hresp}, not itself")
         if rresp != reaper or tresp != reaper:
             problems.append(f"the reaper {reaper} answers to {rresp}, its tool to {tresp}")
-        exe = os.path.realpath(host.harness)
+        exe = os.path.realpath(host.prospero)
         if seen.get("path") != exe:
             problems.append(f"the reaper runs {seen.get('path')}, not {exe}")
         # The same code as the harness runs, which the user's grants are
@@ -358,7 +358,7 @@ def ends(host, disclaimed, mode, env=None, only=None):
             # would lose its sweep of the inner tools otherwise
             outer, oresp = seen.get(files[0], (0, 0))
             inner, iresp = seen.get(files[1], (0, 0))
-            hresp = seen["harness"][1]
+            hresp = seen["prospero"][1]
             want_resp = outer if disclaimed else hresp
             if not inner or iresp != want_resp:
                 print(f"FAIL {name}{mode}: the inner reaper {inner} answers to "
@@ -391,10 +391,10 @@ def replaced(host, mode):
     harness instead. Runs a copy of the harness, which its first tool
     replaces with another copy. Returns failures."""
     t = scenarios.T(host, "script2", None)
-    exe = host.join(t.base, "harness")
-    shutil.copy2(host.harness, exe)
+    exe = host.join(t.base, "prospero")
+    shutil.copy2(host.prospero, exe)
     t.host = copy.copy(host)
-    t.host.harness = exe
+    t.host.prospero = exe
     q = shlex.quote
     t.put("script.sh", "echo $PPID >reaper1.pid; echo $$ >tool1.pid; sleep 2\n"
           f"cp {q(exe)} {q(exe + '.new')} && mv {q(exe + '.new')} {q(exe)}\n")
@@ -409,13 +409,13 @@ def replaced(host, mode):
         while time.monotonic() < deadline and not (
                 t.pids(f"reaper{k}.pid") and t.pids(f"tool{k}.pid")):
             time.sleep(0.05)
-        seen["harness"] = (p.pid, disclaim.responsible(p.pid))
+        seen["prospero"] = (p.pid, disclaim.responsible(p.pid))
         pids = [(t.pids(f"{f}{k}.pid") or [0])[0] for f in ("reaper", "tool")]
         seen[k] = [(pid, disclaim.responsible(pid) if pid else 0) for pid in pids]
         return False
 
     r = t.run(watch=watch, timeout=60)
-    hpid, hresp = seen.get("harness", (0, 0))
+    hpid, hresp = seen.get("prospero", (0, 0))
     (r1, r1resp), (t1, t1resp) = seen.get("1", [(0, 0), (0, 0)])
     (r2, r2resp), (t2, t2resp) = seen.get("2", [(0, 0), (0, 0)])
     problems = []
@@ -442,7 +442,7 @@ def selftest(host, mode):
     """The selftest with the harness disclaimed: every process test, and
     its own check of whom its tools answer to."""
     try:
-        r = subprocess.run(host.prefix + [host.harness, "--selftest"],
+        r = subprocess.run(host.prefix + [host.prospero, "--selftest"],
                            capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:
         print(f"FAIL selftest{mode}: still running after 300 s")
@@ -466,7 +466,7 @@ def skip(mode, only=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--harness", required=True)
+    ap.add_argument("--prospero", required=True)
     ap.add_argument("--host", help="a Windows host to run on over ssh")
     ap.add_argument("--xp", help="a Windows XP host to run on over ssh")
     # The selftest checks latencies, so ctest runs it apart from the rest,
@@ -484,11 +484,11 @@ def main():
         srv, url = fake_provider.start()
     port = srv.server_address[1]
     if args.xp:
-        host = scenarios.XpHost(args.xp, args.harness, url)
+        host = scenarios.XpHost(args.xp, args.prospero, url)
     elif args.host:
-        host = scenarios.SshHost(args.host, args.harness, port, 20000 + port % 20000)
+        host = scenarios.SshHost(args.host, args.prospero, port, 20000 + port % 20000)
     else:
-        host = scenarios.LocalHost(args.harness, url)
+        host = scenarios.LocalHost(args.prospero, url)
 
     failed = 0
     mac = not host.windows and disclaim.available()

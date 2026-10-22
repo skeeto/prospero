@@ -1,4 +1,4 @@
-// harness: a desktop coding harness for locally hosted and remote LLMs
+// prospero: a desktop coding harness for locally hosted and remote LLMs
 //
 // The program is the harness; the LLM driving it is the agent.
 //
@@ -9,8 +9,8 @@
 // This is free and unencumbered software released into the public domain.
 #include "base.cpp"
 
-#ifndef HARNESS_VERSION
-#  define HARNESS_VERSION "0.0.0"
+#ifndef PROSPERO_VERSION
+#  define PROSPERO_VERSION "0.0.0"
 #endif
 
 
@@ -308,7 +308,7 @@ static i32       os_responsible(Os *, i32 pid);
 
 // (M1) GUI builds: wake the GUI loop from any thread, coalesced.
 static void    os_wake(Os *);
-#if HARNESS_GUI
+#if PROSPERO_GUI
 // The platform owns the window, the renderer and the event loop. The
 // core (app.cpp) decides when to draw (sched.cpp) and what (ui.cpp).
 // The platform calls back into the core: gui_input after giving an
@@ -442,19 +442,19 @@ static Arena newarena(Region *r)
 
 
 static Str usage =
-"usage: harness [options]\n"
-"       harness run [options] PROMPT\n"
-"       harness --headless [options]\n"
-"       harness serve [options]\n"
-"       harness attach [--reconnect] [options]\n"
-"       harness hosts [--state DIR]\n"
-"       harness connect NAME | --ssh DEST | --local [options]\n"
-"       harness deploy NAME|DEST [--force] [options]\n"
+"usage: prospero [options]\n"
+"       prospero run [options] PROMPT\n"
+"       prospero --headless [options]\n"
+"       prospero serve [options]\n"
+"       prospero attach [--reconnect] [options]\n"
+"       prospero hosts [--state DIR]\n"
+"       prospero connect NAME | --ssh DEST | --local [options]\n"
+"       prospero deploy NAME|DEST [--force] [options]\n"
 "  --version         print the version and exit\n"
 "  --selftest [URL]  run the platform integration tests, with HTTP\n"
 "                    tests against a fake provider at URL\n"
 "  -h                print this message\n"
-"Run \"harness run\" without arguments for its options.\n";
+"Run \"prospero run\" without arguments for its options.\n";
 
 static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
 {
@@ -462,7 +462,7 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
     iz    cap     = sizeof(void *)==8 ? (iz)1<<30 : (iz)1<<27;  // 32-bit: XP
     Arena scratch = newarena(os_reserve(os, cap));
     if (!scratch.beg) {
-        os_print(os, 2, "harness: out of memory\n");
+        os_print(os, 2, "prospero: out of memory\n");
         return 2;
     }
 
@@ -487,7 +487,7 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
     for (i32 i = 1; i < nargs; i++) {
         Str a = args[i];
         if (a == "--version") {
-            os_print(os, 1, "harness " HARNESS_VERSION "\n");
+            os_print(os, 1, "prospero " PROSPERO_VERSION "\n");
             return 0;
         } else if (a == "--selftest") {
             Str url = i+1<nargs ? args[i+1] : Str{};

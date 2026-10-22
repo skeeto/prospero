@@ -5,20 +5,20 @@
 # ///
 """URL includes: the harness's configuration against a small fake web server.
 
-Each case runs "harness --headless" with a fresh state directory and a
+Each case runs "prospero --headless" with a fresh state directory and a
 configuration that includes pages of the server below, then reads what
 the harness made of it through config.get, with {refresh:1} where a case
 needs the fetches done: diagnostics, settings with their provenance,
 and the includes with their fetch times. The server logs every request,
 so a case also checks what was asked (conditional or not, how often).
 
-  uv run tests/includes.py --harness build/harness [NAME ...]
-  uv run tests/includes.py --harness PATH --host WINHOST   (Windows)
-  uv run tests/includes.py --harness PATH --xp XPHOST      (XP)
+  uv run tests/includes.py --prospero build/prospero [NAME ...]
+  uv run tests/includes.py --prospero PATH --host WINHOST   (Windows)
+  uv run tests/includes.py --prospero PATH --xp XPHOST      (XP)
 
 With --host, the server runs here and the harness on the Windows host
 over ssh, reaching the server through a reverse tunnel, as in
-scenarios.py; PATH is the harness.exe already on that host. With --xp,
+scenarios.py; PATH is the prospero.exe already on that host. With --xp,
 the same for Windows XP and skeeto/sshd (https://github.com/skeeto/sshd),
 which forwards no ports: the server listens on this machine's LAN
 address, over plain http, as XP's WinHTTP has no TLS 1.2.
@@ -156,7 +156,7 @@ def sha256(text):
 
 
 class Engine:
-    """harness --headless on a case's configuration and state."""
+    """prospero --headless on a case's configuration and state."""
 
     def __init__(self, t, env=None):
         self.t0 = time.monotonic()
@@ -254,7 +254,7 @@ class T:
         nonce = f"{random.randrange(1 << 32):08x}"
         self.base = host.join(host.root, f"inc-{name}-{nonce}")
         self.state = host.join(self.base, "state")
-        self.config = host.join(self.base, "harness.ini")
+        self.config = host.join(self.base, "prospero.ini")
         host.mkdir(self.state)
         self.prefix = f"/{name}-{nonce}"
         self.url = host.url + self.prefix
@@ -341,7 +341,7 @@ def fresh(t):
     t.same(len(reqs), 1, "requests")
     t.check("If-None-Match" not in reqs[0], "unconditional")
     text = t.cache(url)
-    t.check(text and text.startswith(f"harness include 1\nurl {url}\nfetched "),
+    t.check(text and text.startswith(f"prospero include 1\nurl {url}\nfetched "),
             f"cache {text!r}")
     t.check('\netag "v1"\n' in text and f"\nmodified {MODIFIED}\n" in text,
             f"validators {text!r}")
@@ -403,10 +403,10 @@ def offline(t):
     c = t.run(refresh=True)
     d = c.diags()
     t.same(len(d), 2, f"diagnostics {d}")
-    t.check(re.fullmatch(rf".*harness\.ini:1:11: warning: cannot fetch "
+    t.check(re.fullmatch(rf".*prospero\.ini:1:11: warning: cannot fetch "
                          rf"{re.escape(url)} \(.+\); using the copy fetched "
                          rf"3 hours ago", d[0]), d[0])
-    t.check(re.fullmatch(rf".*harness\.ini:2:11: warning: cannot fetch "
+    t.check(re.fullmatch(rf".*prospero\.ini:2:11: warning: cannot fetch "
                          rf"{re.escape(gone)} \(.+\), include skipped", d[1]), d[1])
     t.same(c.setting("", "", "model")["value"], "team-model", "model")
     t.same(c.include(url)["fetched"], old, "fetched")
@@ -597,7 +597,7 @@ def interval(t):
     t.page("team.ini", body=TEAM, etag='"v1"')
     url = f"{t.url}/team.ini"
     t.write(f"include = {url}\n")
-    e = t.start(env={"HARNESS_TEST_MINUTE_MS": str(int(every * 100))})
+    e = t.start(env={"PROSPERO_TEST_MINUTE_MS": str(int(every * 100))})
 
     def quiet(what):
         """The fetches so far, after work for the engine, checked to be
@@ -739,7 +739,7 @@ def runone(host, web, name):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--harness", required=True, help="the harness binary")
+    ap.add_argument("--prospero", required=True, help="the harness binary")
     ap.add_argument("--host", help="run the harness on this Windows host over ssh")
     ap.add_argument("--xp", help="run the harness on this Windows XP host over ssh")
     ap.add_argument("-j", type=int, default=0, help="cases at once")
@@ -758,11 +758,11 @@ def main():
     threading.Thread(target=web.serve_forever, daemon=True).start()
     port = web.server_address[1]
     if args.xp:
-        host = XpHost(args.xp, args.harness, f"http://{lan}:{port}")
+        host = XpHost(args.xp, args.prospero, f"http://{lan}:{port}")
     elif args.host:
-        host = SshHost(args.host, args.harness, port, 20000 + port % 20000)
+        host = SshHost(args.host, args.prospero, port, 20000 + port % 20000)
     else:
-        host = LocalHost(args.harness, f"http://127.0.0.1:{port}")
+        host = LocalHost(args.prospero, f"http://127.0.0.1:{port}")
     try:
         failed = 0
         with concurrent.futures.ThreadPoolExecutor(args.j or len(names)) as ex:

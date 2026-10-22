@@ -12,7 +12,7 @@ cache hits grow from step to step (llama.cpp timings.cache_n, or the
 provider's cached tokens, which may grow in blocks), which shows the
 request prefix stays byte-stable. Loading a router model may evict the one already loaded.
 
-  uv run tests/smoke.py --harness build/harness [-e http://localhost/] [-m qwen-flash]
+  uv run tests/smoke.py --prospero build/prospero [-e http://localhost/] [-m qwen-flash]
 """
 
 import argparse
@@ -48,13 +48,13 @@ PROMPT = ("In this repository, add a function multiply(a, b) to calc.py that "
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--harness", required=True)
+    ap.add_argument("--prospero", required=True)
     ap.add_argument("-e", default="http://localhost/")
     ap.add_argument("-m", default="qwen-flash")
     ap.add_argument("--keep", action="store_true", help="keep the temporary repo")
     args = ap.parse_args()
 
-    root = tempfile.mkdtemp(prefix="harness-smoke-")
+    root = tempfile.mkdtemp(prefix="prospero-smoke-")
     repo = os.path.join(root, "repo")
     state = os.path.join(root, "state")
     os.makedirs(repo)
@@ -68,7 +68,7 @@ def main():
     subprocess.run(git + ["commit", "-qm", "start"], check=True)
 
     t0 = time.monotonic()
-    p = subprocess.run([os.path.abspath(args.harness), "run", "-C", repo,
+    p = subprocess.run([os.path.abspath(args.prospero), "run", "-C", repo,
                         "--state", state, "-e", args.e, "-m", args.m, PROMPT],
                        capture_output=True, text=True, timeout=3600)
     dt = time.monotonic() - t0

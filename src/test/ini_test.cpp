@@ -549,7 +549,7 @@ static void testiniinclude(Test *t)
     Os   *os = newos(&a, 8<<20);
 
     // Layers: each include lands where its line is
-    os_write(os, a, "/cfg/harness.ini",
+    os_write(os, a, "/cfg/prospero.ini",
         "include = team.ini\n"
         "include = ../shared/base.ini # base\n"
         "top = mine\n"
@@ -569,18 +569,18 @@ static void testiniinclude(Test *t)
         "model = base-model\n");
     {
         Ini      ini = {};
-        IniFile *f   = iniload(&ini, os, &a, "/cfg/harness.ini");
+        IniFile *f   = iniload(&ini, os, &a, "/cfg/prospero.ini");
         expect(t, "inc.root", inishow(&a, f),
                "@<team.ini> @<../shared/base.ini> "
                "top=<mine> [provider:local] url=<http://mine>");
         expect(t, "inc.diags", inidiags(&a, &ini), "");
         expect(t, "inc.files", inishowfiles(&a, &ini),
-               "/cfg/harness.ini@0 "
-               "/cfg/team.ini<-/cfg/harness.ini:1@1 "
+               "/cfg/prospero.ini@0 "
+               "/cfg/team.ini<-/cfg/prospero.ini:1@1 "
                "/shared/base.ini<-/cfg/team.ini:1@2 "
-               "/shared/base.ini<-/cfg/harness.ini:2@1");
+               "/shared/base.ini<-/cfg/prospero.ini:2@1");
         expect(t, "inc.url", inihistory(&a, &ini, "provider", "local", "url"),
-               "/cfg/harness.ini:5 /shared/base.ini:2 /cfg/team.ini:4 "
+               "/cfg/prospero.ini:5 /shared/base.ini:2 /cfg/team.ini:4 "
                "/shared/base.ini:2");
         expect(t, "inc.model",
                inihistory(&a, &ini, "provider", "local", "model"),
@@ -588,7 +588,7 @@ static void testiniinclude(Test *t)
         expect(t, "inc.key", inihistory(&a, &ini, "provider", "local", "key"),
                "/cfg/team.ini:5");
         expect(t, "inc.top", inihistory(&a, &ini, "", "", "top"),
-               "/cfg/harness.ini:3 /cfg/team.ini:2");
+               "/cfg/prospero.ini:3 /cfg/team.ini:2");
         expect(t, "inc.value", iniget(&ini, "provider", "team", "url"),
                "http://teamserver");
         expect(t, "inc.sections", inishowsections(&a, &ini, "", 1),

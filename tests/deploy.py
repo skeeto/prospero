@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Engine deployment: harness deploy, and connect deploying on its own.
+"""Engine deployment: prospero deploy, and connect deploying on its own.
 
 The local scenarios run the real binary through an ssh and scp of their
 own that work here, in a fresh fake home directory, with an engines
@@ -13,22 +13,22 @@ arrives damaged, refuses another build of the same version without
 --force, and connect then runs the engine deployed, or deploys one
 itself (--deploy, or [remote NAME] deploy = auto) when it finds none.
 
-  uv run tests/deploy.py --harness build/harness [NAME ...]
+  uv run tests/deploy.py --prospero build/prospero [NAME ...]
 
 With --ssh the "real" scenario deploys to that host the engine for its
 platform from the engines directory next to the binary (build/engines,
 from tools/engines.py), deploys again (nothing to upload), then connects
 to it with the fake provider reached as in tests/remote.py, and runs a
-turn with a shell command in it. Engines it put in ~/.harness there, and
-~/.harness itself if it made it, are removed at the end:
+turn with a shell command in it. Engines it put in ~/.prospero there, and
+~/.prospero itself if it made it, are removed at the end:
 
-  uv run tests/deploy.py --harness build/harness --ssh HOST \\
-      --remote-root /tmp/harness-m5-deploy real
-  uv run tests/deploy.py --harness build/harness --ssh WINHOST --windows \\
-      --remote-root %TMP%/harness-m5-deploy real
-  uv run tests/deploy.py --harness build/harness --ssh XPHOST \\
+  uv run tests/deploy.py --prospero build/prospero --ssh HOST \\
+      --remote-root /tmp/prospero-deploy real
+  uv run tests/deploy.py --prospero build/prospero --ssh WINHOST --windows \\
+      --remote-root %TMP%/prospero-deploy real
+  uv run tests/deploy.py --prospero build/prospero --ssh XPHOST \\
       --no-tunnel --shell "sh -s" \\
-      --remote-root %TMP%/harness-m5-deploy real
+      --remote-root %TMP%/prospero-deploy real
 """
 
 import argparse
@@ -128,21 +128,21 @@ class D(R.T):
             with open(path, "w") as f:
                 f.write(text)
             os.chmod(path, 0o755)
-        out = subprocess.run([self.harness, "--version"], capture_output=True,
+        out = subprocess.run([self.prospero, "--version"], capture_output=True,
                              text=True).stdout.split()
         self.version = out[1]
         self.platform = localplatform()
-        self.ename = f"harness-engine-{self.version}-{self.platform}"
+        self.ename = f"prospero-engine-{self.version}-{self.platform}"
         self.rname = f"engine-0-{self.version}-{self.platform}"
         self.env = dict(self.env, FAKEHOME=self.home, FAKELOG=self.fakelog)
-        # No harness on the remote shell's PATH, as on a new machine
+        # No prospero on the remote shell's PATH, as on a new machine
         self.env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
 
     def engine(self, extra=b""):
         """An engine of the local platform in the engines directory: this
         binary, perhaps with bytes after it (another build)."""
         dst = os.path.join(self.engines, self.ename)
-        with open(self.harness, "rb") as f:
+        with open(self.prospero, "rb") as f:
             data = f.read() + extra
         with open(dst, "wb") as f:
             f.write(data)
@@ -152,14 +152,14 @@ class D(R.T):
         return dst
 
     def deploy(self, *extra, env=None, target="here"):
-        argv = [self.harness, "deploy", target, "--ssh-program", self.ssh,
+        argv = [self.prospero, "deploy", target, "--ssh-program", self.ssh,
                 "--scp-program", self.scp, "--engines", self.engines,
                 "--state", self.local] + list(extra)
         return subprocess.run(argv, capture_output=True, text=True, timeout=120,
                               env=env or self.env)
 
     def deployed(self):
-        return os.path.join(self.home, ".harness", self.rname)
+        return os.path.join(self.home, ".prospero", self.rname)
 
     def scps(self):
         try:
@@ -212,15 +212,15 @@ def fresh(t):
     src = t.engine()
     p = t.deploy()
     t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
-    t.check(p.stdout == f"~/.harness/{t.rname}\n", f"stdout {p.stdout!r}")
+    t.check(p.stdout == f"~/.prospero/{t.rname}\n", f"stdout {p.stdout!r}")
     dst = t.deployed()
     t.check(os.path.isfile(dst) and sha256(dst) == sha256(src), "the engine is there")
     t.check(os.stat(dst).st_mode & 0o111, "executable")
-    t.check(oct(os.stat(os.path.dirname(dst)).st_mode & 0o777) == "0o700", "~/.harness 0700")
+    t.check(oct(os.stat(os.path.dirname(dst)).st_mode & 0o777) == "0o700", "~/.prospero 0700")
     t.check(not os.path.exists(dst + ".part"), "no .part left")
     rec = t.record()
     t.check(rec.get("host") == "here" and rec.get("platform") == t.platform and
-            rec.get("path") == f".harness/{t.rname}" and rec.get("sha256") == sha256(src)
+            rec.get("path") == f".prospero/{t.rname}" and rec.get("sha256") == sha256(src)
             and rec.get("proto") == "0" and rec.get("version") == t.version,
             f"record {rec}")
     t.check(t.scps() == 1, f"{t.scps()} uploads")
@@ -312,7 +312,7 @@ def relative_engines(t):
     """An engines directory given relative to where deploy runs, which is
     not where scp runs."""
     src = t.engine()
-    argv = [t.harness, "deploy", "here", "--ssh-program", t.ssh, "--scp-program", t.scp,
+    argv = [t.prospero, "deploy", "here", "--ssh-program", t.ssh, "--scp-program", t.scp,
             "--engines", "engines", "--state", t.local]
     p = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=t.env,
                        cwd=t.root)
@@ -365,7 +365,7 @@ def connect_deployed(t):
     up = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
     t.check(up.get("version") == t.version, f"up {up}")
     t.turn(c)
-    t.check(f".harness/{t.rname} attach" in t.sshlog(), f"ssh ran {t.sshlog()!r}")
+    t.check(f".prospero/{t.rname} attach" in t.sshlog(), f"ssh ran {t.sshlog()!r}")
     q = c.call("quit")
     t.check(q.get("ok") == 1, f"quit {q}")
     t.check(c.close() == 0, "connect exits 0")
@@ -378,7 +378,7 @@ def connect_missing(t):
     f = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "failed",
                what="failed", timeout=20)
     t.check(f.get("deploy") == "missing", f"failed {f}")
-    t.check("harness deploy here" in f.get("msg", ""), f"msg {f}")
+    t.check("prospero deploy here" in f.get("msg", ""), f"msg {f}")
     rc = c.p.wait(10)
     t.check(rc == 2, f"exit {rc}")
     t.check(t.sshlog().count(" attach") == 1, "tried more than once")
@@ -395,7 +395,7 @@ def connect_deploy(t):
     t.check("no engine on here" in dep.get("msg", ""), f"deploying {dep}")
     done = c.wait(lambda r: r.get("ev") == "deploy" and r.get("step") == "done",
                   what="deployed", timeout=60)
-    t.check(done.get("path") == f"~/.harness/{t.rname}" and
+    t.check(done.get("path") == f"~/.prospero/{t.rname}" and
             done.get("platform") == t.platform, f"done {done}")
     c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
     h = c.wait(lambda r: r.get("ev") == "reply" and r.get("id") == held, what="held list")
@@ -425,7 +425,7 @@ def auto_config(t):
     c.call("quit")
     t.check(c.close() == 0, "connect exits 0")
     # Nothing to deploy for this platform: the end, saying why
-    shutil.rmtree(os.path.join(t.home, ".harness"))
+    shutil.rmtree(os.path.join(t.home, ".prospero"))
     os.remove(os.path.join(t.local, "deploy", "here.ini"))
     for n in os.listdir(t.engines):
         os.remove(os.path.join(t.engines, n))
@@ -453,7 +453,7 @@ def mismatch(t):
     # would descend from connect's reaper, which on Linux, a subreaper,
     # takes it down when that connect ends (a real ssh's host is on
     # another machine)
-    env = dict(t.env, HARNESS_TEST_PROTO="7")
+    env = dict(t.env, PROSPERO_TEST_PROTO="7")
     first = R.Client(t)
     first.attach(env=env)
     first.call("hello")
@@ -463,7 +463,7 @@ def mismatch(t):
     f = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "failed",
                what="failed", timeout=20)
     t.check(f.get("deploy") == "mismatch" and "speaks protocol 7" in f.get("msg", "")
-            and "harness deploy here" in f.get("msg", ""), f"failed {f}")
+            and "prospero deploy here" in f.get("msg", ""), f"failed {f}")
     t.check(c.p.wait(10) == 2, "exit 2")
     c = t.connect("--deploy", env=env)
     f = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "failed",
@@ -485,7 +485,7 @@ def rsh(a, script):
     return p.stdout
 
 
-REALMADE = []   # (path, made .harness too) put there by "real"
+REALMADE = []   # (path, made .prospero too) put there by "real"
 
 
 @scenario
@@ -494,10 +494,10 @@ def real(t):
     a = t.args
     if not a.ssh:
         return "skip"
-    engines = os.path.join(os.path.dirname(t.harness), "engines")
-    before = rsh(a, "ls -a .harness 2>/dev/null; echo end")
+    engines = os.path.join(os.path.dirname(t.prospero), "engines")
+    before = rsh(a, "ls -a .prospero 2>/dev/null; echo end")
     madedir = "end" in before and not before.strip().startswith(".")
-    argv = [t.harness, "deploy", a.ssh, "--engines", engines, "--state", t.local]
+    argv = [t.prospero, "deploy", a.ssh, "--engines", engines, "--state", t.local]
     t0 = time.monotonic()
     p = subprocess.run(argv, capture_output=True, text=True, timeout=900)
     took = time.monotonic() - t0
@@ -513,10 +513,10 @@ def real(t):
             k, _, v = line.partition("=")
             rec[k.strip()] = v.strip()
     plat = rec.get("platform", "")
-    local = os.path.join(engines, f"harness-engine-{t.version}-{plat}")
+    local = os.path.join(engines, f"prospero-engine-{t.version}-{plat}")
     local += ".exe" if plat.startswith("windows") else ""
     t.check(rec.get("sha256") == sha256(local), f"record {rec}")
-    there = rsh(a, f"sha256sum .harness/{name}")
+    there = rsh(a, f"sha256sum .prospero/{name}")
     t.check(there.split()[:1] == [sha256(local)], f"there: {there!r}")
     q = subprocess.run(argv, capture_output=True, text=True, timeout=600)
     t.check(q.returncode == 0 and "already deployed" in q.stderr, f"again: {q.stderr}")
@@ -529,7 +529,7 @@ def real(t):
                 "exec ssh \"$@\"\n")
     os.chmod(prog, 0o755)
     rstate = f"{a.remote_root}/state-{t.nonce}"
-    rconf = f"{a.remote_root}/harness-{t.nonce}.ini"
+    rconf = f"{a.remote_root}/prospero-{t.nonce}.ini"
     R.remote_write(a, rconf, open(t.config).read().replace(a.url, a.remote_url))
     try:
         c = R.connect(t, ["--ssh", a.ssh, "--ssh-program", prog, "--remote-state", rstate,
@@ -563,12 +563,12 @@ def real(t):
             f.write(data)
         with open(os.path.join(other, base + ".sha256"), "w") as f:
             f.write(f"{hashlib.sha256(data).hexdigest()}  {base}\n")
-        fargv = [t.harness, "deploy", a.ssh, "--engines", other, "--state", t.local]
+        fargv = [t.prospero, "deploy", a.ssh, "--engines", other, "--state", t.local]
         p = subprocess.run(fargv, capture_output=True, text=True, timeout=900)
         t.check(p.returncode == 1 and "another build" in p.stderr, f"no --force: {p.stderr}")
         p = subprocess.run(fargv + ["--force"], capture_output=True, text=True, timeout=900)
         t.check(p.returncode == 0, f"--force: {p.stderr}")
-        there = rsh(a, f"sha256sum .harness/{name}; ls .harness")
+        there = rsh(a, f"sha256sum .prospero/{name}; ls .prospero")
         t.check(there.split()[:1] == [hashlib.sha256(data).hexdigest()], f"there: {there!r}")
         aside = [x for x in there.split() if ".old-" in x]
         print(f"     --force: {'renamed aside' if aside else 'replaced in place'}", flush=True)
@@ -582,23 +582,23 @@ def real(t):
 
 
 def realcleanup(a):
-    """Remove what "real" deployed, and ~/.harness if it made it."""
+    """Remove what "real" deployed, and ~/.prospero if it made it."""
     for name, madedir in REALMADE:
         # A host that quit may take a moment to let go of its program,
         # which Windows will not remove while it runs
-        script = (f"for i in 1 2 3 4 5; do rm -f .harness/{name} .harness/{name}.part "
-                  f".harness/{name}.old-* && [ ! -e .harness/{name} ] && break; sleep 2; done\n")
+        script = (f"for i in 1 2 3 4 5; do rm -f .prospero/{name} .prospero/{name}.part "
+                  f".prospero/{name}.old-* && [ ! -e .prospero/{name} ] && break; sleep 2; done\n")
         if madedir:
-            script += "rmdir .harness\n"
-        script += "ls -a .harness 2>/dev/null; echo end\n"
+            script += "rmdir .prospero\n"
+        script += "ls -a .prospero 2>/dev/null; echo end\n"
         left = R.remote_sh(a, script).stdout
-        print(f"     removed .harness/{name}" + (" and .harness" if madedir else "")
+        print(f"     removed .prospero/{name}" + (" and .prospero" if madedir else "")
               + f"; left: {left.split()}", flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--harness", required=True)
+    ap.add_argument("--prospero", required=True)
     ap.add_argument("--ssh", help="a host for the real scenario")
     ap.add_argument("--remote-root", help="a directory of ours there")
     ap.add_argument("--windows", action="store_true", help="the ssh host is Windows")

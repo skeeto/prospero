@@ -1,5 +1,5 @@
 // Platform integration tests, run against the real platform layer
-// $ harness --selftest
+// $ prospero --selftest
 //
 // Covers what the unit tests cannot: threads, locks, events and
 // mailboxes under real contention, timing, the file system, and reserved
@@ -114,7 +114,7 @@ static void testbasics(Selftest *t, Arena scratch)
 
     Str path = os_getenv(os, &scratch, "PATH");
     check(t, path.data && path.len, "os_getenv finds PATH");
-    Str none = os_getenv(os, &scratch, "HARNESS_SELFTEST_UNSET_X9");
+    Str none = os_getenv(os, &scratch, "PROSPERO_SELFTEST_UNSET_X9");
     check(t, !none.data, "os_getenv returns null when unset");
     Str nul = os_getenv(os, &scratch, "PATH\0X");
     check(t, !nul.data, "os_getenv of a name with a null byte");
@@ -781,7 +781,7 @@ static i32 selftest(Os *os, Arena *perm, Arena scratch)
 
     Arena a    = scratch;
     Buf   name(&a, 64);
-    print(&name, "harness-selftest-");
+    print(&name, "prospero-selftest-");
     printhex(&name, os_random(os), 16);
     Str dir = join(&a, tempdir(os, &a), finish(&name));
     say(os, dir);

@@ -1694,7 +1694,7 @@ static Str const envoverlay[][2] = {
     {"COMPOSER_NO_INTERACTION", "1"}, {"CLOUDSDK_CORE_DISABLE_PROMPTS", "1"},
     {"HOMEBREW_NO_AUTO_UPDATE", "1"}, {"GCM_INTERACTIVE", "0"},
     {"GIT_SSH_COMMAND", "ssh -o BatchMode=yes"},
-    {"SSH_ASKPASS_REQUIRE", "never"}, {"HARNESS", "1"},
+    {"SSH_ASKPASS_REQUIRE", "never"}, {"PROSPERO", "1"},
 };
 
 // Only where unset, and only on Windows.

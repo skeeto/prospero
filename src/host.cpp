@@ -1,14 +1,14 @@
-// Engine host: "harness serve", "harness attach" and "harness hosts"
+// Engine host: "prospero serve", "prospero attach" and "prospero hosts"
 //
-//   harness serve [options]               the engine, behind a local endpoint
-//   harness attach [--reconnect] [opts]   standard I/O to the endpoint
-//   harness hosts [--state DIR]           the hosts running, as JSONL
+//   prospero serve [options]               the engine, behind a local endpoint
+//   prospero attach [--reconnect] [opts]   standard I/O to the endpoint
+//   prospero hosts [--state DIR]           the hosts running, as JSONL
 //
 // A host is the engine with a local listener (os_listen): one per state
 // directory and protocol version, at os_endpoint(STATE, "host-pN"),
 // guarded by the lock file run/host-pN.lock, and registered while it runs
 // as hosts/PID.ini (pid, endpoint, version, proto, started). A client
-// reaches it through a local connection, or over ssh through "harness
+// reaches it through a local connection, or over ssh through "prospero
 // attach", which bridges its standard I/O to the endpoint, starting a
 // host when none runs. Attach starts the host detached (os_detach), so
 // that it outlives the ssh session, its errors in run/host.log, and
@@ -104,7 +104,7 @@ static Str hostname(Arena *a, i32 proto)
 static void hostsay(Os *os, Arena scratch, Str msg, Str detail = {})
 {
     Buf b(&scratch, 128 + msg.len + detail.len);
-    print(&b, "harness: ");
+    print(&b, "prospero: ");
     print(&b, msg);
     if (detail.len) {
         print(&b, ": ");
@@ -139,7 +139,7 @@ static Str hostentry(Arena *a, i64 pid, Str endpoint, i64 started, i32 proto)
     print(&b, pid);
     print(&b, "\nendpoint = ");
     print(&b, endpoint);
-    print(&b, "\nversion = " HARNESS_VERSION "\nproto = ");
+    print(&b, "\nversion = " PROSPERO_VERSION "\nproto = ");
     print(&b, (i64)proto);
     print(&b, "\nstarted = ");
     print(&b, started);
@@ -184,7 +184,7 @@ static HostEntry *hostentries(Os *os, Arena *a, Str statedir)
     return head;
 }
 
-// harness hosts: the live hosts as JSONL, removing the rest.
+// prospero hosts: the live hosts as JSONL, removing the rest.
 static i32 hostsmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 {
     Str state = {};
@@ -192,7 +192,7 @@ static i32 hostsmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         if (args[i]=="--state" && i+1<nargs) {
             state = args[++i];
         } else {
-            os_print(os, 2, "usage: harness hosts [--state DIR]\n");
+            os_print(os, 2, "usage: prospero hosts [--state DIR]\n");
             return 2;
         }
     }
@@ -662,7 +662,7 @@ static void hosthello(Host *h, HostClient *c, Arena scratch, i64 id, Json *j)
     Buf   b(&scratch, 512);
     EvOut w = evbegin(&b, {}, 0, os_time(h->os), EV_HELLO);
     putintkey(&w.json, "proto", h->proto);
-    putstrkey(&w.json, "version", HARNESS_VERSION);
+    putstrkey(&w.json, "version", PROSPERO_VERSION);
     putkey(&w.json, "caps");
     putarray(&w.json);
     putstr(&w.json, "host");
@@ -680,7 +680,7 @@ static void hosthello(Host *h, HostClient *c, Arena scratch, i64 id, Json *j)
         Buf e(&scratch, 128);
         print(&e, "this host speaks protocol ");
         print(&e, (i64)h->proto);
-        print(&e, " (version " HARNESS_VERSION "), not ");
+        print(&e, " (version " PROSPERO_VERSION "), not ");
         print(&e, proto);
         err = finish(&e);
     }
@@ -1281,10 +1281,10 @@ static i32 hostloop(Host *h)
 }
 
 
-// harness serve
+// prospero serve
 
 static Str serveusage =
-"usage: harness serve [options]\n"
+"usage: prospero serve [options]\n"
 "options:\n"
 "  -c FILE       configuration file\n"
 "  --state DIR   session storage directory\n"
@@ -1344,8 +1344,8 @@ static Host *newhost(Os *os, Arena *perm, Arena scratch, HostConf *hc, Str *err)
     }
     // Test hooks: another protocol, to test a mismatch, and a small
     // queue per client, to test one that falls behind
-    Int proto = parseint(os_getenv(os, &scratch, "HARNESS_TEST_PROTO"));
-    Int keep  = parseint(os_getenv(os, &scratch, "HARNESS_TEST_KEEPMAX"));
+    Int proto = parseint(os_getenv(os, &scratch, "PROSPERO_TEST_PROTO"));
+    Int keep  = parseint(os_getenv(os, &scratch, "PROSPERO_TEST_KEEPMAX"));
     h->proto   = proto.ok ? (i32)proto.val : h->proto;
     h->keepmax = HOST_KEEPMAX;
     if (keep.ok && keep.val>=1<<10 && keep.val<=HOST_KEEPMAX) {
@@ -1452,7 +1452,7 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     }
     Float secs = parsefloat(idle);
     if (idle.len && (!secs.ok || secs.val<=0)) {
-        os_print(os, 2, "harness: --idle must be a number of seconds above 0\n");
+        os_print(os, 2, "prospero: --idle must be a number of seconds above 0\n");
         return 2;
     }
     // The lock first, so that a second host never starts an engine, nor
@@ -1490,7 +1490,7 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 }
 
 
-// Starting a host, and harness attach
+// Starting a host, and prospero attach
 
 struct HostStart {
     Conn *c;
@@ -1519,7 +1519,7 @@ static HostStart hoststart(Os *os, Arena *perm, Arena scratch, Str statedir,
     }
     Str        exe  = os_exepath(os, &scratch);
     Slice<Str> argv = {};
-    argv = push(&scratch, argv, exe.len ? exe : Str("harness"));
+    argv = push(&scratch, argv, exe.len ? exe : Str("prospero"));
     argv = push(&scratch, argv, Str("serve"));
     argv = push(&scratch, argv, Str("--state"));
     argv = push(&scratch, argv, state);
@@ -1591,7 +1591,7 @@ static void attachstdin(void *arg)
 }
 
 static Str attachusage =
-"usage: harness attach [--reconnect] [options]\n"
+"usage: prospero attach [--reconnect] [options]\n"
 "Bridge standard I/O to the host of a state directory, starting one\n"
 "if none runs, or with --reconnect exiting with status 90 instead.\n"
 "options:\n"

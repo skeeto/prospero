@@ -1,12 +1,12 @@
 // Configuration: schema, layering, validation, edits and hot reload
 //
-// The user's file (cfgdefault: ~/.config/harness/harness.ini) is read
+// The user's file (cfgdefault: ~/.config/prospero/prospero.ini) is read
 // with its includes (ini.cpp) over built-in defaults: every setting has
 // a default in the schema below, so an empty file, or none, is a whole
 // configuration. An include's settings land where its line is, and
 // includes come before the first section, so the user's own sections
 // override a shared file's. On first run, when the user has no file,
-// the embedded seed (assets/harness.ini), which documents every key,
+// the embedded seed (assets/prospero.ini), which documents every key,
 // is written there byte for byte.
 //
 // The schema is one table: each key's section kind, type, default,
@@ -39,7 +39,7 @@
 // - At startup (newconfig with CFG_NETWAIT), a URL with no usable cached
 //   copy is fetched while the caller waits, 30 s at most for all of them,
 //   nested includes too. One with a copy loads from it, and the engine
-//   refreshes it in the background once it starts. A host (harness serve,
+//   refreshes it in the background once it starts. A host (prospero serve,
 //   CFG_NETLATER) never waits, as whoever started it waits for it to
 //   listen: it loads what is cached, and its engine fetches the rest in
 //   the background, to apply once it arrives.
@@ -64,10 +64,10 @@
 //
 //   {"cmd":"config.get","id":N}
 //   {"ts":T,"ev":"reply","id":N,"ok":1,
-//    "path":"/home/u/.config/harness/harness.ini",
+//    "path":"/home/u/.config/prospero/prospero.ini",
 //    "exists":1,
 //    "rev":3,
-//    "files":["/home/u/.config/harness/harness.ini", ...],
+//    "files":["/home/u/.config/prospero/prospero.ini", ...],
 //    "settings":[{"kind":"endpoint","name":"local","key":"url",
 //                 "value":"http://localhost/","file":"...","line":61,
 //                 "default":0,"valid":1}, ...],
@@ -125,7 +125,7 @@
 #  pragma clang diagnostic ignored "-Wc23-extensions"
 #endif
 static u8 const cfgseedbytes[] = {
-    #embed "../assets/harness.ini"
+    #embed "../assets/prospero.ini"
 };
 #ifdef __clang__
 #  pragma clang diagnostic pop
@@ -174,7 +174,7 @@ static CfgKind cfgkinds[] = {
     {"tools",    0, "Background jobs, stopping commands, and search"},
     {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
     {"ui",       0, "How the GUI looks"},
-    {"host",     0, "The engine as a background host (harness serve)"},
+    {"host",     0, "The engine as a background host (prospero serve)"},
     {"remote",   1, "An engine on another machine, reached over ssh"},
 };
 
@@ -315,9 +315,9 @@ static CfgKey cfgschema[] = {
 
     {"remote", "ssh", CFG_STRING, "", {}, {}, "remote",
      "Where ssh reaches the machine: [user@]host, or a Host of ~/.ssh/config"},
-    {"remote", "path", CFG_STRING, "harness", {}, {}, "remote",
-     "The harness executable there, a path or a name on its PATH; unset, "
-     "the engine harness deploy put there, else harness"},
+    {"remote", "path", CFG_STRING, "prospero", {}, {}, "remote",
+     "The prospero executable there, a path or a name on its PATH; unset, "
+     "the engine prospero deploy put there, else prospero"},
     {"remote", "state", CFG_STRING, "", {}, {}, "remote",
      "The state directory there, by default its own"},
     {"remote", "config", CFG_STRING, "", {}, {}, "remote",
@@ -1069,7 +1069,7 @@ static void printcfgage(Buf *b, i64 ms)
     }
 }
 
-// A cached copy, as stored: "harness include 1", then "key value" lines
+// A cached copy, as stored: "prospero include 1", then "key value" lines
 // for url, fetched (Unix epoch ms), and the etag and modified validators
 // when the server gave them, a blank line, and the text.
 struct CfgCache {
@@ -1099,7 +1099,7 @@ static CfgCache cfgreadcache(Config *c, Arena *perm, Str url)
         return r;
     }
     Cut line = cut(rd.data, '\n');
-    if (!(line.head == "harness include 1")) {
+    if (!(line.head == "prospero include 1")) {
         return r;
     }
     for (;;) {
@@ -1130,7 +1130,7 @@ static b32 cfgwritecache(Config *c, Arena scratch, CfgCache *k)
 {
     iz  cap = 256 + k->url.len + k->etag.len + k->mod.len + k->body.len;
     Buf b(&scratch, cap);
-    print(&b, "harness include 1\nurl ");
+    print(&b, "prospero include 1\nurl ");
     print(&b, k->url);
     print(&b, "\nfetched ");
     print(&b, k->fetched);
@@ -1291,7 +1291,7 @@ static void cfgsend(Config *c, CfgSlot *s, Arena scratch)
     i64 left = (s->deadline - now) / 1000;
     i64 most = CFG_CONNECTMS;
     Buf h(&scratch, 1024);
-    print(&h, "User-Agent: harness/" HARNESS_VERSION "\r\nAccept: */*\r\n");
+    print(&h, "User-Agent: prospero/" PROSPERO_VERSION "\r\nAccept: */*\r\n");
     if (s->oldetag.len) {
         print(&h, "If-None-Match: ");
         print(&h, s->oldetag);
@@ -1655,21 +1655,21 @@ static void cfgattach(Config *c, Mailbox *mbox, i64 every)
 // Loading
 
 // The default location of the user's file, or null if there is none:
-// $XDG_CONFIG_HOME/harness, else $HOME/.config/harness, else (Windows)
-// %APPDATA%\harness, with harness.ini in it.
+// $XDG_CONFIG_HOME/prospero, else $HOME/.config/prospero, else (Windows)
+// %APPDATA%\prospero, with prospero.ini in it.
 static Str cfgdefault(Os *os, Arena *a)
 {
     Str base = os_getenv(os, a, "XDG_CONFIG_HOME");
     if (base.len) {
-        return join(a, join(a, base, "harness"), "harness.ini");
+        return join(a, join(a, base, "prospero"), "prospero.ini");
     }
     Str home = os_getenv(os, a, "HOME");
     if (home.len) {
-        return join(a, join(a, home, ".config/harness"), "harness.ini");
+        return join(a, join(a, home, ".config/prospero"), "prospero.ini");
     }
     Str appdata = os_getenv(os, a, "APPDATA");
     if (appdata.len) {
-        return join(a, join(a, appdata, "harness"), "harness.ini");
+        return join(a, join(a, appdata, "prospero"), "prospero.ini");
     }
     return {};
 }

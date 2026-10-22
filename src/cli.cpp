@@ -1,8 +1,8 @@
-// Command line: harness run, and harness --headless
+// Command line: prospero run, and prospero --headless
 //
-//   harness run [options] PROMPT        one turn, printing protocol records
-//   harness run [options] --resume SID [PROMPT]
-//   harness --headless [options]        protocol v0 on standard I/O
+//   prospero run [options] PROMPT        one turn, printing protocol records
+//   prospero run [options] --resume SID [PROMPT]
+//   prospero --headless [options]        protocol v0 on standard I/O
 //
 // Both drive the engine thread exactly as the GUI will: commands in,
 // records out. "run" prints each record as a JSONL line, or readable
@@ -23,9 +23,9 @@
 // This is free and unencumbered software released into the public domain.
 
 static Str cliusage =
-"usage: harness run [options] PROMPT\n"
-"       harness run [options] --resume SID [PROMPT]\n"
-"       harness --headless [options]\n"
+"usage: prospero run [options] PROMPT\n"
+"       prospero run [options] --resume SID [PROMPT]\n"
+"       prospero --headless [options]\n"
 "options:\n"
 "  -C DIR        working directory (default: the current one)\n"
 "  -e ENDPOINT   endpoint URL or configured name\n"
@@ -376,7 +376,7 @@ static void clirecord(Cli *c, Arena scratch, Str line)
         i64 id = jsonint(jsonget(j, "id"), 0);
         if (!jsonint(jsonget(j, "ok"), 0) && id!=99) {
             prettyline(c);
-            os_print(c->os, 2, concat(&t, concat(&t, "harness: ",
+            os_print(c->os, 2, concat(&t, concat(&t, "prospero: ",
                      jsonstr(jsonget(j, "err"))), "\n"));
             c->exitcode = 2;
             cliquit(c, t);
@@ -488,17 +488,17 @@ static Str defaultstate(Os *os, Arena *a)
 {
     Str base = os_getenv(os, a, "XDG_STATE_HOME");
     if (base.len) {
-        return join(a, base, "harness");
+        return join(a, base, "prospero");
     }
     if (HOST_WINDOWS) {
         Str local = os_getenv(os, a, "LOCALAPPDATA");
         if (local.len) {
-            return join(a, local, "harness");
+            return join(a, local, "prospero");
         }
     }
     Str home = os_getenv(os, a, "HOME");
     if (!home.len) home = os_getenv(os, a, "USERPROFILE");
-    return join(a, join(a, home, ".local/state"), "harness");
+    return join(a, join(a, home, ".local/state"), "prospero");
 }
 
 // The configuration, its diagnostics reported on standard error: an
@@ -512,15 +512,15 @@ static Config *cliconfig(Os *os, Arena *perm, Arena scratch, Str config,
     Str     path = config.len ? config : cfgdefault(os, perm);
     Config *cfg  = newconfig(os, perm, scratch, path, !config.len, statedir, net);
     if (!cfg) {
-        os_print(os, 2, "harness: out of memory\n");
+        os_print(os, 2, "prospero: out of memory\n");
         return 0;
     } else if (config.len && !cfg->user) {
-        os_print(os, 2, "harness: cannot read the configuration file\n");
+        os_print(os, 2, "prospero: cannot read the configuration file\n");
         return 0;
     }
     for (iz i = 0; i < cfg->ini->diags.len; i++) {
         Buf b(&scratch, 256);
-        print(&b, "harness: ");
+        print(&b, "prospero: ");
         print(&b, cfg->ini->diags[i]);
         putbyte(&b, '\n');
         os_print(os, 2, finish(&b));
@@ -577,7 +577,7 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 
     Str sessions = join(&perm, c.statedir, "sessions");
     if (!os_mkdirs(os, scratch, sessions)) {
-        os_print(os, 2, "harness: cannot create the state directory\n");
+        os_print(os, 2, "prospero: cannot create the state directory\n");
         return 2;
     }
 
@@ -585,7 +585,7 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
     c.out   = c.spare ? newmailbox(&perm, 4<<20, 0, 0) : 0;
     c.e   = c.out ? newengine(os, &perm, cfg, c.statedir, c.out) : 0;
     if (!c.e || !enginestart(c.e)) {
-        os_print(os, 2, "harness: cannot start the engine\n");
+        os_print(os, 2, "prospero: cannot start the engine\n");
         return 2;
     }
 
@@ -595,7 +595,7 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
         r->e  = c.e;
         r->a  = newarena(os_reserve(os, (iz)1<<24));
         if (!r->a.beg || !os_thread(os, stdinthread, r)) {
-            os_print(os, 2, "harness: cannot read standard input\n");
+            os_print(os, 2, "prospero: cannot read standard input\n");
             return 2;
         }
     } else if (resume.len) {

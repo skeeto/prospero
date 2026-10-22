@@ -527,7 +527,7 @@ struct Engine {
     Adm         adm;      // the queues at each endpoint
     i64         admat;    // ticks: admit again then, 0 if never
     i64         minute;   // ticks of a minute of slow retries (a test
-                          // hook, HARNESS_TEST_MINUTE_MS, shortens it)
+                          // hook, PROSPERO_TEST_MINUTE_MS, shortens it)
     Slice<Parked> parked; // sessions parked, revived by their next command
     i64         cfgwait[8];  // config.get {refresh} ids awaiting fetches
     i32         ncfgwait;
@@ -938,7 +938,7 @@ static Str authheaders(Arena *a, Endpoint *ep, Str accept)
     print(&b, "Content-Type: application/json\r\n");
     print(&b, "Accept: ");
     print(&b, accept);
-    print(&b, "\r\nUser-Agent: harness/" HARNESS_VERSION "\r\n");
+    print(&b, "\r\nUser-Agent: prospero/" PROSPERO_VERSION "\r\n");
     if (ep->key.len) {
         print(&b, "Authorization: Bearer ");
         print(&b, ep->key);
@@ -4637,7 +4637,7 @@ static void logsession(Session *s, Arena scratch)
     Buf   b(&scratch, 1024 + s->rolepr.len);
     EvOut w = sbegin(s, &b, EV_SESSION);
     putintkey(&w.json, "proto", 0);
-    putstrkey(&w.json, "version", HARNESS_VERSION);
+    putstrkey(&w.json, "version", PROSPERO_VERSION);
     putstrkey(&w.json, "cwd", s->cwd);
     putstrkey(&w.json, "role", s->role);
     putstrkey(&w.json, "model", s->model);
@@ -6260,7 +6260,7 @@ static void command(Engine *e, Arena scratch, Str line)
         Buf   b(&a, 256);
         EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_HELLO);
         putintkey(&w.json, "proto", 0);
-        putstrkey(&w.json, "version", HARNESS_VERSION);
+        putstrkey(&w.json, "version", PROSPERO_VERSION);
         putkey(&w.json, "caps");
         putarray(&w.json);
         putend(&w.json);
@@ -6793,7 +6793,7 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     }
     loadtrained(e, newarena(e->scratch));
     // Tests shorten minutes of slow retries to milliseconds
-    Int minute = parseint(os_getenv(os, &e->perm, "HARNESS_TEST_MINUTE_MS"));
+    Int minute = parseint(os_getenv(os, &e->perm, "PROSPERO_TEST_MINUTE_MS"));
     e->minute  = minute.ok && minute.val>0 && minute.val<=60000 ? minute.val*MS : 60*SEC;
     // URL includes refresh in the background now, every ten minutes
     cfgattach(cfg, e->in, 10*e->minute);

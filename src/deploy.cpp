@@ -1,9 +1,9 @@
-// Engine deployment: "harness deploy", and deploying for a Remote
+// Engine deployment: "prospero deploy", and deploying for a Remote
 //
-//   harness deploy NAME|DEST [--force] [options]
+//   prospero deploy NAME|DEST [--force] [options]
 //
-// Puts an engine built for the remote machine's platform in ~/.harness
-// there, over ssh and scp, where "harness connect" (remote.cpp) then
+// Puts an engine built for the remote machine's platform in ~/.prospero
+// there, over ssh and scp, where "prospero connect" (remote.cpp) then
 // runs it:
 //
 // 1. Probe, with one command that sh and cmd.exe both take:
@@ -15,13 +15,13 @@
 //    "SYSNAME MACHINE" and then "%OS%" as it is. cmd.exe expands the
 //    variables instead, after a uname of its own (Git's) if it has one,
 //    else with the processor architecture, then ver's version line.
-// 2. Choose harness-engine-VERSION-OS-ARCH[.exe] from the engines
+// 2. Choose prospero-engine-VERSION-OS-ARCH[.exe] from the engines
 //    directory ("engines" next to this executable unless given; built
 //    by tools/engines.py), checked against its .sha256 file. With none
 //    there for the platform, this executable serves when it is built
 //    for that platform.
-// 3. Prepare ~/.harness there (mode 0700), learning what is already at
-//    the engine's place, .harness/engine-PROTO-VERSION-OS-ARCH[.exe]:
+// 3. Prepare ~/.prospero there (mode 0700), learning what is already at
+//    the engine's place, .prospero/engine-PROTO-VERSION-OS-ARCH[.exe]:
 //    the same engine means nothing to upload. With no tool there to
 //    compute a SHA-256 (below), deploying fails at once, for good.
 // 4. Upload with scp to that name plus ".part", again after a dropped
@@ -97,7 +97,7 @@ struct DeployConf {
 
 struct Deployed {
     Str path;      // the engine there, for its shell, from the home directory
-    Str shown;     // the same as ~/.harness/NAME
+    Str shown;     // the same as ~/.prospero/NAME
     Str platform;
     Str err;       // why not, unless ok
     b32 ok;
@@ -292,7 +292,7 @@ static Str deployhash(Arena *a, Str out)
 // Commands there
 
 enum : i32 {
-    DEPLOY_PREPARE,  // make ~/.harness, find a hash tool, hash what is there
+    DEPLOY_PREPARE,  // make ~/.prospero, find a hash tool, hash what is there
     DEPLOY_VERIFY,   // hash the upload, or say nohash
     DEPLOY_INSTALL,  // rename it into place, then run it
     DEPLOY_RUN,      // run what is there
@@ -300,7 +300,7 @@ enum : i32 {
 };
 
 // A command for a step, in the shell's dialect, about the engine at
-// path (.harness/NAME, from the home directory). The stamp names an
+// path (.prospero/NAME, from the home directory). The stamp names an
 // old engine renamed aside, on Windows. A POSIX one runs in sh -c,
 // whatever the login shell (fish, csh), and so has no single quotes.
 static Str deploycmd(Arena *a, i32 shell, i32 step, Str path, i64 stamp)
@@ -314,10 +314,10 @@ static Str deploycmd(Arena *a, i32 shell, i32 step, Str path, i64 stamp)
     switch (step) {
     case DEPLOY_PREPARE:
         if (sh) {
-            print(&b, "mkdir -p .harness && chmod 700 .harness && echo ready; "
-                      "{ command -v sha256sum || command -v shasum || "
-                      "command -v openssl; } >/dev/null 2>&1 || echo nohash; "
-                      "if [ -f ");
+            print(&b, "mkdir -p .prospero && chmod 700 .prospero && "
+                      "echo ready; { command -v sha256sum || "
+                      "command -v shasum || command -v openssl; } "
+                      ">/dev/null 2>&1 || echo nohash; if [ -f ");
             print(&b, p);
             print(&b, " ]; then echo have; { sha256sum ");
             print(&b, p);
@@ -327,8 +327,8 @@ static Str deploycmd(Arena *a, i32 shell, i32 step, Str path, i64 stamp)
             print(&b, p);
             print(&b, "; } 2>/dev/null; fi");
         } else {
-            print(&b, "(if not exist .harness mkdir .harness) & "
-                      "(if exist .harness echo ready) & "
+            print(&b, "(if not exist .prospero mkdir .prospero) & "
+                      "(if exist .prospero echo ready) & "
                       "(where certutil >nul 2>&1 || echo nohash) & (if exist ");
             print(&b, p);
             print(&b, " (echo have & certutil -hashfile ");
@@ -505,7 +505,7 @@ static void deploynote(Deploy *d, Arena scratch, Str step, Str msg,
     DeployConf *c = d->conf;
     if (c->verbose) {
         Buf b(&scratch, 64 + msg.len);
-        print(&b, "harness: deploy: ");
+        print(&b, "prospero: deploy: ");
         print(&b, msg);
         putbyte(&b, '\n');
         os_print(d->os, 2, finish(&b));
@@ -756,7 +756,8 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     // The engine for it
     b32 win  = pf.os == "windows";
     Str exe  = os_exepath(os, &scratch);
-    Str file = concat(&scratch, "harness-engine-" HARNESS_VERSION "-", pf.name);
+    Str file = concat(&scratch, "prospero-engine-" PROSPERO_VERSION "-",
+                      pf.name);
     file = win ? concat(&scratch, file, ".exe") : file;
     Str from = conf->engines.len ? conf->engines : join(&scratch, parentdir(exe), "engines");
     Str local = join(&scratch, from, file);
@@ -798,15 +799,15 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     b = Buf(&scratch, 128);
     print(&b, "engine-");
     print(&b, (i64)HOST_PROTO);
-    print(&b, "-" HARNESS_VERSION "-");
+    print(&b, "-" PROSPERO_VERSION "-");
     print(&b, pf.name);
     print(&b, win ? Str(".exe") : Str(""));
     Str rname = finish(&b);
-    Str rpath = concat(&scratch, pf.shell==DEPLOY_CMD ? Str(".harness\\")
-                                                      : Str(".harness/"), rname);
-    Str upath = concat(&scratch, ".harness/", rname);
+    Str rdir  = pf.shell==DEPLOY_CMD ? Str(".prospero\\") : Str(".prospero/");
+    Str rpath = concat(&scratch, rdir, rname);
+    Str upath = concat(&scratch, ".prospero/", rname);
     upath = concat(&scratch, upath, ".part");
-    Str shown = concat(&scratch, "~/.harness/", rname);
+    Str shown = concat(&scratch, "~/.prospero/", rname);
     i64 stamp = os_time(os);
 
     b = Buf(&scratch, 256);
@@ -828,7 +829,7 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
         return deployfail(&d, perm, scratch, "cancelled");
     } else if (!ready) {
         b = Buf(&scratch, 256);
-        print(&b, "cannot create ~/.harness on ");
+        print(&b, "cannot create ~/.prospero on ");
         print(&b, name);
         print(&b, ": ");
         print(&b, deploysaid(&prep));
@@ -843,7 +844,7 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     } else if (have && there!=sha && !conf->force) {
         b = Buf(&scratch, 256);
         print(&b, name);
-        print(&b, " has another build of harness " HARNESS_VERSION " at ");
+        print(&b, " has another build of prospero " PROSPERO_VERSION " at ");
         print(&b, shown);
         print(&b, ": --force replaces it (what runs from it keeps running)");
         return deployfail(&d, perm, scratch, finish(&b));
@@ -944,7 +945,7 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     DeployRun run = deployssh(&d, &scratch, "install", cmd);
     if (deploycancelled(&d)) {
         return deployfail(&d, perm, scratch, "cancelled");
-    } else if (find(run.out, "harness " HARNESS_VERSION) < 0) {
+    } else if (find(run.out, "prospero " PROSPERO_VERSION) < 0) {
         b = Buf(&scratch, 256);
         print(&b, "the engine does not run on ");
         print(&b, name);
@@ -973,7 +974,7 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     print(&b, rpath);
     print(&b, "\nsha256 = ");
     print(&b, sha);
-    print(&b, "\nversion = " HARNESS_VERSION "\nproto = ");
+    print(&b, "\nversion = " PROSPERO_VERSION "\nproto = ");
     print(&b, (i64)HOST_PROTO);
     print(&b, "\ndeployed = ");
     print(&b, os_time(os));
@@ -998,13 +999,13 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
 }
 
 
-// harness deploy
+// prospero deploy
 
 static Str deployusage =
-"usage: harness deploy NAME|DEST [--force] [options]\n"
+"usage: prospero deploy NAME|DEST [--force] [options]\n"
 "Put an engine for the platform of a remote machine, a [remote NAME] or\n"
-"an ssh destination, in ~/.harness there, over ssh and scp, where\n"
-"\"harness connect\" then runs it. Prints where it went.\n"
+"an ssh destination, in ~/.prospero there, over ssh and scp, where\n"
+"\"prospero connect\" then runs it. Prints where it went.\n"
 "options:\n"
 "  --force             replace another build of this version there\n"
 "  --engines DIR       the engines to choose from (default: engines\n"

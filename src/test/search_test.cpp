@@ -377,7 +377,7 @@ static void test_search(Test *t)
     {
         ToolEnv te = {};
         te.rg  = "rg";
-        te.exe = "harness";
+        te.exe = "prospero";
         Args g = {};
         g.pattern = "**/*.{c,h}";
         Slice<Str> v = searchargv(a, &te, TOOL_GLOB, "/w", ".", &g);
@@ -388,14 +388,14 @@ static void test_search(Test *t)
         }
         expect(t, "argv glob rg", finish(&b), "rg --no-config --hidden --glob "
                "!.git --no-messages --null --color never --files --sortr "
-               "modified --type-add harness:*.{c,h} --type harness -- .");
+               "modified --type-add prospero:*.{c,h} --type prospero -- .");
         g.pattern = "src/**/*.c";
         v = searchargv(a, &te, TOOL_GLOB, "/w", ".", &g);
-        expect(t, "argv glob walker", v[0], "harness");
+        expect(t, "argv glob walker", v[0], "prospero");
         Args q = {};
         q.pattern = "x";
         q.glob    = "**/*.c";
         v = searchargv(a, &te, TOOL_GREP, "/w", ".", &q);
-        expect(t, "argv grep type", istr(a, v[0]=="rg" && v[v.len-7]=="harness:*.c"), "1");
+        expect(t, "argv grep type", istr(a, v[0]=="rg" && v[v.len-7]=="prospero:*.c"), "1");
     }
 }

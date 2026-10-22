@@ -1,9 +1,9 @@
-// Remote engines: the client library, and "harness connect"
+// Remote engines: the client library, and "prospero connect"
 //
-//   harness connect NAME [options]            a [remote NAME] host
-//   harness connect --ssh DEST [options]      a host over ssh
-//   harness connect --local [options]         this machine's host
-//   harness connect --endpoint EP [options]   the one at EP, if it runs
+//   prospero connect NAME [options]            a [remote NAME] host
+//   prospero connect --ssh DEST [options]      a host over ssh
+//   prospero connect --local [options]         this machine's host
+//   prospero connect --endpoint EP [options]   the one at EP, if it runs
 //
 // A Remote speaks to an engine host (host.cpp) as the in-process engine
 // would to its frontend: protocol v0 commands in (remotecmd), records
@@ -55,8 +55,8 @@
 // it cannot be reached, it is gone and the remote ends, closed.
 //
 // The harness there is the one configured (path), else the engine
-// "harness deploy" put there for this protocol (deploy.cpp records it),
-// else "harness" on its PATH. When that one is missing (the shell finds
+// "prospero deploy" put there for this protocol (deploy.cpp records it),
+// else "prospero" on its PATH. When that one is missing (the shell finds
 // no such program) or cannot attach (another protocol, or too old),
 // deploying one helps: a remote that may deploy (deploy, as with
 // "connect --deploy" or [remote NAME] deploy = auto) does so once,
@@ -116,7 +116,7 @@ struct RemoteConf {
     Str name;      // the remote's name, in the sessions list
     Str ssh;       // destination for ssh, empty for this machine's host
     Str program;   // the ssh program, "ssh" if empty
-    Str path;      // the harness there, "harness" if empty
+    Str path;      // the harness there, "prospero" if empty
     Str state;     // its state directory there (--state), if not its own
     Str rconfig;   // its configuration file there (-c), if not its own
     Str localstate;  // here: for ssh's errors, or the host of --local
@@ -282,7 +282,7 @@ static void remoteown(Remote *r, Arena scratch, i32 cmd, Str sid, i64 from, i32 
     EvOut w = cmdbegin(&b, cmd, --r->nextown);
     if (cmd == CMD_HELLO) {
         putintkey(&w.json, "proto", HOST_PROTO);
-        putstrkey(&w.json, "client", "harness " HARNESS_VERSION);
+        putstrkey(&w.json, "client", "prospero " PROSPERO_VERSION);
     }
     if (sid.len) {
         putstrkey(&w.json, "sid", sid);
@@ -391,7 +391,7 @@ static b32 remotestart(Remote *r, Arena scratch)
     Str path = r->conf.path;
     if (!path.len) {
         DeployRec dr = deployrecord(os, &scratch, r->conf.localstate, r->conf.ssh);
-        path = dr.ok && dr.proto==HOST_PROTO ? dr.path : Str("harness");
+        path = dr.ok && dr.proto==HOST_PROTO ? dr.path : Str("prospero");
     }
     Buf cmd(&scratch, 256);
     b32 ok = remotearg(&cmd, path);
@@ -574,13 +574,13 @@ static void remotedeploy(Remote *r, Arena scratch, Str why)
 // Not when ssh itself could not run here (the reaper's 127).
 static i32 remoteneed(Str log, i32 code)
 {
-    if (find(log, "harness: cannot run ") >= 0) {
+    if (find(log, "prospero: cannot run ") >= 0) {
         return NEED_NONE;
     } else if (code==127 ||
             find(log, "is not recognized as an internal or external command")>=0 ||
             find(log, "cannot find the path specified")>=0) {
         return NEED_MISSING;
-    } else if (code==126 || ((code==1 || code==2) && find(log, "usage: harness")>=0)) {
+    } else if (code==126 || ((code==1 || code==2) && find(log, "usage: prospero")>=0)) {
         return NEED_MISMATCH;
     }
     return NEED_NONE;
@@ -605,7 +605,7 @@ static void remoteneeded(Remote *r, Arena scratch, i32 need, Str said)
         remotedeploy(r, scratch, finish(&b));
         return;
     }
-    print(&b, ": deploy one with \"harness deploy ");
+    print(&b, ": deploy one with \"prospero deploy ");
     print(&b, r->conf.name);
     print(&b, "\"");
     r->why = clone(&r->perm, finish(&b));
@@ -753,10 +753,10 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
             print(&b, jsonstr(jsonget(rec.root, "version")));
             print(&b, "), but this one speaks ");
             print(&b, (i64)HOST_PROTO);
-            print(&b, " (version " HARNESS_VERSION "): install a matching "
+            print(&b, " (version " PROSPERO_VERSION "): install a matching "
                       "version there");
             if (ssh) {
-                print(&b, ", as \"harness deploy ");
+                print(&b, ", as \"prospero deploy ");
                 print(&b, r->conf.name);
                 print(&b, "\" does");
             }
@@ -1118,7 +1118,7 @@ static void remoteclose(Remote *r)
 }
 
 // The same once every command sent is answered, or after 30 s: the end
-// of a frontend's commands, as of standard input (harness connect).
+// of a frontend's commands, as of standard input (prospero connect).
 static void remotefinish(Remote *r)
 {
     remoteask(r, REMOTE_FINISH);
@@ -1132,25 +1132,25 @@ static void remotedrop(Remote *r)
 }
 
 
-// harness connect
+// prospero connect
 
 static Str connectusage =
-"usage: harness connect NAME [options]\n"
-"       harness connect --ssh DEST [options]\n"
-"       harness connect --local [options]\n"
-"       harness connect --endpoint EP [options]\n"
-"Protocol v0 on standard I/O, as harness --headless, with the engine\n"
+"usage: prospero connect NAME [options]\n"
+"       prospero connect --ssh DEST [options]\n"
+"       prospero connect --local [options]\n"
+"       prospero connect --endpoint EP [options]\n"
+"Protocol v0 on standard I/O, as prospero --headless, with the engine\n"
 "a host on another machine ([remote NAME], or --ssh), or on this one\n"
-"(starting one if none runs, or only the one at EP, as harness hosts\n"
+"(starting one if none runs, or only the one at EP, as prospero hosts\n"
 "lists it). When standard input ends, the link ends: the host runs on.\n"
 "options:\n"
 "  --ssh DEST          ssh destination: [user@]host\n"
-"  --path PATH         the harness there (default: harness)\n"
+"  --path PATH         the harness there (default: prospero)\n"
 "  --remote-state DIR  its state directory there\n"
 "  --remote-config F   its configuration file there\n"
 "  --ssh-program PROG  ssh itself (default: ssh)\n"
 "  --deploy            deploy an engine there if it has none, or one of\n"
-"                      another protocol (as harness deploy)\n"
+"                      another protocol (as prospero deploy)\n"
 "  --engines DIR       the engines to deploy (default: engines next to\n"
 "                      this program)\n"
 "  --scp-program PROG  scp itself, for deploying (default: scp)\n"

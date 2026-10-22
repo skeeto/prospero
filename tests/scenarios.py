@@ -5,23 +5,23 @@
 # ///
 """Engine scenarios: the harness against the fault-injecting fake provider.
 
-Each scenario runs the real binary ("harness run", or "harness --headless"
+Each scenario runs the real binary ("prospero run", or "prospero --headless"
 for cancels) in a fresh working and state directory, with a model name
 that selects a script in fake_provider.py, then checks the event sequence,
 the files left behind, the exit code and a wall-clock bound, which counts
 from after the directories are made, without the time spent waiting on
 ssh for a remote host's files and processes.
 
-  uv run tests/scenarios.py --harness build/harness [NAME ...]
-  uv run tests/scenarios.py --harness PATH --host WINHOST   (Windows)
-  uv run tests/scenarios.py --harness build/harness --soak 30
+  uv run tests/scenarios.py --prospero build/prospero [NAME ...]
+  uv run tests/scenarios.py --prospero PATH --host WINHOST   (Windows)
+  uv run tests/scenarios.py --prospero build/prospero --soak 30
 
 With --host, the fake provider runs here and the harness runs on the
 Windows host over ssh, reaching the provider through a reverse tunnel;
-PATH is the harness.exe already on that host. busybox.exe is copied next
+PATH is the prospero.exe already on that host. busybox.exe is copied next
 to it from the host's w64devkit, which is how the harness finds its shell.
 
-  uv run tests/scenarios.py --harness 'C:/DOCUME~1/u/LOCALS~1/Temp/harness.exe' \\
+  uv run tests/scenarios.py --prospero 'C:/DOCUME~1/u/LOCALS~1/Temp/prospero.exe' \\
       --xp XPHOST [NAME ...]
 
 With --xp, the same for Windows XP running skeeto/sshd
@@ -85,10 +85,10 @@ class LocalHost:
     windows = os.name == "nt"
     prefix = []  # what starts the harness, as cleanup.py's disclaim.py
 
-    def __init__(self, harness, url):
-        self.harness = os.path.abspath(harness)
+    def __init__(self, prospero, url):
+        self.prospero = os.path.abspath(prospero)
         self.url = url
-        self.root = tempfile.mkdtemp(prefix="harness-scen-")
+        self.root = tempfile.mkdtemp(prefix="prospero-scen-")
         self.t0 = time.time()
 
     def close(self):
@@ -127,7 +127,7 @@ class LocalHost:
 
     def popen(self, args, cwd, stdin=False, env=None):
         return subprocess.Popen(
-            self.prefix + [self.harness] + args, cwd=cwd,
+            self.prefix + [self.prospero] + args, cwd=cwd,
             stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=dict(os.environ, **env) if env else None,
@@ -152,18 +152,18 @@ class SshHost:
     """A Windows host reached over ssh, with busybox from w64devkit."""
     windows = True
 
-    def __init__(self, host, harness, port, rport):
+    def __init__(self, host, prospero, port, rport):
         self.host = host
-        self.harness = harness
-        self.ctl = os.path.join(tempfile.mkdtemp(prefix="harness-ssh-"), "ctl")
+        self.prospero = prospero
+        self.ctl = os.path.join(tempfile.mkdtemp(prefix="prospero-ssh-"), "ctl")
         subprocess.run(["ssh", "-M", "-S", self.ctl, "-fN", "-o", "ExitOnForwardFailure=yes",
                         "-R", f"{rport}:127.0.0.1:{port}", host], check=True)
         self.url = f"http://127.0.0.1:{rport}"
         tmp = self.sh("echo \"$TMP\"").strip()
-        self.root = f"{tmp}/harness-scen-{random.randrange(1 << 32):08x}"
+        self.root = f"{tmp}/prospero-scen-{random.randrange(1 << 32):08x}"
         self.sh(f"mkdir -p {self.root} && cp $HOME/w64devkit/bin/busybox.exe "
-                f"{self.root}/busybox.exe && cp {shlex.quote(harness)} {self.root}/harness.exe")
-        self.exe = f"{self.root}/harness.exe"
+                f"{self.root}/busybox.exe && cp {shlex.quote(prospero)} {self.root}/prospero.exe")
+        self.exe = f"{self.root}/prospero.exe"
 
     def close(self):
         self.sh(cleanroot(self.root))
@@ -282,19 +282,19 @@ class XpHost(SshHost):
     Each command is a connection of its own, retried when the link (Wi-Fi,
     which stalls now and then) drops it."""
 
-    def __init__(self, host, harness, url):
+    def __init__(self, host, prospero, url):
         self.host = host
-        self.harness = harness
+        self.prospero = prospero
         self.url = url
         tmp = self.sh("echo \"$TMP\"").strip()
         run = f"{random.randrange(1 << 32):08x}"
-        self.root = f"{tmp}/harness-scen-{run}"
+        self.root = f"{tmp}/prospero-scen-{run}"
         # A name of the run's own, which no other run's harness, nor any
         # engine of the user's, has
-        self.exename = f"h-{run}.exe"
+        self.exename = f"p-{run}.exe"
         self.sh(f"mkdir -p {self.root} && "
                 f"cp \"$HOME/w64devkit/bin/busybox.exe\" {self.root}/busybox.exe && "
-                f"cp {shlex.quote(harness)} {self.root}/{self.exename}")
+                f"cp {shlex.quote(prospero)} {self.root}/{self.exename}")
         self.exe = f"{self.root}/{self.exename}"
 
     def close(self):
@@ -447,7 +447,7 @@ class T:
         self.base = base
         self.work = host.join(base, "work")
         self.state = host.join(base, "state")
-        self.config = host.join(base, "harness.ini")
+        self.config = host.join(base, "prospero.ini")
         host.mkdir(self.work)
         host.mkdir(self.state)
         # Endpoint settings, with "_top" settings before any section,
@@ -1428,8 +1428,8 @@ def instructions(t):
     imports, in the system prompt; a subdirectory's when the agent
     works there, as a note."""
     xdg = t.host.join(t.base, "xdg")
-    t.host.mkdir(t.host.join(xdg, "harness"))
-    t.host.write(t.host.join(xdg, "harness", "AGENTS.md"), "Global rule: be brief.\n")
+    t.host.mkdir(t.host.join(xdg, "prospero"))
+    t.host.write(t.host.join(xdg, "prospero", "AGENTS.md"), "Global rule: be brief.\n")
     t.host.mkdir(t.host.join(t.work, ".git"))
     t.put("AGENTS.md", "Root rule: use tabs.\nSee @docs/style.md, not "
           "`@docs/nope.md`, nor @../outside.md.\n")
@@ -1830,7 +1830,7 @@ def config(t):
 
         r = call("config.get")
         t.check(r["ok"] == 1 and r["exists"] == 1, f"config.get: {r}")
-        t.check(r["path"].endswith("harness.ini") and len(r["files"]) == 2
+        t.check(r["path"].endswith("prospero.ini") and len(r["files"]) == 2
                 and r["files"][1].endswith("team.ini"), f"files {r['files']}")
         d = r["diags"]
         t.check(len(d) == 1 and (d[0]["line"], d[0]["col"], d[0]["severity"])
@@ -1911,14 +1911,14 @@ def config_seed(t):
     replies = [json.loads(x) for x in out.splitlines() if x.strip()]
     r = next((e for e in replies if e.get("id") == 1), {})
     seedpath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "..", "assets", "harness.ini")
+                            "..", "assets", "prospero.ini")
     with open(seedpath, "rb") as f:
         seed = f.read().decode()
-    written = t.host.read(t.host.join(xdg, "harness", "harness.ini"))
+    written = t.host.read(t.host.join(xdg, "prospero", "prospero.ini"))
     t.check(written == seed, "the seed is written unchanged")
     t.check(r.get("ok") == 1 and r.get("diags") == [] and r.get("rev") == 1,
             f"config.get {r} {err}")
-    t.check(r["path"].endswith("harness/harness.ini"), f"path {r['path']}")
+    t.check(r["path"].endswith("prospero/prospero.ini"), f"path {r['path']}")
     t.check(p.returncode == 0, f"exit {p.returncode}: {err}")
 
 
@@ -1995,7 +1995,7 @@ def crash_ask(t):
         a.send("prompt", sid=sid, text="go")
         a.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
         if t.host.windows:
-            t.host.killhard(a.p, t.pids("harnesspid")[0])
+            t.host.killhard(a.p, t.pids("prosperopid")[0])
         else:
             t.host.killhard(a.p)
         a.p.wait()
@@ -2106,7 +2106,7 @@ def config_link(t):
     the link stays a link."""
     dot = t.host.join(t.base, "dotfiles")
     t.host.mkdir(dot)
-    target = t.host.join(dot, "harness.ini")
+    target = t.host.join(dot, "prospero.ini")
     os.rename(t.config, target)
     os.symlink(target, t.config)
     h = t.headless()
@@ -2300,7 +2300,7 @@ def queue(t):
     t.check(peak == 1, f"one model at a time: {peak}")
 
 
-MINUTE = {"HARNESS_TEST_MINUTE_MS": "60"}  # a minute in 60 ms
+MINUTE = {"PROSPERO_TEST_MINUTE_MS": "60"}  # a minute in 60 ms
 
 
 @scenario(bound=15)
@@ -2636,7 +2636,7 @@ def role_tools(t):
             f"nope {ends[2]}")
 
 
-PARK = {"HARNESS_TEST_MINUTE_MS": "20"}  # parked after 140 ms idle
+PARK = {"PROSPERO_TEST_MINUTE_MS": "20"}  # parked after 140 ms idle
 
 
 @scenario(bound=20)
@@ -3473,7 +3473,7 @@ def soak(host, minutes, workers):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--harness", required=True, help="the harness binary")
+    ap.add_argument("--prospero", required=True, help="the harness binary")
     ap.add_argument("--host", help="run the harness on this Windows host over ssh")
     ap.add_argument("--xp", help="run the harness on this Windows XP host over "
                     "ssh, reaching the provider at this machine's LAN address")
@@ -3492,11 +3492,11 @@ def main():
         srv, url = fake_provider.start()
     port = srv.server_address[1]
     if args.xp:
-        host = XpHost(args.xp, args.harness, url)
+        host = XpHost(args.xp, args.prospero, url)
     elif args.host:
-        host = SshHost(args.host, args.harness, port, 20000 + port % 20000)
+        host = SshHost(args.host, args.prospero, port, 20000 + port % 20000)
     else:
-        host = LocalHost(args.harness, url)
+        host = LocalHost(args.prospero, url)
     try:
         if args.soak:
             ok = soak(host, args.soak, args.workers)

@@ -9,7 +9,7 @@
 //
 // HTTP requests run through cpp-httplib in a separate translation unit
 // (http_httplib.cpp) behind a small C interface, and tool processes run
-// under reapers: this same executable started as "harness --reap".
+// under reapers: this same executable started as "prospero --reap".
 //
 // This is free and unencumbered software released into the public domain.
 #include <dirent.h>
@@ -41,7 +41,7 @@
 #ifdef __linux__
 #  include <sys/prctl.h>   // PR_SET_CHILD_SUBREAPER
 #endif
-#if HARNESS_GUI
+#if PROSPERO_GUI
 #  include <SDL3/SDL.h>
 #  include "imgui.h"
 #  include "imgui_internal.h"
@@ -50,7 +50,7 @@
 #  include "misc/freetype/imgui_freetype.h"
 #  include "md4c.h"
 #endif
-#include "harness.cpp"
+#include "prospero.cpp"
 #include "reap.cpp"
 
 #ifdef __APPLE__
@@ -144,7 +144,7 @@ static b32 writeall(i32 fd, Str s)
 
 [[noreturn]] static void os_oom()
 {
-    writeall(2, "harness: out of memory\n");
+    writeall(2, "prospero: out of memory\n");
     _exit(2);
 }
 
@@ -862,7 +862,7 @@ static Str os_lasterr(Os *, Arena *a)
 // Processes
 //
 // A tool runs under a reaper, this executable started as
-//   harness --reap CWD ARGV...
+//   prospero --reap CWD ARGV...
 // with null stdin (or an input pipe), the output pipe on fds 1 and 2 (or
 // fd 1, with errors to a file), the lifeline on fd 3, and a status pipe
 // on fd 4. The reaper leads a new session and process
@@ -885,7 +885,7 @@ static Str os_lasterr(Os *, Arena *a)
 // whatever is left in its session, and what a scan of every process
 // finds by origin (reaporigin): orphans of the processes recorded,
 // which keep their parents' unique ids until they exec, and when the
-// reaper was spawned disclaimed, as "harness --reap-disclaimed",
+// reaper was spawned disclaimed, as "prospero --reap-disclaimed",
 // whatever it answers for as the responsible process of the tool's
 // tree. A reaper is disclaimed only when the harness answers for
 // itself, as an app does, and its executable is still the one it runs,
@@ -1515,7 +1515,7 @@ static void onsweep(int sig)
 
 static void reapsay(char const *what, char const *arg)
 {
-    Str parts[] = {"harness: ", {}, " ", {}, ": ", {}, "\n"};
+    Str parts[] = {"prospero: ", {}, " ", {}, ": ", {}, "\n"};
     parts[1] = {(u8 *)what, (iz)__builtin_strlen(what)};
     parts[3] = {(u8 *)arg, (iz)__builtin_strlen(arg)};
     parts[2] = parts[3].len ? parts[2] : Str{};
@@ -2044,14 +2044,14 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
     // macOS: the ids of the tool's processes start from the reaper's
     // own, and the sweep looks for what answers to it, if it was spawned
     // disclaimed (--reap-disclaimed) and that took (reaprespid). A test
-    // hook, HARNESS_TEST_REAP=noorigin, leaves responsibility alone to
+    // hook, PROSPERO_TEST_REAP=noorigin, leaves responsibility alone to
     // find what left the tree: no fork watch, and no forking parents.
     r.kq = -1;
     #ifdef __APPLE__
     if (!__builtin_strcmp(argv[1], "--reap-disclaimed")) {
         r.spi = respspi();
     }
-    char *hook   = getenv("HARNESS_TEST_REAP");
+    char *hook   = getenv("PROSPERO_TEST_REAP");
     b32   origin = !hook || __builtin_strcmp(hook, "noorigin");
     i32   resp   = r.spi.pidfor ? r.spi.pidfor(r.self) : 0;
     r.uniq  = reapinfo(&r, r.self, 0).uniq;
@@ -2148,7 +2148,7 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
 // A host's socket lives in its state directory's run directory, which
 // only its owner may enter, and that is the whole of the access control.
 // Where that path is too long for a socket address (about 100 bytes),
-// the address goes through a link /tmp/harness-UID-HASH to the run
+// the address goes through a link /tmp/prospero-UID-HASH to the run
 // directory instead, which must be this user's and point there.
 //
 // Each Conn has a reader thread, posting what arrives, and a writer
@@ -2436,7 +2436,7 @@ static Str os_endpoint(Os *, Arena *a, Str statedir, Str name)
 
     // Too long for an address: through a link of this user's
     Buf b(&tmp, 64);
-    print(&b, "/tmp/harness-");
+    print(&b, "/tmp/prospero-");
     print(&b, (i64)geteuid());
     putbyte(&b, '-');
     printhex(&b, hash(run), 16);
@@ -2570,7 +2570,7 @@ static void os_unlisten(Os *, Listener *l)
     if (sa.sun_path[0]) {
         unlink(sa.sun_path);
         char *path  = sa.sun_path;
-        Str   tmp   = "/tmp/harness-";
+        Str   tmp   = "/tmp/prospero-";
         iz    slash = 0;
         for (iz i = 0; path[i]; i++) {
             slash = path[i]=='/' ? i : slash;
@@ -2916,7 +2916,7 @@ static void os_httpfree(Os *, Http *h)
 }
 
 
-#if HARNESS_GUI
+#if PROSPERO_GUI
 #  include "app.cpp"
 #  include "gui_sdl.cpp"
 #endif
@@ -2938,7 +2938,7 @@ int main(int argc, char **argv)
     Os os = {};
     i32 life[2];
     if (!cloexecpipe(life)) {
-        writeall(2, "harness: cannot create the lifeline pipe\n");
+        writeall(2, "prospero: cannot create the lifeline pipe\n");
         return 2;
     }
     os.lifer = life[0];
@@ -2952,7 +2952,7 @@ int main(int argc, char **argv)
     iz      cap = sizeof(void *)==8 ? (iz)1<<34 : (iz)1<<28;
     Region *r   = os_reserve(&os, cap);
     if (!r) {
-        writeall(2, "harness: out of memory\n");
+        writeall(2, "prospero: out of memory\n");
         return 2;
     }
     Arena a = newarena(r);
@@ -2973,7 +2973,7 @@ int main(int argc, char **argv)
         args[i].data = (u8 *)argv[i];
         while (args[i].data[args[i].len]) args[i].len++;
     }
-    #if HARNESS_GUI
+    #if PROSPERO_GUI
     if (guiwanted(args, argc)) {
         // For sigthread (gui_sdl.cpp) alone: every thread inherits this
         sigset_t quit;

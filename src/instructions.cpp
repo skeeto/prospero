@@ -2,7 +2,7 @@
 //
 // At session start the harness gathers the user's and the project's
 // instructions for the agent: the user's own file in the configuration
-// directory (~/.config/harness/AGENTS.md), then one file for each
+// directory (~/.config/prospero/AGENTS.md), then one file for each
 // directory from the repository root (the nearest ancestor of the
 // working directory holding .git, else the working directory itself)
 // down to the working directory: the first of the configured names

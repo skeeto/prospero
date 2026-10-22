@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""A fault-injecting fake OpenAI Chat Completions server for harness tests.
+"""A fault-injecting fake OpenAI Chat Completions server for Prospero's tests.
 
 The model name picks the script: "fake:SCENARIO" or "fake:SCENARIO:NONCE",
 where requests are counted per full model name, so each run of a scenario
@@ -843,7 +843,7 @@ def sc_crash_ask(model, n, req):
     # The harness's pid (on Windows, the shell's parent), then a write
     # outside, which asks, and the harness dies while asking
     if n == 0:
-        yield from tool(model, n, "shell", {"command": "echo $PPID > harnesspid"})
+        yield from tool(model, n, "shell", {"command": "echo $PPID > prosperopid"})
     elif n == 1:
         yield from tool(model, n, "write", {"path": "../asked.txt", "content": "outside"})
     else:
@@ -1404,7 +1404,7 @@ def sc_edit_hashline(model, n, req):
         yield from answer(model, "Edited by line.")
 
 
-# The GUI's checklist (harness gui --drive, run by tests/gui.py): the
+# The GUI's checklist (prospero gui --drive, run by tests/gui.py): the
 # prompt that began the turn picks the reply, and the step is how many
 # responses the turn has had so far.
 

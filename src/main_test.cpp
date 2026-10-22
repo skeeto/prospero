@@ -1,13 +1,13 @@
 // Unit tests: a platform layer with an in-memory file system, a fake
 // clock, and single-threaded stand-ins for threads, locks, and events.
-// $ cmake --build build && ./build/harness_test
+// $ cmake --build build && ./build/prospero_test
 // This is free and unencumbered software released into the public domain.
 #include <stdio.h>
 #include <stdlib.h>
-#if HARNESS_GUI
+#if PROSPERO_GUI
 #  include "md4c.h"
 #endif
-#include "harness.cpp"
+#include "prospero.cpp"
 #include "wide.cpp"
 #include "reap.cpp"
 
@@ -224,7 +224,7 @@ static Str os_getenv(Os *os, Arena *a, Str name)
     }
     return {};
 }
-static Str os_exepath(Os *, Arena *) { return "harness"; }
+static Str os_exepath(Os *, Arena *) { return "prospero"; }
 
 static b32  os_thread(Os *, void (*)(void *), void *) { return 0; }
 static void os_lockinit(Lock *) {}
@@ -503,7 +503,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/config_test.cpp"
 #include "test/engine_test.cpp"  // after config's test platform
 #include "test/deploy_test.cpp"
-#if HARNESS_GUI
+#if PROSPERO_GUI
 #  include "sched.cpp"
 #  include "highlight.cpp"
 #  include "doc.cpp"
@@ -546,7 +546,7 @@ int main()
     test_engine(&t);
     test_config(&t);
     test_deploy(&t);
-    #if HARNESS_GUI
+    #if PROSPERO_GUI
     test_sched(&t);
     test_highlight(&t);
     test_doc(&t);

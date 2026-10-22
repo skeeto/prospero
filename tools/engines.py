@@ -3,20 +3,20 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Build the headless engines that "harness deploy" puts on remote machines.
+"""Build the headless engines that "prospero deploy" puts on remote machines.
 
   uv run tools/engines.py [--out DIR] [--linux HOST] [PLATFORM ...]
 
-Each engine is a Release build with HARNESS_GUI=OFF, named
-harness-engine-VERSION-OS-ARCH[.exe] in DIR (default: build/engines, where
-build/harness looks for them) with a .sha256 file beside it, as sha256sum
+Each engine is a Release build with PROSPERO_GUI=OFF, named
+prospero-engine-VERSION-OS-ARCH[.exe] in DIR (default: build/engines, where
+build/prospero looks for them) with a .sha256 file beside it, as sha256sum
 writes it:
 
   macos-arm64     here, on an Apple Silicon Mac (macOS 11 and later)
   windows-x86_64  here, with mingw-w64 (Homebrew's): CRT-free
   windows-i686    the same, the XP engine (cmake/Toolchain-Mingw32.cmake),
                   its imports checked against XP SP3 by tests/imports.py
-  linux-aarch64   on HOST over ssh (--linux or $HARNESS_LINUX_HOST, an
+  linux-aarch64   on HOST over ssh (--linux or $PROSPERO_LINUX_HOST, an
   linux-x86_64    aarch64 Linux machine with the x86_64-linux-gnu cross
                   compiler): static, so that any C library will do, and
                   checked to run (x86_64 under the host's QEMU binfmt, if
@@ -75,7 +75,7 @@ def depsargs(deps):
 
 def publish(out, ver, plat, path):
     """Copy an engine into out under its deployed name, with its hash."""
-    name = f"harness-engine-{ver}-{plat}" + (".exe" if plat.startswith("windows") else "")
+    name = f"prospero-engine-{ver}-{plat}" + (".exe" if plat.startswith("windows") else "")
     dst = os.path.join(out, name)
     tmp = dst + ".tmp"
     shutil.copyfile(path, tmp)
@@ -91,17 +91,17 @@ def publish(out, ver, plat, path):
 
 def cmakebuild(builddir, extra):
     run(["cmake", "-S", ROOT, "-B", builddir, "-G", "Ninja",
-         "-DCMAKE_BUILD_TYPE=Release", "-DHARNESS_GUI=OFF"] + extra)
-    run(["cmake", "--build", builddir, "--target", "harness"])
+         "-DCMAKE_BUILD_TYPE=Release", "-DPROSPERO_GUI=OFF"] + extra)
+    run(["cmake", "--build", builddir, "--target", "prospero"])
 
 
 def macos(args, ver):
     b = os.path.join(args.work, "macos-arm64")
     cmakebuild(b, ["-DCMAKE_OSX_ARCHITECTURES=arm64",
                    "-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"] + depsargs(args.deps))
-    exe = os.path.join(b, "harness")
+    exe = os.path.join(b, "prospero")
     out = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
-    if out.strip() != f"harness {ver}":
+    if out.strip() != f"prospero {ver}":
         sys.exit(f"engines: {exe} --version says {out!r}")
     publish(args.out, ver, "macos-arm64", exe)
 
@@ -112,7 +112,7 @@ def windows(args, ver, arch):
     b = os.path.join(args.work, plat)
     cmakebuild(b, [f"-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/{tc}",
                    "-DCMAKE_EXE_LINKER_FLAGS=-s"])
-    exe = os.path.join(b, "harness.exe")
+    exe = os.path.join(b, "prospero.exe")
     run(["uv", "run", os.path.join(ROOT, "tests", "imports.py"), exe])
     publish(args.out, ver, plat, exe)
 
@@ -146,14 +146,14 @@ def linux(args, ver, plats):
         b = f"build-{plat}"
         flags = " ".join(builds[plat])
         script += [
-            f"cmake -S src -B {b} -G Ninja -DCMAKE_BUILD_TYPE=Release -DHARNESS_GUI=OFF "
-            f"-DHARNESS_STATIC=ON -DCMAKE_EXE_LINKER_FLAGS=-s {flags} >{b}.log 2>&1 "
+            f"cmake -S src -B {b} -G Ninja -DCMAKE_BUILD_TYPE=Release -DPROSPERO_GUI=OFF "
+            f"-DPROSPERO_STATIC=ON -DCMAKE_EXE_LINKER_FLAGS=-s {flags} >{b}.log 2>&1 "
             f"|| {{ tail -30 {b}.log; exit 1; }}",
-            f"cmake --build {b} --target harness >>{b}.log 2>&1 "
+            f"cmake --build {b} --target prospero >>{b}.log 2>&1 "
             f"|| {{ tail -30 {b}.log; exit 1; }}",
             f"grep -i 'warning' {b}.log || true",
-            f"file {b}/harness",
-            f"{b}/harness --version",
+            f"file {b}/prospero",
+            f"{b}/prospero --version",
         ]
     say(f"building {', '.join(plats)} on {host}")
     p = subprocess.run(["ssh", host, "sh -s"], input="\n".join(script) + "\n", text=True)
@@ -161,7 +161,7 @@ def linux(args, ver, plats):
         sys.exit(f"engines: the build on {host} failed")
     for plat in plats:
         got = os.path.join(args.work, f"{plat}.bin")
-        run(["scp", "-q", f"{host}:{rdir}/build-{plat}/harness", got])
+        run(["scp", "-q", f"{host}:{rdir}/build-{plat}/prospero", got])
         publish(args.out, ver, plat, got)
 
 
@@ -170,11 +170,11 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "build", "engines"))
     ap.add_argument("--work", default=os.path.join(ROOT, "build-engines"),
                     help="build directories here (default: build-engines)")
-    ap.add_argument("--linux", default=os.environ.get("HARNESS_LINUX_HOST"),
+    ap.add_argument("--linux", default=os.environ.get("PROSPERO_LINUX_HOST"),
                     help="ssh host for the Linux builds "
-                         "(default: $HARNESS_LINUX_HOST)")
-    ap.add_argument("--remote-dir", default="/tmp/harness-engines",
-                    help="its build directory (default: /tmp/harness-engines)")
+                         "(default: $PROSPERO_LINUX_HOST)")
+    ap.add_argument("--remote-dir", default="/tmp/prospero-engines",
+                    help="its build directory (default: /tmp/prospero-engines)")
     ap.add_argument("--deps", help="FetchContent sources: mbedtls-src, cpp-httplib-src")
     ap.add_argument("platforms", nargs="*", help=" ".join(PLATFORMS))
     args = ap.parse_args()
@@ -184,7 +184,7 @@ def main():
             sys.exit(f"engines: unknown platform {p}: one of {' '.join(PLATFORMS)}")
     lin = [p for p in plats if p.startswith("linux-")]
     if lin and not args.linux:
-        sys.exit("engines: the Linux builds need --linux HOST or $HARNESS_LINUX_HOST")
+        sys.exit("engines: the Linux builds need --linux HOST or $PROSPERO_LINUX_HOST")
     if args.deps:
         args.deps = os.path.abspath(args.deps)
     os.makedirs(args.out, exist_ok=True)

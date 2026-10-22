@@ -5,22 +5,22 @@
 # ///
 """The GUI's scripted checklist against the fake provider.
 
-Runs "harness gui --drive" with a real engine, in this process or as
-"harness --headless" (--subprocess), in fresh working, state and
+Runs "prospero gui --drive" with a real engine, in this process or as
+"prospero --headless" (--subprocess), in fresh working, state and
 configuration directories, against fake_provider.py's "gui" scenario.
 It passes when the checklist reports no failed checks and no stale
 frames, the harness exits cleanly in time, the settings edit changed one
 line of the configuration file, and the commands it cancelled or stopped
 by quitting are gone, with no engine process left behind.
 
-  uv run tests/gui.py --harness build/harness [--subprocess] [--inbox-cap N]
-  uv run tests/gui.py --harness build/harness --mode idle      (60 s)
-  uv run tests/gui.py --harness build/harness --mode streamtest
-  uv run tests/gui.py --harness build/harness --mode signals   (POSIX)
-  uv run tests/gui.py --harness build/harness --mode settings [--shots DIR]
-  uv run tests/gui.py --harness build/harness --mode enginestop
-  uv run tests/gui.py --harness build/harness --fake [--mode idle]   (M1's)
-  uv run tests/gui.py --harness build/harness --mode bench   (M1's scale)
+  uv run tests/gui.py --prospero build/prospero [--subprocess] [--inbox-cap N]
+  uv run tests/gui.py --prospero build/prospero --mode idle      (60 s)
+  uv run tests/gui.py --prospero build/prospero --mode streamtest
+  uv run tests/gui.py --prospero build/prospero --mode signals   (POSIX)
+  uv run tests/gui.py --prospero build/prospero --mode settings [--shots DIR]
+  uv run tests/gui.py --prospero build/prospero --mode enginestop
+  uv run tests/gui.py --prospero build/prospero --fake [--mode idle]   (M1's)
+  uv run tests/gui.py --prospero build/prospero --mode bench   (M1's scale)
 
 The settings mode edits a value longer than a field's slack and picks
 the theme, dark then light, from its list over a transcript that shows
@@ -204,7 +204,7 @@ def docktype(pid):
     return m.group(1) if m else None
 
 
-def guipid(harness, state):
+def guipid(prospero, state):
     """The GUI process: the harness, not xvfb-run, not the engine."""
     try:
         out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
@@ -213,7 +213,7 @@ def guipid(harness, state):
         return None
     for line in out.splitlines():
         pid, _, args = line.strip().partition(" ")
-        if args.startswith(harness + " gui ") and state in args:
+        if args.startswith(prospero + " gui ") and state in args:
             return int(pid)
     return None
 
@@ -320,8 +320,8 @@ class Local:
 
     def __init__(self, args):
         self.args = args
-        self.root = tempfile.mkdtemp(prefix="harness-gui-")
-        self.harness = os.path.abspath(args.harness)
+        self.root = tempfile.mkdtemp(prefix="prospero-gui-")
+        self.prospero = os.path.abspath(args.prospero)
 
     def path(self, *parts):
         return os.path.join(self.root, *parts)
@@ -346,7 +346,7 @@ class Local:
     def run(self, guiargs, timeout, cwd=None, tag="", env=None):
         """Run the GUI, echoing its log (each line after tag, if any), in
         cwd (default the working directory). Returns (status, lines)."""
-        cmd = [self.harness, "gui"] + guiargs
+        cmd = [self.prospero, "gui"] + guiargs
         if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
                 and not os.environ.get("WAYLAND_DISPLAY"):
             cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
@@ -370,10 +370,10 @@ class Local:
                 sys.stdout.write(tag + line)
                 sys.stdout.flush()
                 if "drive: mark: " in line:
-                    pid = guipid(self.harness, self.path("state"))
+                    pid = guipid(self.prospero, self.path("state"))
                     if pid:
                         meter = Meter(pid, line.split("drive: mark: ")[1].strip())
-                elif line.startswith("harness: rates: ") and meter:
+                elif line.startswith("prospero: rates: ") and meter:
                     print("measured: " + meter.report(), flush=True)
                     meter = None
                 if time.monotonic() > deadline:
@@ -397,7 +397,7 @@ class Local:
 
     def popen(self, args, stdin=False):
         return subprocess.Popen(
-            [self.harness] + args, cwd=self.path("work"),
+            [self.prospero] + args, cwd=self.path("work"),
             stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 
@@ -437,10 +437,10 @@ class Remote:
         import scenarios
         self.args = args
         rport = 20000 + random.randrange(20000)
-        self.h = scenarios.SshHost(args.host, args.harness, port, rport)
+        self.h = scenarios.SshHost(args.host, args.prospero, port, rport)
         self.root = self.h.root
         self.url = self.h.url
-        self.task = f"harness-gui-{random.randrange(1 << 32):08x}"
+        self.task = f"prospero-gui-{random.randrange(1 << 32):08x}"
         self.tasks = []
 
     def path(self, *parts):
@@ -489,7 +489,7 @@ class Remote:
                 if "drive: mark: " in line:
                     pid = self.guipid()
                     mark = (pid, self.cputime(pid), time.monotonic()) if pid else None
-                elif line.startswith("harness: rates: ") and mark:
+                elif line.startswith("prospero: rates: ") and mark:
                     cpu1 = self.cputime(mark[0])
                     if mark[1] is not None and cpu1 is not None:
                         dt = time.monotonic() - mark[2]
@@ -515,7 +515,7 @@ class Remote:
         return makesessions(self, ini, state, work)
 
     def guipid(self):
-        ps = ("Get-CimInstance Win32_Process -Filter \\\"Name='harness.exe'\\\" | Where-Object "
+        ps = ("Get-CimInstance Win32_Process -Filter \\\"Name='prospero.exe'\\\" | Where-Object "
               f"{{ $_.CommandLine -like '*{win_root(self.root)}*' -and $_.CommandLine -like '* gui *' }} | "
               "ForEach-Object { $_.ProcessId }")
         r = self.h.ssh(f'powershell -NoProfile -Command "{ps}"')
@@ -592,11 +592,11 @@ def signals(args):
     """An idle GUI, with no deadline left to wake it, quits at once on
     SIGTERM and on SIGINT (Ctrl+C in its terminal). POSIX only."""
     problems = []
-    harness = os.path.abspath(args.harness)
+    prospero = os.path.abspath(args.prospero)
     for sig in (signal.SIGTERM, signal.SIGINT):
-        root = tempfile.mkdtemp(prefix="harness-sig-")
+        root = tempfile.mkdtemp(prefix="prospero-sig-")
         state = os.path.join(root, "state")
-        cmd = [harness, "gui", "--fake", "--statedir", state]
+        cmd = [prospero, "gui", "--fake", "--statedir", state]
         if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
                 and not os.environ.get("WAYLAND_DISPLAY"):
             cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
@@ -604,7 +604,7 @@ def signals(args):
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, env=env, start_new_session=True)
         time.sleep(8)  # past the probe and the layout's save: idle
-        pid = guipid(harness, state)
+        pid = guipid(prospero, state)
         if not pid:
             problems.append(f"{sig.name}: no GUI process")
             P.signal_group(p, signal.SIGKILL)
@@ -686,7 +686,7 @@ def background(args, host, guiargs, guicwd):
         if sys.platform == "darwin" and isinstance(host, Local):
             # Its window gone, the process leaves the Dock: the menu bar's
             # icon is the way back
-            pid = guipid(host.harness, host.path("state"))
+            pid = guipid(host.prospero, host.path("state"))
             kind = None
             for _ in range(15):
                 kind = docktype(pid) if pid else "no process"
@@ -709,7 +709,7 @@ def background(args, host, guiargs, guicwd):
             print("the turn ended in the background", flush=True)
         # A registration whose host is long gone, which must hold up nothing
         dead = host.path("state", "run", "dead.sock") if not isinstance(host, Remote) \
-            else "\\\\.\\pipe\\harness-test-dead-host"
+            else "\\\\.\\pipe\\prospero-test-dead-host"
         host.write(stale, f"pid = 99999999\nendpoint = {dead}\nversion = 0.0.0\n"
                           f"proto = 0\nstarted = 1\n")
         # Probing every second while idle, so that a clock drawn with no
@@ -805,13 +805,13 @@ class Far:
         self.server = None
         if self.local:
             self.root = host.path("far")
-            self.harness = host.h.exe if self.windows else host.harness
+            self.prospero = host.h.exe if self.windows else host.prospero
         else:
             self.root = f"{args.remote_root}/gui-{nonce}"
-            self.harness = args.remote_harness
+            self.prospero = args.remote_prospero
         self.state = self.root + "/state"
         self.work = self.root + "/work"
-        self.config = self.root + "/harness.ini"
+        self.config = self.root + "/prospero.ini"
         cfg = config(url, model) + "\n# Its host goes soon after its last client\n" \
                                    "[host]\nidle_exit = 5\n"
         if self.local:
@@ -835,7 +835,7 @@ class Far:
                 self.server = host.popen(serve)
             else:
                 self.server = subprocess.Popen(
-                    [self.harness] + serve, stdin=subprocess.DEVNULL,
+                    [self.prospero] + serve, stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True)
         else:
@@ -858,20 +858,20 @@ class Far:
     def section(self):
         dest = "here" if self.local else self.args.ssh
         return (f"\n# The checklist's remote host\n[remote r]\nssh = {dest}\n"
-                f"path = {self.harness}\nstate = {self.state}\nconfig = {self.config}\n"
+                f"path = {self.prospero}\nstate = {self.state}\nconfig = {self.config}\n"
                 f"\n# One that fails: ssh would take its destination for an option\n"
                 f"[remote bad]\nssh = -oProxyCommand=false\n")
 
     def env(self):
-        return {"HARNESS_TEST_SSH": self.ssh} if self.local else {}
+        return {"PROSPERO_TEST_SSH": self.ssh} if self.local else {}
 
     def hosts(self):
         """The hosts running for its state directory, as JSONL lines."""
         if self.local:
-            r = subprocess.run([self.harness, "hosts", "--state", self.state],
+            r = subprocess.run([self.prospero, "hosts", "--state", self.state],
                                capture_output=True, text=True)
             return [l for l in r.stdout.splitlines() if l.strip()]
-        out = self.sh(f"'{self.harness}' hosts --state '{self.state}'")
+        out = self.sh(f"'{self.prospero}' hosts --state '{self.state}'")
         return [l for l in out.splitlines() if l.strip()]
 
     def close(self, keep):
@@ -909,10 +909,10 @@ class Far:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--harness", required=True,
+    ap.add_argument("--prospero", required=True,
                     help="the binary, or with --host the .exe on that host")
     ap.add_argument("--subprocess", action="store_true",
-                    help="the engine as harness --headless")
+                    help="the engine as prospero --headless")
     ap.add_argument("--inbox-cap", type=int,
                     help="the GUI's inbox, small to force lost records (default "
                          "32768, but the GUI's own for --mode bench, which "
@@ -922,7 +922,7 @@ def main():
                              "settings", "enginestop", "bench", "background", "remote"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
-    ap.add_argument("--remote-harness", help="with --ssh: the harness built there")
+    ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
     ap.add_argument("--remote-root", default="/tmp",
                     help="with --ssh: where its directories go there")
     ap.add_argument("--ssh-windows", action="store_true",
@@ -941,8 +941,8 @@ def main():
     if args.mode == "signals":
         return signals(args)
 
-    if args.mode == "remote" and args.ssh and not args.remote_harness:
-        ap.error("--ssh needs --remote-harness")
+    if args.mode == "remote" and args.ssh and not args.remote_prospero:
+        ap.error("--ssh needs --remote-prospero")
     # A remote host over ssh reaches the provider on this machine's address
     bind = lanaddress(args.ssh) if args.mode == "remote" and args.ssh else "127.0.0.1"
     srv, url = fake_provider.start(bind)
@@ -954,7 +954,7 @@ def main():
     host = Remote(args, srv.server_address[1]) if args.host else Local(args)
     work = host.path("work")
     state = host.path("state")
-    ini = host.path("harness.ini")
+    ini = host.path("prospero.ini")
     host.mkdir(work)
     host.mkdir(state)
     host.write(host.path("work", "hello.txt"), "hello world\n")

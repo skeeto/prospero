@@ -5,10 +5,10 @@
 # ///
 """Check the headless Windows engine's imports against Windows XP's.
 
-  uv run tests/imports.py build-xp/harness.exe
+  uv run tests/imports.py build-xp/prospero.exe
   uv run tests/imports.py --exports kernel32.dll advapi32.dll winhttp.dll
 
-The headless engine (HARNESS_GUI=OFF), i686 or x86_64, may import only
+The headless engine (PROSPERO_GUI=OFF), i686 or x86_64, may import only
 from KERNEL32, ADVAPI32 and WINHTTP, only by name, and only functions
 that Windows XP SP3's copies of those DLLs export. Anything newer must be
 looked up at run time (GetProcAddress) with a fallback. It must also

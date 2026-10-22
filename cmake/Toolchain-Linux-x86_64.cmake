@@ -3,7 +3,7 @@
 # tools/engines.py.
 #
 #   cmake -B build-x64 -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain-Linux-x86_64.cmake \
-#         -DHARNESS_GUI=OFF -DHARNESS_STATIC=ON
+#         -DPROSPERO_GUI=OFF -DPROSPERO_STATIC=ON
 #   cmake --build build-x64
 #
 # Host tooling: x86_64-linux-gnu-gcc and -g++ (apt: g++-x86-64-linux-gnu),

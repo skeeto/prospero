@@ -3,20 +3,20 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Engine hosts and remote clients: harness serve, attach and connect.
+"""Engine hosts and remote clients: prospero serve, attach and connect.
 
 Each scenario runs the real binary against tests/fake_provider.py in a
-fresh state directory, speaking frames (src/frame.cpp) to "harness
-attach" through a client written here, or protocol v0 lines to "harness
+fresh state directory, speaking frames (src/frame.cpp) to "prospero
+attach" through a client written here, or protocol v0 lines to "prospero
 connect", and checks what arrives: every durable record of a session
 once and in order (the same bytes as its log), and the deltas of a
 response exactly once even when the stream breaks in the middle.
 
-  uv run tests/remote.py --harness build/harness [NAME ...]
-  uv run tests/remote.py --harness build/harness --ssh HOST \\
-      --remote-harness /tmp/harness-m5-remote/build/harness
+  uv run tests/remote.py --prospero build/prospero [NAME ...]
+  uv run tests/remote.py --prospero build/prospero --ssh HOST \\
+      --remote-prospero /tmp/prospero-remote/build/prospero
 
-With --ssh the ssh scenarios run too: "harness connect --ssh HOST" against
+With --ssh the ssh scenarios run too: "prospero connect --ssh HOST" against
 the harness already built on that host, which reaches the fake provider
 through a reverse tunnel. Its ssh is a wrapper that records its pid, so
 that a scenario can kill it in the middle of a stream. A host that cannot
@@ -24,9 +24,9 @@ forward a port back, like skeeto/sshd on XP, takes --no-tunnel (the
 provider then listens on this machine's LAN address), and --shell for
 its scripts:
 
-  uv run tests/remote.py --harness build/harness --ssh XPHOST \\
-      --no-tunnel --shell "sh -s" --remote-harness C:/.../harness.exe \\
-      --remote-root %TMP%/harness-m5-remote \\
+  uv run tests/remote.py --prospero build/prospero --ssh XPHOST \\
+      --no-tunnel --shell "sh -s" --remote-prospero C:/.../prospero.exe \\
+      --remote-root %TMP%/prospero-remote \\
       ssh_reconnect ssh_offline
 """
 
@@ -296,7 +296,7 @@ class Stream:
 
 
 class Client:
-    """A link and its streams, through "harness attach"."""
+    """A link and its streams, through "prospero attach"."""
 
     def __init__(self, t):
         self.t = t
@@ -310,7 +310,7 @@ class Client:
         if self.stream:
             self.records += self.stream.records
             self.lines += self.stream.lines
-        argv = [self.t.harness, "attach", "--state", self.t.state, "-c", self.t.config]
+        argv = [self.t.prospero, "attach", "--state", self.t.state, "-c", self.t.config]
         if reconnect:
             argv.append("--reconnect")
         self.stream = Stream(self.link, argv + list(extra), env=env or self.t.env)
@@ -336,14 +336,16 @@ class Client:
 
 class T:
     def __init__(self, args, name):
-        self.harness = os.path.abspath(args.harness)
+        self.prospero = os.path.abspath(args.prospero)
         self.args = args
         self.name = name
         self.nonce = f"{random.randrange(1 << 32):08x}"
-        self.root = tempfile.mkdtemp(prefix="hrem-")
+        # A short name, so that a host's socket fits a socket address
+        # (about 100 bytes) without a link in /tmp (os_endpoint)
+        self.root = tempfile.mkdtemp(prefix="prem-")
         self.state = os.path.join(self.root, "state")
         self.work = os.path.join(self.root, "work")
-        self.config = os.path.join(self.root, "harness.ini")
+        self.config = os.path.join(self.root, "prospero.ini")
         os.makedirs(self.work)
         self.env = dict(os.environ)
         self.procs = []
@@ -364,7 +366,7 @@ class T:
             raise Failure(msg)
 
     def hostpids(self):
-        out = subprocess.run([self.harness, "hosts", "--state", self.state],
+        out = subprocess.run([self.prospero, "hosts", "--state", self.state],
                              capture_output=True, text=True).stdout
         return [json.loads(x)["pid"] for x in out.splitlines() if x.strip()]
 
@@ -450,7 +452,7 @@ psfield = P.psfield
 
 
 def grandchild(pid, root):
-    """Whether root is the parent of pid's parent: an ssh that harness
+    """Whether root is the parent of pid's parent: an ssh that prospero
     connect (root, a process of ours) started under its reaper."""
     try:
         parent = int(psfield(pid, "ppid"))
@@ -486,7 +488,7 @@ def gone(pid, within=10.0):
 def no_host(t):
     """attach --reconnect with no host: status 90 at once, nothing started."""
     t0 = time.monotonic()
-    p = subprocess.run([t.harness, "attach", "--reconnect", "--state", t.state],
+    p = subprocess.run([t.prospero, "attach", "--reconnect", "--state", t.state],
                        capture_output=True, text=True, timeout=10)
     t.check(p.returncode == 90, f"exit {p.returncode}: {p.stderr}")
     t.check("no host" in p.stderr, f"stderr: {p.stderr!r}")
@@ -618,7 +620,7 @@ def backlog(t):
     """A host that keeps little for each client (a test hook), its client
     away while an answer larger than that comes: the answer comes from
     the session's log, every durable record once, in order."""
-    env = dict(t.env, HARNESS_TEST_KEEPMAX=str(640 << 10))
+    env = dict(t.env, PROSPERO_TEST_KEEPMAX=str(640 << 10))
     c = Client(t)
     s = c.attach(env=env)
     c.call("hello")
@@ -662,7 +664,7 @@ def idle_exit(t):
     t.check(gone(pids[0], 15), "the host exited")
     dt = time.monotonic() - t0
     t.check(dt > 1.5, f"exited after {dt:.1f} s, before its idle time")
-    p = subprocess.run([t.harness, "attach", "--reconnect", "--state", t.state],
+    p = subprocess.run([t.prospero, "attach", "--reconnect", "--state", t.state],
                        capture_output=True, text=True, timeout=10)
     t.check(p.returncode == 90, f"then no host: exit {p.returncode}")
     t.check(not os.listdir(os.path.join(t.state, "hosts")), "registration removed")
@@ -692,12 +694,12 @@ def garbage(t):
     s = c.attach()
     c.call("hello")
     pid = t.hostpids()[0]
-    p = subprocess.Popen([t.harness, "attach", "--reconnect", "--state", t.state],
+    p = subprocess.Popen([t.prospero, "attach", "--reconnect", "--state", t.state],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
     out, _ = p.communicate(b"\x02" + os.urandom(64), timeout=10)
     t.check(p.returncode == 0, f"attach exit {p.returncode}")
-    q = subprocess.Popen([t.harness, "attach", "--reconnect", "--state", t.state],
+    q = subprocess.Popen([t.prospero, "attach", "--reconnect", "--state", t.state],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
     big = struct.pack(">BIII", REGULAR, 1, 0, 0xffffffff)
@@ -739,7 +741,7 @@ class Raw:
     acknowledge nothing (ack 0), so that the host keeps all it sends."""
 
     def __init__(self, t, env):
-        self.p = subprocess.Popen([t.harness, "attach", "--state", t.state, "-c", t.config],
+        self.p = subprocess.Popen([t.prospero, "attach", "--state", t.state, "-c", t.config],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, env=env)
         self.frames = []
@@ -805,7 +807,7 @@ def behind_drop(t):
     command (a hello in two pieces, gathered in the stream's buffer)
     meets that: dropped, as too far behind, while the host goes on."""
     keep = 4096
-    env = dict(t.env, HARNESS_TEST_KEEPMAX=str(keep))
+    env = dict(t.env, PROSPERO_TEST_KEEPMAX=str(keep))
     r = Raw(t, env)
     try:
         r.write(r.regular({"cmd": "hello", "id": 1, "proto": 0}))
@@ -851,7 +853,7 @@ def behind_drop(t):
 
 
 def connect(t, args, env=None):
-    p = subprocess.Popen([t.harness, "connect"] + args, stdin=subprocess.PIPE,
+    p = subprocess.Popen([t.prospero, "connect"] + args, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          env=env or t.env, text=True, bufsize=1)
     t.procs.append(p)
@@ -859,7 +861,7 @@ def connect(t, args, env=None):
 
 
 class Lines:
-    """Protocol v0 lines on standard I/O: harness connect."""
+    """Protocol v0 lines on standard I/O: prospero connect."""
 
     def __init__(self, p):
         self.p = p
@@ -967,7 +969,7 @@ def remote_option(t):
     for own in ("", "path = -oProxyCommand=/usr/bin/touch\n"):
         with open(t.config, "w") as f:
             f.write(f"include = {inc}\n[remote team]\nssh = example.invalid\n" + own)
-        p = subprocess.run([t.harness, "connect", "team", "-c", t.config, "--state", local],
+        p = subprocess.run([t.prospero, "connect", "team", "-c", t.config, "--state", local],
                            stdin=subprocess.DEVNULL, capture_output=True, text=True,
                            timeout=60)
         t.check(not os.path.exists(os.path.join(local, "attach")),
@@ -1006,7 +1008,7 @@ def restart_unattended(t):
 @scenario
 def version_mismatch(t):
     """A host of another protocol: a clear error, and the end."""
-    env = dict(t.env, HARNESS_TEST_PROTO="7")
+    env = dict(t.env, PROSPERO_TEST_PROTO="7")
     c = connect(t, ["--local", "--state", t.state, "-c", t.config], env=env)
     try:
         rc = c.p.wait(20)
@@ -1042,7 +1044,7 @@ def file_cmd(t):
             p.get("off") == 2, f"a part: {p}")
     sdir = os.path.join(t.state, "sessions", sid)
     os.symlink(t.config, os.path.join(sdir, "out", "link.ini"))
-    for bad in ("../../harness.ini", "/etc/hosts", "out/../../" + sid + "/events.jsonl",
+    for bad in ("../../prospero.ini", "/etc/hosts", "out/../../" + sid + "/events.jsonl",
                 "out/link.ini", "", "C:x", "out\\..\\..\\x"):
         x = c.call("file", sid=sid, path=bad)
         t.check(x.get("ok") == 0, f"refused {bad!r}: {x}")
@@ -1085,7 +1087,7 @@ def connect_piped(t):
     a.call("hello")
     a.stream.disconnect()
     cmds = '{"cmd":"list","id":1}\n{"cmd":"quit","id":2}\n'
-    p = subprocess.run([t.harness, "connect", "--local", "--state", t.state, "-c", t.config],
+    p = subprocess.run([t.prospero, "connect", "--local", "--state", t.state, "-c", t.config],
                        input=cmds, capture_output=True, text=True, timeout=60, env=t.env)
     replies = {}
     for line in p.stdout.splitlines():
@@ -1115,7 +1117,7 @@ def connect_endpoint(t):
     a = Client(t)
     sa = a.attach()
     a.call("hello")
-    hosts = subprocess.run([t.harness, "hosts", "--state", t.state],
+    hosts = subprocess.run([t.prospero, "hosts", "--state", t.state],
                            capture_output=True, text=True).stdout.splitlines()
     t.check(len(hosts) == 1, f"one host: {hosts}")
     ep = json.loads(hosts[0])["endpoint"]
@@ -1173,7 +1175,7 @@ def connect_reconnect(t):
     first.attach()
     first.call("hello")
     first.stream.disconnect()
-    c = connect(t, ["--ssh", "here", "--ssh-program", prog, "--path", t.harness,
+    c = connect(t, ["--ssh", "here", "--ssh-program", prog, "--path", t.prospero,
                     "--remote-state", t.state, "--remote-config", t.config,
                     "--state", os.path.join(t.root, "local")])
     c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
@@ -1230,7 +1232,7 @@ def connect_slowstart(t):
     first.call("hello")
     first.stream.disconnect()
     prog = slowssh(t, 2, 6)
-    c = connect(t, ["--ssh", "here", "--ssh-program", prog, "--path", t.harness,
+    c = connect(t, ["--ssh", "here", "--ssh-program", prog, "--path", t.prospero,
                     "--remote-state", t.state, "--remote-config", t.config,
                     "--state", os.path.join(t.root, "local")])
     c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
@@ -1307,7 +1309,7 @@ def slow_link(t):
     with open(prog, "w") as f:
         f.write(f"#!{sys.executable}\n" + THROTTLE.replace("RATE", "40000"))
     os.chmod(prog, 0o755)
-    c = connect(t, ["--ssh", "here", "--ssh-program", prog, "--path", t.harness,
+    c = connect(t, ["--ssh", "here", "--ssh-program", prog, "--path", t.prospero,
                     "--remote-state", t.state, "--remote-config", t.config,
                     "--state", os.path.join(t.root, "local")])
     c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
@@ -1346,10 +1348,10 @@ def ssh_reconnect(t):
         f.write(f"#!/bin/sh\necho $$ >> {shlex.quote(pidfile)}\nexec ssh \"$@\"\n")
     os.chmod(prog, 0o755)
     rstate = f"{a.remote_root}/state-{t.nonce}"
-    rconf = f"{a.remote_root}/harness-{t.nonce}.ini"
+    rconf = f"{a.remote_root}/prospero-{t.nonce}.ini"
     remote_write(a, rconf, open(t.config).read().replace(a.url, a.remote_url))
     try:
-        c = connect(t, ["--ssh", a.ssh, "--ssh-program", prog, "--path", a.remote_harness,
+        c = connect(t, ["--ssh", a.ssh, "--ssh-program", prog, "--path", a.remote_prospero,
                         "--remote-state", rstate, "--remote-config", rconf,
                         "--state", os.path.join(t.root, "local")])
         c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up",
@@ -1391,11 +1393,11 @@ def ssh_offline(t):
         f.write(f"#!/bin/sh\necho $$ >> {shlex.quote(pidfile)}\nexec ssh \"$@\"\n")
     os.chmod(prog, 0o755)
     rstate = f"{a.remote_root}/state-{t.nonce}"
-    rconf = f"{a.remote_root}/harness-{t.nonce}.ini"
+    rconf = f"{a.remote_root}/prospero-{t.nonce}.ini"
     remote_write(a, rconf, "endpoint = dead\nmodel = m\n[endpoint dead]\n"
                            "url = http://127.0.0.1:9/\nconnect_timeout = 1\n")
     try:
-        c = connect(t, ["--ssh", a.ssh, "--ssh-program", prog, "--path", a.remote_harness,
+        c = connect(t, ["--ssh", a.ssh, "--ssh-program", prog, "--path", a.remote_prospero,
                         "--remote-state", rstate, "--remote-config", rconf,
                         "--state", os.path.join(t.root, "local")])
         c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up",
@@ -1456,9 +1458,9 @@ def remote_write(a, path, text):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--harness", required=True)
+    ap.add_argument("--prospero", required=True)
     ap.add_argument("--ssh", help="a host for the ssh scenarios")
-    ap.add_argument("--remote-harness", help="the harness built there")
+    ap.add_argument("--remote-prospero", help="the harness built there")
     ap.add_argument("--remote-root", help="a directory of ours there")
     ap.add_argument("--windows", action="store_true", help="the ssh host is Windows")
     ap.add_argument("--shell", help="the ssh host's shell for scripts (default: sh -s)")

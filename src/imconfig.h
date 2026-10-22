@@ -11,8 +11,8 @@
 #define IMGUI_DISABLE_STB_TRUETYPE
 #define IMGUI_DISABLE_OBSOLETE_FUNCTIONS
 
-// A failed assertion goes to harness_imassert (app.cpp), which logs it.
+// A failed assertion goes to prospero_imassert (app.cpp), which logs it.
 // Debug builds then trap. Release builds continue: the engine shares the
 // process, so one GUI mistake must not end every session.
-extern "C" void harness_imassert(char const *expr, char const *file, int line);
-#define IM_ASSERT(e)  ((e) ? (void)0 : harness_imassert(#e, __FILE__, __LINE__))
+extern "C" void prospero_imassert(char const *expr, char const *file, int line);
+#define IM_ASSERT(e) ((e) ? (void)0 : prospero_imassert(#e, __FILE__, __LINE__))

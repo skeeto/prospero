@@ -1,5 +1,5 @@
 // GUI platform for macOS and Linux: SDL3 and OpenGL 3
-// Included by main_posix.cpp after the core when HARNESS_GUI is set, so
+// Included by main_posix.cpp after the core when PROSPERO_GUI is set, so
 // it implements the GUI's os_* functions directly.
 //
 // Wakes from other threads are coalesced with an atomic flag: a producer
@@ -783,7 +783,7 @@ static b32 os_trayopen(Os *os, Str tip)
         }
         return 0;
     }
-    static char const *labels[] = {"Open harness", "Stop all sessions", "Quit harness"};
+    static char const *labels[] = {"Open Prospero", "Stop all sessions", "Quit Prospero"};
     for (i32 i = 0; i < countof(labels); i++) {
         p->items[i].p    = p;
         p->items[i].item = i;

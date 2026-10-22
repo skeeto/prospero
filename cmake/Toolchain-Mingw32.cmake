@@ -1,7 +1,7 @@
 # Cross-compile for 32-bit Windows with mingw-w64: the XP engine.
 #
 #   cmake -B build-xp -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain-Mingw32.cmake \
-#         -DHARNESS_GUI=OFF
+#         -DPROSPERO_GUI=OFF
 #   cmake --build build-xp
 #   ctest --test-dir build-xp
 #

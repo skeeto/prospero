@@ -1285,7 +1285,7 @@ static void drawtranscript(Gui *g)
     if (gs->readonly) {
         g->bannershown = 1;
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
-        ImGui::TextWrapped("Read-only: another harness process has this "
+        ImGui::TextWrapped("Read-only: another Prospero process has this "
                            "session open. Its changes show after it lets go "
                            "and the session is opened again.");
         ImGui::PopStyleColor();
@@ -2362,10 +2362,10 @@ static void drawclose(Gui *g)
         } else if (!g->quitting) {
             g->hosterr = {};
             g->whynobg = clone(&g->perm, cannothost(g));
-            ImGui::OpenPopup("Quit harness?");
+            ImGui::OpenPopup("Quit Prospero?");
         }
     }
-    if (!ImGui::BeginPopupModal("Quit harness?", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (!ImGui::BeginPopupModal("Quit Prospero?", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
         return;
     }
     Arena a = g->frame;
@@ -2629,7 +2629,7 @@ static void drawhosts(Gui *g)
     ImGui::SetItemTooltip("user@host, or a host from ~/.ssh/config");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("##rempath", "harness there (optional)", g->rempath, FIELD_MAX);
+    ImGui::InputTextWithHint("##rempath", "prospero there (optional)", g->rempath, FIELD_MAX);
     b32 add = ImGui::Button("Add remote");
     itemrect(g, RECT_REMADD);
     if (add) {
@@ -2663,8 +2663,8 @@ static void drawhosts(Gui *g)
 
 // Settings
 
-// "from harness.ini:12" from a path and line, or "default", which is
-// "default, empty at harness.ini:12" when set empty. A URL include is
+// "from prospero.ini:12" from a path and line, or "default", which is
+// "default, empty at prospero.ini:12" when set empty. A URL include is
 // named in full, with the age of its copy as of now (Unix epoch ms).
 static Str provenance(Gui *g, Arena *a, CfgRow *r, i64 now)
 {
@@ -2875,7 +2875,7 @@ static void drawsettings(Gui *g)
                 // Keys and provenance as wide as they need, the rest for
                 // values
                 f32 keyw  = ImGui::CalcTextSize("first_byte_timeout").x;
-                f32 fromw = ImGui::CalcTextSize("from harness.ini:999").x;
+                f32 fromw = ImGui::CalcTextSize("from prospero.ini:999").x;
                 ImGui::TableSetupColumn("key", ImGuiTableColumnFlags_WidthFixed, keyw);
                 ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn("from", ImGuiTableColumnFlags_WidthFixed, fromw);

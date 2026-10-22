@@ -480,7 +480,7 @@ static void test_tools(Test *t)
         expect(t, "env strips GIT_DIR", istr(a, find(all, "GIT_DIR=")), "-1");
         expect(t, "env case on POSIX", istr(a, find(all, "git_dir=/x")>=0), "1");
         expect(t, "env pager", istr(a, find(all, "PAGER=cat\n")>=0 && find(all, "PAGER=less")<0), "1");
-        expect(t, "env harness", istr(a, find(all, "\nHARNESS=1\n")>0), "1");
+        expect(t, "env prospero", istr(a, find(all, "\nPROSPERO=1\n")>0), "1");
         expect(t, "env keeps the rest", istr(a, find(all, "HOME=/h\n")>=0), "1");
 
         Slice<Str> wenv = shellenv(a, {inherited, countof(inherited), countof(inherited)}, 1);

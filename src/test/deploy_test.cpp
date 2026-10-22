@@ -66,11 +66,11 @@ static void test_deploy(Test *t)
     Str sp  = "3f 2a 0b 1c 4d 5e 6f 70 81 92 a3 b4 c5 d6 e7 f8 09 1a 2b 3c "
               "4d 5e 6f 70 81 92 a3 b4 c5 d6 e7 f8";
     struct { Str name; Str out; Str want; } hashes[] = {
-        {"sha256sum", concat(&a, h, "  .harness/engine.part\n"), h},
-        {"shasum", concat(&a, h, "  .harness/engine.part\n"), h},
-        {"openssl", concat(&a, h, " *.harness/engine.part\n"), h},
-        {"escaped", concat(&a, concat(&a, "\\", h), "  .harness\\\\x\n"), h},
-        {"certutil", concat(&a, concat(&a, "SHA256 hash of .harness\\x.part:\r\n", h),
+        {"sha256sum", concat(&a, h, "  .prospero/engine.part\n"), h},
+        {"shasum", concat(&a, h, "  .prospero/engine.part\n"), h},
+        {"openssl", concat(&a, h, " *.prospero/engine.part\n"), h},
+        {"escaped", concat(&a, concat(&a, "\\", h), "  .prospero\\\\x\n"), h},
+        {"certutil", concat(&a, concat(&a, "SHA256 hash of .prospero\\x.part:\r\n", h),
                             "\r\nCertUtil: -hashfile command completed successfully.\r\n"), h},
         {"certutil.old", concat(&a, concat(&a, "SHA256 hash of file x:\r\n", sp),
                                 "\r\nCertUtil: -hashfile command completed successfully.\r\n"), h},
@@ -88,60 +88,60 @@ static void test_deploy(Test *t)
 
     // Commands in each dialect
     {
-        Str p  = ".harness/engine-0-1.2.3-linux-aarch64";
-        Str w  = ".harness\\engine-0-1.2.3-windows-x86_64.exe";
+        Str p  = ".prospero/engine-0-1.2.3-linux-aarch64";
+        Str w  = ".prospero\\engine-0-1.2.3-windows-x86_64.exe";
         expect(t, "deploy.cmd.sh.prepare", deploycmd(&a, DEPLOY_SH, DEPLOY_PREPARE, p, 7),
-               "sh -c 'mkdir -p .harness && chmod 700 .harness && echo ready; "
+               "sh -c 'mkdir -p .prospero && chmod 700 .prospero && echo ready; "
                "{ command -v sha256sum || command -v shasum || command -v openssl; } "
                ">/dev/null 2>&1 || echo nohash; "
-               "if [ -f .harness/engine-0-1.2.3-linux-aarch64 ]; then echo have; "
-               "{ sha256sum .harness/engine-0-1.2.3-linux-aarch64 || "
-               "shasum -a 256 .harness/engine-0-1.2.3-linux-aarch64 || "
-               "openssl dgst -sha256 -r .harness/engine-0-1.2.3-linux-aarch64; } "
+               "if [ -f .prospero/engine-0-1.2.3-linux-aarch64 ]; then echo have; "
+               "{ sha256sum .prospero/engine-0-1.2.3-linux-aarch64 || "
+               "shasum -a 256 .prospero/engine-0-1.2.3-linux-aarch64 || "
+               "openssl dgst -sha256 -r .prospero/engine-0-1.2.3-linux-aarch64; } "
                "2>/dev/null; fi'");
         expect(t, "deploy.cmd.sh.verify", deploycmd(&a, DEPLOY_SH, DEPLOY_VERIFY, p, 7),
-               "sh -c 'chmod 755 .harness/engine-0-1.2.3-linux-aarch64.part && "
-               "{ sha256sum .harness/engine-0-1.2.3-linux-aarch64.part || "
-               "shasum -a 256 .harness/engine-0-1.2.3-linux-aarch64.part || "
-               "openssl dgst -sha256 -r .harness/engine-0-1.2.3-linux-aarch64.part || "
+               "sh -c 'chmod 755 .prospero/engine-0-1.2.3-linux-aarch64.part && "
+               "{ sha256sum .prospero/engine-0-1.2.3-linux-aarch64.part || "
+               "shasum -a 256 .prospero/engine-0-1.2.3-linux-aarch64.part || "
+               "openssl dgst -sha256 -r .prospero/engine-0-1.2.3-linux-aarch64.part || "
                "echo nohash; } 2>/dev/null'");
         expect(t, "deploy.cmd.sh.install", deploycmd(&a, DEPLOY_SH, DEPLOY_INSTALL, p, 7),
-               "sh -c '{ mv -f .harness/engine-0-1.2.3-linux-aarch64.part "
-               ".harness/engine-0-1.2.3-linux-aarch64 2>/dev/null || "
-               "{ mv -f .harness/engine-0-1.2.3-linux-aarch64 "
-               ".harness/engine-0-1.2.3-linux-aarch64.old-7 && "
-               "mv -f .harness/engine-0-1.2.3-linux-aarch64.part "
-               ".harness/engine-0-1.2.3-linux-aarch64; }; } && "
-               ".harness/engine-0-1.2.3-linux-aarch64 --version'");
+               "sh -c '{ mv -f .prospero/engine-0-1.2.3-linux-aarch64.part "
+               ".prospero/engine-0-1.2.3-linux-aarch64 2>/dev/null || "
+               "{ mv -f .prospero/engine-0-1.2.3-linux-aarch64 "
+               ".prospero/engine-0-1.2.3-linux-aarch64.old-7 && "
+               "mv -f .prospero/engine-0-1.2.3-linux-aarch64.part "
+               ".prospero/engine-0-1.2.3-linux-aarch64; }; } && "
+               ".prospero/engine-0-1.2.3-linux-aarch64 --version'");
         expect(t, "deploy.cmd.sh.run", deploycmd(&a, DEPLOY_SH, DEPLOY_RUN, p, 7),
-               "sh -c 'chmod 755 .harness/engine-0-1.2.3-linux-aarch64; "
-               ".harness/engine-0-1.2.3-linux-aarch64 --version'");
+               "sh -c 'chmod 755 .prospero/engine-0-1.2.3-linux-aarch64; "
+               ".prospero/engine-0-1.2.3-linux-aarch64 --version'");
         expect(t, "deploy.cmd.sh.remove", deploycmd(&a, DEPLOY_SH, DEPLOY_REMOVE, p, 7),
-               "sh -c 'rm -f .harness/engine-0-1.2.3-linux-aarch64'");
+               "sh -c 'rm -f .prospero/engine-0-1.2.3-linux-aarch64'");
         expect(t, "deploy.cmd.cmd.prepare", deploycmd(&a, DEPLOY_CMD, DEPLOY_PREPARE, w, 7),
-               "(if not exist .harness mkdir .harness) & (if exist .harness echo ready) & "
+               "(if not exist .prospero mkdir .prospero) & (if exist .prospero echo ready) & "
                "(where certutil >nul 2>&1 || echo nohash) & "
-               "(if exist .harness\\engine-0-1.2.3-windows-x86_64.exe (echo have & "
-               "certutil -hashfile .harness\\engine-0-1.2.3-windows-x86_64.exe SHA256))");
+               "(if exist .prospero\\engine-0-1.2.3-windows-x86_64.exe (echo have & "
+               "certutil -hashfile .prospero\\engine-0-1.2.3-windows-x86_64.exe SHA256))");
         expect(t, "deploy.cmd.cmd.verify", deploycmd(&a, DEPLOY_CMD, DEPLOY_VERIFY, w, 7),
-               "certutil -hashfile .harness\\engine-0-1.2.3-windows-x86_64.exe.part SHA256");
+               "certutil -hashfile .prospero\\engine-0-1.2.3-windows-x86_64.exe.part SHA256");
         expect(t, "deploy.cmd.cmd.install", deploycmd(&a, DEPLOY_CMD, DEPLOY_INSTALL, w, 7),
-               "(move /y .harness\\engine-0-1.2.3-windows-x86_64.exe.part "
-               ".harness\\engine-0-1.2.3-windows-x86_64.exe >nul 2>&1 || "
-               "(move /y .harness\\engine-0-1.2.3-windows-x86_64.exe "
-               ".harness\\engine-0-1.2.3-windows-x86_64.exe.old-7 >nul && "
-               "move /y .harness\\engine-0-1.2.3-windows-x86_64.exe.part "
-               ".harness\\engine-0-1.2.3-windows-x86_64.exe >nul)) && "
-               ".harness\\engine-0-1.2.3-windows-x86_64.exe --version");
+               "(move /y .prospero\\engine-0-1.2.3-windows-x86_64.exe.part "
+               ".prospero\\engine-0-1.2.3-windows-x86_64.exe >nul 2>&1 || "
+               "(move /y .prospero\\engine-0-1.2.3-windows-x86_64.exe "
+               ".prospero\\engine-0-1.2.3-windows-x86_64.exe.old-7 >nul && "
+               "move /y .prospero\\engine-0-1.2.3-windows-x86_64.exe.part "
+               ".prospero\\engine-0-1.2.3-windows-x86_64.exe >nul)) && "
+               ".prospero\\engine-0-1.2.3-windows-x86_64.exe --version");
         expect(t, "deploy.cmd.cmd.remove", deploycmd(&a, DEPLOY_CMD, DEPLOY_REMOVE, w, 7),
-               "del /f /q .harness\\engine-0-1.2.3-windows-x86_64.exe");
+               "del /f /q .prospero\\engine-0-1.2.3-windows-x86_64.exe");
     }
 
     // Records, by destination
     {
         Os *os = newos(&a, 1<<16);
         Str rec = "host = me@host.example\nplatform = linux-aarch64\nshell = sh\n"
-                  "path = .harness/engine-0-1-linux-aarch64\nsha256 = ab\n"
+                  "path = .prospero/engine-0-1-linux-aarch64\nsha256 = ab\n"
                   "version = 1\nproto = 0\ndeployed = 5\n";
         Str path = deployfile(&a, "/st", "me@host.example", ".ini");
         expect(t, "deploy.record.file", path, "/st/deploy/me@host.example.ini");
@@ -150,7 +150,7 @@ static void test_deploy(Test *t)
         os_write(os, a, path, rec);
         DeployRec r = deployrecord(os, &a, "/st", "me@host.example");
         expect(t, "deploy.record.ok", r.ok ? Str("ok") : Str("no"), "ok");
-        expect(t, "deploy.record.path", r.path, ".harness/engine-0-1-linux-aarch64");
+        expect(t, "deploy.record.path", r.path, ".prospero/engine-0-1-linux-aarch64");
         expect(t, "deploy.record.platform", r.platform, "linux-aarch64");
         expect(t, "deploy.record.proto", r.proto==0 ? Str("0") : Str("?"), "0");
         // Another destination that maps to the same file name
@@ -163,17 +163,17 @@ static void test_deploy(Test *t)
 
     // What ssh's end says about the engine there
     struct { Str log; i32 code; i32 want; } needs[] = {
-        {"sh: harness: not found\n", 127, NEED_MISSING},
-        {"bash: line 1: harness: command not found\n", 127, NEED_MISSING},
-        {"'harness' is not recognized as an internal or external command,\r\n"
+        {"sh: prospero: not found\n", 127, NEED_MISSING},
+        {"bash: line 1: prospero: command not found\n", 127, NEED_MISSING},
+        {"'prospero' is not recognized as an internal or external command,\r\n"
          "operable program or batch file.\r\n", 1, NEED_MISSING},
         {"The system cannot find the path specified.\r\n", 1, NEED_MISSING},
-        {"usage: harness [options]\n       harness run [options] PROMPT\n", 1, NEED_MISMATCH},
-        {"usage: harness attach [--reconnect] [options]\n", 2, NEED_MISMATCH},
-        {"sh: .harness/engine: cannot execute binary file\n", 126, NEED_MISMATCH},
-        {"harness: cannot create the state directory: denied\n", 1, NEED_NONE},
+        {"usage: prospero [options]\n       prospero run [options] PROMPT\n", 1, NEED_MISMATCH},
+        {"usage: prospero attach [--reconnect] [options]\n", 2, NEED_MISMATCH},
+        {"sh: .prospero/engine: cannot execute binary file\n", 126, NEED_MISMATCH},
+        {"prospero: cannot create the state directory: denied\n", 1, NEED_NONE},
         {"ssh: connect to host x port 22: Connection refused\n", 255, NEED_NONE},
-        {"harness: cannot run ssh: No such file or directory\n", 127, NEED_NONE},
+        {"prospero: cannot run ssh: No such file or directory\n", 127, NEED_NONE},
         {"", 0, NEED_NONE},
     };
     for (iz i = 0; i < countof(needs); i++) {
@@ -188,14 +188,14 @@ static void test_deploy(Test *t)
     // Arguments of the remote command: plain, else quoted for sh and
     // cmd.exe alike, a backslash and a leading - included, or refused
     struct { Str arg; Str want; } args[] = {
-        {"harness", " harness"},
-        {".harness/engine-0-1.2.3-linux-aarch64", " .harness/engine-0-1.2.3-linux-aarch64"},
-        {"~/bin/harness", " ~/bin/harness"},
-        {"C:/tools/harness.exe", " C:/tools/harness.exe"},
-        {"C:\\tools\\harness.exe", " \"C:\\tools\\harness.exe\""},
-        {".harness\\engine-0-1.2.3-windows-x86_64.exe",
-         " \".harness\\engine-0-1.2.3-windows-x86_64.exe\""},
-        {"/opt/my harness/h", " \"/opt/my harness/h\""},
+        {"prospero", " prospero"},
+        {".prospero/engine-0-1.2.3-linux-aarch64", " .prospero/engine-0-1.2.3-linux-aarch64"},
+        {"~/bin/prospero", " ~/bin/prospero"},
+        {"C:/tools/prospero.exe", " C:/tools/prospero.exe"},
+        {"C:\\tools\\prospero.exe", " \"C:\\tools\\prospero.exe\""},
+        {".prospero\\engine-0-1.2.3-windows-x86_64.exe",
+         " \".prospero\\engine-0-1.2.3-windows-x86_64.exe\""},
+        {"/opt/my prospero/p", " \"/opt/my prospero/p\""},
         {"-oProxyCommand=/usr/bin/touch", " \"-oProxyCommand=/usr/bin/touch\""},
         {"", " \"\""},
         {"\\\\srv\\share\\h.exe", "refused"},

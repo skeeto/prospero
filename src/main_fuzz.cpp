@@ -36,7 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "harness.cpp"
+#include "prospero.cpp"
 
 #ifndef __AFL_FUZZ_TESTCASE_LEN
 static ssize_t fuzzlen;
@@ -93,7 +93,7 @@ static b32     os_rename(Os *, Arena, Str, Str) { return 0; }
 static b32     os_remove(Os *, Arena, Str) { return 0; }
 static b32     os_print(Os *, i32, Str) { return 1; }
 static Str     os_getenv(Os *, Arena *, Str) { return {}; }
-static Str     os_exepath(Os *, Arena *) { return "harness"; }
+static Str     os_exepath(Os *, Arena *) { return "prospero"; }
 static b32     os_thread(Os *, void (*)(void *), void *) { return 0; }
 static void    os_lockinit(Lock *) {}
 static void    os_lock(Lock *) {}

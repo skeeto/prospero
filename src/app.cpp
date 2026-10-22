@@ -11,7 +11,7 @@
 // at once.
 //
 // The engine runs on its own thread in this process (newengine), or as
-// "harness --headless" in a child process (--engine=subprocess), whose
+// "prospero --headless" in a child process (--engine=subprocess), whose
 // standard output arrives in the inbox as PROC_DATA records and whose
 // standard input takes the commands, or not at all: a fake agent thread
 // (--fake) streams markdown at a configurable rate, in bursts or with
@@ -661,7 +661,7 @@ static void guilog(Gui *g, Str msg)
     msg = clone(&g->perm, msg);  // first: msg may be in frame scratch
     Arena a = g->frame;
     Buf   b(&a, msg.len+64);
-    print(&b, "harness: ");
+    print(&b, "prospero: ");
     print(&b, msg);
     putbyte(&b, '\n');
     os_print(g->os, 2, finish(&b));
@@ -1848,7 +1848,7 @@ static b32 remoteignored(Gui *g, Str name, Str key)
 }
 
 // Connect to a [remote NAME] over ssh, as its section says. The ssh
-// program is "ssh", or HARNESS_TEST_SSH (a test hook).
+// program is "ssh", or PROSPERO_TEST_SSH (a test hook).
 static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name)
 {
     GuiHost *h = findhost(g, GH_REMOTE, name);
@@ -1862,7 +1862,7 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name)
     rc.path       = remoteset(g, name, "path");
     rc.state      = remoteset(g, name, "state");
     rc.rconfig    = remoteset(g, name, "config");
-    rc.program    = os_getenv(g->os, &scratch, "HARNESS_TEST_SSH");
+    rc.program    = os_getenv(g->os, &scratch, "PROSPERO_TEST_SSH");
     rc.localstate = g->statedir;
     rc.deploy     = remoteset(g, name, "deploy") == "auto";
     if (!rc.ssh.len && remoteignored(g, name, "ssh")) {
@@ -2090,7 +2090,7 @@ static Str hoststatus(Gui *g, Arena *a, GuiHost *h, i64 left)
 // window again, a stop of every session's work, and quitting. Nobody
 // attends the sessions from then on, so an ask is denied by policy at
 // once, until a window opens them attended again. The host ends as
-// "harness serve" does, after [host] idle_exit with no client and
+// "prospero serve" does, after [host] idle_exit with no client and
 // nothing running, and this process with it. A window that comes back
 // here is a client of the host like any other, through its endpoint, so
 // that closing it leaves the host as it was.
@@ -2143,7 +2143,7 @@ static void shed(Gui *g)
     // The tray first, for the window's going to hide the Dock's icon
     // too (macOS): the tray's icon is the way back
     if (!g->trayup) {
-        g->trayup = os_trayopen(g->os, "harness: sessions running in the background");
+        g->trayup = os_trayopen(g->os, "Prospero: sessions running in the background");
     }
     os_guished(g->os);
     guilog(g, g->trayup ? Str("the window is gone; the tray icon brings it back")
@@ -2210,7 +2210,7 @@ static void reopen(Gui *g)
         os_guiraise(g->os);
         return;
     }
-    if (!os_guiopen(g->os, g, "harness")) {
+    if (!os_guiopen(g->os, g, "Prospero")) {
         guilog(g, "cannot open a window");
         return;
     }
@@ -2370,7 +2370,7 @@ static void fakecode(Fake *f, Buf *b, i32 lines)
         "\t\ttotal += i", "\t}", "\tfmt.Println(total)", "}",
     };
     static Str mk[] = {
-        "all: harness", "harness: main.o", "\t$(CC) -o $@ $^ $(LDFLAGS)  ",
+        "all: prospero", "prospero: main.o", "\t$(CC) -o $@ $^ $(LDFLAGS)  ",
     };
     struct { Str *lines; iz n; } srcs[] = {
         {c, countof(c)}, {py, countof(py)}, {sh, countof(sh)},
@@ -2642,7 +2642,7 @@ static void fakehistory(Fake *f, i64 n)
     {
         Arena t = f->turnmem;
         Buf   b(&t, 128);
-        print(&b, "harness: fake: ");
+        print(&b, "prospero: fake: ");
         print(&b, n);
         print(&b, " messages made in ");
         printfloat(&b, (f64)(os_ticks(f->os) - t0 - wait)/1000, 1);
@@ -2999,7 +2999,7 @@ static void savermain(void *arg)
             last |= r.type == SAVE_LAST;
         }
         if (save.ok && !os_write(s->os, s->scratch, s->path, save.data)) {
-            os_print(s->os, 2, "harness: could not save the layout\n");
+            os_print(s->os, 2, "prospero: could not save the layout\n");
         }
         if (last) {
             os_signal(&s->done);
@@ -4164,7 +4164,7 @@ static DriveOp driveops[] = {
     {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 200, ""},
-    {OP_TEXT, 0, 0, 0, 300, "Hello, harness"},
+    {OP_TEXT, 0, 0, 0, 300, "Hello, Prospero"},
     {OP_CHECK, CHK_TYPED, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 5000, ""},
@@ -4625,7 +4625,7 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 200, ""},
-    {OP_TEXT, 0, 0, 0, 300, "Hello, harness"},
+    {OP_TEXT, 0, 0, 0, 300, "Hello, Prospero"},
     {OP_CHECK, CHK_TYPED, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 5000, ""},
@@ -5607,7 +5607,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_NAVWIN:        return c.NavWindowingTarget != 0;
     case CHK_NONAVWIN:      return !c.NavWindowingTarget && c.NavWindowingHighlightAlpha==0;
     case CHK_RESIZED:       return (i32)c.IO.DisplaySize.x == (i32)(1100*winscale(g));
-    case CHK_TYPED:         return promptstr(g) == "Hello, harness";
+    case CHK_TYPED:         return promptstr(g) == "Hello, Prospero";
     case CHK_BLINKOFF:      return !c.IO.ConfigInputTextCursorBlink;
     case CHK_HISTORY:       return v->msgs.len >= 10000;
     case CHK_SCROLLED:      return g->sess ? !g->sess->stick : !g->nosession.stick;
@@ -6358,7 +6358,7 @@ static void drivestep(Gui *g)
             // For a measurement outside, by the operating system
             Arena a = g->frame;
             // Not in the Log window, which would make frames to show it
-            os_print(g->os, 2, concat(&a, concat(&a, "harness: drive: mark: ", op->text), "\n"));
+            os_print(g->os, 2, concat(&a, concat(&a, "prospero: drive: mark: ", op->text), "\n"));
         }
         break;
     case OP_STREAM:
@@ -6603,10 +6603,10 @@ static i64 optint(Str *args, i32 nargs, i32 *i)
 }
 
 static Str guiusage =
-"usage: harness [gui [options]]\n"
-"  -c FILE        configuration file (default: harness.ini, as for run)\n"
+"usage: prospero [gui [options]]\n"
+"  -c FILE        configuration file (default: prospero.ini, as for run)\n"
 "  --statedir DIR sessions, layout file and log (default: the state dir)\n"
-"  --engine=MODE  inproc (default) or subprocess: \"harness --headless\"\n"
+"  --engine=MODE  inproc (default) or subprocess: \"prospero --headless\"\n"
 "  --fake         a fake agent instead of an engine, for measurements:\n"
 "    --tps N        its tokens per second (default 100)\n"
 "    --stream       stream continuously\n"
@@ -6636,7 +6636,7 @@ static Str guiusage =
 "  --trace-drive  log where the checklist's presses land\n"
 "  --quit-after S quit after S seconds\n";
 
-extern "C" void harness_imassert(char const *expr, char const *file, int line)
+extern "C" void prospero_imassert(char const *expr, char const *file, int line)
 {
     ImGuiContext *ctx = ImGui::GetCurrentContext();
     Gui          *g   = ctx ? (Gui *)ImGui::GetIO().UserData : 0;
@@ -6722,7 +6722,7 @@ static b32 startinproc(Gui *g, Arena scratch)
     return 1;
 }
 
-// The engine as "harness --headless" in a child process: its output
+// The engine as "prospero --headless" in a child process: its output
 // arrives in the inbox, its errors go to engine.log.
 static b32 startsubprocess(Gui *g, Arena scratch)
 {
@@ -6888,7 +6888,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             g->nops = fake ? countof(streamops) : countof(m3streamops);
         }
         if (!fake && !g->drivecwd.len) {
-            os_print(os, 2, "harness: the checklist needs --cwd DIR\n");
+            os_print(os, 2, "prospero: the checklist needs --cwd DIR\n");
             return 1;
         }
     }
@@ -6907,7 +6907,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->pendbase  = g->pendmem.beg;
     if (!g->perm.beg || !g->frame.beg || !g->vcache->arena.beg || !g->replayr ||
             !g->cmdr || !g->cfgmem.beg || !g->pendmem.beg) {
-        os_print(os, 2, "harness: out of memory\n");
+        os_print(os, 2, "prospero: out of memory\n");
         return 2;
     }
     g->nosession.stick = 1;
@@ -6963,7 +6963,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->inbox  = newmailbox(&g->perm, g->inboxcap, wakegui, os);
     g->outbox = newmailbox(&g->perm, 1<<16, 0, 0);
     if (!g->inbox || !g->outbox) {
-        os_print(os, 2, "harness: could not create mailboxes\n");
+        os_print(os, 2, "prospero: could not create mailboxes\n");
         return 2;
     }
     Fake *f = 0;
@@ -6979,7 +6979,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         f->tps      = g->tps;
         f->rng      = 1;
         if (!f->perm.beg || !f->turnmem.beg) {
-            os_print(os, 2, "harness: out of memory\n");
+            os_print(os, 2, "prospero: out of memory\n");
             return 2;
         }
         GuiSession *s = addsess(g, g->hosts, f->sid);
@@ -7015,8 +7015,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->sched = newsched(os_ticks(os), 16667);
     g->sched.probing    = probe;
     g->sched.aggressive = aggressive;
-    if (!os_guiopen(os, g, "harness")) {
-        os_print(os, 2, "harness: could not open a window\n");
+    if (!os_guiopen(os, g, "Prospero")) {
+        os_print(os, 2, "prospero: could not open a window\n");
         return 1;
     }
     g->sched.pace = os_guirefresh(os);
@@ -7024,7 +7024,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     switch (g->enginekind) {
     case ENGINE_FAKE:
         if (!os_thread(os, fakemain, f)) {
-            os_print(os, 2, "harness: could not start the fake agent\n");
+            os_print(os, 2, "prospero: could not start the fake agent\n");
             return 2;
         }
         g->engineok = 1;

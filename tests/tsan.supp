@@ -1,5 +1,5 @@
 # ThreadSanitizer suppressions for the harness
-#   TSAN_OPTIONS=suppressions=tests/tsan.supp ./build-tsan/harness ...
+#   TSAN_OPTIONS=suppressions=tests/tsan.supp ./build-tsan/prospero ...
 #
 # macOS recycles a finished detached thread's pthread block, where errno
 # lives, for the next new thread, and TSan does not reset that range when

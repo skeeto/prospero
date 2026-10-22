@@ -1,6 +1,6 @@
 // GUI platform for Windows: Win32 and Direct3D 11
 //
-// This file has two halves. Compiled on its own with HARNESS_GUIEDGE,
+// This file has two halves. Compiled on its own with PROSPERO_GUIEDGE,
 // it is the edge translation unit: windows.h, D3D11, ImGui's Win32 and
 // DX11 backends, the window procedure, and the embedded manifest, all
 // behind extern "C" functions. Included by main_win32.cpp, it is the
@@ -68,7 +68,7 @@ extern "C" int       w32gui_trayopen(void *, unsigned short const *tip);
 extern "C" void      w32gui_trayclose(void *);
 
 
-#if HARNESS_GUIEDGE
+#if PROSPERO_GUIEDGE
 
 #include <windows.h>
 #include <dwmapi.h>
@@ -100,7 +100,7 @@ __asm__(
     "    .rva .Lman\n"
     "    .long .Lmanend - .Lman, 0, 0\n"
     "    .p2align 3\n"
-    ".Lman: .incbin \"assets/harness.manifest\"\n"
+    ".Lman: .incbin \"assets/prospero.manifest\"\n"
     ".Lmanend:\n"
     "    .text\n"
 );
@@ -346,10 +346,10 @@ static LRESULT CALLBACK msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_RBUTTONUP:
         case WM_CONTEXTMENU: {
             HMENU m = CreatePopupMenu();
-            AppendMenuW(m, MF_STRING, TRAY_CMD+0, L"Open harness");
+            AppendMenuW(m, MF_STRING, TRAY_CMD+0, L"Open Prospero");
             AppendMenuW(m, MF_STRING, TRAY_CMD+1, L"Stop all sessions");
             AppendMenuW(m, MF_SEPARATOR, 0, 0);
-            AppendMenuW(m, MF_STRING, TRAY_CMD+2, L"Quit harness");
+            AppendMenuW(m, MF_STRING, TRAY_CMD+2, L"Quit Prospero");
             POINT pt;
             GetCursorPos(&pt);
             SetForegroundWindow(hwnd);  // so that the menu goes away
@@ -422,7 +422,7 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
     wc.lpfnWndProc   = wndproc;
     wc.hInstance     = inst;
     wc.hCursor       = LoadCursorW(0, (LPCWSTR)IDC_ARROW);
-    wc.lpszClassName = L"harness";
+    wc.lpszClassName = L"prospero";
     RegisterClassExW(&wc);
 
     // A top-level window never shown, rather than a message-only one,
@@ -431,9 +431,9 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
     mc.cbSize        = sizeof(mc);
     mc.lpfnWndProc   = msgproc;
     mc.hInstance     = inst;
-    mc.lpszClassName = L"harness-msg";
+    mc.lpszClassName = L"prospero-msg";
     RegisterClassExW(&mc);
-    w->msgwin = CreateWindowExW(0, L"harness-msg", L"harness", WS_OVERLAPPED,
+    w->msgwin = CreateWindowExW(0, L"prospero-msg", L"Prospero", WS_OVERLAPPED,
                                 0, 0, 0, 0, 0, 0, inst, 0);
     if (!w->msgwin) {
         return 0;
@@ -452,7 +452,7 @@ static int makewindow(W32Gui *w, unsigned short const *title)
     w->width     = 0;
     w->height    = 0;
     w->hwnd = CreateWindowExW(
-        0, L"harness", (LPCWSTR)title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+        0, L"prospero", (LPCWSTR)title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
         CW_USEDEFAULT, 1280, 800, 0, 0, inst, 0
     );
     if (!w->hwnd) {
@@ -803,16 +803,16 @@ extern "C" void w32gui_close(void *p)
     w32gui_trayclose(w);
     SetWindowLongPtrW(w->msgwin, GWLP_USERDATA, 0);
     DestroyWindow(w->msgwin);
-    UnregisterClassW(L"harness", GetModuleHandleW(0));
-    UnregisterClassW(L"harness-msg", GetModuleHandleW(0));
+    UnregisterClassW(L"prospero", GetModuleHandleW(0));
+    UnregisterClassW(L"prospero-msg", GetModuleHandleW(0));
 }
 
 // CRT startup lands here (-municode), and the core takes over.
-extern "C" void harness_main();
+extern "C" void prospero_main();
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
-    harness_main();
+    prospero_main();
     return 0;
 }
 

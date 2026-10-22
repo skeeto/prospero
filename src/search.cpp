@@ -3,7 +3,7 @@
 // A search runs as a process under the tool layer, like a command, so
 // that it costs the engine thread nothing and stops the way a command
 // stops: ripgrep when it is on PATH, or else this same executable as
-//   harness --search grep|glob ROOT PATTERN [-i] [-F] [-g GLOB] [-m MAX]
+//   prospero --search grep|glob ROOT PATTERN [-i] [-F] [-g GLOB] [-m MAX]
 // Either way the output is ripgrep's: "path\0line:text\n" for each
 // matching line, or "path\0" for each file, with paths relative to the
 // search directory. The engine keeps a bounded amount of it, killing the
@@ -1201,13 +1201,13 @@ static Str searchrun(Os *os, Arena *perm, Arena scratch, SearchOpts *o,
     return {};
 }
 
-// harness --search grep|glob ROOT PATTERN [-i] [-F] [-g GLOB] [-m MAX]
+// prospero --search grep|glob ROOT PATTERN [-i] [-F] [-g GLOB] [-m MAX]
 // Exits 0 with results, 1 without, 2 for a bad pattern (explained on
 // standard error) or bad usage.
 static i32 searchmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 {
     if (nargs < 5 || (args[2]!="grep" && args[2]!="glob")) {
-        os_print(os, 2, "usage: harness --search grep|glob ROOT PATTERN "
+        os_print(os, 2, "usage: prospero --search grep|glob ROOT PATTERN "
                         "[-i] [-F] [-g GLOB] [-m MAX]\n");
         return 2;
     }
@@ -1227,7 +1227,7 @@ static i32 searchmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             Int n = parseint(args[++i]);
             o.limit = n.ok && n.val>0 ? (iz)n.val : 0;
         } else {
-            os_print(os, 2, "harness --search: unknown option\n");
+            os_print(os, 2, "prospero --search: unknown option\n");
             return 2;
         }
     }
@@ -1303,9 +1303,9 @@ static Slice<Str> searchargv(Arena *a, ToolEnv *te, i32 tool, Str path,
         v = push(a, v, Str("--sortr"));
         v = push(a, v, Str("modified"));
         v = push(a, v, Str("--type-add"));
-        v = push(a, v, concat(a, "harness:", glob));
+        v = push(a, v, concat(a, "prospero:", glob));
         v = push(a, v, Str("--type"));
-        v = push(a, v, Str("harness"));
+        v = push(a, v, Str("prospero"));
     } else {
         static Str const grep[] = {
             "--sort", "path", "--line-number", "--no-heading",
@@ -1319,9 +1319,9 @@ static Slice<Str> searchargv(Arena *a, ToolEnv *te, i32 tool, Str path,
         if (args->literal)    v = push(a, v, Str("--fixed-strings"));
         if (glob.len) {
             v = push(a, v, Str("--type-add"));
-            v = push(a, v, concat(a, "harness:", glob));
+            v = push(a, v, concat(a, "prospero:", glob));
             v = push(a, v, Str("--type"));
-            v = push(a, v, Str("harness"));
+            v = push(a, v, Str("prospero"));
         }
         v = push(a, v, Str("--regexp"));
         v = push(a, v, args->pattern);
