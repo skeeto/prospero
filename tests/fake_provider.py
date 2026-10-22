@@ -1071,11 +1071,14 @@ def sc_escapee_many(model, n, req):
 
 
 def sc_doublefork(model, n, req):
-    # A daemon: fork, setsid, fork again, its parents gone at once
+    # A daemon: fork, setsid, fork again, its parents gone at once, and
+    # then it execs, as a daemon often does, which on macOS leaves it
+    # launchd's id as its parent's (cleanup.py)
     if n == 0:
         cmd = ("perl -e 'use POSIX; exit if fork; setsid(); exit if fork; "
                "open(F, \">>tree.pids\"); print F \"$$\\n\"; close F; "
-               "sleep 300' >/dev/null 2>&1; sleep 0.5; echo forked")
+               "select(undef, undef, undef, 0.3); exec \"sleep\", \"300\"' "
+               ">/dev/null 2>&1; sleep 1; echo forked")
         yield from tool(model, n, "shell", {"command": cmd})
     else:
         yield from answer(model, "Daemonized.")
@@ -1088,6 +1091,15 @@ def sc_script(model, n, req):
         yield from tool(model, n, "shell", {"command": "sh script.sh", "timeout": 120})
     else:
         yield from answer(model, "Script done.")
+
+
+def sc_script2(model, n, req):
+    # script.sh, then script2.sh, each a tool call of its own
+    if n < 2:
+        script = "script2.sh" if n else "script.sh"
+        yield from tool(model, n, "shell", {"command": f"sh {script}", "timeout": 120})
+    else:
+        yield from answer(model, "Scripts done.")
 
 
 def sc_groupfork(model, n, req):

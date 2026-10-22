@@ -167,8 +167,20 @@ if(NOT CMAKE_CROSSCOMPILING)
   if(UV)
     add_test(NAME scenarios COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios.py --harness $<TARGET_FILE:harness>)
-    add_test(NAME cleanup COMMAND ${UV} run
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/cleanup.py --harness $<TARGET_FILE:harness>)
+    if(APPLE)
+      # Its selftest with the harness disclaimed measures latencies too,
+      # so it runs alone, apart from cleanup's cases
+      add_test(NAME cleanup COMMAND ${UV} run
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/cleanup.py --harness $<TARGET_FILE:harness>
+        --no-selftest)
+      add_test(NAME selftest_disclaimed COMMAND ${UV} run
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/cleanup.py --harness $<TARGET_FILE:harness>
+        --selftest-only)
+      set_tests_properties(selftest_disclaimed PROPERTIES RUN_SERIAL ON)
+    else()
+      add_test(NAME cleanup COMMAND ${UV} run
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/cleanup.py --harness $<TARGET_FILE:harness>)
+    endif()
     # Hosts and their clients on this machine (the ssh ones take --ssh)
     add_test(NAME remote COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/remote.py --harness $<TARGET_FILE:harness>)

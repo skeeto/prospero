@@ -491,9 +491,10 @@ def size_cap(t):
 # start until the engine cut it, to the second. A busy machine moves it
 # both ways: at startup the deadline counts from the configuration's
 # opening, so a fetch that starts late is cut sooner, and an engine
-# that comes to the deadline late cuts later. The cases bound the time
-# itself (dt).
-CUTOFF = r"[1-9]\d? seconds"
+# that comes to the deadline late cuts later. So it is bounded as the
+# cases bound the time itself (dt), 25 to 40 s, which still tells a
+# wrong unit or a wrong start from the deadline.
+CUTOFF = r"(2[5-9]|3\d) seconds"
 
 
 @case(bound=50)

@@ -43,6 +43,9 @@ def libc():
         _libc.responsibility_spawnattrs_setdisclaim.argtypes = [ctypes.c_void_p, ctypes.c_int]
         _libc.proc_pidpath.restype = ctypes.c_int
         _libc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        _libc.proc_pidinfo.restype = ctypes.c_int
+        _libc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                       ctypes.c_void_p, ctypes.c_int]
     return _libc
 
 
@@ -61,6 +64,14 @@ def responsible(pid):
     """The pid of the process responsible for pid, or 0 if unknown."""
     r = libc().responsibility_get_pid_responsible_for_pid(pid)
     return r if r > 0 else 0
+
+
+def parentid(pid):
+    """The unique id a process keeps of its parent at its fork or last
+    exec (p_puniqueid, reap.cpp), 1 for launchd, or None if gone."""
+    buf = ctypes.create_string_buffer(56)  # PROC_PIDUNIQIDENTIFIERINFO
+    n = libc().proc_pidinfo(pid, 17, 0, buf, len(buf))
+    return int.from_bytes(buf.raw[24:32], "little") if n == len(buf) else None
 
 
 def pidpath(pid):

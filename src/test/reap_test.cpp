@@ -131,16 +131,61 @@ static void test_reap(Test *t)
     }
 
     // macOS: reapers are disclaimed only for a harness that answers for
-    // itself, an app; never from Terminal, under sshd, or nested
+    // itself, an app; never from Terminal, under sshd, or nested; and
+    // only while they would run the harness's own code
     {
-        expect(t, "reapdisclaim, an app", istr(a, reapdisclaim(4242, 4242)), "1");
-        expect(t, "reapdisclaim, under Terminal", istr(a, reapdisclaim(4242, 500)), "0");
-        expect(t, "reapdisclaim, under a reaper", istr(a, reapdisclaim(4242, 4100)), "0");
-        expect(t, "reapdisclaim, unknown", istr(a, reapdisclaim(4242, 0)), "0");
-        expect(t, "reapdisclaim, no answer", istr(a, reapdisclaim(4242, -1)), "0");
-        expect(t, "reapdisclaim pid 0", istr(a, reapdisclaim(0, 0)), "0");
-        expect(t, "reapdisclaim pid 1", istr(a, reapdisclaim(1, 1)), "0");
-        expect(t, "reapdisclaim pid -1", istr(a, reapdisclaim(-1, -1)), "0");
+        expect(t, "reapdisclaim, an app", istr(a, reapdisclaim(4242, 4242, 1)), "1");
+        expect(t, "reapdisclaim, under Terminal", istr(a, reapdisclaim(4242, 500, 1)), "0");
+        expect(t, "reapdisclaim, under a reaper", istr(a, reapdisclaim(4242, 4100, 1)), "0");
+        expect(t, "reapdisclaim, unknown", istr(a, reapdisclaim(4242, 0, 1)), "0");
+        expect(t, "reapdisclaim, no answer", istr(a, reapdisclaim(4242, -1, 1)), "0");
+        expect(t, "reapdisclaim pid 0", istr(a, reapdisclaim(0, 0, 1)), "0");
+        expect(t, "reapdisclaim pid 1", istr(a, reapdisclaim(1, 1, 1)), "0");
+        expect(t, "reapdisclaim pid -1", istr(a, reapdisclaim(-1, -1, 1)), "0");
+        // An app whose executable a rebuild replaced since it started:
+        // a reaper would be other code, which the user granted nothing
+        expect(t, "reapdisclaim, an app, replaced", istr(a, reapdisclaim(4242, 4242, 0)), "0");
+        expect(t, "reapdisclaim, under Terminal, replaced",
+               istr(a, reapdisclaim(4242, 500, 0)), "0");
+    }
+
+    // macOS: what a recorded process lists as its children is the tool's
+    // only if it forked them. The recorded process is 4250, unique id
+    // 103; its pid was 4240's before, unique id 90. A debugger among the
+    // tool's, 4260 (id 107), attached to the user's 700 (id 60), whose
+    // parent was 600 (id 50); 4261 it started itself.
+    {
+        //                 pid   ppid  pg sid start uniq puniq resp traced oppid
+        ReapProc forked = {4251, 4250, 0, 0, 1,    104, 103,  0,   0,     0};
+        ReapProc older  = {4252, 4250, 0, 0, 1,    95,  90,   0,   0,     0};
+        ReapProc user   = {700,  4260, 0, 0, 1,    60,  50,   0,   1,     600};
+        ReapProc exec   = {700,  4260, 0, 0, 1,    60,  107,  0,   1,     600};
+        ReapProc own    = {4261, 4260, 0, 0, 1,    108, 107,  0,   1,     4260};
+        ReapProc gone   = {700,  4260, 0, 0, 1,    60,  107,  0,   1,     0};
+        ReapProc away   = {4253, 900,  0, 0, 1,    109, 103,  0,   1,     4250};
+        expect(t, "reapforked", istr(a, reapforked(&forked, 4250, 103)), "1");
+        expect(t, "reapforked, no id", istr(a, reapforked(&forked, 4250, 0)), "0");
+        // The pid was another's, whose child is listed under it
+        expect(t, "reapforked, a reused pid", istr(a, reapforked(&older, 4250, 103)), "0");
+        expect(t, "reapforked, by the pid's old id", istr(a, reapforked(&forked, 4250, 90)), "0");
+        // Attached: its puniq is its real parent's, or the debugger's if
+        // it exec'd while attached, but its parent before was 600
+        expect(t, "reapforked, attached", istr(a, reapforked(&user, 4260, 107)), "0");
+        expect(t, "reapforked, attached, exec'd", istr(a, reapforked(&exec, 4260, 107)), "0");
+        expect(t, "reapforked, attached, no oppid", istr(a, reapforked(&gone, 4260, 107)), "0");
+        // Started by the debugger, then traced (PT_ATTACH, or PT_TRACE_ME)
+        expect(t, "reapforked, the debugger's own", istr(a, reapforked(&own, 4260, 107)), "1");
+        // The tool's, which an outside debugger (900) attached to, lists
+        // under the parent it had then (PROC_PPID_ONLY reads p_oppid)
+        expect(t, "reapforked, debugged from outside", istr(a, reapforked(&away, 4250, 103)), "1");
+
+        expect(t, "reapattached", istr(a, reapattached(&user)), "1");
+        expect(t, "reapattached, exec'd", istr(a, reapattached(&exec)), "1");
+        expect(t, "reapattached, no oppid", istr(a, reapattached(&gone)), "1");
+        expect(t, "reapattached, the debugger's own", istr(a, reapattached(&own)), "0");
+        expect(t, "reapattached, untraced", istr(a, reapattached(&forked)), "0");
+        // Whose puniq a scan cannot tell from the debugger's, so trusts not
+        expect(t, "reapattached, debugged from outside", istr(a, reapattached(&away)), "1");
     }
 
     // The id a reaper's sweep looks for: its own, if told and true
@@ -255,6 +300,45 @@ static void test_reap(Test *t)
             any |= none[i];
         }
         expect(t, "reaporigin of nothing", istr(a, any), "0");
+        // With no room for ids (the test hook), by responsibility alone
+        u8 resp[countof(procs)] = {};
+        u64 room[1] = {};
+        reaporigin(procs, n, resp, room, 0, 0, 100);
+        Buf b(a, 64);
+        for (iz i = 0; i < n; i++) {
+            if (resp[i]) {
+                print(&b, (i64)procs[i].pid);
+                putbyte(&b, ' ');
+            }
+        }
+        expect(t, "reaporigin, no room for ids", finish(&b), "4243 4250 4251 4260 ");
+    }
+
+    // A debugger the tool ran (unique id 110), orphaned since, attached
+    // to the user's process 700, child of 600, which then exec'd: its
+    // puniq is now the debugger's, and so is its parent, but neither is
+    // where it came from. 4281 the debugger started itself.
+    {
+        ReapProc procs[] = {
+            //pid  ppid  pg sid start uniq puniq resp traced oppid
+            {4280, 1,    0, 0, 1, 110, 101, 0, 0, 0},
+            {700,  4280, 0, 0, 1, 60,  110, 0, 1, 600},
+            {4281, 4280, 0, 0, 1, 111, 110, 0, 1, 4280},
+        };
+        iz  n       = countof(procs);
+        u64 ids[16] = {};
+        u8  mine[countof(procs)] = {};
+        iz  len = reapaddid(ids, 0, countof(ids), 101);  // the tool
+        len = reaporigin(procs, n, mine, ids, len, countof(ids), 0);
+        Buf b(a, 64);
+        for (iz i = 0; i < n; i++) {
+            if (mine[i]) {
+                print(&b, (i64)procs[i].pid);
+                putbyte(&b, ' ');
+            }
+        }
+        expect(t, "reaporigin, not what a debugger attached to", finish(&b), "4280 4281 ");
+        expect(t, "reaporigin, nor its id", istr(a, reaphasid(ids, len, 60)), "0");
     }
 
     // /proc/PID/stat lines

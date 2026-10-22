@@ -15,7 +15,7 @@
 // On macOS a reaper also finds what left the tool's tree by what each
 // process keeps of its origin (reaporigin): its responsible process,
 // when the reaper was spawned to be that of the tool's tree, and the
-// unique id of the parent that forked it.
+// unique id of its parent when it was forked or last exec'd.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -74,9 +74,11 @@ struct ReapProc {
     i32 pgrp;
     i32 sid;
     i64 start;      // start time: Linux clock ticks after boot, macOS µs
-    u64 uniq  = 0;  // macOS: its unique id, never reused
-    u64 puniq = 0;  // macOS: the unique id of the parent that forked it
-    u64 resp  = 0;  // macOS: the unique id of its responsible process
+    u64 uniq   = 0;  // macOS: its unique id, never reused
+    u64 puniq  = 0;  // macOS: its parent's, at its fork or last exec
+    u64 resp   = 0;  // macOS: the unique id of its responsible process
+    b32 traced = 0;  // macOS: a debugger is attached
+    i32 oppid  = 0;  // macOS: traced, its parent when that happened
 };
 
 // Parse a Linux /proc/PID/stat line, "pid (comm) state ppid pgrp session
@@ -143,29 +145,64 @@ static b32 reapmine(ReapProc *p, i32 self, i32 group, b32 descendant)
 }
 
 // macOS: what a process keeps of where it came from, whatever became of
-// its parents. Each has a unique id, 64 bits, that only grows and is
-// never reused, and keeps the one of the parent that forked it (puniq)
-// through exec and after its orphaning to launchd. (Its pid version,
-// p_idversion, changes with each exec, so a parent's taken before its
-// exec would not match what its later children keep.) And each has a
-// responsible process, its parent's by default, which the kernel keeps
-// through fork, exec, setsid and orphaning: a process spawned
-// "disclaimed" is its own, and so its descendants', unless one of them
-// disclaims in turn.
+// its parents. Each has a unique id, 64 bits, that only grows, is never
+// reused, and survives exec, and keeps its parent's from its fork or
+// its last exec (puniq): so an orphan that execs, as a daemon often
+// does once its parents are gone, keeps launchd's (1), which leads
+// nowhere. (Its pid version, p_idversion, changes with each exec, so a
+// parent's taken before its exec would not match what its later
+// children keep.) And each has a responsible process, its parent's by
+// default, which the kernel keeps through fork, exec, setsid and
+// orphaning: a process spawned "disclaimed" is its own, and so its
+// descendants', unless one of them disclaims in turn.
+//
+// A debugger that attaches to a process (PT_ATTACH, as "lldb -p" does)
+// makes it its child for as long as it lasts, and should it exec
+// meanwhile, gives it the debugger's id as puniq: a tool that debugs
+// the user's process must not make that process the tool's. So neither
+// tells where a traced process came from, unless its debugger was its
+// parent when it attached (oppid), as when the debugger started it
+// (reapforked, reapattached).
 //
 // TCC charges a process's privacy access to its responsible process. A
 // reaper is spawned disclaimed only when the harness is its own already
-// (reapdisclaim), as an app that LaunchServices started is: then the
-// tools answer to the same binary as before. Otherwise they keep
+// (reapdisclaim), as an app that LaunchServices started is, and only
+// while the executable a reaper runs is still the one the harness runs:
+// then the tools answer to the same code as before. Otherwise they keep
 // answering to the app responsible for the harness, Terminal, or sshd
 // with remote logins' full disk access, whose grants a disclaimed
-// reaper would take from them.
+// reaper would take from them, or to the harness itself after its
+// executable was replaced, as a rebuild in place does, rather than to
+// code that the user never granted anything.
 
-// Whether to spawn reapers disclaimed, by this process's pid and that
-// of its responsible process (0 when unknown): only if they are one.
-static b32 reapdisclaim(i64 self, i64 responsible)
+// Whether to spawn a reaper disclaimed, by this process's pid, that of
+// its responsible process (0 when unknown), and whether the executable
+// the reaper would run is still the file this process started from
+// (samefile): only if this process answers for itself, and the reaper
+// would be the same code.
+static b32 reapdisclaim(i64 self, i64 responsible, b32 samefile)
 {
-    return signalable(self) && responsible==self;
+    return signalable(self) && responsible==self && samefile;
+}
+
+// Whether a debugger attached to a process from outside its parentage:
+// traced, and not by the parent it had when that happened (oppid), as
+// when the debugger started it, or was asked by it (PT_TRACE_ME). Its
+// parent is then the debugger, and its puniq too if it exec'd since.
+static b32 reapattached(ReapProc *p)
+{
+    return p->traced && p->oppid!=p->ppid;
+}
+
+// Whether a process that lists as the child of a recorded one, by its
+// pid and unique id, came from it: forked by it, or exec'd while its
+// child, either way keeping its id as puniq. Not a process a debugger
+// attached to, unless that one is the debugger's own, nor the child of
+// another process that the parent's pid named since. Zero is no id.
+static b32 reapforked(ReapProc *child, i64 parent, u64 parentuniq)
+{
+    b32 attached = child->traced && child->oppid!=parent;
+    return parentuniq && child->puniq==parentuniq && !attached;
 }
 
 // The responsible unique id a reaper's sweep looks for: its own (uniq),
@@ -230,10 +267,12 @@ static iz reapaddid(u64 *ids, iz len, iz cap, u64 id)
 // Mark what a scan of n processes found to have come from the tool, by
 // its origin: responsible to resp (reaprespid, or 0 for none), or forked
 // by a process whose unique id is in ids, the tool's processes, alive or
-// gone (sorted, len of at most cap). Each process marked, here or before
-// (mine), adds its own id, and so the closure is transitive: an orphan
-// of an orphan is found too, but only through processes once seen, which
-// a chain of short-lived parents may not be. Returns the new length.
+// gone (sorted, len of at most cap), unless a debugger attached to it
+// (reapattached). Each process marked, here or before (mine), adds its
+// own id, and so the closure is transitive: an orphan of an orphan is
+// found too, but only through processes once seen, which a chain of
+// short-lived parents may not be, and not an orphan that exec'd, whose
+// puniq is launchd's. Returns the new length.
 static iz reaporigin(ReapProc *procs, iz n, u8 *mine, u64 *ids, iz len,
                      iz cap, u64 resp)
 {
@@ -246,8 +285,8 @@ static iz reaporigin(ReapProc *procs, iz n, u8 *mine, u64 *ids, iz len,
         grew = 0;
         for (iz i = 0; i < n; i++) {
             ReapProc *p = procs + i;
-            if (!mine[i] && ((resp && p->resp==resp) ||
-                             reaphasid(ids, len, p->puniq))) {
+            b32 forked = !reapattached(p) && reaphasid(ids, len, p->puniq);
+            if (!mine[i] && ((resp && p->resp==resp) || forked)) {
                 mine[i] = 1;
                 grew    = 1;
                 len     = reapaddid(ids, len, cap, p->uniq);

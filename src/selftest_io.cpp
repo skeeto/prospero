@@ -134,18 +134,48 @@ static void testspawn(ProcTest *p, Arena scratch)
     say(os, "spawn done");
 }
 
-// Bulk output drains as long as it keeps coming: a slow disk, as XP's,
-// is no fault of the harness, but output that stops for 15 s is. A
-// failure ends the checks that depend on it, after the process, so that
-// the next test starts clean, with a file of its own.
+// The time the shell takes to pipe 100 MiB into a file itself, with no
+// harness in the way, or -1 if it failed.
+static i64 bulkbaseline(ProcTest *p, Arena scratch)
+{
+    Os   *os   = p->os;
+    Str   base = join(&scratch, p->dir, "baseline.log");
+    Str   out  = join(&scratch, p->dir, "baseline.out");
+    i64   t0   = os_ticks(os);
+    Proc *pr   = spawnsh(p, scratch, "head -c 104857600 /dev/zero | cat >baseline.log",
+                         out, 1<<10);
+    if (!pr) {
+        return -1;
+    }
+    ProcWatch w  = {};
+    b32       ok = procwatch(os, p->mb, p->id, &w, 600000);
+    i64       dt = os_ticks(os) - t0;
+    ok = ok && w.code==0 && os_stat(os, scratch, base).size==(i64)100<<20;
+    os_kill(os, pr, 1);
+    procwatch(os, p->mb, p->id, &w, 10000);
+    os_procfree(os, pr);
+    os_remove(os, scratch, base);  // unwritten pages go with it
+    os_remove(os, scratch, out);
+    return ok ? dt : -1;
+}
+
+// Bulk output drains about as fast as the shell pipes it into a file
+// by itself: within 3 times that, plus a second, which bounds the cost
+// of the harness's reader on a fast machine and a slow one alike, as
+// XP's disk is, which no fixed time does. Output that stops for 15 s
+// fails at once. A failure ends the checks that depend on it, after the
+// process, so that the next test starts clean, with a file of its own.
 static void testbulk(ProcTest *p, Arena scratch)
 {
-    Selftest *t   = p->t;
-    Os       *os  = p->os;
-    Str       out = join(&scratch, p->dir, "bulk.log");
-    i64       n   = (i64)100 << 20;
-    i64       t0  = os_ticks(os);
-    Proc     *pr  = spawnsh(p, scratch, "head -c 104857600 /dev/zero", out, (i64)1<<30);
+    Selftest *t     = p->t;
+    Os       *os    = p->os;
+    i64       base  = bulkbaseline(p, scratch);
+    i64       limit = 3*base + 1000000;
+    if (!check(t, base>=0, "the shell pipes 100 MiB into a file")) return;
+    Str       out   = join(&scratch, p->dir, "bulk.log");
+    i64       n     = (i64)100 << 20;
+    i64       t0    = os_ticks(os);
+    Proc     *pr    = spawnsh(p, scratch, "head -c 104857600 /dev/zero", out, (i64)1<<30);
     if (!check(t, pr!=0, "os_spawn for bulk output")) return;
     ProcWatch w     = {};
     b32       done  = 0;
@@ -158,10 +188,13 @@ static void testbulk(ProcTest *p, Arena scratch)
     if (check(t, done, "100 MiB of output drains, without stalling")) {
         check(t, w.code==0 && w.total==n, "100 MiB counted");
         check(t, os_stat(os, scratch, out).size == n, "100 MiB written to the file");
+        check(t, dt < limit, "100 MiB drains within 3 times the shell's own time, plus 1 s");
         report(os, scratch, "100 MiB of output in", millis(dt), 0, " ms");
     } else {
         report(os, scratch, "bulk output stalled at", (f64)w.sofar/(1<<20), 1, " MiB");
     }
+    report(os, scratch, "100 MiB piped into a file by the shell itself in",
+           millis(base), 0, " ms");
     os_kill(os, pr, 1);
     procwatch(os, p->mb, p->id, &w, 10000);
     os_procfree(os, pr);
@@ -363,9 +396,10 @@ static void testoverhead(ProcTest *p, Arena scratch)
 }
 
 // macOS: a tool answers to its reaper, which then sweeps whatever does,
-// only if the harness answers for itself, as an app; otherwise to what
-// the harness answers to, Terminal or sshd, whose privacy grants it then
-// keeps (reap.cpp). Elsewhere there is no such thing.
+// only if the harness answers for itself, as an app (and its executable
+// was not replaced since it started, which cleanup.py tests); otherwise
+// to what the harness answers to, Terminal or sshd, whose privacy
+// grants it then keeps (reap.cpp). Elsewhere there is no such thing.
 static void testresponsible(ProcTest *p, Arena scratch)
 {
     Selftest *t    = p->t;
