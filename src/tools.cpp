@@ -1352,12 +1352,14 @@ static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args, b32 tag
 // a newline already, and hashline creates none.
 
 // The line ending to append to content written as a whole file: "\n",
-// "\r\n" or nothing. The file it replaces existed, of size bytes ending
-// in tail, which is null if unreadable: then it counts as no file.
-// Empty, binary and newline-ended content gets nothing, as does content
-// replacing a file that ended without a newline. The ending is CRLF if
-// most of the content's line breaks are, or, with none, if the replaced
-// file's last one was; after a lone CR, only an LF.
+// "\r\n" or nothing. The file it replaces existed, of size bytes, its
+// last three (or fewer) in tail, which is null if unreadable: then it
+// counts as no file, as does an empty one or one that is only a
+// byte-order mark. Empty, binary and newline-ended content gets
+// nothing, as does content replacing a file that ended without a
+// newline. The ending is CRLF if at least half of the content's line
+// breaks are, or, with none, if the replaced file's last one was; after
+// a lone CR, only an LF.
 static Str finalnewline(Str content, b32 existed, i64 size, Str tail)
 {
     Str text = startswith(content, "\xef\xbb\xbf") ? cuthead(content, 3) : content;
@@ -1372,7 +1374,8 @@ static Str finalnewline(Str content, b32 existed, i64 size, Str tail)
         lfs += text[i] == '\n';
         crs += text[i]=='\n' && i && text[i-1]=='\r';
     }
-    b32 old = existed && size>0 && tail.len;  // else as a new file
+    b32 bom = size==3 && tail=="\xef\xbb\xbf";
+    b32 old = existed && size>0 && tail.len && !bom;  // else as a new file
     if (old && tail[tail.len-1]!='\n') {
         return "";
     }
@@ -1399,8 +1402,9 @@ static ToolOut toolwrite(Os *os, Arena *a, Str cwd, Str path, Args *args)
     b32 old  = st.type == STAT_FILE;
     Str tail = {};
     if (old && st.size) {
-        // Only its last two bytes, however large it is
-        Read rd = os_readat(os, a, path, st.size>2 ? st.size-2 : 0, 2);
+        // Only its last three bytes, however large it is: enough for a
+        // CRLF, or to tell a file that is only a byte-order mark
+        Read rd = os_readat(os, a, path, st.size>3 ? st.size-3 : 0, 3);
         tail = rd.err ? Str{} : rd.data;
     }
     Str nl   = finalnewline(args->content, old, st.size, tail);

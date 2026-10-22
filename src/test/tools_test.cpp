@@ -233,6 +233,10 @@ static void test_tools(Test *t)
             {"a\0b", 0, 0, {}, ""},                 // binary
             {"x", 1, 0, "", "\n"},                  // an existing empty file
             {"x", 1, 0, {}, "\n"},
+            {"x", 1, 3, "\xef\xbb\xbf", "\n"},      // or only a BOM
+            {"a\r\nb", 1, 3, "\xef\xbb\xbf", "\r\n"},
+            {"x", 1, 4, "\xbb\xbf\n", "\n"},        // a BOM and a newline
+            {"x", 1, 5, "\xbf\r\n", "\r\n"},
             {"x", 1, 9, "y\n", "\n"},               // old ended: so does this,
             {"x", 1, 9, "y\r\n", "\r\n"},           // with no line breaks as it
             {"x", 1, 1, "\n", "\n"},
@@ -241,6 +245,7 @@ static void test_tools(Test *t)
             {"a\r\nb", 1, 9, "y\n", "\r\n"},
             {"a\n", 1, 9, "yz", ""},
             {"x", 1, 9, "yz", ""},                  // old unended: as given
+            {"x", 1, 9, "\xef\xbb\xbf", ""},        // a BOM's bytes, not a BOM
             {"a\r\nb", 1, 9, "y\r", ""},
             {"a\nb", 1, 1, "z", ""},
             {"", 1, 9, "y\n", ""},
@@ -335,6 +340,10 @@ static void test_tools(Test *t)
             {"new empty", {}, "", "", "Created f.c (0 bytes, 0 lines)."},
             {"empty file", "", "x", "x\n",
              "Replaced f.c (2 bytes, 1 lines; added a final newline)."},
+            {"old bom only", "\xef\xbb\xbf", "x", "x\n",
+             "Replaced f.c (2 bytes, 1 lines; added a final newline)."},
+            {"old bom unended", "\xef\xbb\xbfz", "x", "x",
+             "Replaced f.c (1 bytes, 1 lines)."},
             {"old ended", "old\n", "a\nb", "a\nb\n",
              "Replaced f.c (4 bytes, 2 lines; added a final newline)."},
             {"old crlf", "\xef\xbb\xbfold\r\n", "x", "x\r\n",
