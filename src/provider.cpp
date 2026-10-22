@@ -1,6 +1,11 @@
 // Providers: URLs, the canonical transcript, OpenAI Chat Completions,
 // error classification, and llama.cpp router discovery
 //
+// A tool result may carry a screenshot (the desktop tool's), which goes
+// back to the model as an image: Chat Completions takes images only in
+// user messages, so a run of tool results is followed by one with their
+// screenshots, and Anthropic's tool results hold them as image blocks.
+//
 // The transcript is append-only: an assistant message keeps the blocks
 // the model produced (reasoning with any signature, text, tool calls
 // with their raw argument strings), and requests are encoded from it
@@ -203,6 +208,11 @@ struct Msg {
                           // the session's directory, if one was kept
     b32          error;   // tool messages: the call failed or was refused
     i64          seq;     // of the record it came from, 0 if none
+    Str          image;   // tool messages: a screenshot (PNG), relative
+    i32          imgw;    // to the session's directory, and its size
+    i32          imgh;
+    Str          imgb64;  // in a request's history: the screenshot as
+                          // base64, or null where it is left out
 };
 
 struct Usage {
@@ -389,6 +399,11 @@ struct ModelConf {
     i32          think;      // THINK_*
     b32          hidethink;  // thinking_display omitted, else summarized
     Str          effort;     // output_config.effort, empty: not sent
+    // The desktop tool's screenshots (desktop.cpp)
+    i32          coords;     // COORDS_*: how the model gives points
+    b32          novision;   // the model takes no images
+    i64          imgedge;    // [model] image_edge, 0 if unset
+    i64          imgpixels;  // [model] image_pixels, 0 if unset
 };
 
 struct ChatReq {
@@ -468,6 +483,44 @@ static void encodemsg(JsonOut *w, ModelConf *mc, Msg *m, Arena *a)
     putend(w);
 }
 
+// The screenshots of a run of tool results, h[beg, end), as a user
+// message after them: Chat Completions takes images only from the user.
+static void encodeimages(JsonOut *w, Arena tmp, Slice<Msg> h, iz beg, iz end)
+{
+    b32 any = 0;
+    for (iz i = beg; i < end; i++) {
+        any |= h[i].imgb64.len > 0;
+    }
+    if (!any) {
+        return;
+    }
+    putobject(w);
+    putstrkey(w, "role", "user");
+    putkey(w, "content");
+    putarray(w);
+    for (iz i = beg; i < end; i++) {
+        Msg *m = &h[i];
+        if (!m->imgb64.len) continue;
+        Arena t = tmp;
+        putobject(w);
+        putstrkey(w, "type", "text");
+        putstrkey(w, "text", concat(&t, concat(&t, "The screenshot of tool call ",
+                                                m->callid), ":"));
+        putend(w);
+        putobject(w);
+        putstrkey(w, "type", "image_url");
+        putkey(w, "image_url");
+        putobject(w);
+        putkey(w, "url");
+        Str url = concat(&t, "\"data:image/png;base64,", m->imgb64);
+        putraw(w, concat(&t, url, "\""));  // base64 needs no escapes
+        putend(w);
+        putend(w);
+    }
+    putend(w);
+    putend(w);
+}
+
 // Encode a streaming request into a, using tmp for temporaries. Keys
 // come in a fixed order, so equal histories give equal bytes.
 static Str encodechat(Arena *a, Arena tmp, ChatReq *r)
@@ -487,9 +540,19 @@ static Str encodechat(Arena *a, Arena tmp, ChatReq *r)
         putstr(&w, r->system);
         putend(&w);
     }
+    iz results = -1;  // where the run of tool results began
     for (iz i = 0; i < r->history.len; i++) {
-        Arena t = tmp;
+        Arena t    = tmp;
+        b32   tool = r->history[i].role == ROLE_TOOL;
+        if (!tool && results>=0) {
+            encodeimages(&w, tmp, r->history, results, i);
+            results = -1;
+        }
+        results = tool && results<0 ? i : results;
         encodemsg(&w, r->mc, &r->history[i], &t);
+    }
+    if (results >= 0) {
+        encodeimages(&w, tmp, r->history, results, r->history.len);
     }
     putend(&w);
     if (r->tools.len) {

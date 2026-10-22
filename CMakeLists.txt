@@ -154,6 +154,19 @@ if(APPLE AND PROSPERO_GUI)
 endif()
 set_target_properties(prospero PROPERTIES OUTPUT_NAME ${PROSPERO_NAME})
 
+if(WIN32)
+  # The desktop helper, a program of its own (src/deskhelp.cpp), which
+  # the desktop tool runs from next to the harness: CRT-free, importing
+  # kernel32, user32 and gdi32 only, as old as Windows XP
+  add_executable(prospero-desktop src/main_desktop_win32.cpp)
+  target_link_options(prospero-desktop PRIVATE -nostartfiles -static-libgcc
+    -Wl,--no-insert-timestamp)
+  target_link_libraries(prospero-desktop PRIVATE prospero_core_flags
+    kernel32 user32 gdi32)
+  set_target_properties(prospero-desktop PROPERTIES
+    OUTPUT_NAME ${PROSPERO_NAME}-desktop)
+endif()
+
 find_program(UV uv)
 if(WIN32 AND NOT PROSPERO_GUI AND UV)
   # The headless engine, the XP engine as an i686 build, imports only
@@ -161,6 +174,13 @@ if(WIN32 AND NOT PROSPERO_GUI AND UV)
   enable_testing()
   add_test(NAME imports COMMAND ${UV} run
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/imports.py $<TARGET_FILE:prospero>)
+endif()
+if(WIN32 AND UV)
+  # So does the desktop helper, from its own DLLs
+  enable_testing()
+  add_test(NAME imports_desktop COMMAND ${UV} run
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/imports.py --dlls kernel32,user32,gdi32
+    $<TARGET_FILE:prospero-desktop>)
 endif()
 
 if(NOT CMAKE_CROSSCOMPILING)

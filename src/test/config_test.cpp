@@ -269,9 +269,10 @@ static void testcfgvalidate(Test *t)
         "ignored\n"
         "/c/prospero.ini:20:9: warning: unknown value \"fly\", expected any "
         "of: read, write, edit, shell, grep, glob, todo_write, jobs, "
-        "job_output, job_kill, task\n"
+        "job_output, job_kill, task, desktop\n"
         "/c/prospero.ini:21:2: warning: unknown section kind \"provider\", "
-        "expected endpoint, model, role, guard, tools, instructions or ui\n"
+        "expected endpoint, model, role, guard, tools, instructions, ui, "
+        "desktop, host or remote\n"
         "/c/prospero.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "
@@ -706,6 +707,10 @@ static void testcfgjson(Test *t)
         "model/m/thinking=adaptive*\n"
         "model/m/thinking_display=summarized*\n"
         "model/m/effort=*\n"
+        "model/m/vision=true*\n"
+        "model/m/coordinates=pixels*\n"
+        "model/m/image_edge=*\n"
+        "model/m/image_pixels=*\n"
         "model/m/edit_format=replace*\n"
         "model/m/max_concurrent=*\n"
         "model/m/temperature=*\n"
@@ -727,6 +732,10 @@ static void testcfgjson(Test *t)
         "tools//task_budget=200*\n"
         "instructions//files=AGENTS.md CLAUDE.md*\n"
         "ui//theme=system*\n"
+        "desktop//offer=none*\n"
+        "desktop//ask=true*\n"
+        "desktop//ask_timeout=60*\n"
+        "desktop//images=3*\n"
         "host//idle_exit=600*\n"
         "host//grace=10800*\n");
 
@@ -741,7 +750,7 @@ static void testcfgjson(Test *t)
     expect(t, "json.schema.local", jsonstr(jsonget(ft, "local")), "1800");
     iz    ti    = cfgkey("role", "tools") - cfgschema;
     Json *tools = jsonget(jsonat(schema, ti), "choices");
-    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "11");
+    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "12");
     expect(t, "json.kinds", istr(&a, jsonlen(jsonget(j, "kinds"))),
            istr(&a, countof(cfgkinds)));
 

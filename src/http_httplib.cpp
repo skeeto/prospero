@@ -62,6 +62,7 @@ enum {
     EDGE_CONNECT,  // could not connect
     EDGE_IO,       // the connection failed after connecting
     EDGE_ABORT,    // a callback returned 0
+    EDGE_TRUST,    // the server's certificate was refused
 };
 
 struct Edge {
@@ -392,15 +393,16 @@ extern "C" int httpedge_run(void *p, HttpEdgeReq *r)
     #ifdef __APPLE__
     if (!e->untrusted.empty()) {
         edgeerr(r, "the server's certificate is not trusted: " + e->untrusted);
-        return EDGE_CONNECT;
+        return EDGE_TRUST;
     }
     #endif
     std::string msg = httplib::to_string(err);
-    if (err == httplib::Error::Connection ||
-            err == httplib::Error::ConnectionTimeout ||
-            err == httplib::Error::SSLConnection ||
-            err == httplib::Error::SSLServerVerification ||
+    if (err == httplib::Error::SSLServerVerification ||
             err == httplib::Error::SSLServerHostnameVerification) {
+        return edgeerr(r, msg), EDGE_TRUST;
+    } else if (err == httplib::Error::Connection ||
+            err == httplib::Error::ConnectionTimeout ||
+            err == httplib::Error::SSLConnection) {
         return edgeerr(r, msg), EDGE_CONNECT;
     }
     edgeerr(r, msg);

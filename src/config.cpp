@@ -18,7 +18,8 @@
 // key = env:NAME, resolved when used. A plaintext secret in the user's
 // own file is used, with a warning; in an included (shared) file it is
 // an error and ignored, as is any setting of a [remote] section, which
-// chooses a program to run and where (ssh, path, state, config, deploy).
+// chooses a program to run and where (ssh, path, state, config, deploy),
+// or of the [desktop] section, which lets the agent use the screen.
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -56,9 +57,11 @@
 //   match stays in use; a cached copy that does not match is never used.
 //
 // Nothing a configuration says runs a command but a [remote] section of
-// the user's own file, and an included file's [remote] settings and
-// plaintext secrets are ignored, so a shared file, local or from the
-// web, can at most point the harness at endpoints and models.
+// the user's own file, and an included file's [remote] and [desktop]
+// settings and plaintext secrets are ignored, so a shared file, local or
+// from the web, can at most point the harness at endpoints and models.
+// (A shared [role] may list desktop in its tools, which matters only
+// once the user's own [desktop] offer says roles.)
 //
 // Protocol, as engine.cpp answers it ("..." elides values):
 //
@@ -174,6 +177,7 @@ static CfgKind cfgkinds[] = {
     {"tools",    0, "Background jobs, stopping commands, and search"},
     {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
     {"ui",       0, "How the GUI looks"},
+    {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"host",     0, "The engine as a background host (prospero serve)"},
     {"remote",   1, "An engine on another machine, reached over ssh"},
 };
@@ -254,6 +258,18 @@ static CfgKey cfgschema[] = {
     {"model", "effort", CFG_ENUM, "", {}, "low medium high xhigh max", "model",
      "Anthropic: how much the model thinks and writes, by default its own "
      "default"},
+    {"model", "vision", CFG_BOOL, "true", {}, {}, "model",
+     "Whether the model takes images, as the desktop tool's screenshots"},
+    {"model", "coordinates", CFG_ENUM, "pixels", {}, "pixels norm1000", "model",
+     "How the model gives points in a screenshot: pixels of the image it "
+     "was sent, or norm1000, thousandths of its width and height (Qwen-VL, "
+     "Gemini)"},
+    {"model", "image_edge", CFG_INT, "", {}, {}, "model",
+     "Longest side of a screenshot sent to the model, in pixels (default "
+     "1568 for kind anthropic, else 1280)"},
+    {"model", "image_pixels", CFG_INT, "", {}, {}, "model",
+     "Most pixels in a screenshot sent to the model (default 1150000 for "
+     "kind anthropic, else 1048576)"},
     {"model", "edit_format", CFG_ENUM, "replace", {}, "replace patch hashline",
      "model", "How the model's edit tool changes files: replace (old and "
      "new text), patch (an apply_patch envelope) or hashline (line "
@@ -291,8 +307,9 @@ static CfgKey cfgschema[] = {
      "Model for the role, by default the session's, or a subagent's parent's"},
     {"role", "tools", CFG_LIST,
      "read write edit shell grep glob todo_write jobs job_output job_kill task", {},
-     "read write edit shell grep glob todo_write jobs job_output job_kill task",
-     "role", "Tools the role may use"},
+     "read write edit shell grep glob todo_write jobs job_output job_kill task "
+     "desktop",
+     "role", "Tools the role may use; desktop also needs [desktop] offer"},
 
     {"guard", "roots", CFG_PATHS, "", {}, {}, "guard",
      "More directories the file tools may use, separated by ;"},
@@ -320,6 +337,18 @@ static CfgKey cfgschema[] = {
     {"instructions", "files", CFG_STRING, "AGENTS.md CLAUDE.md", {}, {},
      "instructions", "File names to load from each directory, the first "
      "found in each, separated by blanks"},
+
+    {"desktop", "offer", CFG_ENUM, "none", {}, "none roles all", "desktop",
+     "Which sessions get the desktop tool: none, roles whose tools list "
+     "desktop, or all (sessions without a role too)"},
+    {"desktop", "ask", CFG_BOOL, "true", {}, {}, "desktop",
+     "Ask the user before every desktop action, denying it when nobody "
+     "answers in time; false lets the agent act unattended"},
+    {"desktop", "ask_timeout", CFG_SECONDS, "60", {}, {}, "desktop",
+     "Seconds to wait for an answer to a desktop action, then deny"},
+    {"desktop", "images", CFG_INT, "3", {}, {}, "desktop",
+     "Screenshots kept in the conversation, the latest; older ones are "
+     "left out of requests"},
 
     {"ui", "theme", CFG_ENUM, "system", {}, "system dark light", "ui",
      "Colors: dark, light, or system to follow the operating system"},
@@ -537,9 +566,9 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     v = trim(v);
     if (!v.len) {
         return CFG_OK;
-    } else if (shared && k->kind=="remote") {
-        return CFG_BAD;  // what runs on the user's machines, and where
-    }
+    } else if (shared && (k->kind=="remote" || k->kind=="desktop")) {
+        return CFG_BAD;  // what runs on the user's machines, and where,
+    }                    // and what may use the screen
     switch (k->type) {
     case CFG_STRING:
         return CFG_OK;
@@ -600,6 +629,9 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     if (shared && k->kind=="remote") {
         return "a [remote] setting in an included file is ignored, since it "
                "chooses what runs where: set it in your own file";
+    } else if (shared && k->kind=="desktop") {
+        return "a [desktop] setting in an included file is ignored, since it "
+               "lets the agent use the screen: set it in your own file";
     }
     Buf b(a, 128);
     switch (k->type) {
@@ -838,8 +870,11 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniLine *l)
     if (!k) {
         print(&b, "unknown section kind \"");
         print(&b, l->key);
-        print(&b, "\", expected endpoint, model, role, guard, tools, "
-                  "instructions or ui");
+        print(&b, "\", expected ");
+        for (iz i = 1; i < countof(cfgkinds); i++) {
+            print(&b, i==1 ? Str("") : i==countof(cfgkinds)-1 ? Str(" or ") : Str(", "));
+            print(&b, cfgkinds[i].kind);
+        }
     } else if (unnamed) {
         print(&b, "a section needs a name, as in [");
         print(&b, l->key);

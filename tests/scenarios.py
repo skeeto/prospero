@@ -4312,8 +4312,371 @@ def runone(host, name, verbose):
         return name, "ok", dt, over
     except Failure as e:
         return name, "FAIL", time.monotonic() - t0, str(e)
+    except Skip as e:
+        return name, "skip", 0.0, str(e)
     except Exception:
         return name, "FAIL", time.monotonic() - t0, traceback.format_exc()
+
+
+# M7, from M6's review: a server whose certificate is refused fails the
+# turn at once, with the reason, rather than retrying for hours
+
+TLS_CERT = """-----BEGIN CERTIFICATE-----
+MIIBejCCASCgAwIBAgIUJCO4zezdv3ZN727dLBcsRdRcQjswCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTAyMjEyMDkyMloYDzIxMjYwOTI4
+MTIwOTIyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAARtP2DsWYgmp4laukm0w8WYYWdFlKm8qb6057T23tJjWnkrQ2UNqdB1
+98emu5BtgIYi17jn+21QFY5jxNvMRtJTo04wTDAdBgNVHQ4EFgQUM7KDabc0iLEN
+7x5lQqgXRX+TxJswDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhv
+c3SHBH8AAAEwCgYIKoZIzj0EAwIDSAAwRQIgQuV3bnY7J5FpYJjc2iQAlSNwkMuV
+kmJrPKwnp2A7q4kCIQCAtsvWZcYwoARqme6O/rQkoK6pt+BNAOtYhzd+nMV2PQ==
+-----END CERTIFICATE-----
+"""
+# A throwaway key for the certificate above, self-signed, which nothing
+# trusts: it exists for this test alone
+TLS_KEY = """-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZHK5n3Kl+mrxAoZb
+RRMjybAIqkDkxh3zFj7ju2mJAgGhRANCAARtP2DsWYgmp4laukm0w8WYYWdFlKm8
+qb6057T23tJjWnkrQ2UNqdB198emu5BtgIYi17jn+21QFY5jxNvMRtJT
+-----END PRIVATE KEY-----
+"""
+
+
+class TlsServer:
+    """Accepts TLS connections with a certificate nobody trusts, and
+    counts the handshakes tried."""
+
+    def __init__(self, base):
+        import ssl
+        cert = os.path.join(base, "tls.pem")
+        with open(cert, "w") as f:
+            f.write(TLS_CERT + TLS_KEY)
+        self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.ctx.load_cert_chain(cert)
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.port = self.sock.getsockname()[1]
+        self.tries = 0
+        self.stop = False
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while not self.stop:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            self.tries += 1
+            c.settimeout(5)
+            try:
+                with self.ctx.wrap_socket(c, server_side=True) as s:
+                    s.recv(1)
+            except OSError:
+                pass  # the client refused the certificate
+            finally:
+                c.close()
+
+    def close(self):
+        self.stop = True
+        self.sock.close()
+
+
+@scenario(bound=10)
+def tls_refused(t):
+    if not isinstance(t.host, LocalHost):
+        raise Skip("the TLS server listens on this machine only")
+    srv = TlsServer(t.base)
+    try:
+        t.host.write(t.config, f"[endpoint fake]\nurl = https://127.0.0.1:{srv.port}/\n"
+                     "first_byte_timeout = 5\nidle_timeout = 3\nconnect_timeout = 2\n")
+        r = t.run(timeout=30)
+    finally:
+        srv.close()
+    end = r.last("turn.end")
+    t.check(r.rc == 1 and end.get("why") == "error", f"exit {r.rc}: {end} {r.stderr}")
+    t.check("certificate" in end.get("err", "").lower() or
+            "security" in end.get("err", "").lower(), f"says why: {end}")
+    t.check(not r.all("retry"), f"no retries: {r.all('retry')}")
+    t.check(r.elapsed < 5, f"at once: {r.elapsed:.1f} s")
+    t.check(srv.tries <= 2, f"tried {srv.tries} times")
+
+
+# M7: the desktop tool, with tests/fake_desktop.py as the helper (on
+# this machine only: the remote hosts have no Python for it)
+
+FAKE_DESKTOP = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fake_desktop.py")
+DESKALL = {"_desktop": {"offer": "all", "ask": "false"}}
+
+
+class Skip(Exception):
+    pass
+
+
+def deskenv(t):
+    """The environment that makes the fake the helper, logging to a file."""
+    if not isinstance(t.host, LocalHost):
+        raise Skip("the fake helper runs on this machine only")
+    t.desklog = t.host.join(t.base, "desktop.log")
+    return {"PROSPERO_TEST_DESKTOP": json.dumps([sys.executable, FAKE_DESKTOP]),
+            "FAKE_DESKTOP_LOG": t.desklog}
+
+
+def desklog(t):
+    """The commands the helper took, each a list of its arguments."""
+    text = t.host.read(t.desklog) or ""
+    return [json.loads(line) for line in text.splitlines()]
+
+
+def pngdims(data):
+    t_ = data[12:16]
+    return (int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")) \
+        if data[:8] == b"\x89PNG\r\n\x1a\n" and t_ == b"IHDR" else None
+
+
+def sessdir(t, r):
+    sid, _ = r.sessions()
+    return t.host.join(t.state, "sessions", sid)
+
+
+@scenario(conf={**DESKALL, "_extra": "[model {model}]\nimage_edge = 640\n"}, bound=30)
+def desktop_flow(t):
+    """Screenshots scaled to the model's limit, points mapped back from
+    them, input to the screenshot's window, and the rest of the actions,
+    unattended as configured, through one helper for the turn."""
+    r = t.run(env=deskenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok"] * 10,
+            f"all done: {[(e['status'], e['text'][:80]) for e in ends]}")
+    t.check(not r.all("ask"), "nothing asked: ask is false")
+    got = desklog(t)
+    want = [["hello"],
+            ["shot", "-s", "640", "1048576", "screen"],
+            ["click", "screen", "640", "400"],
+            ["type", "active", "hello\n"],
+            ["key", "active", "ctrl+s", "esc"],
+            ["list"],
+            ["shot", "-s", "640", "1048576", "Fake Editor"],
+            ["click", "hwnd=0x00000010", "10", "20"],
+            ["run", "notepad.exe", "a b"],
+            ["wait", "-t", "10", "pid=4242"],
+            ["close", "pid=4242"]]
+    t.check(got == want, f"the helper took {got}")
+    shot = ends[0]
+    t.check(shot.get("image", "").endswith(".png") and shot["width"] == 640 and
+            shot["height"] == 400 and shot["shot"] == "0 0 1280 800 640 400 0x0",
+            f"the screenshot's record: { {k: shot.get(k) for k in ('image', 'width', 'height', 'shot')} }")
+    t.check("1280x800 pixels, shown to you scaled down to 640x400" in shot["text"] and
+            "x from 0 to 639, y from 0 to 399" in shot["text"], f"text {shot['text']}")
+    with open(os.path.join(sessdir(t, r), shot["image"]), "rb") as f:
+        t.check(pngdims(f.read()) == (640, 400), "the screenshot is kept as it was sent")
+    t.check("Clicked at (320, 200) in the screenshot of the screen" in ends[1]["text"],
+            f"click {ends[1]['text']}")
+    t.check('id=0x00000010 pid=77 640x480 FakeEdit "hello - Fake Editor"' in ends[4]["text"]
+            and "#32768" in ends[4]["text"], f"windows {ends[4]['text']}")
+    t.check("process id 4242" in ends[7]["text"], f"run {ends[7]['text']}")
+    reqs = [q["body"] for q in t.requests()]
+    imgs = fake_provider.desk_images(reqs[1])
+    t.check(len(imgs) == 1 and imgs[0][1].startswith("data:image/png;base64,") and
+            imgs[0][0].startswith("The screenshot of tool call "), f"the image sent: {imgs[:1]}")
+    png = base64.b64decode(imgs[0][1].split(",", 1)[1])
+    t.check(pngdims(png) == (640, 400), "the image as scaled")
+    msgs = reqs[1]["messages"]
+    t.check(msgs[-2]["role"] == "tool" and msgs[-1]["role"] == "user",
+            "the image after the tool result, from the user")
+    desc = [x for x in reqs[0]["tools"] if x["function"]["name"] == "desktop"]
+    t.check(desc and "in pixels of its image" in desc[0]["function"]["description"],
+            "offered, with points in pixels")
+    t.check("desktop tool acts on the user's real screen" in reqs[0]["messages"][0]["content"],
+            "the system prompt mentions it")
+    # Points in a window's screenshot: the latest screenshot was the
+    # editor's, so a click went to it by its id, as later requests keep
+    t.check(len(fake_provider.desk_images(reqs[-1])) == 2, "both screenshots kept")
+
+
+@scenario(bound=10)
+def desktop_off(t):
+    """By default the tool is offered to nobody, and a call to it is an
+    unknown tool's."""
+    r = t.run(env=deskenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    req = t.requests()[0]["body"]
+    t.check("desktop" not in fake_provider.tool_names(req), "not offered")
+    end = r.last("tool.end")
+    t.check(end["status"] == "error" and "not available in this session" in end["text"],
+            f"refused {end}")
+    t.check(not desklog(t), "no helper started")
+
+
+@scenario(conf={"_desktop": {"offer": "all"}}, bound=10)
+def desktop_policy(t):
+    """Unattended with ask left on: denied by policy, and the turn goes on."""
+    r = t.run(env=deskenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ask = r.last("ask")
+    t.check(ask.get("kind") == "desktop" and ask.get("tool") == "desktop" and
+            ask.get("detail") == "desktop: take a screenshot of the screen" and
+            ask.get("dflt") == "deny", f"ask {ask}")
+    ans = r.last("answer")
+    t.check(ans.get("decision") == "deny" and ans.get("by") == "policy", f"answer {ans}")
+    end = r.last("tool.end")
+    t.check(end["status"] == "denied" and "need the user's approval" in end["text"],
+            f"denied {end}")
+    t.check(r.names().index("answer") < r.names().index("tool.start"),
+            "asked before it starts")
+    t.check("Heard: Not done" in r.text(), f"the agent read it: {r.text()!r}")
+    t.check(not desklog(t), "no helper started")
+
+
+@scenario(conf={"_desktop": {"offer": "all", "ask_timeout": 20}}, bound=20)
+def desktop_ask(t):
+    """Attended: each action is asked, with the configured deadline; one
+    allowed runs, one denied with a note tells the agent so."""
+    h = t.headless(env=deskenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="look")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        t.check(ask["kind"] == "desktop" and 19000 <= ask["deadline"] - ask["ts"] <= 21000,
+                f"ask {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ask2 = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid and
+                      e["req"] != ask["req"])
+        t.check(ask2["detail"] == "desktop: click at (1, 1) in the screenshot of the screen",
+                f"ask {ask2}")
+        h.call("answer", sid=sid, req=ask2["req"], decision="deny", note="not there")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"done {end}")
+        st = [(e["status"], e["text"][:60]) for e in h.all("tool.end", sid)]
+        t.check([s for s, _ in st] == ["ok", "denied"], f"statuses {st}")
+        last = h.all("tool.end", sid)[-1]["text"]
+        t.check("the user denied" in last and "not there" in last, f"denial {last}")
+        t.check(desklog(t) == [["hello"], ["shot", "-s", "1280", "1048576", "screen"]],
+                f"only the allowed one ran: {desklog(t)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={**DESKALL, "_extra": "[model {model}]\ncoordinates = norm1000\n"
+                "image_edge = 320\n"}, bound=20)
+def desktop_norm(t):
+    """Points in thousandths: described so, mapped to the pixels captured,
+    and refused outside 0 to 1000."""
+    r = t.run(env=deskenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    got = desklog(t)
+    want = [["hello"], ["shot", "-s", "320", "1048576", "screen"],
+            ["click", "screen", "640", "400"],
+            ["drag", "screen", "0", "0", "1279", "799"],
+            ["wheel", "screen", "320", "600", "-3"]]
+    t.check(got == want, f"the helper took {got}")
+    ends = r.all("tool.end")
+    t.check(ends[2]["status"] == "error" and "x and y go from 0 to 1000" in ends[2]["text"],
+            f"outside {ends[2]}")
+    t.check("thousandths" in ends[0]["text"], f"shot text {ends[0]['text']}")
+    desc = [x for x in t.requests()[0]["body"]["tools"] if x["function"]["name"] == "desktop"]
+    t.check("thousandths of its width and height" in desc[0]["function"]["description"],
+            "described in thousandths")
+
+
+@scenario(conf={"_desktop": {"offer": "all", "ask": "false", "images": 1},
+                "_extra": "[model {model}]\nimage_edge = 64\n"}, bound=20)
+def desktop_images(t):
+    """Only the latest screenshots go with a request; older ones say so."""
+    r = t.run(env=deskenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    last = t.requests()[-1]["body"]
+    imgs = fake_provider.desk_images(last)
+    tools = [m for m in last["messages"] if m["role"] == "tool"]
+    t.check(len(imgs) == 1 and len(tools) == 3, f"one image of three: {len(imgs)}")
+    t.check(tools[2]["tool_call_id"] in imgs[0][0], "the latest one")
+    t.check(all("no longer shown" in m["content"] for m in tools[:2]) and
+            "no longer shown" not in tools[2]["content"], "the others say so")
+
+
+@scenario(conf=DESKALL, bound=20)
+def desktop_crash(t):
+    """A helper that dies fails its call, and the next call starts another."""
+    r = t.run(env=deskenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = [(e["status"], e["text"]) for e in r.all("tool.end")]
+    t.check([s for s, _ in ends] == ["ok", "error", "ok", "ok"], f"statuses {ends}")
+    t.check("helper stopped" in ends[1][1], f"why {ends[1][1]}")
+    hellos = [c for c in desklog(t) if c == ["hello"]]
+    t.check(len(hellos) == 2, f"a second helper: {desklog(t)}")
+    t.check("Clicked at (5, 5)" in ends[2][1], "the screenshot still counts")
+
+
+@scenario(conf=DESKALL, bound=15)
+def desktop_cancel(t):
+    """A cancel while the helper works stops it at once."""
+    h = t.headless(env=deskenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="type")
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        time.sleep(0.5)
+        t0 = time.monotonic()
+        h.call("cancel", sid=sid)
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        dt = time.monotonic() - t0
+        t.check(end["why"] == "cancel" and dt < 3, f"cancelled in {dt:.1f} s: {end}")
+        te = h.all("tool.end", sid)
+        t.check(te and te[-1]["status"] == "cancelled", f"the call: {te}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=DESKALL, bound=180)
+def desktop_xp(t):
+    """The real helper on Windows XP's desktop, with --xp, run by name
+    with PROSPERO_TEST_XP_DESKTOP naming the helper there: Notepad is
+    started, typed into in Unicode, clicked, captured, and closed without
+    saving. The screenshots it sent go to PROSPERO_TEST_XP_SHOTS, a
+    directory here, to look at."""
+    helper = os.environ.get("PROSPERO_TEST_XP_DESKTOP")
+    if not isinstance(t.host, XpHost) or not helper:
+        raise Skip("drives XP's desktop: needs --xp and PROSPERO_TEST_XP_DESKTOP")
+    r = t.run(timeout=170, env={"PROSPERO_TEST_DESKTOP": json.dumps([helper])})
+    ends = [(e["status"], e["text"][:160]) for e in r.all("tool.end")]
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {ends}")
+    t.check(len(ends) == 13 and all(s == "ok" for s, _ in ends), f"every step: {ends}")
+    shots = os.environ.get("PROSPERO_TEST_XP_SHOTS")
+    n = 0
+    for q in t.requests():
+        for label, url in fake_provider.desk_images(q["body"]):
+            png = base64.b64decode(url.split(",", 1)[1])
+            t.check(pngdims(png), f"a PNG: {label}")
+            if shots:
+                name = label.split()[-1].rstrip(":")
+                with open(os.path.join(shots, f"{name}.png"), "wb") as f:
+                    f.write(png)
+            n += 1
+    t.check(n >= 4, f"screenshots sent: {n}")
+
+
+@scenario(conf={**AN, **DESKALL, "_extra": "[model {model}]\nimage_edge = 100\n"}, bound=15)
+def an_desktop(t):
+    """A screenshot goes back to Anthropic in its tool result, as an image
+    block after the text, which the fake checks as the API would, with
+    the image limits of kind anthropic."""
+    env = dict(ANENV, **deskenv(t))
+    r = t.run(env=env)
+    anok(t, r)
+    reqs = [q["body"] for q in t.requests()]
+    result = [b for b in reqs[1]["messages"][-1]["content"] if b["type"] == "tool_result"][0]
+    kinds = [c["type"] for c in result["content"]]
+    t.check(kinds == ["text", "image"], f"the result {kinds}")
+    src = result["content"][1]["source"]
+    t.check(src["type"] == "base64" and src["media_type"] == "image/png" and
+            pngdims(base64.b64decode(src["data"])) == (100, 62), "the image")
+    t.check(desklog(t)[1] == ["shot", "-s", "100", "1150000", "screen"],
+            f"anthropic's pixel limit {desklog(t)[1]}")
+    t.check(desklog(t)[2] == ["click", "screen", "32", "45"], f"mapped {desklog(t)[2]}")
 
 
 # The soak: sessions under 10% random faults for a while

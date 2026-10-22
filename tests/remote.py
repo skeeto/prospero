@@ -743,6 +743,39 @@ def idle_exit(t):
 
 
 @scenario
+def quit_signals(t):
+    """prospero serve asked to quit by a signal (SIGTERM, SIGINT, SIGHUP;
+    on Windows Ctrl+Break at its console) quits as a client's quit does:
+    exit 0, its registration and endpoint gone."""
+    win = os.name == "nt"
+    sigs = [signal.CTRL_BREAK_EVENT] if win else [signal.SIGTERM, signal.SIGINT, signal.SIGHUP]
+    for sig in sigs:
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if win else 0
+        p = subprocess.Popen([t.prospero, "serve", "--state", t.state, "-c", t.config],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, creationflags=flags)
+        t.procs.append(p)
+        deadline = time.monotonic() + 10
+        while p.pid not in t.hostpids() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        t.check(p.pid in t.hostpids(), f"{sig!r}: the host registered")
+        p.send_signal(sig)  # a process of our own, by its Popen
+        try:
+            rc = p.wait(10)
+        except subprocess.TimeoutExpired:
+            raise Failure(f"{sig!r}: the host did not quit")
+        err = p.stderr.read().decode("utf-8", "replace")
+        t.check(rc == 0, f"{sig!r}: exit {rc}: {err}")
+        t.check("asked to stop" in err, f"{sig!r}: it said why: {err!r}")
+        hosts = os.path.join(t.state, "hosts")
+        t.check(not os.path.isdir(hosts) or not os.listdir(hosts),
+                f"{sig!r}: registration removed: {os.listdir(hosts)}")
+        r = subprocess.run([t.prospero, "attach", "--reconnect", "--state", t.state],
+                           capture_output=True, text=True, timeout=10)
+        t.check(r.returncode == 90, f"{sig!r}: then no host: exit {r.returncode}")
+
+
+@scenario
 def idle_busy(t):
     """No client, but a turn running: the host waits for it to end."""
     c = Client(t)

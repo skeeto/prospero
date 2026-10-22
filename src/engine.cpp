@@ -147,6 +147,7 @@ enum : i32 {
     T_JOBS,      // the next deadline of a background job
     T_TASK,      // a subagent reported: end the calls that may end
     T_PARK,      // idle so long: free its memory
+    T_DESK,      // the desktop helper's answer is due
     T_COUNT,
 };
 
@@ -342,6 +343,19 @@ struct ShellRun {
     b32  fold;      // grep ignore_case
 };
 
+// A session's desktop helper (deskrun), while it runs.
+struct DeskRun {
+    Proc    *proc;
+    u64      id;       // its records'
+    Region  *region;   // what it sent and not yet taken, reserved at its
+    Arena    arena;    // first start, and kept for the session's life
+    Buf      in;
+    b32      hello;    // its hello was answered
+    b32      busy;     // a call waits for its reply
+    i32      action;   // that call's, DESK_*
+    DeskShot shot;     // the latest screenshot's, which points refer to
+};
+
 // An ask waiting for the user, or recently resolved.
 struct Ask {
     Str       req;
@@ -435,6 +449,11 @@ struct Session {
     i64          callstart;
     Str          callfail;   // why the current call failed, for tool.end
     Str          callfix;    // what was forgiven in its edit (editrepair)
+    Str          callimage;  // its screenshot, relative to dir, and its
+    i32          callimgw;   // size, and the screenshot's geometry
+    i32          callimgh;   // (deskshotstr), for tool.end
+    Str          callshot;
+    DeskRun      desk;       // the desktop helper
     Proc        *proc;
     u64          procid;
     ShellRun     sh;
@@ -716,9 +735,11 @@ static void addmsg(Session *s, Msg m)
 }
 
 // The next prompt's size in tokens, estimated.
+static i64 deskimagetokens(Session *);
 static i64 estimate(Session *s)
 {
-    return tokensof(s->rate, s->system.len + s->tools.len + s->bytes);
+    return tokensof(s->rate, s->system.len + s->tools.len + s->bytes) +
+           deskimagetokens(s);
 }
 
 static void adduser(Session *s, Arena scratch, Str text, Str via)
@@ -1320,6 +1341,9 @@ static void taskcancel(Session *, Arena);
 static void taskcheck(Session *, Arena, Str why, Str err);
 static b32  taskbudget(Session *, Arena);
 static i64  parkafter(Engine *);
+static b32  deskrun(Session *, Arena, DeskArgs *);
+static Str  deskdenial(Arena *, i32 by, Str note, i64 wait);
+static Slice<Msg> deskimages(Session *, Arena *);
 
 // The ids of the session's calls so far, which a new call's must not
 // repeat (finishpartial).
@@ -1371,7 +1395,7 @@ static void sendchat(Session *s, Arena scratch)
     req.mc        = &s->mc;
     req.system    = s->system;
     req.tools     = s->tools;
-    req.history   = s->history;
+    req.history   = deskimages(s, &scratch);
     req.thinkfrom = s->thinkfrom;
     b32 an        = s->ep.kind == EP_ANTHROPIC;
     Str body      = an ? anencode(&s->attempt, scratch, &req)
@@ -2144,6 +2168,14 @@ static void ondone(Session *s, Arena scratch, i32 err, Str text)
         return;
 
     case S_HEAD: {
+        if (err == HTTP_ETRUST) {
+            // No retry will change it: someone must trust the certificate,
+            // or fix the server or the endpoint's URL
+            Str msg = contains(text, "certificate") ? text :
+                      concat(&scratch, "the server's certificate was refused: ", text);
+            fail(s, scratch, CLASS_FATAL, 0, msg, -1);
+            return;
+        }
         Str msg = concat(&scratch, "connection failed: ", text);
         fail(s, scratch, CLASS_TRANSIENT, 0, msg, -1);
     } return;
@@ -2283,6 +2315,12 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     if (child.len) {
         putstrkey(&w.json, "child", child);
     }
+    if (s->callimage.len) {
+        putstrkey(&w.json, "image", s->callimage);
+        putintkey(&w.json, "width", s->callimgw);
+        putintkey(&w.json, "height", s->callimgh);
+        putstrkey(&w.json, "shot", s->callshot);
+    }
     putintkey(&w.json, "ms", (os_ticks(e->os) - s->callstart)/MS);
     ssend(s, &w);
 
@@ -2292,7 +2330,12 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     m.text   = clone(&s->perm, text);
     m.spill  = spill.len ? clone(&s->perm, spill) : Str{};
     m.error  = toolfailed(status);
+    m.image  = s->callimage;
+    m.imgw   = s->callimgw;
+    m.imgh   = s->callimgh;
     addmsg(s, m);
+    s->callimage = {};
+    s->callshot  = {};
     b32 done = status=="ok" || status=="background";
     s->progressed |= done;
     if (done && toolmutates(toolfind(c->name))) {
@@ -2737,9 +2780,18 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note)
     }
 
     toolstart(s, scratch);
-    if (allow) {
+    if (allow && k->tool==TOOL_DESKTOP) {
+        Args args = parseargs(&scratch, k->tool, c->args, s->te.edit);
+        deskrun(s, scratch, &args.desk);  // which may go on
+        return;
+    } else if (allow) {
         Args args = parseargs(&scratch, k->tool, c->args, s->te.edit);
         runfile(s, scratch, k->tool, k->gp.path, &args);
+        return;
+    } else if (k->tool == TOOL_DESKTOP) {
+        Str text = deskdenial(&scratch, by, note, (t - k->opened + SEC/2) / SEC);
+        toolend(s, scratch, by==DENY_CANCEL ? Str("cancelled") : Str("denied"),
+                text, 0, 0, {}, 0);
         return;
     } else if (by == DENY_CANCEL) {
         toolend(s, scratch, "cancelled", "Not run: the user cancelled the turn.",
@@ -2820,7 +2872,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
 // out/<call>.log for a call's output, unless a model reused the call id
 // in this session: the absolute path, and in rel the path relative to
 // the session directory, both in the session's arena.
-static Str spillfile(Session *s, Arena scratch, Str id, Str *rel)
+static Str spillfile(Session *s, Arena scratch, Str id, Str *rel, Str ext = ".log")
 {
     for (i32 n = 1;; n++) {
         Arena a = scratch;
@@ -2831,7 +2883,7 @@ static Str spillfile(Session *s, Arena scratch, Str id, Str *rel)
             putbyte(&b, '-');
             print(&b, (i64)n);
         }
-        print(&b, ".log");
+        print(&b, ext);
         Str r    = finish(&b);
         Str path = join(&a, s->dir, r);
         if (os_stat(s->e->os, a, path).type == STAT_MISSING) {
@@ -3676,6 +3728,822 @@ static void todoremind(Session *s, Arena scratch)
 }
 
 
+// Desktop control (desktop.cpp)
+//
+// A session's desktop calls go to a helper of its own, started by the
+// first and stopped when the turn ends, one call at a time: the request
+// goes out as a frame, and the session waits in S_TOOL for the reply,
+// at most DESK_ANSWER beyond what the call may take (a wait's seconds).
+// The helper's first reply answers hello, which checks its protocol. A
+// helper that dies, says nothing in time, or answers with something
+// that is no reply fails the call, and the next call starts another.
+// A cancel stops the helper at once, except during a drag, which ends
+// first so that no mouse button stays held down.
+//
+// Every call is asked about ([desktop] ask), before its tool.start as a
+// path is, with kind "desktop" and the deadline [desktop] ask_timeout.
+// Screenshots go to the session's out/ as CALL.png, which the tool.end
+// record names with the screenshot's geometry ("shot"), so that a
+// session opened again maps points as before, and each request reads
+// the latest ([desktop] images) again from there.
+
+enum : i64 {
+    DESK_ANSWER = 30*SEC,  // for the helper to answer, beyond a wait
+    DESK_REGION = (i64)1 << (sizeof(void *)==8 ? 28 : 27),
+};
+
+// The helper's command line: next to this executable, or for tests the
+// JSON array of strings in PROSPERO_TEST_DESKTOP. Empty if none.
+static Slice<Str> deskhelper(Engine *e, Arena *a)
+{
+    Slice<Str> r    = {};
+    Str        test = os_getenv(e->os, a, "PROSPERO_TEST_DESKTOP");
+    if (test.len) {
+        JsonDoc d = jsonparse(a, test);
+        if (d.ok && d.root->type==JSON_ARRAY) {
+            for (Json *k = d.root->child; k; k = k->next) {
+                r = push(a, r, jsonstr(k));
+            }
+        }
+        return r;
+    }
+    Str name = e->te.windows ? Str("prospero-desktop.exe") : Str("prospero-desktop");
+    Str path = join(a, e->exedir, name);
+    if (os_stat(e->os, *a, path).type == STAT_FILE) {
+        r = push(a, r, path);
+    }
+    return r;
+}
+
+static Str deskoffer(Engine *e)
+{
+    return trim(cfgget(e->cfg, "desktop", "", "offer", 0));
+}
+
+// The desktop bit of a new session's tools denied: offered to a role
+// that lists it, unless offer is none, and to a session without a role
+// only when offer is all.
+static u32 deskdeny(Engine *e, b32 role)
+{
+    Str offer = deskoffer(e);
+    b32 ok    = role ? offer!="none" : offer=="all";
+    return ok ? 0 : (u32)TOOL_OFFMASK;
+}
+
+struct DeskLimits {
+    i64 edge;
+    i64 pixels;
+};
+
+// The largest screenshot to send the session's model.
+static DeskLimits desklimits(Session *s)
+{
+    b32        an = s->ep.kind == EP_ANTHROPIC;
+    DeskLimits r  = {};
+    r.edge   = s->mc.imgedge   ? s->mc.imgedge   : an ? DESK_EDGE   : DESK_EDGE_OAI;
+    r.pixels = s->mc.imgpixels ? s->mc.imgpixels : an ? DESK_PIXELS : DESK_PIXELS_OAI;
+    return r;
+}
+
+// Screenshots kept in requests.
+static i64 deskkeep(Engine *e)
+{
+    Int v = parseint(trim(cfgget(e->cfg, "desktop", "", "images", 0)));
+    return v.ok ? (v.val<0 ? 0 : v.val>20 ? 20 : v.val) : DESK_IMAGES;
+}
+
+// Tokens of the screenshots the next request carries.
+static i64 deskimagetokens(Session *s)
+{
+    i64 keep = deskkeep(s->e);
+    i64 n    = 0;
+    i64 r    = 0;
+    for (iz i = s->history.len-1; i>=0 && n<keep; i--) {
+        Msg *m = &s->history[i];
+        if (m->image.len) {
+            r += imagetokens(m->imgw, m->imgh);
+            n++;
+        }
+    }
+    return r;
+}
+
+// The history for a request: the latest screenshots read in as base64,
+// and those left out said to be. The history itself if it has none.
+static Slice<Msg> deskimages(Session *s, Arena *a)
+{
+    Engine *e    = s->e;
+    i64     keep = deskkeep(e);
+    b32     any  = 0;
+    for (iz i = 0; i<s->history.len && !any; i++) {
+        any = s->history[i].image.len > 0;
+    }
+    if (!any) {
+        return s->history;
+    }
+    Slice<Msg> h = {};
+    h.data = alloc<Msg>(a, s->history.len);
+    h.len  = h.cap = s->history.len;
+    i64 n  = 0;
+    for (iz i = s->history.len-1; i >= 0; i--) {
+        Msg m = s->history[i];
+        if (m.image.len && n<keep) {
+            n++;
+            Read rd = os_read(e->os, a, join(a, s->dir, m.image), DESK_REPLYMAX);
+            if (rd.err == READ_OK) {
+                m.imgb64 = base64(a, rd.data);
+            } else {
+                m.text = concat(a, m.text, " [The screenshot is lost: its "
+                                "file could not be read.]");
+            }
+        } else if (m.image.len) {
+            m.text = concat(a, m.text, " [The screenshot is no longer shown: "
+                            "only the latest are.]");
+        }
+        h.data[i] = m;
+    }
+    return h;
+}
+
+static Session *deskbyid(Engine *e, u64 id)
+{
+    for (Session *s = e->sessions; id && s; s = s->next) {
+        if (s->desk.id == id) {
+            return s;
+        }
+    }
+    return 0;
+}
+
+// Forget what the helper sent so far.
+static void deskreset(Session *s)
+{
+    DeskRun *k = &s->desk;
+    k->arena = newarena(k->region);
+    k->in    = Buf(&k->arena, 1<<16);
+}
+
+// Stop the helper at once, its records from then on ignored.
+static void deskkill(Session *s)
+{
+    DeskRun *k = &s->desk;
+    if (k->proc) {
+        os_kill(s->e->os, k->proc, 1);
+        os_procfree(s->e->os, k->proc);
+    }
+    k->proc  = 0;
+    k->id    = 0;
+    k->hello = 0;
+}
+
+// Let the helper go: the end of its input ends it, unless a call still
+// waits for it, which a cancel or a failure deals with first.
+static void deskstop(Session *s)
+{
+    DeskRun *k = &s->desk;
+    if (k->busy) {
+        deskkill(s);
+        k->busy = 0;
+    } else if (k->proc) {
+        os_procwrite(s->e->os, k->proc, {});
+        os_procfree(s->e->os, k->proc);
+        k->proc  = 0;
+        k->id    = 0;
+        k->hello = 0;
+    }
+}
+
+// Start the helper and greet it. 0 on failure, explained by os_lasterr.
+static b32 deskstart(Session *s, Arena scratch)
+{
+    Engine     *e    = s->e;
+    DeskRun    *k    = &s->desk;
+    Slice<Str>  argv = deskhelper(e, &scratch);
+    argv = push(&scratch, argv, Str("--serve"));
+    if (!k->region) {
+        k->region = os_reserve(e->os, DESK_REGION);
+        if (!k->region) {
+            return 0;
+        }
+    }
+    deskreset(s);
+    Slice<Str> secrets = cfgsecrets(e->cfg, &scratch);
+    Spawn      sp      = {};
+    sp.argv      = argv;
+    sp.cwd       = s->cwd;
+    sp.env       = shellenv(&scratch, e->env, s->te.windows, secrets);
+    sp.outpath   = join(&scratch, s->outdir, "desktop.log");
+    sp.mbox      = e->in;
+    sp.id        = k->id = ++e->nextid;
+    sp.breakaway = 1;
+    k->proc = os_spawnio(e->os, &sp, scratch);
+    if (!k->proc) {
+        k->id = 0;
+        return 0;
+    }
+    Slice<Str> hello = {};
+    hello = push(&scratch, hello, Str("hello"));
+    if (!os_procwrite(e->os, k->proc, deskframe(&scratch, hello))) {
+        deskkill(s);
+        return 0;
+    }
+    return 1;
+}
+
+static Str deskint(Arena *a, i64 v)
+{
+    Buf b(a, 24);
+    print(&b, v);
+    return finish(&b);
+}
+
+static void deskxy(Buf *b, f64 x, f64 y)
+{
+    putbyte(b, '(');
+    printfloat(b, x, x==(f64)(i64)x ? 0 : 1);
+    print(b, ", ");
+    printfloat(b, y, y==(f64)(i64)y ? 0 : 1);
+    putbyte(b, ')');
+}
+
+// Where input with no window of its own goes: the window named, the
+// latest screenshot's window, or the foreground.
+static Str deskinput(Session *s, Arena *a, DeskArgs *d)
+{
+    if (d->window.len) {
+        return deskwindow(a, d->window);
+    }
+    DeskShot *shot = &s->desk.shot;
+    return shot->ok && shot->target!="screen" ? shot->target : Str("active");
+}
+
+// What a call does, for the user who is asked, and the agent told.
+static Str deskwhat(Session *s, Arena *a, DeskArgs *d, b32 done)
+{
+    DeskShot *shot  = &s->desk.shot;
+    Buf       b(a, 256);
+    Str       where = shot->ok && shot->target!="screen"
+                    ? Str(" in the screenshot of the window")
+                    : Str(" in the screenshot of the screen");
+    switch (d->action) {
+    case DESK_SCREENSHOT:
+        print(&b, done ? Str("Took a screenshot of ") : Str("take a screenshot of "));
+        if (d->window.len) {
+            print(&b, "the window \"");
+            print(&b, d->window);
+            putbyte(&b, '"');
+        } else {
+            print(&b, "the screen");
+        }
+        break;
+    case DESK_CLICK:
+    case DESK_DOUBLE:
+    case DESK_RIGHT:
+    case DESK_MOVE: {
+        static Str const verbs[][2] = {
+            {"click at ", "Clicked at "},
+            {"double-click at ", "Double-clicked at "},
+            {"right-click at ", "Right-clicked at "},
+            {"move the pointer to ", "Moved the pointer to "},
+        };
+        print(&b, verbs[d->action-DESK_CLICK][done]);
+        deskxy(&b, d->x, d->y);
+        print(&b, where);
+    } break;
+    case DESK_DRAG:
+        print(&b, done ? Str("Dragged from ") : Str("drag from "));
+        deskxy(&b, d->x, d->y);
+        print(&b, " to ");
+        deskxy(&b, d->x2, d->y2);
+        print(&b, where);
+        break;
+    case DESK_SCROLL:
+        print(&b, done ? Str("Scrolled ") : Str("scroll "));
+        print(&b, d->amount>0 ? d->amount : -d->amount);
+        print(&b, d->amount>0 ? Str(" up at ") : Str(" down at "));
+        deskxy(&b, d->x, d->y);
+        print(&b, where);
+        break;
+    case DESK_KEY:
+        print(&b, done ? Str("Pressed ") : Str("press "));
+        print(&b, trim(d->keys));
+        break;
+    case DESK_TYPE: {
+        Str t = d->text.len>200 ? utf8head(d->text, 200) : d->text;
+        print(&b, done ? Str("Typed ") : Str("type "));
+        printjsonstr(&b, t);
+        print(&b, t.len<d->text.len ? Str("...") : Str(""));
+    } break;
+    case DESK_WINDOWS:
+        print(&b, done ? Str("Listed the windows") : Str("list the windows"));
+        break;
+    case DESK_FOCUS:
+        print(&b, done ? Str("Brought \"") : Str("bring \""));
+        print(&b, d->window);
+        print(&b, "\" to the front");
+        break;
+    case DESK_CLOSE:
+        print(&b, done ? Str("Asked \"") : Str("ask \""));
+        print(&b, d->window);
+        print(&b, "\" to close");
+        break;
+    case DESK_WAIT:
+        print(&b, done ? Str("Waited for \"") : Str("wait for \""));
+        print(&b, d->window);
+        print(&b, d->gone ? Str("\" to be gone") : Str("\" to appear"));
+        break;
+    case DESK_RUN:
+        print(&b, done ? Str("Started ") : Str("run "));
+        print(&b, d->program);
+        for (iz i = 0; i < d->args.len; i++) {
+            putbyte(&b, ' ');
+            print(&b, d->args[i]);
+        }
+        break;
+    }
+    if ((d->action==DESK_KEY || d->action==DESK_TYPE) && d->window.len) {
+        print(&b, " in \"");
+        print(&b, d->window);
+        putbyte(&b, '"');
+    }
+    return finish(&b);
+}
+
+// Why a call cannot be made, or null if it can.
+static Str deskcheck(Session *s, Arena *a, DeskArgs *d)
+{
+    Engine *e = s->e;
+    if (deskoffer(e) == "none") {
+        return "Desktop control is off: the configuration's [desktop] offer "
+               "is none, so nothing was done.";
+    } else if (!deskhelper(e, a).len) {
+        return "Desktop control is not available here: there is no desktop "
+               "helper (prospero-desktop) next to the harness, which so far "
+               "exists for Windows only. Nothing was done.";
+    } else if (d->action==DESK_SCREENSHOT && s->mc.novision) {
+        return "This session's model takes no images (its [model] vision is "
+               "false), so it cannot see screenshots.";
+    }
+    if (deskneedspoint(d->action)) {
+        DeskShot *shot = &s->desk.shot;
+        if (!shot->ok) {
+            return "Take a screenshot first: points are in the latest "
+                   "screenshot, and this session has none yet. Nothing was "
+                   "done.";
+        }
+        DeskPoint p = desktarget(a, shot, s->te.coords, d->x, d->y);
+        if (!p.why.data && d->action==DESK_DRAG) {
+            p = desktarget(a, shot, s->te.coords, d->x2, d->y2);
+        }
+        if (p.why.data) {
+            return concat(a, concat(a, "Not done: ", p.why), ". Use a point "
+                          "in the latest screenshot.");
+        }
+    }
+    return {};
+}
+
+// Send the current call to the helper, starting it if need be. Returns
+// 1 if the call finished (it could not be sent), 0 if it waits for the
+// reply.
+static b32 deskrun(Session *s, Arena scratch, DeskArgs *d)
+{
+    Engine    *e    = s->e;
+    DeskRun   *k    = &s->desk;
+    DeskShot  *shot = &k->shot;
+    i32        cs   = s->te.coords;
+    Str        win  = d->window.len ? deskwindow(&scratch, d->window) : Str{};
+    Slice<Str> argv = {};
+    i64        wait = 0;
+    Str        why  = deskcheck(s, &scratch, d);  // the configuration may change
+    if (why.data) {
+        toolend(s, scratch, "error", why, 0, 0, {}, 0);
+        return 1;
+    }
+
+    static Str const clicks[] = {"click", "dclick", "rclick", "hover"};
+    DeskPoint p = {};
+    switch (d->action) {
+    case DESK_SCREENSHOT: {
+        DeskLimits l = desklimits(s);
+        argv = push(&scratch, argv, Str("shot"));
+        argv = push(&scratch, argv, Str("-s"));
+        argv = push(&scratch, argv, deskint(&scratch, l.edge));
+        argv = push(&scratch, argv, deskint(&scratch, l.pixels));
+        argv = push(&scratch, argv, win.len ? win : Str("screen"));
+    } break;
+    case DESK_CLICK:
+    case DESK_DOUBLE:
+    case DESK_RIGHT:
+    case DESK_MOVE:
+        p    = desktarget(&scratch, shot, cs, d->x, d->y);
+        argv = push(&scratch, argv, clicks[d->action-DESK_CLICK]);
+        argv = push(&scratch, argv, shot->target);
+        argv = push(&scratch, argv, deskint(&scratch, p.x));
+        argv = push(&scratch, argv, deskint(&scratch, p.y));
+        break;
+    case DESK_DRAG: {
+        DeskPoint q = desktarget(&scratch, shot, cs, d->x2, d->y2);
+        p    = desktarget(&scratch, shot, cs, d->x, d->y);
+        argv = push(&scratch, argv, Str("drag"));
+        argv = push(&scratch, argv, shot->target);
+        argv = push(&scratch, argv, deskint(&scratch, p.x));
+        argv = push(&scratch, argv, deskint(&scratch, p.y));
+        argv = push(&scratch, argv, deskint(&scratch, q.x));
+        argv = push(&scratch, argv, deskint(&scratch, q.y));
+    } break;
+    case DESK_SCROLL:
+        p    = desktarget(&scratch, shot, cs, d->x, d->y);
+        argv = push(&scratch, argv, Str("wheel"));
+        argv = push(&scratch, argv, shot->target);
+        argv = push(&scratch, argv, deskint(&scratch, p.x));
+        argv = push(&scratch, argv, deskint(&scratch, p.y));
+        argv = push(&scratch, argv, deskint(&scratch, d->amount));
+        break;
+    case DESK_KEY:
+        argv = push(&scratch, argv, Str("key"));
+        argv = push(&scratch, argv, deskinput(s, &scratch, d));
+        for (Str rest = trim(d->keys); rest.len;) {
+            iz i = 0;
+            for (; i<rest.len && !whitespace(rest[i]); i++) {}
+            argv = push(&scratch, argv, takehead(rest, i));
+            rest = trimleft(cuthead(rest, i));
+        }
+        break;
+    case DESK_TYPE:
+        argv = push(&scratch, argv, Str("type"));
+        argv = push(&scratch, argv, deskinput(s, &scratch, d));
+        argv = push(&scratch, argv, d->text);
+        break;
+    case DESK_WINDOWS:
+        argv = push(&scratch, argv, Str("list"));
+        if (win.len) {
+            argv = push(&scratch, argv, win);
+        }
+        break;
+    case DESK_FOCUS:
+    case DESK_CLOSE:
+        argv = push(&scratch, argv, d->action==DESK_FOCUS ? Str("raise") : Str("close"));
+        argv = push(&scratch, argv, win);
+        break;
+    case DESK_WAIT:
+        wait = d->secs>0 ? d->secs : 10;
+        argv = push(&scratch, argv, Str("wait"));
+        if (d->gone) {
+            argv = push(&scratch, argv, Str("-gone"));
+        }
+        argv = push(&scratch, argv, Str("-t"));
+        argv = push(&scratch, argv, deskint(&scratch, wait));
+        argv = push(&scratch, argv, win);
+        break;
+    case DESK_RUN:
+        argv = push(&scratch, argv, Str("run"));
+        argv = push(&scratch, argv, d->program);
+        for (iz i = 0; i < d->args.len; i++) {
+            argv = push(&scratch, argv, d->args[i]);
+        }
+        break;
+    }
+
+    if (!k->proc && !deskstart(s, scratch)) {
+        Str err  = os_lasterr(e->os, &scratch);
+        Str text = concat(&scratch, "The desktop helper could not be started: ", err);
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        return 1;
+    } else if (!os_procwrite(e->os, k->proc, deskframe(&scratch, argv))) {
+        deskkill(s);
+        toolend(s, scratch, "error", "The desktop helper stopped taking "
+                "commands, so nothing was done. Try again.", 0, 0, {}, 0);
+        return 1;
+    }
+    k->busy   = 1;
+    k->action = d->action;
+    arm(s, T_DESK, DESK_ANSWER + wait*SEC);
+    setstate(s, S_TOOL);
+    return 0;
+}
+
+// The helper's list of windows as the agent reads them.
+static Str deskwindows(Arena *a, Str list)
+{
+    Buf b(a, list.len + 256);
+    for (Str rest = list; rest.len;) {
+        Cut line = cut(rest, '\n');
+        rest = line.tail;
+        Str f[6] = {};
+        Str r    = line.head;
+        for (i32 i = 0; i < 6; i++) {
+            Cut c = cut(r, '\t');
+            f[i] = c.head;
+            r    = c.tail;
+            if (!c.ok) break;
+        }
+        if (!f[0].len) {
+            continue;
+        }
+        print(&b, "id=");
+        print(&b, f[0]);
+        print(&b, " pid=");
+        print(&b, f[1]);
+        putbyte(&b, ' ');
+        print(&b, f[3]);
+        putbyte(&b, ' ');
+        print(&b, f[4]);
+        if (f[5].len) {
+            print(&b, " \"");
+            print(&b, f[5]);
+            putbyte(&b, '"');
+        }
+        putbyte(&b, '\n');
+    }
+    if (!b.len) {
+        return "No window matches.";
+    }
+    b.len--;
+    return finish(&b);
+}
+
+// The reply to the current call: its result, then the next call.
+static void deskanswer(Session *s, Arena scratch, DeskReply *r)
+{
+    Engine  *e = s->e;
+    DeskRun *k = &s->desk;
+    Block   *c = &s->calls[s->callidx];
+    Args     a = parseargs(&scratch, TOOL_DESKTOP, c->args, s->te.edit);
+    DeskArgs *d = &a.desk;
+    disarm(s, T_DESK);
+    k->busy = 0;
+    setstate(s, S_IDLE);
+
+    Str what = deskwhat(s, &scratch, d, 1);
+    Str text = {};
+    if (!r->ok) {
+        deskkill(s);
+        text = "The desktop helper's reply made no sense, so it was stopped.";
+    } else if (r->status) {
+        Buf b(&scratch, 256 + r->text.len);
+        print(&b, r->status==3 ? Str("Timed out: ") : Str("Failed: "));
+        print(&b, trim(r->text));
+        print(&b, r->status==2 ? Str(". The windows action lists the windows "
+                                     "there are, with their ids.")
+                               : Str("."));
+        text = finish(&b);
+    }
+    if (text.data) {
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        nexttool(s, scratch);
+        return;
+    }
+
+    Buf b(&scratch, 512 + r->text.len);
+    print(&b, what);
+    switch (d->action) {
+    case DESK_SCREENSHOT: {
+        DeskShot sh = deskshotparse(&scratch, r->text);
+        DeskSize ps = pngsize(r->data);
+        if (!sh.ok || ps.w!=sh.iw || ps.h!=sh.ih) {
+            toolend(s, scratch, "error", "The desktop helper sent a "
+                    "screenshot that is not one.", 0, 0, {}, 0);
+            nexttool(s, scratch);
+            return;
+        }
+        Str rel  = {};
+        Str path = spillfile(s, scratch, c->id, &rel, ".png");
+        if (!os_write(e->os, scratch, path, r->data)) {
+            Str err = os_lasterr(e->os, &scratch);
+            text = concat(&scratch, "The screenshot could not be saved: ", err);
+            toolend(s, scratch, "error", text, 0, 0, {}, 0);
+            nexttool(s, scratch);
+            return;
+        }
+        sh.target = clone(&s->perm, sh.target);
+        k->shot   = sh;
+        s->callimage = rel;
+        s->callimgw  = sh.iw;
+        s->callimgh  = sh.ih;
+        s->callshot  = clone(&s->perm, deskshotstr(&scratch, &sh));
+        print(&b, ": ");
+        print(&b, (i64)sh.w);
+        putbyte(&b, 'x');
+        print(&b, (i64)sh.h);
+        print(&b, " pixels, ");
+        if (sh.iw==sh.w && sh.ih==sh.h) {
+            print(&b, "shown to you as they are.");
+        } else {
+            print(&b, "shown to you scaled down to ");
+            print(&b, (i64)sh.iw);
+            putbyte(&b, 'x');
+            print(&b, (i64)sh.ih);
+            putbyte(&b, '.');
+        }
+        if (s->te.coords == COORDS_NORM1000) {
+            print(&b, " Give points in thousandths of its width and height, "
+                      "0 to 1000.");
+        } else {
+            print(&b, " Give points in pixels of this image: x from 0 to ");
+            print(&b, (i64)(sh.iw - 1));
+            print(&b, ", y from 0 to ");
+            print(&b, (i64)(sh.ih - 1));
+            putbyte(&b, '.');
+        }
+    } break;
+    case DESK_WINDOWS:
+        print(&b, ":\n");
+        print(&b, deskwindows(&scratch, r->text));
+        break;
+    case DESK_WAIT:
+        print(&b, d->gone ? Str(": it is gone.") : Str(": it is there.\n"));
+        if (!d->gone) {
+            print(&b, deskwindows(&scratch, r->text));
+        }
+        break;
+    case DESK_RUN: {
+        Str pid = trim(r->text);
+        print(&b, ", process id ");
+        print(&b, pid);
+        print(&b, ". Wait for its window (wait, with window pid=");
+        print(&b, pid);
+        print(&b, ") before you use it.");
+    } break;
+    default:
+        putbyte(&b, '.');
+    }
+    toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
+    nexttool(s, scratch);
+}
+
+// The helper failed the current call, or went away: end it with why.
+static void deskbroke(Session *s, Arena scratch, Str why)
+{
+    DeskRun *k    = &s->desk;
+    b32      busy = k->busy;
+    Str      log  = {};
+    if (k->proc) {
+        Str  err = join(&scratch, s->outdir, "desktop.log");
+        Read rd  = os_read(s->e->os, &scratch, err, 4096);
+        log = rd.err==READ_OK ? trim(rd.data) : Str{};
+    }
+    deskkill(s);
+    k->busy = 0;
+    if (!busy) {
+        return;
+    }
+    disarm(s, T_DESK);
+    setstate(s, S_IDLE);
+    Buf b(&scratch, 256 + log.len);
+    print(&b, why);
+    if (log.len) {
+        print(&b, " It said: ");
+        print(&b, log);
+    }
+    toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+    nexttool(s, scratch);
+}
+
+// A record of the session's helper: its output, or its end.
+static void deskrecord(Session *s, Arena scratch, Record r)
+{
+    DeskRun *k = &s->desk;
+    if (r.type == PROC_TAIL || r.type == PROC_LIMIT) {
+        return;  // not for a helper
+    } else if (r.type != PROC_DATA) {
+        deskbroke(s, scratch, "The desktop helper stopped, so the action "
+                  "may not have been done.");
+        return;
+    }
+
+    print(&k->in, r.data);
+    // Whole frames out, the rest kept, before any is acted upon, which
+    // may restart the helper
+    Slice<Str> frames = {};
+    for (;;) {
+        Str buf = {k->in.data, k->in.len};
+        iz  n   = deskframelen(buf, DESK_REPLYMAX);
+        if (n < 0) {
+            deskbroke(s, scratch, "The desktop helper sent a reply too "
+                      "large, so it was stopped.");
+            return;
+        } else if (!n) {
+            break;
+        }
+        frames = push(&scratch, frames, clone(&scratch, takehead(buf, n)));
+        for (iz i = n; i < buf.len; i++) {
+            k->in.data[i-n] = k->in.data[i];
+        }
+        k->in.len -= n;
+    }
+    if (!k->in.len && k->in.cap>(1<<20)) {
+        deskreset(s);  // let a large reply's room go
+    }
+
+    u64 id = k->id;
+    for (iz i = 0; i<frames.len && k->id==id; i++) {
+        DeskReply rp = deskreply(frames[i]);
+        if (!k->hello) {
+            Buf want(&scratch, 32);
+            print(&want, "prospero-desktop ");
+            print(&want, (i64)DESK_PROTO);
+            putbyte(&want, ' ');
+            k->hello = 1;
+            if (!rp.ok || rp.status || !startswith(rp.text, finish(&want))) {
+                Str text = rp.ok ? trim(rp.text) : Str("(nothing)");
+                deskbroke(s, scratch, concat(&scratch, "The desktop helper "
+                          "is not one this harness can use, so it was "
+                          "stopped. Its hello: ", text));
+                return;
+            }
+        } else if (k->busy) {
+            deskanswer(s, scratch, &rp);
+        }
+    }
+}
+
+// A desktop call, asked about first if need be. Returns 1 if the call
+// finished, 0 if it goes on (asking, or waiting for the helper).
+static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
+{
+    Engine *e   = s->e;
+    Block  *c   = &s->calls[s->callidx];
+    Str     why = deskcheck(s, &scratch, d);
+    if (why.data) {
+        toolstart(s, scratch);
+        toolend(s, scratch, "error", why, 0, 0, {}, 0);
+        return 1;
+    } else if (!cfgbool(cfgget(e->cfg, "desktop", "", "ask", 0))) {
+        toolstart(s, scratch);
+        return deskrun(s, scratch, d);
+    }
+
+    Ask *k = &s->ask;
+    *k = {};
+    k->req    = clone(&s->perm, concat(&scratch, c->id, "/ask"));
+    k->tool   = TOOL_DESKTOP;
+    k->opened = os_ticks(e->os);
+    b32 steer = s->steers.len > 0;
+    b32 wait  = attending(s) && !steer;
+    i64 delay = cfgms(e->cfg, "desktop", "", "ask_timeout", 0)*MS;
+    if (wait) {
+        arm(s, T_ASK, delay);
+    }
+    {
+        Str   what = concat(&scratch, "desktop: ", deskwhat(s, &scratch, d, 0));
+        Buf   b(&scratch, 512 + what.len);
+        EvOut w = sbegin(s, &b, EV_ASK);
+        putstrkey(&w.json, "req", k->req);
+        putstrkey(&w.json, "call", c->id);
+        putstrkey(&w.json, "kind", "desktop");
+        putstrkey(&w.json, "tool", "desktop");
+        putstrkey(&w.json, "detail", what);
+        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putstrkey(&w.json, "dflt", "deny");
+        ssend(s, &w);
+    }
+    if (!wait) {
+        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        return 1;
+    }
+    setstate(s, S_ASK);
+    return 0;
+}
+
+// Why a desktop call was not made, for the agent.
+static Str deskdenial(Arena *a, i32 by, Str note, i64 wait)
+{
+    Buf b(a, 512 + note.len);
+    switch (by) {
+    case DENY_POLICY:
+        print(&b, "Not done: desktop actions need the user's approval, and "
+                  "nobody is there to give it in this run. Do what you can "
+                  "without the desktop, and say what you would have done.");
+        break;
+    case DENY_USER:
+        print(&b, "Not done: the user denied this desktop action.");
+        if (note.len) {
+            print(&b, " The user's note: ");
+            print(&b, note);
+        } else {
+            print(&b, " Do not try it again unless the user asks.");
+        }
+        break;
+    case DENY_TIMEOUT:
+        print(&b, "Not done: desktop actions need the user's approval, and "
+                  "nobody answered within ");
+        print(&b, wait);
+        print(&b, " seconds.");
+        break;
+    case DENY_STEER:
+        print(&b, "Not done: the user sent a new message instead of "
+                  "answering. Read that message (it follows these results) "
+                  "and do what it says.");
+        break;
+    case DENY_CANCEL:
+        print(&b, "Not run: the user cancelled the turn.");
+        break;
+    }
+    return finish(&b);
+}
+
+
 // Run one call. Returns 1 if it finished, 0 if it goes on (a command or
 // a search, or an ask waiting for the user).
 static b32 runtool(Session *s, Arena scratch)
@@ -3719,6 +4587,10 @@ static b32 runtool(Session *s, Arena scratch)
         return runfile(s, scratch, tool, g.path, &args);
     }
 
+    if (!s->blocked && tool==TOOL_DESKTOP && !args.issues.len) {
+        return deskcall(s, scratch, &args.desk);  // asks before it starts
+    }
+
     toolstart(s, scratch);
     if (s->blocked) {
         Buf b(&scratch, 512);
@@ -3759,6 +4631,7 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_JOBOUT:  tooljobout(s, scratch, &args);  return 1;
     case TOOL_JOBKILL: tooljobkill(s, scratch, &args); return 1;
     case TOOL_TASK:    assert(0);  // starttasks has these
+    case TOOL_DESKTOP: assert(0);  // deskcall has these
     }
     if (args.background) {
         startjob(s, scratch, &args);
@@ -4403,6 +5276,7 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
 {
     release(s, 0);
     stopreq(s);
+    deskstop(s);
     cool(s);  // no next step to keep it for
     for (i32 t = 0; t < T_COUNT; t++) {
         if (t != T_JOBS) {
@@ -4470,6 +5344,18 @@ static void cancelturn(Session *s, Arena scratch)
     s->queued    = {};
     switch (s->state) {
     case S_TOOL:
+        if (s->desk.busy && s->desk.action==DESK_DRAG) {
+            return;  // its button released first: the rest end after it
+        } else if (s->desk.busy) {
+            deskkill(s);
+            s->desk.busy = 0;
+            disarm(s, T_DESK);
+            setstate(s, S_IDLE);
+            toolend(s, scratch, "cancelled", "Stopped: the user cancelled "
+                    "the turn, perhaps before the action was done.", 0, 0, {}, 0);
+            nexttool(s, scratch);
+            return;
+        }
         finishshell(s, scratch, 1);
         nexttool(s, scratch);  // the rest are not run, then the turn ends
         return;
@@ -4610,6 +5496,15 @@ static void modelconf(Engine *e, Arena *perm, Str model, ModelConf *mc)
                     th=="default"       ? THINK_DEFAULT : THINK_ADAPTIVE;
     mc->hidethink = td == "omitted";
     mc->effort    = ef.len ? clone(perm, ef) : Str{};
+
+    // For the desktop tool's screenshots
+    Str co = trim(cfgget(cfg, "model", model, "coordinates", 0));
+    Int ie = parseint(trim(cfgget(cfg, "model", model, "image_edge", 0)));
+    Int ip = parseint(trim(cfgget(cfg, "model", model, "image_pixels", 0)));
+    mc->coords    = co=="norm1000" ? COORDS_NORM1000 : COORDS_PIXELS;
+    mc->novision  = !cfgbool(cfgget(cfg, "model", model, "vision", 0));
+    mc->imgedge   = ie.ok && ie.val>=16 && ie.val<=16384 ? ie.val : 0;
+    mc->imgpixels = ip.ok && ip.val>=256 && ip.val<=(i64)1<<28 ? ip.val : 0;
 }
 
 static Session *newsession(Engine *e, Arena scratch, Str sid)
@@ -4649,6 +5544,10 @@ static void dropsession(Engine *e, Session *s)
     logclose(&s->log);
     if (s->lock >= 0) {
         os_unlockfile(e->os, s->lock);
+    }
+    deskkill(s);
+    if (s->desk.region) {
+        os_release(e->os, s->desk.region);
     }
     Region *r1 = s->perm.region;
     os_release(e->os, s->aregion);
@@ -4737,6 +5636,7 @@ static void buildprefix(Session *s, Arena scratch)
 {
     Engine *e = s->e;
     jobconf(s);
+    s->te.coords = s->mc.coords;
     if (tooloffered(&s->te, TOOL_TASK)) {
         taskroles(e, &s->perm, scratch, &s->te);
     }
@@ -4798,6 +5698,10 @@ static void logprefix(Session *s, Arena scratch)
     putstrkey(&w.json, "tools", s->tools);
     putintkey(&w.json, "job_timeout", s->te.jobtimeout);
     putintkey(&w.json, "job_timeout_max", s->te.jobmax);
+    if (tooloffered(&s->te, TOOL_DESKTOP)) {
+        putstrkey(&w.json, "coordinates", s->te.coords==COORDS_NORM1000
+                                          ? Str("norm1000") : Str("pixels"));
+    }
     ssend(s, &w);
 }
 
@@ -4888,7 +5792,7 @@ static void logsession(Session *s, Arena scratch)
         putstrkey(&w.json, "call", s->pcall);
         putintkey(&w.json, "depth", s->depth);
     }
-    if (s->te.deny) {
+    if (s->te.deny != TOOL_OFFMASK) {
         putkey(&w.json, "tools");
         putarray(&w.json);
         for (i32 t = 0; t < TOOL_COUNT; t++) {
@@ -5025,7 +5929,7 @@ static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
         print(&text, r.name);
         print(&text, ": ");
         print(&text, r.desc.len ? utf8head(r.desc, 300) : Str("(no description)"));
-        if (!r.deny) {
+        if (!(r.deny & ~TOOL_OFFMASK)) {
             print(&text, " (every tool)");
             continue;
         }
@@ -5109,7 +6013,8 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->role    = clone(&s->perm, r.name);
     s->rolepr  = clone(&s->perm, r.prompt);
     s->depth   = p->depth + 1;
-    s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0);
+    s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
+                 deskdeny(e, 1);
     s->psid    = clone(&s->perm, p->sid);
     s->pcall   = clone(&s->perm, c->id);
     s->intask  = 1;
@@ -5595,7 +6500,8 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->attended   = jsonflag(jsonget(j, "attended"), 0);
     s->role       = clone(&s->perm, role.name);
     s->rolepr     = clone(&s->perm, role.prompt);
-    s->te.deny    = role.deny | (tools.data ? tooldeny(tools) : 0);
+    s->te.deny    = role.deny | (tools.data ? tooldeny(tools) : 0) |
+                    deskdeny(e, role.ok);
     s->stepmax    = steps<STEP_HARD ? steps : 0;
     s->projinstr  = instr == "project";
     s->nofallback = !fall;
@@ -5838,7 +6744,9 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                     have |= tool==TOOL_NONE ? 0 : (u32)1<<tool;
                 }
                 s->te.deny = (((u32)1<<TOOL_COUNT) - 1) & ~have;
-            }
+            } else {
+                s->te.deny = TOOL_OFFMASK;  // as it began: every tool but
+            }                               // those offered by name
             // Its edit format as it began: absent, the first one
             s->te.edit = editformat(jsonstr(jsonget(j, "edit_format")));
             i64 steps  = jsonint(jsonget(j, "steps"), 0);
@@ -5906,6 +6814,14 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             m.spill  = clone(&s->perm, jsonstr(jsonget(j, "spill")));
             m.error  = toolfailed(jsonstr(jsonget(j, "status")));
             m.seq    = r.seq;
+            m.image  = clone(&s->perm, jsonstr(jsonget(j, "image")));
+            m.imgw   = (i32)jsonint(jsonget(j, "width"), 0);
+            m.imgh   = (i32)jsonint(jsonget(j, "height"), 0);
+            if (m.image.len) {
+                // Points refer to the latest screenshot, as they did
+                DeskShot sh = deskshotparse(&s->perm, jsonstr(jsonget(j, "shot")));
+                s->desk.shot = sh.ok ? sh : s->desk.shot;
+            }
             addmsg(s, m);
             break;
         case EV_PREFIX:
@@ -5914,6 +6830,8 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->tools         = clone(&s->perm, jsonstr(jsonget(j, "tools")));
             s->te.jobtimeout = jsonint(jsonget(j, "job_timeout"), 0);
             s->te.jobmax     = jsonint(jsonget(j, "job_timeout_max"), 0);
+            s->te.coords     = jsonstr(jsonget(j, "coordinates"))=="norm1000"
+                               ? COORDS_NORM1000 : COORDS_PIXELS;
             s->system.data   = s->system.data ? s->system.data : (u8 *)"";
             prefixed         = 1;
             break;
@@ -6782,6 +7700,11 @@ static void onrecord(Engine *e, Arena scratch, Record r)
 
     b32 proc = r.type>=PROC_TAIL && r.type<=PROC_DATA;
     if (proc) {
+        Session *ds = deskbyid(e, r.id);
+        if (ds) {
+            deskrecord(ds, scratch, r);
+            return;
+        }
         Job     *j  = 0;
         Session *js = jobbyproc(e, r.id, &j);
         if (js) {
@@ -6917,6 +7840,10 @@ static void ontimer(Session *s, Arena scratch, i32 t)
     case T_ASK:
         resolve(s, scratch, 0, DENY_TIMEOUT, {});
         nexttool(s, scratch);
+        return;
+    case T_DESK:
+        deskbroke(s, scratch, "The desktop helper did not answer in time, so "
+                  "it was stopped, and the action may not have been done.");
         return;
     case T_LIVE:
         live(s);

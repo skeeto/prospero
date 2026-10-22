@@ -3,21 +3,23 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Check the headless Windows engine's imports against Windows XP's.
+"""Check a Windows program's imports against Windows XP's.
 
   uv run tests/imports.py build-xp/prospero.exe
+  uv run tests/imports.py --dlls kernel32,user32,gdi32 build-xp/prospero-desktop.exe
   uv run tests/imports.py --exports kernel32.dll advapi32.dll winhttp.dll
 
 The headless engine (PROSPERO_GUI=OFF), i686 or x86_64, may import only
-from KERNEL32, ADVAPI32 and WINHTTP, only by name, and only functions
-that Windows XP SP3's copies of those DLLs export. Anything newer must be
-looked up at run time (GetProcAddress) with a fallback. It must also
-declare an OS and subsystem version that XP loads (5.1 at most, or 5.2
-for x86_64, XP x64), and have no delay-loaded imports, which would dodge
-this check.
+from KERNEL32, ADVAPI32 and WINHTTP, and the desktop helper
+(prospero-desktop) only from KERNEL32, USER32 and GDI32 (--dlls), only
+by name, and only functions that Windows XP SP3's copies of those DLLs
+export. Anything newer must be looked up at run time (GetProcAddress)
+with a fallback. It must also declare an OS and subsystem version that
+XP loads (5.1 at most, or 5.2 for x86_64, XP x64), and have no
+delay-loaded imports, which would dodge this check.
 
 The export lists below come from the DLLs of an XP SP3 machine (version
-5.1.2600, all three dated 2008-04-14) through --exports, which prints
+5.1.2600, all five dated 2008-04-14) through --exports, which prints
 them in this file's format. The PE file is parsed here, with no objdump.
 Exits 1 on any violation, listing each.
 """
@@ -119,8 +121,9 @@ class Pe:
         return [self.cstr(self.u32(names + 4*i)) for i in range(nnames)]
 
 
-def check(path):
-    """Violations of the XP rules in the image at path."""
+def check(path, dlls):
+    """Violations of the XP rules in the image at path, which may import
+    from the DLLs named."""
     pe = Pe(path)
     bad = []
     # XP is 5.1, and its x64 edition (a Server 2003 kernel) 5.2
@@ -131,11 +134,11 @@ def check(path):
                        f"XP loads {most[0]}.{most[1]} at most")
     for dll in pe.delayed():
         bad.append(f"{dll}: delay-loaded")
-    allowed = {k: set(v.split()) for k, v in XP.items()}
+    allowed = {k: set(v.split()) for k, v in XP.items() if k in dlls}
     for dll, funcs in pe.imports().items():
         names = allowed.get(dll.lower())
         if names is None:
-            bad.append(f"{dll}: not one of {', '.join(sorted(XP))}")
+            bad.append(f"{dll}: not one of {', '.join(sorted(allowed))}")
             continue
         for f in funcs:
             if f.startswith("#"):
@@ -150,6 +153,9 @@ def main():
     ap.add_argument("--exports", action="store_true",
                     help="print the export lists of the given DLLs instead")
     ap.add_argument("-v", action="store_true", help="list every import")
+    ap.add_argument("--dlls", default="kernel32,advapi32,winhttp",
+                    help="the DLLs it may import from, separated by commas "
+                    "(default: the engine's, kernel32,advapi32,winhttp)")
     ap.add_argument("files", nargs="+")
     args = ap.parse_args()
 
@@ -172,9 +178,17 @@ def main():
         print("}")
         return 0
 
+    dlls = set()
+    for d in args.dlls.split(","):
+        d = d.strip().lower()
+        d = d if d.endswith(".dll") else d + ".dll"
+        if d not in XP:
+            print(f"no export list for {d}; known: {', '.join(sorted(XP))}")
+            return 2
+        dlls.add(d)
     status = 0
     for path in args.files:
-        pe, bad = check(path)
+        pe, bad = check(path, dlls)
         imports = pe.imports()
         count = sum(len(v) for v in imports.values())
         if args.v:
@@ -673,6 +687,324 @@ WmiQuerySingleInstanceMultipleA WmiQuerySingleInstanceMultipleW
 WmiQuerySingleInstanceW WmiReceiveNotificationsA WmiReceiveNotificationsW
 WmiSetSingleInstanceA WmiSetSingleInstanceW WmiSetSingleItemA
 WmiSetSingleItemW Wow64Win32ApiEntry WriteEncryptedFileRaw
+""",
+    "user32.dll": """
+ActivateKeyboardLayout AdjustWindowRect AdjustWindowRectEx AlignRects
+AllowForegroundActivation AllowSetForegroundWindow AnimateWindow AnyPopup
+AppendMenuA AppendMenuW ArrangeIconicWindows AttachThreadInput
+BeginDeferWindowPos BeginPaint BlockInput BringWindowToTop
+BroadcastSystemMessage BroadcastSystemMessageA BroadcastSystemMessageExA
+BroadcastSystemMessageExW BroadcastSystemMessageW BuildReasonArray
+CalcMenuBar CallMsgFilter CallMsgFilterA CallMsgFilterW CallNextHookEx
+CallWindowProcA CallWindowProcW CascadeChildWindows CascadeWindows
+ChangeClipboardChain ChangeDisplaySettingsA ChangeDisplaySettingsExA
+ChangeDisplaySettingsExW ChangeDisplaySettingsW ChangeMenuA ChangeMenuW
+CharLowerA CharLowerBuffA CharLowerBuffW CharLowerW CharNextA CharNextExA
+CharNextW CharPrevA CharPrevExA CharPrevW CharToOemA CharToOemBuffA
+CharToOemBuffW CharToOemW CharUpperA CharUpperBuffA CharUpperBuffW
+CharUpperW CheckDlgButton CheckMenuItem CheckMenuRadioItem CheckRadioButton
+ChildWindowFromPoint ChildWindowFromPointEx CliImmSetHotKey
+ClientThreadSetup ClientToScreen ClipCursor CloseClipboard CloseDesktop
+CloseWindow CloseWindowStation CopyAcceleratorTableA CopyAcceleratorTableW
+CopyIcon CopyImage CopyRect CountClipboardFormats CreateAcceleratorTableA
+CreateAcceleratorTableW CreateCaret CreateCursor CreateDesktopA
+CreateDesktopW CreateDialogIndirectParamA CreateDialogIndirectParamAorW
+CreateDialogIndirectParamW CreateDialogParamA CreateDialogParamW CreateIcon
+CreateIconFromResource CreateIconFromResourceEx CreateIconIndirect
+CreateMDIWindowA CreateMDIWindowW CreateMenu CreatePopupMenu
+CreateSystemThreads CreateWindowExA CreateWindowExW CreateWindowStationA
+CreateWindowStationW CsrBroadcastSystemMessageExW CtxInitUser32
+DdeAbandonTransaction DdeAccessData DdeAddData DdeClientTransaction
+DdeCmpStringHandles DdeConnect DdeConnectList DdeCreateDataHandle
+DdeCreateStringHandleA DdeCreateStringHandleW DdeDisconnect
+DdeDisconnectList DdeEnableCallback DdeFreeDataHandle DdeFreeStringHandle
+DdeGetData DdeGetLastError DdeGetQualityOfService DdeImpersonateClient
+DdeInitializeA DdeInitializeW DdeKeepStringHandle DdeNameService
+DdePostAdvise DdeQueryConvInfo DdeQueryNextServer DdeQueryStringA
+DdeQueryStringW DdeReconnect DdeSetQualityOfService DdeSetUserHandle
+DdeUnaccessData DdeUninitialize DefDlgProcA DefDlgProcW DefFrameProcA
+DefFrameProcW DefMDIChildProcA DefMDIChildProcW DefRawInputProc
+DefWindowProcA DefWindowProcW DeferWindowPos DeleteMenu
+DeregisterShellHookWindow DestroyAcceleratorTable DestroyCaret DestroyCursor
+DestroyIcon DestroyMenu DestroyReasons DestroyWindow DeviceEventWorker
+DialogBoxIndirectParamA DialogBoxIndirectParamAorW DialogBoxIndirectParamW
+DialogBoxParamA DialogBoxParamW DisableProcessWindowsGhosting
+DispatchMessageA DispatchMessageW DisplayExitWindowsWarnings DlgDirListA
+DlgDirListComboBoxA DlgDirListComboBoxW DlgDirListW DlgDirSelectComboBoxExA
+DlgDirSelectComboBoxExW DlgDirSelectExA DlgDirSelectExW DragDetect
+DragObject DrawAnimatedRects DrawCaption DrawCaptionTempA DrawCaptionTempW
+DrawEdge DrawFocusRect DrawFrame DrawFrameControl DrawIcon DrawIconEx
+DrawMenuBar DrawMenuBarTemp DrawStateA DrawStateW DrawTextA DrawTextExA
+DrawTextExW DrawTextW EditWndProc EmptyClipboard EnableMenuItem
+EnableScrollBar EnableWindow EndDeferWindowPos EndDialog EndMenu EndPaint
+EndTask EnterReaderModeHelper EnumChildWindows EnumClipboardFormats
+EnumDesktopWindows EnumDesktopsA EnumDesktopsW EnumDisplayDevicesA
+EnumDisplayDevicesW EnumDisplayMonitors EnumDisplaySettingsA
+EnumDisplaySettingsExA EnumDisplaySettingsExW EnumDisplaySettingsW
+EnumPropsA EnumPropsExA EnumPropsExW EnumPropsW EnumThreadWindows
+EnumWindowStationsA EnumWindowStationsW EnumWindows EqualRect
+ExcludeUpdateRgn ExitWindowsEx FillRect FindWindowA FindWindowExA
+FindWindowExW FindWindowW FlashWindow FlashWindowEx FrameRect FreeDDElParam
+GetActiveWindow GetAltTabInfo GetAltTabInfoA GetAltTabInfoW GetAncestor
+GetAppCompatFlags GetAppCompatFlags2 GetAsyncKeyState GetCapture
+GetCaretBlinkTime GetCaretPos GetClassInfoA GetClassInfoExA GetClassInfoExW
+GetClassInfoW GetClassLongA GetClassLongW GetClassNameA GetClassNameW
+GetClassWord GetClientRect GetClipCursor GetClipboardData
+GetClipboardFormatNameA GetClipboardFormatNameW GetClipboardOwner
+GetClipboardSequenceNumber GetClipboardViewer GetComboBoxInfo GetCursor
+GetCursorFrameInfo GetCursorInfo GetCursorPos GetDC GetDCEx GetDesktopWindow
+GetDialogBaseUnits GetDlgCtrlID GetDlgItem GetDlgItemInt GetDlgItemTextA
+GetDlgItemTextW GetDoubleClickTime GetFocus GetForegroundWindow
+GetGUIThreadInfo GetGuiResources GetIconInfo GetInputDesktop GetInputState
+GetInternalWindowPos GetKBCodePage GetKeyNameTextA GetKeyNameTextW
+GetKeyState GetKeyboardLayout GetKeyboardLayoutList GetKeyboardLayoutNameA
+GetKeyboardLayoutNameW GetKeyboardState GetKeyboardType GetLastActivePopup
+GetLastInputInfo GetLayeredWindowAttributes GetListBoxInfo GetMenu
+GetMenuBarInfo GetMenuCheckMarkDimensions GetMenuContextHelpId
+GetMenuDefaultItem GetMenuInfo GetMenuItemCount GetMenuItemID
+GetMenuItemInfoA GetMenuItemInfoW GetMenuItemRect GetMenuState
+GetMenuStringA GetMenuStringW GetMessageA GetMessageExtraInfo GetMessagePos
+GetMessageTime GetMessageW GetMonitorInfoA GetMonitorInfoW
+GetMouseMovePointsEx GetNextDlgGroupItem GetNextDlgTabItem
+GetOpenClipboardWindow GetParent GetPriorityClipboardFormat
+GetProcessDefaultLayout GetProcessWindowStation GetProgmanWindow GetPropA
+GetPropW GetQueueStatus GetRawInputBuffer GetRawInputData
+GetRawInputDeviceInfoA GetRawInputDeviceInfoW GetRawInputDeviceList
+GetReasonTitleFromReasonCode GetRegisteredRawInputDevices GetScrollBarInfo
+GetScrollInfo GetScrollPos GetScrollRange GetShellWindow GetSubMenu
+GetSysColor GetSysColorBrush GetSystemMenu GetSystemMetrics
+GetTabbedTextExtentA GetTabbedTextExtentW GetTaskmanWindow GetThreadDesktop
+GetTitleBarInfo GetTopWindow GetUpdateRect GetUpdateRgn
+GetUserObjectInformationA GetUserObjectInformationW GetUserObjectSecurity
+GetWinStationInfo GetWindow GetWindowContextHelpId GetWindowDC GetWindowInfo
+GetWindowLongA GetWindowLongW GetWindowModuleFileName
+GetWindowModuleFileNameA GetWindowModuleFileNameW GetWindowPlacement
+GetWindowRect GetWindowRgn GetWindowRgnBox GetWindowTextA
+GetWindowTextLengthA GetWindowTextLengthW GetWindowTextW
+GetWindowThreadProcessId GetWindowWord GrayStringA GrayStringW HideCaret
+HiliteMenuItem IMPGetIMEA IMPGetIMEW IMPQueryIMEA IMPQueryIMEW IMPSetIMEA
+IMPSetIMEW ImpersonateDdeClientWindow InSendMessage InSendMessageEx
+InflateRect InitializeLpkHooks InitializeWin32EntryTable InsertMenuA
+InsertMenuItemA InsertMenuItemW InsertMenuW InternalGetWindowText
+IntersectRect InvalidateRect InvalidateRgn InvertRect IsCharAlphaA
+IsCharAlphaNumericA IsCharAlphaNumericW IsCharAlphaW IsCharLowerA
+IsCharLowerW IsCharUpperA IsCharUpperW IsChild IsClipboardFormatAvailable
+IsDialogMessage IsDialogMessageA IsDialogMessageW IsDlgButtonChecked
+IsGUIThread IsHungAppWindow IsIconic IsMenu IsRectEmpty IsServerSideWindow
+IsWinEventHookInstalled IsWindow IsWindowEnabled IsWindowInDestroy
+IsWindowUnicode IsWindowVisible IsZoomed KillSystemTimer KillTimer
+LoadAcceleratorsA LoadAcceleratorsW LoadBitmapA LoadBitmapW LoadCursorA
+LoadCursorFromFileA LoadCursorFromFileW LoadCursorW LoadIconA LoadIconW
+LoadImageA LoadImageW LoadKeyboardLayoutA LoadKeyboardLayoutEx
+LoadKeyboardLayoutW LoadLocalFonts LoadMenuA LoadMenuIndirectA
+LoadMenuIndirectW LoadMenuW LoadRemoteFonts LoadStringA LoadStringW
+LockSetForegroundWindow LockWindowStation LockWindowUpdate LockWorkStation
+LookupIconIdFromDirectory LookupIconIdFromDirectoryEx MBToWCSEx MB_GetString
+MapDialogRect MapVirtualKeyA MapVirtualKeyExA MapVirtualKeyExW
+MapVirtualKeyW MapWindowPoints MenuItemFromPoint MenuWindowProcA
+MenuWindowProcW MessageBeep MessageBoxA MessageBoxExA MessageBoxExW
+MessageBoxIndirectA MessageBoxIndirectW MessageBoxTimeoutA
+MessageBoxTimeoutW MessageBoxW ModifyMenuA ModifyMenuW MonitorFromPoint
+MonitorFromRect MonitorFromWindow MoveWindow MsgWaitForMultipleObjects
+MsgWaitForMultipleObjectsEx NotifyWinEvent OemKeyScan OemToCharA
+OemToCharBuffA OemToCharBuffW OemToCharW OffsetRect OpenClipboard
+OpenDesktopA OpenDesktopW OpenIcon OpenInputDesktop OpenWindowStationA
+OpenWindowStationW PackDDElParam PaintDesktop PaintMenuBar PeekMessageA
+PeekMessageW PostMessageA PostMessageW PostQuitMessage PostThreadMessageA
+PostThreadMessageW PrintWindow PrivateExtractIconExA PrivateExtractIconExW
+PrivateExtractIconsA PrivateExtractIconsW PrivateSetDbgTag
+PrivateSetRipFlags PtInRect QuerySendMessage QueryUserCounters
+RealChildWindowFromPoint RealGetWindowClass RealGetWindowClassA
+RealGetWindowClassW ReasonCodeNeedsBugID ReasonCodeNeedsComment
+RecordShutdownReason RedrawWindow RegisterClassA RegisterClassExA
+RegisterClassExW RegisterClassW RegisterClipboardFormatA
+RegisterClipboardFormatW RegisterDeviceNotificationA
+RegisterDeviceNotificationW RegisterHotKey RegisterLogonProcess
+RegisterMessagePumpHook RegisterRawInputDevices RegisterServicesProcess
+RegisterShellHookWindow RegisterSystemThread RegisterTasklist
+RegisterUserApiHook RegisterWindowMessageA RegisterWindowMessageW
+ReleaseCapture ReleaseDC RemoveMenu RemovePropA RemovePropW ReplyMessage
+ResolveDesktopForWOW ReuseDDElParam ScreenToClient ScrollChildren ScrollDC
+ScrollWindow ScrollWindowEx SendDlgItemMessageA SendDlgItemMessageW
+SendIMEMessageExA SendIMEMessageExW SendInput SendMessageA
+SendMessageCallbackA SendMessageCallbackW SendMessageTimeoutA
+SendMessageTimeoutW SendMessageW SendNotifyMessageA SendNotifyMessageW
+SetActiveWindow SetCapture SetCaretBlinkTime SetCaretPos SetClassLongA
+SetClassLongW SetClassWord SetClipboardData SetClipboardViewer
+SetConsoleReserveKeys SetCursor SetCursorContents SetCursorPos
+SetDebugErrorLevel SetDeskWallpaper SetDlgItemInt SetDlgItemTextA
+SetDlgItemTextW SetDoubleClickTime SetFocus SetForegroundWindow
+SetInternalWindowPos SetKeyboardState SetLastErrorEx
+SetLayeredWindowAttributes SetLogonNotifyWindow SetMenu SetMenuContextHelpId
+SetMenuDefaultItem SetMenuInfo SetMenuItemBitmaps SetMenuItemInfoA
+SetMenuItemInfoW SetMessageExtraInfo SetMessageQueue SetParent
+SetProcessDefaultLayout SetProcessWindowStation SetProgmanWindow SetPropA
+SetPropW SetRect SetRectEmpty SetScrollInfo SetScrollPos SetScrollRange
+SetShellWindow SetShellWindowEx SetSysColors SetSysColorsTemp
+SetSystemCursor SetSystemMenu SetSystemTimer SetTaskmanWindow
+SetThreadDesktop SetTimer SetUserObjectInformationA
+SetUserObjectInformationW SetUserObjectSecurity SetWinEventHook
+SetWindowContextHelpId SetWindowLongA SetWindowLongW SetWindowPlacement
+SetWindowPos SetWindowRgn SetWindowStationUser SetWindowTextA SetWindowTextW
+SetWindowWord SetWindowsHookA SetWindowsHookExA SetWindowsHookExW
+SetWindowsHookW ShowCaret ShowCursor ShowOwnedPopups ShowScrollBar
+ShowStartGlass ShowWindow ShowWindowAsync SoftModalMessageBox SubtractRect
+SwapMouseButton SwitchDesktop SwitchToThisWindow SystemParametersInfoA
+SystemParametersInfoW TabbedTextOutA TabbedTextOutW TileChildWindows
+TileWindows ToAscii ToAsciiEx ToUnicode ToUnicodeEx TrackMouseEvent
+TrackPopupMenu TrackPopupMenuEx TranslateAccelerator TranslateAcceleratorA
+TranslateAcceleratorW TranslateMDISysAccel TranslateMessage
+TranslateMessageEx UnhookWinEvent UnhookWindowsHook UnhookWindowsHookEx
+UnionRect UnloadKeyboardLayout UnlockWindowStation UnpackDDElParam
+UnregisterClassA UnregisterClassW UnregisterDeviceNotification
+UnregisterHotKey UnregisterMessagePumpHook UnregisterUserApiHook
+UpdateLayeredWindow UpdatePerUserSystemParameters UpdateWindow
+User32InitializeImmEntryTable UserClientDllInitialize UserHandleGrantAccess
+UserLpkPSMTextOut UserLpkTabbedTextOut UserRealizePalette
+UserRegisterWowHandlers VRipOutput VTagOutput ValidateRect ValidateRgn
+VkKeyScanA VkKeyScanExA VkKeyScanExW VkKeyScanW WCSToMBEx WINNLSEnableIME
+WINNLSGetEnableStatus WINNLSGetIMEHotkey WaitForInputIdle WaitMessage
+Win32PoolAllocationStats WinHelpA WinHelpW WindowFromDC WindowFromPoint
+keybd_event mouse_event wsprintfA wsprintfW wvsprintfA wvsprintfW
+""",
+    "gdi32.dll": """
+AbortDoc AbortPath AddFontMemResourceEx AddFontResourceA AddFontResourceExA
+AddFontResourceExW AddFontResourceTracking AddFontResourceW AngleArc
+AnimatePalette AnyLinkedFonts Arc ArcTo BRUSHOBJ_hGetColorTransform
+BRUSHOBJ_pvAllocRbrush BRUSHOBJ_pvGetRbrush BRUSHOBJ_ulGetBrushColor
+BeginPath BitBlt CLIPOBJ_bEnum CLIPOBJ_cEnumStart CLIPOBJ_ppoGetPath
+CancelDC CheckColorsInGamut ChoosePixelFormat Chord ClearBitmapAttributes
+ClearBrushAttributes CloseEnhMetaFile CloseFigure CloseMetaFile
+ColorCorrectPalette ColorMatchToTarget CombineRgn CombineTransform
+CopyEnhMetaFileA CopyEnhMetaFileW CopyMetaFileA CopyMetaFileW CreateBitmap
+CreateBitmapIndirect CreateBrushIndirect CreateColorSpaceA CreateColorSpaceW
+CreateCompatibleBitmap CreateCompatibleDC CreateDCA CreateDCW
+CreateDIBPatternBrush CreateDIBPatternBrushPt CreateDIBSection
+CreateDIBitmap CreateDiscardableBitmap CreateEllipticRgn
+CreateEllipticRgnIndirect CreateEnhMetaFileA CreateEnhMetaFileW CreateFontA
+CreateFontIndirectA CreateFontIndirectExA CreateFontIndirectExW
+CreateFontIndirectW CreateFontW CreateHalftonePalette CreateHatchBrush
+CreateICA CreateICW CreateMetaFileA CreateMetaFileW CreatePalette
+CreatePatternBrush CreatePen CreatePenIndirect CreatePolyPolygonRgn
+CreatePolygonRgn CreateRectRgn CreateRectRgnIndirect CreateRoundRectRgn
+CreateScalableFontResourceA CreateScalableFontResourceW CreateSolidBrush
+DPtoLP DdEntry0 DdEntry1 DdEntry10 DdEntry11 DdEntry12 DdEntry13 DdEntry14
+DdEntry15 DdEntry16 DdEntry17 DdEntry18 DdEntry19 DdEntry2 DdEntry20
+DdEntry21 DdEntry22 DdEntry23 DdEntry24 DdEntry25 DdEntry26 DdEntry27
+DdEntry28 DdEntry29 DdEntry3 DdEntry30 DdEntry31 DdEntry32 DdEntry33
+DdEntry34 DdEntry35 DdEntry36 DdEntry37 DdEntry38 DdEntry39 DdEntry4
+DdEntry40 DdEntry41 DdEntry42 DdEntry43 DdEntry44 DdEntry45 DdEntry46
+DdEntry47 DdEntry48 DdEntry49 DdEntry5 DdEntry50 DdEntry51 DdEntry52
+DdEntry53 DdEntry54 DdEntry55 DdEntry56 DdEntry6 DdEntry7 DdEntry8 DdEntry9
+DeleteColorSpace DeleteDC DeleteEnhMetaFile DeleteMetaFile DeleteObject
+DescribePixelFormat DeviceCapabilitiesExA DeviceCapabilitiesExW DrawEscape
+Ellipse EnableEUDC EndDoc EndFormPage EndPage EndPath EngAcquireSemaphore
+EngAlphaBlend EngAssociateSurface EngBitBlt EngCheckAbort EngComputeGlyphSet
+EngCopyBits EngCreateBitmap EngCreateClip EngCreateDeviceBitmap
+EngCreateDeviceSurface EngCreatePalette EngCreateSemaphore EngDeleteClip
+EngDeletePalette EngDeletePath EngDeleteSemaphore EngDeleteSurface
+EngEraseSurface EngFillPath EngFindResource EngFreeModule
+EngGetCurrentCodePage EngGetDriverName EngGetPrinterDataFileName
+EngGradientFill EngLineTo EngLoadModule EngLockSurface EngMarkBandingSurface
+EngMultiByteToUnicodeN EngMultiByteToWideChar EngPaint EngPlgBlt
+EngQueryEMFInfo EngQueryLocalTime EngReleaseSemaphore EngStretchBlt
+EngStretchBltROP EngStrokeAndFillPath EngStrokePath EngTextOut
+EngTransparentBlt EngUnicodeToMultiByteN EngUnlockSurface
+EngWideCharToMultiByte EnumEnhMetaFile EnumFontFamiliesA EnumFontFamiliesExA
+EnumFontFamiliesExW EnumFontFamiliesW EnumFontsA EnumFontsW EnumICMProfilesA
+EnumICMProfilesW EnumMetaFile EnumObjects EqualRgn Escape EudcLoadLinkW
+EudcUnloadLinkW ExcludeClipRect ExtCreatePen ExtCreateRegion ExtEscape
+ExtFloodFill ExtSelectClipRgn ExtTextOutA ExtTextOutW
+FONTOBJ_cGetAllGlyphHandles FONTOBJ_cGetGlyphs FONTOBJ_pQueryGlyphAttrs
+FONTOBJ_pfdg FONTOBJ_pifi FONTOBJ_pvTrueTypeFontFile FONTOBJ_pxoGetXform
+FONTOBJ_vGetInfo FillPath FillRgn FixBrushOrgEx FlattenPath FloodFill
+FontIsLinked FrameRgn GdiAddFontResourceW GdiAddGlsBounds GdiAddGlsRecord
+GdiAlphaBlend GdiArtificialDecrementDriver GdiCleanCacheDC GdiComment
+GdiConsoleTextOut GdiConvertAndCheckDC GdiConvertBitmap GdiConvertBitmapV5
+GdiConvertBrush GdiConvertDC GdiConvertEnhMetaFile GdiConvertFont
+GdiConvertMetaFilePict GdiConvertPalette GdiConvertRegion
+GdiConvertToDevmodeW GdiCreateLocalEnhMetaFile GdiCreateLocalMetaFilePict
+GdiDeleteLocalDC GdiDeleteSpoolFileHandle GdiDescribePixelFormat
+GdiDllInitialize GdiDrawStream GdiEndDocEMF GdiEndPageEMF GdiEntry1
+GdiEntry10 GdiEntry11 GdiEntry12 GdiEntry13 GdiEntry14 GdiEntry15 GdiEntry16
+GdiEntry2 GdiEntry3 GdiEntry4 GdiEntry5 GdiEntry6 GdiEntry7 GdiEntry8
+GdiEntry9 GdiFixUpHandle GdiFlush GdiFullscreenControl GdiGetBatchLimit
+GdiGetBitmapBitsSize GdiGetCharDimensions GdiGetCodePage GdiGetDC
+GdiGetDevmodeForPage GdiGetLocalBrush GdiGetLocalDC GdiGetLocalFont
+GdiGetPageCount GdiGetPageHandle GdiGetSpoolFileHandle GdiGetSpoolMessage
+GdiGradientFill GdiInitSpool GdiInitializeLanguagePack GdiIsMetaFileDC
+GdiIsMetaPrintDC GdiIsPlayMetafileDC GdiPlayDCScript GdiPlayEMF
+GdiPlayJournal GdiPlayPageEMF GdiPlayPrivatePageEMF GdiPlayScript
+GdiPrinterThunk GdiProcessSetup GdiQueryFonts GdiQueryTable
+GdiRealizationInfo GdiReleaseDC GdiReleaseLocalDC GdiResetDCEMF GdiSetAttrs
+GdiSetBatchLimit GdiSetLastError GdiSetPixelFormat GdiSetServerAttr
+GdiStartDocEMF GdiStartPageEMF GdiSwapBuffers GdiTransparentBlt
+GdiValidateHandle GetArcDirection GetAspectRatioFilterEx GetBitmapAttributes
+GetBitmapBits GetBitmapDimensionEx GetBkColor GetBkMode GetBoundsRect
+GetBrushAttributes GetBrushOrgEx GetCharABCWidthsA GetCharABCWidthsFloatA
+GetCharABCWidthsFloatW GetCharABCWidthsI GetCharABCWidthsW GetCharWidth32A
+GetCharWidth32W GetCharWidthA GetCharWidthFloatA GetCharWidthFloatW
+GetCharWidthI GetCharWidthInfo GetCharWidthW GetCharacterPlacementA
+GetCharacterPlacementW GetClipBox GetClipRgn GetColorAdjustment
+GetColorSpace GetCurrentObject GetCurrentPositionEx GetDCBrushColor
+GetDCOrgEx GetDCPenColor GetDIBColorTable GetDIBits GetDeviceCaps
+GetDeviceGammaRamp GetETM GetEUDCTimeStamp GetEUDCTimeStampExW
+GetEnhMetaFileA GetEnhMetaFileBits GetEnhMetaFileDescriptionA
+GetEnhMetaFileDescriptionW GetEnhMetaFileHeader GetEnhMetaFilePaletteEntries
+GetEnhMetaFilePixelFormat GetEnhMetaFileW GetFontAssocStatus GetFontData
+GetFontLanguageInfo GetFontResourceInfoW GetFontUnicodeRanges
+GetGlyphIndicesA GetGlyphIndicesW GetGlyphOutline GetGlyphOutlineA
+GetGlyphOutlineW GetGlyphOutlineWow GetGraphicsMode GetHFONT GetICMProfileA
+GetICMProfileW GetKerningPairs GetKerningPairsA GetKerningPairsW GetLayout
+GetLogColorSpaceA GetLogColorSpaceW GetMapMode GetMetaFileA
+GetMetaFileBitsEx GetMetaFileW GetMetaRgn GetMiterLimit GetNearestColor
+GetNearestPaletteIndex GetObjectA GetObjectType GetObjectW
+GetOutlineTextMetricsA GetOutlineTextMetricsW GetPaletteEntries GetPath
+GetPixel GetPixelFormat GetPolyFillMode GetROP2 GetRandomRgn
+GetRasterizerCaps GetRegionData GetRelAbs GetRgnBox GetStockObject
+GetStretchBltMode GetStringBitmapA GetStringBitmapW GetSystemPaletteEntries
+GetSystemPaletteUse GetTextAlign GetTextCharacterExtra GetTextCharset
+GetTextCharsetInfo GetTextColor GetTextExtentExPointA GetTextExtentExPointI
+GetTextExtentExPointW GetTextExtentExPointWPri GetTextExtentPoint32A
+GetTextExtentPoint32W GetTextExtentPointA GetTextExtentPointI
+GetTextExtentPointW GetTextFaceA GetTextFaceAliasW GetTextFaceW
+GetTextMetricsA GetTextMetricsW GetTransform GetViewportExtEx
+GetViewportOrgEx GetWinMetaFileBits GetWindowExtEx GetWindowOrgEx
+GetWorldTransform HT_Get8BPPFormatPalette HT_Get8BPPMaskPalette
+IntersectClipRect InvertRgn IsValidEnhMetaRecord IsValidEnhMetaRecordOffExt
+LPtoDP LineDDA LineTo MaskBlt MirrorRgn ModifyWorldTransform MoveToEx
+NamedEscape OffsetClipRgn OffsetRgn OffsetViewportOrgEx OffsetWindowOrgEx
+PATHOBJ_bEnum PATHOBJ_bEnumClipLines PATHOBJ_vEnumStart
+PATHOBJ_vEnumStartClipLines PATHOBJ_vGetBounds PaintRgn PatBlt PathToRegion
+Pie PlayEnhMetaFile PlayEnhMetaFileRecord PlayMetaFile PlayMetaFileRecord
+PlgBlt PolyBezier PolyBezierTo PolyDraw PolyPatBlt PolyPolygon PolyPolyline
+PolyTextOutA PolyTextOutW Polygon Polyline PolylineTo PtInRegion PtVisible
+QueryFontAssocStatus RealizePalette RectInRegion RectVisible Rectangle
+RemoveFontMemResourceEx RemoveFontResourceA RemoveFontResourceExA
+RemoveFontResourceExW RemoveFontResourceTracking RemoveFontResourceW
+ResetDCA ResetDCW ResizePalette RestoreDC RoundRect STROBJ_bEnum
+STROBJ_bEnumPositionsOnly STROBJ_bGetAdvanceWidths STROBJ_dwGetCodePage
+STROBJ_vEnumStart SaveDC ScaleViewportExtEx ScaleWindowExtEx
+SelectBrushLocal SelectClipPath SelectClipRgn SelectFontLocal SelectObject
+SelectPalette SetAbortProc SetArcDirection SetBitmapAttributes SetBitmapBits
+SetBitmapDimensionEx SetBkColor SetBkMode SetBoundsRect SetBrushAttributes
+SetBrushOrgEx SetColorAdjustment SetColorSpace SetDCBrushColor SetDCPenColor
+SetDIBColorTable SetDIBits SetDIBitsToDevice SetDeviceGammaRamp
+SetEnhMetaFileBits SetFontEnumeration SetGraphicsMode SetICMMode
+SetICMProfileA SetICMProfileW SetLayout SetLayoutWidth SetMagicColors
+SetMapMode SetMapperFlags SetMetaFileBitsEx SetMetaRgn SetMiterLimit
+SetPaletteEntries SetPixel SetPixelFormat SetPixelV SetPolyFillMode SetROP2
+SetRectRgn SetRelAbs SetStretchBltMode SetSystemPaletteUse SetTextAlign
+SetTextCharacterExtra SetTextColor SetTextJustification SetViewportExtEx
+SetViewportOrgEx SetVirtualResolution SetWinMetaFileBits SetWindowExtEx
+SetWindowOrgEx SetWorldTransform StartDocA StartDocW StartFormPage StartPage
+StretchBlt StretchDIBits StrokeAndFillPath StrokePath SwapBuffers TextOutA
+TextOutW TranslateCharsetInfo UnloadNetworkFonts UnrealizeObject
+UpdateColors UpdateICMRegKeyA UpdateICMRegKeyW WidenPath
+XFORMOBJ_bApplyXform XFORMOBJ_iGetXform XLATEOBJ_cGetPalette
+XLATEOBJ_hGetColorTransform XLATEOBJ_iXlate XLATEOBJ_piVector
+bInitSystemAndFontsDirectoriesW bMakePathNameW cGetTTFFromFOT
+gdiPlaySpoolStream
 """,
     "winhttp.dll": """
 DllCanUnloadNow DllGetClassObject DllRegisterServer DllUnregisterServer

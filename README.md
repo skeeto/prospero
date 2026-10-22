@@ -3,7 +3,8 @@
 Prospero is a coding harness: a desktop program in which a language
 model, the agent, works on code through tools. It runs the turn loop,
 the tools (read, write, edit, shell, grep, glob, a todo list,
-background jobs, and subagents), and the processes they start, and
+background jobs, subagents, and where the configuration offers it, the
+desktop), and the processes they start, and
 shows the conversation as it streams. It speaks the OpenAI Chat
 Completions API, so it works with llama.cpp, vLLM, LiteLLM, and hosted
 providers with a compatible API, and Anthropic's Messages API, with
@@ -232,7 +233,7 @@ which defaults to `~/.config/prospero/prospero.ini`. On Windows,
 from its built-in copy ([assets/prospero.ini](assets/prospero.ini)),
 which documents every section and key: `[endpoint NAME]`,
 `[model NAME]`, `[role NAME]`, `[guard]`, `[tools]`, `[instructions]`,
-`[ui]`, `[host]` and `[remote NAME]`. Changes take effect while it
+`[ui]`, `[desktop]`, `[host]` and `[remote NAME]`. Changes take effect while it
 runs. An unknown key or a bad value is reported in the diagnostics,
 and a bad value falls back to its default: nothing in the file keeps
 Prospero from starting.
@@ -243,7 +244,9 @@ adds a shared file, such as a team's endpoints and models, whose
 settings this file can override. An include may be a path or an http
 or https URL, which is fetched at startup, cached, and refreshed in the
 background, and may be pinned to a SHA-256. Nothing in an included file
-can make Prospero run a command, and its plaintext secrets are ignored.
+can make Prospero run a command, and its plaintext secrets, `[remote]`
+and `[desktop]` settings are ignored. A server whose certificate is not
+trusted fails the turn at once, saying why, rather than being retried.
 
 An endpoint speaks Anthropic's Messages API with `kind = anthropic`:
 
@@ -269,7 +272,46 @@ the first of `AGENTS.md` or `CLAUDE.md` (`[instructions] files`) in
 each directory from the root of the repository down to the working
 directory, and more below it as the agent works there.
 
+## Desktop control
+
+The desktop tool lets the agent see the screen and use the mouse and
+keyboard: screenshots of the screen or of one window, clicks, drags,
+scrolling, keys and Unicode text, the list of windows, and starting,
+waiting for and closing programs. It is off unless your own
+configuration offers it, to sessions with a role that lists `desktop`
+in its tools, or to every session, and every action, screenshots
+included, asks you first, denied if you do not answer in time:
+
+    [desktop]
+    offer = roles
+    ask = true
+
+    [role desktop]
+    description = Uses programs on the screen, with the mouse and keys
+    tools = desktop read write
+
+The work is done by a helper, `prospero-desktop`, next to `prospero`,
+which the harness starts for a turn and talks to over pipes: a program
+of its own, so that the one program the system lets watch the screen
+keeps its identity however often Prospero is rebuilt. So far it exists
+for Windows (XP and later); run alone, it takes the same commands on
+its command line (`prospero-desktop shot screen > s.png`, `list`,
+`click WINDOW X Y` and so on; `prospero-desktop -h`).
+
+Screenshots go to the model as images, scaled down to its limits
+(`[model] image_edge` and `image_pixels`: by default 1568 pixels on a
+side and 1.15 megapixels for kind anthropic, else 1280 and 1 megapixel),
+and only the latest few stay in the conversation (`[desktop] images`).
+A model gives points in pixels of the image it saw, or, with
+`[model] coordinates = norm1000`, in thousandths of its width and
+height, as Qwen-VL and Gemini do; the harness maps them back to the
+screen. A model that takes no images is marked `vision = false`.
+
 ## Remote and background hosts
+
+A host quits as when a client asks it to, closing its endpoint and
+removing its registration, on SIGTERM, SIGINT or SIGHUP, or on Windows
+Ctrl+C or Ctrl+Break at its console.
 
 A `[remote NAME]` section names a machine reached over ssh, and the
 window's Hosts panel adds one and connects to it. Prospero there runs
@@ -330,7 +372,8 @@ The suites:
   the file system, and processes. On macOS, `selftest_disclaimed` runs
   it again as its own responsible process, as an app runs.
 - `scenarios`: the engine end to end against a fault-injecting fake
-  provider (`tests/fake_provider.py`).
+  provider (`tests/fake_provider.py`), and for the desktop tool, a fake
+  helper (`tests/fake_desktop.py`).
 - `cleanup`: the harness killed hard while its tools run, which must
   leave no process behind.
 - `remote`, `includes`, `deploy`: hosts and their clients, URL includes
@@ -345,8 +388,10 @@ from this one: `--host` runs Prospero on a Windows host over ssh,
 `--xp` on Windows XP, and `--ssh` connects and deploys to a real
 remote host. `tests/gui.py` drives the GUI through a scripted
 checklist, which fails on a stale frame, and `tests/imports.py` checks
-a headless Windows engine's imports against what XP exports (CTest runs
-it in those builds). Each script's header says how to run it.
+a headless Windows engine's imports, and the desktop helper's, against
+what XP exports (CTest runs it in those builds). The scenario
+`desktop_xp`, run by name with `--xp`, drives Notepad on XP's desktop
+with the real helper. Each script's header says how to run it.
 
 ## License
 

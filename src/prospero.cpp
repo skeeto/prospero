@@ -165,6 +165,8 @@ enum : i32 {
     HTTP_ECONNECT,  // could not connect (includes TLS failures)
     HTTP_EIO,       // the connection failed after connecting
     HTTP_ETOOBIG,   // the response passed maxbytes
+    HTTP_ETRUST,    // the server's certificate was refused: not trusted,
+                    // expired, or for another name
 };
 
 // (M2) Child processes: null stdin, merged stdout and stderr pumped into
@@ -182,6 +184,8 @@ struct Spawn {
     i64        maxbytes;  // output limit
     Mailbox   *mbox;      // receives process records
     u64        id;
+    b32        breakaway; // Windows: its job lets processes leave it, as
+                          // the programs the desktop helper starts do
 };
 // Null on failure, explained by os_lasterr. The process is not waited
 // for, and its records may arrive before this returns.
@@ -300,6 +304,12 @@ struct Detached {
 static Detached  os_detach(Os *, Arena scratch, Slice<Str> argv, Str cwd, Str errpath);
 // (M5) This process's id.
 static i32       os_pid(Os *);
+// (M7) Post a record of the given type to the mailbox whenever this
+// process is asked to quit: SIGTERM, SIGINT or SIGHUP (POSIX), or its
+// console's Ctrl+C, Ctrl+Break or closing (Windows). Call it before
+// starting any thread, so that every thread leaves those to it. Returns
+// 0 on failure.
+static b32       os_onquit(Os *, Mailbox *, u32 type);
 // macOS: the pid of the process responsible for pid, which TCC charges
 // with its privacy access: its own for an app, else what started it, as
 // Terminal. 0 elsewhere, or if unknown. (The selftest checks reapers by
@@ -426,6 +436,7 @@ static Arena newarena(Region *r)
 #include "provider.cpp"
 #include "anthropic.cpp"
 #include "edit.cpp"
+#include "desktop.cpp"
 #include "tools.cpp"
 #include "guard.cpp"
 #include "search.cpp"

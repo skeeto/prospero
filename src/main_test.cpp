@@ -382,6 +382,7 @@ static b32   os_connwrite(Os *, Conn *, Str) { return 0; }
 static void  os_connclose(Os *, Conn *) {}
 static Detached os_detach(Os *, Arena, Slice<Str>, Str, Str) { return {}; }
 static i32   os_pid(Os *) { return 1; }
+static b32   os_onquit(Os *, Mailbox *, u32) { return 1; }
 static i32   os_responsible(Os *, i32) { return 0; }
 
 // A route's response, all of it posted before this returns, so the
@@ -505,6 +506,8 @@ static Str istr(Arena *a, i64 v)
 #include "test/engine_test.cpp"  // after config's test platform
 #include "test/deploy_test.cpp"
 #include "test/eval_test.cpp"
+#include "deskhelp.cpp"
+#include "test/desktop_test.cpp"
 #if PROSPERO_GUI
 #  include "sched.cpp"
 #  include "highlight.cpp"
@@ -550,6 +553,7 @@ int main()
     test_config(&t);
     test_deploy(&t);
     test_eval(&t);
+    test_desktop(&t);
     #if PROSPERO_GUI
     test_sched(&t);
     test_highlight(&t);

@@ -26,8 +26,8 @@ static void testroles(Test *t)
            concat(&a, "|", rd.endpoint))), "Reads|Only read.|fast");
     expect(t, "reader tools", istr(&a, rd.deny==tooldeny("read glob")), "1");
     Role op = findrole(e, "open");
-    expect(t, "a section's default tools", istr(&a, op.ok*10 + (op.deny==0)), "11");
-    expect(t, "general", istr(&a, findrole(e, "general").deny), "0");
+    expect(t, "a section's default tools", istr(&a, op.ok*10 + (op.deny==TOOL_OFFMASK)), "11");
+    expect(t, "general", istr(&a, findrole(e, "general").deny), istr(&a, TOOL_OFFMASK));
     expect(t, "no such role", istr(&a, findrole(e, "nope").ok), "0");
     expect(t, "no empty role", istr(&a, findrole(e, "").ok), "0");
 

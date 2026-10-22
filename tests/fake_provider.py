@@ -1637,6 +1637,154 @@ def sc_eval_auth(model, n, req):
                                   "message": "invalid api key"}})
 
 
+# M7: the desktop tool, against tests/fake_desktop.py as its helper. The
+# script goes by the step within the conversation, and reads the results
+# of the last response's calls with desk_results, since a screenshot
+# comes back as a user message with its image after the tool results.
+
+def desk_results(req):
+    """The results of the last response's calls, past any image message."""
+    out = []
+    for m in reversed(req.get("messages", [])):
+        role = m.get("role")
+        if role == "assistant":
+            break
+        if role == "tool":
+            out.insert(0, str(m.get("content", "")))
+    return out
+
+
+def desk_images(req):
+    """The images of a request: (call id, base64 PNG), in order."""
+    out = []
+    for m in req.get("messages", []):
+        content = m.get("content")
+        if m.get("role") != "user" or not isinstance(content, list):
+            continue
+        label = None
+        for part in content:
+            if part.get("type") == "text":
+                label = part.get("text", "")
+            elif part.get("type") == "image_url":
+                out.append((label, part["image_url"]["url"]))
+    return out
+
+
+DESK_FLOW = [
+    {"action": "screenshot"},
+    {"action": "click", "x": 320, "y": 200},
+    {"action": "type", "text": "hello\n"},
+    {"action": "key", "keys": "ctrl+s  esc"},
+    {"action": "windows"},
+    {"action": "screenshot", "window": "Fake Editor"},
+    {"action": "click", "x": 10, "y": 20},
+    {"action": "run", "program": "notepad.exe", "args": ["a b"]},
+    {"action": "wait", "window": "pid=4242"},
+    {"action": "close", "window": "pid=4242"},
+]
+
+
+def sc_desktop_flow(model, n, req):
+    k = step(req)
+    if k < len(DESK_FLOW):
+        yield from tool(model, n, "desktop", DESK_FLOW[k])
+    else:
+        yield from answer(model, "Done on the desktop.")
+
+
+def sc_desktop_off(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "desktop", {"action": "screenshot"})
+    else:
+        yield from answer(model, "Heard: " + desk_results(req)[0])
+
+
+sc_desktop_policy = sc_desktop_off
+
+
+def sc_desktop_ask(model, n, req):
+    k = step(req)
+    if k == 0:
+        yield from tool(model, n, "desktop", {"action": "screenshot"})
+    elif k == 1:
+        yield from tool(model, n, "desktop", {"action": "click", "x": 1, "y": 1})
+    else:
+        yield from answer(model, "Heard: " + desk_results(req)[0])
+
+
+def sc_desktop_norm(model, n, req):
+    k = step(req)
+    steps = [{"action": "screenshot"},
+             {"action": "click", "x": 500, "y": 500},
+             {"action": "double_click", "x": 1001, "y": 0},
+             {"action": "drag", "x": 0, "y": 0, "x2": 1000, "y2": 1000},
+             {"action": "scroll", "x": 250, "y": 750, "amount": -3}]
+    if k < len(steps):
+        yield from tool(model, n, "desktop", steps[k])
+    else:
+        yield from answer(model, "Done.")
+
+
+def sc_desktop_images(model, n, req):
+    k = step(req)
+    if k < 3:
+        yield from tool(model, n, "desktop", {"action": "screenshot"})
+    else:
+        yield from answer(model, "Saw them.")
+
+
+def sc_desktop_crash(model, n, req):
+    k = step(req)
+    steps = [{"action": "screenshot"},
+             {"action": "type", "text": "CRASH"},
+             {"action": "click", "x": 5, "y": 5},
+             {"action": "screenshot"}]
+    if k < len(steps):
+        yield from tool(model, n, "desktop", steps[k])
+    else:
+        yield from answer(model, "Recovered.")
+
+
+def sc_desktop_xp(model, n, req):
+    """Notepad on a real desktop (scenarios.py desktop_xp): started, typed
+    into, clicked, looked at, and closed without saving."""
+    k = step(req)
+    text = "\n".join(r for m in req.get("messages", []) if m.get("role") == "tool"
+                     for r in [str(m.get("content", ""))])
+    pid = re.search(r"process id (\d+)", text)
+    pid = pid.group(1) if pid else "0"
+    size = re.findall(r"x from 0 to (\d+), y from 0 to (\d+)", text)
+    w, h = (int(size[-1][0]), int(size[-1][1])) if size else (100, 100)
+    win = f"pid={pid}"
+    dialog = f"pid={pid},class=#32770"
+    steps = [
+        {"action": "screenshot"},
+        {"action": "run", "program": "notepad.exe"},
+        {"action": "wait", "window": win, "seconds": 20},
+        {"action": "screenshot", "window": win},
+        {"action": "type", "text": "Hello from Prospero on XP: Gr\u00fc\u00dfe!\n"},
+        {"action": "click", "x": w // 2, "y": h // 2},
+        {"action": "type", "text": "typed after a click"},
+        {"action": "screenshot", "window": win},
+        {"action": "close", "window": win},
+        {"action": "wait", "window": dialog, "seconds": 20},
+        {"action": "screenshot"},
+        {"action": "key", "keys": "alt+n", "window": dialog},
+        {"action": "wait", "window": win, "gone": True, "seconds": 20},
+    ]
+    if k < len(steps):
+        yield from tool(model, n, "desktop", steps[k])
+    else:
+        yield from answer(model, "Notepad typed into, looked at, and closed.")
+
+
+def sc_desktop_cancel(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "desktop", {"action": "type", "text": "HANG"})
+    else:
+        yield from answer(model, "Should not be reached.")
+
+
 # The GUI's checklist (prospero gui --drive, run by tests/gui.py): the
 # prompt that began the turn picks the reply, and the step is how many
 # responses the turn has had so far.
@@ -2429,6 +2577,29 @@ def an_check_reasoning(req, i, k, b):
     return None
 
 
+def an_check_result(where, content):
+    """Why a tool_result's content is not what the API takes: a string,
+    or a list of text and image blocks."""
+    if content is None or isinstance(content, str):
+        return None
+    if not isinstance(content, list):
+        return f"{where}.content: Input should be a valid string or list"
+    for j, c in enumerate(content):
+        at = f"{where}.content.{j}"
+        if c.get("type") == "text":
+            if not str(c.get("text", "")).strip():
+                return f"{at}: text content blocks must contain non-whitespace text"
+        elif c.get("type") == "image":
+            src = c.get("source", {})
+            if (src.get("type") != "base64" or not src.get("data") or
+                    src.get("media_type") not in ("image/png", "image/jpeg",
+                                                  "image/gif", "image/webp")):
+                return f"{at}.source: an image needs base64 data and a media type"
+        else:
+            return f"{at}: unexpected block type {c.get('type')} in a tool result"
+    return None
+
+
 def an_check(req, prefill=False):
     """Why the API would reject a request, or None if it would not."""
     if not isinstance(req.get("max_tokens"), int) or req["max_tokens"] < 1:
@@ -2480,6 +2651,9 @@ def an_check(req, prefill=False):
             elif kind == "tool_result" and role == "user":
                 if texts:
                     return f"{where}: tool_result blocks must come before any text"
+                err = an_check_result(where, b.get("content"))
+                if err:
+                    return err
                 results.append(b.get("tool_use_id"))
             elif kind in ("thinking", "redacted_thinking") and role == "assistant":
                 if "cache_control" in b:
@@ -2847,6 +3021,16 @@ def an_hidden(model, req, seconds):
     yield an_event({"type": "content_block_stop", "index": 0})
     yield from an_text(1, "Thought it through.")
     yield from an_end()
+
+
+def sc_an_desktop(model, n, req):
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k == 0:
+        yield from an_call(model, req, n, "desktop", {"action": "screenshot"})
+    elif k == 1:
+        yield from an_call(model, req, n, "desktop", {"action": "click", "x": 2, "y": 3})
+    else:
+        yield from an_answer(model, req, "Clicked it.")
 
 
 def sc_an_hidden(model, n, req):

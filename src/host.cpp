@@ -50,8 +50,10 @@
 // The host exits after [host] idle_exit (10 min) with no client
 // connected and nothing running (the engine's status: no turn, no job),
 // and when a client quits it ({"cmd":"quit"}), which stops the engine as
-// quit always does. Its errors and notes go to run/host.log, which a
-// host starting when it is past 1 MiB starts over.
+// quit always does, as do SIGTERM, SIGINT and SIGHUP (on Windows, its
+// console's Ctrl+C, Ctrl+Break or closing): either way it unlistens and
+// removes its registration. Its errors and notes go to run/host.log,
+// which a host starting when it is past 1 MiB starts over.
 //
 // A GUI whose window closes with "Keep running in background" becomes a
 // host in place (newhost, then hostrun on a thread of its own): its
@@ -1474,6 +1476,11 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     }
     hc.cfg = cfg;
     hc.inbox = newmailbox(&perm, HOST_INBOX, 0, 0);
+    // Asked to quit by a signal, it quits as when a client asks, taking
+    // its endpoint and registration with it: before any thread starts
+    if (hc.inbox && !os_onquit(os, hc.inbox, HOST_QUITALL)) {
+        hostsay(os, scratch, "cannot watch for signals to quit");
+    }
     hc.idle  = idle.len ? (i64)(secs.val*(f64)SEC) : hostticks(cfg, "idle_exit");
     hc.e     = hc.inbox ? newengine(os, &perm, cfg, statedir, hc.inbox) : 0;
     if (!hc.e || !enginestart(hc.e)) {

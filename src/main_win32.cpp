@@ -96,9 +96,18 @@ enum : i32 {
     STD_INPUT_HANDLE                  = -10,
     STD_OUTPUT_HANDLE                 = -11,
     ATTACH_PARENT_PROCESS             = -1,
+    CTRL_C_EVENT                      = 0,
     CTRL_BREAK_EVENT                  = 1,
+    CTRL_CLOSE_EVENT                  = 2,
     // WinHTTP
     ERROR_WINHTTP_OPERATION_CANCELLED = 12017,
+    ERROR_WINHTTP_SECURE_CERT_DATE_INVALID = 12037,
+    ERROR_WINHTTP_SECURE_CERT_CN_INVALID   = 12038,
+    ERROR_WINHTTP_SECURE_INVALID_CA        = 12045,
+    ERROR_WINHTTP_SECURE_INVALID_CERT      = 12169,
+    ERROR_WINHTTP_SECURE_CERT_REVOKED      = 12170,
+    ERROR_WINHTTP_SECURE_FAILURE           = 12175,
+    ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE  = 12179,
     WINHTTP_ACCESS_TYPE_AUTOMATIC     = 4,
     WINHTTP_ACCESS_TYPE_DEFAULT       = 0,
     WINHTTP_ACCESS_TYPE_NO_PROXY      = 1,
@@ -1646,7 +1655,8 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
          (!io || (CreatePipe(&ir, &iw, 0, 1<<16) && os_eventinit(&wake)));
     if (ok && job) {
         JobLimits lim = {};
-        lim.flags = JOB_KILL_ON_JOB_CLOSE | JOB_DIE_ON_UNHANDLED_EXCEPTION;
+        lim.flags = JOB_KILL_ON_JOB_CLOSE | JOB_DIE_ON_UNHANDLED_EXCEPTION |
+                    (sp->breakaway ? JOB_BREAKAWAY_OK : 0);
         ok = SetInformationJobObject(job, JobObjectExtendedLimitInformation,
                                      &lim, sizeof(lim));
     }
@@ -2487,6 +2497,29 @@ static i32 os_pid(Os *)
     return GetCurrentProcessId();
 }
 
+// Where the console's handler, which has no context of its own, posts.
+static Mailbox *quitbox;
+static u32      quittype;
+
+static b32 __stdcall quithandler(u32 type)
+{
+    if (type==CTRL_C_EVENT || type==CTRL_BREAK_EVENT || type==CTRL_CLOSE_EVENT) {
+        mailpost(quitbox, quittype, 0, {}, 1);
+        if (type == CTRL_CLOSE_EVENT) {
+            Sleep(5000);  // the process ends when this returns
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static b32 os_onquit(Os *, Mailbox *mb, u32 type)
+{
+    quitbox  = mb;
+    quittype = type;
+    return SetConsoleCtrlHandler((uz)quithandler, 1);
+}
+
 static i32 os_responsible(Os *, i32)
 {
     return 0;  // no such thing here
@@ -2649,7 +2682,25 @@ static void httpdone(Http *h, i32 err, Str text)
     mailpost(h->mbox, HTTP_DONE, h->id, {msg, 4+len}, 1);
 }
 
-// The worker's error: a cancel, or the WinHTTP error text.
+// The certificate errors: the server's certificate was refused. (A
+// failed revocation check, which may pass later, is not one of them.)
+static b32 untrusted(i32 code)
+{
+    switch (code) {
+    case ERROR_WINHTTP_SECURE_CERT_DATE_INVALID:
+    case ERROR_WINHTTP_SECURE_CERT_CN_INVALID:
+    case ERROR_WINHTTP_SECURE_INVALID_CA:
+    case ERROR_WINHTTP_SECURE_INVALID_CERT:
+    case ERROR_WINHTTP_SECURE_CERT_REVOKED:
+    case ERROR_WINHTTP_SECURE_FAILURE:
+    case ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE:
+        return 1;
+    }
+    return 0;
+}
+
+// The worker's error: a cancel, a refused certificate, or the WinHTTP
+// error text.
 static void httpfail(Http *h, i32 err, u8 *scratch, iz cap)
 {
     i32 code = GetLastError();
@@ -2657,6 +2708,7 @@ static void httpfail(Http *h, i32 err, u8 *scratch, iz cap)
         httpdone(h, HTTP_ECANCEL, "cancelled");
         return;
     }
+    err = untrusted(code) ? HTTP_ETRUST : err;
     Arena a  = {(byte *)scratch, (byte *)scratch + cap};
     Os    os = {};
     SetLastError(code);

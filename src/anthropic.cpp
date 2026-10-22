@@ -22,6 +22,8 @@
 //   (another model's, or a response cut off) cannot go back, and neither
 //   can reasoning from before the latest compaction, which changed what
 //   came before it: removing the oldest is all the API allows.
+// - A tool result with a screenshot (the desktop tool's) holds it as an
+//   image block after its text.
 // - Tool input streams as the model writes it (eager_input_streaming),
 //   so a long file shows progress and keeps the progress watchdog fed.
 //   It comes unchecked, and repairargs and the tools check it as they
@@ -167,7 +169,35 @@ static void anblock(JsonOut *w, Arena scratch, AnPart *p, b32 cache)
 {
     Msg *m = p->msg;
     putobject(w);
-    if (!p->block && m->role==ROLE_TOOL) {
+    if (!p->block && m->role==ROLE_TOOL && m->imgb64.len) {
+        // A screenshot goes in the result, after its text
+        putstrkey(w, "type", "tool_result");
+        putstrkey(w, "tool_use_id", m->callid);
+        putkey(w, "content");
+        putarray(w);
+        if (!anblank(m->text)) {
+            putobject(w);
+            putstrkey(w, "type", "text");
+            putstrkey(w, "text", m->text);
+            putend(w);
+        }
+        putobject(w);
+        putstrkey(w, "type", "image");
+        putkey(w, "source");
+        putobject(w);
+        putstrkey(w, "type", "base64");
+        putstrkey(w, "media_type", "image/png");
+        putkey(w, "data");
+        Str data = concat(&scratch, "\"", m->imgb64);
+        putraw(w, concat(&scratch, data, "\""));  // base64 needs no escapes
+        putend(w);
+        putend(w);
+        putend(w);
+        if (m->error) {
+            putkey(w, "is_error");
+            putbool(w, 1);
+        }
+    } else if (!p->block && m->role==ROLE_TOOL) {
         putstrkey(w, "type", "tool_result");
         putstrkey(w, "tool_use_id", m->callid);
         if (m->text.len) {

@@ -1,5 +1,5 @@
 // Tools: read, write, edit, shell, grep, glob, todo_write, jobs,
-// job_output, job_kill, task
+// job_output, job_kill, task, desktop
 //
 // Every call ends in exactly one result the agent reads. Invalid calls
 // are never executed, and their results say how to fix them. File tools
@@ -9,8 +9,10 @@
 // timeout moves to the background as a job (engine.cpp), whose end is
 // reported to the agent later. grep and glob run as processes too:
 // ripgrep when it is found, else this same executable (search.cpp).
-// task starts a subagent, a session of its own (engine.cpp). A role may
-// offer fewer tools, and a call to one it does not is an unknown tool.
+// task starts a subagent, a session of its own (engine.cpp). desktop
+// sees and drives the screen through a helper (desktop.cpp), and is
+// offered only where the configuration says. A role may offer fewer
+// tools, and a call to one it does not is an unknown tool.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -27,14 +29,20 @@ enum : i32 {
     TOOL_JOBOUT,
     TOOL_JOBKILL,
     TOOL_TASK,
+    TOOL_DESKTOP,
     TOOL_COUNT,
 };
 
 static Str toolnames[] = {
     "read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
-    "job_output", "job_kill", "task",
+    "job_output", "job_kill", "task", "desktop",
 };
 static_assert(countof(toolnames) == TOOL_COUNT);
+
+// Tools a session lacks unless something offers them: the desktop.
+enum : u32 {
+    TOOL_OFFMASK = (u32)1 << TOOL_DESKTOP,
+};
 
 enum : i64 {
     READ_LINES     = 2000,
@@ -85,6 +93,7 @@ struct ToolEnv {
     Str roles;       // the roles task may give, a line for each
     Str roleenum;    // their names, as a JSON schema's enum member
     i32 edit;        // EDIT_*: the edit tool's format (edit.cpp)
+    i32 coords;      // COORDS_*: how the desktop tool takes points
 };
 
 static i32 toolfind(Str name)
@@ -199,6 +208,47 @@ static Str shelldesc(Arena *a, ToolEnv *te)
     return finish(&b);
 }
 
+static Str deskdesc(Arena *a, ToolEnv *te)
+{
+    Buf b(a, 2048);
+    print(&b, "See and use the user's desktop, as a person at it would: "
+              "take screenshots, and use the mouse and keyboard. Each "
+              "action may need the user's approval, and a refusal comes "
+              "back as its result. Look before you act: take a screenshot "
+              "first, and again after acting to see what happened. Points "
+              "(x, y) are in the latest screenshot, ");
+    if (te->coords == COORDS_NORM1000) {
+        print(&b, "in thousandths of its width and height: (0, 0) is its "
+                  "top left corner and (1000, 1000) its bottom right.");
+    } else {
+        print(&b, "in pixels of its image as you see it: (0, 0) is its top "
+                  "left corner.");
+    }
+    print(&b, " A screenshot of one window (window) takes in only that "
+              "window, and then input goes to that window. Actions:\n"
+              "- screenshot: the whole screen, or window\n"
+              "- click, double_click, right_click: at x, y\n"
+              "- mouse_move: move the pointer to x, y, as to hover\n"
+              "- drag: press at x, y, move to x2, y2, and release\n"
+              "- scroll: at x, y, amount notches, positive up\n"
+              "- key: keys, chords such as ctrl+s, alt+f4, shift+tab, "
+              "enter, esc, f5, separated by spaces\n"
+              "- type: text as characters; a newline presses enter\n"
+              "- windows: list the windows: id, process id, size, title\n"
+              "- focus: bring window to the front\n"
+              "- close: ask window to close, as its close button does\n"
+              "- wait: wait until window exists, or with gone until it is "
+              "gone, for up to seconds (default 10, at most 30)\n"
+              "- run: start program with args, detached, and tell its "
+              "process id; wait for its window before using it\n"
+              "A window is part of its title, or id=ID or pid=PID from "
+              "windows; several criteria are joined by commas. Do not close "
+              "or change windows of the user's that the task does not need, "
+              "and close what you started when you are done, without saving "
+              "unless asked to.");
+    return finish(&b);
+}
+
 static Str taskdesc(Arena *a, ToolEnv *te)
 {
     Buf b(a, 1024 + te->roles.len);
@@ -236,7 +286,7 @@ static Str tooljson(Arena *a, ToolEnv *te)
     struct Def {
         Str   name;
         Str   desc;
-        Param params[5];
+        Param params[14];
     };
     Str todoitem =
         "\"items\":{\"type\":\"object\",\"properties\":{\"content\":{"
@@ -390,6 +440,34 @@ static Str tooljson(Arena *a, ToolEnv *te)
                  "only when asked for one (default: the role's, else yours)", 0, {}},
             },
         },
+        {
+            "desktop",
+            deskdesc(a, te),
+            {
+                {"action", "string", "What to do", 1,
+                 "\"enum\":[\"screenshot\",\"click\",\"double_click\","
+                 "\"right_click\",\"mouse_move\",\"drag\",\"scroll\","
+                 "\"key\",\"type\",\"windows\",\"focus\",\"close\","
+                 "\"wait\",\"run\"]"},
+                {"x", "number", "The point's x: click, double_click, "
+                 "right_click, mouse_move, drag (where it starts), scroll", 0, {}},
+                {"y", "number", "The point's y", 0, {}},
+                {"x2", "number", "drag: where it ends, x", 0, {}},
+                {"y2", "number", "drag: where it ends, y", 0, {}},
+                {"amount", "integer", "scroll: notches, positive up, "
+                 "negative down", 0, {}},
+                {"keys", "string", "key: chords separated by spaces", 0, {}},
+                {"text", "string", "type: the text", 0, {}},
+                {"window", "string", "screenshot, focus, close, wait, and "
+                 "optionally key and type: the window", 0, {}},
+                {"program", "string", "run: the program", 0, {}},
+                {"args", "array", "run: its arguments", 0,
+                 "\"items\":{\"type\":\"string\"}"},
+                {"gone", "boolean", "wait: until the window is gone", 0, {}},
+                {"seconds", "integer", "wait: the most to wait, 1 to 30 "
+                 "(default 10)", 0, {}},
+            },
+        },
     };
     static_assert(countof(defs) == TOOL_COUNT);
 
@@ -539,6 +617,11 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te)
                   "broad search through much code, you may start subagents "
                   "with task; several run at once.\n");
     }
+    if (tooloffered(te, TOOL_DESKTOP)) {
+        print(&b, "- The desktop tool acts on the user's real screen: take a "
+                  "screenshot before acting and after, and use it only as "
+                  "the task needs.\n");
+    }
     print(&b,
         "- Stay inside the working directory; access outside it is denied.\n"
         "- When a tool returns an error, read it, fix the call, and go on. "
@@ -599,6 +682,7 @@ struct Args {
     Str             tag;        // edit as hashline: the file's tag as read
     Slice<HashEdit> hedits;
     Patch           patch;      // edit as patch
+    DeskArgs        desk;       // desktop
     Slice<Str>      issues;
     Str             repaired;   // what repairargs fixed, if anything
 };
@@ -664,6 +748,121 @@ static b32 argbool(Arena *a, Args *r, Json *root, Str key)
     }
     issue(a, r, key, "must be true or false");
     return 0;
+}
+
+// A number, or absent (has clear). Numeric strings are forgiven.
+static f64 argnum(Arena *a, Args *r, Json *root, Str key, b32 *has)
+{
+    Json *v = jsonget(root, key);
+    *has = 0;
+    if (v->type==JSON_MISSING || v->type==JSON_NULL) {
+        return 0;
+    }
+    Str   s = v->type==JSON_STRING ? trim(v->str) :
+              v->type==JSON_NUMBER ? v->raw : Str{};
+    Float f = parsefloat(s);
+    if (!s.len || !f.ok || f.val<-1e9 || f.val>1e9) {
+        issue(a, r, key, "must be a number");
+        return 0;
+    }
+    *has = 1;
+    return f.val;
+}
+
+// The desktop tool's arguments, checked for the action.
+static void argdesk(Arena *a, Args *r, Json *j)
+{
+    DeskArgs *d    = &r->desk;
+    Str       name = argstr(a, r, j, "action", 1);
+    d->action = name.data ? deskaction(name) : -1;
+    if (name.data && d->action<0) {
+        Buf b(a, 256);
+        print(&b, "unknown action \"");
+        print(&b, name.len>64 ? takehead(name, 64) : name);
+        print(&b, "\", expected one of:");
+        for (i32 i = 0; i < DESK_COUNT; i++) {
+            print(&b, i ? Str(", ") : Str(" "));
+            print(&b, desknames[i]);
+        }
+        issue(a, r, "action", finish(&b));
+    }
+    b32 hx = 0, hy = 0, hx2 = 0, hy2 = 0;
+    d->x       = argnum(a, r, j, "x", &hx);
+    d->y       = argnum(a, r, j, "y", &hy);
+    d->x2      = argnum(a, r, j, "x2", &hx2);
+    d->y2      = argnum(a, r, j, "y2", &hy2);
+    d->point   = hx && hy;
+    d->point2  = hx2 && hy2;
+    d->amount  = argint(a, r, j, "amount", 0);
+    d->keys    = argstr(a, r, j, "keys", 0);
+    d->text    = argstr(a, r, j, "text", 0);
+    d->window  = trim(argstr(a, r, j, "window", 0));
+    d->program = trim(argstr(a, r, j, "program", 0));
+    d->gone    = argbool(a, r, j, "gone");
+    d->secs    = argint(a, r, j, "seconds", -1);
+    d->window  = d->window.len ? d->window : Str{};
+
+    Json *args = jsonget(j, "args");
+    if (args->type == JSON_STRING) {
+        JsonDoc doc = jsonparse(a, trim(args->str));
+        args = doc.ok ? doc.root : args;
+    }
+    if (args->type == JSON_ARRAY) {
+        for (Json *e = args->child; e; e = e->next) {
+            Str s = e->type==JSON_STRING ? e->str : e->raw;
+            d->args = push(a, d->args, s);
+        }
+    } else if (args->type!=JSON_MISSING && args->type!=JSON_NULL) {
+        issue(a, r, "args", "must be an array of strings");
+    }
+
+    switch (d->action) {
+    case DESK_CLICK:
+    case DESK_DOUBLE:
+    case DESK_RIGHT:
+    case DESK_MOVE:
+        if (!d->point) issue(a, r, "x, y", "the point is required");
+        break;
+    case DESK_DRAG:
+        if (!d->point) issue(a, r, "x, y", "where the drag starts is required");
+        if (!d->point2) issue(a, r, "x2, y2", "where the drag ends is required");
+        break;
+    case DESK_SCROLL:
+        if (!d->point) issue(a, r, "x, y", "where to scroll is required");
+        if (!d->amount || d->amount<-100 || d->amount>100) {
+            issue(a, r, "amount", "must be 1 to 100 notches up, or -1 to -100 down");
+        }
+        break;
+    case DESK_KEY:
+        if (!trim(d->keys).len) issue(a, r, "keys", "at least one key is required");
+        break;
+    case DESK_TYPE:
+        if (!d->text.len) {
+            issue(a, r, "text", "the text to type is required");
+        } else if (d->text.len > DESK_TEXTMAX) {
+            issue(a, r, "text", "too long: at most 64 KiB at once");
+        }
+        break;
+    case DESK_FOCUS:
+    case DESK_CLOSE:
+    case DESK_WAIT:
+        if (!d->window.len) issue(a, r, "window", "the window is required");
+        if (d->action==DESK_WAIT && d->secs!=-1 && (d->secs<1 || d->secs>DESK_WAITMAX)) {
+            issue(a, r, "seconds", "must be 1 to 30");
+        }
+        break;
+    case DESK_RUN:
+        if (!d->program.len) issue(a, r, "program", "the program is required");
+        break;
+    }
+    b32 nul = cut(d->keys, 0).ok || cut(d->text, 0).ok ||
+              cut(d->window, 0).ok || cut(d->program, 0).ok;
+    for (iz i = 0; i < d->args.len; i++) {
+        nul |= cut(d->args[i], 0).ok;
+    }
+    if (nul) {
+        issue(a, r, "text", "no argument may hold a null character");
+    }
 }
 
 // A todo status by name, forgiving the usual synonyms; -1 if unknown.
@@ -979,6 +1178,9 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
             issue(a, &r, "description", "too long: a few words will do");
         }
         break;
+    case TOOL_DESKTOP:
+        argdesk(a, &r, j);
+        break;
     }
     if (r.path.data && !r.path.len) {
         issue(a, &r, "path", "must not be empty");
@@ -1033,6 +1235,8 @@ static Str unknowntool(Arena *a, Str name, u32 deny)
         {"bashoutput", "job_output"}, {"killshell", "job_kill"},
         {"kill", "job_kill"}, {"agent", "task"}, {"subagent", "task"},
         {"dispatch_agent", "task"}, {"delegate", "task"},
+        {"computer", "desktop"}, {"screenshot", "desktop"},
+        {"computer_use", "desktop"}, {"mouse", "desktop"},
     };
     ToolEnv te = {};
     te.deny = deny;

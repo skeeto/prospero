@@ -2674,6 +2674,43 @@ static i32 os_pid(Os *)
     return (i32)getpid();
 }
 
+struct QuitWatch {
+    Mailbox *mbox;
+    u32      type;
+};
+
+static void quitthread(void *arg)
+{
+    QuitWatch *q = (QuitWatch *)arg;
+    sigset_t   set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGHUP);
+    for (;;) {
+        int sig = 0;
+        if (!sigwait(&set, &sig)) {
+            mailpost(q->mbox, q->type, 0, {}, 1);
+        }
+    }
+}
+
+// The signals are blocked in this thread, and so in every thread that
+// it starts from then on, and one thread takes them with sigwait. Child
+// processes start with nothing blocked (childsignals).
+static b32 os_onquit(Os *os, Mailbox *mb, u32 type)
+{
+    static QuitWatch watch;
+    watch.mbox = mb;
+    watch.type = type;
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGHUP);
+    return !pthread_sigmask(SIG_BLOCK, &set, 0) && os_thread(os, quitthread, &watch);
+}
+
 static i32 os_responsible(Os *os, i32 pid)
 {
     return os->resp.pidfor && signalable(pid) ? os->resp.pidfor(pid) : 0;
@@ -2800,6 +2837,7 @@ enum {
     EDGE_CONNECT,
     EDGE_IO,
     EDGE_ABORT,
+    EDGE_TRUST,
 };
 
 struct Http {
@@ -2886,6 +2924,7 @@ static void httpworker(void *arg)
     case EDGE_CONNECT: err = HTTP_ECONNECT; break;
     case EDGE_IO:      err = HTTP_EIO;      break;
     case EDGE_ABORT:   err = h->toobig ? HTTP_ETOOBIG : HTTP_EIO; break;
+    case EDGE_TRUST:   err = HTTP_ETRUST;   break;
     }
     if (err == HTTP_ETOOBIG) {
         __builtin_strcpy(h->err, "response too large");
