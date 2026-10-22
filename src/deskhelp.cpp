@@ -27,10 +27,10 @@
 // foreground window). Coordinates are relative to the window's visible
 // frame, as in its shot; "screen" is relative to the top-left of the
 // whole (virtual) screen. Their unit is the desktop's own, which hello
-// names: physical pixels on Windows, points on macOS, where a Retina
-// display has two or more pixels to a point. A shot is captured at the
-// display's full resolution and scaled down to the units at most, so
-// that a pixel of the image is never smaller than a unit.
+// names: physical pixels on Windows and X11, points on macOS, where a
+// Retina display has two or more pixels to a point. A shot is captured
+// at the display's full resolution and scaled down to the units at
+// most, so that a pixel of the image is never smaller than a unit.
 //
 // Run with a command, it does that one and exits, as winctl does: text
 // and PNGs on standard output, errors on standard error, exit status 0
@@ -98,6 +98,9 @@ static Str        dk_why(Dk *);
 // "NAME\tmissing", plus what they are granted to; with ask, those
 // missing are asked of the user first. 0 if any is still missing.
 static b32        dk_access(Dk *, Buf *, b32 ask);
+// Why the desktop cannot be used, such as no display to connect to, or
+// null if it can. Asked before every command but help and hello.
+static Str        dk_ready(Dk *);
 // Top-level windows, top of the z-order first: those on the screen
 // (visible and not cloaked), or with all, every one.
 static Slice<DkWin> dk_windows(Dk *, Arena *, b32 all);
@@ -1329,8 +1332,8 @@ static Str dkusage =
 "  --serve                      take commands as frames on standard input\n"
 "WINDOW: title substring, or key=value[,key=value...] with keys title=,\n"
 "  class=, pid=, hwnd=; or 'screen'; or 'active' (the foreground window).\n"
-"Coordinates are relative to the window, as in its shot: pixels on Windows,\n"
-"  points on macOS.\n"
+"Coordinates are relative to the window, as in its shot: pixels on Windows\n"
+"  and X11, points on macOS.\n"
 "Exit status: 0 ok, 1 error, 2 no or ambiguous window match, 3 timeout.\n";
 
 // Run one command, its output in c.
@@ -1342,6 +1345,7 @@ static void dkcommand(DkCtx *c, DkArgs *a)
         return;
     } else if (cmd=="-h" || cmd=="--help" || cmd=="help") {
         print(&c->out, dkusage);
+        return;
     } else if (cmd=="hello" && c->serving) {
         print(&c->out, "prospero-desktop ");
         print(&c->out, (i64)DK_PROTO);
@@ -1350,6 +1354,13 @@ static void dkcommand(DkCtx *c, DkArgs *a)
         putbyte(&c->out, ' ');
         print(&c->out, dk_units(c->dk));
         putbyte(&c->out, '\n');
+        return;
+    }
+
+    // Every other command needs the desktop, the hello only the helper
+    Str why = dk_ready(c->dk);
+    if (why.data) {
+        dkfail(c, DK_FAIL, why);
     } else if (cmd == "list") {
         dkcmdlist(c, a);
     } else if (cmd == "shot") {

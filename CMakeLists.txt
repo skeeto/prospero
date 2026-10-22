@@ -220,6 +220,18 @@ if(WIN32)
     kernel32 user32 gdi32)
   set_target_properties(prospero-desktop PROPERTIES
     OUTPUT_NAME ${PROSPERO_NAME}-desktop)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # On X11 (src/main_desktop_x11.cpp): libX11, libXext and libXtst are
+  # loaded at run time, as SDL3 loads them, so it builds without them,
+  # and never statically, which dlopen needs
+  add_executable(prospero-desktop src/main_desktop_x11.cpp)
+  target_link_libraries(prospero-desktop PRIVATE prospero_core_flags
+    ${CMAKE_DL_LIBS})
+  if(PROSPERO_HAS_NOSTDLIBXX)
+    target_link_options(prospero-desktop PRIVATE -nostdlib++)
+  endif()
+  set_target_properties(prospero-desktop PROPERTIES
+    OUTPUT_NAME ${PROSPERO_NAME}-desktop)
 endif()
 
 find_program(UV uv)

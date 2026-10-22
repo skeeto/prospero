@@ -307,6 +307,11 @@ static b32 dk_access(Dk *, Buf *, b32)
     return 1;
 }
 
+static Str dk_ready(Dk *)
+{
+    return {};  // a desktop always, if perhaps a locked one
+}
+
 // The visible frame. On Vista and later GetWindowRect includes invisible
 // resize borders, so prefer the DWM's frame bounds when available.
 static DkRect winrect(Dk *dk, uz hwnd)

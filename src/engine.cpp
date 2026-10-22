@@ -4137,7 +4137,8 @@ static Str deskcheck(Session *s, Arena *a, DeskArgs *d)
     } else if (!deskhelper(e, a).len) {
         return "Desktop control is not available here: there is no desktop "
                "helper (prospero-desktop) next to the harness, which so far "
-               "exists for Windows and macOS only. Nothing was done.";
+               "exists for Windows, macOS and Linux on X11 only. Nothing "
+               "was done.";
     } else if (d->action==DESK_SCREENSHOT && s->mc.novision) {
         return "This session's model takes no images (its [model] vision is "
                "false), so it cannot see screenshots.";

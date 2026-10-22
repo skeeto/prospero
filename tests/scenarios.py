@@ -35,6 +35,8 @@ import concurrent.futures
 import json
 import os
 import random
+import re
+import select
 import shlex
 import shutil
 import signal
@@ -45,6 +47,7 @@ import tempfile
 import threading
 import time
 import traceback
+import zlib
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -4739,6 +4742,267 @@ def desktop_xp(t):
                     f.write(png)
             n += 1
     t.check(n >= 4, f"screenshots sent: {n}")
+
+
+# The real helper on X11, where Xvfb is installed: a display of the
+# test's own, and tests/xprobe.py's window on it, which logs what it is
+# sent, and with _wm, its stand-in window manager, which speaks EWMH
+
+XPROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xprobe.py")
+
+
+class Xvfb:
+    """An X server on a display it picks itself, stopped by its group,
+    which its own spawn leads (pids.py)."""
+
+    def __init__(self):
+        r, w = os.pipe()
+        try:
+            self.proc = subprocess.Popen(
+                ["Xvfb", "-displayfd", str(w), "-screen", "0", "1024x768x24",
+                 "-nolisten", "tcp"],
+                pass_fds=(w,), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        finally:
+            os.close(w)
+        try:
+            digits = b""
+            deadline = time.monotonic() + 15
+            while not digits.endswith(b"\n") and time.monotonic() < deadline:
+                ready, _, _ = select.select([r], [], [], 0.5)
+                chunk = os.read(r, 16) if ready else b""
+                if ready and not chunk:
+                    break
+                digits += chunk
+        finally:
+            os.close(r)
+        if not digits.strip().isdigit():
+            self.close()
+            raise Failure("Xvfb did not start")
+        self.display = ":" + digits.strip().decode()
+
+    def close(self):
+        if P.signal_group(self.proc, signal.SIGTERM):
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                P.signal_group(self.proc, signal.SIGKILL)
+                self.proc.wait()
+
+
+def pngpixels(data):
+    """The rows of an 8-bit RGB PNG, as the helper writes them: (width,
+    height, rows of bytes)."""
+    w, h = pngdims(data)
+    idat, pos = b"", 8
+    while pos + 8 <= len(data):
+        n = int.from_bytes(data[pos:pos + 4], "big")
+        if data[pos + 4:pos + 8] == b"IDAT":
+            idat += data[pos + 8:pos + 8 + n]
+        pos += 12 + n
+    raw = zlib.decompress(idat)
+    stride, prev, rows = w * 3, bytearray(w * 3), []
+    for y in range(h):
+        f = raw[y * (stride + 1)]
+        line = bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for i in range(stride):
+            a = line[i - 3] if i >= 3 else 0
+            b = prev[i]
+            c = prev[i - 3] if i >= 3 else 0
+            if f == 1:
+                line[i] = (line[i] + a) & 255
+            elif f == 2:
+                line[i] = (line[i] + b) & 255
+            elif f == 3:
+                line[i] = (line[i] + (a + b) // 2) & 255
+            elif f == 4:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        rows.append(bytes(line))
+        prev = line
+    return w, h, rows
+
+
+def darkpixels(png):
+    _, _, rows = pngpixels(png)
+    return sum(1 for row in rows for i in range(0, len(row), 3)
+               if row[i] + row[i + 1] + row[i + 2] < 200)
+
+
+def x11helper(t):
+    """The helper next to the harness, where it can drive an X display."""
+    import ctypes.util
+    if not isinstance(t.host, LocalHost) or not sys.platform.startswith("linux"):
+        raise Skip("drives an X display: Linux, on this machine")
+    if not shutil.which("Xvfb") or not ctypes.util.find_library("X11"):
+        raise Skip("needs Xvfb and libX11")
+    helper = t.host.prospero + "-desktop"
+    if not os.path.exists(helper):
+        raise Skip(f"no helper at {helper}")
+    return helper
+
+
+def xrun(env, *args, data=None):
+    """A command with the display, its exit status, output and errors."""
+    p = subprocess.run(list(args), env=env, input=data, capture_output=True, timeout=60)
+    return p.returncode, p.stdout, p.stderr.decode("utf-8", "replace")
+
+
+def x11cli(t, helper, env, wm):
+    """The helper's own command line: errors without a display, and a
+    window started, moved and resized, captured, typed into, and closed."""
+    plain = {k: v for k, v in env.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+    rc, _, err = xrun(plain, helper, "list")
+    t.check(rc == 1 and "DISPLAY is not set" in err, f"no display: {rc} {err}")
+    rc, _, err = xrun(dict(env, XDG_SESSION_TYPE="wayland"), helper, "list")
+    t.check(rc == 1 and "Wayland is not supported yet" in err, f"wayland: {rc} {err}")
+
+    rc, _, err = xrun(env, helper, "run", t.host.join(t.base, "no-such-program"))
+    t.check(rc == 1 and "no-such-program': No such file" in err, f"run fails: {rc} {err}")
+
+    log = t.host.join(t.base, "cli.log")
+    rc, out, err = xrun(env, helper, "run", sys.executable, "-I", XPROBE, "window", log)
+    pids = P.parse(out.decode())
+    t.check(rc == 0 and len(pids) == 1, f"run: {rc} {out} {err}")
+    win = f"pid={pids[0] if pids else 0}"
+    rc, out, err = xrun(env, helper, "wait", "-t", "20", win)
+    t.check(rc == 0 and b"Prospero probe" in out and b"XProbe" in out, f"wait: {out} {err}")
+    rc, _, err = xrun(env, helper, "wait", "-idle", "-t", "20", win)
+    t.check(rc == 0, f"idle: {rc} {err}")
+    # A manager moves the window when it gets to the request
+    rc, _, err = xrun(env, helper, "move", win, "100", "120", "300", "150")
+    for _ in range(50):
+        rc2, out, _ = xrun(env, helper, "list", win)
+        if b"\t100,120\t300x150\t" in out:
+            break
+        time.sleep(0.1)
+    t.check(rc == 0 and rc2 == 0 and b"\t100,120\t300x150\t" in out, f"moved: {out} {err}")
+    rc, png, err = xrun(env, helper, "shot", win)
+    t.check(rc == 0 and pngdims(png) == (300, 150), f"shot: {rc} {pngdims(png)} {err}")
+    rc, _, err = xrun(env, helper, "type", win, "-", data="é€".encode())
+    t.check(rc == 0, f"type from stdin: {err}")
+    rc, _, err = xrun(env, helper, "wheel", win, "5", "40", "-2")
+    t.check(rc == 0, f"wheel: {err}")
+    rc, _, err = xrun(env, helper, "key", win, "ctrl+zz")
+    t.check(rc == 1 and "unknown key 'ctrl+zz'" in err, f"bad key: {rc} {err}")
+    rc, _, err = xrun(env, helper, "close", win)
+    t.check(rc == 0, f"close: {err}")
+    rc, _, err = xrun(env, helper, "wait", "-gone", "-t", "20", win)
+    t.check(rc == 0, f"gone: {rc} {err}")
+    lines = [json.loads(x) for x in (t.host.read(log) or "").splitlines()]
+    t.check({"close": True, "text": "é€"} in lines, f"typed from stdin: {lines[-3:]}")
+    fx, _, fy, _ = FRAME_X11 if wm else (0, 0, 0, 0)
+    wheel = [x for x in lines if x.get("button") == 5 and x.get("press")]
+    t.check(len(wheel) == 2 and wheel[0]["x"] == 5 - fx and wheel[0]["y"] == 40 - fy,
+            f"wheel down twice at 5,40: {wheel}")
+    if not wm:
+        return
+
+    # A window the manager will not activate gets no input, and the
+    # command says so, whatever X's own focus did meanwhile
+    log = t.host.join(t.base, "stubborn.log")
+    rc, out, err = xrun(env, helper, "run", sys.executable, "-I", XPROBE, "window", log,
+                        "Stubborn probe")
+    pids = P.parse(out.decode())
+    win = f"pid={pids[0] if pids else 0}"
+    rc, _, err = xrun(env, helper, "wait", "-t", "20", win)
+    t.check(rc == 0, f"stubborn wait: {rc} {err}")
+    for cmd in (["type", win, "nope"], ["key", win, "enter"], ["click", win, "5", "40"]):
+        rc, _, err = xrun(env, helper, *cmd)
+        t.check(rc == 1 and "cannot give the keyboard to the window 'Stubborn probe'" in err
+                and "no input was sent" in err, f"refused {cmd[0]}: {rc} {err}")
+    rc, _, err = xrun(env, helper, "close", win)
+    rc2, _, _ = xrun(env, helper, "wait", "-gone", "-t", "20", win)
+    t.check(rc == 0 and rc2 == 0, f"stubborn closed: {err}")
+    lines = [json.loads(x) for x in (t.host.read(log) or "").splitlines()]
+    t.check(lines == [{"close": True, "text": ""}], f"nothing reached it: {lines}")
+
+
+FRAME_X11 = (2, 2, 20, 2)  # xprobe.py's FRAME
+
+
+def x11desk(t, wm):
+    helper = x11helper(t)
+    x = Xvfb()
+    wmproc = None
+    try:
+        env = {"DISPLAY": x.display, "XDG_SESSION_TYPE": "x11", "WAYLAND_DISPLAY": ""}
+        xenv = dict(os.environ, **env)
+        wmlog = t.host.join(t.base, "wm.log")
+        if wm:
+            wmproc = subprocess.Popen([sys.executable, "-I", XPROBE, "wm", wmlog], env=xenv,
+                                      stdin=subprocess.DEVNULL, start_new_session=True)
+            for _ in range(100):
+                if "ready" in (t.host.read(wmlog) or ""):
+                    break
+                time.sleep(0.1)
+            t.check("ready" in (t.host.read(wmlog) or ""), "the window manager started")
+        keys0 = xrun(xenv, sys.executable, "-I", XPROBE, "keys")[1]
+
+        x11cli(t, helper, xenv, wm)
+
+        # Without the window manager, the harness finds the helper next
+        # to itself, as a user's does, unless it has another name
+        log = t.host.join(t.base, "probe.log")
+        prompt = json.dumps({"program": sys.executable, "args": ["-I", XPROBE, "window", log]})
+        if wm or os.path.basename(t.host.prospero) != "prospero":
+            env = dict(env, PROSPERO_TEST_DESKTOP=json.dumps([helper]))
+        r = t.run(prompt=prompt, timeout=80, env=env)
+        ends = [(e["status"], e["text"][:160]) for e in r.all("tool.end")]
+        t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {ends}")
+        t.check(len(ends) == 12 and all(s == "ok" for s, _ in ends), f"every step: {ends}")
+
+        lines = [json.loads(x) for x in (t.host.read(log) or "").splitlines()]
+        want = fake_provider.DESK_X11_TEXT[0] + "Ok!" + fake_provider.DESK_X11_TEXT[1]
+        t.check({"close": True, "text": want} in lines, f"typed: {lines[-1:]}")
+        # The click in the middle of the window's screenshot, in pixels of
+        # its frame, which the client's origin is inside of
+        size = re.findall(r"x from 0 to (\d+), y from 0 to (\d+)", "\n".join(e for _, e in ends))
+        fx, _, fy, _ = FRAME_X11 if wm else (0, 0, 0, 0)
+        cw, ch = 480 + fx + FRAME_X11[1] * wm, 200 + fy + FRAME_X11[3] * wm
+        t.check(size and size[-1] == (str(cw - 1), str(ch - 1)), f"the frame {size}")
+        clicks = [x for x in lines if x.get("button") == 1 and x.get("press")]
+        t.check(clicks == [{"button": 1, "press": True, "x": (cw - 1) // 2 - fx,
+                            "y": (ch - 1) // 2 - fy}], f"clicked {clicks}")
+
+        shots = [base64.b64decode(url.split(",", 1)[1])
+                 for q in t.requests()[-1:]
+                 for _, url in fake_provider.desk_images(q["body"])]
+        dims = [pngdims(s) for s in shots]
+        t.check(dims[-2:] == [(cw, ch), (cw, ch)], f"window shots {dims}")
+        if len(shots) >= 2:
+            before, after = darkpixels(shots[-2]), darkpixels(shots[-1])
+            t.check(after > before + 100, f"text drawn: {before} dark pixels, then {after}")
+        # The helper unbinds them as it exits, a second after the last
+        # key, or at once when the harness's end asks it to quit
+        for _ in range(30):
+            keys1 = xrun(xenv, sys.executable, "-I", XPROBE, "keys")[1]
+            if keys1 == keys0:
+                break
+            time.sleep(0.2)
+        t.check(keys0 and keys0 == keys1, "the spare keycodes are unbound again")
+        if wm:
+            acts = [json.loads(x) for x in (t.host.read(wmlog) or "").splitlines()]
+            t.check(any("active" in a for a in acts) and any("close" in a for a in acts) and
+                    any(a.get("gravity") == 10 for a in acts), f"through EWMH: {acts}")
+    finally:
+        if wmproc:
+            P.signal_group(wmproc, signal.SIGTERM)
+            wmproc.wait()
+        x.close()
+
+
+@scenario(conf=DESKALL, bound=120)
+def desktop_x11(t):
+    """The X11 helper without a window manager, as on a bare Xvfb."""
+    x11desk(t, wm=False)
+
+
+@scenario(conf=DESKALL, bound=120)
+def desktop_x11_wm(t):
+    """The X11 helper through a window manager's EWMH."""
+    x11desk(t, wm=True)
 
 
 @scenario(conf={**AN, **DESKALL, "_extra": "[model {model}]\nimage_edge = 100\n"}, bound=15)

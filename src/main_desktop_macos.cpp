@@ -676,6 +676,12 @@ static Str dk_why(Dk *dk)
     return r;
 }
 
+// Always a desktop: each call asks for the permission it needs (dk_why).
+static Str dk_ready(Dk *)
+{
+    return {};
+}
+
 
 // Objective-C, through the runtime's C functions
 

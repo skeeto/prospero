@@ -1800,6 +1800,47 @@ def sc_desktop_xp(model, n, req):
         yield from answer(model, "Notepad typed into, looked at, and closed.")
 
 
+DESK_X11_TEXT = ("Hello from Prospero on X11: Grüße → ✓\n",
+                 "typed after a click")
+
+
+def sc_desktop_x11(model, n, req):
+    """tests/xprobe.py's window on an X display (scenarios.py
+    desktop_x11): the prompt, JSON, names the program and its arguments.
+    Started, typed into in Unicode, keyed, clicked, looked at, listed,
+    and closed."""
+    k = step(req)
+    spec = json.loads(task_prompt(req))
+    text = "\n".join(str(m.get("content", "")) for m in req.get("messages", [])
+                     if m.get("role") == "tool")
+    pid = re.search(r"process id (\d+)", text)
+    pid = pid.group(1) if pid else "0"
+    size = re.findall(r"x from 0 to (\d+), y from 0 to (\d+)", text)
+    w, h = (int(size[-1][0]), int(size[-1][1])) if size else (100, 100)
+    win = f"pid={pid}"
+    steps = [
+        {"action": "screenshot"},
+        {"action": "run", "program": spec["program"], "args": spec["args"]},
+        {"action": "wait", "window": win, "seconds": 20},
+        {"action": "screenshot", "window": win},
+        {"action": "type", "text": DESK_X11_TEXT[0]},
+        {"action": "key", "keys": "shift+o k !"},
+        {"action": "click", "x": w // 2, "y": h // 2},
+        {"action": "type", "text": DESK_X11_TEXT[1]},
+        {"action": "screenshot", "window": win},
+        {"action": "windows"},
+        {"action": "close", "window": win},
+        {"action": "wait", "window": win, "gone": True, "seconds": 20},
+    ]
+    if k < len(steps):
+        yield from tool(model, n, "desktop", steps[k])
+    else:
+        yield from answer(model, "The probe typed into, looked at, and closed.")
+
+
+sc_desktop_x11_wm = sc_desktop_x11
+
+
 def sc_desktop_cancel(model, n, req):
     if step(req) == 0:
         yield from tool(model, n, "desktop", {"action": "type", "text": "HANG"})

@@ -14,14 +14,16 @@ struct Dk {
     i64    now;     // milliseconds
     Str    stdin_;  // what dk_read reads
     Buf    out[3];  // what dk_write wrote
-    Str    why;     // dk_why's next answer
-    Str    denied;  // why dk_close fails, if it does
-    Str    refused; // why dk_activate fails, if it does
-    i32    scale;   // pixels to a unit, for dk_capture
+    Str    why;      // dk_why's next answer
+    Str    denied;   // why dk_close fails, if it does
+    Str    refused;  // why dk_activate fails, if it does
+    i32    scale;    // pixels to a unit, for dk_capture
+    Str    unready;  // what dk_ready says, null when ready
 };
 
 static Str dk_os(Dk *) { return "fake"; }
 static Str dk_units(Dk *) { return "pixels"; }
+static Str dk_ready(Dk *dk) { return dk->unready; }
 
 static Str dk_why(Dk *dk)
 {
@@ -743,6 +745,19 @@ static void test_desktop(Test *t)
                "Program Manager\n");
         dk->stdin_ = Str{(u8 *)"\xff\xff\xff\x7f", 4};
         expect(t, "serve too long", istr(a, dkserve(dk, *a)), "1");
+
+        // A desktop that cannot be used: the hello and help still work,
+        // and every other command fails with the reason
+        dk->unready = "no X display: DISPLAY is not set";
+        expect(t, "unready hello", dkround(a, dk, "hello"),
+               "0|prospero-desktop 1 fake pixels\n");
+        expect(t, "unready help", takehead(dkround(a, dk, "help"), 8), "0|usage:");
+        expect(t, "unready list", dkround(a, dk, "list"),
+               "1|no X display: DISPLAY is not set");
+        dklog(dk);
+        expect(t, "unready click", dkround(a, dk, "click|screen|1|1"),
+               "1|no X display: DISPLAY is not set");
+        expect(t, "unready no input", dklog(dk), "");
     }
 
     // A Retina display: two pixels to the unit (a point), captured at

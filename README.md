@@ -294,10 +294,10 @@ The work is done by a helper, `prospero-desktop`, next to `prospero`,
 which the harness starts for a turn and talks to over pipes: a program
 of its own, so that the one program the system lets watch the screen
 keeps its identity however often Prospero is rebuilt. So far it exists
-for Windows (XP and later) and macOS (15.2 and later); run alone, it
-takes the same commands on its command line (`prospero-desktop shot
-screen > s.png`, `list`, `click WINDOW X Y` and so on;
-`prospero-desktop -h`).
+for Windows (XP and later), macOS (15.2 and later) and Linux on X11;
+run alone, it takes the same commands on its command line
+(`prospero-desktop shot screen > s.png`, `list`, `click WINDOW X Y` and
+so on; `prospero-desktop -h`).
 
 On macOS the helper sits in `Prospero.app/Contents/MacOS`, and works in
 points, which it captures at the display's full resolution. macOS asks
@@ -311,6 +311,11 @@ one fails at once and says which to grant to what;
 missing. Build with `-DPROSPERO_SIGN_IDENTITY=NAME`, a code-signing
 identity from your keychain, even a self-signed one, so that the
 grants survive rebuilds.
+
+On Linux the helper drives the X11 display that `DISPLAY` names, in
+pixels, loading libX11, libXext and libXtst when it runs. It works with
+a window manager through EWMH, or without one. Wayland is not supported
+yet: in a Wayland session every call fails and says so.
 
 Screenshots go to the model as images, scaled down to its limits
 (`[model] image_edge` and `image_pixels`: by default 1568 pixels on a
