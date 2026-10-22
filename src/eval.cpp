@@ -1,10 +1,11 @@
 // Eval: tasks run through the engine, to compare models and edit formats
 //
 //   prospero eval [options] SUITE...
-//   prospero eval --report FILE...
+//   prospero eval --report [-c FILE] FILE...
 //
 // A suite is a directory of tasks, one INI file each (NAME.ini), with
-// settings for all of them in suite.ini, which a task's own override.
+// settings for all of them in suite.ini, which a task's own override
+// (a task's prompt or prompt_file, either one, over suite.ini's).
 // Each run of a task gets a directory of its own under a temporary one,
 // and in it work/, the agent's working directory: a copy of the task's
 // fixture, changed by its patch and then its setup command. The agent
@@ -14,7 +15,9 @@
 // user's own. The run passes if its turn ended done, every file of
 // expect is in work/ byte for byte, and the check command exits 0.
 // Nothing of a suite, nor any repository, is ever changed: the agent
-// works on copies.
+// works on copies. A fixture may hold a .git directory, which is
+// copied, but no .git file: a worktree's or submodule's, which names
+// another repository's git directory, would have the copy share it.
 //
 // A task's keys, with paths relative to the file that sets them:
 //
@@ -33,10 +36,11 @@
 //   role           a [role] of the configuration
 //   check_timeout  seconds a setup or check command may take (300)
 //
-// Commands run in the agent's shell, with PROSPERO_EVAL_SUITE set to the
-// suite's directory and PROSPERO_EVAL_TASK to the task's name. Symbolic
-// links and file modes are not copied: a check runs its scripts with
-// sh, not by their names.
+// Commands run in the agent's shell, as its commands do (without the
+// variables that endpoints' keys come from), with PROSPERO_EVAL_SUITE
+// set to the suite's directory and PROSPERO_EVAL_TASK to the task's
+// name. Symbolic links and file modes are not copied: a check runs its
+// scripts with sh, not by their names.
 //
 // Every model (-m, each MODEL or ENDPOINT/MODEL) runs every task in each
 // edit format (-f, by default the model's own), n times (-n), with up
@@ -53,33 +57,43 @@
 // verdict of expect and check alone; expect, the first file that did
 // not match; check_exit and check_out), what it took (steps, calls,
 // edits, reads; errors by kind, from tool.end's fail: miss, an edit
-// that did not apply, args, unknown, loop and other; denied by the
+// that did not apply, args, unknown, loop and other; edit_fails, edit
+// calls that failed for any of those, as a patch that does not parse
+// fails as args, and a replacement not found as miss; denied by the
 // guard; repairs, calls in which the harness forgave something, and
 // repaired, how often it forgave each thing, from tool.end's repair;
 // nudges and nudged by kind, retries and retried by class, compactions;
 // tokens in, out, cached and written; wall_ms and queued_ms), the
 // session's sid, and the diff of work/ as the agent left it. All of it
 // is counted from the logs of the run's sessions, its subagents'
-// included. A run that could not be made (its patch or setup failed)
-// has error instead. A run found in the file already, with no error,
-// is skipped, so an eval stopped part way goes on where it stopped.
+// included. A run that could not be made has error instead: its patch
+// or setup failed, the model never answered (no response, and the turn
+// ended in an error, or at its time limit after retries), or a request
+// went to a fallback, which the sessions are told not to use. A run
+// found in the file already, with no error, is skipped, so an eval
+// stopped part way goes on where it stopped. After EVAL_SILENT runs of
+// a model in a row (or -j, if more) were never answered, its runs not
+// started are left out, and the eval exits 1.
 //
 // The summary, after the runs and for --report, is a table by model and
 // format, what was forgiven, nudged and retried, the runs that failed,
 // and for each model run in more than one format, the format to give
-// it: the best pass rate, then the fewest edit misses, steps and
-// tokens, with the numbers behind the choice and whether the pass rates
-// differ by more than chance at that many runs (95% Wilson intervals).
+// it. Formats are compared on the runs that each of them made of the
+// same tasks and repetitions alone, task by task, by sign tests (exact
+// McNemar tests with one run a task): the pass rate, then failed edits,
+// steps and tokens, the first that differs beyond chance (p < 0.05)
+// deciding. A format better so than every other is given, else the
+// model keeps its own, as its own runs or the configuration have it.
 //
 // The engine takes these from new for each run: edit_format, tools,
-// steps and instructions "project" (engine.cpp, cmdnew), and close
-// with forget lets each session go once its run is over.
+// steps, instructions "project" and fallback 0 (engine.cpp, cmdnew),
+// and close with forget lets each session go once its run is over.
 //
 // This is free and unencumbered software released into the public domain.
 
 static Str evalusage =
 "usage: prospero eval [options] SUITE...\n"
-"       prospero eval --report FILE...\n"
+"       prospero eval --report [-c FILE] FILE...\n"
 "options:\n"
 "  -m MODEL,...   models, each MODEL or ENDPOINT/MODEL (default: the\n"
 "                 configured model)\n"
@@ -106,6 +120,8 @@ enum : i64 {
     EVAL_OUTTAIL = 2 << 10,    // of which a failed command's record shows
     EVAL_LCSMAX  = 1 << 22,    // cells of a line diff's table, at most
     EVAL_CONTEXT = 3,          // lines around a diff's changes
+    EVAL_SILENT  = 3,          // runs in a row unanswered drop a model,
+                               // or as many as run at once, if more
 };
 
 
@@ -210,6 +226,26 @@ static void evalcheckini(Os *os, Arena scratch, Ini *ini, Str path)
     }
 }
 
+// The first .git under dir that is a file, not a directory, or null if
+// none. Such a file (a worktree's, or a submodule's) names the git
+// directory of another repository, which a copy would share.
+static Str evalgitfile(Os *os, Arena *perm, Arena scratch, Str dir)
+{
+    for (Dirent *d = os_list(os, &scratch, dir); d; d = d->next) {
+        Arena t    = scratch;
+        Str   path = join(&t, dir, d->name);
+        if (!d->isdir && d->name==".git") {
+            return clone(perm, path);
+        } else if (d->isdir) {
+            Str r = evalgitfile(os, perm, t, path);
+            if (r.data) {
+                return r;
+            }
+        }
+    }
+    return {};
+}
+
 // A suite's settings for every task: suite.ini, or none.
 struct EvalSuiteIni {
     Str path;
@@ -233,8 +269,20 @@ static b32 evaltask(Os *os, Arena *perm, Arena scratch, EvalSuiteIni *suite,
     iniparse(ini, perm, path, rd.data.data ? rd.data : Str{(u8 *)"", 0});
     evalcheckini(os, scratch, ini, path);
 
-    t->prompt  = evalget(ini, "prompt");
-    Str pfile  = evalpath(perm, ini, "prompt_file");
+    // The prompt from the task's own file, if it sets prompt or
+    // prompt_file, over suite.ini's; one file may set only one of them
+    IniEntry *pe = inilookup(ini, "", "", "prompt");
+    IniEntry *pf = inilookup(ini, "", "", "prompt_file");
+    pe = pe && trim(pe->value).len ? pe : 0;
+    pf = pf && trim(pf->value).len ? pf : 0;
+    if (pe && pf && pe->file==pf->file) {
+        evalcomplain(os, scratch, pe->file->path,
+                     "both prompt and prompt_file are set: set one of them");
+        return 0;
+    }
+    b32 byfile = pf && (!pe || pf->file->path==path);
+    Str pfile  = byfile ? evalpath(perm, ini, "prompt_file") : Str{};
+    t->prompt  = byfile ? Str{} : evalget(ini, "prompt");
     t->fixture = evalpath(perm, ini, "fixture");
     t->expect  = evalpath(perm, ini, "expect");
     t->setup   = evalget(ini, "setup");
@@ -277,6 +325,16 @@ static b32 evaltask(Os *os, Arena *perm, Arena scratch, EvalSuiteIni *suite,
             evalcomplain(os, scratch, path, msg);
             return 0;
         }
+    }
+    Str git = t->fixture.data ? evalgitfile(os, perm, scratch, t->fixture) : Str{};
+    if (git.data) {
+        Str msg = concat(&scratch, git, " is a file, which points at the git "
+                         "directory of another repository (a worktree's or a "
+                         "submodule's), so git in a copy of the fixture would "
+                         "change that repository: make the fixture a clone, or "
+                         "a copy without git");
+        evalcomplain(os, scratch, path, msg);
+        return 0;
     }
     if (!t->prompt.len) {
         evalcomplain(os, scratch, path, "the task has no prompt");
@@ -357,8 +415,10 @@ static b32 evalsuite(Os *os, Arena *perm, Arena scratch, Str dir,
 
 // Directories
 
-// Copy a directory tree, but for any .git directory if nogit. Returns
-// null on success, else the path that could not be copied.
+// Copy a directory tree, but for any .git if nogit. Otherwise a .git
+// file is not copied but refused (evalgitfile): it would share the
+// repository it names. Returns null on success, else the path that
+// could not be copied.
 static Str evalcopy(Os *os, Arena *perm, Arena scratch, Str from, Str to, b32 nogit)
 {
     if (!os_mkdirs(os, scratch, to)) {
@@ -368,10 +428,11 @@ static Str evalcopy(Os *os, Arena *perm, Arena scratch, Str from, Str to, b32 no
         Arena t   = scratch;
         Str   src = join(&t, from, d->name);
         Str   dst = join(&t, to, d->name);
-        if (d->isdir) {
-            if (nogit && d->name==".git") {
-                continue;
-            }
+        if (nogit && d->name==".git") {
+            continue;
+        } else if (!d->isdir && d->name==".git") {
+            return clone(perm, src);
+        } else if (d->isdir) {
             Str bad = evalcopy(os, perm, t, src, dst, nogit);
             if (bad.data) {
                 return bad;
@@ -386,16 +447,18 @@ static Str evalcopy(Os *os, Arena *perm, Arena scratch, Str from, Str to, b32 no
     return {};
 }
 
-// Relative paths of the files under dir, as rel/name, but for .git
-// directories if nogit.
+// Relative paths of the files under dir, as rel/name, but for anything
+// named .git if nogit.
 static Slice<Str> evalfiles(Os *os, Arena *a, Str dir, Str rel, b32 nogit,
                             Slice<Str> list)
 {
     for (Dirent *d = os_list(os, a, dir); d; d = d->next) {
         Str name = rel.len ? concat(a, concat(a, rel, "/"), d->name) : d->name;
-        if (!d->isdir) {
+        if (nogit && d->name==".git") {
+            continue;
+        } else if (!d->isdir) {
             list = push(a, list, name);
-        } else if (!nogit || d->name!=".git") {
+        } else {
             list = evalfiles(os, a, join(a, dir, d->name), name, nogit, list);
         }
     }
@@ -711,6 +774,8 @@ static Slice<EvalCount> evalfixes(Arena *perm, Slice<EvalCount> c, Str repair)
 
 struct EvalStats {
     Str              format;  // the run's own session's edit format
+    Str              other;   // a model other than its own that its own
+                              // session asked (a fallback), else null
     Slice<Str>       sids;    // its sessions: its own, then its subagents'
     Slice<EvalCount> fixes;   // repairs, by what was forgiven
     Slice<EvalCount> nudged;  // nudges, by kind
@@ -720,6 +785,7 @@ struct EvalStats {
     i64        edits;
     i64        reads;
     i64        errors[5];  // EVAL_MISS ...
+    i64        editfails;  // edit calls that failed, for any of those
     i64        denied;
     i64        repairs;
     i64        nudges;
@@ -747,16 +813,19 @@ static Str evallogpath(Arena *a, Str statedir, Str sid)
 }
 
 // Count what the logs of a run's sessions hold: its own, then each that
-// a task call of one of them started.
+// a task call of one of them started. Edit calls are known by their ids
+// from tool.start, in a map in perm, which a failed one's tool.end finds.
 static EvalStats evalstats(Os *os, Arena *perm, Arena scratch, Str statedir, Str sid)
 {
-    EvalStats r = {};
+    EvalStats r   = {};
+    Str       own = {};  // the model of the run's own session
     r.format = editnames[EDIT_REPLACE];
     r.sids   = push(perm, r.sids, sid);
     for (iz n = 0; n < r.sids.len; n++) {
-        Arena      t    = scratch;
-        Read       rd   = os_read(os, &t, evallogpath(&t, statedir, r.sids[n]), LOG_MAX);
-        Slice<Str> kids = {};
+        Arena      t     = scratch;
+        Read       rd    = os_read(os, &t, evallogpath(&t, statedir, r.sids[n]), LOG_MAX);
+        Slice<Str> kids  = {};
+        Map<b32>  *edits = 0;
         for (Str rest = rd.data; rest.len;) {
             Cut   c = cut(rest, '\n');
             Arena u = t;
@@ -767,8 +836,15 @@ static EvalStats evalstats(Os *os, Arena *perm, Arena scratch, Str statedir, Str
             case EV_SESSION:
                 if (!n) {
                     r.format = editnames[editformat(jsonstr(jsonget(j, "edit_format")))];
+                    own      = clone(perm, jsonstr(jsonget(j, "model")));
                 }
                 break;
+            case EV_ATTEMPT: {
+                Str model = jsonstr(jsonget(j, "model"));
+                if (!n && own.len && model.len && model!=own && !r.other.data) {
+                    r.other = clone(perm, model);
+                }
+            } break;
             case EV_ASSISTANT: {
                 Json *usage = jsonget(j, "usage");
                 r.steps++;
@@ -782,6 +858,10 @@ static EvalStats evalstats(Os *os, Arena *perm, Arena scratch, Str statedir, Str
                 r.calls++;
                 r.edits += name == "edit";
                 r.reads += name == "read";
+                if (name == "edit") {
+                    Str call = clone(perm, jsonstr(jsonget(j, "call")));
+                    *upsert(&edits, call, perm) = 1;
+                }
             } break;
             case EV_TOOLEND: {
                 Str status = jsonstr(jsonget(j, "status"));
@@ -797,6 +877,8 @@ static EvalStats evalstats(Os *os, Arena *perm, Arena scratch, Str statedir, Str
                         k = fail==evalerrnames[i] ? i : k;
                     }
                     r.errors[k]++;
+                    Str call = jsonstr(jsonget(j, "call"));
+                    r.editfails += upsert(&edits, call, (Arena *)0) != 0;
                 }
                 if (child.len) {
                     kids = push(&t, kids, child);
@@ -828,6 +910,9 @@ static EvalStats evalstats(Os *os, Arena *perm, Arena scratch, Str statedir, Str
 struct EvalModel {
     Str endpoint;  // a configured name or a URL
     Str model;
+    Str own;       // its configured edit format (evalowns)
+    i32 silent;    // its latest runs in a row that it never answered
+    b32 dropped;   // so many that its runs left are not made
 };
 
 enum : i32 {
@@ -880,6 +965,7 @@ struct Eval {
     Region           *spare;    // temporaries of reading logs and trees
     ToolEnv           te;       // the agent's shell, for commands
     Slice<Str>        env;
+    Slice<Str>        secrets;  // variables the commands do not get
     Str               root;     // the runs' directories are under it
     Str               statedir;
     iz                out;      // the results file, as a log
@@ -890,6 +976,8 @@ struct Eval {
     EvalRun         **live;     // running, jobs of them, null when free
     i32               nlive;
     i32               done;
+    i32               silent;   // runs in a row unanswered that drop a model
+    i64               skipped;  // runs not made, their models dropped
     i64               nextid;
 };
 
@@ -912,16 +1000,31 @@ static void evalsend(Eval *ev, Arena scratch, i32 cmd, Str sid, b32 forget)
 // Write a run's line of results and report it, and free its place.
 static void evalfinish(Eval *ev, Arena scratch, EvalRun *run)
 {
-    Os       *os  = ev->os;
-    EvalTask *t   = run->task;
-    Arena     a   = scratch;
-    EvalStats st  = {};
-    Str       dif = {};
-    b32       chk = 0;
+    Os       *os   = ev->os;
+    EvalTask *t    = run->task;
+    Arena     a    = scratch;
+    EvalStats st   = {};
+    Str       dif  = {};
+    b32       chk  = 0;
+    b32       mute = 0;  // the model never answered
     if (!run->error.data) {
         st  = evalstats(os, &a, newarena(ev->spare), ev->statedir, run->sid);
         dif = evaltreediff(os, &a, newarena(ev->spare), run->start, run->work, EVAL_DIFFMAX);
         chk = !run->missed.data && (!t->check.data || run->checkcode==0);
+        // What measures the endpoint or the configuration, rather than
+        // the model, is no run: it is left out, and made again next time.
+        // A model too slow for the time limit, but answering, is a fail.
+        mute = !st.steps && (run->why=="error" || (run->why=="timeout" && st.retries));
+        if (st.other.data) {
+            Buf b(&a, 256);
+            print(&b, "a request went to another model, ");
+            print(&b, st.other);
+            print(&b, ", a fallback, so the run measured that one");
+            run->error = finish(&b);
+        } else if (mute) {
+            Str err = run->err.len ? run->err : run->why;
+            run->error = concat(&a, "the model never answered: ", err);
+        }
     }
     b32 pass = chk && run->why=="done";
 
@@ -966,6 +1069,7 @@ static void evalfinish(Eval *ev, Arena scratch, EvalRun *run)
             putintkey(&w, evalerrnames[i], st.errors[i]);
         }
         putend(&w);
+        putintkey(&w, "edit_fails", st.editfails);
         putintkey(&w, "denied", st.denied);
         putintkey(&w, "repairs", st.repairs);
         putkey(&w, "repaired");
@@ -1044,6 +1148,24 @@ static void evalfinish(Eval *ev, Arena scratch, EvalRun *run)
     putbyte(&p, '\n');
     os_print(os, 2, finish(&p));
 
+    // A model whose endpoint answers nothing gets no more runs, which
+    // would each wait out their time for nothing
+    EvalModel *m = run->model;
+    m->silent = mute ? m->silent+1 : run->error.data ? m->silent : 0;
+    if (m->silent>=ev->silent && !m->dropped) {
+        m->dropped = 1;
+        Buf q(&a, 512);
+        print(&q, "eval: ");
+        print(&q, m->model);
+        print(&q, ": ");
+        print(&q, (i64)m->silent);
+        print(&q, " runs in a row got no answer (");
+        print(&q, run->error);
+        print(&q, "), so its runs not yet started are left out; an eval "
+                  "run again makes them\n");
+        os_print(os, 2, finish(&q));
+    }
+
     if (!ev->keep) {
         removeall(os, scratch, run->base);
     }
@@ -1068,7 +1190,7 @@ static b32 evalspawn(Eval *ev, Arena scratch, EvalRun *run, Str command, Str log
 {
     EvalTask  *t   = run->task;
     ShellCmd   sc  = shellcmd(&scratch, &ev->te, command);
-    Slice<Str> env = shellenv(&scratch, ev->env, ev->te.windows);
+    Slice<Str> env = shellenv(&scratch, ev->env, ev->te.windows, ev->secrets);
     env = push(&scratch, env, concat(&scratch, "PROSPERO_EVAL_SUITE=", t->suitedir));
     env = push(&scratch, env, concat(&scratch, "PROSPERO_EVAL_TASK=", t->name));
     Spawn sp = {};
@@ -1123,6 +1245,7 @@ static void evalbegin(Eval *ev, Arena scratch, Arena *perm, EvalRun *run)
     }
     putintkey(&w.json, "steps", t->steps);
     putstrkey(&w.json, "instructions", "project");
+    putintkey(&w.json, "fallback", 0);
     putstrkey(&w.json, "prompt", t->prompt);
     enginecmd(ev->e, cuttail(evend(&w), 1));
     run->state = RUN_TURN;
@@ -1411,6 +1534,17 @@ static void evalproc(Eval *ev, Arena scratch, Arena *perm, Record r)
 
 // Summary
 
+// A run with a result, as the format recommendation compares them.
+struct EvalRec {
+    Str key;     // suite, task and repetition: what pairs runs
+    Str task;    // suite and task: what a sign test counts by
+    b32 own;     // in the model's own format
+    i64 pass;
+    i64 fails;   // failed edits
+    i64 steps;
+    i64 tokens;  // in and out
+};
+
 struct EvalCell {
     EvalCell *next;
     Str       endpoint;
@@ -1421,7 +1555,7 @@ struct EvalCell {
     i64       errors;    // runs that could not be made
     i64       steps;     // the rest are sums
     i64       calls;
-    i64       miss;
+    i64       fails;     // failed edit calls, of any kind
     i64       bad;       // invalid calls: args, unknown, loop
     i64       denied;
     i64       repairs;
@@ -1433,6 +1567,7 @@ struct EvalCell {
     Slice<EvalCount> fixes;   // what repairs forgave
     Slice<EvalCount> nudged;  // nudges by kind
     Slice<EvalCount> retried; // retries by class
+    Slice<EvalRec>   recs;    // its runs, in order
     i32       order;     // its model's, by first appearance
 };
 
@@ -1444,46 +1579,6 @@ static i32 evalformatrank(Str format)
         }
     }
     return EDIT_COUNT;
-}
-
-// A square root without a C library: Newton's method from above.
-static f64 evalsqrt(f64 x)
-{
-    if (x <= 0) {
-        return 0;
-    }
-    f64 r = x>1 ? x : 1;
-    for (i32 i = 0; i < 64; i++) {
-        f64 n = (r + x/r) / 2;
-        if (n >= r) {
-            break;
-        }
-        r = n;
-    }
-    return r;
-}
-
-// The 95% Wilson interval of a pass rate.
-struct EvalInterval {
-    f64 lo;
-    f64 hi;
-};
-
-static EvalInterval evalwilson(i64 pass, i64 runs)
-{
-    EvalInterval r = {0, 1};
-    if (runs <= 0) {
-        return r;
-    }
-    f64 n  = (f64)runs;
-    f64 p  = (f64)pass / n;
-    f64 z2 = 1.96 * 1.96;
-    f64 d  = 1 + z2/n;
-    f64 c  = (p + z2/(2*n)) / d;
-    f64 h  = 1.96 * evalsqrt(p*(1 - p)/n + z2/(4*n*n)) / d;
-    r.lo = c - h;
-    r.hi = c + h;
-    return r;
 }
 
 // Thousands separated: 13,898.
@@ -1520,47 +1615,146 @@ static void evalmean(Buf *b, i64 sum, i64 n, i32 decimals)
     printpad(b, x % scale, decimals);
 }
 
-// Rates and means, compared as fractions so that no float decides.
-static i32 evalcmp(i64 a, i64 an, i64 b, i64 bn)
+// The two-sided p value of a sign test: of the wins+losses pairs that
+// differ, the chance that a split at least this uneven comes of no
+// difference at all, 2 P(X <= min(wins, losses)) for X binomial with
+// p 1/2, at most 1. Exact: the sum of binomial coefficients is scaled
+// down as it grows, and 2^-n applied last, so that nothing overflows.
+static f64 evalsign(i64 wins, i64 losses)
 {
-    i64 x = a * bn, y = b * an;
-    return x<y ? -1 : x>y;
+    i64 n = wins + losses;
+    i64 k = wins<losses ? wins : losses;
+    f64 term = 1, sum = 1;  // C(n, i) and the sum so far, over 2^shift
+    i64 shift = 0;
+    for (i64 i = 0; i < k; i++) {
+        term = term * (f64)(n - i) / (f64)(i + 1);
+        sum += term;
+        if (sum > 0x1p500) {
+            term  *= 0x1p-500;
+            sum   *= 0x1p-500;
+            shift += 500;
+        }
+    }
+    for (i64 e = shift - n + 1; e; e += e<0 ? 1 : -1) {
+        sum = e<0 ? sum/2 : sum*2;
+    }
+    return sum<1 ? sum : 1;
 }
 
+// A p value as the summary prints it: to three decimals, or < 0.001.
+static void evalp(Buf *b, f64 p)
+{
+    i64 x = (i64)(p*1000 + 0.5);
+    i32 d = 3;
+    if (x >= 1000) {
+        print(b, "p = 1");
+    } else if (x < 1) {
+        print(b, "p < 0.001");
+    } else {
+        for (; x%10 == 0; x /= 10, d--) {}
+        print(b, "p = 0.");
+        printpad(b, x, d);
+    }
+}
+
+// What tells two formats apart, in order: the pass rate (higher), then
+// failed edits, steps and tokens (fewer).
 enum : i32 {
-    DECIDE_PASS,
-    DECIDE_MISS,
-    DECIDE_STEPS,
-    DECIDE_TOKENS,
-    DECIDE_NONE,
+    CRIT_PASS,
+    CRIT_FAILS,
+    CRIT_STEPS,
+    CRIT_TOKENS,
+    CRIT_COUNT,
 };
 
-// What tells cell a from b as the format to give a model, in order: the
-// pass rate (higher), edit misses, steps and tokens a run (fewer).
-static i32 evaldecide(EvalCell *a, EvalCell *b)
+static Str evalcritnames[] = {"the pass rates", "failed edits", "steps", "tokens"};
+static Str evaldeciders[]  = {
+    "the pass rate decides", "fewer failed edits decide", "fewer steps decide",
+    "fewer tokens decide",
+};
+
+// A format's runs among those that every format of its model made:
+// sums over them all, and by task.
+struct EvalArm {
+    EvalCell *cell;
+    i64       sum[CRIT_COUNT];
+    i64      *bytask;  // ntasks of CRIT_COUNT sums
+};
+
+// Two formats compared task by task, each criterion by a sign test over
+// the tasks whose sums differ. The first criterion whose p is below
+// 0.05 decides, in favor of whichever was better on more tasks.
+struct EvalVerdict {
+    i32 crit;  // what decides, CRIT_COUNT if nothing does
+    b32 x;     // the first format is the better
+    i64 wins[CRIT_COUNT];    // tasks on which the first is better
+    i64 losses[CRIT_COUNT];  // and worse
+    f64 p[CRIT_COUNT];
+};
+
+static EvalVerdict evalverdict(EvalArm *x, EvalArm *y, iz ntasks)
 {
-    if (evalcmp(a->pass, a->runs, b->pass, b->runs)) {
-        return DECIDE_PASS;
-    } else if (evalcmp(a->miss, a->runs, b->miss, b->runs)) {
-        return DECIDE_MISS;
-    } else if (evalcmp(a->steps, a->runs, b->steps, b->runs)) {
-        return DECIDE_STEPS;
-    } else if (evalcmp(a->in+a->out, a->runs, b->in+b->out, b->runs)) {
-        return DECIDE_TOKENS;
+    EvalVerdict r = {};
+    r.crit = CRIT_COUNT;
+    for (i32 c = 0; c < CRIT_COUNT; c++) {
+        for (iz i = 0; i < ntasks; i++) {
+            i64 d = x->bytask[i*CRIT_COUNT+c] - y->bytask[i*CRIT_COUNT+c];
+            d = c==CRIT_PASS ? d : -d;
+            r.wins[c]   += d > 0;
+            r.losses[c] += d < 0;
+        }
+        r.p[c] = evalsign(r.wins[c], r.losses[c]);
+        if (r.crit==CRIT_COUNT && r.p[c]<0.05) {
+            r.crit = c;
+            r.x    = r.wins[c] > r.losses[c];
+        }
     }
-    return DECIDE_NONE;
+    return r;
 }
 
-static b32 evalbetter(EvalCell **pa, EvalCell **pb)
+// Whether arm a comes before b by their sums: the order to list them,
+// not a verdict.
+static b32 evalarmless(EvalArm *a, EvalArm *b)
 {
-    EvalCell *a = *pa, *b = *pb;
-    switch (evaldecide(a, b)) {
-    case DECIDE_PASS:   return evalcmp(a->pass, a->runs, b->pass, b->runs) > 0;
-    case DECIDE_MISS:   return evalcmp(a->miss, a->runs, b->miss, b->runs) < 0;
-    case DECIDE_STEPS:  return evalcmp(a->steps, a->runs, b->steps, b->runs) < 0;
-    case DECIDE_TOKENS: return evalcmp(a->in+a->out, a->runs, b->in+b->out, b->runs) < 0;
+    for (i32 c = 0; c < CRIT_COUNT; c++) {
+        if (a->sum[c] != b->sum[c]) {
+            return c==CRIT_PASS ? a->sum[c]>b->sum[c] : a->sum[c]<b->sum[c];
+        }
     }
     return 0;  // the sort is stable: the usual order stays
+}
+
+// Why one format is better than another, or that neither is.
+static void evalwhy(Buf *b, EvalVerdict *v, b32 flip)
+{
+    i32 last = v->crit<CRIT_COUNT ? v->crit : CRIT_COUNT;
+    if (v->crit == CRIT_COUNT) {
+        print(b, "no measurable difference (");
+    }
+    for (i32 c = 0; c < last; c++) {
+        if (c) {
+            print(b, c+1<last || v->crit==CRIT_COUNT ? Str(", ") : Str(" and "));
+        }
+        print(b, evalcritnames[c]);
+        print(b, v->crit==CRIT_COUNT ? Str(" ") : Str(" ("));
+        evalp(b, v->p[c]);
+        print(b, v->crit==CRIT_COUNT ? Str("") : Str(")"));
+    }
+    if (v->crit == CRIT_COUNT) {
+        print(b, ")");
+        return;
+    } else if (last) {
+        print(b, " cannot be told apart, and ");
+    }
+    i32 c = v->crit;
+    print(b, evaldeciders[c]);
+    print(b, " (better on ");
+    print(b, flip ? v->losses[c] : v->wins[c]);
+    print(b, ", worse on ");
+    print(b, flip ? v->wins[c] : v->losses[c]);
+    print(b, " tasks, ");
+    evalp(b, v->p[c]);
+    print(b, ")");
 }
 
 static b32 evalrowless(EvalCell **a, EvalCell **b)
@@ -1613,10 +1807,177 @@ static void evalfailure(Buf *b, Json *j)
     putbyte(b, '\n');
 }
 
+// The format to give one model run in more than one, fs, from the runs
+// that every one of them made, by the same tasks and repetitions: one
+// that does measurably better than each of the others (evalverdict),
+// else the model's own format, from its own runs or the configuration
+// (owns), kept.
+static void evalchoose(Buf *b, Arena scratch, Slice<EvalCell *> fs, Slice<EvalModel> owns,
+                       b32 endpoints)
+{
+    EvalCell *c   = fs[0];
+    Str       own = {};
+    for (iz i = 0; i < owns.len; i++) {
+        if (owns[i].endpoint==c->endpoint && owns[i].model==c->model) {
+            own = owns[i].own;
+        }
+    }
+    i64 total = 0, passed = 0;
+    for (iz f = 0; f < fs.len; f++) {
+        for (iz i = 0; i < fs[f]->recs.len; i++) {
+            own = fs[f]->recs[i].own ? fs[f]->format : own;
+        }
+        total  += fs[f]->runs;
+        passed += fs[f]->pass;
+    }
+
+    // The runs each format made, the first of a key; those of keys
+    // that every format has; and their tasks
+    Map<EvalRec *> **made = alloc<Map<EvalRec *> *>(&scratch, fs.len);
+    for (iz f = 0; f < fs.len; f++) {
+        for (iz i = 0; i < fs[f]->recs.len; i++) {
+            EvalRec **r = upsert(&made[f], fs[f]->recs[i].key, &scratch);
+            *r = *r ? *r : &fs[f]->recs[i];
+        }
+    }
+    Slice<EvalRec *> shared = {};
+    for (iz i = 0; i < fs[0]->recs.len; i++) {
+        EvalRec *r   = &fs[0]->recs[i];
+        b32      all = *upsert(&made[0], r->key, (Arena *)0) == r;
+        for (iz f = 1; all && f<fs.len; f++) {
+            all = upsert(&made[f], r->key, (Arena *)0) != 0;
+        }
+        if (all) {
+            shared = push(&scratch, shared, r);
+        }
+    }
+    Map<iz> *taskidx = 0;
+    iz       ntasks  = 0;
+    for (iz i = 0; i < shared.len; i++) {
+        iz *k = upsert(&taskidx, shared[i]->task, &scratch);
+        *k = *k ? *k : ++ntasks;  // from 1
+    }
+    Slice<EvalArm> arms = {};
+    for (iz f = 0; f < fs.len; f++) {
+        EvalArm arm = {};
+        arm.cell   = fs[f];
+        arm.bytask = alloc<i64>(&scratch, ntasks*CRIT_COUNT);
+        for (iz i = 0; i < shared.len; i++) {
+            EvalRec *r = *upsert(&made[f], shared[i]->key, (Arena *)0);
+            i64     *t = arm.bytask + (*upsert(&taskidx, r->task, (Arena *)0)-1)*CRIT_COUNT;
+            i64      v[CRIT_COUNT] = {r->pass, r->fails, r->steps, r->tokens};
+            for (i32 k = 0; k < CRIT_COUNT; k++) {
+                t[k]       += v[k];
+                arm.sum[k] += v[k];
+            }
+        }
+        arms = push(&scratch, arms, arm);
+    }
+    sort(arms.data, arms.len, evalarmless, scratch);
+
+    // The winner: better than each other format
+    iz win = -1;
+    for (iz w = 0; shared.len && w<arms.len && win<0; w++) {
+        b32 all = 1;
+        for (iz o = 0; all && o<arms.len; o++) {
+            EvalVerdict v = evalverdict(&arms[w], &arms[o], ntasks);
+            all = o==w || (v.crit<CRIT_COUNT && v.x);
+        }
+        win = all ? w : -1;
+    }
+    if (win > 0) {
+        EvalArm first = arms[win];  // listed first
+        for (iz i = win; i > 0; i--) {
+            arms[i] = arms[i-1];
+        }
+        arms[0] = first;
+        win = 0;
+    }
+
+    print(b, "\n");
+    evalcellname(b, c, endpoints);
+    print(b, ": ");
+    if (!passed) {
+        print(b, "none, since no run passed\n");
+    } else if (!shared.len) {
+        print(b, "no task was run in every format, so nothing compares them\n");
+    } else if (win == 0) {
+        print(b, arms[0].cell->format);
+        print(b, arms[0].cell->format==own ? Str(", its own format already\n")
+                                           : Str("\n"));
+    } else if (own.len) {
+        print(b, "keep ");
+        print(b, own);
+        print(b, ", its own format: none did measurably better at this many runs\n");
+    } else {
+        print(b, "keep its own format: none did measurably better at this many runs\n");
+    }
+    if (!shared.len) {
+        return;
+    }
+    print(b, "\n");
+    for (iz i = 0; i < arms.len; i++) {
+        EvalArm *r = &arms[i];
+        print(b, "- ");
+        print(b, r->cell->format);
+        print(b, ": ");
+        print(b, r->sum[CRIT_PASS]);
+        putbyte(b, '/');
+        print(b, (i64)shared.len);
+        print(b, " passed, ");
+        evalmean(b, r->sum[CRIT_FAILS], shared.len, 2);
+        print(b, " failed edits, ");
+        evalmean(b, r->sum[CRIT_STEPS], shared.len, 1);
+        print(b, " steps and ");
+        evalmean(b, r->sum[CRIT_TOKENS], shared.len, 0);
+        print(b, " tokens a run\n");
+    }
+    if (!passed) {
+        return;
+    }
+
+    print(b, "\nOn the ");
+    print(b, (i64)shared.len);
+    print(b, shared.len==1 ? Str(" run") : Str(" runs"));
+    print(b, " of each format with the same tasks and repetitions, by the ");
+    print(b, (i64)ntasks);
+    print(b, ntasks==1 ? Str(" task") : Str(" tasks"));
+    print(b, " (sign tests");
+    i64 left = total - (i64)(shared.len*fs.len);
+    if (left) {
+        print(b, "; ");
+        print(b, left);
+        print(b, left==1 ? Str(" run") : Str(" runs"));
+        print(b, " that not every format made left out");
+    }
+    print(b, "):\n\n");
+    iz from = win==0 ? 1 : arms.len;  // the winner's comparisons, or all
+    for (iz i = 0; i < from; i++) {
+        for (iz k = i+1; k < arms.len; k++) {
+            EvalVerdict v    = evalverdict(&arms[i], &arms[k], ntasks);
+            b32         flip = v.crit<CRIT_COUNT && !v.x;
+            print(b, "- ");
+            print(b, arms[flip ? k : i].cell->format);
+            print(b, v.crit<CRIT_COUNT ? Str(" over ") : Str(" and "));
+            print(b, arms[flip ? i : k].cell->format);
+            print(b, ": ");
+            evalwhy(b, &v, flip);
+            print(b, ".\n");
+        }
+    }
+    if (win==0 && arms[0].cell->format!=own) {
+        print(b, "\n    [model ");
+        print(b, c->model);
+        print(b, "]\n    edit_format = ");
+        print(b, arms[0].cell->format);
+        putbyte(b, '\n');
+    }
+}
+
 // The summary of results lines: a table by model and format, the runs
 // that failed, and the format each model should get, with the numbers
-// behind it.
-static Str evalsummary(Arena *a, Arena scratch, Slice<Str> lines)
+// behind it. owns has the models' own formats where known.
+static Str evalsummary(Arena *a, Arena scratch, Slice<Str> lines, Slice<EvalModel> owns)
 {
     EvalCell  *cells = 0;
     EvalCell **tail  = &cells;
@@ -1655,14 +2016,16 @@ static Str evalsummary(Arena *a, Arena scratch, Slice<Str> lines)
             c->errors++;
             continue;
         }
-        Json *errs = jsonget(j, "errors");
-        Json *tok  = jsonget(j, "tokens");
-        b32   pass = jsonbool(jsonget(j, "pass"), 0);
+        Json *errs  = jsonget(j, "errors");
+        Json *tok   = jsonget(j, "tokens");
+        b32   pass  = jsonbool(jsonget(j, "pass"), 0);
+        i64   miss  = jsonint(jsonget(errs, "miss"), 0);
+        i64   efail = jsonint(jsonget(j, "edit_fails"), miss);  // older lines
         c->runs++;
         c->pass    += pass;
         c->steps   += jsonint(jsonget(j, "steps"), 0);
         c->calls   += jsonint(jsonget(j, "calls"), 0);
-        c->miss    += jsonint(jsonget(errs, "miss"), 0);
+        c->fails   += efail;
         c->bad     += jsonint(jsonget(errs, "args"), 0) +
                       jsonint(jsonget(errs, "unknown"), 0) +
                       jsonint(jsonget(errs, "loop"), 0);
@@ -1685,6 +2048,22 @@ static Str evalsummary(Arena *a, Arena scratch, Slice<Str> lines)
         if (!pass && nfail++<50) {
             evalfailure(&fails, j);
         }
+
+        EvalRec r = {};
+        Buf     k(a, 128);
+        print(&k, jsonstr(jsonget(j, "suite")));
+        putbyte(&k, '\t');
+        print(&k, jsonstr(jsonget(j, "task")));
+        r.task = finish(&k);
+        putbyte(&k, '\t');
+        print(&k, jsonint(jsonget(j, "rep"), 0));
+        r.key    = finish(&k);
+        r.own    = jsonbool(jsonget(j, "own"), 0);
+        r.pass   = pass;
+        r.fails  = efail;
+        r.steps  = jsonint(jsonget(j, "steps"), 0);
+        r.tokens = jsonint(jsonget(tok, "in"), 0) + jsonint(jsonget(tok, "out"), 0);
+        c->recs  = push(a, c->recs, r);
     }
 
     // Rows by model, each model's formats in their usual order
@@ -1695,7 +2074,7 @@ static Str evalsummary(Arena *a, Arena scratch, Slice<Str> lines)
     sort(rows.data, rows.len, evalrowless, scratch);
 
     Buf b(a, 4096);
-    print(&b, "| model | format | runs | pass | steps | calls | edit misses "
+    print(&b, "| model | format | runs | pass | steps | calls | failed edits "
               "| bad calls | denials | repairs | tokens in | cached | tokens out "
               "| retries | time s |\n");
     print(&b, "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
@@ -1721,7 +2100,7 @@ static Str evalsummary(Arena *a, Arena scratch, Slice<Str> lines)
         print(&b, " | ");
         evalmean(&b, c->calls, c->runs, 1);
         print(&b, " | ");
-        print(&b, c->miss);
+        print(&b, c->fails);
         print(&b, " | ");
         print(&b, c->bad);
         print(&b, " | ");
@@ -1740,10 +2119,11 @@ static Str evalsummary(Arena *a, Arena scratch, Slice<Str> lines)
         evalmean(&b, c->ms, c->runs*1000, 1);
         print(&b, " |\n");
     }
-    print(&b, "\nSteps, calls, tokens and time are means a run; edit misses, "
-              "bad calls (invalid arguments, unknown tools, repeated calls), "
-              "denials, repairs and retries are totals. Time leaves out waits "
-              "in the endpoint's queue.\n");
+    print(&b, "\nSteps, calls, tokens and time are means a run; failed edits "
+              "(edit calls that failed, whether the change did not apply or "
+              "the call was invalid), bad calls (invalid arguments, unknown "
+              "tools, repeated calls), denials, repairs and retries are "
+              "totals. Time leaves out waits in the endpoint's queue.\n");
     if (errors) {
         print(&b, "\n");
         print(&b, errors);
@@ -1818,61 +2198,7 @@ static Str evalsummary(Arena *a, Arena scratch, Slice<Str> lines)
             print(&b, "\n## Edit format by model\n");
             heading = 1;
         }
-        sort(fs.data, fs.len, evalbetter, scratch);
-        EvalCell *best = fs[0];
-        EvalCell *next = fs[1];
-        print(&b, "\n");
-        evalcellname(&b, best, endpoints);
-        print(&b, ": ");
-        print(&b, best->pass ? best->format : Str("none, since no run passed"));
-        print(&b, "\n\n");
-        for (iz i = 0; i < fs.len; i++) {
-            EvalCell *r = fs[i];
-            print(&b, "- ");
-            print(&b, r->format);
-            print(&b, ": ");
-            print(&b, r->pass);
-            putbyte(&b, '/');
-            print(&b, r->runs);
-            print(&b, " passed, ");
-            evalmean(&b, r->miss, r->runs, 2);
-            print(&b, " edit misses, ");
-            evalmean(&b, r->steps, r->runs, 1);
-            print(&b, " steps and ");
-            evalmean(&b, r->in + r->out, r->runs, 0);
-            print(&b, " tokens a run\n");
-        }
-
-        if (!best->pass) {
-            continue;
-        }
-        print(&b, "\n");
-        EvalInterval x = evalwilson(best->pass, best->runs);
-        EvalInterval y = evalwilson(next->pass, next->runs);
-        i32          d = evaldecide(best, next);
-        if (d != DECIDE_PASS) {
-            print(&b, "The pass rates are equal");
-        } else if (y.hi < x.lo) {
-            print(&b, "The pass rate is better beyond chance (their 95% "
-                      "intervals do not overlap)");
-        } else {
-            print(&b, "The pass rates differ by no more than chance would at "
-                      "this many runs (their 95% intervals overlap)");
-        }
-        static Str const deciders[] = {
-            "; the pass rate decides.\n",
-            ", and fewer edit misses decide.\n",
-            ", and fewer steps decide.\n",
-            ", and fewer tokens decide.\n",
-            ", and nothing else tells them apart: the first in the usual "
-            "order is taken.\n",
-        };
-        print(&b, deciders[d]);
-        print(&b, "\n    [model ");
-        print(&b, best->model);
-        print(&b, "]\n    edit_format = ");
-        print(&b, best->format);
-        putbyte(&b, '\n');
+        evalchoose(&b, scratch, fs, owns, endpoints);
     }
     return finish(&b);
 }
@@ -1894,6 +2220,31 @@ static Slice<Str> evallines(Os *os, Arena *a, Slice<Str> paths, b32 *ok)
                 r = push(a, r, c.head);
             }
             rest = c.tail;
+        }
+    }
+    return r;
+}
+
+// Each model of results lines, with its own edit format as the
+// configuration has it, for the summary.
+static Slice<EvalModel> evalowns(Arena *a, Arena scratch, Slice<Str> lines, Config *cfg)
+{
+    Slice<EvalModel> r = {};
+    for (iz i = 0; i < lines.len; i++) {
+        Arena t = scratch;
+        Json *j = jsonparse(&t, lines[i]).root;
+        Str   e = jsonstr(jsonget(j, "endpoint"));
+        Str   m = jsonstr(jsonget(j, "model"));
+        b32   seen = 0;
+        for (iz k = 0; k < r.len; k++) {
+            seen |= r[k].endpoint==e && r[k].model==m;
+        }
+        if (!seen && m.len) {
+            EvalModel x = {};
+            x.endpoint = clone(a, e);
+            x.model    = clone(a, m);
+            x.own      = editnames[editformat(cfgget(cfg, "model", m, "edit_format", 0))];
+            r = push(a, r, x);
         }
     }
     return r;
@@ -1983,7 +2334,13 @@ static i32 evalmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             os_print(os, 2, "prospero: cannot read a results file\n");
             return 2;
         }
-        os_print(os, 1, evalsummary(&perm, scratch, lines));
+        // The configuration, for the models' own formats, fetches nothing
+        Config *cfg = cliconfig(os, &perm, scratch, config, state, CFG_NETNONE);
+        if (!cfg) {
+            return 2;
+        }
+        Slice<EvalModel> owns = evalowns(&perm, scratch, lines, cfg);
+        os_print(os, 1, evalsummary(&perm, scratch, lines, owns));
         return 0;
     }
 
@@ -2018,9 +2375,10 @@ static i32 evalmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 
     // Before the engine owns the configuration: the models and endpoints
     Eval ev = {};
-    ev.os   = os;
-    ev.keep = keep;
-    ev.jobs = (i32)jobs;
+    ev.os     = os;
+    ev.keep   = keep;
+    ev.jobs   = (i32)jobs;
+    ev.silent = ev.jobs>EVAL_SILENT ? ev.jobs : (i32)EVAL_SILENT;
     Str root = tempdir(os, &perm);
     Buf name(&perm, 32);
     print(&name, "prospero-eval-");
@@ -2043,8 +2401,10 @@ static i32 evalmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     }
     Slice<EvalModel> ms = {};
     for (iz i = 0; i < models.len; i++) {
-        EvalModel m = {defep, models[i]};
+        EvalModel m = {};
         Cut       c = cut(models[i], '/');
+        m.endpoint = defep;
+        m.model    = models[i];
         if (c.ok && c.tail.len && trim(cfgget(cfg, "endpoint", c.head, "url", 0)).len) {
             m.endpoint = c.head;
             m.model    = c.tail;
@@ -2132,7 +2492,9 @@ static i32 evalmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         b32        ok    = 0;
         Slice<Str> paths = {};
         paths = push(&perm, paths, outpath);
-        os_print(os, 1, evalsummary(&perm, scratch, evallines(os, &perm, paths, &ok)));
+        Slice<Str>       lines = evallines(os, &perm, paths, &ok);
+        Slice<EvalModel> owns  = evalowns(&perm, scratch, lines, cfg);
+        os_print(os, 1, evalsummary(&perm, scratch, lines, owns));
         return 0;
     }
     Str sessions = join(&perm, ev.statedir, "sessions");
@@ -2150,8 +2512,9 @@ static i32 evalmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         os_print(os, 2, "prospero: cannot start the engine\n");
         return 2;
     }
-    ev.te  = ev.e->te;
-    ev.env = ev.e->env;
+    ev.te      = ev.e->te;
+    ev.env     = ev.e->env;
+    ev.secrets = cfgsecrets(cfg, &perm);  // before the engine owns cfg
     if (!enginestart(ev.e)) {
         os_print(os, 2, "prospero: cannot start the engine\n");
         return 2;
@@ -2159,7 +2522,12 @@ static i32 evalmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 
     for (;;) {
         for (; ev.next<ev.runs.len && ev.nlive<ev.jobs; ev.next++) {
-            evalstart(&ev, scratch, &perm, ev.runs[ev.next]);
+            EvalRun *run = ev.runs[ev.next];
+            if (run->model->dropped) {
+                ev.skipped++;
+                continue;
+            }
+            evalstart(&ev, scratch, &perm, run);
         }
         if (!ev.nlive && ev.next==ev.runs.len) {
             break;
@@ -2213,7 +2581,18 @@ static i32 evalmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     b32        ok    = 0;
     Slice<Str> paths = {};
     paths = push(&perm, paths, outpath);
-    Slice<Str> lines = evallines(os, &perm, paths, &ok);
-    os_print(os, 1, evalsummary(&perm, scratch, lines));
+    Slice<Str>       lines = evallines(os, &perm, paths, &ok);
+    Slice<EvalModel> owns  = evalowns(&perm, scratch, lines, cfg);  // the engine is done
+    os_print(os, 1, evalsummary(&perm, scratch, lines, owns));
+    if (ev.skipped) {
+        Buf b(&scratch, 256);
+        print(&b, "eval: ");
+        print(&b, ev.skipped);
+        print(&b, ev.skipped==1 ? Str(" run was") : Str(" runs were"));
+        print(&b, " left out, their models never answering; an eval run "
+                  "again makes them\n");
+        os_print(os, 2, finish(&b));
+        return 1;
+    }
     return 0;
 }

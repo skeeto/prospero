@@ -370,6 +370,7 @@ enum : i32 {
     THINK_ADAPTIVE,  // the model decides how much
     THINK_BUDGET,    // a fixed budget of tokens, for older models
     THINK_OFF,       // sent as disabled
+    THINK_BETWEEN,   // between_tools: Sonnet 5.5's off
     THINK_DEFAULT,   // not sent: the model's own default
 };
 
@@ -592,6 +593,7 @@ struct Chunk {
     Slice<Delta> deltas;
     b32          content;   // text, reasoning, or arguments arrived
     b32          prefill;   // prompt_progress arrived
+    b32          hidden;    // reasoning goes on unseen (anchunk)
     i64          ptotal;
     i64          pdone;
     i64          pcached;

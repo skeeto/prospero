@@ -147,7 +147,11 @@ static EdgeSec *edgesec()
     return ok ? &s : nullptr;
 }
 
-// Certificates as an array, or null.
+// Certificates as an array, or null. The list stops at the first that
+// the system cannot read: one that mbedTLS took (a leaf with a length
+// in BER, say) must never be left out, or the next would be judged in
+// its place, so that a leaf the handshake proved, but the system never
+// saw, would be trusted on another's chain. No leaf, no array.
 static CFRef edgecerts(EdgeSec *s, mbedtls_x509_crt const *chain)
 {
     CFRef certs[16];  // the leaf first; the system may find the rest
@@ -158,9 +162,10 @@ static CFRef edgecerts(EdgeSec *s, mbedtls_x509_crt const *chain)
         if (data) {
             s->release(data);
         }
-        if (cert) {
-            certs[n++] = cert;
+        if (!cert) {
+            break;
         }
+        certs[n++] = cert;
     }
     CFRef r = n ? s->arraynew(0, certs, n, s->arraycb) : nullptr;
     for (long i = 0; i < n; i++) {

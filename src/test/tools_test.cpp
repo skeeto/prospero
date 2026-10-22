@@ -469,8 +469,12 @@ static void test_tools(Test *t)
     // The shell
     {
         Str inherited[] = {"PATH=/bin", "GIT_DIR=/elsewhere", "git_dir=/x", "PAGER=less",
-                           "HOME=/h", "=C:=C:\\x"};
-        Slice<Str> env = shellenv(a, {inherited, countof(inherited), countof(inherited)}, 0);
+                           "HOME=/h", "=C:=C:\\x", "MY_KEY=sk-123", "my_key=lower",
+                           "MY_KEYS=kept"};
+        Str secret[] = {"MY_KEY"};
+        Slice<Str> secrets = {secret, countof(secret), countof(secret)};
+        Slice<Str> env = shellenv(a, {inherited, countof(inherited), countof(inherited)}, 0,
+                                  secrets);
         Buf b(a, 4096);
         for (iz i = 0; i < env.len; i++) {
             print(&b, env[i]);
@@ -482,15 +486,19 @@ static void test_tools(Test *t)
         expect(t, "env pager", istr(a, find(all, "PAGER=cat\n")>=0 && find(all, "PAGER=less")<0), "1");
         expect(t, "env prospero", istr(a, find(all, "\nPROSPERO=1\n")>0), "1");
         expect(t, "env keeps the rest", istr(a, find(all, "HOME=/h\n")>=0), "1");
+        expect(t, "env drops secrets", istr(a, find(all, "sk-123")<0 &&
+               find(all, "my_key=lower\n")>=0 && find(all, "MY_KEYS=kept\n")>=0), "1");
 
-        Slice<Str> wenv = shellenv(a, {inherited, countof(inherited), countof(inherited)}, 1);
-        b32 gitdir = 0, drive = 0, utf8 = 0;
+        Slice<Str> wenv = shellenv(a, {inherited, countof(inherited), countof(inherited)}, 1,
+                                   secrets);
+        b32 gitdir = 0, drive = 0, utf8 = 0, key = 0;
         for (iz i = 0; i < wenv.len; i++) {
             gitdir |= equalfold(cut(wenv[i], '=').head, "git_dir");
             drive  |= wenv[i] == "=C:=C:\\x";
             utf8   |= wenv[i] == "PYTHONUTF8=1";
+            key    |= equalfold(cut(wenv[i], '=').head, "my_key");
         }
-        expect(t, "env windows", istr(a, !gitdir && drive && utf8), "1");
+        expect(t, "env windows", istr(a, !gitdir && drive && utf8 && !key), "1");
 
         ToolEnv te = {};
         te.shell     = "C:\\bb\\busybox.exe";

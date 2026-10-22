@@ -519,6 +519,7 @@ class T:
         # Endpoint settings, with "_top" settings before any section,
         # "_path" after the endpoint's URL, "_extra" as more sections,
         # where {model} and {model2} are the scenario's model names, and
+        # {nonce} its own part of a model name (evalmodel), and
         # any other "_name" as the section [name] ("_guard" in [guard],
         # "_tools" in [tools] and so on)
         top = conf.pop("_top", {})
@@ -533,7 +534,7 @@ class T:
             f"{k} = {v}\n" for k, v in ini.items())
         for name, settings in sections.items():
             body += f"[{name}]\n" + "".join(f"{k} = {v}\n" for k, v in settings.items())
-        body += extra.format(model=self.model, model2=self.model2)
+        body += extra.format(model=self.model, model2=self.model2, nonce=self.nonce)
         host.write(self.config, body)
         self.notes = []
 
@@ -3669,7 +3670,9 @@ def an_pause(t):
 
 @scenario(conf=AN, bound=8)
 def an_refusal(t):
-    """refusal ends the turn with a note that says why."""
+    """refusal ends the turn with a note that says why. The declined
+    response is shown and logged, but never sent back, its reasoning
+    neither: the next turn goes on from the prompt before it."""
     r = t.run(env=ANENV)
     t.check(r.rc == 1, f"exit {r.rc}: {r.stderr}")
     end = r.last("turn.end")
@@ -3678,8 +3681,17 @@ def an_refusal(t):
     notes = [n["text"] for n in r.all("note") if n.get("level") == "error"]
     t.check(any("category cyber: This request was declined." in n for n in notes),
             f"notes {notes}")
-    t.check(r.all("assistant")[0]["finish"] == "refusal", "finish refusal")
+    rec = r.all("assistant")[0]
+    t.check(rec["finish"] == "refusal" and
+            [b["t"] for b in rec["blocks"]] == ["think", "text"], f"recorded {rec}")
     t.check(len(t.requests()) == 1, "no retry")
+    r2 = t.run("next", resume=r.events[0]["sid"], env=ANENV)
+    anok(t, r2)
+    msgs = t.requests()[1]["body"]["messages"]
+    t.check([m["role"] for m in msgs] == ["user"] and
+            [b.get("text") for b in msgs[0]["content"]] == ["go", "next"],
+            f"sent again: {msgs}")
+    t.check(r2.text() == "Another time, then.", f"text {r2.text()!r}")
 
 
 @scenario(conf=AN, bound=20, alone=True)
@@ -3780,6 +3792,103 @@ def an_auth(t):
             f"unset: {end}")
 
 
+@scenario(conf=AN, bound=8)
+def an_env(t):
+    """A command the agent runs never has the variable that the endpoint's
+    key comes from (key = env:NAME), so neither its output nor any
+    request holds the key; other variables pass."""
+    r = t.run(env=dict(ANENV, PROSPERO_TEST_OTHER="passes-through"))
+    anok(t, r)
+    ends = r.all("tool.end")
+    t.check(len(ends) == 1 and ends[0]["status"] == "ok" and
+            "PROSPERO_TEST_OTHER=passes-through" in ends[0]["text"], f"env ran: {ends}")
+    t.check("PROSPERO_TEST_KEY" not in ends[0]["text"] and
+            fake_provider.AN_KEY not in json.dumps(r.events), "the key is not in the output")
+    reqs = t.requests()
+    t.check(len(reqs) == 2 and
+            not any(fake_provider.AN_KEY in json.dumps(x["body"]) for x in reqs),
+            "nor in a request")
+
+
+@scenario(conf=AN, bound=20, alone=True)
+def an_compact_refusal(t):
+    """The summarizer declines part way through: its partial summary is
+    never used, and nothing is asked again, which would decline alike;
+    the turn ends saying why."""
+    bigfiles(t, 4, 100)
+    r = t.run(env=ANENV)
+    t.check(r.rc == 1, f"exit {r.rc}: {r.stderr}")
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "summarizer declined (refusal)" in end.get("err", ""),
+            f"turn end {end}")
+    t.check(not r.all("compact") and not r.all("retry"),
+            f"no summary, no retry: {r.all('compact')} {r.all('retry')}")
+    t.check(len(t.compactions()) == 1 and len(t.requests()) == 5,
+            f"{len(t.compactions())} summaries, {len(t.requests())} requests")
+    notes = [n["text"] for n in r.all("note") if n.get("level") == "error"]
+    t.check(any("category cyber: This request was declined." in n and "compactor" in n
+                for n in notes), f"notes {notes}")
+
+
+@scenario(conf=AN, bound=20, alone=True)
+def an_compact_length(t):
+    """A summary cut off at the output limit is never used: the turn ends
+    saying so."""
+    bigfiles(t, 4, 100)
+    r = t.run(env=ANENV)
+    t.check(r.rc == 1, f"exit {r.rc}: {r.stderr}")
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "cut off at the length limit" in end.get("err", ""),
+            f"turn end {end}")
+    t.check(not r.all("compact") and not r.all("retry") and len(t.compactions()) == 1,
+            f"no summary, no retry: {r.all('compact')} {r.all('retry')}")
+
+
+HIDDEN = dict(AN, _extra="[model {model}]\nthinking_display = omitted\n")
+
+
+@scenario(conf=HIDDEN, bound=15)
+def an_hidden(t):
+    """Reasoning not shown streams pings alone until its signature: they
+    are progress, so 9 s of it pass the 6 s progress watchdog."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    t.check(not r.all("retry"), f"no retries: {r.all('retry')}")
+    t.check(t.requests()[0]["body"]["thinking"] ==
+            {"type": "adaptive", "display": "omitted"}, "omitted")
+    t.check(r.text() == "Thought it through.", f"text {r.text()!r}")
+    blocks = r.all("assistant")[0]["blocks"]
+    t.check(blocks[0]["t"] == "think" and blocks[0].get("sig"), f"blocks {blocks}")
+
+
+@scenario(conf=dict(HIDDEN, _extra="[model {model}]\nthinking_display = omitted\n"
+                                   "max_tokens = 20\n"), bound=20)
+def an_hidden_bound(t):
+    """Pings of unseen reasoning are progress only for as long as
+    max_tokens would take at 10 tokens a second, here 2 s: then the
+    progress watchdog ends a stream that pings forever."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    rs = r.all("retry")
+    t.check(len(rs) == 1 and rs[0]["class"] == "transient" and
+            "no progress for 6 s" in rs[0]["msg"], f"retries {rs}")
+    reqs = t.requests()
+    took = reqs[1]["t"] - reqs[0]["t"]
+    t.check(len(reqs) == 2 and 7 < took < 14, f"{len(reqs)} requests, {took:.1f} s apart")
+    t.check(r.text() == "Answered at last.", f"text {r.text()!r}")
+
+
+@scenario(conf=dict(AN, _extra="[model {model}]\nthinking = between_tools\n"
+                               "thinking_display = omitted\n"), bound=5)
+def an_between(t):
+    """thinking = between_tools, Sonnet 5.5's off, goes alone, with no
+    display, which the API refuses with it."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    t.check(t.requests()[0]["body"]["thinking"] == {"type": "between_tools"},
+            f"thinking {t.requests()[0]['body'].get('thinking')}")
+
+
 # prospero eval: suites of tasks run against the scripted agents of
 # fake_provider.py (sc_eval_*), whose numbers are known
 
@@ -3828,32 +3937,39 @@ def evalcell(recs, model, fmt):
     return [r for r in recs if r["model"] == model and r["format"] == fmt]
 
 
-@scenario(bound=30, alone=True)
+@scenario(bound=40, alone=True)
 def eval_formats(t):
-    """Three scripted agents in every edit format, twice: the numbers each
+    """Four scripted agents in every edit format, twice: the numbers each
     run records, the summary's table, and the format chosen for each, on
-    known behavior. Run again, nothing is made twice."""
+    known behavior. A failed edit counts the same in every format, how
+    each format's edits typically fail aside. Run again, nothing is made
+    twice."""
     good = evalmodel(t, "eval_good")
     flaky = evalmodel(t, "eval_flaky")
     bad = evalmodel(t, "eval_bad")
+    badpatch = evalmodel(t, "eval_badpatch")
     suite = ("suite", EVAL_SUITE)
-    rc, recs, out, err = evalrun(t, suite, [good, flaky, bad], ["-f", "all", "-n", "2", "-j", "3"])
+    models = [good, flaky, bad, badpatch]
+    rc, recs, out, err = evalrun(t, suite, models, ["-f", "all", "-n", "2", "-j", "3"])
     t.check(rc == 0, f"exit {rc}: {err[-2000:]}")
-    t.check(len(recs) == 36 and not any("error" in r for r in recs),
+    t.check(len(recs) == 48 and not any("error" in r for r in recs),
             f"{len(recs)} records: {[r for r in recs if 'error' in r][:2]}")
     t.check({(r["task"], r["rep"]) for r in recs} ==
             {("typo", 1), ("typo", 2), ("count", 1), ("count", 2)}, "every task twice")
-    # (model, format): passes, steps, edit misses, of 4 runs
-    want = {(good, f): (4, 3, 0) for f in ("replace", "patch", "hashline")}
-    want.update({(flaky, "hashline"): (4, 3, 0), (flaky, "replace"): (4, 4, 1),
-                 (flaky, "patch"): (0, 3, 1)})
-    want.update({(bad, f): (0, 3, 1) for f in ("replace", "patch", "hashline")})
-    for (model, fmt), (passes, steps, miss) in want.items():
+    # (model, format): passes, steps, failed edits, of them misses, of 4 runs
+    want = {(good, f): (4, 3, 0, 0) for f in ("replace", "patch", "hashline")}
+    want.update({(flaky, "hashline"): (4, 3, 0, 0), (flaky, "replace"): (4, 4, 1, 1),
+                 (flaky, "patch"): (0, 3, 1, 1)})
+    want.update({(bad, f): (0, 3, 1, 1) for f in ("replace", "patch", "hashline")})
+    want.update({(badpatch, f): (4, 4, 1, int(f != "patch"))
+                 for f in ("replace", "patch", "hashline")})
+    for (model, fmt), (passes, steps, fails, miss) in want.items():
         rs = evalcell(recs, model, fmt)
         got = (sum(r["pass"] for r in rs), {r["steps"] for r in rs},
-               {r["errors"]["miss"] for r in rs})
-        t.check(len(rs) == 4 and got == (passes, {steps}, {miss}),
-                f"{model} {fmt}: {got}, want {(passes, steps, miss)}")
+               {r["edit_fails"] for r in rs}, {r["errors"]["miss"] for r in rs},
+               {r["errors"]["args"] for r in rs})
+        t.check(len(rs) == 4 and got == (passes, {steps}, {fails}, {miss}, {fails - miss}),
+                f"{model} {fmt}: {got}, want {(passes, steps, fails, miss)}")
         t.check(all(r["tokens"] == {"in": 100 * steps, "out": 10 * steps,
                                     "cached": 40 * steps, "written": 0} and
                     r["edits"] == steps - 2 and r["reads"] == 1 and
@@ -3870,27 +3986,38 @@ def eval_formats(t):
 
     t.check(f"| {flaky} | replace | 4 | 100.0% (4) | 4.0 | 3.0 | 4 | 0 | 0 | 0 | 400 | 160 "
             f"| 40 | 0 |" in out, f"table:\n{out}")
-    t.check(f"{flaky}: hashline\n" in out and "fewer edit misses decide" in out and
-            f"[model {flaky}]\n    edit_format = hashline\n" in out, f"flaky's format:\n{out}")
-    t.check(f"{good}: replace\n" in out and "nothing else tells them apart" in out,
-            f"good's format:\n{out}")
+    for fmt, bad_ in (("replace", 0), ("patch", 4), ("hashline", 0)):
+        t.check(f"| {badpatch} | {fmt} | 4 | 100.0% (4) | 4.0 | 3.0 | 4 | {bad_} |" in out,
+                f"{fmt}'s failed edits alike:\n{out}")
+    # Two tasks tell nothing apart beyond chance: each keeps its own
+    # format, replace, as the configuration has none
+    for m in (good, flaky, badpatch):
+        t.check(f"{m}: keep replace, its own format: none did measurably better "
+                f"at this many runs\n" in out and f"[model {m}]" not in out,
+                f"{m}'s format:\n{out}")
+    t.check(f"- hashline and patch: no measurable difference (the pass rates p = 0.5, "
+            in out, f"flaky's verdicts:\n{out}")
     t.check(f"{bad}: none, since no run passed" in out, f"bad's format:\n{out}")
-    t.check("[36/36]" in err, f"progress: {err[-500:]}")
+    t.check("[48/48]" in err, f"progress: {err[-500:]}")
 
     # Again: every run is in the results file already
-    rc, again, out2, err = evalrun(t, suite, [good, flaky, bad], ["-f", "all", "-n", "2"])
-    t.check(rc == 0 and len(again) == 36 and "0 runs to make, 36 made before" in err,
+    rc, again, out2, err = evalrun(t, suite, models, ["-f", "all", "-n", "2"])
+    t.check(rc == 0 and len(again) == 48 and "0 runs to make, 48 made before" in err,
             f"again: {rc} {len(again)} {err[-500:]}")
     t.check(out2 == out, "the same summary")
-    p = t.host.popen(["eval", "--report", t.host.join(t.base, "results.jsonl")], t.work)
+    p = t.host.popen(["eval", "--report", "-c", t.config,
+                      t.host.join(t.base, "results.jsonl")], t.work)
     report, _ = p.communicate(timeout=20)
     t.check(p.returncode == 0 and report == out, f"--report:\n{report}")
 
 
-@scenario(bound=30)
+@scenario(conf={"_extra": "[model fake:eval_limit:{nonce}]\n"
+                          "fallback = fake:eval_limit_b:{nonce}\n"}, bound=30)
 def eval_limits(t):
     """A run's time and step limits, and what it records of retries,
-    denials and repairs on its way."""
+    denials and repairs on its way. A model out of quota answers nothing,
+    so its run could not be made: the model's fallback, which would have
+    answered, is never taken in a run."""
     suite = {"typo.ini": "prompt = Change wrold to world in greet.txt.\nfixture = base\n"
                          "patch = typo.patch\nexpect = base\ntimeout = 3\nsteps = 6\n",
              "base/greet.txt": EVAL_SUITE["base/greet.txt"],
@@ -3898,8 +4025,11 @@ def eval_limits(t):
     mixed = evalmodel(t, "eval_mixed")
     slow = evalmodel(t, "eval_slow")
     busy = evalmodel(t, "eval_busy")
-    rc, recs, out, err = evalrun(t, ("lim", suite), [mixed, slow, busy], ["-f", "replace", "-j", "3"])
-    t.check(rc == 0 and len(recs) == 3, f"exit {rc}, {len(recs)} records: {err[-2000:]}")
+    limit = evalmodel(t, "eval_limit")
+    fallback = evalmodel(t, "eval_limit_b")
+    rc, recs, out, err = evalrun(t, ("lim", suite), [mixed, slow, busy, limit],
+                                 ["-f", "replace", "-j", "4"])
+    t.check(rc == 0 and len(recs) == 4, f"exit {rc}, {len(recs)} records: {err[-2000:]}")
     by = {r["model"]: r for r in recs}
     m = by[mixed]
     t.check(m["pass"] and m["why"] == "done" and m["steps"] == 4 and m["retries"] == 1 and
@@ -3911,6 +4041,11 @@ def eval_limits(t):
     t.check(not s["pass"] and s["why"] == "timeout" and s["steps"] == 0 and
             "longer than its limit of 3 s" in s["err"] and 2900 <= s["wall_ms"] < 6000,
             f"slow: {s}")
+    q = by[limit]
+    t.check(q.get("error", "").startswith("the model never answered: limit: HTTP 429") and
+            len(t.requests(limit)) == 1 and not t.requests(fallback),
+            f"limit: {q}, {len(t.requests(limit))} and {len(t.requests(fallback))} requests")
+    t.check("1 run could not be made" in out, f"summary:\n{out}")
     b = by[busy]
     t.check(not b["pass"] and b["why"] == "budget" and b["steps"] == 6 and
             b["err"] == "the turn reached its limit of 6 model requests", f"busy: {b}")
@@ -3924,8 +4059,8 @@ def eval_queue(t):
     """Runs at once share an endpoint that takes one request at a time:
     the waits are not the runs' time, which would pass their limit. Each
     run takes three responses of 1.5 s, and four take 18 s in all, but
-    their limit of 12 s leaves room for a slow disk's syncs (rat.local's
-    SD card stalls for seconds), which are the run's own time."""
+    their limit of 12 s leaves room for a slow disk's syncs (a Raspberry
+    Pi's SD card stalls for seconds), which are the run's own time."""
     suite = {"suite.ini": "timeout = 12\n", **{k: v for k, v in EVAL_SUITE.items()
                                               if k != "suite.ini"}}
     patient = evalmodel(t, "eval_patient")
@@ -4059,6 +4194,93 @@ def eval_errors(t):
     bad = {"x.ini": "prompt = hi\ntools = read frobnicate\ncheck = true\n"}
     rc, recs, out, err = evalrun(t, ("badsuite", bad), [good], out="bad.jsonl")
     t.check(rc == 2 and "no such tool: frobnicate" in err and not recs, f"{rc}: {err}")
+
+    # One file with both prompt and prompt_file; and a fixture with a .git
+    # file, a worktree's, which a copy would share with its repository
+    both = {"x.ini": "prompt = hi\nprompt_file = p.md\ncheck = true\n", "p.md": "hi\n"}
+    rc, recs, out, err = evalrun(t, ("both", both), [good], out="both.jsonl")
+    t.check(rc == 2 and "both prompt and prompt_file are set" in err and not recs,
+            f"{rc}: {err}")
+    wt = {"x.ini": "prompt = Change one to two in count.txt.\nfixture = count\ncheck = true\n",
+          "count/count.txt": "one\n", "count/.git": "gitdir: /elsewhere/.git/worktrees/x\n"}
+    rc, recs, out, err = evalrun(t, ("wt", wt), [good], out="wt.jsonl")
+    t.check(rc == 2 and ".git is a file, which points at the git directory of another "
+            "repository" in err and not recs, f"{rc}: {err}")
+
+
+@scenario(bound=20)
+def eval_prompts(t):
+    """A task's own prompt, of either key, over suite.ini's."""
+    suite = {"suite.ini": "prompt_file = common.txt\n",
+             "common.txt": "Change one to two in count.txt.\n",
+             "typo.ini": "prompt = Change wrold to world in greet.txt.\nfixture = base\n"
+                         "patch = typo.patch\nexpect = base\n",
+             "typo.patch": EVAL_SUITE["typo.patch"],
+             "base/greet.txt": EVAL_SUITE["base/greet.txt"],
+             "count.ini": "fixture = count\ncheck = grep -qx two count.txt\n",
+             "count/count.txt": "one\n"}
+    good = evalmodel(t, "eval_good")
+    rc, recs, out, err = evalrun(t, ("prompts", suite), [good])
+    t.check(rc == 0 and len(recs) == 2 and all(r["pass"] for r in recs),
+            f"exit {rc}: {recs} {err[-2000:]}")
+
+
+@scenario(conf={"_extra": "[endpoint dead]\nurl = http://127.0.0.1:9/\n"
+                          "connect_timeout = 1\n"}, bound=40)
+def eval_dead(t):
+    """An endpoint that never answers measures no model: its runs could
+    not be made, and an eval run again makes them. After three in a
+    row, a model's runs not started are left out."""
+    suite = {"suite.ini": "timeout = 3\n", **{k: v for k, v in EVAL_SUITE.items()
+                                              if k != "suite.ini"},
+             "count2.ini": EVAL_SUITE["count.ini"], "count3.ini": EVAL_SUITE["count.ini"]}
+    auth = evalmodel(t, "eval_auth")
+    rc, recs, out, err = evalrun(t, ("dead", suite), [auth], ["-f", "replace", "-j", "1"])
+    t.check(rc == 1 and len(recs) == 3 and
+            all(r.get("error", "").startswith("the model never answered: fatal: HTTP 401")
+                for r in recs), f"exit {rc}: {recs} {err[-2000:]}")
+    t.check("3 runs in a row got no answer" in err and "1 run was left out" in err and
+            "3 runs could not be made" in out, f"left out: {err[-1000:]}")
+    rc, recs, out, err = evalrun(t, ("dead", suite), [auth], ["-f", "replace", "-t", "typo"])
+    t.check("1 run to make," in err and len(recs) == 4, f"made again: {err[-500:]}")
+
+    rc, recs, out, err = evalrun(t, ("dead", suite), ["dead/whatever"],
+                                 ["-f", "replace", "-t", "typo,count", "-j", "2"],
+                                 out="dead.jsonl")
+    t.check(rc == 0 and len(recs) == 2 and
+            all(r.get("error") == "the model never answered: the run took longer than "
+                "its limit of 3 s" for r in recs), f"exit {rc}: {recs} {err[-2000:]}")
+
+
+@scenario(bound=30)
+def eval_mixed(t):
+    """Formats are compared on the tasks every one of them ran alone: the
+    runs of a format on more tasks than another's are left out of the
+    comparison."""
+    half = evalmodel(t, "eval_half")
+    suite = ("mixed", EVAL_SUITE)
+    rc, recs, out, err = evalrun(t, suite, [half], ["-f", "replace"])
+    t.check(rc == 0 and [r["pass"] for r in sorted(recs, key=lambda r: r["task"])] ==
+            [False, True], f"replace: {recs}")
+    rc, recs, out, err = evalrun(t, suite, [half], ["-f", "patch", "-t", "typo"])
+    t.check(rc == 0 and len(recs) == 3, f"patch: {rc} {recs}")
+    t.check(f"{half}: keep replace, its own format" in out and
+            "- patch: 1/1 passed" in out and "- replace: 1/1 passed" in out and
+            "1 run that not every format made left out" in out, f"summary:\n{out}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nedit_format = hashline\n"}, bound=30)
+def eval_own(t):
+    """Formats that tie keep the model's own format, which its own runs
+    show: no change to make."""
+    suite = ("own", EVAL_SUITE)
+    rc, recs, out, err = evalrun(t, suite, [t.model])
+    t.check(rc == 0 and len(recs) == 2 and all(r["own"] and r["format"] == "hashline"
+                                               for r in recs), f"own: {rc} {recs}")
+    rc, recs, out, err = evalrun(t, suite, [t.model], ["-f", "replace"])
+    t.check(rc == 0 and len(recs) == 4, f"replace: {rc} {recs}")
+    t.check(f"{t.model}: keep hashline, its own format: none did measurably better" in out
+            and "[model" not in out, f"summary:\n{out}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

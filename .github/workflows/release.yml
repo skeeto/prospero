@@ -32,6 +32,11 @@ on:
 permissions:
   contents: read
 
+# Every checkout leaves its token out of git's configuration
+# (persist-credentials: false): no step after it needs git credentials,
+# and the steps that run what they downloaded (aas-sign) or built (the
+# tests) never see the token. gh takes GH_TOKEN from its own step.
+
 # Explicitly bash, which runs steps with -e and pipefail
 defaults:
   run:
@@ -55,6 +60,8 @@ jobs:
       WINEDLLOVERRIDES: mscoree,mshtml=  # no Mono or Gecko to install
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Check the version
         id: version
@@ -168,6 +175,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
 
       # From a source tarball of its own, whose contents the release job
       # checks against the published one's
@@ -211,6 +220,8 @@ jobs:
       V: ${{ needs.build.outputs.version }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
@@ -244,6 +255,9 @@ jobs:
               echo "::error::dist/ holds more than the six assets"
               exit 1
           fi
+          # As built, for the check after signing
+          mkdir "$RUNNER_TEMP/unsigned"
+          cp dist/*.exe "$RUNNER_TEMP/unsigned/"
 
       - name: Sign the Windows programs
         uses: skeeto/aas-sign@0008af00d4dd2ff2e482ba5ede70831d78f9da59  # v1.1.0
@@ -259,13 +273,18 @@ jobs:
             dist/prospero-engine-${{ env.V }}-windows-x86_64.exe
             dist/prospero-engine-${{ env.V }}-windows-i686.exe
 
-      # A signature is a nonempty security directory (data directory 4)
+      # Each signature is Authenticode's, by the expected signer, for the
+      # file's own digest, and verifies; and with it taken out, each
+      # program is the one the build job made, byte for byte. (Its
+      # certificate's chain to Microsoft's root is not checked here.)
       - name: Check the signatures
-        run: python3 -I tools/pecheck.py --signed dist/*.exe
+        run: |
+          python3 -I tools/pecheck.py --signed --unsigned "$RUNNER_TEMP/unsigned" \
+              --signer "CN=Christopher Wellons" dist/*.exe
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --verify-tag \
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --verify-tag \
               --title "Prospero $V" dist/*

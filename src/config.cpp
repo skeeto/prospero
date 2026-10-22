@@ -242,9 +242,11 @@ static CfgKey cfgschema[] = {
      "Most reasoning tokens in a response before the model is told to "
      "answer; with thinking = budget, Anthropic's budget_tokens"},
     {"model", "thinking", CFG_ENUM, "adaptive", {},
-     "adaptive budget off default", "model",
+     "adaptive budget off between_tools default", "model",
      "Anthropic: adaptive (the model decides how much to think), budget "
-     "(reasoning_budget tokens, default 8192, for older models), off, or "
+     "(reasoning_budget tokens, default 8192, for older models), off "
+     "(which Opus 5.5 and Sonnet 5.5 refuse: lower the effort instead), "
+     "between_tools (Sonnet 5.5's off, at effort high or below), or "
      "default (not sent)"},
     {"model", "thinking_display", CFG_ENUM, "summarized", {},
      "summarized omitted", "model",
@@ -743,6 +745,30 @@ static Str cfgsecret(Config *c, Arena *perm, Str kind, Str name, Str key)
         return os_getenv(c->os, perm, trim(cuthead(v, 4)));
     }
     return v.len ? clone(perm, v) : Str{};
+}
+
+// The environment variables that secret settings name (env:NAME), in
+// any section of any file loaded, overridden definitions included, so
+// that commands run for the agent can be kept from them (shellenv). The
+// names are copies in perm, which outlive the load.
+static Slice<Str> cfgsecrets(Config *c, Arena *perm)
+{
+    Slice<Str> r = {};
+    for (IniSection *s = c->ini->sections; s; s = s->next) {
+        for (IniEntry *k = s->keys; k; k = k->next) {
+            CfgKey *key = cfgkey(s->kind, k->key);
+            if (!key || key->type!=CFG_SECRET) {
+                continue;
+            }
+            for (IniEntry *e = k; e; e = e->older) {
+                Str v = trim(e->value);
+                if (startswith(v, "env:") && trim(cuthead(v, 4)).len) {
+                    r = push(perm, r, clone(perm, trim(cuthead(v, 4))));
+                }
+            }
+        }
+    }
+    return r;
 }
 
 // The paths of a paths setting (CFG_PATHS), with a leading ~ replaced by

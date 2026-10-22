@@ -26,6 +26,7 @@ With --net, real servers too: good ones answer (api.anthropic.com's
 """
 
 import argparse
+import base64
 import http.server
 import os
 import random
@@ -136,6 +137,74 @@ class Certs:
                     f.write(g.read())
         return self.path(f"{name}.key"), chain, self.path(f"{name}.pem")
 
+    def forged(self, name, names, good):
+        """An impostor's leaf for names, self-signed with a key of its own,
+        and three chains of it ahead of a good chain for the same names:
+        the leaf as made (DER, which the system reads), with a length in
+        BER on its outer SEQUENCE, and with one on its TBSCertificate,
+        signed again. mbedTLS reads both BER forms, and the system
+        neither. Returns the key and the three chains' paths."""
+        self.key(name)
+        subj = f"/CN=Prospero test {name} {self.tag}"
+        self.run("req", "-new", "-x509", "-key", self.path(f"{name}.key"), "-subj", subj,
+                 "-days", "30", "-sha256", "-config", self.config(names),
+                 "-extensions", "leaf", "-outform", "DER", "-out", self.path(f"{name}.der"))
+        with open(self.path(f"{name}.der"), "rb") as f:
+            der = f.read()
+        with open(good) as f:
+            rest = f.read()
+        tag, beg, end = tlv(der, 0)
+        outer = bytes([tag]) + berlen(end - beg) + der[beg:end]
+        ttag, tbeg, tend = tlv(der, beg)
+        tbs = bytes([ttag]) + berlen(tend - tbeg) + der[tbeg:tend]
+        _, _, aend = tlv(der, tend)
+        unsigned = self.path(f"{name}.tbs")
+        with open(unsigned, "wb") as f:
+            f.write(tbs)
+        sig = subprocess.run([self.openssl, "dgst", "-sha256", "-sign",
+                              self.path(f"{name}.key"), unsigned],
+                             capture_output=True, check=True).stdout
+        bits = b"\x03" + derlen(len(sig) + 1) + b"\0" + sig
+        body = tbs + der[tend:aend] + bits
+        resigned = b"\x30" + derlen(len(body)) + body
+        chains = []
+        for kind, cert in (("der", der), ("outer", outer), ("tbs", resigned)):
+            path = self.path(f"{name}-{kind}-chain.pem")
+            with open(path, "w") as f:
+                f.write(pem(cert) + rest)
+            chains.append(path)
+        return self.path(f"{name}.key"), chains
+
+
+def tlv(d, i):
+    """A DER element at i: its tag, and where its contents begin and end."""
+    tag, n = d[i], d[i+1]
+    i += 2
+    if n & 0x80:
+        size = int.from_bytes(d[i:i + (n & 0x7f)], "big")
+        i += n & 0x7f
+    else:
+        size = n
+    return tag, i, i + size
+
+
+def derlen(n):
+    if n < 0x80:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def berlen(n):
+    """A length in four bytes, whatever it is: BER, never DER."""
+    return b"\x84" + n.to_bytes(4, "big")
+
+
+def pem(der):
+    b = base64.b64encode(der).decode()
+    lines = "".join(b[i:i+64] + "\n" for i in range(0, len(b), 64))
+    return f"-----BEGIN CERTIFICATE-----\n{lines}-----END CERTIFICATE-----\n"
+
 
 class Quiet(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -198,9 +267,22 @@ def local(t, dir):
     t.expect("another name", t.edge("trust", "other.test", chain, root), False)
     t.expect("an address", t.edge("trust", "127.0.0.1", chain, root), True)
 
+    # An impostor's leaf ahead of the good chain, for the same names: as
+    # made, the system refuses it; in BER, which the system cannot read,
+    # it must not be passed over for the good chain behind it
+    fkey, (fder, fouter, ftbs) = c.forged("forged", ["prospero.test", "localhost"], chain)
+    t.expect("an impostor's leaf", t.edge("trust", "prospero.test", fder, root), False,
+             ["not trusted"])
+    t.expect("an impostor's leaf in BER", t.edge("trust", "prospero.test", fouter, root),
+             False, ["could not be read"])
+    t.expect("an impostor's leaf, its TBSCertificate in BER",
+             t.edge("trust", "prospero.test", ftbs, root), False, ["could not be read"])
+
     # Through handshakes, by name and by address
     srv = serve(key, chain)
     wsrv = serve(wkey, wchain)
+    fsrv = serve(fkey, ftbs)
+    dsrv = serve(fkey, fder)
     try:
         port = srv.server_address[1]
         url = f"https://localhost:{port}/x"
@@ -214,9 +296,19 @@ def local(t, dir):
         wurl = f"https://localhost:{wsrv.server_address[1]}/"
         t.expect("handshake, another name", t.edge("get", wurl, root), False,
                  ["not for localhost"])
+        # The impostor holds its own key alone, and sends the good chain
+        # after its leaf
+        furl = f"https://localhost:{fsrv.server_address[1]}/"
+        t.expect("handshake, an impostor's leaf in BER", t.edge("get", furl, root), False,
+                 ["could not be read"])
+        durl = f"https://localhost:{dsrv.server_address[1]}/"
+        t.expect("handshake, an impostor's leaf", t.edge("get", durl, root), False,
+                 ["not trusted"])
     finally:
         srv.shutdown()
         wsrv.shutdown()
+        fsrv.shutdown()
+        dsrv.shutdown()
 
 
 NET = [

@@ -1727,8 +1727,12 @@ static b32 envnameis(Str entry, Str name, b32 fold)
     return fold ? equalfold(n, name) : n==name;
 }
 
-// The complete environment for an agent command.
-static Slice<Str> shellenv(Arena *a, Slice<Str> inherited, b32 windows)
+// The complete environment for an agent command, without the variables
+// named in secrets: those the configuration's keys come from (env:NAME,
+// cfgsecrets), which a command could otherwise print into the session,
+// its log, and the next request.
+static Slice<Str> shellenv(Arena *a, Slice<Str> inherited, b32 windows,
+                           Slice<Str> secrets)
 {
     Slice<Str> r = {};
     for (iz i = 0; i < inherited.len; i++) {
@@ -1736,6 +1740,9 @@ static Slice<Str> shellenv(Arena *a, Slice<Str> inherited, b32 windows)
         b32  drop = 0;
         for (iz k = 0; !drop && k<countof(envstrip); k++) {
             drop = envnameis(e, envstrip[k], windows);
+        }
+        for (iz k = 0; !drop && k<secrets.len; k++) {
+            drop = envnameis(e, secrets[k], windows);
         }
         for (iz k = 0; !drop && k<countof(envoverlay); k++) {
             drop = envnameis(e, envoverlay[k][0], windows);

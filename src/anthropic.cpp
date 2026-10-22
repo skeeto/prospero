@@ -38,6 +38,12 @@
 // pause_turn, which the engine continues, and refusal, which ends the
 // turn, saying why.
 //
+// Reasoning not shown (thinking_display omitted) streams no text, only
+// its signature at the end, so a long think is pings alone. A ping in a
+// reasoning block not yet signed is reported (Chunk.hidden), and the
+// engine counts it as progress for as long as max_tokens would take at
+// AN_SLOWRATE, so that a stream stuck that way still ends.
+//
 // Everything here is pure: the engine does the I/O.
 //
 // This is free and unencumbered software released into the public domain.
@@ -46,7 +52,16 @@ enum : i64 {
     AN_MAXTOKENS = 32000,  // max_tokens unless configured
     AN_BUDGET    = 8192,   // thinking budget_tokens unless configured
     AN_MINBUDGET = 1024,   // the least budget the API takes
+    AN_SLOWRATE  = 10,     // output tokens a second, below any model's
 };
+
+// The max_tokens of a request: configured, or the default, within the
+// model's limit.
+static i64 anmaxtokens(ModelConf *mc)
+{
+    i64 most = mc->maxtokens ? mc->maxtokens : AN_MAXTOKENS;
+    return mc->maxout && most>mc->maxout ? mc->maxout : most;
+}
 
 static Str const anversion = "2023-06-01";
 
@@ -258,8 +273,7 @@ static void anmessages(JsonOut *w, Arena scratch, ChatReq *r)
 static Str anencode(Arena *a, Arena tmp, ChatReq *r)
 {
     ModelConf *mc   = r->mc;
-    i64        most = mc->maxtokens ? mc->maxtokens : AN_MAXTOKENS;
-    most = mc->maxout && most>mc->maxout ? mc->maxout : most;
+    i64        most = anmaxtokens(mc);
 
     Buf     b(a, 1<<16);
     JsonOut w = {&b};
@@ -310,6 +324,13 @@ static Str anencode(Arena *a, Arena tmp, ChatReq *r)
         putkey(&w, "thinking");
         putobject(&w);
         putstrkey(&w, "type", "disabled");
+        putend(&w);
+        break;
+    case THINK_BETWEEN:
+        // Alone: the API refuses it with any other field
+        putkey(&w, "thinking");
+        putobject(&w);
+        putstrkey(&w, "type", "between_tools");
         putend(&w);
         break;
     }
@@ -568,6 +589,14 @@ static Chunk anchunk(Partial *p, Json *j, Arena *scratch)
     } else if (type == "message_stop") {
         p->done = 1;
 
+    } else if (type == "ping") {
+        // Reasoning not shown (thinking_display omitted) streams nothing
+        // until its signature, at the end: a ping meanwhile, while the
+        // newest block is reasoning not yet signed, says it goes on
+        PartBlock *k = p->parts.len ? &p->parts[p->parts.len-1] : 0;
+        r.hidden = k && k->block==p->nblocks-1 && k->type==BLOCK_THINK &&
+                   !k->sig.len && !p->finish.data;
+
     } else if (type == "message") {
         i64 index = 0;
         for (Json *cb = jsonget(j, "content")->child; cb; cb = cb->next) {
@@ -577,6 +606,6 @@ static Chunk anchunk(Partial *p, Json *j, Arena *scratch)
         anusage(p, jsonget(j, "usage"));
         p->done = 1;
     }
-    // ping, and types yet unknown, change nothing
+    // Types yet unknown change nothing
     return r;
 }

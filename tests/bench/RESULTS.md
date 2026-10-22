@@ -65,7 +65,8 @@ files only, as the run here had none. Run it on the router's models with:
         -n 2 -j 6 -o results.jsonl tests/bench/editbench
     prospero eval --report results.jsonl
 
-Its table has these columns and more: edit misses (failed edits here),
+Its table has these columns and more: failed edits, counted as here
+(every edit call that failed, a patch that does not parse included),
 bad calls, denials and repairs by kind, cached tokens, and the time
 spent waiting at the router apart from the runs' own. With six runs at
 once and models taking turns at the router, runs of the model not loaded
@@ -172,9 +173,14 @@ thinking, the defaults):
 | claude-haiku-5-5 | hashline | 40 | 100.0% (40) | 3.7 | 2.9 | 0 | 0 | 0 | 0 | 9,804 | 8,384 | 448 | 0 | 5.4 |
 
 Every run passed in every format, with no failed edit and nothing for
-the harness to forgive, so this model is no test of the formats: the
-summary's choice of hashline rests on 0.1 steps a run, and replace
-used the fewest tokens. A run of the suite as made before cost about
+the harness to forgive, so this model is no test of the formats. (The
+column "edit misses" then counted misses alone; there were no failed
+edits of any kind.) The summary of the time chose hashline on 0.1 steps
+a run, and replace used the fewest tokens. A difference of 0.1 steps a
+run, at most 4 tasks of 40, no longer decides: the summary now compares
+formats task by task, by sign tests, and gives a format only when it
+did better than each other beyond chance (p < 0.05), the model keeping
+its own otherwise. A run of the suite as made before cost about
 as much and also passed 120 of 120. The 240 runs took about 2.3 million
 tokens in, 85% of them read from the cache, and 110 thousand out.
 

@@ -271,7 +271,13 @@ static void test_anthropic(Test *t)
         mc.think = THINK_OFF;
         d4 = jsonparse(a, anencode(a, tmp, &r));
         expect(t, "an.off", jsonget(d4.root, "thinking")->raw, "{\"type\":\"disabled\"}");
-        mc.think = THINK_DEFAULT;
+        mc.think     = THINK_BETWEEN;
+        mc.hidethink = 1;
+        d4 = jsonparse(a, anencode(a, tmp, &r));
+        expect(t, "an.between_tools", jsonget(d4.root, "thinking")->raw,
+               "{\"type\":\"between_tools\"}");
+        mc.hidethink = 0;
+        mc.think     = THINK_DEFAULT;
         d4 = jsonparse(a, anencode(a, tmp, &r));
         expect(t, "an.default", istr(a, jsonget(d4.root, "thinking")->type),
                istr(a, JSON_MISSING));

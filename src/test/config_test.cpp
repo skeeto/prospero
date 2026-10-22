@@ -368,6 +368,19 @@ static void testcfgvalidate(Test *t)
     expect(t, "env.secret", cfgsecret(c, &a, "endpoint", "a", "key"), "s3cret");
     expect(t, "env.empty", cfgsecret(c, &a, "endpoint", "b", "key"), "");
     cfgfree(c);
+
+    // The variables of every secret setting, overridden ones too, which
+    // the agent's commands do not get
+    os_write(v.os, a, "/c/secrets.ini",
+             "[endpoint a]\nurl = http://a/\nkey = env:FIRST_KEY\n"
+             "key = env:SECOND_KEY\n"
+             "[endpoint b]\nurl = http://b/\nkey = sk-plain\n"
+             "[endpoint c]\nurl = http://c/\nkey = env: OTHER_KEY \n"
+             "[endpoint d]\nurl = http://d/\nkey = env:\n"
+             "[model m]\nkey = env:NOT_A_SECRET\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/secrets.ini", 0);
+    expect(t, "secrets", showlist(&a, cfgsecrets(c, &a)), "SECOND_KEY|FIRST_KEY|OTHER_KEY");
+    cfgfree(c);
 }
 
 // The exact file after each edit, and the reload that follows.

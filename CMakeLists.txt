@@ -218,6 +218,13 @@ if(NOT CMAKE_CROSSCOMPILING)
     # Deploying engines through a fake ssh and scp (a real host: --ssh)
     add_test(NAME deploy COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/deploy.py --prospero $<TARGET_FILE:prospero>)
+    # The release's check of Authenticode signatures (tools/pecheck.py),
+    # on a program signed with a throwaway key
+    find_program(OPENSSL openssl)
+    if(OPENSSL)
+      add_test(NAME signcheck COMMAND ${UV} run
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/signcheck.py)
+    endif()
     # The suites bound how long the harness takes, which a machine kept
     # busy by other suites can miss through no fault of the harness's: a
     # Raspberry Pi's SD card stalls for seconds under writes from several

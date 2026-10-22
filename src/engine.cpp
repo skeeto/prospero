@@ -399,6 +399,7 @@ struct Session {
     i64          lastbyte;   // any byte, or prompt progress
     i64          firstout;   // the first output token
     i64          lastout;
+    i64          hiddenat;   // the first ping of reasoning unseen, or 0
     i64          tokens;     // chunks with output: about one token each
     // The turn
     i64          turn;
@@ -506,6 +507,7 @@ struct Session {
     // Limits a frontend set (new), as an eval does
     i64          stepmax;    // model requests a turn, 0 for STEP_HARD
     b32          projinstr;  // the project's instruction files, not the user's
+    b32          nofallback; // never a fallback model: the one asked, or none
     b32          forget;     // closed: drop it from memory once idle
 };
 
@@ -732,8 +734,8 @@ static void adduser(Session *s, Arena scratch, Str text, Str via)
     addmsg(s, m);
 }
 
-// Append an assistant record and message. The blocks are in perm.
-static void addassistant(Session *s, Arena scratch, Slice<Block> blocks,
+// Log an assistant record. The blocks are in perm.
+static void logassistant(Session *s, Arena scratch, Slice<Block> blocks,
                          Str finishr, Usage *u)
 {
     Buf   b(&scratch, 4096);
@@ -780,16 +782,22 @@ static void addassistant(Session *s, Arena scratch, Slice<Block> blocks,
     }
     putintkey(&w.json, "ms", (os_ticks(s->e->os) - s->sent)/MS);
     ssend(s, &w);
-
-    Msg m = {};
-    m.role   = ROLE_ASSISTANT;
-    m.blocks = blocks;
-    addmsg(s, m);
     if (u && u->in && s->sentbytes) {
         // The server's count calibrates the estimates
         s->rate.tokens = u->in;
         s->rate.bytes  = s->sentbytes;
     }
+}
+
+// Append an assistant record and message. The blocks are in perm.
+static void addassistant(Session *s, Arena scratch, Slice<Block> blocks,
+                         Str finishr, Usage *u)
+{
+    logassistant(s, scratch, blocks, finishr, u);
+    Msg m = {};
+    m.role   = ROLE_ASSISTANT;
+    m.blocks = blocks;
+    addmsg(s, m);
 }
 
 // A nudge: an injected user message, counted against its cap. Returns 0
@@ -1333,11 +1341,12 @@ static void resetattempt(Session *s)
 static void newattempt(Session *s)
 {
     resetattempt(s);
-    s->part    = newpartial(&s->attempt);
-    s->sse     = newsse(&s->attempt, SSE_MAX);
-    s->cycles  = alloc<Cycle>(&s->attempt, 2);
-    s->cycleat = -1;
-    s->ctlwhy  = CTL_NONE;
+    s->part     = newpartial(&s->attempt);
+    s->sse      = newsse(&s->attempt, SSE_MAX);
+    s->cycles   = alloc<Cycle>(&s->attempt, 2);
+    s->cycleat  = -1;
+    s->ctlwhy   = CTL_NONE;
+    s->hiddenat = 0;
 }
 
 static void sendchat(Session *s, Arena scratch)
@@ -1672,9 +1681,13 @@ static b32 usefallback(Session *s, Str spec)
 
 // Move on to the next of the primary's fallbacks ([model] fallback), if
 // one is left, which gets quick retries of its own. Leaving the primary
-// starts its cooldown. Returns 0 at the end of the chain.
+// starts its cooldown. Returns 0 at the end of the chain, and at once
+// for a session that must keep its model (new's fallback, as an eval's).
 static b32 nexttarget(Session *s, Arena scratch, i32 cls, i32 status, Str msg)
 {
+    if (s->nofallback) {
+        return 0;
+    }
     Engine    *e     = s->e;
     Str        list  = cfgget(e->cfg, "model", s->homemodel, "fallback", 0);
     Slice<Str> chain = {};
@@ -1993,6 +2006,15 @@ static b32 onchunk(Session *s, Arena scratch, Json *j)
         s->lastout  = os_ticks(s->e->os);
         s->firstout = s->firstout ? s->firstout : s->lastout;
         s->tokens++;
+    } else if (c.hidden) {
+        // Reasoning that streams unseen is progress for as long as the
+        // response could take at a slow rate, and no longer
+        i64 now  = os_ticks(s->e->os);
+        i64 most = anmaxtokens(reqmc(s)) * SEC / AN_SLOWRATE;
+        s->hiddenat = s->hiddenat ? s->hiddenat : now;
+        if (now-s->hiddenat < most) {
+            arm(s, T_PROGRESS, ep->progress);
+        }
     }
     for (iz i = 0; i < c.deltas.len; i++) {
         Delta *d = &c.deltas[i];
@@ -2823,12 +2845,13 @@ static Str spillfile(Session *s, Arena scratch, Str id, Str *rel)
 static Proc *spawncall(Session *s, Arena scratch, Slice<Str> argv, Str cmdline,
                        Str cwd, Str spill, i64 maxbytes, u64 *id)
 {
-    Engine *e  = s->e;
-    Spawn   sp = {};
+    Engine    *e       = s->e;
+    Slice<Str> secrets = cfgsecrets(e->cfg, &scratch);
+    Spawn      sp      = {};
     sp.argv     = argv;
     sp.cmdline  = cmdline;
     sp.cwd      = cwd;
-    sp.env      = shellenv(&scratch, e->env, s->te.windows);
+    sp.env      = shellenv(&scratch, e->env, s->te.windows, secrets);
     sp.outpath  = spill;
     sp.maxbytes = maxbytes;
     sp.mbox     = e->in;
@@ -4035,13 +4058,40 @@ static void sendcompact(Session *s, Arena scratch)
 // The summary arrived: rebuild the history around it, log it, and carry
 // on with the step, unless the prompt is still above the goal after a
 // compaction at the threshold (the progress guard): compacting again
-// would make no headway, so the turn ends instead.
+// would make no headway, so the turn ends instead. A summary declined
+// (refusal) or cut off (length) is never used, since the history it
+// stands for would be gone for good, and asking again would end alike.
 static void compacted(Session *s, Arena scratch, Partial *p)
 {
     Engine *e    = s->e;
     Compact cp   = s->cp;
     Str     text = trim(summarytext(trim(finish(&p->text))));
-    if (!text.len) {
+    if (p->finish=="refusal" || p->finish=="length") {
+        b32 refused = p->finish == "refusal";
+        Buf b(&scratch, 512 + p->refusal.len);
+        print(&b, "The summarizer, ");
+        print(&b, cp.model);
+        if (refused) {
+            print(&b, ", declined to summarize the conversation (stop "
+                      "reason refusal");
+            if (p->refusal.len) {
+                print(&b, ", ");
+                print(&b, p->refusal);
+            }
+            print(&b, ")");
+        } else {
+            print(&b, ", stopped at its output limit before the summary "
+                      "was done");
+        }
+        print(&b, ", so the conversation was not compacted and the turn "
+                  "ends here. Set [model] compactor to another model");
+        print(&b, refused ? Str(".") : Str(", or raise its max_tokens."));
+        note(s, scratch, "error", finish(&b));
+        Str why = refused ? Str("the summarizer declined (refusal)")
+                          : Str("the summary was cut off at the length limit");
+        failcompact(s, scratch, CLASS_DETERMINISTIC, 0, why, -1);
+        return;
+    } else if (!text.len) {
         failcompact(s, scratch, CLASS_TRANSIENT, 0, "the summary was empty", -1);
         return;
     }
@@ -4105,7 +4155,13 @@ static void finalize(Session *s, Arena scratch)
     Slice<Str> used = usedids(s, &scratch);
     Finished   f    = finishpartial(&s->perm, p, 1, s->turn, s->steps, used);
     Str        fr   = p->finish.data ? p->finish : Str("stop");
-    addassistant(s, scratch, f.blocks, fr, p->hasusage ? &p->usage : 0);
+    if (fr == "refusal") {
+        // Shown and logged, but never sent back: a declined response's
+        // partial output is not a finished turn of the conversation
+        logassistant(s, scratch, f.blocks, fr, p->hasusage ? &p->usage : 0);
+    } else {
+        addassistant(s, scratch, f.blocks, fr, p->hasusage ? &p->usage : 0);
+    }
     setstate(s, S_IDLE);
 
     // The router has just loaded the model, if it was not loaded: its
@@ -4548,9 +4604,10 @@ static void modelconf(Engine *e, Arena *perm, Str model, ModelConf *mc)
     Str td  = trim(cfgget(cfg, "model", model, "thinking_display", 0));
     Str ef  = trim(cfgget(cfg, "model", model, "effort", 0));
     mc->maxtokens = mt.ok && mt.val>0 ? mt.val : 0;
-    mc->think     = th=="budget"  ? THINK_BUDGET :
-                    th=="off"     ? THINK_OFF    :
-                    th=="default" ? THINK_DEFAULT : THINK_ADAPTIVE;
+    mc->think     = th=="budget"        ? THINK_BUDGET  :
+                    th=="off"           ? THINK_OFF     :
+                    th=="between_tools" ? THINK_BETWEEN :
+                    th=="default"       ? THINK_DEFAULT : THINK_ADAPTIVE;
     mc->hidethink = td == "omitted";
     mc->effort    = ef.len ? clone(perm, ef) : Str{};
 }
@@ -5056,6 +5113,9 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->psid    = clone(&s->perm, p->sid);
     s->pcall   = clone(&s->perm, c->id);
     s->intask  = 1;
+    // As new asked of the parent, as an eval's
+    s->projinstr  = p->projinstr;
+    s->nofallback = p->nofallback;
     Str why = opensession(s, scratch);
     if (why.data) {
         dropsession(e, s);
@@ -5452,12 +5512,15 @@ static Str unknowntools(Str list)
 }
 
 // new {cwd, model?, endpoint?, role?, roots?, attended?, prompt?,
-//      edit_format?, tools?, steps?, instructions?}: the model and
-// endpoint given, else the role's, else the configuration's. The rest
-// are for runs that must not depend on the configuration, as an eval's:
-// the edit format instead of the model's, only the tools listed (of the
-// role's, if any), at most steps model requests a turn (up to 300), and
-// with instructions "project", none of the user's own instruction file.
+//      edit_format?, tools?, steps?, instructions?, fallback?}: the model
+// and endpoint given, else the role's, else the configuration's. The
+// rest are for runs that must not depend on the configuration, as an
+// eval's: the edit format instead of the model's, only the tools listed
+// (of the role's, if any), at most steps model requests a turn (up to
+// 300), with instructions "project", none of the user's own instruction
+// file, and with fallback 0 (or false), none of the model's fallbacks,
+// so that every request goes to the model given. Its subagents keep the
+// last two.
 static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str  cwd   = jsonstr(jsonget(j, "cwd"));
@@ -5468,6 +5531,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     Str  tools = jsonstr(jsonget(j, "tools"));
     i64  steps = jsonint(jsonget(j, "steps"), 0);
     Str  instr = jsonstr(jsonget(j, "instructions"));
+    b32  fall  = jsonflag(jsonget(j, "fallback"), 1);
     Role role  = name.len ? findrole(e, name) : Role{};
     if (name.len && !role.ok) {
         Str err = concat(&scratch, "no such role: ", name);
@@ -5526,14 +5590,15 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "out of memory", {});
         return;
     }
-    s->cwd       = clone(&s->perm, real);
-    s->model     = clone(&s->perm, model);
-    s->attended  = jsonflag(jsonget(j, "attended"), 0);
-    s->role      = clone(&s->perm, role.name);
-    s->rolepr    = clone(&s->perm, role.prompt);
-    s->te.deny   = role.deny | (tools.data ? tooldeny(tools) : 0);
-    s->stepmax   = steps<STEP_HARD ? steps : 0;
-    s->projinstr = instr == "project";
+    s->cwd        = clone(&s->perm, real);
+    s->model      = clone(&s->perm, model);
+    s->attended   = jsonflag(jsonget(j, "attended"), 0);
+    s->role       = clone(&s->perm, role.name);
+    s->rolepr     = clone(&s->perm, role.prompt);
+    s->te.deny    = role.deny | (tools.data ? tooldeny(tools) : 0);
+    s->stepmax    = steps<STEP_HARD ? steps : 0;
+    s->projinstr  = instr == "project";
+    s->nofallback = !fall;
     for (iz i = 0; i < roots.len; i++) {
         s->roots = push(&s->perm, s->roots, clone(&s->perm, roots[i]));
     }
@@ -5820,7 +5885,9 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 b.args  = clone(&s->perm, jsonstr(jsonget(k, "args")));
                 m.blocks = push(&s->perm, m.blocks, b);
             }
-            addmsg(s, m);
+            if (jsonstr(jsonget(j, "finish")) != "refusal") {
+                addmsg(s, m);  // a declined one is never sent back (finalize)
+            }
             {
                 // The estimates as the server last calibrated them
                 Json *u     = jsonget(j, "usage");

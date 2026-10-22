@@ -175,15 +175,20 @@ task files, `NAME.ini`, with settings for all of them in `suite.ini`:
     tools    = read edit grep glob
 
 `setup` runs a command before the agent starts, `prompt_file` reads the
-prompt from a file, `role` names a configured role, and `check_timeout`
+prompt from a file (a task's own `prompt` or `prompt_file` wins over
+`suite.ini`'s), `role` names a configured role, and `check_timeout`
 limits setup and check commands. Each run works on its own copy in a
-temporary directory, so no repository is ever touched; the session is
-unattended, so asks are denied, and gets the project's instruction
-files but not the user's own.
+temporary directory, so no repository is ever touched: a fixture may
+hold a `.git` directory, but not a `.git` file (a worktree's or a
+submodule's), which would have the copy share another repository. The
+session is unattended, so asks are denied, gets the project's
+instruction files but not the user's own, and never moves to a
+fallback model; commands run without the variables that endpoints'
+keys come from.
 
     prospero eval -m MODEL,... [-e ENDPOINT] [-f FORMAT,...|all] [-n N]
                   [-j N] [-t TASK,...] [-o FILE] [-c FILE] SUITE...
-    prospero eval --report FILE...
+    prospero eval --report [-c FILE] FILE...
 
 Every model runs every task in each edit format, `-n` times, up to `-j`
 runs at once. A model is `MODEL` at the `-e` endpoint, or
@@ -192,14 +197,22 @@ turn at each endpoint as any session's do (its `max_concurrent`,
 `max_models`, and a model's `max_concurrent`), and runs go model by
 model, so a llama.cpp router that keeps one model loaded swaps rarely.
 Each run appends a JSON line to the results file (`-o`, by default
-`eval.jsonl`): pass or fail and why, steps and tool calls, tool errors
-by kind (edit misses, invalid calls), guard denials, what the harness
-repaired, nudges, retries, tokens with cache reads, the run's own time
-and its time in the queue, and the diff it left. A run already in the
-file is skipped, so an eval stopped part way goes on where it stopped.
-The summary, printed after the runs and by `--report`, is a table by
-model and format, the failed runs, and for each model the edit format
-to give it, with the numbers that decide it.
+`eval.jsonl`): pass or fail and why, steps and tool calls, failed edits
+(alike in every format) and tool errors by kind (edit misses, invalid
+calls), guard denials, what the harness repaired, nudges, retries,
+tokens with cache reads, the run's own time and its time in the queue,
+and the diff it left. A run already in the file is skipped, so an eval
+stopped part way goes on where it stopped. A run that measured no
+model, because the model never answered (a key refused, an endpoint
+down), is recorded as an error and made again next time; after three
+such runs of a model in a row (or `-j`, if more), its runs not yet
+started are left out, and the eval exits 1. The summary, printed after
+the runs and by `--report`, is a table by model and format, the failed
+runs, and for each model the edit format to give it, with the numbers
+that decide it: formats are compared on the runs each made of the same
+tasks, task by task, and one is recommended only if it did better than
+every other beyond chance (sign tests, p < 0.05), on the pass rate,
+else failed edits, steps or tokens. Otherwise the model keeps its own.
 
 `tests/bench/editbench` is the edit-format benchmark as a suite: 40
 one-line bugs in real code, to fix with the file tools alone. For a

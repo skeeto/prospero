@@ -1583,6 +1583,60 @@ def sc_eval_busy(model, n, req):
                                              "offset": 1, "limit": step(req) + 1})
 
 
+def sc_eval_badpatch(model, n, req):
+    """Its first edit fails as each format's typically do, then the second
+    is right: 4 steps, passed, with one failed edit. With patch, the patch
+    lacks its *** End Patch, which the tool cannot take (args); with
+    replace, old_string is not in the file, and with hashline, the tag is
+    stale (both miss)."""
+    k, fmt = step(req), eval_format(req)
+    if k == 0:
+        yield from eval_reply(model, n, "read", {"path": eval_task(req)[2]})
+    elif k == 1:
+        args = eval_edit(req, wrong=fmt != "patch")
+        if fmt == "patch":
+            args["patch"] = args["patch"].replace("*** End Patch\n", "")
+        yield from eval_reply(model, n, "edit", args)
+    elif k == 2:
+        yield from eval_reply(model, n, "edit", eval_edit(req))
+    else:
+        yield from eval_answer(model, "Done.")
+
+
+def sc_eval_own(model, n, req):
+    """As eval_good, under a name of its own, which a scenario configures."""
+    yield from sc_eval_good(model, n, req)
+
+
+def sc_eval_half(model, n, req):
+    """Right on the typo task, and wrong on any other."""
+    k = step(req)
+    if k == 0:
+        yield from eval_reply(model, n, "read", {"path": eval_task(req)[2]})
+    elif k == 1:
+        yield from eval_reply(model, n, "edit",
+                              eval_edit(req, wrong=eval_task(req)[0] != "wrold"))
+    else:
+        yield from eval_answer(model, "Done.")
+
+
+def sc_eval_limit(model, n, req):
+    """Out of quota, every time: a fallback, if the session took one,
+    would answer instead (eval_limit_b)."""
+    yield S.error(429, {"error": {"type": "insufficient_quota",
+                                  "message": "You exceeded your current quota"}})
+
+
+def sc_eval_limit_b(model, n, req):
+    yield from sc_eval_good(model, n, req)
+
+
+def sc_eval_auth(model, n, req):
+    """A key refused: no run gets an answer."""
+    yield S.error(401, {"error": {"type": "invalid_request_error",
+                                  "message": "invalid api key"}})
+
+
 # The GUI's checklist (prospero gui --drive, run by tests/gui.py): the
 # prompt that began the turn picks the reply, and the step is how many
 # responses the turn has had so far.
@@ -2398,7 +2452,9 @@ def an_check(req, prefill=False):
             budget = th.get("budget_tokens", 0)
             if budget < 1024 or budget >= req["max_tokens"]:
                 return "thinking.budget_tokens: must be at least 1024 and below max_tokens"
-        elif kind not in ("adaptive", "disabled"):
+        elif kind == "between_tools" and len(th) > 1:
+            return "thinking: between_tools takes no other field"
+        elif kind not in ("adaptive", "disabled", "between_tools"):
             return f"thinking.type: unknown type {kind}"
     msgs = req.get("messages")
     if not isinstance(msgs, list) or not msgs:
@@ -2664,11 +2720,17 @@ def sc_an_pause(model, n, req):
 
 
 def sc_an_refusal(model, n, req):
-    yield S.head()
-    yield an_start(model, req)
-    yield from an_text(0, "I can help with part")
-    yield from an_end("refusal", details={"type": "refusal", "category": "cyber",
-                                          "explanation": "This request was declined."})
+    # Declined part way, after reasoning and some text; asked again, an
+    # answer
+    if n == 0:
+        yield S.head()
+        yield an_start(model, req)
+        yield from an_think(req, 0, "How to start.")
+        yield from an_text(1, "I can help with part")
+        yield from an_end("refusal", details={"type": "refusal", "category": "cyber",
+                                              "explanation": "This request was declined."})
+    else:
+        yield from an_answer(model, req, "Another time, then.")
 
 
 def sc_an_overflow(model, n, req):
@@ -2715,6 +2777,89 @@ def sc_an_cache(model, n, req):
 
 def sc_an_auth(model, n, req):
     yield from an_answer(model, req, "Never reached: the key is wrong.")
+
+
+def sc_an_between(model, n, req):
+    yield from an_answer(model, req, "Thinking only between tools.")
+
+
+def sc_an_env(model, n, req):
+    # Lists its environment, where the endpoint's key must not be
+    if n == 0:
+        yield from an_call(model, req, n, "shell", {"command": "env"})
+    else:
+        yield from an_answer(model, req, "Listed it.")
+
+
+def an_overflowing(model, n, req):
+    """Reads with reasoning, then the prompt is too long: a compaction."""
+    if n < 4:
+        yield from an_call(model, req, n, "read", {"path": f"f{n}.txt"},
+                           think=f"Read f{n} next.")
+    elif n == 4:
+        p = ptok(req)
+        yield an_fail(400, "invalid_request_error",
+                      f"prompt is too long: {p} tokens > {p * 9 // 10} maximum")
+    else:
+        yield from an_answer(model, req, "Never reached: no summary to go on.")
+
+
+def sc_an_compact_refusal(model, n, req):
+    yield from an_overflowing(model, n, req)
+
+
+def sc_an_compact_refusal_compact(model, n, req):
+    # The summarizer declines part way through its summary
+    yield S.head()
+    yield an_start(model, req)
+    yield from an_text(0, "## Goal\nRead the fi", stop=False)
+    yield from an_end("refusal", details={"type": "refusal", "category": "cyber",
+                                          "explanation": "This request was declined."})
+
+
+def sc_an_compact_length(model, n, req):
+    yield from an_overflowing(model, n, req)
+
+
+def sc_an_compact_length_compact(model, n, req):
+    # The summary reaches the output limit
+    yield S.head()
+    yield an_start(model, req)
+    yield from an_text(0, "## Goal\nRead the files.\n\n## Progress\nRead f0, f1", stop=False)
+    yield from an_end("max_tokens", out=16000)
+
+
+def an_hidden(model, req, seconds):
+    """Reasoning not shown (thinking_display omitted): an empty thinking
+    block, then pings alone, every second, before its signature."""
+    yield S.head()
+    yield an_start(model, req)
+    yield an_event({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
+    for _ in range(seconds):
+        yield S.sleep(1)
+        yield an_event({"type": "ping"})
+    with STATE.lock:
+        sig = f"EqFake{len(STATE.sigs)}x{random.randrange(1 << 32):08x}=="
+        STATE.sigs[sig] = ("", an_binding(req, len(req.get("messages", []))))
+    yield an_event({"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "signature_delta", "signature": sig}})
+    yield an_event({"type": "content_block_stop", "index": 0})
+    yield from an_text(1, "Thought it through.")
+    yield from an_end()
+
+
+def sc_an_hidden(model, n, req):
+    # Thinks for 9 s unseen, past the progress watchdog's 6 s
+    yield from an_hidden(model, req, 9)
+
+
+def sc_an_hidden_bound(model, n, req):
+    # Unseen reasoning that never ends: pings for a minute
+    if n == 0:
+        yield from an_hidden(model, req, 60)
+    else:
+        yield from an_answer(model, req, "Answered at last.")
 
 
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
