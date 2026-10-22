@@ -1857,12 +1857,24 @@ KVPOOL = {"lock": threading.Lock(), "inflight": {}, "full": {}}
 
 def sc_kv_full(model, n, req):
     # A KV pool shared by the slots, with room for one context: while two
-    # requests run at once, every one in flight fails, as llama.cpp does
+    # requests run at once, every one in flight fails, as llama.cpp does.
+    # A request leaves the pool before its last bytes go out, since the
+    # client may send its next as soon as it reads them, sooner than this
+    # thread gets back here on a busy machine.
     with KVPOOL["lock"]:
         k = KVPOOL["inflight"].get(model, 0) + 1
         KVPOOL["inflight"][model] = k
         if k >= 2:
             KVPOOL["full"][model] = True
+    gone = []
+
+    def leave():
+        if not gone:
+            gone.append(1)
+            with KVPOOL["lock"]:
+                KVPOOL["inflight"][model] -= 1
+                if not KVPOOL["inflight"][model]:
+                    KVPOOL["full"][model] = False
     try:
         yield S.head()
         for i in range(10):
@@ -1870,16 +1882,15 @@ def sc_kv_full(model, n, req):
             with KVPOOL["lock"]:
                 full = KVPOOL["full"].get(model)
             if full:
+                leave()
                 yield S.data({"error": {"code": 500, "type": "server_error",
                                         "message": "Context size has been exceeded."}})
                 return
             yield from text(model, f"w{i} ")
+        leave()
         yield from finish(model)
     finally:
-        with KVPOOL["lock"]:
-            KVPOOL["inflight"][model] -= 1
-            if not KVPOOL["inflight"][model]:
-                KVPOOL["full"][model] = False
+        leave()
 
 
 def sc_compact_notice(model, n, req):

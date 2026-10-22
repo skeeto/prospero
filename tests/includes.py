@@ -42,7 +42,7 @@ import traceback
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from scenarios import Failure, LocalHost, SshHost, XpHost, lanaddress  # noqa: E402
+from scenarios import Failure, LocalHost, SshHost, XpHost, lanaddress, settle  # noqa: E402
 
 
 # The web server
@@ -57,7 +57,8 @@ class Web(http.server.ThreadingHTTPServer):
       location  a redirect there, with status (302 by default)
       stall     send the head and half the body, then wait this long
       down      close the connection without a response
-    Every request's headers are logged by path."""
+    Every request's headers are logged by path, with "_at" the time it
+    came (time.monotonic)."""
     daemon_threads = True
     request_queue_size = 128  # cases at once, each fetching several
 
@@ -91,7 +92,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         web = self.server
         with web.lock:
             spec = web.pages.get(self.path)
-            web.log.setdefault(self.path, []).append(dict(self.headers))
+            web.log.setdefault(self.path, []).append(
+                dict(self.headers, _at=time.monotonic()))
         self.close_connection = True
         if spec is None:
             return self.reply(404, b"not found\n")
@@ -485,6 +487,15 @@ def size_cap(t):
     t.same(c.setting("", "", "model")["value"], "large", "model")
 
 
+# What a fetch cut off at its 30 s deadline reports: the time from its
+# start until the engine cut it, to the second. A busy machine moves it
+# both ways: at startup the deadline counts from the configuration's
+# opening, so a fetch that starts late is cut sooner, and an engine
+# that comes to the deadline late cuts later. The cases bound the time
+# itself (dt).
+CUTOFF = r"[1-9]\d? seconds"
+
+
 @case(bound=50)
 def stall_fresh(t):
     """A stalled server with no cached copy holds startup 30 s at most."""
@@ -498,9 +509,10 @@ def stall_fresh(t):
     finally:
         t.check(e.close() == 0, "exit")
     t.check(25 < dt < 40, f"startup took {dt:.1f} s")
-    t.same(c.diags(), [f"{t.config}:1:11: warning: cannot fetch {url} "
-                       f"(timed out after 30 seconds), include skipped"],
-           "diagnostics")
+    d = c.diags()
+    t.check(len(d) == 1 and re.fullmatch(
+        rf"{re.escape(t.config)}:1:11: warning: cannot fetch {re.escape(url)} "
+        rf"\(timed out after {CUTOFF}\), include skipped", d[0]), f"diagnostics: {d}")
 
 
 @case(bound=50)
@@ -527,8 +539,8 @@ def stall_cached(t):
     t.check(25 < dt < 40, f"the refresh took {dt:.1f} s")
     d = c.diags()
     t.check(len(d) == 1 and re.fullmatch(
-        rf".*:1:11: warning: cannot fetch {re.escape(url)} \(timed out after 30 "
-        rf"seconds\); using the copy fetched \d+ seconds ago", d[0]), d)
+        rf".*:1:11: warning: cannot fetch {re.escape(url)} \(timed out after "
+        rf"{CUTOFF}\); using the copy fetched \d+ seconds ago", d[0]), d)
 
 
 @case()
@@ -576,26 +588,46 @@ def relative(t):
 @case()
 def interval(t):
     """Each URL is fetched again at most once an interval (10 minutes,
-    here 1 s), when the engine has work, or at once on refresh."""
+    here 3 s), when the engine has work, or at once on refresh. That no
+    fetch came is checked only while the interval truly had not passed
+    when the engine answered, by the time the web server saw the last
+    fetch: a busy machine may answer later, and then a fetch is right."""
+    every = 3.0
     t.page("team.ini", body=TEAM, etag='"v1"')
     url = f"{t.url}/team.ini"
     t.write(f"include = {url}\n")
-    e = t.start(env={"HARNESS_TEST_MINUTE_MS": "100"})
+    e = t.start(env={"HARNESS_TEST_MINUTE_MS": str(int(every * 100))})
+
+    def quiet(what):
+        """The fetches so far, after work for the engine, checked to be
+        no more than before if it answered within the interval."""
+        last = t.requests("team.ini")[-1]["_at"]
+        before = len(t.requests("team.ini"))
+        e.config()
+        soon = time.monotonic() - last < every
+        time.sleep(0.3)
+        n = len(t.requests("team.ini"))
+        if soon:
+            t.same(n, before, what)
+        return n
+
     try:
-        for _ in range(3):
-            e.config()
+        deadline = time.monotonic() + 10
+        while not t.requests("team.ini") and time.monotonic() < deadline:
+            time.sleep(0.05)
         t.same(len(t.requests("team.ini")), 1, "fetched once at startup")
-        time.sleep(1.5)
+        for _ in range(3):
+            quiet("fetched once at startup")
+        time.sleep(max(0, t.requests("team.ini")[-1]["_at"] + every + 0.5 - time.monotonic()))
+        n = len(t.requests("team.ini"))
         e.config()  # work for the engine: the interval is over
         deadline = time.monotonic() + 10
-        while len(t.requests("team.ini")) < 2 and time.monotonic() < deadline:
+        while len(t.requests("team.ini")) <= n and time.monotonic() < deadline:
             time.sleep(0.05)
-        t.same(len(t.requests("team.ini")), 2, "fetched after the interval")
-        e.config()
-        time.sleep(0.3)
-        t.same(len(t.requests("team.ini")), 2, "not again so soon")
+        t.same(len(t.requests("team.ini")), n + 1, "fetched after the interval")
+        n = quiet("not again so soon")
         c = e.config(refresh=True)
-        t.same(len(t.requests("team.ini")), 3, "forced")
+        t.same(len(t.requests("team.ini")), n + 1, "forced")
         t.same(c.diags(), [], "diagnostics")
     finally:
         t.check(e.close() == 0, "exit")
@@ -719,6 +751,7 @@ def main():
         if n not in CASES:
             print(f"unknown case {n}; known: {' '.join(CASES)}")
             return 2
+    settle()
     lan = lanaddress(args.xp) if args.xp else None
     web = Web(lan or "127.0.0.1")
     threading.Thread(target=web.serve_forever, daemon=True).start()
@@ -737,7 +770,7 @@ def main():
                 name, status, dt, why = f.result()
                 print(f"{status:4} {name:14} {dt:6.1f} s  "
                       f"{why.splitlines()[0] if why else ''}")
-                if args.v and why and status == "FAIL":
+                if status == "FAIL" and "\n" in why:  # whole, for a ctest log
                     print("     " + why.replace("\n", "\n     "))
                 failed += status == "FAIL"
         print(f"{len(names) - failed}/{len(names)} cases passed")

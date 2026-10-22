@@ -161,6 +161,8 @@ if(NOT CMAKE_CROSSCOMPILING)
   endif()
   add_test(NAME unit COMMAND harness_test)
   add_test(NAME selftest COMMAND harness --selftest)
+  # It measures latencies and the reaper's start, so it runs alone
+  set_tests_properties(selftest PROPERTIES RUN_SERIAL ON)
   # The engine end to end against tests/fake_provider.py
   if(UV)
     add_test(NAME scenarios COMMAND ${UV} run
@@ -176,5 +178,16 @@ if(NOT CMAKE_CROSSCOMPILING)
     # Deploying engines through a fake ssh and scp (a real host: --ssh)
     add_test(NAME deploy COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/deploy.py --harness $<TARGET_FILE:harness>)
+    # The suites bound how long the harness takes, which a machine kept
+    # busy by other suites can miss through no fault of the harness's: a
+    # Raspberry Pi's SD card stalls for seconds under writes from several
+    # at once. ctest -j N runs tests together only as far as their
+    # processor slots fit in N, so each claims what it keeps busy: cases
+    # at once (scenarios, includes), or copies of the engine (deploy).
+    # A quad-core Pi at -j4 then runs them one or two at a time, and a
+    # bigger machine several.
+    set_tests_properties(scenarios includes PROPERTIES PROCESSORS 8)
+    set_tests_properties(deploy PROPERTIES PROCESSORS 4)
+    set_tests_properties(cleanup remote PROPERTIES PROCESSORS 2)
   endif()
 endif()

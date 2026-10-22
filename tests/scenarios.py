@@ -8,7 +8,9 @@
 Each scenario runs the real binary ("harness run", or "harness --headless"
 for cancels) in a fresh working and state directory, with a model name
 that selects a script in fake_provider.py, then checks the event sequence,
-the files left behind, the exit code and a wall-clock bound.
+the files left behind, the exit code and a wall-clock bound, which counts
+from after the directories are made, without the time spent waiting on
+ssh for a remote host's files and processes.
 
   uv run tests/scenarios.py --harness build/harness [NAME ...]
   uv run tests/scenarios.py --harness PATH --host biron.local   (Windows)
@@ -59,6 +61,24 @@ import pids as P  # noqa: E402
 # user's whose own line shows the run's own copy of the harness, by its
 # name unique to the run, or the run's directory. Never by an ancestor:
 # Windows does not reparent, so a dead creator's pid may be anyone's.
+
+# Seconds spent waiting on ssh, by the thread that asked, for runone:
+# over ssh each file operation, liveness check or kill is a connection
+# of its own, which a stalled link (XP's Wi-Fi) can hold for half a
+# minute, and that is no time of the harness's.
+LINK = threading.local()
+
+
+def linktime(fn):
+    """Count a method's time as the link's (LINK)."""
+    def timed(*args, **kw):
+        t0 = time.monotonic()
+        try:
+            return fn(*args, **kw)
+        finally:
+            LINK.secs = getattr(LINK, "secs", 0.0) + time.monotonic() - t0
+    return timed
+
 
 class LocalHost:
     windows = os.name == "nt"
@@ -149,6 +169,7 @@ class SshHost:
         subprocess.run(["ssh", "-S", self.ctl, "-O", "exit", self.host],
                        capture_output=True)
 
+    @linktime
     def ssh(self, command, **kw):
         return subprocess.run(["ssh", "-S", self.ctl, self.host, command],
                               capture_output=True, text=True, **kw)
@@ -278,6 +299,7 @@ class XpHost(SshHost):
     def close(self):
         self.sh(cleanroot(self.root), check=False)
 
+    @linktime
     def ssh(self, command, input=None, **kw):
         for attempt in range(4):
             r = subprocess.run(["ssh", "-o", "ConnectTimeout=30", self.host, command],
@@ -338,6 +360,15 @@ def cleanroot(root):
     code page (deep_unicode), through a \\\\?\\ path."""
     win = "\\\\?\\" + root.replace("/", "\\")
     return f"cd / && cmd /c 'rd /s /q {win}'; rm -rf {root}"
+
+
+def settle():
+    """Before timed work: write out what other programs, as another suite
+    under ctest, left in the page cache, which would otherwise go out in
+    the middle of it. A Raspberry Pi's SD card holds up every process
+    that writes for several seconds while it takes a burst."""
+    if hasattr(os, "sync"):
+        os.sync()
 
 
 def lanaddress(host):
@@ -3312,17 +3343,25 @@ SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")
 
 
 def runone(host, name, verbose):
+    """A scenario's bound covers the harness, not the link: the clock
+    starts once its directories and configuration are made, and the time
+    of its file operations and checks over ssh (linktime) is left out."""
     fn, conf, bound, posix, alone = SCENARIOS[name]
     if posix and host.windows:
         return name, "skip", 0.0, "POSIX only"
     t0 = time.monotonic()
+    LINK.secs = 0.0
     try:
         t = T(host, "503x3" if name == "503x3" else name, conf)
+        t0 = time.monotonic()
+        LINK.secs = 0.0
         fn(t)
-        dt = time.monotonic() - t0
+        link = LINK.secs
+        dt = time.monotonic() - t0 - link
+        over = f"(and {link:.1f} s over ssh)" if link >= 0.5 else ""
         if dt > bound:
-            return name, "FAIL", dt, f"took {dt:.1f} s, bound {bound} s"
-        return name, "ok", dt, ""
+            return name, "FAIL", dt, f"took {dt:.1f} s, bound {bound} s {over}"
+        return name, "ok", dt, over
     except Failure as e:
         return name, "FAIL", time.monotonic() - t0, str(e)
     except Exception:
@@ -3394,6 +3433,7 @@ def main():
     ap.add_argument("names", nargs="*")
     args = ap.parse_args()
 
+    settle()
     if args.xp:
         lan = lanaddress(args.xp)
         srv, url = fake_provider.start(lan)
@@ -3415,12 +3455,14 @@ def main():
             if n not in SCENARIOS:
                 print(f"unknown scenario {n}; known: {' '.join(SCENARIOS)}")
                 return 2
-        jobs = args.j or (2 if args.host or args.xp else 8)
+        # No more at once than processors here, which a small machine has
+        # fewer of than the eight that suit a big one
+        jobs = args.j or (2 if args.host or args.xp else min(8, os.cpu_count() or 8))
         failed = 0
 
         def report(name, status, dt, why):
             print(f"{status:4} {name:18} {dt:6.1f} s  {why.splitlines()[0] if why else ''}")
-            if args.v and why and status == "FAIL":
+            if status == "FAIL" and "\n" in why:  # whole, for a ctest log
                 print("     " + why.replace("\n", "\n     "))
             return status == "FAIL"
 
