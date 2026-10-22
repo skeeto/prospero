@@ -139,15 +139,37 @@ endif()
 if(PROSPERO_GUI)
   target_compile_definitions(prospero PRIVATE PROSPERO_GUI=1)
 endif()
+if(APPLE)
+  # A code-signing identity from the keychain (its name, as listed by
+  # "security find-identity -p codesigning"). Privacy grants such as
+  # Screen Recording and Accessibility belong to a signature, and the
+  # linker's ad-hoc signature changes with every build, so a stable
+  # identity, even a self-signed one, keeps them across rebuilds.
+  set(PROSPERO_SIGN_IDENTITY "" CACHE STRING
+      "macOS code-signing identity for the built programs (empty: ad hoc)")
+endif()
+if(APPLE AND PROSPERO_SIGN_IDENTITY)
+  add_custom_command(TARGET prospero POST_BUILD
+    COMMAND codesign --force --timestamp=none
+            --sign ${PROSPERO_SIGN_IDENTITY} $<TARGET_FILE:prospero>
+    VERBATIM
+  )
+endif()
 if(APPLE AND PROSPERO_GUI)
   # The same binary, also wrapped as an application bundle, which macOS
   # wants for a window of its own in the Dock and app switcher.
+  set(prospero_signapp)
+  if(PROSPERO_SIGN_IDENTITY)
+    set(prospero_signapp COMMAND codesign --force --timestamp=none
+                         --sign ${PROSPERO_SIGN_IDENTITY} Prospero.app)
+  endif()
   add_custom_command(TARGET prospero POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory Prospero.app/Contents/MacOS
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${PROJECT_SOURCE_DIR}/assets/Info.plist Prospero.app/Contents/Info.plist
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:prospero> Prospero.app/Contents/MacOS/prospero
+    ${prospero_signapp}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     VERBATIM
   )
