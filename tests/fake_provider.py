@@ -1818,7 +1818,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Start background jobs", "Start a subagent that asks",
                "Write outside as a subagent", "Make undoable changes",
                "Read the big files", "Fail over", "Stream in the background",
-               "Stream for the link")
+               "Stream for the link", "Look at the desktop")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -1908,6 +1908,16 @@ def sc_gui(model, n, req):
             yield from text(model, f"link{i} ")
             yield S.sleep(0.03)
         yield from finish(model)
+    elif "Look at the desktop" in prompt:
+        # Two screenshots (tests/fake_desktop.py as the helper), for the
+        # transcript's thumbnails
+        if step == 0:
+            yield from tool(model, n, "desktop", {"action": "screenshot"})
+        elif step == 1:
+            yield from tool(model, n, "desktop", {"action": "screenshot",
+                                                  "window": "Fake Editor"})
+        else:
+            yield from answer(model, "Looked at the desktop.")
     elif "Stream slowly" in prompt:
         yield S.head()
         for i in range(300):

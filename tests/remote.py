@@ -31,6 +31,7 @@ its scripts:
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -1156,6 +1157,24 @@ def file_cmd(t):
     e = c.call("file", sid=sid, path="events.jsonl", max=64)
     t.check(e.get("ok") == 1 and e.get("more") == 1 and e.get("off") == 64 and
             e.get("text", "").startswith('{"sid":"' + sid), f"its log, in part: {e}")
+    # A binary file, as a screenshot is: in base64, exactly, cut anywhere
+    blob = bytes(range(256)) * 3 + b"\x89PNG\r\n\x1a\n\xe2\x82"
+    with open(os.path.join(sdir, "out", "shot.png"), "wb") as f:
+        f.write(blob)
+    b = c.call("file", sid=sid, path="out/shot.png", encoding="base64")
+    t.check(b.get("ok") == 1 and "text" not in b and b.get("more") == 0 and
+            b.get("size") == len(blob) and base64.b64decode(b.get("data", "")) == blob,
+            f"the binary file whole: { {k: v for k, v in b.items() if k != 'data'} }")
+    got, off = b"", 0
+    while True:
+        p = c.call("file", sid=sid, path="out/shot.png", encoding="base64", off=off, max=100)
+        part = base64.b64decode(p.get("data", ""))
+        t.check(p.get("ok") == 1 and p.get("off") == off + len(part) and len(part) == min(100, len(blob) - off),
+                f"a part at {off}: { {k: v for k, v in p.items() if k != 'data'} }")
+        got, off = got + part, p["off"]
+        if not p.get("more"):
+            break
+    t.check(got == blob, "the binary file in parts")
     s.disconnect()
 
 

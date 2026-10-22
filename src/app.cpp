@@ -54,6 +54,7 @@
 #include "layout.cpp"
 #include "view.cpp"
 #include "theme.cpp"
+#include "png.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -183,6 +184,8 @@ enum : i32 {
     RECT_REMSSH,
     RECT_REMADD,
     RECT_OUTPUT,     // the latest tool row's Output
+    RECT_THUMB,      // the latest screenshot's thumbnail drawn
+    RECT_SHOTCLOSE,  // the Screenshot window's Close
     RECT_REFRESHINC, // the settings window's Refresh includes
     RECT_THEME0,     // the theme's choices in its open list
     RECT_COUNT = RECT_THEME0 + THEME_COUNT,
@@ -384,6 +387,92 @@ struct Saver {
     Event    done;     // the last layout is written
 };
 
+// Screenshots: a desktop call's PNG, out/CALL.png in its session's
+// directory, which the file command brings in base64 through the
+// session's host, one fetch at a time, decoded once whole, shown as a
+// thumbnail on its tool row and whole in the Screenshot window.
+// Thumbnails are kept in IMG_SLOTS, fetched as their rows are first
+// drawn, the slot drawn longest ago making room. Each texture lives in
+// a reservation of its own with its pixels, which goes once the
+// renderer has let the texture go, a frame or two after it is dropped.
+enum : i32 {
+    IMG_SLOTS  = 24,
+    IMG_THUMBW = 320,   // the thumbnail's box, in units at scale 1
+    IMG_THUMBH = 200,
+    IMG_TEXMAX = 8192,  // pixels along a texture's edge, else shrunk
+    IMG_STRMAX = 256,   // bytes of a path or an error kept
+};
+
+enum : iz {
+    IMG_FILEMAX   = sizeof(void *)==8 ? (iz)32<<20 : (iz)8<<20,  // bytes
+    IMG_MAXPIXELS = sizeof(void *)==8 ? (iz)1<<24  : (iz)1<<22,
+    // A fetch's: the PNG, then its pixels and the decoder's temporaries
+    IMG_REGION    = 2*IMG_FILEMAX + 25*IMG_MAXPIXELS + ((iz)1<<20),
+};
+
+enum : i32 {
+    IMG_EMPTY,
+    IMG_WANT,    // waiting for its fetch
+    IMG_FETCH,
+    IMG_READY,
+    IMG_FAILED,
+};
+
+struct GuiTex {
+    GuiTex        *next;   // in the list of the dying
+    Region        *r;
+    ImTextureData  td;
+};
+
+// A string in a buffer of its own, cut to fit.
+struct ImgStr {
+    u8 buf[IMG_STRMAX];
+    iz len;
+};
+
+struct ImgSlot {
+    GuiSession *s;
+    ImgStr      path;
+    i32         state;   // IMG_*
+    GuiTex     *tex;
+    ImgStr      err;
+    i64         used;    // the frame that last drew it
+    i64         opens;   // its host's links when it failed
+};
+
+struct ImgView {
+    GuiSession *s;       // null if none
+    ImgStr      path;
+    i32         w;       // the image's size, as its record gave it
+    i32         h;
+    i32         state;   // IMG_*
+    GuiTex     *tex;
+    ImgStr      err;
+    b32         open;
+    b32         focus;   // brought to the front next frame
+    b32         fit;     // scaled down to fit the window
+};
+
+struct ImgFetch {
+    GuiSession *s;       // null if none
+    ImgStr      path;
+    i64         id;      // the file command in flight
+    i64         off;
+    Region     *r;
+    Arena       mem;
+    u8         *png;     // size bytes, once the first part came
+    i64         size;
+};
+
+struct Images {
+    ImgSlot   slots[IMG_SLOTS];
+    ImgView   view;
+    ImgFetch  fetch;
+    GuiTex   *dying;
+    i64       decodes;   // PNGs decoded, and how long that took
+    i64       decodeus;
+};
+
 struct DriveOp;
 
 struct Gui {
@@ -507,6 +596,7 @@ struct Gui {
     b32                remok;
     GuiHost           *newhost;    // the new session's host
     OutFile            out;        // the Output window's file
+    Images             img;        // screenshots
     b32                outopen;
     b32                outfocus;   // brought to the front next frame
 
@@ -612,6 +702,8 @@ struct Gui {
     i32                infoagents;   // of them AGENTS.md
     i32                bgbadge;      // the session shown was badged background
     b32                outshown;     // the Output window showed text
+    i32                thumbsdrawn;  // thumbnails drawn with their image
+    b32                shotshown;    // the Screenshot window drew its image
     b32                downshown;    // a host's countdown to its next try
     b32                elseshown;    // closing said what runs on elsewhere
     b32                failshown;    // the Hosts panel said why one failed
@@ -958,8 +1050,11 @@ static void guiselect(Gui *g, GuiSession *s)
 
 // No more records of a session: its host may close it, unless another
 // of its clients has it open.
+static void imgdrop(Gui *, GuiSession *);
+
 static void guiclose(Gui *g, GuiSession *s)
 {
+    imgdrop(g, s);
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 128);
     EvOut w = cmdopen(g, &b, CMD_CLOSE, s);
@@ -1028,6 +1123,386 @@ static void onfile(Gui *g, Json *j, b32 ok, Str err)
     o->off  = jsonint(jsonget(j, "off"), o->off);
     o->size = jsonint(jsonget(j, "size"), 0);
     o->more = jsonint(jsonget(j, "more"), 0) != 0;
+}
+
+
+// Screenshots
+
+static Str imgstr(ImgStr *b)
+{
+    return {b->buf, b->len};
+}
+
+static void imgset(ImgStr *b, Str s)
+{
+    b->len = s.len<(iz)IMG_STRMAX ? s.len : (iz)IMG_STRMAX;
+    copybytes(b->buf, s.data, b->len);
+}
+
+static b32 imgis(GuiSession *s, ImgStr *path, GuiSession *s2, Str path2)
+{
+    return s && s==s2 && imgstr(path)==path2;
+}
+
+// A texture of a copy of the pixels, which the renderer creates when it
+// next draws. Null if there is no memory for it.
+static GuiTex *newtex(Gui *g, u8 *rgba, i32 w, i32 h)
+{
+    iz      n = (iz)w * h * 4;
+    Region *r = os_reserve(g->os, n + (iz)sizeof(GuiTex) + 4096);
+    if (!r) {
+        return 0;
+    }
+    Arena   a = newarena(r);
+    GuiTex *t = alloc<GuiTex>(&a);
+    u8     *p = allocbytes(&a, n);
+    copybytes(p, rgba, n);
+    t->r = r;
+    ImTextureData *td = &t->td;
+    td->Format        = ImTextureFormat_RGBA32;
+    td->Width         = w;
+    td->Height        = h;
+    td->BytesPerPixel = 4;
+    td->Pixels        = p;
+    td->UseColors     = 1;
+    td->UsedRect.w    = (unsigned short)w;
+    td->UsedRect.h    = (unsigned short)h;
+    td->UpdateRect.x  = (unsigned short)~0;
+    td->UpdateRect.y  = (unsigned short)~0;
+    td->Status        = ImTextureStatus_WantCreate;
+    ImGui::RegisterUserTexture(td);
+    return t;
+}
+
+// Drop a texture: the renderer destroys it at the next frame, and the
+// frame after that releases it (imgreap). Frames go on until then.
+static void killtex(Gui *g, GuiTex *t)
+{
+    if (t) {
+        t->td.WantDestroyNextFrame = 1;
+        t->next = g->img.dying;
+        g->img.dying = t;
+        scheddirty(&g->sched);
+    }
+}
+
+// Between frames: release the textures the renderer has destroyed.
+static void imgreap(Gui *g)
+{
+    for (GuiTex **p = &g->img.dying; *p;) {
+        GuiTex *t = *p;
+        if (t->td.Status == ImTextureStatus_Destroyed) {
+            *p = t->next;
+            ImGui::UnregisterUserTexture(&t->td);
+            t->td.Pixels = 0;
+            os_release(g->os, t->r);
+        } else {
+            p = &t->next;
+        }
+    }
+}
+
+// Ask for the fetch's next part.
+static void imgrequest(Gui *g)
+{
+    ImgFetch *f = &g->img.fetch;
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + f->path.len);
+    EvOut w = cmdopen(g, &b, CMD_FILE, f->s);
+    putkey(&w.json, "path");
+    putstr(&w.json, imgstr(&f->path));
+    putkey(&w.json, "off");
+    putint(&w.json, f->off);
+    putkey(&w.json, "encoding");
+    putstr(&w.json, "base64");
+    f->id = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+static void imgdone(Gui *g, Png *p, Str err);
+
+// Start the next fetch, if none runs: the Screenshot window's first,
+// then the thumbnail drawn latest.
+static void imgnext(Gui *g)
+{
+    Images   *m = &g->img;
+    ImgFetch *f = &m->fetch;
+    if (f->s) {
+        return;
+    }
+    if (m->view.s && m->view.state==IMG_WANT) {
+        f->s = m->view.s;
+        imgset(&f->path, imgstr(&m->view.path));
+    } else {
+        ImgSlot *best = 0;
+        for (i32 i = 0; i < IMG_SLOTS; i++) {
+            ImgSlot *sl = m->slots + i;
+            if (sl->state==IMG_WANT && (!best || sl->used>best->used)) {
+                best = sl;
+            }
+        }
+        if (!best) {
+            return;
+        }
+        f->s = best->s;
+        imgset(&f->path, imgstr(&best->path));
+    }
+
+    Str path = imgstr(&f->path);
+    for (i32 i = 0; i < IMG_SLOTS; i++) {
+        ImgSlot *sl = m->slots + i;
+        if (imgis(sl->s, &sl->path, f->s, path)) {
+            sl->state = IMG_FETCH;
+        }
+    }
+    if (imgis(m->view.s, &m->view.path, f->s, path)) {
+        m->view.state = IMG_FETCH;
+    }
+    f->r = os_reserve(g->os, IMG_REGION);
+    if (!f->r) {
+        imgdone(g, 0, "out of memory");
+        return;
+    }
+    f->mem = newarena(f->r);
+    imgrequest(g);
+}
+
+// The thumbnail's size in pixels: the image in the box at the display's
+// scale, aspect kept, never larger than it is.
+static Thumb thumbpixels(Gui *g, i32 w, i32 h)
+{
+    f32 fb = ImGui::GetIO().DisplayFramebufferScale.x;
+    fb = fb>0 ? fb : 1;
+    f32 bw = (f32)IMG_THUMBW * g->scale * fb;
+    f32 bh = (f32)IMG_THUMBH * g->scale * fb;
+    f32 s  = bw/(f32)w < bh/(f32)h ? bw/(f32)w : bh/(f32)h;
+    s = s<1 ? s : 1;
+    Thumb r = {};
+    r.w = (f32)(i32)((f32)w*s + 0.5f);
+    r.h = (f32)(i32)((f32)h*s + 0.5f);
+    r.w = r.w<1 ? 1 : r.w;
+    r.h = r.h<1 ? 1 : r.h;
+    return r;
+}
+
+// The fetch ended, with the decoded image or an error: textures for
+// whatever waits for it, and on to the next.
+static void imgdone(Gui *g, Png *p, Str err)
+{
+    Images   *m    = &g->img;
+    ImgFetch *f    = &m->fetch;
+    Str       path = imgstr(&f->path);
+    for (i32 i = 0; i < IMG_SLOTS; i++) {
+        ImgSlot *sl = m->slots + i;
+        if (!imgis(sl->s, &sl->path, f->s, path) || sl->state!=IMG_FETCH) {
+            continue;
+        }
+        if (err.data) {
+            sl->state = IMG_FAILED;
+            sl->opens = sl->s->host->opens;
+            imgset(&sl->err, err);
+            continue;
+        }
+        Thumb  tp = thumbpixels(g, p->width, p->height);
+        i32    tw = (i32)tp.w;
+        i32    th = (i32)tp.h;
+        Arena  a  = f->mem;
+        u8    *px = tw==p->width && th==p->height ? p->rgba :
+                    shrink(&a, p->rgba, p->width, p->height, tw, th);
+        sl->tex   = newtex(g, px, tw, th);
+        sl->state = sl->tex ? IMG_READY : IMG_FAILED;
+        imgset(&sl->err, sl->tex ? Str{} : Str("out of memory"));
+    }
+    ImgView *v = &m->view;
+    if (imgis(v->s, &v->path, f->s, path) && v->state==IMG_FETCH) {
+        if (err.data) {
+            v->state = IMG_FAILED;
+            imgset(&v->err, err);
+        } else {
+            // Too big for a texture: shrunk to fit one
+            i32   w  = p->width;
+            i32   h  = p->height;
+            u8   *px = p->rgba;
+            if (w>IMG_TEXMAX || h>IMG_TEXMAX) {
+                f32   s = (f32)IMG_TEXMAX / (f32)(w>h ? w : h);
+                i32   tw = (i32)((f32)w*s);
+                i32   th = (i32)((f32)h*s);
+                Arena a  = f->mem;
+                tw = tw<1 ? 1 : tw;
+                th = th<1 ? 1 : th;
+                px = shrink(&a, px, w, h, tw, th);
+                w  = tw;
+                h  = th;
+            }
+            v->tex   = newtex(g, px, w, h);
+            v->state = v->tex ? IMG_READY : IMG_FAILED;
+            imgset(&v->err, v->tex ? Str{} : Str("out of memory"));
+        }
+    }
+    if (f->r) {
+        os_release(g->os, f->r);
+    }
+    *f = {};
+    imgnext(g);
+    scheddirty(&g->sched);
+}
+
+// A part of the fetch's file arrived: the next asked for, or once all
+// is here, decoded.
+static void onimgfile(Gui *g, Arena scratch, Json *j, b32 ok, Str err)
+{
+    ImgFetch *f = &g->img.fetch;
+    f->id = 0;
+    if (!ok) {
+        imgdone(g, 0, err.len ? err : Str("cannot read the file"));
+        return;
+    }
+    Json *d = jsonget(j, "data");
+    if (d->type != JSON_STRING) {
+        imgdone(g, 0, "its host is too old to send images");
+        return;
+    }
+    Unbase64 u    = unbase64(&scratch, jsonstr(d));
+    i64      size = jsonint(jsonget(j, "size"), 0);
+    if (!u.ok) {
+        imgdone(g, 0, "a part of it came garbled");
+        return;
+    }
+    if (!f->png) {
+        if (size < 1) {
+            imgdone(g, 0, "the file is empty");
+            return;
+        } else if (size > IMG_FILEMAX) {
+            imgdone(g, 0, "the file is too big to show");
+            return;
+        }
+        f->size = size;
+        f->png  = allocbytes(&f->mem, (iz)size);
+    }
+    if (u.data.len > f->size-f->off || jsonint(jsonget(j, "off"), -1)!=f->off+u.data.len) {
+        imgdone(g, 0, "the file changed while it was read");
+        return;
+    }
+    copybytes(f->png+f->off, u.data.data, u.data.len);
+    f->off += u.data.len;
+    if (jsonint(jsonget(j, "more"), 0)) {
+        if (!u.data.len) {
+            imgdone(g, 0, "the file changed while it was read");
+        } else {
+            imgrequest(g);
+        }
+        return;
+    } else if (f->off != f->size) {
+        imgdone(g, 0, "the file changed while it was read");
+        return;
+    }
+
+    i64 t0 = os_ticks(g->os);
+    Png p  = pngdecode(&f->mem, {f->png, (iz)f->size}, IMG_MAXPIXELS);
+    g->img.decodes++;
+    g->img.decodeus += os_ticks(g->os) - t0;
+    if (p.err.data) {
+        imgdone(g, 0, concat(&scratch, "not an image it can show: ", p.err));
+        return;
+    }
+    imgdone(g, &p, {});
+}
+
+// The thumbnail slot of a session's screenshot, as its row draws in
+// this frame: fetched once, kept while there is room. Null if every
+// slot was drawn in this frame.
+static ImgSlot *imgslot(Gui *g, GuiSession *s, Str path)
+{
+    Images  *m   = &g->img;
+    i64      now = g->total.frames;
+    ImgSlot *old = 0;
+    for (i32 i = 0; i < IMG_SLOTS; i++) {
+        ImgSlot *sl = m->slots + i;
+        if (imgis(sl->s, &sl->path, s, path)) {
+            sl->used = now;
+            if (sl->state==IMG_FAILED && sl->opens!=s->host->opens) {
+                sl->state = IMG_WANT;  // its host is back: once more
+                imgnext(g);
+            }
+            return sl;
+        } else if (sl->state==IMG_FETCH || sl->used==now) {
+            continue;
+        } else if (!old || sl->state==IMG_EMPTY ||
+                   (old->state!=IMG_EMPTY && sl->used<old->used)) {
+            old = sl;
+        }
+    }
+    if (!old || path.len>IMG_STRMAX) {
+        return 0;
+    }
+    killtex(g, old->tex);
+    *old = {};
+    old->s     = s;
+    old->state = imgis(m->fetch.s, &m->fetch.path, s, path) ? IMG_FETCH : IMG_WANT;
+    old->used  = now;
+    imgset(&old->path, path);
+    imgnext(g);
+    return old;
+}
+
+// Show a screenshot whole in the Screenshot window.
+static void imgopen(Gui *g, GuiSession *s, Str path, i32 w, i32 h)
+{
+    ImgView *v = &g->img.view;
+    v->open  = 1;
+    v->focus = 1;
+    scheddirty(&g->sched);
+    if (imgis(v->s, &v->path, s, path) && v->state!=IMG_FAILED) {
+        return;
+    }
+    killtex(g, v->tex);
+    v->tex   = 0;
+    v->s     = s;
+    v->w     = w;
+    v->h     = h;
+    v->err   = {};
+    v->state = path.len>IMG_STRMAX ? IMG_FAILED :
+               imgis(g->img.fetch.s, &g->img.fetch.path, s, path) ? IMG_FETCH : IMG_WANT;
+    imgset(&v->path, path);
+    if (v->state == IMG_FAILED) {
+        imgset(&v->err, "its path is too long");
+    }
+    imgnext(g);
+}
+
+// The Screenshot window closed: its image goes.
+static void imgclose(Gui *g)
+{
+    ImgView *v = &g->img.view;
+    killtex(g, v->tex);
+    v->tex   = 0;
+    v->s     = 0;
+    v->open  = 0;
+    v->state = IMG_EMPTY;
+}
+
+// A session's images go, as it closes here, or its host goes: its
+// thumbnails, the Screenshot window's if it is one of them, and its
+// fetch, whose reply, if it comes, is then ignored.
+static void imgdrop(Gui *g, GuiSession *s)
+{
+    Images *m = &g->img;
+    for (i32 i = 0; i < IMG_SLOTS; i++) {
+        if (m->slots[i].s == s) {
+            killtex(g, m->slots[i].tex);
+            m->slots[i] = {};
+        }
+    }
+    if (m->view.s == s) {
+        imgclose(g);
+    }
+    if (m->fetch.s == s) {
+        if (m->fetch.r) {
+            os_release(g->os, m->fetch.r);
+        }
+        m->fetch = {};
+        imgnext(g);
+    }
 }
 
 // A new session in cwd, with the given model or the configured one,
@@ -1389,6 +1864,8 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_FILE:
         if (id == g->out.id) {
             onfile(g, j, ok, err);
+        } else if (id == g->img.fetch.id) {
+            onimgfile(g, scratch, j, ok, err);
         }
         return;
 
@@ -1728,7 +2205,13 @@ static void reissue(Gui *g)
         case CMD_CONFIGGET: g->cfgget = 0; guiconfigget(g); break;
         case CMD_OPEN:      if (q.s && q.s->openid==q.id) guiopen(g, q.s); break;
         case CMD_NEW:       g->newid = 0; guilist(g, e); break;  // it shows there
-        case CMD_FILE:      if (g->out.id == q.id) g->out.id = 0; break;
+        case CMD_FILE:
+            if (g->out.id == q.id) {
+                g->out.id = 0;
+            } else if (g->img.fetch.id == q.id) {
+                imgrequest(g);  // the same part again
+            }
+            break;
         }
     }
 }
@@ -1938,6 +2421,10 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
     if (h->up && was!=RS_UP) {
         h->opens++;
         guilist(g, h);
+        ImgFetch *f = &g->img.fetch;
+        if (f->s && f->s->host==h && f->id) {
+            imgrequest(g);  // its reply may have gone with the link
+        }
     }
     if (msg.len && h->state!=RS_UP) {
         Buf b(&a, 128 + msg.len);
@@ -1977,6 +2464,11 @@ static void onhostend(Gui *g, GuiHost *h)
     h->closing   = 0;
     h->reconnect = 0;
     h->state     = h->state==RS_FAILED ? RS_FAILED : RS_CLOSED;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->host == h) {
+            imgdrop(g, s);  // closed with its host
+        }
+    }
     if (h->kind!=GH_LOCAL || h->own) {
         if (again) {
             hostagain(g, h);  // asked for while it was closing
@@ -3237,6 +3729,7 @@ static void gui_frame(Gui *g)
     }
     g->fonts.gen++;
     g->layoutus = 0;
+    g->thumbsdrawn = 0;
     cachereset(g->vcache, 0);
     if (g->held && s->now>=g->holduntil) {
         gui_wake(g);  // the hold is over: take what piled up
@@ -3262,6 +3755,7 @@ static void gui_frame(Gui *g)
     i64          laid   = g->view->laidout;
     g->benchtex0 = atlas->TexData ? atlas->TexData->Width : 0;
 
+    imgreap(g);  // before this frame lists the textures
     os_guinewframe(g->os);
     if (g->drive && g->drivemoved) {
         // The backend reads the real mouse when the window has focus and
@@ -3290,6 +3784,9 @@ static void gui_frame(Gui *g)
     uideadlines(g, s);
     if (g->bench) {
         busy |= BUSY_APP;
+    }
+    if (g->img.dying) {
+        busy |= BUSY_TEX;
     }
     if (g->quitat) {
         schedat(s, g->quitat, DUE_APP);
@@ -3761,6 +4258,7 @@ enum : i32 {
     OP_DROPLINK,  // break the shown session's host's stream (remotedrop)
     OP_TEXTRCWD,  // type the --rcwd directory, the remote one
     OP_MARKDELTAS,// remember the deltas the shown session has had
+    OP_IFSESS,    // unless a session's title starts with text, skip dx ops
 };
 
 enum : i32 {
@@ -3814,6 +4312,8 @@ enum : i32 {
     T_HOSTITEM,    // the host named by text, in that list once open
     T_OUTPUT,      // the latest tool row's Output
     T_REFRESHINC,  // the settings' Refresh includes
+    T_THUMB,       // the latest screenshot thumbnail drawn
+    T_SHOTCLOSE,   // the Screenshot window's Close
 };
 
 enum : i32 {
@@ -3918,6 +4418,10 @@ enum : i32 {
     CHK_OWNNEW,
     CHK_CLOSEREMOTE,
     CHK_REMOTEFAILED,
+    CHK_THUMBS,
+    CHK_SHOTOPEN,
+    CHK_SHOTCLOSED,
+    CHK_IMGQUIET,
     CHK_COUNT,
 };
 
@@ -3999,6 +4503,10 @@ static Str chknames[] = {
     "a new session went to this process's own host",
     "closing says the remote turn keeps running there",
     "a remote that cannot work failed, saying why",
+    "screenshots show as thumbnails on their tool rows",
+    "a thumbnail's click opened the screenshot whole, at its size",
+    "closed, the Screenshot window let its texture go",
+    "no frames while screenshots show, once loaded",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -4038,6 +4546,8 @@ enum : i32 {
     W_OUTPUT,     // the Output window's file came
     W_FILE,       // the file named by text exists in --cwd
     W_REFRESHED,  // a config.get {refresh} was answered
+    W_THUMBS,     // the session shown's thumbnails came, and drew
+    W_SHOT,       // the Screenshot window's image came, or failed
 };
 
 static Str waitnames[] = {
@@ -4049,9 +4559,9 @@ static Str waitnames[] = {
     "a compaction", "the endpoint's line", "streaming", "the window to go",
     "the window to come back", "a background host", "the remote host",
     "the link to drop", "the remote to close", "the output", "a file",
-    "the includes",
+    "the includes", "the thumbnails", "the screenshot",
 };
-static_assert(countof(waitnames) == W_REFRESHED+1);
+static_assert(countof(waitnames) == W_SHOT+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -4255,6 +4765,33 @@ static DriveOp m3ops[] = {
     {OP_MARK, 0, 0, 0, 2500, ""},
     {OP_CHECK, CHK_ROQUIET, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "0-readonly"},
+    // A session with two screenshots (tests/gui.py, on POSIX): their
+    // thumbnails, through the file command, then one whole in the
+    // Screenshot window, and closed; no frames meanwhile but for input
+    {OP_IFSESS, 0, 23, 0, 0, "Look at the desktop."},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Look at the desktop."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_WAIT, W_THUMBS, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_THUMBS, 0, 0, 1000, ""},
+    {OP_MARK, 0, 0, 0, 2500, ""},
+    {OP_CHECK, CHK_IMGQUIET, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "0-thumbs"},
+    {OP_MOVE, T_THUMB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SHOT, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 800, ""},
+    {OP_CHECK, CHK_SHOTOPEN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "0-screenshot"},
+    {OP_MOVE, T_SHOTCLOSE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_SHOTCLOSED, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_MARK, 0, 0, 0, 2500, ""},
+    {OP_CHECK, CHK_IMGQUIET, 0, 0, 0, ""},
     {OP_MAIN, 0, 0, 0, 500, ""},
     // Dragging the dock splitter
     {OP_MOVE, T_SPLITTER, 0, 0, 300, ""},
@@ -5203,6 +5740,8 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_HOSTCOMBO:     return rectcenter(g->rects[RECT_HOSTCOMBO]);
     case T_OUTPUT:        return rectcenter(g->rects[RECT_OUTPUT]);
     case T_REFRESHINC:    return rectcenter(g->rects[RECT_REFRESHINC]);
+    case T_THUMB:         return rectcenter(g->rects[RECT_THUMB]);
+    case T_SHOTCLOSE:     return rectcenter(g->rects[RECT_SHOTCLOSE]);
     case T_HOSTITEM:
         for (i32 i = 0; i < countof(g->hostitems); i++) {
             GuiHost *h = g->hostitems[i];
@@ -5344,10 +5883,38 @@ static GuiHost *drivehost(Gui *g, i32 kind)
     return 0;
 }
 
+// The thumbnail slots of the session shown: how many are ready, and
+// how many are still to come.
+struct ImgCount {
+    i32 ready;
+    i32 waiting;
+    i32 failed;
+};
+
+static ImgCount imgcount(Gui *g)
+{
+    ImgCount r = {};
+    for (i32 i = 0; i < IMG_SLOTS; i++) {
+        ImgSlot *sl = g->img.slots + i;
+        if (sl->s && sl->s==g->sess) {
+            r.ready   += sl->state == IMG_READY;
+            r.waiting += sl->state==IMG_WANT || sl->state==IMG_FETCH;
+            r.failed  += sl->state == IMG_FAILED;
+        }
+    }
+    return r;
+}
+
 static b32 drivewaitdone(Gui *g)
 {
     View *v = g->view;
     switch (g->drivewait) {
+    case W_THUMBS: {
+        ImgCount n = imgcount(g);
+        return g->sess && !n.waiting && n.ready+n.failed>0 && g->thumbsdrawn>0;
+    }
+    case W_SHOT:
+        return g->img.view.state==IMG_READY || g->img.view.state==IMG_FAILED;
     case W_STREAMING:
         return g->sess && v->state==LIVE_STREAMING && v->deltas>0;
     case W_SHED:
@@ -5591,6 +6158,58 @@ static b32 drivecheck(Gui *g, i32 chk)
     ImGuiContext &c = *GImGui;
     View         *v = g->view;
     switch (chk) {
+    case CHK_THUMBS: {
+        // Both of the session's screenshots, as their records say
+        ImgCount n     = imgcount(g);
+        i32      shots = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewMsg *m = &v->msgs[i];
+            shots += m->role==VIEW_TOOL && m->tool->image.len && m->tool->imgw>0;
+        }
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drive: screenshots ");
+        print(&b, (i64)shots);
+        print(&b, ", thumbnails ready ");
+        print(&b, (i64)n.ready);
+        print(&b, ", failed ");
+        print(&b, (i64)n.failed);
+        print(&b, ", drawn ");
+        print(&b, (i64)g->thumbsdrawn);
+        print(&b, "; PNGs decoded ");
+        print(&b, g->img.decodes);
+        print(&b, " in ");
+        printfloat(&b, (f64)g->img.decodeus/1000, 1);
+        print(&b, " ms");
+        guilog(g, finish(&b));
+        return shots==2 && n.ready==2 && !n.failed && g->thumbsdrawn==2;
+    }
+    case CHK_SHOTOPEN: {
+        ImgView *iv = &g->img.view;
+        return iv->open && iv->state==IMG_READY && g->shotshown && iv->tex &&
+               iv->tex->td.Width==iv->w && iv->tex->td.Height==iv->h &&
+               ImGui::FindWindowByName("Screenshot") &&
+               ImGui::FindWindowByName("Screenshot")->Active;
+    }
+    case CHK_SHOTCLOSED: {
+        ImGuiWindow *w = ImGui::FindWindowByName("Screenshot");
+        return !g->img.view.open && !g->img.view.tex && !g->img.dying && (!w || !w->Active);
+    }
+    case CHK_IMGQUIET: {
+        // The probe's, and the overlay's numbers if shown
+        i64   n     = g->total.frames - g->driveframes;
+        i64   us    = g->sched.now - g->markat;
+        i64   other = (g->metricsshown ? 4*us/1000000 : 0) + 2;
+        Arena a     = g->frame;
+        Buf   b(&a, 96);
+        print(&b, "drive: frames with screenshots shown: ");
+        print(&b, n);
+        print(&b, " in ");
+        printfloat(&b, (f64)us/1e6, 1);
+        print(&b, " s");
+        guilog(g, finish(&b));
+        return n <= other;
+    }
     case CHK_TOOLTIP:       return tooltipup();
     case CHK_NOTOOLTIP:     return !tooltipup();
     case CHK_POPUP:         return c.OpenPopupStack.Size > 0;
@@ -6525,6 +7144,18 @@ static void drivestep(Gui *g)
         e.text = g->driverwd;  // null-terminated, from the command line
         os_guiinject(g->os, &e);
         break;
+    case OP_IFSESS: {
+        b32 found = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            Str t = s->view && s->view->title.len ? s->view->title : s->title;
+            found |= startswith(t, op->text);
+        }
+        if (!found) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, "drive: skip, with no session titled ", op->text));
+            g->drivepc += (i32)op->dx;
+        }
+    } break;
     case OP_MARKDELTAS:
         g->deltamark = g->view->deltabytes;
         break;

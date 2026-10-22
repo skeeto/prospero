@@ -59,15 +59,16 @@ enum : u32 {
     BUSY_DOCK   = 1u<<9,   // docking requests are pending
     BUSY_APP    = 1u<<10,  // the app animates (smooth scrolling)
     BUSY_LAYOUT = 1u<<11,  // a window's content size changes next frame
+    BUSY_TEX    = 1u<<12,  // dropped textures wait for the renderer
 };
 
 enum : i32 {
-    BUSY_COUNT = 12,
+    BUSY_COUNT = 13,
 };
 
 static Str busynames[] = {
     "mouse", "key", "dim", "navwin", "drag", "hidden", "queue", "scroll",
-    "tabs", "dock", "app", "layout",
+    "tabs", "dock", "app", "layout", "textures",
 };
 static_assert(countof(busynames) == BUSY_COUNT);
 

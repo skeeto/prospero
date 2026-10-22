@@ -7246,21 +7246,25 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     emit(e, evend(&w));
 }
 
-// file {sid, path, off?, max?}: part of a file in the session's
+// file {sid, path, off?, max?, encoding?}: part of a file in the session's
 // directory, for a frontend that cannot read it there, as on another
 // machine: a spill file, out/N.log. The path is relative, and it and
 // what it resolves to stay inside the directory. From off (0), up to max
 // bytes, or FILECMD_MAX, or less where the frontend's mailbox could not
 // take the reply. The reply has the text, cleaned as tool output is and
 // cut on a UTF-8 boundary, off where the next part begins, the file's
-// size, and more:1 if there is more after it.
+// size, and more:1 if there is more after it. With encoding "base64",
+// for a binary file such as a screenshot, the part comes as is in
+// base64, as data rather than text, and cut anywhere.
 static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
 {
-    Os *os   = e->os;
-    Str path = jsonstr(jsonget(j, "path"));
-    i64 off  = jsonint(jsonget(j, "off"), 0);
-    i64 max  = jsonint(jsonget(j, "max"), FILECMD_MAX);
-    iz  most = mailmax(e->out) / 8;  // every byte may be escaped
+    Os *os     = e->os;
+    Str path   = jsonstr(jsonget(j, "path"));
+    i64 off    = jsonint(jsonget(j, "off"), 0);
+    i64 max    = jsonint(jsonget(j, "max"), FILECMD_MAX);
+    b32 binary = jsonstr(jsonget(j, "encoding")) == "base64";
+    // Every byte may be escaped, or base64 takes 4 for 3
+    iz  most   = mailmax(e->out) / (binary ? 2 : 8);
     most = most<(iz)FILECMD_MAX ? most : (iz)FILECMD_MAX;
     max  = max<1 || max>most ? most : max;
 
@@ -7288,20 +7292,20 @@ static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     }
     Str data = rd.data;
     b32 more = off+data.len < rd.size;
-    if (more) {
+    if (more && !binary) {
         // Before any character at the end, which may be cut short
         iz i = data.len - 1;
         for (; i>0 && data.len-i<4 && (data[i]&0xc0)==0x80; i--) {}
         data.len = i>0 && data[i]>=0x80 ? i : data.len;
     }
 
-    Str   text = cleanoutput(&scratch, data);
+    Str   text = binary ? base64(&scratch, data) : cleanoutput(&scratch, data);
     Buf   b(&scratch, 256 + 6*text.len);
     EvOut w = evbegin(&b, s->sid, 0, os_time(os), EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
     putstrkey(&w.json, "path", path);
-    putstrkey(&w.json, "text", text);
+    putstrkey(&w.json, binary ? Str("data") : Str("text"), text);
     putintkey(&w.json, "off", off + data.len);
     putintkey(&w.json, "size", rd.size);
     putintkey(&w.json, "more", more);

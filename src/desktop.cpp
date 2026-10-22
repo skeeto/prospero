@@ -403,6 +403,43 @@ static Str base64(Arena *a, Str s)
     return {p, n};
 }
 
+struct Unbase64 {
+    Str data;
+    b32 ok;
+};
+
+// Decode base64, as base64 writes it: padded, with no other characters.
+static Unbase64 unbase64(Arena *a, Str s)
+{
+    Unbase64 r = {};
+    if (s.len % 4) {
+        return r;
+    }
+    iz  pad = s.len && s[s.len-1]=='=' ? 1 + (s.len>1 && s[s.len-2]=='=') : 0;
+    u8 *p   = allocbytes(a, s.len/4*3);
+    iz  n   = 0;
+    for (iz i = 0; i < s.len; i += 4) {
+        u32 v = 0;
+        for (iz k = 0; k < 4; k++) {
+            u8  c = s[i+k];
+            i32 d = c>='A' && c<='Z' ? c-'A'    :
+                    c>='a' && c<='z' ? c-'a'+26 :
+                    c>='0' && c<='9' ? c-'0'+52 :
+                    c=='+' ? 62 : c=='/' ? 63 : -1;
+            if (d<0 && !(c=='=' && i+k>=s.len-pad)) {
+                return r;
+            }
+            v = v<<6 | (u32)(d<0 ? 0 : d);
+        }
+        p[n++] = (u8)(v >> 16);
+        p[n++] = (u8)(v >> 8);
+        p[n++] = (u8)v;
+    }
+    r.data = {p, n-pad};
+    r.ok   = 1;
+    return r;
+}
+
 // The size of a PNG from its header, or 0 by 0 if it is not one.
 struct DeskSize {
     i32 w, h;

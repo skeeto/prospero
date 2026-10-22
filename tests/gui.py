@@ -562,6 +562,20 @@ def makesessions(host, ini, state, work):
     start may show only in its log."""
     p = host.popen(["run", "-C", work, "-c", ini, "--state", state, "Say hello."])
     p.communicate(timeout=60)
+    if isinstance(host, Local):
+        # Screenshots for the transcript's thumbnails, from the fake
+        # desktop helper (Python, so on this machine only)
+        desk = host.path("desk.ini")
+        host.write(desk, (host.read(ini) or "") +
+                   "\n# The fake desktop's screenshots\n[desktop]\noffer = all\nask = false\n")
+        env = dict(os.environ, PROSPERO_TEST_DESKTOP=json.dumps(
+            [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "fake_desktop.py")]))
+        r = subprocess.run([host.prospero, "run", "-C", work, "-c", desk, "--state", state,
+                            "Look at the desktop."], cwd=work, env=env,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        shots = r.stdout.count('"image":"out/')
+        print(f"the desktop session: exit {r.returncode}, {shots} screenshots", flush=True)
     holder = host.popen(["--headless", "--state", state, "-c", ini], stdin=True)
     cmd = {"cmd": "new", "id": 1, "cwd": work, "prompt": "Hold me: say hello."}
     holder.stdin.write(json.dumps(cmd) + "\n")

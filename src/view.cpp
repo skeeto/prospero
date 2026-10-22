@@ -159,6 +159,9 @@ struct ViewTool {
     Str  child;     // a task's subagent, once it reported
     i32  snap;      // the file it changed: index+1 in the view's snaps
     b32  elided;    // pruned: the agent sees only where its output is
+    Str  image;     // a screenshot, relative to the session directory
+    i32  imgw;      // its size in pixels
+    i32  imgh;
     // Asks
     Str  req;
     Str  tool;      // the tool that asked
@@ -307,6 +310,9 @@ struct View {
     f32             gap;        // between messages
     f32             extra;      // header and padding around each message
     f32             foot;       // an open ask's buttons
+    f32             thumbw;     // the box a screenshot's thumbnail fits
+    f32             thumbh;
+    f32             thumbpad;   // and the space around it
     Sel             sel;
     i64             deltas;     // delta records applied, for rates
     i64             deltabytes;
@@ -1232,6 +1238,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->bytes   = jsonint(jsonget(j, "bytes"), 0);
         t->job     = jsonint(jsonget(j, "job"), t->job);
         t->child   = clone(&v->aux, jsonstr(jsonget(j, "child")));
+        t->image   = clone(&v->aux, jsonstr(jsonget(j, "image")));
+        t->imgw    = (i32)jsonint(jsonget(j, "width"), 0);
+        t->imgh    = (i32)jsonint(jsonget(j, "height"), 0);
         m->seq     = r->seq;
         toolbody(v, scratch, m, jsonstr(jsonget(j, "text")));
         // A call ends its ask, which after a crash has no answer
@@ -1765,12 +1774,41 @@ static Doc *msgdoc(View *v, i32 i)
     return m->doc;
 }
 
+struct Thumb {
+    f32 w;
+    f32 h;
+};
+
+// A screenshot's thumbnail: its image fit in the view's box, aspect
+// kept, an image pixel at most a unit. Zero for a row without one.
+static Thumb msgthumb(View *v, ViewMsg *m)
+{
+    Thumb r = {};
+    if (m->role!=VIEW_TOOL || m->collapsed || !m->tool->image.len ||
+            m->tool->imgw<1 || m->tool->imgh<1 || v->thumbw<1 || v->thumbh<1) {
+        return r;
+    }
+    f32 iw = (f32)m->tool->imgw;
+    f32 ih = (f32)m->tool->imgh;
+    f32 s  = v->thumbw/iw < v->thumbh/ih ? v->thumbw/iw : v->thumbh/ih;
+    s   = s<1 ? s : 1;
+    r.w = (f32)(i32)(iw*s + 0.5f);
+    r.h = (f32)(i32)(ih*s + 0.5f);
+    r.w = r.w<1 ? 1 : r.w;
+    r.h = r.h<1 ? 1 : r.h;
+    return r;
+}
+
 // Below a message's content: an open ask's buttons, or the latest
-// rewind's, when it left files alone.
+// rewind's, when it left files alone, or a screenshot's thumbnail.
 static f32 msgfoot(View *v, ViewMsg *m)
 {
     b32 ask   = m->role==VIEW_ASK && m->tool->answer==VASK_PENDING;
     b32 force = m->role==VIEW_REWIND && m->card->latest && m->card->conflicts;
+    Thumb th  = msgthumb(v, m);
+    if (th.h > 0) {
+        return th.h + v->thumbpad;
+    }
     return (ask || force) && !v->readonly ? v->foot : 0;
 }
 

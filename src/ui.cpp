@@ -1030,6 +1030,44 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
     }
 }
 
+// A screenshot's thumbnail below its tool row, fetched as it first
+// shows, which opens the image whole in the Screenshot window.
+static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, ViewTool *t,
+                      ImVec2 p0, Thumb th, f32 top, f32 bot)
+{
+    Arena    a  = g->frame;
+    f32      sc = g->scale;
+    ImVec2   p1 = v2(p0.x+th.w, p0.y+th.h);
+    b32      in = p1.y>=top && p0.y<=bot;
+    ImgSlot *sl = in ? imgslot(g, s, t->image) : 0;
+    if (sl && sl->state==IMG_READY) {
+        dl->AddImage(sl->tex->td.GetTexRef(), p0, p1);
+        g->thumbsdrawn++;
+    } else {
+        dl->AddRectFilled(p0, p1, g->pal->codebg);
+        Str msg = !in ? Str("") :
+                  !sl ? Str("Too many screenshots in view to show this one") :
+                  sl->state==IMG_FAILED ? concat(&a, "Cannot show the screenshot: ",
+                                                 imgstr(&sl->err)) :
+                  Str("Loading the screenshot...");
+        u32 col = sl && sl->state==IMG_FAILED ? g->pal->bad : g->pal->dim;
+        ImVec4 clip = ImVec4(p0.x, p0.y, p1.x, p1.y);
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), v2(p0.x+6*sc, p0.y+4*sc),
+                    col, msg.cdata, msg.cdata+msg.len, th.w-12*sc, &clip);
+    }
+    dl->AddRect(p0, p1, g->pal->rule);
+
+    ImGui::SetCursorScreenPos(p0);
+    if (ImGui::InvisibleButton("##thumb", v2(th.w, th.h))) {
+        imgopen(g, s, t->image, t->imgw, t->imgh);
+    }
+    itemrect(g, RECT_THUMB);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+    ImGui::SetItemTooltip("%dx%d pixels: open it whole", t->imgw, t->imgh);
+}
+
 // The latest rewind's button, when it left files alone.
 static void drawforce(Gui *g, GuiSession *s, ViewMsg *m)
 {
@@ -1321,6 +1359,14 @@ static void drawtranscript(Gui *g)
     v->extra = extra;
     v->foot  = foot;
     v->gap   = 6*sc;
+    f32 thumbw = (f32)IMG_THUMBW*sc<width ? (f32)IMG_THUMBW*sc : width;
+    f32 thumbh = (f32)IMG_THUMBH*sc;
+    if (v->thumbw!=thumbw || v->thumbh!=thumbh || v->thumbpad!=pad/2) {
+        v->topsdirty = 1;
+    }
+    v->thumbw   = thumbw;
+    v->thumbh   = thumbh;
+    v->thumbpad = pad/2;
 
     if (width != g->lastwidth) {
         v->topsdirty = 1;
@@ -1548,7 +1594,11 @@ static void drawtranscript(Gui *g)
             ImGui::SetCursorScreenPos(v2(x + width - act.w, y + pad/4));
             drawaction(g, gs, m, &act);
         }
-        if (mfoot>0 && m->role==VIEW_ASK) {
+        Thumb th = msgthumb(v, m);
+        if (th.h > 0) {
+            sp->SetCurrentChannel(dl, CH_TEXT);
+            drawthumb(g, gs, dl, m->tool, v2(x, y + head + m->h + pad/4), th, top, bot);
+        } else if (mfoot>0 && m->role==VIEW_ASK) {
             ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
             drawaskbuttons(g, gs, m, i==lastask);
         } else if (mfoot > 0) {
@@ -2486,6 +2536,65 @@ static void drawoutput(Gui *g)
     ImGui::EndChild();
 }
 
+// The Screenshot window: a screenshot whole, at its own size in the
+// screen's pixels, or fit to the window.
+static void drawshot(Gui *g)
+{
+    Arena    a = g->frame;
+    ImgView *v = &g->img.view;
+    if (!v->s) {
+        return;
+    }
+    i32 w = v->tex ? v->tex->td.Width  : v->w;
+    i32 h = v->tex ? v->tex->td.Height : v->h;
+    Buf b(&a, 512);
+    print(&b, imgstr(&v->path));
+    print(&b, " of ");
+    print(&b, sesstitle(v->s));
+    if (v->s->host->kind != GH_ENGINE) {
+        print(&b, ", on ");
+        print(&b, hostlabel(g, &a, v->s->host));
+    }
+    print(&b, ": ");
+    print(&b, (i64)w);
+    putbyte(&b, 'x');
+    print(&b, (i64)h);
+    print(&b, " pixels");
+    ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+    ImGui::SameLine();
+    checkbox("Fit", &v->fit);
+    ImGui::SetItemTooltip("Scale it down to fit the window");
+    ImGui::SameLine();
+    b32 close = ImGui::SmallButton("Close");
+    itemrect(g, RECT_SHOTCLOSE);
+    if (v->state == IMG_FAILED) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextWrapped("Cannot show the screenshot: %s", cstr0(&a, imgstr(&v->err)));
+        ImGui::PopStyleColor();
+    } else if (v->state != IMG_READY) {
+        ImGui::TextDisabled("Loading...");
+    }
+    ImGui::BeginChild("##shot", v2(0, 0), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_HorizontalScrollbar);
+    if (v->state == IMG_READY) {
+        f32    fb   = ImGui::GetIO().DisplayFramebufferScale.x;
+        ImVec2 size = v2((f32)w/(fb>0 ? fb : 1), (f32)h/(fb>0 ? fb : 1));
+        if (v->fit) {
+            ImVec2 room = ImGui::GetContentRegionAvail();
+            f32    s    = room.x/size.x < room.y/size.y ? room.x/size.x : room.y/size.y;
+            s    = s<1 ? s : 1;
+            s    = s>0 ? s : 1;
+            size = v2(size.x*s, size.y*s);
+        }
+        ImGui::Image(v->tex->td.GetTexRef(), size);
+        g->shotshown = 1;
+    }
+    ImGui::EndChild();
+    if (close) {
+        imgclose(g);
+    }
+}
+
 // Hosts
 
 // This process's engine, the background hosts on this machine, and the
@@ -3341,6 +3450,21 @@ static void dockwindows(Gui *g)
         }
         ImGui::End();
         g->outopen = open;
+    }
+    if (g->img.view.open) {
+        bool open = 1;
+        if (g->img.view.focus) {
+            g->img.view.focus = 0;
+            ImGui::SetNextWindowFocus();
+        }
+        ImGui::SetNextWindowSize(v2(900*g->scale, 600*g->scale), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Screenshot", &open)) {
+            drawshot(g);
+        }
+        ImGui::End();
+        if (!open) {
+            imgclose(g);
+        }
     }
     // The tab selected in its node, rather than the log: a node selects
     // the window focused last, which a new window is as it appears, so

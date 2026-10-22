@@ -1,15 +1,16 @@
 // AFL++ fuzz layer: the JSON reader and writer, or with -DFUZZ_EVENTS the
 // session log's open, recovery, and replay over a one-file stub platform,
 // or with -DFUZZ_PROVIDER the engine's parsers of untrusted text, or with
-// -DFUZZ_FRAMES the framing of remote links (frame.cpp)
+// -DFUZZ_FRAMES the framing of remote links (frame.cpp), or with
+// -DFUZZ_PNG the GUI's PNG decoder (png.cpp)
 //   $ afl-clang-fast++ -std=c++20 -fno-exceptions -fno-rtti -g3 \
 //         -fsanitize=address,undefined -fsanitize-trap=undefined \
 //         -o fuzzjson src/main_fuzz.cpp
 //   $ mkdir i && printf '{"a":[1,"\\u00e9",null]}' >i/doc
 //   $ afl-fuzz -i i -o o ./fuzzjson
 //
-// Likewise with -DFUZZ_EVENTS, -DFUZZ_PROVIDER or -DFUZZ_FRAMES for the
-// other targets.
+// Likewise with -DFUZZ_EVENTS, -DFUZZ_PROVIDER, -DFUZZ_FRAMES or
+// -DFUZZ_PNG for the other targets.
 //
 // JSON: an input either fails at an offset inside it, or parses to a root
 // spanning the input less surrounding whitespace, and writes canonical
@@ -31,6 +32,9 @@
 // and stable under renormalizing; edit matches are ordered spans inside
 // the text; and URL, discovery, error and cycle parsing never fault.
 //
+// PNG: a decode fails with a reason and no pixels, or gives pixels
+// within the limit, which shrink to a quarter.
+//
 // Without AFL++ it runs one input from standard input.
 //
 // This is free and unencumbered software released into the public domain.
@@ -38,6 +42,9 @@
 #include <string.h>
 #include <unistd.h>
 #include "prospero.cpp"
+#if FUZZ_PNG
+#  include "png.cpp"
+#endif
 
 #ifndef __AFL_FUZZ_TESTCASE_LEN
 static ssize_t fuzzlen;
@@ -602,6 +609,18 @@ static void fuzzframes(Arena a, Str src)
     }
 }
 
+#if FUZZ_PNG
+static void fuzzpng(Arena a, Str src)
+{
+    Png p = pngdecode(&a, src, 1<<20);
+    assert(!p.err.data == !!p.rgba);
+    if (p.rgba) {
+        assert(p.width>0 && p.height>0 && (i64)p.width*p.height<=1<<20);
+        shrink(&a, p.rgba, p.width, p.height, (p.width+1)/2, (p.height+1)/2);
+    }
+}
+#endif
+
 __AFL_FUZZ_INIT();
 
 int main()
@@ -628,6 +647,8 @@ int main()
         fuzzprovider(a, {src, len});
         #elif FUZZ_FRAMES
         fuzzframes(a, {src, len});
+        #elif FUZZ_PNG
+        fuzzpng(a, {src, len});
         #else
         fuzzjson(a, {src, len});
         #endif
