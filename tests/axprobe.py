@@ -9,17 +9,29 @@ itself rather than trust the helper's replies.
 
   axprobe.py PID
 
-Prints one JSON object: whether this process is trusted for
-Accessibility, the frontmost application's pid, and for each of PID's
-windows its title, whether it is main and focused, the values of its
-text areas, and its sheets' buttons. It only reads: it sets no
-attribute and performs no action. Accessibility is charged to the
+First it prints "pid N", its own pid, and asks nothing until it reads
+the line "go" from its input. Accessibility is charged to the
 responsible process, so the live test runs this under Prospero.app's
-reaper, as it runs the helper, where Prospero.app's grant applies.
+reaper, as it runs the helper, where Prospero.app's grant applies, and
+by that pid checks that it does answer to the reaper before it lets it
+go on. Any other input, or none, and it exits, having asked nothing.
+
+Then it prints one JSON object: whether this process is trusted for
+Accessibility, the frontmost application's pid by system-wide
+Accessibility (0 if unknown, with its AXError), the role of PID's own
+focused element, and for each of PID's windows its title, whether it
+is main and focused, the values of its text areas, and its sheets'
+buttons. It only reads: it sets no attribute and performs no action.
+
+As observed on macOS 27, the system-wide queries fail with -25204
+(cannot complete), and a key window's own AXFocused reads false, even
+while typed keys land in it (Focus, src/main_desktop_macos.cpp): these
+are reported, never relied on.
 """
 
 import ctypes
 import json
+import os
 import sys
 
 UTF8 = 0x08000100  # kCFStringEncodingUTF8
@@ -74,12 +86,16 @@ def cfname(s):
     return _names[s]
 
 
-def attr(e, name):
+def attr(e, name, err=None):
     """An attribute's value: a str, bool, list of elements, an element
-    (a pointer), or None if it cannot be read."""
+    (a pointer), or None if it cannot be read, its AXError then appended
+    to err, if given."""
     ax, cf = lib()
     v = ctypes.c_void_p()
-    if ax.AXUIElementCopyAttributeValue(e, cfname(name), ctypes.byref(v)) or not v.value:
+    rc = ax.AXUIElementCopyAttributeValue(e, cfname(name), ctypes.byref(v))
+    if rc or not v.value:
+        if err is not None:
+            err.append(rc)
         return None
     v = v.value
     t = cf.CFGetTypeID(v)
@@ -123,17 +139,23 @@ def buttons(e, depth=0):
 
 def probe(pid):
     ax, cf = lib()
-    r = {"trusted": bool(ax.AXIsProcessTrusted()), "frontmost": 0, "windows": []}
+    r = {"trusted": bool(ax.AXIsProcessTrusted()), "frontmost": 0,
+         "frontmost_error": 0, "focused_role": None, "windows": []}
     if not r["trusted"]:
         return r
     sys_ = ax.AXUIElementCreateSystemWide()
     ax.AXUIElementSetMessagingTimeout(sys_, 2.0)
-    front = attr(sys_, "AXFocusedApplication")
+    err = []
+    front = attr(sys_, "AXFocusedApplication", err)
+    r["frontmost_error"] = err[0] if err else 0
     if isinstance(front, int):
         p = ctypes.c_int()
         if not ax.AXUIElementGetPid(front, ctypes.byref(p)):
             r["frontmost"] = p.value
     app = ax.AXUIElementCreateApplication(pid)
+    elem = attr(app, "AXFocusedUIElement")
+    if isinstance(elem, int):
+        r["focused_role"] = attr(elem, "AXRole")
     focused = attr(app, "AXFocusedWindow")
     wins = attr(app, "AXWindows")
     for w in wins if isinstance(wins, list) else []:
@@ -155,6 +177,9 @@ def main():
     if len(sys.argv) != 2 or not sys.argv[1].isdigit():
         print(__doc__.splitlines()[0], file=sys.stderr)
         return 2
+    print(f"pid {os.getpid()}", flush=True)
+    if sys.stdin.readline().strip() != "go":
+        return 3  # not let go on: nothing asked
     print(json.dumps(probe(int(sys.argv[1]))))
     return 0
 

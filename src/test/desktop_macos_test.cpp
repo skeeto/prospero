@@ -163,19 +163,78 @@ static i32 dkselftest(Arena *a, Arena perm)
               num(a, k.codes[1]))), concat(a, "3,", num(a, 0x38)));
     }
 
-    // Whether a window has the keyboard, from what Accessibility says,
-    // and what the failure names when it has not. As in the first live
-    // run: TextEdit active, its new window not key, so keys were lost.
+    // Whether a window has the keyboard, from each account of it, and
+    // what the failure names when it has not. The first states are as
+    // observed live on macOS 27, TextEdit (500) the target and Claude
+    // (77) frontmost before.
     {
         DkWin w = {};
         w.id    = 0x2a;
         w.pid   = 500;
         w.title = "Untitled";
         w.cls   = "TextEdit";
+
+        // Before: Claude frontmost by NSWorkspace and the window server,
+        // system-wide Accessibility failing (-25204)
         Focus f = {};
+        f.pid   = 77;
+        f.wspid = 77;
+        f.app   = "Claude";
+        f.win   = 0x10;
+        f.title = "Claude";
+        check(t, "kb before", num(a, haskeyboard(&f, 500, 0x2a)), "0");
+        check(t, "kb before why", unfocused(a, &f, &w),
+              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
+              "Claude (77) is frontmost, its window 'Claude' focused; no input was sent");
+
+        // After activateWithOptions (and after SkyLight's way alike):
+        // TextEdit frontmost by NSWorkspace and the window server, its
+        // focused window the target, its focused element a text area in
+        // it, system-wide Accessibility still failing, and the window's
+        // own AXFocused 0, not consulted. A typed "x" landed: it has
+        // the keyboard. This was the false negative.
+        f       = {};
         f.pid   = 500;
+        f.wspid = 500;
         f.app   = "TextEdit";
-        f.key   = -1;
+        f.win   = 0x2a;
+        f.title = "Untitled";
+        check(t, "kb observed", num(a, haskeyboard(&f, 500, 0x2a)), "1");
+        check(t, "kb observed no element", num(a, haskeyboard(&f, 500, 0)), "1");
+        f.wspid = 0;  // the window server's account unreadable
+        check(t, "kb no window server", num(a, haskeyboard(&f, 500, 0x2a)), "1");
+        f.axpid = 500;  // system-wide Accessibility answering, and agreeing
+        check(t, "kb ax agrees", num(a, haskeyboard(&f, 500, 0x2a)), "1");
+
+        // Each readable account that contradicts refuses input
+        f.wspid = 77;
+        f.axpid = 0;
+        check(t, "kb window server differs", num(a, haskeyboard(&f, 500, 0x2a)), "0");
+        check(t, "kb window server differs no element",
+              num(a, haskeyboard(&f, 500, 0)), "0");
+        check(t, "kb window server differs why", unfocused(a, &f, &w),
+              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
+              "it is frontmost, but the window server has pid 77 in front; "
+              "no input was sent");
+        f.wspid = 500;
+        f.axpid = 77;
+        check(t, "kb ax differs", num(a, haskeyboard(&f, 500, 0x2a)), "0");
+        check(t, "kb ax differs why", unfocused(a, &f, &w),
+              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
+              "it is frontmost, but Accessibility has pid 77 focused; "
+              "no input was sent");
+        f.axpid  = 0;
+        f.astray = 1;
+        check(t, "kb element astray", num(a, haskeyboard(&f, 500, 0x2a)), "0");
+        check(t, "kb element astray why", unfocused(a, &f, &w),
+              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
+              "the window is focused, but its focused element is outside it; "
+              "no input was sent");
+        f.astray = 0;
+
+        // Frontmost with no window focused, as a launch can leave it
+        f.win   = 0;
+        f.title = {};
         check(t, "kb no window", num(a, haskeyboard(&f, 500, 0x2a)), "0");
         check(t, "kb no window why", unfocused(a, &f, &w),
               "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
@@ -183,22 +242,8 @@ static i32 dkselftest(Arena *a, Arena perm)
         check(t, "kb no element", num(a, haskeyboard(&f, 500, 0)), "1");
         check(t, "kb no element other", num(a, haskeyboard(&f, 501, 0)), "0");
 
-        f.win = 0x2a;
-        check(t, "kb key unknown", num(a, haskeyboard(&f, 500, 0x2a)), "1");
-        f.key = 1;
-        check(t, "kb key", num(a, haskeyboard(&f, 500, 0x2a)), "1");
-        f.key = 0;
-        check(t, "kb not key", num(a, haskeyboard(&f, 500, 0x2a)), "0");
-        check(t, "kb not key why", unfocused(a, &f, &w),
-              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
-              "the window is focused, but not key; no input was sent");
-        f.sheet = 1;
-        check(t, "kb sheet shown", num(a, haskeyboard(&f, 500, 0x2a)), "1");
-        f.sheet = 0;
-
         f.win   = 0x2b;
         f.title = "Untitled 2";
-        f.key   = -1;
         check(t, "kb other window", num(a, haskeyboard(&f, 500, 0x2a)), "0");
         check(t, "kb other window why", unfocused(a, &f, &w),
               "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
@@ -209,14 +254,12 @@ static i32 dkselftest(Arena *a, Arena perm)
         f.attached = 0;
 
         f.pid   = 77;
+        f.wspid = 77;
         f.app   = "Terminal";
         f.win   = 0x10;
         f.title = "zsh";
         check(t, "kb other app", num(a, haskeyboard(&f, 500, 0x2a)), "0");
         check(t, "kb other app no element", num(a, haskeyboard(&f, 500, 0)), "0");
-        check(t, "kb other app why", unfocused(a, &f, &w),
-              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
-              "Terminal (77) is frontmost, its window 'zsh' focused; no input was sent");
         f.win = 0;
         f.app = {};
         check(t, "kb other app bare why", unfocused(a, &f, &w),

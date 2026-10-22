@@ -15,7 +15,13 @@ It runs Prospero.app's own helper (Contents/MacOS/prospero-desktop) as
 the harness does when Prospero is started as an app: under Prospero's
 reaper, spawned disclaimed (tests/disclaim.py), so macOS charges the
 helper's Screen Recording and Accessibility to Prospero.app, which is
-where they are granted, and not to the terminal running this. Then:
+where they are granted, and not to the terminal (or other program)
+running this. Everything here that captures the screen, lists windows
+with their titles, or asks Accessibility anything is the helper's or
+the probe's (tests/axprobe.py), so runs that way. Before either is sent
+anything that needs a permission, it is checked to answer to the
+reaper, which must be Prospero.app's prospero and its own responsible
+process (Reaped.vouch); if not, the test stops there. Then:
 
 1. It checks both permissions, which prompts for nothing, and if one is
    missing, says what to grant to which app, and stops. With --ask, the
@@ -32,7 +38,9 @@ where they are granted, and not to the terminal running this. Then:
    run under Prospero's reaper as the helper is, so that Prospero.app's
    grant applies) and requires exactly that text: the helper's reply
    alone proves nothing, as keys sent to an application with no key
-   window are lost without a word.
+   window are lost without a word. TextEdit's text substitutions apply
+   to typed keys (a lone "x" was capitalized to "X"), so the text
+   begins with a capital, which leaves capitalization nothing to change.
 5. It takes a screenshot of the window, unscaled, and of the screen,
    scaled as for Anthropic's models, and checks that each is a PNG of
    the size the helper reported, plausible for this screen, and not of
@@ -74,7 +82,7 @@ import pids  # noqa: E402
 from desktop_macos import frame  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TEXT = "Hello from Prospero"
+TEXT = "Hello from Prospero"  # capitalized already, so autocapitalization keeps it
 TEXTEDIT = "/TextEdit.app/Contents/MacOS/TextEdit"
 ARGS = ["-NSShowAppCentricOpenPanelInsteadOfUntitledFile", "NO",
         "-ApplePersistenceIgnoreState", "YES"]
@@ -99,6 +107,7 @@ class Reaped:
 
     def __init__(self, app, args, prog=None):
         exe = os.path.join(app, "Contents", "MacOS", "prospero")
+        self.reaper = exe
         prog = prog or [os.path.join(app, "Contents", "MacOS", "prospero-desktop")]
         life_r, self.life = os.pipe()
         self.status, st_w = os.pipe()
@@ -128,6 +137,54 @@ class Reaped:
             self.buf += got
         r, self.buf = self.buf[:n], self.buf[n:]
         return r
+
+    def readline(self, timeout):
+        deadline = time.monotonic() + timeout
+        while b"\n" not in self.buf:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([self.out], [], [], left)[0]:
+                raise Stop(("no line in time", 1))
+            got = os.read(self.out, 1 << 16)
+            if not got:
+                raise Stop(("the output ended", 1))
+            self.buf += got
+        line, _, self.buf = self.buf.partition(b"\n")
+        return line.decode("utf-8", "replace")
+
+    def child(self, exe, timeout=10):
+        """The pid of the reaper's child running exe, once it runs."""
+        deadline = time.monotonic() + timeout
+        while True:
+            out = subprocess.run(["ps", "-axww", "-o", "pid=,ppid="], capture_output=True,
+                                 text=True).stdout
+            kids = []
+            for line in out.splitlines():
+                f = line.split()
+                if len(f) == 2 and pids.parse(f[1]) == [self.pid]:
+                    kids += [p for p in pids.parse(f[0]) if disclaim.pidpath(p) == exe]
+            if len(kids) == 1:
+                return kids[0]
+            if time.monotonic() >= deadline:
+                raise Stop((f"no single {exe} under the reaper (pid {self.pid}): {kids}", 1))
+            time.sleep(0.05)
+
+    def vouch(self, pid, what):
+        """Stop unless pid, a child of this reaper, answers to it, and it
+        is Prospero.app's prospero and its own responsible process: that
+        is, unless macOS charges pid's permissions to Prospero.app. Call
+        it before pid is sent anything that needs a permission. Returns
+        the step's description."""
+        parent = pids.parse(pids.psfield(pid, "ppid"))
+        resp = disclaim.responsible(pid)
+        rresp = disclaim.responsible(self.pid)
+        path = disclaim.pidpath(resp) if resp else None
+        if parent != [self.pid] or resp != self.pid or rresp != self.pid or path != self.reaper:
+            raise Stop((f"{what} (pid {pid}, parent {parent}) answers to {path or '?'} "
+                        f"(pid {resp}), not to Prospero.app's reaper (pid {self.pid}, "
+                        f"responsible {rresp}): stopping before it touches the screen "
+                        "or Accessibility, which macOS would charge to that", 1))
+        return (f"{what} (pid {pid}) answers to Prospero.app's reaper (pid {self.pid}, "
+                "its own responsible process)")
 
     def readall(self, timeout):
         data = b""
@@ -171,28 +228,51 @@ class Reaped:
         os.close(self.status)
 
 
-def access(app, ask=False):
-    """The helper's access, run once under the reaper."""
-    r = Reaped(app, ["access", "-ask"] if ask else ["access"])
+def helper(app, t):
+    """The app's helper serving under the reaper, vouched for."""
+    r = Reaped(app, ["--serve"])
     try:
-        r.inp.close()
-        r.inp = None
-        out = r.readall(20).decode("utf-8", "replace")
+        exe = os.path.join(app, "Contents", "MacOS", "prospero-desktop")
+        t.step(True, r.vouch(r.child(exe), "the helper"))
+    except BaseException:
+        r.close()
+        raise
+    return r
+
+
+def access(app, t, ask=False):
+    """The helper's access, under the reaper."""
+    r = helper(app, t)
+    try:
+        st, out, _ = r.call("access", *(["-ask"] if ask else []), timeout=120 if ask else 20)
     finally:
         r.close()
+    if st:
+        raise Stop((f"access failed: {out}", 1))
     return dict(line.split("\t", 1) for line in out.splitlines() if "\t" in line)
 
 
-def probe(app, pid):
+def probe(app, pid, t):
     """TextEdit as Accessibility shows it (tests/axprobe.py), read under
-    the reaper, or None if it could not be read."""
+    the reaper, or None if it could not be read. The probe asks nothing
+    until vouched for, and that failing stops the test."""
     r = Reaped(app, [str(pids.checked(pid))], prog=[sys.executable, "-I", AXPROBE])
     try:
+        try:
+            line = r.readline(20)
+        except Stop:
+            return None
+        got = pids.parse(line.removeprefix("pid "))
+        if not line.startswith("pid ") or len(got) != 1:
+            return None  # its input closed, it asks nothing
+        t.once("probe", r.vouch(got[0], "the Accessibility probe"))
+        r.inp.write(b"go\n")
         r.inp.close()
         r.inp = None
-        out = r.readall(20).decode("utf-8", "replace")
-    except Stop:
-        return None
+        try:
+            out = r.readall(20).decode("utf-8", "replace")
+        except Stop:
+            return None
     finally:
         r.close()
     try:
@@ -216,11 +296,11 @@ def sheet(p):
     return None
 
 
-def until(app, pid, ok, timeout):
+def until(app, pid, t, ok, timeout):
     """Probe until ok(probe) or the timeout: the latest probe, or None."""
     deadline = time.monotonic() + timeout
     while True:
-        p = probe(app, pid)
+        p = probe(app, pid, t)
         if (p and ok(p)) or time.monotonic() >= deadline:
             return p
         time.sleep(0.3)
@@ -277,6 +357,13 @@ def shot(r, t, what, args, outdir, name):
 class T:
     def __init__(self):
         self.failed = 0
+        self.done = set()
+
+    def once(self, key, what):
+        """A step that passed, said the first time only."""
+        if key not in self.done:
+            self.done.add(key)
+            self.step(True, what)
 
     def step(self, ok, what, detail=None):
         say(("ok    " if ok else "FAIL  ") + what +
@@ -291,7 +378,7 @@ def live(app, outdir, ask, check):
     t0 = time.time()
 
     say(f"Prospero.app: {app}")
-    perms = access(app, ask)
+    perms = access(app, t, ask)
     to = perms.get("granted-to", "?")
     t.step(to == f"Prospero.app ({app})", f"permissions are charged to {to}")
     names = {"screen-recording": "Screen Recording", "accessibility": "Accessibility"}
@@ -313,7 +400,7 @@ def live(app, outdir, ask, check):
         raise Stop(("TextEdit is running: quit it first, so that this test touches "
                     "only the TextEdit it starts", 2))
 
-    r = Reaped(app, ["--serve"])
+    r = helper(app, t)
     textedit = None
     left = False
     try:
@@ -348,16 +435,20 @@ def live(app, outdir, ask, check):
 
         st, text, _ = r.call("type", hwnd, TEXT)
         t.step(st == 0, f"the helper typed {TEXT!r}", text)
-        p = until(app, pid, lambda p: TEXT in documents(p), 3)
+        p = until(app, pid, t, lambda p: TEXT in documents(p), 3)
         if p is None:
             raise Stop(("cannot read TextEdit through Accessibility (tests/axprobe.py "
                         "under Prospero's reaper)", 1))
         t.step(documents(p) == [TEXT],
                f"the document holds {TEXT!r}, read back through Accessibility",
                documents(p))
-        say(f"      frontmost pid {p['frontmost']}; window main "
-            f"{[w['main'] for w in p['windows']]}, focused "
-            f"{[w['focused'] for w in p['windows']]}")
+        # Reported only: the system-wide frontmost may fail (-25204), and
+        # a key window's own AXFocused read false (Focus, in the helper)
+        say(f"      system-wide frontmost pid {p['frontmost']} (AXError "
+            f"{p['frontmost_error']}); TextEdit's focused element "
+            f"{p['focused_role']}; window main {[w['main'] for w in p['windows']]}, "
+            f"focused {[w['focused'] for w in p['windows']]}, its app's focused "
+            f"window {[w['focused_window'] for w in p['windows']]}")
 
         ww, wh = (int(v) for v in win[3].split("x"))
         g = shot(r, t, "window shot", [hwnd], outdir, "window.png")
@@ -376,7 +467,7 @@ def live(app, outdir, ask, check):
 
         st, text, _ = r.call("key", hwnd, "cmd+w")
         t.step(st == 0, "the helper pressed Cmd-W", text)
-        p = until(app, pid, lambda p: sheet(p) or not documents(p), 5)
+        p = until(app, pid, t, lambda p: sheet(p) or not documents(p), 5)
         asked = p and sheet(p)
         t.step(p is not None and (asked or not documents(p)),
                "Cmd-W asked to save (a sheet with Delete or Don't Save), "
@@ -387,7 +478,7 @@ def live(app, outdir, ask, check):
                 continue
             st, text, _ = r.call("key", hwnd, chord)
             say(f"      pressed {chord} for {label}: {st} {text.strip()}")
-            p = until(app, pid, lambda p: not documents(p) and not sheet(p), 3)
+            p = until(app, pid, t, lambda p: not documents(p) and not sheet(p), 3)
             if p and not documents(p) and not sheet(p):
                 break
         closed = p is not None and not documents(p) and not sheet(p)
@@ -402,7 +493,11 @@ def live(app, outdir, ask, check):
             pid, ours = textedit
             # Quit only what holds no text: a document typed into, and
             # not confirmed closed, is left for you
-            p = probe(app, pid) if pids.alive(pid) else None
+            try:
+                p = probe(app, pid, t) if pids.alive(pid) else None
+            except Stop as e:
+                t.step(False, e.args[0][0])
+                p = None
             if pids.alive(pid) and (p is None or any(documents(p)) or sheet(p)):
                 left = True
                 t.step(False, f"TextEdit {pid} left running: its document may hold "
