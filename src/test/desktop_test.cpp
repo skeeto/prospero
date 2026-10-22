@@ -487,6 +487,107 @@ static void test_desktop(Test *t)
         expect(t, "anthropic shape", anshape(a, an),
                "user:text* | assistant:tool_use,tool_use | user:tool_result,"
                "tool_result,text*");
+
+        // A screenshot left out: a text in its place, the shape kept
+        msgs[2].imgb64 = {};
+        msgs[2].imgalt = "[screenshot omitted: c1]";
+        body = encodechat(a, tmp, &r);
+        expect(t, "openai image alt",
+               istr(a, find(body, "\"content\":\"data\"},{\"role\":\"user\",\"content\":"
+                    "[{\"type\":\"text\",\"text\":\"[screenshot omitted: c1]\"}]},") > 0), "1");
+        an = anencode(a, tmp, &r);
+        expect(t, "anthropic image alt", istr(a, find(an, "\"content\":[{\"type\":\"text\","
+               "\"text\":\"Took a screenshot\"},{\"type\":\"text\",\"text\":"
+               "\"[screenshot omitted: c1]\"}]}") > 0), "1");
+    }
+
+    // Screenshots leave in steps: none until keep+slack, then back to keep
+    {
+        Buf b(a, 128);
+        for (i64 n = 0; n <= 12; n++) {
+            print(&b, deskdropped(n, 3, 4));
+            putbyte(&b, ' ');
+        }
+        expect(t, "dropped steps", finish(&b), "0 0 0 0 0 0 0 4 4 4 4 8 8 ");
+        expect(t, "dropped no slack", istr(a, deskdropped(5, 3, 0)), "2");
+        expect(t, "dropped none kept", istr(a, deskdropped(5, 0, 4)), "5");
+        expect(t, "dropped few", istr(a, deskdropped(2, 3, 0)), "0");
+    }
+
+    // Anthropic's breakpoints around screenshots dropped: read up to the
+    // oldest dropped, write up to the oldest shown, the tools' given up
+    {
+        ModelConf mc = {};
+        mc.name = "m";
+        Block calls[3] = {};
+        Msg   msgs[7]  = {};
+        msgs[0].role = ROLE_USER;
+        msgs[0].text = "look";
+        for (i32 i = 0; i < 3; i++) {
+            Str id = concat(a, "s", istr(a, i));
+            calls[i].type   = BLOCK_CALL;
+            calls[i].id     = id;
+            calls[i].name   = "desktop";
+            calls[i].args   = "{\"action\":\"screenshot\"}";
+            msgs[1+2*i].role   = ROLE_ASSISTANT;
+            msgs[1+2*i].blocks = {&calls[i], 1, 1};
+            msgs[2+2*i].role   = ROLE_TOOL;
+            msgs[2+2*i].callid = id;
+            msgs[2+2*i].text   = "Took a screenshot";
+            msgs[2+2*i].image  = "out/x.png";
+            msgs[2+2*i].imgb64 = "QUJD";
+        }
+        ChatReq r = {};
+        r.mc      = &mc;
+        r.system  = "sys";
+        r.tools   = "[{\"type\":\"function\",\"function\":{\"name\":\"desktop\","
+                    "\"description\":\"d\",\"parameters\":{\"type\":\"object\"}}}]";
+        r.history = {msgs, 7, 7};
+        Arena tmp = *a;
+        tmp.beg  += (tmp.end - tmp.beg)/2;
+        Str toolmark = "\"eager_input_streaming\":true,\"cache_control\"";
+
+        Str an = anencode(a, tmp, &r);
+        expect(t, "floor none", anshape(a, an),
+               "user:text | assistant:tool_use | user:tool_result | "
+               "assistant:tool_use | user:tool_result* | assistant:tool_use | "
+               "user:tool_result*");
+        expect(t, "floor none tools", istr(a, find(an, toolmark) > 0), "1");
+
+        msgs[6].floor = FLOOR_WRITE;
+        an = anencode(a, tmp, &r);
+        expect(t, "floor write", anshape(a, an),
+               "user:text | assistant:tool_use | user:tool_result | "
+               "assistant:tool_use | user:tool_result* | assistant:tool_use* | "
+               "user:tool_result*");
+        expect(t, "floor write tools", istr(a, find(an, toolmark)), "-1");
+
+        msgs[2].floor  = FLOOR_READ;
+        msgs[2].imgb64 = {};
+        msgs[2].imgalt = "[screenshot omitted: s0]";
+        an = anencode(a, tmp, &r);
+        expect(t, "floor read", anshape(a, an),
+               "user:text | assistant:tool_use* | user:tool_result | "
+               "assistant:tool_use | user:tool_result | assistant:tool_use* | "
+               "user:tool_result*");
+
+        r.system = {};
+        an = anencode(a, tmp, &r);
+        expect(t, "floor read tools", istr(a, find(an, toolmark) > 0), "1");
+    }
+
+    // The loop guard's looks: what they saw, changed or not
+    {
+        DeskReply x = {0, "0 0 4 4 4 4 0x0\n", "PNGa", 1};
+        DeskReply y = x;
+        y.data = "PNGb";
+        expect(t, "looks", istr(a, desklooks(DESK_SCREENSHOT) && desklooks(DESK_WAIT) &&
+               desklooks(DESK_WINDOWS) && !desklooks(DESK_CLICK)), "1");
+        expect(t, "seen same", istr(a, deskseen(0, &x)==deskseen(0, &x)), "1");
+        expect(t, "seen changed", istr(a, deskseen(0, &x)!=deskseen(0, &y)), "1");
+        y = x;
+        y.status = 3;
+        expect(t, "seen status", istr(a, deskseen(0, &x)!=deskseen(0, &y)), "1");
     }
 
     // The helper's core: fitting, scaling, PNG, selection, chords

@@ -16,6 +16,12 @@
 // and the helper adds where that window is now. Input with no window of
 // its own goes where the screenshot was taken.
 //
+// Old screenshots leave requests in steps ([desktop] images and
+// images_slack, deskdropped), each replaced by a short line naming its
+// call, so that the prompt cache hits between steps; for Anthropic, the
+// request at a step marks where its prefix still matches the one before
+// (anthropic.cpp).
+//
 // The tool is off unless [desktop] offer turns it on, which only the
 // user's own file can do, and every action is an ask with a deadline,
 // denied when nobody answers, unless [desktop] ask is false.
@@ -64,6 +70,7 @@ enum : i64 {
     DESK_EDGE_OAI  = 1280,              // and for the others
     DESK_PIXELS_OAI = 1048576,
     DESK_IMAGES    = 3,                 // screenshots kept, by default
+    DESK_SLACK     = 4,                 // and more before any are dropped
 };
 
 // The arguments of a desktop call.
@@ -423,4 +430,37 @@ static DeskSize pngsize(Str png)
 static i64 imagetokens(i32 w, i32 h)
 {
     return (i64)w*h/750 + 1;
+}
+
+// Screenshots dropped from requests, the oldest first, of total in the
+// conversation: none until there are keep+slack, then back to keep all
+// at once, so that a request's prefix changes once every slack
+// screenshots rather than at each one, and the prompt cache keeps
+// hitting in between. A function of the count alone, so that the same
+// history always gives the same requests.
+static i64 deskdropped(i64 total, i64 keep, i64 slack)
+{
+    if (keep <= 0) {
+        return total;
+    } else if (total <= keep) {
+        return 0;
+    } else if (slack <= 0) {
+        return total - keep;
+    }
+    return (total - keep)/slack * slack;
+}
+
+// Actions that only look: the loop guard counts them as repeated only
+// while what they see stays the same (deskseen), since looking again at
+// a screen that changes is how an agent waits for it.
+static b32 desklooks(i32 action)
+{
+    return action==DESK_SCREENSHOT || action==DESK_WINDOWS || action==DESK_WAIT;
+}
+
+// What a step's looks saw so far, h, and then this reply.
+static u64 deskseen(u64 h, DeskReply *r)
+{
+    u64 x = hash(r->text) ^ hash(r->data)*0x9e3779b97f4a7c15u ^ (u64)r->status;
+    return (h ^ x) * 1111111111111111111u;
 }

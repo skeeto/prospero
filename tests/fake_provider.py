@@ -1733,6 +1733,28 @@ def sc_desktop_images(model, n, req):
         yield from answer(model, "Saw them.")
 
 
+def sc_desktop_cache(model, n, req):
+    # Twelve screenshots, one a step: the cache's view of each request
+    if step(req) < 12:
+        yield from tool(model, n, "desktop", {"action": "screenshot"})
+    else:
+        yield from answer(model, "Watched it.")
+
+
+sc_desktop_cache_before = sc_desktop_cache
+
+
+def sc_desktop_looks(model, n, req):
+    # The same screenshot six times: a loop only if the screen stays put
+    if step(req) < 6:
+        yield from tool(model, n, "desktop", {"action": "screenshot"})
+    else:
+        yield from answer(model, "Done looking.")
+
+
+sc_desktop_looks_still = sc_desktop_looks
+
+
 def sc_desktop_crash(model, n, req):
     k = step(req)
     steps = [{"action": "screenshot"},
@@ -3031,6 +3053,17 @@ def sc_an_desktop(model, n, req):
         yield from an_call(model, req, n, "desktop", {"action": "click", "x": 2, "y": 3})
     else:
         yield from an_answer(model, req, "Clicked it.")
+
+
+def sc_an_desktop_cache(model, n, req):
+    k = len([m for m in req.get("messages", []) if m.get("role") == "assistant"])
+    if k < 12:
+        yield from an_call(model, req, n, "desktop", {"action": "screenshot"})
+    else:
+        yield from an_answer(model, req, "Watched it.")
+
+
+sc_an_desktop_cache_before = sc_an_desktop_cache
 
 
 def sc_an_hidden(model, n, req):

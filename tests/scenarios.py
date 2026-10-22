@@ -595,6 +595,9 @@ class T:
         if not cond:
             raise Failure(msg)
 
+    def note(self, msg):
+        self.notes.append(msg)
+
     def seq(self, r, names):
         """The events appear in this order, not necessarily adjacent."""
         got = r.names()
@@ -4309,7 +4312,7 @@ def runone(host, name, verbose):
         over = f"(and {link:.1f} s over ssh)" if link >= 0.5 else ""
         if dt > bound:
             return name, "FAIL", dt, f"took {dt:.1f} s, bound {bound} s {over}"
-        return name, "ok", dt, over
+        return name, "ok", dt, " ".join([over] + t.notes).strip()
     except Failure as e:
         return name, "FAIL", time.monotonic() - t0, str(e)
     except Skip as e:
@@ -4582,10 +4585,13 @@ def desktop_norm(t):
             "described in thousandths")
 
 
-@scenario(conf={"_desktop": {"offer": "all", "ask": "false", "images": 1},
+@scenario(conf={"_desktop": {"offer": "all", "ask": "false", "images": 1,
+                            "images_slack": 0},
                 "_extra": "[model {model}]\nimage_edge = 64\n"}, bound=20)
 def desktop_images(t):
-    """Only the latest screenshots go with a request; older ones say so."""
+    """Only the latest screenshots go with a request; a short text naming
+    the call stands in for each older one, so the request keeps its
+    shape."""
     r = t.run(env=deskenv(t))
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     last = t.requests()[-1]["body"]
@@ -4593,8 +4599,84 @@ def desktop_images(t):
     tools = [m for m in last["messages"] if m["role"] == "tool"]
     t.check(len(imgs) == 1 and len(tools) == 3, f"one image of three: {len(imgs)}")
     t.check(tools[2]["tool_call_id"] in imgs[0][0], "the latest one")
-    t.check(all("no longer shown" in m["content"] for m in tools[:2]) and
-            "no longer shown" not in tools[2]["content"], "the others say so")
+    alts = desk_alts(last)
+    t.check(alts == [f"[screenshot omitted: {m['tool_call_id']}]" for m in tools[:2]],
+            f"the others stand in: {alts}")
+    t.check(all(m["content"].startswith("Took a screenshot") for m in tools),
+            "the results unchanged")
+
+
+def desk_alts(req):
+    """The texts in place of screenshots left out, in order."""
+    return [p["text"] for m in req["messages"]
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for p in m["content"]
+            if p["type"] == "text" and p["text"].startswith("[screenshot")]
+
+
+def prefix_breaks(reqs):
+    """Requests whose messages do not begin with the previous request's:
+    where a prompt cache (llama.cpp's too) stops matching."""
+    n = 0
+    for a, b in zip(reqs, reqs[1:]):
+        n += b["messages"][:len(a["messages"])] != a["messages"]
+    return n
+
+
+@scenario(conf={**DESKALL, "_extra": "[model {model}]\nimage_edge = 64\n"}, bound=30)
+def desktop_cache(t):
+    """Over twelve screenshots, the default 3 kept with 4 slack: older ones
+    leave in two steps, so the prefix changes twice, not at each one."""
+    r = t.run(env=dict(deskenv(t), FAKE_DESKTOP_ANIMATE="1"))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    reqs = [q["body"] for q in t.requests()]
+    t.check(len(reqs) == 13, f"requests {len(reqs)}")
+    shown = [len(fake_provider.desk_images(q)) for q in reqs]
+    t.check(shown == [0, 1, 2, 3, 4, 5, 6, 3, 4, 5, 6, 3, 4], f"shown {shown}")
+    alts = [len(desk_alts(q)) for q in reqs]
+    t.check(alts == [0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 8, 8], f"left out {alts}")
+    breaks = prefix_breaks(reqs)
+    t.check(breaks == 2, f"prefix changes {breaks}")
+    t.note(f"prefix changes: {breaks} of 12")
+
+
+@scenario(conf={"_desktop": {"offer": "all", "ask": "false", "images_slack": 0},
+                "_extra": "[model {model}]\nimage_edge = 64\n"}, bound=30)
+def desktop_cache_before(t):
+    """As desktop_cache, without slack, as before it: the prefix changes
+    at each screenshot past the third."""
+    r = t.run(env=dict(deskenv(t), FAKE_DESKTOP_ANIMATE="1"))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    reqs = [q["body"] for q in t.requests()]
+    shown = [len(fake_provider.desk_images(q)) for q in reqs]
+    t.check(shown == [0, 1, 2] + [3] * 10, f"shown {shown}")
+    breaks = prefix_breaks(reqs)
+    t.check(breaks == 9, f"prefix changes {breaks}")
+    t.note(f"prefix changes: {breaks} of 12")
+
+
+@scenario(conf=DESKALL, bound=20)
+def desktop_looks(t):
+    """Six identical screenshot calls on a screen that changes: looking
+    again is progress, so the loop guard lets each run."""
+    r = t.run(env=dict(deskenv(t), FAKE_DESKTOP_ANIMATE="1"))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check(len(ends) == 6 and all(e["status"] == "ok" for e in ends),
+            f"all six ran: {[(e['status'], e.get('fail')) for e in ends]}")
+    t.check(len([c for c in desklog(t) if c[0] == "shot"]) == 6, "six shots")
+
+
+@scenario(conf=DESKALL, bound=20)
+def desktop_looks_still(t):
+    """Six identical screenshot calls on a screen that stays put: the
+    sixth repeats what five saw, and the loop guard stops it."""
+    r = t.run(env=deskenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    got = [(e["status"], e.get("fail")) for e in ends]
+    t.check(got == [("ok", None)] * 5 + [("error", "loop")], f"the sixth stopped: {got}")
+    t.check(len([c for c in desklog(t) if c[0] == "shot"]) == 5, "five shots")
 
 
 @scenario(conf=DESKALL, bound=20)
@@ -4677,6 +4759,52 @@ def an_desktop(t):
     t.check(desklog(t)[1] == ["shot", "-s", "100", "1150000", "screen"],
             f"anthropic's pixel limit {desklog(t)[1]}")
     t.check(desklog(t)[2] == ["click", "screen", "32", "45"], f"mapped {desklog(t)[2]}")
+
+
+@scenario(conf={**AN, **DESKALL, "_extra": "[model {model}]\nimage_edge = 64\n"}, bound=30)
+def an_desktop_cache(t):
+    """Over twelve screenshots on Anthropic: cache reads grow between the
+    steps where older screenshots leave, and at those steps the request
+    still reads up to the oldest one left out, where the step before
+    wrote a breakpoint, so reads never fall back to the system prompt."""
+    env = dict(ANENV, **deskenv(t), FAKE_DESKTOP_ANIMATE="1")
+    r = t.run(env=env)
+    anok(t, r)
+    reqs = [q["body"] for q in t.requests()]
+    t.check(len(reqs) == 13, f"requests {len(reqs)}")
+    cached = [e["usage"]["cached"] for e in r.all("assistant")]
+    falls = [i for i in range(1, len(cached)) if cached[i] <= cached[i - 1]]
+    t.check(falls == [7, 11], f"reads fall only at the two steps: {cached}")
+    floor = cached[1]  # the system prompt and tools, at least
+    t.check(all(cached[i] > floor for i in falls), f"read past the start at steps: {cached}")
+    t.check(all(cached[i] > cached[i - 1] for i in range(2, len(cached)) if i not in falls),
+            f"reads grow between steps: {cached}")
+    tools = [x for x in reqs[7]["tools"] if "cache_control" in x]
+    t.check(not tools, "the tools' breakpoint gave way at a step")
+    alts = [c["text"] for m in reqs[-1]["messages"] for b in m["content"]
+            if b.get("type") == "tool_result" and isinstance(b.get("content"), list)
+            for c in b["content"] if c["type"] == "text" and c["text"].startswith("[screenshot")]
+    t.check(len(alts) == 8, f"left out {len(alts)}")
+    us = [e["usage"] for e in r.all("assistant")]
+    t.note(f"cache reads: {cached}; in all, read {sum(cached)}, written "
+           f"{sum(u.get('written', 0) for u in us)}, prompt {sum(u['in'] for u in us)}")
+
+
+@scenario(conf={**AN, "_desktop": {"offer": "all", "ask": "false", "images_slack": 0},
+                "_extra": "[model {model}]\nimage_edge = 64\n"}, bound=30)
+def an_desktop_cache_before(t):
+    """As an_desktop_cache, without slack, as before it: past the third
+    screenshot, every request reads only up to the one it leaves out, so
+    the screenshots shown are written anew each time."""
+    env = dict(ANENV, **deskenv(t), FAKE_DESKTOP_ANIMATE="1")
+    r = t.run(env=env)
+    anok(t, r)
+    cached = [e["usage"]["cached"] for e in r.all("assistant")]
+    t.check(len(cached) == 13 and all(c < cached[3] for c in cached[4:]),
+            f"reads stay low past the third: {cached}")
+    us = [e["usage"] for e in r.all("assistant")]
+    t.note(f"cache reads: {cached}; in all, read {sum(cached)}, written "
+           f"{sum(u.get('written', 0) for u in us)}, prompt {sum(u['in'] for u in us)}")
 
 
 # The soak: sessions under 10% random faults for a while

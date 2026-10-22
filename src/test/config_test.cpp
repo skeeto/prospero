@@ -736,6 +736,7 @@ static void testcfgjson(Test *t)
         "desktop//ask=true*\n"
         "desktop//ask_timeout=60*\n"
         "desktop//images=3*\n"
+        "desktop//images_slack=4*\n"
         "host//idle_exit=600*\n"
         "host//grace=10800*\n");
 

@@ -23,6 +23,9 @@ which coordinates. Commands that change how it behaves:
   type ... CRASH     exit at once, without a reply
   type ... HANG      never reply
 
+With FAKE_DESKTOP_ANIMATE set, the screen changes between screenshots,
+as a clock would, so that no two are the same.
+
 Run as the harness would: uv run tests/fake_desktop.py --serve
 """
 
@@ -49,6 +52,7 @@ class Desk:
         self.text = ""
         self.fg = 0x10
         self.next = 0x40
+        self.frame = 0
 
     def line(self, w):
         x0, y0, x1, y1 = w["rect"]
@@ -109,9 +113,9 @@ def fit(w, h, edge, pixels):
     return w, h
 
 
-def png(w, h):
+def png(w, h, blue=128):
     """A gradient: red rises to the right, green downward."""
-    row = bytes(v for x in range(w) for v in (x & 255, 0, 128))
+    row = bytes(v for x in range(w) for v in (x & 255, 0, blue))
     raw = bytearray()
     for y in range(h):
         raw.append(0)
@@ -152,7 +156,11 @@ def command(d, args):
         x0, y0, x1, y1 = w["rect"]
         cw, ch = x1 - x0, y1 - y0
         iw, ih = fit(cw, ch, edge, pixels)
-        return 0, f"0 0 {cw} {ch} {iw} {ih} 0x{w['id']:x}\n", png(iw, ih)
+        blue = 128
+        if os.environ.get("FAKE_DESKTOP_ANIMATE"):
+            d.frame += 1
+            blue = d.frame & 255
+        return 0, f"0 0 {cw} {ch} {iw} {ih} 0x{w['id']:x}\n", png(iw, ih, blue)
     if cmd in ("click", "dclick", "rclick", "hover"):
         w = d.one(a[0])
         ints(a[1:3])

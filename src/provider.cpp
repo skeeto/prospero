@@ -5,6 +5,8 @@
 // back to the model as an image: Chat Completions takes images only in
 // user messages, so a run of tool results is followed by one with their
 // screenshots, and Anthropic's tool results hold them as image blocks.
+// A screenshot left out has a short text in its place, so that the
+// request keeps its shape.
 //
 // The transcript is append-only: an assistant message keeps the blocks
 // the model produced (reasoning with any signature, text, tool calls
@@ -212,7 +214,18 @@ struct Msg {
     i32          imgw;    // to the session's directory, and its size
     i32          imgh;
     Str          imgb64;  // in a request's history: the screenshot as
-                          // base64, or null where it is left out
+                          // base64, or null where it is left out,
+    Str          imgalt;  // with this text in its place
+    i32          floor;   // FLOOR_*: a cache breakpoint just before it
+};
+
+// Where a request's prefix stops matching the one before, at a step of
+// screenshots dropped (deskdropped), so that Anthropic's cache can be
+// read up to there and written up to where the next step changes it.
+enum : i32 {
+    FLOOR_NONE,
+    FLOOR_WRITE,  // the oldest screenshot shown: the next step's change
+    FLOOR_READ,   // the oldest dropped at this step: its change
 };
 
 struct Usage {
@@ -489,7 +502,7 @@ static void encodeimages(JsonOut *w, Arena tmp, Slice<Msg> h, iz beg, iz end)
 {
     b32 any = 0;
     for (iz i = beg; i < end; i++) {
-        any |= h[i].imgb64.len > 0;
+        any |= h[i].imgb64.len>0 || h[i].imgalt.len>0;
     }
     if (!any) {
         return;
@@ -500,7 +513,15 @@ static void encodeimages(JsonOut *w, Arena tmp, Slice<Msg> h, iz beg, iz end)
     putarray(w);
     for (iz i = beg; i < end; i++) {
         Msg *m = &h[i];
-        if (!m->imgb64.len) continue;
+        if (!m->imgb64.len) {
+            if (m->imgalt.len) {
+                putobject(w);
+                putstrkey(w, "type", "text");
+                putstrkey(w, "text", m->imgalt);
+                putend(w);
+            }
+            continue;
+        }
         Arena t = tmp;
         putobject(w);
         putstrkey(w, "type", "text");

@@ -423,6 +423,7 @@ struct Session {
     i32          nudges[N_COUNT];
     u64          lastset;    // hash of the last step's calls
     i32          setrepeat;
+    u64          seen;       // what the last step's desktop looks saw
     b32          blocked;    // this step's calls repeat too often
     b32          progressed; // a tool succeeded this step
     b32          contnext;   // nudge to continue after the tools
@@ -2256,6 +2257,21 @@ static u64 jsonhash(Json *j)
     return h ^ hash(j->raw);
 }
 
+// Whether a step's calls include a desktop action that only looks.
+static b32 desklooking(Session *s, Arena scratch, Slice<Block> calls)
+{
+    for (iz i = 0; i < calls.len; i++) {
+        Arena a = scratch;
+        if (toolfind(calls[i].name)==TOOL_DESKTOP && tooloffered(&s->te, TOOL_DESKTOP)) {
+            Args args = parseargs(&a, TOOL_DESKTOP, calls[i].args, s->te.edit);
+            if (desklooks(args.desk.action)) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 // Hash of a step's calls, independent of their order.
 static u64 callsethash(Arena scratch, Slice<Block> calls)
 {
@@ -3745,7 +3761,7 @@ static void todoremind(Session *s, Arena scratch)
 // Screenshots go to the session's out/ as CALL.png, which the tool.end
 // record names with the screenshot's geometry ("shot"), so that a
 // session opened again maps points as before, and each request reads
-// the latest ([desktop] images) again from there.
+// those it shows ([desktop] images and images_slack) again from there.
 
 enum : i64 {
     DESK_ANSWER = 30*SEC,  // for the helper to answer, beyond a wait
@@ -3805,60 +3821,102 @@ static DeskLimits desklimits(Session *s)
     return r;
 }
 
-// Screenshots kept in requests.
+// Screenshots kept in requests, and how many more before the oldest
+// are dropped (deskdropped).
 static i64 deskkeep(Engine *e)
 {
     Int v = parseint(trim(cfgget(e->cfg, "desktop", "", "images", 0)));
     return v.ok ? (v.val<0 ? 0 : v.val>20 ? 20 : v.val) : DESK_IMAGES;
 }
 
+static i64 deskslack(Engine *e)
+{
+    Int v = parseint(trim(cfgget(e->cfg, "desktop", "", "images_slack", 0)));
+    return v.ok ? (v.val<0 ? 0 : v.val>20 ? 20 : v.val) : DESK_SLACK;
+}
+
+// Which screenshots a request leaves out, the oldest first, and where
+// its prefix stops matching the request before (FLOOR_*).
+struct DeskDrop {
+    i64 drop;   // screenshots left out
+    i64 read;   // FLOOR_READ, or -1
+    i64 write;  // FLOOR_WRITE, or -1
+};
+
+static DeskDrop deskdrop(Session *s)
+{
+    Engine *e     = s->e;
+    i64     keep  = deskkeep(e);
+    i64     slack = deskslack(e);
+    iz      last  = -1;  // the latest response: the request before ended there
+    for (iz i = 0; i < s->history.len; i++) {
+        last = s->history[i].role==ROLE_ASSISTANT ? i : last;
+    }
+    i64 total  = 0;
+    i64 before = 0;
+    for (iz i = 0; i < s->history.len; i++) {
+        b32 shot = s->history[i].image.len > 0;
+        total  += shot;
+        before += shot && i<last;
+    }
+    DeskDrop r   = {};
+    i64      was = deskdropped(before, keep, slack);
+    r.drop  = deskdropped(total, keep, slack);
+    r.read  = keep>0 && r.drop>was ? was : -1;
+    i64 old = keep>0 && before>was ? was : -1;  // the oldest shown, or -1
+    i64 now = keep>0 && total>r.drop ? r.drop : -1;
+    r.write = now!=old ? now : -1;
+    return r;
+}
+
 // Tokens of the screenshots the next request carries.
 static i64 deskimagetokens(Session *s)
 {
-    i64 keep = deskkeep(s->e);
+    i64 drop = deskdrop(s).drop;
     i64 n    = 0;
     i64 r    = 0;
-    for (iz i = s->history.len-1; i>=0 && n<keep; i--) {
+    for (iz i = 0; i < s->history.len; i++) {
         Msg *m = &s->history[i];
-        if (m->image.len) {
+        if (m->image.len && n++>=drop) {
             r += imagetokens(m->imgw, m->imgh);
-            n++;
         }
     }
     return r;
 }
 
-// The history for a request: the latest screenshots read in as base64,
-// and those left out said to be. The history itself if it has none.
+// The history for a request: the screenshots shown read in as base64,
+// with a short text in place of each left out, and the floors marked.
+// The history itself if it has none.
 static Slice<Msg> deskimages(Session *s, Arena *a)
 {
-    Engine *e    = s->e;
-    i64     keep = deskkeep(e);
-    b32     any  = 0;
+    Engine *e   = s->e;
+    b32     any = 0;
     for (iz i = 0; i<s->history.len && !any; i++) {
         any = s->history[i].image.len > 0;
     }
     if (!any) {
         return s->history;
     }
+    DeskDrop   d = deskdrop(s);
     Slice<Msg> h = {};
     h.data = alloc<Msg>(a, s->history.len);
     h.len  = h.cap = s->history.len;
     i64 n  = 0;
-    for (iz i = s->history.len-1; i >= 0; i--) {
+    for (iz i = 0; i < s->history.len; i++) {
         Msg m = s->history[i];
-        if (m.image.len && n<keep) {
-            n++;
-            Read rd = os_read(e->os, a, join(a, s->dir, m.image), DESK_REPLYMAX);
-            if (rd.err == READ_OK) {
-                m.imgb64 = base64(a, rd.data);
+        if (m.image.len) {
+            m.floor = n==d.read ? FLOOR_READ : n==d.write ? FLOOR_WRITE : FLOOR_NONE;
+            if (n++ < d.drop) {
+                m.imgalt = concat(a, concat(a, "[screenshot omitted: ", m.callid), "]");
             } else {
-                m.text = concat(a, m.text, " [The screenshot is lost: its "
-                                "file could not be read.]");
+                Read rd = os_read(e->os, a, join(a, s->dir, m.image), DESK_REPLYMAX);
+                if (rd.err == READ_OK) {
+                    m.imgb64 = base64(a, rd.data);
+                } else {
+                    m.imgalt = concat(a, concat(a, "[screenshot lost: ", m.callid),
+                                      ", its file could not be read]");
+                }
             }
-        } else if (m.image.len) {
-            m.text = concat(a, m.text, " [The screenshot is no longer shown: "
-                            "only the latest are.]");
         }
         h.data[i] = m;
     }
@@ -4274,6 +4332,9 @@ static void deskanswer(Session *s, Arena scratch, DeskReply *r)
     disarm(s, T_DESK);
     k->busy = 0;
     setstate(s, S_IDLE);
+    if (desklooks(d->action)) {
+        s->seen = deskseen(s->seen, r);
+    }
 
     Str what = deskwhat(s, &scratch, d, 1);
     Str text = {};
@@ -5113,9 +5174,16 @@ static void finalize(Session *s, Arena scratch)
         }
     }
     u64 set = callsethash(scratch, calls);
+    if (desklooking(s, scratch, calls)) {
+        // Looking again repeats only if the last look saw no change
+        set ^= (s->seen + 1) * 0x9e3779b97f4a7c15u;
+    }
     s->setrepeat = set==s->lastset ? s->setrepeat+1 : 1;
     s->lastset   = set;
     s->blocked   = s->setrepeat >= 5;
+    if (!s->blocked) {
+        s->seen = 0;  // these calls run and see anew
+    }
     s->lengthcut = fr == "length";
     runcalls(s, scratch, f.blocks);
 }
@@ -5237,6 +5305,7 @@ static void beginturn(Session *s, Arena scratch, Str via)
     s->attempts   = 0;
     s->setrepeat  = 0;
     s->lastset    = 0;
+    s->seen       = 0;
     s->discovered = s->info.learned || (s->info.found && !s->info.llamacpp);
     resetnudges(s, 1);
     instrcheck(s, scratch);

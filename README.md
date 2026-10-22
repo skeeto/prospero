@@ -302,7 +302,9 @@ Screenshots go to the model as images, scaled down to its limits
 (`[model] image_edge` and `image_pixels`: by default 1568 pixels on a
 side and 1.15 megapixels for kind anthropic, else 1280 and 1 megapixel),
 and only the latest few stay in the conversation (`[desktop] images`).
-A model gives points in pixels of the image it saw, or, with
+Older ones leave in steps, `images_slack` at a time (by default 3, with
+up to 4 more before a step), each replaced by a line naming its call,
+so that the prompt cache keeps hitting between steps. A model gives points in pixels of the image it saw, or, with
 `[model] coordinates = norm1000`, in thousandths of its width and
 height, as Qwen-VL and Gemini do; the harness maps them back to the
 screen. A model that takes no images is marked `vision = false`.

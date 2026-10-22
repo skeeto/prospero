@@ -349,6 +349,10 @@ static CfgKey cfgschema[] = {
     {"desktop", "images", CFG_INT, "3", {}, {}, "desktop",
      "Screenshots kept in the conversation, the latest; older ones are "
      "left out of requests"},
+    {"desktop", "images_slack", CFG_INT, "4", {}, {}, "desktop",
+     "Screenshots kept beyond images before older ones are left out, all "
+     "at once, back to images: the prompt cache then hits between those "
+     "steps; 0 leaves one out at each new screenshot"},
 
     {"ui", "theme", CFG_ENUM, "system", {}, "system dark light", "ui",
      "Colors: dark, light, or system to follow the operating system"},

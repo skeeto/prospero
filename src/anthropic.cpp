@@ -13,6 +13,14 @@
 //   API's limit of four: the last message, which the next request reads
 //   back, and the message before the latest response, where the request
 //   that produced it wrote its own.
+// - Screenshots leave requests in steps (desktop.cpp), which change the
+//   prefix at the oldest dropped. The request at a step reads up to just
+//   before that one (FLOOR_READ) instead of at the message before the
+//   latest response, which no longer matches, and writes up to just
+//   before the oldest still shown (FLOOR_WRITE), the next step's change,
+//   which the request where the first screenshot arrives also does.
+//   Those take the tools' breakpoint when four are in use, since the
+//   system prompt's covers the tools too.
 // - Messages of one role in a row are merged into one, its tool results
 //   first, since the API wants the roles to alternate and a message's
 //   tool results before its text. Blank texts, which the API rejects,
@@ -79,8 +87,8 @@ static void ancache(JsonOut *w)
 // Requests
 
 // The tools of a chat request (an array of functions) as the Messages
-// API takes them, the last with a cache breakpoint.
-static void antools(JsonOut *w, Arena scratch, Str tools)
+// API takes them, the last with a cache breakpoint if cache.
+static void antools(JsonOut *w, Arena scratch, Str tools, b32 cache)
 {
     JsonDoc d = jsonparse(&scratch, tools);
     putarray(w);
@@ -93,7 +101,7 @@ static void antools(JsonOut *w, Arena scratch, Str tools)
         putjson(w, jsonget(fn, "parameters"));
         putkey(w, "eager_input_streaming");
         putbool(w, 1);
-        if (!t->next) {
+        if (cache && !t->next) {
             ancache(w);
         }
         putend(w);
@@ -169,8 +177,9 @@ static void anblock(JsonOut *w, Arena scratch, AnPart *p, b32 cache)
 {
     Msg *m = p->msg;
     putobject(w);
-    if (!p->block && m->role==ROLE_TOOL && m->imgb64.len) {
-        // A screenshot goes in the result, after its text
+    if (!p->block && m->role==ROLE_TOOL && (m->imgb64.len || m->imgalt.len)) {
+        // A screenshot goes in the result, after its text, or what
+        // stands in its place
         putstrkey(w, "type", "tool_result");
         putstrkey(w, "tool_use_id", m->callid);
         putkey(w, "content");
@@ -182,15 +191,20 @@ static void anblock(JsonOut *w, Arena scratch, AnPart *p, b32 cache)
             putend(w);
         }
         putobject(w);
-        putstrkey(w, "type", "image");
-        putkey(w, "source");
-        putobject(w);
-        putstrkey(w, "type", "base64");
-        putstrkey(w, "media_type", "image/png");
-        putkey(w, "data");
-        Str data = concat(&scratch, "\"", m->imgb64);
-        putraw(w, concat(&scratch, data, "\""));  // base64 needs no escapes
-        putend(w);
+        if (m->imgb64.len) {
+            putstrkey(w, "type", "image");
+            putkey(w, "source");
+            putobject(w);
+            putstrkey(w, "type", "base64");
+            putstrkey(w, "media_type", "image/png");
+            putkey(w, "data");
+            Str data = concat(&scratch, "\"", m->imgb64);
+            putraw(w, concat(&scratch, data, "\""));  // base64 needs no escapes
+            putend(w);
+        } else {
+            putstrkey(w, "type", "text");
+            putstrkey(w, "text", m->imgalt);
+        }
         putend(w);
         putend(w);
         if (m->error) {
@@ -248,17 +262,31 @@ static b32 ancacheable(AnPart *p)
                          p->block->type!=BLOCK_REDACTED);
 }
 
-static void anmessages(JsonOut *w, Arena scratch, ChatReq *r)
+// Where a request's parts go and which hold cache breakpoints.
+struct AnPlan {
+    Slice<AnPart> parts;
+    Slice<iz>     order;  // parts in the order they go, message by message
+    Slice<b32>    mark;   // by position in order: a cache breakpoint
+    b32           tools;  // the tools' breakpoint too
+};
+
+static AnPlan anplan(Arena *a, ChatReq *r)
 {
-    Slice<AnPart> parts = anparts(&scratch, r->history, r->thinkfrom);
+    AnPlan        p     = {};
+    Slice<AnPart> parts = anparts(a, r->history, r->thinkfrom);
     i32 nmsgs    = parts.len ? parts[parts.len-1].n+1 : 0;
     i32 lastasst = -1;
+    b32 dropped  = 0;
     for (iz i = 0; i < parts.len; i++) {
         lastasst = parts[i].asst ? parts[i].n : lastasst;
+        dropped |= !parts[i].block && parts[i].msg->floor==FLOOR_READ;
     }
-    i32 prev = lastasst - 1;  // roles alternate: a user message, or none
+    // Roles alternate: a user message, or none. Where screenshots were
+    // just dropped, the prefix changed before it, so it reads nothing
+    i32 prev = dropped ? -1 : lastasst-1;
 
-    putarray(w);
+    p.parts = parts;
+    p.mark  = {alloc<b32>(a, parts.len), parts.len, parts.len};
     for (iz beg = 0, end = 0; beg < parts.len; beg = end) {
         i32 n    = parts[beg].n;
         b32 asst = parts[beg].asst;
@@ -267,29 +295,66 @@ static void anmessages(JsonOut *w, Arena scratch, ChatReq *r)
         // The order in which its parts go: a user message's tool results
         // first, then its texts; the breakpoint goes on the last that
         // may hold one
-        Slice<iz> order = {};
+        iz first = p.order.len;
         for (i32 pass = 0; pass < 2; pass++) {
             for (iz i = beg; i < end; i++) {
                 b32 result = !parts[i].block && parts[i].msg->role==ROLE_TOOL;
-                b32 first  = asst || result;
-                if (first == !pass) {
-                    order = push(&scratch, order, i);
+                b32 lead   = asst || result;
+                if (lead == !pass) {
+                    p.order = push(a, p.order, i);
                 }
             }
         }
-        iz mark = -1;
         if (n==nmsgs-1 || n==prev) {
-            for (iz k = 0; k < order.len; k++) {
-                mark = ancacheable(&parts[order[k]]) ? k : mark;
+            iz mark = -1;
+            for (iz k = first; k < p.order.len; k++) {
+                mark = ancacheable(&parts[p.order[k]]) ? k : mark;
+            }
+            if (mark >= 0) {
+                p.mark[mark] = 1;
             }
         }
+    }
 
+    // The screenshot floors: a breakpoint on the last part before each
+    // that may hold one
+    for (iz k = 0; k < p.order.len; k++) {
+        AnPart *q = &parts[p.order[k]];
+        if (q->block || q->msg->floor==FLOOR_NONE) {
+            continue;
+        }
+        for (iz j = k-1; j >= 0; j--) {
+            if (ancacheable(&parts[p.order[j]])) {
+                p.mark[j] = 1;
+                break;
+            }
+        }
+    }
+
+    // Four at most: the tools' gives way, as the system prompt's
+    // breakpoint covers the tools too
+    i32 marks = r->system.len ? 1 : 0;
+    for (iz k = 0; k < p.mark.len; k++) {
+        marks += p.mark[k];
+    }
+    assert(marks <= 4);
+    p.tools = marks < 4;
+    return p;
+}
+
+static void anmessages(JsonOut *w, Arena scratch, AnPlan *p)
+{
+    putarray(w);
+    for (iz beg = 0, end = 0; beg < p->order.len; beg = end) {
+        AnPart *first = &p->parts[p->order[beg]];
+        i32     n     = first->n;
+        for (end = beg; end<p->order.len && p->parts[p->order[end]].n==n; end++) {}
         putobject(w);
-        putstrkey(w, "role", asst ? Str("assistant") : Str("user"));
+        putstrkey(w, "role", first->asst ? Str("assistant") : Str("user"));
         putkey(w, "content");
         putarray(w);
-        for (iz k = 0; k < order.len; k++) {
-            anblock(w, scratch, &parts[order[k]], k==mark);
+        for (iz k = beg; k < end; k++) {
+            anblock(w, scratch, &p->parts[p->order[k]], p->mark[k]);
         }
         putend(w);
         putend(w);
@@ -320,11 +385,12 @@ static Str anencode(Arena *a, Arena tmp, ChatReq *r)
         putend(&w);
         putend(&w);
     }
+    AnPlan plan = anplan(&tmp, r);
     putkey(&w, "messages");
-    anmessages(&w, tmp, r);
+    anmessages(&w, tmp, &plan);
     if (r->tools.len) {
         putkey(&w, "tools");
-        antools(&w, tmp, r->tools);
+        antools(&w, tmp, r->tools, plan.tools);
         putkey(&w, "tool_choice");
         putobject(&w);
         putstrkey(&w, "type", "auto");
