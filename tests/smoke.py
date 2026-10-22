@@ -10,9 +10,10 @@ tests. Passes when the turn ends done, the files hold the new function
 and its test, the tests pass when run here afterward, and the prompt
 cache hits grow from step to step (llama.cpp timings.cache_n, or the
 provider's cached tokens, which may grow in blocks), which shows the
-request prefix stays byte-stable. Loading a router model may evict the one already loaded.
+request prefix stays byte-stable. Loading a router model may evict the
+one already loaded.
 
-  uv run tests/smoke.py --prospero build/prospero [-e http://localhost/] [-m qwen-flash]
+  uv run tests/smoke.py --prospero build/prospero -m MODEL [-e URL]
 """
 
 import argparse
@@ -49,8 +50,9 @@ PROMPT = ("In this repository, add a function multiply(a, b) to calc.py that "
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--prospero", required=True)
-    ap.add_argument("-e", default="http://localhost/")
-    ap.add_argument("-m", default="qwen-flash")
+    ap.add_argument("-e", default="http://localhost/",
+                    help="the endpoint (default: http://localhost/)")
+    ap.add_argument("-m", required=True, help="the model, as the endpoint lists it")
     ap.add_argument("--keep", action="store_true", help="keep the temporary repo")
     args = ap.parse_args()
 

@@ -928,10 +928,10 @@ def main():
     ap.add_argument("--ssh-windows", action="store_true",
                     help="with --ssh: a Windows host whose login shell is cmd.exe, "
                          "with w64devkit for the test's scripts")
-    ap.add_argument("--model", default="qwen-flash", help="with --mode e2e")
+    ap.add_argument("--model", help="with --mode e2e: the model (required)")
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--keep", action="store_true", help="keep the directories")
-    ap.add_argument("--url", help="with --mode e2e: the router (default http://localhost/)")
+    ap.add_argument("--url", help="with --mode e2e: the endpoint (default http://localhost/)")
     ap.add_argument("--shots", help="save the checklist's screenshots here")
     ap.add_argument("--host", help="run the GUI on this Windows host's console")
     ap.add_argument("--trace", action="store_true", help="log where presses land")
@@ -943,6 +943,8 @@ def main():
 
     if args.mode == "remote" and args.ssh and not args.remote_prospero:
         ap.error("--ssh needs --remote-prospero")
+    if args.mode == "e2e" and not args.model:
+        ap.error("--mode e2e needs --model")
     # A remote host over ssh reaches the provider on this machine's address
     bind = lanaddress(args.ssh) if args.mode == "remote" and args.ssh else "127.0.0.1"
     srv, url = fake_provider.start(bind)

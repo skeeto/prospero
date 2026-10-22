@@ -25,6 +25,9 @@ writes it:
                   machine's NSS module, which a static program loads
                   only where glibc's version matches
 
+With no PLATFORM it builds them all, except that without a HOST it
+leaves out the Linux ones, and says so.
+
 The Linux builds get the source as an archive of the working tree (what
 git tracks and what it would add, so uncommitted changes too) through
 scp, into --remote-dir on HOST. --deps DIR names a directory of
@@ -184,7 +187,10 @@ def main():
             sys.exit(f"engines: unknown platform {p}: one of {' '.join(PLATFORMS)}")
     lin = [p for p in plats if p.startswith("linux-")]
     if lin and not args.linux:
-        sys.exit("engines: the Linux builds need --linux HOST or $PROSPERO_LINUX_HOST")
+        if args.platforms:
+            sys.exit("engines: the Linux builds need --linux HOST or $PROSPERO_LINUX_HOST")
+        say("no --linux HOST or $PROSPERO_LINUX_HOST: leaving out the Linux builds")
+        lin = []
     if args.deps:
         args.deps = os.path.abspath(args.deps)
     os.makedirs(args.out, exist_ok=True)

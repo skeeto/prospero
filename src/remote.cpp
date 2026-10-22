@@ -745,7 +745,7 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
             // which starts beside that host (one per protocol)
             b32 ssh = r->conf.ssh.len && !r->conf.path.len;
             Buf b(&scratch, 256);
-            print(&b, "the harness on ");
+            print(&b, "Prospero on ");
             print(&b, r->conf.name);
             print(&b, " speaks protocol ");
             print(&b, jsonint(jsonget(rec.root, "proto"), -1));
@@ -1145,7 +1145,7 @@ static Str connectusage =
 "lists it). When standard input ends, the link ends: the host runs on.\n"
 "options:\n"
 "  --ssh DEST          ssh destination: [user@]host\n"
-"  --path PATH         the harness there (default: prospero)\n"
+"  --path PATH         the prospero executable there (default: prospero)\n"
 "  --remote-state DIR  its state directory there\n"
 "  --remote-config F   its configuration file there\n"
 "  --ssh-program PROG  ssh itself (default: ssh)\n"

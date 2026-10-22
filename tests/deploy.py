@@ -25,10 +25,10 @@ turn with a shell command in it. Engines it put in ~/.prospero there, and
   uv run tests/deploy.py --prospero build/prospero --ssh HOST \\
       --remote-root /tmp/prospero-deploy real
   uv run tests/deploy.py --prospero build/prospero --ssh WINHOST --windows \\
-      --remote-root %TMP%/prospero-deploy real
+      --remote-root C:/Users/USER/AppData/Local/Temp/prospero-deploy real
   uv run tests/deploy.py --prospero build/prospero --ssh XPHOST \\
       --no-tunnel --shell "sh -s" \\
-      --remote-root %TMP%/prospero-deploy real
+      --remote-root C:/DOCUME~1/USER/LOCALS~1/Temp/prospero-deploy real
 """
 
 import argparse

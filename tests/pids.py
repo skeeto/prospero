@@ -5,12 +5,12 @@
 # ///
 """Process ids in the tests: reading them, and signaling only our own.
 
-On 2026-10-21 an agent's cleanup loop sent kill(-1, SIGTERM) to the
-user's whole desktop session: its pid files had no trailing newlines,
-so 50 pids ran together into one token, which zsh's atoi made -1. So a
-pid the tests signal, or put in a command that kills, goes through here
-first: a plain int above 1 and within a pid's range, read one per line,
-and, unless it came from a spawn of the test's own, confirmed to be a
+On 2026-10-21 a cleanup loop sent kill(-1, SIGTERM) to a whole desktop
+session: its pid files had no trailing newlines, so 50 pids ran
+together into one token, which zsh's atoi made -1. So a pid the tests
+signal, or put in a command that kills, goes through here first: a
+plain int above 1 and within a pid's range, read one per line, and,
+unless it came from a spawn of the test's own, confirmed to be a
 process of ours right before the signal. Nothing here ever signals 0,
 -1, a negative pid, or a process group not started by the test.
 

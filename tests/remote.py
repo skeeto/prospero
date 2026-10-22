@@ -26,7 +26,7 @@ its scripts:
 
   uv run tests/remote.py --prospero build/prospero --ssh XPHOST \\
       --no-tunnel --shell "sh -s" --remote-prospero C:/.../prospero.exe \\
-      --remote-root %TMP%/prospero-remote \\
+      --remote-root C:/DOCUME~1/USER/LOCALS~1/Temp/prospero-remote \\
       ssh_reconnect ssh_offline
 """
 

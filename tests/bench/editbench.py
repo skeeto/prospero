@@ -17,7 +17,7 @@ so that every change goes through the edit tool, in the format that
 
   uv run tests/bench/editbench.py tasks [--count 40] [--seed 1]
   uv run tests/bench/editbench.py run --prospero build/prospero \\
-      --models large,qwen-flash --formats replace,patch,hashline \\
+      --models MODEL,... --formats replace,patch,hashline \\
       --count 40 --runs 2 --jobs 4 --out results.jsonl
   uv run tests/bench/editbench.py report --out results.jsonl
   uv run tests/bench/editbench.py run ... --only t15-delete,t21-delete
@@ -508,7 +508,7 @@ def main():
         a.add_argument("--count", type=int, default=40)
         a.add_argument("--seed", type=int, default=1)
     r.add_argument("--prospero", required=True)
-    r.add_argument("--models", default="large,qwen-flash")
+    r.add_argument("--models", required=True, help="models, separated by commas")
     r.add_argument("--formats", default="replace,patch,hashline")
     r.add_argument("--runs", type=int, default=2)
     r.add_argument("--jobs", type=int, default=4)

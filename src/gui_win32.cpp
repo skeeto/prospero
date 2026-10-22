@@ -83,7 +83,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 // Resources: the manifest (per-monitor DPI awareness v2, common
 // controls v6, the Windows versions it targets), from assets/ by the
 // assembler's include path (-Wa,-I, set by CMake). The pattern is
-// gzip's platform/gui_windows.c.
+// platform/gui_windows.c in skeeto/tugz, https://github.com/skeeto/tugz.
 __asm__(
     "    .section .rsrc,\"dr\"\n"
     "    .p2align 2\n"

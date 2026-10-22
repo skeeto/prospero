@@ -58,8 +58,10 @@ advapi32 and winhttp. The i686 build of it is the Windows XP engine:
 
 On macOS the build also wraps the executable as `Prospero.app` in the
 build directory. On Linux, SDL3 loads X11, Wayland and GL at run time,
-so the GUI build still runs headless where no display libraries exist,
-and `-DPROSPERO_STATIC=ON` links fully statically.
+so the GUI build still runs headless where no display libraries exist.
+With `-DPROSPERO_GUI=OFF`, `-DPROSPERO_STATIC=ON` links the headless
+engine fully statically, as `tools/engines.py` does for the Linux
+engines it builds.
 
 ## Usage
 
@@ -109,17 +111,17 @@ client and nothing running.
 
 ## Configuration
 
-The configuration is one INI file,
-`$XDG_CONFIG_HOME/prospero/prospero.ini`, which defaults to
-`~/.config/prospero/prospero.ini`. On Windows, `%XDG_CONFIG_HOME%` and
-`%HOME%\.config` are tried first, then `%APPDATA%\prospero\prospero.ini`.
-On first run Prospero writes it from
-its built-in copy ([assets/prospero.ini](assets/prospero.ini)), which
-documents every section and key: `[endpoint NAME]`, `[model NAME]`,
-`[role NAME]`, `[guard]`, `[tools]`, `[instructions]`, `[ui]`, `[host]`
-and `[remote NAME]`. Changes take effect while it runs. An unknown key
-or a bad value is reported in the diagnostics, and a bad value falls
-back to its default: nothing in the file keeps Prospero from starting.
+Prospero reads one INI file, `$XDG_CONFIG_HOME/prospero/prospero.ini`,
+which defaults to `~/.config/prospero/prospero.ini`. On Windows,
+`%XDG_CONFIG_HOME%` and `%HOME%\.config` are tried first, then
+`%APPDATA%\prospero\prospero.ini`. On first run it writes the file
+from its built-in copy ([assets/prospero.ini](assets/prospero.ini)),
+which documents every section and key: `[endpoint NAME]`,
+`[model NAME]`, `[role NAME]`, `[guard]`, `[tools]`, `[instructions]`,
+`[ui]`, `[host]` and `[remote NAME]`. Changes take effect while it
+runs. An unknown key or a bad value is reported in the diagnostics,
+and a bad value falls back to its default: nothing in the file keeps
+Prospero from starting.
 
 API keys never go in the file: `key = env:NAME` reads one from the
 environment when it is needed. Above the first section, `include = `
@@ -134,10 +136,11 @@ directory: `$XDG_STATE_HOME/prospero`, else `~/.local/state/prospero`,
 or `%LOCALAPPDATA%\prospero` on Windows.
 
 At the start of a session the agent is given its instructions:
-`AGENTS.md` next to the configuration file, then the first of
-`AGENTS.md` or `CLAUDE.md` (`[instructions] files`) in each directory
-from the root of the repository down to the working directory, and
-more below it as the agent works there.
+`AGENTS.md` next to the default configuration file (such as
+`~/.config/prospero/AGENTS.md`), even when `-c` names another, then
+the first of `AGENTS.md` or `CLAUDE.md` (`[instructions] files`) in
+each directory from the root of the repository down to the working
+directory, and more below it as the agent works there.
 
 ## Remote and background hosts
 
@@ -159,15 +162,18 @@ from the `engines` directory next to the executable, named
 `prospero-engine-VERSION-OS-ARCH`, or are the executable itself when it
 is built for that platform. `tools/engines.py` builds them: macOS
 arm64, Windows x86-64 and i686, and Linux aarch64 and x86-64 (static,
-built on a Linux host given with `--linux HOST`).
+built on a Linux host given with `--linux HOST`, else left out).
 
 ## Windows notes
 
-`prospero.exe` is a GUI program, so at an interactive cmd or PowerShell
-prompt it prints nothing and the prompt returns at once. Pipe or
-redirect its output instead: `prospero --version | more`, or
-`prospero --version >out.txt`. Over ssh and in scripts it works as
-usual, and it serves as the headless engine there too.
+The GUI build's `prospero.exe` is a GUI program, so at an interactive
+cmd or PowerShell prompt it prints nothing and the prompt returns at
+once. Pipe or redirect its output instead: `prospero --version | more`,
+or `prospero --version >out.txt`. Over ssh and in scripts it works as
+usual, and it serves as the headless engine there too. The headless
+build (`-DPROSPERO_GUI=OFF`), which is the XP engine and the engine
+deployed to Windows machines, is a console program, and works as usual
+at a prompt as well.
 
 The agent's shell is a POSIX `sh`: `sh.exe` or busybox-w32's
 `busybox.exe` next to `prospero.exe`, else on the PATH. Without either,
