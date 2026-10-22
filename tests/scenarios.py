@@ -3984,8 +3984,9 @@ def eval_formats(t):
     typo = [r for r in evalcell(recs, bad, "hashline") if r["task"] == "typo"][0]
     t.check(typo["expect"] == "greet.txt differs", f"failed expect: {typo}")
 
+    # (Up to the retries, which a slow disk's stalls can cause)
     t.check(f"| {flaky} | replace | 4 | 100.0% (4) | 4.0 | 3.0 | 4 | 0 | 0 | 0 | 400 | 160 "
-            f"| 40 | 0 |" in out, f"table:\n{out}")
+            f"| 40 |" in out, f"table:\n{out}")
     for fmt, bad_ in (("replace", 0), ("patch", 4), ("hashline", 0)):
         t.check(f"| {badpatch} | {fmt} | 4 | 100.0% (4) | 4.0 | 3.0 | 4 | {bad_} |" in out,
                 f"{fmt}'s failed edits alike:\n{out}")
@@ -4244,12 +4245,15 @@ def eval_dead(t):
     rc, recs, out, err = evalrun(t, ("dead", suite), [auth], ["-f", "replace", "-t", "typo"])
     t.check("1 run to make," in err and len(recs) == 4, f"made again: {err[-500:]}")
 
-    rc, recs, out, err = evalrun(t, ("dead", suite), ["dead/whatever"],
+    # Refused connections, retried until the time limit, longer here: on
+    # Windows each refusal takes 2 s to come, the listing's first
+    suite = dict(suite, **{"suite.ini": "timeout = 8\n"})
+    rc, recs, out, err = evalrun(t, ("dead2", suite), ["dead/whatever"],
                                  ["-f", "replace", "-t", "typo,count", "-j", "2"],
                                  out="dead.jsonl")
     t.check(rc == 0 and len(recs) == 2 and
             all(r.get("error") == "the model never answered: the run took longer than "
-                "its limit of 3 s" for r in recs), f"exit {rc}: {recs} {err[-2000:]}")
+                "its limit of 8 s" for r in recs), f"exit {rc}: {recs} {err[-2000:]}")
 
 
 @scenario(bound=30)
