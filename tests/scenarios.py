@@ -3390,6 +3390,316 @@ def final_newline(t):
             f"put back {left}")
 
 
+# M6: Anthropic's Messages API, against the fake's Anthropic mode, which
+# rejects (400) any request the real API would, and reasoning returned
+# other than verbatim and still bound to the conversation before it
+
+AN = {"kind": "anthropic", "key": "env:PROSPERO_TEST_KEY"}
+ANENV = {"PROSPERO_TEST_KEY": fake_provider.AN_KEY}
+
+
+def anblocks(msg, kind):
+    return [b for b in msg["content"] if b.get("type") == kind]
+
+
+def anok(t, r):
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+
+
+@scenario(conf=AN, bound=5)
+def an_plain(t):
+    """A plain answer: the key as x-api-key, the API version, a request
+    with its breakpoints, and max_tokens within the listing's limit."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    t.seq(r, ["session", "user", "title", "turn", "attempt", "assistant", "turn.end"])
+    t.check(r.text() == "Hello from the Messages API.", f"text {r.text()!r}")
+    t.check(not r.all("retry"), "no retries")
+    reqs = t.requests()
+    t.check(len(reqs) == 1, f"one request: {len(reqs)}")
+    h = reqs[0]["headers"]
+    t.check(h.get("anthropic-version") == "2023-06-01" and "authorization" not in h,
+            f"headers {sorted(h)}")
+    body = reqs[0]["body"]
+    t.check(body["max_tokens"] == 16000, f"max_tokens {body['max_tokens']}")
+    t.check(body["system"][0].get("cache_control") == {"type": "ephemeral"},
+            "a breakpoint after the system prompt")
+    tools = body["tools"]
+    t.check("cache_control" in tools[-1] and
+            not any("cache_control" in x for x in tools[:-1]),
+            "a breakpoint after the tools")
+    t.check(all(x.get("eager_input_streaming") is True and "input_schema" in x
+                for x in tools), "tools as the API takes them")
+    t.check(body["tool_choice"] == {"type": "auto"}, f"tool_choice {body['tool_choice']}")
+    t.check(body["thinking"] == {"type": "adaptive", "display": "summarized"},
+            f"thinking {body['thinking']}")
+    t.check(body["messages"] == [{"role": "user", "content": [
+        {"type": "text", "text": "go", "cache_control": {"type": "ephemeral"}}]}],
+            f"messages {body['messages']}")
+    with fake_provider.STATE.lock:
+        listings = list(fake_provider.STATE.listings)
+    t.check(any(x["query"] == "limit=1000" and x["key"] for x in listings),
+            f"the listing asked for: {listings}")
+    u = r.last("assistant").get("usage", {})
+    t.check(u.get("cached") == 0 and u.get("written", 0) > 0 and
+            u.get("in", 0) > u["written"] and u.get("out") == 10, f"usage {u}")
+
+
+@scenario(conf=AN, bound=10)
+def an_tools(t):
+    """read, edit, shell: each step's reasoning goes back verbatim with its
+    signature (redacted reasoning too), each result as a tool_result, and
+    every request extends the one before."""
+    t.put("hello.txt", "hello world\n")
+    r = t.run(env=ANENV)
+    anok(t, r)
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok", "ok"],
+            f"statuses {[e['status'] for e in ends]}")
+    t.check(t.file("hello.txt") == "hello there\n", "the edit landed")
+    t.check(r.text() == "On it.Done: hello.txt now greets there.", f"text {r.text()!r}")
+    reqs = [x["body"] for x in t.requests()]
+    t.check(len(reqs) == 4, f"four requests: {len(reqs)}")
+    last = reqs[-1]["messages"]
+    t.check([m["role"] for m in last] == ["user", "assistant"] * 3 + ["user"],
+            f"roles {[m['role'] for m in last]}")
+    asst = [m for m in last if m["role"] == "assistant"]
+    kinds = [[b["type"] for b in m["content"]] for m in asst]
+    t.check(kinds == [["thinking", "text", "tool_use"],
+                      ["thinking", "redacted_thinking", "tool_use"],
+                      ["thinking", "tool_use"]], f"blocks {kinds}")
+    recs = r.all("assistant")
+    t.check(recs[0]["blocks"][0].get("sig") == asst[0]["content"][0]["signature"],
+            "the record keeps the signature")
+    t.check(any(b["t"] == "redacted" and b.get("data", "").startswith("RedactedFake")
+                for b in recs[1]["blocks"]), f"redacted kept: {recs[1]['blocks']}")
+    res = anblocks(last[2], "tool_result")
+    t.check(len(res) == 1 and res[0]["tool_use_id"] == asst[0]["content"][2]["id"] and
+            "is_error" not in res[0], f"result {res}")
+    for a, b in zip(reqs, reqs[1:]):
+        pa = fake_provider.plain(a["messages"])
+        pb = fake_provider.plain(b["messages"])
+        t.check(pb[:len(pa)] == pa, "each request extends the previous one")
+
+
+@scenario(conf=AN, bound=10)
+def an_think(t):
+    """Reasoning with its signature goes back verbatim next turn, and from
+    the log after the session is opened again."""
+    t.put("a.txt", "hello\n")
+    r = t.run(env=ANENV)
+    anok(t, r)
+    t.check(r.text() == "It says hello.", f"text {r.text()!r}")
+    reqs = t.requests()
+    t.check(len(reqs) == 2, f"two requests: {len(reqs)}")
+    sent = reqs[1]["body"]["messages"][1]["content"][0]
+    rec = r.all("assistant")[0]["blocks"][0]
+    t.check(sent["type"] == "thinking" and
+            sent["thinking"] == "The file will say what to do." and
+            sent["signature"] == rec.get("sig"), f"sent {sent}, recorded {rec}")
+    r2 = t.run("again", resume=r.events[0]["sid"], env=ANENV)
+    anok(t, r2)
+    again = t.requests()[2]["body"]["messages"]
+    t.check(fake_provider.plain(again[1]["content"][0]) == sent,
+            f"replayed from the log: {again[1]['content'][0]}")
+
+
+@scenario(conf=AN, bound=12)
+def an_stall(t):
+    """Headers, then not one event: the idle watchdog retries."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    rs = r.all("retry")
+    t.check(len(rs) == 1 and rs[0]["class"] == "transient", f"retries {rs}")
+    t.check(r.text() == "Answered after a stall.", f"text {r.text()!r}")
+
+
+@scenario(conf=AN, bound=8)
+def an_529(t):
+    """overloaded_error, a 529, backs off and retries."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    rs = r.all("retry")
+    t.check(len(rs) == 1 and rs[0]["status"] == 529 and rs[0]["class"] == "transient"
+            and "overloaded_error" in rs[0]["msg"], f"retries {rs}")
+    t.check(r.text() == "Not overloaded now.", f"text {r.text()!r}")
+
+
+@scenario(conf=AN, bound=8)
+def an_429(t):
+    """rate_limit_error with retry-after: 2 waits as asked."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    rs = r.all("retry")
+    t.check(len(rs) == 1 and rs[0]["status"] == 429 and rs[0]["delay_ms"] >= 2000,
+            f"retries {rs}")
+    reqs = t.requests()
+    t.check(reqs[1]["t"] - reqs[0]["t"] >= 1.9, "waited")
+    t.check(r.text() == "Waited as asked.", f"text {r.text()!r}")
+
+
+@scenario(conf=AN, bound=8)
+def an_midstream(t):
+    """An error event after text: the text is kept and the agent asked to
+    continue; the reasoning, cut off before its signature, stays out."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    t.check(r.text() == "The answer is forty-two.", f"text {r.text()!r}")
+    t.check([n["kind"] for n in r.all("nudge")] == ["continue"], f"nudges {r.all('nudge')}")
+    t.check(r.all("assistant")[0]["finish"] == "interrupted", "committed as interrupted")
+    second = t.requests()[1]["body"]["messages"]
+    t.check([b["type"] for b in second[1]["content"]] == ["text"] and
+            second[1]["content"][0]["text"] == "The answer is",
+            f"the partial went back without its reasoning: {second[1]}")
+
+
+@scenario(conf=AN, bound=8)
+def an_max_tokens(t):
+    """The output limit cuts a call's input short: the call fails, saying
+    why, and goes back as an error."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    end = r.all("tool.end")
+    t.check(len(end) == 1 and end[0]["status"] == "error" and
+            "length limit" in end[0]["text"], f"tool.end {end}")
+    t.check(r.all("assistant")[0]["finish"] == "length", "finish length")
+    t.check(t.file("big.txt") is None, "nothing written")
+    res = anblocks(t.requests()[1]["body"]["messages"][2], "tool_result")
+    t.check(len(res) == 1 and res[0].get("is_error") is True, f"result {res}")
+    t.check(r.text() == "Wrote less at once.", f"text {r.text()!r}")
+
+
+@scenario(conf=AN, bound=8)
+def an_pause(t):
+    """pause_turn: the paused response goes back last, as it is, and the
+    turn goes on with no nudge."""
+    r = t.run(env=ANENV)
+    anok(t, r)
+    t.check(r.text() == "Working on it, and done.", f"text {r.text()!r}")
+    t.check(not r.all("nudge"), f"no nudges: {r.all('nudge')}")
+    t.check([e["finish"] for e in r.all("assistant")] == ["pause_turn", "stop"],
+            f"finishes {[e['finish'] for e in r.all('assistant')]}")
+    reqs = t.requests()
+    t.check(len(reqs) == 2, f"two requests: {len(reqs)}")
+    last = reqs[1]["body"]["messages"][-1]
+    t.check(last["role"] == "assistant" and
+            last["content"][0]["text"] == "Working on it, ", f"last {last}")
+    t.check(len(r.all("turn.end")) == 1, "one turn")
+
+
+@scenario(conf=AN, bound=8)
+def an_refusal(t):
+    """refusal ends the turn with a note that says why."""
+    r = t.run(env=ANENV)
+    t.check(r.rc == 1, f"exit {r.rc}: {r.stderr}")
+    end = r.last("turn.end")
+    t.check(end.get("why") == "error" and "refusal" in end.get("err", ""),
+            f"turn end {end}")
+    notes = [n["text"] for n in r.all("note") if n.get("level") == "error"]
+    t.check(any("category cyber: This request was declined." in n for n in notes),
+            f"notes {notes}")
+    t.check(r.all("assistant")[0]["finish"] == "refusal", "finish refusal")
+    t.check(len(t.requests()) == 1, "no retry")
+
+
+@scenario(conf=AN, bound=20, alone=True)
+def an_overflow(t):
+    """prompt is too long: compact (the summary over the Messages API too),
+    then retry the step, with no reasoning from before the compaction."""
+    bigfiles(t, 4, 100)
+    r = t.run(env=ANENV)
+    anok(t, r)
+    cps = r.all("compact")
+    t.check(cps and cps[-1]["why"] == "overflow", f"compacted for it: {cps}")
+    reqs = t.requests()
+    t.check(len(reqs) == 6, f"the step retried once: {len(reqs)}")
+    post = reqs[5]["body"]["messages"]
+    t.check("<conversation-checkpoint>" in post[0]["content"][0]["text"],
+            "with a checkpoint")
+    t.check(not any(b["type"] in ("thinking", "redacted_thinking")
+                    for m in post for b in m["content"]),
+            "no reasoning from before the compaction")
+    sreq = t.compactions()
+    t.check(sreq and fake_provider.is_compaction(sreq[0]["body"]) and
+            "tools" not in sreq[0]["body"], "the summary over the Messages API")
+    t.check(r.text() == "Fits now.", f"text {r.text()!r}")
+
+
+@scenario(conf=AN, bound=8)
+def an_rebind(t):
+    """Reasoning the API finds bound to another conversation: the step
+    goes again once, with no reasoning sent back."""
+    t.put("a.txt", "hello\n")
+    r = t.run(env=ANENV)
+    anok(t, r)
+    rs = r.all("retry")
+    t.check(len(rs) == 1 and rs[0]["class"] == "deterministic" and
+            "bound to a different conversation" in rs[0]["msg"], f"retries {rs}")
+    reqs = [x["body"]["messages"] for x in t.requests()]
+    t.check(len(reqs) == 3, f"three requests: {len(reqs)}")
+    t.check([b["type"] for b in reqs[1][1]["content"]] == ["thinking", "tool_use"] and
+            [b["type"] for b in reqs[2][1]["content"]] == ["tool_use"],
+            "sent with its reasoning, then without")
+    t.check(r.text() == "Read it.", f"text {r.text()!r}")
+
+
+@scenario(conf=dict(AN, _listing={"max_input_tokens": 100000}), bound=20,
+          alone=True)
+def an_prune(t):
+    """Old tool outputs elided in place: reasoning from before goes no
+    more, and reasoning after it goes back again."""
+    bigfiles(t, 10, 512)
+    r = t.run(env=ANENV)
+    anok(t, r)
+    cps = r.all("compact")
+    t.check(len(cps) == 1 and cps[0]["kind"] == "prune", f"one prune: {cps}")
+    reqs = [x["body"]["messages"] for x in t.requests()]
+    k = next(i for i, m in enumerate(reqs)
+             if any(str(b.get("content", "")).startswith("[output elided")
+                    for x in m for b in x["content"]))
+    count = [sum(b["type"] == "thinking" for x in m for b in x["content"]) for m in reqs]
+    t.check(count[k] == 0 and count[k - 1] == k - 1 and count[-1] == len(reqs) - 1 - k,
+            f"reasoning sent: {count}, pruned at {k}")
+    t.check(r.text() == "Pruned and done.", f"text {r.text()!r}")
+
+
+@scenario(conf=AN, bound=10)
+def an_cache(t):
+    """Cache reads grow turn over turn: each request's prefix is the last
+    one's, with a breakpoint where that one wrote."""
+    bigfiles(t, 4, 50)
+    r = t.run(env=ANENV)
+    anok(t, r)
+    us = [e["usage"] for e in r.all("assistant")]
+    cached = [u["cached"] for u in us]
+    t.check(len(us) == 5 and cached[1] > 0 and
+            all(b > a for a, b in zip(cached[1:], cached[2:])),
+            f"cache reads grow: {cached}")
+    t.check(all(u.get("written", 0) > 0 for u in us), f"written: {us}")
+    t.check(all(u["in"] > u["cached"] + u.get("written", 0) for u in us), f"in: {us}")
+
+
+@scenario(conf=AN, bound=8)
+def an_auth(t):
+    """A key refused is fatal at once, with a hint naming the setting and
+    the variable, never the key."""
+    r = t.run(env={"PROSPERO_TEST_KEY": "wrong-key-123"})
+    t.check(r.rc == 1, f"exit {r.rc}: {r.stderr}")
+    end = r.last("turn.end")
+    err = end.get("err", "")
+    t.check(end.get("why") == "error" and err.startswith("fatal: HTTP 401") and
+            "invalid x-api-key" in err and
+            "[endpoint fake] key = env:PROSPERO_TEST_KEY, which is set" in err,
+            f"turn end {end}")
+    t.check("wrong-key-123" not in json.dumps(r.events) and
+            "wrong-key-123" not in r.stderr, "the key is never shown")
+    t.check(not r.all("retry"), "no retries")
+    r = t.run()
+    end = r.last("turn.end")
+    t.check(r.rc == 1 and "which is not set where the engine runs" in end.get("err", ""),
+            f"unset: {end}")
+
+
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")
 
 

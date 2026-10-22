@@ -3,7 +3,8 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""A fault-injecting fake OpenAI Chat Completions server for Prospero's tests.
+"""A fault-injecting fake OpenAI Chat Completions server for Prospero's tests,
+which also speaks Anthropic's Messages API.
 
 The model name picks the script: "fake:SCENARIO" or "fake:SCENARIO:NONCE",
 where requests are counted per full model name, so each run of a scenario
@@ -19,8 +20,21 @@ A compaction request (its system prompt is the summarizer's) is counted
 apart, as model "M#compact", and answered by the scenario's function
 named SCENARIO_compact if there is one, else with a short summary.
 
+Anthropic's Messages API (POST /v1/messages) takes the same model names,
+and its scenarios, named an_*, answer with its events. It checks each
+request as the real API would, and stricter: the key (AN_KEY, as x-api-key)
+and anthropic-version, roles that alternate, a message's tool results
+before its text and each matching a call of the message before, no blank
+text, at most four cache breakpoints and none on reasoning, and reasoning
+returned verbatim with the signature this server gave it, still bound to
+the conversation before it (the system prompt, the tools and the messages
+before it, unchanged), which compaction must respect. A request that fails
+is answered 400 invalid_request_error, as the API does. Its usage counts
+cache reads and writes from the breakpoints of the requests seen so far.
+
 Other endpoints:
-  GET  /v1/models                   registered models, as a llama.cpp router
+  GET  /v1/models                   registered models, as a llama.cpp router,
+                                    or with anthropic-version, as Anthropic
   GET  /props                       404, except under /routerN/ (below)
   POST /v1/chat/completions/control reasoning_end for a stream that asks
                                     for it (wants_end), else no success
@@ -41,6 +55,7 @@ Run it alone with:  uv run tests/fake_provider.py [--port N]
 """
 
 import argparse
+import hashlib
 import json
 import random
 import socket
@@ -62,18 +77,23 @@ class State:
         self.active = {}    # prefix -> {model: requests in flight}
         self.peak = {}      # prefix -> most different models in flight
         self.includes = 0   # fetches of /fake/include.ini
+        self.sigs = {}      # Anthropic: signature -> (reasoning, binding)
+        self.redacted = set()  # Anthropic: redacted data given out
+        self.caches = {}    # Anthropic: model -> {prefix hash: tokens}
+        self.listings = []  # Anthropic: headers of /v1/models requests
         self.stop = threading.Event()
 
     def register(self, model, **listing):
         with self.lock:
             self.models[model] = listing
 
-    def take(self, model, body):
+    def take(self, model, body, headers=None):
         with self.lock:
             n = self.counts.get(model, 0)
             self.counts[model] = n + 1
             self.requests.setdefault(model, []).append(
-                {"t": time.monotonic(), "end": None, "body": body})
+                {"t": time.monotonic(), "end": None, "body": body,
+                 "headers": headers or {}})
             return n
 
     def finished(self, model, n):
@@ -261,6 +281,9 @@ COMPACT_MARK = "You summarize a coding session"
 
 def is_compaction(req):
     msgs = req.get("messages", [])
+    system = req.get("system")
+    if isinstance(system, list):  # Anthropic
+        return bool(system) and str(system[0].get("text", "")).startswith(COMPACT_MARK)
     return bool(msgs) and msgs[0].get("role") == "system" and \
         str(msgs[0].get("content", "")).startswith(COMPACT_MARK)
 
@@ -2114,6 +2137,430 @@ def sc_final_newline(model, n, req):
         yield from answer(model, "Wrote them all.")
 
 
+# Anthropic's Messages API: its events, the checks the API makes, and
+# its cache's counts
+
+AN_KEY = "fake-anthropic-key"
+AN_VERSION = "2023-06-01"
+
+
+def an_event(obj):
+    return S.raw(f"event: {obj['type']}\ndata: {json.dumps(obj)}\n\n")
+
+
+def an_fail(status, kind, message, headers=None):
+    return S.error(status, {"type": "error", "error": {"type": kind, "message": message}},
+                   headers)
+
+
+def plain(obj):
+    """A value without its cache breakpoints, which neither the cache nor
+    reasoning's binding sees."""
+    if isinstance(obj, dict):
+        return {k: plain(v) for k, v in obj.items() if k != "cache_control"}
+    if isinstance(obj, list):
+        return [plain(v) for v in obj]
+    return obj
+
+
+def an_system(req):
+    system = req.get("system", [])
+    return [{"type": "text", "text": system}] if isinstance(system, str) else system
+
+
+def an_binding(req, upto):
+    """What reasoning in message upto of a request is bound to: the system
+    prompt, the tools, and the messages before it."""
+    r = {"system": plain(an_system(req)), "tools": plain(req.get("tools", [])),
+         "messages": plain(req.get("messages", [])[:upto])}
+    return hashlib.sha256(json.dumps(r, sort_keys=True).encode()).hexdigest()
+
+
+def an_usage(model, req):
+    """Usage as a prompt cache would count it. The prompt runs over the
+    tools, the system prompt, then each message's blocks, at 4 bytes a
+    token. Up to a breakpoint that an earlier request also had is read
+    from the cache; the rest, up to the last breakpoint, is written."""
+    units = [(b, "") for b in req.get("tools", []) + an_system(req)]
+    for i, m in enumerate(req.get("messages", [])):
+        units += [(b, f"{i}:{m.get('role')}") for b in m.get("content", [])]
+    h = hashlib.sha256()
+    size = 0
+    marks = []
+    for b, where in units:
+        u = json.dumps(plain(b), sort_keys=True) + where
+        h.update(u.encode())
+        size += len(u)
+        if isinstance(b, dict) and "cache_control" in b:
+            marks.append((h.hexdigest(), size // 4))
+    with STATE.lock:
+        seen = STATE.caches.setdefault(model, {})
+        read = max([n for k, n in marks if k in seen], default=0)
+        wrote = max(0, marks[-1][1] - read) if marks else 0
+        for k, n in marks:
+            seen[k] = n
+    return {"input_tokens": max(0, size // 4 - read - wrote) + 10,
+            "cache_creation_input_tokens": wrote, "cache_read_input_tokens": read}
+
+
+def an_check_reasoning(req, i, k, b):
+    where = f"messages.{i}.content.{k}"
+    if b.get("type") == "redacted_thinking":
+        with STATE.lock:
+            ok = b.get("data") in STATE.redacted
+        return None if ok else f"{where}: Invalid `data` in `redacted_thinking` block"
+    with STATE.lock:
+        known = STATE.sigs.get(b.get("signature"))
+    if not known or known[0] != b.get("thinking"):
+        return f"{where}: Invalid `signature` in `thinking` block"
+    if known[1] != an_binding(req, i):
+        return (f"{where}: Invalid `signature` in `thinking` block. The block is "
+                "bound to a different conversation.")
+    return None
+
+
+def an_check(req, prefill=False):
+    """Why the API would reject a request, or None if it would not."""
+    if not isinstance(req.get("max_tokens"), int) or req["max_tokens"] < 1:
+        return "max_tokens: Field required"
+    if req.get("stream") is not True:
+        return "stream: expected true"
+    marks = 0
+    for t in req.get("tools", []):
+        if not t.get("name") or t.get("input_schema", {}).get("type") != "object":
+            return "tools: each needs a name and an input_schema of type object"
+        marks += "cache_control" in t
+    choice = req.get("tool_choice")
+    if choice is not None and choice != {"type": "auto"}:
+        return 'tool_choice: type "tool" and "any" are not supported for this model.'
+    for b in an_system(req):
+        marks += "cache_control" in b
+    th = req.get("thinking")
+    if th is not None:
+        kind = th.get("type")
+        if kind == "enabled":
+            budget = th.get("budget_tokens", 0)
+            if budget < 1024 or budget >= req["max_tokens"]:
+                return "thinking.budget_tokens: must be at least 1024 and below max_tokens"
+        elif kind not in ("adaptive", "disabled"):
+            return f"thinking.type: unknown type {kind}"
+    msgs = req.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return "messages: at least one message is required"
+    for i, m in enumerate(msgs):
+        role = m.get("role")
+        if role != ("user" if i % 2 == 0 else "assistant"):
+            return (f'messages.{i}: roles must alternate between "user" and '
+                    '"assistant", starting with "user"')
+        content = m.get("content")
+        if not isinstance(content, list) or not content:
+            return f"messages.{i}: all messages must have non-empty content"
+        results = []
+        texts = False
+        for k, b in enumerate(content):
+            where = f"messages.{i}.content.{k}"
+            kind = b.get("type")
+            marks += "cache_control" in b
+            if kind == "text":
+                if not str(b.get("text", "")).strip():
+                    return f"{where}: text content blocks must contain non-whitespace text"
+                texts = True
+            elif kind == "tool_result" and role == "user":
+                if texts:
+                    return f"{where}: tool_result blocks must come before any text"
+                results.append(b.get("tool_use_id"))
+            elif kind in ("thinking", "redacted_thinking") and role == "assistant":
+                if "cache_control" in b:
+                    return f"{where}: cache_control cannot be set on thinking blocks"
+                err = an_check_reasoning(req, i, k, b)
+                if err:
+                    return err
+            elif kind == "tool_use" and role == "assistant":
+                if not isinstance(b.get("input"), dict):
+                    return f"{where}.input: Input should be a valid dictionary"
+            else:
+                return f"{where}: unexpected block type {kind} in a {role} message"
+        if role == "user":
+            calls = [] if i == 0 else [b.get("id") for b in msgs[i - 1]["content"]
+                                       if b.get("type") == "tool_use"]
+            if sorted(calls) != sorted(results):
+                return (f"messages.{i}: tool_use ids were found without tool_result "
+                        f"blocks immediately after, or the reverse: {calls} {results}")
+    if msgs[-1]["role"] == "assistant" and not prefill:
+        return ("This model does not support assistant message prefill. The "
+                "conversation must end with a user message.")
+    if marks > 4:
+        return f"A maximum of 4 blocks with cache_control may be provided. Found {marks}."
+    return None
+
+
+def an_models():
+    data = []
+    with STATE.lock:
+        listing = dict(STATE.models)
+    for model, over in listing.items():
+        entry = {"type": "model", "id": model, "display_name": model,
+                 "created_at": "2026-10-01T00:00:00Z",
+                 "max_input_tokens": 200000, "max_tokens": 16000}
+        entry.update({k: v for k, v in over.items()
+                      if k in ("max_input_tokens", "max_tokens")})
+        data.append(entry)
+    return {"data": data, "has_more": False,
+            "first_id": data[0]["id"] if data else None,
+            "last_id": data[-1]["id"] if data else None}
+
+
+def an_start(model, req):
+    usage = an_usage(model, req)
+    usage["output_tokens"] = 1
+    return an_event({"type": "message_start", "message": {
+        "id": "msg_fake", "type": "message", "role": "assistant", "model": model,
+        "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage}})
+
+
+def an_text(index, s, pieces=2, stop=True):
+    yield an_event({"type": "content_block_start", "index": index,
+                    "content_block": {"type": "text", "text": ""}})
+    step = max(1, (len(s) + pieces - 1) // pieces)
+    for i in range(0, len(s), step):
+        yield an_event({"type": "content_block_delta", "index": index,
+                        "delta": {"type": "text_delta", "text": s[i:i+step]}})
+    if stop:
+        yield an_event({"type": "content_block_stop", "index": index})
+
+
+def an_think(req, index, s, pieces=2, sign=True, bound=None):
+    """Reasoning, signed (in two pieces) as bound to the request, or to
+    what bound says."""
+    yield an_event({"type": "content_block_start", "index": index,
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
+    step = max(1, (len(s) + pieces - 1) // pieces)
+    for i in range(0, len(s), step):
+        yield an_event({"type": "content_block_delta", "index": index,
+                        "delta": {"type": "thinking_delta", "thinking": s[i:i+step]}})
+    if not sign:
+        return
+    with STATE.lock:
+        sig = f"EqFake{len(STATE.sigs)}x{random.randrange(1 << 32):08x}=="
+        STATE.sigs[sig] = (s, bound or an_binding(req, len(req.get("messages", []))))
+    for piece in (sig[:6], sig[6:]):
+        yield an_event({"type": "content_block_delta", "index": index,
+                        "delta": {"type": "signature_delta", "signature": piece}})
+    yield an_event({"type": "content_block_stop", "index": index})
+
+
+def an_redact(index):
+    data = f"RedactedFake{random.randrange(1 << 32):08x}"
+    with STATE.lock:
+        STATE.redacted.add(data)
+    yield an_event({"type": "content_block_start", "index": index,
+                    "content_block": {"type": "redacted_thinking", "data": data}})
+    yield an_event({"type": "content_block_stop", "index": index})
+
+
+def an_tool(index, cid, name, args, pieces=2):
+    if not isinstance(args, str):
+        args = json.dumps(args)
+    yield an_event({"type": "content_block_start", "index": index, "content_block": {
+        "type": "tool_use", "id": cid, "name": name, "input": {}}})
+    step = max(1, (len(args) + pieces - 1) // pieces)
+    for i in range(0, len(args), step):
+        yield an_event({"type": "content_block_delta", "index": index, "delta": {
+            "type": "input_json_delta", "partial_json": args[i:i+step]}})
+    yield an_event({"type": "content_block_stop", "index": index})
+
+
+def an_end(reason="end_turn", out=10, details=None):
+    delta = {"stop_reason": reason, "stop_sequence": None}
+    if details:
+        delta["stop_details"] = details
+    yield an_event({"type": "message_delta", "delta": delta,
+                    "usage": {"output_tokens": out}})
+    yield an_event({"type": "message_stop"})
+
+
+def an_answer(model, req, s, think=None):
+    yield S.head()
+    yield an_start(model, req)
+    yield an_event({"type": "ping"})
+    k = 0
+    if think:
+        yield from an_think(req, k, think)
+        k += 1
+    yield from an_text(k, s)
+    yield from an_end()
+
+
+def an_call(model, req, n, name, args, think=None, redact=False, say=None, bound=None):
+    yield S.head()
+    yield an_start(model, req)
+    k = 0
+    if think:
+        yield from an_think(req, k, think, bound=bound)
+        k += 1
+    if redact:
+        yield from an_redact(k)
+        k += 1
+    if say:
+        yield from an_text(k, say)
+        k += 1
+    yield from an_tool(k, f"toolu_{n:02d}{random.randrange(1 << 16):04x}", name, args)
+    yield from an_end("tool_use")
+
+
+def an_compact_default(model, n, req):
+    yield S.head()
+    yield an_start(model, req)
+    yield from an_think(req, 0, "What matters to keep.")
+    yield from an_text(1, f"## Goal\nRead the files.\n\n## Progress\n### Done\n"
+                          f"Read the early files. SUMMARY-{n}\n\n## Next steps\n"
+                          f"Read the rest.", 3)
+    yield from an_end()
+
+
+def sc_an_plain(model, n, req):
+    yield from an_answer(model, req, "Hello from the Messages API.")
+
+
+def sc_an_tools(model, n, req):
+    # Each step reasons first, which goes back verbatim; the second's
+    # reasoning is partly redacted
+    steps = [("read", {"path": "hello.txt"}),
+             ("edit", {"path": "hello.txt", "old_string": "world",
+                       "new_string": "there"}),
+             ("shell", {"command": "cat hello.txt"})]
+    if n < len(steps):
+        yield from an_call(model, req, n, *steps[n], think=f"Step {n}: plan it.",
+                           redact=n == 1, say="On it." if n == 0 else None)
+    else:
+        yield from an_answer(model, req, "Done: hello.txt now greets there.",
+                             think="All three worked.")
+
+
+def sc_an_think(model, n, req):
+    if n == 0:
+        yield from an_call(model, req, n, "read", {"path": "a.txt"},
+                           think="The file will say what to do.")
+    else:
+        yield from an_answer(model, req, "It says hello.")
+
+
+def sc_an_stall(model, n, req):
+    # Headers, then not one event, past the idle watchdog
+    if n == 0:
+        yield S.head()
+        yield S.stall(30)
+    else:
+        yield from an_answer(model, req, "Answered after a stall.")
+
+
+def sc_an_529(model, n, req):
+    if n == 0:
+        yield an_fail(529, "overloaded_error", "Overloaded")
+    else:
+        yield from an_answer(model, req, "Not overloaded now.")
+
+
+def sc_an_429(model, n, req):
+    if n == 0:
+        yield an_fail(429, "rate_limit_error", "Number of request tokens has "
+                      "exceeded your per-minute rate limit", {"retry-after": "2"})
+    else:
+        yield from an_answer(model, req, "Waited as asked.")
+
+
+def sc_an_midstream(model, n, req):
+    # Reasoning cut off before its signature, then text, then an error
+    # event: the text is kept, the reasoning cannot go back
+    if n == 0:
+        yield S.head()
+        yield an_start(model, req)
+        yield from an_think(req, 0, "Half a thought", sign=False)
+        yield from an_text(1, "The answer is", stop=False)
+        yield an_event({"type": "error", "error": {"type": "overloaded_error",
+                                                   "message": "Overloaded"}})
+        yield S.sleep(0.2)
+    else:
+        yield from an_answer(model, req, " forty-two.")
+
+
+def sc_an_max_tokens(model, n, req):
+    # The output limit cuts a call's input short
+    if n == 0:
+        yield S.head()
+        yield an_start(model, req)
+        yield from an_tool(0, "toolu_cut", "write",
+                           '{"path": "big.txt", "content": "line one\\nline two', 3)
+        yield from an_end("max_tokens", out=16000)
+    else:
+        yield from an_answer(model, req, "Wrote less at once.")
+
+
+def sc_an_pause(model, n, req):
+    # A long turn paused by the server, then resumed from where it stopped
+    if n == 0:
+        yield S.head()
+        yield an_start(model, req)
+        yield from an_text(0, "Working on it, ")
+        yield from an_end("pause_turn")
+    else:
+        yield from an_answer(model, req, "and done.")
+
+
+def sc_an_refusal(model, n, req):
+    yield S.head()
+    yield an_start(model, req)
+    yield from an_text(0, "I can help with part")
+    yield from an_end("refusal", details={"type": "refusal", "category": "cyber",
+                                          "explanation": "This request was declined."})
+
+
+def sc_an_overflow(model, n, req):
+    # Rejected as too long once, after some reads with reasoning: the
+    # reasoning of the messages kept after compacting cannot go back
+    if n < 4:
+        yield from an_call(model, req, n, "read", {"path": f"f{n}.txt"},
+                           think=f"Read f{n} next.")
+    elif n == 4:
+        p = ptok(req)
+        yield an_fail(400, "invalid_request_error",
+                      f"prompt is too long: {p} tokens > {p * 9 // 10} maximum")
+    else:
+        yield from an_answer(model, req, "Fits now.", think="Enough room.")
+
+
+def sc_an_rebind(model, n, req):
+    # Reasoning bound to another conversation, as when the history was
+    # edited: the request that sends it back is refused (by an_check)
+    if n == 0:
+        yield from an_call(model, req, n, "read", {"path": "a.txt"},
+                           think="Bound elsewhere.", bound="elsewhere")
+    else:
+        yield from an_answer(model, req, "Read it.", think="Fine now.")
+
+
+def sc_an_prune(model, n, req):
+    # Big outputs, reasoning at each step: pruning old outputs edits the
+    # messages before reasoning, which then cannot go back
+    if n < 10:
+        yield from an_call(model, req, n, "read", {"path": f"f{n}.txt"},
+                           think=f"Read f{n} next.")
+    else:
+        yield from an_answer(model, req, "Pruned and done.", think="All read.")
+
+
+def sc_an_cache(model, n, req):
+    if n < 4:
+        yield from an_call(model, req, n, "read", {"path": f"f{n}.txt"},
+                           think=f"Read f{n} next.")
+    else:
+        yield from an_answer(model, req, "Read them all.")
+
+
+def sc_an_auth(model, n, req):
+    yield from an_answer(model, req, "Never reached: the key is wrong.")
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 
@@ -2163,7 +2610,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url, path, prefix = self.route()
         q = urllib.parse.parse_qs(url.query)
-        if path in ("/v1/models", "/models"):
+        if path in ("/v1/models", "/models") and self.headers.get("anthropic-version"):
+            with STATE.lock:
+                STATE.listings.append({"query": url.query,
+                                       "version": self.headers.get("anthropic-version"),
+                                       "key": self.headers.get("x-api-key") == AN_KEY})
+            if self.headers.get("x-api-key") != AN_KEY:
+                self.send_json(401, {"type": "error", "error": {
+                    "type": "authentication_error", "message": "invalid x-api-key"}})
+            else:
+                self.send_json(200, an_models())
+        elif path in ("/v1/models", "/models"):
             self.send_json(200, models())
         elif path == "/props" and prefix.endswith("-flaky") and \
                 not STATE.probed(prefix):
@@ -2227,6 +2684,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/chat/completions/control":
             self.control(raw)
             return
+        if path == "/v1/messages":
+            self.messages(prefix, raw)
+            return
         if path not in ("/v1/chat/completions", "/chat/completions"):
             self.send_json(404, {"error": {"message": "not found"}})
             return
@@ -2250,6 +2710,46 @@ class Handler(BaseHTTPRequestHandler):
         STATE.begin(prefix, model)
         try:
             self.perform(fn(model, n, req))
+        finally:
+            STATE.end(prefix, model)
+            STATE.finished(key, n)
+
+    def messages(self, prefix, raw):
+        """Anthropic's Messages API, checked as the API would."""
+        def fail(status, kind, message):
+            self.send_json(status, {"type": "error", "error": {
+                "type": kind, "message": message}})
+        if self.headers.get("x-api-key") != AN_KEY:
+            fail(401, "authentication_error", "invalid x-api-key")
+            return
+        if self.headers.get("anthropic-version") != AN_VERSION:
+            fail(400, "invalid_request_error", "anthropic-version: unknown version")
+            return
+        try:
+            req = json.loads(raw)
+        except ValueError:
+            fail(400, "invalid_request_error", "invalid JSON body")
+            return
+        model = req.get("model", "")
+        parts = model.split(":")
+        name = parts[1] if len(parts) > 1 and parts[0] == "fake" else ""
+        fn = SCENARIOS.get(name)
+        if not fn:
+            fail(404, "not_found_error", f"model: {model}")
+            return
+        key = model
+        if is_compaction(req):
+            key = model + "#compact"
+            fn = SCENARIOS.get(name + "_compact", an_compact_default)
+        headers = {k.lower(): v for k, v in self.headers.items() if k.lower() != "x-api-key"}
+        n = STATE.take(key, req, headers)
+        STATE.begin(prefix, model)
+        try:
+            err = an_check(req, prefill=name.startswith("an_pause"))
+            if err:
+                fail(400, "invalid_request_error", err)
+            else:
+                self.perform(fn(model, n, req))
         finally:
             STATE.end(prefix, model)
             STATE.finished(key, n)

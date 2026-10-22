@@ -59,14 +59,16 @@ static i64 bytesof(Rate r, i64 tokens)
     return tokens * 4;
 }
 
-// A message's size as estimates count it: its texts and a little for
-// the structure around them.
+// A message's size as estimates count it: its texts (and reasoning's
+// signatures, which carry it) and a little for the structure around
+// them.
 static i64 msgbytes(Msg *m)
 {
     i64 n = 16 + m->text.len;
     for (iz i = 0; i < m->blocks.len; i++) {
         Block *b = &m->blocks[i];
-        n += 16 + b->text.len + b->args.len + b->name.len + b->id.len;
+        n += 16 + b->text.len + b->sig.len + b->args.len + b->name.len +
+             b->id.len;
     }
     return n;
 }
@@ -275,12 +277,11 @@ static Str const compactsections =
     "Exact file paths, names, commands, values and error messages the "
     "work depends on.\n";
 
-// The summarizer's request: no tools offered, text only, the previous
-// summary to update (if any), then the conversation (transcript).
-static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
-                         Str convo, i64 words)
+// The summarizer's prompt: the previous summary to update (if any),
+// then the conversation (transcript).
+static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words)
 {
-    Buf u(&scratch, convo.len + prev.len + 4096);
+    Buf u(a, convo.len + prev.len + 4096);
     print(&u, "Summarize the conversation below for the agent that will "
               "continue it. That agent will see only your summary and the "
               "most recent messages, so keep everything it needs to carry "
@@ -300,7 +301,14 @@ static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
     print(&u, "\n<conversation>\n");
     print(&u, convo);
     print(&u, "</conversation>\n");
+    return finish(&u);
+}
 
+// The summarizer's request: no tools offered, text only.
+static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
+                         Str convo, i64 words)
+{
+    Str     u = summaryprompt(&scratch, prev, convo, words);
     Buf     b(a, u.len + 1024);
     JsonOut w = {&b};
     putobject(&w);
@@ -318,7 +326,7 @@ static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
     putkey(&w, "role");
     putstr(&w, "user");
     putkey(&w, "content");
-    putstr(&w, finish(&u));
+    putstr(&w, u);
     putend(&w);
     putend(&w);
     putkey(&w, "stream");
@@ -340,6 +348,20 @@ static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
     }
     putend(&w);
     return finish(&b);
+}
+
+// The same request for Anthropic's Messages API (anthropic.cpp).
+static Str ansummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
+                     Str convo, i64 words)
+{
+    Msg m = {};
+    m.role = ROLE_USER;
+    m.text = summaryprompt(&scratch, prev, convo, words);
+    ChatReq r = {};
+    r.mc      = mc;
+    r.system  = compactsystem;
+    r.history = {&m, 1, 1};
+    return anencode(a, scratch, &r);
 }
 
 // The user message that stands for the compacted messages.

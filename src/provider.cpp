@@ -2,10 +2,11 @@
 // error classification, and llama.cpp router discovery
 //
 // The transcript is append-only: an assistant message keeps the blocks
-// the model produced (reasoning, text, tool calls with their raw
-// argument strings), and requests are encoded from it deterministically,
-// so that each request's prefix is byte-identical to the previous one
-// and the server's prompt cache keeps hitting.
+// the model produced (reasoning with any signature, text, tool calls
+// with their raw argument strings), and requests are encoded from it
+// deterministically, so that each request's prefix is byte-identical to
+// the previous one and the server's prompt cache keeps hitting.
+// Anthropic's Messages API, the other request format, is anthropic.cpp.
 //
 // Everything here is pure: the engine does the I/O.
 //
@@ -181,11 +182,13 @@ enum : i32 {
     BLOCK_THINK,
     BLOCK_TEXT,
     BLOCK_CALL,
+    BLOCK_REDACTED,  // reasoning the server keeps opaque (Anthropic)
 };
 
 struct Block {
     i32 type;
-    Str text;  // think and text blocks
+    Str text;  // think and text blocks; a redacted block's data
+    Str sig;   // think blocks: the server's signature, empty if none
     Str id;    // call blocks
     Str name;
     Str args;  // the raw argument string, as the model produced it
@@ -198,22 +201,38 @@ struct Msg {
     Str          callid;  // tool messages
     Str          spill;   // tool messages: the full output, relative to
                           // the session's directory, if one was kept
+    b32          error;   // tool messages: the call failed or was refused
     i64          seq;     // of the record it came from, 0 if none
 };
 
 struct Usage {
-    i64 in;      // prompt tokens
-    i64 out;     // completion tokens
-    i64 cached;  // prompt tokens served from the cache
+    i64 in;       // prompt tokens, cached ones included
+    i64 out;      // completion tokens
+    i64 cached;   // prompt tokens served from the cache
+    i64 written;  // prompt tokens written to the cache (Anthropic)
 };
 
 static Str blockname(i32 type)
 {
     switch (type) {
-    case BLOCK_THINK: return "think";
-    case BLOCK_TEXT:  return "text";
+    case BLOCK_THINK:    return "think";
+    case BLOCK_TEXT:     return "text";
+    case BLOCK_REDACTED: return "redacted";
     }
     return "call";
+}
+
+static i32 blocktype(Str name)
+{
+    return name=="think"    ? BLOCK_THINK :
+           name=="text"     ? BLOCK_TEXT  :
+           name=="redacted" ? BLOCK_REDACTED : BLOCK_CALL;
+}
+
+// Whether a tool result's status (tool.end) tells the model it failed.
+static b32 toolfailed(Str status)
+{
+    return status!="ok" && status!="background";
 }
 
 
@@ -340,6 +359,20 @@ struct Extra {
     Str json;
 };
 
+// The request format an endpoint takes ([endpoint] kind).
+enum : i32 {
+    EP_OPENAI,     // Chat Completions
+    EP_ANTHROPIC,  // Messages (anthropic.cpp)
+};
+
+// How an Anthropic model is asked to think ([model] thinking).
+enum : i32 {
+    THINK_ADAPTIVE,  // the model decides how much
+    THINK_BUDGET,    // a fixed budget of tokens, for older models
+    THINK_OFF,       // sent as disabled
+    THINK_DEFAULT,   // not sent: the model's own default
+};
+
 struct ModelConf {
     Str          name;       // as sent in requests
     Str          reasoning;  // field to send reasoning back in, empty: never
@@ -349,6 +382,12 @@ struct ModelConf {
     i64          ctx;        // context limit in tokens, 0 if unknown
     i64          thinkmax;   // reasoning budget in tokens, 0 for none
     i32          edit;       // the edit tool's format, EDIT_* (edit.cpp)
+    // Anthropic
+    i64          maxtokens;  // [model] max_tokens, 0 if unset
+    i64          maxout;     // the server's limit on output, 0 if unknown
+    i32          think;      // THINK_*
+    b32          hidethink;  // thinking_display omitted, else summarized
+    Str          effort;     // output_config.effort, empty: not sent
 };
 
 struct ChatReq {
@@ -356,6 +395,9 @@ struct ChatReq {
     Str        system;
     Str        tools;    // the tools array, already encoded
     Slice<Msg> history;
+    i64        thinkfrom;  // reasoning of messages older than this seq
+                           // is not sent back (Anthropic: compaction
+                           // changed what it was bound to)
 };
 
 static void encodemsg(JsonOut *w, ModelConf *mc, Msg *m, Arena *a)
@@ -481,29 +523,44 @@ static Str encodechat(Arena *a, Arena tmp, ChatReq *r)
 // The partial response accumulates blocks in order of first appearance:
 // at most one reasoning block and one text block (OpenAI chat has one
 // field for each), then the calls in index order as they start. Block
-// numbers in deltas match the blocks of the committed message.
+// numbers in deltas match the blocks of the committed message. A server
+// that numbers its blocks itself (Anthropic) may send any number of each
+// kind, which go to parts instead, while think and text still gather
+// all of their kind, in order, for the checks that read them whole.
 
 struct PartCall {
-    i64 index;  // the server's tool call index
+    i64 index;    // the server's tool call (or content block) index
     i32 block;
     Buf id;
     Buf name;
     Buf args;
+    b32 stopped;  // the server said the block is complete (Anthropic)
+};
+
+struct PartBlock {
+    i64 index;    // the server's content block index
+    i32 block;
+    i32 type;     // BLOCK_THINK, BLOCK_TEXT or BLOCK_REDACTED
+    Buf text;     // a redacted block's data
+    Buf sig;
 };
 
 struct Partial {
-    Arena          *a;
-    Buf             think;
-    Buf             text;
-    i32             thinkblock;  // -1 until it starts
-    i32             textblock;
-    i32             nblocks;
-    Slice<PartCall> calls;
-    Str             finish;      // finish_reason, null until one arrives
-    Str             id;          // the completion's, null until one arrives
-    Usage           usage;
-    b32             hasusage;
-    b32             done;        // [DONE]
+    Arena           *a;
+    Buf              think;
+    Buf              text;
+    i32              thinkblock;  // -1 until it starts
+    i32              textblock;
+    i32              nblocks;
+    Slice<PartCall>  calls;
+    Slice<PartBlock> parts;       // blocks numbered by the server
+    b32              indexed;     // so numbered: parts, not think and text
+    Str              finish;      // finish_reason, null until one arrives
+    Str              id;          // the completion's, null until one arrives
+    Str              refusal;     // why the model declined, if it did
+    Usage            usage;
+    b32              hasusage;
+    b32              done;        // [DONE]
 };
 
 static Partial *newpartial(Arena *a)
@@ -749,8 +806,10 @@ struct Finished {
 
 // Turn the partial response into message blocks in perm. With complete
 // set, every call is complete; otherwise only those followed by another
-// call are known to be, and the last is dropped as incomplete. Call ids
-// differ from those used before in the session.
+// call are known to be, or that the server said were (indexed), and the
+// rest are dropped as incomplete. Text cut short (a cycle cut away)
+// leaves out what follows the cut. Call ids differ from those used
+// before in the session.
 static Finished finishpartial(Arena *perm, Partial *p, b32 complete,
                               i64 turn, i64 step, Slice<Str> used = {})
 {
@@ -768,13 +827,31 @@ static Finished finishpartial(Arena *perm, Partial *p, b32 complete,
         order[p->textblock].text = clone(perm, finish(&p->text));
         keep[p->textblock] = 1;
     }
+    iz left = p->text.len;
+    for (iz i = 0; i < p->parts.len; i++) {
+        PartBlock *k = &p->parts[i];
+        Str        t = finish(&k->text);
+        if (k->type == BLOCK_TEXT) {
+            t     = takehead(t, t.len<left ? t.len : left);
+            left -= t.len;
+            if (!t.len) {
+                continue;
+            }
+        }
+        Block *b = &order[k->block];
+        b->type = k->type;
+        b->text = clone(perm, t);
+        b->sig  = clone(perm, finish(&k->sig));
+        keep[k->block] = 1;
+    }
     i64 lastindex = I64MIN;
     for (iz i = 0; i < p->calls.len; i++) {
         lastindex = p->calls[i].index>lastindex ? p->calls[i].index : lastindex;
     }
     for (iz i = 0; i < p->calls.len; i++) {
         PartCall *c = &p->calls[i];
-        if (!complete && c->index==lastindex) {
+        b32 incomplete = p->indexed ? !c->stopped : c->index==lastindex;
+        if (!complete && incomplete) {
             r.dropped++;
             continue;
         }
@@ -844,13 +921,18 @@ static b32 contains(Str s, Str needle)
 }
 
 // The message of an error response body: {"error":{"message":..}},
-// {"error":".."}, {"message":..}, or the text itself.
+// {"error":".."}, {"message":..}, or the text itself. Anthropic's,
+// {"type":"error","error":{"type":..,"message":..}}, is "TYPE: MESSAGE",
+// since its type says what kind of error it is.
 static Str errormessage(Arena *a, Str body)
 {
     JsonDoc d = jsonparse(a, body);
     if (d.ok) {
-        Json *e = jsonget(d.root, "error");
-        if (e->type != JSON_MISSING) {
+        Json *e    = jsonget(d.root, "error");
+        Str   type = jsonstr(jsonget(e, "type"));
+        if (jsonstr(jsonget(d.root, "type"))=="error" && type.len) {
+            return concat(a, concat(a, type, ": "), errortext(e));
+        } else if (e->type != JSON_MISSING) {
             return errortext(e);
         }
         Str msg = jsonstr(jsonget(d.root, "message"));
@@ -863,6 +945,8 @@ static Str errormessage(Arena *a, Str body)
 
 // Classify an HTTP status and error text (a body or a stream error).
 // Status 0 means the error came mid-stream, already past the headers.
+// Anthropic's error types say as much as statuses do, so a stream's
+// error event is classified by its type too.
 static i32 classify(i32 status, Str text)
 {
     static Str const overflow[] = {
@@ -876,6 +960,8 @@ static i32 classify(i32 status, Str text)
         "too many tokens",
         "input is too long",
         "reduce the length of the messages",
+        "request_too_large",          // Anthropic: the body, 413
+        "exceed context limit",       // Anthropic: input plus max_tokens
     };
     if (contains(text, "failed to parse tool call arguments") ||
             contains(text, "raise_exception") ||
@@ -896,11 +982,19 @@ static i32 classify(i32 status, Str text)
         "exceeded your current quota",
         "quota exceeded",
         "usage limit",
+        "billing_error",              // Anthropic
+        "credit balance is too low",  // Anthropic, as a 400
     };
     for (iz i = 0; i < countof(limits); i++) {
         if (contains(text, limits[i])) {
             return CLASS_LIMIT;
         }
+    }
+    if (contains(text, "authentication_error") ||
+            contains(text, "permission_error")) {
+        return CLASS_FATAL;  // Anthropic, mid-stream too
+    } else if (!status && contains(text, "invalid_request_error")) {
+        return CLASS_DETERMINISTIC;
     }
     switch (status) {
     case 0:  // mid-stream
@@ -911,6 +1005,8 @@ static i32 classify(i32 status, Str text)
         return CLASS_LIMIT;
     case 401: case 403:
         return CLASS_FATAL;
+    case 413:
+        return CLASS_OVERFLOW;
     }
     if (status>=500 && status<600) {
         return CLASS_TRANSIENT;
@@ -939,8 +1035,9 @@ struct Overflow {
 };
 
 // The sizes an overflow error reports: llama.cpp's n_prompt_tokens and
-// n_ctx, or OpenAI's and vLLM's "maximum context length is N tokens"
-// with "(N in the messages".
+// n_ctx, OpenAI's and vLLM's "maximum context length is N tokens" with
+// "(N in the messages", or Anthropic's "prompt is too long: N tokens >
+// M maximum".
 static Overflow overflowsizes(Arena scratch, Str body)
 {
     Overflow r = {};
@@ -951,6 +1048,10 @@ static Overflow overflowsizes(Arena scratch, Str body)
     r.ctx    = jsonint(jsonget(e, "n_ctx"), 0);
     if (!r.ctx) {
         r.ctx = numberafter(body, "maximum context length is");
+    }
+    if (!r.prompt && findfold(body, "prompt is too long:")>=0) {
+        r.prompt = numberafter(body, "prompt is too long:");
+        r.ctx    = r.ctx ? r.ctx : numberafter(body, "tokens >");
     }
     if (!r.prompt) {
         Str m  = errormessage(&scratch, body);
@@ -1070,6 +1171,9 @@ static i64 backoffms(i32 n, u64 rnd)
 // the model is loaded; until then the limit comes from --ctx-size, which
 // under --kv-unified is the shared pool and each sequence may use all of
 // it, and otherwise is divided among --parallel slots.
+//
+// Anthropic's listing gives each model's limits outright: the context
+// (max_input_tokens) and the output (max_tokens).
 
 struct ModelInfo {
     b32 found;     // the endpoint lists the model
@@ -1079,6 +1183,7 @@ struct ModelInfo {
     i64 ctx;       // context limit, 0 if unknown
     i64 trained;   // n_ctx_train, scaled, 0 if unknown
     i32 slots;     // --parallel, the server's total_slots, 0 if unknown
+    i64 maxout;    // most output tokens in a response, 0 if unknown
 };
 
 static Str argvalue(Json *args, Str name)
@@ -1110,6 +1215,15 @@ static ModelInfo modelinfo(Json *m, i64 trained)
         return r;
     }
     r.found = 1;
+
+    i64 maxin  = jsonint(jsonget(m, "max_input_tokens"), 0);
+    i64 maxout = jsonint(jsonget(m, "max_tokens"), 0);
+    if (maxin > 0) {
+        r.ctx     = maxin;  // Anthropic: the server's own word
+        r.learned = 1;
+        r.maxout  = maxout>0 ? maxout : 0;
+        return r;
+    }
 
     Json *status = jsonget(m, "status");
     Json *args   = jsonget(status, "args");

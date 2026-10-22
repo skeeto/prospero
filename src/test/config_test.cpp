@@ -663,6 +663,7 @@ static void testcfgjson(Test *t)
         "//endpoint=*\n"
         "//model=*\n"
         "endpoint/team/url=https://t/@/c/team.ini:2\n"
+        "endpoint/team/kind=openai*\n"
         "endpoint/team/key=(hidden)@/c/team.ini:3!\n"
         "endpoint/team/connect_timeout=15*\n"
         "endpoint/team/first_byte_timeout=300*\n"
@@ -673,6 +674,7 @@ static void testcfgjson(Test *t)
         "endpoint/team/max_concurrent=*\n"
         "endpoint/team/max_models=*\n"
         "endpoint/local/url=http://127.0.0.1:8080/@/c/h.ini:3\n"
+        "endpoint/local/kind=openai*\n"
         "endpoint/local/key=env:KEY@/c/h.ini:5\n"
         "endpoint/local/connect_timeout=5*\n"
         "endpoint/local/first_byte_timeout=1800*\n"
@@ -688,6 +690,9 @@ static void testcfgjson(Test *t)
         "model/m/fallback=*\n"
         "model/m/fallback_cooldown=600*\n"
         "model/m/reasoning_budget=*\n"
+        "model/m/thinking=adaptive*\n"
+        "model/m/thinking_display=summarized*\n"
+        "model/m/effort=*\n"
         "model/m/edit_format=replace*\n"
         "model/m/max_concurrent=*\n"
         "model/m/temperature=*\n"
@@ -715,7 +720,7 @@ static void testcfgjson(Test *t)
     Json *schema = jsonget(j, "schema");
     expect(t, "json.schema", istr(&a, jsonlen(schema)),
            istr(&a, countof(cfgschema)));
-    Json *ft = jsonat(schema, 5);
+    Json *ft = jsonat(schema, 6);
     expect(t, "json.schema.key", jsonstr(jsonget(ft, "key")),
            "first_byte_timeout");
     expect(t, "json.schema.type", jsonstr(jsonget(ft, "type")), "seconds");

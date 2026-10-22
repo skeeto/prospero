@@ -424,6 +424,7 @@ static Arena newarena(Region *r)
 #include "events.cpp"
 #include "frame.cpp"
 #include "provider.cpp"
+#include "anthropic.cpp"
 #include "edit.cpp"
 #include "tools.cpp"
 #include "guard.cpp"

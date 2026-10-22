@@ -6,7 +6,9 @@ the tools (read, write, edit, shell, grep, glob, a todo list,
 background jobs, and subagents), and the processes they start, and
 shows the conversation as it streams. It speaks the OpenAI Chat
 Completions API, so it works with llama.cpp, vLLM, LiteLLM, and hosted
-providers with a compatible API, Anthropic's among them. It is built
+providers with a compatible API, and Anthropic's Messages API, with
+extended thinking and prompt caching (`[endpoint NAME] kind =
+anthropic`). It is built
 first for models served on your own machines, whose servers are slow
 to start, run out of context, and stall: the harness, not the agent,
 retries, compacts, queues requests at a busy server, and keeps a turn
@@ -130,6 +132,19 @@ settings this file can override. An include may be a path or an http
 or https URL, which is fetched at startup, cached, and refreshed in the
 background, and may be pinned to a SHA-256. Nothing in an included file
 can make Prospero run a command, and its plaintext secrets are ignored.
+
+An endpoint speaks Anthropic's Messages API with `kind = anthropic`:
+
+    [endpoint anthropic]
+    kind = anthropic
+    url = https://api.anthropic.com/
+    key = env:ANTHROPIC_API_KEY
+
+Its listing gives each model's context and output limits. Reasoning
+goes back to the model verbatim with its signature, and the tools, the
+system prompt and the conversation carry cache breakpoints, so cache
+reads grow turn over turn. A `[model NAME]` section sets `thinking`
+(adaptive by default), `thinking_display`, `effort` and `max_tokens`.
 
 Sessions, their logs and the cache of URL includes live in the state
 directory: `$XDG_STATE_HOME/prospero`, else `~/.local/state/prospero`,
