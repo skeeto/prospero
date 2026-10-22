@@ -94,6 +94,28 @@ static i32 dkselftest(Arena *a, Arena perm)
         check(t, "ptround huge", num(a, ptround(1e300)), num(a, 1<<30));
     }
 
+    // The screen from its displays, and whether a rectangle can be
+    // captured, from fixed states: a sleeping display keeps its place
+    {
+        Desk d = {};
+        check(t, "desk none", rectstr(a, deskrect(&d)), "0,0,0,0");
+        d.len     = 2;
+        d.disp[0] = {{0, 0, 1728, 1117}, 0};
+        d.disp[1] = {{-1440, -200, 0, 700}, 1};
+        check(t, "desk union", rectstr(a, deskrect(&d)), "-1440,-200,1728,1117");
+        check(t, "unseen awake", num(a, unseen(&d, {10, 10, 20, 20}).data!=0), "0");
+        check(t, "unseen asleep", unseen(&d, {-10, 10, 20, 20}),
+              "cannot capture: the display is asleep");
+        check(t, "unseen edge", num(a, unseen(&d, {0, 0, 20, 20}).data!=0), "0");
+        d.locked = 1;
+        check(t, "unseen locked", unseen(&d, {10, 10, 20, 20}),
+              "cannot capture: the screen is locked");
+        d.locked       = 0;
+        d.disp[0].asleep = 1;
+        check(t, "unseen all asleep", unseen(&d, {-1440, -200, 1728, 1117}),
+              "cannot capture: the display is asleep");
+    }
+
     // Which windows are listed, and which are popups
     {
         DkRect r = {0, 0, 10, 10};
@@ -319,12 +341,17 @@ static i32 dkselftest(Arena *a, Arena perm)
     }
 
     // Every command that needs a permission fails without it, naming it
-    // and what to grant it to, before any capture or input
+    // and what to grant it to, before any capture or input. The displays
+    // are fixed, the one asleep, so the live ones play no part.
+    Desk desk = {};
+    desk.len     = 1;
+    desk.disp[0] = {{0, 0, 1728, 1117}, 1};
     {
         Dk dk = {};
         dk.perm    = perm;
         dk.held    = -1;
         dk.deny    = PERM_SCREEN | PERM_AX;
+        dk.fixed   = &desk;
         dk.granted = "Prospero.app (/A/Prospero.app)";
         Str screen = concat(a, "1|", permmsg(a, PERM_SCREEN, dk.granted));
         Str ax     = concat(a, "1|", permmsg(a, PERM_AX, dk.granted));
@@ -363,6 +390,29 @@ static i32 dkselftest(Arena *a, Arena perm)
         check(t, "no window", serve(a, &dk, "raise|hwnd=0xfffffff0"),
               "2|no window matches 'hwnd=0xfffffff0'");
         check(t, "units", dk_units(&dk), "points");
+    }
+
+    // With Screen Recording granted, a shot of a sleeping display or a
+    // locked screen fails saying which, before any capture is tried;
+    // with no display, there is no screen
+    {
+        Dk dk = {};
+        dk.perm  = perm;
+        dk.held  = -1;
+        dk.allow = PERM_SCREEN;
+        dk.deny  = PERM_AX;
+        dk.fixed = &desk;
+        check(t, "shot asleep", serve(a, &dk, "shot|screen"),
+              "1|cannot capture: the display is asleep");
+        check(t, "shot asleep part", serve(a, &dk, "shot|-s|100|0|screen|5|5|10|10"),
+              "1|cannot capture: the display is asleep");
+        desk.locked = 1;
+        check(t, "shot locked", serve(a, &dk, "shot|screen"),
+              "1|cannot capture: the screen is locked");
+        desk = {};
+        check(t, "shot no display", serve(a, &dk, "shot|screen"),
+              "1|window is off screen or empty 'screen'");
+        check(t, "why taken after shot", num(a, dk.why.data!=0), "0");
     }
 
     Buf b(a, 64);

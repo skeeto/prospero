@@ -10,7 +10,9 @@ Every run treats Screen Recording and Accessibility as missing
 (PROSPERO_TEST_DESKTOP_DENY), so each command that would capture the
 screen, post input or act on a window fails before it does, and these
 check that it fails at once, naming the permission and what to grant it
-to. What needs no permission runs for real: hello, the window list, a
+to. The permission is checked before the display's state, so these hold
+with the screen locked or the display asleep. What needs no permission
+runs for real: hello, the window list, a
 wait that times out, access. Both as one-shot commands and as --serve
 frames. With the responsibility functions (tests/disclaim.py), the
 helper started disclaimed answers for itself, so it names itself.

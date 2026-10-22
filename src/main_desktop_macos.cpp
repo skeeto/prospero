@@ -36,6 +36,11 @@
 // the launch and every Accessibility message wait a bounded time, so an
 // unresponsive system or program fails a call rather than hanging it.
 //
+// The screen is every online display, which includes a sleeping one, so
+// geometry holds while displays sleep. A capture while the screen is
+// locked or a display it covers sleeps fails saying so, without waking
+// anything (readdesk, unseen).
+//
 // For tests, PROSPERO_TEST_DESKTOP_DENY lists permissions to treat as
 // missing, "screen" and "accessibility", so that the error paths run
 // without touching the screen. The DK_SELFTEST build runs this layer's
@@ -96,9 +101,26 @@ struct Click {
     i32 count;
 };
 
+// The displays and the session as a capture sees them (readdesk). Online
+// displays, not just active ones: a sleeping display is online but not
+// active, and its bounds still hold, so the screen keeps its geometry
+// while the display sleeps.
+struct Display {
+    DkRect rect;
+    b32    asleep;
+};
+
+struct Desk {
+    Display disp[32];
+    i32     len;
+    b32     locked;  // the session's screen is locked
+};
+
 struct Dk {
     Arena  perm;      // what outlives a command: messages, MacWait
     u32    deny;      // PERM_* treated as missing (a test hook)
+    u32    allow;     // PERM_* treated as granted (a test hook)
+    Desk  *fixed;     // displays in place of the live ones (a test hook)
     Str    why;       // the latest failure's reason, for dk_why
     Str    granted;   // who permissions are granted to, for messages
     Str    missing[2];  // each permission's message, made once
@@ -224,6 +246,43 @@ static DkRect rectof(CGRect r)
     d.right  = ptround(r.origin.x + r.size.width);
     d.bottom = ptround(r.origin.y + r.size.height);
     return d;
+}
+
+// Every display together, empty if none.
+static DkRect deskrect(Desk *d)
+{
+    DkRect r = {};
+    for (i32 i = 0; i < d->len; i++) {
+        DkRect e = d->disp[i].rect;
+        if (!i) {
+            r = e;
+            continue;
+        }
+        r.left   = e.left   < r.left   ? e.left   : r.left;
+        r.top    = e.top    < r.top    ? e.top    : r.top;
+        r.right  = e.right  > r.right  ? e.right  : r.right;
+        r.bottom = e.bottom > r.bottom ? e.bottom : r.bottom;
+    }
+    return r;
+}
+
+// Why the rectangle cannot be captured, without waking anything to
+// find out, else null: the screen is locked, or a display it touches
+// sleeps, and either would capture black or nothing.
+static Str unseen(Desk *d, DkRect r)
+{
+    if (d->locked) {
+        return "cannot capture: the screen is locked";
+    }
+    for (i32 i = 0; i < d->len; i++) {
+        DkRect e = d->disp[i].rect;
+        b32 meets = e.left<r.right && r.left<e.right &&
+                    e.top<r.bottom && r.top<e.bottom;
+        if (meets && d->disp[i].asleep) {
+            return "cannot capture: the display is asleep";
+        }
+    }
+    return {};
 }
 
 static CGRect cgrect(DkRect r)
@@ -631,6 +690,8 @@ static b32 granted(Dk *dk, i32 perm)
 {
     if (dk->deny & perm) {
         return 0;
+    } else if (dk->allow & perm) {
+        return 1;
     }
     return perm==PERM_SCREEN ? CGPreflightScreenCaptureAccess() : AXIsProcessTrusted();
 }
@@ -911,24 +972,46 @@ static DkWin dk_window(Dk *dk, Arena *a, u64 id)
     return r;
 }
 
-// Every active display together.
-static DkWin dk_screen(Dk *)
+// The displays and the session's lock, read without waking a display.
+static Desk readdesk(Dk *dk)
 {
-    DkWin            r = {};
-    CGDirectDisplayID ids[32];
-    u32              n = 0;
-    CGGetActiveDisplayList((u32)countof(ids), ids, &n);
-    for (u32 i = 0; i < n; i++) {
-        DkRect d = rectof(CGDisplayBounds(ids[i]));
-        if (!i) {
-            r.rect = d;
-            continue;
-        }
-        r.rect.left   = d.left   < r.rect.left   ? d.left   : r.rect.left;
-        r.rect.top    = d.top    < r.rect.top    ? d.top    : r.rect.top;
-        r.rect.right  = d.right  > r.rect.right  ? d.right  : r.rect.right;
-        r.rect.bottom = d.bottom > r.rect.bottom ? d.bottom : r.rect.bottom;
+    if (dk->fixed) {
+        return *dk->fixed;
     }
+    Desk              r = {};
+    CGDirectDisplayID ids[countof(r.disp)];
+    u32               n = 0;
+    if (CGGetOnlineDisplayList((u32)countof(ids), ids, &n)) {
+        n = 0;
+    }
+    for (u32 i = 0; i < n; i++) {
+        if (CGDisplayMirrorsDisplay(ids[i]) != kCGNullDirectDisplay) {
+            continue;  // the same points as the display it mirrors
+        }
+        Display *d = r.disp + r.len++;
+        d->rect   = rectof(CGDisplayBounds(ids[i]));
+        d->asleep = CGDisplayIsAsleep(ids[i]) != 0;
+    }
+    CFStringRef     key = CFSTR("CGSSessionScreenIsLocked");
+    CFDictionaryRef s   = CGSessionCopyCurrentDictionary();
+    if (s) {
+        CFTypeRef v = CFDictionaryGetValue(s, key);
+        if (v && CFGetTypeID(v)==CFBooleanGetTypeID()) {
+            r.locked = CFBooleanGetValue((CFBooleanRef)v);
+        } else {
+            r.locked = cfint(s, key) != 0;
+        }
+        CFRelease(s);
+    }
+    return r;
+}
+
+// Every display together, asleep or awake.
+static DkWin dk_screen(Dk *dk)
+{
+    Desk  d = readdesk(dk);
+    DkWin r = {};
+    r.rect  = deskrect(&d);
     r.title = "screen";
     return r;
 }
@@ -1275,6 +1358,12 @@ static b32 dk_activate(Dk *dk, DkWin *w)
 static u8 *dk_capture(Dk *dk, Arena *a, DkRect r, DkSize *size)
 {
     if (!needperm(dk, PERM_SCREEN)) {
+        return 0;
+    }
+    Desk d   = readdesk(dk);
+    Str  why = unseen(&d, r);
+    if (why.data) {
+        dk->why = why;
         return 0;
     }
     char const *path = "/System/Library/Frameworks/ScreenCaptureKit.framework/ScreenCaptureKit";
