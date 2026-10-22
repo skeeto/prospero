@@ -22,6 +22,9 @@
 // mbedTLS's own verdict, against /etc/ssl/cert.pem, holds Apple's roots
 // alone. mbedTLS still checks the host name, and so does the system.
 // main_edgetest.cpp tests this through calls of its own (EDGE_TEST).
+// Elsewhere mbedTLS decides, through a verifier of the edge's own
+// (edgembedtls), without which a server named by its IP address went
+// unverified.
 //
 // This is free and unencumbered software released into the public domain.
 #define CPPHTTPLIB_EXPECT_100_THRESHOLD 0  // never wait for "100 Continue"
@@ -69,9 +72,8 @@ struct Edge {
     std::mutex  mu;
     bool        cancelled = false;
     int         dupfd     = -1;
-    #ifdef __APPLE__
     std::string untrusted;  // the request's thread only: why the server's
-    #endif                  // certificate was refused, if it was
+                            // certificate was refused, if it was
 };
 
 // Store msg as the error, cut short at a character boundary if need be.
@@ -83,6 +85,28 @@ static void edgeerr(HttpEdgeReq *r, std::string const &msg)
         memcpy(r->err, msg.data(), n);
         r->err[n] = 0;
     }
+}
+
+// mbedTLS's own verdict on each certificate of the chain, against the
+// system's roots that cpp-httplib loads: any problem refuses it. The
+// verifier must be there even so. Without one, cpp-httplib leaves
+// mbedTLS verifying nothing for a host given as an IP address
+// (MBEDTLS_SSL_VERIFY_NONE, which reports a clean result), and its own
+// check after the handshake takes that for success: any certificate
+// at all would do for https://127.0.0.1/.
+static void edgembedtls(httplib::Client *cli, Edge *e)
+{
+    cli->set_server_certificate_verifier([e](httplib::tls::VerifyContext const &v) {
+        if (!v.preverify_ok && e->untrusted.empty()) {
+            std::string why = v.error_string ? v.error_string : "";
+            while (!why.empty() && (why.back()=='\n' || why.back()==' ')) {
+                why.pop_back();
+            }
+            size_t eol = why.find('\n');  // one line per problem: the first
+            e->untrusted = why.empty() ? "it does not verify" : why.substr(0, eol);
+        }
+        return v.preverify_ok;
+    });
 }
 
 
@@ -209,11 +233,13 @@ static std::string edgetrust(EdgeSec *s, mbedtls_x509_crt const *chain,
 // Have the system decide on the server's chain, once mbedTLS reaches the
 // leaf (depth 0), after the rest, whose verdicts give way to this one.
 // The leaf comes first in the list of what the server sent. A name that
-// mbedTLS found wrong stays wrong.
+// mbedTLS found wrong stays wrong. Without the frameworks, mbedTLS
+// decides alone.
 static void edgeverify(httplib::Client *cli, Edge *e)
 {
     EdgeSec *s = edgesec();
     if (!s) {
+        edgembedtls(cli, e);
         return;
     }
     std::string host = cli->host();
@@ -294,6 +320,8 @@ extern "C" int httpedge_run(void *p, HttpEdgeReq *r)
     });
     #ifdef __APPLE__
     edgeverify(&cli, e);
+    #else
+    edgembedtls(&cli, e);
     #endif
 
     httplib::Request req;
@@ -390,12 +418,10 @@ extern "C" int httpedge_run(void *p, HttpEdgeReq *r)
         edgeerr(r, "aborted");
         return EDGE_ABORT;
     }
-    #ifdef __APPLE__
     if (!e->untrusted.empty()) {
         edgeerr(r, "the server's certificate is not trusted: " + e->untrusted);
         return EDGE_TRUST;
     }
-    #endif
     std::string msg = httplib::to_string(err);
     if (err == httplib::Error::SSLServerVerification ||
             err == httplib::Error::SSLServerHostnameVerification) {
