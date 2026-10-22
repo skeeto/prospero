@@ -30,9 +30,17 @@
 //    A damaged copy is uploaded again.
 // 5. Rename it into place, and run it once (--version): an engine that
 //    cannot run there (too old a C library, say) is removed again.
-// 6. Record where it went in <state>/deploy/DEST.ini, for connecting:
+// 6. The desktop helper the same way (steps 3 to 5), when the engines
+//    directory has one for the platform, prospero-desktop-VERSION-OS-
+//    ARCH[.exe] (or, when this program serves, its own helper next to
+//    it), to .prospero/desktop-PROTO-VERSION-OS-ARCH[.exe], beside the
+//    engine, where the engine looks for it (deskhelpers, engine.cpp).
+//    The engine works without it, so a helper that cannot be put there
+//    or does not run there (--version) is only a warning.
+// 7. Record where it went in <state>/deploy/DEST.ini, for connecting:
 //    host, platform, shell, path (for the remote shell), sha256,
-//    version, proto, and deployed (Unix epoch ms).
+//    desktop (the helper's path, if deployed), version, proto, and
+//    deployed (Unix epoch ms).
 //
 // A new version gets a new name, so a running engine is never replaced
 // or stopped: a host of another protocol starts beside the old one (a
@@ -699,6 +707,38 @@ static void printsize(Buf *b, i64 n)
 }
 
 
+// Names
+
+// A platform's programs by name: here, in the engines directory, as a
+// release names them, and there, in ~/.prospero, where the engine looks
+// for its helper beside it (deskhelpers, engine.cpp).
+struct DeployNames {
+    Str engine;    // prospero-engine-VERSION-OS-ARCH[.exe]
+    Str desktop;   // prospero-desktop-VERSION-OS-ARCH[.exe]
+    Str rengine;   // engine-PROTO-VERSION-OS-ARCH[.exe]
+    Str rdesktop;  // desktop-PROTO-VERSION-OS-ARCH[.exe]
+};
+
+static DeployNames deploynames(Arena *a, Str platform, Str ext)
+{
+    DeployNames r = {};
+    Buf b(a, 64);
+    print(&b, "-" PROSPERO_VERSION "-");
+    print(&b, platform);
+    print(&b, ext);
+    Str tail = finish(&b);
+    r.engine  = concat(a, "prospero-engine", tail);
+    r.desktop = concat(a, "prospero-desktop", tail);
+    b = Buf(a, 32);
+    print(&b, "-");
+    print(&b, (i64)HOST_PROTO);
+    Str proto = finish(&b);
+    r.rengine  = concat(a, concat(a, "engine", proto), tail);
+    r.rdesktop = concat(a, concat(a, "desktop", proto), tail);
+    return r;
+}
+
+
 // Deploying
 
 // A failure: noted, and returned.
@@ -710,8 +750,239 @@ static Deployed deployfail(Deploy *d, Arena *perm, Arena scratch, Str why)
     return r;
 }
 
-// Deploy an engine as described at the top. Blocks until done; another
-// thread may cancel through conf->cancel.
+// A program to put there: the engine, or the desktop helper beside it.
+struct DeployFile {
+    Str what;   // for messages: "engine", "desktop helper"
+    Str prog;   // its --version's first word: prospero, prospero-desktop
+    Str local;  // here
+    Str data;
+    Str sha;    // of data, in lowercase hex
+    Str rpath;  // there, for its shell, from the home directory
+    Str upath;  // its upload there, for scp
+    Str shown;  // ~/.prospero/NAME
+    i32 err;    // reading it: READ_OK, READ_NOTFOUND...
+    b32 self;   // it is self, not from dir
+};
+
+// Read a program to upload, from dir/file, or else from self when it
+// is not there and self is not empty. Its place there is .prospero/
+// rname. Null if ok, else why not (unless it is just missing: err).
+static Str deployread(Os *os, Arena *a, DeployFile *f, Str dir, Str file,
+                      Str self, Str rname, i32 shell)
+{
+    f->local = join(a, dir, file);
+    Read rd  = os_read(os, a, f->local, DEPLOY_MAXSIZE);
+    if (rd.err==READ_NOTFOUND && self.len) {
+        f->local = self;
+        f->self  = 1;
+        rd       = os_read(os, a, f->local, DEPLOY_MAXSIZE);
+    }
+    f->err = rd.err;
+    if (rd.err == READ_NOTFOUND) {
+        return {};
+    } else if (rd.err != READ_OK) {
+        return concat(a, "cannot read ", f->local);
+    }
+    Str full = os_realpath(os, a, f->local);  // for scp, which runs elsewhere
+    f->local = full.len ? full : f->local;
+    f->data  = rd.data;
+    f->sha   = cfgsha256(a, rd.data);
+    Str  sums = concat(a, f->local, ".sha256");
+    Read want = os_read(os, a, sums, 1<<12);
+    if (want.err==READ_OK && deployhash(a, want.data)!=f->sha) {
+        Buf b(a, 256);
+        print(&b, f->local);
+        print(&b, " does not match ");
+        print(&b, sums);
+        return finish(&b);
+    }
+    Str rdir = shell==DEPLOY_CMD ? Str(".prospero\\") : Str(".prospero/");
+    f->rpath = concat(a, rdir, rname);
+    f->upath = concat(a, ".prospero/", rname);
+    f->upath = concat(a, f->upath, ".part");
+    f->shown = concat(a, "~/.prospero/", rname);
+    return {};
+}
+
+struct DeployPut {
+    Str err;   // why not, unless ok
+    b32 ok;
+    b32 same;  // it was there already
+};
+
+static DeployPut deployputfail(Arena *perm, Str why)
+{
+    DeployPut r = {};
+    r.err = clone(perm, why);
+    return r;
+}
+
+// Put a program in its place there, unless it is there already, and run
+// it once (--version). Notes progress, but not the failure it returns.
+static DeployPut deployput(Deploy *d, Arena *perm, Arena scratch, Platform *pf,
+                           DeployFile *f, i64 stamp)
+{
+    DeployConf *conf = d->conf;
+    Str         name = conf->name.len ? conf->name : conf->ssh;
+
+    Str       cmd    = deploycmd(&scratch, pf->shell, DEPLOY_PREPARE, f->rpath, stamp);
+    DeployRun prep   = deployssh(d, &scratch, "probe", cmd);
+    b32       ready  = hasline(prep.out, "ready");
+    b32       have   = hasline(prep.out, "have");
+    b32       nohash = hasline(prep.out, "nohash");
+    Str there = have ? deployhash(&scratch, prep.out) : Str{};
+    Buf b(&scratch, 256);
+    if (deploycancelled(d)) {
+        return deployputfail(perm, "cancelled");
+    } else if (!ready) {
+        print(&b, "cannot create ~/.prospero on ");
+        print(&b, name);
+        print(&b, ": ");
+        print(&b, deploysaid(&prep));
+        return deployputfail(perm, finish(&b));
+    } else if (nohash || (have && !there.len)) {
+        print(&b, "cannot compute a SHA-256 on ");
+        print(&b, name);
+        print(&b, pf->shell==DEPLOY_CMD ? Str(": no certutil")
+                                        : Str(": no sha256sum, shasum or openssl"));
+        return deployputfail(perm, finish(&b));
+    } else if (have && there!=f->sha && !conf->force) {
+        print(&b, name);
+        print(&b, " has another build of ");
+        print(&b, f->prog);
+        print(&b, " " PROSPERO_VERSION " at ");
+        print(&b, f->shown);
+        print(&b, ": --force replaces it (what runs from it keeps running)");
+        return deployputfail(perm, finish(&b));
+    }
+
+    // Upload and verify, unless it is there already
+    b32 same = have && there==f->sha && !conf->force;
+    for (i32 n = 1; !same; n++) {
+        b = Buf(&scratch, 256);
+        print(&b, "uploading ");
+        print(&b, basename(f->local));
+        print(&b, " (");
+        printsize(&b, f->data.len);
+        print(&b, ") to ");
+        print(&b, f->shown);
+        print(&b, ".part");
+        if (n > 1) {
+            print(&b, ", try ");
+            print(&b, (i64)n);
+        }
+        deploynote(d, scratch, "upload", finish(&b));
+
+        Arena      a    = scratch;
+        Slice<Str> argv = {};
+        argv = push(&a, argv, conf->scp.len ? conf->scp : Str("scp"));
+        argv = push(&a, argv, Str("-q"));
+        for (iz i = 0; i < countof(deployopts); i++) {
+            argv = push(&a, argv, deployopts[i]);
+        }
+        argv = push(&a, argv, Str("--"));
+        argv = push(&a, argv, f->local);
+        Str dest = concat(&a, conf->ssh, ":");
+        argv = push(&a, argv, concat(&a, dest, f->upath));
+        i64       limit = DEPLOY_UPTIME + f->data.len/DEPLOY_UPRATE*SEC;
+        DeployRun up    = deployrun(d, &a, argv, limit);
+        Str       why   = {};
+        if (deploycancelled(d)) {
+            return deployputfail(perm, "cancelled");
+        } else if (up.code != 0) {
+            b = Buf(&a, 256);
+            print(&b, up.timeout ? Str("the upload took too long")
+                                 : Str("the upload failed"));
+            Str said = deploysaid(&up);
+            if (said.len) {
+                print(&b, " (");
+                print(&b, said);
+                print(&b, ")");
+            }
+            why = finish(&b);
+            if (deploypermanent(up.err)) {
+                return deployputfail(perm, why);
+            }
+        } else {
+            deploynote(d, a, "verify", "verifying its SHA-256 there");
+            Str       vc  = deploycmd(&a, pf->shell, DEPLOY_VERIFY, f->rpath, stamp);
+            DeployRun v   = deployssh(d, &a, "verify", vc);
+            Str       got = deployhash(&a, v.out);
+            if (got == f->sha) {
+                break;
+            } else if (!got.len && hasline(v.out, "nohash")) {
+                b = Buf(&a, 256);
+                print(&b, "cannot compute a SHA-256 on ");
+                print(&b, name);
+                print(&b, ": no sha256sum, shasum or openssl");
+                return deployputfail(perm, finish(&b));
+            } else if (got.len) {
+                why = concat(&a, "the upload arrived damaged, its SHA-256 ", got);
+            } else if (v.code == 0) {
+                b = Buf(&a, 256);
+                print(&b, "cannot compute a SHA-256 on ");
+                print(&b, name);
+                print(&b, ": ");
+                print(&b, deploysaid(&v));
+                return deployputfail(perm, finish(&b));
+            } else {
+                why = concat(&a, "cannot verify the upload: ", deploysaid(&v));
+            }
+        }
+        if (n >= DEPLOY_TRIES) {
+            return deployputfail(perm, why);
+        }
+        i64 wait = deploywaits[n-1];
+        b = Buf(&a, 256);
+        print(&b, why);
+        print(&b, ", trying again in ");
+        print(&b, wait/SEC);
+        print(&b, " s");
+        deploynote(d, a, "upload", finish(&b));
+        if (!deploynap(d, wait)) {
+            return deployputfail(perm, "cancelled");
+        }
+    }
+
+    // Into place, and run once
+    b = Buf(&scratch, 128);
+    print(&b, same ? Str("already there") : Str("renaming"));
+    print(&b, " the ");
+    print(&b, f->what);
+    print(&b, same ? Str(", running it once") : Str(" into place, running it once"));
+    deploynote(d, scratch, "install", finish(&b));
+    cmd = deploycmd(&scratch, pf->shell, same ? DEPLOY_RUN : DEPLOY_INSTALL, f->rpath, stamp);
+    DeployRun run  = deployssh(d, &scratch, "install", cmd);
+    Str       want = concat(&scratch, f->prog, " " PROSPERO_VERSION);
+    if (deploycancelled(d)) {
+        return deployputfail(perm, "cancelled");
+    } else if (find(run.out, want) < 0) {
+        b = Buf(&scratch, 256);
+        print(&b, "the ");
+        print(&b, f->what);
+        print(&b, " does not run on ");
+        print(&b, name);
+        Str said = deploysaid(&run);
+        if (said.len) {
+            print(&b, ": ");
+            print(&b, said);
+        }
+        Str why = finish(&b);
+        if (!same && run.code!=255) {
+            Str rm = deploycmd(&scratch, pf->shell, DEPLOY_REMOVE, f->rpath, stamp);
+            deployssh(d, &scratch, "install", rm);  // put there now, and useless
+        }
+        return deployputfail(perm, why);
+    }
+    DeployPut r = {};
+    r.ok   = 1;
+    r.same = same;
+    return r;
+}
+
+// Deploy an engine as described at the top, and its desktop helper if
+// there is one. Blocks until done; another thread may cancel through
+// conf->cancel.
 static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
 {
     Deploy d = {};
@@ -753,62 +1024,46 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
         return deployfail(&d, perm, scratch, finish(&b));
     }
 
-    // The engine for it
+    // The engine for it, and its place there (deploynames)
     b32 win  = pf.os == "windows";
+    Str ext  = win ? Str(".exe") : Str("");
     Str exe  = os_exepath(os, &scratch);
-    Str file = concat(&scratch, "prospero-engine-" PROSPERO_VERSION "-",
-                      pf.name);
-    file = win ? concat(&scratch, file, ".exe") : file;
+    Str self = pf.name==deployself() ? exe : Str{};  // this program serves
     Str from = conf->engines.len ? conf->engines : join(&scratch, parentdir(exe), "engines");
-    Str local = join(&scratch, from, file);
-    Read eng  = os_read(os, &scratch, local, DEPLOY_MAXSIZE);
-    if (eng.err==READ_NOTFOUND && pf.name==deployself() && exe.len) {
-        local = exe;  // this program serves
-        eng   = os_read(os, &scratch, local, DEPLOY_MAXSIZE);
-    }
-    if (eng.err != READ_OK) {
+    DeployNames names = deploynames(&scratch, pf.name, ext);
+
+    DeployFile eng = {};
+    eng.what = "engine";
+    eng.prog = "prospero";
+    Str err  = deployread(os, &scratch, &eng, from, names.engine, self, names.rengine,
+                          pf.shell);
+    if (eng.err == READ_NOTFOUND) {
         b = Buf(&scratch, 256);
-        if (eng.err == READ_NOTFOUND) {
-            print(&b, "no engine for ");
-            print(&b, pf.name);
-            print(&b, " (");
-            print(&b, pf.about);
-            print(&b, "): ");
-            print(&b, local);
-            print(&b, " is missing (tools/engines.py builds it)");
-        } else {
-            print(&b, "cannot read ");
-            print(&b, local);
-        }
+        print(&b, "no engine for ");
+        print(&b, pf.name);
+        print(&b, " (");
+        print(&b, pf.about);
+        print(&b, "): ");
+        print(&b, join(&scratch, from, names.engine));
+        print(&b, " is missing (tools/engines.py builds it)");
         return deployfail(&d, perm, scratch, finish(&b));
-    }
-    Str  full = os_realpath(os, &scratch, local);  // for scp, which runs elsewhere
-    local = full.len ? full : local;
-    Str  sha  = cfgsha256(&scratch, eng.data);
-    Str  sums = concat(&scratch, local, ".sha256");
-    Read want = os_read(os, &scratch, sums, 1<<12);
-    if (want.err==READ_OK && deployhash(&scratch, want.data)!=sha) {
-        b = Buf(&scratch, 256);
-        print(&b, local);
-        print(&b, " does not match ");
-        print(&b, sums);
-        return deployfail(&d, perm, scratch, finish(&b));
+    } else if (err.len) {
+        return deployfail(&d, perm, scratch, err);
     }
 
-    // Its place there
-    b = Buf(&scratch, 128);
-    print(&b, "engine-");
-    print(&b, (i64)HOST_PROTO);
-    print(&b, "-" PROSPERO_VERSION "-");
-    print(&b, pf.name);
-    print(&b, win ? Str(".exe") : Str(""));
-    Str rname = finish(&b);
-    Str rdir  = pf.shell==DEPLOY_CMD ? Str(".prospero\\") : Str(".prospero/");
-    Str rpath = concat(&scratch, rdir, rname);
-    Str upath = concat(&scratch, ".prospero/", rname);
-    upath = concat(&scratch, upath, ".part");
-    Str shown = concat(&scratch, "~/.prospero/", rname);
-    i64 stamp = os_time(os);
+    // The desktop helper beside it, if any: in the engines directory, or
+    // else, when this program serves, its own helper next to it
+    DeployFile desk = {};
+    desk.what = "desktop helper";
+    desk.prog = "prospero-desktop";
+    Str selfdesk = {};
+    if (eng.self) {
+        Str hname = win ? Str("prospero-desktop.exe") : Str("prospero-desktop");
+        selfdesk  = join(&scratch, parentdir(exe), hname);
+    }
+    Str deskerr = deployread(os, &scratch, &desk, from, names.desktop, selfdesk,
+                             names.rdesktop, pf.shell);
+    b32 hasdesk = desk.err == READ_OK;
 
     b = Buf(&scratch, 256);
     print(&b, name);
@@ -819,147 +1074,28 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     print(&b, pf.shell==DEPLOY_CMD ? Str("; cmd.exe") : Str(""));
     print(&b, ")");
     deploynote(&d, scratch, "probe", finish(&b));
-    Str       cmd    = deploycmd(&scratch, pf.shell, DEPLOY_PREPARE, rpath, stamp);
-    DeployRun prep   = deployssh(&d, &scratch, "probe", cmd);
-    b32       ready  = hasline(prep.out, "ready");
-    b32       have   = hasline(prep.out, "have");
-    b32       nohash = hasline(prep.out, "nohash");
-    Str there = have ? deployhash(&scratch, prep.out) : Str{};
-    if (deploycancelled(&d)) {
-        return deployfail(&d, perm, scratch, "cancelled");
-    } else if (!ready) {
-        b = Buf(&scratch, 256);
-        print(&b, "cannot create ~/.prospero on ");
-        print(&b, name);
-        print(&b, ": ");
-        print(&b, deploysaid(&prep));
-        return deployfail(&d, perm, scratch, finish(&b));
-    } else if (nohash || (have && !there.len)) {
-        b = Buf(&scratch, 256);
-        print(&b, "cannot compute a SHA-256 on ");
-        print(&b, name);
-        print(&b, pf.shell==DEPLOY_CMD ? Str(": no certutil")
-                                       : Str(": no sha256sum, shasum or openssl"));
-        return deployfail(&d, perm, scratch, finish(&b));
-    } else if (have && there!=sha && !conf->force) {
-        b = Buf(&scratch, 256);
-        print(&b, name);
-        print(&b, " has another build of prospero " PROSPERO_VERSION " at ");
-        print(&b, shown);
-        print(&b, ": --force replaces it (what runs from it keeps running)");
-        return deployfail(&d, perm, scratch, finish(&b));
+
+    i64       stamp = os_time(os);
+    DeployPut put   = deployput(&d, perm, scratch, &pf, &eng, stamp);
+    if (!put.ok) {
+        return deployfail(&d, perm, scratch, put.err);
     }
 
-    // Upload and verify, unless it is there already
-    b32 same = have && there==sha && !conf->force;
-    for (i32 n = 1; !same; n++) {
-        b = Buf(&scratch, 256);
-        print(&b, "uploading ");
-        print(&b, basename(local));
-        print(&b, " (");
-        printsize(&b, eng.data.len);
-        print(&b, ") to ");
-        print(&b, shown);
-        print(&b, ".part");
-        if (n > 1) {
-            print(&b, ", try ");
-            print(&b, (i64)n);
-        }
-        deploynote(&d, scratch, "upload", finish(&b));
-
-        Arena      a    = scratch;
-        Slice<Str> argv = {};
-        argv = push(&a, argv, conf->scp.len ? conf->scp : Str("scp"));
-        argv = push(&a, argv, Str("-q"));
-        for (iz i = 0; i < countof(deployopts); i++) {
-            argv = push(&a, argv, deployopts[i]);
-        }
-        argv = push(&a, argv, Str("--"));
-        argv = push(&a, argv, local);
-        Str dest = concat(&a, conf->ssh, ":");
-        argv = push(&a, argv, concat(&a, dest, upath));
-        i64       limit = DEPLOY_UPTIME + eng.data.len/DEPLOY_UPRATE*SEC;
-        DeployRun up    = deployrun(&d, &a, argv, limit);
-        Str       why   = {};
-        if (deploycancelled(&d)) {
-            return deployfail(&d, perm, a, "cancelled");
-        } else if (up.code != 0) {
-            b = Buf(&a, 256);
-            print(&b, up.timeout ? Str("the upload took too long")
-                                 : Str("the upload failed"));
-            Str said = deploysaid(&up);
-            if (said.len) {
-                print(&b, " (");
-                print(&b, said);
-                print(&b, ")");
-            }
-            why = finish(&b);
-            if (deploypermanent(up.err)) {
-                return deployfail(&d, perm, a, why);
-            }
-        } else {
-            deploynote(&d, a, "verify", "verifying its SHA-256 there");
-            Str       vc  = deploycmd(&a, pf.shell, DEPLOY_VERIFY, rpath, stamp);
-            DeployRun v   = deployssh(&d, &a, "verify", vc);
-            Str       got = deployhash(&a, v.out);
-            if (got == sha) {
-                break;
-            } else if (!got.len && hasline(v.out, "nohash")) {
-                b = Buf(&a, 256);
-                print(&b, "cannot compute a SHA-256 on ");
-                print(&b, name);
-                print(&b, ": no sha256sum, shasum or openssl");
-                return deployfail(&d, perm, a, finish(&b));
-            } else if (got.len) {
-                why = concat(&a, "the upload arrived damaged, its SHA-256 ", got);
-            } else if (v.code == 0) {
-                b = Buf(&a, 256);
-                print(&b, "cannot compute a SHA-256 on ");
-                print(&b, name);
-                print(&b, ": ");
-                print(&b, deploysaid(&v));
-                return deployfail(&d, perm, a, finish(&b));
-            } else {
-                why = concat(&a, "cannot verify the upload: ", deploysaid(&v));
-            }
-        }
-        if (n >= DEPLOY_TRIES) {
-            return deployfail(&d, perm, a, why);
-        }
-        i64 wait = deploywaits[n-1];
-        b = Buf(&a, 256);
-        print(&b, why);
-        print(&b, ", trying again in ");
-        print(&b, wait/SEC);
-        print(&b, " s");
-        deploynote(&d, a, "upload", finish(&b));
-        if (!deploynap(&d, wait)) {
-            return deployfail(&d, perm, a, "cancelled");
-        }
+    // The helper is optional: the engine works without it, so a helper
+    // that fails is a warning, and the desktop tool is unavailable there
+    DeployPut dput = {};
+    if (deskerr.len) {
+        dput.err = deskerr;
+    } else if (hasdesk) {
+        dput = deployput(&d, perm, scratch, &pf, &desk, stamp);
     }
-
-    // Into place, and run once
-    deploynote(&d, scratch, "install", same ? Str("already there, running it once")
-                                            : Str("renaming it into place, running it once"));
-    cmd = deploycmd(&scratch, pf.shell, same ? DEPLOY_RUN : DEPLOY_INSTALL, rpath, stamp);
-    DeployRun run = deployssh(&d, &scratch, "install", cmd);
     if (deploycancelled(&d)) {
         return deployfail(&d, perm, scratch, "cancelled");
-    } else if (find(run.out, "prospero " PROSPERO_VERSION) < 0) {
-        b = Buf(&scratch, 256);
-        print(&b, "the engine does not run on ");
-        print(&b, name);
-        Str said = deploysaid(&run);
-        if (said.len) {
-            print(&b, ": ");
-            print(&b, said);
-        }
-        Str why = finish(&b);
-        if (!same && run.code!=255) {
-            Str rm = deploycmd(&scratch, pf.shell, DEPLOY_REMOVE, rpath, stamp);
-            deployssh(&d, &scratch, "install", rm);  // put there now, and useless
-        }
-        return deployfail(&d, perm, scratch, why);
+    } else if (dput.err.len) {
+        b = Buf(&scratch, 256 + dput.err.len);
+        print(&b, "warning: the desktop helper is not deployed: ");
+        print(&b, dput.err);
+        deploynote(&d, scratch, "install", finish(&b));
     }
 
     // Recorded, for connecting
@@ -971,9 +1107,13 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     print(&b, "\nshell = ");
     print(&b, pf.shell==DEPLOY_CMD ? Str("cmd") : Str("sh"));
     print(&b, "\npath = ");
-    print(&b, rpath);
+    print(&b, eng.rpath);
     print(&b, "\nsha256 = ");
-    print(&b, sha);
+    print(&b, eng.sha);
+    if (dput.ok) {
+        print(&b, "\ndesktop = ");
+        print(&b, desk.rpath);
+    }
     print(&b, "\nversion = " PROSPERO_VERSION "\nproto = ");
     print(&b, (i64)HOST_PROTO);
     print(&b, "\ndeployed = ");
@@ -988,13 +1128,17 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
 
     Deployed r = {};
     r.ok       = 1;
-    r.path     = clone(perm, rpath);
-    r.shown    = clone(perm, shown);
+    r.path     = clone(perm, eng.rpath);
+    r.shown    = clone(perm, eng.shown);
     r.platform = clone(perm, pf.name);
+    b32 same   = put.same && (!dput.ok || dput.same);
     b = Buf(&scratch, 256);
     print(&b, same ? Str("already deployed: ") : Str("deployed: "));
-    print(&b, shown);
-    deploynote(&d, scratch, "done", finish(&b), shown, pf.name);
+    print(&b, eng.shown);
+    if (dput.ok) {
+        print(&b, ", with the desktop helper");
+    }
+    deploynote(&d, scratch, "done", finish(&b), eng.shown, pf.name);
     return r;
 }
 
@@ -1005,7 +1149,8 @@ static Str deployusage =
 "usage: prospero deploy NAME|DEST [--force] [options]\n"
 "Put an engine for the platform of a remote machine, a [remote NAME] or\n"
 "an ssh destination, in ~/.prospero there, over ssh and scp, where\n"
-"\"prospero connect\" then runs it. Prints where it went.\n"
+"\"prospero connect\" then runs it, and its desktop helper beside it if\n"
+"the engines directory has one. Prints where the engine went.\n"
 "options:\n"
 "  --force             replace another build of this version there\n"
 "  --engines DIR       the engines to choose from (default: engines\n"

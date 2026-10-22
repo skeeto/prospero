@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Build the headless engines that "prospero deploy" puts on remote machines.
+"""Build the engines and desktop helpers that "prospero deploy" puts remotely.
 
   uv run tools/engines.py [--out DIR] [--linux HOST] [PLATFORM ...]
 
@@ -24,6 +24,14 @@ writes it:
                   which glibc has built in; mDNS (.local) needs the
                   machine's NSS module, which a static program loads
                   only where glibc's version matches
+
+Beside each Windows and Linux engine goes its desktop helper,
+prospero-desktop-VERSION-OS-ARCH[.exe], which deploy puts beside the
+engine there: on Windows CRT-free, its imports checked against XP SP3
+(kernel32, user32 and gdi32); on Linux linked dynamically, since it
+loads the X11 libraries at run time, and run once (--version). macOS
+gets none: its helper's privacy grants belong to Prospero.app, inside
+which it lives.
 
 With no PLATFORM it builds them all, except that without a HOST it
 leaves out the Linux ones, and says so.
@@ -76,9 +84,10 @@ def depsargs(deps):
             f"-DFETCHCONTENT_SOURCE_DIR_CPP-HTTPLIB={deps}/cpp-httplib-src"]
 
 
-def publish(out, ver, plat, path):
-    """Copy an engine into out under its deployed name, with its hash."""
-    name = f"prospero-engine-{ver}-{plat}" + (".exe" if plat.startswith("windows") else "")
+def publish(out, ver, plat, path, kind="engine"):
+    """Copy an engine, or a desktop helper (kind "desktop"), into out
+    under its release name, with its hash."""
+    name = f"prospero-{kind}-{ver}-{plat}" + (".exe" if plat.startswith("windows") else "")
     dst = os.path.join(out, name)
     tmp = dst + ".tmp"
     shutil.copyfile(path, tmp)
@@ -92,10 +101,10 @@ def publish(out, ver, plat, path):
     return dst
 
 
-def cmakebuild(builddir, extra):
+def cmakebuild(builddir, extra, targets=("prospero",)):
     run(["cmake", "-S", ROOT, "-B", builddir, "-G", "Ninja",
          "-DCMAKE_BUILD_TYPE=Release", "-DPROSPERO_GUI=OFF"] + extra)
-    run(["cmake", "--build", builddir, "--target", "prospero"])
+    run(["cmake", "--build", builddir, "--target", *targets])
 
 
 def macos(args, ver):
@@ -114,10 +123,14 @@ def windows(args, ver, arch):
     tc = "Toolchain-Mingw64.cmake" if arch == "x86_64" else "Toolchain-Mingw32.cmake"
     b = os.path.join(args.work, plat)
     cmakebuild(b, [f"-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/{tc}",
-                   "-DCMAKE_EXE_LINKER_FLAGS=-s"])
+                   "-DCMAKE_EXE_LINKER_FLAGS=-s"], ("prospero", "prospero-desktop"))
     exe = os.path.join(b, "prospero.exe")
-    run(["uv", "run", os.path.join(ROOT, "tests", "imports.py"), exe])
+    desk = os.path.join(b, "prospero-desktop.exe")
+    imports = os.path.join(ROOT, "tests", "imports.py")
+    run(["uv", "run", imports, exe])
+    run(["uv", "run", imports, "--dlls", "kernel32,user32,gdi32", desk])
     publish(args.out, ver, plat, exe)
+    publish(args.out, ver, plat, desk, "desktop")
 
 
 def sources():
@@ -152,20 +165,24 @@ def linux(args, ver, plats):
             f"cmake -S src -B {b} -G Ninja -DCMAKE_BUILD_TYPE=Release -DPROSPERO_GUI=OFF "
             f"-DPROSPERO_STATIC=ON -DCMAKE_EXE_LINKER_FLAGS=-s {flags} >{b}.log 2>&1 "
             f"|| {{ tail -30 {b}.log; exit 1; }}",
-            f"cmake --build {b} --target prospero >>{b}.log 2>&1 "
+            f"cmake --build {b} --target prospero prospero-desktop >>{b}.log 2>&1 "
             f"|| {{ tail -30 {b}.log; exit 1; }}",
             f"grep -i 'warning' {b}.log || true",
-            f"file {b}/prospero",
+            f"file {b}/prospero {b}/prospero-desktop",
             f"{b}/prospero --version",
+            # Linked dynamically, so a cross build needs its C library
+            f"QEMU_LD_PREFIX=/usr/x86_64-linux-gnu {b}/prospero-desktop --version"
+            if plat == "linux-x86_64" else f"{b}/prospero-desktop --version",
         ]
     say(f"building {', '.join(plats)} on {host}")
     p = subprocess.run(["ssh", host, "sh -s"], input="\n".join(script) + "\n", text=True)
     if p.returncode != 0:
         sys.exit(f"engines: the build on {host} failed")
     for plat in plats:
-        got = os.path.join(args.work, f"{plat}.bin")
-        run(["scp", "-q", f"{host}:{rdir}/build-{plat}/prospero", got])
-        publish(args.out, ver, plat, got)
+        for prog, kind in (("prospero", "engine"), ("prospero-desktop", "desktop")):
+            got = os.path.join(args.work, f"{plat}-{kind}.bin")
+            run(["scp", "-q", f"{host}:{rdir}/build-{plat}/{prog}", got])
+            publish(args.out, ver, plat, got, kind)
 
 
 def main():

@@ -72,7 +72,7 @@ engines it builds.
 
 ## Releases
 
-Each release on GitHub carries six files:
+Each release on GitHub carries ten files:
 
 - `prospero-VERSION.tar.gz`: the source, with every dependency unpacked
   under `deps/`, so that it builds with no network:
@@ -89,17 +89,25 @@ Each release on GitHub carries six files:
 - `prospero-engine-VERSION-linux-x86_64` and
   `prospero-engine-VERSION-linux-aarch64`: headless engines for Linux,
   linked statically.
+- `prospero-desktop-VERSION-OS-ARCH[.exe]`, for each engine's platform:
+  the desktop helper (Desktop control). The Windows ones import only
+  what XP has; the Linux ones load X11 at run time, so they link the C
+  library dynamically, and need glibc 2.34 or later.
 
-The engines are named as `prospero deploy` expects to find them, in an
-`engines` directory next to the executable. There is no macOS build;
-build it from source.
+The engines and helpers are named as `prospero deploy` expects to find
+them, in an `engines` directory next to the executable, which puts each
+helper beside its engine on the remote machine. To use a helper on the
+machine itself, save it next to `prospero.exe` (or `prospero`) as
+`prospero-desktop.exe` (or `prospero-desktop`). There is no macOS
+build; build it from source.
 
 The release workflow (`.github/workflows/release.yml`) builds every
 program from the source tarball alone. The Windows programs are built
 on Linux by [w64devkit][]'s GCC under Wine, the same programs it builds
-on Windows, stripped and with no timestamp, then signed with an
-Authenticode signature (Azure Artifact Signing), which Windows shows in
-the file's Properties, under Digital Signatures. `tools/dist.py` makes
+on Windows, stripped and with no timestamp, then signed, the helpers
+too, with an Authenticode signature (Azure Artifact Signing), which
+Windows shows in the file's Properties, under Digital Signatures.
+`tools/dist.py` makes
 the source tarball from any commit, the same commit always giving the
 same tar file.
 
@@ -297,7 +305,9 @@ keeps its identity however often Prospero is rebuilt. So far it exists
 for Windows (XP and later), macOS (15.2 and later) and Linux on X11;
 run alone, it takes the same commands on its command line
 (`prospero-desktop shot screen > s.png`, `list`, `click WINDOW X Y` and
-so on; `prospero-desktop -h`).
+so on; `prospero-desktop -h`). An engine that `prospero deploy` put on
+another machine uses the helper deployed beside it (Remote and
+background hosts).
 
 On macOS the helper sits in `Prospero.app/Contents/MacOS`, and works in
 points, which it captures at the display's full resolution. macOS asks
@@ -360,6 +370,14 @@ from the `engines` directory next to the executable, named
 is built for that platform. `tools/engines.py` builds them: macOS
 arm64, Windows x86-64 and i686, and Linux aarch64 and x86-64 (static,
 built on a Linux host given with `--linux HOST`, else left out).
+
+A desktop helper there for the platform,
+`prospero-desktop-VERSION-OS-ARCH`, goes too, as
+`desktop-PROTO-VERSION-OS-ARCH` beside the engine, where the engine
+looks for it first; with the executable itself as the engine, its own
+`prospero-desktop` goes. `tools/engines.py` builds the Windows and Linux
+helpers beside their engines. The engine works without a helper, so one
+that cannot be put there, or does not run there, is only a warning.
 
 ## Windows notes
 

@@ -12,6 +12,9 @@ uploads, verifies and records it, tries again when the upload breaks or
 arrives damaged, refuses another build of the same version without
 --force, and connect then runs the engine deployed, or deploys one
 itself (--deploy, or [remote NAME] deploy = auto) when it finds none.
+A desktop helper in the engines directory (tests/fake_desktop.py behind
+a script) goes beside the engine, where the engine then runs it for its
+desktop tool; one that does not run there is only a warning.
 
   uv run tests/deploy.py --prospero build/prospero [NAME ...]
 
@@ -50,6 +53,7 @@ import remote as R  # noqa: E402
 from remote import Failure  # noqa: E402
 
 SCENARIOS = {}
+FAKE_DESKTOP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_desktop.py")
 
 
 def scenario(fn):
@@ -150,6 +154,27 @@ class D(R.T):
         with open(dst + ".sha256", "w") as f:
             f.write(f"{hashlib.sha256(data).hexdigest()}  {self.ename}\n")
         return dst
+
+    def helper(self, works=True, extra=""):
+        """A desktop helper of the local platform in the engines
+        directory: tests/fake_desktop.py behind a script that answers
+        --version as the real one does, or, unless works, fails it."""
+        name = f"prospero-desktop-{self.version}-{self.platform}"
+        dst = os.path.join(self.engines, name)
+        version = (f'echo "prospero-desktop {self.version}"; exit 0' if works
+                   else 'echo "cannot load libc" >&2; exit 1')
+        text = (f"#!/bin/sh\n# {extra}\n"
+                f'if [ "$1" = --version ]; then {version}; fi\n'
+                f"exec {shlex.quote(sys.executable)} {shlex.quote(FAKE_DESKTOP)} \"$@\"\n")
+        with open(dst, "w") as f:
+            f.write(text)
+        os.chmod(dst, 0o755)
+        with open(dst + ".sha256", "w") as f:
+            f.write(f"{hashlib.sha256(text.encode()).hexdigest()}  {name}\n")
+        return dst
+
+    def helperdeployed(self):
+        return os.path.join(self.home, ".prospero", f"desktop-0-{self.version}-{self.platform}")
 
     def deploy(self, *extra, env=None, target="here"):
         argv = [self.prospero, "deploy", target, "--ssh-program", self.ssh,
@@ -477,6 +502,100 @@ def mismatch(t):
     t.check(t.hostpids() == [pid] and not R.gone(pid, 0.5), "the host stopped")
 
 
+@scenario
+def desktop(t):
+    """A desktop helper in the engines directory goes beside the engine,
+    as desktop-PROTO-VERSION-OS-ARCH, is recorded, and is uploaded again
+    only when missing there; the engine connected to then runs it as its
+    desktop tool's helper."""
+    t.engine()
+    src = t.helper()
+    p = t.deploy()
+    t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    t.check(p.stdout == f"~/.prospero/{t.rname}\n", f"stdout {p.stdout!r}")
+    dst = t.helperdeployed()
+    t.check(os.path.isfile(dst) and sha256(dst) == sha256(src), "the helper is there")
+    t.check(not os.path.exists(dst + ".part"), "no .part left")
+    t.check(t.scps() == 2, f"{t.scps()} uploads")
+    t.check(t.record().get("desktop") == f".prospero/{os.path.basename(dst)}",
+            f"record {t.record()}")
+    t.check("renaming the desktop helper into place" in p.stderr and
+            "with the desktop helper" in p.stderr, f"stderr {p.stderr}")
+    q = t.deploy()
+    t.check(q.returncode == 0 and "already deployed" in q.stderr and t.scps() == 2,
+            f"again: {q.stderr}")
+    os.remove(dst)
+    q = t.deploy()
+    t.check(q.returncode == 0 and "already deployed" not in q.stderr and t.scps() == 3
+            and sha256(dst) == sha256(src), f"the helper missing: {q.stderr}")
+
+    # The deployed engine's desktop tool: its helper is the one beside it
+    log = os.path.join(t.root, "desktop.log")
+    t.write_config(t.args.url, "[desktop]\noffer = all\nask = false\n")
+    env = dict(t.env, FAKE_DESKTOP_LOG=log)
+    env.pop("PROSPERO_TEST_DESKTOP", None)
+    c = t.connect(env=env)
+    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
+    r = c.call("new", cwd=t.work, prompt="go", model=t.model("desktop_off"), attended=1)
+    t.check(r.get("ok") == 1, f"new: {r}")
+    sid = r["sid"]
+    end = c.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                 what="turn.end", timeout=60)
+    t.check(end.get("why") == "done", f"turn.end {end}")
+    tools = [r for r in c.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+    t.check(tools and tools[0].get("status") == "ok", f"the screenshot: {tools}")
+    try:
+        with open(log) as f:
+            took = [json.loads(x) for x in f.read().splitlines()]
+    except OSError:
+        took = []
+    t.check(took[:1] == [["hello"]] and took[1:2] and took[1][0] == "shot",
+            f"the helper took {took}")
+    c.call("quit")
+    t.check(c.close() == 0, "connect exits 0")
+
+
+@scenario
+def desktop_warn(t):
+    """A helper that does not run there, or another build of it, is only
+    a warning: the engine is deployed and recorded all the same, and a
+    helper that does not run is removed again; --force replaces another
+    build."""
+    t.engine()
+    t.helper(works=False)
+    p = t.deploy()
+    t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    t.check("warning: the desktop helper is not deployed: the desktop helper does "
+            "not run on here: cannot load libc" in p.stderr, f"stderr {p.stderr}")
+    t.check(os.path.isfile(t.deployed()) and not os.path.exists(t.helperdeployed()),
+            "the engine alone is there")
+    t.check("desktop" not in t.record(), f"record {t.record()}")
+    good = sha256(t.helper())
+    p = t.deploy()
+    t.check(p.returncode == 0 and "warning" not in p.stderr and
+            sha256(t.helperdeployed()) == good, f"a good one: {p.stderr}")
+    new = sha256(t.helper(extra="another build"))
+    p = t.deploy()
+    t.check(p.returncode == 0 and "another build of prospero-desktop" in p.stderr and
+            sha256(t.helperdeployed()) == good, f"without --force: {p.stderr}")
+    p = t.deploy("--force")
+    t.check(p.returncode == 0 and "warning" not in p.stderr and
+            sha256(t.helperdeployed()) == new, f"--force: {p.stderr}")
+
+
+@scenario
+def desktop_self(t):
+    """No engine in the engines directory, so this program serves, and
+    its own helper next to it goes with it."""
+    mine = os.path.join(os.path.dirname(t.prospero), "prospero-desktop")
+    if not os.path.isfile(mine):
+        return "skip"
+    p = t.deploy()
+    t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    t.check(sha256(t.deployed()) == sha256(t.prospero), "this program is the engine")
+    t.check(sha256(t.helperdeployed()) == sha256(mine), "its helper went with it")
+
+
 # Over real ssh
 
 def rsh(a, script):
@@ -512,6 +631,7 @@ def real(t):
         for line in f:
             k, _, v = line.partition("=")
             rec[k.strip()] = v.strip()
+    print(f"     desktop helper: {rec.get('desktop', 'none')}", flush=True)
     plat = rec.get("platform", "")
     local = os.path.join(engines, f"prospero-engine-{t.version}-{plat}")
     local += ".exe" if plat.startswith("windows") else ""
@@ -585,9 +705,13 @@ def realcleanup(a):
     """Remove what "real" deployed, and ~/.prospero if it made it."""
     for name, madedir in REALMADE:
         # A host that quit may take a moment to let go of its program,
-        # which Windows will not remove while it runs
-        script = (f"for i in 1 2 3 4 5; do rm -f .prospero/{name} .prospero/{name}.part "
-                  f".prospero/{name}.old-* && [ ! -e .prospero/{name} ] && break; sleep 2; done\n")
+        # which Windows will not remove while it runs; the desktop
+        # helper deployed beside it goes too
+        script = ""
+        for n in (name, "desktop-" + name.removeprefix("engine-")):
+            script += (f"for i in 1 2 3 4 5; do rm -f .prospero/{n} .prospero/{n}.part "
+                       f".prospero/{n}.old-* && [ ! -e .prospero/{n} ] && break; "
+                       f"sleep 2; done\n")
         if madedir:
             script += "rmdir .prospero\n"
         script += "ls -a .prospero 2>/dev/null; echo end\n"

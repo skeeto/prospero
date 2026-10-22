@@ -35,6 +35,7 @@
 // Run with a command, it does that one and exits, as winctl does: text
 // and PNGs on standard output, errors on standard error, exit status 0
 // (ok), 1 (error), 2 (no window or several match) or 3 (wait timed out).
+// --version prints "prospero-desktop VERSION", touching no desktop.
 // Run with --serve, it takes commands from the harness on standard input
 // until its end, as frames: a little-endian u32 length, then the
 // arguments, each ending in a null byte. Each gets one reply frame: a
@@ -1310,7 +1311,7 @@ static void dkcmdaccess(DkCtx *c, DkArgs *a)
 
 static Str dkusage =
 "usage: prospero-desktop COMMAND [ARGS]\n"
-"       prospero-desktop --serve\n"
+"       prospero-desktop --serve | --version\n"
 "  list [-a] [WINDOW]           list visible top-level windows (-a: all)\n"
 "  shot [-s EDGE PIXELS] [WINDOW [X Y W H]]\n"
 "                               PNG of the screen under WINDOW to stdout,\n"
@@ -1506,6 +1507,9 @@ static i32 dkmain(Dk *dk, Arena scratch, Str *args, i32 nargs)
 {
     if (nargs==2 && args[1]=="--serve") {
         return dkserve(dk, scratch);
+    } else if (nargs==2 && args[1]=="--version") {
+        // Touches no desktop: deploy runs it to see that it runs there
+        return dk_write(dk, 1, "prospero-desktop " PROSPERO_VERSION "\n") ? DK_OK : DK_FAIL;
     } else if (nargs < 2) {
         dk_write(dk, 2, dkusage);
         return DK_FAIL;

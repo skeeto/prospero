@@ -3768,8 +3768,27 @@ enum : i64 {
     DESK_REGION = (i64)1 << (sizeof(void *)==8 ? 28 : 27),
 };
 
-// The helper's command line: next to this executable, or for tests the
-// JSON array of strings in PROSPERO_TEST_DESKTOP. Empty if none.
+// Where the helper may be for an executable, first to last: for an
+// engine deployed as engine-PROTO-VERSION-OS-ARCH[.exe] (deploy.cpp),
+// the helper deployed beside it, desktop-PROTO-VERSION-OS-ARCH[.exe];
+// then prospero-desktop[.exe] next to it, as a build leaves it.
+static Slice<Str> deskhelpers(Arena *a, Str exe, b32 windows)
+{
+    Slice<Str> r    = {};
+    Str        dir  = parentdir(exe);
+    Str        base = basename(exe);
+    if (startswith(base, "engine-")) {
+        Str name = concat(a, "desktop-", cuthead(base, 7));
+        r = push(a, r, join(a, dir, name));
+    }
+    Str name = windows ? Str("prospero-desktop.exe") : Str("prospero-desktop");
+    r = push(a, r, join(a, dir, name));
+    return r;
+}
+
+// The helper's command line: the first of deskhelpers there, or for
+// tests the JSON array of strings in PROSPERO_TEST_DESKTOP. Empty if
+// none.
 static Slice<Str> deskhelper(Engine *e, Arena *a)
 {
     Slice<Str> r    = {};
@@ -3783,10 +3802,11 @@ static Slice<Str> deskhelper(Engine *e, Arena *a)
         }
         return r;
     }
-    Str name = e->te.windows ? Str("prospero-desktop.exe") : Str("prospero-desktop");
-    Str path = join(a, e->exedir, name);
-    if (os_stat(e->os, *a, path).type == STAT_FILE) {
-        r = push(a, r, path);
+    Slice<Str> paths = deskhelpers(a, e->te.exe, e->te.windows);
+    for (iz i = 0; i < paths.len; i++) {
+        if (os_stat(e->os, *a, paths[i]).type == STAT_FILE) {
+            return push(a, r, paths[i]);
+        }
     }
     return r;
 }
