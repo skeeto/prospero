@@ -294,9 +294,23 @@ The work is done by a helper, `prospero-desktop`, next to `prospero`,
 which the harness starts for a turn and talks to over pipes: a program
 of its own, so that the one program the system lets watch the screen
 keeps its identity however often Prospero is rebuilt. So far it exists
-for Windows (XP and later); run alone, it takes the same commands on
-its command line (`prospero-desktop shot screen > s.png`, `list`,
-`click WINDOW X Y` and so on; `prospero-desktop -h`).
+for Windows (XP and later) and macOS (15.2 and later); run alone, it
+takes the same commands on its command line (`prospero-desktop shot
+screen > s.png`, `list`, `click WINDOW X Y` and so on;
+`prospero-desktop -h`).
+
+On macOS the helper sits in `Prospero.app/Contents/MacOS`, and works in
+points, which it captures at the display's full resolution. macOS asks
+your permission for it twice, in System Settings > Privacy & Security:
+Screen Recording, for screenshots (quit and reopen Prospero after
+granting it), and Accessibility, for input and for raising, closing and
+moving windows. Both are granted to Prospero.app when you start it as
+an app, or to the terminal you start `prospero` from. A call that lacks
+one fails at once and says which to grant to what;
+`prospero-desktop access` lists them, and `access -ask` asks for those
+missing. Build with `-DPROSPERO_SIGN_IDENTITY=NAME`, a code-signing
+identity from your keychain, even a self-signed one, so that the
+grants survive rebuilds.
 
 Screenshots go to the model as images, scaled down to its limits
 (`[model] image_edge` and `image_pixels`: by default 1568 pixels on a
@@ -380,6 +394,11 @@ The suites:
   leave no process behind.
 - `remote`, `includes`, `deploy`: hosts and their clients, URL includes
   against a fake web server, and deploying through a fake ssh and scp.
+- `desktop_unit`, `desktop` (macOS): the desktop helper's own layer
+  (`src/test/desktop_macos_test.cpp`), and the helper itself, its
+  commands and frames, with its permissions treated as missing, so that
+  nothing touches the screen. `tests/desktop_live_macos.py` drives
+  TextEdit for real, under supervision; its header says how.
 - `sectrust` (macOS): the system's trust in https servers, through the
   HTTP layer (`src/main_edgetest.cpp`), with certificates that openssl
   makes for the test and that are never installed. With `--net`, real

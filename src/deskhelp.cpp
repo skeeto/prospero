@@ -18,14 +18,19 @@
 //   type WINDOW TEXT                TEXT as Unicode characters
 //   raise WINDOW                    bring to the foreground
 //   close WINDOW                    ask to close, like the title bar's X
-//   move WINDOW X Y [W H]           move and resize, in screen pixels
+//   move WINDOW X Y [W H]           move and resize, in screen units
 //   run PROGRAM [ARGS...]           start detached, print the pid
+//   access [-ask]                   the permissions it needs, if any
 //
 // WINDOW is a title substring, or key=value[,key=value...] with title=,
 // class=, pid= and hwnd= (a window's id), or "screen", or "active" (the
-// foreground window). Coordinates are physical pixels relative to the
-// window's visible frame, as in its shot; "screen" is relative to the
-// top-left of the whole (virtual) screen.
+// foreground window). Coordinates are relative to the window's visible
+// frame, as in its shot; "screen" is relative to the top-left of the
+// whole (virtual) screen. Their unit is the desktop's own, which hello
+// names: physical pixels on Windows, points on macOS, where a Retina
+// display has two or more pixels to a point. A shot is captured at the
+// display's full resolution and scaled down to the units at most, so
+// that a pixel of the image is never smaller than a unit.
 //
 // Run with a command, it does that one and exits, as winctl does: text
 // and PNGs on standard output, errors on standard error, exit status 0
@@ -35,11 +40,12 @@
 // arguments, each ending in a null byte. Each gets one reply frame: a
 // u32 length, then a status byte (the exit status above), a u32 text
 // length, the text (output, or the error), and binary data (a PNG). The
-// first command is hello, whose text is "prospero-desktop PROTO OS". In
-// serve mode a shot's text is "OX OY W H IW IH ID": where the capture
-// starts relative to the window's origin, the size captured, the size
-// of the image, which -s may have scaled down, and the window's id in
-// hex (0x0 for the screen), with which later commands can name it.
+// first command is hello, whose text is "prospero-desktop PROTO OS
+// UNITS", the units being "pixels" or "points". In serve mode a shot's
+// text is "OX OY W H IW IH ID": where the capture starts relative to the
+// window's origin, the size captured, in units, the size of the image,
+// never larger, which -s may have scaled down further, and the window's
+// id in hex (0x0 for the screen), with which later commands can name it.
 //
 // Everything here is portable; the platform layer (main_desktop_*.cpp)
 // implements the dk_* functions below for its desktop.
@@ -66,9 +72,14 @@ struct DkRect {
 struct DkWin {
     u64    id;     // the platform's handle, 0 for the whole screen
     u32    pid;
-    DkRect rect;   // its visible frame on the screen, physical pixels
+    DkRect rect;   // its visible frame on the screen, in its units
     Str    title;  // UTF-8
     Str    cls;
+    i32    level;  // the platform's stacking level, for dk_popup
+};
+
+struct DkSize {
+    i32 w, h;
 };
 
 
@@ -78,6 +89,15 @@ struct Dk;
 
 // The operating system, for hello: "windows", "macos", "linux".
 static Str        dk_os(Dk *);
+// The unit of every coordinate, for hello: "pixels" or "points".
+static Str        dk_units(Dk *);
+// Why the latest call that failed did, if the platform knows better
+// than the generic message (a permission it lacks); else null.
+static Str        dk_why(Dk *);
+// The permissions the desktop needs, one line each, "NAME\tgranted" or
+// "NAME\tmissing", plus what they are granted to; with ask, those
+// missing are asked of the user first. 0 if any is still missing.
+static b32        dk_access(Dk *, Buf *, b32 ask);
 // Top-level windows, top of the z-order first: those on the screen
 // (visible and not cloaked), or with all, every one.
 static Slice<DkWin> dk_windows(Dk *, Arena *, b32 all);
@@ -93,10 +113,11 @@ static b32        dk_popup(Dk *, DkWin *);
 // Bring a window to the foreground, restoring it if minimized, and
 // update its rectangle. 0 if the system refused.
 static b32        dk_activate(Dk *, DkWin *);
-// The screen's pixels in a rectangle as 32-bit BGRX, top-down rows;
-// null if the screen cannot be read (a locked desktop).
-static u8        *dk_capture(Dk *, Arena *, DkRect);
-// Pointer input at a screen position in physical pixels; button 0 is
+// The screen's pixels in a rectangle of units as 32-bit BGRX, top-down
+// rows, at the display's resolution, whose size goes in size; null if
+// the screen cannot be read (a locked desktop, no permission).
+static u8        *dk_capture(Dk *, Arena *, DkRect, DkSize *size);
+// Pointer input at a screen position in units; button 0 is
 // the left, 1 the right; notches positive scroll up.
 static b32        dk_pointer(Dk *, i32 x, i32 y);
 static b32        dk_button(Dk *, i32 button, b32 down);
@@ -386,10 +407,21 @@ static DkWin dkfindone(DkCtx *c, Str spec)
     return r;
 }
 
+// Fail with the platform's reason, if it has one, else msg.
+static void dkfailwhy(DkCtx *c, Str msg, Str detail = {})
+{
+    Str why = dk_why(c->dk);
+    if (why.data) {
+        dkfail(c, DK_FAIL, why);
+    } else {
+        dkfail(c, DK_FAIL, msg, detail);
+    }
+}
+
 static void dkactivate(DkCtx *c, DkWin *w)
 {
     if (!c->status && w->id && !dk_activate(c->dk, w)) {
-        dkfail(c, DK_FAIL, "cannot bring window to the foreground", w->title);
+        dkfailwhy(c, "cannot bring window to the foreground", w->title);
     }
 }
 
@@ -397,7 +429,7 @@ static void dkinput(DkCtx *c, b32 ok)
 {
     if (!ok) {
         // Blocked by UIPI (an elevated target), or a locked desktop
-        dkfail(c, DK_FAIL, "input failed (elevated window or locked desktop?)");
+        dkfailwhy(c, "input failed (elevated window or locked desktop?)");
     }
 }
 
@@ -406,10 +438,6 @@ static void dkinput(DkCtx *c, b32 ok)
 
 // The largest size within edge on each side and pixels in all, keeping
 // the aspect ratio, never larger than w by h. Zero limits are none.
-struct DkSize {
-    i32 w, h;
-};
-
 static DkSize dkfit(i32 w, i32 h, i32 edge, i64 pixels)
 {
     DkSize r = {w, h};
@@ -851,13 +879,17 @@ static void dkcmdshot(DkCtx *c, DkArgs *a)
         return;
     }
 
-    u8 *bits = dk_capture(c->dk, c->a, r);
+    // Captured at the display's resolution, which on a Retina display
+    // is a multiple of the units, then scaled straight to the image,
+    // which is never larger than the units: points map back exactly
+    DkSize px   = {};
+    u8    *bits = dk_capture(c->dk, c->a, r, &px);
     if (!bits) {
-        dkfail(c, DK_FAIL, "screen capture failed (locked desktop?)");
+        dkfailwhy(c, "screen capture failed (locked desktop?)");
         return;
     }
     DkSize s = dkfit(width, height, edge, pixels);
-    bits    = dkscale(c->a, bits, width, height, s.w, s.h);
+    bits    = dkscale(c->a, bits, px.w, px.h, s.w, s.h);
     c->data = dkpng(c->a, bits, s.w, s.h);
     if (c->serving) {
         print(&c->out, (i64)(r.left - w.rect.left));
@@ -928,7 +960,7 @@ static void dkcmdwait(DkCtx *c, DkArgs *a)
         if (r == 1) {
             dkfail(c, DK_TIMEOUT, "timed out waiting for idle", spec);
         } else if (r) {
-            dkfail(c, DK_FAIL, "cannot wait for idle (not a GUI process?)", spec);
+            dkfailwhy(c, "cannot wait for idle (not a GUI process?)", spec);
         }
         return;
     }
@@ -1207,8 +1239,10 @@ static void dkcmdclose(DkCtx *c, DkArgs *a)
 {
     DkWin w = dkfindone(c, dknext(c, a, "window"));
     dkdone(c, a);
-    if (!c->status && (!w.id || !dk_close(c->dk, &w))) {
-        dkfail(c, DK_FAIL, "cannot close", w.title);
+    if (!c->status && !w.id) {
+        dkfail(c, DK_FAIL, "cannot close the screen");
+    } else if (!c->status && !dk_close(c->dk, &w)) {
+        dkfailwhy(c, "cannot close", w.title);
     }
 }
 
@@ -1228,7 +1262,7 @@ static void dkcmdmove(DkCtx *c, DkArgs *a)
     } else if (size && (cw<=0 || ch<=0)) {
         dkfail(c, DK_FAIL, "width and height must be positive");
     } else if (!dk_move(c->dk, &w, x, y, cw, ch, size)) {
-        dkfail(c, DK_FAIL, "cannot move window", w.title);
+        dkfailwhy(c, "cannot move window", w.title);
     }
 }
 
@@ -1245,14 +1279,29 @@ static void dkcmdrun(DkCtx *c, DkArgs *a)
     b32 attached = 0;
     u32 pid      = dk_run(c->dk, *c->a, argv, &attached);
     if (!pid) {
-        dkfail(c, DK_FAIL, "cannot start", argv[0]);
+        dkfailwhy(c, "cannot start", argv[0]);
         return;
     }
     print(&c->out, (i64)pid);
     putbyte(&c->out, '\n');
     if (attached && !c->serving) {
-        dk_write(c->dk, 2, "prospero-desktop: warning: cannot leave the job, "
-                           "the program may end with the session\n");
+        // Windows: it could not leave the job; macOS: no application, so
+        // it stays in the reaper's tree
+        dk_write(c->dk, 2, "prospero-desktop: warning: cannot detach the "
+                           "program, which may end with the session\n");
+    }
+}
+
+static void dkcmdaccess(DkCtx *c, DkArgs *a)
+{
+    b32 ask = 0;
+    if (dkmore(a) && a->v[a->i]=="-ask") {
+        ask = 1;
+        a->i++;
+    }
+    dkdone(c, a);
+    if (!c->status) {
+        dk_access(c->dk, &c->out, ask);
     }
 }
 
@@ -1273,17 +1322,21 @@ static Str dkusage =
 "  type WINDOW TEXT             TEXT as Unicode keys, - reads stdin (UTF-8)\n"
 "  raise WINDOW                 bring to the foreground\n"
 "  close WINDOW                 ask the window to close\n"
-"  move WINDOW X Y [W H]        move and resize, in screen pixels\n"
+"  move WINDOW X Y [W H]        move and resize, in screen coordinates\n"
 "  run PROGRAM [ARGS...]        start detached from the session, print PID\n"
+"  access [-ask]                the permissions needed, and whether granted\n"
+"                               (-ask: ask the user for those missing)\n"
 "  --serve                      take commands as frames on standard input\n"
 "WINDOW: title substring, or key=value[,key=value...] with keys title=,\n"
 "  class=, pid=, hwnd=; or 'screen'; or 'active' (the foreground window).\n"
-"Coordinates are physical pixels relative to the window, as in its shot.\n"
+"Coordinates are relative to the window, as in its shot: pixels on Windows,\n"
+"  points on macOS.\n"
 "Exit status: 0 ok, 1 error, 2 no or ambiguous window match, 3 timeout.\n";
 
 // Run one command, its output in c.
 static void dkcommand(DkCtx *c, DkArgs *a)
 {
+    dk_why(c->dk);  // a reason left from an earlier command is stale
     Str cmd = dknext(c, a, "command");
     if (c->status) {
         return;
@@ -1294,6 +1347,8 @@ static void dkcommand(DkCtx *c, DkArgs *a)
         print(&c->out, (i64)DK_PROTO);
         putbyte(&c->out, ' ');
         print(&c->out, dk_os(c->dk));
+        putbyte(&c->out, ' ');
+        print(&c->out, dk_units(c->dk));
         putbyte(&c->out, '\n');
     } else if (cmd == "list") {
         dkcmdlist(c, a);
@@ -1325,6 +1380,8 @@ static void dkcommand(DkCtx *c, DkArgs *a)
         dkcmdmove(c, a);
     } else if (cmd == "run") {
         dkcmdrun(c, a);
+    } else if (cmd == "access") {
+        dkcmdaccess(c, a);
     } else {
         dkfail(c, DK_FAIL, "unknown command", cmd);
     }

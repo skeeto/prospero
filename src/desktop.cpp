@@ -4,8 +4,8 @@
 // keyboard. The harness does none of it itself: a helper program,
 // prospero-desktop, next to the executable, takes commands over pipes
 // (the frames deskhelp.cpp describes), started when a session first
-// needs it and stopped when its turn ends. Only Windows has a helper so
-// far; elsewhere the tool says that it is not available.
+// needs it and stopped when its turn ends. Only Windows and macOS have
+// a helper so far; elsewhere the tool says that it is not available.
 //
 // Points are in the latest screenshot, as the model sees its image: a
 // screenshot is scaled down to the model's limits ([model] image_edge

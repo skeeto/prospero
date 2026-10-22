@@ -143,7 +143,7 @@ def command(d, args):
             raise Fail(1, "invalid number")
 
     if cmd == "hello":
-        return 0, "prospero-desktop 1 fake\n", b""
+        return 0, "prospero-desktop 1 fake pixels\n", b""
     if cmd == "list":
         ws = d.windows if not a else d.select(a[0])
         return 0, "".join(d.line(w) for w in ws), b""

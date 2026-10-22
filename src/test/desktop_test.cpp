@@ -14,9 +14,26 @@ struct Dk {
     i64    now;     // milliseconds
     Str    stdin_;  // what dk_read reads
     Buf    out[3];  // what dk_write wrote
+    Str    why;     // dk_why's next answer
+    Str    denied;  // why dk_close fails, if it does
+    i32    scale;   // pixels to a unit, for dk_capture
 };
 
 static Str dk_os(Dk *) { return "fake"; }
+static Str dk_units(Dk *) { return "pixels"; }
+
+static Str dk_why(Dk *dk)
+{
+    Str r = dk->why;
+    dk->why = {};
+    return r;
+}
+
+static b32 dk_access(Dk *dk, Buf *b, b32 ask)
+{
+    print(b, ask ? Str("thing\tasked\n") : Str("thing\tmissing\n"));
+    return 0;
+}
 
 static Slice<DkWin> dk_windows(Dk *dk, Arena *a, b32)
 {
@@ -57,21 +74,24 @@ static b32 dk_activate(Dk *dk, DkWin *w)
     return 1;
 }
 
-// A gradient: blue rises to the right, green downward.
-static u8 *dk_capture(Dk *, Arena *a, DkRect r)
+// A gradient: blue rises to the right, green downward, by unit, at
+// scale pixels to the unit (a Retina display's 2).
+static u8 *dk_capture(Dk *dk, Arena *a, DkRect r, DkSize *size)
 {
-    i32 w = r.right - r.left;
-    i32 h = r.bottom - r.top;
+    i32 k = dk->scale;
+    i32 w = (r.right - r.left) * k;
+    i32 h = (r.bottom - r.top) * k;
     u8 *p = allocbytes(a, (iz)w*h*4);
     for (i32 y = 0; y < h; y++) {
         for (i32 x = 0; x < w; x++) {
             u8 *q = p + ((iz)y*w + x)*4;
-            q[0] = (u8)(r.left + x);
-            q[1] = (u8)(r.top + y);
+            q[0] = (u8)(r.left + x/k);
+            q[1] = (u8)(r.top + y/k);
             q[2] = 0x80;
             q[3] = 0;
         }
     }
+    *size = {w, h};
     return p;
 }
 
@@ -142,6 +162,10 @@ static b32 dk_text(Dk *dk, Arena, Str s)
 
 static b32 dk_close(Dk *dk, DkWin *w)
 {
+    if (dk->denied.data) {
+        dk->why = dk->denied;  // as a platform without the permission fails
+        return 0;
+    }
     print(&dk->log, "close ");
     print(&dk->log, w->title);
     putbyte(&dk->log, '\n');
@@ -187,6 +211,7 @@ static Dk *newdk(Arena *a)
     Dk *dk = alloc<Dk>(a);
     dk->a      = a;
     dk->screen = {0, 0, 1280, 800};
+    dk->scale  = 1;
     dk->log    = Buf(a, 1024);
     for (i32 fd = 0; fd < 3; fd++) {
         dk->out[fd] = Buf(a, 1024);
@@ -650,7 +675,7 @@ static void test_desktop(Test *t)
     // coordinates, failures, all as replies
     {
         Dk *dk = newdk(a);
-        expect(t, "serve hello", dkround(a, dk, "hello"), "0|prospero-desktop 1 fake\n");
+        expect(t, "serve hello", dkround(a, dk, "hello"), "0|prospero-desktop 1 fake pixels\n");
         expect(t, "serve list", dkround(a, dk, "list|pid=7"),
                "0|0x00000010\t7\t100,50\t640x480\tNotepad\tUntitled - Notepad\n"
                "0x00000020\t7\t300,200\t200x100\t#32768\t\n");
@@ -709,9 +734,53 @@ static void test_desktop(Test *t)
         DeskReply r1 = deskreply(takehead(out, n));
         DeskReply r2 = deskreply(cuthead(out, n));
         expect(t, "serve loop replies", concat(a, r1.text, r2.text),
-               "prospero-desktop 1 fake\n0x00000030\t9\t0,0\t1280x800\tProgman\t"
+               "prospero-desktop 1 fake pixels\n0x00000030\t9\t0,0\t1280x800\tProgman\t"
                "Program Manager\n");
         dk->stdin_ = Str{(u8 *)"\xff\xff\xff\x7f", 4};
         expect(t, "serve too long", istr(a, dkserve(dk, *a)), "1");
+    }
+
+    // A Retina display: two pixels to the unit (a point), captured at
+    // full resolution, yet the image never exceeds the units, so the
+    // geometry the harness maps points with is the units', and each
+    // image pixel averages its point's four
+    {
+        Dk *dk = newdk(a);
+        dk->scale = 2;
+        Str data = {};
+        expect(t, "retina shot", dkround(a, dk, "shot|screen|10|20|30|40", &data),
+               "0|10 20 30 40 30 40 0x0\n");
+        DeskSize ps = pngsize(data);
+        expect(t, "retina png", concat(a, istr(a, ps.w), concat(a, "x", istr(a, ps.h))),
+               "30x40");
+        expect(t, "retina scaled", dkround(a, dk, "shot|-s|20|0|screen|10|20|30|40"),
+               "0|10 20 30 40 15 20 0x0\n");
+        DkRect r  = {10, 20, 12, 21};
+        DkSize px = {};
+        u8    *p  = dk_capture(dk, a, r, &px);
+        u8    *q  = dkscale(a, p, px.w, px.h, 2, 1);
+        expect(t, "retina capture", concat(a, concat(a, istr(a, px.w), "x"), istr(a, px.h)),
+               "4x2");
+        expect(t, "retina average", concat(a, concat(a, istr(a, q[0]), ","), istr(a, q[4])),
+               "10,11");
+        expect(t, "retina click", dkround(a, dk, "click|screen|7|8"), "0|");
+        expect(t, "retina click input", takehead(dklog(dk), 9), "move 7,8\n");
+
+        // The platform's reasons, where it has them, before the generic
+        // messages: a permission missing
+        dk->denied = "Accessibility permission is missing";
+        expect(t, "why", dkround(a, dk, "close|Notepad"),
+               "1|Accessibility permission is missing");
+        expect(t, "why taken", istr(a, dk->why.data!=0), "0");
+        dk->denied = {};
+        expect(t, "why none", dkround(a, dk, "close|Notepad"), "0|");
+        // A reason left over from an earlier command never explains a
+        // later failure
+        dk->why = "stale";
+        expect(t, "close screen", dkround(a, dk, "close|screen"),
+               "1|cannot close the screen");
+        expect(t, "access", dkround(a, dk, "access"), "0|thing\tmissing\n");
+        expect(t, "access ask", dkround(a, dk, "access|-ask"), "0|thing\tasked\n");
+        expect(t, "access bad", dkround(a, dk, "access|-x"), "1|unexpected argument '-x'");
     }
 }

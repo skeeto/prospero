@@ -291,6 +291,22 @@ static Str dk_os(Dk *)
     return "windows";
 }
 
+static Str dk_units(Dk *)
+{
+    return "pixels";  // physical, since the process is DPI aware
+}
+
+static Str dk_why(Dk *)
+{
+    return {};
+}
+
+// Windows asks no permission of a desktop program of the user's own.
+static b32 dk_access(Dk *, Buf *, b32)
+{
+    return 1;
+}
+
 // The visible frame. On Vista and later GetWindowRect includes invisible
 // resize borders, so prefer the DWM's frame bounds when available.
 static DkRect winrect(Dk *dk, uz hwnd)
@@ -449,10 +465,11 @@ static b32 dk_activate(Dk *dk, DkWin *w)
     return ok;
 }
 
-static u8 *dk_capture(Dk *, Arena *a, DkRect r)
+static u8 *dk_capture(Dk *, Arena *a, DkRect r, DkSize *size)
 {
     i32 w = r.right - r.left;
     i32 h = r.bottom - r.top;
+    *size = {w, h};
     // Copy the screen, not the window, so popups over it are included
     uz sdc = GetDC(0);
     uz mdc = CreateCompatibleDC(sdc);

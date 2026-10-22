@@ -155,26 +155,59 @@ if(APPLE AND PROSPERO_SIGN_IDENTITY)
     VERBATIM
   )
 endif()
+set_target_properties(prospero PROPERTIES OUTPUT_NAME ${PROSPERO_NAME})
+
+if(APPLE)
+  # The desktop helper (src/deskhelp.cpp), which the desktop tool runs
+  # from next to the harness: CoreGraphics, Accessibility and the
+  # Objective-C runtime's C functions, with ScreenCaptureKit and AppKit
+  # loaded at run time. Signed like the harness, since the privacy
+  # grants it needs belong to a signature.
+  set(prospero_desktop_libs prospero_core_flags
+      "-framework ApplicationServices" "-framework Carbon" objc)
+  add_executable(prospero-desktop src/main_desktop_macos.cpp)
+  target_link_libraries(prospero-desktop PRIVATE ${prospero_desktop_libs})
+  set_target_properties(prospero-desktop PROPERTIES
+    OUTPUT_NAME ${PROSPERO_NAME}-desktop)
+  if(PROSPERO_SIGN_IDENTITY)
+    # A fixed identifier too, which the grants name when it runs as its
+    # own responsible process, rather than one made from its file name
+    add_custom_command(TARGET prospero-desktop POST_BUILD
+      COMMAND codesign --force --timestamp=none
+              --identifier com.nullprogram.prospero.desktop
+              --sign ${PROSPERO_SIGN_IDENTITY} $<TARGET_FILE:prospero-desktop>
+      VERBATIM
+    )
+  endif()
+endif()
+
 if(APPLE AND PROSPERO_GUI)
   # The same binary, also wrapped as an application bundle, which macOS
-  # wants for a window of its own in the Dock and app switcher.
+  # wants for a window of its own in the Dock and app switcher, with the
+  # desktop helper beside it, where the harness looks. The bundle is
+  # put together, and signed, after both are built, since its signature
+  # seals the helper in it.
   set(prospero_signapp)
   if(PROSPERO_SIGN_IDENTITY)
     set(prospero_signapp COMMAND codesign --force --timestamp=none
                          --sign ${PROSPERO_SIGN_IDENTITY} Prospero.app)
   endif()
-  add_custom_command(TARGET prospero POST_BUILD
+  add_custom_command(OUTPUT Prospero.app/Contents/MacOS/prospero
     COMMAND ${CMAKE_COMMAND} -E make_directory Prospero.app/Contents/MacOS
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${PROJECT_SOURCE_DIR}/assets/Info.plist Prospero.app/Contents/Info.plist
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:prospero-desktop> Prospero.app/Contents/MacOS/prospero-desktop
+    COMMAND ${CMAKE_COMMAND} -E copy
             $<TARGET_FILE:prospero> Prospero.app/Contents/MacOS/prospero
     ${prospero_signapp}
+    DEPENDS prospero prospero-desktop ${PROJECT_SOURCE_DIR}/assets/Info.plist
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     VERBATIM
   )
+  add_custom_target(prospero-app ALL
+    DEPENDS ${CMAKE_BINARY_DIR}/Prospero.app/Contents/MacOS/prospero)
 endif()
-set_target_properties(prospero PROPERTIES OUTPUT_NAME ${PROSPERO_NAME})
 
 if(WIN32)
   # The desktop helper, a program of its own (src/deskhelp.cpp), which
@@ -219,6 +252,18 @@ if(NOT CMAKE_CROSSCOMPILING)
   endif()
   add_test(NAME unit COMMAND prospero_test)
   if(APPLE)
+    # The macOS desktop helper's own layer, which never touches the
+    # screen: its pure parts, and its commands without permissions
+    add_executable(prospero-desktop-test src/main_desktop_macos.cpp)
+    target_compile_definitions(prospero-desktop-test PRIVATE DK_SELFTEST=1)
+    target_link_libraries(prospero-desktop-test PRIVATE ${prospero_desktop_libs})
+    add_test(NAME desktop_unit COMMAND prospero-desktop-test)
+    if(UV)
+      # The helper itself, its commands and frames, permissions denied
+      add_test(NAME desktop COMMAND ${UV} run
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/desktop_macos.py
+        --helper $<TARGET_FILE:prospero-desktop>)
+    endif()
     # The HTTP edge with the test-only calls of its trust evaluation,
     # which asks the system's (Security.framework) about each chain
     add_executable(prospero_edgetest src/main_edgetest.cpp)
