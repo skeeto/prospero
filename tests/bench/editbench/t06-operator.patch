@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: router.js
+@@
+ 
+ function splitPath(path) {
+   const q = path.indexOf('?');
+-  const bare = q >= 0 ? path.slice(0, q) : path;
++  const bare = q > 0 ? path.slice(0, q) : path;
+   return bare.split('/').filter((s) => s.length > 0);
+ }
+ 
+*** End Patch

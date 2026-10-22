@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: ledger.py
+@@
+     def trial_balance(self, until=None):
+         """Each top-level account's balance; the sum is always zero."""
+         rows = []
+-        for key, account in sorted(self.accounts.items()):
++        for key, account in sorted(self.balance.items()):
+             if account.parent is None:
+                 rows.append((key, self.balance(key, until)))
+         return rows
+*** End Patch

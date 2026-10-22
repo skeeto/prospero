@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/layout.cpp
+@@
+     f32 *natural = alloc<f32>(perm, ncols);
+     for (i32 i = 0; i < n; i++) {
+         DocBlock *c  = &d->blocks[bi+i];
+-        f32    cw = 2*sp.pad;
++        f32    cw = 3*sp.pad;
+         for (i32 k = 0; k < c->npiece; k++) {
+             Piece *pc = &d->pieces[c->piece0+k];
+             cw += pc->flags&(PIECE_HARD|PIECE_SOFT)
+*** End Patch

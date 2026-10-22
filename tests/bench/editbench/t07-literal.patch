@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: ledger.py
+@@
+     for key in sorted(ledger.accounts):
+         account = ledger.accounts[key]
+         amount = ledger.normal_balance(key, until)
+-        if amount == 0:
++        if amount == 1:
+             continue
+         indent = "  " * account.depth()
+         lines.append(f"{indent}{account.name:<30}{format_cents(amount)}")
+*** End Patch

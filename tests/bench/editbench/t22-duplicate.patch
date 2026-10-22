@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: textutil.py
+@@
+     widths = [0] * max(len(r) for r in rows)
+     for row in rows:
+         for i, cell in enumerate(row):
+-            widths[i] = max(widths[i], len(str(cell)))
++            widths[i] = max(widths[i], len(str(cell)))
++            widths[i] = max(widths[i], len(str(cell)))
+     out = []
+     for row in rows:
+         cells = [str(c).ljust(widths[i]) for i, c in enumerate(row)]
+*** End Patch

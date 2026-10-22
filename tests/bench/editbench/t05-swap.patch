@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/compact.cpp
+@@
+     Slice<Str> parts = {};
+     for (iz i = beg; i < cut; i++) {
+         Msg *m = &h[i];
+-        Buf  b(&scratch, 256);
++        Buf  b(256, &scratch);
+         switch (m->role) {
+         case ROLE_USER:
+             print(&b, "[user]\n");
+*** End Patch

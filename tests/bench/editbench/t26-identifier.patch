@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: textutil.py
+@@
+         return text
+     keep = limit - len(ellipsis)
+     if keep <= 0:
+-        return ellipsis[:limit]
++        return rstrip[:limit]
+     cut = text.rfind(" ", 0, keep + 1)
+     if cut < keep // 2:
+         cut = keep
+*** End Patch

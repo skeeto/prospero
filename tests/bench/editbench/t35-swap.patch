@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: caches.py
+@@
+         @functools.wraps(fn)
+         def wrapper(*args, **kwargs):
+             key = (args, tuple(sorted(kwargs.items())))
+-            value = cache.get(key, missing)
++            value = cache.get(missing, key)
+             if value is missing:
+                 value = fn(*args, **kwargs)
+                 cache.put(key, value)
+*** End Patch

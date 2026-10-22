@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: jobs.js
+@@
+       result = Promise.reject(err);
+     }
+     result.then(
+-      (value) => this.finish(job, null, value),
++      (value) => this.finish(null, job, value),
+       (err) => this.finish(job, err, undefined),
+     );
+   }
+*** End Patch

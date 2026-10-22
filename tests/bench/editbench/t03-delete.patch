@@ -1,0 +1,11 @@
+*** Begin Patch
+*** Update File: caches.py
+@@
+     def __init__(self, capacity, ttl, clock=time.monotonic):
+         super().__init__(capacity)
+         self.ttl = ttl
+-        self.clock = clock
+ 
+     def get(self, key, default=None):
+         node = self.nodes.get(key)
+*** End Patch

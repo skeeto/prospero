@@ -1,0 +1,11 @@
+*** Begin Patch
+*** Update File: src/layout.cpp
+@@
+     if (!l->nrun) {
+         // An empty line: the end of the previous line's text, if any.
+         for (i32 k = li-1; k >= 0; k--) {
+-            Line *pl = &bl->lines[k];
+             if (pl->nrun) return runend(pieces, &bl->runs[pl->run0+pl->nrun-1]);
+         }
+         return b->off0;
+*** End Patch

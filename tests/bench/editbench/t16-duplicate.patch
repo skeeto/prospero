@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: src/wide.cpp
+@@
+             cmd[w++] = cmd[i];
+         }
+     }
+-    args = push(a, args, takehead(cmd, w));
++    args = push(a, args, takehead(cmd, w));
++    args = push(a, args, takehead(cmd, w));
+ 
+     for (;;) {
+         for (; i<cmd.len && (cmd[i]==' ' || cmd[i]=='\t'); i++) {}
+*** End Patch

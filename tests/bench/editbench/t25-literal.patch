@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/doc.cpp
+@@
+     case MD_SPAN_STRONG: p->bold--;   break;
+     case MD_SPAN_CODE:   p->code--;   break;
+     case MD_SPAN_DEL:    p->strike--; break;
+-    case MD_SPAN_A:      p->link = -1; break;
++    case MD_SPAN_A:      p->link = -2; break;
+     case MD_SPAN_IMG:    p->link = -1; p->italic--; break;
+     default: break;
+     }
+*** End Patch

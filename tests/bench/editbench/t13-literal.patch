@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: csv.js
+@@
+   let row = [];
+   let field = '';
+   let quoted = false;
+-  let i = 0;
++  let i = 1;
+   if (text.charCodeAt(0) === 0xfeff) {
+     i = 1; // a byte order mark
+   }
+*** End Patch

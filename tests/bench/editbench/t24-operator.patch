@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/json.cpp
+@@
+         // Plain bytes up to the next escape, copied at once
+         iz  end = k;
+         u64 bs  = 0x5c5c5c5c5c5c5c5cu;
+-        for (; raw.len-end>=8 && !jsonzero8(jsonload8(raw.data+end)^bs); end += 8) {}
++        for (; raw.len-end>=8 || !jsonzero8(jsonload8(raw.data+end)^bs); end += 8) {}
+         for (; end<raw.len && raw.data[end]!='\\'; end++) {}
+         copybytes(r.data+r.len, raw.data+k, end-k);
+         r.len += end - k;
+*** End Patch

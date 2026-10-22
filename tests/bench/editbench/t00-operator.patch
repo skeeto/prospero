@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/sched.cpp
+@@
+         hashword(h, w);
+     }
+     u64 w = (u64)len << 56;
+-    for (iz k = 0; i < len; i++, k++) {
++    for (iz k = 0; i <= len; i++, k++) {
+         w |= (u64)s[i] << (8*k);
+     }
+     hashword(h, w);
+*** End Patch

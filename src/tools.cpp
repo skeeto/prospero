@@ -1212,6 +1212,7 @@ static Str listdir(Os *os, Arena *a, Str cwd, Str path)
 struct ToolOut {
     Str text;   // what the agent sees
     Str wrote;  // the file's new content, if the tool changed it
+    Str fix;    // what an edit forgave (editrepair), null if nothing
     b32 ok;     // the call did what was asked
 };
 
@@ -1491,6 +1492,7 @@ static ToolOut tooledit(Os *os, Arena *a, Str cwd, Str path, Args *args)
     }
     r.text  = e.text;
     r.wrote = e.data;
+    r.fix   = editrepair(a, e.rung, e.forgave);
     r.ok    = 1;
     return r;
 }
@@ -1530,6 +1532,7 @@ struct FileChange {
 struct PatchPlan {
     Slice<FileChange> changes;
     Str               text;  // what was done, or why nothing can be
+    Str               fix;   // what was forgiven (editrepair), null if nothing
     b32               ok;
 };
 
@@ -1582,6 +1585,8 @@ static PatchPlan planpatch(Os *os, Arena *a, Str cwd, Patch *p, b32 win = 0)
 
     Buf done(a, 256);
     Buf notes(a, 256);
+    i32 rung    = RUNG_EXACT;
+    u32 forgave = p->forgave;
     for (iz i = 0; i < p->files.len; i++) {
         PatchFile *f    = &p->files[i];
         Str        show = showpath(cwd, f->file);
@@ -1625,6 +1630,8 @@ static PatchPlan planpatch(Os *os, Arena *a, Str cwd, Patch *p, b32 win = 0)
                 r.text = patchfailed(a, e.text);
                 return r;
             }
+            rung     = e.rung>rung ? e.rung : rung;
+            forgave |= e.forgave;
             if (f->fileto.len && f->fileto!=f->file) {
                 FileChange to = {f->fileto, e.data};
                 r.changes = push(a, r.changes, to);
@@ -1661,6 +1668,7 @@ static PatchPlan planpatch(Os *os, Arena *a, Str cwd, Patch *p, b32 win = 0)
     putbyte(&b, '.');
     print(&b, n);
     r.text = finish(&b);
+    r.fix  = editrepair(a, rung, forgave);
     r.ok   = 1;
     return r;
 }

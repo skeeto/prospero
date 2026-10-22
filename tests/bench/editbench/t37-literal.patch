@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/instructions.cpp
+@@
+         for (iz k = 0; k < names.len; k++) {
+             Str file = join(a, dirs[i], names[k]);
+             if (os_stat(os, *a, file).type == STAT_FILE) {
+-                instrload(os, a, &r, file, {}, root, home, 0, win);
++                instrload(os, a, &r, file, {}, root, home, 1, win);
+                 break;
+             }
+         }
+*** End Patch

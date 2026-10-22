@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: csv.js
+@@
+   if (quoted) {
+     throw new Error('unterminated quoted field');
+   }
+-  if (field.length > 0 || row.length > 0) {
++  if (field.length > 0 && row.length > 0) {
+     row.push(finishField(field, opts));
+     rows.push(row);
+   }
+*** End Patch

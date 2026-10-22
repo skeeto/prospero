@@ -9,37 +9,29 @@ Each task takes a real source file (some of this repository's src/*.cpp,
 and the Python and JavaScript fixtures here), applies one mutation to it
 (an operator swapped, a literal changed, an identifier renamed at one
 site, a line deleted, a line duplicated, or two arguments swapped), and
-asks the agent, through "prospero run", to fix the bug that one sentence
-describes. The run succeeds when the file is byte for byte the original
-afterward. The agent gets only read, edit, grep and glob (role "bench"),
-so that every change goes through the edit tool, in the format that
-[model] edit_format selects.
+asks the agent to fix the bug that one sentence describes. The run
+succeeds when the file is byte for byte the original afterward. The
+agent gets only read, edit, grep and glob, so that every change goes
+through the edit tool, in the format under test.
+
+This script makes the tasks; "prospero eval" runs them, as the suite in
+tests/bench/editbench (one task file and patch each, and a copy of each
+source file as it was when the suite was made):
 
   uv run tests/bench/editbench.py tasks [--count 40] [--seed 1]
-  uv run tests/bench/editbench.py run --prospero build/prospero \\
-      --models MODEL,... --formats replace,patch,hashline \\
-      --count 40 --runs 2 --jobs 4 --out results.jsonl
-  uv run tests/bench/editbench.py report --out results.jsonl
-  uv run tests/bench/editbench.py run ... --only t15-delete,t21-delete
+  uv run tests/bench/editbench.py suite [--count 40] [--seed 1] [--out DIR]
+  prospero eval -m MODEL,... -f all -n 2 -j 4 -o results.jsonl tests/bench/editbench
 
-run appends one JSON line per run to --out and skips runs already there,
-so an interrupted run continues where it stopped. --keep DIR keeps each
-run's JSONL output.
+The suite is kept as made, so that results stay comparable: making it
+again from the sources as they are now changes the tasks.
 """
 
 import argparse
 import collections
-import concurrent.futures
-import json
 import os
 import random
 import re
 import shutil
-import subprocess
-import sys
-import tempfile
-import threading
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -187,7 +179,7 @@ def candidates(path, text, rng):
 
         # A literal changed
         nums = re.findall(r"(?<![\w.])(\d+)(?![\w.])", line)
-        for num in set(nums):
+        for num in sorted(set(nums)):  # sorted: sets follow the hash seed
             if nums.count(num) != 1 or len(num) > 6:
                 continue
             new = re.sub(rf"(?<![\w.]){num}(?![\w.])", str(int(num) + 1), line, count=1)
@@ -205,7 +197,7 @@ def candidates(path, text, rng):
             if function_of(lang, lines, k) == func:
                 body.extend(re.findall(r"\b[A-Za-z_]\w{2,}\b", lines[k]))
         pool = sorted(set(w for w in body if w not in KEYWORDS[lang]))
-        for name in set(idents):
+        for name in sorted(set(idents)):
             if (len(name) < 3 or name in KEYWORDS[lang] or idents.count(name) != 1 or
                     name == func):
                 continue
@@ -286,136 +278,92 @@ def prompt_of(task):
             f"need to build, run or test anything.")
 
 
-# Running
+# The suite: each task as prospero eval runs it
 
-CONFIG = """endpoint = bench
-
-[endpoint bench]
-url = {url}
-
-[model {model}]
-edit_format = {format}
-
-[role bench]
-description = Fixes one bug with the file tools
-tools = read edit grep glob
-
-[instructions]
-files = NO-INSTRUCTIONS-FOR-THE-BENCHMARK.md
+SUITE_INI = """# The edit-format benchmark as a suite for prospero eval, made by
+# tests/bench/editbench.py suite from the sources as they were then,
+# which files/ keeps: regenerate it only to change the benchmark.
+#
+# Each task restores one line of one file that its patch broke, with
+# the file tools alone, so that every change goes through the edit tool.
+tools   = read edit grep glob
+timeout = 600
+steps   = 100
 """
 
 
-def run_one(args, root, task, model, fmt, run):
-    base = tempfile.mkdtemp(prefix=f"{task['id']}-", dir=root)
-    work = os.path.join(base, "work")
-    state = os.path.join(base, "state")
-    os.makedirs(os.path.join(work, os.path.dirname(task["path"])), exist_ok=True)
-    os.makedirs(state)
-    target = os.path.join(work, task["path"])
-    with open(target, "wb") as f:
-        f.write(task["mutated"].encode("utf-8"))
-    config = os.path.join(base, "prospero.ini")
-    with open(config, "w") as f:
-        f.write(CONFIG.format(url=args.endpoint, model=model, format=fmt))
-    cmd = [os.path.abspath(args.prospero), "run", "-C", work, "--state", state,
-           "-c", config, "-e", "bench", "-m", model, "-r", "bench", prompt_of(task)]
-    t0 = time.monotonic()
-    timed_out = False
-    try:
-        p = subprocess.run(cmd, capture_output=True, timeout=args.timeout)
-        out, rc = p.stdout, p.returncode
-    except subprocess.TimeoutExpired as e:
-        out, rc, timed_out = e.stdout or b"", -1, True
-    wall = time.monotonic() - t0
-    with open(target, "rb") as f:
-        final = f.read()
-
-    rec = {"model": model, "format": fmt, "task": task["id"], "kind": task["kind"],
-           "lang": language(task["path"]), "run": run, "rc": rc, "timeout": timed_out,
-           "wall": round(wall, 1), "ok": final == task["original"].encode("utf-8"),
-           "unchanged": final == task["mutated"].encode("utf-8"),
-           "calls": 0, "edits": 0, "edit_errors": 0, "reads": 0, "steps": 0,
-           "in": 0, "out": 0, "cached": 0, "why": None}
-    for line in out.decode("utf-8", "replace").splitlines():
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        name = ev.get("ev")
-        if name == "tool.start":
-            rec["calls"] += 1
-            rec["edits"] += ev.get("name") == "edit"
-            rec["reads"] += ev.get("name") == "read"
-        elif name == "tool.end" and ev.get("status") != "ok":
-            # Which call it ends: edits are the ones that matter
-            rec.setdefault("_bad", []).append(ev.get("call"))
-        elif name == "assistant":
-            rec["steps"] += 1
-            u = ev.get("usage") or {}
-            rec["in"] += u.get("in", 0)
-            rec["out"] += u.get("out", 0)
-            rec["cached"] += u.get("cached", 0)
-        elif name == "turn.end":
-            rec["why"] = ev.get("why")
-    starts = {}
-    for line in out.decode("utf-8", "replace").splitlines():
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        if ev.get("ev") == "tool.start":
-            starts[ev.get("call")] = ev.get("name")
-    rec["edit_errors"] = sum(1 for c in rec.pop("_bad", []) if starts.get(c) == "edit")
-    if args.keep:
-        d = os.path.join(args.keep, model, fmt)
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, f"{task['id']}-{run}.jsonl"), "wb") as f:
-            f.write(out)
-    shutil.rmtree(base, ignore_errors=True)
-    return rec
+def stem(path):
+    return os.path.splitext(os.path.basename(path))[0]
 
 
-def cmd_run(args):
-    tasks = make_tasks(args.count, args.seed)
-    if args.only:
-        tasks = [t for t in tasks if t["id"] in args.only.split(",")]
-    done = set()
-    if os.path.exists(args.out):
-        with open(args.out) as f:
-            for line in f:
-                r = json.loads(line)
-                done.add((r["model"], r["format"], r["task"], r["run"]))
-    todo = []
-    for run in range(args.runs):
-        for model in args.models.split(","):
-            for fmt in args.formats.split(","):
-                for t in tasks:
-                    if (model, fmt, t["id"], run) not in done:
-                        todo.append((t, model, fmt, run))
-    # Interleave models and formats, so that a partial run is balanced
-    random.Random(args.seed).shuffle(todo)
-    print(f"{len(todo)} runs to do, {len(done)} done before", file=sys.stderr)
-    root = tempfile.mkdtemp(prefix="editbench-")
-    lock = threading.Lock()
-    finished = 0
-    t0 = time.monotonic()
-    try:
-        with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-            futs = [pool.submit(run_one, args, root, *x) for x in todo]
-            for fut in concurrent.futures.as_completed(futs):
-                rec = fut.result()
-                with lock:
-                    with open(args.out, "a") as f:
-                        f.write(json.dumps(rec) + "\n")
-                    finished += 1
-                    rate = (time.monotonic() - t0) / finished
-                    print(f"[{finished}/{len(todo)}] {rec['model']:<12} {rec['format']:<9} "
-                          f"{rec['task']:<16} {'ok  ' if rec['ok'] else 'FAIL'} "
-                          f"{rec['wall']:6.1f} s  {rec['calls']} calls  "
-                          f"(~{rate * (len(todo) - finished) / 60:.0f} min left)",
-                          file=sys.stderr, flush=True)
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
+def lines_of(text):
+    """The lines of a text that ends in a newline, without it."""
+    lines = text.split("\n")
+    return lines[:-1] if lines and lines[-1] == "" else lines
+
+
+def runs_at(lines, block):
+    return sum(1 for i in range(len(lines) - len(block) + 1)
+               if lines[i:i + len(block)] == block)
+
+
+def patch_of(task):
+    """The mutation as a patch in the edit tool's format (*** Begin Patch),
+    with context enough around it to fit one place only."""
+    orig = lines_of(task["original"])
+    i = task["line"] - 1
+    new = {"delete": [], "duplicate": [orig[i], orig[i]]}.get(task["kind"])
+    if new is None:
+        new = [lines_of(task["mutated"])[i]]
+    for ctx in range(3, len(orig)):
+        lo, hi = max(0, i - ctx), min(len(orig), i + 1 + ctx)
+        if runs_at(orig, orig[lo:hi]) == 1:
+            break
+    else:
+        raise SystemExit(f"{task['id']}: no unique context")
+    body = ([" " + l for l in orig[lo:i]] + ["-" + orig[i]] + ["+" + l for l in new] +
+            [" " + l for l in orig[i + 1:hi]])
+    # Applied as the harness will, it must give the mutated file
+    got = orig[:lo] + orig[lo:i] + new + orig[i + 1:hi] + orig[hi:]
+    if "\n".join(got) + "\n" != task["mutated"]:
+        raise SystemExit(f"{task['id']}: the patch does not give the mutated file")
+    return ("*** Begin Patch\n*** Update File: " + task["path"] + "\n@@\n" +
+            "\n".join(body) + "\n*** End Patch\n")
+
+
+def cmd_suite(args):
+    """Write the suite: suite.ini, a task file and a patch for each task,
+    and files/STEM/PATH, a copy of each file the tasks change."""
+    out = args.out
+    if os.path.isdir(out):
+        for name in os.listdir(out):
+            if name.endswith((".ini", ".patch")):
+                os.remove(os.path.join(out, name))
+        shutil.rmtree(os.path.join(out, "files"), ignore_errors=True)
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "suite.ini"), "w", newline="\n") as f:
+        f.write(SUITE_INI)
+    for t in make_tasks(args.count, args.seed):
+        files = f"files/{stem(t['path'])}"
+        dest = os.path.join(out, files, *t["path"].split("/"))
+        if not os.path.exists(dest):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(t["original"].encode("utf-8"))
+        with open(os.path.join(out, t["id"] + ".patch"), "w", newline="\n") as f:
+            f.write(patch_of(t))
+        with open(os.path.join(out, t["id"] + ".ini"), "w", newline="\n") as f:
+            f.write(f"# {t['kind']}: {t['path']}, line {t['line']}\n"
+                    f"prompt  = \"{ini_quote(prompt_of(t))}\"\n"
+                    f"fixture = {files}\n"
+                    f"patch   = {t['id']}.patch\n"
+                    f"expect  = {files}\n")
+    print(f"wrote {args.count} tasks to {out}")
+
+
+def ini_quote(s):
+    """A value for a quoted INI value: only \\ and \" are escaped."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def cmd_tasks(args):
@@ -423,103 +371,17 @@ def cmd_tasks(args):
         print(f"{t['id']}  {t['path']}:{t['line']}\n  {prompt_of(t)}\n")
 
 
-# Reporting
-
-def mean(xs):
-    xs = list(xs)
-    return sum(xs) / len(xs) if xs else 0.0
-
-
-def cmd_report(args):
-    recs = []
-    with open(args.out) as f:
-        for line in f:
-            recs.append(json.loads(line))
-    cells = collections.defaultdict(list)
-    for r in recs:
-        cells[(r["model"], r["format"])].append(r)
-    models = sorted({r["model"] for r in recs}, key=lambda m: (m != "large", m))
-    formats = [f for f in ("replace", "patch", "hashline") if any(r["format"] == f for r in recs)]
-
-    # As RESULTS.md has it: tool calls, reads, tokens and wall time are
-    # means per run, failed edits totals per cell
-    print("| model | format | runs | success | tool calls | reads | failed edits "
-          "| tokens in | tokens out | wall s |")
-    print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for m in models:
-        for fmt in formats:
-            rs = cells.get((m, fmt), [])
-            if not rs:
-                continue
-            ok = sum(r["ok"] for r in rs)
-            print(f"| {m} | {fmt} | {len(rs)} | {100 * ok / len(rs):.1f}% ({ok}) "
-                  f"| {mean(r['calls'] for r in rs):.1f} | {mean(r['reads'] for r in rs):.2f} "
-                  f"| {sum(r['edit_errors'] for r in rs)} "
-                  f"| {mean(r['in'] for r in rs):,.0f} | {mean(r['out'] for r in rs):,.0f} "
-                  f"| {mean(r['wall'] for r in rs):.0f} |")
-    print()
-    print("Success by mutation kind:\n")
-    print("| model | format | " + " | ".join(KINDS) + " |")
-    print("|---|---|" + "---:|" * len(KINDS))
-    for m in models:
-        for fmt in formats:
-            rs = cells.get((m, fmt), [])
-            if not rs:
-                continue
-            row = []
-            for k in KINDS:
-                kr = [r for r in rs if r["kind"] == k]
-                row.append(f"{sum(r['ok'] for r in kr)}/{len(kr)}" if kr else "-")
-            print(f"| {m} | {fmt} | " + " | ".join(row) + " |")
-    print()
-    print("Success by language:\n")
-    langs = [l for l in ("cpp", "py", "js") if any(r["lang"] == l for r in recs)]
-    print("| model | format | " + " | ".join(langs) + " |")
-    print("|---|---|" + "---:|" * len(langs))
-    for m in models:
-        for fmt in formats:
-            rs = cells.get((m, fmt), [])
-            if not rs:
-                continue
-            row = []
-            for l in langs:
-                lr = [r for r in rs if r["lang"] == l]
-                row.append(f"{sum(r['ok'] for r in lr)}/{len(lr)}" if lr else "-")
-            print(f"| {m} | {fmt} | " + " | ".join(row) + " |")
-    print()
-    print("Failures: file left as mutated (no fix) / changed but wrong / timed out:\n")
-    for m in models:
-        for fmt in formats:
-            rs = [r for r in cells.get((m, fmt), []) if not r["ok"]]
-            if not rs:
-                continue
-            un = sum(r["unchanged"] for r in rs)
-            to = sum(r["timeout"] for r in rs)
-            print(f"- {m} {fmt}: {un} / {len(rs) - un - to} / {to}")
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("tasks")
-    r = sub.add_parser("run")
-    p = sub.add_parser("report")
-    for a in (t, r):
+    s = sub.add_parser("suite")
+    for a in (t, s):
         a.add_argument("--count", type=int, default=40)
         a.add_argument("--seed", type=int, default=1)
-    r.add_argument("--prospero", required=True)
-    r.add_argument("--models", required=True, help="models, separated by commas")
-    r.add_argument("--formats", default="replace,patch,hashline")
-    r.add_argument("--runs", type=int, default=2)
-    r.add_argument("--jobs", type=int, default=4)
-    r.add_argument("--timeout", type=float, default=600)
-    r.add_argument("--endpoint", default="http://localhost/")
-    r.add_argument("--keep", help="keep each run's output under this directory")
-    r.add_argument("--only", help="only these tasks, by id, separated by commas")
-    for a in (r, p):
-        a.add_argument("--out", default="editbench.jsonl")
+    s.add_argument("--out", default=os.path.join(HERE, "editbench"))
     args = ap.parse_args()
-    {"tasks": cmd_tasks, "run": cmd_run, "report": cmd_report}[args.cmd](args)
+    {"tasks": cmd_tasks, "suite": cmd_suite}[args.cmd](args)
 
 
 if __name__ == "__main__":

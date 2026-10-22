@@ -1,0 +1,11 @@
+*** Begin Patch
+*** Update File: router.js
+@@
+ 
+ function serverError(res, err) {
+   const message = err && err.message ? err.message : String(err);
+-  send(res, 500, { error: message });
+ }
+ 
+ function redirect(res, location, status) {
+*** End Patch

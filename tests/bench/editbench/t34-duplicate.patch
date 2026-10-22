@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: src/layout.cpp
+@@
+     w->x        = w->x0;
+     w->run0     = (i32)bl->runs.len;
+     w->canbreak = 0;
+-    FontMetrics f = w->m->font(w->m->ctx, 0);
++    FontMetrics f = w->m->font(w->m->ctx, 0);
++    FontMetrics f = w->m->font(w->m->ctx, 0);
+     w->lineh  = f.lineh;
+     w->ascent = f.ascent;
+ }
+*** End Patch

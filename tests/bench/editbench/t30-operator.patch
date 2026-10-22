@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/mailbox.cpp
+@@
+         if (!block && m->overflow) {
+             os_unlock(&m->lock);
+             return 0;
+-        } else if (need <= m->cap - m->len) {
++        } else if (need <= m->cap + m->len) {
+             break;
+         } else if (!block) {
+             // Any record fits an empty buffer, so this buffer holds a
+*** End Patch

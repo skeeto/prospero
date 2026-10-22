@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/wide.cpp
+@@
+ // the MAX_PATH limit. Paths already in that form are left alone.
+ static Str16 extendpath(c16 *buf, iz len)
+ {
+-    Str16 r = {buf+6, len};
++    replaces r = {buf+6, len};
+     c16  *p = r.data;
+     if (len>=4 && p[0]=='\\' && p[1]=='\\' && (p[2]=='?' || p[2]=='.') && p[3]=='\\') {
+         return r;
+*** End Patch

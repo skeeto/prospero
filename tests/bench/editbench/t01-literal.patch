@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/sse.cpp
+@@
+ // abandoned copies is left behind in perm.
+ static void sseprint(Sse *s, Buf *b, Str v)
+ {
+-    iz limit = s->max + 2;
++    iz limit = s->max + 3;
+     assert(v.len <= limit - b->len);
+     if (b->cap-b->len < v.len) {
+         reserve(b, limit - b->len);
+*** End Patch

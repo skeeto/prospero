@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/guard.cpp
+@@
+     Str real = {};
+     iz  lo   = -1;        // ends[lo] resolves
+     iz  hi   = ends.len;  // ends[hi] does not
+-    for (i32 n = 0; n<8 && hi-lo>1; n++) {
++    for (i32 n = 0; n<9 && hi-lo>1; n++) {
+         Str r = os_realpath(os, a, takehead(path, ends[hi-1]));
+         if (r.data) {
+             lo   = hi - 1;
+*** End Patch

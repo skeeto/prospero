@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: src/json.cpp
+@@
+ // Close the innermost object or array.
+ static void putend(JsonOut *w)
+ {
+-    assert(w->depth>0 && !w->haskey);
++    assert(w->depth>0 && !w->haskey);
++    assert(w->depth>0 && !w->haskey);
+     w->depth--;
+     putbyte(w->b, w->objects>>w->depth & 1 ? '}' : ']');
+     w->comma = 1;
+*** End Patch

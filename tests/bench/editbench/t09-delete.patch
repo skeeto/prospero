@@ -1,0 +1,11 @@
+*** Begin Patch
+*** Update File: src/base.cpp
+@@
+     if (m) {
+         for (; e >  22; e -= 22) v *= 1e22;
+         for (; e < -22; e += 22) v /= 1e22;
+-        v = e<0 ? v/pow10[-e] : v*pow10[e];
+     }
+     r.val = neg ? -v : v;
+     r.ok  = 1;
+*** End Patch

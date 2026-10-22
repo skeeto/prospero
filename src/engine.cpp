@@ -432,6 +432,8 @@ struct Session {
     Slice<Block> calls;
     iz           callidx;
     i64          callstart;
+    Str          callfail;   // why the current call failed, for tool.end
+    Str          callfix;    // what was forgiven in its edit (editrepair)
     Proc        *proc;
     u64          procid;
     ShellRun     sh;
@@ -501,6 +503,10 @@ struct Session {
     i64          treqs;      // requests made for the task
     Slice<TaskRun> tasks;    // the subagents of the calls running
     b32          parkme;     // idle long enough: park it (enginethread)
+    // Limits a frontend set (new), as an eval does
+    i64          stepmax;    // model requests a turn, 0 for STEP_HARD
+    b32          projinstr;  // the project's instruction files, not the user's
+    b32          forget;     // closed: drop it from memory once idle
 };
 
 // Engine functions take scratch by value, so that whatever a caller has
@@ -2209,20 +2215,40 @@ static u64 callsethash(Arena scratch, Slice<Block> calls)
     return sum;
 }
 
+// What the harness forgave in a call that ran: its arguments' syntax
+// (repairargs), and in an edit what editrepair says. Null if nothing.
+static Str callrepair(Arena *a, Block *c, Str fix)
+{
+    Str args = repairargs(a, c->args).how;
+    if (args.len && fix.len) {
+        return concat(a, concat(a, args, "; "), fix);
+    }
+    return args.len ? args : fix;
+}
+
 // End the current call. A command moved to the background names its
-// job, and a task its subagent's session.
+// job, and a task its subagent's session. Why it failed (callfail) and
+// what was forgiven (callrepair) go into the record too, so that an
+// eval can count them by kind.
 static void toolend(Session *s, Arena scratch, Str status, Str text,
                     i32 code, b32 hascode, Str spill, i64 bytes, i64 job = 0,
                     Str child = {})
 {
-    Engine *e = s->e;
-    Block  *c = &s->calls[s->callidx];
+    Engine *e      = s->e;
+    Block  *c      = &s->calls[s->callidx];
+    Str     repair = status=="cancelled" ? Str{} : callrepair(&scratch, c, s->callfix);
     Buf     b(&scratch, 512 + text.len);
     EvOut   w = sbegin(s, &b, EV_TOOLEND);
     putstrkey(&w.json, "call", c->id);
     putstrkey(&w.json, "status", status);
     if (hascode) {
         putintkey(&w.json, "exit", code);
+    }
+    if (s->callfail.len) {
+        putstrkey(&w.json, "fail", s->callfail);
+    }
+    if (repair.len) {
+        putstrkey(&w.json, "repair", repair);
     }
     putstrkey(&w.json, "text", text);
     if (spill.len) {
@@ -2250,6 +2276,8 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     if (done && toolmutates(toolfind(c->name))) {
         s->mutations++;
     }
+    s->callfail = {};
+    s->callfix  = {};
     s->callidx++;
 }
 
@@ -2570,9 +2598,11 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
     }
     PatchPlan plan = planpatch(e->os, &scratch, s->guard.cwd, p, s->te.windows);
     if (!plan.ok) {
+        s->callfail = "miss";
         toolend(s, scratch, "error", plan.text, 0, 0, {}, 0);
         return;
     }
+    s->callfix = plan.fix;
     iz made = 0;
     for (; made < plan.changes.len; made++) {
         FileChange *c   = &plan.changes[made];
@@ -2642,6 +2672,8 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     if (o.ok) {
         instrlazy(s, scratch, path);
     }
+    s->callfail = tool==TOOL_EDIT && !o.ok ? Str("miss") : Str{};
+    s->callfix  = o.fix;
     toolend(s, scratch, o.ok ? Str("ok") : Str("error"), o.text, 0, 0, {}, 0);
     return 1;
 }
@@ -3674,16 +3706,19 @@ static b32 runtool(Session *s, Arena scratch)
         print(&b, " with these arguments again: do something different, or "
                   "give your final answer.");
         Str text = finish(&b);
+        s->callfail = "loop";
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
         return 1;
     }
 
     if (tool == TOOL_NONE) {
         Str text = unknowntool(&scratch, c->name, s->te.deny);
+        s->callfail = "unknown";
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
         return 1;
     }
     if (args.issues.len) {
+        s->callfail = "args";
         Str text = argserror(&scratch, c->name, c->args, &args);
         if (s->lengthcut && s->callidx==s->calls.len-1) {
             text = concat(&scratch, text, " Your response hit the length "
@@ -4174,10 +4209,18 @@ static void prepare(Session *s, Arena scratch)
 
     s->steps++;
     s->retries = 0;
-    if (s->steps == STEP_SOFT) {
-        note(s, scratch, "warn", "this turn has made 200 model requests; it ends at 300");
-    } else if (s->steps > STEP_HARD) {
-        endturn(s, scratch, "budget", "the turn reached its limit of 300 model requests");
+    i64 hard = s->stepmax ? s->stepmax : STEP_HARD;
+    if (s->steps==STEP_SOFT && hard>STEP_SOFT) {
+        Buf b(&scratch, 128);
+        print(&b, "this turn has made 200 model requests; it ends at ");
+        print(&b, hard);
+        note(s, scratch, "warn", finish(&b));
+    } else if (s->steps > hard) {
+        Buf b(&scratch, 128);
+        print(&b, "the turn reached its limit of ");
+        print(&b, hard);
+        print(&b, hard==1 ? Str(" model request") : Str(" model requests"));
+        endturn(s, scratch, "budget", finish(&b));
         return;
     }
 
@@ -4596,10 +4639,11 @@ static void instrstart(Session *s, Arena scratch)
     if (s->instr.data) {
         return;
     }
-    Str          cwd   = normpath(&scratch, s->cwd, ".", s->te.windows);
-    Slice<Str>   names = instrlist(s, &scratch);
-    Instructions in    = instructions(e->os, &scratch, cwd, e->global, names,
-                                      e->home, s->te.windows);
+    Str          cwd    = normpath(&scratch, s->cwd, ".", s->te.windows);
+    Slice<Str>   names  = instrlist(s, &scratch);
+    Str          global = s->projinstr ? Str{} : e->global;
+    Instructions in     = instructions(e->os, &scratch, cwd, global, names,
+                                       e->home, s->te.windows);
     s->instr = in.text.data ? clone(&s->perm, in.text) : Str{(u8 *)"", 0};
     instrstamp(s, in.files);
 
@@ -4802,6 +4846,9 @@ static void logsession(Session *s, Arena scratch)
     }
     if (s->te.edit != EDIT_REPLACE) {
         putstrkey(&w.json, "edit_format", editnames[s->te.edit]);
+    }
+    if (s->stepmax) {
+        putintkey(&w.json, "steps", s->stepmax);
     }
     ssend(s, &w);
 }
@@ -5298,6 +5345,28 @@ static void park(Engine *e, Session *s)
     dropsession(e, s);
 }
 
+// A session closed with forget may go once nothing runs in it, whatever
+// it would have told the agent next: nobody will open it again here.
+static b32 forgettable(Session *s)
+{
+    for (Job *j = s->jobs; j; j = j->next) {
+        if (j->state != JOB_DONE) {
+            return 0;
+        }
+    }
+    return !busy(s) && !s->intask && !s->http && !s->ctl && s->slot==SLOT_NONE;
+}
+
+// Drop a session from memory for good, its lock released. Its log stays,
+// for an open to read.
+static void forget(Engine *e, Session *s)
+{
+    for (Session *t = e->sessions; t; t = t->next) {
+        t->parent = t->parent==s ? 0 : t->parent;
+    }
+    dropsession(e, s);
+}
+
 static iz parkedat(Engine *e, Str sid)
 {
     for (iz i = 0; i < e->parked.len; i++) {
@@ -5365,18 +5434,64 @@ static b32 jsonflag(Json *j, b32 dflt)
     return j->type==JSON_BOOL ? j->boolean : jsonint(j, dflt)!=0;
 }
 
-// new {cwd, model?, endpoint?, role?, roots?, attended?, prompt?}: the
-// model and endpoint given, else the role's, else the configuration's.
+// The first word of a tool list that names no tool, or null.
+static Str unknowntools(Str list)
+{
+    for (Str rest = list; rest.len;) {
+        iz i = 0;
+        for (; i<rest.len && (whitespace(rest[i]) || rest[i]==','); i++) {}
+        rest = cuthead(rest, i);
+        for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
+        Str word = takehead(rest, i);
+        if (word.len && toolfind(word)==TOOL_NONE) {
+            return word;
+        }
+        rest = cuthead(rest, i);
+    }
+    return {};
+}
+
+// new {cwd, model?, endpoint?, role?, roots?, attended?, prompt?,
+//      edit_format?, tools?, steps?, instructions?}: the model and
+// endpoint given, else the role's, else the configuration's. The rest
+// are for runs that must not depend on the configuration, as an eval's:
+// the edit format instead of the model's, only the tools listed (of the
+// role's, if any), at most steps model requests a turn (up to 300), and
+// with instructions "project", none of the user's own instruction file.
 static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str  cwd   = jsonstr(jsonget(j, "cwd"));
     Str  model = jsonstr(jsonget(j, "model"));
     Str  which = jsonstr(jsonget(j, "endpoint"));
     Str  name  = jsonstr(jsonget(j, "role"));
+    Str  fmt   = trim(jsonstr(jsonget(j, "edit_format")));
+    Str  tools = jsonstr(jsonget(j, "tools"));
+    i64  steps = jsonint(jsonget(j, "steps"), 0);
+    Str  instr = jsonstr(jsonget(j, "instructions"));
     Role role  = name.len ? findrole(e, name) : Role{};
     if (name.len && !role.ok) {
         Str err = concat(&scratch, "no such role: ", name);
         reply(e, scratch, id, 0, err, {});
+        return;
+    }
+    if (fmt.len && !equalfold(editnames[editformat(fmt)], fmt)) {
+        Str err = concat(&scratch, "no such edit format: ", fmt);
+        reply(e, scratch, id, 0, err, {});
+        return;
+    }
+    Str bad = unknowntools(tools);
+    if (bad.len) {
+        Str err = concat(&scratch, "no such tool: ", bad);
+        reply(e, scratch, id, 0, err, {});
+        return;
+    } else if (tools.data && !trim(tools).len) {
+        reply(e, scratch, id, 0, "tools lists no tool", {});
+        return;
+    } else if (steps<0 || steps>STEP_HARD) {
+        reply(e, scratch, id, 0, "steps must be 1 to 300", {});
+        return;
+    } else if (instr.len && instr!="all" && instr!="project") {
+        reply(e, scratch, id, 0, "instructions must be all or project", {});
         return;
     }
     if (!which.len) which = role.endpoint;
@@ -5411,18 +5526,20 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "out of memory", {});
         return;
     }
-    s->cwd      = clone(&s->perm, real);
-    s->model    = clone(&s->perm, model);
-    s->attended = jsonflag(jsonget(j, "attended"), 0);
-    s->role     = clone(&s->perm, role.name);
-    s->rolepr   = clone(&s->perm, role.prompt);
-    s->te.deny  = role.deny;
+    s->cwd       = clone(&s->perm, real);
+    s->model     = clone(&s->perm, model);
+    s->attended  = jsonflag(jsonget(j, "attended"), 0);
+    s->role      = clone(&s->perm, role.name);
+    s->rolepr    = clone(&s->perm, role.prompt);
+    s->te.deny   = role.deny | (tools.data ? tooldeny(tools) : 0);
+    s->stepmax   = steps<STEP_HARD ? steps : 0;
+    s->projinstr = instr == "project";
     for (iz i = 0; i < roots.len; i++) {
         s->roots = push(&s->perm, s->roots, clone(&s->perm, roots[i]));
     }
     endpointconf(e, &s->perm, which, &s->ep);
     modelconf(e, &s->perm, model, &s->mc);
-    s->te.edit = s->mc.edit;
+    s->te.edit = fmt.len ? editformat(fmt) : s->mc.edit;
 
     Str why = opensession(s, scratch);
     if (why.data) {
@@ -5659,6 +5776,8 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             }
             // Its edit format as it began: absent, the first one
             s->te.edit = editformat(jsonstr(jsonget(j, "edit_format")));
+            i64 steps  = jsonint(jsonget(j, "steps"), 0);
+            s->stepmax = steps>0 && steps<STEP_HARD ? steps : 0;
         } break;
         case EV_TITLE:
             s->title = clone(&s->perm, jsonstr(jsonget(j, "text")));
@@ -6493,9 +6612,13 @@ static void command(Engine *e, Arena scratch, Str line)
         cmdfile(e, s, scratch, id, j);
         return;
     case CMD_CLOSE:
-        // Nobody is left to answer asks, nor to need background jobs
+        // Nobody is left to answer asks, nor to need background jobs.
+        // With forget, the session leaves memory, its lock released, as
+        // soon as nothing goes on in it (enginethread): an eval's runs
+        // are many, and none is opened again.
         reply(e, scratch, id, 1, {}, sid);
         s->attended = 0;
+        s->forget   = jsonflag(jsonget(j, "forget"), 0);
         if (!s->readonly) {
             s->closed = 1;
             stopjobs(s, scratch, 0);
@@ -6805,8 +6928,10 @@ static void enginethread(void *arg)
         }
         for (Session **p = &e->sessions; *p;) {
             Session *s = *p;
-            if (s->parkme && parkable(s)) {
-                park(e, s);  // unlinks it: *p is the next
+            if (s->forget && forgettable(s)) {
+                forget(e, s);  // unlinks it: *p is the next
+            } else if (s->parkme && parkable(s)) {
+                park(e, s);
             } else {
                 s->parkme = 0;
                 p = &s->next;

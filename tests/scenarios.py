@@ -909,6 +909,13 @@ def repair(t):
     t.check(t.file("x.txt") is None, "truncated arguments not acted on")
     err = r.all("tool.end")[2]["text"]
     t.check("Invalid arguments" in err and "call the tool again" in err, f"how to fix: {err}")
+    # The record says what was repaired, and why the last call failed
+    ends = r.all("tool.end")
+    t.check([e.get("repair") for e in ends] ==
+            ["raw control characters escaped",
+             "arguments were a JSON string holding the object", None] and
+            [e.get("fail") for e in ends] == [None, None, "args"],
+            f"repair and fail: {[(e.get('repair'), e.get('fail')) for e in ends]}")
     # Later requests carry valid JSON arguments, never the broken text
     for m in t.requests()[-1]["body"]["messages"]:
         for c in m.get("tool_calls", []):
@@ -922,6 +929,7 @@ def unknown_tool(t):
     end = r.all("tool.end")[0]
     t.check(end["status"] == "error" and 'Did you mean "shell"' in end["text"],
             f"suggests the right tool: {end['text']}")
+    t.check(end.get("fail") == "unknown", f"fail {end.get('fail')}")
 
 
 @scenario(bound=10)
@@ -931,6 +939,8 @@ def same_call(t):
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     st = [e["status"] for e in r.all("tool.end")]
     t.check(st == ["ok"] * 4 + ["error"] * 2, f"the guard trips at 5: {st}")
+    fails = [e.get("fail") for e in r.all("tool.end")]
+    t.check(fails == [None] * 4 + ["loop"] * 2, f"fail {fails}")
     t.check([n["kind"] for n in r.all("nudge")] == ["guard", "guard"],
             f"redirects: {[n['kind'] for n in r.all('nudge')]}")
     t.check(r.last("turn.end").get("why") == "done", "the turn still ends well")
@@ -2870,6 +2880,10 @@ def edit_patch(t):
             "deleted old.txt.", f"result {ends[0]['text']!r}")
     t.check(ends[1]["text"].startswith("The patch was not applied, and no file was changed: "
                                        "hunk 1 of hello.txt"), f"error {ends[1]['text']!r}")
+    t.check([(e.get("fail"), e.get("repair")) for e in ends] ==
+            [(None, "text around the patch, kept lines without their space"),
+             ("miss", None), (None, None)],
+            f"fail and repair {[(e.get('fail'), e.get('repair')) for e in ends]}")
     t.check(t.file("hello.txt") == "greet\nhello\nthere\n" and
             t.file("sub/new.txt") == "fresh\n" and t.file("old.txt") is None,
             f"files {t.file('hello.txt')!r} {t.file('sub/new.txt')!r} {t.file('old.txt')!r}")
@@ -3764,6 +3778,287 @@ def an_auth(t):
     end = r.last("turn.end")
     t.check(r.rc == 1 and "which is not set where the engine runs" in end.get("err", ""),
             f"unset: {end}")
+
+
+# prospero eval: suites of tasks run against the scripted agents of
+# fake_provider.py (sc_eval_*), whose numbers are known
+
+EVAL_SUITE = {
+    "suite.ini": "# Every task\ntimeout = 30\nsteps = 10\n",
+    "base/greet.txt": "Hello, world!\nBye.\n",
+    "count/count.txt": "one\n",
+    "typo.ini": "prompt = Change wrold to world in greet.txt.\nfixture = base\n"
+                "patch = typo.patch\nexpect = base\n",
+    "typo.patch": "*** Begin Patch\n*** Update File: greet.txt\n@@\n-Hello, world!\n"
+                  "+Hello, wrold!\n*** End Patch\n",
+    "count.ini": "prompt = Change one to two in count.txt.\nfixture = count\n"
+                 "check = grep -qx two count.txt\n",
+}
+
+
+def evalmodel(t, agent):
+    """The model of a scripted eval agent, for this scenario alone."""
+    name = f"fake:{agent}:{t.nonce}"
+    fake_provider.STATE.register(name)
+    return name
+
+
+def evalrun(t, suite, models, extra=(), out="results.jsonl", timeout=60):
+    """Run prospero eval on a suite (files written under the scenario's
+    directory), returning its exit status, the records of its results
+    file, its summary and its progress."""
+    root = t.host.join(t.base, suite[0])
+    t.host.bulk(root, suite[1])
+    path = t.host.join(t.base, out)
+    args = ["eval", "-c", t.config, "--state", t.state, "-e", "fake", "-o", path,
+            "-m", ",".join(models)] + list(extra) + [root]
+    p = t.host.popen(args, t.work)
+    try:
+        stdout, stderr = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        stdout, stderr = p.communicate()
+        raise Failure(f"eval took over {timeout} s: {stderr[-2000:]}")
+    text = t.host.read(path) or ""
+    recs = [json.loads(line) for line in text.splitlines() if line.strip()]
+    return p.returncode, recs, stdout, stderr
+
+
+def evalcell(recs, model, fmt):
+    return [r for r in recs if r["model"] == model and r["format"] == fmt]
+
+
+@scenario(bound=30, alone=True)
+def eval_formats(t):
+    """Three scripted agents in every edit format, twice: the numbers each
+    run records, the summary's table, and the format chosen for each, on
+    known behavior. Run again, nothing is made twice."""
+    good = evalmodel(t, "eval_good")
+    flaky = evalmodel(t, "eval_flaky")
+    bad = evalmodel(t, "eval_bad")
+    suite = ("suite", EVAL_SUITE)
+    rc, recs, out, err = evalrun(t, suite, [good, flaky, bad], ["-f", "all", "-n", "2", "-j", "3"])
+    t.check(rc == 0, f"exit {rc}: {err[-2000:]}")
+    t.check(len(recs) == 36 and not any("error" in r for r in recs),
+            f"{len(recs)} records: {[r for r in recs if 'error' in r][:2]}")
+    t.check({(r["task"], r["rep"]) for r in recs} ==
+            {("typo", 1), ("typo", 2), ("count", 1), ("count", 2)}, "every task twice")
+    # (model, format): passes, steps, edit misses, of 4 runs
+    want = {(good, f): (4, 3, 0) for f in ("replace", "patch", "hashline")}
+    want.update({(flaky, "hashline"): (4, 3, 0), (flaky, "replace"): (4, 4, 1),
+                 (flaky, "patch"): (0, 3, 1)})
+    want.update({(bad, f): (0, 3, 1) for f in ("replace", "patch", "hashline")})
+    for (model, fmt), (passes, steps, miss) in want.items():
+        rs = evalcell(recs, model, fmt)
+        got = (sum(r["pass"] for r in rs), {r["steps"] for r in rs},
+               {r["errors"]["miss"] for r in rs})
+        t.check(len(rs) == 4 and got == (passes, {steps}, {miss}),
+                f"{model} {fmt}: {got}, want {(passes, steps, miss)}")
+        t.check(all(r["tokens"] == {"in": 100 * steps, "out": 10 * steps,
+                                    "cached": 40 * steps, "written": 0} and
+                    r["edits"] == steps - 2 and r["reads"] == 1 and
+                    r["calls"] == steps - 1 and not r["own"] and r["why"] == "done"
+                    for r in rs), f"{model} {fmt} counts: {rs[0]}")
+    typo = [r for r in evalcell(recs, good, "patch") if r["task"] == "typo"][0]
+    t.check(typo["diff"] == "--- a/greet.txt\n+++ b/greet.txt\n@@ -1,2 +1,2 @@\n"
+                            "-Hello, wrold!\n+Hello, world!\n Bye.\n", f"diff {typo['diff']!r}")
+    count = [r for r in evalcell(recs, bad, "replace") if r["task"] == "count"][0]
+    t.check(count["check_exit"] == 1 and not count["check"] and count["diff"] == "",
+            f"failed check: {count}")
+    typo = [r for r in evalcell(recs, bad, "hashline") if r["task"] == "typo"][0]
+    t.check(typo["expect"] == "greet.txt differs", f"failed expect: {typo}")
+
+    t.check(f"| {flaky} | replace | 4 | 100.0% (4) | 4.0 | 3.0 | 4 | 0 | 0 | 0 | 400 | 160 "
+            f"| 40 | 0 |" in out, f"table:\n{out}")
+    t.check(f"{flaky}: hashline\n" in out and "fewer edit misses decide" in out and
+            f"[model {flaky}]\n    edit_format = hashline\n" in out, f"flaky's format:\n{out}")
+    t.check(f"{good}: replace\n" in out and "nothing else tells them apart" in out,
+            f"good's format:\n{out}")
+    t.check(f"{bad}: none, since no run passed" in out, f"bad's format:\n{out}")
+    t.check("[36/36]" in err, f"progress: {err[-500:]}")
+
+    # Again: every run is in the results file already
+    rc, again, out2, err = evalrun(t, suite, [good, flaky, bad], ["-f", "all", "-n", "2"])
+    t.check(rc == 0 and len(again) == 36 and "0 runs to make, 36 made before" in err,
+            f"again: {rc} {len(again)} {err[-500:]}")
+    t.check(out2 == out, "the same summary")
+    p = t.host.popen(["eval", "--report", t.host.join(t.base, "results.jsonl")], t.work)
+    report, _ = p.communicate(timeout=20)
+    t.check(p.returncode == 0 and report == out, f"--report:\n{report}")
+
+
+@scenario(bound=30)
+def eval_limits(t):
+    """A run's time and step limits, and what it records of retries,
+    denials and repairs on its way."""
+    suite = {"typo.ini": "prompt = Change wrold to world in greet.txt.\nfixture = base\n"
+                         "patch = typo.patch\nexpect = base\ntimeout = 3\nsteps = 6\n",
+             "base/greet.txt": EVAL_SUITE["base/greet.txt"],
+             "typo.patch": EVAL_SUITE["typo.patch"]}
+    mixed = evalmodel(t, "eval_mixed")
+    slow = evalmodel(t, "eval_slow")
+    busy = evalmodel(t, "eval_busy")
+    rc, recs, out, err = evalrun(t, ("lim", suite), [mixed, slow, busy], ["-f", "replace", "-j", "3"])
+    t.check(rc == 0 and len(recs) == 3, f"exit {rc}, {len(recs)} records: {err[-2000:]}")
+    by = {r["model"]: r for r in recs}
+    m = by[mixed]
+    t.check(m["pass"] and m["why"] == "done" and m["steps"] == 4 and m["retries"] == 1 and
+            m["denied"] == 1 and m["repairs"] == 1 and m["reads"] == 2 and
+            m["repaired"] == {"arguments were a JSON string holding the object": 1,
+                              "matched ignoring trailing whitespace": 1} and
+            m["retried"] == {"transient": 1}, f"mixed: {m}")
+    s = by[slow]
+    t.check(not s["pass"] and s["why"] == "timeout" and s["steps"] == 0 and
+            "longer than its limit of 3 s" in s["err"] and 2900 <= s["wall_ms"] < 6000,
+            f"slow: {s}")
+    b = by[busy]
+    t.check(not b["pass"] and b["why"] == "budget" and b["steps"] == 6 and
+            b["err"] == "the turn reached its limit of 6 model requests", f"busy: {b}")
+    t.check(f"- {mixed} replace: repaired 1 x arguments were a JSON string holding "
+            "the object, 1 x matched ignoring trailing whitespace; retried 1 x "
+            "transient\n" in out, f"repairs:\n{out}")
+
+
+@scenario(conf={"max_concurrent": 1}, bound=40, alone=True)
+def eval_queue(t):
+    """Runs at once share an endpoint that takes one request at a time:
+    the waits are not the runs' time, which would pass their limit. Each
+    run takes three responses of 1.5 s, and four take 18 s in all, but
+    their limit of 12 s leaves room for a slow disk's syncs (rat.local's
+    SD card stalls for seconds), which are the run's own time."""
+    suite = {"suite.ini": "timeout = 12\n", **{k: v for k, v in EVAL_SUITE.items()
+                                              if k != "suite.ini"}}
+    patient = evalmodel(t, "eval_patient")
+    rc, recs, out, err = evalrun(t, ("queue", suite), [patient],
+                                 ["-f", "replace,hashline", "-j", "4"])
+    t.check(rc == 0 and len(recs) == 4, f"exit {rc}, {len(recs)} records: {err[-2000:]}")
+    t.check(all(r["pass"] for r in recs), f"failed: {[r for r in recs if not r['pass']][:2]}")
+    own = [r["wall_ms"] - r["queued_ms"] for r in recs]
+    t.check(all(4400 <= ms < 12000 for ms in own), f"own time {own}")
+    t.check(sum(r["queued_ms"] for r in recs) > 10000 and
+            max(r["wall_ms"] for r in recs) > 12000, f"waits {[r['queued_ms'] for r in recs]}")
+
+
+@scenario(bound=15)
+def new_options(t):
+    """new's options for runs that must not depend on the configuration,
+    as prospero eval's: an edit format, the tools offered, a limit of
+    model requests, and the project's instruction files without the
+    user's own; each refused when wrong. close with forget lets a session
+    go, and its log opens again."""
+    t.put("hello.txt", "hi\n")
+    cfg = t.host.join(t.base, "cfg")
+    t.host.bulk(cfg, {"prospero/AGENTS.md": "GLOBAL-RULE-7\n"})
+    h = t.headless(env={"XDG_CONFIG_HOME": cfg})
+    try:
+        bad = [({"edit_format": "sloppy"}, "no such edit format: sloppy"),
+               ({"tools": "read frobnicate"}, "no such tool: frobnicate"),
+               ({"steps": 301}, "steps must be 1 to 300"),
+               ({"instructions": "none"}, "instructions must be all or project")]
+        for fields, err in bad:
+            rep = h.call("new", cwd=t.work, model=t.model, endpoint="fake", **fields)
+            t.check(rep.get("ok") == 0 and rep.get("err") == err, f"{fields}: {rep}")
+
+        rep = h.call("new", cwd=t.work, model=t.model, endpoint="fake", prompt="go",
+                     edit_format="Hashline", tools="read, edit", steps=1,
+                     instructions="project")
+        sid = rep.get("sid")
+        t.check(rep.get("ok") == 1, f"new {rep}")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end.get("why") == "budget" and
+                end.get("err") == "the turn reached its limit of 1 model request",
+                f"turn end {end}")
+        sess = h.all("session", sid)[0]
+        t.check(sess.get("edit_format") == "hashline" and sess.get("steps") == 1 and
+                sess.get("tools") == ["read", "edit"], f"session {sess}")
+        req = t.requests()[0]["body"]
+        t.check(sorted(tool_names_of(req)) == ["edit", "read"] and
+                edit_params_of(req) == ["edits", "path", "tag"], f"tools {tool_names_of(req)}")
+        t.check("GLOBAL-RULE-7" not in req["messages"][0]["content"],
+                "the user's own instructions left out")
+
+        # Without the options: the user's file, every tool, no limit
+        rep = h.call("new", cwd=t.work, model=t.model, endpoint="fake", prompt="go")
+        sid2 = rep.get("sid")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid2)
+        t.check(end.get("why") == "done", f"turn end {end}")
+        req = t.requests()[-1]["body"]
+        t.check("GLOBAL-RULE-7" in req["messages"][0]["content"] and
+                "shell" in tool_names_of(req), "the defaults")
+
+        t.check(h.call("close", sid=sid, forget=1).get("ok") == 1, "closed")
+        st = h.call("status")
+        t.check(st.get("open") == 1, f"one session left in memory: {st}")
+        o = h.call("open", sid=sid, **{"from": 0})
+        t.check(o.get("ok") == 1, f"opened again from its log: {o}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+def tool_names_of(req):
+    return [x.get("function", {}).get("name") for x in req.get("tools", [])]
+
+
+def edit_params_of(req):
+    for x in req.get("tools", []):
+        f = x.get("function", {})
+        if f.get("name") == "edit":
+            return sorted(f.get("parameters", {}).get("properties", {}))
+    return []
+
+
+@scenario(bound=20)
+def eval_checks(t):
+    """A check that runs a script of the suite's the agent never sees, and
+    one past its time limit, killed."""
+    suite = {"hidden.ini": "prompt = Change one to two in count.txt.\nfixture = count\n"
+                           "check = sh \"$PROSPERO_EVAL_SUITE/hidden.sh\" $PROSPERO_EVAL_TASK\n",
+             "hidden.sh": "test \"$1\" = hidden && grep -qx two count.txt\n",
+             "slow.ini": "prompt = Change one to two in count.txt.\nfixture = count\n"
+                         "check = echo checking; sleep 30\ncheck_timeout = 1\n",
+             "count/count.txt": "one\n"}
+    good = evalmodel(t, "eval_good")
+    t0 = time.monotonic()
+    rc, recs, out, err = evalrun(t, ("checks", suite), [good])
+    t.check(rc == 0 and len(recs) == 2, f"exit {rc}: {recs} {err[-2000:]}")
+    by = {r["task"]: r for r in recs}
+    t.check(by["hidden"]["pass"] and by["hidden"]["check_exit"] == 0, f"hidden: {by['hidden']}")
+    s = by["slow"]
+    t.check(not s["pass"] and s["check_exit"] == -1 and s["check_out"] == "checking" and
+            time.monotonic() - t0 < 15, f"slow: {s}")
+
+
+@scenario(bound=20)
+def eval_errors(t):
+    """Runs that cannot be made are recorded so, and made again next
+    time; a suite with a bad task does not run at all."""
+    suite = {"setup.ini": "prompt = Change one to two in count.txt.\nfixture = count\n"
+                          "setup = echo broken; exit 3\ncheck = true\n",
+             "patch.ini": "prompt = Change one to two in count.txt.\nfixture = count\n"
+                          "patch = bad.patch\ncheck = true\n",
+             "bad.patch": "*** Begin Patch\n*** Update File: count.txt\n@@\n-nothing\n+x\n"
+                          "*** End Patch\n",
+             "out.ini": "prompt = Change one to two in count.txt.\nfixture = count\n"
+                        "patch = out.patch\ncheck = true\n",
+             "out.patch": "*** Begin Patch\n*** Add File: ../escaped.txt\n+no\n*** End Patch\n",
+             "count/count.txt": "one\n"}
+    good = evalmodel(t, "eval_good")
+    rc, recs, out, err = evalrun(t, ("errs", suite), [good])
+    t.check(rc == 0 and len(recs) == 3 and all("error" in r for r in recs),
+            f"exit {rc}: {recs} {err[-2000:]}")
+    by = {r["task"]: r["error"] for r in recs}
+    t.check(by["setup"].startswith("the setup command exited with status 3: broken"),
+            f"setup: {by['setup']}")
+    t.check("was not applied" in by["patch"], f"patch: {by['patch']}")
+    t.check("outside the working directory" in by["out"], f"out: {by['out']}")
+    t.check("3 runs could not be made" in out, f"summary:\n{out}")
+    rc, recs, out, err = evalrun(t, ("errs", suite), [good])
+    t.check(len(recs) == 6 and "3 runs to make" in err, f"made again: {err[-500:]}")
+
+    bad = {"x.ini": "prompt = hi\ntools = read frobnicate\ncheck = true\n"}
+    rc, recs, out, err = evalrun(t, ("badsuite", bad), [good], out="bad.jsonl")
+    t.check(rc == 2 and "no such tool: frobnicate" in err and not recs, f"{rc}: {err}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

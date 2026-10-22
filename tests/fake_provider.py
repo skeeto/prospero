@@ -58,6 +58,7 @@ import argparse
 import hashlib
 import json
 import random
+import re
 import socket
 import sys
 import threading
@@ -1425,6 +1426,161 @@ def sc_edit_hashline(model, n, req):
             {"op": "replace", "line": 3, "text": "two"}]})
     else:
         yield from answer(model, "Edited by line.")
+
+
+# Agents for prospero eval (tests/scenarios.py, eval_*): scripted good
+# and bad agents, so that an eval's numbers are known. Every run of a
+# model shares its name, so these decide from the conversation alone:
+# the prompt, "Change OLD to NEW in FILE.", says what to do, the edit
+# tool's parameters say the session's format, and the step is the
+# number of responses so far. Each response reports 100 tokens in, 40
+# of them cached, and 10 out.
+
+EVAL_PROMPT = re.compile(r"Change (\S+) to (\S+) in (\S+)\.")
+EVAL_FAILED = set()  # (model, working directory): runs given a 503
+
+
+def eval_task(req):
+    m = EVAL_PROMPT.search(task_prompt(req))
+    return m.groups() if m else ("", "", "")
+
+
+def eval_format(req):
+    params = edit_params(req)
+    return "patch" if params == ["patch"] else "hashline" if "tag" in params else "replace"
+
+
+def eval_read(req):
+    """The first read's result: the file as the agent saw it."""
+    for m in req.get("messages", []):
+        if m.get("role") == "tool" and "\t" in str(m.get("content", "")):
+            return str(m["content"])
+    return ""
+
+
+def eval_edit(req, wrong=False):
+    """The edit from OLD to NEW in the session's format, from the line the
+    first read showed; wrong, one that does not apply."""
+    old, new, path = eval_task(req)
+    text = eval_read(req)
+    num, line = 1, old
+    for row in text.splitlines():
+        n, sep, rest = row.lstrip().partition("\t")
+        if sep and n.isdigit() and old in rest:
+            num, line = int(n), rest
+            break
+    fmt = eval_format(req)
+    if fmt == "replace":
+        return {"path": path, "old_string": "nowhere " + old if wrong else old,
+                "new_string": new}
+    if fmt == "patch":
+        gone = "no such line" if wrong else line
+        return {"patch": f"*** Begin Patch\n*** Update File: {path}\n@@\n-{gone}\n"
+                         f"+{line.replace(old, new)}\n*** End Patch\n"}
+    tag = "ZZZZ" if wrong else text.split("#", 1)[1].split("]", 1)[0]
+    return {"path": path, "tag": tag,
+            "edits": [{"op": "replace", "line": num, "text": line.replace(old, new)}]}
+
+
+def eval_reply(model, n, name, args):
+    yield S.head()
+    yield from call(model, 0, f"call_{n}", name, args, 2)
+    yield from finish(model, "tool_calls", cache_n=40)
+
+
+def eval_answer(model, s):
+    yield S.head()
+    yield from text(model, s)
+    yield from finish(model, cache_n=40)
+
+
+def sc_eval_good(model, n, req):
+    """Reads the file, edits it right, and says so: 3 steps."""
+    k = step(req)
+    if k == 0:
+        yield from eval_reply(model, n, "read", {"path": eval_task(req)[2]})
+    elif k == 1:
+        yield from eval_reply(model, n, "edit", eval_edit(req))
+    else:
+        yield from eval_answer(model, "Done.")
+
+
+def sc_eval_flaky(model, n, req):
+    """Right at once with hashline (3 steps); with replace, misses once,
+    then right (4 steps); with patch, misses once and gives up (3 steps)."""
+    k, fmt = step(req), eval_format(req)
+    if k == 0:
+        yield from eval_reply(model, n, "read", {"path": eval_task(req)[2]})
+    elif k == 1:
+        yield from eval_reply(model, n, "edit", eval_edit(req, wrong=fmt != "hashline"))
+    elif k == 2 and fmt == "replace":
+        yield from eval_reply(model, n, "edit", eval_edit(req))
+    else:
+        yield from eval_answer(model, "I could not." if fmt == "patch" else "Done.")
+
+
+def sc_eval_bad(model, n, req):
+    """Edits without reading, misses, and gives up: 3 steps, failed."""
+    k = step(req)
+    if k == 0:
+        yield from eval_reply(model, n, "read", {"path": eval_task(req)[2]})
+    elif k == 1:
+        yield from eval_reply(model, n, "edit", eval_edit(req, wrong=True))
+    else:
+        yield from eval_answer(model, "Gave up.")
+
+
+def sc_eval_mixed(model, n, req):
+    """A repair, a denial and a retry on the way to a good edit (replace
+    format): a 503 first, then a read outside, denied; a read; arguments
+    as a JSON string holding the object, its old_string with trailing
+    blanks, which match loosely; and a short answer."""
+    key = (model, system_of(req))
+    if key not in EVAL_FAILED:
+        EVAL_FAILED.add(key)
+        yield S.error(503, {"error": {"code": 503, "message": "Loading model",
+                                      "type": "unavailable_error"}})
+        return
+    k = step(req)
+    old, new, path = eval_task(req)
+    if k == 0:
+        yield from eval_reply(model, n, "read", {"path": "../outside.txt"})
+    elif k == 1:
+        yield from eval_reply(model, n, "read", {"path": path})
+    elif k == 2:
+        args = eval_edit(req)
+        line = next(r.partition("\t")[2] for r in eval_read(req).splitlines()
+                    if old in r)
+        args["old_string"] = line + "   \n"
+        args["new_string"] = line.replace(old, new) + "\n"
+        yield from eval_reply(model, n, "edit", json.dumps(json.dumps(args)))
+    else:
+        yield from eval_answer(model, "Done.")
+
+
+def sc_eval_slow(model, n, req):
+    """Never answers: the eval's time limit ends it."""
+    yield S.stall(60)
+
+
+def sc_new_options(model, n, req):
+    """Reads once, then answers: two steps."""
+    if step(req) == 0:
+        yield from tool(model, n, "read", {"path": "hello.txt"})
+    else:
+        yield from answer(model, "Read it.")
+
+
+def sc_eval_patient(model, n, req):
+    """As eval_good, but each response takes a second and a half."""
+    yield S.sleep(1.5)
+    yield from sc_eval_good(model, n, req)
+
+
+def sc_eval_busy(model, n, req):
+    """Reads one line after another, never done: the step limit ends it."""
+    yield from eval_reply(model, n, "read", {"path": eval_task(req)[2],
+                                             "offset": 1, "limit": step(req) + 1})
 
 
 # The GUI's checklist (prospero gui --drive, run by tests/gui.py): the

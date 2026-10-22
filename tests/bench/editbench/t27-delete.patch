@@ -1,0 +1,11 @@
+*** Begin Patch
+*** Update File: src/compact.cpp
+@@
+                     print(&b, "\n\n");
+                 } else if (bk->type == BLOCK_CALL) {
+                     print(&b, "[tool call: ");
+-                    print(&b, bk->name);
+                     print(&b, "]\n");
+                     print(&b, clip(&scratch, bk->args, COMPACT_ARGSIN));
+                     print(&b, "\n\n");
+*** End Patch

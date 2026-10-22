@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/wide.cpp
+@@
+ // points (from WTF-8) encode as themselves.
+ static iz utf16encode(c16 *s, i32 c)
+ {
+-    if (c > 0x10ffff) {
++    if (c >= 0x10ffff) {
+         c = 0xfffd;
+     } else if (c >= 0x10000) {
+         c -= 0x10000;
+*** End Patch

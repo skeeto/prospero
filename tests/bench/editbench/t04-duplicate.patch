@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: ledger.py
+@@
+ 
+ 
+ def load(text):
+-    data = json.loads(text)
++    data = json.loads(text)
++    data = json.loads(text)
+     ledger = Ledger()
+     for path, kind in data["accounts"]:
+         ledger.open(path, kind)
+*** End Patch

@@ -726,10 +726,55 @@ static void showlines(Buf *b, Slice<Str> lines, iz beg, iz end, iz max)
 
 // replace
 
-struct EditOut {
-    Str data;  // the new content, null if nothing is to change
-    Str text;  // what the agent reads
+// What an edit forgave to apply, besides a loose match (EditOut.rung),
+// for the record of the call (editrepair), so that an eval can count it.
+enum : u32 {
+    FORGAVE_ENVELOPE = 1u << 0,  // a patch without *** Begin Patch
+    FORGAVE_WRAP     = 1u << 1,  // text around a patch: a heredoc, a fence
+    FORGAVE_BARE     = 1u << 2,  // a patch's kept lines without their space
+    FORGAVE_ATCTX    = 1u << 3,  // a hunk begun at its own @@ line
+    FORGAVE_EOFLINE  = 1u << 4,  // a last kept empty line for the final newline
 };
+
+struct EditOut {
+    Str data;     // the new content, null if nothing is to change
+    Str text;     // what the agent reads
+    i32 rung;     // the loosest match it took, RUNG_EXACT if none
+    u32 forgave;  // FORGAVE_* bits
+};
+
+// What an edit forgave, as a phrase for the record of its call, or
+// null for an edit taken as given.
+static Str editrepair(Arena *a, i32 rung, u32 forgave)
+{
+    static Str const loose[] = {
+        {},
+        "matched ignoring trailing whitespace",
+        "matched ignoring indentation",
+        "matched ignoring indentation and comment markers",
+        "matched with typographic characters as ASCII",
+        "matched approximately",
+    };
+    static_assert(countof(loose) == RUNG_FUZZY+1);
+    static Str const notes[] = {
+        "no *** Begin Patch",
+        "text around the patch",
+        "kept lines without their space",
+        "a hunk at its own @@ line",
+        "an empty last line for the final newline",
+    };
+    Buf b(a, 128);
+    if (rung>RUNG_EXACT && rung<=RUNG_FUZZY) {
+        print(&b, loose[rung]);
+    }
+    for (i32 i = 0; i < countof(notes); i++) {
+        if (forgave>>i & 1) {
+            print(&b, b.len ? Str(", ") : Str(""));
+            print(&b, notes[i]);
+        }
+    }
+    return b.len ? finish(&b) : Str{};
+}
 
 static Str rungnote(i32 rung)
 {
@@ -861,6 +906,7 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
             } else if (m.len) {
                 r.data = splice(a, bom, data, m, newstr);
                 r.text = replaced(a, show, m.len, lineat(data, m[0].beg), rungnote(rung));
+                r.rung = rung;
                 return r;
             }
         }
@@ -877,6 +923,7 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
             Slice<Str> out = relines(a, &t, m, want, now, rung>RUNG_RTRIM);
             r.data = jointext(a, &t, out);
             r.text = replaced(a, show, m.len, m[0].beg+1, rungnote(rung));
+            r.rung = rung;
             return r;
         }
     }
@@ -896,6 +943,7 @@ static EditOut editreplace(Arena *a, Str data, Str show, Str oldstr, Str newstr,
         one = push(a, one, s);
         Slice<Str> out = relines(a, &t, one, want, now, 1);
         r.data = jointext(a, &t, out);
+        r.rung = RUNG_FUZZY;
 
         Buf b(a, 1024);
         print(&b, "Edited ");
@@ -1265,7 +1313,8 @@ struct PatchFile {
 
 struct Patch {
     Slice<PatchFile> files;
-    Str              err;  // why it is not a patch, or null
+    Str              err;      // why it is not a patch, or null
+    u32              forgave;  // FORGAVE_* bits
 };
 
 // A line that may wrap a patch: a heredoc's start or end, or a fence.
@@ -1340,6 +1389,7 @@ static Patch parsepatch(Arena *a, Str text)
         }
         beg = first - 1;
         end = end>first ? end : last;
+        r.forgave |= FORGAVE_ENVELOPE;
     } else if (end < beg) {
         r.err = "it does not end with a line \"*** End Patch\"";
         return r;
@@ -1349,6 +1399,8 @@ static Patch parsepatch(Arena *a, Str text)
             r.err = patcherr(a, i+1, i<beg ? Str("unexpected text before *** Begin Patch")
                                            : Str("unexpected text after *** End Patch"));
             return r;
+        } else if ((i<beg || i>end) && trim(lines[i]).len) {
+            r.forgave |= FORGAVE_WRAP;
         }
     }
 
@@ -1452,6 +1504,7 @@ static Patch parsepatch(Arena *a, Str text)
             } else {
                 pl.kind = ' ';  // kept, without its space
                 pl.text = line;
+                r.forgave |= line.len ? (u32)FORGAVE_BARE : 0;
             }
             h->lines = push(a, h->lines, pl);
             break;
@@ -1616,6 +1669,7 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
         PatchSeek        s  = seeklines(*a, t.lines, cursor, old, h->eof);
         if (s.at<0 && ctxat>=0) {
             s = seeklines(*a, t.lines, ctxat, old, h->eof);
+            r.forgave |= s.at>=0 ? (u32)FORGAVE_ATCTX : 0;
         }
         if (s.at<0 && old.len>1 && !old[old.len-1].len) {
             // A last kept empty line may stand for the file's final
@@ -1632,6 +1686,7 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
                 }
             }
             s = seeklines(*a, t.lines, ctxat>=0 ? ctxat : cursor, old, h->eof);
+            r.forgave |= s.at>=0 ? (u32)FORGAVE_EOFLINE : 0;
         }
         if (s.at < 0) {
             Buf b(a, 1024);
@@ -1756,6 +1811,7 @@ static EditOut patchupdate(Arena *a, Str data, Str show, PatchFile *f)
             out = push(a, out, sp[i].lines[k]);
         }
         last = sp[i].at + sp[i].len;
+        r.rung = sp[i].rung>r.rung ? sp[i].rung : r.rung;
         if (sp[i].rung > RUNG_EXACT) {
             print(&note, " Hunk ");
             print(&note, (i64)sp[i].hunk+1);

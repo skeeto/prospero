@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/doc.cpp
+@@
+     Doc *d = p->doc;
+     if (p->cur < 0) {
+         // Text outside any leaf: a tight list item's, or stray.
+-        openblock(p, p->items ? DOC_ITEM : DOC_PARA);
++        openblock(p->items ? DOC_ITEM : DOC_PARA, p);
+     }
+     DocBlock *b = &d->blocks[p->cur];
+     if (!b->npiece) {
+*** End Patch

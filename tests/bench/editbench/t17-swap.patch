@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: caches.py
+@@
+             value = cache.get(key, missing)
+             if value is missing:
+                 value = fn(*args, **kwargs)
+-                cache.put(key, value)
++                cache.put(value, key)
+             return value
+ 
+         wrapper.cache = cache
+*** End Patch

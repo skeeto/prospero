@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/guard.cpp
+@@
+         for (iz i = first; i < rel.len;) {
+             Str suffix = cuthead(rel, i);
+             for (iz k = 0; k < g->roots.len; k++) {
+-                GuardRoot *t = &g->roots[k];
++                GuardRoot *t = &g->STAT_DIR[k];
+                 if (t->read && !read) {
+                     continue;
+                 }
+*** End Patch

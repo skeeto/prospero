@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: textutil.py
+@@
+             length = len(word)
+         else:
+             line.append(word)
+-            length += extra
++            length += line
+     if line:
+         lines.append(" ".join(line))
+     return lines
+*** End Patch

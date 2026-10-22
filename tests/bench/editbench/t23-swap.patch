@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/admit.cpp
+@@
+     if (p->maxreq && p->inflight>=p->maxreq) {
+         return 0;
+     }
+-    AdmLane *l   = admlane(p, 0, w->model);
++    AdmLane *l   = admlane(0, p, w->model);
+     i32      cap = l && l->most && l->most<w->cap ? l->most : w->cap;
+     if (l && l->inflight>=cap) {
+         return 0;
+*** End Patch

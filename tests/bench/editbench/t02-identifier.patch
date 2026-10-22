@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/admit.cpp
+@@
+     }
+     i32 half = l->inflight / 2;
+     l->most  = half>1 ? half : 1;
+-    l->calm  = now + calm;
++    l->calm  = epoch + calm;
+     l->epoch++;
+     return l->most;
+ }
+*** End Patch

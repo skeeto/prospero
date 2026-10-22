@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: jobs.js
+@@
+       let i = 0;
+       for (;;) {
+         const l = 2 * i + 1;
+-        const r = l + 1;
++        const r = l - 1;
+         let best = i;
+         if (l < a.length && this.less(a[l], a[best])) {
+           best = l;
+*** End Patch

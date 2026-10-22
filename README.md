@@ -121,6 +121,7 @@ directory against them all at once:
     prospero hosts [--state DIR]
     prospero connect NAME | --ssh DEST | --local [options]
     prospero deploy NAME|DEST [--force] [options]
+    prospero eval [options] SUITE...
 
 With no arguments, Prospero opens its window: sessions in a sidebar,
 subagents under their parents; the transcript, with markdown, code
@@ -154,7 +155,60 @@ connect` speaks the protocol to a host: a `[remote NAME]`, any ssh
 destination, or this machine's. A host exits after ten minutes with no
 client and nothing running.
 
-`prospero deploy` puts an engine on another machine, as below.
+`prospero deploy` puts an engine on another machine, as below, and
+`prospero eval` runs a suite of tasks to compare models (Evals).
+
+## Evals
+
+`prospero eval` measures models on a suite of tasks: how often each
+passes, and what it took, so that a model's edit format and the
+harness's heuristics can be chosen from data. A suite is a directory of
+task files, `NAME.ini`, with settings for all of them in `suite.ini`:
+
+    prompt   = "Change wrold to world in greet.txt."
+    fixture  = base           # copied as the working directory
+    patch    = typo.patch     # a mutation, in the edit tool's patch format
+    expect   = base           # these files, byte for byte, afterward
+    check    = sh "$PROSPERO_EVAL_SUITE/test.sh"   # and exit 0
+    timeout  = 600            # seconds, not counting the endpoint's queue
+    steps    = 100            # model requests at most
+    tools    = read edit grep glob
+
+`setup` runs a command before the agent starts, `prompt_file` reads the
+prompt from a file, `role` names a configured role, and `check_timeout`
+limits setup and check commands. Each run works on its own copy in a
+temporary directory, so no repository is ever touched; the session is
+unattended, so asks are denied, and gets the project's instruction
+files but not the user's own.
+
+    prospero eval -m MODEL,... [-e ENDPOINT] [-f FORMAT,...|all] [-n N]
+                  [-j N] [-t TASK,...] [-o FILE] [-c FILE] SUITE...
+    prospero eval --report FILE...
+
+Every model runs every task in each edit format, `-n` times, up to `-j`
+runs at once. A model is `MODEL` at the `-e` endpoint, or
+`ENDPOINT/MODEL` with a configured endpoint. Model requests wait their
+turn at each endpoint as any session's do (its `max_concurrent`,
+`max_models`, and a model's `max_concurrent`), and runs go model by
+model, so a llama.cpp router that keeps one model loaded swaps rarely.
+Each run appends a JSON line to the results file (`-o`, by default
+`eval.jsonl`): pass or fail and why, steps and tool calls, tool errors
+by kind (edit misses, invalid calls), guard denials, what the harness
+repaired, nudges, retries, tokens with cache reads, the run's own time
+and its time in the queue, and the diff it left. A run already in the
+file is skipped, so an eval stopped part way goes on where it stopped.
+The summary, printed after the runs and by `--report`, is a table by
+model and format, the failed runs, and for each model the edit format
+to give it, with the numbers that decide it.
+
+`tests/bench/editbench` is the edit-format benchmark as a suite: 40
+one-line bugs in real code, to fix with the file tools alone. For a
+llama.cpp router on this machine, and a model at Anthropic:
+
+    $ prospero eval -e http://localhost/ -m MODEL1,MODEL2 -f all -n 2 \
+          -o local.jsonl tests/bench/editbench
+    $ prospero eval -m anthropic/claude-haiku-5-5 -f all -t t00-operator,t09-delete \
+          -o claude.jsonl tests/bench/editbench
 
 ## Configuration
 

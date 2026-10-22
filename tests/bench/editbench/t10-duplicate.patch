@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: src/guard.cpp
+@@
+     for (iz i = root; i < full.len;) {
+         iz j = i;
+         for (; j<full.len && !issep(full[j], win); j++) {}
+-        Str comp = span(full.data+i, full.data+j);
++        Str comp = span(full.data+i, full.data+j);
++        Str comp = span(full.data+i, full.data+j);
+         i = j + (j < full.len);
+         if (win) {
+             comp = wincomp(comp);
+*** End Patch
