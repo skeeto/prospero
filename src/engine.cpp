@@ -4010,6 +4010,8 @@ static b32 deskstart(Session *s, Arena scratch)
     sp.argv      = argv;
     sp.cwd       = s->cwd;
     sp.env       = shellenv(&scratch, e->env, s->te.windows, secrets);
+    // Where it keeps what it must remember, as Wayland's portal approval
+    sp.env       = push(&scratch, sp.env, concat(&scratch, "PROSPERO_STATE=", e->statedir));
     sp.outpath   = join(&scratch, s->outdir, "desktop.log");
     sp.mbox      = e->in;
     sp.id        = k->id = ++e->nextid;
@@ -4157,8 +4159,8 @@ static Str deskcheck(Session *s, Arena *a, DeskArgs *d)
     } else if (!deskhelper(e, a).len) {
         return "Desktop control is not available here: there is no desktop "
                "helper (prospero-desktop) next to the harness, which so far "
-               "exists for Windows, macOS and Linux on X11 only. Nothing "
-               "was done.";
+               "exists for Windows, macOS and Linux (X11 and Wayland) only. "
+               "Nothing was done.";
     } else if (d->action==DESK_SCREENSHOT && s->mc.novision) {
         return "This session's model takes no images (its [model] vision is "
                "false), so it cannot see screenshots.";

@@ -4849,14 +4849,67 @@ def xrun(env, *args, data=None):
     return p.returncode, p.stdout, p.stderr.decode("utf-8", "replace")
 
 
+def waylandbus(t, helper, wl):
+    """The helper on Wayland against a session bus of the test's own
+    (dbus-daemon, if installed), on which nothing answers for the portal
+    or the compositor, nor is started on demand: each command fails, and
+    says why. Its D-Bus client authenticates, says Hello, and reads the
+    errors of calls to names that are not there."""
+    daemon = shutil.which("dbus-daemon")
+    if not daemon:
+        return
+    sock = t.host.join(t.base, "bus")
+    conf = t.host.join(t.base, "bus.conf")
+    with open(conf, "w") as f:
+        f.write(f"""<busconfig><type>session</type><listen>unix:path={sock}</listen>
+<auth>EXTERNAL</auth><policy context="default"><allow send_destination="*" eavesdrop="true"/>
+<allow eavesdrop="true"/><allow own="*"/></policy>
+<limit name="reply_timeout">60000</limit></busconfig>""")
+    proc = subprocess.Popen([daemon, "--config-file", conf, "--nofork", "--print-address"],
+                            stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+    try:
+        ready, _, _ = select.select([proc.stdout], [], [], 10)
+        addr = proc.stdout.readline().decode().strip() if ready else ""
+        t.check(addr.startswith("unix:"), f"dbus-daemon address: {addr!r}")
+        env = {k: v for k, v in wl.items() if k != "DISPLAY"}
+        env["DBUS_SESSION_BUS_ADDRESS"] = addr
+        env["PROSPERO_STATE"] = t.host.join(t.base, "state")
+        rc, _, err = xrun(env, helper, "list")
+        t.check(rc == 1 and "Window Calls extension" in err, f"wayland, gnome list: {rc} {err}")
+        rc, _, err = xrun(dict(env, XDG_CURRENT_DESKTOP="Hyprland"), helper, "list")
+        t.check(rc == 1 and "'Hyprland') offers no way" in err, f"wayland, other list: {rc} {err}")
+        rc, _, err = xrun(env, helper, "shot")
+        t.check(rc == 1 and "no remote desktop portal" in err, f"wayland, shot: {rc} {err}")
+        rc, _, err = xrun(env, helper, "type", "active", "x")
+        t.check(rc == 1 and "no remote desktop portal" in err, f"wayland, type: {rc} {err}")
+        rc, _, err = xrun(env, helper, "close", "active")
+        t.check(rc == 1 and "cannot be named" in err, f"wayland, close active: {rc} {err}")
+        rc, out, err = xrun(env, helper, "access")
+        out = out.decode()
+        t.check(rc == 0 and "remote-desktop\tmissing" in out and "windows\tmissing" in out,
+                f"wayland, access: {rc} {out!r} {err}")
+    finally:
+        if P.signal_group(proc, signal.SIGTERM):
+            proc.wait(5)
+
+
 def x11cli(t, helper, env, wm):
     """The helper's own command line: errors without a display, and a
     window started, moved and resized, captured, typed into, and closed."""
     plain = {k: v for k, v in env.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
     rc, _, err = xrun(plain, helper, "list")
     t.check(rc == 1 and "DISPLAY is not set" in err, f"no display: {rc} {err}")
-    rc, _, err = xrun(dict(env, XDG_SESSION_TYPE="wayland"), helper, "list")
-    t.check(rc == 1 and "Wayland is not supported yet" in err, f"wayland: {rc} {err}")
+    # A Wayland session goes through D-Bus, here to no bus at all, or one
+    # of the test's own with no portal and no compositor on it; and
+    # PROSPERO_DESKTOP_SESSION picks X11 even so
+    wl = dict(env, WAYLAND_DISPLAY="wayland-x", XDG_CURRENT_DESKTOP="GNOME",
+              DBUS_SESSION_BUS_ADDRESS="unix:path=" + t.host.join(t.base, "no-bus"))
+    rc, _, err = xrun(wl, helper, "list")
+    t.check(rc == 1 and "cannot connect to the session bus" in err, f"wayland, no bus: {rc} {err}")
+    rc, out, err = xrun(dict(wl, PROSPERO_DESKTOP_SESSION="x11"), helper, "list")
+    t.check(rc == 0, f"wayland, forced x11: {rc} {err}")
+    waylandbus(t, helper, wl)
 
     rc, _, err = xrun(env, helper, "run", t.host.join(t.base, "no-such-program"))
     t.check(rc == 1 and "no-such-program': No such file" in err, f"run fails: {rc} {err}")

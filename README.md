@@ -302,7 +302,8 @@ The work is done by a helper, `prospero-desktop`, next to `prospero`,
 which the harness starts for a turn and talks to over pipes: a program
 of its own, so that the one program the system lets watch the screen
 keeps its identity however often Prospero is rebuilt. So far it exists
-for Windows (XP and later), macOS (15.2 and later) and Linux on X11;
+for Windows (XP and later), macOS (15.2 and later) and Linux, on X11
+or Wayland;
 run alone, it takes the same commands on its command line
 (`prospero-desktop shot screen > s.png`, `list`, `click WINDOW X Y` and
 so on; `prospero-desktop -h`). An engine that `prospero deploy` put on
@@ -331,13 +332,33 @@ chooses another; the helper's is that plus `.desktop`.
 
 On Linux the helper drives the X11 display that `DISPLAY` names, in
 pixels, loading libX11, libXext and libXtst when it runs. It works with
-a window manager through EWMH, or without one. Wayland is not supported
-yet: in a Wayland session every call fails and says so. A program the
-tool runs (a path, a name in `PATH`, or a desktop entry such as
+a window manager through EWMH, or without one. A program the tool runs
+(a path, a name in `PATH`, or a desktop entry such as
 `org.gnome.TextEditor`) is started by your systemd user manager, as a
 transient service in `app.slice` with the helper's environment, so that
 it outlives the turn and Prospero, as an application you start does.
 Without a user manager it ends with Prospero, and the tool says so.
+This holds under Wayland too.
+
+In a Wayland session (`WAYLAND_DISPLAY` set) it goes through the
+desktop's portal instead, in the compositor's logical pixels: the
+RemoteDesktop portal, with a screen cast of the monitors, for
+screenshots (read through PipeWire) and input (through libei, or the
+portal's own calls without it); each library is loaded when it runs.
+The desktop asks once, in a dialog (on GNOME, turn on "Allow Remote
+Interaction" and press Share), and the approval is kept: a restore
+token in the state directory lets later runs start without asking
+(`prospero-desktop access -ask` shows the dialog and waits). Wayland
+has no common way for one program to list, raise or close another's
+windows, so that depends on the desktop: KDE Plasma's KWin runs small
+scripts for it; GNOME needs the [Window Calls][] extension; elsewhere,
+or on GNOME without it, only X11 programs (under Xwayland) can be named,
+and the rest of the screen is reached through `screen` and `active`.
+Wayland gives keys only for the characters of the keyboard's layout, so
+text with others is refused before anything is typed.
+`PROSPERO_DESKTOP_SESSION=x11` or `wayland` overrides the choice.
+
+[Window Calls]: https://extensions.gnome.org/extension/4724/window-calls/
 
 Screenshots go to the model as images, scaled down to its limits
 (`[model] image_edge` and `image_pixels`: by default 1568 pixels on a
@@ -436,7 +457,11 @@ The suites:
   (`src/test/desktop_macos_test.cpp`), and the helper itself, its
   commands and frames, with its permissions treated as missing, so that
   nothing touches the screen. `tests/desktop_live_macos.py` drives
-  TextEdit for real, under supervision; its header says how.
+  TextEdit for real, under supervision; its header says how, and
+  `tests/desktop_live_wayland.py` drives GNOME Text Editor or Kate on a
+  Wayland desktop. On Linux, the `desktop_x11` scenarios also run the
+  helper as if under Wayland, against no session bus and against a
+  `dbus-daemon` of their own.
 - `bundle` (macOS): Prospero.app's bundle identifier and signatures,
   never the real app's in a build without a signing identity.
 - `sectrust` (macOS): the system's trust in https servers, through the

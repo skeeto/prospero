@@ -508,6 +508,8 @@ static Str istr(Arena *a, i64 v)
 #include "test/eval_test.cpp"
 #include "deskhelp.cpp"
 #include "test/desktop_test.cpp"
+#include "dbus.cpp"
+#include "test/dbus_test.cpp"
 #if PROSPERO_GUI
 #  include "sched.cpp"
 #  include "highlight.cpp"
@@ -556,6 +558,7 @@ int main()
     test_deploy(&t);
     test_eval(&t);
     test_desktop(&t);
+    test_dbus(&t);
     #if PROSPERO_GUI
     test_sched(&t);
     test_highlight(&t);

@@ -1,5 +1,14 @@
-// Desktop helper, Linux X11 platform layer
+// Desktop helper, Linux platform layer: X11 here, Wayland in
+// deskwayland.cpp, chosen at run time
 // $ c++ -std=c++20 -o prospero-desktop src/main_desktop_x11.cpp
+//
+// A session is Wayland's when WAYLAND_DISPLAY is set, or when
+// XDG_SESSION_TYPE says wayland and there is no DISPLAY; else X11's.
+// PROSPERO_DESKTOP_SESSION=x11 or =wayland overrides that. Under
+// Wayland, X11 programs shown by Xwayland are still X windows, and when
+// the compositor offers no way to name windows of its own, theirs are
+// named through the X11 code below, while the screen and input go
+// through the portal (deskwayland.cpp), since Xwayland sees neither.
 //
 // libX11, libXext (MIT-SHM) and libXtst (XTEST) are loaded at run time
 // with dlopen, as SDL3 loads them for the GUI, so the helper builds
@@ -27,9 +36,6 @@
 // to it: the X focus inside it, and a manager's _NET_ACTIVE_WINDOW too;
 // else the command fails, naming what has the keyboard, and sends none.
 //
-// Wayland is not supported yet: a Wayland session is refused, rather
-// than half-driven through Xwayland.
-//
 // This is free and unencumbered software released into the public domain.
 #include <dlfcn.h>
 #include <errno.h>
@@ -37,12 +43,15 @@
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdio.h>   // rename
 #include <stdlib.h>  // getenv
 #include <string.h>  // strerror
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -261,7 +270,13 @@ struct Bound {
     i64 used;     // when it was last typed, dk_ms
 };
 
+struct Wl;
+
 struct Dk {
+    b32       wayland;      // a Wayland session: through wl
+    Wl       *wl;
+    b32       xwl;          // and its windows are Xwayland's, through X11
+    f64       xk;           // Xwayland's pixels to a logical pixel
     Xlib      x;
     Display  *dpy;
     Xid       root;
@@ -401,6 +416,8 @@ static Str fromcstr(char *s)
     for (; s && s[r.len]; r.len++) {}
     return r;
 }
+
+#include "deskwayland.cpp"
 
 
 // Loading Xlib
@@ -773,6 +790,15 @@ static DkRect makerect(i32 x, i32 y, i32 w, i32 h)
     return {x, y, x+w, y+h};
 }
 
+static DkRect unscale(DkRect r, f64 k)
+{
+    r.left   = (i32)(r.left / k);
+    r.top    = (i32)(r.top / k);
+    r.right  = (i32)(r.right / k);
+    r.bottom = (i32)(r.bottom / k);
+    return r;
+}
+
 static Geom geometry(Dk *dk, Arena a, Xid w)
 {
     Geom              r  = {};
@@ -812,6 +838,13 @@ static Geom geometry(Dk *dk, Arena a, Xid w)
         r.frame.right  -= (i32)propitem(g, 1);
         r.frame.top    += (i32)propitem(g, 2);
         r.frame.bottom -= (i32)propitem(g, 3);
+    }
+
+    // Xwayland may count in pixels of a scaled display (Mutter's native
+    // scaling), more of them than the compositor's logical pixels
+    if (dk->xk > 1) {
+        r.client = unscale(r.client, dk->xk);
+        r.frame  = unscale(r.frame, dk->xk);
     }
     return r;
 }
@@ -855,12 +888,20 @@ static Str dk_why(Dk *dk)
 {
     Str r = dk->failed;
     dk->failed = {};
+    if (dk->wayland && dk->wl->failed.data) {
+        r = dk->wl->failed;
+        dk->wl->failed = {};
+    }
     return r;
 }
 
-// X asks no permission of a client of the display.
-static b32 dk_access(Dk *, Buf *, b32)
+// X asks no permission of a client of the display; Wayland's portal
+// asks the user.
+static b32 dk_access(Dk *dk, Buf *b, b32 ask)
 {
+    if (dk->wayland) {
+        return wlaccess(dk->wl, dk->tmp, b, ask);
+    }
     return 1;
 }
 
@@ -906,23 +947,14 @@ static void loadkeys(Dk *dk)
     dk->x.XFree(syms);
 }
 
-static Str dk_ready(Dk *dk)
+// Open the X display once, or why it cannot be.
+static Str x11open(Dk *dk)
 {
-    while (waitpid(-1, 0, WNOHANG) > 0) {}  // programs run that ended
-    if (dk->why.data) {
-        return dk->why;
-    }
-    Arena *perm = &dk->tmp;  // what stays allocated here stays for good
-    Str    session = fromcstr(getenv("XDG_SESSION_TYPE"));
-    Str    wayland = fromcstr(getenv("WAYLAND_DISPLAY"));
+    Arena *perm    = &dk->tmp;  // what stays allocated here stays for good
     Str    display = fromcstr(getenv("DISPLAY"));
-    if (session=="wayland" || (wayland.len && !display.len)) {
-        return "this is a Wayland session, and Wayland is not supported "
-               "yet: the desktop helper works with X11 only";
-    } else if (!display.len) {
+    if (!display.len) {
         return "no X display: DISPLAY is not set";
     }
-
     if (!dk->dpy) {
         if (!dk->x.XOpenDisplay) {
             Str why = loadxlib(dk, perm);
@@ -954,12 +986,68 @@ static Str dk_ready(Dk *dk)
         dk->x.XInternAtoms(dk->dpy, (char **)atomnames, A_COUNT, 0, dk->atom);
     }
     findwm(dk, dk->tmp);
-    loadkeys(dk);
-    if (recoverkeys(dk)) {
-        loadkeys(dk);  // with the spare keycodes recovered
-        recoverkeys(dk);
-    }
     return {};
+}
+
+static b32 waylandsession()
+{
+    Str force   = fromcstr(getenv("PROSPERO_DESKTOP_SESSION"));
+    Str session = fromcstr(getenv("XDG_SESSION_TYPE"));
+    Str wayland = fromcstr(getenv("WAYLAND_DISPLAY"));
+    Str display = fromcstr(getenv("DISPLAY"));
+    if (force=="x11" || force=="wayland") {
+        return force == "wayland";
+    }
+    return wayland.len || (session=="wayland" && !display.len);
+}
+
+static Str dk_ready(Dk *dk)
+{
+    while (waitpid(-1, 0, WNOHANG) > 0) {}  // programs run that ended
+    if (dk->why.data) {
+        return dk->why;
+    }
+    dk->wayland = waylandsession();
+    if (dk->wayland) {
+        Str why = wlready(dk->wl, dk->tmp);
+        if (why.data) {
+            return why;
+        }
+        // Xwayland's windows, when the compositor names none
+        dk->xwl = 0;
+        if (dk->wl->winapi == WIN_NONE) {
+            dk->xwl = !x11open(dk).data && dk->ewmh;
+            dk->why = {};  // X11 is optional here
+        }
+        if (dk->xwl && dk->xk==0) {
+            XWindowAttributes wa = {};
+            dk->x.XGetWindowAttributes(dk->dpy, dk->root, &wa);
+            i32 lw = wlwidth(dk->wl, dk->tmp);
+            dk->xk = lw>0 && wa.width>lw ? (f64)wa.width/lw : 1;
+        }
+        return {};
+    }
+    Str why = x11open(dk);
+    if (!why.data) {
+        loadkeys(dk);
+        if (recoverkeys(dk)) {
+            loadkeys(dk);  // with the spare keycodes recovered
+            recoverkeys(dk);
+        }
+    }
+    return why;
+}
+
+// Under Wayland without a compositor's window list, whatever names
+// windows says so for a selection that matches none (dk_why).
+static void nowindows(Dk *dk)
+{
+    Str why = dk->wl->winwhy;
+    if (dk->xwl) {
+        why = concat(&dk->wl->perm, why, ", so only X11 windows (Xwayland's) "
+                     "can be named");
+    }
+    dk->wl->failed = why;
 }
 
 // The windows mapped, and those a manager minimized or keeps on another
@@ -967,6 +1055,15 @@ static Str dk_ready(Dk *dk)
 // be named, and activating one brings it back.
 static Slice<DkWin> dk_windows(Dk *dk, Arena *a, b32 all)
 {
+    if (dk->wayland) {
+        if (dk->wl->winapi != WIN_NONE) {
+            return wlwindows(dk->wl, a, all);
+        }
+        nowindows(dk);
+        if (!dk->xwl) {
+            return {};
+        }
+    }
     Slice<Xid>   ids = toplevels(dk, a, dk->tmp);
     Slice<DkWin> r   = {};
     for (iz i = 0; i < ids.len; i++) {
@@ -985,22 +1082,69 @@ static Slice<DkWin> dk_windows(Dk *dk, Arena *a, b32 all)
     return r;
 }
 
-static DkWin dk_window(Dk *dk, Arena *a, u64 id)
-{
-    return id ? describe(dk, a, (Xid)id).win : DkWin{};
-}
-
 static DkWin dk_screen(Dk *dk)
 {
-    DkWin             r  = {};
+    DkWin r = {};
+    r.title = "screen";
+    if (dk->wayland) {
+        if (!portalopen(dk->wl, dk->tmp).data) {
+            r.rect = wlscreen(dk->wl);
+        }
+        return r;
+    }
     XWindowAttributes wa = {};
     dk->x.XGetWindowAttributes(dk->dpy, dk->root, &wa);
-    r.rect  = makerect(0, 0, wa.width, wa.height);
-    r.title = "screen";
+    r.rect = makerect(0, 0, wa.width, wa.height);
     return r;
 }
 
+// The window with the keyboard, on a desktop that cannot say which: the
+// screen's rectangle, since where it lies is not known either.
+static DkWin focusedwin(Dk *dk)
+{
+    DkWin r = {};
+    r.id    = WL_FOCUSED;
+    r.rect  = dk_screen(dk).rect;
+    r.title = "(the window with the keyboard)";
+    return r;
+}
+
+static DkWin dk_window(Dk *dk, Arena *a, u64 id)
+{
+    if (dk->wayland && id==WL_FOCUSED) {
+        return focusedwin(dk);
+    } else if (dk->wayland && dk->wl->winapi!=WIN_NONE) {
+        return wlwindow(dk->wl, a, id);
+    } else if (dk->wayland && !dk->xwl) {
+        return {};
+    }
+    return id ? describe(dk, a, (Xid)id).win : DkWin{};
+}
+
+static u64 x11foreground(Dk *dk);
+
 static u64 dk_foreground(Dk *dk)
+{
+    if (dk->wayland && dk->wl->winapi!=WIN_NONE) {
+        return wlforeground(dk->wl, dk->tmp);
+    } else if (dk->wayland) {
+        // An X window, or else one of Wayland's that cannot be named.
+        // While a Wayland window has the keyboard, Mutter calls a window
+        // of its own active, which is no window to the user.
+        u64 x = dk->xwl ? x11foreground(dk) : 0;
+        if (x) {
+            Arena t = dk->tmp;
+            XWin  w = describe(dk, &t, (Xid)x);
+            DkRect r = w.geom.frame;
+            x = w.win.id && w.geom.viewable && !w.geom.popup &&
+                r.right-r.left>1 && r.bottom-r.top>1 ? x : 0;
+        }
+        return x ? x : WL_FOCUSED;
+    }
+    return x11foreground(dk);
+}
+
+static u64 x11foreground(Dk *dk)
 {
     if (dk->has[A_ACTIVE]) {
         Card c = getcard(dk, dk->root, dk->atom[A_ACTIVE], XA_WINDOW);
@@ -1019,6 +1163,9 @@ static u64 dk_foreground(Dk *dk)
 
 static b32 dk_popup(Dk *dk, DkWin *w)
 {
+    if (dk->wayland && dk->wl->winapi!=WIN_NONE) {
+        return metapopup(w->level & 0xffff);
+    }
     XWindowAttributes wa = {};
     if (dk->x.XGetWindowAttributes(dk->dpy, (Xid)w->id, &wa) && wa.override_redirect) {
         return 1;
@@ -1049,7 +1196,7 @@ static Xid focus(Dk *dk)
 // calls it active. Focus that follows the pointer confirms nothing.
 static b32 haskeyboard(Dk *dk, Xid w)
 {
-    if (dk->has[A_ACTIVE] && dk_foreground(dk)!=w) {
+    if (dk->has[A_ACTIVE] && x11foreground(dk)!=w) {
         return 0;
     }
     Xid f   = focus(dk);
@@ -1087,6 +1234,11 @@ static Str refused(Dk *dk, DkWin *w)
 // only when the keyboard is confirmed to go to it (haskeyboard).
 static b32 dk_activate(Dk *dk, DkWin *w)
 {
+    if (dk->wayland && w->id==WL_FOCUSED) {
+        return 1;  // has the keyboard by definition
+    } else if (dk->wayland && dk->wl->winapi!=WIN_NONE) {
+        return wlactivate(dk->wl, dk->tmp, w);
+    }
     Xid id = (Xid)w->id;
     b32 ok = haskeyboard(dk, id);
     for (i32 attempt = 0; !ok && attempt < 2; attempt++) {
@@ -1236,6 +1388,9 @@ static u8 *shmcapture(Dk *dk, Arena *a, DkRect r)
 // The screen is in pixels, its units, so a capture is the size asked.
 static u8 *dk_capture(Dk *dk, Arena *a, DkRect r, DkSize *size)
 {
+    if (dk->wayland) {
+        return wlcapture(dk->wl, a, r, size);
+    }
     size->w = r.right - r.left;
     size->h = r.bottom - r.top;
     u8 *r32 = dk->shm ? shmcapture(dk, a, r) : 0;
@@ -1266,12 +1421,18 @@ static b32 flushed(Dk *dk)
 
 static b32 dk_pointer(Dk *dk, i32 x, i32 y)
 {
+    if (dk->wayland) {
+        return wlpointer(dk->wl, dk->tmp, x, y);
+    }
     dk->x.XTestFakeMotionEvent(dk->dpy, -1, x, y, 0);
     return flushed(dk);
 }
 
 static b32 dk_button(Dk *dk, i32 button, b32 down)
 {
+    if (dk->wayland) {
+        return wlbutton(dk->wl, dk->tmp, button, down);
+    }
     dk->x.XTestFakeButtonEvent(dk->dpy, button ? 3 : 1, down, 0);
     return flushed(dk);
 }
@@ -1279,6 +1440,9 @@ static b32 dk_button(Dk *dk, i32 button, b32 down)
 // Buttons 4 and 5 are the wheel up and down, a click a notch.
 static b32 dk_wheel(Dk *dk, i32 notches)
 {
+    if (dk->wayland) {
+        return wlwheel(dk->wl, dk->tmp, notches);
+    }
     u32 button = notches>0 ? 4 : 5;
     i32 n      = notches>0 ? notches : -notches;
     for (i32 i = 0; i < n; i++) {
@@ -1358,8 +1522,12 @@ static i32 dk_keycode(Dk *dk, Str k, b32 *shift)
         i32 c = utf8decode(k, &i);
         if (i == k.len && c > ' ') {
             c   = c>='A' && c<='Z' ? c+'a'-'A' : c;
-            sym = keysymof(c);
+            sym = dk->wayland ? wlsymof(dk->wl, c) : keysymof(c);
         }
+    }
+    if (dk->wayland) {
+        // Keysyms, found in the desktop's keymap as they are pressed
+        return sym ? (i32)sym : -1;
     }
     Key key = sym ? findkey(dk, sym) : Key{};
     if (!key.code) {
@@ -1371,6 +1539,9 @@ static i32 dk_keycode(Dk *dk, Str k, b32 *shift)
 
 static b32 dk_keys(Dk *dk, i32 *codes, i32 n)
 {
+    if (dk->wayland) {
+        return wlkeys(dk->wl, dk->tmp, codes, n);
+    }
     for (i32 i = 0; i < n; i++) {
         dk->x.XTestFakeKeyEvent(dk->dpy, (u32)codes[i], 1, 0);
     }
@@ -1640,6 +1811,9 @@ static void unbindall(Dk *dk)
 // one gets there after an unbinding that followed the key at once.
 static b32 dk_text(Dk *dk, Arena scratch, Str s)
 {
+    if (dk->wayland) {
+        return wltext(dk->wl, scratch, s);
+    }
     Slice<Xid> syms = {};
     for (iz i = 0; i < s.len;) {
         i32 c = utf8decode(s, &i);
@@ -1718,8 +1892,25 @@ static b32 dk_text(Dk *dk, Arena scratch, Str s)
 
 // Through the manager, else as a manager would: WM_DELETE_WINDOW to a
 // client that takes it. One that does not is not closed by force.
+// The window with the keyboard, when it cannot be named, cannot be
+// acted on either.
+static b32 unnamed(Dk *dk, DkWin *w)
+{
+    if (dk->wayland && w->id==WL_FOCUSED) {
+        dk->wl->failed = concat(&dk->wl->perm, "cannot act on a window that "
+                                "cannot be named: ", dk->wl->winwhy);
+        return 1;
+    }
+    return 0;
+}
+
 static b32 dk_close(Dk *dk, DkWin *w)
 {
+    if (unnamed(dk, w)) {
+        return 0;
+    } else if (dk->wayland && dk->wl->winapi!=WIN_NONE) {
+        return wlclose(dk->wl, dk->tmp, w);
+    }
     Xid id = (Xid)w->id;
     xerror = 0;
     if (dk->has[A_CLOSE]) {
@@ -1754,6 +1945,11 @@ static b32 dk_close(Dk *dk, DkWin *w)
 // the client's own terms, else directly.
 static b32 dk_move(Dk *dk, DkWin *w, i32 x, i32 y, i32 cw, i32 ch, b32 size)
 {
+    if (unnamed(dk, w)) {
+        return 0;
+    } else if (dk->wayland && dk->wl->winapi!=WIN_NONE) {
+        return wlmove(dk->wl, dk->tmp, w, x, y, cw, ch, size);
+    }
     Xid  id = (Xid)w->id;
     Geom g  = geometry(dk, dk->tmp, id);
     if (!g.ok) {
@@ -1765,6 +1961,11 @@ static b32 dk_move(Dk *dk, DkWin *w, i32 x, i32 y, i32 cw, i32 ch, b32 size)
     ch -= (g.frame.bottom - g.frame.top) - (g.client.bottom - g.client.top);
     if (size && (cw<1 || ch<1)) {
         return 0;
+    } else if (dk->xk > 1) {
+        x  = (i32)(x * dk->xk);
+        y  = (i32)(y * dk->xk);
+        cw = (i32)(cw * dk->xk);
+        ch = (i32)(ch * dk->xk);
     }
     xerror = 0;
     if (dk->has[A_MOVERESIZE]) {
@@ -2460,8 +2661,22 @@ static u8 procstate(u32 pid)
     return paren>=0 && paren+2<got ? buf[paren+2] : 0;
 }
 
+// Under Wayland with no way to see its windows, any process counts as
+// having one.
 static b32 haswindow(Dk *dk, u32 pid)
 {
+    if (dk->wayland && dk->wl->winapi!=WIN_NONE) {
+        Arena        a  = dk->tmp;
+        Slice<DkWin> ws = wlwindows(dk->wl, &a, 0);
+        for (iz i = 0; i < ws.len; i++) {
+            if (ws[i].pid == pid) {
+                return 1;
+            }
+        }
+        return 0;
+    } else if (dk->wayland) {
+        return 1;  // its window may be Wayland's, which cannot be seen
+    }
     Arena a = dk->tmp;
     Arena t = {};  // apart from the list, which grows in a
     iz    n = (iz)1 << 20;
@@ -2568,12 +2783,15 @@ int main(int argc, char **argv)
     iz      cap = sizeof(void *)==8 ? (iz)1<<32 : (iz)1<<29;
     Region *r   = reserve(cap);
     Region *t   = reserve((iz)1<<26);
-    if (!r || !t) {
+    Region *w   = reserve((iz)1<<28);
+    if (!r || !t || !w) {
         os_oom();
     }
     Arena a  = newarena(r);
     Dk   *dk = alloc<Dk>(&a);
     dk->tmp = newarena(t);
+    dk->wl  = alloc<Wl>(&a);
+    dk->wl->perm = newarena(w);
 
     Str *args = alloc<Str>(&a, argc);
     for (i32 i = 0; i < argc; i++) {

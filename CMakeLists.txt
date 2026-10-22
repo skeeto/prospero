@@ -242,9 +242,10 @@ if(WIN32)
   set_target_properties(prospero-desktop PROPERTIES
     OUTPUT_NAME ${PROSPERO_NAME}-desktop)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  # On X11 (src/main_desktop_x11.cpp): libX11, libXext and libXtst are
-  # loaded at run time, as SDL3 loads them, so it builds without them,
-  # and never statically, which dlopen needs
+  # On X11 and Wayland (src/main_desktop_x11.cpp, src/deskwayland.cpp):
+  # libX11, libXext and libXtst, and libei, libxkbcommon and libpipewire,
+  # are loaded at run time, as SDL3 loads them, so it builds without
+  # them, and never statically, which dlopen needs
   add_executable(prospero-desktop src/main_desktop_x11.cpp)
   target_link_libraries(prospero-desktop PRIVATE prospero_core_flags
     ${CMAKE_DL_LIBS})

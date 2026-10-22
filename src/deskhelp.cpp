@@ -399,7 +399,13 @@ static DkWin dkfindone(DkCtx *c, Str spec)
 
     Slice<DkWin> m = dkfindall(c, &s);
     if (!m.len) {
+        // A desktop that cannot list some windows says why
+        Str why = dk_why(c->dk);
         dkfail(c, DK_NOMATCH, "no window matches", spec);
+        if (why.data) {
+            print(&c->err, ": ");
+            print(&c->err, why);
+        }
     } else if (m.len > 1) {
         Buf b(c->a, 256);
         print(&b, (i64)m.len);
@@ -841,6 +847,13 @@ static void dkcmdlist(DkCtx *c, DkArgs *a)
             dkprintwin(&c->out, &ws[i]);
         }
     }
+    if (!ws.len) {
+        // Nothing listed, since the desktop would not say
+        Str why = dk_why(c->dk);
+        if (why.data) {
+            dkfail(c, DK_FAIL, why);
+        }
+    }
 }
 
 static void dkcmdshot(DkCtx *c, DkArgs *a)
@@ -882,7 +895,8 @@ static void dkcmdshot(DkCtx *c, DkArgs *a)
     i32 width  = r.right - r.left;
     i32 height = r.bottom - r.top;
     if (width<=0 || height<=0) {
-        dkfail(c, DK_FAIL, "window is off screen or empty", w.title);
+        // or the screen itself cannot be seen, which the platform says
+        dkfailwhy(c, "window is off screen or empty", w.title);
         return;
     } else if (!c->serving && dk_console(c->dk, 1)) {
         dkfail(c, DK_FAIL, "refusing to write PNG to a console, redirect it");
