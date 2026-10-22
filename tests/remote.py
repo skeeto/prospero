@@ -496,6 +496,78 @@ def no_host(t):
     t.check(not t.hostpids(), "no host started")
 
 
+def tmplinks(target):
+    """This user's links in /tmp that the harness names, leading to target."""
+    out = []
+    for name in os.listdir("/tmp"):
+        path = os.path.join("/tmp", name)
+        if name.startswith(f"prospero-{os.geteuid()}-") and os.path.islink(path) and \
+                os.readlink(path) == target:
+            out.append(path)
+    return out
+
+
+@scenario
+def stale_links(t):
+    """A state directory too deep for a socket address is reached through
+    a link in /tmp (os_endpoint), which a client makes as well as a host,
+    and which outlives the directory when a host was killed, or never
+    ran. The next host to start removes this user's links that lead
+    nowhere, and only those."""
+    if os.name == "nt":
+        return "skip"  # pipe names, no links
+    short = t.state
+    deep = os.path.join(t.root, "deep-" + "x" * 100)
+    t.state = os.path.join(deep, "state")
+    run = os.path.join(os.path.realpath(t.root), os.path.basename(deep), "state", "run")
+
+    # A client alone makes one, then a host killed leaves it
+    p = subprocess.run([t.prospero, "attach", "--reconnect", "--state", t.state],
+                       capture_output=True, text=True, timeout=10)
+    t.check(p.returncode == 90, f"attach --reconnect: exit {p.returncode}: {p.stderr}")
+    links = tmplinks(run)
+    t.check(len(links) == 1, f"a client's link to {run}: {links}")
+    c = Client(t)
+    s = c.attach()
+    c.call("hello")
+    pids = t.hostpids()
+    t.check(len(pids) == 1, f"one host: {pids}")
+    t.check(tmplinks(run) == links, f"the host's link is the client's: {tmplinks(run)}")
+    signal_ours(pids[0], signal.SIGKILL, t.ownhost, "host")
+    t.check(gone(pids[0]), "the host was killed")
+    s.kill()
+    link = links[0]
+    t.check(os.path.exists(link), "the link leads to the run directory")
+    shutil.rmtree(deep)  # now it leads nowhere
+
+    # Others: one that leads nowhere, one that leads somewhere, and one
+    # leading nowhere by a name not the harness's
+    def name(tail=""):
+        return f"/tmp/prospero-{os.geteuid()}-{random.randrange(1 << 64):016x}{tail}"
+    dead, live, other = name(), name(), name("x")
+    planted = [link, dead, live, other]  # all removed after, whatever happens
+    try:
+        os.symlink(os.path.join(t.root, "gone", "run"), dead)
+        os.symlink(t.root, live)
+        os.symlink(os.path.join(t.root, "gone", "run"), other)
+        t.state = short
+        c = Client(t)
+        s = c.attach()
+        c.call("hello")
+        t.check(not os.path.lexists(link), f"the host's dead link stays: {link}")
+        t.check(not os.path.lexists(dead), "the other dead link stays")
+        t.check(os.path.islink(live), "a live link was removed")
+        t.check(os.path.islink(other), "a link by another name was removed")
+        c.call("quit")
+        s.close()
+    finally:
+        for path in planted:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
 @scenario
 def attach_reconnect(t):
     """A host started by attach; the attach killed mid-stream; attach

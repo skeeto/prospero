@@ -42,7 +42,8 @@ import traceback
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from scenarios import Failure, LocalHost, SshHost, XpHost, lanaddress, settle  # noqa: E402
+from scenarios import (Failure, LocalHost, SshHost, XpHost, lanaddress,  # noqa: E402
+                       leftbehind, settle)
 
 
 # The web server
@@ -780,6 +781,7 @@ def main():
         web.stop.set()
         host.close()
         web.shutdown()
+        leftbehind(host)
 
 
 if __name__ == "__main__":

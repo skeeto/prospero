@@ -92,7 +92,17 @@ class LocalHost:
         self.t0 = time.time()
 
     def close(self):
+        for link in tmplinks(self.root):  # what hosts killed, or clients, left
+            try:
+                os.unlink(link)
+            except FileNotFoundError:
+                pass
         shutil.rmtree(self.root, ignore_errors=True)
+
+    def leftovers(self):
+        """What close left: the root, or links in /tmp into it."""
+        left = [self.root] if os.path.lexists(self.root) else []
+        return left + tmplinks(self.root)
 
     def join(self, *parts):
         return os.path.join(*parts)
@@ -155,20 +165,46 @@ class SshHost:
     def __init__(self, host, prospero, port, rport):
         self.host = host
         self.prospero = prospero
-        self.ctl = os.path.join(tempfile.mkdtemp(prefix="prospero-ssh-"), "ctl")
-        subprocess.run(["ssh", "-M", "-S", self.ctl, "-fN", "-o", "ExitOnForwardFailure=yes",
-                        "-R", f"{rport}:127.0.0.1:{port}", host], check=True)
-        self.url = f"http://127.0.0.1:{rport}"
-        tmp = self.sh("echo \"$TMP\"").strip()
-        self.root = f"{tmp}/prospero-scen-{random.randrange(1 << 32):08x}"
-        self.sh(f"mkdir -p {self.root} && cp $HOME/w64devkit/bin/busybox.exe "
-                f"{self.root}/busybox.exe && cp {shlex.quote(prospero)} {self.root}/prospero.exe")
+        # The master connection's socket, in a directory of the run's own
+        self.ctldir = tempfile.mkdtemp(prefix="prospero-ssh-")
+        self.ctl = os.path.join(self.ctldir, "ctl")
+        self.root = None
+        try:
+            subprocess.run(["ssh", "-M", "-S", self.ctl, "-fN", "-o",
+                            "ExitOnForwardFailure=yes", "-R",
+                            f"{rport}:127.0.0.1:{port}", host], check=True)
+            self.url = f"http://127.0.0.1:{rport}"
+            tmp = self.sh("echo \"$TMP\"").strip()
+            self.root = f"{tmp}/prospero-scen-{random.randrange(1 << 32):08x}"
+            self.sh(f"mkdir -p {self.root} && cp $HOME/w64devkit/bin/busybox.exe "
+                    f"{self.root}/busybox.exe && cp {shlex.quote(prospero)} "
+                    f"{self.root}/prospero.exe")
+        except BaseException:
+            self.close()
+            raise
         self.exe = f"{self.root}/prospero.exe"
 
     def close(self):
-        self.sh(cleanroot(self.root))
-        subprocess.run(["ssh", "-S", self.ctl, "-O", "exit", self.host],
-                       capture_output=True)
+        """Remove the root there, then stop the master connection, and
+        remove its directory here once it is gone."""
+        try:
+            if self.root:
+                self.sh(cleanroot(self.root))
+        finally:
+            subprocess.run(["ssh", "-S", self.ctl, "-O", "exit", self.host],
+                           capture_output=True)
+            # The master removes its socket as it exits, which may be a
+            # moment after "-O exit" returns. One still there after that
+            # stays with its directory, for whoever must stop the master.
+            deadline = time.monotonic() + 10
+            while os.path.exists(self.ctl) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if not os.path.exists(self.ctl):
+                shutil.rmtree(self.ctldir, ignore_errors=True)
+
+    def leftovers(self):
+        """What close left here."""
+        return [self.ctldir] if os.path.lexists(self.ctldir) else []
 
     @linktime
     def ssh(self, command, **kw):
@@ -300,6 +336,9 @@ class XpHost(SshHost):
     def close(self):
         self.sh(cleanroot(self.root), check=False)
 
+    def leftovers(self):
+        return []  # nothing here
+
     @linktime
     def ssh(self, command, input=None, **kw):
         for attempt in range(4):
@@ -353,6 +392,33 @@ END {{ exit ok ? 0 : 1 }}' && kill -9 "$pid"
         if r.returncode:
             print(f"     kill: refused or failed for pid {pid}: {r.stderr.strip()}",
                   flush=True)
+
+
+def tmplinks(root):
+    """This user's links in /tmp, by the harness's names for them
+    (os_endpoint, main_posix.cpp), that lead into root."""
+    if not hasattr(os, "geteuid"):
+        return []  # Windows: pipe names
+    real = os.path.realpath(root) + os.sep
+    out = []
+    for name in os.listdir("/tmp"):
+        path = os.path.join("/tmp", name)
+        if not name.startswith(f"prospero-{os.geteuid()}-"):
+            continue
+        try:
+            if os.lstat(path).st_uid == os.geteuid() and os.readlink(path).startswith(real):
+                out.append(path)
+        except OSError:
+            pass  # gone meanwhile, or no link
+    return out
+
+
+def leftbehind(host):
+    """After host.close(): fail the run if it left anything here."""
+    left = host.leftovers()
+    if left:
+        print(f"FAIL left behind here: {' '.join(left)}", flush=True)
+        sys.exit(1)
 
 
 def cleanroot(root):
@@ -3531,6 +3597,7 @@ def main():
         fake_provider.STATE.stop.set()
         host.close()
         srv.shutdown()
+        leftbehind(host)
 
 
 if __name__ == "__main__":
