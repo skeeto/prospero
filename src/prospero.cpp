@@ -454,7 +454,17 @@ static Str usage =
 "  --selftest [URL]  run the platform integration tests, with HTTP\n"
 "                    tests against a fake provider at URL\n"
 "  -h                print this message\n"
-"Run \"prospero run\" without arguments for its options.\n";
+"Run \"prospero run\" without arguments for its options.\n"
+#if defined(_WIN32) && PROSPERO_GUI
+// The GUI subsystem: an interactive console does not wait for it, nor
+// show what it writes, unless that goes through a pipe or a file
+"\n"
+"prospero.exe is a GUI program, so at an interactive cmd or PowerShell\n"
+"prompt it prints nothing and the prompt returns at once. Pipe or\n"
+"redirect its output instead: prospero --version | more, or > out.txt.\n"
+"Over ssh and in scripts it works as usual.\n"
+#endif
+;
 
 static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
 {
