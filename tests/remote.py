@@ -13,20 +13,20 @@ once and in order (the same bytes as its log), and the deltas of a
 response exactly once even when the stream breaks in the middle.
 
   uv run tests/remote.py --harness build/harness [NAME ...]
-  uv run tests/remote.py --harness build/harness --ssh rat.local \\
+  uv run tests/remote.py --harness build/harness --ssh HOST \\
       --remote-harness /tmp/harness-m5-remote/build/harness
 
 With --ssh the ssh scenarios run too: "harness connect --ssh HOST" against
 the harness already built on that host, which reaches the fake provider
 through a reverse tunnel. Its ssh is a wrapper that records its pid, so
 that a scenario can kill it in the middle of a stream. A host that cannot
-forward a port back, like the user's XP sshd, takes --no-tunnel (the
+forward a port back, like skeeto/sshd on XP, takes --no-tunnel (the
 provider then listens on this machine's LAN address), and --shell for
 its scripts:
 
-  uv run tests/remote.py --harness build/harness --ssh 192.168.1.106 \\
+  uv run tests/remote.py --harness build/harness --ssh XPHOST \\
       --no-tunnel --shell "sh -s" --remote-harness C:/.../harness.exe \\
-      --remote-root C:/DOCUME~1/wellons/LOCALS~1/Temp/harness-m5-remote \\
+      --remote-root %TMP%/harness-m5-remote \\
       ssh_reconnect ssh_offline
 """
 

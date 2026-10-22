@@ -22,13 +22,13 @@ to it with the fake provider reached as in tests/remote.py, and runs a
 turn with a shell command in it. Engines it put in ~/.harness there, and
 ~/.harness itself if it made it, are removed at the end:
 
-  uv run tests/deploy.py --harness build/harness --ssh rat.local \\
+  uv run tests/deploy.py --harness build/harness --ssh HOST \\
       --remote-root /tmp/harness-m5-deploy real
-  uv run tests/deploy.py --harness build/harness --ssh biron.local --windows \\
-      --remote-root C:/Users/wellons/AppData/Local/Temp/harness-m5-deploy real
-  uv run tests/deploy.py --harness build/harness --ssh 192.168.1.106 \\
+  uv run tests/deploy.py --harness build/harness --ssh WINHOST --windows \\
+      --remote-root %TMP%/harness-m5-deploy real
+  uv run tests/deploy.py --harness build/harness --ssh XPHOST \\
       --no-tunnel --shell "sh -s" \\
-      --remote-root C:/DOCUME~1/wellons/LOCALS~1/Temp/harness-m5-deploy real
+      --remote-root %TMP%/harness-m5-deploy real
 """
 
 import argparse

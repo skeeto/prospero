@@ -16,13 +16,14 @@ writes it:
   windows-x86_64  here, with mingw-w64 (Homebrew's): CRT-free
   windows-i686    the same, the XP engine (cmake/Toolchain-Mingw32.cmake),
                   its imports checked against XP SP3 by tests/imports.py
-  linux-aarch64   on HOST over ssh (--linux, an aarch64 Linux machine with
-  linux-x86_64    the x86_64-linux-gnu cross compiler): static, so that
-                  any C library will do, and checked to run (x86_64 under
-                  the host's QEMU binfmt, if it has one). Names resolve
-                  through /etc/hosts and DNS, which glibc has built in;
-                  mDNS (.local) needs the machine's NSS module, which a
-                  static program loads only where glibc's version matches
+  linux-aarch64   on HOST over ssh (--linux or $HARNESS_LINUX_HOST, an
+  linux-x86_64    aarch64 Linux machine with the x86_64-linux-gnu cross
+                  compiler): static, so that any C library will do, and
+                  checked to run (x86_64 under the host's QEMU binfmt, if
+                  it has one). Names resolve through /etc/hosts and DNS,
+                  which glibc has built in; mDNS (.local) needs the
+                  machine's NSS module, which a static program loads
+                  only where glibc's version matches
 
 The Linux builds get the source as an archive of the working tree (what
 git tracks and what it would add, so uncommitted changes too) through
@@ -169,8 +170,9 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "build", "engines"))
     ap.add_argument("--work", default=os.path.join(ROOT, "build-engines"),
                     help="build directories here (default: build-engines)")
-    ap.add_argument("--linux", default="rat.local",
-                    help="ssh host for the Linux builds (default: rat.local)")
+    ap.add_argument("--linux", default=os.environ.get("HARNESS_LINUX_HOST"),
+                    help="ssh host for the Linux builds "
+                         "(default: $HARNESS_LINUX_HOST)")
     ap.add_argument("--remote-dir", default="/tmp/harness-engines",
                     help="its build directory (default: /tmp/harness-engines)")
     ap.add_argument("--deps", help="FetchContent sources: mbedtls-src, cpp-httplib-src")
@@ -180,6 +182,9 @@ def main():
     for p in plats:
         if p not in PLATFORMS:
             sys.exit(f"engines: unknown platform {p}: one of {' '.join(PLATFORMS)}")
+    lin = [p for p in plats if p.startswith("linux-")]
+    if lin and not args.linux:
+        sys.exit("engines: the Linux builds need --linux HOST or $HARNESS_LINUX_HOST")
     if args.deps:
         args.deps = os.path.abspath(args.deps)
     os.makedirs(args.out, exist_ok=True)
@@ -189,7 +194,6 @@ def main():
     for arch in ("x86_64", "i686"):
         if f"windows-{arch}" in plats:
             windows(args, ver, arch)
-    lin = [p for p in plats if p.startswith("linux-")]
     if lin:
         linux(args, ver, lin)
     say(f"done: {args.out}")

@@ -301,8 +301,8 @@ static void remoteown(Remote *r, Arena scratch, i32 cmd, Str sid, i64 from, i32 
 
 // An argument of the remote command, for the remote machine's shell: as
 // it is when plain, else in double quotes, which sh and cmd.exe both
-// take, a backslash included (sh drops one unquoted, as on the XP
-// laptop's busybox), and a leading - too. Returns 0 for what they do not
+// take, a backslash included (sh drops one unquoted, as busybox's does
+// on XP), and a leading - too. Returns 0 for what they do not
 // both take literally inside them: quotes, $, `, %, control characters,
 // and a backslash before another or at the end (a UNC path, say).
 static b32 remotearg(Buf *b, Str s)

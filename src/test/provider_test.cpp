@@ -69,8 +69,8 @@ static void test_provider(Test *t)
         expect(t, "url query only", urlshow(a, "http://h?x"), "invalid");
 
         Str local[] = {"localhost", "LOCALHOST", "127.0.0.1", "127.9.9.9", "10.0.0.1",
-                       "172.16.0.1", "172.31.255.255", "192.168.1.106", "169.254.1.1",
-                       "biron.local", "[::1]", "x.localhost"};
+                       "172.16.0.1", "172.31.255.255", "192.168.0.10", "169.254.1.1",
+                       "box.local", "[::1]", "x.localhost"};
         Str remote[] = {"example.com", "8.8.8.8", "172.32.0.1", "172.15.0.1",
                         "192.169.0.1", "local", "1.2.3", "1.2.3.4.5", "300.1.1.1"};
         for (iz i = 0; i < countof(local); i++) {

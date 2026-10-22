@@ -25,7 +25,7 @@
 //    the same engine means nothing to upload. With no tool there to
 //    compute a SHA-256 (below), deploying fails at once, for good.
 // 4. Upload with scp to that name plus ".part", again after a dropped
-//    link (the XP laptop's Wi-Fi stalls), and verify its SHA-256 there
+//    link (an XP laptop's Wi-Fi stalls), and verify its SHA-256 there
 //    (sha256sum, shasum -a 256 or openssl; certutil -hashfile in cmd).
 //    A damaged copy is uploaded again.
 // 5. Rename it into place, and run it once (--version): an engine that
@@ -58,7 +58,7 @@ enum : i64 {
 };
 
 // Tries of an ssh command whose ssh failed (255), or of an upload, with
-// waits between them: together about as long as the XP laptop's Wi-Fi
+// waits between them: together about as long as an XP laptop's Wi-Fi
 // stalls, a minute or two.
 enum : i32 {
     DEPLOY_TRIES = 6,

@@ -46,8 +46,8 @@ Survivors are killed afterward, by pids read one per line and
 confirmed to be ours first (pids.py).
 
   uv run tests/cleanup.py --harness build/harness
-  uv run tests/cleanup.py --harness PATH --host biron.local
-  uv run tests/cleanup.py --harness PATH --xp 192.168.1.106
+  uv run tests/cleanup.py --harness PATH --host WINHOST
+  uv run tests/cleanup.py --harness PATH --xp XPHOST
 """
 
 import argparse

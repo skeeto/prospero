@@ -13,7 +13,7 @@ from after the directories are made, without the time spent waiting on
 ssh for a remote host's files and processes.
 
   uv run tests/scenarios.py --harness build/harness [NAME ...]
-  uv run tests/scenarios.py --harness PATH --host biron.local   (Windows)
+  uv run tests/scenarios.py --harness PATH --host WINHOST   (Windows)
   uv run tests/scenarios.py --harness build/harness --soak 30
 
 With --host, the fake provider runs here and the harness runs on the
@@ -22,10 +22,11 @@ PATH is the harness.exe already on that host. busybox.exe is copied next
 to it from the host's w64devkit, which is how the harness finds its shell.
 
   uv run tests/scenarios.py --harness 'C:/DOCUME~1/u/LOCALS~1/Temp/harness.exe' \\
-      --xp 192.168.1.106 [NAME ...]
+      --xp XPHOST [NAME ...]
 
-With --xp, the same for Windows XP running the user's own sshd: no
-tunnel, so the provider listens on this machine's LAN address instead.
+With --xp, the same for Windows XP running skeeto/sshd
+(https://github.com/skeeto/sshd): no tunnel, so the provider listens
+on this machine's LAN address instead.
 """
 
 import argparse
@@ -274,9 +275,9 @@ class SshHost:
 
 
 class XpHost(SshHost):
-    """Windows XP over the user's own sshd, whose commands run in busybox
-    sh. It takes one channel per connection and forwards no ports, and
-    XP's firewall blocks a new program's listening, so the harness there
+    """Windows XP over skeeto/sshd, whose commands run in busybox sh.
+    It takes one channel per connection and forwards no ports, and XP's
+    firewall blocks a new program's listening, so the harness there
     connects out to the fake provider on this machine's LAN address.
     Each command is a connection of its own, retried when the link (Wi-Fi,
     which stalls now and then) drops it."""

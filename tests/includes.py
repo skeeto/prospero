@@ -13,15 +13,15 @@ and the includes with their fetch times. The server logs every request,
 so a case also checks what was asked (conditional or not, how often).
 
   uv run tests/includes.py --harness build/harness [NAME ...]
-  uv run tests/includes.py --harness PATH --host biron.local   (Windows)
-  uv run tests/includes.py --harness PATH --xp 192.168.1.106   (XP)
+  uv run tests/includes.py --harness PATH --host WINHOST   (Windows)
+  uv run tests/includes.py --harness PATH --xp XPHOST      (XP)
 
 With --host, the server runs here and the harness on the Windows host
 over ssh, reaching the server through a reverse tunnel, as in
 scenarios.py; PATH is the harness.exe already on that host. With --xp,
-the same for Windows XP and the user's own sshd, which forwards no
-ports: the server listens on this machine's LAN address, over plain
-http, as XP's WinHTTP has no TLS 1.2.
+the same for Windows XP and skeeto/sshd (https://github.com/skeeto/sshd),
+which forwards no ports: the server listens on this machine's LAN
+address, over plain http, as XP's WinHTTP has no TLS 1.2.
 """
 
 import argparse

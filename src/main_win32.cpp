@@ -1313,11 +1313,12 @@ static Str os_lasterr(Os *, Arena *a)
 // Before Windows 8 jobs do not nest: a process in a job, such as one an
 // SSH server started, cannot put its children in jobs of their own
 // (jobcheck). Where its job lets children leave, each tool leaves it for
-// its own. That beats relaunching the harness outside the job (the
-// user's sshd's escapejob): the harness stays in the job it started in,
-// so it still ends with that session, and its tools with it. Where the
-// job keeps its children, tools run without jobs, with a warning: a hard
-// kill ends only the tool's own process, and nothing ends it with ours.
+// its own. That beats relaunching the harness outside the job (as
+// escapejob in skeeto/sshd, https://github.com/skeeto/sshd, does): the
+// harness stays in the job it started in, so it still ends with that
+// session, and its tools with it. Where the job keeps its children,
+// tools run without jobs, with a warning: a hard kill ends only the
+// tool's own process, and nothing ends it with ours.
 
 enum : iz {
     PROC_TAILMAX  = 1<<12,

@@ -29,7 +29,7 @@ static void test_deploy(Test *t)
         // busybox-w32 sh on XP
         {"Windows_NT i686\n%OS%\n", "windows-i686 sh Windows_NT i686"},
         {"Windows_NT x86_64\n%OS%\n", "windows-x86_64 sh Windows_NT x86_64"},
-        // cmd.exe, no uname (as on biron), with ver after a blank line
+        // cmd.exe, no uname (as on Windows 11), with ver after a blank line
         {"Windows_NT AMD64 %PROCESSOR_ARCHITEW6432% \r\n\r\n"
          "Microsoft Windows [Version 10.0.26200.9711]\r\n",
          "windows-x86_64 cmd Microsoft Windows [Version 10.0.26200.9711]"},
@@ -140,15 +140,15 @@ static void test_deploy(Test *t)
     // Records, by destination
     {
         Os *os = newos(&a, 1<<16);
-        Str rec = "host = pi@rat.local\nplatform = linux-aarch64\nshell = sh\n"
+        Str rec = "host = me@host.example\nplatform = linux-aarch64\nshell = sh\n"
                   "path = .harness/engine-0-1-linux-aarch64\nsha256 = ab\n"
                   "version = 1\nproto = 0\ndeployed = 5\n";
-        Str path = deployfile(&a, "/st", "pi@rat.local", ".ini");
-        expect(t, "deploy.record.file", path, "/st/deploy/pi@rat.local.ini");
+        Str path = deployfile(&a, "/st", "me@host.example", ".ini");
+        expect(t, "deploy.record.file", path, "/st/deploy/me@host.example.ini");
         expect(t, "deploy.record.safe", deployfile(&a, "/st", ".a/b:c d", ".ini"),
                "/st/deploy/_a_b_c_d.ini");
         os_write(os, a, path, rec);
-        DeployRec r = deployrecord(os, &a, "/st", "pi@rat.local");
+        DeployRec r = deployrecord(os, &a, "/st", "me@host.example");
         expect(t, "deploy.record.ok", r.ok ? Str("ok") : Str("no"), "ok");
         expect(t, "deploy.record.path", r.path, ".harness/engine-0-1-linux-aarch64");
         expect(t, "deploy.record.platform", r.platform, "linux-aarch64");
