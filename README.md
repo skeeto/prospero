@@ -47,8 +47,10 @@ and Ninja on the PATH:
 The Windows GUI is its own Win32 layer over Direct3D 11, and HTTP goes
 through WinHTTP, so it uses the system's certificates and proxies. The
 toolchain files in `cmake/` cross-compile for Windows with Mingw-w64
-(`Toolchain-Mingw64.cmake`, `Toolchain-Mingw32.cmake`) and for x86-64
-Linux (`Toolchain-Linux-x86_64.cmake`).
+(`Toolchain-Mingw64.cmake`, `Toolchain-Mingw32.cmake`), for Windows on
+Linux with w64devkit's own GCC under Wine, as releases are built
+(`Toolchain-W64devkit-Wine.cmake`), and for x86-64 Linux
+(`Toolchain-Linux-x86_64.cmake`).
 
 `-DPROSPERO_GUI=OFF` builds the headless engine alone, with no GUI
 dependencies. On Windows it is CRT-free and imports only kernel32,
@@ -66,6 +68,47 @@ so the GUI build still runs headless where no display libraries exist.
 With `-DPROSPERO_GUI=OFF`, `-DPROSPERO_STATIC=ON` links the headless
 engine fully statically, as `tools/engines.py` does for the Linux
 engines it builds.
+
+## Releases
+
+Each release on GitHub carries six files:
+
+- `prospero-VERSION.tar.gz`: the source, with every dependency unpacked
+  under `deps/`, so that it builds with no network:
+
+      $ tar xzf prospero-VERSION.tar.gz
+      $ cmake -S prospero-VERSION -B build -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+      $ cmake --build build
+
+- `prospero-VERSION-windows-x86_64.exe`: the Windows program, the GUI
+  with its engine.
+- `prospero-engine-VERSION-windows-x86_64.exe` and
+  `prospero-engine-VERSION-windows-i686.exe`: headless engines for
+  Windows, the i686 one for XP.
+- `prospero-engine-VERSION-linux-x86_64` and
+  `prospero-engine-VERSION-linux-aarch64`: headless engines for Linux,
+  linked statically.
+
+The engines are named as `prospero deploy` expects to find them, in an
+`engines` directory next to the executable. There is no macOS build;
+build it from source.
+
+The release workflow (`.github/workflows/release.yml`) builds every
+program from the source tarball alone. The Windows programs are built
+on Linux by [w64devkit][]'s GCC under Wine, the same programs it builds
+on Windows, stripped and with no timestamp, then signed with an
+Authenticode signature (Azure Artifact Signing), which Windows shows in
+the file's Properties, under Digital Signatures. `tools/dist.py` makes
+the source tarball from any commit, the same commit always giving the
+same tar file.
+
+GitHub records each file's SHA-256 digest, shown on the release page
+next to the file. To check the files downloaded into the current
+directory against them all at once:
+
+    $ gh release view vVERSION -R skeeto/prospero --json assets \
+          --jq '.assets[] | .digest[7:] + "  " + .name' |
+          sha256sum -c --ignore-missing
 
 ## Usage
 

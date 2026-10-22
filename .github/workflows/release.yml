@@ -1,0 +1,271 @@
+# On a version tag (v1.2.3, which must equal the project VERSION in
+# CMakeLists.txt, which is PROSPERO_VERSION), build, test, and publish a
+# release of six assets: the source tarball, and programs built from it
+# alone, with FetchContent disconnected.
+#
+#   prospero-VERSION.tar.gz                     the source, every dependency
+#                                               unpacked under deps/
+#                                               (tools/dist.py), deterministic
+#   prospero-VERSION-windows-x86_64.exe         the GUI, engine included
+#   prospero-engine-VERSION-windows-x86_64.exe  headless engines, named as
+#   prospero-engine-VERSION-windows-i686.exe      "prospero deploy" finds
+#   prospero-engine-VERSION-linux-x86_64          them; i686 is the XP engine,
+#   prospero-engine-VERSION-linux-aarch64         and Linux ones are static
+#
+# The Windows programs are built here on Linux by a pinned w64devkit's
+# GCC under Wine (cmake/Toolchain-W64devkit-Wine.cmake), since Ubuntu's
+# Mingw-w64 lacks #embed. They are stripped, with zero PE timestamps, and
+# signed through Azure Artifact Signing (aas-sign, by OIDC, with the
+# release environment's secrets) in a job of their own, which only signs
+# and publishes what the build jobs made. GitHub records each asset's
+# SHA-256 digest.
+#
+# Run by hand (workflow_dispatch), only the build jobs run: nothing is
+# signed or published, and the programs are left as the run's artifacts.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Explicitly bash, which runs steps with -e and pipefail
+defaults:
+  run:
+    shell: bash
+
+env:
+  W64DEVKIT_VERSION: 2.10.1
+  W64DEVKIT_SHA256: add1edf984ce4d473cfeb7c52e0ab38db73a855bba6c7f564d5e16648eb2896a
+  UV_VERSION: 0.13.0
+  UV_SHA256: 1468ebd5a5541121837c5a2817b9972ba6090fa6caa3d142620850a47fb75154
+
+jobs:
+  build:
+    name: Source, Linux x86_64 and Windows
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      WINEDEBUG: -all
+      WINEDLLOVERRIDES: mscoree,mshtml=  # no Mono or Gecko to install
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+
+      - name: Check the version
+        id: version
+        run: |
+          v=$(sed -n 's/^project(prospero VERSION \([0-9.]*\) .*/\1/p' CMakeLists.txt)
+          if [ -z "$v" ]; then
+              echo "::error::no project VERSION in CMakeLists.txt"
+              exit 1
+          fi
+          # The GUI's manifest names the version too, by hand
+          if ! grep -q "name='prospero' version='$v.0'" assets/prospero.manifest; then
+              echo "::error::assets/prospero.manifest's version is not $v.0"
+              exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$v" ]; then
+              echo "::error::tag $GITHUB_REF_NAME is not v$v (the project VERSION)"
+              exit 1
+          fi
+          echo "V=$v" >>"$GITHUB_ENV"
+          echo "version=$v" >>"$GITHUB_OUTPUT"
+
+      # Wine, uv for the Python suites, and w64devkit, the last two pinned
+      # by SHA-256. w64devkit's GCC is multilib, so -m32 builds the i686
+      # engine, and only 64-bit Windows programs run under Wine.
+      - name: Install the tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wine
+          u=uv-x86_64-unknown-linux-gnu
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$u.tar.gz" \
+              "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$u.tar.gz"
+          echo "$UV_SHA256  $RUNNER_TEMP/$u.tar.gz" | sha256sum -c
+          tar xzf "$RUNNER_TEMP/$u.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$u" >>"$GITHUB_PATH"
+          w=w64devkit-x64-$W64DEVKIT_VERSION.7z.exe
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$w" \
+              "https://github.com/skeeto/w64devkit/releases/download/v$W64DEVKIT_VERSION/$w"
+          echo "$W64DEVKIT_SHA256  $RUNNER_TEMP/$w" | sha256sum -c
+          7z x -o"$RUNNER_TEMP" "$RUNNER_TEMP/$w" >/dev/null
+          echo "W64DEVKIT=$RUNNER_TEMP/w64devkit" >>"$GITHUB_ENV"
+          wine wineboot --init
+
+      # Twice, the second from the same downloads, to show it deterministic.
+      # Everything after builds from what it unpacks to.
+      - name: Source tarball
+        run: |
+          mkdir dist
+          python3 -I tools/dist.py --cache "$RUNNER_TEMP/deps" \
+              -o "dist/prospero-$V.tar.gz" "$GITHUB_SHA"
+          python3 -I tools/dist.py --cache "$RUNNER_TEMP/deps" \
+              -o "$RUNNER_TEMP/again.tar.gz" "$GITHUB_SHA"
+          cmp "dist/prospero-$V.tar.gz" "$RUNNER_TEMP/again.tar.gz"
+          tar xzf "dist/prospero-$V.tar.gz" -C "$RUNNER_TEMP"
+          echo "SRC=$RUNNER_TEMP/prospero-$V" >>"$GITHUB_ENV"
+
+      - name: Build and test
+        run: |
+          cmake -S "$SRC" -B build -G Ninja -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+          cmake --build build
+          ctest --test-dir build -j"$(nproc)" --output-on-failure
+
+      - name: Engine, Linux x86_64
+        run: |
+          cmake -S "$SRC" -B build-engine -G Ninja -DPROSPERO_GUI=OFF \
+              -DPROSPERO_STATIC=ON -DCMAKE_EXE_LINKER_FLAGS=-s \
+              -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+          cmake --build build-engine --target prospero
+          exe=build-engine/prospero
+          if readelf -lW "$exe" | grep -q 'program interpreter'; then
+              echo "::error::the Linux engine is not static"
+              exit 1
+          fi
+          test "$($exe --version)" = "prospero $V"
+          "$exe" --selftest
+          cp "$exe" "dist/prospero-engine-$V-linux-x86_64"
+
+      # The engines import only what Windows XP has (tests/imports.py), and
+      # each program runs under Wine far enough to tell its version
+      - name: Windows programs
+        run: |
+          # (The engines fetch nothing, so they ignore the last option)
+          w=(-G Ninja -DCMAKE_TOOLCHAIN_FILE="$SRC/cmake/Toolchain-W64devkit-Wine.cmake"
+             -DCMAKE_EXE_LINKER_FLAGS=-s --no-warn-unused-cli
+             -DFETCHCONTENT_FULLY_DISCONNECTED=ON)
+          cmake -S "$SRC" -B build-gui "${w[@]}"
+          cmake -S "$SRC" -B build-x64 "${w[@]}" -DPROSPERO_GUI=OFF
+          cmake -S "$SRC" -B build-x86 "${w[@]}" -DPROSPERO_GUI=OFF -DW64DEVKIT_ARCH=i686
+          for b in build-gui build-x64 build-x86; do
+              cmake --build "$b" --target prospero
+          done
+          python3 -I tools/pecheck.py --machine x86_64 --subsystem gui build-gui/prospero.exe
+          python3 -I tools/pecheck.py --machine x86_64 --subsystem console build-x64/prospero.exe
+          python3 -I tools/pecheck.py --machine i686 --subsystem console build-x86/prospero.exe
+          python3 -I tests/imports.py build-x64/prospero.exe build-x86/prospero.exe
+          for b in build-gui build-x64 build-x86; do
+              test "$(wine "$b/prospero.exe" --version)" = "prospero $V"
+          done
+          cp build-gui/prospero.exe "dist/prospero-$V-windows-x86_64.exe"
+          cp build-x64/prospero.exe "dist/prospero-engine-$V-windows-x86_64.exe"
+          cp build-x86/prospero.exe "dist/prospero-engine-$V-windows-i686.exe"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: build
+          path: dist/
+          if-no-files-found: error
+
+  linux-aarch64:
+    name: Linux aarch64
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+
+      # From a source tarball of its own, whose contents the release job
+      # checks against the published one's
+      - name: Engine, Linux aarch64
+        run: |
+          v=$(sed -n 's/^project(prospero VERSION \([0-9.]*\) .*/\1/p' CMakeLists.txt)
+          python3 -I tools/dist.py -o "$RUNNER_TEMP/src.tar.gz" "$GITHUB_SHA"
+          tar xzf "$RUNNER_TEMP/src.tar.gz" -C "$RUNNER_TEMP"
+          cmake -S "$RUNNER_TEMP/prospero-$v" -B build-engine -G Ninja \
+              -DPROSPERO_GUI=OFF -DPROSPERO_STATIC=ON -DCMAKE_EXE_LINKER_FLAGS=-s \
+              -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+          cmake --build build-engine --target prospero
+          exe=build-engine/prospero
+          if readelf -lW "$exe" | grep -q 'program interpreter'; then
+              echo "::error::the Linux engine is not static"
+              exit 1
+          fi
+          test "$($exe --version)" = "prospero $v"
+          "$exe" --selftest
+          mkdir out
+          cp "$exe" "out/prospero-engine-$v-linux-aarch64"
+          gzip -dc "$RUNNER_TEMP/src.tar.gz" | sha256sum | cut -d' ' -f1 >out/source.sha256
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: linux-aarch64
+          path: out/
+          if-no-files-found: error
+
+  release:
+    name: Sign and publish
+    needs: [build, linux-aarch64]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write  # gh release create
+      id-token: write  # aas-sign's OIDC exchange
+    env:
+      V: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          path: artifacts
+
+      # Exactly the six assets, the aarch64 engine's source the same
+      - name: Gather the assets
+        run: |
+          mkdir dist
+          mv artifacts/build/* dist/
+          mv "artifacts/linux-aarch64/prospero-engine-$V-linux-aarch64" dist/
+          want=$(cat artifacts/linux-aarch64/source.sha256)
+          got=$(gzip -dc "dist/prospero-$V.tar.gz" | sha256sum | cut -d' ' -f1)
+          if [ "$want" != "$got" ]; then
+              echo "::error::the aarch64 engine's source tarball differs"
+              exit 1
+          fi
+          for f in "prospero-$V.tar.gz" \
+                   "prospero-$V-windows-x86_64.exe" \
+                   "prospero-engine-$V-windows-x86_64.exe" \
+                   "prospero-engine-$V-windows-i686.exe" \
+                   "prospero-engine-$V-linux-x86_64" \
+                   "prospero-engine-$V-linux-aarch64"; do
+              if [ ! -f "dist/$f" ]; then
+                  echo "::error::no $f"
+                  exit 1
+              fi
+          done
+          all=(dist/*)
+          if [ "${#all[@]}" -ne 6 ]; then
+              echo "::error::dist/ holds more than the six assets"
+              exit 1
+          fi
+
+      - name: Sign the Windows programs
+        uses: skeeto/aas-sign@0008af00d4dd2ff2e482ba5ede70831d78f9da59  # v1.1.0
+        with:
+          version:   v1.1.0
+          endpoint:  ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          account:   ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          profile:   ${{ secrets.CERTIFICATE_PROFILE }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          files: |
+            dist/prospero-${{ env.V }}-windows-x86_64.exe
+            dist/prospero-engine-${{ env.V }}-windows-x86_64.exe
+            dist/prospero-engine-${{ env.V }}-windows-i686.exe
+
+      # A signature is a nonempty security directory (data directory 4)
+      - name: Check the signatures
+        run: python3 -I tools/pecheck.py --signed dist/*.exe
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+              --title "Prospero $V" dist/*
