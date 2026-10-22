@@ -205,6 +205,57 @@ static void test_tools(Test *t)
         expect(t, "countlines", istr(a, countlines("a\nb")*10 + countlines("a\nb\n")), "22");
     }
 
+    // The final newline of a file written whole: content, whether a file
+    // existed, its size and last bytes (null: unreadable), the suffix
+    {
+        struct {
+            Str content;
+            b32 existed;
+            i64 size;
+            Str tail;
+            Str want;
+        } cases[] = {
+            {"x", 0, 0, {}, "\n"},                  // no line breaks: LF
+            {"a\nb", 0, 0, {}, "\n"},
+            {"a\r\nb", 0, 0, {}, "\r\n"},           // CRLF as the content's
+            {"a\r\nb\nc\r\nd", 0, 0, {}, "\r\n"},   // mixed: as most are,
+            {"a\nb\nc\r\nd", 0, 0, {}, "\n"},
+            {"a\r\nb\nc", 0, 0, {}, "\r\n"},        // CRLF on a tie
+            {"a\r\nb\r", 0, 0, {}, "\n"},           // a lone CR gains an LF
+            {"a\nb\r", 0, 0, {}, "\n"},
+            {"\r", 0, 0, {}, "\n"},
+            {"", 0, 0, {}, ""},                     // empty stays empty
+            {"\xef\xbb\xbf", 0, 0, {}, ""},
+            {"\xef\xbb\xbfx", 0, 0, {}, "\n"},
+            {"a\n", 0, 0, {}, ""},                  // already ended
+            {"a\r\n", 0, 0, {}, ""},
+            {"\n", 0, 0, {}, ""},
+            {"a\0b", 0, 0, {}, ""},                 // binary
+            {"x", 1, 0, "", "\n"},                  // an existing empty file
+            {"x", 1, 0, {}, "\n"},
+            {"x", 1, 9, "y\n", "\n"},               // old ended: so does this,
+            {"x", 1, 9, "y\r\n", "\r\n"},           // with no line breaks as it
+            {"x", 1, 1, "\n", "\n"},
+            {"x\r", 1, 9, "y\r\n", "\n"},
+            {"a\nb", 1, 9, "\r\n", "\n"},           // else as the content
+            {"a\r\nb", 1, 9, "y\n", "\r\n"},
+            {"a\n", 1, 9, "yz", ""},
+            {"x", 1, 9, "yz", ""},                  // old unended: as given
+            {"a\r\nb", 1, 9, "y\r", ""},
+            {"a\nb", 1, 1, "z", ""},
+            {"", 1, 9, "y\n", ""},
+            {"x", 1, 9, {}, "\n"},                  // unreadable: as new
+            {"a\r\nb", 1, 9, {}, "\r\n"},
+            {"x", 1, 9, "", "\n"},
+            {"x", 0, 9, "y", "\n"},                 // no file, whatever else
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            expect(t, concat(a, "finalnewline ", istr(a, i)),
+                   finalnewline(cases[i].content, cases[i].existed, cases[i].size,
+                                cases[i].tail), cases[i].want);
+        }
+    }
+
     // The file tools
     {
         Os *os = newos(a, 1<<20);
@@ -267,6 +318,65 @@ static void test_tools(Test *t)
         o = toolwrite(os, a, "/w", w.path, &w);
         expect(t, "write", o.text, "Created sub/dir/out.txt (4 bytes, 2 lines).");
 
+        // A whole file written ends in a newline, unless it replaces one
+        // that did not, and what was written is exactly what rewind finds
+        struct {
+            Str name;
+            Str old;      // null: no such file
+            Str content;
+            Str want;     // on disk
+            Str text;
+        } writes[] = {
+            {"new", {}, "int main(void) { return 0; }", "int main(void) { return 0; }\n",
+             "Created f.c (29 bytes, 1 lines; added a final newline)."},
+            {"new crlf", {}, "a\r\nb", "a\r\nb\r\n",
+             "Created f.c (6 bytes, 2 lines; added a final newline)."},
+            {"new ended", {}, "a\n", "a\n", "Created f.c (2 bytes, 1 lines)."},
+            {"new empty", {}, "", "", "Created f.c (0 bytes, 0 lines)."},
+            {"empty file", "", "x", "x\n",
+             "Replaced f.c (2 bytes, 1 lines; added a final newline)."},
+            {"old ended", "old\n", "a\nb", "a\nb\n",
+             "Replaced f.c (4 bytes, 2 lines; added a final newline)."},
+            {"old crlf", "\xef\xbb\xbfold\r\n", "x", "x\r\n",
+             "Replaced f.c (3 bytes, 1 lines; added a final newline)."},
+            {"old unended", "no newline", "still none", "still none",
+             "Replaced f.c (10 bytes, 1 lines)."},
+            {"old unended lf", "x", "a\nb", "a\nb", "Replaced f.c (3 bytes, 2 lines)."},
+        };
+        for (iz i = 0; i < countof(writes); i++) {
+            Str name = concat(a, "write ", writes[i].name);
+            os_remove(os, *a, "/w/f.c");
+            if (writes[i].old.data) {
+                os_write(os, *a, "/w/f.c", writes[i].old);
+            }
+            Args wa = {};
+            wa.content = writes[i].content;
+            o = toolwrite(os, a, "/w", "/w/f.c", &wa);
+            expect(t, name, o.text, writes[i].text);
+            expect(t, concat(a, name, " on disk"), vread(os, a, "/w/f.c"), writes[i].want);
+            expect(t, concat(a, name, " wrote"), istr(a, o.ok && o.wrote.data &&
+                   o.wrote==vread(os, a, "/w/f.c")), "1");
+        }
+
+        // A longer file replaced: its last bytes decide
+        Buf big(a, 1<<16);
+        for (i32 i = 0; i < 4096; i++) print(&big, "0123456789abcd\r\n");
+        os_write(os, *a, "/w/big.txt", finish(&big));
+        Args bw = {};
+        bw.content = "small";
+        o = toolwrite(os, a, "/w", "/w/big.txt", &bw);
+        expect(t, "write over a long file", vread(os, a, "/w/big.txt"), "small\r\n");
+
+        // edit with an empty old_string creates a file as write does
+        Args ec = {};
+        ec.path   = "/w/made.txt";
+        ec.newstr = "fresh";
+        o = tooledit(os, a, "/w", ec.path, &ec);
+        expect(t, "edit creates ended", o.text,
+               "Created made.txt (6 bytes, 1 lines; added a final newline).");
+        expect(t, "edit created ended", vread(os, a, "/w/made.txt"), "fresh\n");
+        expect(t, "edit created wrote", istr(a, o.wrote==vread(os, a, "/w/made.txt")), "1");
+
         // hashline: read shows the tag, and edit checks it
         os_write(os, *a, "/w/h.txt", "one\ntwo\n");
         Str tag = filetag(a, "one\ntwo\n");
@@ -302,6 +412,14 @@ static void test_tools(Test *t)
                             "\"{\\\"op\\\":\\\"delete\\\",\\\"line\\\":\\\"2\\\"}\"}", EDIT_HASHLINE);
         expect(t, "hashline forgiving", istr(a, hc.issues.len*100 + hc.hedits.len*10 +
                                              hc.hedits[0].end), "12");
+        // An empty file gains whole lines, so it ends in a newline
+        Str  eraw = concat(a, concat(a, "{\"path\":\"e.txt\",\"tag\":\"", filetag(a, "")),
+                           "\",\"edits\":[{\"op\":\"insert\",\"line\":0,\"text\":\"x\"}]}");
+        Args he   = parseargs(a, TOOL_EDIT, eraw, EDIT_HASHLINE);
+        o = toolhash(os, a, "/w", "/w/e.txt", &he);
+        expect(t, "hashline into an empty file", concat(a, istr(a, o.ok), vread(os, a, "/w/e.txt")),
+               "1x\n");
+        expect(t, "hashline wrote", istr(a, o.wrote==vread(os, a, "/w/e.txt")), "1");
 
         // patch: every file is worked out before any changes
         os_write(os, *a, "/w/p.c", "int x = 1;\nint y = 2;\n");
@@ -323,6 +441,7 @@ static void test_tools(Test *t)
         expect(t, "patch move to", plan.changes[0].data, "int x = 1;\nint y = 3;\n");
         expect(t, "patch move from", istr(a, plan.changes[1].path=="/w/p.c" &&
                                              !plan.changes[1].data.data), "1");
+        expect(t, "patch added ended", plan.changes[3].data, "fresh\n");
         expect(t, "patch nothing yet", vread(os, a, "/w/p.c"), "int x = 1;\nint y = 2;\n");
         pa.patch.files[1].file = "/w/none.c";
         plan = planpatch(os, a, "/w", &pa.patch);

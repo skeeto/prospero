@@ -837,8 +837,8 @@ def repair(t):
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     st = [e["status"] for e in r.all("tool.end")]
     t.check(st == ["ok", "ok", "error"], f"statuses {st}")
-    t.check(t.file("r.txt") == "line1\nline2", f"raw newline repaired: {t.file('r.txt')!r}")
-    t.check(t.file("s.txt") == "ok", "double-encoded arguments repaired")
+    t.check(t.file("r.txt") == "line1\nline2\n", f"raw newline repaired: {t.file('r.txt')!r}")
+    t.check(t.file("s.txt") == "ok\n", "double-encoded arguments repaired")
     t.check(t.file("x.txt") is None, "truncated arguments not acted on")
     err = r.all("tool.end")[2]["text"]
     t.check("Invalid arguments" in err and "call the tool again" in err, f"how to fix: {err}")
@@ -1484,7 +1484,7 @@ def outside(t):
     deny = r.all("tool.end")[0]["text"]
     t.check("outside the working directory" in deny and "x.txt" in deny, f"hint: {deny}")
     t.check(t.host.read(t.host.join(t.work, "..", "x.txt")) is None, "nothing written outside")
-    t.check(t.file("x.txt") == "yes", "the corrected call succeeds")
+    t.check(t.file("x.txt") == "yes\n", "the corrected call succeeds")
 
 
 @scenario(bound=25)
@@ -1602,7 +1602,7 @@ def ask_allow(t):
                 f"answer {ans}")
         te = h.all("tool.end", sid)[0]
         t.check(te["status"] == "ok", f"the write ran: {te}")
-        t.check(outside_file(t) == "outside", "the file was written outside")
+        t.check(outside_file(t) == "outside\n", "the file was written outside")
         r = h.call("answer", sid=sid, req=ask["req"], decision="allow")
         t.check(r.get("ok") == 0 and "nothing is waiting" in r.get("err", ""),
                 f"a late answer is refused: {r}")
@@ -1630,7 +1630,7 @@ def ask_deny(t):
         deny = h.all("tool.end", sid)[0]["text"]
         t.check("denied by the user" in deny and "keep it inside" in deny, f"why: {deny}")
         t.check(outside_file(t) is None, "nothing written outside")
-        t.check(t.file("inside.txt") == "inside", "the agent wrote inside instead")
+        t.check(t.file("inside.txt") == "inside\n", "the agent wrote inside instead")
         msgs = t.requests()[1]["body"]["messages"]
         t.check(msgs[-1].get("role") == "tool" and "keep it inside" in msgs[-1].get("content", ""),
                 "the agent read the denial")
@@ -1655,7 +1655,7 @@ def ask_timeout(t):
         deny = h.all("tool.end", sid)[0]
         t.check(deny["status"] == "denied" and "nobody answered within 2 seconds" in deny["text"],
                 f"why: {deny}")
-        t.check(t.file("inside.txt") == "inside", "the agent wrote inside instead")
+        t.check(t.file("inside.txt") == "inside\n", "the agent wrote inside instead")
         r = h.call("answer", sid=sid, req=ask["req"], decision="allow")
         t.check(r.get("ok") == 0, f"an answer after the deadline is refused: {r}")
     finally:
@@ -1682,7 +1682,7 @@ def ask_steer(t):
         t.check(msgs[-2].get("role") == "tool" and msgs[-1].get("role") == "user" and
                 msgs[-1].get("content") == "no, put it in steered.txt",
                 "the agent reads the denial, then the steer")
-        t.check(t.file("steered.txt") == "no, put it in steered.txt", "and acts on it")
+        t.check(t.file("steered.txt") == "no, put it in steered.txt\n", "and acts on it")
         t.check(outside_file(t) is None, "nothing written outside")
     finally:
         rc = h.close()
@@ -1699,7 +1699,7 @@ def ask_close(t):
         t.check(end["why"] == "done", f"the turn goes on unattended: {end}")
         ans = h.all("answer", sid)[0]
         t.check(ans["decision"] == "deny" and ans["by"] == "policy", f"answer {ans}")
-        t.check(t.file("inside.txt") == "inside", "the agent wrote inside instead")
+        t.check(t.file("inside.txt") == "inside\n", "the agent wrote inside instead")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -1976,7 +1976,7 @@ def steer_tool(t):
         t.check(end["why"] == "done", f"the turn goes on: {end}")
         st = [e["status"] for e in h.all("tool.end", sid)]
         t.check(st == ["ok", "denied", "ok"], f"statuses {st}")
-        t.check(t.file("steered.txt") == "no, put it in steered.txt", "the steer is acted on")
+        t.check(t.file("steered.txt") == "no, put it in steered.txt\n", "the steer is acted on")
         t.check(outside_file(t) is None, "nothing written outside")
     finally:
         rc = h.close()
@@ -2093,7 +2093,7 @@ def config_roots(t):
         t.check(not h.all("ask", sid), f"no ask: {h.all('ask', sid)}")
         st = [e["status"] for e in h.all("tool.end", sid)]
         t.check(st == ["ok"], f"written: {st}")
-        t.check(outside_file(t) == "outside", "the file is in the new root")
+        t.check(outside_file(t) == "outside\n", "the file is in the new root")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -2713,7 +2713,7 @@ def task_ask(t):
         t.check(end["why"] == "done", f"the parent ends {end}")
         ans = h.all("answer", ask["sid"])
         t.check(ans and ans[0]["by"] == "user" and ans[0]["decision"] == "allow", f"{ans}")
-        t.check(outside_file(t) == "from the child", "written outside")
+        t.check(outside_file(t) == "from the child\n", "written outside")
         te = h.all("tool.end", sid)
         t.check(te and te[0]["text"] == "The child wrote it.", f"report {te}")
     finally:
@@ -3337,6 +3337,56 @@ def pretty_fallback(t):
             f"the switch: {[x for x in out if 'fallback' in x][:2]}")
     t.check(any(x.startswith("[slow retry in ") and f" on {t.model}: " in x
                 for x in out), f"the slow retry: {[x for x in out if 'slow' in x][:2]}")
+
+
+@scenario(bound=15)
+def final_newline(t):
+    """A file written whole ends in a newline though the agent's content
+    does not: a new one gains it in the content's line endings, one that
+    replaces a file ending in CRLF gains a CRLF, and one that replaces a
+    file deliberately without stays without. Rewind puts back the bytes
+    exactly, so what each call wrote is what it says it wrote."""
+    t.put("plain.txt", "deliberately without a newline")
+    t.put("crlf.txt", "one\r\ntwo\r\n")
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(r.text() == "Wrote them all.", f"text {r.text()!r}")
+    ends = [e["text"] for e in r.all("tool.end")]
+    t.check(ends == ["Created main.c (29 bytes, 1 lines; added a final newline).",
+                     "Replaced plain.txt (23 bytes, 1 lines).",
+                     "Replaced crlf.txt (11 bytes, 1 lines; added a final newline).",
+                     "Created win.txt (6 bytes, 2 lines; added a final newline).",
+                     "Created made.txt (13 bytes, 1 lines; added a final newline)."],
+            f"results {ends}")
+    want = {"main.c": "int main(void) { return 0; }\n",
+            "plain.txt": "replaced, still without",
+            "crlf.txt": "only line\r\n",
+            "win.txt": "a\r\nb\r\n",
+            "made.txt": "made by edit\n"}
+    got = {k: t.file(k) for k in want}
+    t.check(got == want, f"files {got}")
+    write = [x["function"] for x in t.requests()[0]["body"]["tools"]
+             if x["function"]["name"] == "write"]
+    t.check("without a final newline gets one" in write[0]["description"],
+            f"the write tool says so: {write[0]['description']!r}")
+
+    sid = r.events[0]["sid"]
+    h = t.headless()
+    try:
+        o = h.call("open", sid=sid, **{"from": 0})
+        t.check(o.get("ok") == 1, f"opened {o}")
+        rr = h.call("rewind", sid=sid, to=1)
+        got = sorted((os.path.basename(f["path"]), f["result"]) for f in rr.get("files", []))
+        t.check(got == [("crlf.txt", "restored"), ("made.txt", "removed"),
+                        ("main.c", "removed"), ("plain.txt", "restored"),
+                        ("win.txt", "removed")], f"rewound {rr}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    left = {k: t.file(k) for k in want}
+    t.check(left == {"main.c": None, "plain.txt": "deliberately without a newline",
+                     "crlf.txt": "one\r\ntwo\r\n", "win.txt": None, "made.txt": None},
+            f"put back {left}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

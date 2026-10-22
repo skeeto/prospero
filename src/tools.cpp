@@ -259,7 +259,9 @@ static Str tooljson(Arena *a, ToolEnv *te)
         {
             "write",
             "Create or replace a whole file with the given content, creating "
-            "missing directories. Prefer edit for changes to existing files.",
+            "missing directories. Content without a final newline gets one, "
+            "unless it replaces a file that had none. Prefer edit for "
+            "changes to existing files.",
             {
                 {"path", "string", "File path, relative to the working directory or absolute", 1, {}},
                 {"content", "string", "The complete new file content", 1, {}},
@@ -1342,6 +1344,44 @@ static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args, b32 tag
 
 
 // write
+//
+// Text files end in a newline, which some models leave off, so content
+// written as a whole file gains one when it lacks it, unless it replaces
+// a file that ended without one: then it is written as given. edit
+// creates files through here too; the patch format's added files end in
+// a newline already, and hashline creates none.
+
+// The line ending to append to content written as a whole file: "\n",
+// "\r\n" or nothing. The file it replaces existed, of size bytes ending
+// in tail, which is null if unreadable: then it counts as no file.
+// Empty, binary and newline-ended content gets nothing, as does content
+// replacing a file that ended without a newline. The ending is CRLF if
+// most of the content's line breaks are, or, with none, if the replaced
+// file's last one was; after a lone CR, only an LF.
+static Str finalnewline(Str content, b32 existed, i64 size, Str tail)
+{
+    Str text = startswith(content, "\xef\xbb\xbf") ? cuthead(content, 3) : content;
+    if (!text.len || text[text.len-1]=='\n') {
+        return "";
+    }
+    iz crs = 0, lfs = 0;
+    for (iz i = 0; i < text.len; i++) {
+        if (!text[i]) {
+            return "";  // binary
+        }
+        lfs += text[i] == '\n';
+        crs += text[i]=='\n' && i && text[i-1]=='\r';
+    }
+    b32 old = existed && size>0 && tail.len;  // else as a new file
+    if (old && tail[tail.len-1]!='\n') {
+        return "";
+    }
+    b32 crlf = lfs ? crs*2>=lfs : old && endswith(tail, "\r\n");
+    if (text[text.len-1] == '\r') {
+        return "\n";
+    }
+    return crlf ? Str("\r\n") : Str("\n");
+}
 
 static ToolOut toolwrite(Os *os, Arena *a, Str cwd, Str path, Args *args)
 {
@@ -1356,20 +1396,30 @@ static ToolOut toolwrite(Os *os, Arena *a, Str cwd, Str path, Args *args)
         r.text = "The parent directory could not be created.";
         return r;
     }
-    if (!os_write(os, *a, path, args->content)) {
+    b32 old  = st.type == STAT_FILE;
+    Str tail = {};
+    if (old && st.size) {
+        // Only its last two bytes, however large it is
+        Read rd = os_readat(os, a, path, st.size>2 ? st.size-2 : 0, 2);
+        tail = rd.err ? Str{} : rd.data;
+    }
+    Str nl   = finalnewline(args->content, old, st.size, tail);
+    Str data = nl.len ? concat(a, args->content, nl) : args->content;
+    data = data.data ? data : Str{(u8 *)"", 0};
+    if (!os_write(os, *a, path, data)) {
         r.text = "The file could not be written.";
         return r;
     }
     Buf b(a, 160);
-    print(&b, st.type==STAT_FILE ? Str("Replaced ") : Str("Created "));
+    print(&b, old ? Str("Replaced ") : Str("Created "));
     print(&b, showpath(cwd, path));
     print(&b, " (");
-    print(&b, (i64)args->content.len);
+    print(&b, (i64)data.len);
     print(&b, " bytes, ");
-    print(&b, (i64)countlines(args->content));
-    print(&b, " lines).");
+    print(&b, (i64)countlines(data));
+    print(&b, nl.len ? Str(" lines; added a final newline).") : Str(" lines)."));
     r.text  = finish(&b);
-    r.wrote = args->content.data ? args->content : Str{(u8 *)"", 0};
+    r.wrote = data;
     r.ok    = 1;
     return r;
 }

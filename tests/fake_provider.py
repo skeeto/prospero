@@ -2098,6 +2098,22 @@ def sc_pretty(model, n, req):
         yield from real_answer(model, req, "Pretty done.")
 
 
+def sc_final_newline(model, n, req):
+    # Whole files without a final newline: new ones, a file replaced that
+    # had none and one that had a CRLF, and a file edit creates
+    steps = [("write", {"path": "main.c", "content": "int main(void) { return 0; }"}),
+             ("write", {"path": "plain.txt", "content": "replaced, still without"}),
+             ("write", {"path": "crlf.txt", "content": "only line"}),
+             ("write", {"path": "win.txt", "content": "a\r\nb"}),
+             ("edit", {"path": "made.txt", "old_string": "", "new_string": "made by edit"})]
+    k = step(req)
+    if k < len(steps):
+        name, args = steps[k]
+        yield from tool(model, n, name, args)
+    else:
+        yield from answer(model, "Wrote them all.")
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 
