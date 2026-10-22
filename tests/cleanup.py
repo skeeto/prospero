@@ -530,6 +530,7 @@ def main():
         fake_provider.STATE.stop.set()
         host.close()
         srv.shutdown()
+        scenarios.leftbehind(host)
     return 1 if failed else 0
 
 

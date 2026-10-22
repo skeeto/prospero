@@ -38,10 +38,12 @@ if(NOT TARGET httpnet)
   add_library(httpnet INTERFACE)
   target_include_directories(httpnet SYSTEM INTERFACE "${cpp-httplib_SOURCE_DIR}")
   target_link_libraries(httpnet INTERFACE mbedtls mbedx509 mbedcrypto)
-  # On macOS, root certificates come from /etc/ssl/cert.pem, the system
-  # anchors, rather than the keychain: linking Security and CoreFoundation
-  # costs every process start about a millisecond, and every tool process
-  # starts under a reaper that is this executable.
+  # On macOS, mbedTLS's roots come from /etc/ssl/cert.pem, Apple's
+  # anchors alone, rather than the keychain, but the system decides on
+  # each chain (http_httplib.cpp). Security and CoreFoundation are loaded
+  # then, not linked: linking them costs every process start about a
+  # millisecond, and every tool process starts under a reaper that is
+  # this executable.
   target_compile_definitions(httpnet INTERFACE
     CPPHTTPLIB_MBEDTLS_SUPPORT CPPHTTPLIB_NO_EXCEPTIONS
     CPPHTTPLIB_DISABLE_MACOSX_AUTOMATIC_ROOT_CERTIFICATES)

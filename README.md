@@ -59,7 +59,9 @@ advapi32 and winhttp. The i686 build of it is the Windows XP engine:
     $ cmake --build build-xp
 
 On macOS the build also wraps the executable as `Prospero.app` in the
-build directory. On Linux, SDL3 loads X11, Wayland and GL at run time,
+build directory. There Prospero asks the system whether to trust each
+server's certificate, as Safari does, so a root that a user or an
+administrator added, such as a corporate proxy's, is trusted. On Linux, SDL3 loads X11, Wayland and GL at run time,
 so the GUI build still runs headless where no display libraries exist.
 With `-DPROSPERO_GUI=OFF`, `-DPROSPERO_STATIC=ON` links the headless
 engine fully statically, as `tools/engines.py` does for the Linux
@@ -223,6 +225,10 @@ The suites:
   leave no process behind.
 - `remote`, `includes`, `deploy`: hosts and their clients, URL includes
   against a fake web server, and deploying through a fake ssh and scp.
+- `sectrust` (macOS): the system's trust in https servers, through the
+  HTTP layer (`src/main_edgetest.cpp`), with certificates that openssl
+  makes for the test and that are never installed. With `--net`, real
+  servers too, badssl.com's bad ones among them.
 
 The Python suites need [uv][]. They also run against other machines
 from this one: `--host` runs Prospero on a Windows host over ssh,

@@ -2149,7 +2149,10 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
 // only its owner may enter, and that is the whole of the access control.
 // Where that path is too long for a socket address (about 100 bytes),
 // the address goes through a link /tmp/prospero-UID-HASH to the run
-// directory instead, which must be this user's and point there.
+// directory instead, which must be this user's and point there. A host
+// removes its link when it stops listening, and as it starts, any link
+// of this user's that leads nowhere, which a host killed, or a client,
+// left behind when the state directory went.
 //
 // Each Conn has a reader thread, posting what arrives, and a writer
 // thread, draining the queue, each with a reference, as has the owner
@@ -2462,6 +2465,49 @@ static Str os_endpoint(Os *, Arena *a, Str statedir, Str name)
     return concat(a, r, file);
 }
 
+// Remove this user's links in /tmp, as os_endpoint names them, that lead
+// nowhere. A link outlives its run directory when that is removed with
+// no os_unlisten first: its host was killed, or only a client made the
+// link. A link that leads somewhere stays, for whoever uses it.
+static void sweeplinks(Arena scratch)
+{
+    i32 fd = open("/tmp", O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    DIR *dir = fdopendir(fd);
+    if (!dir) {
+        close(fd);
+        return;
+    }
+    Buf b(&scratch, 32);
+    print(&b, "prospero-");
+    print(&b, (i64)geteuid());
+    putbyte(&b, '-');
+    Str prefix = finish(&b);
+    for (struct dirent *e; (e = readdir(dir));) {
+        Str name = {(u8 *)e->d_name, 0};
+        while (name.data[name.len]) name.len++;
+        if (!startswith(name, prefix) || name.len!=prefix.len+16) {
+            continue;
+        }
+        b32 hex = 1;
+        for (iz i = prefix.len; i < name.len; i++) {
+            u8 c = name[i];
+            hex &= (c>='0' && c<='9') || (c>='a' && c<='f');
+        }
+        struct stat st;
+        if (!hex || fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) ||
+                !S_ISLNK(st.st_mode) || st.st_uid!=geteuid()) {
+            continue;
+        }
+        if (fstatat(fd, e->d_name, &st, 0) && (errno==ENOENT || errno==ENOTDIR)) {
+            unlinkat(fd, e->d_name, 0);
+        }
+    }
+    closedir(dir);  // also closes fd
+}
+
 static void listenrelease(Listener *l)
 {
     if (!__atomic_sub_fetch(&l->refs, 1, __ATOMIC_ACQ_REL)) {
@@ -2511,12 +2557,13 @@ static void listenthread(void *arg)
     listenrelease(l);
 }
 
-static Listener *os_listen(Os *os, Arena, Str endpoint, Mailbox *mbox)
+static Listener *os_listen(Os *os, Arena scratch, Str endpoint, Mailbox *mbox)
 {
     struct sockaddr_un sa;
     if (!sockaddr(&sa, endpoint)) {
         return 0;
     }
+    sweeplinks(scratch);  // a host starting clears what dead ones left
     i32 fd = cloexecsocket();
     if (fd < 0) {
         return 0;
