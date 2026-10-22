@@ -167,7 +167,7 @@ struct CfgKind {
 
 static CfgKind cfgkinds[] = {
     {"",         0, "Defaults for new sessions"},
-    {"endpoint", 1, "An OpenAI-compatible server"},
+    {"endpoint", 1, "A server of models: OpenAI-compatible, or Anthropic's"},
     {"model",    1, "Settings for one model, named as its endpoint lists it"},
     {"role",     1, "Instructions, a model and tools for one kind of work"},
     {"guard",    0, "Where the file tools may go without asking"},
@@ -196,9 +196,13 @@ static CfgKey cfgschema[] = {
      "Model for new sessions, as the endpoint names it"},
 
     {"endpoint", "url", CFG_URL, "", {}, {}, "endpoint",
-     "Base URL: chat requests go to URL/v1/chat/completions"},
+     "Base URL: chat requests go to URL/v1/chat/completions, or for kind "
+     "anthropic to URL/v1/messages"},
+    {"endpoint", "kind", CFG_ENUM, "openai", {}, "openai anthropic", "endpoint",
+     "The API it speaks: openai (Chat Completions) or anthropic (Messages)"},
     {"endpoint", "key", CFG_SECRET, "", {}, {}, "endpoint",
-     "API key sent as a bearer token, as env:NAME"},
+     "API key sent as a bearer token, or as x-api-key for kind anthropic, "
+     "as env:NAME"},
     {"endpoint", "connect_timeout", CFG_SECONDS, "15", "5", {}, "timeouts",
      "Seconds to connect"},
     {"endpoint", "first_byte_timeout", CFG_SECONDS, "300", "1800", {},
@@ -236,7 +240,18 @@ static CfgKey cfgschema[] = {
      "Seconds on a fallback before this model is tried again"},
     {"model", "reasoning_budget", CFG_INT, "", {}, {}, "model",
      "Most reasoning tokens in a response before the model is told to "
-     "answer"},
+     "answer; with thinking = budget, Anthropic's budget_tokens"},
+    {"model", "thinking", CFG_ENUM, "adaptive", {},
+     "adaptive budget off default", "model",
+     "Anthropic: adaptive (the model decides how much to think), budget "
+     "(reasoning_budget tokens, default 8192, for older models), off, or "
+     "default (not sent)"},
+    {"model", "thinking_display", CFG_ENUM, "summarized", {},
+     "summarized omitted", "model",
+     "Anthropic: summarized reasoning to show, or omitted"},
+    {"model", "effort", CFG_ENUM, "", {}, "low medium high xhigh max", "model",
+     "Anthropic: how much the model thinks and writes, by default its own "
+     "default"},
     {"model", "edit_format", CFG_ENUM, "replace", {}, "replace patch hashline",
      "model", "How the model's edit tool changes files: replace (old and "
      "new text), patch (an apply_patch envelope) or hashline (line "
@@ -261,7 +276,8 @@ static CfgKey cfgschema[] = {
     {"model", "seed", CFG_INT, "", {}, {}, "sampling",
      "Sampling seed, sent only when set"},
     {"model", "max_tokens", CFG_INT, "", {}, {}, "sampling",
-     "Most tokens in one response, sent only when set"},
+     "Most tokens in one response, sent only when set (always for kind "
+     "anthropic: by default 32000, at most the model's limit)"},
 
     {"role", "description", CFG_STRING, "", {}, {}, "role",
      "What the role is for, for an agent choosing one for a subagent"},

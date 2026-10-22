@@ -23,8 +23,9 @@
 // refuses truncation, and when writes fail partway through recovery, a
 // later open leaves the same file as an undisturbed one would have.
 //
-// Provider: a stream, chunked at points the input picks, accumulates
-// into blocks whose request encoding always parses; repaired arguments
+// Provider: a stream, chunked at points the input picks, accumulates as
+// chat chunks and as Anthropic events into blocks whose request
+// encodings, of both kinds, always parse; repaired arguments
 // sent back are always an object; cleaned output holds no escape or
 // carriage return; normalized paths are rooted, free of "." and ".."
 // and stable under renormalizing; edit matches are ordered spans inside
@@ -366,6 +367,7 @@ static void fuzzprovider(Arena a, Str src)
     Arena scr = a;
     scr.beg   = own.end;
     Partial *p   = newpartial(&own);
+    Partial *q   = newpartial(&own);  // the same events as Anthropic's
     Sse      sse = newsse(&own, 1<<12);
     for (Str rest = src; rest.len;) {
         iz  n   = 1 + rest[0]%23;
@@ -380,13 +382,22 @@ static void fuzzprovider(Arena a, Str src)
                 for (iz k = 0; k < c.deltas.len; k++) {
                     assert(c.deltas[k].block>=0 && c.deltas[k].block<p->nblocks);
                 }
+                c = anchunk(q, d.root, &t);
+                for (iz k = 0; k < c.deltas.len; k++) {
+                    assert(c.deltas[k].block>=0 && c.deltas[k].block<q->nblocks);
+                }
             }
         }
     }
     a = scr;
-    for (b32 complete = 0; complete < 2; complete++) {
-        Finished f = finishpartial(&a, p, complete, 1, 1);
-        assert(f.blocks.len <= p->nblocks);
+    for (i32 run = 0; run < 4; run++) {
+        b32      complete = run & 1;
+        Partial *r        = run<2 ? p : q;
+        if (r == q) {
+            q->text.len = q->text.len/(1 + run%2);  // a cycle cut away
+        }
+        Finished f = finishpartial(&a, r, complete, 1, 1);
+        assert(f.blocks.len <= r->nblocks);
         for (iz i = 0; i < f.blocks.len; i++) {
             Block *b = &f.blocks[i];
             if (b->type != BLOCK_CALL) continue;
@@ -401,15 +412,24 @@ static void fuzzprovider(Arena a, Str src)
         ModelConf mc = {};
         mc.name      = "m";
         mc.reasoning = "reasoning_content";
-        Msg m = {};
-        m.role   = ROLE_ASSISTANT;
-        m.blocks = f.blocks;
+        Msg m[3] = {};
+        m[0].role   = ROLE_USER;
+        m[0].text   = src;
+        m[1].role   = ROLE_ASSISTANT;
+        m[1].blocks = f.blocks;
+        m[2].role   = ROLE_TOOL;
+        m[2].callid = "c";
+        m[2].text   = src;
         ChatReq req = {};
         req.mc      = &mc;
-        req.history = {&m, 1, 1};
+        req.history = {m+1, 1, 1};
         Arena tmp = a;
         tmp.beg  += (tmp.end - tmp.beg)/2;
         Str body  = encodechat(&a, tmp, &req);
+        assert(jsonparse(&a, body).ok);
+        req.history   = {m, 3, 3};
+        req.thinkfrom = run;
+        body = anencode(&a, tmp, &req);
         assert(jsonparse(&a, body).ok);
     }
 

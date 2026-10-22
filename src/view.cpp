@@ -1160,7 +1160,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         for (Json *b = blocks->child; b; b = b->next) {
             Str t = jsonstr(jsonget(b, "t"));
             i32 i = -1;
-            if (t == "think") {
+            if (t=="think" && !jsonstr(jsonget(b, "text")).len) {
+                continue;  // reasoning a server kept to itself (Anthropic)
+            } else if (t == "think") {
                 i = addmsg(v, VIEW_THINK, jsonstr(jsonget(b, "text")));
                 v->msgs[i].collapsed = 1;
             } else if (t == "text") {

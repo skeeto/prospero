@@ -311,11 +311,12 @@ struct Parked {
 struct Endpoint {
     Str name;       // its configured section, empty if none
     Str url;
-    Str key;        // bearer token, empty if none
+    Str key;        // bearer token (x-api-key for Anthropic), empty if none
     i64 firstbyte;  // watchdogs, in ticks
     i64 idle;
     i64 progress;
     i32 connectms;
+    i32 kind;       // EP_*
 };
 
 struct Engine;
@@ -441,6 +442,8 @@ struct Session {
     i64          sentbytes;  // of the prompt of the chat request sent
     i64          sentest;    // its tokens, estimated
     Str          summary;    // the latest compaction's, empty if none
+    i64          thinkfrom;  // seq of the latest compaction, which leaves
+                             // older reasoning bound to what it changed
     Compact      cp;         // with REQ_COMPACT
     i32          overflows;  // this step's prompts rejected as too long
     i64          ovsize;     // tokens of the first, 0 if none
@@ -741,8 +744,13 @@ static void addassistant(Session *s, Arena scratch, Slice<Block> blocks,
             putstrkey(&w.json, "id", k->id);
             putstrkey(&w.json, "name", k->name);
             putstrkey(&w.json, "args", k->args);
+        } else if (k->type == BLOCK_REDACTED) {
+            putstrkey(&w.json, "data", k->text);
         } else {
             putstrkey(&w.json, "text", k->text);
+        }
+        if (k->sig.len) {
+            putstrkey(&w.json, "sig", k->sig);  // for the next request
         }
         putend(&w.json);
     }
@@ -754,6 +762,9 @@ static void addassistant(Session *s, Arena scratch, Slice<Block> blocks,
         putintkey(&w.json, "in", u->in);
         putintkey(&w.json, "out", u->out);
         putintkey(&w.json, "cached", u->cached);
+        if (u->written) {
+            putintkey(&w.json, "written", u->written);
+        }
         if (s->sentbytes) {
             // The prompt's bytes as estimates count them: with in, the
             // calibration a session opened again starts from
@@ -939,11 +950,49 @@ static Str authheaders(Arena *a, Endpoint *ep, Str accept)
     print(&b, "Accept: ");
     print(&b, accept);
     print(&b, "\r\nUser-Agent: prospero/" PROSPERO_VERSION "\r\n");
-    if (ep->key.len) {
+    if (ep->kind == EP_ANTHROPIC) {
+        print(&b, "anthropic-version: ");
+        print(&b, anversion);
+        print(&b, "\r\n");
+        if (ep->key.len) {
+            print(&b, "x-api-key: ");
+            print(&b, ep->key);
+            print(&b, "\r\n");
+        }
+    } else if (ep->key.len) {
         print(&b, "Authorization: Bearer ");
         print(&b, ep->key);
         print(&b, "\r\n");
     }
+    return finish(&b);
+}
+
+// What to check when a server refuses the key, to follow its error: the
+// setting and the variable it names, and whether that is set, never
+// the key itself.
+static Str keyhint(Engine *e, Arena *a, Endpoint *ep)
+{
+    Str set = trim(cfgget(e->cfg, "endpoint", ep->name, "key", 0));
+    Buf b(a, 128 + ep->name.len + set.len);
+    print(&b, " (check the endpoint's key: ");
+    if (!ep->name.len) {
+        print(&b, "only an [endpoint] section can set one");
+    } else {
+        print(&b, "[endpoint ");
+        print(&b, ep->name);
+        if (!set.len) {
+            print(&b, "] sets none");
+        } else if (startswith(set, "env:")) {
+            print(&b, "] key = ");
+            print(&b, set);
+            print(&b, ", which is ");
+            print(&b, ep->key.len ? Str("set")
+                                  : Str("not set where the engine runs"));
+        } else {
+            print(&b, "] key, written out in the file");
+        }
+    }
+    putbyte(&b, ')');
     return finish(&b);
 }
 
@@ -1304,14 +1353,18 @@ static void sendchat(Session *s, Arena scratch)
 
     // The body goes into the attempt arena, temporaries into scratch
     ChatReq req = {};
-    req.mc       = &s->mc;
-    req.system   = s->system;
-    req.tools    = s->tools;
-    req.history  = s->history;
-    Str body     = encodechat(&s->attempt, scratch, &req);
-    Str url      = apiurl(&scratch, s->ep.url, "chat/completions");
-    s->sentbytes = s->system.len + s->tools.len + s->bytes;
-    s->sentest   = estimate(s);
+    req.mc        = &s->mc;
+    req.system    = s->system;
+    req.tools     = s->tools;
+    req.history   = s->history;
+    req.thinkfrom = s->thinkfrom;
+    b32 an        = s->ep.kind == EP_ANTHROPIC;
+    Str body      = an ? anencode(&s->attempt, scratch, &req)
+                       : encodechat(&s->attempt, scratch, &req);
+    Str url       = apiurl(&scratch, s->ep.url, an ? Str("messages")
+                                                   : Str("chat/completions"));
+    s->sentbytes  = s->system.len + s->tools.len + s->bytes;
+    s->sentest    = estimate(s);
 
     if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0)) {
         Str err = os_lasterr(e->os, &scratch);
@@ -1364,7 +1417,9 @@ static void proceed(Session *s, Arena scratch)
 
 static void discover(Session *s, Arena scratch)
 {
-    Str url = apiurl(&scratch, s->ep.url, "models");
+    // Anthropic's listing comes in pages, of at most 1000 models
+    Str url = apiurl(&scratch, s->ep.url, s->ep.kind==EP_ANTHROPIC ?
+                     Str("models?limit=1000") : Str("models"));
     resetattempt(s);
     s->discovered = 1;
     if (!startreq(s, scratch, &s->ep, "GET", url, {}, "application/json", 10000)) {
@@ -1455,6 +1510,7 @@ static void discovered(Session *s, Arena scratch, b32 ok)
                 // A configured limit holds until a server reports one
                 s->mc.ctx = s->mc.ctx && !mi.learned ? s->mc.ctx : mi.ctx;
             }
+            s->mc.maxout = mi.maxout;
         }
     }
     stopreq(s);
@@ -1719,6 +1775,21 @@ static void failcompact(Session *s, Arena scratch, i32 cls, i32 status,
     endturn(s, scratch, "error", err);
 }
 
+// Leave out of requests all the reasoning sent back so far (thinkfrom).
+// Returns 0 if there was none to leave out.
+static b32 unbind(Session *s)
+{
+    b32 any = 0;
+    for (iz i = 0; i < s->history.len; i++) {
+        Msg *m = &s->history[i];
+        for (iz k = 0; m->seq>=s->thinkfrom && k<m->blocks.len; k++) {
+            any |= m->blocks[k].type==BLOCK_REDACTED || m->blocks[k].sig.len;
+        }
+    }
+    s->thinkfrom = any ? s->log.seq+1 : s->thinkfrom;
+    return any;
+}
+
 // Fail the current attempt. Transient failures back off and retry while
 // nothing visible has streamed, and otherwise commit what streamed and
 // ask the agent to continue. Once quick retries are spent, fallbacks and
@@ -1752,6 +1823,17 @@ static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 re
     Partial *p       = s->part;
     b32      visible = p && committed(p);
     s->part = 0;
+
+    if (cls==CLASS_DETERMINISTIC && reqep(s)->kind==EP_ANTHROPIC &&
+            contains(msg, "signature") && contains(msg, "thinking") &&
+            unbind(s)) {
+        // Anthropic's reasoning is bound to the conversation before it,
+        // which the API found changed: the step goes again, once,
+        // without the reasoning, which removing it all allows
+        retryevent(s, scratch, RETRY_QUICK, cls, status, 0, msg);
+        request(s, scratch);
+        return;
+    }
 
     if ((cls==CLASS_TRANSIENT || cls==CLASS_LOOP) && visible) {
         // Keep what streamed: the cycle cut away, an incomplete call
@@ -1886,7 +1968,8 @@ static void emitprogress(Session *s, Arena scratch, Chunk *c)
 // Apply one parsed data event. Returns 0 if the attempt failed.
 static b32 onchunk(Session *s, Arena scratch, Json *j)
 {
-    Chunk c = applychunk(s->part, j, &scratch);
+    Chunk c = reqep(s)->kind==EP_ANTHROPIC ? anchunk(s->part, j, &scratch)
+                                           : applychunk(s->part, j, &scratch);
     if (c.bad) {
         fail(s, scratch, CLASS_TRANSIENT, 0, "the stream held a malformed chunk", -1);
         return 0;
@@ -2008,12 +2091,12 @@ static void onbody(Session *s, Arena scratch, Str data)
             fail(s, t, CLASS_TRANSIENT, 0, "the stream held a malformed chunk", -1);
             return;
         }
-        if (ev->type == "error") {
+        if (ev->type=="error" && reqep(s)->kind!=EP_ANTHROPIC) {
             Str msg = errortext(jsonget(d.root, "error"));
             fail(s, t, classify(0, msg), 0, msg, -1);
             return;
         }
-        if (!onchunk(s, t, d.root)) {
+        if (!onchunk(s, t, d.root)) {  // Anthropic's error events too
             return;
         }
     }
@@ -2044,13 +2127,18 @@ static void ondone(Session *s, Arena scratch, i32 err, Str text)
         if (cls == CLASS_OVERFLOW) {
             s->ovinfo = overflowsizes(scratch, body);
         }
-        Buf b(&scratch, 64 + msg.len);
+        Str hint = {};
+        if (cls==CLASS_FATAL && (s->status==401 || s->status==403)) {
+            hint = keyhint(e, &scratch, reqep(s));
+        }
+        Buf b(&scratch, 64 + msg.len + hint.len);
         print(&b, "HTTP ");
         print(&b, (i64)s->status);
         if (msg.len) {
             print(&b, ": ");
             print(&b, msg.len>2000 ? utf8head(msg, 2000) : msg);
         }
+        print(&b, hint);
         Str full = finish(&b);
         i64 wait = retryafter(s->headers, os_time(e->os));
         fail(s, scratch, cls, s->status, full, wait);
@@ -2155,6 +2243,7 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     m.callid = c->id;
     m.text   = clone(&s->perm, text);
     m.spill  = spill.len ? clone(&s->perm, spill) : Str{};
+    m.error  = toolfailed(status);
     addmsg(s, m);
     b32 done = status=="ok" || status=="background";
     s->progressed |= done;
@@ -3802,6 +3891,7 @@ static b32 prune(Session *s, Arena scratch, b32 overflow)
     }
     putend(&w.json);
     ssend(s, &w);
+    s->thinkfrom = s->log.seq;
     return 1;
 }
 
@@ -3891,8 +3981,11 @@ static void sendcompact(Session *s, Arena scratch)
     Str convo = transcript(&s->attempt, scratch, s->history, cp->start,
                            cp->cut, limit);
     i64 words = sumbudget(cp->goal) * 3/4;
-    Str body  = encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words);
-    Str url   = apiurl(&scratch, cp->ep.url, "chat/completions");
+    b32 an    = cp->ep.kind == EP_ANTHROPIC;
+    Str body  = an ? ansummary(&s->attempt, scratch, &cp->mc, prev, convo, words)
+                   : encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words);
+    Str url   = apiurl(&scratch, cp->ep.url, an ? Str("messages")
+                                                : Str("chat/completions"));
     cp->inbytes = convo.len;
     if (!startreq(s, scratch, &cp->ep, "POST", url, body, "text/event-stream", 0)) {
         Str err = os_lasterr(s->e->os, &scratch);
@@ -3934,8 +4027,9 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     putstrkey(&w.json, "model", cp.model);
     putintkey(&w.json, "ms", (os_ticks(e->os) - cp.began)/MS);
     ssend(s, &w);
-    s->purpose = REQ_CHAT;
-    s->cp      = {};
+    s->thinkfrom = s->log.seq;
+    s->purpose   = REQ_CHAT;
+    s->cp        = {};
     setstate(s, S_IDLE);
 
     i64 after = estimate(s);
@@ -3970,6 +4064,9 @@ static void finalize(Session *s, Arena scratch)
         compacted(s, scratch, p);
         return;
     }
+    if (p->finish == "refusal") {
+        p->calls = {};  // a declined response's calls are not run
+    }
     Slice<Str> used = usedids(s, &scratch);
     Finished   f    = finishpartial(&s->perm, p, 1, s->turn, s->steps, used);
     Str        fr   = p->finish.data ? p->finish : Str("stop");
@@ -3980,6 +4077,27 @@ static void finalize(Session *s, Arena scratch)
     // listing now reports the context, so look again before the next step
     if (s->info.llamacpp && !s->info.learned) {
         s->discovered = 0;
+    }
+
+    if (fr == "refusal") {
+        // Anthropic's model, or its safeguards, declined: another try
+        // would decline alike
+        Buf b(&scratch, 256 + p->refusal.len);
+        print(&b, "The model declined to continue (stop reason refusal");
+        if (p->refusal.len) {
+            print(&b, ", ");
+            print(&b, p->refusal);
+        }
+        print(&b, "), so the turn ends here. Rephrase the request, or use "
+                  "another model.");
+        note(s, scratch, "error", finish(&b));
+        endturn(s, scratch, "error", "the model declined to continue (refusal)");
+        return;
+    } else if (fr=="pause_turn" && !f.ncalls) {
+        // The server paused a long turn: sent back as it is, with no
+        // message after it, the response goes on where it stopped
+        prepare(s, scratch);
+        return;
     }
 
     b32 visible = trim(finish(&p->text)).len > 0;
@@ -4353,6 +4471,8 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     i64 connect   = cfgms(cfg, "endpoint", name, "connect_timeout", local);
     ep->connectms = (i32)(connect<0x7fffffff ? connect : 0x7fffffff);
     ep->key       = cfgsecret(cfg, perm, "endpoint", name, "key");
+    Str kind      = trim(cfgget(cfg, "endpoint", name, "kind", 0));
+    ep->kind      = kind=="anthropic" ? EP_ANTHROPIC : EP_OPENAI;
     return 1;
 }
 
@@ -4378,6 +4498,18 @@ static void modelconf(Engine *e, Arena *perm, Str model, ModelConf *mc)
     Int rb  = parseint(trim(cfgget(cfg, "model", model, "reasoning_budget", 0)));
     mc->thinkmax = rb.ok && rb.val>0 ? rb.val : 0;
     mc->edit     = editformat(cfgget(cfg, "model", model, "edit_format", 0));
+
+    // For Anthropic's Messages API
+    Int mt  = parseint(trim(cfgget(cfg, "model", model, "max_tokens", 0)));
+    Str th  = trim(cfgget(cfg, "model", model, "thinking", 0));
+    Str td  = trim(cfgget(cfg, "model", model, "thinking_display", 0));
+    Str ef  = trim(cfgget(cfg, "model", model, "effort", 0));
+    mc->maxtokens = mt.ok && mt.val>0 ? mt.val : 0;
+    mc->think     = th=="budget"  ? THINK_BUDGET :
+                    th=="off"     ? THINK_OFF    :
+                    th=="default" ? THINK_DEFAULT : THINK_ADAPTIVE;
+    mc->hidethink = td == "omitted";
+    mc->effort    = ef.len ? clone(perm, ef) : Str{};
 }
 
 static Session *newsession(Engine *e, Arena scratch, Str sid)
@@ -5553,19 +5685,20 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 summarize(s, summary, jsonint(jsonget(j, "cutseq"), 0), r.seq);
             }
             countbytes(s);
+            s->thinkfrom = r.seq;
         } break;
         case EV_ASSISTANT:
             m.seq  = r.seq;
             m.role = ROLE_ASSISTANT;
             for (Json *k = jsonget(j, "blocks")->child; k; k = k->next) {
                 Block b = {};
-                Str   t = jsonstr(jsonget(k, "t"));
-                b.type = t=="think" ? BLOCK_THINK :
-                         t=="text"  ? BLOCK_TEXT  : BLOCK_CALL;
-                b.text = clone(&s->perm, jsonstr(jsonget(k, "text")));
-                b.id   = clone(&s->perm, jsonstr(jsonget(k, "id")));
-                b.name = clone(&s->perm, jsonstr(jsonget(k, "name")));
-                b.args = clone(&s->perm, jsonstr(jsonget(k, "args")));
+                b.type  = blocktype(jsonstr(jsonget(k, "t")));
+                Str txt = b.type==BLOCK_REDACTED ? Str("data") : Str("text");
+                b.text  = clone(&s->perm, jsonstr(jsonget(k, txt)));
+                b.sig   = clone(&s->perm, jsonstr(jsonget(k, "sig")));
+                b.id    = clone(&s->perm, jsonstr(jsonget(k, "id")));
+                b.name  = clone(&s->perm, jsonstr(jsonget(k, "name")));
+                b.args  = clone(&s->perm, jsonstr(jsonget(k, "args")));
                 m.blocks = push(&s->perm, m.blocks, b);
             }
             addmsg(s, m);
@@ -5585,6 +5718,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             m.callid = clone(&s->perm, jsonstr(jsonget(j, "call")));
             m.text   = clone(&s->perm, jsonstr(jsonget(j, "text")));
             m.spill  = clone(&s->perm, jsonstr(jsonget(j, "spill")));
+            m.error  = toolfailed(jsonstr(jsonget(j, "status")));
             m.seq    = r.seq;
             addmsg(s, m);
             break;
@@ -5647,15 +5781,24 @@ static void sendsnapshot(Session *s, Arena scratch)
     putkey(&w.json, "blocks");
     putarray(&w.json);
     for (i32 i = 0; i < p->nblocks; i++) {
-        Str       kind = {};
-        Str       text = {};
-        PartCall *c    = 0;
+        Str        kind = {};
+        Str        text = {};
+        PartCall  *c    = 0;
+        PartBlock *pb   = 0;
+        for (iz n = 0; n < p->parts.len; n++) {
+            pb = p->parts[n].block==i ? &p->parts[n] : pb;
+        }
         if (i == p->thinkblock) {
             kind = "think";
             text = finish(&p->think);
         } else if (i == p->textblock) {
             kind = "text";
             text = finish(&p->text);
+        } else if (pb && pb->type==BLOCK_REDACTED) {
+            continue;
+        } else if (pb) {
+            kind = pb->type==BLOCK_THINK ? Str("think") : Str("text");
+            text = finish(&pb->text);
         } else {
             for (iz k = 0; k < p->calls.len; k++) {
                 c = p->calls[k].block==i ? &p->calls[k] : c;

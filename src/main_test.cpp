@@ -493,6 +493,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/events_test.cpp"
 #include "test/frame_test.cpp"
 #include "test/provider_test.cpp"
+#include "test/anthropic_test.cpp"
 #include "test/edit_test.cpp"
 #include "test/tools_test.cpp"
 #include "test/guard_test.cpp"
@@ -536,6 +537,7 @@ int main()
     test_frame(&t);
     test_remoteask(&t);
     test_provider(&t);
+    test_anthropic(&t);
     test_edit(&t);
     test_tools(&t);
     test_guard(&t);
