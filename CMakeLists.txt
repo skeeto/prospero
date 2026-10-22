@@ -160,6 +160,18 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_link_options(prospero_test PRIVATE -nostdlib++)
   endif()
   add_test(NAME unit COMMAND prospero_test)
+  if(APPLE)
+    # The HTTP edge with the test-only calls of its trust evaluation,
+    # which asks the system's (Security.framework) about each chain
+    add_executable(prospero_edgetest src/main_edgetest.cpp)
+    target_link_libraries(prospero_edgetest PRIVATE httpnet Threads::Threads)
+    target_compile_options(prospero_edgetest PRIVATE -fno-exceptions)
+    if(UV)
+      add_test(NAME sectrust COMMAND ${UV} run
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/sectrust.py
+        --edgetest $<TARGET_FILE:prospero_edgetest>)
+    endif()
+  endif()
   add_test(NAME selftest COMMAND prospero --selftest)
   # It measures latencies and the reaper's start, so it runs alone
   set_tests_properties(selftest PROPERTIES RUN_SERIAL ON)
