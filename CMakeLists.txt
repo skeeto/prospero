@@ -147,6 +147,32 @@ if(APPLE)
   # identity, even a self-signed one, keeps them across rebuilds.
   set(PROSPERO_SIGN_IDENTITY "" CACHE STRING
       "macOS code-signing identity for the built programs (empty: ad hoc)")
+  # The bundle identifier, which privacy grants name too, so that a test
+  # build, signed ad hoc, never claims the real app's grants, nor leaves
+  # a code requirement of its own on them that then refuses the real
+  # app: com.nullprogram.prospero only for a signed build, by default.
+  # The desktop helper's is this plus ".desktop".
+  set(PROSPERO_BUNDLE_ID "" CACHE STRING
+      "macOS bundle identifier (empty: com.nullprogram.prospero when signed, else .dev)")
+  if(PROSPERO_BUNDLE_ID)
+    set(prospero_bundle_id ${PROSPERO_BUNDLE_ID})
+  elseif(PROSPERO_SIGN_IDENTITY)
+    set(prospero_bundle_id com.nullprogram.prospero)
+  else()
+    set(prospero_bundle_id com.nullprogram.prospero.dev)
+  endif()
+  set(prospero_desktop_id ${prospero_bundle_id}.desktop)
+  if(NOT PROSPERO_SIGN_IDENTITY AND prospero_bundle_id STREQUAL "com.nullprogram.prospero")
+    message(WARNING "an ad-hoc build with the real app's bundle identifier "
+                    "can claim, and spoil, its privacy grants")
+  endif()
+  # Ad hoc, unless an identity is given: either way the identifiers
+  # are ours rather than ones made from file names
+  if(PROSPERO_SIGN_IDENTITY)
+    set(prospero_sign ${PROSPERO_SIGN_IDENTITY})
+  else()
+    set(prospero_sign -)
+  endif()
 endif()
 if(APPLE AND PROSPERO_SIGN_IDENTITY)
   add_custom_command(TARGET prospero POST_BUILD
@@ -169,16 +195,14 @@ if(APPLE)
   target_link_libraries(prospero-desktop PRIVATE ${prospero_desktop_libs})
   set_target_properties(prospero-desktop PROPERTIES
     OUTPUT_NAME ${PROSPERO_NAME}-desktop)
-  if(PROSPERO_SIGN_IDENTITY)
-    # A fixed identifier too, which the grants name when it runs as its
-    # own responsible process, rather than one made from its file name
-    add_custom_command(TARGET prospero-desktop POST_BUILD
-      COMMAND codesign --force --timestamp=none
-              --identifier com.nullprogram.prospero.desktop
-              --sign ${PROSPERO_SIGN_IDENTITY} $<TARGET_FILE:prospero-desktop>
-      VERBATIM
-    )
-  endif()
+  # A fixed identifier too, which the grants name when it runs as its
+  # own responsible process, rather than one made from its file name
+  add_custom_command(TARGET prospero-desktop POST_BUILD
+    COMMAND codesign --force --timestamp=none
+            --identifier ${prospero_desktop_id}
+            --sign ${prospero_sign} $<TARGET_FILE:prospero-desktop>
+    VERBATIM
+  )
 endif()
 
 if(APPLE AND PROSPERO_GUI)
@@ -186,22 +210,19 @@ if(APPLE AND PROSPERO_GUI)
   # wants for a window of its own in the Dock and app switcher, with the
   # desktop helper beside it, where the harness looks. The bundle is
   # put together, and signed, after both are built, since its signature
-  # seals the helper in it.
-  set(prospero_signapp)
-  if(PROSPERO_SIGN_IDENTITY)
-    set(prospero_signapp COMMAND codesign --force --timestamp=none
-                         --sign ${PROSPERO_SIGN_IDENTITY} Prospero.app)
-  endif()
+  # seals the helper in it, ad hoc unless PROSPERO_SIGN_IDENTITY. Its
+  # Info.plist names the bundle identifier and the version.
+  configure_file(assets/Info.plist ${CMAKE_BINARY_DIR}/Info.plist @ONLY)
   add_custom_command(OUTPUT Prospero.app/Contents/MacOS/prospero
     COMMAND ${CMAKE_COMMAND} -E make_directory Prospero.app/Contents/MacOS
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${PROJECT_SOURCE_DIR}/assets/Info.plist Prospero.app/Contents/Info.plist
+            ${CMAKE_BINARY_DIR}/Info.plist Prospero.app/Contents/Info.plist
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:prospero-desktop> Prospero.app/Contents/MacOS/prospero-desktop
     COMMAND ${CMAKE_COMMAND} -E copy
             $<TARGET_FILE:prospero> Prospero.app/Contents/MacOS/prospero
-    ${prospero_signapp}
-    DEPENDS prospero prospero-desktop ${PROJECT_SOURCE_DIR}/assets/Info.plist
+    COMMAND codesign --force --timestamp=none --sign ${prospero_sign} Prospero.app
+    DEPENDS prospero prospero-desktop ${CMAKE_BINARY_DIR}/Info.plist
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     VERBATIM
   )
@@ -270,6 +291,18 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_compile_definitions(prospero-desktop-test PRIVATE DK_SELFTEST=1)
     target_link_libraries(prospero-desktop-test PRIVATE ${prospero_desktop_libs})
     add_test(NAME desktop_unit COMMAND prospero-desktop-test)
+    if(UV AND PROSPERO_GUI)
+      # The bundle's identifiers, never the real app's in a test build
+      set(prospero_signed)
+      if(PROSPERO_SIGN_IDENTITY)
+        set(prospero_signed --signed)
+      endif()
+      add_test(NAME bundle COMMAND ${UV} run
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/bundle.py
+        --app ${CMAKE_BINARY_DIR}/Prospero.app --helper $<TARGET_FILE:prospero-desktop>
+        --version ${PROJECT_VERSION} ${prospero_signed}
+        --bundle-id=${PROSPERO_BUNDLE_ID})
+    endif()
     if(UV)
       # The helper itself, its commands and frames, permissions denied
       add_test(NAME desktop COMMAND ${UV} run

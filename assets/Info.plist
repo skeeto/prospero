@@ -5,13 +5,13 @@
     <key>CFBundleExecutable</key>
     <string>prospero</string>
     <key>CFBundleIdentifier</key>
-    <string>com.nullprogram.prospero</string>
+    <string>@prospero_bundle_id@</string>
     <key>CFBundleName</key>
     <string>Prospero</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.0.0</string>
+    <string>@PROJECT_VERSION@</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>

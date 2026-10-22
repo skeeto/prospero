@@ -312,6 +312,13 @@ missing. Build with `-DPROSPERO_SIGN_IDENTITY=NAME`, a code-signing
 identity from your keychain, even a self-signed one, so that the
 grants survive rebuilds.
 
+Grants also name the bundle identifier, `com.nullprogram.prospero`,
+which only a signed build takes. Any other build is signed ad hoc as
+`com.nullprogram.prospero.dev` (its helper as `....dev.desktop`), so
+that a test build never claims the real app's grants, nor leaves a
+requirement on them that refuses the real app. `-DPROSPERO_BUNDLE_ID=ID`
+chooses another; the helper's is that plus `.desktop`.
+
 On Linux the helper drives the X11 display that `DISPLAY` names, in
 pixels, loading libX11, libXext and libXtst when it runs. It works with
 a window manager through EWMH, or without one. Wayland is not supported
@@ -404,6 +411,8 @@ The suites:
   commands and frames, with its permissions treated as missing, so that
   nothing touches the screen. `tests/desktop_live_macos.py` drives
   TextEdit for real, under supervision; its header says how.
+- `bundle` (macOS): Prospero.app's bundle identifier and signatures,
+  never the real app's in a build without a signing identity.
 - `sectrust` (macOS): the system's trust in https servers, through the
   HTTP layer (`src/main_edgetest.cpp`), with certificates that openssl
   makes for the test and that are never installed. With `--net`, real
