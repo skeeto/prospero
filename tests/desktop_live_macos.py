@@ -27,16 +27,28 @@ where they are granted, and not to the terminal running this. Then:
    run alone: no open panel (-NSShowAppCentricOpenPanelInsteadOfUntitledFile
    NO), and no windows restored or saved (-ApplePersistenceIgnoreState
    YES).
-4. It waits for the document's window and types "Hello from Prospero".
+4. It waits for the document's window and types "Hello from Prospero",
+   then reads the document back through Accessibility (tests/axprobe.py,
+   run under Prospero's reaper as the helper is, so that Prospero.app's
+   grant applies) and requires exactly that text: the helper's reply
+   alone proves nothing, as keys sent to an application with no key
+   window are lost without a word.
 5. It takes a screenshot of the window, unscaled, and of the screen,
    scaled as for Anthropic's models, and checks that each is a PNG of
    the size the helper reported, plausible for this screen, and not of
-   one color. Both are saved to a temporary directory to look at.
-6. It closes the document without saving: Cmd-W, then the sheet's
-   Delete (Cmd-Backspace), or, failing that, Don't Save (Cmd-D).
-7. It checks the window is gone, then quits TextEdit with SIGTERM, by
-   the pid run printed, confirmed first to be the TextEdit this run
-   started. It signals nothing else (tests/pids.py).
+   one color. Both are saved to a temporary directory to look at. The
+   window's shot may be up to FRAME points larger on each side than
+   the window as listed, since the capture takes in the frame's edge.
+6. It closes the document without saving: Cmd-W, after which it
+   requires, by Accessibility, either the sheet asking to save (with
+   Delete or Don't Save) or the document gone; then the sheet's Delete
+   (Cmd-Backspace), or, failing that, Don't Save (Cmd-D), until no
+   window of TextEdit holds a text area.
+7. Only once the document is confirmed gone does it quit TextEdit, with
+   SIGTERM, by the pid run printed, confirmed first to be the TextEdit
+   this run started. It signals nothing else (tests/pids.py). If the
+   document cannot be confirmed closed, or holds text, it leaves
+   TextEdit running for you to close, and fails.
 8. It ends the helper (the end of its input) and the reaper (the end of
    its lifeline).
 
@@ -45,6 +57,7 @@ start (a permission missing, TextEdit running, no helper).
 """
 
 import argparse
+import json
 import os
 import select
 import signal
@@ -65,6 +78,9 @@ TEXT = "Hello from Prospero"
 TEXTEDIT = "/TextEdit.app/Contents/MacOS/TextEdit"
 ARGS = ["-NSShowAppCentricOpenPanelInsteadOfUntitledFile", "NO",
         "-ApplePersistenceIgnoreState", "YES"]
+AXPROBE = os.path.join(HERE, "axprobe.py")
+FRAME = 3  # points of window frame a window's shot may take in, per side
+SAVE = ("Delete", "Don't Save")  # the save sheet's buttons that discard
 
 
 class Stop(Exception):
@@ -78,16 +94,17 @@ def say(msg):
 class Reaped:
     """The app's helper under the app's reaper, disclaimed, as the
     harness runs it: the reaper's lifeline on fd 3 and its status pipe
-    on fd 4, the helper's input and output on pipes here."""
+    on fd 4, the helper's input and output on pipes here. With prog,
+    that program instead of the helper, answering to Prospero.app too."""
 
-    def __init__(self, app, args):
+    def __init__(self, app, args, prog=None):
         exe = os.path.join(app, "Contents", "MacOS", "prospero")
-        helper = os.path.join(app, "Contents", "MacOS", "prospero-desktop")
+        prog = prog or [os.path.join(app, "Contents", "MacOS", "prospero-desktop")]
         life_r, self.life = os.pipe()
         self.status, st_w = os.pipe()
         in_r, in_w = os.pipe()
         self.out, out_w = os.pipe()
-        argv = disclaim.launcher() + [exe, "--reap-disclaimed", os.getcwd(), helper, *args]
+        argv = disclaim.launcher() + [exe, "--reap-disclaimed", os.getcwd(), *prog, *args]
         try:
             # The reaper takes this pid, and it is ours to wait for
             self.pid = os.posix_spawn(argv[0], argv, os.environ, file_actions=[
@@ -164,6 +181,49 @@ def access(app, ask=False):
     finally:
         r.close()
     return dict(line.split("\t", 1) for line in out.splitlines() if "\t" in line)
+
+
+def probe(app, pid):
+    """TextEdit as Accessibility shows it (tests/axprobe.py), read under
+    the reaper, or None if it could not be read."""
+    r = Reaped(app, [str(pids.checked(pid))], prog=[sys.executable, "-I", AXPROBE])
+    try:
+        r.inp.close()
+        r.inp = None
+        out = r.readall(20).decode("utf-8", "replace")
+    except Stop:
+        return None
+    finally:
+        r.close()
+    try:
+        p = json.loads(out)
+    except ValueError:
+        return None
+    return p if p.get("trusted") else None
+
+
+def documents(p):
+    """The values of the text areas in its windows, sheets aside."""
+    return [v for w in p["windows"] for v in w["texts"]]
+
+
+def sheet(p):
+    """The buttons of a save sheet, if one is shown."""
+    for w in p["windows"]:
+        for buttons in w["sheets"]:
+            if any(b in SAVE for b in buttons):
+                return buttons
+    return None
+
+
+def until(app, pid, ok, timeout):
+    """Probe until ok(probe) or the timeout: the latest probe, or None."""
+    deadline = time.monotonic() + timeout
+    while True:
+        p = probe(app, pid)
+        if (p and ok(p)) or time.monotonic() >= deadline:
+            return p
+        time.sleep(0.3)
 
 
 def running_textedit():
@@ -255,6 +315,7 @@ def live(app, outdir, ask, check):
 
     r = Reaped(app, ["--serve"])
     textedit = None
+    left = False
     try:
         st, text, _ = r.call("hello")
         t.step(st == 0 and text.strip() == "prospero-desktop 1 macos points", "hello", text)
@@ -286,15 +347,26 @@ def live(app, outdir, ask, check):
         time.sleep(1)
 
         st, text, _ = r.call("type", hwnd, TEXT)
-        t.step(st == 0, f"typed {TEXT!r}", text)
-        time.sleep(0.5)
+        t.step(st == 0, f"the helper typed {TEXT!r}", text)
+        p = until(app, pid, lambda p: TEXT in documents(p), 3)
+        if p is None:
+            raise Stop(("cannot read TextEdit through Accessibility (tests/axprobe.py "
+                        "under Prospero's reaper)", 1))
+        t.step(documents(p) == [TEXT],
+               f"the document holds {TEXT!r}, read back through Accessibility",
+               documents(p))
+        say(f"      frontmost pid {p['frontmost']}; window main "
+            f"{[w['main'] for w in p['windows']]}, focused "
+            f"{[w['focused'] for w in p['windows']]}")
 
         ww, wh = (int(v) for v in win[3].split("x"))
         g = shot(r, t, "window shot", [hwnd], outdir, "window.png")
         if g:
             w, h, iw, ih = g
-            t.step((w, h) == (ww, wh) and (iw, ih) == (w, h),
-                   "window shot: the window's size in points, the image as large", g)
+            t.step(0 <= w - ww <= 2 * FRAME and 0 <= h - wh <= 2 * FRAME and
+                   (iw, ih) == (w, h),
+                   f"window shot: the window's {ww}x{wh} points, plus at most "
+                   f"{FRAME} of frame a side, the image as large", g)
         g = shot(r, t, "screen shot", ["-s", "1568", "1150000", "screen"], outdir, "screen.png")
         if g:
             w, h, iw, ih = g
@@ -303,37 +375,49 @@ def live(app, outdir, ask, check):
                    "screen shot: plausible for a screen, within the limits", g)
 
         st, text, _ = r.call("key", hwnd, "cmd+w")
-        t.step(st == 0, "pressed Cmd-W", text)
-        time.sleep(1)
-        gone = False
+        t.step(st == 0, "the helper pressed Cmd-W", text)
+        p = until(app, pid, lambda p: sheet(p) or not documents(p), 5)
+        asked = p and sheet(p)
+        t.step(p is not None and (asked or not documents(p)),
+               "Cmd-W asked to save (a sheet with Delete or Don't Save), "
+               "or closed the document, by Accessibility",
+               p and [w["sheets"] for w in p["windows"]])
         for chord, label in (("cmd+backspace", "Delete"), ("cmd+d", "Don't Save")):
+            if not asked or label not in asked:
+                continue
             st, text, _ = r.call("key", hwnd, chord)
             say(f"      pressed {chord} for {label}: {st} {text.strip()}")
-            # By pid, among the windows on the screen: hwnd= takes in
-            # every window, which may count one closed but kept
-            st, text, _ = r.call("wait", "-gone", "-t", "3", f"pid={pid}")
-            if st == 0:
-                gone = True
+            p = until(app, pid, lambda p: not documents(p) and not sheet(p), 3)
+            if p and not documents(p) and not sheet(p):
                 break
-        t.step(gone, "the document closed without saving")
-        if not gone:
-            textedit = None  # an unsaved document: leave it to you
-            raise Stop(("TextEdit's window is still open: close it by hand "
-                        "(Delete, or Don't Save), then quit TextEdit", 1))
-        st, text, _ = r.call("list", f"pid={pid}")
-        t.step(st == 0 and not text.strip(), "TextEdit shows no window", text)
+        closed = p is not None and not documents(p) and not sheet(p)
+        t.step(closed, "the document closed without saving: no text area left, "
+                       "by Accessibility")
+        if closed:
+            st, text, _ = r.call("list", f"pid={pid}")
+            t.step(st == 0 and not text.strip(), "TextEdit shows no window", text)
     finally:
         r.close()
         if textedit:
             pid, ours = textedit
-            if pids.alive(pid):
+            # Quit only what holds no text: a document typed into, and
+            # not confirmed closed, is left for you
+            p = probe(app, pid) if pids.alive(pid) else None
+            if pids.alive(pid) and (p is None or any(documents(p)) or sheet(p)):
+                left = True
+                t.step(False, f"TextEdit {pid} left running: its document may hold "
+                              "text. Close it by hand (Delete, or Don't Save), then "
+                              "quit TextEdit")
+            elif pids.alive(pid):
                 pids.signal_ours(pid, signal.SIGTERM, ours, "TextEdit")
                 for _ in range(100):
                     if not pids.alive(pid):
                         break
                     time.sleep(0.1)
-            t.step(not pids.alive(pid), f"TextEdit {pid} quit")
-    t.step(not running_textedit(), "no TextEdit left running")
+            if not left:
+                t.step(not pids.alive(pid), f"TextEdit {pid} quit")
+    if not left:
+        t.step(not running_textedit(), "no TextEdit left running")
     return t
 
 

@@ -16,6 +16,7 @@ struct Dk {
     Buf    out[3];  // what dk_write wrote
     Str    why;     // dk_why's next answer
     Str    denied;  // why dk_close fails, if it does
+    Str    refused; // why dk_activate fails, if it does
     i32    scale;   // pixels to a unit, for dk_capture
 };
 
@@ -67,6 +68,10 @@ static b32 dk_popup(Dk *, DkWin *w) { return w->cls == "#32768"; }
 
 static b32 dk_activate(Dk *dk, DkWin *w)
 {
+    if (dk->refused.data) {
+        dk->why = dk->refused;  // as when the window never gets the keyboard
+        return 0;
+    }
     dk->fg = w->id;
     print(&dk->log, "raise 0x");
     printhex(&dk->log, w->id, 4);
@@ -774,6 +779,23 @@ static void test_desktop(Test *t)
         expect(t, "why taken", istr(a, dk->why.data!=0), "0");
         dk->denied = {};
         expect(t, "why none", dkround(a, dk, "close|Notepad"), "0|");
+        // A window that does not get the keyboard: each command aimed
+        // at it fails with the platform's reason, and sends nothing
+        dklog(dk);
+        dk->refused = "cannot give the keyboard to the window 'Untitled'; "
+                      "no input was sent";
+        Str refused = concat(a, "1|", dk->refused);
+        expect(t, "refused key", dkround(a, dk, "key|Notepad|ctrl+s|enter"), refused);
+        expect(t, "refused type", dkround(a, dk, "type|Notepad|hello"), refused);
+        expect(t, "refused click", dkround(a, dk, "click|Notepad|5|5"), refused);
+        expect(t, "refused drag", dkround(a, dk, "drag|Notepad|5|5|50|50"), refused);
+        expect(t, "refused wheel", dkround(a, dk, "wheel|Notepad|5|5|1"), refused);
+        expect(t, "refused raise", dkround(a, dk, "raise|Notepad"), refused);
+        expect(t, "refused sent nothing", dklog(dk), "");
+        expect(t, "refused why taken", istr(a, dk->why.data!=0), "0");
+        dk->refused = {};
+        expect(t, "refused no more", dkround(a, dk, "key|Notepad|enter"), "0|");
+        expect(t, "refused no more input", istr(a, dklog(dk).len>0), "1");
         // A reason left over from an earlier command never explains a
         // later failure
         dk->why = "stale";

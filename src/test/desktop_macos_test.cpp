@@ -163,6 +163,72 @@ static i32 dkselftest(Arena *a, Arena perm)
               num(a, k.codes[1]))), concat(a, "3,", num(a, 0x38)));
     }
 
+    // Whether a window has the keyboard, from what Accessibility says,
+    // and what the failure names when it has not. As in the first live
+    // run: TextEdit active, its new window not key, so keys were lost.
+    {
+        DkWin w = {};
+        w.id    = 0x2a;
+        w.pid   = 500;
+        w.title = "Untitled";
+        w.cls   = "TextEdit";
+        Focus f = {};
+        f.pid   = 500;
+        f.app   = "TextEdit";
+        f.key   = -1;
+        check(t, "kb no window", num(a, haskeyboard(&f, 500, 0x2a)), "0");
+        check(t, "kb no window why", unfocused(a, &f, &w),
+              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
+              "it is frontmost, but with no window focused; no input was sent");
+        check(t, "kb no element", num(a, haskeyboard(&f, 500, 0)), "1");
+        check(t, "kb no element other", num(a, haskeyboard(&f, 501, 0)), "0");
+
+        f.win = 0x2a;
+        check(t, "kb key unknown", num(a, haskeyboard(&f, 500, 0x2a)), "1");
+        f.key = 1;
+        check(t, "kb key", num(a, haskeyboard(&f, 500, 0x2a)), "1");
+        f.key = 0;
+        check(t, "kb not key", num(a, haskeyboard(&f, 500, 0x2a)), "0");
+        check(t, "kb not key why", unfocused(a, &f, &w),
+              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
+              "the window is focused, but not key; no input was sent");
+        f.sheet = 1;
+        check(t, "kb sheet shown", num(a, haskeyboard(&f, 500, 0x2a)), "1");
+        f.sheet = 0;
+
+        f.win   = 0x2b;
+        f.title = "Untitled 2";
+        f.key   = -1;
+        check(t, "kb other window", num(a, haskeyboard(&f, 500, 0x2a)), "0");
+        check(t, "kb other window why", unfocused(a, &f, &w),
+              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
+              "it is frontmost, but its window 'Untitled 2' (0x0000002b) is focused; "
+              "no input was sent");
+        f.attached = 1;  // the sheet is the focused window
+        check(t, "kb sheet focused", num(a, haskeyboard(&f, 500, 0x2a)), "1");
+        f.attached = 0;
+
+        f.pid   = 77;
+        f.app   = "Terminal";
+        f.win   = 0x10;
+        f.title = "zsh";
+        check(t, "kb other app", num(a, haskeyboard(&f, 500, 0x2a)), "0");
+        check(t, "kb other app no element", num(a, haskeyboard(&f, 500, 0)), "0");
+        check(t, "kb other app why", unfocused(a, &f, &w),
+              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
+              "Terminal (77) is frontmost, its window 'zsh' focused; no input was sent");
+        f.win = 0;
+        f.app = {};
+        check(t, "kb other app bare why", unfocused(a, &f, &w),
+              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
+              "another application (77) is frontmost; no input was sent");
+        f = {};
+        check(t, "kb nothing", num(a, haskeyboard(&f, 0, 0)), "0");
+        check(t, "kb nothing why", unfocused(a, &f, &w),
+              "cannot give the keyboard to the window 'Untitled' of TextEdit (500): "
+              "no application is frontmost; no input was sent");
+    }
+
     // Who permissions are granted to, and the message when one is missing
     {
         Str exe = "/Users/u/src/harness/build-signed/Prospero.app/Contents/MacOS/prospero";

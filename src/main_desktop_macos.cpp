@@ -11,6 +11,12 @@
 // frameworks loaded at first use. Blocks (clang's -fblocks, on by
 // default for Apple targets) serve as completion handlers.
 //
+// Keys go to the key window, so before any input aimed at a window, it
+// is made key and Accessibility must confirm it (dk_activate), else the
+// command fails and sends nothing. The public ways can leave a newly
+// launched application active with no key window, so the last way is
+// the window server's private one, as window managers use.
+//
 // Coordinates are points, the unit every one of those interfaces uses:
 // the global display space, from the top-left of the main display, y
 // down. A Retina display has two pixels to the point (or another
@@ -105,6 +111,9 @@ struct Dk {
     b32    appkit;    // AppKit is loaded
     i32  (*axwinid)(AXUIElementRef, CGWindowID *);  // private, if any
     i32  (*respfor)(i32);                           // likewise
+    i32  (*psnfor)(i32, u32 *);         // GetProcessForPID, deprecated
+    i32  (*setfront)(u32 *, u32, u32);  // SkyLight's, private
+    i32  (*postrec)(u32 *, u8 *);       // likewise
 };
 
 static b32 writeall(i32 fd, Str s)
@@ -261,6 +270,72 @@ static i32 clickcount(Click *c, i32 button, i32 x, i32 y, i64 now)
     c->y      = y;
     c->ms     = now;
     return c->count;
+}
+
+// Who has the keyboard, as Accessibility tells it: the frontmost
+// application and its focused window, which is the key window. Keys go
+// to the key window, and an application active with none, as a launch
+// can leave one, discards them all.
+struct Focus {
+    u32 pid;       // the frontmost application's, 0 if unknown
+    u64 win;       // its focused window's id, 0 if none
+    b32 attached;  // that window is a sheet of the target
+    i32 key;       // the target window's own AXFocused: 1, 0, -1 unknown
+    b32 sheet;     // the target window shows a sheet
+    Str app;       // names, for messages
+    Str title;
+};
+
+// Whether the window id of process pid has the keyboard, or one of its
+// sheets has, which takes keys in the window's place. With no id, the
+// window has no Accessibility element, as a menu has not, and its
+// application frontmost is as near as it gets.
+static b32 haskeyboard(Focus *f, u32 pid, u64 id)
+{
+    if (!f->pid || f->pid!=pid) {
+        return 0;
+    } else if (!id || f->attached) {
+        return 1;
+    }
+    return f->win==id && (f->key || f->sheet);
+}
+
+// Why a window did not get the keyboard, from what has it instead.
+static Str unfocused(Arena *a, Focus *f, DkWin *w)
+{
+    Buf b(a, 256 + w->title.len + w->cls.len + f->app.len + f->title.len);
+    print(&b, "cannot give the keyboard to the window '");
+    print(&b, w->title);
+    print(&b, "' of ");
+    print(&b, w->cls.len ? w->cls : Str("pid"));
+    print(&b, " (");
+    print(&b, (i64)w->pid);
+    print(&b, "): ");
+    if (!f->pid) {
+        print(&b, "no application is frontmost");
+    } else if (f->pid != w->pid) {
+        print(&b, f->app.len ? f->app : Str("another application"));
+        print(&b, " (");
+        print(&b, (i64)f->pid);
+        print(&b, ") is frontmost");
+        if (f->win) {
+            print(&b, ", its window '");
+            print(&b, f->title);
+            print(&b, "' focused");
+        }
+    } else if (!f->win) {
+        print(&b, "it is frontmost, but with no window focused");
+    } else if (f->win != w->id) {
+        print(&b, "it is frontmost, but its window '");
+        print(&b, f->title);
+        print(&b, "' (0x");
+        printhex(&b, f->win, 8);
+        print(&b, ") is focused");
+    } else {
+        print(&b, "the window is focused, but not key");
+    }
+    print(&b, "; no input was sent");
+    return finish(&b);
 }
 
 // Virtual key codes (HIToolbox's kVK_*), which name physical keys. Mac
@@ -822,16 +897,58 @@ static DkWin dk_screen(Dk *)
     return r;
 }
 
-// The frontmost application's pid, and its focused window's id, by
-// Accessibility; 0 for either if unknown.
-struct Front {
-    u32 pid;
-    u64 id;
-};
-
-static Front axfront(Dk *dk)
+static Str axtitle(Arena *a, AXUIElementRef e)
 {
-    Front r = {};
+    CFTypeRef t = 0;
+    Str       r = {};
+    if (!AXUIElementCopyAttributeValue(e, kAXTitleAttribute, &t)) {
+        r = cfstr(a, t);
+        CFRelease(t);
+    }
+    return r;
+}
+
+// A boolean attribute: 1, 0, or -1 if it cannot be read.
+static i32 axflag(AXUIElementRef e, CFStringRef attr)
+{
+    CFTypeRef v = 0;
+    i32       r = -1;
+    if (!AXUIElementCopyAttributeValue(e, attr, &v)) {
+        if (CFGetTypeID(v) == CFBooleanGetTypeID()) {
+            r = CFBooleanGetValue((CFBooleanRef)v) ? 1 : 0;
+        }
+        CFRelease(v);
+    }
+    return r;
+}
+
+// Whether a window's children include a sheet.
+static b32 hassheet(AXUIElementRef win)
+{
+    CFTypeRef kids = 0;
+    b32       r    = 0;
+    if (!AXUIElementCopyAttributeValue(win, kAXChildrenAttribute, &kids)) {
+        if (CFGetTypeID(kids) == CFArrayGetTypeID()) {
+            CFArrayRef list = (CFArrayRef)kids;
+            for (CFIndex i = 0; !r && i < CFArrayGetCount(list); i++) {
+                AXUIElementRef k    = (AXUIElementRef)CFArrayGetValueAtIndex(list, i);
+                CFTypeRef      role = 0;
+                if (!AXUIElementCopyAttributeValue(k, kAXRoleAttribute, &role)) {
+                    r = CFEqual(role, kAXSheetRole);
+                    CFRelease(role);
+                }
+            }
+        }
+        CFRelease(kids);
+    }
+    return r;
+}
+
+// Who has the keyboard, by Accessibility, and with a target window (its
+// element and id), how that window stands.
+static Focus observe(Dk *dk, Arena *a, AXUIElementRef target, u64 id)
+{
+    Focus r = {};
     if (!granted(dk, PERM_AX)) {
         return r;
     }
@@ -841,18 +958,34 @@ static Front axfront(Dk *dk)
         pid_t pid = 0;
         AXUIElementGetPid((AXUIElementRef)app, &pid);
         r.pid = (u32)pid;
+        r.app = axtitle(a, (AXUIElementRef)app);
         CFTypeRef win = 0;
-        if (dk->axwinid && !AXUIElementCopyAttributeValue((AXUIElementRef)app,
-                kAXFocusedWindowAttribute, &win)) {
+        if (!AXUIElementCopyAttributeValue((AXUIElementRef)app,
+                                           kAXFocusedWindowAttribute, &win)) {
             CGWindowID wid = 0;
-            if (!dk->axwinid((AXUIElementRef)win, &wid)) {
-                r.id = wid;
+            if (dk->axwinid && !dk->axwinid((AXUIElementRef)win, &wid)) {
+                r.win = wid;
+            }
+            r.title = axtitle(a, (AXUIElementRef)win);
+            if (target && CFEqual(win, target)) {
+                r.win = id;
+            } else if (target) {
+                CFTypeRef parent = 0;
+                if (!AXUIElementCopyAttributeValue((AXUIElementRef)win,
+                                                   kAXParentAttribute, &parent)) {
+                    r.attached = CFEqual(parent, target);
+                    CFRelease(parent);
+                }
             }
             CFRelease(win);
         }
         CFRelease(app);
     }
     CFRelease(sys);
+    if (target && id && r.win==id) {
+        r.key   = axflag(target, kAXFocusedAttribute);
+        r.sheet = !r.key && hassheet(target);
+    }
     return r;
 }
 
@@ -860,9 +993,10 @@ static Front axfront(Dk *dk)
 // which belongs to the active application.
 static u64 dk_foreground(Dk *dk)
 {
-    Front f = axfront(dk);
-    if (f.id) {
-        return f.id;
+    Arena scratch = dk->perm;  // discarded: names are not kept
+    Focus f       = observe(dk, &scratch, 0, 0);
+    if (f.win) {
+        return f.win;
     }
     CFArrayRef list = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly|kCGWindowListExcludeDesktopElements,
@@ -896,11 +1030,76 @@ static i64 dk_ms(Dk *)
     return (i64)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000);
 }
 
-// The app frontmost, through Accessibility, which works for a program
-// with no windows of its own, where NSRunningApplication's activation
-// is refused to one not active itself; then the window raised and made
-// main, unminimized first. Done when the app is frontmost with the
-// window focused (or a sheet of it, which is no window of its own).
+// Activation through AppKit, as the Dock asks for it. Since macOS 14,
+// activation is cooperative: the active application yields it to
+// another, which then takes it, and a request from a process not active
+// itself, as this helper with no windows never is, may be declined.
+// So it is only the first of the ways tried.
+static void nsactivate(Dk *dk, u32 pid)
+{
+    char const *fw = "/System/Library/Frameworks/AppKit.framework/AppKit";
+    if (!loadfw(&dk->appkit, fw)) {
+        return;
+    }
+    void *pool = objc_autoreleasePoolPush();
+    id    app  = msg<id>(cls("NSRunningApplication"),
+                         "runningApplicationWithProcessIdentifier:", (i32)pid);
+    if (app) {
+        // NSApplicationActivateAllWindows
+        msg<BOOL>(app, "activateWithOptions:", (uz)1);
+    }
+    objc_autoreleasePoolPop(pool);
+}
+
+// The public ways: the application frontmost by Accessibility, which
+// the application does itself when asked, then the window raised, made
+// main, and focused, and the application's focused window.
+static void axactivate(AXUIElementRef app, AXUIElementRef win)
+{
+    AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
+    if (win) {
+        AXUIElementPerformAction(win, kAXRaiseAction);
+        AXUIElementSetAttributeValue(win, kAXMainAttribute, kCFBooleanTrue);
+        AXUIElementSetAttributeValue(win, kAXFocusedAttribute, kCFBooleanTrue);
+        AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute, win);
+    }
+}
+
+// The window server's own way, private, as window managers (yabai,
+// AltTab) focus a window: the process frontmost with that window, as if
+// by the user (kCPSUserGenerated), then the two event records by which
+// the window server tells a window it is key. A launch can leave an
+// application active with no key window, which the public ways do not
+// mend; this does.
+static void skyactivate(Dk *dk, u32 pid, u64 id)
+{
+    u32 psn[2] = {};
+    if (!dk->psnfor || !dk->setfront || !dk->postrec || !id ||
+            dk->psnfor((i32)pid, psn)) {
+        return;
+    }
+    dk->setfront(psn, (u32)id, 0x200);
+    for (i32 i = 1; i <= 2; i++) {
+        u8 rec[0xf8] = {};
+        rec[0x04] = 0xf8;
+        rec[0x08] = (u8)i;
+        rec[0x3a] = 0x10;
+        for (i32 j = 0x20; j < 0x30; j++) {
+            rec[j] = 0xff;
+        }
+        for (i32 j = 0; j < 4; j++) {
+            rec[0x3c+j] = (u8)(id >> (8*j));
+        }
+        dk->postrec(psn, rec);
+    }
+}
+
+// The window unminimized, its app frontmost and the window key, by each
+// way in turn until Accessibility confirms that the window (or a sheet
+// of it) has the keyboard. Activation is asked of the application,
+// which takes it in its own time, so each way waits a little for it.
+// Without that confirmation it fails, naming what has the keyboard
+// instead, and the caller sends no input.
 static b32 dk_activate(Dk *dk, DkWin *w)
 {
     if (!needperm(dk, PERM_AX)) {
@@ -908,26 +1107,38 @@ static b32 dk_activate(Dk *dk, DkWin *w)
     }
     AXUIElementRef app = AXUIElementCreateApplication((pid_t)w->pid);
     AXUIElementRef win = axwindow(dk, w->pid, w->id);
-    if (win) {
-        CFTypeRef min = 0;
-        if (!AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute, &min)) {
-            if (min == kCFBooleanTrue) {
-                AXUIElementSetAttributeValue(win, kAXMinimizedAttribute, kCFBooleanFalse);
-            }
-            CFRelease(min);
-        }
+    if (win && axflag(win, kAXMinimizedAttribute)==1) {
+        AXUIElementSetAttributeValue(win, kAXMinimizedAttribute, kCFBooleanFalse);
     }
+    u64 id = win ? w->id : 0;  // none to confirm without its element
     b32 ok = 0;
-    for (i32 attempt = 0; !ok && attempt < 2; attempt++) {
-        AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
-        if (win) {
-            AXUIElementPerformAction(win, kAXRaiseAction);
-            AXUIElementSetAttributeValue(win, kAXMainAttribute, kCFBooleanTrue);
+    for (i32 way = 0; !ok && way < 3; way++) {
+        switch (way) {
+        case 0: nsactivate(dk, w->pid);
+                axactivate(app, win);
+                break;
+        case 1: axactivate(app, win);  // again, now that it may be active
+                break;
+        case 2: skyactivate(dk, w->pid, id);
+                axactivate(app, win);
+                break;
         }
         for (i32 i = 0; !ok && i < 25; i++) {
-            Front f = axfront(dk);
-            ok = f.pid==w->pid && (!win || !f.id || f.id==w->id);
-            dk_sleep(dk, ok ? 50 : 20);  // once there, let it draw
+            Arena scratch = dk->perm;  // discarded: names are not kept
+            Focus f       = observe(dk, &scratch, win, id);
+            ok = haskeyboard(&f, w->pid, id);
+            if (!ok) {
+                dk_sleep(dk, 20);
+            }
+        }
+    }
+    if (ok) {
+        dk_sleep(dk, 50);  // let it draw
+    } else {
+        Focus f = observe(dk, &dk->perm, win, id);
+        ok = haskeyboard(&f, w->pid, id);
+        if (!ok) {
+            dk->why = unfocused(&dk->perm, &f, w);
         }
     }
     if (win) CFRelease(win);
@@ -1008,7 +1219,11 @@ static u8 *dk_capture(Dk *dk, Arena *a, DkRect r, DkSize *size)
 }
 
 
-// Input, posted at the HID level, as the devices' own
+// Input, posted at the HID level, as the devices' own. Not to the target
+// process (CGEventPostToPid): AppKit routes keys to its key window all
+// the same, and discards them with none, so it would not mend a window
+// that is not key; system shortcuts and input methods see only HID
+// events; and "key active cmd+tab" must reach the system, not one app.
 
 static b32 post(CGEventRef e)
 {
@@ -1432,6 +1647,16 @@ static Dk *newdk(Region *r)
                   dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow");
     dk->respfor = (i32 (*)(i32))
                   dlsym(RTLD_DEFAULT, "responsibility_get_pid_responsible_for_pid");
+    // Focusing a window as window managers do (skyactivate), when the
+    // public ways leave it without the keyboard
+    dk->psnfor  = (i32 (*)(i32, u32 *))dlsym(RTLD_DEFAULT, "GetProcessForPID");
+    void *sky   = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
+                         RTLD_LAZY|RTLD_LOCAL);
+    if (sky) {
+        dk->setfront = (i32 (*)(u32 *, u32, u32))
+                       dlsym(sky, "_SLPSSetFrontProcessWithOptions");
+        dk->postrec  = (i32 (*)(u32 *, u8 *))dlsym(sky, "SLPSPostEventRecordTo");
+    }
     b32 self    = 0;
     Str resp    = responsible(dk, &dk->perm, &self);
     dk->granted = grantee(&dk->perm, resp, self);
