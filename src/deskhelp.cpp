@@ -32,6 +32,11 @@
 // at the display's full resolution and scaled down to the units at
 // most, so that a pixel of the image is never smaller than a unit.
 //
+// run starts a program apart from the helper, and from the harness's
+// reaper, so that it outlives both, as an application the user started
+// does; where it cannot, it says so (in serve mode, on the line after
+// the pid), since the program then ends with the harness.
+//
 // Run with a command, it does that one and exits, as winctl does: text
 // and PNGs on standard output, errors on standard error, exit status 0
 // (ok), 1 (error), 2 (no window or several match) or 3 (wait timed out).
@@ -103,7 +108,8 @@ static b32        dk_access(Dk *, Buf *, b32 ask);
 // null if it can. Asked before every command but help and hello.
 static Str        dk_ready(Dk *);
 // Top-level windows, top of the z-order first: those on the screen
-// (visible and not cloaked), or with all, every one.
+// (visible and not cloaked, or minimized on Windows and X11), or with
+// all, every one.
 static Slice<DkWin> dk_windows(Dk *, Arena *, b32 all);
 // One window by its id, with id 0 if there is no such window.
 static DkWin      dk_window(Dk *, Arena *, u64 id);
@@ -1288,11 +1294,25 @@ static void dkcmdrun(DkCtx *c, DkArgs *a)
     }
     print(&c->out, (i64)pid);
     putbyte(&c->out, '\n');
-    if (attached && !c->serving) {
-        // Windows: it could not leave the job; macOS: no application, so
-        // it stays in the reaper's tree
-        dk_write(c->dk, 2, "prospero-desktop: warning: cannot detach the "
-                           "program, which may end with the session\n");
+    if (attached) {
+        // Windows: it could not leave the job; macOS: no application;
+        // Linux: no user service manager. So it stays in the reaper's
+        // tree, which ends with the harness: in serve mode, the line
+        // after the pid says so
+        Str why = dk_why(c->dk);
+        Buf b(c->a, 128 + why.len);
+        print(&b, "cannot detach the program, which will end with the session");
+        if (why.data) {
+            print(&b, ": ");
+            print(&b, why);
+        }
+        putbyte(&b, '\n');
+        if (c->serving) {
+            print(&c->out, finish(&b));
+        } else {
+            dk_write(c->dk, 2, "prospero-desktop: warning: ");
+            dk_write(c->dk, 2, finish(&b));
+        }
     }
 }
 

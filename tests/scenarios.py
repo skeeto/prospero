@@ -4916,6 +4916,7 @@ def x11cli(t, helper, env, wm):
     rc2, _, _ = xrun(env, helper, "wait", "-gone", "-t", "20", win)
     t.check(rc == 0 and rc2 == 0, f"stubborn closed: {err}")
     lines = [json.loads(x) for x in (t.host.read(log) or "").splitlines()]
+    lines = [x for x in lines if "mapped" not in x]
     t.check(lines == [{"close": True, "text": ""}], f"nothing reached it: {lines}")
 
 
@@ -4962,7 +4963,8 @@ def x11desk(t, wm):
         fx, _, fy, _ = FRAME_X11 if wm else (0, 0, 0, 0)
         cw, ch = 480 + fx + FRAME_X11[1] * wm, 200 + fy + FRAME_X11[3] * wm
         t.check(size and size[-1] == (str(cw - 1), str(ch - 1)), f"the frame {size}")
-        clicks = [x for x in lines if x.get("button") == 1 and x.get("press")]
+        clicks = [{k: x[k] for k in ("button", "press", "x", "y")}
+                  for x in lines if x.get("button") == 1 and x.get("press")]
         t.check(clicks == [{"button": 1, "press": True, "x": (cw - 1) // 2 - fx,
                             "y": (ch - 1) // 2 - fy}], f"clicked {clicks}")
 
@@ -5003,6 +5005,326 @@ def desktop_x11(t):
 def desktop_x11_wm(t):
     """The X11 helper through a window manager's EWMH."""
     x11desk(t, wm=True)
+
+
+def helperframe(proc, *args):
+    """One command to a helper in serve mode, and its reply: (status,
+    text)."""
+    payload = b"".join(a.encode() + b"\0" for a in args)
+    proc.stdin.write(len(payload).to_bytes(4, "little") + payload)
+    proc.stdin.flush()
+    n = int.from_bytes(proc.stdout.read(4), "little")
+    reply = proc.stdout.read(n)
+    tlen = int.from_bytes(reply[1:5], "little")
+    return reply[0], reply[5:5 + tlen].decode("utf-8", "replace")
+
+
+@scenario(bound=60)
+def desktop_x11_keys(t):
+    """The keycodes a helper binds for typing stay bound while it lives,
+    whatever other helpers do, and when it is killed outright, the next
+    helper's command unbinds them."""
+    helper = x11helper(t)
+    x = Xvfb()
+    probe = None
+    try:
+        env = dict(os.environ, DISPLAY=x.display, XDG_SESSION_TYPE="x11", WAYLAND_DISPLAY="")
+        log = t.host.join(t.base, "keys.log")
+        probe = subprocess.Popen([sys.executable, "-I", XPROBE, "window", log], env=env,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        win = f"pid={probe.pid}"
+        rc, _, err = xrun(env, helper, "wait", "-t", "20", win)
+        t.check(rc == 0, f"the probe's window: {err}")
+
+        def keys():
+            return xrun(env, sys.executable, "-I", XPROBE, "keys")[1]
+
+        def text():
+            texts = [json.loads(x).get("text") for x in (t.host.read(log) or "").splitlines()]
+            texts = [s for s in texts if s is not None]
+            return texts[-1] if texts else ""
+        keys0 = keys()
+
+        # A live helper's keys are its own
+        live = subprocess.Popen([helper, "--serve"], env=env, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            t.check(helperframe(live, "hello")[0] == 0, "hello")
+            st, msg = helperframe(live, "type", win, "é€")
+            t.check(st == 0 and waitfor(lambda: text() == "é€", 5), f"typed: {msg} {text()!r}")
+            bound = keys()
+            t.check(bound != keys0, "keys bound for typing")
+            rc, _, err = xrun(env, helper, "list")
+            t.check(rc == 0 and keys() == bound, f"another helper leaves them: {err}")
+        finally:
+            live.stdin.close()
+            live.wait(10)
+        t.check(waitfor(lambda: keys() == keys0, 5), "unbound as it exits")
+
+        # One killed outright leaves them, for the next to undo
+        dead = subprocess.Popen([helper, "--serve"], env=env, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            helperframe(dead, "hello")
+            st, msg = helperframe(dead, "type", win, "✓")
+            t.check(st == 0 and waitfor(lambda: text() == "é€✓", 5), f"typed: {msg} {text()!r}")
+        finally:
+            dead.kill()  # our own child, not yet reaped
+            dead.wait()
+        t.check(keys() != keys0, "a killed helper leaves its keys bound")
+        rc, _, err = xrun(env, helper, "list")
+        t.check(rc == 0 and keys() == keys0, f"the next helper unbinds them: {err}")
+    finally:
+        if probe and P.signal_group(probe, signal.SIGTERM):
+            probe.wait()
+        x.close()
+
+
+# Real window managers, those installed, each on a display of its own
+X11WMS = [
+    ["openbox"],
+    ["xfwm4", "--compositor=off"],
+    ["metacity", "--replace"],
+    ["kwin_x11", "--replace"],
+    ["icewm"],
+    ["fluxbox"],
+]
+
+
+def listed(out):
+    """The windows of the helper's list: (id, pid, x, y, w, h, title)."""
+    r = []
+    for line in out.decode("utf-8", "replace").splitlines():
+        f = line.split("\t")
+        if len(f) == 6:
+            x, y = map(int, f[2].split(","))
+            w, h = map(int, f[3].split("x"))
+            r.append((f[0], int(f[1]), x, y, w, h, f[5]))
+    return r
+
+
+def x11wm(t, helper, x, argv):
+    """Two probes under a real window manager: run, focused in turn and
+    typed into, clicked where the frame says, captured at its size,
+    restored from minimized, moved, and closed; and a GTK dialog that
+    draws its own decorations, typed into until it prints the text."""
+    env = dict(os.environ, DISPLAY=x.display, XDG_SESSION_TYPE="x11", WAYLAND_DISPLAY="",
+               GDK_BACKEND="x11", NO_AT_BRIDGE="1")
+    name = argv[0]
+    wm = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        t.check(waitfor(lambda: xrun(env, sys.executable, "-I", XPROBE, "wmname")[1].strip(),
+                        15), f"{name}: the window manager started")
+        rc, out, err = xrun(env, helper, "list")
+        t.check(rc == 0 and not out, f"{name}: none of its own windows listed: {out} {err}")
+        logs, pids = {}, {}
+        for k in ("A", "B"):
+            logs[k] = t.host.join(t.base, f"{name}-{k}.log")
+            rc, out, err = xrun(env, helper, "run", sys.executable, "-I", XPROBE, "window",
+                                logs[k], f"Probe {k} {name}")
+            got = P.parse(out.decode())
+            t.check(rc == 0 and len(got) == 1, f"{name}: run {k}: {rc} {out} {err}")
+            pids[k] = got[0]
+            rc, _, err = xrun(env, helper, "wait", "-t", "20", f"pid={pids[k]}")
+            t.check(rc == 0, f"{name}: wait {k}: {err}")
+
+        def logged(k):
+            return [json.loads(x) for x in (t.host.read(logs[k]) or "").splitlines()]
+
+        def text(k):
+            texts = [x["text"] for x in logged(k) if "text" in x]
+            return texts[-1] if texts else ""
+
+        # Focus goes back and forth, through the manager
+        for k, s in (("A", "Grüße ✓"), ("B", "é€"), ("A", " again")):
+            rc, _, err = xrun(env, helper, "type", f"pid={pids[k]}", s)
+            t.check(rc == 0, f"{name}: type into {k}: {err}")
+        t.check(waitfor(lambda: text("A") == "Grüße ✓ again" and text("B") == "é€", 5),
+                f"{name}: typed {text('A')!r} and {text('B')!r}")
+
+        # A click lands where the window's frame, as listed, puts it, and
+        # a shot is the frame's size
+        rc, out, _ = xrun(env, helper, "list", f"pid={pids['A']}")
+        wins = listed(out)
+        t.check(rc == 0 and len(wins) == 1, f"{name}: list A: {out}")
+        _, _, fx, fy, fw, fh, _ = wins[0]
+        rc, _, err = xrun(env, helper, "click", f"pid={pids['A']}", str(fw // 2), str(fh - 20))
+        t.check(rc == 0, f"{name}: click: {err}")
+        t.check(waitfor(lambda: any(c.get("press") for c in logged("A") if "button" in c), 5),
+                f"{name}: clicked")
+        press = [c for c in logged("A") if c.get("button") == 1 and c.get("press")]
+        t.check(press and (press[-1]["rx"], press[-1]["ry"]) == (fx + fw // 2, fy + fh - 20),
+                f"{name}: the click at {fx + fw // 2},{fy + fh - 20}: {press}")
+        rc, png, err = xrun(env, helper, "shot", f"pid={pids['A']}")
+        t.check(rc == 0 and pngdims(png) == (min(fw, 1024 - fx), min(fh, 768 - fy)),
+                f"{name}: shot {pngdims(png)} of {wins[0]}: {err}")
+
+        # Minimized, then typed into: the manager restores it first
+        rc, out, _ = xrun(env, helper, "list", f"pid={pids['B']}")
+        wins = listed(out)
+        t.check(len(wins) == 1, f"{name}: list B: {out}")
+        def mapped(k):
+            maps = [x["mapped"] for x in logged(k) if "mapped" in x]
+            return maps[-1] if maps else None
+
+        xrun(env, sys.executable, "-I", XPROBE, "iconify", wins[0][0])
+        t.check(waitfor(lambda: mapped("B") is False, 5), f"{name}: B minimized")
+        rc, _, err = xrun(env, helper, "type", f"pid={pids['B']}", "!")
+        t.check(rc == 0 and mapped("B") and waitfor(lambda: text("B") == "é€!", 5),
+                f"{name}: typed into B restored: {rc} {err} {text('B')!r}")
+
+        rc, _, err = xrun(env, helper, "move", f"pid={pids['B']}", "100", "120", "300", "150")
+        t.check(rc == 0, f"{name}: move: {err}")
+        t.check(waitfor(lambda: [w[2:6] for w in listed(xrun(env, helper, "list",
+                                                               f"pid={pids['B']}")[1])]
+                        == [(100, 120, 300, 150)], 5), f"{name}: moved")
+
+        for k in ("A", "B"):
+            rc, _, err = xrun(env, helper, "close", f"pid={pids[k]}")
+            rc2, _, _ = xrun(env, helper, "wait", "-gone", "-t", "20", f"pid={pids[k]}")
+            t.check(rc == 0 and rc2 == 0, f"{name}: close {k}: {err}")
+            t.check(logged(k)[-1].get("close"), f"{name}: {k} asked to close")
+
+        if shutil.which("zenity") and shutil.which("dbus-run-session"):
+            x11csd(t, helper, env, name)
+    finally:
+        P.signal_group(wm, signal.SIGTERM)
+        try:
+            wm.wait(5)
+        except subprocess.TimeoutExpired:
+            P.signal_group(wm, signal.SIGKILL)
+            wm.wait()
+
+
+def x11csd(t, helper, env, name):
+    """zenity's entry, a GTK dialog, on a session bus of its own: its
+    frame without the shadow it draws (_GTK_FRAME_EXTENTS), typed into,
+    and the text it prints."""
+    z = subprocess.Popen(["dbus-run-session", "zenity", "--entry", "--title=Csd probe",
+                          "--text=Type here"], env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    try:
+        rc, _, err = xrun(env, helper, "wait", "-t", "30", "title=Csd probe")
+        t.check(rc == 0, f"{name}: zenity's window: {err}")
+        time.sleep(1)  # GTK shows its window before it can take keys
+        rc, out, _ = xrun(env, helper, "list", "title=Csd probe")
+        wins = listed(out)
+        t.check(len(wins) == 1, f"{name}: list zenity: {out}")
+        rc, png, err = xrun(env, helper, "shot", "title=Csd probe")
+        t.check(rc == 0 and pngdims(png) == wins[0][4:6],
+                f"{name}: zenity's shot {pngdims(png)} of {wins[0]}: {err}")
+        rc, _, err = xrun(env, helper, "type", "title=Csd probe", "Grüße ✓")
+        rc2, _, err2 = xrun(env, helper, "key", "title=Csd probe", "enter")
+        t.check(rc == 0 and rc2 == 0, f"{name}: typed into zenity: {err} {err2}")
+        out, _ = z.communicate(timeout=20)
+        t.check(out.decode("utf-8", "replace").splitlines()[-1:] == ["Grüße ✓"],
+                f"{name}: zenity printed {out!r}")
+    finally:
+        if P.signal_group(z, signal.SIGTERM):
+            z.wait()
+
+
+@scenario(bound=300)
+def desktop_x11_wms(t):
+    """The X11 helper under each real window manager installed."""
+    helper = x11helper(t)
+    wms = [w for w in X11WMS if shutil.which(w[0])]
+    if not wms:
+        raise Skip("no window manager installed: " + ", ".join(w[0] for w in X11WMS))
+    for argv in wms:
+        x = Xvfb()
+        try:
+            x11wm(t, helper, x, argv)
+        finally:
+            x.close()
+    t.note("window managers: " + " ".join(w[0] for w in wms))
+
+
+def usermanager():
+    """Whether the user's systemd manager takes transient services."""
+    if not shutil.which("systemd-run") or not shutil.which("systemctl"):
+        return False
+    p = subprocess.run(["systemctl", "--user", "is-system-running"],
+                       capture_output=True, text=True, timeout=30)
+    return p.stdout.strip() in ("running", "degraded")
+
+
+def waitfor(cond, secs):
+    deadline = time.monotonic() + secs
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return cond()
+
+
+@scenario(conf=DESKALL, bound=120)
+def desktop_x11_run(t):
+    """A program the desktop tool runs outlives the turn and the harness,
+    as a service of the user's manager, out of the reaper's tree, while
+    a shell command's escapee is still swept. Where the manager will not
+    start it (a systemd-run that fails, here), the tool says that it
+    ends with the harness, and it does."""
+    helper = x11helper(t)
+    managed = usermanager()
+    fake = t.host.join(t.base, "fakebin")
+    os.makedirs(fake, exist_ok=True)
+    with open(os.path.join(fake, "systemd-run"), "w") as f:
+        f.write("#!/bin/sh\necho 'Failed to connect to bus: no manager here' >&2\nexit 1\n")
+    os.chmod(os.path.join(fake, "systemd-run"), 0o755)
+    x = Xvfb()
+    try:
+        env = {"DISPLAY": x.display, "XDG_SESSION_TYPE": "x11", "WAYLAND_DISPLAY": "",
+               "PROSPERO_TEST_DESKTOP": json.dumps([helper])}
+        xenv = dict(os.environ, **env)
+        for apart in ([True, False] if managed else [False]):
+            name = "apart" if apart else "attached"
+            if not apart:
+                env = dict(env, PATH=fake + os.pathsep + os.environ.get("PATH", ""))
+            log = t.host.join(t.base, f"{name}.log")
+            prompt = json.dumps({"program": sys.executable,
+                                 "args": ["-I", XPROBE, "window", log, f"Probe {name}"]})
+            pidfile = t.host.join(t.work, "tree.pids")
+            if os.path.exists(pidfile):
+                os.remove(pidfile)
+            r = t.run(prompt=prompt, timeout=80, env=env)
+            ends = [(e["status"], e["text"][:800]) for e in r.all("tool.end")]
+            t.check(r.rc == 0 and len(ends) == 3 and all(s == "ok" for s, _ in ends),
+                    f"{name}: exit {r.rc}: {ends}")
+            m = re.search(r"process id (\d+)", ends[0][1] if ends else "")
+            pids = P.parse(m.group(1) if m else "")
+            t.check(len(pids) == 1, f"{name}: the program's pid: {ends[:1]}")
+            pid = pids[0]
+            noted = "cannot detach the program" in ends[0][1]
+            t.check(noted != apart, f"{name}: what run said: {ends[0][1]}")
+            escapees = P.read(pidfile)
+            t.check(len(escapees) == 1, f"{name}: the escapee's pid: {escapees}")
+
+            # The harness has exited: its reaper sweeps what the shell
+            # left, TERM and then KILL 2 s later
+            t.check(waitfor(lambda: not any(P.alive(e) for e in escapees), 10),
+                    f"{name}: the escapee is swept: {escapees}")
+            win = f"pid={pid}"
+            if not apart:
+                t.check(waitfor(lambda: not P.alive(pid), 10),
+                        f"attached: the program ended with the harness: {pid}")
+                continue
+            t.check(P.alive(pid), f"apart: the program outlived the harness: {pid}")
+            try:
+                with open(f"/proc/{P.arg(pid)}/cgroup") as f:
+                    cgroup = f.read()
+            except OSError:
+                cgroup = ""
+            t.check("/app.slice/app-prospero-" in cgroup,
+                    f"apart: in a service of the user's manager: {cgroup!r}")
+            rc, out, err = xrun(xenv, helper, "list", win)
+            t.check(rc == 0 and f"Probe {name}".encode() in out, f"apart: its window: {out} {err}")
+            rc, _, err = xrun(xenv, helper, "close", win)
+            rc2, _, _ = xrun(xenv, helper, "wait", "-gone", "-t", "20", win)
+            t.check(rc == 0 and rc2 == 0 and waitfor(lambda: not P.alive(pid), 10),
+                    f"apart: closed: {err}")
+    finally:
+        x.close()
 
 
 @scenario(conf={**AN, **DESKALL, "_extra": "[model {model}]\nimage_edge = 100\n"}, bound=15)

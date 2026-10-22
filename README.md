@@ -332,7 +332,12 @@ chooses another; the helper's is that plus `.desktop`.
 On Linux the helper drives the X11 display that `DISPLAY` names, in
 pixels, loading libX11, libXext and libXtst when it runs. It works with
 a window manager through EWMH, or without one. Wayland is not supported
-yet: in a Wayland session every call fails and says so.
+yet: in a Wayland session every call fails and says so. A program the
+tool runs (a path, a name in `PATH`, or a desktop entry such as
+`org.gnome.TextEditor`) is started by your systemd user manager, as a
+transient service in `app.slice` with the helper's environment, so that
+it outlives the turn and Prospero, as an application you start does.
+Without a user manager it ends with Prospero, and the tool says so.
 
 Screenshots go to the model as images, scaled down to its limits
 (`[model] image_edge` and `image_pixels`: by default 1568 pixels on a
@@ -419,7 +424,10 @@ The suites:
   it again as its own responsible process, as an app runs.
 - `scenarios`: the engine end to end against a fault-injecting fake
   provider (`tests/fake_provider.py`), and for the desktop tool, a fake
-  helper (`tests/fake_desktop.py`).
+  helper (`tests/fake_desktop.py`). On Linux with Xvfb, the real X11
+  helper too, on displays of their own (`tests/xprobe.py`), under each
+  window manager installed of openbox, xfwm4, metacity, kwin_x11, icewm
+  and fluxbox (`desktop_x11_wms`; with zenity, a GTK dialog too).
 - `cleanup`: the harness killed hard while its tools run, which must
   leave no process behind.
 - `remote`, `includes`, `deploy`: hosts and their clients, URL includes

@@ -4440,12 +4440,20 @@ static void deskanswer(Session *s, Arena scratch, DeskReply *r)
         }
         break;
     case DESK_RUN: {
-        Str pid = trim(r->text);
+        // The pid, and a line more if it could not be detached
+        Cut line = cut(trim(r->text), '\n');
+        Str pid  = trim(line.head);
+        Str note = trim(line.tail);
         print(&b, ", process id ");
         print(&b, pid);
         print(&b, ". Wait for its window (wait, with window pid=");
         print(&b, pid);
         print(&b, ") before you use it.");
+        if (note.len) {
+            print(&b, " Note: ");
+            print(&b, note);
+            putbyte(&b, '.');
+        }
     } break;
     default:
         putbyte(&b, '.');

@@ -10,7 +10,8 @@ X client library and a server such as Xvfb.
   xprobe.py window LOG [TITLE]
                          a window, "Prospero probe" or TITLE, that draws
                          what is typed into it and appends each key,
-                         button and close request to LOG as a JSON line;
+                         button, mapping and close request to LOG as a
+                         JSON line;
                          it exits when asked to close (WM_DELETE_WINDOW)
   xprobe.py wm LOG       a stand-in window manager that speaks just
                          enough EWMH for the helper: the client lists,
@@ -21,6 +22,8 @@ X client library and a server such as Xvfb.
                          never activates a window whose title starts
                          with "Stubborn", as a manager may refuse
   xprobe.py keys         the keycodes that have keysyms, as JSON
+  xprobe.py wmname       the running EWMH window manager's name, if any
+  xprobe.py iconify ID   ask the window manager to minimize window ID
 
 DISPLAY names the display.
 """
@@ -125,6 +128,10 @@ def xlib():
         "XFree": (c_int, [c_void_p]),
         "XFetchName": (c_int, [c_void_p, c_ulong, POINTER(c_char_p)]),
         "XSetErrorHandler": (c_void_p, [c_void_p]),
+        "XGetWindowProperty": (c_int, [c_void_p, c_ulong, c_ulong, c_long, c_long, c_int,
+                                       c_ulong, POINTER(c_ulong), POINTER(c_int),
+                                       POINTER(c_ulong), POINTER(c_ulong),
+                                       POINTER(POINTER(c_ubyte))]),
     }
     for name, (res, args) in sigs.items():
         f = getattr(x, name)
@@ -221,7 +228,10 @@ def window(path, name="Prospero probe"):
                 draw()
         elif ev.type in (ButtonPress, ButtonRelease):
             b = ev.xbutton
-            log(button=b.button, press=ev.type == ButtonPress, x=b.x, y=b.y)
+            log(button=b.button, press=ev.type == ButtonPress, x=b.x, y=b.y,
+                rx=b.x_root, ry=b.y_root)
+        elif ev.type in (MapNotify, UnmapNotify) and ev.xstruct.window == w:
+            log(mapped=ev.type == MapNotify)
         elif ev.type == MappingNotify:
             X.XRefreshKeyboardMapping(byref(ev))
         elif ev.type == Expose:
@@ -339,6 +349,43 @@ def keys():
     print(json.dumps(out))
 
 
+def getprop(dpy, w, name, type_):
+    """A property's bytes, or for format 32, its items as ints."""
+    actual, fmt = c_ulong(), c_int()
+    n, after, data = c_ulong(), c_ulong(), POINTER(c_ubyte)()
+    X.XGetWindowProperty(dpy, w, name, 0, 1024, 0, type_, byref(actual), byref(fmt),
+                         byref(n), byref(after), byref(data))
+    if not data:
+        return b"" if fmt.value != 32 else []
+    if fmt.value == 32:
+        out = list(ctypes.cast(data, POINTER(c_ulong))[:n.value])
+    else:
+        out = bytes(data[:n.value])
+    X.XFree(data)
+    return out
+
+
+def wmname():
+    dpy, _, root = connect()
+    check = atom(dpy, "_NET_SUPPORTING_WM_CHECK")
+    w = getprop(dpy, root, check, XA_WINDOW)
+    if w and getprop(dpy, w[0], check, XA_WINDOW) == w[:1]:
+        name = getprop(dpy, w[0], atom(dpy, "_NET_WM_NAME"), atom(dpy, "UTF8_STRING"))
+        print(name.decode("utf-8", "replace") or "?")
+
+
+def iconify(wid):
+    dpy, _, root = connect()
+    d = XEvent()
+    d.xclient.type = ClientMessage
+    d.xclient.window = wid
+    d.xclient.message_type = atom(dpy, "WM_CHANGE_STATE")
+    d.xclient.format = 32
+    d.xclient.l[0] = 3  # IconicState
+    X.XSendEvent(dpy, root, 0, (1 << 19) | (1 << 20), byref(d))
+    X.XSync(dpy, 0)
+
+
 def main():
     if len(sys.argv) in (3, 4) and sys.argv[1] == "window":
         window(*sys.argv[2:])
@@ -346,6 +393,10 @@ def main():
         wm(sys.argv[2])
     elif len(sys.argv) == 2 and sys.argv[1] == "keys":
         keys()
+    elif len(sys.argv) == 2 and sys.argv[1] == "wmname":
+        wmname()
+    elif len(sys.argv) == 3 and sys.argv[1] == "iconify":
+        iconify(int(sys.argv[2], 0))
     else:
         sys.exit(__doc__)
 

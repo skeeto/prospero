@@ -14,7 +14,8 @@
 // the keyboard makes is bound for a while to a spare keycode, one with
 // no symbols, and the keycode is unbound again as the helper exits, at
 // the end of its input or when asked to quit (SIGTERM). A helper killed
-// outright leaves its bindings, which later ones use as keys.
+// outright leaves its bindings, recorded on the root window, which the
+// next helper to run a command on the display undoes.
 //
 // Windows are the window manager's, through EWMH (_NET_CLIENT_LIST and
 // the client messages for activating, closing and moving), and without
@@ -33,6 +34,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdlib.h>  // getenv
@@ -40,6 +42,8 @@
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include "base.cpp"
@@ -51,6 +55,21 @@ using Xid   = decltype(0ul);  // XID, Window, Atom, KeySym, Time
 using Xlong = decltype(0l);
 struct Display;
 
+// The start of Xlib's public Display, as _XPrivDisplay lays it out, for
+// the mask of a client's resource ids (private4, resource_mask): all of
+// one client's windows share the bits outside it.
+struct XDisplayHead {
+    void *ext_data;
+    void *private1;
+    i32   fd;
+    i32   private2;
+    i32   proto_major_version;
+    i32   proto_minor_version;
+    char *vendor;
+    Xid   private3;  // resource_base
+    Xid   private4;  // resource_mask
+};
+
 enum : i32 {
     X_ISVIEWABLE      = 2,   // map_state
     X_INPUTONLY       = 2,   // class
@@ -59,6 +78,7 @@ enum : i32 {
     X_CLIENTMESSAGE   = 33,
     X_REVERTTOPARENT  = 2,
     X_STATICGRAVITY   = 10,
+    X_PROPMODEREPLACE = 0,
 
     XA_ATOM           = 4,
     XA_CARDINAL       = 6,
@@ -186,6 +206,12 @@ struct Xlib {
     i32      (*XDisplayKeycodes)(Display *, i32 *, i32 *);
     Xid     *(*XGetKeyboardMapping)(Display *, u8, i32, i32 *);
     i32      (*XChangeKeyboardMapping)(Display *, i32, i32, Xid *, i32);
+    i32      (*XChangeProperty)(Display *, Xid, Xid, Xid, i32, i32, u8 *, i32);
+    i32      (*XDeleteProperty)(Display *, Xid, Xid);
+    Xid      (*XCreateWindow)(Display *, Xid, i32, i32, u32, u32, u32, i32,
+                              u32, void *, Xid, void *);
+    i32      (*XGrabServer)(Display *);
+    i32      (*XUngrabServer)(Display *);
     // libXext, optional
     b32      (*XShmQueryExtension)(Display *);
     XImage  *(*XShmCreateImage)(Display *, void *, u32, i32, u8 *,
@@ -204,7 +230,7 @@ enum {
     A_CLIENTS, A_STACKING, A_ACTIVE, A_CLOSE, A_MOVERESIZE, A_SUPPORTED,
     A_CHECK, A_NAME, A_UTF8, A_PID, A_EXTENTS, A_GTKEXTENTS, A_TYPE,
     A_MENU, A_DROPDOWN, A_POPUP, A_TOOLTIP, A_NOTIFICATION, A_COMBO, A_DND,
-    A_WMSTATE, A_PROTOCOLS, A_DELETE,
+    A_WMSTATE, A_PROTOCOLS, A_DELETE, A_KEYS,
     A_COUNT
 };
 
@@ -217,7 +243,7 @@ static char const *atomnames[A_COUNT] = {
     "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", "_NET_WM_WINDOW_TYPE_POPUP_MENU",
     "_NET_WM_WINDOW_TYPE_TOOLTIP", "_NET_WM_WINDOW_TYPE_NOTIFICATION",
     "_NET_WM_WINDOW_TYPE_COMBO", "_NET_WM_WINDOW_TYPE_DND",
-    "WM_STATE", "WM_PROTOCOLS", "WM_DELETE_WINDOW",
+    "WM_STATE", "WM_PROTOCOLS", "WM_DELETE_WINDOW", "_PROSPERO_DESKTOP_KEYS",
 };
 
 enum : iz {
@@ -230,7 +256,9 @@ enum : iz {
 struct Bound {
     i32 code;
     Xid sym;
-    i64 used;  // when it was last typed, dk_ms
+    Xid prev;     // its last keysym, until it is bound to sym, else 0
+    b32 pending;  // bound to sym only as this helper knows the keyboard
+    i64 used;     // when it was last typed, dk_ms
 };
 
 struct Dk {
@@ -242,6 +270,8 @@ struct Dk {
     Str       failed;       // why the latest call failed, for dk_why
     b32       shm;          // MIT-SHM may be tried
     Xid       atom[A_COUNT];
+    Xid       idmask;       // a client's resource ids differ only in these
+    Xid       wmcheck;      // the manager's check window, 0 without EWMH
     b32       ewmh;         // a manager speaks EWMH, with
     b32       has[A_COUNT]; // these in its _NET_SUPPORTED
 
@@ -252,6 +282,7 @@ struct Dk {
     i32       nspare;
     Bound     bound[SPARES];  // by this helper, until it exits
     i32       nbound;
+    Xid       owner;        // names this helper in the record of bindings
 
     Arena     tmp;          // for calls without an arena, reset each
 };
@@ -433,6 +464,11 @@ static Str loadxlib(Dk *dk, Arena *a)
     ok &= load(&x->XDisplayKeycodes,       x11, "XDisplayKeycodes");
     ok &= load(&x->XGetKeyboardMapping,    x11, "XGetKeyboardMapping");
     ok &= load(&x->XChangeKeyboardMapping, x11, "XChangeKeyboardMapping");
+    ok &= load(&x->XChangeProperty,        x11, "XChangeProperty");
+    ok &= load(&x->XDeleteProperty,        x11, "XDeleteProperty");
+    ok &= load(&x->XCreateWindow,          x11, "XCreateWindow");
+    ok &= load(&x->XGrabServer,            x11, "XGrabServer");
+    ok &= load(&x->XUngrabServer,          x11, "XUngrabServer");
     if (!ok) {
         return loadfail(a, "libX11 lacks a function it should have");
     }
@@ -481,9 +517,14 @@ static Prop getprop(Dk *dk, Arena *a, Xid w, Xid prop, Xid type, iz max)
                                            0, type, &actual, &format, &n,
                                            &after, &data);
     if (!err && data && actual && (!type || actual==type)) {
+        // Items are read in place, so they keep their alignment
+        r.len = (iz)n<max ? (iz)n : max;
+        switch (format) {
+        case 32: r.data = (u8 *)alloc<Xlong>(a, r.len); break;
+        case 16: r.data = (u8 *)alloc<short>(a, r.len); break;
+        default: r.data = allocbytes(a, r.len);
+        }
         iz size = format==32 ? (iz)sizeof(Xlong) : format==16 ? 2 : 1;
-        r.len  = (iz)n<max ? (iz)n : max;
-        r.data = allocbytes(a, r.len*size);
         copybytes(r.data, data, r.len*size);
         r.type = actual;
         r.ok   = 1;
@@ -580,7 +621,8 @@ static void sendroot(Dk *dk, Xid w, Xid type, Xlong *l)
 // before each command, since one may start or stop between them.
 static void findwm(Dk *dk, Arena scratch)
 {
-    dk->ewmh = 0;
+    dk->ewmh    = 0;
+    dk->wmcheck = 0;
     for (i32 i = 0; i < A_COUNT; i++) {
         dk->has[i] = 0;
     }
@@ -594,7 +636,8 @@ static void findwm(Dk *dk, Arena scratch)
     if (!self.ok || self.val!=c.val) {
         return;
     }
-    dk->ewmh = 1;
+    dk->ewmh    = 1;
+    dk->wmcheck = (Xid)c.val;
     Prop p = getprop(dk, &scratch, dk->root, dk->atom[A_SUPPORTED], XA_ATOM, 4096);
     for (iz i = 0; i < p.len; i++) {
         for (i32 k = 0; k < A_COUNT; k++) {
@@ -662,20 +705,33 @@ static Xid toplevel(Dk *dk, Arena scratch, Xid w)
     return 0;
 }
 
+// Whether the manager made a window, as it makes its check window: the
+// bits of their ids that name the client are the same.
+static b32 wmowned(Dk *dk, Xid w)
+{
+    Xid client = ~dk->idmask;
+    return dk->wmcheck && (w & client)==(dk->wmcheck & client);
+}
+
 // The windows that are windows to the user, top first: the manager's
 // clients, under the popups (override-redirect, as menus are) over
-// them, or without EWMH, the root's children, or their clients.
+// them, or without EWMH, the root's children, or their clients. The
+// manager's own windows are none of them: its check window, and its
+// panels, which some list as clients (IceWM's taskbar), nor are frames,
+// which some make override-redirect (IceWM).
 static Slice<Xid> toplevels(Dk *dk, Arena *a, Arena tmp)
 {
     Slice<Xid> r    = {};
     Kids       kids = querytree(dk, &tmp, dk->root);
     if (dk->ewmh) {
         for (iz i = kids.len-1; i >= 0; i--) {
+            Xid               w  = kids.ids[i];
             XWindowAttributes wa = {};
-            if (dk->x.XGetWindowAttributes(dk->dpy, kids.ids[i], &wa) &&
+            if (dk->x.XGetWindowAttributes(dk->dpy, w, &wa) &&
                     wa.override_redirect && wa.map_state==X_ISVIEWABLE &&
-                    wa.cls!=X_INPUTONLY) {
-                r = push(a, r, kids.ids[i]);
+                    wa.cls!=X_INPUTONLY && !wmowned(dk, w) &&
+                    !clientin(dk, tmp, w, 2)) {
+                r = push(a, r, w);
             }
         }
         Prop p = getprop(dk, &tmp, dk->root, dk->atom[A_STACKING], XA_WINDOW, 1<<16);
@@ -685,15 +741,21 @@ static Slice<Xid> toplevels(Dk *dk, Arena *a, Arena tmp)
         }
         if (p.ok) {
             for (iz i = p.len-1; i >= 0; i--) {
-                r = push(a, r, (Xid)propitem(p, i));
+                Xid w = (Xid)propitem(p, i);
+                if (!wmowned(dk, w)) {
+                    r = push(a, r, w);
+                }
             }
             return r;
         }
-        r = {};  // a manager without a list
+        r = {};  // a manager without a list, as Xfwm4 before its first client
     }
     for (iz i = kids.len-1; i >= 0; i--) {
         Xid c = clientin(dk, tmp, kids.ids[i], 2);
-        r = push(a, r, c ? c : kids.ids[i]);
+        Xid w = c ? c : kids.ids[i];
+        if (!wmowned(dk, w)) {
+            r = push(a, r, w);
+        }
     }
     return r;
 }
@@ -802,6 +864,9 @@ static b32 dk_access(Dk *, Buf *, b32)
     return 1;
 }
 
+static i32  recoverkeys(Dk *);
+static void reserved(Dk *, Prop);
+
 // The keyboard's keysyms, and the keycodes without any.
 static void loadkeys(Dk *dk)
 {
@@ -843,6 +908,7 @@ static void loadkeys(Dk *dk)
 
 static Str dk_ready(Dk *dk)
 {
+    while (waitpid(-1, 0, WNOHANG) > 0) {}  // programs run that ended
     if (dk->why.data) {
         return dk->why;
     }
@@ -876,6 +942,8 @@ static Str dk_ready(Dk *dk)
         dk->x.XSetErrorHandler(onxerror);
         dk->x.XSetIOErrorHandler(onxioerror);
         dk->screen = dk->x.XDefaultScreen(dk->dpy);
+        Xid mask   = ((XDisplayHead *)dk->dpy)->private4;
+        dk->idmask = mask && !(mask & (mask+1)) ? mask : 0x1fffff;
         dk->root   = dk->x.XRootWindow(dk->dpy, dk->screen);
         i32 n[4] = {};
         if (!dk->x.XTestQueryExtension(dk->dpy, n, n+1, n+2, n+3)) {
@@ -887,17 +955,31 @@ static Str dk_ready(Dk *dk)
     }
     findwm(dk, dk->tmp);
     loadkeys(dk);
+    if (recoverkeys(dk)) {
+        loadkeys(dk);  // with the spare keycodes recovered
+        recoverkeys(dk);
+    }
     return {};
 }
 
+// The windows mapped, and those a manager minimized or keeps on another
+// desktop (IconicState), as Windows lists a minimized window: they may
+// be named, and activating one brings it back.
 static Slice<DkWin> dk_windows(Dk *dk, Arena *a, b32 all)
 {
     Slice<Xid>   ids = toplevels(dk, a, dk->tmp);
     Slice<DkWin> r   = {};
     for (iz i = 0; i < ids.len; i++) {
         XWin w = describe(dk, a, ids[i]);
-        if (w.win.id && (all || w.geom.viewable)) {
+        if (!w.win.id) {
+            continue;
+        } else if (all || w.geom.viewable) {
             r = push(a, r, w.win);
+        } else if (dk->ewmh) {
+            Card st = getcard(dk, ids[i], dk->atom[A_WMSTATE], dk->atom[A_WMSTATE]);
+            if (st.ok && st.val==3) {
+                r = push(a, r, w.win);
+            }
         }
     }
     return r;
@@ -1299,27 +1381,189 @@ static b32 dk_keys(Dk *dk, i32 *codes, i32 n)
 }
 
 // Bind a keycode to a keysym, the same shifted or not, or with none,
-// unbind it.
+// unbind it, in the keyboard as this helper knows it.
+static void cachekey(Dk *dk, i32 code, Xid sym)
+{
+    for (i32 c = 0; c < KEYCOLS; c++) {
+        dk->keys[code][c] = c<2 ? sym : 0;
+    }
+}
+
+// The same in the server's keyboard, for every client.
 static void bindkey(Dk *dk, i32 code, Xid sym)
 {
     Xid row[KEYCOLS] = {};
     i32 cols = dk->cols>1 ? dk->cols : 2;
     row[0] = row[1] = sym;
     dk->x.XChangeKeyboardMapping(dk->dpy, code, cols, row, 1);
-    for (i32 c = 0; c < KEYCOLS; c++) {
-        dk->keys[code][c] = row[c];
+    cachekey(dk, code, sym);
+}
+
+// Whether the server's keyboard binds a keycode to a keysym as bindkey
+// does, and to nothing else: XKB repeats it in each group it reports.
+static b32 boundas(Dk *dk, i32 code, Xid sym)
+{
+    i32  cols = 0;
+    Xid *row  = dk->x.XGetKeyboardMapping(dk->dpy, (u8)code, 1, &cols);
+    if (!row) {
+        return 0;
+    }
+    b32 r = cols>=1 && row[0]==sym;
+    for (i32 c = 1; c < cols; c++) {
+        r &= row[c]==sym || !row[c];
+    }
+    dk->x.XFree(row);
+    return r;
+}
+
+
+// The record of bindings
+//
+// A helper killed outright cannot unbind its keys, so each records what
+// it binds in a property of the root window, _PROSPERO_DESKTOP_KEYS, as
+// CARDINAL triples: the owner, an input-only window of the helper's, a
+// keycode, and the keysym bound to it. A binding is recorded before it
+// is made, and while a key is rebound, both its keysyms are. Before each
+// command, every helper unbinds the keys of owners that are gone, those
+// still bound exactly as recorded, which nothing else has changed since,
+// and drops their records. An owner window is gone with its helper's
+// connection, and carries the same property, unlike a later client's
+// window that the server gave the same id. Records change under a server
+// grab, since helpers may share a display.
+
+enum : iz {
+    RECORDMAX = 3 << 14,  // items of the record read, of every helper
+};
+
+static void putrecords(Dk *dk, Xlong *items, iz len)
+{
+    if (len) {
+        dk->x.XChangeProperty(dk->dpy, dk->root, dk->atom[A_KEYS], XA_CARDINAL,
+                              32, X_PROPMODEREPLACE, (u8 *)items, (i32)len);
+    } else {
+        dk->x.XDeleteProperty(dk->dpy, dk->root, dk->atom[A_KEYS]);
     }
 }
 
-// A keycode for a keysym that no key makes: a spare one bound to it, or
-// else the binding of this helper's typed longest ago, but not in this
-// run (used before now). 0 if there is none.
+// Whether the helper that recorded a binding is still there.
+static b32 ownerlives(Dk *dk, Xid owner)
+{
+    xerror = 0;  // BadWindow, once it has gone
+    return owner==dk->owner || getcard(dk, owner, dk->atom[A_KEYS], XA_CARDINAL).ok;
+}
+
+// Replace this helper's records with its bindings as they are now.
+static void recordkeys(Dk *dk)
+{
+    Xlib *x = &dk->x;
+    if (!dk->owner) {
+        dk->owner = x->XCreateWindow(dk->dpy, dk->root, -1, -1, 1, 1, 0, 0,
+                                     X_INPUTONLY, 0, 0, 0);
+        Xlong pid = getpid();
+        x->XChangeProperty(dk->dpy, dk->owner, dk->atom[A_KEYS], XA_CARDINAL,
+                           32, X_PROPMODEREPLACE, (u8 *)&pid, 1);
+    }
+    Arena a = dk->tmp;
+    x->XGrabServer(dk->dpy);
+    Prop   p     = getprop(dk, &a, dk->root, dk->atom[A_KEYS], XA_CARDINAL, RECORDMAX);
+    Xlong *items = alloc<Xlong>(&a, p.len + 6*SPARES);
+    iz     n     = 0;
+    for (iz i = 0; i+2 < p.len; i += 3) {
+        if ((Xid)propitem(p, i) != dk->owner) {
+            items[n++] = propitem(p, i);
+            items[n++] = propitem(p, i+1);
+            items[n++] = propitem(p, i+2);
+        }
+    }
+    for (i32 i = 0; i < dk->nbound; i++) {
+        Bound *b = &dk->bound[i];
+        for (i32 k = 0; k < 2; k++) {
+            Xid sym = k ? b->prev : b->sym;
+            if (sym) {
+                items[n++] = (Xlong)dk->owner;
+                items[n++] = b->code;
+                items[n++] = (Xlong)sym;
+            }
+        }
+    }
+    putrecords(dk, items, n);
+    x->XUngrabServer(dk->dpy);
+    x->XSync(dk->dpy, 0);
+}
+
+// Unbind the keys recorded by helpers that are gone, if still bound as
+// recorded, and drop their records. Returns how many it unbound. Then
+// the keycodes that other helpers recorded are not spare, even before
+// they are bound.
+static i32 recoverkeys(Dk *dk)
+{
+    Arena a     = dk->tmp;
+    Prop  p     = getprop(dk, &a, dk->root, dk->atom[A_KEYS], XA_CARDINAL, RECORDMAX);
+    b32   stale = 0;
+    for (iz i = 0; !stale && i+2 < p.len; i += 3) {
+        stale = !ownerlives(dk, (Xid)propitem(p, i));
+    }
+    if (!stale) {
+        reserved(dk, p);
+        return 0;
+    }
+
+    i32 n = 0;
+    dk->x.XGrabServer(dk->dpy);
+    p = getprop(dk, &a, dk->root, dk->atom[A_KEYS], XA_CARDINAL, RECORDMAX);
+    Xlong *keep = alloc<Xlong>(&a, p.len);
+    iz     len  = 0;
+    for (iz i = 0; i+2 < p.len; i += 3) {
+        Xid   owner = (Xid)propitem(p, i);
+        Xlong code  = propitem(p, i+1);
+        Xid   sym   = (Xid)propitem(p, i+2);
+        if (ownerlives(dk, owner)) {
+            keep[len++] = (Xlong)owner;
+            keep[len++] = code;
+            keep[len++] = (Xlong)sym;
+        } else if (code>=dk->minkey && code<=dk->maxkey && sym &&
+                   boundas(dk, (i32)code, sym)) {
+            bindkey(dk, (i32)code, 0);
+            n++;
+        }
+    }
+    putrecords(dk, keep, len);
+    dk->x.XUngrabServer(dk->dpy);
+    dk->x.XSync(dk->dpy, 0);
+    Prop kept = {};
+    kept.data = (u8 *)keep;
+    kept.len  = len;
+    reserved(dk, kept);
+    return n;
+}
+
+// Drop from the spare keycodes those that another helper recorded.
+static void reserved(Dk *dk, Prop p)
+{
+    for (iz i = 0; i+2 < p.len; i += 3) {
+        if ((Xid)propitem(p, i) == dk->owner) {
+            continue;
+        }
+        for (i32 k = 0; k < dk->nspare; k++) {
+            if (dk->spare[k] == propitem(p, i+1)) {
+                dk->spare[k--] = dk->spare[--dk->nspare];
+            }
+        }
+    }
+}
+
+
+// A keycode for a keysym that no key makes: a spare one, or else the
+// binding of this helper's typed longest ago, but not in this run (used
+// before now), so far only as this helper knows the keyboard: pending
+// until dk_text records and makes it. 0 if there is none.
 static i32 bindfor(Dk *dk, Xid sym, i64 now)
 {
     Bound *b = 0;
     if (dk->nspare && dk->nbound<SPARES) {
         b = &dk->bound[dk->nbound++];
         b->code = dk->spare[--dk->nspare];
+        b->prev = 0;
     } else {
         for (i32 i = 0; i < dk->nbound; i++) {
             Bound *c = &dk->bound[i];
@@ -1334,11 +1578,27 @@ static i32 bindfor(Dk *dk, Xid sym, i64 now)
             dk->x.XSync(dk->dpy, 0);
             dk_sleep(dk, (i32)wait);
         }
+        b->prev = b->pending ? b->prev : b->sym;
     }
-    b->sym  = sym;
-    b->used = now;
-    bindkey(dk, b->code, sym);
+    b->sym     = sym;
+    b->used    = now;
+    b->pending = 1;
+    cachekey(dk, b->code, sym);
     return b->code;
+}
+
+// Record the pending bindings, then make them.
+static void bindpending(Dk *dk)
+{
+    recordkeys(dk);
+    for (i32 i = 0; i < dk->nbound; i++) {
+        Bound *b = &dk->bound[i];
+        if (b->pending) {
+            bindkey(dk, b->code, b->sym);
+            b->pending = 0;
+            b->prev    = 0;
+        }
+    }
 }
 
 // Mark a key as typed in this run, if it is one this helper bound.
@@ -1352,7 +1612,7 @@ static void markused(Dk *dk, i32 code, i64 now)
 }
 
 // Unbind every keycode this helper bound, once its last key has had
-// time to be looked up, or at once when asked to quit.
+// time to be looked up, or at once when asked to quit, then its record.
 static void unbindall(Dk *dk)
 {
     if (!dk->dpy || !dk->nbound) {
@@ -1371,7 +1631,7 @@ static void unbindall(Dk *dk)
         bindkey(dk, dk->bound[i].code, 0);
     }
     dk->nbound = 0;
-    dk->x.XSync(dk->dpy, 0);
+    recordkeys(dk);
 }
 
 // Type keysyms in runs: each as long as the spare keycodes can hold the
@@ -1425,6 +1685,7 @@ static b32 dk_text(Dk *dk, Arena scratch, Str s)
         if (bound) {
             // Clients learn of a new mapping from an event, which they
             // should have before the keys of it
+            bindpending(dk);
             dk->x.XSync(dk->dpy, 0);
             dk_sleep(dk, 30);
         }
@@ -1518,21 +1779,56 @@ static b32 dk_move(Dk *dk, DkWin *w, i32 x, i32 y, i32 cw, i32 ch, b32 size)
     return flushed(dk);
 }
 
-// In a session of its own, with null standard streams and default
-// signals. It cannot leave the harness's reaper (a subreaper), which
-// ends what is left of a tool when the harness exits.
-static u32 dk_run(Dk *dk, Arena scratch, Slice<Str> argv, b32 *attached)
-{
-    *attached = 0;
-    char **args = alloc<char *>(&scratch, argv.len+1);
-    for (iz i = 0; i < argv.len; i++) {
-        args[i] = cstr(&scratch, argv[i]);
-    }
+// Running programs
+//
+// A program run outlives the turn and the harness, as on Windows, where
+// it leaves the job, and on macOS, where LaunchServices starts it. Here
+// the helper runs under the harness's reaper, a child subreaper, which
+// ends whatever came from the tool however it detaches: setsid and
+// double forks only make it the reaper's child. So the user's service
+// manager starts it instead, as a transient service of its own
+// (systemd-run --user), as desktops start applications: in the user's
+// app.slice, its parent the manager, outside the reaper's tree, with
+// the helper's environment and directory. ExitType=cgroup keeps the
+// service up while anything in it runs, as after a launcher that hands
+// off to a child and exits. Without a user manager, a desktop entry
+// that D-Bus activates goes through gio launch, which asks the session
+// bus to start it, and anything else runs in the helper's tree, in a
+// session of its own, and ends with the harness: attached.
+//
+// The program is a path, a name found in PATH, or a desktop entry: a
+// .desktop file, or its id (org.gnome.TextEditor) where no program has
+// that name, whose Exec line runs, with the arguments in place of its
+// file or URL field code.
 
+enum : i64 {
+    RUNWAIT  = 8000,  // milliseconds a program the helper waits for may take
+    BUSWAIT  = 5000,  // and an activated one, to take its D-Bus name
+};
+
+static char **cargv(Arena *a, Slice<Str> argv)
+{
+    char **r = alloc<char *>(a, argv.len+1);
+    for (iz i = 0; i < argv.len; i++) {
+        r[i] = cstr(a, argv[i]);
+    }
+    return r;
+}
+
+// Spawn with default signals, standard input null, output and errors to
+// out, or null if it is -1, and with session, in a session of its own.
+// An errno value on failure.
+static i32 spawn(pid_t *pid, char **argv, i32 out, b32 session)
+{
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
-    for (i32 fd = 0; fd < 3; fd++) {
-        posix_spawn_file_actions_addopen(&fa, fd, "/dev/null", fd ? O_WRONLY : O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    for (i32 fd = 1; fd < 3; fd++) {
+        if (out >= 0) {
+            posix_spawn_file_actions_adddup2(&fa, out, fd);
+        } else {
+            posix_spawn_file_actions_addopen(&fa, fd, "/dev/null", O_WRONLY, 0);
+        }
     }
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
@@ -1542,27 +1838,596 @@ static u32 dk_run(Dk *dk, Arena scratch, Slice<Str> argv, b32 *attached)
     posix_spawnattr_setsigmask(&attr, &none);
     posix_spawnattr_setsigdefault(&attr, &all);
     short flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
-    #ifdef POSIX_SPAWN_SETSID
-    flags |= POSIX_SPAWN_SETSID;
-    #else
-    flags |= POSIX_SPAWN_SETPGROUP;
-    #endif
+    if (session) {
+        #ifdef POSIX_SPAWN_SETSID
+        flags |= POSIX_SPAWN_SETSID;
+        #else
+        flags |= POSIX_SPAWN_SETPGROUP;
+        #endif
+    }
     posix_spawnattr_setflags(&attr, flags);
-
-    pid_t pid = 0;
-    i32   err = posix_spawnp(&pid, args[0], &fa, &attr, args, environ);
+    i32 err = posix_spawnp(pid, argv[0], &fa, &attr, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&attr);
+    return err;
+}
+
+struct Ran {
+    Str out;     // the start of its output and errors
+    i32 status;  // its exit status, -1 if it did not run, or end by itself
+};
+
+// Run a program to its end, for RUNWAIT at most.
+static Ran runwait(Dk *dk, Arena *a, Slice<Str> argv)
+{
+    Ran r = {};
+    r.status = -1;
+    i32 fds[2];
+    if (pipe2(fds, O_CLOEXEC)) {
+        return r;
+    }
+    pid_t pid = 0;
+    i32   err = spawn(&pid, cargv(a, argv), fds[1], 0);
+    close(fds[1]);
     if (err) {
-        // In the dk's arena, which outlives this scratch
-        Buf b(&dk->tmp, 64);
-        print(&b, "cannot start '");
-        print(&b, argv[0]);
-        print(&b, "': ");
-        print(&b, fromcstr(strerror(err)));
-        dk->failed = finish(&b);
+        close(fds[0]);
+        return r;
+    }
+
+    iz  cap  = 1<<16;
+    u8 *buf  = allocbytes(a, cap);
+    iz  len  = 0;
+    i64 end  = dk_ms(dk) + RUNWAIT;
+    b32 done = 0;
+    for (;;) {
+        i64 left = end - dk_ms(dk);
+        struct pollfd pf = {};
+        pf.fd     = fds[0];
+        pf.events = POLLIN;
+        i32 n = left>0 ? poll(&pf, 1, (i32)left) : 0;
+        if (n<0 && errno==EINTR) {
+            continue;
+        } else if (n <= 0) {
+            break;  // out of time
+        }
+        u8  discard[4096];
+        b32 room = len < cap;
+        iz  got  = read(fds[0], room ? buf+len : discard,
+                        room ? (uz)(cap-len) : sizeof(discard));
+        if (got<0 && errno==EINTR) {
+            continue;
+        } else if (got <= 0) {
+            done = 1;
+            break;
+        }
+        len += room ? got : 0;
+    }
+    close(fds[0]);
+    if (!done) {
+        kill(pid, SIGKILL);  // its own child, not yet waited for
+    }
+    i32 st = 0;
+    while (waitpid(pid, &st, 0)<0 && errno==EINTR) {}
+    r.out    = {buf, len};
+    r.status = done && WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    return r;
+}
+
+static Str firstline(Str s)
+{
+    return trim(cut(trim(s), '\n').head);
+}
+
+static Str readfile(Arena *a, Str path)
+{
+    Str r  = {};
+    i32 fd = open(cstr(a, path), O_RDONLY|O_CLOEXEC);
+    if (fd < 0) {
+        return r;
+    }
+    iz cap = 1<<20;
+    r.data = allocbytes(a, cap);
+    for (;;) {
+        iz got = read(fd, r.data+r.len, (uz)(cap-r.len));
+        if (got<0 && errno==EINTR) {
+            continue;
+        } else if (got <= 0) {
+            break;
+        }
+        r.len += got;
+    }
+    close(fd);
+    a->beg = (byte *)(r.data + r.len);  // give back the rest
+    return r;
+}
+
+// A program as execvp finds it: its path, or null with errno set.
+static Str findprog(Arena *a, Str name)
+{
+    if (!name.len) {
+        errno = ENOENT;
+        return {};
+    } else if (cut(name, '/').ok) {
+        return access(cstr(a, name), X_OK) ? Str{} : name;
+    }
+    Str path = fromcstr(getenv("PATH"));
+    path = path.data ? path : Str("/usr/local/bin:/usr/bin:/bin");
+    i32 why  = ENOENT;
+    for (Str rest = path;;) {
+        Cut         c    = cut(rest, ':');
+        Str         dir  = c.head.len ? c.head : Str(".");
+        Str         full = concat(a, concat(a, dir, "/"), name);
+        char       *z    = cstr(a, full);
+        struct stat st   = {};
+        if (!stat(z, &st) && S_ISREG(st.st_mode)) {
+            if (!access(z, X_OK)) {
+                return full;
+            }
+            why = EACCES;
+        }
+        if (!c.ok) {
+            break;
+        }
+        rest = c.tail;
+    }
+    errno = why;
+    return {};
+}
+
+// Fail with "what 'name': why", in the dk's arena, which outlives the
+// command's scratch.
+static void failwith(Dk *dk, Str what, Str name, Str why)
+{
+    Buf b(&dk->tmp, 64 + name.len + why.len);
+    print(&b, what);
+    print(&b, " '");
+    print(&b, name);
+    print(&b, "': ");
+    print(&b, why);
+    dk->failed = finish(&b);
+}
+
+
+// Desktop entries
+
+struct Entry {
+    Str        path;  // the file
+    Str        id;    // its name less .desktop, which D-Bus activates
+    Slice<Str> argv;  // its Exec line, with the arguments in place
+    b32        dbus;  // DBusActivatable
+};
+
+// The directories of desktop entries, the first to look in first.
+static Slice<Str> appdirs(Arena *a)
+{
+    Slice<Str> r    = {};
+    Str        home = fromcstr(getenv("XDG_DATA_HOME"));
+    Str        user = fromcstr(getenv("HOME"));
+    if (!home.len && user.len) {
+        home = join(a, user, ".local/share");
+    }
+    if (home.len) {
+        r = push(a, r, join(a, home, "applications"));
+    }
+    Str dirs = fromcstr(getenv("XDG_DATA_DIRS"));
+    dirs = dirs.len ? dirs : Str("/usr/local/share:/usr/share");
+    for (Str rest = dirs; rest.len;) {
+        Cut c = cut(rest, ':');
+        rest = c.tail;
+        if (c.head.len) {
+            r = push(a, r, join(a, c.head, "applications"));
+        }
+    }
+    return r;
+}
+
+// A desktop entry's file by a path to it, or by its id; null if none.
+static Str findentry(Arena *a, Str name)
+{
+    b32 named = endswith(name, ".desktop");
+    if (named && cut(name, '/').ok) {
+        return access(cstr(a, name), R_OK) ? Str{} : name;
+    } else if (cut(name, '/').ok || !name.len) {
+        return {};
+    }
+    Str        file = named ? name : concat(a, name, ".desktop");
+    Slice<Str> dirs = appdirs(a);
+    for (iz i = 0; i < dirs.len; i++) {
+        Str path = join(a, dirs[i], file);
+        if (!access(cstr(a, path), R_OK)) {
+            return path;
+        }
+    }
+    return {};
+}
+
+// An Exec value split into words: after the string escapes (\s \n \t
+// \r \\), double quotes group a word, inside which a backslash escapes
+// the next character. %f %F %u %U, each a word of its own, give way to
+// the arguments, at the first of them; %% is %, and the other field
+// codes (%i %c %k, and deprecated ones) are dropped.
+static Slice<Str> execwords(Arena *a, Str value, Slice<Str> args)
+{
+    Buf u(a, value.len + 1);
+    for (iz i = 0; i < value.len; i++) {
+        u8 c = value[i];
+        if (c=='\\' && i+1<value.len) {
+            u8 e = value[++i];
+            switch (e) {
+            case 's':  c = ' ';  break;
+            case 'n':  c = '\n'; break;
+            case 't':  c = '\t'; break;
+            case 'r':  c = '\r'; break;
+            case '\\': c = '\\'; break;
+            default:   putbyte(&u, '\\');  // for the quoting below
+                       c = e;
+            }
+        }
+        putbyte(&u, c);
+    }
+    Str v = finish(&u);
+
+    Slice<Str> r    = {};
+    b32        used = 0;
+    for (iz i = 0; i < v.len;) {
+        for (; i<v.len && (v[i]==' ' || v[i]=='\t' || v[i]=='\n'); i++) {}
+        if (i == v.len) {
+            break;
+        }
+        Buf w(a, 64);
+        b32 quoted = 0;
+        b32 field  = 0;  // a file or URL field code
+        b32 any    = 0;
+        for (; i<v.len && (quoted || (v[i]!=' ' && v[i]!='\t' && v[i]!='\n')); i++) {
+            u8 c = v[i];
+            if (c == '"') {
+                quoted = !quoted;
+                any    = 1;
+            } else if (c=='\\' && i+1<v.len) {
+                putbyte(&w, v[++i]);
+                any = 1;
+            } else if (c=='%' && i+1<v.len) {
+                u8 f = v[++i];
+                if (f == '%') {
+                    putbyte(&w, '%');
+                    any = 1;
+                }
+                field |= f=='f' || f=='F' || f=='u' || f=='U';
+            } else {
+                putbyte(&w, c);
+                any = 1;
+            }
+        }
+        if (field && !w.len) {
+            for (iz k = 0; !used && k < args.len; k++) {
+                r = push(a, r, args[k]);
+            }
+            used = 1;
+        } else if (any) {
+            r = push(a, r, finish(&w));
+        }
+    }
+    return r;
+}
+
+// The [Desktop Entry] group's Exec and DBusActivatable.
+static Entry loadentry(Arena *a, Str path, Slice<Str> args)
+{
+    Entry r = {};
+    r.path = path;
+    Str base = path;
+    for (Cut c = cut(base, '/'); c.ok; c = cut(base, '/')) {
+        base = c.tail;
+    }
+    r.id = endswith(base, ".desktop") ? cuttail(base, 8) : base;
+
+    Str text  = readfile(a, path);
+    b32 group = 0;
+    for (Str rest = text; rest.len;) {
+        Cut line = cut(rest, '\n');
+        rest = line.tail;
+        Str l = trim(line.head);
+        if (l.len && l[0]=='[') {
+            group = l == "[Desktop Entry]";
+            continue;
+        }
+        Cut kv = cut(l, '=');
+        if (!group || !kv.ok) {
+            continue;
+        }
+        Str key   = trim(kv.head);
+        Str value = trim(kv.tail);
+        if (key == "Exec") {
+            r.argv = execwords(a, value, args);
+        } else if (key == "DBusActivatable") {
+            r.dbus = value == "true";
+        }
+    }
+    return r;
+}
+
+
+// Starting it
+
+// Whether an environment variable may go to the service: a valid name
+// and value, as systemd checks them, and not one of those the manager
+// gave this process about itself.
+static b32 passenv(Str var)
+{
+    static Str const own[] = {
+        "NOTIFY_SOCKET", "LISTEN_PID", "LISTEN_PIDFDID", "LISTEN_FDS",
+        "LISTEN_FDNAMES", "INVOCATION_ID", "JOURNAL_STREAM", "MANAGERPID",
+        "SYSTEMD_EXEC_PID", "WATCHDOG_PID", "WATCHDOG_USEC", "MAINPID",
+        "MEMORY_PRESSURE_WATCH", "MEMORY_PRESSURE_WRITE", "TRIGGER_UNIT",
+        "TRIGGER_PATH", "TRIGGER_TIMER_REALTIME_USEC",
+        "TRIGGER_TIMER_MONOTONIC_USEC", "CREDENTIALS_DIRECTORY",
+    };
+    Cut c = cut(var, '=');
+    if (!c.ok || !c.head.len || digit(c.head[0])) {
         return 0;
     }
+    for (iz i = 0; i < c.head.len; i++) {
+        if (!alnum(c.head[i]) && c.head[i]!='_') {
+            return 0;
+        }
+    }
+    for (iz i = 0; i < countof(own); i++) {
+        if (c.head == own[i]) {
+            return 0;
+        }
+    }
+    Str v = c.tail;
+    for (iz i = 0; i < v.len;) {
+        u8  b  = v[i];
+        iz  at = i;
+        i32 cp = utf8decode(v, &i);
+        b32 cc = (b<0x20 && b!='\t' && b!='\n') || b==0x7f;
+        if (cc || (b>=0x80 && (cp==b || i-at<2))) {
+            return 0;  // a control character, or not UTF-8
+        }
+    }
+    return 1;
+}
+
+// A unit name of systemd's convention for applications,
+// app-LAUNCHER-APPID-RANDOM.service, the app id from the program's name.
+static Str unitname(Dk *dk, Arena *a, Str prog)
+{
+    static u32 serial;
+    Str base = prog;
+    for (Cut c = cut(base, '/'); c.ok; c = cut(base, '/')) {
+        base = c.tail;
+    }
+    Buf b(a, 128);
+    print(&b, "app-prospero-");
+    for (iz i = 0; i < base.len && i < 64; i++) {
+        u8 c = base[i];
+        putbyte(&b, alnum(c) || c=='_' || c=='.' ? c : '_');
+    }
+    putbyte(&b, '-');
+    printhex(&b, (u64)getpid(), 8);
+    printhex(&b, (u64)dk_ms(dk)<<8 | (serial++ & 0xff), 12);
+    print(&b, ".service");
+    return finish(&b);
+}
+
+static u32 topid(Str s)
+{
+    Int v = parseint(s);
+    return v.ok && v.val>1 && v.val<=0x7fffffff ? (u32)v.val : 0;
+}
+
+// The service's main process, or else the first one left in its control
+// group, as after a launcher that exited; 0 if none.
+static u32 unitpid(Dk *dk, Arena scratch, Str systemctl, Str unit)
+{
+    Slice<Str> cmd = {};
+    cmd = push(&scratch, cmd, systemctl);
+    cmd = push(&scratch, cmd, Str("--user"));
+    cmd = push(&scratch, cmd, Str("show"));
+    cmd = push(&scratch, cmd, Str("--property=MainPID"));
+    cmd = push(&scratch, cmd, Str("--property=ControlGroup"));
+    cmd = push(&scratch, cmd, unit);
+    Ran x  = runwait(dk, &scratch, cmd);
+    Str cg = {};
+    for (Str rest = x.status ? Str{} : x.out; rest.len;) {
+        Cut line = cut(rest, '\n');
+        rest = line.tail;
+        Cut kv = cut(trim(line.head), '=');
+        if (kv.head=="MainPID" && topid(kv.tail)) {
+            return topid(kv.tail);
+        } else if (kv.head == "ControlGroup") {
+            cg = kv.tail;
+        }
+    }
+    if (!cg.len) {
+        return 0;
+    }
+    // cgroup v2, else v1's hybrid or legacy layout
+    Str roots[] = {"/sys/fs/cgroup", "/sys/fs/cgroup/unified", "/sys/fs/cgroup/systemd"};
+    for (iz i = 0; i < countof(roots); i++) {
+        Str path = concat(&scratch, concat(&scratch, roots[i], cg), "/cgroup.procs");
+        u32 pid  = topid(firstline(readfile(&scratch, path)));
+        if (pid) {
+            return pid;
+        }
+    }
+    return 0;
+}
+
+struct Started {
+    u32 pid;  // the program's, if any is left of it
+    b32 ran;  // the manager started it
+    Str why;  // why it did not, if not: in the dk's arena
+};
+
+// As a transient service of the user's service manager.
+static Started startunit(Dk *dk, Arena scratch, Slice<Str> argv)
+{
+    Started r      = {};
+    Str     sysrun = findprog(&scratch, "systemd-run");
+    Str     sysctl = findprog(&scratch, "systemctl");
+    if (!sysrun.data || !sysctl.data) {
+        r.why = "systemd-run is not installed";
+        return r;
+    }
+    Str unit = unitname(dk, &scratch, argv[0]);
+    for (i32 attempt = 0; !r.ran && attempt < 2; attempt++) {
+        Arena      a   = scratch;
+        Slice<Str> cmd = {};
+        cmd = push(&a, cmd, sysrun);
+        cmd = push(&a, cmd, Str("--user"));
+        cmd = push(&a, cmd, Str("--quiet"));
+        cmd = push(&a, cmd, Str("--collect"));
+        cmd = push(&a, cmd, Str("--service-type=exec"));
+        cmd = push(&a, cmd, Str("--same-dir"));
+        cmd = push(&a, cmd, Str("--slice=app.slice"));
+        cmd = push(&a, cmd, concat(&a, "--unit=", unit));
+        cmd = push(&a, cmd, concat(&a, "--description=Prospero: ", argv[0]));
+        if (!attempt) {
+            cmd = push(&a, cmd, Str("--property=ExitType=cgroup"));
+        }
+        for (char **e = environ; *e; e++) {
+            Str var = fromcstr(*e);
+            if (passenv(var)) {
+                cmd = push(&a, cmd, concat(&a, "--setenv=", var));
+            }
+        }
+        cmd = push(&a, cmd, Str("--"));
+        for (iz i = 0; i < argv.len; i++) {
+            cmd = push(&a, cmd, argv[i]);
+        }
+        Ran x = runwait(dk, &a, cmd);
+        r.ran = !x.status;
+        if (!r.ran) {
+            Str line = firstline(x.out);
+            r.why = clone(&dk->tmp, line.len ? line : Str("systemd-run failed"));
+            if (x.status<0 || find(x.out, "ExitType")<0) {
+                return r;  // only an older manager is tried again, without it
+            }
+        }
+    }
+    if (r.ran) {
+        r.pid = unitpid(dk, scratch, sysctl, unit);
+        r.why = {};
+    }
+    return r;
+}
+
+// D-Bus activation of a desktop entry, through gio launch: the session
+// bus starts it, apart from this tree. Its pid is the owner's of its
+// well-known name, its id, once it takes it.
+static u32 activate(Dk *dk, Arena scratch, Entry *e, Slice<Str> args, Str *why)
+{
+    Str gio   = findprog(&scratch, "gio");
+    Str gdbus = findprog(&scratch, "gdbus");
+    if (!gio.data || !gdbus.data) {
+        return 0;
+    }
+    Slice<Str> cmd = {};
+    cmd = push(&scratch, cmd, gio);
+    cmd = push(&scratch, cmd, Str("launch"));
+    cmd = push(&scratch, cmd, e->path);
+    for (iz i = 0; i < args.len; i++) {
+        cmd = push(&scratch, cmd, args[i]);
+    }
+    Ran x = runwait(dk, &scratch, cmd);
+    if (x.status) {
+        Str line = firstline(x.out);
+        *why = clone(&dk->tmp, line.len ? line : Str("gio launch failed"));
+        return 0;
+    }
+    for (i64 end = dk_ms(dk) + BUSWAIT; dk_ms(dk) < end;) {
+        Arena      a = scratch;
+        Slice<Str> q = {};
+        q = push(&a, q, gdbus);
+        q = push(&a, q, Str("call"));
+        q = push(&a, q, Str("--session"));
+        q = push(&a, q, Str("--dest=org.freedesktop.DBus"));
+        q = push(&a, q, Str("--object-path=/org/freedesktop/DBus"));
+        q = push(&a, q, Str("--method=org.freedesktop.DBus.GetConnectionUnixProcessID"));
+        q = push(&a, q, e->id);
+        Ran o   = runwait(dk, &a, q);
+        Str num = cut(firstline(o.out), ' ').tail;  // "(uint32 1234,)"
+        u32 pid = topid(cut(num, ',').head);
+        if (!o.status && pid) {
+            return pid;
+        }
+        dk_sleep(dk, 100);
+    }
+    *why = "it was activated, but did not take its D-Bus name in time";
+    return 0;
+}
+
+static u32 dk_run(Dk *dk, Arena scratch, Slice<Str> argv, b32 *attached)
+{
+    *attached = 0;
+    Slice<Str> args = {argv.data+1, argv.len-1, argv.len-1};
+    Str        name = argv[0];
+    Str        path = endswith(name, ".desktop") ? findentry(&scratch, name) : Str{};
+    Str        prog = path.data ? Str{} : findprog(&scratch, name);
+    i32        err  = errno;
+    Entry      e    = {};
+    if (!prog.data) {
+        path = path.data ? path : findentry(&scratch, name);
+        if (path.data) {
+            e = loadentry(&scratch, path, args);
+            if (!e.argv.len && !e.dbus) {
+                failwith(dk, "cannot start", name, "the desktop entry has no Exec line");
+                return 0;
+            }
+            prog = e.argv.len ? findprog(&scratch, e.argv[0]) : Str{};
+            err  = errno;
+            argv = e.argv;
+        }
+    }
+    if (!prog.data && !e.dbus) {
+        failwith(dk, "cannot start", argv.len ? argv[0] : name, fromcstr(strerror(err)));
+        return 0;
+    }
+
+    Str why = {};
+    if (prog.data) {
+        Slice<Str> v = {};
+        v = push(&scratch, v, prog);
+        for (iz i = 1; i < argv.len; i++) {
+            v = push(&scratch, v, argv[i]);
+        }
+        argv = v;
+        Started s = startunit(dk, scratch, argv);
+        if (s.pid) {
+            return s.pid;
+        } else if (s.ran) {
+            failwith(dk, "cannot start", name, "it ended as soon as it started, "
+                     "perhaps handing its work to one already running");
+            return 0;
+        }
+        why = s.why;
+    }
+    if (e.dbus) {
+        u32 pid = activate(dk, scratch, &e, args, &why);
+        if (pid || !prog.data) {
+            if (!pid) {
+                why = why.len ? why : Str("gio is not installed");
+                failwith(dk, "cannot start", name, why);
+            }
+            return pid;
+        }
+    }
+
+    // In this tree after all, which the reaper ends with the harness
+    pid_t pid = 0;
+    err = spawn(&pid, cargv(&scratch, argv), -1, 1);
+    if (err) {
+        failwith(dk, "cannot start", name, fromcstr(strerror(err)));
+        return 0;
+    }
+    *attached = 1;
+    Buf b(&dk->tmp, 64 + why.len);
+    print(&b, "no user service manager would start it (");
+    print(&b, why.len ? why : Str("unknown"));
+    print(&b, ")");
+    dk->failed = finish(&b);
     return (u32)pid;
 }
 
@@ -1686,10 +2551,10 @@ int main(int argc, char **argv)
     for (i32 fd = open("/dev/null", O_RDWR); fd>=0 && fd<=2;) {
         fd = dup(fd);
     }
-    // A reply to a harness that has gone fails rather than kills, and
-    // the programs run are reaped by the system
+    // A reply to a harness that has gone fails rather than kills. The
+    // programs it waits for are reaped by their pids (runwait), and
+    // those run in its tree before each command (dk_ready).
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_IGN);
     struct sigaction sa = {};
     sa.sa_handler = onquit;  // no SA_RESTART: a blocked read returns
     sigaction(SIGTERM, &sa, 0);

@@ -1841,6 +1841,30 @@ def sc_desktop_x11(model, n, req):
 sc_desktop_x11_wm = sc_desktop_x11
 
 
+def sc_desktop_x11_run(model, n, req):
+    """A program the desktop tool runs, which should outlive the turn and
+    the harness (scenarios.py desktop_x11_run), and a shell command that
+    leaves an escapee behind, which should not: its pid in tree.pids."""
+    k = step(req)
+    spec = json.loads(task_prompt(req))
+    text = "\n".join(str(m.get("content", "")) for m in req.get("messages", [])
+                     if m.get("role") == "tool")
+    pid = re.search(r"process id (\d+)", text)
+    win = f"pid={pid.group(1) if pid else 0}"
+    escapee = ("perl -e 'use POSIX; setsid(); open(F, \">>tree.pids\"); "
+               "print F \"$$\\n\"; close F; sleep 300' >/dev/null 2>&1 & "
+               "sleep 1; echo left")
+    steps = [
+        ("desktop", {"action": "run", "program": spec["program"], "args": spec["args"]}),
+        ("desktop", {"action": "wait", "window": win, "seconds": 20}),
+        ("shell", {"command": escapee}),
+    ]
+    if k < len(steps):
+        yield from tool(model, n, *steps[k])
+    else:
+        yield from answer(model, "Started it, and left a process behind.")
+
+
 def sc_desktop_cancel(model, n, req):
     if step(req) == 0:
         yield from tool(model, n, "desktop", {"action": "type", "text": "HANG"})
