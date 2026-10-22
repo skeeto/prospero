@@ -93,15 +93,39 @@ def since(t0):
 
 def alive(pid):
     """Whether a process exists, and is not a zombie: the null signal,
-    which signals nothing, to a checked pid."""
+    which signals nothing, to a checked pid. Not on Windows, where
+    os.kill with any signal but the console's two, 0 included, is
+    TerminateProcess: there a handle that may only wait asks."""
+    checked(pid)
+    if os.name == "nt":
+        return winalive(pid)
     try:
-        os.kill(checked(pid), 0)
+        os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
     st = psfield(pid, "stat")
     return bool(st) and not st.startswith("Z")
+
+
+def winalive(pid):
+    """Windows: whether a process runs, by a handle with SYNCHRONIZE
+    access alone, which can do nothing to it but wait."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = k32.OpenProcess(0x00100000, False, checked(pid))  # SYNCHRONIZE
+    if not h:
+        return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: someone's
+    try:
+        return k32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT
+    finally:
+        k32.CloseHandle(h)
 
 
 def signal_ours(pid, sig, owned, what="pid"):
@@ -151,7 +175,7 @@ def selftest():
         pid = 0
         returncode = None
     sent = []
-    real = os.kill, os.killpg
+    real = os.kill, getattr(os, "killpg", None)  # none on Windows
     os.kill = lambda pid, sig: sent.append(("kill", pid, sig))
     os.killpg = lambda pgid, sig: sent.append(("killpg", pgid, sig))
     try:
@@ -182,6 +206,8 @@ def selftest():
             assert not signal_group(Fake, 9), f"signal_group of a reaped proc ({code})"
     finally:
         os.kill, os.killpg = real
+        if not real[1]:
+            del os.killpg
     assert sent == [("kill", 4242, 9), ("killpg", 4243, 9)], sent
     print("pids: all checks passed")
     return 0
