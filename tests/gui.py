@@ -80,9 +80,10 @@ def e2econfig(url, model):
         f"url = {url}\n"
         "idle_timeout = 120\n"
         "\n"
-        "# Asks wait a little\n"
+        "# Asks wait a little, and the temporary directory asks too\n"
         "[guard]\n"
         "ask_timeout = 10\n"
+        "temp = ask\n"
     )
 
 
@@ -141,9 +142,11 @@ def config(url, model, ask=3, extra=""):
         "progress_timeout = 30\n"
         "connect_timeout = 2\n"
         "\n"
-        "# Asks wait briefly\n"
+        "# Asks wait briefly, and the temporary directory asks too, as the\n"
+        "# checklist's directories are in it on Linux (/tmp)\n"
         "[guard]\n"
         f"ask_timeout = {ask}\n"
+        "temp = ask\n"
     ) + extra
 
 

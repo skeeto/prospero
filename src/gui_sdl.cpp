@@ -326,6 +326,11 @@ static b32 wayland()
     return d && !__builtin_strcmp(d, "wayland");
 }
 
+static u32 os_guilimits(Os *)
+{
+    return wayland() ? GUI_NOPLACE|GUI_NOSERIAL : 0;
+}
+
 static i32 os_guidisplays(Os *, WinBox *out, i32 max)
 {
     i32            n       = 0;

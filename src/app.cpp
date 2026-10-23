@@ -1028,6 +1028,7 @@ struct Gui {
     f32                drivex;       // where it is
     f32                drivey;
     Str                drivecode;    // expected on the clipboard
+    Str                driveclip;    // the latest text set on it (driveclipset)
     f32                dpibase;      // scale before the DPI step
     b32                inmodal;
     i64                modalframes;  // drawn from inside modal loops
@@ -9254,6 +9255,40 @@ static b32 pathendswith(Str path, Str tail)
     return 1;
 }
 
+// The checklist's record of what the GUI sets on the clipboard, for
+// window systems that may refuse a selection made by synthetic input
+// (GUI_NOSERIAL): the backend's own setter, wrapped (drivestep).
+static Gui  *clipgui;
+static void (*clipset)(ImGuiContext *, char const *);
+
+static void driveclipset(ImGuiContext *c, char const *text)
+{
+    Gui *g = clipgui;
+    if (g) {
+        g->driveclip = clone(&g->perm, Str{(u8 *)text, (iz)__builtin_strlen(text)});
+    }
+    if (clipset) {
+        clipset(c, text);
+    }
+}
+
+// The clipboard's text for a check. Where the window system takes a
+// selection only with a real input's serial, newer than the last one's
+// (Wayland), the checklist's synthetic clicks and keys have none, so it
+// may refuse the GUI's: then what the GUI set there, which a real
+// user's input would have put on it, as said in the log.
+static Str driveclipboard(Gui *g, Str want)
+{
+    char const *c   = ImGui::GetClipboardText();
+    Str         got = c ? Str{(u8 *)c, (iz)__builtin_strlen(c)} : Str{};
+    if (!(got == want) && (os_guilimits(g->os) & GUI_NOSERIAL) && g->driveclip==want) {
+        guilog(g, "drive: the window system refused the selection made by synthetic "
+                  "input (no real input's serial): checking what the GUI set");
+        return g->driveclip;
+    }
+    return got;
+}
+
 // The compose box's checks: what each found, logged, with what it
 // should have been when not.
 static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
@@ -9314,11 +9349,10 @@ static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
         iz n = promptstr(g).len;
         ok = st && n>0 && st->GetSelectionStart()==0 && st->GetSelectionEnd()==n;
     } break;
-    case CHK_CLIPBOARD: {
-        char const *c = ImGui::GetClipboardText();
-        got = c ? Str{(u8 *)c, (iz)__builtin_strlen(c)} : Str{};
+    case CHK_CLIPBOARD:
+        got = driveclipboard(g, want);
         ok  = got == want;
-    } break;
+        break;
     case CHK_NOTE:
         got = s->note;
         ok  = got.len && find(got, want)>=0;
@@ -9487,12 +9521,9 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->rects[RECT_CODECOPY].x1 > g->rects[RECT_CODECOPY].x0;
     case CHK_CODECOPIED: {
         // The code without its last newline, as a triple click copies it
-        char const *clip = ImGui::GetClipboardText();
-        Str got  = {(u8 *)clip, 0};
         Str want = g->drivecode;
-        while (clip && got.data[got.len]) got.len++;
         want = want.len && want[want.len-1]=='\n' ? cuttail(want, 1) : want;
-        return clip && want.len && got==want && g->copiedshown;
+        return want.len && driveclipboard(g, want)==want && g->copiedshown;
     }
     case CHK_COPYQUIET:
         // Copied back to Copy at its deadline: that frame and its settling,
@@ -9664,6 +9695,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         guilog(g, finish(&b));
         if (!n || !w.ok) {
             return 0;
+        } else if (os_guilimits(g->os) & GUI_NOPLACE) {
+            // The compositor's to place (Wayland): the size fits
+            guilog(g, "drive: the window system places windows: checking the size alone");
+            return w.box.w<=disp[0].w && w.box.h<=disp[0].h;
         }
         i64 cx = 2*(i64)w.box.x + w.box.w, dx = 2*(i64)disp[0].x + disp[0].w;
         return boxoverlap(w.box, disp[0]) == (i64)w.box.w*w.box.h &&
@@ -9773,12 +9808,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         Range r = selrange(&v->sel);
         return v->sel.active && r.end.msg > r.beg.msg;
     }
-    case CHK_COPIED: {
-        char const *clip = ImGui::GetClipboardText();
-        Str got = {(u8 *)clip, 0};
-        while (clip && got.data[got.len]) got.len++;
-        return clip && g->drivecode.len && got==g->drivecode;
-    }
+    case CHK_COPIED:
+        return g->drivecode.len && driveclipboard(g, g->drivecode)==g->drivecode;
     case CHK_SAVED:         return g->idlesaves > 0;
     case CHK_NOSTALE:       return g->stale == 0;
     case CHK_DPI:
@@ -10425,6 +10456,13 @@ static void drivesummary(Gui *g)
 
 static void drivestep(Gui *g)
 {
+    ImGuiPlatformIO &pio = ImGui::GetPlatformIO();
+    if (pio.Platform_SetClipboardTextFn != driveclipset) {
+        // Again after the window comes back, with a new backend
+        clipgui = g;
+        clipset = pio.Platform_SetClipboardTextFn;
+        pio.Platform_SetClipboardTextFn = driveclipset;
+    }
     if (g->drivewait) {
         // The condition holds, or the time ran out
         if (!drivewaitdone(g)) {
@@ -10701,6 +10739,16 @@ static void drivestep(Gui *g)
         }
         break;
     case OP_MINCLOSE:
+        if (os_guilimits(g->os) & GUI_NOPLACE) {
+            // Wayland: a window cannot leave being minimized by itself,
+            // so the dialog would wait there until the user brought it
+            // back, and the checklist forever
+            guilog(g, "drive: a minimized window cannot come back by itself here: "
+                      "closing it as it is");
+            e.kind = GEV_CLOSE;
+            os_guiinject(g->os, &e);
+            break;
+        }
         g->minclose = 1;  // gui_minimized asks to close
         e.kind = GEV_MINIMIZE;
         os_guiinject(g->os, &e);

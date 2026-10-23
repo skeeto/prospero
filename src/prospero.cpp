@@ -475,6 +475,17 @@ static b32     os_guisave(Os *, Arena scratch, Str title, Str name, Mailbox *,
 // (M8) Show a directory in the platform's file manager: Finder,
 // Explorer, or whatever opens directories. Returns 0 on failure.
 static b32     os_guireveal(Os *, Arena scratch, Str dir);
+// (M8) What the window system keeps from the window, as GUI_* flags.
+// Wayland's compositor places windows, so a window neither knows nor
+// sets its place, and cannot leave being minimized by itself
+// (GUI_NOPLACE); it takes a new clipboard selection only with the serial
+// of a real input event newer than the last one's, which no synthetic
+// event has (GUI_NOSERIAL). The checklist allows for both.
+enum : u32 {
+    GUI_NOPLACE  = 1<<0,
+    GUI_NOSERIAL = 1<<1,
+};
+static u32     os_guilimits(Os *);
 #endif
 
 

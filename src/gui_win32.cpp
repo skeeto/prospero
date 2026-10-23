@@ -1309,6 +1309,11 @@ static b32 os_guisave(Os *os, Arena scratch, Str title, Str name, Mailbox *mb,
                        savedone, &c, (int)sizeof(c));
 }
 
+static u32 os_guilimits(Os *)
+{
+    return 0;
+}
+
 static b32 os_guireveal(Os *, Arena scratch, Str dir)
 {
     return w32gui_reveal((unsigned short *)towide(&scratch, dir).data);
