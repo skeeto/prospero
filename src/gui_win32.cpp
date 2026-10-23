@@ -88,9 +88,10 @@ extern "C" int       w32gui_where(void *, int *geom);
 extern "C" void      w32gui_place(void *, int const *geom);
 extern "C" int       w32gui_trayopen(void *, unsigned short const *tip);
 extern "C" void      w32gui_trayclose(void *);
-// The save dialog, on a thread of its own, which calls done with the
-// path chosen, empty if cancelled, and a copy of ctx (at most 32 bytes)
-extern "C" int       w32gui_save(unsigned short const *title,
+// The save dialog, on a thread of its own, over the window, which calls
+// done with the path chosen, empty if cancelled, and a copy of ctx (at
+// most 32 bytes)
+extern "C" int       w32gui_save(void *, unsigned short const *title,
                                  unsigned short const *name,
                                  void (*done)(void *ctx, unsigned short const *path),
                                  void const *ctx, int ctxlen);
@@ -140,6 +141,7 @@ __asm__(
 enum {
     WM_APP_WAKE = WM_APP + 1,
     WM_APP_TRAY,              // the tray icon's notifications
+    WM_APP_FRONT,             // the save dialog (wp) to bring forward
     TIMER_MODAL = 1,
     TRAY_ID     = 1,
     TRAY_CMD    = 100,        // + the TRAY_* item, as a menu command
@@ -415,6 +417,14 @@ static LRESULT CALLBACK msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         InterlockedExchange(&w->wakeflag, 0);
         h->wake(h->gui);
         return 0;
+    case WM_APP_FRONT: {
+        // From this thread, which has the foreground while the user
+        // works in the window, where the dialog's own thread may not
+        HWND d = (HWND)wp;
+        if (IsWindow(d) && IsWindowVisible(d) && GetForegroundWindow()!=d) {
+            SetForegroundWindow(d);
+        }
+    } return 0;
     case WM_APP_TRAY:
         switch (LOWORD(lp)) {
         case WM_LBUTTONUP:
@@ -951,23 +961,55 @@ extern "C" void w32gui_close(void *p)
     UnregisterClassW(L"prospero-msg", GetModuleHandleW(0));
 }
 
-// The save dialog runs on a thread of its own with no owner, so that the
-// window's loop never waits on it: GetSaveFileNameW is modal to the
-// thread that calls it, and an owner on another thread would tie the
-// two threads' input together.
+// The save dialog runs on a thread of its own, so that the window's
+// loop never waits on it: GetSaveFileNameW is modal to the thread that
+// calls it, and an owner on another thread would tie the two threads'
+// input together. Its owner is a hidden window of that thread over the
+// main window, which places it there. To be in front, a CBT hook on
+// that thread names the dialog as it activates to the GUI thread
+// (WM_APP_FRONT), which has the foreground to give it while the user
+// works in the window.
 struct W32Save {
     wchar_t title[256];
     wchar_t path[32768];
     void  (*done)(void *, unsigned short const *);
     char    ctx[32];
+    HWND    main;    // the window, for its place at the call
+    HWND    msgwin;  // the GUI thread's hidden window
 };
+
+static thread_local HWND savemsgwin;  // the dialog's thread's W32Save's
+static thread_local int  savefront;   // the dialog was named
+
+static LRESULT CALLBACK savecbt(int code, WPARAM wp, LPARAM lp)
+{
+    if (code==HCBT_ACTIVATE && !savefront) {
+        wchar_t cls[16];
+        if (GetClassNameW((HWND)wp, cls, 16) && !lstrcmpW(cls, L"#32770")) {
+            savefront = 1;
+            PostMessageW(savemsgwin, WM_APP_FRONT, wp, 0);
+        }
+    }
+    return CallNextHookEx(0, code, wp, lp);
+}
 
 static DWORD WINAPI savethread(void *arg)
 {
     W32Save *s  = (W32Save *)arg;
     HRESULT  co = CoInitializeEx(0, COINIT_APARTMENTTHREADED);
+    RECT     r  = {};
+    HWND     ow = 0;
+    if (s->main && GetWindowRect(s->main, &r)) {
+        ow = CreateWindowExW(WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP,
+                             r.left, r.top, r.right-r.left, r.bottom-r.top,
+                             0, 0, GetModuleHandleW(0), 0);
+    }
+    savemsgwin = s->msgwin;
+    savefront  = 0;
+    HHOOK hook = s->msgwin ? SetWindowsHookExW(WH_CBT, savecbt, 0, GetCurrentThreadId()) : 0;
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = ow;
     ofn.lpstrFilter = L"All files\0*.*\0";
     ofn.lpstrFile   = s->path;
     ofn.nMaxFile    = sizeof(s->path)/sizeof(s->path[0]);
@@ -977,6 +1019,12 @@ static DWORD WINAPI savethread(void *arg)
     if (!GetSaveFileNameW(&ofn)) {
         s->path[0] = 0;
     }
+    if (hook) {
+        UnhookWindowsHookEx(hook);
+    }
+    if (ow) {
+        DestroyWindow(ow);
+    }
     s->done(s->ctx, (unsigned short const *)s->path);
     if (SUCCEEDED(co)) {
         CoUninitialize();
@@ -985,15 +1033,19 @@ static DWORD WINAPI savethread(void *arg)
     return 0;
 }
 
-extern "C" int w32gui_save(unsigned short const *title, unsigned short const *name,
+extern "C" int w32gui_save(void *p, unsigned short const *title,
+                           unsigned short const *name,
                            void (*done)(void *, unsigned short const *),
                            void const *ctx, int ctxlen)
 {
+    W32Gui  *w = (W32Gui *)p;
     W32Save *s = (W32Save *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(W32Save));
     if (!s || ctxlen>(int)sizeof(s->ctx)) {
         if (s) HeapFree(GetProcessHeap(), 0, s);
         return 0;
     }
+    s->main   = w ? w->hwnd : 0;
+    s->msgwin = w ? w->msgwin : 0;
     lstrcpynW(s->title, (wchar_t const *)title, sizeof(s->title)/sizeof(s->title[0]));
     lstrcpynW(s->path, (wchar_t const *)name, sizeof(s->path)/sizeof(s->path[0]));
     memcpy(s->ctx, ctx, (size_t)ctxlen);
@@ -1248,11 +1300,11 @@ static void savedone(void *ctx, unsigned short const *path)
     mailpost(c->mb, c->type, c->id, p, 1);
 }
 
-static b32 os_guisave(Os *, Arena scratch, Str title, Str name, Mailbox *mb,
+static b32 os_guisave(Os *os, Arena scratch, Str title, Str name, Mailbox *mb,
                       u32 type, u64 id)
 {
     W32SaveCtx c = {mb, type, id};
-    return w32gui_save((unsigned short *)towide(&scratch, title).data,
+    return w32gui_save(os->gui, (unsigned short *)towide(&scratch, title).data,
                        (unsigned short *)towide(&scratch, name).data,
                        savedone, &c, (int)sizeof(c));
 }
