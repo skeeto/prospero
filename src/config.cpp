@@ -104,14 +104,21 @@
 // with file "" and line 0, or where the key is set empty); "valid":0
 // marks one ignored for its default. A file may be a URL, and then the
 // setting also has "fetched", when its cached copy was fetched (Unix
-// epoch ms). Includes list the URL includes of the load: the pin
+// epoch ms). A model's setting that it takes from another by like has
+// "like" naming that model, whose file and line it has, and a model
+// with no id has the id it is sent as for its default. After a model's
+// schema keys come its template.NAME keys, its own then those it
+// inherits, each value as written, quotes included, and "valid":0 for
+// a NAME no template can read; the schema has the family as one key,
+// "template.". Includes list the URL includes of the load: the pin
 // written, the SHA-256 of the copy in use, when it was fetched (0 for no
 // copy), whether a fetch is under way or due, and why the latest one
 // failed ("" if it did not). An endpoint's timeouts default by whether
 // its URL is local (the schema's "local" defaults). A plaintext secret
 // is reported as "(hidden)", so no reply ever carries one. The schema's
 // types are string, int, number, seconds, bool, enum, url, secret
-// (env:NAME), list (words of choices) and paths (separated by ;).
+// (env:NAME), list (words of choices), paths (separated by ;), times
+// and template.
 //
 // In config.set, kind and name "" (or absent) are the top level, and a
 // null value removes the key. The reply's line is where the key now is
@@ -119,7 +126,9 @@
 // or a plaintext secret, is refused before anything is written, and an
 // edit whose value is not the one in effect afterward fails, saying
 // which file decides. Both replies carry the diagnostics of the
-// configuration as now loaded.
+// configuration as now loaded. A template.NAME value in quotes, as
+// "25", is written quoted, a string whatever it says; any other is
+// written bare (unless it needs quotes).
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -152,12 +161,14 @@ enum : i32 {
     CFG_LIST,     // words from the choices, separated by blanks or commas
     CFG_PATHS,    // absolute or ~ paths, separated by ;
     CFG_TIMES,    // seconds, each above 0, separated by blanks
+    CFG_TEMPLATE, // a chat template argument: true, false, a number, else
+                  // a string (always, when quoted)
     CFG_NTYPES,
 };
 
 static Str cfgtypenames[] = {
     "string", "int", "number", "seconds", "bool", "enum", "url", "secret",
-    "list", "paths", "times",
+    "list", "paths", "times", "template",
 };
 static_assert(countof(cfgtypenames) == CFG_NTYPES);
 
@@ -182,6 +193,8 @@ static CfgKind cfgkinds[] = {
     {"remote",   1, "An engine on another machine, reached over ssh"},
 };
 
+// A key ending in a dot names a family: any key with that prefix, as
+// template.NAME, its own name after the dot.
 struct CfgKey {
     Str kind;
     Str key;
@@ -228,6 +241,12 @@ static CfgKey cfgschema[] = {
      "Most different models in flight at once, by default a llama.cpp "
      "router's max_instances"},
 
+    {"model", "like", CFG_STRING, "", {}, {}, "model",
+     "Another model whose settings this one takes where it sets none "
+     "itself, as a variant of it, sent as its id"},
+    {"model", "id", CFG_STRING, "", {}, {}, "model",
+     "The model as requests name it, by default that of the model it is "
+     "like, else the section's name"},
     {"model", "reasoning", CFG_ENUM, "reasoning_content", {},
      "reasoning_content reasoning reasoning_text none", "model",
      "Field that returns the model's reasoning to it in later requests, "
@@ -296,6 +315,11 @@ static CfgKey cfgschema[] = {
     {"model", "max_tokens", CFG_INT, "", {}, {}, "sampling",
      "Most tokens in one response, sent only when set (always for kind "
      "anthropic: by default 32000, at most the model's limit)"},
+    {"model", "template.", CFG_TEMPLATE, "", {}, {}, "template",
+     "template.NAME = VALUE: an argument of the chat template, sent in "
+     "chat_template_kwargs to an OpenAI-compatible server (never to kind "
+     "anthropic): true and false as booleans, numbers as numbers, anything "
+     "else, or anything quoted, as a string"},
 
     {"role", "description", CFG_STRING, "", {}, {}, "role",
      "What the role is for, for an agent choosing one for a subagent"},
@@ -501,14 +525,88 @@ static CfgKind *cfgkind(Str kind)
     return 0;
 }
 
+static b32 cfgfamily(CfgKey *k)
+{
+    return k->key.len && k->key[k->key.len-1]=='.';
+}
+
+// A key's schema entry, a family's for a key with its prefix.
 static CfgKey *cfgkey(Str kind, Str key)
 {
     for (iz i = 0; i < countof(cfgschema); i++) {
-        if (cfgschema[i].kind==kind && cfgschema[i].key==key) {
-            return &cfgschema[i];
+        CfgKey *k = &cfgschema[i];
+        if (k->kind==kind &&
+                (k->key==key || (cfgfamily(k) && startswith(key, k->key)))) {
+            return k;
         }
     }
     return 0;
+}
+
+// The name of a template.NAME key, or null if it is not one or NAME is
+// no identifier, which no template could read.
+static Str cfgtemplatename(Str key)
+{
+    if (!startswith(key, "template.")) {
+        return {};
+    }
+    Str name = cuthead(key, 9);
+    if (!name.len || digit(name[0])) {
+        return {};
+    }
+    for (iz i = 0; i < name.len; i++) {
+        if (!alnum(name[i]) && name[i]!='_') {
+            return {};
+        }
+    }
+    return name;
+}
+
+// Whether s is a number as JSON writes it.
+static b32 cfgjsonnumber(Str s)
+{
+    iz i = s.len && s[0]=='-';
+    if (i==s.len || !digit(s[i])) {
+        return 0;
+    } else if (s[i++]=='0' && i<s.len && digit(s[i])) {
+        return 0;  // leading zeros
+    }
+    for (; i<s.len && digit(s[i]); i++) {}
+    if (i<s.len && s[i]=='.') {
+        iz j = ++i;
+        for (; i<s.len && digit(s[i]); i++) {}
+        if (i == j) return 0;
+    }
+    if (i<s.len && (s[i]=='e' || s[i]=='E')) {
+        i++;
+        i += i<s.len && (s[i]=='+' || s[i]=='-');
+        iz j = i;
+        for (; i<s.len && digit(s[i]); i++) {}
+        if (i == j) return 0;
+    }
+    return i == s.len;
+}
+
+// Whether a definition's value was written quoted.
+static b32 cfgquoted(IniEntry *e)
+{
+    IniLine *l = e->line;
+    return l->valbeg<l->valend && l->raw[l->valbeg]=='"';
+}
+
+// A template argument's value as JSON: true and false are booleans, a
+// number is a number, and anything else, or anything quoted, a string.
+static void putcfgtemplate(JsonOut *w, Str v, b32 quoted)
+{
+    if (quoted) {
+        putstr(w, v);
+    } else if (v=="true" || v=="false") {
+        putbool(w, v=="true");
+    } else if (cfgjsonnumber(v)) {
+        putraw(w, v);
+    } else {
+        putstr(w, v);
+    }
 }
 
 // The next word of a list, separated by blanks or commas. Advances *s.
@@ -575,6 +673,7 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     }                    // and what may use the screen
     switch (k->type) {
     case CFG_STRING:
+    case CFG_TEMPLATE:
         return CFG_OK;
     case CFG_INT:
         return parseint(v).ok ? CFG_OK : CFG_BAD;
@@ -727,27 +826,151 @@ static iz cfgdistance(Str a, Str b)
 
 
 // Values in effect
+//
+// A [model] section with "like = OTHER" is a variant of OTHER: each
+// setting it does not make comes from OTHER's section, and so on along
+// the chain, which stops at a model without like, at a cycle, or after
+// CFG_LIKEMAX models. A setting made empty is the default, not
+// inherited, and a bad one is skipped. Its id, the model's name in
+// requests, is likewise inherited, and by default is the name of the
+// model at the end of the chain, so that large-quick, like large, is
+// the server's large with other settings.
+
+enum { CFG_LIKEMAX = 16 };
+
+// The chain of a model's like, into out (room for CFG_LIKEMAX): the
+// model itself first, each at most once. Returns the count of names.
+static i32 cfglikechain(Ini *ini, Str name, Str *out)
+{
+    i32 n = 0;
+    while (name.len && n<CFG_LIKEMAX) {
+        for (i32 i = 0; i < n; i++) {
+            if (out[i] == name) {
+                return n;  // a cycle
+            }
+        }
+        out[n++] = name;
+        IniEntry *l = inilookup(ini, "model", name, "like");
+        name = l ? trim(l->value) : Str{};
+    }
+    return n;
+}
+
+// Where a setting in effect is defined, null if it is not, and for a
+// model, which model of its chain defines it.
+struct CfgFound {
+    IniEntry *e;
+    Str       from;
+};
+
+static CfgFound cfgfind(Config *c, Str kind, Str name, Str key)
+{
+    CfgFound r = {};
+    CfgKey  *k = cfgkey(kind, key);
+    CfgKind *n = cfgkind(kind);
+    if (n && n->named && !name.len) {
+        return r;
+    }
+    Str chain[CFG_LIKEMAX];
+    i32 len = 1;
+    chain[0] = name;
+    if (kind=="model" && key!="like") {
+        len = cfglikechain(c->ini, name, chain);
+    }
+    for (i32 i = 0; i < len; i++) {
+        IniEntry *e = inilookup(c->ini, kind, chain[i], key);
+        if (e && (!k || !trim(e->value).len ||
+                  cfgjudge(k, e->value, e->file!=c->user)!=CFG_BAD)) {
+            r.e    = e;
+            r.from = chain[i];
+            return r;
+        }
+    }
+    return r;
+}
 
 // The value of a setting as the harness uses it: as written, or its
 // default when unset, empty, or bad for its type, or when a kind that
 // takes names has none (as for an endpoint given by URL alone). For a
 // key outside the schema, the raw value or null. With local, a local
-// endpoint's default.
+// endpoint's default. A model's settings follow its like.
 static Str cfgget(Config *c, Str kind, Str name, Str key, b32 local)
 {
     CfgKey   *k = cfgkey(kind, key);
-    CfgKind  *n = cfgkind(kind);
-    IniEntry *e = n && n->named && !name.len ? 0 :
-                  inilookup(c->ini, kind, name, key);
+    IniEntry *e = cfgfind(c, kind, name, key).e;
     if (!k) {
         return e ? e->value : Str{};
     }
     Str dflt = local && k->local.data ? k->local : k->dflt;
-    if (!e || !trim(e->value).len ||
-            cfgjudge(k, e->value, e->file!=c->user)==CFG_BAD) {
+    if (!e || !trim(e->value).len) {
         return dflt;
     }
     return e->value;
+}
+
+// The id of a model, as requests name it: its id setting, else the
+// name of the model at the end of its chain of like.
+static Str cfgmodelid(Config *c, Str name)
+{
+    Str id = trim(cfgget(c, "model", name, "id", 0));
+    if (id.len) {
+        return id;
+    }
+    Str chain[CFG_LIKEMAX];
+    i32 len = cfglikechain(c->ini, name, chain);
+    if (len==CFG_LIKEMAX || !len) {
+        return name;  // too long to tell
+    }
+    IniEntry *l = inilookup(c->ini, "model", chain[len-1], "like");
+    return l && trim(l->value).len ? name : chain[len-1];  // a cycle: itself
+}
+
+// A model's template arguments ([model] template.NAME), merged along its
+// chain of like, as a JSON object in perm, or null if there are none. A
+// variant's arguments replace those it inherits, keeping their places,
+// and one set empty removes it.
+static Str cfgtemplate(Config *c, Arena *perm, Str name)
+{
+    Str chain[CFG_LIKEMAX];
+    i32 len = cfglikechain(c->ini, name, chain);
+
+    Slice<IniEntry *> args = {};
+    for (i32 i = len-1; i >= 0; i--) {
+        IniSection *s = inisection(c->ini, "model", chain[i]);
+        for (IniEntry *e = s ? s->keys : 0; e; e = e->next) {
+            if (!cfgtemplatename(e->key).len) {
+                continue;
+            }
+            iz j = 0;
+            for (; j<args.len && !(args[j]->key==e->key); j++) {}
+            if (j == args.len) {
+                args = push(perm, args, e);
+            } else {
+                args[j] = e;
+            }
+        }
+    }
+
+    b32 any = 0;
+    for (iz i = 0; i < args.len; i++) {
+        any |= trim(args[i]->value).len || cfgquoted(args[i]);
+    }
+    if (!any) {
+        return {};
+    }
+    Buf     b(perm, 256);
+    JsonOut w = {&b};
+    putobject(&w);
+    for (iz i = 0; i < args.len; i++) {
+        IniEntry *e = args[i];
+        if (trim(e->value).len || cfgquoted(e)) {
+            putkey(&w, cfgtemplatename(e->key));
+            putcfgtemplate(&w, cfgquoted(e) ? e->value : trim(e->value),
+                           cfgquoted(e));
+        }
+    }
+    putend(&w);
+    return finish(&b);
 }
 
 // A named section's setting only where a file sets it, and validly for
@@ -948,6 +1171,11 @@ static void cfgkeyline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
         }
         cfgreport(ini, perm, f, l, INI_WARNING, l->keybeg, finish(&b));
         return;
+    } else if (key->type==CFG_TEMPLATE && !cfgtemplatename(l->key).len) {
+        cfgreport(ini, perm, f, l, INI_ERROR, l->keybeg,
+                  "expected template.NAME, NAME letters, digits and _ "
+                  "but not a digit first, so this is ignored");
+        return;
     }
 
     b32 shared = f != user;
@@ -960,6 +1188,48 @@ static void cfgkeyline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
         }
         cfgreport(ini, perm, f, l, sev, l->valbeg, msg);
     }
+}
+
+// Report a model's like, e, when its chain comes back to the model, or
+// runs past CFG_LIKEMAX models. A chain that runs into a cycle of other
+// models is theirs to report.
+static void cfglikecheck(Ini *ini, Arena *perm, Str name, IniEntry *e)
+{
+    Str chain[CFG_LIKEMAX];
+    i32 len  = cfglikechain(ini, name, chain);
+    Str next = {};
+    if (len) {
+        IniEntry *l = inilookup(ini, "model", chain[len-1], "like");
+        next = l ? trim(l->value) : Str{};
+    }
+    b32 cycle = next == name;
+    b32 deep = len==CFG_LIKEMAX && next.len;
+    for (i32 i = 0; deep && i < len; i++) {
+        deep = !(chain[i] == next);
+    }
+    if (!cycle && !deep) {
+        return;
+    }
+    Str msg = {};
+    if (!cfgmuted(e->file)) {
+        Buf b(perm, 128);
+        if (cycle) {
+            print(&b, "like makes a cycle, ");
+            for (i32 i = 0; i < len; i++) {
+                print(&b, chain[i]);
+                print(&b, " -> ");
+            }
+            print(&b, name);
+            print(&b, ", so settings are taken once around it");
+        } else {
+            print(&b, "like makes a chain of more than ");
+            print(&b, (i64)CFG_LIKEMAX);
+            print(&b, " models, so settings are not taken past ");
+            print(&b, chain[len-1]);
+        }
+        msg = finish(&b);
+    }
+    cfgreport(ini, perm, e->file, e->line, INI_WARNING, e->line->valbeg, msg);
 }
 
 // Check a load against the schema, adding diagnostics to it. The user's
@@ -992,6 +1262,9 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
                 }
                 cfgreport(ini, perm, e->file, e->line, INI_WARNING,
                           e->line->valbeg, msg);
+            }
+            if (s->kind=="model" && e->key=="like" && v.len) {
+                cfglikecheck(ini, perm, s->name, e);
             }
             if (k && k->type==CFG_SECRET && startswith(v, "env:") &&
                     cfgjudge(k, v, 0)==CFG_OK) {
@@ -1969,6 +2242,10 @@ static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
     } else if (!s) {
         r.err = "unknown key";
         return r;
+    } else if (s->type==CFG_TEMPLATE && !cfgtemplatename(key).len) {
+        r.err = "expected template.NAME, NAME letters, digits and _ but not "
+                "a digit first";
+        return r;
     } else if (value.data && cfgjudge(s, value, 0)==CFG_BAD) {
         r.err = cfgproblem(perm, s, value, 0);
         return r;
@@ -2008,7 +2285,23 @@ static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
     for (IniEntry *o = was ? was->older : 0; o && was->file!=f; o = o->older) {
         move |= o->file == f;
     }
-    IniEdit e = iniedit(perm, f, kind, name, key, value, move);
+    // A template argument is written as given: quoted, as "...", to be a
+    // string whatever it says, else bare
+    i32 quote = -1;
+    if (s->type==CFG_TEMPLATE && value.data) {
+        Str v = trim(value);
+        quote = v.len>=2 && v[0]=='"' && v[v.len-1]=='"';
+        if (quote) {
+            IniValue d = inivalue(perm, v, 0);
+            if (!d.ok || d.end!=v.len) {
+                r.err = "expected a value in quotes, with \\\" and \\\\ "
+                        "for \" and \\";
+                return r;
+            }
+            value = d.value;
+        }
+    }
+    IniEdit e = iniedit(perm, f, kind, name, key, value, move, quote);
     if (!e.text.data) {
         r.err = e.err;
         return r;
@@ -2074,7 +2367,53 @@ static void putcfgdiags(JsonOut *w, Config *c)
     putend(w);
 }
 
-// Every schema key of one section, as in effect.
+// One setting's row: as defined by e, or by default when e is null or
+// empty. A model's setting may come from another model, like, along its
+// chain of like.
+static void putcfgrow(JsonOut *w, Config *c, CfgKey *k, Str kind, Str name,
+                      Str key, IniEntry *e, Str like, b32 local)
+{
+    Str value  = local && k->local.data ? k->local : k->dflt;
+    b32 valid  = 1;
+    b32 isdflt = 1;  // unset, or set empty
+    if (k->type == CFG_TEMPLATE) {
+        // As written, so that quotes show
+        IniLine *l = e->line;
+        value  = span(l->raw.data+l->valbeg, l->raw.data+l->valend);
+        valid  = cfgtemplatename(key).len > 0;
+        isdflt = !value.len;
+    } else if (e && trim(e->value).len) {
+        Str v = trim(e->value);
+        value  = e->value;
+        valid  = cfgjudge(k, v, e->file!=c->user) != CFG_BAD;
+        isdflt = 0;
+        if (k->type==CFG_SECRET && !startswith(v, "env:")) {
+            value = "(hidden)";
+        }
+    } else if (kind=="model" && key=="id") {
+        value = cfgmodelid(c, name);
+    }
+    putobject(w);
+    putstrkey(w, "kind", kind);
+    putstrkey(w, "name", name);
+    putstrkey(w, "key", key);
+    putstrkey(w, "value", value);
+    putstrkey(w, "file", e ? e->file->path : Str(""));
+    putintkey(w, "line", e ? (i64)e->line->num : 0);
+    putintkey(w, "default", (i64)isdflt);
+    putintkey(w, "valid", (i64)valid);
+    if (like.len) {
+        putstrkey(w, "like", like);
+    }
+    CfgUrl *u = e && iniurl(e->file->path) ? cfgurl(c, e->file->path, 0) : 0;
+    if (u) {
+        putintkey(w, "fetched", u->fetched);
+    }
+    putend(w);
+}
+
+// Every schema key of one section, as in effect, and for a model each
+// template argument, its own and then those it inherits.
 static void putcfgsection(JsonOut *w, Config *c, Str kind, Str name)
 {
     b32 local = 0;
@@ -2084,36 +2423,37 @@ static void putcfgsection(JsonOut *w, Config *c, Str kind, Str name)
     }
     for (iz i = 0; i < countof(cfgschema); i++) {
         CfgKey *k = &cfgschema[i];
-        if (!(k->kind == kind)) {
+        if (!(k->kind == kind) || cfgfamily(k)) {
             continue;
         }
-        IniEntry *e      = inilookup(c->ini, kind, name, k->key);
-        Str       value  = local && k->local.data ? k->local : k->dflt;
-        b32       valid  = 1;
-        b32       isdflt = 1;  // unset, or set empty
-        if (e && trim(e->value).len) {
-            Str v = trim(e->value);
-            value  = e->value;
-            valid  = cfgjudge(k, v, e->file!=c->user) != CFG_BAD;
-            isdflt = 0;
-            if (k->type==CFG_SECRET && !startswith(v, "env:")) {
-                value = "(hidden)";
+        IniEntry *e    = inilookup(c->ini, kind, name, k->key);
+        Str       like = {};
+        if (!e && kind=="model") {
+            CfgFound f = cfgfind(c, kind, name, k->key);
+            e    = f.e;
+            like = f.from;
+        }
+        putcfgrow(w, c, k, kind, name, k->key, e, like, local);
+    }
+
+    if (kind != "model") {
+        return;
+    }
+    Str chain[CFG_LIKEMAX];
+    i32 len = cfglikechain(c->ini, name, chain);
+    for (i32 i = 0; i < len; i++) {
+        IniSection *s = inisection(c->ini, kind, chain[i]);
+        for (IniEntry *e = s ? s->keys : 0; e; e = e->next) {
+            CfgKey *k    = cfgkey(kind, e->key);
+            b32     seen = !k || k->type!=CFG_TEMPLATE;
+            for (i32 j = 0; !seen && j < i; j++) {
+                seen = inilookup(c->ini, kind, chain[j], e->key) != 0;
+            }
+            if (!seen) {
+                Str like = i ? chain[i] : Str{};
+                putcfgrow(w, c, k, kind, name, e->key, e, like, 0);
             }
         }
-        putobject(w);
-        putstrkey(w, "kind", kind);
-        putstrkey(w, "name", name);
-        putstrkey(w, "key", k->key);
-        putstrkey(w, "value", value);
-        putstrkey(w, "file", e ? e->file->path : Str(""));
-        putintkey(w, "line", e ? (i64)e->line->num : 0);
-        putintkey(w, "default", (i64)isdflt);
-        putintkey(w, "valid", (i64)valid);
-        CfgUrl *u = e && iniurl(e->file->path) ? cfgurl(c, e->file->path, 0) : 0;
-        if (u) {
-            putintkey(w, "fetched", u->fetched);
-        }
-        putend(w);
     }
 }
 

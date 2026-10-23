@@ -2773,7 +2773,8 @@ static void drawhosts(Gui *g)
 // Settings
 
 // "from prospero.ini:12" from a path and line, or "default", which is
-// "default, empty at prospero.ini:12" when set empty. A URL include is
+// "default, empty at prospero.ini:12" when set empty, and "like large,
+// from prospero.ini:12" for what a model inherits. A URL include is
 // named in full, with the age of its copy as of now (Unix epoch ms).
 static Str provenance(Gui *g, Arena *a, CfgRow *r, i64 now)
 {
@@ -2788,7 +2789,13 @@ static Str provenance(Gui *g, Arena *a, CfgRow *r, i64 now)
         }
     }
     Buf b(a, 64);
-    print(&b, r->isdflt ? Str("default, empty at ") : Str("from "));
+    if (r->like.len) {
+        print(&b, "like ");
+        print(&b, r->like);
+        print(&b, r->isdflt ? Str(", empty at ") : Str(", from "));
+    } else {
+        print(&b, r->isdflt ? Str("default, empty at ") : Str("from "));
+    }
     print(&b, name);
     putbyte(&b, ':');
     print(&b, r->line);
@@ -2844,7 +2851,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target)
             guiconfigset(g, r->kind, r->name, r->key, pick);
         }
     } else {
-        Str hint  = r->isdflt ? r->value : Str{};
+        Str hint  = r->isdflt || r->like.len ? r->value : Str{};
         b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
                                              ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
         if (target >= 0) {
@@ -2853,7 +2860,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target)
         if (enter || ImGui::IsItemDeactivatedAfterEdit()) {
             // Enter both returns and deactivates: send each edit once
             Str v   = trim({(u8 *)r->buf, (iz)__builtin_strlen(r->buf)});
-            Str was = r->isdflt ? Str{} : r->value;
+            Str was = r->isdflt || r->like.len ? Str{} : r->value;
             if (v!=was && !(r->sent && v==r->sentval)) {
                 r->sent    = 1;
                 r->sentval = clone(&g->cfgmem, v);
@@ -3052,6 +3059,36 @@ static void drawsettings(Gui *g)
                 } else if (name.len) {
                     guiconfigset(g, kind, name, key, val);
                     g->addname[0] = 0;
+                }
+            }
+        }
+        if (kind == "model") {
+            // A template argument, whose names are the template's own
+            f32 sc = g->scale;
+            ImGui::SetNextItemWidth(120*sc);
+            ImGui::InputTextWithHint("##tplmodel", "model", g->tplmodel, FIELD_MAX);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(160*sc);
+            ImGui::InputTextWithHint("##tplname", "template.NAME", g->tplname, FIELD_MAX);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120*sc);
+            ImGui::InputTextWithHint("##tplval", "value", g->tplval, FIELD_MAX);
+            ImGui::SameLine();
+            b32 set = ImGui::Button("Set template argument");
+            ImGui::SetItemTooltip("Sent in chat_template_kwargs: true and false as booleans, "
+                                  "numbers as numbers, the rest, or anything in quotes, as a "
+                                  "string; empty removes what the model inherits");
+            if (set) {
+                Str model = trim({(u8 *)g->tplmodel, (iz)__builtin_strlen(g->tplmodel)});
+                Str name  = trim({(u8 *)g->tplname, (iz)__builtin_strlen(g->tplname)});
+                Str val   = trim({(u8 *)g->tplval, (iz)__builtin_strlen(g->tplval)});
+                Str key   = startswith(name, "template.") ? name : concat(&a, "template.", name);
+                if (!model.len || !name.len) {
+                    g->cfgstatus = "A template argument needs a model and a name";
+                    g->cfgok     = 0;
+                } else {
+                    guiconfigset(g, kind, model, key, val.len ? val : Str(""));
+                    g->tplname[0] = g->tplval[0] = 0;
                 }
             }
         }

@@ -358,6 +358,7 @@ struct CfgRow {
     Str        dflt;
     Str        desc;
     Str        file;     // where it is set, null for its default
+    Str        like;     // a model it is inherited from, null if none
     i64        line;
     i64        fetched;  // a URL file's copy, Unix epoch ms, else 0
     b32        isdflt;
@@ -627,6 +628,9 @@ struct Gui {
     Json              *cfg;        // its reply, null until one arrives
     Slice<CfgRow>      cfgrows;
     char              *addname;    // a new section's name
+    char              *tplmodel;   // a template argument to set: its model,
+    char              *tplname;    // name,
+    char              *tplval;     // and value
     i64                cfgget;     // config.get in flight, 0 if none
     i64                cfgrefresh; // and its id if it refreshes includes
     i64                cfgrefreshed; // config.get {refresh} replies so far
@@ -1712,12 +1716,16 @@ static void loadcfg(Gui *g, Str line)
         r.key     = jsonstr(jsonget(s, "key"));
         r.value   = jsonstr(jsonget(s, "value"));
         r.file    = jsonstr(jsonget(s, "file"));
+        r.like    = jsonstr(jsonget(s, "like"));
         r.line    = jsonint(jsonget(s, "line"), 0);
         r.fetched = jsonint(jsonget(s, "fetched"), 0);
         r.isdflt  = jsonint(jsonget(s, "default"), 0) != 0;
         r.valid   = jsonint(jsonget(s, "valid"), 1) != 0;
         for (Json *k = schema->child; k; k = k->next) {
-            if (jsonstr(jsonget(k, "kind"))==r.kind && jsonstr(jsonget(k, "key"))==r.key) {
+            // A key ending in a dot is a family, as template.NAME
+            Str key    = jsonstr(jsonget(k, "key"));
+            b32 family = key.len && key[key.len-1]=='.' && startswith(r.key, key);
+            if (jsonstr(jsonget(k, "kind"))==r.kind && (key==r.key || family)) {
                 r.type = jsonstr(jsonget(k, "type"));
                 r.dflt = jsonstr(jsonget(k, "default"));
                 r.desc = jsonstr(jsonget(k, "desc"));
@@ -1731,9 +1739,10 @@ static void loadcfg(Gui *g, Str line)
         if (r.kind=="ui" && r.key=="theme") {
             settheme(g, themeparse(r.value));
         }
-        // Defaults show as hints, not values: an edit writes a value. The
-        // field holds the whole value, which an edit sends back whole.
-        Str v = r.isdflt ? Str{} : r.value;
+        // Defaults, and what a model inherits by like, show as hints, not
+        // values: an edit writes a value of its own. The field holds the
+        // whole value, which an edit sends back whole.
+        Str v = r.isdflt || r.like.len ? Str{} : r.value;
         r.cap = v.len + FIELD_MAX;
         r.buf = alloc<char>(a, r.cap);
         copybytes(r.buf, v.data, v.len);
@@ -7550,6 +7559,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->newmodel   = alloc<char>(&g->perm, FIELD_MAX);
     g->denynote   = alloc<char>(&g->perm, FIELD_MAX);
     g->addname    = alloc<char>(&g->perm, FIELD_MAX);
+    g->tplmodel   = alloc<char>(&g->perm, FIELD_MAX);
+    g->tplname    = alloc<char>(&g->perm, FIELD_MAX);
+    g->tplval     = alloc<char>(&g->perm, FIELD_MAX);
     g->remname    = alloc<char>(&g->perm, FIELD_MAX);
     g->remssh     = alloc<char>(&g->perm, FIELD_MAX);
     g->rempath    = alloc<char>(&g->perm, FIELD_MAX);

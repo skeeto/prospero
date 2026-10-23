@@ -1138,12 +1138,13 @@ static void printinifile(Buf *b, IniFile *f)
 }
 
 // Append a value as written after "key = ", quoted only when necessary,
-// so that it parses back to itself. Returns 0, appending nothing, if the
-// value contains a newline, which has no representation.
-static b32 printinivalue(Buf *b, Str v)
+// or always with quote, so that it parses back to itself. Returns 0,
+// appending nothing, if the value contains a newline, which has no
+// representation.
+static b32 printinivalue(Buf *b, Str v, b32 quote = 0)
 {
-    b32 quote = v.len && (v[0]=='"' || whitespace(v[0]) ||
-                          whitespace(v[v.len-1]));
+    quote |= v.len && (v[0]=='"' || whitespace(v[0]) ||
+                       whitespace(v[v.len-1]));
     for (iz i = 0; i < v.len; i++) {
         if (v[i] == '\n') {
             return 0;
@@ -1244,9 +1245,11 @@ static b32 iniin(IniLine *l, Str kind, Str name)
 // - Removing drops every definition of the key in the section.
 //
 // Values are quoted only when they need it (printinivalue), and new
-// lines end like the file's first line.
+// lines end like the file's first line. With quote 1 a value is quoted
+// regardless, and with 0 only as it needs, and either way it replaces
+// a definition written otherwise, even one that decodes to it.
 static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
-                       Str key, Str value, b32 move = 0)
+                       Str key, Str value, b32 move = 0, i32 quote = -1)
 {
     IniEdit r   = {};
     b32     top = !kind.len;
@@ -1259,7 +1262,7 @@ static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
     Str enc = {};
     if (value.data) {
         Buf v(perm, value.len + 8);
-        if (!printinivalue(&v, value)) {
+        if (!printinivalue(&v, value, quote>0)) {
             r.err = "a value cannot contain a newline";
             return r;
         }
@@ -1303,8 +1306,10 @@ static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
         }
         r.changed = drop;
     } else if (last >= 0) {
+        IniLine *l   = &f->lines[last];
+        Str      was = span(l->raw.data+l->valbeg, l->raw.data+l->valend);
         r.line    = last + 1;
-        r.changed = !(f->lines[last].value == value);
+        r.changed = quote<0 ? !(l->value == value) : !(was == enc);
     } else if (anchor>=0 || header>=0) {
         iz after = anchor>=0 ? anchor : header;
         at = after + 1;

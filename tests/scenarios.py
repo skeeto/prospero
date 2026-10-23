@@ -2383,6 +2383,51 @@ def queue(t):
     t.check(peak == 1, f"one model at a time: {peak}")
 
 
+@scenario(conf={"_path": "router1-tpl/", "_extra": (
+    "[model {model}]\n"
+    "template.thinking = true\n"
+    "template.reasoning_effort = 25\n"
+    "template.label = \"42\"\n"
+    "[model deep-{nonce}]\n"
+    "like = {model}\n"
+    "template.reasoning_effort = 100\n"
+    "template.label =\n")}, bound=20)
+def template_variant(t):
+    """A model's template arguments go in chat_template_kwargs, and a
+    variant (like) is the same model to the server: sent as its id, it
+    runs side by side with it on a router with --models-max 1."""
+    variant = f"deep-{t.nonce}"
+    h = t.headless()
+    try:
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        b = h.call("new", cwd=t.work, model=variant, endpoint="fake")["sid"]
+        h.send("prompt", sid=a, text="go")
+        h.wait(lambda e: e.get("sid") == a and e.get("ev") == "live" and
+               e.get("state") == "streaming")
+        h.send("prompt", sid=b, text="go")
+        for s in (a, b):
+            end = h.wait(lambda e: e.get("sid") == s and e.get("ev") == "turn.end")
+            t.check(end["why"] == "done", f"{s}: {end}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = t.requests()
+    t.check(len(reqs) == 2, f"both sent as the model's id: {len(reqs)}")
+    t.check(not t.requests(variant), "nothing sent as the variant's name")
+    base, deep = (x["body"] for x in reqs)
+    t.check(base["model"] == t.model and deep["model"] == t.model, "the id sent")
+    kw = list(base.get("chat_template_kwargs", {}).items())
+    t.check(kw == [("thinking", True), ("reasoning_effort", 25), ("label", "42")],
+            f"the model's arguments: {kw}")
+    kw = list(deep.get("chat_template_kwargs", {}).items())
+    t.check(kw == [("thinking", True), ("reasoning_effort", 100)],
+            f"the variant's arguments: {kw}")
+    t.check(reqs[1]["t"] < reqs[0]["end"], "the variant ran side by side")
+    with fake_provider.STATE.lock:
+        peak = fake_provider.STATE.peak.get("router1-tpl")
+    t.check(peak == 1, f"one model at a time: {peak}")
+
+
 MINUTE = {"PROSPERO_TEST_MINUTE_MS": "60"}  # a minute in 60 ms
 
 

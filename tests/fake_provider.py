@@ -2473,6 +2473,15 @@ def sc_queue_leave_b(model, n, req):
 sc_queue_leave_c = sc_queue_leave_b
 
 
+def sc_template_variant(model, n, req):
+    # Long enough that a model and its variant overlap, if let
+    yield S.head()
+    for i in range(15):
+        yield from text(model, f"t{i} ")
+        yield S.sleep(0.1)
+    yield from finish(model)
+
+
 # M4 review: the tools
 
 def tool_id(model, cid, name, args):

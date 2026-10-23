@@ -269,6 +269,30 @@ system prompt and the conversation carry cache breakpoints, so cache
 reads grow turn over turn. A `[model NAME]` section sets `thinking`
 (adaptive by default), `thinking_display`, `effort` and `max_tokens`.
 
+For an OpenAI-compatible server, `template.NAME = VALUE` in a
+`[model NAME]` section is an argument of the model's chat template,
+sent in `chat_template_kwargs` (as llama.cpp and vLLM take it): `true`
+and `false` as booleans, numbers as numbers, and anything else, or
+anything in quotes, as a string. A model is often run several ways,
+such as thinking more or less, and `like = OTHER` makes a variant: a
+model of its own name that takes OTHER's settings but those it sets
+itself, and is sent to the server as OTHER (or as its own `id`), so
+discovery, context limits and the places on a router are OTHER's:
+
+    [model large]
+    template.thinking = true
+
+    [model large-quick]
+    like = large
+    template.reasoning_effort = 25
+
+    [model large-deep]
+    like = large
+    template.reasoning_effort = 100
+
+A variant is chosen as any model is, for a session, a role, a
+fallback or a compactor.
+
 Sessions, their logs and the cache of URL includes live in the state
 directory: `$XDG_STATE_HOME/prospero`, else `~/.local/state/prospero`,
 or `%LOCALAPPDATA%\prospero` on Windows.

@@ -1111,6 +1111,11 @@ static b32 onprobe(Engine *e, Arena scratch, Record r)
     return 1;
 }
 
+static ModelConf *reqmc(Session *s)
+{
+    return s->purpose==REQ_COMPACT ? &s->cp.mc : &s->mc;
+}
+
 static i32 confint(Config *cfg, Str kind, Str name, Str key)
 {
     Int v = parseint(trim(cfgget(cfg, kind, name, key, 0)));
@@ -1130,6 +1135,7 @@ static b32 admit(Session *s, Arena scratch)
     Config   *cfg   = e->cfg;
     Endpoint *ep    = reqep(s);
     Str       model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
+    Str       id    = reqmc(s)->name;  // variants of a model share it
     AdmPoint *p     = admpoint(&e->adm, &e->perm, ep->url);
     assert(s->slot == SLOT_NONE);
 
@@ -1137,10 +1143,10 @@ static b32 admit(Session *s, Arena scratch)
     // from its discovery, any other, or one its discovery missed, from
     // the last listing seen
     ModelInfo mi = {};
-    if (model==s->model && ep->url==s->ep.url && s->info.found) {
+    if (id==s->mc.name && ep->url==s->ep.url && s->info.found) {
         mi = s->info;
     } else {
-        i64 *k = upsert(&e->kinds, kindkey(&scratch, ep->url, model), (Arena *)0);
+        i64 *k = upsert(&e->kinds, kindkey(&scratch, ep->url, id), (Arena *)0);
         mi.llamacpp = k && (*k&1);
         mi.slots    = k ? (i32)(*k>>1) : 0;
     }
@@ -1156,8 +1162,8 @@ static b32 admit(Session *s, Arena scratch)
     s->admid     = s->admid ? s->admid : ++e->nextid;
     s->point     = p;
     s->slot      = SLOT_WAIT;
-    s->slotmodel = model;
-    admenqueue(p, &e->perm, s->admid, model, cap, mi.llamacpp || p->cfgmodels,
+    s->slotmodel = id;
+    admenqueue(p, &e->perm, s->admid, id, cap, mi.llamacpp || p->cfgmodels,
                os_ticks(e->os));
     pump(e, p);
     if (s->slot == SLOT_HELD) {
@@ -1180,11 +1186,6 @@ static void stopctl(Session *s)
         s->ctl = 0;
     }
     s->ctlid = 0;
-}
-
-static ModelConf *reqmc(Session *s)
-{
-    return s->purpose==REQ_COMPACT ? &s->cp.mc : &s->mc;
 }
 
 // Ask llama.cpp to end the response's reasoning now, so that the model
@@ -1462,6 +1463,12 @@ static void discover(Session *s, Arena scratch)
                      Str("models?limit=1000") : Str("models"));
     resetattempt(s);
     s->discovered = 1;
+    if (s->ep.kind==EP_ANTHROPIC && s->mc.kwargs.len) {
+        Str msg = concat(&scratch, "the template settings of [model ", s->model);
+        msg = concat(&scratch, msg, "] are not sent: kind anthropic takes "
+                     "no chat_template_kwargs");
+        note(s, scratch, "warn", msg);
+    }
     if (!startreq(s, scratch, &s->ep, "GET", url, {}, "application/json", 10000)) {
         proceed(s, scratch);
         return;
@@ -1530,10 +1537,10 @@ static void discovered(Session *s, Arena scratch, b32 ok)
     Engine *e = s->e;
     if (ok && s->status==200) {
         notekinds(e, scratch, s->ep.url, finish(&s->body));
-        Str  key     = concat(&scratch, concat(&scratch, s->ep.url, " "), s->model);
+        Str  key     = kindkey(&scratch, s->ep.url, s->mc.name);
         i64 *cached  = upsert(&e->trained, key, (Arena *)0);
         i64  trained = cached ? *cached : 0;
-        ModelInfo mi = parsemodels(scratch, finish(&s->body), s->model, trained);
+        ModelInfo mi = parsemodels(scratch, finish(&s->body), s->mc.name, trained);
         if (mi.found) {
             s->info        = mi;
             s->mc.llamacpp = mi.llamacpp;
@@ -4941,7 +4948,7 @@ static void compactor(Session *s, Arena scratch, Compact *cp)
         return;
     }
     modelconf(e, &s->perm, cp->model, &cp->mc);
-    i64 *k = upsert(&e->kinds, kindkey(&scratch, cp->ep.url, cp->model), (Arena *)0);
+    i64 *k = upsert(&e->kinds, kindkey(&scratch, cp->ep.url, cp->mc.name), (Arena *)0);
     cp->mc.llamacpp = k && (*k&1);
 }
 
@@ -5568,7 +5575,8 @@ static void modelconf(Engine *e, Arena *perm, Str model, ModelConf *mc)
         "frequency_penalty", "repeat_penalty", "seed", "max_tokens",
     };
     Config *cfg = e->cfg;
-    mc->name = clone(perm, model);
+    mc->name   = clone(perm, cfgmodelid(cfg, model));
+    mc->kwargs = cfgtemplate(cfg, perm, model);
     Str r = trim(cfgget(cfg, "model", model, "reasoning", 0));
     mc->reasoning = r=="none" || r=="never" ? Str{} : clone(perm, r);
     for (iz i = 0; i < countof(sampling); i++) {

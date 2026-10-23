@@ -698,6 +698,8 @@ static void testcfgjson(Test *t)
         "endpoint/local/slow_retry_budget=7200*\n"
         "endpoint/local/max_concurrent=*\n"
         "endpoint/local/max_models=*\n"
+        "model/m/like=*\n"
+        "model/m/id=m*\n"
         "model/m/reasoning=reasoning_content*\n"
         "model/m/context=*\n"
         "model/m/compactor=*\n"
@@ -1231,6 +1233,242 @@ static void testcfgurls(Test *t)
     cfgfree(c);
 }
 
+// Template arguments (template.NAME) and variants (like, id): typing,
+// inheritance, cycles, edits, rows, and the requests that carry them.
+static void testcfglike(Test *t)
+{
+    Arena a = t->perm;
+
+    static struct { Str in; b32 want; } nums[] = {
+        {"0", 1}, {"25", 1}, {"-3", 1}, {"0.5", 1}, {"1e9", 1}, {"2.5E-3", 1},
+        {"-0", 1}, {"007", 0}, {".5", 0}, {"1.", 0}, {"1e", 0}, {"+1", 0},
+        {"-", 0}, {"", 0}, {"0x10", 0}, {"1 2", 0}, {"NaN", 0},
+    };
+    for (iz i = 0; i < countof(nums); i++) {
+        expect(t, concat(&a, "number ", nums[i].in),
+               istr(&a, cfgjsonnumber(nums[i].in)), istr(&a, nums[i].want));
+    }
+    static struct { Str key, want; } names[] = {
+        {"template.thinking", "thinking"}, {"template._x9", "_x9"},
+        {"template.", ""}, {"template.9x", ""}, {"template.a-b", ""},
+        {"template.a.b", ""}, {"templatex", ""},
+    };
+    for (iz i = 0; i < countof(names); i++) {
+        expect(t, concat(&a, "name ", names[i].key),
+               cfgtemplatename(names[i].key), names[i].want);
+    }
+
+    CfgEnv v = newcfgenv(&a);
+    os_write(v.os, a, "/c/team.ini",
+             "[model shared]\n"
+             "template.from_team = yes\n");
+    os_write(v.os, a, "/c/h.ini",
+             "include = team.ini\n"
+             "[model large]\n"
+             "top_p = 0.95\n"
+             "max_tokens = 32768\n"
+             "fallback = small\n"                  // 5
+             "template.thinking = true\n"
+             "template.reasoning_effort = 50\n"
+             "template.label = \"42\"\n"
+             "template.mode = fast # note\n"
+             "template.empty = \"\"\n"             // 10
+             "[model large-quick]\n"
+             "like = large\n"
+             "template.reasoning_effort = 25\n"
+             "template.mode =\n"
+             "fallback =\n"                        // 15
+             "top_p = warm\n"
+             "[model large-deep]\n"
+             "like = large-quick\n"
+             "id = deepseek\n"
+             "template.reasoning_effort = 100\n"   // 20
+             "template.extra = 1.5\n"
+             "[model loop-a]\n"
+             "like = loop-b\n"
+             "temperature = 0.1\n"
+             "[model loop-b]\n"                    // 25
+             "like = loop-a\n"
+             "template.x = 1\n"
+             "[model self]\n"
+             "like = self\n"
+             "[model into]\n"                      // 30
+             "like = loop-a\n"
+             "[model bad]\n"
+             "template.9lives = 1\n"
+             "template.a-b = 2\n"
+             "[model nosection]\n"                 // 35
+             "like = unlisted\n"
+             "[model team]\n"
+             "like = shared\n");
+    Config *c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
+    expect(t, "like.diags", inidiags(&a, c->ini),
+           "/c/h.ini:16:9: error: expected a number, so this is ignored\n"
+           "/c/h.ini:33:1: error: expected template.NAME, NAME letters, "
+           "digits and _ but not a digit first, so this is ignored\n"
+           "/c/h.ini:34:1: error: expected template.NAME, NAME letters, "
+           "digits and _ but not a digit first, so this is ignored\n"
+           "/c/h.ini:23:8: warning: like makes a cycle, loop-a -> loop-b -> "
+           "loop-a, so settings are taken once around it\n"
+           "/c/h.ini:26:8: warning: like makes a cycle, loop-b -> loop-a -> "
+           "loop-b, so settings are taken once around it\n"
+           "/c/h.ini:29:8: warning: like makes a cycle, self -> self, so "
+           "settings are taken once around it");
+
+    // Settings along the chain: set empty is the default, bad is skipped
+    static struct { Str model, key, want; } gets[] = {
+        {"large", "top_p", "0.95"},
+        {"large-quick", "top_p", "0.95"},
+        {"large-quick", "max_tokens", "32768"},
+        {"large-quick", "fallback", ""},
+        {"large-deep", "max_tokens", "32768"},
+        {"large-deep", "fallback", ""},
+        {"large-deep", "like", "large-quick"},
+        {"large-quick", "id", ""},
+        {"large-deep", "reasoning", "reasoning_content"},
+        {"loop-a", "temperature", "0.1"},
+        {"loop-b", "temperature", "0.1"},
+        {"into", "temperature", "0.1"},
+        {"other", "top_p", ""},
+    };
+    for (iz i = 0; i < countof(gets); i++) {
+        Str got = cfgget(c, "model", gets[i].model, gets[i].key, 0);
+        expect(t, concat(&a, concat(&a, concat(&a, "like.get ", gets[i].model), "."),
+                         gets[i].key), got, gets[i].want);
+    }
+
+    // Ids: an own id, else the end of the chain's name; a cycle's itself
+    static struct { Str model, want; } ids[] = {
+        {"large", "large"}, {"large-quick", "large"}, {"large-deep", "deepseek"},
+        {"loop-a", "loop-a"}, {"self", "self"}, {"into", "into"},
+        {"nosection", "unlisted"}, {"other", "other"}, {"team", "shared"},
+    };
+    for (iz i = 0; i < countof(ids); i++) {
+        expect(t, concat(&a, "like.id ", ids[i].model), cfgmodelid(c, ids[i].model),
+               ids[i].want);
+    }
+
+    // Arguments merged from the chain's end, each in its first place
+    static struct { Str model, want; } args[] = {
+        {"large", "{\"thinking\":true,\"reasoning_effort\":50,\"label\":\"42\","
+                  "\"mode\":\"fast\",\"empty\":\"\"}"},
+        {"large-quick", "{\"thinking\":true,\"reasoning_effort\":25,"
+                        "\"label\":\"42\",\"empty\":\"\"}"},
+        {"large-deep", "{\"thinking\":true,\"reasoning_effort\":100,"
+                       "\"label\":\"42\",\"empty\":\"\",\"extra\":1.5}"},
+        {"loop-a", "{\"x\":1}"},
+        {"bad", "(null)"},
+        {"other", "(null)"},
+        {"team", "{\"from_team\":\"yes\"}"},
+    };
+    for (iz i = 0; i < countof(args); i++) {
+        Str got = cfgtemplate(c, &a, args[i].model);
+        expect(t, concat(&a, "like.args ", args[i].model),
+               got.data ? got : Str("(null)"), args[i].want);
+    }
+
+    // The settings window's rows of a variant
+    JsonDoc d = jsonparse(&a, cfgjson(&a, c, 0));
+    Buf     b(&a, 1024);
+    for (Json *s = jsonget(d.root, "settings")->child; s; s = s->next) {
+        Str key  = jsonstr(jsonget(s, "key"));
+        Str like = jsonstr(jsonget(s, "like"));
+        if (!(jsonstr(jsonget(s, "name")) == "large-deep") ||
+                !(key=="id" || key=="top_p" || key=="fallback" ||
+                  startswith(key, "template."))) {
+            continue;
+        }
+        print(&b, key);
+        putbyte(&b, '=');
+        print(&b, jsonstr(jsonget(s, "value")));
+        print(&b, jsonint(jsonget(s, "default"), -1) ? Str("*") : Str(""));
+        if (like.len) {
+            print(&b, " like ");
+            print(&b, like);
+        }
+        putbyte(&b, ' ');
+        print(&b, jsonint(jsonget(s, "line"), -1));
+        putbyte(&b, '\n');
+    }
+    expect(t, "like.rows", finish(&b),
+           "id=deepseek 19\n"
+           "fallback=* like large-quick 15\n"
+           "top_p=0.95 like large 3\n"
+           "template.reasoning_effort=100 20\n"
+           "template.extra=1.5 21\n"
+           "template.mode=* like large-quick 14\n"
+           "template.thinking=true like large 6\n"
+           "template.label=\"42\" like large 8\n"
+           "template.empty=\"\" like large 10\n");
+
+    // The engine: sent as the id, with the arguments, never to anthropic
+    Engine *e = alloc<Engine>(&a);
+    e->os  = v.os;
+    e->cfg = c;
+    e->ini = c->ini;
+    ModelConf mc = {};
+    modelconf(e, &a, "large-quick", &mc);
+    expect(t, "like.mc.name", mc.name, "large");
+    expect(t, "like.mc.kwargs", mc.kwargs,
+           "{\"thinking\":true,\"reasoning_effort\":25,\"label\":\"42\","
+           "\"empty\":\"\"}");
+    Msg msg = {};
+    msg.role = ROLE_USER;
+    msg.text = "hi";
+    ChatReq r = {};
+    r.mc      = &mc;
+    r.history = {&msg, 1, 1};
+    Arena tmp = v.scratch;
+    expect(t, "like.request", encodechat(&a, tmp, &r),
+           "{\"model\":\"large\",\"messages\":[{\"role\":\"user\",\"content\":"
+           "\"hi\"}],\"stream\":true,\"stream_options\":{\"include_usage\":"
+           "true},\"top_p\":0.95,\"max_tokens\":32768,\"chat_template_kwargs\":"
+           "{\"thinking\":true,\"reasoning_effort\":25,\"label\":\"42\","
+           "\"empty\":\"\"}}");
+    Str an = anencode(&a, tmp, &r);
+    expect(t, "like.anthropic", istr(&a, find(an, "chat_template_kwargs")), "-1");
+    expect(t, "like.anthropic.model", istr(&a, find(an, "\"model\":\"large\"")>0), "1");
+    ModelConf none = {};
+    modelconf(e, &a, "other", &none);
+    expect(t, "like.none", none.kwargs.data ? none.kwargs : Str("(null)"), "(null)");
+    cfgfree(c);
+
+    // Edits: quoted values stay strings, bare ones are typed, bad names
+    // are refused
+    os_write(v.os, a, "/e/h.ini", "[model m]\ntemplate.n = \"7\"\n");
+    c = newconfig(v.os, &a, v.scratch, "/e/h.ini", 0);
+    static struct { Str key, value, want; } edits[] = {
+        {"template.n", "7", "[model m]\ntemplate.n = 7\n"},
+        {"template.n", "\"7\"", "[model m]\ntemplate.n = \"7\"\n"},
+        {"template.n", "\"say \\\"hi\\\"\"",
+         "[model m]\ntemplate.n = \"say \\\"hi\\\"\"\n"},
+        {"template.on", "true", "[model m]\ntemplate.n = \"say \\\"hi\\\"\"\n"
+                                "template.on = true\n"},
+        {"template.on", "", "[model m]\ntemplate.n = \"say \\\"hi\\\"\"\n"
+                            "template.on = \n"},
+        {"like", "base", "[model m]\ntemplate.n = \"say \\\"hi\\\"\"\n"
+                         "template.on = \nlike = base\n"},
+    };
+    for (iz i = 0; i < countof(edits); i++) {
+        Arena  t2 = v.scratch;
+        CfgSet s  = cfgset(c, &t2, "model", "m", edits[i].key, edits[i].value);
+        Str    n  = concat(&a, "like.set ", edits[i].value);
+        expect(t, concat(&a, n, " ok"), s.ok ? Str("ok") : s.err, "ok");
+        expect(t, n, cfgfile(v.os, "/e/h.ini"), edits[i].want);
+    }
+    expect(t, "like.set.kwargs", cfgtemplate(c, &a, "m"), "{\"n\":\"say \\\"hi\\\"\"}");
+    static struct { Str key, value; } bad[] = {
+        {"template.", "1"}, {"template.9", "1"}, {"template.a b", "1"},
+        {"template.q", "\"a\" b\""},
+    };
+    for (iz i = 0; i < countof(bad); i++) {
+        Arena  t2 = v.scratch;
+        CfgSet s  = cfgset(c, &t2, "model", "m", bad[i].key, bad[i].value);
+        expect(t, concat(&a, "like.bad ", bad[i].key), istr(&a, s.ok), "0");
+    }
+    cfgfree(c);
+}
+
 static void test_config(Test *t)
 {
     testcfgsha256(t);
@@ -1243,4 +1481,5 @@ static void test_config(Test *t)
     testcfgpoll(t);
     testcfgjson(t);
     testcfgengine(t);
+    testcfglike(t);
 }

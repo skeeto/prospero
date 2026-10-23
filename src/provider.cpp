@@ -398,9 +398,11 @@ enum : i32 {
 };
 
 struct ModelConf {
-    Str          name;       // as sent in requests
+    Str          name;       // as sent in requests, the model's id
     Str          reasoning;  // field to send reasoning back in, empty: never
     Slice<Extra> extras;     // sampling parameters, only if configured
+    Str          kwargs;     // chat_template_kwargs, a JSON object, empty:
+                             // not sent (OpenAI-compatible only)
     b32          llamacpp;   // llama.cpp extras (return_progress,
                              // reasoning_control)
     i64          ctx;        // context limit in tokens, 0 if unknown
@@ -597,6 +599,10 @@ static Str encodechat(Arena *a, Arena tmp, ChatReq *r)
     for (iz i = 0; i < r->mc->extras.len; i++) {
         putkey(&w, r->mc->extras[i].key);
         putraw(&w, r->mc->extras[i].json);
+    }
+    if (r->mc->kwargs.len) {
+        putkey(&w, "chat_template_kwargs");
+        putraw(&w, r->mc->kwargs);
     }
     putend(&w);
     return finish(&b);
