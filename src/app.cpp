@@ -405,6 +405,12 @@ struct GuiHost {
     // again (UPD_*)
     i32        updating;
     Str        updmsg;  // how it goes, or went
+    // The models its own configuration names, for its sessions' model
+    // picker where it is not the main host (hostmodels)
+    Slice<Str> models;
+    i64        modelsid;   // its config.get in flight, 0 if none
+    b32        modelsgot;  // models is its answer since it came up
+    Str        modelserr;  // why there is no answer
 };
 
 // A session the GUI knows: listed by the engine, or opened here.
@@ -1302,6 +1308,62 @@ static void guiconfigget(Gui *g, b32 refresh = 0)
     }
     g->cfgget = g->nextid;
     cmdsend(g, &w, a);
+}
+
+// The models a session of a host other than the main one can switch to
+// are those its engine's own configuration names, which may not be this
+// one's: ask it (config.get) once each time it comes up (onremote).
+static void hostmodels(Gui *g, GuiHost *h)
+{
+    if (h==g->main || h->modelsgot || h->modelsid || !h->up || !h->r) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 64);
+    EvOut w = cmdopen(g, &b, CMD_CONFIGGET, 0, h);
+    h->modelsid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// The models in a config.get reply: the default, then each [model NAME]
+// section's, as cfgmodels lists them.
+static Slice<Str> replymodels(Arena *a, Json *j)
+{
+    Slice<Str> r = {};
+    for (Json *s = jsonget(j, "settings")->child; s; s = s->next) {
+        Str kind = jsonstr(jsonget(s, "kind"));
+        Str m    = !kind.len && jsonstr(jsonget(s, "key"))=="model" ?
+                   jsonstr(jsonget(s, "value")) :
+                   kind=="model" ? jsonstr(jsonget(s, "name")) : Str{};
+        b32 dup  = !m.len;
+        for (iz k = 0; !dup && k < r.len; k++) {
+            dup = r[k] == m;
+        }
+        if (!dup) {
+            r = push(a, r, m);
+        }
+    }
+    return r;
+}
+
+// A host's answer to hostmodels, kept anew only when it changed.
+static void onhostmodels(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok, Str err)
+{
+    h->modelsid  = 0;
+    h->modelsgot = 1;
+    h->modelserr = ok ? Str{} : clone(&g->perm, err);
+    Slice<Str> m    = ok ? replymodels(&scratch, j) : Slice<Str>{};
+    b32        same = m.len == h->models.len;
+    for (iz i = 0; same && i < m.len; i++) {
+        same = m[i] == h->models[i];
+    }
+    if (!same) {
+        h->models = {};
+        for (iz i = 0; i < m.len; i++) {
+            h->models = push(&g->perm, h->models, clone(&g->perm, m[i]));
+        }
+    }
+    scheddirty(&g->sched);
 }
 
 // Change one setting; a null value removes it.
@@ -2499,6 +2561,10 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         return;
 
     case CMD_CONFIGGET:
+        if (q.h && q.h->modelsid==id) {
+            onhostmodels(g, q.h, scratch, j, ok, err);
+            return;
+        }
         if (g->cfgget == id) {
             g->cfgget = 0;
         }
@@ -3363,6 +3429,8 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
     }
     if (h->up && was!=RS_UP) {
         h->opens++;
+        h->modelsid  = 0;  // its configuration may differ now
+        h->modelsgot = 0;
         if (h->updating == UPD_RESTART) {
             h->updating = UPD_DONE;
             h->updmsg   = clone(&g->perm, concat(&a, "Updated: the engine there is ", h->version));
@@ -6415,6 +6483,7 @@ enum : i32 {
     W_EDITED,     // no editor runs
     W_NOTE,       // the session shown has a note
     W_COMPACTED,  // it has a compaction card, and is idle
+    W_NAMED,      // an item named starting with text drew
 };
 
 static Str waitnames[] = {
@@ -6428,8 +6497,9 @@ static Str waitnames[] = {
     "the link to drop", "the remote to close", "the output", "a file",
     "the includes", "the thumbnails", "the screenshot", "reasoning",
     "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
+    "a named item",
 };
-static_assert(countof(waitnames) == W_COMPACTED+1);
+static_assert(countof(waitnames) == W_NAMED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -8060,7 +8130,8 @@ static DriveOp attachops[] = {
 // from the Hosts panel, a session made there through the dialog in its
 // directory there, its stream's link dropped and taken up again, a
 // call's output read through it, URL includes fetched again, then
-// disconnected. Light, then dark.
+// disconnected. Its model picker lists the models of the host's own
+// configuration. Light, then dark.
 static DriveOp remoteops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -8102,6 +8173,14 @@ static DriveOp remoteops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SESSION, 0, 0, 30000, ""},
     {OP_CHECK, CHK_REMOTESESSION, 0, 0, 0, ""},
+    // Its model picker lists the models of the host's own configuration
+    {OP_MOVE, T_NAMED, 0, 0, 100, "model picker"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 20000, "model fake:far:"},
+    {OP_SHOT, 0, 0, 0, 300, "remote-models"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     // Its stream's link dropped in the middle, and taken up again
     {OP_MARKDELTAS, 0, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Stream for the link."},
@@ -8931,6 +9010,14 @@ static b32 drivewaitdone(Gui *g)
         return g->sess && g->sess->note.len;
     case W_COMPACTED:
         return g->sess && !v->busy && lastof(v, VIEW_COMPACT);
+    case W_NAMED:
+        for (i32 i = 0; i < g->nnamed; i++) {
+            Named *n = &g->named[i];
+            if (startswith(Str{n->name, n->len}, g->ops[g->drivepc-1].text)) {
+                return 1;
+            }
+        }
+        return 0;
     case W_SHED:
         return g->bg;
     case W_REOPENED:

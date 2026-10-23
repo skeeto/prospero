@@ -883,7 +883,9 @@ class Far:
         self.work = self.root + "/work"
         self.config = self.root + "/prospero.ini"
         cfg = config(url, model) + "\n# Its host goes soon after its last client\n" \
-                                   "[host]\nidle_exit = 5\n"
+                                   "[host]\nidle_exit = 5\n" \
+                                   "\n# A model only it has, for its sessions' picker\n" \
+                                   f"[model fake:far:{nonce}]\ncontext = 100000\n"
         if self.local:
             host.mkdir(self.work)
             host.mkdir(self.state)

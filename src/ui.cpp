@@ -3197,12 +3197,23 @@ static Slice<Str> cfgmodels(Gui *g, Arena *a)
     return r;
 }
 
-// The models to switch to, as menu items, then a field for another.
+// The models to switch to, as menu items, then a field for another: a
+// host's other than the main one's as its own configuration has them.
 static void modelitems(Gui *g, Arena a, GuiSession *s)
 {
     Str        now    = s->view && s->view->model.len ? s->view->model : s->model;
-    Slice<Str> models = cfgmodels(g, &a);
+    GuiHost   *h      = s->host;
+    b32        theirs = h != g->main;  // its engine's configuration
+    Slice<Str> models = theirs ? h->models : cfgmodels(g, &a);
     b32        first  = 1;
+    if (theirs) {
+        hostmodels(g, h);
+        if (!h->modelsgot) {
+            ImGui::TextDisabled("Asking the host for its models...");
+        } else if (h->modelserr.len) {
+            ImGui::TextDisabled("The host's models: %s", cstr0(&a, h->modelserr));
+        }
+    }
     for (iz i = 0; i < models.len; i++) {
         b32 cur = models[i] == now;
         if (ImGui::MenuItem(cstr0(&a, models[i]), 0, cur, !cur)) {
@@ -3214,9 +3225,6 @@ static void modelitems(Gui *g, Arena a, GuiSession *s)
             itemrect(g, RECT_MODEL0);  // the first to switch to
             first = 0;
         }
-    }
-    if (s->host->kind == GH_REMOTE) {
-        ImGui::TextDisabled("As configured here: %s may differ", cstr0(&a, s->host->name));
     }
     ImGui::SetNextItemWidth(200*g->scale);
     if (ImGui::InputTextWithHint("##other", "another model, Enter", g->modelbuf, FIELD_MAX,
