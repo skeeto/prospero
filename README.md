@@ -158,6 +158,22 @@ Ctrl+- and Ctrl+0, Cmd on macOS, or the wheel with the key held);
 `[ui] font_size` sets its size for good. The window opens where it was
 last, fitted to the displays there are.
 
+The sidebar is a tree: groups, then hosts, then sessions with their
+subagents, and archived sessions folded away at the end. A session's
+context menu, and the Session menu, rename it, move it to a group,
+fork it, compact it now, switch its model, export it (Markdown or the
+raw log), archive or delete it (with its subagents). The transcript's
+context menu forks at a message: before a prompt, which then waits in
+the fork's prompt box, or after a turn. The prompt box keeps a draft
+per session, with the engine, has the session's earlier prompts on Up
+and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
+else `$VISUAL` or `$EDITOR`), and takes `/compact`, `/model`,
+`/rename`, `/fork` and `/export`. An ask may be answered "always",
+which allows that directory for the rest of the session and its
+subagents. Each session has a scratch directory in the system's
+temporary directory, which tools may use freely, as they may the rest
+of it unless `[guard] temp = ask`.
+
 `prospero run` runs one turn with no window and exits when it ends,
 printing its records as JSON lines, or readable text with `--pretty`.
 Nobody answers its asks, so they are denied. It exits 0 when the turn
@@ -435,6 +451,12 @@ from the `engines` directory next to the executable, named
 is built for that platform. `tools/engines.py` builds them: macOS
 arm64, Windows x86-64 and i686, and Linux aarch64 and x86-64 (static,
 built on a Linux host given with `--linux HOST`, else left out).
+A remote whose engine is older than this program shows the operations
+it lacks disabled, and a host's menu has Update engine, which deploys
+this version's engine there and reconnects to it once nothing runs.
+Its sessions' model picker lists the models of the remote's own
+configuration. `list = connected` leaves a remote out of the sidebar
+until it is connected.
 
 A desktop helper there for the platform,
 `prospero-desktop-VERSION-OS-ARCH`, goes too, as
