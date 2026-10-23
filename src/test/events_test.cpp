@@ -74,7 +74,7 @@ static void test_events(Test *t)
         expect(t, "durable events", finish(&durable),
                "session title user turn attempt assistant tool.start "
                "tool.end ask answer retry nudge turn.end note compact job.start "
-               "job.end todo snap rewind instructions notice prefix ");
+               "job.end todo snap rewind instructions notice prefix model grant ");
         expect(t, "synced events", finish(&sync), "tool.start ask answer turn.end rewind ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
         expect(t, "empty event", istr(a, evfind("")), istr(a, EV_NONE));
@@ -84,6 +84,58 @@ static void test_events(Test *t)
         }
         expect(t, "cmd config.set", istr(a, cmdfind("config.set")), istr(a, CMD_CONFIGSET));
         expect(t, "unknown cmd", istr(a, cmdfind("Quit")), istr(a, CMD_NONE));
+        expect(t, "cmd draft", istr(a, cmdfind("draft")), istr(a, CMD_DRAFT));
+    }
+
+    // What hello says the engine speaks, a host adding "host"
+    {
+        Buf     b(a, 64);
+        JsonOut w = {&b};
+        putobject(&w);
+        putcaps(&w, 0);
+        putend(&w);
+        expect(t, "putcaps", finish(&b),
+               "{\"cmds\":[\"hello\",\"list\",\"new\",\"open\",\"close\",\"prompt\","
+               "\"steer\",\"cancel\",\"answer\",\"config.get\",\"config.set\",\"quit\","
+               "\"rewind\",\"job.kill\",\"status\",\"stop\",\"file\",\"rename\",\"delete\","
+               "\"archive\",\"group\",\"fork\",\"compact\",\"model\",\"draft\"],"
+               "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
+               "\"subagents\"]}");
+        b.len = 0;
+        w = {&b};
+        putobject(&w);
+        putcaps(&w, 1);
+        putend(&w);
+        JsonDoc d    = jsonparse(a, finish(&b));
+        Json   *caps = jsonget(d.root, "caps");
+        expect(t, "putcaps host", concat(a, istr(a, jsonlen(jsonget(d.root, "cmds"))),
+               concat(a, " ", jsonstr(jsonat(caps, jsonlen(caps)-1)))),
+               concat(a, istr(a, CMD_COUNT-1), " host"));
+    }
+
+    // Session ids: one plain name of a directory, never a path
+    {
+        struct { Str sid; b32 ok; } sids[] = {
+            {"20261020-153012-7f3a", 1},
+            {"a", 1},
+            {"x.y", 1},
+            {"", 0},
+            {".", 0},
+            {"..", 0},
+            {".hidden", 0},
+            {"a/b", 0},
+            {"a\\b", 0},
+            {"C:x", 0},
+            {"tab\tin", 0},
+            {"nul\0in", 0},
+            {"del\x7f", 0},
+            {"0123456789012345678901234567890123456789012345678901234567890123", 1},
+            {"01234567890123456789012345678901234567890123456789012345678901234", 0},
+        };
+        for (iz i = 0; i < countof(sids); i++) {
+            expect(t, concat(a, "validsid ", sids[i].sid),
+                   istr(a, validsid(sids[i].sid)), istr(a, sids[i].ok));
+        }
     }
 
     // Encoding: fixed header order, seq only when durable, one line each
@@ -554,7 +606,7 @@ static void test_events(Test *t)
                "session=0 title=0 user=0 turn=0 attempt=0 assistant=0 "
                "tool.start=1 tool.end=0 ask=1 answer=1 retry=0 nudge=0 "
                "turn.end=1 note=0 compact=0 job.start=0 job.end=0 todo=0 snap=0 "
-               "rewind=1 instructions=0 notice=0 prefix=0 ");
+               "rewind=1 instructions=0 notice=0 prefix=0 model=0 grant=0 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";

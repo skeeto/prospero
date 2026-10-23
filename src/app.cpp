@@ -302,6 +302,10 @@ struct GuiHost {
     Str      regpath;   // GH_LOCAL: its registration, removed once it is gone
     i64      opens;     // times its link was made, for the checklist
     i64      downs;     // times it went down
+    // Its engine, as its hello says (hostcan)
+    Str        version;
+    Slice<Str> cmds;    // the commands it takes
+    Slice<Str> caps;    // and its features (putcaps)
 };
 
 // A session the GUI knows: listed by the engine, or opened here.
@@ -2011,6 +2015,50 @@ static void enginestopped(Gui *g)
 
 static void onremote(Gui *, GuiHost *, Arena, EvRec *);
 
+// Names from a hello (cmds or caps), kept anew only when they changed,
+// as a host says hello again on every connection.
+static void hostnames(Gui *g, Slice<Str> *names, Json *list)
+{
+    b32 same = jsonlen(list) == names->len;
+    iz  i    = 0;
+    for (Json *k = list->child; same && k; k = k->next, i++) {
+        same = jsonstr(k) == (*names)[i];
+    }
+    if (!same) {
+        *names = {};
+        for (Json *k = list->child; k; k = k->next) {
+            *names = push(&g->perm, *names, clone(&g->perm, jsonstr(k)));
+        }
+    }
+}
+
+// What a host's engine is, from its hello, or from a remote's "up",
+// which passes that on.
+static void hostcaps(Gui *g, GuiHost *h, Json *j)
+{
+    Str version = jsonstr(jsonget(j, "version"));
+    h->version = h->version==version ? h->version : clone(&g->perm, version);
+    hostnames(g, &h->cmds, jsonget(j, "cmds"));
+    hostnames(g, &h->caps, jsonget(j, "caps"));
+}
+
+// Whether a host's engine takes a command, or has a feature, by name:
+// an older engine may lack it.
+static b32 hostcan(GuiHost *h, Str name)
+{
+    for (iz i = 0; i < h->cmds.len; i++) {
+        if (h->cmds[i] == name) {
+            return 1;
+        }
+    }
+    for (iz i = 0; i < h->caps.len; i++) {
+        if (h->caps[i] == name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Apply one record from a host. Returns 1 if what shows changed.
 static b32 guirecord(Gui *g, GuiHost *h, Str line)
 {
@@ -2028,6 +2076,7 @@ static b32 guirecord(Gui *g, GuiHost *h, Str line)
         onreply(g, h, a, &r, line);
         return 1;
     case EV_HELLO:
+        hostcaps(g, h, r.root);
         if (h->kind == GH_ENGINE) {
             g->engineok = 1;
             h->up       = 1;
@@ -2056,10 +2105,17 @@ static b32 guirecord(Gui *g, GuiHost *h, Str line)
 
     GuiSession *s = findsess(g, h, r.sid);
     if (!s || !s->view) {
-        if (!r.seq) {
-            return 0;  // not shown here
+        // A view begins with its session's first record: one made here,
+        // or a subagent. Any record will do for a listed subagent of a
+        // session viewed here, as its host would send it, should its
+        // beginning have been lost (it resyncs). Other records, as of a
+        // command on a session not open here, are not shown: an open
+        // makes its view before it asks for any.
+        GuiSession *p = s && s->parent.len ? findsess(g, h, s->parent) : 0;
+        b32 first = r.ev==EV_SESSION && r.seq==1;
+        if (!first && !(r.seq && p && p->view)) {
+            return 0;
         }
-        // A session made here, or records that outran its reply
         s = s ? s : addsess(g, h, r.sid);
         sessview(g, s);
         if (!g->sess && g->enginekind!=ENGINE_FAKE) {
@@ -2224,10 +2280,9 @@ static void reissue(Gui *g)
         }
         switch (q.cmd) {
         case CMD_HELLO:     guihello(g);    break;
-        case CMD_LIST:      guilist(g, e);  break;
         case CMD_CONFIGGET: g->cfgget = 0; guiconfigget(g); break;
         case CMD_OPEN:      if (q.s && q.s->openid==q.id) guiopen(g, q.s); break;
-        case CMD_NEW:       g->newid = 0; guilist(g, e); break;  // it shows there
+        case CMD_NEW:       g->newid = 0; break;  // it shows in the list
         case CMD_FILE:
             if (g->out.id == q.id) {
                 g->out.id = 0;
@@ -2237,6 +2292,9 @@ static void reissue(Gui *g)
             break;
         }
     }
+    // The list again in any case, with sessions begun in what was lost,
+    // so that their subagents' records make views (guirecord)
+    guilist(g, e);
 }
 
 
@@ -2441,6 +2499,9 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
     h->retryat = r->ts + jsonint(jsonget(r->root, "retry_ms"), 0);
     h->up      = h->state == RS_UP;
     h->downs  += h->state==RS_DOWN && was!=RS_DOWN;
+    if (h->up) {
+        hostcaps(g, h, r->root);
+    }
     if (h->up && was!=RS_UP) {
         h->opens++;
         guilist(g, h);
@@ -6459,7 +6520,11 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->modalframes > 2;
         #endif
     }
-    case CHK_ENGINE:   return g->engineok && !g->engineerr.len;
+    case CHK_ENGINE:
+        // Its hello said what it takes and has (hostcan), and it is no host
+        return g->engineok && !g->engineerr.len && g->hosts->version.len &&
+               hostcan(g->hosts, "list") && hostcan(g->hosts, "file.base64") &&
+               !hostcan(g->hosts, "host");
     case CHK_SESSION:
         g->drivemain = g->sess;
         return g->sess && g->sess->view && g->sess->view->cwd.len;
@@ -6878,8 +6943,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->sess && g->sess->host->kind==GH_LOCAL && !v->busy &&
                countrole(v, VIEW_ASSISTANT)==2;
     case CHK_REMOTEUP: {
+        // Up, with what its hello said passed on by the library
         GuiHost *h = drivehost(g, GH_REMOTE);
-        return h && h->up && h->opens==1;
+        return h && h->up && h->opens==1 && h->version.len &&
+               hostcan(h, "host") && hostcan(h, "open");
     }
     case CHK_REMOTESESSION:
         // (the directory as given, as far as the host spells it alike)

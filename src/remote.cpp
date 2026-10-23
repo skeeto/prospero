@@ -40,7 +40,9 @@
 // records already passed are dropped, and the sessions list gains
 // "host", the remote's name. A "remote" record tells the frontend how
 // the link is: state connecting, up, down (retry_ms until the next
-// try), failed or closed, with msg saying why.
+// try), failed or closed, with msg saying why. Since the library keeps
+// the host's hello to itself, up passes on what it said of the engine
+// there: its version, cmds and caps.
 //
 // remoteclose ends the link with a disconnect frame: the host forgets
 // this client, and its sessions run on without it. remotefinish does so
@@ -181,6 +183,8 @@ struct Remote {
     i64               nextown;  // the library's own ids: -1, -2, ...
     Str               why;      // the last trouble, for the frontend
     Str               version;  // the host's
+    Str               cmds;     // and its hello's cmds and caps, as JSON
+    Str               caps;     // arrays, null if it gave none
     i32               need;     // NEED_*: why deploying would help
     b32               deploying;
     b32               deployed; // tried once: never again
@@ -209,6 +213,14 @@ static void remotestatus(Remote *r, Arena scratch, i32 state, Str msg, i64 retry
     }
     if (state==RS_UP && r->version.len) {
         putstrkey(&w.json, "version", r->version);
+    }
+    if (state==RS_UP && r->cmds.len) {
+        putkey(&w.json, "cmds");
+        putraw(&w.json, r->cmds);
+    }
+    if (state==RS_UP && r->caps.len) {
+        putkey(&w.json, "caps");
+        putraw(&w.json, r->caps);
     }
     if (state==RS_FAILED && r->need) {
         putstrkey(&w.json, "deploy", remoteneeds[r->need]);
@@ -727,6 +739,27 @@ static void remotecommand(Remote *r, Arena scratch, Str line)
     }
 }
 
+// A list of names in the host's hello (cmds or caps), as a JSON array
+// of its strings for the "up" record, or null if it has none. It is kept
+// anew only when it changed, as a host says hello on every stream.
+static Str remotenames(Remote *r, Arena scratch, Str old, Json *list)
+{
+    if (list->type != JSON_ARRAY) {
+        return {};
+    }
+    Buf     b(&scratch, 256);
+    JsonOut w = {&b};
+    putarray(&w);
+    for (Json *k = list->child; k; k = k->next) {
+        if (k->type == JSON_STRING) {
+            putstr(&w, k->str);
+        }
+    }
+    putend(&w);
+    Str names = finish(&b);
+    return names==old ? old : clone(&r->perm, names);
+}
+
 // A record from the host.
 static void remoterecord(Remote *r, Arena scratch, Str line)
 {
@@ -774,6 +807,8 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
         if (jsonstr(jsonget(rec.root, "version")) != r->version) {
             r->version = clone(&r->perm, jsonstr(jsonget(rec.root, "version")));
         }
+        r->cmds = remotenames(r, scratch, r->cmds, jsonget(rec.root, "cmds"));
+        r->caps = remotenames(r, scratch, r->caps, jsonget(rec.root, "caps"));
         r->hellook = 1;
         for (Str rest = finish(&r->held); rest.len;) {
             Arena a = scratch;

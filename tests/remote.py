@@ -579,6 +579,8 @@ def attach_reconnect(t):
     t.check(hello.get("ok") == 1, f"hello: {hello}")
     h = s.wait(lambda r: r.get("ev") == "hello", what="hello")
     t.check(h.get("proto") == 0 and "host" in h.get("caps", []), f"hello: {h}")
+    t.check({"list", "open", "file", "draft"} <= set(h.get("cmds", [])) and
+            "subagents" in h.get("caps", []), f"hello names its commands: {h}")
     pids = t.hostpids()
     t.check(len(pids) == 1, f"one host registered: {pids}")
     r = c.call("new", cwd=t.work, prompt="go", attended=1)
@@ -1024,12 +1026,25 @@ class Lines:
         return rc
 
 
+def checkup(t, c, up):
+    """A link's "up" record passes on what the host's hello said of its
+    engine, as the library keeps the hello to itself."""
+    caps = up.get("caps", [])
+    cmds = up.get("cmds", [])
+    t.check(up.get("version") and "host" in caps and "file.base64" in caps,
+            f"up: {up}")
+    t.check({"hello", "list", "new", "open", "rename", "fork", "draft"} <= set(cmds),
+            f"up names the commands: {up}")
+    t.check(not [r for r in c.records if r.get("ev") == "hello"], "no hello passed on")
+
+
 @scenario
 def connect_local(t):
     """The client library against this machine's host: a turn, then the
     host restarted under it: the session comes back from its log."""
     c = connect(t, ["--local", "--state", t.state, "-c", t.config])
-    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
+    up = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
+    checkup(t, c, up)
     r = c.call("new", cwd=t.work, prompt="go", attended=1)
     sid = r["sid"]
     c.wait(lambda r: r.get("ev") == "turn.end", what="turn.end")
@@ -1046,6 +1061,8 @@ def connect_local(t):
     held = c.send("list")        # while down: it waits for the new host
     c.wait(lambda r: len([x for x in c.records if x.get("ev") == "remote"
                           and x.get("state") == "up"]) > n, what="up again", timeout=40)
+    ups = [x for x in c.records if x.get("ev") == "remote" and x.get("state") == "up"]
+    checkup(t, c, ups[-1])
     h = c.wait(lambda r: r.get("ev") == "reply" and r.get("id") == held, what="the held list")
     t.check(h.get("ok") == 1, f"a command held while down: {h}")
     p = c.call("prompt", sid=sid, text="more")

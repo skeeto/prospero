@@ -611,3 +611,50 @@ static void test_remoteask(Test *t)
     expect(t, "ask.bits", istr(&a, r.asked), istr(&a, REMOTE_CLOSE|REMOTE_DROP));
     expect(t, "ask.woken", istr(&a, mailwait(r.in, 0)), "1");
 }
+
+// The library keeps the host's hello, and passes on what it said of the
+// engine there in the record of the link coming up: its version, cmds
+// and caps (strings only), cloned again only when they change.
+static void test_remotehello(Test *t)
+{
+    Arena   a   = t->perm;
+    Remote *r   = alloc<Remote>(&a);
+    byte   *mem = (byte *)allocbytes(&a, 1<<16);
+    r->os        = newos(&a, 1<<12);
+    r->out       = newmailbox(&a, 1<<14, 0, 0);
+    r->perm      = {mem, mem + (1<<16)};
+    r->held      = Buf(&r->perm, 256);
+    r->link      = newlink(&r->perm, 1, 1<<12, 16);
+    r->conf.name = "vm";
+
+    Str hellos[] = {
+        "{\"ts\":1,\"ev\":\"hello\",\"proto\":0,\"version\":\"9.9.9\","
+        "\"cmds\":[\"list\",\"fork\"],\"caps\":[\"host\",7,\"gauge\"],\"pid\":2}\n",
+        "{\"ts\":2,\"ev\":\"hello\",\"proto\":0,\"version\":\"9.9.9\","
+        "\"cmds\":[\"list\",\"fork\"],\"caps\":[\"host\",\"gauge\"],\"pid\":2}\n",
+        "{\"ts\":3,\"ev\":\"hello\",\"proto\":0,\"version\":\"0.0.1\",\"caps\":[\"host\"]}\n",
+    };
+    Buf got(&a, 1024);
+    Str cmds = {};
+    for (iz i = 0; i < countof(hellos); i++) {
+        r->wanthello = 1;
+        remoterecord(r, a, hellos[i]);
+        Mail m = mailtake(r->out);
+        for (Record rec; (rec = mailnext(&m)).ok;) {
+            print(&got, rec.data);
+        }
+        if (i == 1) {
+            putbyte(&got, r->cmds.data==cmds.data ? '=' : '!');  // kept
+            putbyte(&got, '\n');
+        }
+        cmds = r->cmds;
+    }
+    expect(t, "remote up", finish(&got),
+           "{\"ts\":0,\"ev\":\"remote\",\"host\":\"vm\",\"state\":\"up\",\"version\":\"9.9.9\","
+           "\"cmds\":[\"list\",\"fork\"],\"caps\":[\"host\",\"gauge\"]}\n"
+           "{\"ts\":0,\"ev\":\"remote\",\"host\":\"vm\",\"state\":\"up\",\"version\":\"9.9.9\","
+           "\"cmds\":[\"list\",\"fork\"],\"caps\":[\"host\",\"gauge\"]}\n"
+           "=\n"
+           "{\"ts\":0,\"ev\":\"remote\",\"host\":\"vm\",\"state\":\"up\",\"version\":\"0.0.1\","
+           "\"caps\":[\"host\"]}\n");
+}

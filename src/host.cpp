@@ -665,10 +665,7 @@ static void hosthello(Host *h, HostClient *c, Arena scratch, i64 id, Json *j)
     EvOut w = evbegin(&b, {}, 0, os_time(h->os), EV_HELLO);
     putintkey(&w.json, "proto", h->proto);
     putstrkey(&w.json, "version", PROSPERO_VERSION);
-    putkey(&w.json, "caps");
-    putarray(&w.json);
-    putstr(&w.json, "host");
-    putend(&w.json);
+    putcaps(&w.json, 1);
     putintkey(&w.json, "pid", (i64)os_pid(h->os));
     Str line = evend(&w);
     hostmust(h, c, scratch, line);
@@ -687,12 +684,6 @@ static void hosthello(Host *h, HostClient *c, Arena scratch, i64 id, Json *j)
         err = finish(&e);
     }
     hostreply(h, c, scratch, id, !err.len, err, {});
-}
-
-static b32 validsid(Str sid)
-{
-    return sid.len && sid.len<=64 && !cut(sid, '/').ok && !cut(sid, '\\').ok &&
-           sid[0]!='.';
 }
 
 static void hostcommand(Host *h, HostClient *c, Arena scratch, Str line)

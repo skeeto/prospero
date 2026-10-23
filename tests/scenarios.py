@@ -1838,6 +1838,67 @@ def readonly(t):
 
 
 @scenario(bound=10)
+def hello_caps(t):
+    """hello names every command (cmds) and the engine's features (caps);
+    the commands of M8 are named already, each refused for now without
+    touching the session it names."""
+    h = t.headless()
+    try:
+        r = h.call("hello", proto=0, client="scenarios")
+        t.check(r.get("ok") == 1, f"hello: {r}")
+        hello = h.all("hello")
+        t.check(len(hello) == 1, f"one hello: {hello}")
+        hello = hello[0]
+        t.check(hello.get("proto") == 0 and hello.get("version"), f"hello: {hello}")
+        later = ["rename", "delete", "archive", "group", "fork", "compact", "model",
+                 "draft"]
+        cmds = hello.get("cmds", [])
+        want = ["hello", "list", "new", "open", "close", "prompt", "steer", "cancel",
+                "answer", "config.get", "config.set", "quit", "rewind", "job.kill",
+                "status", "stop", "file"] + later
+        t.check(cmds == want, f"cmds: {cmds}")
+        caps = hello.get("caps", [])
+        t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
+                {"close.forget", "config.refresh", "file.base64", "desktop",
+                 "subagents"} <= set(caps) and "host" not in caps, f"caps: {caps}")
+
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        local = isinstance(t.host, LocalHost)
+        state = t.host.join(t.state, "sessions", sid)
+        before = sorted(os.listdir(state)) if local else None
+        log = t.host.read(t.host.join(state, "events.jsonl"))
+        seen = len([e for e in h.events if e.get("sid") == sid and "seq" in e])
+        fields = {"rename": {"title": "t"}, "archive": {"on": 1},
+                  "group": {"name": "g"}, "fork": {"turn": 1},
+                  "compact": {"focus": "f"}, "model": {"model": t.model},
+                  "draft": {"text": "unsent"}}
+        for cmd in later:
+            r = h.call(cmd, sid=sid, **fields.get(cmd, {}))
+            t.check(r.get("ok") == 0 and r.get("err") == "not implemented yet" and
+                    r.get("sid") == sid, f"{cmd}: {r}")
+        for cmd in ("delete", "archive", "group", "fork", "draft"):
+            # Commands on a session's directory, whether open or not
+            r = h.call(cmd, sid="20260101-000000-none")
+            t.check(r.get("ok") == 0 and r.get("err") == "not implemented yet",
+                    f"{cmd} on another: {r}")
+            for bad in ("../" + sid, "a\\b", "", "C:x", ".x"):
+                r = h.call(cmd, sid=bad)
+                t.check(r.get("ok") == 0 and r.get("err") == "invalid session id",
+                        f"{cmd} {bad!r}: {r}")
+        r = h.call("open", sid="C:x")
+        t.check(r.get("ok") == 0 and r.get("err") == "invalid session id", f"open: {r}")
+        t.check(t.host.read(t.host.join(state, "events.jsonl")) == log,
+                "the log is untouched")
+        if local:
+            t.check(sorted(os.listdir(state)) == before, f"no sidecars: {os.listdir(state)}")
+        records = [e for e in h.events if e.get("sid") == sid and "seq" in e]
+        t.check(len(records) == seen, f"no records: {records[seen:]}")
+    finally:
+        rc = h.close()
+        t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
 def quit_stop(t):
     h = t.headless()
     sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]

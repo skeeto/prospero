@@ -5,6 +5,8 @@
 // Commands from the GUI start with cmd and id instead. A session's log,
 // events.jsonl, holds exactly its durable records, byte for byte as they
 // are sent to the GUI, so replaying a session means streaming its file.
+// The protocol only grows: an engine's hello names its commands (cmds)
+// and features (caps), so that a frontend offers only what it has.
 //
 // Logs are appended one write per record, so a software crash loses
 // nothing and a power loss at worst tears the final line. Opening a log
@@ -41,6 +43,8 @@ enum : i32 {
     EV_INSTRUCTIONS,
     EV_NOTICE,
     EV_PREFIX,
+    EV_MODEL,   // (M8) the session's model from here on
+    EV_GRANT,   // (M8) an "always allow" from the user
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -88,6 +92,8 @@ static EvInfo evinfo[] = {
     {"instructions", 1, 0},
     {"notice",     1, 0},
     {"prefix",     1, 0},  // what every request of the session begins with
+    {"model",      1, 0},
+    {"grant",      1, 0},  // lost to a power cut, it is asked again
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -122,15 +128,35 @@ enum : i32 {
     CMD_STATUS,  // (M5) whether anything runs: for a host's idle exit
     CMD_STOP,    // (M5) stop every turn and job, running on
     CMD_FILE,    // (M5) part of a file in a session's directory
+    CMD_RENAME,  // (M8) a title from the user
+    CMD_DELETE,  // (M8) a session and its subagents, for good
+    CMD_ARCHIVE, // (M8) out of the way, or back
+    CMD_GROUP,   // (M8) into a named group, or out of one
+    CMD_FORK,    // (M8) a new session from a copy of the log
+    CMD_COMPACT, // (M8) compact now
+    CMD_MODEL,   // (M8) another model from here on
+    CMD_DRAFT,   // (M8) the frontend's unsent prompt, kept
     CMD_COUNT,
 };
 
 static Str cmdnames[] = {
     "", "hello", "list", "new", "open", "close", "prompt", "steer",
     "cancel", "answer", "config.get", "config.set", "quit", "rewind",
-    "job.kill", "status", "stop", "file",
+    "job.kill", "status", "stop", "file", "rename", "delete", "archive",
+    "group", "fork", "compact", "model", "draft",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
+
+// What hello's caps name: features of the engine that its commands
+// alone do not show, which a frontend checks for before it relies on
+// one, since an older engine lacks it. Names are only ever added.
+static Str capnames[] = {
+    "close.forget",    // close {forget}: out of memory once idle
+    "config.refresh",  // config.get {refresh}: URL includes fetched anew
+    "file.base64",     // file {encoding:"base64"}, for binary files
+    "desktop",         // the desktop tool, with screenshots in tool.end
+    "subagents",       // the task tool: sessions listed under a parent
+};
 
 static Str evname(i32 ev)
 {
@@ -168,6 +194,18 @@ static i32 cmdfind(Str name)  // CMD_NONE if unknown
         }
     }
     return CMD_NONE;
+}
+
+// A session id as a command names it: one directory under sessions/,
+// never a path, a dot file, nor a drive or stream (':') on Windows.
+static b32 validsid(Str sid)
+{
+    b32 ok = sid.len && sid.len<=64 && sid[0]!='.';
+    for (iz i = 0; ok && i < sid.len; i++) {
+        u8 c = sid[i];
+        ok = c>=0x20 && c!=0x7f && c!='/' && c!='\\' && c!=':';
+    }
+    return ok;
 }
 
 
@@ -227,6 +265,27 @@ static Str evend(EvOut *r)
     putend(&r->json);
     putbyte(r->json.b, '\n');
     return cuthead(finish(r->json.b), r->start);
+}
+
+// What hello says the engine speaks: cmds, every command it takes, and
+// caps (capnames), with "host" from an engine behind a host (host.cpp).
+static void putcaps(JsonOut *w, b32 host)
+{
+    putkey(w, "cmds");
+    putarray(w);
+    for (i32 cmd = 1; cmd < CMD_COUNT; cmd++) {
+        putstr(w, cmdnames[cmd]);
+    }
+    putend(w);
+    putkey(w, "caps");
+    putarray(w);
+    for (iz i = 0; i < countof(capnames); i++) {
+        putstr(w, capnames[i]);
+    }
+    if (host) {
+        putstr(w, "host");
+    }
+    putend(w);
 }
 
 // A record read back.

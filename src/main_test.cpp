@@ -544,6 +544,7 @@ int main()
     test_events(&t);
     test_frame(&t);
     test_remoteask(&t);
+    test_remotehello(&t);
     test_provider(&t);
     test_anthropic(&t);
     test_edit(&t);

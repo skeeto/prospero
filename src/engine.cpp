@@ -5308,6 +5308,8 @@ static Str maketitle(Arena *a, Str text)
     return finish(&b);
 }
 
+static Str sidecarput(Engine *, Arena, Str sid, Str name, Str data);
+
 static void settitle(Session *s, Arena scratch, Str title)
 {
     if (!title.len) {
@@ -5318,9 +5320,7 @@ static void settitle(Session *s, Arena scratch, Str title)
     EvOut w = sbegin(s, &b, EV_TITLE);
     putstrkey(&w.json, "text", title);
     ssend(s, &w);
-    // For listing sessions without reading their logs
-    Str path = join(&scratch, s->dir, "title");
-    os_write(s->e->os, scratch, path, s->title);
+    sidecarput(s->e, scratch, s->sid, "title", s->title);
 }
 
 // Begin a turn, after its user input if any: via names what began it
@@ -6487,6 +6487,182 @@ static void unattend(Engine *e, Arena scratch)
 }
 
 
+// Sessions by id, open here or not
+//
+// A command may name a session this process does not have open: one
+// parked, one closed, or one that another process holds. borrow brings
+// it into memory for the command. Small files beside a session's log,
+// its sidecars, say what the sessions list shows without reading logs:
+// its title, and whatever else is set on it. Only the holder of the
+// session's lock writes them, as only it appends to the log, so that
+// two processes never write over each other: this process while it has
+// the session in memory (not read-only) or parked, and otherwise for a
+// moment, the lock taken for the write alone, refused if another
+// process has it. A draft is the exception: the last writer wins
+// (sidecarwrite).
+
+// The lock this process holds on a session, or -1 if it holds none: the
+// session is read-only here, closed, or parked without its lock.
+static iz heldlock(Engine *e, Str sid)
+{
+    Session *s = findsession(e, sid);
+    if (s) {
+        return s->readonly ? -1 : s->lock;
+    }
+    iz at = parkedat(e, sid);
+    return at<0 ? -1 : e->parked[at].lock;
+}
+
+static Str sidecarpath(Arena *a, Engine *e, Str sid, Str name)
+{
+    return join(a, join(a, join(a, e->statedir, "sessions"), sid), name);
+}
+
+// A sidecar of at most max bytes, or a null string if there is none.
+static Str sidecarget(Engine *e, Arena *a, Str sid, Str name, iz max)
+{
+    if (!validsid(sid)) {
+        return {};
+    }
+    Read rd = os_read(e->os, a, sidecarpath(a, e, sid, name), max);
+    if (rd.err != READ_OK) {
+        return {};
+    }
+    return rd.data.data ? rd.data : Str("");
+}
+
+// Write a sidecar, or remove it if data is null, whoever holds the lock.
+static b32 sidecarwrite(Engine *e, Arena scratch, Str sid, Str name, Str data)
+{
+    if (!validsid(sid)) {
+        return 0;
+    }
+    Str path = sidecarpath(&scratch, e, sid, name);
+    if (data.data) {
+        return os_write(e->os, scratch, path, data);
+    }
+    return os_remove(e->os, scratch, path) ||
+           os_stat(e->os, scratch, path).type==STAT_MISSING;
+}
+
+// Write a sidecar, or remove it if data is null, as the holder of the
+// session's lock. Returns why it could not, or null.
+static Str sidecarput(Engine *e, Arena scratch, Str sid, Str name, Str data)
+{
+    Os *os   = e->os;
+    iz  lock = -1;
+    if (heldlock(e, sid) < 0) {
+        Str log = sidecarpath(&scratch, e, sid, "events.jsonl");
+        if (!validsid(sid) || os_stat(os, scratch, log).type!=STAT_FILE) {
+            return "no such session";
+        }
+        lock = os_lockfile(os, scratch, sidecarpath(&scratch, e, sid, "lock"));
+        if (lock < 0) {
+            return "open in another process";
+        }
+    }
+    b32 ok = sidecarwrite(e, scratch, sid, name, data);
+    if (lock >= 0) {
+        os_unlockfile(os, lock);
+    }
+    return ok ? Str{} : Str("cannot write the session's files");
+}
+
+// A session for a command that may name one not open here: open, else
+// revived if parked, else loaded from its log for the command alone
+// (*transient), which the caller forgets once done with it. Null if
+// there is no such session, or it cannot be loaded. One that another
+// process holds is read-only, as open has it.
+static Session *borrow(Engine *e, Arena scratch, Str sid, b32 *transient)
+{
+    *transient = 0;
+    if (!validsid(sid)) {
+        return 0;
+    }
+    i64      first = 0;
+    Session *s     = findsession(e, sid);
+    s = s ? s : revive(e, scratch, sid, {}, {}, &first);
+    if (!s) {
+        s = loadsession(e, scratch, sid, {}, {}, &first, -1);
+        *transient = s != 0;
+    }
+    return s;
+}
+
+// A session found in the state directory (scansessions), as the
+// sessions list shows it.
+struct ListEntry {
+    Str       sid;
+    Str       title;
+    Str       cwd;
+    Str       model;
+    Str       parent;  // a subagent's, else empty
+    i64       mtime;
+    b32       locked;  // open in another process
+    b32       parked;
+    b32       shown;
+    Slice<iz> kids;    // its subagents, oldest first
+};
+
+static b32 listbefore(ListEntry *a, ListEntry *b)
+{
+    return compare(a->sid, b->sid) < 0;
+}
+
+// The sessions in the state directory, by their first records and their
+// sidecars, oldest first, each subagent among its parent's kids. One
+// whose parent is not there, or is itself, has its parent cleared, to
+// show as any other session. Parents may still form a cycle, so a walk
+// down the kids must be bounded.
+struct SessScan {
+    Slice<ListEntry> list;
+    Map<iz>         *bysid;  // index into list
+};
+
+static SessScan scansessions(Engine *e, Arena *a)
+{
+    SessScan r   = {};
+    Str      dir = join(a, e->statedir, "sessions");
+    for (Dirent *d = os_list(e->os, a, dir); d; d = d->next) {
+        if (!d->isdir) continue;
+        Str   sdir = join(a, dir, d->name);
+        Str   path = join(a, sdir, "events.jsonl");
+        Read  rd   = os_readat(e->os, a, path, 0, 4096);
+        Cut   line = cut(rd.data, '\n');
+        EvRec rec  = evparse(a, line.head);
+        if (!line.ok || rec.ev!=EV_SESSION) continue;
+        Session  *s    = findsession(e, d->name);
+        Str       lock = join(a, sdir, "lock");
+        ListEntry en   = {};
+        en.sid    = d->name;
+        en.title  = sidecarget(e, a, d->name, "title", 1024);
+        en.cwd    = jsonstr(jsonget(rec.root, "cwd"));
+        en.model  = jsonstr(jsonget(rec.root, "model"));
+        en.parent = jsonstr(jsonget(rec.root, "parent"));
+        en.mtime  = d->mtime;
+        en.parked = !s && parkedat(e, d->name)>=0;  // its lock is ours
+        en.locked = (!s || s->readonly) && !en.parked &&
+                    os_lockheld(e->os, *a, lock);
+        r.list = push(a, r.list, en);
+    }
+
+    sort(r.list.data, r.list.len, listbefore, *a);
+    for (iz i = 0; i < r.list.len; i++) {
+        *upsert(&r.bysid, r.list[i].sid, a) = i;
+    }
+    for (iz i = 0; i < r.list.len; i++) {
+        Str parent = r.list[i].parent;
+        iz *p      = parent.len ? upsert(&r.bysid, parent, (Arena *)0) : 0;
+        if (p && *p!=i) {
+            r.list[*p].kids = push(a, r.list[*p].kids, i);
+        } else {
+            r.list[i].parent = {};  // shown as any session
+        }
+    }
+    return r;
+}
+
+
 // Commands
 
 static void reply(Engine *e, Arena scratch, i64 id, b32 ok, Str err, Str sid)
@@ -7058,7 +7234,7 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
         }
     }
     if (!s) {
-        if (!sid.len || cut(sid, '/').ok || cut(sid, '\\').ok || sid[0]=='.') {
+        if (!validsid(sid)) {
             reply(e, scratch, id, 0, "invalid session id", {});
             return;
         }
@@ -7351,25 +7527,6 @@ static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     emit(e, evend(&w));
 }
 
-// A session as the sessions list shows it.
-struct ListEntry {
-    Str       sid;
-    Str       title;
-    Str       cwd;
-    Str       model;
-    Str       parent;  // a subagent's, else empty
-    i64       mtime;
-    b32       locked;  // open in another process
-    b32       parked;
-    b32       shown;
-    Slice<iz> kids;    // its subagents, oldest first
-};
-
-static b32 listbefore(ListEntry *a, ListEntry *b)
-{
-    return compare(a->sid, b->sid) < 0;
-}
-
 // An entry, then its subagents under it, each with its depth there.
 static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 depth)
 {
@@ -7407,48 +7564,8 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
 // under its parent, oldest first: in the order a sidebar shows them.
 static void cmdlist(Engine *e, Arena scratch, i64 id)
 {
-    Slice<ListEntry> list = {};
-    Str dir = join(&scratch, e->statedir, "sessions");
-    for (Dirent *d = os_list(e->os, &scratch, dir); d; d = d->next) {
-        if (!d->isdir) continue;
-        Str   sdir = join(&scratch, dir, d->name);
-        Str   path = join(&scratch, sdir, "events.jsonl");
-        Read  rd   = os_readat(e->os, &scratch, path, 0, 4096);
-        Cut   line = cut(rd.data, '\n');
-        EvRec r    = evparse(&scratch, line.head);
-        if (!line.ok || r.ev!=EV_SESSION) continue;
-        Session  *s     = findsession(e, d->name);
-        Str       title = join(&scratch, sdir, "title");
-        Str       lock  = join(&scratch, sdir, "lock");
-        ListEntry en    = {};
-        en.sid    = d->name;
-        en.title  = os_read(e->os, &scratch, title, 1024).data;
-        en.cwd    = jsonstr(jsonget(r.root, "cwd"));
-        en.model  = jsonstr(jsonget(r.root, "model"));
-        en.parent = jsonstr(jsonget(r.root, "parent"));
-        en.mtime  = d->mtime;
-        en.parked = !s && parkedat(e, d->name)>=0;  // its lock is ours
-        en.locked = (!s || s->readonly) && !en.parked &&
-                    os_lockheld(e->os, scratch, lock);
-        list = push(&scratch, list, en);
-    }
-
-    // Each subagent under its parent, if listed
-    sort(list.data, list.len, listbefore, scratch);
-    Map<iz> *bysid = 0;
-    for (iz i = 0; i < list.len; i++) {
-        *upsert(&bysid, list[i].sid, &scratch) = i;
-    }
-    for (iz i = 0; i < list.len; i++) {
-        iz *p = list[i].parent.len ? upsert(&bysid, list[i].parent, (Arena *)0) : 0;
-        if (p && *p!=i) {
-            list[*p].kids = push(&scratch, list[*p].kids, i);
-        } else {
-            list[i].parent = {};  // shown as any session
-        }
-    }
-
-    Buf   b(&scratch, 4096);
+    Slice<ListEntry> list = scansessions(e, &scratch).list;
+    Buf              b(&scratch, 4096);
     EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_SESSIONS);
     putkey(&w.json, "list");
     putarray(&w.json);
@@ -7609,6 +7726,11 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_STEER:
         case CMD_ANSWER:
         case CMD_REWIND:
+        case CMD_RENAME:
+        case CMD_DELETE:
+        case CMD_FORK:
+        case CMD_COMPACT:
+        case CMD_MODEL:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -7616,13 +7738,11 @@ static void command(Engine *e, Arena scratch, Str line)
     switch (cmd) {
     case CMD_HELLO: {
         Arena a = scratch;
-        Buf   b(&a, 256);
+        Buf   b(&a, 1024);
         EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_HELLO);
         putintkey(&w.json, "proto", 0);
         putstrkey(&w.json, "version", PROSPERO_VERSION);
-        putkey(&w.json, "caps");
-        putarray(&w.json);
-        putend(&w.json);
+        putcaps(&w.json, 0);
         emit(e, evend(&w));
         reply(e, scratch, id, 1, {}, {});
     } return;
@@ -7687,6 +7807,19 @@ static void command(Engine *e, Arena scratch, Str line)
         }
         reply(e, scratch, id, 1, {}, {});
         return;
+    case CMD_DELETE:
+    case CMD_ARCHIVE:
+    case CMD_GROUP:
+    case CMD_FORK:
+    case CMD_DRAFT:
+        // Commands on a session's directory, open here or not, which
+        // need not wake one parked
+        if (!validsid(sid)) {
+            reply(e, scratch, id, 0, "invalid session id", {});
+        } else {
+            reply(e, scratch, id, 0, "not implemented yet", sid);
+        }
+        return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});
         return;
@@ -7738,6 +7871,11 @@ static void command(Engine *e, Arena scratch, Str line)
         reply(e, scratch, id, 1, {}, sid);
         jobstop(s, jb, JOBEND_KILLED);  // the agent is told as it ends
     } return;
+    case CMD_RENAME:
+    case CMD_COMPACT:
+    case CMD_MODEL:
+        reply(e, scratch, id, 0, "not implemented yet", sid);
+        return;
     case CMD_PROMPT:
     case CMD_STEER:
         if (!text.len) {
