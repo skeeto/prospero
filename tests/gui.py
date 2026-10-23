@@ -1169,7 +1169,7 @@ def main():
         # The edits, in order: the long value, the theme, the roots, the
         # deleted endpoint with its comment, the new model
         want = before.replace(f"prompt = {LONG_PROMPT}\n", f"prompt = {LONG_PROMPT}!\n")
-        want = want.replace("ask_timeout = 120\n", "ask_timeout = 120\nroots = ~/a; ~/b\n")
+        want = want.replace("temp = ask\n", "temp = ask\nroots = ~/a; ~/b\n")
         want = want.replace(SETTINGS_GONE + "\n", "")
         want += "\n[ui]\ntheme = light\n\n[model fresh]\nreasoning = reasoning_content\n"
         if after != want:
