@@ -142,7 +142,10 @@ and `hide` leaves it out of the transcript (the session log keeps it,
 and the model still gets it back). A file tool that goes outside the session's working directory,
 or the roots the configuration adds, asks first, and an answer not
 given in time denies it. The settings window edits the configuration
-file in place, changing only the lines it sets. Closing the window
+file in place, changing only the lines it sets, with a page for each
+section. Endpoints, models, roles and remotes are added there, and
+deleted, with the comment just above them, when your own file rather
+than an included one defines them. Closing the window
 while turns run asks whether to stop them, or to keep running in the
 background, with a tray icon to bring the window back.
 

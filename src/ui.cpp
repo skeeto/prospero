@@ -2668,7 +2668,113 @@ static void drawshot(Gui *g)
     }
 }
 
+// Fitting a narrow window, which then has nothing to scroll to sideways
+
+// Text cut to width with an ellipsis, then whole in its tooltip, ahead
+// of tip, which is the tooltip otherwise. Color 0 is the text's own.
+// It takes no more width than it is given. Returns 1 if cut.
+static b32 textfit(Arena a, Str s, f32 width, u32 color, Str tip = {})
+{
+    char const *beg = s.cdata;
+    char const *end = s.cdata + s.len;
+    b32         cut = ImGui::CalcTextSize(beg, end).x > width;
+    if (color) {
+        ImGui::PushStyleColor(ImGuiCol_Text, color);
+    }
+    if (!cut) {
+        ImGui::TextUnformatted(beg, end);
+    } else {
+        width = width>1 ? width : 1;
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        f32    h = ImGui::GetTextLineHeight();
+        p.y += ImGui::GetCurrentWindow()->DC.CurrLineTextBaseOffset;
+        ImGui::Dummy(v2(width, h));
+        ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(), p, v2(p.x+width, p.y+h),
+                                  p.x+width, beg, end, 0);
+    }
+    if (color) {
+        ImGui::PopStyleColor();
+    }
+    if (cut || tip.len) {
+        Buf b(&a, s.len + tip.len + 2);
+        if (cut) {
+            print(&b, s);
+            print(&b, tip.len ? Str("\n") : Str(""));
+        }
+        print(&b, tip);
+        ImGui::SetItemTooltip("%s", cstr0(&a, finish(&b)));
+    }
+    return cut;
+}
+
+// Whether an item w wide fits after the last one on its line, then
+// SameLine if it does.
+static b32 samelineif(f32 w)
+{
+    f32 right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+    f32 x     = ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x;
+    if (x+w > right) {
+        return 0;
+    }
+    ImGui::SameLine();
+    return 1;
+}
+
+
 // Hosts
+
+// A configured remote host's line: a dot in the color of its connection,
+// its name and how it is, cut to leave room for Connect or Disconnect,
+// and why it failed. The button's rectangle goes to RECT_* rect, if not
+// negative.
+static void drawremote(Gui *g, Str name, i32 rect)
+{
+    Arena       a       = g->frame;
+    f32         sc      = g->scale;
+    ImGuiStyle &st      = ImGui::GetStyle();
+    i64         nowms   = os_time(g->os);
+    GuiHost    *h       = findhost(g, GH_REMOTE, name);
+    b32         live    = h && h->r && !h->closing;
+    b32         closing = h && h->r && h->closing;
+    i64         left    = h && h->state==RS_DOWN ? countdown(g, h->retryat, nowms) : 0;
+    pushstr(name);
+    ImVec2 p  = ImGui::GetCursorScreenPos();
+    f32    lh = ImGui::GetTextLineHeight();
+    drawdot(ImGui::GetWindowDrawList(), v2(p.x + 4*sc, p.y + lh/2 + st.FramePadding.y),
+            3.5f*sc, h ? hostcolor(g, h) : g->pal->dim);
+    ImGui::Dummy(v2(10*sc, 0));
+    ImGui::SameLine();
+    Buf b(&a, 128);
+    print(&b, h ? hostlabel(g, &a, h) : name);
+    print(&b, ": ");
+    print(&b, h ? hoststatus(g, &a, h, left) : Str("not connected"));
+    char const *label = live ? "Disconnect" : "Connect";
+    f32         bw    = ImGui::CalcTextSize(label).x + 2*st.FramePadding.x;
+    ImGui::AlignTextToFramePadding();
+    textfit(a, finish(&b), ImGui::GetContentRegionAvail().x - bw - st.ItemSpacing.x, 0);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(closing && h->reconnect);
+    b32 click = ImGui::SmallButton(label);
+    ImGui::EndDisabled();
+    if (rect >= 0) {
+        itemrect(g, rect);
+    }
+    ImGui::SetItemTooltip(live ? "Leave it: its sessions run on there" :
+                          closing ? "Connect again once it has let go" :
+                                    "Connect over ssh, starting a host there if none runs");
+    if (click && live) {
+        hostclose(g, h);
+    } else if (click) {
+        remoteconnect(g, a, name);
+    }
+    if (h && h->msg.len && h->state!=RS_UP) {
+        ImGui::PushStyleColor(ImGuiCol_Text, h->state==RS_FAILED ? g->pal->bad : g->pal->amber);
+        ImGui::TextWrapped("%s", cstr0(&a, h->msg));
+        ImGui::PopStyleColor();
+        g->failshown |= h->state == RS_FAILED;
+    }
+    ImGui::PopID();
+}
 
 // This process's engine, the background hosts on this machine, and the
 // remote ones of the configuration: how each is, connecting and leaving
@@ -2716,7 +2822,9 @@ static void drawhosts(Gui *g)
             printage(g, &b, nowms - h->started);
             print(&b, " ago");
         }
-        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+        ImGuiStyle &st = ImGui::GetStyle();
+        f32         bw = ImGui::CalcTextSize("Stop").x + 2*st.FramePadding.x;
+        textfit(a, finish(&b), ImGui::GetContentRegionAvail().x - bw - st.ItemSpacing.x, 0);
         ImGui::SameLine();
         ImGui::BeginDisabled(!h->up);
         if (ImGui::SmallButton("Stop")) {
@@ -2758,58 +2866,27 @@ static void drawhosts(Gui *g)
         ImGui::TextDisabled("None yet: add one below.");
     }
     for (iz n = 0; n < names.len; n++) {
-        GuiHost *h       = findhost(g, GH_REMOTE, names[n]);
-        b32      live    = h && h->r && !h->closing;
-        b32      closing = h && h->r && h->closing;
-        i64      left    = h && h->state==RS_DOWN ? countdown(g, h->retryat, nowms) : 0;
-        ImGui::PushID(cstr0(&a, names[n]));
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        f32    lh = ImGui::GetTextLineHeight();
-        drawdot(ImGui::GetWindowDrawList(), v2(p.x + 4*sc, p.y + lh/2 + ImGui::GetStyle().FramePadding.y),
-                3.5f*sc, h ? hostcolor(g, h) : g->pal->dim);
-        ImGui::Dummy(v2(10*sc, 0));
-        ImGui::SameLine();
-        Buf b(&a, 128);
-        print(&b, h ? hostlabel(g, &a, h) : names[n]);
-        print(&b, ": ");
-        print(&b, h ? hoststatus(g, &a, h, left) : Str("not connected"));
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
-        ImGui::SameLine();
-        ImGui::BeginDisabled(closing && h->reconnect);
-        b32 click = ImGui::SmallButton(live ? "Disconnect" : "Connect");
-        ImGui::EndDisabled();
-        if (n < 2) {
-            itemrect(g, RECT_CONNECT + (i32)n);  // the first two, for the checklist
-        }
-        ImGui::SetItemTooltip(live ? "Leave it: its sessions run on there" :
-                              closing ? "Connect again once it has let go" :
-                                        "Connect over ssh, starting a host there if none runs");
-        if (click && live) {
-            hostclose(g, h);
-        } else if (click) {
-            remoteconnect(g, a, names[n]);
-        }
-        if (h && h->msg.len && h->state!=RS_UP) {
-            ImGui::PushStyleColor(ImGuiCol_Text, h->state==RS_FAILED ? g->pal->bad : g->pal->amber);
-            ImGui::TextWrapped("%s", cstr0(&a, h->msg));
-            ImGui::PopStyleColor();
-            g->failshown |= h->state == RS_FAILED;
-        }
-        ImGui::PopID();
+        // The first two's buttons, for the checklist
+        drawremote(g, names[n], n<2 ? RECT_CONNECT+(i32)n : -1);
     }
 
-    // A new one, which the configuration keeps
+    // A new one, which the configuration keeps: its fields side by side
+    // when they fit, else one above another
     ImGui::SeparatorText("Add a remote host");
-    ImGui::SetNextItemWidth(120*sc);
+    b32 row = ImGui::GetContentRegionAvail().x >= 440*sc;
+    ImGui::SetNextItemWidth(row ? 120*sc : -1);
     ImGui::InputTextWithHint("##remname", "name", g->remname, FIELD_MAX);
     itemrect(g, RECT_REMNAME);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(200*sc);
+    if (row) {
+        ImGui::SameLine();
+    }
+    ImGui::SetNextItemWidth(row ? 200*sc : -1);
     ImGui::InputTextWithHint("##remssh", "ssh destination", g->remssh, FIELD_MAX);
     itemrect(g, RECT_REMSSH);
     ImGui::SetItemTooltip("user@host, or a host from ~/.ssh/config");
-    ImGui::SameLine();
+    if (row) {
+        ImGui::SameLine();
+    }
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##rempath", "prospero there (optional)", g->rempath, FIELD_MAX);
     b32 add = ImGui::Button("Add remote");
@@ -2840,10 +2917,28 @@ static void drawhosts(Gui *g)
         ImGui::TextWrapped("%s", cstr0(&a, g->remstatus));
         ImGui::PopStyleColor();
     }
+    g->hostshscroll = ImGui::GetScrollMaxX();  // for the checklist
+    g->hostsframe   = g->total.frames;
 }
 
 
 // Settings
+//
+// Two panes when the window is wide enough: a list of pages on the left
+// and the page on the right; narrower, the list is a combo above the
+// page. The pages are General's (the top level and each kind of section
+// without names), each named section under its kind with an Add at the
+// end, and Diagnostics. A page is a table of its settings: the key, the
+// value to edit, and where it is set, which goes under the key when the
+// page is narrow. Nothing is drawn wider than the room it has, text cut
+// with an ellipsis and whole in a tooltip instead, so the window never
+// has anything to scroll to sideways.
+
+enum : i32 {
+    CFG_TWOPANE = 480,  // width at scale 1 for the list beside the page
+    CFG_MINVAL  = 160,  // the value column's least, at scale 1, for a
+                        // column of where each is set beside it
+};
 
 // "from prospero.ini:12" from a path and line, or "default", which is
 // "default, empty at prospero.ini:12" when set empty, and "like large,
@@ -2880,17 +2975,31 @@ static Str provenance(Gui *g, Arena *a, CfgRow *r, i64 now)
     return finish(&b);
 }
 
-// A setting's row: its key, its value to edit, where it is set. Enums
-// are picked from their choices; the rest are typed. The checklist's
-// target row records its field's rectangle (RECT_*, or -1 for none).
-static void drawcfgrow(Gui *g, CfgRow *r, i32 target)
+// A setting's row: its key, its value to edit, where it is set, which
+// with wide is a column of its own, else a line under the key. Enums
+// are picked from their choices, paths edited one a line, and the rest
+// typed. The checklist's target row records its field's rectangle
+// (RECT_*, or -1 for none).
+static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
 {
     Arena a = g->frame;
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
-    ImGui::TextUnformatted(cstr0(&a, r->key));
-    ImGui::SetItemTooltip("%s\n(%s, default %s)", cstr0(&a, r->desc), cstr0(&a, r->type),
-                          r->dflt.len ? cstr0(&a, r->dflt) : "none");
+    Buf tb(&a, 128);
+    print(&tb, r->desc);
+    print(&tb, "\n(");
+    print(&tb, r->type);
+    print(&tb, ", default ");
+    print(&tb, r->dflt.len ? r->dflt : Str("none"));
+    putbyte(&tb, ')');
+    f32 cw   = ImGui::GetContentRegionAvail().x;
+    Str from = r->valid ? provenance(g, &a, r, os_time(g->os)) : Str("invalid: default used");
+    u32 fc   = r->valid ? ImGui::GetColorU32(ImGuiCol_TextDisabled) : g->pal->bad;
+    ImGui::AlignTextToFramePadding();
+    textfit(a, r->key, cw, 0, finish(&tb));
+    if (!wide) {
+        textfit(a, from, cw, fc);
+    }
     ImGui::TableNextColumn();
     ImGui::SetNextItemWidth(-1);
     ImGui::PushID(r);
@@ -2926,6 +3035,32 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target)
             r->sentval = clone(&g->cfgmem, pick);
             guiconfigset(g, r->kind, r->name, r->key, pick);
         }
+    } else if (r->type == "paths") {
+        // One a line, as many lines as there are and one more, saved
+        // joined with "; " once the field is left
+        i32 n = 2;
+        for (char *c = r->buf; *c; c++) {
+            n += *c == '\n';
+        }
+        n = n<8 ? n : 8;
+        f32 h = (f32)n*ImGui::GetTextLineHeight() + 2*ImGui::GetStyle().FramePadding.y;
+        ImGui::InputTextMultiline("##v", r->buf, (uz)r->cap, v2(-1, h));
+        if (target >= 0) {
+            itemrect(g, target);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            Str v   = rejoin(&a, {(u8 *)r->buf, (iz)__builtin_strlen(r->buf)}, '\n', "; ");
+            Str was = r->isdflt ? Str{} : rejoin(&a, r->value, ';', "; ");
+            if (v!=was && !(r->sent && v==r->sentval)) {
+                r->sent    = 1;
+                r->sentval = clone(&g->cfgmem, v);
+                guiconfigset(g, r->kind, r->name, r->key, v.len ? v : Str{});
+            }
+        }
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("One directory a line, absolute or in ~; saved as "
+                            "you leave the field");
+        ImGui::PopTextWrapPos();
     } else {
         Str hint  = r->isdflt || r->like.len ? r->value : Str{};
         b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
@@ -2949,20 +3084,606 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target)
         g->reveal = -1;
     }
     ImGui::PopID();
-    ImGui::TableNextColumn();
-    if (!r->valid) {
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
-        ImGui::TextUnformatted("invalid: default used");
-        ImGui::PopStyleColor();
-    } else {
-        Str from = provenance(g, &a, r, os_time(g->os));
-        ImGui::TextDisabled("%s", cstr0(&a, from));
+    if (wide) {
+        ImGui::TableNextColumn();
+        ImGui::AlignTextToFramePadding();
+        textfit(a, from, ImGui::GetContentRegionAvail().x, fc);
     }
+}
+
+// Whether the latest config.get has a section.
+static b32 cfghas(Gui *g, Str kind, Str name)
+{
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        if (g->cfgrows[i].kind==kind && g->cfgrows[i].name==name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Show a section's page, ("", "") for the top level's.
+static void cfgselect(Gui *g, Str kind, Str name)
+{
+    g->cfgdiag = 0;
+    if (kind==g->cfgpkind && name==g->cfgpname) {
+        return;
+    } else if (kind.len+name.len > FIELD_MAX) {
+        kind = name = {};
+    }
+    copybytes(g->cfgpbuf, kind.data, kind.len);
+    copybytes(g->cfgpbuf+kind.len, name.data, name.len);
+    g->cfgpkind = {g->cfgpbuf, kind.len};
+    g->cfgpname = {g->cfgpbuf+kind.len, name.len};
+}
+
+// A kind of section as the page list names it: the top level is
+// Defaults, [ui] Interface, and others their own, capitalized, and with
+// plural for a group of named ones.
+static Str cfgkindlabel(Arena *a, Str kind, b32 plural)
+{
+    if (!kind.len) {
+        return "Defaults";
+    } else if (kind=="ui" && !plural) {
+        return "Interface";
+    }
+    Buf b(a, kind.len + 2);
+    putbyte(&b, kind[0]>='a' && kind[0]<='z' ? (u8)(kind[0] - 'a' + 'A') : kind[0]);
+    print(&b, cuthead(kind, 1));
+    print(&b, plural ? Str("s") : Str(""));
+    return finish(&b);
+}
+
+// What a page is called for the checklist and in the combo: "endpoint
+// local" for a named section, else its kind, "" for the top level.
+static Str cfgpagekey(Arena *a, Str kind, Str name)
+{
+    return name.len ? concat(a, concat(a, kind, " "), name) : kind;
+}
+
+// One page in the list: selected on a click. In the combo its label is
+// whole, the popup as wide as it needs; in the list it is cut to fit,
+// whole in its tooltip then. Its rectangle goes to rect, if not null.
+static b32 cfgitem(Gui *g, b32 combo, Str label, b32 selected, Str tip,
+                   u32 color, Rect *rect)
+{
+    Arena a     = g->frame;
+    b32   click = 0;
+    if (color) {
+        ImGui::PushStyleColor(ImGuiCol_Text, color);
+    }
+    if (combo) {
+        click = ImGui::Selectable(cstr0(&a, label), selected);
+        if (tip.len) {
+            ImGui::SetItemTooltip("%s", cstr0(&a, tip));
+        }
+    } else {
+        // The label drawn over an unlabeled row, which is no wider than
+        // the list
+        ImVec2      p   = ImGui::GetCursorScreenPos();
+        f32         w   = ImGui::GetContentRegionAvail().x;
+        char const *beg = label.cdata;
+        char const *end = label.cdata + label.len;
+        b32         cut = ImGui::CalcTextSize(beg, end).x > w;
+        click = ImGui::Selectable("##page", selected);
+        f32 h = ImGui::GetTextLineHeight();
+        ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(), p, v2(p.x+w, p.y+h), p.x+w,
+                                  beg, end, 0);
+        if (cut || tip.len) {
+            Str t = cut && tip.len ? concat(&a, concat(&a, label, "\n"), tip) :
+                    cut ? label : tip;
+            ImGui::SetItemTooltip("%s", cstr0(&a, t));
+        }
+    }
+    if (color) {
+        ImGui::PopStyleColor();
+    }
+    if (rect) {
+        ImVec2 mn = ImGui::GetItemRectMin();
+        ImVec2 mx = ImGui::GetItemRectMax();
+        *rect = {mn.x, mn.y, mx.x, mx.y};
+    }
+    return click;
+}
+
+// After an item of the list: scroll to it if it is the page selected
+// other than from the list (cfgshowsel), or if the checklist is about to
+// click it (key as cfgpagekey, or "add KIND"). Not in a list's first
+// frame, whose places are not settled.
+static void cfgreveal(Gui *g, Str key, b32 sel)
+{
+    b32 aim = g->showpage.data && key==g->showpage;
+    if (!(sel && g->cfgshowsel) && !aim) {
+        return;
+    }
+    scheddirty(&g->sched);  // scrolled in the next frame, or then begun
+    if (!ImGui::IsWindowAppearing()) {
+        ImGui::ScrollToItem();
+        g->cfgshowsel &= !sel;
+        g->showpage    = aim ? Str{} : g->showpage;
+    }
+}
+
+static void cfgheading(Gui *g, b32 combo, Str label)
+{
+    Arena a = g->frame;
+    ImGui::Spacing();
+    textfit(a, label, combo ? 1e6f : ImGui::GetContentRegionAvail().x,
+            ImGui::GetColorU32(ImGuiCol_TextDisabled));
+}
+
+// The list of pages, in the list beside the page or in the combo above
+// it: General's, each named kind's sections and its Add, Diagnostics.
+static void drawcfglist(Gui *g, b32 combo)
+{
+    Arena a     = g->frame;
+    f32   sc    = g->scale;
+    Json *kinds = jsonget(g->cfg, "kinds");
+    cfgheading(g, combo, "General");
+    ImGui::Indent(8*sc);
+    for (Json *k = kinds->child; k; k = k->next) {
+        Str kind = jsonstr(jsonget(k, "kind"));
+        if (jsonint(jsonget(k, "named"), 0)) {
+            continue;
+        }
+        // The first row's, for the checklist's aim
+        CfgRow *first = 0;
+        for (iz i = 0; !first && i < g->cfgrows.len; i++) {
+            first = g->cfgrows[i].kind==kind ? &g->cfgrows[i] : 0;
+        }
+        b32 sel = !g->cfgdiag && g->cfgpkind==kind && !g->cfgpname.len;
+        Str tip = jsonstr(jsonget(k, "desc"));
+        pushstr(kind);
+        if (cfgitem(g, combo, cfgkindlabel(&a, kind, 0), sel, tip, 0, first ? &first->page : 0)) {
+            cfgselect(g, kind, "");
+        }
+        cfgreveal(g, kind, sel);
+        ImGui::PopID();
+    }
+    ImGui::Unindent(8*sc);
+
+    i32 group = 0;  // named kinds so far
+    for (Json *k = kinds->child; k; k = k->next) {
+        Str kind = jsonstr(jsonget(k, "kind"));
+        if (!jsonint(jsonget(k, "named"), 0)) {
+            continue;
+        }
+        cfgheading(g, combo, cfgkindlabel(&a, kind, 1));
+        ImGui::Indent(8*sc);
+        pushstr(kind);
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            // A section's rows come together: the first of each
+            CfgRow *r    = &g->cfgrows[i];
+            CfgRow *prev = i ? &g->cfgrows[i-1] : 0;
+            if (r->kind!=kind || (prev && prev->kind==kind && prev->name==r->name)) {
+                continue;
+            }
+            b32 sel = !g->cfgdiag && g->cfgpkind==kind && g->cfgpname==r->name;
+            pushstr(r->name);
+            if (cfgitem(g, combo, r->name, sel, {}, 0, &r->page)) {
+                cfgselect(g, kind, r->name);
+            }
+            cfgreveal(g, cfgpagekey(&a, kind, r->name), sel);
+            ImGui::PopID();
+        }
+        Buf ab(&a, 64);
+        print(&ab, "Add ");
+        print(&ab, kind);
+        print(&ab, "...");
+        Rect at  = {};
+        b32  add = cfgitem(g, combo, finish(&ab), 0, jsonstr(jsonget(k, "desc")),
+                           ImGui::GetColorU32(ImGuiCol_TextDisabled), &at);
+        if (group < 4) {
+            g->rects[RECT_ADDOPEN+group] = at;
+        }
+        cfgreveal(g, concat(&a, "add ", kind), 0);
+        if (add) {
+            g->addkind = clone(&g->perm, kind);
+            g->openadd = 1;
+        }
+        ImGui::PopID();
+        ImGui::Unindent(8*sc);
+        group++;
+    }
+
+    // Diagnostics, colored as the worst of them
+    Json *diags = jsonget(g->cfg, "diags");
+    u32   color = 0;
+    for (Json *d = diags->child; d; d = d->next) {
+        b32 bad = jsonstr(jsonget(d, "severity")) == "error";
+        color = bad || color==g->pal->bad ? g->pal->bad : g->pal->amber;
+    }
+    ImGui::Spacing();
+    Buf db(&a, 32);
+    print(&db, "Diagnostics");
+    if (jsonlen(diags)) {
+        print(&db, " (");
+        print(&db, jsonlen(diags));
+        putbyte(&db, ')');
+    }
+    Rect at = {};
+    if (cfgitem(g, combo, finish(&db), g->cfgdiag, "Problems found in the files, "
+                "with where each is", color, &at)) {
+        g->cfgdiag = 1;
+    }
+    g->rects[RECT_DIAGPAGE] = at;
+}
+
+// Where a section is defined: its first header, or with own its first
+// in the user's own file; null if none.
+static CfgHead *cfghead(Gui *g, Str kind, Str name, b32 own)
+{
+    CfgHead *r = 0;
+    for (iz i = 0; i < g->cfgheads.len; i++) {
+        CfgHead *h = &g->cfgheads[i];
+        if (h->kind==kind && h->name==name && (!r || (own && h->own && !r->own))) {
+            r = h;
+        }
+    }
+    return r && (!own || r->own) ? r : 0;
+}
+
+// A section as a file has it: "[kind name]".
+static Str cfgtitle(Arena *a, Str kind, Str name)
+{
+    Buf b(a, kind.len + name.len + 4);
+    putbyte(&b, '[');
+    print(&b, kind);
+    if (name.len) {
+        putbyte(&b, ' ');
+        print(&b, name);
+    }
+    putbyte(&b, ']');
+    return finish(&b);
+}
+
+// The settings of one section, in a table: three columns when the
+// value has room beside the others, else two, with where each is set
+// under its key.
+static void drawcfgtable(Gui *g, Str kind, Str name)
+{
+    // As if without a scrollbar, so that pages long and short agree
+    f32          sc    = g->scale;
+    ImGuiWindow *w     = ImGui::GetCurrentWindow();
+    f32          avail = ImGui::GetContentRegionAvail().x;
+    f32          room  = avail + (w->ScrollbarY ? ImGui::GetStyle().ScrollbarSize : 0);
+    f32          keyw  = ImGui::CalcTextSize("first_byte_timeout").x;
+    f32          fromw = ImGui::CalcTextSize("from prospero.ini:999").x;
+    b32          wide  = room >= keyw + fromw + (f32)CFG_MINVAL*sc;
+    if (!wide) {
+        // Where each is set goes under its key: room for the usual
+        keyw = keyw>fromw ? keyw : fromw;
+        keyw = keyw<avail*0.45f ? keyw : avail*0.45f;
+    }
+    if (!ImGui::BeginTable("##t", wide ? 3 : 2, ImGuiTableFlags_RowBg)) {
+        return;
+    }
+    ImGui::TableSetupColumn("key", ImGuiTableColumnFlags_WidthFixed, keyw);
+    ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+    if (wide) {
+        ImGui::TableSetupColumn("from", ImGuiTableColumnFlags_WidthFixed, fromw);
+    }
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind!=kind || r->name!=name) {
+            continue;
+        }
+        i32 target = -1;
+        if (kind=="endpoint" && r->key=="idle_timeout") {
+            target = RECT_SETTING;
+        } else if (kind=="ui" && r->key=="theme") {
+            target = RECT_THEMECOMBO;
+        } else if (kind=="guard" && r->key=="roots") {
+            target = RECT_ROOTS;
+        } else if (r->value.len >= FIELD_MAX) {
+            target = RECT_LONGFIELD;  // more than the slack
+        }
+        drawcfgrow(g, r, target, wide);
+    }
+    ImGui::EndTable();
+}
+
+// A model's chat template argument: a name and a value, side by side
+// when they fit, else one above the other.
+static void drawcfgtemplate(Gui *g, Str model)
+{
+    Arena       a  = g->frame;
+    f32         sc = g->scale;
+    ImGuiStyle &st = ImGui::GetStyle();
+    ImGui::Spacing();
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("Set a chat template argument, sent in chat_template_kwargs:");
+    ImGui::PopTextWrapPos();
+    f32 avail = ImGui::GetContentRegionAvail().x;
+    f32 bw    = ImGui::CalcTextSize("Set").x + 2*st.FramePadding.x;
+    b32 row   = avail >= 280*sc + bw;
+    f32 fw    = row ? (avail - bw - 2*st.ItemSpacing.x)/2 : -1;
+    ImGui::SetNextItemWidth(fw);
+    ImGui::InputTextWithHint("##tplname", "template.NAME", g->tplname, FIELD_MAX);
+    if (row) {
+        ImGui::SameLine();
+    }
+    ImGui::SetNextItemWidth(fw);
+    ImGui::InputTextWithHint("##tplval", "value", g->tplval, FIELD_MAX);
+    if (row) {
+        ImGui::SameLine();
+    }
+    b32 set = ImGui::Button("Set");
+    ImGui::SetItemTooltip("Sent in chat_template_kwargs: true and false as booleans, "
+                          "numbers as numbers, the rest, or anything in quotes, as a "
+                          "string; empty removes what the model inherits");
+    if (set) {
+        Str name = trim({(u8 *)g->tplname, (iz)__builtin_strlen(g->tplname)});
+        Str val  = trim({(u8 *)g->tplval, (iz)__builtin_strlen(g->tplval)});
+        Str key  = startswith(name, "template.") ? name : concat(&a, "template.", name);
+        if (!name.len) {
+            g->cfgstatus = "A template argument needs a name";
+            g->cfgok     = 0;
+        } else {
+            guiconfigset(g, "model", model, key, val.len ? val : Str(""));
+            g->tplname[0] = g->tplval[0] = 0;
+        }
+    }
+}
+
+static void drawcfgdiags(Gui *g)
+{
+    Arena a     = g->frame;
+    Json *diags = jsonget(g->cfg, "diags");
+    ImGui::TextUnformatted("Diagnostics");
+    ImGui::PushTextWrapPos(0);
+    if (!jsonlen(diags)) {
+        ImGui::TextDisabled("None: every line of every file was understood.");
+    }
+    for (Json *d = diags->child; d; d = d->next) {
+        Str sev = jsonstr(jsonget(d, "severity"));
+        Buf b(&a, 256);
+        print(&b, jsonstr(jsonget(d, "file")));
+        putbyte(&b, ':');
+        print(&b, jsonint(jsonget(d, "line"), 0));
+        putbyte(&b, ':');
+        print(&b, jsonint(jsonget(d, "col"), 0));
+        print(&b, ": ");
+        print(&b, sev);
+        print(&b, ": ");
+        print(&b, jsonstr(jsonget(d, "message")));
+        ImGui::PushStyleColor(ImGuiCol_Text, sev=="error" ? g->pal->bad : g->pal->amber);
+        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopTextWrapPos();
+}
+
+// The page shown: its section's name and what it is for, Delete for a
+// named one of the user's own file, Connect for a remote, its settings,
+// and a model's template argument.
+static void drawcfgpage(Gui *g)
+{
+    Arena       a  = g->frame;
+    ImGuiStyle &st = ImGui::GetStyle();
+    if (g->cfgdiag) {
+        drawcfgdiags(g);
+        return;
+    }
+    Str   kind  = g->cfgpkind;
+    Str   name  = g->cfgpname;
+    Json *k     = 0;
+    for (Json *e = jsonget(g->cfg, "kinds")->child; e; e = e->next) {
+        k = jsonstr(jsonget(e, "kind"))==kind ? e : k;
+    }
+    b32 named = jsonint(jsonget(k, "named"), 0) != 0;
+    Str title = kind.len ? cfgtitle(&a, kind, name) : Str("Before any section");
+
+    if (!named) {
+        textfit(a, title, ImGui::GetContentRegionAvail().x, 0);
+    } else {
+        // Delete on the title's line when both fit, else under it
+        CfgHead *own   = cfghead(g, kind, name, 1);
+        CfgHead *any   = cfghead(g, kind, name, 0);
+        b32      other = 0;  // an include defines it too
+        for (iz i = 0; i < g->cfgheads.len; i++) {
+            CfgHead *h = &g->cfgheads[i];
+            other |= h->kind==kind && h->name==name && !h->own;
+        }
+        Str      label = "Delete...";
+        f32      bw    = ImGui::CalcTextSize(label.cdata).x + 2*st.FramePadding.x;
+        f32      avail = ImGui::GetContentRegionAvail().x;
+        f32      tw    = ImGui::CalcTextSize(title.cdata, title.cdata+title.len).x;
+        ImGui::AlignTextToFramePadding();
+        if (tw + st.ItemSpacing.x + bw <= avail) {
+            text(title);
+            ImGui::SameLine(0, avail - tw - bw);
+        } else {
+            ImGui::PushTextWrapPos(0);
+            text(title);
+            ImGui::PopTextWrapPos();
+        }
+        Buf why(&a, 256);
+        if (any && !own) {
+            print(&why, "Defined in ");
+            print(&why, any->file);
+            putbyte(&why, ':');
+            print(&why, any->line);
+            print(&why, ", an included file: settings edit only your own "
+                        "file, so delete it there");
+        } else if (!any) {
+            print(&why, "Not in any file yet");
+        }
+        ImGui::BeginDisabled(why.len > 0);
+        b32 del = ImGui::Button(label.cdata);
+        ImGui::EndDisabled();
+        itemrect(g, RECT_DELETE);
+        if (why.len) {
+            ImGui::SetItemTooltip("%s", cstr0(&a, finish(&why)));
+        } else {
+            Buf tb(&a, 256);
+            print(&tb, "Delete ");
+            print(&tb, title);
+            print(&tb, " from ");
+            print(&tb, basename(own->file));
+            print(&tb, ", with the comment just above it");
+            if (other) {
+                print(&tb, "; an included file defines it too, which stays");
+            }
+            ImGui::SetItemTooltip("%s", cstr0(&a, finish(&tb)));
+        }
+        if (del) {
+            g->opendel = 1;
+        }
+    }
+    Str desc = jsonstr(jsonget(k, "desc"));
+    if (desc.len) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("%s", cstr0(&a, desc));
+        ImGui::PopTextWrapPos();
+    }
+    if (kind == "remote") {
+        drawremote(g, name, RECT_PAGECONNECT);
+    }
+    ImGui::Spacing();
+    if (named && !cfghas(g, kind, name)) {
+        ImGui::TextDisabled("Loading...");
+        return;
+    }
+    drawcfgtable(g, kind, name);
+    if (kind == "model") {
+        drawcfgtemplate(g, name);
+    }
+}
+
+// The kind of section's first key, which a new one is written with: a
+// remote's ssh is an alias of its name.
+static void cfgseed(Str kind, Str name, Str *key, Str *val)
+{
+    *key = kind=="endpoint" ? Str("url") :
+           kind=="model"    ? Str("reasoning") :
+           kind=="remote"   ? Str("ssh") : Str("tools");
+    *val = kind=="endpoint" ? Str("http://localhost/") :
+           kind=="model"    ? Str("reasoning_content") :
+           kind=="remote"   ? name : Str("read write edit shell");
+}
+
+// A new named section: its name, then its page.
+static void drawcfgadd(Gui *g)
+{
+    Arena a  = g->frame;
+    f32   sc = g->scale;
+    if (g->openadd) {
+        ImGui::OpenPopup("New section");
+        g->openadd    = 0;
+        g->addname[0] = 0;
+        g->adderr     = {};
+    }
+    ImGui::SetNextWindowSize(v2(380*sc, 0));
+    if (!ImGui::BeginPopupModal("New section", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    Str kind = g->addkind;
+    Str key  = {};
+    Str val  = {};
+    cfgseed(kind, "NAME", &key, &val);
+    ImGui::PushTextWrapPos(0);
+    ImGui::Text("A new [%s NAME] section, which starts as %s = %s:",
+                cstr0(&a, kind), cstr0(&a, key), cstr0(&a, val));
+    ImGui::PopTextWrapPos();
+    if (ImGui::IsWindowAppearing()) {
+        ImGui::SetKeyboardFocusHere();
+    }
+    ImGui::SetNextItemWidth(-1);
+    b32 enter = ImGui::InputTextWithHint("##addname", "NAME", g->addname, FIELD_MAX,
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+    itemrect(g, RECT_ADDNAME);
+    if (g->adderr.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextWrapped("%s", cstr0(&a, g->adderr));
+        ImGui::PopStyleColor();
+    }
+    ImGui::Spacing();
+    b32 add = ImGui::Button("Add", v2(120*sc, 0));
+    itemrect(g, RECT_ADDBTN);
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", v2(120*sc, 0))) {
+        ImGui::CloseCurrentPopup();
+    }
+    if (add || enter) {
+        Str name = trim({(u8 *)g->addname, (iz)__builtin_strlen(g->addname)});
+        if (!name.len) {
+            g->adderr = "A section needs a name";
+        } else if (!iniword(name, 0)) {
+            g->adderr = "A name is one word, without [ or ]";
+        } else if (cfghas(g, kind, name)) {
+            // Its first key would be overwritten: leave it be, and show it
+            Buf eb(&a, 128);
+            print(&eb, cfgtitle(&a, kind, name));
+            print(&eb, " already exists");
+            g->cfgstatus = clone(&g->perm, finish(&eb));
+            g->cfgok     = 0;
+            cfgselect(g, kind, name);
+            g->cfgshowsel = 1;
+            ImGui::CloseCurrentPopup();
+        } else {
+            cfgseed(kind, name, &key, &val);
+            guiconfigset(g, kind, name, key, val);
+            cfgselect(g, kind, name);
+            g->cfgshowsel = 1;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::EndPopup();
+}
+
+// Before deleting the page's section: what goes, from where.
+static void drawcfgdel(Gui *g)
+{
+    Arena a  = g->frame;
+    f32   sc = g->scale;
+    if (g->opendel) {
+        ImGui::OpenPopup("Delete section?");
+        g->opendel = 0;
+    }
+    ImGui::SetNextWindowSize(v2(420*sc, 0));
+    if (!ImGui::BeginPopupModal("Delete section?", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    Str      kind  = g->cfgpkind;
+    Str      name  = g->cfgpname;
+    CfgHead *own   = cfghead(g, kind, name, 1);
+    b32      other = 0;
+    for (iz i = 0; i < g->cfgheads.len; i++) {
+        CfgHead *h = &g->cfgheads[i];
+        other |= h->kind==kind && h->name==name && !h->own;
+    }
+    ImGui::PushTextWrapPos(0);
+    ImGui::Text("Delete %s from %s?", cstr0(&a, cfgtitle(&a, kind, name)),
+                own ? cstr0(&a, basename(own->file)) : "your file");
+    ImGui::TextDisabled("Its settings go, and the comment just above its header. "
+                        "Sessions using it keep the settings they have.");
+    if (other) {
+        ImGui::TextDisabled("An included file defines it too, which stays.");
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    ImGui::BeginDisabled(!own || g->cfgdelid);
+    b32 go = ImGui::Button("Delete", v2(120*sc, 0));
+    itemrect(g, RECT_DELOK);
+    ImGui::EndDisabled();
+    if (go) {
+        guiconfigdelete(g, kind, name);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0));
+    itemrect(g, RECT_DELCANCEL);
+    if (cancel) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 static void drawsettings(Gui *g)
 {
-    Arena a = g->frame;
+    Arena a  = g->frame;
+    f32   sc = g->scale;
     if (g->enginekind == ENGINE_FAKE) {
         ImGui::TextDisabled("No engine: the fake agent has no settings.");
         return;
@@ -2985,9 +3706,10 @@ static void drawsettings(Gui *g)
     i32 urls = (i32)jsonlen(jsonget(j, "includes"));
     if (urls) {
         // Fetching each URL include again, which the reply waits for
-        ImGui::SameLine();
+        char const *label = g->cfgrefresh ? "Fetching..." : "Refresh includes";
+        samelineif(ImGui::CalcTextSize(label).x + 2*ImGui::GetStyle().FramePadding.x);
         ImGui::BeginDisabled(g->cfgrefresh != 0);
-        b32 refresh = ImGui::SmallButton(g->cfgrefresh ? "Fetching..." : "Refresh includes");
+        b32 refresh = ImGui::SmallButton(label);
         itemrect(g, RECT_REFRESHINC);
         ImGui::EndDisabled();
         ImGui::SetItemTooltip("Fetch the %d URL include%s again, rather than wait for the "
@@ -2997,181 +3719,74 @@ static void drawsettings(Gui *g)
             guiconfigget(g, 1);
         }
     }
+    i32 ndiags = (i32)jsonlen(jsonget(j, "diags"));
+    if (ndiags && !g->cfgdiag) {
+        // Whatever the page, a way to the problems in the files
+        Buf db(&a, 32);
+        print(&db, ndiags);
+        print(&db, ndiags==1 ? Str(" diagnostic") : Str(" diagnostics"));
+        Str label = finish(&db);
+        samelineif(ImGui::CalcTextSize(label.cdata, label.cdata+label.len).x +
+                   2*ImGui::GetStyle().FramePadding.x);
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+        if (ImGui::SmallButton(cstr0(&a, label))) {
+            g->cfgdiag = 1;
+        }
+        ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("Show the problems found in the files, with where each is");
+    }
     if (g->cfgstatus.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->cfgok ? g->pal->ok : g->pal->bad);
         ImGui::TextWrapped("%s", cstr0(&a, g->cfgstatus));
         ImGui::PopStyleColor();
     }
 
-    // Diagnostics, with where each is
-    Json *diags = jsonget(j, "diags");
-    if (jsonlen(diags) && ImGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_DefaultOpen)) {
-        for (Json *d = diags->child; d; d = d->next) {
-            Str sev  = jsonstr(jsonget(d, "severity"));
-            Buf b(&a, 256);
-            print(&b, jsonstr(jsonget(d, "file")));
-            putbyte(&b, ':');
-            print(&b, jsonint(jsonget(d, "line"), 0));
-            putbyte(&b, ':');
-            print(&b, jsonint(jsonget(d, "col"), 0));
-            print(&b, ": ");
-            print(&b, sev);
-            print(&b, ": ");
-            print(&b, jsonstr(jsonget(d, "message")));
-            ImGui::PushStyleColor(ImGuiCol_Text, sev=="error" ? g->pal->bad : g->pal->amber);
-            ImGui::TextWrapped("%s", cstr0(&a, finish(&b)));
-            ImGui::PopStyleColor();
-        }
+    // A named section's page gone, deleted or never added, gives way to
+    // the first page once nothing is in flight that would bring it
+    if (!g->cfgdiag && g->cfgpname.len && !cfghas(g, g->cfgpkind, g->cfgpname) &&
+            !g->cfgset && !g->cfgget) {
+        cfgselect(g, "", "");
+        g->cfgshowsel = 1;
     }
 
-    // A section per kind, a table per section
-    b32 first = 1;  // the first endpoint's idle_timeout is the checklist's
-    for (Json *k = jsonget(j, "kinds")->child; k; k = k->next) {
-        Str kind  = jsonstr(jsonget(k, "kind"));
-        b32 named = jsonint(jsonget(k, "named"), 0) != 0;
-        Str desc  = jsonstr(jsonget(k, "desc"));
-        Buf hb(&a, 128);
-        print(&hb, kind.len ? kind : Str("general"));
-        print(&hb, ": ");
-        print(&hb, desc);
-        ImGui::PushID(cstr0(&a, kind));
-        if (!ImGui::CollapsingHeader(cstr0(&a, finish(&hb)), ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::PopID();
-            continue;
+    f32 hs = 0;  // room to scroll sideways, for the checklist
+    f32 w  = ImGui::GetContentRegionAvail().x;
+    g->cfgtwopane = w >= (f32)CFG_TWOPANE*sc;
+    g->cfgcombo   = 0;
+    if (g->cfgtwopane) {
+        f32 lw = w*0.3f;
+        lw = lw<130*sc ? 130*sc : lw>220*sc ? 220*sc : lw;
+        if (ImGui::BeginChild("##pages", v2(lw, 0), ImGuiChildFlags_Borders)) {
+            drawcfglist(g, 0);
+            hs = ImGui::GetScrollMaxX();
         }
-        // Each section's rows, in order of first appearance
-        Slice<Str> names = {};
-        for (iz i = 0; i < g->cfgrows.len; i++) {
-            CfgRow *r = &g->cfgrows[i];
-            b32 seen = r->kind != kind;
-            for (iz n = 0; !seen && n < names.len; n++) {
-                seen = names[n] == r->name;
-            }
-            if (!seen) {
-                names = push(&a, names, r->name);
-            }
+        ImGui::EndChild();
+        ImGui::SameLine();
+    } else {
+        Str    key  = cfgpagekey(&a, g->cfgpkind, g->cfgpname);
+        Str    show = g->cfgdiag ? Str("Diagnostics") :
+                      g->cfgpname.len ? key : cfgkindlabel(&a, g->cfgpkind, 0);
+        ImVec2 at   = ImGui::GetCursorScreenPos();
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##pages", cstr0(&a, show), ImGuiComboFlags_HeightLarge)) {
+            g->cfgcombo = 1;
+            drawcfglist(g, 1);
+            ImGui::EndCombo();
         }
-        for (iz n = 0; n < names.len; n++) {
-            if (named) {
-                Buf sb(&a, 64);
-                putbyte(&sb, '[');
-                print(&sb, kind);
-                putbyte(&sb, ' ');
-                print(&sb, names[n]);
-                putbyte(&sb, ']');
-                ImGui::TextUnformatted(cstr0(&a, finish(&sb)));
-            }
-            ImGui::PushID(cstr0(&a, names[n]));
-            ImGuiTableFlags tf = ImGuiTableFlags_RowBg;
-            if (ImGui::BeginTable("##t", 3, tf)) {
-                // Keys and provenance as wide as they need, the rest for
-                // values
-                f32 keyw  = ImGui::CalcTextSize("first_byte_timeout").x;
-                f32 fromw = ImGui::CalcTextSize("from prospero.ini:999").x;
-                ImGui::TableSetupColumn("key", ImGuiTableColumnFlags_WidthFixed, keyw);
-                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("from", ImGuiTableColumnFlags_WidthFixed, fromw);
-                for (iz i = 0; i < g->cfgrows.len; i++) {
-                    CfgRow *r = &g->cfgrows[i];
-                    if (r->kind==kind && r->name==names[n]) {
-                        i32 target = -1;
-                        if (first && kind=="endpoint" && r->key=="idle_timeout") {
-                            target = RECT_SETTING;
-                        } else if (kind=="ui" && r->key=="theme") {
-                            target = RECT_THEMECOMBO;
-                        } else if (r->value.len >= FIELD_MAX) {
-                            target = RECT_LONGFIELD;  // more than the slack
-                        }
-                        drawcfgrow(g, r, target);
-                    }
-                }
-                ImGui::EndTable();
-            }
-            ImGui::PopID();
-            first &= kind != "endpoint";
-        }
-        if (named) {
-            // A new section: named, with its first key set
-            ImGui::SetNextItemWidth(160*g->scale);
-            ImGui::InputTextWithHint("##add", "name", g->addname, FIELD_MAX);
-            if (kind == "endpoint") {
-                itemrect(g, RECT_ADDNAME);
-                if (g->reveal == RECT_ADDNAME) {
-                    ImGui::SetScrollHereY(0.5f);  // for the checklist
-                    g->reveal = -1;
-                }
-            }
-            ImGui::SameLine();
-            Buf ab(&a, 64);
-            print(&ab, "Add ");
-            print(&ab, kind);
-            b32 add = ImGui::Button(cstr0(&a, finish(&ab)));
-            if (kind == "endpoint") {
-                itemrect(g, RECT_ADDBTN);
-            }
-            if (add) {
-                Str name = trim({(u8 *)g->addname, (iz)__builtin_strlen(g->addname)});
-                // Its first key: a remote's ssh is an alias of its name
-                Str key  = kind=="endpoint" ? Str("url") :
-                           kind=="model"    ? Str("reasoning") :
-                           kind=="remote"   ? Str("ssh") : Str("tools");
-                Str val  = kind=="endpoint" ? Str("http://localhost/") :
-                           kind=="model"    ? Str("reasoning_content") :
-                           kind=="remote"   ? name : Str("read write edit shell");
-                b32 exists = 0;
-                for (iz i = 0; i < names.len; i++) {
-                    exists |= names[i] == name;
-                }
-                if (exists) {
-                    // Its first key would be overwritten: leave it be
-                    Buf eb(&a, 128);
-                    print(&eb, "[");
-                    print(&eb, kind);
-                    putbyte(&eb, ' ');
-                    print(&eb, name);
-                    print(&eb, "] already exists");
-                    g->cfgstatus = clone(&g->perm, finish(&eb));
-                    g->cfgok     = 0;
-                } else if (name.len) {
-                    guiconfigset(g, kind, name, key, val);
-                    g->addname[0] = 0;
-                }
-            }
-        }
-        if (kind == "model") {
-            // A template argument, whose names are the template's own
-            f32 sc = g->scale;
-            ImGui::SetNextItemWidth(120*sc);
-            ImGui::InputTextWithHint("##tplmodel", "model", g->tplmodel, FIELD_MAX);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(160*sc);
-            ImGui::InputTextWithHint("##tplname", "template.NAME", g->tplname, FIELD_MAX);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(120*sc);
-            ImGui::InputTextWithHint("##tplval", "value", g->tplval, FIELD_MAX);
-            ImGui::SameLine();
-            b32 set = ImGui::Button("Set template argument");
-            ImGui::SetItemTooltip("Sent in chat_template_kwargs: true and false as booleans, "
-                                  "numbers as numbers, the rest, or anything in quotes, as a "
-                                  "string; empty removes what the model inherits");
-            if (set) {
-                Str model = trim({(u8 *)g->tplmodel, (iz)__builtin_strlen(g->tplmodel)});
-                Str name  = trim({(u8 *)g->tplname, (iz)__builtin_strlen(g->tplname)});
-                Str val   = trim({(u8 *)g->tplval, (iz)__builtin_strlen(g->tplval)});
-                Str key   = startswith(name, "template.") ? name : concat(&a, "template.", name);
-                if (!model.len || !name.len) {
-                    g->cfgstatus = "A template argument needs a model and a name";
-                    g->cfgok     = 0;
-                } else {
-                    guiconfigset(g, kind, model, key, val.len ? val : Str(""));
-                    g->tplname[0] = g->tplval[0] = 0;
-                }
-            }
-        }
-        ImGui::PopID();
+        g->rects[RECT_PAGECOMBO] = {at.x, at.y, at.x+w, at.y+ImGui::GetFrameHeight()};
     }
+    if (ImGui::BeginChild("##page", v2(0, 0))) {
+        drawcfgpage(g);
+        f32 m = ImGui::GetScrollMaxX();
+        hs = hs>m ? hs : m;
+    }
+    ImGui::EndChild();
+    drawcfgadd(g);
+    drawcfgdel(g);
+    f32 m = ImGui::GetScrollMaxX();
+    g->cfghscroll = hs>m ? hs : m;
+    g->cfgframe   = g->total.frames;
 }
-
 
 // Metrics overlay and log
 

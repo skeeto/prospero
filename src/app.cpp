@@ -190,6 +190,17 @@ enum : i32 {
     RECT_THUMB,      // the latest screenshot's thumbnail drawn
     RECT_SHOTCLOSE,  // the Screenshot window's Close
     RECT_REFRESHINC, // the settings window's Refresh includes
+    RECT_PAGECOMBO,  // its pages as a combo, when narrow
+    RECT_DIAGPAGE,   // its Diagnostics page in the list
+    RECT_ADDOPEN,    // its Add for each named kind, in order: endpoint,
+    RECT_ADDOPEN1,   // model, role, remote
+    RECT_ADDOPEN2,
+    RECT_ADDOPEN3,
+    RECT_DELETE,     // the page's Delete, and its confirmation's buttons
+    RECT_DELOK,
+    RECT_DELCANCEL,
+    RECT_PAGECONNECT,// a remote's page's Connect or Disconnect
+    RECT_ROOTS,      // the guard page's roots field
     RECT_THEME0,     // the theme's choices in its open list
     RECT_COUNT = RECT_THEME0 + THEME_COUNT,
 };
@@ -375,6 +386,16 @@ struct CfgRow {
     iz         cap;
     b32        sent;     // an edit went out, until the next config.get
     Str        sentval;
+    Rect       page;     // the first of a section's: its page in the list
+};
+
+// Where a section is defined, from config.get's headers.
+struct CfgHead {
+    Str kind;
+    Str name;
+    Str file;
+    i64 line;
+    b32 own;  // in the user's own file, which edits go to
 };
 
 // The layout file's writer, on a thread of its own: a write that is to
@@ -635,9 +656,26 @@ struct Gui {
     byte              *cfgbase;
     Json              *cfg;        // its reply, null until one arrives
     Slice<CfgRow>      cfgrows;
-    char              *addname;    // a new section's name
-    char              *tplmodel;   // a template argument to set: its model,
-    char              *tplname;    // name,
+    Slice<CfgHead>     cfgheads;
+    Str                cfgpkind;   // the settings' page: a section's kind
+    Str                cfgpname;   // and name, in cfgpbuf ("" and "" for
+    u8                *cfgpbuf;    // the top level), FIELD_MAX bytes
+    b32                cfgdiag;    // the page is Diagnostics instead
+    b32                cfgshowsel; // scroll the list to it
+    b32                cfgtwopane; // the page list was drawn beside the page
+    b32                cfgcombo;   // or as a combo, which is open
+    f32                cfghscroll; // room the settings had to scroll sideways
+    i64                cfgframe;   // the frame they were last drawn in
+    f32                hostshscroll; // and the Hosts panel, likewise
+    i64                hostsframe;
+    Str                addkind;    // the kind of a new section, and its name
+    char              *addname;
+    Str                adderr;     // why it was not added
+    b32                openadd;    // open the new section's dialog
+    b32                opendel;    // open the deletion's confirmation
+    i64                cfgdelid;   // config.set {delete} in flight, 0 if none
+    Str                cfgdelwhat; // what it deletes, "[kind name]"
+    char              *tplname;    // a template argument to set: its name
     char              *tplval;     // and value
     i64                cfgget;     // config.get in flight, 0 if none
     i64                cfgrefresh; // and its id if it refreshes includes
@@ -760,6 +798,7 @@ struct Gui {
     Counts             markcounts;   // totals at the last OP_MARK
     i64                markat;
     i32                reveal;       // RECT_* the settings scroll to, or -1
+    Str                showpage;     // the settings page the list scrolls to
     Str                longval;      // the long setting before its edit
 };
 
@@ -1038,6 +1077,32 @@ static void guiconfigset(Gui *g, Str kind, Str name, Str key, Str value)
         putnull(&w.json);
     }
     g->cfgset = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// Delete a section of the user's file.
+static void guiconfigdelete(Gui *g, Str kind, Str name)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + kind.len + name.len);
+    EvOut w = cmdopen(g, &b, CMD_CONFIGSET, 0);
+    putkey(&w.json, "kind");
+    putstr(&w.json, kind);
+    putkey(&w.json, "name");
+    putstr(&w.json, name);
+    putkey(&w.json, "delete");
+    putint(&w.json, 1);
+    g->cfgset   = g->nextid;
+    g->cfgdelid = g->nextid;
+    Buf d(&g->perm, 16 + kind.len + name.len);
+    putbyte(&d, '[');
+    print(&d, kind);
+    if (name.len) {
+        putbyte(&d, ' ');
+        print(&d, name);
+    }
+    putbyte(&d, ']');
+    g->cfgdelwhat = finish(&d);
     cmdsend(g, &w, a);
 }
 
@@ -1715,6 +1780,23 @@ static void startquit(Gui *g)
 static void settheme(Gui *, i32);
 static void setthinking(Gui *, i32);
 
+// Words of s separated by sep, trimmed, the empty ones dropped, joined
+// by with: a paths setting as the settings window edits it, one a line.
+static Str rejoin(Arena *a, Str s, u8 sep, Str with)
+{
+    Buf b(a, s.len + 16);
+    for (Str rest = s; rest.len;) {
+        Cut c    = cut(rest, sep);
+        Str word = trim(c.head);
+        rest = c.tail;
+        if (word.len) {
+            print(&b, b.len ? with : Str(""));
+            print(&b, word);
+        }
+    }
+    return finish(&b);
+}
+
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
 static void loadcfg(Gui *g, Str line)
@@ -1722,8 +1804,18 @@ static void loadcfg(Gui *g, Str line)
     g->cfgmem.beg = g->cfgbase;
     Arena *a = &g->cfgmem;
     Json  *j = jsonparse(a, clone(a, line)).root;
-    g->cfg     = j;
-    g->cfgrows = {};
+    g->cfg      = j;
+    g->cfgrows  = {};
+    g->cfgheads = {};
+    for (Json *h = jsonget(j, "headers")->child; h; h = h->next) {
+        CfgHead d = {};
+        d.kind = jsonstr(jsonget(h, "kind"));
+        d.name = jsonstr(jsonget(h, "name"));
+        d.file = jsonstr(jsonget(h, "file"));
+        d.line = jsonint(jsonget(h, "line"), 0);
+        d.own  = jsonint(jsonget(h, "own"), 0) != 0;
+        g->cfgheads = push(a, g->cfgheads, d);
+    }
     Json *schema = jsonget(j, "schema");
     for (Json *s = jsonget(j, "settings")->child; s; s = s->next) {
         CfgRow r = {};
@@ -1759,8 +1851,12 @@ static void loadcfg(Gui *g, Str line)
         }
         // Defaults, and what a model inherits by like, show as hints, not
         // values: an edit writes a value of its own. The field holds the
-        // whole value, which an edit sends back whole.
+        // whole value, which an edit sends back whole, and paths one a
+        // line.
         Str v = r.isdflt || r.like.len ? Str{} : r.value;
+        if (r.type == "paths") {
+            v = rejoin(a, v, ';', "\n");
+        }
         r.cap = v.len + FIELD_MAX;
         r.buf = alloc<char>(a, r.cap);
         copybytes(r.buf, v.data, v.len);
@@ -1959,10 +2055,19 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         if (g->cfgset == id) {
             g->cfgset = 0;
         }
+        b32 del = g->cfgdelid == id;
+        if (del) {
+            g->cfgdelid = 0;
+        }
         g->cfgsets++;
         g->cfgok = ok;
         Buf b(&scratch, 256);
-        if (ok) {
+        if (ok && del) {
+            print(&b, "Deleted ");
+            print(&b, g->cfgdelwhat);
+            print(&b, " from ");
+            print(&b, jsonstr(jsonget(j, "path")));
+        } else if (ok) {
             Str path = jsonstr(jsonget(j, "path"));
             i64 at   = jsonint(jsonget(j, "line"), 0);
             print(&b, at ? Str("Saved: ") : Str("Removed from "));
@@ -4344,6 +4449,7 @@ enum : i32 {
     OP_MARKDELTAS,// remember the deltas the shown session has had
     OP_IFSESS,    // unless a session's title starts with text, skip dx ops
     OP_THINKING,  // show reasoning as dx (THINK_*), as a setting would
+    OP_SHOWPAGE,  // scroll the settings' pages to the one text names
 };
 
 enum : i32 {
@@ -4400,6 +4506,16 @@ enum : i32 {
     T_THUMB,       // the latest screenshot thumbnail drawn
     T_SHOTCLOSE,   // the Screenshot window's Close
     T_THINKHDR,    // the latest reasoning's header drawn
+    T_PAGECOMBO,   // the settings' pages as a combo, when narrow
+    T_PAGEITEM,    // the settings page text names ("endpoint fake", "ui",
+                   // "" for the top level, "diagnostics"), but the combo
+                   // while it is closed: so twice to pick either way
+    T_ADDOPEN,     // the Add of the kind text names, likewise
+    T_DELETE,      // the settings page's Delete
+    T_DELOK,       // its confirmation's Delete and Cancel
+    T_DELCANCEL,
+    T_ROOTS,       // the guard page's roots field
+    T_SPLITFROM,   // where the dock splitter was before the first drag
 };
 
 enum : i32 {
@@ -4518,6 +4634,17 @@ enum : i32 {
     CHK_THINKOPEN,
     CHK_THINKSTAYS,
     CHK_THINKREFOLD,
+    CHK_ONEPANE,
+    CHK_TWOPANE,
+    CHK_NOHSCROLL,
+    CHK_PAGE,
+    CHK_ROOTS,
+    CHK_DELINCLUDE,
+    CHK_DELMODAL,
+    CHK_DELKEPT,
+    CHK_DELETED,
+    CHK_REMOTEPAGE,
+    CHK_HOSTSNOHSCROLL,
     CHK_COUNT,
 };
 
@@ -4613,6 +4740,17 @@ static Str chknames[] = {
     "open: the reasoning streams open",
     "open: the committed reasoning stays open",
     "fold again: reasoning folded, but for what the user opened",
+    "narrow, the settings' pages are a combo above the page",
+    "wide, the settings' pages are a list beside the page",
+    "the settings have nothing to scroll to sideways",
+    "the settings page picked is shown",
+    "the roots, one a line, were saved joined by \"; \"",
+    "a section only an include defines cannot be deleted, which says where it is",
+    "Delete asks first",
+    "cancelled, the section and the file are as they were",
+    "deleted: the section and the comment above it are gone, its page too",
+    "a remote's page has Connect, and its list setting",
+    "the Hosts panel has nothing to scroll to sideways",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -5263,6 +5401,14 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint fake"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint fake"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint fake"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
     {OP_MOVE, T_SETTING, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 200, ""},
@@ -5301,9 +5447,15 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
     {OP_CHECK, CHK_SETTING, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "4-settings"},
-    // Adding a section that exists leaves it alone (the file keeps its
-    // one-line diff, which tests/gui.py checks). Its row is further down.
-    {OP_REVEAL, RECT_ADDNAME, 0, 0, 500, ""},
+    // Adding a section that exists leaves it alone, and shows it (the
+    // file keeps its one-line diff, which tests/gui.py checks)
+    {OP_SHOWPAGE, 0, 0, 0, 300, "add endpoint"},
+    {OP_MOVE, T_ADDOPEN, 0, 0, 100, "endpoint"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_ADDOPEN, 0, 0, 100, "endpoint"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_MOVE, T_ADDNAME, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 200, ""},
@@ -5312,6 +5464,8 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
     {OP_CHECK, CHK_ADDEXISTS, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
     // Typing, then idle for 15 s: the caret blinks for 10 s, then stops
     {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -5445,9 +5599,15 @@ static DriveOp e2eops[] = {
 
 // The settings window (--settings, tests/gui.py --mode settings), over a
 // transcript of most of what it can show: reasoning, markdown and code,
-// a diff, an open ask, the strip waiting for an answer. A value longer
-// than a field's slack is edited whole, and the theme is picked from its
-// list, dark and then light, with a screenshot of each (--shots).
+// a diff, an open ask, the strip waiting for an answer. Docked as it is
+// by default, it is narrow: its pages are a combo above the page. Wider,
+// they are a list beside it, from which the checklist edits a value
+// longer than a field's slack whole, picks the theme from its list, dark
+// and then light, edits the guard's roots one a line, finds a section of
+// an included file that cannot be deleted, deletes one of the user's own
+// after cancelling once, adds a model, and shows a remote's page.
+// Narrower again, nothing scrolls sideways, in the Hosts panel either.
+// Screenshots of each with --shots.
 static DriveOp settingsops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -5459,7 +5619,42 @@ static DriveOp settingsops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    // Narrow: the pages in a combo
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_ONEPANE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint fake"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint fake"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "settings-combo"},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint fake"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint fake"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "settings-narrow"},
+    // Wider: the list beside the page, which stays the one picked
+    {OP_MOVE, T_SPLITTER, 0, 0, 300, ""},
+    {OP_DOWN, 0, 0, 0, 50, ""},
+    {OP_MOVE, T_SPLITFROM, -60, 0, 30, ""},
+    {OP_MOVE, T_SPLITFROM, -120, 0, 30, ""},
+    {OP_MOVE, T_SPLITFROM, -180, 0, 30, ""},
+    {OP_MOVE, T_SPLITFROM, -240, 0, 300, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_TWOPANE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
+    {OP_SHOT, 0, 0, 0, 300, "settings-wide"},
     // The long value: whole in its field, and whole once edited there
+    {OP_SHOWPAGE, 0, 0, 0, 300, "role long"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "role long"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "role long"},
     {OP_REVEAL, RECT_LONGFIELD, 0, 0, 500, ""},
     {OP_CHECK, CHK_LONGFIELD, 0, 0, 0, ""},
     {OP_SNAPCFG, 0, 0, 0, 100, ""},
@@ -5474,6 +5669,10 @@ static DriveOp settingsops[] = {
     {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
     {OP_CHECK, CHK_LONGEDIT, 0, 0, 0, ""},
     // The theme, dark, then light
+    {OP_SHOWPAGE, 0, 0, 0, 300, "ui"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "ui"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_REVEAL, RECT_THEMECOMBO, 0, 0, 500, ""},
     {OP_SNAPCFG, 0, 0, 0, 100, ""},
     {OP_MOVE, T_THEMECOMBO, 0, 0, 100, ""},
@@ -5504,6 +5703,112 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
     {OP_CHECK, CHK_THEMEQUIET, 0, 0, 0, ""},
     {OP_SYSTHEME, 0, -1, 0, 300, ""},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    // The guard's roots, one a line, saved as the field is left
+    {OP_SHOWPAGE, 0, 0, 0, 300, "guard"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "guard"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_ROOTS, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 100, "~/a"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 300, "~/b"},
+    {OP_SHOT, 0, 0, 0, 300, "guard"},
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_ROOTS, 0, 0, 0, ""},
+    // An included file's section cannot be deleted here
+    {OP_SHOWPAGE, 0, 0, 0, 300, "model shared"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "model shared"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_DELINCLUDE, 0, 0, 0, ""},
+    // The user's own: asks first, and cancelled, stays
+    {OP_SHOWPAGE, 0, 0, 0, 300, "endpoint gone"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "endpoint gone"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_DELETE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_DELMODAL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "delete"},
+    {OP_MOVE, T_DELCANCEL, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_DELKEPT, 0, 0, 0, ""},
+    {OP_MOVE, T_DELETE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_DELOK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_DELETED, 0, 0, 0, ""},
+    // A new model from its list, its page then shown
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "add model"},
+    {OP_MOVE, T_ADDOPEN, 0, 0, 100, "model"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_ADDNAME, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "fresh"},
+    {OP_SHOT, 0, 0, 0, 300, "add"},
+    {OP_MOVE, T_ADDBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "model fresh"},
+    {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
+    // A remote's page
+    {OP_SHOWPAGE, 0, 0, 0, 300, "remote far"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "remote far"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_REMOTEPAGE, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "remote"},
+    // Narrower than docked: still nothing to scroll sideways
+    {OP_MOVE, T_SPLITTER, 0, 0, 300, ""},
+    {OP_DOWN, 0, 0, 0, 50, ""},
+    {OP_MOVE, T_SPLITFROM, -60, 0, 30, ""},
+    {OP_MOVE, T_SPLITFROM, 60, 0, 30, ""},
+    {OP_MOVE, T_SPLITFROM, 120, 0, 30, ""},
+    {OP_MOVE, T_SPLITFROM, 150, 0, 300, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_ONEPANE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "settings-narrowest"},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "model shared"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "model shared"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "model shared"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "model shared"},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "settings-narrowest-model"},
+    // The Hosts panel there too, its new remote's fields one a line
+    {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_HOSTSNOHSCROLL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "hosts-narrowest"},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
     // Deny the ask, and quit
     {OP_MOVE, T_DENY, 0, 0, 200, ""},
@@ -5897,6 +6202,40 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_THUMB:         return rectcenter(g->rects[RECT_THUMB]);
     case T_SHOTCLOSE:     return rectcenter(g->rects[RECT_SHOTCLOSE]);
     case T_THINKHDR:      return rectcenter(g->rects[RECT_THINKHDR]);
+    case T_PAGECOMBO:     return rectcenter(g->rects[RECT_PAGECOMBO]);
+    case T_DELETE:        return rectcenter(g->rects[RECT_DELETE]);
+    case T_DELOK:         return rectcenter(g->rects[RECT_DELOK]);
+    case T_DELCANCEL:     return rectcenter(g->rects[RECT_DELCANCEL]);
+    case T_ROOTS:         return rectcenter(g->rects[RECT_ROOTS]);
+    case T_SPLITFROM:     return v2(g->splitx, targetpos(g, T_SPLITTER).y);
+    case T_PAGEITEM:
+    case T_ADDOPEN: {
+        Str text = g->ops[g->drivepc-1].text;
+        if (!g->cfgtwopane && !g->cfgcombo) {
+            return rectcenter(g->rects[RECT_PAGECOMBO]);
+        } else if (t==T_PAGEITEM && text=="diagnostics") {
+            return rectcenter(g->rects[RECT_DIAGPAGE]);
+        } else if (t == T_ADDOPEN) {
+            i32 n = 0;
+            for (Json *k = jsonget(g->cfg, "kinds")->child; k; k = k->next) {
+                if (!jsonint(jsonget(k, "named"), 0)) {
+                    continue;
+                } else if (jsonstr(jsonget(k, "kind")) == text) {
+                    return n<4 ? rectcenter(g->rects[RECT_ADDOPEN+n]) : v2(-1, -1);
+                }
+                n++;
+            }
+            return v2(-1, -1);
+        }
+        Arena a = g->frame;
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            if (cfgpagekey(&a, r->kind, r->name) == text) {
+                return rectcenter(r->page);
+            }
+        }
+        return v2(-1, -1);
+    }
     case T_HOSTITEM:
         for (i32 i = 0; i < countof(g->hostitems); i++) {
             GuiHost *h = g->hostitems[i];
@@ -6689,6 +7028,74 @@ static b32 drivecheck(Gui *g, i32 chk)
         g->longval = clone(&g->perm, r->value);
         return field==r->value && r->cap>=r->value.len+FIELD_MAX;
     }
+    case CHK_ONEPANE:
+        return !g->cfgtwopane && g->cfgframe+3 >= g->total.frames;
+    case CHK_TWOPANE:
+        return g->cfgtwopane && g->cfgframe+3 >= g->total.frames;
+    case CHK_NOHSCROLL: {
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: the settings could scroll sideways by ");
+        print(&b, (i64)g->cfghscroll);
+        guilog(g, finish(&b));
+        return g->cfghscroll<=0 && g->cfgframe+3>=g->total.frames;
+    }
+    case CHK_PAGE: {
+        Arena a    = g->frame;
+        Str   want = g->ops[g->drivepc-1].text;
+        Str   page = g->cfgdiag ? Str("diagnostics") : cfgpagekey(&a, g->cfgpkind, g->cfgpname);
+        return page == want;
+    }
+    case CHK_ROOTS:
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            if (r->kind=="guard" && r->key=="roots") {
+                Str field = {(u8 *)r->buf, (iz)__builtin_strlen(r->buf)};
+                return r->value=="~/a; ~/b" && field=="~/a\n~/b" && r->file.len;
+            }
+        }
+        return 0;
+    case CHK_DELINCLUDE: {
+        CfgHead *any = cfghead(g, "model", "shared", 0);
+        return g->cfgpkind=="model" && g->cfgpname=="shared" &&
+               any && !any->own && endswith(any->file, "team.ini") &&
+               !cfghead(g, "model", "shared", 1) && g->rects[RECT_DELETE].x1>0;
+    }
+    case CHK_DELMODAL: {
+        ImGuiWindow *w = ImGui::GetTopMostPopupModal();
+        return w && find({(u8 *)w->Name, (iz)__builtin_strlen(w->Name)}, "Delete section")>=0;
+    }
+    case CHK_DELKEPT: {
+        Arena a  = g->frame;
+        Read  rd = os_read(g->os, &a, cfgfile(g, &a), 1<<20);
+        return cfghas(g, "endpoint", "gone") && g->cfgsnap.data && rd.data==g->cfgsnap &&
+               g->cfgpkind=="endpoint" && g->cfgpname=="gone";
+    }
+    case CHK_DELETED: {
+        Arena a  = g->frame;
+        Read  rd = os_read(g->os, &a, cfgfile(g, &a), 1<<20);
+        return !cfghas(g, "endpoint", "gone") && startswith(g->cfgstatus, "Deleted [endpoint gone]") &&
+               rd.err==READ_OK && find(rd.data, "[endpoint gone]")<0 &&
+               find(rd.data, "An endpoint to delete")<0 && !g->cfgpkind.len;
+    }
+    case CHK_REMOTEPAGE: {
+        b32 list = 0;
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            list |= r->kind=="remote" && r->name=="far" && r->key=="list" &&
+                    r->value=="connected" && r->choices.len==2;
+        }
+        return list && g->cfgpkind=="remote" && g->cfgpname=="far" &&
+               g->rects[RECT_PAGECONNECT].x1 > 0;
+    }
+    case CHK_HOSTSNOHSCROLL: {
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: the Hosts panel could scroll sideways by ");
+        print(&b, (i64)g->hostshscroll);
+        guilog(g, finish(&b));
+        return g->hostshscroll<=0 && g->hostsframe+3>=g->total.frames;
+    }
     case CHK_LONGEDIT: {
         CfgRow *r = longrow(g);
         Arena   a = g->frame;
@@ -7385,6 +7792,10 @@ static void drivestep(Gui *g)
         g->reveal = op->target;
         scheddirty(&g->sched);
         break;
+    case OP_SHOWPAGE:
+        g->showpage = op->text;  // static
+        scheddirty(&g->sched);
+        break;
     case OP_THINKING:
         setthinking(g, (i32)op->dx);
         g->thinkchars0 = g->thinksecs0 = -1;
@@ -7817,7 +8228,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->newmodel   = alloc<char>(&g->perm, FIELD_MAX);
     g->denynote   = alloc<char>(&g->perm, FIELD_MAX);
     g->addname    = alloc<char>(&g->perm, FIELD_MAX);
-    g->tplmodel   = alloc<char>(&g->perm, FIELD_MAX);
+    g->cfgpbuf    = alloc<u8>(&g->perm, FIELD_MAX);
     g->tplname    = alloc<char>(&g->perm, FIELD_MAX);
     g->tplval     = alloc<char>(&g->perm, FIELD_MAX);
     g->remname    = alloc<char>(&g->perm, FIELD_MAX);

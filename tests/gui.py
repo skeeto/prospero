@@ -24,7 +24,12 @@ by quitting are gone, with no engine process left behind.
 
 The settings mode edits a value longer than a field's slack and picks
 the theme, dark then light, from its list over a transcript that shows
-most of what one can (screenshots of each with --shots). The enginestop
+most of what one can (screenshots of each with --shots). It goes
+through the settings' pages narrow (a combo) and wide (a list), checking
+that nothing scrolls sideways, edits the guard's roots one a line,
+deletes a section after cancelling once, finds an included one it cannot
+delete, and adds a model; the file must then hold those edits and no
+other change. The enginestop
 mode kills the engine process mid-turn and mid-ask: the GUI must stop
 counting either, and quit at once when closed.
 
@@ -72,6 +77,16 @@ def e2econfig(url, model):
 
 # A value longer than a settings field's slack of 1024 bytes
 LONG_PROMPT = " ".join(f"Rule {i}: keep every change small and tested." for i in range(40))
+
+# The settings mode's sections: the long value, an endpoint to delete
+# with the comment above it, and a remote never connected
+SETTINGS_GONE = ("# An endpoint to delete, with this comment\n"
+                 "[endpoint gone]\n"
+                 "url = http://gone.invalid/\n")
+SETTINGS_EXTRA = (f"\n# A long value\n[role long]\nprompt = {LONG_PROMPT}\n"
+                  f"\n{SETTINGS_GONE}"
+                  "\n# A remote host, never connected\n"
+                  "[remote far]\nssh = far.invalid\nlist = connected\n")
 
 
 def config(url, model, ask=3, extra=""):
@@ -980,9 +995,13 @@ def main():
     if args.mode == "e2e":
         before = e2econfig(args.url or "http://localhost/", args.model)
     elif args.mode == "settings":
-        # Asks wait out the screenshots; a role holds the long value
-        before = config(curl, model, 120,
-                        f"\n# A long value\n[role long]\nprompt = {LONG_PROMPT}\n")
+        # Asks wait out the screenshots; a role holds the long value; an
+        # included model, which cannot be deleted here, an endpoint to
+        # delete, and a remote, never connected
+        host.write(host.path("team.ini"), "# Shared\n[model shared]\ntemperature = 0.1\n")
+        before = config(curl, model, 120, SETTINGS_EXTRA)
+        head, _, rest = before.partition("\n")
+        before = f"{head}\ninclude = team.ini\n{rest}"
     elif args.mode == "enginestop":
         before = config(curl, model, 60)
     elif args.mode == "drive" and not args.fake:
@@ -1069,14 +1088,24 @@ def main():
             problems.append("the long value was not saved whole with its edit")
         if "[ui]\ntheme = light\n" not in after:
             problems.append("the theme was not saved as light under [ui]")
-        rest = after.replace(f"prompt = {LONG_PROMPT}!\n", f"prompt = {LONG_PROMPT}\n")
-        rest = rest.replace("\n[ui]\ntheme = light\n", "")
-        if rest != before:
-            problems.append("the configuration changed more than the two edits")
+        # The edits, in order: the long value, the theme, the roots, the
+        # deleted endpoint with its comment, the new model
+        want = before.replace(f"prompt = {LONG_PROMPT}\n", f"prompt = {LONG_PROMPT}!\n")
+        want = want.replace("ask_timeout = 120\n", "ask_timeout = 120\nroots = ~/a; ~/b\n")
+        want = want.replace(SETTINGS_GONE + "\n", "")
+        want += "\n[ui]\ntheme = light\n\n[model fresh]\nreasoning = reasoning_content\n"
+        if after != want:
+            diff = difflib.unified_diff(want.splitlines(), after.splitlines(),
+                                        "expected", "saved", lineterm="", n=1)
+            problems.append("the configuration is not the edits alone:\n" + "\n".join(diff))
         else:
-            print("configuration: the long value and the theme, nothing else")
+            print("configuration: the long value, the theme, the roots, a section "
+                  "deleted and one added, nothing else")
+        if host.read(host.path("team.ini")) != "# Shared\n[model shared]\ntemperature = 0.1\n":
+            problems.append("the included file changed")
         if args.shots and not args.host:
-            for name in ("dark", "light"):
+            for name in ("dark", "light", "settings-narrow", "settings-wide", "delete",
+                         "settings-narrowest"):
                 if not os.path.exists(os.path.join(args.shots, name + ".png")):
                     problems.append(f"no {name}.png")
     if args.mode == "enginestop":
