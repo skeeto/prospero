@@ -464,6 +464,17 @@ static i32     os_guidisplays(Os *, WinBox *, i32 max);
 static WinGeom os_guiwhere(Os *);
 // Move the open window to a geometry, fitted as os_guiopen fits it.
 static void    os_guiplace(Os *, WinGeom);
+// (M8) Ask where to save a file, in the platform's own dialog, which
+// never holds up the loop: the window goes on drawing while it is up.
+// The path chosen, or an empty one if cancelled, comes to the mailbox
+// as a record of the type with id, posted from whatever thread has the
+// answer. The dialog has the title, and suggests the file name. Returns
+// 0 if no dialog can be shown, when nothing is posted.
+static b32     os_guisave(Os *, Arena scratch, Str title, Str name, Mailbox *,
+                          u32 type, u64 id);
+// (M8) Show a directory in the platform's file manager: Finder,
+// Explorer, or whatever opens directories. Returns 0 on failure.
+static b32     os_guireveal(Os *, Arena scratch, Str dir);
 #endif
 
 

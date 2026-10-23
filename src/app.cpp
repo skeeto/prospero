@@ -70,6 +70,7 @@
 #include "fonts.cpp"
 #include "place.cpp"
 #include "compose.cpp"
+#include "sidebar.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -153,6 +154,13 @@ enum : u32 {
     FAKE_QUIT,
 };
 
+// And the tasks mailbox takes these, besides a deployment's MAIL_OUT
+// progress records: outcomes from other threads, which wake the GUI.
+enum : u32 {
+    TASK_SAVED = 32,    // a save dialog's path (id its ask), empty if cancelled
+    TASK_DEPLOYED,      // Update engine: 1 or 0, then the path or why (id the host's uid)
+};
+
 // Item rectangles the scripted checklist aims at
 enum : i32 {
     RECT_PROMPTBTN,
@@ -189,6 +197,7 @@ enum : i32 {
     RECT_INFOBTN,    // the session's Info
     RECT_COMPACTHDR, // the latest compaction card's header
     RECT_THINKHDR,   // the latest reasoning's header drawn
+    RECT_USERMSG,    // the latest user message drawn
     RECT_CLOSEBG,    // the close dialog's Keep running in background
     RECT_HOSTCOMBO,  // the new session's host, and its first choices
     RECT_HOST0,
@@ -343,6 +352,20 @@ struct Fake {
     byte    *turnbase;
 };
 
+// Update engine: deploy the engine for this protocol and version on a
+// remote host, on a thread of its own, its progress and outcome coming
+// to the tasks mailbox (TASK_DEPLOYED). Then, if nothing runs there,
+// the host is stopped and reached again, which starts the new engine
+// (deployrecord); else the user is told how it will take over.
+enum : i32 {
+    UPD_NONE,
+    UPD_DEPLOYING,
+    UPD_CHECKING,  // deployed: asking the host whether it is idle
+    UPD_RESTART,   // stopped, to be reached again
+    UPD_DONE,
+    UPD_FAILED,
+};
+
 // Where sessions run: this process's engine, always first, and hosts
 // reached through the client library (remote.cpp): background hosts on
 // this machine, at the endpoints their registrations name, and remote
@@ -376,6 +399,12 @@ struct GuiHost {
     Str        version;
     Slice<Str> cmds;    // the commands it takes
     Slice<Str> caps;    // and its features (putcaps)
+    b32        relist;  // a command changed its list: ask again (drainmail)
+    u64        uid;     // unique to this host while it is one (addhost)
+    // Update engine: deploying there, then the host stopped and reached
+    // again (UPD_*)
+    i32        updating;
+    Str        updmsg;  // how it goes, or went
 };
 
 // A session the GUI knows: listed by the engine, or opened here.
@@ -412,6 +441,9 @@ struct GuiSession {
     b32          noteerr;
     Str          cmdtext;   // that command, put back in the box if it fails
     i64          cmdid;
+    Str          group;     // its group, from the list (only a root's counts)
+    b32          archived;  // from the list (only a root's counts)
+    b32          gone;      // deleted: shown nowhere
 };
 
 // A command awaiting its reply.
@@ -573,6 +605,64 @@ struct Images {
     i64       decodeus;
 };
 
+// An export of a session: Markdown made from its view, or its log as
+// it is, events.jsonl, read here or through its host (file, in base64
+// parts). A session not viewed here is opened first. Saved where the
+// platform's dialog says (os_guisave), or the Markdown copied.
+enum : i32 {
+    EXPORT_MD,
+    EXPORT_RAW,
+};
+
+enum : i32 {
+    EXP_IDLE,
+    EXP_OPENING,  // the session opens, its replay to come
+    EXP_FETCH,    // the log comes through its host
+    EXP_ASKING,   // the dialog is up
+};
+
+struct Export {
+    GuiSession *s;
+    i32         kind;     // EXPORT_*
+    i32         state;    // EXP_*
+    b32         clip;     // copied instead of saved
+    b32         think;    // the Markdown's: reasoning, tool calls, their output
+    b32         tools;
+    b32         output;
+    i64         id;       // the file command in flight
+    i64         off;
+    u64         ask;      // the dialog's, to know its answer
+    Region     *r;        // what is saved, until it is
+    Arena       mem;
+    Buf         data;
+    Str         status;   // how the last went
+    b32         ok;
+    i64         saves;    // exports written, for the checklist
+    Str         saved;    // and where the last went
+    b32         want;     // asked for from a menu: begun before the next frame
+};
+
+// The dialog that names something: a session's title, a new group for
+// it, or a group's new name.
+enum : i32 {
+    NAME_RENAME,
+    NAME_NEWGROUP,
+    NAME_GROUP,
+};
+
+// Item rectangles by name, for the checklist: menu items by label,
+// headings and fold arrows by what they are for.
+enum : i32 {
+    NAMED_MAX    = 96,
+    SIDEDUMP_MAX = 1<<14,  // bytes of the sidebar's tree as text
+};
+
+struct Named {
+    u8   name[64];
+    iz   len;
+    Rect r;
+};
+
 struct DriveOp;
 
 struct Gui {
@@ -672,6 +762,28 @@ struct Gui {
     GuiSession        *sess;       // the session shown, or null
     GuiSession         nosession;  // the empty view and its scroll state
     Str                lasterr;    // the latest command error
+
+    // The sidebar's tree, and the session operations
+    Map<b32>          *folds;      // the user's fold choices (sidebar.cpp)
+    Slice<Str>         groups;     // the groups' order, empty ones included
+    b32                sidedirty;  // folds or groups changed: kept with the layout
+    GuiSession        *menusess;   // the session the context menu is for
+    char              *namebuf;    // the naming dialog's field
+    i32                nameask;    // NAME_*
+    GuiSession        *namesess;
+    Str                namegroup;  // NAME_GROUP: the group renamed
+    b32                opennamer;  // open it next frame
+    Slice<GuiSession *> delroots;  // to delete once confirmed, with their subagents
+    i32                delcount;   // sessions in all
+    Str                delgroup;   // the group going with them, if any
+    b32                opendelsess;
+    i64                deletes;    // delete replies, for the checklist
+    Mailbox           *tasks;      // the dialogs' and deployments' outcomes
+    Export             exp;
+    b32                openexport; // the Markdown export's options
+    GuiSession        *exportsess;
+    char              *modelbuf;   // the model picker's own name
+    u64                hostuids;
 
     // Hosts
     GuiHost           *hosts;      // the engine's first, then the others
@@ -782,7 +894,6 @@ struct Gui {
     Str                edname;     // as the box names it
     i32                slashsel;   // the slash popup's pick, among its matches
     GuiSession        *pickmodel;  // /model's list is open for it
-    GuiSession        *modelsfor;  // and the session it is for
     i32                menuact;    // a context menu pick waiting for the box
     i32                menuwait;   // frames it has waited
 
@@ -897,6 +1008,10 @@ struct Gui {
     i64                driveframes;  // total.frames when a wait began
     f32                splitx;       // dock splitter before the drag
     Rect               rects[RECT_COUNT];
+    Named              named[NAMED_MAX];
+    i32                nnamed;
+    u8                 sidedump[SIDEDUMP_MAX];  // the sidebar's tree, drawn last
+    iz                 sidelen;
     ImGuiID            dockspace;
     i64                lastsave;     // µs
     i64                idlesaves;    // saves made with no input for 1 s
@@ -1772,10 +1887,10 @@ static void guicancel(Gui *g, GuiSession *s)
     cmdsend(g, &w, a);
 }
 
-// The session operations the compose box's slash commands run (as the
-// menus will): the reply's outcome becomes the session's note above the
-// box, and a failed command's text, kept in cmdtext, goes back in the
-// box (onsesscmd).
+// The session operations the compose box's slash commands and the
+// session menus run alike: the reply's outcome becomes the session's
+// note above the box, and a failed command's text, kept in cmdtext by
+// the box (a menu's has none), goes back in the box (onsesscmd).
 static void guicompact(Gui *g, GuiSession *s, Str focus)
 {
     Arena a = newarena(g->cmdr);
@@ -1785,7 +1900,10 @@ static void guicompact(Gui *g, GuiSession *s, Str focus)
         putkey(&w.json, "focus");
         putstr(&w.json, focus);
     }
-    s->cmdid = g->nextid;
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
+    s->stick   = 1;  // to see it run
     cmdsend(g, &w, a);
 }
 
@@ -1796,8 +1914,12 @@ static void guirename(Gui *g, GuiSession *s, Str title)
     EvOut w = cmdopen(g, &b, CMD_RENAME, s);
     putkey(&w.json, "title");
     putstr(&w.json, title);
-    s->cmdid = g->nextid;
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
     cmdsend(g, &w, a);
+    s->title = clone(&g->perm, title);  // until the list says
+    scheddirty(&g->sched);
 }
 
 // Another model for the rest of the session: a name as the session's
@@ -1809,18 +1931,27 @@ static void guimodel(Gui *g, GuiSession *s, Str model)
     EvOut w = cmdopen(g, &b, CMD_MODEL, s);
     putkey(&w.json, "model");
     putstr(&w.json, model);
-    s->cmdid = g->nextid;
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
     cmdsend(g, &w, a);
 }
 
-// A new session from a copy of this one's log, shown once made, with
-// the prompt that came next, if any, as its draft.
-static void guifork(Gui *g, GuiSession *s)
+// A new session from a copy of this one's log, whole (turn < 0) or cut
+// after a turn, shown once made, with the prompt that came next, if
+// any, as its draft (onsesscmd).
+static void guifork(Gui *g, GuiSession *s, i64 turn)
 {
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 128);
     EvOut w = cmdopen(g, &b, CMD_FORK, s);
-    s->cmdid = g->nextid;
+    if (turn >= 0) {
+        putkey(&w.json, "turn");
+        putint(&w.json, turn);
+    }
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
     cmdsend(g, &w, a);
 }
 
@@ -2063,6 +2194,8 @@ static void loadcfg(Gui *g, Str line)
 static void guiopen(Gui *, GuiSession *);
 static void guiclose(Gui *, GuiSession *);
 
+static void addgroup(Gui *, Str);
+
 // A session moves to another host on this machine, which shares the
 // state directory: one a background host holds, or one it let go. A
 // view goes on from where it is, opened there. Not one open here for
@@ -2133,6 +2266,13 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         s->locked = jsonint(jsonget(e, "locked"), 0) != 0;
         s->state  = livestate(state);
         s->listed = 1;
+        s->gone   = 0;  // listed, so there after all
+        Str group = jsonstr(jsonget(e, "group"));
+        s->group    = s->group==group ? s->group : clone(&g->perm, group);
+        s->archived = jsonint(jsonget(e, "archived"), 0) != 0;
+        if (!s->parent.len && !s->archived) {
+            addgroup(g, group);
+        }
     }
     if (shared) {
         // What it no longer holds is the engine's again
@@ -2222,6 +2362,9 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
     } break;
     }
 }
+static void onexportfile(Gui *, Arena, Json *, b32 ok, Str err);
+static void sessgone(Gui *, GuiSession *);
+static void updatestatus(Gui *, GuiHost *, b32 idle);
 
 static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 {
@@ -2257,6 +2400,39 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             onfile(g, j, ok, err);
         } else if (id == g->img.fetch.id) {
             onimgfile(g, scratch, j, ok, err);
+        } else if (id && id==g->exp.id) {
+            onexportfile(g, scratch, j, ok, err);
+        }
+        return;
+
+    case CMD_ARCHIVE:
+    case CMD_GROUP:
+        // Listed again: as it now is, or back as it was
+        h->relist = 1;
+        break;
+
+    case CMD_DELETE:
+        // Every session it took, subagents included, even should it
+        // fail part of the way
+        g->deletes++;
+        h->relist = 1;
+        for (Json *k = jsonget(j, "deleted")->child; k; k = k->next) {
+            GuiSession *s = findsess(g, h, jsonstr(k));
+            if (s) {
+                sessgone(g, s);
+            }
+        }
+        if (!ok) {
+            break;
+        } else if (q.s && !jsonlen(jsonget(j, "deleted"))) {
+            sessgone(g, q.s);  // a reply that lists none
+        }
+        return;
+
+    case CMD_STATUS:
+        if (q.h && q.h->updating==UPD_CHECKING) {
+            updatestatus(g, q.h, ok && !jsonint(jsonget(j, "turns"), 0) &&
+                                 !jsonint(jsonget(j, "jobs"), 0));
         }
         return;
 
@@ -2727,6 +2903,20 @@ static b32 drainedit(Gui *g)
     return any;
 }
 
+// Whether a host's engine has a feature by name in its caps. Unlike
+// hostcan, not by its cmds, which name every command of the protocol,
+// even those an engine only refuses: an M8 operation works where caps
+// name it (capnames).
+static b32 hostcap(GuiHost *h, Str name)
+{
+    for (iz i = 0; i < h->caps.len; i++) {
+        if (h->caps[i] == name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Apply one record from a host. Returns 1 if what shows changed.
 static b32 guirecord(Gui *g, GuiHost *h, Str line)
 {
@@ -2998,6 +3188,7 @@ static GuiHost *addhost(Gui *g, i32 kind, Str name)
     h->kind  = kind;
     h->name  = clone(&g->perm, name);
     h->state = RS_CLOSED;
+    h->uid   = ++g->hostuids;
     if (kind!=GH_ENGINE && !h->inbox) {
         h->inbox = newmailbox(&g->perm, HOST_MAILCAP, wakegui, g->os);
     }
@@ -3172,6 +3363,10 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
     }
     if (h->up && was!=RS_UP) {
         h->opens++;
+        if (h->updating == UPD_RESTART) {
+            h->updating = UPD_DONE;
+            h->updmsg   = clone(&g->perm, concat(&a, "Updated: the engine there is ", h->version));
+        }
         guilist(g, h);
         ImgFetch *f = &g->img.fetch;
         if (f->s && f->s->host==h && f->id) {
@@ -3320,6 +3515,488 @@ static Str hoststatus(Gui *g, Arena *a, GuiHost *h, i64 left)
     return "not connected";
 }
 
+
+
+// Session operations (M8): what the sidebar's context menus and the
+// Session menu do, each a command to the session's host. Each works only
+// where the host's engine names it in its hello's caps (hostcap), which
+// an older one lacks. What changes a session's place in the list (its
+// title, group, archiving) lists that host again once answered (relist),
+// after updating the session here at once, so that the sidebar moves it
+// before the reply; a refusal's list puts it back.
+
+static b32 hostcap(GuiHost *, Str);
+
+// The session a subagent belongs to, at the top of its parents here.
+static GuiSession *sessroot(Gui *g, GuiSession *s)
+{
+    for (i32 n = 0; n < 16; n++) {
+        Str         p  = s->view && s->view->parent.len ? s->view->parent : s->parent;
+        GuiSession *up = p.len ? findsess(g, s->host, p) : 0;
+        if (!up || up==s) break;
+        s = up;
+    }
+    return s;
+}
+
+// Sessions shown under a root, the root included.
+static i32 sesscount(Gui *g, GuiSession *root)
+{
+    i32 n = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        n += !s->gone && (s->view || s->listed) && s->host==root->host &&
+             sessroot(g, s)==root;
+    }
+    return n;
+}
+
+static void guiarchive(Gui *g, GuiSession *s, b32 on)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_ARCHIVE, s);
+    putkey(&w.json, "on");
+    putint(&w.json, on ? 1 : 0);
+    cmdsend(g, &w, a);
+    s->archived = on;
+    scheddirty(&g->sched);
+}
+
+// A group joins the order kept with the layout, last, unless known.
+static void addgroup(Gui *g, Str name)
+{
+    b32 known = !name.len;
+    for (iz i = 0; !known && i < g->groups.len; i++) {
+        known = g->groups[i] == name;
+    }
+    if (!known) {
+        g->groups    = push(&g->perm, g->groups, clone(&g->perm, name));
+        g->sidedirty = 1;
+    }
+}
+
+// Into a group by name, or out of any (empty name).
+static void guigroup(Gui *g, GuiSession *s, Str name)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128 + name.len);
+    EvOut w = cmdopen(g, &b, CMD_GROUP, s);
+    putkey(&w.json, "name");
+    if (name.len) {
+        putstr(&w.json, name);
+    } else {
+        putnull(&w.json);
+    }
+    cmdsend(g, &w, a);
+    s->group = name.len ? clone(&g->perm, name) : Str{};
+    addgroup(g, name);
+    scheddirty(&g->sched);
+}
+
+// A session and its subagents, for good.
+static void guidelete(Gui *g, GuiSession *s)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_DELETE, s);
+    cmdsend(g, &w, a);
+}
+
+// A session is gone from its host: from the sidebar, the transcript
+// and whatever shows its files.
+static void sessgone(Gui *g, GuiSession *s)
+{
+    s->gone   = 1;
+    s->listed = 0;
+    imgdrop(g, s);
+    if (g->out.s == s) {
+        g->out.s   = 0;
+        g->outopen = 0;
+    }
+    if (g->exp.s == s) {
+        g->exp.s     = 0;
+        g->exp.state = EXP_IDLE;
+    }
+    if (g->sess == s) {
+        setcur(g, 0);
+    }
+    if (g->menusess == s) {
+        g->menusess = 0;
+    }
+    scheddirty(&g->sched);
+}
+
+// What an export keeps until it is saved
+enum : iz {
+    EXPORT_MAX = sizeof(void *)==8 ? (iz)1<<30 : (iz)1<<27,
+};
+
+static void exportfail(Gui *g, Str why)
+{
+    Export *x = &g->exp;
+    x->state   = EXP_IDLE;
+    x->ok      = 0;
+    x->status  = clone(&g->perm, why);
+    g->lasterr = x->status;
+    guilog(g, x->status);
+}
+
+// A file name from a session's title: letters, digits and a few
+// others, the rest as dashes.
+static Str exportname(Arena *a, GuiSession *s, Str ext)
+{
+    Str t = s->view && s->view->title.len ? s->view->title : s->title;
+    Buf b(a, 64 + s->sid.len + ext.len);
+    b32 dash = 0;
+    for (iz i = 0; i<t.len && b.len<60; i++) {
+        u8  c  = t[i];
+        b32 ok = (c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') ||
+                 c=='_' || c>=0x80;
+        if (ok) {
+            putbyte(&b, c);
+            dash = 0;
+        } else if (!dash && b.len) {
+            putbyte(&b, '-');
+            dash = 1;
+        }
+    }
+    // No character cut short at the end, nor a dash
+    iz end = b.len;
+    for (; end>0 && (b.data[end-1]&0xc0)==0x80; end--) {}
+    if (end>0 && b.data[end-1]>=0xc0) {
+        i32 need = b.data[end-1]>=0xf0 ? 4 : b.data[end-1]>=0xe0 ? 3 : 2;
+        b.len = b.len-(end-1)==need ? b.len : end-1;
+    }
+    for (; b.len && b.data[b.len-1]=='-'; b.len--) {}
+    if (!b.len) {
+        print(&b, s->sid);
+    }
+    print(&b, ext);
+    return finish(&b);
+}
+
+static void exportwrite(Gui *g, Arena scratch, Str path);
+static void exportrequest(Gui *g);
+
+// What the export saves is ready: copied, or a place to save it asked
+// for. The checklist saves in its directory without asking.
+static void exportready(Gui *g)
+{
+    Export *x = &g->exp;
+    Arena   a = g->frame;
+    if (x->clip) {
+        putbyte(&x->data, 0);  // for ImGui
+        ImGui::SetClipboardText((char *)x->data.data);
+        x->data.len--;
+        x->state  = EXP_IDLE;
+        x->ok     = 1;
+        x->status = "Copied the Markdown";
+        x->saves++;
+        scheddirty(&g->sched);
+        return;
+    }
+    Str name = exportname(&a, x->s, x->kind==EXPORT_MD ? Str(".md") : Str(".jsonl"));
+    if (g->drive) {
+        Str path = join(&a, g->drivecwd, name);
+        exportwrite(g, a, path);
+        return;
+    }
+    x->state = EXP_ASKING;
+    x->ask++;
+    Str title = x->kind==EXPORT_MD ? Str("Export as Markdown") : Str("Export the raw log");
+    if (!os_guisave(g->os, a, title, name, g->tasks, TASK_SAVED, x->ask)) {
+        exportfail(g, "cannot ask where to save it here");
+    }
+}
+
+// Build what the export saves, once its session's view is loaded.
+static void exportbuild(Gui *g)
+{
+    Export     *x = &g->exp;
+    GuiSession *s = x->s;
+    x->mem  = newarena(x->r);
+    x->data = Buf(&x->mem, 1<<16);
+    if (x->kind == EXPORT_MD) {
+        viewexport(&x->data, s->view, s->sid, x->think, x->tools, x->output);
+        exportready(g);
+    } else if (s->host->kind != GH_REMOTE) {
+        Arena a  = g->frame;
+        Str   p  = join(&a, sessdir(g, &a, s->sid), "events.jsonl");
+        Read  rd = os_read(g->os, &x->mem, p, EXPORT_MAX);
+        if (rd.err != READ_OK) {
+            exportfail(g, rd.err==READ_TOOBIG ? Str("the log is too big to export")
+                                              : Str("cannot read the session's log"));
+            return;
+        }
+        x->data      = Buf();
+        x->data.data = rd.data.data;
+        x->data.len  = rd.data.len;
+        x->data.cap  = rd.data.len;
+        x->data.a    = &x->mem;
+        exportready(g);
+    } else {
+        x->state = EXP_FETCH;
+        x->off   = 0;
+        exportrequest(g);
+    }
+}
+
+// Ask the host for the raw log's next part.
+static void exportrequest(Gui *g)
+{
+    Export *x = &g->exp;
+    Arena   a = newarena(g->cmdr);
+    Buf     b(&a, 256);
+    EvOut   w = cmdopen(g, &b, CMD_FILE, x->s);
+    putkey(&w.json, "path");
+    putstr(&w.json, "events.jsonl");
+    putkey(&w.json, "off");
+    putint(&w.json, x->off);
+    putkey(&w.json, "encoding");
+    putstr(&w.json, "base64");
+    x->id = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// A part of a remote session's raw log arrived.
+static void onexportfile(Gui *g, Arena scratch, Json *j, b32 ok, Str err)
+{
+    Export *x = &g->exp;
+    x->id = 0;
+    if (x->state != EXP_FETCH) {
+        return;
+    } else if (!ok) {
+        exportfail(g, err.len ? err : Str("cannot read the session's log"));
+        return;
+    }
+    Unbase64 u = unbase64(&scratch, jsonstr(jsonget(j, "data")));
+    if (!u.ok || jsonint(jsonget(j, "off"), -1)!=x->off+u.data.len) {
+        exportfail(g, "a part of the log came garbled");
+        return;
+    } else if (x->data.len+u.data.len > EXPORT_MAX) {
+        exportfail(g, "the log is too big to export");
+        return;
+    }
+    print(&x->data, u.data);
+    x->off += u.data.len;
+    if (jsonint(jsonget(j, "more"), 0) && u.data.len) {
+        exportrequest(g);
+    } else {
+        exportready(g);
+    }
+}
+
+// Export a session: Markdown with the options set, or its raw log, saved
+// or copied (clip). A session with no view here opens first. Begun
+// before the next frame (exportstart), whose scratch it has to itself,
+// rather than inside the menu that asked.
+static void guiexport(Gui *g, GuiSession *s, i32 kind, b32 clip)
+{
+    Export *x = &g->exp;
+    x->s    = s;
+    x->kind = kind;
+    x->clip = clip;
+    x->want = 1;
+    scheddirty(&g->sched);
+}
+
+static void exportstart(Gui *g)
+{
+    Export     *x    = &g->exp;
+    GuiSession *s    = x->s;
+    x->want = 0;
+    if (!s || s->gone) {
+        return;
+    }
+    if (!x->r) {
+        x->r = os_reserve(g->os, 2*EXPORT_MAX);
+        if (!x->r) {
+            exportfail(g, "out of memory to export");
+            return;
+        }
+    }
+    x->id     = 0;
+    x->status = {};
+    if (!s->view || s->openid) {
+        x->state = EXP_OPENING;
+        if (!s->view) {
+            guiopen(g, s);
+        }
+        return;
+    }
+    exportbuild(g);
+}
+
+// Between records: an export waiting for its session to open goes on
+// once its replay is in.
+static void exportpoll(Gui *g)
+{
+    Export *x = &g->exp;
+    if (x->state==EXP_OPENING && x->s && x->s->view && !x->s->openid) {
+        x->state = EXP_IDLE;
+        exportbuild(g);
+    }
+}
+
+// Write the export where the dialog said.
+static void exportwrite(Gui *g, Arena scratch, Str path)
+{
+    Export *x = &g->exp;
+    x->state = EXP_IDLE;
+    if (!os_write(g->os, scratch, path, finish(&x->data))) {
+        exportfail(g, concat(&scratch, "cannot write ", path));
+        return;
+    }
+    x->ok     = 1;
+    x->saves++;
+    x->saved  = clone(&g->perm, path);
+    x->status = clone(&g->perm, concat(&scratch, "Exported to ", path));
+    scheddirty(&g->sched);
+}
+
+// Update engine's thread (UPD_*, above GuiHost)
+
+struct GuiDeploy {
+    Os         *os;
+    Mailbox    *done;
+    u64         uid;
+    DeployConf  conf;
+    Region     *perm;
+    Region     *scratch;
+};
+
+static void guideploythread(void *arg)
+{
+    GuiDeploy *d       = (GuiDeploy *)arg;
+    Arena      perm    = newarena(d->perm);
+    Arena      scratch = newarena(d->scratch);
+    Deployed   r       = deploy(d->os, &perm, scratch, &d->conf);
+    Buf b(&perm, 16 + r.shown.len + r.err.len);
+    putbyte(&b, (u8)r.ok);
+    print(&b, r.ok ? r.shown : r.err);
+    mailpost(d->done, TASK_DEPLOYED, d->uid, finish(&b), 1);
+    os_release(d->os, d->scratch);
+    os_release(d->os, d->perm);
+}
+
+static b32 updating(GuiHost *h)
+{
+    return h->updating==UPD_DEPLOYING || h->updating==UPD_CHECKING ||
+           h->updating==UPD_RESTART;
+}
+
+// Deployed, and the host there asked whether anything runs: if not,
+// it is stopped, to be reached again (onhostend), which starts the new
+// engine; else it is left to finish, and the new engine waits.
+static void updatestatus(Gui *g, GuiHost *h, b32 idle)
+{
+    if (!idle || !h->up || h->closing) {
+        h->updating = UPD_DONE;
+        h->updmsg   = "Deployed. Its host is at work, so it runs the old engine until it "
+                      "exits: disconnect, then connect after its idle exit.";
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_QUIT, 0, h);
+    putkey(&w.json, "mode");
+    putstr(&w.json, "stop");
+    cmdsend(g, &w, a);
+    h->updating  = UPD_RESTART;
+    h->updmsg    = "deployed: starting the new engine there";
+    h->reconnect = 1;  // once it ends
+    scheddirty(&g->sched);
+}
+
+// What another thread finished: a save dialog answered, a deployment's
+// progress and outcome.
+static void ontask(Gui *g, Record r)
+{
+    Export *x = &g->exp;
+    switch (r.type) {
+    case TASK_SAVED:
+        if (x->state==EXP_ASKING && r.id==x->ask) {
+            if (r.data.len) {
+                exportwrite(g, g->frame, r.data);
+            } else {
+                x->state = EXP_IDLE;  // cancelled
+            }
+        }
+        return;
+    case TASK_DEPLOYED: {
+        GuiHost *h = 0;
+        for (GuiHost *k = g->hosts; k; k = k->next) {
+            h = k->uid==r.id ? k : h;
+        }
+        if (!h || h->updating!=UPD_DEPLOYING || !r.data.len) {
+            return;
+        }
+        Str msg = cuthead(r.data, 1);
+        if (!r.data[0]) {
+            h->updating = UPD_FAILED;
+            h->updmsg   = clone(&g->perm, concat(&g->frame, "Not deployed: ", msg));
+            guilog(g, concat(&g->frame, concat(&g->frame, h->name, ": "), h->updmsg));
+            return;
+        } else if (!h->up) {
+            h->updating = UPD_DONE;
+            h->updmsg   = clone(&g->perm, concat(&g->frame, msg, " deployed: connect to use it"));
+            return;
+        }
+        Arena a = newarena(g->cmdr);
+        Buf   b(&a, 64);
+        EvOut w = cmdopen(g, &b, CMD_STATUS, 0, h);
+        cmdsend(g, &w, a);
+        h->updating = UPD_CHECKING;
+        h->updmsg   = "deployed: is its host idle?";
+    } return;
+    case MAIL_OUT: {
+        // A deployment's progress, by the remote's name
+        Arena a = g->frame;
+        EvRec e = evparse(&a, r.data);
+        Str   n = jsonstr(jsonget(e.root, "host"));
+        Str   m = jsonstr(jsonget(e.root, "msg"));
+        GuiHost *h = findhost(g, GH_REMOTE, n);
+        if (e.ev==EV_DEPLOY && h && h->updating==UPD_DEPLOYING && m.len) {
+            h->updmsg = clone(&g->perm, m);
+        }
+    } return;
+    }
+}
+
+static void guiupdate(Gui *g, GuiHost *h)
+{
+    if (h->kind!=GH_REMOTE || updating(h)) {
+        return;
+    }
+    Str ssh = remoteset(g, h->name, "ssh");
+    if (!ssh.len) {
+        h->updating = UPD_FAILED;
+        h->updmsg   = "no ssh destination: set ssh in its section";
+        return;
+    }
+    GuiDeploy *d = alloc<GuiDeploy>(&g->perm);  // kept: the thread may outlive a frame
+    d->os              = g->os;
+    d->done            = g->tasks;
+    d->uid             = h->uid;
+    d->perm            = os_reserve(g->os, (iz)1<<24);
+    d->scratch         = os_reserve(g->os, 3*DEPLOY_MAXSIZE);
+    d->conf.name       = clone(&g->perm, h->name);
+    d->conf.ssh        = clone(&g->perm, ssh);
+    d->conf.program    = os_getenv(g->os, &g->perm, "PROSPERO_TEST_SSH");
+    d->conf.localstate = g->statedir;
+    d->conf.force      = 1;  // another build of this version, as a developer's
+    d->conf.notes      = g->tasks;
+    if (!d->perm || !d->scratch || !os_thread(g->os, guideploythread, d)) {
+        if (d->perm) os_release(g->os, d->perm);
+        if (d->scratch) os_release(g->os, d->scratch);
+        h->updating = UPD_FAILED;
+        h->updmsg   = "cannot start deploying: out of memory";
+        return;
+    }
+    h->updating = UPD_DEPLOYING;
+    h->updmsg   = "deploying the engine";
+    scheddirty(&g->sched);
+}
 
 
 // Background hosting
@@ -4072,6 +4749,15 @@ static void drainmail(Gui *g, i64 now)
         }
     }
 
+    // Other threads' outcomes, while hosting too
+    {
+        Mail m = mailtake(g->tasks);
+        for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
+            ontask(g, r);
+            other = 1;
+        }
+    }
+
     for (GuiSession *s = g->sessions; s; s = s->next) {
         if (s->view && s->view->lost && s->host==g->hosts && g->enginekind!=ENGINE_FAKE) {
             flushdeltas(g);
@@ -4084,6 +4770,15 @@ static void drainmail(Gui *g, i64 now)
         g->reissuing = 0;
         reissue(g);
     }
+    // Session operations answered: their hosts' lists, once each
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        if (h->relist) {
+            h->relist = 0;
+            guilist(g, h);
+            other = 1;
+        }
+    }
+    exportpoll(g);
 
     if (g->enginegone && !g->quitting && !g->engineerr.len) {
         g->engineerr = "the engine stopped";
@@ -4387,9 +5082,15 @@ static void saveini(Gui *g, b32 last)
 //   Pos=120,80
 //   Size=1280,800
 //   Maximized=0
+//   [Prospero][Sidebar]
+//   Group=Work
+//   Folded=g:Work
+//   Opened=a
 //
 // A pane missing (a layout older than it) keeps its default, and the
-// window's place is fitted to the displays as they are (place.cpp).
+// window's place is fitted to the displays as they are (place.cpp). The
+// sidebar keeps its groups' order, empty ones included, and each fold
+// the user chose by its key (sidebar.cpp), folded or opened.
 
 static Str inistr(char const *s)
 {
@@ -4399,7 +5100,7 @@ static Str inistr(char const *s)
 static void *iniopen(ImGuiContext *, ImGuiSettingsHandler *, char const *name)
 {
     Str n = inistr(name);
-    return n=="Panes" ? (void *)1 : n=="Window" ? (void *)2 : 0;
+    return n=="Panes" ? (void *)1 : n=="Window" ? (void *)2 : n=="Sidebar" ? (void *)3 : 0;
 }
 
 static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char const *line)
@@ -4410,7 +5111,15 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
         return;
     }
     Int v = parseint(kv.tail);
-    if (entry == (void *)1) {
+    if (entry == (void *)3) {
+        if (kv.head=="Group" && kv.tail.len) {
+            addgroup(g, kv.tail);
+            g->sidedirty = 0;  // as the file has it
+        } else if ((kv.head=="Folded" || kv.head=="Opened") && kv.tail.len) {
+            *upsert(&g->folds, clone(&g->perm, kv.tail), &g->perm) = kv.head == "Folded";
+        }
+        return;
+    } else if (entry == (void *)1) {
         for (i32 i = 0; i < PANE_COUNT; i++) {
             if (v.ok && kv.head==inistr(panenames[i])) {
                 g->panes[i] = v.val != 0;
@@ -4436,6 +5145,19 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
     }
 }
 
+static void inifolds(ImGuiTextBuffer *out, Map<b32> *m)
+{
+    if (!m) {
+        return;
+    }
+    out->append(m->val ? "Folded=" : "Opened=");
+    out->append((char *)m->key.data, (char *)m->key.data + m->key.len);
+    out->append("\n");
+    for (i32 i = 0; i < 4; i++) {
+        inifolds(out, m->child[i]);
+    }
+}
+
 static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *out)
 {
     Gui *g = (Gui *)h->UserData;
@@ -4450,6 +5172,17 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
         out->appendf("Pos=%d,%d\n", (int)w->box.x, (int)w->box.y);
         out->appendf("Size=%d,%d\n", (int)w->box.w, (int)w->box.h);
         out->appendf("Maximized=%d\n\n", w->max ? 1 : 0);
+    }
+    if (g->groups.len || g->folds) {
+        out->append("[Prospero][Sidebar]\n");
+        for (iz i = 0; i < g->groups.len; i++) {
+            Str n = g->groups[i];
+            out->append("Group=");
+            out->append((char *)n.data, (char *)n.data + n.len);
+            out->append("\n");
+        }
+        inifolds(out, g->folds);
+        out->append("\n");
     }
 }
 
@@ -4653,6 +5386,9 @@ static void gui_frame(Gui *g)
     }
     i64 t0 = s->now;
     g->frame.beg = g->framebase;
+    if (g->exp.want) {
+        exportstart(g);  // asked for in the last frame
+    }
     g->episode  |= (g->cause & (WOKE_INPUT|WOKE_MAIL|WOKE_FORCE|WOKE_DEADLINE)) != 0;
     g->cause     = 0;
     if (g->unsnapped && s->now>=g->nextsnap) {
@@ -5289,6 +6025,8 @@ enum : i32 {
     T_CMEDITOR,
     T_EDITCANCEL,  // its Cancel while the editor runs
     T_MODEL0,      // the first model /model lists
+    T_NAMED,       // the item whose name (itemnamed) starts with text
+    T_USERMSG,     // the latest user message drawn in the transcript
 };
 
 enum : i32 {
@@ -5462,6 +6200,15 @@ enum : i32 {
     CHK_LASTUSER,     // its latest user message is text
     CHK_MODELS,
     CHK_COMPACTED,
+    CHK_SIDE,
+    CHK_NOSIDE,
+    CHK_SIDEINI,
+    CHK_MODEL,
+    CHK_EXPORTED,
+    CHK_LASTERR,
+    CHK_HOSTTRIED,
+    CHK_FORKED,
+    CHK_DELCOUNT,     // the delete confirmation counts dx sessions
     CHK_COUNT,
 };
 
@@ -5612,6 +6359,15 @@ static Str chknames[] = {
     "the text went out as a message, not a command",
     "/model lists the configured models",
     "/compact compacted the conversation",
+    "the sidebar shows it",
+    "the sidebar does not show it",
+    "the layout file keeps the sidebar's state",
+    "the session switched model",
+    "the export was written with what it should hold",
+    "the error says why",
+    "the remote's heading connected, or tried",
+    "the fork is shown, its draft the prompt that came next",
+    "the delete confirmation counts the sessions it takes",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -6917,6 +7673,251 @@ static DriveOp settingsops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// The sessions sidebar (--sessions, tests/gui.py --mode sessions): two
+// sessions, one with two subagents, under this computer's heading and
+// a configured remote's, never connected, while a remote listed only
+// when connected is left out. A session with subagents folds and opens
+// again; one is renamed, moved into a new group, which folds, kept in
+// the layout file, archived and back, its model switched from the
+// session bar's picker, exported as Markdown and as its raw log, and
+// forked before its prompt from the transcript's menu, the prompt then
+// the fork's draft. The other is forked whole, then deleted with its
+// subagents after cancelling once. The remote's heading connects. The
+// Session menu compacts, which is refused with its reason. Screenshots
+// of each with --shots.
+static DriveOp sessionsops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Say hello."},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "Hello"},
+    {OP_MOVE, T_EMPTY, 0, 0, 1100, ""},  // the next session's id later
+    {OP_NEWSESSION, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Start subagents."},
+    {OP_WAIT, W_SAID, 0, 0, 20000, "Both"},
+    {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    // The tree: this computer and the remote, the hidden one left out,
+    // the subagents under their parent
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start subagents.\n  S "},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Say hello.\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H remote:far\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "remote:hidden"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-tree"},
+    // Folded, and open again
+    {OP_MOVE, T_NAMED, 0, 0, 100, "fold Start subagents."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start subagents.+\n S Say hello.\n"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Folded=s:this:"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-folded"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "fold Start subagents."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Start subagents.\n  S "},
+    // Renamed from its context menu
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Say hello."},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-menu"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Rename..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 200, "Greeting"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-rename"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 1500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Greeting\n"},
+    // Into a new group, which folds, kept with the layout
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 500, "Move to group"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "New group..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_TEXT, 0, 0, 0, 200, "Work"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Work\n H this\n  S Greeting\n"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Group=Work\n"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-group"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head g:Work"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Work+\nH this\n"},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Folded=g:Work\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head g:Work"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "Opened=g:Work\n"},
+    // Archived: under the Archived heading, folded, opened; then back
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Archive"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "A+\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Greeting"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head a"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "A\n H this\n  S Greeting\n"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-archived"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Unarchive"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Work\n H this\n  S Greeting\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nA"},
+    // Its model, from the session bar's picker
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 5000, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "model picker"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-picker"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "model fake:gui_b:"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_MODEL, 0, 0, 0, "fake:gui_b:"},
+    // Exported: Markdown, then the raw log
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 500, "Export"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "Markdown..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-export"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "export save"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_FILE, 0, 0, 5000, "Greeting.md"},
+    {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Greeting.md|# Greeting\n"},
+    {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Greeting.md|## Agent\n\nHello!"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 500, "Export"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "Raw log..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_FILE, 0, 0, 5000, "Greeting.jsonl"},
+    {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Greeting.jsonl|\"ev\":\"session\""},
+    {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Greeting.jsonl|\"ev\":\"model\""},
+    // The Session menu: compacting so short a session is refused, with
+    // its reason in the note above the box
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-sessmenu"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Compact"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "too little"},
+    // The remote's heading connects (there is no such host)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect h:remote:far"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_HOSTTRIED, 0, 0, 0, "far"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-connect"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect h:remote:far"},  // Disconnect
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_REMOTECLOSED, 0, 0, 10000, ""},
+    // A fork of a whole session, from the sidebar: shown, with no draft,
+    // then renamed from the Session menu
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Fork"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "forked from"},
+    {OP_CHECK, CHK_FORKED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Start subagents. (fork)"},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Rename..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 200, "Whole fork"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Whole fork\n"},
+    // A fork before a prompt, from the transcript's menu: the turns
+    // before it, none here, the prompt left in the new session's box
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 5000, ""},
+    {OP_MOVE, T_USERMSG, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-forkhere"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Fork before this prompt"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FORKED, 0, 0, 0, "Say hello."},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello."},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Greeting (fork)"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-forked"},
+    // The forked session with its subagents, deleted once confirmed,
+    // after a cancel, the confirmation counting all three
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Delete..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_DELCOUNT, 3, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-delete"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "delete cancel"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Start subagents.\n"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Delete..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "delete ok"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Start subagents.\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Whole fork\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Greeting\n"},
+    // Idle: no frames
+    {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},  // hover delays and the layout's save
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_IDLE, 0, 0, 0, 0, "idle 3 s"},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // The engine process dies (--enginestop, tests/gui.py --mode enginestop)
 // with a command running in one session and an ask open in another: no
 // record ends either turn, and the views must stop counting them, so
@@ -7352,7 +8353,7 @@ static DriveOp composeops[] = {
     {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
     {OP_CHECK, CHK_NOTE, 0, 0, 0, "switched"},
     // /fork shows the new session, renamed here so that "Session A"
-    // still names one; /export is not there yet
+    // still names one; /export saves it as Markdown, as the menus do
     CLICK(T_PROMPT, "", 200),
     {OP_TEXT, 0, 0, 0, 200, "/fork"},
     KEY(GKEY_ENTER, 0, 300),
@@ -7370,8 +8371,15 @@ static DriveOp composeops[] = {
     CLICK(T_PROMPT, "", 200),
     SELALL,
     {OP_TEXT, 0, 0, 0, 200, "/export"},
-    KEY(GKEY_ENTER, 0, 300),
-    {OP_CHECK, CHK_NOTE, 0, 0, 0, "not available"},
+    KEY(GKEY_ENTER, 0, 500),
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "export save"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_FILE, 0, 0, 5000, "Session-A.md"},
+    {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Session-A.md|# Session A\n"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    CLICK(T_PROMPT, "", 200),
     // B: a draft of its own. Leaving each keeps its draft at once
     SELALL,
     {OP_TEXT, 0, 0, 0, 200, "Kept across a restart"},
@@ -7573,6 +8581,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_THUMB:         return rectcenter(g->rects[RECT_THUMB]);
     case T_SHOTCLOSE:     return rectcenter(g->rects[RECT_SHOTCLOSE]);
     case T_THINKHDR:      return rectcenter(g->rects[RECT_THINKHDR]);
+    case T_USERMSG:       return rectcenter(g->rects[RECT_USERMSG]);
     case T_CODEBLOCK:     return rectcenter(g->rects[RECT_CODEBLOCK]);
     case T_CODECOPY:      return rectcenter(g->rects[RECT_CODECOPY]);
     case T_TOOLSBTN:      return rectcenter(g->rects[RECT_TOOLSBTN]);
@@ -7623,6 +8632,16 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_CMEDITOR:      return rectcenter(g->rects[RECT_CMEDITOR]);
     case T_EDITCANCEL:    return rectcenter(g->rects[RECT_EDITCANCEL]);
     case T_MODEL0:        return rectcenter(g->rects[RECT_MODEL0]);
+    case T_NAMED: {
+        Str text = g->ops[g->drivepc-1].text;
+        for (i32 i = 0; i < g->nnamed; i++) {
+            Named *n = &g->named[i];
+            if (startswith(Str{n->name, n->len}, text)) {
+                return rectcenter(n->r);
+            }
+        }
+        return v2(-1, -1);
+    }
     case T_PANEITEM:
         for (i32 i = 0; i < PANE_COUNT; i++) {
             if (g->ops[g->drivepc-1].text == inistr(panenames[i])) {
@@ -8594,6 +9613,49 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->modelsshown;
     case CHK_COMPACTED:
         return lastof(v, VIEW_COMPACT) != 0;
+    case CHK_SIDE:
+    case CHK_NOSIDE:
+    case CHK_SIDEINI:
+    case CHK_LASTERR: {
+        Str text = g->ops[g->drivepc-1].text;
+        Str in   = {g->sidedump, g->sidelen};
+        if (chk == CHK_SIDEINI) {
+            uz len = 0;
+            char const *ini = ImGui::SaveIniSettingsToMemory(&len);
+            in = {(u8 *)ini, (iz)len};
+        } else if (chk == CHK_LASTERR) {
+            in = g->lasterr;
+        }
+        b32 found = find(in, text) >= 0;
+        if ((chk==CHK_NOSIDE) == found) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, "drive: the sidebar:\n", Str{g->sidedump, g->sidelen}));
+            guilog(g, concat(&a, "drive: the latest error: ", g->lasterr));
+        }
+        return (chk==CHK_NOSIDE) != found;
+    }
+    case CHK_MODEL:
+        return g->sess && startswith(g->view->model, g->ops[g->drivepc-1].text);
+    case CHK_EXPORTED: {
+        // "FILE|NEEDLE": the file in --cwd holds the needle
+        Arena a    = g->frame;
+        Cut   c    = cut(g->ops[g->drivepc-1].text, '|');
+        Read  rd   = os_read(g->os, &a, join(&a, g->drivecwd, c.head), (iz)1<<24);
+        b32   ok   = rd.err==READ_OK && find(rd.data, c.tail)>=0;
+        if (!ok) {
+            guilog(g, concat(&a, "drive: export status: ", g->exp.status));
+        }
+        return ok;
+    }
+    case CHK_HOSTTRIED: {
+        GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
+        return h && (h->r || h->state==RS_FAILED || h->opens || h->downs);
+    }
+    case CHK_DELCOUNT:
+        return (f32)g->delcount == g->ops[g->drivepc-1].dx;
+    case CHK_FORKED:
+        return g->sess && endswith(sesstitle(g->sess), "(fork)") &&
+               draftstr(g->sess)==g->ops[g->drivepc-1].text;
     case CHK_GEOMKEPT: {
         WinGeom w = os_guiwhere(g->os);
         WinGeom m = g->geommark;
@@ -9801,6 +10863,7 @@ static Str guiusage =
 "  --streamtest   measure 30 s of streaming at 100 tok/s, quit\n"
 "  --e2e          the checklist's end-to-end part against a real model\n"
 "  --settings     the settings window's checklist, screenshots of each theme\n"
+"  --sessions     the sessions sidebar's checklist: tree, menus, export\n"
 "  --enginestop   the engine process dies mid-turn (implies subprocess)\n"
 "  --background   M5's checklist: keep a turn running in the background,\n"
 "                 then come back from the tray (tests/gui.py drives it)\n"
@@ -9972,7 +11035,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     #endif
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
-    b32 background = 0, attach = 0, remote = 0, compose = 0;
+    b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0;
     i64 history = 0;
     i32 bench   = 0;
     for (i32 i = 1 + (nargs>1 && args[1]=="gui"); i < nargs; i++) {
@@ -9998,6 +11061,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             e2e = probe = 1;
         } else if (a == "--settings") {
             settings = probe = 1;
+        } else if (a == "--sessions") {
+            sidebar = probe = 1;
         } else if (a == "--enginestop") {
             enginestop = subprocess = probe = 1;
         } else if (a == "--background") {
@@ -10056,7 +11121,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     }
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
-            background || attach || remote || compose) {
+            background || attach || remote || compose || sidebar) {
         g->drive = 1;
         if (compose) {
             g->ops  = compose==1 ? composeops : compose2ops;
@@ -10076,6 +11141,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         } else if (settings) {
             g->ops  = settingsops;
             g->nops = countof(settingsops);
+        } else if (sidebar) {
+            g->ops  = sessionsops;
+            g->nops = countof(sessionsops);
         } else if (enginestop) {
             g->ops  = stopops;
             g->nops = countof(stopops);
@@ -10118,6 +11186,11 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->view       = g->nosession.view;
     g->edbox      = newmailbox(&g->perm, 1<<14, wakegui, os);
     g->newcwd     = alloc<char>(&g->perm, FIELD_MAX);
+    g->namebuf    = alloc<char>(&g->perm, FIELD_MAX);
+    g->modelbuf   = alloc<char>(&g->perm, FIELD_MAX);
+    g->exp.think  = 0;
+    g->exp.tools  = 1;
+    g->exp.output = 0;
     g->newmodel   = alloc<char>(&g->perm, FIELD_MAX);
     g->denynote   = alloc<char>(&g->perm, FIELD_MAX);
     g->addname    = alloc<char>(&g->perm, FIELD_MAX);
@@ -10171,7 +11244,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
 
     g->inbox  = newmailbox(&g->perm, g->inboxcap, wakegui, os);
     g->outbox = newmailbox(&g->perm, 1<<16, 0, 0);
-    if (!g->inbox || !g->outbox) {
+    g->tasks  = newmailbox(&g->perm, 1<<16, wakegui, os);
+    if (!g->inbox || !g->outbox || !g->tasks) {
         os_print(os, 2, "prospero: could not create mailboxes\n");
         return 2;
     }

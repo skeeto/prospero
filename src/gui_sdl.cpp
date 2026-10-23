@@ -965,6 +965,70 @@ static void os_trayclose(Os *os)
     }
 }
 
+// The save dialog's answer, from whichever thread SDL gives it on.
+struct SdlSave {
+    Mailbox *mb;
+    u32      type;
+    u64      id;
+};
+
+static void SDLCALL savedone(void *ud, char const * const *files, int)
+{
+    SdlSave *s    = (SdlSave *)ud;
+    Str      path = {};
+    if (files && files[0]) {
+        path = {(u8 *)files[0], (iz)SDL_strlen(files[0])};
+    }
+    mailpost(s->mb, s->type, s->id, path, 1);  // empty: cancelled, or failed
+    SDL_free(s);
+}
+
+// A sheet over the window on macOS, the desktop portal's dialog (or
+// zenity's) on Linux: each answers later, the loop running meanwhile.
+// It starts in the Documents folder, the file named.
+static b32 os_guisave(Os *os, Arena scratch, Str title, Str name, Mailbox *mb,
+                      u32 type, u64 id)
+{
+    GuiSdl  *p = (GuiSdl *)os->gui;
+    SdlSave *s = (SdlSave *)SDL_malloc(sizeof(SdlSave));
+    if (!p || !p->window || !s) {
+        SDL_free(s);
+        return 0;
+    }
+    s->mb   = mb;
+    s->type = type;
+    s->id   = id;
+    char const *docs = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS);
+    Str         dir  = docs ? Str{(u8 *)docs, (iz)SDL_strlen(docs)} : Str{};
+    Str         at   = dir.len ? join(&scratch, dir, name) : name;
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_WINDOW_POINTER, p->window);
+    SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_TITLE_STRING, cstr(&scratch, title));
+    SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_LOCATION_STRING, cstr(&scratch, at));
+    SDL_ShowFileDialogWithProperties(SDL_FILEDIALOG_SAVEFILE, savedone, s, props);
+    SDL_DestroyProperties(props);
+    return 1;
+}
+
+// As a file URL, which the system opens with its file manager.
+static b32 os_guireveal(Os *, Arena scratch, Str dir)
+{
+    Buf b(&scratch, 16 + 3*dir.len);
+    print(&b, "file://");
+    for (iz i = 0; i < dir.len; i++) {
+        u8 c = dir[i];
+        if ((c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') ||
+                c=='/' || c=='-' || c=='_' || c=='.' || c=='~') {
+            putbyte(&b, c);
+        } else {
+            putbyte(&b, '%');
+            putbyte(&b, "0123456789ABCDEF"[c>>4]);
+            putbyte(&b, "0123456789ABCDEF"[c&15]);
+        }
+    }
+    return SDL_OpenURL(cstr(&scratch, finish(&b)));
+}
+
 static void os_guiclose(Os *os)
 {
     os_guished(os);

@@ -1399,48 +1399,60 @@ static f32 gaugewidth(Gui *g, View *v)
     return any ? 64*g->scale : 0;
 }
 
+// The bar itself, bh high from (x, y), w wide: the session bar's, and
+// thinner, a sidebar row's. Returns whether it is near compaction.
+static b32 gaugebar(Gui *g, ImDrawList *dl, View *v, f32 x, f32 y, f32 w, f32 bh, f32 tick)
+{
+    Palette *pal   = g->pal;
+    i64      scale = v->ctx>0 ? v->ctx : v->compactat;
+    b32      near  = v->compactat>0 && v->tokens*10 >= v->compactat*9;
+    f32      frac  = (f32)v->tokens / (f32)scale;
+    frac = frac>1 ? 1 : frac;
+    dl->AddRectFilled(v2(x, y), v2(x+w, y+bh), pal->codebg, bh/2);
+    dl->AddRectFilled(v2(x, y), v2(x+w*frac, y+bh), near ? pal->amber : pal->active, bh/2);
+    if (v->compactat>0 && v->compactat<scale) {
+        f32 tx = x + w*(f32)v->compactat/(f32)scale;
+        dl->AddLine(v2(tx, y-tick), v2(tx, y+bh+tick), pal->dim, 1.5f*g->scale);
+    }
+    return near;
+}
+
+// The gauge's numbers, for a tooltip.
+static void gaugetip(Buf *b, View *v)
+{
+    print(b, "Context: ");
+    printgrouped(b, v->tokens);
+    print(b, " tokens");
+    if (v->compactat > 0) {
+        print(b, "\nCompacts at ");
+        printgrouped(b, v->compactat);
+        print(b, " (");
+        print(b, v->tokens*100/v->compactat);
+        print(b, "% of the way)");
+    }
+    if (v->ctx > 0) {
+        print(b, "\nWindow: ");
+        printgrouped(b, v->ctx);
+    }
+    print(b, "\nCached in the last request: ");
+    printgrouped(b, v->cached);
+}
+
 static void drawgauge(Gui *g, View *v, f32 w)
 {
     Arena       a     = g->frame;
     f32         sc    = g->scale;
-    Palette    *pal   = g->pal;
     f32         h     = ImGui::GetFrameHeight();
-    i64         scale = v->ctx>0 ? v->ctx : v->compactat;
-    b32         near  = v->compactat>0 && v->tokens*10 >= v->compactat*9;
     ImVec2      p0    = ImGui::GetCursorScreenPos();
-    ImDrawList *dl    = ImGui::GetWindowDrawList();
     f32         bh    = 5*sc;
-    f32         y0    = p0.y + (h - bh)/2;
-    f32         frac  = (f32)v->tokens / (f32)scale;
-    frac = frac>1 ? 1 : frac;
-    dl->AddRectFilled(v2(p0.x, y0), v2(p0.x+w, y0+bh), pal->codebg, bh/2);
-    dl->AddRectFilled(v2(p0.x, y0), v2(p0.x+w*frac, y0+bh),
-                      near ? pal->amber : pal->active, bh/2);
-    if (v->compactat>0 && v->compactat<scale) {
-        f32 x = p0.x + w*(f32)v->compactat/(f32)scale;
-        dl->AddLine(v2(x, y0-2*sc), v2(x, y0+bh+2*sc), pal->dim, 1.5f*sc);
-    }
+    b32         near  = gaugebar(g, ImGui::GetWindowDrawList(), v, p0.x, p0.y + (h - bh)/2,
+                                 w, bh, 2*sc);
     ImGui::Dummy(v2(w, h));
     itemrect(g, RECT_GAUGE);
     g->gaugeshown = 1 + near;
     if (ImGui::BeginItemTooltip()) {
         Buf b(&a, 256);
-        print(&b, "Context: ");
-        printgrouped(&b, v->tokens);
-        print(&b, " tokens");
-        if (v->compactat > 0) {
-            print(&b, "\nCompacts at ");
-            printgrouped(&b, v->compactat);
-            print(&b, " (");
-            print(&b, v->tokens*100/v->compactat);
-            print(&b, "% of the way)");
-        }
-        if (v->ctx > 0) {
-            print(&b, "\nWindow: ");
-            printgrouped(&b, v->ctx);
-        }
-        print(&b, "\nCached in the last request: ");
-        printgrouped(&b, v->cached);
+        gaugetip(&b, v);
         text(finish(&b));
         ImGui::EndTooltip();
     }
@@ -1469,6 +1481,48 @@ static char const *shortcutname(Gui *g, i32 which)
     return g->mac ? "Cmd+F" : "Ctrl+F";
 }
 
+static void modelitems(Gui *, Arena, GuiSession *);
+static Str  sesswhy(Gui *, GuiSession *, Str cap, b32 idle, b32 rootonly);
+static b32  menuitem(Gui *, Arena, Str label, Str why, char const *key);
+static void whytip(Str);
+static void itemnamed(Gui *, Str);
+
+// The session's model, a combo of those configured to switch to (model)
+// while idle, and what the latest switch's reply noted.
+static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v)
+{
+    Str   why = g->enginekind==ENGINE_FAKE ? Str("No engine") : sesswhy(g, s, "model", 1, 0);
+    Str   now = v->model.len ? v->model : s->model;
+    ImGui::SameLine();
+    // A button that looks the part, its list a popup: a combo's own
+    // popup would begin inside the disabled block
+    Str label = concat(&a, shorten(&a, now.len ? now : Str("(model)"), 40),
+                       "  \xe2\x96\xbe##modelpick");  // a small down triangle
+    if (why.len) {
+        ImGui::BeginDisabled();
+    }
+    b32 click = ImGui::Button(cstr0(&a, label));
+    if (why.len) {
+        ImGui::EndDisabled();
+    }
+    itemnamed(g, "model picker");
+    whytip(why.len ? why : Str("Switch the model for the rest of the session"));
+    if (click || (g->pickmodel==s && !why.len)) {
+        ImGui::OpenPopup("##modelpop");
+    }
+    if (g->pickmodel == s) {
+        if (why.len) {
+            setnote(g, s, concat(&a, "/model: ", why), 1);
+        }
+        g->pickmodel = 0;
+    }
+    if (ImGui::BeginPopup("##modelpop")) {
+        g->modelsshown = 1;
+        modelitems(g, a, s);
+        ImGui::EndPopup();
+    }
+}
+
 // A line above the transcript: the session, or a subagent's parent to
 // go back to, its context gauge, the toggles that open all its tool
 // output and reasoning, and the session's details in a popup.
@@ -1476,6 +1530,7 @@ static void drawsessbar(Gui *g)
 {
     GuiSession *s = g->sess;
     View       *v = g->view;
+    g->modelsshown = 0;
     if (!s || !s->view) {
         return;
     }
@@ -1504,15 +1559,13 @@ static void drawsessbar(Gui *g)
     } else {
         Buf b(&a, 256);
         print(&b, shorten(&a, sesstitle(s), 60));
-        if (v->model.len) {
-            print(&b, "  \xc2\xb7  ");  // a middle dot
-            print(&b, v->model);
-        }
         if (v->role.len) {
             print(&b, "  \xc2\xb7  role ");
             print(&b, v->role);
         }
+        ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        drawmodelpick(g, a, s, v);
     }
     if (right > rightof()) {
         ImGui::SameLine(right);
@@ -1767,6 +1820,31 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
 
 // The transcript of the session shown: virtualized messages with
 // selection across them, tool rows and ask cards.
+// The transcript's menu's fork at a message: a user's prompt forks the
+// turns before it, the prompt left in the new session's box to edit and
+// send again; anything else, the conversation to the end of its turn.
+static void forkitem(Gui *g, ViewMsg *m)
+{
+    GuiSession *s = g->sess;
+    if (!s || !m || (m->turn<=0 && m->startsturn<=0)) {
+        return;
+    }
+    Arena a      = g->frame;
+    b32   prompt = m->role==VIEW_USER && m->startsturn>0;
+    i64   turn   = prompt ? m->startsturn-1 : m->turn;
+    Str   why    = sesswhy(g, s, "fork", 1, 1);
+    ImGui::Separator();
+    if (menuitem(g, a, prompt ? Str("Fork before this prompt") : Str("Fork after this turn"),
+                 why, 0)) {
+        guifork(g, s, turn);
+    }
+    if (!why.len) {
+        ImGui::SetItemTooltip(prompt ? "A new session of the turns before this one, "
+                                       "this prompt in its box to edit and send"
+                                     : "A new session of the conversation up to here");
+    }
+}
+
 static void drawtranscript(Gui *g)
 {
     GuiSession *gs = g->sess ? g->sess : &g->nosession;
@@ -1967,8 +2045,8 @@ static void drawtranscript(Gui *g)
         }
     }
 
-    if (hit && ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-        g->menumsg = at.msg;  // the popup takes the hover from here on
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+        g->menumsg = hit ? at.msg : -1;  // the popup takes the hover from here on
     }
     if (hit && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
         i32 clicks = ImGui::GetMouseClickedCount(ImGuiMouseButton_Left);
@@ -2006,9 +2084,11 @@ static void drawtranscript(Gui *g)
         if (ImGui::MenuItem("Copy as Markdown", 0, false, any)) {
             copyout(g, COPY_MARKDOWN);
         }
-        if (ImGui::MenuItem("Copy Message", 0, false, g->menumsg<v->msgs.len)) {
+        b32 onmsg = g->menumsg>=0 && g->menumsg<v->msgs.len;
+        if (ImGui::MenuItem("Copy Message", 0, false, onmsg)) {
             copymessage(g, g->menumsg);
         }
+        forkitem(g, onmsg ? &v->msgs[g->menumsg] : 0);
         ImGui::Separator();
         if (ImGui::MenuItem("Select All", g->mac ? "Cmd+A" : "Ctrl+A")) {
             selall(v);
@@ -2030,7 +2110,7 @@ static void drawtranscript(Gui *g)
             break;
         }
     }
-    i32 latest[] = {RECT_TASKLINK, RECT_UNDO, RECT_REWINDTURN, RECT_FORCE, RECT_COMPACTHDR,
+    i32 latest[] = {RECT_USERMSG, RECT_TASKLINK, RECT_UNDO, RECT_REWINDTURN, RECT_FORCE, RECT_COMPACTHDR,
                     RECT_THINKHDR};
     for (iz i = 0; i < countof(latest); i++) {
         g->rects[latest[i]] = {};  // the latest drawn, or none
@@ -2058,6 +2138,7 @@ static void drawtranscript(Gui *g)
         // Backgrounds: the user's messages, tool rows, ask cards
         sp->SetCurrentChannel(dl, CH_BG);
         if (m->role == VIEW_USER) {
+            g->rects[RECT_USERMSG] = {box0.x, box0.y, box1.x, box1.y};
             dl->AddRectFilled(box0, box1, g->pal->userbg, 6*sc);
         } else if (m->role == VIEW_TOOL) {
             dl->AddRectFilled(box0, box1, fade(g->pal->toolbg, alpha), 4*sc);
@@ -2510,7 +2591,7 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
         break;
     case SLASH_MODEL:
         if (!sl.arg.len) {
-            g->pickmodel = s;  // the list of configured models
+            g->pickmodel = s;  // the session bar's model picker
             draftput(g, s, "");
             drafttyped(&s->dclock, g->sched.now);
             return;
@@ -2524,13 +2605,20 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
         }
         break;
     case SLASH_FORK:
-        if ((sent = hostcan(h, "fork"))) {
-            guifork(g, s);
+        if ((sent = hostcap(h, "fork"))) {
+            guifork(g, s, sl.turn);
         }
         break;
     case SLASH_EXPORT:
-        setnote(g, s, "/export: not available yet; it will save the transcript "
-                      "as the Session menu's Export does", 1);
+        // As the Session menu's Export does: Markdown's options first
+        draftput(g, s, "");
+        drafttyped(&s->dclock, g->sched.now);
+        if (sl.raw) {
+            guiexport(g, s, EXPORT_RAW, 0);
+        } else {
+            g->exportsess = s;
+            g->openexport = 1;
+        }
         return;
     }
     if (!sent) {
@@ -2576,43 +2664,6 @@ static void drawslash(Gui *g, u32 slash, ImVec2 at)
     g->slashshown = 1;
 }
 
-// The models /model offers: those the configuration names.
-static void drawmodels(Gui *g)
-{
-    if (g->pickmodel) {
-        ImGui::OpenPopup("##models");
-        g->modelsfor = g->pickmodel;
-        g->pickmodel = 0;
-    }
-    if (!ImGui::BeginPopup("##models")) {
-        return;
-    }
-    g->modelsshown = 1;
-    Arena       a = g->frame;
-    GuiSession *s = g->modelsfor;
-    ImGui::TextDisabled("Switch this session's model to");
-    i32 n = 0;
-    for (iz i = 0; i < g->cfgheads.len; i++) {
-        CfgHead *h = &g->cfgheads[i];
-        if (h->kind != "model") {
-            continue;
-        }
-        n++;
-        b32 pick = ImGui::MenuItem(cstr0(&a, h->name));
-        if (n == 1) {
-            itemrect(g, RECT_MODEL0);
-        }
-        if (pick && s) {
-            s->note = {};
-            guimodel(g, s, h->name);
-        }
-    }
-    if (!n) {
-        ImGui::TextDisabled("No [model] sections configured: type /model NAME");
-    }
-    ImGui::EndPopup();
-}
-
 static void drawprompt(Gui *g)
 {
     f32         sc  = g->scale;
@@ -2627,7 +2678,6 @@ static void drawprompt(Gui *g)
     g->cmenushown  = 0;
     g->histshown   = 0;
     g->editshown   = 0;
-    g->modelsshown = 0;
     drawstrip(g);
 
     // A line for the editor at work, else the latest command's outcome
@@ -2795,7 +2845,6 @@ static void drawprompt(Gui *g)
         }
         ImGui::EndPopup();
     }
-    drawmodels(g);
 
     ImGui::SameLine();
     ImGui::BeginGroup();
@@ -2836,7 +2885,11 @@ static void drawprompt(Gui *g)
             draftput(g, s, "");
             s->note = {};
         }
-        ImGui::ActivateItemByID(id);  // to type the next
+        if (!g->pickmodel && !g->openexport) {
+            // To type the next, unless a popup of another window's
+            // opens (/model, /export), which the box would close
+            ImGui::ActivateItemByID(id);
+        }
     }
 }
 
@@ -2900,7 +2953,7 @@ static Slice<GuiSession *> hostsessions(Gui *g, Arena *a, GuiHost *h)
 {
     Slice<GuiSession *> all = {};
     for (GuiSession *s = g->sessions; s; s = s->next) {
-        if (s->host==h && (s->view || s->listed)) {
+        if (s->host==h && !s->gone && (s->view || s->listed)) {
             all = push(a, all, s);
             s->depth = -1;  // not placed yet
         }
@@ -2966,147 +3019,1021 @@ static u32 hostcolor(Gui *g, GuiHost *h)
     return g->pal->dim;
 }
 
-// A host's line above its sessions in the sidebar: a dot in the color of
-// its connection, its name, and how it is, a countdown while down.
-static void drawhosthead(Gui *g, Arena a, GuiHost *h, i64 nowms)
+static b32  cannew(Gui *);
+static void newsession(Gui *);
+
+// Remember where the last item went by name, for the scripted
+// checklist (T_NAMED): menu items by their labels, and the sidebar's
+// headings and fold arrows by what they are for.
+static void itemnamed(Gui *g, Str name)
+{
+    if (!g->drive) {
+        return;
+    }
+    name = takehead(name, name.len<64 ? name.len : 64);
+    ImVec2 a = ImGui::GetItemRectMin();
+    ImVec2 z = ImGui::GetItemRectMax();
+    Named *n = 0;
+    for (i32 i = 0; !n && i < g->nnamed; i++) {
+        Named *k = &g->named[i];
+        n = Str{k->name, k->len}==name ? k : 0;
+    }
+    if (!n && g->nnamed<NAMED_MAX) {
+        n = &g->named[g->nnamed++];
+        copybytes(n->name, name.data, name.len);
+        n->len = name.len;
+    }
+    if (n) {
+        n->r = {a.x, a.y, z.x, z.y};
+    }
+}
+
+// A tooltip for the last item, disabled or not: why it is disabled.
+static void whytip(Str why)
+{
+    if (why.len && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("%.*s", (int)why.len, why.cdata);
+    }
+}
+
+// A menu item, disabled with a reason unless why is empty, its
+// rectangle named by its label for the checklist.
+static b32 menuitem(Gui *g, Arena a, Str label, Str why, char const *key = 0)
+{
+    b32   r = ImGui::MenuItem(cstr0(&a, label), key, false, !why.len);
+    itemnamed(g, label);
+    whytip(why);
+    return r;
+}
+
+// A session's host's sidebar key, stable across runs (sidebar.cpp).
+static Str hostkey(Arena *a, GuiHost *h, Str remote)
+{
+    if (!h) {
+        return concat(a, "remote:", remote);
+    }
+    switch (h->kind) {
+    case GH_ENGINE: return "this";
+    case GH_LOCAL:  return h->own ? Str("own") : concat(a, "bg:", h->name);
+    }
+    return concat(a, "remote:", h->name);
+}
+
+// The configured remotes' names, in the configuration's order.
+static Slice<Str> remotenames(Gui *g, Arena *a)
+{
+    Slice<Str> names = {};
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        b32 seen = r->kind != "remote";
+        for (iz n = 0; !seen && n < names.len; n++) {
+            seen = names[n] == r->name;
+        }
+        if (!seen) {
+            names = push(a, names, r->name);
+        }
+    }
+    return names;
+}
+
+// Whether a remote shows in the sidebar while not connected: unless its
+// list setting says only while connected.
+static b32 remotelisted(Gui *g, GuiHost *h, Str name)
+{
+    b32 live = h && h->r && !h->closing;
+    return live || remoteset(g, h ? h->name : name, "list")!="connected";
+}
+
+// Why a session operation cannot be done now, or empty if it can: the
+// host's engine names it in its caps (cap), the host takes commands,
+// the session is its own here, and, where idle matters, nothing runs.
+static Str sesswhy(Gui *g, GuiSession *s, Str cap, b32 idle, b32 rootonly)
+{
+    if (cap.len && !hostcap(s->host, cap)) {
+        return s->host->kind==GH_REMOTE && s->host->up
+             ? Str("The engine there is too old for this: update it (Update engine)")
+             : Str("This host's engine is too old for this");
+    } else if (!hostlive(g, s)) {
+        return "Its host is not connected";
+    } else if (s->readonly || (!s->view && s->locked)) {
+        return "Another process holds it";
+    } else if (rootonly && sessparent(s).len) {
+        return "A subagent goes with the session that started it";
+    } else if (idle && (s->view ? s->view->busy : s->state!=LIVE_IDLE && s->state!=LIVE_CLOSED)) {
+        return "Wait for its turn to end";
+    }
+    return {};
+}
+
+static void namedialog(Gui *g, i32 what, GuiSession *s, Str group, Str value)
+{
+    g->nameask    = what;
+    g->namesess   = s;
+    g->namegroup  = clone(&g->perm, group);
+    iz n = value.len<FIELD_MAX ? value.len : FIELD_MAX-1;
+    copybytes(g->namebuf, value.data, n);
+    g->namebuf[n] = 0;
+    g->opennamer  = 1;
+}
+
+// Roots to delete, confirmed first, with the group going with them.
+static void askdelete(Gui *g, Slice<GuiSession *> roots, Str group)
+{
+    g->delroots = {};
+    g->delcount = 0;
+    for (iz i = 0; i < roots.len; i++) {
+        g->delroots  = push(&g->perm, g->delroots, roots[i]);
+        g->delcount += sesscount(g, roots[i]);
+    }
+    g->delgroup    = clone(&g->perm, group);
+    g->opendelsess = roots.len || group.len;
+}
+
+// Close a session's view here: its host may let it go, and it goes back
+// to being listed.
+static void sessclose(Gui *g, GuiSession *s)
+{
+    if (!s->view) {
+        return;
+    }
+    if (hostlive(g, s)) {
+        guiclose(g, s);
+    }
+    imgdrop(g, s);
+    View *v = s->view;
+    s->view     = 0;
+    s->openid   = 0;
+    s->readonly = 0;
+    s->win      = 0;
+    os_release(g->os, v->text.region);
+    os_release(g->os, v->meta.region);
+    os_release(g->os, v->aux.region);
+    if (g->sess == s) {
+        setcur(g, 0);
+    }
+    if (g->exp.s==s && g->exp.state==EXP_OPENING) {
+        g->exp.state = EXP_IDLE;
+    }
+    guilist(g, s->host);
+}
+
+// The models a session can switch to, as configured here: the default,
+// then each [model NAME] section's.
+static Slice<Str> cfgmodels(Gui *g, Arena *a)
+{
+    Slice<Str> r = {};
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *c = &g->cfgrows[i];
+        Str     m = !c->kind.len && c->key=="model" ? c->value :
+                    c->kind=="model" ? c->name : Str{};
+        b32 dup = !m.len;
+        for (iz k = 0; !dup && k < r.len; k++) {
+            dup = r[k] == m;
+        }
+        if (!dup) {
+            r = push(a, r, m);
+        }
+    }
+    return r;
+}
+
+// The models to switch to, as menu items, then a field for another.
+static void modelitems(Gui *g, Arena a, GuiSession *s)
+{
+    Str        now    = s->view && s->view->model.len ? s->view->model : s->model;
+    Slice<Str> models = cfgmodels(g, &a);
+    b32        first  = 1;
+    for (iz i = 0; i < models.len; i++) {
+        b32 cur = models[i] == now;
+        if (ImGui::MenuItem(cstr0(&a, models[i]), 0, cur, !cur)) {
+            s->note = {};
+            guimodel(g, s, models[i]);
+        }
+        itemnamed(g, concat(&a, "model ", models[i]));
+        if (!cur && first) {
+            itemrect(g, RECT_MODEL0);  // the first to switch to
+            first = 0;
+        }
+    }
+    if (s->host->kind == GH_REMOTE) {
+        ImGui::TextDisabled("As configured here: %s may differ", cstr0(&a, s->host->name));
+    }
+    ImGui::SetNextItemWidth(200*g->scale);
+    if (ImGui::InputTextWithHint("##other", "another model, Enter", g->modelbuf, FIELD_MAX,
+                                 ImGuiInputTextFlags_EnterReturnsTrue)) {
+        Str m = trim({(u8 *)g->modelbuf, (iz)__builtin_strlen(g->modelbuf)});
+        if (m.len) {
+            s->note = {};
+            guimodel(g, s, m);
+            g->modelbuf[0] = 0;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+}
+
+// The session operations, as menu items: the sidebar's context menu
+// and the Session menu have them alike.
+static void sessitems(Gui *g, Arena a, GuiSession *s)
+{
+    GuiHost *h     = s->host;
+    b32      older = 0;  // an item lacks the engine's support
+
+    if (menuitem(g, a, "Rename...", sesswhy(g, s, "rename", 0, 0))) {
+        namedialog(g, NAME_RENAME, s, {}, sesstitle(s));
+    }
+    older |= !hostcap(h, "rename");
+
+    Str why = sesswhy(g, s, "group", 0, 1);
+    older |= !hostcap(h, "group");
+    b32 sub = ImGui::BeginMenu("Move to group", !why.len);
+    itemnamed(g, "Move to group");
+    whytip(why);
+    if (sub) {
+        for (iz i = 0; i < g->groups.len; i++) {
+            Str n = g->groups[i];
+            b32 cur = n == s->group;
+            ImGui::PushID((i32)i);
+            if (ImGui::MenuItem(cstr0(&a, n), 0, cur, !cur)) {
+                guigroup(g, s, n);
+            }
+            itemnamed(g, concat(&a, "group ", n));
+            ImGui::PopID();
+        }
+        if (g->groups.len) {
+            ImGui::Separator();
+        }
+        if (menuitem(g, a, "New group...", {})) {
+            namedialog(g, NAME_NEWGROUP, s, {}, {});
+        }
+        if (menuitem(g, a, "Remove from group", s->group.len ? Str{} : Str("It is in no group"))) {
+            guigroup(g, s, {});
+        }
+        ImGui::EndMenu();
+    }
+    ImGui::Separator();
+
+    if (menuitem(g, a, "Fork", sesswhy(g, s, "fork", 1, 1))) {
+        guifork(g, s, -1);
+    }
+    older |= !hostcap(h, "fork");
+    if (menuitem(g, a, "Compact", sesswhy(g, s, "compact", 1, 0))) {
+        guicompact(g, s, {});
+    }
+    older |= !hostcap(h, "compact");
+    why = sesswhy(g, s, "model", 1, 0);
+    older |= !hostcap(h, "model");
+    sub = ImGui::BeginMenu("Switch model", !why.len);
+    itemnamed(g, "Switch model");
+    whytip(why);
+    if (sub) {
+        modelitems(g, a, s);
+        ImGui::EndMenu();
+    }
+    sub = ImGui::BeginMenu("Export");
+    itemnamed(g, "Export");
+    if (sub) {
+        if (menuitem(g, a, "Markdown...", {})) {
+            g->exportsess = s;
+            g->openexport = 1;
+        }
+        Str raw = h->kind!=GH_REMOTE || hostcap(h, "file.base64") ? Str{} :
+                  Str("The engine there is too old to send the log");
+        raw = raw.len || h->kind!=GH_REMOTE || hostlive(g, s) ? raw : Str("Its host is not connected");
+        if (menuitem(g, a, "Raw log...", raw)) {
+            guiexport(g, s, EXPORT_RAW, 0);
+        }
+        ImGui::EndMenu();
+    }
+    ImGui::Separator();
+
+    b32 arch = s->archived;
+    if (menuitem(g, a, arch ? Str("Unarchive") : Str("Archive"), sesswhy(g, s, "archive", 0, 1))) {
+        guiarchive(g, s, !arch);
+    }
+    older |= !hostcap(h, "archive");
+    if (menuitem(g, a, "Delete...", sesswhy(g, s, "delete", 1, 0))) {
+        Slice<GuiSession *> one = {};
+        one = push(&a, one, s);
+        askdelete(g, one, {});
+    }
+    older |= !hostcap(h, "delete");
+    ImGui::Separator();
+    if (menuitem(g, a, "Copy session id", {})) {
+        ImGui::SetClipboardText(cstr0(&a, s->sid));
+    }
+    Str reveal = h->kind==GH_REMOTE ? Str("Its files are on another computer") : Str{};
+    if (menuitem(g, a, "Reveal folder", reveal)) {
+        Str dir = sessdir(g, &a, s->sid);
+        if (!os_guireveal(g->os, a, dir)) {
+            g->lasterr = clone(&g->perm, concat(&a, "cannot show ", dir));
+        }
+    }
+    Str close = !s->view ? Str("It is not open here") :
+                s->view->busy && !s->readonly ? Str("Close it once its turn ends") : Str{};
+    if (menuitem(g, a, "Close", close)) {
+        sessclose(g, s);
+    }
+    if (older && h->kind==GH_REMOTE) {
+        ImGui::Separator();
+        Str busy = updating(h) ? Str("Updating already") :
+                   !h->up      ? Str("Its host is not connected") : Str{};
+        if (menuitem(g, a, "Update engine", busy)) {
+            guiupdate(g, h);
+        }
+        ImGui::SetItemTooltip("Deploy this version's engine there, then start it once "
+                              "nothing runs");
+    }
+}
+
+// The roots of a group, on any host.
+static Slice<GuiSession *> grouproots(Gui *g, Arena *a, Str group)
+{
+    Slice<GuiSession *> r = {};
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (!s->gone && (s->view || s->listed) && !sessparent(s).len &&
+                !s->archived && s->group==group) {
+            r = push(a, r, s);
+        }
+    }
+    return r;
+}
+
+// Why every root of a group cannot have an operation, or empty.
+static Str groupwhy(Gui *g, Slice<GuiSession *> roots, Str cap, b32 idle)
+{
+    for (iz i = 0; i < roots.len; i++) {
+        Str why = sesswhy(g, roots[i], cap, idle, 1);
+        if (why.len) {
+            return why;
+        }
+    }
+    return {};
+}
+
+static void groupmove(Gui *g, Str group, i32 by)
+{
+    for (iz i = 0; i < g->groups.len; i++) {
+        iz k = i + by;
+        if (g->groups[i]==group && k>=0 && k<g->groups.len) {
+            Str t = g->groups[k];
+            g->groups[k] = g->groups[i];
+            g->groups[i] = t;
+            g->sidedirty = 1;
+            return;
+        }
+    }
+}
+
+static void groupdrop(Gui *g, Str group)
+{
+    iz n = 0;
+    for (iz i = 0; i < g->groups.len; i++) {
+        if (g->groups[i] != group) {
+            g->groups[n++] = g->groups[i];
+        }
+    }
+    g->sidedirty |= n != g->groups.len;
+    g->groups.len = n;
+}
+
+// A group heading's menu: its sessions on every host.
+static void groupitems(Gui *g, Arena a, Str group)
+{
+    Slice<GuiSession *> roots = grouproots(g, &a, group);
+    if (menuitem(g, a, "Rename group...", groupwhy(g, roots, "group", 0))) {
+        namedialog(g, NAME_GROUP, 0, group, group);
+    }
+    Str why = !roots.len ? Str("It has no sessions") : groupwhy(g, roots, "archive", 0);
+    if (menuitem(g, a, "Archive group", why)) {
+        for (iz i = 0; i < roots.len; i++) {
+            guiarchive(g, roots[i], 1);
+        }
+    }
+    if (menuitem(g, a, "Ungroup", groupwhy(g, roots, "group", 0))) {
+        for (iz i = 0; i < roots.len; i++) {
+            guigroup(g, roots[i], {});
+        }
+        groupdrop(g, group);
+    }
+    ImGui::SetItemTooltip("The group goes; its sessions stay");
+    ImGui::Separator();
+    if (menuitem(g, a, "Move up", g->groups.len && g->groups[0]!=group ? Str{} : Str("First already"))) {
+        groupmove(g, group, -1);
+    }
+    b32 last = !g->groups.len || g->groups[g->groups.len-1]==group;
+    if (menuitem(g, a, "Move down", last ? Str("Last already") : Str{})) {
+        groupmove(g, group, 1);
+    }
+    ImGui::Separator();
+    if (menuitem(g, a, "Delete group and sessions...", groupwhy(g, roots, "delete", 1))) {
+        askdelete(g, roots, group);
+    }
+}
+
+// A host heading's menu.
+static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
+{
+    Str   name = h ? h->name : remote;
+    b32   live = h && h->r && !h->closing;
+    if (!h || h->kind==GH_REMOTE) {
+        if (live) {
+            if (menuitem(g, a, "Disconnect", {})) {
+                hostclose(g, h);
+            }
+            ImGui::SetItemTooltip("Leave it: its sessions run on there");
+        } else {
+            b32 closing = h && h->r && h->closing;
+            if (menuitem(g, a, "Connect", closing && h->reconnect ? Str("Connecting once it lets go")
+                                                               : Str{})) {
+                remoteconnect(g, a, name);
+            }
+            ImGui::SetItemTooltip("Connect over ssh, starting a host there if none runs");
+        }
+    }
+    Str why = h && hostready(g, h) ? Str{} : Str("It is not connected");
+    if (menuitem(g, a, "New session here...", why)) {
+        g->newhost = h;
+        newsession(g);
+    }
+    if (h && h->kind==GH_REMOTE) {
+        ImGui::Separator();
+        Str busy = updating(h) ? Str("Updating already") :
+                   !h->up      ? Str("It is not connected") : Str{};
+        if (menuitem(g, a, "Update engine", busy)) {
+            guiupdate(g, h);
+        }
+        ImGui::SetItemTooltip("Deploy this version's engine there, then start it once "
+                              "nothing runs");
+    }
+}
+
+// A fold arrow at x on the line at y, pointing right when folded.
+static void foldarrow(Gui *g, ImDrawList *dl, f32 x, f32 y, b32 folded, b32 forced)
+{
+    f32 lineh = ImGui::GetTextLineHeight();
+    u32 col   = forced ? fade(g->pal->dim, 0.45f) : g->pal->dim;
+    ImGui::RenderArrow(dl, v2(x, y + lineh*0.15f), col,
+                       folded ? ImGuiDir_Right : ImGuiDir_Down, 0.7f);
+}
+
+// Flip a row's fold, kept with the layout, unless it stays open.
+static void foldrow(Gui *g, SideRow *r)
+{
+    if (r->forced || !r->key.len) {
+        return;
+    }
+    b32 *f = upsert(&g->folds, r->key, (Arena *)0);
+    if (!f) {
+        f = upsert(&g->folds, clone(&g->perm, r->key), &g->perm);
+    }
+    *f = !r->folded;
+    g->sidedirty = 1;
+    scheddirty(&g->sched);
+}
+
+// A heading: a group, a host, or Archived. It folds by a click, and has
+// a menu by a right click; a host's heading has buttons for what is
+// done there most.
+static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64 nowms)
 {
     f32         sc    = g->scale;
     ImDrawList *dl    = ImGui::GetWindowDrawList();
     f32         lineh = ImGui::GetTextLineHeight();
+    f32         x0    = ImGui::GetCursorScreenPos().x + (f32)r->depth*12*sc;
     ImVec2      p     = ImGui::GetCursorScreenPos();
     f32         w     = ImGui::GetContentRegionAvail().x;
-    i64         left  = h->state==RS_DOWN ? countdown(g, h->retryat, nowms) : 0;
-    g->downshown |= h->state==RS_DOWN && left>0;
-    drawdot(dl, v2(p.x + 4*sc, p.y + lineh/2), 3.5f*sc, hostcolor(g, h));
-    Pen t = {dl, &g->fonts, p.x + 13*sc, p.y, p.x + w, g->fonts.size};
-    pen(&t, hostlabel(g, &a, h), STYLE_BOLD, g->pal->text);
-    pen(&t, "  ", 0, g->pal->dim);
-    pen(&t, hoststatus(g, &a, h, left), 0, hostcolor(g, h)==g->pal->ok ? g->pal->dim
-                                                                     : hostcolor(g, h));
-    ImGui::Dummy(v2(w, lineh + 2*sc));
-    if (h->msg.len && h->state!=RS_UP) {
+    ImGuiStyle &st    = ImGui::GetStyle();
+
+    // Buttons at the right of a host's heading
+    b32         remote1 = r->kind==SROW_HOST && (!h || h->kind==GH_REMOTE);
+    b32         live    = h && h->r && !h->closing;
+    char const *cbtn    = live ? "Disconnect" : "Connect";
+    f32         bw      = 0;
+    if (r->kind == SROW_HOST) {
+        bw += ImGui::CalcTextSize("+").x + 2*st.FramePadding.x + st.ItemSpacing.x;
+        if (remote1) {
+            bw += ImGui::CalcTextSize(cbtn).x + 2*st.FramePadding.x + st.ItemSpacing.x;
+        }
+    }
+
+    pushstr(r->key);
+    ImGui::SetNextItemAllowOverlap();
+    ImGui::InvisibleButton("##head", v2(w>1 ? w : 1, lineh + 4*sc));
+    b32 click = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    itemnamed(g, concat(&a, "head ", r->key));
+    if (r->forced && ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Open while something under it needs an answer");
+    } else if (r->kind==SROW_HOST && h && h->msg.len && h->state!=RS_UP) {
         ImGui::SetItemTooltip("%s", cstr0(&a, h->msg));
     }
+    if (ImGui::IsItemHovered()) {
+        dl->AddRectFilled(p, v2(p.x+w, p.y+lineh+4*sc), fade(g->pal->dim, 0.12f));
+    }
+    if (click) {
+        foldrow(g, r);
+    }
+    b32 menu = r->kind!=SROW_ARCHIVED && ImGui::BeginPopupContextItem("##headmenu");
+    if (menu) {
+        if (r->kind == SROW_GROUP) {
+            groupitems(g, a, r->group);
+        } else {
+            hostitems(g, a, h, remote);
+        }
+        ImGui::EndPopup();
+    }
+
+    foldarrow(g, dl, x0, p.y + 2*sc, r->folded, r->forced);
+    f32 x = x0 + 14*sc;
+    Pen t = {dl, &g->fonts, x, p.y + 2*sc, p.x + w - bw, g->fonts.size};
+    Buf c(&a, 32);
+    if (r->count || r->kind!=SROW_HOST) {
+        print(&c, "  ");
+        print(&c, (i64)r->count);
+    }
+    switch (r->kind) {
+    case SROW_GROUP:
+        pen(&t, r->group, STYLE_BOLD, g->pal->text);
+        pen(&t, finish(&c), 0, g->pal->dim);
+        break;
+    case SROW_ARCHIVED:
+        pen(&t, "Archived", STYLE_BOLD, g->pal->dim);
+        pen(&t, finish(&c), 0, g->pal->dim);
+        break;
+    case SROW_HOST: {
+        i64 left = h && h->state==RS_DOWN ? countdown(g, h->retryat, nowms) : 0;
+        g->downshown |= h && h->state==RS_DOWN && left>0;
+        u32 dot = h ? hostcolor(g, h) : g->pal->dim;
+        drawdot(dl, v2(t.x + 4*sc, p.y + 2*sc + lineh/2), 3.5f*sc, dot);
+        t.x += 13*sc;
+        pen(&t, h ? hostlabel(g, &a, h) : remote, STYLE_BOLD, g->pal->text);
+        pen(&t, "  ", 0, g->pal->dim);
+        Str status = h ? hoststatus(g, &a, h, left) : Str("not connected");
+        if (h && h->updating!=UPD_NONE && h->updmsg.len) {
+            status = h->updmsg;
+            dot    = h->updating==UPD_FAILED ? g->pal->bad : g->pal->amber;
+        }
+        pen(&t, status, 0, dot==g->pal->ok ? g->pal->dim : dot);
+        if (r->folded && r->count) {
+            pen(&t, finish(&c), 0, g->pal->dim);
+        }
+    } break;
+    }
+    if (r->asks && r->folded) {
+        pen(&t, "  needs an answer", STYLE_BOLD, g->pal->amber);
+    }
+
+    if (r->kind == SROW_HOST) {
+        // New session here, and Connect or Disconnect
+        f32 y = p.y + (lineh + 4*sc - ImGui::GetFrameHeight())/2;
+        ImGui::SetCursorScreenPos(v2(p.x + w - bw + st.ItemSpacing.x, y));
+        ImGui::BeginDisabled(!h || !hostready(g, h));
+        if (ImGui::SmallButton("+")) {
+            g->newhost = h;
+            newsession(g);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, concat(&a, "new ", r->key));
+        whytip(h && hostready(g, h) ? Str("A new session here") : Str("Not connected"));
+        if (remote1) {
+            ImGui::SameLine();
+            b32 closing = h && h->r && h->closing;
+            ImGui::BeginDisabled(closing && h->reconnect);
+            b32 b = ImGui::SmallButton(cbtn);
+            ImGui::EndDisabled();
+            itemnamed(g, concat(&a, "connect ", r->key));
+            ImGui::SetItemTooltip(live ? "Leave it: its sessions run on there" :
+                                         "Connect over ssh, starting a host there if none runs");
+            if (b && live) {
+                hostclose(g, h);
+            } else if (b) {
+                remoteconnect(g, a, h ? h->name : remote);
+            }
+        }
+        ImGui::SetCursorScreenPos(v2(p.x, p.y + lineh + 4*sc + st.ItemSpacing.y));
+        ImGui::Dummy(v2(0, 0));
+    }
+    ImGui::PopID();
 }
 
+// A session's row: as before, now indented as its place in the tree
+// says, with a fold arrow when it has subagents, its gauge, and its
+// context menu.
+static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
+{
+    f32         sc    = g->scale;
+    ImDrawList *dl    = ImGui::GetWindowDrawList();
+    f32         lineh = ImGui::GetTextLineHeight();
+    f32         small = g->fonts.size * 0.85f;
+    View       *v     = s->view;
+    i32         state = v ? v->state : s->state;
+
+    pushstr(s->sid);
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    f32    w = ImGui::GetContentRegionAvail().x;
+    ImGui::SetNextItemAllowOverlap();
+    if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc))) {
+        guiselect(g, s);
+    }
+    ImVec2 r0 = ImGui::GetItemRectMin();
+    ImVec2 r1 = ImGui::GetItemRectMax();
+    s->row = {r0.x, r0.y, r1.x, r1.y};
+    if (!*other && s!=g->sess) {
+        itemrect(g, RECT_OTHERSESS);
+        *other = 1;
+    }
+    Str cwd = v && v->cwd.len ? v->cwd : s->cwd;
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
+        Buf tip(&a, 256);
+        print(&tip, cwd);
+        putbyte(&tip, '\n');
+        print(&tip, s->sid);
+        if (v && gaugewidth(g, v)>0) {
+            putbyte(&tip, '\n');
+            gaugetip(&tip, v);
+        }
+        ImGui::SetTooltip("%s", cstr0(&a, finish(&tip)));
+    }
+    if (ImGui::BeginPopupContextItem("##sessmenu")) {
+        g->menusess = s;
+        sessitems(g, a, s);
+        ImGui::EndPopup();
+    }
+
+    f32 x = p.x + 4*sc + (f32)r->depth*12*sc;
+    if (r->kids) {
+        // The arrow, over the row, folds its subagents
+        ImVec2 back = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(v2(x - 2*sc, p.y));
+        ImGui::InvisibleButton("##fold", v2(14*sc, lineh + 4*sc));
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            foldrow(g, r);
+        }
+        itemnamed(g, concat(&a, "fold ", sesstitle(s)));
+        whytip(r->forced ? Str("Open while a subagent works or asks") :
+               r->folded ? Str("Show its subagents") : Str("Hide its subagents"));
+        ImGui::SetCursorScreenPos(back);
+        foldarrow(g, dl, x, p.y + 2*sc, r->folded, r->forced);
+    }
+    x += 14*sc;
+
+    // A dot in the color of its state, amber when it, or a subagent
+    // below it, waits for the user
+    b32 ro    = s->readonly || (!v && s->locked);
+    b32 asks  = v && v->asks;
+    s->kidask = r->asks && !asks;
+    u32 color = ro || asks || s->kidask ? g->pal->amber : livecolor(g->pal, state);
+    drawdot(dl, v2(x + 4*sc, p.y + 2*sc + lineh/2), 3.5f*sc, color);
+    x += 13*sc;
+
+    Pen t = {dl, &g->fonts, x, p.y + 2*sc, p.x + w, g->fonts.size};
+    pen(&t, sesstitle(s), 0, g->pal->text);
+    if (r->folded) {
+        Buf k(&a, 32);
+        print(&k, "  +");
+        print(&k, (i64)(r->count - 1));
+        pen(&t, finish(&k), 0, g->pal->dim);
+    }
+    Pen b = {dl, &g->fonts, x, p.y + 2*sc + lineh, p.x + w, small};
+    if (sessparent(s).len && v && v->role.len) {
+        pen(&b, v->role, 0, g->pal->dim);
+        pen(&b, "  ", 0, g->pal->dim);
+    }
+    if (s->host->kind == GH_LOCAL) {
+        pen(&b, "background", STYLE_BOLD, g->pal->active);
+        pen(&b, "  ", 0, g->pal->dim);
+        g->bgbadge += s == g->sess;
+    }
+    if (s->host->kind!=GH_ENGINE && !s->host->up) {
+        // Its link comes back by itself, or not at all
+        b32 back = s->host->r && !s->host->closing;
+        pen(&b, back ? Str("reconnecting") : Str("disconnected"), STYLE_BOLD,
+            back ? g->pal->amber : g->pal->dim);
+    } else if (ro) {
+        pen(&b, "read-only", STYLE_BOLD, g->pal->amber);
+    } else if (asks) {
+        pen(&b, "needs an answer", STYLE_BOLD, g->pal->amber);
+    } else if (s->kidask) {
+        pen(&b, "a subagent needs an answer", STYLE_BOLD, g->pal->amber);
+        g->kidaskshown |= s == g->sess;
+    } else {
+        pen(&b, livelabel(v, state), STYLE_BOLD, livecolor(g->pal, state));
+        if (v && state==LIVE_QUEUED && v->queuepos) {
+            Buf q(&a, 32);
+            print(&q, " ");
+            print(&q, (i64)v->queuepos);
+            print(&q, " of ");
+            print(&q, (i64)(v->queuelen>v->queuepos ? v->queuelen : v->queuepos));
+            pen(&b, finish(&q), 0, g->pal->dim);
+        }
+    }
+    i64 jobs = v ? v->jobsrun : s->jobs;
+    if (jobs) {
+        Buf q(&a, 32);
+        print(&q, "  ");
+        print(&q, jobs);
+        print(&q, jobs==1 ? Str(" job") : Str(" jobs"));
+        pen(&b, finish(&q), STYLE_BOLD, g->pal->active);
+    }
+    pen(&b, "  ", 0, g->pal->dim);
+    pen(&b, cwd, 0, g->pal->dim);
+    // Its context gauge, thin along the row's foot, where a view has it
+    if (v && gaugewidth(g, v)>0 && p.x+w-4*sc-x >= 8) {
+        gaugebar(g, dl, v, x, r1.y - 3*sc, p.x + w - 4*sc - x, 2*sc, sc);
+    }
+    ImGui::PopID();
+}
+
+// The sidebar: a "+" for a new session, then the tree (sidebar.cpp) of
+// groups, hosts, sessions and subagents, and the archived.
 static void drawsessions(Gui *g)
 {
-    f32   sc = g->scale;
-    Arena a  = g->frame;
+    Arena a     = g->frame;
     i64   nowms = os_time(g->os);
+    if (g->sidedirty) {
+        g->sidedirty = 0;
+        ImGui::MarkIniSettingsDirty();
+    }
+    ImGui::BeginDisabled(!cannew(g));
+    if (ImGui::SmallButton("+")) {
+        g->newhost = 0;  // the default host
+        newsession(g);
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, "new session");
+    whytip(cannew(g) ? Str("A new session, on this computer") : Str{});
     if (g->enginekind != ENGINE_FAKE) {
+        ImGui::SameLine();
         if (ImGui::SmallButton("Refresh")) {
             guilistall(g);
         }
         ImGui::SetItemTooltip("List the sessions again");
     }
-    // Heads for each host when there is more than one to show
-    b32 heads = 0;
+
+    // The hosts to list: every one reached, and every configured remote
+    // unless only while connected
+    struct HostRef {
+        GuiHost *h;
+        Str      remote;  // a configured remote never reached
+    };
+    Slice<HostRef>  refs  = {};
+    SideIn          in    = {};
     for (GuiHost *h = g->hosts; h; h = h->next) {
-        heads |= h->kind!=GH_ENGINE;
+        if (h->kind==GH_REMOTE && !remotelisted(g, h, h->name)) {
+            continue;
+        }
+        refs     = push(&a, refs, HostRef{h, {}});
+        in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, h, {}), 1});
     }
-    Slice<GuiSession *> list = sesslist(g, &a);
-    b32         other = 0;  // the checklist's first session not shown
-    ImDrawList *dl    = ImGui::GetWindowDrawList();
-    f32         lineh = ImGui::GetTextLineHeight();
-    f32         small = g->fonts.size * 0.85f;
-    GuiHost    *head  = 0;
-    for (iz i = 0; i < list.len; i++) {
-        GuiSession *s     = list[i];
-        View       *v     = s->view;
-        i32         state = v ? v->state : s->state;
-        if (heads && s->host!=head) {
-            head = s->host;
-            if (i) ImGui::Spacing();
-            drawhosthead(g, a, head, nowms);
+    Slice<Str> names = g->enginekind==ENGINE_FAKE ? Slice<Str>{} : remotenames(g, &a);
+    for (iz i = 0; i < names.len; i++) {
+        if (!findhost(g, GH_REMOTE, names[i]) && remotelisted(g, 0, names[i])) {
+            refs     = push(&a, refs, HostRef{0, names[i]});
+            in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, 0, names[i]), 1});
         }
-        pushstr(s->sid);
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        f32    w = ImGui::GetContentRegionAvail().x;
-        if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc))) {
-            guiselect(g, s);
-        }
-        ImVec2 r0 = ImGui::GetItemRectMin();
-        ImVec2 r1 = ImGui::GetItemRectMax();
-        s->row = {r0.x, r0.y, r1.x, r1.y};
-        if (!other && s!=g->sess) {
-            itemrect(g, RECT_OTHERSESS);
-            other = 1;
-        }
-        Str cwd = v && v->cwd.len ? v->cwd : s->cwd;
-        ImGui::SetItemTooltip("%s\n%s", cstr0(&a, cwd), cstr0(&a, s->sid));
-        f32 x = p.x + 4*sc + (f32)s->depth*14*sc;  // a subagent under its parent
+    }
+    in.heads  = in.hosts.len > 1;
+    in.groups = g->groups;
+    in.folds  = g->folds;
 
-        // A dot in the color of its state, amber when it, or a subagent
-        // below it, waits for the user
-        b32 ro    = s->readonly || (!v && s->locked);
-        b32 asks  = v && v->asks;
-        u32 color = ro || asks || s->kidask ? g->pal->amber : livecolor(g->pal, state);
-        drawdot(dl, v2(x + 4*sc, p.y + 2*sc + lineh/2), 3.5f*sc, color);
-        x += 13*sc;
-
-        Pen t = {dl, &g->fonts, x, p.y + 2*sc, p.x + w, g->fonts.size};
-        pen(&t, sesstitle(s), 0, g->pal->text);
-        Pen b = {dl, &g->fonts, x, p.y + 2*sc + lineh, p.x + w, small};
-        if (s->depth && v && v->role.len) {
-            pen(&b, v->role, 0, g->pal->dim);
-            pen(&b, "  ", 0, g->pal->dim);
-        }
-        if (s->host->kind == GH_LOCAL) {
-            pen(&b, "background", STYLE_BOLD, g->pal->active);
-            pen(&b, "  ", 0, g->pal->dim);
-            g->bgbadge += s == g->sess;
-        }
-        if (s->host->kind!=GH_ENGINE && !s->host->up) {
-            // Its link comes back by itself, or not at all
-            b32 back = s->host->r && !s->host->closing;
-            pen(&b, back ? Str("reconnecting") : Str("disconnected"), STYLE_BOLD,
-                back ? g->pal->amber : g->pal->dim);
-        } else if (ro) {
-            pen(&b, "read-only", STYLE_BOLD, g->pal->amber);
-        } else if (asks) {
-            pen(&b, "needs an answer", STYLE_BOLD, g->pal->amber);
-        } else if (s->kidask) {
-            pen(&b, "a subagent needs an answer", STYLE_BOLD, g->pal->amber);
-            g->kidaskshown |= s == g->sess;
-        } else {
-            pen(&b, livelabel(v, state), STYLE_BOLD, livecolor(g->pal, state));
-            if (v && state==LIVE_QUEUED && v->queuepos) {
-                Buf q(&a, 32);
-                print(&q, " ");
-                print(&q, (i64)v->queuepos);
-                print(&q, " of ");
-                print(&q, (i64)(v->queuelen>v->queuepos ? v->queuelen : v->queuepos));
-                pen(&b, finish(&q), 0, g->pal->dim);
+    // Its sessions, each host's newest first
+    Slice<GuiSession *> sess = {};
+    for (iz i = 0; i < refs.len; i++) {
+        Slice<GuiSession *> l = {};
+        for (GuiSession *s = g->sessions; refs[i].h && s; s = s->next) {
+            if (s->host==refs[i].h && !s->gone && (s->view || s->listed)) {
+                l = push(&a, l, s);
             }
         }
-        i64 jobs = v ? v->jobsrun : s->jobs;
-        if (jobs) {
-            Buf q(&a, 32);
-            print(&q, "  ");
-            print(&q, jobs);
-            print(&q, jobs==1 ? Str(" job") : Str(" jobs"));
-            pen(&b, finish(&q), STYLE_BOLD, g->pal->active);
-        }
-        pen(&b, "  ", 0, g->pal->dim);
-        pen(&b, cwd, 0, g->pal->dim);
-        ImGui::PopID();
-    }
-    // Remote hosts with nothing to show yet, but how they are
-    for (GuiHost *h = g->hosts; heads && h; h = h->next) {
-        b32 any = 0;
-        for (iz i = 0; i < list.len; i++) {
-            any |= list[i]->host == h;
-        }
-        if (!any && h->kind==GH_REMOTE && h->state!=RS_CLOSED) {
-            ImGui::Spacing();
-            drawhosthead(g, a, h, nowms);
+        sort(l.data, l.len, sidafter, a);
+        for (iz k = 0; k < l.len; k++) {
+            GuiSession *s = l[k];
+            View       *v = s->view;
+            SideSess    e = {};
+            e.host     = (i32)i;
+            e.sid      = s->sid;
+            e.parent   = sessparent(s);
+            e.group    = s->group;
+            e.archived = s->archived;
+            e.asks     = v && v->asks && !s->readonly;
+            e.active   = v ? v->busy && !s->readonly
+                           : s->state!=LIVE_IDLE && s->state!=LIVE_CLOSED;
+            in.sess = push(&a, in.sess, e);
+            sess    = push(&a, sess, s);
         }
     }
-    if (!list.len) {
+
+    Slice<SideRow> rows  = sidetree(&a, &in);
+    b32            other = 0;  // the checklist's first session not shown
+    if (g->drive) {
+        // The tree as text, for the checklist: a line a row, indented,
+        // G group, H host, S title, A for Archived, + if folded
+        Buf d(&a, 1024);
+        for (iz i = 0; i < rows.len; i++) {
+            SideRow *r = &rows[i];
+            for (i32 k = 0; k < r->depth; k++) {
+                putbyte(&d, ' ');
+            }
+            switch (r->kind) {
+            case SROW_GROUP:   print(&d, "G "); print(&d, r->group); break;
+            case SROW_HOST:    print(&d, "H "); print(&d, in.hosts[r->host].key); break;
+            case SROW_SESSION: print(&d, "S "); print(&d, sesstitle(sess[r->sess])); break;
+            case SROW_ARCHIVED: print(&d, "A"); break;
+            }
+            print(&d, r->folded ? Str("+\n") : Str("\n"));
+        }
+        Str t = finish(&d);
+        g->sidelen = t.len<(iz)SIDEDUMP_MAX ? t.len : (iz)SIDEDUMP_MAX;
+        copybytes(g->sidedump, t.data, g->sidelen);
+    }
+    for (iz i = 0; i < rows.len; i++) {
+        SideRow *r = &rows[i];
+        if (r->kind == SROW_SESSION) {
+            drawsessrow(g, a, r, sess[r->sess], &other);
+        } else {
+            if (i && r->depth==0) {
+                ImGui::Spacing();
+            }
+            HostRef ref = r->kind==SROW_HOST ? refs[r->host] : HostRef{};
+            drawheading(g, a, r, ref.h, ref.remote, nowms);
+        }
+    }
+    if (!sess.len) {
         ImGui::TextDisabled("No sessions yet.");
     }
 }
+
+// The naming dialog (a session's title, a new group for it, a group's
+// new name), the deletion's confirmation, and the Markdown export's
+// options: the sidebar's and the Session menu's dialogs.
+static void drawsessdialogs(Gui *g)
+{
+    Arena a  = g->frame;
+    f32   sc = g->scale;
+
+    static char const *titles[] = {"Rename session", "New group", "Rename group"};
+    if (g->opennamer) {
+        g->opennamer = 0;
+        ImGui::OpenPopup("##namer");
+    }
+    ImGui::SetNextWindowSize(v2(420*sc, 0));
+    if (ImGui::BeginPopupModal("##namer", 0, ImGuiWindowFlags_NoTitleBar)) {
+        ImGui::TextUnformatted(titles[g->nameask]);
+        if (g->nameask == NAME_NEWGROUP && g->namesess) {
+            ImGui::TextDisabled("For %s", cstr0(&a, shorten(&a, sesstitle(g->namesess), 60)));
+        }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        b32 enter = ImGui::InputText("##name", g->namebuf, FIELD_MAX,
+                                     ImGuiInputTextFlags_EnterReturnsTrue |
+                                     ImGuiInputTextFlags_AutoSelectAll);
+        itemnamed(g, "name field");
+        Str name = trim({(u8 *)g->namebuf, (iz)__builtin_strlen(g->namebuf)});
+        ImGui::BeginDisabled(!name.len);
+        b32 ok = ImGui::Button("OK", v2(120*sc, 0));
+        ImGui::EndDisabled();
+        itemnamed(g, "name ok");
+        ImGui::SameLine();
+        b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape);
+        if ((ok || enter) && name.len) {
+            GuiSession *s = g->namesess;
+            switch (g->nameask) {
+            case NAME_RENAME:
+                if (s && !s->gone) guirename(g, s, name);
+                break;
+            case NAME_NEWGROUP:
+                if (s && !s->gone) guigroup(g, s, name);
+                break;
+            case NAME_GROUP: {
+                Slice<GuiSession *> roots = grouproots(g, &a, g->namegroup);
+                for (iz i = 0; i < roots.len; i++) {
+                    guigroup(g, roots[i], name);
+                }
+                // In the old one's place in the order
+                b32 dup = 0;
+                for (iz i = 0; i < g->groups.len; i++) {
+                    dup |= g->groups[i] == name;
+                }
+                for (iz i = 0; i < g->groups.len; i++) {
+                    if (g->groups[i] == g->namegroup) {
+                        g->groups[i] = clone(&g->perm, name);
+                        break;
+                    }
+                }
+                if (dup) {
+                    groupdrop(g, g->namegroup);
+                }
+                g->sidedirty = 1;
+            } break;
+            }
+            ImGui::CloseCurrentPopup();
+        } else if (cancel) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (g->opendelsess) {
+        g->opendelsess = 0;
+        ImGui::OpenPopup("Delete sessions?");
+    }
+    ImGui::SetNextWindowSize(v2(460*sc, 0));
+    if (ImGui::BeginPopupModal("Delete sessions?", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        Buf b(&a, 512);
+        if (g->delgroup.len) {
+            print(&b, "Delete the group ");
+            print(&b, g->delgroup);
+            print(&b, " and its ");
+        } else {
+            print(&b, "Delete ");
+            print(&b, g->delroots.len ? shorten(&a, sesstitle(g->delroots[0]), 60) : Str(""));
+            print(&b, g->delcount>1 ? Str(" with its subagents: ") : Str(""));
+        }
+        if (g->delgroup.len || g->delcount>1) {
+            print(&b, (i64)g->delcount);
+            print(&b, g->delcount==1 ? Str(" session") : Str(" sessions"));
+            if (g->delgroup.len && g->delcount>(i32)g->delroots.len) {
+                print(&b, ", subagents included");
+            }
+        }
+        print(&b, "?");
+        ImGui::PushTextWrapPos(440*sc);
+        ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+        ImGui::TextDisabled("Their logs and files are removed for good.");
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Button, fade(g->pal->bad, 0.6f));
+        b32 del = ImGui::Button("Delete", v2(120*sc, 0));
+        ImGui::PopStyleColor();
+        itemnamed(g, "delete ok");
+        ImGui::SameLine();
+        b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape);
+        itemnamed(g, "delete cancel");
+        if (del) {
+            for (iz i = 0; i < g->delroots.len; i++) {
+                GuiSession *s = g->delroots[i];
+                if (s->gone) continue;
+                // Not held open by this client: its views go first
+                for (GuiSession *k = g->sessions; k; k = k->next) {
+                    if (k->view && k->host==s->host && sessroot(g, k)==s) {
+                        sessclose(g, k);
+                    }
+                }
+                guidelete(g, s);
+            }
+            if (g->delgroup.len) {
+                groupdrop(g, g->delgroup);
+            }
+            g->delroots = {};
+            ImGui::CloseCurrentPopup();
+        } else if (cancel) {
+            g->delroots = {};
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (g->openexport) {
+        g->openexport = 0;
+        ImGui::OpenPopup("Export as Markdown");
+    }
+    if (ImGui::BeginPopupModal("Export as Markdown", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        GuiSession *s = g->exportsess;
+        Export     *x = &g->exp;
+        if (s) {
+            ImGui::TextDisabled("%s", cstr0(&a, shorten(&a, sesstitle(s), 60)));
+        }
+        checkbox("Reasoning", &x->think);
+        itemnamed(g, "export think");
+        checkbox("Tool calls", &x->tools);
+        itemnamed(g, "export tools");
+        ImGui::BeginDisabled(!x->tools);
+        ImGui::Indent();
+        checkbox("Their output", &x->output);
+        itemnamed(g, "export output");
+        ImGui::Unindent();
+        ImGui::EndDisabled();
+        ImGui::Spacing();
+        ImGui::BeginDisabled(!s || s->gone);
+        b32 save = ImGui::Button("Save...", v2(120*sc, 0));
+        itemnamed(g, "export save");
+        ImGui::SameLine();
+        b32 copy = ImGui::Button("Copy", v2(120*sc, 0));
+        itemnamed(g, "export copy");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape);
+        if ((save || copy) && s && !s->gone) {
+            guiexport(g, s, EXPORT_MD, copy);
+            ImGui::CloseCurrentPopup();
+        } else if (cancel) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 
 // Todo list and background jobs, of the session shown
 
@@ -4434,6 +5361,8 @@ static void drawcfgpage(Gui *g)
                         "file, so delete it there");
         } else if (!any) {
             print(&why, "Not in any file yet");
+        } else if (!hostcap(g->main, "config.delete")) {
+            print(&why, "The engine is too old to delete a section");
         }
         ImGui::BeginDisabled(why.len > 0);
         b32 del = ImGui::Button(label.cdata);
@@ -5041,20 +5970,26 @@ static void drawmenubar(Gui *g)
         if (add) {
             newsession(g);
         }
-        // The engine's session operations, to come
-        ImGui::BeginDisabled();
+        // The session operations, on the session shown, as its context
+        // menu in the sidebar has them
         ImGui::Separator();
-        ImGui::MenuItem("Fork");
-        ImGui::MenuItem("Rename...");
-        ImGui::MenuItem("Compact");
-        ImGui::MenuItem("Switch model...");
-        ImGui::MenuItem("Export...");
-        ImGui::Separator();
-        ImGui::MenuItem("Archive");
-        ImGui::MenuItem("Delete...");
-        ImGui::Separator();
-        ImGui::MenuItem("Close");
-        ImGui::EndDisabled();
+        if (g->sess && !g->sess->gone && g->enginekind!=ENGINE_FAKE) {
+            g->menusess = g->sess;
+            sessitems(g, a, g->sess);
+        } else {
+            ImGui::BeginDisabled();
+            ImGui::MenuItem("Rename...");
+            ImGui::MenuItem("Fork");
+            ImGui::MenuItem("Compact");
+            ImGui::MenuItem("Switch model...");
+            ImGui::MenuItem("Export...");
+            ImGui::Separator();
+            ImGui::MenuItem("Archive");
+            ImGui::MenuItem("Delete...");
+            ImGui::Separator();
+            ImGui::MenuItem("Close");
+            ImGui::EndDisabled();
+        }
         ImGui::Separator();
         #if defined(__APPLE__)
         char const *quit = "Cmd+Q";
@@ -5250,6 +6185,7 @@ static void drawdialogs(Gui *g)
     }
     drawnew(g);
     drawclose(g);
+    drawsessdialogs(g);
 }
 
 // The dock node a window is in, or was in when the layout was saved;

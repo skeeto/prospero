@@ -99,7 +99,7 @@ if(WIN32 AND PROSPERO_GUI)
   )
   add_executable(prospero WIN32 src/main_win32.cpp)
   target_link_libraries(prospero PRIVATE
-    prospero_gui imgui md4c kernel32 advapi32 winhttp
+    prospero_gui imgui md4c kernel32 advapi32 winhttp comdlg32 ole32
   )
   target_link_options(prospero PRIVATE -static -municode)
 elseif(WIN32)

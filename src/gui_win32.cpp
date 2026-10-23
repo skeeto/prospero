@@ -88,11 +88,21 @@ extern "C" int       w32gui_where(void *, int *geom);
 extern "C" void      w32gui_place(void *, int const *geom);
 extern "C" int       w32gui_trayopen(void *, unsigned short const *tip);
 extern "C" void      w32gui_trayclose(void *);
+// The save dialog, on a thread of its own, which calls done with the
+// path chosen, empty if cancelled, and a copy of ctx (at most 32 bytes)
+extern "C" int       w32gui_save(unsigned short const *title,
+                                 unsigned short const *name,
+                                 void (*done)(void *ctx, unsigned short const *path),
+                                 void const *ctx, int ctxlen);
+extern "C" int       w32gui_reveal(unsigned short const *dir);
 
 
 #if PROSPERO_GUIEDGE
 
 #include <windows.h>
+#include <commdlg.h>
+#include <objbase.h>
+#include <shellapi.h>
 #include <dwmapi.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -941,6 +951,68 @@ extern "C" void w32gui_close(void *p)
     UnregisterClassW(L"prospero-msg", GetModuleHandleW(0));
 }
 
+// The save dialog runs on a thread of its own with no owner, so that the
+// window's loop never waits on it: GetSaveFileNameW is modal to the
+// thread that calls it, and an owner on another thread would tie the
+// two threads' input together.
+struct W32Save {
+    wchar_t title[256];
+    wchar_t path[32768];
+    void  (*done)(void *, unsigned short const *);
+    char    ctx[32];
+};
+
+static DWORD WINAPI savethread(void *arg)
+{
+    W32Save *s  = (W32Save *)arg;
+    HRESULT  co = CoInitializeEx(0, COINIT_APARTMENTTHREADED);
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = L"All files\0*.*\0";
+    ofn.lpstrFile   = s->path;
+    ofn.nMaxFile    = sizeof(s->path)/sizeof(s->path[0]);
+    ofn.lpstrTitle  = s->title;
+    ofn.Flags       = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST |
+                      OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+    if (!GetSaveFileNameW(&ofn)) {
+        s->path[0] = 0;
+    }
+    s->done(s->ctx, (unsigned short const *)s->path);
+    if (SUCCEEDED(co)) {
+        CoUninitialize();
+    }
+    HeapFree(GetProcessHeap(), 0, s);
+    return 0;
+}
+
+extern "C" int w32gui_save(unsigned short const *title, unsigned short const *name,
+                           void (*done)(void *, unsigned short const *),
+                           void const *ctx, int ctxlen)
+{
+    W32Save *s = (W32Save *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(W32Save));
+    if (!s || ctxlen>(int)sizeof(s->ctx)) {
+        if (s) HeapFree(GetProcessHeap(), 0, s);
+        return 0;
+    }
+    lstrcpynW(s->title, (wchar_t const *)title, sizeof(s->title)/sizeof(s->title[0]));
+    lstrcpynW(s->path, (wchar_t const *)name, sizeof(s->path)/sizeof(s->path[0]));
+    memcpy(s->ctx, ctx, (size_t)ctxlen);
+    s->done = done;
+    HANDLE t = CreateThread(0, 0, savethread, s, 0, 0);
+    if (!t) {
+        HeapFree(GetProcessHeap(), 0, s);
+        return 0;
+    }
+    CloseHandle(t);
+    return 1;
+}
+
+extern "C" int w32gui_reveal(unsigned short const *dir)
+{
+    HINSTANCE r = ShellExecuteW(0, L"open", (wchar_t const *)dir, 0, 0, SW_SHOWNORMAL);
+    return (INT_PTR)r > 32;
+}
+
 // CRT startup lands here (-municode), and the core takes over.
 extern "C" void prospero_main();
 
@@ -1155,6 +1227,39 @@ static b32 os_trayopen(Os *os, Str tip)
 static void os_trayclose(Os *os)
 {
     w32gui_trayclose(os->gui);
+}
+
+struct W32SaveCtx {
+    Mailbox *mb;
+    u32      type;
+    u64      id;
+};
+
+// On the dialog's thread: the path, in UTF-8, to the mailbox.
+static void savedone(void *ctx, unsigned short const *path)
+{
+    W32SaveCtx *c = (W32SaveCtx *)ctx;
+    static_assert(sizeof(W32SaveCtx) <= 32);
+    byte  mem[1<<17];
+    Arena a = {mem, mem+countof(mem)};
+    iz    n = 0;
+    for (; path[n]; n++) {}
+    Str   p = fromwide(&a, (c16 *)path, n);
+    mailpost(c->mb, c->type, c->id, p, 1);
+}
+
+static b32 os_guisave(Os *, Arena scratch, Str title, Str name, Mailbox *mb,
+                      u32 type, u64 id)
+{
+    W32SaveCtx c = {mb, type, id};
+    return w32gui_save((unsigned short *)towide(&scratch, title).data,
+                       (unsigned short *)towide(&scratch, name).data,
+                       savedone, &c, (int)sizeof(c));
+}
+
+static b32 os_guireveal(Os *, Arena scratch, Str dir)
+{
+    return w32gui_reveal((unsigned short *)towide(&scratch, dir).data);
 }
 
 #endif

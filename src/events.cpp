@@ -169,6 +169,7 @@ static Str capnames[] = {
     "scratch",         // a scratch directory per session, and [guard] temp
     "delete",          // delete, a session with its subagents
     "fork",            // fork, a new session from a turn of another
+    "config.delete",   // config.set {delete}: a section of the user's file
 };
 
 static Str evname(i32 ev)

@@ -2845,3 +2845,140 @@ static void viewdump(Buf *b, View *v)
         putbyte(b, '\n');
     }
 }
+
+
+// Exports
+
+// A fence of backticks longer than any run in s, at least three.
+static void exportfence(Buf *b, Str s)
+{
+    iz n = backticks(s) + 1;
+    for (iz i = 0; i < (n>3 ? n : 3); i++) {
+        putbyte(b, '`');
+    }
+}
+
+// The first line of s, trimmed and cut to a summary's length, and
+// whether anything was left out.
+static Str exportline(Str s, b32 *more)
+{
+    s = trim(s);
+    Cut c = cut(s, '\n');
+    Str r = trimright(c.head);
+    *more = c.ok;
+    if (r.len > VIEW_SUMMARY) {
+        iz n = VIEW_SUMMARY;
+        for (; n>0 && (r[n]&0xc0)==0x80; n--) {}
+        r     = takehead(r, n);
+        *more = 1;
+    }
+    return r;
+}
+
+// The transcript as a Markdown document, for an export: the title and
+// what the session is, then each message under a heading of who wrote
+// it. Reasoning (think), tool calls and asks as a line of their name
+// and summary (tools), and under each call its output (output) are left
+// out unless asked for. Notes and cards are a line each, in italics.
+static void viewexport(Buf *b, View *v, Str sid, b32 think, b32 tools, b32 output)
+{
+    print(b, "# ");
+    print(b, v->title.len ? v->title : Str("Untitled session"));
+    print(b, "\n\nSession ");
+    print(b, sid);
+    if (v->model.len) {
+        print(b, ", ");
+        print(b, v->model);
+    }
+    if (v->cwd.len) {
+        print(b, ", in ");
+        codespan(b, v->cwd);
+    }
+    putbyte(b, '\n');
+    i32 last = -1;
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg *m    = &v->msgs[i];
+        b32      more = 0;
+        if (m->prov) {
+            continue;
+        }
+        switch (m->role) {
+        case VIEW_USER:
+        case VIEW_ASSISTANT:
+            if (m->role==VIEW_USER || last!=VIEW_THINK) {
+                print(b, "\n## ");
+                print(b, m->label.len ? m->label :
+                         m->role==VIEW_USER ? Str("You") : Str("Agent"));
+                putbyte(b, '\n');
+            }
+            putbyte(b, '\n');
+            print(b, m->text);
+            print(b, m->text.len && m->text[m->text.len-1]=='\n' ? Str("") : Str("\n"));
+            break;
+        case VIEW_THINK:
+            if (!think || !m->text.len) {
+                continue;
+            }
+            print(b, last==VIEW_THINK ? Str("") : Str("\n## Agent\n"));
+            print(b, "\n> **Reasoning**\n>\n");
+            for (Str rest = m->text; rest.len;) {
+                Cut c = cut(rest, '\n');
+                print(b, c.head.len ? Str("> ") : Str(">"));
+                print(b, c.head);
+                putbyte(b, '\n');
+                rest = c.tail;
+            }
+            break;
+        case VIEW_TOOL:
+        case VIEW_ASK: {
+            ViewTool *t = m->tool;
+            if (!tools || !t) {
+                continue;
+            }
+            b32 ask = m->role == VIEW_ASK;
+            print(b, ask ? Str("\n**Asked: ") : Str("\n**Tool: "));
+            print(b, ask ? t->tool : t->name);
+            print(b, "**");
+            Str what = exportline(ask ? (t->path.len ? t->path : t->detail) : t->summary, &more);
+            if (what.len) {
+                putbyte(b, ' ');
+                codespan(b, what);
+                print(b, more ? Str("\xe2\x80\xa6") : Str(""));
+            }
+            if (ask) {
+                print(b, t->answer==VASK_ALLOWED ? Str(" (allowed)") :
+                         t->answer==VASK_DENIED  ? Str(" (denied)")  : Str(""));
+            } else if (t->status != VTOOL_OK) {
+                print(b, " (");
+                print(b, vtoolnames[t->status]);
+                putbyte(b, ')');
+            }
+            putbyte(b, '\n');
+            if (output && !ask && m->text.len) {
+                putbyte(b, '\n');
+                exportfence(b, m->text);
+                putbyte(b, '\n');
+                print(b, m->text);
+                print(b, m->text[m->text.len-1]=='\n' ? Str("") : Str("\n"));
+                exportfence(b, m->text);
+                putbyte(b, '\n');
+            }
+        } break;
+        default: {
+            // Notes, compactions, rewinds: their first line
+            Str line = exportline(m->text, &more);
+            if (!line.len) {
+                continue;
+            }
+            print(b, "\n_");
+            print(b, m->label.len ? m->label : m->role==VIEW_COMPACT ? Str("Compacted")
+                                             : m->role==VIEW_REWIND  ? Str("Rewound")
+                                                                     : Str("Note"));
+            print(b, ":_ ");
+            print(b, line);
+            print(b, more ? Str("\xe2\x80\xa6\n") : Str("\n"));
+        }
+        }
+        last = m->role;
+    }
+}

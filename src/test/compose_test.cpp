@@ -40,6 +40,13 @@ static void test_compose(Test *t)
     expect(t, "slash.fork", slashstr(&a, "/fork"), "/fork|");
     expect(t, "slash.forkargs", slashstr(&a, "/fork now"), "/fork|now|err");
     expect(t, "slash.export", slashstr(&a, "/export\n"), "/export|");
+    expect(t, "slash.forkturn", slashstr(&a, "/fork 3"), "/fork|3");
+    expect(t, "slash.forkn", istr(&a, parseslash("/fork 3").turn), "3");
+    expect(t, "slash.forkall", istr(&a, parseslash("/fork").turn), "-1");
+    expect(t, "slash.forkneg", slashstr(&a, "/fork -1"), "/fork|-1|err");
+    expect(t, "slash.raw", istr(&a, parseslash("/export raw").raw), "1");
+    expect(t, "slash.md", slashstr(&a, "/export md"), "/export|md");
+    expect(t, "slash.exportbad", slashstr(&a, "/export pdf"), "/export|pdf|err");
     expect(t, "slash.newline", slashstr(&a, "/compact\nkeep the API"), "/compact|keep the API");
     expect(t, "slash.path", slashstr(&a, "/usr/bin/foo is broken"), "text|");
     expect(t, "slash.prefix", slashstr(&a, "/comp"), "text|");

@@ -19,6 +19,7 @@ by quitting are gone, with no engine process left behind.
   uv run tests/gui.py --prospero build/prospero --mode signals   (POSIX)
   uv run tests/gui.py --prospero build/prospero --mode settings [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode enginestop
+  uv run tests/gui.py --prospero build/prospero --mode sessions [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --fake [--mode idle]   (M1's)
   uv run tests/gui.py --prospero build/prospero --mode bench   (M1's scale)
   uv run tests/gui.py --prospero build/prospero --mode compose [--shots DIR]
@@ -30,7 +31,12 @@ through the settings' pages narrow (a combo) and wide (a list), checking
 that nothing scrolls sideways, edits the guard's roots one a line,
 deletes a section after cancelling once, finds an included one it cannot
 delete, and adds a model; the file must then hold those edits and no
-other change. The enginestop
+other change. The sessions mode goes through the sidebar's tree and its
+context menus: folding, renaming, a group, archiving, a model switch,
+exports as Markdown and as the raw log (which must hold what they
+should), a whole session forked, another forked before its prompt (the
+prompt then in the fork's box), and a session with its subagents
+deleted. The enginestop
 mode kills the engine process mid-turn and mid-ask: the GUI must stop
 counting either, and quit at once when closed. The compose mode runs
 the compose box's checklist, with [ui] editor a test script (an editor
@@ -984,7 +990,7 @@ def main():
     ap.add_argument("--mode", default="drive",
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
-                             "compose"])
+                             "compose", "sessions"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1046,6 +1052,13 @@ def main():
         editor = host.path("edit.sh")
         host.write(editor, COMPOSE_EDITOR)
         before = config(curl, model, extra=composeconfig(editor, nonce))
+    elif args.mode == "sessions":
+        # A model to switch to; a remote listed always, never reached,
+        # and one listed only while connected
+        before = config(curl, model, 60,
+                        f"\n[model fake:gui_b:{nonce}]\ntemperature = 0.5\n"
+                        "\n[remote far]\nssh = far.invalid\n"
+                        "\n[remote hidden]\nssh = hidden.invalid\nlist = connected\n")
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
         # Instruction files for the info popup, and files to compact over
@@ -1132,7 +1145,7 @@ def main():
         else:
             print(f"the URL include was fetched {fetched} times")
         problems += far.close(args.keep)
-    if args.mode in ("drive", "e2e", "settings", "enginestop"):
+    if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")
@@ -1168,6 +1181,12 @@ def main():
                          "settings-narrowest"):
                 if not os.path.exists(os.path.join(args.shots, name + ".png")):
                     problems.append(f"no {name}.png")
+    if args.mode == "sessions" and args.shots and not args.host:
+        for name in ("sessions-tree", "sessions-folded", "sessions-menu", "sessions-group",
+                     "sessions-archived", "sessions-picker", "sessions-export",
+                     "sessions-forkhere", "sessions-forked", "sessions-delete"):
+            if not os.path.exists(os.path.join(args.shots, name + ".png")):
+                problems.append(f"no {name}.png")
     if args.mode == "enginestop":
         time.sleep(0.5)
         found = P.parse(host.read(host.path("work", "close.pid")))

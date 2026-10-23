@@ -221,7 +221,7 @@ static void test_events(Test *t)
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
-               "\"delete\",\"fork\"]}");
+               "\"delete\",\"fork\",\"config.delete\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);

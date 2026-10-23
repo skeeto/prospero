@@ -32,8 +32,8 @@ static SlashInfo slashinfo[] = {
     {"/compact", "[focus]", "Summarize older messages now, keeping what the focus names"},
     {"/model",   "[NAME]",  "Switch this session's model, or pick one from a list"},
     {"/rename",  "TITLE",   "Give this session a title"},
-    {"/fork",    "",        "Start a new session from a copy of this one"},
-    {"/export",  "",        "Save the transcript to a file"},
+    {"/fork",    "[TURN]",  "Start a new session from a copy of this one, or of its first turns"},
+    {"/export",  "[raw]",   "Save the transcript as Markdown, or its raw log"},
 };
 static_assert(countof(slashinfo) == SLASH_COUNT);
 
@@ -41,12 +41,15 @@ struct Slash {
     i32 cmd;  // SLASH_*
     Str arg;  // the rest, trimmed
     Str err;  // why the command cannot run as typed, else null
+    i64 turn; // /fork's turn, else -1: the whole session
+    b32 raw;  // /export's raw log, not Markdown
 };
 
 // The command a message is, if its first word is exactly one.
 static Slash parseslash(Str text)
 {
     Slash r    = {};
+    r.turn     = -1;
     Str   t    = trim(text);
     iz    word = 0;
     while (word<t.len && !whitespace(t[word])) word++;
@@ -70,10 +73,16 @@ static Slash parseslash(Str text)
         }
         break;
     case SLASH_FORK:
-    case SLASH_EXPORT:
         if (r.arg.len) {
-            r.err = r.cmd==SLASH_FORK ? Str("/fork takes nothing after it")
-                                      : Str("/export takes nothing after it");
+            Int n = parseint(r.arg);
+            r.turn = n.ok && n.val>=0 ? n.val : -1;
+            r.err  = r.turn<0 ? Str("/fork takes a turn's number, or nothing") : Str{};
+        }
+        break;
+    case SLASH_EXPORT:
+        r.raw = r.arg=="raw";
+        if (r.arg.len && !r.raw && !(r.arg=="md")) {
+            r.err = "/export takes raw (the log) or md, or nothing (Markdown)";
         }
         break;
     }
