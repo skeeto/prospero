@@ -419,6 +419,7 @@ struct ModelConf {
     b32          novision;   // the model takes no images
     i64          imgedge;    // [model] image_edge, 0 if unset
     i64          imgpixels;  // [model] image_pixels, 0 if unset
+    b32          conf;       // from a [model NAME] section of its name
 };
 
 struct ChatReq {

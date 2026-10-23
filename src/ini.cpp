@@ -67,7 +67,11 @@
 // The writer (iniedit) edits one file's text: it sets a key by splicing
 // its value span, adds a key after the section's last one or a section
 // at the end, and removes a key by dropping its line. All other bytes
-// come through unchanged, so one edit is a one-line diff.
+// come through unchanged, so one edit is a one-line diff. Another
+// (inidelsection) deletes a section: its headers, the lines under them
+// but for comments and blank lines, and the comment lines directly
+// above each header, and the rest stays as it was but for blank lines
+// that set it apart.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -1391,6 +1395,92 @@ static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
     }
     if (at == n) {
         print(&b, finish(&add));
+    }
+    r.text = finish(&b);
+    return r;
+}
+
+// Delete section (kind, name) from one file's text, with everything in
+// perm: each of its headers, the keys and malformed lines under them,
+// and the comment block directly above each header (comment lines with
+// no blank line between them and it). Comments and blank lines among
+// its keys stay, since they may be about anything, as does everything
+// else. (A malformed line goes because one, such as an include inside a
+// section, might mean something where it would land.) Where a deleted
+// stretch was set apart by blank lines, the blanks after it go too, and
+// at the end of the text those before it, so that deleting a section
+// iniedit added gives the text back. A text without a final line
+// terminator still lacks one. Deleting a section the file lacks changes
+// nothing.
+static IniEdit inidelsection(Arena *perm, IniFile *f, Str kind, Str name)
+{
+    IniEdit r = {};
+    if (!iniword(kind, 0) || (name.len && !iniword(name, 0))) {
+        r.err = "invalid section name";
+        return r;
+    }
+
+    iz   n    = f->lines.len;
+    b32 *drop = alloc<b32>(perm, n);
+    b32  in   = 0;  // under one of its headers
+    for (iz i = 0; i < n; i++) {
+        IniLine *l = &f->lines[i];
+        if (startswith(trimleft(l->raw), "[")) {
+            in = l->type==INI_SECTION && iniin(l, kind, name);
+            for (iz k = i; in && k>0 && f->lines[k-1].type==INI_COMMENT; k--) {
+                drop[k-1] = 1;
+            }
+            drop[i]    = in;
+            r.changed |= in;
+        } else if (in && (l->type==INI_KEY || l->type==INI_INVALID)) {
+            drop[i] = 1;
+        }
+    }
+
+    // Each deleted stretch, joined to the next across blank lines
+    for (iz i = 0; i < n;) {
+        if (!drop[i]) {
+            i++;
+            continue;
+        }
+        iz lo = i;
+        iz hi = i;
+        iz j  = i;
+        for (;;) {
+            for (; hi<n && drop[hi]; hi++) {}
+            for (j = hi; j<n && f->lines[j].type==INI_BLANK; j++) {}
+            if (j==n || !drop[j]) {
+                break;
+            }
+            for (; hi < j; hi++) {
+                drop[hi] = 1;
+            }
+        }
+        b32 last  = j == n;
+        b32 apart = !lo || f->lines[lo-1].type==INI_BLANK;
+        for (iz k = hi; (last || apart) && k < j; k++) {
+            drop[k] = 1;
+        }
+        for (iz k = lo; last && k>0 && f->lines[k-1].type==INI_BLANK; k--) {
+            drop[k-1] = 1;
+        }
+        i = j;
+    }
+
+    iz keep = -1;  // the last line kept
+    for (iz i = 0; i < n; i++) {
+        keep = drop[i] ? keep : i;
+    }
+    b32 open = n && !f->lines[n-1].eol.len;  // no final terminator
+    Buf b(perm, 64);
+    if (f->bom) {
+        print(&b, "\xef\xbb\xbf");
+    }
+    for (iz i = 0; i < n; i++) {
+        if (!drop[i]) {
+            print(&b, f->lines[i].raw);
+            print(&b, i==keep && open ? Str{} : f->lines[i].eol);
+        }
     }
     r.text = finish(&b);
     return r;

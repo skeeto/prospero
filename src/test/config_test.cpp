@@ -549,6 +549,101 @@ static void testcfgset(Test *t)
     }
 }
 
+// Deleting sections: only the user's own, never an include's, saying
+// where one is defined when it cannot go
+static void testcfgdelete(Test *t)
+{
+    Arena  a    = t->perm;
+    CfgEnv v    = newcfgenv(&a);
+    Str    team = "# shared\n[endpoint team]\nurl = http://t/\n\n"
+                  "[model both]\ntemperature = 0.1\n";
+    os_write(v.os, a, "/d/team.ini", team);
+    os_write(v.os, a, "/d/h.ini",
+        "# My settings\n"
+        "include = team.ini\n"
+        "\n"
+        "# The local server\n"
+        "[endpoint local]\n"
+        "url = http://localhost/\n"
+        "\n"
+        "# Mine too\n"
+        "[model both]\n"
+        "top_k = 20\n"
+        "\n"
+        "[guard]\n"
+        "ask_timeout = 9\n");
+    Config *c = newconfig(v.os, &a, v.scratch, "/d/h.ini", 0);
+    expect(t, "del.clean", inidiags(&a, c->ini), "");
+
+    // Refusals leave the file alone
+    Str before = cfgfile(v.os, "/d/h.ini");
+    static struct { Str kind, name, err; } bad[] = {
+        {"endpoint", "team", "[endpoint team] is defined in /d/team.ini:2, an "
+         "included file, not in /d/h.ini"},
+        {"endpoint", "none", "[endpoint none] is not in /d/h.ini"},
+        {"", "", "the top level is not a section to delete"},
+        {"provider", "x", "unknown section kind"},
+        {"endpoint", "", "this kind of section needs a name"},
+        {"guard", "g", "this kind of section has no name"},
+        {"model", "a b", "[model a b] is not in /d/h.ini"},
+    };
+    for (iz i = 0; i < countof(bad); i++) {
+        Arena  tmp = v.scratch;
+        CfgSet r   = cfgdelete(c, &tmp, bad[i].kind, bad[i].name);
+        Str    name = concat(&a, "del.refuse ", concat(&a, bad[i].kind, bad[i].name));
+        expect(t, name, r.err, bad[i].err);
+        expect(t, concat(&a, name, " (ok)"), istr(&a, r.ok), "0");
+    }
+    expect(t, "del.refuse.file", cfgfile(v.os, "/d/h.ini"), before);
+
+    // The user's own: gone with the comment above it
+    Arena  tmp = v.scratch;
+    CfgSet r   = cfgdelete(c, &tmp, "endpoint", "local");
+    expect(t, "del.local", istr(&a, r.ok*10 + r.line), "10");
+    expect(t, "del.local.gone", istr(&a, inisection(c->ini, "endpoint", "local") != 0), "0");
+    expect(t, "del.local.text", cfgfile(v.os, "/d/h.ini"),
+        "# My settings\n"
+        "include = team.ini\n"
+        "\n"
+        "# Mine too\n"
+        "[model both]\n"
+        "top_k = 20\n"
+        "\n"
+        "[guard]\n"
+        "ask_timeout = 9\n");
+
+    // One an include also defines stays, as the include has it
+    tmp = v.scratch;
+    r   = cfgdelete(c, &tmp, "model", "both");
+    expect(t, "del.both", istr(&a, r.ok), "1");
+    expect(t, "del.both.kept", cfgget(c, "model", "both", "temperature", 0), "0.1");
+    expect(t, "del.both.mine", cfgget(c, "model", "both", "top_k", 0), "");
+    tmp = v.scratch;
+    r   = cfgdelete(c, &tmp, "model", "both");
+    expect(t, "del.both.again", r.err, "[model both] is defined in "
+           "/d/team.ini:5, an included file, not in /d/h.ini");
+
+    // A kind without names, the file's last section
+    tmp = v.scratch;
+    r   = cfgdelete(c, &tmp, "guard", "");
+    expect(t, "del.guard", istr(&a, r.ok), "1");
+    expect(t, "del.guard.value", cfgget(c, "guard", "", "ask_timeout", 0), "30");
+    expect(t, "del.text", cfgfile(v.os, "/d/h.ini"),
+           "# My settings\ninclude = team.ini\n");
+    expect(t, "del.team", cfgfile(v.os, "/d/team.ini"), team);
+    expect(t, "del.diags", inidiags(&a, c->ini), "");
+    cfgfree(c);
+
+    // A hand edit not yet loaded is what the deletion edits
+    os_write(v.os, a, "/d/k.ini", "[role a]\nprompt = x\n\n[role b]\nprompt = y\n");
+    tmp = v.scratch;
+    c = newconfig(v.os, &a, tmp, "/d/k.ini", 0);
+    os_write(v.os, a, "/d/k.ini", "[role a]\nprompt = z\n\n[role b]\nprompt = y\n");
+    r = cfgdelete(c, &tmp, "role", "b");
+    expect(t, "del.tick", cfgfile(v.os, "/d/k.ini"), "[role a]\nprompt = z\n");
+    cfgfree(c);
+}
+
 static void testcfgpoll(Test *t)
 {
     Arena  a = t->perm;
@@ -726,6 +821,7 @@ static void testcfgjson(Test *t)
         "model/m/max_tokens=*\n"
         "guard//roots=*\n"
         "guard//ask_timeout=30*\n"
+        "guard//temp=allow*\n"
         "tools//job_timeout=1800*\n"
         "tools//job_timeout_max=7200*\n"
         "tools//auto_resume=5*\n"
@@ -757,6 +853,21 @@ static void testcfgjson(Test *t)
     expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "12");
     expect(t, "json.kinds", istr(&a, jsonlen(jsonget(j, "kinds"))),
            istr(&a, countof(cfgkinds)));
+    Buf hb(&a, 256);
+    for (Json *h = jsonget(j, "headers")->child; h; h = h->next) {
+        print(&hb, jsonstr(jsonget(h, "kind")));
+        putbyte(&hb, '/');
+        print(&hb, jsonstr(jsonget(h, "name")));
+        putbyte(&hb, '@');
+        print(&hb, jsonstr(jsonget(h, "file")));
+        putbyte(&hb, ':');
+        print(&hb, jsonint(jsonget(h, "line"), -1));
+        print(&hb, jsonint(jsonget(h, "own"), -1) ? Str(" own\n") : Str("\n"));
+    }
+    expect(t, "json.headers", finish(&hb),
+           "endpoint/local@/c/h.ini:2 own\n"
+           "model/m@/c/h.ini:6 own\n"
+           "endpoint/team@/c/team.ini:1\n");
 
     Json *diag = jsonget(j, "diags")->child;
     expect(t, "json.diags", istr(&a, jsonlen(jsonget(j, "diags"))), "3");
@@ -889,6 +1000,41 @@ static void testcfgengine(Test *t)
         expect(t, concat(&a, "model ", models[i].model), finish(&b),
                models[i].want);
     }
+
+    // A session whose endpoint and model sections are deleted keeps the
+    // settings it had, as another reload finds them still gone
+    Session *s = alloc<Session>(&a);
+    s->e        = e;
+    s->perm.beg = (byte *)allocbytes(&a, 1<<20);
+    s->perm.end = s->perm.beg + (1<<20);
+    s->model    = "m";
+    s->cwd      = "/w";
+    endpointconf(e, &s->perm, "local", &s->ep);
+    modelconf(e, &s->perm, s->model, &s->mc);
+    e->sessions = s;
+    for (i32 i = 0; i < 2; i++) {
+        Arena tmp = v.scratch;
+        cfgdelete(c, &tmp, "model", "m");
+        tmp = v.scratch;
+        cfgdelete(c, &tmp, "endpoint", "local");
+        reconfigure(e);
+        Buf b(&a, 128);
+        print(&b, s->ep.url);
+        putbyte(&b, ' ');
+        print(&b, s->ep.idle / SEC);
+        putbyte(&b, ' ');
+        print(&b, s->mc.name);
+        print(&b, " ctx=");
+        print(&b, s->mc.ctx);
+        print(&b, " extras=");
+        print(&b, s->mc.extras.len);
+        expect(t, "deleted.kept", finish(&b),
+               "http://localhost:8080/ 7 m ctx=8192 extras=1");
+    }
+    expect(t, "deleted.gone", cfgfile(v.os, "/c/h.ini"),
+           "[endpoint slow]\nurl = http://slow.example/\n"
+           "connect_timeout = 3000000\n");
+    e->sessions = 0;
     cfgfree(c);
 }
 
@@ -1479,6 +1625,7 @@ static void test_config(Test *t)
     testcfgseed(t);
     testcfgvalidate(t);
     testcfgset(t);
+    testcfgdelete(t);
     testcfgpoll(t);
     testcfgjson(t);
     testcfgengine(t);

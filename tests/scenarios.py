@@ -2044,6 +2044,113 @@ def config(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=20)
+def config_delete(t):
+    """config.set {delete}: a section of the user's file goes with the
+    comment above it, the rest byte for byte; one an include defines is
+    refused, saying where; and a session using a deleted endpoint and a
+    deleted model, a variant with an id and a temperature, goes on with
+    the settings it had."""
+    team = t.host.join(t.base, "team.ini")
+    shared = "[endpoint team]\nurl = http://team.invalid/\n\n[model shared]\ntemperature = 0.1\n"
+    t.host.write(team, shared)
+    model = t.model.replace(":config_delete:", ":plain:")
+    fake_provider.STATE.register(model)
+    text = ("# My settings\n"
+            "include = team.ini\n"
+            "\n"
+            "# The fake provider\n"
+            "[endpoint fake]\n"
+            f"url = {t.host.url}/\n"
+            "first_byte_timeout = 5\n"
+            "idle_timeout = 3\n"
+            "connect_timeout = 2\n"
+            "\n"
+            "# A variant of the test's model, by another name\n"
+            "[model nick]\n"
+            f"id = {model}\n"
+            "temperature = 0.25\n"
+            "\n"
+            "# Notes about roles\n"
+            "\n"
+            "[role r]  # a role\n"
+            "prompt = Be brief.\n"
+            "\n"
+            "[remote far]\n"
+            "ssh = far.invalid\n"
+            "list = connected\n")
+    t.host.write(t.config, text)
+
+    h = t.headless()
+    try:
+        r = h.call("config.get")
+        heads = {(x["kind"], x["name"]): (x["line"], x["own"]) for x in r["headers"]}
+        t.check(heads.get(("endpoint", "fake")) == (5, 1) and
+                heads.get(("model", "nick")) == (12, 1) and
+                heads.get(("role", "r")) == (18, 1) and
+                heads.get(("remote", "far")) == (21, 1) and
+                heads.get(("endpoint", "team")) == (1, 0) and
+                heads.get(("model", "shared")) == (4, 0), f"headers {r['headers']}")
+        got = {(s["kind"], s["name"], s["key"]): s for s in r["settings"]}
+        t.check(got[("remote", "far", "list")]["value"] == "connected" and
+                got[("guard", "", "temp")]["value"] == "allow" and
+                got[("guard", "", "temp")]["default"] == 1, "the new keys")
+
+        sid = h.call("new", cwd=t.work, model="nick", endpoint="fake")["sid"]
+
+        def turn(prompt):
+            done = len(h.all("turn.end", sid))
+            h.call("prompt", sid=sid, text=prompt)
+            h.wait(lambda e: len(h.all("turn.end", sid)) > done)
+            body = t.requests(model)[-1]["body"]
+            t.check(h.all("turn.end", sid)[-1].get("why") == "done",
+                    f"the turn ended done: {h.all('turn.end', sid)[-1]}")
+            return body
+
+        body = turn("one")
+        t.check(body.get("model") == model and body.get("temperature") == 0.25,
+                f"the variant: {body}")
+
+        # Refusals change nothing
+        for fields, why in [({"kind": "model", "name": "shared"}, "team.ini:4"),
+                            ({"kind": "endpoint", "name": "none"}, "is not in"),
+                            ({"kind": "", "name": ""}, "top level"),
+                            ({"kind": "endpoint", "name": "fake", "key": "url"},
+                             "not a key"),
+                            ({"kind": "guard", "name": "g"}, "has no name")]:
+            r = h.call("config.set", delete=True, **fields)
+            t.check(r["ok"] == 0 and why in r.get("err", ""), f"refusal: {r}")
+        t.check(t.host.read(t.config) == text, "refusals leave the file alone")
+
+        # The model and the endpoint the session uses, and a role
+        for kind, name in [("model", "nick"), ("endpoint", "fake"), ("role", "r")]:
+            r = h.call("config.set", kind=kind, name=name, delete=1)
+            t.check(r["ok"] == 1 and r["line"] == 0, f"deleted [{kind} {name}]: {r}")
+        want = ("# My settings\n"
+                "include = team.ini\n"
+                "\n"
+                "# Notes about roles\n"
+                "\n"
+                "[remote far]\n"
+                "ssh = far.invalid\n"
+                "list = connected\n")
+        after = t.host.read(t.config)
+        t.check(after == want, f"the file after: {after!r}")
+        r = h.call("config.get")
+        names = {(x["kind"], x["name"]) for x in r["headers"]}
+        t.check(("model", "nick") not in names and ("endpoint", "fake") not in names
+                and ("remote", "far") in names, f"headers after {r['headers']}")
+
+        # The session goes on as it was
+        body = turn("two")
+        t.check(body.get("model") == model and body.get("temperature") == 0.25,
+                f"kept: {body}")
+        t.check(t.host.read(team) == shared, "the include is never edited")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=10)
 def config_seed(t):
     """Without a configuration file, the first run writes the seed byte for

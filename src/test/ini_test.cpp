@@ -1375,6 +1375,209 @@ static void testiniwrite(Test *t)
     }
 }
 
+static void testinidelsection(Test *t)
+{
+    static struct {
+        Str in, kind, name, want;
+        b32 changed;
+    } cases[] = {
+        // The comment just above goes, one set apart by a blank stays
+        {"# top\nx = 1\n\n# about a\n[endpoint a]\nurl = http://a/\n\n"
+         "# about b\n[endpoint b]\nurl = http://b/\n",
+         "endpoint", "a",
+         "# top\nx = 1\n\n# about b\n[endpoint b]\nurl = http://b/\n", 1},
+        {"[s]\nk = 1\n\n# about the group\n\n[a]\nk = 2\n\n[t]\n", "a", "",
+         "[s]\nk = 1\n\n# about the group\n\n[t]\n", 1},
+        {"[s]\nk = 1\n# about a\n# more\n[a]\nk = 2\n[t]\n", "a", "",
+         "[s]\nk = 1\n[t]\n", 1},
+        // Comments below and among its keys stay, as does the next one's
+        {"[s]\nk = 1\n\n[a]\n# note in a\nk = 2\n\n# trailing\n\n[t]\n", "a", "",
+         "[s]\nk = 1\n\n# note in a\n\n# trailing\n\n[t]\n", 1},
+        {"[b]\ny = 2\n# about c\n[c]\n", "b", "", "# about c\n[c]\n", 1},
+        {"[a]\nk = 1  # inline\n; after\n", "a", "", "; after\n", 1},
+        // First, last, only, and between others with no blank lines
+        {"# a's\n[a]\nk = 1\n\n# b's\n[b]\nk = 2\n", "a", "",
+         "# b's\n[b]\nk = 2\n", 1},
+        {"a = 1\n\n[endpoint x]\nurl = http://h/\n", "endpoint", "x",
+         "a = 1\n", 1},
+        {"a = 1\n\n# x\n[endpoint x]\nurl = http://h/\n\n", "endpoint", "x",
+         "a = 1\n", 1},
+        {"x = 1\n[a]\nk = 1\n", "a", "", "x = 1\n", 1},
+        {"[s]\nk = 1\n", "s", "", "", 1},
+        {"[a]\nx = 1\n[b]\ny = 2\n[c]\nz = 3\n", "b", "",
+         "[a]\nx = 1\n[c]\nz = 3\n", 1},
+        // Every header of it, with the blanks between
+        {"[a]\nk = 1\n\n[b]\nj = 2\n\n[a]\nm = 3\n", "a", "", "[b]\nj = 2\n", 1},
+        {"[a]\nk = 1\n\n[a]\nm = 3\n\n[b]\n", "a", "", "[b]\n", 1},
+        // Malformed lines under it go, an invalid header's lines stay
+        {"[a]\ninclude = x.ini\njunk\n[b]\n", "a", "", "[b]\n", 1},
+        {"[a b c]\nk = 1\n[a]\nk = 2\n", "a", "", "[a b c]\nk = 1\n", 1},
+        // Kinds alone, and named, are different sections
+        {"[guard]\nroots = /x\n", "guard", "", "", 1},
+        {"[model]\nk = 1\n[model a]\nk = 2\n", "model", "a", "[model]\nk = 1\n", 1},
+        {"[model a]\nk = 1\n[model ab]\nk = 2\n", "model", "a", "[model ab]\nk = 2\n", 1},
+        // Line terminators: CRLF, a BOM, and a missing final one
+        {"# c\r\n[a]\r\nk = 1\r\n\r\n[b]\r\nk = 2\r\n", "a", "", "[b]\r\nk = 2\r\n", 1},
+        {"[s]\r\nk = 1\r\n\r\n[a]\r\nk = 2\r\n\r\n[t]\r\n", "a", "",
+         "[s]\r\nk = 1\r\n\r\n[t]\r\n", 1},
+        {"\xef\xbb\xbf[a]\nk = 1\n\n[b]\n", "a", "", "\xef\xbb\xbf[b]\n", 1},
+        {"[a]\nk = 1\n\n[b]\nk = 2", "b", "", "[a]\nk = 1", 1},
+        {"[a]\nk = 1\n\n[b]\nk = 2", "a", "", "[b]\nk = 2", 1},
+        {"[a]\nk = 1\n\n[b]\nk = 2\n", "b", "", "[a]\nk = 1\n", 1},
+        {"[a]", "a", "", "", 1},
+        // Absent: nothing changes
+        {"[a]\nk = 1\n", "b", "", "[a]\nk = 1\n", 0},
+        {"# [a]\n", "a", "", "# [a]\n", 0},
+        {"", "a", "", "", 0},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        Arena    a   = t->perm;
+        Ini      ini = {};
+        IniFile *f   = iniparse(&ini, &a, "", cases[i].in);
+        IniEdit  e   = inidelsection(&a, f, cases[i].kind, cases[i].name);
+        Str name = concat(&a, cases[i].in, " -= ");
+        name = concat(&a, name, cases[i].kind);
+        expect(t, name, e.text, cases[i].want);
+        expect(t, concat(&a, name, " (changed)"), istr(&a, e.changed),
+               istr(&a, cases[i].changed));
+    }
+
+    // Adding a section and deleting it gives the text back
+    static Str texts[] = {
+        "a = 1\n", "# c\n[s]\nk = v\n", "[s]\nk = v", "", "\xef\xbb\xbf# c\r\n",
+    };
+    for (iz i = 0; i < countof(texts); i++) {
+        Arena    a   = t->perm;
+        Ini      one = {};
+        IniFile *f   = iniparse(&one, &a, "", texts[i]);
+        IniEdit  e   = iniedit(&a, f, "endpoint", "x", "url", "http://h/");
+        Ini      two = {};
+        IniFile *g   = iniparse(&two, &a, "", e.text);
+        IniEdit  d   = inidelsection(&a, g, "endpoint", "x");
+        Str      want = texts[i];
+        if (want.len && want[want.len-1]!='\n') {
+            want = concat(&a, want, "\n");  // the add ended its last line
+        }
+        expect(t, concat(&a, "add, delete: ", texts[i]), d.text, want);
+    }
+
+    // Refusals
+    static struct { Str kind, name; } bad[] = {
+        {"", ""}, {"a b", ""}, {"a", "x y"}, {"a]", ""}, {"a", "[x"},
+    };
+    for (iz i = 0; i < countof(bad); i++) {
+        Arena    a   = t->perm;
+        Ini      ini = {};
+        IniFile *f   = iniparse(&ini, &a, "", "[a]\nk = 1\n");
+        IniEdit  e   = inidelsection(&a, f, bad[i].kind, bad[i].name);
+        Str name = concat(&a, "refuse delete ", bad[i].kind);
+        expect(t, name, istr(&a, !e.text.data && e.err.len), "1");
+    }
+}
+
+// Every winning definition but section (kind, name)'s, as inidump.
+static Str inidumpwithout(Arena *a, Ini *ini, Str kind, Str name)
+{
+    Buf b(a, 256);
+    for (IniSection *s = ini->sections; s; s = s->next) {
+        for (IniEntry *e = s->keys; !(s->kind==kind && s->name==name) && e; e = e->next) {
+            print(&b, s->kind);
+            putbyte(&b, ':');
+            print(&b, s->name);
+            putbyte(&b, ':');
+            print(&b, e->key);
+            putbyte(&b, '=');
+            print(&b, e->value);
+            putbyte(&b, '\n');
+        }
+    }
+    return finish(&b);
+}
+
+// Random deletions from random texts: the section is gone, every other
+// keeps its values, the lines left are lines of the text, in order, and
+// every comment but those just above its headers is still there.
+static void testinidelrandom(Test *t)
+{
+    static Str pieces[] = {
+        "k = 1\n", "j = \"2\" # c\n", "[s]\n", "[s t]\n", "  [t] # c\n",
+        "[a b c]\n", "# c\n", "; d\n", "\n", "\r\n", "junk\n",
+        "include = x.ini\n", "k = 4", "[s]", "j=5\r\n", "[u]\n",
+    };
+    static Str kinds[] = {"s", "s", "t", "u"};
+    static Str names[] = {"", "", "t"};
+    u64 rng = 11;
+    i32 bad = 0;
+    for (i32 n = 0; n < 20000; n++) {
+        Arena a = t->perm;
+        Buf   b(&a, 256);
+        iz    count = inirand(&rng) % 10;
+        if (!(inirand(&rng) % 8)) {
+            print(&b, "\xef\xbb\xbf");
+        }
+        for (iz i = 0; i < count; i++) {
+            print(&b, pieces[inirand(&rng) % countof(pieces)]);
+        }
+        Str src  = finish(&b);
+        Str kind = kinds[inirand(&rng) % countof(kinds)];
+        Str name = names[inirand(&rng) % countof(names)];
+
+        Ini      before = {};
+        IniFile *f      = iniparse(&before, &a, "", src);
+        IniEdit  e      = inidelsection(&a, f, kind, name);
+        Ini      after  = {};
+        IniFile *g      = iniparse(&after, &a, "", e.text);
+
+        // The comments that should stay: all but those just above its
+        // headers
+        iz want = 0;
+        for (iz i = 0; i < f->lines.len; i++) {
+            if (f->lines[i].type != INI_COMMENT) {
+                continue;
+            }
+            iz k = i;
+            for (; k<f->lines.len && f->lines[k].type==INI_COMMENT; k++) {}
+            IniLine *h = k<f->lines.len ? &f->lines[k] : 0;
+            want += !h || h->type!=INI_SECTION || !iniin(h, kind, name);
+        }
+        iz got = 0;
+        for (iz i = 0; i < g->lines.len; i++) {
+            got += g->lines[i].type == INI_COMMENT;
+        }
+        // Each line left is the next of the text's, in order
+        iz  at  = 0;
+        b32 sub = 1;
+        for (iz i = 0; sub && i < g->lines.len; i++) {
+            for (; at<f->lines.len && !(f->lines[at].raw==g->lines[i].raw); at++) {}
+            sub = at++ < f->lines.len;
+        }
+        Str why = {};
+        if (!e.text.data) {
+            why = "failed";
+        } else if (inisection(&after, kind, name)) {
+            why = "still there";
+        } else if (!(inidumpwithout(&a, &before, kind, name) ==
+                     inidumpwithout(&a, &after, kind, name))) {
+            why = "others";
+        } else if (!sub) {
+            why = "lines";
+        } else if (got != want) {
+            why = "comments";
+        } else if (g->bom != f->bom) {
+            why = "bom";
+        } else if (e.changed != !(e.text == src)) {
+            why = "changed";
+        }
+        if (why.len && !bad++) {
+            Str msg = concat(&a, concat(&a, "random delete: ", why), " ");
+            msg = concat(&a, concat(&a, msg, kind), concat(&a, " ", name));
+            expect(t, concat(&a, concat(&a, msg, ": "), src), e.text, "");
+        }
+    }
+    Arena a = t->perm;
+    expect(t, "delete.random.failures", istr(&a, bad), "0");
+}
+
 // Line count of a text, as the parser counts after a BOM.
 static iz inilinecount(Str s)
 {
@@ -1715,6 +1918,8 @@ static void test_ini(Test *t)
     testiniedit(t);
     testiniwrite(t);
     testiniwriterandom(t);
+    testinidelsection(t);
+    testinidelrandom(t);
     testinilayers(t);
     testinipaths(t);
     testiniinclude(t);

@@ -23,7 +23,10 @@
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
-// order kept. The file is replaced atomically (os_write) and reloaded.
+// order kept. Deleting a section (cfgdelete, through inidelsection)
+// takes its lines and the comment just above it, and only from the
+// user's file: a section an include defines stays as the include has
+// it. The file is replaced atomically (os_write) and reloaded.
 // The engine thread owns the Config. It polls the fingerprint of the
 // files (type, size and mtime of the user's file and of every include
 // target) at most once a second while it has work, and reloads when
@@ -78,6 +81,8 @@
 //               "local":"","choices":[],"group":"endpoint",
 //               "desc":"..."}, ...],
 //    "kinds":[{"kind":"endpoint","named":1,"desc":"..."}, ...],
+//    "headers":[{"kind":"endpoint","name":"local","file":"...",
+//                "line":60,"own":1}, ...],
 //    "includes":[{"url":"https://team.example/h.ini","pin":"",
 //                 "sha256":"...","fetched":T,"fetching":0,
 //                 "error":""}, ...],
@@ -93,6 +98,10 @@
 //    "diags":[...]}
 //   {"ts":T,"ev":"reply","id":N,"ok":0,"err":"...","path":"...","line":0,
 //    "rev":3,"diags":[...]}
+//
+//   {"cmd":"config.set","id":N,"kind":"endpoint","name":"local",
+//    "delete":1}
+//   (the same replies, line 0)
 //
 // In config.get, path is where edits go ("" if there is no location),
 // exists says whether that file was read, rev counts loads, and files
@@ -129,6 +138,15 @@
 // configuration as now loaded. A template.NAME value in quotes, as
 // "25", is written quoted, a string whatever it says; any other is
 // written bare (unless it needs quotes).
+//
+// With delete (true, or a nonzero number), config.set deletes the whole
+// section of kind and name from the user's file instead, and takes no
+// key or value. It fails for the top level, and for a section the
+// user's file does not define, saying which included file does if one
+// does. Headers in config.get list every section header of a known
+// kind, file by file as files lists them, with own:1 for those in the
+// user's file: a section the user's file defines can be deleted, and is
+// then gone unless an include also defines it.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -340,6 +358,9 @@ static CfgKey cfgschema[] = {
     {"guard", "ask_timeout", CFG_SECONDS, "30", {}, {}, "guard",
      "Seconds to wait for an answer when a tool asks to leave the roots, "
      "then deny"},
+    {"guard", "temp", CFG_ENUM, "allow", {}, "allow ask", "guard",
+     "The system's temporary directory: allow the file tools there without "
+     "asking, or ask as for any directory outside the roots"},
 
     {"tools", "job_timeout", CFG_SECONDS, "1800", {}, {}, "tools",
      "Seconds a background job may run, unless the agent asks for less "
@@ -403,6 +424,9 @@ static CfgKey cfgschema[] = {
     {"remote", "deploy", CFG_ENUM, "ask", {}, "ask auto", "remote",
      "When the machine has no engine, or one of another protocol: ask "
      "before deploying one, or deploy it unasked (auto)"},
+    {"remote", "list", CFG_ENUM, "always", {}, "always connected", "remote",
+     "When the session list shows the host: always, or connected, which "
+     "keeps it out of the list while it is disconnected"},
 };
 
 // Value judgments
@@ -2221,6 +2245,52 @@ struct CfgSet {
     b32 ok;
 };
 
+// Load again if the user's file is not as last loaded, to edit it as it
+// is now. The fingerprint misses a change of the same size within one
+// mtime tick, so compare the text itself.
+static void cfgreread(Config *c, Arena scratch)
+{
+    cfgpoll(c, scratch, 1);
+    if (c->user) {
+        Arena t  = scratch;
+        Read  rd = os_read(c->os, &t, c->path, INI_MAXBYTES);
+        Buf   b(&t, rd.data.len + 1);
+        printinifile(&b, c->user);
+        if (rd.err || !(rd.data == finish(&b))) {
+            cfgload(c, scratch);
+        }
+    }
+}
+
+// Replace the user's file with text, atomically. Returns 0 on failure.
+static b32 cfgwrite(Config *c, Arena scratch, Str text)
+{
+    Str dst = cfgdest(c, &scratch);
+    Str dir = inidir(dst);
+    if ((dir.len && !os_mkdirs(c->os, scratch, dir)) ||
+            !os_write(c->os, scratch, dst, text)) {
+        return 0;
+    }
+    c->note = {};
+    return 1;
+}
+
+// The first header of section s in file f, or in any file of the load
+// when f is null, and in *in the file it is in. Null if none.
+static IniLine *cfgheader(Ini *ini, IniSection *s, IniFile *f, IniFile **in)
+{
+    for (IniFile *g = f ? f : ini->files; g; g = f ? 0 : g->next) {
+        for (iz i = 0; i < g->lines.len; i++) {
+            IniLine *l = &g->lines[i];
+            if (l->type==INI_SECTION && l->section==s) {
+                *in = g;
+                return l;
+            }
+        }
+    }
+    return 0;
+}
+
 // Set a key in the user's file, or remove it given a null value, then
 // replace the file atomically and reload. Kind and name "" are the top
 // level. Unknown keys, values bad for their type, and plaintext secrets
@@ -2261,18 +2331,7 @@ static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
         return r;
     }
 
-    // Edit the file as it is now. The fingerprint misses a change of the
-    // same size within one mtime tick, so compare the text itself.
-    cfgpoll(c, *perm, 1);
-    if (c->user) {
-        Arena t  = *perm;
-        Read  rd = os_read(c->os, &t, c->path, INI_MAXBYTES);
-        Buf   b(&t, rd.data.len + 1);
-        printinifile(&b, c->user);
-        if (rd.err || !(rd.data == finish(&b))) {
-            cfgload(c, *perm);
-        }
-    }
+    cfgreread(c, *perm);
     IniFile *f = c->user;
     if (!f) {
         if (os_stat(c->os, *perm, c->path).type != STAT_MISSING) {
@@ -2309,15 +2368,9 @@ static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
         r.err = e.err;
         return r;
     }
-    if (e.changed || !c->user) {
-        Str dst = cfgdest(c, perm);
-        Str dir = inidir(dst);
-        if ((dir.len && !os_mkdirs(c->os, *perm, dir)) ||
-                !os_write(c->os, *perm, dst, e.text)) {
-            r.err = concat(perm, "cannot write ", c->path);
-            return r;
-        }
-        c->note = {};
+    if ((e.changed || !c->user) && !cfgwrite(c, *perm, e.text)) {
+        r.err = concat(perm, "cannot write ", c->path);
+        return r;
     }
     cfgload(c, *perm);
     r.line = e.line;
@@ -2345,6 +2398,72 @@ static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
         r.err = finish(&b);
         return r;
     }
+    r.ok = 1;
+    return r;
+}
+
+// Delete section (kind, name) from the user's file, then replace the
+// file atomically and reload. Only the user's own definitions go: one
+// that only an include makes is refused, saying where it is, and one
+// an include also makes stays as the include has it. Results and
+// temporaries go in perm.
+static CfgSet cfgdelete(Config *c, Arena *perm, Str kind, Str name)
+{
+    CfgSet   r = {};
+    CfgKind *k = kind.len ? cfgkind(kind) : 0;
+    if (!kind.len) {
+        r.err = "the top level is not a section to delete";
+        return r;
+    } else if (!k) {
+        r.err = "unknown section kind";
+        return r;
+    } else if (k->named != (name.len>0)) {
+        r.err = k->named ? Str("this kind of section needs a name")
+                         : Str("this kind of section has no name");
+        return r;
+    } else if (!c->path.len) {
+        r.err = "no configuration file location";
+        return r;
+    }
+
+    cfgreread(c, *perm);
+    IniSection *s   = inisection(c->ini, kind, name);
+    IniFile    *in  = 0;
+    IniLine    *own = s && c->user ? cfgheader(c->ini, s, c->user, &in) : 0;
+    if (!own) {
+        IniLine *l = s ? cfgheader(c->ini, s, 0, &in) : 0;
+        Buf      b(perm, 128);
+        putbyte(&b, '[');
+        print(&b, kind);
+        if (name.len) {
+            putbyte(&b, ' ');
+            print(&b, name);
+        }
+        putbyte(&b, ']');
+        if (l) {
+            print(&b, " is defined in ");
+            print(&b, in->path);
+            putbyte(&b, ':');
+            print(&b, l->num);
+            print(&b, ", an included file, not in ");
+            print(&b, c->path);
+        } else {
+            print(&b, " is not in ");
+            print(&b, c->path);
+        }
+        r.err = finish(&b);
+        return r;
+    }
+
+    IniEdit e = inidelsection(perm, c->user, kind, name);
+    if (!e.text.data) {
+        r.err = e.err;
+        return r;
+    } else if (!cfgwrite(c, *perm, e.text)) {
+        r.err = concat(perm, "cannot write ", c->path);
+        return r;
+    }
+    cfgload(c, *perm);
     r.ok = 1;
     return r;
 }
@@ -2544,6 +2663,28 @@ static void putcfg(JsonOut *w, Config *c)
         putintkey(w, "named", (i64)cfgkinds[i].named);
         putstrkey(w, "desc", cfgkinds[i].desc);
         putend(w);
+    }
+    putend(w);
+
+    // Every section header, for where a section is defined
+    putkey(w, "headers");
+    putarray(w);
+    for (IniFile *f = c->ini->files; f; f = f->next) {
+        for (iz i = 0; i < f->lines.len; i++) {
+            IniLine    *l = &f->lines[i];
+            IniSection *s = l->type==INI_SECTION ? l->section : 0;
+            CfgKind    *k = s && s->kind.len ? cfgkind(s->kind) : 0;
+            if (!k || k->named!=(s->name.len>0)) {
+                continue;
+            }
+            putobject(w);
+            putstrkey(w, "kind", s->kind);
+            putstrkey(w, "name", s->name);
+            putstrkey(w, "file", f->path);
+            putintkey(w, "line", (i64)l->num);
+            putintkey(w, "own", (i64)(f == c->user));
+            putend(w);
+        }
     }
     putend(w);
 

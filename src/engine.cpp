@@ -5575,6 +5575,7 @@ static void modelconf(Engine *e, Arena *perm, Str model, ModelConf *mc)
         "frequency_penalty", "repeat_penalty", "seed", "max_tokens",
     };
     Config *cfg = e->cfg;
+    mc->conf   = inisection(cfg->ini, "model", model) != 0;
     mc->name   = clone(perm, cfgmodelid(cfg, model));
     mc->kwargs = cfgtemplate(cfg, perm, model);
     Str r = trim(cfgget(cfg, "model", model, "reasoning", 0));
@@ -7586,6 +7587,9 @@ static void cmdlist(Engine *e, Arena scratch, i64 id)
 // and model's settings for its next request, and the guard's roots for
 // its next call. The system prompt stays as it was, byte for byte, to
 // keep the prompt cache: it names only the roots the session began with.
+// A session whose endpoint or model section is gone, deleted, keeps the
+// settings it had: a model renamed by its section (id) would otherwise
+// be sent by a name the server does not know.
 static void reconfigure(Engine *e)
 {
     e->ini = e->cfg->ini;
@@ -7598,6 +7602,9 @@ static void reconfigure(Engine *e)
         }
         ModelConf mc = {};
         modelconf(e, &s->perm, s->model, &mc);
+        if (s->mc.conf && !mc.conf) {
+            continue;
+        }
         mc.llamacpp = s->mc.llamacpp;  // learned by discovery
         mc.ctx      = mc.ctx ? mc.ctx : s->mc.ctx;
         s->mc = mc;
@@ -7656,7 +7663,8 @@ static b32 onconfig(Engine *e, Arena scratch, Record r)
 // config.get and config.set, with the shapes in config.cpp. With
 // refresh, config.get fetches every URL include anew, and its reply
 // waits for the fetches to end (30 s at most), unless 8 such replies
-// wait already, when it comes at once.
+// wait already, when it comes at once. With delete, config.set deletes
+// a section.
 static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
 {
     Config *c   = e->cfg;
@@ -7674,6 +7682,14 @@ static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
                 }
                 return;
             }
+        }
+    } else if (jsonflag(jsonget(j, "delete"), 0)) {
+        if (jsonget(j, "key")->type!=JSON_MISSING ||
+                jsonget(j, "value")->type!=JSON_MISSING) {
+            r.err = "delete takes a section's kind and name, not a key or value";
+        } else {
+            r = cfgdelete(c, &scratch, jsonstr(jsonget(j, "kind")),
+                          jsonstr(jsonget(j, "name")));
         }
     } else {
         Json *v     = jsonget(j, "value");
