@@ -560,6 +560,7 @@ static Str istr(Arena *a, i64 v)
 #  include "png.cpp"
 #  include "fonts.cpp"
 #  include "place.cpp"
+#  include "compose.cpp"
 #  include "test/sched_test.cpp"
 #  include "test/highlight_test.cpp"
 #  include "test/doc_test.cpp"
@@ -569,6 +570,7 @@ static Str istr(Arena *a, i64 v)
 #  include "test/png_test.cpp"
 #  include "test/fonts_test.cpp"
 #  include "test/place_test.cpp"
+#  include "test/compose_test.cpp"
 #endif
 
 int main()
@@ -617,6 +619,7 @@ int main()
     test_png(&t);
     test_fonts(&t);
     test_place(&t);
+    test_compose(&t);
     #endif
 
     fprintf(stderr, "%d tests, %d failed\n", t.run, t.failed);

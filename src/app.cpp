@@ -35,6 +35,11 @@
 // lists its sessions too, as held elsewhere: they are the host's while
 // it holds them, and the engine's again once it lets them go.
 //
+// Each session has its own draft in the compose box, which its engine
+// keeps (draft) once typing pauses, as the session is left, and as the
+// GUI quits, and which open's reply gives back (Drafts, below); the box
+// opens a draft in an external editor, run as a tool is (The editor).
+//
 // Closing the window with turns running may keep them running instead
 // of stopping them: this process becomes a host of its engine, in
 // place, with no window and a tray icon (Background hosting, below).
@@ -64,6 +69,7 @@
 #include "png.cpp"
 #include "fonts.cpp"
 #include "place.cpp"
+#include "compose.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -73,7 +79,6 @@ enum : i64 {
 };
 
 enum : iz {
-    PROMPT_MAX = 1<<16,
     BENCH_MAX  = 4096,
     GUILOG_MAX = 200,     // lines kept in the Log window
     INBOX_CAP  = 1<<21,   // bytes per inbox buffer
@@ -218,6 +223,15 @@ enum : i32 {
     RECT_ROOTS,      // the guard page's roots field
     RECT_SESSMENU,   // the menu bar's Session menu
     RECT_ZOOMRESET,  // View's Actual size
+    RECT_EDITCANCEL, // the compose box's Cancel of the editor
+    RECT_CMUNDO,     // its context menu's Undo, Copy, Paste, Select all,
+    RECT_CMCOPY,     // and Open in editor
+    RECT_CMPASTE,
+    RECT_CMSELALL,
+    RECT_CMEDITOR,
+    RECT_CMREDO,
+    RECT_CMCUT,
+    RECT_MODEL0,     // /model's first model
     RECT_THEME0,     // the theme's choices in its open list
     RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
     RECT_COUNT = RECT_PANE0 + 10,
@@ -386,6 +400,18 @@ struct GuiSession {
     i64          openid;    // the open in flight, 0 if none
     i32          depth;     // under its parent in the sidebar, this frame
     b32          kidask;    // a subagent below it needs an answer, this frame
+    // Its compose box (compose.cpp): the draft, in a reservation of its
+    // own made as it is first needed, untouched pages costing nothing
+    Region      *dregion;
+    char        *draft;     // DRAFT_MAX+1 bytes, null until made
+    DraftClock   dclock;
+    ImGuiID      draftid;   // the box's item, as last drawn
+    i32          hist;      // recalling history entry hist (1 the newest), else 0
+    i32          histmsg;   // its message in the view
+    Str          note;      // what the latest command from the box came to
+    b32          noteerr;
+    Str          cmdtext;   // that command, put back in the box if it fails
+    i64          cmdid;
 };
 
 // A command awaiting its reply.
@@ -744,8 +770,23 @@ struct Gui {
     Str                cfgstatus;  // the latest config.set outcome
     b32                cfgok;      // and whether it worked
 
+    // Compose box: the editor a draft is out in (one at a time), and
+    // what the box's popups have open
+    Str                editor;     // [ui] editor
+    Mailbox           *edbox;      // its process's records
+    GuiSession        *edsess;     // whose draft it edits, or null
+    Proc              *edproc;
+    u64                edid;
+    Str                edpath;     // the draft's file
+    Str                edlog;      // the editor's output
+    Str                edname;     // as the box names it
+    i32                slashsel;   // the slash popup's pick, among its matches
+    GuiSession        *pickmodel;  // /model's list is open for it
+    GuiSession        *modelsfor;  // and the session it is for
+    i32                menuact;    // a context menu pick waiting for the box
+    i32                menuwait;   // frames it has waited
+
     // Menu bar, toolbar and layout
-    char              *prompt;
     i32                tps;
     b32                bursts;
     b32                pauses;
@@ -845,6 +886,8 @@ struct Gui {
     i64                holduntil;    // µs: the inbox is left alone until
     b32                held;         // a wake came during the hold
     Str                cfgsnap;      // the config file before an edit
+    GuiSession        *drivesess;    // the session OP_MARKSESS remembered
+    b32                modelsshown;  // /model's list drew
     i64                tailseen;     // tool.out records for running rows
     b32                drive;
     i32                drivepc;
@@ -876,6 +919,12 @@ struct Gui {
     Str                showpage;     // the settings page the list scrolls to
     Str                longval;      // the long setting before its edit
     WinGeom            geommark;     // the window's, as OP_GEOMMARK found it
+    b32                slashshown;   // the slash popup drew
+    b32                cmenushown;   // the compose box's context menu drew
+    u32                cmenustate;   // and what it enabled: 1 undo, 2 redo,
+                                     // 4 cut and copy, 8 paste, 16 editor
+    i32                histshown;    // the box showed history entry N/M
+    b32                editshown;    // it said an editor was at work
 };
 
 // Log to standard error, the log file, and the Log window, which then
@@ -979,8 +1028,13 @@ static View *sessview(Gui *g, GuiSession *s)
 }
 
 // The session shown, or none.
+static void draftsend(Gui *, GuiSession *);
+
 static void setcur(Gui *g, GuiSession *s)
 {
+    if (g->sess && g->sess!=s) {
+        draftsend(g, g->sess);  // left: its draft is kept now
+    }
     g->sess = s;
     g->view = s && s->view ? s->view : g->nosession.view;
     scheddirty(&g->sched);
@@ -1718,6 +1772,58 @@ static void guicancel(Gui *g, GuiSession *s)
     cmdsend(g, &w, a);
 }
 
+// The session operations the compose box's slash commands run (as the
+// menus will): the reply's outcome becomes the session's note above the
+// box, and a failed command's text, kept in cmdtext, goes back in the
+// box (onsesscmd).
+static void guicompact(Gui *g, GuiSession *s, Str focus)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + focus.len);
+    EvOut w = cmdopen(g, &b, CMD_COMPACT, s);
+    if (focus.len) {
+        putkey(&w.json, "focus");
+        putstr(&w.json, focus);
+    }
+    s->cmdid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+static void guirename(Gui *g, GuiSession *s, Str title)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + title.len);
+    EvOut w = cmdopen(g, &b, CMD_RENAME, s);
+    putkey(&w.json, "title");
+    putstr(&w.json, title);
+    s->cmdid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// Another model for the rest of the session: a name as the session's
+// endpoint lists it, or ENDPOINT/MODEL.
+static void guimodel(Gui *g, GuiSession *s, Str model)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + model.len);
+    EvOut w = cmdopen(g, &b, CMD_MODEL, s);
+    putkey(&w.json, "model");
+    putstr(&w.json, model);
+    s->cmdid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// A new session from a copy of this one's log, shown once made, with
+// the prompt that came next, if any, as its draft.
+static void guifork(Gui *g, GuiSession *s)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_FORK, s);
+    s->cmdid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
 static void guianswer(Gui *g, GuiSession *s, Str req, b32 allow, Str note)
 {
     Arena a = newarena(g->cmdr);
@@ -1831,6 +1937,9 @@ static b32 quitdone(Gui *g)
 // Stop every turn of this process's engine, which kills their tools,
 // leave the other hosts, then exit once all that is done, or after
 // QUIT_GRACE regardless. Sessions on the other hosts run on.
+static void draftsendall(Gui *);
+static void editcancel(Gui *);
+
 static void startquit(Gui *g)
 {
     if (g->quitting) {
@@ -1838,6 +1947,8 @@ static void startquit(Gui *g)
     }
     g->quitting = 1;
     g->quitby   = os_ticks(g->os) + QUIT_GRACE;
+    draftsendall(g);  // before the hosts are left
+    editcancel(g);
     closehosts(g);
     if (!g->enginegone && !g->host) {
         Arena a = newarena(g->cmdr);
@@ -1931,6 +2042,8 @@ static void loadcfg(Gui *g, Str line)
             settools(g, toolsparse(r.value));
         } else if (r.kind=="ui" && r.key=="font_size") {
             setfontbase(g, r.value);
+        } else if (r.kind=="ui" && r.key=="editor" && r.value!=g->editor) {
+            g->editor = clone(&g->perm, r.value);
         }
         // Defaults, and what a model inherits by like, show as hints, not
         // values: an edit writes a value of its own. The field holds the
@@ -2037,6 +2150,78 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
 }
 
 static void onfile(Gui *, Json *, b32 ok, Str err);
+static Str  draftstr(GuiSession *);
+static void draftput(Gui *, GuiSession *, Str);
+static void setdraft(Gui *, GuiSession *, Str);
+static void setnote(Gui *, GuiSession *, Str, b32);
+
+// The reply to a session operation from the box (guicompact and the
+// rest): its note, or its error with the command put back in the box,
+// if it is still empty, to try again; a fork's new session is shown.
+static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
+{
+    Json       *j    = r->root;
+    b32         ok   = jsonint(jsonget(j, "ok"), 0) != 0;
+    Str         err  = jsonstr(jsonget(j, "err"));
+    Str         note = jsonstr(jsonget(j, "note"));
+    GuiSession *s    = q->s;
+    if (!s) {
+        return;
+    }
+    b32 mine = s->cmdid == q->id;
+    s->cmdid = mine ? 0 : s->cmdid;
+    if (!ok) {
+        setnote(g, s, err.len ? err : Str("the command failed"), 1);
+        if (mine && s->cmdtext.len && !draftstr(s).len) {
+            setdraft(g, s, s->cmdtext);
+        }
+        s->cmdtext = mine ? Str{} : s->cmdtext;
+        return;
+    }
+    s->cmdtext = mine ? Str{} : s->cmdtext;
+    switch (q->cmd) {
+    case CMD_COMPACT:
+        setnote(g, s, "compacting: summarizing the older messages", 0);
+        break;
+    case CMD_RENAME:
+        setnote(g, s, "renamed", 0);
+        guilist(g, h);
+        break;
+    case CMD_MODEL: {
+        Str  model = jsonstr(jsonget(j, "model"));
+        Buf  b(&scratch, 256 + model.len + note.len);
+        print(&b, "switched model");
+        if (model.len) {
+            print(&b, " to ");
+            print(&b, model);
+        }
+        if (note.len) {
+            print(&b, ": ");
+            print(&b, note);
+        }
+        setnote(g, s, finish(&b), 0);
+        guilist(g, h);
+    } break;
+    case CMD_FORK: {
+        // {ok, sid:<new>, from, turn, next?}
+        Str sid = jsonstr(jsonget(j, "sid"));
+        if (!validsid(sid) || sid==s->sid) {
+            setnote(g, s, "forked", 0);
+            guilist(g, h);
+            break;
+        }
+        GuiSession *f = findsess(g, h, sid);
+        f = f ? f : addsess(g, h, sid);
+        guiselect(g, f);
+        Str next = jsonstr(jsonget(j, "next"));
+        if (next.len) {
+            setdraft(g, f, next);
+        }
+        setnote(g, f, concat(&scratch, "forked from ", s->sid), 0);
+        guilist(g, h);
+    } break;
+    }
+}
 
 static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 {
@@ -2094,7 +2279,25 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             s->view->readonly  = s->readonly;
             s->view->topsdirty = 1;  // no buttons on its asks
         }
+        // The draft its engine kept, unless something was typed since
+        Str draft = jsonstr(jsonget(j, "draft"));
+        if (draft.len && draftloads(&s->dclock) && g->edsess!=s) {
+            draftput(g, s, draft);
+        }
     } return;
+
+    case CMD_COMPACT:
+    case CMD_RENAME:
+    case CMD_MODEL:
+    case CMD_FORK:
+        onsesscmd(g, h, scratch, &q, r);
+        return;
+
+    case CMD_DRAFT:
+        if (!ok && q.s) {
+            setnote(g, q.s, concat(&scratch, "the draft was not kept: ", err), 1);
+        }
+        return;
 
     case CMD_REWIND: {
         if (g->rewindid == id) {
@@ -2245,6 +2448,283 @@ static b32 hostcan(GuiHost *h, Str name)
         }
     }
     return 0;
+}
+
+
+// Drafts: each session's compose box, which its engine keeps (draft)
+// once typing pauses, as the session is left, and as the GUI quits or
+// goes to the background, and gives back in open's reply. A host whose
+// engine is too old for drafts, or is down, keeps none: the box keeps
+// its text for this run only.
+
+// A session's draft, its buffer made on first use: reserved, and
+// untouched until typed in, it costs no memory.
+static char *draftbuf(Gui *g, GuiSession *s)
+{
+    if (!s->draft) {
+        s->dregion = os_reserve(g->os, DRAFT_MAX + ((iz)1<<16));
+        if (!s->dregion) {
+            os_oom();
+        }
+        Arena a = newarena(s->dregion);
+        s->draft = (char *)allocbytes(&a, DRAFT_MAX+1);
+        s->draft[0] = 0;
+    }
+    return s->draft;
+}
+
+static Str draftstr(GuiSession *s)
+{
+    return s->draft ? Str{(u8 *)s->draft, (iz)__builtin_strlen(s->draft)} : Str{};
+}
+
+// Whether a session's host keeps its draft now: up, with an engine new
+// enough.
+static b32 draftkept(Gui *g, GuiSession *s)
+{
+    GuiHost *h = s->host;
+    if (!h) {
+        return 0;  // the empty view's
+    } else if (h->kind == GH_ENGINE) {
+        return !g->enginegone && !g->host && g->enginekind!=ENGINE_FAKE &&
+               engineup(g) && hostcan(h, "draft");
+    }
+    return h->r && !h->closing && hostcan(h, "draft");
+}
+
+// Give the engine the draft now, if it changed since it last did. A
+// host that cannot keep it leaves it here, waiting for no deadline.
+static void draftsend(Gui *g, GuiSession *s)
+{
+    if (!s->dclock.dirty) {
+        return;
+    } else if (!draftkept(g, s)) {
+        s->dclock.due = 0;
+        return;
+    }
+    Str   text = draftstr(s);
+    Arena a    = newarena(g->cmdr);
+    Buf   b(&a, 256 + text.len + text.len/8);
+    EvOut w = cmdopen(g, &b, CMD_DRAFT, s);
+    putkey(&w.json, "text");
+    putstr(&w.json, text);
+    cmdsend(g, &w, a);
+    draftdone(&s->dclock);
+}
+
+static void draftsendall(Gui *g)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        draftsend(g, s);
+    }
+}
+
+// Between frames: drafts whose typing paused go out, and the next to
+// come due asks for a frame then, which draws nothing new.
+static void draftpoll(Gui *g, Sched *sc)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (draftdue(&s->dclock, sc->now)) {
+            draftsend(g, s);
+        }
+        if (s->dclock.due) {
+            schedat(sc, s->dclock.due, DUE_APP);
+        }
+    }
+}
+
+// Put text in a session's box, at most a draft's worth, cut at a code
+// point. ImGui's state of the box, if it has it, takes it up, the caret
+// at its end. Not sent: setdraft sends.
+static void draftput(Gui *g, GuiSession *s, Str text)
+{
+    char *buf = draftbuf(g, s);
+    iz    n   = text.len<DRAFT_MAX ? text.len : (iz)DRAFT_MAX;
+    while (n>0 && n<text.len && (text[n]&0xc0)==0x80) n--;
+    copybytes(buf, text.data, n);
+    buf[n]  = 0;
+    s->hist = 0;
+    ImGuiInputTextState *st = ImGui::GetCurrentContext() ? ImGui::GetInputTextState(s->draftid) : 0;
+    if (st) {
+        st->ReloadUserBufAndMoveToEnd();
+    }
+    scheddirty(&g->sched);
+}
+
+// The text becomes a session's draft, as if typed, and its engine keeps
+// it at once: for a fork, its next prompt; for the editor, the file.
+static void setdraft(Gui *g, GuiSession *s, Str text)
+{
+    draftput(g, s, text);
+    drafttyped(&s->dclock, os_ticks(g->os));
+    draftsend(g, s);
+}
+
+// What the latest command from the box came to, shown above it until
+// the next is typed.
+static void setnote(Gui *g, GuiSession *s, Str note, b32 err)
+{
+    s->note    = clone(&g->perm, note);
+    s->noteerr = err;
+    scheddirty(&g->sched);
+}
+
+
+// The editor: the draft written to a file under the state directory,
+// which is this user's own, then opened by [ui] editor, else $VISUAL,
+// else $EDITOR, else macOS's default text editor, through the shell, as
+// a tool runs: under a reaper (POSIX) or in a job (Windows), so that it
+// goes if this process does. Its exit comes as a record, which wakes
+// the GUI: with status 0 the file is the new draft; with any other, or
+// cancelled, the draft stays as it was. One draft at a time is out,
+// and its box is read-only meanwhile.
+
+static Str editorcmd(Gui *g, Arena *a)
+{
+    return editorpick(g->editor, os_getenv(g->os, a, "VISUAL"),
+                      os_getenv(g->os, a, "EDITOR"), g->mac);
+}
+
+static void editstart(Gui *g, GuiSession *s)
+{
+    if (g->edsess) {
+        setnote(g, s, g->edsess==s ? Str("the draft is open in the editor already")
+                                   : Str("the editor has another session's draft open"), 1);
+        return;
+    }
+    Arena a   = g->frame;
+    Str   cmd = editorcmd(g, &a);
+    if (!cmd.len) {
+        setnote(g, s, "no editor: set [ui] editor in the settings (or $VISUAL or $EDITOR)", 1);
+        return;
+    }
+    Str dir  = join(&a, g->statedir, "edit");
+    Str base = concat(&a, "draft-", s->sid.len ? s->sid : Str("new"));
+    Str path = join(&a, dir, concat(&a, base, ".md"));
+    Str log  = join(&a, dir, concat(&a, base, ".log"));
+    if (!os_mkdirs(g->os, a, dir) || !os_write(g->os, a, path, draftstr(s))) {
+        setnote(g, s, concat(&a, "cannot write the draft for the editor: ", os_lasterr(g->os, &a)), 1);
+        return;
+    }
+    Spawn sp = {};
+    #ifdef _WIN32
+    Str comspec = os_getenv(g->os, &a, "COMSPEC");
+    comspec = comspec.len ? comspec : Str("cmd.exe");
+    Str line = editorline(&a, cmd, path, 1);
+    Buf c(&a, 64 + comspec.len + line.len);
+    putbyte(&c, '"');
+    print(&c, comspec);
+    print(&c, "\" /d /s /c \"");
+    print(&c, line);
+    putbyte(&c, '"');
+    sp.argv    = push(&a, sp.argv, comspec);
+    sp.cmdline = finish(&c);
+    #else
+    sp.argv = push(&a, sp.argv, Str("/bin/sh"));
+    sp.argv = push(&a, sp.argv, Str("-c"));
+    sp.argv = push(&a, sp.argv, editorline(&a, cmd, path, 0));
+    #endif
+    sp.cwd      = dir;
+    sp.env      = os_environ(g->os, &a);
+    sp.outpath  = log;
+    sp.maxbytes = 1<<16;
+    sp.mbox     = g->edbox;
+    sp.id       = ++g->edid;
+    Proc *p = os_spawn(g->os, &sp, a);
+    if (!p) {
+        setnote(g, s, concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a)), 1);
+        os_remove(g->os, a, path);
+        return;
+    }
+    g->edsess = s;
+    g->edproc = p;
+    g->edpath = clone(&g->perm, path);
+    g->edlog  = clone(&g->perm, log);
+    g->edname = clone(&g->perm, editorname(cmd));
+    guilog(g, concat(&a, "editing a draft: ", cmd));
+    s->hist   = 0;
+    s->note   = {};
+    scheddirty(&g->sched);
+}
+
+// The editor exited with a status, or was cancelled (status -1).
+static void editend(Gui *g, i32 status)
+{
+    GuiSession *s = g->edsess;
+    Arena       a = g->frame;
+    if (status == 0) {
+        Read rd = os_read(g->os, &a, g->edpath, DRAFT_MAX+2);
+        Str  t  = editortext(rd.data);
+        if (rd.err==READ_TOOBIG || t.len>DRAFT_MAX) {
+            setnote(g, s, "the edited draft is too long, over 1 MiB: the draft is as it was", 1);
+        } else if (rd.err != READ_OK) {
+            setnote(g, s, "cannot read the edited draft: the draft is as it was", 1);
+        } else {
+            setdraft(g, s, t);
+            s->note = {};
+        }
+    } else if (status > 0) {
+        // Its output's last line says why, as a shell's does when it
+        // finds no such command
+        Read rd   = os_read(g->os, &a, g->edlog, 1<<16);
+        Str  out  = trim(rd.data);
+        iz   from = out.len;
+        while (from>0 && out[from-1]!='\n') from--;
+        Str  last = cuthead(out, from);
+        last = takehead(last, last.len<200 ? last.len : 200);
+        Buf  b(&a, 256 + last.len);
+        print(&b, "the editor exited with status ");
+        print(&b, (i64)status);
+        print(&b, ": the draft is as it was");
+        if (last.len) {
+            print(&b, " (");
+            print(&b, last);
+            putbyte(&b, ')');
+        }
+        setnote(g, s, finish(&b), 1);
+    }
+    Buf lb(&a, 64);
+    print(&lb, "the draft's editor ");
+    print(&lb, status<0 ? Str("was cancelled") : Str("exited with status "));
+    if (status >= 0) {
+        print(&lb, (i64)status);
+    }
+    guilog(g, finish(&lb));
+    os_remove(g->os, a, g->edpath);
+    os_remove(g->os, a, g->edlog);
+    os_procfree(g->os, g->edproc);
+    g->edsess = 0;
+    g->edproc = 0;
+    scheddirty(&g->sched);
+}
+
+// Cancel the edit: the editor is killed, and its exit, when it comes,
+// is ignored.
+static void editcancel(Gui *g)
+{
+    if (g->edproc) {
+        os_kill(g->os, g->edproc, 1);
+        editend(g, -1);
+    }
+}
+
+// The editor's records: only its exit matters.
+static b32 drainedit(Gui *g)
+{
+    if (!g->edbox) {
+        return 0;
+    }
+    b32  any = 0;
+    Mail m   = mailtake(g->edbox);
+    for (Record r = mailnext(&m); r.ok; r = mailnext(&m)) {
+        if (r.type==PROC_EXIT && g->edproc && r.id==g->edid) {
+            i32 code = get32(r.data);
+            i32 sig  = get32(cuthead(r.data, 4));
+            editend(g, sig ? 128+sig : code<0 ? 255 : code);
+            any = 1;
+        }
+    }
+    return any;
 }
 
 // Apply one record from a host. Returns 1 if what shows changed.
@@ -3021,6 +3501,7 @@ static void shednow(Gui *g)
 {
     i32 req = g->shedreq;
     g->shedreq = 0;
+    draftsendall(g);
     if (req == 2) {
         gobackground(g);
     } else if (req==1 && g->host) {
@@ -3566,6 +4047,8 @@ static void drainmail(Gui *g, i64 now)
             }
         }
     }
+
+    other |= drainedit(g);
 
     // The other hosts': let go while closing, or in the background
     for (GuiHost *h = g->hosts, *next; h; h = next) {
@@ -4241,6 +4724,7 @@ static void gui_frame(Gui *g)
     if (g->img.dying) {
         busy |= BUSY_TEX;
     }
+    draftpoll(g, s);
     if (g->quitat) {
         schedat(s, g->quitat, DUE_APP);
     }
@@ -4721,6 +5205,7 @@ enum : i32 {
     OP_GEOMMARK,  // remember the window's geometry
     OP_PLACE,     // move the window as if saved: dx 1 on a display to the
                   // right of all, gone since; 0 back as remembered
+    OP_MARKSESS,  // remember the session shown, for CHK_DRAFTFILE
 };
 
 enum : i32 {
@@ -4795,6 +5280,15 @@ enum : i32 {
     T_SESSMENU,    // the menu bar's Session menu
     T_ZOOMRESET,   // View's Actual size
     T_PANEITEM,    // View's toggle of the pane named by text
+    T_CMUNDO,      // the compose box's context menu's items
+    T_CMREDO,
+    T_CMCUT,
+    T_CMCOPY,
+    T_CMPASTE,
+    T_CMSELALL,
+    T_CMEDITOR,
+    T_EDITCANCEL,  // its Cancel while the editor runs
+    T_MODEL0,      // the first model /model lists
 };
 
 enum : i32 {
@@ -4951,6 +5445,23 @@ enum : i32 {
     CHK_ZOOMQUIET,
     CHK_PLACED,
     CHK_GEOMKEPT,
+    CHK_PROMPT,       // the compose box holds text
+    CHK_HIST,         // it recalls history entry text ("N/M"), "" if none
+    CHK_DRAFTFILE,    // the marked session's draft sidecar holds text
+    CHK_CARET,        // the caret: "0", "end", "first" or "second" line
+    CHK_COMPOSEQUIET,
+    CHK_CMENU,        // its context menu, enabling dy of the items dx
+    CHK_SELALL,
+    CHK_CLIPBOARD,    // the clipboard holds text
+    CHK_EDITING,
+    CHK_NOTEDITING,
+    CHK_NOTE,         // the session's note has text in it
+    CHK_SLASH,        // the slash popup lists dx commands (0: closed)
+    CHK_SLASHSEL,     // its pick is text
+    CHK_TITLE,        // the session's title is text
+    CHK_LASTUSER,     // its latest user message is text
+    CHK_MODELS,
+    CHK_COMPACTED,
     CHK_COUNT,
 };
 
@@ -5084,6 +5595,23 @@ static Str chknames[] = {
     "no frames once the zoom settled",
     "a window saved on a display gone since is centered on the primary",
     "the window is where it was",
+    "the compose box holds what it should",
+    "history mode as it should be",
+    "the engine keeps the draft it should",
+    "the caret is where it should be",
+    "no frames once typing is done, the draft kept",
+    "the box's context menu, its items enabled as they should be",
+    "the box's text all selected",
+    "the clipboard holds what was cut",
+    "the box is read-only, saying an editor is at work",
+    "no editor at work, and the box is writable",
+    "the session's note says how the command went",
+    "the slash popup lists the commands it should",
+    "the slash popup's pick moved",
+    "the session's title is as renamed",
+    "the text went out as a message, not a command",
+    "/model lists the configured models",
+    "/compact compacted the conversation",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -5127,6 +5655,10 @@ enum : i32 {
     W_SHOT,       // the Screenshot window's image came, or failed
     W_THINKING,   // the session shown streams reasoning
     W_THINKSTALL, // and has had none for a while
+    W_TURNS,      // the session shown is idle after dx turns
+    W_EDITED,     // no editor runs
+    W_NOTE,       // the session shown has a note
+    W_COMPACTED,  // it has a compaction card, and is idle
 };
 
 static Str waitnames[] = {
@@ -5139,9 +5671,9 @@ static Str waitnames[] = {
     "the window to come back", "a background host", "the remote host",
     "the link to drop", "the remote to close", "the output", "a file",
     "the includes", "the thumbnails", "the screenshot", "reasoning",
-    "a pause in reasoning",
+    "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
 };
-static_assert(countof(waitnames) == W_THINKSTALL+1);
+static_assert(countof(waitnames) == W_COMPACTED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -6641,6 +7173,273 @@ static DriveOp remoteops[] = {
 };
 
 // Idle: nothing for a minute after startup settles.
+// The compose box (--compose, then --compose-again, as tests/gui.py
+// --mode compose runs them): history, the caret's edges, the context
+// menu, the editor ([ui] editor a test script), slash commands and their
+// popup, and one draft per session, kept by the engine once typing
+// pauses and at once on leaving it or quitting, with no frames for it;
+// then, after a restart, the drafts back from the engine.
+#define KEY(k, mods, ms) \
+    {OP_KEYDOWN, 0, k, mods, 50, ""}, {OP_KEYUP, 0, k, mods, ms, ""}
+#define CLICK(t, text, ms) \
+    {OP_MOVE, t, 0, 0, 100, text}, {OP_DOWN, 0, 0, 0, 60, ""}, {OP_UP, 0, 0, 0, ms, ""}
+#define RCLICK(ms) \
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""}, {OP_RDOWN, 0, 0, 0, 60, ""}, \
+    {OP_RUP, 0, 0, 0, ms, ""}
+#define SELALL \
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""}, KEY(GKEY_A, KEY_CMD, 50), \
+    {OP_KEYUP, 0, GKEY_CMD, 0, 200, ""}
+#define CTRLG(ms) \
+    {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, KEY(GKEY_G, KEY_CTRL, 50), \
+    {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+
+static DriveOp composeops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    // A, with two prompts to recall
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_MARKSESS, 0, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 200, "Say hello."},
+    {OP_WAIT, W_TURNS, 1, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 200, "Say hello again, please."},
+    {OP_WAIT, W_TURNS, 2, 0, 10000, ""},
+    // History: Up on the empty box recalls the newest, then older, no
+    // further than the oldest; Down comes back to the empty draft, as
+    // Esc does, which leaves the turn alone
+    CLICK(T_PROMPT, "", 300),
+    KEY(GKEY_UP, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello again, please."},
+    {OP_CHECK, CHK_HIST, 0, 0, 0, "2/2"},
+    KEY(GKEY_UP, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello."},
+    {OP_CHECK, CHK_HIST, 0, 0, 0, "1/2"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-history"},
+    KEY(GKEY_UP, 0, 300),
+    {OP_CHECK, CHK_HIST, 0, 0, 0, "1/2"},
+    KEY(GKEY_DOWN, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello again, please."},
+    KEY(GKEY_DOWN, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_HIST, 0, 0, 0, ""},
+    KEY(GKEY_UP, 0, 300),
+    KEY(GKEY_ESCAPE, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_HIST, 0, 0, 0, ""},
+    // Editing a recalled message makes it the draft, which the engine
+    // keeps once typing has paused for a second
+    KEY(GKEY_UP, 0, 300),
+    {OP_TEXT, 0, 0, 0, 300, " Thanks."},
+    {OP_CHECK, CHK_HIST, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello again, please. Thanks."},
+    {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, "Say hello again, please. Thanks."},
+    // The caret: between lines as ever, but Up on the first goes to the
+    // start, and Down on the last to the end
+    KEY(GKEY_ENTER, KEY_SHIFT, 100),
+    {OP_TEXT, 0, 0, 0, 300, "line two"},
+    {OP_CHECK, CHK_CARET, 0, 0, 0, "end"},
+    KEY(GKEY_UP, 0, 300),
+    {OP_CHECK, CHK_CARET, 0, 0, 0, "first"},
+    KEY(GKEY_UP, 0, 300),
+    {OP_CHECK, CHK_CARET, 0, 0, 0, "0"},
+    KEY(GKEY_DOWN, 0, 300),
+    {OP_CHECK, CHK_CARET, 0, 0, 0, "second"},
+    KEY(GKEY_DOWN, 0, 300),
+    {OP_CHECK, CHK_CARET, 0, 0, 0, "end"},
+    // Once the caret stops blinking, nothing: the draft's deadline went
+    // by in a frame of its own long ago
+    {OP_MOVE, T_EMPTY, 0, 0, 11000, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_COMPOSEQUIET, 0, 0, 0, ""},
+    {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
+    // The context menu, each pick done by the box itself: Undo there,
+    // nothing selected; then Select all, Cut, Paste, Undo and Redo
+    RCLICK(500),
+    {OP_CHECK, CHK_CMENU, 1|4|16, 1|16, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "compose-menu"},
+    CLICK(T_CMSELALL, "", 500),
+    {OP_CHECK, CHK_SELALL, 0, 0, 0, ""},
+    RCLICK(500),
+    {OP_CHECK, CHK_CMENU, 4, 4, 0, ""},
+    CLICK(T_CMCUT, "", 500),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
+    RCLICK(500),
+    CLICK(T_CMPASTE, "", 500),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
+    RCLICK(500),
+    CLICK(T_CMUNDO, "", 500),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    RCLICK(500),
+    {OP_CHECK, CHK_CMENU, 2, 2, 0, ""},
+    CLICK(T_CMREDO, "", 500),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
+    // The editor, by Ctrl+G: read-only meanwhile, saying so, then the
+    // draft as it saved it, kept at once
+    CTRLG(300),
+    {OP_CHECK, CHK_EDITING, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "compose-editing"},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0,
+     "Say hello again, please. Thanks.\nline two\nEdited by the test editor."},
+    {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0,
+     "Say hello again, please. Thanks.\nline two\nEdited by the test editor."},
+    // An editor that fails, from the menu, leaves the draft alone, and
+    // so does one cancelled
+    CLICK(T_PROMPT, "", 200),
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 300, "exit 1 please"},
+    RCLICK(500),
+    CLICK(T_CMEDITOR, "", 300),
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "exit 1 please"},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "status 1"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-editfailed"},
+    CLICK(T_PROMPT, "", 200),
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 300, "sleep please"},
+    CTRLG(800),
+    {OP_CHECK, CHK_EDITING, 0, 0, 0, ""},
+    CLICK(T_EDITCANCEL, "", 500),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "sleep please"},
+    {OP_CHECK, CHK_NOTEDITING, 0, 0, 0, ""},
+    // Slash commands: the popup while the first word is typed, Down to
+    // pick, Tab to complete; /rename end to end
+    CLICK(T_PROMPT, "", 200),
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 300, "/"},
+    {OP_CHECK, CHK_SLASH, SLASH_COUNT-1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "compose-slash"},
+    KEY(GKEY_DOWN, 0, 300),
+    {OP_CHECK, CHK_SLASHSEL, 0, 0, 0, "/model"},
+    {OP_TEXT, 0, 0, 0, 300, "re"},
+    {OP_CHECK, CHK_SLASH, 1, 0, 0, ""},
+    KEY(GKEY_TAB, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "/rename "},
+    {OP_CHECK, CHK_SLASH, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 200, "Session A"},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "renamed"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Session A"},
+    // Not a command: a path is sent as text
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "/usr/bin/foo is broken"},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_TURNS, 3, 0, 10000, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "/usr/bin/foo is broken"},
+    // /compact with too little to compact: the reason, and the command
+    // back in the box
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "/compact the parser"},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "too little"},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "/compact the parser"},
+    // /model alone lists the configured models; one picked switches
+    CLICK(T_PROMPT, "", 200),
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 200, "/model"},
+    KEY(GKEY_ENTER, 0, 600),
+    {OP_CHECK, CHK_MODELS, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "compose-models"},
+    CLICK(T_MODEL0, "", 300),
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "switched"},
+    // /fork shows the new session, renamed here so that "Session A"
+    // still names one; /export is not there yet
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "/fork"},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "forked from"},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Session A (fork)"},
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "/rename Forked"},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "renamed"},
+    CLICK(T_SESSTITLE, "Session A", 500),
+    CLICK(T_PROMPT, "", 200),
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 200, "/export"},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "not available"},
+    // B: a draft of its own. Leaving each keeps its draft at once
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 200, "Kept across a restart"},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, "Kept across a restart"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_MARKSESS, 0, 0, 0, 0, ""},
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "/rename Session B"},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_TEXT, 0, 0, 0, 200, "Draft for B"},
+    CLICK(T_SESSTITLE, "Session A", 500),
+    {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, "Draft for B"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Kept across a restart"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-drafts"},
+    CLICK(T_SESSTITLE, "Session B", 500),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for B"},
+    // C: enough of a conversation for /compact, with a focus
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 200, "Answer at length."},
+    {OP_WAIT, W_TURNS, 1, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 200, "Answer at length, again."},
+    {OP_WAIT, W_TURNS, 2, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 200, "Answer at length, once more."},
+    {OP_WAIT, W_TURNS, 3, 0, 10000, ""},
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "/compact keep the API"},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_COMPACTED, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_COMPACTED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "compose-compacted"},
+    // Quitting keeps a draft typed just before
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 100, "Draft for C"},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
+// After a restart: each draft back from its engine, as typed.
+static DriveOp compose2ops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    CLICK(T_SESSTITLE, "Session A", 300),
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Kept across a restart"},
+    CLICK(T_SESSTITLE, "Session B", 300),
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for B"},
+    CLICK(T_SESSTITLE, "Answer at length.", 300),
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for C"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-restored"},
+    {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_COMPOSEQUIET, 0, 0, 0, ""},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+#undef KEY
+#undef CLICK
+#undef RCLICK
+#undef SELALL
+#undef CTRLG
+
 static DriveOp idleops[] = {
     {OP_MARK, 0, 0, 0, 10000, ""},  // startup settles
     {OP_MARK, 0, 0, 0, 60000, "idle"},
@@ -6815,6 +7614,15 @@ static ImVec2 targetpos(Gui *g, i32 t)
     }
     case T_SESSMENU:      return rectcenter(g->rects[RECT_SESSMENU]);
     case T_ZOOMRESET:     return rectcenter(g->rects[RECT_ZOOMRESET]);
+    case T_CMUNDO:        return rectcenter(g->rects[RECT_CMUNDO]);
+    case T_CMREDO:        return rectcenter(g->rects[RECT_CMREDO]);
+    case T_CMCUT:         return rectcenter(g->rects[RECT_CMCUT]);
+    case T_CMCOPY:        return rectcenter(g->rects[RECT_CMCOPY]);
+    case T_CMPASTE:       return rectcenter(g->rects[RECT_CMPASTE]);
+    case T_CMSELALL:      return rectcenter(g->rects[RECT_CMSELALL]);
+    case T_CMEDITOR:      return rectcenter(g->rects[RECT_CMEDITOR]);
+    case T_EDITCANCEL:    return rectcenter(g->rects[RECT_EDITCANCEL]);
+    case T_MODEL0:        return rectcenter(g->rects[RECT_MODEL0]);
     case T_PANEITEM:
         for (i32 i = 0; i < PANE_COUNT; i++) {
             if (g->ops[g->drivepc-1].text == inistr(panenames[i])) {
@@ -6873,11 +7681,10 @@ static b32 tabselected(char const *name)
     return w && w->DockTabIsVisible;
 }
 
+// The compose box's text, the session shown's draft.
 static Str promptstr(Gui *g)
 {
-    Str p = {(u8 *)g->prompt, 0};
-    while (p.data[p.len]) p.len++;
-    return p;
+    return draftstr(g->sess ? g->sess : &g->nosession);
 }
 
 // The latest message of a role in the session shown, or null.
@@ -7097,6 +7904,14 @@ static b32 drivewaitdone(Gui *g)
         return g->sess && thinking(v) && (v->thinking==THINK_HIDE || g->thinkchars>0);
     case W_THINKSTALL:
         return g->sess && thinking(v) && os_time(g->os)-v->lastdata>=700;
+    case W_TURNS:
+        return g->sess && !v->busy && v->turn>=(i32)g->ops[g->drivepc-1].dx;
+    case W_EDITED:
+        return !g->edsess;
+    case W_NOTE:
+        return g->sess && g->sess->note.len;
+    case W_COMPACTED:
+        return g->sess && !v->busy && lastof(v, VIEW_COMPACT);
     case W_SHED:
         return g->bg;
     case W_REOPENED:
@@ -7331,6 +8146,112 @@ static b32 pathendswith(Str path, Str tail)
         }
     }
     return 1;
+}
+
+// The compose box's checks: what each found, logged, with what it
+// should have been when not.
+static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
+{
+    Arena       a    = g->frame;
+    GuiSession *s    = g->sess ? g->sess : &g->nosession;
+    View       *v    = g->view;
+    Str         want = op->text;
+    Str         got  = {};
+    b32         ok   = 0;
+    switch (chk) {
+    case CHK_PROMPT:
+        got = promptstr(g);
+        ok  = got == want;
+        break;
+    case CHK_HIST: {
+        Buf b(&a, 32);
+        if (s->hist) {
+            i32 m = histcount(v);
+            print(&b, (i64)(m - s->hist + 1));
+            putbyte(&b, '/');
+            print(&b, (i64)m);
+        }
+        got = finish(&b);
+        ok  = got==want && (!s->hist || g->histshown==s->hist);
+    } break;
+    case CHK_DRAFTFILE: {
+        GuiSession *m = g->drivesess;
+        if (m) {
+            Str path = join(&a, sessdir(g, &a, m->sid), "draft");
+            got = os_read(g->os, &a, path, DRAFT_MAX).data;
+        }
+        ok = m && got==want;
+    } break;
+    case CHK_CARET: {
+        ImGuiInputTextState *st = ImGui::GetInputTextState(s->draftid);
+        Str text = promptstr(g);
+        iz  nl   = 0;
+        while (nl<text.len && text[nl]!='\n') nl++;
+        i64 at = st ? st->GetCursorPos() : -1;
+        Buf b(&a, 24);
+        print(&b, at);
+        got = finish(&b);
+        ok  = st && (want=="0"      ? at==0 :
+                     want=="end"    ? at==text.len :
+                     want=="first"  ? at>0 && at<=nl :
+                     want=="second" ? at>nl : 0);
+    } break;
+    case CHK_CMENU: {
+        u32 mask = (u32)op->dx;
+        Buf b(&a, 24);
+        print(&b, (i64)(g->cmenustate & mask));
+        got = finish(&b);
+        ok  = g->cmenushown && (g->cmenustate & mask)==(u32)op->dy;
+    } break;
+    case CHK_SELALL: {
+        ImGuiInputTextState *st = ImGui::GetInputTextState(s->draftid);
+        iz n = promptstr(g).len;
+        ok = st && n>0 && st->GetSelectionStart()==0 && st->GetSelectionEnd()==n;
+    } break;
+    case CHK_CLIPBOARD: {
+        char const *c = ImGui::GetClipboardText();
+        got = c ? Str{(u8 *)c, (iz)__builtin_strlen(c)} : Str{};
+        ok  = got == want;
+    } break;
+    case CHK_NOTE:
+        got = s->note;
+        ok  = got.len && find(got, want)>=0;
+        break;
+    case CHK_SLASH: {
+        i32 n = slashcount(slashmatches(promptstr(g)));
+        Buf b(&a, 24);
+        print(&b, (i64)(g->slashshown ? n : 0));
+        got = finish(&b);
+        ok  = (i32)op->dx ? g->slashshown && n==(i32)op->dx : !g->slashshown;
+    } break;
+    case CHK_SLASHSEL:
+        got = slashinfo[slashnth(slashmatches(promptstr(g)), g->slashsel)].name;
+        ok  = g->slashshown && got==want;
+        break;
+    case CHK_TITLE:
+        got = v->title;
+        ok  = got == want;
+        break;
+    case CHK_LASTUSER: {
+        ViewMsg *m = lastmsg(g, VIEW_USER);
+        got = m ? m->text : Str{};
+        ok  = got == want;
+    } break;
+    }
+    Buf b(&a, 256 + got.len);
+    print(&b, "prospero: drive: ");
+    print(&b, chknames[chk]);
+    print(&b, ": [");
+    print(&b, takehead(got, got.len<200 ? got.len : 200));
+    putbyte(&b, ']');
+    if (!ok) {
+        print(&b, ", not [");
+        print(&b, want);
+        putbyte(&b, ']');
+    }
+    putbyte(&b, '\n');
+    os_print(g->os, 2, finish(&b));
+    return ok;
 }
 
 static b32 drivecheck(Gui *g, i32 chk)
@@ -7642,6 +8563,37 @@ static b32 drivecheck(Gui *g, i32 chk)
         return boxoverlap(w.box, disp[0]) == (i64)w.box.w*w.box.h &&
                cx-dx<=4 && dx-cx<=4 && g->geom.box.x==w.box.x && g->geom.box.y==w.box.y;
     }
+    case CHK_PROMPT:
+    case CHK_HIST:
+    case CHK_DRAFTFILE:
+    case CHK_CARET:
+    case CHK_CMENU:
+    case CHK_SELALL:
+    case CHK_CLIPBOARD:
+    case CHK_NOTE:
+    case CHK_SLASH:
+    case CHK_SLASHSEL:
+    case CHK_TITLE:
+    case CHK_LASTUSER:
+        return composecheck(g, chk, &g->ops[g->drivepc-1]);
+    case CHK_COMPOSEQUIET: {
+        i64 n = g->total.frames - g->driveframes;
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: ");
+        print(&b, n);
+        print(&b, " frames in 3 s, the box idle");
+        guilog(g, finish(&b));
+        return n <= 2 + 3*(g->saves - g->marksaves);  // the probe's, the script's, a save's
+    }
+    case CHK_EDITING:
+        return g->sess && g->edsess==g->sess && g->editshown;
+    case CHK_NOTEDITING:
+        return !g->edsess && !g->edproc;
+    case CHK_MODELS:
+        return g->modelsshown;
+    case CHK_COMPACTED:
+        return lastof(v, VIEW_COMPACT) != 0;
     case CHK_GEOMKEPT: {
         WinGeom w = os_guiwhere(g->os);
         WinGeom m = g->geommark;
@@ -8734,6 +9686,9 @@ static void drivestep(Gui *g)
     case OP_GEOMMARK:
         g->geommark = os_guiwhere(g->os);
         break;
+    case OP_MARKSESS:
+        g->drivesess = g->sess;
+        break;
     case OP_PLACE:
         if (op->dx != 0) {
             // As if saved on a display right of every display there is
@@ -8852,6 +9807,9 @@ static Str guiusage =
 "  --attach       a second window while one runs in the background\n"
 "  --remote       a remote host, [remote r], its link dropped mid-turn\n"
 "  --rcwd DIR     the remote checklist's working directory there\n"
+"  --compose      the compose box's checklist: drafts, history, the menu,\n"
+"                 the editor, slash commands ([ui] editor a test script)\n"
+"  --compose-again  its drafts after a restart, in the same directories\n"
 "  --host-idle S  in the background, exit S seconds after the last\n"
 "                 session ends with no window (default: [host] idle_exit)\n"
 "  --probe        staleness probe on (default in debug builds)\n"
@@ -8920,6 +9878,7 @@ static void readconfig(Gui *g, Arena scratch)
     i32 tools = toolsparse(cfgget(cfg, "ui", "", "tools", 0));
     g->toolset = tools<0 ? TOOLS_AUTO : tools;
     setfontbase(g, cfgget(cfg, "ui", "", "font_size", 0));
+    g->editor = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
     if (own) {
         g->config = cfg;
     } else {
@@ -9013,7 +9972,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     #endif
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
-    b32 background = 0, attach = 0, remote = 0;
+    b32 background = 0, attach = 0, remote = 0, compose = 0;
     i64 history = 0;
     i32 bench   = 0;
     for (i32 i = 1 + (nargs>1 && args[1]=="gui"); i < nargs; i++) {
@@ -9047,6 +10006,11 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             attach = probe = 1;
         } else if (a == "--remote") {
             remote = probe = 1;
+        } else if (a == "--compose") {
+            compose = probe = 1;
+        } else if (a == "--compose-again") {
+            compose = 2;
+            probe   = 1;
         } else if (a=="--rcwd" && i+1<nargs) {
             g->driverwd = cstrclone(&mem, args[++i]);
         } else if (a == "--trace") {
@@ -9092,9 +10056,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     }
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
-            background || attach || remote) {
+            background || attach || remote || compose) {
         g->drive = 1;
-        if (e2e) {
+        if (compose) {
+            g->ops  = compose==1 ? composeops : compose2ops;
+            g->nops = compose==1 ? countof(composeops) : countof(compose2ops);
+        } else if (e2e) {
             g->ops  = e2eops;
             g->nops = countof(e2eops);
         } else if (background) {
@@ -9149,7 +10116,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->nosession.view  = newview(&g->perm, g->vcache, os_reserve(os, 16*mb),
                                  os_reserve(os, 16*mb), os_reserve(os, 16*mb));
     g->view       = g->nosession.view;
-    g->prompt     = alloc<char>(&g->perm, PROMPT_MAX);
+    g->edbox      = newmailbox(&g->perm, 1<<14, wakegui, os);
     g->newcwd     = alloc<char>(&g->perm, FIELD_MAX);
     g->newmodel   = alloc<char>(&g->perm, FIELD_MAX);
     g->denynote   = alloc<char>(&g->perm, FIELD_MAX);

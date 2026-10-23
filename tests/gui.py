@@ -21,6 +21,7 @@ by quitting are gone, with no engine process left behind.
   uv run tests/gui.py --prospero build/prospero --mode enginestop
   uv run tests/gui.py --prospero build/prospero --fake [--mode idle]   (M1's)
   uv run tests/gui.py --prospero build/prospero --mode bench   (M1's scale)
+  uv run tests/gui.py --prospero build/prospero --mode compose [--shots DIR]
 
 The settings mode edits a value longer than a field's slack and picks
 the theme, dark then light, from its list over a transcript that shows
@@ -31,7 +32,11 @@ deletes a section after cancelling once, finds an included one it cannot
 delete, and adds a model; the file must then hold those edits and no
 other change. The enginestop
 mode kills the engine process mid-turn and mid-ask: the GUI must stop
-counting either, and quit at once when closed.
+counting either, and quit at once when closed. The compose mode runs
+the compose box's checklist, with [ui] editor a test script (an editor
+that appends a line, one that exits 1, and one cancelled), then the GUI
+again, to find each session's draft back from its engine; no draft file
+for the editor may be left over.
 
 On Linux without a display it runs under xvfb-run. --serve only runs the
 provider and writes the configuration, for a GUI started elsewhere (a
@@ -87,6 +92,31 @@ SETTINGS_EXTRA = (f"\n# A long value\n[role long]\nprompt = {LONG_PROMPT}\n"
                   f"\n{SETTINGS_GONE}"
                   "\n# A remote host, never connected\n"
                   "[remote far]\nssh = far.invalid\nlist = connected\n")
+
+
+# The compose mode's editor: it fails for a draft that asks it to, waits
+# to be cancelled for one that says sleep, and otherwise appends a line
+COMPOSE_EDITOR = """#!/bin/sh
+case $(cat "$1") in
+*"exit 1"*) echo "the test editor refuses" >&2; exit 1;;
+*sleep*) sleep 60;;
+esac
+sleep 1
+printf '\nEdited by the test editor.\n' >> "$1"
+"""
+
+
+def composeconfig(editor, nonce):
+    """The compose mode's: the test editor, and a model for /model."""
+    quoted = "'" + editor.replace("'", "'\\''") + "'"
+    return (
+        "\n# The compose box's editor, a test script\n"
+        "[ui]\n"
+        f"editor = sh {quoted}\n"
+        "\n# A model for /model to list\n"
+        f"[model fake:gui_b:{nonce}]\n"
+        "context = 100000\n"
+    )
 
 
 def config(url, model, ask=3, extra=""):
@@ -953,7 +983,8 @@ def main():
                          "measures how fast a history arrives)")
     ap.add_argument("--mode", default="drive",
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
-                             "settings", "enginestop", "bench", "background", "remote"])
+                             "settings", "enginestop", "bench", "background", "remote",
+                             "compose"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1009,6 +1040,12 @@ def main():
         before = f"{head}\ninclude = team.ini\n{rest}"
     elif args.mode == "enginestop":
         before = config(curl, model, 60)
+    elif args.mode == "compose":
+        if args.host:
+            ap.error("--mode compose runs only here: its test editor is a sh script")
+        editor = host.path("edit.sh")
+        host.write(editor, COMPOSE_EDITOR)
+        before = config(curl, model, extra=composeconfig(editor, nonce))
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
         # Instruction files for the info popup, and files to compact over
@@ -1058,6 +1095,24 @@ def main():
     if args.mode == "background":
         problems, lines = background(args, host, guiargs, guicwd)
         status = 0
+    elif args.mode == "compose":
+        # Twice: the second finds the drafts the first left
+        status, lines = host.run(guiargs, args.timeout, guicwd)
+        problems += summaryproblems(status, lines, "the window")
+        status = 0
+        if not problems:
+            again = ["--compose-again" if a == "--compose" else a for a in guiargs]
+            st, more = host.run(again, args.timeout, guicwd, tag="again: ")
+            problems += summaryproblems(st, more, "the window again")
+            lines += more
+        left = host.listdir(host.path("state", "edit"))
+        if left:
+            problems.append("the editor's files are left: " + ", ".join(left))
+        if args.shots:
+            for name in ("history", "menu", "editing", "editfailed", "slash", "models",
+                         "drafts", "compacted", "restored"):
+                if not os.path.exists(os.path.join(args.shots, f"compose-{name}.png")):
+                    problems.append(f"no compose-{name}.png")
     else:
         status, lines = host.run(guiargs, args.timeout, guicwd,
                                  env=far.env() if far else None)

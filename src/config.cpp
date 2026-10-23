@@ -417,6 +417,15 @@ static CfgKey cfgschema[] = {
     {"ui", "font_size", CFG_NUMBER, "15", {}, {}, "ui",
      "Text size in pixels at 100% display scale, 8 to 40; the View "
      "menu's zoom scales it until Prospero exits"},
+    {"ui", "editor", CFG_STRING, "", {}, {}, "ui",
+     "The command that opens a draft in an editor (Ctrl+G, or the compose "
+     "box's menu), given the file as one more word; it must wait until the "
+     "editing is done, as code --wait, subl -w or gvim -f do, and run a "
+     "window of its own, since there is no terminal. Empty: $VISUAL, else "
+     "$EDITOR, else on macOS the default text editor (open -W -n -t), "
+     "which must be quit. A GUI started from the Finder or a desktop menu "
+     "has no shell environment: no $VISUAL, no $EDITOR, and its PATH may "
+     "lack the editor, so name it in full here"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "

@@ -2335,26 +2335,471 @@ static void drawstrip(Gui *g)
     }
 }
 
+// The compose box: one draft per session (app.cpp), with history, slash
+// commands, a context menu and an external editor (compose.cpp holds
+// the logic apart from ImGui). ImGui keeps undo for the box last
+// active, in stb_textedit's state, whose layout imgui_internal.h only
+// declares: its undo points say what Undo and Redo can do.
+namespace ImStb {
+#include "imstb_textedit.h"
+}
+
+static char const *cmdkey(Gui *, Arena *, Str);
+
+// The context menu's picks, done by the box itself: each as the key
+// chord it answers to, once the box is active again.
+enum : i32 {
+    CM_NONE,
+    CM_UNDO,
+    CM_REDO,
+    CM_CUT,
+    CM_COPY,
+    CM_PASTE,
+    CM_SELALL,
+};
+
+// The session's own prompts and steers, which history recalls: its
+// user messages, but not the tasks a subagent's parent gave it.
+static b32 histmsg(ViewMsg *m)
+{
+    return m->role==VIEW_USER && !m->prov && m->label!="Task from the parent agent";
+}
+
+static i32 histcount(View *v)
+{
+    i32 n = 0;
+    for (iz i = 0; i < v->msgs.len; i++) {
+        n += histmsg(&v->msgs[i]);
+    }
+    return n;
+}
+
+// History entry pos, 1 the newest: its message, else -1.
+static i32 histfind(View *v, i32 pos)
+{
+    for (iz i = v->msgs.len-1; i>=0 && pos>0; i--) {
+        if (histmsg(&v->msgs[i]) && !--pos) {
+            return (i32)i;
+        }
+    }
+    return -1;
+}
+
+// What the box's callback works with, for one frame.
+struct ComposeCb {
+    GuiSession *s;
+    View       *v;
+    i32        *slashsel;
+    u32         slash;     // the slash popup's matches, 0 if it is closed
+    i32         cursor;    // the caret before this frame's keys, -1 if inactive
+    b32         hadsel;
+    b32         recalled;  // history replaced the text
+    b32         tab;       // Tab, kept out of the text, completes the pick
+    b32         escaped;   // Esc left history: the box stays active
+};
+
+// Up and Down that moved nothing, on the first or last visual line,
+// go to the start or end of the text; on an empty box, and once
+// recalling, through the session's history (histkey). With the slash
+// popup open, they pick among its commands instead, and Tab, which the
+// box then takes as a character, completes (filtered out). Esc while
+// recalling empties the box, as the box gives it up. The active box
+// owns every key, so the callback, inside it, is where they are seen.
+static i32 composecb(ImGuiInputTextCallbackData *d)
+{
+    ComposeCb *c  = (ComposeCb *)d->UserData;
+    ImGuiIO   &io = ImGui::GetIO();
+    if (d->EventFlag == ImGuiInputTextFlags_CallbackCharFilter) {
+        if (d->EventChar=='\t' && c->slash) {
+            c->tab = 1;
+            return 1;
+        }
+        return 0;
+    }
+    if (c->s->hist && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        d->DeleteChars(0, d->BufTextLen);
+        c->s->hist  = 0;
+        c->recalled = 1;
+        c->escaped  = 1;
+        return 0;
+    }
+    b32 up = ImGui::IsKeyPressed(ImGuiKey_UpArrow);
+    b32 dn = ImGui::IsKeyPressed(ImGuiKey_DownArrow);
+    if ((!up && !dn) || c->cursor<0 || io.KeyCtrl || io.KeyShift || io.KeyAlt || io.KeySuper) {
+        return 0;
+    }
+    if (c->slash) {
+        i32 n = slashcount(c->slash);
+        *c->slashsel = (*c->slashsel + (up ? n-1 : 1)) % n;
+        return 0;
+    }
+    b32     edge = d->CursorPos==c->cursor && !c->hadsel;
+    HistKey k    = histkey(up, edge, c->s->hist, histcount(c->v), d->BufTextLen==0);
+    switch (k.act) {
+    case HK_START:
+        d->CursorPos = d->SelectionStart = d->SelectionEnd = 0;
+        break;
+    case HK_END:
+        d->CursorPos = d->SelectionStart = d->SelectionEnd = d->BufTextLen;
+        break;
+    case HK_RECALL: {
+        i32 i    = k.pos ? histfind(c->v, k.pos) : -1;
+        Str text = i>=0 ? c->v->msgs[i].text : Str{};
+        if (k.pos && (i<0 || text.len>=d->BufSize)) {
+            break;
+        }
+        d->DeleteChars(0, d->BufTextLen);
+        d->InsertChars(0, text.cdata, text.cdata+text.len);
+        d->CursorPos = d->SelectionStart = d->SelectionEnd = d->BufTextLen;
+        c->s->hist    = k.pos;
+        c->s->histmsg = i;
+        c->recalled   = 1;
+    } break;
+    }
+    return 0;
+}
+
+// A context menu pick, as its key chord, queued for the next frame's
+// input: the platform's command key is Super to ImGui on macOS, which
+// it then swaps for Ctrl, as it does the real key.
+static void composechord(Gui *g, i32 act)
+{
+    ImGuiKey key   = ImGuiKey_None;
+    b32      shift = 0;
+    switch (act) {
+    case CM_UNDO:   key = ImGuiKey_Z; break;
+    case CM_REDO:   key = ImGuiKey_Z; shift = 1; break;
+    case CM_CUT:    key = ImGuiKey_X; break;
+    case CM_COPY:   key = ImGuiKey_C; break;
+    case CM_PASTE:  key = ImGuiKey_V; break;
+    case CM_SELALL: key = ImGuiKey_A; break;
+    }
+    if (key == ImGuiKey_None) {
+        return;
+    }
+    ImGuiIO &io  = ImGui::GetIO();
+    ImGuiKey mod = g->mac ? ImGuiMod_Super : ImGuiMod_Ctrl;
+    io.AddKeyEvent(mod, true);
+    if (shift) {
+        io.AddKeyEvent(ImGuiMod_Shift, true);
+    }
+    io.AddKeyEvent(key, true);
+    io.AddKeyEvent(key, false);
+    if (shift) {
+        io.AddKeyEvent(ImGuiMod_Shift, false);
+    }
+    io.AddKeyEvent(mod, false);
+}
+
+// Run a slash command typed in the box (parseslash). Sent commands
+// clear the box, keeping the text to put back if the command fails.
+static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
+{
+    s->note = {};
+    if (sl.err.len) {
+        setnote(g, s, sl.err, 1);
+        return;
+    }
+    GuiHost *h    = s->host;
+    b32      sent = 0;
+    switch (sl.cmd) {
+    case SLASH_COMPACT:
+        if ((sent = hostcan(h, "compact"))) {
+            guicompact(g, s, sl.arg);
+        }
+        break;
+    case SLASH_MODEL:
+        if (!sl.arg.len) {
+            g->pickmodel = s;  // the list of configured models
+            draftput(g, s, "");
+            drafttyped(&s->dclock, g->sched.now);
+            return;
+        } else if ((sent = hostcan(h, "model"))) {
+            guimodel(g, s, sl.arg);
+        }
+        break;
+    case SLASH_RENAME:
+        if ((sent = hostcan(h, "rename"))) {
+            guirename(g, s, sl.arg);
+        }
+        break;
+    case SLASH_FORK:
+        if ((sent = hostcan(h, "fork"))) {
+            guifork(g, s);
+        }
+        break;
+    case SLASH_EXPORT:
+        setnote(g, s, "/export: not available yet; it will save the transcript "
+                      "as the Session menu's Export does", 1);
+        return;
+    }
+    if (!sent) {
+        Arena a = g->frame;
+        setnote(g, s, concat(&a, slashinfo[sl.cmd].name,
+                             ": this host's engine is too old for it; update the engine"), 1);
+        return;
+    }
+    s->cmdtext = clone(&g->perm, text);
+    draftput(g, s, "");
+    drafttyped(&s->dclock, g->sched.now);
+}
+
+// The slash popup, above the box while its first word is typed: each
+// command that word may become, with what it does, the pick marked.
+static void drawslash(Gui *g, u32 slash, ImVec2 at)
+{
+    ImGui::SetNextWindowPos(at, ImGuiCond_Always, v2(0, 1));
+    ImGuiWindowFlags f = ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoTitleBar |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoDocking;
+    if (ImGui::Begin("##slash", 0, f)) {
+        Arena a = g->frame;
+        i32   n = slashcount(slash);
+        for (i32 i = 0; i < n; i++) {
+            SlashInfo *c = slashinfo + slashnth(slash, i);
+            Buf b(&a, 64);
+            print(&b, c->name);
+            if (c->args.len) {
+                putbyte(&b, ' ');
+                print(&b, c->args);
+            }
+            ImGui::Selectable(cstr0(&a, finish(&b)), i==g->slashsel, 0,
+                              v2(ImGui::CalcTextSize("/compact [focus]").x, 0));
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", cstr0(&a, c->desc));
+        }
+        ImGui::TextDisabled("Tab or Enter completes; Up and Down pick");
+    }
+    ImGui::End();
+    g->slashshown = 1;
+}
+
+// The models /model offers: those the configuration names.
+static void drawmodels(Gui *g)
+{
+    if (g->pickmodel) {
+        ImGui::OpenPopup("##models");
+        g->modelsfor = g->pickmodel;
+        g->pickmodel = 0;
+    }
+    if (!ImGui::BeginPopup("##models")) {
+        return;
+    }
+    g->modelsshown = 1;
+    Arena       a = g->frame;
+    GuiSession *s = g->modelsfor;
+    ImGui::TextDisabled("Switch this session's model to");
+    i32 n = 0;
+    for (iz i = 0; i < g->cfgheads.len; i++) {
+        CfgHead *h = &g->cfgheads[i];
+        if (h->kind != "model") {
+            continue;
+        }
+        n++;
+        b32 pick = ImGui::MenuItem(cstr0(&a, h->name));
+        if (n == 1) {
+            itemrect(g, RECT_MODEL0);
+        }
+        if (pick && s) {
+            s->note = {};
+            guimodel(g, s, h->name);
+        }
+    }
+    if (!n) {
+        ImGui::TextDisabled("No [model] sections configured: type /model NAME");
+    }
+    ImGui::EndPopup();
+}
+
 static void drawprompt(Gui *g)
 {
-    f32  sc   = g->scale;
-    View *v   = g->view;
-    b32  can  = g->sess && g->sess->view && !g->sess->readonly && !g->quitting &&
-                (hostlive(g, g->sess) || g->enginekind==ENGINE_FAKE);
+    f32         sc  = g->scale;
+    View       *v   = g->view;
+    GuiSession *s   = g->sess ? g->sess : &g->nosession;
+    b32         can = g->sess && g->sess->view && !g->sess->readonly && !g->quitting &&
+                      (hostlive(g, g->sess) || g->enginekind==ENGINE_FAKE);
+    b32         editing = g->edsess && g->edsess==s;
+    char       *buf     = draftbuf(g, s);
+    Arena       a       = g->frame;
+    g->slashshown  = 0;
+    g->cmenushown  = 0;
+    g->histshown   = 0;
+    g->editshown   = 0;
+    g->modelsshown = 0;
     drawstrip(g);
-    escapecancel(g);
+
+    // A line for the editor at work, else the latest command's outcome
+    if (editing) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("editing in %s...", cstr0(&a, g->edname));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Cancel")) {
+            editcancel(g);
+            editing = 0;
+        }
+        ImGui::SetItemTooltip("Stop the editor, leaving the draft as it was");
+        itemrect(g, RECT_EDITCANCEL);
+        g->editshown = 1;
+    } else if (s->note.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, s->noteerr ? g->pal->bad : g->pal->paneldim);
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextUnformatted(cstr0(&a, s->note));
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::PushID(s);
+    ImGuiID id     = ImGui::GetID("##prompt");
+    b32     active = ImGui::GetActiveID() == id;
+    s->draftid = id;
+    ImGui::PopID();
+
+    // The slash popup while its first word is typed: its pick, which
+    // Tab completes, as does Enter on a word typed in part (below)
+    Str text  = draftstr(s);
+    u32 slash = active && !editing ? slashmatches(text) : 0;
+    i32 pick  = SLASH_NONE;
+    if (slash) {
+        i32 n = slashcount(slash);
+        g->slashsel = g->slashsel<n ? g->slashsel : 0;
+        pick = slashnth(slash, g->slashsel);
+    } else {
+        g->slashsel = 0;
+    }
+
+    // Esc while recalling empties the box (composecb), else it cancels
+    // the turn
+    if (!s->hist) {
+        escapecancel(g);
+    }
+    // Ctrl+G opens the draft in the editor: Ctrl on every platform, as
+    // in terminal tools, which ImGui calls Super on macOS. The active
+    // box owns the keys, so they are read as they are, with the focus
+    // here (the transcript's find bar takes its own Ctrl+G).
+    ImGuiIO &io   = ImGui::GetIO();
+    ImGuiKey ctrl = g->mac ? ImGuiMod_Super : ImGuiMod_Ctrl;
+    if (!editing && io.KeyMods==ctrl && ImGui::IsKeyPressed(ImGuiKey_G, false) &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows)) {
+        editstart(g, s);
+        editing = g->edsess == s;
+    }
+
+    // A context menu pick, once the box is active again: as its chord
+    if (g->menuact && active && !GImGui->ActiveIdIsJustActivated) {
+        composechord(g, g->menuact);
+        g->menuact = 0;
+    } else if (g->menuact && ++g->menuwait>30) {
+        g->menuact = 0;  // the box never came back
+    } else if (g->menuact) {
+        scheddirty(&g->sched);
+    }
+
+    ComposeCb cb = {};
+    cb.s        = s;
+    cb.v        = v;
+    cb.slashsel = &g->slashsel;
+    cb.slash    = slash;
+    cb.cursor   = -1;
+    ImGuiInputTextState *st = ImGui::GetInputTextState(id);
+    if (st && active) {
+        cb.cursor = st->GetCursorPos();
+        cb.hadsel = st->HasSelection();
+    }
 
     ImGuiInputTextFlags flags = ImGuiInputTextFlags_WordWrap |
                                 ImGuiInputTextFlags_EnterReturnsTrue |
-                                ImGuiInputTextFlags_CtrlEnterForNewLine;
+                                ImGuiInputTextFlags_CtrlEnterForNewLine |
+                                ImGuiInputTextFlags_CallbackAlways |
+                                ImGuiInputTextFlags_CallbackCharFilter;
+    if (editing) {
+        flags |= ImGuiInputTextFlags_ReadOnly;
+    }
+    if (slash) {
+        flags |= ImGuiInputTextFlags_AllowTabInput;  // to complete, not move on
+    }
     f32 bw = 80*sc;
     ImVec2 size = v2(ImGui::GetContentRegionAvail().x - bw - ImGui::GetStyle().ItemSpacing.x,
                      ImGui::GetContentRegionAvail().y);
-    b32 send = ImGui::InputTextMultiline("##prompt", g->prompt, PROMPT_MAX, size, flags);
+    ImGui::PushID(s);
+    b32 send = ImGui::InputTextMultiline("##prompt", buf, DRAFT_MAX+1, size, flags, composecb, &cb);
+    b32 edited = ImGui::IsItemEdited();
+    ImGui::PopID();
     itemrect(g, RECT_PROMPT);
+    ImVec2 r0 = ImGui::GetItemRectMin();
+    ImVec2 r1 = ImGui::GetItemRectMax();
+    if (edited && !cb.recalled) {
+        // Typed: the draft, kept once typing pauses, out of history
+        s->hist = 0;
+        s->note = {};
+        drafttyped(&s->dclock, g->sched.now);
+    }
+    if (cb.escaped) {
+        ImGui::ActivateItemByID(id);
+    }
+    if (pick && (cb.tab || (send && slashcompletes(text, pick)))) {
+        // Completed rather than sent, the box kept active
+        SlashInfo *c = slashinfo + pick;
+        draftput(g, s, c->args.len ? concat(&a, c->name, " ") : c->name);
+        drafttyped(&s->dclock, g->sched.now);
+        send = 0;
+        ImGui::ActivateItemByID(id);
+    }
+    if (slash && ImGui::GetActiveID()==id) {
+        drawslash(g, slashmatches(draftstr(s)), v2(r0.x, r0.y));
+    }
+
+    // The context menu
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Right) && ImGui::IsMouseHoveringRect(r0, r1) &&
+            ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
+        ImGui::OpenPopup("##composemenu");
+    }
+    if (ImGui::BeginPopup("##composemenu")) {
+        g->cmenushown = 1;
+        st = ImGui::GetInputTextState(id);
+        b32 sel  = st && st->HasSelection();
+        b32 undo = st && st->Stb->undostate.undo_point>0;
+        b32 redo = st && st->Stb->undostate.redo_point<IMSTB_TEXTEDIT_UNDOSTATECOUNT;
+        b32 clip = ImGui::GetClipboardText() && *ImGui::GetClipboardText();
+        b32 any  = draftstr(s).len > 0;
+        i32 act  = CM_NONE;
+        act = ImGui::MenuItem("Undo", cmdkey(g, &a, "Z"), false, undo && !editing) ? CM_UNDO : act;
+        itemrect(g, RECT_CMUNDO);
+        act = ImGui::MenuItem("Redo", g->mac ? "Cmd+Shift+Z" : "Ctrl+Y", false, redo && !editing) ? CM_REDO : act;
+        itemrect(g, RECT_CMREDO);
+        ImGui::Separator();
+        act = ImGui::MenuItem("Cut", cmdkey(g, &a, "X"), false, sel && !editing) ? CM_CUT : act;
+        itemrect(g, RECT_CMCUT);
+        act = ImGui::MenuItem("Copy", cmdkey(g, &a, "C"), false, sel) ? CM_COPY : act;
+        itemrect(g, RECT_CMCOPY);
+        act = ImGui::MenuItem("Paste", cmdkey(g, &a, "V"), false, clip && !editing) ? CM_PASTE : act;
+        itemrect(g, RECT_CMPASTE);
+        act = ImGui::MenuItem("Select all", cmdkey(g, &a, "A"), false, any) ? CM_SELALL : act;
+        itemrect(g, RECT_CMSELALL);
+        ImGui::Separator();
+        b32 ed = !g->edsess && editorcmd(g, &a).len;
+        if (ImGui::MenuItem("Open in editor", "Ctrl+G", false, ed)) {
+            editstart(g, s);
+        }
+        itemrect(g, RECT_CMEDITOR);
+        if (!editorcmd(g, &a).len) {
+            ImGui::SetItemTooltip("Set [ui] editor in the settings, or $VISUAL or $EDITOR");
+        }
+        g->cmenustate = (undo ? 1 : 0) | (redo ? 2 : 0) | (sel ? 4 : 0) | (clip ? 8 : 0) | (ed ? 16 : 0);
+        if (act) {
+            g->menuact  = act;
+            g->menuwait = 0;
+            ImGui::ActivateItemByID(id);
+            scheddirty(&g->sched);
+        }
+        ImGui::EndPopup();
+    }
+    drawmodels(g);
+
     ImGui::SameLine();
     ImGui::BeginGroup();
-    ImGui::BeginDisabled(!can);
+    ImGui::BeginDisabled(!can || editing);
     send |= ImGui::Button(v->busy ? "Steer" : "Send", v2(bw, 0));
     ImGui::SetItemTooltip(v->busy ? "Send to the running turn: the agent reads it at its next step (Enter)"
                                   : "Send the prompt (Enter; Shift+Enter for a new line)");
@@ -2365,15 +2810,33 @@ static void drawprompt(Gui *g)
         ImGui::SetItemTooltip("Cancel the turn, killing any command it runs (Esc)");
     }
     ImGui::EndDisabled();
+    if (s->hist) {
+        // Which of the session's messages the box holds: oldest is 1
+        i32 m = histcount(v);
+        Buf b(&a, 32);
+        putbyte(&b, '(');
+        print(&b, (i64)(m - s->hist + 1));
+        putbyte(&b, '/');
+        print(&b, (i64)m);
+        putbyte(&b, ')');
+        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        ImGui::SetItemTooltip("A message sent before, recalled: Up for older, Down for "
+                              "newer, Esc for the empty draft, or edit it to send again");
+        g->histshown = s->hist;
+    }
     ImGui::EndGroup();
-    if (send && can) {
-        Str p = {(u8 *)g->prompt, (iz)__builtin_strlen(g->prompt)};
-        p = trim(p);
-        if (p.len) {
+    if (send && can && !editing) {
+        Str   p  = trim(draftstr(s));
+        Slash sl = parseslash(p);
+        if (sl.cmd) {
+            runslash(g, s, sl, p);
+        } else if (p.len) {
+            draftdone(&s->dclock);  // the prompt clears the engine's draft
             guiprompt(g, p);
-            g->prompt[0] = 0;
+            draftput(g, s, "");
+            s->note = {};
         }
-        ImGui::SetKeyboardFocusHere(-1);
+        ImGui::ActivateItemByID(id);  // to type the next
     }
 }
 
@@ -4407,6 +4870,29 @@ static void drawhelp(Gui *g)
         "thinking say; again, and the rows fold as before. The bar beside "
         "them shows how full the context is, amber near where it is "
         "compacted.", mod, mod);
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "Each session keeps its own draft in the compose box, saved as you "
+        "type. On an empty box, Up recalls the session's earlier prompts, "
+        "newest first; Up and Down go back and forth, Esc returns to the "
+        "empty draft. A message that starts with /compact [focus], "
+        "/model [NAME], /rename TITLE, /fork or /export runs that command "
+        "instead (Tab completes); any other text, even one starting with a "
+        "slash, is sent as it is. Right-click the box for Undo, Paste and "
+        "the rest.");
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "Ctrl+G (Ctrl on macOS too) opens the draft in an editor: "
+        "[ui] editor in the settings, else $VISUAL, else $EDITOR%s. The "
+        "command must wait until you are done editing, as code --wait, "
+        "subl -w or gvim -f do, and open a window of its own, since there "
+        "is no terminal. The draft becomes what you save when the editor "
+        "exits with status 0. Started from the %s, Prospero does not have "
+        "your shell's environment (no $VISUAL or $EDITOR, and maybe not "
+        "the editor's directory in PATH): set [ui] editor, with a full "
+        "path if need be.",
+        g->mac ? ", else the default text editor, which you then quit" : "",
+        g->mac ? "Finder or the Dock" : "desktop's menus");
     ImGui::Spacing();
     ImGui::TextWrapped(
         "The View menu shows and hides these panes, and zooms the text: "

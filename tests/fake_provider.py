@@ -1886,7 +1886,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Write outside as a subagent", "Make undoable changes",
                "Read the big files", "Fail over", "Stream in the background",
                "Stream for the link", "Look at the desktop", "Think slowly",
-               "Think briefly")
+               "Think briefly", "Answer at length")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2069,6 +2069,11 @@ def sc_gui(model, n, req):
         yield from finish(model)
     elif "Say hello" in prompt:
         yield from answer(model, "Hello!")
+    elif "Answer at length" in prompt:
+        # About 10,000 tokens, counted as such: three make enough of a
+        # conversation to compact on request
+        words = " ".join(f"word{i}" for i in range(6000))
+        yield from real_answer(model, req, "A long answer: " + words)
     elif "Start subagents" in prompt:
         if step == 0:
             yield from calls(model, n, [
