@@ -35,6 +35,8 @@ enum : i64 {
     COMPACT_TOOLIN   = 3 << 10,   // bytes of a tool result summarized
     COMPACT_TEXTIN   = 16 << 10,  // bytes of a message summarized
     COMPACT_ARGSIN   = 2 << 10,   // bytes of a call's arguments
+    COMPACT_MINUSER  = 4096,      // tokens a compaction the user asks
+                                  // for must summarize, at least
 };
 
 // The rate of tokens to bytes the server last reported.
@@ -169,6 +171,18 @@ static iz cutpoint(Slice<Msg> h, iz start, Rate rate, i64 keep)
     return cut;
 }
 
+// Tokens of the messages a compaction would summarize: those from start
+// up to where the newest COMPACT_KEEP tokens begin (cutpoint).
+static i64 compactable(Slice<Msg> h, iz start, Rate rate)
+{
+    iz  kept = cutpoint(h, start, rate, COMPACT_KEEP);
+    i64 n    = 0;
+    for (iz i = start; i < kept; i++) {
+        n += tokensof(rate, msgbytes(&h[i]));
+    }
+    return n;
+}
+
 // A text, cut in the middle to max bytes or so.
 static Str clip(Arena *a, Str s, iz max)
 {
@@ -278,10 +292,11 @@ static Str const compactsections =
     "work depends on.\n";
 
 // The summarizer's prompt: the previous summary to update (if any),
-// then the conversation (transcript).
-static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words)
+// then the conversation (transcript). A focus, from a user asking for
+// the compaction, is what to keep in more detail.
+static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words, Str focus)
 {
-    Buf u(a, convo.len + prev.len + 4096);
+    Buf u(a, convo.len + prev.len + focus.len + 4096);
     print(&u, "Summarize the conversation below for the agent that will "
               "continue it. That agent will see only your summary and the "
               "most recent messages, so keep everything it needs to carry "
@@ -291,6 +306,14 @@ static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words)
     print(&u, "\nKeep it under ");
     print(&u, words);
     print(&u, " words.\n");
+    if (focus.len) {
+        print(&u, "\nThe user asked for this summary, and wants it to keep "
+                  "more detail about the following, in whichever sections "
+                  "it belongs, even where that means less about the rest:\n"
+                  "\n<focus>\n");
+        print(&u, focus);
+        print(&u, "\n</focus>\n");
+    }
     if (prev.len) {
         print(&u, "\nThis updates an earlier summary: keep what still holds, "
                   "revise what changed, and drop what no longer matters.\n\n"
@@ -306,9 +329,9 @@ static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words)
 
 // The summarizer's request: no tools offered, text only.
 static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
-                         Str convo, i64 words)
+                         Str convo, i64 words, Str focus)
 {
-    Str     u = summaryprompt(&scratch, prev, convo, words);
+    Str     u = summaryprompt(&scratch, prev, convo, words, focus);
     Buf     b(a, u.len + 1024);
     JsonOut w = {&b};
     putobject(&w);
@@ -356,11 +379,11 @@ static Str encodesummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
 
 // The same request for Anthropic's Messages API (anthropic.cpp).
 static Str ansummary(Arena *a, Arena scratch, ModelConf *mc, Str prev,
-                     Str convo, i64 words)
+                     Str convo, i64 words, Str focus)
 {
     Msg m = {};
     m.role = ROLE_USER;
-    m.text = summaryprompt(&scratch, prev, convo, words);
+    m.text = summaryprompt(&scratch, prev, convo, words, focus);
     ChatReq r = {};
     r.mc      = mc;
     r.system  = compactsystem;

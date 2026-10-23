@@ -849,6 +849,8 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         }
         if (c->why == "overflow") {
             print(&b, ", as the server found it too long");
+        } else if (c->why == "manual") {
+            print(&b, ", as asked");
         }
         pen(p, finish(&b), 0, dim);
     } break;

@@ -108,6 +108,10 @@ enum : i64 {
     QUIT_WAIT    = 5*SEC,         // for turns to end after quit
     LIVE_EVERY   = 1*SEC,         // live records while a request runs
     TITLE_MAX    = 60,            // code points
+    RENAME_MAX   = 120,           // code points of a title from the user
+    GROUP_MAX    = 120,           // bytes of a group's name
+    DRAFT_MAX    = 1 << 20,       // bytes of an unsent prompt kept
+    FOCUS_MAX    = 4 << 10,       // bytes of a compaction's focus
     SNAPSHOT_MAX = 256 << 10,     // bytes of text in a snapshot
     FILECMD_MAX  = 1 << 20,       // bytes of a file a file command gives
     PARK_IDLE    = 7*60*SEC,      // idle this long, a session is parked
@@ -183,6 +187,16 @@ enum : i32 {
     REQ_CHAT,     // what a request is for: a step of the turn
     REQ_COMPACT,  // a summary of older messages
 };
+
+enum : i32 {
+    CW_THRESHOLD, // why a compaction: the prompt reached the threshold
+    CW_OVERFLOW,  // the server rejected the prompt as too long
+    CW_MANUAL,    // the user asked for one (compact)
+    CW_COUNT,
+};
+
+static Str cwnames[] = {"threshold", "overflow", "manual"};
+static_assert(countof(cwnames) == CW_COUNT);
 
 enum : i32 {
     SLOT_NONE,    // a session's place at its endpoint
@@ -371,7 +385,8 @@ struct Compact {
     Str       model;
     ModelConf mc;
     i64       goal;      // tokens the prompt must come to, at most
-    b32       overflow;  // the server rejected the prompt: no guard
+    i32       why;       // CW_*: the progress guard is a threshold's alone
+    Str       focus;     // what the user asked to keep (CW_MANUAL)
     i64       before;    // tokens, estimated
     iz        start;     // history[start, cut) is summarized
     iz        cut;
@@ -394,6 +409,7 @@ struct Session {
     Slice<Str>   roots;     // extra workspace roots
     Str          model;
     Str          title;
+    b32          usertitle;  // the user named it (rename), not its prompt
     Endpoint     ep;
     ModelConf    mc;
     ModelInfo    info;
@@ -468,6 +484,10 @@ struct Session {
     i64          thinkfrom;  // seq of the latest compaction, which leaves
                              // older reasoning bound to what it changed
     Compact      cp;         // with REQ_COMPACT
+    b32          compactnext;  // the turn compacts, as asked (compact)
+    Str          cpfocus;    // and what to keep of it
+    i64          ctxhint;    // the window as the log last gave it, shown
+                             // until discovery tells (gauge)
     i32          overflows;  // this step's prompts rejected as too long
     i64          ovsize;     // tokens of the first, 0 if none
     Overflow     ovinfo;     // the sizes the latest rejection gave
@@ -552,6 +572,8 @@ struct Engine {
     Map<i64>   *trained;  // n_ctx_train by "url model", learned when loaded
     Slice<Str>  learned;  // its keys, in order, for saving
     Map<i64>   *kinds;    // by "url model": 1 if llama.cpp's, + slots<<1
+    Map<Str>   *listings; // by url: the ids its latest listing gave, one
+                          // to a line, for checking a subagent's model
     u64         nextid;
     b32         quitting;
     i64         quitby;   // ticks: stop waiting for turns to end
@@ -647,17 +669,36 @@ static Endpoint *reqep(Session *s)
     return s->purpose==REQ_COMPACT ? &s->cp.ep : &s->ep;
 }
 
+// The context's gauge: the window (ctx) and the prompt size at which it
+// compacts (compact_at), both left out while unknown, and the prompt's
+// size (tokens), estimated. Before discovery, the window is as the log
+// last gave it (ctxhint).
+static void putgauge(Session *s, JsonOut *w, i64 tokens)
+{
+    i64 ctx = s->mc.ctx ? s->mc.ctx : s->ctxhint;
+    if (ctx > 0) {
+        putintkey(w, "ctx", ctx);
+        putintkey(w, "compact_at", compactat(ctx));
+    }
+    putintkey(w, "tokens", tokens);
+}
+
+static i64 estimate(Session *);
+
 // The state for the frontend. Small and bounded, so it needs no scratch.
+// While a request runs, every second, the gauge is the prompt sent, so
+// that the tick never walks the history (estimate).
 static void live(Session *s)
 {
-    byte  mem[512];
+    byte  mem[640];
     Arena a   = {mem, mem+countof(mem)};
-    Buf   b(&a, 384);
+    Buf   b(&a, 512);
     Os   *os  = s->e->os;
     i64   now = os_ticks(os);
     EvOut w   = sbegin(s, &b, EV_LIVE);
     b32   cp  = s->purpose==REQ_COMPACT && requesting(s->state);
     putstrkey(&w.json, "state", cp ? Str("compacting") : statenames[s->state]);
+    putgauge(s, &w.json, requesting(s->state) ? s->sentest : estimate(s));
     if (requesting(s->state)) {
         Endpoint *ep = reqep(s);
         putintkey(&w.json, "idle_ms", (now - s->lastbyte)/MS);
@@ -737,7 +778,7 @@ static void addmsg(Session *s, Msg m)
 
 // The next prompt's size in tokens, estimated.
 static i64 deskimagetokens(Session *);
-static i64 estimate(Session *s)
+static i64 estimate(Session *s)  // walks the history for screenshots
 {
     return tokensof(s->rate, s->system.len + s->tools.len + s->bytes) +
            deskimagetokens(s);
@@ -1333,7 +1374,7 @@ static void prepare(Session *, Arena);
 static void finalize(Session *, Arena);
 static void nexttool(Session *, Arena);
 static void sendcompact(Session *, Arena);
-static void compact(Session *, Arena, i64 enough, i64 goal, b32 overflow);
+static void compact(Session *, Arena, i64 enough, i64 goal, i32 why);
 static void beginturn(Session *, Arena, Str via);
 static b32  busy(Session *);
 static i32  get32(Str);
@@ -1379,14 +1420,17 @@ static void sendchat(Session *s, Arena scratch)
 {
     Engine *e = s->e;
     s->attempts++;
+    s->sentbytes = s->system.len + s->tools.len + s->bytes;
+    s->sentest   = estimate(s);
     {
         Arena a = scratch;
-        Buf   b(&a, 256);
+        Buf   b(&a, 256 + s->ep.url.len + s->model.len);
         EvOut w = sbegin(s, &b, EV_ATTEMPT);
         putintkey(&w.json, "turn", s->turn);
         putintkey(&w.json, "n", s->attempts);
         putstrkey(&w.json, "endpoint", s->ep.url);
         putstrkey(&w.json, "model", s->model);
+        putgauge(s, &w.json, s->sentest);
         ssend(s, &w);
     }
 
@@ -1404,8 +1448,6 @@ static void sendchat(Session *s, Arena scratch)
                        : encodechat(&s->attempt, scratch, &req);
     Str url       = apiurl(&scratch, s->ep.url, an ? Str("messages")
                                                    : Str("chat/completions"));
-    s->sentbytes  = s->system.len + s->tools.len + s->bytes;
-    s->sentest    = estimate(s);
 
     if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0)) {
         Str err = os_lasterr(e->os, &scratch);
@@ -1446,10 +1488,18 @@ static void proceed(Session *s, Arena scratch)
         discover(s, scratch);
         return;
     }
+    if (s->purpose==REQ_CHAT && s->compactnext) {
+        // A turn of its own (compact), to 80% of the threshold, like a
+        // threshold's, or else as far as keeping the newest goes
+        s->compactnext = 0;
+        i64 goal = s->mc.ctx ? compactat(s->mc.ctx)*4/5 : (i64)1<<40;
+        compact(s, scratch, 0, goal, CW_MANUAL);
+        return;
+    }
     if (s->purpose==REQ_CHAT && s->mc.ctx) {
         i64 at = compactat(s->mc.ctx);
         if (estimate(s) >= at) {
-            compact(s, scratch, at, at*4/5, 0);
+            compact(s, scratch, at, at*4/5, CW_THRESHOLD);
             return;
         }
     }
@@ -1515,10 +1565,12 @@ static void savetrained(Engine *e, Arena scratch)
 }
 
 // Note what a listing says of every model, for requests to models other
-// than a session's own (a compactor).
+// than a session's own (a compactor), and its ids (listings), kept anew
+// only when they change.
 static void notekinds(Engine *e, Arena scratch, Str url, Str body)
 {
     JsonDoc d = jsonparse(&scratch, body);
+    Buf     ids(&scratch, 1024);
     for (Json *m = jsonget(d.root, "data")->child; m; m = m->next) {
         Str id = jsonstr(jsonget(m, "id"));
         if (id.len) {
@@ -1528,7 +1580,15 @@ static void notekinds(Engine *e, Arena scratch, Str url, Str body)
             i64      *v  = upsert(&e->kinds, k, (Arena *)0);
             v = v ? v : upsert(&e->kinds, clone(&e->perm, k), &e->perm);
             *v = (i64)mi.llamacpp | (i64)mi.slots<<1;
+            print(&ids, id);
+            putbyte(&ids, '\n');
         }
+    }
+    Str  list = finish(&ids);
+    Str *have = upsert(&e->listings, url, (Arena *)0);
+    have = have ? have : upsert(&e->listings, clone(&e->perm, url), &e->perm);
+    if (!have->data || *have!=list) {
+        *have = clone(&e->perm, list);
     }
 }
 
@@ -1699,16 +1759,32 @@ static b32 usetarget(Session *s, Str which, Str model)
     return 1;
 }
 
-// A fallback is MODEL, at the primary's endpoint, or ENDPOINT/MODEL with
-// ENDPOINT a configured name.
+// A model and the endpoint (name or URL) that serves it.
+struct Target {
+    Str which;
+    Str model;
+};
+
+// A model as settings name one: MODEL, at the endpoint dflt, or
+// ENDPOINT/MODEL, but only where ENDPOINT is a configured endpoint's
+// name, since a model's own name may hold a slash (Qwen/Qwen3-8B).
+static Target targetof(Engine *e, Str spec, Str dflt)
+{
+    Target t = {dflt, spec};
+    Cut    c = cut(spec, '/');
+    if (c.ok && c.head.len && c.tail.len &&
+            trim(cfgget(e->cfg, "endpoint", c.head, "url", 0)).len) {
+        t.which = c.head;
+        t.model = c.tail;
+    }
+    return t;
+}
+
+// A fallback, MODEL at the primary's endpoint or ENDPOINT/MODEL.
 static b32 usefallback(Session *s, Str spec)
 {
-    Cut c = cut(spec, '/');
-    if (c.ok && c.tail.len &&
-            trim(cfgget(s->e->cfg, "endpoint", c.head, "url", 0)).len) {
-        return usetarget(s, c.head, c.tail);
-    }
-    return usetarget(s, s->home, spec);
+    Target t = targetof(s->e, spec, s->home);
+    return usetarget(s, t.which, t.model);
 }
 
 // Move on to the next of the primary's fallbacks ([model] fallback), if
@@ -1792,7 +1868,7 @@ static void overflowed(Session *s, Arena scratch, Str msg)
         i64 most = compactat(s->mc.ctx) * 4/5;
         goal = goal<most ? goal : most;
     }
-    compact(s, scratch, goal, goal, 1);
+    compact(s, scratch, goal, goal, CW_OVERFLOW);
 }
 
 // A summary request failed: transient failures retry as any request
@@ -4546,9 +4622,10 @@ static void deskrecord(Session *s, Arena scratch, Record r)
             k->hello = 1;
             if (!rp.ok || rp.status || !startswith(rp.text, finish(&want))) {
                 Str text = rp.ok ? trim(rp.text) : Str("(nothing)");
-                deskbroke(s, scratch, concat(&scratch, "The desktop helper "
-                          "is not one this harness can use, so it was "
-                          "stopped. Its hello: ", text));
+                Str msg  = concat(&scratch, "The desktop helper is not one "
+                                  "this harness can use, so it was stopped. "
+                                  "Its hello: ", text);
+                deskbroke(s, scratch, msg);  // msg made before scratch is copied
                 return;
             }
         } else if (k->busy) {
@@ -4874,19 +4951,18 @@ static Str fulloutput(Session *s, Arena *a, Arena scratch, Msg *m)
     return {};
 }
 
-static void compactevent(Session *s, EvOut *w, Str kind, b32 overflow,
-                         i64 before)
+static void compactevent(Session *s, EvOut *w, Str kind, i32 why, i64 before)
 {
     putintkey(&w->json, "turn", s->turn);
     putstrkey(&w->json, "kind", kind);
-    putstrkey(&w->json, "why", overflow ? Str("overflow") : Str("threshold"));
+    putstrkey(&w->json, "why", cwnames[why]);
     putintkey(&w->json, "before", before);
     putintkey(&w->json, "after", estimate(s));
 }
 
 // Elide old tool outputs (pickprune), logging which, so that a replay
 // elides them alike. Returns 1 if it did.
-static b32 prune(Session *s, Arena scratch, b32 overflow)
+static b32 prune(Session *s, Arena scratch, i32 why)
 {
     Prune pr = pickprune(&scratch, s->history, s->rate);
     if (!pr.idx.len) {
@@ -4909,7 +4985,7 @@ static b32 prune(Session *s, Arena scratch, b32 overflow)
 
     Buf   b(&scratch, 256 + 256*done.len);
     EvOut w = sbegin(s, &b, EV_COMPACT);
-    compactevent(s, &w, "prune", overflow, before);
+    compactevent(s, &w, "prune", why, before);
     putkey(&w.json, "elided");
     putarray(&w.json);
     for (iz i = 0; i < done.len; i++) {
@@ -4931,13 +5007,10 @@ static void compactor(Session *s, Arena scratch, Compact *cp)
 {
     Engine *e     = s->e;
     Str     spec  = trim(cfgget(e->cfg, "model", s->model, "compactor", 0));
-    Str     which = s->ep.name.len ? s->ep.name : s->ep.url;
-    Str     model = spec.len ? spec : s->model;
-    Cut     c     = cut(spec, '/');
-    if (c.ok && c.tail.len && trim(cfgget(e->cfg, "endpoint", c.head, "url", 0)).len) {
-        which = c.head;
-        model = c.tail;
-    }
+    Str     own   = s->ep.name.len ? s->ep.name : s->ep.url;
+    Target  t     = spec.len ? targetof(e, spec, own) : Target{own, s->model};
+    Str     which = t.which;
+    Str     model = t.model;
     if (!endpointconf(e, &s->perm, which, &cp->ep)) {
         cp->ep = s->ep;
         model  = s->model;
@@ -4955,11 +5028,12 @@ static void compactor(Session *s, Arena scratch, Compact *cp)
 // Make room in the context: prune old tool outputs, and if the prompt
 // is still not under enough tokens, summarize the older messages so
 // that it comes to goal. The step goes on (proceed) once there is room,
-// or else the turn ends saying why.
-static void compact(Session *s, Arena scratch, i64 enough, i64 goal, b32 overflow)
+// or else the turn ends saying why. A compaction the user asked for
+// summarizes, without pruning first.
+static void compact(Session *s, Arena scratch, i64 enough, i64 goal, i32 why)
 {
     Engine *e = s->e;
-    if (prune(s, scratch, overflow) && estimate(s)<enough) {
+    if (why!=CW_MANUAL && prune(s, scratch, why) && estimate(s)<enough) {
         proceed(s, scratch);
         return;
     }
@@ -4974,7 +5048,7 @@ static void compact(Session *s, Arena scratch, i64 enough, i64 goal, b32 overflo
     iz  kept   = keep>0 ? cutpoint(s->history, start, s->rate, keep) : s->history.len;
     if (fixed+512>=goal || kept<=start) {
         Buf b(&scratch, 256);
-        print(&b, overflow ? Str("overflow: the") : Str("the"));
+        print(&b, why==CW_OVERFLOW ? Str("overflow: the") : Str("the"));
         print(&b, " conversation, about ");
         print(&b, before);
         print(&b, " tokens, must come under ");
@@ -4988,7 +5062,8 @@ static void compact(Session *s, Arena scratch, i64 enough, i64 goal, b32 overflo
     Compact cp = {};
     compactor(s, scratch, &cp);
     cp.goal     = goal;
-    cp.overflow = overflow;
+    cp.why      = why;
+    cp.focus    = why==CW_MANUAL ? s->cpfocus : Str{};
     cp.before   = before;
     cp.start    = start;
     cp.cut      = kept;
@@ -5012,8 +5087,10 @@ static void sendcompact(Session *s, Arena scratch)
                            cp->cut, limit);
     i64 words = sumbudget(cp->goal) * 3/4;
     b32 an    = cp->ep.kind == EP_ANTHROPIC;
-    Str body  = an ? ansummary(&s->attempt, scratch, &cp->mc, prev, convo, words)
-                   : encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words);
+    Str body  = an ? ansummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
+                               cp->focus)
+                   : encodesummary(&s->attempt, scratch, &cp->mc, prev, convo, words,
+                                   cp->focus);
     Str url   = apiurl(&scratch, cp->ep.url, an ? Str("messages")
                                                 : Str("chat/completions"));
     cp->inbytes = convo.len;
@@ -5030,7 +5107,8 @@ static void sendcompact(Session *s, Arena scratch)
 // The summary arrived: rebuild the history around it, log it, and carry
 // on with the step, unless the prompt is still above the goal after a
 // compaction at the threshold (the progress guard): compacting again
-// would make no headway, so the turn ends instead. A summary declined
+// would make no headway, so the turn ends instead. A compaction the
+// user asked for is its turn's whole work, which ends. A summary declined
 // (refusal) or cut off (length) is never used, since the history it
 // stands for would be gone for good, and asking again would end alike.
 static void compacted(Session *s, Arena scratch, Partial *p)
@@ -5077,12 +5155,15 @@ static void compacted(Session *s, Arena scratch, Partial *p)
 
     Buf   b(&scratch, 512 + summary.len*2);
     EvOut w = sbegin(s, &b, EV_COMPACT);
-    compactevent(s, &w, "summary", cp.overflow, cp.before);
+    compactevent(s, &w, "summary", cp.why, cp.before);
     putintkey(&w.json, "cutseq", cutseq);
     putstrkey(&w.json, "summary", summary);
     putstrkey(&w.json, "endpoint", cp.ep.url);
     putstrkey(&w.json, "model", cp.model);
     putintkey(&w.json, "ms", (os_ticks(e->os) - cp.began)/MS);
+    if (cp.focus.len) {
+        putstrkey(&w.json, "focus", cp.focus);
+    }
     ssend(s, &w);
     s->thinkfrom = s->log.seq;
     s->purpose   = REQ_CHAT;
@@ -5090,7 +5171,10 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     setstate(s, S_IDLE);
 
     i64 after = estimate(s);
-    if (!cp.overflow && after>cp.goal) {
+    if (cp.why == CW_MANUAL) {
+        endturn(s, scratch, "done", {});
+        return;
+    } else if (cp.why==CW_THRESHOLD && after>cp.goal) {
         Buf t(&scratch, 512);
         print(&t, "Compacting left the conversation at about ");
         print(&t, after);
@@ -5267,12 +5351,13 @@ static void prepare(Session *s, Arena scratch)
     proceed(s, scratch);
 }
 
-// A session's title from its first prompt: one line, each run of
-// whitespace a single space, cut near TITLE_MAX code points on a word
-// boundary (unless that would lose half of it) with an ellipsis.
-static Str maketitle(Arena *a, Str text)
+// A title from a text, as its first prompt or the user gives it: one
+// line, each run of whitespace a single space, cut near max code points
+// on a word boundary (unless that would lose half of it) with an
+// ellipsis. Empty if the text has nothing to show.
+static Str cleantitle(Arena *a, Str text, iz max)
 {
-    Buf b(a, 4*TITLE_MAX + 8);
+    Buf b(a, 4*max + 8);
     iz  n     = 0;   // code points so far
     iz  sp    = -1;  // b.len at the last space
     iz  spn   = 0;   // n there
@@ -5285,7 +5370,7 @@ static Str maketitle(Arena *a, Str text)
             space = b.len > 0;
             continue;
         }
-        if (n+space+1 > TITLE_MAX) {
+        if (n+space+1 > max) {
             more = 1;
             break;
         }
@@ -5300,7 +5385,7 @@ static Str maketitle(Arena *a, Str text)
         n++;
     }
     if (more) {
-        if (!space && sp>=0 && spn>=TITLE_MAX/2) {
+        if (!space && sp>=0 && spn>=max/2) {
             b.len = sp;  // within a word: back to its start
         }
         print(&b, "\xe2\x80\xa6");  // ellipsis
@@ -5310,21 +5395,26 @@ static Str maketitle(Arena *a, Str text)
 
 static Str sidecarput(Engine *, Arena, Str sid, Str name, Str data);
 
-static void settitle(Session *s, Arena scratch, Str title)
+// Title the session, by "auto" (its first prompt, or a subagent's task)
+// or by "user" (rename), which no automatic title replaces.
+static void settitle(Session *s, Arena scratch, Str title, Str by)
 {
     if (!title.len) {
         return;
     }
-    s->title = clone(&s->perm, title);
+    s->title     = clone(&s->perm, title);
+    s->usertitle = by == "user";
     Buf   b(&scratch, 128 + title.len);
     EvOut w = sbegin(s, &b, EV_TITLE);
     putstrkey(&w.json, "text", title);
+    putstrkey(&w.json, "by", by);
     ssend(s, &w);
     sidecarput(s->e, scratch, s->sid, "title", s->title);
 }
 
 // Begin a turn, after its user input if any: via names what began it
-// without input ("job": notices of background jobs), else is null.
+// without input ("job": notices of background jobs; "compact": the user
+// asked for a compaction, the turn's only work), else is null.
 static void beginturn(Session *s, Arena scratch, Str via)
 {
     s->cancelled = 0;
@@ -5345,6 +5435,7 @@ static void beginturn(Session *s, Arena scratch, Str via)
     s->lastset    = 0;
     s->seen       = 0;
     s->discovered = s->info.learned || (s->info.found && !s->info.llamacpp);
+    s->sentest    = estimate(s);  // the gauge until the request (live)
     resetnudges(s, 1);
     instrcheck(s, scratch);
     prepare(s, scratch);
@@ -5355,8 +5446,8 @@ static void startturn(Session *s, Arena scratch, Str text, Str via)
     s->cancelled = 0;
     adduser(s, scratch, text, via);
     if (!s->title.len) {
-        Str title = maketitle(&scratch, text);
-        settitle(s, scratch, title);
+        Str title = cleantitle(&scratch, text, TITLE_MAX);
+        settitle(s, scratch, title, "auto");
     }
     beginturn(s, scratch, {});
 }
@@ -5390,12 +5481,14 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
             disarm(s, t);  // jobs outlive turns
         }
     }
-    s->part     = 0;
-    s->purpose  = REQ_CHAT;
-    s->cp       = {};
-    s->slowing  = 0;
-    s->slowfrom = 0;
-    s->slown    = 0;
+    s->part        = 0;
+    s->purpose     = REQ_CHAT;
+    s->cp          = {};
+    s->compactnext = 0;
+    s->cpfocus     = {};
+    s->slowing     = 0;
+    s->slowfrom    = 0;
+    s->slown       = 0;
     // A job that ended after the turn's last request starts the next
     b32 resume = !s->steers.len && !s->queued.len && !s->closed && s->wake &&
                  s->notices.len && canresume(s);
@@ -5411,6 +5504,7 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
         if (resume) {
             putintkey(&w.json, "resume", 1);
         }
+        putgauge(s, &w.json, estimate(s));  // as it rests
         ssend(s, &w);
     }
     setstate(s, S_IDLE);
@@ -6066,6 +6160,57 @@ static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
     te->roleenum = clone(perm, finish(&en));
 }
 
+// Why a subagent cannot have a model at the endpoint at url, in perm,
+// or null if it can: a model with a [model] section, or one the
+// endpoint's latest listing gave (notekinds). At an endpoint never
+// listed, any model goes, as the request will tell.
+static Str submodel(Engine *e, Arena *perm, Arena scratch, Str model, Str url)
+{
+    Str *list = upsert(&e->listings, url, (Arena *)0);
+    if (!list || inisection(e->ini, "model", model)) {
+        return {};
+    }
+    for (Str rest = *list; rest.len;) {
+        Cut c = cut(rest, '\n');
+        if (c.head == model) {
+            return {};
+        }
+        rest = c.tail;
+    }
+
+    // The choices: configured models, then those listed, each once
+    Slice<Str> names = {};
+    for (IniSection *s = inifirst(e->ini, "model"); s; s = ininext(s)) {
+        if (s->name.len) {
+            names = push(&scratch, names, s->name);
+        }
+    }
+    for (Str rest = *list; rest.len;) {
+        Cut c    = cut(rest, '\n');
+        b32 seen = !c.head.len;
+        for (iz i = 0; !seen && i<names.len; i++) {
+            seen = names[i] == c.head;
+        }
+        if (!seen) {
+            names = push(&scratch, names, c.head);
+        }
+        rest = c.tail;
+    }
+    Buf b(perm, 512);
+    print(&b, "No subagent was started: no model \"");
+    print(&b, model);
+    print(&b, "\" is configured or listed at ");
+    print(&b, url);
+    print(&b, ". Give one of these, or none for the default: ");
+    for (iz i = 0; i<names.len && i<40; i++) {
+        print(&b, i ? Str(", ") : Str(""));
+        print(&b, names[i]);
+    }
+    print(&b, names.len>40 ? Str(", ...") : Str(""));
+    print(&b, names.len ? Str(".") : Str("(none)."));
+    return finish(&b);
+}
+
 // The session for task call k, its turn not begun. Null if it cannot be
 // made, with why in *err, in the parent's arena.
 static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
@@ -6084,17 +6229,15 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
         return 0;
     }
 
-    // An explicit model, else the role's, else the parent's own: at the
-    // role's endpoint, else the parent's, unless it is ENDPOINT/MODEL
-    Str model = args->model.len ? args->model :
-                r.model.len     ? r.model     : p->homemodel;
-    Str which = r.endpoint.len ? r.endpoint : p->home;
-    Cut em    = cut(args->model, '/');
-    if (args->model.len && em.ok && em.tail.len &&
-            trim(cfgget(e->cfg, "endpoint", em.head, "url", 0)).len) {
-        which = em.head;
-        model = em.tail;
-    }
+    // The task's model, else the role's, else the one the parent's model
+    // names for its subagents, else the parent's own, each MODEL or
+    // ENDPOINT/MODEL: at that endpoint, else the role's, else the parent's
+    Str      dflt  = r.endpoint.len ? r.endpoint : p->home;
+    Str      sub   = trim(cfgget(e->cfg, "model", p->homemodel, "subagent_model", 0));
+    Str      spec  = args->model.len ? args->model : r.model.len ? r.model : sub;
+    Target   to    = spec.len ? targetof(e, spec, dflt) : Target{dflt, p->homemodel};
+    Str      model = to.model;
+    Str      which = to.which;
     Endpoint probe = {};
     if (!endpointconf(e, &scratch, which, &probe)) {
         Buf b(&p->perm, 256);
@@ -6102,6 +6245,11 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
         print(&b, which);
         print(&b, "\", is neither a URL nor a configured endpoint.");
         *err = finish(&b);
+        return 0;
+    }
+    Str bad = spec.len ? submodel(e, &p->perm, scratch, model, probe.url) : Str{};
+    if (bad.len) {
+        *err = bad;
         return 0;
     }
 
@@ -6141,8 +6289,9 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     instrlogstart(s, scratch);
     logprefix(s, scratch);
     // Complete before scratch is passed on, which copies it
-    Str title = maketitle(&scratch, args->desc.len ? args->desc : args->prompt);
-    settitle(s, scratch, title);
+    Str title = cleantitle(&scratch, args->desc.len ? args->desc : args->prompt,
+                           TITLE_MAX);
+    settitle(s, scratch, title, "auto");
     return s;
 }
 
@@ -6553,11 +6702,13 @@ static Str sidecarput(Engine *e, Arena scratch, Str sid, Str name, Str data)
     Os *os   = e->os;
     iz  lock = -1;
     if (heldlock(e, sid) < 0) {
-        Str log = sidecarpath(&scratch, e, sid, "events.jsonl");
+        // Paths made before scratch is passed on, which copies it
+        Str log  = sidecarpath(&scratch, e, sid, "events.jsonl");
+        Str path = sidecarpath(&scratch, e, sid, "lock");
         if (!validsid(sid) || os_stat(os, scratch, log).type!=STAT_FILE) {
             return "no such session";
         }
-        lock = os_lockfile(os, scratch, sidecarpath(&scratch, e, sid, "lock"));
+        lock = os_lockfile(os, scratch, path);
         if (lock < 0) {
             return "open in another process";
         }
@@ -6598,9 +6749,11 @@ struct ListEntry {
     Str       cwd;
     Str       model;
     Str       parent;  // a subagent's, else empty
+    Str       group;   // empty if in none
     i64       mtime;
     b32       locked;  // open in another process
     b32       parked;
+    b32       archived;
     b32       shown;
     Slice<iz> kids;    // its subagents, oldest first
 };
@@ -6635,15 +6788,18 @@ static SessScan scansessions(Engine *e, Arena *a)
         Session  *s    = findsession(e, d->name);
         Str       lock = join(a, sdir, "lock");
         ListEntry en   = {};
-        en.sid    = d->name;
-        en.title  = sidecarget(e, a, d->name, "title", 1024);
-        en.cwd    = jsonstr(jsonget(rec.root, "cwd"));
-        en.model  = jsonstr(jsonget(rec.root, "model"));
-        en.parent = jsonstr(jsonget(rec.root, "parent"));
-        en.mtime  = d->mtime;
-        en.parked = !s && parkedat(e, d->name)>=0;  // its lock is ours
-        en.locked = (!s || s->readonly) && !en.parked &&
-                    os_lockheld(e->os, *a, lock);
+        Str       mod  = sidecarget(e, a, d->name, "model", 1024);  // switched
+        en.sid      = d->name;
+        en.title    = sidecarget(e, a, d->name, "title", 1024);
+        en.cwd      = jsonstr(jsonget(rec.root, "cwd"));
+        en.model    = mod.len ? mod : jsonstr(jsonget(rec.root, "model"));
+        en.parent   = jsonstr(jsonget(rec.root, "parent"));
+        en.group    = sidecarget(e, a, d->name, "group", GROUP_MAX);
+        en.archived = sidecarget(e, a, d->name, "archived", 16).data != 0;
+        en.mtime    = d->mtime;
+        en.parked   = !s && parkedat(e, d->name)>=0;  // its lock is ours
+        en.locked   = (!s || s->readonly) && !en.parked &&
+                      os_lockheld(e->os, *a, lock);
         r.list = push(a, r.list, en);
     }
 
@@ -6748,8 +6904,12 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "instructions must be all or project", {});
         return;
     }
+    if (!model.len && role.model.len) {
+        Target t = targetof(e, role.model, role.endpoint);  // ENDPOINT/MODEL?
+        model = t.model;
+        which = which.len ? which : t.which;
+    }
     if (!which.len) which = role.endpoint;
-    if (!model.len) model = role.model;
     if (!which.len) which = iniget(e->ini, "", "", "endpoint");
     if (!model.len) model = iniget(e->ini, "", "", "model");
     Slice<Str> roots = {};
@@ -7038,7 +7198,20 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->stepmax = steps>0 && steps<STEP_HARD ? steps : 0;
         } break;
         case EV_TITLE:
-            s->title = clone(&s->perm, jsonstr(jsonget(j, "text")));
+            s->title     = clone(&s->perm, jsonstr(jsonget(j, "text")));
+            s->usertitle = jsonstr(jsonget(j, "by")) == "user";
+            break;
+        case EV_MODEL:
+            // Switched (model): the model from here on, whose requests
+            // never carry reasoning from before it
+            storedmodel  = clone(&s->perm, jsonstr(jsonget(j, "model")));
+            storedurl    = clone(&s->perm, jsonstr(jsonget(j, "endpoint")));
+            s->thinkfrom = r.seq;
+            s->ctxhint   = jsonint(jsonget(j, "ctx"), 0);
+            break;
+        case EV_ATTEMPT:
+        case EV_TURNEND:
+            s->ctxhint = jsonint(jsonget(j, "ctx"), s->ctxhint);
             break;
         case EV_TURN:
             s->turn = jsonint(jsonget(j, "n"), s->turn);
@@ -7266,12 +7439,25 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
     sendsnapshot(s, scratch);
     s->closed = 0;
 
-    Buf   b(&scratch, 256);
-    EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
-    putintkey(&w.json, "id", id);
-    putintkey(&w.json, "ok", 1);
-    putintkey(&w.json, "readonly", s->readonly);
-    emit(e, evend(&w));
+    // With the unsent prompt kept (draft), unless the reply would then
+    // be too long for the frontend's mailbox
+    Str draft = sidecarget(e, &scratch, s->sid, "draft", DRAFT_MAX);
+    for (i32 pass = 0; pass < 2; pass++) {
+        Arena a = scratch;
+        Buf   b(&a, 256 + (pass ? 0 : draft.len + draft.len/8));
+        EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
+        putintkey(&w.json, "id", id);
+        putintkey(&w.json, "ok", 1);
+        putintkey(&w.json, "readonly", s->readonly);
+        if (!pass && draft.len) {
+            putstrkey(&w.json, "draft", draft);
+        }
+        Str line = evend(&w);
+        if (pass || line.len<=mailmax(e->out)) {
+            emit(e, line);
+            break;
+        }
+    }
     live(s);  // the state of a session that was open already
 }
 
@@ -7555,6 +7741,12 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     if (en->parked) {
         putintkey(w, "parked", 1);
     }
+    if (en->archived) {
+        putintkey(w, "archived", 1);
+    }
+    if (en->group.len) {
+        putstrkey(w, "group", en->group);
+    }
     putend(w);
     for (iz k = 0; k<en->kids.len && depth<=TASK_DEPTH+8; k++) {
         listput(e, w, list, en->kids[k], depth+1);
@@ -7581,6 +7773,241 @@ static void cmdlist(Engine *e, Arena scratch, i64 id)
     putend(&w.json);
     emit(e, evend(&w));
     reply(e, scratch, id, 1, {}, {});
+}
+
+// rename {sid, title}: a title from the user, cleaned up as any title
+// (cleantitle), which no automatic one replaces. Also while a turn runs,
+// and on a session not open here (borrow), but never on one another
+// process holds. The reply has the title as it came out.
+static void cmdrename(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str sid   = jsonstr(jsonget(j, "sid"));
+    Str title = cleantitle(&scratch, jsonstr(jsonget(j, "title")), RENAME_MAX);
+    if (!validsid(sid)) {
+        reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    } else if (!title.len) {
+        reply(e, scratch, id, 0, "the title is empty", sid);
+        return;
+    }
+    b32      transient = 0;
+    Session *s         = borrow(e, scratch, sid, &transient);
+    Str      err       = !s          ? Str("no such session") :
+                         s->readonly ? Str("open in another process") : Str{};
+    if (!err.len) {
+        settitle(s, scratch, title, "user");
+    }
+    if (transient) {
+        forget(e, s);
+    }
+    if (err.len) {
+        reply(e, scratch, id, 0, err, sid);
+        return;
+    }
+    Buf   b(&scratch, 256 + title.len);
+    EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "title", title);
+    emit(e, evend(&w));
+}
+
+// archive {sid, on}, group {sid, name} and draft {sid, text}: what is
+// kept beside a session's log (sidecars), set whether it is open here
+// or not, and never waking it if parked. Archived (on, 1 if absent) is
+// for a frontend to set the session aside, its subagents with it. A
+// group is named by one line of text, and null or empty leaves it. A
+// draft is a frontend's unsent prompt, which open returns, and prompt
+// and steer remove; the last to write it wins, as two frontends may
+// each have the session open. Empty text removes it.
+static void cmdsidecar(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
+{
+    Str sid = jsonstr(jsonget(j, "sid"));
+    if (!validsid(sid)) {
+        reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    }
+    Str err = {};
+    switch (cmd) {
+    case CMD_ARCHIVE: {
+        b32 on = jsonflag(jsonget(j, "on"), 1);
+        err = sidecarput(e, scratch, sid, "archived", on ? Str("1") : Str{});
+    } break;
+    case CMD_GROUP: {
+        Json *n    = jsonget(j, "name");
+        Str   name = trim(jsonstr(n));
+        b32   ok   = n->type==JSON_STRING || n->type==JSON_NULL;
+        for (iz i = 0; ok && i<name.len; i++) {
+            ok = name[i]>=0x20 && name[i]!=0x7f;
+        }
+        if (!ok) {
+            err = "name must be one line of text, or null to leave the group";
+        } else if (name.len > GROUP_MAX) {
+            err = "a group's name is at most 120 bytes";
+        } else {
+            err = sidecarput(e, scratch, sid, "group", name.len ? name : Str{});
+        }
+    } break;
+    case CMD_DRAFT: {
+        Json *t    = jsonget(j, "text");
+        Str   text = jsonstr(t);
+        Str   log  = sidecarpath(&scratch, e, sid, "events.jsonl");
+        if (t->type!=JSON_STRING && t->type!=JSON_NULL && t->type!=JSON_MISSING) {
+            err = "text must be a string";
+        } else if (text.len > DRAFT_MAX) {
+            err = "the draft is too long: at most 1 MiB";
+        } else if (os_stat(e->os, scratch, log).type != STAT_FILE) {
+            err = "no such session";
+        } else if (!sidecarwrite(e, scratch, sid, "draft", text.len ? text : Str{})) {
+            err = "cannot write the session's files";
+        }
+    } break;
+    }
+    reply(e, scratch, id, !err.len, err, sid);
+}
+
+// model {sid, model, endpoint?}: another model for the rest of the
+// session, as its primary from now on, at the endpoint given, else as
+// the model names one (targetof), else at the session's. Only while it
+// is idle, also on a session not open here (borrow). What its prefix
+// froze stays, byte for byte: the system prompt and tools, with the
+// edit format and the desktop's coordinates they describe, which the
+// reply's note points out if the new model's settings differ, as it
+// does a conversation already past its compaction threshold. Reasoning
+// from before goes to no request after (thinkfrom), since it is bound
+// to the model that made it. The agent is not told.
+static void cmdmodel(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str sid   = jsonstr(jsonget(j, "sid"));
+    Str spec  = trim(jsonstr(jsonget(j, "model")));
+    Str which = trim(jsonstr(jsonget(j, "endpoint")));
+    if (!validsid(sid)) {
+        reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    } else if (!spec.len) {
+        reply(e, scratch, id, 0, "model is required", sid);
+        return;
+    }
+    b32      transient = 0;
+    Session *s         = borrow(e, scratch, sid, &transient);
+    Str      err       = !s          ? Str("no such session") :
+                         s->readonly ? Str("open in another process") :
+                         busy(s) || s->intask ? Str("busy: switch once the turn ends")
+                                              : Str{};
+    Target   t         = {};
+    Endpoint probe     = {};
+    if (!err.len) {
+        t = which.len ? Target{which, spec} : targetof(e, spec, s->home);
+        if (!endpointconf(e, &scratch, t.which, &probe)) {
+            err = "no usable endpoint: give a URL or a configured name";
+        }
+    }
+    if (err.len) {
+        if (transient) {
+            forget(e, s);
+        }
+        reply(e, scratch, id, 0, err, sid);
+        return;
+    }
+
+    usetarget(s, t.which, t.model);
+    s->home      = clone(&s->perm, t.which);
+    s->homemodel = s->model;
+    s->target    = 0;
+    s->homeat    = 0;
+    {
+        Arena a = scratch;
+        Buf   b(&a, 256 + s->ep.url.len + s->model.len);
+        EvOut w = sbegin(s, &b, EV_MODEL);
+        putstrkey(&w.json, "endpoint", s->ep.url);
+        putstrkey(&w.json, "model", s->model);
+        if (s->mc.ctx) {
+            putintkey(&w.json, "ctx", s->mc.ctx);
+        }
+        ssend(s, &w);
+    }
+    s->thinkfrom = s->log.seq;
+    s->ctxhint   = s->mc.ctx;
+    sidecarput(e, scratch, sid, "model", s->model);
+
+    // What the new model's settings would change, were they not frozen
+    Buf note(&scratch, 512);
+    if (s->mc.edit != s->te.edit) {
+        print(&note, "The edit tool keeps the session's format, ");
+        print(&note, editnames[s->te.edit]);
+        print(&note, ", not this model's, ");
+        print(&note, editnames[s->mc.edit]);
+        print(&note, ". ");
+    }
+    if (tooloffered(&s->te, TOOL_DESKTOP) && s->mc.coords!=s->te.coords) {
+        Str has  = s->te.coords==COORDS_NORM1000 ? Str("norm1000") : Str("pixels");
+        Str want = s->mc.coords==COORDS_NORM1000 ? Str("norm1000") : Str("pixels");
+        print(&note, "The desktop tool keeps the session's coordinates, ");
+        print(&note, has);
+        print(&note, ", not this model's, ");
+        print(&note, want);
+        print(&note, ". ");
+    }
+    i64 tokens = estimate(s);
+    if (s->mc.ctx && tokens>=compactat(s->mc.ctx)) {
+        print(&note, "The conversation, about ");
+        print(&note, tokens);
+        print(&note, " tokens, is past this model's compaction threshold of ");
+        print(&note, compactat(s->mc.ctx));
+        print(&note, " tokens, so it is compacted before the next request. ");
+    }
+    Str text = trim(finish(&note));
+
+    Buf   b(&scratch, 512 + text.len + s->model.len + s->ep.url.len);
+    EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "model", s->model);
+    putstrkey(&w.json, "endpoint", s->ep.url);
+    if (s->mc.ctx) {
+        putintkey(&w.json, "ctx", s->mc.ctx);
+    }
+    if (text.len) {
+        putstrkey(&w.json, "note", text);
+    }
+    Str line = evend(&w);  // in scratch, before s may go
+    if (transient) {
+        forget(e, s);
+    }
+    emit(e, line);
+}
+
+// compact {sid, focus?}: compact now, in a turn of its own (via
+// "compact") once the model's listing is read, summarizing all but the
+// newest messages (compact), with what the user would keep in more
+// detail (focus). Only while idle, and only with something worth
+// summarizing, else the reply says why and nothing is logged.
+static void cmdcompact(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
+{
+    Str focus = trim(jsonstr(jsonget(j, "focus")));
+    if (busy(s) || s->intask) {
+        reply(e, scratch, id, 0, "busy: compact once the turn ends", s->sid);
+        return;
+    } else if (focus.len > FOCUS_MAX) {
+        reply(e, scratch, id, 0, "the focus is too long: at most 4 KiB", s->sid);
+        return;
+    }
+    i64 older = compactable(s->history, s->summary.len ? 1 : 0, s->rate);
+    if (older < COMPACT_MINUSER) {
+        Buf b(&scratch, 256);
+        print(&b, "too little to compact: about ");
+        print(&b, older);
+        print(&b, " tokens of older messages, while the newest ");
+        print(&b, (i64)COMPACT_KEEP);
+        print(&b, " tokens stay as they are");
+        Str err = finish(&b);
+        reply(e, scratch, id, 0, err, s->sid);
+        return;
+    }
+    reply(e, scratch, id, 1, {}, s->sid);
+    s->compactnext = 1;
+    s->cpfocus     = clone(&s->perm, focus);
+    beginturn(s, scratch, "compact");
 }
 
 // After the configuration reloads: each session takes up its endpoint's
@@ -7823,18 +8250,26 @@ static void command(Engine *e, Arena scratch, Str line)
         }
         reply(e, scratch, id, 1, {}, {});
         return;
-    case CMD_DELETE:
     case CMD_ARCHIVE:
     case CMD_GROUP:
-    case CMD_FORK:
     case CMD_DRAFT:
         // Commands on a session's directory, open here or not, which
         // need not wake one parked
+        cmdsidecar(e, scratch, id, cmd, j);
+        return;
+    case CMD_DELETE:
+    case CMD_FORK:
         if (!validsid(sid)) {
             reply(e, scratch, id, 0, "invalid session id", {});
         } else {
             reply(e, scratch, id, 0, "not implemented yet", sid);
         }
+        return;
+    case CMD_RENAME:
+        cmdrename(e, scratch, id, j);  // on a session open here or not
+        return;
+    case CMD_MODEL:
+        cmdmodel(e, scratch, id, j);
         return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});
@@ -7887,10 +8322,8 @@ static void command(Engine *e, Arena scratch, Str line)
         reply(e, scratch, id, 1, {}, sid);
         jobstop(s, jb, JOBEND_KILLED);  // the agent is told as it ends
     } return;
-    case CMD_RENAME:
     case CMD_COMPACT:
-    case CMD_MODEL:
-        reply(e, scratch, id, 0, "not implemented yet", sid);
+        cmdcompact(e, s, scratch, id, j);
         return;
     case CMD_PROMPT:
     case CMD_STEER:
@@ -7899,6 +8332,7 @@ static void command(Engine *e, Arena scratch, Str line)
             return;
         }
         reply(e, scratch, id, 1, {}, sid);
+        sidecarwrite(e, scratch, s->sid, "draft", {});  // sent, so no draft
         if (!busy(s)) {
             startturn(s, scratch, text, cmd==CMD_PROMPT ? Str("prompt") : Str("steer"));
         } else if (cmd == CMD_PROMPT) {

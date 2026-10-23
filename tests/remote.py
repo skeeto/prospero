@@ -360,7 +360,14 @@ class T:
                     + extra)
 
     def model(self, scenario):
-        return f"fake:{scenario}:{self.nonce}"
+        """The scenario's model, listed with the one for its subagents
+        (NAME_b), as a server lists the models it has: a subagent's model
+        must be among them."""
+        name = f"fake:{scenario}:{self.nonce}"
+        with fake_provider.STATE.lock:
+            for m in (name, f"fake:{scenario}_b:{self.nonce}"):
+                fake_provider.STATE.models.setdefault(m, {})
+        return name
 
     def check(self, cond, msg):
         if not cond:

@@ -26,9 +26,10 @@ request as the real API would, and stricter: the key (AN_KEY, as x-api-key)
 and anthropic-version, roles that alternate, a message's tool results
 before its text and each matching a call of the message before, no blank
 text, at most four cache breakpoints and none on reasoning, and reasoning
-returned verbatim with the signature this server gave it, still bound to
-the conversation before it (the system prompt, the tools and the messages
-before it, unchanged), which compaction must respect. A request that fails
+returned verbatim with the signature this server gave it, to the model
+that gave it, still bound to the conversation before it (the system
+prompt, the tools and the messages before it, unchanged), which
+compaction and a model switch must respect. A request that fails
 is answered 400 invalid_request_error, as the API does. Its usage counts
 cache reads and writes from the breakpoints of the requests seen so far.
 
@@ -79,6 +80,7 @@ class State:
         self.peak = {}      # prefix -> most different models in flight
         self.includes = 0   # fetches of /fake/include.ini
         self.sigs = {}      # Anthropic: signature -> (reasoning, binding)
+        self.signers = {}   # Anthropic: signature -> the model that gave it
         self.redacted = set()  # Anthropic: redacted data given out
         self.caches = {}    # Anthropic: model -> {prefix hash: tokens}
         self.listings = []  # Anthropic: headers of /v1/models requests
@@ -2697,8 +2699,12 @@ def an_check_reasoning(req, i, k, b):
         return None if ok else f"{where}: Invalid `data` in `redacted_thinking` block"
     with STATE.lock:
         known = STATE.sigs.get(b.get("signature"))
+        signer = STATE.signers.get(b.get("signature"))
     if not known or known[0] != b.get("thinking"):
         return f"{where}: Invalid `signature` in `thinking` block"
+    if signer != req.get("model"):
+        return (f"{where}: Invalid `signature` in `thinking` block. The block "
+                "was produced by a different model.")
     if known[1] != an_binding(req, i):
         return (f"{where}: Invalid `signature` in `thinking` block. The block is "
                 "bound to a different conversation.")
@@ -2857,6 +2863,7 @@ def an_think(req, index, s, pieces=2, sign=True, bound=None):
     with STATE.lock:
         sig = f"EqFake{len(STATE.sigs)}x{random.randrange(1 << 32):08x}=="
         STATE.sigs[sig] = (s, bound or an_binding(req, len(req.get("messages", []))))
+        STATE.signers[sig] = req.get("model")
     for piece in (sig[:6], sig[6:]):
         yield an_event({"type": "content_block_delta", "index": index,
                         "delta": {"type": "signature_delta", "signature": piece}})
@@ -3144,6 +3151,7 @@ def an_hidden(model, req, seconds):
     with STATE.lock:
         sig = f"EqFake{len(STATE.sigs)}x{random.randrange(1 << 32):08x}=="
         STATE.sigs[sig] = ("", an_binding(req, len(req.get("messages", []))))
+        STATE.signers[sig] = req.get("model")
     yield an_event({"type": "content_block_delta", "index": 0,
                     "delta": {"type": "signature_delta", "signature": sig}})
     yield an_event({"type": "content_block_stop", "index": 0})
@@ -3183,6 +3191,121 @@ def sc_an_hidden_bound(model, n, req):
         yield from an_hidden(model, req, 60)
     else:
         yield from an_answer(model, req, "Answered at last.")
+
+
+# M8: session operations. These go by the conversation's last user
+# message, which a compaction or a model switch leaves in place.
+
+def last_user_text(req):
+    for m in reversed(req.get("messages", [])):
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, list):  # Anthropic's blocks
+                texts = [b.get("text", "") for b in c if b.get("type") == "text"]
+                if not texts:
+                    return None  # tool results
+                return "".join(texts)
+            return str(c or "")
+    return ""
+
+
+def since_user(req):
+    """Tool results since the last user message."""
+    k = 0
+    for m in reversed(req.get("messages", [])):
+        if m.get("role") == "user":
+            break
+        k += m.get("role") == "tool"
+    return k
+
+
+def sc_session_ops(model, n, req):
+    yield S.head()
+    if last_user_text(req) == "slow":
+        yield S.sleep(1.5)  # busy a while, for a rename meanwhile
+    yield from text(model, f"Answer {n}.")
+    yield from finish(model)
+
+
+def sc_draft(model, n, req):
+    yield from answer(model, "Sent.")
+
+
+def sc_gauge(model, n, req):
+    yield S.head()
+    yield S.sleep(1.5)  # long enough for a live record
+    yield from text(model, "Measured.")
+    yield from real_finish(model, req)
+
+
+def sc_model_switch(model, n, req):
+    # Answers name the model, which a slow prompt keeps busy a while
+    if last_user_text(req) == "slow":
+        yield S.head()
+        yield S.sleep(1.5)
+        yield from text(model, "Slowly.")
+        yield from finish(model)
+    else:
+        yield from answer(model, f"From {model.split(':')[1]}.")
+
+
+sc_model_switch_b = sc_model_switch
+
+
+def sc_compact_manual(model, n, req):
+    # Reads eight big files, then answers; anything else, at once
+    k = since_user(req)
+    if last_user_text(req) != "read them":
+        yield from real_answer(model, req, "Again.")
+    elif k < 8:
+        yield from real_tool(model, req, n, "read", {"path": f"f{k}.txt"})
+    else:
+        yield from real_answer(model, req, "All files read.")
+
+
+sc_compact_cancel = sc_compact_manual
+
+
+def sc_compact_cancel_compact(model, n, req):
+    # A summarizer slow enough to cancel, then a quick one
+    yield S.head()
+    if n == 0:
+        yield S.sleep(30)
+    yield from text(model, f"## Goal\nRead the files. SUMMARY-{n}", 2)
+    yield from finish(model, prompt=ptok(req))
+
+
+def sc_task_model(model, n, req):
+    # A parent's four tasks: by [model] subagent_model, by a role's
+    # ENDPOINT/MODEL, by the task's own model over the role's, and by a
+    # model nobody knows; subagents say which model they run on
+    if "# Subagent" in system_of(req):
+        yield from answer(model, f"Child on {model}.")
+    elif step(req) == 0:
+        yield from calls(model, n, [
+            ("task", {"description": "A", "prompt": "Task A."}),
+            ("task", {"description": "B", "prompt": "Task B.", "role": "pinned"}),
+            ("task", {"description": "C", "prompt": "Task C.", "role": "pinned",
+                      "model": second(model)}),
+            ("task", {"description": "D", "prompt": "Task D.",
+                      "model": "fake:no_such_model"})])
+    else:
+        yield from answer(model, " | ".join(tool_results(req)))
+
+
+sc_task_model_b = sc_task_model
+
+
+def sc_an_model_switch(model, n, req):
+    # Reasoning signed by each model, a step with a call then an answer
+    if last_user_text(req) is None:
+        yield from an_answer(model, req, "Read it.", think="It is read.")
+    else:
+        yield from an_call(model, req, n, "read", {"path": "a.txt"},
+                           think=f"Read a.txt with {model.split(':')[1]}.")
+
+
+sc_an_model_switch_b = sc_an_model_switch
 
 
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()

@@ -156,6 +156,15 @@ static Str capnames[] = {
     "file.base64",     // file {encoding:"base64"}, for binary files
     "desktop",         // the desktop tool, with screenshots in tool.end
     "subagents",       // the task tool: sessions listed under a parent
+    // Commands named in cmds since the protocol froze, as each works
+    "rename",          // rename
+    "title.by",        // title {by}: "user" (rename) or "auto"
+    "archive",         // archive, and list's archived
+    "group",           // group, and list's group
+    "draft",           // draft, and open's draft
+    "compact",         // compact, a turn of its own (via "compact")
+    "model",           // model, and the durable model record
+    "gauge",           // ctx, compact_at and tokens on attempt, turn.end, live
 };
 
 static Str evname(i32 ev)

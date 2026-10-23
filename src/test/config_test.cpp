@@ -800,6 +800,7 @@ static void testcfgjson(Test *t)
         "model/m/compactor=*\n"
         "model/m/fallback=*\n"
         "model/m/fallback_cooldown=600*\n"
+        "model/m/subagent_model=*\n"
         "model/m/reasoning_budget=*\n"
         "model/m/thinking=adaptive*\n"
         "model/m/thinking_display=summarized*\n"

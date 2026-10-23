@@ -279,6 +279,10 @@ static CfgKey cfgschema[] = {
      "each MODEL or ENDPOINT/MODEL"},
     {"model", "fallback_cooldown", CFG_SECONDS, "600", {}, {}, "model",
      "Seconds on a fallback before this model is tried again"},
+    {"model", "subagent_model", CFG_STRING, "", {}, {}, "model",
+     "Model for the subagents of a session on this one, MODEL or "
+     "ENDPOINT/MODEL, unless the task or its role names one; by default "
+     "this one"},
     {"model", "reasoning_budget", CFG_INT, "", {}, {}, "model",
      "Most reasoning tokens in a response before the model is told to "
      "answer; with thinking = budget, Anthropic's budget_tokens"},
@@ -346,7 +350,9 @@ static CfgKey cfgschema[] = {
     {"role", "endpoint", CFG_STRING, "", {}, {}, "role",
      "Endpoint for the role, by default the session's, or a subagent's parent's"},
     {"role", "model", CFG_STRING, "", {}, {}, "role",
-     "Model for the role, by default the session's, or a subagent's parent's"},
+     "Model for the role, MODEL or ENDPOINT/MODEL, by default the "
+     "session's, or for a subagent its parent's [model] subagent_model, "
+     "else the parent's own"},
     {"role", "tools", CFG_LIST,
      "read write edit shell grep glob todo_write jobs job_output job_kill task", {},
      "read write edit shell grep glob todo_write jobs job_output job_kill task "

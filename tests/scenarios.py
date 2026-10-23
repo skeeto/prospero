@@ -1840,8 +1840,8 @@ def readonly(t):
 @scenario(bound=10)
 def hello_caps(t):
     """hello names every command (cmds) and the engine's features (caps);
-    the commands of M8 are named already, each refused for now without
-    touching the session it names."""
+    the commands of M8 are named already, those still to come refused
+    for now without touching the session it names."""
     h = t.headless()
     try:
         r = h.call("hello", proto=0, client="scenarios")
@@ -1850,17 +1850,20 @@ def hello_caps(t):
         t.check(len(hello) == 1, f"one hello: {hello}")
         hello = hello[0]
         t.check(hello.get("proto") == 0 and hello.get("version"), f"hello: {hello}")
-        later = ["rename", "delete", "archive", "group", "fork", "compact", "model",
-                 "draft"]
+        m8 = ["rename", "delete", "archive", "group", "fork", "compact", "model",
+              "draft"]
         cmds = hello.get("cmds", [])
         want = ["hello", "list", "new", "open", "close", "prompt", "steer", "cancel",
                 "answer", "config.get", "config.set", "quit", "rewind", "job.kill",
-                "status", "stop", "file"] + later
+                "status", "stop", "file"] + m8
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
                 {"close.forget", "config.refresh", "file.base64", "desktop",
-                 "subagents"} <= set(caps) and "host" not in caps, f"caps: {caps}")
+                 "subagents", "rename", "title.by", "archive", "group", "draft",
+                 "compact", "model", "gauge"} <= set(caps) and "host" not in caps,
+                f"caps: {caps}")
+        later = ["delete", "fork"]  # still to come
 
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
         local = isinstance(t.host, LocalHost)
@@ -1868,19 +1871,16 @@ def hello_caps(t):
         before = sorted(os.listdir(state)) if local else None
         log = t.host.read(t.host.join(state, "events.jsonl"))
         seen = len([e for e in h.events if e.get("sid") == sid and "seq" in e])
-        fields = {"rename": {"title": "t"}, "archive": {"on": 1},
-                  "group": {"name": "g"}, "fork": {"turn": 1},
-                  "compact": {"focus": "f"}, "model": {"model": t.model},
-                  "draft": {"text": "unsent"}}
+        fields = {"fork": {"turn": 1}}
         for cmd in later:
             r = h.call(cmd, sid=sid, **fields.get(cmd, {}))
             t.check(r.get("ok") == 0 and r.get("err") == "not implemented yet" and
                     r.get("sid") == sid, f"{cmd}: {r}")
-        for cmd in ("delete", "archive", "group", "fork", "draft"):
-            # Commands on a session's directory, whether open or not
-            r = h.call(cmd, sid="20260101-000000-none")
-            t.check(r.get("ok") == 0 and r.get("err") == "not implemented yet",
-                    f"{cmd} on another: {r}")
+        for cmd in ("delete", "archive", "group", "fork", "draft", "rename", "model"):
+            # Commands on a session open here or not
+            r = h.call(cmd, sid="20260101-000000-none", title="t", model="m", name="g")
+            want = "not implemented yet" if cmd in later else "no such session"
+            t.check(r.get("ok") == 0 and r.get("err") == want, f"{cmd} on another: {r}")
             for bad in ("../" + sid, "a\\b", "", "C:x", ".x"):
                 r = h.call(cmd, sid=bad)
                 t.check(r.get("ok") == 0 and r.get("err") == "invalid session id",
@@ -4504,6 +4504,394 @@ def eval_own(t):
     t.check(rc == 0 and len(recs) == 4, f"replace: {rc} {recs}")
     t.check(f"{t.model}: keep hashline, its own format: none did measurably better" in out
             and "[model" not in out, f"summary:\n{out}")
+
+
+# M8: session operations, on a session open here, parked, closed, or
+# held by another process
+
+def listentry(h, sid):
+    h.call("list")  # its reply follows the list
+    return next((e for e in h.all("sessions")[-1]["list"] if e["sid"] == sid), None)
+
+
+def sidecar(t, sid, name):
+    """A file beside a session's log, None if there is none."""
+    return t.host.read(t.host.join(t.state, "sessions", sid, name))
+
+
+def logged(t, sid):
+    data = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl")) or ""
+    return [json.loads(x) for x in data.splitlines() if x.strip()]
+
+
+def ended(h, sid, turn):
+    return h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and
+                  e.get("turn") == turn)
+
+
+@scenario(bound=15)
+def session_ops(t):
+    """rename, archive and group: a title from the user, also while a turn
+    runs, and sidecars the list shows, written by whoever holds the
+    session, refused while another process does, and on a closed session
+    for the moment, which stays closed."""
+    a = t.headless()
+    b = None
+    try:
+        sid = a.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        a.send("prompt", sid=sid, text="first question")
+        ended(a, sid, 1)
+        auto = a.all("title", sid)
+        t.check(len(auto) == 1 and auto[0].get("by") == "auto", f"auto title {auto}")
+        r = a.call("rename", sid=sid, title="  My \t new\ntitle  ")
+        t.check(r.get("ok") == 1 and r.get("title") == "My new title", f"rename {r}")
+        last = a.all("title", sid)[-1]
+        t.check(last["text"] == "My new title" and last.get("by") == "user" and
+                last.get("seq"), f"title record {last}")
+        t.check(sidecar(t, sid, "title") == "My new title", "the title's sidecar")
+        r = a.call("rename", sid=sid, title=" \n\t ")
+        t.check(r.get("ok") == 0 and r.get("err") == "the title is empty", f"blank {r}")
+        r = a.call("rename", sid=sid, title="x" * 200)
+        t.check(r.get("ok") == 1 and r["title"] == "x" * 120 + "…", f"long {r}")
+
+        # While a turn runs
+        a.send("prompt", sid=sid, text="slow")
+        a.wait(lambda e: e.get("ev") == "attempt" and e.get("sid") == sid and
+               e.get("turn") == 2)
+        r = a.call("rename", sid=sid, title="Renamed while busy")
+        t.check(r.get("ok") == 1, f"rename while busy {r}")
+        t.check(ended(a, sid, 2)["why"] == "done", "the turn goes on")
+
+        # Another process: refused, as this one holds the session
+        b = t.headless()
+        for cmd, f in (("rename", {"title": "theirs"}), ("archive", {"on": 1}),
+                       ("group", {"name": "g"})):
+            r = b.call(cmd, sid=sid, **f)
+            t.check(r.get("ok") == 0 and r.get("err") == "open in another process",
+                    f"{cmd} elsewhere: {r}")
+        t.check(a.call("archive", sid=sid, on=1).get("ok") == 1, "archived")
+        t.check(a.call("group", sid=sid, name="  Work stuff ").get("ok") == 1, "grouped")
+        for name in ("a\nb", "x" * 121, 5):
+            r = a.call("group", sid=sid, name=name)
+            t.check(r.get("ok") == 0 and r.get("err"), f"group {name!r}: {r}")
+        en = listentry(b, sid)
+        t.check(en.get("archived") == 1 and en.get("group") == "Work stuff" and
+                en["title"] == "Renamed while busy" and en["locked"] == 1, f"listed {en}")
+        t.check(a.close() == 0, "the first exits")
+        a = None
+
+        # Closed: changed for the moment, and it stays closed
+        r = b.call("rename", sid=sid, title="Closed rename")
+        t.check(r.get("ok") == 1 and r.get("title") == "Closed rename", f"closed rename {r}")
+        r = b.call("archive", sid=sid, on=0)
+        t.check(r.get("ok") == 1, f"unarchived {r}")
+        r = b.call("group", sid=sid, name=None)
+        t.check(r.get("ok") == 1, f"ungrouped {r}")
+        en = listentry(b, sid)
+        t.check(en["state"] == "closed" and en["locked"] == 0 and
+                en["title"] == "Closed rename" and "archived" not in en and
+                "group" not in en, f"listed closed {en}")
+        t.check(sidecar(t, sid, "archived") is None and sidecar(t, sid, "group") is None,
+                "the sidecars are gone")
+        recs = logged(t, sid)
+        t.check([e["seq"] for e in recs] == list(range(1, len(recs) + 1)), "the log in order")
+        titles = [e for e in recs if e["ev"] == "title"]
+        t.check([e.get("by") for e in titles] == ["auto"] + ["user"] * 4 and
+                titles[-1]["text"] == "Closed rename", f"titles {titles}")
+        r = b.call("open", sid=sid)
+        t.check(r.get("ok") == 1 and r.get("readonly") == 0, f"free to open {r}")
+    finally:
+        if a:
+            a.close()
+        rc = b.close() if b else 0
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def draft(t):
+    """draft: an unsent prompt beside the log, which whoever writes last
+    sets, open returns, prompt clears, and which never wakes a parked
+    session."""
+    a = t.headless(env=PARK)
+    b = None
+    try:
+        sid = a.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = a.call("draft", sid=sid, text="half a thought")
+        t.check(r.get("ok") == 1 and sidecar(t, sid, "draft") == "half a thought",
+                f"drafted {r}")
+        deadline = time.monotonic() + 5
+        while not listentry(a, sid).get("parked") and time.monotonic() < deadline:
+            time.sleep(0.2)
+        r = a.call("draft", sid=sid, text="the whole thought, über alles")
+        t.check(r.get("ok") == 1, f"drafted parked {r}")
+        t.check(listentry(a, sid).get("parked") == 1, "still parked")
+
+        # Another process sees it, and may write it too
+        b = t.headless()
+        o = b.call("open", sid=sid)
+        t.check(o.get("ok") == 1 and o.get("readonly") == 1 and
+                o.get("draft") == "the whole thought, über alles", f"open elsewhere {o}")
+        t.check(b.call("draft", sid=sid, text="their version").get("ok") == 1,
+                "the last writer wins")
+        o = a.call("open", sid=sid)
+        t.check(o.get("ok") == 1 and o.get("draft") == "their version", f"open {o}")
+        r = a.call("draft", sid=sid, text="x" * ((1 << 20) + 16))
+        t.check(r.get("ok") == 0 and "too long" in r.get("err", ""), f"too long {r}")
+        t.check(sidecar(t, sid, "draft") == "their version", "unchanged")
+        r = a.call("draft", sid=sid, text=5)
+        t.check(r.get("ok") == 0, f"not text {r}")
+
+        a.send("prompt", sid=sid, text="sent now")
+        ended(a, sid, 1)
+        t.check(sidecar(t, sid, "draft") is None, "the prompt clears it")
+        o = a.call("open", sid=sid)
+        t.check(o.get("ok") == 1 and "draft" not in o, f"none {o}")
+        t.check(a.call("draft", sid=sid, text="again").get("ok") == 1, "again")
+        t.check(a.call("draft", sid=sid, text="").get("ok") == 1 and
+                sidecar(t, sid, "draft") is None, "empty removes it")
+        r = a.call("draft", sid="20260101-000000-none", text="x")
+        t.check(r.get("ok") == 0 and r.get("err") == "no such session", f"none {r}")
+    finally:
+        if b:
+            b.close()
+        rc = a.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=SMALL, bound=15)
+def gauge(t):
+    """The context's gauge: the window, the size at which it compacts and
+    the prompt's size, on attempt and turn.end, for a replay, and on live,
+    also for a session opened again before its listing is read."""
+    a = t.headless()
+    b = None
+    try:
+        sid = a.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        a.send("prompt", sid=sid, text="measure")
+        end = ended(a, sid, 1)
+        at = a.all("attempt", sid)[-1]
+        t.check(at.get("ctx") == 24000 and at.get("compact_at") == 20400 and
+                at.get("tokens", 0) > 500, f"attempt {at}")
+        t.check(end.get("ctx") == 24000 and end.get("compact_at") == 20400 and
+                end.get("tokens", 0) > 500, f"turn.end {end}")
+        running = [e for e in a.all("live", sid) if e["state"] in ("waiting", "streaming")]
+        t.check(running and all(e.get("tokens") == at["tokens"] and e.get("ctx") == 24000
+                                for e in running), f"live {running}")
+        t.check(a.close() == 0, "the first exits")
+        a = None
+
+        b = t.headless()
+        o = b.call("open", sid=sid)
+        t.check(o.get("ok") == 1, f"open {o}")
+        live = b.all("live", sid)[-1]
+        t.check(live.get("ctx") == 24000 and live.get("compact_at") == 20400 and
+                live.get("tokens", 0) > 500, f"live after open {live}")
+    finally:
+        if a:
+            a.close()
+        rc = b.close() if b else 0
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_extra": "[model {model2}]\nedit_format = patch\n"}, bound=20)
+def model_switch(t):
+    """model: another model from the next request on, while idle, kept
+    in the log and listed; the frozen prefix stays, which the reply's
+    note points out; an open naming a model still wins."""
+    a = t.headless()
+    b = c = None
+    try:
+        sid = a.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        a.send("prompt", sid=sid, text="one")
+        ended(a, sid, 1)
+        url = a.all("attempt", sid)[-1]["endpoint"]
+        r = a.call("model", sid=sid, model=t.model2)
+        t.check(r.get("ok") == 1 and r.get("model") == t.model2 and
+                r.get("endpoint") == url, f"switched {r}")
+        t.check("patch" in r.get("note", "") and "replace" in r.get("note", ""),
+                f"the note {r}")
+        m = a.all("model", sid)[-1]
+        t.check(m.get("model") == t.model2 and m.get("endpoint") == url and m.get("seq"),
+                f"model record {m}")
+        t.check(sidecar(t, sid, "model") == t.model2, "the model's sidecar")
+        t.check(listentry(a, sid)["model"] == t.model2, "listed")
+        r = a.call("model", sid=sid, model="m", endpoint="nowhere")
+        t.check(r.get("ok") == 0 and "endpoint" in r.get("err", ""), f"no endpoint {r}")
+
+        a.send("prompt", sid=sid, text="two")
+        ended(a, sid, 2)
+        reqs = t.requests(t.model2)
+        t.check(len(reqs) == 1 and reqs[0]["body"]["model"] == t.model2, "sent to it")
+        t.check(reqs[0]["body"]["tools"] == t.requests()[0]["body"]["tools"],
+                "the tools as they were")
+        t.check(a.all("attempt", sid)[-1].get("model") == t.model2, "its attempt")
+
+        # Busy: refused
+        a.send("prompt", sid=sid, text="slow")
+        a.wait(lambda e: e.get("ev") == "attempt" and e.get("sid") == sid and
+               e.get("turn") == 3)
+        r = a.call("model", sid=sid, model=t.model)
+        t.check(r.get("ok") == 0 and "busy" in r.get("err", ""), f"busy {r}")
+        ended(a, sid, 3)
+        t.check(a.close() == 0, "the first exits")
+        a = None
+
+        # Opened again: still the new model; but an open naming one wins
+        b = t.headless()
+        b.call("open", sid=sid)
+        b.send("prompt", sid=sid, text="three")
+        ended(b, sid, 4)
+        t.check(len(t.requests(t.model2)) == 3 and len(t.requests()) == 1, "kept")
+        t.check(b.close() == 0, "the second exits")
+        b = None
+        c = t.headless()
+        c.call("open", sid=sid, model=t.model)
+        c.send("prompt", sid=sid, text="four")
+        ended(c, sid, 5)
+        t.check(len(t.requests()) == 2, "the open's model")
+    finally:
+        for h in (a, b, c):
+            if h:
+                h.close()
+
+
+@scenario(conf=AN, bound=15)
+def an_model_switch(t):
+    """A model switch on Anthropic: no reasoning from before it goes to
+    the new model, which would refuse another model's signature (400)."""
+    t.put("a.txt", "hello\n")
+    h = t.headless(env=ANENV)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="first")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn")
+        r = h.call("model", sid=sid, model=t.model2)
+        t.check(r.get("ok") == 1 and r.get("model") == t.model2, f"switched {r}")
+        h.send("prompt", sid=sid, text="second")
+        t.check(ended(h, sid, 2)["why"] == "done", "the second turn")
+        t.check(not h.all("retry", sid), f"no retries {h.all('retry', sid)}")
+        reqs = [x["body"]["messages"] for x in t.requests(t.model2)]
+        t.check(len(reqs) == 2, f"two requests {len(reqs)}")
+
+        def thinking(msgs):
+            return [b for m in msgs for b in m["content"]
+                    if b.get("type") in ("thinking", "redacted_thinking")]
+        old = t.requests()[1]["body"]["messages"]
+        t.check(len(thinking(old)) == 1, f"the first model's own went back {old}")
+        t.check(not thinking(reqs[0]), f"none from before {reqs[0]}")
+        t.check(len(thinking(reqs[1])) == 1 and "model_switch_b" in
+                thinking(reqs[1])[0]["thinking"], f"the new model's own {reqs[1]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+BIG = {"_listing": {"meta": {"n_ctx": 262144, "n_ctx_train": 262144}}}
+
+
+@scenario(conf=BIG, bound=25, alone=True)
+def compact_manual(t):
+    """compact: refused with too little to summarize, logging nothing;
+    then a turn of its own summarizes all but the newest messages, with
+    the user's focus, and ends; the next prompt carries the checkpoint."""
+    bigfiles(t, 8, 256)
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        n = len(logged(t, sid))
+        r = h.call("compact", sid=sid)
+        t.check(r.get("ok") == 0 and "too little to compact" in r.get("err", ""),
+                f"too little {r}")
+        t.check(len(logged(t, sid)) == n, "nothing logged")
+        h.send("prompt", sid=sid, text="read them")
+        t.check(ended(h, sid, 1)["why"] == "done", "the reads")
+        chats = len(t.requests())
+
+        r = h.call("compact", sid=sid, focus="the numbers in f3.txt")
+        t.check(r.get("ok") == 1, f"compact {r}")
+        end = ended(h, sid, 2)
+        t.check(end["why"] == "done", f"ends done {end}")
+        turn = [e for e in h.all("turn", sid) if e.get("n") == 2]
+        t.check(turn and turn[0].get("via") == "compact", f"its turn {turn}")
+        cps = h.all("compact", sid)
+        t.check(len(cps) == 1 and cps[0]["kind"] == "summary" and cps[0]["why"] == "manual"
+                and cps[0].get("focus") == "the numbers in f3.txt" and
+                cps[0]["after"] < cps[0]["before"], f"compacted {cps}")
+        sreq = t.compactions()
+        t.check(len(sreq) == 1, f"one summary {len(sreq)}")
+        user = sreq[0]["body"]["messages"][1]["content"]
+        t.check("<focus>\nthe numbers in f3.txt\n</focus>" in user, "the focus asked for")
+        t.check(len(t.requests()) == chats, "no chat request in its turn")
+
+        h.send("prompt", sid=sid, text="again")
+        ended(h, sid, 3)
+        reqs = t.requests()
+        t.check(len(reqs) == chats + 1 and checkpointed(chat(reqs[-1])),
+                "the next request has the checkpoint")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=BIG, bound=25, alone=True)
+def compact_cancel(t):
+    """A compaction cancelled ends its turn with nothing compacted; one
+    asked for while one runs is refused; a prompt queued meanwhile runs
+    after it."""
+    bigfiles(t, 8, 256)
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="read them")
+        ended(h, sid, 1)
+        t.check(h.call("compact", sid=sid).get("ok") == 1, "compacting")
+        h.wait(lambda e: e.get("ev") == "live" and e.get("sid") == sid and
+               e.get("state") == "compacting")
+        r = h.call("compact", sid=sid)
+        t.check(r.get("ok") == 0 and "busy" in r.get("err", ""), f"busy {r}")
+        h.call("cancel", sid=sid)
+        t.check(ended(h, sid, 2)["why"] == "cancel", "cancelled")
+        t.check(not h.all("compact", sid), "nothing compacted")
+
+        t.check(h.call("compact", sid=sid).get("ok") == 1, "again")
+        h.send("prompt", sid=sid, text="queued")
+        t.check(ended(h, sid, 3)["why"] == "done", "compacted")
+        end = ended(h, sid, 4)
+        t.check(end["why"] == "done", f"then the prompt {end}")
+        cps = h.all("compact", sid)
+        t.check(len(cps) == 1 and cps[0]["why"] == "manual" and "focus" not in cps[0],
+                f"compacted {cps}")
+        t.check(checkpointed(chat(t.requests()[-1])), "the prompt after it")
+        t.check([e.get("via") for e in h.all("user", sid)][-1] == "queue", "queued")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nsubagent_model = {model2}\n"
+                          "[role pinned]\nmodel = fake/{model}\n"}, bound=20)
+def task_model(t):
+    """A subagent's model: the task's, else its role's (ENDPOINT/MODEL),
+    else what the parent's model names for its subagents; one neither
+    configured nor listed is a tool error naming the choices, with no
+    session made."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    t.check([k["model"] for k in kids] == [t.model2, t.model, t.model2],
+            f"their models {[k['model'] for k in kids]}")
+    ends = r.all("tool.end", own)
+    t.check([e["status"] for e in ends] == ["ok", "ok", "ok", "error"], f"statuses {ends}")
+    t.check([e["text"] for e in ends[:3]] ==
+            [f"Child on {t.model2}.", f"Child on {t.model}.", f"Child on {t.model2}."],
+            f"reports {ends}")
+    err = ends[3]["text"]
+    t.check('no model "fake:no_such_model"' in err and t.model in err and
+            "Give one of these" in err, f"the error {err}")
+    t.check(not ends[3].get("child"), "no child")
+    if isinstance(t.host, LocalHost):
+        made = os.listdir(t.host.join(t.state, "sessions"))
+        t.check(len(made) == 4, f"four sessions {made}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

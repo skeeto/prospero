@@ -131,7 +131,7 @@ static void test_compact(Test *t)
         ModelConf mc = {};
         mc.name     = "m";
         mc.llamacpp = 1;
-        Str     body = encodesummary(a, tmp, &mc, "old", "[user]\nhi\n\n", 300);
+        Str     body = encodesummary(a, tmp, &mc, "old", "[user]\nhi\n\n", 300, {});
         JsonDoc d    = jsonparse(a, body);
         expect(t, "summary request parses", istr(a, d.ok), "1");
         expect(t, "summary no tools",
@@ -148,6 +148,32 @@ static void test_compact(Test *t)
         expect(t, "summary conversation",
                istr(a, endswith(user, "<conversation>\n[user]\nhi\n\n</conversation>\n")), "1");
         expect(t, "summary llama.cpp", istr(a, find(body, "\"reasoning_control\":true") > 0), "1");
+        expect(t, "summary no focus", istr(a, find(user, "<focus>")), "-1");
+
+        // A focus from the user: a paragraph before the conversation
+        Str focused = summaryprompt(a, {}, "[user]\nhi\n\n", 300, "the parser's API");
+        iz  at      = find(focused, "<focus>\nthe parser's API\n</focus>\n");
+        expect(t, "summary focus", istr(a, at>0 && at<find(focused, "<conversation>")), "1");
+        expect(t, "summary focus asks", istr(a, find(focused, "more detail about") > 0), "1");
+        Str an = ansummary(a, tmp, &mc, {}, "[user]\nhi\n\n", 300, "the parser's API");
+        expect(t, "summary focus anthropic", istr(a, find(an, "\\u003cfocus>") > 0 ||
+               find(an, "<focus>") > 0), "1");
+    }
+
+    // A compaction asked for: the tokens it would summarize, all but the
+    // newest COMPACT_KEEP
+    {
+        Rate       none = {};
+        Slice<Msg> h    = {};
+        expect(t, "compactable none", istr(a, compactable(h, 0, none)), "0");
+        for (i32 i = 0; i < 4; i++) {
+            h = push(a, h, testmsg(a, ROLE_USER, 40000, {}));  // 10000 tokens
+        }
+        i64 one = tokensof(none, msgbytes(&h[0]));  // just over 10000
+        expect(t, "compactable", istr(a, compactable(h, 0, none)), istr(a, 3*one));
+        expect(t, "compactable after a summary", istr(a, compactable(h, 1, none)),
+               istr(a, 2*one));
+        expect(t, "compactable all kept", istr(a, compactable(h, 3, none)), "0");
     }
 
     // Checkpoints and files

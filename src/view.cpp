@@ -1193,6 +1193,12 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->title = clone(&v->aux, jsonstr(jsonget(j, "text")));
         return 1;
 
+    case EV_MODEL:
+        // Switched for the rest of the session (model)
+        v->model    = clone(&v->aux, jsonstr(jsonget(j, "model")));
+        v->endpoint = clone(&v->aux, jsonstr(jsonget(j, "endpoint")));
+        return 1;
+
     case EV_USER: {
         dropprov(v);
         Str via = jsonstr(jsonget(j, "via"));
@@ -1219,6 +1225,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             v->msgs[i].seq        = r->seq;
             v->msgs[i].label      = "Resumed by itself";
             v->msgs[i].startsturn = v->turn;
+        } else if (via == "compact") {
+            // Asked for by the user (compact), with no message of its
+            // own: its card (EV_COMPACT) says what it did
         } else if (v->msgs.len) {
             ViewMsg *m = &v->msgs[v->msgs.len-1];
             if (m->role==VIEW_USER && !m->startsturn && m->label!="You (steering)") {
@@ -1537,7 +1546,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         Str       kind = jsonstr(jsonget(j, "kind"));
         ViewCard *c    = alloc<ViewCard>(&v->aux);
         c->kind   = kind=="summary" ? Str("summary") : Str("prune");
-        c->why    = jsonstr(jsonget(j, "why"))=="overflow" ? Str("overflow") : Str("threshold");
+        Str why   = jsonstr(jsonget(j, "why"));
+        c->why    = why=="overflow" ? Str("overflow") :
+                    why=="manual"   ? Str("manual")   : Str("threshold");
         c->before = jsonint(jsonget(j, "before"), 0);
         c->after  = jsonint(jsonget(j, "after"), 0);
         c->model  = clone(&v->aux, jsonstr(jsonget(j, "model")));

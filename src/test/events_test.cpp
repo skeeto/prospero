@@ -100,7 +100,8 @@ static void test_events(Test *t)
                "\"rewind\",\"job.kill\",\"status\",\"stop\",\"file\",\"rename\",\"delete\","
                "\"archive\",\"group\",\"fork\",\"compact\",\"model\",\"draft\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
-               "\"subagents\"]}");
+               "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
+               "\"compact\",\"model\",\"gauge\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);

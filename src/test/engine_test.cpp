@@ -275,6 +275,105 @@ static void testsidecars(Test *t)
     expect(t, "borrow parked, its log gone", istr(&a,
            !borrow(e, v.scratch, q.sid, &transient) && e->parked.len==1 &&
            !os_lockheld(v.os, a, "/s/sessions/20260101-000009-gone/lock")), "1");
+
+    // The commands: a draft past DRAFT_MAX refused, one written over
+    // another process's lock, as the last writer wins, where archive and
+    // group are refused, and a group's name checked
+    e->out = newmailbox(&a, 1<<16, 0, 0);
+    Buf big(&a, DRAFT_MAX + 128);
+    print(&big, "{\"cmd\":\"draft\",\"id\":1,\"sid\":\"20260101-000001-bbbb\",\"text\":\"");
+    for (iz i = 0; i < DRAFT_MAX+1; i++) {
+        putbyte(&big, 'x');
+    }
+    print(&big, "\"}");
+    Str cmds[] = {
+        finish(&big),
+        "{\"cmd\":\"draft\",\"id\":2,\"sid\":\"20260101-000001-bbbb\",\"text\":\"mine\"}",
+        "{\"cmd\":\"archive\",\"id\":3,\"sid\":\"20260101-000001-bbbb\"}",
+        "{\"cmd\":\"group\",\"id\":4,\"sid\":\"20260101-000001-bbbb\",\"name\":\"g\"}",
+        "{\"cmd\":\"group\",\"id\":5,\"sid\":\"20260101-000000-aaaa\",\"name\":\" a\\tb \"}",
+        "{\"cmd\":\"group\",\"id\":6,\"sid\":\"20260101-000000-aaaa\"}",
+        "{\"cmd\":\"group\",\"id\":7,\"sid\":\"20260101-000000-aaaa\",\"name\":\" Mine \"}",
+        "{\"cmd\":\"archive\",\"id\":8,\"sid\":\"20260101-000000-aaaa\",\"on\":true}",
+        "{\"cmd\":\"draft\",\"id\":9,\"sid\":\"20260101-000000-aaaa\",\"text\":7}",
+    };
+    for (iz i = 0; i < countof(cmds); i++) {
+        command(e, v.scratch, cmds[i]);
+    }
+    Buf  got(&a, 1024);
+    Mail m = mailtake(e->out);
+    for (Record r; (r = mailnext(&m)).ok;) {
+        EvRec rec = evparse(&a, r.data);
+        print(&got, jsonint(jsonget(rec.root, "id"), 0));
+        putbyte(&got, jsonint(jsonget(rec.root, "ok"), 0) ? '+' : '-');
+        print(&got, jsonstr(jsonget(rec.root, "err")));
+        putbyte(&got, '\n');
+    }
+    expect(t, "sidecar commands", finish(&got),
+           "1-the draft is too long: at most 1 MiB\n"
+           "2+\n"
+           "3-open in another process\n"
+           "4-open in another process\n"
+           "5-name must be one line of text, or null to leave the group\n"
+           "6-name must be one line of text, or null to leave the group\n"
+           "7+\n"
+           "8+\n"
+           "9-text must be a string\n");
+    expect(t, "sidecar commands wrote", concat(&a,
+           sidecarget(e, &a, "20260101-000001-bbbb", "draft", 64), concat(&a, "|",
+           concat(&a, sidecarget(e, &a, aaaa, "group", 64), concat(&a, "|",
+           sidecarget(e, &a, aaaa, "archived", 64))))), "mine|Mine|1");
+}
+
+// Models as settings name them: ENDPOINT/MODEL only where ENDPOINT is a
+// configured endpoint, so that a model named with a slash stays whole;
+// and a subagent's model, known by its section or its endpoint's
+// listing, or anything at an endpoint never listed.
+static void testtargets(Test *t)
+{
+    Arena   a = t->perm;
+    CfgEnv  v = newcfgenv(&a);
+    os_write(v.os, a, "/r/h.ini",
+             "[endpoint fast]\nurl = http://fast/v1\n"
+             "[endpoint Qwen]\nkind = openai\n"  // no url: not an endpoint
+             "[model small]\n[model big]\n");
+    Engine *e   = alloc<Engine>(&a);
+    byte   *mem = alloc<byte>(&a, 1<<16);
+    e->os   = v.os;
+    e->perm = {mem, mem + (1<<16)};
+    e->cfg  = newconfig(v.os, &a, v.scratch, "/r/h.ini", 0);
+    e->ini  = e->cfg->ini;
+
+    struct { Str spec; Str want; } specs[] = {
+        {"small",             "home|small"},
+        {"fast/small",        "fast|small"},
+        {"Qwen/Qwen3-8B",     "home|Qwen/Qwen3-8B"},
+        {"org/model",         "home|org/model"},
+        {"fast/org/model",    "fast|org/model"},
+        {"fast/",             "home|fast/"},
+        {"/small",            "home|/small"},
+        {"",                  "home|"},
+    };
+    for (iz i = 0; i < countof(specs); i++) {
+        Target got = targetof(e, specs[i].spec, "home");
+        expect(t, concat(&a, "targetof ", specs[i].spec),
+               concat(&a, concat(&a, got.which, "|"), got.model), specs[i].want);
+    }
+
+    Str url = "http://fast/v1";
+    expect(t, "submodel never listed", submodel(e, &a, v.scratch, "any", url), "");
+    notekinds(e, v.scratch, url, "{\"data\":[{\"id\":\"listed\"},{\"id\":\"small\"},"
+                                 "{\"id\":\"other\"}]}");
+    expect(t, "submodel listed", submodel(e, &a, v.scratch, "listed", url), "");
+    expect(t, "submodel configured", submodel(e, &a, v.scratch, "big", url), "");
+    expect(t, "submodel unknown", submodel(e, &a, v.scratch, "nope", url),
+           "No subagent was started: no model \"nope\" is configured or listed "
+           "at http://fast/v1. Give one of these, or none for the default: "
+           "small, big, listed, other.");
+    notekinds(e, v.scratch, url, "{\"data\":[{\"id\":\"nope\"}]}");
+    expect(t, "submodel listed anew", submodel(e, &a, v.scratch, "nope", url), "");
+    expect(t, "submodel listed no more", istr(&a,
+           submodel(e, &a, v.scratch, "listed", url).len > 0), "1");
 }
 
 static void test_engine(Test *t)
@@ -282,6 +381,7 @@ static void test_engine(Test *t)
     testroles(t);
     testlist(t);
     testsidecars(t);
+    testtargets(t);
     Arena *a = &t->perm;
 
     Str long60 = "Refactor the parser so that it handles nested quotes and "
@@ -301,7 +401,7 @@ static void test_engine(Test *t)
         {"tab\x7f" "del\xc2\xa0nbsp", "tab del nbsp"},
     };
     for (iz i = 0; i < countof(titles); i++) {
-        expect(t, concat(a, "title ", titles[i].in), maketitle(a, titles[i].in),
+        expect(t, concat(a, "title ", titles[i].in), cleantitle(a, titles[i].in, TITLE_MAX),
                titles[i].want);
     }
 
@@ -311,10 +411,10 @@ static void test_engine(Test *t)
         print(&b, "\xc3\xa9");
     }
     Str sixty = finish(&b);
-    expect(t, "title of 60 code points", maketitle(a, sixty), sixty);
+    expect(t, "title of 60 code points", cleantitle(a, sixty, TITLE_MAX), sixty);
     Str more = concat(a, sixty, "\xc3\xa9");
     expect(t, "title of 61 code points",
-           maketitle(a, more), concat(a, sixty, "\xe2\x80\xa6"));
+           cleantitle(a, more, TITLE_MAX), concat(a, sixty, "\xe2\x80\xa6"));
 
     // No space in its second half: cut inside the long word
     Buf in(a, 128);
@@ -323,8 +423,24 @@ static void test_engine(Test *t)
         putbyte(&in, 'a');
     }
     Str word = finish(&in);
-    expect(t, "title cut in a word", maketitle(a, word),
+    expect(t, "title cut in a word", cleantitle(a, word, TITLE_MAX),
            concat(a, takehead(word, 60), "\xe2\x80\xa6"));
+
+    // A user's title (rename) goes to 120 code points, on one line
+    Buf rn(a, 512);
+    Buf rw(a, 512);
+    for (i32 i = 0; i < 26; i++) {
+        print(&rn, i&1 ? Str("word\n") : Str("word\t"));
+        if (i < 24) {
+            print(&rw, i ? Str(" word") : Str("word"));  // 119 code points
+        }
+    }
+    Str words = finish(&rn);
+    expect(t, "user title cut", cleantitle(a, words, RENAME_MAX),
+           concat(a, finish(&rw), "\xe2\x80\xa6"));
+    expect(t, "user title fits", cleantitle(a, takehead(words, 30), RENAME_MAX),
+           "word word word word word word");
+    expect(t, "user title blank", istr(a, cleantitle(a, " \t\r\n\x7f ", RENAME_MAX).len), "0");
 
     // The id of a command too long to parse, from its start
     struct { Str line; i64 want; } ids[] = {
@@ -412,9 +528,9 @@ static void test_engine(Test *t)
                "11-the engine is stopping\n"
                "12-the engine is stopping\n"
                "13-the engine is stopping\n"
-               "14-not implemented yet\n"
-               "15-not implemented yet\n"
-               "16-not implemented yet\n"
+               "14-no such session\n"
+               "15-no such session\n"
+               "16-no such session\n"
                "17-invalid session id\n"
                "8-command too long\n");
         Buf want(a, 1024);
@@ -463,15 +579,15 @@ static void test_engine(Test *t)
         }
         expect(t, "the commands to come", finish(&got),
                "1-not implemented yet @2026\n"
-               "2-not implemented yet @2026\n"
-               "3-not implemented yet @2026\n"
+               "2-no such session @2026\n"
+               "3-no such session @2026\n"
                "4-not implemented yet @2026\n"
-               "5-not implemented yet @2026\n"
+               "5-no such session @2026\n"
                "6-invalid session id\n"
                "7-invalid session id\n"
-               "8-no such open session @2026\n"
+               "8-no such session @2026\n"
                "9-no such open session @2026\n"
-               "10-no such open session @2026\n"
+               "10-no such session @2026\n"
                "11-invalid session id\n");
     }
 }

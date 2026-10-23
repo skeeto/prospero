@@ -713,6 +713,33 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.cut", concat(&a, c->card->why, istr(&a, v->cutseq)), "overflow5");
     }
 
+    // A compaction the user asked for: its turn starts at no message,
+    // the prompt before keeps its own turn, and the card says manual; a
+    // model switch, and titles by whoever set them
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w","model":"m","endpoint":"http://a/"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"user","text":"go"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"title","text":"go","by":"auto"})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"turn.end","turn":1,"why":"done",)"
+                    R"("ctx":1000,"compact_at":850,"tokens":12})");
+        apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"user","text":"queued, then cancelled"})");
+        apply(v, a, R"({"sid":"s","seq":7,"ts":0,"ev":"turn","n":2,"via":"compact"})");
+        expect(t, "panels.compactturn", concat(&a, istr(&a, v->msgs[0].startsturn),
+               istr(&a, v->msgs[1].startsturn)), "10");
+        apply(v, a, R"({"sid":"s","seq":8,"ts":0,"ev":"compact","turn":2,"kind":"summary","why":"manual",)"
+                    R"("before":500,"after":100,"cutseq":6,"summary":"S","model":"m","ms":7,"focus":"f"})");
+        apply(v, a, R"({"sid":"s","seq":9,"ts":0,"ev":"turn.end","turn":2,"why":"done"})");
+        ViewMsg *c = &v->msgs[v->msgs.len-1];
+        expect(t, "panels.manual", concat(&a, c->card->why, istr(&a, v->busy)), "manual0");
+        apply(v, a, R"({"sid":"s","seq":10,"ts":0,"ev":"model","endpoint":"http://b/","model":"n","ctx":9})");
+        apply(v, a, R"({"sid":"s","seq":11,"ts":0,"ev":"title","text":"Mine","by":"user"})");
+        expect(t, "panels.switched", concat(&a, concat(&a, v->model, v->endpoint), v->title),
+               "nhttp://b/Mine");
+    }
+
     // A turn the session began by itself, its notice folded; liveness
     {
         Arena a = perm;
