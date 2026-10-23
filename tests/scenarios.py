@@ -517,8 +517,17 @@ class T:
         self.work = host.join(base, "work")
         self.state = host.join(base, "state")
         self.config = host.join(base, "prospero.ini")
+        # The system's temporary directory, the run's own, for the
+        # sessions' scratch directories (os_scratchdir)
+        self.tmp = host.join(base, "tmp")
         host.mkdir(self.work)
         host.mkdir(self.state)
+        host.mkdir(self.tmp)
+        if host.windows:
+            win = self.tmp.replace("/", "\\")
+            self.tmpenv = {"TMP": win, "TEMP": win}
+        else:
+            self.tmpenv = {"TMPDIR": self.tmp}
         # Endpoint settings, with "_top" settings before any section,
         # "_path" after the endpoint's URL, "_extra" as more sections,
         # where {model} and {model2} are the scenario's model names, and
@@ -529,6 +538,10 @@ class T:
         path = conf.pop("_path", "")
         extra = conf.pop("_extra", "")
         sections = {k[1:]: conf.pop(k) for k in list(conf) if k.startswith("_")}
+        # The run's directories may be in /tmp (Linux), where the paths
+        # "outside" that scenarios ask about would need no asking with
+        # [guard] temp = allow: that only where a scenario says so
+        sections.setdefault("guard", {}).setdefault("temp", "ask")
         ini = {"first_byte_timeout": 5, "idle_timeout": 3,
                "progress_timeout": 6, "connect_timeout": 2}
         ini.update(conf)
@@ -553,7 +566,7 @@ class T:
         if prompt:
             args.append(prompt)
         t0 = time.monotonic()
-        p = self.host.popen(args, self.work, env=env)
+        p = self.host.popen(args, self.work, env=dict(self.tmpenv, **(env or {})))
         lines = []
         killer = threading.Timer(timeout, p.kill)
         killer.start()
@@ -629,7 +642,8 @@ class T:
 class Headless:
     def __init__(self, t, env=None):
         self.t = t
-        self.p = t.host.popen(["--headless"] + t.args(), t.work, stdin=True, env=env)
+        self.p = t.host.popen(["--headless"] + t.args(), t.work, stdin=True,
+                              env=dict(t.tmpenv, **(env or {})))
         self.events = []
         self.cond = threading.Condition()
         self.reader = threading.Thread(target=self.read, daemon=True)
@@ -1840,8 +1854,8 @@ def readonly(t):
 @scenario(bound=10)
 def hello_caps(t):
     """hello names every command (cmds) and the engine's features (caps);
-    the commands of M8 are named already, those still to come refused
-    for now without touching the session it names."""
+    the commands of M8 refuse a session that is not there, or a turn that
+    is not, without touching the session named."""
     h = t.headless()
     try:
         r = h.call("hello", proto=0, client="scenarios")
@@ -1861,9 +1875,9 @@ def hello_caps(t):
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
                 {"close.forget", "config.refresh", "file.base64", "desktop",
                  "subagents", "rename", "title.by", "archive", "group", "draft",
-                 "compact", "model", "gauge"} <= set(caps) and "host" not in caps,
+                 "compact", "model", "gauge", "answer.always", "scratch", "delete",
+                 "fork"} <= set(caps) and "host" not in caps,
                 f"caps: {caps}")
-        later = ["delete", "fork"]  # still to come
 
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
         local = isinstance(t.host, LocalHost)
@@ -1871,16 +1885,14 @@ def hello_caps(t):
         before = sorted(os.listdir(state)) if local else None
         log = t.host.read(t.host.join(state, "events.jsonl"))
         seen = len([e for e in h.events if e.get("sid") == sid and "seq" in e])
-        fields = {"fork": {"turn": 1}}
-        for cmd in later:
-            r = h.call(cmd, sid=sid, **fields.get(cmd, {}))
-            t.check(r.get("ok") == 0 and r.get("err") == "not implemented yet" and
-                    r.get("sid") == sid, f"{cmd}: {r}")
+        r = h.call("fork", sid=sid, turn=1)
+        t.check(r.get("ok") == 0 and r.get("err") == "no turn 1 in this session" and
+                r.get("sid") == sid, f"fork: {r}")
         for cmd in ("delete", "archive", "group", "fork", "draft", "rename", "model"):
             # Commands on a session open here or not
             r = h.call(cmd, sid="20260101-000000-none", title="t", model="m", name="g")
-            want = "not implemented yet" if cmd in later else "no such session"
-            t.check(r.get("ok") == 0 and r.get("err") == want, f"{cmd} on another: {r}")
+            t.check(r.get("ok") == 0 and r.get("err") == "no such session",
+                    f"{cmd} on another: {r}")
             for bad in ("../" + sid, "a\\b", "", "C:x", ".x"):
                 r = h.call(cmd, sid=bad)
                 t.check(r.get("ok") == 0 and r.get("err") == "invalid session id",
@@ -2157,7 +2169,7 @@ def config_seed(t):
     byte, and it loads without a single diagnostic."""
     xdg = t.host.join(t.base, "xdg")
     p = t.host.popen(["--headless", "--state", t.state], t.work, stdin=True,
-                     env={"XDG_CONFIG_HOME": xdg})
+                     env=dict(t.tmpenv, XDG_CONFIG_HOME=xdg))
     out, err = p.communicate('{"cmd":"config.get","id":1}\n', timeout=10)
     replies = [json.loads(x) for x in out.splitlines() if x.strip()]
     r = next((e for e in replies if e.get("id") == 1), {})
@@ -2407,7 +2419,7 @@ def compaction(t):
     """A small window: the older reads are summarized, the newest stay
     verbatim, the turn carries on, and a resumed session replays the
     compaction to the same prompt."""
-    bigfiles(t, 8, 160)
+    bigfiles(t, 8, 150)
     r = t.run()
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     t.check(r.text() == "All files read.", f"text {r.text()!r}")
@@ -3615,7 +3627,7 @@ def rawlines(r):
 def pretty(t):
     """--pretty tells of retries and compactions, and of instruction files
     only when there are some."""
-    bigfiles(t, 8, 160)
+    bigfiles(t, 8, 150)
     r = t.run(extra=("--pretty",))
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     out = rawlines(r)
@@ -4140,7 +4152,7 @@ def evalrun(t, suite, models, extra=(), out="results.jsonl", timeout=60):
     path = t.host.join(t.base, out)
     args = ["eval", "-c", t.config, "--state", t.state, "-e", "fake", "-o", path,
             "-m", ",".join(models)] + list(extra) + [root]
-    p = t.host.popen(args, t.work)
+    p = t.host.popen(args, t.work, env=t.tmpenv)
     try:
         stdout, stderr = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -4226,7 +4238,7 @@ def eval_formats(t):
             f"again: {rc} {len(again)} {err[-500:]}")
     t.check(out2 == out, "the same summary")
     p = t.host.popen(["eval", "--report", "-c", t.config,
-                      t.host.join(t.base, "results.jsonl")], t.work)
+                      t.host.join(t.base, "results.jsonl")], t.work, env=t.tmpenv)
     report, _ = p.communicate(timeout=20)
     t.check(p.returncode == 0 and report == out, f"--report:\n{report}")
 
@@ -4892,6 +4904,476 @@ def task_model(t):
     if isinstance(t.host, LocalHost):
         made = os.listdir(t.host.join(t.state, "sessions"))
         t.check(len(made) == 4, f"four sessions {made}")
+
+
+# M8, session operations, part 2
+
+def nextask(h, sid=None, after=0):
+    """The first ask, of sid or of any session, logged after seq after."""
+    return h.wait(lambda e: e.get("ev") == "ask" and (sid is None or e.get("sid") == sid)
+                  and e.get("seq", 0) > after)
+
+
+def gone(t, path, within=10.0):
+    """Whether a path on the host is gone, or goes within the time."""
+    deadline = time.monotonic() + within
+    while True:
+        if isinstance(t.host, LocalHost):
+            there = os.path.lexists(path)
+        else:
+            there = t.host.sh(f"test -e {shlex.quote(path)} && echo y || echo n").strip() == "y"
+        if not there:
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.2)
+
+
+@scenario(bound=20)
+def always(t):
+    """answer always: the ask offers its directory (a search's, itself),
+    the answer and a grant are logged before the call starts, the next
+    call there does not ask, nor one in a later process; a read grant
+    still asks for writes."""
+    for d in ("ext", "ro", "gl"):
+        t.host.mkdir(t.host.join(t.base, d))
+    t.host.write(t.host.join(t.base, "ro", "x.txt"), "x\n")
+    t.host.write(t.host.join(t.base, "gl", "g.txt"), "hello\n")
+    a = t.headless()
+    b = None
+    try:
+        sid = a.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        a.send("prompt", sid=sid, text="write")
+        ask = nextask(a, sid)
+        ext = ask.get("always", "")
+        t.check(ext.endswith("/ext") and ask.get("access") == "write" and
+                ask.get("path", "").endswith("/ext/a.txt"), f"the ask offers its directory: {ask}")
+        r = a.call("answer", sid=sid, req=ask["req"], decision="always", note="go ahead")
+        t.check(r.get("ok") == 1, f"answered {r}")
+        t.check(ended(a, sid, 1)["why"] == "done", "the turn ends")
+        names = [n for n in a.names(sid)
+                 if n in ("ask", "answer", "grant", "tool.start", "tool.end")]
+        t.check(names == ["ask", "answer", "grant", "tool.start", "tool.end", "tool.start",
+                          "tool.end"], f"one ask, then none beside it: {names}")
+        ans = a.all("answer", sid)[0]
+        t.check(ans["decision"] == "allow" and ans["by"] == "user" and ans.get("always") == 1,
+                f"the answer: {ans}")
+        g = a.all("grant", sid)[0]
+        t.check(g["path"] == ext and g["access"] == "write" and g["by"] == "user" and
+                g["req"] == ask["req"] and g["seq"] == ans["seq"] + 1, f"the grant: {g}")
+        for f, want in (("a.txt", "a\n"), ("b.txt", "b\n")):
+            got = t.host.read(t.host.join(t.base, "ext", f))
+            t.check(got == want, f"{f}: {got!r}")
+
+        # A read grant asks for a write
+        a.send("prompt", sid=sid, text="read")
+        ask = nextask(a, sid, ask["seq"])
+        t.check(ask.get("tool") == "read" and ask.get("access") == "read" and
+                ask.get("always", "").endswith("/ro"), f"a read's ask: {ask}")
+        a.call("answer", sid=sid, req=ask["req"], decision="always")
+        ask = nextask(a, sid, ask["seq"])
+        t.check(ask.get("tool") == "write" and ask.get("access") == "write", f"asked: {ask}")
+        a.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(a, sid, 2)
+        t.check(t.host.read(t.host.join(t.base, "ro", "y.txt")) is None, "not written")
+        g = a.all("grant", sid)[-1]
+        t.check(g["access"] == "read" and g["path"].endswith("/ro"), f"a read grant: {g}")
+
+        # A search's directory is granted itself
+        a.send("prompt", sid=sid, text="search")
+        ask = nextask(a, sid, ask["seq"])
+        t.check(ask.get("tool") == "glob" and ask.get("always", "").endswith("/gl") and
+                ask.get("access") == "read", f"a search's ask: {ask}")
+        r = a.call("answer", sid=sid, req="nope", decision="always")
+        t.check(r.get("ok") == 0, f"the wrong request: {r}")
+        a.call("answer", sid=sid, req=ask["req"], decision="always")
+        ended(a, sid, 3)
+        te = [e for e in a.all("tool.end", sid)][-2:]
+        t.check([e["status"] for e in te] == ["ok", "ok"] and "g.txt" in te[1]["text"],
+                f"searched: {te}")
+        t.check(len(a.all("ask", sid)) == 4, f"no more asks: {len(a.all('ask', sid))}")
+        t.check(a.close() == 0, "the first exits")
+        a = None
+
+        # Another process: the grants hold
+        b = t.headless()
+        o = b.call("open", sid=sid, attended=1)
+        t.check(o.get("ok") == 1, f"open {o}")
+        last = max(e["seq"] for e in b.all("grant", sid))
+        b.send("prompt", sid=sid, text="again")
+        t.check(ended(b, sid, 4)["why"] == "done", "the turn ends")
+        new = [e for e in b.all("ask", sid) if e["seq"] > last]
+        t.check(not new, f"no ask: {new}")
+        t.check(t.host.read(t.host.join(t.base, "ext", "c.txt")) == "c\n", "written")
+    finally:
+        if a:
+            a.close()
+        rc = b.close() if b else 0
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def always_task(t):
+    """A subagent starts with its parent's grants (logged in it, by
+    "parent"); one it is given is logged in it and in its root (by
+    "subagent"), and holds for the whole tree from then on."""
+    t.host.mkdir(t.host.join(t.base, "ext"))
+    t.host.mkdir(t.host.join(t.base, "sub"))
+    t.host.write(t.host.join(t.base, "sub", "s.txt"), "s\n")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ask = nextask(h, sid)
+        h.call("answer", sid=sid, req=ask["req"], decision="always")
+        kask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") != sid)
+        kid = kask["sid"]
+        t.check(kask.get("tool") == "read" and kask.get("always", "").endswith("/sub"),
+                f"the subagent's ask: {kask}")
+        h.call("answer", sid=kid, req=kask["req"], decision="always")
+        t.check(ended(h, sid, 1)["why"] == "done", "the parent ends")
+        t.check(len(h.all("ask", sid)) == 1 and len(h.all("ask", kid)) == 1,
+                f"no more asks: {len(h.all('ask', sid))} {len(h.all('ask', kid))}")
+        kg = [(g["by"], g["access"], g["path"].rsplit("/", 1)[-1]) for g in logged(t, kid)
+              if g["ev"] == "grant"]
+        t.check(kg == [("parent", "write", "ext"), ("user", "read", "sub")],
+                f"the subagent's grants: {kg}")
+        pg = [g for g in logged(t, sid) if g["ev"] == "grant"]
+        t.check([(g["by"], g["access"]) for g in pg] == [("user", "write"),
+                                                         ("subagent", "read")] and
+                pg[1].get("from") == kid and pg[1].get("req") == kask["req"],
+                f"the root's grants: {pg}")
+        t.check(t.host.read(t.host.join(t.base, "ext", "child.txt")) == "c\n",
+                "the subagent wrote without asking")
+        te = h.all("tool.end", sid)
+        t.check(te[-1]["status"] == "ok" and te[-1]["text"].rstrip().endswith("s"),
+                f"read {te[-1]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+def scratchof(h, sid):
+    return h.all("session", sid)[0].get("scratch", "")
+
+
+@scenario(conf={"_guard": {"temp": "allow"}}, bound=20)
+def temp(t):
+    """A session's scratch directory, named in its system prompt, made in
+    the temporary directory (the run's own TMPDIR here) and the user's
+    alone; the temporary directory needs no asking, but a link there
+    leading elsewhere does, and /tmp is allowed as it really is."""
+    h = t.headless()
+    local = isinstance(t.host, LocalHost) and not t.host.windows
+    mark = f"/tmp/prospero-scen-{t.nonce}.txt"
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        scratch = scratchof(h, sid)
+        base = scratch.rsplit("/", 1)[0]
+        t.check(scratch.endswith("/" + sid) and
+                base.rsplit("/", 1)[-1] in ("prospero", f"prospero-{os.geteuid() if local else ''}"),
+                f"the scratch directory: {scratch}")
+        if local:
+            st = os.stat(base)
+            t.check(st.st_mode & 0o777 == 0o700 and st.st_uid == os.geteuid() and
+                    os.path.realpath(base) == os.path.realpath(
+                        os.path.join(t.tmp, f"prospero-{os.geteuid()}")) and
+                    os.path.isdir(scratch), f"its base: {oct(st.st_mode)}")
+        h.send("prompt", sid=sid, text="files")
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn ends")
+        t.check(not h.all("ask", sid), f"no asks: {h.all('ask', sid)}")
+        system = t.requests()[0]["body"]["messages"][0]["content"]
+        t.check(f"Put scratch files (notes, test inputs, output you will not keep) in "
+                f"{scratch}, which is this session's own" in system, f"the prompt: {system}")
+        t.check(t.host.read(t.host.join(scratch, "s.txt")) == "s\n" and
+                t.host.read(t.host.join(base.rsplit("/", 1)[0], "t.txt")) == "t\n",
+                "written in the scratch and temporary directories")
+        if local:
+            # To a directory outside every temporary one (the run's own
+            # are in /tmp on Linux), which the write is never let into
+            os.symlink("/etc", os.path.join(base.rsplit("/", 1)[0], "link"))
+            h.send("prompt", sid=sid, text="link")
+            ask = nextask(h, sid)
+            t.check("symbolic link" in ask.get("detail", ""), f"through the link: {ask}")
+            h.call("answer", sid=sid, req=ask["req"], decision="deny")
+            ended(h, sid, 2)
+            te = h.all("tool.end", sid)[-1]
+            t.check(te["status"] == "denied", f"not written: {te}")
+            h.send("prompt", sid=sid, text=mark)
+            ended(h, sid, 3)
+            t.check(len(h.all("ask", sid)) == 1, f"/tmp is allowed: {h.all('ask', sid)}")
+            with open(mark) as f:
+                t.check(f.read() == "slash tmp\n", "written in /tmp")
+    finally:
+        if local and os.path.lexists(mark):
+            os.unlink(mark)
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15, posix=True)
+def temp_planted(t):
+    """The scratch directories' base is the user's alone: a link planted
+    in its place gets no session's files, and a base open to others is
+    closed; a scratch directory purged is made again on reopening."""
+    if not isinstance(t.host, LocalHost):
+        raise Skip("plants a link here")
+    base = os.path.join(t.tmp, f"prospero-{os.geteuid()}")
+    elsewhere = os.path.join(t.base, "elsewhere")
+    os.mkdir(elsewhere)
+    os.symlink(elsewhere, base)
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        t.check(not scratchof(h, sid), f"no scratch directory: {h.all('session', sid)}")
+        t.check(not os.listdir(elsewhere), "nothing made through the link")
+        os.unlink(base)
+        os.mkdir(base, 0o755)
+        os.chmod(base, 0o755)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        scratch = scratchof(h, sid)
+        t.check(os.path.isdir(scratch) and os.stat(base).st_mode & 0o777 == 0o700,
+                f"made private: {oct(os.stat(base).st_mode)}")
+        h.call("close", sid=sid)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    os.rmdir(scratch)
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        t.check(os.path.isdir(scratch), "the scratch directory is made again")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"temp": "ask"}}, bound=15)
+def temp_ask(t):
+    """[guard] temp = ask: the temporary directory needs asking, the
+    session's scratch directory never."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        scratch = scratchof(h, sid)
+        h.send("prompt", sid=sid, text="files")
+        ask = nextask(h, sid)
+        t.check(ask.get("path", "").endswith("/t.txt"), f"the temporary directory asks: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(h, sid, 1)
+        t.check(len(h.all("ask", sid)) == 1, "the scratch directory did not ask")
+        t.check(t.host.read(t.host.join(scratch, "s.txt")) == "s\n", "written")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def delete(t):
+    """delete: a session and its subagent, gone with the scratch directory,
+    children first; a link in out/ is removed, its target left alone; a
+    subagent cannot be forked."""
+    h = t.headless()
+    local = isinstance(t.host, LocalHost) and not t.host.windows
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="task")
+        ended(h, sid, 1)
+        kids = [e["sid"] for e in h.all("session") if e.get("parent") == sid]
+        t.check(len(kids) == 1, f"one subagent: {kids}")
+        kid = kids[0]
+        scratch = scratchof(h, sid)
+        t.check(scratchof(h, kid) == scratch, "the subagent shares it")
+        t.host.write(t.host.join(scratch, "note.txt"), "n")
+        sdir = t.host.join(t.state, "sessions", sid)
+        kdir = t.host.join(t.state, "sessions", kid)
+        if local:
+            target = os.path.join(t.base, "target.txt")
+            tdir = os.path.join(t.base, "targetdir")
+            os.mkdir(tdir)
+            for p in (target, os.path.join(tdir, "inner.txt")):
+                with open(p, "w") as f:
+                    f.write("keep")
+            os.symlink(target, os.path.join(sdir, "out", "link"))
+            os.symlink(tdir, os.path.join(sdir, "out", "dirlink"))
+            ro = os.path.join(sdir, "out", "ro")
+            os.mkdir(ro)
+            with open(os.path.join(ro, "f"), "w") as f:
+                f.write("r")
+            os.chmod(os.path.join(ro, "f"), 0o400)
+            os.chmod(ro, 0o500)
+        r = h.call("fork", sid=kid)
+        t.check(r.get("ok") == 0 and "subagent cannot be forked" in r.get("err", ""),
+                f"a subagent's fork: {r}")
+        r = h.call("delete", sid=sid)
+        t.check(r.get("ok") == 1 and r.get("deleted") == [kid, sid], f"deleted: {r}")
+        t.check(gone(t, sdir) and gone(t, kdir), "the directories are gone")
+        t.check(gone(t, scratch), "the scratch directory is gone")
+        deadline = time.monotonic() + 10
+        trash = t.host.join(t.state, "trash")
+        while local and os.listdir(trash) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if local:
+            t.check(not os.listdir(trash), f"the trash empties: {os.listdir(trash)}")
+            t.check(open(target).read() == "keep" and
+                    open(os.path.join(tdir, "inner.txt")).read() == "keep",
+                    "the links' targets are left alone")
+        h.call("list")
+        listed = [e["sid"] for e in h.all("sessions")[-1]["list"]]
+        t.check(sid not in listed and kid not in listed, f"not listed: {listed}")
+        r = h.call("delete", sid=sid)
+        t.check(r.get("ok") == 0 and r.get("err") == "no such session", f"again: {r}")
+        r = h.call("prompt", sid=sid, text="still there?")
+        t.check(r.get("ok") == 0, f"gone from memory: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=25)
+def delete_refused(t):
+    """delete is refused while a turn runs, while a job does, and while
+    another process has the session open; a parked one may go."""
+    a = t.headless(env=PARK)
+    b = None
+    try:
+        s1 = a.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        a.send("prompt", sid=s1, text="slow")
+        a.wait(lambda e: e.get("ev") == "attempt" and e.get("sid") == s1)
+        r = a.call("delete", sid=s1)
+        t.check(r.get("ok") == 0 and r.get("err", "").startswith("busy") and
+                not r.get("deleted"), f"busy: {r}")
+        ended(a, s1, 1)
+
+        s2 = a.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        a.send("prompt", sid=s2, text="job")
+        ended(a, s2, 1)
+        r = a.call("delete", sid=s2)
+        t.check(r.get("ok") == 0 and r.get("err", "").startswith("busy"), f"a job: {r}")
+        a.call("job.kill", sid=s2, job=1)
+        a.wait(lambda e: e.get("ev") == "job.end" and e.get("sid") == s2)
+        deadline = time.monotonic() + 10
+        while True:
+            r = a.call("delete", sid=s2)
+            if r.get("ok") == 1 or time.monotonic() > deadline:
+                break
+            time.sleep(0.2)
+        t.check(r.get("ok") == 1 and r.get("deleted") == [s2], f"once the job ended: {r}")
+
+        b = t.headless()
+        s3 = b.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = a.call("delete", sid=s3)
+        t.check(r.get("ok") == 0 and r.get("err") == "open in another process", f"elsewhere: {r}")
+        t.check(gone(t, t.host.join(t.state, "sessions", s3), 0) is False, "still there")
+
+        deadline = time.monotonic() + 10
+        while not (listentry(a, s1) or {}).get("parked") and time.monotonic() < deadline:
+            time.sleep(0.2)
+        t.check(listentry(a, s1).get("parked") == 1, "parked")
+        r = a.call("delete", sid=s1)
+        t.check(r.get("ok") == 1 and r.get("deleted") == [s1], f"parked: {r}")
+        t.check(gone(t, t.host.join(t.state, "sessions", s1)), "gone")
+    finally:
+        if b:
+            b.close()
+        rc = a.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
+def fork(t):
+    """fork: a copy of the log cut after a turn (with what came between
+    turns), under a new sid and directory, with only the files its log
+    names, every path to the old directory rewritten; the next prompt in
+    the reply; rewind in the fork from its own snapshots; the original
+    untouched."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.call("group", sid=sid, name="Forks")
+        h.send("prompt", sid=sid, text="one")
+        ended(h, sid, 1)
+        resumed = h.wait(lambda e: e.get("ev") == "turn" and e.get("sid") == sid and
+                         e.get("n") == 2, 15)
+        t.check(resumed.get("via") == "job", f"a job's end resumes it: {resumed}")
+        ended(h, sid, 2)
+        h.send("prompt", sid=sid, text="two")
+        h.wait(lambda e: e.get("ev") == "attempt" and e.get("sid") == sid and
+               e.get("turn") == 3)
+        h.send("prompt", sid=sid, text="three")
+        ended(h, sid, 4)
+        t.check(t.file("f.txt") == "v2\n", "changed twice")
+        src = logged(t, sid)
+        old = t.host.join(t.state, "sessions", sid)
+        spilled = [e for e in src if e["ev"] == "tool.end" and
+                   "the full output is in" in e.get("text", "")]
+        t.check(len(spilled) == 1 and old in spilled[0]["text"], f"a spill: {spilled}")
+
+        def forked(turn, nxt):
+            args = {} if turn is None else {"turn": turn}
+            r = h.call("fork", sid=sid, **args)
+            t.check(r.get("ok") == 1 and r.get("from") == sid and r.get("sid") != sid and
+                    r.get("next") == nxt and r.get("turn") == (4 if turn is None else turn),
+                    f"fork {turn}: {r}")
+            recs = logged(t, r["sid"])
+            t.check([e["seq"] for e in recs] == list(range(1, len(recs) + 1)) and
+                    all(e["sid"] == r["sid"] for e in recs), f"fork {turn}: seq and sid")
+            first = recs[0]
+            t.check(list(first)[:6] == ["sid", "seq", "ts", "ev", "forked_from", "fork_turn"]
+                    and first["forked_from"] == sid and first["fork_turn"] == r["turn"],
+                    f"its session record: {first}")
+            t.check(recs[-1]["ev"] == "title" and recs[-1]["text"].endswith(" (fork)") and
+                    sidecar(t, r["sid"], "title") == recs[-1]["text"] and
+                    sidecar(t, r["sid"], "group") == "Forks", f"titled {recs[-1]}")
+            return r, recs
+
+        r1, recs = forked(1, None)
+        t.check([e["ev"] for e in recs[-3:]] == ["turn.end", "job.end", "title"] and
+                not any(e["ev"] == "turn" and e["n"] == 2 for e in recs),
+                f"cut after turn 1, its job's end kept: {[e['ev'] for e in recs[-4:]]}")
+        r, recs = forked(2, "two")
+        t.check(not any(e["ev"] == "user" and e["text"] == "two" for e in recs), "cut")
+        r3, recs = forked(3, "three")
+        new = t.host.join(t.state, "sessions", r3["sid"])
+        text = json.dumps(recs)
+        t.check(old not in text and new in text, "the paths name the fork")
+        spill = [e for e in recs if e["ev"] == "tool.end" and e.get("spill")]
+        snaps = [e["snap"] for e in recs if e["ev"] == "snap"]
+        t.check(spill and snaps and all(sidecar(t, r3["sid"], e["spill"]) ==
+                                        sidecar(t, sid, e["spill"]) for e in spill) and
+                all(sidecar(t, r3["sid"], s) == sidecar(t, sid, s) for s in snaps) and
+                any(sidecar(t, r3["sid"], s) for s in snaps),
+                f"its files: {[e['spill'] for e in spill]} {snaps}")
+        later = [e["spill"] for e in spill if e["spill"] not in json.dumps(logged(t, r1["sid"]))]
+        t.check(later and all(sidecar(t, r1["sid"], x) is None for x in later),
+                f"only the files its log names: {later}")
+        forked(None, None)
+        r = h.call("fork", sid=sid, turn=5)
+        t.check(r.get("ok") == 0 and r.get("err") == "no turn 5 in this session", f"{r}")
+        r = h.call("fork", sid=sid, turn="x")
+        t.check(r.get("ok") == 0, f"not a number: {r}")
+        t.check(logged(t, sid) == src, "the original untouched")
+
+        # The fork at turn 0: settings, no history
+        r0, recs = forked(0, "one")
+        t.check(not any(e["ev"] in ("user", "turn", "assistant") for e in recs), "no history")
+
+        # The fork goes on by itself: rewound from its own snapshots
+        o = h.call("open", sid=r3["sid"])
+        t.check(o.get("ok") == 1 and o.get("readonly") == 0, f"open the fork: {o}")
+        rw = h.call("rewind", sid=r3["sid"], to=3)
+        t.check(rw.get("ok") == 1 and [f["result"] for f in rw.get("files", [])] == ["restored"],
+                f"rewound: {rw}")
+        t.check(t.file("f.txt") == "v1\n", "as turn 3 found it")
+        h.send("prompt", sid=r3["sid"], text="three")
+        t.check(ended(h, r3["sid"], 4)["why"] == "done", "the fork goes on")
+        h.call("list")
+        listed = {e["sid"]: e for e in h.all("sessions")[-1]["list"]}
+        t.check(r3["sid"] in listed and listed[r3["sid"]]["title"].endswith(" (fork)"),
+                f"listed: {listed.get(r3['sid'])}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

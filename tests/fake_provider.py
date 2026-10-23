@@ -3308,6 +3308,127 @@ def sc_an_model_switch(model, n, req):
 sc_an_model_switch_b = sc_an_model_switch
 
 
+# M8, session operations, part 2
+
+def scratch_of(req):
+    """The scratch directory the system prompt names, or None."""
+    m = re.search(r"Put scratch files \([^)]*\) in (.+?), which", system_of(req))
+    return m.group(1) if m else None
+
+
+def sc_always(model, n, req):
+    # Asks to answer with always: a write outside, then another beside it;
+    # a read outside, then a write beside it; a search of a directory;
+    # and a write where the first was, in a later run
+    u = last_user_text(req)
+    k = since_user(req)
+    plan = {
+        "write": [("write", {"path": "../ext/a.txt", "content": "a"}),
+                  ("write", {"path": "../ext/b.txt", "content": "b"})],
+        "read": [("read", {"path": "../ro/x.txt"}),
+                 ("write", {"path": "../ro/y.txt", "content": "y"})],
+        "search": [("glob", {"path": "../gl", "pattern": "*.txt"}),
+                   ("grep", {"path": "../gl", "pattern": "hello"})],
+        "again": [("write", {"path": "../ext/c.txt", "content": "c"})],
+    }.get(u, [])
+    if k < len(plan):
+        yield from tool(model, n, *plan[k])
+    else:
+        yield from answer(model, f"Done with {u}.")
+
+
+def sc_always_task(model, n, req):
+    # A parent that is allowed a directory for good, then a subagent (the
+    # _b model) that writes there without asking, and asks for another
+    if "# Subagent" in system_of(req):
+        k = step(req)
+        if k == 0:
+            yield from tool(model, n, "write", {"path": "../ext/child.txt", "content": "c"})
+        elif k == 1:
+            yield from tool(model, n, "read", {"path": "../sub/s.txt"})
+        else:
+            yield from answer(model, "Child done.")
+        return
+    k = step(req)
+    if k == 0:
+        yield from tool(model, n, "write", {"path": "../ext/a.txt", "content": "a"})
+    elif k == 1:
+        yield from tool(model, n, "task", {"description": "Child", "prompt": "Write.",
+                                           "model": second(model)})
+    elif k == 2:
+        yield from tool(model, n, "read", {"path": "../sub/s.txt"})
+    else:
+        yield from answer(model, "Parent done.")
+
+
+sc_always_task_b = sc_always_task
+
+
+def sc_temp(model, n, req):
+    # Files in the scratch directory, then in the temporary directory it
+    # is in, then through a link planted there (POSIX), then in /tmp
+    scratch = scratch_of(req)
+    tmp = scratch.rsplit("/", 2)[0] if scratch else ""
+    u = last_user_text(req)
+    k = since_user(req)
+    plan = [("write", {"path": f"{scratch}/s.txt", "content": "s"}),
+            ("write", {"path": f"{tmp}/t.txt", "content": "t"})]
+    if u.startswith("link"):
+        plan = [("write", {"path": f"{tmp}/link/x.txt", "content": "x"})]
+    elif u.startswith("/tmp/"):
+        plan = [("write", {"path": u, "content": "slash tmp"})]
+    if k < len(plan):
+        yield from tool(model, n, *plan[k])
+    else:
+        yield from answer(model, f"Scratch is {scratch}.")
+
+
+sc_temp_ask = sc_temp
+
+
+def sc_delete(model, n, req):
+    # A task for a subagent (the _b model); a slow answer; a job
+    u = last_user_text(req)
+    if "# Subagent" in system_of(req):
+        yield from answer(model, "Child reports.")
+    elif u == "task" and step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Child", "prompt": "Report.",
+                                           "model": second(model)})
+    elif u == "slow" and step(req) == 0:
+        yield S.head()
+        yield S.sleep(2)
+        yield from text(model, "Slowly.")
+        yield from finish(model)
+    elif u == "job" and since_user(req) == 0:
+        yield from tool(model, n, "shell", {"command": "sleep 30", "background": True})
+    else:
+        yield from answer(model, f"Answer {n}.")
+
+
+sc_delete_b = sc_delete_refused = sc_delete_refused_b = sc_delete
+
+
+def sc_fork(model, n, req):
+    # Turn 1 changes a file and starts a job, whose end resumes the
+    # session (turn 2); turn 3, slow, spills a command's output and
+    # changes the file again, while turn 4 waits in the queue
+    u = last_user_text(req)
+    k = since_user(req)
+    if u == "one" and k == 0:
+        yield from calls(model, n, [
+            ("write", {"path": "f.txt", "content": "v1"}),
+            ("shell", {"command": "sleep 1; echo jobdone", "background": True})])
+    elif u == "two" and k == 0:
+        yield S.head()
+        yield S.sleep(1.5)
+        yield from call(model, 0, f"call_{n}", "shell", {"command": "seq 1 20000"}, 2)
+        yield from finish(model, "tool_calls")
+    elif u == "two" and k == 1:
+        yield from tool(model, n, "write", {"path": "f.txt", "content": "v2"})
+    else:
+        yield from answer(model, f"Answer to {(u or 'the job')[:20]}.")
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 

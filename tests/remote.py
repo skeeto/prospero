@@ -348,7 +348,12 @@ class T:
         self.work = os.path.join(self.root, "work")
         self.config = os.path.join(self.root, "prospero.ini")
         os.makedirs(self.work)
+        # The system's temporary directory, the scenario's own, for the
+        # sessions' scratch directories
+        tmp = os.path.join(self.root, "tmp")
+        os.makedirs(tmp)
         self.env = dict(os.environ)
+        self.env.update({"TMP": tmp, "TEMP": tmp} if os.name == "nt" else {"TMPDIR": tmp})
         self.procs = []
         self.write_config(args.url)
 
@@ -851,6 +856,59 @@ def close_subagents(t):
     s.disconnect()
 
 
+@scenario
+def host_ops(t):
+    """delete through a host: refused while another client has the
+    session, or a subagent of it, open, and done for the one that has it;
+    fork through a host, its new session then opened like any other."""
+    c = Client(t)
+    s = c.attach()
+    c.call("hello")
+    r = c.call("new", cwd=t.work, prompt="task", model=t.model("delete"), attended=1)
+    t.check(r.get("ok") == 1, f"new: {r}")
+    sid = r["sid"]
+    s.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid, timeout=30,
+           what="the parent's turn.end")
+    kids = [r["sid"] for r in c.all() if r.get("ev") == "session" and r.get("parent") == sid]
+    t.check(len(kids) == 1, f"a subagent: {kids}")
+
+    b = Client(t)
+    sb = b.attach(reconnect=True)
+    b.call("hello")
+    o = b.call("open", sid=kids[0])
+    t.check(o.get("ok") == 1, f"B opens the subagent: {o}")
+    d = c.call("delete", sid=sid)
+    t.check(d.get("ok") == 0 and d.get("err") == "open in another client", f"refused: {d}")
+    t.check(os.path.isdir(os.path.join(t.state, "sessions", sid)), "still there")
+
+    f = c.call("fork", sid=sid, turn=1)
+    t.check(f.get("ok") == 1 and f.get("from") == sid and f.get("sid") != sid, f"fork: {f}")
+    fork = f["sid"]
+    o = c.call("open", sid=fork, attended=1)
+    t.check(o.get("ok") == 1, f"open the fork: {o}")
+    first = s.wait(lambda r: r.get("sid") == fork and r.get("seq") == 1, what="its record")
+    t.check(first.get("ev") == "session" and first.get("forked_from") == sid, f"{first}")
+    p = c.call("prompt", sid=fork, text="more")
+    t.check(p.get("ok") == 1, f"prompt the fork: {p}")
+    s.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == fork and r.get("turn") == 2,
+           timeout=30, what="the fork's turn")
+    d = b.call("delete", sid=fork)
+    t.check(d.get("ok") == 0 and d.get("err") == "open in another client", f"B: {d}")
+
+    x = b.call("close", sid=kids[0])
+    t.check(x.get("ok") == 1, f"B closes: {x}")
+    d = c.call("delete", sid=sid)
+    t.check(d.get("ok") == 1 and d.get("deleted") == [kids[0], sid], f"deleted: {d}")
+    d = c.call("delete", sid=fork)
+    t.check(d.get("ok") == 1 and d.get("deleted") == [fork], f"the fork, open here: {d}")
+    for gonesid in (sid, kids[0], fork):
+        t.check(not os.path.exists(os.path.join(t.state, "sessions", gonesid)), "gone")
+    p = c.call("prompt", sid=fork, text="still?")
+    t.check(p.get("ok") == 0, f"no more: {p}")
+    s.disconnect()
+    sb.disconnect()
+
+
 class Raw:
     """attach's standard I/O, frames written by hand: regular frames that
     acknowledge nothing (ack 0), so that the host keeps all it sends."""
@@ -1114,7 +1172,8 @@ def restart_unattended(t):
     """A session made unattended (new without attended), then its host
     restarted under the client library: opened again on the new host,
     it is still unattended, so an ask there is denied at once."""
-    t.write_config(t.args.url, "[guard]\nask_timeout = 60\n")
+    # Asked about even in /tmp, where the directories may be (Linux)
+    t.write_config(t.args.url, "[guard]\nask_timeout = 60\ntemp = ask\n")
     c = connect(t, ["--local", "--state", t.state, "-c", t.config])
     c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
     r = c.call("new", cwd=t.work, model=t.model("ask"))

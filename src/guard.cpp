@@ -6,8 +6,12 @@
 // then the missing rest appended. Both must lie within a workspace root:
 // the working directory, any extra roots from the configuration, and for
 // reads only, the session's own directory, where shell output is
-// spilled. A path inside lexically whose real path leaves is a symlink
-// pointing out, and is reported as such.
+// spilled. Hidden roots, which the agent is never told of nor hinted
+// at, add the session's scratch directory, the system's temporary
+// directories, and what the user allowed for good (guardgrant), which
+// may be a directory not made yet, or a single file. A path inside
+// lexically whose real path leaves is a symlink pointing out, and is
+// reported as such.
 //
 // A path outside is not an error of the harness: it becomes a request
 // for permission (an ask), which an attended session puts to the user
@@ -245,9 +249,11 @@ static Str realpathof(Os *os, Arena *a, Str path, b32 win)
 }
 
 struct GuardRoot {
-    Str lex;   // normalized
-    Str real;  // its real path, normalized
-    b32 read;  // only for reads
+    Str lex;     // normalized
+    Str real;    // its real path, normalized
+    b32 read;    // only for reads
+    b32 hidden;  // never named to the agent, nor hinted at: the system's
+                 // temporary directories, and grants from the user
 };
 
 // The workspace of one session.
@@ -258,21 +264,39 @@ struct Guard {
     b32              win;
 };
 
+enum : i32 {
+    ROOT_READ    = 1<<0,  // only for reads
+    ROOT_HIDDEN  = 1<<1,  // GuardRoot hidden
+    ROOT_MISSING = 1<<2,  // kept though it does not exist (yet)
+};
+
 // Add a root, as a path relative to the working directory or absolute.
-// A root that does not exist is ignored.
-static void guardroot(Os *os, Arena *perm, Guard *g, Str path, b32 read)
+// A root that does not exist is ignored, unless ROOT_MISSING keeps it,
+// with the real path of its deepest existing ancestor (realpathof): a
+// directory the user allowed before it was made, or a file to be.
+static void guardadd(Os *os, Arena *perm, Guard *g, Str path, i32 flags)
 {
     if (!path.len || cut(path, 0).ok) {
         return;
     }
     GuardRoot r = {};
-    r.lex  = normpath(perm, g->cwd, expandhome(perm, path, g->home, g->win), g->win);
-    r.real = os_realpath(os, perm, r.lex);
-    r.read = read;
+    r.lex    = normpath(perm, g->cwd, expandhome(perm, path, g->home, g->win), g->win);
+    r.read   = !!(flags & ROOT_READ);
+    r.hidden = !!(flags & ROOT_HIDDEN);
+    if (flags & ROOT_MISSING) {
+        r.real = realpathof(os, perm, r.lex, g->win);
+    } else {
+        r.real = os_realpath(os, perm, r.lex);
+        r.real = r.real.data ? normpath(perm, r.lex, r.real, g->win) : Str{};
+    }
     if (r.real.data) {
-        r.real   = normpath(perm, r.lex, r.real, g->win);
         g->roots = push(perm, g->roots, r);
     }
+}
+
+static void guardroot(Os *os, Arena *perm, Guard *g, Str path, b32 read)
+{
+    guardadd(os, perm, g, path, read ? ROOT_READ : 0);
 }
 
 // The workspace: the working directory (absolute), extra roots, and a
@@ -331,6 +355,32 @@ static GuardPath guardpath(Os *os, Arena *a, Guard *g, Str path, b32 read)
     return r;
 }
 
+// What "always allow" grants with an ask's answer: the directory of
+// the path asked about, or with isdir (a search) the path itself, on
+// its real path where a symlink leads out. A filesystem root or the
+// home directory is too much to give at once: then the path alone, or
+// nothing if it is one of those itself. Null if nothing.
+static Str guardgrant(Arena *a, Guard *g, GuardPath *gp, b32 isdir)
+{
+    Str path = gp->diverged ? gp->real : gp->path;
+    if (!path.data) {
+        return {};
+    }
+    Str home = g->home.len ? normpath(a, g->cwd, g->home, g->win) : Str{};
+    Str dir  = isdir ? path : normpath(a, path, "..", g->win);
+    for (i32 pass = 0; pass < 2; pass++) {
+        b32 big = pathroot(dir, g->win)==dir.len ||
+                  (home.len && (g->win ? equalfold(dir, home) : dir==home));
+        if (!big) {
+            return dir;
+        } else if (isdir || pass) {
+            return {};
+        }
+        dir = path;
+    }
+    return {};
+}
+
 struct GuardHint {
     Str path;    // null if no hint
     b32 exists;  // names something now, rather than a likely place
@@ -360,7 +410,7 @@ static GuardHint guardhint(Os *os, Arena *a, Guard *g, Str path, b32 read,
             Str suffix = cuthead(rel, i);
             for (iz k = 0; k < g->roots.len; k++) {
                 GuardRoot *t = &g->roots[k];
-                if (t->read && !read) {
+                if ((t->read && !read) || t->hidden) {
                     continue;
                 }
                 Str cand = normpath(a, t->lex, suffix, g->win);

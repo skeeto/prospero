@@ -2525,6 +2525,183 @@ static i32 os_responsible(Os *, i32)
     return 0;  // no such thing here
 }
 
+
+// Trees, copies and temporary directories (M8)
+
+W32(b32,    CopyFileW(c16 *, c16 *, b32));
+W32(u32,    GetTempPathW(u32, c16 *));
+W32(b32,    SetFileAttributesW(c16 *, i32));
+
+enum : i32 {
+    ERROR_DIR_NOT_EMPTY     = 145,
+    FILE_ATTRIBUTE_READONLY = 0x01,
+    RM_TRIES                = 20,  // sharing violations, 10 ms apart
+};
+
+// Delete a file or remove an empty directory (dir) by its extended path,
+// a reparse point itself rather than its target, with the read-only
+// attribute cleared if it stops that, and retried while another process
+// has it open without delete sharing, as a scanner may for a moment, or
+// while a directory still lists entries whose deletion is pending.
+// Gone already counts as done.
+static b32 rmentry(c16 *p, b32 dir, b32 readonly)
+{
+    for (i32 n = 0; n < RM_TRIES; n++) {
+        if (dir ? RemoveDirectoryW(p) : DeleteFileW(p)) {
+            return 1;
+        }
+        i32 err = GetLastError();
+        if (notfound(err)) {
+            return 1;
+        } else if (err==ERROR_ACCESS_DENIED && readonly) {
+            SetFileAttributesW(p, FILE_ATTRIBUTE_NORMAL);
+            readonly = 0;
+            continue;
+        } else if (err!=ERROR_SHARING_VIOLATION && err!=ERROR_ACCESS_DENIED &&
+                   err!=ERROR_DIR_NOT_EMPTY) {
+            return 0;
+        }
+        Sleep(10);
+    }
+    return 0;
+}
+
+// A directory's extended path with "\name" or "\*" after it.
+static c16 *rmchild(Arena *a, Str16 dir, c16 *name, iz len)
+{
+    c16 *p = alloc<c16>(a, dir.len+len+2);
+    copybytes(p, dir.data, dir.len*(iz)sizeof(c16));
+    iz n = dir.len;
+    if (!n || p[n-1]!='\\') {
+        p[n++] = '\\';
+    }
+    copybytes(p+n, name, len*(iz)sizeof(c16));
+    return p;
+}
+
+// Depth first with a stack of its own. The directory listing tells each
+// entry's attributes without following anything, and every reparse point
+// (a symlink, a junction, a mount point) is removed as the entry it is,
+// never entered: RemoveDirectoryW and DeleteFileW act on the point.
+static b32 os_removetree(Os *, Arena scratch, Str path)
+{
+    if (!path.len || hasnul(path)) {
+        return 0;
+    }
+    Str16 root = widepath(&scratch, path);
+    i32   attr = GetFileAttributesW(root.data);
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        return notfound(GetLastError());
+    }
+    b32 ro = !!(attr & FILE_ATTRIBUTE_READONLY);
+    if (attr&FILE_ATTRIBUTE_REPARSE_POINT || !(attr&FILE_ATTRIBUTE_DIRECTORY)) {
+        return rmentry(root.data, !!(attr & FILE_ATTRIBUTE_DIRECTORY), ro);
+    }
+
+    // Each directory is listed when it comes to the top, and removed
+    // when it comes there again with its subdirectories done
+    struct RmDir {
+        Str16 path;
+        b32   listed;
+        b32   readonly;
+    };
+    b32          ok    = 1;
+    Slice<RmDir> stack = {};
+    RmDir        top   = {root, 0, ro};
+    stack = push(&scratch, stack, top);
+    while (stack.len) {
+        RmDir d = stack[stack.len-1];
+        if (d.listed) {
+            stack.len--;
+            ok &= rmentry(d.path.data, 1, d.readonly);
+            continue;
+        }
+        stack[stack.len-1].listed = 1;
+        c16     *pat = rmchild(&scratch, d.path, (c16 *)u"*", 1);
+        FindData fd  = {};
+        uz       h   = FindFirstFileExW(pat, FindExInfoStandard, &fd,
+                                        FindExSearchNameMatch, 0, 0);
+        if (h == INVALID_HANDLE_VALUE) {
+            ok &= notfound(GetLastError());
+            continue;
+        }
+        do {
+            c16 *name = fd.name;
+            if (name[0]=='.' && (!name[1] || (name[1]=='.' && !name[2]))) {
+                continue;
+            }
+            iz len = 0;
+            for (; len<countof(fd.name) && name[len]; len++) {}
+            c16 *p    = rmchild(&scratch, d.path, name, len);
+            b32  isd  = !!(fd.attr & FILE_ATTRIBUTE_DIRECTORY);
+            b32  rdo  = !!(fd.attr & FILE_ATTRIBUTE_READONLY);
+            if (fd.attr&FILE_ATTRIBUTE_REPARSE_POINT || !isd) {
+                ok &= rmentry(p, isd, rdo);
+            } else {
+                iz    n   = d.path.len + 1 + len;
+                RmDir sub = {{p, n}, 0, rdo};
+                stack = push(&scratch, stack, sub);
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return ok;
+}
+
+static b32 os_copyfile(Os *, Arena scratch, Str from, Str to)
+{
+    if (hasnul(from) || hasnul(to)) {
+        return 0;
+    }
+    c16 *src = widepath(&scratch, from).data;
+    c16 *dst = widepath(&scratch, to).data;
+    i32  attr = GetFileAttributesW(src);
+    if (attr==INVALID_FILE_ATTRIBUTES ||
+            attr&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)) {
+        return 0;
+    }
+    return CopyFileW(src, dst, 1);
+}
+
+// GetTempPathW's directory, without its trailing backslash, or null.
+static Str temppath(Arena *a)
+{
+    c16 buf[264];  // MAX_PATH+1 at most, by its documentation
+    u32 len = GetTempPathW(countof(buf), buf);
+    if (!len || len>=countof(buf)) {
+        return {};
+    }
+    for (; len>3 && (buf[len-1]=='\\' || buf[len-1]=='/'); len--) {}
+    return fromwide(a, buf, len);
+}
+
+static Str os_scratchdir(Os *, Arena *a)
+{
+    Arena save = *a;
+    Str   tmp  = temppath(a);
+    if (!tmp.len) {
+        *a = save;
+        return {};
+    }
+    Str   dir     = concat(a, tmp, "\\prospero");
+    Arena scratch = *a;
+    c16  *p       = widepath(&scratch, dir).data;
+    i32   attr    = CreateDirectoryW(p, 0) ? 0 : GetFileAttributesW(p);
+    if (attr && (attr==INVALID_FILE_ATTRIBUTES || !(attr&FILE_ATTRIBUTE_DIRECTORY) ||
+                 attr&FILE_ATTRIBUTE_REPARSE_POINT)) {
+        *a = save;
+        return {};
+    }
+    return dir;
+}
+
+static Slice<Str> os_tempdirs(Os *, Arena *a)
+{
+    Slice<Str> r   = {};
+    Str        tmp = temppath(a);
+    return tmp.len ? push(a, r, tmp) : r;
+}
+
 // No console, a process group of its own, and out of this process's job,
 // unless the job forbids that (ERROR_ACCESS_DENIED), as an ssh session's
 // may: then in the job, attached. Its standard handles are inheritable

@@ -316,6 +316,25 @@ static b32       os_onquit(Os *, Mailbox *, u32 type);
 // it: see reap.cpp.)
 static i32       os_responsible(Os *, i32 pid);
 
+// (M8) Remove a file or a directory tree, never through a link: a
+// symlink, or on Windows a junction or any other reparse point, is
+// removed itself and never entered, so that nothing outside the tree is
+// touched. Read-only files and directories go too. What is gone already,
+// or goes meanwhile (another remover's), counts as removed. Returns 0 if
+// anything is left.
+static b32       os_removetree(Os *, Arena scratch, Str path);
+// (M8) Copy a regular file, not through a link, to a new file. Returns
+// 0 on failure, the target then gone, or if it existed already.
+static b32       os_copyfile(Os *, Arena scratch, Str from, Str to);
+// (M8) The directory for sessions' scratch directories, made if missing:
+// prospero-EUID in $TMPDIR (if absolute) or /tmp, this user's alone
+// (mode 0700) and no link; on Windows, prospero in GetTempPathW's. Null
+// on failure, explained by os_lasterr.
+static Str       os_scratchdir(Os *, Arena *);
+// (M8) The system's temporary directories: $TMPDIR (if absolute) and
+// /tmp, or GetTempPathW's on Windows, without a trailing separator.
+static Slice<Str> os_tempdirs(Os *, Arena *);
+
 // (M1) GUI builds: wake the GUI loop from any thread, coalesced.
 static void    os_wake(Os *);
 #if PROSPERO_GUI

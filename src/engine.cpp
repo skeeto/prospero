@@ -72,10 +72,17 @@
 // blocking nothing else: an answer resolves it, the deadline denies it,
 // and so does a steer, whose text the agent reads next (as does any ask
 // while a steer waits for the next step). Every denial is the call's
-// tool result, explaining what to do instead. The log holds ask and
-// answer before the call's tool.start, so a crash while asking leaves a
-// call that never started rather than an unknown outcome, which the
-// next open closes in order: answer, tool.start, tool.end (logopen).
+// tool result, explaining what to do instead. A path's ask offers to
+// allow its directory for good ("always"), which the answer may take
+// (see "Grants"). The log holds ask and answer (and its grant) before
+// the call's tool.start, so a crash while asking leaves a call that
+// never started rather than an unknown outcome, which the next open
+// closes in order: answer, tool.start, tool.end (logopen).
+//
+// Scratch files: each session has a directory of its own for them,
+// named in its system prompt, <sid> in os_scratchdir, which its
+// subagents share; the system's temporary directories are open to the
+// file tools too, unless [guard] temp = ask.
 //
 // Locks: each session's directory has a lock file, held while a process
 // has the session open. A second process opens it read-only: it replays
@@ -377,6 +384,16 @@ struct Ask {
     GuardPath gp;
     GuardHint hint;
     i64       opened;   // ticks
+    Str       grant;    // what "always" would allow (guardgrant), or null
+    b32       gwrite;   // and for writes too, not only reads
+};
+
+// An "always allow" from the user: a path (a directory, or a file) the
+// file tools may use from then on, for reads alone or for writes too,
+// in the session and every session of its tree (see "Grants").
+struct Grant {
+    Str path;
+    b32 write;
 };
 
 // A summary compaction under way (REQ_COMPACT).
@@ -407,6 +424,9 @@ struct Session {
     Str          outdir;    // dir/out
     Str          cwd;
     Slice<Str>   roots;     // extra workspace roots
+    Str          scratch;   // its scratch directory, null if none: a
+                            // subagent's is its parent's
+    Slice<Grant> grants;    // "always allow" answers, inherited too
     Str          model;
     Str          title;
     b32          usertitle;  // the user named it (rename), not its prompt
@@ -548,6 +568,8 @@ struct Session {
     i64          stepmax;    // model requests a turn, 0 for STEP_HARD
     b32          projinstr;  // the project's instruction files, not the user's
     b32          nofallback; // never a fallback model: the one asked, or none
+    b32          tempask;    // asks for the temporary directories, whatever
+                             // [guard] temp says (new {temp:"ask"})
     b32          forget;     // closed: drop it from memory once idle
 };
 
@@ -584,6 +606,8 @@ struct Engine {
     Slice<Parked> parked; // sessions parked, revived by their next command
     i64         cfgwait[8];  // config.get {refresh} ids awaiting fetches
     i32         ncfgwait;
+    Slice<Str>  tempdirs; // the system's (os_tempdirs), for [guard] temp
+    Str         scratchbase;  // os_scratchdir, null until made
 };
 
 
@@ -2845,10 +2869,103 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
 static Str bynames[] = {"policy", "user", "timeout", "steer", "cancel"};
 static_assert(countof(bynames) == DENY_COUNT);
 
+// Grants
+//
+// "Always allow" answers an ask for good: what it offered (guardgrant),
+// a directory or a file, becomes a hidden root of the session's guard,
+// for reads alone or for writes too, logged as a grant record, which
+// loadsession replays. A grant covers the session's whole tree: a new
+// subagent starts with its parent's, logged in it by "parent", and one
+// that a subagent gets is logged in its root too, by "subagent", and is
+// given to every session of the tree in memory. The frozen system prompt
+// never names a grant.
+
+static b32 hasgrant(Session *s, Str path, b32 write)
+{
+    for (iz i = 0; i < s->grants.len; i++) {
+        Grant *g = &s->grants[i];
+        if (g->path==path && (g->write || !write)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The grants' roots, after the rest of the session's (sessionguard).
+static void guardgrants(Session *s, Arena *perm, Guard *g)
+{
+    for (iz i = 0; i < s->grants.len; i++) {
+        Grant *t     = &s->grants[i];
+        i32    flags = ROOT_HIDDEN | ROOT_MISSING | (t->write ? 0 : ROOT_READ);
+        guardadd(s->e->os, perm, g, t->path, flags);
+    }
+}
+
+// Give a session in memory a grant, from its next call on.
+static void addgrant(Session *s, Str path, b32 write)
+{
+    if (hasgrant(s, path, write)) {
+        return;
+    }
+    Grant g = {clone(&s->perm, path), write};
+    s->grants = push(&s->perm, s->grants, g);
+    i32 flags = ROOT_HIDDEN | ROOT_MISSING | (write ? 0 : ROOT_READ);
+    guardadd(s->e->os, &s->perm, &s->guard, g.path, flags);
+}
+
+// The durable record of a grant: by "user" (req, the ask it answered),
+// "parent" (inherited) or "subagent" (from, the subagent it answered).
+static void loggrant(Session *s, Arena scratch, Grant g, Str by, Str req, Str from)
+{
+    if (s->readonly) {
+        return;
+    }
+    Buf   b(&scratch, 256 + g.path.len + req.len + from.len);
+    EvOut w = sbegin(s, &b, EV_GRANT);
+    putstrkey(&w.json, "path", g.path);
+    putstrkey(&w.json, "access", g.write ? Str("write") : Str("read"));
+    putstrkey(&w.json, "by", by);
+    if (req.len) {
+        putstrkey(&w.json, "req", req);
+    }
+    if (from.len) {
+        putstrkey(&w.json, "from", from);
+    }
+    ssend(s, &w);
+}
+
+// The topmost ancestor in memory.
+static Session *treeroot(Session *s)
+{
+    for (i32 n = 0; s->parent && n<=TASK_DEPTH+8; n++) {
+        s = s->parent;
+    }
+    return s;
+}
+
+// The user's "always" for the ask of s: logged in s, and in its root if
+// that is another session in memory, then given to the whole tree.
+static void usergrant(Session *s, Arena scratch, Str path, b32 write, Str req)
+{
+    Grant    g    = {path, write};
+    Session *root = treeroot(s);
+    loggrant(s, scratch, g, "user", req, {});
+    if (root!=s && !root->psid.len) {
+        loggrant(root, scratch, g, "subagent", req, s->sid);
+    }
+    for (Session *t = s->e->sessions; t; t = t->next) {
+        if (treeroot(t) == root) {
+            addgrant(t, path, write);
+        }
+    }
+}
+
 // Resolve the current call's ask: log the answer, then run the call, or
 // end it with the denial as its result. The caller moves on to the next
-// call (nexttool).
-static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note)
+// call (nexttool). With always, the answer allows it for good (Grants),
+// which old frontends take as a plain allow.
+static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
+                    b32 always = 0)
 {
     Engine *e = s->e;
     Ask    *k = &s->ask;
@@ -2875,7 +2992,13 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note)
         putstrkey(&w.json, "decision", allow ? Str("allow") : Str("deny"));
         putstrkey(&w.json, "by", bynames[by]);
         putstrkey(&w.json, "note", why);
+        if (always) {
+            putintkey(&w.json, "always", 1);
+        }
         ssend(s, &w);
+    }
+    if (allow && always && k->grant.len) {
+        usergrant(s, scratch, k->grant, k->gwrite, k->req);
     }
 
     toolstart(s, scratch);
@@ -2921,9 +3044,16 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     if (!gp->diverged) {
         h = guardhint(e->os, &scratch, &s->guard, gp->path, read, tool==TOOL_WRITE);
     }
+    // What "always" would allow: a search's directory itself, else the
+    // directory the path is in
+    b32 search = tool==TOOL_GREP || tool==TOOL_GLOB;
+    b32 isdir  = search && os_stat(e->os, scratch, gp->path).type==STAT_DIR;
+    Str grant  = guardgrant(&scratch, &s->guard, gp, isdir);
 
     Ask *k = &s->ask;
     *k = {};
+    k->grant       = grant.data ? clone(&s->perm, grant) : Str{};
+    k->gwrite      = !read;
     k->req         = clone(&s->perm, concat(&scratch, c->id, "/ask"));
     k->tool        = tool;
     k->gp.path     = clone(&s->perm, gp->path);
@@ -2955,6 +3085,10 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
         putstrkey(&w.json, "detail", why);
         if (h.path.data) {
             putstrkey(&w.json, "hint", h.path);
+        }
+        if (k->grant.data) {
+            putstrkey(&w.json, "always", k->grant);
+            putstrkey(&w.json, "access", read ? Str("read") : Str("write"));
         }
         putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
         putstrkey(&w.json, "dflt", "deny");
@@ -5763,7 +5897,10 @@ static Str lockpath(Arena *a, Session *s)
 }
 
 // The session's workspace: its working directory, its own extra roots,
-// and those of the configuration ("[guard] roots = A; B").
+// and those of the configuration ("[guard] roots = A; B"). Then hidden
+// roots, which the system prompt leaves out: its scratch directory,
+// named in a section of its own, the system's temporary directories
+// unless "[guard] temp = ask", and the user's grants.
 static Guard sessionguard(Session *s, Arena *perm)
 {
     Engine    *e     = s->e;
@@ -5775,7 +5912,17 @@ static Guard sessionguard(Session *s, Arena *perm)
     for (iz i = 0; i < conf.len; i++) {
         roots = push(perm, roots, conf[i]);
     }
-    return newguard(e->os, perm, s->cwd, e->home, roots, s->dir, s->te.windows);
+    Guard g = newguard(e->os, perm, s->cwd, e->home, roots, s->dir, s->te.windows);
+    if (s->scratch.len) {
+        guardadd(e->os, perm, &g, s->scratch, ROOT_HIDDEN|ROOT_MISSING);
+    }
+    if (!s->tempask && trim(cfgget(e->cfg, "guard", "", "temp", 0))!="ask") {
+        for (iz i = 0; i < e->tempdirs.len; i++) {
+            guardadd(e->os, perm, &g, e->tempdirs[i], ROOT_HIDDEN);
+        }
+    }
+    guardgrants(s, perm, &g);
+    return g;
 }
 
 // The job limits the session's tools describe, from the configuration.
@@ -5865,7 +6012,7 @@ static void buildprefix(Session *s, Arena scratch)
     Buf b(&s->perm, 256);
     for (iz i = 1; i < s->guard.roots.len; i++) {
         GuardRoot *t = &s->guard.roots[i];
-        if (!t->read) {
+        if (!t->read && !t->hidden) {
             print(&b, "\n- ");
             print(&b, t->lex);
         }
@@ -5876,6 +6023,22 @@ static void buildprefix(Session *s, Arena scratch)
                            "\n\nBesides the working directory, the file "
                            "tools may also use these directories:");
         s->system = concat(&s->perm, s->system, list);
+    }
+    if (s->scratch.len) {
+        Str dir   = normpath(&scratch, s->cwd, s->scratch, s->te.windows);
+        s->system = concat(&s->perm, s->system,
+                           "\n\n# Temporary files\n\nPut scratch files (notes, "
+                           "test inputs, output you will not keep) in ");
+        s->system = concat(&s->perm, s->system, dir);
+        s->system = concat(&s->perm, s->system,
+                           s->depth ? Str(", which your parent agent shares")
+                                    : Str(", which is this session's own"));
+        s->system = concat(&s->perm, s->system,
+                           s->te.windows ? Str(", never in the working directory "
+                                               "or the system's temporary "
+                                               "directory.")
+                                         : Str(", never in the working directory "
+                                               "or /tmp."));
     }
     if (s->instr.len) {
         s->system = concat(&s->perm, s->system,
@@ -5908,11 +6071,48 @@ static void logprefix(Session *s, Arena scratch)
     ssend(s, &w);
 }
 
+// Where the scratch directory of session sid goes (os_scratchdir), the
+// base made ready, normalized, in a. Null if there is no base.
+static Str scratchfor(Engine *e, Arena *a, Str sid)
+{
+    Str base = os_scratchdir(e->os, a);
+    if (!base.len) {
+        return {};
+    }
+    if (HOST_WINDOWS) {
+        Str real = os_realpath(e->os, a, base);  // long names, not 8.3
+        base = real.len ? real : base;
+    }
+    base = normpath(a, base, ".", HOST_WINDOWS);
+    if (!(base == e->scratchbase)) {
+        e->scratchbase = clone(&e->perm, base);
+    }
+    return normpath(a, base, sid, HOST_WINDOWS);
+}
+
+// A new session's scratch directory, made, or null if it cannot be.
+static Str newscratch(Engine *e, Arena *perm, Arena scratch, Str sid)
+{
+    Str dir = scratchfor(e, &scratch, sid);
+    if (!dir.len || !os_mkdirs(e->os, scratch, dir)) {
+        return {};
+    }
+    return clone(perm, dir);
+}
+
 // Join a session to the engine: its workspace, and its prefix unless its
-// log held one (loadsession), with its job limits.
+// log held one (loadsession), with its job limits. A scratch directory
+// the system purged since is made again, where it would be made now.
 static void sessionready(Session *s, Arena scratch)
 {
     Engine *e = s->e;
+    if (s->scratch.len && !s->readonly &&
+            os_stat(e->os, scratch, s->scratch).type==STAT_MISSING) {
+        Str sid = basename(s->scratch);
+        if (validsid(sid) && scratchfor(e, &scratch, sid)==s->scratch) {
+            os_mkdirs(e->os, scratch, s->scratch);
+        }
+    }
     instrstart(s, scratch);
     s->home      = s->ep.name.len ? s->ep.name : s->ep.url;
     s->homemodel = s->model;
@@ -5982,6 +6182,9 @@ static void logsession(Session *s, Arena scratch)
     putstrkey(&w.json, "role", s->role);
     putstrkey(&w.json, "model", s->model);
     putstrkey(&w.json, "endpoint", s->ep.url);
+    if (s->scratch.len) {
+        putstrkey(&w.json, "scratch", s->scratch);
+    }
     if (s->roots.len) {
         putkey(&w.json, "roots");
         putarray(&w.json);
@@ -6013,6 +6216,9 @@ static void logsession(Session *s, Arena scratch)
     }
     if (s->stepmax) {
         putintkey(&w.json, "steps", s->stepmax);
+    }
+    if (s->tempask) {
+        putstrkey(&w.json, "temp", "ask");
     }
     ssend(s, &w);
 }
@@ -6263,6 +6469,12 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     for (iz i = 0; i < p->roots.len; i++) {
         s->roots = push(&s->perm, s->roots, clone(&s->perm, p->roots[i]));
     }
+    // The parent's scratch directory, and its grants (logged below)
+    s->scratch = p->scratch.len ? clone(&s->perm, p->scratch) : Str{};
+    for (iz i = 0; i < p->grants.len; i++) {
+        Grant g = {clone(&s->perm, p->grants[i].path), p->grants[i].write};
+        s->grants = push(&s->perm, s->grants, g);
+    }
     s->model = clone(&s->perm, model);
     endpointconf(e, &s->perm, which, &s->ep);
     modelconf(e, &s->perm, s->model, &s->mc);
@@ -6278,6 +6490,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     // As new asked of the parent, as an eval's
     s->projinstr  = p->projinstr;
     s->nofallback = p->nofallback;
+    s->tempask    = p->tempask;
     Str why = opensession(s, scratch);
     if (why.data) {
         dropsession(e, s);
@@ -6288,6 +6501,9 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     logsession(s, scratch);
     instrlogstart(s, scratch);
     logprefix(s, scratch);
+    for (iz i = 0; i < s->grants.len; i++) {
+        loggrant(s, scratch, s->grants[i], "parent", {}, {});
+    }
     // Complete before scratch is passed on, which copies it
     Str title = cleantitle(&scratch, args->desc.len ? args->desc : args->prompt,
                            TITLE_MAX);
@@ -6750,6 +6966,7 @@ struct ListEntry {
     Str       model;
     Str       parent;  // a subagent's, else empty
     Str       group;   // empty if in none
+    Str       scratch; // its scratch directory, if any
     i64       mtime;
     b32       locked;  // open in another process
     b32       parked;
@@ -6794,6 +7011,7 @@ static SessScan scansessions(Engine *e, Arena *a)
         en.cwd      = jsonstr(jsonget(rec.root, "cwd"));
         en.model    = mod.len ? mod : jsonstr(jsonget(rec.root, "model"));
         en.parent   = jsonstr(jsonget(rec.root, "parent"));
+        en.scratch  = jsonstr(jsonget(rec.root, "scratch"));
         en.group    = sidecarget(e, a, d->name, "group", GROUP_MAX);
         en.archived = sidecarget(e, a, d->name, "archived", 16).data != 0;
         en.mtime    = d->mtime;
@@ -6817,6 +7035,105 @@ static SessScan scansessions(Engine *e, Arena *a)
         }
     }
     return r;
+}
+
+
+// The trash
+//
+// A session deleted (delete), or a fork that failed part of the way,
+// leaves the sessions directory at once, renamed into STATE/trash under
+// a name of its own, and a detached thread removes it from there with
+// os_removetree, so that the engine thread never waits on a big tree.
+// Whatever a crash leaves in the trash goes when an engine next starts,
+// as two engines (a GUI's and a host's) may well both sweep at once.
+
+struct Remover {
+    Region    *region;  // holds the remover itself
+    Os        *os;
+    Slice<Str> paths;
+    Arena      scratch;
+};
+
+static void removerthread(void *arg)
+{
+    Remover *r  = (Remover *)arg;
+    Os      *os = r->os;
+    for (iz i = 0; i < r->paths.len; i++) {
+        os_removetree(os, r->scratch, r->paths[i]);
+    }
+    os_release(os, r->region);
+}
+
+// Remove trees on a thread of their own. Those in the trash stay there
+// for the next sweep should no thread start.
+static void removelater(Engine *e, Slice<Str> paths)
+{
+    if (!paths.len) {
+        return;
+    }
+    Region *rg = os_reserve(e->os, (iz)1<<(sizeof(void *)==8 ? 30 : 24));
+    if (!rg) {
+        return;
+    }
+    Arena    a = newarena(rg);
+    Remover *r = alloc<Remover>(&a);
+    r->region = rg;
+    r->os     = e->os;
+    for (iz i = 0; i < paths.len; i++) {
+        r->paths = push(&a, r->paths, clone(&a, paths[i]));
+    }
+    r->scratch = a;
+    if (!os_thread(e->os, removerthread, r)) {
+        os_release(e->os, rg);
+    }
+}
+
+static Str trashdir(Arena *a, Engine *e)
+{
+    return join(a, e->statedir, "trash");
+}
+
+// A name in the trash for a session's directory.
+static Str trashname(Arena *a, Engine *e, Str sid)
+{
+    Buf b(a, sid.len + 24);
+    print(&b, sid);
+    putbyte(&b, '.');
+    printhex(&b, os_random(e->os), 16);
+    return join(a, trashdir(a, e), finish(&b));
+}
+
+// Move a directory into the trash, and have it removed. On Windows a
+// directory with a file open in it cannot be renamed, which is why the
+// caller lets go of its lock first there, and the rename is tried a few
+// times, for a scanner that may have a file open for a moment.
+static b32 totrash(Engine *e, Arena scratch, Str dir, Str sid)
+{
+    // Paths complete before scratch is passed on, which copies it
+    Str to    = trashname(&scratch, e, sid);
+    Str trash = trashdir(&scratch, e);
+    if (!os_mkdirs(e->os, scratch, trash)) {
+        return 0;
+    }
+    b32 ok = 0;
+    for (i32 n = 0; !ok && n<(HOST_WINDOWS ? 5 : 1); n++) {
+        ok = os_rename(e->os, scratch, dir, to);
+    }
+    if (ok) {
+        removelater(e, {&to, 1, 1});
+    }
+    return ok;
+}
+
+// What a crash left in the trash, removed.
+static void sweeptrash(Engine *e, Arena scratch)
+{
+    Slice<Str> paths = {};
+    Str        dir   = trashdir(&scratch, e);
+    for (Dirent *d = os_list(e->os, &scratch, dir); d; d = d->next) {
+        paths = push(&scratch, paths, join(&scratch, dir, d->name));
+    }
+    removelater(e, paths);
 }
 
 
@@ -6858,15 +7175,16 @@ static Str unknowntools(Str list)
 }
 
 // new {cwd, model?, endpoint?, role?, roots?, attended?, prompt?,
-//      edit_format?, tools?, steps?, instructions?, fallback?}: the model
-// and endpoint given, else the role's, else the configuration's. The
-// rest are for runs that must not depend on the configuration, as an
-// eval's: the edit format instead of the model's, only the tools listed
-// (of the role's, if any), at most steps model requests a turn (up to
-// 300), with instructions "project", none of the user's own instruction
-// file, and with fallback 0 (or false), none of the model's fallbacks,
-// so that every request goes to the model given. Its subagents keep the
-// last two.
+//      edit_format?, tools?, steps?, instructions?, fallback?, temp?}: the
+// model and endpoint given, else the role's, else the configuration's.
+// The rest are for runs that must not depend on the configuration, as
+// an eval's: the edit format instead of the model's, only the tools
+// listed (of the role's, if any), at most steps model requests a turn
+// (up to 300), with instructions "project", none of the user's own
+// instruction file, with fallback 0 (or false), none of the model's
+// fallbacks, so that every request goes to the model given, and with
+// temp "ask", the system's temporary directories outside the workspace
+// (where an eval's other runs are). Its subagents keep the last three.
 static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str  cwd   = jsonstr(jsonget(j, "cwd"));
@@ -6878,6 +7196,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     i64  steps = jsonint(jsonget(j, "steps"), 0);
     Str  instr = jsonstr(jsonget(j, "instructions"));
     b32  fall  = jsonflag(jsonget(j, "fallback"), 1);
+    Str  temp  = jsonstr(jsonget(j, "temp"));
     Role role  = name.len ? findrole(e, name) : Role{};
     if (name.len && !role.ok) {
         Str err = concat(&scratch, "no such role: ", name);
@@ -6902,6 +7221,9 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     } else if (instr.len && instr!="all" && instr!="project") {
         reply(e, scratch, id, 0, "instructions must be all or project", {});
+        return;
+    } else if (temp.len && temp!="ask") {
+        reply(e, scratch, id, 0, "temp must be ask, or absent for the configuration's", {});
         return;
     }
     if (!model.len && role.model.len) {
@@ -6950,6 +7272,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->stepmax    = steps<STEP_HARD ? steps : 0;
     s->projinstr  = instr == "project";
     s->nofallback = !fall;
+    s->tempask    = temp == "ask";
     for (iz i = 0; i < roots.len; i++) {
         s->roots = push(&s->perm, s->roots, clone(&s->perm, roots[i]));
     }
@@ -6963,6 +7286,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, why, {});
         return;
     }
+    s->scratch = newscratch(e, &s->perm, scratch, s->sid);
     sessionready(s, scratch);
     logsession(s, scratch);
     instrlogstart(s, scratch);
@@ -7170,6 +7494,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->cwd      = clone(&s->perm, jsonstr(jsonget(j, "cwd")));
             storedmodel = clone(&s->perm, jsonstr(jsonget(j, "model")));
             storedurl   = clone(&s->perm, jsonstr(jsonget(j, "endpoint")));
+            s->scratch  = clone(&s->perm, jsonstr(jsonget(j, "scratch")));
             for (Json *k = jsonget(j, "roots")->child; k; k = k->next) {
                 Str root = clone(&s->perm, jsonstr(k));
                 s->roots = push(&s->perm, s->roots, root);
@@ -7196,6 +7521,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->te.edit = editformat(jsonstr(jsonget(j, "edit_format")));
             i64 steps  = jsonint(jsonget(j, "steps"), 0);
             s->stepmax = steps>0 && steps<STEP_HARD ? steps : 0;
+            s->tempask = jsonstr(jsonget(j, "temp")) == "ask";
         } break;
         case EV_TITLE:
             s->title     = clone(&s->perm, jsonstr(jsonget(j, "text")));
@@ -7213,6 +7539,15 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         case EV_TURNEND:
             s->ctxhint = jsonint(jsonget(j, "ctx"), s->ctxhint);
             break;
+        case EV_GRANT: {
+            // "Always allow", as the guard has it from then on
+            Str path  = jsonstr(jsonget(j, "path"));
+            b32 write = jsonstr(jsonget(j, "access")) == "write";
+            if (path.len && !hasgrant(s, path, write)) {
+                Grant g = {clone(&s->perm, path), write};
+                s->grants = push(&s->perm, s->grants, g);
+            }
+        } break;
         case EV_TURN:
             s->turn = jsonint(jsonget(j, "n"), s->turn);
             break;
@@ -8010,6 +8345,255 @@ static void cmdcompact(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     beginturn(s, scratch, "compact");
 }
 
+// The sessions of a tree in the scan, its root first and each after its
+// parent, each once however the parents run in a cycle.
+static Slice<iz> subtree(Arena *a, SessScan *sc, iz root)
+{
+    Slice<iz> tree = {};
+    b32      *seen = alloc<b32>(a, sc->list.len);
+    seen[root] = 1;
+    tree = push(a, tree, root);
+    for (iz i = 0; i < tree.len; i++) {
+        Slice<iz> kids = sc->list[tree[i]].kids;
+        for (iz k = 0; k < kids.len; k++) {
+            if (!seen[kids[k]]) {
+                seen[kids[k]] = 1;
+                tree = push(a, tree, kids[k]);
+            }
+        }
+    }
+    return tree;
+}
+
+// delete {sid}: a session for good, with its subagents (subtree), once
+// each of them is checked: nothing may run in one here (forgettable, as
+// busy alone leaves out background jobs), and none may be open in
+// another process; one parked may go. Subagents go first, so that a
+// failure part of the way never leaves one to show as a session of its
+// own, its parent gone. Each directory goes into the trash while its
+// lock is held (on Windows, just after), and so does the session's
+// scratch directory if it is its own: the sid's in os_scratchdir. The
+// reply lists the sessions deleted, also those before a failure.
+static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str sid = jsonstr(jsonget(j, "sid"));
+    if (!validsid(sid)) {
+        reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    }
+    SessScan sc = scansessions(e, &scratch);
+    iz      *at = upsert(&sc.bysid, sid, (Arena *)0);
+    if (!at) {
+        reply(e, scratch, id, 0, "no such session", sid);
+        return;
+    }
+
+    Slice<iz> tree = subtree(&scratch, &sc, *at);
+    Str       err  = {};
+    for (iz i = 0; i<tree.len && !err.len; i++) {
+        ListEntry *en = &sc.list[tree[i]];
+        Session   *s  = findsession(e, en->sid);
+        Str        of = en->sid==sid ? Str{} : concat(&scratch, ": its subagent ", en->sid);
+        if (s && !s->readonly && !forgettable(s)) {
+            err = concat(&scratch, "busy: cancel its turn and stop its jobs first", of);
+        } else if (en->locked) {
+            err = concat(&scratch, "open in another process", of);
+        }
+    }
+    if (err.len) {
+        reply(e, scratch, id, 0, err, sid);
+        return;
+    }
+
+    Slice<Str> deleted = {};
+    Slice<Str> mines   = {};  // scratch directories of their own
+    for (iz n = tree.len-1; n>=0 && !err.len; n--) {
+        ListEntry *en   = &sc.list[tree[n]];
+        Str        msid = en->sid;
+        Str        mine = en->scratch;
+        Session   *s    = findsession(e, msid);
+        iz         park = parkedat(e, msid);
+        iz         lock = -1;
+        if (s) {
+            // Out of memory, but the lock kept for the rename
+            mine    = s->scratch.len ? clone(&scratch, s->scratch) : mine;
+            lock    = s->readonly ? -1 : s->lock;
+            s->lock = -1;
+            forget(e, s);
+        } else if (park >= 0) {
+            lock = e->parked[park].lock;
+            e->parked[park] = e->parked[e->parked.len-1];
+            e->parked.len--;
+        }
+        Str dir = join(&scratch, join(&scratch, e->statedir, "sessions"), msid);
+        if (lock < 0) {
+            Str path = sidecarpath(&scratch, e, msid, "lock");
+            lock = os_lockfile(e->os, scratch, path);
+        }
+        if (lock < 0) {
+            err = concat(&scratch, "open in another process: ", msid);
+            break;
+        }
+        if (HOST_WINDOWS) {
+            os_unlockfile(e->os, lock);  // an open file holds its directory
+            lock = -1;
+        }
+        if (!totrash(e, scratch, dir, msid)) {
+            err = concat(&scratch, "cannot move the session's directory away: ", msid);
+        }
+        if (lock >= 0) {
+            os_unlockfile(e->os, lock);
+        }
+        if (err.len) {
+            break;
+        }
+        deleted = push(&scratch, deleted, msid);
+        if (mine.len && scratchfor(e, &scratch, msid)==mine) {
+            mines = push(&scratch, mines, mine);
+        }
+    }
+    removelater(e, mines);
+    Buf   b(&scratch, 256 + err.len + 64*deleted.len);
+    EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", !err.len);
+    if (err.len) {
+        putstrkey(&w.json, "err", err);
+    }
+    putkey(&w.json, "deleted");
+    putarray(&w.json);
+    for (iz i = 0; i < deleted.len; i++) {
+        putstr(&w.json, deleted[i]);
+    }
+    putend(&w.json);
+    emit(e, evend(&w));
+}
+
+// fork {sid, turn?}: a new session from a copy of another's log, cut
+// after the end of a turn, or whole (logcopy), while that one is idle,
+// and never a subagent, which only its parent may carry on. The fork's
+// directory has only those of the original's out/ and snap/ files its
+// log names (os_copyfile), as rewind needs the snapshots; its title,
+// "TITLE (fork)", and the original's group, but neither its draft nor
+// its archived flag; and it shares the original's scratch directory.
+// The log is written last, so that the sessions list never shows a fork
+// half made. The workspace is left as it is. The reply names the fork
+// (sid) and its original (from), the turn, and next, the prompt that
+// began the turn after it, which a frontend may offer to send again.
+static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Os   *os   = e->os;
+    Str   sid  = jsonstr(jsonget(j, "sid"));
+    Json *tj   = jsonget(j, "turn");
+    b32   all  = tj->type==JSON_MISSING || tj->type==JSON_NULL;
+    i64   turn = all ? -1 : jsonint(tj, -1);
+    if (!validsid(sid)) {
+        reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    } else if (!all && (tj->type!=JSON_NUMBER || turn<0)) {
+        reply(e, scratch, id, 0, "turn must be a turn's number, or 0 for none", sid);
+        return;
+    }
+    Session *s = findsession(e, sid);
+    if (s && (busy(s) || s->intask)) {
+        reply(e, scratch, id, 0, "busy: fork once the turn ends", sid);
+        return;
+    }
+    Str sessions = join(&scratch, e->statedir, "sessions");
+    Str from     = join(&scratch, sessions, sid);
+    Str path     = join(&scratch, from, "events.jsonl");
+    if (os_stat(os, scratch, path).type != STAT_FILE) {
+        reply(e, scratch, id, 0, "no such session", sid);
+        return;
+    }
+    Arena  lines = newarena(e->replay);
+    Replay rp    = logreplay(os, &lines, scratch, path, sid, 0, LOG_MAX);
+    if (!rp.ok) {
+        reply(e, scratch, id, 0, "cannot read the session's log", sid);
+        return;
+    }
+
+    // The directory as lines may spell it: as given, and for real
+    Str        to   = freshsid(e, &scratch);
+    Str        dir  = join(&scratch, sessions, to);
+    Slice<Str> olds = {};
+    Slice<Str> news = {};
+    olds = push(&scratch, olds, from);
+    news = push(&scratch, news, dir);
+    Str real = os_realpath(os, &scratch, from);
+    if (real.len>sid.len && endswith(real, sid) && !(real == from)) {
+        olds = push(&scratch, olds, real);
+        news = push(&scratch, news, concat(&scratch, cuttail(real, sid.len), to));
+    }
+    LogCopy c = logcopy(&lines, scratch, rp.lines, sid, to, olds, news, turn,
+                        os_time(os), HOST_WINDOWS);
+    if (c.err.len) {
+        reply(e, scratch, id, 0, c.err, sid);
+        return;
+    }
+    Str lock = join(&scratch, from, "lock");
+    if (all && c.open && os_lockheld(os, scratch, lock)) {
+        reply(e, scratch, id, 0, "busy in another process: fork it at a turn "
+              "that has ended", sid);
+        return;
+    }
+
+    // Its files, of those regular files there that the log names
+    Map<b32> *have = 0;
+    for (i32 k = 0; k < 2; k++) {
+        Str sub = k ? Str("snap") : Str("out");
+        for (Dirent *d = os_list(os, &scratch, join(&scratch, from, sub)); d; d = d->next) {
+            if (!d->isdir) {
+                *upsert(&have, join(&scratch, sub, d->name), &scratch) = 1;
+            }
+        }
+    }
+    Str out = join(&scratch, dir, "out");
+    Str log = join(&scratch, dir, "events.jsonl");
+    b32 ok  = os_mkdirs(os, scratch, out);
+    for (iz i = 0; ok && i<c.files.len; i++) {
+        Str rel = c.files[i];
+        if (!upsert(&have, rel, (Arena *)0)) {
+            continue;  // named, but not there
+        }
+        Str src = join(&scratch, from, rel);
+        Str dst = join(&scratch, dir, rel);
+        ok = (os_stat(os, scratch, parentdir(dst)).type==STAT_DIR ||
+              os_mkdirs(os, scratch, parentdir(dst))) &&
+             os_copyfile(os, scratch, src, dst);
+    }
+    Str group = sidecarget(e, &scratch, sid, "group", GROUP_MAX);
+    ok = ok && sidecarwrite(e, scratch, to, "title", c.title);
+    ok = ok && (!group.len || sidecarwrite(e, scratch, to, "group", group));
+    ok = ok && (!c.model.len || sidecarwrite(e, scratch, to, "model", c.model));
+    ok = ok && os_write(os, scratch, log, c.log);
+    if (!ok) {
+        totrash(e, scratch, dir, to);
+        reply(e, scratch, id, 0, "cannot write the fork's files", sid);
+        return;
+    }
+
+    // With the next prompt, unless the reply would then be too long for
+    // the frontend's mailbox
+    for (i32 pass = 0; pass < 2; pass++) {
+        Arena a = scratch;
+        Buf   b(&a, 256 + (pass ? 0 : c.next.len + c.next.len/8));
+        EvOut w = evbegin(&b, to, 0, os_time(os), EV_REPLY);
+        putintkey(&w.json, "id", id);
+        putintkey(&w.json, "ok", 1);
+        putstrkey(&w.json, "from", sid);
+        putintkey(&w.json, "turn", c.turn);
+        if (!pass && c.next.len) {
+            putstrkey(&w.json, "next", c.next);
+        }
+        Str line = evend(&w);
+        if (pass || line.len<=mailmax(e->out)) {
+            emit(e, line);
+            break;
+        }
+    }
+}
+
 // After the configuration reloads: each session takes up its endpoint's
 // and model's settings for its next request, and the guard's roots for
 // its next call. The system prompt stays as it was, byte for byte, to
@@ -8258,12 +8842,10 @@ static void command(Engine *e, Arena scratch, Str line)
         cmdsidecar(e, scratch, id, cmd, j);
         return;
     case CMD_DELETE:
+        cmddelete(e, scratch, id, j);  // on a session open here or not
+        return;
     case CMD_FORK:
-        if (!validsid(sid)) {
-            reply(e, scratch, id, 0, "invalid session id", {});
-        } else {
-            reply(e, scratch, id, 0, "not implemented yet", sid);
-        }
+        cmdfork(e, scratch, id, j);
         return;
     case CMD_RENAME:
         cmdrename(e, scratch, id, j);  // on a session open here or not
@@ -8359,12 +8941,14 @@ static void command(Engine *e, Arena scratch, Str line)
         } else if (req != s->ask.req) {
             Str err = concat(&scratch, "no such request: the one waiting is ", s->ask.req);
             reply(e, scratch, id, 0, err, sid);
-        } else if (decision!="allow" && decision!="deny") {
-            reply(e, scratch, id, 0, "decision must be \"allow\" or \"deny\"", sid);
+        } else if (decision!="allow" && decision!="deny" && decision!="always") {
+            reply(e, scratch, id, 0, "decision must be \"allow\", \"always\" or \"deny\"", sid);
+        } else if (decision=="always" && !s->ask.grant.len) {
+            reply(e, scratch, id, 0, "this ask offers no always: allow or deny it", sid);
         } else {
             reply(e, scratch, id, 1, {}, sid);
             Str note = jsonstr(jsonget(j, "note"));
-            resolve(s, scratch, decision=="allow", DENY_USER, note);
+            resolve(s, scratch, decision!="deny", DENY_USER, note, decision=="always");
             nexttool(s, scratch);
         }
     } return;
@@ -8568,6 +9152,7 @@ static void enginethread(void *arg)
 {
     Engine *e = (Engine *)arg;
     cfgrefresh(e->cfg, newarena(e->scratch), 0);  // what loaded from a cache
+    sweeptrash(e, newarena(e->scratch));
     for (;;) {
         i64 now  = os_ticks(e->os);
         i64 next = e->quitting ? e->quitby : I64MAX;
@@ -8734,13 +9319,14 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     if (!e->in || !r || !e->scratch || !e->replay) {
         return 0;
     }
-    e->perm    = newarena(r);
-    Str exe    = os_exepath(os, &e->perm);
-    e->exedir  = parentdir(exe);
-    e->te      = findshell(os, &e->perm, newarena(e->scratch), e->exedir, HOST_WINDOWS);
-    e->te.exe  = exe;
-    e->env     = os_environ(os, &e->perm);
-    e->home    = os_getenv(os, &e->perm, "HOME");
+    e->perm     = newarena(r);
+    Str exe     = os_exepath(os, &e->perm);
+    e->exedir   = parentdir(exe);
+    e->te       = findshell(os, &e->perm, newarena(e->scratch), e->exedir, HOST_WINDOWS);
+    e->te.exe   = exe;
+    e->env      = os_environ(os, &e->perm);
+    e->tempdirs = os_tempdirs(os, &e->perm);
+    e->home     = os_getenv(os, &e->perm, "HOME");
     if (HOST_WINDOWS && !e->home.len) {
         e->home = os_getenv(os, &e->perm, "USERPROFILE");
     }

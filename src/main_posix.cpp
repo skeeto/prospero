@@ -444,6 +444,160 @@ static b32 os_remove(Os *, Arena scratch, Str path)
     return (errno==EISDIR || errno==EPERM) && !rmdir(p);
 }
 
+// A directory being removed (os_removetree): its descriptor, its name in
+// its parent's, and the names in it, read at once so that only the one
+// descriptor stays open while its subdirectories are.
+struct RmDir {
+    i32    fd;
+    char  *name;
+    char **names;
+    iz     len;
+    iz     next;
+};
+
+// Open a directory in dir, never through a link, made this user's to
+// change (rwx) if it was not, so that its entries can go. -1 on failure.
+static i32 rmopen(i32 dir, char *name)
+{
+    i32 flags = O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC;
+    i32 fd    = openat(dir, name, flags);
+    // Unreadable: AT_SYMLINK_NOFOLLOW fails rather than follow
+    if (fd<0 && errno==EACCES && !fchmodat(dir, name, 0700, AT_SYMLINK_NOFOLLOW)) {
+        fd = openat(dir, name, flags);
+    }
+    struct stat st;
+    if (fd>=0 && !fstat(fd, &st) && (st.st_mode&0700)!=0700) {
+        fchmod(fd, (st.st_mode & 07777) | 0700);
+    }
+    return fd;
+}
+
+// The names in a directory, but "." and "..", or null names on failure.
+static RmDir rmread(Arena *a, i32 fd, char *name)
+{
+    RmDir r = {};
+    r.fd   = fd;
+    r.name = name;
+    i32  dup  = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    DIR *dir  = dup<0 ? 0 : fdopendir(dup);
+    if (!dir) {
+        if (dup >= 0) close(dup);
+        return r;
+    }
+    Slice<char *> names = {};
+    for (struct dirent *e; (e = readdir(dir));) {
+        Str n = {(u8 *)e->d_name, 0};
+        while (n.data[n.len]) n.len++;
+        if (!(n == ".") && !(n == "..")) {
+            names = push(a, names, cstr(a, n));
+        }
+    }
+    closedir(dir);
+    r.names = names.data ? names.data : alloc<char *>(a);
+    r.len   = names.len;
+    return r;
+}
+
+// Depth first with a stack of its own, descending only into directories
+// found by fstatat without following, each opened with O_NOFOLLOW, every
+// name taken relative to its directory's descriptor: a link anywhere in
+// the tree, or one put in place of a directory meanwhile, is unlinked,
+// never followed.
+static b32 os_removetree(Os *, Arena scratch, Str path)
+{
+    if (!path.len || hasnul(path)) {
+        return 0;
+    }
+    char *p = cstr(&scratch, path);
+    struct stat st;
+    if (lstat(p, &st)) {
+        return errno == ENOENT;
+    } else if (!S_ISDIR(st.st_mode)) {
+        return !unlink(p) || errno==ENOENT;
+    }
+    i32 fd = rmopen(AT_FDCWD, p);
+    if (fd < 0) {
+        return errno == ENOENT;
+    }
+
+    b32          ok    = 1;
+    Slice<RmDir> stack = {};
+    RmDir        top   = rmread(&scratch, fd, p);
+    ok &= !!top.names;
+    stack = push(&scratch, stack, top);
+    while (stack.len) {
+        RmDir *d = &stack[stack.len-1];
+        if (d->next < d->len) {
+            char *name = d->names[d->next++];
+            if (fstatat(d->fd, name, &st, AT_SYMLINK_NOFOLLOW)) {
+                ok &= errno == ENOENT;
+            } else if (!S_ISDIR(st.st_mode)) {
+                ok &= !unlinkat(d->fd, name, 0) || errno==ENOENT;
+            } else if ((fd = rmopen(d->fd, name)) < 0) {
+                ok &= errno == ENOENT;
+            } else {
+                RmDir sub = rmread(&scratch, fd, name);
+                ok &= !!sub.names;
+                stack = push(&scratch, stack, sub);
+            }
+            continue;
+        }
+        RmDir done = *d;
+        stack.len--;
+        close(done.fd);
+        if (stack.len) {
+            RmDir *up = &stack[stack.len-1];
+            ok &= !unlinkat(up->fd, done.name, AT_REMOVEDIR) || errno==ENOENT;
+        } else {
+            ok &= !rmdir(p) || errno==ENOENT;
+        }
+    }
+    return ok;
+}
+
+static b32 os_copyfile(Os *, Arena scratch, Str from, Str to)
+{
+    if (hasnul(from) || hasnul(to)) {
+        return 0;
+    }
+    i32 in = open(cstr(&scratch, from), O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    if (in < 0) {
+        return 0;
+    }
+    struct stat st;
+    if (fstat(in, &st) || !S_ISREG(st.st_mode)) {
+        close(in);
+        return 0;
+    }
+    char *dst = cstr(&scratch, to);
+    i32   out = open(dst, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0666);
+    if (out < 0) {
+        close(in);
+        return 0;
+    }
+    iz  cap = (iz)1 << 16;
+    u8 *buf = allocbytes(&scratch, cap);
+    b32 ok  = 1;
+    for (;;) {
+        iz n = read(in, buf, (uz)cap);
+        if (n<0 && errno==EINTR) {
+            continue;
+        } else if (n <= 0) {
+            ok = !n;
+            break;
+        } else if (!writeall(out, {buf, n})) {
+            ok = 0;
+            break;
+        }
+    }
+    close(in);
+    ok &= !close(out);
+    if (!ok) {
+        unlink(dst);
+    }
+    return ok;
+}
+
 static b32 os_print(Os *, i32 fd, Str s)
 {
     return writeall(fd, s);
@@ -2412,6 +2566,47 @@ static b32 privatedir(char *path)
         return 0;
     }
     return !(st.st_mode & 077) || !chmod(path, 0700);
+}
+
+// $TMPDIR if it is an absolute path, without trailing slashes, else null.
+static Str tmpdirenv()
+{
+    char *env = getenv("TMPDIR");
+    if (!env || env[0]!='/') {
+        return {};
+    }
+    Str dir = {(u8 *)env, 0};
+    while (dir.data[dir.len]) dir.len++;
+    for (; dir.len>1 && dir[dir.len-1]=='/'; dir.len--) {}
+    return dir;
+}
+
+static Str os_scratchdir(Os *, Arena *a)
+{
+    Str base = tmpdirenv();
+    base = base.len ? base : Str("/tmp");
+    Arena save = *a;
+    Buf   b(a, base.len + 32);
+    print(&b, base);
+    print(&b, base.len>1 ? Str("/prospero-") : Str("prospero-"));
+    print(&b, (i64)geteuid());
+    Str   dir = finish(&b);
+    Arena tmp = *a;
+    if (!privatedir(cstr(&tmp, dir))) {
+        *a = save;
+        return {};
+    }
+    return dir;
+}
+
+static Slice<Str> os_tempdirs(Os *, Arena *a)
+{
+    Slice<Str> r   = {};
+    Str        env = tmpdirenv();
+    if (env.len && !(env == "/tmp")) {
+        r = push(a, r, clone(a, env));
+    }
+    return push(a, r, Str("/tmp"));
 }
 
 static Str os_endpoint(Os *, Arena *a, Str statedir, Str name)

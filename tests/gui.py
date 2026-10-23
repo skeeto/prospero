@@ -337,6 +337,11 @@ class Local:
         self.args = args
         self.root = tempfile.mkdtemp(prefix="prospero-gui-")
         self.prospero = os.path.abspath(args.prospero)
+        # The system's temporary directory for what this starts, as the
+        # sessions' scratch directories go there
+        tmp = os.path.join(self.root, "tmp")
+        os.makedirs(tmp)
+        os.environ.update({"TMP": tmp, "TEMP": tmp} if os.name == "nt" else {"TMPDIR": tmp})
 
     def path(self, *parts):
         return os.path.join(self.root, *parts)

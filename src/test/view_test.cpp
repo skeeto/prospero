@@ -334,6 +334,33 @@ static void test_view(Test *t)
         expect(t, "view.deniedopen", istr(&a, v->msgs[0].collapsed), "0");
     }
 
+    // Always: the ask offers a grant, the answer allows it for good, and
+    // the grant record that follows changes nothing shown; a fork's
+    // session record names its original
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","forked_from":"o","fork_turn":2,)"
+                    R"("cwd":"/w","scratch":"/t/prospero-1/s"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"c5","name":"read","args":"{\"path\":\"/x/y\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"ask","req":"c5/ask","call":"c5","kind":"path",)"
+                    R"("tool":"read","path":"/x/y","detail":"outside","always":"/x","access":"read",)"
+                    R"("deadline":30000,"dflt":"deny"})");
+        ViewTool *k = v->msgs[1].tool;
+        expect(t, "view.always", concat(&a, k->grant, concat(&a, " ", k->access)), "/x read");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"answer","req":"c5/ask","decision":"allow",)"
+                    R"("by":"user","note":"","always":1})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"grant","path":"/x","access":"read",)"
+                    R"("by":"user","req":"c5/ask"})");
+        expect(t, "view.alwaysanswer", istr(&a, v->asks*100 + k->answer*10 + k->always),
+               concat(&a, istr(&a, VASK_ALLOWED), "1"));
+        expect(t, "view.grantseq", istr(&a, v->lastseq), "5");
+        expect(t, "view.fork", concat(&a, v->forkedfrom, concat(&a, " ", istr(&a, v->forkturn))),
+               "o 2");
+        expect(t, "view.scratch", v->scratch, "/t/prospero-1/s");
+    }
+
     // A crash while asking leaves no answer, and recovery ends the call:
     // its end closes the card too
     {

@@ -86,7 +86,8 @@
 // model keeps its own, as its own runs or the configuration have it.
 //
 // The engine takes these from new for each run: edit_format, tools,
-// steps, instructions "project" and fallback 0 (engine.cpp, cmdnew),
+// steps, instructions "project", fallback 0 and temp "ask", as the
+// runs' directories are in the temporary directory (engine.cpp, cmdnew),
 // and close with forget lets each session go once its run is over.
 //
 // This is free and unencumbered software released into the public domain.
@@ -1246,6 +1247,7 @@ static void evalbegin(Eval *ev, Arena scratch, Arena *perm, EvalRun *run)
     putintkey(&w.json, "steps", t->steps);
     putstrkey(&w.json, "instructions", "project");
     putintkey(&w.json, "fallback", 0);
+    putstrkey(&w.json, "temp", "ask");
     putstrkey(&w.json, "prompt", t->prompt);
     enginecmd(ev->e, cuttail(evend(&w), 1));
     run->state = RUN_TURN;

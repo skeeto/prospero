@@ -46,6 +46,8 @@
 // while any client has it open attended, and it closes, stopping its
 // jobs, when the last client that opened it closes it; a client that
 // goes away for good closes nothing, and a turn without clients goes on.
+// A session is deleted only while no other client has it, or one under
+// it, open, and the sessions deleted are closed for whoever had them.
 //
 // The host exits after [host] idle_exit (10 min) with no client
 // connected and nothing running (the engine's status: no turn, no job),
@@ -381,6 +383,42 @@ static b32 hostattended(Host *h, Str sid)
         HostSub *s = findsub(c, sid);
         if (s && s->attended) {
             return 1;
+        }
+    }
+    return 0;
+}
+
+// A session's parent, as records passing through told, else as its
+// log's first record says, kept from then on. Empty for none.
+static Str hostparent(Host *h, Arena scratch, Str sid)
+{
+    HostSess *ss = upsert(&h->sess, sid, (Arena *)0);
+    if (ss && ss->parent.len) {
+        return ss->parent;
+    }
+    Str  dir  = join(&scratch, join(&scratch, h->statedir, "sessions"), sid);
+    Read rd   = os_readat(h->os, &scratch, join(&scratch, dir, "events.jsonl"), 0, 4096);
+    Cut  line = cut(rd.data, '\n');
+    Str  p    = jsonstr(jsonget(evparse(&scratch, line.head).root, "parent"));
+    if (line.ok && validsid(p)) {
+        hostsess(h, sid)->parent = clone(&h->perm, p);
+        return hostsess(h, sid)->parent;
+    }
+    return {};
+}
+
+// Whether a client other than c has the session, or one under it, open.
+static b32 hostopenelse(Host *h, HostClient *c, Arena scratch, Str sid)
+{
+    for (HostClient *o = h->clients; o; o = o->next) {
+        for (HostSub *s = o==c || o->gone ? 0 : o->subs; s; s = s->next) {
+            Str at = s->sid;
+            for (i32 n = 0; at.len && n<=TASK_DEPTH+8; n++) {
+                if (at == sid) {
+                    return 1;
+                }
+                at = hostparent(h, scratch, at);
+            }
         }
     }
     return 0;
@@ -745,6 +783,14 @@ static void hostcommand(Host *h, HostClient *c, Arena scratch, Str line)
         q = hostforward(h, scratch, j, cmd, HOSTCMD_CLIENT, -1, -1);
         h->quitting |= q != 0;
         break;
+    case CMD_DELETE:
+        // Not from under another client
+        if (validsid(sid) && hostopenelse(h, c, scratch, sid)) {
+            hostreply(h, c, scratch, cid, 0, "open in another client", sid);
+            return;
+        }
+        q = hostforward(h, scratch, j, cmd, HOSTCMD_CLIENT, -1, -1);
+        break;
     default:
         q = hostforward(h, scratch, j, cmd, HOSTCMD_CLIENT, -1, -1);
     }
@@ -839,6 +885,14 @@ static void hostreplied(Host *h, Arena scratch, EvRec *r, Str line)
             hostsub(c, sid, q.from, q.attended);
         } else if (ok && q.cmd==CMD_NEW && validsid(r->sid)) {
             hostsub(c, r->sid, 0, q.attended);
+        }
+        if (q.cmd == CMD_DELETE) {
+            // Gone, also those deleted before a failure
+            for (Json *k = jsonget(r->root, "deleted")->child; k; k = k->next) {
+                for (HostClient *o = h->clients; o; o = o->next) {
+                    hostunsub(h, o, scratch, jsonstr(k));
+                }
+            }
         }
         Str out = hostreid(&scratch, r->root, q.cid);
         hostmust(h, c, scratch, out);

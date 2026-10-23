@@ -124,6 +124,20 @@ static void testlist(Test *t)
         expect(t, "scansessions", finish(&got),
                "aaaa>bbbb,eeee bbbb^aaaa>dddd cccc dddd^bbbb eeee^aaaa ffff "
                "gggg^hhhh>hhhh hhhh^gggg>gggg iiii ");
+
+        // What delete takes: a tree, each once, a cycle of parents too
+        Str roots[] = {"20260101-000000-aaaa", "20260101-000001-bbbb",
+                       "20260101-000006-gggg", "20260101-000008-iiii"};
+        Buf trees(&tmp, 256);
+        for (iz r = 0; r < countof(roots); r++) {
+            Slice<iz> tree = subtree(&tmp, &sc, *upsert(&sc.bysid, roots[r], (Arena *)0));
+            for (iz i = 0; i < tree.len; i++) {
+                print(&trees, cuthead(sc.list[tree[i]].sid, 16));
+                putbyte(&trees, i+1<tree.len ? ',' : ' ');
+            }
+        }
+        expect(t, "subtree", finish(&trees),
+               "aaaa,bbbb,eeee,dddd bbbb,dddd gggg,hhhh iiii ");
     }
 
     cmdlist(e, v.scratch, 1);
@@ -184,6 +198,61 @@ static void testlist(Test *t)
            "\"parked\":1}");
     expect(t, "list record", istr(&a, startswith(line, "{\"ts\":0,\"ev\":\"sessions\","
            "\"list\":[{\"sid\":\"20260101-000008-iiii\"")), "1");
+}
+
+// delete: a tree, checked whole first, refused while one of it is open in
+// another process, nothing moved then; else children first, each into
+// the trash, which a thread would empty (none starts in a test).
+static void testdelete(Test *t)
+{
+    Arena   a = t->perm;
+    CfgEnv  v = newcfgenv(&a);
+    Engine *e = alloc<Engine>(&a);
+    e->os       = v.os;
+    e->out      = newmailbox(&a, 1<<16, 0, 0);
+    e->statedir = "/s";
+    MadeSession made[] = {
+        {"20260101-000000-aaaa", {}},
+        {"20260101-000001-bbbb", "20260101-000000-aaaa"},
+        {"20260101-000002-cccc", "20260101-000001-bbbb"},
+        {"20260101-000003-dddd", {}},
+    };
+    makesessions(v.os, &a, {made, countof(made)});
+    iz held = os_lockfile(v.os, a, "/s/sessions/20260101-000002-cccc/lock");
+    command(e, v.scratch, "{\"cmd\":\"delete\",\"id\":1,\"sid\":\"20260101-000000-aaaa\"}");
+    os_unlockfile(v.os, held);
+    command(e, v.scratch, "{\"cmd\":\"delete\",\"id\":2,\"sid\":\"20260101-000000-aaaa\"}");
+    command(e, v.scratch, "{\"cmd\":\"delete\",\"id\":3,\"sid\":\"20260101-000000-aaaa\"}");
+
+    Buf  got(&a, 1024);
+    Mail m = mailtake(e->out);
+    for (Record r; (r = mailnext(&m)).ok;) {
+        EvRec rec = evparse(&a, r.data);
+        print(&got, jsonint(jsonget(rec.root, "id"), 0));
+        putbyte(&got, jsonint(jsonget(rec.root, "ok"), 0) ? '+' : '-');
+        print(&got, jsonstr(jsonget(rec.root, "err")));
+        for (Json *k = jsonget(rec.root, "deleted")->child; k; k = k->next) {
+            putbyte(&got, ' ');
+            print(&got, cuthead(jsonstr(k), 16));
+        }
+        putbyte(&got, '\n');
+    }
+    expect(t, "delete", finish(&got),
+           "1-open in another process: its subagent 20260101-000002-cccc\n"
+           "2+ cccc bbbb aaaa\n"
+           "3-no such session\n");
+    Buf left(&a, 256);
+    for (iz i = 0; i < countof(made); i++) {
+        Str dir = concat(&a, "/s/sessions/", made[i].sid);
+        print(&left, os_stat(v.os, a, dir).type==STAT_DIR ? cuthead(made[i].sid, 16) : Str("-"));
+    }
+    i32 trashed = 0;
+    for (Dirent *d = os_list(v.os, &a, "/s/trash"); d; d = d->next) {
+        trashed += startswith(d->name, "20260101-00000");
+    }
+    print(&left, " ");
+    print(&left, (i64)trashed);
+    expect(t, "delete left", finish(&left), "---dddd 3");
 }
 
 // Sidecars are written by the holder of the session's lock alone: this
@@ -381,6 +450,7 @@ static void test_engine(Test *t)
     testroles(t);
     testlist(t);
     testsidecars(t);
+    testdelete(t);
     testtargets(t);
     Arena *a = &t->perm;
 
@@ -545,7 +615,7 @@ static void test_engine(Test *t)
         expect(t, "hello", hello, finish(&want));
     }
 
-    // Not stopping: the commands of later work, already named
+    // Not stopping: the session commands, on sessions that are not there
     {
         Engine *e = alloc<Engine>(a);
         e->os  = newos(a, 1<<16);
@@ -578,10 +648,10 @@ static void test_engine(Test *t)
             putbyte(&got, '\n');
         }
         expect(t, "the commands to come", finish(&got),
-               "1-not implemented yet @2026\n"
+               "1-no such session @2026\n"
                "2-no such session @2026\n"
                "3-no such session @2026\n"
-               "4-not implemented yet @2026\n"
+               "4-no such session @2026\n"
                "5-no such session @2026\n"
                "6-invalid session id\n"
                "7-invalid session id\n"

@@ -171,6 +171,10 @@ static void  os_connclose(Os *, Conn *) {}
 static Detached os_detach(Os *, Arena, Slice<Str>, Str, Str) { return {}; }
 static i32   os_pid(Os *) { return 1; }
 static i32   os_responsible(Os *, i32) { return 0; }
+static b32   os_removetree(Os *, Arena, Str) { return 0; }
+static b32   os_copyfile(Os *, Arena, Str, Str) { return 0; }
+static Str   os_scratchdir(Os *, Arena *) { return {}; }
+static Slice<Str> os_tempdirs(Os *, Arena *) { return {}; }
 
 
 // Valid UTF-8 without surrogates or raw control characters.

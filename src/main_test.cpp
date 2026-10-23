@@ -331,6 +331,46 @@ static Str os_realpath(Os *os, Arena *a, Str path)
     return {};
 }
 
+// Links are only os_realpath's, so the tree never reaches through one.
+static b32 os_removetree(Os *os, Arena, Str path)
+{
+    for (VFile *f = os->files; f; f = f->next) {
+        Str p = f->path;
+        if (p==path || (startswith(p, path) && p.len>path.len && p[path.len]=='/')) {
+            f->exists = 0;
+        }
+    }
+    return 1;
+}
+
+static b32 os_copyfile(Os *os, Arena scratch, Str from, Str to)
+{
+    VFile *src = vfind(os, from, 0);
+    VFile *dst = vfind(os, to, 0);
+    if (!src || !src->exists || src->isdir || (dst && dst->exists)) {
+        return 0;
+    }
+    return os_write(os, scratch, to, src->data);
+}
+
+// $TMPDIR, else /tmp, as the test's environment has it.
+static Slice<Str> os_tempdirs(Os *os, Arena *a)
+{
+    Slice<Str> r   = {};
+    Str        env = os_getenv(os, a, "TMPDIR");
+    if (env.len && !(env == "/tmp")) {
+        r = push(a, r, env);
+    }
+    return push(a, r, Str("/tmp"));
+}
+
+static Str os_scratchdir(Os *os, Arena *a)
+{
+    Str dir = concat(a, os_tempdirs(os, a)[0], "/prospero-1");
+    os_mkdirs(os, *a, dir);
+    return dir;
+}
+
 static iz os_lockfile(Os *os, Arena, Str path)
 {
     iz slot = -1;

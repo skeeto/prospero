@@ -612,6 +612,100 @@ static void testrealpaths(ProcTest *p, Arena scratch)
     say(os, "real paths done");
 }
 
+// Trees and copies (delete, fork): os_removetree never follows a link,
+// to a file or a directory (on Windows a junction, which needs no
+// privilege, unlike a symlink), and removes read-only files and
+// directories; os_copyfile copies a file, never through a link nor over
+// another file. The shell makes the links and the read-only bits.
+static void testtrees(ProcTest *p, Arena scratch)
+{
+    Selftest *t    = p->t;
+    Os       *os   = p->os;
+    b32       win  = HOST_WINDOWS;
+    Str       tree = join(&scratch, p->dir, "tree");
+    Str       keep = join(&scratch, p->dir, "keep");
+    Str       kept[] = {join(&scratch, keep, "f.txt"), join(&scratch, keep, "sub/g.txt")};
+    Str       dirs[] = {join(&scratch, tree, "a/b/c"), join(&scratch, keep, "sub")};
+    Str       made[] = {join(&scratch, tree, "a/b/c/x.txt"), join(&scratch, tree, "a/ro.txt"),
+                        join(&scratch, tree, "f.txt")};
+    for (iz i = 0; i < countof(dirs); i++) {
+        os_mkdirs(os, scratch, dirs[i]);
+    }
+    for (iz i = 0; i < countof(made); i++) {
+        os_write(os, scratch, made[i], "x");
+    }
+    for (iz i = 0; i < countof(kept); i++) {
+        os_write(os, scratch, kept[i], "keep");
+    }
+    Str cmd = win ?
+        Str("cd tree && mkdir rodir && echo y >rodir/y && cmd /c attrib +r rodir\\y && "
+            "cmd /c attrib +r a\\ro.txt && cmd /c mklink /J dirlink '..\\keep' && "
+            "cmd /c mklink /J a\\b\\deep '..\\..\\keep'") :
+        Str("cd tree && mkdir rodir && echo y >rodir/y && chmod 400 rodir/y a/ro.txt && "
+            "chmod 500 rodir && ln -s ../keep dirlink && ln -s ../keep/f.txt filelink && "
+            "ln -s ../../../keep a/b/deep && ln -s nowhere dangling && chmod 500 a/b");
+    Str   log = join(&scratch, p->dir, "trees.log");
+    Proc *pr  = spawnsh(p, scratch, cmd, log, 1<<16);
+    ProcWatch w = {};
+    b32 shell = pr && procwatch(os, p->mb, p->id, &w, 10000) && !w.code;
+    if (pr) {
+        os_procfree(os, pr);
+    }
+    b32 nolinks = !shell && win && find(os_read(os, &scratch, log, 1<<12).data, "'mklink'")>=0;
+    if (nolinks) {
+        say(os, "no mklink (Windows XP): trees without junctions");
+    } else if (!check(t, shell, "trees made by the shell")) {
+        say(os, os_read(os, &scratch, log, 1<<12).data);
+    }
+
+    check(t, os_removetree(os, scratch, tree), "os_removetree");
+    check(t, os_stat(os, scratch, tree).type==STAT_MISSING, "the tree is gone");
+    b32 intact = 1;
+    for (iz i = 0; i < countof(kept); i++) {
+        intact &= os_read(os, &scratch, kept[i], 64).data == "keep";
+    }
+    check(t, intact, "what its links led to is left alone");
+    check(t, os_removetree(os, scratch, tree), "a tree that is gone counts as removed");
+    Str file = join(&scratch, p->dir, "lone.txt");
+    os_write(os, scratch, file, "lone");
+    check(t, os_removetree(os, scratch, file) &&
+             os_stat(os, scratch, file).type==STAT_MISSING, "os_removetree of a file");
+
+    Str copy = join(&scratch, p->dir, "copy.txt");
+    Str none = join(&scratch, p->dir, "none");
+    Str to   = join(&scratch, p->dir, "none.txt");
+    check(t, os_copyfile(os, scratch, kept[0], copy) &&
+             os_read(os, &scratch, copy, 64).data=="keep", "os_copyfile");
+    check(t, !os_copyfile(os, scratch, kept[1], copy) &&
+             os_read(os, &scratch, copy, 64).data=="keep", "os_copyfile never over a file");
+    check(t, !os_copyfile(os, scratch, keep, to) && os_stat(os, scratch, to).type==STAT_MISSING,
+          "os_copyfile of a directory fails");
+    check(t, !os_copyfile(os, scratch, none, to) && os_stat(os, scratch, to).type==STAT_MISSING,
+          "os_copyfile of nothing fails");
+    os_remove(os, scratch, copy);
+    if (!win) {
+        Str link = join(&scratch, p->dir, "flink");
+        Proc *lp = spawnsh(p, scratch, "ln -s keep/f.txt flink", log, 1<<16);
+        ProcWatch lw = {};
+        b32 ok = lp && procwatch(os, p->mb, p->id, &lw, 10000) && !lw.code;
+        if (lp) {
+            os_procfree(os, lp);
+        }
+        check(t, ok && !os_copyfile(os, scratch, link, copy), "os_copyfile never through a link");
+        os_remove(os, scratch, link);
+    }
+    removeall(os, scratch, keep);
+
+    Slice<Str> temps = os_tempdirs(os, &scratch);
+    b32        ok    = temps.len > 0;
+    for (iz i = 0; i < temps.len; i++) {
+        ok &= os_stat(os, scratch, temps[i]).type==STAT_DIR &&
+              pathroot(temps[i], win) && (temps[i].len==1 || !issep(temps[i][temps[i].len-1], win));
+    }
+    check(t, ok, "os_tempdirs: directories, absolute, with no trailing separator");
+    say(os, "trees done");
+}
+
 static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
 {
     Os       *os = t->os;
@@ -642,6 +736,7 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     testresponsible(p, scratch);
     testspawnio(p, scratch);
     testrealpaths(p, scratch);
+    testtrees(p, scratch);
 }
 
 

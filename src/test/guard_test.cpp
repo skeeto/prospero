@@ -317,4 +317,63 @@ static void test_guard(Test *t)
     d.hint = guardhint(os, a, &g, d.gp.path, 0, 1);
     deny   = guarddenial(a, &d);
     expect(t, "denial example", istr(a, find(deny, "(for example /w/new.txt)")>0), "1");
+
+    // What "always" grants: the directory, a search's directory itself,
+    // the file alone in a root or the home directory, never those whole,
+    // and where a link leads out, the real directory
+    struct { Str path; b32 isdir; Str want; } grants[] = {
+        {"/x/y/f.txt",   0, "/x/y"},
+        {"/x/y",         1, "/x/y"},
+        {"/f.txt",       0, "/f.txt"},
+        {"/home/u/f",    0, "/home/u/f"},
+        {"~/sub/f",      0, "/home/u/sub"},
+        {"/",            1, "(none)"},
+        {"/home/u",      1, "(none)"},
+        {"/home/u/",     1, "(none)"},
+        {"out/passwd",   0, "/etc"},
+        {"out",          1, "/etc"},
+    };
+    for (iz i = 0; i < countof(grants); i++) {
+        GuardPath gp = guardpath(os, a, &g, grants[i].path, 1);
+        Str       gr = guardgrant(a, &g, &gp, grants[i].isdir);
+        expect(t, concat(a, "grant ", grants[i].path), gr.data ? gr : Str("(none)"),
+               grants[i].want);
+    }
+
+    // Grants and temporary directories as hidden roots: a directory not
+    // made yet, a file, one for reads alone, and /tmp, which is a link
+    // here as on macOS, where a link planted inside leads out still
+    os_mkdirs(os, *a, "/private/tmp");
+    os_mkdirs(os, *a, "/g");
+    os_write(os, *a, "/g/file.txt", "data");
+    os_write(os, *a, "/private/tmp/near/x.c", "data");
+    vlink(os, "/private/tmp/evil", "/etc");
+    Guard h = newguard(os, a, "/w", "/home/u", {}, "/s/sess", 0);
+    guardadd(os, a, &h, "/g/later", ROOT_HIDDEN|ROOT_MISSING);
+    guardadd(os, a, &h, "/g/file.txt", ROOT_HIDDEN|ROOT_MISSING);
+    guardadd(os, a, &h, "/x/extra", ROOT_HIDDEN|ROOT_MISSING|ROOT_READ);
+    guardadd(os, a, &h, "/tmp", ROOT_HIDDEN);
+    guardadd(os, a, &h, "/nowhere", ROOT_HIDDEN);
+    expect(t, "hidden roots", istr(a, h.roots.len), "6");
+    expect(t, "hidden root real", h.roots[5].real, "/private/tmp");
+    struct { Str path; b32 read; Str want; } hidden[] = {
+        {"/g/later/new.txt",    0, "/g/later/new.txt I"},
+        {"/g/later",            0, "/g/later I"},
+        {"/g/other.txt",        0, "/g/other.txt O"},
+        {"/g/file.txt",         0, "/g/file.txt I"},
+        {"/x/extra/f",          1, "/x/extra/f I"},
+        {"/x/extra/f",          0, "/x/extra/f O"},
+        {"/tmp/t.txt",          0, "/tmp/t.txt I"},
+        {"/private/tmp/t.txt",  0, "/private/tmp/t.txt I"},
+        {"/tmp/evil/passwd",    1, "/tmp/evil/passwd D"},
+        {"/nowhere/f",          0, "/nowhere/f O"},
+    };
+    for (iz i = 0; i < countof(hidden); i++) {
+        GuardPath gp = guardpath(os, a, &h, hidden[i].path, hidden[i].read);
+        Str got = concat(a, gp.path, gp.inside ? Str(" I") : gp.diverged ? Str(" D") : Str(" O"));
+        expect(t, concat(a, "hidden root ", hidden[i].path), got, hidden[i].want);
+    }
+    // A hint is never in a hidden root
+    GuardHint nh = guardhint(os, a, &h, "/q/near/x.c", 1, 0);
+    expect(t, "no hint in a hidden root", nh.path.data ? nh.path : Str("(none)"), "(none)");
 }

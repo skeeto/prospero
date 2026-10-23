@@ -246,6 +246,9 @@ struct ViewTool {
     Str  hint;
     i64  deadline;  // epoch ms
     i32  answer;    // VASK_*
+    Str  grant;     // what always would allow: a directory or a file
+    Str  access;    // and for what: read or write
+    b32  always;    // allowed for good (a grant)
     Str  by;
     Str  note;
 };
@@ -424,6 +427,9 @@ struct View {
     i32             depth;
     Str             tools;      // those offered, if restricted: blank separated
     Str             roleprompt;
+    Str             scratch;    // its scratch directory, if any
+    Str             forkedfrom; // the session it was forked from, if any
+    i64             forkturn;   // and the turn it was cut after
     i32             turn;
     i32             attempt;
     b32             busy;       // a turn is running
@@ -1347,6 +1353,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->pcall    = clone(&v->aux, jsonstr(jsonget(j, "call")));
         v->depth    = (i32)jsonint(jsonget(j, "depth"), 0);
         v->roleprompt = clone(&v->aux, jsonstr(jsonget(j, "prompt")));
+        v->scratch    = clone(&v->aux, jsonstr(jsonget(j, "scratch")));
+        v->forkedfrom = clone(&v->aux, jsonstr(jsonget(j, "forked_from")));
+        v->forkturn   = jsonint(jsonget(j, "fork_turn"), 0);
         {
             Buf b(&scratch, 256);
             for (Json *t = jsonget(j, "tools")->child; t; t = t->next) {
@@ -1603,6 +1612,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->detail   = clone(&v->aux, detail);
         t->hint     = clone(&v->aux, hint);
         t->deadline = jsonint(jsonget(j, "deadline"), r->ts);
+        t->grant    = clone(&v->aux, jsonstr(jsonget(j, "always")));
+        t->access   = clone(&v->aux, jsonstr(jsonget(j, "access")));
         v->msgs[i].tool = t;
         v->msgs[i].seq  = r->seq;
         v->asks++;
@@ -1627,6 +1638,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->answer = allow ? VASK_ALLOWED : VASK_DENIED;
         t->by     = clone(&v->aux, jsonstr(jsonget(j, "by")));
         t->note   = clone(&v->aux, jsonstr(jsonget(j, "note")));
+        t->always = allow && jsonflag(jsonget(j, "always"), 0);
         m->ver++;
         v->topsdirty = 1;  // no more buttons
     } return 1;

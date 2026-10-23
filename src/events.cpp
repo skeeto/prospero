@@ -165,6 +165,10 @@ static Str capnames[] = {
     "compact",         // compact, a turn of its own (via "compact")
     "model",           // model, and the durable model record
     "gauge",           // ctx, compact_at and tokens on attempt, turn.end, live
+    "answer.always",   // answer {decision:"always"} for an ask's always
+    "scratch",         // a scratch directory per session, and [guard] temp
+    "delete",          // delete, a session with its subagents
+    "fork",            // fork, a new session from a turn of another
 };
 
 static Str evname(i32 ev)
@@ -731,4 +735,275 @@ static Replay logreplay(Os *os, Arena *perm, Arena scratch, Str path,
                         Str sid, i64 from, iz max)
 {
     return logreplayat(os, perm, scratch, path, sid, from, 0, max);
+}
+
+
+// Copies of logs
+//
+// A fork is a new session made from another's log (logcopy): its records
+// up to a cut, under the new sid, with their seq numbers, to which
+// compaction records refer. The cut follows the end of a turn,
+// turn.end{turn:N}, and keeps what came between turns after it (a job's
+// end, a rewind, a model switch, notes) up to the next turn's first
+// record, user or turn. Turn 0 keeps the settings with no history, and
+// no turn the whole log. Every line kept names the new session: its sid,
+// and its directory wherever a path named the old one, as a tool result
+// names a spill file, in each spelling as JSON escapes it (a Windows
+// path's backslashes doubled), so that the copy never depends on the
+// original. The session record says where it came from (forked_from,
+// fork_turn) right after ev, where the sessions list, which reads only a
+// log's first 4 KiB, finds it, and a title record "TITLE (fork)" ends the
+// log. It is pure, so that an import can make use of it too.
+
+struct LogCopy {
+    Str        log;    // the new events.jsonl, null on failure
+    Str        err;    // why not
+    Str        next;   // the prompt that began the turn after the cut
+    Str        title;  // the copy's own
+    Str        model;  // as a model record left it at the cut, else null
+    i64        turn;   // the last turn kept
+    b32        open;   // the lines kept end inside a turn
+    Slice<Str> files;  // the out/ and snap/ files they name, as "out/NAME"
+};
+
+// A string as JSON escapes it, without its quotes.
+static Str jsonescaped(Arena *a, Str s)
+{
+    Buf b(a, s.len + 16);
+    printjsonstr(&b, s);
+    return cuttail(cuthead(finish(&b), 1), 1);
+}
+
+// Print s with each whole occurrence of olds[k], one not followed by more
+// of a name, replaced by news[k].
+static void printreplaced(Buf *b, Str s, Slice<Str> olds, Slice<Str> news)
+{
+    iz last = 0;
+    for (iz i = 0; i < s.len;) {
+        iz k = 0;
+        for (; k < olds.len; k++) {
+            Str o   = olds[k];
+            iz  end = i + o.len;
+            if (o.len && o.len<=s.len-i && s[i]==o[0] &&
+                    !__builtin_memcmp(s.data+i, o.data, (uz)o.len) &&
+                    (end==s.len || !(alnum(s[end]) || s[end]=='-' || s[end]=='_'))) {
+                break;
+            }
+        }
+        if (k == olds.len) {
+            i++;
+            continue;
+        }
+        print(b, span(s.data+last, s.data+i));
+        print(b, news[k]);
+        i   += olds[k].len;
+        last = i;
+    }
+    print(b, cuthead(s, last));
+}
+
+// Whether a byte ends a file name written in a log.
+static b32 nameend(u8 c)
+{
+    return c<0x20 || c=='"' || c=='\\' || c=='/' || c==' ' || c==',' || c==';' ||
+           c==':' || c=='\'' || c=='`' || c=='(' || c==')' || c=='<' || c=='>' ||
+           c=='[' || c==']' || c=='{' || c=='}' || c=='|' || c=='*' || c=='?';
+}
+
+// The out/ and snap/ files a log names, as "out/NAME": in a relative
+// path or after the session directory, with either separator, and also
+// without the dots that may end a sentence. Some may name nothing.
+static Slice<Str> lognames(Arena *a, Str log)
+{
+    static Str const dirs[] = {"out/", "snap/", "out\\\\", "snap\\\\"};
+    Slice<Str> r    = {};
+    Map<b32>  *seen = 0;
+    for (iz i = 0; i < log.len; i++) {
+        if (log[i]!='o' && log[i]!='s') {
+            continue;
+        }
+        for (iz k = 0; k < countof(dirs); k++) {
+            Str d = dirs[k];
+            if (d.len>log.len-i || __builtin_memcmp(log.data+i, d.data, (uz)d.len)) {
+                continue;
+            }
+            iz beg = i + d.len;
+            iz end = beg;
+            for (; end<log.len && !nameend(log[end]); end++) {}
+            Str name = span(log.data+beg, log.data+end);
+            Str dir  = d[0]=='o' ? Str("out/") : Str("snap/");
+            for (i32 pass = 0; pass<2 && name.len; pass++) {
+                Str  rel = concat(a, dir, name);
+                b32 *got = upsert(&seen, rel, a);
+                if (!*got) {
+                    *got = 1;
+                    r    = push(a, r, rel);
+                }
+                for (; name.len && name[name.len-1]=='.'; name.len--) {}
+            }
+            break;
+        }
+    }
+    return r;
+}
+
+// Copy a log, its replayed lines, for session to, cut after turn (all of
+// it if negative), with the session directory spelled olds[k] replaced
+// by news[k] in every line, and a title record at now. With win, each in
+// either separator too.
+static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
+                       Str to, Slice<Str> olds, Slice<Str> news, i64 turn,
+                       i64 now, b32 win)
+{
+    LogCopy r = {};
+    if (!lines.len || evparse(&scratch, lines[0]).ev!=EV_SESSION) {
+        r.err = "the session's log does not begin with its session record";
+        return r;
+    } else if (jsonget(evparse(&scratch, lines[0]).root, "parent")->type == JSON_STRING) {
+        r.err = "a subagent cannot be forked, only the session it worked for";
+        return r;
+    }
+
+    // The cut: after turn.end{turn}, then on to the next turn's start
+    // (end -2 while looking for it)
+    iz  end   = turn<0 ? lines.len : -1;
+    i64 most  = 0;
+    Str title = {};
+    for (iz i = 0; i < lines.len; i++) {
+        Arena t     = scratch;
+        EvRec rec   = evparse(&t, lines[i]);
+        b32   begin = i>0 && (rec.ev==EV_USER || rec.ev==EV_TURN);
+        if (rec.ev == EV_TITLE) {
+            title = clone(a, jsonstr(jsonget(rec.root, "text")));
+        } else if (rec.ev == EV_TURN) {
+            i64 n = jsonint(jsonget(rec.root, "n"), 0);
+            most  = n>most ? n : most;
+        }
+        if (end==-1 && turn==0 && begin) {
+            end = i;
+        } else if (end==-1 && turn>0 && rec.ev==EV_TURNEND &&
+                   jsonint(jsonget(rec.root, "turn"), -1)==turn) {
+            end = -2;
+        } else if (end==-2 && begin) {
+            end = i;
+        }
+    }
+    end = end==-2 || (end==-1 && turn==0) ? lines.len : end;
+    if (end < 0) {
+        Buf b(&scratch, 64);
+        print(&b, turn>most ? Str("no turn ") : Str("turn "));
+        print(&b, turn);
+        print(&b, turn>most ? Str(" in this session") : Str(" has not ended"));
+        r.err = clone(a, finish(&b));
+        return r;
+    }
+
+    // What the cut leaves
+    for (iz i = 0; i < end; i++) {
+        Arena t   = scratch;
+        EvRec rec = evparse(&t, lines[i]);
+        switch (rec.ev) {
+        case EV_TURN:
+            r.turn = jsonint(jsonget(rec.root, "n"), r.turn);
+            r.open = 1;
+            break;
+        case EV_TURNEND:
+            r.open = 0;
+            break;
+        case EV_MODEL:
+            r.model = clone(a, jsonstr(jsonget(rec.root, "model")));
+            break;
+        }
+    }
+    if (end < lines.len) {
+        EvRec rec = evparse(&scratch, lines[end]);
+        if (rec.ev == EV_USER) {
+            r.next = clone(a, jsonstr(jsonget(rec.root, "text")));
+        }
+    }
+    r.title = concat(a, title.len ? title : Str("Untitled"), " (fork)");
+    r.turn  = turn<0 ? r.turn : turn;
+
+    // Every spelling of the directory, escaped as in a line
+    Slice<Str> o = {};
+    Slice<Str> n = {};
+    for (iz k = 0; k<olds.len && k<news.len; k++) {
+        for (i32 form = 0; form < (win ? 3 : 1); form++) {
+            Str x = clone(&scratch, olds[k]);
+            Str y = clone(&scratch, news[k]);
+            u8  c = form==1 ? '/' : '\\';
+            for (iz i = 0; form && i<x.len; i++) {
+                x[i] = x[i]=='/' || x[i]=='\\' ? c : x[i];
+            }
+            for (iz i = 0; form && i<y.len; i++) {
+                y[i] = y[i]=='/' || y[i]=='\\' ? c : y[i];
+            }
+            x = jsonescaped(&scratch, x);
+            b32 dup = !x.len;
+            for (iz i = 0; i<o.len && !dup; i++) {
+                dup = o[i] == x;
+            }
+            if (!dup) {
+                o = push(&scratch, o, x);
+                n = push(&scratch, n, jsonescaped(&scratch, y));
+            }
+        }
+    }
+
+    Str head    = concat(&scratch, "{\"sid\":\"", jsonescaped(&scratch, from));
+    head        = concat(&scratch, head, "\",");
+    Str newhead = concat(&scratch, "{\"sid\":\"", jsonescaped(&scratch, to));
+    newhead     = concat(&scratch, newhead, "\",");
+    i64 last    = 0;
+    Buf out(a, 4096);
+    for (iz i = 0; i < end; i++) {
+        Arena t    = scratch;
+        Str   line = lines[i];
+        EvRec rec  = evparse(&t, line);
+        last = rec.seq;
+        if (i == 0) {
+            // Where it came from, early in the session record
+            Buf   b(&t, line.len + 256);
+            EvOut w = evbegin(&b, to, rec.seq, rec.ts, EV_SESSION);
+            putstrkey(&w.json, "forked_from", from);
+            putintkey(&w.json, "fork_turn", r.turn);
+            for (Json *m = rec.root->child; m; m = m->next) {
+                if (m->key=="sid" || m->key=="seq" || m->key=="ts" || m->key=="ev" ||
+                        m->key=="forked_from" || m->key=="fork_turn") {
+                    continue;
+                }
+                putkey(&w.json, m->key);
+                putjson(&w.json, m);
+            }
+            line = evend(&w);
+        } else if (startswith(line, head)) {
+            line = concat(&t, newhead, cuthead(line, head.len));
+        } else {
+            // Written some other way: the record anew, with the new sid
+            Buf     b(&t, line.len + 256);
+            JsonOut w = {&b};
+            putobject(&w);
+            putstrkey(&w, "sid", to);
+            for (Json *m = rec.root->child; m; m = m->next) {
+                if (!(m->key == "sid")) {
+                    putkey(&w, m->key);
+                    putjson(&w, m);
+                }
+            }
+            putend(&w);
+            putbyte(&b, '\n');
+            line = finish(&b);
+        }
+        printreplaced(&out, line, o, n);
+    }
+    {
+        Buf   b(&scratch, 256 + r.title.len);
+        EvOut w = evbegin(&b, to, last+1, now, EV_TITLE);
+        putstrkey(&w.json, "text", r.title);
+        putstrkey(&w.json, "by", "auto");
+        print(&out, evend(&w));
+    }
+    r.log   = finish(&out);
+    r.files = lognames(a, r.log);
+    return r;
 }

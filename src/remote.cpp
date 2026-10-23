@@ -27,22 +27,22 @@
 //
 // Each new host, or a host that lost records for this link, gets hello
 // first, and its protocol must match (HOST_PROTO): a different major is
-// a clear error, and the end. Then the sessions the frontend has open
-// are opened again, from the last record it has of each, attended as
-// before, so that it catches up over the link: a resync never reads
-// local files, which may be on another machine. Replies to the
-// library's own commands (negative ids) stay here, and replies the new
-// host can never give, to commands the old one may or may not have run,
-// fail. The frontend's commands wait while no host has answered hello,
-// then go in order, and fail if the remote ends instead: every command
-// gets one reply. Records pass to the frontend in order, waiting for
-// room in its mailbox, so none is ever lost there; a session's durable
-// records already passed are dropped, and the sessions list gains
-// "host", the remote's name. A "remote" record tells the frontend how
-// the link is: state connecting, up, down (retry_ms until the next
-// try), failed or closed, with msg saying why. Since the library keeps
-// the host's hello to itself, up passes on what it said of the engine
-// there: its version, cmds and caps.
+// a clear error, and the end. Then the sessions the frontend has open,
+// neither closed nor deleted since, are opened again, from the last
+// record it has of each, attended as before, so that it catches up over
+// the link: a resync never reads local files, which may be on another
+// machine. Replies to the library's own commands (negative ids) stay
+// here, and replies the new host can never give, to commands the old
+// one may or may not have run, fail. The frontend's commands wait while
+// no host has answered hello, then go in order, and fail if the remote
+// ends instead: every command gets one reply. Records pass to the
+// frontend in order, waiting for room in its mailbox, so none is ever
+// lost there; a session's durable records already passed are dropped,
+// and the sessions list gains "host", the remote's name. A "remote"
+// record tells the frontend how the link is: state connecting, up, down
+// (retry_ms until the next try), failed or closed, with msg saying why.
+// Since the library keeps the host's hello to itself, up passes on what
+// it said of the engine there: its version, cmds and caps.
 //
 // remoteclose ends the link with a disconnect frame: the host forgets
 // this client, and its sessions run on without it. remotefinish does so
@@ -829,6 +829,13 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
             return;  // the library's own
         }
         dropid(&r->pending, id);
+        // Deleted, as good as closed: never opened again on reconnecting
+        for (Json *k = jsonget(rec.root, "deleted")->child; k; k = k->next) {
+            RemoteSess *s = remotesess(r, jsonstr(k), 0);
+            if (s) {
+                s->open = 0;
+            }
+        }
         for (iz i = 0; i < r->news.len; i++) {
             RemoteNew n = r->news[i];
             if (n.id != id) {

@@ -48,6 +48,125 @@ static Str logshow(Arena *a, EventLog *log)
     return finish(&b);
 }
 
+// The seqs of a log's lines, then its sids where they are not "B".
+static Str logseqs(Arena *a, Str log)
+{
+    Buf b(a, 256);
+    for (Str rest = log; rest.len;) {
+        Cut   c   = cut(rest, '\n');
+        EvRec rec = evparse(a, c.head);
+        rest = c.tail;
+        print(&b, b.len ? Str(" ") : Str(""));
+        print(&b, rec.seq);
+        if (!(rec.sid == "B")) {
+            print(&b, concat(a, "!", rec.sid));
+        }
+    }
+    return finish(&b);
+}
+
+// A fork's copy of a log (logcopy): where the cut falls, the session
+// record and the sids, the session directory in each of its spellings,
+// and the files the copy names.
+static void testlogcopy(Test *t)
+{
+    Arena a       = t->perm;
+    Arena scratch = t->perm;
+    scratch.beg  += (scratch.end - scratch.beg)/2;
+    Str src[] = {
+        "{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"proto\":0,\"cwd\":\"/w\","
+        "\"scratch\":\"/t/prospero-1/A\"}\n",
+        "{\"sid\":\"A\",\"seq\":2,\"ts\":6,\"ev\":\"prefix\",\"system\":\"s\"}\n",
+        "{\"sid\":\"A\",\"seq\":3,\"ts\":7,\"ev\":\"user\",\"text\":\"one\"}\n",
+        "{\"sid\":\"A\",\"seq\":4,\"ts\":7,\"ev\":\"turn\",\"n\":1}\n",
+        "{\"sid\":\"A\",\"seq\":5,\"ts\":8,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":"
+        "\"see /s/sessions/A/out/c1.log, C:\\\\S\\\\sessions\\\\A\\\\out\\\\c2.log, "
+        "C:/S/sessions/A/snap/3. Not /s/sessions/AB/x\",\"spill\":\"out/c1.log\"}\n",
+        "{\"ts\":9,\"sid\":\"A\",\"seq\":6,\"ev\":\"title\",\"text\":\"First\",\"by\":\"auto\"}\n",
+        "{\"sid\":\"A\",\"seq\":7,\"ts\":9,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n",
+        "{\"sid\":\"A\",\"seq\":8,\"ts\":9,\"ev\":\"job.end\",\"job\":1}\n",
+        "{\"sid\":\"A\",\"seq\":9,\"ts\":9,\"ev\":\"turn\",\"n\":2,\"via\":\"job\"}\n",
+        "{\"sid\":\"A\",\"seq\":10,\"ts\":9,\"ev\":\"turn.end\",\"turn\":2,\"why\":\"done\"}\n",
+        "{\"sid\":\"A\",\"seq\":11,\"ts\":9,\"ev\":\"model\",\"model\":\"m2\"}\n",
+        "{\"sid\":\"A\",\"seq\":12,\"ts\":9,\"ev\":\"user\",\"text\":\"two\"}\n",
+        "{\"sid\":\"A\",\"seq\":13,\"ts\":9,\"ev\":\"turn\",\"n\":3}\n",
+    };
+    Slice<Str> lines = {src, countof(src), countof(src)};
+    Str        po[]  = {"/s/sessions/A"};
+    Str        pn[]  = {"/s/sessions/B"};
+    Str        wo[]  = {"C:\\S\\sessions\\A"};
+    Str        wn[]  = {"C:\\S\\sessions\\B"};
+    Slice<Str> posix = {po, 1, 1};
+    Slice<Str> posixnew = {pn, 1, 1};
+    Slice<Str> win   = {wo, 1, 1};
+    Slice<Str> winnew = {wn, 1, 1};
+
+    struct {
+        i64 turn;
+        Str want;  // seqs, the next prompt, the model, open, the turn
+    } cuts[] = {
+        { 1, "1 2 3 4 5 6 7 8 9 next= model= open=0 turn=1"},
+        { 2, "1 2 3 4 5 6 7 8 9 10 11 12 next=two model=m2 open=0 turn=2"},
+        { 0, "1 2 3 next=one model= open=0 turn=0"},
+        {-1, "1 2 3 4 5 6 7 8 9 10 11 12 13 14 next= model=m2 open=1 turn=3"},
+    };
+    for (iz i = 0; i < countof(cuts); i++) {
+        LogCopy c = logcopy(&a, scratch, lines, "A", "B", posix, posixnew,
+                            cuts[i].turn, 100, 0);
+        Buf     b(&a, 256);
+        print(&b, logseqs(&a, c.log));
+        print(&b, " next=");
+        print(&b, c.next);
+        print(&b, " model=");
+        print(&b, c.model);
+        print(&b, " open=");
+        print(&b, (i64)c.open);
+        print(&b, " turn=");
+        print(&b, c.turn);
+        expect(t, concat(&a, "logcopy cut ", istr(&a, cuts[i].turn)), finish(&b),
+               cuts[i].want);
+    }
+
+    LogCopy c = logcopy(&a, scratch, lines, "A", "B", posix, posixnew, 1, 100, 0);
+    Str     want =
+        "{\"sid\":\"B\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"forked_from\":\"A\","
+        "\"fork_turn\":1,\"proto\":0,\"cwd\":\"/w\",\"scratch\":\"/t/prospero-1/A\"}\n"
+        "{\"sid\":\"B\",\"seq\":2,\"ts\":6,\"ev\":\"prefix\",\"system\":\"s\"}\n"
+        "{\"sid\":\"B\",\"seq\":3,\"ts\":7,\"ev\":\"user\",\"text\":\"one\"}\n"
+        "{\"sid\":\"B\",\"seq\":4,\"ts\":7,\"ev\":\"turn\",\"n\":1}\n"
+        "{\"sid\":\"B\",\"seq\":5,\"ts\":8,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":"
+        "\"see /s/sessions/B/out/c1.log, C:\\\\S\\\\sessions\\\\A\\\\out\\\\c2.log, "
+        "C:/S/sessions/A/snap/3. Not /s/sessions/AB/x\",\"spill\":\"out/c1.log\"}\n"
+        "{\"sid\":\"B\",\"ts\":9,\"seq\":6,\"ev\":\"title\",\"text\":\"First\",\"by\":\"auto\"}\n"
+        "{\"sid\":\"B\",\"seq\":7,\"ts\":9,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n"
+        "{\"sid\":\"B\",\"seq\":8,\"ts\":9,\"ev\":\"job.end\",\"job\":1}\n"
+        "{\"sid\":\"B\",\"seq\":9,\"ts\":100,\"ev\":\"title\",\"text\":\"First (fork)\","
+        "\"by\":\"auto\"}\n";
+    expect(t, "logcopy", c.log, want);
+    expect(t, "logcopy title", c.title, "First (fork)");
+    expect(t, "logcopy files", joinlines(&a, c.files), "out/c1.logout/c2.logsnap/3.snap/3");
+
+    // Windows: backslashes doubled in JSON, or either separator
+    c = logcopy(&a, scratch, lines, "A", "B", win, winnew, 1, 100, 1);
+    Str rest = cuthead(c.log, find(c.log, "{\"sid\":\"B\",\"seq\":5,"));
+    Str text = jsonstr(jsonget(evparse(&a, cut(rest, '\n').head).root, "text"));
+    expect(t, "logcopy windows", text,
+           "see /s/sessions/A/out/c1.log, C:\\S\\sessions\\B\\out\\c2.log, "
+           "C:/S/sessions/B/snap/3. Not /s/sessions/AB/x");
+
+    // Refused: a subagent's log, a turn not ended, a turn not there
+    Str kid[] = {"{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"parent\":\"P\"}\n"};
+    c = logcopy(&a, scratch, {kid, 1, 1}, "A", "B", posix, posixnew, -1, 100, 0);
+    expect(t, "logcopy subagent", c.err, "a subagent cannot be forked, only the "
+           "session it worked for");
+    c = logcopy(&a, scratch, lines, "A", "B", posix, posixnew, 3, 100, 0);
+    expect(t, "logcopy open turn", c.err, "turn 3 has not ended");
+    c = logcopy(&a, scratch, lines, "A", "B", posix, posixnew, 4, 100, 0);
+    expect(t, "logcopy no turn", c.err, "no turn 4 in this session");
+    c = logcopy(&a, scratch, {src+1, 1, 1}, "A", "B", posix, posixnew, -1, 100, 0);
+    expect(t, "logcopy no session", istr(&a, c.err.len>0 && !c.log.data), "1");
+}
+
 static void test_events(Test *t)
 {
     Arena perm    = t->perm;
@@ -101,7 +220,8 @@ static void test_events(Test *t)
                "\"archive\",\"group\",\"fork\",\"compact\",\"model\",\"draft\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
-               "\"compact\",\"model\",\"gauge\"]}");
+               "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
+               "\"delete\",\"fork\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);
@@ -649,4 +769,6 @@ static void test_events(Test *t)
             "{\"sid\":\"s15\",\"seq\":7,\"ts\":0,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"interrupted\"}\n"));
         logclose(&log);
     }
+
+    testlogcopy(t);
 }
