@@ -44,6 +44,29 @@
 // state of the provisional reasoning it replaces over to its own, by
 // their place among the response's reasoning.
 //
+// Tool rows fold as [ui] tools says (viewtools): auto, the default, folds
+// reads, writes and todo lists, and once a call ends opens a failure and
+// folds a background job's start and a long shell output; fold and open
+// apply to every row. A row the user opened or closed keeps that, through
+// its end too. A session's own toggles (viewshowtools, viewshowthink)
+// open every row of their kind, hidden reasoning included, until turned
+// off, leaving the configuration alone.
+//
+// A search (ViewSearch) finds text in the messages' sources, ignoring
+// ASCII case, folded rows included but not hidden reasoning. It keeps up
+// with the view a budget of bytes at a time, searching again only from
+// the first message that changed, which while streaming is at the end.
+//
+// A change of width keeps what is at the top edge there (viewanchor,
+// anchory): the message, the source offset its line there begins at, and
+// how far into that line the edge is, found in the old layout and put
+// back in the new one.
+//
+// The context gauge's numbers come from records that carry them: the
+// tokens the context holds, where it compacts and the model's window
+// (ctx, compact_at, tokens on attempt, turn.end and live), and a response's
+// usage, its tokens and how many of them the server had cached.
+//
 // Besides its transcript a view keeps what the panels beside it show:
 // the agent's todo list, the session's background jobs with the latest
 // of their output, the files write and edit changed (snapshots), which
@@ -63,6 +86,28 @@ enum : i32 {
     VIEW_COMPACT,  // a compaction's card
     VIEW_REWIND,   // a rewind's card
 };
+
+// How tool rows fold ([ui] tools)
+enum : i32 {
+    TOOLS_AUTO,  // by kind and outcome
+    TOOLS_FOLD,
+    TOOLS_OPEN,
+    TOOLS_COUNT,
+};
+
+static Str toolsnames[] = {"auto", "fold", "open"};
+static_assert(countof(toolsnames) == TOOLS_COUNT);
+
+// The setting's value from its name, or -1 if it names none.
+static i32 toolsparse(Str s)
+{
+    for (i32 i = 0; i < TOOLS_COUNT; i++) {
+        if (toolsnames[i] == s) {
+            return i;
+        }
+    }
+    return -1;
+}
 
 // Tool rows
 enum : i32 {
@@ -182,6 +227,7 @@ struct ViewTool {
     i64  ms;        // its duration, once ended
     Str  spill;     // the full output, relative to the session directory
     i64  bytes;
+    b32  ended;     // tool.end came
     i64  outbytes;  // output so far, while running
     u8  *tail;      // the live output, a buffer reused for each tool.out
     iz   tailcap;
@@ -353,6 +399,11 @@ struct View {
     i64             laidout;    // messages laid out, for benchmarks
     b32             overflow;   // fake agent: events were dropped
     i32             thinking;   // THINK_*: how reasoning shows
+    i32             toolmode;   // TOOLS_*: how tool rows fold
+    b32             showtools;  // the session's toggles: every tool row
+    b32             showthink;  //   or reasoning open, whatever the mode
+    f32             lastw;      // the width laid out last
+    f32             head;       // a message's header line, as drawn
 
     // Ordering
     i64             lastseq;    // the last durable record applied
@@ -389,6 +440,10 @@ struct View {
     i64             watchms;    // and waits this long in all
     i64             pdone;      // prompt processing, tokens of total
     i64             ptotal;
+    i64             ctx;        // the context gauge: the model's window,
+    i64             compactat;  //   where compaction begins,
+    i64             tokens;     //   the tokens it holds now,
+    i64             cached;     //   and of the last prompt, those cached
     i64             outts;      // the last tool.out
     i32             queuepos;   // queued: the place in line, of
     i32             queuelen;
@@ -478,13 +533,50 @@ static i64 countchars(Str s)
 // Whether reasoning not chosen open or closed starts folded.
 static b32 thinkfolded(View *v)
 {
-    return v->thinking != THINK_OPEN;
+    return v->thinking!=THINK_OPEN && !v->showthink;
 }
 
 // Whether a message takes no space and draws nothing.
 static b32 msghidden(View *v, ViewMsg *m)
 {
-    return m->role==VIEW_THINK && v->thinking==THINK_HIDE;
+    return m->role==VIEW_THINK && v->thinking==THINK_HIDE && !v->showthink;
+}
+
+// Whether a tool row folds by its kind and outcome (tools = auto): reads,
+// writes and todo lists fold; once it ends, a failure opens, the start of
+// a background job folds, as the Jobs panel has it, and so does a shell
+// command's output past 24 lines.
+static b32 toolauto(ViewMsg *m)
+{
+    ViewTool *t = m->tool;
+    if (t->ended) {
+        if (t->status != VTOOL_OK) {
+            return 0;
+        } else if (t->job) {
+            return 1;
+        } else if (t->name == "shell") {
+            return m->nl > 24;
+        }
+    }
+    return t->name=="read" || t->name=="write" || t->name=="todo_write";
+}
+
+// Whether a tool row folds: as the user chose, else as the session's
+// toggle or [ui] tools says. Arguments still arriving have no body yet.
+static b32 toolfolded(View *v, ViewMsg *m)
+{
+    if (m->chosen) {
+        return m->collapsed;
+    } else if (m->tool->status == VTOOL_STREAMING) {
+        return 1;
+    } else if (v->showtools) {
+        return 0;
+    }
+    switch (v->toolmode) {
+    case TOOLS_FOLD: return 1;
+    case TOOLS_OPEN: return 0;
+    }
+    return toolauto(m);
 }
 
 // A copy in the text arena, which provisional messages must know about.
@@ -584,7 +676,7 @@ static void viewargs(View *v, i32 block, Str id, Str name, Str text)
         t->block  = block;
         t->status = VTOOL_STREAMING;
         v->msgs[i].tool      = t;
-        v->msgs[i].collapsed = 1;
+        v->msgs[i].collapsed = toolfolded(v, &v->msgs[i]);
         v->stream = -1;  // text after it is a new message
     }
     if (id.len)   t->call = clone(&v->aux, id);
@@ -679,14 +771,24 @@ static void takethink(ViewMsg *m, Slice<ViewMsg> was, iz n)
     }
 }
 
-// Show reasoning as [ui] thinking says (THINK_*), all of it at once but
-// what the user opened or closed. Returns whether anything changed.
-static b32 viewthink(View *v, i32 mode)
+// The provisional tool rows the user opened or closed, whose state the
+// committed rows of the same calls take over.
+static Slice<ViewMsg> provchosen(View *v, Arena *a)
 {
-    if (v->thinking == mode) {
-        return 0;
+    Slice<ViewMsg> r = {};
+    for (iz i = v->prov<0 ? v->msgs.len : v->prov; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->prov && m->chosen && m->role==VIEW_TOOL && m->tool->call.len) {
+            r = push(a, r, *m);
+        }
     }
-    v->thinking = mode;
+    return r;
+}
+
+// Fold or open all reasoning as the setting and the session's toggle
+// say, but what the user opened or closed, and hide it or show it.
+static void rethink(View *v)
+{
     for (iz i = 0; i < v->msgs.len; i++) {
         ViewMsg *m = &v->msgs[i];
         if (m->role == VIEW_THINK) {
@@ -696,6 +798,72 @@ static b32 viewthink(View *v, i32 mode)
         }
     }
     v->topsdirty = 1;
+}
+
+// Show reasoning as [ui] thinking says (THINK_*), all of it at once but
+// what the user opened or closed. Returns whether anything changed.
+static b32 viewthink(View *v, i32 mode)
+{
+    if (v->thinking == mode) {
+        return 0;
+    }
+    v->thinking = mode;
+    rethink(v);
+    return 1;
+}
+
+// The session's toggle: all reasoning open, hidden or not, or else as
+// the setting says. Returns whether anything changed.
+static b32 viewshowthink(View *v, b32 on)
+{
+    if (v->showthink == on) {
+        return 0;
+    }
+    v->showthink = on;
+    rethink(v);
+    return 1;
+}
+
+// Fold or open every tool row the user did not choose, as the setting
+// and the session's toggle now say.
+static void retool(View *v)
+{
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role != VIEW_TOOL) {
+            continue;
+        }
+        b32 c = toolfolded(v, m);
+        if (c != m->collapsed) {
+            m->collapsed = c;
+            m->measured  = 0;
+            m->ver++;
+            v->topsdirty = 1;
+        }
+    }
+}
+
+// Fold tool rows as [ui] tools says (TOOLS_*), all at once but what the
+// user opened or closed. Returns whether anything changed.
+static b32 viewtools(View *v, i32 mode)
+{
+    if (v->toolmode == mode) {
+        return 0;
+    }
+    v->toolmode = mode;
+    retool(v);
+    return 1;
+}
+
+// The session's toggle: every tool row open, or else as the setting
+// says. Returns whether anything changed.
+static b32 viewshowtools(View *v, b32 on)
+{
+    if (v->showtools == on) {
+        return 0;
+    }
+    v->showtools = on;
+    retool(v);
     return 1;
 }
 
@@ -1102,12 +1270,13 @@ static i32 addcall(View *v, Arena scratch, Str id, Str name, Str args)
     t->summary = toolsummary(&v->aux, scratch, name, args, v->cwd);
     t->status  = VTOOL_CALLED;
     v->msgs[i].tool      = t;
-    v->msgs[i].collapsed = name=="read" || name=="write" || name=="todo_write";
+    v->msgs[i].collapsed = toolfolded(v, &v->msgs[i]);
     return i;
 }
 
 // The body of a finished call: a diff for edits and writes that worked,
-// otherwise the result the agent read, then where the whole output is.
+// otherwise the result the agent read. Where the whole output is, which
+// the agent's text names in a last line, the row's Output action has.
 static void toolbody(View *v, Arena scratch, ViewMsg *m, Str text)
 {
     ViewTool *t = m->tool;
@@ -1122,22 +1291,24 @@ static void toolbody(View *v, Arena scratch, ViewMsg *m, Str text)
         settext(v, m, text, 1);
         return;
     }
-    if (t->spill.len) {
-        Buf b(&scratch, text.len + 256);
-        print(&b, text);
-        if (text.len && text[text.len-1]!='\n') putbyte(&b, '\n');
-        print(&b, "\nFull output: ");
-        print(&b, v->dir.len ? join(&scratch, v->dir, t->spill) : t->spill);
-        print(&b, " (");
-        print(&b, t->bytes);
-        print(&b, " bytes)");
-        text = finish(&b);
-    }
     settext(v, m, text, 0);
 }
 
 
 // Records
+
+// The context gauge's numbers a record has. Returns whether any changed.
+static b32 viewgauge(View *v, Json *j)
+{
+    Json *ctx = jsonget(j, "ctx");
+    Json *at  = jsonget(j, "compact_at");
+    Json *tok = jsonget(j, "tokens");
+    i64   was[] = {v->ctx, v->compactat, v->tokens};
+    v->ctx       = ctx->type==JSON_NUMBER ? jsonint(ctx, 0) : v->ctx;
+    v->compactat = at->type==JSON_NUMBER  ? jsonint(at, 0)  : v->compactat;
+    v->tokens    = tok->type==JSON_NUMBER ? jsonint(tok, 0) : v->tokens;
+    return was[0]!=v->ctx || was[1]!=v->compactat || was[2]!=v->tokens;
+}
 
 static i32 livestate(Str s)
 {
@@ -1241,6 +1412,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         clampsel(v);
         v->attempt = (i32)jsonint(jsonget(j, "n"), v->attempt+1);
         v->pdone   = v->ptotal = 0;
+        viewgauge(v, j);
         return 1;
 
     case EV_DELTA: {
@@ -1294,9 +1466,19 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
     } return 1;
 
     case EV_ASSISTANT: {
-        Slice<ViewMsg> was = provthinks(v, &scratch);
-        iz             n   = 0;  // reasoning so far
+        Slice<ViewMsg> was    = provthinks(v, &scratch);
+        Slice<ViewMsg> chosen = provchosen(v, &scratch);
+        iz             n      = 0;  // reasoning so far
         dropprov(v);
+        // Its usage: what the context holds after it, the prompt and the
+        // reply, and how much of the prompt the server had cached
+        Json *u = jsonget(j, "usage");
+        if (u->type == JSON_OBJECT) {
+            i64 in  = jsonint(jsonget(u, "in"), 0);
+            i64 out = jsonint(jsonget(u, "out"), 0);
+            v->tokens = in>0 ? in+out : v->tokens;
+            v->cached = jsonint(jsonget(u, "cached"), 0);
+        }
         v->doneturn    = (i32)jsonint(jsonget(j, "turn"), v->turn);
         v->doneattempt = (i32)jsonint(jsonget(j, "attempt"), v->attempt);
         Json *blocks = jsonget(j, "blocks");
@@ -1311,8 +1493,15 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             } else if (t == "text") {
                 i = addmsg(v, VIEW_ASSISTANT, jsonstr(jsonget(b, "text")));
             } else if (t == "call") {
-                i = addcall(v, scratch, jsonstr(jsonget(b, "id")),
-                            jsonstr(jsonget(b, "name")), jsonstr(jsonget(b, "args")));
+                Str id = jsonstr(jsonget(b, "id"));
+                i = addcall(v, scratch, id, jsonstr(jsonget(b, "name")),
+                            jsonstr(jsonget(b, "args")));
+                for (iz k = 0; k < chosen.len; k++) {
+                    if (chosen[k].tool->call == id) {
+                        v->msgs[i].chosen    = 1;
+                        v->msgs[i].collapsed = chosen[k].collapsed;
+                    }
+                }
             } else {
                 continue;
             }
@@ -1391,13 +1580,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                 v->topsdirty = 1;
             }
         }
-        if (t->status != VTOOL_OK) {
-            m->collapsed = 0;  // what went wrong
-        } else if (t->job) {
-            m->collapsed = 1;  // started in the background: the panel has it
-        } else if (t->name == "shell") {
-            m->collapsed = m->nl > 24;
-        }
+        t->ended     = 1;
+        m->collapsed = toolfolded(v, m);  // unless the user chose
     } return 1;
 
     case EV_ASK: {
@@ -1776,6 +1960,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->busy  = 0;
         v->state = v->state==LIVE_CLOSED ? LIVE_CLOSED : LIVE_IDLE;
         v->pdone = v->ptotal = 0;
+        viewgauge(v, j);
         Str why = jsonstr(jsonget(j, "why"));
         Str err = jsonstr(jsonget(j, "err"));
         if (why != "done") {
@@ -1822,7 +2007,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->watchms = jsonint(jsonget(j, "watchdog_of"), 0);
         i64 moved  = v->lastdata - lastdata;
         i64 moved2 = v->watchat - watchat;
-        return state!=v->state || (i64)(tps*10)!=(i64)(v->tps*10) ||
+        b32 gauge  = viewgauge(v, j);
+        return gauge || state!=v->state || (i64)(tps*10)!=(i64)(v->tps*10) ||
                retryat!=v->retryat || moved<-50 || moved>50 ||
                moved2<-50 || moved2>50 || qpos!=v->queuepos ||
                qlen!=v->queuelen || tasks!=v->tasks;
@@ -2049,6 +2235,52 @@ static void togglemsg(View *v, i32 i)
     m->collapsed = !m->collapsed;
     m->ver++;
     v->topsdirty = 1;
+}
+
+// What is at a height in the transcript, as a place in the source that a
+// new width keeps: the message there, -1 if none; the source offset its
+// line there begins at, -1 in its header, a folded body or its foot; and
+// how far below that line's top, or the message's, the height is.
+struct Anchor {
+    i32 msg;
+    i32 off;
+    f64 dy;
+};
+
+// The anchor at y, with the tops and layouts at the width given, below
+// a header line of head.
+static Anchor viewanchor(View *v, Measure *ms, f32 width, f32 scale, f32 head, f64 y)
+{
+    Anchor r = {viewfind(v, y), -1, 0};
+    if (r.msg < 0) {
+        return r;
+    }
+    ViewMsg *m = &v->msgs[r.msg];
+    r.dy = y - m->top;
+    f32 ly = (f32)(r.dy - head);
+    if (ly<0 || m->collapsed) {
+        return r;
+    }
+    MsgLayout *ml = msglayout(v, r.msg, ms, width, scale);
+    if (ly >= ml->h) {
+        return r;
+    }
+    Doc *d = msgdoc(v, r.msg);
+    r.off = msghit(ms, d, ml, 0, ly);
+    r.dy  = ly - msgy(d, ml, r.off);
+    return r;
+}
+
+// The height of an anchor at the width given, its message laid out
+// there, with the tops as they are.
+static f64 anchory(View *v, Anchor an, Measure *ms, f32 width, f32 scale, f32 head)
+{
+    ViewMsg *m = &v->msgs[an.msg];
+    if (an.off<0 || m->collapsed) {
+        return m->top + an.dy;
+    }
+    MsgLayout *ml = msglayout(v, an.msg, ms, width, scale);
+    return m->top + head + msgy(msgdoc(v, an.msg), ml, an.off) + an.dy;
 }
 
 
@@ -2374,6 +2606,169 @@ static Str copysel(View *v, Arena *perm, i32 how)
         }
     }
     return finish(&b);
+}
+
+
+// A code block's code, as selecting the block whole (a triple click)
+// copies it: byte for byte, but for its last newline, so that a command
+// pasted into a terminal waits for Enter.
+static Str copyblock(View *v, Arena *perm, i32 msg, i32 block)
+{
+    Doc      *d = msgdoc(v, msg);
+    DocBlock *k = &d->blocks[block];
+    Buf       b(perm, k->off1 - k->off0 + 64);
+    copytext(&b, d, k->off0, k->off1);
+    return finish(&b);
+}
+
+
+// Searching
+
+struct FindHit {
+    i32 msg;
+    i32 off;
+    i32 len;
+};
+
+// A message as a search last saw it.
+struct FindSeen {
+    u8 *data;
+    iz  len;
+    i32 ver;
+    b32 hidden;
+};
+
+struct ViewSearch {
+    View            *v;
+    Str              q;         // lowercase ASCII
+    iz               qmax;
+    Arena            hitmem;    // each alone in its arena, to grow in place
+    byte            *hitbase;
+    Arena            seenmem;
+    byte            *seenbase;
+    Slice<FindHit>   hits;      // in order
+    Slice<FindSeen>  seen;      // the messages searched, in order
+    i32              cur;       // the current hit, -1 if none
+};
+
+static ViewSearch *newsearch(Arena *perm, Region *hits, Region *seen, iz qmax)
+{
+    ViewSearch *s = alloc<ViewSearch>(perm);
+    s->hitmem   = newarena(hits);
+    s->hitbase  = s->hitmem.beg;
+    s->seenmem  = newarena(seen);
+    s->seenbase = s->seenmem.beg;
+    s->q.data   = alloc<u8>(perm, qmax);
+    s->qmax     = qmax;
+    s->cur      = -1;
+    return s;
+}
+
+// Search a view for q from the start, as searchstep goes on to.
+static void searchreset(ViewSearch *s, View *v, Str q)
+{
+    q = q.len>s->qmax ? takehead(q, s->qmax) : q;
+    for (iz i = 0; i < q.len; i++) {
+        s->q.data[i] = lowercase(q[i]);
+    }
+    s->q.len      = q.len;
+    s->v          = v;
+    s->hitmem.beg = s->hitbase;
+    s->seenmem.beg = s->seenbase;
+    s->hits       = {};
+    s->seen       = {};
+    s->cur        = -1;
+}
+
+static FindSeen seenof(View *v, ViewMsg *m)
+{
+    return {m->text.data, m->text.len, m->ver, msghidden(v, m)};
+}
+
+static b32 seeneq(FindSeen a, FindSeen b)
+{
+    return a.data==b.data && a.len==b.len && a.ver==b.ver && a.hidden==b.hidden;
+}
+
+// Bring the hits up to date with the view: searched again from the first
+// message that changed, at most about budget bytes of text at a time.
+// Returns whether they are, else it goes on from there next call.
+static b32 searchstep(ViewSearch *s, iz budget)
+{
+    View *v = s->v;
+    iz    n = s->seen.len<v->msgs.len ? s->seen.len : v->msgs.len;
+    iz    first = n;
+    for (iz i = 0; i < n; i++) {
+        if (!seeneq(s->seen[i], seenof(v, &v->msgs[i]))) {
+            first = i;
+            break;
+        }
+    }
+    if (first < s->seen.len) {
+        iz k = s->hits.len;
+        for (; k>0 && s->hits[k-1].msg>=first; k--) {}
+        s->hits.len = k;
+        s->seen.len = first;
+        s->cur      = s->cur<k ? s->cur : (i32)k-1;
+    }
+
+    Str q = s->q;
+    for (iz i = s->seen.len; i < v->msgs.len; i++) {
+        if (budget <= 0) {
+            return 0;
+        }
+        ViewMsg *m = &v->msgs[i];
+        Str      t = m->text;
+        s->seen = push(&s->seenmem, s->seen, seenof(v, m));
+        if (!q.len || msghidden(v, m)) {
+            continue;
+        }
+        budget -= t.len + 1;
+        u8 q0 = q[0];
+        for (iz at = 0; at+q.len <= t.len; at++) {
+            if (lowercase(t[at]) != q0) {
+                continue;
+            }
+            iz k = 1;
+            for (; k<q.len && lowercase(t[at+k])==q[k]; k++) {}
+            if (k == q.len) {
+                FindHit h = {(i32)i, (i32)at, (i32)q.len};
+                s->hits = push(&s->hitmem, s->hits, h);
+                at += q.len - 1;
+            }
+        }
+    }
+    return 1;
+}
+
+// The first hit in a message at or after an offset, else the next
+// message's, else hits.len.
+static iz searchfrom(ViewSearch *s, i32 msg, i32 off)
+{
+    iz lo = 0, hi = s->hits.len;
+    while (lo < hi) {
+        iz mid = lo + (hi - lo)/2;
+        FindHit *h = &s->hits[mid];
+        if (h->msg<msg || (h->msg==msg && h->off+h->len<=off)) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// Show a hit: its message opened if folded, as if the user had, which
+// changes nothing to search again.
+static void searchreveal(ViewSearch *s, FindHit *h)
+{
+    View *v = s->v;
+    if (v->msgs[h->msg].collapsed) {
+        togglemsg(v, h->msg);
+        if (h->msg < s->seen.len) {
+            s->seen[h->msg].ver = v->msgs[h->msg].ver;
+        }
+    }
 }
 
 

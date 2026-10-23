@@ -43,8 +43,9 @@
 // window opens, so that it opens in it, then from each config.get
 // reply, and picked in the settings window, where it applies at once.
 // "system" follows what the platform reports (gui_systheme). [ui]
-// thinking, how reasoning shows, comes the same ways and applies to
-// every session's view at once (setthinking). [ui] font_size sets the
+// thinking, how reasoning shows, and [ui] tools, how tool rows fold,
+// come the same ways and apply to every session's view at once
+// (setthinking, settools). [ui] font_size sets the
 // text's size, which the View menu's zoom scales for this run only
 // (setzoom), both applied between frames (fontsize). The layout
 // file is written by a thread of its own (Saver), since a write that is
@@ -68,6 +69,7 @@ enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
     JOBS_PERIOD   = 250000,      // µs between frames showing job output
     CARET_STOP    = 10000000,    // µs after the last key: stop blinking
+    COPIED_US     = 1500000,     // µs a code block's button says Copied
 };
 
 enum : iz {
@@ -77,6 +79,7 @@ enum : iz {
     INBOX_CAP  = 1<<21,   // bytes per inbox buffer
     FIELD_MAX  = 1<<10,   // bytes of a settings or dialog field
     REQ_MAX    = 64,      // commands awaiting replies
+    FIND_BUDGET = 4<<20,  // bytes of text a frame searches at most
 };
 
 enum : i64 {
@@ -196,6 +199,12 @@ enum : i32 {
     RECT_THUMB,      // the latest screenshot's thumbnail drawn
     RECT_SHOTCLOSE,  // the Screenshot window's Close
     RECT_REFRESHINC, // the settings window's Refresh includes
+    RECT_CODEBLOCK,  // the code block aimed at (selectcode), else the latest
+    RECT_CODECOPY,   // and its Copy button, while shown
+    RECT_TOOLSBTN,   // the session bar's toggles
+    RECT_THINKBTN,
+    RECT_FINDFIELD,  // the find bar's field
+    RECT_GAUGE,      // the context gauge
     RECT_PAGECOMBO,  // its pages as a combo, when narrow
     RECT_DIAGPAGE,   // its Diagnostics page in the list
     RECT_ADDOPEN,    // its Add for each named kind, in order: endpoint,
@@ -559,6 +568,7 @@ struct Gui {
     Palette           *pal;        // the theme in effect
     i32                themeset;   // THEME_*, from [ui] theme
     i32                thinkset;   // THINK_*, from [ui] thinking
+    i32                toolset;    // TOOLS_*, from [ui] tools
     b32                sysdark;    // the system prefers dark
     b32                syshas;     // the platform said so once
     b32                titleok;    // the window's frame follows the theme
@@ -667,10 +677,23 @@ struct Gui {
     b32                outfocus;   // brought to the front next frame
 
     // Transcript
-    f32                lastwidth;
     f64                scrollto;   // -1 if none
     b32                dragging;
     i32                menumsg;    // the message the context menu is for
+    View              *copiedview; // a code block's Copy, clicked then
+    i32                copiedmsg;
+    i32                copiedblk;
+    i64                copiedat;   // µs, 0 if never
+
+    // The find bar
+    ViewSearch        *search;
+    char              *findbuf;
+    b32                findopen;
+    b32                findfocus;  // focus its field next frame
+    b32                findactive; // its field had the keyboard
+    b32                findjump;   // scroll to the current hit
+    b32                findwant;   // the current hit is the first found
+    i32                findfrom;   //   from this message on
 
     // Dialogs and settings
     char              *newcwd;     // the new session's fields
@@ -803,6 +826,12 @@ struct Gui {
     i64                thinkchars0;  // as a check last saw them
     i64                thinksecs0;
     b32                thinkhidshown; // the strip said reasoning is hidden
+    b32                copiedshown;  // a code block's button said Copied
+    i32                gaugeshown;   // the gauge drew: 1, 2 if amber
+    i32                drivecodemsg; // the code block selectcode chose, or
+    i32                drivecodeblk; //   -1 for any
+    Anchor             driveanchor;  // the top edge before a resize
+    i32                drivefound;   // the find hit first current
     b32                shotshown;    // the Screenshot window drew its image
     b32                downshown;    // a host's countdown to its next try
     b32                elseshown;    // closing said what runs on elsewhere
@@ -944,6 +973,7 @@ static View *sessview(Gui *g, GuiSession *s)
             s->view->dir = sessdir(g, &g->perm, s->sid);
         }
         viewthink(s->view, g->thinkset);
+        viewtools(s->view, g->toolset);
     }
     return s->view;
 }
@@ -1826,6 +1856,7 @@ static void startquit(Gui *g)
 
 static void settheme(Gui *, i32);
 static void setthinking(Gui *, i32);
+static void settools(Gui *, i32);
 static void setfontbase(Gui *, Str);
 
 // Words of s separated by sep, trimmed, the empty ones dropped, joined
@@ -1896,6 +1927,8 @@ static void loadcfg(Gui *g, Str line)
             settheme(g, themeparse(r.value));
         } else if (r.kind=="ui" && r.key=="thinking") {
             setthinking(g, thinkparse(r.value));
+        } else if (r.kind=="ui" && r.key=="tools") {
+            settools(g, toolsparse(r.value));
         } else if (r.kind=="ui" && r.key=="font_size") {
             setfontbase(g, r.value);
         }
@@ -4680,6 +4713,10 @@ enum : i32 {
     OP_MARKDELTAS,// remember the deltas the shown session has had
     OP_IFSESS,    // unless a session's title starts with text, skip dx ops
     OP_THINKING,  // show reasoning as dx (THINK_*), as a setting would
+    OP_TOOLS,     // fold tool rows as dx (TOOLS_*), as a setting would
+    OP_SHOWCODE,  // scroll to the code block selectcode chose
+    OP_ANCHOR,    // remember what is at the transcript's top edge
+    OP_GAUGE,     // a live record with ctx dx, compact_at dy, tokens text
     OP_SHOWPAGE,  // scroll the settings' pages to the one text names
     OP_GEOMMARK,  // remember the window's geometry
     OP_PLACE,     // move the window as if saved: dx 1 on a display to the
@@ -4740,6 +4777,11 @@ enum : i32 {
     T_THUMB,       // the latest screenshot thumbnail drawn
     T_SHOTCLOSE,   // the Screenshot window's Close
     T_THINKHDR,    // the latest reasoning's header drawn
+    T_CODEBLOCK,   // the code block selectcode chose, as drawn
+    T_CODECOPY,    // and its Copy button
+    T_TOOLSBTN,    // the session bar's toggles
+    T_THINKBTN,
+    T_GAUGE,       // the context gauge
     T_PAGECOMBO,   // the settings' pages as a combo, when narrow
     T_PAGEITEM,    // the settings page text names ("endpoint fake", "ui",
                    // "" for the top level, "diagnostics"), but the combo
@@ -4871,6 +4913,26 @@ enum : i32 {
     CHK_THINKOPEN,
     CHK_THINKSTAYS,
     CHK_THINKREFOLD,
+    CHK_COPYBTN,
+    CHK_CODECOPIED,
+    CHK_COPYQUIET,
+    CHK_REFLOW,
+    CHK_TOOLSOPEN,
+    CHK_TOOLSFOLD,
+    CHK_TOOLSAUTO,
+    CHK_SHOWTOOLS,
+    CHK_SHOWTHINK,
+    CHK_THINKBACK,
+    CHK_FINDOPEN,
+    CHK_FOUND,
+    CHK_FOUNDNEXT,
+    CHK_FOUNDPREV,
+    CHK_FINDQUIET,
+    CHK_FINDHIDDEN,
+    CHK_FINDCLOSED,
+    CHK_GAUGEREAL,
+    CHK_GAUGE,
+    CHK_GAUGEAMBER,
     CHK_ONEPANE,
     CHK_TWOPANE,
     CHK_NOHSCROLL,
@@ -4984,6 +5046,26 @@ static Str chknames[] = {
     "open: the reasoning streams open",
     "open: the committed reasoning stays open",
     "fold again: reasoning folded, but for what the user opened",
+    "a code block shows its Copy button while the mouse is over it",
+    "its Copy put its code on the clipboard byte for byte, and said so",
+    "Copied went back to Copy on its deadline, and little else drew",
+    "a new width kept the line at the top edge there",
+    "tools = open: every tool row open but those the user chose",
+    "tools = fold: every tool row folded but those the user chose",
+    "tools = auto: tool rows folded by kind and outcome again",
+    "the session's toggle opened every tool row, the setting unchanged",
+    "the session's toggle opened all reasoning",
+    "toggled off, reasoning folded again but for what the user opened",
+    "the find bar opened with its field focused",
+    "found in folded reasoning, opened as chosen and scrolled to",
+    "Enter went to the next match, opening its row",
+    "Shift+Enter went back to the first",
+    "no frames while the find bar shows its matches",
+    "hidden reasoning is not searched",
+    "Esc closed the find bar, and left the session alone",
+    "the context gauge drew from the engine's own numbers",
+    "the context gauge drew from a record's numbers",
+    "the gauge turned amber near where compaction begins",
     "narrow, the settings' pages are a combo above the page",
     "wide, the settings' pages are a list beside the page",
     "the settings have nothing to scroll to sideways",
@@ -5585,6 +5667,108 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_THINKSTAYS, 0, 0, 0, ""},
     {OP_THINKING, 0, THINK_FOLD, 0, 500, ""},
     {OP_CHECK, CHK_THINKREFOLD, 0, 0, 0, ""},
+    // The transcript's M8 parts, over what the turns so far made. A code
+    // block's Copy, shown while the mouse is over it: the code byte for
+    // byte, then "Copied" until its deadline, and little else drawn
+    {OP_SELCODE, 0, 0, 0, 0, ""},
+    {OP_SHOWCODE, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_CODEBLOCK, 0, 0, 400, ""},
+    {OP_CHECK, CHK_COPYBTN, 0, 0, 0, ""},
+    {OP_MOVE, T_CODECOPY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_CHECK, CHK_CODECOPIED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "20-codecopy"},
+    {OP_MARK, 0, 0, 0, 2500, ""},
+    {OP_CHECK, CHK_COPYQUIET, 0, 0, 0, ""},
+    // A narrower window and back: the line at the transcript's top edge
+    // stays there
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_WHEEL, 0, 0, -2, 800, ""},
+    {OP_ANCHOR, 0, 0, 0, 0, ""},
+    {OP_RESIZE, 0, 1050, 760, 800, ""},
+    {OP_CHECK, CHK_REFLOW, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "21-reflow"},
+    {OP_ANCHOR, 0, 0, 0, 0, ""},
+    {OP_RESIZE, 0, 1280, 800, 800, ""},
+    {OP_CHECK, CHK_REFLOW, 0, 0, 0, ""},
+    // tools = open, fold and auto again, as the settings would set it
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_TOOLS, 0, TOOLS_OPEN, 0, 300, ""},
+    {OP_CHECK, CHK_TOOLSOPEN, 0, 0, 0, ""},
+    {OP_TOOLS, 0, TOOLS_FOLD, 0, 300, ""},
+    {OP_CHECK, CHK_TOOLSFOLD, 0, 0, 0, ""},
+    {OP_TOOLS, 0, TOOLS_AUTO, 0, 300, ""},
+    {OP_CHECK, CHK_TOOLSAUTO, 0, 0, 0, ""},
+    // The session's toggles, from the session bar, then off by their
+    // shortcuts, Cmd+Shift+T and R (Ctrl elsewhere)
+    {OP_MOVE, T_TOOLSBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_CHECK, CHK_SHOWTOOLS, 0, 0, 0, ""},
+    {OP_MOVE, T_THINKBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_CHECK, CHK_SHOWTHINK, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "22-showall"},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_T, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_T, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_CHECK, CHK_TOOLSAUTO, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_R, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_R, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_CHECK, CHK_THINKBACK, 0, 0, 0, ""},
+    // Find, opened by Cmd+F (Ctrl elsewhere): in folded reasoning, whose row
+    // opens; Enter to the next match and Shift+Enter back; nothing
+    // drawn while the matches show; hidden reasoning not searched; Esc
+    // closes the bar
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_CHECK, CHK_FINDOPEN, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 800, "briefly 7."},
+    {OP_CHECK, CHK_FOUND, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "23-find"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 600, ""},
+    {OP_CHECK, CHK_FOUNDNEXT, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ENTER, KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, KEY_SHIFT, 600, ""},
+    {OP_CHECK, CHK_FOUNDPREV, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_MARK, 0, 0, 0, 2500, ""},
+    {OP_CHECK, CHK_FINDQUIET, 0, 0, 0, ""},
+    {OP_THINKING, 0, THINK_HIDE, 0, 500, ""},
+    {OP_CHECK, CHK_FINDHIDDEN, 0, 0, 0, ""},
+    {OP_THINKING, 0, THINK_FOLD, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_F, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_FINDCLOSED, 0, 0, 0, ""},
+    // The context gauge, from the engine's records, then from a live
+    // record's numbers near where compaction begins, and its tooltip
+    {OP_CHECK, CHK_GAUGEREAL, 0, 0, 0, ""},
+    {OP_GAUGE, 0, 131072, 104857, 300, "42000"},
+    {OP_CHECK, CHK_GAUGE, 0, 0, 0, ""},
+    {OP_GAUGE, 0, 131072, 104857, 300, "98000"},
+    {OP_CHECK, CHK_GAUGEAMBER, 0, 0, 0, ""},
+    {OP_MOVE, T_GAUGE, 0, 0, 1500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "24-gauge"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     // An ask, allowed through its card
     {OP_PROMPT, 0, 0, 0, 100, "Write outside the workspace, ask, and be allowed."},
     {OP_WAIT, W_ASK, 0, 0, 10000, ""},
@@ -6590,6 +6774,11 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_THUMB:         return rectcenter(g->rects[RECT_THUMB]);
     case T_SHOTCLOSE:     return rectcenter(g->rects[RECT_SHOTCLOSE]);
     case T_THINKHDR:      return rectcenter(g->rects[RECT_THINKHDR]);
+    case T_CODEBLOCK:     return rectcenter(g->rects[RECT_CODEBLOCK]);
+    case T_CODECOPY:      return rectcenter(g->rects[RECT_CODECOPY]);
+    case T_TOOLSBTN:      return rectcenter(g->rects[RECT_TOOLSBTN]);
+    case T_THINKBTN:      return rectcenter(g->rects[RECT_THINKBTN]);
+    case T_GAUGE:         return rectcenter(g->rects[RECT_GAUGE]);
     case T_PAGECOMBO:     return rectcenter(g->rects[RECT_PAGECOMBO]);
     case T_DELETE:        return rectcenter(g->rects[RECT_DELETE]);
     case T_DELOK:         return rectcenter(g->rects[RECT_DELOK]);
@@ -6752,6 +6941,84 @@ static ViewMsg *lastof(View *v, i32 role)
         }
     }
     return 0;
+}
+
+// Whether every tool row the user did not choose is folded (want 1),
+// open (0), or as tools = auto says (-1).
+static b32 toolsas(View *v, i32 want)
+{
+    i32 rows = 0;
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role!=VIEW_TOOL || m->chosen || m->prov) {
+            continue;
+        }
+        rows++;
+        b32 f = want<0 ? toolauto(m) : want;
+        if (m->collapsed != f) {
+            return 0;
+        }
+    }
+    return rows > 0;
+}
+
+// Whether every reasoning the user did not choose is folded (want 1) or
+// open (0), with none hidden.
+static b32 thinkas(View *v, b32 want)
+{
+    i32 rows = 0;
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role!=VIEW_THINK || m->prov) {
+            continue;
+        }
+        rows++;
+        if (msghidden(v, m) || (!m->chosen && m->collapsed!=want)) {
+            return 0;
+        }
+    }
+    return rows > 0;
+}
+
+// Whether the current find hit's row is open, as chosen, with its line
+// in the transcript's window.
+static b32 hitshown(Gui *g)
+{
+    ViewSearch *s  = g->search;
+    View       *v  = g->view;
+    GuiSession *gs = g->sess;
+    if (!gs || !gs->win || s->v!=v || s->cur<0 || s->cur>=s->hits.len) {
+        return 0;
+    }
+    FindHit *h = &s->hits[s->cur];
+    ViewMsg *m = &v->msgs[h->msg];
+    if (m->collapsed || !m->chosen) {
+        return 0;
+    }
+    MsgLayout *ml = msglayout(v, h->msg, &g->measure, v->lastw, g->scale);
+    f64        y  = m->top + v->head + msgy(msgdoc(v, h->msg), ml, h->off);
+    f32        sy = gs->win->Scroll.y;
+    return y>=sy && y<sy+gs->win->Size.y;
+}
+
+// Frames since the mark: the probe's, a deadline's frame and its
+// settling, and the overlay's numbers if shown.
+static b32 drivequiet(Gui *g, Str what, i64 allow)
+{
+    i64   n     = g->total.frames - g->driveframes;
+    i64   us    = g->sched.now - g->markat;
+    i64   other = (g->metricsshown ? 4*us/1000000 : 0) + allow;
+    Arena a     = g->frame;
+    Buf   b(&a, 128);
+    print(&b, "drive: frames ");
+    print(&b, what);
+    print(&b, ": ");
+    print(&b, n);
+    print(&b, " in ");
+    printfloat(&b, (f64)us/1e6, 1);
+    print(&b, " s");
+    guilog(g, finish(&b));
+    return n <= other;
 }
 
 // The latest reasoning in a view, provisional or not, or null.
@@ -7189,6 +7456,91 @@ static b32 drivecheck(Gui *g, i32 chk)
         }
         return opened==1 && !wrong && g->thinkrows>0;
     }
+    case CHK_COPYBTN:
+        return g->rects[RECT_CODECOPY].x1 > g->rects[RECT_CODECOPY].x0;
+    case CHK_CODECOPIED: {
+        // The code without its last newline, as a triple click copies it
+        char const *clip = ImGui::GetClipboardText();
+        Str got  = {(u8 *)clip, 0};
+        Str want = g->drivecode;
+        while (clip && got.data[got.len]) got.len++;
+        want = want.len && want[want.len-1]=='\n' ? cuttail(want, 1) : want;
+        return clip && want.len && got==want && g->copiedshown;
+    }
+    case CHK_COPYQUIET:
+        // Copied back to Copy at its deadline: that frame and its settling,
+        // the probe's, and the checklist's own at the mark and the check
+        return !g->copiedshown && drivequiet(g, "after Copied", 5);
+    case CHK_REFLOW: {
+        GuiSession *gs  = g->sess;
+        Anchor      was = g->driveanchor;
+        if (!gs || !gs->win || was.msg<0) {
+            return 0;
+        }
+        Anchor now = viewanchor(v, &g->measure, v->lastw, g->scale, v->head, gs->win->Scroll.y);
+        b32    ok  = now.msg==was.msg && now.dy-was.dy<1.5 && was.dy-now.dy<1.5;
+        if (ok && was.off>=0) {
+            Doc       *d  = msgdoc(v, now.msg);
+            MsgLayout *ml = msglayout(v, now.msg, &g->measure, v->lastw, g->scale);
+            ok = now.off>=0 && msgy(d, ml, now.off)==msgy(d, ml, was.off);
+        }
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drive: the top edge at width ");
+        print(&b, (i64)v->lastw);
+        print(&b, ": message ");
+        print(&b, (i64)now.msg);
+        print(&b, ", offset ");
+        print(&b, (i64)now.off);
+        print(&b, " for ");
+        print(&b, (i64)was.off);
+        print(&b, ", ");
+        printfloat(&b, now.dy, 1);
+        print(&b, " px into its line for ");
+        printfloat(&b, was.dy, 1);
+        guilog(g, finish(&b));
+        return ok;
+    }
+    case CHK_TOOLSOPEN:  return g->toolset==TOOLS_OPEN && toolsas(v, 0);
+    case CHK_TOOLSFOLD:  return g->toolset==TOOLS_FOLD && toolsas(v, 1);
+    case CHK_TOOLSAUTO:  return g->toolset==TOOLS_AUTO && !v->showtools && toolsas(v, -1);
+    case CHK_SHOWTOOLS:  return g->toolset==TOOLS_AUTO && v->showtools && toolsas(v, 0);
+    case CHK_SHOWTHINK:  return g->thinkset==THINK_FOLD && v->showthink && thinkas(v, 0);
+    case CHK_THINKBACK:  return !v->showthink && thinkas(v, 1);
+    case CHK_FINDOPEN:   return g->findopen && g->findactive;
+    case CHK_FOUND:
+        g->drivefound = g->search->cur;
+        return g->search->hits.len==2 && v->msgs[g->search->hits[0].msg].role==VIEW_THINK &&
+               hitshown(g);
+    case CHK_FOUNDNEXT: {
+        ViewSearch *s = g->search;
+        b32 both = s->hits.len==2 && v->msgs[s->hits[0].msg].chosen &&
+                   v->msgs[s->hits[1].msg].chosen;
+        return both && s->cur==(g->drivefound+1)%2 && hitshown(g);
+    }
+    case CHK_FOUNDPREV:
+        return g->search->cur==g->drivefound && hitshown(g);
+    case CHK_FINDQUIET:
+        return g->findopen && !g->findactive && g->search->hits.len==2 &&
+               drivequiet(g, "with the find bar's matches shown", 3);
+    case CHK_FINDHIDDEN:
+        return g->findopen && !g->search->hits.len;
+    case CHK_FINDCLOSED:
+        return !g->findopen && !g->findactive && !v->busy;
+    case CHK_GAUGEREAL: {
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drive: the gauge: ");
+        print(&b, v->tokens);
+        print(&b, " tokens, compacting at ");
+        print(&b, v->compactat);
+        print(&b, ", window ");
+        print(&b, v->ctx);
+        guilog(g, finish(&b));
+        return g->gaugeshown==1 && v->ctx>0 && v->compactat>0 && v->tokens>0;
+    }
+    case CHK_GAUGE:      return g->gaugeshown == 1;
+    case CHK_GAUGEAMBER: return g->gaugeshown == 2;
     case CHK_IMGQUIET: {
         // The probe's, and the overlay's numbers if shown
         i64   n     = g->total.frames - g->driveframes;
@@ -7925,7 +8277,9 @@ static void selectcode(Gui *g)
             }
             Str c = finish(&code);
             if (find(c, "\t")<0 || find(c, " \n")<0) continue;
-            g->drivecode   = c;
+            g->drivecode    = c;
+            g->drivecodemsg = i;
+            g->drivecodeblk = k;
             v->sel         = {};
             v->sel.active  = 1;
             v->sel.anchor  = {i, b->off0};
@@ -8289,6 +8643,51 @@ static void drivestep(Gui *g)
         g->reveal = op->target;
         scheddirty(&g->sched);
         break;
+    case OP_TOOLS:
+        settools(g, (i32)op->dx);
+        break;
+    case OP_SHOWCODE: {
+        View *v = g->view;
+        if (g->drivecodemsg>=0 && g->drivecodemsg<v->msgs.len && v->lastw>0) {
+            i32        i  = g->drivecodemsg;
+            MsgLayout *ml = msglayout(v, i, &g->measure, v->lastw, g->scale);
+            f64        y  = v->msgs[i].top + v->head;
+            for (iz k = 0; k < ml->blocks.len; k++) {
+                if (ml->blocks[k].block == g->drivecodeblk) {
+                    y += ml->blocks[k].y;
+                }
+            }
+            g->scrollto = y - 120*g->scale;
+            g->scrollto = g->scrollto<0 ? 0 : g->scrollto;
+            if (g->sess) g->sess->stick = 0;
+            scheddirty(&g->sched);
+        }
+    } break;
+    case OP_ANCHOR: {
+        View       *v  = g->view;
+        GuiSession *gs = g->sess;
+        g->driveanchor = {-1, -1, 0};
+        if (gs && gs->win) {
+            g->driveanchor = viewanchor(v, &g->measure, v->lastw, g->scale, v->head,
+                                        gs->win->Scroll.y);
+        }
+    } break;
+    case OP_GAUGE: {
+        // As track A1's engine sends them
+        Arena a = g->frame;
+        Buf   b(&a, 256);
+        print(&b, "{\"ts\":");
+        print(&b, os_time(g->os));
+        print(&b, ",\"ev\":\"live\",\"state\":\"idle\",\"ctx\":");
+        print(&b, (i64)op->dx);
+        print(&b, ",\"compact_at\":");
+        print(&b, (i64)op->dy);
+        print(&b, ",\"tokens\":");
+        print(&b, op->text);
+        putbyte(&b, '}');
+        viewapply(g->view, a, finish(&b));
+        scheddirty(&g->sched);
+    } break;
     case OP_SHOWPAGE:
         g->showpage = op->text;  // static
         scheddirty(&g->sched);
@@ -8518,6 +8917,8 @@ static void readconfig(Gui *g, Arena scratch)
     g->themeset = theme<0 ? THEME_SYSTEM : theme;
     i32 think = thinkparse(cfgget(cfg, "ui", "", "thinking", 0));
     g->thinkset = think<0 ? THINK_FOLD : think;
+    i32 tools = toolsparse(cfgget(cfg, "ui", "", "tools", 0));
+    g->toolset = tools<0 ? TOOLS_AUTO : tools;
     setfontbase(g, cfgget(cfg, "ui", "", "font_size", 0));
     if (own) {
         g->config = cfg;
@@ -8757,6 +9158,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->tplname    = alloc<char>(&g->perm, FIELD_MAX);
     g->tplval     = alloc<char>(&g->perm, FIELD_MAX);
     g->remname    = alloc<char>(&g->perm, FIELD_MAX);
+    g->findbuf    = alloc<char>(&g->perm, FIELD_MAX);
+    g->search     = newsearch(&g->perm, os_reserve(os, 256*mb), os_reserve(os, 256*mb),
+                              FIELD_MAX);
+    g->drivecodemsg = -1;
     g->remssh     = alloc<char>(&g->perm, FIELD_MAX);
     g->rempath    = alloc<char>(&g->perm, FIELD_MAX);
     g->hosts      = addhost(g, GH_ENGINE, "");

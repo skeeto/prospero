@@ -832,6 +832,7 @@ static void testcfgjson(Test *t)
         "instructions//files=AGENTS.md CLAUDE.md*\n"
         "ui//theme=system*\n"
         "ui//thinking=fold*\n"
+        "ui//tools=auto*\n"
         "ui//font_size=15*\n"
         "desktop//offer=none*\n"
         "desktop//ask=true*\n"

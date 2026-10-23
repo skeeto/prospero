@@ -828,7 +828,8 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
     case 3: {  // key: the backend reads modifiers from the key state
         static WORD const vks[] = {
             VK_TAB, VK_CONTROL, VK_ESCAPE, VK_RETURN, 'C', VK_SHIFT, 'A',
-            VK_END, VK_CONTROL, VK_OEM_PLUS, VK_OEM_MINUS, '0',
+            VK_END, VK_CONTROL, VK_OEM_PLUS, VK_OEM_MINUS, '0', 'F', 'G', 'T',
+            'R',
         };
         BYTE state[256];
         GetKeyboardState(state);

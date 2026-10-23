@@ -388,6 +388,89 @@ static void setthinking(Gui *g, i32 mode)
     }
 }
 
+// Fold tool rows as [ui] tools says: TOOLS_*, or -1 for an unknown name,
+// which means auto. Every view at once, in one frame.
+static void settools(Gui *g, i32 mode)
+{
+    mode = mode<0 ? TOOLS_AUTO : mode;
+    b32 changed = g->toolset != mode;
+    g->toolset = mode;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        changed |= s->view && viewtools(s->view, mode);
+    }
+    if (changed) {
+        g->woke |= WOKE_FORCE;
+        schedforce(&g->sched);
+    }
+}
+
+// A session's own toggles, which the session bar, their shortcuts and the
+// View menu work: every tool row open, or all reasoning shown, whatever
+// the settings say, until turned off again, when the settings fold them
+// as before but for rows the user opened or closed. The configuration is
+// left alone. A null session is the one shown.
+static void setsessiontools(Gui *g, GuiSession *s, b32 on)
+{
+    s = s ? s : g->sess;
+    if (s && s->view && viewshowtools(s->view, on)) {
+        scheddirty(&g->sched);
+    }
+}
+
+static void setsessionthink(Gui *g, GuiSession *s, b32 on)
+{
+    s = s ? s : g->sess;
+    if (s && s->view && viewshowthink(s->view, on)) {
+        g->thinkhidshown = 0;
+        scheddirty(&g->sched);
+    }
+}
+
+// Whether the toggles are on, for a menu's check marks.
+static b32 sessiontools(Gui *g)
+{
+    return g->sess && g->sess->view && g->sess->view->showtools;
+}
+
+static b32 sessionthink(Gui *g)
+{
+    return g->sess && g->sess->view && g->sess->view->showthink;
+}
+
+// Find in the transcript (Cmd/Ctrl+F, and Edit > Find): the find bar
+// opens over the transcript with its field focused, its text selected.
+static void gui_find_open(Gui *g)
+{
+    setpane(g, PANE_TRANSCRIPT, 1);
+    g->findopen  = 1;
+    g->findfocus = 1;
+    scheddirty(&g->sched);
+}
+
+static void gui_find_close(Gui *g)
+{
+    g->findopen   = 0;
+    g->findactive = 0;
+    scheddirty(&g->sched);
+}
+
+// The next match (dir 1) or the previous (-1), wrapping around, shown
+// and opened if folded.
+static void gui_find_next(Gui *g, i32 dir)
+{
+    ViewSearch *s = g->search;
+    iz          n = s->hits.len;
+    if (!g->findopen || !n || s->v!=g->view) {
+        return;
+    }
+    iz cur = s->cur<0 ? (dir>0 ? 0 : n-1) : (s->cur + dir + n) % n;
+    s->cur      = (i32)cur;
+    g->findjump = 1;
+    g->findwant = 0;
+    searchreveal(s, &s->hits[cur]);
+    scheddirty(&g->sched);
+}
+
 
 // Transcript
 
@@ -529,10 +612,46 @@ enum : i32 {
     CH_COUNT,
 };
 
+// A message's find hits, in order, and which of them is current, -1
+// if none.
+struct Marks {
+    FindHit *h;
+    iz       n;
+    iz       cur;
+};
+
+// The part of a run a message's hits cover, highlighted behind its text:
+// the current hit stronger.
+static void drawmarks(Gui *g, ImDrawList *dl, Marks *mk, Piece *pieces, Run *r,
+                      f32 ox, f32 ly, f32 lh)
+{
+    i32 rb = runbeg(pieces, r), re = runend(pieces, r);
+    if (rb == re) {
+        return;
+    }
+    iz lo = 0, hi = mk->n;
+    while (lo < hi) {
+        iz mid = lo + (hi - lo)/2;
+        if (mk->h[mid].off+mk->h[mid].len <= rb) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    for (iz i = lo; i<mk->n && mk->h[i].off<re; i++) {
+        FindHit *h  = &mk->h[i];
+        f32      x0 = runx(&g->measure, pieces, r, h->off>rb ? h->off : rb);
+        f32      x1 = runx(&g->measure, pieces, r, h->off+h->len);
+        f32      a  = i==mk->cur ? 0.75f : 0.3f;
+        dl->AddRectFilled(v2(ox+x0, ly), v2(ox+(x1>x0+1 ? x1 : x0+1), ly+lh),
+                          fade(g->pal->amber, a));
+    }
+}
+
 // Draw one placed block of a message whose content starts at origin.
 static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
                       Doc *d, i32 msg, Placed *p, ImVec2 origin, Range sel,
-                      f32 cliptop, f32 clipbot, f32 alpha)
+                      Marks *mk, f32 cliptop, f32 clipbot, f32 alpha)
 {
     BlockLayout *bl     = p->bl;
     DocBlock    *b      = &d->blocks[p->block];
@@ -590,6 +709,10 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
             Run   *r  = &bl->runs[l->run0+k];
             Piece *pc = &pieces[r->piece];
             f32    x0 = 0, x1 = 0;  // the run's selected part, if any
+            if (mk->n) {
+                sp->SetCurrentChannel(dl, CH_SEL);
+                drawmarks(g, dl, mk, pieces, r, ox, ly, l->h);
+            }
             if (selected) {
                 i32 rb = runbeg(pieces, r), re = runend(pieces, r);
                 b32 synth = rb == re;
@@ -1080,11 +1203,16 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
                               "this turn on");
         if (go) askrewind(g, s, {}, m->startsturn, 0);
         break;
-    case ACT_OUTPUT:
+    case ACT_OUTPUT: {
+        // Where it is, which the agent's text names too
         itemrect(g, RECT_OUTPUT);
-        ImGui::SetItemTooltip("Show the whole output, from its host");
+        Arena a = g->frame;
+        Str   d = s->view ? s->view->dir : Str{};
+        Str   p = d.len ? join(&a, d, t->spill) : t->spill;
+        ImGui::SetItemTooltip("Show the whole output, from its host:\n%s (%s)",
+                              cstr0(&a, p), cstr0(&a, bytesize(&a, t->bytes)));
         if (go) showfile(g, s, t->spill);
-        break;
+    } break;
     }
 }
 
@@ -1262,8 +1390,88 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
     g->infoagents = agents;
 }
 
+// The context gauge: a thin bar of the tokens the context holds, on the
+// scale of the model's window, with a tick where compaction begins, amber
+// from 90% of the way there. Nothing without the numbers.
+static f32 gaugewidth(Gui *g, View *v)
+{
+    b32 any = v->tokens>0 && (v->ctx>0 || v->compactat>0);
+    return any ? 64*g->scale : 0;
+}
+
+static void drawgauge(Gui *g, View *v, f32 w)
+{
+    Arena       a     = g->frame;
+    f32         sc    = g->scale;
+    Palette    *pal   = g->pal;
+    f32         h     = ImGui::GetFrameHeight();
+    i64         scale = v->ctx>0 ? v->ctx : v->compactat;
+    b32         near  = v->compactat>0 && v->tokens*10 >= v->compactat*9;
+    ImVec2      p0    = ImGui::GetCursorScreenPos();
+    ImDrawList *dl    = ImGui::GetWindowDrawList();
+    f32         bh    = 5*sc;
+    f32         y0    = p0.y + (h - bh)/2;
+    f32         frac  = (f32)v->tokens / (f32)scale;
+    frac = frac>1 ? 1 : frac;
+    dl->AddRectFilled(v2(p0.x, y0), v2(p0.x+w, y0+bh), pal->codebg, bh/2);
+    dl->AddRectFilled(v2(p0.x, y0), v2(p0.x+w*frac, y0+bh),
+                      near ? pal->amber : pal->active, bh/2);
+    if (v->compactat>0 && v->compactat<scale) {
+        f32 x = p0.x + w*(f32)v->compactat/(f32)scale;
+        dl->AddLine(v2(x, y0-2*sc), v2(x, y0+bh+2*sc), pal->dim, 1.5f*sc);
+    }
+    ImGui::Dummy(v2(w, h));
+    itemrect(g, RECT_GAUGE);
+    g->gaugeshown = 1 + near;
+    if (ImGui::BeginItemTooltip()) {
+        Buf b(&a, 256);
+        print(&b, "Context: ");
+        printgrouped(&b, v->tokens);
+        print(&b, " tokens");
+        if (v->compactat > 0) {
+            print(&b, "\nCompacts at ");
+            printgrouped(&b, v->compactat);
+            print(&b, " (");
+            print(&b, v->tokens*100/v->compactat);
+            print(&b, "% of the way)");
+        }
+        if (v->ctx > 0) {
+            print(&b, "\nWindow: ");
+            printgrouped(&b, v->ctx);
+        }
+        print(&b, "\nCached in the last request: ");
+        printgrouped(&b, v->cached);
+        text(finish(&b));
+        ImGui::EndTooltip();
+    }
+}
+
+// A toggle button, highlighted while on.
+static b32 togglebutton(char const *label, b32 on)
+{
+    if (on) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+    }
+    b32 r = ImGui::SmallButton(label);
+    if (on) {
+        ImGui::PopStyleColor();
+    }
+    return r;
+}
+
+// A shortcut's name: Cmd on macOS, Ctrl elsewhere.
+static char const *shortcutname(Gui *g, i32 which)
+{
+    switch (which) {
+    case 0: return g->mac ? "Cmd+Shift+T" : "Ctrl+Shift+T";
+    case 1: return g->mac ? "Cmd+Shift+R" : "Ctrl+Shift+R";
+    }
+    return g->mac ? "Cmd+F" : "Ctrl+F";
+}
+
 // A line above the transcript: the session, or a subagent's parent to
-// go back to, and the session's details in a popup.
+// go back to, its context gauge, the toggles that open all its tool
+// output and reasoning, and the session's details in a popup.
 static void drawsessbar(Gui *g)
 {
     GuiSession *s = g->sess;
@@ -1273,8 +1481,15 @@ static void drawsessbar(Gui *g)
     }
     Arena       a     = g->frame;
     ImGuiStyle &st    = ImGui::GetStyle();
+    f32         gap   = st.ItemSpacing.x;
+    f32         gw    = gaugewidth(g, v);
+    char const *tl    = "Tool output";
+    char const *rl    = "Reasoning";
     f32         infow = ImGui::CalcTextSize("Info").x + 2*st.FramePadding.x;
-    f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - infow;
+    f32         tw    = ImGui::CalcTextSize(tl).x + 2*st.FramePadding.x;
+    f32         rw    = ImGui::CalcTextSize(rl).x + 2*st.FramePadding.x;
+    f32         rest  = (gw>0 ? gw + gap : 0) + tw + gap + rw + gap + infow;
+    f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rest;
     if (v->parent.len) {
         GuiSession *p = findsess(g, s->host, v->parent);
         ImGui::TextDisabled(v->role.len ? "Subagent (%s) of" : "Subagent%s of",
@@ -1299,7 +1514,30 @@ static void drawsessbar(Gui *g)
         }
         ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
     }
-    ImGui::SameLine(right > rightof() ? right : 0);
+    if (right > rightof()) {
+        ImGui::SameLine(right);
+    } else if (right > ImGui::GetCursorPosX()) {
+        ImGui::SetCursorPosX(right);  // too narrow: a line of their own
+    }
+    g->gaugeshown = 0;
+    if (gw > 0) {
+        drawgauge(g, v, gw);
+        ImGui::SameLine();
+    }
+    if (togglebutton(tl, v->showtools)) {
+        setsessiontools(g, s, !v->showtools);
+    }
+    itemrect(g, RECT_TOOLSBTN);
+    ImGui::SetItemTooltip("Open every tool row's output in this session, or fold them "
+                          "again as the settings say (%s)", shortcutname(g, 0));
+    ImGui::SameLine();
+    if (togglebutton(rl, v->showthink)) {
+        setsessionthink(g, s, !v->showthink);
+    }
+    itemrect(g, RECT_THINKBTN);
+    ImGui::SetItemTooltip("Show all reasoning in this session, even hidden, or fold it "
+                          "again as the settings say (%s)", shortcutname(g, 1));
+    ImGui::SameLine();
     if (ImGui::SmallButton("Info")) {
         ImGui::OpenPopup("##sessinfo");
     }
@@ -1368,6 +1606,165 @@ static void drawrewind(Gui *g)
     ImGui::EndPopup();
 }
 
+// A message's find hits, while the find bar is open on its view.
+static Marks msgmarks(Gui *g, View *v, i32 msg)
+{
+    ViewSearch *s = g->search;
+    Marks       r = {0, 0, -1};
+    if (!g->findopen || s->v!=v || !s->hits.len) {
+        return r;
+    }
+    iz lo = searchfrom(s, msg, 0);
+    iz hi = searchfrom(s, msg+1, 0);
+    r.h   = s->hits.data + lo;
+    r.n   = hi - lo;
+    r.cur = s->cur>=lo && s->cur<hi ? s->cur-lo : -1;
+    return r;
+}
+
+// A code block's Copy button, at its top right while the mouse is over
+// the block, which it overlaps as the headers' toggles overlap the text:
+// the code byte for byte, as selecting the block whole copies it. It says
+// "Copied" for a moment after, until a deadline.
+static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f32 top)
+{
+    BlockLayout *bl = pl->bl;
+    Deco        *bg = 0;
+    for (iz i = 0; i<bl->decos.len && !bg; i++) {
+        bg = bl->decos[i].kind==DECO_CODEBG ? &bl->decos[i] : 0;
+    }
+    if (!bg) {
+        return;
+    }
+    f32     sc = g->scale;
+    ImVec2  a  = v2(origin.x+bg->x, origin.y+pl->y+bg->y);
+    ImVec2  z  = v2(a.x+bg->w, a.y+bg->h);
+    ImVec2  mp = ImGui::GetIO().MousePos;
+    b32     aimed = g->drivecodemsg<0 || (msg==g->drivecodemsg && pl->block==g->drivecodeblk);
+    if (aimed) {
+        f32 y0 = a.y>top ? a.y : top;
+        g->rects[RECT_CODEBLOCK] = {a.x, y0, z.x, z.y};
+    }
+    b32 over = mp.x>=a.x && mp.x<z.x && mp.y>=a.y && mp.y<z.y && mp.y>=top;
+    if (!over || g->dragging ||
+            !ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
+        return;
+    }
+    i64 until  = g->copiedat + COPIED_US;
+    b32 copied = g->copiedat && g->sched.now<until && g->copiedview==v &&
+                 g->copiedmsg==msg && g->copiedblk==pl->block;
+    if (copied) {
+        schedat(&g->sched, until + 1000, DUE_APP);
+    }
+    // As wide as its longer label, so that it stays under the mouse, and
+    // one ID for both, so that what the mouse is over stays the same and
+    // no hover delays start again with the change
+    char const *label = copied ? "Copied###copy" : "Copy###copy";
+    ImGuiStyle &st    = ImGui::GetStyle();
+    f32         bw    = ImGui::CalcTextSize("Copied", 0, 1).x + 2*st.FramePadding.x;
+    f32         by    = (a.y>top ? a.y : top) + 4*sc;
+    ImGui::SetCursorScreenPos(v2(z.x - bw - 4*sc, by));
+    ImGui::PushID(pl->block);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, v2(st.FramePadding.x, 0));
+    b32 go = ImGui::Button(label, v2(bw, 0));
+    ImGui::PopStyleVar();
+    ImGui::PopID();
+    if (aimed) {
+        itemrect(g, RECT_CODECOPY);
+    }
+    g->copiedshown |= copied;
+    if (go) {
+        Arena t = g->frame;
+        ImGui::SetClipboardText(cstr0(&t, copyblock(v, &t, msg, pl->block)));
+        g->copiedview = v;
+        g->copiedmsg  = msg;
+        g->copiedblk  = pl->block;
+        g->copiedat   = g->sched.now;
+    }
+}
+
+// The find bar, open over the transcript: the text to find, the hits
+// counted, and the buttons to go between them. A new text or session
+// searches again, a budget of bytes a frame, and the first hit at or
+// below the top of the screen becomes the current one.
+static void drawfind(Gui *g, View *v, f64 scrolly)
+{
+    ViewSearch *s  = g->search;
+    f32         sc = g->scale;
+    Arena       a  = g->frame;
+    if (!g->findopen) {
+        return;
+    }
+    if (g->findfocus) {
+        ImGui::SetKeyboardFocusHere();
+        g->findfocus = 0;
+    }
+    ImGui::SetNextItemWidth(260*sc);
+    b32 enter = ImGui::InputTextWithHint("##find", "Find in the transcript", g->findbuf,
+                                         FIELD_MAX, ImGuiInputTextFlags_EnterReturnsTrue|
+                                                    ImGuiInputTextFlags_AutoSelectAll);
+    itemrect(g, RECT_FINDFIELD);
+    b32 again = ImGui::IsItemEdited() || s->v!=v;
+    b32 esc   = ImGui::IsItemDeactivated() && ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    g->findactive = ImGui::IsItemActive();
+    if (enter) {
+        g->findfocus = 1;  // Enter lets go of the field: take it back
+    }
+
+    if (again) {
+        Str q = {(u8 *)g->findbuf, (iz)__builtin_strlen(g->findbuf)};
+        searchreset(s, v, q);
+        g->findfrom = viewfind(v, scrolly);
+        g->findwant = 1;
+    }
+    b32 done = searchstep(s, FIND_BUDGET);
+    if (!done) {
+        scheddirty(&g->sched);  // more next frame
+    }
+    if (g->findwant && s->cur<0) {
+        // The first hit from the top of the screen down, else from the
+        // start once all are found
+        iz i = searchfrom(s, g->findfrom<0 ? 0 : g->findfrom, 0);
+        if (i < s->hits.len) {
+            s->cur = (i32)i;
+        } else if (done && s->hits.len) {
+            s->cur = 0;
+        }
+        if (s->cur >= 0) {
+            searchreveal(s, &s->hits[s->cur]);
+            g->findjump = 1;
+        }
+    }
+    g->findwant &= !done && s->cur<0;
+
+    ImGui::SameLine();
+    b32 prev = ImGui::ArrowButton("##findprev", ImGuiDir_Up);
+    ImGui::SetItemTooltip("The previous match (Shift+Enter)");
+    ImGui::SameLine();
+    b32 next = ImGui::ArrowButton("##findnext", ImGuiDir_Down);
+    ImGui::SetItemTooltip("The next match (Enter)");
+    ImGui::SameLine();
+    Buf b(&a, 64);
+    if (s->q.len && !s->hits.len && done) {
+        print(&b, "No matches");
+    } else if (s->q.len) {
+        print(&b, (i64)(s->cur>=0 ? s->cur+1 : 0));
+        print(&b, " of ");
+        print(&b, (i64)s->hits.len);
+        print(&b, done ? Str("") : Str("+"));
+    }
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+    ImGui::SameLine();
+    b32 close = ImGui::SmallButton("Close");
+    ImGui::SetItemTooltip("Close the find bar (Esc)");
+    if (esc || close) {
+        gui_find_close(g);
+    } else if (enter || next || prev) {
+        gui_find_next(g, enter ? (ImGui::GetIO().KeyShift ? -1 : 1) : prev ? -1 : 1);
+    }
+}
+
 // The transcript of the session shown: virtualized messages with
 // selection across them, tool rows and ask cards.
 static void drawtranscript(Gui *g)
@@ -1397,6 +1794,16 @@ static void drawtranscript(Gui *g)
         ImGui::PopStyleColor();
     }
 
+    // Going between find hits is the find bar's and the transcript's
+    // alone (menukeys has the rest)
+    if (g->findopen && ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_G)) {
+        gui_find_next(g, 1);
+    }
+    if (g->findopen && ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_G)) {
+        gui_find_next(g, -1);
+    }
+    drawfind(g, v, gs->win ? gs->win->Scroll.y : 0);
+
     // Layout comes first, before the child window begins, so that its
     // content size and scroll take effect this very frame: a scroll set
     // inside it would land a frame late and cost a second present for
@@ -1416,6 +1823,7 @@ static void drawtranscript(Gui *g)
     }
     v->extra = extra;
     v->foot  = foot;
+    v->head  = head;
     v->gap   = 6*sc;
     f32 thumbw = (f32)IMG_THUMBW*sc<width ? (f32)IMG_THUMBW*sc : width;
     f32 thumbh = (f32)IMG_THUMBH*sc;
@@ -1425,11 +1833,6 @@ static void drawtranscript(Gui *g)
     v->thumbw   = thumbw;
     v->thumbh   = thumbh;
     v->thumbpad = pad/2;
-
-    if (width != g->lastwidth) {
-        v->topsdirty = 1;
-        g->lastwidth = width;
-    }
 
     // Where the view is: last frame's scroll, or where the wheel just
     // sent it.
@@ -1444,7 +1847,50 @@ static void drawtranscript(Gui *g)
         }
         scrolly = scrolly<0 ? 0 : scrolly>last->ScrollMax.y ? last->ScrollMax.y : scrolly;
     }
+    f32 scroll0 = scrolly;  // what the window has, unless set below
+
+    // A new width (this session's own, since each scrolls in its own
+    // coordinates): what was at the top edge stays there. Its place is
+    // found with the old width's heights and layouts, before the new
+    // width discards them, and put back with the new.
+    if (width != v->lastw) {
+        Anchor an = {-1, -1, 0};
+        if (v->lastw>0 && last && !bottom) {
+            viewtops(v, v->lastw, charw, fm.lineh);
+            an = viewanchor(v, &g->measure, v->lastw, sc, head, scrolly);
+        }
+        v->topsdirty = 1;
+        v->lastw     = width;
+        if (an.msg >= 0) {
+            viewtops(v, width, charw, fm.lineh);
+            msglayout(v, an.msg, &g->measure, width, sc);
+            viewtops(v, width, charw, fm.lineh);
+            scrolly = (f32)anchory(v, an, &g->measure, width, sc, head);
+        }
+    }
     viewtops(v, width, charw, fm.lineh);
+
+    // Going to a find hit: its message and the screen above it laid out
+    // first, so that it lands a third of the way down
+    ViewSearch *srch = g->search;
+    if (g->findjump && g->findopen && srch->v==v && srch->cur>=0) {
+        FindHit *h = &srch->hits[srch->cur];
+        msglayout(v, h->msg, &g->measure, width, sc);
+        viewtops(v, width, charw, fm.lineh);
+        i32 j0 = viewfind(v, v->msgs[h->msg].top - winh);
+        for (i32 i = j0; i>=0 && i < h->msg; i++) {
+            msglayout(v, i, &g->measure, width, sc);
+        }
+        viewtops(v, width, charw, fm.lineh);
+        ViewMsg   *m  = &v->msgs[h->msg];
+        MsgLayout *ml = msglayout(v, h->msg, &g->measure, width, sc);
+        f64        y  = m->top + head + msgy(msgdoc(v, h->msg), ml, h->off);
+        scrolly  = (f32)(y - winh/3);
+        scrolly  = scrolly<0 ? 0 : scrolly;
+        bottom   = 0;
+        gs->stick = 0;
+        g->findjump = 0;
+    }
 
     // Anchor on the first visible message, so that height corrections
     // above it do not move what is on screen.
@@ -1475,7 +1921,7 @@ static void drawtranscript(Gui *g)
     want = want<0 ? 0 : want;
 
     ImGui::SetNextWindowContentSize(v2(0, (f32)total + pad));
-    if ((f32)want != scrolly) {
+    if ((f32)want != scroll0) {
         ImGui::SetNextWindowScroll(v2(-1, (f32)want));
     }
     pushstr(gs->sid);
@@ -1592,6 +2038,9 @@ static void drawtranscript(Gui *g)
     g->thinkrows  = 0;
     g->thinkchars = -1;
     g->thinksecs  = -1;
+    g->rects[RECT_CODEBLOCK] = {};
+    g->rects[RECT_CODECOPY]  = {};
+    g->copiedshown = 0;
     sp->Split(dl, CH_COUNT);
     for (i32 i = d0; i>=0 && i <= d1; i++) {
         if (msghidden(v, &v->msgs[i])) {
@@ -1630,18 +2079,27 @@ static void drawtranscript(Gui *g)
         Pen p = {dl, &g->fonts, x, y + pad/4, x + width - actw, g->fonts.size*0.85f};
         drawheader(g, &p, v, m, nowms);
         ImVec2 origin = v2(x, y + head);
-        if (!m->collapsed) {
-            Doc *d = msgdoc(v, i);
+        Doc   *d      = m->collapsed ? 0 : msgdoc(v, i);
+        if (d) {
+            Marks mk = msgmarks(g, v, i);
             for (iz k = 0; k < ml->blocks.len; k++) {
                 Placed *pl = &ml->blocks[k];
                 if (origin.y+pl->y > bot || origin.y+pl->y+pl->bl->h < top) {
                     continue;
                 }
-                drawblock(g, dl, sp, d, i, pl, origin, sel, top, bot, alpha);
+                drawblock(g, dl, sp, d, i, pl, origin, sel, &mk, top, bot, alpha);
             }
         }
 
         ImGui::PushID(i);
+        for (iz k = 0; d && k < ml->blocks.len; k++) {
+            Placed *pl = &ml->blocks[k];
+            if (d->blocks[pl->block].type!=DOC_CODE || origin.y+pl->y > bot ||
+                    origin.y+pl->y+pl->bl->h < top) {
+                continue;
+            }
+            drawcodecopy(g, v, i, pl, origin, top);
+        }
         if (m->fold || m->role==VIEW_TOOL || m->role==VIEW_THINK) {
             // The header toggles the body, but for its action
             ImGui::SetCursorScreenPos(v2(x, y));
@@ -1726,10 +2184,11 @@ static void drawtranscript(Gui *g)
 // Esc cancels the shown session's turn, from inside the windows about
 // the session while one has focus: there it goes ahead of the prompt
 // box, which would otherwise take it to undo the typing, while a field
-// elsewhere (Settings) keeps Esc to abandon its edit.
+// elsewhere (Settings) keeps Esc to abandon its edit, and so does the
+// find bar's, where it closes the bar.
 static void escapecancel(Gui *g)
 {
-    if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+    if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && !g->findactive &&
             ImGui::Shortcut(ImGuiKey_Escape, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
         guicancel(g, g->sess);
     }
@@ -1772,7 +2231,7 @@ static void drawstrip(Gui *g)
         ImGui::SameLine();
         ImGui::TextUnformatted(cstr0(&a, finish(&b)));
     }
-    if (v->busy && v->thinking==THINK_HIDE && v->stream>=0 &&
+    if (v->busy && v->thinking==THINK_HIDE && !v->showthink && v->stream>=0 &&
             v->streamkind==VIEW_THINK) {
         // Why the transcript shows nothing while the model thinks
         g->thinkhidshown = 1;
@@ -3032,6 +3491,8 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
                 settheme(g, themeparse(pick));
             } else if (r->kind=="ui" && r->key=="thinking") {
                 setthinking(g, thinkparse(pick));
+            } else if (r->kind=="ui" && r->key=="tools") {
+                settools(g, toolsparse(pick));
             }
             r->sent    = 1;
             r->sentval = clone(&g->cfgmem, pick);
@@ -3929,7 +4390,23 @@ static void drawhelp(Gui *g)
     ImGui::TextWrapped(
         "Drag to select across messages; double-click selects a word, "
         "triple-click a block, Shift-click extends. Right-click for copy "
-        "options.");
+        "options. A code block's Copy button, at its corner while the "
+        "mouse is over it, copies its code exactly.");
+    ImGui::Spacing();
+    char const *mod = g->mac ? "Cmd" : "Ctrl";
+    ImGui::TextWrapped(
+        "%s+F finds text in the transcript, folded tool output and "
+        "reasoning included: Enter or %s+G goes to the next match, "
+        "Shift+Enter or %s+Shift+G to the previous, and a folded row "
+        "opens to show one. Esc closes the find bar.", mod, mod, mod);
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "The Tool output and Reasoning buttons above the transcript, or "
+        "%s+Shift+T and %s+Shift+R, open all of a session's tool output or "
+        "reasoning, hidden reasoning too, whatever [ui] tools and [ui] "
+        "thinking say; again, and the rows fold as before. The bar beside "
+        "them shows how full the context is, amber near where it is "
+        "compacted.", mod, mod);
     ImGui::Spacing();
     ImGui::TextWrapped(
         "The View menu shows and hides these panes, and zooms the text: "
@@ -4008,7 +4485,8 @@ static void newsession(Gui *g)
 
 // The menus' shortcuts, wherever the focus is (a global route, which a
 // focused field's own use of a key goes ahead of): a new session, zoom
-// by key or by Ctrl+wheel (Cmd on macOS), and quitting on Linux, where
+// by key or by Ctrl+wheel (Cmd on macOS), find and the session's
+// folding toggles, and quitting on Linux, where
 // no system shortcut does (macOS has Cmd+Q, Windows Alt+F4).
 static void menukeys(Gui *g)
 {
@@ -4029,6 +4507,16 @@ static void menukeys(Gui *g)
     if (ImGui::Shortcut(ctrl|ImGuiKey_0, glob) ||
             ImGui::Shortcut(ctrl|ImGuiKey_Keypad0, glob)) {
         setzoom(g, 1);
+    }
+    // Find, and the session's toggles of its tool output and reasoning
+    if (g->sess && ImGui::Shortcut(ctrl|ImGuiKey_F, glob)) {
+        gui_find_open(g);
+    }
+    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_T, glob)) {
+        setsessiontools(g, 0, !sessiontools(g));
+    }
+    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_R, glob)) {
+        setsessionthink(g, 0, !sessionthink(g));
     }
     #if !defined(_WIN32) && !defined(__APPLE__)
     if (ImGui::Shortcut(ctrl|ImGuiKey_Q, glob)) {
@@ -4109,7 +4597,9 @@ static void drawmenubar(Gui *g)
             selall(v);
         }
         ImGui::Separator();
-        ImGui::MenuItem("Find...", cmdkey(g, &a, "F"), false, false);
+        if (ImGui::MenuItem("Find...", cmdkey(g, &a, "F"), false, g->sess!=0)) {
+            gui_find_open(g);
+        }
         ImGui::EndMenu();
     }
 
@@ -4147,9 +4637,15 @@ static void drawmenubar(Gui *g)
             setzoom(g, 1);
         }
         ImGui::Separator();
-        // Folding for the session shown, to come
-        ImGui::MenuItem("Expand tool output", 0, false, false);
-        ImGui::MenuItem("Expand thinking", 0, false, false);
+        // Folding for the session shown, its toggles as the session
+        // bar has them
+        b32 has = g->sess && g->sess->view;
+        if (ImGui::MenuItem("Expand tool output", shortcutname(g, 0), sessiontools(g), has)) {
+            setsessiontools(g, 0, !sessiontools(g));
+        }
+        if (ImGui::MenuItem("Expand thinking", shortcutname(g, 1), sessionthink(g), has)) {
+            setsessionthink(g, 0, !sessionthink(g));
+        }
         ImGui::Separator();
         if (ImGui::BeginMenu("Theme")) {
             static char const *labels[] = {"System", "Dark", "Light"};

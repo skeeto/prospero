@@ -292,8 +292,8 @@ static void test_view(Test *t)
                "U:go;X[shell make test\xe2\x80\xa6 running]:line 1\n;X[edit a.c called]:;");
         apply(v, a, R"({"sid":"s","seq":7,"ts":3200,"ev":"tool.end","call":"c1","status":"ok","exit":0,"text":"ok\n","spill":"out/c1.log","bytes":3,"ms":1200})");
         ViewTool *sh = v->msgs[1].tool;
-        expect(t, "view.shellend", v->msgs[1].text,
-               "ok\n\nFull output: /st/sessions/s/out/c1.log (3 bytes)");
+        expect(t, "view.shellend", v->msgs[1].text, "ok\n");  // the Output action has the file
+        expect(t, "view.spill", sh->spill, "out/c1.log");
         expect(t, "view.shellexit", istr(&a, sh->hasexit*10000 + sh->exit*1000 + sh->ms), "11200");
         b32 late = apply(v, a, R"({"sid":"s","ts":0,"ev":"tool.out","call":"c1","tail":"late","bytes":9})");
         expect(t, "view.lateout", istr(&a, late), "0");
@@ -948,5 +948,247 @@ static void test_viewthinking(Test *t)
         expect(t, "thinking.findprev", istr(&a, viewfind(v, 5)), "0");
         selset(v, 0, 0, 2, 2);
         expect(t, "thinking.copy", copysel(v, &a, COPY_TEXT), "hi\n\nHm, caf\xc3\xa9 ok\n\nHi");
+    }
+}
+
+// Tool rows and reasoning as each message has it: f folded or o open, h
+// hidden, then * if the user chose.
+static Str foldshow(Arena *a, View *v)
+{
+    Buf b(a, 128);
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role!=VIEW_TOOL && m->role!=VIEW_THINK) {
+            continue;
+        }
+        print(&b, msghidden(v, m) ? Str("h") : m->collapsed ? Str("f") : Str("o"));
+        if (m->chosen) putbyte(&b, '*');
+        putbyte(&b, ';');
+    }
+    return finish(&b);
+}
+
+// Hits as "msg:off" each.
+static Str hitshow(Arena *a, ViewSearch *s)
+{
+    Buf b(a, 128);
+    for (iz i = 0; i < s->hits.len; i++) {
+        print(&b, (i64)s->hits[i].msg);
+        putbyte(&b, ':');
+        print(&b, (i64)s->hits[i].off);
+        putbyte(&b, ';');
+    }
+    return finish(&b);
+}
+
+static ViewSearch *testsearch(Arena *a)
+{
+    Os *os = newos(a, 1<<12);
+    iz  mb = (iz)1<<20;
+    return newsearch(a, os_reserve(os, 16*mb), os_reserve(os, 16*mb), 256);
+}
+
+static void test_viewtranscript(Test *t)
+{
+    Arena perm = t->perm;
+    Str   recs[] = {
+        R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"go"})",
+        R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})",
+        R"({"sid":"s","seq":3,"ts":0,"ev":"attempt","turn":1,"n":1})",
+        R"({"sid":"s","seq":4,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+        R"({"t":"think","text":"Needle in the reasoning"},)"
+        R"({"t":"call","id":"c1","name":"read","args":"{\"path\":\"a\"}"},)"
+        R"({"t":"call","id":"c2","name":"shell","args":"{\"command\":\"ls\"}"},)"
+        R"({"t":"call","id":"c3","name":"shell","args":"{\"command\":\"bad\"}"}]})",
+        R"({"sid":"s","seq":5,"ts":0,"ev":"tool.start","call":"c1","name":"read","args":"{}"})",
+        R"({"sid":"s","seq":6,"ts":0,"ev":"tool.end","call":"c1","status":"ok","text":"a NEEDLE read"})",
+        R"({"sid":"s","seq":7,"ts":0,"ev":"tool.start","call":"c2","name":"shell","args":"{}"})",
+    };
+    Str end2 = R"({"sid":"s","seq":8,"ts":0,"ev":"tool.end","call":"c2","status":"ok","text":)"
+               R"("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n"})";
+    Str end3 = R"({"sid":"s","seq":9,"ts":0,"ev":"tool.end","call":"c3","status":"error","text":"needle, failed"})";
+
+    // Each mode: auto folds the read and the long shell output and opens
+    // the failure; fold and open apply to every row; a row the user
+    // opened or closed keeps it through its end and every mode
+    {
+        Str want[] = {"f;f;f;o;", "f;f;f;f;", "f;o;o;o;"};
+        for (i32 mode = 0; mode < TOOLS_COUNT; mode++) {
+            Arena a = perm;
+            View *v = testview(&a);
+            viewtools(v, mode);
+            for (iz i = 0; i < countof(recs); i++) apply(v, a, recs[i]);
+            apply(v, a, end2);
+            apply(v, a, end3);
+            expect(t, concat(&a, "tools.", toolsnames[mode]), foldshow(&a, v), want[mode]);
+        }
+
+        Arena a = perm;
+        View *v = testview(&a);
+        for (iz i = 0; i < countof(recs); i++) apply(v, a, recs[i]);
+        expect(t, "tools.running", foldshow(&a, v), "f;f;o;o;");
+        togglemsg(v, 3);  // folded by the user while it runs: tool.end leaves it
+        apply(v, a, end2);
+        togglemsg(v, 4);  // and the failure, before its end
+        apply(v, a, end3);
+        expect(t, "tools.chosen", foldshow(&a, v), "f;f;f*;f*;");
+        viewtools(v, TOOLS_OPEN);
+        expect(t, "tools.chosenopen", foldshow(&a, v), "f;o;f*;f*;");
+        viewtools(v, TOOLS_AUTO);
+        expect(t, "tools.back", foldshow(&a, v), "f;f;f*;f*;");
+
+        // The session's toggles open everything of their kind, hidden
+        // reasoning too, but for what the user chose, and off again fold
+        // as before
+        viewthink(v, THINK_HIDE);
+        expect(t, "toggle.hidden", foldshow(&a, v), "h;f;f*;f*;");
+        viewshowtools(v, 1);
+        viewshowthink(v, 1);
+        expect(t, "toggle.on", foldshow(&a, v), "o;o;f*;f*;");
+        togglemsg(v, 2);  // closed by the user while all are open
+        viewshowtools(v, 0);
+        viewshowthink(v, 0);
+        expect(t, "toggle.off", foldshow(&a, v), "h;f*;f*;f*;");
+    }
+
+    // A provisional call the user opened stays open once committed
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, recs[0]);
+        apply(v, a, recs[1]);
+        apply(v, a, recs[2]);
+        apply(v, a, R"({"sid":"s","ts":1,"ev":"delta","turn":1,"attempt":1,"kind":"args",)"
+                    R"("block":0,"id":"c1","name":"read","text":"{}"})");
+        togglemsg(v, 1);
+        apply(v, a, R"({"sid":"s","seq":4,"ts":2,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"c1","name":"read","args":"{}"}]})");
+        expect(t, "tools.provchosen", foldshow(&a, v), "o*;");
+    }
+
+    // Finding: ASCII case ignored, folded rows searched, hidden reasoning
+    // not; the search keeps up with new text from where it changed, a
+    // budget at a time
+    {
+        Arena       a = perm;
+        View       *v = testview(&a);
+        ViewSearch *s = testsearch(&a);
+        for (iz i = 0; i < countof(recs); i++) apply(v, a, recs[i]);
+        searchreset(s, v, "needle");
+        expect(t, "find.done", istr(&a, searchstep(s, 1<<20)), "1");
+        expect(t, "find.hits", hitshow(&a, s), "1:0;2:2;");
+        apply(v, a, end2);
+        apply(v, a, end3);
+        searchstep(s, 1<<20);
+        expect(t, "find.more", hitshow(&a, s), "1:0;2:2;4:0;");
+        viewthink(v, THINK_HIDE);
+        searchstep(s, 1<<20);
+        expect(t, "find.hidden", hitshow(&a, s), "2:2;4:0;");
+        viewthink(v, THINK_FOLD);
+        searchreset(s, v, "NEEDLE");
+        expect(t, "find.budget", istr(&a, searchstep(s, 10)), "0");
+        expect(t, "find.partial", hitshow(&a, s), "1:0;");
+        while (!searchstep(s, 10)) {}
+        expect(t, "find.rest", hitshow(&a, s), "1:0;2:2;4:0;");
+        expect(t, "find.from", istr(&a, searchfrom(s, 3, 0)), "2");
+        // A folded hit opens as if chosen, and is not searched again
+        s->cur = 1;
+        searchreveal(s, &s->hits[1]);
+        searchstep(s, 1<<20);
+        expect(t, "find.revealed", foldshow(&a, v), "f;o*;f;o;");
+        expect(t, "find.kept", istr(&a, s->cur), "1");
+        searchreset(s, v, "");
+        searchstep(s, 1<<20);
+        expect(t, "find.empty", istr(&a, s->hits.len), "0");
+    }
+
+    // The context gauge: usage, then the engine's own numbers
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, recs[0]);
+        apply(v, a, recs[1]);
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"attempt","turn":1,"n":1,)"
+                    R"("ctx":131072,"compact_at":104857,"tokens":9000})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"assistant","turn":1,"attempt":1,)"
+                    R"("blocks":[{"t":"text","text":"hi"}],"usage":{"in":12000,"out":345,"cached":11000}})");
+        Buf b(&a, 64);
+        print(&b, v->ctx);
+        putbyte(&b, ' ');
+        print(&b, v->compactat);
+        putbyte(&b, ' ');
+        print(&b, v->tokens);
+        putbyte(&b, ' ');
+        print(&b, v->cached);
+        expect(t, "gauge.usage", finish(&b), "131072 104857 12345 11000");
+        b32 changed = apply(v, a, R"({"sid":"s","ts":0,"ev":"live","state":"idle","tokens":20000})");
+        expect(t, "gauge.live", istr(&a, changed*100000 + v->tokens), "120000");
+        changed = apply(v, a, R"({"sid":"s","ts":0,"ev":"live","state":"idle"})");
+        expect(t, "gauge.kept", istr(&a, changed*1000000 + v->ctx), "131072");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"turn.end","turn":1,"why":"done",)"
+                    R"("ctx":200000,"compact_at":160000,"tokens":21000})");
+        expect(t, "gauge.turnend", istr(&a, v->ctx + v->compactat + v->tokens), "381000");
+    }
+
+    // A code block's Copy: its code byte for byte, as selecting the
+    // block whole (a triple click) copies it, without its last newline
+    {
+        Arena a  = perm;
+        View *v  = testview(&a);
+        Str   md = "Text.\n\n```c\nint\tx;  \n\ty;\n```\n\nAfter.\n";
+        addmsg(v, VIEW_ASSISTANT, md);
+        Doc *d  = msgdoc(v, 0);
+        i32  cb = -1;
+        for (i32 k = 0; k < d->blocks.len; k++) {
+            cb = d->blocks[k].type==DOC_CODE ? k : cb;
+        }
+        expect(t, "copyblock", copyblock(v, &a, 0, cb), "int\tx;  \n\ty;");
+        i32 c0 = (i32)find(md, "int");
+        selbegin(v, {0, c0+2}, SEL_BLOCK);
+        expect(t, "copyblock.triple", copysel(v, &a, COPY_TEXT), "int\tx;  \n\ty;");
+    }
+
+    // A new width keeps the top edge's line: the anchor found at one
+    // width, put back at another, finds the same message, the line
+    // holding the same offset, and the same distance into it
+    {
+        Arena   a = perm;
+        View   *v = testview(&a);
+        Measure m = fixedmeasure();
+        v->extra = 30;
+        v->gap   = 4;
+        Buf para(&a, 4096);
+        for (i32 i = 0; i < 60; i++) {
+            print(&para, "word");
+            print(&para, (i64)i);
+            putbyte(&para, ' ');
+        }
+        Str p = finish(&para);
+        for (i32 i = 0; i < 6; i++) {
+            addmsg(v, VIEW_ASSISTANT, p);
+        }
+        f32 head = 20;
+        for (i32 i = 0; i < 6; i++) msglayout(v, i, &m, 400, 1);
+        viewtops(v, 400, 10, 20);
+        f64    y  = v->msgs[3].top + head + 3*20 + 7;
+        Anchor an = viewanchor(v, &m, 400, 1, head, y);
+        Doc   *d  = msgdoc(v, 3);
+        expect(t, "anchor.msg", istr(&a, an.msg*1000 + (i32)an.dy), "3007");
+        expect(t, "anchor.line", istr(&a, an.off>0 && msgy(d, &v->msgs[3].layout, an.off)==60), "1");
+
+        v->topsdirty = 1;
+        viewtops(v, 250, 10, 20);  // above it, estimates at the new width
+        msglayout(v, 3, &m, 250, 1);
+        viewtops(v, 250, 10, 20);
+        f64        y2 = anchory(v, an, &m, 250, 1, head);
+        Anchor     b  = viewanchor(v, &m, 250, 1, head, y2);
+        MsgLayout *ml = &v->msgs[3].layout;
+        expect(t, "anchor.again", istr(&a, b.msg*1000 + (i32)b.dy), "3007");
+        expect(t, "anchor.same", istr(&a, msgy(d, ml, b.off)==msgy(d, ml, an.off) && b.off<=an.off), "1");
+
+        // In a header: the distance from the message's top
+        Anchor h = viewanchor(v, &m, 250, 1, head, v->msgs[2].top + 5);
+        expect(t, "anchor.header", istr(&a, h.msg*1000 + h.off*100 + (i32)h.dy), "1905");
+        expect(t, "anchor.headery", istr(&a, (i64)(anchory(v, h, &m, 250, 1, head) - v->msgs[2].top)), "5");
     }
 }

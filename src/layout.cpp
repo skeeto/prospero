@@ -730,6 +730,32 @@ static i32 blockhit(Measure *m, Doc *d, Placed *p, f32 x, f32 y)
     return runend(pieces, last);
 }
 
+// The top of the line holding a source offset in a message laid out by
+// layoutmsg, relative to the message's top: the first of the lines that
+// begin last at or before it, or 0 if none does.
+static f32 msgy(Doc *d, MsgLayout *ml, i32 off)
+{
+    f32 y    = 0;
+    i32 best = -1;
+    for (iz k = 0; k < ml->blocks.len; k++) {
+        Placed      *p      = &ml->blocks[k];
+        BlockLayout *bl     = p->bl;
+        Piece       *pieces = d->pieces.data + d->blocks[p->block].piece0;
+        for (iz i = 0; i < bl->lines.len; i++) {
+            Line *l = &bl->lines[i];
+            if (!l->nrun) {
+                continue;
+            }
+            i32 b = runbeg(pieces, &bl->runs[l->run0]);
+            if (b<=off && b>best) {
+                best = b;
+                y    = p->y + l->y;
+            }
+        }
+    }
+    return y;
+}
+
 // The source offset nearest to (x, y) in a message laid out by
 // layoutmsg, at y relative to the message's top.
 static i32 msghit(Measure *m, Doc *d, MsgLayout *ml, f32 x, f32 y)

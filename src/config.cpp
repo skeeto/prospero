@@ -410,6 +410,10 @@ static CfgKey cfgschema[] = {
     {"ui", "thinking", CFG_ENUM, "fold", {}, "fold open hide", "ui",
      "Reasoning in the transcript: fold to a line that counts it as it "
      "streams, open, or hide"},
+    {"ui", "tools", CFG_ENUM, "auto", {}, "auto fold open", "ui",
+     "Tool output in the transcript: auto folds reads, writes, todo lists, "
+     "background jobs and long shell output and opens failures; fold or "
+     "open every row"},
     {"ui", "font_size", CFG_NUMBER, "15", {}, {}, "ui",
      "Text size in pixels at 100% display scale, 8 to 40; the View "
      "menu's zoom scales it until Prospero exits"},

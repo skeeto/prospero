@@ -572,6 +572,7 @@ int main()
     test_view(&t);
     test_viewpanels(&t);
     test_viewthinking(&t);
+    test_viewtranscript(&t);
     test_theme(&t);
     test_png(&t);
     test_fonts(&t);

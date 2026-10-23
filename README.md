@@ -139,7 +139,12 @@ message that began a turn; the todo list and background jobs; and the
 prompt. The model's reasoning folds to one line that counts it as it
 streams, which a click opens; `[ui] thinking = open` shows it whole,
 and `hide` leaves it out of the transcript (the session log keeps it,
-and the model still gets it back). A file tool that goes outside the session's working directory,
+and the model still gets it back). Tool rows fold by kind and outcome,
+or all of them with `[ui] tools = fold` or `open`, and a session's
+Tool output and Reasoning buttons open everything for that session
+alone. Cmd/Ctrl+F finds text in the transcript, folded rows included,
+and a code block's Copy button copies its code exactly. A bar above the
+transcript shows how full the context is. A file tool that goes outside the session's working directory,
 or the roots the configuration adds, asks first, and an answer not
 given in time denies it. The settings window edits the configuration
 file in place, changing only the lines it sets, with a page for each

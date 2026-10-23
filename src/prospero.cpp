@@ -404,6 +404,10 @@ enum {
     GKEY_EQUAL,
     GKEY_MINUS,
     GKEY_0,
+    GKEY_F,
+    GKEY_G,
+    GKEY_T,
+    GKEY_R,
 };
 struct GuiEvent {
     i32 kind;
