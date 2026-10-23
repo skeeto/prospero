@@ -2876,9 +2876,10 @@ static_assert(countof(bynames) == DENY_COUNT);
 // for reads alone or for writes too, logged as a grant record, which
 // loadsession replays. A grant covers the session's whole tree: a new
 // subagent starts with its parent's, logged in it by "parent", and one
-// that a subagent gets is logged in its root too, by "subagent", and is
-// given to every session of the tree in memory. The frozen system prompt
-// never names a grant.
+// that a subagent gets is logged in its root too, by "subagent". Every
+// grant is given to every session of the tree in memory, and logged by
+// "parent" in those it was new to. The frozen system prompt never names
+// a grant.
 
 static b32 hasgrant(Session *s, Str path, b32 write)
 {
@@ -2901,16 +2902,18 @@ static void guardgrants(Session *s, Arena *perm, Guard *g)
     }
 }
 
-// Give a session in memory a grant, from its next call on.
-static void addgrant(Session *s, Str path, b32 write)
+// Give a session in memory a grant, from its next call on. Whether it
+// is new to the session.
+static b32 addgrant(Session *s, Str path, b32 write)
 {
     if (hasgrant(s, path, write)) {
-        return;
+        return 0;
     }
     Grant g = {clone(&s->perm, path), write};
     s->grants = push(&s->perm, s->grants, g);
     i32 flags = ROOT_HIDDEN | ROOT_MISSING | (write ? 0 : ROOT_READ);
     guardadd(s->e->os, &s->perm, &s->guard, g.path, flags);
+    return 1;
 }
 
 // The durable record of a grant: by "user" (req, the ask it answered),
@@ -2944,18 +2947,22 @@ static Session *treeroot(Session *s)
 }
 
 // The user's "always" for the ask of s: logged in s, and in its root if
-// that is another session in memory, then given to the whole tree.
+// that is another session in memory, then given to the whole tree, and
+// logged by "parent" in each other session of it that lacked it, so
+// that one opened again later has it as it had it here.
 static void usergrant(Session *s, Arena scratch, Str path, b32 write, Str req)
 {
     Grant    g    = {path, write};
     Session *root = treeroot(s);
+    b32      top  = root!=s && !root->psid.len;
     loggrant(s, scratch, g, "user", req, {});
-    if (root!=s && !root->psid.len) {
+    if (top) {
         loggrant(root, scratch, g, "subagent", req, s->sid);
     }
     for (Session *t = s->e->sessions; t; t = t->next) {
-        if (treeroot(t) == root) {
-            addgrant(t, path, write);
+        if (treeroot(t)==root && addgrant(t, path, write) &&
+                t!=s && !(t==root && top)) {
+            loggrant(t, scratch, g, "parent", {}, {});
         }
     }
 }
@@ -8365,14 +8372,49 @@ static Slice<iz> subtree(Arena *a, SessScan *sc, iz root)
     return tree;
 }
 
+// Of the scratch directories of sessions just deleted, those to remove:
+// each one in os_scratchdir named after a sid, so made for a session of
+// its own, that no session left names, nor is that sid's. A fork names
+// its original's (cmdfork), so that directory outlives the original
+// until the last fork of it goes too.
+static Slice<Str> ownscratch(Engine *e, Arena *a, SessScan *sc,
+                             Slice<Str> deleted, Slice<Str> dirs)
+{
+    Map<b32> *gone = 0;
+    for (iz i = 0; i < deleted.len; i++) {
+        *upsert(&gone, deleted[i], a) = 1;
+    }
+    Slice<Str> r = {};
+    for (iz i = 0; i < dirs.len; i++) {
+        Str  dir   = dirs[i];
+        Str  owner = basename(dir);
+        b32  keep  = !validsid(owner) || !(scratchfor(e, a, owner)==dir);
+        for (iz k = 0; k<r.len && !keep; k++) {
+            keep = r[k] == dir;
+        }
+        for (iz k = 0; k<sc->list.len && !keep; k++) {
+            ListEntry *en = &sc->list[k];
+            keep = !upsert(&gone, en->sid, (Arena *)0) &&
+                   (en->scratch==dir || en->sid==owner);
+        }
+        for (Session *s = e->sessions; s && !keep; s = s->next) {
+            keep = !upsert(&gone, s->sid, (Arena *)0) && s->scratch==dir;
+        }
+        if (!keep) {
+            r = push(a, r, dir);
+        }
+    }
+    return r;
+}
+
 // delete {sid}: a session for good, with its subagents (subtree), once
 // each of them is checked: nothing may run in one here (forgettable, as
 // busy alone leaves out background jobs), and none may be open in
 // another process; one parked may go. Subagents go first, so that a
 // failure part of the way never leaves one to show as a session of its
 // own, its parent gone. Each directory goes into the trash while its
-// lock is held (on Windows, just after), and so does the session's
-// scratch directory if it is its own: the sid's in os_scratchdir. The
+// lock is held (on Windows, just after), and so do scratch directories
+// no session left uses (ownscratch). The
 // reply lists the sessions deleted, also those before a failure.
 static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
 {
@@ -8406,7 +8448,7 @@ static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
     }
 
     Slice<Str> deleted = {};
-    Slice<Str> mines   = {};  // scratch directories of their own
+    Slice<Str> mines   = {};  // their scratch directories
     for (iz n = tree.len-1; n>=0 && !err.len; n--) {
         ListEntry *en   = &sc.list[tree[n]];
         Str        msid = en->sid;
@@ -8448,11 +8490,11 @@ static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
             break;
         }
         deleted = push(&scratch, deleted, msid);
-        if (mine.len && scratchfor(e, &scratch, msid)==mine) {
+        if (mine.len) {
             mines = push(&scratch, mines, mine);
         }
     }
-    removelater(e, mines);
+    removelater(e, ownscratch(e, &scratch, &sc, deleted, mines));
     Buf   b(&scratch, 256 + err.len + 64*deleted.len);
     EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
     putintkey(&w.json, "id", id);
@@ -8475,7 +8517,9 @@ static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
 // directory has only those of the original's out/ and snap/ files its
 // log names (os_copyfile), as rewind needs the snapshots; its title,
 // "TITLE (fork)", and the original's group, but neither its draft nor
-// its archived flag; and it shares the original's scratch directory.
+// its archived flag; and it shares the original's scratch directory,
+// named in their frozen prompts, which a delete leaves while a session
+// naming it is left (ownscratch).
 // The log is written last, so that the sessions list never shows a fork
 // half made. The workspace is left as it is. The reply names the fork
 // (sid) and its original (from), the turn, and next, the prompt that

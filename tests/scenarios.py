@@ -5016,7 +5016,8 @@ def always(t):
 def always_task(t):
     """A subagent starts with its parent's grants (logged in it, by
     "parent"); one it is given is logged in it and in its root (by
-    "subagent"), and holds for the whole tree from then on."""
+    "subagent"), and holds for the whole tree from then on; a later one
+    the parent gets is logged in the subagent, by "parent"."""
     t.host.mkdir(t.host.join(t.base, "ext"))
     t.host.mkdir(t.host.join(t.base, "sub"))
     t.host.write(t.host.join(t.base, "sub", "s.txt"), "s\n")
@@ -5048,6 +5049,19 @@ def always_task(t):
         te = h.all("tool.end", sid)
         t.check(te[-1]["status"] == "ok" and te[-1]["text"].rstrip().endswith("s"),
                 f"read {te[-1]}")
+
+        # A later grant of the parent's is logged in the live subagent
+        t.host.mkdir(t.host.join(t.base, "more"))
+        h.send("prompt", sid=sid, text="more")
+        ask = nextask(h, sid, ask["seq"])
+        h.call("answer", sid=sid, req=ask["req"], decision="always")
+        t.check(ended(h, sid, 2)["why"] == "done", "the parent's second turn")
+        kg = [(g["by"], g["access"], g["path"].rsplit("/", 1)[-1]) for g in logged(t, kid)
+              if g["ev"] == "grant"]
+        t.check(kg == [("parent", "write", "ext"), ("user", "read", "sub"),
+                       ("parent", "write", "more")], f"the subagent's grants now: {kg}")
+        pg = [g["by"] for g in logged(t, sid) if g["ev"] == "grant"]
+        t.check(pg == ["user", "subagent", "user"], f"the root's grants now: {pg}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -5354,6 +5368,22 @@ def fork(t):
         t.check(r.get("ok") == 0, f"not a number: {r}")
         t.check(logged(t, sid) == src, "the original untouched")
 
+        # Before each prompt, as the transcript's menu forks (viewforkat):
+        # the prompt's record, a title at most, then its turn's record,
+        # whose n less one is the fork's turn, a turn begun by a job's end
+        # counted, and that prompt comes back as next
+        prompts = 0
+        for i, e in enumerate(src):
+            if e["ev"] != "user" or e.get("via") == "steer":
+                continue
+            nxt = next(x for x in src[i+1:] if x["ev"] != "title")
+            t.check(nxt["ev"] == "turn", f"{e['text']} begins a turn: {nxt}")
+            r = h.call("fork", sid=sid, turn=nxt["n"] - 1)
+            t.check(r.get("ok") == 1 and r.get("next") == e["text"],
+                    f"fork before {e['text']} (turn {nxt['n']}): {r}")
+            prompts += 1
+        t.check(prompts == 3, f"three prompts: {prompts}")
+
         # The fork at turn 0: settings, no history
         r0, recs = forked(0, "one")
         t.check(not any(e["ev"] in ("user", "turn", "assistant") for e in recs), "no history")
@@ -5371,6 +5401,45 @@ def fork(t):
         listed = {e["sid"]: e for e in h.all("sessions")[-1]["list"]}
         t.check(r3["sid"] in listed and listed[r3["sid"]]["title"].endswith(" (fork)"),
                 f"listed: {listed.get(r3['sid'])}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def fork_scratch(t):
+    """A fork names its original's scratch directory, so deleting the
+    original leaves it while a fork remains; deleting the last of them
+    removes it."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="one")
+        ended(h, sid, 1)
+        scratch = scratchof(h, sid)
+        t.check(scratch, "a scratch directory")
+        t.host.write(t.host.join(scratch, "note.txt"), "n")
+        f1 = h.call("fork", sid=sid)["sid"]
+        f2 = h.call("fork", sid=sid, turn=1)["sid"]
+        t.check(logged(t, f1)[0].get("scratch") == scratch and
+                logged(t, f2)[0].get("scratch") == scratch, "the forks name it")
+        r = h.call("delete", sid=sid)
+        t.check(r.get("ok") == 1 and r.get("deleted") == [sid], f"deleted: {r}")
+        t.check(gone(t, t.host.join(t.state, "sessions", sid)), "the original is gone")
+        time.sleep(0.5)  # removed by a thread, if it were
+        t.check(t.host.read(t.host.join(scratch, "note.txt")) == "n",
+                "its scratch directory stays for the forks")
+        h.call("open", sid=f1)
+        h.send("prompt", sid=f1, text="two")
+        t.check(ended(h, f1, 2)["why"] == "done", "the fork goes on")
+        r = h.call("delete", sid=f1)
+        t.check(r.get("ok") == 1, f"deleted: {r}")
+        time.sleep(0.5)
+        t.check(t.host.read(t.host.join(scratch, "note.txt")) == "n",
+                "still there for the other fork")
+        r = h.call("delete", sid=f2)
+        t.check(r.get("ok") == 1, f"deleted: {r}")
+        t.check(gone(t, scratch), "gone with the last fork")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

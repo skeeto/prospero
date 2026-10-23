@@ -1825,14 +1825,14 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
 // send again; anything else, the conversation to the end of its turn.
 static void forkitem(Gui *g, ViewMsg *m)
 {
-    GuiSession *s = g->sess;
-    if (!s || !m || (m->turn<=0 && m->startsturn<=0)) {
+    GuiSession *s      = g->sess;
+    b32         prompt = 0;
+    i64         turn   = m ? viewforkat(m, &prompt) : -1;
+    if (!s || turn<0) {
         return;
     }
-    Arena a      = g->frame;
-    b32   prompt = m->role==VIEW_USER && m->startsturn>0;
-    i64   turn   = prompt ? m->startsturn-1 : m->turn;
-    Str   why    = sesswhy(g, s, "fork", 1, 1);
+    Arena a   = g->frame;
+    Str   why = sesswhy(g, s, "fork", 1, 1);
     ImGui::Separator();
     if (menuitem(g, a, prompt ? Str("Fork before this prompt") : Str("Fork after this turn"),
                  why, 0)) {

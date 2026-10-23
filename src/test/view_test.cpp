@@ -767,6 +767,60 @@ static void test_viewpanels(Test *t)
                "nhttp://b/Mine");
     }
 
+    // Where a fork at each message cuts (viewforkat), by the engine's turn
+    // numbers: turns begun by a job's end and by a manual compaction count,
+    // a steer is no prompt of its own, and a queued prompt is one; the
+    // records as the engine logs them, a title between a prompt and its turn
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        Str log[] = {
+            R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w","model":"m"})",
+            R"({"sid":"s","seq":2,"ts":0,"ev":"user","text":"one","via":"prompt"})",
+            R"({"sid":"s","seq":3,"ts":0,"ev":"title","text":"one","by":"auto"})",
+            R"({"sid":"s","seq":4,"ts":0,"ev":"turn","n":1})",
+            R"({"sid":"s","seq":5,"ts":0,"ev":"user","text":"wait","via":"steer"})",
+            R"({"sid":"s","seq":6,"ts":0,"ev":"assistant","turn":1,"attempt":1,)"
+                R"("blocks":[{"t":"text","text":"A1"}]})",
+            R"({"sid":"s","seq":7,"ts":0,"ev":"turn.end","turn":1,"why":"done"})",
+            R"({"sid":"s","seq":8,"ts":0,"ev":"turn","n":2,"via":"job"})",
+            R"({"sid":"s","seq":9,"ts":0,"ev":"assistant","turn":2,"attempt":1,)"
+                R"("blocks":[{"t":"text","text":"A2"}]})",
+            R"({"sid":"s","seq":10,"ts":0,"ev":"turn.end","turn":2,"why":"done"})",
+            R"({"sid":"s","seq":11,"ts":0,"ev":"turn","n":3,"via":"compact"})",
+            R"({"sid":"s","seq":12,"ts":0,"ev":"compact","turn":3,"kind":"summary","why":"manual",)"
+                R"("before":500,"after":100,"cutseq":6,"summary":"S","model":"m","ms":7})",
+            R"({"sid":"s","seq":13,"ts":0,"ev":"turn.end","turn":3,"why":"done"})",
+            R"({"sid":"s","seq":14,"ts":0,"ev":"user","text":"two","via":"prompt"})",
+            R"({"sid":"s","seq":15,"ts":0,"ev":"turn","n":4})",
+            R"({"sid":"s","seq":16,"ts":0,"ev":"assistant","turn":4,"attempt":1,)"
+                R"("blocks":[{"t":"text","text":"A4"}]})",
+            R"({"sid":"s","seq":17,"ts":0,"ev":"turn.end","turn":4,"why":"done"})",
+            R"({"sid":"s","seq":18,"ts":0,"ev":"user","text":"three","via":"queue"})",
+            R"({"sid":"s","seq":19,"ts":0,"ev":"turn","n":5})",
+            R"({"sid":"s","seq":20,"ts":0,"ev":"assistant","turn":5,"attempt":1,)"
+                R"("blocks":[{"t":"text","text":"A5"}]})",
+            R"({"sid":"s","seq":21,"ts":0,"ev":"turn.end","turn":5,"why":"done"})",
+        };
+        for (iz i = 0; i < countof(log); i++) {
+            apply(v, a, log[i]);
+        }
+        Buf b(&a, 256);
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewMsg *m      = &v->msgs[i];
+            b32      before = 0;
+            i64      at     = viewforkat(m, &before);
+            if (m->role==VIEW_USER || m->role==VIEW_ASSISTANT || m->role==VIEW_NOTE) {
+                print(&b, m->role==VIEW_NOTE ? Str("note") : m->text);
+                putbyte(&b, before ? '<' : '>');
+                print(&b, at);
+                putbyte(&b, ' ');
+            }
+        }
+        expect(t, "panels.forkat", finish(&b),
+               "one<0 wait>1 A1>1 note>2 A2>2 two<3 A4>4 three<4 A5>5 ");
+    }
+
     // A turn the session began by itself, its notice folded; liveness
     {
         Arena a = perm;

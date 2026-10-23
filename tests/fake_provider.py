@@ -3355,7 +3355,13 @@ def sc_always_task(model, n, req):
             yield from answer(model, "Child done.")
         return
     k = step(req)
-    if k == 0:
+    if last_user_text(req) == "more":
+        # A later turn's grant, which the live subagent gets too
+        if since_user(req) == 0:
+            yield from tool(model, n, "write", {"path": "../more/m.txt", "content": "m"})
+        else:
+            yield from answer(model, "More done.")
+    elif k == 0:
         yield from tool(model, n, "write", {"path": "../ext/a.txt", "content": "a"})
     elif k == 1:
         yield from tool(model, n, "task", {"description": "Child", "prompt": "Write.",
@@ -3432,6 +3438,9 @@ def sc_fork(model, n, req):
         yield from tool(model, n, "write", {"path": "f.txt", "content": "v2"})
     else:
         yield from answer(model, f"Answer to {(u or 'the job')[:20]}.")
+
+
+sc_fork_scratch = sc_session_ops
 
 
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()

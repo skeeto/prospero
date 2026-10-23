@@ -1245,6 +1245,19 @@ static Slice<ViewSnap> rewindset(View *v, Arena *a, Str call, i32 turn)
     return r;
 }
 
+// The turn a fork at a message is cut after (fork's turn), or -1 if
+// none: the turn before the one a prompt began (before), else the
+// message's own. Both are the engine's numbers, from its turn records'
+// n, so that turns it began by itself (via job or compact) count too.
+static i64 viewforkat(ViewMsg *m, b32 *before)
+{
+    *before = m->role==VIEW_USER && m->startsturn>0;
+    if (*before) {
+        return m->startsturn - 1;
+    }
+    return m->turn>0 ? m->turn : -1;
+}
+
 // Whether a rewind from a turn on would change any file.
 static b32 turnrewinds(View *v, i32 turn)
 {
