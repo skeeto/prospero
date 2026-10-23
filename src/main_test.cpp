@@ -518,6 +518,8 @@ static Str istr(Arena *a, i64 v)
 #  include "view.cpp"
 #  include "theme.cpp"
 #  include "png.cpp"
+#  include "fonts.cpp"
+#  include "place.cpp"
 #  include "test/sched_test.cpp"
 #  include "test/highlight_test.cpp"
 #  include "test/doc_test.cpp"
@@ -525,6 +527,8 @@ static Str istr(Arena *a, i64 v)
 #  include "test/view_test.cpp"
 #  include "test/theme_test.cpp"
 #  include "test/png_test.cpp"
+#  include "test/fonts_test.cpp"
+#  include "test/place_test.cpp"
 #endif
 
 int main()
@@ -570,6 +574,8 @@ int main()
     test_viewthinking(&t);
     test_theme(&t);
     test_png(&t);
+    test_fonts(&t);
+    test_place(&t);
     #endif
 
     fprintf(stderr, "%d tests, %d failed\n", t.run, t.failed);

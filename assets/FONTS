@@ -1,4 +1,5 @@
-Embedded fonts, decompressed unchanged from dcmake's src/*_font.hpp:
+Embedded fonts, the first two decompressed unchanged from dcmake's
+src/*_font.hpp:
 
 Roboto-Medium.ttf
     Roboto Medium, version 2.001152 (2014)
@@ -11,3 +12,16 @@ JetBrainsMono-Regular.ttf
     Copyright 2020 The JetBrains Mono Project Authors
     SIL Open Font License, Version 1.1
     https://github.com/JetBrains/JetBrainsMono
+
+NotoSansSymbols2-subset.ttf, NotoSansMath-subset.ttf
+    Subsets of Noto Sans Symbols 2 (version 2.008) and Noto Sans Math
+    (version 3.000), made by tools/symbols.py from google/fonts at the
+    commits and SHA-256 digests it names: the symbols Roboto and
+    JetBrains Mono lack, as fallbacks merged into the transcript's fonts.
+    Copyright 2022 The Noto Project Authors; Copyright 2022 Google LLC
+    SIL Open Font License, Version 1.1 (no Reserved Font Names)
+    https://openfontlicense.org
+    SHA-256 e250f41a7f94d0f18704071c428410e8391b513c5b325ccd0f18243bf1d117b0
+            NotoSansSymbols2-subset.ttf
+    SHA-256 7fb88435205f87de14836b5097be625f9e8d31757c0934c3e81c6324ba4d2b46
+            NotoSansMath-subset.ttf

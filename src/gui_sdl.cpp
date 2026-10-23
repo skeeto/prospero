@@ -37,6 +37,19 @@
 // of ours watches for the signal on a D-Bus connection of its own
 // (libdbus, loaded as SDL loads it) and brings the change in at once.
 //
+// The window opens where it was last, its client area's place and size
+// fitted to the displays as they are (place.cpp), the title bar counted
+// above it where SDL knows its height; under Wayland, where a window
+// never knows its place, only its size. Moves, resizes, maximizing and
+// restoring go to the core (gui_placed), which saves them.
+//
+// Scrolling: macOS trackpads' momentum (the scroll that goes on after a
+// flick), which SDL turns off unless asked, comes as more wheel events,
+// each input like any other, so frames end as they stop. Neither X11
+// nor Wayland has momentum: libinput leaves kinetic scrolling to the
+// toolkit, and SDL ignores Wayland's axis source and stop events, which
+// would tell a finger's lift, so none is made here.
+//
 // This is free and unencumbered software released into the public domain.
 
 #ifdef __linux__
@@ -95,6 +108,8 @@ struct GuiSdl {
                                // 2 dark, 0 the real one
     i32           portal;      // atomic: the portal's latest, as drivetheme,
                                // 0 if it said nothing yet (Linux)
+    WinBox        normal;      // the window when last neither maximized,
+    b32           hasnormal;   // minimized nor full screen
     GlViewport    glviewport;
     GlClearColor  glclearcolor;
     GlClear       glclear;
@@ -303,6 +318,120 @@ static bool SDLCALL sdlwatch(void *ud, SDL_Event *e)
 
 static b32 sdlwindow(Os *, Gui *, GuiSdl *, Str title);
 
+// Whether windows are Wayland's, whose compositor places them, so that
+// a window knows neither where it is nor how to move.
+static b32 wayland()
+{
+    char const *d = SDL_GetCurrentVideoDriver();
+    return d && !__builtin_strcmp(d, "wayland");
+}
+
+static i32 os_guidisplays(Os *, WinBox *out, i32 max)
+{
+    i32            n       = 0;
+    i32            count   = 0;
+    SDL_DisplayID  primary = SDL_GetPrimaryDisplay();
+    SDL_DisplayID *ids     = SDL_GetDisplays(&count);
+    for (i32 pass = 0; pass < 2; pass++) {
+        for (i32 i = 0; ids && i<count && n<max; i++) {
+            SDL_Rect r = {};
+            if ((ids[i]==primary) == (pass==0) && SDL_GetDisplayUsableBounds(ids[i], &r)) {
+                out[n++] = {r.x, r.y, r.w, r.h};
+            }
+        }
+    }
+    SDL_free(ids);
+    return n;
+}
+
+// A geometry fitted to the displays as they are now (place.cpp), the
+// title bar above the client area title high. Under Wayland only the
+// size counts, fitted to the primary display.
+static WinGeom fitgeom(Os *os, WinGeom geom, i32 title)
+{
+    WinBox disp[16];
+    i32    n     = os_guidisplays(os, disp, countof(disp));
+    WinBox frame = geom.box;
+    frame.y -= title;
+    frame.h += title;
+    if (wayland() && n) {
+        frame.x = disp[0].x;
+        frame.y = disp[0].y;
+        n = 1;
+    }
+    frame    = placewindow(frame, disp, n);
+    geom.box = {frame.x, frame.y + title, frame.w, frame.h - title};
+    return geom;
+}
+
+// The title bar's height, from the window's borders where SDL knows
+// them (macOS; an X11 window manager's only once the window shows),
+// else none, the client area's top standing for it.
+static i32 titleheight(SDL_Window *w)
+{
+    i32 top = 0;
+    return SDL_GetWindowBordersSize(w, &top, 0, 0, 0) && top>0 ? top : 0;
+}
+
+// Put the window at a geometry, fitted to the displays.
+static void sdlplace(Os *os, GuiSdl *p, WinGeom geom)
+{
+    geom = fitgeom(os, geom, titleheight(p->window));
+    SDL_SetWindowSize(p->window, geom.box.w, geom.box.h);
+    if (!wayland()) {
+        SDL_SetWindowPosition(p->window, geom.box.x, geom.box.y);
+    }
+}
+
+// The window moved, resized, or was maximized or restored: the core
+// keeps the latest, which the window opens at next time.
+static void sdlplaced(GuiSdl *p)
+{
+    SDL_WindowFlags f = SDL_GetWindowFlags(p->window);
+    if (f & (SDL_WINDOW_MINIMIZED|SDL_WINDOW_FULLSCREEN|SDL_WINDOW_HIDDEN)) {
+        return;
+    }
+    if (!(f & SDL_WINDOW_MAXIMIZED)) {
+        WinBox *b = &p->normal;
+        SDL_GetWindowPosition(p->window, &b->x, &b->y);
+        SDL_GetWindowSize(p->window, &b->w, &b->h);
+        p->hasnormal = 1;
+    }
+    if (p->hasnormal) {
+        WinGeom geom = {p->normal, (f & SDL_WINDOW_MAXIMIZED)!=0, 1};
+        gui_placed(p->gui, geom);
+    }
+}
+
+static WinGeom os_guiwhere(Os *os)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    WinGeom r = {};
+    if (p && p->window) {
+        SDL_WindowFlags f = SDL_GetWindowFlags(p->window);
+        SDL_GetWindowPosition(p->window, &r.box.x, &r.box.y);
+        SDL_GetWindowSize(p->window, &r.box.w, &r.box.h);
+        r.max = (f & SDL_WINDOW_MAXIMIZED) != 0;
+        r.ok  = 1;
+    }
+    return r;
+}
+
+static void os_guiplace(Os *os, WinGeom geom)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p || !p->window || !geom.ok) {
+        return;
+    }
+    if (SDL_GetWindowFlags(p->window) & SDL_WINDOW_MAXIMIZED) {
+        SDL_RestoreWindow(p->window);
+    }
+    sdlplace(os, p, geom);
+    if (geom.max) {
+        SDL_MaximizeWindow(p->window);
+    }
+}
+
 #ifdef __APPLE__
 // Whether the app shows in the Dock and the app switcher: not while
 // only its menu bar icon is left (an accessory app).
@@ -337,6 +466,10 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     // The window may go while a tray icon keeps the program running
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+    // A trackpad's flick goes on scrolling after the fingers lift, as
+    // elsewhere on macOS: SDL turns that off unless asked, as it reads
+    // the hint once, in SDL_Init
+    SDL_SetHint(SDL_HINT_MAC_SCROLL_MOMENTUM, "1");
     if (g->drive) {
         // Synthetic input must not compete with the real mouse, which
         // the backend reads directly while the window has focus.
@@ -370,10 +503,22 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
 
     SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
                             SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
+    // Where it was last, if anywhere, fitted to the displays once it
+    // exists and its borders are known, before it shows
+    WinGeom geom = g->geom;
+    i32     w    = geom.ok ? geom.box.w : 1280;
+    i32     h    = geom.ok ? geom.box.h : 800;
+    flags |= geom.ok && geom.max ? SDL_WINDOW_MAXIMIZED : 0;
     Arena t = g->frame;
-    p->window = SDL_CreateWindow(cstr0(&t, title), 1280, 800, flags);
+    p->window    = SDL_CreateWindow(cstr0(&t, title), w, h, flags);
+    p->hasnormal = 0;
     if (!p->window) {
         return 0;
+    }
+    if (geom.ok) {
+        sdlplace(os, p, geom);
+        p->normal    = fitgeom(os, geom, titleheight(p->window)).box;
+        p->hasnormal = 1;
     }
     p->gl = SDL_GL_CreateContext(p->window);
     if (!p->gl) {
@@ -487,6 +632,10 @@ static void dispatch(GuiSdl *p, SDL_Event *e)
             gui_minimized(g, 1);
         }
         break;
+    }
+    if (e->type==SDL_EVENT_WINDOW_MOVED || e->type==SDL_EVENT_WINDOW_RESIZED ||
+            e->type==SDL_EVENT_WINDOW_MAXIMIZED || e->type==SDL_EVENT_WINDOW_RESTORED) {
+        sdlplaced(p);
     }
     if (ImGui_ImplSDL3_ProcessEvent(e)) {
         gui_input(g, inputkind(e));
@@ -630,13 +779,18 @@ static void os_guiinject(Os *os, GuiEvent *ge)
             {SDLK_LSHIFT, SDL_SCANCODE_LSHIFT},
             {SDLK_A,      SDL_SCANCODE_A},
             {SDLK_END,    SDL_SCANCODE_END},
+            {SDLK_LGUI,   SDL_SCANCODE_LGUI},
+            {SDLK_EQUALS, SDL_SCANCODE_EQUALS},
+            {SDLK_MINUS,  SDL_SCANCODE_MINUS},
+            {SDLK_0,      SDL_SCANCODE_0},
         };
         e.type         = ge->down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
         e.key.windowID = id;
         e.key.key      = keys[ge->key].key;
         e.key.scancode = keys[ge->key].scan;
         e.key.mod      = (SDL_Keymod)((ge->ctrl ? SDL_KMOD_LCTRL : 0) |
-                                      (ge->shift ? SDL_KMOD_LSHIFT : 0));
+                                      (ge->shift ? SDL_KMOD_LSHIFT : 0) |
+                                      (ge->cmd ? SDL_KMOD_LGUI : 0));
         e.key.down     = ge->down;
     } break;
     case GEV_TEXT:
@@ -714,6 +868,7 @@ static void os_guished(Os *os)
     if (!p || !p->window) {
         return;
     }
+    sdlplaced(p);  // where it opens again
     SDL_RemoveEventWatch(sdlwatch, p);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();

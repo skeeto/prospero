@@ -23,6 +23,13 @@
 // or 19 before Windows 10 20H1); Windows 10 repaints it only when the
 // window's activation changes, so that is restated.
 //
+// The window opens where it was last, its frame fitted to the monitors'
+// work areas as they are (place.cpp, in the core's half), maximized if
+// it was. WM_MOVE and WM_SIZE tell the core its geometry: the frame, or
+// when maximized, the frame it restores to (GetWindowPlacement). A
+// precision touchpad's scrolling comes as WM_MOUSEWHEEL with deltas
+// smaller than a notch, inertia included, which ImGui takes as they are.
+//
 // This is free and unencumbered software released into the public domain.
 
 // Shared by both halves: the core's callbacks, called on the GUI thread.
@@ -39,7 +46,17 @@ struct W32Hooks {
     void (*close)(void *gui);             // the user asks to close it
     void (*systheme)(void *gui, int dark);// the system's theme changed
     void (*tray)(void *gui, int item);    // a pick from the tray's menu
+    void (*placed)(void *gui, int const *geom);  // moved, resized: GEOM_*
     int    drive;                         // scripted: never take focus
+};
+
+// Window geometry, in pixels of the virtual screen: the frame when not
+// maximized, as an array of these
+enum {
+    GEOM_X, GEOM_Y, GEOM_W, GEOM_H,
+    GEOM_MAX,    // maximized
+    GEOM_OK,     // known: else the system's place and default size
+    GEOM_COUNT,
 };
 
 // Input kinds, as app.cpp numbers them (INPUT_*)
@@ -48,7 +65,8 @@ enum {
     W32IN_FOCUS, W32IN_WINDOW, W32IN_OTHER,
 };
 
-extern "C" void     *w32gui_open(W32Hooks *, unsigned short const *title);
+extern "C" void     *w32gui_open(W32Hooks *, unsigned short const *title,
+                                  int const *geom);
 extern "C" void      w32gui_show(void *);
 extern "C" int       w32gui_wait(void *, long long us);
 extern "C" void      w32gui_wake(void *);
@@ -63,7 +81,11 @@ extern "C" int       w32gui_systheme(void *);  // 1 if apps should be dark
 extern "C" int       w32gui_theme(void *, int dark);  // the title bar's
 extern "C" void      w32gui_close(void *);
 extern "C" void      w32gui_shed(void *);      // the window goes, the loop stays
-extern "C" int       w32gui_reopen(void *, unsigned short const *title);
+extern "C" int       w32gui_reopen(void *, unsigned short const *title,
+                                    int const *geom);
+extern "C" int       w32gui_displays(int *xywh, int max);  // work areas
+extern "C" int       w32gui_where(void *, int *geom);
+extern "C" void      w32gui_place(void *, int const *geom);
 extern "C" int       w32gui_trayopen(void *, unsigned short const *tip);
 extern "C" void      w32gui_trayclose(void *);
 
@@ -130,6 +152,7 @@ struct W32Gui {
     int                     inmodal;     // inside a move, size or menu loop
     int                     width, height;
     int                     framedark;   // the title bar: -1 unset, 0, 1
+    int                     showmax;     // show it maximized
     int                     drivetheme;  // the checklist's system theme:
                                          // 1 light, 2 dark, 0 the real one
 };
@@ -206,6 +229,45 @@ static int inputkind(UINT msg)
     return -1;
 }
 
+// The window's geometry (GEOM_*), unless minimized: its frame, or when
+// maximized, the frame it is restored to, whose workspace coordinates
+// are offset by the primary display's task bar, if at its top or left.
+static int geomnow(W32Gui *w, int *geom)
+{
+    if (!w->hwnd || IsIconic(w->hwnd) || !IsWindowVisible(w->hwnd)) {
+        return 0;
+    }
+    int  max = IsZoomed(w->hwnd) != 0;
+    RECT r;
+    if (max) {
+        WINDOWPLACEMENT wp = {};
+        wp.length = sizeof(wp);
+        GetWindowPlacement(w->hwnd, &wp);
+        r = wp.rcNormalPosition;
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+        OffsetRect(&r, mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top);
+    } else {
+        GetWindowRect(w->hwnd, &r);
+    }
+    geom[GEOM_X]   = r.left;
+    geom[GEOM_Y]   = r.top;
+    geom[GEOM_W]   = r.right - r.left;
+    geom[GEOM_H]   = r.bottom - r.top;
+    geom[GEOM_MAX] = max;
+    geom[GEOM_OK]  = 1;
+    return 1;
+}
+
+static void placed(W32Gui *w)
+{
+    int geom[GEOM_COUNT];
+    if (geomnow(w, geom)) {
+        w->hooks.placed(w->hooks.gui, geom);
+    }
+}
+
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     W32Gui *w = (W32Gui *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -237,6 +299,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         h->minimized(h->gui, 0);
         h->force(h->gui);
         h->frame(h->gui);  // at once, even inside a modal resize
+        placed(w);
+        return 0;
+
+    case WM_MOVE:
+        placed(w);
         return 0;
 
     case WM_ENTERSIZEMOVE:
@@ -396,9 +463,10 @@ static int makedevice(W32Gui *w, D3D_DRIVER_TYPE type)
     return r == S_OK;
 }
 
-static int makewindow(W32Gui *w, unsigned short const *title);
+static int makewindow(W32Gui *w, unsigned short const *title, int const *geom);
 
-extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
+extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title,
+                             int const *geom)
 {
     W32Gui *w = (W32Gui *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(W32Gui));
     if (!w) {
@@ -439,30 +507,37 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title)
         return 0;
     }
     SetWindowLongPtrW(w->msgwin, GWLP_USERDATA, (LONG_PTR)w);
-    return makewindow(w, title) ? w : 0;
+    return makewindow(w, title, geom) ? w : 0;
 }
 
 // The main window, its device, and ImGui's backends for them, which
-// w32gui_shed takes down again.
-static int makewindow(W32Gui *w, unsigned short const *title)
+// w32gui_shed takes down again. It goes where geom says (fitted to the
+// displays already), else where the system puts it, 1280 by 800 at its
+// display's scale.
+static int makewindow(W32Gui *w, unsigned short const *title, int const *geom)
 {
     W32Hooks *hooks = &w->hooks;
     HINSTANCE inst  = GetModuleHandleW(0);
+    int       at    = geom && geom[GEOM_OK];
     w->framedark = -1;
     w->width     = 0;
     w->height    = 0;
+    w->showmax   = at && geom[GEOM_MAX];
     w->hwnd = CreateWindowExW(
-        0, L"prospero", (LPCWSTR)title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-        CW_USEDEFAULT, 1280, 800, 0, 0, inst, 0
+        0, L"prospero", (LPCWSTR)title, WS_OVERLAPPEDWINDOW,
+        at ? geom[GEOM_X] : CW_USEDEFAULT, at ? geom[GEOM_Y] : CW_USEDEFAULT,
+        at ? geom[GEOM_W] : 1280, at ? geom[GEOM_H] : 800, 0, 0, inst, 0
     );
     if (!w->hwnd) {
         return 0;
     }
     float scale = ImGui_ImplWin32_GetDpiScaleForHwnd(w->hwnd);
-    RECT  r     = {0, 0, (LONG)(1280*scale), (LONG)(800*scale)};
-    AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, 0, 0);
-    SetWindowPos(w->hwnd, 0, 0, 0, r.right-r.left, r.bottom-r.top,
-                 SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+    if (!at) {
+        RECT r = {0, 0, (LONG)(1280*scale), (LONG)(800*scale)};
+        AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, 0, 0);
+        SetWindowPos(w->hwnd, 0, 0, 0, r.right-r.left, r.bottom-r.top,
+                     SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+    }
 
     // Hardware, else WARP: a VM or a remote session may have no GPU.
     if (!makedevice(w, D3D_DRIVER_TYPE_HARDWARE) &&
@@ -516,10 +591,67 @@ extern "C" void w32gui_shed(void *p)
     w->inmodal  = 0;
 }
 
-extern "C" int w32gui_reopen(void *p, unsigned short const *title)
+extern "C" int w32gui_reopen(void *p, unsigned short const *title, int const *geom)
 {
     W32Gui *w = (W32Gui *)p;
-    return w->hwnd || makewindow(w, title);
+    return w->hwnd || makewindow(w, title, geom);
+}
+
+struct Displays {
+    int *xywh;
+    int  max;
+    int  n;
+};
+
+static BOOL CALLBACK adddisplay(HMONITOR m, HDC, LPRECT, LPARAM arg)
+{
+    Displays   *d  = (Displays *)arg;
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (d->n<d->max && GetMonitorInfoW(m, &mi)) {
+        int i = d->n++;
+        if (mi.dwFlags & MONITORINFOF_PRIMARY) {
+            for (; i > 0; i--) {  // the primary first
+                for (int k = 0; k < 4; k++) {
+                    d->xywh[4*i+k] = d->xywh[4*(i-1)+k];
+                }
+            }
+        }
+        RECT r = mi.rcWork;
+        d->xywh[4*i+0] = r.left;
+        d->xywh[4*i+1] = r.top;
+        d->xywh[4*i+2] = r.right - r.left;
+        d->xywh[4*i+3] = r.bottom - r.top;
+    }
+    return TRUE;
+}
+
+extern "C" int w32gui_displays(int *xywh, int max)
+{
+    Displays d = {xywh, max, 0};
+    EnumDisplayMonitors(0, 0, adddisplay, (LPARAM)&d);
+    return d.n;
+}
+
+extern "C" int w32gui_where(void *p, int *geom)
+{
+    return geomnow((W32Gui *)p, geom);
+}
+
+extern "C" void w32gui_place(void *p, int const *geom)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (!w->hwnd || !geom[GEOM_OK]) {
+        return;
+    }
+    if (IsZoomed(w->hwnd)) {
+        ShowWindow(w->hwnd, SW_RESTORE);
+    }
+    SetWindowPos(w->hwnd, 0, geom[GEOM_X], geom[GEOM_Y], geom[GEOM_W],
+                 geom[GEOM_H], SWP_NOZORDER|SWP_NOACTIVATE);
+    if (geom[GEOM_MAX]) {
+        ShowWindow(w->hwnd, SW_MAXIMIZE);
+    }
 }
 
 extern "C" int w32gui_trayopen(void *p, unsigned short const *tip)
@@ -557,7 +689,8 @@ extern "C" void w32gui_trayclose(void *p)
 extern "C" void w32gui_show(void *p)
 {
     W32Gui *w = (W32Gui *)p;
-    ShowWindow(w->hwnd, w->hooks.drive ? SW_SHOWNOACTIVATE : SW_SHOWDEFAULT);
+    ShowWindow(w->hwnd, w->hooks.drive ? SW_SHOWNOACTIVATE :
+                        w->showmax     ? SW_SHOWMAXIMIZED  : SW_SHOWDEFAULT);
 }
 
 extern "C" int w32gui_wait(void *p, long long us)
@@ -695,7 +828,7 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
     case 3: {  // key: the backend reads modifiers from the key state
         static WORD const vks[] = {
             VK_TAB, VK_CONTROL, VK_ESCAPE, VK_RETURN, 'C', VK_SHIFT, 'A',
-            VK_END,
+            VK_END, VK_CONTROL, VK_OEM_PLUS, VK_OEM_MINUS, '0',
         };
         BYTE state[256];
         GetKeyboardState(state);
@@ -838,6 +971,60 @@ static void hookclose(void *g)           { gui_close((Gui *)g); }
 static void hooksystheme(void *g, int d) { gui_systheme((Gui *)g, d); }
 static void hooktray(void *g, int item)  { gui_tray((Gui *)g, item); }
 
+static WinGeom fromgeom(int const *geom)
+{
+    WinGeom r = {};
+    r.box = {geom[GEOM_X], geom[GEOM_Y], geom[GEOM_W], geom[GEOM_H]};
+    r.max = geom[GEOM_MAX];
+    r.ok  = geom[GEOM_OK];
+    return r;
+}
+
+static void hookplaced(void *g, int const *geom)
+{
+    gui_placed((Gui *)g, fromgeom(geom));
+}
+
+static i32 os_guidisplays(Os *, WinBox *out, i32 max)
+{
+    int xywh[4*16];
+    int n = w32gui_displays(xywh, max<16 ? max : 16);
+    for (int i = 0; i < n; i++) {
+        out[i] = {xywh[4*i], xywh[4*i+1], xywh[4*i+2], xywh[4*i+3]};
+    }
+    return n;
+}
+
+// A geometry fitted to the displays as they are now (place.cpp), as
+// GEOM_* for the edge.
+static void fitgeom(Os *os, WinGeom g, int *geom)
+{
+    WinBox disp[16];
+    i32    n = os_guidisplays(os, disp, countof(disp));
+    WinBox b = placewindow(g.box, disp, n);
+    geom[GEOM_X]   = b.x;
+    geom[GEOM_Y]   = b.y;
+    geom[GEOM_W]   = b.w;
+    geom[GEOM_H]   = b.h;
+    geom[GEOM_MAX] = g.max;
+    geom[GEOM_OK]  = g.ok;
+}
+
+static WinGeom os_guiwhere(Os *os)
+{
+    int geom[GEOM_COUNT] = {};
+    return os->gui && w32gui_where(os->gui, geom) ? fromgeom(geom) : WinGeom{};
+}
+
+static void os_guiplace(Os *os, WinGeom g)
+{
+    int geom[GEOM_COUNT];
+    fitgeom(os, g, geom);
+    if (os->gui) {
+        w32gui_place(os->gui, geom);
+    }
+}
+
 static void hooktick(void *p)
 {
     Gui *g = (Gui *)p;
@@ -858,9 +1045,11 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
 {
     Arena t = g->frame;
     unsigned short *wtitle = (unsigned short *)towide(&t, title).data;
+    int geom[GEOM_COUNT];
+    fitgeom(os, g->geom, geom);  // where it was last, if anywhere
     if (os->gui) {
         // Again, after os_guished
-        if (!w32gui_reopen(os->gui, wtitle)) {
+        if (!w32gui_reopen(os->gui, wtitle, geom)) {
             return 0;
         }
         gui_systheme(g, w32gui_systheme(os->gui));
@@ -880,8 +1069,9 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     h.close     = hookclose;
     h.systheme  = hooksystheme;
     h.tray      = hooktray;
+    h.placed    = hookplaced;
     h.drive     = g->drive;
-    os->gui = w32gui_open(&h, wtitle);
+    os->gui = w32gui_open(&h, wtitle, geom);
     if (!os->gui) {
         return 0;
     }

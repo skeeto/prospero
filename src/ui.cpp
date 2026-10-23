@@ -4,8 +4,8 @@
 // sessions under it, the todo list and background jobs panels, the
 // liveness strip and the prompt, the settings window, the Hosts panel,
 // the Output window, the new session, rewind and close dialogs, the
-// dock layout, the metrics overlay, the theme's colors, and the
-// scheduler's view of ImGui
+// menu bar and the dock layout of panes it shows and hides, the metrics
+// overlay, the theme's colors, and the scheduler's view of ImGui
 //
 // Tool rows carry an action at the right of their header: Undo on a
 // write's or edit's (a rewind from its call on), Rewind to here on the
@@ -3907,7 +3907,16 @@ static void drawlog(Gui *g)
     ImGui::EndChild();
 }
 
-static void drawhelp(Gui *)
+// The fonts' licenses, which their files ask to be shown.
+static void drawfontcredits()
+{
+    ImGui::BulletText("Roboto: Copyright 2011 Google (Apache 2.0)");
+    ImGui::BulletText("JetBrains Mono: Copyright 2020 JetBrains (OFL 1.1)");
+    ImGui::BulletText("Noto Sans Symbols 2, Noto Sans Math: Copyright 2022 "
+                      "The Noto Project Authors, Google (OFL 1.1)");
+}
+
+static void drawhelp(Gui *g)
 {
     ImGui::TextWrapped(
         "Each session is a conversation with the agent in one working "
@@ -3922,12 +3931,18 @@ static void drawhelp(Gui *)
         "triple-click a block, Shift-click extends. Right-click for copy "
         "options.");
     ImGui::Spacing();
-    ImGui::BulletText("Roboto: Copyright 2011 Google (Apache 2.0)");
-    ImGui::BulletText("JetBrains Mono: Copyright 2020 JetBrains (OFL 1.1)");
+    ImGui::TextWrapped(
+        "The View menu shows and hides these panes, and zooms the text: "
+        "%s+= and %s+-, %s+0 to reset, or %s and the mouse wheel. "
+        "[ui] font_size in the settings sets its size for good.",
+        g->mac ? "Cmd" : "Ctrl", g->mac ? "Cmd" : "Ctrl",
+        g->mac ? "Cmd" : "Ctrl", g->mac ? "Cmd" : "Ctrl");
+    ImGui::Spacing();
+    drawfontcredits();
 }
 
 
-// Toolbar, dock space, and windows
+// Menu bar, toolbar, dock space, and windows
 
 static void drawfaketools(Gui *g)
 {
@@ -3973,36 +3988,194 @@ static void drawfaketools(Gui *g)
     ImGui::SetItemTooltip("Load 10,000 messages (about 5 MB) of history");
 }
 
-static void drawtoolbar(Gui *g)
+// A shortcut as the menus show it: Cmd on macOS, else Ctrl.
+static char const *cmdkey(Gui *g, Arena *a, Str key)
 {
-    f32 sc = g->scale;
-    if (g->enginekind == ENGINE_FAKE) {
-        drawfaketools(g);
-    } else {
-        ImGui::BeginDisabled(!g->engineok || g->quitting);
-        b32 add = ImGui::Button("New session");
-        itemrect(g, RECT_NEWBTN);
-        if (add) {
-            g->opennew = 1;
-            g->newerr  = {};
-        }
-        ImGui::SetItemTooltip("Start a session in a working directory");
-        ImGui::EndDisabled();
+    return cstr0(a, concat(a, g->mac ? Str("Cmd+") : Str("Ctrl+"), key));
+}
+
+// Whether a new session can start now.
+static b32 cannew(Gui *g)
+{
+    return g->enginekind!=ENGINE_FAKE && g->engineok && !g->quitting;
+}
+
+static void newsession(Gui *g)
+{
+    g->opennew = 1;
+    g->newerr  = {};
+}
+
+// The menus' shortcuts, wherever the focus is (a global route, which a
+// focused field's own use of a key goes ahead of): a new session, zoom
+// by key or by Ctrl+wheel (Cmd on macOS), and quitting on Linux, where
+// no system shortcut does (macOS has Cmd+Q, Windows Alt+F4).
+static void menukeys(Gui *g)
+{
+    ImGuiInputFlags glob = ImGuiInputFlags_RouteGlobal;
+    ImGuiKeyChord   ctrl = ImGuiMod_Ctrl;
+    if (cannew(g) && ImGui::Shortcut(ctrl|ImGuiKey_N, glob)) {
+        newsession(g);
     }
-    ImGui::SameLine();
-    b32 menu = ImGui::Button("Menu");
+    if (ImGui::Shortcut(ctrl|ImGuiKey_Equal, glob) ||
+            ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_Equal, glob) ||
+            ImGui::Shortcut(ctrl|ImGuiKey_KeypadAdd, glob)) {
+        zoomby(g, 1);
+    }
+    if (ImGui::Shortcut(ctrl|ImGuiKey_Minus, glob) ||
+            ImGui::Shortcut(ctrl|ImGuiKey_KeypadSubtract, glob)) {
+        zoomby(g, -1);
+    }
+    if (ImGui::Shortcut(ctrl|ImGuiKey_0, glob) ||
+            ImGui::Shortcut(ctrl|ImGuiKey_Keypad0, glob)) {
+        setzoom(g, 1);
+    }
+    #if !defined(_WIN32) && !defined(__APPLE__)
+    if (ImGui::Shortcut(ctrl|ImGuiKey_Q, glob)) {
+        gui_close(g);
+    }
+    #endif
+
+    // The wheel with Ctrl held scrolls nothing (ImGui leaves it alone):
+    // each notch a zoom step, a trackpad's fractions adding up to one
+    ImGuiIO &io = ImGui::GetIO();
+    if (!io.KeyCtrl) {
+        g->zoomwheel = 0;
+    } else if (io.MouseWheel!=0 && ImGui::IsMousePosValid()) {
+        g->zoomwheel += io.MouseWheel;
+        i32 steps = (i32)g->zoomwheel;
+        if (steps) {
+            g->zoomwheel -= (f32)steps;
+            zoomby(g, steps);
+        }
+    }
+}
+
+static void drawmenubar(Gui *g)
+{
+    if (!ImGui::BeginMainMenuBar()) {
+        return;
+    }
+    Arena a = g->frame;
+
+    b32 menu = ImGui::BeginMenu("Session");
+    itemrect(g, RECT_SESSMENU);
+    if (menu) {
+        b32 add = ImGui::MenuItem("New session...", cmdkey(g, &a, "N"), false, cannew(g));
+        itemrect(g, RECT_NEWBTN);
+        ImGui::SetItemTooltip("Start a session in a working directory");
+        if (add) {
+            newsession(g);
+        }
+        // The engine's session operations, to come
+        ImGui::BeginDisabled();
+        ImGui::Separator();
+        ImGui::MenuItem("Fork");
+        ImGui::MenuItem("Rename...");
+        ImGui::MenuItem("Compact");
+        ImGui::MenuItem("Switch model...");
+        ImGui::MenuItem("Export...");
+        ImGui::Separator();
+        ImGui::MenuItem("Archive");
+        ImGui::MenuItem("Delete...");
+        ImGui::Separator();
+        ImGui::MenuItem("Close");
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        #if defined(__APPLE__)
+        char const *quit = "Cmd+Q";
+        #elif defined(_WIN32)
+        char const *quit = "Alt+F4";
+        #else
+        char const *quit = "Ctrl+Q";
+        #endif
+        if (ImGui::MenuItem("Quit", quit)) {
+            gui_close(g);
+        }
+        ImGui::EndMenu();
+    }
+
+    // The transcript's selection, as its own context menu has it
+    if (ImGui::BeginMenu("Edit")) {
+        View *v   = g->view;
+        b32   any = !selempty(&v->sel);
+        if (ImGui::MenuItem("Copy", cmdkey(g, &a, "C"), false, any)) {
+            copyout(g, COPY_TEXT);
+        }
+        if (ImGui::MenuItem("Copy as Markdown", cmdkey(g, &a, "Shift+C"), false, any)) {
+            copyout(g, COPY_MARKDOWN);
+        }
+        if (ImGui::MenuItem("Select all", cmdkey(g, &a, "A"), false, v->msgs.len>0)) {
+            selall(v);
+        }
+        ImGui::Separator();
+        ImGui::MenuItem("Find...", cmdkey(g, &a, "F"), false, false);
+        ImGui::EndMenu();
+    }
+
+    menu = ImGui::BeginMenu("View");
     itemrect(g, RECT_MENU);
     if (menu) {
-        ImGui::OpenPopup("##menu");
-    }
-    ImGui::SetItemTooltip("Layout and other options");
-    if (ImGui::BeginPopup("##menu")) {
-        bool demo = g->showdemo;
-        if (ImGui::MenuItem("Show demo window", 0, &demo)) {
-            g->showdemo = demo;
+        for (i32 i = 0; i < PANE_COUNT; i++) {
+            if (i == PANE_HELP) {
+                ImGui::Separator();
+            }
+            bool on = g->panes[i];
+            if (ImGui::MenuItem(panenames[i], 0, &on)) {
+                setpane(g, i, on);
+            }
+            itemrect(g, RECT_PANE0+i);
+        }
+        ImGui::Separator();
+        f32 lo = zoomsteps[0], hi = zoomsteps[countof(zoomsteps)-1];
+        if (ImGui::MenuItem("Zoom in", cmdkey(g, &a, "="), false, g->zoom<hi)) {
+            zoomby(g, 1);
+        }
+        if (ImGui::MenuItem("Zoom out", cmdkey(g, &a, "-"), false, g->zoom>lo)) {
+            zoomby(g, -1);
+        }
+        Buf b(&a, 32);
+        print(&b, "Actual size");
+        if (g->zoom != 1) {
+            print(&b, " (now ");
+            print(&b, (i64)(g->zoom*100 + 0.5f));
+            print(&b, "%)");
+        }
+        b32 reset = ImGui::MenuItem(cstr0(&a, finish(&b)), cmdkey(g, &a, "0"), false, g->zoom!=1);
+        itemrect(g, RECT_ZOOMRESET);
+        if (reset) {
+            setzoom(g, 1);
+        }
+        ImGui::Separator();
+        // Folding for the session shown, to come
+        ImGui::MenuItem("Expand tool output", 0, false, false);
+        ImGui::MenuItem("Expand thinking", 0, false, false);
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Theme")) {
+            static char const *labels[] = {"System", "Dark", "Light"};
+            static_assert(countof(labels) == THEME_COUNT);
+            for (i32 i = 0; i < THEME_COUNT; i++) {
+                if (ImGui::MenuItem(labels[i], 0, g->themeset==i) && g->themeset!=i) {
+                    // As the settings window picks it: at once, then kept
+                    settheme(g, i);
+                    if (g->enginekind!=ENGINE_FAKE && engineup(g)) {
+                        guiconfigset(g, "ui", "", "theme", themenames[i]);
+                    }
+                }
+            }
+            ImGui::EndMenu();
         }
         if (ImGui::MenuItem("Reset layout")) {
+            for (i32 i = 0; i < PANE_COUNT; i++) {
+                setpane(g, i, i != PANE_METRICS);
+            }
+            g->panefocus    = 0;
             g->resetpending = 1;
+        }
+        ImGui::SeparatorText("Debug");
+        bool demo = g->showdemo;
+        if (ImGui::MenuItem("ImGui demo window", 0, &demo)) {
+            g->showdemo = demo;
         }
         if (g->enginekind == ENGINE_FAKE) {
             b32 modal = ImGui::MenuItem("Modal dialog...");
@@ -4011,11 +4184,49 @@ static void drawtoolbar(Gui *g)
                 g->openmodal = 1;
             }
         }
-        if (ImGui::MenuItem("Quit")) {
-            gui_close(g);
-        }
-        ImGui::EndPopup();
+        ImGui::EndMenu();
     }
+
+    if (ImGui::BeginMenu("Help")) {
+        if (ImGui::MenuItem("Help")) {
+            setpane(g, PANE_HELP, 1);
+        }
+        if (ImGui::MenuItem("About Prospero")) {
+            g->openabout = 1;
+        }
+        ImGui::EndMenu();
+    }
+
+    // The latest error at the right, and the empty stretch before it,
+    // where the checklist moves the mouse out of the way
+    Str msg = g->engineerr.len ? g->engineerr : g->lasterr;
+    f32 x0  = ImGui::GetCursorScreenPos().x;
+    f32 x1  = ImGui::GetWindowPos().x + ImGui::GetWindowWidth();
+    f32 pad = ImGui::GetStyle().ItemSpacing.x;
+    if (msg.len) {
+        char const *s = cstr0(&a, msg);
+        f32 w = ImGui::CalcTextSize(s).x;
+        f32 x = x1 - w - pad;
+        x = x<x0 ? x0 : x;
+        ImGui::SetCursorScreenPos(v2(x, ImGui::GetCursorScreenPos().y));
+        x1 = x;
+        if (g->engineerr.len) {
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+            ImGui::TextUnformatted(s);
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::TextDisabled("%s", s);
+        }
+    }
+    ImVec2 p = ImGui::GetWindowPos();
+    g->rects[RECT_TOOLBAR] = {x0, p.y, x1, p.y + ImGui::GetWindowHeight()};
+    ImGui::EndMainMenuBar();
+}
+
+// Dialogs, which any window may ask for
+static void drawdialogs(Gui *g)
+{
+    f32 sc = g->scale;
     if (g->openmodal) {
         ImGui::OpenPopup("Modal");
         g->openmodal = 0;
@@ -4029,20 +4240,34 @@ static void drawtoolbar(Gui *g)
         }
         ImGui::EndPopup();
     }
+
+    if (g->openabout) {
+        ImGui::OpenPopup("About Prospero");
+        g->openabout = 0;
+    }
+    if (ImGui::BeginPopupModal("About Prospero", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Prospero %s", PROSPERO_VERSION);
+        ImGui::TextUnformatted("A coding harness: the agent's turns, tools and sessions.");
+        ImGui::TextUnformatted("Free and unencumbered software released into the public domain.");
+        ImGui::Spacing();
+        ImGui::SeparatorText("Third-party software");
+        ImGui::BulletText("Dear ImGui: Copyright 2014 Omar Cornut (MIT)");
+        ImGui::BulletText("FreeType: Copyright 1996 The FreeType Project (FTL)");
+        ImGui::BulletText("MD4C: Copyright 2016 Martin Mitas (MIT)");
+        #ifndef _WIN32
+        ImGui::BulletText("SDL: Copyright 1997 Sam Lantinga (zlib)");
+        ImGui::BulletText("cpp-httplib: Copyright 2017 Yuji Hirose (MIT)");
+        ImGui::BulletText("Mbed TLS: Copyright The Mbed TLS Contributors (Apache 2.0)");
+        #endif
+        drawfontcredits();
+        ImGui::Spacing();
+        if (ImGui::Button("Close", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
     drawnew(g);
     drawclose(g);
-
-    if (g->engineerr.len) {
-        Arena a = g->frame;
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
-        ImGui::TextUnformatted(cstr0(&a, g->engineerr));
-        ImGui::PopStyleColor();
-    } else if (g->lasterr.len) {
-        Arena a = g->frame;
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", cstr0(&a, g->lasterr));
-    }
 }
 
 // The dock node a window is in, or was in when the layout was saved;
@@ -4057,24 +4282,47 @@ static ImGuiID saveddock(char const *name)
     return s ? s->DockId : 0;
 }
 
+// Begin a pane shown: its tab's close button hides it, until the View
+// menu shows it again. Returns whether its contents are visible. End
+// it with ImGui::End.
+static b32 beginpane(Gui *g, i32 pane)
+{
+    if (g->panefocus == pane+1) {
+        g->panefocus = 0;
+        ImGui::SetNextWindowFocus();
+    }
+    bool open = 1;
+    b32  vis  = ImGui::Begin(panenames[pane], &open);
+    if (!open) {
+        setpane(g, pane, 0);
+    }
+    return vis;
+}
+
 static void dockwindows(Gui *g)
 {
-    ImGuiViewport *vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(vp->WorkPos);
-    ImGui::SetNextWindowSize(v2(vp->WorkSize.x, 0));
-    ImGui::Begin("##Toolbar", 0,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking |
-                 ImGuiWindowFlags_NoSavedSettings);
-    drawtoolbar(g);
-    f32 toolh = ImGui::GetWindowHeight();
-    ImVec2 tp = ImGui::GetWindowPos();
-    g->rects[RECT_TOOLBAR] = {tp.x, tp.y, tp.x+ImGui::GetWindowWidth(), tp.y+toolh};
-    ImGui::End();
+    menukeys(g);
+    drawmenubar(g);
+    ImGuiViewportP *vp   = (ImGuiViewportP *)ImGui::GetMainViewport();
+    ImRect          work = vp->GetBuildWorkRect();
 
-    ImVec2 pos  = v2(vp->WorkPos.x, vp->WorkPos.y + toolh);
-    ImVec2 size = v2(vp->WorkSize.x, vp->WorkSize.y - toolh);
+    // The fake agent's controls, for measurements, under the menu bar
+    f32 toolh = 0;
+    if (g->enginekind == ENGINE_FAKE) {
+        ImGui::SetNextWindowPos(work.Min);
+        ImGui::SetNextWindowSize(v2(work.GetWidth(), 0));
+        ImGui::Begin("##Toolbar", 0,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking |
+                     ImGuiWindowFlags_NoSavedSettings);
+        drawfaketools(g);
+        toolh = ImGui::GetWindowHeight();
+        ImGui::End();
+    }
+
+    ImVec2 pos  = v2(work.Min.x, work.Min.y + toolh);
+    ImVec2 size = v2(work.GetWidth(), work.GetHeight() - toolh);
     ImGui::SetNextWindowPos(pos);
     ImGui::SetNextWindowSize(size);
     ImGui::Begin("##DockHost", 0,
@@ -4120,54 +4368,73 @@ static void dockwindows(Gui *g)
         g->jobsfocus = 2;
     }
     ImGui::DockSpace(id, v2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
+    drawdialogs(g);
     ImGui::End();
 
-    if (ImGui::Begin("Sessions")) {
-        escapecancel(g);
-        drawsessions(g);
+    b32 *show = g->panes;
+    if (show[PANE_SESSIONS]) {
+        if (beginpane(g, PANE_SESSIONS)) {
+            escapecancel(g);
+            drawsessions(g);
+        }
+        ImGui::End();
     }
-    ImGui::End();
     // Windows that a layout saved before them lacks join a neighbor
     ImGuiID near = saveddock("Sessions");
-    if (near) {
-        ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+    if (show[PANE_TODO]) {
+        if (near) {
+            ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+        }
+        if (beginpane(g, PANE_TODO)) {
+            drawtodo(g);
+        }
+        ImGui::End();
     }
-    if (ImGui::Begin("Todo")) {
-        drawtodo(g);
-    }
-    ImGui::End();
     // Submitted first, so that it is the tab selected in its dock node.
-    if (ImGui::Begin("Transcript")) {
-        escapecancel(g);
-        drawtranscript(g);
+    if (show[PANE_TRANSCRIPT]) {
+        if (beginpane(g, PANE_TRANSCRIPT)) {
+            escapecancel(g);
+            drawtranscript(g);
+        }
+        ImGui::End();
     }
-    ImGui::End();
-    if (ImGui::Begin("Help")) {
-        drawhelp(g);
+    if (show[PANE_HELP]) {
+        if (beginpane(g, PANE_HELP)) {
+            drawhelp(g);
+        }
+        ImGui::End();
     }
-    ImGui::End();
-    if (ImGui::Begin("Prompt")) {
-        drawprompt(g);
+    if (show[PANE_PROMPT]) {
+        if (beginpane(g, PANE_PROMPT)) {
+            drawprompt(g);
+        }
+        ImGui::End();
     }
-    ImGui::End();
-    g->metricsshown = ImGui::Begin("Metrics");
-    if (g->metricsshown) {
-        drawmetrics(g);
+    g->metricsshown = 0;
+    if (show[PANE_METRICS]) {
+        g->metricsshown = beginpane(g, PANE_METRICS);
+        if (g->metricsshown) {
+            drawmetrics(g);
+        }
+        ImGui::End();
     }
-    ImGui::End();
-    if (ImGui::Begin("Settings")) {
-        drawsettings(g);
+    if (show[PANE_SETTINGS]) {
+        if (beginpane(g, PANE_SETTINGS)) {
+            drawsettings(g);
+        }
+        ImGui::End();
     }
-    ImGui::End();
     // Windows that a layout saved before them lacks join a neighbor
     near = saveddock("Settings");
-    if (near) {
-        ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+    if (show[PANE_HOSTS]) {
+        if (near) {
+            ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+        }
+        if (beginpane(g, PANE_HOSTS)) {
+            drawhosts(g);
+        }
+        ImGui::End();
     }
-    if (ImGui::Begin("Hosts")) {
-        drawhosts(g);
-    }
-    ImGui::End();
     if (g->outopen) {
         bool open = 1;
         if (g->outfocus) {
@@ -4200,21 +4467,26 @@ static void dockwindows(Gui *g)
     // the window focused last, which a new window is as it appears, so
     // Jobs is focused once, the frame after its windows first appear
     near = saveddock("Log");
-    if (near) {
-        ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+    g->jobsvisible = 0;
+    if (show[PANE_JOBS]) {
+        if (near) {
+            ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+        }
+        if (g->jobsfocus && !--g->jobsfocus) {
+            ImGui::SetNextWindowFocus();
+        }
+        g->jobsvisible = beginpane(g, PANE_JOBS);
+        if (g->jobsvisible) {
+            drawjobs(g);
+        }
+        ImGui::End();
     }
-    if (g->jobsfocus && !--g->jobsfocus) {
-        ImGui::SetNextWindowFocus();
+    if (show[PANE_LOG]) {
+        if (beginpane(g, PANE_LOG)) {
+            drawlog(g);
+        }
+        ImGui::End();
     }
-    g->jobsvisible = ImGui::Begin("Jobs");
-    if (g->jobsvisible) {
-        drawjobs(g);
-    }
-    ImGui::End();
-    if (ImGui::Begin("Log")) {
-        drawlog(g);
-    }
-    ImGui::End();
     if (g->showdemo) {
         bool open = 1;
         ImGui::ShowDemoWindow(&open);

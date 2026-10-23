@@ -329,7 +329,8 @@ static void    os_wake(Os *);
 // (dark or light) as the window opens and whenever it changes, and
 // gui_close when the user asks to close the window or quit, which the
 // core may decline: the window stays until os_guiclose. gui_tray tells
-// of a pick from the tray icon's menu (TRAY_*).
+// of a pick from the tray icon's menu (TRAY_*), and gui_placed of the
+// window moved, resized, maximized or restored (WinGeom, below).
 struct Gui;
 // Open the main window with ImGui's platform and renderer backends, or
 // open it again after os_guished. Returns 0 on failure.
@@ -399,6 +400,10 @@ enum {
     GKEY_SHIFT,
     GKEY_A,
     GKEY_END,
+    GKEY_CMD,    // macOS's Cmd (SDL only: elsewhere the core sends Ctrl)
+    GKEY_EQUAL,
+    GKEY_MINUS,
+    GKEY_0,
 };
 struct GuiEvent {
     i32 kind;
@@ -408,9 +413,32 @@ struct GuiEvent {
     i32 key;
     b32 ctrl;   // held with the key
     b32 shift;
+    b32 cmd;    // macOS's Cmd held (SDL only)
     Str text;   // null-terminated, and must outlive the event's dispatch
 };
 static void    os_guiinject(Os *, GuiEvent *);
+
+// (M8) Window geometry, in the platform's screen coordinates: SDL's
+// (points on macOS) for the window's client area, Win32's pixels for
+// its frame. The box is the window's when not maximized, which max
+// says it is. The core keeps the latest in its settings, as gui_placed
+// tells of changes, and os_guiopen opens the window there, fitted to
+// the displays as they are then (place.cpp).
+struct WinBox {
+    i32 x, y, w, h;
+};
+struct WinGeom {
+    WinBox box;
+    b32    max;
+    b32    ok;   // known: else the platform's own place and size
+};
+// The displays' usable rectangles (without menu bars, docks and task
+// bars), the primary first. Returns how many, at most max.
+static i32     os_guidisplays(Os *, WinBox *, i32 max);
+// The open window's geometry now.
+static WinGeom os_guiwhere(Os *);
+// Move the open window to a geometry, fitted as os_guiopen fits it.
+static void    os_guiplace(Os *, WinGeom);
 #endif
 
 

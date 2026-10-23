@@ -147,7 +147,11 @@ section. Endpoints, models, roles and remotes are added there, and
 deleted, with the comment just above them, when your own file rather
 than an included one defines them. Closing the window
 while turns run asks whether to stop them, or to keep running in the
-background, with a tray icon to bring the window back.
+background, with a tray icon to bring the window back. The View menu
+shows and hides the panes and zooms the text for the run (Ctrl+=,
+Ctrl+- and Ctrl+0, Cmd on macOS, or the wheel with the key held);
+`[ui] font_size` sets its size for good. The window opens where it was
+last, fitted to the displays there are.
 
 `prospero run` runs one turn with no window and exits when it ends,
 printing its records as JSON lines, or readable text with `--pretty`.

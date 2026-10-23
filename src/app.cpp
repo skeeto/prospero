@@ -44,9 +44,13 @@
 // reply, and picked in the settings window, where it applies at once.
 // "system" follows what the platform reports (gui_systheme). [ui]
 // thinking, how reasoning shows, comes the same ways and applies to
-// every session's view at once (setthinking). The layout
+// every session's view at once (setthinking). [ui] font_size sets the
+// text's size, which the View menu's zoom scales for this run only
+// (setzoom), both applied between frames (fontsize). The layout
 // file is written by a thread of its own (Saver), since a write that is
-// to survive a crash waits on the disk for longer than a frame.
+// to survive a crash waits on the disk for longer than a frame. It also
+// keeps which panes show and the window's geometry (iniwrite), read
+// before the window opens.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -57,6 +61,8 @@
 #include "view.cpp"
 #include "theme.cpp"
 #include "png.cpp"
+#include "fonts.cpp"
+#include "place.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -201,8 +207,38 @@ enum : i32 {
     RECT_DELCANCEL,
     RECT_PAGECONNECT,// a remote's page's Connect or Disconnect
     RECT_ROOTS,      // the guard page's roots field
+    RECT_SESSMENU,   // the menu bar's Session menu
+    RECT_ZOOMRESET,  // View's Actual size
     RECT_THEME0,     // the theme's choices in its open list
-    RECT_COUNT = RECT_THEME0 + THEME_COUNT,
+    RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
+    RECT_COUNT = RECT_PANE0 + 10,
+};
+
+// The panes, which the View menu shows and hides
+enum : i32 {
+    PANE_SESSIONS,
+    PANE_TRANSCRIPT,
+    PANE_PROMPT,
+    PANE_TODO,
+    PANE_JOBS,
+    PANE_LOG,
+    PANE_HOSTS,
+    PANE_SETTINGS,
+    PANE_HELP,
+    PANE_METRICS,
+    PANE_COUNT,
+};
+
+static char const *panenames[] = {
+    "Sessions", "Transcript", "Prompt", "Todo", "Jobs", "Log", "Hosts",
+    "Settings", "Help", "Metrics",
+};
+static_assert(countof(panenames) == PANE_COUNT);
+static_assert((i32)RECT_COUNT == (i32)RECT_PANE0 + (i32)PANE_COUNT);
+
+// Zoom steps, as browsers have them: the View menu's, and Ctrl+wheel's
+static f32 zoomsteps[] = {
+    0.5f, 0.67f, 0.75f, 0.8f, 0.9f, 1, 1.1f, 1.25f, 1.5f, 1.75f, 2, 2.5f, 3,
 };
 
 struct Rect {
@@ -685,12 +721,20 @@ struct Gui {
     Str                cfgstatus;  // the latest config.set outcome
     b32                cfgok;      // and whether it worked
 
-    // Toolbar and layout
+    // Menu bar, toolbar and layout
     char              *prompt;
     i32                tps;
     b32                bursts;
     b32                pauses;
     b32                showdemo;
+    b32                panes[PANE_COUNT];  // shown, as the View menu says
+    i32                panefocus;  // PANE_*+1 to bring to the front, else 0
+    b32                openabout;
+    f32                fontbase;   // [ui] font_size
+    f32                zoom;       // the View menu's, for this run only
+    f32                zoomwheel;  // Ctrl+wheel notches short of a step
+    b32                fontdirty;  // the size changed: fontsize next frame
+    WinGeom            geom;       // the window's, as last placed
     b32                firstlayout;
     i32                jobsfocus;  // frames until the Jobs tab is selected
     b32                resetpending;
@@ -784,6 +828,8 @@ struct Gui {
     ImGuiID            dockspace;
     i64                lastsave;     // µs
     i64                idlesaves;    // saves made with no input for 1 s
+    i64                saves;        // all saves, and as of the last OP_MARK
+    i64                marksaves;
     i64                lastinput;    // µs
     b32                drivemoved;   // the synthetic mouse has a position
     f32                drivex;       // where it is
@@ -800,6 +846,7 @@ struct Gui {
     i32                reveal;       // RECT_* the settings scroll to, or -1
     Str                showpage;     // the settings page the list scrolls to
     Str                longval;      // the long setting before its edit
+    WinGeom            geommark;     // the window's, as OP_GEOMMARK found it
 };
 
 // Log to standard error, the log file, and the Log window, which then
@@ -1779,6 +1826,7 @@ static void startquit(Gui *g)
 
 static void settheme(Gui *, i32);
 static void setthinking(Gui *, i32);
+static void setfontbase(Gui *, Str);
 
 // Words of s separated by sep, trimmed, the empty ones dropped, joined
 // by with: a paths setting as the settings window edits it, one a line.
@@ -1848,6 +1896,8 @@ static void loadcfg(Gui *g, Str line)
             settheme(g, themeparse(r.value));
         } else if (r.kind=="ui" && r.key=="thinking") {
             setthinking(g, thinkparse(r.value));
+        } else if (r.kind=="ui" && r.key=="font_size") {
+            setfontbase(g, r.value);
         }
         // Defaults, and what a model inherits by like, show as hints, not
         // values: an edit writes a value of its own. The field holds the
@@ -2980,6 +3030,9 @@ static void gui_tray(Gui *g, i32 item)
 }
 
 static void gui_close(Gui *);
+static void setzoom(Gui *, f32);
+static void zoomby(Gui *, i32);
+static void setpane(Gui *, i32, b32);
 
 #include "ui.cpp"
 
@@ -3626,6 +3679,25 @@ static void gui_modal(Gui *g, b32 inmodal)
     g->inmodal = inmodal;
 }
 
+// Text at its size: [ui] font_size, zoomed, at the display's scale, in
+// ImGui's widgets and the transcript alike, whose layouts for the old
+// size go. Never inside a frame, which would mix sizes (setzoom).
+static void fontsize(Gui *g)
+{
+    ImGuiStyle &st = ImGui::GetStyle();
+    st.FontSizeBase  = g->fontbase;
+    st.FontScaleMain = g->zoom;
+    st.FontScaleDpi  = g->scale;
+    g->fonts.size    = g->fontbase * g->zoom * g->scale;
+    g->fontdirty     = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->view) s->view->topsdirty = 1;
+    }
+    g->nosession.view->topsdirty = 1;
+    cachereset(g->vcache, 1);  // layouts for the old font size
+    schedforce(&g->sched);
+}
+
 // The window's content scale changed (or was first learned).
 static void gui_scale(Gui *g, f32 scale)
 {
@@ -3636,14 +3708,67 @@ static void gui_scale(Gui *g, f32 scale)
     ImGuiStyle &st = ImGui::GetStyle();
     st = g->basestyle;
     st.ScaleAllSizes(scale);
-    st.FontScaleDpi = scale;
-    g->fonts.size   = 15 * scale;
-    for (GuiSession *s = g->sessions; s; s = s->next) {
-        if (s->view) s->view->topsdirty = 1;
+    fontsize(g);
+}
+
+// Zoom to a step (zoomsteps) for this run, clamped to the steps, from
+// the next frame on.
+static void setzoom(Gui *g, f32 zoom)
+{
+    f32 lo = zoomsteps[0], hi = zoomsteps[countof(zoomsteps)-1];
+    zoom = zoom<lo ? lo : zoom>hi ? hi : zoom;
+    if (zoom != g->zoom) {
+        g->zoom      = zoom;
+        g->fontdirty = 1;
+        scheddirty(&g->sched);
     }
-    g->nosession.view->topsdirty = 1;
-    cachereset(g->vcache, 1);  // layouts for the old font size
-    schedforce(&g->sched);
+}
+
+// Zoom in (steps > 0) or out by steps from the nearest step.
+static void zoomby(Gui *g, i32 steps)
+{
+    i32 at = 0;
+    for (i32 i = 1; i < countof(zoomsteps); i++) {
+        f32 d0 = zoomsteps[at] - g->zoom, d1 = zoomsteps[i] - g->zoom;
+        at = d1*d1 < d0*d0 ? i : at;
+    }
+    at += steps;
+    at  = at<0 ? 0 : at>=countof(zoomsteps) ? countof(zoomsteps)-1 : at;
+    setzoom(g, zoomsteps[at]);
+}
+
+// The permanent text size, [ui] font_size, in pixels at scale 1: from
+// the configuration at startup and from each config.get. Out of range
+// or unreadable is the default, 15.
+static void setfontbase(Gui *g, Str value)
+{
+    Float f    = parsefloat(trim(value));
+    f32   base = f.ok && f.val>=8 && f.val<=40 ? (f32)f.val : 15;
+    if (base != g->fontbase) {
+        g->fontbase  = base;
+        g->fontdirty = 1;
+        scheddirty(&g->sched);
+    }
+}
+
+// The window was moved, resized, maximized or restored: its geometry is
+// saved with the layout, a little later (ImGui's ini saving rate), by
+// a frame of its own if nothing else draws one.
+static void gui_placed(Gui *g, WinGeom geom)
+{
+    WinGeom *o = &g->geom;
+    if (!geom.ok || (o->ok && o->max==geom.max && o->box.x==geom.box.x &&
+                     o->box.y==geom.box.y && o->box.w==geom.box.w &&
+                     o->box.h==geom.box.h)) {
+        return;
+    }
+    *o = geom;
+    ImGuiContext &c = *GImGui;
+    if (c.SettingsDirtyTimer <= 0) {
+        ImGui::MarkIniSettingsDirty();
+        Sched *s = &g->sched;
+        schedat(s, os_ticks(g->os) + (i64)(c.IO.IniSavingRate*1e6f) + 1000, DUE_SETTINGS);
+    }
 }
 
 // The system's theme preference, as the window opens and whenever it
@@ -3725,6 +3850,7 @@ static void saveini(Gui *g, b32 last)
     }
     g->lastsave = os_ticks(g->os);
     g->idlesaves += g->lastsave-g->lastinput >= 1000000;
+    g->saves++;
     if (g->drive && g->lastinput) {
         Arena a = g->frame;
         Buf   b(&a, 64);
@@ -3734,6 +3860,108 @@ static void saveini(Gui *g, b32 last)
         guilog(g, finish(&b));
     }
     ImGui::GetIO().WantSaveIniSettings = 0;
+}
+
+// The window's own settings in the layout file, beside ImGui's, read
+// before the window opens: which panes show, and where the window is.
+//
+//   [Prospero][Panes]
+//   Metrics=0
+//   [Prospero][Window]
+//   Pos=120,80
+//   Size=1280,800
+//   Maximized=0
+//
+// A pane missing (a layout older than it) keeps its default, and the
+// window's place is fitted to the displays as they are (place.cpp).
+
+static Str inistr(char const *s)
+{
+    return {(u8 *)s, s ? (iz)__builtin_strlen(s) : 0};
+}
+
+static void *iniopen(ImGuiContext *, ImGuiSettingsHandler *, char const *name)
+{
+    Str n = inistr(name);
+    return n=="Panes" ? (void *)1 : n=="Window" ? (void *)2 : 0;
+}
+
+static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char const *line)
+{
+    Gui *g  = (Gui *)h->UserData;
+    Cut  kv = cut(inistr(line), '=');
+    if (!kv.ok) {
+        return;
+    }
+    Int v = parseint(kv.tail);
+    if (entry == (void *)1) {
+        for (i32 i = 0; i < PANE_COUNT; i++) {
+            if (v.ok && kv.head==inistr(panenames[i])) {
+                g->panes[i] = v.val != 0;
+            }
+        }
+        return;
+    }
+    Cut xy = cut(kv.tail, ',');
+    Int x  = parseint(xy.head);
+    Int y  = parseint(xy.tail);
+    b32 ok = xy.ok && x.ok && y.ok && x.val>-(1<<20) && x.val<1<<20 &&
+             y.val>-(1<<20) && y.val<1<<20;
+    WinGeom *w = &g->geom;
+    if (kv.head=="Pos" && ok) {
+        w->box.x = (i32)x.val;
+        w->box.y = (i32)y.val;
+    } else if (kv.head=="Size" && ok && x.val>0 && y.val>0) {
+        w->box.w = (i32)x.val;
+        w->box.h = (i32)y.val;
+        w->ok    = 1;
+    } else if (kv.head=="Maximized" && v.ok) {
+        w->max = v.val != 0;
+    }
+}
+
+static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *out)
+{
+    Gui *g = (Gui *)h->UserData;
+    out->append("[Prospero][Panes]\n");
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        out->appendf("%s=%d\n", panenames[i], g->panes[i] ? 1 : 0);
+    }
+    out->append("\n");
+    WinGeom *w = &g->geom;
+    if (w->ok) {
+        out->append("[Prospero][Window]\n");
+        out->appendf("Pos=%d,%d\n", (int)w->box.x, (int)w->box.y);
+        out->appendf("Size=%d,%d\n", (int)w->box.w, (int)w->box.h);
+        out->appendf("Maximized=%d\n\n", w->max ? 1 : 0);
+    }
+}
+
+// Read and write the window's settings with the layout file's.
+static void addinihandler(Gui *g)
+{
+    ImGuiSettingsHandler h;
+    h.TypeName   = "Prospero";
+    h.TypeHash   = ImHashStr("Prospero");
+    h.ReadOpenFn = iniopen;
+    h.ReadLineFn = iniline;
+    h.WriteAllFn = iniwrite;
+    h.UserData   = g;
+    ImGui::AddSettingsHandler(&h);
+}
+
+// Show or hide a pane, kept with the layout. One shown is brought to
+// the front, its tab selected.
+static void setpane(Gui *g, i32 pane, b32 show)
+{
+    if (g->panes[pane] != show) {
+        g->panes[pane] = show;
+        ImGui::MarkIniSettingsDirty();
+        scheddirty(&g->sched);
+    }
+    if (show) {
+        g->panefocus = pane + 1;
+    }
 }
 
 static void snapshot(Gui *g)
@@ -3919,6 +4147,9 @@ static void gui_frame(Gui *g)
     g->fonts.gen++;
     g->layoutus = 0;
     g->thumbsdrawn = 0;
+    if (g->fontdirty) {
+        fontsize(g);  // zoomed, or [ui] font_size changed
+    }
     cachereset(g->vcache, 0);
     if (g->held && s->now>=g->holduntil) {
         gui_wake(g);  // the hold is over: take what piled up
@@ -4450,24 +4681,27 @@ enum : i32 {
     OP_IFSESS,    // unless a session's title starts with text, skip dx ops
     OP_THINKING,  // show reasoning as dx (THINK_*), as a setting would
     OP_SHOWPAGE,  // scroll the settings' pages to the one text names
+    OP_GEOMMARK,  // remember the window's geometry
+    OP_PLACE,     // move the window as if saved: dx 1 on a display to the
+                  // right of all, gone since; 0 back as remembered
 };
 
 enum : i32 {
     T_NONE,
     T_PROMPTBTN,
-    T_MENU,
+    T_MENU,        // the menu bar's View menu
     T_HISTORY,
     T_MODALITEM,
     T_MODALOK,
     T_TRANSCRIPT,
     T_PROMPT,
-    T_EMPTY,       // an empty part of the toolbar
+    T_EMPTY,       // an empty part of the menu bar
     T_SPLITTER,    // the dock splitter between the columns
     T_HELPTAB,
     T_TRANSCRIPTTAB,
     T_BELOW,       // below the transcript's bottom edge
     T_COPYITEM,    // "Copy" in the transcript's context menu
-    T_NEWBTN,      // the toolbar's "New session"
+    T_NEWBTN,      // the Session menu's "New session..."
     T_NEWCWD,      // the new session's directory field
     T_NEWCREATE,
     T_ALLOW,       // the latest open ask's buttons
@@ -4516,6 +4750,9 @@ enum : i32 {
     T_DELCANCEL,
     T_ROOTS,       // the guard page's roots field
     T_SPLITFROM,   // where the dock splitter was before the first drag
+    T_SESSMENU,    // the menu bar's Session menu
+    T_ZOOMRESET,   // View's Actual size
+    T_PANEITEM,    // View's toggle of the pane named by text
 };
 
 enum : i32 {
@@ -4645,6 +4882,13 @@ enum : i32 {
     CHK_DELETED,
     CHK_REMOTEPAGE,
     CHK_HOSTSNOHSCROLL,
+    CHK_MENU,
+    CHK_PANECLOSED,
+    CHK_PANEOPEN,
+    CHK_ZOOM,
+    CHK_ZOOMQUIET,
+    CHK_PLACED,
+    CHK_GEOMKEPT,
     CHK_COUNT,
 };
 
@@ -4751,6 +4995,13 @@ static Str chknames[] = {
     "deleted: the section and the comment above it are gone, its page too",
     "a remote's page has Connect, and its list setting",
     "the Hosts panel has nothing to scroll to sideways",
+    "a menu of the menu bar opened",
+    "the pane is hidden, and the layout file will say so",
+    "the pane is shown again, its tab in front",
+    "zoomed: the text's size in ImGui and the transcript",
+    "no frames once the zoom settled",
+    "a window saved on a display gone since is centered on the primary",
+    "the window is where it was",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -4813,6 +5064,7 @@ static_assert(countof(waitnames) == W_THINKSTALL+1);
 enum : i32 {
     KEY_CTRL  = 1,
     KEY_SHIFT = 2,
+    KEY_CMD   = 4,  // Cmd on macOS, else Ctrl
 };
 
 struct DriveOp {
@@ -4917,6 +5169,67 @@ static DriveOp driveops[] = {
     {OP_CHECK, CHK_DPI, 0, 0, 0, ""},
     {OP_DPI, 0, 0, 0, 800, ""},  // back to the monitor's own
     {OP_CHECK, CHK_DPIBACK, 0, 0, 0, ""},
+    // The menu bar: a pane hidden from the View menu, the layout saying
+    // so, then shown again, in front
+    {OP_MOVE, T_MENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MENU, 0, 0, 0, ""},
+    {OP_MOVE, T_PANEITEM, 0, 0, 100, "Todo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Todo"},
+    {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "18-notodo"},
+    {OP_MOVE, T_MENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_PANEITEM, 0, 0, 100, "Todo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Todo"},
+    // Zoom, by keys (Cmd on macOS, else Ctrl), by the wheel with the
+    // key held, and back from the View menu, each in a few frames
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_EQUAL, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_EQUAL, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_EQUAL, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_EQUAL, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
+    {OP_CHECK, CHK_ZOOM, 0, 0, 0, "125"},
+    {OP_SHOT, 0, 0, 0, 300, "19-zoom125"},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
+    {OP_CHECK, CHK_ZOOM, 0, 0, 0, "90"},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_WHEEL, 0, 0, 1, 50, ""},
+    {OP_WHEEL, 0, 0, 1, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
+    {OP_CHECK, CHK_ZOOM, 0, 0, 0, "110"},
+    {OP_MOVE, T_MENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_ZOOMRESET, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 5000, ""},  // hover delays and the layout's save
+    {OP_MARK, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_ZOOM, 0, 0, 0, "100"},
+    {OP_CHECK, CHK_ZOOMQUIET, 0, 0, 0, ""},
+    // A window saved on a display unplugged since comes back centered on
+    // the primary display, then goes back where it was
+    {OP_GEOMMARK, 0, 0, 0, 0, ""},
+    {OP_PLACE, 0, 1, 0, 1000, ""},
+    {OP_CHECK, CHK_PLACED, 0, 0, 0, ""},
+    {OP_PLACE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_GEOMKEPT, 0, 0, 0, ""},
     // Typing, then idle for 15 s: the caret blinks for 10 s, then stops
     {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -4969,11 +5282,17 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
     {OP_CHECK, CHK_JOBSTAB, 0, 0, 0, ""},
     {OP_CHECK, CHK_CLICKTHROUGH, 0, 0, 0, ""},
-    // Tooltip on a toolbar button, appearing with no event at all
+    // Tooltip on a menu item, appearing with no event at all
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MENU, 0, 0, 0, ""},
     {OP_MOVE, T_NEWBTN, 0, 0, 1000, ""},
     {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 700, ""},
     {OP_CHECK, CHK_NOTOOLTIP, 0, 0, 0, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     // A popup
     {OP_MOVE, T_MENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -4983,8 +5302,11 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 700, ""},
     {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
-    // A new session through its dialog, a modal: the directory typed
-    // over the field's suggestion
+    // A new session through its dialog, a modal, from the Session menu:
+    // the directory typed over the field's suggestion
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1000, ""},
@@ -5102,6 +5424,67 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_DPI, 0, 0, 0, ""},
     {OP_DPI, 0, 0, 0, 800, ""},
     {OP_CHECK, CHK_DPIBACK, 0, 0, 0, ""},
+    // The menu bar: a pane hidden from the View menu, the layout saying
+    // so, then shown again, in front
+    {OP_MOVE, T_MENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MENU, 0, 0, 0, ""},
+    {OP_MOVE, T_PANEITEM, 0, 0, 100, "Todo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Todo"},
+    {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "18-notodo"},
+    {OP_MOVE, T_MENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_PANEITEM, 0, 0, 100, "Todo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Todo"},
+    // Zoom, by keys (Cmd on macOS, else Ctrl), by the wheel with the
+    // key held, and back from the View menu, each in a few frames
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_EQUAL, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_EQUAL, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_EQUAL, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_EQUAL, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
+    {OP_CHECK, CHK_ZOOM, 0, 0, 0, "125"},
+    {OP_SHOT, 0, 0, 0, 300, "19-zoom125"},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_MINUS, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
+    {OP_CHECK, CHK_ZOOM, 0, 0, 0, "90"},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_WHEEL, 0, 0, 1, 50, ""},
+    {OP_WHEEL, 0, 0, 1, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
+    {OP_CHECK, CHK_ZOOM, 0, 0, 0, "110"},
+    {OP_MOVE, T_MENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_ZOOMRESET, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 5000, ""},  // hover delays and the layout's save
+    {OP_MARK, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_ZOOM, 0, 0, 0, "100"},
+    {OP_CHECK, CHK_ZOOMQUIET, 0, 0, 0, ""},
+    // A window saved on a display unplugged since comes back centered on
+    // the primary display, then goes back where it was
+    {OP_GEOMMARK, 0, 0, 0, 0, ""},
+    {OP_PLACE, 0, 1, 0, 1000, ""},
+    {OP_CHECK, CHK_PLACED, 0, 0, 0, ""},
+    {OP_PLACE, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_GEOMKEPT, 0, 0, 0, ""},
     // A coding turn, typed: Shift+Enter adds a line, Enter sends. Tool
     // rows for read, edit (a diff) and shell (its output as it runs)
     {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
@@ -5865,6 +6248,7 @@ static DriveOp bgops[] = {
     {OP_CHECK, CHK_SESSION, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Stream in the background."},
     {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    {OP_GEOMMARK, 0, 0, 0, 0, ""},
     {OP_MARK, 0, 0, 0, 800, ""},
     {OP_CLOSE, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_CLOSEMODAL, 0, 0, 0, ""},
@@ -5886,6 +6270,7 @@ static DriveOp bgops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 15000, ""},
     {OP_MARK, 0, 0, 0, 1500, ""},
     {OP_CHECK, CHK_REOPENED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_GEOMKEPT, 0, 0, 0, ""},
     {OP_CHECK, CHK_BGDONE, 0, 0, 0, ""},
     {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "bg-3-reopened"},
@@ -5979,6 +6364,9 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_REMOTEFAILED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-1-hosts"},
     // A session there, through the dialog
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1000, ""},
@@ -6236,6 +6624,15 @@ static ImVec2 targetpos(Gui *g, i32 t)
         }
         return v2(-1, -1);
     }
+    case T_SESSMENU:      return rectcenter(g->rects[RECT_SESSMENU]);
+    case T_ZOOMRESET:     return rectcenter(g->rects[RECT_ZOOMRESET]);
+    case T_PANEITEM:
+        for (i32 i = 0; i < PANE_COUNT; i++) {
+            if (g->ops[g->drivepc-1].text == inistr(panenames[i])) {
+                return rectcenter(g->rects[RECT_PANE0+i]);
+            }
+        }
+        return v2(-1, -1);
     case T_HOSTITEM:
         for (i32 i = 0; i < countof(g->hostitems); i++) {
             GuiHost *h = g->hostitems[i];
@@ -6733,10 +7130,13 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_THINKQUIET: {
         // Its clock and the turn's tick on one deadline a second, a
         // frame and its settling, plus the probe's: never 30 a second
-        // for a count that does not change
+        // for a count that does not change. Windows draws about five a
+        // second (the 15 s amber wait shows the same), which the metrics
+        // overlay, shown by default before, used to hide in its slack
         i64   n     = g->total.frames - g->driveframes;
         i64   us    = g->sched.now - g->markat;
-        i64   other = (g->metricsshown ? 4*us/1000000 : 0) + 3;
+        i64   other = (g->metricsshown ? 4*us/1000000 : 0) + 3 +
+                      3*(g->saves - g->marksaves);  // a save's, and a probe after
         ViewMsg *m  = lastthink(v);
         Arena a     = g->frame;
         Buf   b(&a, 128);
@@ -6751,7 +7151,7 @@ static b32 drivecheck(Gui *g, i32 chk)
         print(&b, " s");
         guilog(g, finish(&b));
         return m && m->prov && m->collapsed && g->thinksecs>g->thinksecs0 &&
-               n <= 4*us/1000000 + other;
+               n <= 6*us/1000000 + other;
     }
     case CHK_THINKOPENED: {
         ViewMsg *m = lastthink(v);
@@ -6793,7 +7193,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         // The probe's, and the overlay's numbers if shown
         i64   n     = g->total.frames - g->driveframes;
         i64   us    = g->sched.now - g->markat;
-        i64   other = (g->metricsshown ? 4*us/1000000 : 0) + 2;
+        i64   other = (g->metricsshown ? 4*us/1000000 : 0) + 2 +
+                      3*(g->saves - g->marksaves);  // a save's, and a probe after
         Arena a     = g->frame;
         Buf   b(&a, 96);
         print(&b, "drive: frames with screenshots shown: ");
@@ -6803,6 +7204,97 @@ static b32 drivecheck(Gui *g, i32 chk)
         print(&b, " s");
         guilog(g, finish(&b));
         return n <= other;
+    }
+    case CHK_MENU: {
+        // A popup of the menu bar's, which a click opened
+        ImGuiWindow *w = c.OpenPopupStack.Size ? c.OpenPopupStack[0].Window : 0;
+        return w && (w->Flags & ImGuiWindowFlags_ChildMenu) && w->Active;
+    }
+    case CHK_PANECLOSED:
+    case CHK_PANEOPEN: {
+        Str name = g->ops[g->drivepc-1].text;
+        i32 pane = -1;
+        for (i32 i = 0; i < PANE_COUNT; i++) {
+            pane = name==inistr(panenames[i]) ? i : pane;
+        }
+        if (pane < 0) {
+            return 0;
+        }
+        ImGuiWindow *w = ImGui::FindWindowByName(panenames[pane]);
+        if (chk == CHK_PANEOPEN) {
+            return g->panes[pane] && w && w->Active && (!w->DockNode || w->DockTabIsVisible);
+        }
+        uz   len = 0;
+        char const *ini = ImGui::SaveIniSettingsToMemory(&len);
+        Str  want = concat(&g->frame, concat(&g->frame, "\n", name), "=0\n");
+        return !g->panes[pane] && (!w || !w->Active) &&
+               find({(u8 *)ini, (iz)len}, want) >= 0;
+    }
+    case CHK_ZOOM: {
+        Int   pct  = parseint(g->ops[g->drivepc-1].text);
+        f32   want = (f32)pct.val / 100;
+        Arena a    = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drive: zoom ");
+        print(&b, (i64)(g->zoom*100 + 0.5f));
+        print(&b, "%, text ");
+        printfloat(&b, g->fonts.size, 2);
+        print(&b, " px, ImGui's ");
+        printfloat(&b, ImGui::GetStyle().FontSizeBase*ImGui::GetStyle().FontScaleMain*
+                       ImGui::GetStyle().FontScaleDpi, 2);
+        guilog(g, finish(&b));
+        ImGuiStyle &st = ImGui::GetStyle();
+        return g->zoom==want && st.FontScaleMain==want &&
+               g->fonts.size==g->fontbase*want*g->scale && !g->fontdirty;
+    }
+    case CHK_ZOOMQUIET: {
+        i64 n = g->total.frames - g->driveframes;
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: ");
+        print(&b, n);
+        print(&b, " frames in 2 s after the zoom");
+        guilog(g, finish(&b));
+        return n <= 2;  // the probe's, and the script's own
+    }
+    case CHK_PLACED: {
+        // Wholly on the primary display, centered across it
+        WinBox  disp[16];
+        i32     n = os_guidisplays(g->os, disp, countof(disp));
+        WinGeom w = os_guiwhere(g->os);
+        Arena   a = g->frame;
+        Buf     b(&a, 128);
+        print(&b, "drive: the window at ");
+        print(&b, (i64)w.box.x);
+        putbyte(&b, ',');
+        print(&b, (i64)w.box.y);
+        print(&b, ", ");
+        print(&b, (i64)w.box.w);
+        putbyte(&b, 'x');
+        print(&b, (i64)w.box.h);
+        print(&b, "; the primary display ");
+        if (n) {
+            print(&b, (i64)disp[0].x);
+            putbyte(&b, ',');
+            print(&b, (i64)disp[0].y);
+            print(&b, ", ");
+            print(&b, (i64)disp[0].w);
+            putbyte(&b, 'x');
+            print(&b, (i64)disp[0].h);
+        }
+        guilog(g, finish(&b));
+        if (!n || !w.ok) {
+            return 0;
+        }
+        i64 cx = 2*(i64)w.box.x + w.box.w, dx = 2*(i64)disp[0].x + disp[0].w;
+        return boxoverlap(w.box, disp[0]) == (i64)w.box.w*w.box.h &&
+               cx-dx<=4 && dx-cx<=4 && g->geom.box.x==w.box.x && g->geom.box.y==w.box.y;
+    }
+    case CHK_GEOMKEPT: {
+        WinGeom w = os_guiwhere(g->os);
+        WinGeom m = g->geommark;
+        return w.ok && m.ok && w.box.x==m.box.x && w.box.y==m.box.y &&
+               w.box.w==m.box.w && w.box.h==m.box.h && w.max==m.max;
     }
     case CHK_TOOLTIP:       return tooltipup();
     case CHK_NOTOOLTIP:     return !tooltipup();
@@ -6838,7 +7330,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_NOSTALE:       return g->stale == 0;
     case CHK_DPI:
         return g->scale==1.5f && ImGui::GetStyle().FontScaleDpi==1.5f &&
-               g->fonts.size==15*1.5f;
+               g->fonts.size==g->fontbase*g->zoom*1.5f;
     case CHK_DPIBACK:
         return g->scale==g->dpibase && ImGui::GetStyle().FontScaleDpi==g->dpibase;
     case CHK_MODALSIZE: {
@@ -7190,7 +7682,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         // metrics, if shown, count each second in a few more.
         i64   n     = g->total.frames - g->driveframes;
         i64   us    = g->sched.now - g->markat;
-        i64   other = (g->metricsshown ? 4*us/1000000 : 0) + 2;
+        i64   other = (g->metricsshown ? 4*us/1000000 : 0) + 2 +
+                      3*(g->saves - g->marksaves);  // a save's, and a probe after
         b32   show  = chk == CHK_JOBSDRAWN;
         Arena a     = g->frame;
         Buf   b(&a, 128);
@@ -7551,14 +8044,17 @@ static void drivestep(Gui *g)
         os_guiinject(g->os, &e);
         break;
     case OP_KEYDOWN:
-    case OP_KEYUP:
+    case OP_KEYUP: {
+        // The command key is Cmd on macOS, Ctrl elsewhere
+        b32 cmd = ((i32)op->dy & KEY_CMD) != 0;
         e.kind  = GEV_KEY;
-        e.key   = (i32)op->dx;
-        e.ctrl  = ((i32)op->dy & KEY_CTRL) != 0;
+        e.key   = (i32)op->dx==GKEY_CMD && !g->mac ? GKEY_CTRL : (i32)op->dx;
+        e.ctrl  = ((i32)op->dy & KEY_CTRL)!=0 || (cmd && !g->mac);
+        e.cmd   = cmd && g->mac;
         e.shift = ((i32)op->dy & KEY_SHIFT) != 0;
         e.down  = op->op == OP_KEYDOWN;
         os_guiinject(g->os, &e);
-        break;
+    } break;
     case OP_TEXT:
         e.kind = GEV_TEXT;
         e.text = op->text;
@@ -7641,6 +8137,7 @@ static void drivestep(Gui *g)
         g->driveframes = g->total.frames;
         g->markcounts  = g->total;
         g->markat      = g->sched.now;
+        g->marksaves   = g->saves;
         if (op->text.len) {
             // For a measurement outside, by the operating system
             Arena a = g->frame;
@@ -7835,6 +8332,25 @@ static void drivestep(Gui *g)
     case OP_MARKDELTAS:
         g->deltamark = g->view->deltabytes;
         break;
+    case OP_GEOMMARK:
+        g->geommark = os_guiwhere(g->os);
+        break;
+    case OP_PLACE:
+        if (op->dx != 0) {
+            // As if saved on a display right of every display there is
+            WinBox disp[16];
+            i32    n    = os_guidisplays(g->os, disp, countof(disp));
+            WinGeom far = g->geommark;
+            for (i32 i = 0; i < n; i++) {
+                i32 right = disp[i].x + disp[i].w;
+                far.box.x = right>far.box.x ? right : far.box.x;
+            }
+            far.box.x += 200;
+            os_guiplace(g->os, far);
+        } else {
+            os_guiplace(g->os, g->geommark);
+        }
+        break;
     case OP_SHOT:
         if (g->shotdir.len) {
             Str name = concat(&g->perm, op->text, ".png");
@@ -7859,28 +8375,31 @@ static b32 guiwanted(Str *args, i32 nargs)
     return nargs<2 || args[1]=="gui";
 }
 
-#ifdef __clang__
-#  pragma clang diagnostic push
-#  pragma clang diagnostic ignored "-Wc23-extensions"
-#endif
-static u8 const robotottf[] = {
-    #embed "../assets/Roboto-Medium.ttf"
-};
-static u8 const monottf[] = {
-    #embed "../assets/JetBrainsMono-Regular.ttf"
-};
-#ifdef __clang__
-#  pragma clang diagnostic pop
-#endif
-
-static ImFont *addfont(u8 const *data, iz len, i32 flags)
+// A font for each style, from fonts.cpp: prose falls back on code's font
+// and then the symbol subsets, code on the subsets, each fallback merged
+// into the face before it with the face's own flags (synthetic bold and
+// oblique), so that a symbol in bold prose is bold. Glyphs share the
+// first font's baseline, which the loader aligns them on.
+static ImFont *addfont(Str data, i32 flags, b32 merge)
 {
     ImFontConfig cfg;
     cfg.FontDataOwnedByAtlas = 0;
     cfg.FontLoaderFlags      = (u32)flags;
+    cfg.MergeMode            = merge != 0;
     return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
-        (void *)data, (i32)len, 15, &cfg
+        (void *)data.data, (i32)data.len, 15, &cfg
     );
+}
+
+static ImFont *addface(Str data, i32 flags)
+{
+    ImFont *f = addfont(data, flags, 0);
+    if (data.data != fontmono().data) {
+        addfont(fontmono(), flags, 1);
+    }
+    addfont(fontsymbols(), flags, 1);
+    addfont(fontmath(), flags, 1);
+    return f;
 }
 
 static void loadfonts(Gui *g)
@@ -7888,12 +8407,12 @@ static void loadfonts(Gui *g)
     i32 bold   = ImGuiFreeTypeLoaderFlags_Bold;
     i32 italic = ImGuiFreeTypeLoaderFlags_Oblique;
     Fonts *f = &g->fonts;
-    f->prose      = addfont(robotottf, countof(robotottf), 0);
-    f->bold       = addfont(robotottf, countof(robotottf), bold);
-    f->italic     = addfont(robotottf, countof(robotottf), italic);
-    f->bolditalic = addfont(robotottf, countof(robotottf), bold|italic);
-    f->mono       = addfont(monottf, countof(monottf), 0);
-    f->monobold   = addfont(monottf, countof(monottf), bold);
+    f->prose      = addface(fontroboto(), 0);
+    f->bold       = addface(fontroboto(), bold);
+    f->italic     = addface(fontroboto(), italic);
+    f->bolditalic = addface(fontroboto(), bold|italic);
+    f->mono       = addface(fontmono(), 0);
+    f->monobold   = addface(fontmono(), bold);
     f->size       = 15;
     g->measure.advance = fontadvance;
     g->measure.font    = fontmetrics;
@@ -7999,6 +8518,7 @@ static void readconfig(Gui *g, Arena scratch)
     g->themeset = theme<0 ? THEME_SYSTEM : theme;
     i32 think = thinkparse(cfgget(cfg, "ui", "", "thinking", 0));
     g->thinkset = think<0 ? THINK_FOLD : think;
+    setfontbase(g, cfgget(cfg, "ui", "", "font_size", 0));
     if (own) {
         g->config = cfg;
     } else {
@@ -8077,6 +8597,11 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->inboxcap = INBOX_CAP;
     g->reveal   = -1;
     g->firstlayout = 1;
+    g->zoom     = 1;
+    g->fontbase = 15;
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        g->panes[i] = i != PANE_METRICS;  // the metrics only when asked for
+    }
     #ifdef __APPLE__
     g->mac = 1;
     #endif
@@ -8311,10 +8836,13 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     io.IniFilename  = 0;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_DockingEnable;
     io.ConfigErrorRecoveryEnableAssert = 0;
+    // Panes close from their tabs alone, not each dock node as well
+    ImGui::GetStyle().DockingNodeHasCloseButton = 0;
     g->basestyle = ImGui::GetStyle();
     g->sysdark   = 1;  // until the window opens and the platform says
     applytheme(g);
     loadfonts(g);
+    addinihandler(g);
 
     if (g->inipath.len) {
         Arena t  = g->frame;
