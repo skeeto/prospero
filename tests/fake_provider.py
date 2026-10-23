@@ -1883,7 +1883,8 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Start background jobs", "Start a subagent that asks",
                "Write outside as a subagent", "Make undoable changes",
                "Read the big files", "Fail over", "Stream in the background",
-               "Stream for the link", "Look at the desktop")
+               "Stream for the link", "Look at the desktop", "Think slowly",
+               "Think briefly")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -1983,6 +1984,27 @@ def sc_gui(model, n, req):
                                                   "window": "Fake Editor"})
         else:
             yield from answer(model, "Looked at the desktop.")
+    elif "Think slowly" in prompt:
+        # Reasoning for 3 s, a pause of 6 s within it (the GUI's folded
+        # header draws only its clock then), 1 s more, and an answer
+        yield S.head()
+        for i in range(150):
+            yield from think(model, f"Weighing option {i}. ")
+            yield S.sleep(0.02)
+        yield S.sleep(6)
+        for i in range(50):
+            yield from think(model, f"Settling on {i}. ")
+            yield S.sleep(0.02)
+        yield from text(model, "Thought it through.")
+        yield from finish(model)
+    elif "Think briefly" in prompt:
+        # Reasoning for about 1.5 s, then an answer
+        yield S.head()
+        for i in range(75):
+            yield from think(model, f"Briefly {i}. ")
+            yield S.sleep(0.02)
+        yield from text(model, "Thought briefly.")
+        yield from finish(model)
     elif "Stream slowly" in prompt:
         yield S.head()
         for i in range(300):

@@ -786,3 +786,140 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.background", istr(&a, v->msgs[1].tool->job*10 + v->msgs[1].collapsed), "40");
     }
 }
+
+// Reasoning as each message has it: f folded, o open or h hidden, then
+// * if the user chose, ~ if provisional, its count and its seconds.
+static Str thinkshow(Arena *a, View *v)
+{
+    Buf b(a, 128);
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role != VIEW_THINK) {
+            continue;
+        }
+        print(&b, msghidden(v, m) ? Str("h") : m->collapsed ? Str("f") : Str("o"));
+        if (m->chosen) putbyte(&b, '*');
+        if (m->prov)   putbyte(&b, '~');
+        putbyte(&b, ' ');
+        print(&b, m->chars);
+        putbyte(&b, ' ');
+        print(&b, (m->ts1 - m->ts0)/1000);
+        putbyte(&b, ';');
+    }
+    return finish(&b);
+}
+
+static void test_viewthinking(Test *t)
+{
+    Arena perm = t->perm;
+    Str   user = R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"hi"})";
+    Str   turn = R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})";
+    Str   att  = R"({"sid":"s","seq":3,"ts":0,"ev":"attempt","turn":1,"n":1})";
+    Str   d1   = R"({"sid":"s","ts":1000,"ev":"delta","turn":1,"attempt":1,"kind":"think","text":"Hm, café"})";
+    Str   d2   = R"({"sid":"s","ts":4500,"ev":"delta","turn":1,"attempt":1,"kind":"think","text":" ok"})";
+    Str   d3   = R"({"sid":"s","ts":5000,"ev":"delta","turn":1,"attempt":1,"kind":"text","text":"Hi"})";
+    Str   done = R"({"sid":"s","seq":4,"ts":6000,"ev":"assistant","turn":1,"attempt":1,)"
+                 R"("blocks":[{"t":"think","text":"Hm, café ok"},{"t":"text","text":"Hi"}]})";
+
+    // Each setting, streamed then committed: folded from the first delta
+    // (fold), open throughout (open), or hidden (hide); counted in code
+    // points, and timed from the first delta to the last
+    Str want[][2] = {
+        {"f~ 11 3;", "f 11 3;"},
+        {"o~ 11 3;", "o 11 3;"},
+        {"h~ 11 3;", "h 11 3;"},
+    };
+    for (i32 mode = 0; mode < THINK_COUNT; mode++) {
+        Arena a = perm;
+        View *v = testview(&a);
+        viewthink(v, mode);
+        apply(v, a, user);
+        apply(v, a, turn);
+        apply(v, a, att);
+        apply(v, a, d1);
+        apply(v, a, d2);
+        apply(v, a, d3);
+        Str name = concat(&a, "thinking.", thinknames[mode]);
+        expect(t, concat(&a, name, ".streamed"), thinkshow(&a, v), want[mode][0]);
+        apply(v, a, done);
+        expect(t, concat(&a, name, ".committed"), thinkshow(&a, v), want[mode][1]);
+        expect(t, concat(&a, name, ".msgs"), msgsshow(&a, v), "U:hi;T:Hm, caf\xc3\xa9 ok;A:Hi;");
+    }
+
+    // Opened by the user while it streams, it stays open through more
+    // deltas, its commit, and settings that fold everything else
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, user);
+        apply(v, a, turn);
+        apply(v, a, att);
+        apply(v, a, d1);
+        togglemsg(v, 1);
+        apply(v, a, d2);
+        expect(t, "thinking.opened", thinkshow(&a, v), "o*~ 11 3;");
+        apply(v, a, d3);
+        apply(v, a, done);
+        expect(t, "thinking.keptopen", thinkshow(&a, v), "o* 11 3;");
+        viewthink(v, THINK_HIDE);
+        expect(t, "thinking.hidden", thinkshow(&a, v), "h* 11 3;");
+        viewthink(v, THINK_FOLD);
+        expect(t, "thinking.backopen", thinkshow(&a, v), "o* 11 3;");
+        // Closed by the user under open, it stays closed
+        viewthink(v, THINK_OPEN);
+        togglemsg(v, 1);
+        viewthink(v, THINK_FOLD);
+        viewthink(v, THINK_OPEN);
+        expect(t, "thinking.keptclosed", thinkshow(&a, v), "f* 11 3;");
+    }
+
+    // A response's reasoning in two parts, the second opened: the commit
+    // gives each its own by their order, and a snapshot does too
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, user);
+        apply(v, a, turn);
+        apply(v, a, att);
+        apply(v, a, R"({"sid":"s","ts":1000,"ev":"delta","turn":1,"attempt":1,"kind":"think","text":"one"})");
+        apply(v, a, R"({"sid":"s","ts":2000,"ev":"delta","turn":1,"attempt":1,"kind":"args","block":1,"id":"c1","name":"read","text":"{}"})");
+        apply(v, a, R"({"sid":"s","ts":3000,"ev":"delta","turn":1,"attempt":1,"kind":"think","text":"two"})");
+        togglemsg(v, 3);
+        expect(t, "thinking.two", thinkshow(&a, v), "f~ 3 0;o*~ 3 0;");
+        apply(v, a, R"({"sid":"s","ts":5000,"ev":"snapshot","turn":1,"attempt":1,"blocks":[)"
+                    R"({"block":0,"kind":"think","text":"one"},{"block":1,"kind":"args","id":"c1","name":"read","text":"{}"},)"
+                    R"({"block":2,"kind":"think","text":"two!"}]})");
+        expect(t, "thinking.snapshot", thinkshow(&a, v), "f~ 3 0;o*~ 4 0;");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":6000,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"think","text":"one"},{"t":"call","id":"c1","name":"read","args":"{}"},)"
+                    R"({"t":"think","text":"two!"}]})");
+        expect(t, "thinking.twocommitted", thinkshow(&a, v), "f 3 0;o* 4 0;");
+    }
+
+    // Hidden, reasoning takes no space and is never the message at a
+    // height, even last; folded, it takes its header's. Copying across
+    // it still takes its text.
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        v->extra = 10;
+        v->gap   = 2;
+        apply(v, a, user);
+        apply(v, a, turn);
+        apply(v, a, att);
+        apply(v, a, d1);
+        apply(v, a, d2);
+        f64 folded = viewtops(v, 100, 10, 10);
+        expect(t, "thinking.foldedh", istr(&a, (i64)folded), "32");
+        viewthink(v, THINK_HIDE);
+        f64 hidden = viewtops(v, 100, 10, 10);
+        expect(t, "thinking.hiddenh", istr(&a, (i64)hidden), "20");
+        expect(t, "thinking.findlast", istr(&a, viewfind(v, 25)), "0");
+        apply(v, a, d3);
+        viewtops(v, 100, 10, 10);
+        expect(t, "thinking.findnext", istr(&a, viewfind(v, 22)), "2");
+        expect(t, "thinking.findprev", istr(&a, viewfind(v, 5)), "0");
+        selset(v, 0, 0, 2, 2);
+        expect(t, "thinking.copy", copysel(v, &a, COPY_TEXT), "hi\n\nHm, caf\xc3\xa9 ok\n\nHi");
+    }
+}

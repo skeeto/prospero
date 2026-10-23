@@ -380,6 +380,9 @@ static CfgKey cfgschema[] = {
 
     {"ui", "theme", CFG_ENUM, "system", {}, "system dark light", "ui",
      "Colors: dark, light, or system to follow the operating system"},
+    {"ui", "thinking", CFG_ENUM, "fold", {}, "fold open hide", "ui",
+     "Reasoning in the transcript: fold to a line that counts it as it "
+     "streams, open, or hide"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "

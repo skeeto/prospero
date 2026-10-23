@@ -566,6 +566,7 @@ int main()
     test_layout(&t);
     test_view(&t);
     test_viewpanels(&t);
+    test_viewthinking(&t);
     test_theme(&t);
     test_png(&t);
     #endif

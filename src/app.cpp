@@ -42,7 +42,9 @@
 // The theme is [ui] theme: read from the configuration before the
 // window opens, so that it opens in it, then from each config.get
 // reply, and picked in the settings window, where it applies at once.
-// "system" follows what the platform reports (gui_systheme). The layout
+// "system" follows what the platform reports (gui_systheme). [ui]
+// thinking, how reasoning shows, comes the same ways and applies to
+// every session's view at once (setthinking). The layout
 // file is written by a thread of its own (Saver), since a write that is
 // to survive a crash waits on the disk for longer than a frame.
 //
@@ -172,6 +174,7 @@ enum : i32 {
     RECT_FORCE,      // the latest rewind card's Rewind anyway
     RECT_INFOBTN,    // the session's Info
     RECT_COMPACTHDR, // the latest compaction card's header
+    RECT_THINKHDR,   // the latest reasoning's header drawn
     RECT_CLOSEBG,    // the close dialog's Keep running in background
     RECT_HOSTCOMBO,  // the new session's host, and its first choices
     RECT_HOST0,
@@ -494,6 +497,7 @@ struct Gui {
     b32                quit;
     Palette           *pal;        // the theme in effect
     i32                themeset;   // THEME_*, from [ui] theme
+    i32                thinkset;   // THINK_*, from [ui] thinking
     b32                sysdark;    // the system prefers dark
     b32                syshas;     // the platform said so once
     b32                titleok;    // the window's frame follows the theme
@@ -707,6 +711,12 @@ struct Gui {
     i32                bgbadge;      // the session shown was badged background
     b32                outshown;     // the Output window showed text
     i32                thumbsdrawn;  // thumbnails drawn with their image
+    i32                thinkrows;    // reasoning headers the transcript drew
+    i64                thinkchars;   // the latest one's count, -1 if none
+    i64                thinksecs;    // and its clock while it streams, else -1
+    i64                thinkchars0;  // as a check last saw them
+    i64                thinksecs0;
+    b32                thinkhidshown; // the strip said reasoning is hidden
     b32                shotshown;    // the Screenshot window drew its image
     b32                downshown;    // a host's countdown to its next try
     b32                elseshown;    // closing said what runs on elsewhere
@@ -843,6 +853,7 @@ static View *sessview(Gui *g, GuiSession *s)
         if (s->host->kind != GH_REMOTE) {
             s->view->dir = sessdir(g, &g->perm, s->sid);
         }
+        viewthink(s->view, g->thinkset);
     }
     return s->view;
 }
@@ -1698,6 +1709,7 @@ static void startquit(Gui *g)
 // Records from the engine
 
 static void settheme(Gui *, i32);
+static void setthinking(Gui *, i32);
 
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
@@ -1738,6 +1750,8 @@ static void loadcfg(Gui *g, Str line)
         }
         if (r.kind=="ui" && r.key=="theme") {
             settheme(g, themeparse(r.value));
+        } else if (r.kind=="ui" && r.key=="thinking") {
+            setthinking(g, thinkparse(r.value));
         }
         // Defaults, and what a model inherits by like, show as hints, not
         // values: an edit writes a value of its own. The field holds the
@@ -4268,6 +4282,7 @@ enum : i32 {
     OP_TEXTRCWD,  // type the --rcwd directory, the remote one
     OP_MARKDELTAS,// remember the deltas the shown session has had
     OP_IFSESS,    // unless a session's title starts with text, skip dx ops
+    OP_THINKING,  // show reasoning as dx (THINK_*), as a setting would
 };
 
 enum : i32 {
@@ -4323,6 +4338,7 @@ enum : i32 {
     T_REFRESHINC,  // the settings' Refresh includes
     T_THUMB,       // the latest screenshot thumbnail drawn
     T_SHOTCLOSE,   // the Screenshot window's Close
+    T_THINKHDR,    // the latest reasoning's header drawn
 };
 
 enum : i32 {
@@ -4431,6 +4447,16 @@ enum : i32 {
     CHK_SHOTOPEN,
     CHK_SHOTCLOSED,
     CHK_IMGQUIET,
+    CHK_THINKFOLD,
+    CHK_THINKGREW,
+    CHK_THINKQUIET,
+    CHK_THINKOPENED,
+    CHK_THINKKEPT,
+    CHK_THINKHIDDEN,
+    CHK_THINKNONE,
+    CHK_THINKOPEN,
+    CHK_THINKSTAYS,
+    CHK_THINKREFOLD,
     CHK_COUNT,
 };
 
@@ -4516,6 +4542,16 @@ static Str chknames[] = {
     "a thumbnail's click opened the screenshot whole, at its size",
     "closed, the Screenshot window let its texture go",
     "no frames while screenshots show, once loaded",
+    "reasoning streams folded to one header with its count and clock",
+    "the folded header's count grew as it streamed",
+    "a pause in reasoning drew its clock each second, and little more",
+    "a click opened the streaming reasoning",
+    "the reasoning opened stayed open through its commit",
+    "hide: no reasoning drawn while it streams, the strip says why",
+    "hide: no reasoning drawn once committed either",
+    "open: the reasoning streams open",
+    "open: the committed reasoning stays open",
+    "fold again: reasoning folded, but for what the user opened",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -4557,6 +4593,8 @@ enum : i32 {
     W_REFRESHED,  // a config.get {refresh} was answered
     W_THUMBS,     // the session shown's thumbnails came, and drew
     W_SHOT,       // the Screenshot window's image came, or failed
+    W_THINKING,   // the session shown streams reasoning
+    W_THINKSTALL, // and has had none for a while
 };
 
 static Str waitnames[] = {
@@ -4568,9 +4606,10 @@ static Str waitnames[] = {
     "a compaction", "the endpoint's line", "streaming", "the window to go",
     "the window to come back", "a background host", "the remote host",
     "the link to drop", "the remote to close", "the output", "a file",
-    "the includes", "the thumbnails", "the screenshot",
+    "the includes", "the thumbnails", "the screenshot", "reasoning",
+    "a pause in reasoning",
 };
-static_assert(countof(waitnames) == W_SHOT+1);
+static_assert(countof(waitnames) == W_THINKSTALL+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -4919,6 +4958,51 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
     {OP_CHECK, CHK_COPIED, 0, 0, 0, ""},
+    // Reasoning as [ui] thinking says, changed as a setting would be,
+    // for the session already open. Folded, one line whose count goes
+    // up as it streams, its clock drawn once a second through a pause
+    // and little else; opened by a click while it streams, it stays
+    // open through its commit
+    {OP_THINKING, 0, THINK_FOLD, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Think slowly."},
+    {OP_WAIT, W_THINKING, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_THINKFOLD, 0, 0, 800, ""},
+    {OP_CHECK, CHK_THINKGREW, 0, 0, 0, ""},
+    {OP_WAIT, W_THINKSTALL, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 2500, ""},
+    {OP_CHECK, CHK_THINKQUIET, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "17-thinking"},
+    {OP_MOVE, T_THINKHDR, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_THINKOPENED, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_THINKKEPT, 0, 0, 0, ""},
+    // Hidden: none drawn, this turn's or the earlier, the strip saying
+    // why nothing shows
+    {OP_THINKING, 0, THINK_HIDE, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Think briefly."},
+    {OP_WAIT, W_THINKING, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_THINKHIDDEN, 0, 0, 0, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_THINKNONE, 0, 0, 0, ""},
+    // Open: streamed open, and left so; folded again, all but the one
+    // the user opened
+    {OP_THINKING, 0, THINK_OPEN, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Think briefly."},
+    {OP_WAIT, W_THINKING, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_THINKOPEN, 0, 0, 0, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_THINKSTAYS, 0, 0, 0, ""},
+    {OP_THINKING, 0, THINK_FOLD, 0, 500, ""},
+    {OP_CHECK, CHK_THINKREFOLD, 0, 0, 0, ""},
     // An ask, allowed through its card
     {OP_PROMPT, 0, 0, 0, 100, "Write outside the workspace, ask, and be allowed."},
     {OP_WAIT, W_ASK, 0, 0, 10000, ""},
@@ -5751,6 +5835,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_REFRESHINC:    return rectcenter(g->rects[RECT_REFRESHINC]);
     case T_THUMB:         return rectcenter(g->rects[RECT_THUMB]);
     case T_SHOTCLOSE:     return rectcenter(g->rects[RECT_SHOTCLOSE]);
+    case T_THINKHDR:      return rectcenter(g->rects[RECT_THINKHDR]);
     case T_HOSTITEM:
         for (i32 i = 0; i < countof(g->hostitems); i++) {
             GuiHost *h = g->hostitems[i];
@@ -5872,6 +5957,24 @@ static ViewMsg *lastof(View *v, i32 role)
     return 0;
 }
 
+// The latest reasoning in a view, provisional or not, or null.
+static ViewMsg *lastthink(View *v)
+{
+    for (iz i = v->msgs.len-1; i >= 0; i--) {
+        if (v->msgs[i].role == VIEW_THINK) {
+            return &v->msgs[i];
+        }
+    }
+    return 0;
+}
+
+// Whether the view streams reasoning now.
+static b32 thinking(View *v)
+{
+    return v->busy && v->stream>=0 && v->streamkind==VIEW_THINK &&
+           v->msgs[v->stream].chars>0;
+}
+
 static i32 countrole(View *v, i32 role)
 {
     i32 n = 0;
@@ -5926,6 +6029,10 @@ static b32 drivewaitdone(Gui *g)
         return g->img.view.state==IMG_READY || g->img.view.state==IMG_FAILED;
     case W_STREAMING:
         return g->sess && v->state==LIVE_STREAMING && v->deltas>0;
+    case W_THINKING:
+        return g->sess && thinking(v) && (v->thinking==THINK_HIDE || g->thinkchars>0);
+    case W_THINKSTALL:
+        return g->sess && thinking(v) && os_time(g->os)-v->lastdata>=700;
     case W_SHED:
         return g->bg;
     case W_REOPENED:
@@ -6203,6 +6310,84 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_SHOTCLOSED: {
         ImGuiWindow *w = ImGui::FindWindowByName("Screenshot");
         return !g->img.view.open && !g->img.view.tex && !g->img.dying && (!w || !w->Active);
+    }
+    case CHK_THINKFOLD:
+    case CHK_THINKGREW: {
+        // One header line, its count and clock as last drawn
+        ViewMsg *m   = lastthink(v);
+        b32      ok  = m && m->prov && m->collapsed && thinking(v) && g->thinkrows>0 &&
+                       g->thinkchars==m->chars && g->thinksecs>=0;
+        b32      grew = g->thinkchars > g->thinkchars0;
+        Arena    a   = g->frame;
+        Buf      b(&a, 96);
+        print(&b, "drive: reasoning folded: ");
+        print(&b, g->thinkchars);
+        print(&b, " characters, ");
+        print(&b, g->thinksecs);
+        print(&b, " s");
+        guilog(g, finish(&b));
+        g->thinkchars0 = g->thinkchars;
+        g->thinksecs0  = g->thinksecs;
+        return ok && (chk==CHK_THINKFOLD || grew);
+    }
+    case CHK_THINKQUIET: {
+        // Its clock and the turn's tick on one deadline a second, a
+        // frame and its settling, plus the probe's: never 30 a second
+        // for a count that does not change
+        i64   n     = g->total.frames - g->driveframes;
+        i64   us    = g->sched.now - g->markat;
+        i64   other = (g->metricsshown ? 4*us/1000000 : 0) + 3;
+        ViewMsg *m  = lastthink(v);
+        Arena a     = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drive: frames while reasoning paused: ");
+        print(&b, n);
+        print(&b, " in ");
+        printfloat(&b, (f64)us/1e6, 1);
+        print(&b, " s, its clock from ");
+        print(&b, g->thinksecs0);
+        print(&b, " to ");
+        print(&b, g->thinksecs);
+        print(&b, " s");
+        guilog(g, finish(&b));
+        return m && m->prov && m->collapsed && g->thinksecs>g->thinksecs0 &&
+               n <= 4*us/1000000 + other;
+    }
+    case CHK_THINKOPENED: {
+        ViewMsg *m = lastthink(v);
+        return m && m->prov && !m->collapsed && m->chosen && m->measured && m->h>0;
+    }
+    case CHK_THINKKEPT: {
+        ViewMsg *m = lastthink(v);
+        return m && !m->prov && m->seq && !m->collapsed && m->chosen && m->measured &&
+               m->h>0 && !v->busy;
+    }
+    case CHK_THINKHIDDEN:
+        return thinking(v) && v->thinking==THINK_HIDE && g->thinkhidshown && !g->thinkrows;
+    case CHK_THINKNONE: {
+        ViewMsg *m = lastthink(v);
+        return m && !m->prov && !v->busy && countrole(v, VIEW_THINK)>=2 && !g->thinkrows;
+    }
+    case CHK_THINKOPEN: {
+        ViewMsg *m = lastthink(v);
+        return m && m->prov && thinking(v) && !m->collapsed && !m->chosen && m->measured &&
+               m->h>0 && g->thinkrows>0;
+    }
+    case CHK_THINKSTAYS: {
+        ViewMsg *m = lastthink(v);
+        return m && !m->prov && !v->busy && !m->collapsed && !m->chosen && g->thinkrows>0;
+    }
+    case CHK_THINKREFOLD: {
+        // The one opened by a click stays open, the rest fold
+        i32 opened = 0, wrong = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewMsg *m = &v->msgs[i];
+            if (m->role == VIEW_THINK) {
+                opened += m->chosen && !m->collapsed;
+                wrong  += !m->chosen && !m->collapsed;
+            }
+        }
+        return opened==1 && !wrong && g->thinkrows>0;
     }
     case CHK_IMGQUIET: {
         // The probe's, and the overlay's numbers if shown
@@ -7133,6 +7318,10 @@ static void drivestep(Gui *g)
         g->reveal = op->target;
         scheddirty(&g->sched);
         break;
+    case OP_THINKING:
+        setthinking(g, (i32)op->dx);
+        g->thinkchars0 = g->thinksecs0 = -1;
+        break;
     case OP_TRAY:
         e.kind = GEV_TRAY;
         e.x    = op->dx;
@@ -7330,6 +7519,8 @@ static void readconfig(Gui *g, Arena scratch)
     }
     i32 theme = themeparse(cfgget(cfg, "ui", "", "theme", 0));
     g->themeset = theme<0 ? THEME_SYSTEM : theme;
+    i32 think = thinkparse(cfgget(cfg, "ui", "", "thinking", 0));
+    g->thinkset = think<0 ? THINK_FOLD : think;
     if (own) {
         g->config = cfg;
     } else {

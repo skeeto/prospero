@@ -371,6 +371,23 @@ static void settheme(Gui *g, i32 theme)
     applytheme(g);
 }
 
+// Show reasoning as [ui] thinking says: THINK_*, or -1 for an unknown
+// name, which means fold. Every view at once, in one frame.
+static void setthinking(Gui *g, i32 mode)
+{
+    mode = mode<0 ? THINK_FOLD : mode;
+    b32 changed = g->thinkset != mode;
+    g->thinkset = mode;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        changed |= s->view && viewthink(s->view, mode);
+    }
+    if (changed) {
+        g->thinkhidshown = 0;
+        g->woke |= WOKE_FORCE;
+        schedforce(&g->sched);
+    }
+}
+
 
 // Transcript
 
@@ -692,6 +709,23 @@ static Str bytesize(Arena *a, i64 n)
     return finish(&b);
 }
 
+// A count as "523", "1.2k", "48k" or "1.3M".
+static void printcount(Buf *b, i64 n)
+{
+    if (n < 1000) {
+        print(b, n);
+    } else if (n < 10000) {
+        printfloat(b, (f64)n/1000, 1);
+        putbyte(b, 'k');
+    } else if (n < 1000000) {
+        print(b, n/1000);
+        putbyte(b, 'k');
+    } else {
+        printfloat(b, (f64)n/1000000, 1);
+        putbyte(b, 'M');
+    }
+}
+
 // Whole seconds left until an epoch-ms time, rounded up, and a deadline
 // at the next change of that number, only while it is drawn.
 static i64 countdown(Gui *g, i64 at, i64 nowms)
@@ -855,14 +889,36 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         }
     } break;
     case VIEW_THINK: {
-        pen(p, "Reasoning", STYLE_BOLD, dim);
-        if (m->collapsed) {
-            Buf b(&a, 32);
+        // Streaming, its size and a clock; once done, how long it took,
+        // if seen. The clock counts the turn clock's seconds since it
+        // began, so that both tick on the strip's one deadline a second.
+        b32 live = v->busy && v->stream>=0 && &v->msgs[v->stream]==m &&
+                   v->streamkind==VIEW_THINK && !m->faded;
+        i64 secs = -1;
+        if (live && m->ts0) {
+            i64 t0 = v->turnts && v->turnts<=m->ts0 ? v->turnts : m->ts0;
+            i64 el = nowms - t0;
+            el   = el<0 ? 0 : el;
+            secs = el/1000 - (m->ts0 - t0)/1000;
+            schedat(&g->sched, g->sched.now + (1000 - el%1000)*1000 + 1000, DUE_CLOCK);
+        } else if (m->ts0 && m->ts1-m->ts0>=1000) {
+            secs = (m->ts1 - m->ts0) / 1000;
+        }
+        pen(p, live ? Str("Thinking\xe2\x80\xa6") : Str("Reasoning"), STYLE_BOLD,
+            live ? pal->active : dim);
+        if (m->collapsed || live) {
+            Buf b(&a, 64);
             print(&b, "  ");
-            print(&b, m->nl + 1);
-            print(&b, m->nl ? Str(" lines") : Str(" line"));
+            printcount(&b, m->chars);
+            print(&b, m->chars==1 ? Str(" character") : Str(" characters"));
+            if (secs >= 0) {
+                print(&b, ", ");
+                print(&b, secstext(&a, secs));
+            }
             pen(p, finish(&b), 0, dim);
         }
+        g->thinkchars = m->chars;
+        g->thinksecs  = live ? secs : -1;
     } break;
     case VIEW_ASK: {
         Buf b(&a, 256);
@@ -1526,12 +1582,19 @@ static void drawtranscript(Gui *g)
             break;
         }
     }
-    i32 latest[] = {RECT_TASKLINK, RECT_UNDO, RECT_REWINDTURN, RECT_FORCE, RECT_COMPACTHDR};
+    i32 latest[] = {RECT_TASKLINK, RECT_UNDO, RECT_REWINDTURN, RECT_FORCE, RECT_COMPACTHDR,
+                    RECT_THINKHDR};
     for (iz i = 0; i < countof(latest); i++) {
         g->rects[latest[i]] = {};  // the latest drawn, or none
     }
+    g->thinkrows  = 0;
+    g->thinkchars = -1;
+    g->thinksecs  = -1;
     sp->Split(dl, CH_COUNT);
     for (i32 i = d0; i>=0 && i <= d1; i++) {
+        if (msghidden(v, &v->msgs[i])) {
+            continue;  // reasoning, with thinking = hide
+        }
         ViewMsg   *m     = &v->msgs[i];
         MsgLayout *ml    = msglayout(v, i, &g->measure, width, sc);
         f32        y     = wpos.y + (f32)(m->top - scrolly);
@@ -1585,6 +1648,9 @@ static void drawtranscript(Gui *g)
             }
             if (m->role == VIEW_COMPACT) {
                 itemrect(g, RECT_COMPACTHDR);
+            } else if (m->role == VIEW_THINK) {
+                itemrect(g, RECT_THINKHDR);
+                g->thinkrows++;
             }
             if (ImGui::IsItemHovered()) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -1703,6 +1769,13 @@ static void drawstrip(Gui *g)
         print(&b, " s");
         ImGui::SameLine();
         ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+    }
+    if (v->busy && v->thinking==THINK_HIDE && v->stream>=0 &&
+            v->streamkind==VIEW_THINK) {
+        // Why the transcript shows nothing while the model thinks
+        g->thinkhidshown = 1;
+        ImGui::SameLine();
+        ImGui::TextDisabled("thinking (reasoning hidden)");
     }
     if (v->state == LIVE_QUEUED) {
         // Its place in the endpoint's line, which live records update
@@ -2822,7 +2895,8 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target)
     ImGui::SetNextItemWidth(-1);
     ImGui::PushID(r);
     if (r->choices.len) {
-        // A pick goes out at once; the theme even before the file has it
+        // A pick goes out at once; the theme and how reasoning shows
+        // apply even before the file has them
         b32    theme = r->kind=="ui" && r->key=="theme";
         ImVec2 at    = ImGui::GetCursorScreenPos();
         Str    pick  = {};
@@ -2845,6 +2919,8 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target)
         if (pick.len && pick!=r->value && !(r->sent && pick==r->sentval)) {
             if (theme) {
                 settheme(g, themeparse(pick));
+            } else if (r->kind=="ui" && r->key=="thinking") {
+                setthinking(g, thinkparse(pick));
             }
             r->sent    = 1;
             r->sentval = clone(&g->cfgmem, pick);

@@ -36,6 +36,14 @@
 // lexicographically, so it spans messages and survives relayout and
 // streaming. Copying turns it back into text or markdown.
 //
+// Reasoning shows as the [ui] thinking setting says (viewthink): folded
+// to its header, even while it streams (fold, the default), open, or
+// not at all (hide), when it takes no space and draws nothing. A row
+// the user opened or closed keeps that (chosen) through setting
+// changes, and through its commit: a commit, or a snapshot, carries the
+// state of the provisional reasoning it replaces over to its own, by
+// their place among the response's reasoning.
+//
 // Besides its transcript a view keeps what the panels beside it show:
 // the agent's todo list, the session's background jobs with the latest
 // of their output, the files write and edit changed (snapshots), which
@@ -131,6 +139,28 @@ static Str livenames[] = {
     "ask", "queued", "task", "compacting", "closed",
 };
 static_assert(countof(livenames) == LIVE_COUNT);
+
+// How reasoning shows ([ui] thinking)
+enum : i32 {
+    THINK_FOLD,  // its header only, until opened
+    THINK_OPEN,
+    THINK_HIDE,  // not at all
+    THINK_COUNT,
+};
+
+static Str thinknames[] = {"fold", "open", "hide"};
+static_assert(countof(thinknames) == THINK_COUNT);
+
+// The setting's value from its name, or -1 if it names none.
+static i32 thinkparse(Str s)
+{
+    for (i32 i = 0; i < THINK_COUNT; i++) {
+        if (thinknames[i] == s) {
+            return i;
+        }
+    }
+    return -1;
+}
 
 enum : iz {
     VIEW_DIFFMAX = 64 << 10,  // bytes of a write's content shown as a diff
@@ -246,9 +276,13 @@ struct ViewMsg {
     b32       prov;       // provisional: streamed, not yet committed
     b32       faded;      // provisional text of a failed attempt
     b32       collapsed;  // only the header shows
+    b32       chosen;     // the user opened or closed it: settings keep off
     b32       fold;       // its header shows and hides the rest
     b32       md;         // markdown, not plain text
     i32       startsturn; // the turn this message began, 0 if none
+    i64       chars;      // reasoning: code points in its text
+    i64       ts0;        // reasoning: its first and last deltas, epoch
+    i64       ts1;        //   ms, or 0 where it did not stream
     Str       label;      // the header, if not the role's name
     ViewTool *tool;       // tool rows and asks
     ViewCard *card;       // compactions and rewinds
@@ -318,6 +352,7 @@ struct View {
     i64             deltabytes;
     i64             laidout;    // messages laid out, for benchmarks
     b32             overflow;   // fake agent: events were dropped
+    i32             thinking;   // THINK_*: how reasoning shows
 
     // Ordering
     i64             lastseq;    // the last durable record applied
@@ -430,6 +465,28 @@ static i64 countnl(Str s)
     return n;
 }
 
+// Code points in s, which is UTF-8: its bytes but continuation bytes.
+static i64 countchars(Str s)
+{
+    i64 n = s.len;
+    for (iz i = 0; i < s.len; i++) {
+        n -= (s[i] & 0xc0) == 0x80;
+    }
+    return n;
+}
+
+// Whether reasoning not chosen open or closed starts folded.
+static b32 thinkfolded(View *v)
+{
+    return v->thinking != THINK_OPEN;
+}
+
+// Whether a message takes no space and draws nothing.
+static b32 msghidden(View *v, ViewMsg *m)
+{
+    return m->role==VIEW_THINK && v->thinking==THINK_HIDE;
+}
+
 // A copy in the text arena, which provisional messages must know about.
 static Str viewclone(View *v, Str s)
 {
@@ -447,6 +504,10 @@ static i32 addmsg(View *v, i32 role, Str text)
     m.text = viewclone(v, text);
     m.nl   = countnl(text);
     m.md   = role == VIEW_ASSISTANT;
+    if (role == VIEW_THINK) {
+        m.chars     = countchars(text);
+        m.collapsed = thinkfolded(v);
+    }
     v->msgs = push(&v->meta, v->msgs, m);
     v->topsdirty  = 1;
     v->provmixed |= v->prov >= 0;
@@ -478,6 +539,7 @@ static i32 addprov(View *v, i32 role)
     m.attempt = v->attempt;
     m.prov    = 1;
     m.md      = role == VIEW_ASSISTANT;
+    m.collapsed = role==VIEW_THINK && thinkfolded(v);
     v->msgs = push(&v->meta, v->msgs, m);
     v->topsdirty = 1;
     return (i32)v->msgs.len - 1;
@@ -485,8 +547,8 @@ static i32 addprov(View *v, i32 role)
 
 // Append to the provisional message for this kind of delta, starting
 // one if needed. Its text is the text arena's last allocation, so this
-// extends it in place.
-static void viewdelta(View *v, i32 role, Str text)
+// extends it in place. Reasoning keeps when it arrived (ts, epoch ms).
+static void viewdelta(View *v, i32 role, Str text, i64 ts)
 {
     if (v->stream<0 || v->streamkind!=role) {
         v->stream     = addprov(v, role);
@@ -495,6 +557,11 @@ static void viewdelta(View *v, i32 role, Str text)
     ViewMsg *m = &v->msgs[v->stream];
     m->text = concat(&v->text, m->text, text);
     m->nl  += countnl(text);
+    if (role == VIEW_THINK) {
+        m->chars += countchars(text);
+        m->ts0    = m->ts0 ? m->ts0 : ts;
+        m->ts1    = ts;
+    }
     m->ver++;
     v->deltas++;
     v->deltabytes += text.len;
@@ -578,6 +645,58 @@ static void fadeprov(View *v)
         v->msgs[i].faded |= v->msgs[i].prov;
     }
     v->stream = -1;
+}
+
+// The provisional reasoning, in order, whose state the messages that
+// replace it take over (takethink).
+static Slice<ViewMsg> provthinks(View *v, Arena *a)
+{
+    Slice<ViewMsg> r = {};
+    for (iz i = v->prov<0 ? v->msgs.len : v->prov; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->prov && !m->faded && m->role==VIEW_THINK) {
+            r = push(a, r, *m);
+        }
+    }
+    return r;
+}
+
+// The nth reasoning of a response takes over its provisional one's
+// times, and whether the user opened or closed it.
+static void takethink(ViewMsg *m, Slice<ViewMsg> was, iz n)
+{
+    if (n >= was.len) {
+        return;
+    }
+    ViewMsg *w = &was[n];
+    if (w->ts0) {
+        m->ts0 = w->ts0;
+        m->ts1 = w->ts1;
+    }
+    if (w->chosen) {
+        m->chosen    = 1;
+        m->collapsed = w->collapsed;
+    }
+}
+
+// Show reasoning as [ui] thinking says (THINK_*), all of it at once but
+// what the user opened or closed. Returns whether anything changed.
+static b32 viewthink(View *v, i32 mode)
+{
+    if (v->thinking == mode) {
+        return 0;
+    }
+    v->thinking = mode;
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role == VIEW_THINK) {
+            m->collapsed = m->chosen ? m->collapsed : thinkfolded(v);
+            m->measured  = 0;
+            m->ver++;
+        }
+    }
+    v->topsdirty = 1;
+    return 1;
 }
 
 // Keep a selection inside the messages that exist.
@@ -1128,7 +1247,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             viewargs(v, (i32)jsonint(jsonget(j, "block"), 0),
                      jsonstr(jsonget(j, "id")), jsonstr(jsonget(j, "name")), text);
         } else {
-            viewdelta(v, kind=="think" ? VIEW_THINK : VIEW_ASSISTANT, text);
+            viewdelta(v, kind=="think" ? VIEW_THINK : VIEW_ASSISTANT, text, r->ts);
         }
     } return 1;
 
@@ -1140,6 +1259,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         if (turn<v->doneturn || (turn==v->doneturn && attempt<=v->doneattempt)) {
             return 0;  // committed already
         }
+        Slice<ViewMsg> was = provthinks(v, &scratch);
         dropprov(v);
         v->lastdata = r->ts;
         for (Json *b = jsonget(j, "blocks")->child; b; b = b->next) {
@@ -1152,13 +1272,21 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                 viewargs(v, (i32)jsonint(jsonget(b, "block"), 0),
                          jsonstr(jsonget(b, "id")), jsonstr(jsonget(b, "name")), text);
             } else {
-                viewdelta(v, kind=="think" ? VIEW_THINK : VIEW_ASSISTANT, text);
+                viewdelta(v, kind=="think" ? VIEW_THINK : VIEW_ASSISTANT, text, r->ts);
+            }
+        }
+        iz n = 0;
+        for (iz i = v->prov<0 ? v->msgs.len : v->prov; i < v->msgs.len; i++) {
+            if (v->msgs[i].prov && v->msgs[i].role==VIEW_THINK) {
+                takethink(&v->msgs[i], was, n++);
             }
         }
         clampsel(v);
     } return 1;
 
     case EV_ASSISTANT: {
+        Slice<ViewMsg> was = provthinks(v, &scratch);
+        iz             n   = 0;  // reasoning so far
         dropprov(v);
         v->doneturn    = (i32)jsonint(jsonget(j, "turn"), v->turn);
         v->doneattempt = (i32)jsonint(jsonget(j, "attempt"), v->attempt);
@@ -1170,7 +1298,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                 continue;  // reasoning a server kept to itself (Anthropic)
             } else if (t == "think") {
                 i = addmsg(v, VIEW_THINK, jsonstr(jsonget(b, "text")));
-                v->msgs[i].collapsed = 1;
+                takethink(&v->msgs[i], was, n++);
             } else if (t == "text") {
                 i = addmsg(v, VIEW_ASSISTANT, jsonstr(jsonget(b, "text")));
             } else if (t == "call") {
@@ -1813,14 +1941,14 @@ static f32 msgfoot(View *v, ViewMsg *m)
 }
 
 // Lay out message i at the width, updating its height. A collapsed
-// message has no content.
+// or hidden message has no content.
 static MsgLayout *msglayout(View *v, i32 i, Measure *ms, f32 width, f32 scale)
 {
     ViewMsg   *m = &v->msgs[i];
     ViewCache *c = v->c;
     if (m->layoutver!=m->ver || m->layoutgen!=c->gen || m->layoutw!=width ||
             !m->measured) {
-        if (m->collapsed) {
+        if (m->collapsed || msghidden(v, m)) {
             m->layout = {};
             m->layout.width = width;
         } else {
@@ -1864,18 +1992,24 @@ static f64 viewtops(View *v, f32 width, f32 charw, f32 lineh)
                 m->h = estimate(m, width, charw, lineh);
             }
             m->top = y;
-            y += v->extra + m->h + msgfoot(v, m) + v->gap;
+            if (!msghidden(v, m)) {
+                y += v->extra + m->h + msgfoot(v, m) + v->gap;
+            }
         }
         v->topsdirty = 0;
     }
-    if (!v->msgs.len) {
+    iz i = v->msgs.len - 1;
+    for (; i>=0 && msghidden(v, &v->msgs[i]); i--) {}
+    if (i < 0) {
         return 0;
     }
-    ViewMsg *last = &v->msgs[v->msgs.len-1];
+    ViewMsg *last = &v->msgs[i];
     return last->top + v->extra + last->h + msgfoot(v, last);
 }
 
-// The message at y: the last whose top is at or above it.
+// The message at y: the last whose top is at or above it. A hidden one
+// shares its top with the next, so only a run of them at the end could
+// be last: then the one shown before them, or after if none, or -1.
 static i32 viewfind(View *v, f64 y)
 {
     iz lo = 0, hi = v->msgs.len;
@@ -1890,13 +2024,17 @@ static i32 viewfind(View *v, f64 y)
             hi = mid;
         }
     }
-    return (i32)lo;
+    iz i = lo;
+    for (; i>=0 && msghidden(v, &v->msgs[i]); i--) {}
+    for (i = i<0 ? lo : i; i<v->msgs.len && msghidden(v, &v->msgs[i]); i++) {}
+    return i<v->msgs.len ? (i32)i : -1;
 }
 
-// Show or hide a message's content.
+// Show or hide a message's content, as the user chose.
 static void togglemsg(View *v, i32 i)
 {
     ViewMsg *m = &v->msgs[i];
+    m->chosen    = 1;
     m->collapsed = !m->collapsed;
     m->ver++;
     v->topsdirty = 1;

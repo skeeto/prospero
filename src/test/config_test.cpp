@@ -734,6 +734,7 @@ static void testcfgjson(Test *t)
         "tools//task_budget=200*\n"
         "instructions//files=AGENTS.md CLAUDE.md*\n"
         "ui//theme=system*\n"
+        "ui//thinking=fold*\n"
         "desktop//offer=none*\n"
         "desktop//ask=true*\n"
         "desktop//ask_timeout=60*\n"
