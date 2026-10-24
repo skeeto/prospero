@@ -11,6 +11,7 @@
 // This is free and unencumbered software released into the public domain.
 #include "base.cpp"
 #include "wide.cpp"
+#include "png.cpp"
 #include "deskhelp.cpp"
 
 using u16 = decltype((unsigned short)0);

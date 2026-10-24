@@ -524,6 +524,7 @@ static Arena newarena(Region *r)
 #include "provider.cpp"
 #include "anthropic.cpp"
 #include "edit.cpp"
+#include "png.cpp"
 #include "desktop.cpp"
 #include "tools.cpp"
 #include "guard.cpp"

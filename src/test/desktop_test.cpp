@@ -651,7 +651,7 @@ static void test_desktop(Test *t)
         b32 ok = 1;
         for (iz i = 8; ok && i+12 <= png.len;) {
             u32 len = (u32)png[i]<<24 | (u32)png[i+1]<<16 | (u32)png[i+2]<<8 | png[i+3];
-            u32 crc = dkcrc32(0, png.data+i+4, len+4);
+            u32 crc = zcrc32(0, png.data+i+4, len+4);
             u8 *c   = png.data + i + 8 + len;
             ok = crc == ((u32)c[0]<<24 | (u32)c[1]<<16 | (u32)c[2]<<8 | c[3]);
             i += 12 + len;

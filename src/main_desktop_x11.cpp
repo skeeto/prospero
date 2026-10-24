@@ -56,6 +56,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "base.cpp"
+#include "png.cpp"
 #include "deskhelp.cpp"
 
 extern char **environ;

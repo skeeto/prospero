@@ -66,6 +66,7 @@
 #undef assert  // the system's, from <assert.h>: base.cpp has its own
 #include "base.cpp"
 #include "wide.cpp"
+#include "png.cpp"
 #include "deskhelp.cpp"
 
 extern "C" void *objc_autoreleasePoolPush(void);

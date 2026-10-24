@@ -2,7 +2,7 @@
 // session log's open, recovery, and replay over a one-file stub platform,
 // or with -DFUZZ_PROVIDER the engine's parsers of untrusted text, or with
 // -DFUZZ_FRAMES the framing of remote links (frame.cpp), or with
-// -DFUZZ_PNG the GUI's PNG decoder (png.cpp)
+// -DFUZZ_PNG the PNG decoder (png.cpp)
 //   $ afl-clang-fast++ -std=c++20 -fno-exceptions -fno-rtti -g3 \
 //         -fsanitize=address,undefined -fsanitize-trap=undefined \
 //         -o fuzzjson src/main_fuzz.cpp
@@ -42,9 +42,6 @@
 #include <string.h>
 #include <unistd.h>
 #include "prospero.cpp"
-#if FUZZ_PNG
-#  include "png.cpp"
-#endif
 
 #ifndef __AFL_FUZZ_TESTCASE_LEN
 static ssize_t fuzzlen;

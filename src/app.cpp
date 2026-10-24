@@ -66,7 +66,6 @@
 #include "layout.cpp"
 #include "view.cpp"
 #include "theme.cpp"
-#include "png.cpp"
 #include "fonts.cpp"
 #include "place.cpp"
 #include "compose.cpp"
