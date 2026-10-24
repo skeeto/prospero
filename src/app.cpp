@@ -9945,6 +9945,14 @@ static DriveOp remoteops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
     {OP_TEXTRCWD, 0, 0, 0, 300, ""},
+    // Its folders, listed there (dir) for the field's completion, which
+    // Esc then closes
+    {OP_TEXT, 0, 0, 0, 2000, "/"},
+    {OP_CHECK, CHK_PATHPICK, 1, 0, 0, "nested"},
+    {OP_SHOT, 0, 0, 0, 300, "remote-1-pathpick"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_PATHPICK, 0, 0, 0, ""},
     {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},

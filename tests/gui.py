@@ -1236,6 +1236,7 @@ class Far:
             host.mkdir(self.state)
             host.write(self.config, cfg)
             host.write(self.work + "/hello.txt", "hello world\n")
+            host.mkdir(self.work + "/nested")  # for the directory's completion
             if self.windows:
                 self.ssh = host.path("fakessh.exe")
                 host.write(host.path("fakessh.c"), FAKESSH_C)
@@ -1256,7 +1257,7 @@ class Far:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True)
         else:
-            self.sh(f"mkdir -p {self.work} {self.state} && "
+            self.sh(f"mkdir -p {self.work}/nested {self.state} && "
                     f"echo 'hello world' > {self.work}/hello.txt")
             b = cfg.replace("'", "")
             self.sh(f"cat > {self.config} <<'EOF'\n{b}EOF\n")
