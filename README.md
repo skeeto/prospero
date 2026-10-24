@@ -600,7 +600,9 @@ A remote machine needs an engine built for its platform, which
 `prospero deploy` uploads with scp to `~/.prospero` there, as
 `engine-PROTO-VERSION-OS-ARCH`, verifies it by its SHA-256, and
 records where it went, for connecting. With `deploy = auto` in its
-section, connecting deploys one when the machine has none. Engines come
+section, connecting deploys one when the machine has none; with the
+default, `ask`, a failed connection offers Deploy engine in the Hosts
+pane. Engines come
 from the `engines` directory next to the executable, named
 `prospero-engine-VERSION-OS-ARCH`, or are the executable itself when it
 is built for that platform. `tools/engines.py` builds them: macOS

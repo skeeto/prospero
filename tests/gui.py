@@ -1294,7 +1294,11 @@ class Far:
         return (f"\n# The checklist's remote host\n[remote r]\nssh = {dest}\n"
                 f"path = {self.prospero}\nstate = {self.state}\nconfig = {self.config}\n"
                 f"\n# One that fails: ssh would take its destination for an option\n"
-                f"[remote bad]\nssh = -oProxyCommand=false\n")
+                f"[remote bad]\nssh = -oProxyCommand=false\n"
+                + (f"\n# One with no engine there (no path, and none on PATH\n"
+                   f"# here), which offers to deploy one\n"
+                   f"[remote missing]\nssh = {dest}\nstate = {self.state}-missing\n"
+                   f"config = {self.config}\n" if self.local else ""))
 
     def env(self):
         return {"PROSPERO_TEST_SSH": self.ssh} if self.local else {}

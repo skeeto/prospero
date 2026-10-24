@@ -408,6 +408,7 @@ struct GuiHost {
     Mailbox *inbox;     // its records, which wake the GUI
     i32      state;     // RS_*, from its "remote" records
     Str      msg;       // why it is down, or failed
+    b32      deploys;   // failed, where deploying an engine would help
     i64      retryat;   // epoch ms: it tries again then, while down
     b32      up;        // it answered hello
     b32      closing;   // asked to close: its records are let go
@@ -4585,7 +4586,9 @@ static b32 remoteignored(Gui *g, Str name, Str key)
 
 // Connect to a [remote NAME] over ssh, as its section says. The ssh
 // program is "ssh", or PROSPERO_TEST_SSH (a test hook).
-static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name)
+// With deploy, an engine is deployed there if it has none or one of
+// another protocol, as [remote NAME] deploy = auto has it always.
+static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
 {
     GuiHost *h = findhost(g, GH_REMOTE, name);
     h = h ? h : addhost(g, GH_REMOTE, name);
@@ -4600,7 +4603,8 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name)
     rc.rconfig    = remoteset(g, name, "config");
     rc.program    = os_getenv(g->os, &scratch, "PROSPERO_TEST_SSH");
     rc.localstate = g->statedir;
-    rc.deploy     = remoteset(g, name, "deploy") == "auto";
+    rc.deploy     = deploy || remoteset(g, name, "deploy")=="auto";
+    h->deploys    = 0;
     if (!rc.ssh.len && remoteignored(g, name, "ssh")) {
         h->state = RS_FAILED;
         h->msg   = "its ssh is set in an included file, which cannot choose "
@@ -4669,6 +4673,7 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
     }
     h->msg     = h->msg==msg ? h->msg : clone(&g->perm, msg);
     h->retryat = r->ts + jsonint(jsonget(r->root, "retry_ms"), 0);
+    h->deploys = h->state==RS_FAILED && jsonstr(jsonget(r->root, "deploy")).len;
     h->up      = h->state == RS_UP;
     h->downs  += h->state==RS_DOWN && was!=RS_DOWN;
     if (h->up) {
@@ -7926,6 +7931,8 @@ enum : i32 {
     CHK_HELPPAGE,     // Help shows the topic whose page starts with text
     CHK_HELPNARROW,   // dx 1: Help's topics are a combo above the page; 0 a list
     CHK_HELPCOPY,     // the clipboard has Help's page, selected whole
+    CHK_DEPLOYOFFER,  // the remote "missing" failed with no engine there,
+                      // Deploy engine offered; "bad" not offered it
     CHK_COUNT,
 };
 
@@ -8128,6 +8135,7 @@ static Str chknames[] = {
     "Help shows the topic picked, its page from the top",
     "Help's topics are a combo when narrow, else a list beside the page",
     "Help's page, selected whole, copied as its text",
+    "a remote with no engine there failed, and Deploy engine is offered",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -8183,6 +8191,7 @@ enum : i32 {
     W_PICKED,     // the box's context menu closed, its pick's chord
                   // taken in
     W_DRAFTS,     // every draft sent was answered, so kept
+    W_DEPLOYOFFER,// the remote "missing" failed, offering to deploy
 };
 
 static Str waitnames[] = {
@@ -8197,9 +8206,9 @@ static Str waitnames[] = {
     "the includes", "the thumbnails", "the screenshot", "reasoning",
     "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
     "a named item", "a launch to hand off", "the import", "the export",
-    "the plan", "the menu's pick", "the drafts kept",
+    "the plan", "the menu's pick", "the drafts kept", "the offer to deploy",
 };
-static_assert(countof(waitnames) == W_DRAFTS+1);
+static_assert(countof(waitnames) == W_DEPLOYOFFER+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -10126,6 +10135,13 @@ static DriveOp remoteops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 5000, ""},
     {OP_CHECK, CHK_REMOTEFAILED, 0, 0, 0, ""},
+    // One with no engine there fails too, offering to deploy one, which
+    // the checklist leaves alone
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect missing"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_DEPLOYOFFER, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_DEPLOYOFFER, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-1-hosts"},
     // A session there, through the dialog
     {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
@@ -11591,6 +11607,17 @@ static ImgCount imgcount(Gui *g)
     return r;
 }
 
+// Whether the configuration names the remote host name.
+static b32 hasremote(Gui *g, Str name)
+{
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        if (g->cfgrows[i].kind=="remote" && g->cfgrows[i].name==name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static b32 drivewaitdone(Gui *g)
 {
     View *v = g->view;
@@ -11645,6 +11672,10 @@ static b32 drivewaitdone(Gui *g)
     case W_REMOTEUP: {
         GuiHost *h = drivehost(g, GH_REMOTE);
         return h && h->up;
+    }
+    case W_DEPLOYOFFER: {
+        GuiHost *h = findhost(g, GH_REMOTE, "missing");
+        return !hasremote(g, "missing") || (h && h->state==RS_FAILED && h->deploys);
     }
     case W_REMOTEDOWN: {
         GuiHost *h = drivehost(g, GH_REMOTE);
@@ -13290,6 +13321,19 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_OWNNEW:
         return g->sess && g->main->own && g->sess->host==g->main && v->cwd.len &&
                !g->sess->readonly;
+    case CHK_DEPLOYOFFER: {
+        if (!hasremote(g, "missing")) {
+            return 1;  // only through the fake ssh, where none is on PATH
+        }
+        GuiHost *h   = findhost(g, GH_REMOTE, "missing");
+        GuiHost *bad = findhost(g, GH_REMOTE, "bad");
+        b32      btn = 0;
+        for (i32 i = 0; i < g->nnamed; i++) {
+            btn |= Str{g->named[i].name, g->named[i].len} == "deploy engine";
+        }
+        return h && h->state==RS_FAILED && !h->r && h->deploys &&
+               bad && !bad->deploys && btn;
+    }
     case CHK_REMOTEFAILED: {
         GuiHost *h = findhost(g, GH_REMOTE, "bad");
         return h && h->state==RS_FAILED && !h->r && g->failshown &&

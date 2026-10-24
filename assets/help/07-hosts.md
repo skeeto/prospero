@@ -48,8 +48,10 @@ uploads an engine with scp to `~/.prospero` there, and records where
 it went, for connecting. Engines come from an `engines` directory next
 to the executable, as releases name them, or are the executable itself
 when it is built for that platform. With `deploy = auto` in the
-remote's section, connecting deploys one when the machine has none;
-otherwise the connection fails, saying to run `prospero deploy`.
+remote's section, connecting deploys one when the machine has none.
+Otherwise (`deploy = ask`, the default) the connection fails, and the
+Hosts pane offers Deploy engine under the reason, which deploys one and
+connects; `prospero deploy NAME` does the same from a terminal.
 
 A remote whose engine is older than this program shows what it cannot
 do disabled, and its menu has Update engine, which deploys this

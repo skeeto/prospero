@@ -39,8 +39,9 @@ saying why.
 row in the sidebar, show why: the last line ssh printed, also kept in
 `remote/NAME.log` in the state directory. ssh runs in batch mode, so
 it never asks for a password or to accept a new host key: try `ssh
-HOST` in a terminal first, and use a key or an ssh agent. A machine with no engine needs `prospero
-deploy NAME` first, or `deploy = auto`. See
+HOST` in a terminal first, and use a key or an ssh agent. A machine
+with no engine needs one deployed: Deploy engine in the Hosts pane,
+`prospero deploy NAME`, or `deploy = auto`. See
 [Hosts and remotes](help:hosts).
 
 **A program is not found when started from the Finder, Dock or Start

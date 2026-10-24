@@ -5878,6 +5878,7 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
     if (rect >= 0) {
         itemrect(g, rect);
     }
+    itemnamed(g, concat(&a, "connect ", name));
     ImGui::SetItemTooltip(live ? "Leave it: its sessions run on there" :
                           closing ? "Connect again once it has let go" :
                                     "Connect over ssh, starting a host there if none runs");
@@ -5891,6 +5892,15 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         ImGui::TextWrapped("%s", cstr0(&a, h->msg));
         ImGui::PopStyleColor();
         g->failshown |= h->state == RS_FAILED;
+    }
+    // [remote NAME] deploy = ask: offered here, once it is known to help
+    if (h && h->deploys && !live && !closing) {
+        if (ImGui::SmallButton("Deploy engine")) {
+            remoteconnect(g, a, name, 1);
+        }
+        itemnamed(g, "deploy engine");
+        ImGui::SetItemTooltip("Copy this version's engine there, as prospero deploy "
+                              "does, then connect to it");
     }
     ImGui::PopID();
 }
