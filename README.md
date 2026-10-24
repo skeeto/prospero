@@ -33,11 +33,13 @@ later, or a recent Clang):
 The default build type is Release. Debug builds trap on undefined
 behavior (UBSan), failed assertions included. Dependencies are fetched
 at configure time, each pinned by URL and SHA-256: Dear ImGui (docking
-branch), md4c, FreeType and SDL3 for the GUI, and mbedTLS with
-cpp-httplib for HTTP on macOS and Linux. To build offline, or with a
+branch), md4c, FreeType and SDL3 for the GUI, mbedTLS with
+cpp-httplib for HTTP on macOS and Linux, and Wuffs's single-file
+release for decoding images everywhere. To build offline, or with a
 modified dependency, put its source under `deps/` (`deps/imgui`,
 `deps/md4c`, `deps/freetype`, `deps/sdl3`, `deps/mbedtls`,
-`deps/cpp-httplib`), and it is used instead.
+`deps/cpp-httplib`, and `deps/wuffs` holding `wuffs-v0.4.c`), and it
+is used instead.
 
 On Windows, build the same way from a [w64devkit][] shell, with CMake
 and Ninja on the PATH:
@@ -190,10 +192,13 @@ to the old machine: allowed directories and grants, snapshots and
 rewinds, spilled output files, images, subagents and jobs. The new
 session is titled "(imported)" and remembers the session it came from.
 
-Images go with a message, for a model that takes them: drop PNG or
-JPEG files on the window, paste one (or a copied image file), or pick
-them with the Image button. They wait as thumbnails above the prompt
-box until sent, at most ten to a message, and a large PNG is shrunk.
+Images go with a message, for a model that takes them: drop PNG,
+JPEG, GIF, WebP or BMP files on the window, paste one (or a copied
+image file), or pick them with the Image button. They wait as
+thumbnails above the prompt box until sent, at most ten to a message.
+A PNG or JPEG goes as it is; a GIF (its first frame), WebP or BMP goes
+as a PNG, and so does a large image, shrunk to fit. Images are decoded
+by [Wuffs][], which is memory-safe against hostile files.
 The session keeps them, so they go back to the model on every request,
 show in the transcript and come with a fork, but not with an export.
 `[model] vision = false` turns them off for a model that has none.
@@ -621,5 +626,11 @@ with the real helper. Each script's header says how to run it.
 Prospero is free and unencumbered software released into the public
 domain. See [UNLICENSE](UNLICENSE).
 
+Its programs include third-party code under its own licenses: Dear
+ImGui (MIT), FreeType (FTL), md4c (MIT), SDL3 (zlib), cpp-httplib
+(MIT), Mbed TLS (Apache-2.0), and Wuffs (Apache-2.0 or MIT, at your
+option), which every program with the engine includes.
+
 [uv]: https://docs.astral.sh/uv/
+[Wuffs]: https://github.com/google/wuffs
 [w64devkit]: https://github.com/skeeto/w64devkit
