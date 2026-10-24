@@ -438,6 +438,7 @@ struct GuiSession {
     i32          state;     // LIVE_*, from the list until opened
     Str          title;     // from the list until opened
     Str          cwd;
+    b32          nofolder;  // cwd is a folder of its own, from the list
     Str          model;
     Str          parent;    // a subagent's, from the list until opened
     i64          mtime;
@@ -744,11 +745,13 @@ struct Import {
     Str      title;      // and from its records: the latest title, the
     Str      cwd;        // session record's cwd, and the model as the
     Str      model;      // latest model record left it
+    b32      nofolder;   // and whether that cwd was a folder of its own
     GuiHost *filled;     // the host the dialog was filled for
     b32      modelwait;  // its models were yet to come
     GuiHost *to;         // where it goes, as what the dialog said
     Str      newcwd;
     Str      newmodel;
+    b32      newnofolder;
     Str      token;      // the upload's, once the first part is in
     i64      off;        // bytes uploaded
     i64      id;         // the command in flight
@@ -961,6 +964,12 @@ struct Gui {
     i32                raises;     // launches that handed off to this window
     b32                raisereq;   // between frames: come forward for one
     Str                raisetoken; // its activation token (Wayland)
+    Slice<Str>         raisedirs;  // and directories for new sessions
+    Str                opendir;    // prospero DIR: a session there after hello
+    i64                opendup;    // until then, ticks, an open event for it
+                                   // (macOS, of the argument) is ignored
+    i32                opened;     // sessions asked for by launches and opens
+    b32                detached;   // prospero DIR detached: stderr is gui.log
     Str                hosterr;    // why this process could not host
     Str                whynobg;    // why it cannot, as the close dialog opened
     i32                hostfound;  // background hosts found at startup
@@ -1004,8 +1013,10 @@ struct Gui {
     GuiHost           *browsehost; // and the host it was for
     i64                browsed;    // directories it answered, for the checklist
     b32                browseoff;  // and it is off, the host remote
+    b32                cwdoff;     // the directory's field is off: No folder
     b32                opennew;
     b32                newplan;    // in plan mode
+    b32                newnofolder;// in a folder of its own, not newcwd
     i64                newid;      // the new command in flight
     char              *denynote;   // "Deny with note"
     Str                denyreq;
@@ -1243,7 +1254,9 @@ static void guilog(Gui *g, Str msg)
     print(&b, "prospero: ");
     print(&b, msg);
     putbyte(&b, '\n');
-    os_print(g->os, 2, finish(&b));
+    if (!g->detached) {
+        os_print(g->os, 2, finish(&b));  // else it is the log already
+    }
     if (g->logfd >= 0) {
         os_logwrite(g->os, g->logfd, finish(&b));
     }
@@ -2154,15 +2167,21 @@ static void imgdrop(Gui *g, GuiSession *s)
     }
 }
 
-// A new session in cwd, with the given model or the configured one,
-// and a role ([role NAME]), if named, in plan mode if asked.
-static void guinew(Gui *g, GuiHost *h, Str cwd, Str model, Str role = {}, b32 plan = 0)
+// A new session in cwd, or with nofolder in a folder of its own, with
+// the given model or the configured one, and a role ([role NAME]), if
+// named, in plan mode if asked.
+static void guinew(Gui *g, GuiHost *h, Str cwd, Str model, Str role = {}, b32 plan = 0,
+                   b32 nofolder = 0)
 {
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 512 + cwd.len + model.len + role.len);
     EvOut w = cmdopen(g, &b, CMD_NEW, 0, h);
-    putkey(&w.json, "cwd");
-    putstr(&w.json, cwd);
+    if (nofolder) {
+        putintkey(&w.json, "nofolder", 1);
+    } else {
+        putkey(&w.json, "cwd");
+        putstr(&w.json, cwd);
+    }
     if (model.len) {
         putkey(&w.json, "model");
         putstr(&w.json, model);
@@ -2676,6 +2695,7 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         Str parent = jsonstr(jsonget(e, "parent"));
         s->title  = s->title==title   ? s->title  : clone(&g->perm, title);
         s->cwd    = s->cwd==cwd       ? s->cwd    : clone(&g->perm, cwd);
+        s->nofolder = jsonint(jsonget(e, "nofolder"), 0) == 1;
         s->model  = s->model==model   ? s->model  : clone(&g->perm, model);
         s->parent = s->parent==parent ? s->parent : clone(&g->perm, parent);
         s->mtime  = jsonint(jsonget(e, "mtime"), 0);
@@ -3023,11 +3043,48 @@ static void browsestart(Gui *g, GuiHost *h)
     }
 }
 
-// A dropped file, attached to the draft shown.
-static void gui_drop(Gui *g, Str path)
+static void fieldput(char *, Str);
+
+// A new session in dir, with the configured model, in Build mode, as a
+// launch (prospero DIR) or an open event asked (why): shown once made,
+// or failing that, the new session dialog with dir and the error.
+static void opendirnew(Gui *g, Str dir, Str why)
+{
+    Arena a = g->frame;
+    g->opened++;
+    g->newhost = g->main;
+    fieldput(g->newcwd, dir);
+    guilog(g, concat(&a, concat(&a, concat(&a, "a new session in ", dir), ", as "), why));
+    guinew(g, g->main, dir, {});
+}
+
+// A dropped file, attached to the draft shown. A directory has a new
+// session there instead: at once if opened in the application (app:
+// Finder, the Dock, open -a), else through the new session dialog,
+// dropped on the window perhaps only to be attached. The open event
+// macOS makes of prospero DIR's argument is ignored, as the launch has
+// that session already.
+static void gui_drop(Gui *g, Str path, b32 app)
 {
     GuiSession *s = g->sess;
     g->drops++;
+    if (os_stat(g->os, g->frame, path).type == STAT_DIR) {
+        Str real = os_realpath(g->os, &g->frame, path);  // until the next frame
+        real = real.len ? real : path;
+        if (app && g->opendup && os_ticks(g->os)<g->opendup && real==g->opendir) {
+            g->opendup = 0;
+            guilog(g, "the launch's directory came as an open event too: ignored");
+        } else if (app) {
+            opendirnew(g, real, "opened in the application");
+        } else {
+            g->newhost = g->main;
+            g->newerr  = {};
+            g->opennew = 1;
+            fieldput(g->newcwd, real);
+        }
+        scheddirty(&g->sched);
+        return;
+    }
     Str err = attachfile(g, s, path);
     if (err.len && s) {
         setnote(g, s, concat(&g->frame, "not attached: ", err), 1);
@@ -3480,6 +3537,23 @@ static void hostcaps(Gui *g, GuiHost *h, Json *j)
 static Str homeshow(Arena *a, GuiHost *h, Str path)
 {
     return h ? tildeform(a, path, h->home) : path;
+}
+
+// Whether a session works in a folder of its own (new {nofolder}), as
+// its view has it, else as the list does.
+static b32 sessnofolder(GuiSession *s)
+{
+    View *v = s->view;
+    return v && v->cwd.len ? v->nofolder : s->nofolder;
+}
+
+// Where a session works, as shown: "No folder" for a folder of its own,
+// whose path in the state directory says nothing, else its directory.
+static Str sesswhere(Arena *a, GuiSession *s)
+{
+    View *v   = s->view;
+    Str   cwd = v && v->cwd.len ? v->cwd : s->cwd;
+    return sessnofolder(s) ? Str("No folder") : homeshow(a, s->host, cwd);
 }
 
 // Whether a host's engine takes a command, or has a feature, by name:
@@ -4914,6 +4988,7 @@ static void importread(Gui *g, Str path)
     }
     x->cwd   = clone(&x->mem, jsonstr(jsonget(e.root, "cwd")));
     x->model = clone(&x->mem, jsonstr(jsonget(e.root, "model")));
+    x->nofolder = jsonint(jsonget(e.root, "nofolder"), 0) == 1;
     x->title = {};
     for (Str rest = c.tail; rest.len;) {
         Cut l = cut(rest, '\n');
@@ -4962,7 +5037,11 @@ static void importnext(Gui *g)
     Buf   b(&a, 256 + x->newcwd.len + x->newmodel.len);
     EvOut w = cmdopen(g, &b, CMD_IMPORT, 0, x->to);
     putstrkey(&w.json, "token", x->token);
-    putstrkey(&w.json, "cwd", x->newcwd);
+    if (x->newnofolder) {
+        putintkey(&w.json, "nofolder", 1);
+    } else {
+        putstrkey(&w.json, "cwd", x->newcwd);
+    }
     if (x->newmodel.len) {
         putstrkey(&w.json, "model", x->newmodel);
     }
@@ -4971,11 +5050,13 @@ static void importnext(Gui *g)
     cmdsend(g, &w, a);
 }
 
-// The dialog's Import: the log goes to the host, from its start.
-static void importbegin(Gui *g, GuiHost *h, Str cwd, Str model)
+// The dialog's Import: the log goes to the host, from its start, to
+// work in cwd, or with nofolder in a folder of its own.
+static void importbegin(Gui *g, GuiHost *h, Str cwd, Str model, b32 nofolder)
 {
     Import *x = &g->imp;
     x->to       = h;
+    x->newnofolder = nofolder;
     x->newcwd   = clone(&x->mem, cwd);
     x->newmodel = clone(&x->mem, model);
     x->token    = {};
@@ -5151,12 +5232,16 @@ static void ontask(Gui *g, Record r)
         h->updating = UPD_CHECKING;
         h->updmsg   = "deployed: is its host idle?";
     } return;
-    case TASK_RAISE:
+    case TASK_RAISE: {
+        DoorRaise d = doorraised(r.data);
         g->raises++;
         g->raisereq   = 1;
-        g->raisetoken = clone(&g->perm, r.data);
+        g->raisetoken = clone(&g->perm, d.token);
+        if (d.cwd.len) {
+            g->raisedirs = push(&g->perm, g->raisedirs, clone(&g->perm, d.cwd));
+        }
         scheddirty(&g->sched);
-        return;
+    } return;
     case MAIL_OUT: {
         // A deployment's progress, by the remote's name
         Arena a = g->frame;
@@ -5441,6 +5526,8 @@ static void gui_tray(Gui *g, i32 item)
 // a shed window opening with the launcher's activation token. A window
 // up already gets only what os_guiraise can do, which under Wayland is
 // an attention hint, as the token is good only for a window's showing.
+// A launch with a directory (prospero DIR) has a new session there, to
+// which a window brought back holds the command until its host's hello.
 static void raisenow(Gui *g)
 {
     g->raisereq = 0;
@@ -5450,22 +5537,38 @@ static void raisenow(Gui *g)
         os_guitoken(g->os, g->raisetoken);
     }
     gui_tray(g, TRAY_OPEN);
+    for (iz i = 0; i < g->raisedirs.len; i++) {
+        opendirnew(g, g->raisedirs[i], "another launch asked");
+    }
+    g->raisedirs = {};
 }
 
 // This launch found the state directory's window lock held: ask its
-// window to come forward instead, given half a second to be found (it
-// may be starting), and exit. Returns the exit status.
+// window to come forward instead, with a new session in the launch's
+// directory, if any, given half a second to be found (it may be
+// starting), and exit. Returns the exit status. The session starts in
+// the window's process, so it has that one's environment, not this one's.
 static i32 handoff(Gui *g)
 {
     Os   *os    = g->os;
     Arena a     = g->frame;
     Str   token = os_getenv(os, &a, "XDG_ACTIVATION_TOKEN");
-    Knock k     = knock(os, &g->perm, a, g->statedir, token, 500, os_guiletfront);
-    Buf   b(&a, 256 + g->statedir.len);
+    Knock k     = knock(os, &g->perm, a, g->statedir, token, g->opendir, 500,
+                        os_guiletfront);
+    Buf   b(&a, 256 + g->statedir.len + g->opendir.len);
     if (k.ok) {
         print(&b, "prospero: a window has this state directory already, process ");
         print(&b, k.pid);
-        print(&b, ": brought it forward\n");
+        print(&b, ": brought it forward");
+        if (k.opens) {
+            print(&b, ", with a new session in ");
+            print(&b, g->opendir);
+        } else if (g->opendir.len) {
+            print(&b, ", but it is too old to start a session in ");
+            print(&b, g->opendir);
+            print(&b, ": quit it and launch again");
+        }
+        putbyte(&b, '\n');
         os_print(os, 2, finish(&b));
         return 0;
     }
@@ -7231,6 +7334,8 @@ enum : i32 {
                   // (a flat gray JPEG if text ends in .jpg)
     OP_CLIPPNG,   // the clipboard's text kept, a dx by dy PNG put there
     OP_CLIPBACK,  // the clipboard's text put back
+    OP_OPENDIR,   // an open event (macOS: open -a) for the directory text
+                  // in --cwd, or the launch's (prospero DIR) if empty
 };
 
 enum : i32 {
@@ -7530,6 +7635,12 @@ enum : i32 {
     CHK_PLANQUIET,    // the session is idle, asking nothing
     CHK_PLANREVISED,  // the agent heard the plan approved was revised by hand
     CHK_BYPASS,       // dx 1: the session shown is in Bypass, chip and label red; 0 not
+    CHK_LAUNCHDIR,    // the session shown is in the launch's directory (DIR)
+    CHK_OPENED,       // dx sessions asked for by launches and open events,
+                      // the one shown in a directory ending in text, if any
+    CHK_HANDEDDIR,    // the session shown is in --cwd, as a launch handed off
+    CHK_NOFOLDERBOX,  // the new session dialog's No folder is ticked
+    CHK_NOFOLDER,     // the session shown is in a folder of its own
     CHK_COUNT,
 };
 
@@ -7718,6 +7829,11 @@ static Str chknames[] = {
     "the session is idle and asks nothing: the agent was not told",
     "the agent heard that the plan it carries out was revised by hand",
     "Bypass mode is on or off as it should be, in red when on",
+    "the launch's directory has the session shown, made after hello",
+    "launches and open events asked for as many sessions as they should",
+    "the second launch's directory has the session shown, the window up",
+    "No folder is ticked, the directory's field and Browse off",
+    "the session shown works in a folder of its own, shown as No folder",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9912,6 +10028,57 @@ static DriveOp planops[] = {
     {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
     {OP_CHECK, CHK_BYPASS, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-9-build"},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
+// prospero DIR (tests/gui.py --mode launch, which starts this window as
+// "prospero gui --launch DIR"): the session in DIR made after hello,
+// macOS's open event for the same DIR ignored, another launch's directory
+// (--cwd) handed off as a new session shown in a window brought up, an
+// open event for another directory, and a session with no folder from
+// the new session dialog.
+static DriveOp launchops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_LAUNCHDIR, 0, 0, 0, ""},
+    {OP_OPENDIR, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_OPENED, 1, 0, 0, ""},
+    {OP_CHECK, CHK_LAUNCHDIR, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "launch-1-dir"},
+    // tests/gui.py launches "prospero --cwd's" now
+    {OP_TOUCH, 0, 0, 0, 0, "launch-ready"},
+    {OP_WAIT, W_RAISED, 1, 0, 60000, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_HANDEDDIR, 0, 0, 0, ""},
+    {OP_CHECK, CHK_OPENED, 2, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "launch-2-handed"},
+    // An open event for a directory not seen yet: a session there
+    {OP_OPENDIR, 0, 0, 0, 300, "opened"},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_OPENED, 3, 0, 0, "/opened"},
+    // No folder, from the dialog
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new nofolder"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_NOFOLDERBOX, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "launch-3-nofolder"},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOFOLDER, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "launch-4-session"},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -12235,6 +12402,30 @@ static b32 drivecheck(Gui *g, i32 chk)
         return !g->edsess && g->planedits>0 && m && m->tool->kind=="plan" &&
                m->tool->answer==VASK_PENDING && find(m->text, g->ops[g->drivepc-1].text)>=0;
     }
+    case CHK_LAUNCHDIR:
+        return g->sess && g->opendir.len && v->cwd==g->opendir && !v->nofolder &&
+               g->opened>=1 && !g->sess->readonly;
+    case CHK_OPENED: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        return g->opened==(i32)op->dx &&
+               (!op->text.len || (g->sess && endswith(v->cwd, op->text)));
+    }
+    case CHK_HANDEDDIR: {
+        Arena a    = g->frame;
+        Str   real = os_realpath(g->os, &a, g->drivecwd);
+        return g->sess && real.len && v->cwd==real && !(real==g->opendir) &&
+               g->raises>=1 && !g->bg && !g->raisereq && !g->raisedirs.len;
+    }
+    case CHK_NOFOLDERBOX:
+        return g->newnofolder && g->cwdoff && ImGui::GetTopMostPopupModal();
+    case CHK_NOFOLDER: {
+        Arena a    = g->frame;
+        Str   base = os_realpath(g->os, &a, statepath(g, "sessions"));
+        return g->sess && v->nofolder && sessnofolder(g->sess) && base.len &&
+               within(normpath(&a, base, ".", HOST_WINDOWS),
+                      normpath(&a, v->cwd, ".", HOST_WINDOWS), HOST_WINDOWS) &&
+               sesswhere(&a, g->sess)=="No folder" && !g->sess->readonly;
+    }
     case CHK_PLANMODEL:
         return g->sess && v->busy && planwaits(v) &&
                !sesswhy(g, g->sess, "model", !planwaits(v), 0).len;
@@ -12733,6 +12924,14 @@ static void drivestep(Gui *g)
         ImGui::SetClipboardText(cstr0(&a, g->clipkept));
         g->clippng = {};
     } break;
+    case OP_OPENDIR: {
+        // In perm, as gui_drop uses the frame's scratch
+        Str dir = op->text.len ? join(&g->perm, g->drivecwd, op->text) : g->opendir;
+        if (op->text.len) {
+            os_mkdirs(g->os, g->frame, dir);
+        }
+        gui_drop(g, dir, 1);
+    } break;
     case OP_HOLD:
         g->holduntil = g->sched.now + (i64)op->dx*1000;
         break;
@@ -13032,9 +13231,56 @@ static void drivestep(Gui *g)
 
 // Setup
 
+// Whether the arguments ask for the window: none, gui and its options,
+// or a directory for a new session (prospero DIR), any first argument
+// that is neither an option nor one of app_main's commands.
 static b32 guiwanted(Str *args, i32 nargs)
 {
-    return nargs<2 || args[1]=="gui";
+    static Str const cmds[] = {
+        "run", "serve", "attach", "hosts", "connect", "deploy", "eval",
+    };
+    if (nargs<2 || args[1]=="gui") {
+        return 1;
+    } else if (!args[1].len || args[1][0]=='-') {
+        return 0;
+    }
+    for (i32 i = 0; i < countof(cmds); i++) {
+        if (args[1] == cmds[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// prospero DIR, with no window on the state directory yet: the window
+// goes on in a process detached from this one and from its terminal,
+// which has its prompt back, as this program again with the same
+// arguments and --detached, in the same directory and environment. Its
+// errors go to the state directory's gui.log. Should another launch's
+// window take the lock first, it hands off to that one. Returns the
+// exit status.
+static i32 detachgui(Gui *g, Str *args, i32 nargs, Str here)
+{
+    Os        *os   = g->os;
+    Arena      a    = g->frame;
+    Slice<Str> argv = {};
+    for (i32 i = 0; i < nargs; i++) {
+        argv = push(&a, argv, args[i]);
+    }
+    argv = push(&a, argv, Str("--detached"));
+    Str log = join(&a, g->statedir, "gui.log");
+    os_mkdirs(os, a, g->statedir);  // for the log
+    Detached d = os_detach(os, a, argv, here.len ? here : Str("."), log);
+    if (!d.pid) {
+        Str err = os_lasterr(os, &a);
+        Buf b(&a, 256 + err.len);
+        print(&b, "prospero: cannot start the window: ");
+        print(&b, err);
+        putbyte(&b, '\n');
+        os_print(os, 2, finish(&b));
+        return 1;
+    }
+    return 0;
 }
 
 // A font for each style, from fonts.cpp: prose falls back on code's font
@@ -13092,6 +13338,9 @@ static i64 optint(Str *args, i32 nargs, i32 *i)
 
 static Str guiusage =
 "usage: prospero [gui [options]]\n"
+"       prospero [gui] DIR [options]\n"
+"  DIR            a new session in DIR: in the window open already, else\n"
+"                 in a new one, which goes on detached (POSIX)\n"
 "  -c FILE        configuration file (default: prospero.ini, as for run)\n"
 "  --statedir DIR sessions, layout file and log (default: the state dir)\n"
 "  --engine=MODE  inproc (default) or subprocess: \"prospero --headless\"\n"
@@ -13121,6 +13370,8 @@ static Str guiusage =
 "  --compose-again  its drafts after a restart, in the same directories\n"
 "  --plan         plan mode's checklist: the dialog, the plan's ask, the\n"
 "                 Plan window, the toggle and /plan\n"
+"  --launch       prospero DIR's checklist: DIR's session, another launch's\n"
+"                 handed off (tests/gui.py drives it), a session with no folder\n"
 "  --host-idle S  in the background, exit S seconds after the last\n"
 "                 session ends with no window (default: [host] idle_exit)\n"
 "  --probe        staleness probe on (default in debug builds)\n"
@@ -13285,7 +13536,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
+    b32 launch = 0;
     i64 history = 0;
+    Str opendir = {};  // prospero DIR, as given
     i32 bench   = 0;
     for (i32 i = 1 + (nargs>1 && args[1]=="gui"); i < nargs; i++) {
         Str a = args[i];
@@ -13322,6 +13575,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             remote = probe = 1;
         } else if (a == "--compose") {
             compose = probe = 1;
+        } else if (a == "--launch") {
+            launch = probe = 1;
         } else if (a == "--plan") {
             plan = probe = 1;
         } else if (a == "--compose-again") {
@@ -13361,6 +13616,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         } else if (a == "--host-idle") {
             i64 s = optint(args, nargs, &i);
             g->hostidle = s>0 ? s*1000000 : 0;
+        } else if (a == "--detached") {
+            g->detached = 1;  // detachgui's: the window, its launch gone
+        } else if (a.len && a[0]!='-' && !opendir.len) {
+            opendir = a;
         } else {
             os_print(os, 2, guiusage);
             return 1;
@@ -13372,9 +13631,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     }
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
-            background || attach || remote || compose || sidebar || plan) {
+            background || attach || remote || compose || sidebar || plan || launch) {
         g->drive = 1;
-        if (plan) {
+        if (launch) {
+            g->ops  = launchops;
+            g->nops = countof(launchops);
+        } else if (plan) {
             g->ops  = planops;
             g->nops = countof(planops);
         } else if (compose) {
@@ -13485,6 +13747,30 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     }
     if (!g->statedir.len) {
         g->statedir = defaultstate(os, &g->perm);
+    }
+    // prospero DIR: an existing directory, absolute, for a session there
+    // once the engine says hello, here or in the window open already
+    if (opendir.len) {
+        Str full = here.len ? normpath(&g->perm, here, opendir, HOST_WINDOWS) : opendir;
+        Str real = os_realpath(os, &g->perm, full);
+        if (!real.len || os_stat(os, g->frame, real).type!=STAT_DIR) {
+            Arena a = g->frame;
+            os_print(os, 2, concat(&a, concat(&a, "prospero: no such directory: ", opendir),
+                                   "\n"));
+            return 1;
+        }
+        g->opendir = real;
+        g->opendup = os_ticks(os) + (i64)30000*MS;
+    }
+    // From a terminal, the window goes on detached and the prompt comes
+    // back (POSIX; Windows' GUI programs never hold a console)
+    if (g->opendir.len && !g->detached && !g->drive && !HOST_WINDOWS && g->statedir.len) {
+        Arena a    = g->frame;
+        Str   path = guilockpath(&a, g->statedir);
+        if (os_lockheld(os, a, path)) {
+            return handoff(g);
+        }
+        return detachgui(g, args, nargs, here);
     }
     // One window per state directory (door.cpp), its lock held for this
     // process's life, the window gone to the background or not: a second
@@ -13602,6 +13888,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         guihello(g);
         guilist(g);
         guiconfigget(g);
+        if (g->opendir.len) {
+            opendirnew(g, g->opendir, "the launch asked");
+        }
     }
     if (!fake) {
         findhosts(g, g->frame);  // background hosts of the state directory

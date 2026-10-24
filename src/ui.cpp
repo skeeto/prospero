@@ -1602,7 +1602,7 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
     if (ImGui::BeginTable("##info", 2, ImGuiTableFlags_SizingFixedFit)) {
         inforow("Session", s->sid);
         inforow("Title", sesstitle(s));
-        inforow("Directory", v->cwd);
+        inforow("Directory", v->nofolder ? Str("No folder") : v->cwd);
         inforow("Model", v->model);
         inforow("Endpoint", v->endpoint);
         if (v->role.len) {
@@ -4425,7 +4425,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
         itemrect(g, RECT_OTHERSESS);
         *other = 1;
     }
-    Str cwd = v && v->cwd.len ? v->cwd : s->cwd;
+    Str cwd = sessnofolder(s) ? Str("No folder") : v && v->cwd.len ? v->cwd : s->cwd;
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
         Buf tip(&a, 256);
         print(&tip, cwd);
@@ -4519,7 +4519,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
         pen(&b, finish(&q), STYLE_BOLD, g->pal->active);
     }
     pen(&b, "  ", 0, g->pal->dim);
-    pen(&b, homeshow(&a, s->host, cwd), 0, g->pal->dim);
+    pen(&b, sesswhere(&a, s), 0, g->pal->dim);
     // Its context gauge, thin along the row's foot, where a view has it
     if (v && gaugewidth(g, v)>0 && p.x+w-4*sc-x >= 8) {
         gaugebar(g, dl, v, x, r1.y - 3*sc, p.x + w - 4*sc - x, 2*sc, sc);
@@ -5110,12 +5110,18 @@ static void importfill(Gui *g, GuiHost *h)
         for (iz i = 0; i < list.len; i++) {
             GuiSession *s = list[i];
             Str         d = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+            if (sessnofolder(s)) {
+                continue;  // a folder of its own, for it alone
+            }
             there |= x->cwd.len && d==x->cwd;
             newest = newest.len ? newest : d;
         }
+        there &= !x->nofolder;
         fieldput(g->newcwd, there              ? x->cwd     :
                             newest.len         ? newest     :
                             h->kind!=GH_REMOTE ? g->firstcwd : Str{});
+        // A session that had a folder of its own has one again
+        g->newnofolder = x->nofolder && hostcap(h, "nofolder");
     }
     if (x->modelwait && h!=g->main) {
         hostmodels(g, h);
@@ -5147,6 +5153,7 @@ static void drawnew(Gui *g)
         ImGui::OpenPopup(name);
         g->opennew = 0;
         g->newplan = 0;
+        g->newnofolder = 0;
     }
     ImGui::SetNextWindowSize(v2(560*sc, 0));
     if (!ImGui::BeginPopupModal(name, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -5202,6 +5209,22 @@ static void drawnew(Gui *g)
         ImGui::SameLine();
         ImGui::TextDisabled("on %s", cstr0(&a, host->name));
     }
+    // Or none: a folder of the session's own, which the directory's
+    // field, Browse and the recent ones then have nothing to do with
+    b32 canfree  = hostcap(host, "nofolder");
+    b32 nofolder = canfree && g->newnofolder;
+    if (canfree) {
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12*sc);
+        checkbox("No folder", &g->newnofolder);
+        itemnamed(g, "new nofolder");
+        ImGui::SetItemTooltip("No project: the session works in a folder of its own, "
+                              "kept with it and deleted with it");
+        nofolder = g->newnofolder;
+    }
+    ImGui::BeginDisabled(nofolder);
+    g->cwdoff = nofolder;
+
     // Beside it, Browse, in the platform's dialog, for a directory here
     char const *browse = "Browse\xe2\x80\xa6";
     f32 bw = ImGui::CalcTextSize(browse).x + 2*ImGui::GetStyle().FramePadding.x;
@@ -5224,12 +5247,12 @@ static void drawnew(Gui *g)
                            host->name)
                   : Str("Choose the directory in a dialog"));
 
-    // Recent directories there, newest first
+    // Recent directories there, newest first, not folders of sessions' own
     Slice<GuiSession *> list   = sesslist(g, &a);
     Slice<Str>          recent = {};
     for (iz i = 0; i<list.len && recent.len<8; i++) {
         Str cwd = list[i]->view && list[i]->view->cwd.len ? list[i]->view->cwd : list[i]->cwd;
-        b32 dup = !cwd.len || list[i]->host!=host;
+        b32 dup = !cwd.len || list[i]->host!=host || sessnofolder(list[i]);
         for (iz k = 0; !dup && k < recent.len; k++) {
             dup = recent[k] == cwd;
         }
@@ -5248,6 +5271,7 @@ static void drawnew(Gui *g)
             ImGui::PopID();
         }
     }
+    ImGui::EndDisabled();
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Model");
@@ -5283,9 +5307,9 @@ static void drawnew(Gui *g)
         Str cwd   = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
         Str model = trim({(u8 *)g->newmodel, (iz)__builtin_strlen(g->newmodel)});
         if (import) {
-            importbegin(g, host, cwd, model);
+            importbegin(g, host, cwd, model, nofolder);
         } else {
-            guinew(g, host, cwd, model, {}, plan && g->newplan);
+            guinew(g, host, cwd, model, {}, plan && g->newplan, nofolder);
         }
         ImGui::CloseCurrentPopup();
     }

@@ -6,18 +6,24 @@
 // thread of its own (opendoor). A launch that finds the lock held knocks
 // at the door (knock), and goes:
 //
-//   newcomer: {"raise":1,"token":T}   T: its XDG_ACTIVATION_TOKEN, if any
-//   window:   {"ok":1,"pid":N}
+//   newcomer: {"raise":1,"token":T,"cwd":D}
+//                                     T: its XDG_ACTIVATION_TOKEN, if any
+//                                     D: a directory (prospero DIR), if any
+//   window:   {"ok":1,"pid":N,"new":1}
+//                                     "new" if it takes D, which a window
+//                                     from before D ignores
 //   newcomer: {"go":1}                after AllowSetForegroundWindow(N)
 //   window:   ends the connection,    having posted the raise
 //
 // The window takes the raise as a record of the type it chose in its
-// mailbox, with the token as payload, and comes forward as the tray's
-// Open brings it. A connection that ends after the raise request without
-// "go" raises all the same. A newcomer that finds nobody at the door
-// (the window still starting) tries again for a while. The kernel lets
-// the lock go with its process, however that ends, and a door left by a
-// dead process refuses connections until the next window replaces it.
+// mailbox, with the token and the directory as payload (doorraised),
+// comes forward as the tray's Open brings it, and starts a new session
+// in the directory, if any. A connection that ends after the raise
+// request without "go" raises all the same. A newcomer that finds nobody
+// at the door (the window still starting) tries again for a while. The
+// kernel lets the lock go with its process, however that ends, and a
+// door left by a dead process refuses connections until the next window
+// replaces it.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -58,11 +64,13 @@ enum : i32 {
 
 struct DoorReq {
     Str token;  // DOOR_RAISE: printable ASCII, else empty
+    Str cwd;    // DOOR_RAISE: a directory, else empty
     i32 kind;
 };
 
 // A newcomer's request line. A token that is too long or not printable
-// ASCII is dropped, as it goes into the environment.
+// ASCII is dropped, as it goes into the environment; so is a directory
+// with a null byte, which no path has.
 static DoorReq doorparse(Arena *a, Str line)
 {
     DoorReq r   = {};
@@ -82,7 +90,25 @@ static DoorReq doorparse(Arena *a, Str line)
         ok = tok[i]>0x20 && tok[i]<0x7f;
     }
     r.token = ok ? tok : Str{};
+    r.cwd   = jsonstr(jsonget(doc.root, "cwd"));
+    r.cwd   = cut(r.cwd, 0).ok ? Str{} : r.cwd;
     r.kind  = DOOR_RAISE;
+    return r;
+}
+
+// A raise's payload: the token, then, if a directory came, a null byte
+// and the directory.
+struct DoorRaise {
+    Str token;
+    Str cwd;
+};
+
+static DoorRaise doorraised(Str data)
+{
+    Cut       c = cut(data, 0);
+    DoorRaise r = {};
+    r.token = c.head;
+    r.cwd   = c.ok ? c.tail : Str{};
     return r;
 }
 
@@ -92,8 +118,8 @@ struct DoorConn {
     u64       id;
     u8       *line;    // DOOR_LINE bytes
     iz        len;
-    u8       *token;   // DOOR_TOKEN bytes
-    iz        toklen;
+    u8       *post;    // DOOR_LINE bytes: the raise's payload (doorraised)
+    iz        postlen;
     b32       asked;   // a raise request came
     b32       raised;  // and was posted
 };
@@ -114,7 +140,7 @@ static void doorraise(Door *d, DoorConn *k)
 {
     if (k->asked && !k->raised) {
         k->raised = 1;
-        mailpost(d->done, d->type, 0, {k->token, k->toklen}, 1);
+        mailpost(d->done, d->type, 0, {k->post, k->postlen}, 1);
     }
 }
 
@@ -137,13 +163,19 @@ static void doorline(Door *d, DoorConn *k, Str line)
             doorhangup(d, k);
             return;
         }
-        k->asked  = 1;
-        k->toklen = req.token.len;
-        copybytes(k->token, req.token.data, req.token.len);
+        // Both fit, as the line held them, escaped or not
+        k->asked   = 1;
+        k->postlen = req.token.len;
+        copybytes(k->post, req.token.data, req.token.len);
+        if (req.cwd.len) {
+            k->post[k->postlen++] = 0;
+            copybytes(k->post+k->postlen, req.cwd.data, req.cwd.len);
+            k->postlen += req.cwd.len;
+        }
         Buf b(&a, 64);
         print(&b, "{\"ok\":1,\"pid\":");
         print(&b, d->pid);
-        print(&b, "}\n");
+        print(&b, req.cwd.len ? Str(",\"new\":1}\n") : Str("}\n"));
         os_connwrite(d->os, k->c, finish(&b));
     } return;
     case DOOR_GO:
@@ -175,16 +207,16 @@ static void doorthread(void *arg)
                     d->free = k->next;
                 } else {
                     k = alloc<DoorConn>(&d->perm);
-                    k->line  = allocbytes(&d->perm, DOOR_LINE);
-                    k->token = allocbytes(&d->perm, DOOR_TOKEN);
+                    k->line = allocbytes(&d->perm, DOOR_LINE);
+                    k->post = allocbytes(&d->perm, DOOR_LINE);
                 }
                 Conn *c = 0;
                 copybytes(&c, r.data.data, sizeof(c));
-                u8 *line  = k->line;
-                u8 *token = k->token;
+                u8 *line = k->line;
+                u8 *post = k->post;
                 *k = {};
                 k->line  = line;
-                k->token = token;
+                k->post  = post;
                 k->c     = c;
                 k->id    = r.id;
                 k->next  = d->conns;
@@ -249,8 +281,9 @@ static Str opendoor(Os *os, Arena *perm, Arena scratch, Str statedir,
 }
 
 struct Knock {
-    i64 pid;  // the window's process
-    b32 ok;   // it answered, and comes forward
+    i64 pid;    // the window's process
+    b32 ok;     // it answered, and comes forward
+    b32 opens;  // and starts a session in the directory given
 };
 
 // Wait for records of connection 1 until the condition holds or the
@@ -281,11 +314,12 @@ static b32 knockwait(Os *os, Mailbox *mb, Buf *got, b32 *eof, i64 deadline, b32 
 
 // Knock at the door of the window that holds statedir, trying for up to
 // ms to find it, and ask it to come forward, passing on token (Wayland's
-// activation token, or empty). With letfront, the window's process may
+// activation token, or empty), and to start a new session in cwd unless
+// empty (an absolute directory). With letfront, the window's process may
 // take the foreground before it is told to go on (Windows). The mailbox
 // goes in perm, as the connection's records may outlive the call.
 static Knock knock(Os *os, Arena *perm, Arena scratch, Str statedir, Str token,
-                   i32 ms, void (*letfront)(Os *, i64 pid))
+                   Str cwd, i32 ms, void (*letfront)(Os *, i64 pid))
 {
     Knock    r  = {};
     Str      ep = doorendpoint(os, &scratch, statedir);
@@ -302,11 +336,14 @@ static Knock knock(Os *os, Arena *perm, Arena scratch, Str statedir, Str token,
         mailwait(mb, 50);
     }
 
-    Buf     req(&scratch, 64 + token.len);
+    Buf     req(&scratch, 64 + token.len + 6*cwd.len);
     JsonOut w = {&req};
     putobject(&w);
     putintkey(&w, "raise", 1);
     putstrkey(&w, "token", token);
+    if (cwd.len) {
+        putstrkey(&w, "cwd", cwd);
+    }
     putend(&w);
     putbyte(&req, '\n');
     Buf got(&scratch, DOOR_LINE);
@@ -329,8 +366,9 @@ static Knock knock(Os *os, Arena *perm, Arena scratch, Str statedir, Str token,
         letfront(os, pid);
     }
     os_connwrite(os, c, "{\"go\":1}\n");
-    r.pid = pid;
-    r.ok  = knockwait(os, mb, &got, &eof, os_ticks(os) + (i64)DOOR_WAIT*MS, 0);
+    r.pid   = pid;
+    r.opens = cwd.len && jsonint(jsonget(reply.root, "new"), 0)==1;
+    r.ok    = knockwait(os, mb, &got, &eof, os_ticks(os) + (i64)DOOR_WAIT*MS, 0);
     os_connclose(os, c);
     return r;
 }

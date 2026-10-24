@@ -1339,7 +1339,7 @@ static void hookdrop(void *p, unsigned short const *path)
     Gui *g = (Gui *)p;
     iz   n = 0;
     for (; path[n]; n++) {}
-    gui_drop(g, fromwide(&g->frame, (c16 *)path, n));  // until the next frame
+    gui_drop(g, fromwide(&g->frame, (c16 *)path, n), 0);  // until the next frame
 }
 
 static i32 os_guidisplays(Os *, WinBox *out, i32 max)

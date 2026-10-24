@@ -124,6 +124,7 @@ directory against them all at once:
 ## Usage
 
     prospero [gui [options]]
+    prospero [gui] DIR [options]
     prospero run [options] PROMPT
     prospero run [options] --resume SID [PROMPT]
     prospero --headless [options]
@@ -165,6 +166,18 @@ shows and hides the panes and zooms the text for the run (Ctrl+=,
 Ctrl+- and Ctrl+0, Cmd on macOS, or the wheel with the key held);
 `[ui] font_size` sets its size for good. The window opens where it was
 last, fitted to the displays there are.
+
+`prospero DIR`, such as `prospero .` in a terminal, opens a new
+session in that directory, in Build mode with the configured model,
+ready for a prompt. With no window open yet, the window goes on
+detached and the shell has its prompt back, as with `code .`, its
+errors going to `gui.log` in the state directory; the session has the
+terminal's environment. With a window open already, the session starts
+there, and that window comes forward: the session then has that
+window's environment, not the terminal's. On macOS, opening a folder
+with Prospero (`open -a Prospero DIR`, or dropping it on the Dock
+icon) does the same. A folder dropped on the window fills the New
+session dialog with it.
 
 The sidebar is a tree: groups, then hosts, then sessions with their
 subagents, and archived sessions folded away at the end. A session's
@@ -209,6 +222,13 @@ leading `~` there (`~`, `~/src`, and `~\src` on Windows) is the home
 directory of the host the session runs on, `HOME`, else `USERPROFILE`
 on Windows; `~user` is not supported. Paths in the home directory show
 as `~/...` in the sidebar and among the recent directories.
+
+A session needs no project: No folder, in the New and Import session
+dialogs, gives it a folder of its own instead, `sessions/SID/work` in
+the state directory, for general help with the machine. The agent works
+there freely, a fork gets a copy of it, and it is deleted with the
+session. Such a session has only your own instructions and skills,
+none of a project's, and shows as "No folder" in the sidebar.
 
 A message sent while a turn runs waits above the prompt box until the
 agent takes it in at its next step (or, too late for this turn, runs as

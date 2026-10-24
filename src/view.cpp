@@ -441,6 +441,7 @@ struct View {
     // The session
     Str             title;
     Str             cwd;
+    b32             nofolder;   // cwd is a folder of the session's own
     Str             model;
     Str             endpoint;
     Str             role;
@@ -1394,6 +1395,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
     switch (r->ev) {
     case EV_SESSION:
         v->cwd      = clone(&v->aux, jsonstr(jsonget(j, "cwd")));
+        v->nofolder = jsonint(jsonget(j, "nofolder"), 0) == 1;
         v->model    = clone(&v->aux, jsonstr(jsonget(j, "model")));
         v->endpoint = clone(&v->aux, jsonstr(jsonget(j, "endpoint")));
         v->role     = clone(&v->aux, jsonstr(jsonget(j, "role")));
@@ -3078,7 +3080,9 @@ static void viewexport(Buf *b, View *v, Str sid, b32 think, b32 tools, b32 outpu
         print(b, ", ");
         print(b, v->model);
     }
-    if (v->cwd.len) {
+    if (v->nofolder) {
+        print(b, ", with no folder");
+    } else if (v->cwd.len) {
         print(b, ", in ");
         codespan(b, v->cwd);
     }

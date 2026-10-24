@@ -1052,7 +1052,7 @@ static void testdoor(Selftest *t, Arena *perm, Arena scratch, Str dir)
     iz lb = guilock(os, scratch, b);
     check(t, lb >= 0, "another state directory's is its own");
 
-    Knock k = knock(os, perm, scratch, a, "tok", 200, 0);
+    Knock k = knock(os, perm, scratch, a, "tok", {}, 200, 0);
     check(t, !k.ok, "a knock with nobody at the door fails");
     Mailbox *mb  = newmailbox(perm, 1<<12, 0, 0);
     Str      err = opendoor(os, perm, scratch, a, mb, 77);
@@ -1060,7 +1060,7 @@ static void testdoor(Selftest *t, Arena *perm, Arena scratch, Str dir)
         say(os, err);
         return;
     }
-    k = knock(os, perm, scratch, a, "tok-1.2_X", 2000, 0);
+    k = knock(os, perm, scratch, a, "tok-1.2_X", {}, 2000, 0);
     check(t, k.ok && k.pid==os_pid(os), "a knock is answered, with the pid");
     Mail m = mailtake(mb);
     Record r = mailnext(&m);
@@ -1082,11 +1082,34 @@ static void testdoor(Selftest *t, Arena *perm, Arena scratch, Str dir)
               "a go before a raise is hung up on");
         os_connclose(os, c);
     }
-    k = knock(os, perm, scratch, a, "bad token\n", 2000, 0);
+    k = knock(os, perm, scratch, a, "bad token\n", {}, 2000, 0);
     check(t, k.ok, "a knock with a token not to pass on");
     m = mailtake(mb);
     r = mailnext(&m);
     check(t, r.ok && r.type==77 && !r.data.len, "raises without it");
+    check(t, !mailnext(&m).ok, "once");
+
+    // prospero DIR: the directory goes along, after the token
+    k = knock(os, perm, scratch, a, "tok", "/some dir/\xc3\xa9", 2000, 0);
+    check(t, k.ok && k.opens, "a knock with a directory is answered as taking it");
+    m = mailtake(mb);
+    r = mailnext(&m);
+    DoorRaise dr = doorraised(r.data);
+    check(t, r.ok && r.type==77 && dr.token=="tok" && dr.cwd=="/some dir/\xc3\xa9",
+          "and the raise posted, with the token and the directory");
+    check(t, !mailnext(&m).ok, "once");
+    k = knock(os, perm, scratch, a, {}, "/a", 2000, 0);
+    m = mailtake(mb);
+    r = mailnext(&m);
+    dr = doorraised(r.data);
+    check(t, k.ok && k.opens && r.ok && !dr.token.len && dr.cwd=="/a",
+          "a directory without a token");
+    k = knock(os, perm, scratch, a, "tok", Str{(u8 *)"/a\0b", 4}, 2000, 0);
+    m = mailtake(mb);
+    r = mailnext(&m);
+    dr = doorraised(r.data);
+    check(t, k.ok && !k.opens && r.ok && dr.token=="tok" && !dr.cwd.len,
+          "a directory with a null byte is dropped, the raise not");
     check(t, !mailnext(&m).ok, "once");
 
     os_unlockfile(os, la);

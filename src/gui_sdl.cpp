@@ -730,7 +730,9 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
         return;
     case SDL_EVENT_DROP_FILE:
         if (e->drop.data) {
-            gui_drop(g, {(u8 *)e->drop.data, (iz)SDL_strlen(e->drop.data)});
+            // No window: opened in the application (macOS's open events)
+            gui_drop(g, {(u8 *)e->drop.data, (iz)SDL_strlen(e->drop.data)},
+                     !e->drop.windowID);
         }
         return;
     case SDL_EVENT_WINDOW_RESIZED:

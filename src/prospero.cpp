@@ -350,7 +350,8 @@ static void    os_wake(Os *);
 // core may decline: the window stays until os_guiclose. gui_tray tells
 // of a pick from the tray icon's menu (TRAY_*), gui_placed of the
 // window moved, resized, maximized or restored (WinGeom, below), and
-// gui_drop of a file dropped on the window, by its path.
+// gui_drop of a file dropped on the window, by its path, or opened in
+// the application as a whole (macOS: Finder, the Dock, open -a).
 struct Gui;
 // Open the main window with ImGui's platform and renderer backends, or
 // open it again after os_guished. Returns 0 on failure.
@@ -575,6 +576,9 @@ static Arena newarena(Region *r)
 
 static Str usage =
 "usage: prospero [options]\n"
+#if PROSPERO_GUI
+"       prospero [gui] [DIR] [options]\n"
+#endif
 "       prospero run [options] PROMPT\n"
 "       prospero --headless [options]\n"
 "       prospero serve [options]\n"

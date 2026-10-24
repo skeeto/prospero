@@ -24,6 +24,7 @@ by quitting are gone, with no engine process left behind.
   uv run tests/gui.py --prospero build/prospero --mode bench   (M1's scale)
   uv run tests/gui.py --prospero build/prospero --mode compose [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode plan [--shots DIR]
+  uv run tests/gui.py --prospero build/prospero --mode launch [--shots DIR]
 
 The settings mode edits a value longer than a field's slack and picks
 the theme, dark then light, from its list over a transcript that shows
@@ -50,7 +51,12 @@ asking to approve its plan: kept planning with a note, revised by hand
 with Edit plan ([ui] editor a test script, here only), then approved;
 the Plan window shows each plan, and the toggle by Send and /plan off
 turn plan mode on and off; then Bypass from the list, in red, and Plan
-from there, whose approval lands in Build.
+from there, whose approval lands in Build. The launch mode is prospero
+DIR's: a window started with a directory has a session there, another
+launch with one hands off to it as a new session shown, an open event makes another,
+and the new session dialog one with no folder; then, here on POSIX,
+two launches with no window both detach at once, leaving one window
+with both sessions, which is then told to quit.
 
 On Linux without a display it runs under xvfb-run. --serve only runs the
 provider and writes the configuration, for a GUI started elsewhere (a
@@ -434,10 +440,10 @@ class Local:
     def alive(self, pid):
         return alive(pid)
 
-    def run(self, guiargs, timeout, cwd=None, tag="", env=None):
+    def run(self, guiargs, timeout, cwd=None, tag="", env=None, sub="gui"):
         """Run the GUI, echoing its log (each line after tag, if any), in
         cwd (default the working directory). Returns (status, lines)."""
-        cmd = [self.prospero, "gui"] + guiargs
+        cmd = [self.prospero] + ([sub] if sub else []) + guiargs
         if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
                 and not os.environ.get("WAYLAND_DISPLAY"):
             cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
@@ -549,14 +555,14 @@ class Remote:
     def alive(self, pid):
         return self.h.alive(pid)
 
-    def run(self, guiargs, timeout, cwd=None, tag="", env=None):
+    def run(self, guiargs, timeout, cwd=None, tag="", env=None, sub="gui"):
         win = lambda p: p.replace("/", "\\")
         q = lambda a: '"' + win(a) + '"' if "/" in a or " " in a else a
         name = "run" + tag.strip(" :[]")
         task = self.task + tag.strip(" :[]")
         sets = "".join(f"set {k}={win(v)}\r\n" for k, v in (env or {}).items())
         bat = ("@echo off\r\ncd /d \"%~dp0\"\r\n" + sets +
-               q(self.h.exe) + " gui " + " ".join(q(a) for a in guiargs) +
+               q(self.h.exe) + (f" {sub} " if sub else " ") + " ".join(q(a) for a in guiargs) +
                f" > {name}.log 2>&1\r\necho done %errorlevel% >> {name}.log\r\n")
         self.h.write(self.path(name + ".bat"), bat)
         self.tasks.append(task)
@@ -777,6 +783,130 @@ def handoffproblems(status, lines, who):
     if not any("brought it forward" in l for l in lines):
         return [f"{who}: did not say it handed off"]
     return []
+
+
+def launch(args, host, guiargs, guicwd):
+    """--mode launch: the first window, started as "prospero gui --launch
+    DIR", has a session in DIR after hello; a second launch, "prospero
+    WORK" as from a terminal, hands off to it, which shows a new session
+    in WORK and comes forward, and the launch exits saying so; the
+    checklist goes on to an open event and a session with no folder,
+    and quits. Then, here on POSIX with a display, two launches at once
+    with no window detach and return at once, one window going on
+    with both sessions. Returns problems and the logs."""
+    problems = []
+    first = {}
+    t = threading.Thread(target=lambda: first.update(r=host.run(
+        guiargs, args.timeout, guicwd, tag="[1] ")))
+    t.start()
+    more = []
+    plain = ["-c", host.path("prospero.ini"), "--statedir", host.path("state")]
+    if not waitfor(lambda: host.read(host.path("work", "launch-ready")), 120, 1):
+        problems.append("the first window never showed its launch's session")
+    else:
+        status, lines = host.run([host.path("work")] + plain, 60, guicwd, tag="[2] ",
+                                 sub=None)
+        problems += handoffproblems(status, lines, "the second launch")
+        if not any("with a new session in" in l for l in lines):
+            problems.append("the second launch did not say the window starts its session")
+        more += lines
+    t.join(args.timeout + 60)
+    status1, lines1 = first.get("r", (None, []))
+    problems += summaryproblems(status1, lines1, "the first window")
+    if status1 is not None and isinstance(host, Local) and os.name == "posix":
+        p, lines = detaching(host, plain)
+        problems += p
+        more += lines
+    return problems, lines1 + more
+
+
+def detached(host):
+    """The pids of the windows that "prospero DIR" left running detached
+    in the run's directory (--detached on their command lines), each a
+    process of this user's naming the run's directory."""
+    out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
+                         text=True).stdout
+    found = []
+    for line in out.splitlines():
+        pid, _, rest = line.strip().partition(" ")
+        if rest.startswith(host.prospero + " ") and " --detached" in rest and \
+                host.root in rest:
+            found += [p for p in P.parse(pid) if ours(p, host.root)]
+    return found
+
+
+def detaching(host, plain):
+    """Two "prospero DIR" launches at once with no window on the state
+    directory: each detaches and exits at once, giving the terminal back;
+    one window goes on, the other having handed off to it, with a session
+    in either directory. The window is then asked to quit (SIGTERM), by
+    the pid found from its command line, checked as ours."""
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
+            and not os.environ.get("WAYLAND_DISPLAY"):
+        print("detaching: skipped, with no display for a window to go on in", flush=True)
+        return [], []
+    problems, lines = [], []
+    dirs = [host.path("work", "two"), host.path("work", "three")]
+    for d in dirs:
+        host.mkdir(d)
+    t0 = time.monotonic()
+    procs = [subprocess.Popen([host.prospero, d] + plain, cwd=host.path("work"),
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, start_new_session=True)
+             for d in dirs]
+    for i, p in enumerate(procs):
+        try:
+            out, _ = p.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            P.signal_group(p, signal.SIGKILL)
+            out, _ = p.communicate()
+            problems.append(f"detaching launch {i} did not return")
+        for line in out.splitlines():
+            lines.append(f"[d{i}] {line}\n")
+            print(lines[-1], end="", flush=True)
+        if p.returncode != 0:
+            problems.append(f"detaching launch {i}: exit status {p.returncode}")
+    dt = time.monotonic() - t0
+    print(f"the detaching launches returned in {dt:.1f} s", flush=True)
+    if dt > 10:
+        problems.append(f"the detaching launches took {dt:.1f} s to return")
+
+    def made():
+        cwds = []
+        for sid in host.listdir(host.path("state", "sessions")):
+            text = host.read(host.path("state", "sessions", sid, "events.jsonl")) or ""
+            first = text.split("\n", 1)[0]
+            try:
+                cwds.append(json.loads(first).get("cwd"))
+            except ValueError:
+                pass
+        real = [os.path.realpath(d) for d in dirs]
+        return all(r in cwds for r in real)
+    if not waitfor(made, 30, 0.5):
+        problems.append("the detached window has not both launches' sessions")
+    else:
+        print("the detached window has both launches' sessions", flush=True)
+    time.sleep(2)  # the other window, had it gone on, would show by now
+    pids = detached(host)
+    print(f"detached windows: {pids}", flush=True)
+    if len(pids) != 1:
+        problems.append(f"{len(pids)} detached windows, not one")
+    log = (host.read(host.path("state", "gui.log")) or "") + "".join(lines)
+    if "brought it forward, with a new session in" not in log:
+        problems.append("the later detached launch did not hand off to the first (gui.log)")
+    for pid in pids:
+        try:
+            P.signal_ours(pid, signal.SIGTERM, lambda q: ours(q, host.root))
+        except (OSError, P.Refused) as e:
+            problems.append(f"cannot ask the detached window to quit: {e}")
+            continue
+        if not waitfor(lambda: not alive(pid), 20, 0.5):
+            problems.append(f"the detached window {pid} did not quit")
+            try:
+                P.signal_ours(pid, signal.SIGKILL, lambda q: ours(q, host.root))
+            except (OSError, P.Refused):
+                pass
+    return problems, lines
 
 
 def background(args, host, guiargs, guicwd):
@@ -1200,7 +1330,7 @@ def main():
     ap.add_argument("--mode", default="drive",
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
-                             "compose", "sessions", "plan"])
+                             "compose", "sessions", "plan", "launch"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1328,6 +1458,10 @@ def main():
     guiargs = ["-c", paths[0], "--statedir", paths[1], "--cwd", paths[2]]
     if args.mode != "background":
         guiargs.insert(0, f"--{args.mode}")  # it runs two checklists
+    if args.mode == "launch":
+        # prospero gui --launch DIR: a session in DIR after hello
+        host.mkdir(host.path("work", "one"))
+        guiargs.insert(1, host.path("work", "one"))
     if args.inbox_cap or args.mode not in ("bench", "background"):
         guiargs += ["--inbox-cap", str(args.inbox_cap or 65536)]
     if far:
@@ -1346,6 +1480,9 @@ def main():
     problems = []
     if args.mode == "background":
         problems, lines = background(args, host, guiargs, guicwd)
+        status = 0
+    elif args.mode == "launch":
+        problems, lines = launch(args, host, guiargs, guicwd)
         status = 0
     elif args.mode == "compose":
         # Twice: the second finds the drafts the first left
