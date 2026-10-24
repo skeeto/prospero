@@ -463,6 +463,7 @@ struct WinGeom {
     WinBox box;
     b32    max;
     b32    ok;   // known: else the platform's own place and size
+    b32    full; // full screen (SDL only), over max and box
 };
 // The displays' usable rectangles (without menu bars, docks and task
 // bars), the primary first. Returns how many, at most max.

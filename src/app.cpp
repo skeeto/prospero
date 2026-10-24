@@ -5550,9 +5550,9 @@ static void setfontbase(Gui *g, Str value)
 static void gui_placed(Gui *g, WinGeom geom)
 {
     WinGeom *o = &g->geom;
-    if (!geom.ok || (o->ok && o->max==geom.max && o->box.x==geom.box.x &&
-                     o->box.y==geom.box.y && o->box.w==geom.box.w &&
-                     o->box.h==geom.box.h)) {
+    if (!geom.ok || (o->ok && o->max==geom.max && o->full==geom.full &&
+                     o->box.x==geom.box.x && o->box.y==geom.box.y &&
+                     o->box.w==geom.box.w && o->box.h==geom.box.h)) {
         return;
     }
     *o = geom;
@@ -5664,6 +5664,7 @@ static void saveini(Gui *g, b32 last)
 //   Pos=120,80
 //   Size=1280,800
 //   Maximized=0
+//   Fullscreen=0
 //   [Prospero][Sidebar]
 //   Group=Work
 //   Folded=g:Work
@@ -5724,6 +5725,8 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
         w->ok    = 1;
     } else if (kv.head=="Maximized" && v.ok) {
         w->max = v.val != 0;
+    } else if (kv.head=="Fullscreen" && v.ok) {
+        w->full = v.val != 0;
     }
 }
 
@@ -5753,7 +5756,8 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
         out->append("[Prospero][Window]\n");
         out->appendf("Pos=%d,%d\n", (int)w->box.x, (int)w->box.y);
         out->appendf("Size=%d,%d\n", (int)w->box.w, (int)w->box.h);
-        out->appendf("Maximized=%d\n\n", w->max ? 1 : 0);
+        out->appendf("Maximized=%d\n", w->max ? 1 : 0);
+        out->appendf("Fullscreen=%d\n\n", w->full ? 1 : 0);
     }
     if (g->groups.len || g->folds) {
         out->append("[Prospero][Sidebar]\n");
@@ -6540,6 +6544,9 @@ enum : i32 {
                   // right of all, gone since; 0 back as remembered
     OP_MARKSESS,  // remember the session shown, for CHK_DRAFTFILE
     OP_IFROLE,    // unless the configuration has role text, skip dx ops
+    OP_MAXIMIZE,  // maximize the window (macOS: zoom), as its button would;
+                  // dx 1: fill the primary display unmaximized (macOS's
+                  // Fill), else skip the next op where that is no maximum
 };
 
 enum : i32 {
@@ -6822,6 +6829,8 @@ enum : i32 {
     CHK_PLANASK,      // the open ask is the plan's, in Markdown, its buttons drawn
     CHK_PLANTEXT,     // the Plan window shows the plan, with text in it
     CHK_PLANMODEL,    // the model picker is enabled while the plan waits
+    CHK_MAXIMIZED,    // maximized, filling its display, and saved so;
+                      // dx 1: filling it, saved as maximized
     CHK_COUNT,
 };
 
@@ -6995,6 +7004,7 @@ static Str chknames[] = {
     "the plan's ask shows the plan, with Approve plan and Keep planning",
     "the Plan window shows the plan as the agent wrote it",
     "the model may change while the plan waits",
+    "the window is maximized, filling its display, and will open so",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9299,6 +9309,12 @@ static DriveOp composeops[] = {
     // Quitting keeps a draft typed just before
     CLICK(T_PROMPT, "", 200),
     {OP_TEXT, 0, 0, 0, 100, "Draft for C"},
+    // Filling the display counts as maximized. Maximized (zoomed) from
+    // there, it does not go smaller, and it opens maximized again.
+    {OP_MAXIMIZE, 0, 1, 0, 1500, ""},
+    {OP_CHECK, CHK_MAXIMIZED, 1, 0, 0, ""},
+    {OP_MAXIMIZE, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_MAXIMIZED, 0, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -9307,6 +9323,7 @@ static DriveOp composeops[] = {
 static DriveOp compose2ops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_MAXIMIZED, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     CLICK(T_SESSTITLE, "Session A", 300),
     {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
@@ -9321,6 +9338,7 @@ static DriveOp compose2ops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_COMPOSEQUIET, 0, 0, 0, ""},
+    {OP_CHECK, CHK_MAXIMIZED, 0, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -10602,6 +10620,34 @@ static b32 drivecheck(Gui *g, i32 chk)
         return w.ok && m.ok && w.box.x==m.box.x && w.box.y==m.box.y &&
                w.box.w==m.box.w && w.box.h==m.box.h && w.max==m.max;
     }
+    case CHK_MAXIMIZED: {
+        // Most of the display it is on, and the layout says maximized
+        WinBox  disp[16];
+        i32     n = os_guidisplays(g->os, disp, countof(disp));
+        WinGeom w = os_guiwhere(g->os);
+        i64     most = 0;
+        WinBox  on   = {};
+        for (i32 i = 0; i < n; i++) {
+            i64 o = boxoverlap(w.box, disp[i]);
+            on    = o>most ? disp[i] : on;
+            most  = o>most ? o : most;
+        }
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, "drive: the window ");
+        print(&b, (i64)w.box.w);
+        putbyte(&b, 'x');
+        print(&b, (i64)w.box.h);
+        print(&b, w.max ? Str(", maximized") : Str(", not maximized"));
+        print(&b, g->geom.max ? Str(", saved so") : Str(", saved not so"));
+        print(&b, "; its display ");
+        print(&b, (i64)on.w);
+        putbyte(&b, 'x');
+        print(&b, (i64)on.h);
+        guilog(g, finish(&b));
+        return w.ok && (w.max || g->ops[g->drivepc-1].dx!=0) && g->geom.max &&
+               10*(i64)w.box.w>=9*(i64)on.w && 10*(i64)w.box.h>=8*(i64)on.h;
+    }
     case CHK_TOOLTIP:       return tooltipup();
     case CHK_NOTOOLTIP:     return !tooltipup();
     case CHK_POPUP:         return c.OpenPopupStack.Size > 0;
@@ -11813,6 +11859,25 @@ static void drivestep(Gui *g)
     case OP_GEOMMARK:
         g->geommark = os_guiwhere(g->os);
         break;
+    case OP_MAXIMIZE: {
+        WinGeom w = os_guiwhere(g->os);
+        WinBox  d = {};
+        w.max = op->dx == 0;
+        if (op->dx != 0) {
+            #ifdef _WIN32
+            b32 nofill = 1;
+            #else
+            b32 nofill = (os_guilimits(g->os) & GUI_NOPLACE) != 0;
+            #endif
+            if (nofill || !os_guidisplays(g->os, &d, 1)) {
+                guilog(g, "drive: skip filling the display (no maximum here)");
+                g->drivepc++;
+                break;
+            }
+            w.box = {d.x, d.y + PLACE_TITLE, d.w, d.h - PLACE_TITLE};
+        }
+        os_guiplace(g->os, w);
+    } break;
     case OP_MARKSESS:
         g->drivesess = g->sess;
         break;

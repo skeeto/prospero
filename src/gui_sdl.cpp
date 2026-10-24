@@ -45,8 +45,13 @@
 // The window opens where it was last, its client area's place and size
 // fitted to the displays as they are (place.cpp), the title bar counted
 // above it where SDL knows its height; under Wayland, where a window
-// never knows its place, only its size. Moves, resizes, maximizing and
-// restoring go to the core (gui_placed), which saves them.
+// never knows its place, only its size. Moves, resizes, maximizing,
+// restoring and full screen go to the core (gui_placed), which saves
+// them. On macOS a window can fill its display without being zoomed
+// (Fill, tiling), which counts as maximized; and zooming toggles, so a
+// window opened maximized from a box that fills its display already
+// starts from a smaller one, else AppKit would take it as zoomed and
+// shrink it.
 //
 // Scrolling: macOS trackpads' momentum (the scroll that goes on after a
 // flick), which SDL turns off unless asked, comes as more wheel events,
@@ -93,6 +98,10 @@ using GlReadPixels = void (*)(i32, i32, i32, i32, u32, u32, void *);
 
 struct GuiSdl;
 
+enum : i32 {
+    FILL_SLACK = 16,  // points between a filling window's edge and its display's
+};
+
 struct TrayItem {
     GuiSdl *p;
     i32     item;  // TRAY_*
@@ -115,7 +124,8 @@ struct GuiSdl {
     i32           portal;      // atomic: the portal's latest, as drivetheme,
                                // 0 if it said nothing yet (Linux)
     WinBox        normal;      // the window when last neither maximized,
-    b32           hasnormal;   // minimized nor full screen
+                               // minimized nor full screen
+    b32           max;         // maximized when last not full screen
     GlViewport    glviewport;
     GlClearColor  glclearcolor;
     GlClear       glclear;
@@ -384,34 +394,75 @@ static i32 titleheight(SDL_Window *w)
     return SDL_GetWindowBordersSize(w, &top, 0, 0, 0) && top>0 ? top : 0;
 }
 
-// Put the window at a geometry, fitted to the displays.
+// Whether a client box, the title bar title high above it (roughly, if
+// not yet known), fills one of the displays, near enough each edge: as
+// macOS's Fill (tiling, or a title bar's double-click) leaves a window,
+// never flagged maximized, and as zooming does. Never under Wayland,
+// where boxes have no place.
+static b32 filling(Os *os, WinBox box, i32 title)
+{
+    WinBox disp[16];
+    i32    n = wayland() ? 0 : os_guidisplays(os, disp, countof(disp));
+    title = title>0 ? title : PLACE_TITLE;
+    box.y -= title;
+    box.h += title;
+    for (i32 i = 0; i < n; i++) {
+        WinBox d       = disp[i];
+        i32    edges[] = {box.x - d.x, box.y - d.y, d.x+d.w - (box.x+box.w),
+                          d.y+d.h - (box.y+box.h)};
+        b32    near    = 1;
+        for (i32 e = 0; e < countof(edges); e++) {
+            near &= edges[e]>=-FILL_SLACK && edges[e]<=FILL_SLACK;
+        }
+        if (near) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Put the window at a geometry, fitted to the displays. Maximizing on
+// macOS toggles (NSWindow zoom:), and a box that fills its display
+// already counts as zoomed, so it would go smaller instead: such a box,
+// to be maximized, first shrinks by a quarter about its center.
 static void sdlplace(Os *os, GuiSdl *p, WinGeom geom)
 {
-    geom = fitgeom(os, geom, titleheight(p->window));
+    i32 title = titleheight(p->window);
+    geom = fitgeom(os, geom, title);
+    if (geom.max && filling(os, geom.box, title)) {
+        geom.box.x += geom.box.w/8;
+        geom.box.y += geom.box.h/8;
+        geom.box.w -= geom.box.w/4;
+        geom.box.h -= geom.box.h/4;
+    }
+    p->normal = geom.box;
     SDL_SetWindowSize(p->window, geom.box.w, geom.box.h);
     if (!wayland()) {
         SDL_SetWindowPosition(p->window, geom.box.x, geom.box.y);
     }
 }
 
-// The window moved, resized, or was maximized or restored: the core
-// keeps the latest, which the window opens at next time.
-static void sdlplaced(GuiSdl *p)
+// The window moved, resized, was maximized or restored, or went full
+// screen or back: the core keeps the latest, which the window opens at
+// next time. Filling its display unflagged counts as maximized, the
+// normal box the one before.
+static void sdlplaced(Os *os, GuiSdl *p)
 {
     SDL_WindowFlags f = SDL_GetWindowFlags(p->window);
-    if (f & (SDL_WINDOW_MINIMIZED|SDL_WINDOW_FULLSCREEN|SDL_WINDOW_HIDDEN)) {
+    if (f & (SDL_WINDOW_MINIMIZED|SDL_WINDOW_HIDDEN)) {
         return;
     }
-    if (!(f & SDL_WINDOW_MAXIMIZED)) {
-        WinBox *b = &p->normal;
-        SDL_GetWindowPosition(p->window, &b->x, &b->y);
-        SDL_GetWindowSize(p->window, &b->w, &b->h);
-        p->hasnormal = 1;
+    if (!(f & SDL_WINDOW_FULLSCREEN)) {
+        WinBox b = {};
+        SDL_GetWindowPosition(p->window, &b.x, &b.y);
+        SDL_GetWindowSize(p->window, &b.w, &b.h);
+        p->max = (f & SDL_WINDOW_MAXIMIZED) || filling(os, b, titleheight(p->window));
+        if (!p->max) {
+            p->normal = b;
+        }
     }
-    if (p->hasnormal) {
-        WinGeom geom = {p->normal, (f & SDL_WINDOW_MAXIMIZED)!=0, 1};
-        gui_placed(p->gui, geom);
-    }
+    WinGeom geom = {p->normal, p->max, 1, (f & SDL_WINDOW_FULLSCREEN)!=0};
+    gui_placed(p->gui, geom);
 }
 
 static WinGeom os_guiwhere(Os *os)
@@ -422,8 +473,9 @@ static WinGeom os_guiwhere(Os *os)
         SDL_WindowFlags f = SDL_GetWindowFlags(p->window);
         SDL_GetWindowPosition(p->window, &r.box.x, &r.box.y);
         SDL_GetWindowSize(p->window, &r.box.w, &r.box.h);
-        r.max = (f & SDL_WINDOW_MAXIMIZED) != 0;
-        r.ok  = 1;
+        r.max  = (f & SDL_WINDOW_MAXIMIZED) != 0;
+        r.ok   = 1;
+        r.full = (f & SDL_WINDOW_FULLSCREEN) != 0;
     }
     return r;
 }
@@ -571,15 +623,22 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     i32     h    = geom.ok ? geom.box.h : 800;
     flags |= geom.ok && geom.max ? SDL_WINDOW_MAXIMIZED : 0;
     Arena t = g->frame;
-    p->window    = SDL_CreateWindow(cstr0(&t, title), w, h, flags);
-    p->hasnormal = 0;
+    p->window = SDL_CreateWindow(cstr0(&t, title), w, h, flags);
     if (!p->window) {
         return 0;
     }
     if (geom.ok) {
         sdlplace(os, p, geom);
-        p->normal    = fitgeom(os, geom, titleheight(p->window)).box;
-        p->hasnormal = 1;
+    } else {
+        // The system's place, the normal box should it be maximized
+        // before it ever moves
+        WinBox *b = &p->normal;
+        SDL_GetWindowPosition(p->window, &b->x, &b->y);
+        SDL_GetWindowSize(p->window, &b->w, &b->h);
+    }
+    p->max = geom.ok && geom.max;
+    if (geom.ok && geom.full) {
+        SDL_SetWindowFullscreen(p->window, 1);  // as it shows
     }
     p->gl = SDL_GL_CreateContext(p->window);
     if (!p->gl) {
@@ -641,7 +700,7 @@ static i32 inputkind(SDL_Event *e)
 }
 
 // Closing and quitting are requests the core may decline.
-static void dispatch(GuiSdl *p, SDL_Event *e)
+static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
 {
     Gui *g = p->gui;
     if (e->type == p->wakeevent) {
@@ -695,8 +754,10 @@ static void dispatch(GuiSdl *p, SDL_Event *e)
         break;
     }
     if (e->type==SDL_EVENT_WINDOW_MOVED || e->type==SDL_EVENT_WINDOW_RESIZED ||
-            e->type==SDL_EVENT_WINDOW_MAXIMIZED || e->type==SDL_EVENT_WINDOW_RESTORED) {
-        sdlplaced(p);
+            e->type==SDL_EVENT_WINDOW_MAXIMIZED || e->type==SDL_EVENT_WINDOW_RESTORED ||
+            e->type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN ||
+            e->type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) {
+        sdlplaced(os, p);
     }
     if (ImGui_ImplSDL3_ProcessEvent(e)) {
         gui_input(g, inputkind(e));
@@ -713,7 +774,7 @@ static b32 os_guiwait(Os *os, i64 us)
         return 1;  // timed out
     }
     do {
-        dispatch(p, &e);
+        dispatch(os, p, &e);
     } while (SDL_PollEvent(&e));
     return 1;
 }
@@ -948,7 +1009,7 @@ static void os_guished(Os *os)
     if (!p || !p->window) {
         return;
     }
-    sdlplaced(p);  // where it opens again
+    sdlplaced(os, p);  // where it opens again
     SDL_RemoveEventWatch(sdlwatch, p);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
