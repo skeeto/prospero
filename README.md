@@ -190,6 +190,14 @@ to the old machine: allowed directories and grants, snapshots and
 rewinds, spilled output files, images, subagents and jobs. The new
 session is titled "(imported)" and remembers the session it came from.
 
+Images go with a message, for a model that takes them: drop PNG or
+JPEG files on the window, paste one (or a copied image file), or pick
+them with the Image button. They wait as thumbnails above the prompt
+box until sent, at most ten to a message, and a large PNG is shrunk.
+The session keeps them, so they go back to the model on every request,
+show in the transcript and come with a fork, but not with an export.
+`[model] vision = false` turns them off for a model that has none.
+
 A message sent while a turn runs waits above the prompt box until the
 agent takes it in at its next step (or, too late for this turn, runs as
 the next prompt), and its Withdraw button puts it back in the draft.
