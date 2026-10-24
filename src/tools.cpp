@@ -677,7 +677,9 @@ static Str tooljson(Arena *a, ToolEnv *te)
     return finish(&b);
 }
 
-static Str systemprompt(Arena *a, Str cwd, ToolEnv *te)
+// The system prompt's start. A session in a folder of its own (nofolder)
+// is told that its working directory is no project.
+static Str systemprompt(Arena *a, Str cwd, ToolEnv *te, b32 nofolder = 0)
 {
     Buf b(a, 2048);
     print(&b,
@@ -730,6 +732,9 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te)
         "- Do not narrate what you will do next: do it with a tool call.\n\n"
         "Working directory: ");
     print(&b, cwd);
+    if (nofolder) {
+        print(&b, " (a private folder for this session; there is no project)");
+    }
     print(&b, "\nPlatform: ");
     print(&b, te->windows ? Str("Windows") : Str("POSIX (macOS or Linux)"));
     print(&b, "\n");

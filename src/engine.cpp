@@ -639,6 +639,8 @@ struct Session {
     b32          nofallback; // never a fallback model: the one asked, or none
     b32          tempask;    // asks for the temporary directories, whatever
                              // [guard] temp says (new {temp:"ask"})
+    b32          nofolder;   // works in a folder of its own, sessions/SID/work,
+                             // not a project's (new {nofolder})
     b32          forget;     // closed: drop it from memory once idle
 };
 
@@ -2837,8 +2839,13 @@ static void snapafter(Session *s, Arena scratch, Str path, SnapPre *pre, Str wro
 
 // Instruction files (instructions.cpp)
 
+// The names of instruction files to look for in a project's directories:
+// none for a session in a folder of its own, which is in no project.
 static Slice<Str> instrlist(Session *s, Arena *a)
 {
+    if (s->nofolder) {
+        return {};
+    }
     return instrnames(a, cfgget(s->e->cfg, "instructions", "", "files", 0));
 }
 
@@ -5665,15 +5672,16 @@ static u32 skilldeny(Engine *e)
 
 // The directories of a session's skills, by precedence. A session with
 // the project's instructions alone (new {instructions:"project"}) has
-// the project's skills alone, and [skills] paths.
+// the project's skills alone, and [skills] paths. One in a folder of its
+// own (new {nofolder}) is in no project: [skills] paths and the user's.
 static Slice<SkillDir> skilldirs(Session *s, Arena *a)
 {
     Engine         *e    = s->e;
     b32             win  = s->te.windows;
     Slice<SkillDir> r    = {};
     Str             cwd  = normpath(a, s->cwd, ".", win);
-    Str             root = instrroot(e->os, a, cwd, win);
-    for (Str d = cwd;;) {
+    Str             root = s->nofolder ? Str{} : instrroot(e->os, a, cwd, win);
+    for (Str d = cwd; root.len;) {
         SkillDir c = {normpath(a, d, ".claude/skills", win), root};
         SkillDir g = {normpath(a, d, ".agents/skills", win), root};
         r = push(a, r, c);
@@ -7263,7 +7271,7 @@ static void buildprefix(Session *s, Arena scratch)
     if (tooloffered(&s->te, TOOL_TASK)) {
         taskroles(e, &s->perm, scratch, &s->te);
     }
-    s->system = systemprompt(&s->perm, s->cwd, &s->te);
+    s->system = systemprompt(&s->perm, s->cwd, &s->te, s->nofolder);
     s->tools  = tooljson(&s->perm, &s->te);
     if (s->rolepr.len) {
         s->system = concat(&s->perm, s->system, "\n\n# Your role: ");
@@ -7413,6 +7421,17 @@ static void sessionready(Session *s, Arena scratch)
             os_mkdirs(e->os, scratch, s->scratch);
         }
     }
+    // Likewise a folder of its own, should something have removed it,
+    // but only where the state directory keeps such folders
+    if (s->nofolder && !s->readonly &&
+            os_stat(e->os, scratch, s->cwd).type==STAT_MISSING) {
+        Str base = os_realpath(e->os, &scratch, join(&scratch, e->statedir, "sessions"));
+        Str cwd  = normpath(&scratch, s->cwd, ".", HOST_WINDOWS);
+        if (base.len && within(normpath(&scratch, base, ".", HOST_WINDOWS), cwd, HOST_WINDOWS) &&
+                basename(cwd)=="work") {
+            os_mkdirs(e->os, scratch, s->cwd);
+        }
+    }
     instrstart(s, scratch);
     Str dir = os_realpath(e->os, &scratch, s->dir);  // as the guard has paths
     if (dir.len) {
@@ -7525,6 +7544,9 @@ static void logsession(Session *s, Arena scratch)
     }
     if (s->tempask) {
         putstrkey(&w.json, "temp", "ask");
+    }
+    if (s->nofolder) {
+        putintkey(&w.json, "nofolder", 1);
     }
     ssend(s, &w);
 }
@@ -7798,6 +7820,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->projinstr  = p->projinstr;
     s->nofallback = p->nofallback;
     s->tempask    = p->tempask;
+    s->nofolder   = p->nofolder;  // in the parent's folder
     Str why = opensession(s, scratch);
     if (why.data) {
         dropsession(e, s);
@@ -8282,6 +8305,7 @@ struct ListEntry {
     b32       locked;  // open in another process
     b32       parked;
     b32       archived;
+    b32       nofolder;  // in a folder of its own
     b32       shown;
     Slice<iz> kids;    // its subagents, oldest first
 };
@@ -8325,6 +8349,7 @@ static SessScan scansessions(Engine *e, Arena *a)
         en.scratch  = jsonstr(jsonget(rec.root, "scratch"));
         en.group    = sidecarget(e, a, d->name, "group", GROUP_MAX);
         en.archived = sidecarget(e, a, d->name, "archived", 16).data != 0;
+        en.nofolder = jsonint(jsonget(rec.root, "nofolder"), 0) == 1;
         en.mtime    = d->mtime;
         en.parked   = !s && parkedat(e, d->name)>=0;  // its lock is ours
         en.locked   = (!s || s->readonly) && !en.parked &&
@@ -8821,7 +8846,10 @@ static Str unknowntools(Str list)
 // fallbacks, so that every request goes to the model given, and with
 // temp "ask", the system's temporary directories outside the workspace
 // (where an eval's other runs are). Its subagents keep the last three.
-// A leading ~ in cwd is this host's home directory (tildepath).
+// A leading ~ in cwd is this host's home directory (tildepath). With
+// nofolder 1 instead of a cwd, the session works in a folder of its own,
+// its directory's work, which goes with it: no project's, so no
+// project's instruction files or skills either, only the user's.
 static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str  cwd   = jsonstr(jsonget(j, "cwd"));
@@ -8835,6 +8863,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     b32  fall  = jsonflag(jsonget(j, "fallback"), 1);
     Str  temp  = jsonstr(jsonget(j, "temp"));
     b32  plan  = jsonflag(jsonget(j, "plan"), 0);
+    b32  nofolder = jsonflag(jsonget(j, "nofolder"), 0);
     Role role  = name.len ? findrole(e, name) : Role{};
     if (name.len && !role.ok) {
         Str err = concat(&scratch, "no such role: ", name);
@@ -8883,13 +8912,13 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         }
     }
 
-    HomePath hp = tildepath(&scratch, cwd, e->home, HOST_WINDOWS);
+    HomePath hp = nofolder ? HomePath{} : tildepath(&scratch, cwd, e->home, HOST_WINDOWS);
     if (hp.err.len) {
         reply(e, scratch, id, 0, hp.err, {});
         return;
     }
-    Str real = cwd.len ? os_realpath(e->os, &scratch, hp.path) : Str{};
-    if (!real.len || os_stat(e->os, scratch, real).type!=STAT_DIR) {
+    Str real = cwd.len && !nofolder ? os_realpath(e->os, &scratch, hp.path) : Str{};
+    if (!nofolder && (!real.len || os_stat(e->os, scratch, real).type!=STAT_DIR)) {
         reply(e, scratch, id, 0, "cwd must name an existing directory", {});
         return;
     } else if (!model.len) {
@@ -8919,6 +8948,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->projinstr  = instr == "project";
     s->nofallback = !fall;
     s->tempask    = temp == "ask";
+    s->nofolder   = nofolder;
     for (iz i = 0; i < roots.len; i++) {
         s->roots = push(&s->perm, s->roots, clone(&s->perm, roots[i]));
     }
@@ -8927,6 +8957,12 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->te.edit = fmt.len ? editformat(fmt) : s->mc.edit;
 
     Str why = opensession(s, scratch);
+    if (!why.data && nofolder) {
+        Str work = join(&scratch, s->dir, "work");
+        real = os_mkdirs(e->os, scratch, work) ? os_realpath(e->os, &scratch, work) : Str{};
+        why  = real.len ? Str{} : Str("cannot create the session's folder");
+        s->cwd = clone(&s->perm, real);
+    }
     if (why.data) {
         dropsession(e, s);
         reply(e, scratch, id, 0, why, {});
@@ -9175,7 +9211,8 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->te.edit = editformat(jsonstr(jsonget(j, "edit_format")));
             i64 steps  = jsonint(jsonget(j, "steps"), 0);
             s->stepmax = steps>0 && steps<STEP_HARD ? steps : 0;
-            s->tempask = jsonstr(jsonget(j, "temp")) == "ask";
+            s->tempask  = jsonstr(jsonget(j, "temp")) == "ask";
+            s->nofolder = jsonflag(jsonget(j, "nofolder"), 0);
         } break;
         case EV_TITLE:
             s->title     = clone(&s->perm, jsonstr(jsonget(j, "text")));
@@ -9773,6 +9810,9 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     putstrkey(w, "sid", en->sid);
     putstrkey(w, "title", en->title);
     putstrkey(w, "cwd", en->cwd);
+    if (en->nofolder) {
+        putintkey(w, "nofolder", 1);
+    }
     putstrkey(w, "model", en->model);
     putstrkey(w, "state", state);
     putintkey(w, "mtime", en->mtime);
@@ -10265,6 +10305,28 @@ static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
     emit(e, evend(&w));
 }
 
+enum : i32 {
+    TREE_DEPTH = 64,  // directories deep that copytree goes, at most
+};
+
+// Copy a directory's regular files and directories, to any depth up to
+// TREE_DEPTH, into a new directory: as os_list lists them, so never
+// through a symlink. Returns 0 if anything failed.
+static b32 copytree(Os *os, Arena scratch, Str from, Str to, i32 depth)
+{
+    if (depth>TREE_DEPTH || !os_mkdirs(os, scratch, to)) {
+        return 0;
+    }
+    b32 ok = 1;
+    for (Dirent *d = os_list(os, &scratch, from); ok && d; d = d->next) {
+        Arena a   = scratch;
+        Str   src = join(&a, from, d->name);
+        Str   dst = join(&a, to, d->name);
+        ok = d->isdir ? copytree(os, a, src, dst, depth+1) : os_copyfile(os, a, src, dst);
+    }
+    return ok;
+}
+
 // fork {sid, turn?}: a new session from a copy of another's log, cut
 // after the end of a turn, or whole (logcopy), while that one is idle,
 // and never a subagent, which only its parent may carry on. The fork's
@@ -10275,7 +10337,9 @@ static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
 // named in their frozen prompts, which a delete leaves while a session
 // naming it is left (ownscratch).
 // The log is written last, so that the sessions list never shows a fork
-// half made. The workspace is left as it is. The reply names the fork
+// half made. The workspace is left as it is, but for a folder of the
+// original's own (new {nofolder}), which the fork has a whole copy of
+// (copytree), as its log, rewritten, says it works there. The reply names the fork
 // (sid) and its original (from), the turn, and next, the prompt that
 // began the turn after it, which a frontend may offer to send again.
 static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
@@ -10365,6 +10429,12 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     Str copy = join(&scratch, dir, "plan.md");
     if (ok && os_stat(os, scratch, plan).type==STAT_FILE) {
         ok = os_copyfile(os, scratch, plan, copy);
+    }
+    // A folder of its own (new {nofolder}), whole, as the fork's own
+    Str work  = join(&scratch, from, "work");
+    Str wcopy = join(&scratch, dir, "work");
+    if (ok && os_stat(os, scratch, work).type==STAT_DIR) {
+        ok = copytree(os, scratch, work, wcopy, 0);
     }
     Str group = sidecarget(e, &scratch, sid, "group", GROUP_MAX);
     ok = ok && sidecarwrite(e, scratch, to, "title", c.title);
@@ -10754,12 +10824,14 @@ static void cmdupload(Engine *e, Arena scratch, i64 id, Json *j)
 // the model and the endpoint given, else the configuration's, as new
 // has them (MODEL, or ENDPOINT/MODEL). Its title and its log are written
 // as a fork's are, the log last. The reply names the new session (sid)
-// and the one it was (from). The session is not opened.
+// and the one it was (from). The session is not opened. With nofolder 1
+// instead of a cwd, it works in a folder of its own, as new makes one.
 static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Os  *os    = e->os;
     Str  token = jsonstr(jsonget(j, "token"));
     Str  cwd   = jsonstr(jsonget(j, "cwd"));
+    b32  nofolder = jsonflag(jsonget(j, "nofolder"), 0);
     Str  spec  = trim(jsonstr(jsonget(j, "model")));
     Str  which = trim(jsonstr(jsonget(j, "endpoint")));
     if (!validtoken(token)) {
@@ -10779,13 +10851,13 @@ static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     }
 
-    HomePath hp = tildepath(&scratch, cwd, e->home, HOST_WINDOWS);
+    HomePath hp = nofolder ? HomePath{} : tildepath(&scratch, cwd, e->home, HOST_WINDOWS);
     if (hp.err.len) {
         reply(e, scratch, id, 0, hp.err, {});
         return;
     }
-    Str real = cwd.len ? os_realpath(os, &scratch, hp.path) : Str{};
-    if (!real.len || os_stat(os, scratch, real).type!=STAT_DIR) {
+    Str real = cwd.len && !nofolder ? os_realpath(os, &scratch, hp.path) : Str{};
+    if (!nofolder && (!real.len || os_stat(os, scratch, real).type!=STAT_DIR)) {
         reply(e, scratch, id, 0, "cwd must name an existing directory", {});
         return;
     }
@@ -10805,15 +10877,28 @@ static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     }
 
-    Str       to  = freshsid(e, &scratch);
-    Str       dir = scratchfor(e, &scratch, to);
-    LogImport li  = logimport(&lines, scratch, rd.data, to, real, t.model,
-                              ep.url, dir, os_time(os));
+    Str to   = freshsid(e, &scratch);
+    Str dir  = scratchfor(e, &scratch, to);
+    Str sdir = join(&scratch, join(&scratch, e->statedir, "sessions"), to);
+    if (nofolder) {
+        // Its folder, made first, its real path the cwd as new has it
+        Str work = join(&scratch, sdir, "work");
+        real = os_mkdirs(os, scratch, work) ? os_realpath(os, &scratch, work) : Str{};
+        if (!real.len) {
+            totrash(e, scratch, sdir, to);
+            reply(e, scratch, id, 0, "cannot create the session's folder", {});
+            return;
+        }
+    }
+    LogImport li = logimport(&lines, scratch, rd.data, to, real, t.model,
+                             ep.url, dir, os_time(os), nofolder);
     if (li.err.len) {
+        if (nofolder) {
+            totrash(e, scratch, sdir, to);
+        }
         reply(e, scratch, id, 0, li.err, {});
         return;
     }
-    Str sdir = join(&scratch, join(&scratch, e->statedir, "sessions"), to);
     Str out  = join(&scratch, sdir, "out");
     Str log  = join(&scratch, sdir, "events.jsonl");
     b32 ok   = os_mkdirs(os, scratch, out);

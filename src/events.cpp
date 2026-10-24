@@ -193,6 +193,8 @@ static Str capnames[] = {
                        // beginning with ~, in that home directory
     "bypass",          // mode {mode:"bypass"}, the mode record's bypass,
                        // and answers by "bypass"
+    "nofolder",        // new and import {nofolder}: a folder of the session's
+                       // own, and nofolder in its session record and list
 };
 
 static Str evname(i32 ev)
@@ -1148,9 +1150,10 @@ static Str importstrip(Arena *a, EvRec *rec, Str line)
     return finish(&b);
 }
 
-// The session record made anew for where the session now works.
+// The session record made anew for where the session now works: in a
+// folder of its own with nofolder (new {nofolder}).
 static Str importsession(Arena *a, EvRec *rec, Str cwd, Str model,
-                         Str endpoint, Str scratch)
+                         Str endpoint, Str scratch, b32 nofolder)
 {
     static Str const kept[] = {"role", "prompt", "tools", "edit_format", "steps"};
     Json *j = rec->root;
@@ -1174,14 +1177,19 @@ static Str importsession(Arena *a, EvRec *rec, Str cwd, Str model,
             putjson(&w.json, m);
         }
     }
+    if (nofolder) {
+        putintkey(&w.json, "nofolder", 1);
+    }
     return evend(&w);
 }
 
 // An import of a raw log, data, as session to, working in cwd with the
 // model at the endpoint (a URL), with its scratch directory there, and
-// titled at now. A session is listed only by a first line under 4 KiB.
+// titled at now, in a folder of its own with nofolder (cwd). A session
+// is listed only by a first line under 4 KiB.
 static LogImport logimport(Arena *a, Arena scratch, Str data, Str to, Str cwd,
-                           Str model, Str endpoint, Str dir, i64 now)
+                           Str model, Str endpoint, Str dir, i64 now,
+                           b32 nofolder = 0)
 {
     LogImport r = {};
 
@@ -1221,7 +1229,7 @@ static LogImport logimport(Arena *a, Arena scratch, Str data, Str to, Str cwd,
         }
         last = rec.seq;
         if (i == 0) {
-            line = importsession(a, &rec, cwd, model, endpoint, dir);
+            line = importsession(a, &rec, cwd, model, endpoint, dir, nofolder);
         } else if (!importkeeps(rec.ev)) {
             r.dropped++;
             continue;

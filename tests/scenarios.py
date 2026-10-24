@@ -2139,7 +2139,7 @@ def hello_caps(t):
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
-                 "message", "bypass"} <= set(caps)
+                 "message", "bypass", "nofolder"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -5825,6 +5825,129 @@ def new_tilde(t):
         r = h.call("new", cwd="~/work", model=t.model, endpoint="fake")
         t.check(r.get("ok") == 0 and "no home directory for ~" in r.get("err", ""),
                 f"no home: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+def rmtree(t, path):
+    if isinstance(t.host, LocalHost):
+        shutil.rmtree(path)
+    else:
+        t.host.sh(f"rm -rf {shlex.quote(path)}")
+
+
+def isdir(t, path):
+    if isinstance(t.host, LocalHost):
+        return os.path.isdir(path)
+    return t.host.sh(f"test -d {shlex.quote(path)} && echo y || echo n").strip() == "y"
+
+
+@scenario(bound=30)
+def nofolder(t):
+    """new {nofolder}: a session working in a folder of its own, its
+    directory's work, under the state directory, which is in a home that
+    is a git repository (dotfiles): the agent writes there without asking;
+    the system prompt says it is no project, with the user's instructions
+    and skills but not the home's; listed with nofolder; its folder made
+    again on opening if gone; a fork has a copy of its own; a delete takes
+    it; an import may have one too. new with neither cwd nor nofolder is
+    still refused."""
+    env = skillhome(t)
+    home = t.base  # the state directory is in it, as ~/.local/state is
+    env["HOME"] = home
+    if t.host.windows:
+        env["USERPROFILE"] = home.replace("/", "\\")
+    xdg = env["XDG_CONFIG_HOME"]
+    t.host.write(t.host.join(xdg, "prospero", "AGENTS.md"), "Global rule: be brief.\n")
+    skillput(t, t.host.join(xdg, "prospero", "skills"), "usr",
+             "---\ndescription: User skill\n---\nUSR\n")
+    t.host.mkdir(t.host.join(home, ".git"))
+    t.host.write(t.host.join(home, "AGENTS.md"), "Home project rule.\n")
+    skillput(t, t.host.join(t.state, ".claude", "skills"), "proj",
+             "---\ndescription: Project skill\n---\nPROJ\n")
+    sessions = t.host.join(t.state, "sessions")
+    h = t.headless(env=env)
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        t.check("nofolder" in h.all("hello")[0].get("caps", []), "the nofolder cap")
+        r = h.call("new", model=t.model, endpoint="fake")
+        t.check(r.get("ok") == 0 and r.get("err") == "cwd must name an existing directory",
+                f"neither cwd nor nofolder: {r}")
+        r = h.call("new", nofolder=1, model=t.model, endpoint="fake", attended=1)
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        rec = h.wait(lambda e: e.get("ev") == "session" and e.get("sid") == sid)
+        cwd = rec.get("cwd", "")
+        t.check(cwd.replace("\\", "/").endswith(f"/sessions/{sid}/work") and
+                rec.get("nofolder") == 1, f"its session record: {rec}")
+        work = t.host.join(sessions, sid, "work")
+
+        h.send("prompt", sid=sid, text="write")
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "done", f"the turn: {end}")
+        t.check(not h.all("ask", sid), f"asked: {h.all('ask', sid)}")
+        t.check([e["status"] for e in h.all("tool.end", sid)] == ["ok"],
+                f"the write: {h.all('tool.end', sid)}")
+        t.check(t.host.read(t.host.join(work, "notes.txt")) == "kept\n", "written in its folder")
+        system = fake_provider.system_of(t.requests()[0]["body"])
+        t.check(f"Working directory: {cwd} (a private folder for this session; "
+                "there is no project)" in system, "the prompt says it is no project")
+        t.check("Global rule" in system and "Home project rule" not in system,
+                "the user's instructions, not the home's")
+        t.check("- usr: User skill" in system and "Project skill" not in system,
+                "the user's skills, not those up the tree")
+        ins = [e for e in h.all("instructions", sid) if e.get("why") == "start"]
+        t.check(len(ins) == 1 and len(ins[0]["files"]) == 1, f"instructions: {ins}")
+
+        h.call("list")
+        entry = next((e for e in h.all("sessions")[-1]["list"] if e["sid"] == sid), {})
+        t.check(entry.get("nofolder") == 1 and entry.get("cwd") == cwd, f"listed: {entry}")
+
+        # A fork works in a copy of its own
+        f = h.call("fork", sid=sid)
+        t.check(f.get("ok") == 1, f"fork: {f}")
+        fork = f.get("sid", "")
+        frec = logged(t, fork)[0]
+        fwork = frec.get("cwd", "")
+        t.check(fwork.replace("\\", "/").endswith(f"/sessions/{fork}/work") and
+                frec.get("nofolder") == 1, f"the fork's record: {frec}")
+        t.check(t.host.read(t.host.join(sessions, fork, "work", "notes.txt")) == "kept\n",
+                "the fork has a copy of the folder")
+        h.call("open", sid=fork)
+        h.send("prompt", sid=fork, text="read")
+        t.check(ended(h, fork, 2)["why"] == "done", "the fork goes on")
+        last = h.all("tool.end", fork)[-1]
+        t.check(last["status"] == "ok" and "kept" in last["text"] and
+                not h.all("ask", fork), f"read in its folder: {last}")
+
+        # Opened again with its folder gone: made again
+        r = h.call("close", sid=sid, forget=1)
+        t.check(r.get("ok") == 1, f"close: {r}")
+        rmtree(t, work)
+        r = h.call("open", sid=sid)
+        t.check(r.get("ok") == 1, f"open: {r}")
+        t.check(isdir(t, work) and t.host.read(t.host.join(work, "notes.txt")) is None,
+                "made again, empty")
+        h.send("prompt", sid=sid, text="write")
+        t.check(ended(h, sid, 2)["why"] == "done", "and written again")
+        t.check(t.host.read(t.host.join(work, "notes.txt")) == "kept\n", "its folder is back")
+
+        # A delete takes it
+        r = h.call("delete", sid=fork)
+        t.check(r.get("ok") == 1, f"delete: {r}")
+        t.check(gone(t, t.host.join(sessions, fork)), "the fork and its folder are gone")
+
+        # An import in a folder of its own
+        log = t.host.read(t.host.join(sessions, sid, "events.jsonl"))
+        r = importlog(t, h, log, cwd="", nofolder=1, model=t.model, endpoint="fake")
+        t.check(r.get("ok") == 1, f"import: {r}")
+        imp = r.get("sid", "")
+        irec = logged(t, imp)[0]
+        t.check(irec.get("cwd", "").replace("\\", "/").endswith(f"/sessions/{imp}/work") and
+                irec.get("nofolder") == 1, f"imported: {irec}")
+        t.check(t.host.read(t.host.join(sessions, imp, "work", "notes.txt")) is None,
+                "an import's folder starts empty")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

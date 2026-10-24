@@ -3946,6 +3946,20 @@ def sc_an_attach(model, n, req):
     yield from an_answer(model, req, f"I see {len(user_images(req))} images.")
 
 
+def sc_nofolder(model, n, req):
+    # A session in a folder of its own: "write" makes a file there, by a
+    # relative path, "read" reads it back; then a plain answer
+    msgs = req.get("messages", [])
+    if msgs and msgs[-1].get("role") == "tool":
+        yield from answer(model, "Done in my folder.")
+    elif last_user(req) == "write":
+        yield from tool(model, n, "write", {"path": "notes.txt", "content": "kept\n"})
+    elif last_user(req) == "read":
+        yield from tool(model, n, "read", {"path": "notes.txt"})
+    else:
+        yield from answer(model, "Nothing to do.")
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 
