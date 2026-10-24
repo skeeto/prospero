@@ -5783,6 +5783,53 @@ IMPORTED = {"session", "title", "user", "turn", "attempt", "assistant", "tool.st
             "notice"}
 
 
+@scenario(bound=15)
+def new_tilde(t):
+    """new and import take a cwd beginning with ~, the home directory of
+    the engine's host (HOME, else on Windows USERPROFILE), which hello
+    names; ~user is refused, as is ~ with no home known."""
+    env = {"HOME": t.base}
+    if t.host.windows:
+        env["USERPROFILE"] = t.base.replace("/", "\\")
+    h = t.headless(env=env)
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        hello = h.all("hello")[0]
+        t.check("home" in hello.get("caps", []) and hello.get("home") == t.base,
+                f"hello: {hello.get('home')!r}")
+        plain = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        want = h.wait(lambda e: e.get("ev") == "session" and e.get("sid") == plain)["cwd"]
+        tildes = ["~/work", "~/work/"] + (["~\\work"] if t.host.windows else [])
+        for cwd in tildes:
+            r = h.call("new", cwd=cwd, model=t.model, endpoint="fake")
+            t.check(r.get("ok") == 1, f"new {cwd}: {r}")
+            sess = h.wait(lambda e: e.get("ev") == "session" and e.get("sid") == r.get("sid"))
+            t.check(sess["cwd"] == want, f"{cwd} is {sess['cwd']}, not {want}")
+        r = h.call("new", cwd="~nobody/work", model=t.model, endpoint="fake")
+        t.check(r.get("ok") == 0 and "~user is not supported" in r.get("err", ""),
+                f"~user: {r}")
+        log = t.host.read(t.host.join(t.state, "sessions", plain, "events.jsonl"))
+        r = importlog(t, h, log, cwd="~/work", model=t.model, endpoint="fake")
+        t.check(r.get("ok") == 1, f"import ~/work: {r}")
+        made = [e for e in logged(t, r.get("sid", "")) if e["ev"] == "session"]
+        t.check(made and made[0]["cwd"] == want, f"imported to {made[:1]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+    # No home: refused, saying why
+    h = t.headless(env={"HOME": "", "USERPROFILE": ""})
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        t.check("home" not in h.all("hello")[0], f"a home: {h.all('hello')[0]}")
+        r = h.call("new", cwd="~/work", model=t.model, endpoint="fake")
+        t.check(r.get("ok") == 0 and "no home directory for ~" in r.get("err", ""),
+                f"no home: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=20)
 def import_roundtrip(t):
     """import: a session's raw log, uploaded in parts, becomes a new

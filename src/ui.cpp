@@ -4270,7 +4270,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
         pen(&b, finish(&q), STYLE_BOLD, g->pal->active);
     }
     pen(&b, "  ", 0, g->pal->dim);
-    pen(&b, cwd, 0, g->pal->dim);
+    pen(&b, homeshow(&a, s->host, cwd), 0, g->pal->dim);
     // Its context gauge, thin along the row's foot, where a view has it
     if (v && gaugewidth(g, v)>0 && p.x+w-4*sc-x >= 8) {
         gaugebar(g, dl, v, x, r1.y - 3*sc, p.x + w - 4*sc - x, 2*sc, sc);
@@ -4972,10 +4972,9 @@ static void drawnew(Gui *g)
         ImGui::TextDisabled("Recent");
         for (iz i = 0; i < recent.len; i++) {
             ImGui::PushID((i32)i);
-            if (ImGui::Selectable(cstr0(&a, recent[i]))) {
-                iz n = recent[i].len<FIELD_MAX ? recent[i].len : FIELD_MAX-1;
-                copybytes(g->newcwd, recent[i].data, n);
-                g->newcwd[n] = 0;
+            Str shown = homeshow(&a, host, recent[i]);  // ~ as the host has it
+            if (ImGui::Selectable(cstr0(&a, shown))) {
+                fieldput(g->newcwd, shown);
             }
             ImGui::PopID();
         }

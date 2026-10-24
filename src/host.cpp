@@ -704,6 +704,10 @@ static void hosthello(Host *h, HostClient *c, Arena scratch, i64 id, Json *j)
     putintkey(&w.json, "proto", h->proto);
     putstrkey(&w.json, "version", PROSPERO_VERSION);
     putcaps(&w.json, 1);
+    Str home = userhome(h->os, &scratch);  // the engine's, where ~ is
+    if (home.len) {
+        putstrkey(&w.json, "home", home);
+    }
     putintkey(&w.json, "pid", (i64)os_pid(h->os));
     Str line = evend(&w);
     hostmust(h, c, scratch, line);

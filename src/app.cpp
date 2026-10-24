@@ -405,6 +405,7 @@ struct GuiHost {
     Str        version;
     Slice<Str> cmds;    // the commands it takes
     Slice<Str> caps;    // and its features (putcaps)
+    Str        home;    // its home directory, ~ there (homeshow), if known
     b32        relist;  // a command changed its list: ask again (drainmail)
     u64        uid;     // unique to this host while it is one (addhost)
     // Update engine: deploying there, then the host stopped and reached
@@ -3385,6 +3386,15 @@ static void hostcaps(Gui *g, GuiHost *h, Json *j)
     h->version = h->version==version ? h->version : clone(&g->perm, version);
     hostnames(g, &h->cmds, jsonget(j, "cmds"));
     hostnames(g, &h->caps, jsonget(j, "caps"));
+    Str home = jsonstr(jsonget(j, "home"));
+    h->home = h->home==home ? h->home : clone(&g->perm, home);
+}
+
+// A path on a host as ~ where it is in the host's home directory, which
+// its engine takes back (new, import), else as it is.
+static Str homeshow(Arena *a, GuiHost *h, Str path)
+{
+    return h ? tildeform(a, path, h->home) : path;
 }
 
 // Whether a host's engine takes a command, or has a feature, by name:

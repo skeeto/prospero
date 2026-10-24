@@ -445,8 +445,35 @@ static void testtargets(Test *t)
            submodel(e, &a, v.scratch, "listed", url).len > 0), "1");
 }
 
+// A typed directory's leading ~ (new, import): this host's home, else
+// refused, as is ~user; a ~ elsewhere is a plain name.
+static void testtilde(Test *t)
+{
+    Arena *a = &t->perm;
+    struct { Str path; Str home; b32 win; Str want; } cases[] = {
+        {"~", "/home/u", 0, "/home/u"},
+        {"~/src/x", "/home/u", 0, "/home/u/src/x"},
+        {"~/", "/home/u", 0, "/home/u/"},
+        {"~\\x", "/home/u", 0, "!~user is not supported: give the directory's full path"},
+        {"~\\x", "C:\\Users\\u", 1, "C:\\Users\\u\\x"},
+        {"~/x", "C:\\Users\\u", 1, "C:\\Users\\u/x"},
+        {"~bob/x", "/home/u", 0, "!~user is not supported: give the directory's full path"},
+        {"~/x", "", 0, "!no home directory for ~: HOME is not set"},
+        {"~", "", 1, "!no home directory for ~: neither HOME nor USERPROFILE is set"},
+        {"/tmp/~", "", 0, "/tmp/~"},
+        {"a~", "/home/u", 0, "a~"},
+        {"", "/home/u", 0, ""},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        HomePath r = tildepath(a, cases[i].path, cases[i].home, cases[i].win);
+        Str got = r.err.len ? concat(a, "!", r.err) : r.path;
+        expect(t, concat(a, "tilde ", cases[i].path), got, cases[i].want);
+    }
+}
+
 static void test_engine(Test *t)
 {
+    testtilde(t);
     testroles(t);
     testlist(t);
     testsidecars(t);

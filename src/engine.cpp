@@ -8569,6 +8569,32 @@ static b32 jsonflag(Json *j, b32 dflt)
     return j->type==JSON_BOOL ? j->boolean : jsonint(j, dflt)!=0;
 }
 
+// A directory typed for new or import, its leading ~ expanded as a
+// shell would, here, where the path lives: "~" and "~/x" (on Windows
+// also "~\x") in the home directory, HOME, else on Windows USERPROFILE.
+// Refused with no home known, and for "~user", which is not supported,
+// rather than taken as a relative name nobody means.
+struct HomePath {
+    Str path;
+    Str err;  // null if none
+};
+
+static HomePath tildepath(Arena *a, Str path, Str home, b32 win)
+{
+    HomePath r = {path, {}};
+    if (!path.len || path[0]!='~') {
+        return r;
+    } else if (path.len>1 && !issep(path[1], win)) {
+        r.err = "~user is not supported: give the directory's full path";
+    } else if (!home.len) {
+        r.err = win ? Str("no home directory for ~: neither HOME nor USERPROFILE is set")
+                    : Str("no home directory for ~: HOME is not set");
+    } else {
+        r.path = concat(a, home, cuthead(path, 1));
+    }
+    return r;
+}
+
 // The first word of a tool list that names no tool, or null.
 static Str unknowntools(Str list)
 {
@@ -8597,6 +8623,7 @@ static Str unknowntools(Str list)
 // fallbacks, so that every request goes to the model given, and with
 // temp "ask", the system's temporary directories outside the workspace
 // (where an eval's other runs are). Its subagents keep the last three.
+// A leading ~ in cwd is this host's home directory (tildepath).
 static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str  cwd   = jsonstr(jsonget(j, "cwd"));
@@ -8658,7 +8685,12 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         }
     }
 
-    Str real = cwd.len ? os_realpath(e->os, &scratch, cwd) : Str{};
+    HomePath hp = tildepath(&scratch, cwd, e->home, HOST_WINDOWS);
+    if (hp.err.len) {
+        reply(e, scratch, id, 0, hp.err, {});
+        return;
+    }
+    Str real = cwd.len ? os_realpath(e->os, &scratch, hp.path) : Str{};
     if (!real.len || os_stat(e->os, scratch, real).type!=STAT_DIR) {
         reply(e, scratch, id, 0, "cwd must name an existing directory", {});
         return;
@@ -10504,11 +10536,11 @@ static void cmdupload(Engine *e, Arena scratch, i64 id, Json *j)
 
 // import {token, cwd, model?, endpoint?}: a new session from the raw log
 // an upload staged, which it removes whatever comes of it, as logimport
-// makes it, working in cwd, which must exist, with the model and the
-// endpoint given, else the configuration's, as new has them (MODEL, or
-// ENDPOINT/MODEL). Its title and its log are written as a fork's are,
-// the log last. The reply names the new session (sid) and the one it
-// was (from). The session is not opened.
+// makes it, working in cwd, which must exist (~ as new takes it), with
+// the model and the endpoint given, else the configuration's, as new
+// has them (MODEL, or ENDPOINT/MODEL). Its title and its log are written
+// as a fork's are, the log last. The reply names the new session (sid)
+// and the one it was (from). The session is not opened.
 static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Os  *os    = e->os;
@@ -10533,7 +10565,12 @@ static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     }
 
-    Str real = cwd.len ? os_realpath(os, &scratch, cwd) : Str{};
+    HomePath hp = tildepath(&scratch, cwd, e->home, HOST_WINDOWS);
+    if (hp.err.len) {
+        reply(e, scratch, id, 0, hp.err, {});
+        return;
+    }
+    Str real = cwd.len ? os_realpath(os, &scratch, hp.path) : Str{};
     if (!real.len || os_stat(os, scratch, real).type!=STAT_DIR) {
         reply(e, scratch, id, 0, "cwd must name an existing directory", {});
         return;
@@ -10760,6 +10797,9 @@ static void command(Engine *e, Arena scratch, Str line)
         putintkey(&w.json, "proto", 0);
         putstrkey(&w.json, "version", PROSPERO_VERSION);
         putcaps(&w.json, 0);
+        if (e->home.len) {
+            putstrkey(&w.json, "home", e->home);  // where ~ is
+        }
         emit(e, evend(&w));
         reply(e, scratch, id, 1, {}, {});
     } return;

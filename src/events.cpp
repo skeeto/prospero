@@ -189,6 +189,8 @@ static Str capnames[] = {
     "queue",           // queue records, and unqueue to withdraw from one
     "message",         // sessions and send_message, notices of kind message
     "images",          // upload {kind:"image"}, prompt and steer {images}
+    "home",            // hello {home}, and new and import take a cwd
+                       // beginning with ~, in that home directory
 };
 
 static Str evname(i32 ev)

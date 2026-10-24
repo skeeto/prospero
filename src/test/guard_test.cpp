@@ -120,6 +120,24 @@ static void test_guard(Test *t)
         Str got = expandhome(a, homes[i].path, homes[i].home, 0);
         expect(t, concat(a, "home ", homes[i].path), got, homes[i].want);
     }
+    struct { Str path; Str home; Str want; } tildes[] = {
+        {"/home/u", "/home/u", "~"},
+        {"/home/u/x/y", "/home/u", "~/x/y"},
+        {"/home/u/x", "/home/u/", "~/x"},
+        {"/home/user/x", "/home/u", "/home/user/x"},
+        {"/home/U/x", "/home/u", "/home/U/x"},
+        {"/home", "/home/u", "/home"},
+        {"/x", "/", "/x"},
+        {"/x", "", "/x"},
+        {"C:/Users/Me/src", "C:\\Users\\me", "~/src"},
+        {"C:\\Users\\Me\\src", "C:\\Users\\Me", "~\\src"},
+        {"C:\\Users\\Mel", "C:\\Users\\Me", "C:\\Users\\Mel"},
+        {"D:/x", "D:\\", "D:/x"},
+    };
+    for (iz i = 0; i < countof(tildes); i++) {
+        Str got = tildeform(a, tildes[i].path, tildes[i].home);
+        expect(t, concat(a, "tilde form ", tildes[i].path), got, tildes[i].want);
+    }
 
     // A workspace on a virtual file system with symlinks
     Os *os = newos(a, 1<<20);

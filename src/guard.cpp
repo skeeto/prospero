@@ -194,6 +194,31 @@ static Str expandhome(Arena *a, Str path, Str home, b32 win)
     return path;  // "~user" is a plain name
 }
 
+// The other way: a path in the home directory as "~" or "~/x", else as
+// it is. A home with a drive (C:) is a Windows path, compared without
+// case, its separators either. The path keeps its own separators.
+static Str tildeform(Arena *a, Str path, Str home)
+{
+    b32 win  = home.len>=2 && home[1]==':';
+    iz  root = pathroot(home, win);
+    for (; home.len>root && issep(home[home.len-1], win); home.len--) {}
+    if (!root || root==home.len || path.len<home.len) {
+        return path;  // no home, or a root: the whole file system
+    }
+    for (iz i = 0; i < home.len; i++) {
+        u8  x    = path[i];
+        u8  y    = home[i];
+        b32 same = win ? (issep(x, 1) && issep(y, 1)) || equalfold({&x, 1}, {&y, 1}) : x==y;
+        if (!same) {
+            return path;
+        }
+    }
+    if (path.len>home.len && !issep(path[home.len], win)) {
+        return path;
+    }
+    return concat(a, "~", cuthead(path, home.len));
+}
+
 // The real path of a normalized one: symlinks resolved through the
 // deepest ancestor that exists, then the missing rest appended. Null if
 // not even the root resolves. The deepest few ancestors are tried one
