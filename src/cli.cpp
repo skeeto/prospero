@@ -517,31 +517,18 @@ static void stdinthread(void *arg)
     enginecmd(r->e, "{\"cmd\":\"quit\",\"id\":0}");
 }
 
-// $XDG_STATE_HOME/prospero, else $HOME/.local/state/prospero, else
-// (Windows) %LOCALAPPDATA%\prospero, in the order cfgdefault looks for
-// the configuration, so that with HOME set both are under it. Except
-// that on Windows, where state was in %LOCALAPPDATA% before HOME came
-// first, a state directory there is kept while none is under HOME.
+// $XDG_STATE_HOME/prospero, else ~/.local/state/prospero (userhome),
+// in the order cfgdefault looks for the configuration. On Windows,
+// %LOCALAPPDATA%\prospero is used while ~/.local/state has none, as
+// state went there before, or with no home at all.
 static Str defaultstate(Os *os, Arena *a)
 {
     Str base = os_getenv(os, a, "XDG_STATE_HOME");
     if (base.len) {
         return join(a, base, "prospero");
     }
-    Str home  = os_getenv(os, a, "HOME");
-    Str local = HOST_WINDOWS ? os_getenv(os, a, "LOCALAPPDATA") : Str{};
-    if (local.len) {
-        Str old = join(a, local, "prospero");
-        if (!home.len) {
-            return old;
-        }
-        Str want = join(a, join(a, home, ".local/state"), "prospero");
-        b32 kept = os_stat(os, *a, want).type==STAT_MISSING &&
-                   os_stat(os, *a, old).type==STAT_DIR;
-        return kept ? old : want;
-    }
-    if (!home.len) home = os_getenv(os, a, "USERPROFILE");
-    return join(a, join(a, home, ".local/state"), "prospero");
+    return homeorold(os, a, userhome(os, a), ".local/state/prospero",
+                     "LOCALAPPDATA", "prospero", STAT_DIR);
 }
 
 // The configuration, its diagnostics reported on standard error: an

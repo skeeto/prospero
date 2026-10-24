@@ -2066,24 +2066,46 @@ static void cfgattach(Config *c, Mailbox *mbox, i64 every)
 
 // Loading
 
+// The user's home: $HOME, else on Windows %USERPROFILE%, which is what
+// w64devkit and the like set HOME to, so that a program started from
+// Explorer, with no HOME, finds the same files as one started there.
+static Str userhome(Os *os, Arena *a)
+{
+    Str home = os_getenv(os, a, "HOME");
+    if (!home.len && HOST_WINDOWS) {
+        home = os_getenv(os, a, "USERPROFILE");
+    }
+    return home;
+}
+
+// Under the home directory, rel, unless (Windows) only the older place
+// under the known folder in env has one, kind a file or a directory.
+static Str homeorold(Os *os, Arena *a, Str home, Str rel, Str env,
+                     Str oldrel, i32 kind)
+{
+    Str known = HOST_WINDOWS ? os_getenv(os, a, env) : Str{};
+    Str old   = known.len ? join(a, known, oldrel) : Str{};
+    if (!home.len) {
+        return old;
+    }
+    Str want = join(a, home, rel);
+    b32 kept = old.len && os_stat(os, *a, want).type==STAT_MISSING &&
+               os_stat(os, *a, old).type==kind;
+    return kept ? old : want;
+}
+
 // The default location of the user's file, or null if there is none:
-// $XDG_CONFIG_HOME/prospero, else $HOME/.config/prospero, else (Windows)
-// %APPDATA%\prospero, with prospero.ini in it.
+// $XDG_CONFIG_HOME/prospero, else ~/.config/prospero (userhome), with
+// prospero.ini in it. On Windows, %APPDATA%\prospero's is used while
+// ~/.config has none, or with no home at all.
 static Str cfgdefault(Os *os, Arena *a)
 {
     Str base = os_getenv(os, a, "XDG_CONFIG_HOME");
     if (base.len) {
         return join(a, join(a, base, "prospero"), "prospero.ini");
     }
-    Str home = os_getenv(os, a, "HOME");
-    if (home.len) {
-        return join(a, join(a, home, ".config/prospero"), "prospero.ini");
-    }
-    Str appdata = os_getenv(os, a, "APPDATA");
-    if (appdata.len) {
-        return join(a, join(a, appdata, "prospero"), "prospero.ini");
-    }
-    return {};
+    return homeorold(os, a, userhome(os, a), ".config/prospero/prospero.ini",
+                     "APPDATA", "prospero/prospero.ini", STAT_FILE);
 }
 
 // A hash over the type, size and mtime of each path, never 0.

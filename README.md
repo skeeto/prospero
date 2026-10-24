@@ -312,9 +312,11 @@ llama.cpp router on this machine, and a model at Anthropic:
 ## Configuration
 
 Prospero reads one INI file, `$XDG_CONFIG_HOME/prospero/prospero.ini`,
-which defaults to `~/.config/prospero/prospero.ini`. On Windows,
-`%XDG_CONFIG_HOME%` and `%HOME%\.config` are tried first, then
-`%APPDATA%\prospero\prospero.ini`. On first run it writes the file
+which defaults to `~/.config/prospero/prospero.ini`. On Windows, home
+is `%HOME%`, else `%USERPROFILE%`, so that Prospero started from
+Explorer finds the same files as from a shell that sets HOME, and
+`%APPDATA%\prospero\prospero.ini` is used only while there is none
+under home. On first run it writes the file
 from its built-in copy ([assets/prospero.ini](assets/prospero.ini)),
 which documents every section and key: `[endpoint NAME]`,
 `[model NAME]`, `[role NAME]`, `[guard]`, `[tools]`, `[instructions]`,
@@ -372,9 +374,8 @@ fallback or a compactor.
 
 Sessions, their logs and the cache of URL includes live in the state
 directory: `$XDG_STATE_HOME/prospero`, else `~/.local/state/prospero`.
-On Windows, with no `%HOME%` (as from Explorer, but not w64devkit), it
-is `%LOCALAPPDATA%\prospero`, and there a state directory made before
-`%HOME%` came first is used until one exists under `%HOME%`.
+On Windows, `%LOCALAPPDATA%\prospero`, where it used to be, is used
+while there is none under home.
 
 At the start of a session the agent is given its instructions:
 `AGENTS.md` next to the default configuration file (such as
