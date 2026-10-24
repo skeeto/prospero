@@ -592,7 +592,7 @@ def desktop(t):
     tools = [r for r in c.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
     t.check(tools and tools[0].get("status") == "ok", f"the screenshot: {tools}")
     try:
-        with open(log) as f:
+        with open(log, encoding="utf-8") as f:
             took = [json.loads(x) for x in f.read().splitlines()]
     except OSError:
         took = []

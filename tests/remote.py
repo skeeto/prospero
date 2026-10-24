@@ -412,7 +412,7 @@ class T:
 
     def log(self, sid):
         path = os.path.join(self.state, "sessions", sid, "events.jsonl")
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return f.read().splitlines(keepends=True)
 
 
@@ -774,7 +774,7 @@ def backlog(t):
     q = c.call("quit")
     t.check(q.get("ok") == 1, f"quit: {q}")
     s.close()
-    with open(os.path.join(t.state, "run", "host.log")) as f:
+    with open(os.path.join(t.state, "run", "host.log"), encoding="utf-8") as f:
         log = f.read()
     t.check("fell behind" in log, f"it never fell behind: {log!r}")
 
@@ -1064,7 +1064,7 @@ def behind_drop(t):
         log = ""
         while "fell too far behind" not in log and time.monotonic() < deadline:
             time.sleep(0.2)
-            with open(os.path.join(t.state, "run", "host.log")) as f:
+            with open(os.path.join(t.state, "run", "host.log"), encoding="utf-8") as f:
                 log = f.read()
         t.check("fell too far behind" in log, f"dropped: {log[-300:]!r}")
         t.check(not gone(pid, 0.5), "the host lives on")
