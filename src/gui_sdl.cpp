@@ -89,6 +89,50 @@ static b32 firstmouse(SDL_Window *w)
     void *view = ((Get)(void *)objc_msgSend)(win, sel_registerName("contentView"));
     return view && ((Test)(void *)objc_msgSend)(view, sel_registerName("acceptsFirstMouse:"), 0);
 }
+
+extern "C" void *objc_autoreleasePoolPush();
+extern "C" void  objc_autoreleasePoolPop(void *);
+
+// No window restoration, which the window's own saved place makes moot:
+// after a crash AppKit would otherwise hold the launch at a modal "reopen
+// its windows?" alert, before any window shows. Registered defaults, so
+// the user's own settings are untouched. Before SDL_Init, which finishes
+// the launch.
+static void nopersist()
+{
+    using Get  = void *(*)(void *, void *);
+    using Cstr = void *(*)(void *, void *, char const *);
+    using Bool = void *(*)(void *, void *, bool);
+    using Two  = void *(*)(void *, void *, void *, void *);
+    using Set  = void  (*)(void *, void *, void *);
+    void *pool = objc_autoreleasePoolPush();
+    Cstr  str  = (Cstr)(void *)objc_msgSend;
+    void *nstr = objc_getClass("NSString");
+    void *no   = ((Bool)(void *)objc_msgSend)(objc_getClass("NSNumber"),
+                                              sel_registerName("numberWithBool:"), false);
+    void *yes  = ((Bool)(void *)objc_msgSend)(objc_getClass("NSNumber"),
+                                              sel_registerName("numberWithBool:"), true);
+    void *keys[] = {
+        str(nstr, sel_registerName("stringWithUTF8String:"), "ApplePersistenceIgnoreState"),
+        str(nstr, sel_registerName("stringWithUTF8String:"), "NSQuitAlwaysKeepsWindows"),
+    };
+    void *ka   = ((Two)(void *)objc_msgSend)(objc_getClass("NSArray"),
+                                             sel_registerName("arrayWithObjects:count:"),
+                                             keys, (void *)(uz)2);
+    void *vals[] = {yes, no};
+    void *va   = ((Two)(void *)objc_msgSend)(objc_getClass("NSArray"),
+                                             sel_registerName("arrayWithObjects:count:"),
+                                             vals, (void *)(uz)2);
+    void *dict = ((Two)(void *)objc_msgSend)(objc_getClass("NSDictionary"),
+                                             sel_registerName("dictionaryWithObjects:forKeys:"),
+                                             va, ka);
+    void *defs = ((Get)(void *)objc_msgSend)(objc_getClass("NSUserDefaults"),
+                                             sel_registerName("standardUserDefaults"));
+    if (yes && no && keys[0] && keys[1] && dict && defs) {
+        ((Set)(void *)objc_msgSend)(defs, sel_registerName("registerDefaults:"), dict);
+    }
+    objc_autoreleasePoolPop(pool);
+}
 #endif
 
 using GlViewport   = void (*)(i32, i32, i32, i32);
@@ -585,6 +629,9 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
         // the backend reads directly while the window has focus.
         SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
     }
+    #ifdef __APPLE__
+    nopersist();
+    #endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         return 0;
     }
