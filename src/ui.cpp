@@ -814,11 +814,11 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
     }
 }
 
-// Copy the selection to the clipboard.
-static void copyout(Gui *g, i32 how)
+// Copy a view's selection to the clipboard.
+static void copyout(Gui *g, View *v, i32 how)
 {
     Arena a = g->frame;
-    Str   s = copysel(g->view, &a, how);
+    Str   s = copysel(v, &a, how);
     if (s.len) {
         ImGui::SetClipboardText(cstr0(&a, s));
     }
@@ -1389,6 +1389,54 @@ static void drawforce(Gui *g, GuiSession *s, ViewMsg *m)
     ImGui::TextDisabled("overwrites the changes made since");
 }
 
+// Whether the plan of the session is out in the editor, for the ask req
+// (Approve held), or for none, which holds any.
+static b32 planediting(Gui *g, GuiSession *s, Str req)
+{
+    return g->edsess==s && g->edplan && (!g->edreq.len || g->edreq==req);
+}
+
+// Why a session's plan file cannot go out to the editor, or empty: only
+// a plan on this computer does.
+static Str planeditwhy(Gui *g, GuiSession *s, Str path, Arena *a)
+{
+    if (s->host->kind == GH_REMOTE) {
+        return concat(a, "The plan is on ", concat(a, s->host->name,
+                      ": only a plan on this computer opens in the editor"));
+    }
+    return !path.len ? Str("No plan file") : editorwhy(g, s, a);
+}
+
+static Str planedittip = "Revise the plan file by hand in your editor before you approve "
+                         "it: the agent carries out the plan as the file has it then";
+
+// The plan file in the editor (planedit), for the plan's ask req, else
+// none: its button, or while it is out, which editor and a Cancel.
+static void planeditbutton(Gui *g, GuiSession *s, Str path, Str req, char const *label,
+                           Str named, Str tip)
+{
+    Arena a = g->frame;
+    if (g->edsess==s && g->edplan) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("editing in %s...", cstr0(&a, g->edname));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Cancel##planedit")) {
+            editcancel(g);
+        }
+        itemnamed(g, "cancel plan editor");
+        ImGui::SetItemTooltip("Stop the editor: the plan is as it left the file");
+        return;
+    }
+    Str why = planeditwhy(g, s, path, &a);
+    ImGui::BeginDisabled(why.len != 0);
+    if (ImGui::Button(label)) {
+        planedit(g, s, path, req);
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, named);
+    whytip(why.len ? why : tip);
+}
+
 // An open ask's buttons, below its text. Always, where the ask offers
 // it and the host's engine can take it, stands apart from Allow, past a
 // rule, so that neither is pressed for the other.
@@ -1400,7 +1448,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         // Plan mode's asks: the plan to approve, or to plan first. Not
         // while the plan is out in the editor, nor once it is empty.
         b32 enter   = t->kind == "plan.enter";
-        b32 editing = !enter && g->edsess==s && g->edplan && g->edreq==t->req;
+        b32 editing = !enter && planediting(g, s, t->req);
         Str nogo    = editing ? Str("The plan is open in the editor: close it first, "
                                     "and the plan as it saved it is the one approved") :
                       !enter && !trim(m->text).len
@@ -1437,30 +1485,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
 
         // Edit plan: the plan file in the editor, on this machine
         ImGui::SameLine();
-        if (editing) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("editing in %s...", cstr0(&a, g->edname));
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel##planedit")) {
-                editcancel(g);
-            }
-            itemnamed(g, "cancel plan editor");
-            ImGui::SetItemTooltip("Stop the editor: the plan is as it left the file");
-            return;
-        }
-        Str why = s->host->kind==GH_REMOTE
-                ? concat(&a, "The plan is on ", concat(&a, s->host->name,
-                         ": only a plan on this computer opens in the editor"))
-                : !t->path.len ? Str("No plan file") : editorwhy(g, s, &a);
-        ImGui::BeginDisabled(why.len != 0);
-        if (ImGui::Button("Edit plan")) {
-            planedit(g, s, t);
-        }
-        ImGui::EndDisabled();
-        itemnamed(g, "edit plan");
-        whytip(why.len ? why : Str("Revise the plan file by hand in your editor before you "
-                                   "approve it: the agent carries out the plan as the file "
-                                   "has it then"));
+        planeditbutton(g, s, t->path, t->req, "Edit plan", "edit plan", planedittip);
         return;
     }
     if (ImGui::Button("Allow")) {
@@ -1954,8 +1979,10 @@ static Marks msgmarks(Gui *g, View *v, i32 msg)
 // A code block's Copy button, at its top right while the mouse is over
 // the block, which it overlaps as the headers' toggles overlap the text:
 // the code byte for byte, as selecting the block whole copies it. It says
-// "Copied" for a moment after, until a deadline.
-static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f32 top)
+// "Copied" for a moment after, until a deadline. With aim, the one the
+// checklist chose is where it can find it.
+static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f32 top,
+                         b32 dragging, b32 aim)
 {
     BlockLayout *bl = pl->bl;
     Deco        *bg = 0;
@@ -1969,13 +1996,14 @@ static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f3
     ImVec2  a  = v2(origin.x+bg->x, origin.y+pl->y+bg->y);
     ImVec2  z  = v2(a.x+bg->w, a.y+bg->h);
     ImVec2  mp = ImGui::GetIO().MousePos;
-    b32     aimed = g->drivecodemsg<0 || (msg==g->drivecodemsg && pl->block==g->drivecodeblk);
+    b32     aimed = aim && (g->drivecodemsg<0 ||
+                            (msg==g->drivecodemsg && pl->block==g->drivecodeblk));
     if (aimed) {
         f32 y0 = a.y>top ? a.y : top;
         g->rects[RECT_CODEBLOCK] = {a.x, y0, z.x, z.y};
     }
     b32 over = mp.x>=a.x && mp.x<z.x && mp.y>=a.y && mp.y<z.y && mp.y>=top;
-    if (!over || g->dragging ||
+    if (!over || dragging ||
             !ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
         return;
     }
@@ -2010,6 +2038,240 @@ static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f3
         g->copiedblk  = pl->block;
         g->copiedat   = g->sched.now;
     }
+}
+
+
+// Selectable text: a view's messages drawn in a child window, which the
+// transcript and documents (DocView) share. The transcript adds its
+// headers, cards and buttons around what is here.
+
+// Where a view's text lies this frame, in the child window it is drawn
+// in: what hit-testing and drawing it share.
+struct TextArea {
+    View  *v;
+    ImVec2 wpos;     // the child window's top left
+    f32    winh;     // and its height
+    f32    width;    // the text's wrap width
+    f32    pad;      // its left margin
+    f32    head;     // a message's header line, above its text
+    f64    scrolly;
+    b32   *dragging; // a selection is being dragged
+    f64   *scrollto; // where a drag past an edge scrolls to, -1 if none
+};
+
+struct TextHit {
+    Pos at;
+    b32 hit;
+};
+
+// The mouse over a view's text: an invisible button over the visible
+// area, which items made later may overlap, then the place under the
+// mouse, clamped into the visible messages. A click selects there (a
+// double click a word, a triple click a block, with Shift extending)
+// and a drag extends it, scrolling past an edge toward the mouse,
+// faster the further. Right clicks are the caller's, on the button,
+// which stays the last item.
+static TextHit textmouse(Gui *g, TextArea *ta)
+{
+    View       *v     = ta->v;
+    f32         sc    = g->scale;
+    ImGuiStyle &st    = ImGui::GetStyle();
+    ImVec2      wpos  = ta->wpos;
+    f32         top   = wpos.y;
+    f32         bot   = wpos.y + ta->winh;
+    ImGui::SetCursorScreenPos(wpos);
+    ImGui::SetNextItemAllowOverlap();
+    ImGui::InvisibleButton("##text", v2(ImGui::GetWindowWidth() - st.ScrollbarSize, ta->winh),
+                           ImGuiButtonFlags_MouseButtonLeft|ImGuiButtonFlags_MouseButtonRight);
+    ImGuiIO &io = ImGui::GetIO();
+    b32 hovered = ImGui::IsItemHovered();
+    b32 active  = ImGui::IsItemActive();
+    if (hovered) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+    }
+
+    TextHit r = {};
+    if ((hovered || active) && v->msgs.len) {
+        f32 my = io.MousePos.y;
+        my = my<top ? top : my>bot-1 ? bot-1 : my;
+        f64 cy = ta->scrolly + (my - wpos.y);
+        i32 i  = viewfind(v, cy);
+        if (i >= 0) {
+            ViewMsg   *m  = &v->msgs[i];
+            MsgLayout *ml = msglayout(v, i, &g->measure, ta->width, sc);
+            f32 ly = (f32)(cy - m->top - ta->head);
+            r.at.msg = i;
+            r.at.off = ly<0 || m->collapsed ? 0 :
+                       msghit(&g->measure, msgdoc(v, i), ml, io.MousePos.x - wpos.x - ta->pad, ly);
+            if (ly > m->h) r.at.off = (i32)m->text.len;
+            r.hit = 1;
+        }
+    }
+
+    if (r.hit && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        i32 clicks = ImGui::GetMouseClickedCount(ImGuiMouseButton_Left);
+        if (io.KeyShift && v->sel.active) {
+            selextend(v, r.at);
+        } else {
+            selbegin(v, r.at, clicks>=3 ? SEL_BLOCK : clicks==2 ? SEL_WORD : SEL_CHAR);
+        }
+        *ta->dragging = 1;
+    }
+    if (*ta->dragging) {
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            *ta->dragging = 0;
+        } else if (r.hit) {
+            selextend(v, r.at);
+            f32 my = io.MousePos.y;
+            f32 dy = my<top ? my-top : my>bot ? my-bot : 0;
+            if (dy != 0) {
+                f32 step = dy * 0.5f;
+                step = step<-60*sc ? -60*sc : step>60*sc ? 60*sc : step;
+                *ta->scrollto = ta->scrolly + step;
+                if (*ta->scrollto < 0) *ta->scrollto = 0;
+            }
+        }
+    }
+    return r;
+}
+
+// The text's context menu, if it opened on the last item: Copy and Copy
+// as Markdown, which the caller may follow with items of its own before
+// endtextmenu. With copyrect not negative, Copy is that RECT_*.
+static b32 begintextmenu(Gui *g, View *v, i32 copyrect)
+{
+    if (!ImGui::BeginPopupContextItem("##textmenu")) {
+        return 0;
+    }
+    b32 any  = !selempty(&v->sel);
+    b32 copy = ImGui::MenuItem("Copy", g->mac ? "Cmd+C" : "Ctrl+C", false, any);
+    itemnamed(g, "text copy");
+    if (copyrect >= 0) {
+        itemrect(g, copyrect);
+    }
+    if (copy) {
+        copyout(g, v, COPY_TEXT);
+    }
+    if (ImGui::MenuItem("Copy as Markdown", 0, false, any)) {
+        copyout(g, v, COPY_MARKDOWN);
+    }
+    itemnamed(g, "text copy markdown");
+    return 1;
+}
+
+static void endtextmenu(Gui *g, View *v)
+{
+    ImGui::Separator();
+    if (ImGui::MenuItem("Select All", g->mac ? "Cmd+A" : "Ctrl+A")) {
+        selall(v);
+    }
+    itemnamed(g, "text select all");
+    ImGui::EndPopup();
+}
+
+// The selection's keys, while the window around the text has focus.
+static void textkeys(Gui *g, View *v)
+{
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_A)) {
+            selall(v);
+        }
+        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_C)) {
+            copyout(g, v, COPY_TEXT);
+        }
+        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_C)) {
+            copyout(g, v, COPY_MARKDOWN);
+        }
+    }
+}
+
+// A message's text, laid out in ml, from origin: its blocks within the
+// window's [top, bot], with the selection and its find hits, then its
+// code blocks' Copy buttons.
+static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea *ta,
+                        i32 i, MsgLayout *ml, ImVec2 origin, Range sel, Marks *mk,
+                        f32 alpha, b32 aim)
+{
+    View *v   = ta->v;
+    Doc  *d   = msgdoc(v, i);
+    f32   top = ta->wpos.y;
+    f32   bot = ta->wpos.y + ta->winh;
+    for (iz k = 0; k < ml->blocks.len; k++) {
+        Placed *pl = &ml->blocks[k];
+        if (origin.y+pl->y > bot || origin.y+pl->y+pl->bl->h < top) {
+            continue;
+        }
+        drawblock(g, dl, sp, d, i, pl, origin, sel, mk, top, bot, alpha);
+    }
+    ImGui::PushID(i);
+    for (iz k = 0; k < ml->blocks.len; k++) {
+        Placed *pl = &ml->blocks[k];
+        if (d->blocks[pl->block].type!=DOC_CODE || origin.y+pl->y > bot ||
+                origin.y+pl->y+pl->bl->h < top) {
+            continue;
+        }
+        drawcodecopy(g, v, i, pl, origin, top, *ta->dragging, aim);
+    }
+    ImGui::PopID();
+}
+
+// A document (DocView) in a child window filling the rest of the window
+// at the cursor: laid out at its width whole, as a document is short,
+// its text selectable, with the text's context menu, and its keys while
+// the window has focus.
+static void drawdoc(Gui *g, DocView *d, char const *id)
+{
+    View       *v     = d->v;
+    f32         sc    = g->scale;
+    ImGuiStyle &st    = ImGui::GetStyle();
+    ImVec2      avail = ImGui::GetContentRegionAvail();
+    f32         pad   = 4*sc;
+    f32         width = avail.x - st.ScrollbarSize - 2*pad;
+    width = (f32)(i32)(width<50*sc ? 50*sc : width);
+    FontMetrics fm    = fontmetrics(&g->fonts, 0);
+    f32         charw = fontadvance(&g->fonts, 0, 'n');
+    if (width != v->lastw) {
+        v->topsdirty = 1;
+        v->lastw     = width;
+    }
+    viewtops(v, width, charw, fm.lineh);
+    for (i32 i = 0; i < v->msgs.len; i++) {
+        msglayout(v, i, &g->measure, width, sc);
+    }
+    f64 total = viewtops(v, width, charw, fm.lineh);
+
+    ImGui::SetNextWindowContentSize(v2(0, (f32)total + 2*pad));
+    if (d->scrollto >= 0) {
+        ImGui::SetNextWindowScroll(v2(-1, (f32)d->scrollto));
+        d->scrollto = -1;
+    }
+    ImGui::BeginChild(id, v2(0, 0));
+    d->win = ImGui::GetCurrentWindow();
+    ImVec2   wpos = ImGui::GetWindowPos();
+    TextArea ta   = {v, wpos, ImGui::GetWindowHeight(), width, pad, pad,
+                     ImGui::GetScrollY(), &d->dragging, &d->scrollto};
+    textmouse(g, &ta);
+    if (begintextmenu(g, v, -1)) {
+        endtextmenu(g, v);
+    }
+
+    ImDrawList         *dl  = ImGui::GetWindowDrawList();
+    ImDrawListSplitter *sp  = &g->splitter;
+    Range               sel = selrange(&v->sel);
+    Marks               mk  = {0, 0, -1};
+    sp->Split(dl, CH_COUNT);
+    for (i32 i = viewfind(v, ta.scrolly); i>=0 && i<v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        f32      y = wpos.y + (f32)(m->top - ta.scrolly);
+        if (y > wpos.y+ta.winh) {
+            break;
+        }
+        MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
+        drawmsgtext(g, dl, sp, &ta, i, ml, v2(wpos.x + pad, y + pad), sel, &mk, 1, 0);
+    }
+    sp->Merge(dl);
+    ImGui::EndChild();
+    textkeys(g, v);  // the window's, as its child's
 }
 
 // The find bar, open over the transcript: the text to find, the hits
@@ -2291,87 +2553,19 @@ static void drawtranscript(Gui *g)
 
     // Mouse: an invisible button over the visible area, which the
     // headers' toggles and the asks' buttons, made later, overlap.
-    ImGui::SetCursorScreenPos(wpos);
-    ImGui::SetNextItemAllowOverlap();
-    ImGui::InvisibleButton("##text", v2(ImGui::GetWindowWidth() - st.ScrollbarSize, winh),
-                           ImGuiButtonFlags_MouseButtonLeft|ImGuiButtonFlags_MouseButtonRight);
+    TextArea ta  = {v, wpos, winh, width, pad, head, scrolly, &g->dragging, &g->scrollto};
+    TextHit  hit = textmouse(g, &ta);
     itemrect(g, RECT_TRANSCRIPT);
-    ImGuiIO &io = ImGui::GetIO();
-    b32 hovered = ImGui::IsItemHovered();
-    b32 active  = ImGui::IsItemActive();
-    if (hovered) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
-    }
-
-    // The position under the mouse, clamped into the visible messages.
-    Pos at = {};
-    b32 hit = 0;
-    if ((hovered || active) && v->msgs.len) {
-        f32 my = io.MousePos.y;
-        my = my<top ? top : my>bot-1 ? bot-1 : my;
-        f64 cy = scrolly + (my - wpos.y);
-        i32 i  = viewfind(v, cy);
-        if (i >= 0) {
-            ViewMsg   *m  = &v->msgs[i];
-            MsgLayout *ml = msglayout(v, i, &g->measure, width, sc);
-            f32 ly = (f32)(cy - m->top - head);
-            at.msg = i;
-            at.off = ly<0 || m->collapsed ? 0 :
-                     msghit(&g->measure, msgdoc(v, i), ml, io.MousePos.x - wpos.x - pad, ly);
-            if (ly > m->h) at.off = (i32)m->text.len;
-            hit = 1;
-        }
-    }
-
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-        g->menumsg = hit ? at.msg : -1;  // the popup takes the hover from here on
+        g->menumsg = hit.hit ? hit.at.msg : -1;  // the popup takes the hover from here on
     }
-    if (hit && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-        i32 clicks = ImGui::GetMouseClickedCount(ImGuiMouseButton_Left);
-        if (io.KeyShift && v->sel.active) {
-            selextend(v, at);
-        } else {
-            selbegin(v, at, clicks>=3 ? SEL_BLOCK : clicks==2 ? SEL_WORD : SEL_CHAR);
-        }
-        g->dragging = 1;
-    }
-    if (g->dragging) {
-        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            g->dragging = 0;
-        } else if (hit) {
-            selextend(v, at);
-            // Past an edge: scroll toward the mouse, faster the further.
-            f32 my = io.MousePos.y;
-            f32 dy = my<top ? my-top : my>bot ? my-bot : 0;
-            if (dy != 0) {
-                f32 step = dy * 0.5f;
-                step = step<-60*sc ? -60*sc : step>60*sc ? 60*sc : step;
-                g->scrollto = scrolly + step;
-                if (g->scrollto < 0) g->scrollto = 0;
-            }
-        }
-    }
-
-    if (ImGui::BeginPopupContextItem("##textmenu")) {
-        b32 any = !selempty(&v->sel);
-        b32 copy = ImGui::MenuItem("Copy", g->mac ? "Cmd+C" : "Ctrl+C", false, any);
-        itemrect(g, RECT_COPYITEM);
-        if (copy) {
-            copyout(g, COPY_TEXT);
-        }
-        if (ImGui::MenuItem("Copy as Markdown", 0, false, any)) {
-            copyout(g, COPY_MARKDOWN);
-        }
+    if (begintextmenu(g, v, RECT_COPYITEM)) {
         b32 onmsg = g->menumsg>=0 && g->menumsg<v->msgs.len;
         if (ImGui::MenuItem("Copy Message", 0, false, onmsg)) {
             copymessage(g, g->menumsg);
         }
         forkitem(g, onmsg ? &v->msgs[g->menumsg] : 0);
-        ImGui::Separator();
-        if (ImGui::MenuItem("Select All", g->mac ? "Cmd+A" : "Ctrl+A")) {
-            selall(v);
-        }
-        ImGui::EndPopup();
+        endtextmenu(g, v);
     }
 
     // Drawing
@@ -2438,28 +2632,12 @@ static void drawtranscript(Gui *g)
         f32       actw = act.kind ? act.w + 8*sc : 0;
         Pen p = {dl, &g->fonts, x, y + pad/4, x + width - actw, g->fonts.size*0.85f};
         drawheader(g, &p, v, m, nowms);
-        ImVec2 origin = v2(x, y + head);
-        Doc   *d      = m->collapsed ? 0 : msgdoc(v, i);
-        if (d) {
+        if (!m->collapsed) {
             Marks mk = msgmarks(g, v, i);
-            for (iz k = 0; k < ml->blocks.len; k++) {
-                Placed *pl = &ml->blocks[k];
-                if (origin.y+pl->y > bot || origin.y+pl->y+pl->bl->h < top) {
-                    continue;
-                }
-                drawblock(g, dl, sp, d, i, pl, origin, sel, &mk, top, bot, alpha);
-            }
+            drawmsgtext(g, dl, sp, &ta, i, ml, v2(x, y + head), sel, &mk, alpha, 1);
         }
 
         ImGui::PushID(i);
-        for (iz k = 0; d && k < ml->blocks.len; k++) {
-            Placed *pl = &ml->blocks[k];
-            if (d->blocks[pl->block].type!=DOC_CODE || origin.y+pl->y > bot ||
-                    origin.y+pl->y+pl->bl->h < top) {
-                continue;
-            }
-            drawcodecopy(g, v, i, pl, origin, top);
-        }
         if (m->fold || m->role==VIEW_TOOL || m->role==VIEW_THINK) {
             // The header toggles the body, but for its action
             ImGui::SetCursorScreenPos(v2(x, y));
@@ -2505,18 +2683,7 @@ static void drawtranscript(Gui *g)
         ImGui::PopID();
     }
     sp->Merge(dl);
-
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
-        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_A)) {
-            selall(v);
-        }
-        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_C)) {
-            copyout(g, COPY_TEXT);
-        }
-        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_C)) {
-            copyout(g, COPY_MARKDOWN);
-        }
-    }
+    textkeys(g, v);
 
     gs->stick = scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh;
     ImGui::EndChild();
@@ -4670,34 +4837,31 @@ static void drawtodo(Gui *g)
     g->todoshown = (i32)v->todos.len;
 }
 
-// A line of Markdown without its inline marks: strong, emphasis by
-// underscores, and code spans.
-static Str unmark(Arena *a, Str s)
-{
-    Buf b(a, s.len);
-    for (iz i = 0; i < s.len; i++) {
-        if (s[i] == '`') {
-            continue;
-        } else if (i+1<s.len && (s[i]=='*' || s[i]=='_') && s[i+1]==s[i]) {
-            i++;
-            continue;
-        }
-        putbyte(&b, s[i]);
-    }
-    return finish(&b);
-}
+static b32 samelineif(f32);
 
 // The session's plan file, as plan mode writes it, fetched as it
-// changes (guiplan): headings bold, list items with a bullet, code in
-// the code font, the rest wrapped, without inline marks.
+// changes (guiplan), shown as a document (drawdoc): its text selectable,
+// copied as text or as Markdown. While the file is there, it opens in
+// the editor, as the waiting plan's Edit plan, else edited by hand with
+// the agent not told, and in the system's file manager, both only on
+// this computer.
 static void drawplan(Gui *g)
 {
-    View     *v = g->view;
-    PlanFile *f = &g->plan;
+    GuiSession *s = g->sess;
+    View       *v = g->view;
+    PlanFile   *f = &g->plan;
     g->planshown = 0;
     guiplan(g);
-    b32 mine = g->sess && f->s==g->sess && f->v==v;
-    if (!g->sess || !v->planpath.len || (mine && !f->id && !f->text.len)) {
+    b32 mine = s && f->s==s && f->v==v;
+    if (mine && f->have && f->docgot!=f->got) {
+        if (!f->doc) {
+            f->doc = newdocview(&g->perm, g->os, g->vcache);
+        }
+        docset(f->doc, finish(&f->text));
+        f->docgot = f->got;
+        f->docv   = v;
+    }
+    if (!s || !v->planpath.len || (mine && !f->id && !f->text.len)) {
         ImGui::PushTextWrapPos(0);
         ImGui::TextDisabled("%s", mine && f->err.len ? cstr0(&g->frame, f->err) :
                             "No plan. In plan mode the agent writes one here "
@@ -4705,51 +4869,59 @@ static void drawplan(Gui *g)
         ImGui::PopTextWrapPos();
         return;
     }
-    Arena a = g->frame;
-    ImGui::PushTextWrapPos(0);
-    if (v->plan) {
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
-        ImGui::TextUnformatted("Plan mode: changing nothing until you approve");
-        ImGui::PopStyleColor();
-    } else {
-        ImGui::TextDisabled("Plan mode is off");
+    // While the plan is there: the editor, the file manager, then how
+    // plan mode is, on the same line if it fits
+    Arena a     = g->frame;
+    b32   shown = f->doc && f->docv==v;
+    if (shown) {
+        i32       k = planask(v);
+        ViewTool *t = k>=0 ? v->msgs[k].tool : 0;
+        if (t) {
+            Str path = t->path.len ? t->path : v->planpath;
+            planeditbutton(g, s, path, t->req, "Edit plan", "plan editor", planedittip);
+        } else {
+            planeditbutton(g, s, v->planpath, {}, "View in editor", "plan editor",
+                           "Open the plan file in your editor: it shows here as the "
+                           "editor leaves it, and the agent is not told");
+        }
+        ImGui::SameLine();
+        Str why = s->host->kind==GH_REMOTE
+                ? concat(&a, "The plan is on ", concat(&a, s->host->name,
+                         ": only a file on this computer shows in its file manager"))
+                : Str{};
+        ImGui::BeginDisabled(why.len != 0);
+        if (ImGui::Button("Reveal")) {
+            guishow(g, v->planpath);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "plan reveal");
+        #if defined(__APPLE__)
+        whytip(why.len ? why : Str("Show the plan file in Finder"));
+        #elif defined(_WIN32)
+        whytip(why.len ? why : Str("Show the plan file in File Explorer"));
+        #else
+        whytip(why.len ? why : Str("Show the plan file in the file manager"));
+        #endif
     }
+    char const *mode = v->plan ? "Plan mode: changing nothing until you approve"
+                               : "Plan mode is off";
+    if (shown) {
+        samelineif(ImGui::CalcTextSize(mode).x);
+        ImGui::AlignTextToFramePadding();
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, v->plan ? g->pal->amber
+                                                 : ImGui::GetColorU32(ImGuiCol_TextDisabled));
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextUnformatted(mode);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
     ImGui::SetItemTooltip("%s", cstr0(&a, v->planpath));
-    if (!mine || !f->text.len) {
-        ImGui::PopTextWrapPos();
+    if (!shown) {
         return;  // on its way
     }
-    b32 code = 0;
-    for (Str rest = finish(&f->text); rest.len;) {
-        Cut c = cut(rest, '\n');
-        Str line = c.ok ? c.head : rest;
-        rest = c.ok ? c.tail : Str{};
-        line = line.len && line[line.len-1]=='\r' ? takehead(line, line.len-1) : line;
-        Str t = trim(line);
-        if (t.len>=3 && takehead(t, 3)=="```") {
-            code = !code;
-            continue;
-        }
-        if (code) {
-            ImGui::PushFont(g->fonts.mono, 0);
-            text(line);
-            ImGui::PopFont();
-        } else if (t.len && t[0]=='#') {
-            for (; t.len && t[0]=='#'; t = cuthead(t, 1)) {}
-            ImGui::PushFont(g->fonts.bold, 0);
-            text(unmark(&a, trim(t)));
-            ImGui::PopFont();
-        } else if (t.len>1 && (t[0]=='-' || t[0]=='*') && t[1]==' ') {
-            ImGui::Bullet();
-            text(unmark(&a, trim(cuthead(t, 2))));
-        } else if (t.len) {
-            text(unmark(&a, t));
-        } else {
-            ImGui::Spacing();
-        }
-    }
-    ImGui::PopTextWrapPos();
-    g->planshown = (i32)f->text.len;
+    drawdoc(g, f->doc, "##plan");
+    itemnamed(g, "plan text");
+    g->planshown = (i32)f->doc->v->msgs[0].text.len;
 }
 
 // The last n lines of s.
@@ -6779,10 +6951,10 @@ static void drawmenubar(Gui *g)
         View *v   = g->view;
         b32   any = !selempty(&v->sel);
         if (ImGui::MenuItem("Copy", cmdkey(g, &a, "C"), false, any)) {
-            copyout(g, COPY_TEXT);
+            copyout(g, v, COPY_TEXT);
         }
         if (ImGui::MenuItem("Copy as Markdown", cmdkey(g, &a, "Shift+C"), false, any)) {
-            copyout(g, COPY_MARKDOWN);
+            copyout(g, v, COPY_MARKDOWN);
         }
         if (ImGui::MenuItem("Select all", cmdkey(g, &a, "A"), false, v->msgs.len>0)) {
             selall(v);

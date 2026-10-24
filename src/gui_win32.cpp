@@ -114,6 +114,8 @@ extern "C" long long w32gui_clip(void *, int format, void *buf, long long cap);
 // Put a PNG on the clipboard, as the "PNG" format. Returns 0 on failure.
 extern "C" int       w32gui_clipput(void *, void const *png, long long len);
 extern "C" int       w32gui_reveal(unsigned short const *dir);
+// Show a file selected in Explorer: a path with backslashes
+extern "C" int       w32gui_select(unsigned short const *file);
 extern "C" void      w32gui_letfront(unsigned long pid);  // AllowSetForegroundWindow
 
 
@@ -1270,6 +1272,22 @@ extern "C" int w32gui_reveal(unsigned short const *dir)
     return (INT_PTR)r > 32;
 }
 
+// The shell opens its folder, or finds a window that has it open, with
+// the file selected. It wants COM on the calling thread.
+extern "C" int w32gui_select(unsigned short const *file)
+{
+    HRESULT          co = CoInitializeEx(0, COINIT_APARTMENTTHREADED);
+    PIDLIST_ABSOLUTE id = ILCreateFromPathW((wchar_t const *)file);
+    HRESULT          r  = id ? SHOpenFolderAndSelectItems(id, 0, 0, 0) : E_FAIL;
+    if (id) {
+        ILFree(id);
+    }
+    if (SUCCEEDED(co)) {
+        CoUninitialize();
+    }
+    return SUCCEEDED(r);
+}
+
 // CRT startup lands here (-municode), and the core takes over.
 extern "C" void prospero_main();
 
@@ -1665,6 +1683,15 @@ static u32 os_guilimits(Os *)
 static b32 os_guireveal(Os *, Arena scratch, Str dir)
 {
     return w32gui_reveal((unsigned short *)towide(&scratch, dir).data);
+}
+
+static b32 os_guishow(Os *, Arena scratch, Str file)
+{
+    Str16 w = towide(&scratch, file);
+    for (iz i = 0; i < w.len; i++) {
+        w.data[i] = w.data[i]=='/' ? '\\' : w.data[i];  // as the shell parses
+    }
+    return w32gui_select((unsigned short *)w.data);
 }
 
 #endif

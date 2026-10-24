@@ -225,7 +225,13 @@ planning sends it a note. Edit plan opens the plan file in the editor
 (as Ctrl+G does a draft), on this computer, to revise it by hand
 first: the agent carries out the plan as the file has it when
 approved, told that you revised it. The model may be changed while
-the plan waits. The Plan pane shows the plan file, which stays after approval.
+the plan waits. The Plan pane shows the plan file, which stays after
+approval, rendered as the transcript renders Markdown, its text
+selectable and copied as text or as Markdown. Its View in editor opens
+the file in the editor at any time (while a plan waits, it is that
+plan's Edit plan; otherwise the agent is not told), and Reveal shows it
+in Finder, Explorer or the file manager; both only for a plan on this
+computer.
 
 Sessions may talk to each other: the agent lists the other sessions on
 its host, with how they relate to it (parent, child, sibling), and

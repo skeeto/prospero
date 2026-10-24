@@ -489,8 +489,46 @@ struct OutFile {
     byte       *base;
 };
 
+// A Markdown document, read-only, shown as the transcript shows a
+// message, its text selectable and copied likewise (drawdoc): the Plan
+// window's plan, or any other text. Its view holds the document as one
+// message, without a header, made again from the text by docset, its
+// arenas reset; it scrolls on its own.
+struct DocView {
+    View        *v;
+    Arena        text;      // the view's arenas, as made, for docset
+    Arena        meta;
+    ImGuiWindow *win;       // its child window, last frame
+    f64          scrollto;  // a scroll to set, -1 if none
+    b32          dragging;  // a selection being dragged
+};
+
+static DocView *newdocview(Arena *perm, Os *os, ViewCache *c)
+{
+    iz       mb = (iz)1 << 20;
+    DocView *d  = alloc<DocView>(perm);
+    d->v        = newview(perm, c, os_reserve(os, 64*mb), os_reserve(os, mb),
+                          os_reserve(os, mb));
+    d->text     = d->v->text;
+    d->meta     = d->v->meta;
+    d->scrollto = -1;
+    return d;
+}
+
+// Show md in the document instead, which keeps its selection where it
+// still fits, and its scroll.
+static void docset(DocView *d, Str md)
+{
+    View *v = d->v;
+    v->text = d->text;
+    v->meta = d->meta;
+    v->msgs = {};
+    addmsg(v, VIEW_ASSISTANT, md);
+    clampsel(v);
+}
+
 // The Plan window's plan file, of the session shown, fetched again as
-// its view's planver changes.
+// its view's planver changes, and shown as a document.
 struct PlanFile {
     GuiSession *s;
     View       *v;
@@ -499,8 +537,13 @@ struct PlanFile {
     i64         off;
     i64         id;     // the command in flight, 0 if none
     Str         err;
+    b32         have;   // the file was read whole: it exists
+    i32         got;    // reads finished, the text whole
     Arena       mem;
     byte       *base;
+    DocView    *doc;    // null until first shown
+    i32         docgot; // the read it shows
+    View       *docv;   // and whose plan that is
 };
 
 // One setting in the settings window, from config.get.
@@ -1014,8 +1057,11 @@ struct Gui {
     Mailbox           *edbox;      // its process's records
     GuiSession        *edsess;     // whose draft it edits, or null
     b32                edplan;     // its plan file instead (Edit plan)
-    Str                edreq;      // and that plan's ask
+    Str                edreq;      // and that plan's ask, empty if none
     i64                planedits;  // plans edited, for the checklist
+    Str                revealed;   // the file guishow showed last, for
+    i64                reveals;    //   the checklist, and how many
+    b32                realreveal; // the checklist's show the file manager
     Proc              *edproc;
     u64                edid;
     Str                edpath;     // the draft's file, or the plan file
@@ -1650,6 +1696,7 @@ static void guiplan(Gui *g)
     f->text = Buf(&f->mem, 1<<16);
     f->off  = 0;
     f->err  = {};
+    f->have = 0;
     planpart(g);
 }
 
@@ -1697,6 +1744,9 @@ static void onplanfile(Gui *g, Json *j, b32 ok, Str err)
     f->off = jsonint(jsonget(j, "off"), f->off);
     if (jsonint(jsonget(j, "more"), 0) && f->s) {
         planpart(g);
+    } else {
+        f->have = 1;
+        f->got++;
     }
     scheddirty(&g->sched);
 }
@@ -3574,10 +3624,11 @@ static void setnote(Gui *g, GuiSession *s, Str note, b32 err)
 // the GUI: with status 0 the file is the new draft; with any other, or
 // cancelled, the draft stays as it was. One draft at a time is out,
 // and its box is read-only meanwhile. Or, from a plan's ask (Edit
-// plan), the plan file itself, edited in place, on this machine: once
-// the editor exits, however it went, the ask and the Plan window show
-// the file as it is, which is the plan the engine approves. One file at
-// a time is out, a draft or a plan.
+// plan) or the Plan window, the plan file itself, edited in place, on
+// this machine: once the editor exits, however it went, the ask and the
+// Plan window show the file as it is, which is the plan the engine
+// approves. Edited while no plan waits, the Plan window shows it, and
+// the agent is not told. One file at a time is out, a draft or a plan.
 
 static Str editorcmd(Gui *g, Arena *a)
 {
@@ -3664,8 +3715,22 @@ static void editstart(Gui *g, GuiSession *s)
     scheddirty(&g->sched);
 }
 
-// Edit plan: the plan file a plan's ask names, in the editor, in place.
-static void planedit(Gui *g, GuiSession *s, ViewTool *t)
+// The plan waiting for approval, as its ask: the latest pending, if it
+// is the plan's. Else -1.
+static i32 planask(View *v)
+{
+    for (iz i = v->msgs.len-1; v->asks && i >= 0; i--) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role==VIEW_ASK && m->tool->answer==VASK_PENDING) {
+            return m->tool->kind=="plan" ? (i32)i : -1;
+        }
+    }
+    return -1;
+}
+
+// Edit plan: the plan file at path, in the editor, in place, for the
+// plan's ask req, else with none waiting.
+static void planedit(Gui *g, GuiSession *s, Str path, Str req)
 {
     Arena a   = g->frame;
     Str   why = editorwhy(g, s, &a);
@@ -3676,7 +3741,7 @@ static void planedit(Gui *g, GuiSession *s, ViewTool *t)
     Str cmd = editorcmd(g, &a);
     Str dir = join(&a, g->statedir, "edit");
     Str log = join(&a, dir, concat(&a, concat(&a, "plan-", s->sid), ".log"));
-    Proc *p = os_mkdirs(g->os, a, dir) ? editrun(g, a, cmd, t->path, dir, log) : 0;
+    Proc *p = os_mkdirs(g->os, a, dir) ? editrun(g, a, cmd, path, dir, log) : 0;
     if (!p) {
         setnote(g, s, concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a)), 1);
         return;
@@ -3684,8 +3749,8 @@ static void planedit(Gui *g, GuiSession *s, ViewTool *t)
     g->edsess = s;
     g->edplan = 1;
     g->edproc = p;
-    g->edpath = clone(&g->perm, t->path);
-    g->edreq  = clone(&g->perm, t->req);
+    g->edpath = clone(&g->perm, path);
+    g->edreq  = clone(&g->perm, req);
     g->edlog  = clone(&g->perm, log);
     g->edname = clone(&g->perm, editorname(cmd));
     guilog(g, concat(&a, "editing a plan: ", cmd));
@@ -3693,8 +3758,23 @@ static void planedit(Gui *g, GuiSession *s, ViewTool *t)
     scheddirty(&g->sched);
 }
 
-// The plan file as the editor left it, in its ask, empty if it is gone
-// or too long to put to the user, and in the Plan window, fetched again.
+// A file of this computer, selected in the system's file manager. The
+// checklist only notes it, so that it opens no windows, unless asked to
+// (PROSPERO_TEST_REVEAL).
+static void guishow(Gui *g, Str path)
+{
+    Arena a = g->frame;
+    g->revealed = clone(&g->perm, path);
+    g->reveals++;
+    if (!g->drive || g->realreveal) {
+        b32 ok = os_guishow(g->os, a, path);
+        guilog(g, concat(&a, ok ? Str("revealed ") : Str("cannot reveal "), path));
+    }
+}
+
+// The plan file as the editor left it, in its ask (or the plan's ask
+// that came while it was out), empty if it is gone or too long to put
+// to the user, and in the Plan window, fetched again.
 static void planedited(Gui *g, GuiSession *s)
 {
     View *v = s->view;
@@ -3702,7 +3782,7 @@ static void planedited(Gui *g, GuiSession *s)
         return;
     }
     Arena a = g->frame;
-    i32   i = findask(v, g->edreq);
+    i32   i = g->edreq.len ? findask(v, g->edreq) : planask(v);
     if (i >= 0) {
         Read rd = os_read(g->os, &a, g->edpath, (iz)64<<10);
         Str  t  = rd.err==READ_OK ? trimright(rd.data) : Str{};
@@ -7441,6 +7521,10 @@ enum : i32 {
     CHK_BROWSEOFF,    // Browse is off for a remote host's directory
     CHK_PLANEDITING,  // the plan is out in the editor, Approve held
     CHK_PLANEDITED,   // the plan's ask shows the file as edited, with text
+    CHK_PLANREVEAL,   // Reveal showed the plan file, once
+    CHK_PLANPLAIN,    // the plan is out in the editor, no plan waiting
+    CHK_PLANQUIET,    // the session is idle, asking nothing
+    CHK_PLANREVISED,  // the agent heard the plan approved was revised by hand
     CHK_COUNT,
 };
 
@@ -7624,6 +7708,10 @@ static Str chknames[] = {
     "Browse is off for a directory on a remote host",
     "the plan is open in the editor, Approve held meanwhile",
     "the plan's ask shows the plan as the editor left it",
+    "Reveal showed the plan file in the file manager",
+    "the plan is open in the editor, with no plan waiting",
+    "the session is idle and asks nothing: the agent was not told",
+    "the agent heard that the plan it carries out was revised by hand",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9625,11 +9713,14 @@ static DriveOp remoteops[] = {
 
 // Plan mode (--plan): a new session in plan mode from its dialog, the
 // chip in its bar; the agent refused a change, asking to approve its
-// plan, which the Plan window shows; kept planning with a note, the
-// plan written again and shown again, the model free to change while
-// it waits; revised by hand in the editor ([ui] editor a test script,
-// where tests/gui.py sets one); approved, plan mode off and the plan
-// carried out; then the toggle by Send, and /plan off.
+// plan, which the Plan window shows, its text selected and copied, the
+// file revealed (noted only), and revised by hand from the ask (Edit
+// plan, with [ui] editor a test script, where tests/gui.py sets one);
+// kept planning with a note, the plan written again and shown again,
+// the model free to change while it waits; revised by hand from the
+// Plan window; approved, plan mode off and the plan carried out, the
+// agent told of the revision; edited by hand once more, the agent not
+// told; then the toggle by Send, and /plan off.
 static DriveOp planops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -9663,6 +9754,43 @@ static DriveOp planops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_PLANTEXT, 0, 0, 0, "Write **inside.txt**"},
     {OP_SHOT, 0, 0, 0, 300, "plan-2-ask"},
+    // Its text, selected whole and copied by keys, as text; then as
+    // Markdown from its context menu, the file byte for byte
+    {OP_MOVE, T_NAMED, 0, 0, 100, "plan text"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_A, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_A, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_C, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_C, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "Plan\n\n- Write inside.txt."},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "plan text"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-menu"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "text copy markdown"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "# Plan\n\n- Write **inside.txt**.\n"},
+    // Reveal, which the checklist only notes (PROSPERO_TEST_REVEAL)
+    {OP_MOVE, T_NAMED, 0, 0, 100, "plan reveal"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PLANREVEAL, 0, 0, 0, ""},
+    // Edit plan from its ask, with [ui] editor a test script that adds
+    // a line: then the ask and the Plan window show it as revised
+    {OP_IFEDITOR, 0, 7, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "Revised by hand."},
+    {OP_CHECK, CHK_PLANEDITED, 0, 0, 0, "Revised by hand."},
     // Keep planning, with a note: written again, asked again
     {OP_MOVE, T_DENY, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -9680,11 +9808,12 @@ static DriveOp planops[] = {
     {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
     {OP_CHECK, CHK_PLANMODEL, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-4-again"},
-    // Edit plan, with [ui] editor a test script that adds a line: the
-    // plan file out in the editor, Approve held meanwhile, then the
-    // ask and the Plan window show it as revised, which is approved
+    // The Plan window's editor button, which while the plan waits is
+    // its ask's Edit plan: the plan file out in the editor, Approve
+    // held meanwhile, then the ask and the Plan window show it as
+    // revised, which is approved, and the agent hears so
     {OP_IFEDITOR, 0, 9, 0, 0, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "plan editor"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
@@ -9702,6 +9831,19 @@ static DriveOp planops[] = {
     {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-5-approved"},
+    // With no plan waiting, the same button edits the file by hand:
+    // the Plan window shows it as the editor left it, the agent not told
+    {OP_IFEDITOR, 0, 10, 0, 0, ""},
+    {OP_CHECK, CHK_PLANREVISED, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "plan editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PLANPLAIN, 0, 0, 0, ""},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "Revised by hand.\n- Revised by hand."},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_PLANTEXT, 0, 0, 0, "Revised by hand.\n- Revised by hand."},
+    {OP_CHECK, CHK_PLANQUIET, 0, 0, 0, ""},
     // The mode by Send, while idle, then /plan off
     {OP_MOVE, T_NAMED, 0, 0, 100, "session mode"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -12003,8 +12145,8 @@ static b32 drivecheck(Gui *g, i32 chk)
                g->rects[RECT_DENY].x1>0;
     }
     case CHK_PLANTEXT:
-        return tabselected("Plan") && g->planshown>0 &&
-               find(finish(&g->plan.text), g->ops[g->drivepc-1].text)>=0;
+        return tabselected("Plan") && g->planshown>0 && g->plan.doc &&
+               find(g->plan.doc->v->msgs[0].text, g->ops[g->drivepc-1].text)>=0;
     case CHK_BROWSED: {
         Arena a     = g->frame;
         Str   field = {(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)};
@@ -12012,8 +12154,27 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_BROWSEOFF:
         return g->browseoff;
-    case CHK_PLANEDITING:
-        return g->sess && g->edsess==g->sess && g->edplan && g->edproc;
+    case CHK_PLANEDITING: {
+        // For the plan waiting, which is held: Approve is disabled
+        i32 k = planask(v);
+        return g->sess && g->edsess==g->sess && g->edplan && g->edproc && k>=0 &&
+               g->edreq==v->msgs[k].tool->req && planediting(g, g->sess, g->edreq);
+    }
+    case CHK_PLANPLAIN:
+        return g->sess && g->edsess==g->sess && g->edplan && g->edproc &&
+               !g->edreq.len && planask(v)<0;
+    case CHK_PLANQUIET:
+        return g->sess && !v->busy && !v->asks;
+    case CHK_PLANREVEAL: {
+        Arena a = g->frame;
+        guilog(g, concat(&a, "drive: Reveal showed ", g->revealed));
+        return g->sess && g->reveals==1 && g->revealed.len && g->revealed==v->planpath;
+    }
+    case CHK_PLANREVISED: {
+        ViewMsg *m = lasttoolmsg(g, "exit_plan_mode");
+        return m && find(m->text, "The user revised the plan")>=0 &&
+               find(m->text, "Revised by hand.")>=0;
+    }
     case CHK_PLANEDITED: {
         ViewMsg *m = lastmsg(g, VIEW_ASK);
         return !g->edsess && g->planedits>0 && m && m->tool->kind=="plan" &&
@@ -13217,6 +13378,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             !g->cmdr || !g->cfgmem.beg || !g->pendmem.beg) {
         os_print(os, 2, "prospero: out of memory\n");
         return 2;
+    }
+    {
+        Arena a = g->frame;
+        g->realreveal = g->drive && os_getenv(os, &a, "PROSPERO_TEST_REVEAL").len;
     }
     g->nosession.stick = 1;
     g->nosession.view  = newview(&g->perm, g->vcache, os_reserve(os, 16*mb),

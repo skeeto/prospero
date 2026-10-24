@@ -510,6 +510,11 @@ static b32     os_guiclipput(Os *, Arena scratch, Str png);
 // (M8) Show a directory in the platform's file manager: Finder,
 // Explorer, or whatever opens directories. Returns 0 on failure.
 static b32     os_guireveal(Os *, Arena scratch, Str dir);
+// Show a file in the platform's file manager, selected in its directory:
+// Finder, Explorer, or what answers org.freedesktop.FileManager1, else
+// its directory as os_guireveal shows it. Returns 0 on failure, where
+// the platform knows of it before the file manager takes over.
+static b32     os_guishow(Os *, Arena scratch, Str file);
 // (M8) What the window system keeps from the window, as GUI_* flags.
 // Wayland's compositor places windows, so a window neither knows nor
 // sets its place, and cannot leave being minimized by itself

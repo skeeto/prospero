@@ -1334,13 +1334,13 @@ static b32 os_guiclipput(Os *, Arena, Str png)
     return SDL_SetClipboardData(clipsend, clipfree, keep, mimes, 1);
 }
 
-// As a file URL, which the system opens with its file manager.
-static b32 os_guireveal(Os *, Arena scratch, Str dir)
+// An absolute path as a file URL, null-terminated.
+static char *fileurl(Arena *a, Str path)
 {
-    Buf b(&scratch, 16 + 3*dir.len);
+    Buf b(a, 16 + 3*path.len);
     print(&b, "file://");
-    for (iz i = 0; i < dir.len; i++) {
-        u8 c = dir[i];
+    for (iz i = 0; i < path.len; i++) {
+        u8 c = path[i];
         if ((c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') ||
                 c=='/' || c=='-' || c=='_' || c=='.' || c=='~') {
             putbyte(&b, c);
@@ -1350,8 +1350,148 @@ static b32 os_guireveal(Os *, Arena scratch, Str dir)
             putbyte(&b, "0123456789ABCDEF"[c&15]);
         }
     }
-    return SDL_OpenURL(cstr(&scratch, finish(&b)));
+    return cstr(a, finish(&b));
 }
+
+// As a file URL, which the system opens with its file manager.
+static b32 os_guireveal(Os *, Arena scratch, Str dir)
+{
+    return SDL_OpenURL(fileurl(&scratch, dir));
+}
+
+#if defined(__APPLE__)
+extern "C" void *objc_autoreleasePoolPush();
+extern "C" void  objc_autoreleasePoolPop(void *);
+
+// NSWorkspace selects it in a Finder window, which it brings forward.
+static b32 os_guishow(Os *, Arena scratch, Str file)
+{
+    using Get  = void *(*)(void *, void *);
+    using Cstr = void *(*)(void *, void *, char const *);
+    using Obj  = void *(*)(void *, void *, void *);
+    using Show = void  (*)(void *, void *, void *);
+    void *pool = objc_autoreleasePoolPush();
+    void *path = ((Cstr)(void *)objc_msgSend)(objc_getClass("NSString"),
+                                              sel_registerName("stringWithUTF8String:"),
+                                              cstr(&scratch, file));
+    void *url  = !path ? 0 : ((Obj)(void *)objc_msgSend)(objc_getClass("NSURL"),
+                                                         sel_registerName("fileURLWithPath:"),
+                                                         path);
+    void *urls = !url ? 0 : ((Obj)(void *)objc_msgSend)(objc_getClass("NSArray"),
+                                                        sel_registerName("arrayWithObject:"),
+                                                        url);
+    void *ws   = ((Get)(void *)objc_msgSend)(objc_getClass("NSWorkspace"),
+                                             sel_registerName("sharedWorkspace"));
+    if (urls && ws) {
+        ((Show)(void *)objc_msgSend)(ws, sel_registerName("activateFileViewerSelectingURLs:"),
+                                     urls);
+    }
+    objc_autoreleasePoolPop(pool);
+    return urls && ws;
+}
+
+#elif defined(__linux__)
+// libdbus, as much as ShowItems needs, beside the portal watch's
+using DbusClose    = void  (*)(void *);
+using DbusNewCall  = void *(*)(char const *, char const *, char const *, char const *);
+using DbusIterApp  = void  (*)(void *, void *);
+using DbusIterOpen = u32   (*)(void *, i32, char const *, void *);
+using DbusIterEnd  = u32   (*)(void *, void *);
+using DbusIterPut  = u32   (*)(void *, i32, void const *);
+using DbusCallWait = void *(*)(void *, void *, i32, void *);
+
+// A file to show, its URL and its directory's, which a thread shows,
+// then frees: in one allocation of SDL's.
+struct ShowFile {
+    char *url;
+    char *dir;
+};
+
+// The file manager's ShowItems ({file URL}, no startup ID) on the
+// session bus, waiting for its answer, since one may be started for
+// it; with no answer, its directory opened instead.
+static void showthread(void *arg)
+{
+    ShowFile *sf = (ShowFile *)arg;
+    b32       ok = 0;
+    void     *h  = dlopen("libdbus-1.so.3", RTLD_NOW|RTLD_LOCAL);
+    if (h) {
+        DbusInit     init    = (DbusInit)dlsym(h, "dbus_threads_init_default");
+        DbusGet      get     = (DbusGet)dlsym(h, "dbus_bus_get_private");
+        DbusExit     noexit  = (DbusExit)dlsym(h, "dbus_connection_set_exit_on_disconnect");
+        DbusClose    shut    = (DbusClose)dlsym(h, "dbus_connection_close");
+        DbusUnref    connrel = (DbusUnref)dlsym(h, "dbus_connection_unref");
+        DbusNewCall  newcall = (DbusNewCall)dlsym(h, "dbus_message_new_method_call");
+        DbusIterApp  args    = (DbusIterApp)dlsym(h, "dbus_message_iter_init_append");
+        DbusIterOpen nest    = (DbusIterOpen)dlsym(h, "dbus_message_iter_open_container");
+        DbusIterEnd  unnest  = (DbusIterEnd)dlsym(h, "dbus_message_iter_close_container");
+        DbusIterPut  put     = (DbusIterPut)dlsym(h, "dbus_message_iter_append_basic");
+        DbusCallWait callw   = (DbusCallWait)dlsym(h, "dbus_connection_send_with_reply_and_block");
+        DbusUnref    msgrel  = (DbusUnref)dlsym(h, "dbus_message_unref");
+        b32 have = init && get && noexit && shut && connrel && newcall && args && nest &&
+                   unnest && put && callw && msgrel;
+        void *conn = have && init() ? get(0, 0) : 0;  // the session bus
+        if (conn) {
+            noexit(conn, 0);
+            void *m = newcall("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                              "org.freedesktop.FileManager1", "ShowItems");
+            if (m) {
+                DbusIter    it  = {};
+                DbusIter    arr = {};
+                char const *url = sf->url;
+                char const *id  = "";
+                args(m, &it);
+                ok = nest(&it, 'a', "s", &arr) && put(&arr, 's', &url) &&
+                     unnest(&it, &arr) && put(&it, 's', &id);
+                void *r = ok ? callw(conn, m, 10000, 0) : 0;
+                ok = r != 0;
+                if (r) {
+                    msgrel(r);
+                }
+                msgrel(m);
+            }
+            shut(conn);
+            connrel(conn);
+        }
+    }
+    if (!ok) {
+        SDL_OpenURL(sf->dir);
+    }
+    SDL_free(sf);
+}
+
+static b32 os_guishow(Os *os, Arena scratch, Str file)
+{
+    iz i = file.len;
+    for (; i>1 && file[i-1]!='/'; i--) {}
+    Str   dir = takehead(file, i>1 ? i-1 : i);
+    char *url = fileurl(&scratch, file);
+    char *du  = fileurl(&scratch, dir);
+    iz    ul  = (iz)__builtin_strlen(url) + 1;
+    iz    dl  = (iz)__builtin_strlen(du) + 1;
+    ShowFile *sf = (ShowFile *)SDL_malloc(sizeof(ShowFile) + (size_t)(ul + dl));
+    if (!sf) {
+        return 0;
+    }
+    sf->url = (char *)(sf + 1);
+    sf->dir = sf->url + ul;
+    SDL_memcpy(sf->url, url, (size_t)ul);
+    SDL_memcpy(sf->dir, du, (size_t)dl);
+    if (!os_thread(os, showthread, sf)) {
+        SDL_free(sf);
+        return os_guireveal(os, scratch, dir);
+    }
+    return 1;
+}
+
+#else
+static b32 os_guishow(Os *os, Arena scratch, Str file)
+{
+    iz i = file.len;
+    for (; i>1 && file[i-1]!='/'; i--) {}
+    return os_guireveal(os, scratch, takehead(file, i>1 ? i-1 : i));
+}
+#endif
 
 static void os_guiclose(Os *os)
 {
