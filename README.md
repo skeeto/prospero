@@ -152,7 +152,13 @@ section. Endpoints, models, roles and remotes are added there, and
 deleted, with the comment just above them, when your own file rather
 than an included one defines them. Closing the window
 while turns run asks whether to stop them, or to keep running in the
-background, with a tray icon to bring the window back. The View menu
+background, with a tray icon to bring the window back. One window
+runs per state directory: launching Prospero again on the same one,
+even while its window is in the background, brings that window
+forward and exits, as does opening the app again on macOS. Under
+Wayland a window already open may only ask for attention, as the
+compositor decides focus. A different `--statedir` (or
+`XDG_STATE_HOME`) is a separate instance. The View menu
 shows and hides the panes and zooms the text for the run (Ctrl+=,
 Ctrl+- and Ctrl+0, Cmd on macOS, or the wheel with the key held);
 `[ui] font_size` sets its size for good. The window opens where it was
@@ -438,8 +444,9 @@ as `prospero attach`, started over `ssh -T`, which starts a host that
 outlives the ssh session. A link that breaks is taken up again from
 where it was, and the host keeps a client's place for three hours. A
 window closed with "Keep running in background" makes its own process
-such a host, and a later window lists its sessions and attaches to
-them.
+such a host, and keeps the state directory, so a later launch brings
+that window back. A window on a state directory that `prospero serve`
+hosts lists the sessions the host holds and attaches to them.
 
 A remote machine needs an engine built for its platform, which
 `prospero deploy` uploads with scp to `~/.prospero` there, as
