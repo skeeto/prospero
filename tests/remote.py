@@ -1152,6 +1152,7 @@ def exportlog(sid, pad):
         {"ev": "session", "proto": 0, "version": "0.0.0", "cwd": "/nowhere/else",
          "role": "", "model": "elsewhere", "endpoint": "http://192.0.2.1/",
          "roots": ["/"]},
+        {"ev": "instructions", "text": "Be brief."},  # left out: a gap
         {"ev": "user", "text": "Hello from elsewhere.", "via": "prompt"},
         {"ev": "turn", "n": 1},
         {"ev": "assistant", "blocks": [{"t": "text", "text": "Hi there."}]},
@@ -1201,6 +1202,14 @@ def importthrough(t, c, cwd, timeout=30):
     t.check("Elsewhere (imported)" in titles, f"titled: {titles}")
     seqs = [r["seq"] for r in c.records if r.get("sid") == sid and "seq" in r]
     t.check(seqs == sorted(set(seqs)), f"no record twice: {seqs}")
+    # The whole log from its start, after the open's reply, skipping the
+    # numbers of records the import left out, which a view must take as
+    # no loss (the GUI's once showed nothing of it)
+    t.check(seqs[:1] == [1] and any(b > a + 1 for a, b in zip(seqs, seqs[1:])),
+            f"from 1, skipping numbers: {seqs}")
+    users = [r.get("text") for r in c.records if r.get("ev") == "user" and
+             r.get("sid") == sid]
+    t.check(users[:1] == ["Hello from elsewhere."], f"its prompts: {users}")
     return sid
 
 

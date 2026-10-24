@@ -1094,7 +1094,14 @@ static b32 os_guiopenfile(Os *os, Arena scratch, Str title, Mailbox *mb, u32 typ
     s->id   = id;
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_FILTERS_POINTER, (void *)filters);
-    SDL_SetNumberProperty(props, SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER, countof(filters));
+    #ifdef __APPLE__
+    // Cocoa's panel has no list of filters, and a "*" among them turns
+    // filtering off: logs only
+    i64 nfilters = 1;
+    #else
+    i64 nfilters = countof(filters);
+    #endif
+    SDL_SetNumberProperty(props, SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER, nfilters);
     SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_WINDOW_POINTER, p->window);
     SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_TITLE_STRING, cstr(&scratch, title));
     SDL_ShowFileDialogWithProperties(SDL_FILEDIALOG_OPENFILE, savedone, s, props);

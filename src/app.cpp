@@ -886,6 +886,7 @@ struct Gui {
     // Dialogs and settings
     char              *newcwd;     // the new session's fields
     char              *newmodel;
+    Str                firstcwd;   // newcwd's first, a directory here
     Str                newerr;
     b32                opennew;
     i64                newid;      // the new command in flight
@@ -1187,6 +1188,7 @@ static View *sessview(Gui *g, GuiSession *s)
         if (s->host->kind != GH_REMOTE) {
             s->view->dir = sessdir(g, &g->perm, s->sid);
         }
+        s->view->loose = s->host->kind != GH_ENGINE;  // as an open's reply says
         viewthink(s->view, g->thinkset);
         viewtools(s->view, g->toolset);
     }
@@ -2551,7 +2553,11 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         }
         s->openid = 0;
         if (s->view) {
-            s->view->loose = 0;
+            // The engine here replays before it replies. A host replays
+            // after, from the log, which may skip numbers (an import
+            // leaves records out), and it brings whatever a client
+            // misses itself, so that a gap through it is no loss
+            s->view->loose = s->host->kind != GH_ENGINE;
         }
         if (!ok) {
             g->lasterr = clone(&g->perm, err.len ? err : Str("cannot open the session"));
@@ -6583,6 +6589,8 @@ enum : i32 {
     CHK_ALWAYSPATH,
     CHK_DESKALWAYSBTN,
     CHK_KIDALWAYS,
+    CHK_IMPORTCWD,
+    CHK_IMPORTREMOTE,
     CHK_COUNT,
 };
 
@@ -6747,6 +6755,8 @@ static Str chknames[] = {
     "allowed always: the second write was not asked about",
     "the subagent's desktop ask offers Always for input",
     "the subagent typed for good, asked once",
+    "the import dialog holds the directory there",
+    "the imported session is shown on the remote host, no records lost",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -6797,6 +6807,7 @@ enum : i32 {
     W_NAMED,      // an item named starting with text drew
     W_RAISED,     // dx launches handed off to this window, and it is up
     W_IMPORTED,   // an import ended, and none is under way
+    W_EXPORTED,   // an export was saved, and none is under way
 };
 
 static Str waitnames[] = {
@@ -6810,9 +6821,9 @@ static Str waitnames[] = {
     "the link to drop", "the remote to close", "the output", "a file",
     "the includes", "the thumbnails", "the screenshot", "reasoning",
     "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
-    "a named item", "a launch to hand off", "the import",
+    "a named item", "a launch to hand off", "the import", "the export",
 };
-static_assert(countof(waitnames) == W_IMPORTED+1);
+static_assert(countof(waitnames) == W_EXPORTED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -8513,8 +8524,8 @@ static DriveOp attachops[] = {
 // M5, a remote host (--remote, tests/gui.py --mode remote): connected
 // from the Hosts panel, a session made there through the dialog in its
 // directory there, its stream's link dropped and taken up again, a
-// call's output read through it, URL includes fetched again, then
-// disconnected. Its model picker lists the models of the host's own
+// call's output read through it, its raw log exported and imported
+// there, URL includes fetched again, then disconnected. Its model picker lists the models of the host's own
 // configuration. Light, then dark.
 static DriveOp remoteops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
@@ -8594,6 +8605,43 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_OUTPUT, 0, 0, 0, ""},
     {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-3-output"},
+    // Its raw log exported, and imported there again from the Session
+    // menu, the dialog filled with its directory there: the copy shown
+    // with its transcript, though its log skips the numbers of the
+    // records an import leaves out, and its replay follows the reply
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 500, "Export"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "Raw log..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_EXPORTED, 0, 0, 30000, ""},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Import session..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_MOVE, T_HOSTCOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_HOSTITEM, 0, 0, 100, "r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_IMPORTCWD, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "remote-import"},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_IMPORTED, 0, 0, 60000, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 30000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "imported from"},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Run the tools: read, edit, then a slow shell command."},
+    {OP_CHECK, CHK_IMPORTREMOTE, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "remote-imported"},
     // URL includes, fetched again from the settings window
     {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -9397,6 +9445,8 @@ static b32 drivewaitdone(Gui *g)
         return g->sess && !v->busy && lastof(v, VIEW_COMPACT);
     case W_IMPORTED:
         return g->imp.imports && g->imp.state==IMP_IDLE;
+    case W_EXPORTED:
+        return g->exp.saves && g->exp.state==EXP_IDLE && !g->exp.want;
     case W_NAMED:
         for (i32 i = 0; i < g->nnamed; i++) {
             Named *n = &g->named[i];
@@ -10778,6 +10828,13 @@ static b32 drivecheck(Gui *g, i32 chk)
         // (the directory as given, as far as the host spells it alike)
         return g->sess && g->sess->host->kind==GH_REMOTE && g->driverwd.len &&
                pathendswith(v->cwd, g->driverwd) && !g->sess->readonly;
+    case CHK_IMPORTCWD: {
+        Str cwd = {(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)};
+        return g->driverwd.len && pathendswith(cwd, g->driverwd);
+    }
+    case CHK_IMPORTREMOTE:
+        return g->sess && g->sess->host->kind==GH_REMOTE && !v->lost &&
+               g->sess->note.len && !g->sess->readonly;
     case CHK_REMOTEDOWN:
         return g->downshown;
     case CHK_REMOTEOK: {
@@ -11835,12 +11892,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         g->logfd   = os_logopen(os, g->frame, statepath(g, "gui.log"));
         g->saver   = newsaver(os, &g->perm, g->inipath);
     }
-    if (g->drivecwd.len) {
-        Str cwd = g->drivecwd;
+    {
+        Str cwd = g->drivecwd.len ? g->drivecwd : os_realpath(os, &g->perm, ".");
         copybytes(g->newcwd, cwd.data, cwd.len<FIELD_MAX ? cwd.len : FIELD_MAX-1);
-    } else {
-        Str cwd = os_realpath(os, &g->frame, ".");
-        copybytes(g->newcwd, cwd.data, cwd.len<FIELD_MAX ? cwd.len : FIELD_MAX-1);
+        g->firstcwd = cwd;
     }
 
     g->inbox  = newmailbox(&g->perm, g->inboxcap, wakegui, os);

@@ -414,7 +414,7 @@ struct View {
     i64             lastseq;    // the last durable record applied
     i64             logoff;     // where the last resync's reading ended
     b32             lost;       // records went missing: resync from the log
-    b32             loose;      // a replay: seq may skip numbers
+    b32             loose;      // a replay, or a host's: seq may skip numbers
     i32             doneturn;   // the last committed response:
     i32             doneattempt;  // deltas up to it are stale
 

@@ -4289,9 +4289,11 @@ static void fieldput(char *field, Str s)
 
 // The new session dialog filled for an import to a host: the log's
 // directory where it is known to be there (on this machine, or as
-// another session's there), and its model where that host has one by
+// another session's there), else the newest of that host's sessions',
+// else this machine's first, or nothing for a remote with none, never
+// a directory of another machine. Its model where that host has one by
 // its name (its configuration's, which a host other than the main one
-// is asked for). Otherwise each is as it was.
+// is asked for), else none.
 static void importfill(Gui *g, GuiHost *h)
 {
     Import *x = &g->imp;
@@ -4299,17 +4301,19 @@ static void importfill(Gui *g, GuiHost *h)
     if (x->filled != h) {
         x->filled    = h;
         x->modelwait = 1;
-        b32 there = 0;
-        if (h->kind != GH_REMOTE) {
-            there = x->cwd.len && os_stat(g->os, a, x->cwd).type==STAT_DIR;
+        b32 there = h->kind!=GH_REMOTE && x->cwd.len &&
+                    os_stat(g->os, a, x->cwd).type==STAT_DIR;
+        Str newest = {};
+        Slice<GuiSession *> list = hostsessions(g, &a, h);
+        for (iz i = 0; i < list.len; i++) {
+            GuiSession *s = list[i];
+            Str         d = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+            there |= x->cwd.len && d==x->cwd;
+            newest = newest.len ? newest : d;
         }
-        for (GuiSession *s = g->sessions; s && !there && x->cwd.len; s = s->next) {
-            Str cwd = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
-            there = s->host==h && !s->gone && cwd==x->cwd;
-        }
-        if (there) {
-            fieldput(g->newcwd, x->cwd);
-        }
+        fieldput(g->newcwd, there              ? x->cwd     :
+                            newest.len         ? newest     :
+                            h->kind!=GH_REMOTE ? g->firstcwd : Str{});
     }
     if (x->modelwait && h!=g->main) {
         hostmodels(g, h);
