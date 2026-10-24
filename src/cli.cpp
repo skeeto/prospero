@@ -134,12 +134,22 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
     case EV_SESSION:
         c->model = clone(&c->keep, jsonstr(jsonget(j, "model")));
         return;
-    case EV_USER:
+    case EV_USER: {
+        // A skill invoked shows as typed, its instructions left out
         prettyline(c);
+        Str skill = jsonstr(jsonget(j, "skill"));
+        Str args  = jsonstr(jsonget(j, "args"));
         print(&b, "> ");
-        print(&b, jsonstr(jsonget(j, "text")));
+        if (skill.len) {
+            putbyte(&b, '/');
+            print(&b, skill);
+            print(&b, args.len ? Str(" ") : Str(""));
+            print(&b, args);
+        } else {
+            print(&b, jsonstr(jsonget(j, "text")));
+        }
         print(&b, "\n");
-        break;
+    } break;
     case EV_DELTA: {
         Str kind  = jsonstr(jsonget(j, "kind"));
         i32 block = (i32)jsonint(jsonget(j, "block"), 0);
@@ -163,6 +173,7 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         Repair  rp   = repairargs(&scratch, jsonstr(jsonget(j, "args")));
         Str     what = name=="shell" ? jsonstr(jsonget(rp.root, "command")) :
                        name=="task"  ? jsonstr(jsonget(rp.root, "description")) :
+                       name=="skill" ? jsonstr(jsonget(rp.root, "name")) :
                        jsonstr(jsonget(rp.root, "path"));
         Json   *pt   = jsonget(rp.root, "patch");
         if (name=="edit" && pt->type==JSON_STRING) {

@@ -1561,6 +1561,169 @@ def instructions(t):
     t.check(sum("Pkg rule" in (m.get("content") or "") for m in reqs[2]) == 1, "once")
 
 
+def skillhome(t):
+    """A home and configuration directory of the scenario's own, where
+    the user's skills are, never the real ones: the environment to run
+    with."""
+    home = t.host.join(t.base, "home")
+    xdg = t.host.join(t.base, "xdg")
+    t.host.mkdir(home)
+    t.host.mkdir(t.host.join(xdg, "prospero", "skills"))
+    env = {"HOME": home, "XDG_CONFIG_HOME": xdg}
+    if t.host.windows:
+        env["USERPROFILE"] = home.replace("/", "\\")
+    return env
+
+
+def skillput(t, parent, name, text):
+    d = t.host.join(parent, name)
+    t.host.mkdir(d)
+    t.host.write(t.host.join(d, "SKILL.md"), text)
+    return d
+
+
+@scenario(bound=15)
+def skills(t):
+    """Skills of the user and of the project, the nearer of a name first,
+    listed in the system prompt; the skill tool gives one's instructions,
+    after which the agent reads in its directory without asking; a hidden
+    skill is neither listed nor loaded, a malformed one left out with a
+    warning."""
+    env = skillhome(t)
+    user = t.host.join(env["XDG_CONFIG_HOME"], "prospero", "skills")
+    notes = skillput(t, user, "notes", "---\nname: notes\n"
+                     "description: \"Take notes: carefully\"  # quoted\n---\nNOTES-BODY\n")
+    t.host.write(t.host.join(notes, "ref.txt"), "reference text\n")
+    skillput(t, user, "pdf", "---\ndescription: User PDF\n---\nUSER-PDF\n")
+    skillput(t, t.host.join(env["HOME"], ".claude", "skills"), "review",
+             "---\r\nname: review\r\ndescription: Review\r\n"
+             "disable-model-invocation: true\r\n---\r\nREVIEW\r\n")
+    # The repository is the run's directory, the work directory in it
+    t.host.mkdir(t.host.join(t.base, ".git"))
+    skillput(t, t.host.join(t.base, ".claude", "skills"), "lint", "---\ndescription: Far lint\n---\n")
+    skillput(t, t.host.join(t.work, ".agents", "skills"), "lint", "---\ndescription: Near lint\n---\n")
+    proj = t.host.join(t.work, ".claude", "skills")
+    skillput(t, proj, "pdf", "---\ndescription: Project PDF\n---\nPROJECT-PDF\n")
+    skillput(t, proj, "broken", "---\nname: broken\ndescription: never closed\n")
+
+    r = t.run(env=env)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    reqs = [q["body"] for q in t.requests()]
+    system = fake_provider.system_of(reqs[0])
+    t.check("# Skills" in system and "skill" in fake_provider.tool_names(reqs[0]), "offered")
+    listed = [x for x in system.split("\n") if x.startswith("- ")]
+    for want in ("- lint: Near lint", "- notes: Take notes: carefully", "- pdf: Project PDF"):
+        t.check(want in listed, f"{want!r} in {listed}")
+    for unwanted in ("User PDF", "Far lint", "- review:", "- broken:"):
+        t.check(unwanted not in system, f"{unwanted} not in the system prompt")
+    t.check(all(fake_provider.system_of(q) == system for q in reqs), "the system prompt stays")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok", "error"], f"statuses {ends}")
+    body = ends[0]["text"]
+    t.check("NOTES-BODY" in body and "Base directory for this skill: " in body and
+            body.endswith("ARGUMENTS: the args") and "description" not in body, f"body {body!r}")
+    t.check("reference text" in ends[1]["text"], f"read {ends[1]}")
+    t.check(not r.all("ask"), "no ask for the skill's directory")
+    grants = [g for g in r.all("grant") if g.get("by") == "skill"]
+    t.check(len(grants) == 1 and grants[0]["path"].replace("\\", "/").endswith("/notes") and
+            grants[0]["access"] == "read", f"grants {grants}")
+    t.check("No skill is named \"review\"" in ends[2]["text"], f"hidden {ends[2]}")
+    warns = [n["text"] for n in r.all("note")
+             if n.get("level") == "warn" and "skill left out" in n["text"]]
+    t.check(len(warns) == 1 and "broken" in warns[0] and "closing ---" in warns[0],
+            f"warned {warns}")
+
+
+@scenario(bound=20)
+def skill_prompt(t):
+    """/name from the user invokes a skill, a hidden one too: its body in
+    the prompt, the user record naming it; skills lists them all; one
+    added mid-session is told as a notice, which reopening does not
+    repeat."""
+    env = skillhome(t)
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    proj = t.host.join(t.work, ".claude", "skills")
+    skillput(t, proj, "review", "---\nname: review\ndescription: Review a change\n"
+             "disable-model-invocation: true\n---\nREVIEW-BODY\n")
+    skillput(t, proj, "pdf", "---\ndescription: Read PDFs\n---\nPDF-BODY\n")
+    told = "The skills changed"
+    h = t.headless(env)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        sk = h.call("skills", sid=sid)
+        got = [(k["name"], k["description"], k["hidden"]) for k in sk.get("skills", [])]
+        t.check(sk.get("ok") == 1 and sk.get("sid") == sid and
+                got == [("pdf", "Read PDFs", False), ("review", "Review a change", True)] and
+                all(k["path"].endswith("SKILL.md") for k in sk["skills"]), f"skills {sk}")
+        bad = h.call("prompt", sid=sid, text="x", skill="nope")
+        t.check(bad.get("ok") == 0 and "no such skill" in bad.get("err", ""), f"nope {bad}")
+        h.send("prompt", sid=sid, text="src/a.c", skill="review")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        reqs = [q["body"] for q in t.requests()]
+        last = reqs[0]["messages"][-1]["content"]
+        t.check(last.startswith("<skill name=\"review\" dir=\"") and "REVIEW-BODY" in last and
+                last.endswith("</skill>\n\nsrc/a.c"), f"prompt {last!r}")
+        system = fake_provider.system_of(reqs[0])
+        t.check("- pdf: Read PDFs" in system and "- review:" not in system, "listed")
+        user = h.all("user", sid)
+        t.check(len(user) == 1 and user[0].get("skill") == "review" and
+                user[0].get("args") == "src/a.c", f"user {user}")
+
+        skillput(t, proj, "fresh", "---\ndescription: Fresh skill\n---\nFRESH\n")
+        h.send("prompt", sid=sid, text="second")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 2)
+        reqs = [q["body"] for q in t.requests()]
+        msgs = [str(m.get("content")) for m in reqs[1]["messages"] if told in str(m.get("content"))]
+        t.check(len(msgs) == 1 and msgs[0].endswith("\n- fresh: Fresh skill (new)"),
+                f"told {msgs}")
+        t.check(fake_provider.system_of(reqs[1]) == system, "the system prompt stays")
+        notices = [n for n in h.all("notice", sid) if n.get("kind") == "skills"]
+        t.check(len(notices) == 1 and [k["name"] for k in notices[0].get("skills", [])] ==
+                ["fresh", "pdf"], f"notices {notices}")
+        seen = notices[0]["seq"]
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+    h = t.headless(env)
+    try:
+        o = h.call("open", sid=sid)
+        t.check(o.get("ok") == 1, f"opened {o}")
+        h.send("prompt", sid=sid, text="third")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 3)
+        reqs = [q["body"] for q in t.requests()]
+        t.check(len(reqs) == 3, f"requests {len(reqs)}")
+        msgs = [m for m in reqs[2]["messages"] if told in str(m.get("content"))]
+        t.check(len(msgs) == 1, f"told once: {len(msgs)}")
+        again = [n for n in h.all("notice", sid) if n.get("kind") == "skills" and n["seq"] > seen]
+        t.check(not again, f"no notice after reopening: {again}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def skill_task(t):
+    """A subagent has the skill tool and the listing too."""
+    env = skillhome(t)
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    skillput(t, t.host.join(t.work, ".claude", "skills"), "pdf",
+             "---\ndescription: Read PDFs\n---\nPDF-BODY\n")
+    r = t.run(env=env)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    own, kids = r.sessions()
+    t.check(len(kids) == 1, f"kids {kids}")
+    kreqs = [q["body"] for q in t.requests(t.model2)]
+    t.check(kreqs and "skill" in fake_provider.tool_names(kreqs[0]) and
+            "- pdf: Read PDFs" in fake_provider.system_of(kreqs[0]), "the child's tools")
+    kend = r.all("tool.end", kids[0]["sid"])
+    t.check(len(kend) == 1 and kend[0]["status"] == "ok" and "PDF-BODY" in kend[0]["text"],
+            f"child {kend}")
+    ends = r.all("tool.end", own)
+    t.check(len(ends) == 1 and "Child read: " in ends[0]["text"] and
+            "PDF-BODY" in ends[0]["text"], f"parent {ends}")
+
+
 @scenario(bound=10)
 def grandchild(t):
     r = t.run()
@@ -1869,14 +2032,14 @@ def hello_caps(t):
         cmds = hello.get("cmds", [])
         want = ["hello", "list", "new", "open", "close", "prompt", "steer", "cancel",
                 "answer", "config.get", "config.set", "quit", "rewind", "job.kill",
-                "status", "stop", "file"] + m8
+                "status", "stop", "file"] + m8 + ["skills"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
                 {"close.forget", "config.refresh", "file.base64", "desktop",
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
-                 "fork", "answer.always.desktop"} <= set(caps) and "host" not in caps,
+                 "fork", "answer.always.desktop", "skills"} <= set(caps) and "host" not in caps,
                 f"caps: {caps}")
 
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
@@ -2928,11 +3091,11 @@ def role_tools(t):
     t.check(roles == ["explore", "fast"], f"roles {roles}")
     ex = [k for k in kids if k["role"] == "explore"][0]
     fast = [k for k in kids if k["role"] == "fast"][0]
-    t.check(ex["tools"] == ["read", "grep", "glob"] and ex["model"] == t.model, f"explore {ex}")
+    t.check(ex["tools"] == ["read", "grep", "glob", "skill"] and ex["model"] == t.model, f"explore {ex}")
     t.check(fast["model"] == t.model2 and "tools" not in fast, f"fast {fast}")
     exreq = [q["body"] for q in t.requests() if "# Your role: explore" in
              fake_provider.system_of(q["body"])]
-    t.check(exreq and fake_provider.tool_names(exreq[0]) == ["read", "grep", "glob"],
+    t.check(exreq and fake_provider.tool_names(exreq[0]) == ["read", "grep", "glob", "skill"],
             "explore's tools")
     t.check(t.file("shell.txt") is None, "explore ran no command")
     ends = r.all("tool.end", own)

@@ -890,6 +890,18 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.primary", istr(&a, v->fallback), "0");
     }
 
+    // A skill the user invoked: /name and its args, the body folded
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"user","via":"prompt","skill":"pdf",)"
+                    R"("args":"x.pdf","text":"<skill name=\"pdf\" dir=\"/s/pdf\">\nRead it.\n</skill>\n\nx.pdf"})");
+        expect(t, "panels.skill", msgsshow(&a, v),
+               "U:/pdf x.pdf;N:<skill name=\"pdf\" dir=\"/s/pdf\">\nRead it.\n</skill>;");
+        expect(t, "panels.skillnote", concat(&a, v->msgs[1].label, istr(&a, v->msgs[1].collapsed)),
+               "To the agent: skill pdf1");
+    }
+
     // Instruction files, each once as last told; a task's report as
     // markdown, its subagent named; a command moved to the background
     {

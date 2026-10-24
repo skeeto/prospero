@@ -966,6 +966,9 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
         return finish(&b);
     } else if (name=="task" && desc.len) {
         return oneline(perm, desc);
+    } else if (name == "skill") {
+        Str skill = jsonstr(jsonget(j, "name"));
+        return oneline(perm, skill.len ? skill : args);
     } else if (name=="edit" && patch->type==JSON_STRING) {
         // The files the patch names, as it names them
         Slice<Str> paths = patchpaths(&scratch, patch->str);
@@ -1395,13 +1398,36 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         return 1;
 
     case EV_USER: {
+        // A skill the user invoked shows as typed, /name and what
+        // followed it, and the instructions it sent fold below
         dropprov(v);
-        Str via = jsonstr(jsonget(j, "via"));
-        i32 i   = addmsg(v, VIEW_USER, jsonstr(jsonget(j, "text")));
+        Str via   = jsonstr(jsonget(j, "via"));
+        Str text  = jsonstr(jsonget(j, "text"));
+        Str skill = jsonstr(jsonget(j, "skill"));
+        Str args  = jsonstr(jsonget(j, "args"));
+        Str typed = text;
+        if (skill.len) {
+            Buf b(&scratch, 64 + args.len);
+            putbyte(&b, '/');
+            print(&b, skill);
+            print(&b, args.len ? Str(" ") : Str(""));
+            print(&b, args);
+            typed = finish(&b);
+        }
+        i32 i = addmsg(v, VIEW_USER, typed);
         v->msgs[i].seq   = r->seq;
         v->msgs[i].label = via=="steer" ? Str("You (steering)") :
                            via=="queue" ? Str("You (queued)") :
                            via=="task"  ? Str("Task from the parent agent") : Str{};
+        if (skill.len) {
+            iz  end  = find(text, "\n</skill>");
+            Str body = end<0 ? text : takehead(text, end + 9);
+            i32 k    = addmsg(v, VIEW_NOTE, body);
+            v->msgs[k].seq       = r->seq;
+            v->msgs[k].fold      = 1;
+            v->msgs[k].collapsed = 1;
+            v->msgs[k].label     = concat(&v->aux, "To the agent: skill ", clone(&v->aux, skill));
+        }
         clampsel(v);
     } return 1;
 
@@ -1748,6 +1774,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         } else {
             m->label = kind=="rewind"       ? Str("To the agent: files rewound") :
                        kind=="instructions" ? Str("To the agent: instruction files") :
+                       kind=="skills"       ? Str("To the agent: skills") :
                        kind=="budget"       ? Str("To the agent: wrap up") :
                        Str("To the agent");
         }

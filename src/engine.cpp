@@ -223,11 +223,12 @@ enum : i64 {
 };
 
 // Something for the agent to read before its next request: a job that
-// ended, files rewound, instructions for a directory.
+// ended, files rewound, instructions for a directory, skills changed.
 struct Notice {
-    Str kind;  // "job", "rewind", "instructions"
+    Str kind;    // "job", "rewind", "instructions", "skills"
     Str text;
-    i64 job;   // for "job"
+    i64 job;     // for "job"
+    b32 skills;  // its record lists the skills the agent knows now
 };
 
 enum : i32 {
@@ -558,6 +559,10 @@ struct Session {
     Slice<InstrStamp> instrfiles;  // every file loaded, lazily too
     Instructions instrpend;  // those loaded at the start, to log
     b32          instrlog;   // that record is still to log
+    // Skills (skills.cpp)
+    b32          skillson;   // its prefix lists skills: tell it of changes
+    Slice<Skill> skillseen;  // what the agent knows of: name, description
+    Slice<Str>   skillwarned;  // skills left out, warned of already
     // Roles and subagents
     Str          role;       // the role's name, empty if none
     Str          rolepr;     // its prompt, in the system prompt
@@ -593,6 +598,7 @@ struct Engine {
     Str         exedir;
     Str         home;     // for "~" in paths
     Str         global;   // the user's own instruction file
+    Str         skilldir; // the user's own skills, next to it
     ToolEnv     te;
     Slice<Str>  env;      // inherited environment
     Session    *sessions;
@@ -819,6 +825,11 @@ static void adduser(Session *s, Arena scratch, Str text, Str via)
     EvOut w = sbegin(s, &b, EV_USER);
     putstrkey(&w.json, "text", text);
     putstrkey(&w.json, "via", via);
+    SkillCall sc = skillcalled(text);  // a skill the user invoked
+    if (sc.ok) {
+        putstrkey(&w.json, "skill", sc.name);
+        putstrkey(&w.json, "args", sc.args);
+    }
     ssend(s, &w);
     Msg m = {};
     m.role = ROLE_USER;
@@ -936,6 +947,26 @@ static void resetnudges(Session *s, b32 all = 0)
     }
 }
 
+// The skills key of a record: name and description of each, and with
+// all, the path to its SKILL.md and whether it is the user's alone.
+static void putskills(JsonOut *w, Slice<Skill> list, b32 all)
+{
+    putkey(w, "skills");
+    putarray(w);
+    for (iz i = 0; i < list.len; i++) {
+        putobject(w);
+        putstrkey(w, "name", list[i].name);
+        putstrkey(w, "description", list[i].desc);
+        if (all) {
+            putstrkey(w, "path", list[i].path);
+            putkey(w, "hidden");
+            putbool(w, list[i].hidden);
+        }
+        putend(w);
+    }
+    putend(w);
+}
+
 // Queue a notice for the agent's next request. The text is copied.
 static void notify(Session *s, Str kind, Str text, i64 job)
 {
@@ -961,6 +992,9 @@ static void deliver(Session *s, Arena scratch)
             putintkey(&w.json, "job", n->job);
         }
         putstrkey(&w.json, "text", n->text);
+        if (n->skills) {
+            putskills(&w.json, s->skillseen, 0);
+        }
         ssend(s, &w);
 
         Msg m = {};
@@ -3008,12 +3042,13 @@ static Session *treeroot(Session *s)
 // The user's "always" for the ask of s: logged in s, and in its root if
 // that is another session in memory, then given to the whole tree, and
 // logged by "parent" in each other session of it that lacked it, so
-// that one opened again later has it as it had it here.
-static void usergrant(Session *s, Arena scratch, Grant g, Str req)
+// that one opened again later has it as it had it here. A skill's
+// directory is granted the same way, by "skill" (skillgrant).
+static void usergrant(Session *s, Arena scratch, Grant g, Str req, Str by)
 {
     Session *root = treeroot(s);
     b32      top  = root!=s && !root->psid.len;
-    loggrant(s, scratch, g, "user", req, {});
+    loggrant(s, scratch, g, by, req, {});
     if (top) {
         loggrant(root, scratch, g, "subagent", req, s->sid);
     }
@@ -3070,7 +3105,7 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
             g.path  = k->grant;
             g.write = k->gwrite;
         }
-        usergrant(s, scratch, g, k->req);
+        usergrant(s, scratch, g, k->req, "user");
     }
 
     toolstart(s, scratch);
@@ -4939,6 +4974,226 @@ static Str deskdenial(Arena *a, i32 by, Str note, i64 wait)
 }
 
 
+// Skills (skills.cpp)
+//
+// The system prompt lists the skills the agent may use as the session
+// began, and the prefix record names them (skillseen). At each turn's
+// start they are looked for again, and any added, changed or removed
+// since are told in a notice, whose record names them as the agent then
+// knows them, so that replay tells nothing twice. Skills are looked for
+// anew wherever needed, since nothing else keeps them.
+
+// The skill tool's bit, denied to new sessions while [skills] enabled
+// is off.
+static u32 skilldeny(Engine *e)
+{
+    b32 on = cfgbool(trim(cfgget(e->cfg, "skills", "", "enabled", 0))) != 0;
+    return on ? 0 : (u32)1<<TOOL_SKILL;
+}
+
+// The directories of a session's skills, by precedence. A session with
+// the project's instructions alone (new {instructions:"project"}) has
+// the project's skills alone, and [skills] paths.
+static Slice<SkillDir> skilldirs(Session *s, Arena *a)
+{
+    Engine         *e    = s->e;
+    b32             win  = s->te.windows;
+    Slice<SkillDir> r    = {};
+    Str             cwd  = normpath(a, s->cwd, ".", win);
+    Str             root = instrroot(e->os, a, cwd, win);
+    for (Str d = cwd;;) {
+        SkillDir c = {normpath(a, d, ".claude/skills", win), root};
+        SkillDir g = {normpath(a, d, ".agents/skills", win), root};
+        r = push(a, r, c);
+        r = push(a, r, g);
+        Str up = normpath(a, d, "..", win);
+        if (d.len<=root.len || up==d) break;
+        d = up;
+    }
+    Slice<Str> more = cfgpaths(e->cfg, a, "skills", "", "paths", e->home);
+    for (iz i = 0; i < more.len; i++) {
+        SkillDir x = {normpath(a, cwd, more[i], win), {}};
+        r = push(a, r, x);
+    }
+    Str user[] = {
+        e->skilldir,
+        e->home.len ? normpath(a, e->home, ".claude/skills", win) : Str{},
+        e->home.len ? normpath(a, e->home, ".agents/skills", win) : Str{},
+    };
+    for (iz i = 0; i<countof(user) && !s->projinstr; i++) {
+        SkillDir u = {user[i], {}};
+        r = user[i].len ? push(a, r, u) : r;
+    }
+    return r;
+}
+
+// A session's skills as they are now: none while [skills] is off.
+static Skills sessskills(Session *s, Arena *a)
+{
+    if (skilldeny(s->e)) {
+        return {};
+    }
+    return skillfind(s->e->os, a, skilldirs(s, a), s->te.windows);
+}
+
+// What the agent knows of skills from now on: those it may use.
+static void skillsee(Session *s, Slice<Skill> list)
+{
+    s->skillseen = {};
+    for (iz i = 0; i < list.len; i++) {
+        if (!list[i].hidden) {
+            Skill k = {};
+            k.name = clone(&s->perm, list[i].name);
+            k.desc = clone(&s->perm, list[i].desc);
+            s->skillseen = push(&s->perm, s->skillseen, k);
+        }
+    }
+}
+
+// The same from a record's skills.
+static void skillseenfrom(Session *s, Json *list)
+{
+    s->skillseen = {};
+    for (Json *j = list->child; j; j = j->next) {
+        Skill k = {};
+        k.name = clone(&s->perm, jsonstr(jsonget(j, "name")));
+        k.desc = clone(&s->perm, jsonstr(jsonget(j, "description")));
+        s->skillseen = push(&s->perm, s->skillseen, k);
+    }
+}
+
+// Skills added, changed or removed since the agent was told of them: a
+// notice for its next request, since the system prompt stays as it
+// was. A skill left out is warned of, once while in memory.
+static void skillcheck(Session *s, Arena scratch)
+{
+    if (!s->skillson) {
+        return;
+    }
+    Skills sk = sessskills(s, &scratch);
+    for (iz i = 0; i < sk.skipped.len; i++) {
+        b32 warned = 0;
+        for (iz k = 0; k<s->skillwarned.len && !warned; k++) {
+            warned = s->skillwarned[k] == sk.skipped[i];
+        }
+        if (!warned) {
+            Str why = concat(&scratch, "skill left out: ", sk.skipped[i]);
+            s->skillwarned = push(&s->perm, s->skillwarned, clone(&s->perm, sk.skipped[i]));
+            note(s, scratch, "warn", why);
+        }
+    }
+
+    Buf b(&scratch, 1024);
+    for (iz i = 0; i < sk.list.len; i++) {
+        Skill *k   = &sk.list[i];
+        Skill *was = skillbyname(s->skillseen, k->name);
+        if (!k->hidden && (!was || !(was->desc==k->desc))) {
+            print(&b, "\n- ");
+            print(&b, k->name);
+            print(&b, ": ");
+            print(&b, k->desc);
+            print(&b, was ? Str(" (changed)") : Str(" (new)"));
+        }
+    }
+    for (iz i = 0; i < s->skillseen.len; i++) {
+        Skill *k = skillbyname(sk.list, s->skillseen[i].name);
+        if (!k || k->hidden) {
+            print(&b, "\n- ");
+            print(&b, s->skillseen[i].name);
+            print(&b, " (removed)");
+        }
+    }
+    if (!b.len) {
+        return;
+    }
+    Str list = finish(&b);
+    Buf t(&scratch, 256 + list.len);
+    print(&t, "The skills changed since your instructions listed them. Use "
+              "the skill tool with the name of a skill when a task matches "
+              "it:");
+    print(&t, list);
+    skillsee(s, sk.list);
+    notify(s, "skills", finish(&t), 0);
+    s->notices[s->notices.len-1].skills = 1;
+}
+
+// The agent may read a skill's other files without asking: its
+// directory is granted for reads to the session's tree, as an "always"
+// of the user's is, unless the guard allows it already.
+static void skillgrant(Session *s, Arena scratch, Str dir)
+{
+    GuardPath gp = guardpath(s->e->os, &scratch, &s->guard, dir, 1);
+    if (!gp.inside) {
+        Grant g = {};
+        g.path = dir;
+        usergrant(s, scratch, g, {}, "skill");
+    }
+}
+
+// The skill tool: a skill's instructions, by name, never one of the
+// user's alone.
+static void toolskill(Session *s, Arena scratch, Args *args)
+{
+    Skills sk = sessskills(s, &scratch);
+    Skill *k  = skillbyname(sk.list, args->name);
+    if (!k || k->hidden) {
+        Buf b(&scratch, 1024);
+        print(&b, "No skill is named \"");
+        print(&b, utf8head(args->name, SKILL_NAME));
+        print(&b, "\", so nothing was loaded.");
+        i32 n = 0;
+        for (iz i = 0; i < sk.list.len; i++) {
+            if (!sk.list[i].hidden) {
+                print(&b, n++ ? Str(", ") : Str(" The skills are: "));
+                print(&b, sk.list[i].name);
+            }
+        }
+        print(&b, n ? Str(".") : Str(" There are no skills."));
+        Str text = finish(&b);
+        s->callfail = "skill";
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        return;
+    }
+    SkillMeta m = skillload(s->e->os, &scratch, k);
+    if (m.err.data) {
+        Str text = concat(&scratch, "The skill cannot be used: ", m.err);
+        s->callfail = "skill";
+        toolend(s, scratch, "error", text, 0, 0, {}, 0);
+        return;
+    }
+    skillgrant(s, scratch, k->dir);
+    Str text = skilltext(&scratch, k, m.body, args->args);
+    toolend(s, scratch, "ok", text, 0, 0, {}, 0);
+}
+
+// The text of a prompt invoking a skill (prompt {skill}): its
+// instructions, then what the user typed, args. The user's own skills
+// too, hidden from the agent. The text null if it cannot be, with why.
+struct SkillUse {
+    Str text;
+    Str err;
+};
+
+static SkillUse skillinvoke(Session *s, Arena *a, Str name, Str args)
+{
+    SkillUse r  = {};
+    Skills   sk = sessskills(s, a);
+    Skill   *k  = skillbyname(sk.list, name);
+    if (!k) {
+        r.err = concat(a, "no such skill: ", utf8head(name, SKILL_NAME));
+        return r;
+    }
+    SkillMeta m = skillload(s->e->os, a, k);
+    if (m.err.data) {
+        r.err = concat(a, "the skill cannot be used: ", m.err);
+        return r;
+    }
+    skillgrant(s, *a, k->dir);
+    r.text = skillprompt(a, k, m.body, args);
+    return r;
+}
+
+
 // Run one call. Returns 1 if it finished, 0 if it goes on (a command or
 // a search, or an ask waiting for the user).
 static b32 runtool(Session *s, Arena scratch)
@@ -5025,6 +5280,7 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_JOBS:    tooljobs(s, scratch);           return 1;
     case TOOL_JOBOUT:  tooljobout(s, scratch, &args);  return 1;
     case TOOL_JOBKILL: tooljobkill(s, scratch, &args); return 1;
+    case TOOL_SKILL:   toolskill(s, scratch, &args);   return 1;
     case TOOL_TASK:    assert(0);  // starttasks has these
     case TOOL_DESKTOP: assert(0);  // deskcall has these
     }
@@ -5657,6 +5913,7 @@ static void beginturn(Session *s, Arena scratch, Str via)
     s->sentest    = estimate(s);  // the gauge until the request (live)
     resetnudges(s, 1);
     instrcheck(s, scratch);
+    skillcheck(s, scratch);
     prepare(s, scratch);
 }
 
@@ -6125,6 +6382,28 @@ static void buildprefix(Session *s, Arena scratch)
                                          : Str(", never in the working directory "
                                                "or /tmp."));
     }
+    s->skillson = tooloffered(&s->te, TOOL_SKILL);
+    if (s->skillson) {
+        Arena  a  = scratch;
+        Skills sk = sessskills(s, &a);
+        skillsee(s, sk.list);
+        Buf t(&a, 1024);
+        for (iz i = 0; i < s->skillseen.len; i++) {
+            print(&t, "\n- ");
+            print(&t, s->skillseen[i].name);
+            print(&t, ": ");
+            print(&t, s->skillseen[i].desc);
+        }
+        if (t.len) {
+            s->system = concat(&s->perm, s->system,
+                               "\n\n# Skills\n\nSkills hold instructions for "
+                               "particular kinds of tasks. When a task matches "
+                               "a skill's description, call the skill tool with "
+                               "its name before you start, and follow what it "
+                               "says. The skills:");
+            s->system = concat(&s->perm, s->system, finish(&t));
+        }
+    }
     if (s->instr.len) {
         s->system = concat(&s->perm, s->system,
                            "\n\n# Instructions\n\nThe user and the project "
@@ -6152,6 +6431,9 @@ static void logprefix(Session *s, Arena scratch)
     if (tooloffered(&s->te, TOOL_DESKTOP)) {
         putstrkey(&w.json, "coordinates", s->te.coords==COORDS_NORM1000
                                           ? Str("norm1000") : Str("pixels"));
+    }
+    if (s->skillson) {
+        putskills(&w.json, s->skillseen, 0);
     }
     ssend(s, &w);
 }
@@ -6357,7 +6639,7 @@ static struct {
         "is relevant with grep and glob, read it, and report what you "
         "found, with file paths and line numbers. You can only read: you "
         "cannot change files or run commands.",
-        "read grep glob",
+        "read grep glob skill",
     },
     {
         "general",
@@ -6569,7 +6851,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->rolepr  = clone(&s->perm, r.prompt);
     s->depth   = p->depth + 1;
     s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
-                 deskdeny(e, 1);
+                 deskdeny(e, 1) | skilldeny(e);
     s->psid    = clone(&s->perm, p->sid);
     s->pcall   = clone(&s->perm, c->id);
     s->intask  = 1;
@@ -7354,7 +7636,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->role       = clone(&s->perm, role.name);
     s->rolepr     = clone(&s->perm, role.prompt);
     s->te.deny    = role.deny | (tools.data ? tooldeny(tools) : 0) |
-                    deskdeny(e, role.ok);
+                    deskdeny(e, role.ok) | skilldeny(e);
     s->stepmax    = steps<STEP_HARD ? steps : 0;
     s->projinstr  = instr == "project";
     s->nofallback = !fall;
@@ -7437,6 +7719,9 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
         Job *jb = jobfind(s, jsonint(jsonget(j, "job"), 0));
         if (jb && jsonstr(jsonget(j, "kind"))=="job") {
             jb->quiet = 1;
+        }
+        if (jsonget(j, "skills")->type == JSON_ARRAY) {
+            skillseenfrom(s, jsonget(j, "skills"));  // as the agent knew them
         }
     } break;
 
@@ -7712,6 +7997,8 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->te.coords     = jsonstr(jsonget(j, "coordinates"))=="norm1000"
                                ? COORDS_NORM1000 : COORDS_PIXELS;
             s->system.data   = s->system.data ? s->system.data : (u8 *)"";
+            s->skillson      = jsonget(j, "skills")->type == JSON_ARRAY;
+            skillseenfrom(s, jsonget(j, "skills"));
             prefixed         = 1;
             break;
         }
@@ -9196,7 +9483,7 @@ static void command(Engine *e, Arena scratch, Str line)
     if (!s) {
         reply(e, scratch, id, 0, "no such open session", sid);
         return;
-    } else if (s->readonly && cmd!=CMD_CLOSE && cmd!=CMD_FILE) {
+    } else if (s->readonly && cmd!=CMD_CLOSE && cmd!=CMD_FILE && cmd!=CMD_SKILLS) {
         reply(e, scratch, id, 0, "read-only: another process has this "
               "session open; open it again once that one has closed it", sid);
         return;
@@ -9238,9 +9525,29 @@ static void command(Engine *e, Arena scratch, Str line)
     case CMD_COMPACT:
         cmdcompact(e, s, scratch, id, j);
         return;
+    case CMD_SKILLS: {
+        // What the user may invoke as /name: every skill, theirs too
+        Arena  a  = scratch;
+        Skills sk = sessskills(s, &a);
+        Buf    b(&a, 1024);
+        EvOut  w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
+        putintkey(&w.json, "id", id);
+        putintkey(&w.json, "ok", 1);
+        putskills(&w.json, sk.list, 1);
+        emit(e, evend(&w));
+    } return;
     case CMD_PROMPT:
-    case CMD_STEER:
-        if (!text.len) {
+    case CMD_STEER: {
+        // A skill the user invoked comes first, with what was typed after
+        Json *skill = jsonget(j, "skill");
+        if (skill->type!=JSON_MISSING && skill->type!=JSON_NULL) {
+            SkillUse u = skillinvoke(s, &scratch, jsonstr(skill), text);
+            if (!u.text.data) {
+                reply(e, scratch, id, 0, u.err, sid);
+                return;
+            }
+            text = u.text;
+        } else if (!text.len) {
             reply(e, scratch, id, 0, "text is required", sid);
             return;
         }
@@ -9259,7 +9566,7 @@ static void command(Engine *e, Arena scratch, Str line)
                 nexttool(s, scratch);
             }
         }
-        return;
+    } return;
     case CMD_CANCEL:
         reply(e, scratch, id, 1, {}, sid);
         cancelturn(s, scratch);
@@ -9669,7 +9976,8 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     // The user's own instructions, next to the configuration
     Str conf = cfgdefault(os, &e->perm);
     if (conf.len) {
-        e->global = normpath(&e->perm, parentdir(conf), "AGENTS.md", HOST_WINDOWS);
+        e->global   = normpath(&e->perm, parentdir(conf), "AGENTS.md", HOST_WINDOWS);
+        e->skilldir = normpath(&e->perm, parentdir(conf), "skills", HOST_WINDOWS);
     }
     loadtrained(e, newarena(e->scratch));
     // Tests shorten minutes of slow retries to milliseconds

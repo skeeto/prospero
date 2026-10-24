@@ -107,7 +107,7 @@
 // exists says whether that file was read, rev counts loads, and files
 // lists every file read, in load order. Settings list every schema key
 // of the top level and of the unnamed kinds ([guard], [tools],
-// [instructions], [ui] and [host]), and of each named [endpoint],
+// [instructions], [skills], [ui] and [host]), and of each named [endpoint],
 // [model], [role] and [remote] section that exists, in schema order. A
 // value is the one in effect as written, or its default ("default":1,
 // with file "" and line 0, or where the key is set empty); "valid":0
@@ -205,6 +205,7 @@ static CfgKind cfgkinds[] = {
     {"guard",    0, "Where the file tools may go without asking"},
     {"tools",    0, "Background jobs, stopping commands, and search"},
     {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
+    {"skills",   0, "Skills: SKILL.md instructions the agent uses as a task calls for them"},
     {"ui",       0, "How the GUI looks"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"host",     0, "The engine as a background host (prospero serve)"},
@@ -354,9 +355,10 @@ static CfgKey cfgschema[] = {
      "session's, or for a subagent its parent's [model] subagent_model, "
      "else the parent's own"},
     {"role", "tools", CFG_LIST,
-     "read write edit shell grep glob todo_write jobs job_output job_kill task", {},
      "read write edit shell grep glob todo_write jobs job_output job_kill task "
-     "desktop",
+     "skill", {},
+     "read write edit shell grep glob todo_write jobs job_output job_kill task "
+     "desktop skill",
      "role", "Tools the role may use; desktop also needs [desktop] offer"},
 
     {"guard", "roots", CFG_PATHS, "", {}, {}, "guard",
@@ -388,6 +390,13 @@ static CfgKey cfgschema[] = {
     {"instructions", "files", CFG_STRING, "AGENTS.md CLAUDE.md", {}, {},
      "instructions", "File names to load from each directory, the first "
      "found in each, separated by blanks"},
+
+    {"skills", "enabled", CFG_BOOL, "true", {}, {}, "skills",
+     "Offer skills: SKILL.md files in .claude/skills and .agents/skills "
+     "of the project, and in the user's own skill directories"},
+    {"skills", "paths", CFG_PATHS, "", {}, {}, "skills",
+     "More directories of skills, each holding NAME/SKILL.md, separated "
+     "by ;, after the project's and before the user's"},
 
     {"desktop", "offer", CFG_ENUM, "none", {}, "none roles all", "desktop",
      "Which sessions get the desktop tool: none, roles whose tools list "

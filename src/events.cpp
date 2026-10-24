@@ -138,6 +138,7 @@ enum : i32 {
     CMD_DRAFT,   // (M8) the frontend's unsent prompt, kept
     CMD_UPLOAD,  // (M9) part of a file staged for import
     CMD_IMPORT,  // (M9) a new session from a log staged by upload
+    CMD_SKILLS,  // a session's skills, for /name
     CMD_COUNT,
 };
 
@@ -146,6 +147,7 @@ static Str cmdnames[] = {
     "cancel", "answer", "config.get", "config.set", "quit", "rewind",
     "job.kill", "status", "stop", "file", "rename", "delete", "archive",
     "group", "fork", "compact", "model", "draft", "upload", "import",
+    "skills",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -174,6 +176,7 @@ static Str capnames[] = {
     "config.delete",   // config.set {delete}: a section of the user's file
     "import",          // upload and import, a session from a raw log
     "answer.always.desktop",  // a desktop ask's always, by action class
+    "skills",          // skills, the skill tool, and prompt {skill}
 };
 
 static Str evname(i32 ev)

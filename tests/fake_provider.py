@@ -741,6 +741,42 @@ def sc_instructions(model, n, req):
         yield from answer(model, "Read.")
 
 
+def sc_skills(model, n, req):
+    k = step(req)
+    if k == 0:
+        yield from tool(model, n, "skill", {"name": "notes", "args": "the args"})
+    elif k == 1:
+        base = ""
+        for line in tool_results(req)[0].split("\n"):
+            if line.startswith("Base directory for this skill: "):
+                base = line.split(": ", 1)[1]
+        yield from tool(model, n, "read", {"path": base + "/ref.txt"})
+    elif k == 2:
+        yield from tool(model, n, "skill", {"name": "review"})
+    else:
+        yield from answer(model, "Used the skills.")
+
+
+def sc_skill_prompt(model, n, req):
+    yield from answer(model, f"Answer number {n}.")
+
+
+def sc_skill_task(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Use a skill",
+                                           "prompt": "Use the pdf skill.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, "Parent heard: " + tool_results(req)[0])
+
+
+def sc_skill_task_b(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "skill", {"name": "pdf"})
+    else:
+        yield from answer(model, "Child read: " + tool_results(req)[0][-40:])
+
+
 def sc_grandchild(model, n, req):
     if n == 0:
         cmd = "sleep 30 & echo $! > pid3; echo started"

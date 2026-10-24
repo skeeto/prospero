@@ -19,7 +19,7 @@ static void testroles(Test *t)
 
     Role ex = findrole(e, "explore");
     expect(t, "explore over the built-in", concat(&a, concat(&a, ex.model, "|"),
-           istr(&a, ex.deny==tooldeny("read grep glob"))), "small|1");
+           istr(&a, ex.deny==tooldeny("read grep glob skill"))), "small|1");
     expect(t, "explore keeps its prompt", istr(&a, startswith(ex.prompt, "Explore the code")), "1");
     Role rd = findrole(e, "reader");
     expect(t, "reader", concat(&a, concat(&a, rd.desc, "|"), concat(&a, rd.prompt,
@@ -36,7 +36,7 @@ static void testroles(Test *t)
     expect(t, "task roles", te.roles,
            "\n- explore: Finds and reads code to answer a question, and reports "
            "what it found; it cannot change files or run commands (tools: read, "
-           "grep, glob)\n- general: Does any task, with every tool (every tool)\n"
+           "grep, glob, skill)\n- general: Does any task, with every tool (every tool)\n"
            "- reader: Reads (tools: read, glob)\n- open: (no description) (every tool)");
     expect(t, "task role enum", te.roleenum,
            "\"enum\":[\"explore\",\"general\",\"reader\",\"open\"]");

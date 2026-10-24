@@ -1,5 +1,5 @@
 // Tools: read, write, edit, shell, grep, glob, todo_write, jobs,
-// job_output, job_kill, task, desktop
+// job_output, job_kill, task, desktop, skill
 //
 // Every call ends in exactly one result the agent reads. Invalid calls
 // are never executed, and their results say how to fix them. File tools
@@ -11,7 +11,8 @@
 // ripgrep when it is found, else this same executable (search.cpp).
 // task starts a subagent, a session of its own (engine.cpp). desktop
 // sees and drives the screen through a helper (desktop.cpp), and is
-// offered only where the configuration says. A role may offer fewer
+// offered only where the configuration says. skill gives the agent a
+// skill's instructions (skills.cpp). A role may offer fewer
 // tools, and a call to one it does not is an unknown tool.
 //
 // This is free and unencumbered software released into the public domain.
@@ -30,12 +31,13 @@ enum : i32 {
     TOOL_JOBKILL,
     TOOL_TASK,
     TOOL_DESKTOP,
+    TOOL_SKILL,
     TOOL_COUNT,
 };
 
 static Str toolnames[] = {
     "read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
-    "job_output", "job_kill", "task", "desktop",
+    "job_output", "job_kill", "task", "desktop", "skill",
 };
 static_assert(countof(toolnames) == TOOL_COUNT);
 
@@ -468,6 +470,19 @@ static Str tooljson(Arena *a, ToolEnv *te)
                  "(default 10)", 0, {}},
             },
         },
+        {
+            "skill",
+            "Use a skill: get its instructions, then follow them. Your "
+            "instructions list the skills, each with what it is for; when "
+            "a task matches one, call this first. The result gives the "
+            "skill's base directory, where any files it names are, which "
+            "you may read.",
+            {
+                {"name", "string", "The skill's name, as listed", 1, {}},
+                {"args", "string", "Arguments for the skill, if it takes "
+                 "any", 0, {}},
+            },
+        },
     };
     static_assert(countof(defs) == TOOL_COUNT);
 
@@ -684,6 +699,8 @@ struct Args {
     Slice<HashEdit> hedits;
     Patch           patch;      // edit as patch
     DeskArgs        desk;       // desktop
+    Str             name;       // skill
+    Str             args;       // skill: its arguments, null if none
     Slice<Str>      issues;
     Str             repaired;   // what repairargs fixed, if anything
 };
@@ -1182,6 +1199,16 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
     case TOOL_DESKTOP:
         argdesk(a, &r, j);
         break;
+    case TOOL_SKILL:
+        r.name = trim(argstr(a, &r, j, "name", 1));
+        r.args = argstr(a, &r, j, "args", 0);
+        if (startswith(r.name, "/")) {
+            r.name = cuthead(r.name, 1);  // as the user would type it
+        }
+        if (r.name.data && !r.name.len) {
+            issue(a, &r, "name", "must not be empty");
+        }
+        break;
     }
     if (r.path.data && !r.path.len) {
         issue(a, &r, "path", "must not be empty");
@@ -1238,6 +1265,7 @@ static Str unknowntool(Arena *a, Str name, u32 deny)
         {"dispatch_agent", "task"}, {"delegate", "task"},
         {"computer", "desktop"}, {"screenshot", "desktop"},
         {"computer_use", "desktop"}, {"mouse", "desktop"},
+        {"use_skill", "skill"}, {"load_skill", "skill"}, {"skills", "skill"},
     };
     ToolEnv te = {};
     te.deny = deny;
