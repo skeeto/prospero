@@ -12696,9 +12696,16 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->sess && g->opendir.len && v->cwd==g->opendir && !v->nofolder &&
                g->opened>=1 && !g->sess->readonly;
     case CHK_OPENED: {
-        DriveOp *op = &g->ops[g->drivepc-1];
-        return g->opened==(i32)op->dx &&
-               (!op->text.len || (g->sess && endswith(v->cwd, op->text)));
+        DriveOp *op  = &g->ops[g->drivepc-1];
+        Str      end = {};
+        if (g->sess && v->cwd.len>=op->text.len) {
+            end = cuthead(v->cwd, v->cwd.len-op->text.len);
+        }
+        b32 same = end.len == op->text.len;
+        for (iz i = 0; same && i < end.len; i++) {
+            same = end[i]==op->text[i] || (end[i]=='\\' && op->text[i]=='/');  // Windows
+        }
+        return g->opened==(i32)op->dx && (!op->text.len || (g->sess && same));
     }
     case CHK_HANDEDDIR: {
         Arena a    = g->frame;
