@@ -434,11 +434,12 @@ static JsonDoc jsonparse(Arena *perm, Str src)
 
 // Accessors: all accept the missing node and any type.
 
-// Member of an object by name, the last one when names repeat.
+// Member of an object by name, the last one when names repeat; missing
+// from no object at all, as from a configuration not yet arrived.
 static Json *jsonget(Json *j, Str key)
 {
     Json *r = (Json *)&jsonmissing;
-    if (j->type == JSON_OBJECT) {
+    if (j && j->type==JSON_OBJECT) {
         for (Json *m = j->child; m; m = m->next) {
             if (m->key == key) {
                 r = m;

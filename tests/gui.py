@@ -1180,7 +1180,7 @@ def main():
                     help="the engine as prospero --headless")
     ap.add_argument("--inbox-cap", type=int,
                     help="the GUI's inbox, small to force lost records (default "
-                         "32768, but the GUI's own for --mode bench, which "
+                         "65536, but the GUI's own for --mode bench, which "
                          "measures how fast a history arrives)")
     ap.add_argument("--mode", default="drive",
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
@@ -1308,7 +1308,7 @@ def main():
     if args.mode != "background":
         guiargs.insert(0, f"--{args.mode}")  # it runs two checklists
     if args.inbox_cap or args.mode not in ("bench", "background"):
-        guiargs += ["--inbox-cap", str(args.inbox_cap or 32768)]
+        guiargs += ["--inbox-cap", str(args.inbox_cap or 65536)]
     if far:
         guiargs += ["--rcwd", far.work]
     if args.subprocess:
