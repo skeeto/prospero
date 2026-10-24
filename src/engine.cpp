@@ -121,6 +121,7 @@ enum : i64 {
     DRAFT_MAX    = 1 << 20,       // bytes of an unsent prompt kept
     FOCUS_MAX    = 4 << 10,       // bytes of a compaction's focus
     SNAPSHOT_MAX = 256 << 10,     // bytes of text in a snapshot
+    QUEUE_SHOW   = 4 << 10,       // bytes of a queued message a queue shows
     FILECMD_MAX  = 1 << 20,       // bytes of a file a file command gives
     PARK_IDLE    = 7*60*SEC,      // idle this long, a session is parked
     TASK_SOFT    = 200,           // a subagent's requests, by default
@@ -420,6 +421,13 @@ struct Compact {
     i64       began;     // ticks
 };
 
+// A message from the user waiting to be taken in, which the user may
+// withdraw until then (unqueue) by its id, unique in its session.
+struct Queued {
+    Str text;
+    i64 id;
+};
+
 struct Session {
     Session     *next;
     Engine      *e;
@@ -472,8 +480,9 @@ struct Session {
     b32          contnext;   // nudge to continue after the tools
     b32          lengthcut;  // the response stopped at the length limit
     b32          cancelled;
-    Slice<Str>   queued;     // prompts waiting for the turn to end
-    Slice<Str>   steers;     // input for the next step: asks yield to it
+    Slice<Queued> queued;    // prompts waiting for the turn to end
+    Slice<Queued> steers;    // input for the next step: asks yield to it
+    i64          queueid;    // the latest queued's id
     Ask          ask;        // with S_ASK
     // The current request
     Http        *http;
@@ -777,6 +786,46 @@ static void live(Session *s)
         }
         putintkey(&w.json, "tasks", n);  // subagents still at work
     }
+    ssend(s, &w);
+}
+
+// What waits to be taken in: steers, which the next step takes, then
+// prompts, each for a turn of its own (a steer whose turn ends first
+// follows them, as one more). Sent as it changes, emptied included, and
+// as a frontend opens the session. Each text is shown cut to its share
+// of a budget, as a snapshot's are (cut, the bytes left out at its
+// end); unqueue gives it whole.
+static void sendqueue(Session *s, Arena scratch)
+{
+    iz n      = s->steers.len + s->queued.len;
+    iz budget = mailmax(s->e->out) / 8;
+    iz share  = budget / (n ? n : 1);
+    share = share<QUEUE_SHOW ? share : QUEUE_SHOW;
+    Buf   b(&scratch, 256 + n*(64 + share));
+    EvOut w = sbegin(s, &b, EV_QUEUE);
+    putkey(&w.json, "items");
+    putarray(&w.json);
+    for (iz i = 0; i < n; i++) {
+        b32    steer = i < s->steers.len;
+        Queued q     = steer ? s->steers[i] : s->queued[i-s->steers.len];
+        Str    text  = q.text;
+        iz     cut   = 0;
+        if (text.len > share) {
+            iz end = share;
+            for (; end>0 && (text[end]&0xc0)==0x80; end--) {}
+            cut  = text.len - end;
+            text = takehead(text, end);
+        }
+        putobject(&w.json);
+        putintkey(&w.json, "id", q.id);
+        putstrkey(&w.json, "kind", steer ? Str("steer") : Str("prompt"));
+        putstrkey(&w.json, "text", text);
+        if (cut) {
+            putintkey(&w.json, "cut", cut);
+        }
+        putend(&w.json);
+    }
+    putend(&w.json);
     ssend(s, &w);
 }
 
@@ -6146,9 +6195,12 @@ static void finalize(Session *s, Arena scratch)
 static void prepare(Session *s, Arena scratch)
 {
     for (iz i = 0; i < s->steers.len; i++) {
-        adduser(s, scratch, s->steers[i], "steer");
+        adduser(s, scratch, s->steers[i].text, "steer");
     }
-    s->steers = {};
+    if (s->steers.len) {
+        s->steers = {};
+        sendqueue(s, scratch);
+    }
     if (s->cancelled) {
         endturn(s, scratch, "cancel", {});
         return;
@@ -6343,15 +6395,23 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     setstate(s, S_IDLE);
 
     // Steering that came too late becomes the next prompt
+    b32 changed = s->steers.len > 0;
     for (iz i = 0; i < s->steers.len; i++) {
         s->queued = push(&s->perm, s->queued, s->steers[i]);
     }
     s->steers = {};
+    Str next = {};
     if (s->queued.len && !s->e->quitting) {
-        Str next = s->queued[0];
+        next = s->queued[0].text;
         s->queued.data++;
         s->queued.len--;
         s->queued.cap--;
+        changed = 1;
+    }
+    if (changed) {
+        sendqueue(s, scratch);
+    }
+    if (next.data) {
         startturn(s, scratch, next, "queue");
     } else if (s->closed) {
         stopjobs(s, scratch, 0);  // started after the session closed
@@ -6375,7 +6435,10 @@ static void cancelturn(Session *s, Arena scratch)
         return;
     }
     s->cancelled = 1;
-    s->queued    = {};
+    if (s->queued.len) {
+        s->queued = {};
+        sendqueue(s, scratch);
+    }
     switch (s->state) {
     case S_TOOL:
         if (s->desk.busy && s->desk.action==DESK_DRAG) {
@@ -8554,6 +8617,38 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
         }
     }
     live(s);  // the state of a session that was open already
+    if (busy(s)) {
+        sendqueue(s, scratch);  // what waits in it, if anything
+    }
+}
+
+// unqueue {sid, item}: withdraw a queued message (queue's id) not yet
+// taken in, replying with its text whole, else an error.
+static void cmdunqueue(Engine *e, Session *s, Arena scratch, i64 id, i64 item)
+{
+    Slice<Queued> *lists[] = {&s->steers, &s->queued};
+    for (i32 k = 0; k < countof(lists); k++) {
+        Slice<Queued> *l = lists[k];
+        for (iz i = 0; i < l->len; i++) {
+            if ((*l)[i].id != item) {
+                continue;
+            }
+            Str text = (*l)[i].text;
+            for (iz n = i+1; n < l->len; n++) {
+                (*l)[n-1] = (*l)[n];
+            }
+            l->len--;
+            Buf   b(&scratch, 256 + text.len + text.len/8);
+            EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
+            putintkey(&w.json, "id", id);
+            putintkey(&w.json, "ok", 1);
+            putstrkey(&w.json, "text", text);
+            emit(e, evend(&w));
+            sendqueue(s, scratch);
+            return;
+        }
+    }
+    reply(e, scratch, id, 0, "nothing queued by that id: taken in already, or withdrawn", s->sid);
 }
 
 struct RewindFile {
@@ -9993,17 +10088,24 @@ static void command(Engine *e, Arena scratch, Str line)
         if (!busy(s)) {
             startturn(s, scratch, text, cmd==CMD_PROMPT ? Str("prompt") : Str("steer"));
         } else if (cmd == CMD_PROMPT) {
-            s->queued = push(&s->perm, s->queued, clone(&s->perm, text));
+            Queued q = {clone(&s->perm, text), ++s->queueid};
+            s->queued = push(&s->perm, s->queued, q);
+            sendqueue(s, scratch);
         } else {
             // Read at the next step; a pending ask yields to it, as do
             // any more asks before then (askcall)
-            s->steers = push(&s->perm, s->steers, clone(&s->perm, text));
+            Queued q = {clone(&s->perm, text), ++s->queueid};
+            s->steers = push(&s->perm, s->steers, q);
+            sendqueue(s, scratch);
             if (s->state == S_ASK) {
                 resolve(s, scratch, 0, DENY_STEER, {});
                 nexttool(s, scratch);
             }
         }
     } return;
+    case CMD_UNQUEUE:
+        cmdunqueue(e, s, scratch, id, jsonint(jsonget(j, "item"), 0));
+        return;
     case CMD_CANCEL:
         reply(e, scratch, id, 1, {}, sid);
         cancelturn(s, scratch);

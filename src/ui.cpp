@@ -2894,6 +2894,49 @@ static void drawslash(Gui *g, Str text, Slice<SkillItem> skills, ImVec2 at)
     g->slashshown = 1;
 }
 
+// Messages sent to the turn at work that wait to be taken in: dim
+// bubbles above the box, oldest first, each with a Withdraw that puts
+// it back in the draft (guiunqueue), unless it was taken in meanwhile.
+static void drawqueue(Gui *g, GuiSession *s)
+{
+    View       *v   = s->view;
+    Arena       a   = g->frame;
+    f32         sc  = g->scale;
+    ImGuiStyle &st  = ImGui::GetStyle();
+    ImDrawList *dl  = ImGui::GetWindowDrawList();
+    f32         h   = ImGui::GetFrameHeight();
+    f32         bw  = ImGui::CalcTextSize("Withdraw").x + 2*st.FramePadding.x;
+    f32         pad = 8*sc;
+    for (iz i = 0; i < v->queue.len; i++) {
+        ViewQueued *q = &v->queue[i];
+        ImVec2      p = ImGui::GetCursorScreenPos();
+        f32         w = ImGui::GetContentRegionAvail().x;
+        dl->AddRectFilled(p, v2(p.x+w, p.y+h), g->pal->userbg, 6*sc);
+        Str    label = q->steer ? Str("next step  ") : Str("queued  ");
+        f32    lw    = ImGui::CalcTextSize(label.cdata, label.cdata+label.len).x;
+        f32    ty    = p.y + st.FramePadding.y;
+        f32    end   = p.x + w - bw - 2*pad;
+        Str    line  = oneline(&a, q->text);
+        dl->AddText(v2(p.x+pad, ty), g->pal->paneldim, label.cdata, label.cdata+label.len);
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->paneldim);
+        ImGui::RenderTextEllipsis(dl, v2(p.x+pad+lw, ty), v2(end, p.y+h), end,
+                                  line.cdata, line.cdata+line.len, 0);
+        ImGui::PopStyleColor();
+        ImGui::SetCursorScreenPos(v2(p.x + w - bw - pad/2, p.y));
+        ImGui::PushID((i32)q->id);
+        ImGui::BeginDisabled(s->unqueue != 0);
+        if (ImGui::Button("Withdraw", v2(bw, h))) {
+            guiunqueue(g, s, q->id);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "withdraw");
+        ImGui::SetItemTooltip(q->steer ? "Take it back into the box, before the agent reads it"
+                                       : "Take it back into the box, before its turn begins");
+        ImGui::PopID();
+    }
+    g->queueshown = (i32)v->queue.len;
+}
+
 static void drawprompt(Gui *g)
 {
     f32         sc  = g->scale;
@@ -2908,6 +2951,7 @@ static void drawprompt(Gui *g)
     g->cmenushown  = 0;
     g->histshown   = 0;
     g->editshown   = 0;
+    g->queueshown  = 0;
     drawstrip(g);
 
     // A line for the editor at work, else the latest command's outcome
@@ -2928,6 +2972,10 @@ static void drawprompt(Gui *g)
         ImGui::TextUnformatted(cstr0(&a, s->note));
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
+    }
+    View *sv = g->sess ? g->sess->view : 0;
+    if (sv && sv->queue.len && !g->sess->readonly && hostcap(g->sess->host, "queue")) {
+        drawqueue(g, g->sess);
     }
 
     ImGui::PushID(s);
@@ -3015,8 +3063,9 @@ static void drawprompt(Gui *g)
         s->note = {};
         drafttyped(&s->dclock, g->sched.now);
     }
-    if (cb.escaped) {
+    if (cb.escaped || (g->promptfocus && g->sess==s)) {
         ImGui::ActivateItemByID(id);
+        g->promptfocus = 0;
     }
     SlashInfo c = pick ? slashpickinfo(&a, pick, s->skills) : SlashInfo{};
     if (pick && (cb.tab || (send && text!=c.name))) {

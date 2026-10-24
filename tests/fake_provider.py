@@ -1007,6 +1007,19 @@ def sc_queue(model, n, req):
     yield from finish(model)
 
 
+def sc_unqueue(model, n, req):
+    # Three seconds of streaming, while messages queue up behind it; then
+    # each queued one is answered at once
+    if n == 0:
+        yield S.head()
+        for i in range(30):
+            yield from text(model, f"slow{i} ")
+            yield S.sleep(0.1)
+        yield from finish(model)
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
 def sc_queue_b(model, n, req):
     yield from answer(model, "The other model answered.")
 

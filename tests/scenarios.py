@@ -1959,6 +1959,70 @@ def ask_steer(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=15)
+def unqueue(t):
+    """Steers and prompts sent while a response streams wait in a queue,
+    each record of it listing them with their ids; one withdrawn never
+    reaches the agent, and comes back whole. Reopening shows the queue;
+    a withdrawal once it was taken in, or twice, is refused."""
+    h = t.headless()
+
+    def queues(n):
+        """The queue records, once there are n: each follows its reply."""
+        deadline = time.monotonic() + 5
+        while len(h.all("queue", sid)) < n and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return h.all("queue", sid)
+
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "delta" and e.get("sid") == sid)
+        sent = [("steer", "withdraw this steer"), ("steer", "keep this steer"),
+                ("prompt", "withdraw this prompt"), ("prompt", "keep this prompt")]
+        for cmd, text in sent:
+            t.check(h.call(cmd, sid=sid, text=text).get("ok") == 1, f"{cmd} {text}")
+        q = queues(4)
+        t.check(len(q) == 4, f"a queue record each: {q}")
+        items = q[-1]["items"]
+        t.check([(i["kind"], i["text"]) for i in items] == sent and
+                len({i["id"] for i in items}) == 4, f"the queue: {items}")
+        ids = {i["text"]: i["id"] for i in items}
+
+        r = h.call("unqueue", sid=sid, item=ids["withdraw this steer"])
+        t.check(r.get("ok") == 1 and r.get("text") == "withdraw this steer", f"unqueue: {r}")
+        r = h.call("unqueue", sid=sid, item=ids["withdraw this prompt"])
+        t.check(r.get("ok") == 1 and r.get("text") == "withdraw this prompt", f"unqueue: {r}")
+        r = h.call("unqueue", sid=sid, item=ids["withdraw this prompt"])
+        t.check(r.get("ok") == 0 and r.get("err"), f"twice: {r}")
+        left = [i["text"] for i in queues(6)[-1]["items"]]
+        t.check(left == ["keep this steer", "keep this prompt"], f"left: {left}")
+
+        # Opened again, as a frontend coming back would: the queue as it is
+        n = len(h.all("queue", sid))
+        t.check(h.call("open", sid=sid, **{"from": 1 << 40}).get("ok") == 1, "reopened")
+        q = queues(n+1)
+        t.check(len(q) == n+1 and [i["text"] for i in q[-1]["items"]] == left,
+                f"the queue on open: {q[n:]}")
+
+        # The prompt starts the next turn, then the steer, too late for
+        # the one-step turn, as a prompt; neither can be withdrawn once
+        # taken in
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid
+               and e.get("turn") == 3, timeout=10)
+        r = h.call("unqueue", sid=sid, item=ids["keep this steer"])
+        t.check(r.get("ok") == 0, f"taken in already: {r}")
+        users = [(e["text"], e.get("via")) for e in h.all("user", sid)]
+        t.check(users[1:] == [("keep this prompt", "queue"), ("keep this steer", "queue")]
+                and users[0][0] == "go", f"messages: {users}")
+        t.check(h.all("queue", sid)[-1]["items"] == [], "the queue ends empty")
+        said = json.dumps([r["body"]["messages"] for r in t.requests()])
+        t.check("withdraw this" not in said, "nothing withdrawn reached the agent")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=10)
 def ask_close(t):
     h = t.headless()
@@ -2041,14 +2105,14 @@ def hello_caps(t):
         cmds = hello.get("cmds", [])
         want = ["hello", "list", "new", "open", "close", "prompt", "steer", "cancel",
                 "answer", "config.get", "config.set", "quit", "rewind", "job.kill",
-                "status", "stop", "file"] + m8 + ["skills", "mode"]
+                "status", "stop", "file"] + m8 + ["skills", "mode", "unqueue"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
                 {"close.forget", "config.refresh", "file.base64", "desktop",
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
-                 "fork", "answer.always.desktop", "skills", "plan"} <= set(caps)
+                 "fork", "answer.always.desktop", "skills", "plan", "queue"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 

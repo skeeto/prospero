@@ -298,6 +298,13 @@ struct ViewTodo {
     i32 status;     // VTODO_*
 };
 
+// A message sent to the turn at work, waiting to be taken in (queue).
+struct ViewQueued {
+    Str text;       // cut to its start if long: unqueue gives it whole
+    i64 id;
+    b32 steer;      // for the next step, else a prompt for a turn of its own
+};
+
 // A file that write or edit changed, whose original a rewind restores.
 struct ViewSnap {
     Str  call;
@@ -466,6 +473,7 @@ struct View {
 
     // Beside the transcript
     Slice<ViewTodo>  todos;     // the latest list
+    Slice<ViewQueued> queue;    // the latest queue, empty once a turn ends
     Slice<ViewJob>   jobs;      // by number
     i32              jobsrun;   // running
     Slice<ViewSnap>  snaps;     // in order
@@ -2026,8 +2034,23 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         }
     } return 1;
 
+    case EV_QUEUE: {
+        Json       *items = jsonget(j, "items");
+        iz          n     = jsonlen(items);
+        ViewQueued *q     = alloc<ViewQueued>(&v->aux, n);
+        iz          k     = 0;
+        for (Json *e = items->child; e && k<n; e = e->next, k++) {
+            q[k].text  = clone(&v->aux, jsonstr(jsonget(e, "text")));
+            q[k].id    = jsonint(jsonget(e, "id"), 0);
+            q[k].steer = jsonstr(jsonget(e, "kind")) == "steer";
+        }
+        v->queue.data = q;
+        v->queue.len  = v->queue.cap = k;
+    } return 1;
+
     case EV_TURNEND: {
         dropprov(v);
+        v->queue = {};  // its record lost, the next says what is left
         v->doneturn    = (i32)jsonint(jsonget(j, "turn"), v->turn);
         v->doneattempt = 0x7fffffff;
         v->busy  = 0;
@@ -2134,6 +2157,7 @@ static void viewstopped(View *v)
         }
     }
     fadeprov(v);
+    v->queue     = {};
     v->jobsrun   = 0;
     v->busy      = 0;
     v->asks      = 0;

@@ -451,6 +451,7 @@ struct GuiSession {
     Str          note;      // what the latest command from the box came to
     b32          noteerr;
     Str          cmdtext;   // that command, put back in the box if it fails
+    i64          unqueue;   // the queued message being withdrawn, else 0
     i64          cmdid;
     Str          group;     // its group, from the list (only a root's counts)
     b32          archived;  // from the list (only a root's counts)
@@ -1116,6 +1117,8 @@ struct Gui {
                                      // 4 cut and copy, 8 paste, 16 editor
     i32                histshown;    // the box showed history entry N/M
     b32                editshown;    // it said an editor was at work
+    i32                queueshown;   // queued messages drawn above the box
+    b32                promptfocus;  // activate the box when next drawn
 };
 
 // Log to standard error, the log file, and the Log window, which then
@@ -2144,6 +2147,22 @@ static void onskills(Gui *g, GuiSession *s, Json *j, b32 ok)
     scheddirty(&g->sched);
 }
 
+// Withdraw a message queued for the session's turn (queue's id): its
+// text comes back in the reply, for the draft (onreply).
+static void guiunqueue(Gui *g, GuiSession *s, i64 item)
+{
+    if (!s || s->unqueue) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_UNQUEUE, s);
+    putkey(&w.json, "item");
+    putint(&w.json, item);
+    cmdsend(g, &w, a);
+    s->unqueue = item;
+}
+
 static void guicancel(Gui *g, GuiSession *s)
 {
     if (!s || !s->view || !s->view->busy) {
@@ -2789,6 +2808,22 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_DRAFT:
         if (!ok && q.s) {
             setnote(g, q.s, concat(&scratch, "the draft was not kept: ", err), 1);
+        }
+        return;
+
+    case CMD_UNQUEUE:
+        // Withdrawn: back in the box, after what it holds, to edit
+        if (q.s && ok) {
+            Str text  = jsonstr(jsonget(j, "text"));
+            Str draft = draftstr(q.s);
+            setdraft(g, q.s, draft.len ? concat(&scratch, concat(&scratch, draft, "\n"), text)
+                                       : text);
+            g->promptfocus = q.s == g->sess;
+        } else if (q.s) {
+            setnote(g, q.s, concat(&scratch, "not withdrawn: ", err), 1);
+        }
+        if (q.s) {
+            q.s->unqueue = 0;
         }
         return;
 
@@ -6831,6 +6866,7 @@ enum : i32 {
     CHK_PLANMODEL,    // the model picker is enabled while the plan waits
     CHK_MAXIMIZED,    // maximized, filling its display, and saved so;
                       // dx 1: filling it, saved as maximized
+    CHK_QUEUESHOWN,   // dx queued messages drawn above the box, the first text
     CHK_COUNT,
 };
 
@@ -7005,6 +7041,7 @@ static Str chknames[] = {
     "the Plan window shows the plan as the agent wrote it",
     "the model may change while the plan waits",
     "the window is maximized, filling its display, and will open so",
+    "the box shows the messages queued, as it should",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9300,6 +9337,25 @@ static DriveOp composeops[] = {
     {OP_SHOT, 0, 0, 0, 300, "compose-drafts"},
     CLICK(T_SESSTITLE, "Session B", 500),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for B"},
+    // D: a steer sent while the response streams waits above the box
+    // until withdrawn, back into the box, and never reaches the agent
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 200, "Stream in the background."},
+    {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "Withdraw me"},
+    KEY(GKEY_ENTER, 0, 600),
+    {OP_CHECK, CHK_QUEUESHOWN, 1, 0, 0, "Withdraw me"},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "compose-queued"},
+    {OP_TEXT, 0, 0, 0, 200, "Draft for D"},
+    CLICK(T_NAMED, "withdraw", 600),
+    {OP_CHECK, CHK_QUEUESHOWN, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for D\nWithdraw me"},
+    {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Stream in the background."},
     // C: enough of a conversation for /compact, with a focus
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
@@ -10656,6 +10712,11 @@ static b32 drivecheck(Gui *g, i32 chk)
         guilog(g, finish(&b));
         return w.ok && (w.max || g->ops[g->drivepc-1].dx!=0) && g->geom.max &&
                10*(i64)w.box.w>=9*(i64)on.w && 10*(i64)w.box.h>=8*(i64)on.h;
+    }
+    case CHK_QUEUESHOWN: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        return g->sess && v->queue.len==(iz)op->dx && g->queueshown==(i32)op->dx &&
+               (!v->queue.len || v->queue[0].text==op->text);
     }
     case CHK_TOOLTIP:       return tooltipup();
     case CHK_NOTOOLTIP:     return !tooltipup();

@@ -708,6 +708,42 @@ def two_clients(t):
 
 
 @scenario
+def queue_clients(t):
+    """A steer queued through one client reaches another that opens the
+    session after it (the open's queue), and that one withdraws it: both
+    see the queue empty, and the steer never becomes a message."""
+    a = Client(t)
+    sa = a.attach()
+    a.call("hello")
+    sid = a.call("new", cwd=t.work, prompt="go", attended=1)["sid"]
+    sa.wait(lambda r: r.get("ev") == "delta", what="a delta")
+    t.check(a.call("steer", sid=sid, text="take me back").get("ok") == 1, "steered")
+    q = sa.wait(lambda r: r.get("ev") == "queue" and r.get("items"), what="A's queue")
+    item = q["items"][0]
+    t.check(item["kind"] == "steer" and item["text"] == "take me back", f"queue: {q}")
+    b = Client(t)
+    sb = b.attach(reconnect=True)
+    b.call("hello")
+    t.check(b.call("open", sid=sid, **{"from": 0}).get("ok") == 1, "B opened")
+    qb = sb.wait(lambda r: r.get("ev") == "queue" and r.get("sid") == sid,
+                 what="B's queue")
+    t.check(qb["items"] == q["items"], f"B's queue: {qb}")
+    r = b.call("unqueue", sid=sid, item=item["id"])
+    t.check(r.get("ok") == 1 and r.get("text") == "take me back", f"unqueue: {r}")
+    for s in (sa, sb):
+        s.wait(lambda r: r.get("ev") == "queue" and r.get("items") == [],
+               what="the queue emptied")
+    sa.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+            timeout=30, what="turn.end")
+    r = a.call("unqueue", sid=sid, item=item["id"])
+    t.check(r.get("ok") == 0, f"withdrawn already: {r}")
+    users = [r for r in sa.records if r.get("ev") == "user" and r.get("sid") == sid]
+    t.check([u.get("text") for u in users] == ["go"], f"messages: {users}")
+    for s in (sa, sb):
+        s.disconnect()
+
+
+@scenario
 def backlog(t):
     """A host that keeps little for each client (a test hook), its client
     away while an answer larger than that comes: the answer comes from
