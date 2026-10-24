@@ -174,7 +174,7 @@ the fork's prompt box, or after a turn. The prompt box keeps a draft
 per session, with the engine, has the session's earlier prompts on Up
 and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
 else `$VISUAL` or `$EDITOR`), and takes `/compact`, `/model`,
-`/rename`, `/fork` and `/export`. An ask may be answered "always",
+`/rename`, `/fork`, `/export`, `/plan` and a skill's `/NAME`. An ask may be answered "always",
 with the button set apart from Allow, which allows that directory, for
 reads or for writes too, for the rest of the session and its subagents,
 even after it is opened again. Each session has a scratch directory in the system's
@@ -189,6 +189,28 @@ notes, compactions and the todo list) and drops everything that refers
 to the old machine: allowed directories and grants, snapshots and
 rewinds, spilled output files, images, subagents and jobs. The new
 session is titled "(imported)" and remembers the session it came from.
+
+A message sent while a turn runs waits above the prompt box until the
+agent takes it in at its next step (or, too late for this turn, runs as
+the next prompt), and its Withdraw button puts it back in the draft.
+
+Plan mode has the agent explore and write a plan before it changes
+anything: the New session dialog's Plan mode box, `/plan` (and `/plan
+off`) or the toggle below Send turns it on, and the agent may ask to
+turn it on itself. While planning, its file tools may write only the
+session's plan file, `plan.md` in the session's directory, the desktop
+tool may only look, and subagents plan too. When it is done it asks for
+approval, showing the plan: Approve plan lets it go ahead, and Keep
+planning sends it a note. The model may be changed while the plan
+waits. The Plan pane shows the plan file, which stays after approval.
+
+Sessions may talk to each other: the agent lists the other sessions on
+its host, with how they relate to it (parent, child, sibling), and
+sends one a message, which it reads at its next step, or which starts a
+turn if it is idle. A message is marked as another session's, never as
+the user's words or permission. A chain of messages with no prompt from
+the user in between stops waking sessions after eight hops, and a turn
+may send at most twenty.
 
 `prospero run` runs one turn with no window and exits when it ends,
 printing its records as JSON lines, or readable text with `--pretty`.
@@ -288,7 +310,7 @@ which defaults to `~/.config/prospero/prospero.ini`. On Windows,
 from its built-in copy ([assets/prospero.ini](assets/prospero.ini)),
 which documents every section and key: `[endpoint NAME]`,
 `[model NAME]`, `[role NAME]`, `[guard]`, `[tools]`, `[instructions]`,
-`[ui]`, `[desktop]`, `[host]` and `[remote NAME]`. Changes take effect while it
+`[skills]`, `[ui]`, `[desktop]`, `[host]` and `[remote NAME]`. Changes take effect while it
 runs. An unknown key or a bad value is reported in the diagnostics,
 and a bad value falls back to its default: nothing in the file keeps
 Prospero from starting.
@@ -350,6 +372,19 @@ At the start of a session the agent is given its instructions:
 the first of `AGENTS.md` or `CLAUDE.md` (`[instructions] files`) in
 each directory from the root of the repository down to the working
 directory, and more below it as the agent works there.
+
+Skills are the same as in Claude Code and other harnesses: a directory
+holding `SKILL.md`, whose frontmatter gives its `name` and
+`description`, with any files it refers to beside it. They are found in
+`.claude/skills` and `.agents/skills` in each directory from the
+working directory up to the root of the repository, then in `[skills]
+paths`, then in `~/.config/prospero/skills`, `~/.claude/skills` and
+`~/.agents/skills`; the nearest of a name wins. The agent is told each
+skill's name and description, loads one with its skill tool, which
+also lets it read the skill's directory, and hears of skills added or
+changed as it works. `/NAME args` in the prompt box uses a skill
+directly, and one with `disable-model-invocation: true` is for that
+alone. `[skills] enabled = false` turns them off.
 
 ## Desktop control
 
