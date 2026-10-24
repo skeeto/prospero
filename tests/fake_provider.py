@@ -1426,6 +1426,14 @@ def sc_edit_hashline(model, n, req):
         tag = res[0].split("[list.txt#", 1)[1].split("]", 1)[0]
         yield from tool(model, n, "edit", {"path": "list.txt", "tag": tag, "edits": [
             {"op": "replace", "line": 3, "text": "two"}]})
+    elif k == 6:
+        # CRLF, and no final newline, which write adds
+        yield from tool(model, n, "write", {"path": "new.txt", "content": "a\r\nb"})
+    elif k == 7:
+        # The tag from write's result works, with no read
+        tag = res[0].split("[new.txt#", 1)[1].split("]", 1)[0]
+        yield from tool(model, n, "edit", {"path": "new.txt", "tag": tag, "edits": [
+            {"op": "replace", "line": 2, "text": "B"}]})
     else:
         yield from answer(model, "Edited by line.")
 

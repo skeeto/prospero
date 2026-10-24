@@ -2854,7 +2854,7 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     }
     switch (tool) {
     case TOOL_READ:  o = toolread(e->os, &scratch, ncwd, path, args, hl); break;
-    case TOOL_WRITE: o = toolwrite(e->os, &scratch, ncwd, path, args);    break;
+    case TOOL_WRITE: o = toolwrite(e->os, &scratch, ncwd, path, args, hl); break;
     case TOOL_EDIT:  o = hl ? toolhash(e->os, &scratch, ncwd, path, args)
                             : tooledit(e->os, &scratch, ncwd, path, args);
                      break;

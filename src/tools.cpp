@@ -526,11 +526,12 @@ static Str tooljson(Arena *a, ToolEnv *te)
             "no longer matches, and nothing is changed: read it again. The "
             "result shows the new tag and the changed lines with their new "
             "numbers. Line endings and any byte order mark are kept. To "
-            "create a file, use write.",
+            "create a file, use write, whose result gives its tag; its lines "
+            "are numbered from 1 as written.",
             {
                 {"path", "string", "File path, relative to the working directory or absolute", 1, {}},
                 {"tag", "string", "The TAG of the file's [PATH#TAG] header, from "
-                 "the read or edit that showed it last", 1, {}},
+                 "the read, write or edit that showed it last", 1, {}},
                 {"edits", "array", "The changes, made together", 1, hashitem},
             },
         },
@@ -1591,7 +1592,10 @@ static Str finalnewline(Str content, b32 existed, i64 size, Str tail)
     return crlf ? Str("\r\n") : Str("\n");
 }
 
-static ToolOut toolwrite(Os *os, Arena *a, Str cwd, Str path, Args *args)
+// Write a file whole. Tagged (hashline edits), the result gives its new
+// tag, as an edit's does, since an edit needs one.
+static ToolOut toolwrite(Os *os, Arena *a, Str cwd, Str path, Args *args,
+                         b32 tagged = 0)
 {
     ToolOut r   = {};
     Stat    st  = os_stat(os, *a, path);
@@ -1627,6 +1631,13 @@ static ToolOut toolwrite(Os *os, Arena *a, Str cwd, Str path, Args *args)
     print(&b, " bytes, ");
     print(&b, (i64)countlines(data));
     print(&b, nl.len ? Str(" lines; added a final newline).") : Str(" lines)."));
+    if (tagged) {
+        print(&b, " Its tag:\n[");
+        print(&b, showpath(cwd, path));
+        putbyte(&b, '#');
+        print(&b, filetag(a, data));
+        putbyte(&b, ']');
+    }
     r.text  = finish(&b);
     r.wrote = data;
     r.ok    = 1;
