@@ -664,11 +664,22 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     SDL_WindowFlags flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
                             SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
     // Where it was last, if anywhere, fitted to the displays once it
-    // exists and its borders are known, before it shows
+    // exists and its borders are known, before it shows. Else its first
+    // size, at the primary display's scale: X11's windows are in pixels,
+    // whose scale is the desktop's, while macOS's points and Wayland's
+    // logical units are at scale 1 already.
     WinGeom geom = g->geom;
-    i32     w    = geom.ok ? geom.box.w : 1280;
-    i32     h    = geom.ok ? geom.box.h : 800;
-    flags |= geom.ok && geom.max ? SDL_WINDOW_MAXIMIZED : 0;
+    if (!geom.ok) {
+        WinBox d = g->firstdisp;
+        if (!d.w) {
+            os_guidisplays(os, &d, 1);
+        }
+        f32 scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+        geom = firstgeom(d, scale);
+    }
+    i32 w = geom.box.w;
+    i32 h = geom.box.h;
+    flags |= geom.max ? SDL_WINDOW_MAXIMIZED : 0;
     Arena t = g->frame;
     p->window = SDL_CreateWindow(cstr0(&t, title), w, h, flags);
     if (!p->window) {
@@ -683,7 +694,7 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
         SDL_GetWindowPosition(p->window, &b->x, &b->y);
         SDL_GetWindowSize(p->window, &b->w, &b->h);
     }
-    p->max = geom.ok && geom.max;
+    p->max = geom.max;
     if (geom.ok && geom.full) {
         SDL_SetWindowFullscreen(p->window, 1);  // as it shows
     }

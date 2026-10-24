@@ -671,6 +671,7 @@ int main()
     test_thumb(&t);
     test_fonts(&t);
     test_place(&t);
+    test_firstgeom(&t);
     test_compose(&t);
     test_pathpick(&t);
     test_sidebar(&t);

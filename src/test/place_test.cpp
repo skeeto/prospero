@@ -1,7 +1,8 @@
 // Window placement tests: a saved window on displays as they are now,
 // faked: kept where the displays cover it, fitted onto the display with
 // most of its title bar, or centered on the primary when it was on a
-// display gone since.
+// display gone since. With nothing saved, the first size at the
+// display's scale, or maximized on a display too small for it.
 
 static Str boxstr(Arena *a, WinBox b)
 {
@@ -70,4 +71,43 @@ static void test_place(Test *t)
     expect(t, "place.left", boxstr(&a, placewindow(w, left, 2)), "-1200,50 1000x700");
     w = {-1200, 50, 1000, 700};
     expect(t, "place.leftgone", boxstr(&a, placewindow(w, left, 1)), "460,170 1000x700");
+}
+
+static Str firststr(Arena *a, WinBox disp, f32 scale)
+{
+    WinGeom g = firstgeom(disp, scale);
+    Buf     p(a, 64);
+    print(&p, (i64)g.box.w);
+    putbyte(&p, 'x');
+    print(&p, (i64)g.box.h);
+    print(&p, g.max ? Str(" max") : Str(""));
+    print(&p, g.ok ? Str(" ok") : Str(""));
+    return finish(&p);
+}
+
+static void test_firstgeom(Test *t)
+{
+    Arena a = t->perm;
+
+    // A 1080p display under a task bar: room at scale 1, not at 1.25
+    WinBox hd = {0, 0, 1920, 1040};
+    expect(t, "first.hd", firststr(&a, hd, 1), "1700x900");
+    expect(t, "first.hd125", firststr(&a, hd, 1.25f), "1440x780 max");
+
+    // 4K at 200%, as pixels (Win32, X11): the same in logical units
+    WinBox uhd = {0, 0, 3840, 2080};
+    expect(t, "first.uhd", firststr(&a, uhd, 2), "3400x1800");
+
+    // A laptop in points (macOS) under its menu bar and dock, and one a
+    // little short of the title bar's room
+    expect(t, "first.laptop", firststr(&a, {0, 38, 1728, 1009}, 1), "1700x900");
+    expect(t, "first.short", firststr(&a, {0, 25, 1728, 920}, 1), "1296x690 max");
+
+    // Narrower than the window: maximized, never below the minimum
+    expect(t, "first.narrow", firststr(&a, {0, 25, 1440, 875}, 1), "1080x657 max");
+    expect(t, "first.tiny", firststr(&a, {0, 0, 200, 100}, 1), "320x240 max");
+
+    // An unknown display, or scale: the size as is
+    expect(t, "first.nodisplay", firststr(&a, {}, 1.5f), "2550x1350");
+    expect(t, "first.noscale", firststr(&a, hd, 0), "1700x900");
 }

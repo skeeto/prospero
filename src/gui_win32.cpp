@@ -25,7 +25,8 @@
 //
 // The window opens where it was last, its frame fitted to the monitors'
 // work areas as they are (place.cpp, in the core's half), maximized if
-// it was. WM_MOVE and WM_SIZE tell the core its geometry: the frame, or
+// it was, else at its first size (place.cpp, the core's half too).
+// WM_MOVE and WM_SIZE tell the core its geometry: the frame, or
 // when maximized, the frame it restores to (GetWindowPlacement). A
 // precision touchpad's scrolling comes as WM_MOUSEWHEEL with deltas
 // smaller than a notch, inertia included, which ImGui takes as they are.
@@ -56,7 +57,8 @@ struct W32Hooks {
 enum {
     GEOM_X, GEOM_Y, GEOM_W, GEOM_H,
     GEOM_MAX,    // maximized
-    GEOM_OK,     // known: else the system's place and default size
+    GEOM_OK,     // known: else centered on the primary display, W and H
+                 // the client area's first size, maximized if MAX
     GEOM_COUNT,
 };
 
@@ -85,6 +87,7 @@ extern "C" void      w32gui_shed(void *);      // the window goes, the loop stay
 extern "C" int       w32gui_reopen(void *, unsigned short const *title,
                                     int const *geom);
 extern "C" int       w32gui_displays(int *xywh, int max);  // work areas
+extern "C" float     w32gui_scale0(void);  // the primary display's DPI scale
 extern "C" int       w32gui_where(void *, int *geom);
 extern "C" void      w32gui_place(void *, int const *geom);
 extern "C" int       w32gui_trayopen(void *, unsigned short const *tip);
@@ -568,37 +571,46 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title,
 
 // The main window, its device, and ImGui's backends for them, which
 // w32gui_shed takes down again. It goes where geom says (fitted to the
-// displays already), else where the system puts it, 1280 by 800 at its
-// display's scale.
+// displays already), else centered on the primary display, its client
+// area geom's first size (the core's, at that display's scale).
 static int makewindow(W32Gui *w, unsigned short const *title, int const *geom)
 {
     W32Hooks *hooks = &w->hooks;
     HINSTANCE inst  = GetModuleHandleW(0);
-    int       at    = geom && geom[GEOM_OK];
+    int       at    = geom[GEOM_OK];
     w->framedark = -1;
     w->width     = 0;
     w->height    = 0;
-    w->showmax   = at && geom[GEOM_MAX];
+    w->showmax   = geom[GEOM_MAX];
     // Maximized from creation, for a show that does not activate (the
     // checklist's), as no show command maximizes without activating.
     // Its normal box is still the one given.
     DWORD style = WS_OVERLAPPEDWINDOW | (w->showmax ? WS_MAXIMIZE : 0);
+    // A first window centered on the primary display's work area, as
+    // the system's cascade would leave a big one hanging off it
+    RECT  r     = {0, 0, geom[GEOM_W], geom[GEOM_H]};
+    int   x     = geom[GEOM_X];
+    int   y     = geom[GEOM_Y];
+    if (!at) {
+        AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, 0, 0);
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+        RECT wa = mi.rcWork;
+        x = wa.left + ((wa.right-wa.left) - (r.right-r.left))/2;
+        y = wa.top  + ((wa.bottom-wa.top) - (r.bottom-r.top))/2;
+        x = x<wa.left ? wa.left : x;
+        y = y<wa.top  ? wa.top  : y;
+    }
     w->hwnd = CreateWindowExW(
-        0, L"prospero", (LPCWSTR)title, style,
-        at ? geom[GEOM_X] : CW_USEDEFAULT, at ? geom[GEOM_Y] : CW_USEDEFAULT,
-        at ? geom[GEOM_W] : 1280, at ? geom[GEOM_H] : 800, 0, 0, inst, 0
+        0, L"prospero", (LPCWSTR)title, style, x, y,
+        r.right-r.left, r.bottom-r.top, 0, 0, inst, 0
     );
     if (!w->hwnd) {
         return 0;
     }
     DragAcceptFiles(w->hwnd, TRUE);
     float scale = ImGui_ImplWin32_GetDpiScaleForHwnd(w->hwnd);
-    if (!at) {
-        RECT r = {0, 0, (LONG)(1280*scale), (LONG)(800*scale)};
-        AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, 0, 0);
-        SetWindowPos(w->hwnd, 0, 0, 0, r.right-r.left, r.bottom-r.top,
-                     SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
-    }
 
     // Hardware, else WARP: a VM or a remote session may have no GPU.
     if (!makedevice(w, D3D_DRIVER_TYPE_HARDWARE) &&
@@ -692,6 +704,13 @@ extern "C" int w32gui_displays(int *xywh, int max)
     Displays d = {xywh, max, 0};
     EnumDisplayMonitors(0, 0, adddisplay, (LPARAM)&d);
     return d.n;
+}
+
+extern "C" float w32gui_scale0(void)
+{
+    return ImGui_ImplWin32_GetDpiScaleForMonitor(
+        MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY)
+    );
 }
 
 extern "C" int w32gui_where(void *p, int *geom)
@@ -1358,7 +1377,7 @@ static void fitgeom(Os *os, WinGeom g, int *geom)
 {
     WinBox disp[16];
     i32    n = os_guidisplays(os, disp, countof(disp));
-    WinBox b = placewindow(g.box, disp, n);
+    WinBox b = g.ok ? placewindow(g.box, disp, n) : g.box;
     geom[GEOM_X]   = b.x;
     geom[GEOM_Y]   = b.y;
     geom[GEOM_W]   = b.w;
@@ -1402,8 +1421,18 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
 {
     Arena t = g->frame;
     unsigned short *wtitle = (unsigned short *)towide(&t, title).data;
+    // Where it was last, if anywhere, else its first size: the work
+    // area's pixels hold it at the primary display's scale, or not
+    WinGeom at = g->geom;
+    if (!at.ok) {
+        WinBox d = g->firstdisp;
+        if (!d.w) {
+            os_guidisplays(os, &d, 1);
+        }
+        at = firstgeom(d, w32gui_scale0());
+    }
     int geom[GEOM_COUNT];
-    fitgeom(os, g->geom, geom);  // where it was last, if anywhere
+    fitgeom(os, at, geom);
     if (os->gui) {
         // Again, after os_guished
         if (!w32gui_reopen(os->gui, wtitle, geom)) {

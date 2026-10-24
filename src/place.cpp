@@ -6,16 +6,21 @@
 // or task bar moved over it. Then it is fitted, no bigger than the
 // display that has the most of its title bar, and moved onto it; or, if
 // no display has any of its title bar, which it needs to be moved by
-// hand, centered on the primary display. Each platform gives its own
-// coordinates (WinGeom, prospero.cpp), and the frame's outer rectangle
-// here, the title bar along its top.
+// hand, centered on the primary display. A window with nothing saved
+// opens PLACE_FIRSTW by PLACE_FIRSTH at its display's scale, where the
+// platform puts it, or maximized if that display is too small to
+// hold it. Each platform gives its own coordinates (WinGeom,
+// prospero.cpp), and the frame's outer rectangle here, the title bar
+// along its top.
 //
 // This is free and unencumbered software released into the public domain.
 
 enum : i32 {
-    PLACE_TITLE = 30,   // the title bar's height, roughly
-    PLACE_MINW  = 320,  // the smallest window a saved size makes
-    PLACE_MINH  = 240,
+    PLACE_TITLE  = 30,    // the title bar's height, roughly
+    PLACE_MINW   = 320,   // the smallest window a saved size makes
+    PLACE_MINH   = 240,
+    PLACE_FIRSTW = 1700,  // the client area with nothing saved, at scale 1
+    PLACE_FIRSTH = 900,
 };
 
 static i64 boxoverlap(WinBox a, WinBox b)
@@ -73,4 +78,28 @@ static WinBox placewindow(WinBox win, WinBox *disp, i32 n)
         win.y = clampi32(win.y, d.y, d.y + d.h - win.h);
     }
     return win;
+}
+
+// The geometry a window opens at with nothing saved, on a display of
+// that usable rectangle (empty: unknown) at a scale: its client area
+// PLACE_FIRSTW by PLACE_FIRSTH, scaled, where the platform puts it (not
+// ok). If the display cannot hold that under a title bar, maximized,
+// its normal box, should it be restored, three quarters of the display
+// each way: one that filled it would count as maximized already, and
+// macOS's zoom would take it smaller.
+static WinGeom firstgeom(WinBox disp, f32 scale)
+{
+    scale = scale>0 ? scale : 1;
+    WinGeom r     = {};
+    i32     title = (i32)((f32)PLACE_TITLE*scale + 0.5f);
+    r.box.w = (i32)((f32)PLACE_FIRSTW*scale + 0.5f);
+    r.box.h = (i32)((f32)PLACE_FIRSTH*scale + 0.5f);
+    if (disp.w>0 && disp.h>0 && (r.box.w>disp.w || r.box.h+title>disp.h)) {
+        r.max   = 1;
+        r.box.w = disp.w - disp.w/4;
+        r.box.h = disp.h - disp.h/4;
+        r.box.w = r.box.w<PLACE_MINW ? PLACE_MINW : r.box.w;
+        r.box.h = r.box.h<PLACE_MINH ? PLACE_MINH : r.box.h;
+    }
+    return r;
 }

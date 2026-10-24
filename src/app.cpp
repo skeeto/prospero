@@ -1149,6 +1149,8 @@ struct Gui {
     f32                zoomwheel;  // Ctrl+wheel notches short of a step
     b32                fontdirty;  // the size changed: fontsize next frame
     WinGeom            geom;       // the window's, as last placed
+    WinBox             firstdisp;  // --display: the usable size a first
+                                   // window fits, else the primary's
     b32                firstlayout;
     i32                jobsfocus;  // frames until the Jobs tab is selected
     b32                resetpending;
@@ -13702,6 +13704,8 @@ static Str guiusage =
 "  --aggressive   probe every second while idle\n"
 "  --trace        log every frame and why it ran\n"
 "  --trace-drive  log where the checklist's presses land\n"
+"  --display WxH  the usable size of the display a first window fits\n"
+"                 (nothing saved), as if the primary's\n"
 "  --quit-after S quit after S seconds\n";
 
 extern "C" void prospero_imassert(char const *expr, char const *file, int line)
@@ -13919,6 +13923,17 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             probe = 0;
         } else if (a == "--aggressive") {
             probe = aggressive = 1;
+        } else if (a=="--display" && i+1<nargs) {
+            // The checklist's small display, for the first size
+            Cut wh = cut(args[++i], 'x');
+            Int w  = parseint(wh.head);
+            Int h  = parseint(wh.tail);
+            if (!wh.ok || !w.ok || !h.ok || w.val<1 || h.val<1 ||
+                    w.val>1<<16 || h.val>1<<16) {
+                os_print(os, 2, guiusage);
+                return 1;
+            }
+            g->firstdisp = {0, 0, (i32)w.val, (i32)h.val};
         } else if (a == "--quit-after") {
             i64 s = optint(args, nargs, &i);
             g->quitat = s<0 ? 0 : g->started + s*1000000;
