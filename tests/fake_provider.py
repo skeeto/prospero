@@ -3039,6 +3039,12 @@ def an_check(req, prefill=False):
                 if not str(b.get("text", "")).strip():
                     return f"{where}: text content blocks must contain non-whitespace text"
                 texts = True
+            elif kind == "image" and role == "user":
+                src = b.get("source", {})
+                if (src.get("type") != "base64" or not src.get("data") or
+                        src.get("media_type") not in ("image/png", "image/jpeg",
+                                                      "image/gif", "image/webp")):
+                    return f"{where}.source: an image needs base64 data and a media type"
             elif kind == "tool_result" and role == "user":
                 if texts:
                     return f"{where}: tool_result blocks must come before any text"
@@ -3833,6 +3839,53 @@ def sc_msg_siblings_b(model, n, req):
         yield from tool(model, n, "shell", {"command": "sleep 2"})
     else:
         yield from answer(model, "Receiver report: " + last_user(req))
+
+
+# Images attached to user messages, answered with how many the request
+# carries: as image_url parts (Chat Completions) or image blocks
+# (Messages). The first response of attach_steer streams for a while,
+# for messages to queue behind it.
+
+def user_images(req):
+    """The images of a request's user messages, as (mime, base64), with
+    the text parts beside them."""
+    out = []
+    for m in req.get("messages", []):
+        c = m.get("content")
+        if m.get("role") != "user" or not isinstance(c, list):
+            continue
+        for p in c:
+            if p.get("type") == "image_url":
+                url = p["image_url"]["url"]
+                out.append((url[5:url.index(";")], url[url.index(",") + 1:]))
+            elif p.get("type") == "image":
+                out.append((p["source"]["media_type"], p["source"]["data"]))
+    return out
+
+
+def sc_attach(model, n, req):
+    yield from answer(model, f"I see {len(user_images(req))} images.")
+
+
+sc_attach_replay = sc_attach
+sc_attach_refused = sc_attach
+sc_attach_shrink = sc_attach
+sc_attach_copies = sc_attach
+
+
+def sc_attach_steer(model, n, req):
+    if n == 0:
+        yield S.head()
+        for i in range(20):
+            yield from text(model, f"slow{i} ")
+            yield S.sleep(0.1)
+        yield from finish(model)
+    else:
+        yield from answer(model, f"I see {len(user_images(req))} images.")
+
+
+def sc_an_attach(model, n, req):
+    yield from an_answer(model, req, f"I see {len(user_images(req))} images.")
 
 
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()

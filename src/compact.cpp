@@ -214,6 +214,9 @@ static Str transcript(Arena *a, Arena scratch, Slice<Msg> h, iz beg, iz cut,
         case ROLE_USER:
             print(&b, "[user]\n");
             print(&b, clip(&scratch, m->text, COMPACT_TEXTIN));
+            for (iz k = 0; k < m->images.len; k++) {
+                print(&b, "\n[image]");  // which the summary cannot see
+            }
             print(&b, "\n\n");
             break;
         case ROLE_TOOL:

@@ -128,6 +128,12 @@ enum : i64 {
     HOP_MAX      = 8,             // messages since user input that wake
     MSG_TURN     = 20,            // send_message calls a turn
     SESS_SHOWN   = 50,            // unrelated sessions the sessions tool lists
+    // Images attached to a message (upload, prompt)
+    ATTACH_MAX    = 10,           // a message's
+    ATTACH_BYTES  = 5 << 20,      // its base64, as the APIs take it
+    ATTACH_EDGE   = 8000,         // pixels on a side
+    ATTACH_UPLOAD = (i64)64 << 20,  // bytes uploaded, before shrinking
+    ATTACH_PIXELS = sizeof(void *)==8 ? (i64)1<<26 : (i64)1<<22,  // decoded
 };
 
 enum : i32 {
@@ -431,8 +437,9 @@ struct Compact {
 // A message from the user waiting to be taken in, which the user may
 // withdraw until then (unqueue) by its id, unique in its session.
 struct Queued {
-    Str text;
-    i64 id;
+    Str             text;
+    i64             id;
+    Slice<MsgImage> images;
 };
 
 struct Session {
@@ -762,6 +769,9 @@ static void live(Session *s)
     b32   cp  = s->purpose==REQ_COMPACT && requesting(s->state);
     putstrkey(&w.json, "state", cp ? Str("compacting") : statenames[s->state]);
     putgauge(s, &w.json, requesting(s->state) ? s->sentest : estimate(s));
+    if (s->mc.novision) {
+        putintkey(&w.json, "novision", 1);  // its model takes no images
+    }
     if (requesting(s->state)) {
         Endpoint *ep = reqep(s);
         putintkey(&w.json, "idle_ms", (now - s->lastbyte)/MS);
@@ -837,6 +847,9 @@ static void sendqueue(Session *s, Arena scratch)
         if (cut) {
             putintkey(&w.json, "cut", cut);
         }
+        if (q.images.len) {
+            putintkey(&w.json, "images", q.images.len);
+        }
         putend(&w.json);
     }
     putend(&w.json);
@@ -881,15 +894,51 @@ static void addmsg(Session *s, Msg m)
 
 // The next prompt's size in tokens, estimated.
 static i64 deskimagetokens(Session *);
-static i64 estimate(Session *s)  // walks the history for screenshots
+static i64 attachtokens(Session *);
+static i64 estimate(Session *s)  // walks the history for images
 {
     return tokensof(s->rate, s->system.len + s->tools.len + s->bytes) +
-           deskimagetokens(s);
+           deskimagetokens(s) + attachtokens(s);
 }
 
-static void adduser(Session *s, Arena scratch, Str text, Str via)
+// Put images as the user record has them: [{name, mime, w, h}].
+static void putimages(JsonOut *w, Slice<MsgImage> images)
 {
-    Buf   b(&scratch, 256 + text.len);
+    putkey(w, "images");
+    putarray(w);
+    for (iz i = 0; i < images.len; i++) {
+        putobject(w);
+        putstrkey(w, "name", images[i].name);
+        putstrkey(w, "mime", images[i].mime);
+        putintkey(w, "w", images[i].w);
+        putintkey(w, "h", images[i].h);
+        putend(w);
+    }
+    putend(w);
+}
+
+// The images of a user record, in perm, those well formed.
+static Slice<MsgImage> getimages(Arena *perm, Json *list)
+{
+    Slice<MsgImage> r = {};
+    for (Json *x = list->child; x; x = x->next) {
+        MsgImage g = {};
+        g.name = clone(perm, jsonstr(jsonget(x, "name")));
+        g.mime = clone(perm, jsonstr(jsonget(x, "mime")));
+        g.w    = (i32)jsonint(jsonget(x, "w"), 0);
+        g.h    = (i32)jsonint(jsonget(x, "h"), 0);
+        if (g.name.len && g.mime.len) {
+            r = push(perm, r, g);
+        }
+    }
+    return r;
+}
+
+// Log a user record and append its message: the images in perm.
+static void adduser(Session *s, Arena scratch, Str text, Str via,
+                    Slice<MsgImage> images = {})
+{
+    Buf   b(&scratch, 256 + text.len + 128*images.len);
     EvOut w = sbegin(s, &b, EV_USER);
     putstrkey(&w.json, "text", text);
     putstrkey(&w.json, "via", via);
@@ -898,10 +947,14 @@ static void adduser(Session *s, Arena scratch, Str text, Str via)
         putstrkey(&w.json, "skill", sc.name);
         putstrkey(&w.json, "args", sc.args);
     }
+    if (images.len) {
+        putimages(&w.json, images);
+    }
     ssend(s, &w);
     Msg m = {};
-    m.role = ROLE_USER;
-    m.text = clone(&s->perm, text);
+    m.role   = ROLE_USER;
+    m.text   = clone(&s->perm, text);
+    m.images = images;
     addmsg(s, m);
 }
 
@@ -1539,6 +1592,7 @@ static Str  deskdenial(Arena *, i32 by, Str note, i64 wait);
 static Slice<Msg> deskimages(Session *, Arena *);
 static void toolsessions(Session *, Arena);
 static void toolmessage(Session *, Arena, Args *);
+static b32  validimage(Str name);
 
 // The ids of the session's calls so far, which a new call's must not
 // repeat (finishpartial).
@@ -4602,15 +4656,39 @@ static i64 deskimagetokens(Session *s)
     return r;
 }
 
+// Tokens of the images attached to user messages, which requests always
+// carry, each as the model's limits would scale it down (desklimits).
+static i64 attachtokens(Session *s)
+{
+    DeskLimits l = desklimits(s);
+    i64        r = 0;
+    for (iz i = 0; i < s->history.len; i++) {
+        Msg *m = &s->history[i];
+        for (iz k = 0; k < m->images.len; k++) {
+            i64 w    = m->images[k].w;
+            i64 h    = m->images[k].h;
+            i64 edge = w>h ? w : h;
+            if (edge > l.edge) {
+                w = w*l.edge/edge;
+                h = h*l.edge/edge;
+            }
+            i64 px = w*h<l.pixels ? w*h : l.pixels;
+            r += px/750 + 1;
+        }
+    }
+    return r;
+}
+
 // The history for a request: the screenshots shown read in as base64,
-// with a short text in place of each left out, and the floors marked.
-// The history itself if it has none.
+// with a short text in place of each left out, and the floors marked;
+// and the images attached, each read in, or a note if its file is lost.
+// The history itself if it has neither.
 static Slice<Msg> deskimages(Session *s, Arena *a)
 {
     Engine *e   = s->e;
     b32     any = 0;
     for (iz i = 0; i<s->history.len && !any; i++) {
-        any = s->history[i].image.len > 0;
+        any = s->history[i].image.len>0 || s->history[i].images.len>0;
     }
     if (!any) {
         return s->history;
@@ -4635,6 +4713,28 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
                                       ", its file could not be read]");
                 }
             }
+        }
+        if (m.images.len) {
+            Slice<MsgImage> imgs = {};
+            imgs.data = alloc<MsgImage>(a, m.images.len);
+            imgs.len  = imgs.cap = m.images.len;
+            for (iz k = 0; k < m.images.len; k++) {
+                MsgImage g  = m.images[k];
+                b32      ok = validimage(g.name);
+                Read     rd = {};
+                if (ok) {
+                    rd = os_read(e->os, a, join(a, s->dir, g.name), ATTACH_UPLOAD);
+                    ok = rd.err==READ_OK && imagekind(rd.data).mime==g.mime;
+                }
+                if (ok) {
+                    g.b64 = base64(a, rd.data);
+                } else {
+                    g.alt = concat(a, concat(a, "[image lost: ", g.name),
+                                   ", its file could not be read]");
+                }
+                imgs.data[k] = g;
+            }
+            m.images = imgs;
         }
         h.data[i] = m;
     }
@@ -6252,7 +6352,7 @@ static void finalize(Session *s, Arena scratch)
 static void prepare(Session *s, Arena scratch)
 {
     for (iz i = 0; i < s->steers.len; i++) {
-        adduser(s, scratch, s->steers[i].text, "steer");
+        adduser(s, scratch, s->steers[i].text, "steer", s->steers[i].images);
         userinput(s);
     }
     if (s->steers.len) {
@@ -6390,13 +6490,14 @@ static void beginturn(Session *s, Arena scratch, Str via)
 }
 
 // A subagent's task carries its parent's hop, and user input resets it.
-static void startturn(Session *s, Arena scratch, Str text, Str via)
+static void startturn(Session *s, Arena scratch, Str text, Str via,
+                      Slice<MsgImage> images = {})
 {
     s->cancelled = 0;
     if (via != "task") {
         userinput(s);
     }
-    adduser(s, scratch, text, via);
+    adduser(s, scratch, text, via, images);
     if (!s->title.len) {
         Str title = cleantitle(&scratch, text, TITLE_MAX);
         settitle(s, scratch, title, "auto");
@@ -6471,9 +6572,9 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
         s->queued = push(&s->perm, s->queued, s->steers[i]);
     }
     s->steers = {};
-    Str next = {};
+    Queued next = {};
     if (s->queued.len && !s->e->quitting) {
-        next = s->queued[0].text;
+        next = s->queued[0];
         s->queued.data++;
         s->queued.len--;
         s->queued.cap--;
@@ -6482,8 +6583,8 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     if (changed) {
         sendqueue(s, scratch);
     }
-    if (next.data) {
-        startturn(s, scratch, next, "queue");
+    if (next.text.data) {
+        startturn(s, scratch, next.text, "queue", next.images);
     } else if (mhop) {
         s->hop = mhop;
         beginturn(s, scratch, "message");
@@ -8746,9 +8847,10 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             break;
         case EV_USER:
         case EV_NUDGE:
-            m.role = ROLE_USER;
-            m.text = clone(&s->perm, jsonstr(jsonget(j, "text")));
-            m.seq  = r.seq;
+            m.role   = ROLE_USER;
+            m.text   = clone(&s->perm, jsonstr(jsonget(j, "text")));
+            m.seq    = r.seq;
+            m.images = getimages(&s->perm, jsonget(j, "images"));
             addmsg(s, m);
             break;
         case EV_COMPACT: {
@@ -9007,16 +9109,19 @@ static void cmdunqueue(Engine *e, Session *s, Arena scratch, i64 id, i64 item)
             if ((*l)[i].id != item) {
                 continue;
             }
-            Str text = (*l)[i].text;
+            Queued q = (*l)[i];
             for (iz n = i+1; n < l->len; n++) {
                 (*l)[n-1] = (*l)[n];
             }
             l->len--;
-            Buf   b(&scratch, 256 + text.len + text.len/8);
+            Buf   b(&scratch, 256 + q.text.len + q.text.len/8 + 128*q.images.len);
             EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
             putintkey(&w.json, "id", id);
             putintkey(&w.json, "ok", 1);
-            putstrkey(&w.json, "text", text);
+            putstrkey(&w.json, "text", q.text);
+            if (q.images.len) {
+                putimages(&w.json, q.images);  // to attach again
+            }
             emit(e, evend(&w));
             sendqueue(s, scratch);
             return;
@@ -9846,8 +9951,8 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
 
     // Its files, of those regular files there that the log names
     Map<b32> *have = 0;
-    for (i32 k = 0; k < 2; k++) {
-        Str sub = k ? Str("snap") : Str("out");
+    for (i32 k = 0; k < 3; k++) {
+        Str sub = k==2 ? Str("img") : k ? Str("snap") : Str("out");
         for (Dirent *d = os_list(os, &scratch, join(&scratch, from, sub)); d; d = d->next) {
             if (!d->isdir) {
                 *upsert(&have, join(&scratch, sub, d->name), &scratch) = 1;
@@ -9948,12 +10053,209 @@ static void sweepuploads(Engine *e, Arena scratch)
     }
 }
 
-// upload {token?, data, off, done?}: a part of a raw log, its bytes in
-// base64 at offset off, which must be the bytes staged so far, so that
-// a part sent twice, or out of order, is refused. The first part has no
-// token, and its reply names the one the rest give. With done, the log
-// is complete, and ready to import. The reply has the token and off,
-// the bytes staged.
+// Attachments: an image comes in parts as a log does (upload, kind
+// "image"), and once complete is kept in its session's directory as
+// img/N.png or img/N.jpg, numbered from 1, which prompts then name. Only
+// PNG and JPEG are taken, by their first bytes. One too large for the
+// APIs, over ATTACH_EDGE pixels on a side or ATTACH_BYTES as base64, is
+// shrunk to fit if a PNG, else refused, as there is no JPEG decoder.
+
+// An attached image's name, as attaching makes them.
+static b32 validimage(Str name)
+{
+    Str ext = endswith(name, ".png") ? Str(".png") :
+              endswith(name, ".jpg") ? Str(".jpg") : Str{};
+    if (!ext.len || !startswith(name, "img/")) {
+        return 0;
+    }
+    Str n  = cuttail(cuthead(name, 4), 4);
+    b32 ok = n.len>0 && n.len<=9 && n[0]!='0';
+    for (iz i = 0; ok && i < n.len; i++) {
+        ok = n[i]>='0' && n[i]<='9';
+    }
+    return ok;
+}
+
+static iz base64len(iz n)
+{
+    return (n + 2)/3 * 4;
+}
+
+struct Shrunk {
+    Str png;  // null on failure
+    Str err;
+};
+
+// A PNG shrunk until it fits the APIs: within ATTACH_EDGE on each side,
+// then smaller until its base64 is within ATTACH_BYTES.
+static Shrunk shrinkpng(Os *os, Arena *a, Str png)
+{
+    Shrunk  r   = {};
+    Region *reg = os_reserve(os, (iz)ATTACH_PIXELS*4*4 + ((iz)16<<20));
+    if (!reg) {
+        r.err = "out of memory to shrink the image";
+        return r;
+    }
+    Arena mem = newarena(reg);
+    Png   p   = pngdecode(&mem, png, ATTACH_PIXELS);
+    if (p.err.data) {
+        r.err = concat(a, "the image is too large, and cannot be shrunk: ", p.err);
+        os_release(os, reg);
+        return r;
+    }
+    i32 w    = p.width;
+    i32 h    = p.height;
+    i32 edge = w>h ? w : h;
+    f64 s    = edge>ATTACH_EDGE ? (f64)ATTACH_EDGE/edge : 1;
+    for (i32 tries = 0; tries<8 && !r.png.data; tries++, s *= 0.75) {
+        Arena t  = mem;
+        i32   tw = (i32)(w*s);
+        i32   th = (i32)(h*s);
+        tw = tw<1 ? 1 : tw;
+        th = th<1 ? 1 : th;
+        u8 *px  = tw==w && th==h ? p.rgba : shrink(&t, p.rgba, w, h, tw, th);
+        Str out = pngencodez(&t, px, tw, th, 0);
+        if (base64len(out.len) <= ATTACH_BYTES) {
+            r.png = clone(a, out);
+        }
+    }
+    if (!r.png.data) {
+        r.err = "the image is too large, and does not shrink to fit";
+    }
+    os_release(os, reg);
+    return r;
+}
+
+struct Attached {
+    MsgImage img;
+    Str      err;
+};
+
+// Keep the image a complete upload staged at path, which goes, as session
+// sid's next, shrunk if it must be, all in a. The image, or why not.
+static Attached attachstaged(Engine *e, Arena *a, Str sid, Str path)
+{
+    Os      *os = e->os;
+    Attached r  = {};
+    Read     rd = os_read(os, a, path, ATTACH_UPLOAD);
+    os_remove(os, *a, path);
+    if (rd.err != READ_OK) {
+        r.err = "cannot read the staged upload";
+        return r;
+    }
+    Str       data = rd.data;
+    ImageKind k    = imagekind(data);
+    if (!k.mime.data) {
+        r.err = "not an image: only PNG and JPEG can be attached";
+        return r;
+    } else if (k.w<1 || k.h<1) {
+        r.err = "a damaged image: its size cannot be read";
+        return r;
+    }
+    b32 big = base64len(data.len)>ATTACH_BYTES || k.w>ATTACH_EDGE || k.h>ATTACH_EDGE;
+    if (big && k.ext=="jpg") {
+        r.err = "the JPEG is too large to attach: at most 8000 pixels on a "
+                "side and 3.75 MiB; shrink it first, or attach a PNG";
+        return r;
+    } else if (big) {
+        Shrunk z = shrinkpng(os, a, data);
+        if (!z.png.data) {
+            r.err = z.err;
+            return r;
+        }
+        data = z.png;
+        k    = imagekind(data);
+    }
+
+    // The next number: one past the highest there
+    Str sdir = join(a, join(a, e->statedir, "sessions"), sid);
+    Str dir  = join(a, sdir, "img");
+    i64 n    = 0;
+    for (Dirent *d = os_list(os, a, dir); d; d = d->next) {
+        Str name = concat(a, "img/", d->name);
+        if (validimage(name)) {
+            Int v = parseint(takehead(d->name, d->name.len-4));
+            n = v.ok && v.val>n ? v.val : n;
+        }
+    }
+    Buf b(a, 32);
+    print(&b, "img/");
+    print(&b, n+1);
+    putbyte(&b, '.');
+    print(&b, k.ext);
+    Str name = finish(&b);
+    if (!os_mkdirs(os, *a, dir) || !os_write(os, *a, join(a, sdir, name), data)) {
+        r.err = "cannot keep the image in the session's directory";
+        return r;
+    }
+    r.img.name = name;
+    r.img.mime = k.mime;
+    r.img.w    = k.w;
+    r.img.h    = k.h;
+    return r;
+}
+
+struct Attaching {
+    Slice<MsgImage> images;
+    Str             err;
+};
+
+// The images a prompt or a steer names (images), as attached to the
+// session, read for their kind and size, in perm, and only once all are
+// found. None if it names none.
+static Attaching attaching(Session *s, Arena *perm, Arena scratch, Json *list)
+{
+    Attaching r = {};
+    if (list->type==JSON_MISSING || list->type==JSON_NULL) {
+        return r;
+    } else if (list->type != JSON_ARRAY) {
+        r.err = "images must be an array of the names upload gave";
+        return r;
+    } else if (jsonlen(list) > ATTACH_MAX) {
+        r.err = "too many images: at most 10 in a message";
+        return r;
+    } else if (jsonlen(list) && s->mc.novision) {
+        r.err = "this model takes no images: [model] vision is off for it";
+        return r;
+    }
+    Slice<MsgImage> imgs = {};
+    for (Json *x = list->child; x; x = x->next) {
+        Str name = x->type==JSON_STRING ? jsonstr(x) : Str{};
+        if (!validimage(name)) {
+            r.err = "an image must be named as upload named it: img/N.png or img/N.jpg";
+            return r;
+        }
+        Arena     t  = scratch;
+        Read      rd = os_read(s->e->os, &t, join(&t, s->dir, name), ATTACH_UPLOAD);
+        ImageKind k  = rd.err==READ_OK ? imagekind(rd.data) : ImageKind{};
+        if (!k.mime.data || k.w<1) {
+            r.err = "no such image in the session: upload it first";
+            return r;
+        }
+        MsgImage g = {};
+        g.name = name;
+        g.mime = k.mime;
+        g.w    = k.w;
+        g.h    = k.h;
+        imgs = push(&scratch, imgs, g);
+    }
+    r.images.data = alloc<MsgImage>(perm, imgs.len);
+    r.images.len  = r.images.cap = imgs.len;
+    for (iz i = 0; i < imgs.len; i++) {
+        r.images[i]      = imgs[i];
+        r.images[i].name = clone(perm, imgs[i].name);
+    }
+    return r;
+}
+
+// upload {token?, data, off, done?, kind?, sid?}: a part of a raw log,
+// its bytes in base64 at offset off, which must be the bytes staged so
+// far, so that a part sent twice, or out of order, is refused. The first
+// part has no token, and its reply names the one the rest give. With
+// done, the log is complete, and ready to import. The reply has the
+// token and off, the bytes staged. With kind "image", an image to attach
+// to session sid's messages instead, kept once done (attachstaged), the
+// last reply naming it, with its mime, w and h.
 static void cmdupload(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Os      *os    = e->os;
@@ -9961,9 +10263,20 @@ static void cmdupload(Engine *e, Arena scratch, i64 id, Json *j)
     Json    *oj    = jsonget(j, "off");
     i64      off   = jsonint(oj, -1);
     b32      done  = jsonflag(jsonget(j, "done"), 0);
+    Str      kind  = jsonstr(jsonget(j, "kind"));
+    Str      sid   = jsonstr(jsonget(j, "sid"));
+    b32      image = kind == "image";
     Unbase64 u     = unbase64(&scratch, jsonstr(jsonget(j, "data")));
     Str      err   = {};
-    if (token.data && !validtoken(token)) {
+    Str      sdir  = {};
+    if (image && validsid(sid)) {
+        sdir = join(&scratch, join(&scratch, e->statedir, "sessions"), sid);
+    }
+    if (kind.len && !image) {
+        err = "kind must be \"image\", or absent for a log";
+    } else if (image && !sdir.len) {
+        err = "an image needs its session's sid";
+    } else if (token.data && !validtoken(token)) {
         err = "invalid token";
     } else if (!u.ok) {
         err = "data must be base64";
@@ -9971,10 +10284,14 @@ static void cmdupload(Engine *e, Arena scratch, i64 id, Json *j)
         err = "a part is at most 512 KiB";
     } else if (oj->type!=JSON_NUMBER || off<0) {
         err = "off must be the bytes staged so far";
+    } else if (image && off>ATTACH_UPLOAD-u.data.len) {
+        err = "too large to attach: an image is at most 64 MiB";
     } else if (off > LOG_MAX-u.data.len) {
         err = "too large to import: a log is at most 1 GiB";
     } else if (!token.data && off) {
         err = "off must be 0 to begin an upload";
+    } else if (image && os_stat(os, scratch, sdir).type!=STAT_DIR) {
+        err = "no such session";
     }
     if (err.len) {
         reply(e, scratch, id, 0, err, {});
@@ -10012,11 +10329,19 @@ static void cmdupload(Engine *e, Arena scratch, i64 id, Json *j)
     if (fd >= 0) {
         os_logclose(os, fd);
     }
-    ok = ok && (!done || os_rename(os, scratch, path, to));
+    ok = ok && (!done || image || os_rename(os, scratch, path, to));
     if (!ok) {
         os_remove(os, scratch, path);
         reply(e, scratch, id, 0, "cannot stage the upload", {});
         return;
+    }
+    Attached at = {};
+    if (image && done) {
+        at = attachstaged(e, &scratch, sid, path);
+        if (at.err.len) {
+            reply(e, scratch, id, 0, at.err, {});
+            return;
+        }
     }
     Buf   b(&scratch, 256);
     EvOut w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
@@ -10024,6 +10349,12 @@ static void cmdupload(Engine *e, Arena scratch, i64 id, Json *j)
     putintkey(&w.json, "ok", 1);
     putstrkey(&w.json, "token", token);
     putintkey(&w.json, "off", off + u.data.len);
+    if (at.img.name.len) {
+        putstrkey(&w.json, "name", at.img.name);
+        putstrkey(&w.json, "mime", at.img.mime);
+        putintkey(&w.json, "w", at.img.w);
+        putintkey(&w.json, "h", at.img.h);
+    }
     emit(e, evend(&w));
 }
 
@@ -10445,6 +10776,11 @@ static void command(Engine *e, Arena scratch, Str line)
     case CMD_PROMPT:
     case CMD_STEER: {
         // A skill the user invoked comes first, with what was typed after
+        Attaching at = attaching(s, &s->perm, scratch, jsonget(j, "images"));
+        if (at.err.len) {
+            reply(e, scratch, id, 0, at.err, sid);
+            return;
+        }
         Json *skill = jsonget(j, "skill");
         if (skill->type!=JSON_MISSING && skill->type!=JSON_NULL) {
             SkillUse u = skillinvoke(s, &scratch, jsonstr(skill), text);
@@ -10453,22 +10789,23 @@ static void command(Engine *e, Arena scratch, Str line)
                 return;
             }
             text = u.text;
-        } else if (!text.len) {
+        } else if (!text.len && !at.images.len) {
             reply(e, scratch, id, 0, "text is required", sid);
             return;
         }
+        Slice<MsgImage> imgs = at.images;
         reply(e, scratch, id, 1, {}, sid);
         sidecarwrite(e, scratch, s->sid, "draft", {});  // sent, so no draft
         if (!busy(s)) {
-            startturn(s, scratch, text, cmd==CMD_PROMPT ? Str("prompt") : Str("steer"));
+            startturn(s, scratch, text, cmd==CMD_PROMPT ? Str("prompt") : Str("steer"), imgs);
         } else if (cmd == CMD_PROMPT) {
-            Queued q = {clone(&s->perm, text), ++s->queueid};
+            Queued q = {clone(&s->perm, text), ++s->queueid, imgs};
             s->queued = push(&s->perm, s->queued, q);
             sendqueue(s, scratch);
         } else {
             // Read at the next step; a pending ask yields to it, as do
             // any more asks before then (askcall)
-            Queued q = {clone(&s->perm, text), ++s->queueid};
+            Queued q = {clone(&s->perm, text), ++s->queueid, imgs};
             s->steers = push(&s->perm, s->steers, q);
             sendqueue(s, scratch);
             if (s->state == S_ASK) {

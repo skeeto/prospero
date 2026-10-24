@@ -188,6 +188,7 @@ static Str capnames[] = {
                        // of kind plan and plan.enter, model while asked
     "queue",           // queue records, and unqueue to withdraw from one
     "message",         // sessions and send_message, notices of kind message
+    "images",          // upload {kind:"image"}, prompt and steer {images}
 };
 
 static Str evname(i32 ev)
@@ -784,7 +785,7 @@ struct LogCopy {
     Str        model;  // as a model record left it at the cut, else null
     i64        turn;   // the last turn kept
     b32        open;   // the lines kept end inside a turn
-    Slice<Str> files;  // the out/ and snap/ files they name, as "out/NAME"
+    Slice<Str> files;  // the out/, snap/ and img/ files they name, as "out/NAME"
 };
 
 // A string as JSON escapes it, without its quotes.
@@ -831,16 +832,16 @@ static b32 nameend(u8 c)
            c=='[' || c==']' || c=='{' || c=='}' || c=='|' || c=='*' || c=='?';
 }
 
-// The out/ and snap/ files a log names, as "out/NAME": in a relative
+// The out/, snap/ and img/ files a log names, as "out/NAME": in a relative
 // path or after the session directory, with either separator, and also
 // without the dots that may end a sentence. Some may name nothing.
 static Slice<Str> lognames(Arena *a, Str log)
 {
-    static Str const dirs[] = {"out/", "snap/", "out\\\\", "snap\\\\"};
+    static Str const dirs[] = {"out/", "snap/", "img/", "out\\\\", "snap\\\\"};
     Slice<Str> r    = {};
     Map<b32>  *seen = 0;
     for (iz i = 0; i < log.len; i++) {
-        if (log[i]!='o' && log[i]!='s') {
+        if (log[i]!='o' && log[i]!='s' && log[i]!='i') {
             continue;
         }
         for (iz k = 0; k < countof(dirs); k++) {
@@ -852,7 +853,7 @@ static Slice<Str> lognames(Arena *a, Str log)
             iz end = beg;
             for (; end<log.len && !nameend(log[end]); end++) {}
             Str name = span(log.data+beg, log.data+end);
-            Str dir  = d[0]=='o' ? Str("out/") : Str("snap/");
+            Str dir  = d[0]=='o' ? Str("out/") : d[0]=='i' ? Str("img/") : Str("snap/");
             for (i32 pass = 0; pass<2 && name.len; pass++) {
                 Str  rel = concat(a, dir, name);
                 b32 *got = upsert(&seen, rel, a);
@@ -1089,19 +1090,21 @@ static b32 importkeeps(i32 ev)
 // Whether an import drops a field: of a tool result, one naming a file
 // or a session of the old state directory (spill, image, child, a
 // message's target), or describing one; of a message's notice, its
-// sender, whose title and text stay.
+// sender, whose title and text stay; of a user record, its images.
 static b32 importdrops(i32 ev, Str key)
 {
     if (ev == EV_NOTICE) {
         return key == "from";
+    } else if (ev == EV_USER) {
+        return key == "images";
     }
     return key=="spill" || key=="bytes" || key=="image" || key=="width" ||
            key=="height" || key=="shot" || key=="child" || key=="job" ||
            key=="to";
 }
 
-// A tool result or notice without the fields an import drops, or the
-// line itself if it has none.
+// A tool result, notice or user record without the fields an import
+// drops, or the line itself if it has none.
 static Str importstrip(Arena *a, EvRec *rec, Str line)
 {
     b32 any = 0;
@@ -1202,7 +1205,7 @@ static LogImport logimport(Arena *a, Arena scratch, Str data, Str to, Str cwd,
         } else if (!importkeeps(rec.ev)) {
             r.dropped++;
             continue;
-        } else if (rec.ev==EV_TOOLEND || rec.ev==EV_NOTICE) {
+        } else if (rec.ev==EV_TOOLEND || rec.ev==EV_NOTICE || rec.ev==EV_USER) {
             line = importstrip(a, &rec, line);
         }
         kept = push(&scratch, kept, line);  // t is dead now

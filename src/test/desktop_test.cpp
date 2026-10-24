@@ -533,6 +533,110 @@ static void test_desktop(Test *t)
                "\"[screenshot omitted: c1]\"}]}") > 0), "1");
     }
 
+    // Images attached to a user message: parts after its text (OpenAI),
+    // blocks before it (Anthropic), the breakpoint on the last, and a
+    // note in place of one whose file is lost
+    {
+        ModelConf mc = {};
+        mc.name = "m";
+        MsgImage imgs[2] = {};
+        imgs[0].name = "img/1.png";
+        imgs[0].mime = "image/png";
+        imgs[0].b64  = "QUJD";
+        imgs[1].name = "img/2.jpg";
+        imgs[1].mime = "image/jpeg";
+        imgs[1].b64  = "REVG";
+        Msg msgs[1] = {};
+        msgs[0].role   = ROLE_USER;
+        msgs[0].text   = "what is this?";
+        msgs[0].images = {imgs, 2, 2};
+        ChatReq r = {};
+        r.mc      = &mc;
+        r.history = {msgs, 1, 1};
+        Arena tmp = *a;
+        tmp.beg  += (tmp.end - tmp.beg)/2;
+        Str body = encodechat(a, tmp, &r);
+        expect(t, "attach openai", istr(a, find(body, "{\"role\":\"user\",\"content\":["
+               "{\"type\":\"text\",\"text\":\"what is this?\"},{\"type\":\"image_url\","
+               "\"image_url\":{\"url\":\"data:image/png;base64,QUJD\"}},{\"type\":"
+               "\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,REVG\"}}]}") > 0),
+               "1");
+        Str an = anencode(a, tmp, &r);
+        expect(t, "attach anthropic", istr(a, find(an, "{\"role\":\"user\",\"content\":["
+               "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":"
+               "\"image/png\",\"data\":\"QUJD\"}},{\"type\":\"image\",\"source\":{\"type\":"
+               "\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"REVG\"}},{\"type\":"
+               "\"text\",\"text\":\"what is this?\",\"cache_control\"") > 0), "1");
+        expect(t, "attach anthropic shape", anshape(a, an), "user:image,image,text*");
+
+        // Images alone, one of them lost
+        msgs[0].text = "";
+        imgs[1].b64  = {};
+        imgs[1].alt  = "[image lost: img/2.jpg, its file could not be read]";
+        body = encodechat(a, tmp, &r);
+        expect(t, "attach openai alone", istr(a, find(body, "\"content\":[{\"type\":"
+               "\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,QUJD\"}},"
+               "{\"type\":\"text\",\"text\":\"[image lost: img/2.jpg, its file could not "
+               "be read]\"}]}") > 0), "1");
+        an = anencode(a, tmp, &r);
+        expect(t, "attach anthropic alone", anshape(a, an), "user:image,text*");
+        expect(t, "attach anthropic lost", istr(a, find(an, "{\"type\":\"text\",\"text\":"
+               "\"[image lost: img/2.jpg") > 0), "1");
+
+        // Outside a request (no data read): a plain note
+        imgs[0].b64 = {};
+        imgs[1].alt = {};
+        body = encodechat(a, tmp, &r);
+        expect(t, "attach openai unread", istr(a, find(body, "\"content\":[{\"type\":"
+               "\"text\",\"text\":\"[image]\"},{\"type\":\"text\",\"text\":\"[image]\"}]")
+               > 0), "1");
+    }
+
+    // What an image to attach is: PNG or JPEG by its first bytes, its size
+    // from its header (a JPEG's frame, past other segments), and the names
+    // attaching gives
+    {
+        u8 px[2*2*4] = {};
+        for (i32 i = 0; i < 4; i++) {
+            px[i*4+0] = (u8)(i*60);
+            px[i*4+3] = i==3 ? 128 : 255;
+        }
+        Str       png = pngencodez(a, px, 2, 2, 0);
+        ImageKind k   = imagekind(png);
+        expect(t, "kind png", concat(a, k.mime, concat(a, " ", concat(a, istr(a, k.w),
+               istr(a, k.h)))), "image/png 22");
+        Png p = pngdecode(a, png, 16);
+        expect(t, "png rgba round trip", istr(a, !p.err.data &&
+               !__builtin_memcmp(p.rgba, px, sizeof(px))), "1");
+        px[15] = 255;
+        Png q = pngdecode(a, pngencodez(a, px, 2, 2, 0), 16);
+        expect(t, "png opaque as rgb", istr(a, !q.err.data && q.rgba[15]==255 &&
+               q.rgba[4]==60), "1");
+
+        static u8 const jpg[] = {
+            0xff, 0xd8,                                      // SOI
+            0xff, 0xe0, 0x00, 0x04, 0x4a, 0x46,              // APP0, short
+            0xff, 0xff,                                      // fill
+            0xff, 0xc2, 0x00, 0x0b, 0x08, 0x01, 0x2c, 0x02,  // SOF2: 300 high,
+            0x58, 0x01, 0x01, 0x11, 0x00,                    //   600 wide
+            0xff, 0xd9,
+        };
+        k = imagekind({(u8 *)jpg, countof(jpg)});
+        expect(t, "kind jpeg", concat(a, k.mime, concat(a, " ", concat(a, istr(a, k.w),
+               concat(a, "x", istr(a, k.h))))), "image/jpeg 600x300");
+        k = imagekind({(u8 *)jpg, 12});
+        expect(t, "kind jpeg cut", concat(a, k.mime, istr(a, k.w)), "image/jpeg0");
+        static u8 const scan[] = {0xff, 0xd8, 0xff, 0xda, 0x00, 0x02, 0xff, 0xd9};
+        expect(t, "jpeg scan first", istr(a, jpegsize({(u8 *)scan, countof(scan)}).w), "0");
+        expect(t, "kind gif", istr(a, imagekind("GIF89a......").mime.data != 0), "0");
+
+        expect(t, "image names", concat(a, concat(a, istr(a, validimage("img/1.png")),
+               istr(a, validimage("img/12.jpg"))), concat(a, concat(a,
+               istr(a, validimage("img/0.png")), istr(a, validimage("img/../1.png"))),
+               concat(a, istr(a, validimage("img/1.gif")), istr(a, validimage("out/1.png"))))),
+               "110000");
+    }
+
     // Screenshots leave in steps: none until keep+slack, then back to keep
     {
         Buf b(a, 128);

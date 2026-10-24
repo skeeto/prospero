@@ -201,6 +201,16 @@ struct Block {
     Str args;  // the raw argument string, as the model produced it
 };
 
+// An image the user attached to a message.
+struct MsgImage {
+    Str name;  // relative to the session's directory: img/N.png
+    Str mime;  // image/png or image/jpeg
+    i32 w;
+    i32 h;
+    Str b64;   // in a request's history: the image as base64, or null
+    Str alt;   // with this text in its place (its file is lost)
+};
+
 struct Msg {
     i32          role;
     Str          text;    // user and tool messages
@@ -217,6 +227,7 @@ struct Msg {
                           // base64, or null where it is left out,
     Str          imgalt;  // with this text in its place
     i32          floor;   // FLOOR_*: a cache breakpoint just before it
+    Slice<MsgImage> images;  // user messages: those attached
 };
 
 // Where a request's prefix stops matching the one before, at a step of
@@ -432,6 +443,28 @@ struct ChatReq {
                            // changed what it was bound to)
 };
 
+// Base64 data as a JSON string, put raw (base64 needs no escapes): as
+// a data URL of the mime type, if given.
+static void putb64(JsonOut *w, Arena scratch, Str mime, Str b64)
+{
+    Buf b(&scratch, 32 + mime.len + b64.len);
+    putbyte(&b, '"');
+    if (mime.len) {
+        print(&b, "data:");
+        print(&b, mime);
+        print(&b, ";base64,");
+    }
+    print(&b, b64);
+    putbyte(&b, '"');
+    putraw(w, finish(&b));
+}
+
+// What stands in a request for an attached image not sent.
+static Str imagealt(MsgImage *g)
+{
+    return g->alt.len ? g->alt : Str("[image]");
+}
+
 static void encodemsg(JsonOut *w, ModelConf *mc, Msg *m, Arena *a)
 {
     putobject(w);
@@ -440,7 +473,35 @@ static void encodemsg(JsonOut *w, ModelConf *mc, Msg *m, Arena *a)
         putkey(w, "role");
         putstr(w, "user");
         putkey(w, "content");
-        putstr(w, m->text);
+        if (!m->images.len) {
+            putstr(w, m->text);
+            break;
+        }
+        // Its text, then its images as parts
+        putarray(w);
+        if (m->text.len) {
+            putobject(w);
+            putstrkey(w, "type", "text");
+            putstrkey(w, "text", m->text);
+            putend(w);
+        }
+        for (iz i = 0; i < m->images.len; i++) {
+            MsgImage *g = &m->images[i];
+            putobject(w);
+            if (g->b64.len) {
+                putstrkey(w, "type", "image_url");
+                putkey(w, "image_url");
+                putobject(w);
+                putkey(w, "url");
+                putb64(w, *a, g->mime, g->b64);
+                putend(w);
+            } else {
+                putstrkey(w, "type", "text");
+                putstrkey(w, "text", imagealt(g));
+            }
+            putend(w);
+        }
+        putend(w);
         break;
 
     case ROLE_TOOL:

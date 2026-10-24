@@ -3998,6 +3998,34 @@ def an_plain(t):
 
 
 @scenario(conf=AN, bound=10)
+def an_attach(t):
+    """Images attached to a prompt go before its text as image blocks, of
+    their media type, the breakpoint on the text; images alone, the
+    breakpoint on the last. The fake checks each as the API would."""
+    h = t.headless(env=ANENV)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        a = attached(t, h, sid, PNG)
+        b = attached(t, h, sid, JPG)
+        h.call("prompt", sid=sid, text="what are these?", images=[a, b])
+        t.check(ended(h, sid, 1)["why"] == "done", "answered")
+        t.check(lastsaid(h, sid) == "I see 2 images.", f"said: {lastsaid(h, sid)}")
+        msg = t.requests()[-1]["body"]["messages"][0]
+        t.check([x["type"] for x in msg["content"]] == ["image", "image", "text"] and
+                msg["content"][1]["source"] == {"type": "base64", "media_type": "image/jpeg",
+                                                "data": base64.b64encode(JPG).decode()} and
+                "cache_control" in msg["content"][2], f"the message: {str(msg)[:400]}")
+        h.call("prompt", sid=sid, text=" ", images=[a])
+        t.check(ended(h, sid, 2)["why"] == "done", "answered again")
+        msg = t.requests()[-1]["body"]["messages"][-1]
+        t.check([x["type"] for x in msg["content"]] == ["image"] and
+                "cache_control" in msg["content"][0], f"alone: {str(msg)[:400]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=AN, bound=10)
 def an_tools(t):
     """read, edit, shell: each step's reasoning goes back verbatim with its
     signature (redacted reasoning too), each result as a tool_result, and
@@ -5922,6 +5950,309 @@ def import_refused(t):
         h.call("list")
         listed = [e["sid"] for e in h.all("sessions")[-1]["list"]]
         t.check(listed == [sid], f"nothing imported: {listed}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+# Images attached to prompts: uploaded (upload {kind: "image", sid}),
+# kept in the session's img/, named by prompt and steer {images}, sent
+# as parts of the user message (fake_provider.sc_attach answers with how
+# many it sees).
+
+def rgbpng(w, h, pixel=lambda x, y: (x & 255, y & 255, 128), level=6):
+    """A PNG of w by h RGB pixels."""
+    def chunk(kind, data):
+        crc = zlib.crc32(kind + data)
+        return len(data).to_bytes(4, "big") + kind + data + crc.to_bytes(4, "big")
+    ihdr = w.to_bytes(4, "big") + h.to_bytes(4, "big") + bytes([8, 2, 0, 0, 0])
+    raw = b"".join(b"\x00" + bytes(c for x in range(w) for c in pixel(x, y))
+                   for y in range(h))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+            chunk(b"IDAT", zlib.compress(raw, level)) + chunk(b"IEND", b""))
+
+
+def fakejpeg(w, h):
+    """A JPEG's header, as far as its frame, which is all the engine reads."""
+    app0 = b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    sof = b"\xff\xc0\x00\x11\x08" + h.to_bytes(2, "big") + w.to_bytes(2, "big") + \
+        b"\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+    return b"\xff\xd8" + app0 + sof + b"\xff\xd9"
+
+
+def upimage(t, h, sid, data, part=1 << 19):
+    """Upload an image to a session, part by part; the last reply."""
+    token, off = None, 0
+    while True:
+        chunk = data[off:off + part]
+        last = off + len(chunk) >= len(data)
+        args = {"kind": "image", "sid": sid, "data": base64.b64encode(chunk).decode(),
+                "off": off}
+        if token:
+            args["token"] = token
+        if last:
+            args["done"] = 1
+        r = h.call("upload", timeout=60, **args)
+        if not last or r.get("ok") != 1:
+            t.check(r.get("ok") == 1 or last, f"upload at {off}: {r}")
+        if last or r.get("ok") != 1:
+            return r
+        token, off = r["token"], r["off"]
+
+
+def attached(t, hd, sid, data, **want):
+    """Upload an image, which must be taken as want says; its name."""
+    r = upimage(t, hd, sid, data)
+    t.check(r.get("ok") == 1 and all(r.get(k) == v for k, v in want.items()),
+            f"attached: {r}")
+    return r["name"]
+
+
+def lastimages(req):
+    return fake_provider.user_images(req["body"])
+
+
+def rmfile(t, path):
+    if isinstance(t.host, LocalHost):
+        os.remove(path)
+    else:
+        t.host.sh(f"rm -f {shlex.quote(path)}")
+
+
+PNG = rgbpng(3, 2)
+JPG = fakejpeg(640, 480)
+
+
+@scenario(bound=15)
+def attach(t):
+    """An image is uploaded in parts and kept in its session's img/,
+    numbered; a prompt names it, and the user record lists it, with its
+    type and size; the request carries it as an image_url part after the
+    text, as a data URL. Images alone need no text."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        caps = h.all("hello")[0].get("caps", [])
+        t.check("images" in caps, f"caps: {caps}")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = upimage(t, h, sid, PNG, part=20)
+        t.check(r.get("ok") == 1 and r.get("name") == "img/1.png" and
+                r.get("mime") == "image/png" and (r.get("w"), r.get("h")) == (3, 2),
+                f"the first: {r}")
+        name = attached(t, h, sid, JPG, name="img/2.jpg", mime="image/jpeg", w=640, h=480)
+        r = h.call("prompt", sid=sid, text="what are these?", images=["img/1.png", name])
+        t.check(r.get("ok") == 1, f"prompt: {r}")
+        ended(h, sid, 1)
+        user = h.all("user", sid)[0]
+        t.check(user["text"] == "what are these?" and user["images"] == [
+            {"name": "img/1.png", "mime": "image/png", "w": 3, "h": 2},
+            {"name": "img/2.jpg", "mime": "image/jpeg", "w": 640, "h": 480}],
+            f"the user record: {user}")
+        body = t.requests()[-1]["body"]
+        content = body["messages"][-1]["content"]
+        t.check(content[0] == {"type": "text", "text": "what are these?"} and
+                lastimages(t.requests()[-1]) ==
+                [("image/png", base64.b64encode(PNG).decode()),
+                 ("image/jpeg", base64.b64encode(JPG).decode())],
+                f"the request: {str(content)[:300]}")
+        t.check(lastsaid(h, sid) == "I see 2 images.", f"said: {lastsaid(h, sid)}")
+        t.check(t.host.read(t.host.join(t.state, "sessions", sid, "img", "1.png")) is not None,
+                "kept in img/")
+
+        # Images alone, the history's too
+        r = h.call("prompt", sid=sid, text="", images=["img/1.png"])
+        t.check(r.get("ok") == 1, f"images alone: {r}")
+        ended(h, sid, 2)
+        t.check(lastsaid(h, sid) == "I see 3 images.", f"said: {lastsaid(h, sid)}")
+        t.check(t.requests()[-1]["body"]["messages"][-1]["content"][0]["type"] == "image_url",
+                "no text part")
+        r = h.call("prompt", sid=sid, text="")
+        t.check(r.get("ok") == 0 and r.get("err") == "text is required", f"nothing: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_extra": "[model {model2}]\nvision = false\n"}, bound=15)
+def attach_refused(t):
+    """upload refuses what is not a PNG or a JPEG, a session that does not
+    exist, a JPEG too large to send; prompt refuses more than 10 images,
+    names not made by upload, images that are not there, and any image
+    for a model with vision off."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+
+        def refused(r, err):
+            t.check(r.get("ok") == 0 and r.get("err", "").startswith(err), f"{err}: {r}")
+
+        refused(upimage(t, h, sid, b"GIF89a" + b"\x00" * 64),
+                "not an image: only PNG and JPEG can be attached")
+        refused(upimage(t, h, sid, b"plain text, not an image"),
+                "not an image: only PNG and JPEG can be attached")
+        refused(upimage(t, h, "20260101-000000-none", PNG), "no such session")
+        refused(upimage(t, h, "../x", PNG), "an image needs its session's sid")
+        refused(h.call("upload", kind="text", data="", off=0), "kind must be")
+        refused(upimage(t, h, sid, fakejpeg(9000, 100)), "the JPEG is too large to attach")
+        refused(upimage(t, h, sid, fakejpeg(100, 100) + b"\x00" * (4 << 20)),
+                "the JPEG is too large to attach")
+        tmp = t.host.join(t.state, "tmp")
+        if isinstance(t.host, LocalHost) and os.path.isdir(tmp):
+            t.check(not os.listdir(tmp), f"nothing left staged: {os.listdir(tmp)}")
+        t.check(t.host.read(t.host.join(t.state, "sessions", sid, "img", "1.png")) is None,
+                "nothing kept")
+
+        name = attached(t, h, sid, PNG, name="img/1.png")
+        refused(h.call("prompt", sid=sid, text="x", images=[name] * 11),
+                "too many images: at most 10 in a message")
+        refused(h.call("prompt", sid=sid, text="x", images=["../events.jsonl"]),
+                "an image must be named as upload named it")
+        refused(h.call("prompt", sid=sid, text="x", images=["img/7.png"]),
+                "no such image in the session")
+        refused(h.call("prompt", sid=sid, text="x", images="img/1.png"),
+                "images must be an array")
+        r = h.call("prompt", sid=sid, text="ten", images=[name] * 10)
+        t.check(r.get("ok") == 1, f"ten: {r}")
+        ended(h, sid, 1)
+        t.check(lastsaid(h, sid) == "I see 10 images.", f"said: {lastsaid(h, sid)}")
+        t.check(len(h.all("user", sid)) == 1, "only the one taken")
+
+        # A model without vision takes none
+        other = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        n2 = attached(t, h, other, PNG)
+        refused(h.call("prompt", sid=other, text="x", images=[n2]),
+                "this model takes no images")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
+def attach_shrink(t):
+    """A PNG too large for the APIs, over 8000 pixels on a side or 5 MiB
+    as base64, is shrunk until it fits, and kept as a PNG."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        wide = rgbpng(9000, 3)
+        r = upimage(t, h, sid, wide)
+        t.check(r.get("ok") == 1 and (r.get("w"), r.get("h")) == (8000, 2) and
+                r.get("mime") == "image/png", f"wide: {r}")
+        rnd = random.Random(1)
+        noise = bytes(rnd.getrandbits(8) for _ in range(1200 * 1200 * 3))
+        big = rgbpng(1200, 1200, lambda x, y: noise[(y*1200 + x)*3:(y*1200 + x)*3 + 3],
+                     level=0)
+        t.check(len(big) * 4 // 3 > 5 << 20, f"big enough: {len(big)}")
+        r = upimage(t, h, sid, big)
+        t.check(r.get("ok") == 1 and 0 < r.get("w", 0) < 1200 and r.get("w") == r.get("h"),
+                f"big: {r}")
+        h.call("prompt", sid=sid, text="look", images=["img/1.png", r["name"]])
+        ended(h, sid, 1)
+        imgs = lastimages(t.requests()[-1])
+        sizes = [int.from_bytes(base64.b64decode(b)[16:20], "big") for _, b in imgs]
+        t.check(sizes == [8000, r["w"]] and all(len(b) <= 5 << 20 for _, b in imgs),
+                f"as sent: {sizes} {[len(b) for _, b in imgs]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def attach_replay(t):
+    """Opened again, a session sends its images again from their files;
+    one whose file is gone becomes a note in its place, the turn going
+    on."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        a = attached(t, h, sid, PNG)
+        b = attached(t, h, sid, JPG)
+        h.call("prompt", sid=sid, text="one", images=[a, b])
+        ended(h, sid, 1)
+    finally:
+        h.close()
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        h.call("prompt", sid=sid, text="two")
+        ended(h, sid, 2)
+        t.check(lastsaid(h, sid) == "I see 2 images.", f"said: {lastsaid(h, sid)}")
+        rmfile(t, t.host.join(t.state, "sessions", sid, "img", "2.jpg"))
+        h.call("prompt", sid=sid, text="three")
+        ended(h, sid, 3)
+        t.check(lastsaid(h, sid) == "I see 1 images.", f"said: {lastsaid(h, sid)}")
+        first = t.requests()[-1]["body"]["messages"][1]["content"]
+        t.check([p["type"] for p in first] == ["text", "image_url", "text"] and
+                first[2]["text"].startswith("[image lost: img/2.jpg"), f"lost: {first}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def attach_copies(t):
+    """A fork copies the images its log names, and goes on with them; an
+    import, which brings no files, drops them from the user records."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        a = attached(t, h, sid, PNG)
+        h.call("prompt", sid=sid, text="one", images=[a])
+        ended(h, sid, 1)
+        attached(t, h, sid, JPG)  # not named in the log
+        r = h.call("fork", sid=sid)
+        new = r.get("sid")
+        t.check(r.get("ok") == 1 and new, f"fork: {r}")
+        img = t.host.join(t.state, "sessions", new, "img")
+        t.check(t.host.read(t.host.join(img, "1.png")) is not None and
+                t.host.read(t.host.join(img, "2.jpg")) is None, "the image named, copied")
+        h.call("open", sid=new)
+        h.call("prompt", sid=new, text="two")
+        ended(h, new, 2)
+        t.check(lastsaid(h, new) == "I see 1 images.", f"forked: {lastsaid(h, new)}")
+
+        raw = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+        r = importlog(t, h, raw, model=t.model, endpoint="fake")
+        imp = r.get("sid")
+        t.check(r.get("ok") == 1, f"imported: {r}")
+        users = [e for e in logged(t, imp) if e["ev"] == "user"]
+        t.check(users and not any("images" in e for e in users), f"stripped: {users}")
+        h.call("open", sid=imp)
+        h.call("prompt", sid=imp, text="two")
+        ended(h, imp, 2)
+        t.check(lastsaid(h, imp) == "I see 0 images.", f"imported: {lastsaid(h, imp)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def attach_steer(t):
+    """A steer and a prompt with images, sent while a response streams,
+    queue with them (the queue counts them); one withdrawn comes back
+    with its images, the other is taken in with them."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        a = attached(t, h, sid, PNG)
+        b = attached(t, h, sid, JPG)
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "delta" and e.get("sid") == sid)
+        t.check(h.call("steer", sid=sid, text="see", images=[a]).get("ok") == 1, "steer")
+        t.check(h.call("prompt", sid=sid, text="later", images=[a, b]).get("ok") == 1,
+                "prompt")
+        q = h.wait(lambda e: e.get("ev") == "queue" and e.get("sid") == sid and
+                   len(e.get("items", [])) == 2)
+        t.check([i.get("images") for i in q["items"]] == [1, 2], f"queued: {q}")
+        r = h.call("unqueue", sid=sid, item=q["items"][1]["id"])
+        t.check(r.get("ok") == 1 and r.get("text") == "later" and
+                [i["name"] for i in r.get("images", [])] == [a, b], f"unqueue: {r}")
+        # Too late for the one-step turn, the steer is the next prompt
+        ended(h, sid, 2)
+        users = [(e["text"], [i["name"] for i in e.get("images", [])])
+                 for e in h.all("user", sid)]
+        t.check(users == [("go", []), ("see", [a])], f"taken in: {users}")
+        t.check(lastsaid(h, sid) == "I see 1 images.", f"said: {lastsaid(h, sid)}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

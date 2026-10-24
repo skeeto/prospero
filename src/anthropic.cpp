@@ -164,7 +164,7 @@ static Slice<AnPart> anparts(Arena *a, Slice<Msg> h, i64 thinkfrom)
                     r = push(a, r, p);
                 }
             }
-        } else if (m->role==ROLE_TOOL || !anblank(m->text)) {
+        } else if (m->role==ROLE_TOOL || !anblank(m->text) || m->images.len) {
             n += next;
             AnPart p = {n, 0, m, 0};
             r = push(a, r, p);
@@ -173,9 +173,43 @@ static Slice<AnPart> anparts(Arena *a, Slice<Msg> h, i64 thinkfrom)
     return r;
 }
 
+// An image block, or the text in its place.
+static void animage(JsonOut *w, Arena scratch, MsgImage *g, b32 cache)
+{
+    putobject(w);
+    if (g->b64.len) {
+        putstrkey(w, "type", "image");
+        putkey(w, "source");
+        putobject(w);
+        putstrkey(w, "type", "base64");
+        putstrkey(w, "media_type", g->mime);
+        putkey(w, "data");
+        putb64(w, scratch, {}, g->b64);
+        putend(w);
+    } else {
+        putstrkey(w, "type", "text");
+        putstrkey(w, "text", imagealt(g));
+    }
+    if (cache) {
+        ancache(w);
+    }
+    putend(w);
+}
+
 static void anblock(JsonOut *w, Arena scratch, AnPart *p, b32 cache)
 {
     Msg *m = p->msg;
+    if (!p->block && m->role==ROLE_USER && m->images.len) {
+        // Its images first, then its text, if any, which has the
+        // breakpoint, else the last image
+        b32 text = !anblank(m->text);
+        for (iz i = 0; i < m->images.len; i++) {
+            animage(w, scratch, &m->images[i], cache && !text && i==m->images.len-1);
+        }
+        if (!text) {
+            return;
+        }
+    }
     putobject(w);
     if (!p->block && m->role==ROLE_TOOL && (m->imgb64.len || m->imgalt.len)) {
         // A screenshot goes in the result, after its text, or what

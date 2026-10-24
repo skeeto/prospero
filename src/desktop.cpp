@@ -466,6 +466,77 @@ static DeskSize pngsize(Str png)
     return r;
 }
 
+// The size of a JPEG from its frame header (SOFn), or 0 by 0 if it is
+// not one, or ends before it.
+static DeskSize jpegsize(Str jpg)
+{
+    DeskSize r = {};
+    if (jpg.len<4 || jpg[0]!=0xff || jpg[1]!=0xd8) {
+        return r;
+    }
+    for (iz i = 2; i+4 <= jpg.len;) {
+        if (jpg[i] != 0xff) {
+            return r;  // not a marker
+        }
+        u8 m = jpg[i+1];
+        if (m == 0xff) {
+            i++;  // fill
+            continue;
+        } else if (m==0x01 || (m>=0xd0 && m<=0xd7)) {
+            i += 2;  // stands alone
+            continue;
+        } else if (m==0xd9 || m==0xda) {
+            return r;  // the end, or the scan, before any frame
+        }
+        iz len = (iz)jpg[i+2]<<8 | jpg[i+3];
+        if (len<2 || len>jpg.len-i-2) {
+            return r;
+        }
+        if (m>=0xc0 && m<=0xcf && m!=0xc4 && m!=0xc8 && m!=0xcc) {
+            u8 *p = jpg.data + i + 4;
+            if (len < 7) {
+                return r;
+            }
+            i32 h = (i32)p[1]<<8 | p[2];
+            i32 w = (i32)p[3]<<8 | p[4];
+            if (w && h) {
+                r.w = w;
+                r.h = h;
+            }
+            return r;
+        }
+        i += 2 + len;
+    }
+    return r;
+}
+
+// What an image to attach is, by its first bytes: PNG or JPEG, else
+// neither (null mime), with its size, 0 by 0 if its header is bad.
+struct ImageKind {
+    Str mime;
+    Str ext;
+    i32 w, h;
+};
+
+static ImageKind imagekind(Str data)
+{
+    ImageKind r = {};
+    if (startswith(data, "\x89PNG\r\n\x1a\n")) {
+        DeskSize z = pngsize(data);
+        r.mime = "image/png";
+        r.ext  = "png";
+        r.w    = z.w;
+        r.h    = z.h;
+    } else if (data.len>=3 && data[0]==0xff && data[1]==0xd8 && data[2]==0xff) {
+        DeskSize z = jpegsize(data);
+        r.mime = "image/jpeg";
+        r.ext  = "jpg";
+        r.w    = z.w;
+        r.h    = z.h;
+    }
+    return r;
+}
+
 // Tokens an image costs a model, about: Anthropic's width*height/750.
 static i64 imagetokens(i32 w, i32 h)
 {
