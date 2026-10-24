@@ -2041,14 +2041,15 @@ def hello_caps(t):
         cmds = hello.get("cmds", [])
         want = ["hello", "list", "new", "open", "close", "prompt", "steer", "cancel",
                 "answer", "config.get", "config.set", "quit", "rewind", "job.kill",
-                "status", "stop", "file"] + m8 + ["skills"]
+                "status", "stop", "file"] + m8 + ["skills", "mode"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
                 {"close.forget", "config.refresh", "file.base64", "desktop",
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
-                 "fork", "answer.always.desktop", "skills"} <= set(caps) and "host" not in caps,
+                 "fork", "answer.always.desktop", "skills", "plan"} <= set(caps)
+                and "host" not in caps,
                 f"caps: {caps}")
 
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
@@ -5860,6 +5861,273 @@ def import_refused(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+# Plan mode: fake_provider.sc_plan tries to write inside.txt, is refused,
+# asks for an empty plan's approval, writes the plan file and asks again;
+# approved, it writes inside.txt.
+
+def planask(h, sid, after=0):
+    """The next ask of a plan's approval in sid."""
+    return h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid and
+                  e.get("kind") == "plan" and e.get("seq", 0) > after)
+
+
+def modes(h, sid):
+    return [f"{e['mode']}/{e['by']}" for e in h.all("mode", sid)]
+
+
+def lastsaid(h, sid):
+    said = [b.get("text", "") for e in h.all("assistant", sid)
+            for b in e.get("blocks", []) if b.get("t") == "text"]
+    return said[-1] if said else ""
+
+
+@scenario(bound=15)
+def plan_new(t):
+    """A session new in plan mode: its agent told so, a write outside the
+    plan file refused, an empty plan not put to the user, the plan file
+    written without an ask, then the plan asked about with no deadline:
+    kept planning with a note, which the agent reads, then approved, which
+    ends plan mode, and the write goes ahead."""
+    h = t.headless()
+    try:
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", plan=1,
+                   tools="read write")
+        t.check(r.get("ok") == 0 and "exit_plan_mode" in r.get("err", ""),
+                f"no plan mode without its way out: {r}")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                     plan=1)["sid"]
+        mode = h.wait(lambda e: e.get("ev") == "mode" and e.get("sid") == sid)
+        plan = mode.get("path", "")
+        t.check(mode["mode"] == "plan" and mode["by"] == "new" and
+                plan.endswith(f"/{sid}/plan.md"), f"mode: {mode}")
+        h.send("prompt", sid=sid, text="Write inside.")
+        ask = planask(h, sid)
+        t.check(ask["deadline"] == 0 and ask["path"] == plan and ask["tool"] == "exit_plan_mode"
+                and "Write **inside.txt**." in ask["detail"], f"the plan's ask: {ask}")
+        ends = h.all("tool.end", sid)
+        t.check([e["status"] for e in ends] == ["denied", "error", "ok"],
+                f"refused, no plan yet, the plan written: {ends}")
+        t.check("plan mode is on" in ends[0]["text"] and plan in ends[0]["text"],
+                f"why: {ends[0]['text']}")
+        t.check("no plan to approve yet" in ends[1]["text"], f"empty: {ends[1]['text']}")
+        t.check(not [e for e in h.all("ask", sid) if e.get("kind") != "plan"],
+                "the plan file needs no ask")
+        t.check(t.file("inside.txt") is None, "nothing written while planning")
+        first = t.requests()[0]["body"]
+        msgs = first["messages"]
+        t.check(msgs[-1]["role"] == "user" and msgs[-1]["content"].startswith("Plan mode is on")
+                and plan in msgs[-1]["content"], f"told: {msgs[-1]}")
+        t.check("except to approve a plan in plan mode" in msgs[0]["content"] and
+                "exit_plan_mode" in msgs[0]["content"], "the system prompt says plan mode exists")
+        names = fake_provider.tool_names(first)
+        t.check("enter_plan_mode" in names and "exit_plan_mode" in names, f"tools: {names}")
+
+        h.call("answer", sid=sid, req=ask["req"], decision="deny", note="Also test it.")
+        again = planask(h, sid, ask["seq"])
+        t.check(again["detail"] == "# Plan v2\n\n- Also test it.", f"revised: {again}")
+        t.check(t.host.read(plan) == "# Plan v2\n\n- Also test it.\n", "the plan file")
+        t.check(modes(h, sid) == ["plan/new"], f"still planning: {modes(h, sid)}")
+        h.call("answer", sid=sid, req=again["req"], decision="allow")
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "done", f"done: {end}")
+        t.check(t.file("inside.txt") == "done\n", "written once approved")
+        t.check(modes(h, sid) == ["plan/new", "default/approved"], f"modes: {modes(h, sid)}")
+        res = [e["text"] for e in h.all("tool.end", sid)]
+        t.check(any("keep planning" in x and "Also test it." in x for x in res) and
+                any("approved your plan" in x and "Plan v2" in x and "todo_write" in x
+                    for x in res), f"results: {res}")
+        t.check(lastsaid(h, sid) == "Done.", f"said: {lastsaid(h, sid)}")
+        # A fork has the plan file too, where its log now names it
+        r = h.call("fork", sid=sid, turn=1)
+        t.check(r.get("ok") == 1, f"forked: {r}")
+        fk = [e for e in logged(t, r["sid"]) if e["ev"] == "mode"]
+        path = fk[0].get("path", "") if fk else ""
+        t.check(len(fk) == 2 and path.endswith(f"/{r['sid']}/plan.md") and
+                t.host.read(path) == "# Plan v2\n\n- Also test it.\n", f"the fork's plan: {fk}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def plan_reopen(t):
+    """Plan mode survives a session opened again, as does its notice,
+    never sent before; unattended, nobody can approve the plan, so plan
+    mode stays on and the turn ends with the plan left for review."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", plan=1)["sid"]
+    finally:
+        h.close()
+    r = t.run("Write inside.", resume=sid)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    log = logged(t, sid)
+    t.check([e["by"] for e in log if e["ev"] == "mode"] == ["new"], "one mode record")
+    msgs = t.requests()[0]["body"]["messages"]
+    t.check(msgs[-1]["content"].startswith("Plan mode is on"), f"told: {msgs[-1]}")
+    st = [e["status"] for e in r.all("tool.end")]
+    t.check(st == ["denied", "error", "ok", "denied"], f"statuses {st}")
+    ask = r.last("ask")
+    ans = r.last("answer")
+    t.check(ask.get("kind") == "plan" and ans.get("by") == "policy", f"{ask} {ans}")
+    t.check("Nobody can approve the plan" in r.all("tool.end")[-1]["text"], "why")
+    t.check(r.text().endswith("Plan left for review."), f"text {r.text()!r}")
+    t.check(t.file("inside.txt") is None, "nothing written")
+    t.check((t.host.read(ask.get("path", "")) or "").startswith("# Plan"), "the plan stays")
+
+
+@scenario(bound=15)
+def plan_mode(t):
+    """The mode command: on and off again before a prompt, which tells the
+    agent nothing; on, then refused while the plan is asked about; a steer
+    instead of an answer keeps plan mode; off while idle, told."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        r = h.call("mode", sid=sid, mode="maybe")
+        t.check(r.get("ok") == 0, f"an unknown mode: {r}")
+        r = h.call("mode", sid=sid, mode="plan")
+        t.check(r.get("ok") == 1 and r.get("mode") == "plan", f"on: {r}")
+        r = h.call("mode", sid=sid, mode="default")
+        t.check(r.get("ok") == 1 and r.get("mode") == "default", f"off: {r}")
+        t.check(modes(h, sid) == ["plan/user", "default/user"], f"modes {modes(h, sid)}")
+        h.send("prompt", sid=sid, text="Write inside.")
+        ended(h, sid, 1)
+        t.check(t.file("inside.txt") == "done\n", "written")
+        told = [m for q in t.requests() for m in q["body"]["messages"]
+                if str(m.get("content", "")).startswith("Plan mode")]
+        t.check(not told, f"nothing to tell: {told}")
+
+        h.call("mode", sid=sid, mode="plan")
+        h.send("prompt", sid=sid, text="Write inside again.")
+        ask = planask(h, sid)
+        r = h.call("mode", sid=sid, mode="default")
+        t.check(r.get("ok") == 0 and "answer" in r.get("err", ""), f"refused: {r}")
+        h.call("steer", sid=sid, text="Stop.")
+        ended(h, sid, 2)
+        ans = h.all("answer", sid)[-1]
+        t.check(ans["by"] == "steer", f"answered by the steer: {ans}")
+        t.check(lastsaid(h, sid) == "Stopped.", f"said {lastsaid(h, sid)}")
+        t.check(modes(h, sid)[-1] == "plan/user", "still planning")
+
+        r = h.call("mode", sid=sid, mode="default")
+        t.check(r.get("ok") == 1, f"off: {r}")
+        h.send("prompt", sid=sid, text="Write it now.")
+        ended(h, sid, 3)
+        msgs = t.requests()[-2]["body"]["messages"]
+        t.check(msgs[-1]["content"].startswith("Plan mode is off"), f"told: {msgs[-1]}")
+        t.check(lastsaid(h, sid) == "Done.", f"said {lastsaid(h, sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def plan_enter(t):
+    """enter_plan_mode: unattended, denied by policy; attended, allowed,
+    which the call's result tells, with no notice, then the plan approved."""
+    r = t.run("Plan first.")
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(r.last("ask").get("kind") == "plan.enter" and r.last("answer").get("by") == "policy",
+            f"denied: {r.last('answer')}")
+    t.check(not r.all("mode") and r.text() == "No plan mode.", f"text {r.text()!r}")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="Plan first.")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        t.check(ask["kind"] == "plan.enter" and 29000 <= ask["deadline"] - ask["ts"] <= 31000,
+                f"the ask: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        plan = planask(h, sid)
+        t.check(modes(h, sid) == ["plan/agent"], f"modes {modes(h, sid)}")
+        res = h.all("tool.end", sid)[0]
+        t.check(res["status"] == "ok" and "The user agreed" in res["text"] and
+                plan["path"] in res["text"], f"told: {res}")
+        notices = [e for e in h.all("notice", sid) if e.get("kind") == "mode"]
+        t.check(not notices, f"no notice: {notices}")
+        h.call("answer", sid=sid, req=plan["req"], decision="allow")
+        ended(h, sid, 1)
+        t.check(t.file("inside.txt") == "done\n", "written once approved")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def plan_model(t):
+    """The model may change while the plan is asked about, for its doing,
+    though not while a turn runs otherwise."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                     plan=1)["sid"]
+        h.send("prompt", sid=sid, text="Write inside.")
+        ask = planask(h, sid)
+        n = len(t.requests())
+        r = h.call("model", sid=sid, model=t.model2)
+        t.check(r.get("ok") == 1 and r.get("model") == t.model2, f"switched: {r}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 1)
+        t.check(len(t.requests()) == n, "the old model is asked no more")
+        after = t.requests(t.model2)
+        t.check(after and "approved your plan" in after[0]["body"]["messages"][-1]["content"],
+                "the new model carries the plan out")
+        t.check(t.file("inside.txt") == "done\n", "written")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def plan_patch(t):
+    """In plan mode, a patch may change the plan file alone."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", plan=1,
+                     edit_format="patch")["sid"]
+        plan = h.wait(lambda e: e.get("ev") == "mode" and e.get("sid") == sid)["path"]
+        h.send("prompt", sid=sid, text="go")
+        ended(h, sid, 1)
+        te = h.all("tool.end", sid)
+        t.check([e["status"] for e in te] == ["denied", "ok"], f"statuses: {te}")
+        t.check("plan mode is on" in te[0]["text"], f"why: {te[0]['text']}")
+        t.check(t.file("inside.txt") is None, "nothing written")
+        t.check(t.host.read(plan) == "# Patched\n", "the plan file patched")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def plan_task(t):
+    """A subagent started in plan mode is in it too: told, without plan
+    mode's tools, and refused its write."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", plan=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ended(h, sid, 1)
+        kids = [e for e in h.all("session") if e.get("parent") == sid]
+        t.check(len(kids) == 1, f"one subagent: {kids}")
+        kid = kids[0]["sid"]
+        t.check(modes(h, kid) == ["plan/parent"], f"its mode: {modes(h, kid)}")
+        te = h.all("tool.end", kid)
+        t.check(te and te[0]["status"] == "denied" and "must not change anything" in te[0]["text"],
+                f"refused: {te}")
+        t.check(t.file("child.txt") is None, "nothing written")
+        req = t.requests(t.model2)[0]["body"]
+        names = fake_provider.tool_names(req)
+        t.check("exit_plan_mode" not in names and "enter_plan_mode" not in names, f"tools {names}")
+        t.check(req["messages"][-1]["content"].startswith("Plan mode is on: the agent you work for"),
+                f"told: {req['messages'][-1]}")
+        t.check("except to approve a plan" not in req["messages"][0]["content"], "its prompt")
+        t.check(lastsaid(h, sid).startswith("Parent heard: Child: Not done"), lastsaid(h, sid))
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")
 
 
@@ -6081,6 +6349,23 @@ def desktop_off(t):
     t.check(end["status"] == "error" and "not available in this session" in end["text"],
             f"refused {end}")
     t.check(not desklog(t), "no helper started")
+
+
+@scenario(conf=DESKALL, bound=15)
+def desktop_plan(t):
+    """In plan mode the desktop tool may only look."""
+    h = t.headless(env=deskenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", plan=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ended(h, sid, 1)
+        te = h.all("tool.end", sid)
+        t.check([e["status"] for e in te] == ["denied", "ok"], f"statuses: {te}")
+        t.check("may only look" in te[0]["text"], f"why: {te[0]['text']}")
+        t.check(not [c for c in desklog(t) if "click" in json.dumps(c)], "no click made")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 @scenario(conf={"_desktop": {"offer": "all"}}, bound=10)

@@ -223,9 +223,10 @@ enum : i64 {
 };
 
 // Something for the agent to read before its next request: a job that
-// ended, files rewound, instructions for a directory, skills changed.
+// ended, files rewound, instructions for a directory, skills changed,
+// plan mode.
 struct Notice {
-    Str kind;    // "job", "rewind", "instructions", "skills"
+    Str kind;    // "job", "rewind", "instructions", "skills", "budget", "mode"
     Str text;
     i64 job;     // for "job"
     b32 skills;  // its record lists the skills the agent knows now
@@ -550,6 +551,10 @@ struct Session {
     // The todo list
     Slice<TodoItem> todos;
     i32          mutations;  // mutating calls since the list changed
+    // Plan mode
+    b32          plan;       // nothing changes but the plan file
+    b32          planheard;  // the agent was told the mode as it is
+    Str          planfile;   // plan.md in dir: absolute, normalized
     // Snapshots for rewind
     Slice<Snap>  snaps;
     Slice<CallMark> marks;
@@ -1001,6 +1006,9 @@ static void deliver(Session *s, Arena scratch)
         m.role = ROLE_USER;
         m.text = n->text;
         addmsg(s, m);
+        if (n->kind == "mode") {
+            s->planheard = s->plan;  // the one queued is as it is now
+        }
     }
     s->notices = {};
 }
@@ -2771,6 +2779,254 @@ static void instrcheck(Session *s, Arena scratch)
 }
 
 
+// Plan mode
+//
+// A session in plan mode explores and plans before it changes anything:
+// write and edit refuse every file but its plan file, plan.md in the
+// session's directory, which they use without asking (the harness's
+// own file), and the desktop tool may only look. Commands still run,
+// the agent told to run only those that change nothing, as is a
+// subagent started in plan mode, which stays in it for its task. The
+// user turns it on (new {plan}, mode) and off (mode), and the agent
+// asks to begin with enter_plan_mode, an ask of kind "plan.enter", and
+// to end with exit_plan_mode, an ask of kind "plan" whose detail is the
+// plan, with no deadline: approved, plan mode ends and the agent
+// carries the plan out; denied, the user's note says what to change.
+// The mode record logs each change, which loadsession replays. The
+// frozen system prompt only says that plan mode exists: a change the
+// agent did not ask for reaches it as a notice (planheed), as changed
+// instructions do, and so does the mode again after a compaction.
+
+enum : iz {
+    PLAN_MAX = 64 << 10,  // bytes of a plan put to the user
+};
+
+// What plan mode allows, for the agent.
+static Str planrules(Session *s, Arena *a)
+{
+    Buf b(a, 1024 + s->planfile.len);
+    if (s->depth) {
+        print(&b, "Plan mode is on: the agent you work for is planning, so "
+                  "you must not change anything. Do not write or edit "
+                  "files, and run only commands that change nothing. "
+                  "Report what you found.");
+        return finish(&b);
+    }
+    print(&b, "Plan mode is on: explore and plan, but change nothing yet. "
+              "Read files and search the code, and run only commands that "
+              "change nothing (no edits, installs, commits, or builds that "
+              "write into the working directory). Write and edit work only "
+              "on the plan file, ");
+    print(&b, s->planfile);
+    print(&b, ", which stays after plan mode ends. Write your plan there in "
+              "Markdown: the goal, the changes file by file, and how to "
+              "verify them. Once it is complete, call exit_plan_mode to ask "
+              "the user to approve it. If you need the user to decide "
+              "something first, end your turn with the question.");
+    return finish(&b);
+}
+
+// Queue the notice of the mode, unless the agent knows it as it is: a
+// notice of the mode queued before goes, as the mode changed since.
+static void planheed(Session *s, Arena scratch)
+{
+    iz n = 0;
+    for (iz i = 0; i < s->notices.len; i++) {
+        if (!(s->notices[i].kind == "mode")) {
+            s->notices[n++] = s->notices[i];
+        }
+    }
+    s->notices.len = n;
+    if (s->plan != s->planheard) {
+        Str text = s->plan ? planrules(s, &scratch)
+                           : Str("Plan mode is off: the user ended it. Change "
+                                 "files and run commands as the task needs.");
+        notify(s, "mode", text, 0);
+    }
+}
+
+// Change the mode and log it, by "new", "user" (mode), "agent"
+// (enter_plan_mode, allowed), "approved" (exit_plan_mode) or "parent"
+// (a subagent's, as it starts). The agent hears of it in a call's result
+// for its own asks, and otherwise from a notice.
+static void setmode(Session *s, Arena scratch, b32 plan, Str by)
+{
+    s->plan = plan;
+    {
+        Arena a = scratch;
+        Buf   b(&a, 256 + s->planfile.len);
+        EvOut w = sbegin(s, &b, EV_MODE);
+        putstrkey(&w.json, "mode", plan ? Str("plan") : Str("default"));
+        putstrkey(&w.json, "by", by);
+        putstrkey(&w.json, "path", s->planfile);
+        ssend(s, &w);
+    }
+    if (by=="agent" || by=="approved") {
+        s->planheard = plan;
+    }
+    planheed(s, scratch);
+}
+
+// Whether a normalized absolute path is the session's plan file.
+static b32 isplanfile(Session *s, Str path)
+{
+    return s->planfile.len && (HOST_WINDOWS ? equalfold(path, s->planfile)
+                                            : path==s->planfile);
+}
+
+// Why plan mode refuses a change to the file at path.
+static Str planrefusal(Session *s, Arena *a, Str path)
+{
+    Buf b(a, 512 + path.len + s->planfile.len);
+    if (s->depth) {
+        print(&b, "Not done: plan mode is on, and you must not change "
+                  "anything. Report what you found instead.");
+        return finish(&b);
+    }
+    print(&b, "Not done: plan mode is on, so nothing may change but the "
+              "plan file, and this would change ");
+    print(&b, showpath(s->guard.cwd, path));
+    print(&b, ". Write your plan to ");
+    print(&b, s->planfile);
+    print(&b, ", then call exit_plan_mode to ask the user to approve it.");
+    return finish(&b);
+}
+
+// In plan mode, the first file a patch changes that is not the plan
+// file, or null. The patch's paths are absolute (patchguard).
+static Str planpatchout(Session *s, Patch *p)
+{
+    for (iz i = 0; s->plan && i<p->files.len; i++) {
+        PatchFile *f = &p->files[i];
+        if (f->file.data && !isplanfile(s, f->file)) {
+            return f->file;
+        } else if (f->fileto.data && !isplanfile(s, f->fileto)) {
+            return f->fileto;
+        }
+    }
+    return {};
+}
+
+// The plan file's text, or why it cannot be put to the user.
+struct PlanText {
+    Str text;
+    Str err;  // for the agent, null if none
+};
+
+static PlanText readplan(Session *s, Arena *a)
+{
+    PlanText r  = {};
+    Read     rd = os_readat(s->e->os, a, s->planfile, 0, PLAN_MAX);
+    if (rd.size > PLAN_MAX) {
+        Buf b(a, 256 + s->planfile.len);
+        print(&b, "The plan is too long to put to the user: keep ");
+        print(&b, s->planfile);
+        print(&b, " under 64 KiB, then call exit_plan_mode again.");
+        r.err = finish(&b);
+    } else if (rd.err || !trim(rd.data).len) {
+        Buf b(a, 256 + s->planfile.len);
+        print(&b, "There is no plan to approve yet: write your plan to ");
+        print(&b, s->planfile);
+        print(&b, " first, then call exit_plan_mode again.");
+        r.err = finish(&b);
+    } else {
+        r.text = trimright(rd.data);
+    }
+    return r;
+}
+
+// The answer to an ask of enter_plan_mode or exit_plan_mode (resolve),
+// whose call starts and ends here. wait is how long it was asked, in
+// seconds.
+static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
+                        i64 wait)
+{
+    b32 leave = s->ask.tool == TOOL_PLANEXIT;
+    toolstart(s, scratch);
+    if (by == DENY_CANCEL) {
+        toolend(s, scratch, "cancelled", "Not run: the user cancelled the turn.",
+                0, 0, {}, 0);
+        return;
+    }
+
+    Str      rules = {};
+    PlanText plan  = {};
+    if (allow && !leave) {
+        setmode(s, scratch, 1, "agent");
+        rules = planrules(s, &scratch);
+    } else if (allow) {
+        plan = readplan(s, &scratch);
+        setmode(s, scratch, 0, "approved");
+    }
+    Buf b(&scratch, 1024 + note.len + rules.len + plan.text.len);
+    if (allow && !leave) {
+        print(&b, "The user agreed. ");
+        print(&b, rules);
+    } else if (allow) {
+        print(&b, "The user approved your plan, and plan mode is off: carry "
+                  "it out now. ");
+        if (tooloffered(&s->te, TOOL_TODO)) {
+            print(&b, "If it has several steps, begin with a todo list of "
+                      "them (todo_write), and keep it up to date. ");
+        }
+        print(&b, "The plan, as approved, also in ");
+        print(&b, s->planfile);
+        print(&b, ":\n\n");
+        print(&b, plan.text.len ? plan.text : Str("(the plan file is gone)"));
+    } else {
+        switch (by) {
+        case DENY_USER:
+            if (leave) {
+                print(&b, "The user did not approve the plan yet: keep "
+                          "planning, as plan mode is still on.");
+            } else {
+                print(&b, "The user declined plan mode: go on with the task "
+                          "as usual.");
+            }
+            if (note.len) {
+                print(&b, " The user's note: ");
+                print(&b, note);
+            }
+            if (leave) {
+                print(&b, "\n\nRevise the plan in ");
+                print(&b, s->planfile);
+                print(&b, ", then call exit_plan_mode again; or, if you "
+                          "need the user to decide something, end your "
+                          "turn with the question.");
+            }
+            break;
+        case DENY_POLICY:
+            if (leave) {
+                print(&b, "Nobody can approve the plan in this run, so plan "
+                          "mode stays on: end your turn with a short summary "
+                          "of the plan, which stays in ");
+                print(&b, s->planfile);
+                print(&b, " for the user.");
+            } else {
+                print(&b, "Not done: nobody is there to agree to plan mode in "
+                          "this run. Go on with the task as usual.");
+            }
+            break;
+        case DENY_TIMEOUT:
+            print(&b, "Nobody answered within ");
+            print(&b, wait);
+            print(&b, " seconds, so plan mode is not on. Go on with the task "
+                      "as usual.");
+            break;
+        case DENY_STEER:
+            print(&b, "Not done: the user sent a new message instead of "
+                      "answering. Read that message (it follows these "
+                      "results) and do what it says.");
+            if (leave) {
+                print(&b, " Plan mode is still on.");
+            }
+            break;
+        }
+    }
+    toolend(s, scratch, allow ? Str("ok") : Str("denied"), finish(&b), 0, 0, {}, 0);
+}
+
+
 // Searches (search.cpp) and file tools
 
 static b32 startsearch(Session *, Arena, i32 tool, Str path, Args *);
@@ -2797,7 +3053,8 @@ static PatchGuard patchguard(Session *s, Arena *a, Patch *p, Str allowed)
             } else {
                 f->file = g.path;
             }
-            if (g.inside || g.path==allowed || g.path==r.out.path) {
+            if (g.inside || g.path==allowed || g.path==r.out.path ||
+                    isplanfile(s, g.path)) {
                 continue;
             } else if (r.out.path.data) {
                 r.many = 1;
@@ -2816,7 +3073,12 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
     Engine    *e  = s->e;
     Patch     *p  = &args->patch;
     PatchGuard pg = patchguard(s, &scratch, p, allowed);
-    if (pg.out.path.data) {
+    Str        no = planpatchout(s, p);
+    if (no.data) {
+        Str text = planrefusal(s, &scratch, no);
+        toolend(s, scratch, "denied", text, 0, 0, {}, 0);
+        return;
+    } else if (pg.out.path.data) {
         Str text = concat(&scratch, "Not run: the patch changes a file "
                           "outside the working directory that was not "
                           "allowed: ", pg.out.path);
@@ -2881,6 +3143,10 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     b32     hl   = s->te.edit == EDIT_HASHLINE;
     if (tool==TOOL_EDIT && s->te.edit==EDIT_PATCH) {
         runpatch(s, scratch, args, path);
+        return 1;
+    } else if (s->plan && !toolreads(tool) && !isplanfile(s, path)) {
+        Str text = planrefusal(s, &scratch, path);
+        toolend(s, scratch, "denied", text, 0, 0, {}, 0);
         return 1;
     }
     if (tool==TOOL_WRITE || tool==TOOL_EDIT) {
@@ -3108,6 +3374,10 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         usergrant(s, scratch, g, k->req, "user");
     }
 
+    if (k->tool==TOOL_PLANENTER || k->tool==TOOL_PLANEXIT) {
+        planresolve(s, scratch, allow, by, note, (t - k->opened + SEC/2) / SEC);
+        return;
+    }
     toolstart(s, scratch);
     if (allow && k->tool==TOOL_DESKTOP) {
         Args args = parseargs(&scratch, k->tool, c->args, s->te.edit);
@@ -5194,6 +5464,69 @@ static SkillUse skillinvoke(Session *s, Arena *a, Str name, Str args)
 }
 
 
+// enter_plan_mode or exit_plan_mode, asked about unless there is
+// nothing to ask (Plan mode). The plan's ask has no deadline. Returns 1
+// if the call finished, 0 if the session now waits for an answer.
+static b32 plancall(Session *s, Arena scratch, i32 tool)
+{
+    Engine  *e     = s->e;
+    Block   *c     = &s->calls[s->callidx];
+    b32      leave = tool == TOOL_PLANEXIT;
+    PlanText plan  = {};
+    if (!leave && s->plan) {
+        plan.err = concat(&scratch, "Plan mode is on already. Write your "
+                          "plan to ", s->planfile);
+        plan.err = concat(&scratch, plan.err, ", then call exit_plan_mode.");
+    } else if (leave && !s->plan) {
+        plan.err = "Plan mode is not on, so there is no plan to approve. Go "
+                   "on with the task.";
+    } else if (leave) {
+        plan = readplan(s, &scratch);
+    }
+    if (plan.err.data) {
+        toolstart(s, scratch);
+        toolend(s, scratch, "error", plan.err, 0, 0, {}, 0);
+        return 1;
+    }
+
+    Ask *k = &s->ask;
+    *k = {};
+    k->req    = clone(&s->perm, concat(&scratch, c->id, "/ask"));
+    k->tool   = tool;
+    k->opened = os_ticks(e->os);
+    b32 steer = s->steers.len > 0;
+    b32 wait  = attending(s) && !steer;
+    i64 delay = leave ? 0 : cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    if (wait && delay) {
+        arm(s, T_ASK, delay);
+    }
+    {
+        Str   what = leave ? plan.text :
+                     Str("The agent asks to plan first: in plan mode it "
+                         "explores without changing anything, and writes a "
+                         "plan for you to approve.");
+        Buf   b(&scratch, 512 + 2*what.len + s->planfile.len);
+        EvOut w = sbegin(s, &b, EV_ASK);
+        putstrkey(&w.json, "req", k->req);
+        putstrkey(&w.json, "call", c->id);
+        putstrkey(&w.json, "kind", leave ? Str("plan") : Str("plan.enter"));
+        putstrkey(&w.json, "tool", toolnames[tool]);
+        putstrkey(&w.json, "path", s->planfile);
+        putstrkey(&w.json, "detail", what);
+        // A plan waits for its answer: 0 is no deadline
+        i64 at = !wait ? os_time(e->os) : delay ? os_time(e->os)+delay/MS : 0;
+        putintkey(&w.json, "deadline", at);
+        putstrkey(&w.json, "dflt", "deny");
+        ssend(s, &w);
+    }
+    if (!wait) {
+        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        return 1;
+    }
+    setstate(s, S_ASK);
+    return 0;
+}
+
 // Run one call. Returns 1 if it finished, 0 if it goes on (a command or
 // a search, or an ask waiting for the user).
 static b32 runtool(Session *s, Arena scratch)
@@ -5214,7 +5547,10 @@ static b32 runtool(Session *s, Arena scratch)
     // names one such file, which is asked about.
     if (!s->blocked && tool==TOOL_EDIT && s->te.edit==EDIT_PATCH && !args.issues.len) {
         PatchGuard pg = patchguard(s, &scratch, &args.patch, {});
-        if (pg.many) {
+        if (planpatchout(s, &args.patch).data) {
+            toolstart(s, scratch);
+            return runfile(s, scratch, tool, s->guard.cwd, &args);  // refused
+        } else if (pg.many) {
             toolstart(s, scratch);
             toolend(s, scratch, "denied", "Not run: the patch changes more than "
                     "one file outside the working directory. Change each of "
@@ -5230,15 +5566,27 @@ static b32 runtool(Session *s, Arena scratch)
     if (!s->blocked && tool!=TOOL_NONE && toolhaspath(tool) && !args.issues.len) {
         Str       want = args.path.data ? args.path : Str(".");
         GuardPath g    = guardpath(e->os, &scratch, &s->guard, want, toolreads(tool));
-        if (!g.inside) {
+        b32       mine = isplanfile(s, g.path);  // the harness's own file
+        if (!g.inside && !mine && !(s->plan && !toolreads(tool))) {
             return askcall(s, scratch, tool, &g);
         }
         toolstart(s, scratch);
-        return runfile(s, scratch, tool, g.path, &args);
+        return runfile(s, scratch, tool, g.path, &args);  // refused in plan mode
     }
 
     if (!s->blocked && tool==TOOL_DESKTOP && !args.issues.len) {
+        if (s->plan && deskclass(args.desk.action)!=DESKC_OBSERVE) {
+            toolstart(s, scratch);
+            toolend(s, scratch, "denied", "Not done: plan mode is on, so the "
+                    "desktop tool may only look: screenshot, windows and "
+                    "wait.", 0, 0, {}, 0);
+            return 1;
+        }
         return deskcall(s, scratch, &args.desk);  // asks before it starts
+    }
+
+    if (!s->blocked && (tool==TOOL_PLANENTER || tool==TOOL_PLANEXIT) && !args.issues.len) {
+        return plancall(s, scratch, tool);  // asks before it starts
     }
 
     toolstart(s, scratch);
@@ -5281,8 +5629,10 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_JOBOUT:  tooljobout(s, scratch, &args);  return 1;
     case TOOL_JOBKILL: tooljobkill(s, scratch, &args); return 1;
     case TOOL_SKILL:   toolskill(s, scratch, &args);   return 1;
-    case TOOL_TASK:    assert(0);  // starttasks has these
-    case TOOL_DESKTOP: assert(0);  // deskcall has these
+    case TOOL_TASK:      assert(0);  // starttasks has these
+    case TOOL_DESKTOP:   assert(0);  // deskcall has these
+    case TOOL_PLANENTER: assert(0);  // plancall has these
+    case TOOL_PLANEXIT:  assert(0);
     }
     if (args.background) {
         startjob(s, scratch, &args);
@@ -5644,6 +5994,13 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     s->purpose   = REQ_CHAT;
     s->cp        = {};
     setstate(s, S_IDLE);
+    // The summary may have left out plan mode: told again, before the
+    // request that follows
+    s->planheard = 0;
+    planheed(s, scratch);
+    if (s->plan && cp.why!=CW_MANUAL) {
+        deliver(s, scratch);
+    }
 
     i64 after = estimate(s);
     if (cp.why == CW_MANUAL) {
@@ -6481,6 +6838,10 @@ static void sessionready(Session *s, Arena scratch)
         }
     }
     instrstart(s, scratch);
+    Str dir = os_realpath(e->os, &scratch, s->dir);  // as the guard has paths
+    if (dir.len) {
+        s->planfile = clone(&s->perm, normpath(&scratch, dir, "plan.md", HOST_WINDOWS));
+    }
     s->home      = s->ep.name.len ? s->ep.name : s->ep.url;
     s->homemodel = s->model;
     s->guard     = sessionguard(s, &s->perm);
@@ -6565,7 +6926,9 @@ static void logsession(Session *s, Arena scratch)
         putstrkey(&w.json, "call", s->pcall);
         putintkey(&w.json, "depth", s->depth);
     }
-    if (s->te.deny != TOOL_OFFMASK) {
+    // Plan mode's tools go without saying: never a role's
+    u32 plain = TOOL_OFFMASK | (s->role.len ? (u32)TOOL_PLANMASK : 0);
+    if (s->te.deny != plain) {
         putkey(&w.json, "tools");
         putarray(&w.json);
         for (i32 t = 0; t < TOOL_COUNT; t++) {
@@ -6705,7 +7068,7 @@ static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
         print(&text, r.name);
         print(&text, ": ");
         print(&text, r.desc.len ? utf8head(r.desc, 300) : Str("(no description)"));
-        if (!(r.deny & ~TOOL_OFFMASK)) {
+        if (!(r.deny & ~(TOOL_OFFMASK|TOOL_PLANMASK))) {
             print(&text, " (every tool)");
             continue;
         }
@@ -6851,7 +7214,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->rolepr  = clone(&s->perm, r.prompt);
     s->depth   = p->depth + 1;
     s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
-                 deskdeny(e, 1) | skilldeny(e);
+                 deskdeny(e, 1) | skilldeny(e) | TOOL_PLANMASK;
     s->psid    = clone(&s->perm, p->sid);
     s->pcall   = clone(&s->perm, c->id);
     s->intask  = 1;
@@ -6871,6 +7234,9 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     logprefix(s, scratch);
     for (iz i = 0; i < s->grants.len; i++) {
         loggrant(s, scratch, s->grants[i], "parent", {}, {});
+    }
+    if (p->plan) {
+        setmode(s, scratch, 1, "parent");  // read-only for its task
     }
     // Complete before scratch is passed on, which copies it
     Str title = cleantitle(&scratch, args->desc.len ? args->desc : args->prompt,
@@ -7565,6 +7931,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     Str  instr = jsonstr(jsonget(j, "instructions"));
     b32  fall  = jsonflag(jsonget(j, "fallback"), 1);
     Str  temp  = jsonstr(jsonget(j, "temp"));
+    b32  plan  = jsonflag(jsonget(j, "plan"), 0);
     Role role  = name.len ? findrole(e, name) : Role{};
     if (name.len && !role.ok) {
         Str err = concat(&scratch, "no such role: ", name);
@@ -7592,6 +7959,9 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     } else if (temp.len && temp!="ask") {
         reply(e, scratch, id, 0, "temp must be ask, or absent for the configuration's", {});
+        return;
+    } else if (plan && (role.deny | (tools.data ? tooldeny(tools) : 0))>>TOOL_PLANEXIT & 1) {
+        reply(e, scratch, id, 0, "plan mode needs the exit_plan_mode tool", {});
         return;
     }
     if (!model.len && role.model.len) {
@@ -7659,6 +8029,9 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     logsession(s, scratch);
     instrlogstart(s, scratch);
     logprefix(s, scratch);
+    if (plan) {
+        setmode(s, scratch, 1, "new");
+    }
     reply(e, scratch, id, 1, {}, s->sid);
 
     Str prompt = jsonstr(jsonget(j, "prompt"));
@@ -7886,8 +8259,10 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 }
                 s->te.deny = (((u32)1<<TOOL_COUNT) - 1) & ~have;
             } else {
-                s->te.deny = TOOL_OFFMASK;  // as it began: every tool but
-            }                               // those offered by name
+                // As it began: every tool but those offered by name, and
+                // plan mode's for a role
+                s->te.deny = TOOL_OFFMASK | (s->role.len ? (u32)TOOL_PLANMASK : 0);
+            }
             // Its edit format as it began: absent, the first one
             s->te.edit = editformat(jsonstr(jsonget(j, "edit_format")));
             i64 steps  = jsonint(jsonget(j, "steps"), 0);
@@ -7909,6 +8284,16 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         case EV_ATTEMPT:
         case EV_TURNEND:
             s->ctxhint = jsonint(jsonget(j, "ctx"), s->ctxhint);
+            break;
+        case EV_MODE: {
+            Str by = jsonstr(jsonget(j, "by"));
+            s->plan = jsonstr(jsonget(j, "mode")) == "plan";
+            s->planheard = by=="agent" || by=="approved" ? s->plan : s->planheard;
+        } break;
+        case EV_NOTICE:
+            if (jsonstr(jsonget(j, "kind")) == "mode") {
+                s->planheard = s->plan;
+            }
             break;
         case EV_GRANT: {
             // "Always allow", as the guard has it from then on, or a
@@ -7942,6 +8327,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             }
             countbytes(s);
             s->thinkfrom = r.seq;
+            s->planheard = 0;  // told again (compacted)
         } break;
         case EV_ASSISTANT:
             m.seq  = r.seq;
@@ -8019,6 +8405,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
     modelconf(e, &s->perm, s->model, &s->mc);
     replayjobs(s, scratch);
     sessionready(s, scratch);
+    planheed(s, scratch);  // a notice of the mode lost with its process
     instrlogstart(s, scratch);
     if (!prefixed) {
         logprefix(s, scratch);  // a log from before prefix records
@@ -8598,10 +8985,13 @@ static void cmdmodel(Engine *e, Arena scratch, i64 id, Json *j)
     }
     b32      transient = 0;
     Session *s         = borrow(e, scratch, sid, &transient);
+    // While the user is asked to approve a plan, a model to carry it out
+    b32      planask   = s && s->state==S_ASK && s->ask.tool==TOOL_PLANEXIT;
     Str      err       = !s          ? Str("no such session") :
                          s->readonly ? Str("open in another process") :
-                         busy(s) || s->intask ? Str("busy: switch once the turn ends")
-                                              : Str{};
+                         (busy(s) && !planask) || s->intask
+                                     ? Str("busy: switch once the turn ends")
+                                     : Str{};
     Target   t         = {};
     Endpoint probe     = {};
     if (!err.len) {
@@ -8618,6 +9008,9 @@ static void cmdmodel(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     }
 
+    if (planask) {
+        cool(s);  // the old model's lane need not wait for this one
+    }
     usetarget(s, t.which, t.model);
     s->home      = clone(&s->perm, t.which);
     s->homemodel = s->model;
@@ -8683,6 +9076,40 @@ static void cmdmodel(Engine *e, Arena scratch, i64 id, Json *j)
         forget(e, s);
     }
     emit(e, line);
+}
+
+// mode {sid, mode}: plan mode ("plan") or out of it ("default"), which
+// the agent reads in a notice at its next request (Plan mode). Only
+// while idle, or while an ask waits, but not the agent's own asks about
+// plan mode, which their answers settle. A subagent's mode is its
+// parent's, and a session without exit_plan_mode is never in plan mode.
+static void cmdmode(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
+{
+    Str mode = jsonstr(jsonget(j, "mode"));
+    b32 plan = mode == "plan";
+    b32 own  = s->state==S_ASK && (s->ask.tool==TOOL_PLANENTER ||
+                                   s->ask.tool==TOOL_PLANEXIT);
+    Str err  = !plan && mode!="default" ? Str("mode must be plan or default") :
+               s->depth ? Str("a subagent's mode is its parent's") :
+               plan && !tooloffered(&s->te, TOOL_PLANEXIT)
+                        ? Str("this session has no exit_plan_mode tool") :
+               own      ? Str("the agent asks about plan mode: answer that instead") :
+               busy(s) && s->state!=S_ASK
+                        ? Str("busy: change the mode once the turn ends, or while it asks")
+                        : Str{};
+    if (err.len) {
+        reply(e, scratch, id, 0, err, s->sid);
+        return;
+    }
+    if (plan != s->plan) {
+        setmode(s, scratch, plan, "user");
+    }
+    Buf   b(&scratch, 256);
+    EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "mode", s->plan ? Str("plan") : Str("default"));
+    emit(e, evend(&w));
 }
 
 // compact {sid, focus?}: compact now, in a turn of its own (via
@@ -8971,6 +9398,12 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
         ok = (os_stat(os, scratch, parentdir(dst)).type==STAT_DIR ||
               os_mkdirs(os, scratch, parentdir(dst))) &&
              os_copyfile(os, scratch, src, dst);
+    }
+    // The plan file, which the copied log names in its new place
+    Str plan = join(&scratch, from, "plan.md");
+    Str copy = join(&scratch, dir, "plan.md");
+    if (ok && os_stat(os, scratch, plan).type==STAT_FILE) {
+        ok = os_copyfile(os, scratch, plan, copy);
     }
     Str group = sidecarget(e, &scratch, sid, "group", GROUP_MAX);
     ok = ok && sidecarwrite(e, scratch, to, "title", c.title);
@@ -9370,6 +9803,7 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_MODEL:
         case CMD_UPLOAD:
         case CMD_IMPORT:
+        case CMD_MODE:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -9536,6 +9970,9 @@ static void command(Engine *e, Arena scratch, Str line)
         putskills(&w.json, sk.list, 1);
         emit(e, evend(&w));
     } return;
+    case CMD_MODE:
+        cmdmode(e, s, scratch, id, j);
+        return;
     case CMD_PROMPT:
     case CMD_STEER: {
         // A skill the user invoked comes first, with what was typed after

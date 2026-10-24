@@ -1,5 +1,6 @@
 // Tools: read, write, edit, shell, grep, glob, todo_write, jobs,
-// job_output, job_kill, task, desktop, skill
+// job_output, job_kill, task, desktop, skill, enter_plan_mode,
+// exit_plan_mode
 //
 // Every call ends in exactly one result the agent reads. Invalid calls
 // are never executed, and their results say how to fix them. File tools
@@ -12,8 +13,9 @@
 // task starts a subagent, a session of its own (engine.cpp). desktop
 // sees and drives the screen through a helper (desktop.cpp), and is
 // offered only where the configuration says. skill gives the agent a
-// skill's instructions (skills.cpp). A role may offer fewer
-// tools, and a call to one it does not is an unknown tool.
+// skill's instructions (skills.cpp). The plan mode tools ask the user
+// to begin planning and to approve the plan (engine.cpp). A role may
+// offer fewer tools, and a call to one it does not is an unknown tool.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -32,18 +34,23 @@ enum : i32 {
     TOOL_TASK,
     TOOL_DESKTOP,
     TOOL_SKILL,
+    TOOL_PLANENTER,
+    TOOL_PLANEXIT,
     TOOL_COUNT,
 };
 
 static Str toolnames[] = {
     "read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
-    "job_output", "job_kill", "task", "desktop", "skill",
+    "job_output", "job_kill", "task", "desktop", "skill", "enter_plan_mode",
+    "exit_plan_mode",
 };
 static_assert(countof(toolnames) == TOOL_COUNT);
 
 // Tools a session lacks unless something offers them: the desktop.
+// Plan mode's are the user's own sessions', never a role's.
 enum : u32 {
-    TOOL_OFFMASK = (u32)1 << TOOL_DESKTOP,
+    TOOL_OFFMASK  = (u32)1 << TOOL_DESKTOP,
+    TOOL_PLANMASK = (u32)1<<TOOL_PLANENTER | (u32)1<<TOOL_PLANEXIT,
 };
 
 enum : i64 {
@@ -483,6 +490,21 @@ static Str tooljson(Arena *a, ToolEnv *te)
                  "any", 0, {}},
             },
         },
+        {
+            "enter_plan_mode",
+            "Ask the user to switch to plan mode, before a large or unclear "
+            "change: explore read-only and write a plan for the user to "
+            "approve before you change anything. If the user agrees, the "
+            "result tells you the rules and where the plan file is.",
+            {},
+        },
+        {
+            "exit_plan_mode",
+            "In plan mode, once the plan file holds your whole plan: ask the "
+            "user to approve it. Approved, plan mode ends and you carry out "
+            "the plan; otherwise the user's note says what to change.",
+            {},
+        },
     };
     static_assert(countof(defs) == TOOL_COUNT);
 
@@ -618,8 +640,12 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te)
         "machine: read and change files, run commands, and check your work "
         "by running it. Work until the task is done, then reply with a "
         "short summary of what you did. The user is not watching and "
-        "cannot answer questions: make reasonable assumptions and state "
-        "them.\n\n"
+        "cannot answer questions");
+    print(&b, tooloffered(te, TOOL_PLANEXIT)
+              ? Str(", except to approve a plan in plan mode")
+              : Str(""));
+    print(&b,
+        ": make reasonable assumptions and state them.\n\n"
         "Guidelines:\n"
         "- Read files before editing them, and keep edits small and exact.\n");
     if (tooloffered(te, TOOL_GREP) && tooloffered(te, TOOL_GLOB)) {
@@ -637,6 +663,14 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te)
         print(&b, "- The desktop tool acts on the user's real screen: take a "
                   "screenshot before acting and after, and use it only as "
                   "the task needs.\n");
+    }
+    if (tooloffered(te, TOOL_PLANEXIT)) {
+        print(&b, "- Plan mode: for a large or unclear change you may ask to "
+                  "plan first with enter_plan_mode, and the user may put the "
+                  "session in plan mode. In plan mode, change nothing but the "
+                  "plan file, run only commands that change nothing, write "
+                  "your plan to the plan file, then ask the user to approve "
+                  "it with exit_plan_mode.\n");
     }
     print(&b,
         "- Stay inside the working directory; access outside it is denied.\n"
@@ -1209,6 +1243,9 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
             issue(a, &r, "name", "must not be empty");
         }
         break;
+    case TOOL_PLANENTER:
+    case TOOL_PLANEXIT:
+        break;
     }
     if (r.path.data && !r.path.len) {
         issue(a, &r, "path", "must not be empty");
@@ -1266,6 +1303,8 @@ static Str unknowntool(Arena *a, Str name, u32 deny)
         {"computer", "desktop"}, {"screenshot", "desktop"},
         {"computer_use", "desktop"}, {"mouse", "desktop"},
         {"use_skill", "skill"}, {"load_skill", "skill"}, {"skills", "skill"},
+        {"enterplanmode", "enter_plan_mode"},
+        {"exitplanmode", "exit_plan_mode"},
     };
     ToolEnv te = {};
     te.deny = deny;

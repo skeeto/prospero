@@ -260,8 +260,20 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         break;
     case EV_ASK:
         prettyline(c);
+        if (jsonstr(jsonget(j, "kind")) == "plan") {
+            os_print(os, 1, "[asking to approve the plan:]\n");
+            prettyexcerpt(c, scratch, jsonstr(jsonget(j, "detail")));
+            return;
+        }
         print(&b, "[asking: ");
         print(&b, jsonstr(jsonget(j, "detail")));
+        print(&b, "]\n");
+        break;
+    case EV_MODE:
+        prettyline(c);
+        print(&b, jsonstr(jsonget(j, "mode"))=="plan" ? Str("[plan mode on, by ")
+                                                      : Str("[plan mode off, by "));
+        print(&b, jsonstr(jsonget(j, "by")));
         print(&b, "]\n");
         break;
     case EV_ANSWER: {

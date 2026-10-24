@@ -45,6 +45,7 @@ enum : i32 {
     EV_PREFIX,
     EV_MODEL,   // (M8) the session's model from here on
     EV_GRANT,   // (M8) an "always allow" from the user
+    EV_MODE,    // plan mode, or out of it, from here on
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -94,6 +95,7 @@ static EvInfo evinfo[] = {
     {"prefix",     1, 0},  // what every request of the session begins with
     {"model",      1, 0},
     {"grant",      1, 0},  // lost to a power cut, it is asked again
+    {"mode",       1, 0},
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -139,6 +141,7 @@ enum : i32 {
     CMD_UPLOAD,  // (M9) part of a file staged for import
     CMD_IMPORT,  // (M9) a new session from a log staged by upload
     CMD_SKILLS,  // a session's skills, for /name
+    CMD_MODE,    // plan mode, or out of it
     CMD_COUNT,
 };
 
@@ -147,7 +150,7 @@ static Str cmdnames[] = {
     "cancel", "answer", "config.get", "config.set", "quit", "rewind",
     "job.kill", "status", "stop", "file", "rename", "delete", "archive",
     "group", "fork", "compact", "model", "draft", "upload", "import",
-    "skills",
+    "skills", "mode",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -177,6 +180,8 @@ static Str capnames[] = {
     "import",          // upload and import, a session from a raw log
     "answer.always.desktop",  // a desktop ask's always, by action class
     "skills",          // skills, the skill tool, and prompt {skill}
+    "plan",            // plan mode: mode, new {plan}, the mode record, asks
+                       // of kind plan and plan.enter, model while asked
 };
 
 static Str evname(i32 ev)

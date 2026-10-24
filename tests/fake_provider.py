@@ -1474,6 +1474,101 @@ def sc_edit_hashline(model, n, req):
         yield from answer(model, "Edited by line.")
 
 
+# Plan mode: an agent that tries to work, is refused, asks to have an
+# empty plan approved, writes the plan file the harness named, and asks
+# again; approved, it writes inside.txt, and kept planning, it writes the
+# plan again with the user's note. It decides from the last message, and
+# the call before it, so that one script serves every turn.
+
+PLAN_FILE = re.compile(r"(?:plan file, |plan to |stays in )(\S+?plan\.md)")
+
+
+def plan_path(req):
+    for m in reversed(req.get("messages", [])):
+        found = PLAN_FILE.search(str(m.get("content", "")))
+        if found:
+            return found.group(1)
+    return None
+
+
+def last_call(req):
+    """The name and arguments of the last call made."""
+    for m in reversed(req.get("messages", [])):
+        for c in reversed(m.get("tool_calls") or []):
+            f = c.get("function", {})
+            try:
+                return f.get("name"), json.loads(f.get("arguments") or "{}")
+            except ValueError:
+                return f.get("name"), {}
+    return None, {}
+
+
+def sc_plan(model, n, req):
+    msgs = req.get("messages", [])
+    last = str(msgs[-1].get("content", "")) if msgs else ""
+    name, args = last_call(req)
+    if msgs[-1].get("role") == "tool" and name == "write" and last.startswith(("Created", "Replaced")):
+        if str(args.get("path", "")).endswith("plan.md"):
+            yield from tool(model, n, "exit_plan_mode", {})
+        else:
+            yield from answer(model, "Done.")
+    elif "approved your plan" in last:
+        yield from tool(model, n, "write", {"path": "inside.txt", "content": "done"})
+    elif "did not approve the plan yet" in last:
+        note = last.split("The user's note: ", 1)[-1].split("\n", 1)[0]
+        yield from tool(model, n, "write", {"path": plan_path(req),
+                                            "content": f"# Plan v2\n\n- {note}\n"})
+    elif "There is no plan to approve yet" in last:
+        yield from tool(model, n, "write", {"path": plan_path(req),
+                                            "content": "# Plan\n\n- Write **inside.txt**.\n"})
+    elif "Not done: plan mode is on" in last:
+        yield from tool(model, n, "exit_plan_mode", {})
+    elif "Nobody can approve the plan" in last:
+        yield from answer(model, "Plan left for review.")
+    elif "declined plan mode" in last or "nobody is there to agree" in last or \
+            "Nobody answered" in last:
+        yield from answer(model, "No plan mode.")
+    elif last == "Plan first.":
+        yield from tool(model, n, "enter_plan_mode", {})
+    elif last == "Stop.":
+        yield from answer(model, "Stopped.")
+    else:
+        # A prompt, or the notice of plan mode on or off: get to work
+        yield from tool(model, n, "write", {"path": "inside.txt", "content": "done"})
+
+
+sc_plan_new = sc_plan_keep = sc_plan_reopen = sc_plan_mode = sc_plan_enter = sc_plan
+sc_plan_model = sc_plan_model_b = sc_plan
+
+
+def sc_plan_patch(model, n, req):
+    # Patches in plan mode: one that adds inside.txt, refused, then one
+    # that adds the plan file
+    k = step(req)
+    if k < 2:
+        path = "inside.txt" if k == 0 else plan_path(req)
+        patch = f"*** Begin Patch\n*** Add File: {path}\n+# Patched\n*** End Patch\n"
+        yield from tool(model, n, "edit", {"patch": patch})
+    else:
+        yield from answer(model, "Patched.")
+
+
+def sc_plan_task(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Look around",
+                                           "prompt": "Write child.txt.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, "Parent heard: " + tool_results(req)[0])
+
+
+def sc_plan_task_b(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "write", {"path": "child.txt", "content": "child"})
+    else:
+        yield from answer(model, "Child: " + tool_results(req)[0])
+
+
 # Agents for prospero eval (tests/scenarios.py, eval_*): scripted good
 # and bad agents, so that an eval's numbers are known. Every run of a
 # model shares its name, so these decide from the conversation alone:
@@ -1736,6 +1831,17 @@ def sc_desktop_flow(model, n, req):
         yield from tool(model, n, "desktop", DESK_FLOW[k])
     else:
         yield from answer(model, "Done on the desktop.")
+
+
+def sc_desktop_plan(model, n, req):
+    # In plan mode: a click, refused, then a screenshot, which only looks
+    k = step(req)
+    if k == 0:
+        yield from tool(model, n, "desktop", {"action": "click", "x": 10, "y": 10})
+    elif k == 1:
+        yield from tool(model, n, "desktop", {"action": "screenshot"})
+    else:
+        yield from answer(model, "Looked.")
 
 
 def sc_desktop_off(model, n, req):

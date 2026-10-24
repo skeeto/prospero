@@ -294,7 +294,7 @@ static void test_events(Test *t)
         expect(t, "durable events", finish(&durable),
                "session title user turn attempt assistant tool.start "
                "tool.end ask answer retry nudge turn.end note compact job.start "
-               "job.end todo snap rewind instructions notice prefix model grant ");
+               "job.end todo snap rewind instructions notice prefix model grant mode ");
         expect(t, "synced events", finish(&sync), "tool.start ask answer turn.end rewind ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
         expect(t, "empty event", istr(a, evfind("")), istr(a, EV_NONE));
@@ -319,12 +319,12 @@ static void test_events(Test *t)
                "\"steer\",\"cancel\",\"answer\",\"config.get\",\"config.set\",\"quit\","
                "\"rewind\",\"job.kill\",\"status\",\"stop\",\"file\",\"rename\",\"delete\","
                "\"archive\",\"group\",\"fork\",\"compact\",\"model\",\"draft\",\"upload\","
-               "\"import\",\"skills\"],"
+               "\"import\",\"skills\",\"mode\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
                "\"delete\",\"fork\",\"config.delete\",\"import\","
-               "\"answer.always.desktop\",\"skills\"]}");
+               "\"answer.always.desktop\",\"skills\",\"plan\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);
@@ -830,7 +830,7 @@ static void test_events(Test *t)
                "session=0 title=0 user=0 turn=0 attempt=0 assistant=0 "
                "tool.start=1 tool.end=0 ask=1 answer=1 retry=0 nudge=0 "
                "turn.end=1 note=0 compact=0 job.start=0 job.end=0 todo=0 snap=0 "
-               "rewind=1 instructions=0 notice=0 prefix=0 model=0 grant=0 ");
+               "rewind=1 instructions=0 notice=0 prefix=0 model=0 grant=0 mode=0 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";
