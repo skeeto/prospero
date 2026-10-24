@@ -187,6 +187,7 @@ static Str capnames[] = {
     "plan",            // plan mode: mode, new {plan}, the mode record, asks
                        // of kind plan and plan.enter, model while asked
     "queue",           // queue records, and unqueue to withdraw from one
+    "message",         // sessions and send_message, notices of kind message
 };
 
 static Str evname(i32 ev)
@@ -1085,21 +1086,27 @@ static b32 importkeeps(i32 ev)
     return 0;
 }
 
-// Whether an import drops a tool result's field: one naming a file of
-// the old session (spill, image, child), or describing one.
-static b32 importdrops(Str key)
+// Whether an import drops a field: of a tool result, one naming a file
+// or a session of the old state directory (spill, image, child, a
+// message's target), or describing one; of a message's notice, its
+// sender, whose title and text stay.
+static b32 importdrops(i32 ev, Str key)
 {
+    if (ev == EV_NOTICE) {
+        return key == "from";
+    }
     return key=="spill" || key=="bytes" || key=="image" || key=="width" ||
-           key=="height" || key=="shot" || key=="child" || key=="job";
+           key=="height" || key=="shot" || key=="child" || key=="job" ||
+           key=="to";
 }
 
-// A tool result without the fields an import drops, or the line itself
-// if it has none.
+// A tool result or notice without the fields an import drops, or the
+// line itself if it has none.
 static Str importstrip(Arena *a, EvRec *rec, Str line)
 {
     b32 any = 0;
     for (Json *m = rec->root->child; m; m = m->next) {
-        any |= importdrops(m->key);
+        any |= importdrops(rec->ev, m->key);
     }
     if (!any) {
         return line;
@@ -1108,7 +1115,7 @@ static Str importstrip(Arena *a, EvRec *rec, Str line)
     JsonOut w = {&b};
     putobject(&w);
     for (Json *m = rec->root->child; m; m = m->next) {
-        if (!importdrops(m->key)) {
+        if (!importdrops(rec->ev, m->key)) {
             putkey(&w, m->key);
             putjson(&w, m);
         }
@@ -1195,7 +1202,7 @@ static LogImport logimport(Arena *a, Arena scratch, Str data, Str to, Str cwd,
         } else if (!importkeeps(rec.ev)) {
             r.dropped++;
             continue;
-        } else if (rec.ev == EV_TOOLEND) {
+        } else if (rec.ev==EV_TOOLEND || rec.ev==EV_NOTICE) {
             line = importstrip(a, &rec, line);
         }
         kept = push(&scratch, kept, line);  // t is dead now

@@ -966,6 +966,41 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.taskmd", concat(&a, v->msgs[0].tool->child, istr(&a, v->msgs[0].md)), "kid1");
         expect(t, "panels.background", istr(&a, v->msgs[1].tool->job*10 + v->msgs[1].collapsed), "40");
     }
+
+    // Messages between sessions: the sender's row names the target as
+    // given, then by its title; a message read shows open, its sender
+    // named, and linked by sid
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"m1","name":"send_message","args":"{\"to\":\"k1\",\"text\":\"hi\"}"},)"
+                    R"({"t":"call","id":"m2","name":"send_message","args":"{\"to\":\"nobody\"}"}]})");
+        expect(t, "panels.msgcall", msgsshow(&a, v),
+               "X[send_message Message \xe2\x86\x92 k1 called]:;"
+               "X[send_message Message \xe2\x86\x92 nobody called]:;");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"tool.end","call":"m1","status":"ok",)"
+                    R"("text":"Sent.","to":"k1","to_title":"Fix the build","delivery":"woke",)"
+                    R"("hop":1,"ms":1})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"tool.end","call":"m2","status":"error",)"
+                    R"("text":"Not sent.","fail":"message","ms":1})");
+        expect(t, "panels.msgsent", msgsshow(&a, v),
+               "X[send_message Message \xe2\x86\x92 Fix the build ok]:Sent.;"
+               "X[send_message Message \xe2\x86\x92 nobody error]:Not sent.;");
+        expect(t, "panels.msgtarget", concat(&a, v->msgs[0].tool->child, "|"), "k1|");
+        expect(t, "panels.msgnotarget", concat(&a, v->msgs[1].tool->child, "|"), "|");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"notice","kind":"message","from":"k1",)"
+                    R"("from_title":"Fix the build","hop":2,"text":"Message from another session"})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"notice","kind":"message",)"
+                    R"("from_title":"","hop":1,"text":"Imported"})");
+        ViewMsg *m = &v->msgs[2];
+        expect(t, "panels.msgnote", concat(&a, concat(&a, m->label, "|"),
+               concat(&a, m->from, istr(&a, m->fold*10 + m->collapsed))),
+               "Message from Fix the build|k110");
+        m = &v->msgs[3];
+        expect(t, "panels.msgnofrom", concat(&a, concat(&a, m->label, "|"), m->from),
+               "Message from another session|");
+    }
 }
 
 // Reasoning as each message has it: f folded, o open or h hidden, then

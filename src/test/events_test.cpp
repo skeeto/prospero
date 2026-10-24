@@ -192,7 +192,8 @@ static void testlogimport(Test *t)
         "\"snap\":\"snap/1\"}\n"
         "{\"sid\":\"A\",\"seq\":9,\"ts\":8,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\","
         "\"spill\":\"../../x\",\"bytes\":3,\"image\":\"../../x\",\"width\":1,\"height\":1,"
-        "\"shot\":\"s\",\"child\":\"K\",\"job\":2,\"ms\":4}\n"
+        "\"shot\":\"s\",\"child\":\"K\",\"job\":2,\"to\":\"K2\",\"to_title\":\"T\","
+        "\"ms\":4}\n"
         "{\"sid\":\"B\",\"seq\":10,\"ts\":8,\"ev\":\"user\",\"text\":\"other\"}\n"
         "{\"sid\":\"A\",\"seq\":11,\"ts\":8,\"ev\":\"rewind\",\"undone\":[\"snap/1\"]}\n"
         "{\"sid\":\"A\",\"seq\":12,\"ts\":8,\"ev\":\"job.start\",\"job\":2,\"spill\":\"/x\"}\n"
@@ -201,8 +202,10 @@ static void testlogimport(Test *t)
         "{\"sid\":\"A\",\"seq\":15,\"ts\":8,\"ev\":\"model\",\"model\":\"m2\"}\n"
         "{\"sid\":\"A\",\"seq\":16,\"ts\":9,\"ev\":\"title\",\"text\":\"First\",\"by\":\"auto\"}\n"
         "{\"sid\":\"A\",\"seq\":17,\"ts\":9,\"ev\":\"newer\",\"x\":1}\n"
-        "{\"sid\":\"A\",\"seq\":18,\"ts\":9,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n"
-        "{\"sid\":\"A\",\"seq\":19,\"ts\":9,\"ev\":\"user\",\"te";
+        "{\"sid\":\"A\",\"seq\":18,\"ts\":9,\"ev\":\"notice\",\"kind\":\"message\","
+        "\"from\":\"K3\",\"from_title\":\"U\",\"hop\":1,\"text\":\"hi\"}\n"
+        "{\"sid\":\"A\",\"seq\":19,\"ts\":9,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n"
+        "{\"sid\":\"A\",\"seq\":20,\"ts\":9,\"ev\":\"user\",\"te";
     LogImport r = logimport(&a, scratch, log, "N", "/here", "mm", "http://e/",
                             "/t/prospero-1/N", 100);
     Str want =
@@ -214,10 +217,12 @@ static void testlogimport(Test *t)
         "{\"sid\":\"N\",\"seq\":5,\"ts\":7,\"ev\":\"turn\",\"n\":1}\n"
         "{\"sid\":\"N\",\"seq\":7,\"ts\":8,\"ev\":\"tool.start\",\"call\":\"c1\",\"name\":\"x\"}\n"
         "{\"sid\":\"N\",\"seq\":9,\"ts\":8,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\","
-        "\"ms\":4}\n"
+        "\"to_title\":\"T\",\"ms\":4}\n"
         "{\"sid\":\"N\",\"seq\":16,\"ts\":9,\"ev\":\"title\",\"text\":\"First\",\"by\":\"auto\"}\n"
-        "{\"sid\":\"N\",\"seq\":18,\"ts\":9,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n"
-        "{\"sid\":\"N\",\"seq\":19,\"ts\":100,\"ev\":\"title\",\"text\":\"First (imported)\","
+        "{\"sid\":\"N\",\"seq\":18,\"ts\":9,\"ev\":\"notice\",\"kind\":\"message\","
+        "\"from_title\":\"U\",\"hop\":1,\"text\":\"hi\"}\n"
+        "{\"sid\":\"N\",\"seq\":19,\"ts\":9,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n"
+        "{\"sid\":\"N\",\"seq\":20,\"ts\":100,\"ev\":\"title\",\"text\":\"First (imported)\","
         "\"by\":\"auto\"}\n";
     expect(t, "logimport", r.log, want);
     expect(t, "logimport err", r.err, "");
@@ -229,7 +234,7 @@ static void testlogimport(Test *t)
     print(&b, (i64)r.dropped);
     putbyte(&b, ' ');
     print(&b, (i64)r.bad);
-    expect(t, "logimport counts", finish(&b), "7 10 2");
+    expect(t, "logimport counts", finish(&b), "8 10 2");
 
     // Refused: a subagent's log, one that begins otherwise, mostly bad
     struct {
@@ -324,7 +329,7 @@ static void test_events(Test *t)
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
                "\"delete\",\"fork\",\"config.delete\",\"import\","
-               "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\"]}");
+               "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);

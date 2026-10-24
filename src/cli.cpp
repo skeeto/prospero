@@ -174,6 +174,7 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         Str     what = name=="shell" ? jsonstr(jsonget(rp.root, "command")) :
                        name=="task"  ? jsonstr(jsonget(rp.root, "description")) :
                        name=="skill" ? jsonstr(jsonget(rp.root, "name")) :
+                       name=="send_message" ? jsonstr(jsonget(rp.root, "to")) :
                        jsonstr(jsonget(rp.root, "path"));
         Json   *pt   = jsonget(rp.root, "patch");
         if (name=="edit" && pt->type==JSON_STRING) {
@@ -334,14 +335,23 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         print(&b, n);
         print(&b, " done]\n");
     } break;
-    case EV_NOTICE:
+    case EV_NOTICE: {
+        // A message from another session names its sender
         prettyline(c);
-        print(&b, "[notice: ");
-        print(&b, jsonstr(jsonget(j, "kind")));
+        Str kind  = jsonstr(jsonget(j, "kind"));
+        Str title = jsonstr(jsonget(j, "from_title"));
+        Str from  = title.len ? title : jsonstr(jsonget(j, "from"));
+        if (kind=="message" && from.len) {
+            print(&b, "[message from ");
+            print(&b, from);
+        } else {
+            print(&b, "[notice: ");
+            print(&b, kind);
+        }
         print(&b, "]\n");
         os_print(os, 1, finish(&b));
         prettyexcerpt(c, scratch, jsonstr(jsonget(j, "text")));
-        return;
+    } return;
     case EV_REWIND:
         prettyline(c);
         print(&b, "[rewound ");

@@ -125,6 +125,9 @@ enum : i64 {
     FILECMD_MAX  = 1 << 20,       // bytes of a file a file command gives
     PARK_IDLE    = 7*60*SEC,      // idle this long, a session is parked
     TASK_SOFT    = 200,           // a subagent's requests, by default
+    HOP_MAX      = 8,             // messages since user input that wake
+    MSG_TURN     = 20,            // send_message calls a turn
+    SESS_SHOWN   = 50,            // unrelated sessions the sessions tool lists
 };
 
 enum : i32 {
@@ -225,12 +228,16 @@ enum : i64 {
 
 // Something for the agent to read before its next request: a job that
 // ended, files rewound, instructions for a directory, skills changed,
-// plan mode.
+// plan mode, a message from another session.
 struct Notice {
-    Str kind;    // "job", "rewind", "instructions", "skills", "budget", "mode"
+    Str kind;    // "job", "rewind", "instructions", "skills", "budget",
+                 // "mode", "message"
     Str text;
     i64 job;     // for "job"
     b32 skills;  // its record lists the skills the agent knows now
+    Str from;    // for "message": the sender's sid and title
+    Str ftitle;
+    i32 hop;     // and its hop count (see "Messages")
 };
 
 enum : i32 {
@@ -557,6 +564,13 @@ struct Session {
     b32          wake;       // a job ended: start a turn if idle
     b32          closed;     // the frontend closed it: no jobs, no resumes
     Slice<Notice> notices;   // delivered at the next request
+    // Messages between sessions
+    i32          hop;        // messages since user input, for this turn
+    i32          msgsent;    // send_message calls this turn
+    Str          msgto;      // the current call's target, for tool.end
+    Str          msgtitle;
+    Str          msghow;     // busy, woke or waiting
+    i32          msghop;     // the message's hop
     // The todo list
     Slice<TodoItem> todos;
     i32          mutations;  // mutating calls since the list changed
@@ -1031,6 +1045,16 @@ static void notify(Session *s, Str kind, Str text, i64 job)
     s->notices = push(&s->perm, s->notices, n);
 }
 
+// The user's input resets the hop count (see "Messages"), also of the
+// messages waiting, which the user's turn takes in.
+static void userinput(Session *s)
+{
+    s->hop = 0;
+    for (iz i = 0; i < s->notices.len; i++) {
+        s->notices[i].hop = 0;
+    }
+}
+
 // Give the agent the notices queued since its last request, each a
 // message of its own and a durable record, so that a session opened
 // again sends the same history.
@@ -1044,6 +1068,12 @@ static void deliver(Session *s, Arena scratch)
         putstrkey(&w.json, "kind", n->kind);
         if (n->job) {
             putintkey(&w.json, "job", n->job);
+        }
+        if (n->kind == "message") {
+            putstrkey(&w.json, "from", n->from);
+            putstrkey(&w.json, "from_title", n->ftitle);
+            putintkey(&w.json, "hop", n->hop);
+            s->hop = n->hop>s->hop ? n->hop : s->hop;
         }
         putstrkey(&w.json, "text", n->text);
         if (n->skills) {
@@ -1507,6 +1537,8 @@ static i64  parkafter(Engine *);
 static b32  deskrun(Session *, Arena, DeskArgs *);
 static Str  deskdenial(Arena *, i32 by, Str note, i64 wait);
 static Slice<Msg> deskimages(Session *, Arena *);
+static void toolsessions(Session *, Arena);
+static void toolmessage(Session *, Arena, Args *);
 
 // The ids of the session's calls so far, which a new call's must not
 // repeat (finishpartial).
@@ -2534,6 +2566,12 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     if (child.len) {
         putstrkey(&w.json, "child", child);
     }
+    if (s->msgto.len) {
+        putstrkey(&w.json, "to", s->msgto);  // send_message's target
+        putstrkey(&w.json, "to_title", s->msgtitle);
+        putstrkey(&w.json, "delivery", s->msghow);
+        putintkey(&w.json, "hop", s->msghop);
+    }
     if (s->callimage.len) {
         putstrkey(&w.json, "image", s->callimage);
         putintkey(&w.json, "width", s->callimgw);
@@ -2555,6 +2593,9 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     addmsg(s, m);
     s->callimage = {};
     s->callshot  = {};
+    s->msgto     = {};
+    s->msgtitle  = {};
+    s->msghow    = {};
     b32 done = status=="ok" || status=="background";
     s->progressed |= done;
     if (done && toolmutates(toolfind(c->name))) {
@@ -3707,6 +3748,20 @@ static b32 canresume(Session *s)
         n += now - s->resumed[i] < 3600*SEC;
     }
     return !e->quitting && !s->readonly && !s->closed && n<cap;
+}
+
+// The hop of the messages waiting that may wake the session, the most
+// of them, or 0 if none may (see "Messages").
+static i32 msgwake(Session *s)
+{
+    i32 hop = 0;
+    for (iz i = 0; i < s->notices.len; i++) {
+        Notice *n = &s->notices[i];
+        if (n->kind=="message" && n->hop<HOP_MAX && n->hop>hop) {
+            hop = n->hop;
+        }
+    }
+    return s->readonly || s->e->quitting ? 0 : hop;
 }
 
 // Start a turn to give the agent its notices, a session left idle.
@@ -5678,6 +5733,8 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_JOBOUT:  tooljobout(s, scratch, &args);  return 1;
     case TOOL_JOBKILL: tooljobkill(s, scratch, &args); return 1;
     case TOOL_SKILL:   toolskill(s, scratch, &args);   return 1;
+    case TOOL_SESSIONS: toolsessions(s, scratch);      return 1;
+    case TOOL_MESSAGE: toolmessage(s, scratch, &args); return 1;
     case TOOL_TASK:      assert(0);  // starttasks has these
     case TOOL_DESKTOP:   assert(0);  // deskcall has these
     case TOOL_PLANENTER: assert(0);  // plancall has these
@@ -6196,6 +6253,7 @@ static void prepare(Session *s, Arena scratch)
 {
     for (iz i = 0; i < s->steers.len; i++) {
         adduser(s, scratch, s->steers[i].text, "steer");
+        userinput(s);
     }
     if (s->steers.len) {
         s->steers = {};
@@ -6297,11 +6355,13 @@ static void settitle(Session *s, Arena scratch, Str title, Str by)
 }
 
 // Begin a turn, after its user input if any: via names what began it
-// without input ("job": notices of background jobs; "compact": the user
-// asked for a compaction, the turn's only work), else is null.
+// without input ("job": notices of background jobs; "message": a message
+// from another session, at hop; "compact": the user asked for a
+// compaction, the turn's only work), else is null.
 static void beginturn(Session *s, Arena scratch, Str via)
 {
     s->cancelled = 0;
+    s->msgsent   = 0;
     s->turn++;
     {
         Arena a = scratch;
@@ -6310,6 +6370,9 @@ static void beginturn(Session *s, Arena scratch, Str via)
         putintkey(&w.json, "n", s->turn);
         if (via.len) {
             putstrkey(&w.json, "via", via);
+        }
+        if (via == "message") {
+            putintkey(&w.json, "hop", s->hop);
         }
         ssend(s, &w);
     }
@@ -6326,9 +6389,13 @@ static void beginturn(Session *s, Arena scratch, Str via)
     prepare(s, scratch);
 }
 
+// A subagent's task carries its parent's hop, and user input resets it.
 static void startturn(Session *s, Arena scratch, Str text, Str via)
 {
     s->cancelled = 0;
+    if (via != "task") {
+        userinput(s);
+    }
     adduser(s, scratch, text, via);
     if (!s->title.len) {
         Str title = cleantitle(&scratch, text, TITLE_MAX);
@@ -6374,9 +6441,13 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     s->slowing     = 0;
     s->slowfrom    = 0;
     s->slown       = 0;
-    // A job that ended after the turn's last request starts the next
-    b32 resume = !s->steers.len && !s->queued.len && !s->closed && s->wake &&
-                 s->notices.len && canresume(s);
+    // A job that ended after the turn's last request starts the next,
+    // and so does a message, even to a closed session, but not right
+    // after the user cancelled
+    b32 input  = s->steers.len || s->queued.len;
+    i32 mhop   = !input && why!="cancel" ? msgwake(s) : 0;
+    b32 resume = mhop || (!input && !s->closed && s->wake && s->notices.len &&
+                          canresume(s));
     {
         Arena a = scratch;
         Buf   b(&a, 256 + err.len);
@@ -6413,6 +6484,9 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     }
     if (next.data) {
         startturn(s, scratch, next, "queue");
+    } else if (mhop) {
+        s->hop = mhop;
+        beginturn(s, scratch, "message");
     } else if (s->closed) {
         stopjobs(s, scratch, 0);  // started after the session closed
     } else if (resume) {
@@ -7343,6 +7417,7 @@ static void starttasks(Session *s, Arena scratch)
         }
         s->tasks = push(&s->perm, s->tasks, t);
         if (c) {
+            c->hop = s->hop;
             startturn(c, a, args.prompt, "task");
         }
     }
@@ -7832,6 +7907,305 @@ static SessScan scansessions(Engine *e, Arena *a)
         }
     }
     return r;
+}
+
+
+// Messages
+//
+// An agent lists the other sessions of the state directory (sessions)
+// and sends one a message (send_message), by its id or exact title. The
+// target may be open here, parked, or only on disk, which loads it, but
+// never archived (it or an ancestor), held by another process, nor the
+// sender itself. The message is a notice of kind "message", whose
+// record names the sender and the hop, and whose text says it comes
+// from another session: it is never user input, so it neither answers
+// nor ends an ask as a steer does. A target at work reads it at its
+// next step: one asking the user after the answer, one waiting for its
+// subagents once they have reported. An idle one starts a turn for it
+// (via "message"), as does one whose turn ends with a message waiting,
+// unless the user cancelled that turn. The target runs as it would for
+// the user: its own grants, attended or not.
+//
+// Loop guard: a turn's hop counts messages since the user's input,
+// which resets it (a prompt, a steer), and the hop of the messages still
+// waiting too. A message carries its sender's hop plus one, a subagent
+// its parent's hop. One at HOP_MAX or more is delivered but wakes
+// nobody, and its sender is told so, as is its target when its reply
+// would be such. A turn makes at most MSG_TURN send_message calls.
+
+// Whether a scanned session, or one above it, is archived.
+static b32 scanarchived(SessScan *sc, iz i)
+{
+    for (i32 n = 0; i>=0 && n<=TASK_DEPTH+8; n++) {
+        ListEntry *en = &sc->list[i];
+        if (en->archived) {
+            return 1;
+        }
+        iz *p = en->parent.len ? upsert(&sc->bysid, en->parent, (Arena *)0) : 0;
+        i = p ? *p : -1;
+    }
+    return 0;
+}
+
+// How a scanned session relates to s.
+static Str relation(Session *s, ListEntry *en)
+{
+    if (s->psid.len && en->sid==s->psid) {
+        return "parent";
+    } else if (en->parent == s->sid) {
+        return "child";
+    } else if (s->psid.len && en->parent==s->psid) {
+        return "sibling";
+    }
+    return "other";
+}
+
+static void putsession(Session *s, Buf *b, ListEntry *en)
+{
+    Session *t  = findsession(s->e, en->sid);
+    Str      st = en->locked ? Str("locked") :
+                  t          ? (busy(t) ? Str("busy") : Str("idle")) :
+                  en->parked ? Str("parked") : Str("closed");
+    print(b, en->sid);
+    print(b, "  ");
+    print(b, st);
+    print(b, "  ");
+    print(b, relation(s, en));
+    print(b, "  ");
+    print(b, en->cwd);
+    print(b, "  \"");
+    print(b, en->title);
+    print(b, "\"\n");
+}
+
+// The sessions tool: the caller's relatives, then the rest, each newest
+// first, up to SESS_SHOWN of the rest. Archived sessions are left out.
+static void toolsessions(Session *s, Arena scratch)
+{
+    SessScan sc = scansessions(s->e, &scratch);
+    Buf      b(&scratch, 4096);
+    print(&b, "You are session ");
+    print(&b, s->sid);
+    if (s->title.len) {
+        print(&b, " (\"");
+        print(&b, s->title);
+        print(&b, "\")");
+    }
+    print(&b, ".\n");
+    iz head = b.len;
+    print(&b, "Other sessions: id, state, relation to you, working "
+              "directory, title.\n");
+    iz  list   = b.len;
+    i64 others = 0;
+    for (i32 kin = 1; kin >= 0; kin--) {
+        for (iz i = sc.list.len-1; i >= 0; i--) {
+            ListEntry *en  = &sc.list[i];
+            b32        rel = relation(s, en) != "other";
+            if (en->sid==s->sid || rel!=kin || scanarchived(&sc, i)) {
+                continue;
+            } else if (!kin && others++>=SESS_SHOWN) {
+                continue;
+            }
+            putsession(s, &b, en);
+        }
+    }
+    if (b.len == list) {
+        b.len = head;
+        print(&b, "There are no other sessions.\n");
+    } else if (others > SESS_SHOWN) {
+        print(&b, "... and ");
+        print(&b, others - SESS_SHOWN);
+        print(&b, " older sessions, not shown.\n");
+    }
+    toolend(s, scratch, "ok", trimright(finish(&b)), 0, 0, {}, 0);
+}
+
+// The session a message goes to, by id, else by an exact title no other
+// session has: its index in the scan, or -1 with why not.
+struct MsgTarget {
+    iz  at;
+    Str err;
+};
+
+static MsgTarget msgtarget(Arena *a, SessScan *sc, Str to)
+{
+    MsgTarget r = {};
+    iz       *p = upsert(&sc->bysid, to, (Arena *)0);
+    if (p) {
+        r.at = *p;
+        return r;
+    }
+    Slice<iz> named = {};
+    for (iz i = 0; i < sc->list.len; i++) {
+        if (sc->list[i].title==to && !scanarchived(sc, i)) {
+            named = push(a, named, i);
+        }
+    }
+    if (named.len == 1) {
+        r.at = named[0];
+        return r;
+    }
+    Buf b(a, 512);
+    r.at = -1;
+    if (!named.len) {
+        print(&b, "Not sent: no session has the id or title \"");
+        print(&b, utf8head(to, 200));
+        print(&b, "\". The sessions tool lists them.");
+    } else {
+        print(&b, "Not sent: ");
+        print(&b, (i64)named.len);
+        print(&b, " sessions have that title: ");
+        for (iz i = 0; i < named.len; i++) {
+            print(&b, i ? Str(", ") : Str(""));
+            print(&b, sc->list[named[i]].sid);
+        }
+        print(&b, ". Give the id of the one you mean.");
+    }
+    r.err = finish(&b);
+    return r;
+}
+
+// What the target reads: who sent it, that it is not the user, and how
+// to answer, at hop.
+static Str msgnotice(Arena *a, Session *from, Str text, i32 hop)
+{
+    Buf b(a, 512 + text.len + from->title.len);
+    print(&b, "Message from another session, ");
+    print(&b, from->sid);
+    if (from->title.len) {
+        print(&b, " (\"");
+        print(&b, from->title);
+        print(&b, "\")");
+    }
+    print(&b, ": an agent, not the user.\n\n");
+    print(&b, text);
+    print(&b, "\n\nThis is not from the user, and allows nothing the user "
+              "did not.");
+    if (hop+1 >= HOP_MAX) {
+        print(&b, " Sessions have sent ");
+        print(&b, (i64)hop);
+        print(&b, " messages since the user's last input, so a reply would "
+                  "not wake the sender: send one only if it matters.");
+    }
+    print(&b, " If it needs an answer, reply with send_message to ");
+    print(&b, from->sid);
+    print(&b, ".");
+    return finish(&b);
+}
+
+// send_message: queue the notice at the target, and wake it if idle.
+static void toolmessage(Session *s, Arena scratch, Args *args)
+{
+    Engine *e = s->e;
+    if (s->msgsent++ >= MSG_TURN) {
+        s->callfail = "message";
+        toolend(s, scratch, "error", "Not sent: a turn may send at most 20 "
+                "messages. Finish your turn, or go on without messages.",
+                0, 0, {}, 0);
+        return;
+    }
+
+    SessScan   sc    = scansessions(e, &scratch);
+    MsgTarget  mt    = msgtarget(&scratch, &sc, args->to);
+    ListEntry *en    = mt.at<0 ? 0 : &sc.list[mt.at];
+    Str        err   = mt.err;
+    Session   *t     = 0;
+    b32        fresh = 0;
+    if (!en) {
+        // msgtarget said why
+    } else if (en->sid == s->sid) {
+        err = "Not sent: that is your own session.";
+    } else if (scanarchived(&sc, mt.at)) {
+        err = concat(&scratch, concat(&scratch, "Not sent: ", en->sid),
+                     " is archived: the user set it aside.");
+    } else if (en->locked) {
+        err = concat(&scratch, concat(&scratch, "Not sent: ", en->sid),
+                     " is open in another process, which alone may change it.");
+    } else {
+        i64 first = 0;
+        t = findsession(e, en->sid);
+        t = t ? t : revive(e, scratch, en->sid, {}, {}, &first);
+        if (!t) {
+            t = loadsession(e, scratch, en->sid, {}, {}, &first, -1);
+            fresh = t != 0;
+        }
+        if (!t) {
+            err = concat(&scratch, concat(&scratch, "Not sent: ", en->sid),
+                         " cannot be opened.");
+        } else if (t->readonly) {
+            err = concat(&scratch, concat(&scratch, "Not sent: ", en->sid),
+                         " is open in another process, which alone may change it.");
+            if (fresh) {
+                forget(e, t);
+            }
+        } else if (fresh) {
+            t->closed = 1;  // as it was: no frontend has it open
+        }
+    }
+    if (err.len) {
+        s->callfail = "message";
+        toolend(s, scratch, "error", err, 0, 0, {}, 0);
+        return;
+    }
+
+    Notice n = {};
+    n.kind   = "message";
+    n.hop    = s->hop + 1;
+    n.text   = clone(&t->perm, msgnotice(&scratch, s, args->text, n.hop));
+    n.from   = clone(&t->perm, s->sid);
+    n.ftitle = clone(&t->perm, s->title);
+    t->notices = push(&t->perm, t->notices, n);
+
+    b32 wake = !busy(t) && n.hop<HOP_MAX && !e->quitting;
+    Buf b(&scratch, 512 + t->title.len);
+    print(&b, "Sent to ");
+    print(&b, t->sid);
+    if (t->title.len) {
+        print(&b, " (\"");
+        print(&b, t->title);
+        print(&b, "\")");
+    }
+    if (busy(t)) {
+        print(&b, t->state==S_ASK  ? Str(", which waits for the user to "
+                                         "answer a question: it reads the "
+                                         "message after that.") :
+                  t->state==S_TASK ? Str(", which waits for its subagents: "
+                                         "it reads the message once they "
+                                         "have reported.") :
+                  Str(", which is at work: it reads the message at its next "
+                      "step."));
+        if (n.hop >= HOP_MAX) {
+            print(&b, " Should its turn end first, it reads it only once the "
+                      "user prompts it, as messages since the user's last "
+                      "input wake nobody any more.");
+        }
+    } else if (wake) {
+        print(&b, ", which was idle and started a turn to read it.");
+    } else if (e->quitting) {
+        print(&b, ", which is idle and was not woken: the harness is "
+                  "stopping. Do not wait for a reply.");
+    } else {
+        print(&b, ", which is idle and was not woken: this is message ");
+        print(&b, (i64)n.hop);
+        print(&b, " between sessions since the user's last input, and from ");
+        print(&b, (i64)HOP_MAX);
+        print(&b, " on they wake nobody. It reads this only once the user "
+                  "prompts it. Do not wait for a reply.");
+    }
+    if (busy(t) || wake) {
+        print(&b, " A reply, if it sends one, comes to you as a message: do "
+                  "not wait or poll for it.");
+    }
+    Str text = finish(&b);
+    s->msgto    = clone(&scratch, t->sid);
+    s->msgtitle = clone(&scratch, t->title);
+    s->msghow   = busy(t) ? Str("busy") : wake ? Str("woke") : Str("waiting");
+    s->msghop   = n.hop;
+    if (wake) {
+        t->hop = n.hop;
+        beginturn(t, scratch, "message");
+    }
+    toolend(s, scratch, "ok", text, 0, 0, {}, 0);
 }
 
 

@@ -232,7 +232,8 @@ struct ViewTool {
     u8  *tail;      // the live output, a buffer reused for each tool.out
     iz   tailcap;
     i64  job;       // the background job it started, 0 if none
-    Str  child;     // a task's subagent, once it reported
+    Str  child;     // a task's subagent, once it reported, or a
+                    // message's target
     i32  snap;      // the file it changed: index+1 in the view's snaps
     b32  elided;    // pruned: the agent sees only where its output is
     Str  image;     // a screenshot, relative to the session directory
@@ -343,6 +344,7 @@ struct ViewMsg {
     i64       ts0;        // reasoning: its first and last deltas, epoch
     i64       ts1;        //   ms, or 0 where it did not stream
     Str       label;      // the header, if not the role's name
+    Str       from;       // a message's sender, a session's id
     ViewTool *tool;       // tool rows and asks
     ViewCard *card;       // compactions and rewinds
     f64       top;        // prefix sum of heights above, with gaps
@@ -981,6 +983,10 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
     } else if (name == "skill") {
         Str skill = jsonstr(jsonget(j, "name"));
         return oneline(perm, skill.len ? skill : args);
+    } else if (name == "send_message") {
+        // The target as given, until the result names its title
+        Str to = jsonstr(jsonget(j, "to"));
+        return oneline(perm, concat(&scratch, "Message \xe2\x86\x92 ", to));
     } else if (name=="edit" && patch->type==JSON_STRING) {
         // The files the patch names, as it names them
         Slice<Str> paths = patchpaths(&scratch, patch->str);
@@ -1633,6 +1639,13 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->bytes   = jsonint(jsonget(j, "bytes"), 0);
         t->job     = jsonint(jsonget(j, "job"), t->job);
         t->child   = clone(&v->aux, jsonstr(jsonget(j, "child")));
+        Str to     = jsonstr(jsonget(j, "to"));
+        Str title  = jsonstr(jsonget(j, "to_title"));
+        if (t->name=="send_message" && (to.len || title.len)) {
+            Str name   = title.len ? title : to;
+            t->summary = oneline(&v->aux, concat(&scratch, "Message \xe2\x86\x92 ", name));
+            t->child   = clone(&v->aux, to);
+        }
         t->image   = clone(&v->aux, jsonstr(jsonget(j, "image")));
         t->imgw    = (i32)jsonint(jsonget(j, "width"), 0);
         t->imgh    = (i32)jsonint(jsonget(j, "height"), 0);
@@ -1797,6 +1810,14 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             print(&b, job);
             print(&b, " ended");
             m->label = finish(&b);
+        } else if (kind == "message") {
+            // From another session: open, and named as the sender was
+            Str from  = jsonstr(jsonget(j, "from"));
+            Str title = jsonstr(jsonget(j, "from_title"));
+            Str name  = title.len ? title : from.len ? from : Str("another session");
+            m->label     = oneline(&v->aux, concat(&scratch, "Message from ", name));
+            m->from      = clone(&v->aux, from);
+            m->collapsed = 0;
         } else {
             m->label = kind=="rewind"       ? Str("To the agent: files rewound") :
                        kind=="instructions" ? Str("To the agent: instruction files") :

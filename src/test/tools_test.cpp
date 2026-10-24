@@ -171,10 +171,12 @@ static void test_tools(Test *t)
         expect(t, "tooldeny", istr(a, deny), istr(a, (((u32)1<<TOOL_COUNT) - 1) &
                ~((u32)1<<TOOL_READ | (u32)1<<TOOL_GREP | (u32)1<<TOOL_GLOB)));
         expect(t, "tooldeny all but desktop", istr(a, tooldeny("read write edit "
-               "shell grep glob todo_write jobs job_output job_kill task skill")),
+               "shell grep glob todo_write jobs job_output job_kill task skill sessions "
+               "send_message")),
                istr(a, TOOL_OFFMASK|TOOL_PLANMASK));
         expect(t, "tooldeny all", istr(a, tooldeny("read write edit shell grep glob "
-               "todo_write jobs job_output job_kill task desktop skill")),
+               "todo_write jobs job_output job_kill task desktop skill sessions "
+               "send_message")),
                istr(a, TOOL_PLANMASK));
         expect(t, "tooldeny none", istr(a, tooldeny("")), istr(a, ((u32)1<<TOOL_COUNT) - 1));
         expect(t, "unknown for the role", unknowntool(a, "write", deny),
@@ -197,6 +199,25 @@ static void test_tools(Test *t)
         Args tc = parseargs(a, TOOL_TASK, "{\"description\":\"x\"}", EDIT_REPLACE);
         expect(t, "task no prompt", tc.issues.len ? tc.issues[0] : Str{},
                "prompt: required string is missing");
+
+        // send_message: a target and some text, at most 16 KiB of it
+        Args ma = parseargs(a, TOOL_MESSAGE, "{\"to\":\" k1 \",\"text\":\"hi\"}", EDIT_REPLACE);
+        expect(t, "message args", concat(a, concat(a, ma.to, "|"), ma.text), "k1|hi");
+        expect(t, "message no issues", istr(a, ma.issues.len), "0");
+        Args mb = parseargs(a, TOOL_MESSAGE, "{\"to\":\"\",\"text\":\" \"}", EDIT_REPLACE);
+        expect(t, "message empty", concat(a, concat(a, mb.issues[0], "|"), mb.issues[1]),
+               "to: must not be empty|text: must not be empty");
+        Buf big(a, MESSAGE_MAX + 64);
+        print(&big, "{\"to\":\"k\",\"text\":\"");
+        for (iz i = 0; i <= MESSAGE_MAX; i++) {
+            putbyte(&big, 'x');
+        }
+        print(&big, "\"}");
+        Args mc = parseargs(a, TOOL_MESSAGE, finish(&big), EDIT_REPLACE);
+        expect(t, "message too long", mc.issues.len ? mc.issues[0] : Str{},
+               "text: too long: at most 16 KiB");
+        expect(t, "message alias", istr(a, find(unknowntool(a, "sendmessage", 0),
+               "Did you mean \"send_message\"")>0), "1");
     }
 
     // Output cleaning

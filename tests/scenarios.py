@@ -2112,7 +2112,8 @@ def hello_caps(t):
                 {"close.forget", "config.refresh", "file.base64", "desktop",
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
-                 "fork", "answer.always.desktop", "skills", "plan", "queue"} <= set(caps)
+                 "fork", "answer.always.desktop", "skills", "plan", "queue",
+                 "message"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -2648,7 +2649,7 @@ def checkpointed(msgs):
     return len(msgs) > 1 and "<conversation-checkpoint>" in str(msgs[1].get("content"))
 
 
-SMALL = {"_listing": {"meta": {"n_ctx": 24000, "n_ctx_train": 262144}}}
+SMALL = {"_listing": {"meta": {"n_ctx": 25000, "n_ctx_train": 262144}}}
 
 
 @scenario(conf=SMALL, bound=25, alone=True)
@@ -4921,12 +4922,12 @@ def gauge(t):
         a.send("prompt", sid=sid, text="measure")
         end = ended(a, sid, 1)
         at = a.all("attempt", sid)[-1]
-        t.check(at.get("ctx") == 24000 and at.get("compact_at") == 20400 and
+        t.check(at.get("ctx") == 25000 and at.get("compact_at") == 21250 and
                 at.get("tokens", 0) > 500, f"attempt {at}")
-        t.check(end.get("ctx") == 24000 and end.get("compact_at") == 20400 and
+        t.check(end.get("ctx") == 25000 and end.get("compact_at") == 21250 and
                 end.get("tokens", 0) > 500, f"turn.end {end}")
         running = [e for e in a.all("live", sid) if e["state"] in ("waiting", "streaming")]
-        t.check(running and all(e.get("tokens") == at["tokens"] and e.get("ctx") == 24000
+        t.check(running and all(e.get("tokens") == at["tokens"] and e.get("ctx") == 25000
                                 for e in running), f"live {running}")
         t.check(a.close() == 0, "the first exits")
         a = None
@@ -4935,7 +4936,7 @@ def gauge(t):
         o = b.call("open", sid=sid)
         t.check(o.get("ok") == 1, f"open {o}")
         live = b.all("live", sid)[-1]
-        t.check(live.get("ctx") == 24000 and live.get("compact_at") == 20400 and
+        t.check(live.get("ctx") == 25000 and live.get("compact_at") == 21250 and
                 live.get("tokens", 0) > 500, f"live after open {live}")
     finally:
         if a:
@@ -6305,6 +6306,356 @@ def tls_refused(t):
     t.check(not r.all("retry"), f"no retries: {r.all('retry')}")
     t.check(r.elapsed < 5, f"at once: {r.elapsed:.1f} s")
     t.check(srv.tries <= 2, f"tried {srv.tries} times")
+
+
+# Messages between sessions: sessions and send_message, sc_msg_* in
+# fake_provider.py, with the target's sid in the sender's prompt
+
+def msgnew(t, h, model=None, **kw):
+    return h.call("new", cwd=t.work, model=model or t.model, endpoint="fake", **kw)["sid"]
+
+
+def turnend(h, sid, n=None, timeout=20):
+    return h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and
+                  (n is None or e.get("turn") == n), timeout)
+
+
+def sent(h, sid):
+    """The send_message results of a session, in order."""
+    return [e for e in h.all("tool.end", sid) if "to_title" in e or e.get("fail") == "message"]
+
+
+def quiet(h, secs=1.0, timeout=30):
+    """Wait until no turn runs, and none starts for a while."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        n = len(h.events)
+        if h.call("status").get("turns") == 0:
+            time.sleep(secs)
+            if h.call("status").get("turns") == 0 and \
+                    not [e for e in h.events[n:] if e.get("ev") == "turn"]:
+                return
+        time.sleep(0.1)
+    raise Failure("the sessions never went quiet")
+
+
+@scenario(bound=15)
+def msg_busy(t):
+    """A message to a session at work is read at its next step, in the
+    same turn, labelled as another session's, with how to reply."""
+    h = t.headless()
+    try:
+        b = msgnew(t, h, t.model2)
+        h.send("prompt", sid=b, text="be busy")
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == b)
+        a = msgnew(t, h)
+        h.send("prompt", sid=a, text=f"send to: {b}")
+        turnend(h, a)
+        res = sent(h, a)
+        t.check(len(res) == 1 and res[0]["status"] == "ok" and res[0]["to"] == b and
+                res[0]["delivery"] == "busy" and res[0]["to_title"] == "be busy" and
+                "at its next step" in res[0]["text"], f"sent {res}")
+        turnend(h, b)
+        t.check(len(h.all("turn", b)) == 1, "read in its own turn")
+        note = h.all("notice", b)
+        t.check(len(note) == 1 and note[0]["kind"] == "message" and note[0]["from"] == a and
+                note[0]["hop"] == 1 and note[0]["from_title"] == f"send to: {b}", f"notice {note}")
+        text = note[0]["text"]
+        t.check(text.startswith(f"Message from another session, {a}") and
+                "hello 0 from the sender" in text and "not from the user" in text and
+                text.endswith(f"reply with send_message to {a}."), f"text {text!r}")
+        last = t.requests(t.model2)[-1]["body"]["messages"]
+        t.check(last[-2]["role"] == "tool" and last[-1]["content"] == text,
+                f"after the command's result: {last[-2:]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def msg_wake(t):
+    """A message wakes an idle session, its turn via "message" at hop 1;
+    a session in plan mode may send one."""
+    h = t.headless()
+    try:
+        b = msgnew(t, h, t.model2)
+        a = msgnew(t, h, plan=1)
+        h.send("prompt", sid=a, text=f"send to: {b}")
+        turnend(h, b)
+        turn = h.all("turn", b)
+        t.check(len(turn) == 1 and turn[0].get("via") == "message" and turn[0].get("hop") == 1,
+                f"woken {turn}")
+        turnend(h, a)
+        res = sent(h, a)
+        t.check(len(res) == 1 and res[0]["delivery"] == "woke" and
+                "started a turn" in res[0]["text"], f"sent {res}")
+        msgs = t.requests(t.model2)[0]["body"]["messages"]
+        t.check([m["role"] for m in msgs] == ["system", "user"] and
+                MSG_MARK in msgs[1]["content"], f"the notice alone: {msgs}")
+        t.check(not h.all("user", b), "no user record")
+        # The tools are offered, with a line in the rules
+        req = t.requests()[0]["body"]
+        names = [x["function"]["name"] for x in req["tools"]]
+        t.check("sessions" in names and "send_message" in names, f"tools {names}")
+        t.check("Other agents may send you messages" in req["messages"][0]["content"],
+                "the rules say so")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+MSG_MARK = fake_provider.MSG_MARK
+
+
+@scenario(bound=20)
+def msg_roundtrip(t):
+    """A sends, B replies as the notice says, and A reads the reply: in
+    its turn still running, or in a turn the reply starts."""
+    h = t.headless()
+    try:
+        b = msgnew(t, h, t.model2)
+        a = msgnew(t, h)
+        h.send("prompt", sid=a, text=f"send to: {b}")
+        h.wait(lambda e: e.get("ev") == "assistant" and e.get("sid") == a and
+               any(MSG_MARK in x.get("text", "") or "Got back" in x.get("text", "")
+                   for x in e.get("blocks", [])))
+        quiet(h)
+        got = [x["text"] for e in h.all("assistant", a) for x in e["blocks"]
+               if x.get("t") == "text" and x["text"].startswith("Got back")]
+        t.check(got and f"Message from another session, {b}" in got[0] and "pong" in got[0],
+                f"got {got}")
+        rb = sent(h, b)
+        t.check(len(rb) == 1 and rb[0]["to"] == a and rb[0]["status"] == "ok", f"reply {rb}")
+        hops = [e["hop"] for e in h.all("notice") if e.get("kind") == "message"]
+        t.check(hops == [1, 2], f"hops {hops}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=40)
+def msg_pingpong(t):
+    """Two agents that always reply: the message at hop 8 wakes nobody,
+    and its sender is told why; the user's prompt starts the count over."""
+    h = t.headless()
+    try:
+        b = msgnew(t, h, t.model2)
+        a = msgnew(t, h)
+        h.send("prompt", sid=a, text=f"send to: {b}")
+        last = h.wait(lambda e: e.get("ev") == "tool.end" and e.get("hop") == 8)
+        quiet(h)
+        woke = [e["hop"] for e in h.all("turn") if e.get("via") == "message"]
+        t.check(woke and max(woke) < 8, f"woken at hops {woke}")
+        res = sorted(sent(h, a) + sent(h, b), key=lambda e: e["hop"])
+        t.check([e["hop"] for e in res] == list(range(1, 9)), f"one chain {res}")
+        t.check(all(e["delivery"] != "waiting" for e in res[:7]), f"all woken {res}")
+        why = {"waiting": "was not woken", "busy": "Should its turn end first"}
+        t.check(why[last["delivery"]] in last["text"], f"told why: {last}")
+        notes = [e for e in h.all("notice") if e.get("kind") == "message"]
+        t.check([e["hop"] for e in notes] == list(range(1, 8)), f"notices {notes}")
+        t.check("a reply would not wake the sender" in notes[-1]["text"],
+                f"told as it nears the end: {notes[-1]}")
+        # The message left waits for the user's prompt, which resets the count
+        n0 = len(h.events)
+        h.send("prompt", sid=last["to"], text="go on")
+        h.wait(lambda e: e.get("ev") == "tool.end" and e.get("hop") == 8 and e is not last)
+        quiet(h)
+        later = h.events[n0:]
+        hops = [e["hop"] for e in later if e.get("ev") == "notice"]
+        t.check(hops == list(range(0, 8)), f"the waiting message, reset, then on: {hops}")
+        woke = [e["hop"] for e in later if e.get("ev") == "turn" and e.get("via") == "message"]
+        t.check(woke and woke[0] == 1 and max(woke) < 8, f"counted from 0 again: {woke}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def msg_refused(t):
+    """Messages to oneself, an archived session, a subagent of one, an
+    unknown target, an ambiguous title, and a session another process
+    holds are refused, and so is an invalid one; an exact title reaches
+    its session."""
+    h = t.headless()
+    other = None
+    try:
+        arch = msgnew(t, h, t.model2)
+        named = msgnew(t, h, t.model2)
+        twin1 = msgnew(t, h, t.model2)
+        twin2 = msgnew(t, h, t.model2)
+        for sid, title in ((named, "The Named One"), (twin1, "Twin"), (twin2, "Twin")):
+            r = h.call("rename", sid=sid, title=title)
+            t.check(r.get("ok") == 1, f"renamed {r}")
+        r = h.call("archive", sid=arch, on=1)
+        t.check(r.get("ok") == 1, f"archived {r}")
+        other = t.headless()
+        held = other.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        a = msgnew(t, h)
+        targets = [a, arch, "nobody-at-all", "Twin", held, "", "The Named One"]
+        h.send("prompt", sid=a, text="send to: " + " | ".join(targets))
+        turnend(h, a)
+        res = [e for e in h.all("tool.end", a)]
+        t.check(len(res) == 7, f"results {res}")
+        want = ["your own session", "is archived", "no session has the id or title",
+                "2 sessions have that title", "open in another process",
+                "Invalid arguments", None]
+        for e, w in zip(res, want):
+            if w:
+                t.check(e["status"] == "error" and w in e["text"] and
+                        "to" not in e, f"refused, {w}: {e}")
+        last = res[-1]
+        t.check(last["status"] == "ok" and last["to"] == named and
+                last["to_title"] == "The Named One" and last["delivery"] == "woke",
+                f"by its title {last}")
+        turnend(h, named)
+        t.check(not h.all("notice", arch) and not h.all("turn", arch), "nothing archived")
+        t.check(not other.all("notice", held), "nothing to the other process's")
+        t.check([e["fail"] for e in res[:6]] == ["message"] * 5 + ["args"], f"fail {res}")
+    finally:
+        rc = h.close()
+        if other:
+            other.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def msg_parked(t):
+    """A parked target is revived and woken, and so is one only on disk,
+    which a process that ended left; both run unattended."""
+    h = t.headless(env=PARK)
+    try:
+        other = t.headless()
+        gone = other.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        other.send("prompt", sid=gone, text="earlier work")
+        turnend(other, gone)
+        t.check(other.close() == 0, "the other process exits")
+
+        b = msgnew(t, h, t.model2, attended=1)
+        h.send("prompt", sid=b, text="first")
+        turnend(h, b)
+        deadline = time.monotonic() + 5
+        while not (listentry(h, b) or {}).get("parked") and time.monotonic() < deadline:
+            time.sleep(0.2)
+        t.check(listentry(h, b).get("parked") == 1, "parked")
+        t.check(listentry(h, gone).get("state") == "closed", "on disk only")
+
+        a = msgnew(t, h)
+        h.send("prompt", sid=a, text=f"send to: {b} | {gone}")
+        for sid in (b, gone):
+            end = turnend(h, sid, 2)
+            t.check(end["why"] == "done", f"woken {end}")
+            turn = h.all("turn", sid)[-1]
+            t.check(turn.get("via") == "message" and turn.get("hop") == 1, f"turn {turn}")
+        turnend(h, a)
+        res = sent(h, a)
+        t.check([e["delivery"] for e in res] == ["woke", "woke"], f"sent {res}")
+        msgs = t.requests(t.model2)[-1]["body"]["messages"]
+        said = [m["role"] for m in msgs if m["role"] != "system"]
+        t.check(said == ["user", "assistant", "user"] and MSG_MARK in msgs[-1]["content"],
+                f"its history, then the message: {said}")
+        seqs = [e["seq"] for e in h.events if e.get("sid") == b and "seq" in e]
+        t.check(seqs == sorted(seqs) and len(seqs) == len(set(seqs)), f"seq {seqs}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def msg_siblings(t):
+    """Two subagents of one parent: one finds the other with sessions and
+    sends it a message, which it reads while at work; the parent's
+    sessions lists its subagents as children, and another session as
+    other, but not the archived one."""
+    h = t.headless()
+    try:
+        u = msgnew(t, h, t.model2)
+        h.call("rename", sid=u, title="Unrelated")
+        arch = msgnew(t, h, t.model2)
+        h.call("archive", sid=arch, on=1)
+        a = msgnew(t, h)
+        h.send("prompt", sid=a, text="go")
+        turnend(h, a)
+        kids = {e["sid"]: e for e in h.all("session") if e.get("parent") == a}
+        t.check(len(kids) == 2, f"two subagents {kids}")
+        sender = next(s for s in kids if h.all("user", s)[0]["text"] == "You send.")
+        receiver = next(s for s in kids if s != sender)
+        listing = h.all("tool.end", sender)[0]["text"]
+        t.check(listing.startswith(f"You are session {sender} (\"Send\").") and
+                f"{receiver}  busy  sibling  " in listing and
+                f"{a}  busy  parent  " in listing and f"{u}  idle  other  " in listing and
+                arch not in listing, f"the sender's listing {listing!r}")
+        res = sent(h, sender)
+        t.check(len(res) == 1 and res[0]["to"] == receiver and res[0]["delivery"] == "busy",
+                f"sent {res}")
+        note = h.all("notice", receiver)
+        t.check(len(note) == 1 and note[0]["from"] == sender and note[0]["hop"] == 1, f"{note}")
+        ends = h.all("tool.end", a)
+        reports = " ".join(e["text"] for e in ends)
+        t.check("Receiver report: Message from another session" in reports and
+                "hi sibling" in reports, f"the receiver read it: {reports!r}")
+        mine = ends[-1]["text"]
+        t.check(all(f"{k}  idle  child  " in mine for k in kids) and
+                f"{u}  idle  other  " in mine, f"the parent's listing {mine!r}")
+        t.check(mine.index("child") < mine.index("other"), "relatives first")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def msg_rate(t):
+    """A turn sends at most 20 messages; the target reads them all, the
+    ones after its first step in a turn of their own."""
+    h = t.headless()
+    try:
+        b = msgnew(t, h, t.model2)
+        a = msgnew(t, h)
+        h.send("prompt", sid=a, text=f"send to: {b}")
+        turnend(h, a)
+        res = h.all("tool.end", a)
+        t.check(len(res) == 21, f"21 results {len(res)}")
+        t.check(all(e["status"] == "ok" for e in res[:20]), "20 sent")
+        t.check(res[20]["status"] == "error" and "at most 20" in res[20]["text"] and
+                res[20].get("fail") == "message", f"the 21st {res[20]}")
+        quiet(h)
+        note = h.all("notice", b)
+        t.check(len(note) == 20, f"20 notices {len(note)}")
+        t.check(all(e.get("via") == "message" and e.get("hop") == 1
+                    for e in h.all("turn", b)), "woken by them")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def msg_ask(t):
+    """A message to a session waiting for the user's answer leaves the
+    ask alone, unlike a steer: it is read after the answer."""
+    h = t.headless()
+    try:
+        b = msgnew(t, h, t.model2, attended=1)
+        h.send("prompt", sid=b, text="write outside")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == b)
+        a = msgnew(t, h)
+        h.send("prompt", sid=a, text=f"send to: {b}")
+        turnend(h, a)
+        res = sent(h, a)
+        t.check(len(res) == 1 and res[0]["delivery"] == "busy" and
+                "waits for the user to answer" in res[0]["text"], f"sent {res}")
+        time.sleep(0.3)
+        t.check(not h.all("answer", b) and not h.all("notice", b), "the ask still waits")
+        r = h.call("answer", sid=b, req=ask["req"], decision="allow")
+        t.check(r.get("ok") == 1, f"answered {r}")
+        turnend(h, b)
+        ans = h.all("answer", b)
+        t.check(len(ans) == 1 and ans[0]["by"] == "user", f"answered by the user {ans}")
+        t.check(outside_file(t) == "outside\n", "the write ran")
+        msgs = t.requests(t.model2)[-1]["body"]["messages"]
+        t.check(msgs[-2]["role"] == "tool" and MSG_MARK in msgs[-1]["content"],
+                f"read after the answer {msgs[-2:]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 # M7: the desktop tool, with tests/fake_desktop.py as the helper (on

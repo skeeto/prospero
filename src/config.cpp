@@ -356,9 +356,9 @@ static CfgKey cfgschema[] = {
      "else the parent's own"},
     {"role", "tools", CFG_LIST,
      "read write edit shell grep glob todo_write jobs job_output job_kill task "
-     "skill", {},
+     "skill sessions send_message", {},
      "read write edit shell grep glob todo_write jobs job_output job_kill task "
-     "desktop skill",
+     "desktop skill sessions send_message",
      "role", "Tools the role may use; desktop also needs [desktop] offer"},
 
     {"guard", "roots", CFG_PATHS, "", {}, {}, "guard",

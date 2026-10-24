@@ -3692,6 +3692,130 @@ sc_import_hostile = sc_import_roundtrip
 sc_import_refused = sc_import_roundtrip
 
 
+# Messages between sessions: a sender sends to each target its prompt
+# names after "send to: ", one a step; a replier answers each message it
+# reads with a message back to its sender, as the notice says to; a
+# reader reports the last message it read.
+
+MSG_MARK = "Message from another session"
+MSG_REPLY = re.compile(r"reply with send_message to (\S+?)\.(?:\s|$)")
+
+
+def msg_last(req):
+    """The last message, if it is a message notice: its text, else None."""
+    msgs = req.get("messages", [])
+    last = str(msgs[-1].get("content", "")) if msgs else ""
+    return last if msgs and msgs[-1].get("role") == "user" and MSG_MARK in last else None
+
+
+def msg_targets(req):
+    p = task_prompt(req)
+    return p.split("send to: ", 1)[1].split(" | ") if "send to: " in p else []
+
+
+def sc_msg_send(model, n, req):
+    k = step(req)
+    targets = msg_targets(req)
+    note = msg_last(req)
+    if note is not None:
+        yield from answer(model, "Sender read: " + note)
+    elif k < len(targets):
+        yield from tool(model, n, "send_message", {"to": targets[k],
+                                                   "text": f"hello {k} from the sender"})
+    else:
+        yield from answer(model, "Sent: " + " | ".join(tool_results(req)))
+
+
+def sc_msg_read(model, n, req):
+    # Busy in a command at first when told to be, then what it read
+    if "be busy" in task_prompt(req) and step(req) == 0:
+        yield from tool(model, n, "shell", {"command": "sleep 2"})
+    else:
+        yield from answer(model, "Read: " + last_user(req))
+
+
+def sc_msg_reply(model, n, req):
+    note = msg_last(req)
+    targets = msg_targets(req)
+    if note is not None:
+        to = MSG_REPLY.search(note).group(1)
+        yield from tool(model, n, "send_message", {"to": to, "text": f"pong {n}"})
+    elif step(req) == 0 and targets:
+        yield from tool(model, n, "send_message", {"to": targets[0], "text": "ping"})
+    else:
+        yield from answer(model, f"Replied {n}.")
+
+
+sc_msg_busy = sc_msg_wake = sc_msg_refused = sc_msg_parked = sc_msg_ask = sc_msg_send
+sc_msg_busy_b = sc_msg_wake_b = sc_msg_parked_b = sc_msg_refused_b = sc_msg_read
+sc_msg_pingpong = sc_msg_pingpong_b = sc_msg_reply
+
+
+def sc_msg_roundtrip(model, n, req):
+    # Ping the target, then report the answer it sends back
+    note = msg_last(req)
+    if note is not None:
+        yield from answer(model, "Got back: " + note)
+    elif step(req) == 0:
+        yield from tool(model, n, "send_message", {"to": msg_targets(req)[0], "text": "ping"})
+    else:
+        yield from answer(model, "Waiting for the answer.")
+
+
+sc_msg_roundtrip_b = sc_msg_reply
+
+
+def sc_msg_rate(model, n, req):
+    if step(req) == 0:
+        to = msg_targets(req)[0]
+        yield from calls(model, n, [("send_message", {"to": to, "text": f"m{i}"})
+                                    for i in range(21)])
+    else:
+        yield from answer(model, "Sent many.")
+
+
+sc_msg_rate_b = sc_msg_read
+
+
+def sc_msg_ask_b(model, n, req):
+    # Asks to write outside, and reads the message once answered
+    if step(req) == 0:
+        yield from tool(model, n, "write", {"path": "../asked.txt", "content": "outside"})
+    else:
+        yield from answer(model, "Read: " + last_user(req))
+
+
+def sc_msg_siblings(model, n, req):
+    # Two subagents, one sending to the other; then the sessions it sees
+    k = step(req)
+    if k == 0:
+        b = second(model)
+        yield from calls(model, n, [
+            ("task", {"description": "Send", "prompt": "You send.", "model": b}),
+            ("task", {"description": "Receive", "prompt": "You receive.", "model": b})])
+    elif k == 1:
+        yield from tool(model, n, "sessions", {})
+    else:
+        yield from answer(model, "Parent done.")
+
+
+def sc_msg_siblings_b(model, n, req):
+    k = step(req)
+    if "You send." in task_prompt(req):
+        if k == 0:
+            yield from tool(model, n, "sessions", {})
+        elif k == 1:
+            lines = [l for l in tool_results(req)[0].splitlines() if "  sibling  " in l]
+            yield from tool(model, n, "send_message", {"to": lines[0].split()[0],
+                                                       "text": "hi sibling"})
+        else:
+            yield from answer(model, "Sender report: " + tool_results(req)[0])
+    elif k == 0:
+        yield from tool(model, n, "shell", {"command": "sleep 2"})
+    else:
+        yield from answer(model, "Receiver report: " + last_user(req))
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 

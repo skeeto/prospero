@@ -269,7 +269,7 @@ static void testcfgvalidate(Test *t)
         "ignored\n"
         "/c/prospero.ini:20:9: warning: unknown value \"fly\", expected any "
         "of: read, write, edit, shell, grep, glob, todo_write, jobs, "
-        "job_output, job_kill, task, desktop, skill\n"
+        "job_output, job_kill, task, desktop, skill, sessions, send_message\n"
         "/c/prospero.ini:21:2: warning: unknown section kind \"provider\", "
         "expected endpoint, model, role, guard, tools, instructions, skills, "
         "ui, desktop, host or remote\n"
@@ -856,7 +856,7 @@ static void testcfgjson(Test *t)
     expect(t, "json.schema.local", jsonstr(jsonget(ft, "local")), "1800");
     iz    ti    = cfgkey("role", "tools") - cfgschema;
     Json *tools = jsonget(jsonat(schema, ti), "choices");
-    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "13");
+    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "15");
     expect(t, "json.kinds", istr(&a, jsonlen(jsonget(j, "kinds"))),
            istr(&a, countof(cfgkinds)));
     Buf hb(&a, 256);
