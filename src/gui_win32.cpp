@@ -96,9 +96,9 @@ extern "C" int       w32gui_save(void *, unsigned short const *title,
                                  void (*done)(void *ctx, unsigned short const *path),
                                  void const *ctx, int ctxlen);
 // The open dialog likewise, for a session's raw log (*.jsonl)
-extern "C" int       w32gui_open(void *, unsigned short const *title,
-                                 void (*done)(void *ctx, unsigned short const *path),
-                                 void const *ctx, int ctxlen);
+extern "C" int       w32gui_openfile(void *, unsigned short const *title,
+                                     void (*done)(void *ctx, unsigned short const *path),
+                                     void const *ctx, int ctxlen);
 extern "C" int       w32gui_reveal(unsigned short const *dir);
 extern "C" void      w32gui_letfront(unsigned long pid);  // AllowSetForegroundWindow
 
@@ -1085,9 +1085,9 @@ extern "C" int w32gui_save(void *p, unsigned short const *title,
     return w32dialog(p, title, name, done, ctx, ctxlen, 0);
 }
 
-extern "C" int w32gui_open(void *p, unsigned short const *title,
-                           void (*done)(void *, unsigned short const *),
-                           void const *ctx, int ctxlen)
+extern "C" int w32gui_openfile(void *p, unsigned short const *title,
+                               void (*done)(void *, unsigned short const *),
+                               void const *ctx, int ctxlen)
 {
     return w32dialog(p, title, (unsigned short const *)L"", done, ctx, ctxlen, 1);
 }
@@ -1352,8 +1352,8 @@ static b32 os_guisave(Os *os, Arena scratch, Str title, Str name, Mailbox *mb,
 static b32 os_guiopenfile(Os *os, Arena scratch, Str title, Mailbox *mb, u32 type, u64 id)
 {
     W32SaveCtx c = {mb, type, id};
-    return w32gui_open(os->gui, (unsigned short *)towide(&scratch, title).data,
-                       savedone, &c, (int)sizeof(c));
+    return w32gui_openfile(os->gui, (unsigned short *)towide(&scratch, title).data,
+                           savedone, &c, (int)sizeof(c));
 }
 
 static u32 os_guilimits(Os *)
