@@ -2184,7 +2184,7 @@ def hello_caps(t):
         cmds = hello.get("cmds", [])
         want = ["hello", "list", "new", "open", "close", "prompt", "steer", "cancel",
                 "answer", "config.get", "config.set", "quit", "rewind", "job.kill",
-                "status", "stop", "file"] + m8 + ["skills", "mode", "unqueue"]
+                "status", "stop", "file"] + m8 + ["skills", "mode", "unqueue", "dir"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -2192,7 +2192,7 @@ def hello_caps(t):
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
-                 "message", "bypass", "nofolder"} <= set(caps)
+                 "message", "bypass", "nofolder", "dir"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -6001,6 +6001,79 @@ def nofolder(t):
                 irec.get("nofolder") == 1, f"imported: {irec}")
         t.check(t.host.read(t.host.join(sessions, imp, "work", "notes.txt")) is None,
                 "an import's folder starts empty")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
+def dir_listing(t):
+    """dir {path, dirs?}: a directory's entries on the engine's machine,
+    for completing a path typed for it: files and directories, a link to
+    a directory one (POSIX), only directories with dirs; ~ in the home
+    directory, kept as typed in the reply; a missing directory, a file,
+    and a relative path refused; at most 2000 entries, with more."""
+    env = skillhome(t)
+    home = env["HOME"]
+    base = t.host.join(home, "pick")
+    t.host.mkdir(t.host.join(base, "alpha"))
+    t.host.mkdir(t.host.join(base, "Beta"))
+    t.host.write(t.host.join(base, "notes.txt"), "n\n")
+    want = {"alpha": 1, "Beta": 1, "notes.txt": 0}
+    if not t.host.windows:
+        target = t.host.join(t.base, "elsewhere")
+        t.host.mkdir(target)
+        os.symlink(target, t.host.join(base, "linked"))
+        os.symlink(t.host.join(t.base, "missing"), t.host.join(base, "broken"))
+        os.symlink(t.host.join(base, "notes.txt"), t.host.join(base, "notelink"))
+        want.update(linked=1, notelink=0)
+    big = t.host.join(t.base, "big")
+    t.host.bulk(big, {f"f{i:04}": "" for i in range(2001)})
+    t.host.mkdir(t.host.join(big, "sub"))
+    h = t.headless(env=env)
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        t.check("dir" in h.all("hello")[0].get("caps", []), "the dir cap")
+
+        def entries(r):
+            return {e["name"]: e["dir"] for e in r.get("entries", [])}
+
+        r = h.call("dir", path=base)
+        t.check(r.get("ok") == 1 and r.get("path") == base and r.get("more") == 0,
+                f"dir: {r}")
+        t.check(entries(r) == want, f"entries: {entries(r)}, not {want}")
+        r = h.call("dir", path=base + "/", dirs=1)
+        dirs = {k: v for k, v in want.items() if v}
+        t.check(r.get("ok") == 1 and entries(r) == dirs, f"dirs only: {r}")
+        if t.host.windows:
+            r = h.call("dir", path=base.replace("/", "\\") + "\\", dirs=1)
+            t.check(r.get("ok") == 1 and entries(r) == dirs, f"with backslashes: {r}")
+
+        # ~ is the home directory, the path kept as typed
+        r = h.call("dir", path="~/pick", dirs=1)
+        t.check(r.get("ok") == 1 and r.get("path") == "~/pick" and entries(r) == dirs,
+                f"~/pick: {r}")
+        r = h.call("dir", path="~", dirs=1)
+        t.check(r.get("ok") == 1 and "pick" in entries(r), f"~: {r}")
+        r = h.call("dir", path="~nobody/x")
+        t.check(r.get("ok") == 0 and "~user" in r.get("err", ""), f"~user: {r}")
+
+        # Refused
+        for path, err in [(t.host.join(base, "nothere"), "no such directory"),
+                          (t.host.join(base, "notes.txt"), "not a directory"),
+                          ("pick/alpha", "the path must be absolute, or begin with ~"),
+                          ("", "path is required")]:
+            r = h.call("dir", path=path)
+            t.check(r.get("ok") == 0 and r.get("err") == err, f"{path!r}: {r}")
+
+        # The cap
+        r = h.call("dir", path=big)
+        got = entries(r)
+        t.check(r.get("ok") == 1 and len(got) == 2000 and r.get("more") == 1,
+                f"capped: {len(got)} entries, more {r.get('more')}")
+        r = h.call("dir", path=big, dirs=1)
+        t.check(r.get("ok") == 1 and entries(r) == {"sub": 1} and r.get("more") == 0,
+                f"its one directory: {r}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

@@ -811,6 +811,79 @@ static Dirent *os_list(Os *, Arena *a, Str path)
     return head;
 }
 
+static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max)
+{
+    Listing r = {};
+    if (!path.len || hasnul(path)) {
+        return r;
+    }
+
+    Arena tmp = *a;
+    Str16 dir = widepath(&tmp, path);
+    iz    len = dir.len;
+    c16  *pat = alloc<c16>(&tmp, len + 2 + 260);  // and for a name (FindData)
+    copybytes(pat, dir.data, len*(iz)sizeof(c16));
+    if (!len || (pat[len-1]!='\\' && pat[len-1]!='/')) {
+        pat[len++] = '\\';
+    }
+    pat[len]   = '*';
+    pat[len+1] = 0;
+
+    FindData fd = {};
+    uz h = FindFirstFileExW(
+        pat, FindExInfoBasic, &fd, FindExSearchNameMatch, 0,
+        FIND_FIRST_EX_LARGE_FETCH
+    );
+    if (h==INVALID_HANDLE_VALUE && GetLastError()==ERROR_INVALID_PARAMETER) {
+        h = FindFirstFileExW(
+            pat, FindExInfoStandard, &fd, FindExSearchNameMatch, 0, 0
+        );
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        return r;
+    }
+    r.ok = 1;
+    do {
+        c16 *name = fd.name;
+        if (name[0]=='.' && (!name[1] || (name[1]=='.' && !name[2]))) {
+            continue;
+        }
+        if (fd.attr & FILE_ATTRIBUTE_DEVICE) {
+            continue;
+        }
+        iz namelen = 0;
+        for (; namelen<countof(fd.name) && name[namelen]; namelen++) {}
+        b32 isdir = !!(fd.attr & FILE_ATTRIBUTE_DIRECTORY);
+        if (fd.attr&FILE_ATTRIBUTE_REPARSE_POINT &&
+                fd.reparsetag&IO_REPARSE_TAG_NAME_SURROGATE) {
+            // A symlink or junction: what it names, if anything
+            copybytes(pat+len, name, (namelen+1)*(iz)sizeof(c16));
+            i32 type = statwide(pat).type;
+            if (type==STAT_MISSING || type==STAT_OTHER) {
+                continue;
+            }
+            isdir = type == STAT_DIR;
+        }
+        if (dirs && !isdir) {
+            continue;
+        }
+        if (r.len == max) {
+            r.more = 1;
+            break;
+        }
+        Dirent *d = alloc<Dirent>(a);
+        d->name  = fromwide(a, name, namelen);
+        d->size  = (i64)fd.sizehi<<32 | fd.sizelo;
+        d->mtime = unixms(fd.mtime);
+        d->isdir = isdir;
+        d->next  = r.head;
+        r.head = d;
+        r.len++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return r;
+}
+
 static Stat os_stat(Os *, Arena scratch, Str path)
 {
     if (hasnul(path)) {

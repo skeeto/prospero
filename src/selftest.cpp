@@ -657,6 +657,16 @@ static void testfiles(Selftest *t, Arena scratch, Str dir)
     Str want = "a.txt:9 big.bin:3145735 empty:0 "
                "na\xc3\xafve-\xe6\x97\xa5\xe6\x9c\xac.txt:3 sub/";
     check(t, listshow(os, &a, dir)==want, "os_list");
+    a = scratch;
+    Listing all  = os_listall(os, &a, dir, 0, 100);
+    Listing dirs = os_listall(os, &a, dir, 1, 100);
+    Listing two  = os_listall(os, &a, dir, 0, 2);
+    check(t, all.ok && all.len==5 && !all.more, "os_listall");
+    check(t, dirs.ok && dirs.len==1 && dirs.head->name=="sub" && dirs.head->isdir,
+          "os_listall of directories");
+    check(t, two.ok && two.len==2 && two.more, "os_listall up to a maximum");
+    check(t, !os_listall(os, &a, gone, 0, 100).ok, "os_listall of a missing directory");
+    check(t, !os_listall(os, &a, fa, 0, 100).ok, "os_listall of a file");
 
     // Times are Unix epoch milliseconds
     Stat s   = os_stat(os, scratch, fa);

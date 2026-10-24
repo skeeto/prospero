@@ -64,6 +64,13 @@ struct Dirent {
     b32     isdir;
 };
 
+struct Listing {
+    Dirent *head;
+    iz      len;
+    b32     ok;    // the directory could be read
+    b32     more;  // entries past max were left out
+};
+
 enum {
     READ_OK,
     READ_NOTFOUND,
@@ -101,6 +108,11 @@ static b32     os_write(Os *, Arena, Str path, Str data);
 static b32     os_mkdirs(Os *, Arena, Str path);
 // List a directory, excluding "." and "..", symlinks, and special files.
 static Dirent *os_list(Os *, Arena *, Str path);
+// List a directory for a person to pick from (path completion): as
+// os_list, but symlinks are what they name, a link to a directory one
+// too, only directories with dirs, and at most max entries, in no
+// particular order. Broken links are left out.
+static Listing os_listall(Os *, Arena *, Str path, b32 dirs, iz max);
 // Type, size, and modification time of a path, following symlinks.
 static Stat    os_stat(Os *, Arena, Str path);
 // Rename a file, replacing any existing target.

@@ -123,6 +123,8 @@ enum : i64 {
     SNAPSHOT_MAX = 256 << 10,     // bytes of text in a snapshot
     QUEUE_SHOW   = 4 << 10,       // bytes of a queued message a queue shows
     FILECMD_MAX  = 1 << 20,       // bytes of a file a file command gives
+    DIRCMD_MAX   = 2000,          // entries a dir command gives
+    DIRCMD_BYTES = 256 << 10,     // and bytes of their names
     PARK_IDLE    = 7*60*SEC,      // idle this long, a session is parked
     TASK_SOFT    = 200,           // a subagent's requests, by default
     HOP_MAX      = 8,             // messages since user input that wake
@@ -9835,6 +9837,67 @@ static void cmdfile(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     emit(e, evend(&w));
 }
 
+// dir {path, dirs?}: the entries of a directory on this machine, for a
+// frontend completing a path typed for it, as the new session dialog's
+// working directory: each {name, dir}, dir 1 for a directory or a link
+// to one, and with dirs only those. A leading ~ is the home directory
+// (tildepath), and a relative path is refused, as relative to nothing
+// the user knows. At most DIRCMD_MAX entries and DIRCMD_BYTES of names,
+// fewer where the frontend's mailbox could not take them, in no order,
+// with more:1 if any were left out. The reply's path is as given.
+static void cmddir(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Os      *os   = e->os;
+    Str      path = jsonstr(jsonget(j, "path"));
+    b32      dirs = jsonflag(jsonget(j, "dirs"), 0);
+    HomePath hp   = tildepath(&scratch, path, e->home, HOST_WINDOWS);
+    if (!path.len) {
+        reply(e, scratch, id, 0, "path is required", {});
+        return;
+    } else if (hp.err.len) {
+        reply(e, scratch, id, 0, hp.err, {});
+        return;
+    } else if (!pathroot(hp.path, HOST_WINDOWS)) {
+        reply(e, scratch, id, 0, "the path must be absolute, or begin with ~", {});
+        return;
+    }
+    Listing l = os_listall(os, &scratch, hp.path, dirs, DIRCMD_MAX);
+    if (!l.ok) {
+        i32 type = os_stat(os, scratch, hp.path).type;
+        reply(e, scratch, id, 0, type==STAT_MISSING ? Str("no such directory") :
+                                 type!=STAT_DIR     ? Str("not a directory")   :
+                                                      Str("cannot list the directory"), {});
+        return;
+    }
+
+    // Every byte of a name may be escaped
+    iz budget = mailmax(e->out) / 8;
+    budget = budget<(iz)DIRCMD_BYTES ? budget : (iz)DIRCMD_BYTES;
+    Buf   b(&scratch, 256 + 6*budget + 32*l.len);
+    EvOut w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "path", path);
+    putkey(&w.json, "entries");
+    putarray(&w.json);
+    b32 more = l.more;
+    iz  used = 0;
+    for (Dirent *d = l.head; d; d = d->next) {
+        if (used+d->name.len > budget) {
+            more = 1;
+            break;
+        }
+        used += d->name.len;
+        putobject(&w.json);
+        putstrkey(&w.json, "name", d->name);
+        putintkey(&w.json, "dir", d->isdir);
+        putend(&w.json);
+    }
+    putend(&w.json);
+    putintkey(&w.json, "more", more);
+    emit(e, evend(&w));
+}
+
 // An entry, then its subagents under it, each with its depth there.
 static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 depth)
 {
@@ -11237,6 +11300,9 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_MODEL:
         cmdmodel(e, scratch, id, j);
+        return;
+    case CMD_DIR:
+        cmddir(e, scratch, id, j);
         return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});

@@ -173,6 +173,49 @@ static Dirent *os_list(Os *os, Arena *a, Str path)
     return head;
 }
 
+// Links listed as what they name, through os_realpath.
+static Listing os_listall(Os *os, Arena *a, Str path, b32 dirs, iz max)
+{
+    Listing r = {};
+    VFile  *d = vfind(os, path, 0);
+    r.ok = d && d->exists && d->isdir;
+    for (Dirent *e = r.ok ? os_list(os, a, path) : 0; e; e = e->next) {
+        if (dirs && !e->isdir) {
+            continue;
+        } else if (r.len == max) {
+            r.more = 1;
+            return r;
+        }
+        Dirent *c = alloc<Dirent>(a);
+        *c = *e;
+        c->next = r.head;
+        r.head  = c;
+        r.len++;
+    }
+    for (VLink *l = r.ok ? os->links : 0; l; l = l->next) {
+        Str f = l->from;
+        if (f.len<=path.len+1 || !startswith(f, path) || f[path.len]!='/' ||
+                cut(cuthead(f, path.len+1), '/').ok) {
+            continue;
+        }
+        Str    real = os_realpath(os, a, f);
+        VFile *t    = real.data ? vfind(os, real, 0) : 0;
+        if (!t || (dirs && !t->isdir)) {
+            continue;
+        } else if (r.len == max) {
+            r.more = 1;
+            return r;
+        }
+        Dirent *c = alloc<Dirent>(a);
+        c->name  = cuthead(f, path.len+1);
+        c->isdir = t->isdir;
+        c->next  = r.head;
+        r.head   = c;
+        r.len++;
+    }
+    return r;
+}
+
 static Stat os_stat(Os *os, Arena, Str path)
 {
     Stat   s = {};

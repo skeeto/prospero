@@ -145,6 +145,7 @@ enum : i32 {
     CMD_SKILLS,  // a session's skills, for /name
     CMD_MODE,    // plan mode, Bypass mode, or neither
     CMD_UNQUEUE, // withdraw a queued message not yet taken in
+    CMD_DIR,     // a directory's entries, for completing a path typed
     CMD_COUNT,
 };
 
@@ -154,7 +155,7 @@ static Str cmdnames[] = {
     "job.kill", "status", "stop", "file", "rename", "delete", "archive",
     "group", "fork", "compact", "model", "draft", "upload", "import",
     "skills", "mode",
-    "unqueue",
+    "unqueue", "dir",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -195,6 +196,7 @@ static Str capnames[] = {
                        // and answers by "bypass"
     "nofolder",        // new and import {nofolder}: a folder of the session's
                        // own, and nofolder in its session record and list
+    "dir",             // dir, a directory's entries on the engine's machine
 };
 
 static Str evname(i32 ev)

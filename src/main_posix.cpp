@@ -407,6 +407,53 @@ static Dirent *os_list(Os *, Arena *a, Str path)
     return head;
 }
 
+static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max)
+{
+    Listing r = {};
+    if (hasnul(path)) {
+        return r;
+    }
+    Arena tmp = *a;
+    i32   fd  = open(cstr(&tmp, path), O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if (fd < 0) {
+        return r;
+    }
+    DIR *dir = fdopendir(fd);
+    if (!dir) {
+        close(fd);
+        return r;
+    }
+    r.ok = 1;
+    for (struct dirent *e; (e = readdir(dir));) {
+        Str name = {(u8 *)e->d_name, 0};
+        while (name.data[name.len]) name.len++;
+        if (name == "." || name == ".." || (dirs && e->d_type==DT_REG)) {
+            continue;
+        }
+        struct stat st;
+        if (fstatat(fd, e->d_name, &st, 0)) {
+            continue;  // a broken link
+        }
+        if (!S_ISDIR(st.st_mode) && (dirs || !S_ISREG(st.st_mode))) {
+            continue;
+        }
+        if (r.len == max) {
+            r.more = 1;
+            break;
+        }
+        Dirent *d = alloc<Dirent>(a);
+        d->name  = clone(a, name);
+        d->size  = (i64)st.st_size;
+        d->mtime = mtimems(&st);
+        d->isdir = S_ISDIR(st.st_mode);
+        d->next  = r.head;
+        r.head = d;
+        r.len++;
+    }
+    closedir(dir);  // also closes fd
+    return r;
+}
+
 static Stat os_stat(Os *, Arena scratch, Str path)
 {
     Stat r = {};
