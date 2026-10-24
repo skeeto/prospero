@@ -1145,6 +1145,103 @@ def connect_local(t):
     t.check(newpid and newpid[0] != pid, "a new host runs on")
 
 
+def exportlog(sid, pad):
+    """A raw log as another machine exported it: a turn, then pad notes
+    of 500 kB, so that an upload of 512 KiB parts takes pad of them."""
+    recs = [
+        {"ev": "session", "proto": 0, "version": "0.0.0", "cwd": "/nowhere/else",
+         "role": "", "model": "elsewhere", "endpoint": "http://192.0.2.1/",
+         "roots": ["/"]},
+        {"ev": "user", "text": "Hello from elsewhere.", "via": "prompt"},
+        {"ev": "turn", "n": 1},
+        {"ev": "assistant", "blocks": [{"t": "text", "text": "Hi there."}]},
+        {"ev": "turn.end", "turn": 1, "why": "done"},
+        {"ev": "title", "text": "Elsewhere", "by": "auto"},
+    ] + [{"ev": "note", "level": "info", "text": f"{i}" * 500000} for i in range(pad)]
+    out = ""
+    for seq, r in enumerate(recs, 1):
+        out += json.dumps(dict({"sid": sid, "seq": seq, "ts": seq}, **r)) + "\n"
+    return out.encode()
+
+
+def importthrough(t, c, cwd, timeout=30):
+    """Upload a log from elsewhere through a client library's link, in
+    parts as large as a part may be, import it there, open it and go on."""
+    old = "20260101-000000-else"
+    data = exportlog(old, 3)
+    token, off, parts = None, 0, 0
+    while off < len(data):
+        chunk = data[off:off + (1 << 19)]
+        args = {"data": base64.b64encode(chunk).decode(), "off": off}
+        if token:
+            args["token"] = token
+        if off + len(chunk) == len(data):
+            args["done"] = 1
+        r = c.call("upload", timeout=timeout, **args)
+        t.check(r.get("ok") == 1 and r.get("off") == off + len(chunk), f"upload {off}: {r}")
+        token, off, parts = r["token"], r["off"], parts + 1
+    t.check(parts == 3, f"in {parts} parts")
+    r = c.call("import", token=token, cwd=cwd, timeout=timeout)
+    sid = r.get("sid")
+    t.check(r.get("ok") == 1 and r.get("from") == old and sid and sid != old,
+            f"import: {r}")
+    o = c.call("open", sid=sid, timeout=timeout)
+    t.check(o.get("ok") == 1 and o.get("readonly") == 0, f"open: {o}")
+    first = c.wait(lambda r: r.get("ev") == "session" and r.get("sid") == sid,
+                   what="its session record")
+    t.check(first.get("imported_from") == old and "roots" not in first and
+            first.get("cwd") and first.get("cwd") != "/nowhere/else", f"session: {first}")
+    p = c.call("prompt", sid=sid, text="more", timeout=timeout)
+    t.check(p.get("ok") == 1, f"prompt: {p}")
+    c.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid and
+           r.get("turn") == 2, what="its turn 2", timeout=60)
+    t.check(finaltext(c.records, sid), "an answer")
+    titles = [r.get("text") for r in c.records if r.get("ev") == "title" and
+              r.get("sid") == sid]
+    t.check("Elsewhere (imported)" in titles, f"titled: {titles}")
+    seqs = [r["seq"] for r in c.records if r.get("sid") == sid and "seq" in r]
+    t.check(seqs == sorted(set(seqs)), f"no record twice: {seqs}")
+    return sid
+
+
+@scenario
+def import_host(t):
+    """A raw log from elsewhere imported through this machine's host, by
+    the client library, in parts near its command limit."""
+    c = connect(t, ["--local", "--state", t.state, "-c", t.config])
+    up = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
+    t.check("import" in up.get("caps", []) and
+            {"upload", "import"} <= set(up.get("cmds", [])), f"up: {up}")
+    sid = importthrough(t, c, t.work)
+    t.check(t.log(sid)[0].startswith('{"sid":"' + sid), "its log")
+    rc = c.close()
+    t.check(rc == 0, f"connect exit {rc}")
+
+
+@scenario
+def ssh_import(t):
+    """connect --ssh to a real host: a raw log from this machine
+    imported there, and continued."""
+    if not t.args.ssh:
+        return "skip"
+    a = t.args
+    rstate = f"{a.remote_root}/state-{t.nonce}"
+    rconf = f"{a.remote_root}/prospero-{t.nonce}.ini"
+    remote_write(a, rconf, open(t.config).read().replace(a.url, a.remote_url))
+    try:
+        c = connect(t, ["--ssh", a.ssh, "--path", a.remote_prospero,
+                        "--remote-state", rstate, "--remote-config", rconf,
+                        "--state", os.path.join(t.root, "local")])
+        c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up",
+               timeout=60)
+        importthrough(t, c, a.remote_work, timeout=120)
+        q = c.call("quit", timeout=30)
+        t.check(q.get("ok") == 1, f"quit {q}")
+        t.check(c.close(timeout=30) == 0, "connect exits 0")
+    finally:
+        remote_sh(a, f"rm -rf {rstate} {rconf}")
+
+
 @scenario
 def remote_option(t):
     """A remote's path that ssh would take for an option: ignored from an

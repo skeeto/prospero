@@ -1865,7 +1865,7 @@ def hello_caps(t):
         hello = hello[0]
         t.check(hello.get("proto") == 0 and hello.get("version"), f"hello: {hello}")
         m8 = ["rename", "delete", "archive", "group", "fork", "compact", "model",
-              "draft"]
+              "draft", "upload", "import"]
         cmds = hello.get("cmds", [])
         want = ["hello", "list", "new", "open", "close", "prompt", "steer", "cancel",
                 "answer", "config.get", "config.set", "quit", "rewind", "job.kill",
@@ -5440,6 +5440,247 @@ def fork_scratch(t):
         r = h.call("delete", sid=f2)
         t.check(r.get("ok") == 1, f"deleted: {r}")
         t.check(gone(t, scratch), "gone with the last fork")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+def upload(t, h, data, part=1 << 19):
+    """Stage a raw log by upload, part by part, the last with done;
+    returns its token."""
+    if isinstance(data, str):
+        data = data.encode()
+    token, off = None, 0
+    while True:
+        chunk = data[off:off + part]
+        last = off + len(chunk) >= len(data)
+        args = {"data": base64.b64encode(chunk).decode(), "off": off}
+        if token:
+            args["token"] = token
+        if last:
+            args["done"] = 1
+        r = h.call("upload", **args)
+        t.check(r.get("ok") == 1 and r.get("off") == off + len(chunk) and
+                (token is None or r.get("token") == token), f"upload at {off}: {r}")
+        token, off = r["token"], r["off"]
+        if last:
+            return token
+
+
+def staged(t, token):
+    """An upload's staged files there are."""
+    tmp = t.host.join(t.state, "tmp")
+    return [x for x in (f"import-{token}.part", f"import-{token}.jsonl")
+            if t.host.read(t.host.join(tmp, x)) is not None]
+
+
+def importlog(t, h, data, part=1 << 19, **fields):
+    token = upload(t, h, data, part)
+    fields.setdefault("cwd", t.work)
+    r = h.call("import", token=token, **fields)
+    t.check(not staged(t, token), f"the staged log removed: {staged(t, token)}")
+    return r
+
+
+# What an import keeps: the conversation
+IMPORTED = {"session", "title", "user", "turn", "attempt", "assistant", "tool.start",
+            "tool.end", "retry", "nudge", "turn.end", "note", "compact", "todo",
+            "notice"}
+
+
+@scenario(bound=20)
+def import_roundtrip(t):
+    """import: a session's raw log, uploaded in parts, becomes a new
+    session where it is imported, with the conversation's records under
+    a new sid and their seqs, a session record of its own (imported_from)
+    and the title "TITLE (imported)", and goes on from its history."""
+    h = t.headless()
+    try:
+        r = h.call("hello", proto=0, client="scenarios")
+        caps = h.all("hello")[0].get("caps", [])
+        t.check("import" in caps, f"caps: {caps}")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="one")
+        ended(h, sid, 1)
+        src = logged(t, sid)
+        raw = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+        t.check(any(e["ev"] == "snap" for e in src), "a snapshot to leave behind")
+
+        r = importlog(t, h, raw, part=500, model=t.model, endpoint="fake")
+        new = r.get("sid")
+        t.check(r.get("ok") == 1 and r.get("from") == sid and new and new != sid,
+                f"imported: {r}")
+        recs = logged(t, new)
+        first = recs[0]
+        t.check(list(first)[:5] == ["sid", "seq", "ts", "ev", "imported_from"] and
+                first["imported_from"] == sid and first["model"] == t.model and
+                "forked_from" not in first and "roots" not in first,
+                f"its session record: {first}")
+        t.check(first["scratch"] != src[0]["scratch"] and first["scratch"].endswith(new),
+                f"a scratch directory of its own: {first['scratch']}")
+        kept = [e for e in src if e["ev"] in IMPORTED]
+        t.check([(e["seq"], e["ev"]) for e in recs[:-1]] ==
+                [(e["seq"], e["ev"]) for e in kept] and
+                all(e["sid"] == new for e in recs), "the conversation, as it was")
+        for a, b in zip(recs[1:-1], kept[1:]):
+            a = {k: v for k, v in a.items() if k != "sid"}
+            b = {k: v for k, v in b.items() if k != "sid"}
+            if b["ev"] == "tool.end":
+                b = {k: v for k, v in b.items() if k not in ("spill", "bytes")}
+            t.check(a == b, f"kept as it was: {a} {b}")
+        t.check(recs[-1]["ev"] == "title" and recs[-1]["text"].endswith(" (imported)") and
+                sidecar(t, new, "title") == recs[-1]["text"], f"titled {recs[-1]}")
+        t.check(listentry(h, new)["title"].endswith(" (imported)"), "listed")
+
+        o = h.call("open", sid=new)
+        t.check(o.get("ok") == 1 and o.get("readonly") == 0, f"open: {o}")
+        h.send("prompt", sid=new, text="two")
+        t.check(ended(h, new, 2)["why"] == "done", "it goes on")
+        said = h.all("assistant", new)[-1]
+        text = "".join(b.get("text", "") for b in said.get("blocks", []))
+        t.check(text == "Answer to two after 2 prompts.", f"with its history: {text!r}")
+        t.check(any(e["ev"] == "prefix" for e in logged(t, new)), "a prefix of its own")
+        t.check(logged(t, sid) == src, "the original untouched")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+def tinypng():
+    """A PNG of one red pixel."""
+    def chunk(kind, data):
+        crc = zlib.crc32(kind + data)
+        return len(data).to_bytes(4, "big") + kind + data + crc.to_bytes(4, "big")
+    ihdr = (1).to_bytes(4, "big") * 2 + bytes([8, 2, 0, 0, 0])
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+            chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + chunk(b"IEND", b""))
+
+
+@scenario(bound=20)
+def import_hostile(t):
+    """A log from elsewhere is not trusted: an import drops its snapshots
+    (whose paths a rewind would write), grants and roots (which widen the
+    guard), and a tool result's image and spill (read from the session's
+    directory), keeps only complete lines, and the session goes on."""
+    victim = t.host.join(t.base, "victim.txt")
+    t.host.write(victim, "safe\n")
+    # Where an image ../../x.png of the import's directory would be read
+    t.host.write(t.host.join(t.state, "x.png"), tinypng())
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="one")
+        ended(h, sid, 1)
+        recs = logged(t, sid)
+        for e in recs:
+            if e["ev"] == "session":
+                e.update(roots=["/"], temp="allow", scratch=t.base, parent_x=1)
+            elif e["ev"] == "snap":
+                e.update(path=victim, existed=1)
+            elif e["ev"] == "tool.end":
+                e.update(image="../../x.png", width=8, height=8, spill="../../victim.txt",
+                         child="../x")
+        last = recs[-1]["seq"]
+        recs.append({"sid": sid, "seq": last + 1, "ts": 1, "ev": "grant", "path": "/",
+                     "access": "write", "by": "user"})
+        recs.append({"sid": sid, "seq": last + 2, "ts": 1, "ev": "rewind",
+                     "undone": ["snap/1"]})
+        raw = "".join(json.dumps(e, separators=(",", ":")) + "\n" for e in recs)
+        raw += '{"sid":"%s","seq":%d,"ts":1,"ev":"user","te' % (sid, last + 3)
+
+        r = importlog(t, h, raw, model=t.model, endpoint="fake")
+        new = r.get("sid")
+        t.check(r.get("ok") == 1 and r.get("from") == sid, f"imported: {r}")
+        got = logged(t, new)
+        evs = {e["ev"] for e in got}
+        t.check(evs <= IMPORTED and "snap" not in evs and "grant" not in evs,
+                f"only the conversation: {sorted(evs)}")
+        first = got[0]
+        t.check(not {"roots", "temp", "parent_x"} & set(first) and
+                first["scratch"] != t.base, f"the session record anew: {first}")
+        ends = [e for e in got if e["ev"] == "tool.end"]
+        t.check(ends and not any({"image", "spill", "child", "width"} & set(e) for e in ends),
+                f"no files named: {ends}")
+        t.check(not any(e["seq"] == last + 3 and e["ev"] == "user" for e in got),
+                "the torn line left out")
+
+        h.call("open", sid=new)
+        rw = h.call("rewind", sid=new, to=1)
+        t.check(rw.get("ok") == 0 or not rw.get("files"), f"nothing to rewind: {rw}")
+        t.check(t.host.read(victim) == "safe\n", "the file named by a snapshot untouched")
+        h.send("prompt", sid=new, text="two")
+        t.check(ended(h, new, 2)["why"] == "done", "it goes on")
+        body = json.dumps(t.requests()[-1]["body"])
+        t.check("image_url" not in body and "base64" not in body, "no image in the request")
+        t.check(t.host.read(victim) == "safe\n", "untouched still")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def import_refused(t):
+    """upload refuses a part out of order, too large, or not base64, and a
+    log over 1 GiB; import refuses an upload not done, a subagent's log,
+    one not a session's, and a cwd that does not exist, and removes the
+    staged log whatever comes of it. Stale staged files are swept when
+    the engine starts."""
+    tmp = t.host.join(t.state, "tmp")
+    t.host.mkdir(tmp)
+    stale = t.host.join(tmp, "import-00000000000000aa.part")
+    fresh = t.host.join(tmp, "import-00000000000000bb.jsonl")
+    t.host.write(stale, "x")
+    t.host.write(fresh, "y")
+    t.host.touch(stale, time.time() - 7200)
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        t.check(t.host.read(stale) is None and t.host.read(fresh) == "y",
+                "the stale upload swept, the fresh one left")
+
+        def refused(cmd, err, **fields):
+            r = h.call(cmd, **fields)
+            t.check(r.get("ok") == 0 and r.get("err") == err, f"{cmd} {fields}: {r}")
+
+        b64 = base64.b64encode
+        refused("upload", "too large to import: a log is at most 1 GiB",
+                data=b64(b"xx").decode(), off=(1 << 30) - 1)
+        refused("upload", "a part is at most 512 KiB",
+                data=b64(b"x" * ((1 << 19) + 1)).decode(), off=0)
+        refused("upload", "data must be base64", data="!!!!", off=0)
+        refused("upload", "off must be 0 to begin an upload", data="", off=5)
+        refused("upload", "invalid token", data="", off=0, token="../x")
+        refused("upload", "no such upload", data="", off=3, token="0123456789abcdef")
+        r = h.call("upload", data=b64(b"abc").decode(), off=0)
+        token = r.get("token")
+        t.check(r.get("ok") == 1 and r.get("off") == 3 and len(token or "") == 16,
+                f"begun: {r}")
+        refused("upload", "off must be 3, the bytes staged so far",
+                data=b64(b"abc").decode(), off=0, token=token)
+        refused("import", "no such upload: upload the log first, ending with done",
+                token=token, cwd=t.work)
+        refused("import", "invalid token", token="x", cwd=t.work)
+
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="two")
+        ended(h, sid, 1)
+        raw = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+        r = importlog(t, h, raw, cwd=t.host.join(t.work, "nowhere"))
+        t.check(r.get("ok") == 0 and r.get("err") == "cwd must name an existing directory",
+                f"no such cwd: {r}")
+        recs = logged(t, sid)
+        recs[0]["parent"] = "20260101-000000-dad"
+        kid = "".join(json.dumps(e) + "\n" for e in recs)
+        r = importlog(t, h, kid, model=t.model, endpoint="fake")
+        t.check(r.get("ok") == 0 and r.get("err") ==
+                "a subagent's log cannot be imported, only its parent's", f"a subagent: {r}")
+        r = importlog(t, h, "hello\nworld\n", model=t.model, endpoint="fake")
+        t.check(r.get("ok") == 0 and r.get("err") ==
+                "not a session's raw log: it must begin with its session record",
+                f"not a log: {r}")
+        h.call("list")
+        listed = [e["sid"] for e in h.all("sessions")[-1]["list"]]
+        t.check(listed == [sid], f"nothing imported: {listed}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

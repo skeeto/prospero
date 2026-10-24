@@ -3443,6 +3443,22 @@ def sc_fork(model, n, req):
 sc_fork_scratch = sc_session_ops
 
 
+def sc_import_roundtrip(model, n, req):
+    # Turn "one" writes a file (a snapshot), then answers; any other
+    # prompt is answered with how many prompts its request carries, the
+    # imported history's among them
+    u = last_user_text(req)
+    if u == "one" and since_user(req) == 0:
+        yield from tool(model, n, "write", {"path": "f.txt", "content": "v1"})
+    else:
+        users = sum(m.get("role") == "user" for m in req.get("messages", []))
+        yield from answer(model, f"Answer to {(u or '')[:20]} after {users} prompts.")
+
+
+sc_import_hostile = sc_import_roundtrip
+sc_import_refused = sc_import_roundtrip
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 

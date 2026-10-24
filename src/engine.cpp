@@ -8638,6 +8638,206 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     }
 }
 
+// Imports: a raw log comes in parts (upload), staged in the state
+// directory's tmp/ as import-TOKEN.part, then import-TOKEN.jsonl once
+// complete, until import makes a session of it (logimport) and removes
+// it. Parts are small enough for any link's commands, and an upload is
+// at most a log's size. Staged files untouched for an hour are swept
+// when an engine starts (another engine of the state directory may have
+// one under way).
+enum : i64 {
+    UPLOAD_PART  = (i64)512 << 10,       // bytes of a part, decoded
+    UPLOAD_STALE = (i64)60 * 60 * 1000,  // ms
+};
+
+// An upload's token, as the engine makes them: 16 hexadecimal digits.
+static b32 validtoken(Str token)
+{
+    b32 ok = token.len == 16;
+    for (iz i = 0; ok && i < token.len; i++) {
+        u8 c = token[i];
+        ok = (c>='0' && c<='9') || (c>='a' && c<='f');
+    }
+    return ok;
+}
+
+static Str uploadpath(Arena *a, Engine *e, Str token, b32 done)
+{
+    Str name = concat(a, concat(a, "import-", token), done ? Str(".jsonl") : Str(".part"));
+    return join(a, join(a, e->statedir, "tmp"), name);
+}
+
+// Staged uploads left untouched for a while, removed.
+static void sweepuploads(Engine *e, Arena scratch)
+{
+    Str dir = join(&scratch, e->statedir, "tmp");
+    i64 now = os_time(e->os);
+    for (Dirent *d = os_list(e->os, &scratch, dir); d; d = d->next) {
+        if (!d->isdir && startswith(d->name, "import-") && now-d->mtime>UPLOAD_STALE) {
+            Str path = join(&scratch, dir, d->name);
+            os_remove(e->os, scratch, path);
+        }
+    }
+}
+
+// upload {token?, data, off, done?}: a part of a raw log, its bytes in
+// base64 at offset off, which must be the bytes staged so far, so that
+// a part sent twice, or out of order, is refused. The first part has no
+// token, and its reply names the one the rest give. With done, the log
+// is complete, and ready to import. The reply has the token and off,
+// the bytes staged.
+static void cmdupload(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Os      *os    = e->os;
+    Str      token = jsonstr(jsonget(j, "token"));
+    Json    *oj    = jsonget(j, "off");
+    i64      off   = jsonint(oj, -1);
+    b32      done  = jsonflag(jsonget(j, "done"), 0);
+    Unbase64 u     = unbase64(&scratch, jsonstr(jsonget(j, "data")));
+    Str      err   = {};
+    if (token.data && !validtoken(token)) {
+        err = "invalid token";
+    } else if (!u.ok) {
+        err = "data must be base64";
+    } else if (u.data.len > UPLOAD_PART) {
+        err = "a part is at most 512 KiB";
+    } else if (oj->type!=JSON_NUMBER || off<0) {
+        err = "off must be the bytes staged so far";
+    } else if (off > LOG_MAX-u.data.len) {
+        err = "too large to import: a log is at most 1 GiB";
+    } else if (!token.data && off) {
+        err = "off must be 0 to begin an upload";
+    }
+    if (err.len) {
+        reply(e, scratch, id, 0, err, {});
+        return;
+    }
+
+    if (!token.data) {
+        Buf b(&scratch, 16);
+        printhex(&b, os_random(os), 16);
+        token = finish(&b);
+        Str dir = join(&scratch, e->statedir, "tmp");
+        if (!os_mkdirs(os, scratch, dir)) {
+            reply(e, scratch, id, 0, "cannot stage the upload", {});
+            return;
+        }
+    }
+    Str  path = uploadpath(&scratch, e, token, 0);
+    Str  to   = uploadpath(&scratch, e, token, 1);
+    Stat st   = os_stat(os, scratch, path);
+    i64  have = st.type==STAT_FILE ? st.size : 0;
+    if (off && st.type!=STAT_FILE) {
+        reply(e, scratch, id, 0, "no such upload", {});
+        return;
+    } else if (off != have) {
+        Buf b(&scratch, 64);
+        print(&b, "off must be ");
+        print(&b, have);
+        print(&b, ", the bytes staged so far");
+        reply(e, scratch, id, 0, finish(&b), {});
+        return;
+    }
+    iz  fd = os_logopen(os, scratch, path);
+    b32 ok = fd >= 0;
+    ok = ok && (!u.data.len || os_logwrite(os, fd, u.data));
+    if (fd >= 0) {
+        os_logclose(os, fd);
+    }
+    ok = ok && (!done || os_rename(os, scratch, path, to));
+    if (!ok) {
+        os_remove(os, scratch, path);
+        reply(e, scratch, id, 0, "cannot stage the upload", {});
+        return;
+    }
+    Buf   b(&scratch, 256);
+    EvOut w = evbegin(&b, {}, 0, os_time(os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "token", token);
+    putintkey(&w.json, "off", off + u.data.len);
+    emit(e, evend(&w));
+}
+
+// import {token, cwd, model?, endpoint?}: a new session from the raw log
+// an upload staged, which it removes whatever comes of it, as logimport
+// makes it, working in cwd, which must exist, with the model and the
+// endpoint given, else the configuration's, as new has them (MODEL, or
+// ENDPOINT/MODEL). Its title and its log are written as a fork's are,
+// the log last. The reply names the new session (sid) and the one it
+// was (from). The session is not opened.
+static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Os  *os    = e->os;
+    Str  token = jsonstr(jsonget(j, "token"));
+    Str  cwd   = jsonstr(jsonget(j, "cwd"));
+    Str  spec  = trim(jsonstr(jsonget(j, "model")));
+    Str  which = trim(jsonstr(jsonget(j, "endpoint")));
+    if (!validtoken(token)) {
+        reply(e, scratch, id, 0, "invalid token", {});
+        return;
+    }
+    Str   path  = uploadpath(&scratch, e, token, 1);
+    Arena lines = newarena(e->replay);
+    Read  rd    = os_read(os, &lines, path, LOG_MAX);
+    if (rd.err == READ_NOTFOUND) {
+        reply(e, scratch, id, 0, "no such upload: upload the log first, ending with done", {});
+        return;
+    }
+    os_remove(os, scratch, path);
+    if (rd.err != READ_OK) {
+        reply(e, scratch, id, 0, "cannot read the uploaded log", {});
+        return;
+    }
+
+    Str real = cwd.len ? os_realpath(os, &scratch, cwd) : Str{};
+    if (!real.len || os_stat(os, scratch, real).type!=STAT_DIR) {
+        reply(e, scratch, id, 0, "cwd must name an existing directory", {});
+        return;
+    }
+    Str dflt = iniget(e->ini, "", "", "endpoint");
+    if (!spec.len) {
+        spec  = iniget(e->ini, "", "", "model");
+        which = which.len ? which : dflt;
+    }
+    if (!spec.len) {
+        reply(e, scratch, id, 0, "no model: give one, or set model in the config", {});
+        return;
+    }
+    Target   t  = which.len ? Target{which, spec} : targetof(e, spec, dflt);
+    Endpoint ep = {};
+    if (!t.which.len || !endpointconf(e, &scratch, t.which, &ep)) {
+        reply(e, scratch, id, 0, "no usable endpoint: give a URL or a configured name", {});
+        return;
+    }
+
+    Str       to  = freshsid(e, &scratch);
+    Str       dir = scratchfor(e, &scratch, to);
+    LogImport li  = logimport(&lines, scratch, rd.data, to, real, t.model,
+                              ep.url, dir, os_time(os));
+    if (li.err.len) {
+        reply(e, scratch, id, 0, li.err, {});
+        return;
+    }
+    Str sdir = join(&scratch, join(&scratch, e->statedir, "sessions"), to);
+    Str out  = join(&scratch, sdir, "out");
+    Str log  = join(&scratch, sdir, "events.jsonl");
+    b32 ok   = os_mkdirs(os, scratch, out);
+    ok = ok && sidecarwrite(e, scratch, to, "title", li.title);
+    ok = ok && os_write(os, scratch, log, li.log);
+    if (!ok) {
+        totrash(e, scratch, sdir, to);
+        reply(e, scratch, id, 0, "cannot write the imported session's files", {});
+        return;
+    }
+    Buf   b(&scratch, 256 + li.from.len);
+    EvOut w = evbegin(&b, to, 0, os_time(os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "from", li.from);
+    emit(e, evend(&w));
+}
+
 // After the configuration reloads: each session takes up its endpoint's
 // and model's settings for its next request, and the guard's roots for
 // its next call. The system prompt stays as it was, byte for byte, to
@@ -8802,6 +9002,8 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_FORK:
         case CMD_COMPACT:
         case CMD_MODEL:
+        case CMD_UPLOAD:
+        case CMD_IMPORT:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -8890,6 +9092,12 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_FORK:
         cmdfork(e, scratch, id, j);
+        return;
+    case CMD_UPLOAD:
+        cmdupload(e, scratch, id, j);
+        return;
+    case CMD_IMPORT:
+        cmdimport(e, scratch, id, j);
         return;
     case CMD_RENAME:
         cmdrename(e, scratch, id, j);  // on a session open here or not
@@ -9197,6 +9405,7 @@ static void enginethread(void *arg)
     Engine *e = (Engine *)arg;
     cfgrefresh(e->cfg, newarena(e->scratch), 0);  // what loaded from a cache
     sweeptrash(e, newarena(e->scratch));
+    sweepuploads(e, newarena(e->scratch));
     for (;;) {
         i64 now  = os_ticks(e->os);
         i64 next = e->quitting ? e->quitby : I64MAX;

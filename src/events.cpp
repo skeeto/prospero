@@ -136,6 +136,8 @@ enum : i32 {
     CMD_COMPACT, // (M8) compact now
     CMD_MODEL,   // (M8) another model from here on
     CMD_DRAFT,   // (M8) the frontend's unsent prompt, kept
+    CMD_UPLOAD,  // (M9) part of a file staged for import
+    CMD_IMPORT,  // (M9) a new session from a log staged by upload
     CMD_COUNT,
 };
 
@@ -143,7 +145,7 @@ static Str cmdnames[] = {
     "", "hello", "list", "new", "open", "close", "prompt", "steer",
     "cancel", "answer", "config.get", "config.set", "quit", "rewind",
     "job.kill", "status", "stop", "file", "rename", "delete", "archive",
-    "group", "fork", "compact", "model", "draft",
+    "group", "fork", "compact", "model", "draft", "upload", "import",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -170,6 +172,7 @@ static Str capnames[] = {
     "delete",          // delete, a session with its subagents
     "fork",            // fork, a new session from a turn of another
     "config.delete",   // config.set {delete}: a section of the user's file
+    "import",          // upload and import, a session from a raw log
 };
 
 static Str evname(i32 ev)
@@ -754,7 +757,9 @@ static Replay logreplay(Os *os, Arena *perm, Arena scratch, Str path,
 // original. The session record says where it came from (forked_from,
 // fork_turn) right after ev, where the sessions list, which reads only a
 // log's first 4 KiB, finds it, and a title record "TITLE (fork)" ends the
-// log. It is pure, so that an import can make use of it too.
+// log. It is pure, so that an import can make use of it too: an import
+// (logimport) is a copy of the whole log, whose session record says
+// imported_from instead, and whose title is "TITLE (imported)".
 
 struct LogCopy {
     Str        log;    // the new events.jsonl, null on failure
@@ -851,10 +856,10 @@ static Slice<Str> lognames(Arena *a, Str log)
 // Copy a log, its replayed lines, for session to, cut after turn (all of
 // it if negative), with the session directory spelled olds[k] replaced
 // by news[k] in every line, and a title record at now. With win, each in
-// either separator too.
+// either separator too. An import's copy (imported) says so instead.
 static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
                        Str to, Slice<Str> olds, Slice<Str> news, i64 turn,
-                       i64 now, b32 win)
+                       i64 now, b32 win, b32 imported = 0)
 {
     LogCopy r = {};
     if (!lines.len || evparse(&scratch, lines[0]).ev!=EV_SESSION) {
@@ -922,7 +927,8 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
             r.next = clone(a, jsonstr(jsonget(rec.root, "text")));
         }
     }
-    r.title = concat(a, title.len ? title : Str("Untitled"), " (fork)");
+    Str suffix = imported ? Str(" (imported)") : Str(" (fork)");
+    r.title = concat(a, title.len ? title : Str("Untitled"), suffix);
     r.turn  = turn<0 ? r.turn : turn;
 
     // Every spelling of the directory, escaped as in a line
@@ -966,8 +972,12 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
             // Where it came from, early in the session record
             Buf   b(&t, line.len + 256);
             EvOut w = evbegin(&b, to, rec.seq, rec.ts, EV_SESSION);
-            putstrkey(&w.json, "forked_from", from);
-            putintkey(&w.json, "fork_turn", r.turn);
+            if (imported) {
+                putstrkey(&w.json, "imported_from", from);
+            } else {
+                putstrkey(&w.json, "forked_from", from);
+                putintkey(&w.json, "fork_turn", r.turn);
+            }
             for (Json *m = rec.root->child; m; m = m->next) {
                 if (m->key=="sid" || m->key=="seq" || m->key=="ts" || m->key=="ev" ||
                         m->key=="forked_from" || m->key=="fork_turn") {
@@ -1006,5 +1016,191 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
     }
     r.log   = finish(&out);
     r.files = lognames(a, r.log);
+    return r;
+}
+
+
+// Imports
+//
+// An import is a new session from a raw log written elsewhere, perhaps
+// on another machine, and so not trusted: its records may name any
+// path, and some would have the engine read or write there (a snap's
+// path, which rewind writes; a tool result's image, read into requests)
+// or widen the guard (roots, temp, grants). Only the conversation is
+// kept, by an allowlist of events, and of those records the fields
+// that name files of the old session's directory are dropped, since
+// those files never come along. The session record is made anew for
+// where the session now works (cwd, model, endpoint, scratch), keeping
+// the role, its prompt and tools, the edit format and the step limit.
+// With the prefix and instruction records gone, opening the session
+// builds its prefix afresh, for its new place. Foreign paths in the
+// text of old calls and results stay, as history. A torn final line is
+// left out, and a log whose lines are mostly not records of its session
+// is refused. The copy is then logcopy's, imported, whole.
+
+struct LogImport {
+    Str log;      // the new events.jsonl, null on failure
+    Str err;      // why not
+    Str from;     // the session it was
+    Str title;    // the import's own
+    i32 kept;     // records kept
+    i32 dropped;  // records of events not kept
+    i32 bad;      // lines that were no record of the session
+};
+
+// Whether an import keeps records of an event: the conversation's.
+static b32 importkeeps(i32 ev)
+{
+    switch (ev) {
+    case EV_TITLE:
+    case EV_USER:
+    case EV_TURN:
+    case EV_ATTEMPT:
+    case EV_ASSISTANT:
+    case EV_TOOLSTART:
+    case EV_TOOLEND:
+    case EV_RETRY:
+    case EV_NUDGE:
+    case EV_TURNEND:
+    case EV_NOTE:
+    case EV_COMPACT:
+    case EV_TODO:
+    case EV_NOTICE:
+        return 1;
+    }
+    return 0;
+}
+
+// Whether an import drops a tool result's field: one naming a file of
+// the old session (spill, image, child), or describing one.
+static b32 importdrops(Str key)
+{
+    return key=="spill" || key=="bytes" || key=="image" || key=="width" ||
+           key=="height" || key=="shot" || key=="child" || key=="job";
+}
+
+// A tool result without the fields an import drops, or the line itself
+// if it has none.
+static Str importstrip(Arena *a, EvRec *rec, Str line)
+{
+    b32 any = 0;
+    for (Json *m = rec->root->child; m; m = m->next) {
+        any |= importdrops(m->key);
+    }
+    if (!any) {
+        return line;
+    }
+    Buf     b(a, line.len);
+    JsonOut w = {&b};
+    putobject(&w);
+    for (Json *m = rec->root->child; m; m = m->next) {
+        if (!importdrops(m->key)) {
+            putkey(&w, m->key);
+            putjson(&w, m);
+        }
+    }
+    putend(&w);
+    putbyte(&b, '\n');
+    return finish(&b);
+}
+
+// The session record made anew for where the session now works.
+static Str importsession(Arena *a, EvRec *rec, Str cwd, Str model,
+                         Str endpoint, Str scratch)
+{
+    static Str const kept[] = {"role", "prompt", "tools", "edit_format", "steps"};
+    Json *j = rec->root;
+    Buf   b(a, 1024 + cwd.len + model.len + endpoint.len + scratch.len);
+    EvOut w = evbegin(&b, rec->sid, rec->seq, rec->ts, EV_SESSION);
+    putintkey(&w.json, "proto", 0);
+    Json *v = jsonget(j, "version");
+    if (v->type == JSON_STRING) {
+        putstrkey(&w.json, "version", jsonstr(v));
+    }
+    putstrkey(&w.json, "cwd", cwd);
+    putstrkey(&w.json, "model", model);
+    putstrkey(&w.json, "endpoint", endpoint);
+    if (scratch.len) {
+        putstrkey(&w.json, "scratch", scratch);
+    }
+    for (iz k = 0; k < countof(kept); k++) {
+        Json *m = jsonget(j, kept[k]);
+        if (m->type != JSON_MISSING) {
+            putkey(&w.json, kept[k]);
+            putjson(&w.json, m);
+        }
+    }
+    return evend(&w);
+}
+
+// An import of a raw log, data, as session to, working in cwd with the
+// model at the endpoint (a URL), with its scratch directory there, and
+// titled at now. A session is listed only by a first line under 4 KiB.
+static LogImport logimport(Arena *a, Arena scratch, Str data, Str to, Str cwd,
+                           Str model, Str endpoint, Str dir, i64 now)
+{
+    LogImport r = {};
+
+    // Its complete lines, a torn tail left out
+    Slice<Str> lines = {};
+    for (Str rest = data;;) {
+        Cut c = cut(rest, '\n');
+        if (!c.ok) {
+            break;
+        }
+        rest  = c.tail;
+        lines = push(&scratch, lines, Str{c.head.data, c.head.len+1});
+    }
+
+    {
+        Arena t   = scratch;
+        EvRec rec = lines.len ? evparse(&t, lines[0]) : EvRec{};
+        if (!rec.ok || rec.ev!=EV_SESSION || rec.seq!=1 || !validsid(rec.sid)) {
+            r.err = "not a session's raw log: it must begin with its session record";
+            return r;
+        } else if (jsonget(rec.root, "parent")->type == JSON_STRING) {
+            r.err = "a subagent's log cannot be imported, only its parent's";
+            return r;
+        }
+        r.from = clone(a, rec.sid);
+    }
+
+    Slice<Str> kept = {};
+    i64        last = 0;
+    for (iz i = 0; i < lines.len; i++) {
+        Arena t    = scratch;
+        Str   line = lines[i];
+        EvRec rec  = evparse(&t, line);
+        if (!evvalid(&rec, r.from, last)) {
+            r.bad++;
+            continue;
+        }
+        last = rec.seq;
+        if (i == 0) {
+            line = importsession(a, &rec, cwd, model, endpoint, dir);
+        } else if (!importkeeps(rec.ev)) {
+            r.dropped++;
+            continue;
+        } else if (rec.ev == EV_TOOLEND) {
+            line = importstrip(a, &rec, line);
+        }
+        kept = push(&scratch, kept, line);  // t is dead now
+        r.kept++;
+    }
+    if (r.bad > lines.len/2) {
+        r.err = "most of its lines are not records of its session";
+        return r;
+    }
+
+    LogCopy c = logcopy(a, scratch, kept, r.from, to, {}, {}, -1, now, 0, 1);
+    if (c.err.len) {
+        r.err = c.err;
+        return r;
+    } else if (cut(c.log, '\n').head.len >= 4096) {
+        r.err = "its session record is too long to be listed: over 4 KiB";
+        return r;
+    }
+    r.log   = c.log;
+    r.title = c.title;
     return r;
 }

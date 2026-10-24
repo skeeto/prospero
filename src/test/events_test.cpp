@@ -167,6 +167,107 @@ static void testlogcopy(Test *t)
     expect(t, "logcopy no session", istr(&a, c.err.len>0 && !c.log.data), "1");
 }
 
+// An import of a log from elsewhere (logimport): the conversation's
+// records kept, with their seqs, and every other dropped; tool results
+// without the fields naming the old session's files; the session record
+// made anew; a torn tail and a few bad lines skipped; and refusals.
+static void testlogimport(Test *t)
+{
+    Arena a       = t->perm;
+    Arena scratch = t->perm;
+    scratch.beg  += (scratch.end - scratch.beg)/2;
+    Str log =
+        "{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"forked_from\":\"Z\","
+        "\"proto\":0,\"version\":\"0.9\",\"cwd\":\"/w\",\"role\":\"r\",\"model\":\"m\","
+        "\"endpoint\":\"http://evil/\",\"scratch\":\"/etc\",\"roots\":[\"/\"],"
+        "\"temp\":\"allow\",\"tools\":[\"read\"],\"prompt\":\"p\",\"steps\":9}\n"
+        "{\"sid\":\"A\",\"seq\":2,\"ts\":6,\"ev\":\"instructions\",\"why\":\"start\"}\n"
+        "{\"sid\":\"A\",\"seq\":3,\"ts\":6,\"ev\":\"prefix\",\"system\":\"s\"}\n"
+        "{\"sid\":\"A\",\"seq\":4,\"ts\":7,\"ev\":\"user\",\"text\":\"one\"}\n"
+        "{\"sid\":\"A\",\"seq\":5,\"ts\":7,\"ev\":\"turn\",\"n\":1}\n"
+        "{\"sid\":\"A\",\"seq\":6,\"ts\":7,\"ev\":\"grant\",\"path\":\"/\",\"access\":\"write\"}\n"
+        "garbage\n"
+        "{\"sid\":\"A\",\"seq\":7,\"ts\":8,\"ev\":\"tool.start\",\"call\":\"c1\",\"name\":\"x\"}\n"
+        "{\"sid\":\"A\",\"seq\":8,\"ts\":8,\"ev\":\"snap\",\"call\":\"c1\",\"path\":\"/etc/passwd\","
+        "\"snap\":\"snap/1\"}\n"
+        "{\"sid\":\"A\",\"seq\":9,\"ts\":8,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\","
+        "\"spill\":\"../../x\",\"bytes\":3,\"image\":\"../../x\",\"width\":1,\"height\":1,"
+        "\"shot\":\"s\",\"child\":\"K\",\"job\":2,\"ms\":4}\n"
+        "{\"sid\":\"B\",\"seq\":10,\"ts\":8,\"ev\":\"user\",\"text\":\"other\"}\n"
+        "{\"sid\":\"A\",\"seq\":11,\"ts\":8,\"ev\":\"rewind\",\"undone\":[\"snap/1\"]}\n"
+        "{\"sid\":\"A\",\"seq\":12,\"ts\":8,\"ev\":\"job.start\",\"job\":2,\"spill\":\"/x\"}\n"
+        "{\"sid\":\"A\",\"seq\":13,\"ts\":8,\"ev\":\"ask\",\"req\":\"q\"}\n"
+        "{\"sid\":\"A\",\"seq\":14,\"ts\":8,\"ev\":\"answer\",\"req\":\"q\"}\n"
+        "{\"sid\":\"A\",\"seq\":15,\"ts\":8,\"ev\":\"model\",\"model\":\"m2\"}\n"
+        "{\"sid\":\"A\",\"seq\":16,\"ts\":9,\"ev\":\"title\",\"text\":\"First\",\"by\":\"auto\"}\n"
+        "{\"sid\":\"A\",\"seq\":17,\"ts\":9,\"ev\":\"newer\",\"x\":1}\n"
+        "{\"sid\":\"A\",\"seq\":18,\"ts\":9,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n"
+        "{\"sid\":\"A\",\"seq\":19,\"ts\":9,\"ev\":\"user\",\"te";
+    LogImport r = logimport(&a, scratch, log, "N", "/here", "mm", "http://e/",
+                            "/t/prospero-1/N", 100);
+    Str want =
+        "{\"sid\":\"N\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"imported_from\":\"A\","
+        "\"proto\":0,\"version\":\"0.9\",\"cwd\":\"/here\",\"model\":\"mm\","
+        "\"endpoint\":\"http://e/\",\"scratch\":\"/t/prospero-1/N\",\"role\":\"r\","
+        "\"prompt\":\"p\",\"tools\":[\"read\"],\"steps\":9}\n"
+        "{\"sid\":\"N\",\"seq\":4,\"ts\":7,\"ev\":\"user\",\"text\":\"one\"}\n"
+        "{\"sid\":\"N\",\"seq\":5,\"ts\":7,\"ev\":\"turn\",\"n\":1}\n"
+        "{\"sid\":\"N\",\"seq\":7,\"ts\":8,\"ev\":\"tool.start\",\"call\":\"c1\",\"name\":\"x\"}\n"
+        "{\"sid\":\"N\",\"seq\":9,\"ts\":8,\"ev\":\"tool.end\",\"call\":\"c1\",\"text\":\"t\","
+        "\"ms\":4}\n"
+        "{\"sid\":\"N\",\"seq\":16,\"ts\":9,\"ev\":\"title\",\"text\":\"First\",\"by\":\"auto\"}\n"
+        "{\"sid\":\"N\",\"seq\":18,\"ts\":9,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n"
+        "{\"sid\":\"N\",\"seq\":19,\"ts\":100,\"ev\":\"title\",\"text\":\"First (imported)\","
+        "\"by\":\"auto\"}\n";
+    expect(t, "logimport", r.log, want);
+    expect(t, "logimport err", r.err, "");
+    expect(t, "logimport from", r.from, "A");
+    expect(t, "logimport title", r.title, "First (imported)");
+    Buf b(&a, 64);
+    print(&b, (i64)r.kept);
+    putbyte(&b, ' ');
+    print(&b, (i64)r.dropped);
+    putbyte(&b, ' ');
+    print(&b, (i64)r.bad);
+    expect(t, "logimport counts", finish(&b), "7 10 2");
+
+    // Refused: a subagent's log, one that begins otherwise, mostly bad
+    struct {
+        Str log;
+        Str err;
+    } refused[] = {
+        {"{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"parent\":\"P\"}\n",
+         "a subagent's log cannot be imported, only its parent's"},
+        {"{\"sid\":\"A\",\"seq\":2,\"ts\":5,\"ev\":\"session\"}\n",
+         "not a session's raw log: it must begin with its session record"},
+        {"{\"sid\":\"../x\",\"seq\":1,\"ts\":5,\"ev\":\"session\"}\n",
+         "not a session's raw log: it must begin with its session record"},
+        {"{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"user\"}\n",
+         "not a session's raw log: it must begin with its session record"},
+        {"{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\"}",
+         "not a session's raw log: it must begin with its session record"},
+        {"", "not a session's raw log: it must begin with its session record"},
+        {"{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\"}\nx\ny\n",
+         "most of its lines are not records of its session"},
+    };
+    for (iz i = 0; i < countof(refused); i++) {
+        r = logimport(&a, scratch, refused[i].log, "N", "/here", "mm", "http://e/",
+                      {}, 100);
+        expect(t, concat(&a, "logimport refused ", istr(&a, i)), r.err, refused[i].err);
+        expect(t, concat(&a, "logimport no log ", istr(&a, i)), istr(&a, !r.log.data), "1");
+    }
+
+    // A session record too long for the sessions list
+    Buf big(&a, 8192);
+    print(&big, "{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"prompt\":\"");
+    for (i32 i = 0; i < 4096; i++) {
+        putbyte(&big, 'p');
+    }
+    print(&big, "\"}\n");
+    r = logimport(&a, scratch, finish(&big), "N", "/here", "mm", "http://e/", {}, 100);
+    expect(t, "logimport long", r.err, "its session record is too long to be listed: over 4 KiB");
+}
+
 static void test_events(Test *t)
 {
     Arena perm    = t->perm;
@@ -217,11 +318,12 @@ static void test_events(Test *t)
                "{\"cmds\":[\"hello\",\"list\",\"new\",\"open\",\"close\",\"prompt\","
                "\"steer\",\"cancel\",\"answer\",\"config.get\",\"config.set\",\"quit\","
                "\"rewind\",\"job.kill\",\"status\",\"stop\",\"file\",\"rename\",\"delete\","
-               "\"archive\",\"group\",\"fork\",\"compact\",\"model\",\"draft\"],"
+               "\"archive\",\"group\",\"fork\",\"compact\",\"model\",\"draft\",\"upload\","
+               "\"import\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
-               "\"delete\",\"fork\",\"config.delete\"]}");
+               "\"delete\",\"fork\",\"config.delete\",\"import\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);
@@ -771,4 +873,5 @@ static void test_events(Test *t)
     }
 
     testlogcopy(t);
+    testlogimport(t);
 }
