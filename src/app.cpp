@@ -93,6 +93,10 @@ enum : i64 {
     AMBER_MS   = 15000,    // no data from the model for this long: amber
 };
 
+// [ui] font_size's default, in pixels at scale 1, as config.cpp's
+// schema has it
+enum : i32 { FONT_BASE = 17 };
+
 // Where the engine runs
 enum : i32 {
     ENGINE_INPROC,
@@ -6529,11 +6533,11 @@ static void zoomby(Gui *g, i32 steps)
 
 // The permanent text size, [ui] font_size, in pixels at scale 1: from
 // the configuration at startup and from each config.get. Out of range
-// or unreadable is the default, 15.
+// or unreadable is the default, FONT_BASE.
 static void setfontbase(Gui *g, Str value)
 {
     Float f    = parsefloat(trim(value));
-    f32   base = f.ok && f.val>=8 && f.val<=40 ? (f32)f.val : 15;
+    f32   base = f.ok && f.val>=8 && f.val<=40 ? (f32)f.val : (f32)FONT_BASE;
     if (base != g->fontbase) {
         g->fontbase  = base;
         g->fontdirty = 1;
@@ -13640,7 +13644,7 @@ static void loadfonts(Gui *g)
     f->bolditalic = addface(fontroboto(), bold|italic);
     f->mono       = addface(fontmono(), 0);
     f->monobold   = addface(fontmono(), bold);
-    f->size       = 15;
+    f->size       = FONT_BASE;
     g->measure.advance = fontadvance;
     g->measure.font    = fontmetrics;
     g->measure.ctx     = f;
@@ -13842,7 +13846,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->reveal   = -1;
     g->firstlayout = 1;
     g->zoom     = 1;
-    g->fontbase = 15;
+    g->fontbase = FONT_BASE;
     for (i32 i = 0; i < PANE_COUNT; i++) {
         g->panes[i] = i != PANE_METRICS;  // the metrics only when asked for
     }

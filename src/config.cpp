@@ -441,7 +441,7 @@ static CfgKey cfgschema[] = {
      "Tool output in the transcript: auto folds reads, writes, todo lists, "
      "background jobs and long shell output and opens failures; fold or "
      "open every row"},
-    {"ui", "font_size", CFG_NUMBER, "15", {}, {}, "ui",
+    {"ui", "font_size", CFG_NUMBER, "17", {}, {}, "ui",
      "Text size in pixels at 100% display scale, 8 to 40; the View "
      "menu's zoom scales it until Prospero exits"},
     {"ui", "editor", CFG_STRING, "", {}, {}, "ui",

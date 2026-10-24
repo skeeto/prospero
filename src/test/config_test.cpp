@@ -861,7 +861,7 @@ static void testcfgjson(Test *t)
         "ui//theme=system*\n"
         "ui//thinking=fold*\n"
         "ui//tools=auto*\n"
-        "ui//font_size=15*\n"
+        "ui//font_size=17*\n"
         "ui//editor=*\n"
         "desktop//offer=none*\n"
         "desktop//ask=true*\n"
