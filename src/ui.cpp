@@ -850,6 +850,33 @@ static void pen(Pen *p, Str s, i32 style, u32 col)
     p->x += font->CalcTextSizeA(p->size, 1e9f, 0, s.cdata, s.cdata+s.len).x;
 }
 
+// A button whose label is runs of text in styles, drawn as pen draws
+// them: a name in it in the code font, say. Returns whether pressed.
+static b32 penbutton(Gui *g, char const *id, Str *runs, i32 *styles, i32 n)
+{
+    ImGuiStyle &st   = ImGui::GetStyle();
+    f32         size = ImGui::GetFontSize();
+    f32         w    = 0;
+    for (i32 i = 0; i < n; i++) {
+        Str s = runs[i];
+        w += stylefont(&g->fonts, styles[i])->CalcTextSizeA(size, 1e9f, 0, s.cdata,
+                                                             s.cdata+s.len).x;
+    }
+    ImVec2 at   = ImGui::GetCursorScreenPos();
+    b32    hit  = ImGui::InvisibleButton(id, v2(w + 2*st.FramePadding.x, ImGui::GetFrameHeight()));
+    ImRect bb   = {ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
+    i32    col  = ImGui::IsItemActive()  ? ImGuiCol_ButtonActive :
+                  ImGui::IsItemHovered() ? ImGuiCol_ButtonHovered : ImGuiCol_Button;
+    ImGui::RenderNavCursor(bb, ImGui::GetItemID());
+    ImGui::RenderFrame(bb.Min, bb.Max, ImGui::GetColorU32(col), 1, st.FrameRounding);
+    Pen p = {ImGui::GetWindowDrawList(), &g->fonts, at.x + st.FramePadding.x,
+             at.y + st.FramePadding.y, bb.Max.x, size};
+    for (i32 i = 0; i < n; i++) {
+        pen(&p, runs[i], styles[i], ImGui::GetColorU32(ImGuiCol_Text));
+    }
+    return hit;
+}
+
 // Milliseconds as "850 ms", "1.2 s" or "3 min 5 s".
 static Str duration(Arena *a, i64 ms)
 {
@@ -1108,8 +1135,10 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         } else {
             Buf b(&a, 256);
             print(&b, t->tool);
-            print(&b, " ");
-            print(&b, t->path);
+            if (t->path.len) {
+                print(&b, " ");
+                print(&b, t->path);
+            }
             pen(p, "Allow ", STYLE_BOLD, pal->amber);
             pen(p, finish(&b), STYLE_CODE, pal->summary);
             pen(p, "?  ", STYLE_BOLD, pal->amber);
@@ -1391,11 +1420,13 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         ImGui::Dummy(v2(1, h));
         ImGui::SameLine(0, sp);
 
-        Buf b(&a, 128 + t->grant.len);
+        // The class or directory in the code font, as the header has it
+        Str runs[3]   = {};
+        i32 styles[3] = {0, STYLE_CODE, 0};
         if (desk) {
-            print(&b, "Allow ");
-            print(&b, t->grant);
-            print(&b, " for this session");
+            runs[0] = "Allow ";
+            runs[1] = t->grant;
+            runs[2] = " for this session";
         } else {
             // Its last name, cut to its end if long, so that the
             // buttons fit; the tooltip has the whole path
@@ -1408,12 +1439,11 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
                 for (; i<dir.len && (dir[i]&0xc0)==0x80; i++) {}
                 dir = concat(&a, "\xe2\x80\xa6", cuthead(dir, i));
             }
-            print(&b, "Always allow ");
-            print(&b, dir);
-            print(&b, t->access=="write" ? Str(" (write)") : Str(" (read)"));
+            runs[0] = "Always allow ";
+            runs[1] = dir;
+            runs[2] = t->access=="write" ? Str(" (write)") : Str(" (read)");
         }
-        print(&b, "##always");
-        if (ImGui::Button(cstr0(&a, finish(&b)))) {
+        if (penbutton(g, "##always", runs, styles, countof(runs))) {
             guianswer(g, s, t->req, "always", {});
         }
         if (latest) itemrect(g, RECT_ALWAYS);
