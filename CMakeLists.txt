@@ -82,6 +82,9 @@ set_property(SOURCE src/main_posix.cpp src/main_win32.cpp src/main_test.cpp
   ${PROJECT_SOURCE_DIR}/assets/NotoSansSymbols2-subset.ttf
   ${PROJECT_SOURCE_DIR}/assets/NotoSansMath-subset.ttf)
 
+# Every program with the core decodes images (src/wuffs.c)
+include(FetchWuffs)
+
 if(PROSPERO_GUI)
   include(FetchGui)
 endif()
@@ -134,7 +137,7 @@ else()
     target_link_options(prospero PRIVATE -static)
   endif()
 endif()
-target_link_libraries(prospero PRIVATE prospero_core_flags)
+target_link_libraries(prospero PRIVATE prospero_core_flags wuffs)
 if(WIN32)
   # A zero PE timestamp, as w64devkit's ld writes by default, rather than
   # the link time, so the same sources link the same program with any
@@ -280,7 +283,7 @@ endif()
 if(NOT CMAKE_CROSSCOMPILING)
   enable_testing()
   add_executable(prospero_test src/main_test.cpp)
-  target_link_libraries(prospero_test PRIVATE prospero_core_flags)
+  target_link_libraries(prospero_test PRIVATE prospero_core_flags wuffs)
   if(PROSPERO_GUI)
     # The GUI's pure modules: scheduler, markdown, layout, view model.
     target_link_libraries(prospero_test PRIVATE md4c)
