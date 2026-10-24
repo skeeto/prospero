@@ -5828,10 +5828,9 @@ static b32 samelineif(f32 w)
 // A configured remote host's line: a dot in the color of its connection,
 // its name and how it is, cut to leave room for Connect or Disconnect,
 // and why it failed. The button's rectangle goes to RECT_* rect, if not
-// negative.
-static void drawremote(Gui *g, Str name, i32 rect)
+// negative. Its scratch is a, after what the caller keeps there (name).
+static void drawremote(Gui *g, Arena a, Str name, i32 rect)
 {
-    Arena       a       = g->frame;
     f32         sc      = g->scale;
     ImGuiStyle &st      = ImGui::GetStyle();
     i64         nowms   = os_time(g->os);
@@ -5969,7 +5968,7 @@ static void drawhosts(Gui *g)
     }
     for (iz n = 0; n < names.len; n++) {
         // The first two's buttons, for the checklist
-        drawremote(g, names[n], n<2 ? RECT_CONNECT+(i32)n : -1);
+        drawremote(g, a, names[n], n<2 ? RECT_CONNECT+(i32)n : -1);
     }
 
     // A new one, which the configuration keeps: its fields side by side
@@ -6644,7 +6643,7 @@ static void drawcfgpage(Gui *g)
         ImGui::PopTextWrapPos();
     }
     if (kind == "remote") {
-        drawremote(g, name, RECT_PAGECONNECT);
+        drawremote(g, a, name, RECT_PAGECONNECT);
     }
     ImGui::Spacing();
     if (named && !cfghas(g, kind, name)) {
