@@ -24,6 +24,15 @@
 // each frame with schedat, of which only the earliest is kept, and its
 // reasons to keep going (held buttons, fades) through the busy mask.
 //
+// A held key is busy, as ImGui repeats it on its own timer, but only
+// while the OS confirms it: a key truly held auto-repeats, each repeat
+// another key event (schedkey). One with no event for KEY_STALE lost
+// its release (a synthetic key-down, focus taken mid-press), and the
+// frame says to let go of it rather than draw on forever. KEY_STALE
+// outlasts the longest delays and intervals the systems' settings
+// offer: macOS 1.8 s (InitialKeyRepeat 120), Windows 1 s, GNOME 2 s.
+// With repeat turned off, ImGui's own repeat stops there too.
+//
 // Present is skipped when a frame hashes the same as what is on screen,
 // but frames stay paced to the display refresh either way.
 //
@@ -43,6 +52,7 @@ enum : i64 {
     PROBE_DELAY   = 250000,   // µs after going idle
     PROBE_REPEAT  = 1000000,  // µs between probes in aggressive mode
     PROBE_SLACK   = 50000,    // µs: no probe this close before a deadline
+    KEY_STALE     = 2500000,  // µs: a key held with no repeat was released
 };
 
 // Reasons a frame needs a successor, from the UI scan (ui.cpp)
@@ -105,7 +115,9 @@ struct Sched {
     b32 probing;    // staleness probe enabled
     b32 aggressive; // probe every PROBE_REPEAT while idle
     b32 probe;      // the running frame is a probe
+    b32 keylost;    // a key went stale since keyat (keyup given)
     i64 shadowat;   // when the next probe runs, 0 if none
+    i64 keyat;      // the last key event: down, up, or an auto-repeat
     u64 prevhash;   // last frame's draw hash
     u64 shownhash;  // the presented draw hash
 };
@@ -116,6 +128,7 @@ struct Frame {
     b32 stale;    // a probe found the screen out of date: a missed wake
     b32 runaway;  // it kept changing with no declared reason, so stopped
     b32 probe;    // it was a probe
+    b32 keyup;    // a key held with no repeat for KEY_STALE: release it
 };
 
 static Sched newsched(i64 now, i64 pace)
@@ -140,6 +153,14 @@ static void schedinput(Sched *s)
 {
     s->owed     = maxi32(s->owed, SETTLE_INPUT);
     s->shadowat = 0;
+}
+
+// A key event arrived at time t (µs): a press, a release, or the OS's
+// auto-repeat of a key held.
+static void schedkey(Sched *s, i64 t)
+{
+    s->keyat   = t;
+    s->keylost = 0;
 }
 
 // Drained events changed what the view shows.
@@ -237,6 +258,13 @@ static b32 schedbegin(Sched *s)
 static Frame schedend(Sched *s, u64 hash, u32 busy)
 {
     Frame r = {};
+    if (busy&BUSY_KEY && s->now-s->keyat>=KEY_STALE) {
+        // Its release was lost: the caller lets go of it, once, and it
+        // is busy no more whether or not that worked
+        busy      &= ~(u32)BUSY_KEY;
+        r.keyup    = !s->keylost;
+        s->keylost = 1;
+    }
     r.probe   = s->probe;
     r.present = s->force || hash!=s->shownhash;
     r.stale   = s->probe && r.present && !s->force;
@@ -250,6 +278,9 @@ static Frame schedend(Sched *s, u64 hash, u32 busy)
     s->owed     = maxi32(s->owed-1, 0);
     if (s->changing) {
         s->owed = maxi32(s->owed, 1);  // until two frames match
+    }
+    if (r.keyup) {
+        s->owed = maxi32(s->owed, 1);  // to take in the release
     }
     if (s->changing>=RUNAWAY && !busy) {
         // An animation nobody declared: stop rather than spin forever.

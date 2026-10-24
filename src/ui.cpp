@@ -262,6 +262,22 @@ static u32 uiscan()
     return busy;
 }
 
+// Let go of every key ImGui holds but modifiers, as busy counts them:
+// their releases were lost (schedend's keyup). Returns how many.
+static i32 uikeysup()
+{
+    ImGuiIO &io = ImGui::GetIO();
+    i32      n  = 0;
+    for (i32 k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
+        if (k>=ImGuiKey_MouseLeft && k<=ImGuiKey_MouseWheelY) continue;
+        if (!modifierkey(k) && ImGui::IsKeyDown((ImGuiKey)k)) {
+            io.AddKeyEvent((ImGuiKey)k, false);
+            n++;
+        }
+    }
+    return n;
+}
+
 // Timers ImGui runs without any event: tooltips, the caret, the
 // settings save. Declares a deadline for each pending one.
 static void uideadlines(Gui *g, Sched *s)

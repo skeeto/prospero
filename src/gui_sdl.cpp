@@ -28,7 +28,9 @@
 // has no Dock icon on macOS (an accessory app). AppKit's reopen (the
 // Dock's icon clicked, or the app launched again through Launch
 // Services) comes as the tray's Open, by a method added at run time to
-// SDL's app delegate, so that it brings a shed window back too.
+// SDL's app delegate, so that it brings a shed window back too. SDL
+// waits for events on a window, and with none it polls instead, every
+// millisecond (3-4% of a core): a hidden window stands in while shed.
 //
 // SDL reports the system's theme (macOS: the app's effective appearance;
 // Linux: the desktop portal's color-scheme, unknown without one, taken
@@ -99,6 +101,7 @@ struct TrayItem {
 struct GuiSdl {
     Gui          *gui;
     SDL_Window   *window;      // null while shed (os_guished)
+    SDL_Window   *waiter;      // hidden, while shed: SDL waits on it
     SDL_GLContext gl;
     SDL_Tray     *tray;
     TrayItem      items[3];
@@ -505,7 +508,12 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
         dockicon(1);
         #endif
         p->framedark = -1;
-        return sdlwindow(os, g, p, title);
+        if (!sdlwindow(os, g, p, title)) {
+            return 0;
+        }
+        SDL_DestroyWindow(p->waiter);
+        p->waiter = 0;
+        return 1;
     }
     p = alloc<GuiSdl>(&g->perm);
     p->gui = g;
@@ -948,6 +956,7 @@ static void os_guished(Os *os)
     SDL_DestroyWindow(p->window);
     p->window = 0;
     p->gl     = 0;
+    p->waiter = SDL_CreateWindow("", 1, 1, SDL_WINDOW_HIDDEN);
     #ifdef __APPLE__
     if (p->tray) {
         dockicon(0);  // the menu bar icon is the way back

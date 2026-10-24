@@ -66,6 +66,7 @@ static void simframe(Sim *m)
     if (f.stale)   putbyte(&m->trace, 'S');
     if (f.runaway) putbyte(&m->trace, 'R');
     if (f.probe)   putbyte(&m->trace, '?');
+    if (f.keyup)   putbyte(&m->trace, 'K');
     putbyte(&m->trace, '@');
     print(&m->trace, m->s.now/1000);
     putbyte(&m->trace, ' ');
@@ -210,6 +211,29 @@ static void test_sched(Test *t)
         simrun(&m, 3000000);
         expect(t, "sched.busyheld", simtrace(&m),
             "F@2000 F@2016 F@2033 F@2050 | wait");
+    }
+
+    // A key held keeps frames coming while the OS repeats it; with no
+    // event for KEY_STALE its release was lost: let go of it, once, and
+    // stop, though ImGui still holds it here
+    {
+        Sim m = newsim(&a, 500000);
+        u32 busy[] = {BUSY_KEY};
+        m.busy  = busy;
+        m.nbusy = 1;
+        simrun(&m, 10000000);
+        expect(t, "sched.keylost", simtrace(&m),
+            "FP@0 F@500 F@1000 F@1500 F@2000 FK@2500 F@3000 | wait");
+        m.s.now = 10000000;
+        schedinput(&m.s);
+        schedkey(&m.s, m.s.now);
+        simrun(&m, 11900000);
+        expect(t, "sched.keyheld", simtrace(&m),
+            "F@10000 F@10500 F@11000 F@11500 | t=12000");
+        schedkey(&m.s, m.s.now);  // a repeat at 11.9 s
+        simrun(&m, 20000000);
+        expect(t, "sched.keyrepeat", simtrace(&m),
+            "F@12000 F@12500 F@13000 F@13500 F@14000 FK@14500 F@15000 | wait");
     }
 
     // A forced frame presents an unchanged picture

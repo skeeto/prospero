@@ -327,6 +327,7 @@ struct MetricsSnap {
     i32    owed;
     i32    changing;
     u32    busy;
+    i64    at;          // when it was taken
 };
 
 struct Fake {
@@ -842,6 +843,8 @@ struct Gui {
     Host              *host;       // this process as a host, else null
     i32                hostdone;   // atomic: that host has stopped
     b32                bg;         // the window is gone, the host runs on
+    i64                shedat;     // total.frames as it went
+    i64                shedframes; // frames drawn while shed: none, ever
     i32                shedreq;    // between frames: 1 the window goes,
                                    // 2 to the background
     i64                hostidle;   // ticks: --host-idle, else [host] idle_exit
@@ -4389,7 +4392,9 @@ static void shed(Gui *g)
     }
     saveini(g, 0);
     flushdeltas(g);
-    g->bg = 1;
+    g->bg     = 1;
+    g->shedat = g->total.frames;
+    schedminimize(&g->sched, 1);  // no frames, whatever is owed or busy
     // The tray first, for the window's going to hide the Dock's icon
     // too (macOS): the tray's icon is the way back
     if (!g->trayup) {
@@ -4460,12 +4465,15 @@ static void reopen(Gui *g)
         os_guiraise(g->os);
         return;
     }
+    i64 frames = g->total.frames;  // before the opening draws any
     if (!os_guiopen(g->os, g, "Prospero")) {
         guilog(g, "cannot open a window");
         return;
     }
-    g->bg = 0;
-    g->sched.pace = os_guirefresh(g->os);
+    g->bg          = 0;
+    g->shedframes += frames - g->shedat;
+    g->sched.pace  = os_guirefresh(g->os);
+    schedminimize(&g->sched, 0);
     schedforce(&g->sched);
 
     Arena    a   = g->frame;
@@ -5037,6 +5045,9 @@ static void gui_input(Gui *g, i32 kind)
 {
     schedinput(&g->sched);
     g->lastinput = os_ticks(g->os);
+    if (kind == INPUT_KEY) {
+        schedkey(&g->sched, g->lastinput);  // a held key's repeats too
+    }
     g->woke |= WOKE_INPUT;
     g->inputs[g->ninputs++ % countof(g->inputs)] = kind;
     if (kind==INPUT_KEY || kind==INPUT_TEXT || kind==INPUT_BUTTON) {
@@ -5603,6 +5614,7 @@ static void snapshot(Gui *g)
     m->owed       = s->owed;
     m->changing   = s->changing;
     m->busy       = s->busy;
+    m->at         = s->now;
 }
 
 // Roll the per-second counters forward to now.
@@ -5855,6 +5867,15 @@ static void gui_frame(Gui *g)
     g->lastdeadline = s->deadline;
     g->lastduewhy   = s->duewhy;
     Frame f = schedend(s, hash, busy);
+    if (f.keyup) {
+        Arena a = g->frame;
+        Buf   b(&a, 96);
+        print(&b, "no key event for ");
+        print(&b, (s->now - s->keyat)/1000);
+        print(&b, " ms with a key held: its release was lost, let go of ");
+        print(&b, (i64)uikeysup());
+        guilog(g, finish(&b));
+    }
     if (g->trace) {
         traceframe(g, f, busy);
     }
@@ -5921,10 +5942,12 @@ static void gui_frame(Gui *g)
 
     // The overlay's numbers change at most once a second, at the first
     // frame past a second boundary, or by a deadline then if idle. The
-    // frames that only show new numbers are not work to report.
+    // frames that only show new numbers are not work to report. Frames
+    // that run on are, each second as they go, lest the overlay stand
+    // still exactly while they run (a reason to go on that never ends).
+    g->unsnapped |= g->episode;
     if (!s->owed && !s->busy) {
-        g->unsnapped |= g->episode;
-        g->episode  = 0;
+        g->episode = 0;
     }
     if (g->unsnapped && g->metricsshown) {
         schedat(s, g->nextsnap, DUE_CLOCK);
@@ -6591,6 +6614,9 @@ enum : i32 {
     CHK_KIDALWAYS,
     CHK_IMPORTCWD,
     CHK_IMPORTREMOTE,
+    CHK_SHEDQUIET,
+    CHK_KEYLOST,
+    CHK_SNAPLIVE,
     CHK_COUNT,
 };
 
@@ -6757,6 +6783,9 @@ static Str chknames[] = {
     "the subagent typed for good, asked once",
     "the import dialog holds the directory there",
     "the imported session is shown on the remote host, no records lost",
+    "no frames while the window was gone",
+    "a key whose release was lost was let go of, and frames stopped",
+    "the metrics overlay's numbers went on as frames ran on",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -7033,6 +7062,20 @@ static DriveOp driveops[] = {
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_IDLE, 0, 0, 0, 0, "idle 3 s"},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    // A key pressed whose release never comes (synthetic typing, focus
+    // taken mid-press) is busy as if held, the metrics overlay's numbers
+    // following the frames as they run, until no auto-repeat came for
+    // KEY_STALE: then it is let go of, and frames stop. Away from the
+    // prompt first, whose caret would blink again after a key
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_KEYDOWN, 0, GKEY_G, 0, 0, ""},
+    {OP_MARK, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_SNAPLIVE, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    {OP_MARK, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_KEYLOST, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
@@ -7743,6 +7786,20 @@ static DriveOp m3ops[] = {
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_IDLE, 0, 0, 0, 0, "idle 3 s"},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    // A key pressed whose release never comes (synthetic typing, focus
+    // taken mid-press) is busy as if held, the metrics overlay's numbers
+    // following the frames as they run, until no auto-repeat came for
+    // KEY_STALE: then it is let go of, and frames stop. Away from the
+    // prompt first, whose caret would blink again after a key
+    {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_KEYDOWN, 0, GKEY_G, 0, 0, ""},
+    {OP_MARK, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_SNAPLIVE, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    {OP_MARK, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_KEYLOST, 0, 0, 0, ""},
     // Closing with a turn running asks first; Cancel goes back, and
     // stopping quits
     {OP_PROMPT, 0, 0, 0, 100, "Close me: run a very slow command."},
@@ -8406,8 +8463,9 @@ static DriveOp stopops[] = {
 // M5, keeping a turn running in the background (--background,
 // tests/gui.py --mode background): the window goes partway through a
 // streaming turn, and this process hosts its engine, keeping the state
-// directory's window lock (M9). The checklist goes on without frames
-// until tests/gui.py launches the GUI again on that state directory,
+// directory's window lock (M9), a key held as it goes (its release
+// lost). The checklist goes on without frames, none drawn for that
+// key, until tests/gui.py launches the GUI again on that state directory,
 // which hands off to this process and exits: the window comes back, a
 // client of its own host, showing the turn finished. Another launch,
 // and the tray's Open, then raise it. A new session there starts a
@@ -8432,6 +8490,9 @@ static DriveOp bgops[] = {
     {OP_CHECK, CHK_LIGHT, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "bg-1-close"},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    // A key's release lost as the window goes: busy, and no frames
+    // anyway while shed
+    {OP_KEYDOWN, 0, GKEY_G, 0, 100, ""},
     {OP_MOVE, T_CLOSEBG, 0, 0, 200, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -8446,6 +8507,7 @@ static DriveOp bgops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 15000, ""},
     {OP_MARK, 0, 0, 0, 1500, ""},
     {OP_CHECK, CHK_REOPENED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_SHEDQUIET, 0, 0, 0, ""},
     {OP_CHECK, CHK_GEOMKEPT, 0, 0, 0, ""},
     {OP_CHECK, CHK_BGDONE, 0, 0, 0, ""},
     {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
@@ -10764,6 +10826,31 @@ static b32 drivecheck(Gui *g, i32 chk)
         print(&b, g->trayup ? Str(", with a tray icon") : Str(", with no tray icon"));
         guilog(g, finish(&b));
         return g->bg && reg && listening;
+    }
+    case CHK_SHEDQUIET: {
+        Arena a = g->frame;
+        Buf   b(&a, 64);
+        print(&b, "drive: frames while shed: ");
+        print(&b, g->shedframes);
+        guilog(g, finish(&b));
+        return !g->shedframes;
+    }
+    case CHK_KEYLOST:
+        // Frames since the mark: the probe's and the script's own
+        return !ImGui::IsKeyDown(ImGuiKey_G) &&
+               drivequiet(g, "2 s after a key's release was lost", 2);
+    case CHK_SNAPLIVE: {
+        // Taken again a second or more into the run, the key busy: one
+        // a second, not only when frames stop
+        i64   ms = (g->snap.at - g->markat)/1000;
+        Arena a  = g->frame;
+        Buf   b(&a, 96);
+        print(&b, "drive: metrics snapshot ");
+        print(&b, ms);
+        print(&b, " ms after the mark");
+        print(&b, (g->snap.busy & BUSY_KEY) ? Str(", key busy") : Str(""));
+        guilog(g, finish(&b));
+        return g->snap.busy&BUSY_KEY && ms>=1000;
     }
     case CHK_REOPENED:
         return !g->bg && g->main->own && g->main->up && g->sess &&

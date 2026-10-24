@@ -762,7 +762,8 @@ def handoffproblems(status, lines, who):
 def background(args, host, guiargs, guicwd):
     """--mode background: the first window keeps its turn running in the
     background and goes, its process keeping the state directory's
-    window lock; the turn ends with no window; a second launch on that
+    window lock, its GUI thread idle (here, where that can be measured);
+    the turn ends with no window; a second launch on that
     state directory hands off to the first, which comes back, and exits;
     a third, the window up, raises it and exits; the first starts another
     turn, goes again, stops it from the tray, and its process ends after
@@ -796,6 +797,19 @@ def background(args, host, guiargs, guicwd):
             print(f"the first window's process, in the background: {kind}", flush=True)
             if kind != "UIElement":
                 problems.append(f"the first window's process is still in the Dock ({kind})")
+        if isinstance(host, Local):
+            # With no window, its GUI thread neither draws nor polls (SDL
+            # polls every millisecond with no window to wait on)
+            pid = guipid(host.prospero, host.path("state"))
+            time.sleep(1)  # the window's going settles
+            gui0 = mainthread(pid) if pid else None
+            time.sleep(4)
+            gui1 = mainthread(pid) if gui0 is not None else None
+            if gui1 is not None:
+                pct = 100 * (gui1 - gui0) / 4
+                print(f"the shed window's GUI thread: {pct:.1f}% of a core", flush=True)
+                if pct > 1:
+                    problems.append(f"the GUI thread works with no window ({pct:.1f}%)")
         regs = host.listdir(host.path("state", "hosts"))
         print(f"registered hosts: {regs}", flush=True)
         if not regs:
