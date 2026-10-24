@@ -571,8 +571,12 @@ static int makewindow(W32Gui *w, unsigned short const *title, int const *geom)
     w->width     = 0;
     w->height    = 0;
     w->showmax   = at && geom[GEOM_MAX];
+    // Maximized from creation, for a show that does not activate (the
+    // checklist's), as no show command maximizes without activating.
+    // Its normal box is still the one given.
+    DWORD style = WS_OVERLAPPEDWINDOW | (w->showmax ? WS_MAXIMIZE : 0);
     w->hwnd = CreateWindowExW(
-        0, L"prospero", (LPCWSTR)title, WS_OVERLAPPEDWINDOW,
+        0, L"prospero", (LPCWSTR)title, style,
         at ? geom[GEOM_X] : CW_USEDEFAULT, at ? geom[GEOM_Y] : CW_USEDEFAULT,
         at ? geom[GEOM_W] : 1280, at ? geom[GEOM_H] : 800, 0, 0, inst, 0
     );
@@ -734,11 +738,13 @@ extern "C" void w32gui_trayclose(void *p)
 }
 
 // Separate from opening, since showing sends WM_SIZE, which draws, which
-// needs the core to know this window.
+// needs the core to know this window. The checklist's shows as created,
+// maximized or not (SW_SHOWNOACTIVATE would restore it), without the
+// focus.
 extern "C" void w32gui_show(void *p)
 {
     W32Gui *w = (W32Gui *)p;
-    ShowWindow(w->hwnd, w->hooks.drive ? SW_SHOWNOACTIVATE :
+    ShowWindow(w->hwnd, w->hooks.drive ? SW_SHOWNA :
                         w->showmax     ? SW_SHOWMAXIMIZED  : SW_SHOWDEFAULT);
 }
 
