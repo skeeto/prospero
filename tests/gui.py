@@ -1343,7 +1343,7 @@ def main():
             problems.append("the editor's files are left: " + ", ".join(left))
         if args.shots:
             for name in ("history", "menu", "editing", "editfailed", "slash", "models",
-                         "drafts", "compacted", "restored"):
+                         "drafts", "attached", "images", "compacted", "restored"):
                 if not os.path.exists(os.path.join(args.shots, f"compose-{name}.png")):
                     problems.append(f"no compose-{name}.png")
     else:

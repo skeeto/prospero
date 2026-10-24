@@ -56,6 +56,7 @@ Run it alone with:  uv run tests/fake_provider.py [--port N]
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import random
@@ -2091,7 +2092,8 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Stream for the link", "Look at the desktop", "Think slowly",
                "Think briefly", "Answer at length", "Write outside for good",
                "Start a desktop subagent", "Type on the desktop as a subagent",
-               "Start a subagent that messages", "Message the parent as a subagent")
+               "Start a subagent that messages", "Message the parent as a subagent",
+               "Describe the images")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2155,6 +2157,8 @@ def gui_turn(req):
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i]
         c = m.get("content") or ""
+        if isinstance(c, list):  # with images: its text parts
+            c = "".join(p.get("text", "") for p in c if p.get("type") == "text")
         if m.get("role") == "user" and isinstance(c, str) and \
                 any(k in c for k in GUI_PROMPTS):
             after = msgs[i+1:]
@@ -2166,7 +2170,13 @@ def gui_turn(req):
 def sc_gui(model, n, req):
     prompt, step, after = gui_turn(req)
     last = after[-1] if after else {}
-    if "Stream in the background" in prompt:
+    if "Describe the images" in prompt:
+        # Attached in the compose box: as many as it sent, each a PNG
+        images = user_images(req)
+        ok = all(mime == "image/png" and base64.b64decode(data).startswith(b"\x89PNG")
+                 for mime, data in images)
+        yield from answer(model, f"I see {len(images)} images{'' if ok else ', some broken'}.")
+    elif "Stream in the background" in prompt:
         # About 8 s: the window goes partway through, and the rest
         # streams to nobody but the log
         yield S.head()

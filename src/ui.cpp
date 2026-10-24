@@ -1326,26 +1326,33 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
     }
 }
 
-// A screenshot's thumbnail below its tool row, fetched as it first
-// shows, which opens the image whole in the Screenshot window.
-static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, ViewTool *t,
-                      ImVec2 p0, Thumb th, f32 top, f32 bot)
+static void itemnamed(Gui *, Str);
+
+// A screenshot's thumbnail below its tool row, or an image's below the
+// user's message it was attached to, fetched as it first shows, which
+// opens the image whole in the Screenshot window. A JPEG, which nothing
+// here decodes, shows as a box saying so.
+static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, Str path, i32 w, i32 h,
+                      b32 user, ImVec2 p0, Thumb th, f32 top, f32 bot)
 {
-    Arena    a  = g->frame;
-    f32      sc = g->scale;
-    ImVec2   p1 = v2(p0.x+th.w, p0.y+th.h);
-    b32      in = p1.y>=top && p0.y<=bot;
-    ImgSlot *sl = in ? imgslot(g, s, t->image) : 0;
+    Arena    a    = g->frame;
+    f32      sc   = g->scale;
+    ImVec2   p1   = v2(p0.x+th.w, p0.y+th.h);
+    b32      in   = p1.y>=top && p0.y<=bot;
+    b32      jpeg = endswith(path, ".jpg");
+    ImgSlot *sl   = in && !jpeg ? imgslot(g, s, path) : 0;
     if (sl && sl->state==IMG_READY) {
         dl->AddImage(sl->tex->td.GetTexRef(), p0, p1);
         g->thumbsdrawn++;
+        g->userthumbs += user;
     } else {
         dl->AddRectFilled(p0, p1, g->pal->codebg);
-        Str msg = !in ? Str("") :
-                  !sl ? Str("Too many screenshots in view to show this one") :
-                  sl->state==IMG_FAILED ? concat(&a, "Cannot show the screenshot: ",
+        Str msg = !in  ? Str("") :
+                  jpeg ? Str("A JPEG, which cannot be shown here") :
+                  !sl  ? Str("Too many images in view to show this one") :
+                  sl->state==IMG_FAILED ? concat(&a, "Cannot show the image: ",
                                                  imgstr(&sl->err)) :
-                  Str("Loading the screenshot...");
+                  Str("Loading the image...");
         u32 col = sl && sl->state==IMG_FAILED ? g->pal->bad : g->pal->dim;
         ImVec4 clip = ImVec4(p0.x, p0.y, p1.x, p1.y);
         dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), v2(p0.x+6*sc, p0.y+4*sc),
@@ -1354,14 +1361,19 @@ static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, ViewTool *t,
     dl->AddRect(p0, p1, g->pal->rule);
 
     ImGui::SetCursorScreenPos(p0);
-    if (ImGui::InvisibleButton("##thumb", v2(th.w, th.h))) {
-        imgopen(g, s, t->image, t->imgw, t->imgh);
+    if (ImGui::InvisibleButton("##thumb", v2(th.w, th.h)) && !jpeg) {
+        imgopen(g, s, path, w, h);
     }
-    itemrect(g, RECT_THUMB);
-    if (ImGui::IsItemHovered()) {
+    if (user) {
+        itemnamed(g, "user image");
+    } else {
+        itemrect(g, RECT_THUMB);
+    }
+    if (ImGui::IsItemHovered() && !jpeg) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     }
-    ImGui::SetItemTooltip("%dx%d pixels: open it whole", t->imgw, t->imgh);
+    ImGui::SetItemTooltip(jpeg ? "%dx%d pixels, sent as a JPEG" : "%dx%d pixels: open it whole",
+                          w, h);
 }
 
 // The latest rewind's button, when it left files alone.
@@ -2132,9 +2144,11 @@ static void drawtranscript(Gui *g)
     v->gap   = 6*sc;
     f32 thumbw = (f32)IMG_THUMBW*sc<width ? (f32)IMG_THUMBW*sc : width;
     f32 thumbh = (f32)IMG_THUMBH*sc;
-    if (v->thumbw!=thumbw || v->thumbh!=thumbh || v->thumbpad!=pad/2) {
+    if (v->thumbw!=thumbw || v->thumbh!=thumbh || v->thumbpad!=pad/2 ||
+            v->thumbrow!=width) {
         v->topsdirty = 1;
     }
+    v->thumbrow = width;
     v->thumbw   = thumbw;
     v->thumbh   = thumbh;
     v->thumbpad = pad/2;
@@ -2432,7 +2446,18 @@ static void drawtranscript(Gui *g)
         Thumb th = msgthumb(v, m);
         if (th.h > 0) {
             sp->SetCurrentChannel(dl, CH_TEXT);
-            drawthumb(g, gs, dl, m->tool, v2(x, y + head + m->h + pad/4), th, top, bot);
+            drawthumb(g, gs, dl, m->tool->image, m->tool->imgw, m->tool->imgh, 0,
+                      v2(x, y + head + m->h + pad/4), th, top, bot);
+        } else if (mfoot>0 && m->role==VIEW_USER) {
+            sp->SetCurrentChannel(dl, CH_TEXT);
+            for (iz k = 0; k < m->images.len; k++) {
+                ViewImage *im = &m->images[k];
+                ThumbAt    t  = userthumbat(v, m, k);
+                ImGui::PushID((i32)k);
+                drawthumb(g, gs, dl, im->name, im->w, im->h, 1,
+                          v2(x + t.x, y + head + m->h + pad/4 + t.y), {t.w, t.h}, top, bot);
+                ImGui::PopID();
+            }
         } else if (mfoot>0 && m->role==VIEW_ASK) {
             ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
             drawaskbuttons(g, gs, m, i==lastask);
@@ -2951,6 +2976,104 @@ static void drawqueue(Gui *g, GuiSession *s)
     g->queueshown = (i32)v->queue.len;
 }
 
+// The images attached to the draft: thumbnails above the box, in rows,
+// each with an x that removes it, dimmed while they are sent.
+static void drawattached(Gui *g, GuiSession *s)
+{
+    AttBox     *x    = s->att;
+    Arena       a    = g->frame;
+    f32         sc   = g->scale;
+    f32         box  = (f32)ATT_THUMB * sc;
+    f32         gap  = 6*sc;
+    f32         rad  = 8*sc;
+    ImDrawList *dl   = ImGui::GetWindowDrawList();
+    ImVec2      p    = ImGui::GetCursorScreenPos();
+    f32         maxw = ImGui::GetContentRegionAvail().x;
+    f32         cx   = 0;
+    f32         cy   = 0;
+    b32         busy = x->state != ATT_IDLE;
+    i32         drop = -1;
+    for (i32 i = 0; i < x->len; i++) {
+        AttImage *m = x->imgs + i;
+        if (cx>0 && cx+box>maxw) {
+            cx  = 0;
+            cy += box + gap;
+        }
+        ImVec2 c0 = v2(p.x+cx, p.y+cy);
+        ImVec2 c1 = v2(c0.x+box, c0.y+box);
+        cx += box + gap;
+        dl->AddRectFilled(c0, c1, g->pal->codebg, 4*sc);
+
+        // The image fit in the box: its own thumbnail, else as uploaded
+        ImTextureData *td = m->tex ? &m->tex->td : 0;
+        if (!td && m->name.len && m->mime=="image/png") {
+            ImgSlot *sl = imgslot(g, s, m->name);
+            td = sl && sl->state==IMG_READY ? &sl->tex->td : 0;
+        }
+        if (td) {
+            f32 iw = (f32)td->Width;
+            f32 ih = (f32)td->Height;
+            f32 k  = box/iw < box/ih ? box/iw : box/ih;
+            k = k<1 ? k : 1;
+            ImVec2 q0 = v2(c0.x + (box - iw*k)/2, c0.y + (box - ih*k)/2);
+            dl->AddImage(td->GetTexRef(), q0, v2(q0.x+iw*k, q0.y+ih*k), v2(0, 0), v2(1, 1),
+                         busy ? IM_COL32(255, 255, 255, 110) : IM_COL32_WHITE);
+            g->attready++;
+        } else {
+            Str t = m->mime=="image/jpeg" ? Str("JPEG") : Str("PNG");
+            dl->AddText(v2(c0.x+6*sc, c0.y+4*sc), g->pal->dim, t.cdata, t.cdata+t.len);
+        }
+        dl->AddRect(c0, c1, g->pal->rule, 4*sc);
+
+        ImGui::PushID(i);
+        // Its x, in a circle at the corner, before the rest of the
+        // thumbnail claims the pointer
+        ImVec2 k = v2(c1.x - rad - 2*sc, c0.y + rad + 2*sc);
+        ImGui::SetCursorScreenPos(v2(k.x-rad, k.y-rad));
+        ImGui::BeginDisabled(busy);
+        b32 go  = ImGui::InvisibleButton("##remove", v2(2*rad, 2*rad));
+        b32 hov = ImGui::IsItemHovered();
+        ImGui::EndDisabled();
+        if (!busy) {
+            itemnamed(g, "attach remove");
+            ImGui::SetItemTooltip("Remove it");
+            f32 d = rad*0.4f;
+            dl->AddCircleFilled(k, rad, hov ? g->pal->bad : g->pal->paneldim);
+            dl->AddLine(v2(k.x-d, k.y-d), v2(k.x+d, k.y+d), g->pal->codebg, 1.5f*sc);
+            dl->AddLine(v2(k.x-d, k.y+d), v2(k.x+d, k.y-d), g->pal->codebg, 1.5f*sc);
+        }
+
+        ImGui::SetCursorScreenPos(c0);
+        ImGui::InvisibleButton("##att", v2(box, box));
+        if (ImGui::IsItemHovered()) {
+            Buf b(&a, 128 + m->label.len);
+            print(&b, m->label.len ? m->label : Str("Pasted"));
+            print(&b, ", ");
+            print(&b, (i64)m->w);
+            putbyte(&b, 'x');
+            print(&b, (i64)m->h);
+            print(&b, m->mime=="image/jpeg" ? Str(" JPEG") : Str(" PNG"));
+            if (m->data.len) {
+                print(&b, ", ");
+                print(&b, bytesize(&a, m->data.len));
+            }
+            print(&b, busy ? Str(": being sent") : Str(": sent with the next message"));
+            ImGui::SetTooltip("%s", cstr0(&a, finish(&b)));
+        }
+        drop = go ? i : drop;
+        ImGui::PopID();
+    }
+    ImGui::SetCursorScreenPos(p);
+    ImGui::Dummy(v2(maxw, cy + box));
+    if (busy) {
+        ImGui::TextDisabled(x->state==ATT_UPLOADING ? "sending the images..." : "sending...");
+    }
+    g->attshown = x->len;
+    if (drop >= 0) {
+        attachremove(g, s, drop);
+    }
+}
+
 static void drawprompt(Gui *g)
 {
     f32         sc  = g->scale;
@@ -2966,6 +3089,8 @@ static void drawprompt(Gui *g)
     g->histshown   = 0;
     g->editshown   = 0;
     g->queueshown  = 0;
+    g->attshown    = 0;
+    g->attready    = 0;
     drawstrip(g);
 
     // A line for the editor at work, else the latest command's outcome
@@ -2990,6 +3115,9 @@ static void drawprompt(Gui *g)
     View *sv = g->sess ? g->sess->view : 0;
     if (sv && sv->queue.len && !g->sess->readonly && hostcap(g->sess->host, "queue")) {
         drawqueue(g, g->sess);
+    }
+    if (g->sess && g->sess->att && g->sess->att->len) {
+        drawattached(g, g->sess);
     }
 
     ImGui::PushID(s);
@@ -3061,6 +3189,14 @@ static void drawprompt(Gui *g)
     if (slash) {
         flags |= ImGuiInputTextFlags_AllowTabInput;  // to complete, not move on
     }
+    // Paste: an image, or an image file, the clipboard holds is attached,
+    // the key kept from the box
+    if (active && !editing && g->sess && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_V) &&
+            attachpaste(g, s)) {
+        ImGui::SetKeyOwner(ImGuiKey_V, ImGui::GetID("##attachpaste"), ImGuiInputFlags_LockThisFrame);
+        g->promptfocus = 1;
+    }
+
     f32 bw = 80*sc;
     ImVec2 size = v2(ImGui::GetContentRegionAvail().x - bw - ImGui::GetStyle().ItemSpacing.x,
                      ImGui::GetContentRegionAvail().y);
@@ -3152,6 +3288,17 @@ static void drawprompt(Gui *g)
         ImGui::SetItemTooltip("Cancel the turn, killing any command it runs (Esc)");
     }
     ImGui::EndDisabled();
+    if (g->sess && hostcap(s->host, "images")) {
+        Str why = attachwhy(s);
+        ImGui::BeginDisabled(why.len>0 || editing);
+        if (ImGui::Button("Image...", v2(bw, 0))) {
+            attachpick(g, s);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "attach");
+        whytip(why.len ? why : Str("Attach an image, PNG or JPEG, to the next message: "
+                                   "or drop one on the window, or paste one"));
+    }
     if (g->sess && hostcap(s->host, "plan") && !v->parent.len) {
         Str why = planwhy(g, s, !v->plan);
         ImGui::BeginDisabled(why.len > 0);
@@ -3190,6 +3337,12 @@ static void drawprompt(Gui *g)
         } else if (sk.skill.len && hostcap(s->host, "skills")) {
             draftdone(&s->dclock);
             guiskill(g, s, sk.skill, sk.arg, p);
+            draftput(g, s, "");
+        } else if (s->att && s->att->state!=ATT_IDLE) {
+            setnote(g, s, "wait for the images being sent", 1);
+        } else if (s->att && s->att->len) {
+            draftdone(&s->dclock);
+            attachsend(g, s, p);
             draftput(g, s, "");
         } else if (p.len) {
             draftdone(&s->dclock);  // the prompt clears the engine's draft

@@ -728,6 +728,11 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
     case SDL_EVENT_SYSTEM_THEME_CHANGED:
         gui_systheme(g, sysdark(p));
         return;
+    case SDL_EVENT_DROP_FILE:
+        if (e->drop.data) {
+            gui_drop(g, {(u8 *)e->drop.data, (iz)SDL_strlen(e->drop.data)});
+        }
+        return;
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
     case SDL_EVENT_WINDOW_EXPOSED:
@@ -924,6 +929,7 @@ static void os_guiinject(Os *os, GuiEvent *ge)
             {SDLK_R,      SDL_SCANCODE_R},
             {SDLK_UP,     SDL_SCANCODE_UP},
             {SDLK_DOWN,   SDL_SCANCODE_DOWN},
+            {SDLK_V,      SDL_SCANCODE_V},
         };
         e.type         = ge->down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
         e.key.windowID = id;
@@ -966,6 +972,13 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         // As SDL reports a change, which the pretense then answers
         p->drivetheme = ge->x<0 ? 0 : ge->x>0 ? 2 : 1;
         e.type = SDL_EVENT_SYSTEM_THEME_CHANGED;
+        break;
+    case GEV_DROP:
+        e.type          = SDL_EVENT_DROP_FILE;
+        e.drop.windowID = id;
+        e.drop.x        = ge->x;
+        e.drop.y        = ge->y;
+        e.drop.data     = ge->text.cdata;  // outlives dispatch
         break;
     }
     e.common.timestamp = SDL_GetTicksNS();
@@ -1146,13 +1159,20 @@ static b32 os_guisave(Os *os, Arena scratch, Str title, Str name, Mailbox *mb,
     return 1;
 }
 
-// The same for a file to open, a raw log, answered as savedone does.
-static b32 os_guiopenfile(Os *os, Arena scratch, Str title, Mailbox *mb, u32 type, u64 id)
+// The same for a file to open, a raw log or an image, answered as
+// savedone does.
+static b32 os_guiopenfile(Os *os, Arena scratch, Str title, i32 kind, Mailbox *mb,
+                          u32 type, u64 id)
 {
-    static SDL_DialogFileFilter const filters[] = {
+    static SDL_DialogFileFilter const logs[] = {
         {"Session logs (*.jsonl)", "jsonl"},
         {"All files", "*"},
     };
+    static SDL_DialogFileFilter const images[] = {
+        {"Images (*.png, *.jpg)", "png;jpg;jpeg"},
+        {"All files", "*"},
+    };
+    SDL_DialogFileFilter const *filters = kind==OPEN_IMAGE ? images : logs;
     GuiSdl  *p = (GuiSdl *)os->gui;
     SdlSave *s = (SdlSave *)SDL_malloc(sizeof(SdlSave));
     if (!p || !p->window || !s) {
@@ -1166,10 +1186,10 @@ static b32 os_guiopenfile(Os *os, Arena scratch, Str title, Mailbox *mb, u32 typ
     SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_FILTERS_POINTER, (void *)filters);
     #ifdef __APPLE__
     // Cocoa's panel has no list of filters, and a "*" among them turns
-    // filtering off: logs only
+    // filtering off: logs or images only
     i64 nfilters = 1;
     #else
-    i64 nfilters = countof(filters);
+    i64 nfilters = 2;
     #endif
     SDL_SetNumberProperty(props, SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER, nfilters);
     SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_WINDOW_POINTER, p->window);
@@ -1177,6 +1197,114 @@ static b32 os_guiopenfile(Os *os, Arena scratch, Str title, Mailbox *mb, u32 typ
     SDL_ShowFileDialogWithProperties(SDL_FILEDIALOG_OPENFILE, savedone, s, props);
     SDL_DestroyProperties(props);
     return 1;
+}
+
+static i32 urlhex(u8 c)
+{
+    return c>='0' && c<='9' ? c-'0' : c>='a' && c<='f' ? c-'a'+10 :
+           c>='A' && c<='F' ? c-'A'+10 : -1;
+}
+
+// A file URL's path, its %XX escapes decoded, else null.
+static Str fileurlpath(Arena *a, Str url)
+{
+    Str r = {};
+    if (!startswith(url, "file://")) {
+        return r;
+    }
+    url = cuthead(url, 7);
+    iz i = 0;
+    for (; i<url.len && url[i]!='/'; i++) {}  // a host, usually none
+    url = cuthead(url, i);
+    r.data = alloc<u8>(a, url.len);
+    for (iz k = 0; k < url.len; k++) {
+        u8  c = url[k];
+        i32 hi = k+2<url.len ? urlhex(url[k+1]) : -1;
+        i32 lo = k+2<url.len ? urlhex(url[k+2]) : -1;
+        if (c=='%' && hi>=0 && lo>=0) {
+            c  = (u8)(hi<<4 | lo);
+            k += 2;
+        }
+        r.data[r.len++] = c;
+    }
+    return r;
+}
+
+// The clipboard's image, as PNG (or JPEG) from SDL's MIME types, else
+// the first file it holds, as Finder (public.file-url) or a Linux file
+// manager (text/uri-list) puts it there.
+static ClipImage os_guiclipimage(Os *, Arena *a)
+{
+    ClipImage r = {};
+    static char const *mimes[] = {"image/png", "image/jpeg"};
+    for (i32 i = 0; i < countof(mimes); i++) {
+        if (!SDL_HasClipboardData(mimes[i])) {
+            continue;
+        }
+        size_t len  = 0;
+        void  *data = SDL_GetClipboardData(mimes[i], &len);
+        if (data && len>0 && len<=(size_t)ATTACH_UPLOAD) {
+            r.data = clone(a, Str{(u8 *)data, (iz)len});
+        }
+        SDL_free(data);
+        if (r.data.len) {
+            return r;
+        }
+    }
+    #ifdef __APPLE__
+    char const *urls = "public.file-url";
+    #else
+    char const *urls = "text/uri-list";
+    #endif
+    if (SDL_HasClipboardData(urls)) {
+        size_t len  = 0;
+        void  *data = SDL_GetClipboardData(urls, &len);
+        if (data && len>0 && len<4096) {
+            Str list = {(u8 *)data, (iz)len};
+            for (Str rest = list; rest.len && !r.path.data;) {
+                Cut c = cut(rest, '\n');
+                rest  = c.tail;
+                Str l = trim(c.head);
+                if (l.len && l[0]!='#') {
+                    r.path = fileurlpath(a, l);
+                }
+            }
+        }
+        SDL_free(data);
+    }
+    return r;
+}
+
+// SDL asks for the PNG when something pastes it.
+static void const *SDLCALL clipsend(void *ud, char const *mime, size_t *size)
+{
+    Str *png = (Str *)ud;
+    if (mime && !SDL_strcmp(mime, "image/png")) {
+        *size = (size_t)png->len;
+        return png->data;
+    }
+    *size = 0;
+    return 0;
+}
+
+static void SDLCALL clipfree(void *ud)
+{
+    Str *png = (Str *)ud;
+    SDL_free(png);
+}
+
+static b32 os_guiclipput(Os *, Arena, Str png)
+{
+    // A copy that lives until the clipboard changes again
+    Str *keep = (Str *)SDL_malloc(sizeof(Str) + (size_t)png.len);
+    if (!keep) {
+        return 0;
+    }
+    keep->data = (u8 *)(keep + 1);
+    keep->len  = png.len;
+    SDL_memcpy(keep->data, png.data, (size_t)png.len);
+    static char const *mimes[] = {"image/png"};
+    return SDL_SetClipboardData(clipsend, clipfree, keep, mimes, 1);
 }
 
 // As a file URL, which the system opens with its file manager.

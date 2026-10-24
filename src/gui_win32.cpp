@@ -47,6 +47,7 @@ struct W32Hooks {
     void (*systheme)(void *gui, int dark);// the system's theme changed
     void (*tray)(void *gui, int item);    // a pick from the tray's menu
     void (*placed)(void *gui, int const *geom);  // moved, resized: GEOM_*
+    void (*drop)(void *gui, unsigned short const *path);  // a file dropped
     int    drive;                         // scripted: never take focus
 };
 
@@ -95,10 +96,18 @@ extern "C" int       w32gui_save(void *, unsigned short const *title,
                                  unsigned short const *name,
                                  void (*done)(void *ctx, unsigned short const *path),
                                  void const *ctx, int ctxlen);
-// The open dialog likewise, for a session's raw log (*.jsonl)
-extern "C" int       w32gui_openfile(void *, unsigned short const *title,
+// The open dialog likewise, for a session's raw log (*.jsonl), or for
+// an image (images)
+extern "C" int       w32gui_openfile(void *, unsigned short const *title, int images,
                                      void (*done)(void *ctx, unsigned short const *path),
                                      void const *ctx, int ctxlen);
+// The clipboard's data in a format (W32CLIP_*), copied to buf if it has
+// room: its size in bytes, or -1 if it holds none. A file is its path,
+// the first of those copied, null-terminated UTF-16.
+enum { W32CLIP_PNG, W32CLIP_DIBV5, W32CLIP_DIB, W32CLIP_FILE };
+extern "C" long long w32gui_clip(void *, int format, void *buf, long long cap);
+// Put a PNG on the clipboard, as the "PNG" format. Returns 0 on failure.
+extern "C" int       w32gui_clipput(void *, void const *png, long long len);
 extern "C" int       w32gui_reveal(unsigned short const *dir);
 extern "C" void      w32gui_letfront(unsigned long pid);  // AllowSetForegroundWindow
 
@@ -109,6 +118,7 @@ extern "C" void      w32gui_letfront(unsigned long pid);  // AllowSetForegroundW
 #include <commdlg.h>
 #include <objbase.h>
 #include <shellapi.h>
+#include <shlobj.h>  // DROPFILES
 #include <dwmapi.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -393,6 +403,19 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         h->close(h->gui);
         return 0;
 
+    case WM_DROPFILES: {
+        HDROP    d = (HDROP)wp;
+        UINT     n = DragQueryFileW(d, 0xffffffff, 0, 0);
+        wchar_t *p = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, 32768*sizeof(wchar_t));
+        for (UINT i = 0; p && i < n; i++) {
+            if (DragQueryFileW(d, i, p, 32768)) {
+                h->drop(h->gui, (unsigned short const *)p);
+            }
+        }
+        if (p) HeapFree(GetProcessHeap(), 0, p);
+        DragFinish(d);
+    } return 0;
+
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -556,6 +579,7 @@ static int makewindow(W32Gui *w, unsigned short const *title, int const *geom)
     if (!w->hwnd) {
         return 0;
     }
+    DragAcceptFiles(w->hwnd, TRUE);
     float scale = ImGui_ImplWin32_GetDpiScaleForHwnd(w->hwnd);
     if (!at) {
         RECT r = {0, 0, (LONG)(1280*scale), (LONG)(800*scale)};
@@ -854,7 +878,7 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         static WORD const vks[] = {
             VK_TAB, VK_CONTROL, VK_ESCAPE, VK_RETURN, 'C', VK_SHIFT, 'A',
             VK_END, VK_CONTROL, VK_OEM_PLUS, VK_OEM_MINUS, '0', 'F', 'G', 'T',
-            'R', VK_UP, VK_DOWN,
+            'R', VK_UP, VK_DOWN, 'V',
         };
         BYTE state[256];
         GetKeyboardState(state);
@@ -907,6 +931,26 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         w->drivetheme = x<0 ? 0 : x>0 ? 2 : 1;
         HANDLE t = CreateThread(0, 0, announcetheme, w->hwnd, 0, 0);
         if (t) CloseHandle(t);
+    } break;
+    case 12: {  // a file dropped, as Explorer drops it
+        int n = 0;
+        for (; text && text[n]; n++) {}
+        SIZE_T  size = sizeof(DROPFILES) + (SIZE_T)(n + 2)*sizeof(wchar_t);
+        HGLOBAL mem  = GlobalAlloc(GMEM_MOVEABLE|GMEM_ZEROINIT, size);
+        DROPFILES *df = mem ? (DROPFILES *)GlobalLock(mem) : 0;
+        if (!df) {
+            if (mem) GlobalFree(mem);
+            break;
+        }
+        df->pFiles = sizeof(DROPFILES);
+        df->pt.x   = (LONG)x;
+        df->pt.y   = (LONG)y;
+        df->fWide  = TRUE;
+        memcpy(df + 1, text, (size_t)n*sizeof(wchar_t));
+        GlobalUnlock(mem);
+        if (!PostMessageW(w->hwnd, WM_DROPFILES, (WPARAM)mem, 0)) {
+            GlobalFree(mem);
+        }
     } break;
     }
 }
@@ -988,6 +1032,7 @@ struct W32Save {
     HWND    main;    // the window, for its place at the call
     HWND    msgwin;  // the GUI thread's hidden window
     int     open;    // an open dialog, not a save dialog
+    int     images;  // and for an image
 };
 
 static thread_local HWND savemsgwin;  // the dialog's thread's W32Save's
@@ -1029,7 +1074,9 @@ static DWORD WINAPI savethread(void *arg)
     ofn.Flags       = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST |
                       OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
     if (s->open) {
-        ofn.lpstrFilter = L"Session logs (*.jsonl)\0*.jsonl\0All files\0*.*\0";
+        ofn.lpstrFilter = s->images
+                        ? L"Images (*.png, *.jpg)\0*.png;*.jpg;*.jpeg\0All files\0*.*\0"
+                        : L"Session logs (*.jsonl)\0*.jsonl\0All files\0*.*\0";
         ofn.Flags       = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
                           OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
     }
@@ -1053,7 +1100,7 @@ static DWORD WINAPI savethread(void *arg)
 static int w32dialog(void *p, unsigned short const *title,
                      unsigned short const *name,
                      void (*done)(void *, unsigned short const *),
-                     void const *ctx, int ctxlen, int open)
+                     void const *ctx, int ctxlen, int open, int images)
 {
     W32Gui  *w = (W32Gui *)p;
     W32Save *s = (W32Save *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(W32Save));
@@ -1066,8 +1113,9 @@ static int w32dialog(void *p, unsigned short const *title,
     lstrcpynW(s->title, (wchar_t const *)title, sizeof(s->title)/sizeof(s->title[0]));
     lstrcpynW(s->path, (wchar_t const *)name, sizeof(s->path)/sizeof(s->path[0]));
     memcpy(s->ctx, ctx, (size_t)ctxlen);
-    s->done = done;
-    s->open = open;
+    s->done   = done;
+    s->open   = open;
+    s->images = images;
     HANDLE t = CreateThread(0, 0, savethread, s, 0, 0);
     if (!t) {
         HeapFree(GetProcessHeap(), 0, s);
@@ -1082,14 +1130,73 @@ extern "C" int w32gui_save(void *p, unsigned short const *title,
                            void (*done)(void *, unsigned short const *),
                            void const *ctx, int ctxlen)
 {
-    return w32dialog(p, title, name, done, ctx, ctxlen, 0);
+    return w32dialog(p, title, name, done, ctx, ctxlen, 0, 0);
 }
 
-extern "C" int w32gui_openfile(void *p, unsigned short const *title,
+extern "C" int w32gui_openfile(void *p, unsigned short const *title, int images,
                                void (*done)(void *, unsigned short const *),
                                void const *ctx, int ctxlen)
 {
-    return w32dialog(p, title, (unsigned short const *)L"", done, ctx, ctxlen, 1);
+    return w32dialog(p, title, (unsigned short const *)L"", done, ctx, ctxlen, 1, images);
+}
+
+extern "C" long long w32gui_clip(void *p, int format, void *buf, long long cap)
+{
+    W32Gui *w  = (W32Gui *)p;
+    UINT    cf = format==W32CLIP_PNG   ? RegisterClipboardFormatW(L"PNG") :
+                 format==W32CLIP_DIBV5 ? CF_DIBV5 :
+                 format==W32CLIP_DIB   ? CF_DIB : CF_HDROP;
+    if (!cf || !IsClipboardFormatAvailable(cf) || !OpenClipboard(w ? w->hwnd : 0)) {
+        return -1;
+    }
+    long long n = -1;
+    HANDLE    h = GetClipboardData(cf);
+    if (h && cf==CF_HDROP) {
+        UINT len = DragQueryFileW((HDROP)h, 0, 0, 0);
+        if (len) {
+            n = (long long)(len + 1) * (long long)sizeof(wchar_t);
+            if (buf && cap>=n) {
+                DragQueryFileW((HDROP)h, 0, (wchar_t *)buf, len + 1);
+            }
+        }
+    } else if (h) {
+        void  *d  = GlobalLock(h);
+        SIZE_T sz = GlobalSize(h);
+        if (d) {
+            n = (long long)sz;
+            if (buf && cap>=n) {
+                memcpy(buf, d, sz);
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return n;
+}
+
+extern "C" int w32gui_clipput(void *p, void const *png, long long len)
+{
+    W32Gui *w  = (W32Gui *)p;
+    UINT    cf = RegisterClipboardFormatW(L"PNG");
+    HGLOBAL h  = cf ? GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)len) : 0;
+    void   *d  = h ? GlobalLock(h) : 0;
+    if (!d) {
+        if (h) GlobalFree(h);
+        return 0;
+    }
+    memcpy(d, png, (size_t)len);
+    GlobalUnlock(h);
+    if (!OpenClipboard(w ? w->hwnd : 0)) {
+        GlobalFree(h);
+        return 0;
+    }
+    EmptyClipboard();
+    int ok = SetClipboardData(cf, h) != 0;
+    CloseClipboard();
+    if (!ok) {
+        GlobalFree(h);
+    }
+    return ok;
 }
 
 extern "C" int w32gui_reveal(unsigned short const *dir)
@@ -1113,7 +1220,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
 static_assert((i32)W32IN_MOVE==(i32)INPUT_MOVE && (i32)W32IN_OTHER==(i32)INPUT_OTHER);
 static_assert(GEV_MOVE==0 && GEV_RESIZE==5 && GEV_MODALSIZE==6 && GEV_DPI==7 &&
-              GEV_CLOSE==8 && GEV_MINIMIZE==9 && GEV_SYSTHEME==10 && GEV_TRAY==11);
+              GEV_CLOSE==8 && GEV_MINIMIZE==9 && GEV_SYSTHEME==10 && GEV_TRAY==11 &&
+              GEV_DROP==12);
 static_assert(TRAY_OPEN==0 && TRAY_STOPALL==1 && TRAY_QUIT==2);
 
 W32(i32, GetCurrentThreadId());
@@ -1141,6 +1249,14 @@ static WinGeom fromgeom(int const *geom)
 static void hookplaced(void *g, int const *geom)
 {
     gui_placed((Gui *)g, fromgeom(geom));
+}
+
+static void hookdrop(void *p, unsigned short const *path)
+{
+    Gui *g = (Gui *)p;
+    iz   n = 0;
+    for (; path[n]; n++) {}
+    gui_drop(g, fromwide(&g->frame, (c16 *)path, n));  // until the next frame
 }
 
 static i32 os_guidisplays(Os *, WinBox *out, i32 max)
@@ -1228,6 +1344,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     h.systheme  = hooksystheme;
     h.tray      = hooktray;
     h.placed    = hookplaced;
+    h.drop      = hookdrop;
     h.drive     = g->drive;
     os->gui = w32gui_open(&h, wtitle, geom);
     if (!os->gui) {
@@ -1349,11 +1466,121 @@ static b32 os_guisave(Os *os, Arena scratch, Str title, Str name, Mailbox *mb,
                        savedone, &c, (int)sizeof(c));
 }
 
-static b32 os_guiopenfile(Os *os, Arena scratch, Str title, Mailbox *mb, u32 type, u64 id)
+static b32 os_guiopenfile(Os *os, Arena scratch, Str title, i32 kind, Mailbox *mb,
+                          u32 type, u64 id)
 {
     W32SaveCtx c = {mb, type, id};
     return w32gui_openfile(os->gui, (unsigned short *)towide(&scratch, title).data,
-                           savedone, &c, (int)sizeof(c));
+                           kind==OPEN_IMAGE, savedone, &c, (int)sizeof(c));
+}
+
+static i32 dibint(u8 *p)
+{
+    return (i32)((u32)p[0] | (u32)p[1]<<8 | (u32)p[2]<<16 | (u32)p[3]<<24);
+}
+
+// A device-independent bitmap, 24-bit, or 32-bit as BGRA (its alpha
+// kept unless all of it is zero, as most writers leave it), as a PNG in
+// a. Null if it is another kind.
+static Str dibpng(Os *os, Arena *a, Str dib)
+{
+    Str r = {};
+    if (dib.len < 40) {
+        return r;
+    }
+    u8 *p    = dib.data;
+    i32 hdr  = dibint(p);
+    i32 w    = dibint(p+4);
+    i32 h    = dibint(p+8);
+    i32 bpp  = p[14] | p[15]<<8;
+    i32 comp = dibint(p+16);
+    b32 down = h < 0;  // top-down
+    h = down ? -h : h;
+    if (hdr<40 || hdr>dib.len || w<1 || h<1 || (bpp!=24 && bpp!=32) ||
+            (comp!=0 && comp!=3) || (iz)w*h>(iz)ATTACH_PIXELS) {
+        return r;
+    }
+    // BI_BITFIELDS: its masks follow a short header, or are in a long
+    // one, and only the usual BGRA is taken
+    iz off = hdr + (comp==3 && hdr==40 ? 12 : 0);
+    if (comp==3 && (off>dib.len || dibint(p+40)!=0xff0000 ||
+                    dibint(p+44)!=0xff00 || dibint(p+48)!=0xff)) {
+        return r;
+    }
+    iz stride = ((iz)w*bpp/8 + 3) & ~(iz)3;
+    if (off>dib.len || stride*h>dib.len-off) {
+        return r;
+    }
+    iz      pixels = (iz)w * h;
+    Region *reg    = os_reserve(os, 14*pixels + ((iz)4<<20));
+    if (!reg) {
+        return r;
+    }
+    Arena t     = newarena(reg);
+    u8   *rgba  = allocbytes(&t, 4*pixels);
+    b32   alpha = 0;
+    for (i32 y = 0; y < h; y++) {
+        u8 *src = p + off + stride*(down ? y : h-1-y);
+        u8 *dst = rgba + (iz)y*w*4;
+        for (i32 x = 0; x < w; x++) {
+            u8 *s = src + x*(bpp/8);
+            dst[x*4+0] = s[2];
+            dst[x*4+1] = s[1];
+            dst[x*4+2] = s[0];
+            dst[x*4+3] = bpp==32 ? s[3] : 255;
+            alpha |= bpp==32 && s[3];
+        }
+    }
+    for (iz i = 0; !alpha && i < pixels; i++) {
+        rgba[i*4+3] = 255;
+    }
+    Str png = pngencodez(&t, rgba, w, h, 0);
+    if (png.len <= (iz)ATTACH_UPLOAD) {
+        r = clone(a, png);
+    }
+    os_release(os, reg);
+    return r;
+}
+
+// The clipboard's image: a PNG as it is, else a bitmap made one, else
+// the first file copied, by its path.
+static ClipImage os_guiclipimage(Os *os, Arena *a)
+{
+    ClipImage r = {};
+    for (i32 f = W32CLIP_PNG; f <= W32CLIP_FILE; f++) {
+        long long n = w32gui_clip(os->gui, f, 0, 0);
+        if (n<1 || n>ATTACH_UPLOAD) {
+            continue;
+        }
+        Arena t   = *a;
+        u8   *buf = allocbytes(&t, (iz)n);
+        if (w32gui_clip(os->gui, f, buf, n) != n) {
+            continue;
+        }
+        if (f == W32CLIP_PNG) {
+            *a     = t;
+            r.data = {buf, (iz)n};
+            return r;
+        } else if (f == W32CLIP_FILE) {
+            iz len = 0;
+            for (c16 *w = (c16 *)buf; len<n/2 && w[len]; len++) {}
+            *a     = t;
+            r.path = fromwide(a, (c16 *)buf, len);
+            return r;
+        }
+        Str png = dibpng(os, &t, {buf, (iz)n});
+        if (png.len) {
+            *a     = t;
+            r.data = png;
+            return r;
+        }
+    }
+    return r;
+}
+
+static b32 os_guiclipput(Os *os, Arena, Str png)
+{
+    return w32gui_clipput(os->gui, png.data, png.len);
 }
 
 static u32 os_guilimits(Os *)

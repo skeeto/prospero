@@ -348,8 +348,9 @@ static void    os_wake(Os *);
 // (dark or light) as the window opens and whenever it changes, and
 // gui_close when the user asks to close the window or quit, which the
 // core may decline: the window stays until os_guiclose. gui_tray tells
-// of a pick from the tray icon's menu (TRAY_*), and gui_placed of the
-// window moved, resized, maximized or restored (WinGeom, below).
+// of a pick from the tray icon's menu (TRAY_*), gui_placed of the
+// window moved, resized, maximized or restored (WinGeom, below), and
+// gui_drop of a file dropped on the window, by its path.
 struct Gui;
 // Open the main window with ImGui's platform and renderer backends, or
 // open it again after os_guished. Returns 0 on failure.
@@ -416,6 +417,7 @@ enum {
                     // or back to what it really is (x -1)
     GEV_TRAY,       // the tray icon's menu item x (TRAY_*) is picked,
                     // tray or not, window or not
+    GEV_DROP,       // a file, its path the text, is dropped on the window
 };
 enum {
     GKEY_TAB,
@@ -436,6 +438,7 @@ enum {
     GKEY_R,
     GKEY_UP,
     GKEY_DOWN,
+    GKEY_V,
 };
 struct GuiEvent {
     i32 kind;
@@ -480,11 +483,26 @@ static void    os_guiplace(Os *, WinGeom);
 // 0 if no dialog can be shown, when nothing is posted.
 static b32     os_guisave(Os *, Arena scratch, Str title, Str name, Mailbox *,
                           u32 type, u64 id);
-// (M9) Ask which file to open, a session's raw log (*.jsonl), likewise:
-// the path chosen, or an empty one if cancelled, posted to the mailbox
-// as a record of the type with id. Returns 0 if no dialog can be shown.
-static b32     os_guiopenfile(Os *, Arena scratch, Str title, Mailbox *,
-                              u32 type, u64 id);
+// (M9) Ask which file to open, of a kind (OPEN_*), likewise: the path
+// chosen, or an empty one if cancelled, posted to the mailbox as a
+// record of the type with id. Returns 0 if no dialog can be shown.
+enum : i32 {
+    OPEN_LOG,    // a session's raw log (*.jsonl)
+    OPEN_IMAGE,  // an image to attach (*.png, *.jpg, *.jpeg)
+};
+static b32     os_guiopenfile(Os *, Arena scratch, Str title, i32 kind,
+                              Mailbox *, u32 type, u64 id);
+// An image the clipboard holds, to attach, as PNG or JPEG bytes in a,
+// else a file it holds (a file manager's copy) as its path; both null if
+// neither.
+struct ClipImage {
+    Str data;
+    Str path;
+};
+static ClipImage os_guiclipimage(Os *, Arena *);
+// Put a PNG on the clipboard, as an image (the checklist's paste).
+// Returns 0 on failure.
+static b32     os_guiclipput(Os *, Arena scratch, Str png);
 // (M8) Show a directory in the platform's file manager: Finder,
 // Explorer, or whatever opens directories. Returns 0 on failure.
 static b32     os_guireveal(Os *, Arena scratch, Str dir);

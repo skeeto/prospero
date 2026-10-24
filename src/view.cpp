@@ -325,6 +325,14 @@ struct ViewInstr {
     Str importer;   // the file that imported it, if any
 };
 
+// An image the user attached to a message, in the session directory.
+struct ViewImage {
+    Str name;  // img/N.png or img/N.jpg
+    Str mime;
+    i32 w;
+    i32 h;
+};
+
 struct ViewMsg {
     Str       text;       // source, in the text arena
     i32       role;
@@ -347,6 +355,7 @@ struct ViewMsg {
     Str       from;       // a message's sender, a session's id
     ViewTool *tool;       // tool rows and asks
     ViewCard *card;       // compactions and rewinds
+    Slice<ViewImage> images;  // the user's, attached
     f64       top;        // prefix sum of heights above, with gaps
     f32       h;          // content height: measured, or estimated
     b32       measured;   // h is from a layout at the current width
@@ -408,6 +417,7 @@ struct View {
     f32             thumbw;     // the box a screenshot's thumbnail fits
     f32             thumbh;
     f32             thumbpad;   // and the space around it
+    f32             thumbrow;   // the width a user's thumbnails wrap at
     Sel             sel;
     i64             deltas;     // delta records applied, for rates
     i64             deltabytes;
@@ -445,6 +455,7 @@ struct View {
     i32             turn;
     i32             attempt;
     b32             busy;       // a turn is running
+    b32             novision;   // its model takes no images (live)
     b32             readonly;   // open elsewhere: answering is not possible
     i64             turnts;     // epoch ms the running turn began
     i32             asks;       // pending asks
@@ -1441,6 +1452,14 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         }
         i32 i = addmsg(v, VIEW_USER, typed);
         v->msgs[i].seq   = r->seq;
+        for (Json *k = jsonget(j, "images")->child; k; k = k->next) {
+            ViewImage im = {};
+            im.name = clone(&v->aux, jsonstr(jsonget(k, "name")));
+            im.mime = clone(&v->aux, jsonstr(jsonget(k, "mime")));
+            im.w    = (i32)jsonint(jsonget(k, "w"), 0);
+            im.h    = (i32)jsonint(jsonget(k, "h"), 0);
+            v->msgs[i].images = push(&v->aux, v->msgs[i].images, im);
+        }
         v->msgs[i].label = via=="steer" ? Str("You (steering)") :
                            via=="queue" ? Str("You (queued)") :
                            via=="task"  ? Str("Task from the parent agent") : Str{};
@@ -2109,7 +2128,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         i32  qpos     = v->queuepos;
         i32  qlen     = v->queuelen;
         i32  tasks    = v->tasks;
+        b32  novision = v->novision;
         v->state    = livestate(jsonstr(jsonget(j, "state")));
+        v->novision = jsonint(jsonget(j, "novision"), 0) != 0;
         v->queuepos = (i32)jsonint(jsonget(j, "queue_pos"), 0);
         v->queuelen = (i32)jsonint(jsonget(j, "queue_len"), 0);
         v->tasks    = (i32)jsonint(jsonget(j, "tasks"), 0);
@@ -2128,7 +2149,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         return gauge || state!=v->state || (i64)(tps*10)!=(i64)(v->tps*10) ||
                retryat!=v->retryat || moved<-50 || moved>50 ||
                moved2<-50 || moved2>50 || qpos!=v->queuepos ||
-               qlen!=v->queuelen || tasks!=v->tasks;
+               qlen!=v->queuelen || tasks!=v->tasks || novision!=v->novision;
     }
 
     case EV_PROGRESS:
@@ -2245,10 +2266,66 @@ static Thumb msgthumb(View *v, ViewMsg *m)
     return r;
 }
 
+// A user's attached image's thumbnail: fit in a quarter of the box.
+static Thumb userthumb(View *v, ViewImage *im)
+{
+    Thumb r  = {};
+    f32   bw = v->thumbw / 2;
+    f32   bh = v->thumbh / 2;
+    if (im->w<1 || im->h<1) {
+        r.w = bh;
+        r.h = bh;
+        return r;
+    }
+    f32 iw = (f32)im->w;
+    f32 ih = (f32)im->h;
+    f32 s  = bw/iw < bh/ih ? bw/iw : bh/ih;
+    s   = s<1 ? s : 1;
+    r.w = (f32)(i32)(iw*s + 0.5f);
+    r.h = (f32)(i32)(ih*s + 0.5f);
+    r.w = r.w<1 ? 1 : r.w;
+    r.h = r.h<1 ? 1 : r.h;
+    return r;
+}
+
+struct ThumbAt {
+    f32 x, y, w, h;
+};
+
+// Where a user message's kth thumbnail goes below it, from its left, in
+// rows wrapping at the view's width. For k past the last, y is the
+// height of them all.
+static ThumbAt userthumbat(View *v, ViewMsg *m, iz k)
+{
+    ThumbAt r    = {};
+    f32     rowh = 0;
+    for (iz i = 0; i<=k && i<m->images.len; i++) {
+        Thumb t = userthumb(v, &m->images[i]);
+        if (r.x>0 && r.x+t.w>v->thumbrow) {
+            r.x  = 0;
+            r.y += rowh + v->gap;
+            rowh = 0;
+        }
+        if (i == k) {
+            r.w = t.w;
+            r.h = t.h;
+            return r;
+        }
+        r.x += t.w + v->gap;
+        rowh = rowh>t.h ? rowh : t.h;
+    }
+    r.y += rowh;
+    return r;
+}
+
 // Below a message's content: an open ask's buttons, or the latest
-// rewind's, when it left files alone, or a screenshot's thumbnail.
+// rewind's, when it left files alone, or a screenshot's thumbnail, or
+// the user's attached images'.
 static f32 msgfoot(View *v, ViewMsg *m)
 {
+    if (m->role==VIEW_USER && m->images.len && !m->collapsed) {
+        return userthumbat(v, m, m->images.len).y + v->thumbpad;
+    }
     b32 ask   = m->role==VIEW_ASK && m->tool->answer==VASK_PENDING;
     b32 force = m->role==VIEW_REWIND && m->card->latest && m->card->conflicts;
     Thumb th  = msgthumb(v, m);
@@ -3023,6 +3100,10 @@ static void viewexport(Buf *b, View *v, Str sid, b32 think, b32 tools, b32 outpu
             putbyte(b, '\n');
             print(b, m->text);
             print(b, m->text.len && m->text[m->text.len-1]=='\n' ? Str("") : Str("\n"));
+            for (iz k = 0; k < m->images.len; k++) {
+                print(b, k ? Str(" [image]") : Str("\n[image]"));
+            }
+            print(b, m->images.len ? Str("\n") : Str(""));
             break;
         case VIEW_THINK:
             if (!think || !m->text.len) {
