@@ -3278,7 +3278,7 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
     }
 }
 static void onexportfile(Gui *, Arena, Json *, b32 ok, Str err);
-static void ondir(Gui *, i64 id, Json *, b32 ok, Str err);
+static void ondir(Gui *, Arena, i64 id, Json *, b32 ok, Str err);
 static void onimport(Gui *, GuiHost *, Arena, Request *, EvRec *);
 static void sessgone(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
@@ -3338,7 +3338,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         break;
 
     case CMD_DIR:
-        ondir(g, id, j, ok, err);
+        ondir(g, scratch, id, j, ok, err);
         return;
 
     case CMD_FILE:
@@ -4119,7 +4119,7 @@ static void dirput(PathComp *pc, DirList *l, Slice<PathEntry> ents, b32 more, St
 // The folders in a folder typed on a host, as listed so far, which is
 // listed if it is not, or was a while ago: here at once, or by the
 // host's engine (dir), its answer coming in later (ondir).
-static DirList *dirget(Gui *g, GuiHost *h, Str dir)
+static DirList *dirget(Gui *g, Arena scratch, GuiHost *h, Str dir)
 {
     DirList *l = dirslot(g, h, dir);
     if (l->id || (l->got && g->sched.now-l->at<DIRLIST_TTL)) {
@@ -4127,7 +4127,7 @@ static DirList *dirget(Gui *g, GuiHost *h, Str dir)
     }
     l->at = g->sched.now;
     if (h->kind != GH_REMOTE) {
-        Arena            a  = g->frame;
+        Arena            a  = scratch;
         HomePath         hp = tildepath(&a, dir, h->home, HOST_WINDOWS);
         Listing          ls = hp.err.len ? Listing{} :
                               os_listall(g->os, &a, hp.path, 1, DIRLIST_MAX);
@@ -4154,7 +4154,7 @@ static DirList *dirget(Gui *g, GuiHost *h, Str dir)
 }
 
 // A host's answer to dirget, for the list that asked, if still kept.
-static void ondir(Gui *g, i64 id, Json *j, b32 ok, Str err)
+static void ondir(Gui *g, Arena a, i64 id, Json *j, b32 ok, Str err)
 {
     PathComp *pc = &g->pc;
     DirList  *l  = 0;
@@ -4164,7 +4164,6 @@ static void ondir(Gui *g, i64 id, Json *j, b32 ok, Str err)
     if (!l) {
         return;
     }
-    Arena            a = g->frame;
     Slice<PathEntry> e = {};
     for (Json *x = jsonget(j, "entries")->child; ok && x; x = x->next) {
         Str name = jsonstr(jsonget(x, "name"));
@@ -4487,8 +4486,10 @@ static GuiHost *findhost(Gui *g, i32 kind, Str name)
 
 // Reach a host through the library. Sessions viewed here open again,
 // from where their views are, once it answers hello. A host still
-// closing is reached again once that ends (onhostend, hostagain).
-static b32 hostconnect(Gui *g, GuiHost *h, RemoteConf *rc)
+// closing is reached again once that ends (onhostend, hostagain). The
+// scratch is the caller's: a fresh copy of the frame arena would start
+// at its base, over whatever the caller still holds there.
+static b32 hostconnect(Gui *g, GuiHost *h, RemoteConf *rc, Arena scratch)
 {
     if (h->r && h->closing) {
         h->reconnect = 1;
@@ -4498,8 +4499,7 @@ static b32 hostconnect(Gui *g, GuiHost *h, RemoteConf *rc)
         return h->r != 0;
     }
     // ssh, as configured now, found as the editor is
-    Arena fa = g->frame;
-    rc->envpath = guipath(g, &fa);
+    rc->envpath = guipath(g, &scratch);
     // Its own memory, as connections come and go (its reservations are
     // never let go: the library's thread may outlive its MAIL_QUIT)
     Arena   ra = newarena(os_reserve(g->os, (iz)1<<22));
@@ -4578,7 +4578,7 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name)
         h->msg   = "no ssh destination: set ssh in its section";
         return h;
     }
-    hostconnect(g, h, &rc);
+    hostconnect(g, h, &rc, scratch);
     return h;
 }
 
@@ -4619,7 +4619,7 @@ static void findhosts(Gui *g, Arena a)
         rc.name       = "background";
         rc.endpoint   = e->endpoint;
         rc.localstate = g->statedir;
-        hostconnect(g, h, &rc);
+        hostconnect(g, h, &rc, a);
         g->hostfound++;
     }
 }
@@ -4679,7 +4679,7 @@ static void hostagain(Gui *g, GuiHost *h)
     rc.name       = "background";
     rc.endpoint   = h->endpoint;
     rc.localstate = g->statedir;
-    hostconnect(g, h, &rc);
+    hostconnect(g, h, &rc, g->frame);
 }
 
 // A host's connection ended (MAIL_QUIT). A background host's sessions
@@ -5676,7 +5676,7 @@ static void reopen(Gui *g)
     rc.name       = "background";
     rc.endpoint   = own->endpoint;
     rc.localstate = g->statedir;
-    hostconnect(g, own, &rc);
+    hostconnect(g, own, &rc, a);
     guiconfigget(g);
     os_guiraise(g->os);  // in front, as asked for from the tray
     guilog(g, "the window is back");

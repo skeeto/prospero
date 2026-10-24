@@ -5153,6 +5153,7 @@ struct PathCb {
     Gui            *g;
     PathQuery       q;
     Slice<PathPick> picks;
+    Arena           scratch;   // past the picks, for pathcb and pathafter
     b32             accepted;  // Tab accepted a pick
 };
 
@@ -5177,7 +5178,7 @@ static i32 pathcb(ImGuiInputTextCallbackData *d)
         }
         pc->shown = 1;
     } else if (d->EventFlag==ImGuiInputTextFlags_CallbackCompletion && n) {
-        Arena a = c->g->frame;
+        Arena a = c->scratch;
         Str   t = pathaccept(&a, c->q, c->picks[pc->sel>=0 ? pc->sel : 0]);
         if (t.len < d->BufSize) {
             d->DeleteChars(0, d->BufTextLen);
@@ -5232,8 +5233,11 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off)
     if (!active || !pathlistable(f.cb.q.dir, win)) {
         return f;
     }
-    f.list     = dirget(g, h, f.cb.q.dir);
-    f.cb.picks = pathpicks(a, f.list->ents, f.cb.q.filter, 1);
+    // Its own arena, never the frame's: the caller holds a copy of that,
+    // which a fresh one would write over
+    f.list       = dirget(g, *a, h, f.cb.q.dir);
+    f.cb.picks   = pathpicks(a, f.list->ents, f.cb.q.filter, 1);
+    f.cb.scratch = *a;
     i32 n      = (i32)f.cb.picks.len;
     pc->sel    = pc->sel<n ? pc->sel : -1;
     f.visible  = pc->shown && (n || f.list->err.len || !f.list->got);
@@ -5262,10 +5266,9 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off)
 }
 
 // Put an accepted pick in the field, from outside it.
-static void pathput(Gui *g, PathField *f, char *buf, PathPick p)
+static void pathput(PathField *f, char *buf, PathPick p, Arena scratch)
 {
-    Arena a = g->frame;
-    Str   t = pathaccept(&a, f->cb.q, p);
+    Str t = pathaccept(&scratch, f->cb.q, p);
     if (t.len < FIELD_MAX) {
         fieldput(buf, t);
         ImGuiInputTextState *st = ImGui::GetInputTextState(f->id);
@@ -5291,7 +5294,7 @@ static void pathafter(Gui *g, PathField *f, char *buf)
     Slice<PathPick> picks = f->cb.picks;
     i32             n     = (i32)picks.len;
     if (f->enter && pc->sel>=0 && pc->sel<n) {
-        pathput(g, f, buf, picks[pc->sel]);
+        pathput(f, buf, picks[pc->sel], f->cb.scratch);
         pc->shown = 0;
         pc->sel   = -1;
         pc->accepts++;
@@ -5322,7 +5325,7 @@ static void pathafter(Gui *g, PathField *f, char *buf)
                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
                           ImGuiWindowFlags_NoDocking;
     if (ImGui::Begin("##pathpick", 0, fl)) {
-        Arena       a    = g->frame;
+        Arena       a    = f->cb.scratch;
         DirList    *l    = f->list;
         ImDrawList *dl   = ImGui::GetWindowDrawList();
         f32         rw   = ImGui::GetContentRegionAvail().x;
@@ -5337,7 +5340,7 @@ static void pathafter(Gui *g, PathField *f, char *buf)
             ImGui::PushID(i);
             if (ImGui::Selectable("##pick", i==pc->sel, ImGuiSelectableFlags_SelectOnClick,
                                   v2(rw, 0))) {
-                pathput(g, f, buf, p);
+                pathput(f, buf, p, a);
                 pc->shown   = 0;
                 pc->sel     = -1;
                 pc->refocus = 1;
