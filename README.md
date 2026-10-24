@@ -474,8 +474,11 @@ holding `SKILL.md`, whose frontmatter gives its `name` and
 `description`, with any files it refers to beside it. They are found in
 `.claude/skills` and `.agents/skills` in each directory from the
 working directory up to the root of the repository, then in `[skills]
-paths`, then in `~/.config/prospero/skills`, `~/.claude/skills` and
-`~/.agents/skills`; the nearest of a name wins. The agent is told each
+paths`, then in each `--skillsdir DIR` given to `prospero`, `run`,
+`serve` or `attach` (as many as wanted), then in
+`~/.config/prospero/skills`, `~/.claude/skills` and
+`~/.agents/skills`; the nearest of a name wins. The last three follow
+the default configuration file, even when `-c` names another. The agent is told each
 skill's name and description, loads one with its skill tool, which
 also lets it read the skill's directory, and hears of skills added or
 changed as it works. `/NAME args` in the prompt box uses a skill

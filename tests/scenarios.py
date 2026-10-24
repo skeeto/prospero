@@ -1722,6 +1722,34 @@ def skills(t):
             f"warned {warns}")
 
 
+@scenario(bound=15)
+def skillsdir(t):
+    """--skillsdir, given twice, the second relative to the current
+    directory: both directories' skills listed and loaded, after [skills]
+    paths and before the user's own."""
+    env = skillhome(t)
+    user = t.host.join(env["XDG_CONFIG_HOME"], "prospero", "skills")
+    skillput(t, user, "pdf", "---\ndescription: User PDF\n---\n")
+    one = t.host.join(t.base, "sd1")
+    two = t.host.join(t.base, "sd2")
+    conf = t.host.join(t.base, "sdconf")
+    skillput(t, one, "alpha", "---\ndescription: Alpha\n---\n")
+    skillput(t, one, "pdf", "---\ndescription: Flag PDF\n---\n")
+    skillput(t, one, "csv", "---\ndescription: Flag CSV\n---\n")
+    skillput(t, two, "beta", "---\ndescription: Beta\n---\nBETA-BODY\n")
+    skillput(t, conf, "csv", "---\ndescription: Config CSV\n---\n")
+    t.host.write(t.config, t.host.read(t.config) + f"[skills]\npaths = {conf}\n")
+
+    r = t.run(env=env, extra=["--skillsdir", one, "--skillsdir", "../sd2"])
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    system = fake_provider.system_of(t.requests()[0]["body"])
+    listed = [x for x in system.split("\n") if x.startswith("- ")]
+    for want in ("- alpha: Alpha", "- beta: Beta", "- pdf: Flag PDF", "- csv: Config CSV"):
+        t.check(want in listed, f"{want!r} in {listed}")
+    ends = r.all("tool.end")
+    t.check(len(ends) == 1 and "BETA-BODY" in ends[0]["text"], f"loaded {ends}")
+
+
 @scenario(bound=20)
 def skill_prompt(t):
     """/name from the user invokes a skill, a hidden one too: its body in

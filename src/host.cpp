@@ -1339,6 +1339,7 @@ static Str serveusage =
 "options:\n"
 "  -c FILE       configuration file\n"
 "  --state DIR   session storage directory\n"
+"  --skillsdir DIR  more skills, in DIR (repeatable)\n"
 "  --idle SECS   exit after this long with no client and no work\n"
 "                (default: [host] idle_exit)\n";
 
@@ -1487,6 +1488,7 @@ static i32 hostrun(Host *h)
 static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 {
     Str config = {}, state = {}, idle = {};
+    Slice<Str> skills = {};
     for (i32 i = 2; i < nargs; i++) {
         Str a    = args[i];
         b32 more = i+1 < nargs;
@@ -1494,6 +1496,8 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             config = args[++i];
         } else if (a=="--state" && more) {
             state = args[++i];
+        } else if (a=="--skillsdir" && more) {
+            skills = skillsdirarg(os, &perm, skills, args[++i]);
         } else if (a=="--idle" && more) {
             idle = args[++i];
         } else {
@@ -1531,7 +1535,7 @@ static i32 servemain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         hostsay(os, scratch, "cannot watch for signals to quit");
     }
     hc.idle  = idle.len ? (i64)(secs.val*(f64)SEC) : hostticks(cfg, "idle_exit");
-    hc.e     = hc.inbox ? newengine(os, &perm, cfg, statedir, hc.inbox) : 0;
+    hc.e     = hc.inbox ? newengine(os, &perm, cfg, statedir, hc.inbox, skills) : 0;
     if (!hc.e || !enginestart(hc.e)) {
         hostsay(os, scratch, "cannot start the engine");
         return 2;
@@ -1557,7 +1561,8 @@ struct HostStart {
 // Connect to the host of a state directory, starting one detached if
 // none runs, and waiting up to HOST_READY for it to listen.
 static HostStart hoststart(Os *os, Arena *perm, Arena scratch, Str statedir,
-                           Str config, Str idle, Str endpoint, Mailbox *mb, u64 id)
+                           Str config, Str idle, Str endpoint, Mailbox *mb, u64 id,
+                           Slice<Str> skills = {})
 {
     HostStart r = {};
     r.c = os_connect(os, scratch, endpoint, mb, id);
@@ -1586,6 +1591,10 @@ static HostStart hoststart(Os *os, Arena *perm, Arena scratch, Str statedir,
     if (idle.len) {
         argv = push(&scratch, argv, Str("--idle"));
         argv = push(&scratch, argv, idle);
+    }
+    for (iz i = 0; i < skills.len; i++) {
+        argv = push(&scratch, argv, Str("--skillsdir"));
+        argv = push(&scratch, argv, skills[i]);
     }
     Str log = join(&scratch, join(&scratch, state, "run"), "host.log");
     if (os_stat(os, scratch, log).size > HOST_LOGMAX) {
@@ -1653,11 +1662,13 @@ static Str attachusage =
 "options:\n"
 "  -c FILE       configuration file, for a host started\n"
 "  --state DIR   session storage directory\n"
+"  --skillsdir DIR  more skills, in DIR, for a host started (repeatable)\n"
 "  --idle SECS   idle exit of a host started\n";
 
 static i32 attachmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 {
     Str config = {}, state = {}, idle = {};
+    Slice<Str> skills = {};
     b32 reconnect = 0;
     for (i32 i = 2; i < nargs; i++) {
         Str a    = args[i];
@@ -1668,6 +1679,8 @@ static i32 attachmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             config = args[++i];
         } else if (a=="--state" && more) {
             state = args[++i];
+        } else if (a=="--skillsdir" && more) {
+            skills = skillsdirarg(os, &perm, skills, args[++i]);
         } else if (a=="--idle" && more) {
             idle = args[++i];
         } else {
@@ -1699,7 +1712,7 @@ static i32 attachmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         return HOST_NOSERVER;
     } else if (!c) {
         HostStart hs = hoststart(os, &perm, scratch, state, config, idle,
-                                 endpoint, mb, 1);
+                                 endpoint, mb, 1, skills);
         if (hs.attached) {
             hostsay(os, scratch, "this session's job forbids breaking away, so the "
                     "host runs in it, attached, and stops when the session ends");

@@ -959,6 +959,7 @@ struct Gui {
     byte              *linebase;
     Buf                line;
     Str                cfgpath;    // -c FILE, else null for the default
+    Slice<Str>         skillsdirs; // --skillsdir DIR, each absolute
     i64                nextid;
     GuiHost           *cmdhost;    // where the command being written goes
     Request            reqs[REQ_MAX];
@@ -14150,6 +14151,7 @@ static Str guiusage =
 "                 in a new one, which goes on detached (POSIX)\n"
 "  -c FILE        configuration file (default: prospero.ini, as for run)\n"
 "  --statedir DIR sessions, layout file and log (default: the state dir)\n"
+"  --skillsdir DIR more skills, in DIR (repeatable)\n"
 "  --engine=MODE  inproc (default) or subprocess: \"prospero --headless\"\n"
 "  --fake         a fake agent instead of an engine, for measurements:\n"
 "    --tps N        its tokens per second (default 100)\n"
@@ -14279,7 +14281,7 @@ static b32 startinproc(Gui *g, Arena scratch)
         print(&b, cfg->ini->diags[i]);
         guilog(g, finish(&b));
     }
-    g->engine = newengine(os, &g->perm, cfg, g->statedir, g->inbox);
+    g->engine = newengine(os, &g->perm, cfg, g->statedir, g->inbox, g->skillsdirs);
     if (!g->engine || !enginestart(g->engine)) {
         g->engineerr = "cannot start the engine";
         return 0;
@@ -14301,6 +14303,10 @@ static b32 startsubprocess(Gui *g, Arena scratch)
     if (g->cfgpath.len) {
         argv = push(&scratch, argv, Str("-c"));
         argv = push(&scratch, argv, g->cfgpath);
+    }
+    for (iz i = 0; i < g->skillsdirs.len; i++) {
+        argv = push(&scratch, argv, Str("--skillsdir"));
+        argv = push(&scratch, argv, g->skillsdirs[i]);
     }
     Spawn sp = {};
     sp.argv    = argv;
@@ -14428,6 +14434,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             g->statedir = args[++i];
         } else if (a=="-c" && i+1<nargs) {
             g->cfgpath = args[++i];
+        } else if (a=="--skillsdir" && i+1<nargs) {
+            g->skillsdirs = skillsdirarg(os, &mem, g->skillsdirs, args[++i]);
         } else if (a=="--cwd" && i+1<nargs) {
             g->drivecwd = cstrclone(&mem, args[++i]);
         } else if (a == "--inbox-cap") {

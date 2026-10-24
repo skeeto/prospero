@@ -786,6 +786,13 @@ def sc_skills(model, n, req):
         yield from answer(model, "Used the skills.")
 
 
+def sc_skillsdir(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "skill", {"name": "beta"})
+    else:
+        yield from answer(model, "Used beta.")
+
+
 def sc_skill_prompt(model, n, req):
     yield from answer(model, f"Answer number {n}.")
 

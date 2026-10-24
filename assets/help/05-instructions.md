@@ -37,9 +37,10 @@ Skills are looked for in:
 1. `.claude/skills` and `.agents/skills` in each directory from the
    working directory up to the root of the repository;
 2. `[skills] paths`, separated by `;`;
-3. `skills` next to the default configuration file, such as
-   `~/.config/prospero/skills`;
-4. `~/.claude/skills`, then `~/.agents/skills`.
+3. each `--skillsdir DIR` given when starting Prospero, in order;
+4. `skills` next to the default configuration file, such as
+   `~/.config/prospero/skills`, even when `-c` names another file;
+5. `~/.claude/skills`, then `~/.agents/skills`.
 
 The first skill of a name wins.
 

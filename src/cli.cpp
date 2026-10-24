@@ -33,6 +33,7 @@ static Str cliusage =
 "  -r ROLE       role, a [role] in the configuration (run only)\n"
 "  -c FILE       configuration file\n"
 "  --state DIR   session storage directory\n"
+"  --skillsdir DIR  more skills, in DIR (repeatable)\n"
 "  --pretty      readable output instead of JSONL (run only)\n";
 
 struct Cli {
@@ -569,6 +570,7 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 
     Str dir = {}, endpoint = {}, model = {}, config = {}, state = {}, resume = {};
     Str prompt = {}, role = {};
+    Slice<Str> skills = {};
     for (i32 i = 2; i < nargs; i++) {
         Str a = args[i];
         b32 more = i+1 < nargs;
@@ -584,6 +586,8 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
             config = args[++i];
         } else if (a=="--state" && more) {
             state = args[++i];
+        } else if (a=="--skillsdir" && more) {
+            skills = skillsdirarg(os, &perm, skills, args[++i]);
         } else if (a=="--resume" && more && !headless) {
             resume = args[++i];
         } else if (a=="--pretty" && !headless) {
@@ -615,7 +619,7 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 
     c.spare = os_reserve(os, sizeof(void *)==8 ? (iz)1<<32 : (iz)1<<27);
     c.out   = c.spare ? newmailbox(&perm, 4<<20, 0, 0) : 0;
-    c.e   = c.out ? newengine(os, &perm, cfg, c.statedir, c.out) : 0;
+    c.e   = c.out ? newengine(os, &perm, cfg, c.statedir, c.out, skills) : 0;
     if (!c.e || !enginestart(c.e)) {
         os_print(os, 2, "prospero: cannot start the engine\n");
         return 2;

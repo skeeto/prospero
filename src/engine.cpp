@@ -662,6 +662,7 @@ struct Engine {
     Str         home;     // for "~" in paths
     Str         global;   // the user's own instruction file
     Str         skilldir; // the user's own skills, next to it
+    Slice<Str>  skillsdirs;  // --skillsdir, each absolute
     ToolEnv     te;
     Slice<Str>  env;      // inherited environment
     Session    *sessions;
@@ -5687,10 +5688,20 @@ static u32 skilldeny(Engine *e)
     return on ? 0 : (u32)1<<TOOL_SKILL;
 }
 
+// --skillsdir DIR, as each frontend takes it: absolute, from the current
+// directory, as the engine may run in another (a host in its state
+// directory). It need not exist yet.
+static Slice<Str> skillsdirarg(Os *os, Arena *perm, Slice<Str> dirs, Str dir)
+{
+    Str here = os_realpath(os, perm, ".");
+    return push(perm, dirs, normpath(perm, here, dir, HOST_WINDOWS));
+}
+
 // The directories of a session's skills, by precedence. A session with
 // the project's instructions alone (new {instructions:"project"}) has
-// the project's skills alone, and [skills] paths. One in a folder of its
-// own (new {nofolder}) is in no project: [skills] paths and the user's.
+// the project's skills alone, [skills] paths and --skillsdir. One in a
+// folder of its own (new {nofolder}) is in no project: [skills] paths,
+// --skillsdir and the user's.
 static Slice<SkillDir> skilldirs(Session *s, Arena *a)
 {
     Engine         *e    = s->e;
@@ -5710,6 +5721,10 @@ static Slice<SkillDir> skilldirs(Session *s, Arena *a)
     Slice<Str> more = cfgpaths(e->cfg, a, "skills", "", "paths", e->home);
     for (iz i = 0; i < more.len; i++) {
         SkillDir x = {normpath(a, cwd, more[i], win), {}};
+        r = push(a, r, x);
+    }
+    for (iz i = 0; i < e->skillsdirs.len; i++) {
+        SkillDir x = {e->skillsdirs[i], {}};
         r = push(a, r, x);
     }
     Str user[] = {
@@ -11729,8 +11744,9 @@ static void enginethread(void *arg)
 
 // An engine with its configuration (config.cpp), which from now on
 // belongs to the engine thread: frontends use config.get and config.set.
+// skills are the directories given by --skillsdir (skillsdirarg).
 static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
-                         Mailbox *out)
+                         Mailbox *out, Slice<Str> skills = {})
 {
     b32     big = sizeof(void *) == 8;
     Engine *e   = alloc<Engine>(perm);
@@ -11766,6 +11782,9 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     if (conf.len) {
         e->global   = normpath(&e->perm, parentdir(conf), "AGENTS.md", HOST_WINDOWS);
         e->skilldir = normpath(&e->perm, parentdir(conf), "skills", HOST_WINDOWS);
+    }
+    for (iz i = 0; i < skills.len; i++) {
+        e->skillsdirs = push(&e->perm, e->skillsdirs, clone(&e->perm, skills[i]));
     }
     loadtrained(e, newarena(e->scratch));
     // Tests shorten minutes of slow retries to milliseconds
