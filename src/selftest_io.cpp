@@ -715,7 +715,8 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     p->mb  = newmailbox(perm, 1<<20, 0, 0);
     p->dir = dir;
     Str exe = os_exepath(os, perm);
-    p->te  = findshell(os, perm, scratch, parentdir(exe), HOST_WINDOWS, {});
+    Str path = os_getenv(os, perm, "PATH");
+    p->te  = findshell(os, perm, scratch, parentdir(exe), path, HOST_WINDOWS, {});
     p->env = shellenv(perm, os_environ(os, perm), HOST_WINDOWS, {});
     if (!check(t, p->mb!=0, "newmailbox")) return;
     {

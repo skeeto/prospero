@@ -1624,6 +1624,45 @@ static void closeall(uz *hs, iz n)
     }
 }
 
+// A program named without a directory, as the child's own PATH finds it:
+// CreateProcessW would search this process's PATH instead, which may
+// lack what the configuration adds (path_prepend), as POSIX children
+// find it through the reaper's environment. Like CreateProcessW, a name
+// without an extension gets .exe. Null if no directory there has it,
+// for CreateProcessW to search as it does.
+static Str childpath(Os *os, Arena *a, Slice<Str> env, Str name)
+{
+    b32 ext = 0;
+    for (iz i = 0; i < name.len; i++) {
+        if (name[i]=='/' || name[i]=='\\' || name[i]==':') {
+            return {};
+        }
+        ext |= name[i] == '.';
+    }
+    if (!name.len) {
+        return {};
+    }
+    name = ext ? name : concat(a, name, ".exe");
+    for (Str rest = envpath(env, 1); rest.len;) {
+        Cut c = cut(rest, ';');
+        Str d = trim(c.head);
+        rest = c.tail;
+        if (d.len>=2 && d[0]=='"' && d[d.len-1]=='"') {
+            d = takehead(cuthead(d, 1), d.len-2);
+        }
+        if (!d.len) {
+            continue;
+        }
+        Arena t = *a;
+        Str   p = join(&t, d, name);
+        if (os_stat(os, t, p).type == STAT_FILE) {
+            *a = t;
+            return p;
+        }
+    }
+    return {};
+}
+
 // Spawn into a new job. With io, input is a pipe from the writer
 // thread, errors go to outpath (or NUL) directly, and the reader passes
 // output on as records instead of into the file.
@@ -1633,7 +1672,17 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    Str  line = sp->cmdline.len ? sp->cmdline : quoteargv(&scratch, sp->argv);
+    Slice<Str> argv  = sp->argv;
+    Str        found = sp->cmdline.len ? Str{} : childpath(os, &scratch, sp->env, argv[0]);
+    if (found.len) {
+        Slice<Str> copy = {};
+        copy = push(&scratch, copy, found);
+        for (iz i = 1; i < argv.len; i++) {
+            copy = push(&scratch, copy, argv[i]);
+        }
+        argv = copy;
+    }
+    Str  line = sp->cmdline.len ? sp->cmdline : quoteargv(&scratch, argv);
     c16 *cmd  = towide(&scratch, line).data;
     c16 *cwd  = towide(&scratch, sp->cwd).data;  // not \\?\, which cmd rejects
     c16 *env  = envblock(&scratch, sp->env);

@@ -3848,17 +3848,33 @@ static Str spillfile(Session *s, Arena scratch, Str id, Str *rel, Str ext = ".lo
     }
 }
 
+// The PATH that programs are found by, for commands and for the engine's
+// own lookups: the one it started with, and around it [tools]
+// path_prepend and path_append as the configuration now says.
+static Str enginepath(Engine *e, Arena *a, b32 win)
+{
+    return cfgsearchpath(e->cfg, a, envpath(e->env, win), e->home, win);
+}
+
+// The environment for a command or helper: shellenv's, with the PATH
+// of enginepath.
+static Slice<Str> engineenv(Engine *e, Arena *a, b32 win)
+{
+    Slice<Str> secrets = cfgsecrets(e->cfg, a);
+    Slice<Str> env     = shellenv(a, e->env, win, secrets);
+    return envsetpath(a, env, enginepath(e, a, win), win);
+}
+
 // Spawn a process for the current call, its output into spill.
 static Proc *spawncall(Session *s, Arena scratch, Slice<Str> argv, Str cmdline,
                        Str envadd, Str cwd, Str spill, i64 maxbytes, u64 *id)
 {
-    Engine    *e       = s->e;
-    Slice<Str> secrets = cfgsecrets(e->cfg, &scratch);
-    Spawn      sp      = {};
+    Engine *e  = s->e;
+    Spawn   sp = {};
     sp.argv     = argv;
     sp.cmdline  = cmdline;
     sp.cwd      = cwd;
-    sp.env      = shellenv(&scratch, e->env, s->te.windows, secrets);
+    sp.env      = engineenv(e, &scratch, s->te.windows);
     if (envadd.len) {
         sp.env = push(&scratch, sp.env, envadd);
     }
@@ -5007,11 +5023,10 @@ static b32 deskstart(Session *s, Arena scratch)
         }
     }
     deskreset(s);
-    Slice<Str> secrets = cfgsecrets(e->cfg, &scratch);
-    Spawn      sp      = {};
+    Spawn sp = {};
     sp.argv      = argv;
     sp.cwd       = s->cwd;
-    sp.env       = shellenv(&scratch, e->env, s->te.windows, secrets);
+    sp.env       = engineenv(e, &scratch, s->te.windows);
     // Where it keeps what it must remember, as Wayland's portal approval
     sp.env       = push(&scratch, sp.env, concat(&scratch, "PROSPERO_STATE=", e->statedir));
     sp.outpath   = join(&scratch, s->outdir, "desktop.log");
@@ -7071,10 +7086,10 @@ static Guard sessionguard(Session *s, Arena *perm)
     return g;
 }
 
-// An executable on PATH, by its file name, or null.
-static Str findpath(Os *os, Arena *perm, Arena scratch, Str name, b32 win)
+// An executable on a PATH, by its file name, or null.
+static Str findpath(Os *os, Arena *perm, Arena scratch, Str path, Str name,
+                    b32 win)
 {
-    Str path = os_getenv(os, &scratch, "PATH");
     for (Str rest = path; rest.len;) {
         Cut c = cut(rest, win ? ';' : ':');
         rest = c.tail;
@@ -7088,6 +7103,18 @@ static Str findpath(Os *os, Arena *perm, Arena scratch, Str name, b32 win)
         }
     }
     return {};
+}
+
+// ripgrep, if [tools] use_rg allows it, on the PATH programs are found
+// by now: in perm, or null.
+static Str findrg(Engine *e, Arena *perm, Arena scratch)
+{
+    if (cfgbool(trim(cfgget(e->cfg, "tools", "", "use_rg", 0))) == 0) {
+        return {};
+    }
+    Str path = enginepath(e, &scratch, HOST_WINDOWS);
+    Str rg   = HOST_WINDOWS ? Str("rg.exe") : Str("rg");
+    return findpath(e->os, perm, scratch, path, rg, HOST_WINDOWS);
 }
 
 // The kind of shell an executable is, by its file name.
@@ -7110,12 +7137,14 @@ static i32 shellkindof(Str path, b32 win)
 }
 
 // Find the agent's shell by the [tools] shell setting: auto, sh,
-// powershell, cmd, or an executable's path. A POSIX sh comes first, as
+// powershell, cmd, or an executable, by its path or by its name on
+// path, the PATH that programs are found by. A POSIX sh comes first, as
 // the one models know best: /bin/sh, or on Windows sh.exe or busybox.exe
-// next to the executable, then on PATH. Then PowerShell 7 (pwsh on PATH),
-// Windows PowerShell, and last cmd.exe. A choice not found is as auto.
+// next to the executable, then on path. Then PowerShell 7 (pwsh on
+// path), Windows PowerShell, and last cmd.exe. A choice not found is as
+// auto.
 static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
-                         b32 win, Str pref)
+                         Str path, b32 win, Str pref)
 {
     ToolEnv te = {};
     te.windows = win;
@@ -7126,6 +7155,17 @@ static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
         te.shell     = clone(perm, pref);
         te.shellkind = shellkindof(pref, win);
         return te;
+    } else if (named && basename(pref)==pref) {
+        Str name = pref;
+        if (win && find(name, ".")<0) {
+            name = concat(&scratch, name, ".exe");
+        }
+        Str found = findpath(os, perm, scratch, path, name, win);
+        if (found.len) {
+            te.shell     = found;
+            te.shellkind = shellkindof(found, win);
+            return te;
+        }
     }
     b32 wantps  = pref == "powershell";
     b32 wantcmd = win && pref=="cmd";
@@ -7138,7 +7178,6 @@ static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
         }
         Slice<Str> dirs = {};
         dirs = push(&scratch, dirs, exedir);
-        Str path = os_getenv(os, &scratch, "PATH");
         for (Str rest = path; rest.len;) {
             Cut c = cut(rest, ';');
             if (c.head.len) dirs = push(&scratch, dirs, c.head);
@@ -7164,7 +7203,7 @@ static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
     Str root = os_getenv(os, &scratch, "SystemRoot");
     root = root.len ? root : Str("C:\\Windows");
     if (!wantcmd) {
-        Str pwsh = findpath(os, perm, scratch, win ? Str("pwsh.exe") : Str("pwsh"), win);
+        Str pwsh = findpath(os, perm, scratch, path, win ? Str("pwsh.exe") : Str("pwsh"), win);
         if (pwsh.len) {
             te.shell     = pwsh;
             te.shellkind = SHELL_PWSH;
@@ -7263,8 +7302,9 @@ static void buildprefix(Session *s, Arena scratch)
 {
     Engine *e = s->e;
     jobconf(s);
-    ToolEnv sh = findshell(e->os, &s->perm, scratch, e->exedir, s->te.windows,
-                           cfgget(e->cfg, "tools", "", "shell", 0));
+    Str     path = enginepath(e, &scratch, s->te.windows);
+    ToolEnv sh   = findshell(e->os, &s->perm, scratch, e->exedir, path,
+                             s->te.windows, cfgget(e->cfg, "tools", "", "shell", 0));
     s->te.shell     = sh.shell;
     s->te.shellkind = sh.shellkind;
     s->te.coords    = s->mc.coords;
@@ -10923,11 +10963,21 @@ static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
 // keep the prompt cache: it names only the roots the session began with.
 // A session whose endpoint or model section is gone, deleted, keeps the
 // settings it had: a model renamed by its section (id) would otherwise
-// be sent by a name the server does not know.
-static void reconfigure(Engine *e)
+// be sent by a name the server does not know. ripgrep is looked for
+// again, by [tools] use_rg on the PATH as now set, for every session's
+// next search; a session's shell stays the one it began with.
+static void reconfigure(Engine *e, Arena scratch)
 {
     e->ini = e->cfg->ini;
+    Arena found = {};  // apart from the scratch findrg uses
+    found.beg = (byte *)allocbytes(&scratch, 1<<16);
+    found.end = found.beg + (1<<16);
+    Str rg = findrg(e, &found, scratch);
+    if (rg != e->te.rg) {
+        e->te.rg = clone(&e->perm, rg);
+    }
     for (Session *s = e->sessions; s; s = s->next) {
+        s->te.rg = e->te.rg;
         s->guard = sessionguard(s, &s->perm);
         Str      which = s->ep.name.len ? s->ep.name : s->ep.url;
         Endpoint ep    = {};
@@ -10988,7 +11038,7 @@ static b32 onconfig(Engine *e, Arena scratch, Record r)
         return 0;
     }
     if (e->cfg->rev != rev) {
-        reconfigure(e);
+        reconfigure(e, scratch);
     }
     configwaiters(e, scratch);
     return 1;
@@ -11012,7 +11062,7 @@ static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
             if (cfgbusy(c) && e->ncfgwait<countof(e->cfgwait)) {
                 e->cfgwait[e->ncfgwait++] = id;
                 if (c->rev != rev) {
-                    reconfigure(e);
+                    reconfigure(e, scratch);
                 }
                 return;
             }
@@ -11038,7 +11088,7 @@ static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
         }
     }
     if (c->rev != rev) {
-        reconfigure(e);
+        reconfigure(e, scratch);
     }
     replyconfig(e, scratch, id, cmd, &r);
 }
@@ -11547,7 +11597,7 @@ static void enginethread(void *arg)
         // Records mean work: catch up with configuration edits first
         Mail m = mailtake(e->in);
         if (m.len && cfgpoll(e->cfg, newarena(e->scratch), 0)) {
-            reconfigure(e);
+            reconfigure(e, newarena(e->scratch));
         }
         for (Record r; (r = mailnext(&m)).ok;) {
             onrecord(e, newarena(e->scratch), r);
@@ -11573,7 +11623,7 @@ static void enginethread(void *arg)
             i64 rev = e->cfg->rev;
             cfgtimeout(e->cfg, newarena(e->scratch));
             if (e->cfg->rev != rev) {
-                reconfigure(e);
+                reconfigure(e, newarena(e->scratch));
             }
             configwaiters(e, newarena(e->scratch));
         }
@@ -11633,19 +11683,18 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     e->perm     = newarena(r);
     Str exe     = os_exepath(os, &e->perm);
     e->exedir   = parentdir(exe);
-    e->te       = findshell(os, &e->perm, newarena(e->scratch), e->exedir,
-                            HOST_WINDOWS, cfgget(cfg, "tools", "", "shell", 0));
-    e->te.exe   = exe;
     e->env      = os_environ(os, &e->perm);
     e->tempdirs = os_tempdirs(os, &e->perm);
     e->home     = os_getenv(os, &e->perm, "HOME");
     if (HOST_WINDOWS && !e->home.len) {
         e->home = os_getenv(os, &e->perm, "USERPROFILE");
     }
-    if (cfgbool(trim(cfgget(cfg, "tools", "", "use_rg", 0))) != 0) {
-        Str rg = HOST_WINDOWS ? Str("rg.exe") : Str("rg");
-        e->te.rg = findpath(os, &e->perm, newarena(e->scratch), rg, HOST_WINDOWS);
-    }
+    Arena scratch = newarena(e->scratch);
+    Str   path    = enginepath(e, &scratch, HOST_WINDOWS);
+    e->te       = findshell(os, &e->perm, scratch, e->exedir, path, HOST_WINDOWS,
+                            cfgget(cfg, "tools", "", "shell", 0));
+    e->te.exe   = exe;
+    e->te.rg    = findrg(e, &e->perm, newarena(e->scratch));
     // The user's own instructions, next to the configuration
     Str conf = cfgdefault(os, &e->perm);
     if (conf.len) {

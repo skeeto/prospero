@@ -1610,6 +1610,59 @@ def powershell(t):
     t.check("PowerShell" in tools, "the shell tool describes PowerShell")
 
 
+@scenario(bound=20)
+def path_settings(t):
+    """[tools] path_prepend and path_append: the agent's shell finds a
+    program by its bare name in a directory added before PATH, and one in
+    a directory added after; PATH starts with the first and ends with the
+    second, the inherited one between, so that a name in both is the
+    prepended one's, and a system program (cat) is not the appended
+    directory's."""
+    pre = t.host.join(t.base, "pre")
+    post = t.host.join(t.base, "post")
+    t.host.mkdir(pre)
+    t.host.mkdir(post)
+
+    def tool(d, name, says):
+        if t.host.windows:
+            t.host.write(t.host.join(d, name + ".bat"), f"@echo {says}\r\n")
+        else:
+            p = t.host.join(d, name)
+            t.host.write(p, f"#!/bin/sh\necho {says}\n")
+            os.chmod(p, 0o755)
+    tool(pre, "prospero_pre_tool", "pre-tool-ran")
+    tool(post, "prospero_post_tool", "post-tool-ran")
+    tool(pre, "prospero_both_tool", "both-from-pre")
+    tool(post, "prospero_both_tool", "both-from-post")
+    tool(post, "cat", "appended-cat")
+    t.put("seen.txt", "the real cat\n")
+    t.host.write(t.config, t.host.read(t.config) +
+                 f"[tools]\npath_prepend = {pre}\npath_append = ; {post}\n")
+
+    r = t.run(timeout=60)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = [e["text"] for e in r.all("tool.end")]
+    t.check(len(ends) == 5, f"{len(ends)} shell calls")
+    if len(ends) < 5:
+        return
+    t.check("pre-tool-ran" in ends[0] and "[exit code 0]" in ends[0],
+            f"prepended: {ends[0]!r}")
+    t.check("post-tool-ran" in ends[1] and "[exit code 0]" in ends[1],
+            f"appended: {ends[1]!r}")
+    t.check("both-from-pre" in ends[2], f"prepended first: {ends[2]!r}")
+    t.check("the real cat" in ends[3] and "appended-cat" not in ends[3],
+            f"the system's cat first: {ends[3]!r}")
+    line = next((x for x in ends[4].splitlines() if x.startswith("PATH=")), "")
+    sep = ";" if t.host.windows and ";" in line else ":"
+
+    def norm(p):
+        p = p.replace("\\", "/").rstrip("/")
+        return p.lower() if t.host.windows else p
+    dirs = [norm(d) for d in line[5:].split(sep) if d]
+    t.check(len(dirs) > 2 and dirs[0] == norm(pre) and dirs[-1] == norm(post),
+            f"PATH from {norm(pre)} to {norm(post)}: {line!r}")
+
+
 def skillput(t, parent, name, text):
     d = t.host.join(parent, name)
     t.host.mkdir(d)

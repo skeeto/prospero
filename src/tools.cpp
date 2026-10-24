@@ -2127,6 +2127,69 @@ static Slice<Str> shellenv(Arena *a, Slice<Str> inherited, b32 windows,
     return r;
 }
 
+// The value of an environment's PATH (on Windows, Path in any case),
+// the first one, or null.
+static Str envpath(Slice<Str> env, b32 windows)
+{
+    for (iz i = 0; i < env.len; i++) {
+        if (envnameis(env[i], "PATH", windows)) {
+            return cuthead(env[i], 5);
+        }
+    }
+    return {};
+}
+
+// An environment with its PATH set to path, the first entry replaced
+// where it is, under its own name (Path on Windows, say), or added: env
+// itself when it says so already.
+static Slice<Str> envsetpath(Arena *a, Slice<Str> env, Str path, b32 windows)
+{
+    iz at = -1;
+    for (iz i = 0; at<0 && i<env.len; i++) {
+        at = envnameis(env[i], "PATH", windows) ? i : -1;
+    }
+    if ((at>=0 && cuthead(env[at], 5)==path) || (at<0 && !path.len)) {
+        return env;
+    }
+    Str        name = at>=0 ? takehead(env[at], 4) : Str("PATH");
+    Str        set  = concat(a, concat(a, name, "="), path);
+    Slice<Str> r    = {};
+    for (iz i = 0; i < env.len; i++) {
+        r = push(a, r, i==at ? set : env[i]);
+    }
+    if (at < 0) {
+        r = push(a, r, set);
+    }
+    return r;
+}
+
+// A PATH of the directories pre, then path, then post, each joined by
+// the platform's separator, empty ones left out. On Windows the extra
+// directories take backslashes, which cmd.exe's own search wants.
+static Str pathjoin(Arena *a, Slice<Str> pre, Str path, Slice<Str> post,
+                    b32 windows)
+{
+    if (!pre.len && !post.len) {
+        return path;
+    }
+    u8  sep = windows ? ';' : ':';
+    Buf b(a, path.len + 256);
+    for (iz i = 0; i < pre.len+1+post.len; i++) {
+        b32 extra = i != pre.len;
+        Str dir   = i<pre.len ? pre[i] : extra ? post[i-pre.len-1] : path;
+        if (!dir.len) {
+            continue;
+        }
+        if (b.len) {
+            putbyte(&b, sep);
+        }
+        for (iz k = 0; k < dir.len; k++) {
+            putbyte(&b, windows && extra && dir[k]=='/' ? '\\' : dir[k]);
+        }
+    }
+    return finish(&b);
+}
+
 struct ShellCmd {
     Slice<Str> argv;
     Str        cmdline;  // Windows cmd.exe only

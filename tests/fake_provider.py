@@ -333,6 +333,20 @@ def sc_powershell(model, n, req):
         yield from answer(model, "PowerShell ran.")
 
 
+def sc_path_settings(model, n, req):
+    commands = [
+        "prospero_pre_tool",
+        "prospero_post_tool",
+        "prospero_both_tool",
+        "cat seen.txt",
+        'echo "PATH=$PATH"',
+    ]
+    if n < len(commands):
+        yield from tool(model, n, "shell", {"command": commands[n]})
+    else:
+        yield from answer(model, "Found them.")
+
+
 def sc_bytewise(model, n, req):
     yield S.bytewise()
     if n == 0:

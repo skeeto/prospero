@@ -1065,6 +1065,8 @@ struct Gui {
     // Compose box: the editor a draft is out in (one at a time), and
     // what the box's popups have open
     Str                editor;     // [ui] editor
+    Str                pathpre;    // [tools] path_prepend, as written
+    Str                pathpost;   // [tools] path_append
     Mailbox           *edbox;      // its process's records
     GuiSession        *edsess;     // whose draft it edits, or null
     b32                edplan;     // its plan file instead (Edit plan)
@@ -2554,6 +2556,17 @@ static Str rejoin(Arena *a, Str s, u8 sep, Str with)
     return finish(&b);
 }
 
+// A setting the GUI keeps, from its row: the value in effect, which is
+// the default for one ignored, as some are in an included file. Kept in
+// perm only when it changes.
+static void setcfgstr(Gui *g, Str *dst, CfgRow r)
+{
+    Str v = r.valid ? r.value : r.dflt;
+    if (v != *dst) {
+        *dst = clone(&g->perm, v);
+    }
+}
+
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
 static void loadcfg(Gui *g, Str line)
@@ -2609,8 +2622,12 @@ static void loadcfg(Gui *g, Str line)
             settools(g, toolsparse(r.value));
         } else if (r.kind=="ui" && r.key=="font_size") {
             setfontbase(g, r.value);
-        } else if (r.kind=="ui" && r.key=="editor" && r.value!=g->editor) {
-            g->editor = clone(&g->perm, r.value);
+        } else if (r.kind=="ui" && r.key=="editor") {
+            setcfgstr(g, &g->editor, r);
+        } else if (r.kind=="tools" && r.key=="path_prepend") {
+            setcfgstr(g, &g->pathpre, r);
+        } else if (r.kind=="tools" && r.key=="path_append") {
+            setcfgstr(g, &g->pathpost, r);
         }
         // Defaults, and what a model inherits by like, show as hints, not
         // values: an edit writes a value of its own. The field holds the
@@ -3708,6 +3725,22 @@ static void setnote(Gui *g, GuiSession *s, Str note, b32 err)
 // approves. Edited while no plan waits, the Plan window shows it, and
 // the agent is not told. One file at a time is out, a draft or a plan.
 
+// The PATH for what the GUI runs itself, the editor and ssh: its own,
+// with [tools] path_prepend and path_append around it, as the engine
+// does for commands. Not for the engine's process, which does that
+// itself, as configured at the time.
+static Str guipath(Gui *g, Arena *a)
+{
+    Str path = os_getenv(g->os, a, "PATH");
+    Str home = userhome(g->os, a);
+    return searchpath(a, g->pathpre, path, g->pathpost, home, HOST_WINDOWS);
+}
+
+static Slice<Str> guienv(Gui *g, Arena *a)
+{
+    return envsetpath(a, os_environ(g->os, a), guipath(g, a), HOST_WINDOWS);
+}
+
 static Str editorcmd(Gui *g, Arena *a)
 {
     return editorpick(g->editor, os_getenv(g->os, a, "VISUAL"),
@@ -3750,7 +3783,7 @@ static Proc *editrun(Gui *g, Arena a, Str cmd, Str path, Str dir, Str log)
     sp.argv = push(&a, sp.argv, editorline(&a, cmd, path, 0));
     #endif
     sp.cwd      = dir;
-    sp.env      = os_environ(g->os, &a);
+    sp.env      = guienv(g, &a);
     sp.outpath  = log;
     sp.maxbytes = 1<<16;
     sp.mbox     = g->edbox;
@@ -4285,6 +4318,9 @@ static b32 hostconnect(Gui *g, GuiHost *h, RemoteConf *rc)
     } else if (h->r || !h->inbox) {
         return h->r != 0;
     }
+    // ssh, as configured now, found as the editor is
+    Arena fa = g->frame;
+    rc->envpath = guipath(g, &fa);
     // Its own memory, as connections come and go (its reservations are
     // never let go: the library's thread may outlive its MAIL_QUIT)
     Arena   ra = newarena(os_reserve(g->os, (iz)1<<22));
@@ -5276,6 +5312,7 @@ static void guiupdate(Gui *g, GuiHost *h)
     d->conf.name       = clone(&g->perm, h->name);
     d->conf.ssh        = clone(&g->perm, ssh);
     d->conf.program    = os_getenv(g->os, &g->perm, "PROSPERO_TEST_SSH");
+    d->conf.envpath    = guipath(g, &g->perm);
     d->conf.localstate = g->statedir;
     d->conf.force      = 1;  // another build of this version, as a developer's
     d->conf.notes      = g->tasks;
@@ -13440,7 +13477,9 @@ static void readconfig(Gui *g, Arena scratch)
     i32 tools = toolsparse(cfgget(cfg, "ui", "", "tools", 0));
     g->toolset = tools<0 ? TOOLS_AUTO : tools;
     setfontbase(g, cfgget(cfg, "ui", "", "font_size", 0));
-    g->editor = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
+    g->editor   = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
+    g->pathpre  = clone(&g->perm, cfgget(cfg, "tools", "", "path_prepend", 0));
+    g->pathpost = clone(&g->perm, cfgget(cfg, "tools", "", "path_append", 0));
     if (own) {
         g->config = cfg;
     } else {

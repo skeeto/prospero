@@ -2518,7 +2518,8 @@ static i32 evalmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         return 2;
     }
     ev.te      = ev.e->te;
-    ev.env     = ev.e->env;
+    ev.env     = envsetpath(&perm, ev.e->env, enginepath(ev.e, &perm, HOST_WINDOWS),
+                            HOST_WINDOWS);  // as configured when it began
     ev.secrets = cfgsecrets(cfg, &perm);  // before the engine owns cfg
     if (!enginestart(ev.e)) {
         os_print(os, 2, "prospero: cannot start the engine\n");

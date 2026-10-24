@@ -388,6 +388,18 @@ can make Prospero run a command, and its plaintext secrets, `[remote]`
 and `[desktop]` settings are ignored. A server whose certificate is not
 trusted fails the turn at once, saying why, rather than being retried.
 
+Prospero started from Spotlight, the Finder, the Start menu or a desktop
+menu has a shorter PATH than a shell gives it. `[tools] path_prepend`
+and `path_append` add directories, separated by `;`, before and after
+it: for the agent's commands, its shell and ripgrep, and for what the
+GUI runs itself, the editor and ssh. A change applies to the next
+command, and for the editor and ssh once saved in the settings window
+(or at the next start). A remote engine goes by its own machine's
+configuration.
+
+    [tools]
+    path_prepend = ~/.local/bin; /opt/homebrew/bin
+
 An endpoint speaks Anthropic's Messages API with `kind = anthropic`:
 
     [endpoint anthropic]
@@ -606,7 +618,8 @@ Without either, commands run in PowerShell: PowerShell 7 (`pwsh.exe` on
 the PATH), else the Windows PowerShell 5.1 that comes with Windows, and
 `cmd.exe` only as a last resort. The shell tool's description tells the
 agent which it has. `[tools] shell` picks one instead (`sh`,
-`powershell`, `cmd`, or an executable's path) for new sessions; a
+`powershell`, `cmd`, or an executable by its path or its name on the
+PATH, `[tools] path_prepend` included) for new sessions; a
 session keeps the shell it began with. PowerShell takes a second or more
 to start, so each command is that much slower than in busybox.
 Each tool runs in a job object, so that its whole process tree dies

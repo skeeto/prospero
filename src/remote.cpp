@@ -129,6 +129,7 @@ struct RemoteConf {
                    // remote ends (closed), as the host is gone
     Str scp;       // for deploying: scp itself, "scp" if empty
     Str engines;   // for deploying: the engines, if not next to this program
+    Str envpath;   // PATH for ssh and scp, if not this process's
     b32 deploy;    // deploy an engine when the one there is missing or another
 };
 
@@ -451,6 +452,9 @@ static b32 remotestart(Remote *r, Arena scratch)
     sp.argv    = argv;
     sp.cwd     = r->conf.localstate;
     sp.env     = os_environ(os, &scratch);
+    if (r->conf.envpath.len) {
+        sp.env = envsetpath(&scratch, sp.env, r->conf.envpath, HOST_WINDOWS);
+    }
     sp.outpath = remotelog(r, &scratch);
     sp.mbox    = r->in;
     sp.id      = r->tid;
@@ -562,6 +566,7 @@ static void remotedeploy(Remote *r, Arena scratch, Str why)
     rd->conf.program    = r->conf.program;
     rd->conf.scp        = r->conf.scp;
     rd->conf.engines    = r->conf.engines;
+    rd->conf.envpath    = r->conf.envpath;
     rd->conf.localstate = r->conf.localstate;
     rd->conf.notes      = r->in;
     rd->conf.cancel     = &r->cancel;
@@ -1119,6 +1124,7 @@ static Remote *newremote(Os *os, Arena *perm, RemoteConf *conf, Mailbox *out)
     r->conf.endpoint   = clone(&r->perm, conf->endpoint);
     r->conf.scp        = clone(&r->perm, conf->scp);
     r->conf.engines    = clone(&r->perm, conf->engines);
+    r->conf.envpath    = clone(&r->perm, conf->envpath);
     r->conf.deploy     = conf->deploy;
     if (!r->conf.name.len) {
         r->conf.name = "local";
@@ -1305,7 +1311,8 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         rc.name  = name;
         rc.deploy |= cfgget(cfg, "remote", name, "deploy", 0) == "auto";
     }
-    rc.config = config;
+    rc.config  = config;
+    rc.envpath = cfgownpath(cfg, &perm);
     if (!os_mkdirs(os, scratch, rc.localstate)) {
         Str err = os_lasterr(os, &scratch);
         hostsay(os, scratch, "cannot create the state directory", err);

@@ -383,8 +383,17 @@ static CfgKey cfgschema[] = {
      "Windows) and killing it (default: 2, or 3 on Windows)"},
     {"tools", "shell", CFG_STRING, "auto", {}, {}, "tools",
      "The agent's shell for new sessions: auto, sh, powershell, cmd, or an "
-     "executable's path. auto is a POSIX sh, or on Windows sh.exe or "
-     "busybox.exe next to Prospero or on PATH, then PowerShell, then cmd"},
+     "executable, by its path or its name on PATH. auto is a POSIX sh, or "
+     "on Windows sh.exe or busybox.exe next to Prospero or on PATH, then "
+     "PowerShell, then cmd"},
+    {"tools", "path_prepend", CFG_PATHS, "", {}, {}, "tools",
+     "Directories to find programs in before PATH, separated by ;: for the "
+     "agent's commands, its shell, ripgrep, and what Prospero runs itself "
+     "(the editor, ssh). A GUI started from a desktop menu or the Finder "
+     "has a short PATH, without a shell's additions"},
+    {"tools", "path_append", CFG_PATHS, "", {}, {}, "tools",
+     "Directories to find programs in after PATH, separated by ;, as for "
+     "path_prepend"},
     {"tools", "use_rg", CFG_BOOL, "true", {}, {}, "tools",
      "Search with ripgrep (rg on PATH) when found, else the built-in search"},
     {"tools", "task_budget", CFG_INT, "200", {}, {}, "tools",
@@ -438,7 +447,8 @@ static CfgKey cfgschema[] = {
      "$EDITOR, else on macOS the default text editor (open -W -n -t), "
      "which must be quit. A GUI started from the Finder or a desktop menu "
      "has no shell environment: no $VISUAL, no $EDITOR, and its PATH may "
-     "lack the editor, so name it in full here"},
+     "lack the editor, so name it in full here, or add its directory to "
+     "[tools] path_prepend"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "
@@ -1092,13 +1102,12 @@ static Slice<Str> cfgsecrets(Config *c, Arena *perm)
     return r;
 }
 
-// The paths of a paths setting (CFG_PATHS), with a leading ~ replaced by
+// The paths of a paths value (CFG_PATHS), with a leading ~ replaced by
 // the home directory when one is known, in perm.
-static Slice<Str> cfgpaths(Config *c, Arena *perm, Str kind, Str name,
-                           Str key, Str home)
+static Slice<Str> splitpaths(Arena *perm, Str v, Str home)
 {
     Slice<Str> r = {};
-    for (Str rest = cfgget(c, kind, name, key, 0); rest.len;) {
+    for (Str rest = v; rest.len;) {
         Cut cp = cut(rest, ';');
         Str p  = trim(cp.head);
         rest = cp.tail;
@@ -1112,6 +1121,46 @@ static Slice<Str> cfgpaths(Config *c, Arena *perm, Str kind, Str name,
         r = push(perm, r, p);
     }
     return r;
+}
+
+// The paths of a paths setting, as splitpaths makes them.
+static Slice<Str> cfgpaths(Config *c, Arena *perm, Str kind, Str name,
+                           Str key, Str home)
+{
+    return splitpaths(perm, cfgget(c, kind, name, key, 0), home);
+}
+
+// The PATH that programs are found by, from path, the inherited one:
+// the directories of pre ([tools] path_prepend) before it, and those of
+// post (path_append) after, each as a file writes them, ~ the home
+// directory. A relative one is left out, as is ~ with no home known,
+// since what it found would depend on where a command runs, and on
+// POSIX one with a colon, which PATH cannot hold. Just path when no
+// directory is left.
+static Str searchpath(Arena *perm, Str pre, Str path, Str post, Str home,
+                      b32 windows)
+{
+    Slice<Str> dirs[2] = {splitpaths(perm, pre, home), splitpaths(perm, post, home)};
+    for (i32 k = 0; k < 2; k++) {
+        iz n = 0;
+        for (iz i = 0; i < dirs[k].len; i++) {
+            Str d = dirs[k][i];
+            if (iniroot(d) && (windows || find(d, ":")<0)) {
+                dirs[k][n++] = dirs[k][i];
+            }
+        }
+        dirs[k].len = n;
+    }
+    return pathjoin(perm, dirs[0], path, dirs[1], windows);
+}
+
+// The PATH that programs are found by, from path, as the configuration
+// now loaded says (searchpath).
+static Str cfgsearchpath(Config *c, Arena *perm, Str path, Str home, b32 windows)
+{
+    Str pre  = cfgget(c, "tools", "", "path_prepend", 0);
+    Str post = cfgget(c, "tools", "", "path_append", 0);
+    return searchpath(perm, pre, path, post, home, windows);
 }
 
 
@@ -2080,6 +2129,14 @@ static Str userhome(Os *os, Arena *a)
         home = os_getenv(os, a, "USERPROFILE");
     }
     return home;
+}
+
+// The PATH for programs this process runs itself, as ssh: its own, as
+// the configuration says (cfgsearchpath).
+static Str cfgownpath(Config *c, Arena *perm)
+{
+    Str path = os_getenv(c->os, perm, "PATH");
+    return cfgsearchpath(c, perm, path, userhome(c->os, perm), HOST_WINDOWS);
 }
 
 // Under the home directory, rel, unless only the older place under the

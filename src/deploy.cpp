@@ -96,6 +96,7 @@ struct DeployConf {
     Str       program;     // ssh itself, "ssh" if empty
     Str       scp;         // scp itself, "scp" if empty
     Str       engines;     // directory of engines, if not next to this program
+    Str       envpath;     // PATH for ssh and scp, if not this process's
     Str       localstate;  // the record goes under deploy/ there
     b32       force;       // replace another build of this version
     b32       verbose;     // progress on standard error
@@ -990,6 +991,9 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     d.conf = conf;
     d.mb   = newmailbox(perm, 1<<16, 0, 0);  // children may outlive a call
     d.env  = os_environ(os, perm);
+    if (conf->envpath.len) {
+        d.env = envsetpath(perm, d.env, conf->envpath, HOST_WINDOWS);
+    }
     Str name = conf->name.len ? conf->name : conf->ssh;
     Str dir  = join(&scratch, conf->localstate, "deploy");
     if (startswith(conf->ssh, "-")) {
@@ -1200,6 +1204,7 @@ static i32 deploymain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     Str dest = cfgget(cfg, "remote", target, "ssh", 0);
     dc.ssh     = dest.len ? dest : target;
     dc.name    = target;
+    dc.envpath = cfgownpath(cfg, &perm);
     dc.verbose = 1;
 
     Deployed r = deploy(os, &perm, scratch, &dc);

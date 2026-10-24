@@ -142,11 +142,17 @@ printf -- '- Revised by hand.\\n' >> "$1"
 
 
 def composeconfig(editor, nonce):
-    """The compose mode's: the test editor, and a model for /model."""
+    """The compose mode's: the test editor, by its name alone, found in
+    a directory of [tools] path_prepend as a desktop-started GUI finds
+    one (on Windows, run by sh), and a model for /model."""
+    if os.name == "nt":
+        ui = f"[ui]\neditor = sh {shword(editor)}\n"
+    else:
+        ui = (f"[tools]\npath_prepend = {os.path.dirname(editor)}\n"
+              f"[ui]\neditor = {os.path.basename(editor)}\n")
     return (
-        "\n# The compose box's editor, a test script\n"
-        "[ui]\n"
-        f"editor = sh {shword(editor)}\n"
+        "\n# The compose box's editor, a test script on the added PATH\n"
+        f"{ui}"
         "\n# A model for /model to list\n"
         f"[model fake:gui_b:{nonce}]\n"
         "context = 100000\n"
@@ -1389,8 +1395,10 @@ def main():
     elif args.mode == "compose":
         if args.host:
             ap.error("--mode compose runs only here: its test editor is a sh script")
-        editor = host.path("edit.sh")
+        host.mkdir(host.path("bin"))
+        editor = host.path("bin", f"prospero-test-editor-{nonce}")
         host.write(editor, COMPOSE_EDITOR)
+        os.chmod(editor, 0o755)
         # A skill of the workspace's, for /name's completion
         host.mkdir(host.path("work", ".claude", "skills", "zzcheck"))
         host.write(host.path("work", ".claude", "skills", "zzcheck", "SKILL.md"),

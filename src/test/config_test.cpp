@@ -93,6 +93,8 @@ static void testcfgschema(Test *t)
         {"guard", "roots", "/a; ~/b; ~; C:\\x; //srv/share", CFG_OK, 0},
         {"guard", "roots", "/a; b", CFG_ODD, 0},
         {"guard", "roots", ";;", CFG_OK, 0},
+        {"tools", "path_prepend", "/x; ~/y", CFG_OK, 0},
+        {"tools", "path_append", "/x; rel", CFG_ODD, 0},
     };
     for (iz i = 0; i < countof(judge); i++) {
         CfgKey *k = cfgkey(judge[i].kind, judge[i].key);
@@ -839,6 +841,8 @@ static void testcfgjson(Test *t)
         "tools//auto_resume=5*\n"
         "tools//stop_grace=*\n"
         "tools//shell=auto*\n"
+        "tools//path_prepend=*\n"
+        "tools//path_append=*\n"
         "tools//use_rg=true*\n"
         "tools//task_budget=200*\n"
         "instructions//files=AGENTS.md CLAUDE.md*\n"
@@ -1035,7 +1039,7 @@ static void testcfgengine(Test *t)
         cfgdelete(c, &tmp, "model", "m");
         tmp = v.scratch;
         cfgdelete(c, &tmp, "endpoint", "local");
-        reconfigure(e);
+        reconfigure(e, v.scratch);
         Buf b(&a, 128);
         print(&b, s->ep.url);
         putbyte(&b, ' ');
@@ -1634,6 +1638,88 @@ static void testcfglike(Test *t)
     cfgfree(c);
 }
 
+// [tools] path_prepend and path_append: the PATH programs are found by;
+// the environment's PATH set to it, and the engine's lookups on it.
+static void testcfgpath(Test *t)
+{
+    Arena  a = t->perm;
+    CfgEnv v = newcfgenv(&a);
+
+    // In order, ~ the home directory, empty, relative and (on POSIX)
+    // colon entries left out
+    os_write(v.os, a, "/c/h.ini",
+             "[tools]\n"
+             "path_prepend = ~/bin; ; /opt/x/bin ;rel/bin; C:/x\n"
+             "path_append = /late\n");
+    Config *c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
+    expect(t, "path.own",cfgsearchpath(c, &a, "/usr/bin:/bin", "/home/u", 0),
+           "/home/u/bin:/opt/x/bin:/usr/bin:/bin:/late");
+    expect(t, "path.own.nohome", cfgsearchpath(c, &a, "/usr/bin", "", 0),
+           "/opt/x/bin:/usr/bin:/late");
+    expect(t, "path.own.empty", cfgsearchpath(c, &a, "", "/home/u", 0),
+           "/home/u/bin:/opt/x/bin:/late");
+    cfgfree(c);
+
+    // Windows: ; between, backslashes in the directories added
+    os_write(v.os, a, "/c/w.ini",
+             "[tools]\n"
+             "path_prepend = C:\\tools; ~/bin\n"
+             "path_append = D:/late;\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/w.ini", 0);
+    expect(t, "path.windows",
+           cfgsearchpath(c, &a, "C:\\Windows;C:/Windows/System32", "C:\\Users\\u", 1),
+           "C:\\tools;C:\\Users\\u\\bin;C:\\Windows;C:/Windows/System32;D:\\late");
+    cfgfree(c);
+    os_write(v.os, a, "/c/none.ini", "");
+    c = newconfig(v.os, &a, v.scratch, "/c/none.ini", 0);
+    Str same = "/usr/bin:/bin";
+    Str got  = cfgsearchpath(c, &a, same, "/home/u", 0);
+    expect(t, "path.unset", istr(&a, got.data==same.data && got.len==same.len), "1");
+    cfgfree(c);
+
+    // The environment's PATH, set to it: in place, under its own name
+    {
+        Str posix[] = {"HOME=/h", "PATH=/bin", "X=1"};
+        Slice<Str> env = {posix, countof(posix), countof(posix)};
+        expect(t, "env.path", envpath(env, 0), "/bin");
+        expect(t, "env.setpath", showlist(&a, envsetpath(&a, env, "/a:/bin", 0)),
+               "HOME=/h|PATH=/a:/bin|X=1");
+        Slice<Str> same = envsetpath(&a, env, "/bin", 0);
+        expect(t, "env.setpath.same", istr(&a, same.data==env.data), "1");
+
+        Str win[] = {"=C:=C:\\x", "Path=C:\\w", "PATH2=y"};
+        Slice<Str> wenv = {win, countof(win), countof(win)};
+        expect(t, "env.path.win", envpath(wenv, 1), "C:\\w");
+        expect(t, "env.setpath.win",
+               showlist(&a, envsetpath(&a, wenv, "C:\\t;C:\\w", 1)),
+               "=C:=C:\\x|Path=C:\\t;C:\\w|PATH2=y");
+        expect(t, "env.path.case", envpath(wenv, 0).data ? Str("set") : Str("null"),
+               "null");
+        expect(t, "env.setpath.case", showlist(&a, envsetpath(&a, wenv, "/a", 0)),
+               "=C:=C:\\x|Path=C:\\w|PATH2=y|PATH=/a");
+
+        Slice<Str> none = {};
+        expect(t, "env.setpath.none", istr(&a, envsetpath(&a, none, "", 0).len), "0");
+    }
+
+    // The engine's lookups go by the PATH given: busybox for Windows'
+    // sh, a shell by its name, ripgrep
+    {
+        os_write(v.os, a, "/bb/busybox.exe", "MZ");
+        os_write(v.os, a, "/opt/bin/zsh", "#!");
+        os_write(v.os, a, "/w/bin/nu.exe", "MZ");
+        ToolEnv te = findshell(v.os, &a, v.scratch, "/exe", "C:/nowhere;/bb", 1, "auto");
+        expect(t, "findshell.busybox", te.shell, "/bb/busybox.exe");
+        expect(t, "findshell.busybox.kind", istr(&a, te.shellkind), istr(&a, SHELL_BUSYBOX));
+        te = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin:/opt/bin", 0, "zsh");
+        expect(t, "findshell.name", te.shell, "/opt/bin/zsh");
+        te = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin", 0, "zsh");
+        expect(t, "findshell.name.missing", te.shell, "/bin/sh");
+        te = findshell(v.os, &a, v.scratch, "/exe", "/w/bin", 1, "nu");
+        expect(t, "findshell.name.exe", te.shell, "/w/bin/nu.exe");
+    }
+}
+
 static void test_config(Test *t)
 {
     testcfgsha256(t);
@@ -1648,4 +1734,5 @@ static void test_config(Test *t)
     testcfgjson(t);
     testcfgengine(t);
     testcfglike(t);
+    testcfgpath(t);
 }
