@@ -92,6 +92,9 @@ class LocalHost:
         self.prospero = os.path.abspath(prospero)
         self.url = url
         self.root = tempfile.mkdtemp(prefix="prospero-scen-")
+        if self.windows:
+            # Paths as the harness reports them, as over ssh (SshHost)
+            self.root = self.root.replace("\\", "/")
         self.t0 = time.time()
 
     def close(self):
@@ -100,7 +103,11 @@ class LocalHost:
                 os.unlink(link)
             except FileNotFoundError:
                 pass
-        shutil.rmtree(self.root, ignore_errors=True)
+        root = self.root
+        if self.windows:
+            # Through a \\?\ path, which reaches past MAX_PATH (deep_unicode)
+            root = "\\\\?\\" + os.path.abspath(root)
+        shutil.rmtree(root, ignore_errors=True)
 
     def leftovers(self):
         """What close left: the root, or links in /tmp into it."""
@@ -108,15 +115,17 @@ class LocalHost:
         return left + tmplinks(self.root)
 
     def join(self, *parts):
-        return os.path.join(*parts)
+        path = os.path.join(*parts)
+        return path.replace("\\", "/") if self.windows else path
 
     def mkdir(self, path):
         os.makedirs(path, exist_ok=True)
 
     def write(self, path, data):
-        mode = "wb" if isinstance(data, bytes) else "w"
-        with open(path, mode) as f:
-            f.write(data)
+        # The bytes given, without Windows' text mode, which would make
+        # each newline CRLF
+        with open(path, "wb") as f:
+            f.write(data.encode() if isinstance(data, str) else data)
 
     def read(self, path):
         try:
@@ -156,7 +165,7 @@ class LocalHost:
     def killpid(self, pid):
         """Kill a leftover process by a pid from a file, if it is ours."""
         try:
-            P.signal_ours(pid, signal.SIGKILL, P.since(self.t0))
+            P.signal_ours(pid, P.KILL, P.since(self.t0))
         except (OSError, P.Refused) as e:
             print(f"     kill: {e}", flush=True)
 

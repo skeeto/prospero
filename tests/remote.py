@@ -36,7 +36,6 @@ import hashlib
 import json
 import os
 import random
-import shlex
 import shutil
 import signal
 import socket
@@ -358,7 +357,7 @@ class T:
         self.write_config(args.url)
 
     def write_config(self, url, extra=""):
-        with open(self.config, "w") as f:
+        with open(self.config, "w", newline="") as f:
             f.write(f"endpoint = fake\nmodel = fake:remote_slow:{self.nonce}\n"
                     f"[endpoint fake]\nurl = {url}/\nfirst_byte_timeout = 5\n"
                     f"idle_timeout = 5\nprogress_timeout = 10\nconnect_timeout = 2\n"
@@ -386,14 +385,15 @@ class T:
     def ownhost(self, pid):
         """Whether pid is a host of this scenario's own state directory,
         a fresh temporary one: its command line names it."""
-        cmd = psfield(pid, "command")
-        return (psfield(pid, "uid") == str(os.getuid()) and " serve " in cmd and
-                os.path.realpath(self.state) in cmd)
+        cmd, state = P.command(pid), os.path.realpath(self.state)
+        if os.name == "nt":  # either slash, any case
+            cmd, state = (x.replace("\\", "/").lower() for x in (cmd, state))
+        return P.mine(pid) and " serve " in cmd and state in cmd
 
     def cleanup(self):
         for pid in self.hostpids():
             try:
-                signal_ours(pid, signal.SIGKILL, self.ownhost, "host")
+                signal_ours(pid, P.KILL, self.ownhost, "host")
             except (Failure, OSError) as e:
                 print(f"     cleanup: {e}", flush=True)
         for p in self.procs:
@@ -402,6 +402,12 @@ class T:
             except OSError:
                 pass
         shutil.rmtree(self.root, ignore_errors=True)
+        # Windows removes no file a process has open, nor a program that
+        # runs, and a host killed or quit may take a moment to let go
+        deadline = time.monotonic() + 15
+        while os.path.exists(self.root) and time.monotonic() < deadline:
+            time.sleep(0.2)
+            shutil.rmtree(self.root, ignore_errors=True)
 
     def log(self, sid):
         path = os.path.join(self.state, "sessions", sid, "events.jsonl")
@@ -461,16 +467,15 @@ def scenario(fn):
     return fn
 
 
-psfield = P.psfield
-
-
 def grandchild(pid, root):
     """Whether root is the parent of pid's parent: an ssh that prospero
-    connect (root, a process of ours) started under its reaper."""
+    connect (root, a process of ours) started under its reaper. Windows
+    has no reaper there: its parent, then."""
     try:
-        parent = int(psfield(pid, "ppid"))
-        return parent > 1 and int(psfield(parent, "ppid")) == root
-    except (ValueError, P.Refused):
+        if os.name == "nt":
+            return P.descends(pid, root, 1)
+        return P.parent(pid) != root and P.descends(pid, root, 2)
+    except P.Refused:
         return False
 
 
@@ -546,7 +551,7 @@ def stale_links(t):
     pids = t.hostpids()
     t.check(len(pids) == 1, f"one host: {pids}")
     t.check(tmplinks(run) == links, f"the host's link is the client's: {tmplinks(run)}")
-    signal_ours(pids[0], signal.SIGKILL, t.ownhost, "host")
+    signal_ours(pids[0], P.KILL, t.ownhost, "host")
     t.check(gone(pids[0]), "the host was killed")
     s.kill()
     link = links[0]
@@ -757,12 +762,22 @@ def idle_exit(t):
     t.check(not os.listdir(os.path.join(t.state, "hosts")), "registration removed")
 
 
+def pesubsystem(path):
+    """A PE program's subsystem: 2 for a GUI program, 3 for a console's."""
+    with open(path, "rb") as f:
+        data = f.read(4096)
+    pe = struct.unpack_from("<I", data, 0x3c)[0]
+    return struct.unpack_from("<H", data, pe + 24 + 68)[0]
+
+
 @scenario
 def quit_signals(t):
     """prospero serve asked to quit by a signal (SIGTERM, SIGINT, SIGHUP;
     on Windows Ctrl+Break at its console) quits as a client's quit does:
     exit 0, its registration and endpoint gone."""
     win = os.name == "nt"
+    if win and pesubsystem(t.prospero) == 2:
+        return "skip"  # a GUI program, with no console for Ctrl+Break to reach
     sigs = [signal.CTRL_BREAK_EVENT] if win else [signal.SIGTERM, signal.SIGINT, signal.SIGHUP]
     for sig in sigs:
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if win else 0
@@ -835,7 +850,7 @@ def close_subagents(t):
     """Closing a session whose subagents the host gave this client too:
     the close is answered, and the host and the client go on."""
     for name, text in (("a.txt", "1\n2\n3\n"), ("b.txt", "1\n2\n")):
-        with open(os.path.join(t.work, name), "w") as f:
+        with open(os.path.join(t.work, name), "w", newline="") as f:
             f.write(text)
     c = Client(t)
     s = c.attach()
@@ -1119,7 +1134,7 @@ def connect_local(t):
 
     # The host goes away hard: a new one starts, and the session reopens
     pid = t.hostpids()[0]
-    signal_ours(pid, signal.SIGKILL, t.ownhost, "host")
+    signal_ours(pid, P.KILL, t.ownhost, "host")
     t.check(gone(pid), "killed")
     c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "down", what="down")
     n = len([r for r in c.records if r.get("ev") == "remote" and r.get("state") == "up"])
@@ -1258,10 +1273,10 @@ def remote_option(t):
     real ssh (to a name that never resolves) runs nothing here."""
     local = os.path.join(t.root, "local")
     inc = os.path.join(t.root, "team.ini")
-    with open(inc, "w") as f:
+    with open(inc, "w", newline="") as f:
         f.write("[remote team]\npath = -oProxyCommand=/usr/bin/touch\n")
     for own in ("", "path = -oProxyCommand=/usr/bin/touch\n"):
-        with open(t.config, "w") as f:
+        with open(t.config, "w", newline="") as f:
             f.write(f"include = {inc}\n[remote team]\nssh = example.invalid\n" + own)
         p = subprocess.run([t.prospero, "connect", "team", "-c", t.config, "--state", local],
                            stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -1286,7 +1301,7 @@ def restart_unattended(t):
     t.check(r.get("ok") == 1, f"new: {r}")
     sid = r["sid"]
     pid = t.hostpids()[0]
-    signal_ours(pid, signal.SIGKILL, t.ownhost, "host")
+    signal_ours(pid, P.KILL, t.ownhost, "host")
     t.check(gone(pid), "killed")
     c.wait(lambda r: ups(c) >= 2, what="up again", timeout=40)
     p = c.call("prompt", sid=sid, text="write outside")
@@ -1338,9 +1353,15 @@ def file_cmd(t):
     t.check(p.get("ok") == 1 and p.get("text") == "i" and p.get("more") == 1 and
             p.get("off") == 2, f"a part: {p}")
     sdir = os.path.join(t.state, "sessions", sid)
-    os.symlink(t.config, os.path.join(sdir, "out", "link.ini"))
-    for bad in ("../../prospero.ini", "/etc/hosts", "out/../../" + sid + "/events.jsonl",
-                "out/link.ini", "", "C:x", "out\\..\\..\\x"):
+    link = ["out/link.ini"]
+    try:
+        os.symlink(t.config, os.path.join(sdir, "out", "link.ini"))
+    except OSError:
+        if os.name != "nt":
+            raise
+        link = []  # Windows, without the privilege to make links
+    for bad in ["../../prospero.ini", "/etc/hosts", "out/../../" + sid + "/events.jsonl",
+                "", "C:x", "out\\..\\..\\x"] + link:
         x = c.call("file", sid=sid, path=bad)
         t.check(x.get("ok") == 0, f"refused {bad!r}: {x}")
     e = c.call("file", sid=sid, path="events.jsonl", max=64)
@@ -1455,18 +1476,71 @@ def connect_endpoint(t):
     sa.disconnect()
 
 
+# The parts of a fake ssh, in Python, so that it runs on Windows too
+FAKE = r'''
+import os, subprocess, sys, time
+
+def record(path):
+    """This ssh's pid, the one the harness started: on Windows the shim's
+    (shim), which runs this script."""
+    with open(path, "a") as f:
+        f.write(f"{os.environ['PROSPERO_SHIM_PID'] if os.name == 'nt' else os.getpid()}\n")
+
+def command(args):
+    """ssh's command, after its options and destination."""
+    while len(args) > 1:
+        if args[0] == "-o":
+            args = args[2:]
+        elif args[0].startswith("-"):
+            args = args[1:]
+        else:
+            return args[1]
+    return args[0] if args else ""
+
+def run(argv):
+    """argv in place of this process, or on Windows, which cannot, as its
+    child, in the shim's job, which the shim's death takes down."""
+    if os.name != "nt":
+        os.execvp(argv[0], argv)
+    sys.exit(subprocess.call(argv))
+'''
+
+
+def program(t, name, source):
+    """A program of the scenario's own in Python, for the harness to run
+    as its ssh: a #! script, or on Windows, which runs no scripts as
+    programs, the shim running this Python on it (shim)."""
+    if os.name != "nt":
+        path = os.path.join(t.root, name)
+        with open(path, "w", newline="") as f:
+            f.write(f"#!{sys.executable}\n" + source)
+        os.chmod(path, 0o755)
+        return path
+    script = os.path.join(t.root, name + ".py")
+    with open(script, "w", newline="") as f:
+        f.write(source)
+    return shim(t.args, os.path.join(t.root, name + ".exe"), [sys.executable, "-I", script])
+
+
+def shim(args, path, argv):
+    """Windows: a program at path that runs argv followed by its own
+    arguments: a copy of the shim (tests/shim_win32.c, built beside the
+    harness and given as --shim) with that command line appended."""
+    if not args.shim:
+        raise Failure("on Windows this needs --shim, the program of tests/shim_win32.c")
+    with open(args.shim, "rb") as f:
+        data = f.read()
+    cmd = subprocess.list2cmdline(argv).encode()
+    with open(path, "wb") as f:
+        f.write(data + cmd + struct.pack("<I", len(cmd)) + b"SHIM")
+    return path
+
+
 def fakessh(t):
     """An ssh that runs the command here, recording its pid."""
-    path = os.path.join(t.root, "fakessh")
     pids = os.path.join(t.root, "ssh.pids")
-    with open(path, "w") as f:
-        f.write("#!/bin/sh\n"
-                f"echo $$ >> {shlex.quote(pids)}\n"
-                "while [ $# -gt 1 ]; do\n"
-                "  case \"$1\" in -o) shift 2;; -*) shift;; *) shift; break;; esac\n"
-                "done\n"
-                "exec sh -c \"$1\"\n")
-    os.chmod(path, 0o755)
+    path = program(t, "fakessh", FAKE + f"record({pids!r})\n"
+                   "run(['sh', '-c', command(sys.argv[1:])])\n")
     return path, pids
 
 
@@ -1497,7 +1571,7 @@ def connect_reconnect(t):
     sid = r["sid"]
     c.wait(lambda r: r.get("ev") == "delta" and "w5 " in r.get("text", ""), what="deltas")
     pids = sshpids(pidfile)
-    signal_ours(pids[-1], signal.SIGKILL, lambda p: grandchild(p, c.p.pid), "ssh")
+    signal_ours(pids[-1], P.KILL, lambda p: grandchild(p, c.p.pid), "ssh")
     c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "down", what="down")
     c.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid, what="turn.end",
            timeout=40)
@@ -1514,20 +1588,19 @@ def connect_reconnect(t):
 def slowssh(t, slow, delay):
     """A fake ssh, as fakessh's, whose invocation number slow (from 1)
     first sleeps, with what the client writes waiting in its input."""
-    path = os.path.join(t.root, "slowssh")
     count = os.path.join(t.root, "ssh.count")
-    with open(path, "w") as f:
-        f.write("#!/bin/sh\n"
-                f"n=$(cat {shlex.quote(count)} 2>/dev/null || echo 0)\n"
-                "n=$((n+1))\n"
-                f"echo $n > {shlex.quote(count)}\n"
-                "while [ $# -gt 1 ]; do\n"
-                "  case \"$1\" in -o) shift 2;; -*) shift;; *) shift; break;; esac\n"
-                "done\n"
-                f"if [ $n -eq {slow} ]; then sleep {delay}; fi\n"
-                "exec sh -c \"$1\"\n")
-    os.chmod(path, 0o755)
-    return path
+    return program(t, "slowssh", FAKE + f"""
+try:
+    with open({count!r}) as f:
+        n = int(f.read()) + 1
+except OSError:
+    n = 1
+with open({count!r}, "w") as f:
+    f.write(f"{{n}}\\n")
+if n == {slow}:
+    time.sleep({delay})
+run(["sh", "-c", command(sys.argv[1:])])
+""")
 
 
 def ups(c):
@@ -1618,10 +1691,7 @@ def slow_link(t):
     first.attach()
     first.call("hello")
     first.stream.disconnect()
-    prog = os.path.join(t.root, "slowssh")
-    with open(prog, "w") as f:
-        f.write(f"#!{sys.executable}\n" + THROTTLE.replace("RATE", "40000"))
-    os.chmod(prog, 0o755)
+    prog = program(t, "slowssh", THROTTLE.replace("RATE", "40000"))
     c = connect(t, ["--ssh", "here", "--ssh-program", prog, "--path", t.prospero,
                     "--remote-state", t.state, "--remote-config", t.config,
                     "--state", os.path.join(t.root, "local")])
@@ -1631,7 +1701,7 @@ def slow_link(t):
     c.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid, what="turn.end")
     line = "x" * 99 + "\n"
     size = (1 << 20) - 4096
-    with open(os.path.join(t.state, "sessions", sid, "big.txt"), "w") as f:
+    with open(os.path.join(t.state, "sessions", sid, "big.txt"), "w", newline="") as f:
         f.write(line * (size // len(line)))
     t0 = time.monotonic()
     got = c.call("file", sid=sid, path="big.txt", timeout=60)
@@ -1655,11 +1725,9 @@ def ssh_reconnect(t):
     if not t.args.ssh:
         return "skip"
     a = t.args
-    prog = os.path.join(t.root, "sshwrap")
     pidfile = os.path.join(t.root, "ssh.pids")
-    with open(prog, "w") as f:
-        f.write(f"#!/bin/sh\necho $$ >> {shlex.quote(pidfile)}\nexec ssh \"$@\"\n")
-    os.chmod(prog, 0o755)
+    prog = program(t, "sshwrap", FAKE + f"record({pidfile!r})\n"
+                   "run(['ssh'] + sys.argv[1:])\n")
     rstate = f"{a.remote_root}/state-{t.nonce}"
     rconf = f"{a.remote_root}/prospero-{t.nonce}.ini"
     remote_write(a, rconf, open(t.config).read().replace(a.url, a.remote_url))
@@ -1674,7 +1742,7 @@ def ssh_reconnect(t):
         sid = r["sid"]
         c.wait(lambda r: r.get("ev") == "delta" and "w5 " in r.get("text", ""),
                what="deltas", timeout=60)
-        signal_ours(sshpids(pidfile)[-1], signal.SIGKILL,
+        signal_ours(sshpids(pidfile)[-1], P.KILL,
                     lambda p: grandchild(p, c.p.pid), "ssh")
         c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "down", what="down")
         c.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
@@ -1700,11 +1768,9 @@ def ssh_offline(t):
     if not t.args.ssh:
         return "skip"
     a = t.args
-    prog = os.path.join(t.root, "sshwrap")
     pidfile = os.path.join(t.root, "ssh.pids")
-    with open(prog, "w") as f:
-        f.write(f"#!/bin/sh\necho $$ >> {shlex.quote(pidfile)}\nexec ssh \"$@\"\n")
-    os.chmod(prog, 0o755)
+    prog = program(t, "sshwrap", FAKE + f"record({pidfile!r})\n"
+                   "run(['ssh'] + sys.argv[1:])\n")
     rstate = f"{a.remote_root}/state-{t.nonce}"
     rconf = f"{a.remote_root}/prospero-{t.nonce}.ini"
     remote_write(a, rconf, "endpoint = dead\nmodel = m\n[endpoint dead]\n"
@@ -1720,7 +1786,7 @@ def ssh_offline(t):
         sid = r["sid"]
         c.wait(lambda r: r.get("ev") == "retry" and r.get("sid") == sid, what="a retry",
                timeout=120)
-        signal_ours(sshpids(pidfile)[-1], signal.SIGKILL,
+        signal_ours(sshpids(pidfile)[-1], P.KILL,
                     lambda p: grandchild(p, c.p.pid), "ssh")
         c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "down", what="down")
         ups = lambda: len([x for x in c.records if x.get("ev") == "remote"
@@ -1779,6 +1845,7 @@ def main():
     ap.add_argument("--shell", help="the ssh host's shell for scripts (default: sh -s)")
     ap.add_argument("--no-tunnel", action="store_true",
                     help="the ssh host cannot forward a port back")
+    ap.add_argument("--shim", help="Windows: the program of tests/shim_win32.c")
     ap.add_argument("-v", action="store_true")
     ap.add_argument("names", nargs="*")
     args = ap.parse_args()

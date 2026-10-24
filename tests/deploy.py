@@ -61,48 +61,67 @@ def scenario(fn):
     return fn
 
 
-FAKESSH = r"""#!/bin/sh
+# Python, as remote.py's fakes (R.program), so that they run on Windows
+# too, where the shell there is busybox-w32's sh, from PATH
+FAKESSH = R.FAKE + r"""
 # ssh here: the command runs in $FAKEHOME, as a remote shell's would in
 # the home directory; FAKEUNAME makes the probe's uname say otherwise,
 # and FAKEPATH is the only PATH there
-echo "$*" >> "$FAKELOG/ssh.log"
-while [ $# -gt 1 ]; do
-  case "$1" in -o) shift 2;; -*) shift;; *) shift; break;; esac
-done
-if [ -n "$FAKEUNAME" ] && [ "${1#uname}" != "$1" ]; then
-  printf '%s\n%%OS%%\n' "$FAKEUNAME"
-  exit 0
-fi
-if [ -n "$FAKEPATH" ]; then
-  PATH="$FAKEPATH"
-  export PATH
-fi
-cd "$FAKEHOME" && exec /bin/sh -c "$1"
+args = sys.argv[1:]
+with open(os.path.join(os.environ["FAKELOG"], "ssh.log"), "a", newline="") as f:
+    f.write(" ".join(args) + "\n")
+cmd = command(args)
+if os.environ.get("FAKEUNAME") and cmd.startswith("uname"):
+    sys.stdout.buffer.write(os.environ["FAKEUNAME"].encode() + b"\n%OS%\n")
+    sys.exit(0)
+if os.environ.get("FAKEPATH"):
+    os.environ["PATH"] = os.environ["FAKEPATH"]
+os.chdir(os.environ["FAKEHOME"])
+run(["sh" if os.name == "nt" else "/bin/sh", "-c", cmd])
 """
 
-FAKESCP = r"""#!/bin/sh
+FAKESCP = r"""
 # scp here, into $FAKEHOME: the first $FAKESCP_FAIL calls fail as a
 # dropped link would, and the first $FAKESCP_CORRUPT arrive damaged
-echo "$*" >> "$FAKELOG/scp.log"
-n=$(cat "$FAKELOG/scp.count" 2>/dev/null || echo 0)
-n=$((n + 1))
-echo "$n" > "$FAKELOG/scp.count"
-if [ "$n" -le "${FAKESCP_FAIL:-0}" ]; then
-  echo "Connection closed by 10.0.0.1 port 22" >&2
-  exit 255
-fi
-while [ $# -gt 2 ]; do
-  case "$1" in -o) shift 2;; -*) shift;; *) break;; esac
-done
-dst="$FAKEHOME/${2#*:}"
-cp "$1" "$dst" || exit 1
-if [ "$n" -le "${FAKESCP_CORRUPT:-0}" ]; then
-  printf 'x' >> "$dst"
-fi
+import os, shutil, sys
+args = sys.argv[1:]
+log = os.environ["FAKELOG"]
+with open(os.path.join(log, "scp.log"), "a", newline="") as f:
+    f.write(" ".join(args) + "\n")
+try:
+    with open(os.path.join(log, "scp.count")) as f:
+        n = int(f.read()) + 1
+except OSError:
+    n = 1
+with open(os.path.join(log, "scp.count"), "w", newline="") as f:
+    f.write(f"{n}\n")
+if n <= int(os.environ.get("FAKESCP_FAIL", "0")):
+    sys.stderr.write("Connection closed by 10.0.0.1 port 22\n")
+    sys.exit(255)
+while len(args) > 2:
+    if args[0] == "-o":
+        args = args[2:]
+    elif args[0].startswith("-"):
+        args = args[1:]
+    else:
+        break
+dst = os.path.join(os.environ["FAKEHOME"], args[1].split(":", 1)[-1])
+try:
+    shutil.copyfile(args[0], dst)
+except OSError as e:
+    sys.stderr.write(f"fakescp: {e}\n")
+    sys.exit(1)
+if n <= int(os.environ.get("FAKESCP_CORRUPT", "0")):
+    with open(dst, "ab") as f:
+        f.write(b"x")
 """
 
 
 def localplatform():
+    if os.name == "nt":
+        # As the harness names Windows: x86-64 on Arm too, which runs it
+        import platform
+        return "windows-" + ("i686" if platform.machine() == "x86" else "x86_64")
     sysname, mach = os.uname().sysname, os.uname().machine
     osname = {"Darwin": "macos", "Linux": "linux"}[sysname]
     arch = {"arm64": "arm64" if osname == "macos" else "aarch64",
@@ -126,21 +145,20 @@ class D(R.T):
         self.fakelog = os.path.join(self.root, "log")
         for d in (self.home, self.local, self.engines, self.fakelog):
             os.makedirs(d)
-        self.ssh = os.path.join(self.root, "fakessh")
-        self.scp = os.path.join(self.root, "fakescp")
-        for path, text in ((self.ssh, FAKESSH), (self.scp, FAKESCP)):
-            with open(path, "w") as f:
-                f.write(text)
-            os.chmod(path, 0o755)
+        self.ssh = R.program(self, "fakessh", FAKESSH)
+        self.scp = R.program(self, "fakescp", FAKESCP)
         out = subprocess.run([self.prospero, "--version"], capture_output=True,
                              text=True).stdout.split()
         self.version = out[1]
         self.platform = localplatform()
-        self.ename = f"prospero-engine-{self.version}-{self.platform}"
-        self.rname = f"engine-0-{self.version}-{self.platform}"
+        self.exe = ".exe" if os.name == "nt" else ""
+        self.ename = f"prospero-engine-{self.version}-{self.platform}{self.exe}"
+        self.rname = f"engine-0-{self.version}-{self.platform}{self.exe}"
         self.env = dict(self.env, FAKEHOME=self.home, FAKELOG=self.fakelog)
-        # No prospero on the remote shell's PATH, as on a new machine
-        self.env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        # No prospero on the remote shell's PATH, as on a new machine (on
+        # Windows it never was, and PATH has the shell, busybox-w32's)
+        if os.name != "nt":
+            self.env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
 
     def engine(self, extra=b""):
         """An engine of the local platform in the engines directory: this
@@ -151,7 +169,7 @@ class D(R.T):
         with open(dst, "wb") as f:
             f.write(data)
         os.chmod(dst, 0o755)
-        with open(dst + ".sha256", "w") as f:
+        with open(dst + ".sha256", "w", newline="") as f:
             f.write(f"{hashlib.sha256(data).hexdigest()}  {self.ename}\n")
         return dst
 
@@ -159,22 +177,38 @@ class D(R.T):
         """A desktop helper of the local platform in the engines
         directory: tests/fake_desktop.py behind a script that answers
         --version as the real one does, or, unless works, fails it."""
-        name = f"prospero-desktop-{self.version}-{self.platform}"
+        name = f"prospero-desktop-{self.version}-{self.platform}{self.exe}"
         dst = os.path.join(self.engines, name)
-        version = (f'echo "prospero-desktop {self.version}"; exit 0' if works
-                   else 'echo "cannot load libc" >&2; exit 1')
-        text = (f"#!/bin/sh\n# {extra}\n"
-                f'if [ "$1" = --version ]; then {version}; fi\n'
-                f"exec {shlex.quote(sys.executable)} {shlex.quote(FAKE_DESKTOP)} \"$@\"\n")
-        with open(dst, "w") as f:
-            f.write(text)
-        os.chmod(dst, 0o755)
-        with open(dst + ".sha256", "w") as f:
-            f.write(f"{hashlib.sha256(text.encode()).hexdigest()}  {name}\n")
+        if os.name == "nt":
+            # The shim, running a script of its own per build (works,
+            # extra), so that each build is another program
+            out = (f'sys.stdout.write("prospero-desktop {self.version}\\n"); sys.exit(0)'
+                   if works else 'sys.stderr.write("cannot load libc\\n"); sys.exit(1)')
+            text = (f"# {extra}\nimport subprocess, sys\n"
+                    f'if sys.argv[1:2] == ["--version"]:\n    {out}\n'
+                    f"sys.exit(subprocess.call([sys.executable, {FAKE_DESKTOP!r}] + "
+                    "sys.argv[1:]))\n")
+            build = hashlib.sha256(text.encode()).hexdigest()[:16]
+            script = os.path.join(self.root, f"helper-{build}.py")
+            with open(script, "w", newline="") as f:
+                f.write(text)
+            R.shim(self.args, dst, [sys.executable, "-I", script])
+        else:
+            version = (f'echo "prospero-desktop {self.version}"; exit 0' if works
+                       else 'echo "cannot load libc" >&2; exit 1')
+            text = (f"#!/bin/sh\n# {extra}\n"
+                    f'if [ "$1" = --version ]; then {version}; fi\n'
+                    f"exec {shlex.quote(sys.executable)} {shlex.quote(FAKE_DESKTOP)} \"$@\"\n")
+            with open(dst, "w", newline="") as f:
+                f.write(text)
+            os.chmod(dst, 0o755)
+        with open(dst + ".sha256", "w", newline="") as f:
+            f.write(f"{sha256(dst)}  {name}\n")
         return dst
 
     def helperdeployed(self):
-        return os.path.join(self.home, ".prospero", f"desktop-0-{self.version}-{self.platform}")
+        return os.path.join(self.home, ".prospero",
+                            f"desktop-0-{self.version}-{self.platform}{self.exe}")
 
     def deploy(self, *extra, env=None, target="here"):
         argv = [self.prospero, "deploy", target, "--ssh-program", self.ssh,
@@ -240,8 +274,10 @@ def fresh(t):
     t.check(p.stdout == f"~/.prospero/{t.rname}\n", f"stdout {p.stdout!r}")
     dst = t.deployed()
     t.check(os.path.isfile(dst) and sha256(dst) == sha256(src), "the engine is there")
-    t.check(os.stat(dst).st_mode & 0o111, "executable")
-    t.check(oct(os.stat(os.path.dirname(dst)).st_mode & 0o777) == "0o700", "~/.prospero 0700")
+    if os.name != "nt":  # no modes there
+        t.check(os.stat(dst).st_mode & 0o111, "executable")
+        t.check(oct(os.stat(os.path.dirname(dst)).st_mode & 0o777) == "0o700",
+                "~/.prospero 0700")
     t.check(not os.path.exists(dst + ".part"), "no .part left")
     rec = t.record()
     t.check(rec.get("host") == "here" and rec.get("platform") == t.platform and
@@ -285,7 +321,7 @@ def damaged(t):
     small = b"not an engine\n" * 64
     with open(src, "wb") as f:
         f.write(small)
-    with open(src + ".sha256", "w") as f:
+    with open(src + ".sha256", "w", newline="") as f:
         f.write(f"{hashlib.sha256(small).hexdigest()}  {t.ename}\n")
     env = dict(t.env, FAKESCP_CORRUPT="99")
     start = time.monotonic()
@@ -349,6 +385,8 @@ def relative_engines(t):
 def no_hash(t):
     """No tool there to compute a SHA-256: deploying fails at once, for
     good, before uploading anything."""
+    if os.name == "nt":
+        return "skip"  # busybox-w32's sh runs its applets, sha256sum too, whatever PATH has
     t.engine()
     bindir = os.path.join(t.root, "bin")
     os.makedirs(bindir)
@@ -449,8 +487,17 @@ def auto_config(t):
     t.check(os.path.isfile(t.deployed()), "deployed")
     c.call("quit")
     t.check(c.close() == 0, "connect exits 0")
-    # Nothing to deploy for this platform: the end, saying why
-    shutil.rmtree(os.path.join(t.home, ".prospero"))
+    # Nothing to deploy for this platform: the end, saying why. (Windows
+    # removes no running program, so the host quit must first be gone.)
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            shutil.rmtree(os.path.join(t.home, ".prospero"))
+            break
+        except PermissionError:
+            if os.name != "nt" or time.monotonic() > deadline:
+                raise
+            time.sleep(0.2)
     os.remove(os.path.join(t.local, "deploy", "here.ini"))
     for n in os.listdir(t.engines):
         os.remove(os.path.join(t.engines, n))
@@ -587,7 +634,7 @@ def desktop_warn(t):
 def desktop_self(t):
     """No engine in the engines directory, so this program serves, and
     its own helper next to it goes with it."""
-    mine = os.path.join(os.path.dirname(t.prospero), "prospero-desktop")
+    mine = os.path.join(os.path.dirname(t.prospero), "prospero-desktop" + t.exe)
     if not os.path.isfile(mine):
         return "skip"
     p = t.deploy()
@@ -643,11 +690,11 @@ def real(t):
     t.check("uploading" not in q.stderr, "uploaded again")
 
     # Connect to it, through an ssh that logs what it runs
-    prog = os.path.join(t.root, "sshwrap")
-    with open(prog, "w") as f:
-        f.write(f"#!/bin/sh\necho \"$*\" >> {shlex.quote(t.fakelog)}/ssh.log\n"
-                "exec ssh \"$@\"\n")
-    os.chmod(prog, 0o755)
+    prog = R.program(t, "sshwrap", R.FAKE + f"""
+with open({os.path.join(t.fakelog, "ssh.log")!r}, "a", newline="") as f:
+    f.write(" ".join(sys.argv[1:]) + "\\n")
+run(["ssh"] + sys.argv[1:])
+""")
     rstate = f"{a.remote_root}/state-{t.nonce}"
     rconf = f"{a.remote_root}/prospero-{t.nonce}.ini"
     R.remote_write(a, rconf, open(t.config).read().replace(a.url, a.remote_url))
@@ -681,7 +728,7 @@ def real(t):
             data = f.read() + b"another build"
         with open(os.path.join(other, base), "wb") as f:
             f.write(data)
-        with open(os.path.join(other, base + ".sha256"), "w") as f:
+        with open(os.path.join(other, base + ".sha256"), "w", newline="") as f:
             f.write(f"{hashlib.sha256(data).hexdigest()}  {base}\n")
         fargv = [t.prospero, "deploy", a.ssh, "--engines", other, "--state", t.local]
         p = subprocess.run(fargv, capture_output=True, text=True, timeout=900)
@@ -729,6 +776,7 @@ def main():
     ap.add_argument("--shell", help="the ssh host's shell for scripts (default: sh -s)")
     ap.add_argument("--no-tunnel", action="store_true",
                     help="the ssh host cannot forward a port back")
+    ap.add_argument("--shim", help="Windows: the program of tests/shim_win32.c")
     ap.add_argument("-v", action="store_true")
     ap.add_argument("names", nargs="*")
     args = ap.parse_args()

@@ -347,15 +347,24 @@ if(NOT CMAKE_CROSSCOMPILING)
       add_test(NAME cleanup COMMAND ${UV} run
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/cleanup.py --prospero $<TARGET_FILE:prospero>)
     endif()
+    # The fake ssh, scp and desktop helper are Python, which Windows runs
+    # as a program only through a shim (tests/shim_win32.c)
+    set(prospero_shim)
+    if(WIN32)
+      add_executable(prospero_testshim tests/shim_win32.c)
+      set(prospero_shim --shim $<TARGET_FILE:prospero_testshim>)
+    endif()
     # Hosts and their clients on this machine (the ssh ones take --ssh)
     add_test(NAME remote COMMAND ${UV} run
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/remote.py --prospero $<TARGET_FILE:prospero>)
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/remote.py --prospero $<TARGET_FILE:prospero>
+      ${prospero_shim})
     # URL includes in the configuration, against a fake web server
     add_test(NAME includes COMMAND ${UV} run
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/includes.py --prospero $<TARGET_FILE:prospero>)
     # Deploying engines through a fake ssh and scp (a real host: --ssh)
     add_test(NAME deploy COMMAND ${UV} run
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/deploy.py --prospero $<TARGET_FILE:prospero>)
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/deploy.py --prospero $<TARGET_FILE:prospero>
+      ${prospero_shim})
     # The release's check of Authenticode signatures (tools/pecheck.py),
     # on a program signed with a throwaway key
     find_program(OPENSSL openssl)

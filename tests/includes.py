@@ -707,6 +707,11 @@ def serve_nowait(t):
         r = wait(lambda r: r.get("ev") == "reply" and r.get("id") == 1, 15, "config.get")
         i = [x for x in r.get("includes", []) if x["url"] == url]
         t.check(i and i[0]["fetching"] == 1 and not i[0]["fetched"], f"include {i}")
+        # Its request under way may not have reached the server yet (on
+        # Windows WinHTTP takes a moment to send it)
+        deadline = time.monotonic() + 10
+        while not t.requests("slow.ini") and time.monotonic() < deadline:
+            time.sleep(0.05)
         p.stdin.write('{"cmd":"quit","id":2}\n')
         p.stdin.flush()
         wait(lambda r: r.get("ev") == "reply" and r.get("id") == 2, 15, "quit")
