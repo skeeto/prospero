@@ -153,6 +153,17 @@ static void testcfgdefault(Test *t)
            "C:/Users/u/AppData/Roaming/prospero/prospero.ini");
     expect(t, "default.seeded", cfgfile(v.os, c->path), cfgseed());
     cfgfree(c);
+
+    // With a home, a file only in the older place is still used
+    CfgEnv k = newcfgenv(&a);
+    addenv(k.os, &a, "APPDATA=/A");
+    addenv(k.os, &a, "HOME=/h");
+    os_mkdirs(k.os, a, "/A/prospero");
+    os_write(k.os, a, "/A/prospero/prospero.ini", "");
+    expect(t, "default.kept", cfgdefault(k.os, &a), "/A/prospero/prospero.ini");
+    os_mkdirs(k.os, a, "/h/.config/prospero");
+    os_write(k.os, a, "/h/.config/prospero/prospero.ini", "");
+    expect(t, "default.home", cfgdefault(k.os, &a), "/h/.config/prospero/prospero.ini");
 }
 
 // First run writes the seed byte for byte, and it is a clean, complete

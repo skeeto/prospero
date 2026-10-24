@@ -2078,12 +2078,12 @@ static Str userhome(Os *os, Arena *a)
     return home;
 }
 
-// Under the home directory, rel, unless (Windows) only the older place
-// under the known folder in env has one, kind a file or a directory.
+// Under the home directory, rel, unless only the older place under the
+// known folder in env (Windows) has one, kind a file or a directory.
 static Str homeorold(Os *os, Arena *a, Str home, Str rel, Str env,
                      Str oldrel, i32 kind)
 {
-    Str known = HOST_WINDOWS ? os_getenv(os, a, env) : Str{};
+    Str known = os_getenv(os, a, env);  // set on Windows alone
     Str old   = known.len ? join(a, known, oldrel) : Str{};
     if (!home.len) {
         return old;
