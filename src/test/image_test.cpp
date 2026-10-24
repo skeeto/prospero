@@ -452,12 +452,14 @@ static void test_image(Test *t)
         expect(t, "bmp", istr(a, imgdiff(*a, FIX(fxbmp), want, 5, 3)), "0");
     }
 
-    // WebP, lossless exactly, alpha and all, and lossy near enough
+    // WebP, lossless exactly, alpha and all, and lossy near enough: 11
+    // off at most, as libwebp's dwebp decodes it too
     {
         u8 *want = fxpixels(a, 5, 3, 1);
         expect(t, "webp lossless", istr(a, imgdiff(*a, FIX(fxwebpl), want, 5, 3)), "0");
-        i32 d = imgdiff(*a, FIX(fxwebpy), fxsmooth(a, 16, 16), 16, 16);
-        expect(t, "webp lossy", istr(a, d>=0 && d<=6), "1");
+        want = fxsmooth(a, 16, 16);  // before the scratch copy, not after
+        i32 d = imgdiff(*a, FIX(fxwebpy), want, 16, 16);
+        expect(t, "webp lossy", istr(a, d>=0 && d<=12), "1");
     }
 
     // What an image is, and its size, by its header alone
