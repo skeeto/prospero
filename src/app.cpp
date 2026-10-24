@@ -7331,7 +7331,18 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 700, ""},
     {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
     // A new session through its dialog, a modal, from the Session menu:
-    // the directory typed over the field's suggestion
+    // Esc cancels it; then the directory typed over the field's
+    // suggestion, and Enter creates it
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
@@ -7340,9 +7351,8 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     {OP_TEXTCWD, 0, 0, 0, 300, ""},
-    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
@@ -8486,9 +8496,8 @@ static DriveOp sessionsops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "sessions-export"},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "export save"},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},  // Save...
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
     {OP_WAIT, W_FILE, 0, 0, 5000, "Greeting.md"},
     {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Greeting.md|# Greeting\n"},
     {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Greeting.md|## Agent\n\nHello!"},

@@ -80,6 +80,43 @@ static b32 checkbox(char const *label, b32 *v)
     return r;
 }
 
+// A key pressed for the current window, a modal, itself: not as it
+// appears (the key that opened it), nor while a popup of its own shows
+// or did last frame, which the key was for (a combo's list, which Esc
+// closes before the modal draws). Whoever owns the key: a field's
+// claim on Esc while it was active must not keep the modal open.
+static b32 modalkey(ImGuiKey key)
+{
+    ImGuiContext &c   = *GImGui;
+    ImGuiWindow  *cur = c.CurrentWindow;
+    if (ImGui::IsWindowAppearing() || !ImGui::IsKeyPressed(key, 0)) {
+        return 0;
+    }
+    for (i32 i = 0; i < c.Windows.Size; i++) {
+        ImGuiWindow *w = c.Windows[i];
+        if (w!=cur && (w->Flags & ImGuiWindowFlags_Popup) && w->ParentWindow==cur &&
+                w->LastFrameActive>=c.FrameCount-1) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Enter for a modal's default button, called first in its body: in a
+// single-line field, or with no item under the keyboard's nav cursor,
+// which Enter activates instead (Cancel, a checkbox).
+static b32 modalenter()
+{
+    ImGuiContext &c = *GImGui;
+    if (!modalkey(ImGuiKey_Enter) && !modalkey(ImGuiKey_KeypadEnter)) {
+        return 0;
+    }
+    b32 typing = c.ActiveId && c.InputTextState.ID==c.ActiveId &&
+                 !(c.InputTextState.Flags & ImGuiInputTextFlags_Multiline);
+    b32 navon  = c.NavCursorVisible && c.NavId && c.NavWindow==c.CurrentWindow;
+    return typing || !navon;
+}
+
 
 // Fonts and measurement
 
@@ -4131,7 +4168,7 @@ static void drawsessdialogs(Gui *g)
         ImGui::EndDisabled();
         itemnamed(g, "name ok");
         ImGui::SameLine();
-        b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape);
+        b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || modalkey(ImGuiKey_Escape);
         if ((ok || enter) && name.len) {
             GuiSession *s = g->namesess;
             switch (g->nameask) {
@@ -4235,8 +4272,9 @@ static void drawsessdialogs(Gui *g)
         ImGui::OpenPopup("Export as Markdown");
     }
     if (ImGui::BeginPopupModal("Export as Markdown", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
-        GuiSession *s = g->exportsess;
-        Export     *x = &g->exp;
+        GuiSession *s     = g->exportsess;
+        Export     *x     = &g->exp;
+        b32         enter = modalenter();
         if (s) {
             ImGui::TextDisabled("%s", cstr0(&a, shorten(&a, sesstitle(s), 60)));
         }
@@ -4252,7 +4290,7 @@ static void drawsessdialogs(Gui *g)
         ImGui::EndDisabled();
         ImGui::Spacing();
         ImGui::BeginDisabled(!s || s->gone);
-        b32 save = ImGui::Button("Save...", v2(120*sc, 0));
+        b32 save = ImGui::Button("Save...", v2(120*sc, 0)) || (enter && s && !s->gone);
         itemnamed(g, "export save");
         ImGui::SameLine();
         b32 copy = ImGui::Button("Copy", v2(120*sc, 0));
@@ -4598,7 +4636,8 @@ static void drawnew(Gui *g)
     if (!ImGui::BeginPopupModal(name, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
         return;
     }
-    Arena a = g->frame;
+    Arena a     = g->frame;
+    b32   enter = modalenter();
 
     // Where it runs, when there is a choice: its directory is there
     GuiHost *host  = g->newhost && hostready(g, g->newhost) &&
@@ -4708,7 +4747,7 @@ static void drawnew(Gui *g)
     }
 
     ImGui::Spacing();
-    b32 create = ImGui::Button(import ? "Import" : "Create", v2(120*sc, 0));
+    b32 create = ImGui::Button(import ? "Import" : "Create", v2(120*sc, 0)) || enter;
     itemrect(g, RECT_NEWCREATE);
     if (create) {
         Str cwd   = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
@@ -4721,7 +4760,7 @@ static void drawnew(Gui *g)
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Cancel", v2(120*sc, 0))) {
+    if (ImGui::Button("Cancel", v2(120*sc, 0)) || modalkey(ImGuiKey_Escape)) {
         g->newerr = {};
         if (import) {
             g->imp.state = IMP_IDLE;
@@ -6577,6 +6616,7 @@ static void drawdialogs(Gui *g)
         g->openabout = 0;
     }
     if (ImGui::BeginPopupModal("About Prospero", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        b32 enter = modalenter();
         ImGui::Text("Prospero %s", PROSPERO_VERSION);
         ImGui::TextUnformatted("A coding harness: the agent's turns, tools and sessions.");
         ImGui::TextUnformatted("Free and unencumbered software released into the public domain.");
@@ -6592,7 +6632,7 @@ static void drawdialogs(Gui *g)
         #endif
         drawfontcredits();
         ImGui::Spacing();
-        if (ImGui::Button("Close", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape)) {
+        if (ImGui::Button("Close", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape) || enter) {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
