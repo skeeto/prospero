@@ -240,11 +240,12 @@ struct ViewTool {
     i32  imgh;
     // Asks
     Str  req;
+    Str  kind;      // path, desktop, plan (detail the plan), plan.enter
     Str  tool;      // the tool that asked
     Str  path;
     Str  detail;
     Str  hint;
-    i64  deadline;  // epoch ms
+    i64  deadline;  // epoch ms, 0 for none (a plan's)
     i32  answer;    // VASK_*
     Str  grant;     // what always would allow: a directory or a file,
                     // or a desktop class (scope "desktop")
@@ -438,6 +439,9 @@ struct View {
     b32             readonly;   // open elsewhere: answering is not possible
     i64             turnts;     // epoch ms the running turn began
     i32             asks;       // pending asks
+    b32             plan;       // plan mode
+    Str             planpath;   // the plan file, once in plan mode
+    i32             planver;    // bumped as the plan file may change
 
     // Liveness, from live and progress records (epoch ms)
     i32             state;      // LIVE_*
@@ -1397,6 +1401,13 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->endpoint = clone(&v->aux, jsonstr(jsonget(j, "endpoint")));
         return 1;
 
+    case EV_MODE: {
+        Str path = jsonstr(jsonget(j, "path"));
+        v->plan     = jsonstr(jsonget(j, "mode")) == "plan";
+        v->planpath = path==v->planpath ? v->planpath : clone(&v->aux, path);
+        v->planver++;
+    } return 1;
+
     case EV_USER: {
         // A skill the user invoked shows as typed, /name and what
         // followed it, and the instructions it sent fold below
@@ -1619,6 +1630,10 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->imgh    = (i32)jsonint(jsonget(j, "height"), 0);
         m->seq     = r->seq;
         toolbody(v, scratch, m, jsonstr(jsonget(j, "text")));
+        if (v->planpath.len && (t->name=="write" || t->name=="edit") &&
+                find(t->args, "plan.md")>=0) {
+            v->planver++;  // perhaps the plan file
+        }
         // A call ends its ask, which after a crash has no answer
         for (iz i = v->msgs.len-1; i >= 0; i--) {
             ViewMsg *k = &v->msgs[i];
@@ -1647,6 +1662,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         i32       i = addmsg(v, VIEW_ASK, finish(&b));
         ViewTool *t = alloc<ViewTool>(&v->aux);
         t->req      = clone(&v->aux, jsonstr(jsonget(j, "req")));
+        t->kind     = clone(&v->aux, jsonstr(jsonget(j, "kind")));
         t->call     = clone(&v->aux, jsonstr(jsonget(j, "call")));
         t->tool     = clone(&v->aux, jsonstr(jsonget(j, "tool")));
         t->path     = clone(&v->aux, jsonstr(jsonget(j, "path")));
@@ -1658,6 +1674,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->scope    = clone(&v->aux, jsonstr(jsonget(j, "scope")));
         v->msgs[i].tool = t;
         v->msgs[i].seq  = r->seq;
+        v->msgs[i].md   = t->kind == "plan";  // the plan, in Markdown
+        v->planver     += t->kind == "plan";
         v->asks++;
         i32 c = findcall(v, t->call);
         if (c >= 0) {
@@ -2135,8 +2153,11 @@ static Doc *msgdoc(View *v, i32 i)
     }
     switch (m->role) {
     case VIEW_USER:
-    case VIEW_ASK:
         m->doc = parseplain(&c->arena, m->text, 0);
+        break;
+    case VIEW_ASK:
+        m->doc = m->md ? parsedoc(&c->arena, m->text, &c->memo)  // a plan
+                       : parseplain(&c->arena, m->text, 0);
         break;
     case VIEW_THINK:
     case VIEW_NOTE:

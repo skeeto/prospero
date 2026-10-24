@@ -20,6 +20,7 @@ enum : i32 {
     SLASH_RENAME,
     SLASH_FORK,
     SLASH_EXPORT,
+    SLASH_PLAN,
     SLASH_COUNT,
 };
 
@@ -36,6 +37,7 @@ static SlashInfo slashinfo[] = {
     {"/rename",  "TITLE",   "Give this session a title"},
     {"/fork",    "[TURN]",  "Start a new session from a copy of this one, or of its first turns"},
     {"/export",  "[raw]",   "Save the transcript as Markdown, or its raw log"},
+    {"/plan",    "[off]",   "Plan mode: the agent plans for you to approve before it changes anything"},
 };
 static_assert(countof(slashinfo) == SLASH_COUNT);
 
@@ -46,6 +48,7 @@ struct Slash {
     Str err;    // why the command cannot run as typed, else null
     i64 turn;   // /fork's turn, else -1: the whole session
     b32 raw;    // /export's raw log, not Markdown
+    b32 off;    // /plan off: leave plan mode
 };
 
 // The command a message is, if its first word is exactly one.
@@ -86,6 +89,12 @@ static Slash parseslash(Str text)
         r.raw = r.arg=="raw";
         if (r.arg.len && !r.raw && !(r.arg=="md")) {
             r.err = "/export takes raw (the log) or md, or nothing (Markdown)";
+        }
+        break;
+    case SLASH_PLAN:
+        r.off = r.arg=="off";
+        if (r.arg.len && !r.off && !(r.arg=="on")) {
+            r.err = "/plan takes off, or nothing (plan mode on)";
         }
         break;
     }

@@ -246,7 +246,7 @@ enum : i32 {
     RECT_MODEL0,     // /model's first model
     RECT_THEME0,     // the theme's choices in its open list
     RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
-    RECT_COUNT = RECT_PANE0 + 10,
+    RECT_COUNT = RECT_PANE0 + 11,
 };
 
 // The panes, which the View menu shows and hides
@@ -255,6 +255,7 @@ enum : i32 {
     PANE_TRANSCRIPT,
     PANE_PROMPT,
     PANE_TODO,
+    PANE_PLAN,
     PANE_JOBS,
     PANE_LOG,
     PANE_HOSTS,
@@ -265,7 +266,7 @@ enum : i32 {
 };
 
 static char const *panenames[] = {
-    "Sessions", "Transcript", "Prompt", "Todo", "Jobs", "Log", "Hosts",
+    "Sessions", "Transcript", "Prompt", "Todo", "Plan", "Jobs", "Log", "Hosts",
     "Settings", "Help", "Metrics",
 };
 static_assert(countof(panenames) == PANE_COUNT);
@@ -475,6 +476,20 @@ struct OutFile {
     i64         off;    // where the next part begins
     i64         size;
     b32         more;
+    i64         id;     // the command in flight, 0 if none
+    Str         err;
+    Arena       mem;
+    byte       *base;
+};
+
+// The Plan window's plan file, of the session shown, fetched again as
+// its view's planver changes.
+struct PlanFile {
+    GuiSession *s;
+    View       *v;
+    i32         ver;    // the planver fetched, or being fetched
+    Buf         text;
+    i64         off;
     i64         id;     // the command in flight, 0 if none
     Str         err;
     Arena       mem;
@@ -865,6 +880,7 @@ struct Gui {
     b32                remok;
     GuiHost           *newhost;    // the new session's host
     OutFile            out;        // the Output window's file
+    PlanFile           plan;       // the Plan window's
     Images             img;        // screenshots
     b32                outopen;
     b32                outfocus;   // brought to the front next frame
@@ -894,11 +910,13 @@ struct Gui {
     Str                firstcwd;   // newcwd's first, a directory here
     Str                newerr;
     b32                opennew;
+    b32                newplan;    // in plan mode
     i64                newid;      // the new command in flight
     char              *denynote;   // "Deny with note"
     Str                denyreq;
     GuiSession        *denysess;
-    b32                opendeny;
+    i32                opendeny;   // 2 to keep planning
+    b32                denyplan;
     b32                openrewind; // the rewind confirmation, for
     GuiSession        *rewsess;
     Str                rewcall;    // a call's change and those after, or
@@ -1022,6 +1040,7 @@ struct Gui {
     b32                fallbackshown;  // a retry on a fallback model
     b32                kidaskshown;  // the sidebar: a subagent needs an answer
     i32                todoshown;    // items the todo list drew
+    i32                planshown;    // bytes of the plan the Plan window drew
     i32                jobsshown;    // jobs the jobs panel drew
     i32                infoshown;    // instruction files the info listed
     i32                infoagents;   // of them AGENTS.md
@@ -1523,6 +1542,50 @@ static void guifile(Gui *g)
     cmdsend(g, &w, a);
 }
 
+// Ask for the plan file's next part.
+static void planpart(Gui *g)
+{
+    PlanFile *f = &g->plan;
+    Arena     a = newarena(g->cmdr);
+    Buf       b(&a, 256);
+    EvOut     w = cmdopen(g, &b, CMD_FILE, f->s);
+    putkey(&w.json, "path");
+    putstr(&w.json, "plan.md");  // in the session's directory
+    putkey(&w.json, "off");
+    putint(&w.json, f->off);
+    f->id = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+static b32 hostlive(Gui *, GuiSession *);
+
+// Fetch the shown session's plan file, from its start, unless what the
+// Plan window has is the latest or on its way.
+static void guiplan(Gui *g)
+{
+    PlanFile   *f = &g->plan;
+    GuiSession *s = g->sess;
+    View       *v = g->view;
+    if (!s || !v || !v->planpath.len || s->gone || !hostlive(g, s)) {
+        return;
+    }
+    if (f->id || (f->s==s && f->v==v && f->ver==v->planver)) {
+        return;
+    }
+    if (!f->base) {
+        f->mem  = newarena(os_reserve(g->os, (iz)1<<20));
+        f->base = f->mem.beg;
+    }
+    f->mem.beg = f->base;
+    f->s    = s;
+    f->v    = v;
+    f->ver  = v->planver;
+    f->text = Buf(&f->mem, 1<<16);
+    f->off  = 0;
+    f->err  = {};
+    planpart(g);
+}
+
 // Show a file of a session's directory in the Output window, taken
 // through its host, which may be on another machine.
 static void showfile(Gui *g, GuiSession *s, Str path)
@@ -1544,6 +1607,30 @@ static void showfile(Gui *g, GuiSession *s, Str path)
     g->outopen  = 1;
     g->outfocus = 1;
     guifile(g);
+    scheddirty(&g->sched);
+}
+
+// A part of the plan arrived, and then the next, if more, as long as
+// the plan is no longer than the engine takes (PLAN_MAX).
+static void onplanfile(Gui *g, Json *j, b32 ok, Str err)
+{
+    PlanFile *f = &g->plan;
+    f->id = 0;
+    if (!ok) {
+        f->text.len = 0;
+        f->err = err=="no such file" ? Str{} : clone(&f->mem, err);
+        return;
+    }
+    Str text = jsonstr(jsonget(j, "text"));
+    if (f->text.len+text.len > (iz)64<<10) {
+        f->err = "too long to show";
+        return;
+    }
+    print(&f->text, text);
+    f->off = jsonint(jsonget(j, "off"), f->off);
+    if (jsonint(jsonget(j, "more"), 0) && f->s) {
+        planpart(g);
+    }
     scheddirty(&g->sched);
 }
 
@@ -1950,8 +2037,8 @@ static void imgdrop(Gui *g, GuiSession *s)
 }
 
 // A new session in cwd, with the given model or the configured one,
-// and a role ([role NAME]), if named.
-static void guinew(Gui *g, GuiHost *h, Str cwd, Str model, Str role = {})
+// and a role ([role NAME]), if named, in plan mode if asked.
+static void guinew(Gui *g, GuiHost *h, Str cwd, Str model, Str role = {}, b32 plan = 0)
 {
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 512 + cwd.len + model.len + role.len);
@@ -1965,6 +2052,10 @@ static void guinew(Gui *g, GuiHost *h, Str cwd, Str model, Str role = {})
     if (role.len) {
         putkey(&w.json, "role");
         putstr(&w.json, role);
+    }
+    if (plan) {
+        putkey(&w.json, "plan");
+        putint(&w.json, 1);
     }
     putkey(&w.json, "attended");
     putint(&w.json, 1);
@@ -2108,6 +2199,20 @@ static void guimodel(Gui *g, GuiSession *s, Str model)
     EvOut w = cmdopen(g, &b, CMD_MODEL, s);
     putkey(&w.json, "model");
     putstr(&w.json, model);
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
+    cmdsend(g, &w, a);
+}
+
+// Plan mode on or off: the agent hears of it at its next request.
+static void guimode(Gui *g, GuiSession *s, b32 plan)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_MODE, s);
+    putkey(&w.json, "mode");
+    putstr(&w.json, plan ? Str("plan") : Str("default"));
     s->cmdid   = g->nextid;
     s->cmdtext = {};
     s->note    = {};
@@ -2519,6 +2624,11 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
         setnote(g, s, finish(&b), 0);
         guilist(g, h);
     } break;
+    case CMD_MODE:
+        setnote(g, s, jsonstr(jsonget(j, "mode"))=="plan"
+                      ? Str("plan mode: the agent changes nothing but its plan")
+                      : Str("plan mode is off"), 0);
+        break;
     case CMD_FORK: {
         // {ok, sid:<new>, from, turn, next?}
         Str sid = jsonstr(jsonget(j, "sid"));
@@ -2592,6 +2702,8 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_FILE:
         if (id == g->out.id) {
             onfile(g, j, ok, err);
+        } else if (id && id==g->plan.id) {
+            onplanfile(g, j, ok, err);
         } else if (id == g->img.fetch.id) {
             onimgfile(g, scratch, j, ok, err);
         } else if (id && id==g->exp.id) {
@@ -2664,6 +2776,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_COMPACT:
     case CMD_RENAME:
     case CMD_MODEL:
+    case CMD_MODE:
     case CMD_FORK:
         onsesscmd(g, h, scratch, &q, r);
         return;
@@ -3832,6 +3945,9 @@ static void sessgone(Gui *g, GuiSession *s)
     if (g->out.s == s) {
         g->out.s   = 0;
         g->outopen = 0;
+    }
+    if (g->plan.s == s) {
+        g->plan.s = 0;
     }
     if (g->exp.s == s) {
         g->exp.s     = 0;
@@ -6702,6 +6818,10 @@ enum : i32 {
     CHK_SHEDQUIET,
     CHK_KEYLOST,
     CHK_SNAPLIVE,
+    CHK_PLANMODE,     // dx 1: the session shown is in plan mode, 0 not
+    CHK_PLANASK,      // the open ask is the plan's, in Markdown, its buttons drawn
+    CHK_PLANTEXT,     // the Plan window shows the plan, with text in it
+    CHK_PLANMODEL,    // the model picker is enabled while the plan waits
     CHK_COUNT,
 };
 
@@ -6871,6 +6991,10 @@ static Str chknames[] = {
     "no frames while the window was gone",
     "a key whose release was lost was let go of, and frames stopped",
     "the metrics overlay's numbers went on as frames ran on",
+    "plan mode is on or off as it should be",
+    "the plan's ask shows the plan, with Approve plan and Keep planning",
+    "the Plan window shows the plan as the agent wrote it",
+    "the model may change while the plan waits",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -6922,6 +7046,7 @@ enum : i32 {
     W_RAISED,     // dx launches handed off to this window, and it is up
     W_IMPORTED,   // an import ended, and none is under way
     W_EXPORTED,   // an export was saved, and none is under way
+    W_PLAN,       // the Plan window has the plan, with text in it
 };
 
 static Str waitnames[] = {
@@ -6936,8 +7061,9 @@ static Str waitnames[] = {
     "the includes", "the thumbnails", "the screenshot", "reasoning",
     "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
     "a named item", "a launch to hand off", "the import", "the export",
+    "the plan",
 };
-static_assert(countof(waitnames) == W_EXPORTED+1);
+static_assert(countof(waitnames) == W_PLAN+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -8831,6 +8957,94 @@ static DriveOp remoteops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// Plan mode (--plan): a new session in plan mode from its dialog, the
+// chip in its bar; the agent refused a change, asking to approve its
+// plan, which the Plan window shows; kept planning with a note, the
+// plan written again and shown again, the model free to change while
+// it waits; approved, plan mode off and the plan carried out; then the
+// toggle by Send, and /plan off.
+static DriveOp planops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXTCWD, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-1-new"},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 10000, "plan chip"},
+    {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 200, "Make inside.txt."},
+    {OP_WAIT, W_ASK, 0, 0, 30000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 0, ""},
+    // The chip shows the Plan window, beside the todo list
+    {OP_MOVE, T_NAMED, 0, 0, 100, "plan chip"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "# Plan"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANTEXT, 0, 0, 0, "Write **inside.txt**"},
+    {OP_SHOT, 0, 0, 0, 300, "plan-2-ask"},
+    // Keep planning, with a note: written again, asked again
+    {OP_MOVE, T_DENY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "Test it too."},
+    {OP_SHOT, 0, 0, 0, 300, "plan-3-note"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 15000, "Plan v2"},
+    {OP_WAIT, W_ASK, 0, 0, 15000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PLANTEXT, 0, 0, 0, "Test it too."},
+    {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
+    {OP_CHECK, CHK_PLANMODEL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-4-again"},
+    // Approved: plan mode ends, and the agent carries out the plan
+    {OP_MOVE, T_ALLOW, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SAID, 0, 0, 15000, "Done"},
+    {OP_WAIT, W_FILE, 0, 0, 5000, "inside.txt"},
+    {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-5-approved"},
+    // The toggle by Send, while idle, then /plan off
+    {OP_MOVE, T_NAMED, 0, 0, 100, "plan toggle"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NOTE, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "plan mode:"},
+    {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-6-toggle"},
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/plan off"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_NOTE, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "plan mode is off"},
+    {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // Idle: nothing for a minute after startup settles.
 // The compose box (--compose, then --compose-again, as tests/gui.py
 // --mode compose runs them): history, the caret's edges, the context
@@ -9038,7 +9252,8 @@ static DriveOp composeops[] = {
     CLICK(T_PROMPT, "", 200),
     SELALL,
     {OP_TEXT, 0, 0, 0, 200, "/export"},
-    KEY(GKEY_ENTER, 0, 500),
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     {OP_MOVE, T_NAMED, 0, 0, 100, "export save"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -9640,6 +9855,11 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_OUTPUT:
         return g->out.s && !g->out.id && (g->out.text.len || g->out.err.len);
+    case W_PLAN: {
+        PlanFile *f = &g->plan;
+        return g->sess && f->s==g->sess && !f->id && f->ver==v->planver &&
+               find(finish(&f->text), g->ops[g->drivepc-1].text)>=0;
+    }
     case W_FILE: {
         Arena a = g->frame;
         Str   f = join(&a, g->drivecwd, g->ops[g->drivepc-1].text);
@@ -10937,6 +11157,20 @@ static b32 drivecheck(Gui *g, i32 chk)
         // Frames since the mark: the probe's and the script's own
         return !ImGui::IsKeyDown(ImGuiKey_G) &&
                drivequiet(g, "2 s after a key's release was lost", 2);
+    case CHK_PLANMODE:
+        return g->sess && v->plan==(b32)g->ops[g->drivepc-1].dx;
+    case CHK_PLANASK: {
+        ViewMsg *m = lastmsg(g, VIEW_ASK);
+        return m && m->tool->answer==VASK_PENDING && m->tool->kind=="plan" &&
+               m->md && find(m->text, "# Plan")==0 && g->rects[RECT_ALLOW].x1>0 &&
+               g->rects[RECT_DENY].x1>0;
+    }
+    case CHK_PLANTEXT:
+        return tabselected("Plan") && g->planshown>0 &&
+               find(finish(&g->plan.text), g->ops[g->drivepc-1].text)>=0;
+    case CHK_PLANMODEL:
+        return g->sess && v->busy && planwaits(v) &&
+               !sesswhy(g, g->sess, "model", !planwaits(v), 0).len;
     case CHK_SNAPLIVE: {
         // Taken again a second or more into the run, the key busy: one
         // a second, not only when frames stop
@@ -11704,6 +11938,8 @@ static Str guiusage =
 "  --compose      the compose box's checklist: drafts, history, the menu,\n"
 "                 the editor, slash commands ([ui] editor a test script)\n"
 "  --compose-again  its drafts after a restart, in the same directories\n"
+"  --plan         plan mode's checklist: the dialog, the plan's ask, the\n"
+"                 Plan window, the toggle and /plan\n"
 "  --host-idle S  in the background, exit S seconds after the last\n"
 "                 session ends with no window (default: [host] idle_exit)\n"
 "  --probe        staleness probe on (default in debug builds)\n"
@@ -11867,7 +12103,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     #endif
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
-    b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0;
+    b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
     i64 history = 0;
     i32 bench   = 0;
     for (i32 i = 1 + (nargs>1 && args[1]=="gui"); i < nargs; i++) {
@@ -11905,6 +12141,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             remote = probe = 1;
         } else if (a == "--compose") {
             compose = probe = 1;
+        } else if (a == "--plan") {
+            plan = probe = 1;
         } else if (a == "--compose-again") {
             compose = 2;
             probe   = 1;
@@ -11953,9 +12191,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     }
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
-            background || attach || remote || compose || sidebar) {
+            background || attach || remote || compose || sidebar || plan) {
         g->drive = 1;
-        if (compose) {
+        if (plan) {
+            g->ops  = planops;
+            g->nops = countof(planops);
+        } else if (compose) {
             g->ops  = compose==1 ? composeops : compose2ops;
             g->nops = compose==1 ? countof(composeops) : countof(compose2ops);
         } else if (e2e) {

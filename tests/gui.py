@@ -23,6 +23,7 @@ by quitting are gone, with no engine process left behind.
   uv run tests/gui.py --prospero build/prospero --fake [--mode idle]   (M1's)
   uv run tests/gui.py --prospero build/prospero --mode bench   (M1's scale)
   uv run tests/gui.py --prospero build/prospero --mode compose [--shots DIR]
+  uv run tests/gui.py --prospero build/prospero --mode plan [--shots DIR]
 
 The settings mode edits a value longer than a field's slack and picks
 the theme, dark then light, from its list over a transcript that shows
@@ -43,7 +44,11 @@ counting either, and quit at once when closed. The compose mode runs
 the compose box's checklist, with [ui] editor a test script (an editor
 that appends a line, one that exits 1, and one cancelled), then the GUI
 again, to find each session's draft back from its engine; no draft file
-for the editor may be left over.
+for the editor may be left over. The plan mode makes a session in plan
+mode from the new session dialog, its agent refused a change, then
+asking to approve its plan: kept planning with a note, then approved;
+the Plan window shows each plan, and the toggle by Send and /plan off
+turn plan mode on and off.
 
 On Linux without a display it runs under xvfb-run. --serve only runs the
 provider and writes the configuration, for a GUI started elsewhere (a
@@ -1180,7 +1185,7 @@ def main():
     ap.add_argument("--mode", default="drive",
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
-                             "compose", "sessions"])
+                             "compose", "sessions", "plan"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1246,6 +1251,13 @@ def main():
         host.write(host.path("work", ".claude", "skills", "zzcheck", "SKILL.md"),
                    "---\ndescription: A skill of the checklist's\n---\nCheck.\n")
         before = config(curl, model, extra=composeconfig(editor, nonce))
+    elif args.mode == "plan":
+        # The agent plans (fake_provider's sc_plan); a model to switch to
+        # while the plan waits
+        model = f"fake:plan_gui:{nonce}"
+        fake_provider.STATE.register(model)
+        before = config(curl, model, 60,
+                        f"\n[model fake:plan_gui_b:{nonce}]\ntemperature = 0.5\n")
     elif args.mode == "sessions":
         # A model to switch to; a remote listed always, never reached,
         # and one listed only while connected
@@ -1351,7 +1363,7 @@ def main():
         else:
             print(f"the URL include was fetched {fetched} times")
         problems += far.close(args.keep)
-    if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions"):
+    if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")

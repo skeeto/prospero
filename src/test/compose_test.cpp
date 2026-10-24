@@ -60,7 +60,7 @@ static void test_compose(Test *t)
     u32 all = slashmatches("/");
     expect(t, "slash.all", istr(&a, slashcount(all)), istr(&a, SLASH_COUNT-1));
     expect(t, "slash.first", slashinfo[slashnth(all, 0)].name, "/compact");
-    expect(t, "slash.last", slashinfo[slashnth(all, SLASH_COUNT-2)].name, "/export");
+    expect(t, "slash.last", slashinfo[slashnth(all, SLASH_COUNT-2)].name, "/plan");
     expect(t, "slash.past", istr(&a, slashnth(all, SLASH_COUNT-1)), "0");
     u32 r = slashmatches("/r");
     expect(t, "slash.r", istr(&a, slashcount(r)), "1");
@@ -91,8 +91,8 @@ static void test_compose(Test *t)
             putbyte(&b, ' ');
         }
         expect(t, "skill.picks", finish(&b),
-               "/compact /model /rename /fork /export /pdf /review ");
-        p = slashpicks(&a, "/p", sk);
+               "/compact /model /rename /fork /export /plan /pdf /review ");
+        p = slashpicks(&a, "/pd", sk);  // not /plan
         expect(t, "skill.pick", istr(&a, p.len), "1");
         expect(t, "skill.pickdesc", slashpickinfo(&a, p[0], sk).desc, "Read PDFs");
         expect(t, "skill.pickspace", istr(&a, slashpicks(&a, "/pdf x", sk).len), "0");

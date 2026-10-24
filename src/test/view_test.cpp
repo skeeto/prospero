@@ -361,6 +361,37 @@ static void test_view(Test *t)
         expect(t, "view.scratch", v->scratch, "/t/prospero-1/s");
     }
 
+    // Plan mode: the mode record sets it, the plan's ask holds the plan
+    // in Markdown, and the plan file's changes bump planver
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"mode","mode":"plan","by":"new",)"
+                    R"("path":"/s/plan.md"})");
+        expect(t, "view.mode", concat(&a, istr(&a, v->plan), concat(&a, " ", v->planpath)),
+               "1 /s/plan.md");
+        i32 ver = v->planver;
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"p1","name":"write","args":"{\"path\":\"/s/plan.md\"}"},)"
+                    R"({"t":"call","id":"p2","name":"exit_plan_mode","args":"{}"}]})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"tool.start","call":"p1","name":"write",)"
+                    R"("args":"{\"path\":\"/s/plan.md\"}","cwd":"/w"})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"tool.end","call":"p1","status":"ok","text":"Created."})");
+        expect(t, "view.planwrite", istr(&a, v->planver - ver), "1");
+        apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"ask","req":"p2/ask","call":"p2","kind":"plan",)"
+                    R"("tool":"exit_plan_mode","path":"/s/plan.md","detail":"# Plan\n\n- One","deadline":0})");
+        ViewMsg *m = &v->msgs[v->msgs.len-1];
+        expect(t, "view.planask", concat(&a, m->tool->kind, istr(&a, m->md)), "plan1");
+        expect(t, "view.planver", istr(&a, v->planver - ver), "2");
+        expect(t, "view.plandeadline", istr(&a, m->tool->deadline), "0");
+        apply(v, a, R"({"sid":"s","seq":7,"ts":0,"ev":"answer","req":"p2/ask","decision":"allow","by":"user"})");
+        apply(v, a, R"({"sid":"s","seq":8,"ts":0,"ev":"mode","mode":"default","by":"approved",)"
+                    R"("path":"/s/plan.md"})");
+        expect(t, "view.modeoff", concat(&a, istr(&a, v->plan), concat(&a, " ", v->planpath)),
+               "0 /s/plan.md");
+    }
+
     // A desktop ask offers its class for good, and one for run offers
     // nothing; a desktop grant record changes nothing shown
     {

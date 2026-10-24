@@ -1062,16 +1062,28 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         g->thinksecs  = live ? secs : -1;
     } break;
     case VIEW_ASK: {
-        Buf b(&a, 256);
-        print(&b, t->tool);
-        print(&b, " ");
-        print(&b, t->path);
-        pen(p, "Allow ", STYLE_BOLD, pal->amber);
-        pen(p, finish(&b), STYLE_CODE, pal->summary);
-        pen(p, "?  ", STYLE_BOLD, pal->amber);
+        b32 plan = t->kind=="plan" || t->kind=="plan.enter";
+        if (t->kind == "plan") {
+            pen(p, "Approve the plan?  ", STYLE_BOLD, pal->amber);
+        } else if (plan) {
+            pen(p, "Plan first, changing nothing until you approve?  ",
+                STYLE_BOLD, pal->amber);
+        } else {
+            Buf b(&a, 256);
+            print(&b, t->tool);
+            print(&b, " ");
+            print(&b, t->path);
+            pen(p, "Allow ", STYLE_BOLD, pal->amber);
+            pen(p, finish(&b), STYLE_CODE, pal->summary);
+            pen(p, "?  ", STYLE_BOLD, pal->amber);
+        }
         if (t->answer == VASK_PENDING) {
             if (v->readonly) {
                 pen(p, "waiting in another process", 0, dim);
+                break;
+            }
+            if (!t->deadline) {
+                pen(p, "waiting for you", 0, pal->amber);  // no deadline
                 break;
             }
             i64 secs = countdown(g, t->deadline, nowms);
@@ -1087,7 +1099,9 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         } else {
             b32 ok = t->answer == VASK_ALLOWED;
             Buf c(&a, 256);
-            print(&c, ok ? Str("allowed") : Str("denied"));
+            print(&c, t->kind=="plan" ? (ok ? Str("approved") : Str("kept planning")) :
+                      plan            ? (ok ? Str("agreed") : Str("declined")) :
+                      ok              ? Str("allowed") : Str("denied"));
             print(&c, t->always        ? Str(" (always) by you") :
                       t->by=="user"    ? Str(" by you") :
                       t->by=="timeout" ? Str(": nobody answered in time") :
@@ -1294,6 +1308,33 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
 {
     ViewTool *t = m->tool;
     Arena     a = g->frame;
+    if (t->kind=="plan" || t->kind=="plan.enter") {
+        // Plan mode's asks: the plan to approve, or to plan first
+        b32 enter = t->kind == "plan.enter";
+        if (ImGui::Button(enter ? "Plan first" : "Approve plan")) {
+            guianswer(g, s, t->req, "allow", {});
+        }
+        if (latest) itemrect(g, RECT_ALLOW);
+        ImGui::SetItemTooltip(enter ? "Plan mode: the agent explores and writes a plan, "
+                                      "changing nothing else until you approve it"
+                                    : "End plan mode: the agent carries out this plan");
+        ImGui::SameLine();
+        if (ImGui::Button(enter ? "Go ahead without" : "Keep planning\xe2\x80\xa6")) {
+            if (enter) {
+                guianswer(g, s, t->req, "deny", {});
+            } else {
+                g->denyreq  = t->req;
+                g->denysess = s;
+                g->denynote[0] = 0;
+                g->opendeny = 2;
+            }
+        }
+        if (latest) itemrect(g, RECT_DENY);
+        ImGui::SetItemTooltip(enter ? "No plan mode: the agent works as before"
+                                    : "Plan mode stays on: tell the agent what to change "
+                                      "in the plan");
+        return;
+    }
     if (ImGui::Button("Allow")) {
         guianswer(g, s, t->req, "allow", {});
     }
@@ -1577,12 +1618,15 @@ static Str  sesswhy(Gui *, GuiSession *, Str cap, b32 idle, b32 rootonly);
 static b32  menuitem(Gui *, Arena, Str label, Str why, char const *key);
 static void whytip(Str);
 static void itemnamed(Gui *, Str);
+static b32  planwaits(View *);
+static Str  planwhy(Gui *, GuiSession *, b32 plan);
 
 // The session's model, a combo of those configured to switch to (model)
 // while idle, and what the latest switch's reply noted.
 static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v)
 {
-    Str   why = g->enginekind==ENGINE_FAKE ? Str("No engine") : sesswhy(g, s, "model", 1, 0);
+    Str   why = g->enginekind==ENGINE_FAKE ? Str("No engine") :
+                sesswhy(g, s, "model", !planwaits(v), 0);
     Str   now = v->model.len ? v->model : s->model;
     ImGui::SameLine();
     // A button that looks the part, its list a popup: a combo's own
@@ -1657,6 +1701,18 @@ static void drawsessbar(Gui *g)
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
         drawmodelpick(g, a, s, v);
+    }
+    if (v->plan) {
+        // A chip that shows the plan
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+        if (ImGui::SmallButton("Plan mode")) {
+            setpane(g, PANE_PLAN, 1);
+        }
+        ImGui::PopStyleColor();
+        itemnamed(g, "plan chip");
+        ImGui::SetItemTooltip("The agent changes nothing but its plan until you approve "
+                              "it. Click to see the plan.");
     }
     if (right > rightof()) {
         ImGui::SameLine(right);
@@ -2325,17 +2381,19 @@ static void drawtranscript(Gui *g)
 
     if (g->opendeny) {
         ImGui::OpenPopup("##denynote");
+        g->denyplan = g->opendeny == 2;
         g->opendeny = 0;
     }
     if (ImGui::BeginPopup("##denynote")) {
-        ImGui::TextUnformatted("Deny, and tell the agent:");
+        ImGui::TextUnformatted(g->denyplan ? "Keep planning, and tell the agent:"
+                                           : "Deny, and tell the agent:");
         if (ImGui::IsWindowAppearing()) {
             ImGui::SetKeyboardFocusHere();
         }
         ImGui::SetNextItemWidth(360*sc);
         b32 go = ImGui::InputText("##note", g->denynote, FIELD_MAX,
                                   ImGuiInputTextFlags_EnterReturnsTrue);
-        go |= ImGui::Button("Deny");
+        go |= ImGui::Button(g->denyplan ? "Keep planning" : "Deny");
         if (go) {
             Str note = {(u8 *)g->denynote, (iz)__builtin_strlen(g->denynote)};
             guianswer(g, g->denysess, g->denyreq, "deny", trim(note));
@@ -2711,6 +2769,15 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
             g->openexport = 1;
         }
         return;
+    case SLASH_PLAN: {
+        Str why = planwhy(g, s, !sl.off);
+        if (why.len) {
+            setnote(g, s, concat(&g->frame, "/plan: ", why), 1);
+            return;
+        }
+        guimode(g, s, !sl.off);
+        sent = 1;
+    } break;
     }
     if (!sent) {
         Arena a = g->frame;
@@ -2955,6 +3022,20 @@ static void drawprompt(Gui *g)
         ImGui::SetItemTooltip("Cancel the turn, killing any command it runs (Esc)");
     }
     ImGui::EndDisabled();
+    if (g->sess && hostcap(s->host, "plan") && !v->parent.len) {
+        Str why = planwhy(g, s, !v->plan);
+        ImGui::BeginDisabled(why.len > 0);
+        if (togglebutton("Plan mode", v->plan)) {
+            guimode(g, s, !v->plan);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "plan toggle");
+        whytip(why.len ? why : v->plan
+                   ? Str("Plan mode is on: the agent changes nothing but its plan. "
+                         "Click to end it (/plan off)")
+                   : Str("Plan mode: the agent explores and writes a plan for you to "
+                         "approve before it changes anything (/plan)"));
+    }
     if (s->hist) {
         // Which of the session's messages the box holds: oldest is 1
         i32 m = histcount(v);
@@ -3222,6 +3303,45 @@ static Str sesswhy(Gui *g, GuiSession *s, Str cap, b32 idle, b32 rootonly)
         return "A subagent goes with the session that started it";
     } else if (idle && (s->view ? s->view->busy : s->state!=LIVE_IDLE && s->state!=LIVE_CLOSED)) {
         return "Wait for its turn to end";
+    }
+    return {};
+}
+
+// Whether the session waits for the user to approve its plan: then
+// the model may change, though the turn runs.
+static b32 planwaits(View *v)
+{
+    for (iz i = v->msgs.len-1; v->asks && i >= 0; i--) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role==VIEW_ASK && m->tool->answer==VASK_PENDING) {
+            return m->tool->kind == "plan";
+        }
+    }
+    return 0;
+}
+
+// Why plan mode cannot be turned on (or off) now, or empty: as the
+// engine's mode command has it, idle or while an ask waits, but not
+// one about plan mode itself.
+static Str planwhy(Gui *g, GuiSession *s, b32 plan)
+{
+    View *v   = s->view;
+    Str   why = sesswhy(g, s, "plan", !v || !v->asks, 1);
+    if (why.len || !v) {
+        return why;
+    }
+    for (iz i = v->msgs.len-1; v->asks && i >= 0; i--) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role==VIEW_ASK && m->tool->answer==VASK_PENDING) {
+            Str kind = m->tool->kind;
+            if (kind=="plan" || kind=="plan.enter") {
+                return "Answer the agent's question about plan mode";
+            }
+            break;
+        }
+    }
+    if (!plan && !v->plan) {
+        return "Plan mode is not on";
     }
     return {};
 }
@@ -4209,6 +4329,88 @@ static void drawtodo(Gui *g)
     g->todoshown = (i32)v->todos.len;
 }
 
+// A line of Markdown without its inline marks: strong, emphasis by
+// underscores, and code spans.
+static Str unmark(Arena *a, Str s)
+{
+    Buf b(a, s.len);
+    for (iz i = 0; i < s.len; i++) {
+        if (s[i] == '`') {
+            continue;
+        } else if (i+1<s.len && (s[i]=='*' || s[i]=='_') && s[i+1]==s[i]) {
+            i++;
+            continue;
+        }
+        putbyte(&b, s[i]);
+    }
+    return finish(&b);
+}
+
+// The session's plan file, as plan mode writes it, fetched as it
+// changes (guiplan): headings bold, list items with a bullet, code in
+// the code font, the rest wrapped, without inline marks.
+static void drawplan(Gui *g)
+{
+    View     *v = g->view;
+    PlanFile *f = &g->plan;
+    g->planshown = 0;
+    guiplan(g);
+    b32 mine = g->sess && f->s==g->sess && f->v==v;
+    if (!g->sess || !v->planpath.len || (mine && !f->id && !f->text.len)) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("%s", mine && f->err.len ? cstr0(&g->frame, f->err) :
+                            "No plan. In plan mode the agent writes one here "
+                            "for you to approve before it changes anything.");
+        ImGui::PopTextWrapPos();
+        return;
+    }
+    Arena a = g->frame;
+    ImGui::PushTextWrapPos(0);
+    if (v->plan) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+        ImGui::TextUnformatted("Plan mode: changing nothing until you approve");
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::TextDisabled("Plan mode is off");
+    }
+    ImGui::SetItemTooltip("%s", cstr0(&a, v->planpath));
+    if (!mine || !f->text.len) {
+        ImGui::PopTextWrapPos();
+        return;  // on its way
+    }
+    b32 code = 0;
+    for (Str rest = finish(&f->text); rest.len;) {
+        Cut c = cut(rest, '\n');
+        Str line = c.ok ? c.head : rest;
+        rest = c.ok ? c.tail : Str{};
+        line = line.len && line[line.len-1]=='\r' ? takehead(line, line.len-1) : line;
+        Str t = trim(line);
+        if (t.len>=3 && takehead(t, 3)=="```") {
+            code = !code;
+            continue;
+        }
+        if (code) {
+            ImGui::PushFont(g->fonts.mono, 0);
+            text(line);
+            ImGui::PopFont();
+        } else if (t.len && t[0]=='#') {
+            for (; t.len && t[0]=='#'; t = cuthead(t, 1)) {}
+            ImGui::PushFont(g->fonts.bold, 0);
+            text(unmark(&a, trim(t)));
+            ImGui::PopFont();
+        } else if (t.len>1 && (t[0]=='-' || t[0]=='*') && t[1]==' ') {
+            ImGui::Bullet();
+            text(unmark(&a, trim(cuthead(t, 2))));
+        } else if (t.len) {
+            text(unmark(&a, t));
+        } else {
+            ImGui::Spacing();
+        }
+    }
+    ImGui::PopTextWrapPos();
+    g->planshown = (i32)f->text.len;
+}
+
 // The last n lines of s.
 static Str lastlines(Str s, i32 n)
 {
@@ -4390,6 +4592,7 @@ static void drawnew(Gui *g)
     if (g->opennew) {
         ImGui::OpenPopup(name);
         g->opennew = 0;
+        g->newplan = 0;
     }
     ImGui::SetNextWindowSize(v2(560*sc, 0));
     if (!ImGui::BeginPopupModal(name, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -4490,6 +4693,14 @@ static void drawnew(Gui *g)
     char const *hint = host->kind==GH_REMOTE ? "as configured there" :
                        dflt.len ? cstr0(&a, concat(&a, "configured: ", dflt)) : "the model's name";
     ImGui::InputTextWithHint("##model", hint, g->newmodel, FIELD_MAX);
+    b32 plan = !import && hostcap(host, "plan");
+    if (plan) {
+        ImGui::Spacing();
+        checkbox("Plan mode", &g->newplan);
+        itemnamed(g, "new plan");
+        ImGui::SetItemTooltip("The agent explores and writes a plan for you to approve "
+                              "before it changes anything");
+    }
     if (g->newerr.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
         ImGui::TextWrapped("%s", cstr0(&a, g->newerr));
@@ -4505,7 +4716,7 @@ static void drawnew(Gui *g)
         if (import) {
             importbegin(g, host, cwd, model);
         } else {
-            guinew(g, host, cwd, model);
+            guinew(g, host, cwd, model, {}, plan && g->newplan);
         }
         ImGui::CloseCurrentPopup();
     }
@@ -6002,11 +6213,11 @@ static void drawhelp(Gui *g)
         "type. On an empty box, Up recalls the session's earlier prompts, "
         "newest first; Up and Down go back and forth, Esc returns to the "
         "empty draft. A message that starts with /compact [focus], "
-        "/model [NAME], /rename TITLE, /fork or /export runs that command "
-        "instead (Tab completes), and /NAME [args] invokes the skill NAME, "
-        "its SKILL.md sent with the args; any other text, even one starting "
-        "with a slash, is sent as it is. Right-click the box for Undo, Paste and "
-        "the rest.");
+        "/model [NAME], /rename TITLE, /fork, /export or /plan [off] runs "
+        "that command instead (Tab completes), and /NAME [args] invokes the "
+        "skill NAME, its SKILL.md sent with the args; any other text, even "
+        "one starting with a slash, is sent as it is. Right-click the box "
+        "for Undo, Paste and the rest.");
     ImGui::Spacing();
     ImGui::TextWrapped(
         "Ctrl+G (Ctrl on macOS too) opens the draft in an editor: "
@@ -6477,6 +6688,7 @@ static void dockwindows(Gui *g)
         ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.35f, &lbot, &ltop);
         ImGui::DockBuilderDockWindow("Sessions", ltop);
         ImGui::DockBuilderDockWindow("Todo", lbot);
+        ImGui::DockBuilderDockWindow("Plan", lbot);
         ImGui::DockBuilderDockWindow("Help", top);
         ImGui::DockBuilderDockWindow("Transcript", top);
         ImGui::DockBuilderDockWindow("Prompt", bottom);
@@ -6508,6 +6720,17 @@ static void dockwindows(Gui *g)
         }
         if (beginpane(g, PANE_TODO)) {
             drawtodo(g);
+        }
+        ImGui::End();
+    }
+    g->planshown = -1;  // not drawn
+    if (show[PANE_PLAN]) {
+        ImGuiID todo = saveddock("Todo");
+        if (todo) {
+            ImGui::SetNextWindowDockID(todo, ImGuiCond_FirstUseEver);
+        }
+        if (beginpane(g, PANE_PLAN)) {
+            drawplan(g);
         }
         ImGui::End();
     }
