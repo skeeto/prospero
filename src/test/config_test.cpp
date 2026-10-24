@@ -838,6 +838,7 @@ static void testcfgjson(Test *t)
         "tools//job_timeout_max=7200*\n"
         "tools//auto_resume=5*\n"
         "tools//stop_grace=*\n"
+        "tools//shell=auto*\n"
         "tools//use_rg=true*\n"
         "tools//task_budget=200*\n"
         "instructions//files=AGENTS.md CLAUDE.md*\n"

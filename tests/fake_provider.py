@@ -319,6 +319,20 @@ def sc_read_edit_shell(model, n, req):
         yield from answer(model, "Done: hello.txt now greets there.")
 
 
+def sc_powershell(model, n, req):
+    commands = [
+        'Write-Output "h$([char]0xe9)llo"; "w\u00e9ll"',
+        "Get-Item nope-ps-xyz",
+        "cmd /c exit 3",
+        "$env:PROSPERO_COMMAND; Write-Output end",
+        "if (",
+    ]
+    if n < len(commands):
+        yield from tool(model, n, "shell", {"command": commands[n]})
+    else:
+        yield from answer(model, "PowerShell ran.")
+
+
 def sc_bytewise(model, n, req):
     yield S.bytewise()
     if n == 0:

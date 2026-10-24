@@ -381,6 +381,10 @@ static CfgKey cfgschema[] = {
     {"tools", "stop_grace", CFG_SECONDS, "", {}, {}, "tools",
      "Seconds between asking a command to stop (SIGTERM, or CTRL_BREAK on "
      "Windows) and killing it (default: 2, or 3 on Windows)"},
+    {"tools", "shell", CFG_STRING, "auto", {}, {}, "tools",
+     "The agent's shell for new sessions: auto, sh, powershell, cmd, or an "
+     "executable's path. auto is a POSIX sh, or on Windows sh.exe or "
+     "busybox.exe next to Prospero or on PATH, then PowerShell, then cmd"},
     {"tools", "use_rg", CFG_BOOL, "true", {}, {}, "tools",
      "Search with ripgrep (rg on PATH) when found, else the built-in search"},
     {"tools", "task_budget", CFG_INT, "200", {}, {}, "tools",

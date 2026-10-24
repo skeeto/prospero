@@ -4,7 +4,7 @@
 //                                  tests/fake_provider.py at URL)
 //
 // Processes run through the agent's shell (findshell): /bin/sh, or
-// busybox sh on Windows. With only cmd.exe, the shell-specific checks
+// busybox sh on Windows. Without a POSIX shell, the shell-specific checks
 // are skipped.
 //
 // This is free and unencumbered software released into the public domain.
@@ -715,7 +715,7 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     p->mb  = newmailbox(perm, 1<<20, 0, 0);
     p->dir = dir;
     Str exe = os_exepath(os, perm);
-    p->te  = findshell(os, perm, scratch, parentdir(exe), HOST_WINDOWS);
+    p->te  = findshell(os, perm, scratch, parentdir(exe), HOST_WINDOWS, {});
     p->env = shellenv(perm, os_environ(os, perm), HOST_WINDOWS, {});
     if (!check(t, p->mb!=0, "newmailbox")) return;
     {
@@ -724,7 +724,7 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
         print(&b, p->te.shell);
         say(os, finish(&b));
     }
-    if (p->te.shellkind == SHELL_CMD) {
+    if (p->te.shellkind!=SHELL_SH && p->te.shellkind!=SHELL_BUSYBOX) {
         say(os, "no POSIX shell: process tests skipped");
         return;
     }

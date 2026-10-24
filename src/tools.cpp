@@ -91,7 +91,10 @@ enum : i32 {
     SHELL_SH,       // argv: SHELL -c COMMAND
     SHELL_BUSYBOX,  // argv: BUSYBOX sh -c COMMAND
     SHELL_CMD,      // cmd.exe /d /s /c "COMMAND"
+    SHELL_PWSH,     // PowerShell 7: pwsh -Command BOOT, command in PSBOOTVAR
+    SHELL_PS,       // Windows PowerShell 5.1, as SHELL_PWSH
 };
+static Str const shellkinds[] = {"sh", "busybox", "cmd", "pwsh", "powershell"};
 
 // What the tools need to know about where they run.
 struct ToolEnv {
@@ -195,6 +198,21 @@ static Str shelldesc(Arena *a, ToolEnv *te)
     case SHELL_CMD:
         print(&b, "Run a command with cmd.exe /d /s /c. No POSIX shell was "
                   "found, so use cmd syntax and Windows commands");
+        break;
+    case SHELL_PWSH:
+    case SHELL_PS:
+        print(&b, te->shellkind==SHELL_PWSH ? Str("Run a command with PowerShell 7 (")
+                                            : Str("Run a command with Windows PowerShell 5.1 ("));
+        print(&b, te->shell);
+        print(&b, "), as a script: use PowerShell syntax and cmdlets, and "
+                  "$env:NAME for environment variables. ");
+        if (te->shellkind == SHELL_PS) {
+            print(&b, "This version has no && or ||: separate commands with "
+                      "; or newlines, and test $? or $LASTEXITCODE. ");
+        }
+        print(&b, "The command fails if its last statement does, with a "
+                  "native program's exit status ($LASTEXITCODE) when it "
+                  "has one");
         break;
     }
     print(&b, " in the working directory. Each call starts a fresh shell "
@@ -2107,7 +2125,27 @@ static Slice<Str> shellenv(Arena *a, Slice<Str> inherited, b32 windows,
 struct ShellCmd {
     Slice<Str> argv;
     Str        cmdline;  // Windows cmd.exe only
+    Str        env;      // PowerShell: NAME=value to add to the environment
 };
+
+// PowerShell takes the command from this variable rather than its command
+// line, which has no quoting to get wrong and holds 32K characters, and
+// runs it as a script. The script fails if its last statement does, with
+// the status of a native program when there was one. It is parsed alone
+// first, so that a syntax error shows the agent's own text.
+#define PSBOOTVAR "PROSPERO_COMMAND"
+static char const psboot[] =
+    "$ProgressPreference='SilentlyContinue';"
+    "try{$__u=New-Object Text.UTF8Encoding $false;"
+    "[Console]::OutputEncoding=$__u;$OutputEncoding=$__u}catch{};"
+    "$__c=$env:" PSBOOTVAR ";Remove-Item Env:" PSBOOTVAR ";"
+    "try{$__b=[ScriptBlock]::Create($__c)}"
+    "catch{$__e=$_.Exception;if($__e.InnerException){$__e=$__e.InnerException};"
+    "[Console]::Error.WriteLine($__e.Message);exit 1};"
+    "$__b=[ScriptBlock]::Create($__c+[char]10+'$global:__ok=$?');"
+    "$global:__ok=$false;$global:LASTEXITCODE=0;"
+    "try{. $__b}catch{[Console]::Error.WriteLine(($_|Out-String).Trim());exit 1};"
+    "if($global:__ok){exit 0};if($LASTEXITCODE){exit $LASTEXITCODE};exit 1";
 
 static ShellCmd shellcmd(Arena *a, ToolEnv *te, Str command)
 {
@@ -2134,6 +2172,20 @@ static ShellCmd shellcmd(Arena *a, ToolEnv *te, Str command)
         putbyte(&b, '"');
         r.cmdline = finish(&b);
     } break;
+    case SHELL_PWSH:
+    case SHELL_PS:
+        r.argv = push(a, r.argv, te->shell);
+        r.argv = push(a, r.argv, Str("-NoLogo"));
+        r.argv = push(a, r.argv, Str("-NoProfile"));
+        r.argv = push(a, r.argv, Str("-NonInteractive"));
+        if (te->windows) {
+            r.argv = push(a, r.argv, Str("-ExecutionPolicy"));
+            r.argv = push(a, r.argv, Str("Bypass"));
+        }
+        r.argv = push(a, r.argv, Str("-Command"));
+        r.argv = push(a, r.argv, Str(psboot));
+        r.env  = concat(a, PSBOOTVAR "=", command);
+        break;
     }
     return r;
 }

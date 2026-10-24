@@ -3649,7 +3649,7 @@ static Str spillfile(Session *s, Arena scratch, Str id, Str *rel, Str ext = ".lo
 
 // Spawn a process for the current call, its output into spill.
 static Proc *spawncall(Session *s, Arena scratch, Slice<Str> argv, Str cmdline,
-                       Str cwd, Str spill, i64 maxbytes, u64 *id)
+                       Str envadd, Str cwd, Str spill, i64 maxbytes, u64 *id)
 {
     Engine    *e       = s->e;
     Slice<Str> secrets = cfgsecrets(e->cfg, &scratch);
@@ -3658,6 +3658,9 @@ static Proc *spawncall(Session *s, Arena scratch, Slice<Str> argv, Str cmdline,
     sp.cmdline  = cmdline;
     sp.cwd      = cwd;
     sp.env      = shellenv(&scratch, e->env, s->te.windows, secrets);
+    if (envadd.len) {
+        sp.env = push(&scratch, sp.env, envadd);
+    }
     sp.outpath  = spill;
     sp.maxbytes = maxbytes;
     sp.mbox     = e->in;
@@ -4072,7 +4075,7 @@ static void startjob(Session *s, Arena scratch, Args *args)
     Str      spill = spillfile(s, scratch, c->id, &rel);
     ShellCmd sc    = shellcmd(&scratch, &s->te, args->command);
     u64      id    = 0;
-    Proc    *p     = spawncall(s, scratch, sc.argv, sc.cmdline, s->cwd, spill,
+    Proc    *p     = spawncall(s, scratch, sc.argv, sc.cmdline, sc.env, s->cwd, spill,
                                SHELL_OUTMAX, &id);
     if (!p) {
         Str err  = os_lasterr(e->os, &scratch);
@@ -4292,7 +4295,7 @@ static b32 startshell(Session *s, Arena scratch, Args *args)
     s->sh = sh;
 
     ShellCmd sc = shellcmd(&scratch, &s->te, args->command);
-    s->proc = spawncall(s, scratch, sc.argv, sc.cmdline, s->cwd, s->sh.spill,
+    s->proc = spawncall(s, scratch, sc.argv, sc.cmdline, sc.env, s->cwd, s->sh.spill,
                         SHELL_OUTMAX, &s->procid);
     if (!s->proc) {
         return 0;
@@ -4342,7 +4345,7 @@ static b32 startsearch(Session *s, Arena scratch, i32 tool, Str path, Args *args
 
     Slice<Str> argv = searchargv(&scratch, &s->te, tool, path, target, args);
     i64        max  = tool==TOOL_GLOB ? SEARCH_GLOBMAX : SEARCH_OUTMAX;
-    s->proc = spawncall(s, scratch, argv, {}, root, s->sh.spill, max, &s->procid);
+    s->proc = spawncall(s, scratch, argv, {}, {}, root, s->sh.spill, max, &s->procid);
     if (!s->proc) {
         Str err  = os_lasterr(e->os, &scratch);
         Str text = concat(&scratch, "The search could not be started: ", err);
@@ -6862,6 +6865,137 @@ static Guard sessionguard(Session *s, Arena *perm)
     return g;
 }
 
+// An executable on PATH, by its file name, or null.
+static Str findpath(Os *os, Arena *perm, Arena scratch, Str name, b32 win)
+{
+    Str path = os_getenv(os, &scratch, "PATH");
+    for (Str rest = path; rest.len;) {
+        Cut c = cut(rest, win ? ';' : ':');
+        rest = c.tail;
+        if (!c.head.len) {
+            continue;
+        }
+        Arena a = scratch;
+        Str   p = join(&a, c.head, name);
+        if (os_stat(os, a, p).type == STAT_FILE) {
+            return clone(perm, p);
+        }
+    }
+    return {};
+}
+
+// The kind of shell an executable is, by its file name.
+static i32 shellkindof(Str path, b32 win)
+{
+    Str name = basename(path);
+    if (win && name.len>4 && equalfold(cuthead(name, name.len-4), ".exe")) {
+        name = takehead(name, name.len-4);
+    }
+    if (equalfold(name, "pwsh")) {
+        return SHELL_PWSH;
+    } else if (equalfold(name, "powershell")) {
+        return SHELL_PS;
+    } else if (win && equalfold(name, "cmd")) {
+        return SHELL_CMD;
+    } else if (startswith(name, "busybox")) {
+        return SHELL_BUSYBOX;
+    }
+    return SHELL_SH;
+}
+
+// Find the agent's shell by the [tools] shell setting: auto, sh,
+// powershell, cmd, or an executable's path. A POSIX sh comes first, as
+// the one models know best: /bin/sh, or on Windows sh.exe or busybox.exe
+// next to the executable, then on PATH. Then PowerShell 7 (pwsh on PATH),
+// Windows PowerShell, and last cmd.exe. A choice not found is as auto.
+static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
+                         b32 win, Str pref)
+{
+    ToolEnv te = {};
+    te.windows = win;
+    pref = trim(pref);
+    b32 named = pref.len && pref!="auto" && pref!="sh" &&
+                pref!="powershell" && pref!="cmd";
+    if (named && os_stat(os, scratch, pref).type==STAT_FILE) {
+        te.shell     = clone(perm, pref);
+        te.shellkind = shellkindof(pref, win);
+        return te;
+    }
+    b32 wantps  = pref == "powershell";
+    b32 wantcmd = win && pref=="cmd";
+
+    if (!wantps && !wantcmd) {
+        if (!win) {
+            te.shell     = "/bin/sh";
+            te.shellkind = SHELL_SH;
+            return te;
+        }
+        Slice<Str> dirs = {};
+        dirs = push(&scratch, dirs, exedir);
+        Str path = os_getenv(os, &scratch, "PATH");
+        for (Str rest = path; rest.len;) {
+            Cut c = cut(rest, ';');
+            if (c.head.len) dirs = push(&scratch, dirs, c.head);
+            rest = c.tail;
+        }
+        for (iz i = 0; i < dirs.len; i++) {
+            Arena a  = scratch;
+            Str   sh = join(&a, dirs[i], "sh.exe");
+            if (os_stat(os, a, sh).type == STAT_FILE) {
+                te.shell     = clone(perm, sh);
+                te.shellkind = SHELL_SH;
+                return te;
+            }
+            Str bb = join(&a, dirs[i], "busybox.exe");
+            if (os_stat(os, a, bb).type == STAT_FILE) {
+                te.shell     = clone(perm, bb);
+                te.shellkind = SHELL_BUSYBOX;
+                return te;
+            }
+        }
+    }
+
+    Str root = os_getenv(os, &scratch, "SystemRoot");
+    root = root.len ? root : Str("C:\\Windows");
+    if (!wantcmd) {
+        Str pwsh = findpath(os, perm, scratch, win ? Str("pwsh.exe") : Str("pwsh"), win);
+        if (pwsh.len) {
+            te.shell     = pwsh;
+            te.shellkind = SHELL_PWSH;
+            return te;
+        }
+        Str ps = concat(&scratch, root, "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        if (win && os_stat(os, scratch, ps).type==STAT_FILE) {
+            te.shell     = clone(perm, ps);
+            te.shellkind = SHELL_PS;
+            return te;
+        }
+    }
+    if (!win) {
+        te.shell     = "/bin/sh";
+        te.shellkind = SHELL_SH;
+        return te;
+    }
+    Str cmd = concat(&scratch, root, "\\System32\\cmd.exe");
+    te.shell     = clone(perm, cmd);
+    te.shellkind = SHELL_CMD;
+    return te;
+}
+
+// The shell the session's prefix describes, as it began, if it is
+// still there: else the session goes on with the engine's.
+static void prefixshell(Session *s, Arena scratch, Json *j)
+{
+    Str shell = jsonstr(jsonget(j, "shell"));
+    Str kind  = jsonstr(jsonget(j, "shell_kind"));
+    for (i32 k = 0; shell.len && k<countof(shellkinds); k++) {
+        if (kind==shellkinds[k] && os_stat(s->e->os, scratch, shell).type==STAT_FILE) {
+            s->te.shell     = clone(&s->perm, shell);
+            s->te.shellkind = k;
+        }
+    }
+}
+
 // The job limits the session's tools describe, from the configuration.
 static void jobconf(Session *s)
 {
@@ -6923,7 +7057,11 @@ static void buildprefix(Session *s, Arena scratch)
 {
     Engine *e = s->e;
     jobconf(s);
-    s->te.coords = s->mc.coords;
+    ToolEnv sh = findshell(e->os, &s->perm, scratch, e->exedir, s->te.windows,
+                           cfgget(e->cfg, "tools", "", "shell", 0));
+    s->te.shell     = sh.shell;
+    s->te.shellkind = sh.shellkind;
+    s->te.coords    = s->mc.coords;
     if (tooloffered(&s->te, TOOL_TASK)) {
         taskroles(e, &s->perm, scratch, &s->te);
     }
@@ -7023,6 +7161,8 @@ static void logprefix(Session *s, Arena scratch)
     putstrkey(&w.json, "tools", s->tools);
     putintkey(&w.json, "job_timeout", s->te.jobtimeout);
     putintkey(&w.json, "job_timeout_max", s->te.jobmax);
+    putstrkey(&w.json, "shell", s->te.shell);
+    putstrkey(&w.json, "shell_kind", shellkinds[s->te.shellkind]);
     if (tooloffered(&s->te, TOOL_DESKTOP)) {
         putstrkey(&w.json, "coordinates", s->te.coords==COORDS_NORM1000
                                           ? Str("norm1000") : Str("pixels"));
@@ -8919,6 +9059,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->tools         = clone(&s->perm, jsonstr(jsonget(j, "tools")));
             s->te.jobtimeout = jsonint(jsonget(j, "job_timeout"), 0);
             s->te.jobmax     = jsonint(jsonget(j, "job_timeout_max"), 0);
+            prefixshell(s, scratch, j);
             s->te.coords     = jsonstr(jsonget(j, "coordinates"))=="norm1000"
                                ? COORDS_NORM1000 : COORDS_PIXELS;
             s->system.data   = s->system.data ? s->system.data : (u8 *)"";
@@ -11128,67 +11269,6 @@ static void enginethread(void *arg)
     }
 }
 
-// Find the agent's shell: on Windows, busybox-w32 sh next to the
-// executable, then on PATH, else cmd.exe; elsewhere /bin/sh.
-static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir, b32 win)
-{
-    ToolEnv te = {};
-    te.windows = win;
-    if (!win) {
-        te.shell     = "/bin/sh";
-        te.shellkind = SHELL_SH;
-        return te;
-    }
-
-    Slice<Str> dirs = {};
-    dirs = push(&scratch, dirs, exedir);
-    Str path = os_getenv(os, &scratch, "PATH");
-    for (Str rest = path; rest.len;) {
-        Cut c = cut(rest, ';');
-        if (c.head.len) dirs = push(&scratch, dirs, c.head);
-        rest = c.tail;
-    }
-    for (iz i = 0; i < dirs.len; i++) {
-        Arena a  = scratch;
-        Str   sh = join(&a, dirs[i], "sh.exe");
-        if (os_stat(os, a, sh).type == STAT_FILE) {
-            te.shell     = clone(perm, sh);
-            te.shellkind = SHELL_SH;
-            return te;
-        }
-        Str bb = join(&a, dirs[i], "busybox.exe");
-        if (os_stat(os, a, bb).type == STAT_FILE) {
-            te.shell     = clone(perm, bb);
-            te.shellkind = SHELL_BUSYBOX;
-            return te;
-        }
-    }
-    Str root = os_getenv(os, &scratch, "SystemRoot");
-    Str cmd  = concat(&scratch, root.len ? root : Str("C:\\Windows"), "\\System32\\cmd.exe");
-    te.shell     = clone(perm, cmd);
-    te.shellkind = SHELL_CMD;
-    return te;
-}
-
-// An executable on PATH, by its file name, or null.
-static Str findpath(Os *os, Arena *perm, Arena scratch, Str name, b32 win)
-{
-    Str path = os_getenv(os, &scratch, "PATH");
-    for (Str rest = path; rest.len;) {
-        Cut c = cut(rest, win ? ';' : ':');
-        rest = c.tail;
-        if (!c.head.len) {
-            continue;
-        }
-        Arena a = scratch;
-        Str   p = join(&a, c.head, name);
-        if (os_stat(os, a, p).type == STAT_FILE) {
-            return clone(perm, p);
-        }
-    }
-    return {};
-}
-
 // An engine with its configuration (config.cpp), which from now on
 // belongs to the engine thread: frontends use config.get and config.set.
 static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
@@ -11211,7 +11291,8 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     e->perm     = newarena(r);
     Str exe     = os_exepath(os, &e->perm);
     e->exedir   = parentdir(exe);
-    e->te       = findshell(os, &e->perm, newarena(e->scratch), e->exedir, HOST_WINDOWS);
+    e->te       = findshell(os, &e->perm, newarena(e->scratch), e->exedir,
+                            HOST_WINDOWS, cfgget(cfg, "tools", "", "shell", 0));
     e->te.exe   = exe;
     e->env      = os_environ(os, &e->perm);
     e->tempdirs = os_tempdirs(os, &e->perm);

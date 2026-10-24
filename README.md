@@ -547,9 +547,15 @@ build (`-DPROSPERO_GUI=OFF`), which is the XP engine and the engine
 deployed to Windows machines, is a console program, and works as usual
 at a prompt as well.
 
-The agent's shell is a POSIX `sh`: `sh.exe` or busybox-w32's
-`busybox.exe` next to `prospero.exe`, else on the PATH. Without either,
-commands run in `cmd.exe`, and the shell tool's description says so.
+The agent's shell is a POSIX `sh` when there is one: `sh.exe` or
+busybox-w32's `busybox.exe` next to `prospero.exe`, else on the PATH.
+Without either, commands run in PowerShell: PowerShell 7 (`pwsh.exe` on
+the PATH), else the Windows PowerShell 5.1 that comes with Windows, and
+`cmd.exe` only as a last resort. The shell tool's description tells the
+agent which it has. `[tools] shell` picks one instead (`sh`,
+`powershell`, `cmd`, or an executable's path) for new sessions; a
+session keeps the shell it began with. PowerShell takes a second or more
+to start, so each command is that much slower than in busybox.
 Each tool runs in a job object, so that its whole process tree dies
 with it, or with Prospero.
 

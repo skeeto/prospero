@@ -537,6 +537,22 @@ static void test_tools(Test *t)
         expect(t, "cmd line", c.cmdline,
                "\"C:\\Windows\\System32\\cmd.exe\" /d /s /c \"dir \"a b\" & echo %X%\"");
         expect(t, "cmd description", istr(a, find(shelldesc(a, &te), "No POSIX shell")>0), "1");
+        te.shell     = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+        te.shellkind = SHELL_PS;
+        c = shellcmd(a, &te, "echo \"a b\"; exit 3");
+        expect(t, "ps argv", istr(a, c.argv.len==8 && c.argv[0]==te.shell &&
+               c.argv[5]=="Bypass" && c.argv[6]=="-Command" && !c.cmdline.len), "1");
+        expect(t, "ps env", c.env, "PROSPERO_COMMAND=echo \"a b\"; exit 3");
+        expect(t, "ps boot quoting", istr(a, find(c.argv[7], "\"")<0), "1");
+        expect(t, "ps description", istr(a, find(shelldesc(a, &te), "no && or ||")>0), "1");
+        te.shell     = "/usr/bin/pwsh";
+        te.shellkind = SHELL_PWSH;
+        te.windows   = 0;
+        c = shellcmd(a, &te, "ls");
+        expect(t, "pwsh argv", istr(a, c.argv.len==6 && c.argv[4]=="-Command"), "1");
+        expect(t, "pwsh description", istr(a, find(shelldesc(a, &te), "PowerShell 7")>0 &&
+               find(shelldesc(a, &te), "no &&")<0), "1");
+        te.windows   = 1;
         te.jobtimeout = 90;
         te.jobmax     = 3600;
         Str desc = shelldesc(a, &te);

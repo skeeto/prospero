@@ -1584,6 +1584,32 @@ def skillhome(t):
     return env
 
 
+@scenario(conf={"_tools": {"shell": "powershell"}}, bound=30)
+def powershell(t):
+    """[tools] shell = powershell on Windows: the command goes through an
+    environment variable, output is UTF-8, and the exit status is the last
+    statement's, or its native program's."""
+    if not t.host.windows:
+        t.note("Windows only")
+        return
+    r = t.run(timeout=60)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = [e["text"] for e in r.all("tool.end")]
+    t.check(len(ends) == 5, f"{len(ends)} shell calls")
+    if len(ends) < 5:
+        return
+    t.check("h\u00e9llo" in ends[0] and "w\u00e9ll" in ends[0]
+            and "[exit code 0]" in ends[0], f"UTF-8 output: {ends[0]!r}")
+    t.check("[exit code 1]" in ends[1], f"a failed cmdlet: {ends[1]!r}")
+    t.check("[exit code 3]" in ends[2], f"a native status: {ends[2]!r}")
+    t.check("PROSPERO_COMMAND" not in ends[3] and "end" in ends[3]
+            and "[exit code 0]" in ends[3], f"variable removed: {ends[3]!r}")
+    t.check("[exit code 1]" in ends[4] and "line:1" in ends[4]
+            and "__ok" not in ends[4], f"a parse error: {ends[4]!r}")
+    tools = json.dumps(t.requests()[0]["body"].get("tools"))
+    t.check("PowerShell" in tools, "the shell tool describes PowerShell")
+
+
 def skillput(t, parent, name, text):
     d = t.host.join(parent, name)
     t.host.mkdir(d)
