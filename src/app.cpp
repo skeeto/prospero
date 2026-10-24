@@ -69,6 +69,7 @@
 #include "fonts.cpp"
 #include "place.cpp"
 #include "compose.cpp"
+#include "pathpick.cpp"
 #include "sidebar.cpp"
 
 enum : i64 {
@@ -488,6 +489,50 @@ struct OutFile {
     Str         err;
     Arena       mem;
     byte       *base;
+};
+
+// A folder listed for a path field's completion (pathpick.cpp): on this
+// machine, by the GUI itself, else by the host's engine (dir), on its way
+// meanwhile. Each is kept a little while (DIRLIST_TTL), then listed again
+// when wanted, its entries shown until the new ones come.
+struct DirList {
+    u64              host;  // its host's uid, 0 for a free slot
+    Str              dir;   // as typed, with its last separator
+    Slice<PathEntry> ents;
+    Str              err;   // why it could not be listed
+    i64              at;    // when asked, µs (sched)
+    i64              id;    // its dir command in flight, 0 if none
+    b32              got;   // ents and err are an answer
+    b32              more;  // there were more entries than these
+};
+
+enum : i32 {
+    DIRLISTS  = 8,     // folders kept at once
+    PICK_ROWS = 12,    // the dropdown's rows
+};
+
+enum : i64 {
+    DIRLIST_TTL = 5000000,  // µs
+    DIRLIST_MAX = 2000,     // entries of a folder listed here
+};
+
+// The new session dialog's directory field's completion: the folders
+// listed, and the dropdown under the field (drawnew).
+struct PathComp {
+    DirList  lists[DIRLISTS];
+    Arena    mem;      // the lists', reset when it fills up
+    byte    *base;
+    Arena    picks;    // the frame's picks, apart from its scratch,
+    byte    *pickbase; //   which the dialog's own drawing reuses
+    i32      sel;      // the pick Up and Down chose, -1 for none
+    i32      top;      // the first row shown
+    b32      shown;    // typed in since the last accept, or Up or Down
+    b32      refocus;  // the field to have the keyboard again, its caret
+                       // at the end: after a click on a row
+    // For the checklist: the dropdown as drawn last
+    i32      rows;     // its picks, 0 if it was not drawn
+    char     first[64];
+    i64      accepts;
 };
 
 // A Markdown document, read-only, shown as the transcript shows a
@@ -1017,6 +1062,7 @@ struct Gui {
     b32                opennew;
     b32                newplan;    // in plan mode
     b32                newnofolder;// in a folder of its own, not newcwd
+    PathComp           pc;         // newcwd's completion
     i64                newid;      // the new command in flight
     char              *denynote;   // "Deny with note"
     Str                denyreq;
@@ -3232,6 +3278,7 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
     }
 }
 static void onexportfile(Gui *, Arena, Json *, b32 ok, Str err);
+static void ondir(Gui *, i64 id, Json *, b32 ok, Str err);
 static void onimport(Gui *, GuiHost *, Arena, Request *, EvRec *);
 static void sessgone(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
@@ -3289,6 +3336,10 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             return;
         }
         break;
+
+    case CMD_DIR:
+        ondir(g, id, j, ok, err);
+        return;
 
     case CMD_FILE:
         if (id == g->out.id) {
@@ -4005,6 +4056,126 @@ static b32 hostcap(GuiHost *h, Str name)
     return 0;
 }
 
+// Whether paths on a host are Windows': this machine's, or a remote's by
+// its home directory (hello's home), which then has a drive.
+static b32 hostwin(GuiHost *h)
+{
+    return h->kind==GH_REMOTE ? h->home.len>=2 && h->home[1]==':' : (b32)HOST_WINDOWS;
+}
+
+// Whether a host's folders can be listed, for completing a path typed
+// there: this machine's always, a remote's where its engine has dir.
+static b32 hostlists(GuiHost *h)
+{
+    return h->kind!=GH_REMOTE || (h->up && hostcap(h, "dir"));
+}
+
+// Folders as listed, kept in pc->mem, which starts over when it runs
+// low: a reply to a list let go then finds no slot and is dropped.
+static DirList *dirslot(Gui *g, GuiHost *h, Str dir)
+{
+    PathComp *pc = &g->pc;
+    if (!pc->base) {
+        pc->mem  = newarena(os_reserve(g->os, (iz)1<<26));
+        pc->base = pc->mem.beg;
+    }
+    DirList *free = 0;  // else the one asked for longest ago
+    for (i32 i = 0; i < DIRLISTS; i++) {
+        DirList *l = &pc->lists[i];
+        if (l->host==h->uid && l->dir==dir) {
+            return l;
+        }
+        if (!free || (free->host && (!l->host || l->at<free->at))) {
+            free = l;
+        }
+    }
+    if (pc->mem.beg-pc->base > (iz)1<<25) {  // half the reservation
+        for (i32 i = 0; i < DIRLISTS; i++) {
+            pc->lists[i] = {};
+        }
+        pc->mem.beg = pc->base;
+        free = &pc->lists[0];
+    }
+    *free = {};
+    free->host = h->uid;
+    free->dir  = clone(&pc->mem, dir);
+    return free;
+}
+
+// A folder's listing, from the GUI's own or a dir command's reply.
+static void dirput(PathComp *pc, DirList *l, Slice<PathEntry> ents, b32 more, Str err)
+{
+    l->ents = {};
+    for (iz i = 0; i < ents.len; i++) {
+        PathEntry e = {clone(&pc->mem, ents[i].name), ents[i].dir};
+        l->ents = push(&pc->mem, l->ents, e);
+    }
+    l->more = more;
+    l->err  = err.len ? clone(&pc->mem, err) : Str{};
+    l->got  = 1;
+    l->id   = 0;
+}
+
+// The folders in a folder typed on a host, as listed so far, which is
+// listed if it is not, or was a while ago: here at once, or by the
+// host's engine (dir), its answer coming in later (ondir).
+static DirList *dirget(Gui *g, GuiHost *h, Str dir)
+{
+    DirList *l = dirslot(g, h, dir);
+    if (l->id || (l->got && g->sched.now-l->at<DIRLIST_TTL)) {
+        return l;
+    }
+    l->at = g->sched.now;
+    if (h->kind != GH_REMOTE) {
+        Arena            a  = g->frame;
+        HomePath         hp = tildepath(&a, dir, h->home, HOST_WINDOWS);
+        Listing          ls = hp.err.len ? Listing{} :
+                              os_listall(g->os, &a, hp.path, 1, DIRLIST_MAX);
+        Slice<PathEntry> e  = {};
+        for (Dirent *d = ls.head; d; d = d->next) {
+            e = push(&a, e, PathEntry{d->name, 1});
+        }
+        Str err = hp.err.len ? hp.err : ls.ok ? Str{} :
+                  os_stat(g->os, a, hp.path).type==STAT_MISSING ? Str("no such folder") :
+                  Str("cannot list this folder");
+        dirput(&g->pc, l, e, ls.more, err);
+        return l;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + 6*dir.len);
+    EvOut w = cmdopen(g, &b, CMD_DIR, 0, h);
+    putkey(&w.json, "path");
+    putstr(&w.json, dir);
+    putkey(&w.json, "dirs");
+    putint(&w.json, 1);
+    l->id = g->nextid;
+    cmdsend(g, &w, a);
+    return l;
+}
+
+// A host's answer to dirget, for the list that asked, if still kept.
+static void ondir(Gui *g, i64 id, Json *j, b32 ok, Str err)
+{
+    PathComp *pc = &g->pc;
+    DirList  *l  = 0;
+    for (i32 i = 0; id && i < DIRLISTS; i++) {
+        l = pc->lists[i].id==id ? &pc->lists[i] : l;
+    }
+    if (!l) {
+        return;
+    }
+    Arena            a = g->frame;
+    Slice<PathEntry> e = {};
+    for (Json *x = jsonget(j, "entries")->child; ok && x; x = x->next) {
+        Str name = jsonstr(jsonget(x, "name"));
+        if (name.len && jsonint(jsonget(x, "dir"), 0)) {
+            e = push(&a, e, PathEntry{name, 1});
+        }
+    }
+    dirput(pc, l, e, ok && jsonint(jsonget(j, "more"), 0), ok ? Str{} : err);
+    scheddirty(&g->sched);
+}
+
 // Apply one record from a host. Returns 1 if what shows changed.
 static b32 guirecord(Gui *g, GuiHost *h, Str line)
 {
@@ -4239,6 +4410,14 @@ static void reissue(Gui *g)
         case CMD_CONFIGGET: g->cfgget = 0; guiconfigget(g); break;
         case CMD_OPEN:      if (q.s && q.s->openid==q.id) guiopen(g, q.s); break;
         case CMD_NEW:       g->newid = 0; break;  // it shows in the list
+        case CMD_DIR:
+            for (i32 k = 0; k < DIRLISTS; k++) {
+                DirList *l = &g->pc.lists[k];
+                if (l->id == q.id) {
+                    l->id = l->at = 0;  // asked again when wanted
+                }
+            }
+            break;
         case CMD_FILE:
             if (g->out.id == q.id) {
                 g->out.id = 0;
@@ -7374,6 +7553,16 @@ enum : i32 {
     OP_OPENDIR,   // an open event (macOS: open -a) for the directory text
                   // in --cwd, or the launch's (prospero DIR) if empty
 };
+// OP_TEXTCWD with text types the --cwd directory and text after it, on
+// Windows with backslashes, as a Windows user types a path.
+static Str drivepath(Gui *g, Arena *a, Str text)
+{
+    Str p = concat(a, clone(a, g->drivecwd), text);  // a copy of its own
+    for (iz i = 0; HOST_WINDOWS && i < p.len; i++) {
+        p[i] = p[i]=='/' ? '\\' : p[i];
+    }
+    return p;
+}
 
 enum : i32 {
     T_NONE,
@@ -7678,6 +7867,10 @@ enum : i32 {
     CHK_HANDEDDIR,    // the session shown is in --cwd, as a launch handed off
     CHK_NOFOLDERBOX,  // the new session dialog's No folder is ticked
     CHK_NOFOLDER,     // the session shown is in a folder of its own
+    CHK_PATHPICK,     // the directory's dropdown lists dx folders, the first
+                      // text if any (0: not drawn)
+    CHK_NEWCWD,       // the directory's field is --cwd and text (drivepath)
+    CHK_SESSDIR,      // the session shown works in a directory ending in text
     CHK_COUNT,
 };
 
@@ -7871,6 +8064,9 @@ static Str chknames[] = {
     "the second launch's directory has the session shown, the window up",
     "No folder is ticked, the directory's field and Browse off",
     "the session shown works in a folder of its own, shown as No folder",
+    "the directory's dropdown lists the folders the text picks, best first",
+    "the directory's field holds the path completed",
+    "the session shown works in the directory completed",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -10115,6 +10311,55 @@ static DriveOp launchops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_NOFOLDER, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "launch-4-session"},
+    // The directory's completion, in a tree tests/gui.py made: a path
+    // typed in part lists the folders it picks, not dot folders nor
+    // files; Tab completes the first; Esc closes the list, not the
+    // dialog; Down twice picks the second, which Enter completes; a
+    // click on a row completes it; and Enter then creates the session
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    // The field has the keyboard, its text all selected, to type over
+    {OP_TEXTCWD, 0, 0, 0, 500, "/pick/al"},
+    {OP_CHECK, CHK_PATHPICK, 2, 0, 0, "alpha"},
+    {OP_SHOT, 0, 0, 0, 300, "launch-5-pathpick"},
+    {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_TAB, 0, 300, ""},
+    {OP_CHECK, CHK_NEWCWD, 0, 0, 0, "/pick/alpha/"},
+    {OP_CHECK, CHK_PATHPICK, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 500, "t"},
+    {OP_CHECK, CHK_PATHPICK, 2, 0, 0, "three"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_PATHPICK, 0, 0, 0, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_DOWN, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_DOWN, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_DOWN, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_DOWN, 0, 300, ""},
+    {OP_CHECK, CHK_PATHPICK, 2, 0, 0, "three"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_CHECK, CHK_NEWCWD, 0, 0, 0, "/pick/alpha/two/"},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    // A click on a row accepts it too, the field keeping the keyboard
+    {OP_TEXT, 0, 0, 0, 500, "d"},
+    {OP_CHECK, CHK_PATHPICK, 1, 0, 0, "deep"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "path pick"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NEWCWD, 0, 0, 0, "/pick/alpha/two/deep/"},
+    {OP_CHECK, CHK_PATHPICK, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SESSDIR, 0, 0, 0, "/pick/alpha/two/deep"},
+    {OP_SHOT, 0, 0, 0, 300, "launch-6-completed"},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
@@ -12455,6 +12700,24 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_NOFOLDERBOX:
         return g->newnofolder && g->cwdoff && ImGui::GetTopMostPopupModal();
+    case CHK_PATHPICK: {
+        DriveOp *op    = &g->ops[g->drivepc-1];
+        Str      first = {(u8 *)g->pc.first, (iz)__builtin_strlen(g->pc.first)};
+        return ImGui::GetTopMostPopupModal() && g->pc.rows==(i32)op->dx &&
+               (!op->text.len || first==op->text);
+    }
+    case CHK_NEWCWD: {
+        Arena    a  = g->frame;
+        DriveOp *op = &g->ops[g->drivepc-1];
+        Str      f  = {(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)};
+        return ImGui::GetTopMostPopupModal() && f==drivepath(g, &a, op->text);
+    }
+    case CHK_SESSDIR: {
+        Arena    a   = g->frame;
+        DriveOp *op  = &g->ops[g->drivepc-1];
+        Str      cwd = g->sess ? normpath(&a, v->cwd, ".", HOST_WINDOWS) : Str{};
+        return g->sess && endswith(cwd, op->text) && !ImGui::GetTopMostPopupModal();
+    }
     case CHK_NOFOLDER: {
         Arena a    = g->frame;
         Str   base = os_realpath(g->os, &a, statepath(g, "sessions"));
@@ -12812,6 +13075,10 @@ static void drivestep(Gui *g)
     case OP_TEXTCWD:
         e.kind = GEV_TEXT;
         e.text = g->drivecwd;  // null-terminated, from the command line
+        if (op->text.len) {
+            Str t = drivepath(g, &g->perm, op->text);
+            e.text = {(u8 *)cstr0(&g->perm, t), t.len};
+        }
         os_guiinject(g->os, &e);
         break;
     case OP_MODALSIZE:

@@ -223,6 +223,17 @@ directory of the host the session runs on, `HOME`, else `USERPROFILE`
 on Windows; `~user` is not supported. Paths in the home directory show
 as `~/...` in the sidebar and among the recent directories.
 
+Typing a path there drops down the folders it may go on to, listed on
+the session's host (a remote one through its engine). The text up to
+the last `/` (or `\` on Windows) names the folder listed, and the rest
+picks among its folders: each word, in any case, must be in the name.
+A name typed exactly comes first, then those that begin with the first
+word, then the rest. Dot folders show once the text begins with a dot.
+Up and Down pick, Tab or a click takes the pick (or the first), as
+does Enter once one is picked, and the field then holds that folder,
+ready to list its own. Esc closes the list, and Enter otherwise
+creates the session.
+
 A session needs no project: No folder, in the New and Import session
 dialogs, gives it a folder of its own instead, `sessions/SID/work` in
 the state directory, for general help with the machine. The agent works

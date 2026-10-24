@@ -5140,6 +5140,252 @@ static void importfill(Gui *g, GuiHost *h)
     }
 }
 
+// Completion of a path typed in a field (pathpick.cpp), for the new
+// session dialog's directory: a dropdown under the field of the folders
+// the text picks, listed on the host, which leaves the keyboard with the
+// field. It shows once the text is typed in, or Up or Down pressed, and
+// hides on accepting a pick, on Esc, and as the field loses the keyboard.
+// Up and Down pick; Tab accepts the pick, or the first, and Enter one
+// picked, else Enter is the dialog's; a click on a row accepts it. An
+// accepted folder is the text's, with a separator: its own folders are
+// then listed, as soon as the text changes again.
+struct PathCb {
+    Gui            *g;
+    PathQuery       q;
+    Slice<PathPick> picks;
+    b32             accepted;  // Tab accepted a pick
+};
+
+struct PathField {
+    PathCb              cb;
+    ImGuiID             id;
+    ImGuiInputTextFlags flags;
+    DirList            *list;     // the folder's listing, null if none
+    b32                 visible;  // the dropdown is drawn
+    b32                 enter;    // Enter accepts the pick
+};
+
+static i32 pathcb(ImGuiInputTextCallbackData *d)
+{
+    PathCb   *c  = (PathCb *)d->UserData;
+    PathComp *pc = &c->g->pc;
+    i32       n  = (i32)c->picks.len;
+    if (d->EventFlag == ImGuiInputTextFlags_CallbackHistory) {
+        b32 up = d->EventKey == ImGuiKey_UpArrow;
+        if (n) {
+            pc->sel = pc->sel<0 || !pc->shown ? (up ? n-1 : 0) : (pc->sel + (up ? n-1 : 1)) % n;
+        }
+        pc->shown = 1;
+    } else if (d->EventFlag==ImGuiInputTextFlags_CallbackCompletion && n) {
+        Arena a = c->g->frame;
+        Str   t = pathaccept(&a, c->q, c->picks[pc->sel>=0 ? pc->sel : 0]);
+        if (t.len < d->BufSize) {
+            d->DeleteChars(0, d->BufTextLen);
+            d->InsertChars(0, t.cdata, t.cdata+t.len);
+            c->accepted = 1;
+        }
+    }
+    return 0;
+}
+
+// Before the field: what it picks, from its text as it stands, and the
+// keys the dropdown takes from it and the dialog (*enter).
+static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off)
+{
+    PathComp *pc = &g->pc;
+    PathField f  = {};
+    f.cb.g  = g;
+    f.id    = ImGui::GetID("##cwd");
+    f.flags = ImGuiInputTextFlags_AutoSelectAll;
+    b32 active = ImGui::GetActiveID() == f.id;
+    if (!active && !pc->refocus) {
+        pc->shown = 0;
+        pc->sel   = -1;
+    }
+    if (pc->refocus && active) {
+        // Back after a click on a row: the caret at the end, not all
+        // selected, to type on
+        ImGuiInputTextState *st = ImGui::GetInputTextState(f.id);
+        if (st) {
+            st->ReloadUserBufAndMoveToEnd();
+        }
+        pc->refocus = 0;
+    } else if (pc->refocus) {
+        ImGui::ActivateItemByID(f.id);
+        scheddirty(&g->sched);
+    }
+    if (off || !hostlists(h)) {
+        pc->refocus = 0;
+        return f;
+    }
+    f.flags |= ImGuiInputTextFlags_CallbackHistory;
+
+    if (!pc->pickbase) {
+        pc->picks    = newarena(os_reserve(g->os, (iz)1<<24));
+        pc->pickbase = pc->picks.beg;
+    }
+    pc->picks.beg = pc->pickbase;
+    Arena *a    = &pc->picks;
+    Str    text = {(u8 *)buf, (iz)__builtin_strlen(buf)};
+    b32    win  = hostwin(h) || (text.len>=2 && text[1]==':');
+    f.cb.q = pathquery(text, win);
+    if (!active || !pathlistable(f.cb.q.dir, win)) {
+        return f;
+    }
+    f.list     = dirget(g, h, f.cb.q.dir);
+    f.cb.picks = pathpicks(a, f.list->ents, f.cb.q.filter, 1);
+    i32 n      = (i32)f.cb.picks.len;
+    pc->sel    = pc->sel<n ? pc->sel : -1;
+    f.visible  = pc->shown && (n || f.list->err.len || !f.list->got);
+    if (!f.visible) {
+        return f;
+    }
+    if (n) {
+        f.flags |= ImGuiInputTextFlags_CallbackCompletion;  // Tab, kept from nav
+    }
+    // Esc closes the dropdown, not the dialog, nor reverts the field
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        pc->shown = 0;
+        ImGui::SetKeyOwner(ImGuiKey_Escape, ImGui::GetID("##pathkeys"),
+                           ImGuiInputFlags_LockThisFrame);
+    }
+    // Enter with a pick accepts it, the field keeping the keyboard
+    if (*enter && pc->sel>=0) {
+        *enter  = 0;
+        f.enter = 1;
+        ImGui::SetKeyOwner(ImGuiKey_Enter, ImGui::GetID("##pathkeys"),
+                           ImGuiInputFlags_LockThisFrame);
+        ImGui::SetKeyOwner(ImGuiKey_KeypadEnter, ImGui::GetID("##pathkeys"),
+                           ImGuiInputFlags_LockThisFrame);
+    }
+    return f;
+}
+
+// Put an accepted pick in the field, from outside it.
+static void pathput(Gui *g, PathField *f, char *buf, PathPick p)
+{
+    Arena a = g->frame;
+    Str   t = pathaccept(&a, f->cb.q, p);
+    if (t.len < FIELD_MAX) {
+        fieldput(buf, t);
+        ImGuiInputTextState *st = ImGui::GetInputTextState(f->id);
+        if (st && ImGui::GetActiveID()==f->id) {
+            st->ReloadUserBufAndMoveToEnd();
+        }
+    }
+}
+
+// After the field: an accepted pick, then the dropdown under the field.
+static void pathafter(Gui *g, PathField *f, char *buf)
+{
+    PathComp *pc = &g->pc;
+    if (f->cb.accepted) {
+        pc->shown = 0;
+        pc->sel   = -1;
+        pc->accepts++;
+    } else if (ImGui::IsItemEdited()) {
+        pc->shown = 1;
+        pc->sel   = -1;
+        pc->top   = 0;
+    }
+    Slice<PathPick> picks = f->cb.picks;
+    i32             n     = (i32)picks.len;
+    if (f->enter && pc->sel>=0 && pc->sel<n) {
+        pathput(g, f, buf, picks[pc->sel]);
+        pc->shown = 0;
+        pc->sel   = -1;
+        pc->accepts++;
+    }
+    pc->rows = 0;
+    if (!f->visible || f->cb.accepted || f->enter) {
+        DirList *l = f->list;
+        if (pc->shown && l && (n || l->err.len || !l->got)) {
+            scheddirty(&g->sched);  // Up or Down showed it: drawn next frame
+        }
+        return;
+    }
+
+    // Rows from top, which follows the pick
+    pc->top = pc->sel>=0 && pc->sel<pc->top ? pc->sel :
+              pc->sel>=pc->top+PICK_ROWS ? pc->sel-PICK_ROWS+1 : pc->top;
+    pc->top = pc->top>n-PICK_ROWS ? n-PICK_ROWS : pc->top;
+    pc->top = pc->top<0 ? 0 : pc->top;
+
+    ImVec2 r0 = ImGui::GetItemRectMin();
+    ImVec2 r1 = ImGui::GetItemRectMax();
+    f32    w  = r1.x - r0.x;
+    ImGui::SetNextWindowPos(v2(r0.x, r1.y));
+    ImGui::SetNextWindowSizeConstraints(v2(w, 0), v2(w, 1e6f));
+    ImGuiWindowFlags fl = ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoTitleBar |
+                          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                          ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                          ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                          ImGuiWindowFlags_NoDocking;
+    if (ImGui::Begin("##pathpick", 0, fl)) {
+        Arena       a    = g->frame;
+        DirList    *l    = f->list;
+        ImDrawList *dl   = ImGui::GetWindowDrawList();
+        f32         rw   = ImGui::GetContentRegionAvail().x;
+        u32         dim  = g->pal->paneldim;
+        u32         mark = g->pal->link;
+        u32         text = ImGui::GetColorU32(ImGuiCol_Text);
+        Str         sep  = f->cb.q.dir.len ? cuthead(f->cb.q.dir, f->cb.q.dir.len-1) : Str("/");
+        i32         end  = pc->top+PICK_ROWS<n ? pc->top+PICK_ROWS : n;
+        for (i32 i = pc->top; i < end; i++) {
+            PathPick p  = picks[i];
+            ImVec2   at = ImGui::GetCursorScreenPos();
+            ImGui::PushID(i);
+            if (ImGui::Selectable("##pick", i==pc->sel, ImGuiSelectableFlags_SelectOnClick,
+                                  v2(rw, 0))) {
+                pathput(g, f, buf, p);
+                pc->shown   = 0;
+                pc->sel     = -1;
+                pc->refocus = 1;
+                pc->accepts++;
+                scheddirty(&g->sched);
+            }
+            ImGui::PopID();
+            if (i == pc->top) {
+                itemnamed(g, "path pick");
+            }
+            // The name, the parts the filter matched in the link color
+            u8 *m = pathmarks(&a, p.name, f->cb.q.filter);
+            f32 x = at.x;
+            for (iz k = 0; k < p.name.len;) {
+                iz j = k;
+                for (; j<p.name.len && m[j]==m[k]; j++) {}
+                Str s = {p.name.data+k, j-k};
+                dl->AddText(v2(x, at.y), m[k] ? mark : text, s.cdata, s.cdata+s.len);
+                x += ImGui::CalcTextSize(s.cdata, s.cdata+s.len).x;
+                k = j;
+            }
+            if (p.dir) {
+                dl->AddText(v2(x, at.y), dim, sep.cdata, sep.cdata+sep.len);
+            }
+        }
+        if (!n && l->err.len) {
+            ImGui::TextDisabled("%s", cstr0(&a, l->err));
+        } else if (!n) {
+            ImGui::TextDisabled("Listing\xe2\x80\xa6");
+        } else if (end<n || l->more) {
+            Buf b(&a, 64);
+            if (end < n) {
+                print(&b, (i64)(n-end));
+                print(&b, " more");
+            }
+            print(&b, !l->more ? Str{} : end<n ? Str(", and more not listed") : Str("More not listed"));
+            ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        }
+        if (n) {
+            ImGui::TextDisabled("Tab completes; Up and Down pick");
+        }
+        pc->rows = n;
+        Str first = n ? picks[0].name : Str{};
+        fieldput(pc->first, first.len<countof(pc->first) ? first : Str{});
+    }
+    ImGui::End();
+}
+
 // The new session dialog: a working directory, typed or from those of
 // earlier sessions, and a model, by default the configured one. For an
 // import, it says what is imported, filled from it (importfill), and
@@ -5154,6 +5400,8 @@ static void drawnew(Gui *g)
         g->opennew = 0;
         g->newplan = 0;
         g->newnofolder = 0;
+        g->pc.shown = g->pc.refocus = 0;
+        g->pc.sel = -1;
     }
     ImGui::SetNextWindowSize(v2(560*sc, 0));
     if (!ImGui::BeginPopupModal(name, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -5232,8 +5480,10 @@ static void drawnew(Gui *g)
     if (ImGui::IsWindowAppearing()) {
         ImGui::SetKeyboardFocusHere();
     }
-    ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, ImGuiInputTextFlags_AutoSelectAll);
+    PathField pf = pathbefore(g, host, g->newcwd, &enter, nofolder);
+    ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, pf.flags, pathcb, &pf.cb);
     itemrect(g, RECT_NEWCWD);
+    pathafter(g, &pf, g->newcwd);
     ImGui::SameLine();
     b32 remote = host->kind == GH_REMOTE;
     g->browseoff = remote;

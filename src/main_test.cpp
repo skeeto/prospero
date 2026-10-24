@@ -606,6 +606,7 @@ static Str istr(Arena *a, i64 v)
 #  include "fonts.cpp"
 #  include "place.cpp"
 #  include "compose.cpp"
+#  include "pathpick.cpp"
 #  include "sidebar.cpp"
 #  include "test/sched_test.cpp"
 #  include "test/highlight_test.cpp"
@@ -617,6 +618,7 @@ static Str istr(Arena *a, i64 v)
 #  include "test/fonts_test.cpp"
 #  include "test/place_test.cpp"
 #  include "test/compose_test.cpp"
+#  include "test/pathpick_test.cpp"
 #  include "test/sidebar_test.cpp"
 #endif
 
@@ -670,6 +672,7 @@ int main()
     test_fonts(&t);
     test_place(&t);
     test_compose(&t);
+    test_pathpick(&t);
     test_sidebar(&t);
     test_viewexport(&t);
     #endif

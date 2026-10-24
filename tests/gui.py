@@ -54,7 +54,8 @@ turn plan mode on and off; then Bypass from the list, in red, and Plan
 from there, whose approval lands in Build. The launch mode is prospero
 DIR's: a window started with a directory has a session there, another
 launch with one hands off to it as a new session shown, an open event makes another,
-and the new session dialog one with no folder; then, here on POSIX,
+and the new session dialog one with no folder, and one in a directory
+completed as typed (Tab, Esc, Down, Enter, a click); then, here on POSIX,
 two launches with no window both detach at once, leaving one window
 with both sessions, which is then told to quit.
 
@@ -1470,6 +1471,11 @@ def main():
         # prospero gui --launch DIR: a session in DIR after hello
         host.mkdir(host.path("work", "one"))
         guiargs.insert(1, host.path("work", "one"))
+        # A tree for the directory's completion: folders "al" picks and
+        # those it must not (a dot folder, a file), and folders in one
+        for d in ("alpha/one", "alpha/two/deep", "alpha/three", "alpine", "beta", ".alhidden"):
+            host.mkdir(host.path("work", "pick", *d.split("/")))
+        host.write(host.path("work", "pick", "alfile"), "a file\n")
     if args.inbox_cap or args.mode not in ("bench", "background"):
         guiargs += ["--inbox-cap", str(args.inbox_cap or 65536)]
     if far:
