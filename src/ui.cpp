@@ -2797,7 +2797,8 @@ static i32 composecb(ImGuiInputTextCallbackData *d)
 
 // A context menu pick, as its key chord, queued for the next frame's
 // input: the platform's command key is Super to ImGui on macOS, which
-// it then swaps for Ctrl, as it does the real key.
+// it then swaps for Ctrl, as it does the real key. Its key is held
+// while the release waits in the queue, which is no lost release.
 static void composechord(Gui *g, i32 act)
 {
     ImGuiKey key   = ImGuiKey_None;
@@ -2815,6 +2816,7 @@ static void composechord(Gui *g, i32 act)
     }
     ImGuiIO &io  = ImGui::GetIO();
     ImGuiKey mod = g->mac ? ImGuiMod_Super : ImGuiMod_Ctrl;
+    schedkey(&g->sched, g->sched.now);
     io.AddKeyEvent(mod, true);
     if (shift) {
         io.AddKeyEvent(ImGuiMod_Shift, true);
