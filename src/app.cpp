@@ -1015,6 +1015,7 @@ struct Gui {
     GuiSession        *pickmodel;  // /model's list is open for it
     i32                menuact;    // a context menu pick waiting for the box
     i32                menuwait;   // frames it has waited
+    i32                draftsout;  // drafts sent, not yet answered
 
     // Menu bar, toolbar and layout
     i32                tps;
@@ -3219,6 +3220,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         return;
 
     case CMD_DRAFT:
+        g->draftsout -= g->draftsout>0;
         if (!ok && q.s) {
             setnote(g, q.s, concat(&scratch, "the draft was not kept: ", err), 1);
         }
@@ -3458,6 +3460,7 @@ static void draftsend(Gui *g, GuiSession *s)
     putstr(&w.json, text);
     cmdsend(g, &w, a);
     draftdone(&s->dclock);
+    g->draftsout++;
 }
 
 static void draftsendall(Gui *g)
@@ -7533,6 +7536,9 @@ enum : i32 {
     W_IMPORTED,   // an import ended, and none is under way
     W_EXPORTED,   // an export was saved, and none is under way
     W_PLAN,       // the Plan window has the plan, with text in it
+    W_PICKED,     // the box's context menu closed, its pick's chord
+                  // taken in
+    W_DRAFTS,     // every draft sent was answered, so kept
 };
 
 static Str waitnames[] = {
@@ -7547,9 +7553,9 @@ static Str waitnames[] = {
     "the includes", "the thumbnails", "the screenshot", "reasoning",
     "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
     "a named item", "a launch to hand off", "the import", "the export",
-    "the plan",
+    "the plan", "the menu's pick", "the drafts kept",
 };
-static_assert(countof(waitnames) == W_PLAN+1);
+static_assert(countof(waitnames) == W_DRAFTS+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -9569,6 +9575,10 @@ static DriveOp planops[] = {
 #define RCLICK(ms) \
     {OP_MOVE, T_PROMPT, 0, 0, 100, ""}, {OP_RDOWN, 0, 0, 0, 60, ""}, \
     {OP_RUP, 0, 0, 0, ms, ""}
+// A pick from the box's context menu, waiting out its chord, which
+// takes several frames: on a slow display, longer than any fixed wait
+#define PICK(t) \
+    CLICK(t, "", 100), {OP_WAIT, W_PICKED, 0, 0, 5000, ""}
 #define SELALL \
     {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""}, KEY(GKEY_A, KEY_CMD, 50), \
     {OP_KEYUP, 0, GKEY_CMD, 0, 200, ""}
@@ -9642,22 +9652,22 @@ static DriveOp composeops[] = {
     RCLICK(500),
     {OP_CHECK, CHK_CMENU, 1|4|16, 1|16, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "compose-menu"},
-    CLICK(T_CMSELALL, "", 500),
+    PICK(T_CMSELALL),
     {OP_CHECK, CHK_SELALL, 0, 0, 0, ""},
     RCLICK(500),
     {OP_CHECK, CHK_CMENU, 4, 4, 0, ""},
-    CLICK(T_CMCUT, "", 500),
+    PICK(T_CMCUT),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_CHECK, CHK_CLIPBOARD, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
     RCLICK(500),
-    CLICK(T_CMPASTE, "", 500),
+    PICK(T_CMPASTE),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
     RCLICK(500),
-    CLICK(T_CMUNDO, "", 500),
+    PICK(T_CMUNDO),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     RCLICK(500),
     {OP_CHECK, CHK_CMENU, 2, 2, 0, ""},
-    CLICK(T_CMREDO, "", 500),
+    PICK(T_CMREDO),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
     // The editor, by Ctrl+G: read-only meanwhile, saying so, then the
     // draft as it saved it, kept at once
@@ -9665,6 +9675,7 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_EDITING, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "compose-editing"},
     {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_WAIT, W_DRAFTS, 0, 0, 5000, ""},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0,
      "Say hello again, please. Thanks.\nline two\nEdited by the test editor."},
     {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0,
@@ -9777,6 +9788,7 @@ static DriveOp composeops[] = {
     {OP_TEXT, 0, 0, 0, 200, "Kept across a restart"},
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_WAIT, W_DRAFTS, 0, 0, 5000, ""},
     {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, "Kept across a restart"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_MARKSESS, 0, 0, 0, 0, ""},
@@ -9902,6 +9914,7 @@ static DriveOp compose2ops[] = {
 #undef KEY
 #undef CLICK
 #undef RCLICK
+#undef PICK
 #undef SELALL
 #undef CTRLG
 
@@ -10436,6 +10449,18 @@ static b32 drivewaitdone(Gui *g)
         return g->sess && f->s==g->sess && !f->id && f->ver==v->planver &&
                find(finish(&f->text), g->ops[g->drivepc-1].text)>=0;
     }
+    case W_PICKED: {
+        // The chord's events go in over frames of their own
+        ImGuiContext &c = *GImGui;
+        for (i32 i = 0; i < c.InputEventsQueue.Size; i++) {
+            if (c.InputEventsQueue[i].Type == ImGuiInputEventType_Key) {
+                return 0;
+            }
+        }
+        return !g->cmenushown && !g->menuact;
+    }
+    case W_DRAFTS:
+        return !g->draftsout;
     case W_FILE: {
         Arena a = g->frame;
         Str   f = join(&a, g->drivecwd, g->ops[g->drivepc-1].text);
