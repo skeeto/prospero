@@ -159,6 +159,7 @@ enum : u32 {
 enum : u32 {
     TASK_SAVED = 32,    // a save dialog's path (id its ask), empty if cancelled
     TASK_DEPLOYED,      // Update engine: 1 or 0, then the path or why (id the host's uid)
+    TASK_RAISE,         // a launch handed off to this window: its token (door.cpp)
 };
 
 // Item rectangles the scripted checklist aims at
@@ -806,6 +807,10 @@ struct Gui {
                                    // 2 to the background
     i64                hostidle;   // ticks: --host-idle, else [host] idle_exit
     b32                trayup;     // a tray icon brings the window back
+    iz                 guilock;    // the state directory's (door.cpp), or -1
+    i32                raises;     // launches that handed off to this window
+    b32                raisereq;   // between frames: come forward for one
+    Str                raisetoken; // its activation token (Wayland)
     Str                hosterr;    // why this process could not host
     Str                whynobg;    // why it cannot, as the close dialog opened
     i32                hostfound;  // background hosts found at startup
@@ -3978,7 +3983,7 @@ static void updatestatus(Gui *g, GuiHost *h, b32 idle)
 }
 
 // What another thread finished: a save dialog answered, a deployment's
-// progress and outcome.
+// progress and outcome, a launch that handed off to this window.
 static void ontask(Gui *g, Record r)
 {
     Export *x = &g->exp;
@@ -4018,6 +4023,12 @@ static void ontask(Gui *g, Record r)
         h->updating = UPD_CHECKING;
         h->updmsg   = "deployed: is its host idle?";
     } return;
+    case TASK_RAISE:
+        g->raises++;
+        g->raisereq   = 1;
+        g->raisetoken = clone(&g->perm, r.data);
+        scheddirty(&g->sched);
+        return;
     case MAIL_OUT: {
         // A deployment's progress, by the remote's name
         Arena a = g->frame;
@@ -4074,7 +4085,9 @@ static void guiupdate(Gui *g, GuiHost *h)
 // engine (host.cpp), in place: the engine's records, which came to the
 // GUI's inbox, go to a host thread from then on, which listens at the
 // state directory's endpoint and is registered there, so that a window
-// that comes later, in this process or another, finds its sessions.
+// that comes later finds its sessions: this process's own, as a launch
+// on the same state directory hands off to it (door.cpp), or a client
+// from elsewhere (prospero attach, a remote's window).
 // Nothing moves, as the engine stays where it was. The window and its
 // renderer go, and a tray icon, where the system has one, offers the
 // window again, a stop of every session's work, and quitting. Nobody
@@ -4287,6 +4300,47 @@ static void gui_tray(Gui *g, i32 item)
         }
         break;
     }
+}
+
+// Another launch on this state directory handed off to this window
+// (door.cpp), between frames: it comes forward as from the tray's Open,
+// a shed window opening with the launcher's activation token. A window
+// up already gets only what os_guiraise can do, which under Wayland is
+// an attention hint, as the token is good only for a window's showing.
+static void raisenow(Gui *g)
+{
+    g->raisereq = 0;
+    guilog(g, g->bg ? Str("another launch asked for the window: it comes back")
+                    : Str("another launch asked for the window: raised"));
+    if (g->bg) {
+        os_guitoken(g->os, g->raisetoken);
+    }
+    gui_tray(g, TRAY_OPEN);
+}
+
+// This launch found the state directory's window lock held: ask its
+// window to come forward instead, given half a second to be found (it
+// may be starting), and exit. Returns the exit status.
+static i32 handoff(Gui *g)
+{
+    Os   *os    = g->os;
+    Arena a     = g->frame;
+    Str   token = os_getenv(os, &a, "XDG_ACTIVATION_TOKEN");
+    Knock k     = knock(os, &g->perm, a, g->statedir, token, 500, os_guiletfront);
+    Buf   b(&a, 256 + g->statedir.len);
+    if (k.ok) {
+        print(&b, "prospero: a window has this state directory already, process ");
+        print(&b, k.pid);
+        print(&b, ": brought it forward\n");
+        os_print(os, 2, finish(&b));
+        return 0;
+    }
+    print(&b, "prospero: another Prospero window holds this state directory, "
+              "and does not answer: ");
+    print(&b, g->statedir);
+    putbyte(&b, '\n');
+    os_print(os, 2, finish(&b));
+    return 1;
 }
 
 static void gui_close(Gui *);
@@ -5686,6 +5740,9 @@ static void gui_run(Gui *g)
         } else if (g->shedreq) {
             shednow(g);
             continue;
+        } else if (g->raisereq) {
+            raisenow(g);
+            continue;
         } else if (g->bg) {
             bgwait(g);
             continue;
@@ -6278,6 +6335,7 @@ enum : i32 {
     CHK_HOSTTRIED,
     CHK_FORKED,
     CHK_DELCOUNT,     // the delete confirmation counts dx sessions
+    CHK_GUILOCK,      // this process holds the state directory's window lock
     CHK_COUNT,
 };
 
@@ -6344,7 +6402,7 @@ static Str chknames[] = {
     "no frames for a job's output, the Jobs tab hidden",
     "closing offers to keep the turn running in the background",
     "the window is gone, and this process hosts its engine, registered",
-    "the tray's Open brought the window back, a client of its own host",
+    "the window came back, a client of its own host",
     "the turn finished in the background, its whole answer shown",
     "a new window found the background host and listed its session",
     "the background session opened, badged, its finished turn shown",
@@ -6437,6 +6495,7 @@ static Str chknames[] = {
     "the remote's heading connected, or tried",
     "the fork is shown, its draft the prompt that came next",
     "the delete confirmation counts the sessions it takes",
+    "the window lock is held, and by this process",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -6485,6 +6544,7 @@ enum : i32 {
     W_NOTE,       // the session shown has a note
     W_COMPACTED,  // it has a compaction card, and is idle
     W_NAMED,      // an item named starting with text drew
+    W_RAISED,     // dx launches handed off to this window, and it is up
 };
 
 static Str waitnames[] = {
@@ -6498,9 +6558,9 @@ static Str waitnames[] = {
     "the link to drop", "the remote to close", "the output", "a file",
     "the includes", "the thumbnails", "the screenshot", "reasoning",
     "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
-    "a named item",
+    "a named item", "a launch to hand off",
 };
-static_assert(countof(waitnames) == W_NAMED+1);
+static_assert(countof(waitnames) == W_RAISED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -8019,14 +8079,16 @@ static DriveOp stopops[] = {
 
 // M5, keeping a turn running in the background (--background,
 // tests/gui.py --mode background): the window goes partway through a
-// streaming turn, and this process hosts its engine. The checklist goes
-// on without frames until tests/gui.py, having run a second window
-// (attachops) against the host, writes open-now; then the tray's Open
-// brings the window back, a client of its own host, showing the turn
-// finished. A new session there starts a turn, and closing the window
-// leaves the host and the turn running; the tray's Stop all stops the
-// turn, and the host, with nothing to do, ends this process after its
-// idle time (--host-idle). Light first, then dark.
+// streaming turn, and this process hosts its engine, keeping the state
+// directory's window lock (M9). The checklist goes on without frames
+// until tests/gui.py launches the GUI again on that state directory,
+// which hands off to this process and exits: the window comes back, a
+// client of its own host, showing the turn finished. Another launch,
+// and the tray's Open, then raise it. A new session there starts a
+// turn, and closing the window leaves the host and the turn running;
+// the tray's Stop all stops the turn, and the host, with nothing to do,
+// ends this process after its idle time (--host-idle). Light first,
+// then dark.
 static DriveOp bgops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -8049,10 +8111,10 @@ static DriveOp bgops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SHED, 0, 0, 10000, ""},
     {OP_CHECK, CHK_SHED, 0, 0, 0, ""},
-    // No window: tests/gui.py looks on, then says when to come back
+    {OP_CHECK, CHK_GUILOCK, 0, 0, 0, ""},
+    // No window: tests/gui.py looks on, then launches the GUI again
     {OP_TOUCH, 0, 0, 0, 0, "bg-ready"},
-    {OP_WAIT, W_FILE, 0, 0, 180000, "open-now"},
-    {OP_TRAY, 0, TRAY_OPEN, 0, 500, ""},
+    {OP_WAIT, W_RAISED, 1, 0, 180000, ""},
     {OP_WAIT, W_REOPENED, 0, 0, 15000, ""},
     {OP_SYSTHEME, 0, 1, 0, 0, ""},
     {OP_WAIT, W_IDLE, 0, 0, 15000, ""},
@@ -8063,6 +8125,10 @@ static DriveOp bgops[] = {
     {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "bg-3-reopened"},
     {OP_TRAY, 0, TRAY_OPEN, 0, 1000, ""},  // shown already: raised
+    // Launched again, shown: raised, and that launch exits
+    {OP_TOUCH, 0, 0, 0, 0, "bg-back"},
+    {OP_WAIT, W_RAISED, 2, 0, 60000, ""},
+    {OP_CHECK, CHK_GUILOCK, 0, 0, 0, ""},
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_IDLE, 0, 0, 0, 0, "idle 3 s, the window back"},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
@@ -8086,10 +8152,12 @@ static DriveOp bgops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
-// M5, a second window while the first runs in the background (--attach,
-// tests/gui.py --mode background): it finds the host at startup, lists
-// its session, badged, opens it with the turn finished, and prompts it
-// through the host. Dark first, then light.
+// M5, a window while another process hosts its state directory
+// (--attach, tests/gui.py --mode background: since M9 "prospero serve",
+// once the first window's process has ended, as two windows never
+// share a state directory): it finds the host at startup, lists the
+// session that ran in the background, badged, opens it with the turn
+// finished, and prompts it through the host. Dark first, then light.
 static DriveOp attachops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_SYSTHEME, 0, 1, 0, 0, ""},
@@ -9019,6 +9087,8 @@ static b32 drivewaitdone(Gui *g)
             }
         }
         return 0;
+    case W_RAISED:
+        return !g->bg && !g->raisereq && g->raises>=(i32)g->ops[g->drivepc-1].dx;
     case W_SHED:
         return g->bg;
     case W_REOPENED:
@@ -10284,18 +10354,26 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_REOPENED:
         return !g->bg && g->main->own && g->main->up && g->sess &&
                g->sess->host==g->main && !g->sess->readonly;
+    case CHK_GUILOCK: {
+        // Taken again from here, it fails as for any other process
+        Arena a     = g->frame;
+        Str   path  = guilockpath(&a, g->statedir);
+        b32   held  = os_lockheld(g->os, a, path);
+        iz    again = guilock(g->os, a, g->statedir);
+        if (again >= 0) {
+            os_unlockfile(g->os, again);
+        }
+        return g->guilock>=0 && held && again<0;
+    }
     case CHK_BGDONE:
     case CHK_BGSESSION: {
         // The whole answer, streamed partly to nobody, in order, once
-        // (the first window: then the second window's turn, too)
         ViewMsg *m = 0;
         for (iz i = v->msgs.len-1; i >= 0; i--) {
             m = v->msgs[i].role==VIEW_ASSISTANT && !v->msgs[i].prov ? &v->msgs[i] : m;
         }
-        ViewMsg *z     = lastmsg(g, VIEW_ASSISTANT);
-        i32      n     = chk==CHK_BGDONE ? 2 : 1;
-        b32      whole = m && startswith(m->text, "bg0 bg1 ") && endswith(m->text, "bg399 ") &&
-                         countrole(v, VIEW_ASSISTANT)==n && (n==1 || z->text=="Hello!");
+        b32 whole = m && startswith(m->text, "bg0 bg1 ") && endswith(m->text, "bg399 ") &&
+                    countrole(v, VIEW_ASSISTANT)==1;
         Arena a = g->frame;
         Buf   b(&a, 256);
         print(&b, "drive: ");
@@ -11149,6 +11227,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->os       = os;
     g->started  = os_ticks(os);
     g->logfd    = -1;
+    g->guilock  = -1;
     g->scrollto = -1;
     g->second   = g->started;
     g->tps      = 100;
@@ -11363,6 +11442,17 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     if (!g->statedir.len) {
         g->statedir = defaultstate(os, &g->perm);
     }
+    // One window per state directory (door.cpp), its lock held for this
+    // process's life, the window gone to the background or not: a second
+    // launch hands off to the first, and goes
+    if (g->statedir.len) {
+        Arena a    = g->frame;
+        Str   path = guilockpath(&a, g->statedir);
+        g->guilock = guilock(os, a, g->statedir);
+        if (g->guilock<0 && os_lockheld(os, a, path)) {
+            return handoff(g);
+        }
+    }
     Str sessions = join(&g->perm, g->statedir, "sessions");
     if (g->statedir.len && os_mkdirs(os, g->frame, sessions)) {
         g->inipath = statepath(g, "imgui.ini");
@@ -11383,6 +11473,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     if (!g->inbox || !g->outbox || !g->tasks) {
         os_print(os, 2, "prospero: could not create mailboxes\n");
         return 2;
+    }
+    if (g->guilock >= 0) {
+        Str err = opendoor(os, &g->perm, g->frame, g->statedir, g->tasks, TASK_RAISE);
+        if (err.len) {
+            guilog(g, concat(&g->frame, "other launches cannot hand off: ", err));
+        }
     }
     Fake *f = 0;
     if (fake) {

@@ -1036,6 +1036,65 @@ static void testendpoints(Selftest *t, Arena *perm, Arena scratch, Str dir)
     say(os, "endpoints done");
 }
 
+// One window per state directory (door.cpp): the window lock, which
+// another state directory does not share, and a launch knocking at the
+// window's door. The door stays open until the process ends.
+static void testdoor(Selftest *t, Arena *perm, Arena scratch, Str dir)
+{
+    Os *os = t->os;
+    Str a  = join(&scratch, dir, "door-a");
+    Str b  = join(&scratch, dir, "door-b");
+    Str pa = guilockpath(&scratch, a);
+    iz  la = guilock(os, scratch, a);
+    check(t, la >= 0, "guilock takes a state directory's window lock");
+    check(t, os_lockheld(os, scratch, pa), "os_lockheld sees it");
+    check(t, guilock(os, scratch, a) < 0, "a second window lock fails");
+    iz lb = guilock(os, scratch, b);
+    check(t, lb >= 0, "another state directory's is its own");
+
+    Knock k = knock(os, perm, scratch, a, "tok", 200, 0);
+    check(t, !k.ok, "a knock with nobody at the door fails");
+    Mailbox *mb  = newmailbox(perm, 1<<12, 0, 0);
+    Str      err = opendoor(os, perm, scratch, a, mb, 77);
+    if (!check(t, !err.len, "opendoor")) {
+        say(os, err);
+        return;
+    }
+    k = knock(os, perm, scratch, a, "tok-1.2_X", 2000, 0);
+    check(t, k.ok && k.pid==os_pid(os), "a knock is answered, with the pid");
+    Mail m = mailtake(mb);
+    Record r = mailnext(&m);
+    check(t, r.ok && r.type==77 && r.data=="tok-1.2_X", "and the raise posted, with the token");
+    check(t, !mailnext(&m).ok, "once");
+
+    // A request out of order, or garbage, is hung up on, raising nothing
+    Str      ep = doorendpoint(os, &scratch, a);
+    Mailbox *cm = newmailbox(perm, 1<<12, 0, 0);
+    Conn    *c  = os_connect(os, scratch, ep, cm, 1);
+    check(t, c!=0, "the door takes a connection");
+    if (c) {
+        os_connwrite(os, c, "{\"go\":1}\n");
+        ConnWatch w = {};
+        w.c   = c;
+        w.id  = 1;
+        w.got = Buf(&scratch, 1<<10);
+        check(t, connwatch(os, cm, &w, 5000, haseof) && !w.got.len,
+              "a go before a raise is hung up on");
+        os_connclose(os, c);
+    }
+    k = knock(os, perm, scratch, a, "bad token\n", 2000, 0);
+    check(t, k.ok, "a knock with a token not to pass on");
+    m = mailtake(mb);
+    r = mailnext(&m);
+    check(t, r.ok && r.type==77 && !r.data.len, "raises without it");
+    check(t, !mailnext(&m).ok, "once");
+
+    os_unlockfile(os, la);
+    os_unlockfile(os, lb);
+    check(t, !os_lockheld(os, scratch, pa), "the lock goes");
+    say(os, "door done");
+}
+
 static i32 selftestio(Os *os, Arena *perm, Arena scratch, Str url)
 {
     Selftest t = {};
@@ -1054,6 +1113,7 @@ static i32 selftestio(Os *os, Arena *perm, Arena scratch, Str url)
 
     testlocks(&t, a, dir);
     testendpoints(&t, perm, a, dir);
+    testdoor(&t, perm, a, dir);
     testprocs(&t, perm, a, dir);
     if (url.len) {
         testhttp(&t, perm, a, url);

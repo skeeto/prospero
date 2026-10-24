@@ -25,7 +25,10 @@
 // bar; Linux: a status notifier, through appindicator loaded at run
 // time, or none), whose menu picks arrive as events of our own; a window
 // comes back through os_guiopen. While only the icon is left, the app
-// has no Dock icon on macOS (an accessory app).
+// has no Dock icon on macOS (an accessory app). AppKit's reopen (the
+// Dock's icon clicked, or the app launched again through Launch
+// Services) comes as the tray's Open, by a method added at run time to
+// SDL's app delegate, so that it brings a shed window back too.
 //
 // SDL reports the system's theme (macOS: the app's effective appearance;
 // Linux: the desktop portal's color-scheme, unknown without one, taken
@@ -450,6 +453,48 @@ static void dockicon(b32 show)
         ((Set)(void *)objc_msgSend)(app, sel_registerName("setActivationPolicy:"), show ? 0 : 1);
     }
 }
+
+// AppKit asks the app delegate to reopen when the Dock's icon is clicked
+// or the app is launched again (Launch Services) while it runs, and SDL
+// leaves it unanswered, which would leave a shed window shed. It goes
+// as the tray's Open, through the queue: the type of SDL's event for
+// that, for the method, which has nowhere else to find it.
+static u32 reopenevent;
+
+#if __arm64__
+using ObjcBool = bool;
+static char const reopentypes[] = "B@:@B";
+#else
+using ObjcBool = signed char;
+static char const reopentypes[] = "c@:@c";
+#endif
+
+static ObjcBool shouldreopen(void *, void *, void *, ObjcBool)
+{
+    SDL_Event e = {};
+    e.type      = reopenevent;
+    e.user.code = TRAY_OPEN;
+    SDL_PushEvent(&e);
+    return 0;  // handled: AppKit does nothing more
+}
+
+extern "C" void *object_getClass(void *);
+extern "C" bool  class_addMethod(void *, void *, void *, char const *);
+
+static void handlereopen(u32 trayevent)
+{
+    using Get = void *(*)(void *, void *);
+    Get   get = (Get)(void *)objc_msgSend;
+    void *cls = objc_getClass("NSApplication");
+    void *app = cls ? get(cls, sel_registerName("sharedApplication")) : 0;
+    void *dlg = app ? get(app, sel_registerName("delegate")) : 0;
+    if (dlg) {
+        reopenevent = trayevent;
+        class_addMethod(object_getClass(dlg),
+                        sel_registerName("applicationShouldHandleReopen:hasVisibleWindows:"),
+                        (void *)shouldreopen, reopentypes);
+    }
+}
 #endif
 
 static b32 os_guiopen(Os *os, Gui *g, Str title)
@@ -486,6 +531,9 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     p->wakeevent = SDL_RegisterEvents(2);
     p->trayevent = p->wakeevent + 1;
     p->framedark = -1;
+    #ifdef __APPLE__
+    handlereopen(p->trayevent);
+    #endif
     if (!sdlwindow(os, g, p, title)) {
         return 0;
     }
@@ -726,6 +774,19 @@ static void os_guiraise(Os *os)
         SDL_RaiseWindow(p->window);
     }
 }
+
+// SDL's Wayland backend activates a window it shows with the token in
+// the environment, then removes it from there. Elsewhere it would only
+// linger, for the engine's commands to inherit.
+static void os_guitoken(Os *os, Str token)
+{
+    if (os->gui && wayland() && token.len) {
+        Arena a = ((GuiSdl *)os->gui)->gui->frame;
+        SDL_setenv_unsafe("XDG_ACTIVATION_TOKEN", cstr0(&a, token), 1);
+    }
+}
+
+static void os_guiletfront(Os *, i64) {}
 
 static i64 os_guirefresh(Os *os)
 {

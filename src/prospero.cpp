@@ -368,6 +368,13 @@ static i64     os_guirefresh(Os *);
 // Bring the window back for the user: restored if minimized, and raised
 // unless scripted (it would take the user's focus).
 static void    os_guiraise(Os *);
+// (M9) A launcher's activation token (Wayland's XDG_ACTIVATION_TOKEN),
+// for the window that os_guiopen opens next to take the focus with.
+// Ignored elsewhere.
+static void    os_guitoken(Os *, Str token);
+// (M9) Let another process take the foreground: this one, launched in
+// front, hands off to that one's window (Windows). A no-op elsewhere.
+static void    os_guiletfront(Os *, i64 pid);
 // Make the window's frame (its title bar) dark or light to match the
 // theme, where the platform can: Windows 10 1809 and later, and macOS.
 // Returns 0 where it cannot, and before the window exists.
@@ -522,6 +529,7 @@ static Arena newarena(Region *r)
 #include "engine.cpp"
 #include "cli.cpp"
 #include "host.cpp"
+#include "door.cpp"
 #include "deploy.cpp"
 #include "remote.cpp"
 #include "selftest.cpp"

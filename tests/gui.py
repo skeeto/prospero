@@ -735,24 +735,39 @@ def sessionlog(host, state, needle):
     return None
 
 
+def handoffproblems(status, lines, who):
+    """What is wrong with a launch that should have handed off to the
+    window holding its state directory, and exited."""
+    if status is None:
+        return [f"{who}: did not exit in time"]
+    if status != 0:
+        return [f"{who}: exit status {status}"]
+    if not any("brought it forward" in l for l in lines):
+        return [f"{who}: did not say it handed off"]
+    return []
+
+
 def background(args, host, guiargs, guicwd):
     """--mode background: the first window keeps its turn running in the
-    background and goes; the turn ends with no window; a second window
-    finds the host (and passes over a stale registration), shows the
-    session and prompts it, and quits; then the first comes back from the
-    tray, starts another turn, goes again, stops it from the tray, and
-    its process ends after its idle time. Returns problems and both
-    logs."""
+    background and goes, its process keeping the state directory's
+    window lock; the turn ends with no window; a second launch on that
+    state directory hands off to the first, which comes back, and exits;
+    a third, the window up, raises it and exits; the first starts another
+    turn, goes again, stops it from the tray, and its process ends after
+    its idle time. Then "prospero serve" hosts the state directory, and
+    a window attaching to it (passing over a stale registration) shows
+    the session and prompts it, and quits. Here on POSIX, a window's
+    process killed with SIGKILL leaves the lock free. Returns problems
+    and the logs."""
     problems = []
     first = {}
-    # Long enough to go on between the second window and the first's
-    # return, short enough to end it all soon after
+    # Long enough to go on between the launches and the first's return,
+    # short enough to end it all soon after
     t = threading.Thread(target=lambda: first.update(r=host.run(
         ["--background", "--host-idle", "20"] + guiargs, args.timeout, guicwd,
         tag="[1] ")))
     t.start()
-    lines2 = []
-    stale = host.path("state", "hosts", "99999999.ini")
+    more = []
     if not waitfor(lambda: host.read(host.path("work", "bg-ready")), 120, 1):
         problems.append("the first window never went to the background")
     else:
@@ -780,31 +795,175 @@ def background(args, host, guiargs, guicwd):
             problems.append("the turn did not end in the background")
         else:
             print("the turn ended in the background", flush=True)
+        # Launched again: the shed window comes back, and this one goes
+        status, lines = host.run(guiargs, 60, guicwd, tag="[2] ")
+        problems += handoffproblems(status, lines, "the second launch")
+        more += lines
+        if not waitfor(lambda: host.read(host.path("work", "bg-back")), 60, 1):
+            problems.append("the first window did not come back")
+        else:
+            # And again, the window up: raised
+            status, lines = host.run(guiargs, 60, guicwd, tag="[3] ")
+            problems += handoffproblems(status, lines, "the third launch")
+            more += lines
+    t.join(args.timeout + 60)
+    status1, lines1 = first.get("r", (None, []))
+    problems += summaryproblems(status1, lines1, "the first window")
+    if status1 is not None and host.listdir(host.path("state", "hosts")):
+        problems.append("a host is still registered after the first window quit")
+    if status1 is not None:
+        p, lines = serveattach(args, host, guiargs, guicwd)
+        problems += p
+        more += lines
+    text = sessionlog(host, "state", "Stream in the background") or ""
+    if '"via":"prompt"' not in text or text.count('"ev":"turn.end"') != 2:
+        problems.append("the log lacks the turn or the attached window's prompt")
+    later = sessionlog(host, "state", "Stream slowly for a while") or ""
+    if '"why":"cancel"' not in later:
+        problems.append("the tray's Stop all did not stop the later turn")
+    if isinstance(host, Local) and os.name == "posix":
+        problems += crashed(args)
+    return problems, lines1 + more
+
+
+def serveattach(args, host, guiargs, guicwd):
+    """"prospero serve" hosting the state directory the first window had,
+    and a window attaching to it (attachops), which must pass over a
+    stale registration. Returns problems and the window's log."""
+    problems = []
+    state = host.path("state")
+    serve = host.popen(["serve", "--state", state, "-c", host.path("prospero.ini"),
+                        "--idle", "30"])
+    # Its output must keep flowing, or it would block writing it
+    threading.Thread(target=lambda: [None for _ in serve.stdout], daemon=True).start()
+    lines = []
+    regs = waitfor(lambda: host.listdir(host.path("state", "hosts")), 30, 0.5)
+    print(f"prospero serve registered: {regs}", flush=True)
+    sid = next((s for s in host.listdir(host.path("state", "sessions"))
+                if "Stream in the background" in (host.read(host.path(
+                    "state", "sessions", s, "events.jsonl")) or "")), None)
+    if not regs:
+        problems.append("prospero serve never registered")
+    elif not sid:
+        problems.append("no session of the first window's")
+    elif not serveopen(host, state, sid):
+        problems.append("the host would not open the session")
+    else:
         # A registration whose host is long gone, which must hold up nothing
+        stale = host.path("state", "hosts", "99999999.ini")
         dead = host.path("state", "run", "dead.sock") if not isinstance(host, Remote) \
             else "\\\\.\\pipe\\prospero-test-dead-host"
         host.write(stale, f"pid = 99999999\nendpoint = {dead}\nversion = 0.0.0\n"
                           f"proto = 0\nstarted = 1\n")
         # Probing every second while idle, so that a clock drawn with no
         # deadline (a host's age, say) is caught for sure
-        status2, lines2 = host.run(["--attach", "--aggressive"] + guiargs, args.timeout,
-                                   guicwd, tag="[2] ")
-        problems += summaryproblems(status2, lines2, "the second window")
+        status, lines = host.run(["--attach", "--aggressive"] + guiargs, args.timeout,
+                                 guicwd, tag="[4] ")
+        problems += summaryproblems(status, lines, "the attached window")
         if host.read(stale) is not None:
             problems.append("the stale registration is still there")
-    host.write(host.path("work", "open-now"), "go\n")
-    t.join(args.timeout + 60)
-    status1, lines1 = first.get("r", (None, []))
-    problems += summaryproblems(status1, lines1, "the first window")
-    if status1 is not None and host.listdir(host.path("state", "hosts")):
-        problems.append("a host is still registered after the first window quit")
-    text = sessionlog(host, "state", "Stream in the background") or ""
-    if '"via":"prompt"' not in text or text.count('"ev":"turn.end"') != 2:
-        problems.append("the log lacks the turn or the second window's prompt")
-    later = sessionlog(host, "state", "Stream slowly for a while") or ""
-    if '"why":"cancel"' not in later:
-        problems.append("the tray's Stop all did not stop the later turn")
-    return problems, lines1 + lines2
+    # Its idle time, with nobody left
+    try:
+        serve.wait(timeout=90)
+    except subprocess.TimeoutExpired:
+        problems.append("prospero serve did not exit after its idle time")
+        serve.kill()  # the test's own child
+        serve.wait()
+    return problems, lines
+
+
+def serveopen(host, state, sid):
+    """Have the host of state open sid, through a client that then goes,
+    so that the host holds it, as a host whose window went holds what it
+    ran. Returns whether the open was answered."""
+    c = host.popen(["connect", "--local", "--state", state, "-c",
+                    host.path("prospero.ini")], stdin=True)
+    c.stdin.write(json.dumps({"cmd": "open", "id": 1, "sid": sid, "from": 0}) + "\n")
+    c.stdin.flush()
+    ok = [False]
+
+    def read():
+        for line in c.stdout:
+            if '"ev":"reply"' in line and json.loads(line).get("id") == 1:
+                ok[0] = json.loads(line).get("ok") == 1
+                break
+    r = threading.Thread(target=read, daemon=True)
+    r.start()
+    r.join(30)
+    c.stdin.close()  # the link ends, and the host runs on
+    try:
+        c.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        c.kill()  # the test's own child
+        c.wait()
+    print(f"the host opened {sid}: {ok[0]}", flush=True)
+    return ok[0]
+
+
+def crashed(args):
+    """A window's process killed with SIGKILL leaves its state
+    directory's window lock free: another window then takes it, and
+    keeps it. POSIX only, here."""
+    import fcntl
+    problems = []
+    prospero = os.path.abspath(args.prospero)
+    root = tempfile.mkdtemp(prefix="prospero-crash-")
+    state = os.path.join(root, "state")
+    lock = os.path.join(state, "run", "gui.lock")
+
+    def held():
+        try:
+            fd = os.open(lock, os.O_RDONLY)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)  # and with it the shared lock, if taken
+
+    def start():
+        cmd = [prospero, "gui", "--fake", "--statedir", state]
+        if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
+                and not os.environ.get("WAYLAND_DISPLAY"):
+            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
+        env = dict(os.environ, SDL_WINDOW_ACTIVATE_WHEN_SHOWN="0")
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+
+    def stop(p, sig):
+        pid = guipid(prospero, state)
+        if pid:
+            P.signal_ours(pid, sig, lambda q: ours(q, state), "GUI")
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            problems.append(f"still running 10 s after {sig.name}")
+            P.signal_group(p, signal.SIGKILL)
+            p.wait()
+
+    p = start()
+    if not waitfor(held, 30, 0.2):
+        problems.append("crash: the window never took the lock")
+    stop(p, signal.SIGKILL)
+    if held():
+        problems.append("crash: the lock is still held after SIGKILL")
+    else:
+        print("crash: the lock is free after SIGKILL", flush=True)
+    p = start()
+    if not waitfor(held, 30, 0.2) or p.poll() is not None:
+        problems.append("crash: a new window did not take the lock")
+    else:
+        time.sleep(2)
+        if p.poll() is not None:
+            problems.append(f"crash: the new window exited ({p.returncode})")
+        else:
+            print("crash: a new window took the lock", flush=True)
+    stop(p, signal.SIGTERM)
+    shutil.rmtree(root, ignore_errors=True)
+    return problems
 
 
 def lanaddress(host):

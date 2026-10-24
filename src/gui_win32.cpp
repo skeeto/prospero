@@ -96,6 +96,7 @@ extern "C" int       w32gui_save(void *, unsigned short const *title,
                                  void (*done)(void *ctx, unsigned short const *path),
                                  void const *ctx, int ctxlen);
 extern "C" int       w32gui_reveal(unsigned short const *dir);
+extern "C" void      w32gui_letfront(unsigned long pid);  // AllowSetForegroundWindow
 
 
 #if PROSPERO_GUIEDGE
@@ -920,6 +921,11 @@ extern "C" void w32gui_raise(void *p)
     }
 }
 
+extern "C" void w32gui_letfront(unsigned long pid)
+{
+    AllowSetForegroundWindow(pid);
+}
+
 extern "C" int w32gui_systheme(void *p)
 {
     return systemdark((W32Gui *)p);
@@ -1249,6 +1255,13 @@ static void os_guiinject(Os *os, GuiEvent *e)
 static void os_guiraise(Os *os)
 {
     w32gui_raise(os->gui);
+}
+
+static void os_guitoken(Os *, Str) {}
+
+static void os_guiletfront(Os *, i64 pid)
+{
+    w32gui_letfront((unsigned long)pid);
 }
 
 static b32 os_guitheme(Os *os, b32 dark)
