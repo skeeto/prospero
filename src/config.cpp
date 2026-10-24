@@ -306,7 +306,8 @@ static CfgKey cfgschema[] = {
      "Anthropic: how much the model thinks and writes, by default its own "
      "default"},
     {"model", "vision", CFG_BOOL, "true", {}, {}, "model",
-     "Whether the model takes images, as the desktop tool's screenshots"},
+     "Whether the model takes images: the desktop tool's screenshots and "
+     "image files read"},
     {"model", "coordinates", CFG_ENUM, "pixels", {}, "pixels norm1000", "model",
      "How the model gives points in a screenshot: pixels of the image it "
      "was sent, or norm1000, thousandths of its width and height (Qwen-VL, "
@@ -425,12 +426,12 @@ static CfgKey cfgschema[] = {
     {"desktop", "ask_timeout", CFG_SECONDS, "60", {}, {}, "desktop",
      "Seconds to wait for an answer to a desktop action, then deny"},
     {"desktop", "images", CFG_INT, "3", {}, {}, "desktop",
-     "Screenshots kept in the conversation, the latest; older ones are "
-     "left out of requests"},
+     "Screenshots and image files read kept in the conversation, the "
+     "latest; older ones are left out of requests"},
     {"desktop", "images_slack", CFG_INT, "4", {}, {}, "desktop",
-     "Screenshots kept beyond images before older ones are left out, all "
-     "at once, back to images: the prompt cache then hits between those "
-     "steps; 0 leaves one out at each new screenshot"},
+     "Images kept beyond images before older ones are left out, all at "
+     "once, back to images: the prompt cache then hits between those "
+     "steps; 0 leaves one out at each new image"},
 
     {"ui", "theme", CFG_ENUM, "system", {}, "system dark light", "ui",
      "Colors: dark, light, or system to follow the operating system"},

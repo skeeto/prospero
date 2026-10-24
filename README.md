@@ -223,6 +223,13 @@ The session keeps them, so they go back to the model on every request,
 show in the transcript and come with a fork, but not with an export.
 `[model] vision = false` turns them off for a model that has none.
 
+The agent can look at image files on its own, too: `read` shows a PNG,
+JPEG, GIF, WebP or BMP file to a model that takes images, as an image,
+scaled down to the model's limits as a screenshot is (below). Images
+read leave the conversation along with screenshots (`[desktop]
+images`), each replaced by a line that says to read the file again. A
+model with `vision = false` is told only the image's kind and size.
+
 The New session dialog's working directory may be picked with Browse,
 in the platform's folder dialog, for a directory on this computer. A
 leading `~` there (`~`, `~/src`, and `~\src` on Windows) is the home
@@ -575,7 +582,8 @@ text with others is refused before anything is typed.
 Screenshots go to the model as images, scaled down to its limits
 (`[model] image_edge` and `image_pixels`: by default 1568 pixels on a
 side and 1.15 megapixels for kind anthropic, else 1280 and 1 megapixel),
-and only the latest few stay in the conversation (`[desktop] images`).
+and only the latest few stay in the conversation, images read
+included (`[desktop] images`).
 Older ones leave in steps, `images_slack` at a time (by default 3, with
 up to 4 more before a step), each replaced by a line naming its call,
 so that the prompt cache keeps hitting between steps. A model gives points in pixels of the image it saw, or, with

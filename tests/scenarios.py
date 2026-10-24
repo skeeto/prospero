@@ -8080,6 +8080,78 @@ def desktop_images(t):
             "the results unchanged")
 
 
+READIMG = "[desktop]\nimages = 1\nimages_slack = 0\n[model {model}]\nimage_edge = 64\n"
+
+
+def readimages(t):
+    """The work directory's images for read_image, and a text file."""
+    t.host.write(t.host.join(t.work, "red.png"), tinypng())
+    t.host.write(t.host.join(t.work, "four.gif"), GIF)
+    t.host.write(t.host.join(t.work, "wide.bmp"),
+                 rgbbmp(200, 100, lambda x, y: (x, y, 7)))
+    t.host.write(t.host.join(t.work, "notes.txt"), "plain\n")
+
+
+@scenario(conf={"_extra": READIMG}, bound=20)
+def read_image(t):
+    """read shows an image file to a model that takes images: as a PNG,
+    scaled to the model's limits, sent as a screenshot is and left out
+    as screenshots are ([desktop] images), with a short text naming the
+    call in its place; text files read as they always have."""
+    readimages(t)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    texts = [e["text"] for e in ends]
+    t.check(texts[:3] == ["red.png: a PNG image, 1x1 pixels, shown to you as it is.",
+                          "four.gif: a GIF image, 6x4 pixels, shown to you as it is.",
+                          "wide.bmp: a BMP image, 200x100 pixels, shown to you scaled "
+                          "down to 64x32."], f"results {texts}")
+    t.check("plain" in texts[3] and "image" not in ends[3], f"text {ends[3]}")
+    t.check([(e.get("width"), e.get("height")) for e in ends[:3]] ==
+            [(1, 1), (6, 4), (64, 32)] and all("shot" not in e for e in ends), f"ends {ends}")
+    tools = t.requests()[0]["body"]["tools"]
+    desc = [x["function"]["description"] for x in tools if x["function"]["name"] == "read"][0]
+    t.check("shown to you as an image" in desc, f"read says so: {desc}")
+
+    # Each image in the request after its read, then only the latest
+    reqs = [q["body"] for q in t.requests()]
+    first = fake_provider.desk_images(reqs[1])
+    t.check(len(first) == 1 and first[0][0].startswith("The image read by tool call ") and
+            first[0][1].startswith("data:image/png;base64,"), f"sent {first}")
+    gif = base64.b64decode(fake_provider.desk_images(reqs[2])[-1][1].split(",", 1)[1])
+    t.check(pngpixels(gif) == (6, 4, [bytes(c for x in range(6) for c in GIFPAL[(x + y) % 4])
+                                      for y in range(4)]), "the GIF's pixels")
+    last = reqs[-1]
+    imgs = fake_provider.desk_images(last)
+    calls = [m["tool_call_id"] for m in last["messages"] if m["role"] == "tool"]
+    t.check(len(imgs) == 1 and calls[2] in imgs[0][0], f"the latest alone {imgs}")
+    t.check(pngdims(base64.b64decode(imgs[0][1].split(",", 1)[1])) == (64, 32), "scaled")
+    alts = [p["text"] for m in last["messages"]
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for p in m["content"] if p["type"] == "text" and p["text"].startswith("[image")]
+    t.check(alts == [f"[image omitted: {c}; read the file again to see it]" for c in calls[:2]],
+            f"the others stand in: {alts}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nvision = false\n"}, bound=15)
+def read_image_blind(t):
+    """A model with vision off is told what an image file is, not shown
+    it, and read's description does not offer images."""
+    readimages(t)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "ok" and "image" not in end and
+            end["text"].startswith("red.png: a PNG image, 1x1 pixels. This model takes no "
+                                   "images"), f"told {end}")
+    reqs = [q["body"] for q in t.requests()]
+    t.check(not fake_provider.desk_images(reqs[-1]), "no image sent")
+    desc = [x["function"]["description"] for x in reqs[0]["tools"]
+            if x["function"]["name"] == "read"][0]
+    t.check("image" not in desc, f"read's description: {desc}")
+
+
 def desk_alts(req):
     """The texts in place of screenshots left out, in order."""
     return [p["text"] for m in req["messages"]

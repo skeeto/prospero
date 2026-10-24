@@ -66,4 +66,6 @@ cancels it.
 
 - A folder dropped on the window opens the New session dialog with it.
 - An image file dropped on the window is attached to the draft (PNG,
-  JPEG, GIF, WebP or BMP, at most ten to a message).
+  JPEG, GIF, WebP or BMP, at most ten to a message). The agent can also
+  look at image files itself: `read` shows them to a model that takes
+  images.

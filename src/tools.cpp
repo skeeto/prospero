@@ -110,6 +110,7 @@ struct ToolEnv {
     Str roleenum;    // their names, as a JSON schema's enum member
     i32 edit;        // EDIT_*: the edit tool's format (edit.cpp)
     i32 coords;      // COORDS_*: how the desktop tool takes points
+    b32 vision;      // the model takes images, which read then shows
 };
 
 static i32 toolfind(Str name)
@@ -621,6 +622,14 @@ static Str tooljson(Arena *a, ToolEnv *te)
     static_assert(countof(editdefs) == EDIT_COUNT);
     if (te->edit>=0 && te->edit<EDIT_COUNT) {
         defs[TOOL_EDIT] = editdefs[te->edit];
+    }
+    if (te->vision) {
+        defs[TOOL_READ].desc =
+            "Read a text file in the working directory, showing each line "
+            "with its number and a tab. Long files are shown 2000 lines at "
+            "a time; use offset to continue. A directory lists its entries. "
+            "An image (PNG, JPEG, GIF, WebP or BMP) is shown to you as an "
+            "image, scaled down if it is large.";
     }
 
     putarray(&w);

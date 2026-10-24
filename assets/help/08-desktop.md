@@ -58,6 +58,6 @@ the same commands on its command line (`prospero-desktop -h`).
 A session on a remote host uses the helper deployed beside its engine
 there.
 
-Only the latest few screenshots stay in the conversation (`[desktop]
-images`, 3 by default). A model that takes no images is marked
+Only the latest few screenshots, and image files the agent read, stay
+in the conversation (`[desktop] images`, 3 by default). A model that takes no images is marked
 `vision = false` in its `[model]` section.

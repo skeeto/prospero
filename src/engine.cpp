@@ -541,9 +541,9 @@ struct Session {
     i64          callstart;
     Str          callfail;   // why the current call failed, for tool.end
     Str          callfix;    // what was forgiven in its edit (editrepair)
-    Str          callimage;  // its screenshot, relative to dir, and its
-    i32          callimgw;   // size, and the screenshot's geometry
-    i32          callimgh;   // (deskshotstr), for tool.end
+    Str          callimage;  // its screenshot or image read, relative
+    i32          callimgw;   // to dir, and its size, and a screenshot's
+    i32          callimgh;   // geometry (deskshotstr), for tool.end
     Str          callshot;
     DeskRun      desk;       // the desktop helper
     Proc        *proc;
@@ -2690,7 +2690,9 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
         putstrkey(&w.json, "image", s->callimage);
         putintkey(&w.json, "width", s->callimgw);
         putintkey(&w.json, "height", s->callimgh);
-        putstrkey(&w.json, "shot", s->callshot);
+        if (s->callshot.len) {
+            putstrkey(&w.json, "shot", s->callshot);  // a screenshot's
+        }
     }
     putintkey(&w.json, "ms", (os_ticks(e->os) - s->callstart)/MS);
     ssend(s, &w);
@@ -2704,6 +2706,7 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     m.image  = s->callimage;
     m.imgw   = s->callimgw;
     m.imgh   = s->callimgh;
+    m.imgread = s->callimage.len && !s->callshot.len;
     addmsg(s, m);
     s->callimage = {};
     s->callshot  = {};
@@ -3468,6 +3471,8 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
     toolend(s, scratch, "ok", plan.text, 0, 0, {}, 0);
 }
 
+static b32 readimage(Session *, Arena, Str);
+
 // A path tool on a path the guard allowed, or the user did. Returns 1
 // if the call finished, 0 if it goes on (a search).
 static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
@@ -3498,6 +3503,8 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     }
     if (tool==TOOL_WRITE || tool==TOOL_EDIT) {
         pre = snapbefore(s, scratch, path);
+    } else if (tool==TOOL_READ && readimage(s, scratch, path)) {
+        return 1;
     }
     switch (tool) {
     case TOOL_READ:  o = toolread(e->os, &scratch, ncwd, path, args, hl); break;
@@ -4925,15 +4932,18 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
         Msg m = s->history[i];
         if (m.image.len) {
             m.floor = n==d.read ? FLOOR_READ : n==d.write ? FLOOR_WRITE : FLOOR_NONE;
+            Str what = m.imgread ? Str("image") : Str("screenshot");
             if (n++ < d.drop) {
-                m.imgalt = concat(a, concat(a, "[screenshot omitted: ", m.callid), "]");
+                Str why  = m.imgread ? Str("; read the file again to see it]") : Str("]");
+                m.imgalt = concat(a, concat(a, concat(a, "[", what), " omitted: "),
+                                  concat(a, m.callid, why));
             } else {
                 Read rd = os_read(e->os, a, join(a, s->dir, m.image), DESK_REPLYMAX);
                 if (rd.err == READ_OK) {
                     m.imgb64 = base64(a, rd.data);
                 } else {
-                    m.imgalt = concat(a, concat(a, "[screenshot lost: ", m.callid),
-                                      ", its file could not be read]");
+                    m.imgalt = concat(a, concat(a, concat(a, "[", what), " lost: "),
+                                      concat(a, m.callid, ", its file could not be read]"));
                 }
             }
         }
@@ -7325,6 +7335,7 @@ static void buildprefix(Session *s, Arena scratch)
     s->te.shell     = sh.shell;
     s->te.shellkind = sh.shellkind;
     s->te.coords    = s->mc.coords;
+    s->te.vision    = !s->mc.novision;
     if (tooloffered(&s->te, TOOL_TASK)) {
         taskroles(e, &s->perm, scratch, &s->te);
     }
@@ -9374,6 +9385,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             m.image  = clone(&s->perm, jsonstr(jsonget(j, "image")));
             m.imgw   = (i32)jsonint(jsonget(j, "width"), 0);
             m.imgh   = (i32)jsonint(jsonget(j, "height"), 0);
+            m.imgread = m.image.len && !jsonstr(jsonget(j, "shot")).len;
             if (m.image.len) {
                 // Points refer to the latest screenshot, as they did
                 DeskShot sh = deskshotparse(&s->perm, jsonstr(jsonget(j, "shot")));
@@ -10662,9 +10674,10 @@ struct Converted {
     Str err;
 };
 
-// An image as a PNG that fits the APIs: decoded, within ATTACH_EDGE on
-// each side, then smaller until its base64 is within ATTACH_BYTES.
-static Converted topng(Os *os, Arena *a, Str data, b32 big)
+// An image as a PNG that fits the APIs: decoded, within edge pixels on
+// each side and pixels in all, then smaller until its base64 is within
+// ATTACH_BYTES.
+static Converted topng(Os *os, Arena *a, Str data, b32 big, i64 edge, i64 pixels)
 {
     Converted r   = {};
     // The pixels and the decoder's work buffer (image.cpp), then the
@@ -10684,8 +10697,11 @@ static Converted topng(Os *os, Arena *a, Str data, b32 big)
     }
     i32 w    = p.width;
     i32 h    = p.height;
-    i32 edge = w>h ? w : h;
-    f64 s    = edge>ATTACH_EDGE ? (f64)ATTACH_EDGE/edge : 1;
+    i32 most = w>h ? w : h;
+    f64 s    = most>edge ? (f64)edge/most : 1;
+    while ((f64)w*s*h*s > (f64)pixels) {
+        s *= 0.97;
+    }
     for (i32 tries = 0; tries<8 && !r.png.data; tries++, s *= 0.75) {
         Arena t  = mem;
         i32   tw = (i32)(w*s);
@@ -10736,7 +10752,7 @@ static Attached attachstaged(Engine *e, Arena *a, Str sid, Str path)
     b32 big  = base64len(data.len)>ATTACH_BYTES || k.w>ATTACH_EDGE || k.h>ATTACH_EDGE;
     b32 kept = k.kind==IMAGE_PNG || k.kind==IMAGE_JPEG;  // as the APIs take them
     if (big || !kept) {
-        Converted z = topng(os, a, data, big);
+        Converted z = topng(os, a, data, big, ATTACH_EDGE, ATTACH_PIXELS);
         if (!z.png.data) {
             r.err = z.err;
             return r;
@@ -10771,6 +10787,88 @@ static Attached attachstaged(Engine *e, Arena *a, Str sid, Str path)
     r.img.w    = k.w;
     r.img.h    = k.h;
     return r;
+}
+
+// read on an image, a file that begins as one does: for a model that
+// takes images, the image itself, shrunk to the model's limits
+// (desklimits) as a PNG, kept among the session's output files and
+// sent as a screenshot is (callimage), so that it leaves requests with
+// them ([desktop] images, deskdrop); for one that takes none, what it
+// is. Returns 0 if the file is not an image, for read to show as text.
+static b32 readimage(Session *s, Arena scratch, Str path)
+{
+    Engine *e    = s->e;
+    Read    head = os_readat(e->os, &scratch, path, 0, 16);
+    if (head.err!=READ_OK || !imagesniff(head.data)) {
+        return 0;
+    }
+    Read rd = os_read(e->os, &scratch, path, (iz)FILE_MAX);
+    if (rd.err != READ_OK) {
+        return 0;  // read says why
+    }
+    ImageKind k = imagekind(scratch, rd.data);
+    Buf       b(&scratch, 512);
+    print(&b, showpath(s->guard.cwd, path));
+    print(&b, ": a ");
+    print(&b, k.name);
+    print(&b, " image");
+    if (k.w<1 || k.h<1) {
+        print(&b, ", damaged: its size cannot be read: ");
+        print(&b, k.err);
+        putbyte(&b, '.');
+        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+        return 1;
+    }
+    print(&b, ", ");
+    print(&b, (i64)k.w);
+    putbyte(&b, 'x');
+    print(&b, (i64)k.h);
+    print(&b, " pixels");
+    if (s->mc.novision) {
+        print(&b, ". This model takes no images, so it is not shown. The "
+                  "shell can tell more about it.");
+        toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
+        return 1;
+    }
+
+    // As it is if it fits, else converted
+    DeskLimits l    = desklimits(s);
+    Str        png  = rd.data;
+    b32        big  = k.w>l.edge || k.h>l.edge || (i64)k.w*k.h>l.pixels;
+    if (big || k.kind!=IMAGE_PNG || base64len(png.len)>ATTACH_BYTES) {
+        Converted z = topng(e->os, &scratch, rd.data, big, l.edge, l.pixels);
+        if (!z.png.data) {
+            print(&b, ". It cannot be shown: ");
+            print(&b, z.err);
+            putbyte(&b, '.');
+            toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+            return 1;
+        }
+        png = z.png;
+    }
+    ImageKind p   = imagekind(scratch, png);
+    Str       rel = {};
+    Str       out = spillfile(s, scratch, s->calls[s->callidx].id, &rel, ".png");
+    if (!os_write(e->os, scratch, out, png)) {
+        print(&b, ". It could not be saved to show you: ");
+        print(&b, os_lasterr(e->os, &scratch));
+        toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+        return 1;
+    }
+    if (p.w==k.w && p.h==k.h) {
+        print(&b, ", shown to you as it is.");
+    } else {
+        print(&b, ", shown to you scaled down to ");
+        print(&b, (i64)p.w);
+        putbyte(&b, 'x');
+        print(&b, (i64)p.h);
+        putbyte(&b, '.');
+    }
+    s->callimage = rel;
+    s->callimgw  = p.w;
+    s->callimgh  = p.h;
+    toolend(s, scratch, "ok", finish(&b), 0, 0, {}, 0);
+    return 1;
 }
 
 struct Attaching {

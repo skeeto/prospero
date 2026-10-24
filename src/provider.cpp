@@ -1,12 +1,12 @@
 // Providers: URLs, the canonical transcript, OpenAI Chat Completions,
 // error classification, and llama.cpp router discovery
 //
-// A tool result may carry a screenshot (the desktop tool's), which goes
-// back to the model as an image: Chat Completions takes images only in
-// user messages, so a run of tool results is followed by one with their
-// screenshots, and Anthropic's tool results hold them as image blocks.
-// A screenshot left out has a short text in its place, so that the
-// request keeps its shape.
+// A tool result may carry an image, the desktop tool's screenshot or an
+// image file read, which goes back to the model as one: Chat Completions
+// takes images only in user messages, so a run of tool results is
+// followed by one with their images, and Anthropic's tool results hold
+// them as image blocks. An image left out has a short text in its
+// place, so that the request keeps its shape.
 //
 // The transcript is append-only: an assistant message keeps the blocks
 // the model produced (reasoning with any signature, text, tool calls
@@ -220,9 +220,10 @@ struct Msg {
                           // the session's directory, if one was kept
     b32          error;   // tool messages: the call failed or was refused
     i64          seq;     // of the record it came from, 0 if none
-    Str          image;   // tool messages: a screenshot (PNG), relative
-    i32          imgw;    // to the session's directory, and its size
-    i32          imgh;
+    Str          image;   // tool messages: a screenshot or an image
+    i32          imgw;    // read (PNG), relative to the session's
+    i32          imgh;    // directory, and its size
+    b32          imgread;  // an image read, not a screenshot
     Str          imgb64;  // in a request's history: the screenshot as
                           // base64, or null where it is left out,
     Str          imgalt;  // with this text in its place
@@ -589,8 +590,9 @@ static void encodeimages(JsonOut *w, Arena tmp, Slice<Msg> h, iz beg, iz end)
         Arena t = tmp;
         putobject(w);
         putstrkey(w, "type", "text");
-        putstrkey(w, "text", concat(&t, concat(&t, "The screenshot of tool call ",
-                                                m->callid), ":"));
+        Str what = m->imgread ? Str("The image read by tool call ")
+                              : Str("The screenshot of tool call ");
+        putstrkey(w, "text", concat(&t, concat(&t, what, m->callid), ":"));
         putend(w);
         putobject(w);
         putstrkey(w, "type", "image_url");

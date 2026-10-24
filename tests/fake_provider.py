@@ -2005,6 +2005,23 @@ def sc_desktop_images(model, n, req):
         yield from answer(model, "Saw them.")
 
 
+def sc_read_image(model, n, req):
+    # Each image in turn, then text, which read shows as it always has
+    files = ["red.png", "four.gif", "wide.bmp", "notes.txt"]
+    k = step(req)
+    if k < len(files):
+        yield from tool(model, n, "read", {"path": files[k]})
+    else:
+        yield from answer(model, "Looked.")
+
+
+def sc_read_image_blind(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "read", {"path": "red.png"})
+    else:
+        yield from answer(model, "Read it.")
+
+
 def sc_desktop_cache(model, n, req):
     # Twelve screenshots, one a step: the cache's view of each request
     if step(req) < 12:
