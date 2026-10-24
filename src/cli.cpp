@@ -270,13 +270,15 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         print(&b, jsonstr(jsonget(j, "detail")));
         print(&b, "]\n");
         break;
-    case EV_MODE:
+    case EV_MODE: {
+        Str mode = jsonstr(jsonget(j, "mode"));
         prettyline(c);
-        print(&b, jsonstr(jsonget(j, "mode"))=="plan" ? Str("[plan mode on, by ")
-                                                      : Str("[plan mode off, by "));
+        print(&b, mode=="plan"   ? Str("[plan mode on, by ") :
+                  mode=="bypass" ? Str("[bypass mode on, nothing asked, by ") :
+                                   Str("[build mode, by "));
         print(&b, jsonstr(jsonget(j, "by")));
         print(&b, "]\n");
-        break;
+    } break;
     case EV_ANSWER: {
         prettyline(c);
         Str note = jsonstr(jsonget(j, "note"));

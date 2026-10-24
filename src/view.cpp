@@ -460,6 +460,7 @@ struct View {
     i64             turnts;     // epoch ms the running turn began
     i32             asks;       // pending asks
     b32             plan;       // plan mode
+    b32             bypass;     // Bypass mode: nothing asked but plans
     Str             planpath;   // the plan file, once in plan mode
     i32             planver;    // bumped as the plan file may change
 
@@ -1429,6 +1430,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
     case EV_MODE: {
         Str path = jsonstr(jsonget(j, "path"));
         v->plan     = jsonstr(jsonget(j, "mode")) == "plan";
+        v->bypass   = jsonstr(jsonget(j, "mode")) == "bypass";
         v->planpath = path==v->planpath ? v->planpath : clone(&v->aux, path);
         v->planver++;
     } return 1;

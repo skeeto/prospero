@@ -216,7 +216,7 @@ the next prompt), and its Withdraw button puts it back in the draft.
 
 Plan mode has the agent explore and write a plan before it changes
 anything: the New session dialog's Plan mode box, `/plan` (and `/plan
-off`) or the mode list below Send (Build or Plan) turns it on, and the agent may ask to
+off`) or the mode list below Send (Build, Plan or Bypass) turns it on, and the agent may ask to
 turn it on itself. While planning, its file tools may write only the
 session's plan file, `plan.md` in the session's directory, the desktop
 tool may only look, and subagents plan too. When it is done it asks for
@@ -232,6 +232,18 @@ the file in the editor at any time (while a plan waits, it is that
 plan's Edit plan; otherwise the agent is not told), and Reveal shows it
 in Finder, Explorer or the file manager; both only for a plan on this
 computer.
+
+Bypass mode, in red in the same mode list, is for an agent left to
+work alone somewhere it can do no harm: nothing is asked, attended or
+not, so its file tools read and write outside the working directory, a
+patch may change many files there, and the desktop tool acts, running
+programs too. Only the agent's own asks about plan mode remain, and
+writes under the state directory (but the plan file) are refused, as
+are paths that name nothing. Only you turn it on, from the list, never
+a new session, the agent or the configuration. It stays through
+reopening and restarts, subagents follow it, and asks waiting when it
+is picked are allowed; a fork or an import starts in Build, and an
+approved plan always goes to Build.
 
 Sessions may talk to each other: the agent lists the other sessions on
 its host, with how they relate to it (parent, child, sibling), and

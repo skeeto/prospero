@@ -1773,7 +1773,7 @@ static b32  menuitem(Gui *, Arena, Str label, Str why, char const *key);
 static void whytip(Str);
 static void itemnamed(Gui *, Str);
 static b32  planwaits(View *);
-static Str  planwhy(Gui *, GuiSession *, b32 plan);
+static Str  modewhy(Gui *, GuiSession *, Str mode);
 
 // The session's model, a combo of those configured to switch to (model)
 // while idle, and what the latest switch's reply noted.
@@ -1867,6 +1867,17 @@ static void drawsessbar(Gui *g)
         itemnamed(g, "plan chip");
         ImGui::SetItemTooltip("The agent changes nothing but its plan until you approve "
                               "it. Click to see the plan.");
+    } else if (v->bypass) {
+        // A warning that nothing is asked
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextUnformatted("Bypass");
+        ImGui::PopStyleColor();
+        itemnamed(g, "bypass chip");
+        ImGui::SetItemTooltip("Bypass mode: the agent reads and writes outside its working "
+                              "directory, and acts on the desktop, without asking you. "
+                              "Change it in the mode list by Send.");
     }
     if (right > rightof()) {
         ImGui::SameLine(right);
@@ -3082,12 +3093,15 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
         }
         return;
     case SLASH_PLAN: {
-        Str why = planwhy(g, s, !sl.off);
+        Str why = modewhy(g, s, sl.off ? Str("default") : Str("plan"));
+        if (!why.len && sl.off && s->view && !s->view->plan) {
+            why = "Plan mode is not on";
+        }
         if (why.len) {
             setnote(g, s, concat(&g->frame, "/plan: ", why), 1);
             return;
         }
-        guimode(g, s, !sl.off);
+        guimode(g, s, sl.off ? Str("default") : Str("plan"));
         sent = 1;
     } break;
     }
@@ -3507,27 +3521,54 @@ static void drawprompt(Gui *g)
                                    "or drop one on the window, or paste one"));
     }
     if (g->sess && hostcap(s->host, "plan") && !v->parent.len) {
-        // The session's mode, one of these, as wide as the buttons
-        static struct { Str name; b32 plan; Str tip; } const modes[] = {
-            {"Build", 0, "Build: the agent works on the task, changing files as "
-                         "it goes (/plan off)"},
-            {"Plan",  1, "Plan: the agent explores and writes a plan for you to "
-                         "approve before it changes anything (/plan)"},
+        // The session's mode, one of these, as wide as the buttons, and
+        // in red while nothing is asked (Bypass), which only the user
+        // picks here, trusted to know what it does
+        static struct { Str name; Str mode; Str tip; } const modes[] = {
+            {"Build",  "default", "Build: the agent works on the task, changing files as "
+                                  "it goes (/plan off)"},
+            {"Plan",   "plan",    "Plan: the agent explores and writes a plan for you to "
+                                  "approve before it changes anything (/plan)"},
+            {"Bypass", "bypass",  "Bypass: the agent reads, writes and acts anywhere, outside "
+                                  "its working directory and on the desktop, without asking "
+                                  "you. Only for an agent working alone somewhere it can do "
+                                  "no harm"},
         };
-        Str  why  = planwhy(g, s, !v->plan);
-        Str  name = v->plan ? Str("Plan") : Str("Build");
+        iz  cur  = v->bypass ? 2 : v->plan ? 1 : 0;
+        iz  n    = hostcap(s->host, "bypass") ? 3 : 2;
+        Str why  = {};  // why no other mode can be picked, if none can
+        b32 any  = 0;
+        for (iz i = 0; i < n; i++) {
+            Str off = i==cur ? Str{} : modewhy(g, s, modes[i].mode);
+            any |= i!=cur && !off.len;
+            why  = why.len || i==cur ? why : off;
+        }
+        why = any ? Str{} : why;
         ImGui::BeginDisabled(why.len > 0);
         ImGui::SetNextItemWidth(bw);
-        b32 open = ImGui::BeginCombo("##mode", cstr0(&a, name));
+        if (cur == 2) {
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        }
+        g->modetext = ImGui::GetColorU32(ImGuiCol_Text);  // for CHK_BYPASS
+        b32 open = ImGui::BeginCombo("##mode", cstr0(&a, modes[cur].name));
+        if (cur == 2) {
+            ImGui::PopStyleColor();
+        }
         itemnamed(g, "session mode");
-        whytip(why.len ? why : modes[v->plan ? 1 : 0].tip);
+        whytip(why.len ? why : modes[cur].tip);
         if (open) {
-            for (iz i = 0; i < countof(modes); i++) {
-                b32 on  = modes[i].plan == v->plan;
-                Str off = on ? Str{} : planwhy(g, s, modes[i].plan);
+            for (iz i = 0; i < n; i++) {
+                b32 on  = i == cur;
+                Str off = on ? Str{} : modewhy(g, s, modes[i].mode);
                 ImGui::BeginDisabled(off.len > 0);
+                if (i == 2) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+                }
                 if (ImGui::Selectable(cstr0(&a, modes[i].name), on) && !on) {
-                    guimode(g, s, modes[i].plan);
+                    guimode(g, s, modes[i].mode);
+                }
+                if (i == 2) {
+                    ImGui::PopStyleColor();
                 }
                 ImGui::EndDisabled();
                 itemnamed(g, concat(&a, Str("session mode "), modes[i].name));
@@ -3827,13 +3868,16 @@ static b32 planwaits(View *v)
     return 0;
 }
 
-// Why plan mode cannot be turned on (or off) now, or empty: as the
-// engine's mode command has it, idle or while an ask waits, but not
-// one about plan mode itself.
-static Str planwhy(Gui *g, GuiSession *s, b32 plan)
+// Why the session cannot change to mode ("plan", "bypass" or "default")
+// now, or empty: as the engine's mode command has it, into or out of
+// plan mode idle or while an ask waits, between Build and Bypass at any
+// time, but never while the agent asks about plan mode itself.
+static Str modewhy(Gui *g, GuiSession *s, Str mode)
 {
-    View *v   = s->view;
-    Str   why = sesswhy(g, s, "plan", !v || !v->asks, 1);
+    View *v    = s->view;
+    b32   plan = mode=="plan" || !v || v->plan;
+    Str   cap  = mode=="bypass" ? Str("bypass") : Str("plan");
+    Str   why  = sesswhy(g, s, cap, plan && (!v || !v->asks), 1);
     if (why.len || !v) {
         return why;
     }
@@ -3846,9 +3890,6 @@ static Str planwhy(Gui *g, GuiSession *s, b32 plan)
             }
             break;
         }
-    }
-    if (!plan && !v->plan) {
-        return "Plan mode is not on";
     }
     return {};
 }

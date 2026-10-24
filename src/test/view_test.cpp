@@ -390,6 +390,13 @@ static void test_view(Test *t)
                     R"("path":"/s/plan.md"})");
         expect(t, "view.modeoff", concat(&a, istr(&a, v->plan), concat(&a, " ", v->planpath)),
                "0 /s/plan.md");
+        // Bypass mode, then Build again
+        apply(v, a, R"({"sid":"s","seq":9,"ts":0,"ev":"mode","mode":"bypass","by":"user",)"
+                    R"("path":"/s/plan.md"})");
+        expect(t, "view.bypass", concat(&a, istr(&a, v->plan), istr(&a, v->bypass)), "01");
+        apply(v, a, R"({"sid":"s","seq":10,"ts":0,"ev":"mode","mode":"default","by":"user",)"
+                    R"("path":"/s/plan.md"})");
+        expect(t, "view.bypassoff", concat(&a, istr(&a, v->plan), istr(&a, v->bypass)), "00");
     }
 
     // A desktop ask offers its class for good, and one for run offers

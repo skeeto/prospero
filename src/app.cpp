@@ -1188,6 +1188,7 @@ struct Gui {
     Rect               rects[RECT_COUNT];
     Named              named[NAMED_MAX];
     i32                nnamed;
+    u32                modetext;     // the mode list's label colour, as drawn
     u8                 sidedump[SIDEDUMP_MAX];  // the sidebar's tree, drawn last
     iz                 sidelen;
     ImGuiID            dockspace;
@@ -2338,14 +2339,15 @@ static void guimodel(Gui *g, GuiSession *s, Str model)
     cmdsend(g, &w, a);
 }
 
-// Plan mode on or off: the agent hears of it at its next request.
-static void guimode(Gui *g, GuiSession *s, b32 plan)
+// The session's mode, "plan", "bypass" or "default" (Build): the agent
+// hears of it at its next request.
+static void guimode(Gui *g, GuiSession *s, Str mode)
 {
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 128);
     EvOut w = cmdopen(g, &b, CMD_MODE, s);
     putkey(&w.json, "mode");
-    putstr(&w.json, plan ? Str("plan") : Str("default"));
+    putstr(&w.json, mode);
     s->cmdid   = g->nextid;
     s->cmdtext = {};
     s->note    = {};
@@ -3128,11 +3130,13 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
         setnote(g, s, finish(&b), 0);
         guilist(g, h);
     } break;
-    case CMD_MODE:
-        setnote(g, s, jsonstr(jsonget(j, "mode"))=="plan"
-                      ? Str("plan mode: the agent changes nothing but its plan")
-                      : Str("plan mode is off"), 0);
-        break;
+    case CMD_MODE: {
+        Str mode = jsonstr(jsonget(j, "mode"));
+        setnote(g, s, mode=="plan"   ? Str("plan mode: the agent changes nothing but its plan") :
+                      mode=="bypass" ? Str("Bypass mode: the agent asks nothing, inside or "
+                                           "outside its directory") :
+                                       Str("build mode: plan mode and Bypass are off"), 0);
+    } break;
     case CMD_FORK: {
         // {ok, sid:<new>, from, turn, next?}
         Str sid = jsonstr(jsonget(j, "sid"));
@@ -7525,6 +7529,7 @@ enum : i32 {
     CHK_PLANPLAIN,    // the plan is out in the editor, no plan waiting
     CHK_PLANQUIET,    // the session is idle, asking nothing
     CHK_PLANREVISED,  // the agent heard the plan approved was revised by hand
+    CHK_BYPASS,       // dx 1: the session shown is in Bypass, chip and label red; 0 not
     CHK_COUNT,
 };
 
@@ -7712,6 +7717,7 @@ static Str chknames[] = {
     "the plan is open in the editor, with no plan waiting",
     "the session is idle and asks nothing: the agent was not told",
     "the agent heard that the plan it carries out was revised by hand",
+    "Bypass mode is on or off as it should be, in red when on",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9720,7 +9726,9 @@ static DriveOp remoteops[] = {
 // the model free to change while it waits; revised by hand from the
 // Plan window; approved, plan mode off and the plan carried out, the
 // agent told of the revision; edited by hand once more, the agent not
-// told; then the toggle by Send, and /plan off.
+// told; then the toggle by Send, and /plan off;
+// then Bypass from the list, shown in red, and from it Plan again,
+// whose approval is Build.
 static DriveOp planops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -9865,8 +9873,45 @@ static DriveOp planops[] = {
     {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
     {OP_WAIT, W_NOTE, 0, 0, 5000, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
-    {OP_CHECK, CHK_NOTE, 0, 0, 0, "plan mode is off"},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "build mode:"},
     {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_BYPASS, 0, 0, 0, ""},
+    // Bypass from the list, in red, then Plan, whose approval is Build
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-7-modes"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode Bypass"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NOTE, 0, 0, 5000, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 5000, "bypass chip"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "Bypass mode:"},
+    {OP_CHECK, CHK_BYPASS, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-8-bypass"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode Plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_NOTE, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
+    {OP_CHECK, CHK_BYPASS, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 200, "Make inside.txt again."},
+    {OP_WAIT, W_ASK, 0, 0, 30000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANASK, 0, 0, 0, ""},
+    {OP_MOVE, T_ALLOW, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 15000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_BYPASS, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-9-build"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -12138,6 +12183,16 @@ static b32 drivecheck(Gui *g, i32 chk)
                drivequiet(g, "2 s after a key's release was lost", 2);
     case CHK_PLANMODE:
         return g->sess && v->plan==(b32)g->ops[g->drivepc-1].dx;
+    case CHK_BYPASS: {
+        // In Bypass, its chip drawn and the mode list's label in red
+        b32 want = (b32)g->ops[g->drivepc-1].dx;
+        b32 chip = 0;
+        for (i32 i = 0; i < g->nnamed; i++) {
+            chip |= Str{g->named[i].name, g->named[i].len} == "bypass chip";
+        }
+        b32 red = (g->modetext & 0xffffff) == (g->pal->bad & 0xffffff);
+        return g->sess && v->bypass==want && red==want && (chip || !want);
+    }
     case CHK_PLANASK: {
         ViewMsg *m = lastmsg(g, VIEW_ASK);
         return m && m->tool->answer==VASK_PENDING && m->tool->kind=="plan" &&

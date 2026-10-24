@@ -49,7 +49,8 @@ mode from the new session dialog, its agent refused a change, then
 asking to approve its plan: kept planning with a note, revised by hand
 with Edit plan ([ui] editor a test script, here only), then approved;
 the Plan window shows each plan, and the toggle by Send and /plan off
-turn plan mode on and off.
+turn plan mode on and off; then Bypass from the list, in red, and Plan
+from there, whose approval lands in Build.
 
 On Linux without a display it runs under xvfb-run. --serve only runs the
 provider and writes the configuration, for a GUI started elsewhere (a
