@@ -161,6 +161,7 @@ enum : u32 {
     TASK_RAISE,         // a launch handed off to this window: its token (door.cpp)
     TASK_OPENED,        // an open dialog's path (id its ask), empty if cancelled
     TASK_ATTACH,        // the attach dialog's image path, likewise
+    TASK_BROWSED,       // the new session dialog's directory, likewise
 };
 
 // Item rectangles the scripted checklist aims at
@@ -956,6 +957,10 @@ struct Gui {
     char              *newmodel;
     Str                firstcwd;   // newcwd's first, a directory here
     Str                newerr;
+    u64                browseask;  // its Browse dialog's latest ask
+    GuiHost           *browsehost; // and the host it was for
+    i64                browsed;    // directories it answered, for the checklist
+    b32                browseoff;  // and it is off, the host remote
     b32                opennew;
     b32                newplan;    // in plan mode
     i64                newid;      // the new command in flight
@@ -2940,6 +2945,29 @@ static void attachpick(Gui *g, GuiSession *s)
     }
 }
 
+// Browse for the new session dialog's directory (TASK_BROWSED), on this
+// machine, in the platform's folder dialog, starting in the directory
+// typed, if it is one. The checklist's answer is the state directory,
+// without asking.
+static void browsestart(Gui *g, GuiHost *h)
+{
+    Arena a = g->frame;
+    g->browseask++;
+    g->browsehost = h;
+    g->newerr     = {};
+    if (g->drive) {
+        mailpost(g->tasks, TASK_BROWSED, g->browseask, g->statedir, 1);
+        return;
+    }
+    Str at = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
+    at = expandhome(&a, at, userhome(g->os, &a), HOST_WINDOWS);
+    at = at.len && os_stat(g->os, a, at).type==STAT_DIR ? at : Str{};
+    if (!os_guiopendir(g->os, a, "Choose the working directory", at, g->tasks,
+                       TASK_BROWSED, g->browseask)) {
+        g->newerr = "cannot ask for a directory here";
+    }
+}
+
 // A dropped file, attached to the draft shown.
 static void gui_drop(Gui *g, Str path)
 {
@@ -4891,6 +4919,8 @@ static void updatestatus(Gui *g, GuiHost *h, b32 idle)
     scheddirty(&g->sched);
 }
 
+static void fieldput(char *, Str);
+
 // What another thread finished: a save or open dialog answered, a
 // deployment's progress and outcome, a launch that handed off to this
 // window.
@@ -4923,6 +4953,12 @@ static void ontask(Gui *g, Record r)
                 setnote(g, g->attsess, concat(&g->frame, "not attached: ", err), 1);
             }
             g->promptfocus = g->attsess == g->sess;
+        }
+        return;
+    case TASK_BROWSED:
+        if (r.id==g->browseask && r.data.len) {
+            fieldput(g->newcwd, homeshow(&g->frame, g->browsehost, r.data));
+            g->browsed++;
         }
         return;
     case TASK_DEPLOYED: {
@@ -7320,6 +7356,8 @@ enum : i32 {
     CHK_MSGSENDER,    // the link showed the sender, whose row links back
     CHK_ATTACHED,     // dx images attached to the draft, their thumbnails drawn
     CHK_USERIMAGES,   // the latest user message has dx images, drawn
+    CHK_BROWSED,      // Browse put its directory in the new session dialog
+    CHK_BROWSEOFF,    // Browse is off for a remote host's directory
     CHK_COUNT,
 };
 
@@ -7499,6 +7537,8 @@ static Str chknames[] = {
     "the link showed the subagent, its message row linking back",
     "the images attached show above the box",
     "the message shows the images sent with it",
+    "Browse put the directory chosen in the field",
+    "Browse is off for a directory on a remote host",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -7847,6 +7887,15 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    // Browse, its answer the state directory here (no dialog), puts
+    // that in the field; then the field again, typed over
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new browse"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_BROWSED, 0, 0, 0, ""},
+    {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
     {OP_TEXTCWD, 0, 0, 0, 300, ""},
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
@@ -9363,6 +9412,7 @@ static DriveOp remoteops[] = {
     {OP_MOVE, T_HOSTITEM, 0, 0, 100, "r"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_BROWSEOFF, 0, 0, 0, ""},
     {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
@@ -11856,6 +11906,13 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_PLANTEXT:
         return tabselected("Plan") && g->planshown>0 &&
                find(finish(&g->plan.text), g->ops[g->drivepc-1].text)>=0;
+    case CHK_BROWSED: {
+        Arena a     = g->frame;
+        Str   field = {(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)};
+        return g->browsed>0 && field==homeshow(&a, g->browsehost, g->statedir);
+    }
+    case CHK_BROWSEOFF:
+        return g->browseoff;
     case CHK_PLANMODEL:
         return g->sess && v->busy && planwaits(v) &&
                !sesswhy(g, g->sess, "model", !planwaits(v), 0).len;

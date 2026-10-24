@@ -203,6 +203,13 @@ The session keeps them, so they go back to the model on every request,
 show in the transcript and come with a fork, but not with an export.
 `[model] vision = false` turns them off for a model that has none.
 
+The New session dialog's working directory may be picked with Browse,
+in the platform's folder dialog, for a directory on this computer. A
+leading `~` there (`~`, `~/src`, and `~\src` on Windows) is the home
+directory of the host the session runs on, `HOME`, else `USERPROFILE`
+on Windows; `~user` is not supported. Paths in the home directory show
+as `~/...` in the sidebar and among the recent directories.
+
 A message sent while a turn runs waits above the prompt box until the
 agent takes it in at its next step (or, too late for this turn, runs as
 the next prompt), and its Withdraw button puts it back in the draft.

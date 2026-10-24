@@ -4948,12 +4948,27 @@ static void drawnew(Gui *g)
         ImGui::SameLine();
         ImGui::TextDisabled("on %s", cstr0(&a, host->name));
     }
-    ImGui::SetNextItemWidth(-1);
+    // Beside it, Browse, in the platform's dialog, for a directory here
+    char const *browse = "Browse\xe2\x80\xa6";
+    f32 bw = ImGui::CalcTextSize(browse).x + 2*ImGui::GetStyle().FramePadding.x;
+    ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
     if (ImGui::IsWindowAppearing()) {
         ImGui::SetKeyboardFocusHere();
     }
     ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, ImGuiInputTextFlags_AutoSelectAll);
     itemrect(g, RECT_NEWCWD);
+    ImGui::SameLine();
+    b32 remote = host->kind == GH_REMOTE;
+    g->browseoff = remote;
+    ImGui::BeginDisabled(remote);
+    if (ImGui::Button(browse)) {
+        browsestart(g, host);
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, "new browse");
+    whytip(remote ? concat(&a, "Only for a directory on this computer: this one is on ",
+                           host->name)
+                  : Str("Choose the directory in a dialog"));
 
     // Recent directories there, newest first
     Slice<GuiSession *> list   = sesslist(g, &a);

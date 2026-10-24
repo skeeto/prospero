@@ -101,6 +101,11 @@ extern "C" int       w32gui_save(void *, unsigned short const *title,
 extern "C" int       w32gui_openfile(void *, unsigned short const *title, int images,
                                      void (*done)(void *ctx, unsigned short const *path),
                                      void const *ctx, int ctxlen);
+// And for a directory, starting in at (empty for the dialog's own)
+extern "C" int       w32gui_opendir(void *, unsigned short const *title,
+                                    unsigned short const *at,
+                                    void (*done)(void *ctx, unsigned short const *path),
+                                    void const *ctx, int ctxlen);
 // The clipboard's data in a format (W32CLIP_*), copied to buf if it has
 // room: its size in bytes, or -1 if it holds none. A file is its path,
 // the first of those copied, null-terminated UTF-16.
@@ -119,6 +124,7 @@ extern "C" void      w32gui_letfront(unsigned long pid);  // AllowSetForegroundW
 #include <objbase.h>
 #include <shellapi.h>
 #include <shlobj.h>  // DROPFILES
+#include <shobjidl.h>  // IFileOpenDialog
 #include <dwmapi.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -1023,9 +1029,10 @@ extern "C" void w32gui_close(void *p)
 
 // The save dialog runs on a thread of its own, so that the window's
 // loop never waits on it: GetSaveFileNameW (GetOpenFileNameW for the
-// open dialog, which works the same way) is modal to the thread that
-// calls it, and an owner on another thread would tie the two threads'
-// input together. Its owner is a hidden window of that thread over the
+// open dialog, and IFileOpenDialog for a directory, which work the same
+// way) is modal to the thread that calls it, and an owner on another
+// thread would tie the two threads' input together. Its owner is a
+// hidden window of that thread over the
 // main window, which places it there. To be in front, a CBT hook on
 // that thread names the dialog as it activates to the GUI thread
 // (WM_APP_FRONT), which has the foreground to give it while the user
@@ -1039,6 +1046,7 @@ struct W32Save {
     HWND    msgwin;  // the GUI thread's hidden window
     int     open;    // an open dialog, not a save dialog
     int     images;  // and for an image
+    int     dir;     // or for a directory, starting in path
 };
 
 static thread_local HWND savemsgwin;  // the dialog's thread's W32Save's
@@ -1054,6 +1062,46 @@ static LRESULT CALLBACK savecbt(int code, WPARAM wp, LPARAM lp)
         }
     }
     return CallNextHookEx(0, code, wp, lp);
+}
+
+// The folder dialog, which GetOpenFileNameW cannot be: the shell's
+// IFileOpenDialog picking folders (Vista and later), starting in the
+// directory in s->path, where it puts the answer. Returns 0 if
+// cancelled, or if no dialog could be shown.
+static int pickdir(W32Save *s, HWND owner)
+{
+    IFileOpenDialog *d = 0;
+    if (FAILED(CoCreateInstance(__uuidof(FileOpenDialog), 0, CLSCTX_INPROC_SERVER,
+                                __uuidof(IFileOpenDialog), (void **)&d))) {
+        return 0;
+    }
+    FILEOPENDIALOGOPTIONS o = 0;
+    d->GetOptions(&o);
+    d->SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST |
+                  FOS_NOCHANGEDIR);
+    d->SetTitle(s->title);
+    for (wchar_t *c = s->path; *c; c++) {
+        *c = *c=='/' ? '\\' : *c;  // the shell parses only backslashes
+    }
+    IShellItem *at = 0;
+    if (s->path[0] && SUCCEEDED(SHCreateItemFromParsingName(s->path, 0, __uuidof(IShellItem),
+                                                            (void **)&at))) {
+        d->SetFolder(at);
+        at->Release();
+    }
+    int         ok = 0;
+    IShellItem *r  = 0;
+    if (SUCCEEDED(d->Show(owner)) && SUCCEEDED(d->GetResult(&r))) {
+        wchar_t *path = 0;
+        if (SUCCEEDED(r->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+            lstrcpynW(s->path, path, sizeof(s->path)/sizeof(s->path[0]));
+            CoTaskMemFree(path);
+            ok = 1;
+        }
+        r->Release();
+    }
+    d->Release();
+    return ok;
 }
 
 static DWORD WINAPI savethread(void *arg)
@@ -1087,7 +1135,8 @@ static DWORD WINAPI savethread(void *arg)
         ofn.Flags       = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
                           OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
     }
-    if (!(s->open ? GetOpenFileNameW(&ofn) : GetSaveFileNameW(&ofn))) {
+    if (s->dir ? !pickdir(s, ow) :
+                 !(s->open ? GetOpenFileNameW(&ofn) : GetSaveFileNameW(&ofn))) {
         s->path[0] = 0;
     }
     if (hook) {
@@ -1107,7 +1156,7 @@ static DWORD WINAPI savethread(void *arg)
 static int w32dialog(void *p, unsigned short const *title,
                      unsigned short const *name,
                      void (*done)(void *, unsigned short const *),
-                     void const *ctx, int ctxlen, int open, int images)
+                     void const *ctx, int ctxlen, int open, int images, int dir = 0)
 {
     W32Gui  *w = (W32Gui *)p;
     W32Save *s = (W32Save *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(W32Save));
@@ -1123,6 +1172,7 @@ static int w32dialog(void *p, unsigned short const *title,
     s->done   = done;
     s->open   = open;
     s->images = images;
+    s->dir    = dir;
     HANDLE t = CreateThread(0, 0, savethread, s, 0, 0);
     if (!t) {
         HeapFree(GetProcessHeap(), 0, s);
@@ -1145,6 +1195,14 @@ extern "C" int w32gui_openfile(void *p, unsigned short const *title, int images,
                                void const *ctx, int ctxlen)
 {
     return w32dialog(p, title, (unsigned short const *)L"", done, ctx, ctxlen, 1, images);
+}
+
+extern "C" int w32gui_opendir(void *p, unsigned short const *title,
+                              unsigned short const *at,
+                              void (*done)(void *, unsigned short const *),
+                              void const *ctx, int ctxlen)
+{
+    return w32dialog(p, title, at, done, ctx, ctxlen, 1, 0, 1);
 }
 
 extern "C" long long w32gui_clip(void *p, int format, void *buf, long long cap)
@@ -1479,6 +1537,15 @@ static b32 os_guiopenfile(Os *os, Arena scratch, Str title, i32 kind, Mailbox *m
     W32SaveCtx c = {mb, type, id};
     return w32gui_openfile(os->gui, (unsigned short *)towide(&scratch, title).data,
                            kind==OPEN_IMAGE, savedone, &c, (int)sizeof(c));
+}
+
+static b32 os_guiopendir(Os *os, Arena scratch, Str title, Str at, Mailbox *mb,
+                         u32 type, u64 id)
+{
+    W32SaveCtx c = {mb, type, id};
+    return w32gui_opendir(os->gui, (unsigned short *)towide(&scratch, title).data,
+                          (unsigned short *)towide(&scratch, at).data,
+                          savedone, &c, (int)sizeof(c));
 }
 
 static i32 dibint(u8 *p)

@@ -1199,6 +1199,30 @@ static b32 os_guiopenfile(Os *os, Arena scratch, Str title, i32 kind, Mailbox *m
     return 1;
 }
 
+// And for a directory, starting in at.
+static b32 os_guiopendir(Os *os, Arena scratch, Str title, Str at, Mailbox *mb,
+                         u32 type, u64 id)
+{
+    GuiSdl  *p = (GuiSdl *)os->gui;
+    SdlSave *s = (SdlSave *)SDL_malloc(sizeof(SdlSave));
+    if (!p || !p->window || !s) {
+        SDL_free(s);
+        return 0;
+    }
+    s->mb   = mb;
+    s->type = type;
+    s->id   = id;
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_WINDOW_POINTER, p->window);
+    SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_TITLE_STRING, cstr(&scratch, title));
+    if (at.len) {
+        SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_LOCATION_STRING, cstr(&scratch, at));
+    }
+    SDL_ShowFileDialogWithProperties(SDL_FILEDIALOG_OPENFOLDER, savedone, s, props);
+    SDL_DestroyProperties(props);
+    return 1;
+}
+
 static i32 urlhex(u8 c)
 {
     return c>='0' && c<='9' ? c-'0' : c>='a' && c<='f' ? c-'a'+10 :

@@ -492,6 +492,10 @@ enum : i32 {
 };
 static b32     os_guiopenfile(Os *, Arena scratch, Str title, i32 kind,
                               Mailbox *, u32 type, u64 id);
+// Ask which directory, likewise, the dialog starting in the directory
+// at, if not null.
+static b32     os_guiopendir(Os *, Arena scratch, Str title, Str at,
+                             Mailbox *, u32 type, u64 id);
 // An image the clipboard holds, to attach, as its bytes in a (PNG, JPEG,
 // GIF, WebP or BMP), else a file it holds (a file manager's copy) as its
 // path; both null if neither.
