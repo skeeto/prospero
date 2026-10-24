@@ -61,7 +61,8 @@ static i32 imagesniff(Str d)
         return IMAGE_JPEG;
     } else if (startswith(d, "GIF87a") || startswith(d, "GIF89a")) {
         return IMAGE_GIF;
-    } else if (startswith(d, "RIFF") && cuthead(takehead(d, 12), 8)=="WEBP") {
+    } else if (d.len>=12 && startswith(d, "RIFF") &&
+               cuthead(takehead(d, 12), 8)=="WEBP") {
         return IMAGE_WEBP;
     } else if (startswith(d, "BM")) {
         return IMAGE_BMP;

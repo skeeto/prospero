@@ -490,6 +490,8 @@ static void test_image(Test *t)
                "image/gif 0");
         expect(t, "kind gif why", istr(a, k.err.len > 0), "1");
         expect(t, "kind none", istr(a, imagekind(*a, "%PDF-1.4").mime.data != 0), "0");
+        expect(t, "kind riff short", istr(a, imagekind(*a, "RIFF\xfc").kind), "0");
+        expect(t, "kind riff wave", istr(a, imagekind(*a, "RIFF\xfc\0\0\0WAVE").kind), "0");
         expect(t, "kind names", concat(a, imagename("image/webp"), imagename("text/plain")),
                "WebPimage");
     }
