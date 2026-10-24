@@ -19,7 +19,11 @@
 // own file is used, with a warning; in an included (shared) file it is
 // an error and ignored, as is any setting of a [remote] section, which
 // chooses a program to run and where (ssh, path, state, config, deploy),
-// or of the [desktop] section, which lets the agent use the screen.
+// or of the [desktop] section, which lets the agent use the screen, and
+// any other setting that chooses a program to run here (cfgruns): [tools]
+// path_prepend and path_append, which say where programs are found, a
+// [tools] shell other than a keyword (auto, sh, powershell, cmd), and
+// [ui] editor.
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -59,10 +63,11 @@
 //   is an error and is ignored, never cached, so a cached copy that does
 //   match stays in use; a cached copy that does not match is never used.
 //
-// Nothing a configuration says runs a command but a [remote] section of
-// the user's own file, and an included file's [remote] and [desktop]
-// settings and plaintext secrets are ignored, so a shared file, local or
-// from the web, can at most point the harness at endpoints and models.
+// Only the user's own file chooses what runs: its [remote] sections, a
+// shell, the editor, and where programs are found. An included file's
+// [remote] and [desktop] settings, those of cfgruns and plaintext secrets
+// are ignored, so a shared file, local or from the web, can at most
+// point the harness at endpoints and models.
 // (A shared [role] may list desktop in its tools, which matters only
 // once the user's own [desktop] offer says roles.)
 //
@@ -733,6 +738,19 @@ static b32 cfgtilde(Str p)
     return p=="~" || startswith(p, "~/") || startswith(p, "~\\");
 }
 
+// Whether a value, trimmed, chooses a program for this machine to run,
+// which only the user's own file may: where programs are found ([tools]
+// path_prepend and path_append), a shell by its path or name rather than
+// a keyword, or the editor's command.
+static b32 cfgruns(CfgKey *k, Str v)
+{
+    if (k->kind == "tools") {
+        return k->key=="path_prepend" || k->key=="path_append" ||
+               (k->key=="shell" && !cfghasword("auto sh powershell cmd", v));
+    }
+    return k->kind=="ui" && k->key=="editor";
+}
+
 // How a value fares as a setting of its key. A shared value comes from
 // an included file. An empty value means the default, and is fine.
 static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
@@ -742,7 +760,9 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
         return CFG_OK;
     } else if (shared && (k->kind=="remote" || k->kind=="desktop")) {
         return CFG_BAD;  // what runs on the user's machines, and where,
-    }                    // and what may use the screen
+    } else if (shared && cfgruns(k, v)) {  // and what may use the screen
+        return CFG_BAD;
+    }
     switch (k->type) {
     case CFG_STRING:
     case CFG_TEMPLATE:
@@ -807,6 +827,19 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     } else if (shared && k->kind=="desktop") {
         return "a [desktop] setting in an included file is ignored, since it "
                "lets the agent use the screen: set it in your own file";
+    } else if (shared && cfgruns(k, v) && k->key=="shell") {
+        return "a shell by its path or name in an included file is ignored, "
+               "since it chooses what runs: set it in your own file, or "
+               "here one of auto, sh, powershell, cmd";
+    } else if (shared && cfgruns(k, v)) {
+        Buf b(a, 128);
+        print(&b, "[");
+        print(&b, k->kind);
+        print(&b, "] ");
+        print(&b, k->key);
+        print(&b, " in an included file is ignored, since it chooses what "
+                  "runs: set it in your own file");
+        return finish(&b);
     }
     Buf b(a, 128);
     switch (k->type) {

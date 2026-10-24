@@ -94,7 +94,17 @@ static void testcfgschema(Test *t)
         {"guard", "roots", "/a; b", CFG_ODD, 0},
         {"guard", "roots", ";;", CFG_OK, 0},
         {"tools", "path_prepend", "/x; ~/y", CFG_OK, 0},
-        {"tools", "path_append", "/x; rel", CFG_ODD, 0},
+        {"tools", "path_prepend", "/x", CFG_BAD, 1},
+        {"tools", "path_append", "/x", CFG_BAD, 1},
+        {"tools", "path_append", " ", CFG_OK, 1},
+        {"tools", "shell", "/bin/zsh", CFG_OK, 0},
+        {"tools", "shell", "/bin/zsh", CFG_BAD, 1},
+        {"tools", "shell", "zsh", CFG_BAD, 1},
+        {"tools", "shell", " powershell ", CFG_OK, 1},
+        {"tools", "shell", "auto", CFG_OK, 1},
+        {"ui", "editor", "code --wait", CFG_OK, 0},
+        {"ui", "editor", "code --wait", CFG_BAD, 1},
+        {"ui", "theme", "dark", CFG_OK, 1},
     };
     for (iz i = 0; i < countof(judge); i++) {
         CfgKey *k = cfgkey(judge[i].kind, judge[i].key);
@@ -1638,21 +1648,64 @@ static void testcfglike(Test *t)
     cfgfree(c);
 }
 
-// [tools] path_prepend and path_append: the PATH programs are found by;
-// the environment's PATH set to it, and the engine's lookups on it.
+// [tools] path_prepend and path_append: the PATH programs are found by,
+// and in an included file, ignored with the other settings that choose
+// what runs; the environment's PATH set to it, and the engine's lookups
+// on it.
 static void testcfgpath(Test *t)
 {
     Arena  a = t->perm;
     CfgEnv v = newcfgenv(&a);
 
-    // In order, ~ the home directory, empty, relative and (on POSIX)
-    // colon entries left out
+    // An included file chooses nothing that runs, but may name a shell
+    // by its keyword
+    os_write(v.os, a, "/c/keyword.ini", "[tools]\nshell = powershell\n");
+    os_write(v.os, a, "/c/shared.ini",
+        "[tools]\n"
+        "path_prepend = /evil/bin\n"
+        "path_append = /evil/late\n"
+        "shell = /evil/sh\n"
+        "[ui]\n"                                // 5
+        "editor = evil --wait\n"
+        "theme = dark\n");
+    os_write(v.os, a, "/c/h.ini", "include = keyword.ini\ninclude = shared.ini\n");
+    Config *c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
+    expect(t, "path.shared.diags", inidiags(&a, c->ini),
+        "/c/shared.ini:2:16: error: [tools] path_prepend in an included file "
+        "is ignored, since it chooses what runs: set it in your own file\n"
+        "/c/shared.ini:3:15: error: [tools] path_append in an included file "
+        "is ignored, since it chooses what runs: set it in your own file\n"
+        "/c/shared.ini:4:9: error: a shell by its path or name in an included "
+        "file is ignored, since it chooses what runs: set it in your own "
+        "file, or here one of auto, sh, powershell, cmd\n"
+        "/c/shared.ini:6:10: error: [ui] editor in an included file is "
+        "ignored, since it chooses what runs: set it in your own file");
+    expect(t, "path.shared.prepend", cfgget(c, "tools", "", "path_prepend", 0), "");
+    expect(t, "path.shared.shell", cfgget(c, "tools", "", "shell", 0), "auto");
+    expect(t, "path.shared.editor", cfgget(c, "ui", "", "editor", 0), "");
+    expect(t, "path.shared.theme", cfgget(c, "ui", "", "theme", 0), "dark");
+    expect(t, "path.shared.path", cfgsearchpath(c, &a, "/usr/bin:/bin", "/home/u", 0),
+           "/usr/bin:/bin");
+    cfgfree(c);
+    os_write(v.os, a, "/c/h.ini", "include = shared.ini\ninclude = keyword.ini\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
+    expect(t, "path.keyword", cfgget(c, "tools", "", "shell", 0), "powershell");
+    cfgfree(c);
+
+    // The user's own: in order, ~ the home directory, empty, relative
+    // and (on POSIX) colon entries left out
     os_write(v.os, a, "/c/h.ini",
+             "include = shared.ini\n"
              "[tools]\n"
              "path_prepend = ~/bin; ; /opt/x/bin ;rel/bin; C:/x\n"
-             "path_append = /late\n");
-    Config *c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
-    expect(t, "path.own",cfgsearchpath(c, &a, "/usr/bin:/bin", "/home/u", 0),
+             "path_append = /late\n"
+             "shell = /bin/zsh\n"
+             "[ui]\n"
+             "editor = code --wait\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
+    expect(t, "path.own.shell", cfgget(c, "tools", "", "shell", 0), "/bin/zsh");
+    expect(t, "path.own.editor", cfgget(c, "ui", "", "editor", 0), "code --wait");
+    expect(t, "path.own", cfgsearchpath(c, &a, "/usr/bin:/bin", "/home/u", 0),
            "/home/u/bin:/opt/x/bin:/usr/bin:/bin:/late");
     expect(t, "path.own.nohome", cfgsearchpath(c, &a, "/usr/bin", "", 0),
            "/opt/x/bin:/usr/bin:/late");
