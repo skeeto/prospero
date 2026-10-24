@@ -164,8 +164,13 @@ compositor decides focus. A different `--statedir` (or
 `XDG_STATE_HOME`) is a separate instance. The View menu
 shows and hides the panes and zooms the text for the run (Ctrl+=,
 Ctrl+- and Ctrl+0, Cmd on macOS, or the wheel with the key held);
-`[ui] font_size` sets its size for good. The window opens where it was
-last, fitted to the displays there are.
+`[ui] font_size` (17 pixels by default) sets its size for good, and
+View's Reset layout puts every pane back in its place. The window
+opens where it was last, fitted to the displays there are; the first
+time, 1700 by 900 at the display's scale, or maximized on a display
+too small for that. The first run shows Help in front, with Settings
+and Hosts when the configuration names no model and no remote host;
+close them once read, as the View menu shows each again.
 
 `prospero DIR`, such as `prospero .` in a terminal, opens a new
 session in that directory, in Build mode with the configured model,

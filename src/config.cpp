@@ -1078,6 +1078,22 @@ static Str cfgtemplate(Config *c, Arena *perm, Str name)
     return finish(&b);
 }
 
+// Whether the configuration names a model, by default or with a
+// [model NAME] section, or a [remote NAME] host to run on: a GUI with
+// none shows its settings and hosts on its first run.
+static b32 cfgconfigured(Config *c)
+{
+    if (trim(cfgget(c, "", "", "model", 0)).len) {
+        return 1;
+    }
+    for (IniSection *s = c->ini->sections; s; s = s->next) {
+        if ((s->kind=="model" || s->kind=="remote") && s->name.len) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // A named section's setting only where a file sets it, and validly for
 // a schema key: null when unset, empty or bad, for a caller with
 // defaults of its own (a built-in role's).

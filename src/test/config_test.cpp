@@ -197,6 +197,7 @@ static void testcfgseed(Test *t)
     expect(t, "seed.endpoint", cfgget(c, "", "", "endpoint", 0), "local");
     expect(t, "seed.url", cfgget(c, "endpoint", "local", "url", 1),
            "http://localhost/");
+    expect(t, "seed.configured", istr(&a, cfgconfigured(c)), "0");
     expect(t, "seed.newline", istr(&a, cfgseed()[cfgseed().len-1]), "10");
     for (iz i = 0; i < c->user->lines.len; i++) {
         if (c->user->lines[i].raw.len > 79) {
@@ -224,6 +225,32 @@ static void testcfgseed(Test *t)
            "/elsewhere/h.ini: warning: cannot read file (not found)");
     expect(t, "seed.notuser", istr(&a, c->user != 0), "0");
     cfgfree(c);
+
+    // A model, by default or by section, or a remote host: configured
+    Str configured[] = {
+        "model = m\n",
+        "[model m]\ncontext = 1000\n",
+        "[remote r]\nssh = r.invalid\n",
+        "include = team.ini\n",
+    };
+    os_write(v.os, a, "/c/team.ini", "[model shared]\n");
+    for (i32 i = 0; i < countof(configured); i++) {
+        os_write(v.os, a, "/c/x.ini", configured[i]);
+        c = newconfig(v.os, &a, v.scratch, "/c/x.ini", 0);
+        expect(t, "seed.configured.yes", istr(&a, cfgconfigured(c)), "1");
+        cfgfree(c);
+    }
+    Str unconfigured[] = {
+        "",
+        "model =\n[endpoint e]\nurl = http://localhost/\n",
+        "[role r]\nmodel = m\n[model]\n",
+    };
+    for (i32 i = 0; i < countof(unconfigured); i++) {
+        os_write(v.os, a, "/c/x.ini", unconfigured[i]);
+        c = newconfig(v.os, &a, v.scratch, "/c/x.ini", 0);
+        expect(t, "seed.configured.no", istr(&a, cfgconfigured(c)), "0");
+        cfgfree(c);
+    }
 
     // No location at all
     c = newconfig(v.os, &a, v.scratch, {}, 1);

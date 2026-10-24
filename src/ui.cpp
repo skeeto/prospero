@@ -7024,6 +7024,13 @@ static void drawfontcredits()
 
 static void drawhelp(Gui *g)
 {
+    // First, so that a new user knows these panes can go
+    ImGui::PushFont(g->fonts.bold, 0);
+    ImGui::TextWrapped(
+        "Close any pane you do not need, this one too: the View menu "
+        "shows each again, and Reset layout puts them all back.");
+    ImGui::PopFont();
+    ImGui::Spacing();
     ImGui::TextWrapped(
         "Each session is a conversation with the agent in one working "
         "directory. Enter sends, Shift+Enter starts a new line, and "
@@ -7341,9 +7348,14 @@ static void drawmenubar(Gui *g)
             }
             ImGui::EndMenu();
         }
-        if (ImGui::MenuItem("Reset layout")) {
+        b32 relayout = ImGui::MenuItem("Reset layout");
+        itemnamed(g, "Reset layout");
+        if (relayout) {
+            // The docked panes, while Help, Settings and Hosts stay as
+            // they are, and join the jobs
             for (i32 i = 0; i < PANE_COUNT; i++) {
-                setpane(g, i, i != PANE_METRICS);
+                b32 extra = i==PANE_HELP || i==PANE_SETTINGS || i==PANE_HOSTS;
+                setpane(g, i, extra ? g->panes[i] : i!=PANE_METRICS);
             }
             g->panefocus    = 0;
             g->resetpending = 1;
@@ -7478,6 +7490,72 @@ static b32 beginpane(Gui *g, i32 pane)
     return vis;
 }
 
+// The first run's pane, the floating dock node id, centered in a dock
+// space of a size at pos, most of it but not too big to read.
+static void placefirst(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
+{
+    f32    sc = g->scale;
+    ImVec2 fs = v2(size.x*0.6f, size.y*0.7f);
+    fs.x = fs.x<1100*sc ? fs.x : 1100*sc;
+    fs.y = fs.y<800*sc ? fs.y : 800*sc;
+    ImVec2 at = v2(pos.x + (size.x - fs.x)/2, pos.y + (size.y - fs.y)/2);
+    ImGui::DockBuilderSetNodePos(id, at);
+    ImGui::DockBuilderSetNodeSize(id, fs);
+    g->firstpane = id;
+    g->firstspace = size;
+    g->firstbox   = {at.x, at.y, at.x + fs.x, at.y + fs.y};
+}
+
+// The layout, in the dock space id of a size at pos: the sessions over
+// the todo list at the left, the transcript over the prompt, and at the
+// right the jobs and the log, Jobs selected, over the plan. Help,
+// Settings and Hosts join the jobs, when shown now or later; on a first
+// run, those shown float in front instead, centered, Help selected.
+// Metrics floats, when shown.
+static void buildlayout(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
+{
+    ImGuiID first = ImGui::GetID("FirstRun");
+    ImGui::DockBuilderRemoveNode(first);
+    ImGui::DockBuilderRemoveNode(id);
+    ImGui::DockBuilderAddNode(id, ImGuiDockNodeFlags_DockSpace);
+    ImGui::DockBuilderSetNodeSize(id, size);
+    ImGuiID left = 0, rest = 0, right = 0, center = 0;
+    ImGuiID top = 0, bottom = 0, rtop = 0, rbot = 0;
+    ImGuiID ltop = 0, lbot = 0;
+    ImGui::DockBuilderSplitNode(id, ImGuiDir_Right, LAYOUT_RIGHT, &right, &rest);
+    ImGui::DockBuilderSplitNode(rest, ImGuiDir_Left, LAYOUT_LEFT, &left, &center);
+    ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, LAYOUT_PROMPT, &bottom, &top);
+    ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, LAYOUT_PLAN, &rbot, &rtop);
+    ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, LAYOUT_TODO, &lbot, &ltop);
+    ImGui::DockBuilderDockWindow("Sessions", ltop);
+    ImGui::DockBuilderDockWindow("Todo", lbot);
+    ImGui::DockBuilderDockWindow("Transcript", top);
+    ImGui::DockBuilderDockWindow("Prompt", bottom);
+    ImGui::DockBuilderDockWindow("Jobs", rtop);
+    ImGui::DockBuilderDockWindow("Log", rtop);
+    ImGui::DockBuilderDockWindow("Plan", rbot);
+    ImGui::DockBuilderFinish(id);
+    g->jobsfocus = 2;
+
+    i32 extras[] = {PANE_HELP, PANE_SETTINGS, PANE_HOSTS};
+    b32 floats   = g->firstrun && g->panes[PANE_HELP];
+    g->firstpane = 0;
+    if (floats) {
+        ImGui::DockBuilderAddNode(first, ImGuiDockNodeFlags_None);
+        placefirst(g, first, pos, size);
+        g->helpfocus = 3;  // after Jobs
+    }
+    for (i32 i = 0; i < countof(extras); i++) {
+        i32 pane = extras[i];
+        b32 here = floats && g->panes[pane];
+        ImGui::DockBuilderDockWindow(panenames[pane], here ? first : rtop);
+    }
+    if (floats) {
+        ImGui::DockBuilderFinish(first);
+    }
+    g->firstrun = 0;
+}
+
 static void dockwindows(Gui *g)
 {
     menukeys(g);
@@ -7520,32 +7598,27 @@ static void dockwindows(Gui *g)
     } else if (g->resetlayout || (g->firstlayout && !ImGui::DockBuilderGetNode(id))) {
         g->firstlayout = 0;
         g->resetlayout = 0;
-        ImGui::DockBuilderRemoveNode(id);
-        ImGui::DockBuilderAddNode(id, ImGuiDockNodeFlags_DockSpace);
-        ImGui::DockBuilderSetNodeSize(id, size);
-        // The first split is between the right column and the rest, of
-        // which the sessions take the left
-        ImGuiID left = 0, rest = 0, right = 0, center = 0;
-        ImGuiID top = 0, bottom = 0, rtop = 0, rbot = 0;
-        ImGuiID ltop = 0, lbot = 0;
-        ImGui::DockBuilderSplitNode(id, ImGuiDir_Right, 0.28f, &right, &rest);
-        ImGui::DockBuilderSplitNode(rest, ImGuiDir_Left, 0.25f, &left, &center);
-        ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.22f, &bottom, &top);
-        ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.40f, &rbot, &rtop);
-        ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.35f, &lbot, &ltop);
-        ImGui::DockBuilderDockWindow("Sessions", ltop);
-        ImGui::DockBuilderDockWindow("Todo", lbot);
-        ImGui::DockBuilderDockWindow("Plan", lbot);
-        ImGui::DockBuilderDockWindow("Help", top);
-        ImGui::DockBuilderDockWindow("Transcript", top);
-        ImGui::DockBuilderDockWindow("Prompt", bottom);
-        ImGui::DockBuilderDockWindow("Metrics", rtop);
-        ImGui::DockBuilderDockWindow("Hosts", rtop);
-        ImGui::DockBuilderDockWindow("Settings", rtop);
-        ImGui::DockBuilderDockWindow("Jobs", rbot);
-        ImGui::DockBuilderDockWindow("Log", rbot);
-        ImGui::DockBuilderFinish(id);
-        g->jobsfocus = 2;
+        buildlayout(g, id, pos, size);
+    } else if (g->firstpane) {
+        // The first run's pane stays centered while the window settles
+        // (a window manager maximizing it, say), until it is moved,
+        // resized, or gone
+        ImGuiDockNode *n    = ImGui::DockBuilderGetNode(g->firstpane);
+        Rect           b    = g->firstbox;
+        f32            off  = 0;
+        if (n) {
+            f32 d[] = {n->Pos.x - b.x0, n->Pos.y - b.y0,
+                       n->Pos.x+n->Size.x - b.x1, n->Pos.y+n->Size.y - b.y1};
+            for (i32 i = 0; i < countof(d); i++) {
+                off = d[i]>off ? d[i] : -d[i]>off ? -d[i] : off;
+            }
+        }
+        b32 kept = n && !n->ParentNode && off<3;  // as rounded
+        if (!kept) {
+            g->firstpane = 0;
+        } else if (size.x!=g->firstspace.x || size.y!=g->firstspace.y) {
+            placefirst(g, g->firstpane, pos, size);
+        }
     }
     ImGui::DockSpace(id, v2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
     drawdialogs(g);
@@ -7572,9 +7645,9 @@ static void dockwindows(Gui *g)
     }
     g->planshown = -1;  // not drawn
     if (show[PANE_PLAN]) {
-        ImGuiID todo = saveddock("Todo");
-        if (todo) {
-            ImGui::SetNextWindowDockID(todo, ImGuiCond_FirstUseEver);
+        ImGuiID logs = saveddock("Log");
+        if (logs) {
+            ImGui::SetNextWindowDockID(logs, ImGuiCond_FirstUseEver);
         }
         if (beginpane(g, PANE_PLAN)) {
             drawplan(g);
@@ -7590,6 +7663,15 @@ static void dockwindows(Gui *g)
         ImGui::End();
     }
     if (show[PANE_HELP]) {
+        // Selected in the first run's pane, after Jobs is in its node
+        if (g->helpfocus && !--g->helpfocus) {
+            ImGui::SetNextWindowFocus();
+        }
+        // A floating node of Help alone keeps its tab bar, and with it
+        // the node, rather than leaving Help a loose window
+        ImGuiWindowClass wc;
+        wc.DockingAlwaysTabBar = 1;
+        ImGui::SetNextWindowClass(&wc);
         if (beginpane(g, PANE_HELP)) {
             drawhelp(g);
         }
@@ -7617,6 +7699,7 @@ static void dockwindows(Gui *g)
     }
     // Windows that a layout saved before them lacks join a neighbor
     near = saveddock("Settings");
+    near = near ? near : saveddock("Log");
     if (show[PANE_HOSTS]) {
         if (near) {
             ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);

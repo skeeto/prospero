@@ -277,6 +277,17 @@ static char const *panenames[] = {
     "Settings", "Help", "Metrics",
 };
 static_assert(countof(panenames) == PANE_COUNT);
+
+// The layout's splits (buildlayout), each a share of the node split: the
+// right column's of the width, the left column's of the rest, the
+// prompt's of the center's height, and the lower node's of each column.
+// At the first window's 1700 pixels wide, the side columns are 425 and
+// about 280 wide; at 1280, 320 and about 210.
+static f32 const LAYOUT_RIGHT  = 0.25f;
+static f32 const LAYOUT_LEFT   = 0.22f;
+static f32 const LAYOUT_PROMPT = 0.28f;
+static f32 const LAYOUT_PLAN   = 0.5f;
+static f32 const LAYOUT_TODO   = 0.25f;
 static_assert((i32)RECT_COUNT == (i32)RECT_PANE0 + (i32)PANE_COUNT);
 
 // Zoom steps, as browsers have them: the View menu's, and Ctrl+wheel's
@@ -1152,7 +1163,13 @@ struct Gui {
     WinBox             firstdisp;  // --display: the usable size a first
                                    // window fits, else the primary's
     b32                firstlayout;
+    b32                firstrun;   // no layout file: Help floats in front
+    b32                configured; // a model or remote host (cfgconfigured)
     i32                jobsfocus;  // frames until the Jobs tab is selected
+    i32                helpfocus;  // and the Help tab, on a first run
+    ImGuiID            firstpane;  // the first run's floating dock node,
+    ImVec2             firstspace; // centered in a dock space this size,
+    Rect               firstbox;   // there, until moved
     b32                resetpending;
     b32                resetlayout;
     b32                openmodal;
@@ -13767,9 +13784,10 @@ static void readconfig(Gui *g, Arena scratch)
     i32 tools = toolsparse(cfgget(cfg, "ui", "", "tools", 0));
     g->toolset = tools<0 ? TOOLS_AUTO : tools;
     setfontbase(g, cfgget(cfg, "ui", "", "font_size", 0));
-    g->editor   = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
-    g->pathpre  = clone(&g->perm, cfgget(cfg, "tools", "", "path_prepend", 0));
-    g->pathpost = clone(&g->perm, cfgget(cfg, "tools", "", "path_append", 0));
+    g->editor     = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
+    g->pathpre    = clone(&g->perm, cfgget(cfg, "tools", "", "path_prepend", 0));
+    g->pathpost   = clone(&g->perm, cfgget(cfg, "tools", "", "path_append", 0));
+    g->configured = cfgconfigured(cfg);
     if (own) {
         g->config = cfg;
     } else {
@@ -14189,12 +14207,20 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     loadfonts(g);
     addinihandler(g);
 
+    // No layout file is a first run: Help floats in front, with Settings
+    // and Hosts unless the configuration says what to use already
+    g->firstrun = 1;
     if (g->inipath.len) {
         Arena t  = g->frame;
         Read  rd = os_read(os, &t, g->inipath, 1<<20);
         if (rd.err == READ_OK) {
             ImGui::LoadIniSettingsFromMemory((char *)rd.data.data, (uz)rd.data.len);
+            g->firstrun = 0;
         }
+    }
+    if (g->firstrun) {
+        g->panes[PANE_SETTINGS] = !g->configured;
+        g->panes[PANE_HOSTS]    = !g->configured;
     }
 
     g->sched = newsched(os_ticks(os), 16667);
