@@ -192,6 +192,7 @@ enum : i32 {
     RECT_JOBKILL,    // the newest running job's Kill
     RECT_TASKLINK,   // the latest task row's subagent link
     RECT_PARENTLINK, // a subagent's link to its parent
+    RECT_MSGLINK,    // the latest message's link to its other session
     RECT_UNDO,       // the latest Undo on a tool row
     RECT_REWINDTURN, // the latest Rewind to here
     RECT_REWINDOK,   // the rewind confirmation's buttons
@@ -6619,6 +6620,7 @@ enum : i32 {
     T_LONGFIELD,   // a setting's field holding more than its slack
     T_TASKLINK,    // the latest task row's subagent link
     T_PARENTLINK,  // a subagent's link back to its parent
+    T_MSGLINK,     // the latest message's link to its other session
     T_UNDO,        // the latest Undo on a tool row
     T_REWINDTURN,  // the latest Rewind to here
     T_REWINDOK,    // the rewind confirmation's Rewind
@@ -6867,6 +6869,8 @@ enum : i32 {
     CHK_MAXIMIZED,    // maximized, filling its display, and saved so;
                       // dx 1: filling it, saved as maximized
     CHK_QUEUESHOWN,   // dx queued messages drawn above the box, the first text
+    CHK_MSGNOTE,      // a message's notice names its sender, with a link
+    CHK_MSGSENDER,    // the link showed the sender, whose row links back
     CHK_COUNT,
 };
 
@@ -7042,6 +7046,8 @@ static Str chknames[] = {
     "the model may change while the plan waits",
     "the window is maximized, filling its display, and will open so",
     "the box shows the messages queued, as it should",
+    "the message from the subagent is shown, with a link to it",
+    "the link showed the subagent, its message row linking back",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -7834,6 +7840,21 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_CHILDSHOWN, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "8-subagent"},
     {OP_MOVE, T_PARENTLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
+    // A subagent messages its parent, read after it reports; the notice
+    // leads to the sender, and its row back
+    {OP_PROMPT, 0, 0, 0, 0, "Start a subagent that messages."},
+    {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
+    {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
+    {OP_CHECK, CHK_MSGNOTE, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "8b-message"},
+    {OP_MOVE, T_MSGLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MSGSENDER, 0, 0, 0, ""},
+    {OP_MOVE, T_MSGLINK, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
@@ -9505,6 +9526,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_LONGFIELD:   return rectcenter(g->rects[RECT_LONGFIELD]);
     case T_TASKLINK:    return rectcenter(g->rects[RECT_TASKLINK]);
     case T_PARENTLINK:  return rectcenter(g->rects[RECT_PARENTLINK]);
+    case T_MSGLINK:     return rectcenter(g->rects[RECT_MSGLINK]);
     case T_UNDO:        return rectcenter(g->rects[RECT_UNDO]);
     case T_REWINDTURN:  return rectcenter(g->rects[RECT_REWINDTURN]);
     case T_REWINDOK:    return rectcenter(g->rects[RECT_REWINDOK]);
@@ -11071,6 +11093,22 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_PARENTSHOWN:
         return g->sess && g->sess==g->drivemain;
+    case CHK_MSGNOTE:
+    case CHK_MSGSENDER: {
+        b32 want = chk==CHK_MSGNOTE;
+        b32 row  = 0;
+        if (!g->drivemain || !v) return 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewMsg *m = &v->msgs[i];
+            row |= want ? m->role==VIEW_NOTE && m->from.len &&
+                          m->label=="Message from Messenger"
+                        : m->role==VIEW_TOOL && m->tool->name=="send_message" &&
+                          m->tool->child==g->drivemain->sid;
+        }
+        b32 where = want ? g->sess==g->drivemain
+                         : g->sess!=g->drivemain && v->parent==g->drivemain->sid;
+        return where && row && g->rects[RECT_MSGLINK].x1>0;
+    }
     case CHK_KIDASK:
         return g->kidaskshown && g->kidlinkshown && g->rects[RECT_TASKLINK].x1>0;
     case CHK_KIDALLOWED: {

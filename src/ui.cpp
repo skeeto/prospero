@@ -1248,6 +1248,14 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
             r.kind  = ACT_OPEN;
             r.label = r.amber ? "Answer the subagent" : "Open subagent";
         }
+    } else if (s && ((m->role==VIEW_TOOL && t->name=="send_message" && t->child.len) ||
+                     (m->role==VIEW_NOTE && m->from.len))) {
+        // A message's other session, if this window knows it
+        r.child = findsess(g, s->host, m->from.len ? m->from : t->child);
+        if (r.child) {
+            r.kind  = ACT_OPEN;
+            r.label = m->from.len ? "Open sender" : "Open session";
+        }
     } else if (m->role == VIEW_TOOL) {
         ViewSnap *sn = rowsnap(v, t);
         if (sn && !sn->undone && canrewind(g, s)) {
@@ -1284,8 +1292,13 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
     b32 go = ImGui::SmallButton(act->label);
     switch (act->kind) {
     case ACT_OPEN:
-        itemrect(g, RECT_TASKLINK);
-        ImGui::SetItemTooltip("Show the subagent's own transcript");
+        if (t && t->name=="task") {
+            itemrect(g, RECT_TASKLINK);
+            ImGui::SetItemTooltip("Show the subagent's own transcript");
+        } else {
+            itemrect(g, RECT_MSGLINK);
+            ImGui::SetItemTooltip("Show that session's transcript");
+        }
         if (go) guiselect(g, act->child);
         break;
     case ACT_UNDO:
@@ -2332,6 +2345,7 @@ static void drawtranscript(Gui *g)
     g->thinkrows  = 0;
     g->thinkchars = -1;
     g->thinksecs  = -1;
+    g->rects[RECT_MSGLINK]   = {};
     g->rects[RECT_CODEBLOCK] = {};
     g->rects[RECT_CODECOPY]  = {};
     g->copiedshown = 0;

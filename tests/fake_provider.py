@@ -2090,7 +2090,8 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Read the big files", "Fail over", "Stream in the background",
                "Stream for the link", "Look at the desktop", "Think slowly",
                "Think briefly", "Answer at length", "Write outside for good",
-               "Start a desktop subagent", "Type on the desktop as a subagent")
+               "Start a desktop subagent", "Type on the desktop as a subagent",
+               "Start a subagent that messages", "Message the parent as a subagent")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2323,6 +2324,24 @@ def sc_gui(model, n, req):
             killed = any("the user stopped it" in c for c in seen)
             yield from answer(model, "The second job was killed." if killed
                               else "A job ended.")
+    elif "Start a subagent that messages" in prompt:
+        # Its message waits for the parent's next step, after the report
+        if step == 0:
+            yield from tool(model, n, "task", {"description": "Messenger",
+                                               "prompt": "Message the parent as a subagent."})
+        else:
+            yield from answer(model, "The messenger reported.")
+    elif "Message the parent as a subagent" in prompt:
+        if step == 0:
+            # Slow enough for the parent's task row to be seen at work
+            yield S.sleep(1.5)
+            yield from tool(model, n, "sessions", {})
+        elif step == 1:
+            lines = [l for l in tool_results(req)[0].splitlines() if "  parent  " in l]
+            yield from tool(model, n, "send_message", {"to": lines[0].split()[0],
+                                                       "text": "Hello from the messenger."})
+        else:
+            yield from answer(model, "Messenger report: sent.")
     elif "Start a subagent that asks" in prompt:
         if step == 0:
             yield from tool(model, n, "task", {"description": "Ask first",
