@@ -73,10 +73,12 @@ if(PROSPERO_HAS_PREFIXMAP)
 endif()
 
 # The core embeds the seed configuration with #embed (config.cpp), and
-# the GUI its fonts (fonts.cpp), which not every compiler lists as
-# dependencies.
+# the GUI its fonts (fonts.cpp) and its Help pages (help.cpp), which not
+# every compiler lists as dependencies.
+file(GLOB prospero_help CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/assets/help/*.md)
 set_property(SOURCE src/main_posix.cpp src/main_win32.cpp src/main_test.cpp
-  APPEND PROPERTY OBJECT_DEPENDS ${PROJECT_SOURCE_DIR}/assets/prospero.ini
+  APPEND PROPERTY OBJECT_DEPENDS ${prospero_help}
+  ${PROJECT_SOURCE_DIR}/assets/prospero.ini
   ${PROJECT_SOURCE_DIR}/assets/Roboto-Medium.ttf
   ${PROJECT_SOURCE_DIR}/assets/JetBrainsMono-Regular.ttf
   ${PROJECT_SOURCE_DIR}/assets/NotoSansSymbols2-subset.ttf

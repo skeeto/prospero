@@ -604,6 +604,7 @@ static Str istr(Arena *a, i64 v)
 #  include "view.cpp"
 #  include "theme.cpp"
 #  include "fonts.cpp"
+#  include "help.cpp"
 #  include "place.cpp"
 #  include "compose.cpp"
 #  include "pathpick.cpp"
@@ -616,6 +617,7 @@ static Str istr(Arena *a, i64 v)
 #  include "test/theme_test.cpp"
 #  include "test/thumb_test.cpp"
 #  include "test/fonts_test.cpp"
+#  include "test/help_test.cpp"
 #  include "test/place_test.cpp"
 #  include "test/compose_test.cpp"
 #  include "test/pathpick_test.cpp"
@@ -670,6 +672,7 @@ int main()
     test_theme(&t);
     test_thumb(&t);
     test_fonts(&t);
+    test_help(&t);
     test_place(&t);
     test_firstgeom(&t);
     test_compose(&t);

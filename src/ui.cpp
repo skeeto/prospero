@@ -2229,8 +2229,9 @@ static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea
 // A document (DocView) in a child window filling the rest of the window
 // at the cursor: laid out at its width whole, as a document is short,
 // its text selectable, with the text's context menu, and its keys while
-// the window has focus.
-static void drawdoc(Gui *g, DocView *d, char const *id)
+// the window has focus. Returns the destination of a link clicked, if
+// any, which is the caller's to follow.
+static Str drawdoc(Gui *g, DocView *d, char const *id)
 {
     View       *v     = d->v;
     f32         sc    = g->scale;
@@ -2261,7 +2262,16 @@ static void drawdoc(Gui *g, DocView *d, char const *id)
     ImVec2   wpos = ImGui::GetWindowPos();
     TextArea ta   = {v, wpos, ImGui::GetWindowHeight(), width, pad, pad,
                      ImGui::GetScrollY(), &d->dragging, &d->scrollto};
-    textmouse(g, &ta);
+    TextHit hit  = textmouse(g, &ta);
+    Str     link = {};
+    if (hit.hit && ImGui::IsItemHovered()) {
+        link = doclinkat(msgdoc(v, hit.at.msg), hit.at.off);
+        if (link.len) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        }
+    }
+    b32 follow = link.len && ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
+                 !ImGui::GetIO().KeyShift;
     if (begintextmenu(g, v, -1)) {
         endtextmenu(g, v);
     }
@@ -2283,6 +2293,7 @@ static void drawdoc(Gui *g, DocView *d, char const *id)
     sp->Merge(dl);
     ImGui::EndChild();
     textkeys(g, v);  // the window's, as its child's
+    return follow ? link : Str{};
 }
 
 // The find bar, open over the transcript: the text to find, the hits
@@ -3752,17 +3763,15 @@ static u32 hostcolor(Gui *g, GuiHost *h)
 static b32  cannew(Gui *);
 static void newsession(Gui *);
 
-// Remember where the last item went by name, for the scripted
-// checklist (T_NAMED): menu items by their labels, and the sidebar's
-// headings and fold arrows by what they are for.
-static void itemnamed(Gui *g, Str name)
+// Remember where something went by name, for the scripted checklist
+// (T_NAMED): menu items by their labels, and the sidebar's headings and
+// fold arrows by what they are for.
+static void namedrect(Gui *g, Str name, ImVec2 a, ImVec2 z)
 {
     if (!g->drive) {
         return;
     }
     name = takehead(name, name.len<64 ? name.len : 64);
-    ImVec2 a = ImGui::GetItemRectMin();
-    ImVec2 z = ImGui::GetItemRectMax();
     Named *n = 0;
     for (i32 i = 0; !n && i < g->nnamed; i++) {
         Named *k = &g->named[i];
@@ -3776,6 +3785,12 @@ static void itemnamed(Gui *g, Str name)
     if (n) {
         n->r = {a.x, a.y, z.x, z.y};
     }
+}
+
+// The last item, by name.
+static void itemnamed(Gui *g, Str name)
+{
+    namedrect(g, name, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
 }
 
 // A tooltip for the last item, disabled or not: why it is disabled.
@@ -7022,76 +7037,79 @@ static void drawfontcredits()
                       "The Noto Project Authors, Google (OFL 1.1)");
 }
 
+// A Help topic picked, from its list or a link: shown from its top, and
+// kept with the layout.
+static void helppick(Gui *g, i32 page)
+{
+    if (page>=0 && page!=g->helppage) {
+        g->helppage = page;
+        ImGui::MarkIniSettingsDirty();
+        scheddirty(&g->sched);
+    }
+}
+
+// Help: its topics (help.cpp) as a list beside the page, or in a pane
+// narrower than about 40 ems, as a combo above it. The page is a
+// document, selectable and copied as the Plan window's is, and a link
+// to help:NAME in it goes to that topic.
 static void drawhelp(Gui *g)
 {
-    // First, so that a new user knows these panes can go
-    ImGui::PushFont(g->fonts.bold, 0);
-    ImGui::TextWrapped(
-        "Close any pane you do not need, this one too: the View menu "
-        "shows each again, and Reset layout puts them all back.");
-    ImGui::PopFont();
-    ImGui::Spacing();
-    ImGui::TextWrapped(
-        "Each session is a conversation with the agent in one working "
-        "directory. Enter sends, Shift+Enter starts a new line, and "
-        "sending while the agent works steers it. Esc or Stop cancels "
-        "the turn. Tool rows and reasoning open and close with a click on "
-        "their header. When a tool asks to leave the workspace, answer "
-        "on its card before the countdown ends, or it is denied.");
-    ImGui::Spacing();
-    ImGui::TextWrapped(
-        "Drag to select across messages; double-click selects a word, "
-        "triple-click a block, Shift-click extends. Right-click for copy "
-        "options. A code block's Copy button, at its corner while the "
-        "mouse is over it, copies its code exactly.");
-    ImGui::Spacing();
-    char const *mod = g->mac ? "Cmd" : "Ctrl";
-    ImGui::TextWrapped(
-        "%s+F finds text in the transcript, folded tool output and "
-        "reasoning included: Enter or %s+G goes to the next match, "
-        "Shift+Enter or %s+Shift+G to the previous, and a folded row "
-        "opens to show one. Esc closes the find bar.", mod, mod, mod);
-    ImGui::Spacing();
-    ImGui::TextWrapped(
-        "The Tool output and Reasoning buttons above the transcript, or "
-        "%s+Shift+T and %s+Shift+R, open all of a session's tool output or "
-        "reasoning, hidden reasoning too, whatever [ui] tools and [ui] "
-        "thinking say; again, and the rows fold as before. The bar beside "
-        "them shows how full the context is, amber near where it is "
-        "compacted.", mod, mod);
-    ImGui::Spacing();
-    ImGui::TextWrapped(
-        "Each session keeps its own draft in the compose box, saved as you "
-        "type. On an empty box, Up recalls the session's earlier prompts, "
-        "newest first; Up and Down go back and forth, Esc returns to the "
-        "empty draft. A message that starts with /compact [focus], "
-        "/model [NAME], /rename TITLE, /fork, /export or /plan [off] runs "
-        "that command instead (Tab completes), and /NAME [args] invokes the "
-        "skill NAME, its SKILL.md sent with the args; any other text, even "
-        "one starting with a slash, is sent as it is. Right-click the box "
-        "for Undo, Paste and the rest.");
-    ImGui::Spacing();
-    ImGui::TextWrapped(
-        "Ctrl+G (Ctrl on macOS too) opens the draft in an editor: "
-        "[ui] editor in the settings, else $VISUAL, else $EDITOR%s. The "
-        "command must wait until you are done editing, as code --wait, "
-        "subl -w or gvim -f do, and open a window of its own, since there "
-        "is no terminal. The draft becomes what you save when the editor "
-        "exits with status 0. Started from the %s, Prospero does not have "
-        "your shell's environment (no $VISUAL or $EDITOR, and maybe not "
-        "the editor's directory in PATH): set [ui] editor, with a full "
-        "path if need be.",
-        g->mac ? ", else the default text editor, which you then quit" : "",
-        g->mac ? "Finder or the Dock" : "desktop's menus");
-    ImGui::Spacing();
-    ImGui::TextWrapped(
-        "The View menu shows and hides these panes, and zooms the text: "
-        "%s+= and %s+-, %s+0 to reset, or %s and the mouse wheel. "
-        "[ui] font_size in the settings sets its size for good.",
-        g->mac ? "Cmd" : "Ctrl", g->mac ? "Cmd" : "Ctrl",
-        g->mac ? "Cmd" : "Ctrl", g->mac ? "Cmd" : "Ctrl");
-    ImGui::Spacing();
-    drawfontcredits();
+    Arena       a   = g->frame;
+    ImGuiStyle &st  = ImGui::GetStyle();
+    i32         cur = g->helppage>=0 && g->helppage<HELP_COUNT ? g->helppage : 0;
+    if (!g->helpdoc) {
+        g->helpdoc = newdocview(&g->perm, g->os, g->vcache);
+    }
+    if (g->helpshown != cur+1) {
+        docset(g->helpdoc, helptext(cur));
+        g->helpdoc->v->sel      = {};
+        g->helpdoc->scrollto    = 0;
+        g->helpshown            = cur + 1;
+    }
+
+    i32 pick = -1;
+    f32 w    = ImGui::GetContentRegionAvail().x;
+    g->helpnarrow = w < 40*ImGui::GetFontSize();
+    g->helpframe  = g->total.frames;
+    if (!g->helpnarrow) {
+        f32 lw = 0;
+        for (i32 i = 0; i < HELP_COUNT; i++) {
+            Str t = helptitle(i);
+            f32 tw = ImGui::CalcTextSize(t.cdata, t.cdata+t.len).x;
+            lw = tw>lw ? tw : lw;
+        }
+        lw += 2*st.WindowPadding.x + 2*st.FramePadding.x;
+        lw  = lw>w*0.4f ? w*0.4f : lw;
+        if (ImGui::BeginChild("##topics", v2(lw, 0), ImGuiChildFlags_Borders)) {
+            for (i32 i = 0; i < HELP_COUNT; i++) {
+                Str t = helptitle(i);
+                if (ImGui::Selectable(cstr0(&a, t), i==cur)) {
+                    pick = i;
+                }
+                itemnamed(g, concat(&a, "help topic ", t));
+            }
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+    } else {
+        ImVec2 at = ImGui::GetCursorScreenPos();
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##topics", cstr0(&a, helptitle(cur)),
+                              ImGuiComboFlags_HeightLarge)) {
+            for (i32 i = 0; i < HELP_COUNT; i++) {
+                Str t = helptitle(i);
+                if (ImGui::Selectable(cstr0(&a, t), i==cur)) {
+                    pick = i;
+                }
+                itemnamed(g, concat(&a, "help topic ", t));
+            }
+            ImGui::EndCombo();
+        }
+        namedrect(g, "help topics", at, v2(at.x+w, at.y+ImGui::GetFrameHeight()));
+    }
+    Str link = drawdoc(g, g->helpdoc, "##helppage");
+    itemnamed(g, "help text");
+    helppick(g, pick>=0 ? pick : helplink(link));
 }
 
 
@@ -7375,8 +7393,12 @@ static void drawmenubar(Gui *g)
         ImGui::EndMenu();
     }
 
-    if (ImGui::BeginMenu("Help")) {
-        if (ImGui::MenuItem("Help")) {
+    menu = ImGui::BeginMenu("Help");
+    itemnamed(g, "menu Help");
+    if (menu) {
+        b32 help = ImGui::MenuItem("Help");
+        itemnamed(g, "open Help");
+        if (help) {
             setpane(g, PANE_HELP, 1);
         }
         if (ImGui::MenuItem("About Prospero")) {
@@ -7480,6 +7502,25 @@ static b32 beginpane(Gui *g, i32 pane)
 {
     if (g->panefocus == pane+1) {
         g->panefocus = 0;
+        ImGui::SetNextWindowFocus();
+    }
+    if (g->floatpane == pane+1) {
+        // The checklist's sizing of a pane: floating, then docked back
+        g->floatpane = 0;
+        ImGuiWindow *w = ImGui::FindWindowByName(panenames[pane]);
+        if (g->floatsize.x > 0) {
+            if (!g->floating) {
+                g->floatdock = w ? w->DockId : 0;
+                g->floating  = 1;
+            }
+            ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+            ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(g->floatsize, ImGuiCond_Always);
+            ImGui::SetNextWindowPos(c, ImGuiCond_Always, v2(0.5f, 0.5f));
+        } else if (g->floating) {
+            ImGui::SetNextWindowDockID(g->floatdock, ImGuiCond_Always);
+            g->floating = 0;
+        }
         ImGui::SetNextWindowFocus();
     }
     bool open = 1;

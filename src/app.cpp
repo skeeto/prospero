@@ -67,6 +67,7 @@
 #include "view.cpp"
 #include "theme.cpp"
 #include "fonts.cpp"
+#include "help.cpp"
 #include "place.cpp"
 #include "compose.cpp"
 #include "pathpick.cpp"
@@ -1041,6 +1042,11 @@ struct Gui {
     GuiHost           *newhost;    // the new session's host
     OutFile            out;        // the Output window's file
     PlanFile           plan;       // the Plan window's
+    i32                helppage;   // the Help window's topic (HELP_*)
+    DocView           *helpdoc;    // and its page, null until first shown
+    i32                helpshown;  // the topic in helpdoc, plus one
+    b32                helpnarrow; // its topics were a combo, not a list
+    i64                helpframe;  // the frame they were last drawn in
     Images             img;        // screenshots
     b32                outopen;
     b32                outfocus;   // brought to the front next frame
@@ -1154,6 +1160,10 @@ struct Gui {
     b32                showdemo;
     b32                panes[PANE_COUNT];  // shown, as the View menu says
     i32                panefocus;  // PANE_*+1 to bring to the front, else 0
+    i32                floatpane;  // PANE_*+1 to float or dock back (OP_FLOAT)
+    ImVec2             floatsize;  // its size floating, 0 wide to dock back
+    ImGuiID            floatdock;  // the dock node it was in, to go back to
+    b32                floating;   // floatdock is saved
     b32                openabout;
     f32                fontbase;   // [ui] font_size
     f32                zoom;       // the View menu's, for this run only
@@ -6689,11 +6699,14 @@ static void saveini(Gui *g, b32 last)
 //   Group=Work
 //   Folded=g:Work
 //   Opened=a
+//   [Prospero][Help]
+//   Page=plan
 //
 // A pane missing (a layout older than it) keeps its default, and the
 // window's place is fitted to the displays as they are (place.cpp). The
 // sidebar keeps its groups' order, empty ones included, and each fold
-// the user chose by its key (sidebar.cpp), folded or opened.
+// the user chose by its key (sidebar.cpp), folded or opened. Help keeps
+// its topic by name (help.cpp), an unknown one the first.
 
 static Str inistr(char const *s)
 {
@@ -6703,7 +6716,8 @@ static Str inistr(char const *s)
 static void *iniopen(ImGuiContext *, ImGuiSettingsHandler *, char const *name)
 {
     Str n = inistr(name);
-    return n=="Panes" ? (void *)1 : n=="Window" ? (void *)2 : n=="Sidebar" ? (void *)3 : 0;
+    return n=="Panes"   ? (void *)1 : n=="Window" ? (void *)2 :
+           n=="Sidebar" ? (void *)3 : n=="Help"   ? (void *)4 : 0;
 }
 
 static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char const *line)
@@ -6714,7 +6728,13 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
         return;
     }
     Int v = parseint(kv.tail);
-    if (entry == (void *)3) {
+    if (entry == (void *)4) {
+        i32 page = helpnamed(kv.tail);
+        if (kv.head == "Page") {
+            g->helppage = page<0 ? 0 : page;
+        }
+        return;
+    } else if (entry == (void *)3) {
         if (kv.head=="Group" && kv.tail.len) {
             addgroup(g, kv.tail);
             g->sidedirty = 0;  // as the file has it
@@ -6789,6 +6809,9 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
         }
         inifolds(out, g->folds);
         out->append("\n");
+    }
+    if (g->helppage) {
+        out->appendf("[Prospero][Help]\nPage=%s\n\n", helpnames[g->helppage]);
     }
 }
 
@@ -7575,6 +7598,8 @@ enum : i32 {
     OP_CLIPBACK,  // the clipboard's text put back
     OP_OPENDIR,   // an open event (macOS: open -a) for the directory text
                   // in --cwd, or the launch's (prospero DIR) if empty
+    OP_FLOAT,     // float the pane named text, dx by dy, centered; dx 0
+                  // docks it back where it was before it first floated
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -7898,6 +7923,9 @@ enum : i32 {
     CHK_FIRSTRUN,     // Help floats centered, selected; Settings and Hosts
                       // with it if dx, else closed
     CHK_DOCKTREE,     // the docked layout, as built, Jobs selected
+    CHK_HELPPAGE,     // Help shows the topic whose page starts with text
+    CHK_HELPNARROW,   // dx 1: Help's topics are a combo above the page; 0 a list
+    CHK_HELPCOPY,     // the clipboard has Help's page, selected whole
     CHK_COUNT,
 };
 
@@ -8097,6 +8125,9 @@ static Str chknames[] = {
     "the window opened at its first size, maximized on a small display",
     "a first run's Help floats centered in front, its tab selected",
     "the layout is as built: its panes' places and shares, Jobs selected",
+    "Help shows the topic picked, its page from the top",
+    "Help's topics are a combo when narrow, else a list beside the page",
+    "Help's page, selected whole, copied as its text",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9149,6 +9180,99 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_ADDEXISTS, 0, 0, 0, ""},
     {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
+    // Help, from its menu, floated wide: each topic in the list beside
+    // the page shows its page from the top, which, selected whole from
+    // its context menu, is copied as its text. Narrow, the topics are a
+    // combo above the page; docked back as it was, the topic is kept.
+    {OP_MOVE, T_NAMED, 0, 0, 100, "menu Help"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "open Help"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 700, ""},
+    {OP_FLOAT, 0, 900, 600, 700, "Help"},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPNARROW, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Sessions and modes"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Sessions and modes\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Permissions and asks"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Permissions and asks\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Plan mode"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Plan mode\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Instructions and skills"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Instructions and skills\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Jobs, todo and subagents"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Jobs, todo and subagents\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Hosts and remotes"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Hosts and remotes\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Desktop control"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Desktop control\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Configuration"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Configuration\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Keyboard and mouse"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Keyboard and mouse\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Troubleshooting"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Troubleshooting\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Getting started"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Getting started\n\n**Close any pane"},
+    {OP_SHOT, 0, 0, 0, 300, "help-wide"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help text"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "text select all"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help text"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "text copy"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_HELPCOPY, 0, 0, 0, ""},
+    {OP_FLOAT, 0, 360, 500, 700, "Help"},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPNARROW, 1, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topics"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "help-combo"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Configuration"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Configuration\n"},
+    {OP_FLOAT, 0, 0, 0, 700, "Help"},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Configuration\n"},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 700, ""},
+    {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
     // Typing, then idle for 15 s: the caret blinks for 10 s, then stops
     {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -12937,6 +13061,30 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_PLANTEXT:
         return tabselected("Plan") && g->planshown>0 && g->plan.doc &&
                find(g->plan.doc->v->msgs[0].text, g->ops[g->drivepc-1].text)>=0;
+    case CHK_HELPPAGE: {
+        DocView *d    = g->helpdoc;
+        Str      want = g->ops[g->drivepc-1].text;
+        return g->helpframe+3>=g->total.frames && d &&
+               d->win && d->win->Scroll.y==0 && g->helpshown==g->helppage+1 &&
+               startswith(helptext(g->helppage), want) &&
+               startswith(d->v->msgs[0].text, want);
+    }
+    case CHK_HELPNARROW:
+        return g->helpframe+3>=g->total.frames &&
+               g->helpnarrow==(g->ops[g->drivepc-1].dx!=0);
+    case CHK_HELPCOPY: {
+        // Copied as text, and as Markdown the page's file, byte for byte
+        Arena    a = g->frame;
+        DocView *d = g->helpdoc;
+        if (!d) return 0;
+        Str text = copysel(d->v, &a, COPY_TEXT);
+        Str md   = copysel(d->v, &a, COPY_MARKDOWN);
+        Str clip = driveclipboard(g, text);
+        if (!(clip == text)) {
+            guilog(g, concat(&a, "drive: the clipboard has ", clip));
+        }
+        return text.len>0 && clip==text && md==helptext(g->helppage);
+    }
     case CHK_BROWSED: {
         Arena a     = g->frame;
         Str   field = {(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)};
@@ -13408,6 +13556,15 @@ static void drivestep(Gui *g)
     case OP_CLOSE:
         e.kind = GEV_CLOSE;
         os_guiinject(g->os, &e);
+        break;
+    case OP_FLOAT:
+        for (i32 i = 0; i < PANE_COUNT; i++) {
+            if (op->text == inistr(panenames[i])) {
+                g->floatpane = i + 1;
+                g->floatsize = v2(op->dx*g->scale, op->dy*g->scale);
+            }
+        }
+        scheddirty(&g->sched);
         break;
     case OP_CHECK: {
         if ((op->target==CHK_DPI || op->target==CHK_DPIBACK) && g->dpibase==0) {

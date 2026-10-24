@@ -170,7 +170,9 @@ opens where it was last, fitted to the displays there are; the first
 time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings
 and Hosts when the configuration names no model and no remote host;
-close them once read, as the View menu shows each again.
+close them once read, as the View menu shows each again. Help → Help
+shows a page on each topic, from getting started to troubleshooting,
+built in from `assets/help`.
 
 `prospero DIR`, such as `prospero .` in a terminal, opens a new
 session in that directory, in Build mode with the configured model,

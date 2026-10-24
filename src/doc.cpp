@@ -713,3 +713,15 @@ static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo)
     closeblock(&p);
     return d;
 }
+
+// The destination of the link at source offset off, empty if none.
+static Str doclinkat(Doc *d, i32 off)
+{
+    for (iz i = 0; i < d->pieces.len; i++) {
+        Piece *pc = &d->pieces[i];
+        if (pc->link>=0 && off>=pc->off && off<pc->off+pc->len) {
+            return d->links[pc->link];
+        }
+    }
+    return {};
+}
