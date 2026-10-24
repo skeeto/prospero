@@ -175,8 +175,9 @@ per session, with the engine, has the session's earlier prompts on Up
 and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
 else `$VISUAL` or `$EDITOR`), and takes `/compact`, `/model`,
 `/rename`, `/fork` and `/export`. An ask may be answered "always",
-which allows that directory for the rest of the session and its
-subagents. Each session has a scratch directory in the system's
+with the button set apart from Allow, which allows that directory, for
+reads or for writes too, for the rest of the session and its subagents,
+even after it is opened again. Each session has a scratch directory in the system's
 temporary directory, which tools may use freely, as they may the rest
 of it unless `[guard] temp = ask`.
 
@@ -367,6 +368,13 @@ included, asks you first, denied if you do not answer in time:
     [role desktop]
     description = Uses programs on the screen, with the mouse and keys
     tools = desktop read write
+
+An ask may instead allow its action's class for the rest of the session
+and its subagents ("Allow input for this session"): `observe` for
+screenshots, the list of windows and waiting; `input` for clicks, the
+mouse, scrolling, keys and text, which includes `observe`; and
+`windows` for focusing and closing them. Starting a program is asked
+about every time. `ask = false` asks about nothing at all.
 
 The work is done by a helper, `prospero-desktop`, next to `prospero`,
 which the harness starts for a turn and talks to over pipes: a program

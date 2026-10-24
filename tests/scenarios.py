@@ -1876,7 +1876,7 @@ def hello_caps(t):
                 {"close.forget", "config.refresh", "file.base64", "desktop",
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
-                 "fork"} <= set(caps) and "host" not in caps,
+                 "fork", "answer.always.desktop"} <= set(caps) and "host" not in caps,
                 f"caps: {caps}")
 
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
@@ -5957,6 +5957,86 @@ def desktop_ask(t):
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_desktop": {"offer": "all", "ask_timeout": 20},
+                "_extra": "[role desk]\ndescription = Types\ntools = desktop\nmodel = {model2}\n"},
+          bound=30)
+def desktop_always(t):
+    """A desktop ask offers its action's class for good: always for input
+    stops the asks for typing, clicking and looking, but not for closing
+    a window or running a program, whose always is refused; a subagent
+    has the grant, logged by "parent", and so does the session in a
+    later process."""
+    env = deskenv(t)
+    h = t.headless(env=env)
+    b = None
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        look = nextask(h, sid)
+        t.check(look.get("always") == "observe" and look.get("scope") == "desktop" and
+                "access" not in look and "path" not in look, f"a look's ask: {look}")
+        h.call("answer", sid=sid, req=look["req"], decision="allow")
+        typ = nextask(h, sid, look["seq"])
+        t.check(typ.get("always") == "input" and typ.get("scope") == "desktop",
+                f"typing's ask: {typ}")
+        r = h.call("answer", sid=sid, req=typ["req"], decision="always")
+        t.check(r.get("ok") == 1, f"answered {r}")
+        close = nextask(h, sid, typ["seq"])
+        t.check(close.get("always") == "windows" and "to close" in close["detail"],
+                f"close's ask: {close}")
+        h.call("answer", sid=sid, req=close["req"], decision="allow")
+        run = nextask(h, sid, close["seq"])
+        t.check("always" not in run and "scope" not in run, f"run's ask offers no always: {run}")
+        r = h.call("answer", sid=sid, req=run["req"], decision="always")
+        t.check(r.get("ok") == 0 and "offers no always" in r.get("err", ""),
+                f"always refused for run: {r}")
+        h.call("answer", sid=sid, req=run["req"], decision="deny")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        asks = h.all("ask", sid)
+        t.check(len(asks) == 4, f"four asks: {[a['detail'] for a in asks]}")
+        ans = h.all("answer", sid)
+        t.check([(a["decision"], a.get("always")) for a in ans] ==
+                [("allow", None), ("allow", 1), ("allow", None), ("deny", None)],
+                f"the answers: {ans}")
+        g = [e for e in logged(t, sid) if e["ev"] == "grant"]
+        t.check(len(g) == 1 and g[0].get("desktop") == "input" and g[0]["by"] == "user" and
+                g[0]["req"] == typ["req"] and "path" not in g[0] and "access" not in g[0],
+                f"the grant: {g}")
+        st = [e["status"] for e in h.all("tool.end", sid)]
+        t.check(st == ["ok"] * 5 + ["denied", "ok"], f"statuses: {st}")
+
+        kid = [s for s in {e.get("sid") for e in h.all("session")} if s and s != sid]
+        t.check(len(kid) == 1, f"one subagent: {kid}")
+        kid = kid[0]
+        kl = logged(t, kid)
+        kg = [(e["by"], e.get("desktop")) for e in kl if e["ev"] == "grant"]
+        t.check(kg == [("parent", "input")], f"the subagent's grants: {kg}")
+        t.check(not [e for e in kl if e["ev"] == "ask"], "the subagent never asked")
+        ke = [(e["status"], e["text"][:80]) for e in kl if e["ev"] == "tool.end"]
+        t.check([st for st, _ in ke] == ["ok"], f"it typed: {ke}")
+        t.check(h.close() == 0, "the first exits")
+        h = None
+
+        # Another process: the grant holds for input, and windows still asks
+        b = t.headless(env=env)
+        o = b.call("open", sid=sid, attended=1)
+        t.check(o.get("ok") == 1, f"open {o}")
+        b.send("prompt", sid=sid, text="again")
+        focus = nextask(b, sid, max(e["seq"] for e in logged(t, sid)))
+        t.check("to the front" in focus["detail"] and
+                focus.get("always") == "windows", f"only focus asks: {focus}")
+        b.call("answer", sid=sid, req=focus["req"], decision="deny")
+        t.check(ended(b, sid, 2)["why"] == "done", "the second turn ends")
+        typed = [c for c in desklog(t) if c[:1] == ["type"]]
+        t.check([c[-1] for c in typed] == ["a", "kid", "b"], f"typed: {typed}")
+        acts = [c[0] for c in desklog(t) if c[:1] in (["run"], ["close"], ["focus"])]
+        t.check(acts == ["close"], f"closed once, nothing run or focused: {acts}")
+    finally:
+        rc = h.close() if h else 0
+        rc2 = b.close() if b else 0
+    t.check(rc == 0 and rc2 == 0, f"headless exit {rc} {rc2}")
 
 
 @scenario(conf={**DESKALL, "_extra": "[model {model}]\ncoordinates = norm1000\n"

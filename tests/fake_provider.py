@@ -1714,6 +1714,46 @@ def sc_desktop_ask(model, n, req):
         yield from answer(model, "Heard: " + desk_results(req)[0])
 
 
+# M9: desktop grants by class. The first turn looks (asked), types (an
+# always for input), clicks and looks (not asked), closes a window and
+# runs a program (each asked), and starts a subagent that types; the
+# second, in a later process, types (not asked) and focuses (asked).
+DESK_ALWAYS = [
+    {"action": "screenshot"},
+    {"action": "type", "text": "a"},
+    {"action": "click", "x": 1, "y": 1},
+    {"action": "screenshot"},
+    {"action": "close", "window": "Fake Editor"},
+    {"action": "run", "program": "notepad.exe"},
+    None,  # the subagent
+    "Done once.",
+    {"action": "type", "text": "b"},
+    {"action": "focus", "window": "Fake Editor"},
+    "Done again.",
+]
+
+
+def sc_desktop_always(model, n, req):
+    k = step(req)
+    if "# Subagent" in system_of(req):
+        if k == 0:
+            yield from tool(model, n, "desktop", {"action": "type", "text": "kid"})
+        else:
+            yield from answer(model, "Child done.")
+        return
+    act = DESK_ALWAYS[k] if k < len(DESK_ALWAYS) else "Done."
+    if act is None:
+        yield from tool(model, n, "task", {"description": "Child", "prompt": "Type.",
+                                           "role": "desk"})
+    elif isinstance(act, str):
+        yield from answer(model, act)
+    else:
+        yield from tool(model, n, "desktop", act)
+
+
+sc_desktop_always_b = sc_desktop_always
+
+
 def sc_desktop_norm(model, n, req):
     k = step(req)
     steps = [{"action": "screenshot"},
@@ -1886,7 +1926,8 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Write outside as a subagent", "Make undoable changes",
                "Read the big files", "Fail over", "Stream in the background",
                "Stream for the link", "Look at the desktop", "Think slowly",
-               "Think briefly", "Answer at length")
+               "Think briefly", "Answer at length", "Write outside for good",
+               "Start a desktop subagent", "Type on the desktop as a subagent")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2133,6 +2174,35 @@ def sc_gui(model, n, req):
             res = tool_results(req)[0]
             yield from answer(model, "Child wrote it." if res.startswith("Created")
                               else "Child was refused.")
+    elif "Write outside for good" in prompt:
+        # Asked once, answered always for ../gui-always (tests/gui.py
+        # makes it), so the second write there is not asked about
+        if step < 2:
+            yield from tool(model, n, "write", {"path": f"../gui-always/{'ab'[step]}.txt",
+                                                "content": "always\n"})
+        else:
+            res = [str(m.get("content", "")) for m in after if m.get("role") == "tool"]
+            ok = len(res) == 2 and all(r.startswith(("Created", "Replaced")) for r in res)
+            yield from answer(model, "Written twice, allowed for good." if ok
+                              else "Not written: " + " / ".join(res))
+    elif "Start a desktop subagent" in prompt:
+        if step == 0:
+            yield from tool(model, n, "task", {"description": "Desktop",
+                                               "prompt": "Type on the desktop as a subagent.",
+                                               "role": "desk"})
+        else:
+            yield from answer(model, "The subagent said: " + tool_results(req)[0][:60])
+    elif "Type on the desktop as a subagent" in prompt:
+        # Typing asked once, answered always for input (the fake helper,
+        # tests/fake_desktop.py), so a key press is not asked about
+        steps = [{"action": "type", "text": "x"}, {"action": "key", "keys": "esc"}]
+        if step < len(steps):
+            yield from tool(model, n, "desktop", steps[step])
+        else:
+            res = [str(m.get("content", "")) for m in after if m.get("role") == "tool"]
+            bad = [r for r in res if r.startswith(("Not done", "Not run", "Failed"))]
+            yield from answer(model, "Typed for good." if len(res) == 2 and not bad
+                              else "Child was refused: " + " / ".join(res))
     elif "Make undoable changes" in prompt:
         steps = [("write", {"path": "undo-a.txt", "content": "one\n"}),
                  ("edit", {"path": "undo-a.txt", "old_string": "one", "new_string": "two"}),

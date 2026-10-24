@@ -1072,7 +1072,8 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             b32 ok = t->answer == VASK_ALLOWED;
             Buf c(&a, 256);
             print(&c, ok ? Str("allowed") : Str("denied"));
-            print(&c, t->by=="user"    ? Str(" by you") :
+            print(&c, t->always        ? Str(" (always) by you") :
+                      t->by=="user"    ? Str(" by you") :
                       t->by=="timeout" ? Str(": nobody answered in time") :
                       t->by=="steer"   ? Str(": you sent a message instead") :
                       t->by=="cancel"  ? Str(": the turn was cancelled") :
@@ -1270,19 +1271,73 @@ static void drawforce(Gui *g, GuiSession *s, ViewMsg *m)
     ImGui::TextDisabled("overwrites the changes made since");
 }
 
-// An open ask's buttons, below its text.
+// An open ask's buttons, below its text. Always, where the ask offers
+// it and the host's engine can take it, stands apart from Allow, past a
+// rule, so that neither is pressed for the other.
 static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
 {
     ViewTool *t = m->tool;
     Arena     a = g->frame;
     if (ImGui::Button("Allow")) {
-        guianswer(g, s, t->req, 1, {});
+        guianswer(g, s, t->req, "allow", {});
     }
     if (latest) itemrect(g, RECT_ALLOW);
     ImGui::SetItemTooltip("Let the %s go ahead", t->tool.len ? cstr0(&a, t->tool) : "tool");
+
+    b32 desk   = t->scope == "desktop";
+    b32 always = t->grant.len &&
+                 hostcap(s->host, desk ? Str("answer.always.desktop") : Str("answer.always"));
+    if (always) {
+        f32 sp = ImGui::GetStyle().ItemSpacing.x;
+        f32 h  = ImGui::GetFrameHeight();
+        ImGui::SameLine(0, sp);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::GetWindowDrawList()->AddLine(p, v2(p.x, p.y+h),
+                                            ImGui::GetColorU32(ImGuiCol_Separator));
+        ImGui::Dummy(v2(1, h));
+        ImGui::SameLine(0, sp);
+
+        Buf b(&a, 128 + t->grant.len);
+        if (desk) {
+            print(&b, "Allow ");
+            print(&b, t->grant);
+            print(&b, " for this session");
+        } else {
+            // Its last name, cut to its end if long, so that the
+            // buttons fit; the tooltip has the whole path
+            Str dir = t->grant;
+            iz  i   = dir.len;
+            for (; i>1 && dir[i-1]!='/' && dir[i-1]!='\\'; i--) {}
+            dir = i>1 && i<dir.len ? cuthead(dir, i) : dir;
+            if (dir.len > 20) {
+                i = dir.len - 19;
+                for (; i<dir.len && (dir[i]&0xc0)==0x80; i++) {}
+                dir = concat(&a, "\xe2\x80\xa6", cuthead(dir, i));
+            }
+            print(&b, "Always allow ");
+            print(&b, dir);
+            print(&b, t->access=="write" ? Str(" (write)") : Str(" (read)"));
+        }
+        print(&b, "##always");
+        if (ImGui::Button(cstr0(&a, finish(&b)))) {
+            guianswer(g, s, t->req, "always", {});
+        }
+        if (latest) itemrect(g, RECT_ALWAYS);
+        if (desk) {
+            ImGui::SetItemTooltip("Allow this action, and every %s action from now on in "
+                                  "this session and its subagents, without asking",
+                                  cstr0(&a, t->grant));
+        } else {
+            ImGui::SetItemTooltip("Allow this, and every %s in %s from now on in this "
+                                  "session and its subagents, without asking",
+                                  t->access=="write" ? "read and write" : "read",
+                                  cstr0(&a, t->grant));
+        }
+    }
+
     ImGui::SameLine();
     if (ImGui::Button("Deny")) {
-        guianswer(g, s, t->req, 0, {});
+        guianswer(g, s, t->req, "deny", {});
     }
     if (latest) itemrect(g, RECT_DENY);
     ImGui::SetItemTooltip("The agent reads why and tries something else");
@@ -2111,7 +2166,7 @@ static void drawtranscript(Gui *g)
         }
     }
     i32 latest[] = {RECT_USERMSG, RECT_TASKLINK, RECT_UNDO, RECT_REWINDTURN, RECT_FORCE, RECT_COMPACTHDR,
-                    RECT_THINKHDR};
+                    RECT_THINKHDR, RECT_ALWAYS};
     for (iz i = 0; i < countof(latest); i++) {
         g->rects[latest[i]] = {};  // the latest drawn, or none
     }
@@ -2247,7 +2302,7 @@ static void drawtranscript(Gui *g)
         go |= ImGui::Button("Deny");
         if (go) {
             Str note = {(u8 *)g->denynote, (iz)__builtin_strlen(g->denynote)};
-            guianswer(g, g->denysess, g->denyreq, 0, trim(note));
+            guianswer(g, g->denysess, g->denyreq, "deny", trim(note));
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();

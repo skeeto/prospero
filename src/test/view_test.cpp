@@ -361,6 +361,36 @@ static void test_view(Test *t)
         expect(t, "view.scratch", v->scratch, "/t/prospero-1/s");
     }
 
+    // A desktop ask offers its class for good, and one for run offers
+    // nothing; a desktop grant record changes nothing shown
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"d1","name":"desktop","args":"{\"action\":\"type\"}"},)"
+                    R"({"t":"call","id":"d2","name":"desktop","args":"{\"action\":\"run\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"ask","req":"d1/ask","call":"d1",)"
+                    R"("kind":"desktop","tool":"desktop","detail":"desktop: type \"hi\"",)"
+                    R"("always":"input","scope":"desktop","deadline":30000,"dflt":"deny"})");
+        ViewTool *k = v->msgs[2].tool;
+        expect(t, "view.deskalways", concat(&a, k->grant, concat(&a, " ", k->scope)),
+               "input desktop");
+        expect(t, "view.deskaccess", istr(&a, k->access.len + k->path.len), "0");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"answer","req":"d1/ask","decision":"allow",)"
+                    R"("by":"user","note":"","always":1})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"grant","desktop":"input","by":"user",)"
+                    R"("req":"d1/ask"})");
+        expect(t, "view.deskanswer", istr(&a, v->asks*100 + k->answer*10 + k->always),
+               concat(&a, istr(&a, VASK_ALLOWED), "1"));
+        apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"ask","req":"d2/ask","call":"d2",)"
+                    R"("kind":"desktop","tool":"desktop","detail":"desktop: run x",)"
+                    R"("deadline":30000,"dflt":"deny"})");
+        ViewTool *r = v->msgs[3].tool;
+        expect(t, "view.deskrun", istr(&a, r->grant.len + r->scope.len + v->asks*100), "100");
+        expect(t, "view.deskseq", istr(&a, v->lastseq), "6");
+    }
+
     // A crash while asking leaves no answer, and recovery ends the call:
     // its end closes the card too
     {

@@ -179,6 +179,7 @@ enum : i32 {
     RECT_NEWCREATE,
     RECT_ALLOW,
     RECT_DENY,
+    RECT_ALWAYS,
     RECT_SETTING,
     RECT_CLOSESTOP,
     RECT_CLOSECANCEL,
@@ -2061,7 +2062,7 @@ static void guifork(Gui *g, GuiSession *s, i64 turn)
     cmdsend(g, &w, a);
 }
 
-static void guianswer(Gui *g, GuiSession *s, Str req, b32 allow, Str note)
+static void guianswer(Gui *g, GuiSession *s, Str req, Str decision, Str note)
 {
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 256 + req.len + note.len);
@@ -2069,7 +2070,7 @@ static void guianswer(Gui *g, GuiSession *s, Str req, b32 allow, Str note)
     putkey(&w.json, "req");
     putstr(&w.json, req);
     putkey(&w.json, "decision");
-    putstr(&w.json, allow ? Str("allow") : Str("deny"));
+    putstr(&w.json, decision);
     if (note.len) {
         putkey(&w.json, "note");
         putstr(&w.json, note);
@@ -6308,6 +6309,7 @@ enum : i32 {
     OP_PLACE,     // move the window as if saved: dx 1 on a display to the
                   // right of all, gone since; 0 back as remembered
     OP_MARKSESS,  // remember the session shown, for CHK_DRAFTFILE
+    OP_IFROLE,    // unless the configuration has role text, skip dx ops
 };
 
 enum : i32 {
@@ -6330,6 +6332,7 @@ enum : i32 {
     T_NEWCREATE,
     T_ALLOW,       // the latest open ask's buttons
     T_DENY,
+    T_ALWAYS,
     T_SETTINGSTAB,
     T_SETTING,     // the first endpoint's idle_timeout field
     T_CLOSESTOP,   // the close dialog's buttons
@@ -6576,6 +6579,10 @@ enum : i32 {
     CHK_FORKED,
     CHK_DELCOUNT,     // the delete confirmation counts dx sessions
     CHK_GUILOCK,      // this process holds the state directory's window lock
+    CHK_ALWAYSBTN,
+    CHK_ALWAYSPATH,
+    CHK_DESKALWAYSBTN,
+    CHK_KIDALWAYS,
     CHK_COUNT,
 };
 
@@ -6736,6 +6743,10 @@ static Str chknames[] = {
     "the fork is shown, its draft the prompt that came next",
     "the delete confirmation counts the sessions it takes",
     "the window lock is held, and by this process",
+    "the ask offers Always for its directory, apart from Allow",
+    "allowed always: the second write was not asked about",
+    "the subagent's desktop ask offers Always for input",
+    "the subagent typed for good, asked once",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -7440,6 +7451,20 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_CHECK, CHK_ASKALLOWED, 0, 0, 0, ""},
+    // An ask allowed for good through its Always button, past a rule
+    // from Allow: a directory of its own (tests/gui.py), so that later
+    // asks still ask, written twice with one ask
+    {OP_PROMPT, 0, 0, 0, 100, "Write outside for good: ask once."},
+    {OP_WAIT, W_ASK, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_ALWAYSBTN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "2-always"},
+    {OP_MOVE, T_ALWAYS, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_ALWAYSPATH, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "2-allowedalways"},
     // An ask nobody answers, denied at its deadline, its countdown
     // drawn by deadlines alone
     {OP_PROMPT, 0, 0, 0, 100, "Write outside the workspace, ask, and wait for nobody."},
@@ -8309,6 +8334,28 @@ static DriveOp sessionsops[] = {
     {OP_WAIT, W_SAID, 0, 0, 10000, "Hello"},
     {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Say hello again."},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Greeting (imported)\n"},
+    // A subagent's desktop ask (the fake helper, which tests/gui.py
+    // configures here only), allowed for its class through Always,
+    // apart from Allow: its next input is not asked about
+    {OP_IFROLE, 0, 17, 0, 0, "desk"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Start a desktop subagent."},
+    {OP_WAIT, W_KIDASK, 0, 0, 10000, ""},
+    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_WAIT, W_ASK, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_DESKALWAYSBTN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-deskalways"},
+    {OP_MOVE, T_ALWAYS, 0, 0, 150, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_ALLIDLE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_KIDALWAYS, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-deskallowed"},
     // Idle: no frames
     {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},  // hover delays and the layout's save
     {OP_MARK, 0, 0, 0, 3000, ""},
@@ -8945,6 +8992,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_NEWCREATE:   return rectcenter(g->rects[RECT_NEWCREATE]);
     case T_ALLOW:       return rectcenter(g->rects[RECT_ALLOW]);
     case T_DENY:        return rectcenter(g->rects[RECT_DENY]);
+    case T_ALWAYS:      return rectcenter(g->rects[RECT_ALWAYS]);
     case T_SETTING:     return rectcenter(g->rects[RECT_SETTING]);
     case T_ADDNAME:     return rectcenter(g->rects[RECT_ADDNAME]);
     case T_ADDBTN:      return rectcenter(g->rects[RECT_ADDBTN]);
@@ -10489,6 +10537,52 @@ static b32 drivecheck(Gui *g, i32 chk)
                m && find(m->text, "Child wrote it")>=0 &&
                os_stat(g->os, a, f).type==STAT_FILE;
     }
+    case CHK_ALWAYSBTN: {
+        ViewMsg *m = lastmsg(g, VIEW_ASK);
+        Rect     a = g->rects[RECT_ALLOW];
+        Rect     w = g->rects[RECT_ALWAYS];
+        Rect     d = g->rects[RECT_DENY];
+        return m && m->tool->answer==VASK_PENDING && endswith(m->tool->grant, "/gui-always") &&
+               m->tool->access=="write" && !m->tool->scope.len &&
+               w.x1>w.x0 && w.x0>a.x1 && d.x0>w.x1;
+    }
+    case CHK_ALWAYSPATH: {
+        ViewMsg *k = lastmsg(g, VIEW_ASK);
+        ViewMsg *m = lastmsg(g, VIEW_ASSISTANT);
+        Arena    a = g->frame;
+        Str      f = join(&a, g->drivecwd, "../gui-always/b.txt");
+        i32      n = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewTool *t = v->msgs[i].tool;
+            n += v->msgs[i].role==VIEW_ASK && endswith(t->grant, "/gui-always");
+        }
+        return k && k->tool->answer==VASK_ALLOWED && k->tool->always &&
+               k->tool->by=="user" && n==1 && g->rects[RECT_ALWAYS].x1<=0 &&
+               m && find(m->text, "Written twice")>=0 &&
+               os_stat(g->os, a, f).type==STAT_FILE;
+    }
+    case CHK_DESKALWAYSBTN: {
+        ViewMsg *m = lastmsg(g, VIEW_ASK);
+        Rect     a = g->rects[RECT_ALLOW];
+        Rect     w = g->rects[RECT_ALWAYS];
+        return v->parent.len && m && m->tool->answer==VASK_PENDING &&
+               m->tool->scope=="desktop" && m->tool->grant=="input" &&
+               w.x1>w.x0 && w.x0>a.x1;
+    }
+    case CHK_KIDALWAYS: {
+        // Shown: the subagent, whose parent's reply follows
+        GuiSession *k = g->sess;
+        GuiSession *p = k ? findsess(g, k->host, v->parent) : 0;
+        ViewMsg    *q = lastof(v, VIEW_ASK);
+        ViewMsg    *m = p && p->view ? lastof(p->view, VIEW_ASSISTANT) : 0;
+        i32         n = 0;
+        for (iz i = 0; k && i < k->view->msgs.len; i++) {
+            n += k->view->msgs[i].role == VIEW_ASK;
+        }
+        return q && q->tool->answer==VASK_ALLOWED && q->tool->always &&
+               q->tool->scope=="desktop" && n==1 &&
+               m && find(m->text, "Typed for good")>=0;
+    }
     case CHK_TODOACTIVE:
         return g->todoshown==3 && v->todos[0].status==VTODO_ACTIVE &&
                v->todos[1].status==VTODO_PENDING && v->todos[2].status==VTODO_PENDING;
@@ -11222,6 +11316,18 @@ static void drivestep(Gui *g)
         if (!found) {
             Arena a = g->frame;
             guilog(g, concat(&a, "drive: skip, with no session titled ", op->text));
+            g->drivepc += (i32)op->dx;
+        }
+    } break;
+    case OP_IFROLE: {
+        b32 found = 0;
+        for (iz i = 0; i < g->cfgheads.len; i++) {
+            CfgHead *h = &g->cfgheads[i];
+            found |= h->kind=="role" && h->name==op->text;
+        }
+        if (!found) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, "drive: skip, with no role ", op->text));
             g->drivepc += (i32)op->dx;
         }
     } break;

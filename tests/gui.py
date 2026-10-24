@@ -188,6 +188,17 @@ def m4config(url, nonce):
     )
 
 
+DESKROLE = (
+    "\n# A subagent's desktop ask, allowed always (the fake helper)\n"
+    "[desktop]\n"
+    "offer = roles\n"
+    "\n"
+    "[role desk]\n"
+    "description = Uses the desktop\n"
+    "tools = desktop\n"
+)
+
+
 M4MODELS = {"gui_b": {}, "guifail": {}, "guifail_b": {},
             "gui_small": {"meta": {"n_ctx": 24000, "n_ctx_train": 262144}},
             "gui_prune": {"meta": {"n_ctx": 100000, "n_ctx_train": 262144}}}
@@ -1224,8 +1235,20 @@ def main():
                         f"\n[model fake:gui_b:{nonce}]\ntemperature = 0.5\n"
                         "\n[remote far]\nssh = far.invalid\n"
                         "\n[remote hidden]\nssh = hidden.invalid\nlist = connected\n")
+        if isinstance(host, Local):
+            # A role with the desktop tool, its helper the fake (which
+            # every process of the run inherits), for a subagent's ask
+            # allowed always; the checklist skips it without the role.
+            # Not in drive mode: there the configuration would outgrow
+            # its small inbox.
+            os.environ["PROSPERO_TEST_DESKTOP"] = json.dumps(
+                [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "fake_desktop.py")])
+            before += DESKROLE
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
+        # A directory for the ask allowed always
+        host.mkdir(host.path("gui-always"))
         # Instruction files for the info popup, and files to compact over
         host.write(host.path("work", "AGENTS.md"), "# Checklist rules\n\nKeep it short.\n")
         bigfiles(host, "small-", 8, 160)
@@ -1393,6 +1416,12 @@ def main():
             holder.wait(timeout=10)
         except subprocess.TimeoutExpired:
             holder.kill()
+    if isinstance(host, Local):
+        # A desktop helper's reaper (the sessions mode's subagent) goes
+        # a few seconds after the engine that started it
+        deadline = time.monotonic() + 5
+        while strays(host.root) and time.monotonic() < deadline:
+            time.sleep(0.25)
     left = host.strays()
     if left:
         problems.append("processes left: " + "; ".join(left))

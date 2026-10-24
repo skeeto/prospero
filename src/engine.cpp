@@ -73,11 +73,12 @@
 // and so does a steer, whose text the agent reads next (as does any ask
 // while a steer waits for the next step). Every denial is the call's
 // tool result, explaining what to do instead. A path's ask offers to
-// allow its directory for good ("always"), which the answer may take
-// (see "Grants"). The log holds ask and answer (and its grant) before
-// the call's tool.start, so a crash while asking leaves a call that
-// never started rather than an unknown outcome, which the next open
-// closes in order: answer, tool.start, tool.end (logopen).
+// allow its directory for good ("always"), and a desktop ask its class
+// of actions, which the answer may take (see "Grants"). The log holds
+// ask and answer (and its grant) before the call's tool.start, so a
+// crash while asking leaves a call that never started rather than an
+// unknown outcome, which the next open closes in order: answer,
+// tool.start, tool.end (logopen).
 //
 // Scratch files: each session has a directory of its own for them,
 // named in its system prompt, <sid> in os_scratchdir, which its
@@ -384,16 +385,20 @@ struct Ask {
     GuardPath gp;
     GuardHint hint;
     i64       opened;   // ticks
-    Str       grant;    // what "always" would allow (guardgrant), or null
+    Str       grant;    // what "always" would allow (guardgrant), or a
+                        // desktop class's name, or null
     b32       gwrite;   // and for writes too, not only reads
+    i32       gclass;   // a desktop ask's DESKC_*, with grant its name
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
 // file tools may use from then on, for reads alone or for writes too,
-// in the session and every session of its tree (see "Grants").
+// or a class of desktop actions, in the session and every session of
+// its tree (see "Grants").
 struct Grant {
-    Str path;
+    Str path;   // null for a desktop grant
     b32 write;
+    u32 desk;   // a desktop grant's class, as its bit (1<<DESKC_*)
 };
 
 // A summary compaction under way (REQ_COMPACT).
@@ -2874,46 +2879,96 @@ static_assert(countof(bynames) == DENY_COUNT);
 // "Always allow" answers an ask for good: what it offered (guardgrant),
 // a directory or a file, becomes a hidden root of the session's guard,
 // for reads alone or for writes too, logged as a grant record, which
-// loadsession replays. A grant covers the session's whole tree: a new
-// subagent starts with its parent's, logged in it by "parent", and one
-// that a subagent gets is logged in its root too, by "subagent". Every
-// grant is given to every session of the tree in memory, and logged by
-// "parent" in those it was new to. The frozen system prompt never names
-// a grant.
+// loadsession replays. A desktop ask offers its action's class instead
+// (deskclass), never run's: then that class's actions, and those it
+// implies (deskcovers), skip the ask while [desktop] ask is on. Its
+// record names the class in place of a path, the guard never sees it,
+// and engines before it skip it on replay. A grant covers the
+// session's whole tree: a new subagent starts with its parent's,
+// logged in it by "parent", and one that a subagent gets is logged in
+// its root too, by "subagent". Every grant is given to every session of
+// the tree in memory, and logged by "parent" in those it was new to.
+// The frozen system prompt never names a grant.
 
-static b32 hasgrant(Session *s, Str path, b32 write)
+// The desktop classes a session's grants cover, as bits.
+static u32 deskgranted(Session *s)
 {
+    u32 r = 0;
+    for (iz i = 0; i < s->grants.len; i++) {
+        for (i32 c = 0; c < DESKC_COUNT; c++) {
+            r |= s->grants[i].desk>>c & 1 ? deskcovers(c) : 0;
+        }
+    }
+    return r;
+}
+
+static b32 hasgrant(Session *s, Grant want)
+{
+    if (want.desk) {
+        return (deskgranted(s) & want.desk) == want.desk;
+    }
     for (iz i = 0; i < s->grants.len; i++) {
         Grant *g = &s->grants[i];
-        if (g->path==path && (g->write || !write)) {
+        if (!g->desk && g->path==want.path && (g->write || !want.write)) {
             return 1;
         }
     }
     return 0;
 }
 
-// The grants' roots, after the rest of the session's (sessionguard).
+// The path grants' roots, after the rest of the session's (sessionguard).
 static void guardgrants(Session *s, Arena *perm, Guard *g)
 {
     for (iz i = 0; i < s->grants.len; i++) {
         Grant *t     = &s->grants[i];
         i32    flags = ROOT_HIDDEN | ROOT_MISSING | (t->write ? 0 : ROOT_READ);
-        guardadd(s->e->os, perm, g, t->path, flags);
+        if (!t->desk) {
+            guardadd(s->e->os, perm, g, t->path, flags);
+        }
     }
 }
 
 // Give a session in memory a grant, from its next call on. Whether it
 // is new to the session.
-static b32 addgrant(Session *s, Str path, b32 write)
+static b32 addgrant(Session *s, Grant g)
 {
-    if (hasgrant(s, path, write)) {
+    if (hasgrant(s, g)) {
         return 0;
     }
-    Grant g = {clone(&s->perm, path), write};
+    g.path = g.desk ? Str{} : clone(&s->perm, g.path);
     s->grants = push(&s->perm, s->grants, g);
-    i32 flags = ROOT_HIDDEN | ROOT_MISSING | (write ? 0 : ROOT_READ);
-    guardadd(s->e->os, &s->perm, &s->guard, g.path, flags);
+    if (!g.desk) {
+        i32 flags = ROOT_HIDDEN | ROOT_MISSING | (g.write ? 0 : ROOT_READ);
+        guardadd(s->e->os, &s->perm, &s->guard, g.path, flags);
+    }
     return 1;
+}
+
+// A grant record's grant, not cloned: zero (no path, no class) if it
+// has neither, as for a class that is never granted.
+static Grant grantof(Json *j)
+{
+    Grant g = {};
+    Str   d = jsonstr(jsonget(j, "desktop"));
+    if (d.data) {
+        i32 c = deskclassfind(d);
+        g.desk = c>=0 && deskcovers(c) ? 1u<<c : 0;
+    } else {
+        g.path  = jsonstr(jsonget(j, "path"));
+        g.write = jsonstr(jsonget(j, "access")) == "write";
+    }
+    return g;
+}
+
+// A desktop grant's class, by name.
+static Str grantclass(Grant g)
+{
+    for (i32 c = 0; c < DESKC_COUNT; c++) {
+        if (g.desk>>c & 1) {
+            return deskclassnames[c];
+        }
+    }
+    return {};
 }
 
 // The durable record of a grant: by "user" (req, the ask it answered),
@@ -2925,8 +2980,12 @@ static void loggrant(Session *s, Arena scratch, Grant g, Str by, Str req, Str fr
     }
     Buf   b(&scratch, 256 + g.path.len + req.len + from.len);
     EvOut w = sbegin(s, &b, EV_GRANT);
-    putstrkey(&w.json, "path", g.path);
-    putstrkey(&w.json, "access", g.write ? Str("write") : Str("read"));
+    if (g.desk) {
+        putstrkey(&w.json, "desktop", grantclass(g));
+    } else {
+        putstrkey(&w.json, "path", g.path);
+        putstrkey(&w.json, "access", g.write ? Str("write") : Str("read"));
+    }
     putstrkey(&w.json, "by", by);
     if (req.len) {
         putstrkey(&w.json, "req", req);
@@ -2950,9 +3009,8 @@ static Session *treeroot(Session *s)
 // that is another session in memory, then given to the whole tree, and
 // logged by "parent" in each other session of it that lacked it, so
 // that one opened again later has it as it had it here.
-static void usergrant(Session *s, Arena scratch, Str path, b32 write, Str req)
+static void usergrant(Session *s, Arena scratch, Grant g, Str req)
 {
-    Grant    g    = {path, write};
     Session *root = treeroot(s);
     b32      top  = root!=s && !root->psid.len;
     loggrant(s, scratch, g, "user", req, {});
@@ -2960,7 +3018,7 @@ static void usergrant(Session *s, Arena scratch, Str path, b32 write, Str req)
         loggrant(root, scratch, g, "subagent", req, s->sid);
     }
     for (Session *t = s->e->sessions; t; t = t->next) {
-        if (treeroot(t)==root && addgrant(t, path, write) &&
+        if (treeroot(t)==root && addgrant(t, g) &&
                 t!=s && !(t==root && top)) {
             loggrant(t, scratch, g, "parent", {}, {});
         }
@@ -3005,7 +3063,14 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         ssend(s, &w);
     }
     if (allow && always && k->grant.len) {
-        usergrant(s, scratch, k->grant, k->gwrite, k->req);
+        Grant g = {};
+        if (k->tool == TOOL_DESKTOP) {
+            g.desk  = 1u << k->gclass;
+        } else {
+            g.path  = k->grant;
+            g.write = k->gwrite;
+        }
+        usergrant(s, scratch, g, k->req);
     }
 
     toolstart(s, scratch);
@@ -4775,18 +4840,23 @@ static void deskrecord(Session *s, Arena scratch, Record r)
     }
 }
 
-// A desktop call, asked about first if need be. Returns 1 if the call
-// finished, 0 if it goes on (asking, or waiting for the helper).
+// A desktop call, asked about first if need be: unless a grant covers
+// its class (see "Grants"). Returns 1 if the call finished, 0 if it
+// goes on (asking, or waiting for the helper).
 static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
 {
     Engine *e   = s->e;
     Block  *c   = &s->calls[s->callidx];
-    Str     why = deskcheck(s, &scratch, d);
+    i32     cls = deskclass(d->action);
+    Grant   g   = {};
+    g.desk = 1u << cls;
+    Str why = deskcheck(s, &scratch, d);
     if (why.data) {
         toolstart(s, scratch);
         toolend(s, scratch, "error", why, 0, 0, {}, 0);
         return 1;
-    } else if (!cfgbool(cfgget(e->cfg, "desktop", "", "ask", 0))) {
+    } else if (!cfgbool(cfgget(e->cfg, "desktop", "", "ask", 0)) ||
+               (deskcovers(cls) && hasgrant(s, g))) {
         toolstart(s, scratch);
         return deskrun(s, scratch, d);
     }
@@ -4796,6 +4866,10 @@ static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
     k->req    = clone(&s->perm, concat(&scratch, c->id, "/ask"));
     k->tool   = TOOL_DESKTOP;
     k->opened = os_ticks(e->os);
+    if (deskcovers(cls)) {
+        k->grant  = deskclassnames[cls];  // static
+        k->gclass = cls;
+    }
     b32 steer = s->steers.len > 0;
     b32 wait  = attending(s) && !steer;
     i64 delay = cfgms(e->cfg, "desktop", "", "ask_timeout", 0)*MS;
@@ -4811,6 +4885,10 @@ static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
         putstrkey(&w.json, "kind", "desktop");
         putstrkey(&w.json, "tool", "desktop");
         putstrkey(&w.json, "detail", what);
+        if (k->grant.data) {
+            putstrkey(&w.json, "always", k->grant);
+            putstrkey(&w.json, "scope", "desktop");
+        }
         putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
@@ -6479,7 +6557,8 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     // The parent's scratch directory, and its grants (logged below)
     s->scratch = p->scratch.len ? clone(&s->perm, p->scratch) : Str{};
     for (iz i = 0; i < p->grants.len; i++) {
-        Grant g = {clone(&s->perm, p->grants[i].path), p->grants[i].write};
+        Grant g = p->grants[i];
+        g.path = g.desk ? Str{} : clone(&s->perm, g.path);
         s->grants = push(&s->perm, s->grants, g);
     }
     s->model = clone(&s->perm, model);
@@ -7547,11 +7626,11 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->ctxhint = jsonint(jsonget(j, "ctx"), s->ctxhint);
             break;
         case EV_GRANT: {
-            // "Always allow", as the guard has it from then on
-            Str path  = jsonstr(jsonget(j, "path"));
-            b32 write = jsonstr(jsonget(j, "access")) == "write";
-            if (path.len && !hasgrant(s, path, write)) {
-                Grant g = {clone(&s->perm, path), write};
+            // "Always allow", as the guard has it from then on, or a
+            // class of desktop actions
+            Grant g = grantof(j);
+            if ((g.desk || g.path.len) && !hasgrant(s, g)) {
+                g.path = g.desk ? Str{} : clone(&s->perm, g.path);
                 s->grants = push(&s->perm, s->grants, g);
             }
         } break;

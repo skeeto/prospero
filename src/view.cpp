@@ -246,8 +246,10 @@ struct ViewTool {
     Str  hint;
     i64  deadline;  // epoch ms
     i32  answer;    // VASK_*
-    Str  grant;     // what always would allow: a directory or a file
+    Str  grant;     // what always would allow: a directory or a file,
+                    // or a desktop class (scope "desktop")
     Str  access;    // and for what: read or write
+    Str  scope;     // "desktop" for a class, else a path
     b32  always;    // allowed for good (a grant)
     Str  by;
     Str  note;
@@ -1627,6 +1629,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->deadline = jsonint(jsonget(j, "deadline"), r->ts);
         t->grant    = clone(&v->aux, jsonstr(jsonget(j, "always")));
         t->access   = clone(&v->aux, jsonstr(jsonget(j, "access")));
+        t->scope    = clone(&v->aux, jsonstr(jsonget(j, "scope")));
         v->msgs[i].tool = t;
         v->msgs[i].seq  = r->seq;
         v->asks++;
@@ -2959,7 +2962,8 @@ static void viewexport(Buf *b, View *v, Str sid, b32 think, b32 tools, b32 outpu
                 print(b, more ? Str("\xe2\x80\xa6") : Str(""));
             }
             if (ask) {
-                print(b, t->answer==VASK_ALLOWED ? Str(" (allowed)") :
+                print(b, t->always                 ? Str(" (allowed always)") :
+                         t->answer==VASK_ALLOWED ? Str(" (allowed)") :
                          t->answer==VASK_DENIED  ? Str(" (denied)")  : Str(""));
             } else if (t->status != VTOOL_OK) {
                 print(b, " (");

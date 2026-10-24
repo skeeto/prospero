@@ -25,7 +25,9 @@
 //
 // The tool is off unless [desktop] offer turns it on, which only the
 // user's own file can do, and every action is an ask with a deadline,
-// denied when nobody answers, unless [desktop] ask is false.
+// denied when nobody answers, unless [desktop] ask is false. The user
+// may allow a class of actions for good (deskclass), which the engine
+// keeps as a grant, as it does a path's.
 //
 // Everything here is pure: the engine does the I/O.
 //
@@ -494,6 +496,54 @@ static i64 deskdropped(i64 total, i64 keep, i64 slack)
 static b32 desklooks(i32 action)
 {
     return action==DESK_SCREENSHOT || action==DESK_WINDOWS || action==DESK_WAIT;
+}
+
+// Classes of actions, which a desktop grant allows for good: looking,
+// input (which looks too), and managing windows. Running a program is
+// asked about every time, and never granted by class.
+enum : i32 {
+    DESKC_OBSERVE,
+    DESKC_INPUT,
+    DESKC_WINDOWS,
+    DESKC_RUN,
+    DESKC_COUNT,
+};
+
+static Str deskclassnames[] = {"observe", "input", "windows", "run"};
+static_assert(countof(deskclassnames) == DESKC_COUNT);
+
+static i32 deskclass(i32 action)
+{
+    switch (action) {
+    case DESK_SCREENSHOT:
+    case DESK_WINDOWS:
+    case DESK_WAIT:   return DESKC_OBSERVE;
+    case DESK_FOCUS:
+    case DESK_CLOSE:  return DESKC_WINDOWS;
+    case DESK_RUN:    return DESKC_RUN;
+    }
+    return DESKC_INPUT;
+}
+
+static i32 deskclassfind(Str name)  // -1 if unknown
+{
+    for (i32 i = 0; i < DESKC_COUNT; i++) {
+        if (deskclassnames[i] == name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// The classes a grant of class c covers, as bits: none for run.
+static u32 deskcovers(i32 c)
+{
+    switch (c) {
+    case DESKC_OBSERVE: return 1u<<DESKC_OBSERVE;
+    case DESKC_INPUT:   return 1u<<DESKC_INPUT | 1u<<DESKC_OBSERVE;
+    case DESKC_WINDOWS: return 1u<<DESKC_WINDOWS;
+    }
+    return 0;
 }
 
 // What a step's looks saw so far, h, and then this reply.

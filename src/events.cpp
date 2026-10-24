@@ -173,6 +173,7 @@ static Str capnames[] = {
     "fork",            // fork, a new session from a turn of another
     "config.delete",   // config.set {delete}: a section of the user's file
     "import",          // upload and import, a session from a raw log
+    "answer.always.desktop",  // a desktop ask's always, by action class
 };
 
 static Str evname(i32 ev)
