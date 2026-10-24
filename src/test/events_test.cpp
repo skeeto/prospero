@@ -154,6 +154,32 @@ static void testlogcopy(Test *t)
            "see /s/sessions/A/out/c1.log, C:\\S\\sessions\\B\\out\\c2.log, "
            "C:/S/sessions/B/snap/3. Not /s/sessions/AB/x");
 
+    // Bypass mode stays behind, as plan mode does not: a mode record
+    // back to Build, in the new directory, before the title
+    {
+        Str modes[] = {
+            src[0],
+            "{\"sid\":\"A\",\"seq\":2,\"ts\":6,\"ev\":\"mode\",\"mode\":\"plan\","
+            "\"by\":\"new\",\"path\":\"/s/sessions/A/plan.md\"}\n",
+            "{\"sid\":\"A\",\"seq\":3,\"ts\":7,\"ev\":\"mode\",\"mode\":\"bypass\","
+            "\"by\":\"user\",\"path\":\"/s/sessions/A/plan.md\"}\n",
+        };
+        Slice<Str> ml = {modes, countof(modes), countof(modes)};
+        c = logcopy(&a, scratch, ml, "A", "B", posix, posixnew, -1, 100, 0);
+        rest = cuthead(c.log, find(c.log, "{\"sid\":\"B\",\"seq\":4,"));
+        expect(t, "logcopy bypass", rest,
+               "{\"sid\":\"B\",\"seq\":4,\"ts\":100,\"ev\":\"mode\",\"mode\":\"default\","
+               "\"by\":\"fork\",\"path\":\"/s/sessions/B/plan.md\"}\n"
+               "{\"sid\":\"B\",\"seq\":5,\"ts\":100,\"ev\":\"title\",\"text\":\"Untitled (fork)\","
+               "\"by\":\"auto\"}\n");
+        ml.len = 2;
+        c = logcopy(&a, scratch, ml, "A", "B", posix, posixnew, -1, 100, 0);
+        expect(t, "logcopy plan", logseqs(&a, c.log), "1 2 3");
+        ml.len = 3;
+        c = logcopy(&a, scratch, ml, "A", "B", posix, posixnew, -1, 100, 0, 1);
+        expect(t, "logcopy bypass imported", logseqs(&a, c.log), "1 2 3 4");
+    }
+
     // Refused: a subagent's log, a turn not ended, a turn not there
     Str kid[] = {"{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"parent\":\"P\"}\n"};
     c = logcopy(&a, scratch, {kid, 1, 1}, "A", "B", posix, posixnew, -1, 100, 0);
@@ -329,7 +355,7 @@ static void test_events(Test *t)
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
                "\"delete\",\"fork\",\"config.delete\",\"import\","
-               "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\"]}");
+               "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);

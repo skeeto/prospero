@@ -45,7 +45,7 @@ enum : i32 {
     EV_PREFIX,
     EV_MODEL,   // (M8) the session's model from here on
     EV_GRANT,   // (M8) an "always allow" from the user
-    EV_MODE,    // plan mode, or out of it, from here on
+    EV_MODE,    // plan mode, Bypass mode, or neither, from here on
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -143,7 +143,7 @@ enum : i32 {
     CMD_UPLOAD,  // (M9) part of a file staged for import
     CMD_IMPORT,  // (M9) a new session from a log staged by upload
     CMD_SKILLS,  // a session's skills, for /name
-    CMD_MODE,    // plan mode, or out of it
+    CMD_MODE,    // plan mode, Bypass mode, or neither
     CMD_UNQUEUE, // withdraw a queued message not yet taken in
     CMD_COUNT,
 };
@@ -191,6 +191,8 @@ static Str capnames[] = {
     "images",          // upload {kind:"image"}, prompt and steer {images}
     "home",            // hello {home}, and new and import take a cwd
                        // beginning with ~, in that home directory
+    "bypass",          // mode {mode:"bypass"}, the mode record's bypass,
+                       // and answers by "bypass"
 };
 
 static Str evname(i32 ev)
@@ -775,7 +777,8 @@ static Replay logreplay(Os *os, Arena *perm, Arena scratch, Str path,
 // original. The session record says where it came from (forked_from,
 // fork_turn) right after ev, where the sessions list, which reads only a
 // log's first 4 KiB, finds it, and a title record "TITLE (fork)" ends the
-// log. It is pure, so that an import can make use of it too: an import
+// log, after a mode record back to Build (by "fork") if the cut left it
+// in Bypass mode. It is pure, so that an import can make use of it too: an import
 // (logimport) is a copy of the whole log, whose session record says
 // imported_from instead, and whose title is "TITLE (imported)".
 
@@ -923,6 +926,8 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
     }
 
     // What the cut leaves
+    b32 bypass   = 0;
+    Str planfile = {};
     for (iz i = 0; i < end; i++) {
         Arena t   = scratch;
         EvRec rec = evparse(&t, lines[i]);
@@ -936,6 +941,10 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
             break;
         case EV_MODEL:
             r.model = clone(a, jsonstr(jsonget(rec.root, "model")));
+            break;
+        case EV_MODE:
+            bypass   = jsonstr(jsonget(rec.root, "mode")) == "bypass";
+            planfile = clone(a, jsonstr(jsonget(rec.root, "path")));
             break;
         }
     }
@@ -1024,6 +1033,15 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
             line = finish(&b);
         }
         printreplaced(&out, line, o, n);
+    }
+    if (bypass && !imported) {
+        // Bypass was the user's pick for that session alone
+        Buf   b(&scratch, 256 + planfile.len);
+        EvOut w = evbegin(&b, to, ++last, now, EV_MODE);
+        putstrkey(&w.json, "mode", "default");
+        putstrkey(&w.json, "by", "fork");
+        putstrkey(&w.json, "path", planfile);
+        printreplaced(&out, evend(&w), o, n);
     }
     {
         Buf   b(&scratch, 256 + r.title.len);

@@ -335,6 +335,14 @@ static void test_guard(Test *t)
     d.hint = guardhint(os, a, &g, d.gp.path, 0, 1);
     deny   = guarddenial(a, &d);
     expect(t, "denial example", istr(a, find(deny, "(for example /w/new.txt)")>0), "1");
+    deny   = guardstatedenial(a, "write", "/s/sessions/x/events.jsonl", "/s", "/w");
+    expect(t, "denial state", deny,
+           "Permission denied: write of /s/sessions/x/events.jsonl would write "
+           "under the harness's state directory /s, where it keeps its "
+           "sessions' logs, locks and caches. Bypass mode allows writes "
+           "outside the working directory, but never there, so nothing was "
+           "done. Do not retry this path. Write somewhere else instead, for "
+           "example inside /w.");
 
     // What "always" grants: the directory, a search's directory itself,
     // the file alone in a root or the home directory, never those whole,

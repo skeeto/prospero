@@ -232,14 +232,36 @@ enum : i64 {
     TODO_REMIND = 12,  // mutating calls without a todo update
 };
 
+// A session's mode (Plan mode, Bypass mode), by its record's name.
+enum : i32 {
+    MODE_BUILD,   // "default": asks as configured
+    MODE_PLAN,    // nothing changes but the plan file
+    MODE_BYPASS,  // nothing is asked of the user but plans
+    MODE_COUNT,
+};
+
+static Str modenames[] = {"default", "plan", "bypass"};
+static_assert(countof(modenames) == MODE_COUNT);
+
+static i32 modefind(Str name)
+{
+    for (i32 m = 0; m < MODE_COUNT; m++) {
+        if (modenames[m] == name) {
+            return m;
+        }
+    }
+    return -1;
+}
+
 // Something for the agent to read before its next request: a job that
 // ended, files rewound, instructions for a directory, skills changed,
-// plan mode, a message from another session.
+// the mode, a message from another session.
 struct Notice {
     Str kind;    // "job", "rewind", "instructions", "skills", "budget",
                  // "mode", "message"
     Str text;
     i64 job;     // for "job"
+    i32 mode;    // for "mode": MODE_*, the one it tells
     b32 skills;  // its record lists the skills the agent knows now
     Str from;    // for "message": the sender's sid and title
     Str ftitle;
@@ -582,9 +604,10 @@ struct Session {
     // The todo list
     Slice<TodoItem> todos;
     i32          mutations;  // mutating calls since the list changed
-    // Plan mode
-    b32          plan;       // nothing changes but the plan file
-    b32          planheard;  // the agent was told the mode as it is
+    // Plan mode and Bypass mode
+    i32          mode;       // MODE_*, its own: a subagent's Bypass is
+                             // its parent's (bypassing)
+    i32          modeheard;  // MODE_*, as the agent was last told it
     Str          planfile;   // plan.md in dir: absolute, normalized
     // Snapshots for rewind
     Slice<Snap>  snaps;
@@ -882,6 +905,31 @@ static b32 attending(Session *s)
     return 0;
 }
 
+static b32 planning(Session *s)
+{
+    return s->mode == MODE_PLAN;
+}
+
+// Whether the session is in Bypass mode: the nearest of it and its
+// ancestors in memory that is not in Build, as it is now, so that a
+// subagent follows its parent's changes, even while idle. One in Plan
+// mode (a subagent of a planning parent) never bypasses.
+static b32 bypassing(Session *s)
+{
+    for (i32 n = 0; s && n<=TASK_DEPTH; s = s->parent, n++) {
+        if (s->mode != MODE_BUILD) {
+            return s->mode == MODE_BYPASS;
+        }
+    }
+    return 0;
+}
+
+// The mode as the agent should know it.
+static i32 modeof(Session *s)
+{
+    return planning(s) ? MODE_PLAN : bypassing(s) ? MODE_BYPASS : MODE_BUILD;
+}
+
 
 // History
 
@@ -1111,9 +1159,12 @@ static void userinput(Session *s)
 
 // Give the agent the notices queued since its last request, each a
 // message of its own and a durable record, so that a session opened
-// again sends the same history.
+// again sends the same history. The mode is looked at anew, as a
+// subagent's follows its parent's.
+static void planheed(Session *, Arena);
 static void deliver(Session *s, Arena scratch)
 {
+    planheed(s, scratch);
     for (iz i = 0; i < s->notices.len; i++) {
         Notice *n = &s->notices[i];
         Arena   a = scratch;
@@ -1129,6 +1180,9 @@ static void deliver(Session *s, Arena scratch)
             putintkey(&w.json, "hop", n->hop);
             s->hop = n->hop>s->hop ? n->hop : s->hop;
         }
+        if (n->kind == "mode") {
+            putstrkey(&w.json, "mode", modenames[n->mode]);
+        }
         putstrkey(&w.json, "text", n->text);
         if (n->skills) {
             putskills(&w.json, s->skillseen, 0);
@@ -1140,7 +1194,7 @@ static void deliver(Session *s, Arena scratch)
         m.text = n->text;
         addmsg(s, m);
         if (n->kind == "mode") {
-            s->planheard = s->plan;  // the one queued is as it is now
+            s->modeheard = n->mode;
         }
     }
     s->notices = {};
@@ -2973,6 +3027,68 @@ static Str planrules(Session *s, Arena *a)
     return finish(&b);
 }
 
+// Bypass mode
+//
+// A session in Bypass mode asks the user nothing but the agent's own
+// asks about plan mode, which are decisions, not permissions: its file
+// tools read and write outside the roots, patches change files there,
+// many at once, and the desktop tool acts in every class, run's too,
+// attended or not, as for an agent left to work alone somewhere that
+// it cannot harm. Still refused: a path that names nothing (NUL), the
+// desktop's own errors (deskcheck), and writes under the state
+// directory but the plan file, as the sessions' logs, locks and caches
+// are there (bypassrefuses). Only the user turns it on (mode), never a
+// new session, an agent or the configuration, and it lasts, as a mode
+// record, through reopening, reviving and restarts, but a fork starts
+// in Build (logcopy) and an import has no mode records. A subagent
+// follows its root's mode as it is now (bypassing). Turned on while
+// asks wait in the tree, they are allowed, by "bypass". The agent
+// learns of it from a notice (planheed), which overrides the frozen
+// system prompt's word that access outside the working directory is
+// denied.
+
+// What Bypass mode allows, for the agent.
+static Str bypassrules(Session *s, Arena *a)
+{
+    Buf b(a, 1024 + s->e->statedir.len);
+    print(&b, s->modeheard==MODE_PLAN ? Str("Plan mode is off. ") : Str(""));
+    print(&b, s->depth ? Str("Bypass mode is on: the user allows the agent "
+                             "you work for, and you, to work without asking. ")
+                       : Str("Bypass mode is on: the user allows you to work "
+                             "without asking. "));
+    print(&b, "Your file tools may read and write outside the working "
+              "directory, and the desktop tool may act, all without the "
+              "user's approval. This overrides what you were told before, "
+              "that access outside the working directory is denied. Writes "
+              "under the harness's state directory, ");
+    print(&b, s->e->statedir);
+    print(&b, ", are still refused: leave its files alone. Take care, as "
+              "nobody checks your actions first.");
+    return finish(&b);
+}
+
+// The notice of mode m, to an agent told of another.
+static Str modenotice(Session *s, Arena *a, i32 m)
+{
+    switch (m) {
+    case MODE_PLAN: {
+        Str rules = planrules(s, a);
+        return s->modeheard==MODE_BYPASS ? concat(a, "Bypass mode is off. ", rules)
+                                         : rules;
+    }
+    case MODE_BYPASS:
+        return bypassrules(s, a);
+    }
+    if (s->modeheard == MODE_BYPASS) {
+        return "Bypass mode is off: the user ended it. Access outside the "
+               "working directory needs the user's approval again, as do "
+               "the desktop actions that needed it before, and either may "
+               "be denied.";
+    }
+    return "Plan mode is off: the user ended it. Change files and run "
+           "commands as the task needs.";
+}
+
 // Queue the notice of the mode, unless the agent knows it as it is: a
 // notice of the mode queued before goes, as the mode changed since.
 static void planheed(Session *s, Arena scratch)
@@ -2984,32 +3100,33 @@ static void planheed(Session *s, Arena scratch)
         }
     }
     s->notices.len = n;
-    if (s->plan != s->planheard) {
-        Str text = s->plan ? planrules(s, &scratch)
-                           : Str("Plan mode is off: the user ended it. Change "
-                                 "files and run commands as the task needs.");
-        notify(s, "mode", text, 0);
+    i32 m = modeof(s);
+    if (m != s->modeheard) {
+        notify(s, "mode", modenotice(s, &scratch, m), 0);
+        s->notices[s->notices.len-1].mode = m;
     }
 }
 
 // Change the mode and log it, by "new", "user" (mode), "agent"
-// (enter_plan_mode, allowed), "approved" (exit_plan_mode) or "parent"
-// (a subagent's, as it starts). The agent hears of it in a call's result
-// for its own asks, and otherwise from a notice.
-static void setmode(Session *s, Arena scratch, b32 plan, Str by)
+// (enter_plan_mode, allowed), "approved" (exit_plan_mode), "parent"
+// (a subagent's, as it starts) or "fork" (out of Bypass, at the end of
+// a fork's copy of the log, logcopy). The agent hears of it in a call's
+// result for its own asks, and otherwise from a notice, as do the
+// subagents that follow it (deliver).
+static void setmode(Session *s, Arena scratch, i32 mode, Str by)
 {
-    s->plan = plan;
+    s->mode = mode;
     {
         Arena a = scratch;
         Buf   b(&a, 256 + s->planfile.len);
         EvOut w = sbegin(s, &b, EV_MODE);
-        putstrkey(&w.json, "mode", plan ? Str("plan") : Str("default"));
+        putstrkey(&w.json, "mode", modenames[mode]);
         putstrkey(&w.json, "by", by);
         putstrkey(&w.json, "path", s->planfile);
         ssend(s, &w);
     }
     if (by=="agent" || by=="approved") {
-        s->planheard = plan;
+        s->modeheard = mode;
     }
     planheed(s, scratch);
 }
@@ -3019,6 +3136,27 @@ static b32 isplanfile(Session *s, Str path)
 {
     return s->planfile.len && (HOST_WINDOWS ? equalfold(path, s->planfile)
                                             : path==s->planfile);
+}
+
+// Whether a write to a normalized absolute path is one Bypass mode
+// refuses: under the state directory, lexically or for real, but
+// neither the plan file (a real path) nor inside the guard's roots, as
+// the user allowed those without it.
+static b32 bypassrefuses(Session *s, Arena scratch, Str path)
+{
+    Os *os  = s->e->os;
+    b32 win = s->guard.win;
+    if (!bypassing(s) || guardpath(os, &scratch, &s->guard, path, 0).inside) {
+        return 0;
+    }
+    Str want = realpathof(os, &scratch, path, win);
+    if (isplanfile(s, path) || (want.data && isplanfile(s, want))) {
+        return 0;
+    }
+    Str dir  = normpath(&scratch, s->guard.cwd, s->e->statedir, win);
+    Str real = realpathof(os, &scratch, dir, win);
+    return within(dir, path, win) ||
+           (real.data && want.data && within(real, want, win));
 }
 
 // Why plan mode refuses a change to the file at path.
@@ -3043,7 +3181,7 @@ static Str planrefusal(Session *s, Arena *a, Str path)
 // file, or null. The patch's paths are absolute (patchguard).
 static Str planpatchout(Session *s, Patch *p)
 {
-    for (iz i = 0; s->plan && i<p->files.len; i++) {
+    for (iz i = 0; planning(s) && i<p->files.len; i++) {
         PatchFile *f = &p->files[i];
         if (f->file.data && !isplanfile(s, f->file)) {
             return f->file;
@@ -3101,11 +3239,11 @@ static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
     Str      rules = {};
     PlanText plan  = {};
     if (allow && !leave) {
-        setmode(s, scratch, 1, "agent");
+        setmode(s, scratch, MODE_PLAN, "agent");
         rules = planrules(s, &scratch);
     } else if (allow) {
         plan = readplan(s, &scratch);
-        setmode(s, scratch, 0, "approved");
+        setmode(s, scratch, MODE_BUILD, "approved");
     }
     Buf b(&scratch, 1024 + note.len + rules.len + plan.text.len);
     if (allow && !leave) {
@@ -3200,10 +3338,14 @@ static b32 startsearch(Session *, Arena, i32 tool, Str path, Args *);
 
 // The files a patch names, judged by the guard: those outside the roots,
 // unless the user allowed one, to be asked about (out), and at most one
-// such (many is set).
+// such (many is set). In Bypass mode none is asked about, but the patch
+// is refused for the first that names nothing (nul), or else for the
+// first under the state directory (state).
 struct PatchGuard {
     GuardPath out;
     b32       many;
+    Str       nul;
+    Str       state;
 };
 
 static PatchGuard patchguard(Session *s, Arena *a, Patch *p, Str allowed)
@@ -3227,14 +3369,26 @@ static PatchGuard patchguard(Session *s, Arena *a, Patch *p, Str allowed)
                 r.many = 1;
             }
             r.out = g;
+            if (!r.nul.data && cut(g.path, 0).ok) {
+                r.nul = g.path;
+            } else if (!r.state.data && bypassrefuses(s, *a, g.path)) {
+                r.state = g.path;
+            }
         }
     }
     return r;
 }
 
+// The result of a call refused in Bypass mode for a path that names
+// nothing, which the user would have been asked about otherwise.
+static Str const NULREFUSAL = "Not run: a path holds a NUL byte, so it names "
+                              "no file, and nothing was done. Give the path "
+                              "without it.";
+
 // edit as a patch: change, with snapshots, every file the patch names,
-// all inside the roots but the one the user may have allowed. Each
-// change is worked out before any is made.
+// all inside the roots but the one the user may have allowed, or in
+// Bypass mode, any but those under the state directory. Each change is
+// worked out before any is made.
 static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
 {
     Engine    *e  = s->e;
@@ -3245,7 +3399,15 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
         Str text = planrefusal(s, &scratch, no);
         toolend(s, scratch, "denied", text, 0, 0, {}, 0);
         return;
-    } else if (pg.out.path.data) {
+    } else if (pg.nul.data && bypassing(s)) {
+        toolend(s, scratch, "denied", NULREFUSAL, 0, 0, {}, 0);
+        return;
+    } else if (pg.state.data) {
+        Str text = guardstatedenial(&scratch, toolnames[TOOL_EDIT], pg.state,
+                                    e->statedir, s->guard.cwd);
+        toolend(s, scratch, "denied", text, 0, 0, {}, 0);
+        return;
+    } else if (pg.out.path.data && !bypassing(s)) {
         Str text = concat(&scratch, "Not run: the patch changes a file "
                           "outside the working directory that was not "
                           "allowed: ", pg.out.path);
@@ -3300,7 +3462,10 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
 // if the call finished, 0 if it goes on (a search).
 static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
 {
-    if (tool==TOOL_GREP || tool==TOOL_GLOB) {
+    if (cut(path, 0).ok && bypassing(s)) {
+        toolend(s, scratch, "denied", NULREFUSAL, 0, 0, {}, 0);
+        return 1;
+    } else if (tool==TOOL_GREP || tool==TOOL_GLOB) {
         return startsearch(s, scratch, tool, path, args);
     }
     Engine *e    = s->e;
@@ -3311,8 +3476,13 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     if (tool==TOOL_EDIT && s->te.edit==EDIT_PATCH) {
         runpatch(s, scratch, args, path);
         return 1;
-    } else if (s->plan && !toolreads(tool) && !isplanfile(s, path)) {
+    } else if (planning(s) && !toolreads(tool) && !isplanfile(s, path)) {
         Str text = planrefusal(s, &scratch, path);
+        toolend(s, scratch, "denied", text, 0, 0, {}, 0);
+        return 1;
+    } else if (!toolreads(tool) && bypassrefuses(s, scratch, path)) {
+        Str text = guardstatedenial(&scratch, toolnames[tool], path,
+                                    e->statedir, s->guard.cwd);
         toolend(s, scratch, "denied", text, 0, 0, {}, 0);
         return 1;
     }
@@ -3338,7 +3508,7 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     return 1;
 }
 
-static Str bynames[] = {"policy", "user", "timeout", "steer", "cancel"};
+static Str bynames[] = {"policy", "user", "timeout", "steer", "cancel", "bypass"};
 static_assert(countof(bynames) == DENY_COUNT);
 
 // Grants
@@ -3516,6 +3686,7 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         case DENY_TIMEOUT: why = "nobody answered before the deadline"; break;
         case DENY_STEER:   why = "the user sent a message instead";     break;
         case DENY_CANCEL:  why = "the turn was cancelled";              break;
+        case DENY_BYPASS:  why = "the user turned on Bypass mode";      break;
         }
     }
     {
@@ -5376,8 +5547,9 @@ static void deskrecord(Session *s, Arena scratch, Record r)
 }
 
 // A desktop call, asked about first if need be: unless a grant covers
-// its class (see "Grants"). Returns 1 if the call finished, 0 if it
-// goes on (asking, or waiting for the helper).
+// its class (see "Grants"), or in Bypass mode, any class, even run's.
+// Returns 1 if the call finished, 0 if it goes on (asking, or waiting
+// for the helper).
 static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
 {
     Engine *e   = s->e;
@@ -5390,7 +5562,7 @@ static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
         toolstart(s, scratch);
         toolend(s, scratch, "error", why, 0, 0, {}, 0);
         return 1;
-    } else if (!cfgbool(cfgget(e->cfg, "desktop", "", "ask", 0)) ||
+    } else if (bypassing(s) || !cfgbool(cfgget(e->cfg, "desktop", "", "ask", 0)) ||
                (deskcovers(cls) && hasgrant(s, g))) {
         toolstart(s, scratch);
         return deskrun(s, scratch, d);
@@ -5703,11 +5875,11 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
     Block   *c     = &s->calls[s->callidx];
     b32      leave = tool == TOOL_PLANEXIT;
     PlanText plan  = {};
-    if (!leave && s->plan) {
+    if (!leave && planning(s)) {
         plan.err = concat(&scratch, "Plan mode is on already. Write your "
                           "plan to ", s->planfile);
         plan.err = concat(&scratch, plan.err, ", then call exit_plan_mode.");
-    } else if (leave && !s->plan) {
+    } else if (leave && !planning(s)) {
         plan.err = "Plan mode is not on, so there is no plan to approve. Go "
                    "on with the task.";
     } else if (leave) {
@@ -5775,12 +5947,14 @@ static b32 runtool(Session *s, Arena scratch)
     // The guard comes first: a path it questions is asked about before
     // the call starts. A search without a path searches the working
     // directory. A patch may change files outside the roots only when it
-    // names one such file, which is asked about.
+    // names one such file, which is asked about. Bypass mode asks about
+    // none of them, but refuses some (runfile, runpatch).
+    b32 bypass = bypassing(s);
     if (!s->blocked && tool==TOOL_EDIT && s->te.edit==EDIT_PATCH && !args.issues.len) {
         PatchGuard pg = patchguard(s, &scratch, &args.patch, {});
-        if (planpatchout(s, &args.patch).data) {
+        if (planpatchout(s, &args.patch).data || bypass) {
             toolstart(s, scratch);
-            return runfile(s, scratch, tool, s->guard.cwd, &args);  // refused
+            return runfile(s, scratch, tool, s->guard.cwd, &args);  // or refused
         } else if (pg.many) {
             toolstart(s, scratch);
             toolend(s, scratch, "denied", "Not run: the patch changes more than "
@@ -5798,7 +5972,7 @@ static b32 runtool(Session *s, Arena scratch)
         Str       want = args.path.data ? args.path : Str(".");
         GuardPath g    = guardpath(e->os, &scratch, &s->guard, want, toolreads(tool));
         b32       mine = isplanfile(s, g.path);  // the harness's own file
-        if (!g.inside && !mine && !(s->plan && !toolreads(tool))) {
+        if (!g.inside && !mine && !(planning(s) && !toolreads(tool)) && !bypass) {
             return askcall(s, scratch, tool, &g);
         }
         toolstart(s, scratch);
@@ -5806,7 +5980,7 @@ static b32 runtool(Session *s, Arena scratch)
     }
 
     if (!s->blocked && tool==TOOL_DESKTOP && !args.issues.len) {
-        if (s->plan && deskclass(args.desk.action)!=DESKC_OBSERVE) {
+        if (planning(s) && deskclass(args.desk.action)!=DESKC_OBSERVE) {
             toolstart(s, scratch);
             toolend(s, scratch, "denied", "Not done: plan mode is on, so the "
                     "desktop tool may only look: screenshot, windows and "
@@ -6229,9 +6403,9 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     setstate(s, S_IDLE);
     // The summary may have left out plan mode: told again, before the
     // request that follows
-    s->planheard = 0;
+    s->modeheard = MODE_BUILD;
     planheed(s, scratch);
-    if (s->plan && cp.why!=CW_MANUAL) {
+    if (modeof(s)!=MODE_BUILD && cp.why!=CW_MANUAL) {
         deliver(s, scratch);
     }
 
@@ -7637,8 +7811,8 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     for (iz i = 0; i < s->grants.len; i++) {
         loggrant(s, scratch, s->grants[i], "parent", {}, {});
     }
-    if (p->plan) {
-        setmode(s, scratch, 1, "parent");  // read-only for its task
+    if (planning(p)) {
+        setmode(s, scratch, MODE_PLAN, "parent");  // read-only for its task
     }
     // Complete before scratch is passed on, which copies it
     Str title = cleantitle(&scratch, args->desc.len ? args->desc : args->prompt,
@@ -8764,7 +8938,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     instrlogstart(s, scratch);
     logprefix(s, scratch);
     if (plan) {
-        setmode(s, scratch, 1, "new");
+        setmode(s, scratch, MODE_PLAN, "new");
     }
     reply(e, scratch, id, 1, {}, s->sid);
 
@@ -9020,13 +9194,17 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->ctxhint = jsonint(jsonget(j, "ctx"), s->ctxhint);
             break;
         case EV_MODE: {
-            Str by = jsonstr(jsonget(j, "by"));
-            s->plan = jsonstr(jsonget(j, "mode")) == "plan";
-            s->planheard = by=="agent" || by=="approved" ? s->plan : s->planheard;
+            // A mode unknown here, a newer engine's, is Build
+            Str by   = jsonstr(jsonget(j, "by"));
+            i32 mode = modefind(jsonstr(jsonget(j, "mode")));
+            s->mode  = mode<0 ? MODE_BUILD : mode;
+            s->modeheard = by=="agent" || by=="approved" ? s->mode : s->modeheard;
         } break;
         case EV_NOTICE:
             if (jsonstr(jsonget(j, "kind")) == "mode") {
-                s->planheard = s->plan;
+                // The mode it told, else (an older record) the mode then
+                i32 told = modefind(jsonstr(jsonget(j, "mode")));
+                s->modeheard = told<0 ? s->mode : told;
             }
             break;
         case EV_GRANT: {
@@ -9062,7 +9240,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             }
             countbytes(s);
             s->thinkfrom = r.seq;
-            s->planheard = 0;  // told again (compacted)
+            s->modeheard = MODE_BUILD;  // told again (compacted)
         } break;
         case EV_ASSISTANT:
             m.seq  = r.seq;
@@ -9849,37 +10027,49 @@ static void cmdmodel(Engine *e, Arena scratch, i64 id, Json *j)
     emit(e, line);
 }
 
-// mode {sid, mode}: plan mode ("plan") or out of it ("default"), which
-// the agent reads in a notice at its next request (Plan mode). Only
-// while idle, or while an ask waits, but not the agent's own asks about
-// plan mode, which their answers settle. A subagent's mode is its
-// parent's, and a session without exit_plan_mode is never in plan mode.
+// mode {sid, mode}: plan mode ("plan"), Bypass mode ("bypass") or
+// neither ("default"), which the agent reads in a notice at its next
+// request (Plan mode, Bypass mode). Into or out of plan mode only while
+// idle, or while an ask waits, but not the agent's own asks about plan
+// mode, which their answers settle; between Build and Bypass at any
+// time. A subagent's mode is its parent's, and a session without
+// exit_plan_mode is never in plan mode. Into Bypass, the path and
+// desktop asks waiting in the session's tree are allowed, by "bypass".
 static void cmdmode(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
 {
-    Str mode = jsonstr(jsonget(j, "mode"));
-    b32 plan = mode == "plan";
+    i32 mode = modefind(jsonstr(jsonget(j, "mode")));
+    b32 plan = mode==MODE_PLAN || planning(s);
     b32 own  = s->state==S_ASK && (s->ask.tool==TOOL_PLANENTER ||
                                    s->ask.tool==TOOL_PLANEXIT);
-    Str err  = !plan && mode!="default" ? Str("mode must be plan or default") :
+    Str err  = mode<0   ? Str("mode must be plan, bypass or default") :
                s->depth ? Str("a subagent's mode is its parent's") :
-               plan && !tooloffered(&s->te, TOOL_PLANEXIT)
+               mode==MODE_PLAN && !tooloffered(&s->te, TOOL_PLANEXIT)
                         ? Str("this session has no exit_plan_mode tool") :
                own      ? Str("the agent asks about plan mode: answer that instead") :
-               busy(s) && s->state!=S_ASK
+               plan && busy(s) && s->state!=S_ASK
                         ? Str("busy: change the mode once the turn ends, or while it asks")
                         : Str{};
     if (err.len) {
         reply(e, scratch, id, 0, err, s->sid);
         return;
     }
-    if (plan != s->plan) {
-        setmode(s, scratch, plan, "user");
+    if (mode != s->mode) {
+        setmode(s, scratch, mode, "user");
+    }
+    for (Session *t = e->sessions; mode==MODE_BYPASS && t; t = t->next) {
+        b32 asks = t->state==S_ASK && (t->ask.tool!=TOOL_PLANENTER &&
+                                       t->ask.tool!=TOOL_PLANEXIT);
+        if (asks && treeroot(t)==s && bypassing(t)) {
+            Arena a = scratch;
+            resolve(t, a, 1, DENY_BYPASS, {});
+            nexttool(t, a);
+        }
     }
     Buf   b(&scratch, 256);
     EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
-    putstrkey(&w.json, "mode", s->plan ? Str("plan") : Str("default"));
+    putstrkey(&w.json, "mode", modenames[s->mode]);
     emit(e, evend(&w));
 }
 

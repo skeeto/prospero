@@ -1597,6 +1597,37 @@ def sc_plan_task_b(model, n, req):
         yield from answer(model, "Child: " + tool_results(req)[0])
 
 
+# Bypass mode: the scenario's prompt, a task's or a message, says what
+# to call, as "do " and a JSON list of [name, args], all in one
+# response; once they are done, the agent answers with their results,
+# each up to its first period. Notices (of the mode) may follow it.
+
+def sc_bypass(model, n, req):
+    msgs = req.get("messages", [])
+    at = max((i for i, m in enumerate(msgs) if m.get("role") == "user" and
+              "do [" in str(m.get("content", ""))), default=-1)
+    done = any(m.get("role") == "assistant" for m in msgs[at+1:])
+    if at >= 0 and not done:
+        # The first that parses: a message's notice begins with its
+        # sender's title, which may be such a prompt cut short
+        text = str(msgs[at]["content"])
+        items, i = None, text.find("do [")
+        while items is None and i >= 0:
+            try:
+                items = json.JSONDecoder().raw_decode(text, i + 3)[0]
+            except ValueError:
+                i = text.find("do [", i + 1)
+        yield from calls(model, n, [(c[0], c[1]) for c in items])
+    else:
+        res = tool_results(req)
+        yield from answer(model, "Results: " + " | ".join(r.split(".")[0] for r in res))
+
+
+sc_bypass_mode = sc_bypass_ask = sc_bypass_unattended = sc_bypass_desktop = sc_bypass
+sc_bypass_state = sc_bypass_fork = sc_bypass_task = sc_bypass_task_b = sc_bypass
+sc_bypass_plan = sc_plan
+
+
 # Agents for prospero eval (tests/scenarios.py, eval_*): scripted good
 # and bad agents, so that an eval's numbers are known. Every run of a
 # model shares its name, so these decide from the conversation alone:

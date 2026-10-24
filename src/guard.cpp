@@ -466,6 +466,7 @@ enum : i32 {
     DENY_TIMEOUT,  // nobody answered in time
     DENY_STEER,    // the user sent a message instead of answering
     DENY_CANCEL,   // the turn was cancelled while asking
+    DENY_BYPASS,   // not denied: the user turned on Bypass mode
     DENY_COUNT,
 };
 
@@ -553,5 +554,26 @@ static Str guarddenial(Arena *a, GuardDenial *d)
     } else {
         putbyte(&b, '.');
     }
+    return finish(&b);
+}
+
+// The tool result for a write under the harness's state directory,
+// which Bypass mode refuses, though it allows writes elsewhere outside
+// the working directory: the sessions' logs, locks and caches are there.
+static Str guardstatedenial(Arena *a, Str tool, Str path, Str statedir, Str cwd)
+{
+    Buf b(a, 512 + path.len + statedir.len + cwd.len);
+    print(&b, "Permission denied: ");
+    print(&b, tool);
+    print(&b, " of ");
+    print(&b, path);
+    print(&b, " would write under the harness's state directory ");
+    print(&b, statedir);
+    print(&b, ", where it keeps its sessions' logs, locks and caches. Bypass "
+              "mode allows writes outside the working directory, but never "
+              "there, so nothing was done. Do not retry this path. Write "
+              "somewhere else instead, for example inside ");
+    print(&b, cwd);
+    putbyte(&b, '.');
     return finish(&b);
 }

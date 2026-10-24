@@ -2139,7 +2139,7 @@ def hello_caps(t):
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
-                 "message"} <= set(caps)
+                 "message", "bypass"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -6719,6 +6719,322 @@ def plan_task(t):
                 f"told: {req['messages'][-1]}")
         t.check("except to approve a plan" not in req["messages"][0]["content"], "its prompt")
         t.check(lastsaid(h, sid).startswith("Parent heard: Child: Not done"), lastsaid(h, sid))
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+# Bypass mode: fake_provider.sc_bypass makes the calls its prompt names
+# (do), and the scenarios check what was asked, run and refused
+
+def do(*items):
+    return "do " + json.dumps([[name, args] for name, args in items])
+
+
+def modetold(h, sid):
+    """The mode notices a session's agent was given: (mode, text)."""
+    return [(e.get("mode"), e["text"]) for e in h.all("notice", sid)
+            if e.get("kind") == "mode"]
+
+
+def beside(t, rel):
+    return t.host.read(t.host.join(t.base, rel))
+
+
+BYPASS_PATCH = ("*** Begin Patch\n*** Add File: ../p1.txt\n+one\n"
+                "*** Add File: ../p2.txt\n+two\n*** Add File: inside.txt\n+in\n"
+                "*** End Patch\n")
+
+
+@scenario(bound=15)
+def bypass_mode(t):
+    """Bypass mode, the user's pick: a read and a write outside the
+    working directory and a patch of two files there, none asked about,
+    the agent told once that this overrides its system prompt; then back
+    in Build, told so, and a write outside asks again."""
+    t.host.write(t.host.join(t.base, "in.txt"), "secret\n")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                     edit_format="patch")["sid"]
+        r = h.call("mode", sid=sid, mode="bypass")
+        t.check(r.get("ok") == 1 and r.get("mode") == "bypass", f"on: {r}")
+        h.send("prompt", sid=sid, text=do(("read", {"path": "../in.txt"}),
+                                          ("write", {"path": "../out.txt", "content": "out"}),
+                                          ("edit", {"patch": BYPASS_PATCH})))
+        ended(h, sid, 1)
+        te = h.all("tool.end", sid)
+        t.check([e["status"] for e in te] == ["ok"] * 3,
+                f"all ran: {[(e['status'], e['text'][:80]) for e in te]}")
+        t.check("secret" in te[0]["text"], f"read: {te[0]['text']}")
+        t.check(not h.all("ask", sid), f"nothing asked: {h.all('ask', sid)}")
+        t.check(beside(t, "out.txt") == "out\n" and beside(t, "p1.txt") == "one\n" and
+                beside(t, "p2.txt") == "two\n" and t.file("inside.txt") == "in\n",
+                "written outside, and inside")
+        msgs = t.requests()[0]["body"]["messages"]
+        said = msgs[-1].get("content", "")
+        t.check(msgs[-1]["role"] == "user" and said.startswith("Bypass mode is on") and
+                "overrides what you were told before" in said and
+                "state directory" in said and "access outside it is denied" in
+                msgs[0]["content"], f"told: {said}")
+
+        # Again: nothing more to tell
+        h.send("prompt", sid=sid, text=do(("write", {"path": "../again.txt", "content": "a"})))
+        ended(h, sid, 2)
+        t.check(beside(t, "again.txt") == "a\n" and not h.all("ask", sid), "again unasked")
+        t.check([m for m, _ in modetold(h, sid)] == ["bypass"], f"told once: {modetold(h, sid)}")
+
+        # Build again: told, and asked
+        t.check(h.call("mode", sid=sid, mode="default").get("mode") == "default", "off")
+        h.send("prompt", sid=sid, text=do(("write", {"path": "../no.txt", "content": "no"})))
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        t.check(ask["kind"] == "path" and ask["path"].endswith("no.txt"), f"asked: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(h, sid, 3)
+        told = modetold(h, sid)
+        t.check([m for m, _ in told] == ["bypass", "default"] and
+                told[1][1].startswith("Bypass mode is off"), f"told: {told}")
+        t.check(beside(t, "no.txt") is None, "nothing written outside")
+        t.check(modes(h, sid) == ["bypass/user", "default/user"], f"modes {modes(h, sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def bypass_ask(t):
+    """Bypass mode picked while a write outside is asked about allows
+    it, by "bypass"; an unknown mode is refused."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        r = h.call("mode", sid=sid, mode="yolo")
+        t.check(r.get("ok") == 0 and "bypass" in r.get("err", ""), f"refused: {r}")
+        h.send("prompt", sid=sid, text=do(("write", {"path": "../asked.txt", "content": "x"})))
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        r = h.call("mode", sid=sid, mode="bypass")
+        t.check(r.get("ok") == 1 and r.get("mode") == "bypass", f"on: {r}")
+        ended(h, sid, 1)
+        ans = h.all("answer", sid)
+        t.check([(a["req"], a["decision"], a["by"]) for a in ans] ==
+                [(ask["req"], "allow", "bypass")] and "Bypass" in ans[0]["note"],
+                f"answered: {ans}")
+        te = h.all("tool.end", sid)
+        t.check([e["status"] for e in te] == ["ok"], f"ran: {te}")
+        t.check(beside(t, "asked.txt") == "x\n", "written outside")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def bypass_unattended(t):
+    """Unattended, in another process (as reopened or revived), Bypass
+    mode still allows reads, writes and a patch outside, which would be
+    denied by policy; the agent is told once, not again in a later run."""
+    t.host.write(t.host.join(t.base, "in.txt"), "secret\n")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
+                     edit_format="patch")["sid"]
+        t.check(h.call("mode", sid=sid, mode="bypass").get("ok") == 1, "on")
+    finally:
+        h.close()
+    r = t.run(do(("read", {"path": "../in.txt"}),
+                 ("write", {"path": "../out.txt", "content": "out"}),
+                 ("edit", {"patch": BYPASS_PATCH})), resume=sid)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    te = r.all("tool.end")
+    t.check([e["status"] for e in te] == ["ok"] * 3,
+            f"all ran: {[(e['status'], e['text'][:80]) for e in te]}")
+    t.check(not r.all("ask"), f"nothing asked: {r.all('ask')}")
+    t.check(beside(t, "out.txt") == "out\n" and beside(t, "p1.txt") == "one\n" and
+            beside(t, "p2.txt") == "two\n", "written outside")
+    r = t.run(do(("write", {"path": "../again.txt", "content": "a"})), resume=sid)
+    t.check(r.rc == 0 and r.last("tool.end").get("status") == "ok" and not r.all("ask"),
+            f"again: {r.all('tool.end')} {r.stderr}")
+    log = logged(t, sid)
+    told = [e["mode"] for e in log if e["ev"] == "notice" and e.get("kind") == "mode"]
+    t.check(told == ["bypass"], f"told once: {told}")
+    t.check([e["by"] for e in log if e["ev"] == "mode"] == ["user"], "one mode record")
+    msgs = t.requests()[-1]["body"]["messages"]
+    t.check(sum(str(m.get("content", "")).startswith("Bypass mode is on") for m in msgs) == 1,
+            "the notice once in the history")
+
+
+@scenario(conf={"_desktop": {"offer": "all"}}, bound=15)
+def bypass_desktop(t):
+    """With [desktop] ask on, unattended, Bypass mode runs desktop
+    actions unasked, run's among them, which is never granted for good."""
+    env = deskenv(t)
+    h = t.headless(env=env)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.call("mode", sid=sid, mode="bypass")
+        h.send("prompt", sid=sid, text=do(
+            ("desktop", {"action": "screenshot"}),
+            ("desktop", {"action": "run", "program": "notepad.exe", "args": ["a b"]})))
+        ended(h, sid, 1)
+        te = h.all("tool.end", sid)
+        t.check([e["status"] for e in te] == ["ok", "ok"],
+                f"ran: {[(e['status'], e['text'][:80]) for e in te]}")
+        t.check(not h.all("ask", sid), "nothing asked")
+        t.check(["run", "notepad.exe", "a b"] in desklog(t), f"the helper took {desklog(t)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def bypass_state(t):
+    """Bypass mode refuses writes under the state directory, but for the
+    plan file; Build still asks about them, and Plan writes the plan file."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        sdir = t.host.join(t.state, "sessions", sid)
+        plan = t.host.join(sdir, "plan.md")
+        junk = t.host.join(t.state, "junk.txt")
+        h.call("mode", sid=sid, mode="bypass")
+        h.send("prompt", sid=sid, text=do(
+            ("write", {"path": junk, "content": "junk"}),
+            ("write", {"path": plan, "content": "# Plan"}),
+            ("write", {"path": t.host.join(sdir, "events.jsonl"), "content": "{}"}),
+            ("read", {"path": t.host.join(sdir, "events.jsonl")})))
+        ended(h, sid, 1)
+        te = h.all("tool.end", sid)
+        t.check([e["status"] for e in te] == ["denied", "ok", "denied", "ok"],
+                f"statuses: {[(e['status'], e['text'][:80]) for e in te]}")
+        t.check("under the harness's state directory" in te[0]["text"] and
+                "Write somewhere else" in te[0]["text"], f"why: {te[0]['text']}")
+        t.check(not h.all("ask", sid), "nothing asked")
+        t.check(t.host.read(junk) is None, "nothing written there")
+        t.check(t.host.read(plan) == "# Plan\n", "the plan file written")
+        t.check(logged(t, sid)[0]["ev"] == "session", "the log intact")
+
+        # Build asks, as before
+        h.call("mode", sid=sid, mode="default")
+        h.send("prompt", sid=sid, text=do(("write", {"path": junk, "content": "junk"})))
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        t.check(ask["kind"] == "path" and ask["path"].endswith("junk.txt"), f"asked: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(h, sid, 2)
+
+        # Plan writes its plan file, as named to the agent
+        h.call("mode", sid=sid, mode="plan")
+        named = h.all("mode", sid)[-1]["path"]
+        h.send("prompt", sid=sid, text=do(("write", {"path": named, "content": "# Plan 2"})))
+        ended(h, sid, 3)
+        t.check(h.all("tool.end", sid)[-1]["status"] == "ok" and
+                t.host.read(plan) == "# Plan 2\n", "the plan file, in plan mode")
+        t.check(len(h.all("ask", sid)) == 1, "asked once in all")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def bypass_fork(t):
+    """A fork of a session in Bypass mode starts in Build, by "fork", its
+    agent told, and asks; an import has no mode records, so Build too."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.call("mode", sid=sid, mode="bypass")
+        h.send("prompt", sid=sid, text=do(("write", {"path": "../a.txt", "content": "a"})))
+        ended(h, sid, 1)
+        r = h.call("fork", sid=sid)
+        t.check(r.get("ok") == 1, f"forked: {r}")
+        fk = r["sid"]
+        fm = [f"{e['mode']}/{e['by']}" for e in logged(t, fk) if e["ev"] == "mode"]
+        t.check(fm == ["bypass/user", "default/fork"], f"the fork's modes: {fm}")
+        t.check(h.call("open", sid=fk, attended=1).get("ok") == 1, "opened")
+        h.send("prompt", sid=fk, text=do(("write", {"path": "../b.txt", "content": "b"})))
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == fk)
+        h.call("answer", sid=fk, req=ask["req"], decision="deny")
+        ended(h, fk, 2)
+        told = modetold(h, fk)  # the original's, then its own
+        t.check([m for m, _ in told] == ["bypass", "default"] and
+                told[1][1].startswith("Bypass mode is off"), f"told: {told}")
+        t.check(beside(t, "b.txt") is None, "nothing written")
+        t.check(modes(h, sid) == ["bypass/user"], "the original stays in Bypass")
+
+        raw = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+        r = importlog(t, h, raw, model=t.model, endpoint="fake")
+        t.check(r.get("ok") == 1, f"imported: {r}")
+        t.check(not [e for e in logged(t, r["sid"]) if e["ev"] == "mode"], "no mode records")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=25)
+def bypass_task(t):
+    """A subagent follows its parent's mode as it is now: in Bypass, it
+    writes outside unasked, told so; its own mode cannot be set; the
+    parent back in Build while it is idle, a message wakes it, told, and
+    its write asks; the parent in Bypass again allows that ask."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.call("mode", sid=sid, mode="bypass")
+        task = {"description": "Write", "model": t.model2,
+                "prompt": do(("write", {"path": "../kid1.txt", "content": "1"}))}
+        h.send("prompt", sid=sid, text=do(("task", task)))
+        ended(h, sid, 1)
+        kids = [e["sid"] for e in h.all("session") if e.get("parent") == sid]
+        t.check(len(kids) == 1, f"one subagent: {kids}")
+        kid = kids[0]
+        t.check(beside(t, "kid1.txt") == "1\n" and not h.all("ask", kid), "written unasked")
+        told = modetold(h, kid)
+        t.check([m for m, _ in told] == ["bypass"] and
+                told[0][1].startswith("Bypass mode is on: the user allows the agent you work for"),
+                f"told: {told}")
+        t.check(not modes(h, kid), f"no mode of its own: {modes(h, kid)}")
+        r = h.call("mode", sid=kid, mode="bypass")
+        t.check(r.get("ok") == 0 and "parent's" in r.get("err", ""), f"refused: {r}")
+
+        # Build while it is idle, then a message wakes it
+        h.call("mode", sid=sid, mode="default")
+        msg = do(("write", {"path": "../kid2.txt", "content": "2"}))
+        h.send("prompt", sid=sid, text=do(("send_message", {"to": kid, "text": msg})))
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == kid)
+        told = modetold(h, kid)
+        t.check([m for m, _ in told] == ["bypass", "default"], f"told: {told}")
+        r = h.call("mode", sid=sid, mode="bypass")
+        t.check(r.get("ok") == 1, f"on again: {r}")
+        ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == kid)
+        t.check(ans["req"] == ask["req"] and ans["decision"] == "allow" and ans["by"] == "bypass",
+                f"answered: {ans}")
+        turnend(h, kid, 2)
+        t.check(beside(t, "kid2.txt") == "2\n", "written")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def bypass_plan(t):
+    """In Bypass mode the agent's plan asks are still asked, and an
+    approved plan goes to Build."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.call("mode", sid=sid, mode="bypass")
+        h.send("prompt", sid=sid, text="Get to work.")  # and read the notice
+        ended(h, sid, 1)
+        h.send("prompt", sid=sid, text="Plan first.")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        t.check(ask["kind"] == "plan.enter", f"asked: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        plan = planask(h, sid)
+        h.call("answer", sid=sid, req=plan["req"], decision="allow")
+        ended(h, sid, 2)
+        t.check(modes(h, sid) == ["bypass/user", "plan/agent", "default/approved"],
+                f"modes {modes(h, sid)}")
+        te = h.all("tool.end", sid)
+        t.check(te[-1]["status"] == "ok" and te[-1]["text"].startswith("Replaced"),
+                f"carried out: {te[-1]}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
