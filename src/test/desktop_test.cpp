@@ -592,44 +592,8 @@ static void test_desktop(Test *t)
                > 0), "1");
     }
 
-    // What an image to attach is: PNG or JPEG by its first bytes, its size
-    // from its header (a JPEG's frame, past other segments), and the names
-    // attaching gives
+    // The names attaching gives (image_test.cpp has what an image is)
     {
-        u8 px[2*2*4] = {};
-        for (i32 i = 0; i < 4; i++) {
-            px[i*4+0] = (u8)(i*60);
-            px[i*4+3] = i==3 ? 128 : 255;
-        }
-        Str       png = pngencodez(a, px, 2, 2, 0);
-        ImageKind k   = imagekind(png);
-        expect(t, "kind png", concat(a, k.mime, concat(a, " ", concat(a, istr(a, k.w),
-               istr(a, k.h)))), "image/png 22");
-        Png p = pngdecode(a, png, 16);
-        expect(t, "png rgba round trip", istr(a, !p.err.data &&
-               !__builtin_memcmp(p.rgba, px, sizeof(px))), "1");
-        px[15] = 255;
-        Png q = pngdecode(a, pngencodez(a, px, 2, 2, 0), 16);
-        expect(t, "png opaque as rgb", istr(a, !q.err.data && q.rgba[15]==255 &&
-               q.rgba[4]==60), "1");
-
-        static u8 const jpg[] = {
-            0xff, 0xd8,                                      // SOI
-            0xff, 0xe0, 0x00, 0x04, 0x4a, 0x46,              // APP0, short
-            0xff, 0xff,                                      // fill
-            0xff, 0xc2, 0x00, 0x0b, 0x08, 0x01, 0x2c, 0x02,  // SOF2: 300 high,
-            0x58, 0x01, 0x01, 0x11, 0x00,                    //   600 wide
-            0xff, 0xd9,
-        };
-        k = imagekind({(u8 *)jpg, countof(jpg)});
-        expect(t, "kind jpeg", concat(a, k.mime, concat(a, " ", concat(a, istr(a, k.w),
-               concat(a, "x", istr(a, k.h))))), "image/jpeg 600x300");
-        k = imagekind({(u8 *)jpg, 12});
-        expect(t, "kind jpeg cut", concat(a, k.mime, istr(a, k.w)), "image/jpeg0");
-        static u8 const scan[] = {0xff, 0xd8, 0xff, 0xda, 0x00, 0x02, 0xff, 0xd9};
-        expect(t, "jpeg scan first", istr(a, jpegsize({(u8 *)scan, countof(scan)}).w), "0");
-        expect(t, "kind gif", istr(a, imagekind("GIF89a......").mime.data != 0), "0");
-
         expect(t, "image names", concat(a, concat(a, istr(a, validimage("img/1.png")),
                istr(a, validimage("img/12.jpg"))), concat(a, concat(a,
                istr(a, validimage("img/0.png")), istr(a, validimage("img/../1.png"))),

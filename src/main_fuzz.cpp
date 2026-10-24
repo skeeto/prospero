@@ -2,15 +2,20 @@
 // session log's open, recovery, and replay over a one-file stub platform,
 // or with -DFUZZ_PROVIDER the engine's parsers of untrusted text, or with
 // -DFUZZ_FRAMES the framing of remote links (frame.cpp), or with
-// -DFUZZ_PNG the PNG decoder (png.cpp)
+// -DFUZZ_IMAGE an image's intake: its kind, its decode through Wuffs
+// (image.cpp, wuffs.c), shrinking and PNG encoding. Every target links
+// Wuffs, from the release file CMake fetched:
+//   $ afl-clang-fast -O2 -g3 -fsanitize=address,undefined \
+//         -fsanitize-trap=undefined -I build/_deps/wuffs-src \
+//         -c -o wuffs.o src/wuffs.c
 //   $ afl-clang-fast++ -std=c++20 -fno-exceptions -fno-rtti -g3 \
 //         -fsanitize=address,undefined -fsanitize-trap=undefined \
-//         -o fuzzjson src/main_fuzz.cpp
+//         -o fuzzjson src/main_fuzz.cpp wuffs.o
 //   $ mkdir i && printf '{"a":[1,"\\u00e9",null]}' >i/doc
 //   $ afl-fuzz -i i -o o ./fuzzjson
 //
 // Likewise with -DFUZZ_EVENTS, -DFUZZ_PROVIDER, -DFUZZ_FRAMES or
-// -DFUZZ_PNG for the other targets.
+// -DFUZZ_IMAGE for the other targets.
 //
 // JSON: an input either fails at an offset inside it, or parses to a root
 // spanning the input less surrounding whitespace, and writes canonical
@@ -32,8 +37,10 @@
 // and stable under renormalizing; edit matches are ordered spans inside
 // the text; and URL, discovery, error and cycle parsing never fault.
 //
-// PNG: a decode fails with a reason and no pixels, or gives pixels
-// within the limit, which shrink to a quarter.
+// Image: a decode fails with a reason and no pixels, leaving the arena
+// as it was, or gives pixels within the limit, of the size the header
+// alone gives, which shrink to a quarter, and which encode as a PNG
+// that decodes back to the same pixels.
 //
 // Without AFL++ it runs one input from standard input.
 //
@@ -610,15 +617,27 @@ static void fuzzframes(Arena a, Str src)
     }
 }
 
-#if FUZZ_PNG
-static void fuzzpng(Arena a, Str src)
+#if FUZZ_IMAGE
+static void fuzzimage(Arena a, Str src)
 {
-    Png p = pngdecode(&a, src, 1<<20);
+    ImageKind k   = imagekind(a, src);
+    byte     *beg = a.beg;
+    Image     p   = imgdecode(&a, src, 1<<20);
     assert(!p.err.data == !!p.rgba);
-    if (p.rgba) {
-        assert(p.width>0 && p.height>0 && (i64)p.width*p.height<=1<<20);
-        shrink(&a, p.rgba, p.width, p.height, (p.width+1)/2, (p.height+1)/2);
+    if (!p.rgba) {
+        assert(a.beg == beg);
+        return;
     }
+    i32 w = p.width;
+    i32 h = p.height;
+    assert(w>0 && h>0 && (i64)w*h<=1<<20);
+    assert(k.mime.data && k.w==w && k.h==h);
+    shrink(&a, p.rgba, w, h, (w+1)/2, (h+1)/2);
+
+    Str   png = pngencodez(&a, p.rgba, w, h, 0);
+    Image q   = imgdecode(&a, png, 1<<20);
+    assert(q.rgba && q.width==w && q.height==h);
+    assert(!__builtin_memcmp(p.rgba, q.rgba, (uz)w*h*4));
 }
 #endif
 
@@ -648,8 +667,8 @@ int main()
         fuzzprovider(a, {src, len});
         #elif FUZZ_FRAMES
         fuzzframes(a, {src, len});
-        #elif FUZZ_PNG
-        fuzzpng(a, {src, len});
+        #elif FUZZ_IMAGE
+        fuzzimage(a, {src, len});
         #else
         fuzzjson(a, {src, len});
         #endif

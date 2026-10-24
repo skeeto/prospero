@@ -1330,8 +1330,7 @@ static void itemnamed(Gui *, Str);
 
 // A screenshot's thumbnail below its tool row, or an image's below the
 // user's message it was attached to, fetched as it first shows, which
-// opens the image whole in the Screenshot window. A JPEG, which nothing
-// here decodes, shows as a box saying so.
+// opens the image whole in the Screenshot window.
 static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, Str path, i32 w, i32 h,
                       b32 user, ImVec2 p0, Thumb th, f32 top, f32 bot)
 {
@@ -1339,17 +1338,15 @@ static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, Str path, i32 w, i3
     f32      sc   = g->scale;
     ImVec2   p1   = v2(p0.x+th.w, p0.y+th.h);
     b32      in   = p1.y>=top && p0.y<=bot;
-    b32      jpeg = endswith(path, ".jpg");
-    ImgSlot *sl   = in && !jpeg ? imgslot(g, s, path) : 0;
+    ImgSlot *sl   = in ? imgslot(g, s, path) : 0;
     if (sl && sl->state==IMG_READY) {
         dl->AddImage(sl->tex->td.GetTexRef(), p0, p1);
         g->thumbsdrawn++;
         g->userthumbs += user;
     } else {
         dl->AddRectFilled(p0, p1, g->pal->codebg);
-        Str msg = !in  ? Str("") :
-                  jpeg ? Str("A JPEG, which cannot be shown here") :
-                  !sl  ? Str("Too many images in view to show this one") :
+        Str msg = !in ? Str("") :
+                  !sl ? Str("Too many images in view to show this one") :
                   sl->state==IMG_FAILED ? concat(&a, "Cannot show the image: ",
                                                  imgstr(&sl->err)) :
                   Str("Loading the image...");
@@ -1361,7 +1358,7 @@ static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, Str path, i32 w, i3
     dl->AddRect(p0, p1, g->pal->rule);
 
     ImGui::SetCursorScreenPos(p0);
-    if (ImGui::InvisibleButton("##thumb", v2(th.w, th.h)) && !jpeg) {
+    if (ImGui::InvisibleButton("##thumb", v2(th.w, th.h))) {
         imgopen(g, s, path, w, h);
     }
     if (user) {
@@ -1369,11 +1366,10 @@ static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, Str path, i32 w, i3
     } else {
         itemrect(g, RECT_THUMB);
     }
-    if (ImGui::IsItemHovered() && !jpeg) {
+    if (ImGui::IsItemHovered()) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     }
-    ImGui::SetItemTooltip(jpeg ? "%dx%d pixels, sent as a JPEG" : "%dx%d pixels: open it whole",
-                          w, h);
+    ImGui::SetItemTooltip("%dx%d pixels: open it whole", w, h);
 }
 
 // The latest rewind's button, when it left files alone.
@@ -3008,7 +3004,7 @@ static void drawattached(Gui *g, GuiSession *s)
 
         // The image fit in the box: its own thumbnail, else as uploaded
         ImTextureData *td = m->tex ? &m->tex->td : 0;
-        if (!td && m->name.len && m->mime=="image/png") {
+        if (!td && m->name.len) {
             ImgSlot *sl = imgslot(g, s, m->name);
             td = sl && sl->state==IMG_READY ? &sl->tex->td : 0;
         }
@@ -3022,7 +3018,7 @@ static void drawattached(Gui *g, GuiSession *s)
                          busy ? IM_COL32(255, 255, 255, 110) : IM_COL32_WHITE);
             g->attready++;
         } else {
-            Str t = m->mime=="image/jpeg" ? Str("JPEG") : Str("PNG");
+            Str t = imagename(m->mime);
             dl->AddText(v2(c0.x+6*sc, c0.y+4*sc), g->pal->dim, t.cdata, t.cdata+t.len);
         }
         dl->AddRect(c0, c1, g->pal->rule, 4*sc);
@@ -3054,7 +3050,8 @@ static void drawattached(Gui *g, GuiSession *s)
             print(&b, (i64)m->w);
             putbyte(&b, 'x');
             print(&b, (i64)m->h);
-            print(&b, m->mime=="image/jpeg" ? Str(" JPEG") : Str(" PNG"));
+            putbyte(&b, ' ');
+            print(&b, imagename(m->mime));
             if (m->data.len) {
                 print(&b, ", ");
                 print(&b, bytesize(&a, m->data.len));
@@ -3298,7 +3295,7 @@ static void drawprompt(Gui *g)
         }
         ImGui::EndDisabled();
         itemnamed(g, "attach");
-        whytip(why.len ? why : Str("Attach an image, PNG or JPEG, to the next message: "
+        whytip(why.len ? why : Str("Attach an image, PNG, JPEG, GIF, WebP or BMP, to the next message: "
                                    "or drop one on the window, or paste one"));
     }
     if (g->sess && hostcap(s->host, "plan") && !v->parent.len) {
@@ -6890,6 +6887,7 @@ static void drawdialogs(Gui *g)
         ImGui::BulletText("Dear ImGui: Copyright 2014 Omar Cornut (MIT)");
         ImGui::BulletText("FreeType: Copyright 1996 The FreeType Project (FTL)");
         ImGui::BulletText("MD4C: Copyright 2016 Martin Mitas (MIT)");
+        ImGui::BulletText("Wuffs: Copyright 2017 The Wuffs Authors (Apache 2.0 or MIT)");
         #ifndef _WIN32
         ImGui::BulletText("SDL: Copyright 1997 Sam Lantinga (zlib)");
         ImGui::BulletText("cpp-httplib: Copyright 2017 Yuji Hirose (MIT)");

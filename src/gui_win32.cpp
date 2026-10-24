@@ -1081,7 +1081,8 @@ static DWORD WINAPI savethread(void *arg)
                       OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
     if (s->open) {
         ofn.lpstrFilter = s->images
-                        ? L"Images (*.png, *.jpg)\0*.png;*.jpg;*.jpeg\0All files\0*.*\0"
+                        ? L"Images (*.png, *.jpg, *.gif, *.webp, *.bmp)\0"
+                          L"*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp\0All files\0*.*\0"
                         : L"Session logs (*.jsonl)\0*.jsonl\0All files\0*.*\0";
         ofn.Flags       = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
                           OFN_NOCHANGEDIR | OFN_HIDEREADONLY;

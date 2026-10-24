@@ -2185,9 +2185,11 @@ def sc_gui(model, n, req):
     prompt, step, after = gui_turn(req)
     last = after[-1] if after else {}
     if "Describe the images" in prompt:
-        # Attached in the compose box: as many as it sent, each a PNG
+        # Attached in the compose box: as many as it sent, each a PNG or
+        # a JPEG
         images = user_images(req)
-        ok = all(mime == "image/png" and base64.b64decode(data).startswith(b"\x89PNG")
+        magic = {"image/png": b"\x89PNG", "image/jpeg": b"\xff\xd8\xff"}
+        ok = all(base64.b64decode(data).startswith(magic.get(mime, b"?"))
                  for mime, data in images)
         yield from answer(model, f"I see {len(images)} images{'' if ok else ', some broken'}.")
     elif "Stream in the background" in prompt:
@@ -3894,6 +3896,7 @@ def sc_attach(model, n, req):
 sc_attach_replay = sc_attach
 sc_attach_refused = sc_attach
 sc_attach_shrink = sc_attach
+sc_attach_convert = sc_attach
 sc_attach_copies = sc_attach
 
 

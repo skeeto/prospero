@@ -6006,6 +6006,48 @@ def fakejpeg(w, h):
     return b"\xff\xd8" + app0 + sof + b"\xff\xd9"
 
 
+def flatjpeg(w, h):
+    """A baseline grayscale JPEG of w by h mid-gray pixels: each block's
+    codes, under one-symbol Huffman tables, a bit for its DC and one for
+    its end, both zero."""
+    dqt = b"\xff\xdb\x00\x43\x00" + bytes([1] * 64)
+    sof = b"\xff\xc0\x00\x0b\x08" + h.to_bytes(2, "big") + w.to_bytes(2, "big") + \
+        b"\x01\x01\x11\x00"
+    def dht(cls):
+        return b"\xff\xc4\x00\x14" + bytes([cls, 1]) + bytes(15) + b"\x00"
+    sos = b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
+    bits = 2 * ((w + 7) // 8) * ((h + 7) // 8)
+    data = bytes(bits // 8) + (bytes([0xff >> bits % 8]) if bits % 8 else b"")
+    return b"\xff\xd8" + dqt + sof + dht(0x00) + dht(0x10) + sos + data + b"\xff\xd9"
+
+
+def rgbbmp(w, h, pixel):
+    """A 24-bit BMP of w by h pixels, its rows bottom up, padded."""
+    pad = -3 * w % 4
+    data = b"".join(b"".join(bytes(reversed(pixel(x, y))) for x in range(w)) + bytes(pad)
+                    for y in reversed(range(h)))
+    le = lambda v, n: v.to_bytes(n, "little")
+    return (b"BM" + le(54 + len(data), 4) + le(0, 4) + le(54, 4) + le(40, 4) +
+            le(w, 4) + le(h, 4) + le(1, 2) + le(24, 2) + le(0, 4) + le(len(data), 4) +
+            le(2835, 4) * 2 + le(0, 4) * 2 + data)
+
+
+# Pillow's, 6x4, two frames: the first in four colors by (x + y) % 4, the
+# second all green
+GIF = base64.b64decode(
+    "R0lGODlhBgAEAIEAAP8AAAD/AAAA/wkJCSH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAABgAE"
+    "AAAIEQABBBAwQODAggMJCiSIUGFAACH5BAAKAAAALAAAAAAGAAQAgf8AAAD/AAAA/wkJCQgLAAMIHEiw"
+    "oMGBAQEAOw==")
+GIFPAL = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (9, 9, 9)]
+# cwebp's: 5x3 lossless, (x*50, y*80, 200); 16x16 lossy
+WEBP = base64.b64decode(
+    "UklGRjwAAABXRUJQVlA4TC8AAAAvBIAAAHdAkG0zxCLcH+QMIzPI89+DDLC8AAYBIBGoWFJIIbgUVhg1"
+    "ov/hIce+AAA=")
+WEBPLOSSY = base64.b64decode(
+    "UklGRl4AAABXRUJQVlA4IFIAAABQAgCdASoQABAAAMASJbACdLoAAwYBSFzN8gAA/v4sCk78k78g1Sof"
+    "zGPAvUZRnebmI8/X/+Im70GL5gO5X3vwU3/9MbXgB/7xvwUp/8+AAAAA")
+
+
 def upimage(t, h, sid, data, part=1 << 19):
     """Upload an image to a session, part by part; the last reply."""
     token, off = None, 0
@@ -6101,8 +6143,9 @@ def attach(t):
 
 @scenario(conf={"_extra": "[model {model2}]\nvision = false\n"}, bound=15)
 def attach_refused(t):
-    """upload refuses what is not a PNG or a JPEG, a session that does not
-    exist, a JPEG too large to send; prompt refuses more than 10 images,
+    """upload refuses what is not a PNG, JPEG, GIF, WebP or BMP, a damaged
+    image, one too large that does not decode to shrink, a session that
+    does not exist; prompt refuses more than 10 images,
     names not made by upload, images that are not there, and any image
     for a model with vision off."""
     h = t.headless()
@@ -6113,15 +6156,18 @@ def attach_refused(t):
             t.check(r.get("ok") == 0 and r.get("err", "").startswith(err), f"{err}: {r}")
 
         refused(upimage(t, h, sid, b"GIF89a" + b"\x00" * 64),
-                "not an image: only PNG and JPEG can be attached")
+                "a damaged GIF: its size cannot be read: ")
         refused(upimage(t, h, sid, b"plain text, not an image"),
-                "not an image: only PNG and JPEG can be attached")
+                "not an image: only PNG, JPEG, GIF, WebP and BMP can be attached")
+        refused(upimage(t, h, sid, GIF[:70]),
+                "the image cannot be converted to a PNG: ")
         refused(upimage(t, h, "20260101-000000-none", PNG), "no such session")
         refused(upimage(t, h, "../x", PNG), "an image needs its session's sid")
         refused(h.call("upload", kind="text", data="", off=0), "kind must be")
-        refused(upimage(t, h, sid, fakejpeg(9000, 100)), "the JPEG is too large to attach")
-        refused(upimage(t, h, sid, fakejpeg(100, 100) + b"\x00" * (4 << 20)),
-                "the JPEG is too large to attach")
+        refused(upimage(t, h, sid, fakejpeg(60000, 60000)),
+                "the image is too large, and cannot be shrunk: too many pixels")
+        refused(upimage(t, h, sid, rgbpng(9000, 50)[:-40]),
+                "the image is too large, and cannot be shrunk: it ends early")
         tmp = t.host.join(t.state, "tmp")
         if isinstance(t.host, LocalHost) and os.path.isdir(tmp):
             t.check(not os.listdir(tmp), f"nothing left staged: {os.listdir(tmp)}")
@@ -6153,10 +6199,44 @@ def attach_refused(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=20)
+def attach_convert(t):
+    """A GIF (its first frame), a BMP and a WebP, lossless or lossy, are
+    each kept, and sent, as a PNG of their pixels."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        rows53 = [bytes(c for x in range(5) for c in (x * 50, y * 80, 200)) for y in range(3)]
+        cases = [
+            (GIF, 6, 4, [bytes(c for x in range(6) for c in GIFPAL[(x + y) % 4])
+                         for y in range(4)]),
+            (rgbbmp(5, 3, lambda x, y: (x * 50, y * 80, 200)), 5, 3, rows53),
+            (WEBP, 5, 3, rows53),
+            (WEBPLOSSY, 16, 16, None),  # its size only
+        ]
+        names = []
+        for i, (data, w, hh, rows) in enumerate(cases, 1):
+            names.append(attached(t, h, sid, data, name=f"img/{i}.png", mime="image/png",
+                                  w=w, h=hh))
+        h.call("prompt", sid=sid, text="look", images=names)
+        ended(h, sid, 1)
+        t.check(lastsaid(h, sid) == "I see 4 images.", f"said: {lastsaid(h, sid)}")
+        imgs = lastimages(t.requests()[-1])
+        t.check([m for m, _ in imgs] == ["image/png"] * 4, f"as sent: {imgs}")
+        pngs = [base64.b64decode(b) for _, b in imgs]
+        for (data, w, hh, rows), png in zip(cases, pngs):
+            got = pngpixels(png)
+            t.check(got[:2] == (w, hh) and (rows is None or got[2] == rows),
+                    f"pixels of {data[:4]}: {got}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=30)
 def attach_shrink(t):
-    """A PNG too large for the APIs, over 8000 pixels on a side or 5 MiB
-    as base64, is shrunk until it fits, and kept as a PNG."""
+    """A PNG or JPEG too large for the APIs, over 8000 pixels on a side or
+    5 MiB as base64, is shrunk until it fits, and kept as a PNG."""
     h = t.headless()
     try:
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
@@ -6172,12 +6252,19 @@ def attach_shrink(t):
         r = upimage(t, h, sid, big)
         t.check(r.get("ok") == 1 and 0 < r.get("w", 0) < 1200 and r.get("w") == r.get("h"),
                 f"big: {r}")
-        h.call("prompt", sid=sid, text="look", images=["img/1.png", r["name"]])
+        jpg = upimage(t, h, sid, flatjpeg(9000, 16))
+        t.check(jpg.get("ok") == 1 and jpg.get("name") == "img/3.png" and
+                (jpg.get("w"), jpg.get("h")) == (8000, 14) and jpg.get("mime") == "image/png",
+                f"wide JPEG: {jpg}")
+        h.call("prompt", sid=sid, text="look", images=["img/1.png", r["name"], jpg["name"]])
         ended(h, sid, 1)
         imgs = lastimages(t.requests()[-1])
         sizes = [int.from_bytes(base64.b64decode(b)[16:20], "big") for _, b in imgs]
-        t.check(sizes == [8000, r["w"]] and all(len(b) <= 5 << 20 for _, b in imgs),
+        t.check(sizes == [8000, r["w"], 8000] and all(len(b) <= 5 << 20 for _, b in imgs),
                 f"as sent: {sizes} {[len(b) for _, b in imgs]}")
+        _, _, rows = pngpixels(base64.b64decode(imgs[2][1]))
+        t.check(all(abs(v - 128) <= 1 for row in rows for v in row),
+                f"mid-gray: {set(v for row in rows for v in row)}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

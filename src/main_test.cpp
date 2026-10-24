@@ -549,6 +549,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/eval_test.cpp"
 #include "deskhelp.cpp"
 #include "test/desktop_test.cpp"
+#include "test/image_test.cpp"  // after deskhelp.cpp: dkpng
 #include "dbus.cpp"
 #include "test/dbus_test.cpp"
 #include "test/door_test.cpp"
@@ -569,7 +570,7 @@ static Str istr(Arena *a, i64 v)
 #  include "test/layout_test.cpp"
 #  include "test/view_test.cpp"
 #  include "test/theme_test.cpp"
-#  include "test/png_test.cpp"
+#  include "test/thumb_test.cpp"
 #  include "test/fonts_test.cpp"
 #  include "test/place_test.cpp"
 #  include "test/compose_test.cpp"
@@ -609,6 +610,7 @@ int main()
     test_deploy(&t);
     test_eval(&t);
     test_desktop(&t);
+    test_image(&t);
     test_dbus(&t);
     test_door(&t);
     #if PROSPERO_GUI
@@ -621,7 +623,7 @@ int main()
     test_viewthinking(&t);
     test_viewtranscript(&t);
     test_theme(&t);
-    test_png(&t);
+    test_thumb(&t);
     test_fonts(&t);
     test_place(&t);
     test_compose(&t);

@@ -4727,7 +4727,7 @@ static Slice<Msg> deskimages(Session *s, Arena *a)
                 Read     rd = {};
                 if (ok) {
                     rd = os_read(e->os, a, join(a, s->dir, g.name), ATTACH_UPLOAD);
-                    ok = rd.err==READ_OK && imagekind(rd.data).mime==g.mime;
+                    ok = rd.err==READ_OK && imagetypes[imagesniff(rd.data)].mime==g.mime;
                 }
                 if (ok) {
                     g.b64 = base64(a, rd.data);
@@ -10196,10 +10196,11 @@ static void sweepuploads(Engine *e, Arena scratch)
 
 // Attachments: an image comes in parts as a log does (upload, kind
 // "image"), and once complete is kept in its session's directory as
-// img/N.png or img/N.jpg, numbered from 1, which prompts then name. Only
-// PNG and JPEG are taken, by their first bytes. One too large for the
-// APIs, over ATTACH_EDGE pixels on a side or ATTACH_BYTES as base64, is
-// shrunk to fit if a PNG, else refused, as there is no JPEG decoder.
+// img/N.png or img/N.jpg, numbered from 1, which prompts then name.
+// PNG, JPEG, GIF, WebP and BMP are taken, by their first bytes (image.cpp).
+// A PNG or JPEG goes to the APIs as it is, and the rest as a PNG, a GIF
+// its first frame. One too large for the APIs, over ATTACH_EDGE pixels
+// on a side or ATTACH_BYTES as base64, is shrunk to fit, as a PNG.
 
 // An attached image's name, as attaching makes them.
 static b32 validimage(Str name)
@@ -10222,25 +10223,28 @@ static iz base64len(iz n)
     return (n + 2)/3 * 4;
 }
 
-struct Shrunk {
+struct Converted {
     Str png;  // null on failure
     Str err;
 };
 
-// A PNG shrunk until it fits the APIs: within ATTACH_EDGE on each side,
-// then smaller until its base64 is within ATTACH_BYTES.
-static Shrunk shrinkpng(Os *os, Arena *a, Str png)
+// An image as a PNG that fits the APIs: decoded, within ATTACH_EDGE on
+// each side, then smaller until its base64 is within ATTACH_BYTES.
+static Converted topng(Os *os, Arena *a, Str data, b32 big)
 {
-    Shrunk  r   = {};
-    Region *reg = os_reserve(os, (iz)ATTACH_PIXELS*4*4 + ((iz)16<<20));
+    Converted r   = {};
+    // The pixels and the decoder's work buffer (image.cpp), then the
+    // shrunk pixels and their PNG, with room to spare
+    Region   *reg = os_reserve(os, (iz)ATTACH_PIXELS*4*6 + ((iz)32<<20));
     if (!reg) {
-        r.err = "out of memory to shrink the image";
+        r.err = "out of memory to convert the image";
         return r;
     }
     Arena mem = newarena(reg);
-    Png   p   = pngdecode(&mem, png, ATTACH_PIXELS);
+    Image p   = imgdecode(&mem, data, ATTACH_PIXELS);
     if (p.err.data) {
-        r.err = concat(a, "the image is too large, and cannot be shrunk: ", p.err);
+        r.err = big ? concat(a, "the image is too large, and cannot be shrunk: ", p.err)
+                    : concat(a, "the image cannot be converted to a PNG: ", p.err);
         os_release(os, reg);
         return r;
     }
@@ -10273,7 +10277,8 @@ struct Attached {
 };
 
 // Keep the image a complete upload staged at path, which goes, as session
-// sid's next, shrunk if it must be, all in a. The image, or why not.
+// sid's next, converted or shrunk if it must be, all in a. The image, or
+// why not.
 static Attached attachstaged(Engine *e, Arena *a, Str sid, Str path)
 {
     Os      *os = e->os;
@@ -10285,27 +10290,25 @@ static Attached attachstaged(Engine *e, Arena *a, Str sid, Str path)
         return r;
     }
     Str       data = rd.data;
-    ImageKind k    = imagekind(data);
+    ImageKind k    = imagekind(*a, data);
     if (!k.mime.data) {
-        r.err = "not an image: only PNG and JPEG can be attached";
+        r.err = "not an image: only PNG, JPEG, GIF, WebP and BMP can be attached";
         return r;
     } else if (k.w<1 || k.h<1) {
-        r.err = "a damaged image: its size cannot be read";
+        r.err = concat(a, concat(a, "a damaged ", k.name),
+                       concat(a, ": its size cannot be read: ", k.err));
         return r;
     }
-    b32 big = base64len(data.len)>ATTACH_BYTES || k.w>ATTACH_EDGE || k.h>ATTACH_EDGE;
-    if (big && k.ext=="jpg") {
-        r.err = "the JPEG is too large to attach: at most 8000 pixels on a "
-                "side and 3.75 MiB; shrink it first, or attach a PNG";
-        return r;
-    } else if (big) {
-        Shrunk z = shrinkpng(os, a, data);
+    b32 big  = base64len(data.len)>ATTACH_BYTES || k.w>ATTACH_EDGE || k.h>ATTACH_EDGE;
+    b32 kept = k.kind==IMAGE_PNG || k.kind==IMAGE_JPEG;  // as the APIs take them
+    if (big || !kept) {
+        Converted z = topng(os, a, data, big);
         if (!z.png.data) {
             r.err = z.err;
             return r;
         }
         data = z.png;
-        k    = imagekind(data);
+        k    = imagekind(*a, data);
     }
 
     // The next number: one past the highest there
@@ -10368,7 +10371,7 @@ static Attaching attaching(Session *s, Arena *perm, Arena scratch, Json *list)
         }
         Arena     t  = scratch;
         Read      rd = os_read(s->e->os, &t, join(&t, s->dir, name), ATTACH_UPLOAD);
-        ImageKind k  = rd.err==READ_OK ? imagekind(rd.data) : ImageKind{};
+        ImageKind k  = rd.err==READ_OK ? imagekind(t, rd.data) : ImageKind{};
         if (!k.mime.data || k.w<1) {
             r.err = "no such image in the session: upload it first";
             return r;

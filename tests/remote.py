@@ -46,6 +46,7 @@ import tempfile
 import threading
 import time
 import traceback
+import zlib
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1288,8 +1289,13 @@ def image_host(t):
     t.check("images" in up.get("caps", []), f"up: {up}")
     model = t.model("attach")
     sid = c.call("new", cwd=t.work, model=model, attended=1)["sid"]
-    png = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x05\x00\x00\x00\x07"
-           b"\x08\x02\x00\x00\x00" + b"\x00" * 600)  # its header is all that is read
+    def pngchunk(kind, data):
+        return (len(data).to_bytes(4, "big") + kind + data +
+                zlib.crc32(kind + data).to_bytes(4, "big"))
+    raw = b"".join(b"\x00" + bytes(range(y, y + 15)) for y in range(40))  # 5x40 RGB
+    png = (b"\x89PNG\r\n\x1a\n" +
+           pngchunk(b"IHDR", struct.pack(">IIBBBBB", 5, 40, 8, 2, 0, 0, 0)) +
+           pngchunk(b"IDAT", zlib.compress(raw, 0)) + pngchunk(b"IEND", b""))
     token, off = None, 0
     while off < len(png):
         part = png[off:off + 256]
@@ -1302,14 +1308,14 @@ def image_host(t):
         r = c.call("upload", **args)
         t.check(r.get("ok") == 1 and r.get("off") == off + len(part), f"upload {off}: {r}")
         token, off = r["token"], r["off"]
-    t.check(r.get("name") == "img/1.png" and (r.get("w"), r.get("h")) == (5, 7),
+    t.check(r.get("name") == "img/1.png" and (r.get("w"), r.get("h")) == (5, 40),
             f"attached: {r}")
     p = c.call("prompt", sid=sid, text="look", images=[r["name"]])
     t.check(p.get("ok") == 1, f"prompt: {p}")
     c.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid, what="turn.end")
     user = next(r for r in c.records if r.get("ev") == "user" and r.get("sid") == sid)
     t.check(user.get("images") == [{"name": "img/1.png", "mime": "image/png", "w": 5,
-                                    "h": 7}], f"the user record: {user}")
+                                    "h": 40}], f"the user record: {user}")
     sent = fake_provider.user_images(fake_provider.STATE.log(model)[-1]["body"])
     t.check(sent == [("image/png", base64.b64encode(png).decode())], f"sent: {sent}")
     t.check(finaltext(c.records, sid) == "I see 1 images.", "answered")

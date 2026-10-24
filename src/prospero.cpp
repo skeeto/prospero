@@ -488,13 +488,13 @@ static b32     os_guisave(Os *, Arena scratch, Str title, Str name, Mailbox *,
 // record of the type with id. Returns 0 if no dialog can be shown.
 enum : i32 {
     OPEN_LOG,    // a session's raw log (*.jsonl)
-    OPEN_IMAGE,  // an image to attach (*.png, *.jpg, *.jpeg)
+    OPEN_IMAGE,  // an image to attach (*.png, *.jpg, *.jpeg, *.gif, *.webp, *.bmp)
 };
 static b32     os_guiopenfile(Os *, Arena scratch, Str title, i32 kind,
                               Mailbox *, u32 type, u64 id);
-// An image the clipboard holds, to attach, as PNG or JPEG bytes in a,
-// else a file it holds (a file manager's copy) as its path; both null if
-// neither.
+// An image the clipboard holds, to attach, as its bytes in a (PNG, JPEG,
+// GIF, WebP or BMP), else a file it holds (a file manager's copy) as its
+// path; both null if neither.
 struct ClipImage {
     Str data;
     Str path;
@@ -543,6 +543,7 @@ static Arena newarena(Region *r)
 #include "anthropic.cpp"
 #include "edit.cpp"
 #include "png.cpp"
+#include "image.cpp"
 #include "desktop.cpp"
 #include "tools.cpp"
 #include "guard.cpp"

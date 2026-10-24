@@ -1169,7 +1169,7 @@ static b32 os_guiopenfile(Os *os, Arena scratch, Str title, i32 kind, Mailbox *m
         {"All files", "*"},
     };
     static SDL_DialogFileFilter const images[] = {
-        {"Images (*.png, *.jpg)", "png;jpg;jpeg"},
+        {"Images (*.png, *.jpg, *.gif, *.webp, *.bmp)", "png;jpg;jpeg;gif;webp;bmp"},
         {"All files", "*"},
     };
     SDL_DialogFileFilter const *filters = kind==OPEN_IMAGE ? images : logs;
@@ -1230,13 +1230,16 @@ static Str fileurlpath(Arena *a, Str url)
     return r;
 }
 
-// The clipboard's image, as PNG (or JPEG) from SDL's MIME types, else
+// The clipboard's image, as PNG (or JPEG, GIF, WebP or BMP) from SDL's
+// MIME types, else
 // the first file it holds, as Finder (public.file-url) or a Linux file
 // manager (text/uri-list) puts it there.
 static ClipImage os_guiclipimage(Os *, Arena *a)
 {
     ClipImage r = {};
-    static char const *mimes[] = {"image/png", "image/jpeg"};
+    static char const *mimes[] = {
+        "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp",
+    };
     for (i32 i = 0; i < countof(mimes); i++) {
         if (!SDL_HasClipboardData(mimes[i])) {
             continue;

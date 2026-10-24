@@ -570,7 +570,8 @@ enum : i32 {
 enum : iz {
     IMG_FILEMAX   = sizeof(void *)==8 ? (iz)32<<20 : (iz)8<<20,  // bytes
     IMG_MAXPIXELS = sizeof(void *)==8 ? (iz)1<<24  : (iz)1<<22,
-    // A fetch's: the PNG, then its pixels and the decoder's temporaries
+    // A fetch's: the file, then its pixels and the decoder's state and
+    // work buffer, at most 16 bytes a pixel (image.cpp)
     IMG_REGION    = 2*IMG_FILEMAX + 25*IMG_MAXPIXELS + ((iz)1<<20),
 };
 
@@ -728,11 +729,11 @@ enum : i32 {
 struct AttImage {
     Region *r;      // what follows, until sent or removed
     Arena   mem;
-    Str     data;   // PNG or JPEG, empty once withdrawn from the queue
+    Str     data;   // as attached, empty once withdrawn from the queue
     Str     mime;
     i32     w;
     i32     h;
-    GuiTex *tex;    // its thumbnail, null for a JPEG (none decodes here)
+    GuiTex *tex;    // its thumbnail, null if it did not decode
     Str     label;  // where it came from: a file's name, else empty
     Str     name;   // as uploaded, img/N.png or img/N.jpg
 };
@@ -1807,7 +1808,7 @@ static void imgrequest(Gui *g)
     cmdsend(g, &w, a);
 }
 
-static void imgdone(Gui *g, Png *p, Str err);
+static void imgdone(Gui *g, Image *p, Str err);
 
 // Start the next fetch, if none runs: the Screenshot window's first,
 // then the thumbnail drawn latest.
@@ -1875,7 +1876,7 @@ static Thumb thumbpixels(Gui *g, i32 w, i32 h)
 
 // The fetch ended, with the decoded image or an error: textures for
 // whatever waits for it, and on to the next.
-static void imgdone(Gui *g, Png *p, Str err)
+static void imgdone(Gui *g, Image *p, Str err)
 {
     Images   *m    = &g->img;
     ImgFetch *f    = &m->fetch;
@@ -1985,8 +1986,8 @@ static void onimgfile(Gui *g, Arena scratch, Json *j, b32 ok, Str err)
         return;
     }
 
-    i64 t0 = os_ticks(g->os);
-    Png p  = pngdecode(&f->mem, {f->png, (iz)f->size}, IMG_MAXPIXELS);
+    i64   t0 = os_ticks(g->os);
+    Image p  = imgdecode(&f->mem, {f->png, (iz)f->size}, IMG_MAXPIXELS);
     g->img.decodes++;
     g->img.decodeus += os_ticks(g->os) - t0;
     if (p.err.data) {
@@ -2671,16 +2672,16 @@ static Str attachwhy(GuiSession *s)
     return {};
 }
 
-// A thumbnail of a PNG, fit in the box at the display's scale. Null if
-// it cannot be decoded.
-static GuiTex *attthumb(Gui *g, Str png)
+// A thumbnail of an image, fit in the box at the display's scale. Null
+// if it cannot be decoded.
+static GuiTex *attthumb(Gui *g, Str data)
 {
     Region *r = os_reserve(g->os, IMG_REGION);
     if (!r) {
         return 0;
     }
     Arena   a = newarena(r);
-    Png     p = pngdecode(&a, png, IMG_MAXPIXELS);
+    Image   p = imgdecode(&a, data, IMG_MAXPIXELS);
     GuiTex *t = 0;
     if (!p.err.data) {
         f32 fb = ImGui::GetIO().DisplayFramebufferScale.x;
@@ -2699,7 +2700,8 @@ static GuiTex *attthumb(Gui *g, Str png)
     return t;
 }
 
-// Attach an image, PNG or JPEG, its bytes copied. Returns why not, or
+// Attach an image, PNG, JPEG, GIF, WebP or BMP, its bytes copied, which
+// the engine converts to a PNG if not a PNG or JPEG. Returns why not, or
 // empty if attached.
 static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
 {
@@ -2707,11 +2709,12 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
     if (why.len) {
         return why;
     }
-    ImageKind k = imagekind(data);
+    ImageKind k = imagekind(g->frame, data);
     if (!k.mime.len) {
-        return "not an image: only PNG and JPEG can be attached";
+        return "not an image: only PNG, JPEG, GIF, WebP and BMP can be attached";
     } else if (k.w<1 || k.h<1) {
-        return "a damaged image: its size cannot be read";
+        return concat(&g->frame, concat(&g->frame, "a damaged ", k.name),
+                      concat(&g->frame, ": its size cannot be read: ", k.err));
     } else if (data.len > ATTACH_UPLOAD) {
         return "too large to attach: an image is at most 64 MiB";
     }
@@ -2731,7 +2734,7 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
     m->mime  = k.mime;
     m->w     = k.w;
     m->h     = k.h;
-    m->tex   = k.mime=="image/png" ? attthumb(g, data) : 0;
+    m->tex   = attthumb(g, data);
     scheddirty(&g->sched);
     return {};
 }
@@ -2980,7 +2983,8 @@ static b32 attachpaste(Gui *g, GuiSession *s)
         low[i] = (u8)(ext[i]>='A' && ext[i]<='Z' ? ext[i]+32 : ext[i]);
     }
     ext = {low, ext.len};
-    img = img && (ext=="png" || ext=="jpg" || ext=="jpeg");
+    img = img && (ext=="png" || ext=="jpg" || ext=="jpeg" || ext=="gif" ||
+                  ext=="webp" || ext=="bmp");
     Str err = {};
     b32 got = c.data.len>0 || img;
     if (c.data.len) {
@@ -7013,6 +7017,7 @@ enum : i32 {
                   // dx 1: fill the primary display unmaximized (macOS's
                   // Fill), else skip the next op where that is no maximum
     OP_DROP,      // write a dx by dy PNG to --cwd as text, and drop it there
+                  // (a flat gray JPEG if text ends in .jpg)
     OP_CLIPPNG,   // the clipboard's text kept, a dx by dy PNG put there
     OP_CLIPBACK,  // the clipboard's text put back
 };
@@ -9826,14 +9831,15 @@ static DriveOp composeops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Stream in the background."},
-    // E: images attached by dropping two files and pasting a third, the
-    // pasted one removed by its x, the others sent with the prompt and
-    // counted by the agent; a thumbnail in the transcript opens whole
+    // E: images attached by dropping two files, a PNG and a JPEG, and
+    // pasting a third, the pasted one removed by its x, the others sent
+    // with the prompt and counted by the agent, their thumbnails decoded
+    // in the box and in the transcript; a thumbnail there opens whole
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_DROP, 0, 96, 64, 800, "dropped-a.png"},
     {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
-    {OP_DROP, 0, 40, 120, 800, "dropped-b.png"},
+    {OP_DROP, 0, 40, 120, 800, "dropped-b.jpg"},
     {OP_CHECK, CHK_ATTACHED, 2, 0, 0, ""},
     {OP_CLIPPNG, 0, 80, 80, 200, ""},
     CLICK(T_PROMPT, "", 200),
@@ -12044,6 +12050,49 @@ static void drivesummary(Gui *g)
     guilog(g, finish(&b));
 }
 
+// A baseline grayscale JPEG of w by h mid-gray pixels, for the checklist
+// to drop: under one-symbol Huffman tables, each block a zero bit for
+// its DC and another for its end.
+static Str flatjpeg(Arena *a, i32 w, i32 h)
+{
+    static u8 const dqt[] = {0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00};  // SOI, DQT
+    static u8 const sof[] = {0xff, 0xc0, 0x00, 0x0b, 0x08};
+    static u8 const one[] = {0x01, 0x01, 0x11, 0x00};  // its one component
+    static u8 const dht[] = {0xff, 0xc4, 0x00, 0x14};
+    static u8 const sos[] = {0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00};
+    iz  bits = 2 * (iz)((w + 7)/8) * ((h + 7)/8);
+    Buf b(a, 160 + bits/8);
+    print(&b, Str{(u8 *)dqt, countof(dqt)});
+    for (i32 i = 0; i < 64; i++) {
+        putbyte(&b, 1);  // quantized by 1
+    }
+    print(&b, Str{(u8 *)sof, countof(sof)});
+    putbyte(&b, (u8)(h >> 8));
+    putbyte(&b, (u8)h);
+    putbyte(&b, (u8)(w >> 8));
+    putbyte(&b, (u8)w);
+    print(&b, Str{(u8 *)one, countof(one)});
+    for (i32 cls = 0x00; cls <= 0x10; cls += 0x10) {
+        print(&b, Str{(u8 *)dht, countof(dht)});
+        putbyte(&b, (u8)cls);
+        putbyte(&b, 1);  // one code of length 1
+        for (i32 i = 0; i < 15; i++) {
+            putbyte(&b, 0);
+        }
+        putbyte(&b, 0);  // its symbol: DC category 0, or AC end of block
+    }
+    print(&b, Str{(u8 *)sos, countof(sos)});
+    for (iz i = 0; i < bits/8; i++) {
+        putbyte(&b, 0);
+    }
+    if (bits % 8) {
+        putbyte(&b, (u8)(0xff >> (bits % 8)));  // padded with ones
+    }
+    putbyte(&b, 0xff);
+    putbyte(&b, 0xd9);
+    return finish(&b);
+}
+
 static void drivestep(Gui *g)
 {
     ImGuiPlatformIO &pio = ImGui::GetPlatformIO();
@@ -12265,7 +12314,8 @@ static void drivestep(Gui *g)
                 p[3] = 255;
             }
         }
-        Str png = pngencodez(&a, px, w, h, 0);
+        Str png = endswith(op->text, ".jpg") ? flatjpeg(&a, w, h) :
+                  pngencodez(&a, px, w, h, 0);
         if (op->op == OP_CLIPPNG) {
             char const *t = ImGui::GetClipboardText();
             g->clipkept = t ? clone(&g->perm, Str{(u8 *)t, (iz)__builtin_strlen(t)}) : Str{};
