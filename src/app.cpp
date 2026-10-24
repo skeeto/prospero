@@ -4111,14 +4111,15 @@ static Str hostlockpath(Arena *a, Str statedir)
 // or null if it can.
 static Str cannothost(Gui *g)
 {
-    Arena a = g->frame;
+    Arena a    = g->frame;
+    Str   lock = hostlockpath(&a, g->statedir);  // before a goes as scratch
     if (g->host) {
         return {};
     } else if (g->enginekind != ENGINE_INPROC) {
         return "the engine runs as a process of its own (--engine)";
     } else if (!g->engine || g->enginegone) {
         return "the engine has stopped";
-    } else if (os_lockheld(g->os, a, hostlockpath(&a, g->statedir))) {
+    } else if (os_lockheld(g->os, a, lock)) {
         return "another process already runs a background host for this "
                "state directory";
     }
