@@ -72,6 +72,32 @@ static void test_compose(Test *t)
     expect(t, "slash.completes", istr(&a, slashcompletes("/fo", SLASH_FORK)), "1");
     expect(t, "slash.complete", istr(&a, slashcompletes("/fork", SLASH_FORK)), "0");
 
+    // Skills: /name exactly, after the commands, which keep their names
+    {
+        SkillItem items[] = {{"pdf", "Read PDFs", "/s/pdf/SKILL.md", 0},
+                             {"compact", "", "/s/compact/SKILL.md", 0},
+                             {"review", "", "/s/review/SKILL.md", 1}};
+        Slice<SkillItem> sk = {items, countof(items)};
+        Slash k = parseskill("  /pdf  file.pdf ", sk);
+        expect(t, "skill.parse", concat(&a, concat(&a, k.skill, "|"), k.arg), "pdf|file.pdf");
+        expect(t, "skill.hidden", parseskill("/review", sk).skill, "review");
+        expect(t, "skill.taken", istr(&a, parseskill("/compact", sk).skill.len), "0");
+        expect(t, "skill.prefix", istr(&a, parseskill("/pd x", sk).skill.len), "0");
+        expect(t, "skill.path", istr(&a, parseskill("/pdf/x", sk).skill.len), "0");
+        Slice<i32> p = slashpicks(&a, "/", sk);
+        Buf b(&a, 64);
+        for (iz i = 0; i < p.len; i++) {
+            print(&b, slashpickinfo(&a, p[i], sk).name);
+            putbyte(&b, ' ');
+        }
+        expect(t, "skill.picks", finish(&b),
+               "/compact /model /rename /fork /export /pdf /review ");
+        p = slashpicks(&a, "/p", sk);
+        expect(t, "skill.pick", istr(&a, p.len), "1");
+        expect(t, "skill.pickdesc", slashpickinfo(&a, p[0], sk).desc, "Read PDFs");
+        expect(t, "skill.pickspace", istr(&a, slashpicks(&a, "/pdf x", sk).len), "0");
+    }
+
     // History: empty box, Up begins at the newest
     expect(t, "hist.begin", histstr(&a, histkey(1, 1, 0, 3, 1)), "recall 1");
     expect(t, "hist.none", histstr(&a, histkey(1, 1, 0, 0, 1)), "start 0");

@@ -454,6 +454,8 @@ struct GuiSession {
     Str          group;     // its group, from the list (only a root's counts)
     b32          archived;  // from the list (only a root's counts)
     b32          gone;      // deleted: shown nowhere
+    Slice<SkillItem> skills;  // what /name invokes, as its engine lists them
+    i64          skillsid;  // that list's skills in flight, 0 if none
 };
 
 // A command awaiting its reply.
@@ -1988,6 +1990,69 @@ static void guiprompt(Gui *g, Str text)
     cmdsend(g, &w, a);
 }
 
+static b32 hostcap(GuiHost *, Str);
+
+// Ask a session's engine for its skills, what /name in the compose box
+// may invoke: as it opens, and as each turn ends (onskills).
+static void guiskills(Gui *g, GuiSession *s)
+{
+    if (!s || s->skillsid || !hostcap(s->host, "skills")) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_SKILLS, s);
+    s->skillsid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// Invoke a skill in the current session, with what followed /name: as
+// a prompt, or a steer while its turn runs. A failure puts the text
+// back in the box (onsesscmd).
+static void guiskill(Gui *g, GuiSession *s, Str skill, Str args, Str text)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + skill.len + args.len);
+    EvOut w = cmdopen(g, &b, s->view->busy ? CMD_STEER : CMD_PROMPT, s);
+    putkey(&w.json, "text");
+    putstr(&w.json, args);
+    putkey(&w.json, "skill");
+    putstr(&w.json, skill);
+    s->stick   = 1;
+    s->cmdid   = g->nextid;
+    s->cmdtext = clone(&g->perm, text);
+    s->note    = {};
+    cmdsend(g, &w, a);
+}
+
+// A skills reply: the list kept anew only when it changed.
+static void onskills(Gui *g, GuiSession *s, Json *j, b32 ok)
+{
+    Json *list = jsonget(j, "skills");
+    b32   same = jsonlen(list) == s->skills.len;
+    iz    i    = 0;
+    for (Json *k = list->child; same && k; k = k->next, i++) {
+        SkillItem *t = &s->skills[i];
+        same = t->name==jsonstr(jsonget(k, "name")) &&
+               t->desc==jsonstr(jsonget(k, "description")) &&
+               t->path==jsonstr(jsonget(k, "path")) &&
+               t->hidden==(jsonget(k, "hidden")->boolean != 0);
+    }
+    if (!ok || same) {
+        return;
+    }
+    s->skills = {};
+    for (Json *k = list->child; k; k = k->next) {
+        SkillItem t = {};
+        t.name   = clone(&g->perm, jsonstr(jsonget(k, "name")));
+        t.desc   = clone(&g->perm, jsonstr(jsonget(k, "description")));
+        t.path   = clone(&g->perm, jsonstr(jsonget(k, "path")));
+        t.hidden = jsonget(k, "hidden")->boolean != 0;
+        s->skills = push(&g->perm, s->skills, t);
+    }
+    scheddirty(&g->sched);
+}
+
 static void guicancel(Gui *g, GuiSession *s)
 {
     if (!s || !s->view || !s->view->busy) {
@@ -2506,7 +2571,23 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         sessview(g, s);
         setcur(g, s);
         guilist(g, h);
+        guiskills(g, s);
     } return;
+
+    case CMD_SKILLS:
+        if (q.s && q.s->skillsid==id) {
+            q.s->skillsid = 0;
+            onskills(g, q.s, j, ok);
+        }
+        return;
+
+    case CMD_PROMPT:
+    case CMD_STEER:
+        if (q.s && q.s->cmdid==id) {
+            onsesscmd(g, h, scratch, &q, r);  // a skill invoked (guiskill)
+            return;
+        }
+        break;
 
     case CMD_FILE:
         if (id == g->out.id) {
@@ -2577,6 +2658,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         if (draft.len && draftloads(&s->dclock) && g->edsess!=s) {
             draftput(g, s, draft);
         }
+        guiskills(g, s);
     } return;
 
     case CMD_COMPACT:
@@ -3131,6 +3213,9 @@ static b32 guirecord(Gui *g, GuiHost *h, Str line)
     b32 changed = viewrecord(v, a, &r);
     if (r.ev==EV_ASK && changed) {
         s->stick = 1;  // an ask needs seeing: scroll to it
+    }
+    if (r.ev==EV_TURNEND && s==g->sess) {
+        guiskills(g, s);  // skills may have come or gone meanwhile
     }
     if (r.ev == EV_JOBOUT) {
         // Applied, so that the Jobs window is current once shown, but
@@ -6592,7 +6677,7 @@ enum : i32 {
     CHK_EDITING,
     CHK_NOTEDITING,
     CHK_NOTE,         // the session's note has text in it
-    CHK_SLASH,        // the slash popup lists dx commands (0: closed)
+    CHK_SLASH,        // the slash popup lists dx commands, skills aside (0: none)
     CHK_SLASHSEL,     // its pick is text
     CHK_TITLE,        // the session's title is text
     CHK_LASTUSER,     // its latest user message is text
@@ -8900,8 +8985,17 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_TITLE, 0, 0, 0, "Session A"},
+    // A skill of the workspace's (tests/gui.py) completes as a command
+    // does
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 300, "/zzc"},
+    {OP_CHECK, CHK_SLASH, 0, 0, 0, ""},
+    {OP_CHECK, CHK_SLASHSEL, 0, 0, 0, "/zzcheck"},
+    KEY(GKEY_TAB, 0, 300),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "/zzcheck "},
     // Not a command: a path is sent as text
     CLICK(T_PROMPT, "", 200),
+    SELALL,
     {OP_TEXT, 0, 0, 0, 200, "/usr/bin/foo is broken"},
     KEY(GKEY_ENTER, 0, 300),
     {OP_WAIT, W_TURNS, 3, 0, 10000, ""},
@@ -9858,16 +9952,20 @@ static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
         ok  = got.len && find(got, want)>=0;
         break;
     case CHK_SLASH: {
+        // Commands only: the user's own skills may be listed too
         i32 n = slashcount(slashmatches(promptstr(g)));
+        n = g->slashshown ? n : 0;
         Buf b(&a, 24);
-        print(&b, (i64)(g->slashshown ? n : 0));
+        print(&b, (i64)n);
         got = finish(&b);
-        ok  = (i32)op->dx ? g->slashshown && n==(i32)op->dx : !g->slashshown;
+        ok  = n == (i32)op->dx;
     } break;
-    case CHK_SLASHSEL:
-        got = slashinfo[slashnth(slashmatches(promptstr(g)), g->slashsel)].name;
+    case CHK_SLASHSEL: {
+        Slice<SkillItem> sk = g->sess ? g->sess->skills : Slice<SkillItem>{};
+        Slice<i32>       p  = slashpicks(&a, promptstr(g), sk);
+        got = g->slashsel<p.len ? slashpickinfo(&a, p[g->slashsel], sk).name : Str{};
         ok  = g->slashshown && got==want;
-        break;
+    } break;
     case CHK_TITLE:
         got = v->title;
         ok  = got == want;

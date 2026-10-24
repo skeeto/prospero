@@ -4,10 +4,12 @@
 //
 // Slash commands are recognized only as the message's first word, and
 // only these exact words: anything else that starts with a slash, such
-// as a path, is sent as text. History counts back from the newest of
-// the session's prompts and steers, 1 being the newest and 0 the draft
-// itself. A draft goes to the engine (draft) once typing has paused for
-// DRAFT_IDLE, and at once when the session is left or the GUI quits.
+// as a path, is sent as text. So are the session's skills (skills.cpp),
+// /name invoking one, unless a command has the name. History counts
+// back from the newest of the session's prompts and steers, 1 being the
+// newest and 0 the draft itself. A draft goes to the engine (draft) once
+// typing has paused for DRAFT_IDLE, and at once when the session is left
+// or the GUI quits.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -38,11 +40,12 @@ static SlashInfo slashinfo[] = {
 static_assert(countof(slashinfo) == SLASH_COUNT);
 
 struct Slash {
-    i32 cmd;  // SLASH_*
-    Str arg;  // the rest, trimmed
-    Str err;  // why the command cannot run as typed, else null
-    i64 turn; // /fork's turn, else -1: the whole session
-    b32 raw;  // /export's raw log, not Markdown
+    i32 cmd;    // SLASH_*
+    Str skill;  // or the skill it invokes (parseskill)
+    Str arg;    // the rest, trimmed
+    Str err;    // why the command cannot run as typed, else null
+    i64 turn;   // /fork's turn, else -1: the whole session
+    b32 raw;    // /export's raw log, not Markdown
 };
 
 // The command a message is, if its first word is exactly one.
@@ -132,6 +135,92 @@ static i32 slashcount(u32 mask)
 static b32 slashcompletes(Str text, i32 cmd)
 {
     return cmd && text!=slashinfo[cmd].name;
+}
+
+
+// Skills: /name, as the session's engine lists them (skills)
+
+struct SkillItem {
+    Str name;
+    Str desc;
+    Str path;    // its SKILL.md
+    b32 hidden;  // never offered to the agent: the user's alone
+};
+
+// Whether a command has a skill's name, which it then keeps.
+static b32 slashtaken(Str name)
+{
+    for (i32 i = 1; i < SLASH_COUNT; i++) {
+        if (cuthead(slashinfo[i].name, 1) == name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The skill a message invokes, by its first word: exactly /name. Its
+// arg is the rest, trimmed, and skill null if it invokes none.
+static Slash parseskill(Str text, Slice<SkillItem> skills)
+{
+    Slash r    = {};
+    r.turn     = -1;
+    Str   t    = trim(text);
+    iz    word = 0;
+    while (word<t.len && !whitespace(t[word])) word++;
+    Str head = takehead(t, word);
+    if (!startswith(head, "/") || slashtaken(cuthead(head, 1))) {
+        return r;
+    }
+    for (iz i = 0; i < skills.len; i++) {
+        if (cuthead(head, 1) == skills[i].name) {
+            r.skill = skills[i].name;
+            r.arg   = trim(cuthead(t, word));
+        }
+    }
+    return r;
+}
+
+// The slash popup's entries for a partly typed first word, as for
+// slashmatches: the commands (SLASH_*), then the skills, each as
+// SLASH_COUNT plus its index.
+static Slice<i32> slashpicks(Arena *a, Str text, Slice<SkillItem> skills)
+{
+    Slice<i32> r = {};
+    u32        m = slashmatches(text);
+    for (i32 i = 1; i < SLASH_COUNT; i++) {
+        if (m>>i & 1) {
+            r = push(a, r, i);
+        }
+    }
+    if (!startswith(text, "/")) {
+        return r;
+    }
+    Str word = cuthead(text, 1);
+    for (iz i = 0; i < word.len; i++) {
+        if (whitespace(word[i])) {
+            return r;
+        }
+    }
+    for (iz i = 0; i < skills.len; i++) {
+        if (startswith(skills[i].name, word) && !slashtaken(skills[i].name)) {
+            r = push(a, r, SLASH_COUNT + (i32)i);
+        }
+    }
+    return r;
+}
+
+// An entry's word, what it takes, and what it does.
+static SlashInfo slashpickinfo(Arena *a, i32 pick, Slice<SkillItem> skills)
+{
+    if (pick < SLASH_COUNT) {
+        return slashinfo[pick];
+    }
+    SkillItem *k = &skills[pick-SLASH_COUNT];
+    SlashInfo  r = {};
+    r.name = concat(a, "/", k->name);
+    r.args = "[args]";
+    r.desc = k->desc.len ? k->desc : Str("(a skill)");
+    return r;
 }
 
 

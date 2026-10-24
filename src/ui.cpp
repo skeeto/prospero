@@ -1456,6 +1456,26 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
             ImGui::SetClipboardText(cstr0(&a, v->instrtext));
         }
     }
+
+    // Skills, as its engine last listed them: /name invokes one
+    ImGui::Separator();
+    ImGui::TextUnformatted("Skills");
+    if (!hostcap(s->host, "skills")) {
+        ImGui::TextDisabled("None: this host's engine is too old for skills.");
+    } else if (!s->skills.len) {
+        ImGui::TextDisabled("None: no SKILL.md in the project's skill directories, nor in yours.");
+    }
+    for (iz i = 0; i < s->skills.len; i++) {
+        SkillItem *k = &s->skills[i];
+        ImGui::Bullet();
+        text(concat(&a, "/", k->name));
+        if (k->desc.len) {
+            ImGui::SetItemTooltip("%s", cstr0(&a, k->desc));
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s%s", cstr0(&a, showpath(v, k->path)),
+                            k->hidden ? ", for you alone: not offered to the agent" : "");
+    }
     ImGui::PopTextWrapPos();
     g->infoshown = (i32)v->instr.len;
     g->infoagents = agents;
@@ -2542,7 +2562,7 @@ struct ComposeCb {
     GuiSession *s;
     View       *v;
     i32        *slashsel;
-    u32         slash;     // the slash popup's matches, 0 if it is closed
+    i32         slash;     // the slash popup's entries, 0 if it is closed
     i32         cursor;    // the caret before this frame's keys, -1 if inactive
     b32         hadsel;
     b32         recalled;  // history replaced the text
@@ -2581,7 +2601,7 @@ static i32 composecb(ImGuiInputTextCallbackData *d)
         return 0;
     }
     if (c->slash) {
-        i32 n = slashcount(c->slash);
+        i32 n = c->slash;
         *c->slashsel = (*c->slashsel + (up ? n-1 : 1)) % n;
         return 0;
     }
@@ -2704,8 +2724,9 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
 }
 
 // The slash popup, above the box while its first word is typed: each
-// command that word may become, with what it does, the pick marked.
-static void drawslash(Gui *g, u32 slash, ImVec2 at)
+// command and skill that word may become, with what it does, the pick
+// marked.
+static void drawslash(Gui *g, Str text, Slice<SkillItem> skills, ImVec2 at)
 {
     ImGui::SetNextWindowPos(at, ImGuiCond_Always, v2(0, 1));
     ImGuiWindowFlags f = ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoTitleBar |
@@ -2714,20 +2735,24 @@ static void drawslash(Gui *g, u32 slash, ImVec2 at)
                          ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
                          ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoDocking;
     if (ImGui::Begin("##slash", 0, f)) {
-        Arena a = g->frame;
-        i32   n = slashcount(slash);
-        for (i32 i = 0; i < n; i++) {
-            SlashInfo *c = slashinfo + slashnth(slash, i);
-            Buf b(&a, 64);
-            print(&b, c->name);
-            if (c->args.len) {
-                putbyte(&b, ' ');
-                print(&b, c->args);
-            }
-            ImGui::Selectable(cstr0(&a, finish(&b)), i==g->slashsel, 0,
-                              v2(ImGui::CalcTextSize("/compact [focus]").x, 0));
+        Arena         a     = g->frame;
+        Slice<i32>    picks = slashpicks(&a, text, skills);
+        Slice<char *> heads = {};
+        f32           w     = ImGui::CalcTextSize("/compact [focus]").x;
+        for (iz i = 0; i < picks.len; i++) {
+            SlashInfo c = slashpickinfo(&a, picks[i], skills);
+            Str       h = c.args.len ? concat(&a, concat(&a, c.name, " "), c.args) : c.name;
+            heads = push(&a, heads, cstr0(&a, h));
+            f32 hw = ImGui::CalcTextSize(heads[i]).x;
+            w = hw>w ? hw : w;
+        }
+        for (iz i = 0; i < picks.len; i++) {
+            SlashInfo c = slashpickinfo(&a, picks[i], skills);
+            ImGui::PushID((i32)i);
+            ImGui::Selectable(heads[i], i==g->slashsel, 0, v2(w, 0));
+            ImGui::PopID();
             ImGui::SameLine();
-            ImGui::TextDisabled("%s", cstr0(&a, c->desc));
+            ImGui::TextDisabled("%s", cstr0(&a, utf8head(c.desc, 120)));
         }
         ImGui::TextDisabled("Tab or Enter completes; Up and Down pick");
     }
@@ -2779,13 +2804,13 @@ static void drawprompt(Gui *g)
 
     // The slash popup while its first word is typed: its pick, which
     // Tab completes, as does Enter on a word typed in part (below)
-    Str text  = draftstr(s);
-    u32 slash = active && !editing ? slashmatches(text) : 0;
-    i32 pick  = SLASH_NONE;
+    Str        text  = draftstr(s);
+    Slice<i32> picks = active && !editing ? slashpicks(&a, text, s->skills) : Slice<i32>{};
+    i32        slash = (i32)picks.len;
+    i32        pick  = SLASH_NONE;
     if (slash) {
-        i32 n = slashcount(slash);
-        g->slashsel = g->slashsel<n ? g->slashsel : 0;
-        pick = slashnth(slash, g->slashsel);
+        g->slashsel = g->slashsel<slash ? g->slashsel : 0;
+        pick = picks[g->slashsel];
     } else {
         g->slashsel = 0;
     }
@@ -2859,16 +2884,16 @@ static void drawprompt(Gui *g)
     if (cb.escaped) {
         ImGui::ActivateItemByID(id);
     }
-    if (pick && (cb.tab || (send && slashcompletes(text, pick)))) {
+    SlashInfo c = pick ? slashpickinfo(&a, pick, s->skills) : SlashInfo{};
+    if (pick && (cb.tab || (send && text!=c.name))) {
         // Completed rather than sent, the box kept active
-        SlashInfo *c = slashinfo + pick;
-        draftput(g, s, c->args.len ? concat(&a, c->name, " ") : c->name);
+        draftput(g, s, c.args.len ? concat(&a, c.name, " ") : c.name);
         drafttyped(&s->dclock, g->sched.now);
         send = 0;
         ImGui::ActivateItemByID(id);
     }
     if (slash && ImGui::GetActiveID()==id) {
-        drawslash(g, slashmatches(draftstr(s)), v2(r0.x, r0.y));
+        drawslash(g, draftstr(s), s->skills, v2(r0.x, r0.y));
     }
 
     // The context menu
@@ -2948,8 +2973,13 @@ static void drawprompt(Gui *g)
     if (send && can && !editing) {
         Str   p  = trim(draftstr(s));
         Slash sl = parseslash(p);
+        Slash sk = parseskill(p, s->skills);
         if (sl.cmd) {
             runslash(g, s, sl, p);
+        } else if (sk.skill.len && hostcap(s->host, "skills")) {
+            draftdone(&s->dclock);
+            guiskill(g, s, sk.skill, sk.arg, p);
+            draftput(g, s, "");
         } else if (p.len) {
             draftdone(&s->dclock);  // the prompt clears the engine's draft
             guiprompt(g, p);
@@ -5973,8 +6003,9 @@ static void drawhelp(Gui *g)
         "newest first; Up and Down go back and forth, Esc returns to the "
         "empty draft. A message that starts with /compact [focus], "
         "/model [NAME], /rename TITLE, /fork or /export runs that command "
-        "instead (Tab completes); any other text, even one starting with a "
-        "slash, is sent as it is. Right-click the box for Undo, Paste and "
+        "instead (Tab completes), and /NAME [args] invokes the skill NAME, "
+        "its SKILL.md sent with the args; any other text, even one starting "
+        "with a slash, is sent as it is. Right-click the box for Undo, Paste and "
         "the rest.");
     ImGui::Spacing();
     ImGui::TextWrapped(

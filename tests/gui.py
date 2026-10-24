@@ -1241,6 +1241,10 @@ def main():
             ap.error("--mode compose runs only here: its test editor is a sh script")
         editor = host.path("edit.sh")
         host.write(editor, COMPOSE_EDITOR)
+        # A skill of the workspace's, for /name's completion
+        host.mkdir(host.path("work", ".claude", "skills", "zzcheck"))
+        host.write(host.path("work", ".claude", "skills", "zzcheck", "SKILL.md"),
+                   "---\ndescription: A skill of the checklist's\n---\nCheck.\n")
         before = config(curl, model, extra=composeconfig(editor, nonce))
     elif args.mode == "sessions":
         # A model to switch to; a remote listed always, never reached,
