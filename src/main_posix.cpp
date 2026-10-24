@@ -2931,8 +2931,7 @@ static Detached os_detach(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Str e
         }
     }
     char **cargv = alloc<char *>(&scratch, argv.len+1);
-    cargv[0] = os->exe;  // this executable, whatever argv[0] says
-    for (iz i = 1; i < argv.len; i++) {
+    for (iz i = 0; i < argv.len; i++) {
         cargv[i] = cstr(&scratch, argv[i]);
     }
     char *ccwd = cstr(&scratch, cwd);
@@ -2971,7 +2970,7 @@ static Detached os_detach(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Str e
         if (chdir(ccwd)) {
             // It starts where this process is, then
         }
-        execv(cargv[0], cargv);
+        execv(os->exe, cargv);  // this executable, whatever argv[0] says
         i32 v[2] = {0, errno};
         while (write(p[1], v, sizeof(v))<0 && errno==EINTR) {}
         _exit(127);
