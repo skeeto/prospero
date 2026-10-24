@@ -814,7 +814,7 @@ static void sendqueue(Session *s, Arena scratch)
     iz n      = s->steers.len + s->queued.len;
     iz budget = mailmax(s->e->out) / 8;
     iz share  = budget / (n ? n : 1);
-    share = share<QUEUE_SHOW ? share : QUEUE_SHOW;
+    share = share<(iz)QUEUE_SHOW ? share : (iz)QUEUE_SHOW;
     Buf   b(&scratch, 256 + n*(64 + share));
     EvOut w = sbegin(s, &b, EV_QUEUE);
     putkey(&w.json, "items");

@@ -3524,10 +3524,10 @@ sc_compact_cancel = sc_compact_manual
 
 
 def sc_compact_cancel_compact(model, n, req):
-    # A summarizer slow enough to cancel, then a quick one
+    # A summarizer slow enough to cancel, then one quick, but not so
+    # quick that it ends before the prompt sent after it is queued
     yield S.head()
-    if n == 0:
-        yield S.sleep(30)
+    yield S.sleep(30 if n == 0 else 1)
     yield from text(model, f"## Goal\nRead the files. SUMMARY-{n}", 2)
     yield from finish(model, prompt=ptok(req))
 

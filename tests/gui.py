@@ -121,7 +121,9 @@ printf '\nEdited by the test editor.\n' >> "$1"
 
 def composeconfig(editor, nonce):
     """The compose mode's: the test editor, and a model for /model."""
-    quoted = "'" + editor.replace("'", "'\\''") + "'"
+    # Run by sh -c, or on Windows by cmd.exe, which knows only "
+    quoted = (f'"{editor}"' if os.name == "nt" else
+              "'" + editor.replace("'", "'\\''") + "'")
     return (
         "\n# The compose box's editor, a test script\n"
         "[ui]\n"
@@ -467,7 +469,7 @@ class Local:
                 pass
             p.wait()
             return None, lines
-        if p.returncode == -signal.SIGKILL:
+        if p.returncode == -getattr(signal, "SIGKILL", 9):  # none on Windows
             return None, lines  # the timer's, which killed the whole group
         return p.returncode, lines
 

@@ -4935,7 +4935,8 @@ def gauge(t):
         b = t.headless()
         o = b.call("open", sid=sid)
         t.check(o.get("ok") == 1, f"open {o}")
-        live = b.all("live", sid)[-1]
+        # live follows open's reply (cmdopen), so wait for it
+        live = b.wait(lambda e: e.get("ev") == "live" and e.get("sid") == sid)
         t.check(live.get("ctx") == 25000 and live.get("compact_at") == 21250 and
                 live.get("tokens", 0) > 500, f"live after open {live}")
     finally:

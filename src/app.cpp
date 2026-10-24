@@ -10732,8 +10732,13 @@ static b32 drivecheck(Gui *g, i32 chk)
         putbyte(&b, 'x');
         print(&b, (i64)on.h);
         guilog(g, finish(&b));
-        return w.ok && (w.max || g->ops[g->drivepc-1].dx!=0) && g->geom.max &&
-               10*(i64)w.box.w>=9*(i64)on.w && 10*(i64)w.box.h>=8*(i64)on.h;
+        #ifdef _WIN32
+        // Win32 gives a maximized window's restored box, not its frame
+        b32 fills = w.max;
+        #else
+        b32 fills = 10*(i64)w.box.w>=9*(i64)on.w && 10*(i64)w.box.h>=8*(i64)on.h;
+        #endif
+        return w.ok && (w.max || g->ops[g->drivepc-1].dx!=0) && g->geom.max && fills;
     }
     case CHK_QUEUESHOWN: {
         DriveOp *op = &g->ops[g->drivepc-1];
