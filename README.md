@@ -371,8 +371,10 @@ A variant is chosen as any model is, for a session, a role, a
 fallback or a compactor.
 
 Sessions, their logs and the cache of URL includes live in the state
-directory: `$XDG_STATE_HOME/prospero`, else `~/.local/state/prospero`,
-or `%LOCALAPPDATA%\prospero` on Windows.
+directory: `$XDG_STATE_HOME/prospero`, else `~/.local/state/prospero`.
+On Windows, with no `%HOME%` (as from Explorer, but not w64devkit), it
+is `%LOCALAPPDATA%\prospero`, and there a state directory made before
+`%HOME%` came first is used until one exists under `%HOME%`.
 
 At the start of a session the agent is given its instructions:
 `AGENTS.md` next to the default configuration file (such as
