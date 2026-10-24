@@ -7521,7 +7521,7 @@ enum : i32 {
     OP_KEYDOWN,   // key in dx, modifiers (KEY_*) in dy
     OP_KEYUP,
     OP_TEXT,
-    OP_RESIZE,    // to dx by dy
+    OP_RESIZE,    // to dx by dy, or 0 by 0: the first size (firstgeom)
     OP_CHECK,     // target is a CHK_*
     OP_IDLE,      // log frames since the last OP_MARK
     OP_MARK,
@@ -7894,6 +7894,10 @@ enum : i32 {
                       // text if any (0: not drawn)
     CHK_NEWCWD,       // the directory's field is --cwd and text (drivepath)
     CHK_SESSDIR,      // the session shown works in a directory ending in text
+    CHK_FIRSTSIZE,    // the window opened at its first size, or maximized
+    CHK_FIRSTRUN,     // Help floats centered, selected; Settings and Hosts
+                      // with it if dx, else closed
+    CHK_DOCKTREE,     // the docked layout, as built, Jobs selected
     CHK_COUNT,
 };
 
@@ -8090,6 +8094,9 @@ static Str chknames[] = {
     "the directory's dropdown lists the folders the text picks, best first",
     "the directory's field holds the path completed",
     "the session shown works in the directory completed",
+    "the window opened at its first size, maximized on a small display",
+    "a first run's Help floats centered in front, its tab selected",
+    "the layout is as built: its panes' places and shares, Jobs selected",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -8177,8 +8184,30 @@ struct DriveOp {
     Str text;
 };
 
+// A first run, as every checklist's is (in a fresh state directory):
+// the window at its first size, Help in front with Settings and Hosts
+// if extras (nothing configured), else they are closed. Then View's
+// Reset layout docks it all as built, Help and the rest with the jobs.
+#define FIRSTRUN(extras) \
+    {OP_CHECK, CHK_FIRSTSIZE, 0, 0, 0, ""}, \
+    {OP_CHECK, CHK_FIRSTRUN, extras, 0, 0, ""}, \
+    {OP_SHOT, 0, 0, 0, 300, "firstrun"}, \
+    {OP_MOVE, T_MENU, 0, 0, 100, ""}, {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 500, ""}, \
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Reset layout"}, {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 800, ""}, \
+    {OP_CHECK, CHK_DOCKTREE, 0, 0, 0, ""}
+// A pane shown from the View menu, its tab selected
+#define SHOWPANE(name) \
+    {OP_MOVE, T_MENU, 0, 0, 100, ""}, {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 500, ""}, \
+    {OP_MOVE, T_PANEITEM, 0, 0, 100, name}, {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 500, ""}, \
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, name}
+
 static DriveOp driveops[] = {
     {OP_MARK, 0, 0, 0, 1500, ""},
+    FIRSTRUN(1),
     {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
     {OP_CHECK, CHK_CLICKTHROUGH, 0, 0, 0, ""},
     // Tooltip on a toolbar button, appearing with no event at all
@@ -8245,10 +8274,10 @@ static DriveOp driveops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 700, ""},
     {OP_CHECK, CHK_HELPTAB, 0, 0, 0, ""},
-    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_MOVE, T_JOBSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 700, ""},
-    {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
+    {OP_CHECK, CHK_JOBSTAB, 0, 0, 0, ""},
     // Ctrl+Tab, held
     {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""},
     {OP_KEYDOWN, 0, GKEY_TAB, KEY_CTRL, 50, ""},
@@ -8256,16 +8285,16 @@ static DriveOp driveops[] = {
     {OP_CHECK, CHK_NAVWIN, 0, 0, 0, ""},
     {OP_KEYUP, 0, GKEY_CTRL, 0, 800, ""},
     {OP_CHECK, CHK_NONAVWIN, 0, 0, 0, ""},
-    // Resizing the window
+    // Resizing the window, and back to its first size
     {OP_RESIZE, 0, 1100, 700, 800, ""},
     {OP_CHECK, CHK_RESIZED, 0, 0, 0, ""},
-    {OP_RESIZE, 0, 1280, 800, 800, ""},
+    {OP_RESIZE, 0, 0, 0, 800, ""},
     // Windows' own modal resize loop, during which streaming goes on
     {OP_STREAM, 0, 100, 0, 500, ""},
     {OP_MODALSIZE, 0, 12, 0, 1500, ""},
     {OP_CHECK, CHK_MODALSIZE, 0, 0, 0, ""},
     {OP_STOP, 0, 0, 0, 300, ""},
-    {OP_RESIZE, 0, 1280, 800, 800, ""},
+    {OP_RESIZE, 0, 0, 0, 800, ""},
     // Moving to a monitor of another DPI
     {OP_DPI, 0, 144, 0, 800, ""},
     {OP_CHECK, CHK_DPI, 0, 0, 0, ""},
@@ -8395,6 +8424,11 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_ENGINE, 0, 0, 0, ""},
+    FIRSTRUN(0),
+    SHOWPANE("Settings"),
+    {OP_MOVE, T_JOBSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
     {OP_CHECK, CHK_JOBSTAB, 0, 0, 0, ""},
     {OP_CHECK, CHK_CLICKTHROUGH, 0, 0, 0, ""},
@@ -8533,10 +8567,10 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 700, ""},
     {OP_CHECK, CHK_HELPTAB, 0, 0, 0, ""},
-    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_MOVE, T_JOBSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 700, ""},
-    {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
+    {OP_CHECK, CHK_JOBSTAB, 0, 0, 0, ""},
     // Ctrl+Tab, held
     {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""},
     {OP_KEYDOWN, 0, GKEY_TAB, KEY_CTRL, 50, ""},
@@ -8544,16 +8578,16 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_NAVWIN, 0, 0, 0, ""},
     {OP_KEYUP, 0, GKEY_CTRL, 0, 800, ""},
     {OP_CHECK, CHK_NONAVWIN, 0, 0, 0, ""},
-    // Resizing the window
+    // Resizing the window, and back to its first size
     {OP_RESIZE, 0, 1100, 700, 800, ""},
     {OP_CHECK, CHK_RESIZED, 0, 0, 0, ""},
-    {OP_RESIZE, 0, 1280, 800, 800, ""},
+    {OP_RESIZE, 0, 0, 0, 800, ""},
     // The system's modal resize loop while a reply streams
     {OP_PROMPT, 0, 0, 0, 500, "Stream slowly for a while."},
     {OP_MODALSIZE, 0, 12, 0, 1500, ""},
     {OP_CHECK, CHK_MODALSIZE, 0, 0, 0, ""},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
-    {OP_RESIZE, 0, 1280, 800, 800, ""},
+    {OP_RESIZE, 0, 0, 0, 800, ""},
     // Moving to a monitor of another DPI
     {OP_DPI, 0, 144, 0, 800, ""},
     {OP_CHECK, CHK_DPI, 0, 0, 0, ""},
@@ -8743,7 +8777,7 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_REFLOW, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "21-reflow"},
     {OP_ANCHOR, 0, 0, 0, 0, ""},
-    {OP_RESIZE, 0, 1280, 800, 800, ""},
+    {OP_RESIZE, 0, 0, 0, 800, ""},
     {OP_CHECK, CHK_REFLOW, 0, 0, 0, ""},
     // tools = open, fold and auto again, as the settings would set it
     {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
@@ -9176,6 +9210,9 @@ static DriveOp m3ops[] = {
 static DriveOp e2eops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    SHOWPANE("Settings"),
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_CHECK, CHK_SESSION, 0, 0, 0, ""},
@@ -9274,6 +9311,10 @@ static DriveOp e2eops[] = {
 static DriveOp settingsops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    SHOWPANE("Settings"),
+    SHOWPANE("Hosts"),
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Show the themes."},
@@ -9496,6 +9537,9 @@ static DriveOp settingsops[] = {
 static DriveOp sessionsops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    SHOWPANE("Hosts"),
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Say hello."},
@@ -9780,6 +9824,8 @@ static DriveOp sessionsops[] = {
 // that closing quits at once.
 static DriveOp stopops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Close me: run a very slow command."},
@@ -9818,6 +9864,9 @@ static DriveOp stopops[] = {
 static DriveOp bgops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    SHOWPANE("Hosts"),
     {OP_SYSTHEME, 0, 0, 0, 1000, ""},
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
@@ -9934,6 +9983,10 @@ static DriveOp attachops[] = {
 static DriveOp remoteops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    SHOWPANE("Settings"),
+    SHOWPANE("Hosts"),
     {OP_SYSTHEME, 0, 0, 0, 500, ""},
     {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -10112,6 +10165,8 @@ static DriveOp remoteops[] = {
 static DriveOp planops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
     {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
@@ -10307,6 +10362,8 @@ static DriveOp launchops[] = {
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_CHECK, CHK_LAUNCHDIR, 0, 0, 0, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
     {OP_OPENDIR, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_OPENED, 1, 0, 0, ""},
     {OP_CHECK, CHK_LAUNCHDIR, 0, 0, 0, ""},
@@ -10424,6 +10481,8 @@ static DriveOp launchops[] = {
 static DriveOp composeops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
     // A, with two prompts to recall
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
@@ -10747,12 +10806,26 @@ static DriveOp compose2ops[] = {
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
+// A first run with nothing configured, on a display too small for the
+// first size (--display): maximized, Help in front with Settings and
+// Hosts, which Reset layout puts with the jobs.
+static DriveOp firstops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1500, ""},
+    FIRSTRUN(1),
+    {OP_SHOT, 0, 0, 0, 300, "firstrun-reset"},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
 #undef KEY
 #undef CLICK
 #undef RCLICK
 #undef PICK
 #undef SELALL
 #undef CTRLG
+#undef FIRSTRUN
+#undef SHOWPANE
 
 static DriveOp idleops[] = {
     {OP_MARK, 0, 0, 0, 10000, ""},  // startup settles
@@ -10809,8 +10882,15 @@ static ImVec2 tabcenter(char const *name)
     if (!tab) {
         return v2(-1, -1);
     }
-    return v2(tb->BarRect.Min.x + tab->Offset + tab->Width/2,
-              (tb->BarRect.Min.y + tb->BarRect.Max.y)/2);
+    // Its part shown in a tab bar scrolled for want of room
+    f32 x0 = tb->BarRect.Min.x + tab->Offset - tb->ScrollingAnim;
+    f32 x1 = x0 + tab->Width;
+    x0 = x0>tb->ScrollingRectMinX ? x0 : tb->ScrollingRectMinX;
+    x1 = x1<tb->ScrollingRectMaxX ? x1 : tb->ScrollingRectMaxX;
+    if (x1 <= x0) {
+        return v2(-1, -1);
+    }
+    return v2((x0 + x1)/2, (tb->BarRect.Min.y + tb->BarRect.Max.y)/2);
 }
 
 static ImGuiDockNode *rootsplit(Gui *g)
@@ -11006,6 +11086,178 @@ static b32 tabselected(char const *name)
 {
     ImGuiWindow *w = ImGui::FindWindowByName(name);
     return w && w->DockTabIsVisible;
+}
+
+// The dock node a pane is in, or is to join when shown.
+static ImGuiID panedock(i32 pane)
+{
+    ImGuiWindow *w = ImGui::FindWindowByName(panenames[pane]);
+    if (w && w->DockNode) {
+        return w->DockNode->ID;
+    }
+    ImGuiWindowSettings *s = ImGui::FindWindowSettingsByID(ImHashStr(panenames[pane]));
+    return w ? w->DockId : s ? s->DockId : 0;
+}
+
+// Whether a node split along axis has its share of the size there,
+// within a little for the splitters.
+static b32 dockshare(ImGuiDockNode *parent, i32 axis, i32 child, f32 share)
+{
+    ImGuiDockNode *n = parent ? parent->ChildNodes[child] : 0;
+    if (!n || parent->SplitAxis!=axis) {
+        return 0;
+    }
+    f32 want = share * parent->Size[axis];
+    f32 off  = n->Size[axis] - want;
+    off = off<0 ? -off : off;
+    return off <= 0.02f*parent->Size[axis] + 4;
+}
+
+// The first size (firstgeom) at the display's scale, on the display
+// given by --display or the primary: as ImGui sees it, or maximized.
+static b32 firstsizecheck(Gui *g)
+{
+    WinBox d = g->firstdisp;
+    if (!d.w) {
+        os_guidisplays(g->os, &d, 1);
+    }
+    WinGeom want = firstgeom(d, g->scale);
+    WinGeom now  = os_guiwhere(g->os);
+    ImVec2  ds   = ImGui::GetIO().DisplaySize;
+    Arena   a    = g->frame;
+    Buf     b(&a, 160);
+    print(&b, "drive: the window ");
+    print(&b, (i64)ds.x);
+    putbyte(&b, 'x');
+    print(&b, (i64)ds.y);
+    print(&b, now.max ? Str(", maximized") : Str(""));
+    print(&b, "; its first ");
+    print(&b, (i64)want.box.w);
+    putbyte(&b, 'x');
+    print(&b, (i64)want.box.h);
+    print(&b, want.max ? Str(", maximized") : Str(""));
+    print(&b, ", for a display ");
+    print(&b, (i64)d.w);
+    putbyte(&b, 'x');
+    print(&b, (i64)d.h);
+    print(&b, " at scale ");
+    printfloat(&b, g->scale, 2);
+    guilog(g, finish(&b));
+    if (want.max) {
+        return now.ok && now.max;
+    }
+    f32 dx = ds.x - (f32)want.box.w;
+    f32 dy = ds.y - (f32)want.box.h;
+    return now.ok && !now.max && dx>-1.5f && dx<1.5f && dy>-1.5f && dy<1.5f;
+}
+
+// A first run's pane: Help's floating node, centered on the dock space,
+// Help selected, with Settings and Hosts in it if extras, else closed.
+static b32 firstruncheck(Gui *g, b32 extras)
+{
+    ImGuiWindow   *h    = ImGui::FindWindowByName("Help");
+    ImGuiDockNode *n    = h ? h->DockNode : 0;
+    ImGuiDockNode *root = ImGui::DockBuilderGetNode(g->dockspace);
+    if (!n || !root || n->ParentNode || n->IsDockSpace() || n->HostWindow==0) {
+        guilog(g, "drive: Help is in no floating dock node");
+        return 0;
+    }
+    ImVec2 c  = v2(root->Pos.x + root->Size.x/2, root->Pos.y + root->Size.y/2);
+    ImVec2 nc = v2(n->Pos.x + n->Size.x/2, n->Pos.y + n->Size.y/2);
+    Arena  a  = g->frame;
+    Buf    b(&a, 160);
+    print(&b, "drive: Help's node ");
+    print(&b, (i64)n->Size.x);
+    putbyte(&b, 'x');
+    print(&b, (i64)n->Size.y);
+    print(&b, " centered at ");
+    print(&b, (i64)nc.x);
+    putbyte(&b, ',');
+    print(&b, (i64)nc.y);
+    print(&b, " (the dock space's ");
+    print(&b, (i64)c.x);
+    putbyte(&b, ',');
+    print(&b, (i64)c.y);
+    print(&b, "), with ");
+    print(&b, (i64)n->Windows.Size);
+    print(&b, " windows");
+    guilog(g, finish(&b));
+    f32 dx = nc.x - c.x;
+    f32 dy = nc.y - c.y;
+    b32 ok = dx>-2 && dx<2 && dy>-2 && dy<2 && tabselected("Help") &&
+             n->Windows.Size==(extras ? 3 : 1);
+    i32 more[] = {PANE_SETTINGS, PANE_HOSTS};
+    for (i32 i = 0; i < countof(more); i++) {
+        ok &= g->panes[more[i]] == extras;
+        ok &= (panedock(more[i]) == n->ID) == extras;
+    }
+    // In front of the docked panes
+    ImGuiWindow *front = 0;
+    ImGuiContext &ctx = *GImGui;
+    for (i32 i = ctx.Windows.Size-1; i>=0 && !front; i--) {
+        ImGuiWindow *w = ctx.Windows[i];
+        b32 at = w->Active && !w->Hidden && !(w->Flags & ImGuiWindowFlags_ChildWindow) &&
+                 w->Rect().Contains(nc);
+        front = at ? w : 0;
+    }
+    return ok && front && front->RootWindowDockTree==n->HostWindow->RootWindowDockTree;
+}
+
+// The layout buildlayout makes: the shares of each split, the panes in
+// their places, Help, Settings and Hosts with the jobs, Jobs selected.
+static b32 docktreecheck(Gui *g)
+{
+    ImGuiDockNode *root = ImGui::DockBuilderGetNode(g->dockspace);
+    ImGuiDockNode *rest = root ? root->ChildNodes[0] : 0;
+    ImGuiDockNode *right = root ? root->ChildNodes[1] : 0;
+    ImGuiDockNode *left = rest ? rest->ChildNodes[0] : 0;
+    ImGuiDockNode *center = rest ? rest->ChildNodes[1] : 0;
+    if (!right || !left || !center) {
+        guilog(g, "drive: the dock space is not split in three columns");
+        return 0;
+    }
+    b32 ok = dockshare(root, ImGuiAxis_X, 1, LAYOUT_RIGHT) &&
+             dockshare(rest, ImGuiAxis_X, 0, LAYOUT_LEFT) &&
+             dockshare(center, ImGuiAxis_Y, 1, LAYOUT_PROMPT) &&
+             dockshare(right, ImGuiAxis_Y, 1, LAYOUT_PLAN) &&
+             dockshare(left, ImGuiAxis_Y, 1, LAYOUT_TODO);
+    if (!ok) {
+        Arena a = g->frame;
+        Buf   b(&a, 160);
+        print(&b, "drive: the columns ");
+        print(&b, (i64)left->Size.x);
+        print(&b, ", ");
+        print(&b, (i64)center->Size.x);
+        print(&b, ", ");
+        print(&b, (i64)right->Size.x);
+        print(&b, " wide, not in their shares of ");
+        print(&b, (i64)root->Size.x);
+        guilog(g, finish(&b));
+        return 0;
+    }
+    ImGuiDockNode *rtop = right->ChildNodes[0];
+    struct { i32 pane; ImGuiDockNode *n; } places[] = {
+        {PANE_SESSIONS,   left->ChildNodes[0]},
+        {PANE_TODO,       left->ChildNodes[1]},
+        {PANE_TRANSCRIPT, center->ChildNodes[0]},
+        {PANE_PROMPT,     center->ChildNodes[1]},
+        {PANE_JOBS,       rtop},
+        {PANE_LOG,        rtop},
+        {PANE_PLAN,       right->ChildNodes[1]},
+        {PANE_HELP,       rtop},
+        {PANE_SETTINGS,   rtop},
+        {PANE_HOSTS,      rtop},
+    };
+    for (i32 i = 0; i < countof(places); i++) {
+        ImGuiDockNode *n = places[i].n;
+        if (!n || panedock(places[i].pane)!=n->ID) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, "drive: out of place: ",
+                             inistr(panenames[places[i].pane])));
+            return 0;
+        }
+    }
+    return tabselected("Jobs") && !g->panes[PANE_METRICS];
 }
 
 // The compose box's text, the session shown's draft.
@@ -12100,6 +12352,9 @@ static b32 drivecheck(Gui *g, i32 chk)
         ImVec2 p = targetpos(g, T_SPLITTER);
         return p.x>0 && p.x < g->splitx - 40;
     }
+    case CHK_FIRSTSIZE:     return firstsizecheck(g);
+    case CHK_FIRSTRUN:      return firstruncheck(g, g->ops[g->drivepc-1].dx != 0);
+    case CHK_DOCKTREE:      return docktreecheck(g);
     case CHK_HELPTAB:       return tabselected("Help");
     case CHK_TRANSCRIPTTAB: return tabselected("Transcript");
     case CHK_JOBSTAB:       return tabselected("Jobs") && g->jobsvisible;
@@ -13139,6 +13394,15 @@ static void drivestep(Gui *g)
         e.kind = GEV_RESIZE;
         e.x    = op->dx * winscale(g);
         e.y    = op->dy * winscale(g);
+        if (op->dx == 0) {
+            WinBox d = g->firstdisp;
+            if (!d.w) {
+                os_guidisplays(g->os, &d, 1);
+            }
+            WinGeom f = firstgeom(d, g->scale);
+            e.x = (f32)f.box.w;
+            e.y = (f32)f.box.h;
+        }
         os_guiinject(g->os, &e);
         break;
     case OP_CLOSE:
@@ -13714,6 +13978,8 @@ static Str guiusage =
 "                 Plan window, the toggle and /plan\n"
 "  --launch       prospero DIR's checklist: DIR's session, another launch's\n"
 "                 handed off (tests/gui.py drives it), a session with no folder\n"
+"  --firstrun     a first run's layout, with nothing configured (with\n"
+"                 --display, on a small display)\n"
 "  --host-idle S  in the background, exit S seconds after the last\n"
 "                 session ends with no window (default: [host] idle_exit)\n"
 "  --probe        staleness probe on (default in debug builds)\n"
@@ -13883,7 +14149,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
-    b32 launch = 0;
+    b32 launch = 0, first = 0;
     i64 history = 0;
     Str opendir = {};  // prospero DIR, as given
     i32 bench   = 0;
@@ -13926,6 +14192,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             launch = probe = 1;
         } else if (a == "--plan") {
             plan = probe = 1;
+        } else if (a == "--firstrun") {
+            first = probe = 1;
         } else if (a == "--compose-again") {
             compose = 2;
             probe   = 1;
@@ -13989,9 +14257,13 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     }
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
-            background || attach || remote || compose || sidebar || plan || launch) {
+            background || attach || remote || compose || sidebar || plan || launch ||
+            first) {
         g->drive = 1;
-        if (launch) {
+        if (first) {
+            g->ops  = firstops;
+            g->nops = countof(firstops);
+        } else if (launch) {
             g->ops  = launchops;
             g->nops = countof(launchops);
         } else if (plan) {

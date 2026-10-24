@@ -25,6 +25,7 @@ by quitting are gone, with no engine process left behind.
   uv run tests/gui.py --prospero build/prospero --mode compose [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode plan [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode launch [--shots DIR]
+  uv run tests/gui.py --prospero build/prospero --mode firstrun [--shots DIR]
 
 The settings mode edits a value longer than a field's slack and picks
 the theme, dark then light, from its list over a transcript that shows
@@ -58,6 +59,12 @@ and the new session dialog one with no folder, and one in a directory
 completed as typed (Tab, Esc, Down, Enter, a click); then, here on POSIX,
 two launches with no window both detach at once, leaving one window
 with both sessions, which is then told to quit.
+
+Every checklist starts as a first run, its state directory fresh: the
+window at its first size, and Help in front, then Reset layout. The
+firstrun mode's configuration names no model and no remote host, so
+Settings and Hosts are in front with Help, and its display is too
+small for the first size (--display), so the window opens maximized.
 
 On Linux without a display it runs under xvfb-run. --serve only runs the
 provider and writes the configuration, for a GUI started elsewhere (a
@@ -182,6 +189,15 @@ def config(url, model, ask=3, extra=""):
         f"ask_timeout = {ask}\n"
         "temp = ask\n"
     ) + extra
+
+
+def firstconfig(url):
+    """The firstrun mode's: an endpoint, but no model and no remote."""
+    return (
+        "# A first run's configuration: nothing says which model\n"
+        "[endpoint fake]\n"
+        f"url = {url}/\n"
+    )
 
 
 def m4config(url, nonce):
@@ -453,7 +469,7 @@ class Local:
         cmd = [self.prospero] + ([sub] if sub else []) + guiargs
         if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
                 and not os.environ.get("WAYLAND_DISPLAY"):
-            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
+            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24"] + cmd
         print(" ".join(cmd), flush=True)
         p = subprocess.Popen(cmd, cwd=cwd or self.path("work"), stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -717,7 +733,7 @@ def signals(args):
         cmd = [prospero, "gui", "--fake", "--statedir", state]
         if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
                 and not os.environ.get("WAYLAND_DISPLAY"):
-            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
+            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24"] + cmd
         env = dict(os.environ, SDL_WINDOW_ACTIVATE_WHEN_SHOWN="0")
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, env=env, start_new_session=True)
@@ -1111,7 +1127,7 @@ def crashed(args):
         cmd = [prospero, "gui", "--fake", "--statedir", state]
         if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
                 and not os.environ.get("WAYLAND_DISPLAY"):
-            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1600x1000x24"] + cmd
+            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24"] + cmd
         env = dict(os.environ, SDL_WINDOW_ACTIVATE_WHEN_SHOWN="0")
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, env=env, start_new_session=True)
@@ -1338,7 +1354,7 @@ def main():
     ap.add_argument("--mode", default="drive",
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
-                             "compose", "sessions", "plan", "launch"])
+                             "compose", "sessions", "plan", "launch", "firstrun"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1436,6 +1452,8 @@ def main():
                 [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                               "fake_desktop.py")])
             before += DESKROLE
+    elif args.mode == "firstrun":
+        before = firstconfig(curl)
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
         # A directory for the ask allowed always
@@ -1481,6 +1499,8 @@ def main():
         guiargs += ["--inbox-cap", str(args.inbox_cap or 65536)]
     if far:
         guiargs += ["--rcwd", far.work]
+    if args.mode == "firstrun":
+        guiargs += ["--display", "1280x720"]  # too small: maximized
     if args.subprocess:
         guiargs.append("--engine=subprocess")
     if args.trace:
@@ -1536,7 +1556,8 @@ def main():
         else:
             print(f"the URL include was fetched {fetched} times")
         problems += far.close(args.keep)
-    if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan"):
+    if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
+                     "firstrun"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")
