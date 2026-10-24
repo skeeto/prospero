@@ -1013,9 +1013,12 @@ struct Gui {
     Str                editor;     // [ui] editor
     Mailbox           *edbox;      // its process's records
     GuiSession        *edsess;     // whose draft it edits, or null
+    b32                edplan;     // its plan file instead (Edit plan)
+    Str                edreq;      // and that plan's ask
+    i64                planedits;  // plans edited, for the checklist
     Proc              *edproc;
     u64                edid;
-    Str                edpath;     // the draft's file
+    Str                edpath;     // the draft's file, or the plan file
     Str                edlog;      // the editor's output
     Str                edname;     // as the box names it
     i32                slashsel;   // the slash popup's pick, among its matches
@@ -3227,7 +3230,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         }
         // The draft its engine kept, unless something was typed since
         Str draft = jsonstr(jsonget(j, "draft"));
-        if (draft.len && draftloads(&s->dclock) && g->edsess!=s) {
+        if (draft.len && draftloads(&s->dclock) && (g->edsess!=s || g->edplan)) {
             draftput(g, s, draft);
         }
         guiskills(g, s);
@@ -3570,7 +3573,11 @@ static void setnote(Gui *g, GuiSession *s, Str note, b32 err)
 // goes if this process does. Its exit comes as a record, which wakes
 // the GUI: with status 0 the file is the new draft; with any other, or
 // cancelled, the draft stays as it was. One draft at a time is out,
-// and its box is read-only meanwhile.
+// and its box is read-only meanwhile. Or, from a plan's ask (Edit
+// plan), the plan file itself, edited in place, on this machine: once
+// the editor exits, however it went, the ask and the Plan window show
+// the file as it is, which is the plan the engine approves. One file at
+// a time is out, a draft or a plan.
 
 static Str editorcmd(Gui *g, Arena *a)
 {
@@ -3578,27 +3585,23 @@ static Str editorcmd(Gui *g, Arena *a)
                       os_getenv(g->os, a, "EDITOR"), g->mac);
 }
 
-static void editstart(Gui *g, GuiSession *s)
+// Why no file can go out to the editor now, or null if one can.
+static Str editorwhy(Gui *g, GuiSession *s, Arena *a)
 {
-    if (g->edsess) {
-        setnote(g, s, g->edsess==s ? Str("the draft is open in the editor already")
-                                   : Str("the editor has another session's draft open"), 1);
-        return;
+    if (!editorcmd(g, a).len) {
+        return "no editor: set [ui] editor in the settings (or $VISUAL or $EDITOR)";
+    } else if (g->edsess && g->edplan) {
+        return "the editor has a plan open";
+    } else if (g->edsess) {
+        return g->edsess==s ? Str("the draft is open in the editor already")
+                            : Str("the editor has another session's draft open");
     }
-    Arena a   = g->frame;
-    Str   cmd = editorcmd(g, &a);
-    if (!cmd.len) {
-        setnote(g, s, "no editor: set [ui] editor in the settings (or $VISUAL or $EDITOR)", 1);
-        return;
-    }
-    Str dir  = join(&a, g->statedir, "edit");
-    Str base = concat(&a, "draft-", s->sid.len ? s->sid : Str("new"));
-    Str path = join(&a, dir, concat(&a, base, ".md"));
-    Str log  = join(&a, dir, concat(&a, base, ".log"));
-    if (!os_mkdirs(g->os, a, dir) || !os_write(g->os, a, path, draftstr(s))) {
-        setnote(g, s, concat(&a, "cannot write the draft for the editor: ", os_lasterr(g->os, &a)), 1);
-        return;
-    }
+    return {};
+}
+
+// Run the editor on a file, from dir, its output to log. Null on failure.
+static Proc *editrun(Gui *g, Arena a, Str cmd, Str path, Str dir, Str log)
+{
     Spawn sp = {};
     #ifdef _WIN32
     Str comspec = os_getenv(g->os, &a, "COMSPEC");
@@ -3623,13 +3626,34 @@ static void editstart(Gui *g, GuiSession *s)
     sp.maxbytes = 1<<16;
     sp.mbox     = g->edbox;
     sp.id       = ++g->edid;
-    Proc *p = os_spawn(g->os, &sp, a);
+    return os_spawn(g->os, &sp, a);
+}
+
+static void editstart(Gui *g, GuiSession *s)
+{
+    Arena a   = g->frame;
+    Str   why = editorwhy(g, s, &a);
+    if (why.len) {
+        setnote(g, s, why, 1);
+        return;
+    }
+    Str cmd  = editorcmd(g, &a);
+    Str dir  = join(&a, g->statedir, "edit");
+    Str base = concat(&a, "draft-", s->sid.len ? s->sid : Str("new"));
+    Str path = join(&a, dir, concat(&a, base, ".md"));
+    Str log  = join(&a, dir, concat(&a, base, ".log"));
+    if (!os_mkdirs(g->os, a, dir) || !os_write(g->os, a, path, draftstr(s))) {
+        setnote(g, s, concat(&a, "cannot write the draft for the editor: ", os_lasterr(g->os, &a)), 1);
+        return;
+    }
+    Proc *p = editrun(g, a, cmd, path, dir, log);
     if (!p) {
         setnote(g, s, concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a)), 1);
         os_remove(g->os, a, path);
         return;
     }
     g->edsess = s;
+    g->edplan = 0;
     g->edproc = p;
     g->edpath = clone(&g->perm, path);
     g->edlog  = clone(&g->perm, log);
@@ -3640,12 +3664,63 @@ static void editstart(Gui *g, GuiSession *s)
     scheddirty(&g->sched);
 }
 
+// Edit plan: the plan file a plan's ask names, in the editor, in place.
+static void planedit(Gui *g, GuiSession *s, ViewTool *t)
+{
+    Arena a   = g->frame;
+    Str   why = editorwhy(g, s, &a);
+    if (why.len) {
+        setnote(g, s, why, 1);
+        return;
+    }
+    Str cmd = editorcmd(g, &a);
+    Str dir = join(&a, g->statedir, "edit");
+    Str log = join(&a, dir, concat(&a, concat(&a, "plan-", s->sid), ".log"));
+    Proc *p = os_mkdirs(g->os, a, dir) ? editrun(g, a, cmd, t->path, dir, log) : 0;
+    if (!p) {
+        setnote(g, s, concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a)), 1);
+        return;
+    }
+    g->edsess = s;
+    g->edplan = 1;
+    g->edproc = p;
+    g->edpath = clone(&g->perm, t->path);
+    g->edreq  = clone(&g->perm, t->req);
+    g->edlog  = clone(&g->perm, log);
+    g->edname = clone(&g->perm, editorname(cmd));
+    guilog(g, concat(&a, "editing a plan: ", cmd));
+    s->note = {};
+    scheddirty(&g->sched);
+}
+
+// The plan file as the editor left it, in its ask, empty if it is gone
+// or too long to put to the user, and in the Plan window, fetched again.
+static void planedited(Gui *g, GuiSession *s)
+{
+    View *v = s->view;
+    if (!v) {
+        return;
+    }
+    Arena a = g->frame;
+    i32   i = findask(v, g->edreq);
+    if (i >= 0) {
+        Read rd = os_read(g->os, &a, g->edpath, (iz)64<<10);
+        Str  t  = rd.err==READ_OK ? trimright(rd.data) : Str{};
+        settext(v, &v->msgs[i], t, 1);
+        g->planedits++;
+    }
+    v->planver++;
+}
+
 // The editor exited with a status, or was cancelled (status -1).
 static void editend(Gui *g, i32 status)
 {
-    GuiSession *s = g->edsess;
-    Arena       a = g->frame;
-    if (status == 0) {
+    GuiSession *s    = g->edsess;
+    Arena       a    = g->frame;
+    Str         what = g->edplan ? Str("the plan") : Str("the draft");
+    if (g->edplan) {
+        planedited(g, s);
+    } else if (status == 0) {
         Read rd = os_read(g->os, &a, g->edpath, DRAFT_MAX+2);
         Str  t  = editortext(rd.data);
         if (rd.err==READ_TOOBIG || t.len>DRAFT_MAX) {
@@ -3656,7 +3731,8 @@ static void editend(Gui *g, i32 status)
             setdraft(g, s, t);
             s->note = {};
         }
-    } else if (status > 0) {
+    }
+    if (status > 0) {
         // Its output's last line says why, as a shell's does when it
         // finds no such command
         Read rd   = os_read(g->os, &a, g->edlog, 1<<16);
@@ -3668,7 +3744,8 @@ static void editend(Gui *g, i32 status)
         Buf  b(&a, 256 + last.len);
         print(&b, "the editor exited with status ");
         print(&b, (i64)status);
-        print(&b, ": the draft is as it was");
+        print(&b, g->edplan ? Str(": the plan is as it left it")
+                            : Str(": the draft is as it was"));
         if (last.len) {
             print(&b, " (");
             print(&b, last);
@@ -3677,17 +3754,20 @@ static void editend(Gui *g, i32 status)
         setnote(g, s, finish(&b), 1);
     }
     Buf lb(&a, 64);
-    print(&lb, "the draft's editor ");
-    print(&lb, status<0 ? Str("was cancelled") : Str("exited with status "));
+    print(&lb, what);
+    print(&lb, status<0 ? Str("'s editor was cancelled") : Str("'s editor exited with status "));
     if (status >= 0) {
         print(&lb, (i64)status);
     }
     guilog(g, finish(&lb));
-    os_remove(g->os, a, g->edpath);
+    if (!g->edplan) {
+        os_remove(g->os, a, g->edpath);  // the plan file stays, of course
+    }
     os_remove(g->os, a, g->edlog);
     os_procfree(g->os, g->edproc);
     g->edsess = 0;
     g->edproc = 0;
+    g->edplan = 0;
     scheddirty(&g->sched);
 }
 
@@ -7059,6 +7139,7 @@ enum : i32 {
                   // right of all, gone since; 0 back as remembered
     OP_MARKSESS,  // remember the session shown, for CHK_DRAFTFILE
     OP_IFROLE,    // unless the configuration has role text, skip dx ops
+    OP_IFEDITOR,  // unless [ui] editor is set, skip dx ops
     OP_MAXIMIZE,  // maximize the window (macOS: zoom), as its button would;
                   // dx 1: fill the primary display unmaximized (macOS's
                   // Fill), else skip the next op where that is no maximum
@@ -7358,6 +7439,8 @@ enum : i32 {
     CHK_USERIMAGES,   // the latest user message has dx images, drawn
     CHK_BROWSED,      // Browse put its directory in the new session dialog
     CHK_BROWSEOFF,    // Browse is off for a remote host's directory
+    CHK_PLANEDITING,  // the plan is out in the editor, Approve held
+    CHK_PLANEDITED,   // the plan's ask shows the file as edited, with text
     CHK_COUNT,
 };
 
@@ -7539,6 +7622,8 @@ static Str chknames[] = {
     "the message shows the images sent with it",
     "Browse put the directory chosen in the field",
     "Browse is off for a directory on a remote host",
+    "the plan is open in the editor, Approve held meanwhile",
+    "the plan's ask shows the plan as the editor left it",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9542,8 +9627,9 @@ static DriveOp remoteops[] = {
 // chip in its bar; the agent refused a change, asking to approve its
 // plan, which the Plan window shows; kept planning with a note, the
 // plan written again and shown again, the model free to change while
-// it waits; approved, plan mode off and the plan carried out; then the
-// toggle by Send, and /plan off.
+// it waits; revised by hand in the editor ([ui] editor a test script,
+// where tests/gui.py sets one); approved, plan mode off and the plan
+// carried out; then the toggle by Send, and /plan off.
 static DriveOp planops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -9594,6 +9680,19 @@ static DriveOp planops[] = {
     {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
     {OP_CHECK, CHK_PLANMODEL, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-4-again"},
+    // Edit plan, with [ui] editor a test script that adds a line: the
+    // plan file out in the editor, Approve held meanwhile, then the
+    // ask and the Plan window show it as revised, which is approved
+    {OP_IFEDITOR, 0, 9, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "edit plan"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_PLANEDITING, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-editing"},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_WAIT, W_PLAN, 0, 0, 10000, "Revised by hand."},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PLANEDITED, 0, 0, 0, "Revised by hand."},
     // Approved: plan mode ends, and the agent carries out the plan
     {OP_MOVE, T_ALLOW, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -11913,6 +12012,13 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_BROWSEOFF:
         return g->browseoff;
+    case CHK_PLANEDITING:
+        return g->sess && g->edsess==g->sess && g->edplan && g->edproc;
+    case CHK_PLANEDITED: {
+        ViewMsg *m = lastmsg(g, VIEW_ASK);
+        return !g->edsess && g->planedits>0 && m && m->tool->kind=="plan" &&
+               m->tool->answer==VASK_PENDING && find(m->text, g->ops[g->drivepc-1].text)>=0;
+    }
     case CHK_PLANMODEL:
         return g->sess && v->busy && planwaits(v) &&
                !sesswhy(g, g->sess, "model", !planwaits(v), 0).len;
@@ -12629,6 +12735,12 @@ static void drivestep(Gui *g)
             g->drivepc += (i32)op->dx;
         }
     } break;
+    case OP_IFEDITOR:
+        if (!g->editor.len) {
+            guilog(g, "drive: skip, with no [ui] editor");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
     case OP_IFROLE: {
         b32 found = 0;
         for (iz i = 0; i < g->cfgheads.len; i++) {

@@ -6580,6 +6580,45 @@ def plan_mode(t):
 
 
 @scenario(bound=15)
+def plan_revised(t):
+    """The plan file revised by hand while its ask waits (the GUI's Edit
+    plan): approved, the agent carries out the file as it is then, told
+    that the user revised it; emptied before approval, the result says
+    so, and to carry out the plan as the agent wrote it."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                     plan=1)["sid"]
+        h.send("prompt", sid=sid, text="Write inside.")
+        ask = planask(h, sid)
+        revised = "# Plan, revised\n\n- Write **inside.txt**, by hand.\n"
+        t.host.write(ask["path"], revised)
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 1)
+        res = [e["text"] for e in h.all("tool.end", sid) if "approved your plan" in e["text"]]
+        t.check(len(res) == 1 and "revised the plan before approving it" in res[0] and
+                res[0].endswith(revised.rstrip()) and ask["path"] in res[0] and
+                "as approved" not in res[0], f"the revised plan: {res}")
+        t.check(t.file("inside.txt") == "done\n", "carried out")
+
+        # Again, the plan file emptied before approval
+        h.call("mode", sid=sid, mode="plan")
+        h.send("prompt", sid=sid, text="Write inside again.")
+        again = planask(h, sid, ask["seq"])
+        t.check(again["detail"] == revised.rstrip(), f"asked as it is: {again['detail']!r}")
+        t.host.write(again["path"], "")
+        h.call("answer", sid=sid, req=again["req"], decision="allow")
+        ended(h, sid, 2)
+        res = [e["text"] for e in h.all("tool.end", sid) if "approved your plan" in e["text"]]
+        t.check(len(res) == 2 and "was empty or unreadable" in res[1] and
+                "as you wrote it" in res[1], f"emptied: {res[-1:]}")
+        t.check(modes(h, sid)[-1] == "default/approved", f"modes: {modes(h, sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
 def plan_enter(t):
     """enter_plan_mode: unattended, denied by policy; attended, allowed,
     which the call's result tells, with no notice, then the plan approved."""

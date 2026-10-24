@@ -221,8 +221,11 @@ turn it on itself. While planning, its file tools may write only the
 session's plan file, `plan.md` in the session's directory, the desktop
 tool may only look, and subagents plan too. When it is done it asks for
 approval, showing the plan: Approve plan lets it go ahead, and Keep
-planning sends it a note. The model may be changed while the plan
-waits. The Plan pane shows the plan file, which stays after approval.
+planning sends it a note. Edit plan opens the plan file in the editor
+(as Ctrl+G does a draft), on this computer, to revise it by hand
+first: the agent carries out the plan as the file has it when
+approved, told that you revised it. The model may be changed while
+the plan waits. The Plan pane shows the plan file, which stays after approval.
 
 Sessions may talk to each other: the agent lists the other sessions on
 its host, with how they relate to it (parent, child, sibling), and

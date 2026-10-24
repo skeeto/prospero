@@ -1327,6 +1327,7 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
 }
 
 static void itemnamed(Gui *, Str);
+static void whytip(Str);
 
 // A screenshot's thumbnail below its tool row, or an image's below the
 // user's message it was attached to, fetched as it first shows, which
@@ -1396,15 +1397,25 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
     ViewTool *t = m->tool;
     Arena     a = g->frame;
     if (t->kind=="plan" || t->kind=="plan.enter") {
-        // Plan mode's asks: the plan to approve, or to plan first
-        b32 enter = t->kind == "plan.enter";
+        // Plan mode's asks: the plan to approve, or to plan first. Not
+        // while the plan is out in the editor, nor once it is empty.
+        b32 enter   = t->kind == "plan.enter";
+        b32 editing = !enter && g->edsess==s && g->edplan && g->edreq==t->req;
+        Str nogo    = editing ? Str("The plan is open in the editor: close it first, "
+                                    "and the plan as it saved it is the one approved") :
+                      !enter && !trim(m->text).len
+                              ? Str("The plan file is empty, or too long to show: write "
+                                    "the plan there, or keep planning") : Str{};
+        ImGui::BeginDisabled(nogo.len != 0);
         if (ImGui::Button(enter ? "Plan first" : "Approve plan")) {
             guianswer(g, s, t->req, "allow", {});
         }
+        ImGui::EndDisabled();
         if (latest) itemrect(g, RECT_ALLOW);
-        ImGui::SetItemTooltip(enter ? "Plan mode: the agent explores and writes a plan, "
-                                      "changing nothing else until you approve it"
-                                    : "End plan mode: the agent carries out this plan");
+        whytip(nogo.len ? nogo :
+               enter    ? Str("Plan mode: the agent explores and writes a plan, "
+                              "changing nothing else until you approve it")
+                        : Str("End plan mode: the agent carries out this plan"));
         ImGui::SameLine();
         if (ImGui::Button(enter ? "Go ahead without" : "Keep planning\xe2\x80\xa6")) {
             if (enter) {
@@ -1420,6 +1431,36 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         ImGui::SetItemTooltip(enter ? "No plan mode: the agent works as before"
                                     : "Plan mode stays on: tell the agent what to change "
                                       "in the plan");
+        if (enter) {
+            return;
+        }
+
+        // Edit plan: the plan file in the editor, on this machine
+        ImGui::SameLine();
+        if (editing) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("editing in %s...", cstr0(&a, g->edname));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Cancel##planedit")) {
+                editcancel(g);
+            }
+            itemnamed(g, "cancel plan editor");
+            ImGui::SetItemTooltip("Stop the editor: the plan is as it left the file");
+            return;
+        }
+        Str why = s->host->kind==GH_REMOTE
+                ? concat(&a, "The plan is on ", concat(&a, s->host->name,
+                         ": only a plan on this computer opens in the editor"))
+                : !t->path.len ? Str("No plan file") : editorwhy(g, s, &a);
+        ImGui::BeginDisabled(why.len != 0);
+        if (ImGui::Button("Edit plan")) {
+            planedit(g, s, t);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "edit plan");
+        whytip(why.len ? why : Str("Revise the plan file by hand in your editor before you "
+                                   "approve it: the agent carries out the plan as the file "
+                                   "has it then"));
         return;
     }
     if (ImGui::Button("Allow")) {
@@ -3080,7 +3121,7 @@ static void drawprompt(Gui *g)
     GuiSession *s   = g->sess ? g->sess : &g->nosession;
     b32         can = g->sess && g->sess->view && !g->sess->readonly && !g->quitting &&
                       (hostlive(g, g->sess) || g->enginekind==ENGINE_FAKE);
-    b32         editing = g->edsess && g->edsess==s;
+    b32         editing = g->edsess && g->edsess==s && !g->edplan;
     char       *buf     = draftbuf(g, s);
     Arena       a       = g->frame;
     g->slashshown  = 0;
@@ -3152,7 +3193,7 @@ static void drawprompt(Gui *g)
     if (!editing && io.KeyMods==ctrl && ImGui::IsKeyPressed(ImGuiKey_G, false) &&
             ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows)) {
         editstart(g, s);
-        editing = g->edsess == s;
+        editing = g->edsess==s && !g->edplan;
     }
 
     // A context menu pick, once the box is active again: as its chord

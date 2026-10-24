@@ -46,7 +46,8 @@ that appends a line, one that exits 1, and one cancelled), then the GUI
 again, to find each session's draft back from its engine; no draft file
 for the editor may be left over. The plan mode makes a session in plan
 mode from the new session dialog, its agent refused a change, then
-asking to approve its plan: kept planning with a note, then approved;
+asking to approve its plan: kept planning with a note, revised by hand
+with Edit plan ([ui] editor a test script, here only), then approved;
 the Plan window shows each plan, and the toggle by Send and /plan off
 turn plan mode on and off.
 
@@ -119,15 +120,26 @@ printf '\nEdited by the test editor.\n' >> "$1"
 """
 
 
+def shword(path):
+    """A script's path as the editor's command has it: run by sh -c, or
+    on Windows by cmd.exe, which knows only double quotes."""
+    return (f'"{path}"' if os.name == "nt" else
+            "'" + path.replace("'", "'\\''") + "'")
+
+
+# The plan mode's editor: Edit plan revises the plan file by hand
+PLAN_EDITOR = """#!/bin/sh
+sleep 1
+printf -- '- Revised by hand.\\n' >> "$1"
+"""
+
+
 def composeconfig(editor, nonce):
     """The compose mode's: the test editor, and a model for /model."""
-    # Run by sh -c, or on Windows by cmd.exe, which knows only "
-    quoted = (f'"{editor}"' if os.name == "nt" else
-              "'" + editor.replace("'", "'\\''") + "'")
     return (
         "\n# The compose box's editor, a test script\n"
         "[ui]\n"
-        f"editor = sh {quoted}\n"
+        f"editor = sh {shword(editor)}\n"
         "\n# A model for /model to list\n"
         f"[model fake:gui_b:{nonce}]\n"
         "context = 100000\n"
@@ -1258,8 +1270,14 @@ def main():
         # while the plan waits
         model = f"fake:plan_gui:{nonce}"
         fake_provider.STATE.register(model)
-        before = config(curl, model, 60,
-                        f"\n[model fake:plan_gui_b:{nonce}]\ntemperature = 0.5\n")
+        extra = f"\n[model fake:plan_gui_b:{nonce}]\ntemperature = 0.5\n"
+        if not args.host:
+            # Edit plan's editor, a sh script (the checklist skips it
+            # without one)
+            editor = host.path("plan-edit.sh")
+            host.write(editor, PLAN_EDITOR)
+            extra += f"\n# Edit plan's editor, a test script\n[ui]\neditor = sh {shword(editor)}\n"
+        before = config(curl, model, 60, extra)
     elif args.mode == "sessions":
         # A model to switch to; a remote listed always, never reached,
         # and one listed only while connected

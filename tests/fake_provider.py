@@ -1566,7 +1566,7 @@ def sc_plan(model, n, req):
 
 
 sc_plan_new = sc_plan_keep = sc_plan_reopen = sc_plan_mode = sc_plan_enter = sc_plan
-sc_plan_model = sc_plan_model_b = sc_plan_gui = sc_plan_gui_b = sc_plan
+sc_plan_model = sc_plan_model_b = sc_plan_gui = sc_plan_gui_b = sc_plan_revised = sc_plan
 
 
 def sc_plan_patch(model, n, req):

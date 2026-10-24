@@ -405,6 +405,7 @@ struct Ask {
                         // desktop class's name, or null
     b32       gwrite;   // and for writes too, not only reads
     i32       gclass;   // a desktop ask's DESKC_*, with grant its name
+    u64       plansum;  // a plan's: the hash of the text put to the user
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
@@ -2935,7 +2936,9 @@ static void instrcheck(Session *s, Arena scratch)
 // asks to begin with enter_plan_mode, an ask of kind "plan.enter", and
 // to end with exit_plan_mode, an ask of kind "plan" whose detail is the
 // plan, with no deadline: approved, plan mode ends and the agent
-// carries the plan out; denied, the user's note says what to change.
+// carries the plan out, as the plan file has it then, which the user
+// may have revised by hand meanwhile (the result says so); denied, the
+// user's note says what to change.
 // The mode record logs each change, which loadsession replays. The
 // frozen system prompt only says that plan mode exists: a change the
 // agent did not ask for reaches it as a notice (planheed), as changed
@@ -3055,6 +3058,7 @@ static Str planpatchout(Session *s, Patch *p)
 struct PlanText {
     Str text;
     Str err;  // for the agent, null if none
+    b32 big;  // the error is its size
 };
 
 static PlanText readplan(Session *s, Arena *a)
@@ -3067,6 +3071,7 @@ static PlanText readplan(Session *s, Arena *a)
         print(&b, s->planfile);
         print(&b, " under 64 KiB, then call exit_plan_mode again.");
         r.err = finish(&b);
+        r.big = 1;
     } else if (rd.err || !trim(rd.data).len) {
         Buf b(a, 256 + s->planfile.len);
         print(&b, "There is no plan to approve yet: write your plan to ");
@@ -3113,10 +3118,28 @@ static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
             print(&b, "If it has several steps, begin with a todo list of "
                       "them (todo_write), and keep it up to date. ");
         }
-        print(&b, "The plan, as approved, also in ");
-        print(&b, s->planfile);
-        print(&b, ":\n\n");
-        print(&b, plan.text.len ? plan.text : Str("(the plan file is gone)"));
+        if (plan.err.len) {
+            // The user emptied it, or made it too long, since the ask
+            print(&b, "The plan file, ");
+            print(&b, s->planfile);
+            print(&b, plan.big ? Str(", grew over 64 KiB before the user approved it: "
+                                     "read it there, and carry out what it says.")
+                               : Str(", was empty or unreadable when the user approved "
+                                     "it: carry out the plan as you wrote it."));
+        } else if (hash(plan.text) != s->ask.plansum) {
+            // Revised by hand (Edit plan), which the user approved
+            print(&b, "The user revised the plan before approving it, so it is "
+                      "not the one you wrote: carry out the revised plan, below "
+                      "and in ");
+            print(&b, s->planfile);
+            print(&b, ".\n\n");
+            print(&b, plan.text);
+        } else {
+            print(&b, "The plan, as approved, also in ");
+            print(&b, s->planfile);
+            print(&b, ":\n\n");
+            print(&b, plan.text);
+        }
     } else {
         switch (by) {
         case DENY_USER:
@@ -5698,9 +5721,10 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
 
     Ask *k = &s->ask;
     *k = {};
-    k->req    = clone(&s->perm, concat(&scratch, c->id, "/ask"));
-    k->tool   = tool;
-    k->opened = os_ticks(e->os);
+    k->req     = clone(&s->perm, concat(&scratch, c->id, "/ask"));
+    k->tool    = tool;
+    k->opened  = os_ticks(e->os);
+    k->plansum = hash(plan.text);  // to know a plan revised by hand
     b32 steer = s->steers.len > 0;
     b32 wait  = attending(s) && !steer;
     i64 delay = leave ? 0 : cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
