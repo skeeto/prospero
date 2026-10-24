@@ -3302,18 +3302,35 @@ static void drawprompt(Gui *g)
                                    "or drop one on the window, or paste one"));
     }
     if (g->sess && hostcap(s->host, "plan") && !v->parent.len) {
-        Str why = planwhy(g, s, !v->plan);
+        // The session's mode, one of these, as wide as the buttons
+        static struct { Str name; b32 plan; Str tip; } const modes[] = {
+            {"Build", 0, "Build: the agent works on the task, changing files as "
+                         "it goes (/plan off)"},
+            {"Plan",  1, "Plan: the agent explores and writes a plan for you to "
+                         "approve before it changes anything (/plan)"},
+        };
+        Str  why  = planwhy(g, s, !v->plan);
+        Str  name = v->plan ? Str("Plan") : Str("Build");
         ImGui::BeginDisabled(why.len > 0);
-        if (togglebutton("Plan mode", v->plan)) {
-            guimode(g, s, !v->plan);
+        ImGui::SetNextItemWidth(bw);
+        b32 open = ImGui::BeginCombo("##mode", cstr0(&a, name));
+        itemnamed(g, "session mode");
+        whytip(why.len ? why : modes[v->plan ? 1 : 0].tip);
+        if (open) {
+            for (iz i = 0; i < countof(modes); i++) {
+                b32 on  = modes[i].plan == v->plan;
+                Str off = on ? Str{} : planwhy(g, s, modes[i].plan);
+                ImGui::BeginDisabled(off.len > 0);
+                if (ImGui::Selectable(cstr0(&a, modes[i].name), on) && !on) {
+                    guimode(g, s, modes[i].plan);
+                }
+                ImGui::EndDisabled();
+                itemnamed(g, concat(&a, Str("session mode "), modes[i].name));
+                whytip(off.len ? off : modes[i].tip);
+            }
+            ImGui::EndCombo();
         }
         ImGui::EndDisabled();
-        itemnamed(g, "plan toggle");
-        whytip(why.len ? why : v->plan
-                   ? Str("Plan mode is on: the agent changes nothing but its plan. "
-                         "Click to end it (/plan off)")
-                   : Str("Plan mode: the agent explores and writes a plan for you to "
-                         "approve before it changes anything (/plan)"));
     }
     if (s->hist) {
         // Which of the session's messages the box holds: oldest is 1

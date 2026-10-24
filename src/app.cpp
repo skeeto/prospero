@@ -9538,8 +9538,12 @@ static DriveOp planops[] = {
     {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-5-approved"},
-    // The toggle by Send, while idle, then /plan off
-    {OP_MOVE, T_NAMED, 0, 0, 100, "plan toggle"},
+    // The mode by Send, while idle, then /plan off
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_SHOT, 0, 0, 0, 300, "plan-6-modes"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode Plan"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_NOTE, 0, 0, 5000, ""},
