@@ -160,6 +160,7 @@ enum : u32 {
     TASK_SAVED = 32,    // a save dialog's path (id its ask), empty if cancelled
     TASK_DEPLOYED,      // Update engine: 1 or 0, then the path or why (id the host's uid)
     TASK_RAISE,         // a launch handed off to this window: its token (door.cpp)
+    TASK_OPENED,        // an open dialog's path (id its ask), empty if cancelled
 };
 
 // Item rectangles the scripted checklist aims at
@@ -649,6 +650,42 @@ struct Export {
     b32         want;     // asked for from a menu: begun before the next frame
 };
 
+// Import session: a raw log picked in the platform's dialog
+// (os_guiopenfile) and read here, then the new session dialog, filled
+// from the log's records for the host it shows, then the log uploaded to
+// the host picked, a part at each reply, and imported there (IMP_*). A
+// failure opens the dialog again with why, and trying again uploads the
+// log anew, as the engine removes what was staged whatever comes of it.
+enum : i32 {
+    IMP_IDLE,
+    IMP_ASKING,     // the open dialog is up
+    IMP_DIALOG,     // the new session dialog is up for it
+    IMP_UPLOADING,  // its parts go to the host
+    IMP_IMPORTING,  // and then the import
+};
+
+struct Import {
+    i32      state;      // IMP_*
+    u64      ask;        // the open dialog's, to know its answer
+    Region  *r;          // what follows, until the next import
+    Arena    mem;
+    Str      data;       // the log
+    Str      path;       // where it came from
+    Str      title;      // and from its records: the latest title, the
+    Str      cwd;        // session record's cwd, and the model as the
+    Str      model;      // latest model record left it
+    GuiHost *filled;     // the host the dialog was filled for
+    b32      modelwait;  // its models were yet to come
+    GuiHost *to;         // where it goes, as what the dialog said
+    Str      newcwd;
+    Str      newmodel;
+    Str      token;      // the upload's, once the first part is in
+    i64      off;        // bytes uploaded
+    i64      id;         // the command in flight
+    Str      status;     // how the last went
+    i64      imports;    // imports made, for the checklist
+};
+
 // The dialog that names something: a session's title, a new group for
 // it, or a group's new name.
 enum : i32 {
@@ -787,6 +824,7 @@ struct Gui {
     i64                deletes;    // delete replies, for the checklist
     Mailbox           *tasks;      // the dialogs' and deployments' outcomes
     Export             exp;
+    Import             imp;
     b32                openexport; // the Markdown export's options
     GuiSession        *exportsess;
     char              *modelbuf;   // the model picker's own name
@@ -2431,6 +2469,7 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
     }
 }
 static void onexportfile(Gui *, Arena, Json *, b32 ok, Str err);
+static void onimport(Gui *, GuiHost *, Arena, Request *, EvRec *);
 static void sessgone(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
 
@@ -2535,6 +2574,11 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_MODEL:
     case CMD_FORK:
         onsesscmd(g, h, scratch, &q, r);
+        return;
+
+    case CMD_UPLOAD:
+    case CMD_IMPORT:
+        onimport(g, h, scratch, &q, r);
         return;
 
     case CMD_DRAFT:
@@ -3061,6 +3105,13 @@ static b32 guirecord(Gui *g, GuiHost *h, Str line)
     if (r.seq && v->lost) {
         // The resync brings it, in order: applied now, in a replay's
         // loose order, it would move lastseq past the records lost
+        return 0;
+    }
+    if (r.seq && s->openid && !v->lastseq && r.seq!=1) {
+        // Written as its host opened it (instructions changed, as for an
+        // imported session), ahead of the replay from its start, which
+        // brings it too: applied now, in the replay's loose order, the
+        // replay's records would seem applied already
         return 0;
     }
     if (r.ev==EV_TOOLOUT) {
@@ -3928,6 +3979,184 @@ static void exportwrite(Gui *g, Arena scratch, Str path)
     scheddirty(&g->sched);
 }
 
+// Import session (IMP_*, above Gui)
+
+static void importfail(Gui *g, Str why)
+{
+    Import *x = &g->imp;
+    x->state   = IMP_IDLE;
+    x->status  = clone(&g->perm, why);
+    g->lasterr = x->status;
+    guilog(g, x->status);
+}
+
+// Ask for a raw log to import to a host (the dialog's default if null).
+// The checklist imports its latest export without asking.
+static void importstart(Gui *g, GuiHost *h)
+{
+    Import *x = &g->imp;
+    if (x->state != IMP_IDLE) {
+        return;
+    }
+    g->newhost = h;
+    x->status  = {};
+    x->state   = IMP_ASKING;
+    x->ask++;
+    if (g->drive) {
+        mailpost(g->tasks, TASK_OPENED, x->ask, g->exp.saved, 1);
+    } else if (!os_guiopenfile(g->os, g->frame, "Import a session's raw log", g->tasks,
+                               TASK_OPENED, x->ask)) {
+        importfail(g, "cannot ask for a file here");
+    }
+}
+
+// The log picked: read, whole, and the new session dialog opened for it.
+static void importread(Gui *g, Str path)
+{
+    Import *x = &g->imp;
+    x->state = IMP_IDLE;
+    if (!x->r) {
+        x->r = os_reserve(g->os, EXPORT_MAX + ((iz)1<<20));
+        if (!x->r) {
+            importfail(g, "out of memory to import");
+            return;
+        }
+    }
+    x->mem   = newarena(x->r);
+    Read rd  = os_read(g->os, &x->mem, path, EXPORT_MAX);
+    if (rd.err != READ_OK) {
+        importfail(g, rd.err==READ_TOOBIG ? Str("the log is too big to import")
+                                          : concat(&g->frame, "cannot read ", path));
+        return;
+    }
+    x->data = rd.data;
+    x->path = clone(&x->mem, path);
+
+    // What its records say, of those the dialog shows
+    Arena a = g->frame;
+    Cut   c = cut(x->data, '\n');
+    EvRec e = evparse(&a, c.head);
+    if (!c.ok || e.ev!=EV_SESSION) {
+        importfail(g, "not a session's raw log: it must begin with its session record");
+        return;
+    }
+    x->cwd   = clone(&x->mem, jsonstr(jsonget(e.root, "cwd")));
+    x->model = clone(&x->mem, jsonstr(jsonget(e.root, "model")));
+    x->title = {};
+    for (Str rest = c.tail; rest.len;) {
+        Cut l = cut(rest, '\n');
+        rest  = l.tail;
+        if (find(l.head, "\"ev\":\"title\"")<0 && find(l.head, "\"ev\":\"model\"")<0) {
+            continue;
+        }
+        Arena t = a;
+        EvRec r = evparse(&t, l.head);
+        if (r.ev == EV_TITLE) {
+            x->title = clone(&x->mem, jsonstr(jsonget(r.root, "text")));
+        } else if (r.ev == EV_MODEL) {
+            x->model = clone(&x->mem, jsonstr(jsonget(r.root, "model")));
+        }
+    }
+    x->state   = IMP_DIALOG;
+    x->filled  = 0;
+    g->newerr  = {};
+    g->opennew = 1;
+}
+
+// Send the log's next part, or once all are in, the import.
+static void importnext(Gui *g)
+{
+    Import *x = &g->imp;
+    Arena   a = newarena(g->cmdr);
+    if (x->off < x->data.len) {
+        iz    n    = x->data.len - (iz)x->off;
+        n          = n<(iz)UPLOAD_PART ? n : (iz)UPLOAD_PART;
+        Str   data = base64(&a, Str{x->data.data+x->off, n});
+        Buf   b(&a, 256 + data.len);
+        EvOut w = cmdopen(g, &b, CMD_UPLOAD, 0, x->to);
+        if (x->token.len) {
+            putstrkey(&w.json, "token", x->token);
+        }
+        putstrkey(&w.json, "data", data);
+        putintkey(&w.json, "off", x->off);
+        if (x->off+n == x->data.len) {
+            putintkey(&w.json, "done", 1);
+        }
+        x->state = IMP_UPLOADING;
+        x->id    = g->nextid;
+        cmdsend(g, &w, a);
+        return;
+    }
+    Buf   b(&a, 256 + x->newcwd.len + x->newmodel.len);
+    EvOut w = cmdopen(g, &b, CMD_IMPORT, 0, x->to);
+    putstrkey(&w.json, "token", x->token);
+    putstrkey(&w.json, "cwd", x->newcwd);
+    if (x->newmodel.len) {
+        putstrkey(&w.json, "model", x->newmodel);
+    }
+    x->state = IMP_IMPORTING;
+    x->id    = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// The dialog's Import: the log goes to the host, from its start.
+static void importbegin(Gui *g, GuiHost *h, Str cwd, Str model)
+{
+    Import *x = &g->imp;
+    x->to       = h;
+    x->newcwd   = clone(&x->mem, cwd);
+    x->newmodel = clone(&x->mem, model);
+    x->token    = {};
+    x->off      = 0;
+    g->newerr   = {};
+    importnext(g);
+}
+
+// A reply to the upload or the import in flight.
+static void onimport(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
+{
+    Import *x   = &g->imp;
+    Json   *j   = r->root;
+    b32     ok  = jsonint(jsonget(j, "ok"), 0) != 0;
+    Str     err = jsonstr(jsonget(j, "err"));
+    if (q->id!=x->id || (x->state!=IMP_UPLOADING && x->state!=IMP_IMPORTING)) {
+        return;
+    }
+    x->id = 0;
+    if (!ok) {
+        // As a new session's failure: the dialog again, with why
+        x->state   = IMP_DIALOG;
+        g->newhost = x->to;
+        g->newerr  = clone(&g->perm, err.len ? err : Str("the import failed"));
+        g->opennew = 1;
+        return;
+    }
+    if (q->cmd == CMD_UPLOAD) {
+        Str token = jsonstr(jsonget(j, "token"));
+        i64 off   = jsonint(jsonget(j, "off"), -1);
+        if (!token.len || off<=x->off || off>x->data.len) {
+            importfail(g, "the host's answer to an upload came garbled");
+            return;
+        }
+        x->token = x->token.len ? x->token : clone(&x->mem, token);
+        x->off   = off;
+        importnext(g);
+        return;
+    }
+    x->state = IMP_IDLE;
+    x->imports++;
+    x->status = clone(&g->perm, concat(&scratch, "Imported ", x->path));
+    if (!validsid(r->sid)) {
+        guilist(g, h);
+        return;
+    }
+    GuiSession *s = findsess(g, h, r->sid);
+    s = s ? s : addsess(g, h, r->sid);
+    guiselect(g, s);
+    setnote(g, s, concat(&scratch, "imported from ", x->path), 0);
+    guilist(g, h);
+}
+
 // Update engine's thread (UPD_*, above GuiHost)
 
 struct GuiDeploy {
@@ -3982,8 +4211,9 @@ static void updatestatus(Gui *g, GuiHost *h, b32 idle)
     scheddirty(&g->sched);
 }
 
-// What another thread finished: a save dialog answered, a deployment's
-// progress and outcome, a launch that handed off to this window.
+// What another thread finished: a save or open dialog answered, a
+// deployment's progress and outcome, a launch that handed off to this
+// window.
 static void ontask(Gui *g, Record r)
 {
     Export *x = &g->exp;
@@ -3994,6 +4224,15 @@ static void ontask(Gui *g, Record r)
                 exportwrite(g, g->frame, r.data);
             } else {
                 x->state = EXP_IDLE;  // cancelled
+            }
+        }
+        return;
+    case TASK_OPENED:
+        if (g->imp.state==IMP_ASKING && r.id==g->imp.ask) {
+            if (r.data.len) {
+                importread(g, r.data);
+            } else {
+                g->imp.state = IMP_IDLE;  // cancelled
             }
         }
         return;
@@ -6546,6 +6785,7 @@ enum : i32 {
     W_COMPACTED,  // it has a compaction card, and is idle
     W_NAMED,      // an item named starting with text drew
     W_RAISED,     // dx launches handed off to this window, and it is up
+    W_IMPORTED,   // an import ended, and none is under way
 };
 
 static Str waitnames[] = {
@@ -6559,9 +6799,9 @@ static Str waitnames[] = {
     "the link to drop", "the remote to close", "the output", "a file",
     "the includes", "the thumbnails", "the screenshot", "reasoning",
     "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
-    "a named item", "a launch to hand off",
+    "a named item", "a launch to hand off", "the import",
 };
-static_assert(countof(waitnames) == W_RAISED+1);
+static_assert(countof(waitnames) == W_IMPORTED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -8042,6 +8282,33 @@ static DriveOp sessionsops[] = {
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Start subagents.\n"},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Whole fork\n"},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Greeting\n"},
+    // Imported from the raw log exported above, from the Session menu
+    // (the open dialog's answer that export): the dialog filled from the
+    // log, its model the one switched to, then the imported session
+    // shown with its transcript, and going on
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Import session..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-import"},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_IMPORTED, 0, 0, 10000, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "imported from"},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Greeting (imported)"},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Say hello."},
+    {OP_CHECK, CHK_MODEL, 0, 0, 0, "fake:gui_b:"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-imported"},
+    {OP_PROMPT, 0, 0, 0, 100, "Say hello again."},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "Hello"},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Say hello again."},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Greeting (imported)\n"},
     // Idle: no frames
     {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},  // hover delays and the layout's save
     {OP_MARK, 0, 0, 0, 3000, ""},
@@ -9080,6 +9347,8 @@ static b32 drivewaitdone(Gui *g)
         return g->sess && g->sess->note.len;
     case W_COMPACTED:
         return g->sess && !v->busy && lastof(v, VIEW_COMPACT);
+    case W_IMPORTED:
+        return g->imp.imports && g->imp.state==IMP_IDLE;
     case W_NAMED:
         for (i32 i = 0; i < g->nnamed; i++) {
             Named *n = &g->named[i];

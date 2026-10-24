@@ -180,6 +180,15 @@ subagents. Each session has a scratch directory in the system's
 temporary directory, which tools may use freely, as they may the rest
 of it unless `[guard] temp = ask`.
 
+Import session, in the Session menu and a host's menu, makes a new
+session from a raw log exported here or on another machine, on the
+host picked, in a working directory and with a model picked there. It
+keeps the conversation (prompts, replies, tool calls and their results,
+notes, compactions and the todo list) and drops everything that refers
+to the old machine: allowed directories and grants, snapshots and
+rewinds, spilled output files, images, subagents and jobs. The new
+session is titled "(imported)" and remembers the session it came from.
+
 `prospero run` runs one turn with no window and exits when it ends,
 printing its records as JSON lines, or readable text with `--pretty`.
 Nobody answers its asks, so they are denied. It exits 0 when the turn

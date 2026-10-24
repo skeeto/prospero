@@ -1076,6 +1076,32 @@ static b32 os_guisave(Os *os, Arena scratch, Str title, Str name, Mailbox *mb,
     return 1;
 }
 
+// The same for a file to open, a raw log, answered as savedone does.
+static b32 os_guiopenfile(Os *os, Arena scratch, Str title, Mailbox *mb, u32 type, u64 id)
+{
+    static SDL_DialogFileFilter const filters[] = {
+        {"Session logs (*.jsonl)", "jsonl"},
+        {"All files", "*"},
+    };
+    GuiSdl  *p = (GuiSdl *)os->gui;
+    SdlSave *s = (SdlSave *)SDL_malloc(sizeof(SdlSave));
+    if (!p || !p->window || !s) {
+        SDL_free(s);
+        return 0;
+    }
+    s->mb   = mb;
+    s->type = type;
+    s->id   = id;
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_FILTERS_POINTER, (void *)filters);
+    SDL_SetNumberProperty(props, SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER, countof(filters));
+    SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_WINDOW_POINTER, p->window);
+    SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_TITLE_STRING, cstr(&scratch, title));
+    SDL_ShowFileDialogWithProperties(SDL_FILEDIALOG_OPENFILE, savedone, s, props);
+    SDL_DestroyProperties(props);
+    return 1;
+}
+
 // As a file URL, which the system opens with its file manager.
 static b32 os_guireveal(Os *, Arena scratch, Str dir)
 {

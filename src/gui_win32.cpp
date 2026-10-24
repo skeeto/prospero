@@ -95,6 +95,10 @@ extern "C" int       w32gui_save(void *, unsigned short const *title,
                                  unsigned short const *name,
                                  void (*done)(void *ctx, unsigned short const *path),
                                  void const *ctx, int ctxlen);
+// The open dialog likewise, for a session's raw log (*.jsonl)
+extern "C" int       w32gui_open(void *, unsigned short const *title,
+                                 void (*done)(void *ctx, unsigned short const *path),
+                                 void const *ctx, int ctxlen);
 extern "C" int       w32gui_reveal(unsigned short const *dir);
 extern "C" void      w32gui_letfront(unsigned long pid);  // AllowSetForegroundWindow
 
@@ -968,7 +972,8 @@ extern "C" void w32gui_close(void *p)
 }
 
 // The save dialog runs on a thread of its own, so that the window's
-// loop never waits on it: GetSaveFileNameW is modal to the thread that
+// loop never waits on it: GetSaveFileNameW (GetOpenFileNameW for the
+// open dialog, which works the same way) is modal to the thread that
 // calls it, and an owner on another thread would tie the two threads'
 // input together. Its owner is a hidden window of that thread over the
 // main window, which places it there. To be in front, a CBT hook on
@@ -982,6 +987,7 @@ struct W32Save {
     char    ctx[32];
     HWND    main;    // the window, for its place at the call
     HWND    msgwin;  // the GUI thread's hidden window
+    int     open;    // an open dialog, not a save dialog
 };
 
 static thread_local HWND savemsgwin;  // the dialog's thread's W32Save's
@@ -1022,7 +1028,12 @@ static DWORD WINAPI savethread(void *arg)
     ofn.lpstrTitle  = s->title;
     ofn.Flags       = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST |
                       OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
-    if (!GetSaveFileNameW(&ofn)) {
+    if (s->open) {
+        ofn.lpstrFilter = L"Session logs (*.jsonl)\0*.jsonl\0All files\0*.*\0";
+        ofn.Flags       = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
+                          OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+    }
+    if (!(s->open ? GetOpenFileNameW(&ofn) : GetSaveFileNameW(&ofn))) {
         s->path[0] = 0;
     }
     if (hook) {
@@ -1039,10 +1050,10 @@ static DWORD WINAPI savethread(void *arg)
     return 0;
 }
 
-extern "C" int w32gui_save(void *p, unsigned short const *title,
-                           unsigned short const *name,
-                           void (*done)(void *, unsigned short const *),
-                           void const *ctx, int ctxlen)
+static int w32dialog(void *p, unsigned short const *title,
+                     unsigned short const *name,
+                     void (*done)(void *, unsigned short const *),
+                     void const *ctx, int ctxlen, int open)
 {
     W32Gui  *w = (W32Gui *)p;
     W32Save *s = (W32Save *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(W32Save));
@@ -1056,6 +1067,7 @@ extern "C" int w32gui_save(void *p, unsigned short const *title,
     lstrcpynW(s->path, (wchar_t const *)name, sizeof(s->path)/sizeof(s->path[0]));
     memcpy(s->ctx, ctx, (size_t)ctxlen);
     s->done = done;
+    s->open = open;
     HANDLE t = CreateThread(0, 0, savethread, s, 0, 0);
     if (!t) {
         HeapFree(GetProcessHeap(), 0, s);
@@ -1063,6 +1075,21 @@ extern "C" int w32gui_save(void *p, unsigned short const *title,
     }
     CloseHandle(t);
     return 1;
+}
+
+extern "C" int w32gui_save(void *p, unsigned short const *title,
+                           unsigned short const *name,
+                           void (*done)(void *, unsigned short const *),
+                           void const *ctx, int ctxlen)
+{
+    return w32dialog(p, title, name, done, ctx, ctxlen, 0);
+}
+
+extern "C" int w32gui_open(void *p, unsigned short const *title,
+                           void (*done)(void *, unsigned short const *),
+                           void const *ctx, int ctxlen)
+{
+    return w32dialog(p, title, (unsigned short const *)L"", done, ctx, ctxlen, 1);
 }
 
 extern "C" int w32gui_reveal(unsigned short const *dir)
@@ -1319,6 +1346,13 @@ static b32 os_guisave(Os *os, Arena scratch, Str title, Str name, Mailbox *mb,
     W32SaveCtx c = {mb, type, id};
     return w32gui_save(os->gui, (unsigned short *)towide(&scratch, title).data,
                        (unsigned short *)towide(&scratch, name).data,
+                       savedone, &c, (int)sizeof(c));
+}
+
+static b32 os_guiopenfile(Os *os, Arena scratch, Str title, Mailbox *mb, u32 type, u64 id)
+{
+    W32SaveCtx c = {mb, type, id};
+    return w32gui_open(os->gui, (unsigned short *)towide(&scratch, title).data,
                        savedone, &c, (int)sizeof(c));
 }
 

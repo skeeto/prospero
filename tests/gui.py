@@ -35,8 +35,9 @@ other change. The sessions mode goes through the sidebar's tree and its
 context menus: folding, renaming, a group, archiving, a model switch,
 exports as Markdown and as the raw log (which must hold what they
 should), a whole session forked, another forked before its prompt (the
-prompt then in the fork's box), and a session with its subagents
-deleted. The enginestop
+prompt then in the fork's box), a session with its subagents
+deleted, and the raw log exported imported as a new session, which
+goes on. The enginestop
 mode kills the engine process mid-turn and mid-ask: the GUI must stop
 counting either, and quit at once when closed. The compose mode runs
 the compose box's checklist, with [ui] editor a test script (an editor
@@ -1348,7 +1349,8 @@ def main():
     if args.mode == "sessions" and args.shots and not args.host:
         for name in ("sessions-tree", "sessions-folded", "sessions-menu", "sessions-group",
                      "sessions-archived", "sessions-picker", "sessions-export",
-                     "sessions-forkhere", "sessions-forked", "sessions-delete"):
+                     "sessions-forkhere", "sessions-forked", "sessions-delete",
+                     "sessions-import", "sessions-imported"):
             if not os.path.exists(os.path.join(args.shots, name + ".png")):
                 problems.append(f"no {name}.png")
     if args.mode == "enginestop":

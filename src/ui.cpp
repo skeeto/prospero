@@ -3438,6 +3438,8 @@ static void groupitems(Gui *g, Arena a, Str group)
     }
 }
 
+static Str importwhy(Gui *, GuiHost *);
+
 // A host heading's menu.
 static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
 {
@@ -3463,6 +3465,11 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
         g->newhost = h;
         newsession(g);
     }
+    Str iwhy = why.len ? why : importwhy(g, h);
+    if (menuitem(g, a, "Import session here...", iwhy)) {
+        importstart(g, h);
+    }
+    ImGui::SetItemTooltip("A session from its raw log, exported here or elsewhere");
     if (h && h->kind==GH_REMOTE) {
         ImGui::Separator();
         Str busy = updating(h) ? Str("Updating already") :
@@ -4210,26 +4217,96 @@ static void drawjobs(Gui *g)
     }
 }
 
+// Why a host cannot import a session now, or null if it can.
+static Str importwhy(Gui *g, GuiHost *h)
+{
+    return g->imp.state!=IMP_IDLE ? Str("An import is under way") :
+           !h || !hostcap(h, "import") ? Str("Its engine is too old to import") : Str{};
+}
+
+// Copy a string into a dialog's field, as much as fits.
+static void fieldput(char *field, Str s)
+{
+    iz n = s.len<FIELD_MAX ? s.len : FIELD_MAX-1;
+    copybytes(field, s.data, n);
+    field[n] = 0;
+}
+
+// The new session dialog filled for an import to a host: the log's
+// directory where it is known to be there (on this machine, or as
+// another session's there), and its model where that host has one by
+// its name (its configuration's, which a host other than the main one
+// is asked for). Otherwise each is as it was.
+static void importfill(Gui *g, GuiHost *h)
+{
+    Import *x = &g->imp;
+    Arena   a = g->frame;
+    if (x->filled != h) {
+        x->filled    = h;
+        x->modelwait = 1;
+        b32 there = 0;
+        if (h->kind != GH_REMOTE) {
+            there = x->cwd.len && os_stat(g->os, a, x->cwd).type==STAT_DIR;
+        }
+        for (GuiSession *s = g->sessions; s && !there && x->cwd.len; s = s->next) {
+            Str cwd = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+            there = s->host==h && !s->gone && cwd==x->cwd;
+        }
+        if (there) {
+            fieldput(g->newcwd, x->cwd);
+        }
+    }
+    if (x->modelwait && h!=g->main) {
+        hostmodels(g, h);
+        if (!h->modelsgot) {
+            return;
+        }
+    }
+    if (x->modelwait) {
+        x->modelwait = 0;
+        Slice<Str> models = h==g->main ? cfgmodels(g, &a) : h->models;
+        b32        known  = 0;
+        for (iz i = 0; i < models.len; i++) {
+            known |= x->model.len && models[i]==x->model;
+        }
+        fieldput(g->newmodel, known ? x->model : Str{});
+    }
+}
+
 // The new session dialog: a working directory, typed or from those of
-// earlier sessions, and a model, by default the configured one.
+// earlier sessions, and a model, by default the configured one. For an
+// import, it says what is imported, filled from it (importfill), and
+// lists only the hosts that can import.
 static void drawnew(Gui *g)
 {
-    f32 sc = g->scale;
+    f32         sc     = g->scale;
+    b32         import = g->imp.state == IMP_DIALOG;
+    char const *name   = import ? "Import session" : "New session";
     if (g->opennew) {
-        ImGui::OpenPopup("New session");
+        ImGui::OpenPopup(name);
         g->opennew = 0;
     }
     ImGui::SetNextWindowSize(v2(560*sc, 0));
-    if (!ImGui::BeginPopupModal("New session", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (!ImGui::BeginPopupModal(name, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
         return;
     }
     Arena a = g->frame;
 
     // Where it runs, when there is a choice: its directory is there
-    GuiHost *host  = g->newhost && hostready(g, g->newhost) ? g->newhost : g->main;
+    GuiHost *host  = g->newhost && hostready(g, g->newhost) &&
+                     (!import || hostcap(g->newhost, "import")) ? g->newhost : g->main;
     i32      ready = 0;
     for (GuiHost *h = g->hosts; h; h = h->next) {
-        ready += hostready(g, h);
+        ready += hostready(g, h) && (!import || hostcap(h, "import"));
+    }
+    if (import) {
+        Import *x = &g->imp;
+        importfill(g, host);
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->paneldim);
+        ImGui::TextWrapped("%s", cstr0(&a, x->title.len ? x->title : Str("Untitled")));
+        ImGui::TextWrapped("from %s", cstr0(&a, x->path));
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
     }
     if (ready > 1) {
         ImGui::TextUnformatted("Host");
@@ -4238,7 +4315,7 @@ static void drawnew(Gui *g)
         if (ImGui::BeginCombo("##host", cstr0(&a, hostlabel(g, &a, host)))) {
             i32 n = 0;
             for (GuiHost *h = g->hosts; h; h = h->next) {
-                if (!hostready(g, h)) continue;
+                if (!hostready(g, h) || (import && !hostcap(h, "import"))) continue;
                 ImGui::PushID(h);
                 if (ImGui::Selectable(cstr0(&a, hostlabel(g, &a, h)), h==host)) {
                     g->newhost = h;
@@ -4315,17 +4392,24 @@ static void drawnew(Gui *g)
     }
 
     ImGui::Spacing();
-    b32 create = ImGui::Button("Create", v2(120*sc, 0));
+    b32 create = ImGui::Button(import ? "Import" : "Create", v2(120*sc, 0));
     itemrect(g, RECT_NEWCREATE);
     if (create) {
         Str cwd   = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
         Str model = trim({(u8 *)g->newmodel, (iz)__builtin_strlen(g->newmodel)});
-        guinew(g, host, cwd, model);
+        if (import) {
+            importbegin(g, host, cwd, model);
+        } else {
+            guinew(g, host, cwd, model);
+        }
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel", v2(120*sc, 0))) {
         g->newerr = {};
+        if (import) {
+            g->imp.state = IMP_IDLE;
+        }
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
@@ -5978,6 +6062,11 @@ static void drawmenubar(Gui *g)
         if (add) {
             newsession(g);
         }
+        Str iwhy = !cannew(g) ? Str("No engine") : importwhy(g, g->main);
+        if (menuitem(g, a, "Import session...", iwhy)) {
+            importstart(g, 0);
+        }
+        ImGui::SetItemTooltip("A session from its raw log, exported here or elsewhere");
         // The session operations, on the session shown, as its context
         // menu in the sidebar has them
         ImGui::Separator();

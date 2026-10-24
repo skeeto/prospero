@@ -479,6 +479,11 @@ static void    os_guiplace(Os *, WinGeom);
 // 0 if no dialog can be shown, when nothing is posted.
 static b32     os_guisave(Os *, Arena scratch, Str title, Str name, Mailbox *,
                           u32 type, u64 id);
+// (M9) Ask which file to open, a session's raw log (*.jsonl), likewise:
+// the path chosen, or an empty one if cancelled, posted to the mailbox
+// as a record of the type with id. Returns 0 if no dialog can be shown.
+static b32     os_guiopenfile(Os *, Arena scratch, Str title, Mailbox *,
+                              u32 type, u64 id);
 // (M8) Show a directory in the platform's file manager: Finder,
 // Explorer, or whatever opens directories. Returns 0 on failure.
 static b32     os_guireveal(Os *, Arena scratch, Str dir);
