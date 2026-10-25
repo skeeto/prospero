@@ -835,6 +835,27 @@ static void test_viewpanels(Test *t)
                "nhttp://b/Mine");
     }
 
+    // A steer too late for its turn stays queued through the turn's end,
+    // as the engine's next record says it is a prompt now, and leaves as
+    // that prompt is taken in; a stop empties the queue
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w","model":"m"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"user","text":"go"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"queue","items":[{"id":1,"kind":"steer","text":"late"}]})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"turn.end","turn":1,"why":"done"})");
+        expect(t, "panels.queuekept", istr(&a, v->queue.len*10 + v->queue[0].steer), "11");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"user","text":"late","via":"queue"})");
+        expect(t, "panels.queuetaking", istr(&a, v->queue.len), "1");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"queue","items":[]})");
+        expect(t, "panels.queuetaken", istr(&a, v->queue.len), "0");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"queue","items":[{"id":2,"kind":"prompt","text":"x"}]})");
+        viewstopped(v);
+        expect(t, "panels.queuestopped", istr(&a, v->queue.len), "0");
+    }
+
     // Where a fork at each message cuts (viewforkat), by the engine's turn
     // numbers: turns begun by a job's end and by a manual compaction count,
     // a steer is no prompt of its own, and a queued prompt is one; the
@@ -909,6 +930,22 @@ static void test_viewpanels(Test *t)
                istr(&a, 1000 + LIVE_QUEUED*100 + 23));
         ch = apply(v, a, R"({"sid":"s","ts":0,"ev":"live","state":"queued","queue_pos":1,"queue_len":3})");
         expect(t, "panels.queuemoved", istr(&a, ch), "1");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"queue","items":[)"
+                    R"({"id":4,"kind":"steer","text":"look","cut":9,"images":2},)"
+                    R"({"id":5,"kind":"prompt","text":"then this"}]})");
+        {
+            Buf b(&a, 128);
+            for (iz i = 0; i < v->queue.len; i++) {
+                ViewQueued *q = &v->queue[i];
+                print(&b, (i64)q->id);
+                print(&b, q->steer ? Str("s") : Str("p"));
+                print(&b, (i64)q->cut);
+                print(&b, (i64)q->images);
+                print(&b, q->text);
+                print(&b, Str(";"));
+            }
+            expect(t, "panels.queue", finish(&b), "4s12look;5p00then this;");
+        }
         ch = apply(v, a, R"({"sid":"s","ts":0,"ev":"live","state":"task","tasks":2})");
         expect(t, "panels.tasks", istr(&a, ch*100 + v->state*10 + v->tasks), istr(&a, 100 + LIVE_TASK*10 + 2));
         expect(t, "panels.compacting", istr(&a, livestate("compacting")), istr(&a, LIVE_COMPACTING));

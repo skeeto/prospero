@@ -2526,6 +2526,102 @@ static void sideitem(Gui *g, View *v, b32 sep)
     }
 }
 
+// Messages sent to the turn at work that wait to be taken in: a tail
+// below the last message, of dim user bubbles, oldest first, each with
+// a Withdraw that puts it back in the draft (guiunqueue), unless it was
+// taken in meanwhile. They are no messages (msgs), so that selection,
+// find, export and fork never see them.
+
+enum { QUEUE_LINES = 3 };
+
+struct QueueShow {
+    Str lines[QUEUE_LINES];  // wrapped, the last with an ellipsis if more
+    i32 n;
+    f32 h;                   // the bubble's
+};
+
+static QueueShow queueshow(Arena *a, ViewQueued *q, f32 width, f32 pad)
+{
+    ImFont   *f    = ImGui::GetFont();
+    f32       fs   = ImGui::GetFontSize();
+    f32       lh   = ImGui::GetTextLineHeight();
+    QueueShow r    = {};
+    Str       rest = trim(q->text);
+    for (; rest.len && r.n<QUEUE_LINES; rest = trim(rest)) {
+        iz nl = 0;
+        for (; nl<rest.len && rest[nl]!='\n'; nl++) {}
+        char const *beg = rest.cdata;
+        iz          n   = f->CalcWordWrapPosition(fs, beg, beg+nl, width) - beg;
+        for (n = n>0 ? n : 1; n<nl && (rest[n]&0xc0)==0x80; n++) {}
+        r.lines[r.n++] = trimright(takehead(rest, n));
+        rest = cuthead(rest, n);
+    }
+    if (r.n && (rest.len || q->cut)) {
+        Str         last = r.lines[r.n-1];
+        f32         ew   = ImGui::CalcTextSize("...").x;
+        char const *end  = f->CalcWordWrapPosition(fs, last.cdata, last.cdata+last.len, width-ew);
+        r.lines[r.n-1] = concat(a, trimright(takehead(last, end - last.cdata)), "...");
+    }
+    r.h = pad/4 + lh + (f32)r.n*lh + (q->images ? lh : 0) + pad/2;
+    return r;
+}
+
+// The tail's bubbles, as measured (shows), from y in the transcript's
+// coordinates.
+static void drawqueue(Gui *g, GuiSession *s, Slice<QueueShow> shows, f64 y,
+                      ImVec2 wpos, f32 scrolly, f32 winh, f32 width, f32 pad)
+{
+    View       *v  = s->view;
+    Arena       a  = g->frame;
+    f32         sc = g->scale;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    f32         lh = ImGui::GetTextLineHeight();
+    f32         bw = ImGui::CalcTextSize("Withdraw").x + 2*ImGui::GetStyle().FramePadding.x;
+    for (iz i = 0; i < shows.len; y += shows[i].h + v->gap, i++) {
+        ViewQueued *q   = &v->queue[i];
+        QueueShow  *qs  = &shows[i];
+        f32         top = wpos.y + (f32)(y - scrolly);
+        ImVec2      b0  = v2(wpos.x+pad/2, top);
+        ImVec2      b1  = v2(wpos.x+pad*1.5f+width, top+qs->h);
+        if (!i) {
+            g->rects[RECT_QUEUEITEM] = {b0.x, b0.y, b1.x, b1.y};
+        }
+        g->queueshown++;
+        if (b1.y<wpos.y || b0.y>wpos.y+winh) {
+            continue;  // out of sight
+        }
+        dl->AddRectFilled(b0, b1, fade(g->pal->userbg, 0.55f), 6*sc);
+        f32 x     = wpos.x + pad;
+        f32 ty    = top + pad/4;
+        Str label = q->steer ? Str("Next step") : Str("Queued");
+        dl->AddText(v2(x, ty), g->pal->paneldim, label.cdata, label.cdata+label.len);
+        for (i32 k = 0; k < qs->n; k++) {
+            Str line = qs->lines[k];
+            ty += lh;
+            dl->AddText(v2(x, ty), g->pal->paneldim, line.cdata, line.cdata+line.len);
+        }
+        if (q->images) {
+            Buf b(&a, 32);
+            print(&b, (i64)q->images);
+            print(&b, q->images==1 ? Str(" image") : Str(" images"));
+            Str n = finish(&b);
+            ty += lh;
+            dl->AddText(v2(x, ty), g->pal->paneldim, n.cdata, n.cdata+n.len);
+        }
+        ImGui::SetCursorScreenPos(v2(x + width - bw, top + pad/4));
+        ImGui::PushID((i32)q->id);
+        ImGui::BeginDisabled(s->unqueue != 0);
+        if (ImGui::SmallButton("Withdraw")) {
+            guiunqueue(g, s, q->id);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "withdraw");
+        ImGui::SetItemTooltip(q->steer ? "Take it back into the box, before the agent reads it"
+                                       : "Take it back into the box, before its turn begins");
+        ImGui::PopID();
+    }
+}
+
 static void drawtranscript(Gui *g)
 {
     GuiSession *gs = g->sess ? g->sess : &g->nosession;
@@ -2668,6 +2764,40 @@ static void drawtranscript(Gui *g)
     g->layoutus += os_ticks(g->os) - t0;
     f64 total = viewtops(v, width, charw, fm.lineh);
 
+    // The queue's tail below the messages, in the height so that the
+    // view stuck to the bottom shows it
+    Slice<QueueShow> shows = {};
+    f64              tail0 = total + v->gap;
+    g->queueshown = 0;
+    g->rects[RECT_QUEUEITEM] = {};
+    g->rects[RECT_LASTMSG]   = {};
+    if (g->sess && g->sess->view==v && v->queue.len && !gs->readonly &&
+            hostcap(gs->host, "queue")) {
+        shows.data = alloc<QueueShow>(&g->frame, v->queue.len);
+        shows.len  = shows.cap = v->queue.len;
+        f64 y = tail0;
+        for (iz i = 0; i < shows.len; i++) {
+            shows[i] = queueshow(&g->frame, &v->queue[i], width, pad);
+            total    = y + shows[i].h;
+            y        = total + v->gap;
+        }
+    }
+    if (g->queueview != v) {
+        g->queueview = v;
+        g->queuelen  = shows.len;
+        g->queuemark = v->msgs.len;
+    } else if (g->queuelen != shows.len) {
+        // Shrunk with no message of the user's since: withdrawn, or
+        // gone missing for a while (the drive checks count these)
+        b32 taken = 0;
+        for (iz i = g->queuemark; i < v->msgs.len; i++) {
+            taken |= v->msgs[i].role == VIEW_USER;
+        }
+        g->queuedrops += shows.len<g->queuelen && !taken;
+        g->queuelen  = shows.len;
+        g->queuemark = v->msgs.len;
+    }
+
     f64 want = scrolly;
     if (bottom) {
         want = total + pad - winh;  // the scroll range's end, so it sticks
@@ -2755,6 +2885,9 @@ static void drawtranscript(Gui *g)
 
         // Backgrounds: the user's messages, tool rows, ask cards
         sp->SetCurrentChannel(dl, CH_BG);
+        if (i == v->msgs.len-1) {
+            g->rects[RECT_LASTMSG] = {box0.x, box0.y, box1.x, box1.y};
+        }
         if (m->role == VIEW_USER) {
             g->rects[RECT_USERMSG] = {box0.x, box0.y, box1.x, box1.y};
             dl->AddRectFilled(box0, box1, g->pal->userbg, 6*sc);
@@ -2836,6 +2969,9 @@ static void drawtranscript(Gui *g)
         ImGui::PopID();
     }
     sp->Merge(dl);
+    if (shows.len) {
+        drawqueue(g, g->sess, shows, tail0, wpos, scrolly, winh, width, pad);
+    }
     textkeys(g, v);
 
     gs->stick = scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh;
@@ -3323,49 +3459,6 @@ static void drawslash(Gui *g, Str text, Slice<SkillItem> skills, ImVec2 at)
     g->slashshown = 1;
 }
 
-// Messages sent to the turn at work that wait to be taken in: dim
-// bubbles above the box, oldest first, each with a Withdraw that puts
-// it back in the draft (guiunqueue), unless it was taken in meanwhile.
-static void drawqueue(Gui *g, GuiSession *s)
-{
-    View       *v   = s->view;
-    Arena       a   = g->frame;
-    f32         sc  = g->scale;
-    ImGuiStyle &st  = ImGui::GetStyle();
-    ImDrawList *dl  = ImGui::GetWindowDrawList();
-    f32         h   = ImGui::GetFrameHeight();
-    f32         bw  = ImGui::CalcTextSize("Withdraw").x + 2*st.FramePadding.x;
-    f32         pad = 8*sc;
-    for (iz i = 0; i < v->queue.len; i++) {
-        ViewQueued *q = &v->queue[i];
-        ImVec2      p = ImGui::GetCursorScreenPos();
-        f32         w = ImGui::GetContentRegionAvail().x;
-        dl->AddRectFilled(p, v2(p.x+w, p.y+h), g->pal->userbg, 6*sc);
-        Str    label = q->steer ? Str("next step  ") : Str("queued  ");
-        f32    lw    = ImGui::CalcTextSize(label.cdata, label.cdata+label.len).x;
-        f32    ty    = p.y + st.FramePadding.y;
-        f32    end   = p.x + w - bw - 2*pad;
-        Str    line  = oneline(&a, q->text);
-        dl->AddText(v2(p.x+pad, ty), g->pal->paneldim, label.cdata, label.cdata+label.len);
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->paneldim);
-        ImGui::RenderTextEllipsis(dl, v2(p.x+pad+lw, ty), v2(end, p.y+h), end,
-                                  line.cdata, line.cdata+line.len, 0);
-        ImGui::PopStyleColor();
-        ImGui::SetCursorScreenPos(v2(p.x + w - bw - pad/2, p.y));
-        ImGui::PushID((i32)q->id);
-        ImGui::BeginDisabled(s->unqueue != 0);
-        if (ImGui::Button("Withdraw", v2(bw, h))) {
-            guiunqueue(g, s, q->id);
-        }
-        ImGui::EndDisabled();
-        itemnamed(g, "withdraw");
-        ImGui::SetItemTooltip(q->steer ? "Take it back into the box, before the agent reads it"
-                                       : "Take it back into the box, before its turn begins");
-        ImGui::PopID();
-    }
-    g->queueshown = (i32)v->queue.len;
-}
-
 // The images attached to the draft: thumbnails above the box, in rows,
 // each with an x that removes it, dimmed while they are sent.
 static void drawattached(Gui *g, GuiSession *s)
@@ -3479,7 +3572,6 @@ static void drawprompt(Gui *g)
     g->cmenushown  = 0;
     g->histshown   = 0;
     g->editshown   = 0;
-    g->queueshown  = 0;
     g->attshown    = 0;
     g->attready    = 0;
     drawstrip(g);
@@ -3502,10 +3594,6 @@ static void drawprompt(Gui *g)
         ImGui::TextUnformatted(cstr0(&a, s->note));
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
-    }
-    View *sv = g->sess ? g->sess->view : 0;
-    if (sv && sv->queue.len && !g->sess->readonly && hostcap(g->sess->host, "queue")) {
-        drawqueue(g, g->sess);
     }
     if (g->sess && g->sess->att && g->sess->att->len) {
         drawattached(g, g->sess);

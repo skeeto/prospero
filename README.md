@@ -260,8 +260,8 @@ there freely, a fork gets a copy of it, and it is deleted with the
 session. Such a session has only your own instructions and skills,
 none of a project's, and shows as "No folder" in the sidebar.
 
-A message sent while a turn runs waits above the prompt box until the
-agent takes it in at its next step (or, too late for this turn, runs as
+A message sent while a turn runs waits, dimmed, at the end of the
+transcript until the agent takes it in at its next step (or, too late for this turn, runs as
 the next prompt), and its Withdraw button puts it back in the draft.
 
 Plan mode has the agent explore and write a plan before it changes

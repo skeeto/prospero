@@ -306,6 +306,8 @@ struct ViewQueued {
     Str text;       // cut to its start if long: unqueue gives it whole
     i64 id;
     b32 steer;      // for the next step, else a prompt for a turn of its own
+    b32 cut;        // text is only its start
+    i32 images;     // attached
 };
 
 // A file that write or edit changed, whose original a rewind restores.
@@ -492,7 +494,7 @@ struct View {
 
     // Beside the transcript
     Slice<ViewTodo>  todos;     // the latest list
-    Slice<ViewQueued> queue;    // the latest queue, empty once a turn ends
+    Slice<ViewQueued> queue;    // the latest queue record's
     Slice<ViewJob>   jobs;      // by number
     i32              jobsrun;   // running
     Slice<ViewSnap>  snaps;     // in order
@@ -2104,17 +2106,20 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         ViewQueued *q     = alloc<ViewQueued>(&v->aux, n);
         iz          k     = 0;
         for (Json *e = items->child; e && k<n; e = e->next, k++) {
-            q[k].text  = clone(&v->aux, jsonstr(jsonget(e, "text")));
-            q[k].id    = jsonint(jsonget(e, "id"), 0);
-            q[k].steer = jsonstr(jsonget(e, "kind")) == "steer";
+            q[k].text   = clone(&v->aux, jsonstr(jsonget(e, "text")));
+            q[k].id     = jsonint(jsonget(e, "id"), 0);
+            q[k].steer  = jsonstr(jsonget(e, "kind")) == "steer";
+            q[k].cut    = jsonint(jsonget(e, "cut"), 0) > 0;
+            q[k].images = (i32)jsonint(jsonget(e, "images"), 0);
         }
         v->queue.data = q;
         v->queue.len  = v->queue.cap = k;
     } return 1;
 
     case EV_TURNEND: {
+        // The queue stays as it was: the engine sends what is left, and
+        // a steer too late for this turn stays shown, as a prompt now
         dropprov(v);
-        v->queue = {};  // its record lost, the next says what is left
         v->doneturn    = (i32)jsonint(jsonget(j, "turn"), v->turn);
         v->doneattempt = 0x7fffffff;
         v->busy  = 0;

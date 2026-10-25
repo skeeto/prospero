@@ -32,10 +32,11 @@ once.
 ## Talking to the agent
 
 Enter sends the prompt. While the agent works, the Send button becomes
-Steer: what you send then waits above the box, marked "next step",
-until the agent reads it at its next step (or marked "queued", for a
-turn of its own), and its Withdraw button takes it back into the box. Stop, or Esc, cancels the turn and kills
-any command it runs.
+Steer: what you send then waits at the end of the transcript, dimmed
+and marked "Next step", until the agent reads it at its next step (or
+marked "Queued", for a turn of its own, as it is when sent too late for
+this turn), and its Withdraw button takes it back into the box. Stop,
+or Esc, cancels the turn and kills any command it runs.
 
 A long command or subagent keeps the agent from reading what you
 send until it ends. Run in background, on its row, or Ctrl+B (also in

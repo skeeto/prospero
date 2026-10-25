@@ -6909,11 +6909,14 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
         s->queued.cap--;
         changed = 1;
     }
-    if (changed) {
+    if (changed && !next.text.data) {
         sendqueue(s, scratch);
     }
     if (next.text.data) {
+        // Its message goes out ahead of the queue without it, so that a
+        // frontend never shows it in neither
         startturn(s, scratch, next.text, "queue", next.images);
+        sendqueue(s, scratch);
     } else if (mhop) {
         s->hop = mhop;
         beginturn(s, scratch, "message");

@@ -255,6 +255,8 @@ enum : i32 {
     RECT_SIDELINK,   // a side chat's link to its original
     RECT_NEWMODEL,   // the new session dialog's model combo
     RECT_NEWPICK,    // its first pick other than the default model
+    RECT_QUEUEITEM,  // the transcript's first queued message
+    RECT_LASTMSG,    // the transcript's last message, if drawn
     RECT_THEME0,     // the theme's choices in its open list
     RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
     RECT_COUNT = RECT_PANE0 + 11,
@@ -1371,7 +1373,11 @@ struct Gui {
                                      // 4 cut and copy, 8 paste, 16 editor
     i32                histshown;    // the box showed history entry N/M
     b32                editshown;    // it said an editor was at work
-    i32                queueshown;   // queued messages drawn above the box
+    i32                queueshown;   // queued messages in the transcript's tail
+    i32                queuedrops;   // times the tail shrank, none taken in
+    void              *queueview;    // the view of the tail as last drawn,
+    iz                 queuelen;     // its length,
+    iz                 queuemark;    // and its messages as it last changed
     i32                attshown;     // attached images drawn above it
     i32                attready;     // of them with their thumbnail
     i64                drops;        // files dropped on the window
@@ -4941,6 +4947,11 @@ static void resync(Gui *g, GuiSession *s)
     }
     v->loose = loose;
     v->lost  = 0;
+    if (!v->busy) {
+        // A queue record, which no log keeps, may have been lost: an
+        // idle session's engine waits with nothing queued
+        v->queue = {};
+    }
     g->resyncs++;
 }
 
@@ -8435,7 +8446,7 @@ enum : i32 {
     CHK_PLANMODEL,    // the model picker is enabled while the plan waits
     CHK_MAXIMIZED,    // maximized, filling its display, and saved so;
                       // dx 1: filling it, saved as maximized
-    CHK_QUEUESHOWN,   // dx queued messages drawn above the box, the first text
+    CHK_QUEUESHOWN,   // dx queued messages in the transcript, the first text
     CHK_MSGNOTE,      // a message's notice names its sender, with a link
     CHK_MSGSENDER,    // the link showed the sender, whose row links back
     CHK_ATTACHED,     // dx images attached to the draft, their thumbnails drawn
@@ -8482,6 +8493,9 @@ enum : i32 {
                       // first, then text's models (text "fake/")
     CHK_NEWPICKED,    // the combo shows the pick (pickwant)
     CHK_SESSPICKED,   // the session shown has the pick's endpoint and model
+    CHK_QUEUETAIL,    // the first queued message is drawn below the last
+                      // message, inside the transcript
+    CHK_QUEUEKEPT,    // queued messages left the tail untaken dx times
     CHK_COUNT,
 };
 
@@ -8656,7 +8670,7 @@ static Str chknames[] = {
     "the Plan window shows the plan as the agent wrote it",
     "the model may change while the plan waits",
     "the window is maximized, filling its display, and will open so",
-    "the box shows the messages queued, as it should",
+    "the transcript shows the messages queued, as it should",
     "the message from the subagent is shown, with a link to it",
     "the link showed the subagent, its message row linking back",
     "the images attached show above the box",
@@ -8694,6 +8708,8 @@ static Str chknames[] = {
     "the model list has the defaults first, then the endpoint's models",
     "the model combo shows the model picked",
     "the new session has the endpoint and model picked",
+    "the queued message shows in the transcript, below its last message",
+    "a queued message left the transcript only when withdrawn or taken in",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -11475,25 +11491,33 @@ static DriveOp composeops[] = {
     {OP_SHOT, 0, 0, 0, 300, "compose-drafts"},
     CLICK(T_SESSTITLE, "Session B", 500),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for B"},
-    // D: a steer sent while the response streams waits above the box
-    // until withdrawn, back into the box, and never reaches the agent
+    // D: a steer sent while the response streams waits in the
+    // transcript, below its last message, until withdrawn, back into
+    // the box, and never reaches the agent. Another, too late for the
+    // turn, stays shown as it becomes a prompt, until taken in
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
-    {OP_PROMPT, 0, 0, 0, 200, "Stream in the background."},
+    {OP_PROMPT, 0, 0, 0, 200, "Stream, then pause."},
     {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
     CLICK(T_PROMPT, "", 200),
     {OP_TEXT, 0, 0, 0, 200, "Withdraw me"},
     KEY(GKEY_ENTER, 0, 600),
     {OP_CHECK, CHK_QUEUESHOWN, 1, 0, 0, "Withdraw me"},
+    {OP_CHECK, CHK_QUEUETAIL, 0, 0, 0, ""},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "compose-queued"},
     {OP_TEXT, 0, 0, 0, 200, "Draft for D"},
     CLICK(T_NAMED, "withdraw", 600),
     {OP_CHECK, CHK_QUEUESHOWN, 0, 0, 0, ""},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for D\nWithdraw me"},
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 200, "Late steer"},
+    KEY(GKEY_ENTER, 0, 600),
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
-    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Stream in the background."},
+    {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Late steer"},
+    {OP_CHECK, CHK_QUEUESHOWN, 0, 0, 0, ""},
+    {OP_CHECK, CHK_QUEUEKEPT, 1, 0, 0, ""},
     // E: images attached by dropping two files, a PNG and a JPEG, and
     // pasting a third, the pasted one removed by its x, the others sent
     // with the prompt and counted by the agent, their thumbnails decoded
@@ -13140,6 +13164,17 @@ static b32 drivecheck(Gui *g, i32 chk)
         DriveOp *op = &g->ops[g->drivepc-1];
         return g->sess && v->queue.len==(iz)op->dx && g->queueshown==(i32)op->dx &&
                (!v->queue.len || v->queue[0].text==op->text);
+    }
+    case CHK_QUEUEKEPT: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        return g->queuedrops == (i32)op->dx;
+    }
+    case CHK_QUEUETAIL: {
+        Rect q = g->rects[RECT_QUEUEITEM];
+        Rect m = g->rects[RECT_LASTMSG];
+        Rect t = g->rects[RECT_TRANSCRIPT];
+        return q.y1>q.y0 && m.y1>m.y0 && q.y0>=m.y1 &&
+               q.x0>=t.x0 && q.x1<=t.x1 && q.y0>=t.y0 && q.y1<=t.y1;
     }
     case CHK_TOOLTIP:       return tooltipup();
     case CHK_NOTOOLTIP:     return !tooltipup();

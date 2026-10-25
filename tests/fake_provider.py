@@ -2177,7 +2177,8 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Think briefly", "Answer at length", "Write outside for good",
                "Start a desktop subagent", "Type on the desktop as a subagent",
                "Start a subagent that messages", "Message the parent as a subagent",
-               "Describe the images", "Ask on the side", "Run a long command")
+               "Describe the images", "Ask on the side", "Run a long command",
+               "Stream, then pause")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2270,6 +2271,16 @@ def sc_gui(model, n, req):
             yield from text(model, f"bg{i} ")
             yield S.sleep(0.02)
         yield from finish(model)
+    elif "Stream, then pause" in prompt and step == 0:
+        # A line, then a pause of about 6 s, while the queue's tail below
+        # it holds still for a click
+        yield S.head()
+        for i in range(5):
+            yield from text(model, f"pause{i} ")
+        yield S.sleep(6)
+        yield from finish(model)
+    elif "Stream, then pause" in prompt:
+        yield from answer(model, "Taken in.")
     elif "Stream for the link" in prompt:
         # About 9 s, long enough for a link to drop and come back
         yield S.head()

@@ -2353,6 +2353,16 @@ def unqueue(t):
         t.check(users[1:] == [("keep this prompt", "queue"), ("keep this steer", "queue")]
                 and users[0][0] == "go", f"messages: {users}")
         t.check(h.all("queue", sid)[-1]["items"] == [], "the queue ends empty")
+        # Frontends show the queue as its records say, through turn ends:
+        # it empties only at the last, and each prompt taken in comes as
+        # a message while still queued, never shown in neither
+        t.check(all(q["items"] for q in h.all("queue", sid)[:-1]), "emptied only once")
+        mine = [e for e in h.events if e.get("sid") == sid and e.get("ev") in ("user", "queue")]
+        for i, e in enumerate(mine):
+            if e["ev"] == "user" and e.get("via") == "queue":
+                last = [q for q in mine[:i] if q["ev"] == "queue"][-1:]
+                t.check(last and e["text"] in [q["text"] for q in last[0]["items"]],
+                        f"queued until taken in: {e['text']}")
         said = json.dumps([r["body"]["messages"] for r in t.requests()])
         t.check("withdraw this" not in said, "nothing withdrawn reached the agent")
     finally:
