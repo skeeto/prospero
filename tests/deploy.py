@@ -160,9 +160,14 @@ class D(R.T):
         os.makedirs(conf)
         self.env.update(XDG_CONFIG_HOME=conf, APPDATA=conf)
         # No prospero on the remote shell's PATH, as on a new machine (on
-        # Windows it never was, and PATH has the shell, busybox-w32's)
+        # Windows PATH has the shell, busybox-w32's, so only directories
+        # with a prospero go)
         if os.name != "nt":
             self.env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        else:
+            self.env["PATH"] = os.pathsep.join(
+                d for d in self.env.get("PATH", "").split(os.pathsep)
+                if not os.path.exists(os.path.join(d, "prospero.exe")))
 
     def engine(self, extra=b""):
         """An engine of the local platform in the engines directory: this
