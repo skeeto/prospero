@@ -6517,7 +6517,12 @@ def dir_listing(t):
         t.host.mkdir(target)
         win = lambda p: p.replace("/", "\\")
         for name, to in [("linked", target), ("lost", t.host.join(t.base, "missing"))]:
-            t.host.sh(f'cmd /c mklink /J "{win(t.host.join(base, name))}" "{win(to)}"')
+            link, to = win(t.host.join(base, name)), win(to)
+            if isinstance(t.host, LocalHost):
+                subprocess.run(["cmd", "/c", "mklink", "/J", link, to], check=True,
+                               stdout=subprocess.DEVNULL)
+            else:
+                t.host.sh(f'cmd /c mklink /J "{link}" "{to}"')
         want.update(linked=1)
     big = t.host.join(t.base, "big")
     t.host.bulk(big, {f"f{i:04}": "" for i in range(2001)})

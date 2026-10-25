@@ -572,6 +572,11 @@ def desktop(t):
     t.write_config(t.args.url, "[desktop]\noffer = all\nask = false\n")
     env = dict(t.env, FAKE_DESKTOP_LOG=log)
     env.pop("PROSPERO_TEST_DESKTOP", None)
+    if sys.platform.startswith("linux") and not (env.get("DISPLAY") or
+                                                 env.get("WAYLAND_DISPLAY")):
+        # The engine offers the tool only with a display, which the fake
+        # helper does not need, and ctest over ssh has none
+        env["DISPLAY"] = ":99"
     c = t.connect(env=env)
     c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up")
     r = c.call("new", cwd=t.work, prompt="go", model=t.model("desktop_off"), attended=1)
