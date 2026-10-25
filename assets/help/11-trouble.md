@@ -21,9 +21,15 @@
 ## Common problems
 
 **"no model: give one, or set model in the config".** No model is
-configured and the New session dialog named none. Set `model` on the
-Settings pane's Defaults page, or type one in the dialog. See
+configured, no `[model]` section either, the New session dialog named
+none, and the endpoint has listed none. Open the dialog's Model list:
+an endpoint that cannot be reached says why there. Check its `url`,
+or set `model` on the Settings pane's Defaults page. See
 [Getting started](help:start).
+
+**"no usable endpoint: give a URL or a configured name".** No
+`[endpoint]` section has a `url`, or the one named does not exist.
+Add one under Endpoints in the Settings pane.
 
 **The endpoint does not answer.** The harness retries: ten quick
 retries, then the model's `fallback` models if any, then slow retries

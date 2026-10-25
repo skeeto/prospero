@@ -14,7 +14,12 @@ here... in a host's menu in the sidebar, opens the New session dialog:
   the state directory, deleted with it, and shows as "No folder" in
   the sidebar. It has only your own instructions and skills, none of a
   project's.
-- **Model**: empty for the configured one.
+- **Model**: the models the endpoints list, as `ENDPOINT/MODEL`: the
+  default first, then each endpoint's, its `[model]` sections first.
+  An endpoint that cannot be reached shows why, greyed out. Type in
+  the field at the top to filter the list, or type a model it lacks,
+  `MODEL` or `ENDPOINT/MODEL`, and press Enter. The pick holds for
+  later sessions while the endpoint still lists it.
 - **Role**, when the configuration has roles: start in one, with its
   instructions, model and tools (see [Subagents](help:jobs)). A
   session with a role cannot use Plan mode.

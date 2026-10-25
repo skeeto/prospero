@@ -167,13 +167,13 @@ View's Reset layout puts every pane back in its place. The window
 opens where it was last, fitted to the displays there are; the first
 time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings
-and Hosts when the configuration names no model and no remote host;
-close them once read, as the View menu shows each again. Help → Help
+and Hosts when the configuration names no model and no remote host,
+and none of its endpoints lists a model either; close them once read, as the View menu shows each again. Help → Help
 shows a page on each topic, from getting started to troubleshooting,
 built in from `assets/help`.
 
 `prospero DIR`, such as `prospero .` in a terminal, opens a new
-session in that directory, in Build mode with the configured model,
+session in that directory, in Build mode with the default model,
 ready for a prompt. With no window open yet, the window goes on
 detached and the shell has its prompt back, as with `code .`, its
 errors going to `gui.log` in the state directory; the session has the
@@ -308,7 +308,15 @@ printing its records as JSON lines, or readable text with `--pretty`.
 Nobody answers its asks, so they are denied. It exits 0 when the turn
 is done, 1 on error, 3 at the step budget, 130 when cancelled, and 2
 for usage errors. Options: `-C DIR` (working directory), `-e ENDPOINT`,
-`-m MODEL`, `-r ROLE`, `-c FILE` (configuration) and `--state DIR`.
+`-m MODEL` (or `ENDPOINT/MODEL`), `-r ROLE`, `-c FILE` (configuration)
+and `--state DIR`.
+
+A session that names no endpoint gets the configuration's `endpoint`,
+else the first `[endpoint]` section with a URL; one that names no model
+gets the configuration's `model`, else the first `[model]` section,
+else the first model its endpoint listed when last asked. The New
+session dialog asks every endpoint for its listing (`/v1/models`, which
+loads nothing) and offers what they serve as `ENDPOINT/MODEL`.
 
 `prospero --headless` is the engine alone, speaking the protocol (one
 JSON object per line, `src/events.cpp`) on standard input and output:
