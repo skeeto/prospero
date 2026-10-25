@@ -193,6 +193,90 @@ static void testlogcopy(Test *t)
     expect(t, "logcopy no session", istr(&a, c.err.len>0 && !c.log.data), "1");
 }
 
+// A side chat's copy (COPY_SIDE), cut into a turn at work: a result for
+// the call running there, an answer and a result for the one asking,
+// the job still running ended as forked, without a notice, then the
+// turn's end and the notice; and a copy that logopen leaves alone. A
+// plain fork ends the job alike.
+static void testlogside(Test *t)
+{
+    Arena a       = t->perm;
+    Arena scratch = t->perm;
+    scratch.beg  += (scratch.end - scratch.beg)/2;
+    Str src[] = {
+        "{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"proto\":0,\"cwd\":\"/w\","
+        "\"side_of\":\"Z\"}\n",
+        "{\"sid\":\"A\",\"seq\":2,\"ts\":6,\"ev\":\"user\",\"text\":\"one\"}\n",
+        "{\"sid\":\"A\",\"seq\":3,\"ts\":6,\"ev\":\"turn\",\"n\":1}\n",
+        "{\"sid\":\"A\",\"seq\":4,\"ts\":7,\"ev\":\"tool.start\",\"call\":\"c0\"}\n",
+        "{\"sid\":\"A\",\"seq\":5,\"ts\":7,\"ev\":\"job.start\",\"job\":1,\"call\":\"c0\"}\n",
+        "{\"sid\":\"A\",\"seq\":6,\"ts\":7,\"ev\":\"tool.end\",\"call\":\"c0\","
+        "\"status\":\"background\",\"job\":1}\n",
+        "{\"sid\":\"A\",\"seq\":7,\"ts\":8,\"ev\":\"title\",\"text\":\"Work\",\"by\":\"auto\"}\n",
+        "{\"sid\":\"A\",\"seq\":8,\"ts\":8,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n",
+        "{\"sid\":\"A\",\"seq\":9,\"ts\":9,\"ev\":\"user\",\"text\":\"two\"}\n",
+        "{\"sid\":\"A\",\"seq\":10,\"ts\":9,\"ev\":\"turn\",\"n\":2}\n",
+        "{\"sid\":\"A\",\"seq\":11,\"ts\":9,\"ev\":\"assistant\",\"blocks\":["
+        "{\"t\":\"call\",\"id\":\"c1\",\"name\":\"task\",\"args\":\"{}\"},"
+        "{\"t\":\"call\",\"id\":\"c2\",\"name\":\"write\",\"args\":\"{\\\"path\\\":\\\"x\\\"}\"}]}\n",
+        "{\"sid\":\"A\",\"seq\":12,\"ts\":9,\"ev\":\"tool.start\",\"call\":\"c1\"}\n",
+        "{\"sid\":\"A\",\"seq\":13,\"ts\":9,\"ev\":\"ask\",\"req\":\"q2\",\"call\":\"c2\"}\n",
+    };
+    Slice<Str> lines = {src, countof(src), countof(src)};
+    LogCopy    c     = logcopy(&a, scratch, lines, "A", "B", {}, {}, -1, 100, 0, COPY_SIDE);
+    expect(t, "logside seqs", logseqs(&a, c.log), "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 "
+           "17 18 19 20 21");
+    expect(t, "logside open", istr(&a, c.open), "0");
+    expect(t, "logside title", c.title, "Work (side chat)");
+    expect(t, "logside next", istr(&a, c.next.len), "0");
+    expect(t, "logside session", cut(c.log, '\n').head,
+           "{\"sid\":\"B\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"forked_from\":\"A\","
+           "\"fork_turn\":2,\"side_of\":\"A\",\"proto\":0,\"cwd\":\"/w\"}");
+    Str rest = cuthead(c.log, find(c.log, "{\"sid\":\"B\",\"seq\":14,"));
+    expect(t, "logside closed", rest,
+        "{\"sid\":\"B\",\"seq\":14,\"ts\":100,\"ev\":\"tool.end\",\"call\":\"c1\","
+        "\"status\":\"cancelled\",\"text\":\"[still running in the main session when "
+        "this side chat began]\"}\n"
+        "{\"sid\":\"B\",\"seq\":15,\"ts\":100,\"ev\":\"answer\",\"req\":\"q2\","
+        "\"decision\":\"deny\",\"by\":\"cancel\",\"note\":\"asked in the main session "
+        "when this side chat began\"}\n"
+        "{\"sid\":\"B\",\"seq\":16,\"ts\":100,\"ev\":\"tool.start\",\"call\":\"c2\","
+        "\"name\":\"write\",\"args\":\"{\\\"path\\\":\\\"x\\\"}\",\"cwd\":\"/w\"}\n"
+        "{\"sid\":\"B\",\"seq\":17,\"ts\":100,\"ev\":\"tool.end\",\"call\":\"c2\","
+        "\"status\":\"cancelled\",\"text\":\"[not yet run in the main session when "
+        "this side chat began]\"}\n"
+        "{\"sid\":\"B\",\"seq\":18,\"ts\":100,\"ev\":\"job.end\",\"job\":1,\"call\":\"c0\","
+        "\"status\":\"forked\",\"text\":\"still running in the main session when this "
+        "side chat began\",\"notice\":0}\n"
+        "{\"sid\":\"B\",\"seq\":19,\"ts\":100,\"ev\":\"turn.end\",\"turn\":2,\"why\":\"side\"}\n"
+        "{\"sid\":\"B\",\"seq\":20,\"ts\":100,\"ev\":\"notice\",\"kind\":\"side\",\"text\":"
+        "\"This is a side chat with the user, forked from the session \\\"Work\\\" (A), "
+        "where the main agent may still be working. Do not change files unless the "
+        "user asks you to.\"}\n"
+        "{\"sid\":\"B\",\"seq\":21,\"ts\":100,\"ev\":\"title\",\"text\":\"Work (side chat)\","
+        "\"by\":\"auto\"}\n");
+
+    // Opened as it is: nothing left to close
+    Os *os = newos(&a, 1<<20);
+    os_write(os, scratch, "side.jsonl", c.log);
+    EventLog log = logopen(os, &a, scratch, "side.jsonl", "B", 1<<20);
+    expect(t, "logside opens", logshow(&a, &log), "ok=1 seq=21 turn=2 torn=0 bad=0 synth=0");
+    logclose(&log);
+
+    // A plain fork after turn 1, the job running then
+    c = logcopy(&a, scratch, lines, "A", "B", {}, {}, 1, 100, 0);
+    rest = cuthead(c.log, find(c.log, "{\"sid\":\"B\",\"seq\":9,"));
+    expect(t, "logfork job", rest,
+        "{\"sid\":\"B\",\"seq\":9,\"ts\":100,\"ev\":\"job.end\",\"job\":1,\"call\":\"c0\","
+        "\"status\":\"forked\",\"text\":\"still running in the original session when this "
+        "fork was made\",\"notice\":0}\n"
+        "{\"sid\":\"B\",\"seq\":10,\"ts\":100,\"ev\":\"title\",\"text\":\"Work (fork)\","
+        "\"by\":\"auto\"}\n");
+    // Imported, the job is left for logopen
+    c = logcopy(&a, scratch, lines, "A", "B", {}, {}, -1, 100, 0, COPY_IMPORT);
+    expect(t, "logimport job", istr(&a, find(c.log, "forked")), "-1");
+}
+
 // An import of a log from elsewhere (logimport): the conversation's
 // records kept, with their seqs, and every other dropped; tool results
 // without the fields naming the old session's files; the session record
@@ -355,7 +439,7 @@ static void test_events(Test *t)
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
                "\"delete\",\"fork\",\"config.delete\",\"import\","
-               "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\",\"nofolder\",\"dir\",\"config.create\"]}");
+               "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\",\"nofolder\",\"dir\",\"config.create\",\"side\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);
@@ -905,5 +989,6 @@ static void test_events(Test *t)
     }
 
     testlogcopy(t);
+    testlogside(t);
     testlogimport(t);
 }

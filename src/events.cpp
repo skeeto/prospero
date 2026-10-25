@@ -198,6 +198,8 @@ static Str capnames[] = {
                        // own, and nofolder in its session record and list
     "dir",             // dir, a directory's entries on the engine's machine
     "config.create",   // config.set {create}: the user's file, made if missing
+    "side",            // fork {side:1}, a side chat also of a busy session,
+                       // and side_of in its session record and list
 };
 
 static Str evname(i32 ev)
@@ -783,9 +785,28 @@ static Replay logreplay(Os *os, Arena *perm, Arena scratch, Str path,
 // fork_turn) right after ev, where the sessions list, which reads only a
 // log's first 4 KiB, finds it, and a title record "TITLE (fork)" ends the
 // log, after a mode record back to Build (by "fork") if the cut left it
-// in Bypass mode. It is pure, so that an import can make use of it too: an import
+// in Bypass mode. Background jobs still running at the cut go on in the
+// original alone: the copy ends each with a job.end of status "forked"
+// and no notice (notice:0), so that the fork's agent never hears of
+// their end. It is pure, so that an import can make use of it too: an import
 // (logimport) is a copy of the whole log, whose session record says
 // imported_from instead, and whose title is "TITLE (imported)".
+//
+// A side chat (COPY_SIDE) is a fork of the whole log while the original
+// may be at work: its session record says side_of too, and the copy
+// closes the turn it cuts into, as a running engine would have: a
+// result for every call without one, still running there (tool.end) or
+// not yet run (an answer to its pending ask, tool.start and tool.end),
+// each of status "cancelled" and saying so, then turn.end{why:"side"}.
+// Records not yet committed there (a reply still streaming) are not in
+// the log, and so not in the copy. A notice of kind "side" tells its
+// agent what it is, just before the title "TITLE (side chat)".
+
+enum : i32 {
+    COPY_FORK,
+    COPY_IMPORT,
+    COPY_SIDE,
+};
 
 struct LogCopy {
     Str        log;    // the new events.jsonl, null on failure
@@ -879,14 +900,43 @@ static Slice<Str> lognames(Arena *a, Str log)
     return r;
 }
 
+// The notice that begins a side chat of session from, titled title.
+static Str sidenotice(Arena *a, Str from, Str title)
+{
+    Buf b(a, 256 + title.len);
+    print(&b, "This is a side chat with the user, forked from the session ");
+    if (title.len) {
+        putbyte(&b, '"');
+        print(&b, title);
+        print(&b, "\" (");
+        print(&b, from);
+        putbyte(&b, ')');
+    } else {
+        print(&b, from);
+    }
+    print(&b, ", where the main agent may still be working. Do not change "
+              "files unless the user asks you to.");
+    return finish(&b);
+}
+
+// An id and the call it goes with, as raw JSON text, while copying.
+struct CopyRef {
+    Str id;
+    Str call;
+};
+
 // Copy a log, its replayed lines, for session to, cut after turn (all of
 // it if negative), with the session directory spelled olds[k] replaced
 // by news[k] in every line, and a title record at now. With win, each in
-// either separator too. An import's copy (imported) says so instead.
+// either separator too. An import's copy (COPY_IMPORT) says so instead,
+// and a side chat's (COPY_SIDE) is whole and closes its open turn.
 static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
                        Str to, Slice<Str> olds, Slice<Str> news, i64 turn,
-                       i64 now, b32 win, b32 imported = 0)
+                       i64 now, b32 win, i32 kind = COPY_FORK)
 {
+    b32 imported = kind == COPY_IMPORT;
+    b32 side     = kind == COPY_SIDE;
+    turn = side ? -1 : turn;
     LogCopy r = {};
     if (!lines.len || evparse(&scratch, lines[0]).ev!=EV_SESSION) {
         r.err = "the session's log does not begin with its session record";
@@ -930,13 +980,76 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
         return r;
     }
 
-    // What the cut leaves
-    b32 bypass   = 0;
-    Str planfile = {};
+    // What the cut leaves, with its open calls, asks and jobs by the raw
+    // text of their ids, which point into lines: each push follows the
+    // last use of that line's parse, as in logopen
+    b32            bypass   = 0;
+    Str            planfile = {};
+    Str            cwd      = {};  // raw, from the session record
+    Slice<Str>     tools    = {};  // started, not ended
+    Slice<Str>     ended    = {};  // since the last assistant record
+    Slice<CopyRef> asks     = {};  // not answered: {req, call}
+    Slice<CopyRef> jobs     = {};  // started, not ended: {job, call}
+    iz             asst     = -1;  // the last assistant record
     for (iz i = 0; i < end; i++) {
-        Arena t   = scratch;
-        EvRec rec = evparse(&t, lines[i]);
+        Arena t    = scratch;
+        EvRec rec  = evparse(&t, lines[i]);
+        Json *id   = jsonget(rec.root, "call");
+        Str   call = id->type==JSON_STRING ? id->raw : Str{};
+        Json *rq   = jsonget(rec.root, "req");
+        Str   req  = rq->type==JSON_STRING ? rq->raw : Str{};
         switch (rec.ev) {
+        case EV_SESSION: {
+            Json *dir = jsonget(rec.root, "cwd");
+            cwd = dir->type==JSON_STRING ? dir->raw : Str{};
+        } break;
+        case EV_ASSISTANT:
+            asst      = i;
+            ended.len = 0;
+            break;
+        case EV_TOOLSTART:
+            if (call.data) {
+                tools = push(&scratch, tools, call);
+            }
+            break;
+        case EV_TOOLEND:
+            logforget(&tools, call);
+            if (call.data) {
+                ended = push(&scratch, ended, call);
+            }
+            break;
+        case EV_ASK:
+            if (req.data && call.data) {
+                asks = push(&scratch, asks, CopyRef{req, call});
+            }
+            break;
+        case EV_ANSWER:
+            for (iz k = 0; k < asks.len; k++) {
+                if (asks[k].id == req) {
+                    asks[k] = asks[asks.len-1];
+                    asks.len--;
+                    break;
+                }
+            }
+            break;
+        case EV_JOBSTART: {
+            Json *n = jsonget(rec.root, "job");
+            if (n->type==JSON_NUMBER && call.data) {
+                jobs = push(&scratch, jobs, CopyRef{n->raw, call});
+            }
+        } break;
+        case EV_JOBEND: {
+            Str n = jsonget(rec.root, "job")->raw;
+            for (iz k = 0; k < jobs.len; k++) {
+                if (jobs[k].id == n) {
+                    for (iz m = k+1; m < jobs.len; m++) {
+                        jobs[m-1] = jobs[m];
+                    }
+                    jobs.len--;
+                    break;
+                }
+            }
+        } break;
         case EV_TURN:
             r.turn = jsonint(jsonget(rec.root, "n"), r.turn);
             r.open = 1;
@@ -953,13 +1066,38 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
             break;
         }
     }
+
+    // In a side chat's open turn, the calls of its last assistant record
+    // that never started
+    Slice<Json *> unstarted = {};
+    if (side && r.open && asst>=0) {
+        EvRec rec = evparse(&scratch, lines[asst]);
+        for (Json *k = jsonget(rec.root, "blocks")->child; k; k = k->next) {
+            Json *cid  = jsonget(k, "id");
+            Str   call = cid->type==JSON_STRING ? cid->raw : Str{};
+            if (jsonstr(jsonget(k, "t"))!="call" || !call.data) {
+                continue;
+            }
+            b32 seen = 0;
+            for (iz i = 0; i<tools.len && !seen; i++) {
+                seen = tools[i] == call;
+            }
+            for (iz i = 0; i<ended.len && !seen; i++) {
+                seen = ended[i] == call;
+            }
+            if (!seen) {
+                unstarted = push(&scratch, unstarted, k);
+            }
+        }
+    }
     if (end < lines.len) {
         EvRec rec = evparse(&scratch, lines[end]);
         if (rec.ev == EV_USER) {
             r.next = clone(a, jsonstr(jsonget(rec.root, "text")));
         }
     }
-    Str suffix = imported ? Str(" (imported)") : Str(" (fork)");
+    Str suffix = imported ? Str(" (imported)") :
+                 side     ? Str(" (side chat)") : Str(" (fork)");
     r.title = concat(a, title.len ? title : Str("Untitled"), suffix);
     r.turn  = turn<0 ? r.turn : turn;
 
@@ -1009,10 +1147,14 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
             } else {
                 putstrkey(&w.json, "forked_from", from);
                 putintkey(&w.json, "fork_turn", r.turn);
+                if (side) {
+                    putstrkey(&w.json, "side_of", from);
+                }
             }
             for (Json *m = rec.root->child; m; m = m->next) {
                 if (m->key=="sid" || m->key=="seq" || m->key=="ts" || m->key=="ev" ||
-                        m->key=="forked_from" || m->key=="fork_turn") {
+                        m->key=="forked_from" || m->key=="fork_turn" ||
+                        m->key=="side_of") {
                     continue;
                 }
                 putkey(&w.json, m->key);
@@ -1039,6 +1181,83 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
         }
         printreplaced(&out, line, o, n);
     }
+
+    // A side chat closes the turn it cut into
+    for (iz i = 0; side && r.open && i<tools.len; i++) {
+        Buf   b(&scratch, 256);
+        EvOut w = evbegin(&b, to, ++last, now, EV_TOOLEND);
+        putkey(&w.json, "call");
+        putraw(&w.json, tools[i]);
+        putstrkey(&w.json, "status", "cancelled");
+        putstrkey(&w.json, "text", "[still running in the main session when "
+                                   "this side chat began]");
+        printreplaced(&out, evend(&w), o, n);
+    }
+    for (iz i = 0; side && r.open && i<unstarted.len; i++) {
+        Json *k    = unstarted[i];
+        Str   call = jsonget(k, "id")->raw;
+        for (iz q = 0; q < asks.len; q++) {
+            if (!(asks[q].call == call)) {
+                continue;
+            }
+            Buf   b(&scratch, 256);
+            EvOut w = evbegin(&b, to, ++last, now, EV_ANSWER);
+            putkey(&w.json, "req");
+            putraw(&w.json, asks[q].id);
+            putstrkey(&w.json, "decision", "deny");
+            putstrkey(&w.json, "by", "cancel");
+            putstrkey(&w.json, "note", "asked in the main session when this "
+                                       "side chat began");
+            printreplaced(&out, evend(&w), o, n);
+        }
+        Str   args = jsonstr(jsonget(k, "args"));
+        Buf   b(&scratch, 256 + args.len + args.len/8 + cwd.len);
+        EvOut w = evbegin(&b, to, ++last, now, EV_TOOLSTART);
+        putkey(&w.json, "call");
+        putraw(&w.json, call);
+        putstrkey(&w.json, "name", jsonstr(jsonget(k, "name")));
+        putstrkey(&w.json, "args", args);
+        putkey(&w.json, "cwd");
+        if (cwd.data) {
+            putraw(&w.json, cwd);
+        } else {
+            putstr(&w.json, "");
+        }
+        printreplaced(&out, evend(&w), o, n);
+
+        b.len = 0;
+        w = evbegin(&b, to, ++last, now, EV_TOOLEND);
+        putkey(&w.json, "call");
+        putraw(&w.json, call);
+        putstrkey(&w.json, "status", "cancelled");
+        putstrkey(&w.json, "text", "[not yet run in the main session when "
+                                   "this side chat began]");
+        printreplaced(&out, evend(&w), o, n);
+    }
+    for (iz i = 0; !imported && i<jobs.len; i++) {
+        // It goes on in the original alone, with nothing to tell here
+        Buf   b(&scratch, 256);
+        EvOut w = evbegin(&b, to, ++last, now, EV_JOBEND);
+        putkey(&w.json, "job");
+        putraw(&w.json, jobs[i].id);
+        putkey(&w.json, "call");
+        putraw(&w.json, jobs[i].call);
+        putstrkey(&w.json, "status", "forked");
+        putstrkey(&w.json, "text", side ? Str("still running in the main session "
+                                              "when this side chat began")
+                                        : Str("still running in the original "
+                                              "session when this fork was made"));
+        putintkey(&w.json, "notice", 0);
+        printreplaced(&out, evend(&w), o, n);
+    }
+    if (side && r.open) {
+        Buf   b(&scratch, 128);
+        EvOut w = evbegin(&b, to, ++last, now, EV_TURNEND);
+        putintkey(&w.json, "turn", r.turn);
+        putstrkey(&w.json, "why", "side");
+        printreplaced(&out, evend(&w), o, n);
+        r.open = 0;
+    }
     if (bypass && !imported) {
         // Bypass was the user's pick for that session alone
         Buf   b(&scratch, 256 + planfile.len);
@@ -1047,6 +1266,15 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
         putstrkey(&w.json, "by", "fork");
         putstrkey(&w.json, "path", planfile);
         printreplaced(&out, evend(&w), o, n);
+    }
+    if (side) {
+        // What it is, durable, so that its first request has it
+        Str   text = sidenotice(&scratch, from, title);
+        Buf   b(&scratch, 256 + text.len + text.len/8);
+        EvOut w = evbegin(&b, to, ++last, now, EV_NOTICE);
+        putstrkey(&w.json, "kind", "side");
+        putstrkey(&w.json, "text", text);
+        print(&out, evend(&w));
     }
     {
         Buf   b(&scratch, 256 + r.title.len);
@@ -1247,7 +1475,7 @@ static LogImport logimport(Arena *a, Arena scratch, Str data, Str to, Str cwd,
         return r;
     }
 
-    LogCopy c = logcopy(a, scratch, kept, r.from, to, {}, {}, -1, now, 0, 1);
+    LogCopy c = logcopy(a, scratch, kept, r.from, to, {}, {}, -1, now, 0, COPY_IMPORT);
     if (c.err.len) {
         r.err = c.err;
         return r;

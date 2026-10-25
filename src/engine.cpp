@@ -283,11 +283,12 @@ enum : i32 {
     JOBEND_CLOSED,   // the session closed, or the engine stopped
     JOBEND_LIMIT,    // too much output
     JOBEND_LOST,     // the harness stopped while it ran (logopen)
+    JOBEND_FORKED,   // it ran on in the session this one is a fork of
     JOBEND_COUNT,
 };
 
 static Str jobendnames[] = {
-    "exited", "timeout", "killed", "closed", "limit", "unknown",
+    "exited", "timeout", "killed", "closed", "limit", "unknown", "forked",
 };
 static_assert(countof(jobendnames) == JOBEND_COUNT);
 
@@ -4089,6 +4090,9 @@ static Str jobnotice(Session *s, Arena *a, Job *j, i64 bytes)
         break;
     case JOBEND_LOST:
         print(&b, "the harness stopped while it ran, which stopped it too");
+        break;
+    case JOBEND_FORKED:
+        print(&b, "it ran on in the session this one was forked from");
         break;
     }
     if (j->ran) {  // unknown for a job lost in a crash
@@ -8435,6 +8439,7 @@ struct ListEntry {
     Str       cwd;
     Str       model;
     Str       parent;  // a subagent's, else empty
+    Str       sideof;  // a side chat's original, else empty
     Str       group;   // empty if in none
     Str       scratch; // its scratch directory, if any
     i64       mtime;
@@ -8482,6 +8487,7 @@ static SessScan scansessions(Engine *e, Arena *a)
         en.cwd      = jsonstr(jsonget(rec.root, "cwd"));
         en.model    = mod.len ? mod : jsonstr(jsonget(rec.root, "model"));
         en.parent   = jsonstr(jsonget(rec.root, "parent"));
+        en.sideof   = jsonstr(jsonget(rec.root, "side_of"));
         en.scratch  = jsonstr(jsonget(rec.root, "scratch"));
         en.group    = sidecarget(e, a, d->name, "group", GROUP_MAX);
         en.archived = sidecarget(e, a, d->name, "archived", 16).data != 0;
@@ -10021,6 +10027,9 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
         putstrkey(w, "parent", en->parent);
         putintkey(w, "depth", depth);
     }
+    if (en->sideof.len) {
+        putstrkey(w, "side_of", en->sideof);
+    }
     if (en->parked) {
         putintkey(w, "parked", 1);
     }
@@ -10541,22 +10550,31 @@ static b32 copytree(Os *os, Arena scratch, Str from, Str to, i32 depth)
 // (copytree), as its log, rewritten, says it works there. The reply names the fork
 // (sid) and its original (from), the turn, and next, the prompt that
 // began the turn after it, which a frontend may offer to send again.
+//
+// fork {sid, side:1}: a side chat (cap "side"), a fork of the whole log
+// made also while the original is at work, its turn closed in the copy
+// and its agent told what it is (logcopy, COPY_SIDE). It starts idle, its
+// mode Build, and its reply has side:1 and no next.
 static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Os   *os   = e->os;
     Str   sid  = jsonstr(jsonget(j, "sid"));
     Json *tj   = jsonget(j, "turn");
+    b32   side = jsonflag(jsonget(j, "side"), 0);
     b32   all  = tj->type==JSON_MISSING || tj->type==JSON_NULL;
     i64   turn = all ? -1 : jsonint(tj, -1);
     if (!validsid(sid)) {
         reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    } else if (side && !all) {
+        reply(e, scratch, id, 0, "a side chat takes the whole session, not a turn", sid);
         return;
     } else if (!all && (tj->type!=JSON_NUMBER || turn<0)) {
         reply(e, scratch, id, 0, "turn must be a turn's number, or 0 for none", sid);
         return;
     }
     Session *s = findsession(e, sid);
-    if (s && (busy(s) || s->intask)) {
+    if (!side && s && (busy(s) || s->intask)) {
         reply(e, scratch, id, 0, "busy: fork once the turn ends", sid);
         return;
     }
@@ -10587,13 +10605,13 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
         news = push(&scratch, news, concat(&scratch, cuttail(real, sid.len), to));
     }
     LogCopy c = logcopy(&lines, scratch, rp.lines, sid, to, olds, news, turn,
-                        os_time(os), HOST_WINDOWS);
+                        os_time(os), HOST_WINDOWS, side ? COPY_SIDE : COPY_FORK);
     if (c.err.len) {
         reply(e, scratch, id, 0, c.err, sid);
         return;
     }
     Str lock = join(&scratch, from, "lock");
-    if (all && c.open && os_lockheld(os, scratch, lock)) {
+    if (!side && all && c.open && os_lockheld(os, scratch, lock)) {
         reply(e, scratch, id, 0, "busy in another process: fork it at a turn "
               "that has ended", sid);
         return;
@@ -10656,7 +10674,9 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
         putintkey(&w.json, "ok", 1);
         putstrkey(&w.json, "from", sid);
         putintkey(&w.json, "turn", c.turn);
-        if (!pass && c.next.len) {
+        if (side) {
+            putintkey(&w.json, "side", 1);
+        } else if (!pass && c.next.len) {
             putstrkey(&w.json, "next", c.next);
         }
         Str line = evend(&w);

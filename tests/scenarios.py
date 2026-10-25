@@ -2226,7 +2226,7 @@ def hello_caps(t):
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
-                 "message", "bypass", "nofolder", "dir", "config.create"} <= set(caps)
+                 "message", "bypass", "nofolder", "dir", "config.create", "side"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -5878,6 +5878,162 @@ def fork_scratch(t):
         r = h.call("delete", sid=f2)
         t.check(r.get("ok") == 1, f"deleted: {r}")
         t.check(gone(t, scratch), "gone with the last fork")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+SIDE_RUNNING = "[still running in the main session when this side chat began]"
+SIDE_NOTICE = "This is a side chat with the user, forked from the session "
+
+
+def sidecheck(t, h, sid, side):
+    """A side chat's copy, of sid: its session record, the open turn
+    closed with the side wording, the notice and title at its end; it
+    loads with nothing to repair; its first request has it all, every
+    call answered; and it goes on, while sid is left alone. Returns its
+    records."""
+    recs = logged(t, side)
+    first = recs[0]
+    t.check(first.get("forked_from") == sid and first.get("side_of") == sid and
+            not first.get("parent"), f"its session record: {first}")
+    t.check([e["seq"] for e in recs] == list(range(1, len(recs) + 1)) and
+            all(e["sid"] == side for e in recs), "seq and sid")
+    closed = [e for e in recs if e["ev"] == "tool.end" and e.get("text") == SIDE_RUNNING]
+    t.check(len(closed) == 1 and closed[0]["status"] == "cancelled", f"closed: {closed}")
+    t.check([e["ev"] for e in recs[-3:]] == ["turn.end", "notice", "title"] and
+            recs[-3]["why"] == "side" and recs[-2]["kind"] == "side" and
+            recs[-2]["text"].startswith(SIDE_NOTICE) and sid in recs[-2]["text"] and
+            "Do not change files unless the user asks you to." in recs[-2]["text"] and
+            recs[-1]["text"].endswith(" (side chat)"), f"its end: {recs[-3:]}")
+    t.check(listentry(h, side).get("side_of") == sid, f"listed: {listentry(h, side)}")
+    t.check(not listentry(h, sid).get("side_of"), "the original is no side chat")
+
+    o = h.call("open", sid=side)
+    t.check(o.get("ok") == 1 and o.get("readonly") == 0, f"open: {o}")
+    later = logged(t, side)[len(recs):]
+    t.check(not [e for e in later if e["ev"] in ("tool.end", "turn.end", "job.end")],
+            f"nothing to repair: {later}")
+    t.check(not [e for e in h.all("turn", side) if e.get("seq", 0) > len(recs)],
+            "idle: no turn of its own")
+    h.send("prompt", sid=side, text="aside")
+    end = ended(h, side, 2)
+    t.check(end["why"] == "done", f"the side chat's turn: {end}")
+    req = next((r["body"] for r in t.requests()
+                if (fake_provider.last_user_text(r["body"]) or "").endswith("aside")), None)
+    t.check(req, "the side chat's request")
+    msgs = req["messages"]
+    tools = [m for m in msgs if m.get("role") == "tool"]
+    t.check(any(SIDE_RUNNING in str(m.get("content")) for m in tools),
+            "its request has the closed call")
+    t.check(any(m.get("role") == "user" and SIDE_NOTICE in str(m.get("content"))
+                for m in msgs), "its request has the notice")
+    ids = [c["id"] for m in msgs if m.get("role") == "assistant"
+           for c in m.get("tool_calls") or []]
+    t.check(ids and sorted(ids) == sorted(m.get("tool_call_id") for m in tools),
+            f"every call answered: {ids}")
+    return recs
+
+
+@scenario(bound=25)
+def side_chat(t):
+    """A side chat (fork {side:1}) of a session running a command: the
+    copy has the call closed, then the notice; the original's turn goes
+    on to its end unaffected; a plain fork is still refused meanwhile,
+    and a side chat takes no turn."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="work")
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        r = h.call("fork", sid=sid)
+        t.check(r.get("ok") == 0 and r.get("err", "").startswith("busy"), f"plain: {r}")
+        r = h.call("fork", sid=sid, side=1, turn=1)
+        t.check(r.get("ok") == 0 and "whole session" in r.get("err", ""), f"a turn: {r}")
+        r = h.call("fork", sid=sid, side=1)
+        side = r.get("sid")
+        t.check(r.get("ok") == 1 and r.get("side") == 1 and r.get("from") == sid and
+                side and side != sid and "next" not in r, f"side: {r}")
+        recs = sidecheck(t, h, sid, side)
+        t.check(not any(e["ev"] == "tool.end" and "worked" in e.get("text", "")
+                        for e in recs), "the command's own end is not in the copy")
+
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "done", f"the original's turn: {end}")
+        src = logged(t, sid)
+        te = [e for e in src if e["ev"] == "tool.end"]
+        t.check(len(te) == 1 and te[0]["status"] == "ok" and "worked" in te[0]["text"],
+                f"its command ran to its end: {te}")
+        t.check(not any(e["ev"] == "notice" for e in src) and "side_of" not in src[0],
+                "the original knows nothing of it")
+        t.check(h.all("assistant", sid)[-1]["blocks"][-1].get("text") == "Main done.",
+                "and answers")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=25)
+def side_task(t):
+    """A side chat of a session waiting on a subagent: its task call
+    closed in the copy; the subagent itself has none, and the original
+    goes on."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="work")
+        kid = h.wait(lambda e: e.get("ev") == "session" and e.get("parent") == sid)["sid"]
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == kid)
+        r = h.call("fork", sid=kid, side=1)
+        t.check(r.get("ok") == 0 and "subagent cannot be forked" in r.get("err", ""),
+                f"a subagent's: {r}")
+        r = h.call("fork", sid=sid, side=1)
+        t.check(r.get("ok") == 1 and r.get("side") == 1, f"side: {r}")
+        recs = sidecheck(t, h, sid, r["sid"])
+        task = [e for e in recs if e["ev"] == "tool.start" and e.get("name") == "task"]
+        closed = [e for e in recs if e["ev"] == "tool.end" and e.get("text") == SIDE_RUNNING]
+        t.check(task and closed and closed[0]["call"] == task[0]["call"],
+                f"the task call is the one closed: {task} {closed}")
+        listed = listentry(h, r["sid"])
+        t.check(not listed.get("parent"), f"no subagent: {listed}")
+
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "done", f"the original's turn: {end}")
+        te = h.all("tool.end", sid)
+        t.check(len(te) == 1 and te[0]["status"] == "ok" and "Slept." in te[0]["text"],
+                f"its subagent reported: {te}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def fork_job_quiet(t):
+    """A plain fork of an idle session whose job still runs: the copy
+    ends the job as forked, without a notice, and the fork's agent never
+    hears of it, while the original's job runs on."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ended(h, sid, 1)
+        r = h.call("fork", sid=sid)
+        t.check(r.get("ok") == 1 and "side" not in r, f"fork: {r}")
+        recs = logged(t, r["sid"])
+        je = [e for e in recs if e["ev"] == "job.end"]
+        t.check(len(je) == 1 and je[0]["status"] == "forked" and je[0]["notice"] == 0 and
+                not recs[0].get("side_of"), f"its job: {je}")
+        h.call("open", sid=r["sid"])
+        h.send("prompt", sid=r["sid"], text="next")
+        end = ended(h, r["sid"], 2)
+        t.check(end["why"] == "done", f"the fork's turn: {end}")
+        said = h.all("assistant", r["sid"])[-1]["blocks"][-1].get("text")
+        t.check(said == "Not told.", f"no notice of the job: {said}")
+        t.check(not [e for e in h.all("notice", r["sid"]) if e.get("kind") == "job"],
+                "no job notice")
+        t.check(not h.all("job.end", sid), "the original's job runs on")
+        h.call("job.kill", sid=sid, job=1)
+        h.wait(lambda e: e.get("ev") == "job.end" and e.get("sid") == sid)
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

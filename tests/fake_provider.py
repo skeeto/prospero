@@ -2177,7 +2177,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Think briefly", "Answer at length", "Write outside for good",
                "Start a desktop subagent", "Type on the desktop as a subagent",
                "Start a subagent that messages", "Message the parent as a subagent",
-               "Describe the images")
+               "Describe the images", "Ask on the side")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2368,6 +2368,12 @@ def sc_gui(model, n, req):
             yield from text(model, f"t{i}" + ("\n\n" if i % 40 == 39 else " "))
             yield S.sleep(0.01)
         yield from finish(model)
+    elif "Ask on the side" in prompt:
+        # A command that outlasts a side chat begun meanwhile
+        if step == 0:
+            yield from tool(model, n, "shell", {"command": "sleep 6"})
+        else:
+            yield from answer(model, "Done, while the side chat waited.")
     elif "Say hello" in prompt:
         yield from answer(model, "Hello!")
     elif "Answer at length" in prompt:
@@ -3795,6 +3801,54 @@ def sc_fork(model, n, req):
 
 
 sc_fork_scratch = sc_session_ops
+
+
+# Side chats (fork {side:1}): the original's turn, "work", runs long
+# enough for a side chat to begin meanwhile: a command (side_chat), or
+# a subagent's command (side_task); the side chat's own prompt, "aside",
+# is answered at once.
+
+def sc_side_chat(model, n, req):
+    u = last_user_text(req) or ""
+    if u.endswith("aside"):
+        yield from answer(model, "Aside.")
+    elif u == "work" and since_user(req) == 0:
+        yield from tool(model, n, "shell", {"command": "sleep 3; echo worked"})
+    else:
+        yield from answer(model, "Main done.")
+
+
+def sc_side_task(model, n, req):
+    u = last_user_text(req) or ""
+    if u.endswith("aside"):
+        yield from answer(model, "Aside.")
+    elif u == "work" and since_user(req) == 0:
+        yield from tool(model, n, "task", {"description": "Sleep",
+                                           "prompt": "Sleep a while.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, "Main done.")
+
+
+def sc_side_task_b(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "shell", {"command": "sleep 3"})
+    else:
+        yield from answer(model, "Slept.")
+
+
+def sc_fork_job_quiet(model, n, req):
+    # A job left running by the original's turn; the fork's prompt
+    # answered with whether its request tells of the job's end
+    u = last_user_text(req) or ""
+    if u == "go" and since_user(req) == 0:
+        yield from tool(model, n, "shell", {"command": "sleep 30", "background": True})
+    elif u.endswith("next"):
+        told = any("Background job" in str(m.get("content", ""))
+                   for m in req.get("messages", []))
+        yield from answer(model, "Told." if told else "Not told.")
+    else:
+        yield from answer(model, "Started.")
 
 
 def sc_import_roundtrip(model, n, req):
