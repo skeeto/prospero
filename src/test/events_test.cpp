@@ -434,12 +434,12 @@ static void test_events(Test *t)
                "\"steer\",\"cancel\",\"answer\",\"config.get\",\"config.set\",\"quit\","
                "\"rewind\",\"job.kill\",\"status\",\"stop\",\"file\",\"rename\",\"delete\","
                "\"archive\",\"group\",\"fork\",\"compact\",\"model\",\"draft\",\"upload\","
-               "\"import\",\"skills\",\"mode\",\"unqueue\",\"dir\"],"
+               "\"import\",\"skills\",\"mode\",\"unqueue\",\"dir\",\"background\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
                "\"delete\",\"fork\",\"config.delete\",\"import\","
-               "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\",\"nofolder\",\"dir\",\"config.create\",\"side\"]}");
+               "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\",\"nofolder\",\"dir\",\"config.create\",\"side\",\"background\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);

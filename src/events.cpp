@@ -146,6 +146,7 @@ enum : i32 {
     CMD_MODE,    // plan mode, Bypass mode, or neither
     CMD_UNQUEUE, // withdraw a queued message not yet taken in
     CMD_DIR,     // a directory's entries, for completing a path typed
+    CMD_BACKGROUND,  // the running command or subagents, to the background
     CMD_COUNT,
 };
 
@@ -155,7 +156,7 @@ static Str cmdnames[] = {
     "job.kill", "status", "stop", "file", "rename", "delete", "archive",
     "group", "fork", "compact", "model", "draft", "upload", "import",
     "skills", "mode",
-    "unqueue", "dir",
+    "unqueue", "dir", "background",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -200,6 +201,9 @@ static Str capnames[] = {
     "config.create",   // config.set {create}: the user's file, made if missing
     "side",            // fork {side:1}, a side chat also of a busy session,
                        // and side_of in its session record and list
+    "background",      // background: the user moves a running command to a
+                       // job, or subagents on, their reports as notices
+                       // of kind task (turn via "task")
 };
 
 static Str evname(i32 ev)

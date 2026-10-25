@@ -2225,6 +2225,8 @@ struct ShellEnd {
     b32  cancelled;
     i64  timeout;   // seconds
     i64  job;       // moved to the background as this job, or 0
+    b32  moved;     // and moved there by the user, not at its timeout
+    i64  elapsed;   // seconds it had run then
     b32  nojob;     // timed out, but too many jobs ran to move it
 };
 
@@ -2262,9 +2264,15 @@ static ToolOut shellresult(Os *os, Arena *a, Str spill, ShellEnd *e)
     if (e->cancelled) {
         print(&b, "[cancelled by the user: the command was killed]");
     } else if (e->job) {
-        print(&b, "[still running after ");
-        printduration(&b, e->timeout);
-        print(&b, ", so it continues in the background as job ");
+        if (e->moved) {
+            print(&b, "[the user moved it to the background after ");
+            printduration(&b, e->elapsed);
+            print(&b, ", so it continues as job ");
+        } else {
+            print(&b, "[still running after ");
+            printduration(&b, e->timeout);
+            print(&b, ", so it continues in the background as job ");
+        }
         print(&b, e->job);
         print(&b, ". You will be told when it ends: do not poll it or wait "
                   "for it. Use job_output to read more of its output, and "

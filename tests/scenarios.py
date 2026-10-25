@@ -1276,6 +1276,230 @@ def resume_cap(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+def waitpids(t, rel, n=1, within=5):
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline and len(t.pids(rel)) < n:
+        time.sleep(0.05)
+    return t.pids(rel)
+
+
+@scenario(bound=20)
+def bg_shell(t):
+    """The user moves a running command to the background: its call ends
+    at once, as a job, and the agent reads that in its next request, with
+    a steer sent while the command ran (which a steer sent after the move
+    may miss, that request being under way); the job's end comes as its
+    notice."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = h.call("background", sid=sid)
+        t.check(r.get("ok") == 0 and
+                r.get("err") == "nothing running that can go to the background",
+                f"idle: {r}")
+        h.send("prompt", sid=sid, text="go")
+        start = h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        pids = waitpids(t, "bgpid")
+        t.check(pids, "the command started")
+        r = h.call("background", sid=sid, call="nope")
+        t.check(r.get("ok") == 0 and "not the one running" in r.get("err", ""),
+                f"another call: {r}")
+        h.call("steer", sid=sid, text="steer-after-bg")
+        time.sleep(1)
+        r = h.call("background", sid=sid, call=start["call"])
+        t.check(r.get("ok") == 1, f"moved: {r}")
+        end = h.wait(lambda e: e.get("ev") == "tool.end" and e.get("sid") == sid)
+        t.check(end["status"] == "background" and end.get("job") == 1 and
+                "started" in end["text"] and end["ms"] < 3000, f"the call ended: {end}")
+        t.check(re.search(r"\[the user moved it to the background after [12] seconds?, so "
+                          r"it continues as job 1\. You will be told when it ends: do not "
+                          r"poll it or wait for it\.", end["text"]), f"its text: {end['text']!r}")
+        js = h.all("job.start", sid)
+        t.check(js and js[0]["call"] == start["call"], f"job.start {js}")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        msgs = t.requests()[1]["body"]["messages"]
+        tool = [m for m in msgs if m["role"] == "tool"]
+        t.check(tool and "the user moved it to the background" in tool[-1]["content"],
+                f"the agent read the result: {tool}")
+        t.check(msgs[-1]["role"] == "user" and msgs[-1]["content"] == "steer-after-bg",
+                f"and the steer, in the same request: {msgs[-1]}")
+        je = h.wait(lambda e: e.get("ev") == "job.end" and e.get("sid") == sid)
+        t.check(je["status"] == "exited" and je.get("exit") == 0 and je.get("resume") == 1,
+                f"job.end {je}")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and
+               e.get("turn") == 2)
+        n = h.all("notice", sid)
+        t.check(n and n[-1]["kind"] == "job" and "finished" in n[-1]["text"], f"notice {n}")
+        turns = h.all("turn", sid)
+        t.check(turns[-1].get("via") == "job", f"turns {turns}")
+        last = t.requests()[-1]["body"]["messages"]
+        t.check(last[-1]["content"].startswith("Background job 1 ended: it exited with code 0"),
+                f"told: {last[-1]}")
+        t.check(t.gone(pids), "the job's process is gone")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def bg_full(t):
+    """With 16 jobs running, a command cannot be moved to the background."""
+    h = t.headless()
+    pids = []
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        pids = waitpids(t, "full.pids", 17, within=10)
+        t.check(len(pids) == 17, f"16 jobs and a command: {pids}")
+        r = h.call("background", sid=sid)
+        t.check(r.get("ok") == 0 and r.get("err") == "16 jobs are already running: stop "
+                "one first", f"refused: {r}")
+        h.call("cancel", sid=sid)
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "cancel", f"cancelled: {end}")
+        t.check(len(h.all("job.start", sid)) == 16, "no 17th job")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    t.check(t.gone(pids), f"all gone: {pids}")
+
+
+def bgtask(t, h, sid):
+    """Start the task, move it to the background mid-turn, and check the
+    parent's call: the subagent's session."""
+    h.send("prompt", sid=sid, text="go")
+    kid = h.wait(lambda e: e.get("ev") == "session" and e.get("parent") == sid)["sid"]
+    h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == kid)
+    r = h.call("background", sid=sid, call="nope")
+    t.check(r.get("ok") == 0, f"no such call: {r}")
+    r = h.call("background", sid=sid)
+    t.check(r.get("ok") == 1, f"moved: {r}")
+    end = h.wait(lambda e: e.get("ev") == "tool.end" and e.get("sid") == sid)
+    t.check(end["status"] == "background" and end.get("child") == kid and
+            end["text"] == f"The user moved this subagent to the background. It continues "
+                           f"in session {kid}, and its report comes to you as a notice "
+                           f"when it finishes: do not wait for it or poll it.",
+            f"the call: {end}")
+    return kid
+
+
+def bgheard(t, h, sid, kid, turn):
+    """The subagent's report, as a notice, began the parent's turn."""
+    t.put("go.flag", "")
+    kend = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == kid)
+    t.check(kend["why"] == "done", f"the subagent finished: {kend}")
+    pend = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and
+                  e.get("turn") == turn)
+    t.check(pend["why"] == "done", f"the parent's turn {pend}")
+    tn = h.all("turn", sid)[-1]
+    t.check(tn.get("via") == "task", f"via task: {tn}")
+    n = [e for e in h.all("notice", sid) if e.get("kind") == "task"]
+    t.check(len(n) == 1 and n[0].get("child") == kid and
+            n[0].get("child_title") == "Slow child" and
+            n[0]["text"] == f"The subagent \"Slow child\" (session {kid}), which the user "
+                            f"moved to the background, finished. Its report:\n\n"
+                            f"Child report: flagged", f"notice {n}")
+    last = t.requests()[-1]["body"]["messages"]
+    t.check(last[-1]["role"] == "user" and "Child report: flagged" in last[-1]["content"],
+            f"the agent read it: {last[-1]}")
+
+
+@scenario(bound=25)
+def bg_task(t):
+    """A subagent moved to the background mid-turn: the parent's call
+    ends at once and its turn goes on and ends; the subagent's report
+    comes later as a notice, which starts a turn of the parent's."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        kid = bgtask(t, h, sid)
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"the parent's turn ended: {end}")
+        msgs = t.requests()[1]["body"]["messages"]
+        t.check(msgs[-1]["role"] == "tool" and
+                msgs[-1]["content"].startswith("The user moved this subagent"),
+                f"the parent read it: {msgs[-1]}")
+        t.check(not h.all("turn.end", kid), "the subagent is still at work")
+        note = [e for e in h.all("note", kid) if "background" in e.get("text", "")]
+        t.check(note, "the subagent's transcript says so")
+        bgheard(t, h, sid, kid, 2)
+        r = h.call("background", sid=sid)
+        t.check(r.get("ok") == 0, f"nothing left: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=25)
+def bg_task_park(t):
+    """The parent parks while its subagent works in the background: the
+    report revives it from its log."""
+    h = t.headless(env=PARK)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        kid = bgtask(t, h, sid)
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+
+        def entry():
+            h.call("list")
+            return [e for e in h.all("sessions")[-1]["list"] if e["sid"] == sid][0]
+
+        deadline = time.monotonic() + 5
+        while not entry().get("parked") and time.monotonic() < deadline:
+            time.sleep(0.2)
+        t.check(entry().get("parked") == 1, "the parent parked")
+        bgheard(t, h, sid, kid, 2)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=25)
+def bg_task_closed(t):
+    """The parent is closed and forgotten while its subagent works in the
+    background: the report opens it again from its log."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        kid = bgtask(t, h, sid)
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        h.call("close", sid=sid, forget=1)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            h.call("status")
+            if h.all("reply")[-1].get("open") == 1:  # the subagent alone
+                break
+            time.sleep(0.1)
+        t.check(h.all("reply")[-1].get("open") == 1, "the parent left memory")
+        bgheard(t, h, sid, kid, 2)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=25)
+def bg_task_cancel(t):
+    """Cancelling the parent's turn leaves its subagent in the background
+    at work, whose report starts the parent's next turn."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        kid = bgtask(t, h, sid)
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid and
+               e.get("name") == "shell")
+        pids = waitpids(t, "parent.pid")
+        h.call("cancel", sid=sid)
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "cancel", f"the parent cancelled: {end}")
+        t.check(t.gone(pids), "its command is gone")
+        time.sleep(0.3)
+        t.check(not h.all("turn.end", kid), "the subagent goes on")
+        bgheard(t, h, sid, kid, 2)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=15)
 def rewind_reopen(t):
     """Snapshots survive the process: a session opened again rewinds what
@@ -2218,7 +2442,8 @@ def hello_caps(t):
         cmds = hello.get("cmds", [])
         want = ["hello", "list", "new", "open", "close", "prompt", "steer", "cancel",
                 "answer", "config.get", "config.set", "quit", "rewind", "job.kill",
-                "status", "stop", "file"] + m8 + ["skills", "mode", "unqueue", "dir"]
+                "status", "stop", "file"] + m8 + ["skills", "mode", "unqueue", "dir",
+                                                   "background"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -2226,7 +2451,7 @@ def hello_caps(t):
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
-                 "message", "bypass", "nofolder", "dir", "config.create", "side"} <= set(caps)
+                 "message", "bypass", "nofolder", "dir", "config.create", "side", "background"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 

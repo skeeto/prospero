@@ -685,6 +685,13 @@ static void test_tools(Test *t)
                "continues in the background as job 3. You will be told when it ends: "
                "do not poll it or wait for it. Use job_output to read more of its "
                "output, and job_kill to stop it]");
+        e.moved   = 1;
+        e.elapsed = 7;
+        o = shellresult(os, a, "/s/none.log", &e);
+        expect(t, "moved by the user", o.text, "[the user moved it to the background "
+               "after 7 seconds, so it continues as job 3. You will be told when it "
+               "ends: do not poll it or wait for it. Use job_output to read more of "
+               "its output, and job_kill to stop it]");
         e = {};
         e.timedout = 1;
         e.nojob    = 1;

@@ -257,16 +257,17 @@ static i32 modefind(Str name)
 
 // Something for the agent to read before its next request: a job that
 // ended, files rewound, instructions for a directory, skills changed,
-// the mode, a message from another session.
+// the mode, a message from another session, the report of a subagent
+// in the background.
 struct Notice {
     Str kind;    // "job", "rewind", "instructions", "skills", "budget",
-                 // "mode", "message"
+                 // "mode", "message", "task"
     Str text;
     i64 job;     // for "job"
     i32 mode;    // for "mode": MODE_*, the one it tells
     b32 skills;  // its record lists the skills the agent knows now
-    Str from;    // for "message": the sender's sid and title
-    Str ftitle;
+    Str from;    // for "message": the sender's sid and title; for
+    Str ftitle;  // "task": the subagent's
     i32 hop;     // and its hop count (see "Messages")
 };
 
@@ -633,6 +634,9 @@ struct Session {
     Str          pcall;      // and the call that started it
     Session     *parent;     // the parent, while both are in memory
     b32          intask;     // the parent waits for this one's report
+    b32          bgtask;     // or no longer: the user moved it to the
+                             // background, and the report goes to psid
+                             // as a notice (bgreport)
     i64          treqs;      // requests made for the task
     Slice<TaskRun> tasks;    // the subagents of the calls running
     b32          parkme;     // idle long enough: park it (enginethread)
@@ -1186,6 +1190,10 @@ static void deliver(Session *s, Arena scratch)
             putintkey(&w.json, "hop", n->hop);
             s->hop = n->hop>s->hop ? n->hop : s->hop;
         }
+        if (n->kind == "task") {
+            putstrkey(&w.json, "child", n->from);
+            putstrkey(&w.json, "child_title", n->ftitle);
+        }
         if (n->kind == "mode") {
             putstrkey(&w.json, "mode", modenames[n->mode]);
         }
@@ -1647,6 +1655,7 @@ static void starttasks(Session *, Arena);
 static void taskcancel(Session *, Arena);
 static void taskcheck(Session *, Arena, Str why, Str err);
 static b32  taskbudget(Session *, Arena);
+static b32  taskwake(Session *);
 static i64  parkafter(Engine *);
 static b32  deskrun(Session *, Arena, DeskArgs *);
 static Str  deskdenial(Arena *, i32 by, Str note, i64 wait);
@@ -4350,11 +4359,13 @@ static void jobadopt(Session *s, Job *j)
     }
 }
 
-// A foreground command still running at its timeout becomes a job.
-static void movetojob(Session *s, Arena scratch)
+// A foreground command still running at its timeout becomes a job, as
+// does one the user moved to the background (background).
+static void movetojob(Session *s, Arena scratch, b32 user)
 {
     Engine *e = s->e;
     Block  *c = &s->calls[s->callidx];
+    i64     t = os_ticks(e->os) - s->sh.start;
     disarm(s, T_TOOL);
     disarm(s, T_KILL);
     disarm(s, T_DRAIN);
@@ -4368,6 +4379,8 @@ static void movetojob(Session *s, Arena scratch)
     ShellEnd end = {};
     end.job     = j->n;
     end.timeout = s->sh.timeout;
+    end.moved   = user;
+    end.elapsed = (t + SEC/2) / SEC;
     ToolOut o  = shellresult(e->os, &scratch, s->sh.spill, &end);
     Stat    st = os_stat(e->os, scratch, s->sh.spill);
     toolend(s, scratch, "background", o.text, 0, 0, s->sh.rel, st.size, j->n);
@@ -6743,8 +6756,9 @@ static void settitle(Session *s, Arena scratch, Str title, Str by)
 
 // Begin a turn, after its user input if any: via names what began it
 // without input ("job": notices of background jobs; "message": a message
-// from another session, at hop; "compact": the user asked for a
-// compaction, the turn's only work), else is null.
+// from another session, at hop; "task": the report of a subagent in the
+// background; "compact": the user asked for a compaction, the turn's
+// only work), else is null.
 static void beginturn(Session *s, Arena scratch, Str via)
 {
     s->cancelled = 0;
@@ -6834,8 +6848,9 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     // after the user cancelled
     b32 input  = s->steers.len || s->queued.len;
     i32 mhop   = !input && why!="cancel" ? msgwake(s) : 0;
-    b32 resume = mhop || (!input && !s->closed && s->wake && s->notices.len &&
-                          canresume(s));
+    b32 twake  = !input && why!="cancel" && taskwake(s);
+    b32 resume = mhop || twake ||
+                 (!input && !s->closed && s->wake && s->notices.len && canresume(s));
     {
         Arena a = scratch;
         Buf   b(&a, 256 + err.len);
@@ -6875,6 +6890,8 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     } else if (mhop) {
         s->hop = mhop;
         beginturn(s, scratch, "message");
+    } else if (twake) {
+        beginturn(s, scratch, "task");  // a subagent in the background
     } else if (s->closed) {
         stopjobs(s, scratch, 0);  // started after the session closed
     } else if (resume) {
@@ -8050,12 +8067,79 @@ static Str lastreport(Session *s, Arena *a)
     return {};
 }
 
+// A subagent's report as its parent reads it, and the status of the
+// call it ends. why and err are as its last turn ended.
+static Str reporttext(Session *c, Arena *a, Str why, Str err, Str *status)
+{
+    Str report = lastreport(c, a);
+    Buf b(a, 512 + report.len + err.len);
+    *status = "ok";
+    if (why == "done") {
+        print(&b, report.len ? report : Str("The subagent ended its turn "
+                                            "without a report."));
+    } else if (why == "cancel") {
+        *status = "cancelled";
+        print(&b, "The subagent was cancelled before it finished.");
+    } else if (why == "budget") {
+        *status = "error";
+        print(&b, "The subagent was stopped before it finished, at the end "
+                  "of its budget of ");
+        print(&b, c->treqs - 1);
+        print(&b, " model requests.");
+    } else {
+        *status = "error";
+        print(&b, "The subagent stopped before it finished, on an error: ");
+        print(&b, err.len ? err : why);
+    }
+    if (why!="done" && report.len) {
+        print(&b, " What it said last:\n\n");
+        print(&b, report);
+    }
+    return finish(&b);
+}
+
+// A report over TASK_REPORT: all of it in a file of the parent's named
+// for the call, which the agent may read, and the start inline.
+static Str reportcut(Session *p, Arena *a, Str call, Str text, Str *spill, i64 *bytes)
+{
+    if (text.len <= TASK_REPORT) {
+        return text;
+    }
+    Engine *e    = p->e;
+    Str     rel  = {};
+    Str     path = spillfile(p, *a, call, &rel);
+    Str     head = utf8head(text, TASK_REPORT);
+    Buf     in(a, head.len + 256 + path.len);
+    print(&in, head);
+    if (os_write(e->os, *a, path, text)) {
+        *spill = rel;
+        *bytes = text.len;
+        print(&in, "\n\n[The report goes on: it was cut here at 50 KiB. "
+                   "All of it is in ");
+        print(&in, path);
+        print(&in, ", where this part ends at line ");
+        print(&in, countlines(head));
+        print(&in, ".]");
+    } else {
+        print(&in, "\n\n[The report goes on, but it was cut here at "
+                   "50 KiB.]");
+    }
+    return finish(&in);
+}
+
+static void bgreport(Session *, Arena, Str why, Str err);
+
 // A subagent is done with its task: its report goes to the parent's
-// call, which ends once the calls before it have (taskflush). why and
-// err are as its last turn ended.
+// call, which ends once the calls before it have (taskflush), or as a
+// notice if the user moved it to the background. why and err are as
+// its last turn ended.
 static void taskreport(Session *c, Arena scratch, Str why, Str err)
 {
     c->intask = 0;
+    if (c->bgtask) {
+        bgreport(c, scratch, why, err);
+        return;
+    }
     Session *p = c->parent;
     TaskRun *t = 0;
     for (iz i = 0; p && i<p->tasks.len; i++) {
@@ -8065,55 +8149,8 @@ static void taskreport(Session *c, Arena scratch, Str why, Str err)
         return;  // its parent stopped waiting (cancelled, or quit)
     }
 
-    Str report = lastreport(c, &scratch);
-    Buf b(&scratch, 512 + report.len + err.len);
-    t->status = "ok";
-    if (why == "done") {
-        print(&b, report.len ? report : Str("The subagent ended its turn "
-                                            "without a report."));
-    } else if (why == "cancel") {
-        t->status = "cancelled";
-        print(&b, "The subagent was cancelled before it finished.");
-    } else if (why == "budget") {
-        t->status = "error";
-        print(&b, "The subagent was stopped before it finished, at the end "
-                  "of its budget of ");
-        print(&b, c->treqs - 1);
-        print(&b, " model requests.");
-    } else {
-        t->status = "error";
-        print(&b, "The subagent stopped before it finished, on an error: ");
-        print(&b, err.len ? err : why);
-    }
-    if (why!="done" && report.len) {
-        print(&b, " What it said last:\n\n");
-        print(&b, report);
-    }
-    Str text = finish(&b);
-
-    if (text.len > TASK_REPORT) {
-        // All of it in a file the agent may read, and the start inline
-        Engine *e    = p->e;
-        Str     rel  = {};
-        Str     path = spillfile(p, scratch, p->calls[t->call].id, &rel);
-        Str     head = utf8head(text, TASK_REPORT);
-        Buf     in(&scratch, head.len + 256 + path.len);
-        print(&in, head);
-        if (os_write(e->os, scratch, path, text)) {
-            t->spill = rel;
-            t->bytes = text.len;
-            print(&in, "\n\n[The report goes on: it was cut here at 50 KiB. "
-                       "All of it is in ");
-            print(&in, path);
-            print(&in, ", where this part ends at line ");
-            print(&in, countlines(head));
-            print(&in, ".]");
-        } else {
-            print(&in, "\n\n[The report goes on, but it was cut here at "
-                       "50 KiB.]");
-        }
-        text = finish(&in);
-    }
+    Str text = reporttext(c, &scratch, why, err, &t->status);
+    text = reportcut(p, &scratch, p->calls[t->call].id, text, &t->spill, &t->bytes);
     t->text = clone(&p->perm, text);
     t->done = 1;
     arm(p, T_TASK, 0);
@@ -8179,6 +8216,145 @@ static void taskcancel(Session *s, Arena scratch)
             taskreport(c, a, "cancel", {});
         }
     }
+}
+
+
+// Run in background
+//
+// The user, never the agent, may move what a turn waits for out of its
+// way (background): the running command becomes a job, as at its
+// timeout, and subagents at work go on by themselves, their calls ended
+// at once. A subagent moved so (bgtask) reports to its parent, by sid,
+// as a notice of kind "task", which starts the parent's turn if it is
+// idle, from its log if parked or no longer open, as a message would.
+// Cancelling the parent leaves it be, as it does jobs. Quitting stops
+// it like any turn, and its parent is not told.
+
+static Session *revive(Engine *, Arena, Str sid, Str model, Str which, i64 *firstnew);
+static Session *loadsession(Engine *, Arena, Str sid, Str model, Str which,
+                            i64 *firstnew, iz held);
+static void forget(Engine *, Session *);
+
+// A subagent in the background is done: tell its parent.
+static void bgreport(Session *c, Arena scratch, Str why, Str err)
+{
+    Engine *e = c->e;
+    c->bgtask = 0;
+    if (e->quitting) {
+        return;
+    }
+    i64      first = 0;
+    b32      fresh = 0;
+    Session *p     = findsession(e, c->psid);
+    p = p ? p : revive(e, scratch, c->psid, {}, {}, &first);
+    if (!p) {
+        p     = loadsession(e, scratch, c->psid, {}, {}, &first, -1);
+        fresh = p != 0;
+    }
+    if (!p || p->readonly) {
+        if (fresh) {
+            forget(e, p);
+        }
+        note(c, scratch, "warn", "the parent session could not be opened "
+             "here, so it was not given this report");
+        return;
+    } else if (fresh) {
+        p->closed = 1;  // as it was: no frontend has it open
+    }
+
+    Str status = {};
+    Str spill  = {};
+    i64 bytes  = 0;
+    Str text   = reporttext(c, &scratch, why, err, &status);
+    text = reportcut(p, &scratch, c->pcall, text, &spill, &bytes);
+    Buf b(&scratch, 512 + c->title.len + text.len);
+    print(&b, "The subagent ");
+    if (c->title.len) {
+        print(&b, "\"");
+        print(&b, c->title);
+        print(&b, "\" ");
+    }
+    print(&b, "(session ");
+    print(&b, c->sid);
+    print(&b, "), which the user moved to the background, ");
+    print(&b, status=="ok" ? Str("finished. Its report:\n\n")
+                           : Str("ended before it finished:\n\n"));
+    print(&b, text);
+
+    Notice n = {};
+    n.kind   = "task";
+    n.text   = clone(&p->perm, finish(&b));
+    n.from   = clone(&p->perm, c->sid);
+    n.ftitle = clone(&p->perm, c->title);
+    p->notices = push(&p->perm, p->notices, n);
+    if (!busy(p)) {
+        beginturn(p, scratch, "task");
+    }  // else read at its next step, or its turn's end starts one
+}
+
+// Whether a subagent's report waits that may start a turn.
+static b32 taskwake(Session *s)
+{
+    for (iz i = 0; i < s->notices.len; i++) {
+        if (s->notices[i].kind == "task") {
+            return !s->readonly && !s->e->quitting;
+        }
+    }
+    return 0;
+}
+
+// Move the running command, or the subagents at work (only call's if
+// given), to the background. Null if moved, else why not.
+static Str movebg(Session *s, Arena *a, Str call)
+{
+    Engine *e = s->e;
+    if (s->state == S_TOOL) {
+        Block *c = &s->calls[s->callidx];
+        if (s->desk.busy || !s->proc || s->sh.tool!=TOOL_SHELL) {
+            return "the running call is not a command";
+        } else if (call.len && call!=c->id) {
+            return "that call is not the one running";
+        } else if (s->cancelled || s->sh.exited || s->sh.timedout || s->sh.limited) {
+            return "the command is ending already";
+        } else if (jobsrunning(s) >= JOB_RUNNING) {
+            Buf b(a, 64);
+            print(&b, (i64)JOB_RUNNING);
+            print(&b, " jobs are already running: stop one first");
+            return finish(&b);
+        }
+        movetojob(s, *a, 1);
+        nexttool(s, *a);
+        return {};
+    }
+
+    b32 moved = 0;
+    for (iz i = 0; s->state==S_TASK && i<s->tasks.len; i++) {
+        TaskRun *t = &s->tasks[i];
+        Session *c = t->done ? 0 : findsession(e, t->child);
+        if (!c || (call.len && call!=s->calls[t->call].id)) {
+            continue;
+        }
+        Buf b(a, 512);
+        print(&b, "The user moved this subagent to the background. It "
+                  "continues in session ");
+        print(&b, c->sid);
+        print(&b, ", and its report comes to you as a notice when it "
+                  "finishes: do not wait for it or poll it.");
+        c->bgtask = 1;
+        t->status = "background";
+        t->text   = clone(&s->perm, finish(&b));
+        t->done   = 1;
+        moved     = 1;
+        note(c, *a, "info", "moved to the background by the user: the "
+             "parent went on, and is given the report as a notice");
+    }
+    if (!moved) {
+        return call.len ? Str("no such call running that can go to the background")
+                        : Str("nothing running that can go to the background");
+    }
+    arm(s, T_TASK, 0);  // taskflush ends the calls
+    live(s);
+    return {};
 }
 
 // Count a subagent's request against its budget: a notice to wrap up at
@@ -11367,6 +11543,13 @@ static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
     replyconfig(e, scratch, id, cmd, &r);
 }
 
+// The user moves what the session's turn waits for to the background.
+static void cmdbackground(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
+{
+    Str why = movebg(s, &scratch, jsonstr(jsonget(j, "call")));
+    reply(e, scratch, id, !why.data, why, s->sid);
+}
+
 static b32 allidle(Engine *e)
 {
     for (Session *s = e->sessions; s; s = s->next) {
@@ -11408,6 +11591,7 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_UPLOAD:
         case CMD_IMPORT:
         case CMD_MODE:
+        case CMD_BACKGROUND:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -11631,6 +11815,9 @@ static void command(Engine *e, Arena scratch, Str line)
         reply(e, scratch, id, 1, {}, sid);
         cancelturn(s, scratch);
         return;
+    case CMD_BACKGROUND:
+        cmdbackground(e, s, scratch, id, j);
+        return;
     case CMD_ANSWER: {
         Str req      = jsonstr(jsonget(j, "req"));
         Str decision = jsonstr(jsonget(j, "decision"));
@@ -11799,7 +11986,7 @@ static void ontimer(Session *s, Arena scratch, i32 t)
         } else if (s->sh.exited) {
             return;  // done, and draining its output already
         } else if (jobsrunning(s) < JOB_RUNNING) {
-            movetojob(s, scratch);
+            movetojob(s, scratch, 0);
             nexttool(s, scratch);
             return;
         }

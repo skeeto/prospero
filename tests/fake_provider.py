@@ -4053,6 +4053,77 @@ def sc_nofolder(model, n, req):
         yield from answer(model, "Nothing to do.")
 
 
+# Run in background: the user moves the running command, or a subagent
+# at work, to the background (background), and the agent goes on
+
+def sc_bg_shell(model, n, req):
+    k = step(req)
+    if k == 0:
+        cmd = "echo $$ > bgpid; echo started; sleep 4; echo finished"
+        yield from tool(model, n, "shell", {"command": cmd, "timeout": 60})
+    elif k == 1:
+        yield from answer(model, "Going on.")
+    else:
+        yield from answer(model, "Saw: " + last_user(req)[:60])
+
+
+def sc_bg_full(model, n, req):
+    # Sixteen jobs, then a command that cannot join them
+    k = step(req)
+    if k == 0:
+        yield from calls(model, n, [("shell", {"command": "echo $$ >> full.pids; sleep 30",
+                                               "background": True})] * 16)
+    elif k == 1:
+        yield from tool(model, n, "shell", {"command": "echo $$ >> full.pids; sleep 30",
+                                            "timeout": 60})
+    else:
+        yield from answer(model, "Not reached.")
+
+
+def sc_bg_task(model, n, req):
+    k = step(req)
+    if k == 0:
+        yield from tool(model, n, "task", {"description": "Slow child",
+                                           "prompt": "Wait for the flag.",
+                                           "model": second(model)})
+    elif k == 1:
+        yield from answer(model, "Parent goes on.")
+    else:
+        yield from answer(model, "Heard: " + last_user(req)[:200])
+
+
+def sc_bg_task_b(model, n, req):
+    # At work until the test puts go.flag
+    if step(req) == 0:
+        cmd = "while [ ! -e go.flag ]; do sleep 0.1; done; echo flagged"
+        yield from tool(model, n, "shell", {"command": cmd, "timeout": 60})
+    else:
+        yield from answer(model, "Child report: " + tool_results(req)[0].splitlines()[0])
+
+
+sc_bg_task_park = sc_bg_task
+sc_bg_task_park_b = sc_bg_task_b
+sc_bg_task_closed = sc_bg_task
+sc_bg_task_closed_b = sc_bg_task_b
+
+
+def sc_bg_task_cancel(model, n, req):
+    # The parent goes on to a command of its own, which the user cancels
+    k = step(req)
+    if k == 0:
+        yield from tool(model, n, "task", {"description": "Slow child",
+                                           "prompt": "Wait for the flag.",
+                                           "model": second(model)})
+    elif k == 1:
+        yield from tool(model, n, "shell", {"command": "echo $$ > parent.pid; sleep 30",
+                                            "timeout": 60})
+    else:
+        yield from answer(model, "Heard: " + last_user(req)[:200])
+
+
+sc_bg_task_cancel_b = sc_bg_task_b
+
+
 SCENARIOS = {name[3:]: fn for name, fn in globals().items()
              if name.startswith("sc_")}
 
