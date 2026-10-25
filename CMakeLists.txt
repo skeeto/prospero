@@ -112,9 +112,12 @@ if(WIN32 AND PROSPERO_GUI)
   target_link_options(prospero PRIVATE -static -municode)
 elseif(WIN32)
   # CRT-free: system DLLs only. Static libgcc keeps its helpers (e.g.
-  # 64-bit division on i686) from adding a DLL dependency.
+  # 64-bit division on i686) from adding a DLL dependency. Nothing is
+  # auto-imported: under LTO, ld would otherwise bring in mingw's
+  # pseudo-relocation runtime, and with it msvcrt.dll.
   add_executable(prospero src/main_win32.cpp src/deskwin32.cpp)
-  target_link_options(prospero PRIVATE -nostartfiles -static-libgcc)
+  target_link_options(prospero PRIVATE -nostartfiles -static-libgcc
+    -Wl,--disable-auto-import)
   target_link_libraries(prospero PRIVATE kernel32 advapi32 winhttp user32 gdi32)
 else()
   # HTTP goes through the httpedge object, the one translation unit

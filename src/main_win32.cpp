@@ -337,16 +337,18 @@ W32(b32,    IsProcessInJob(uz, uz, b32 *));
 W32(b32,    QueryInformationJobObject(uz, i32, void *, i32, i32 *));
 
 // GCC emits calls to these even without a CRT. Defining them keeps
-// msvcrt.dll out of the imports. GUI builds have the CRT's.
+// msvcrt.dll out of the imports. GUI builds have the CRT's. Under LTO
+// those calls appear only after the definitions would be dropped as
+// unused, so they are marked used.
 #if !PROSPERO_GUI && (defined(__x86_64__) || defined(__i386__))
-extern "C" void *memcpy(void *dst, void const *src, uz len)
+extern "C" __attribute((used)) void *memcpy(void *dst, void const *src, uz len)
 {
     void *r = dst;
     __asm volatile ("rep movsb" : "+D"(dst), "+S"(src), "+c"(len) : : "memory");
     return r;
 }
 
-extern "C" void *memmove(void *dst, void const *src, uz len)
+extern "C" __attribute((used)) void *memmove(void *dst, void const *src, uz len)
 {
     void *r = dst;
     if ((uz)dst-(uz)src >= len) {  // forward is safe
@@ -360,14 +362,14 @@ extern "C" void *memmove(void *dst, void const *src, uz len)
     return r;
 }
 
-extern "C" void *memset(void *dst, i32 c, uz len)
+extern "C" __attribute((used)) void *memset(void *dst, i32 c, uz len)
 {
     void *r = dst;
     __asm volatile ("rep stosb" : "+D"(dst), "+c"(len) : "a"(c) : "memory");
     return r;
 }
 
-extern "C" void *memchr(void const *s, i32 c, uz len)
+extern "C" __attribute((used)) void *memchr(void const *s, i32 c, uz len)
 {
     u8 *p = (u8 *)s;
     for (uz i = 0; i < len; i++) {
@@ -378,7 +380,7 @@ extern "C" void *memchr(void const *s, i32 c, uz len)
     return 0;
 }
 
-extern "C" i32 memcmp(void const *a, void const *b, uz len)
+extern "C" __attribute((used)) i32 memcmp(void const *a, void const *b, uz len)
 {
     u8 *x = (u8 *)a;
     u8 *y = (u8 *)b;
