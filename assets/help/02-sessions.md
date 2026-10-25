@@ -40,6 +40,7 @@ agent (Tab completes the name):
 - `/model [NAME]` switches the model, or picks one from a list;
 - `/rename TITLE` sets the title;
 - `/fork [TURN]` forks the session, or only its first turns;
+- `/side` starts a side chat (below);
 - `/export [raw]` saves the transcript as Markdown, or its raw log;
 - `/plan` and `/plan off` turn Plan mode on and off;
 - `/NAME [args]` uses the skill NAME (see
@@ -72,6 +73,8 @@ Right-click a session in the sidebar, or open the Session menu, for:
 - **Fork**: a new session with a copy of this conversation, titled
   "(fork)", which starts in Build mode. A No folder session's fork gets
   a copy of its folder.
+- **Start a side chat**: a fork you can make while the agent works
+  (below).
 - **Compact**: summarize the conversation now.
 - **Switch model**: a configured model, or another typed in.
 - **Export**: Markdown..., with or without reasoning and tool calls, to
@@ -88,6 +91,22 @@ Right-click in the transcript to Copy Message, or to fork there: Fork
 before this prompt puts that prompt in the fork's box to edit and
 send, and Fork after this turn keeps the conversation up to that
 point.
+
+## Side chats
+
+A side chat asks about a session without disturbing it, even while its
+agent works: Start a side chat in the transcript's right-click menu,
+in the Session menu, or `/side`. It is a fork of the whole
+conversation so far, titled "(side chat)", shown under its session in
+the sidebar, and its bar links back. From the transcript, the text
+selected is quoted (`> `) in its box, ready for your question below
+it. It waits for you: nothing is sent until you send it.
+
+The side chat's agent is told that it is a side chat, and that the
+main agent may still be working, so that it changes no files unless
+you ask. It has every tool all the same. Calls the main agent had
+under way are closed in the copy as still running there, and its
+background jobs run on there alone.
 
 ## Undo and rewind
 

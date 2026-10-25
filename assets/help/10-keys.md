@@ -44,7 +44,8 @@ The transcript, the Plan pane and these Help pages select alike:
 - **Ctrl+A** selects all, **Ctrl+C** copies the text, and
   **Ctrl+Shift+C** copies it as Markdown;
 - right-click for Copy, Copy as Markdown and Select All, and in the
-  transcript Copy Message and the forks.
+  transcript Copy Message, the forks and Start a side chat (which quotes
+  the selection in the side chat's box).
 
 A code block's Copy button, at its corner while the mouse is over it,
 copies its code exactly. A click on a tool row's or reasoning's header

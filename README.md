@@ -190,11 +190,14 @@ context menu, and the Session menu, rename it, move it to a group,
 fork it, compact it now, switch its model, export it (Markdown or the
 raw log), archive or delete it (with its subagents). The transcript's
 context menu forks at a message: before a prompt, which then waits in
-the fork's prompt box, or after a turn. The prompt box keeps a draft
+the fork's prompt box, or after a turn. A side chat, from that menu,
+the Session menu or `/side`, is a fork made even while the agent
+works, nested under its session, the selection quoted in its box; its
+agent is told to leave files alone. The prompt box keeps a draft
 per session, with the engine, has the session's earlier prompts on Up
 and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
 else `$VISUAL` or `$EDITOR`), and takes `/compact`, `/model`,
-`/rename`, `/fork`, `/export`, `/plan` and a skill's `/NAME`. An ask may be answered "always",
+`/rename`, `/fork`, `/side`, `/export`, `/plan` and a skill's `/NAME`. An ask may be answered "always",
 with the button set apart from Allow, which allows that directory, for
 reads or for writes too, for the rest of the session and its subagents,
 even after it is opened again. Each session has a scratch directory in the system's
