@@ -21,6 +21,7 @@ enum : i32 {
     SLASH_FORK,
     SLASH_EXPORT,
     SLASH_PLAN,
+    SLASH_SIDE,
     SLASH_COUNT,
 };
 
@@ -38,6 +39,8 @@ static SlashInfo slashinfo[] = {
     {"/fork",    "[TURN]",  "Start a new session from a copy of this one, or of its first turns"},
     {"/export",  "[raw]",   "Save the transcript as Markdown, or its raw log"},
     {"/plan",    "[off]",   "Plan mode: the agent plans for you to approve before it changes anything"},
+    {"/side",    "",        "Start a side chat: a copy of this session to ask about it, "
+                            "while its agent works on"},
 };
 static_assert(countof(slashinfo) == SLASH_COUNT);
 
@@ -97,8 +100,41 @@ static Slash parseslash(Str text)
             r.err = "/plan takes off, or nothing (plan mode on)";
         }
         break;
+    case SLASH_SIDE:
+        if (r.arg.len) {
+            r.err = "/side takes nothing: select text in the transcript to quote it";
+        }
+        break;
     }
     return r;
+}
+
+// A side chat's first draft from the text selected: each line quoted
+// with "> " (an empty one ">"), then a blank line to write below.
+// Nothing selected, nothing.
+static Str sidequote(Arena *a, Str text)
+{
+    for (; text.len && (text[text.len-1]=='\n' || text[text.len-1]=='\r'); text.len--) {}
+    if (!text.len) {
+        return {};
+    }
+    Buf b(a, text.len + text.len/4 + 16);
+    for (Str rest = text;;) {
+        Cut c    = cut(rest, '\n');
+        Str line = c.head;
+        if (line.len && line[line.len-1]=='\r') {
+            line.len--;
+        }
+        print(&b, line.len ? Str("> ") : Str(">"));
+        print(&b, line);
+        putbyte(&b, '\n');
+        if (!c.ok) {
+            break;
+        }
+        rest = c.tail;
+    }
+    putbyte(&b, '\n');
+    return finish(&b);
 }
 
 // The commands a partly typed first word may become, as a mask of bits

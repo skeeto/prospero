@@ -140,11 +140,13 @@ enum : i32 {
     VJOB_CLOSED,
     VJOB_LIMIT,
     VJOB_UNKNOWN,
+    VJOB_FORKED,  // it ran on in the session this one is a fork of
     VJOB_COUNT,
 };
 
 static Str vjobnames[] = {
     "running", "exited", "timeout", "killed", "closed", "limit", "unknown",
+    "forked",
 };
 static_assert(countof(vjobnames) == VJOB_COUNT);
 
@@ -453,6 +455,7 @@ struct View {
     Str             scratch;    // its scratch directory, if any
     Str             forkedfrom; // the session it was forked from, if any
     i64             forkturn;   // and the turn it was cut after
+    Str             sideof;     // a side chat's original session, else empty
     i32             turn;
     i32             attempt;
     b32             busy;       // a turn is running
@@ -1406,6 +1409,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->scratch    = clone(&v->aux, jsonstr(jsonget(j, "scratch")));
         v->forkedfrom = clone(&v->aux, jsonstr(jsonget(j, "forked_from")));
         v->forkturn   = jsonint(jsonget(j, "fork_turn"), 0);
+        v->sideof     = clone(&v->aux, jsonstr(jsonget(j, "side_of")));
         {
             Buf b(&scratch, 256);
             for (Json *t = jsonget(j, "tools")->child; t; t = t->next) {
@@ -1846,6 +1850,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                        kind=="instructions" ? Str("To the agent: instruction files") :
                        kind=="skills"       ? Str("To the agent: skills") :
                        kind=="budget"       ? Str("To the agent: wrap up") :
+                       kind=="side"         ? Str("To the agent: a side chat") :
                        Str("To the agent");
         }
     } return 1;
@@ -2109,6 +2114,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             print(&b, why=="cancel"      ? Str("Cancelled.") :
                       why=="interrupted" ? Str("Interrupted: the harness stopped during this turn.") :
                       why=="budget"      ? Str("Stopped at the step budget.") :
+                      why=="side"        ? Str("This side chat began here, while the "
+                                               "main session's turn went on there.") :
                       Str("The turn ended with an error."));
             if (err.len) {
                 putbyte(&b, ' ');
@@ -2116,7 +2123,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             }
             i32 i = addmsg(v, VIEW_NOTE, finish(&b));
             v->msgs[i].seq   = r->seq;
-            v->msgs[i].label = why=="error" ? Str("Error") : Str("Turn ended");
+            v->msgs[i].label = why=="error" ? Str("Error") :
+                               why=="side"  ? Str("Side chat") : Str("Turn ended");
         }
         clampsel(v);
     } return 1;

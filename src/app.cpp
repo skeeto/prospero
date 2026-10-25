@@ -252,6 +252,7 @@ enum : i32 {
     RECT_CMREDO,
     RECT_CMCUT,
     RECT_MODEL0,     // /model's first model
+    RECT_SIDELINK,   // a side chat's link to its original
     RECT_THEME0,     // the theme's choices in its open list
     RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
     RECT_COUNT = RECT_PANE0 + 11,
@@ -469,6 +470,7 @@ struct GuiSession {
     b32          nofolder;  // cwd is a folder of its own, from the list
     Str          model;
     Str          parent;    // a subagent's, from the list until opened
+    Str          sideof;    // a side chat's original, from the list until opened
     i64          mtime;
     i64          jobs;      // running background jobs, from the list
     i64          openid;    // the open in flight, 0 if none
@@ -501,6 +503,7 @@ struct Request {
     i32         cmd;
     GuiSession *s;
     GuiHost    *h;   // where it went
+    Str         quote;  // a side chat's draft (guiside), else null
 };
 
 // A file of a session's directory, as the file command brings it in
@@ -2535,6 +2538,26 @@ static void guifork(Gui *g, GuiSession *s, i64 turn)
     cmdsend(g, &w, a);
 }
 
+// A side chat of a session, busy or not (fork {side:1}): shown once
+// made, idle, with the quote, if any, as its draft (onsesscmd).
+static void guiside(Gui *g, GuiSession *s, Str quote)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_FORK, s);
+    putkey(&w.json, "side");
+    putint(&w.json, 1);
+    for (i32 i = 0; quote.len && i<REQ_MAX; i++) {
+        if (g->reqs[i].id == g->nextid) {
+            g->reqs[i].quote = clone(&g->perm, quote);
+        }
+    }
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
+    cmdsend(g, &w, a);
+}
+
 static void guianswer(Gui *g, GuiSession *s, Str req, Str decision, Str note)
 {
     Arena a = newarena(g->cmdr);
@@ -2852,7 +2875,9 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         Str cwd    = jsonstr(jsonget(e, "cwd"));
         Str model  = jsonstr(jsonget(e, "model"));
         Str parent = jsonstr(jsonget(e, "parent"));
+        Str sideof = jsonstr(jsonget(e, "side_of"));
         s->title  = s->title==title   ? s->title  : clone(&g->perm, title);
+        s->sideof = s->sideof==sideof ? s->sideof : clone(&g->perm, sideof);
         s->cwd    = s->cwd==cwd       ? s->cwd    : clone(&g->perm, cwd);
         s->nofolder = jsonint(jsonget(e, "nofolder"), 0) == 1;
         s->model  = s->model==model   ? s->model  : clone(&g->perm, model);
@@ -2890,6 +2915,8 @@ static Str  draftstr(GuiSession *);
 static void draftput(Gui *, GuiSession *, Str);
 static void setdraft(Gui *, GuiSession *, Str);
 static void setnote(Gui *, GuiSession *, Str, b32);
+static Str  sesstitle(GuiSession *);
+static Str  shorten(Arena *, Str, iz);
 
 
 // Attachments (AttBox, above Gui)
@@ -3364,6 +3391,16 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
         GuiSession *f = findsess(g, h, sid);
         f = f ? f : addsess(g, h, sid);
         guiselect(g, f);
+        if (jsonint(jsonget(j, "side"), 0)) {
+            // Idle, the quote to write under, the box ready for it
+            f->sideof = clone(&g->perm, s->sid);  // until the list says
+            setdraft(g, f, q->quote);
+            g->promptfocus = 1;
+            Str title = shorten(&scratch, sesstitle(s), 60);
+            setnote(g, f, concat(&scratch, "side chat of ", title), 0);
+            guilist(g, h);
+            break;
+        }
         Str next = jsonstr(jsonget(j, "next"));
         if (next.len) {
             setdraft(g, f, next);
@@ -7844,6 +7881,7 @@ enum : i32 {
     T_MODEL0,      // the first model /model lists
     T_NAMED,       // the item whose name (itemnamed) starts with text
     T_USERMSG,     // the latest user message drawn in the transcript
+    T_SIDELINK,    // a side chat's link back to its original
 };
 
 enum : i32 {
@@ -8077,6 +8115,8 @@ enum : i32 {
                       // Deploy engine offered; "bad" not offered it
     CHK_CFGEDITING,   // the configuration file is out in the editor
     CHK_CFGEDITED,    // the editor gone, Settings lists [model text], no error
+    CHK_SIDECHAT,     // a side chat of the session the checklist made is
+                      // shown, idle, under it, its box the selection quoted
     CHK_COUNT,
 };
 
@@ -8282,6 +8322,7 @@ static Str chknames[] = {
     "a remote with no engine there failed, and Deploy engine is offered",
     "Open in editor has the configuration file out in the editor",
     "the configuration file as the editor left it is read again, in Settings",
+    "the side chat is shown, idle, under its original, the selection quoted",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -8338,6 +8379,7 @@ enum : i32 {
                   // taken in
     W_DRAFTS,     // every draft sent was answered, so kept
     W_DEPLOYOFFER,// the remote "missing" failed, offering to deploy
+    W_SIDECHAT,   // a side chat is shown, open, its replay applied
 };
 
 static Str waitnames[] = {
@@ -8353,8 +8395,9 @@ static Str waitnames[] = {
     "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
     "a named item", "a launch to hand off", "the import", "the export",
     "the plan", "the menu's pick", "the drafts kept", "the offer to deploy",
+    "the side chat",
 };
-static_assert(countof(waitnames) == W_DEPLOYOFFER+1);
+static_assert(countof(waitnames) == W_SIDECHAT+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -9177,6 +9220,29 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SAID, 0, 0, 10000, "The second job was killed."},
     {OP_CHECK, CHK_JOBKILLED, 0, 0, 0, ""},
+    // A side chat while a turn runs: over a code block selected, from
+    // the transcript's menu, a new session under this one, shown and
+    // idle, the selection quoted in its box; its link leads back, where
+    // the turn goes on to its end
+    {OP_PROMPT, 0, 0, 0, 100, "Ask on the side while a command runs."},
+    {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
+    {OP_SELCODE, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Start a side chat"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_SIDECHAT, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "side chat of"},
+    {OP_CHECK, CHK_SIDECHAT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "10b-sidechat"},
+    {OP_MOVE, T_SIDELINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
+    {OP_WAIT, W_SAID, 0, 0, 20000, "Done, while the side chat waited."},
     // Then dark. The latest write undone from its row, the turn rewound
     // into a conflict with a change made outside, then forced
     {OP_SYSTHEME, 0, 1, 0, 1000, ""},
@@ -11268,6 +11334,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_SHOTCLOSE:     return rectcenter(g->rects[RECT_SHOTCLOSE]);
     case T_THINKHDR:      return rectcenter(g->rects[RECT_THINKHDR]);
     case T_USERMSG:       return rectcenter(g->rects[RECT_USERMSG]);
+    case T_SIDELINK:      return rectcenter(g->rects[RECT_SIDELINK]);
     case T_CODEBLOCK:     return rectcenter(g->rects[RECT_CODEBLOCK]);
     case T_CODECOPY:      return rectcenter(g->rects[RECT_CODECOPY]);
     case T_TOOLSBTN:      return rectcenter(g->rects[RECT_TOOLSBTN]);
@@ -11798,6 +11865,9 @@ static b32 drivewaitdone(Gui *g)
         return !g->edproc;
     case W_NOTE:
         return g->sess && g->sess->note.len;
+    case W_SIDECHAT:
+        return g->sess && sessside(g->sess).len && g->sess->view &&
+               !g->sess->openid && v->lastseq;
     case W_COMPACTED:
         return g->sess && !v->busy && lastof(v, VIEW_COMPACT);
     case W_IMPORTED:
@@ -13498,6 +13568,28 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_CFGEDITED:
         return !g->edproc && !g->edcfg && !g->cfgget && !g->cfgstatus.len &&
                cfghas(g, "model", g->ops[g->drivepc-1].text);
+    case CHK_SIDECHAT: {
+        // Shown, idle, under the session it began from, which is still at
+        // work, its box that session's selection quoted
+        GuiSession *s = g->sess;
+        GuiSession *m = g->drivemain;
+        if (!s || !m || s==m || !s->view || !m->view) {
+            return 0;
+        }
+        Arena               a     = g->frame;
+        Slice<GuiSession *> list  = sesslist(g, &a);
+        b32                 under = 0;
+        for (iz i = 0; i < list.len; i++) {
+            if (list[i] != m) continue;
+            for (iz k = i+1; k<list.len && list[k]->depth>m->depth && !under; k++) {
+                under = list[k]==s && s->depth==m->depth+1;
+            }
+        }
+        Str quote = sidequote(&a, copysel(m->view, &a, COPY_MARKDOWN));
+        return under && sessside(s)==m->sid && !s->view->busy && m->view->busy &&
+               startswith(quote, "> ") && draftstr(s)==quote &&
+               endswith(sesstitle(s), "(side chat)");
+    }
     case CHK_REMOTEFAILED: {
         GuiHost *h = findhost(g, GH_REMOTE, "bad");
         return h && h->state==RS_FAILED && !h->r && g->failshown &&

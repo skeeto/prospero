@@ -603,7 +603,8 @@ static u32 jobcolor(Palette *p, ViewJob *j)
     case VJOB_RUNNING: return p->active;
     case VJOB_EXITED:  return j->hasexit && !j->exit ? p->ok : p->bad;
     case VJOB_KILLED:
-    case VJOB_CLOSED:  return p->amber;
+    case VJOB_CLOSED:
+    case VJOB_FORKED:  return p->amber;
     }
     return p->bad;
 }
@@ -1773,6 +1774,8 @@ static char const *shortcutname(Gui *g, i32 which)
 
 static void modelitems(Gui *, Arena, GuiSession *);
 static Str  sesswhy(Gui *, GuiSession *, Str cap, b32 idle, b32 rootonly);
+static Str  sessparent(GuiSession *);
+static Str  sessside(GuiSession *);
 static b32  menuitem(Gui *, Arena, Str label, Str why, char const *key);
 static void whytip(Str);
 static void itemnamed(Gui *, Str);
@@ -1849,6 +1852,19 @@ static void drawsessbar(Gui *g)
         }
         itemrect(g, RECT_PARENTLINK);
         ImGui::SetItemTooltip("Back to the session that started this subagent");
+    } else if (sessside(s).len) {
+        // A side chat names its original in place of its own title
+        Str         o = sessside(s);
+        GuiSession *p = findsess(g, s->host, o);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("Side chat of");
+        ImGui::SameLine();
+        if (ImGui::TextLink(cstr0(&a, shorten(&a, p ? sesstitle(p) : o, 60)))) {
+            guiselect(g, p ? p : addsess(g, s->host, o));
+        }
+        itemrect(g, RECT_SIDELINK);
+        ImGui::SetItemTooltip("Back to the session this side chat began from");
+        drawmodelpick(g, a, s, v);
     } else {
         Buf b(&a, 256);
         print(&b, shorten(&a, sesstitle(s), 60));
@@ -2387,13 +2403,13 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
 // The transcript's menu's fork at a message: a user's prompt forks the
 // turns before it, the prompt left in the new session's box to edit and
 // send again; anything else, the conversation to the end of its turn.
-static void forkitem(Gui *g, ViewMsg *m)
+static b32 forkitem(Gui *g, ViewMsg *m)
 {
     GuiSession *s      = g->sess;
     b32         prompt = 0;
     i64         turn   = m ? viewforkat(m, &prompt) : -1;
     if (!s || turn<0) {
-        return;
+        return 0;
     }
     Arena a   = g->frame;
     Str   why = sesswhy(g, s, "fork", 1, 1);
@@ -2406,6 +2422,40 @@ static void forkitem(Gui *g, ViewMsg *m)
         ImGui::SetItemTooltip(prompt ? "A new session of the turns before this one, "
                                        "this prompt in its box to edit and send"
                                      : "A new session of the conversation up to here");
+    }
+    return 1;
+}
+
+// Why a session cannot have a side chat now, or empty if it can: busy
+// or not, but a root.
+static Str sidewhy(Gui *g, GuiSession *s)
+{
+    if (!s) {
+        return "Open a session first";
+    } else if (sessparent(s).len) {
+        return "A subagent has no side chat: start one from the session it works for";
+    }
+    return sesswhy(g, s, "side", 0, 1);
+}
+
+// The transcript's menu's side chat: a copy of the whole session, at
+// work or not, the selection quoted in its box (sidequote).
+static void sideitem(Gui *g, View *v, b32 sep)
+{
+    GuiSession *s   = g->sess;
+    Arena       a   = g->frame;
+    Str         why = sidewhy(g, s);
+    if (sep) {
+        ImGui::Separator();
+    }
+    if (menuitem(g, a, "Start a side chat", why, 0)) {
+        guiside(g, s, sidequote(&a, copysel(v, &a, COPY_MARKDOWN)));
+    }
+    if (!why.len) {
+        ImGui::SetItemTooltip(selempty(&v->sel)
+            ? "A new session of this conversation, to ask about it while its agent works on"
+            : "A new session of this conversation, to ask about it while its agent "
+              "works on, the selection quoted in its box");
     }
 }
 
@@ -2590,7 +2640,8 @@ static void drawtranscript(Gui *g)
         if (ImGui::MenuItem("Copy Message", 0, false, onmsg)) {
             copymessage(g, g->menumsg);
         }
-        forkitem(g, onmsg ? &v->msgs[g->menumsg] : 0);
+        b32 forked = forkitem(g, onmsg ? &v->msgs[g->menumsg] : 0);
+        sideitem(g, v, !forked);
         endtextmenu(g, v);
     }
 
@@ -3094,6 +3145,14 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
     case SLASH_FORK:
         if ((sent = hostcap(h, "fork"))) {
             guifork(g, s, sl.turn);
+        }
+        break;
+    case SLASH_SIDE:
+        if (sessparent(s).len) {
+            setnote(g, s, concat(&g->frame, "/side: ", sidewhy(g, s)), 1);
+            return;
+        } else if ((sent = hostcap(h, "side"))) {
+            guiside(g, s, {});
         }
         break;
     case SLASH_EXPORT:
@@ -3657,6 +3716,28 @@ static Str sessparent(GuiSession *s)
     return s->view && s->view->parent.len ? s->view->parent : s->parent;
 }
 
+// A side chat's original session, else empty.
+static Str sessside(GuiSession *s)
+{
+    return s->view && s->view->sideof.len ? s->view->sideof : s->sideof;
+}
+
+// The session another shows under in the sidebar: a subagent's parent,
+// a side chat's original while in its group and archived with it, as
+// the sidebar would place it anyway (sidebar.cpp). Only there: a side
+// chat is a root otherwise.
+static Str sessnest(Gui *g, GuiSession *s)
+{
+    Str p = sessparent(s);
+    if (p.len) {
+        return p;
+    }
+    Str         o  = sessside(s);
+    GuiSession *up = o.len ? findsess(g, s->host, o) : 0;
+    b32         ok = up && up->group==s->group && !up->archived==!s->archived;
+    return ok ? o : Str{};
+}
+
 struct SessTree {
     Map<Slice<GuiSession *>> *kids;  // by parent sid, oldest first
     Slice<GuiSession *>       out;
@@ -3715,14 +3796,14 @@ static Slice<GuiSession *> hostsessions(Gui *g, Arena *a, GuiHost *h)
         *upsert(&bysid, all[i]->sid, a) = all[i];
     }
     for (iz i = all.len-1; i >= 0; i--) {
-        Str p = sessparent(all[i]);
+        Str p = sessnest(g, all[i]);
         if (p.len && upsert(&bysid, p, (Arena *)0)) {
             Slice<GuiSession *> *k = upsert(&t.kids, p, a);
             *k = push(a, *k, all[i]);
         }
     }
     for (iz i = 0; i < all.len; i++) {
-        Str p = sessparent(all[i]);
+        Str p = sessnest(g, all[i]);
         if (!p.len || !upsert(&bysid, p, (Arena *)0)) {
             sessplace(&t, all[i], 0);
         }
@@ -4072,6 +4153,10 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
         guifork(g, s, -1);
     }
     older |= !hostcap(h, "fork");
+    if (menuitem(g, a, "Start a side chat", sidewhy(g, s))) {
+        guiside(g, s, {});
+    }
+    older |= !hostcap(h, "side");
     if (menuitem(g, a, "Compact", sesswhy(g, s, "compact", 1, 0))) {
         guicompact(g, s, {});
     }
@@ -4500,6 +4585,9 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
     if (sessparent(s).len && v && v->role.len) {
         pen(&b, v->role, 0, g->pal->dim);
         pen(&b, "  ", 0, g->pal->dim);
+    } else if (!sessparent(s).len && sessside(s).len) {
+        pen(&b, "side", STYLE_BOLD, g->pal->dim);
+        pen(&b, "  ", 0, g->pal->dim);
     }
     if (s->host->kind == GH_LOCAL) {
         pen(&b, "background", STYLE_BOLD, g->pal->active);
@@ -4614,7 +4702,7 @@ static void drawsessions(Gui *g)
             SideSess    e = {};
             e.host     = (i32)i;
             e.sid      = s->sid;
-            e.parent   = sessparent(s);
+            e.parent   = sessnest(g, s);
             e.group    = s->group;
             e.archived = s->archived;
             e.asks     = v && v->asks && !s->readonly;
