@@ -3069,10 +3069,11 @@ static Str bypassrules(Session *s, Arena *a)
                              "you work for, and you, to work without asking. ")
                        : Str("Bypass mode is on: the user allows you to work "
                              "without asking. "));
-    print(&b, "Your file tools may read and write outside the working "
-              "directory, and the desktop tool may act, all without the "
-              "user's approval. This overrides what you were told before, "
-              "that access outside the working directory is denied. Writes "
+    print(&b, "Your file tools, and the shell, may read and write outside "
+              "the working directory, and the desktop tool may act, all "
+              "without the user's approval. This overrides what you were "
+              "told before, that you must work inside the working directory "
+              "and that denied paths stay denied. Writes "
               "under the harness's state directory, ");
     print(&b, s->e->statedir);
     print(&b, ", are still refused: leave its files alone. Take care, as "
@@ -3093,10 +3094,11 @@ static Str modenotice(Session *s, Arena *a, i32 m)
         return bypassrules(s, a);
     }
     if (s->modeheard == MODE_BYPASS) {
-        return "Bypass mode is off: the user ended it. Access outside the "
-               "working directory needs the user's approval again, as do "
-               "the desktop actions that needed it before, and either may "
-               "be denied.";
+        return "Bypass mode is off: the user ended it. Work inside the "
+               "working directory again: the file tools need the user's "
+               "approval outside it, and the shell must not go there, and "
+               "the desktop actions that needed approval before need it "
+               "again. Either may be denied.";
     }
     return "Plan mode is off: the user ended it. Change files and run "
            "commands as the task needs.";

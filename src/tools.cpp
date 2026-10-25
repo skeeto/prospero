@@ -761,7 +761,9 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te, b32 nofolder = 0)
                   "it helps.\n");
     }
     print(&b,
-        "- Stay inside the working directory; access outside it is denied.\n"
+        "- Work inside the working directory. Reach files outside it only "
+        "with the file tools, which ask the user, never the shell. A "
+        "denied path stays denied, by any route.\n"
         "- When a tool returns an error, read it, fix the call, and go on. "
         "Never repeat a call that failed in the same way.\n"
         "- Do not narrate what you will do next: do it with a tool call.\n\n"

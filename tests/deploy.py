@@ -155,6 +155,10 @@ class D(R.T):
         self.ename = f"prospero-engine-{self.version}-{self.platform}{self.exe}"
         self.rname = f"engine-0-{self.version}-{self.platform}{self.exe}"
         self.env = dict(self.env, FAKEHOME=self.home, FAKELOG=self.fakelog)
+        # An empty configuration, never the user's own
+        conf = os.path.join(self.root, "config")
+        os.makedirs(conf)
+        self.env.update(XDG_CONFIG_HOME=conf, APPDATA=conf)
         # No prospero on the remote shell's PATH, as on a new machine (on
         # Windows it never was, and PATH has the shell, busybox-w32's)
         if os.name != "nt":

@@ -319,7 +319,9 @@ static void test_guard(Test *t)
     d.by   = DENY_TIMEOUT;
     d.wait = 30;
     deny   = guarddenial(a, &d);
-    expect(t, "denial timeout", istr(a, find(deny, "nobody answered within 30 seconds")>0), "1");
+    expect(t, "denial timeout", istr(a, find(deny, "nobody answered within 30 seconds")>0 &&
+                                       find(deny, "as with the shell")>0 &&
+                                       find(deny, "in your final response.")>0), "1");
     d.by   = DENY_STEER;
     deny   = guarddenial(a, &d);
     expect(t, "denial steer", istr(a, find(deny, "sent a new message")>0), "1");

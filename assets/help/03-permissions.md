@@ -7,8 +7,11 @@ symbolic link counts as where the link leads.
 
 Anywhere else, reading as well as writing, the tool asks you first.
 Shell commands do not ask: the agent is told to stay inside the
-working directory, but nothing holds a command to it, and files that
-commands change cannot be undone.
+working directory, to reach outside it only with the file tools, so
+that you are asked, and not to reach a denied path another way. But
+nothing holds a command to it, and files that commands change cannot
+be undone. After a denial the agent is told to go on without the path
+and, if it cannot finish, to ask you for it when it ends its turn.
 
 ## Answering an ask
 

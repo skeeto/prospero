@@ -2756,7 +2756,7 @@ def checkpointed(msgs):
     return len(msgs) > 1 and "<conversation-checkpoint>" in str(msgs[1].get("content"))
 
 
-SMALL = {"_listing": {"meta": {"n_ctx": 25000, "n_ctx_train": 262144}}}
+SMALL = {"_listing": {"meta": {"n_ctx": 25500, "n_ctx_train": 262144}}}
 
 
 @scenario(conf=SMALL, bound=25, alone=True)
@@ -5110,12 +5110,12 @@ def gauge(t):
         a.send("prompt", sid=sid, text="measure")
         end = ended(a, sid, 1)
         at = a.all("attempt", sid)[-1]
-        t.check(at.get("ctx") == 25000 and at.get("compact_at") == 21250 and
+        t.check(at.get("ctx") == 25500 and at.get("compact_at") == 21675 and
                 at.get("tokens", 0) > 500, f"attempt {at}")
-        t.check(end.get("ctx") == 25000 and end.get("compact_at") == 21250 and
+        t.check(end.get("ctx") == 25500 and end.get("compact_at") == 21675 and
                 end.get("tokens", 0) > 500, f"turn.end {end}")
         running = [e for e in a.all("live", sid) if e["state"] in ("waiting", "streaming")]
-        t.check(running and all(e.get("tokens") == at["tokens"] and e.get("ctx") == 25000
+        t.check(running and all(e.get("tokens") == at["tokens"] and e.get("ctx") == 25500
                                 for e in running), f"live {running}")
         t.check(a.close() == 0, "the first exits")
         a = None
@@ -5125,7 +5125,7 @@ def gauge(t):
         t.check(o.get("ok") == 1, f"open {o}")
         # live follows open's reply (cmdopen), so wait for it
         live = b.wait(lambda e: e.get("ev") == "live" and e.get("sid") == sid)
-        t.check(live.get("ctx") == 25000 and live.get("compact_at") == 21250 and
+        t.check(live.get("ctx") == 25500 and live.get("compact_at") == 21675 and
                 live.get("tokens", 0) > 500, f"live after open {live}")
     finally:
         if a:
@@ -7116,7 +7116,7 @@ def bypass_mode(t):
         said = msgs[-1].get("content", "")
         t.check(msgs[-1]["role"] == "user" and said.startswith("Bypass mode is on") and
                 "overrides what you were told before" in said and
-                "state directory" in said and "access outside it is denied" in
+                "state directory" in said and "never the shell" in
                 msgs[0]["content"], f"told: {said}")
 
         # Again: nothing more to tell

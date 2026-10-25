@@ -541,7 +541,9 @@ static Str guarddenial(Arena *a, GuardDenial *d)
         return "Not run: the user cancelled the turn.";
     }
 
-    print(&b, " Do not retry this path. Continue without it, working inside ");
+    print(&b, " Do not retry this path, and do not reach it or anything in "
+              "it another way, as with the shell or through another path "
+              "to it. Continue without it, working inside ");
     print(&b, d->cwd);
     if (d->hint.path.data && d->hint.exists) {
         print(&b, ". Did you mean ");
@@ -554,6 +556,8 @@ static Str guarddenial(Arena *a, GuardDenial *d)
     } else {
         putbyte(&b, '.');
     }
+    print(&b, " If you cannot finish without it, finish what you can, then "
+              "ask the user for it in your final response.");
     return finish(&b);
 }
 
