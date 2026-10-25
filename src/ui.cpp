@@ -120,16 +120,20 @@ static b32 modalenter()
 
 // Fonts and measurement
 
+// In whole pixels: ImGui bakes and measures a font at its size rounded,
+// but draws text scaled to the size asked, so a fractional size (a zoom
+// step, Windows' 125%) drew each run narrower than its measured place,
+// and the shortfall gathered where runs end, as wide gaps at soft breaks.
 static f32 stylesize(Fonts *f, i32 style)
 {
-    f32 base = f->size;
+    f32 size = f->size;
     switch ((style & STYLE_HMASK) >> STYLE_HSHIFT) {
-    case 1: return base * 1.60f;
-    case 2: return base * 1.35f;
-    case 3: return base * 1.17f;
-    case 4: return base * 1.05f;
+    case 1: size *= 1.60f; break;
+    case 2: size *= 1.35f; break;
+    case 3: size *= 1.17f; break;
+    case 4: size *= 1.05f; break;
     }
-    return base;
+    return (f32)(i32)(size + 0.5f);
 }
 
 static ImFont *stylefont(Fonts *f, i32 style)
