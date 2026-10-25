@@ -6038,7 +6038,7 @@ def nofolder(t):
 def dir_listing(t):
     """dir {path, dirs?}: a directory's entries on the engine's machine,
     for completing a path typed for it: files and directories, a link to
-    a directory one (POSIX), only directories with dirs; ~ in the home
+    a directory one, a junction too (Windows), only directories with dirs; ~ in the home
     directory, kept as typed in the reply; a missing directory, a file,
     and a relative path refused; at most 2000 entries, with more."""
     env = skillhome(t)
@@ -6055,6 +6055,17 @@ def dir_listing(t):
         os.symlink(t.host.join(t.base, "missing"), t.host.join(base, "broken"))
         os.symlink(t.host.join(base, "notes.txt"), t.host.join(base, "notelink"))
         want.update(linked=1, notelink=0)
+    else:
+        # Junctions, listed after enough entries that a link's name, once
+        # written over them while looking where it goes, broke the listing
+        t.host.bulk(base, {f"f{i:02}": "" for i in range(24)})
+        want.update({f"f{i:02}": 0 for i in range(24)})
+        target = t.host.join(t.base, "elsewhere")
+        t.host.mkdir(target)
+        win = lambda p: p.replace("/", "\\")
+        for name, to in [("linked", target), ("lost", t.host.join(t.base, "missing"))]:
+            t.host.sh(f'cmd /c mklink /J "{win(t.host.join(base, name))}" "{win(to)}"')
+        want.update(linked=1)
     big = t.host.join(t.base, "big")
     t.host.bulk(big, {f"f{i:04}": "" for i in range(2001)})
     t.host.mkdir(t.host.join(big, "sub"))

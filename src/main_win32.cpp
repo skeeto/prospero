@@ -818,10 +818,11 @@ static Listing os_listall(Os *, Arena *a, Str path, b32 dirs, iz max)
         return r;
     }
 
-    Arena tmp = *a;
-    Str16 dir = widepath(&tmp, path);
+    // Kept below the entries, not in scratch past them: each link's name
+    // is written into it, which would run over the entries allocated so far
+    Str16 dir = widepath(a, path);
     iz    len = dir.len;
-    c16  *pat = alloc<c16>(&tmp, len + 2 + 260);  // and for a name (FindData)
+    c16  *pat = alloc<c16>(a, len + 2 + 260);  // and for a name (FindData)
     copybytes(pat, dir.data, len*(iz)sizeof(c16));
     if (!len || (pat[len-1]!='\\' && pat[len-1]!='/')) {
         pat[len++] = '\\';
