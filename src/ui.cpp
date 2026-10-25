@@ -3489,7 +3489,7 @@ static void drawprompt(Gui *g)
         act = ImGui::MenuItem("Select all", cmdkey(g, &a, "A"), false, any) ? CM_SELALL : act;
         itemrect(g, RECT_CMSELALL);
         ImGui::Separator();
-        b32 ed = !g->edsess && editorcmd(g, &a).len;
+        b32 ed = !g->edproc && editorcmd(g, &a).len;
         if (ImGui::MenuItem("Open in editor", "Ctrl+G", false, ed)) {
             editstart(g, s);
         }
@@ -6859,6 +6859,55 @@ static void drawcfgdel(Gui *g)
     ImGui::EndPopup();
 }
 
+// Why the configuration file at path cannot go out to the editor, or
+// empty.
+static Str cfgeditwhy(Gui *g, Str path, b32 exists, Arena *a)
+{
+    if (!path.len) {
+        return "No configuration file location";
+    } else if (g->cfgcreate) {
+        return "Creating the file...";
+    } else if (!exists && !hostcap(g->main, "config.create")) {
+        return "The engine is too old to create the file";
+    }
+    return editorwhy(g, 0, a);
+}
+
+// The configuration file in the editor (cfgedit), beside Reload: its
+// button, or while it is out, which editor and a Cancel.
+static void cfgeditbutton(Gui *g, Str path, b32 exists)
+{
+    Arena       a  = g->frame;
+    ImGuiStyle &st = ImGui::GetStyle();
+    if (g->edcfg) {
+        char *what = cstr0(&a, concat(&a, concat(&a, "editing in ", g->edname), "..."));
+        samelineif(ImGui::CalcTextSize(what).x + st.ItemSpacing.x +
+                   ImGui::CalcTextSize("Cancel").x + 2*st.FramePadding.x);
+        ImGui::TextDisabled("%s", what);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Cancel##cfgedit")) {
+            editcancel(g);
+        }
+        itemnamed(g, "cancel config editor");
+        ImGui::SetItemTooltip("Stop the editor: the file is as it left it, read again");
+        return;
+    }
+    char const *label = "Open in editor";
+    Str         why   = cfgeditwhy(g, path, exists, &a);
+    samelineif(ImGui::CalcTextSize(label).x + 2*st.FramePadding.x);
+    ImGui::BeginDisabled(why.len != 0);
+    if (ImGui::SmallButton(label)) {
+        cfgedit(g, path, exists);
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, "config editor");
+    whytip(why.len ? why : exists ? Str("Edit the file by hand in your editor: it is read "
+                                        "again once the editor exits")
+                                  : Str("Create the file as the first edit would (the "
+                                        "documented template, for the default file), then "
+                                        "edit it by hand in your editor"));
+}
+
 static void drawsettings(Gui *g)
 {
     Arena a  = g->frame;
@@ -6882,6 +6931,7 @@ static void drawsettings(Gui *g)
     if (ImGui::SmallButton("Reload")) {
         guiconfigget(g);
     }
+    cfgeditbutton(g, path, jsonint(jsonget(j, "exists"), 0) != 0);
     i32 urls = (i32)jsonlen(jsonget(j, "includes"));
     if (urls) {
         // Fetching each URL include again, which the reply waits for

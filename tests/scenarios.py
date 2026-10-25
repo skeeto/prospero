@@ -2226,7 +2226,7 @@ def hello_caps(t):
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
-                 "message", "bypass", "nofolder", "dir"} <= set(caps)
+                 "message", "bypass", "nofolder", "dir", "config.create"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -2374,6 +2374,13 @@ def config(t):
             t.check(r["ok"] == 0 and why in r.get("err", ""), f"refusal: {r}")
             t.check(len(r["diags"]) == 1, "diagnostics come with refusals")
         t.check(text() == after, "refusals leave the file alone")
+
+        # Create, for an editor, leaves a file that exists alone
+        r = call("config.set", create=1)
+        t.check(r["ok"] == 1 and r["line"] == 0, f"create: {r}")
+        r = call("config.set", create=1, key="model")
+        t.check(r["ok"] == 0 and "takes no" in r.get("err", ""), f"create refused: {r}")
+        t.check(text() == after, "create leaves the file alone")
 
         # A new section, then a session using it
         r = call("config.set", kind="model", name=model, key="temperature",

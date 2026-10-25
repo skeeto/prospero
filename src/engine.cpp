@@ -11294,7 +11294,7 @@ static b32 onconfig(Engine *e, Arena scratch, Record r)
 // refresh, config.get fetches every URL include anew, and its reply
 // waits for the fetches to end (30 s at most), unless 8 such replies
 // wait already, when it comes at once. With delete, config.set deletes
-// a section.
+// a section, and with create, makes the user's file if it is missing.
 static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
 {
     Config *c   = e->cfg;
@@ -11312,6 +11312,14 @@ static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
                 }
                 return;
             }
+        }
+    } else if (jsonflag(jsonget(j, "create"), 0)) {
+        if (jsonget(j, "kind")->type!=JSON_MISSING || jsonget(j, "name")->type!=JSON_MISSING ||
+                jsonget(j, "key")->type!=JSON_MISSING ||
+                jsonget(j, "value")->type!=JSON_MISSING) {
+            r.err = "create takes no kind, name, key or value";
+        } else {
+            r = cfgcreate(c, &scratch);
         }
     } else if (jsonflag(jsonget(j, "delete"), 0)) {
         if (jsonget(j, "key")->type!=JSON_MISSING ||

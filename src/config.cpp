@@ -108,6 +108,9 @@
 //    "delete":1}
 //   (the same replies, line 0)
 //
+//   {"cmd":"config.set","id":N,"create":1}
+//   (the same replies, line 0)
+//
 // In config.get, path is where edits go ("" if there is no location),
 // exists says whether that file was read, rev counts loads, and files
 // lists every file read, in load order. Settings list every schema key
@@ -152,6 +155,12 @@
 // kind, file by file as files lists them, with own:1 for those in the
 // user's file: a section the user's file defines can be deleted, and is
 // then gone unless an include also defines it.
+//
+// With create (true, or a nonzero number), config.set creates the
+// user's file where it is missing, as the first edit would (the seed
+// for the default file, else empty), and leaves one that exists alone:
+// a frontend's way to a file to open in an editor. It takes no kind,
+// name, key or value.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -2636,6 +2645,32 @@ static CfgSet cfgdelete(Config *c, Arena *perm, Str kind, Str name)
         return r;
     }
     cfgload(c, *perm);
+    r.ok = 1;
+    return r;
+}
+
+// Create the user's file where it is missing, as the first edit would:
+// the seed when this Config seeds, else empty, so that it can be opened
+// in an editor. One that exists is left alone. Results and temporaries
+// go in perm.
+static CfgSet cfgcreate(Config *c, Arena *perm)
+{
+    CfgSet r = {};
+    if (!c->path.len) {
+        r.err = "no configuration file location";
+        return r;
+    }
+    cfgreread(c, *perm);
+    if (!c->user) {
+        if (os_stat(c->os, *perm, c->path).type != STAT_MISSING) {
+            r.err = concat(perm, "cannot read ", c->path);
+            return r;
+        } else if (!cfgwrite(c, *perm, c->seed ? cfgseed() : Str(""))) {
+            r.err = concat(perm, "cannot write ", c->path);
+            return r;
+        }
+        cfgload(c, *perm);
+    }
     r.ok = 1;
     return r;
 }

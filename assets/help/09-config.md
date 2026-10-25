@@ -19,6 +19,12 @@ comments. Its top line says which file it edits. Diagnostics, at the
 end of its list, shows each problem found in the files, with where it
 is; a bad value falls back to its default.
 
+**Open in editor**, beside Reload, opens the file itself in your
+editor (`[ui] editor`, else `$VISUAL` or `$EDITOR`), to edit it by
+hand. A missing file is first created: from the built-in copy, as on
+the first run, or empty for one named by `-c`. Once the editor exits, Settings reads the file again.
+Cancel stops the editor and keeps the file as it left it.
+
 The state directory holds the sessions, the window's layout and
 `gui.log`: `$XDG_STATE_HOME/prospero`, else
 `~/.local/state/prospero`. On Windows `%LOCALAPPDATA%\prospero` is

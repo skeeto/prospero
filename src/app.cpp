@@ -1139,6 +1139,7 @@ struct Gui {
     i64                cfgrefreshed; // config.get {refresh} replies so far
     i64                cfgset;     // config.set in flight, 0 if none
     i64                cfgsets;    // config.set replies so far
+    i64                cfgcreate;  // config.set {create} in flight, 0 if none
     Str                cfgstatus;  // the latest config.set outcome
     b32                cfgok;      // and whether it worked
 
@@ -1150,6 +1151,7 @@ struct Gui {
     Mailbox           *edbox;      // its process's records
     GuiSession        *edsess;     // whose draft it edits, or null
     b32                edplan;     // its plan file instead (Edit plan)
+    b32                edcfg;      // or the configuration file (Settings)
     Str                edreq;      // and that plan's ask, empty if none
     i64                planedits;  // plans edited, for the checklist
     Str                revealed;   // the file guishow showed last, for
@@ -1157,7 +1159,8 @@ struct Gui {
     b32                realreveal; // the checklist's show the file manager
     Proc              *edproc;
     u64                edid;
-    Str                edpath;     // the draft's file, or the plan file
+    Str                edpath;     // the draft's file, the plan file, or the
+                                   //   configuration file
     Str                edlog;      // the editor's output
     Str                edname;     // as the box names it
     i32                slashsel;   // the slash popup's pick, among its matches
@@ -1738,6 +1741,18 @@ static void guiconfigdelete(Gui *g, Str kind, Str name)
     }
     putbyte(&d, ']');
     g->cfgdelwhat = finish(&d);
+    cmdsend(g, &w, a);
+}
+
+// Make the user's file where it is missing, for the editor (cfgedit).
+static void guiconfigcreate(Gui *g)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 64);
+    EvOut w = cmdopen(g, &b, CMD_CONFIGSET, 0);
+    putkey(&w.json, "create");
+    putint(&w.json, 1);
+    g->cfgcreate = g->nextid;
     cmdsend(g, &w, a);
 }
 
@@ -3363,6 +3378,7 @@ static void ondir(Gui *, Arena, i64 id, Json *, b32 ok, Str err);
 static void onimport(Gui *, GuiHost *, Arena, Request *, EvRec *);
 static void sessgone(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
+static void cfgeditrun(Gui *, Str path);
 
 static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 {
@@ -3584,6 +3600,18 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         return;
 
     case CMD_CONFIGSET: {
+        if (g->cfgcreate == id) {
+            // The file is there now: out to the editor
+            g->cfgcreate = 0;
+            if (ok) {
+                cfgeditrun(g, jsonstr(jsonget(j, "path")));
+            } else {
+                g->cfgstatus = clone(&g->perm, concat(&scratch, "Not created: ", err));
+                g->cfgok     = 0;
+            }
+            guiconfigget(g);
+            return;
+        }
         if (g->cfgset == id) {
             g->cfgset = 0;
         }
@@ -3855,7 +3883,10 @@ static void setnote(Gui *g, GuiSession *s, Str note, b32 err)
 // this machine: once the editor exits, however it went, the ask and the
 // Plan window show the file as it is, which is the plan the engine
 // approves. Edited while no plan waits, the Plan window shows it, and
-// the agent is not told. One file at a time is out, a draft or a plan.
+// the agent is not told. Or, from Settings, the configuration file, in
+// place, made first if it is missing (config.set {create}): once the
+// editor exits, the engine reads it again. One file at a time is out, a
+// draft, a plan or the configuration.
 
 // The PATH for what the GUI runs itself, the editor and ssh: its own,
 // with [tools] path_prepend and path_append around it, as the engine
@@ -3879,16 +3910,20 @@ static Str editorcmd(Gui *g, Arena *a)
                       os_getenv(g->os, a, "EDITOR"), g->mac);
 }
 
-// Why no file can go out to the editor now, or null if one can.
+// Why no file can go out to the editor now, for session s (null for the
+// configuration), or null if one can.
 static Str editorwhy(Gui *g, GuiSession *s, Arena *a)
 {
     if (!editorcmd(g, a).len) {
         return "no editor: set [ui] editor in the settings (or $VISUAL or $EDITOR)";
-    } else if (g->edsess && g->edplan) {
+    } else if (g->edcfg) {
+        return "the editor has the configuration file open";
+    } else if (g->edproc && g->edplan) {
         return "the editor has a plan open";
-    } else if (g->edsess) {
-        return g->edsess==s ? Str("the draft is open in the editor already")
-                            : Str("the editor has another session's draft open");
+    } else if (g->edproc) {
+        return g->edsess==s ? Str("the draft is open in the editor already") :
+               s            ? Str("the editor has another session's draft open")
+                            : Str("the editor has a draft open");
     }
     return {};
 }
@@ -4001,6 +4036,54 @@ static void planedit(Gui *g, GuiSession *s, Str path, Str req)
     scheddirty(&g->sched);
 }
 
+// The configuration file at path, which exists, in the editor, in
+// place. What goes wrong is Settings' status.
+static void cfgeditrun(Gui *g, Str path)
+{
+    Arena a   = g->frame;
+    Str   why = editorwhy(g, 0, &a);
+    Str   err = {};
+    Proc *p   = 0;
+    Str   cmd = editorcmd(g, &a);
+    Str   dir = join(&a, g->statedir, "edit");
+    Str   log = join(&a, dir, "config.log");
+    if (why.len) {
+        err = why;
+    } else if (!path.len) {
+        err = "no configuration file location";
+    } else if (!(p = os_mkdirs(g->os, a, dir) ? editrun(g, a, cmd, path, dir, log) : 0)) {
+        err = concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a));
+    }
+    if (!p) {
+        g->cfgstatus = clone(&g->perm, err);
+        g->cfgok     = 0;
+        scheddirty(&g->sched);
+        return;
+    }
+    g->edsess    = 0;
+    g->edplan    = 0;
+    g->edcfg     = 1;
+    g->edproc    = p;
+    g->edpath    = clone(&g->perm, path);
+    g->edreq     = {};
+    g->edlog     = clone(&g->perm, log);
+    g->edname    = clone(&g->perm, editorname(cmd));
+    g->cfgstatus = {};
+    guilog(g, concat(&a, "editing the configuration: ", cmd));
+    scheddirty(&g->sched);
+}
+
+// Open in editor, from Settings: the configuration file at path, made
+// first by the engine, as its first edit would, if it does not exist.
+static void cfgedit(Gui *g, Str path, b32 exists)
+{
+    if (exists) {
+        cfgeditrun(g, path);
+    } else if (!g->cfgcreate) {
+        guiconfigcreate(g);
+    }
+}
+
 // A file of this computer, selected in the system's file manager. The
 // checklist only notes it, so that it opens no windows, unless asked to
 // (PROSPERO_TEST_REVEAL).
@@ -4040,8 +4123,13 @@ static void editend(Gui *g, i32 status)
 {
     GuiSession *s    = g->edsess;
     Arena       a    = g->frame;
-    Str         what = g->edplan ? Str("the plan") : Str("the draft");
-    if (g->edplan) {
+    Str         what = g->edcfg  ? Str("the configuration") :
+                       g->edplan ? Str("the plan") : Str("the draft");
+    if (g->edcfg) {
+        // Read again, however it went: this answer is the one that counts
+        g->cfgget = 0;
+        guiconfigget(g);
+    } else if (g->edplan) {
         planedited(g, s);
     } else if (status == 0) {
         Read rd = os_read(g->os, &a, g->edpath, DRAFT_MAX+2);
@@ -4067,14 +4155,20 @@ static void editend(Gui *g, i32 status)
         Buf  b(&a, 256 + last.len);
         print(&b, "the editor exited with status ");
         print(&b, (i64)status);
-        print(&b, g->edplan ? Str(": the plan is as it left it")
+        print(&b, g->edcfg  ? Str(": the file is as it left it") :
+                  g->edplan ? Str(": the plan is as it left it")
                             : Str(": the draft is as it was"));
         if (last.len) {
             print(&b, " (");
             print(&b, last);
             putbyte(&b, ')');
         }
-        setnote(g, s, finish(&b), 1);
+        if (g->edcfg) {
+            g->cfgstatus = clone(&g->perm, finish(&b));
+            g->cfgok     = 0;
+        } else {
+            setnote(g, s, finish(&b), 1);
+        }
     }
     Buf lb(&a, 64);
     print(&lb, what);
@@ -4083,14 +4177,15 @@ static void editend(Gui *g, i32 status)
         print(&lb, (i64)status);
     }
     guilog(g, finish(&lb));
-    if (!g->edplan) {
-        os_remove(g->os, a, g->edpath);  // the plan file stays, of course
+    if (!g->edplan && !g->edcfg) {
+        os_remove(g->os, a, g->edpath);  // the plan and config files stay, of course
     }
     os_remove(g->os, a, g->edlog);
     os_procfree(g->os, g->edproc);
     g->edsess = 0;
     g->edproc = 0;
     g->edplan = 0;
+    g->edcfg  = 0;
     scheddirty(&g->sched);
 }
 
@@ -7980,6 +8075,8 @@ enum : i32 {
     CHK_HELPCOPY,     // the clipboard has Help's page, selected whole
     CHK_DEPLOYOFFER,  // the remote "missing" failed with no engine there,
                       // Deploy engine offered; "bad" not offered it
+    CHK_CFGEDITING,   // the configuration file is out in the editor
+    CHK_CFGEDITED,    // the editor gone, Settings lists [model text], no error
     CHK_COUNT,
 };
 
@@ -8183,6 +8280,8 @@ static Str chknames[] = {
     "Help's topics are a combo when narrow, else a list beside the page",
     "Help's page, selected whole, copied as its text",
     "a remote with no engine there failed, and Deploy engine is offered",
+    "Open in editor has the configuration file out in the editor",
+    "the configuration file as the editor left it is read again, in Settings",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9236,6 +9335,18 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_ADDEXISTS, 0, 0, 0, ""},
     {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
+    // Open in editor, with [ui] editor a test script that adds a model
+    // to the file (which tests/gui.py allows for): once it exits, the
+    // file is read again, and Settings lists the model
+    {OP_IFEDITOR, 0, 8, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "config editor"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_CFGEDITING, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "4-cfgediting"},
+    {OP_WAIT, W_EDITED, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_CFGEDITED, 0, 0, 0, "edited-by-hand"},
     // Help, from its menu, floated wide: each topic in the list beside
     // the page shows its page from the top, which, selected whole from
     // its context menu, is copied as its text. Narrow, the topics are a
@@ -11684,7 +11795,7 @@ static b32 drivewaitdone(Gui *g)
     case W_TURNS:
         return g->sess && !v->busy && v->turn>=(i32)g->ops[g->drivepc-1].dx;
     case W_EDITED:
-        return !g->edsess;
+        return !g->edproc;
     case W_NOTE:
         return g->sess && g->sess->note.len;
     case W_COMPACTED:
@@ -13193,7 +13304,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_PLANEDITED: {
         ViewMsg *m = lastmsg(g, VIEW_ASK);
-        return !g->edsess && g->planedits>0 && m && m->tool->kind=="plan" &&
+        return !g->edproc && g->planedits>0 && m && m->tool->kind=="plan" &&
                m->tool->answer==VASK_PENDING && find(m->text, g->ops[g->drivepc-1].text)>=0;
     }
     case CHK_LAUNCHDIR:
@@ -13381,6 +13492,12 @@ static b32 drivecheck(Gui *g, i32 chk)
         return h && h->state==RS_FAILED && !h->r && h->deploys &&
                bad && !bad->deploys && btn;
     }
+    case CHK_CFGEDITING:
+        return g->edcfg && g->edproc && !g->edsess && g->edpath.len &&
+               g->edpath==jsonstr(jsonget(g->cfg, "path"));
+    case CHK_CFGEDITED:
+        return !g->edproc && !g->edcfg && !g->cfgget && !g->cfgstatus.len &&
+               cfghas(g, "model", g->ops[g->drivepc-1].text);
     case CHK_REMOTEFAILED: {
         GuiHost *h = findhost(g, GH_REMOTE, "bad");
         return h && h->state==RS_FAILED && !h->r && g->failshown &&

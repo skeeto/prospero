@@ -197,6 +197,7 @@ static Str capnames[] = {
     "nofolder",        // new and import {nofolder}: a folder of the session's
                        // own, and nofolder in its session record and list
     "dir",             // dir, a directory's entries on the engine's machine
+    "config.create",   // config.set {create}: the user's file, made if missing
 };
 
 static Str evname(i32 ev)

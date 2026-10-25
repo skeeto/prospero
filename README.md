@@ -399,7 +399,9 @@ which documents every section and key: `[endpoint NAME]`,
 `[skills]`, `[ui]`, `[desktop]`, `[host]` and `[remote NAME]`. Changes take effect while it
 runs. An unknown key or a bad value is reported in the diagnostics,
 and a bad value falls back to its default: nothing in the file keeps
-Prospero from starting.
+Prospero from starting. The settings window edits the file a line at a
+time, and its Open in editor opens the whole file in your editor, read
+again once the editor exits.
 
 API keys never go in the file: `key = env:NAME` reads one from the
 environment when it is needed. Above the first section, `include = `

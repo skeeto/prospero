@@ -553,6 +553,34 @@ static void testcfgset(Test *t)
         cfgfree(m);
     }
 
+    // Created for the editor as the first edit would, the seed or nothing,
+    // and one that exists is left alone
+    for (i32 seed = 0; seed < 2; seed++) {
+        Arena   tmp = v.scratch;
+        Str     p   = seed ? Str("/cs/prospero.ini") : Str("/cn/prospero.ini");
+        Config *m   = newconfig(v.os, &a, tmp, p, seed);
+        os_remove(v.os, a, p);
+        i64     rev = m->rev;
+        CfgSet  r   = cfgcreate(m, &tmp);
+        expect(t, concat(&a, "create ", p), cfgfile(v.os, p), seed ? cfgseed() : Str(""));
+        expect(t, concat(&a, "create.ok ", p), istr(&a, r.ok), "1");
+        expect(t, concat(&a, "create.user ", p), istr(&a, m->user != 0), "1");
+        expect(t, concat(&a, "create.rev ", p), istr(&a, m->rev > rev), "1");
+        os_write(v.os, a, p, "# mine\n");
+        tmp = v.scratch;
+        r   = cfgcreate(m, &tmp);
+        expect(t, concat(&a, "create.kept ", p), cfgfile(v.os, p), "# mine\n");
+        expect(t, concat(&a, "create.kept.ok ", p), istr(&a, r.ok), "1");
+        cfgfree(m);
+    }
+    {
+        Arena   tmp = v.scratch;
+        Config *m   = newconfig(v.os, &a, tmp, {}, 0);
+        CfgSet  r   = cfgcreate(m, &tmp);
+        expect(t, "create.nowhere", r.err, "no configuration file location");
+        cfgfree(m);
+    }
+
     // Includes: a top-level setting an include overrides moves below it,
     // and removing what only an include sets says so
     {

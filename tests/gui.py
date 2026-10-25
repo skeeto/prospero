@@ -149,6 +149,15 @@ printf -- '- Revised by hand.\\n' >> "$1"
 """
 
 
+# The drive mode's editor: Open in editor in Settings adds a model to
+# the configuration file by hand, which the diff of the file allows for
+CONFIG_EDITED = "\n# Added in the editor\n[model edited-by-hand]\ntemperature = 0.3\n"
+CONFIG_EDITOR = """#!/bin/sh
+sleep 1
+printf '\\n# Added in the editor\\n[model edited-by-hand]\\ntemperature = 0.3\\n' >> "$1"
+"""
+
+
 def composeconfig(editor, nonce):
     """The compose mode's: the test editor, by its name alone, found in
     a directory of [tools] path_prepend as a desktop-started GUI finds
@@ -1460,6 +1469,12 @@ def main():
         before = firstconfig(curl)
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
+        if not args.host:
+            # Open in editor's editor, a sh script (the checklist skips it
+            # without one)
+            editor = host.path("config-edit.sh")
+            host.write(editor, CONFIG_EDITOR)
+            before += f"\n# Open in editor's editor, a test script\n[ui]\neditor = sh {shword(editor)}\n"
         # A directory for the ask allowed always
         host.mkdir(host.path("gui-always"))
         # Instruction files for the info popup, and files to compact over
@@ -1616,6 +1631,11 @@ def main():
             print(f"close: pid {pid} gone with the engine")
     if args.mode in ("drive", "e2e") and not args.fake:
         after = host.read(ini) or ""
+        if args.mode == "drive" and not args.host:
+            # What Open in editor's editor added, at the end
+            if CONFIG_EDITED not in after:
+                problems.append("the editor's model is not in the configuration")
+            after = after.replace(CONFIG_EDITED, "", 1)
         diff = list(difflib.unified_diff(before.splitlines(), after.splitlines(),
                                          lineterm="", n=0))
         body = [l for l in diff if l[:1] in "+-" and l[:3] not in ("+++", "---")]
