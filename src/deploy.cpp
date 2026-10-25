@@ -16,8 +16,9 @@
 //    variables instead, after a uname of its own (Git's) if it has one,
 //    else with the processor architecture, then ver's version line.
 // 2. Choose prospero-engine-VERSION-OS-ARCH[.exe] from the engines
-//    directory ("engines" next to this executable unless given; built
-//    by tools/engines.py), checked against its .sha256 file. With none
+//    directory ("engines" next to this executable, else beside the
+//    default prospero.ini, unless given; built by tools/engines.py),
+//    checked against its .sha256 file. With none
 //    there for the platform, this executable serves when it is built
 //    for that platform.
 // 3. Prepare ~/.prospero there (mode 0700), learning what is already at
@@ -766,6 +767,23 @@ struct DeployFile {
     b32 self;   // it is self, not from dir
 };
 
+// The engines directory, unless given: "engines" next to this program,
+// else "engines" in the configuration directory, beside prospero.ini,
+// where the release's engines zip unpacks wherever the program lives:
+// a macOS app in /Applications, say, whose bundle stays as signed.
+static Str enginesdir(Os *os, Arena *a, Str exe)
+{
+    Str here = join(a, parentdir(exe), "engines");
+    Str cfg  = cfgdefault(os, a);
+    if (cfg.len && os_stat(os, *a, here).type!=STAT_DIR) {
+        Str there = join(a, parentdir(cfg), "engines");
+        if (os_stat(os, *a, there).type == STAT_DIR) {
+            return there;
+        }
+    }
+    return here;
+}
+
 // Read a program to upload, from dir/file, or else from self when it
 // is not there and self is not empty. Its place there is .prospero/
 // rname. Null if ok, else why not (unless it is just missing: err).
@@ -1034,7 +1052,7 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     Str ext  = win ? Str(".exe") : Str("");
     Str exe  = os_exepath(os, &scratch);
     Str self = pf.name==deployself() ? exe : Str{};  // this program serves
-    Str from = conf->engines.len ? conf->engines : join(&scratch, parentdir(exe), "engines");
+    Str from = conf->engines.len ? conf->engines : enginesdir(os, &scratch, exe);
     DeployNames names = deploynames(&scratch, pf.name, ext);
 
     DeployFile eng = {};
@@ -1161,7 +1179,8 @@ static Str deployusage =
 "options:\n"
 "  --force             replace another build of this version there\n"
 "  --engines DIR       the engines to choose from (default: engines\n"
-"                      next to this program)\n"
+"                      next to this program, else engines beside the\n"
+"                      default prospero.ini)\n"
 "  --ssh-program PROG  ssh itself (default: ssh)\n"
 "  --scp-program PROG  scp itself (default: scp)\n"
 "  -c FILE             configuration file\n"

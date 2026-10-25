@@ -376,6 +376,26 @@ def relative_engines(t):
 
 
 @scenario
+def config_engines(t):
+    """With no engines directory next to the program, the one beside the
+    default prospero.ini, where the engines zip unpacks wherever the
+    program is installed (a macOS app in /Applications). Another build,
+    so that this program serving instead would show."""
+    src = t.engine(extra=b"another build")
+    there = os.path.join(t.root, "config", "prospero", "engines")
+    shutil.copytree(t.engines, there)
+    bindir = os.path.join(t.root, "bin")
+    os.makedirs(bindir)
+    exe = os.path.join(bindir, os.path.basename(t.prospero))
+    shutil.copy2(t.prospero, exe)
+    argv = [exe, "deploy", "here", "--ssh-program", t.ssh, "--scp-program", t.scp,
+            "--state", t.local]
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=t.env)
+    t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    t.check(sha256(t.deployed()) == sha256(src), "the engine beside prospero.ini is there")
+
+
+@scenario
 def no_hash(t):
     """No tool there to compute a SHA-256: deploying fails at once, for
     good, before uploading anything."""
