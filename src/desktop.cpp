@@ -2,10 +2,11 @@
 //
 // The desktop tool lets an agent see the screen and use the mouse and
 // keyboard. The harness does none of it itself: a helper process takes
-// commands over pipes (the frames deskhelp.cpp describes), the program
-// prospero-desktop next to the executable, or on Windows the executable
-// itself as "prospero desktop" (deskwin32.cpp), started when a session first
-// needs it and stopped when its turn ends. Only Windows, macOS and
+// commands over pipes (the frames deskhelp.cpp describes): the
+// executable itself as "prospero desktop" where it holds the helper
+// (PROSPERO_DESKTOP), else the program prospero-desktop next to it. It
+// is started when a session first needs it and stopped when its turn
+// ends. Only Windows, macOS and
 // Linux (X11, and Wayland through its portals) have a helper so far;
 // elsewhere the tool says that it is not available.
 //

@@ -24,6 +24,7 @@
 // at the system call.
 //
 // This is free and unencumbered software released into the public domain.
+#define PROSPERO_DESKTOP 1  // its own desktop helper (deskwin32.cpp)
 #if PROSPERO_GUI
 #  include "imgui.h"
 #  include "imgui_internal.h"

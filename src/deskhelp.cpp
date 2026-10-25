@@ -1,13 +1,14 @@
 // Desktop helper: prospero-desktop, which sees and drives a desktop
 //
 // A process of its own, apart from the harness, which the turn can stop
-// and whose failures stay its own. On macOS and Linux it is a program of
-// its own too: on macOS so that the one executable with the operating
-// system's grant to watch the screen and send input (macOS asks for it
-// by program) keeps its identity, and on Linux because it loads X11 and
-// the portal's libraries, which a static engine cannot. On Windows it is
-// prospero.exe itself, run as "prospero desktop". It started as winctl
-// (the user's sshd, ~/src/sshd), whose command set it keeps:
+// and whose failures stay its own. On Windows, and in a Linux build that
+// is not static, it is prospero itself, run as "prospero desktop".
+// Elsewhere it is a program of its own too: on macOS so that the one
+// executable with the operating system's grant to watch the screen and
+// send input (macOS asks for it by program) keeps its identity, and
+// beside a static Linux engine because it loads X11 and the portal's
+// libraries, which a static program cannot. It started as winctl (the
+// user's sshd, ~/src/sshd), whose command set it keeps:
 //
 //   list [-a] [WINDOW]              visible top-level windows (-a: all)
 //   shot [-s EDGE PIXELS] [WINDOW [X Y W H]]

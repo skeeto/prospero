@@ -38,10 +38,10 @@ denied.
 ## The helper
 
 The work is done by a helper, which the harness starts for a turn: on
-Windows `prospero.exe` itself, and elsewhere a program of its own,
-`prospero-desktop`, next to `prospero`. Run alone, it takes the same
-commands on its command line (`prospero desktop -h` on Windows,
-`prospero-desktop -h` elsewhere).
+Windows, and in a Linux build from source, `prospero` itself, and
+elsewhere a program of its own, `prospero-desktop`, next to
+`prospero`. Run alone, it takes the same commands on its command line
+(`prospero desktop -h`, or `prospero-desktop -h`).
 
 - **macOS** (15.2 and later): the helper is in
   `Prospero.app/Contents/MacOS`. macOS asks for two permissions, in

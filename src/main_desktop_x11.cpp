@@ -2,6 +2,11 @@
 // deskwayland.cpp, chosen at run time
 // $ c++ -std=c++20 -o prospero-desktop src/main_desktop_x11.cpp
 //
+// A program of its own beside a static engine, which cannot dlopen.
+// Built with PROSPERO_DESKTOP, it is instead a translation unit of
+// prospero's, its "desktop" command (main_posix.cpp), with one entry
+// point, prospero_desktop, so that a build from source is one program.
+//
 // A session is Wayland's when WAYLAND_DISPLAY is set, or when
 // XDG_SESSION_TYPE says wayland and there is no DISPLAY; else X11's.
 // PROSPERO_DESKTOP_SESSION=x11 or =wayland overrides that. Under
@@ -37,6 +42,9 @@
 // else the command fails, naming what has the keyboard, and sends none.
 //
 // This is free and unencumbered software released into the public domain.
+#if PROSPERO_DESKTOP
+#  define DK_NAME "prospero desktop"
+#endif
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -2760,7 +2768,12 @@ static b32 dk_console(Dk *, i32 fd)
 }
 
 
+#if PROSPERO_DESKTOP
+// "prospero desktop ARGS...", "desktop" first in place of a program name
+extern "C" int prospero_desktop(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
     // Standard descriptors must exist, or the display's connection may
     // take one, and output would go into it

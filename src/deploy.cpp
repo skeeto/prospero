@@ -30,9 +30,9 @@
 //    A damaged copy is uploaded again.
 // 5. Rename it into place, and run it once (--version): an engine that
 //    cannot run there (too old a C library, say) is removed again.
-// 6. The desktop helper the same way (steps 3 to 5), except on Windows,
-//    where the engine is its own helper, when the engines directory has
-//    one for the platform, prospero-desktop-VERSION-OS-
+// 6. The desktop helper the same way (steps 3 to 5), except for an
+//    engine that is its own helper (Windows', or this program's where it
+//    is one), when the engines directory has one for the platform, prospero-desktop-VERSION-OS-
 //    ARCH[.exe] (or, when this program serves, its own helper next to
 //    it), to .prospero/desktop-PROTO-VERSION-OS-ARCH[.exe], beside the
 //    engine, where the engine looks for it (deskhelpers, engine.cpp).
@@ -1058,13 +1058,14 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
 
     // The desktop helper beside it, if any: in the engines directory, or
     // else, when this program serves, its own helper next to it. None for
-    // Windows, whose engine is its own helper ("prospero desktop").
+    // an engine that is its own helper ("prospero desktop"): Windows', and
+    // this program serving when it is one (PROSPERO_DESKTOP).
     DeployFile desk = {};
     desk.what = "desktop helper";
     desk.prog = "prospero-desktop";
     Str deskerr = {};
     b32 hasdesk = 0;
-    if (!win) {
+    if (!win && !(eng.self && PROSPERO_DESKTOP)) {
         Str selfdesk = eng.self ? join(&scratch, parentdir(exe), "prospero-desktop") : Str{};
         deskerr = deployread(os, &scratch, &desk, from, names.desktop, selfdesk,
                              names.rdesktop, pf.shell);

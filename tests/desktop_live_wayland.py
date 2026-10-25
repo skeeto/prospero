@@ -13,6 +13,9 @@ a desktop nobody is using: it types and clicks for real.
   uv run tests/desktop_live_wayland.py --helper build/prospero-desktop
                                        [--ask] [--portal]
 
+--helper is a command line, split as the shell would: "build/prospero
+desktop" for a build that holds the helper.
+
 1. It asks the helper what it may do (access). Without the portal's
    approval saved, it stops, unless --ask, when the helper asks for it
    and the desktop shows its remote desktop dialog for the user to
@@ -48,6 +51,7 @@ start (no Wayland, no approval, the editor running already).
 
 import argparse
 import os
+import shlex
 import signal
 import struct
 import subprocess
@@ -225,7 +229,7 @@ def main():
     env["QT_LINUX_ACCESSIBILITY_ALWAYS_ON"] = "1"  # Qt's AT-SPI, for reading back
     if opt.portal:
         env["PROSPERO_DESKTOP_EI"] = "0"
-    h = Serve([opt.helper], env=env, timeout=30)
+    h = Serve(shlex.split(opt.helper), env=env, timeout=30)
     started = None
     try:
         st, text, _ = h.call("hello")

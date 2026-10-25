@@ -3249,12 +3249,22 @@ static void os_httpfree(Os *, Http *h)
 #endif
 
 
+#if PROSPERO_DESKTOP
+// The desktop helper, "prospero desktop" (main_desktop_x11.cpp)
+extern "C" int prospero_desktop(int argc, char **argv);
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc>1 && (!__builtin_strcmp(argv[1], "--reap") ||
                    !__builtin_strcmp(argv[1], "--reap-disclaimed"))) {
         reap(argc, argv);
     }
+    #if PROSPERO_DESKTOP
+    if (argc>1 && !__builtin_strcmp(argv[1], "desktop")) {
+        return prospero_desktop(argc-1, argv+1);
+    }
+    #endif
 
     // Standard descriptors must exist, or new ones would take their place
     for (i32 fd = open("/dev/null", O_RDWR); fd>=0 && fd<=2;) {

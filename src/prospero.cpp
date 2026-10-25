@@ -599,7 +599,7 @@ static Str usage =
 "       prospero connect NAME | --ssh DEST | --local [options]\n"
 "       prospero deploy NAME|DEST [--force] [options]\n"
 "       prospero eval [options] SUITE...\n"
-#if defined(_WIN32)
+#if PROSPERO_DESKTOP
 "       prospero desktop COMMAND [ARGS]  (prospero desktop -h)\n"
 #endif
 "  --version         print the version and exit\n"

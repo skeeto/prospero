@@ -8384,21 +8384,29 @@ def darkpixels(png):
 
 
 def x11helper(t):
-    """The helper next to the harness, where it can drive an X display."""
+    """The helper's command line, where it can drive an X display: the
+    harness's own desktop command, in a build that is not static, else
+    the helper next to it."""
     import ctypes.util
     if not isinstance(t.host, LocalHost) or not sys.platform.startswith("linux"):
         raise Skip("drives an X display: Linux, on this machine")
     if not shutil.which("Xvfb") or not ctypes.util.find_library("X11"):
         raise Skip("needs Xvfb and libX11")
+    own = [t.host.prospero, "desktop"]
+    p = subprocess.run(own + ["--version"], capture_output=True, text=True, timeout=30)
+    if p.stdout.startswith("prospero-desktop "):
+        return own
     helper = t.host.prospero + "-desktop"
     if not os.path.exists(helper):
         raise Skip(f"no helper at {helper}")
-    return helper
+    return [helper]
 
 
 def xrun(env, *args, data=None):
-    """A command with the display, its exit status, output and errors."""
-    p = subprocess.run(list(args), env=env, input=data, capture_output=True, timeout=60)
+    """A command with the display, its exit status, output and errors: a
+    list among args, such as a helper's command line, is spliced in."""
+    argv = [x for a in args for x in (a if isinstance(a, list) else [a])]
+    p = subprocess.run(argv, env=env, input=data, capture_output=True, timeout=60)
     return p.returncode, p.stdout, p.stderr.decode("utf-8", "replace")
 
 
@@ -8549,12 +8557,12 @@ def x11desk(t, wm):
 
         x11cli(t, helper, xenv, wm)
 
-        # Without the window manager, the harness finds the helper next
-        # to itself, as a user's does, unless it has another name
+        # Without the window manager, the harness finds the helper as a
+        # user's does, itself or next to itself, unless it has another name
         log = t.host.join(t.base, "probe.log")
         prompt = json.dumps({"program": sys.executable, "args": ["-I", XPROBE, "window", log]})
         if wm or os.path.basename(t.host.prospero) != "prospero":
-            env = dict(env, PROSPERO_TEST_DESKTOP=json.dumps([helper]))
+            env = dict(env, PROSPERO_TEST_DESKTOP=json.dumps(helper))
         r = t.run(prompt=prompt, timeout=80, env=env)
         ends = [(e["status"], e["text"][:160]) for e in r.all("tool.end")]
         t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {ends}")
@@ -8652,7 +8660,7 @@ def desktop_x11_keys(t):
         keys0 = keys()
 
         # A live helper's keys are its own
-        live = subprocess.Popen([helper, "--serve"], env=env, stdin=subprocess.PIPE,
+        live = subprocess.Popen(helper + ["--serve"], env=env, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
             t.check(helperframe(live, "hello")[0] == 0, "hello")
@@ -8668,7 +8676,7 @@ def desktop_x11_keys(t):
         t.check(waitfor(lambda: keys() == keys0, 5), "unbound as it exits")
 
         # One killed outright leaves them, for the next to undo
-        dead = subprocess.Popen([helper, "--serve"], env=env, stdin=subprocess.PIPE,
+        dead = subprocess.Popen(helper + ["--serve"], env=env, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
             helperframe(dead, "hello")
@@ -8881,7 +8889,7 @@ def desktop_x11_run(t):
     x = Xvfb()
     try:
         env = {"DISPLAY": x.display, "XDG_SESSION_TYPE": "x11", "WAYLAND_DISPLAY": "",
-               "PROSPERO_TEST_DESKTOP": json.dumps([helper])}
+               "PROSPERO_TEST_DESKTOP": json.dumps(helper)}
         xenv = dict(os.environ, **env)
         for apart in ([True, False] if managed else [False]):
             name = "apart" if apart else "attached"

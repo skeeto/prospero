@@ -243,8 +243,15 @@ if(APPLE AND PROSPERO_GUI)
     DEPENDS ${CMAKE_BINARY_DIR}/Prospero.app/Contents/MacOS/prospero)
 endif()
 
-# On Windows the desktop helper is prospero.exe itself (above)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# On Windows the desktop helper is prospero.exe itself (above), and so
+# on Linux in a build that is not static: there it is "prospero desktop"
+# too, the same source as a translation unit of its own. A static
+# engine cannot dlopen, so it gets the helper as a program of its own.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT PROSPERO_STATIC)
+  target_sources(prospero PRIVATE src/main_desktop_x11.cpp)
+  target_link_libraries(prospero PRIVATE ${CMAKE_DL_LIBS})
+  target_compile_definitions(prospero PRIVATE PROSPERO_DESKTOP=1)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # On X11 and Wayland (src/main_desktop_x11.cpp, src/deskwayland.cpp):
   # libX11, libXext and libXtst, and libei, libxkbcommon and libpipewire,
   # are loaded at run time, as SDL3 loads them, so it builds without

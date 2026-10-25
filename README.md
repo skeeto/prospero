@@ -516,19 +516,19 @@ mouse, scrolling, keys and text, which includes `observe`; and
 about every time. `ask = false` asks about nothing at all.
 
 The work is done by a helper, which the harness starts for a turn and
-talks to over pipes. On Windows it is `prospero.exe` itself, run as
-`prospero desktop`. On macOS and Linux it is a program of its own,
-`prospero-desktop`, next to `prospero`: on macOS so that the one program
-the system lets watch the screen keeps its identity however often
-Prospero is rebuilt, and on Linux because it loads the X11 and portal
-libraries, which the static engines cannot. So far it exists
-for Windows (XP and later), macOS (15.2 and later) and Linux, on X11
-or Wayland;
-run alone, it takes the same commands on its command line
-(`prospero-desktop shot screen > s.png`, `list`, `click WINDOW X Y` and
-so on; `prospero-desktop -h`; on Windows `prospero desktop`). An engine that `prospero deploy` put on
-another machine uses the helper deployed beside it (Remote and
-background hosts).
+talks to over pipes. On Windows, and in a Linux build from source, it
+is `prospero` itself, run as `prospero desktop`. Elsewhere it is a
+program of its own, `prospero-desktop`, next to `prospero`: on macOS
+so that the one program the system lets watch the screen keeps its
+identity however often Prospero is rebuilt, and beside the static Linux
+engines of a release because it loads the X11 and portal libraries,
+which a static program cannot. So far it exists for Windows (XP and
+later), macOS (15.2 and later) and Linux, on X11 or Wayland. Run
+alone, it takes the same commands on its command line (`prospero
+desktop shot screen > s.png`, or `prospero-desktop shot screen`;
+`list`, `click WINDOW X Y` and so on; `-h`). An engine that `prospero
+deploy` put on another machine uses the helper deployed beside it, or
+itself (Remote and background hosts).
 
 On macOS the helper sits in `Prospero.app/Contents/MacOS`, and works in
 points, which it captures at the display's full resolution. macOS asks
@@ -631,8 +631,8 @@ A desktop helper there for the platform,
 `prospero-desktop-VERSION-OS-ARCH`, goes too, as
 `desktop-PROTO-VERSION-OS-ARCH` beside the engine, where the engine
 looks for it first; with the executable itself as the engine, its own
-`prospero-desktop` goes. A Windows engine is its own helper, so none
-goes there. `tools/engines.py` builds the Linux helpers beside their
+`prospero-desktop` goes. An engine that is its own helper, a Windows
+one or this executable built from source on Linux, gets none. `tools/engines.py` builds the Linux helpers beside their
 engines. The engine works without a helper, so one
 that cannot be put there, or does not run there, is only a warning.
 

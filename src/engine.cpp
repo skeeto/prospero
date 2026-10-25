@@ -4752,9 +4752,8 @@ enum : i64 {
 
 // Where the helper may be for an executable, first to last: for an
 // engine deployed as engine-PROTO-VERSION-OS-ARCH (deploy.cpp), the
-// helper deployed beside it, desktop-PROTO-VERSION-OS-ARCH; then
-// prospero-desktop next to it, as a build leaves it. Not on Windows,
-// where the engine is its own helper.
+// helper deployed beside it, desktop-PROTO-VERSION-OS-ARCH; then, always
+// last, prospero-desktop next to it, as a build leaves it.
 static Slice<Str> deskhelpers(Arena *a, Str exe)
 {
     Slice<Str> r    = {};
@@ -4768,10 +4767,16 @@ static Slice<Str> deskhelpers(Arena *a, Str exe)
     return r;
 }
 
-// The helper's command line: on Windows this executable's desktop
-// command (deskwin32.cpp), elsewhere the first of deskhelpers there, or
-// for tests the JSON array of strings in PROSPERO_TEST_DESKTOP. Empty if
-// none.
+#ifndef PROSPERO_DESKTOP
+#  define PROSPERO_DESKTOP 0  // whether this executable is its own helper
+#endif
+
+// The helper's command line: the first of deskhelpers there, or this
+// executable's desktop command where it has one (PROSPERO_DESKTOP:
+// Windows, and Linux builds not static), which comes before all but a
+// helper deployed beside it for its version, and on Windows, whose
+// deploys put none there, before all. For tests, the JSON array of
+// strings in PROSPERO_TEST_DESKTOP. Empty if none.
 static Slice<Str> deskhelper(Engine *e, Arena *a)
 {
     Slice<Str> r    = {};
@@ -4784,18 +4789,17 @@ static Slice<Str> deskhelper(Engine *e, Arena *a)
             }
         }
         return r;
-    } else if (HOST_WINDOWS) {
-        if (!e->te.exe.len) {
-            return r;
-        }
-        r = push(a, r, e->te.exe);
-        return push(a, r, Str("desktop"));
     }
     Slice<Str> paths = deskhelpers(a, e->te.exe);
-    for (iz i = 0; i < paths.len; i++) {
+    iz         n     = !PROSPERO_DESKTOP ? paths.len : HOST_WINDOWS ? 0 : paths.len-1;
+    for (iz i = 0; i < n; i++) {
         if (os_stat(e->os, *a, paths[i]).type == STAT_FILE) {
             return push(a, r, paths[i]);
         }
+    }
+    if (PROSPERO_DESKTOP && e->te.exe.len) {
+        r = push(a, r, e->te.exe);
+        r = push(a, r, Str("desktop"));
     }
     return r;
 }
