@@ -529,14 +529,20 @@ class T:
         # The system's temporary directory, the run's own, for the
         # sessions' scratch directories (os_scratchdir)
         self.tmp = host.join(base, "tmp")
+        # A home of its own, so that the user's configuration, skills and
+        # instructions never reach a scenario
+        self.home = host.join(base, "home")
         host.mkdir(self.work)
         host.mkdir(self.state)
         host.mkdir(self.tmp)
+        host.mkdir(self.home)
         if host.windows:
             win = self.tmp.replace("/", "\\")
-            self.tmpenv = {"TMP": win, "TEMP": win}
+            self.tmpenv = {"TMP": win, "TEMP": win, "HOME": self.home,
+                           "APPDATA": host.join(self.home, "AppData").replace("/", "\\")}
         else:
-            self.tmpenv = {"TMPDIR": self.tmp}
+            self.tmpenv = {"TMPDIR": self.tmp, "HOME": self.home,
+                           "XDG_CONFIG_HOME": host.join(self.home, ".config")}
         # Endpoint settings, with "_top" settings before any section,
         # "_path" after the endpoint's URL, "_extra" as more sections,
         # where {model} and {model2} are the scenario's model names, and
