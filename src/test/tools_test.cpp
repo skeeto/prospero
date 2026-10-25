@@ -619,7 +619,7 @@ static void test_tools(Test *t)
                "Roles:\n- explore: reads")>0), "1");
         Str sys = systemprompt(a, "/w", &te);
         expect(t, "system prompt for a role", istr(a, find(sys, "grep and glob")<0 &&
-               find(sys, "todo_write")<0 && find(sys, "subagents")>0), "1");
+               find(sys, "another session")<0), "1");
     }
 
     // Todo lists

@@ -455,8 +455,7 @@ static void test_desktop(Test *t)
         te.coords = COORDS_NORM1000;
         Str norm = tooljson(a, &te);
         expect(t, "desktop norm1000", istr(a, find(norm, "thousandths")>0), "1");
-        Str sys = systemprompt(a, "/w", &te);
-        expect(t, "desktop guideline", istr(a, find(sys, "desktop tool")>0), "1");
+        expect(t, "desktop look first", istr(a, find(norm, "before acting and after")>0), "1");
         expect(t, "computer alias", istr(a, find(unknowntool(a, "computer", 0),
                "Did you mean \"desktop\"")>0), "1");
     }

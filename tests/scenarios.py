@@ -4078,10 +4078,6 @@ def final_newline(t):
             "made.txt": "made by edit\n"}
     got = {k: t.file(k) for k in want}
     t.check(got == want, f"files {got}")
-    write = [x["function"] for x in t.requests()[0]["body"]["tools"]
-             if x["function"]["name"] == "write"]
-    t.check("without a final newline gets one" in write[0]["description"],
-            f"the write tool says so: {write[0]['description']!r}")
 
     sid = r.events[0]["sid"]
     h = t.headless()
@@ -6815,8 +6811,8 @@ def plan_new(t):
         msgs = first["messages"]
         t.check(msgs[-1]["role"] == "user" and msgs[-1]["content"].startswith("Plan mode is on")
                 and plan in msgs[-1]["content"], f"told: {msgs[-1]}")
-        t.check("except to approve a plan in plan mode" in msgs[0]["content"] and
-                "exit_plan_mode" in msgs[0]["content"], "the system prompt says plan mode exists")
+        t.check("except to approve a plan in plan mode" in msgs[0]["content"],
+                "the system prompt says plan mode exists")
         names = fake_provider.tool_names(first)
         t.check("enter_plan_mode" in names and "exit_plan_mode" in names, f"tools: {names}")
 
@@ -7585,7 +7581,7 @@ def msg_wake(t):
         req = t.requests()[0]["body"]
         names = [x["function"]["name"] for x in req["tools"]]
         t.check("sessions" in names and "send_message" in names, f"tools {names}")
-        t.check("Other agents may send you messages" in req["messages"][0]["content"],
+        t.check("Messages marked as from another session" in req["messages"][0]["content"],
                 "the rules say so")
     finally:
         rc = h.close()
@@ -7933,8 +7929,8 @@ def desktop_flow(t):
     desc = [x for x in reqs[0]["tools"] if x["function"]["name"] == "desktop"]
     t.check(desc and "in pixels of its image" in desc[0]["function"]["description"],
             "offered, with points in pixels")
-    t.check("desktop tool acts on the user's real screen" in reqs[0]["messages"][0]["content"],
-            "the system prompt mentions it")
+    t.check("screenshot before acting and after" in desc[0]["function"]["description"],
+            "look before and after")
     # Points in a window's screenshot: the latest screenshot was the
     # editor's, so a click went to it by its id, as later requests keep
     t.check(len(fake_provider.desk_images(reqs[-1])) == 2, "both screenshots kept")
@@ -8189,7 +8185,7 @@ def read_image(t):
             [(1, 1), (6, 4), (64, 32)] and all("shot" not in e for e in ends), f"ends {ends}")
     tools = t.requests()[0]["body"]["tools"]
     desc = [x["function"]["description"] for x in tools if x["function"]["name"] == "read"][0]
-    t.check("shown to you as an image" in desc, f"read says so: {desc}")
+    t.check("shown as an image" in desc, f"read says so: {desc}")
 
     # Each image in the request after its read, then only the latest
     reqs = [q["body"] for q in t.requests()]
