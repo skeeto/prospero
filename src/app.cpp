@@ -253,6 +253,8 @@ enum : i32 {
     RECT_CMCUT,
     RECT_MODEL0,     // /model's first model
     RECT_SIDELINK,   // a side chat's link to its original
+    RECT_NEWMODEL,   // the new session dialog's model combo
+    RECT_NEWPICK,    // its first pick other than the default model
     RECT_THEME0,     // the theme's choices in its open list
     RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
     RECT_COUNT = RECT_PANE0 + 11,
@@ -401,6 +403,22 @@ enum : i32 {
     GH_REMOTE,  // a [remote NAME] over ssh
 };
 
+// An endpoint a host's engine listed the models of (models).
+struct GuiEndpoint {
+    Str        name;
+    Str        url;
+    b32        ok;
+    Str        err;     // why not, if not
+    Slice<Str> models;  // ids, as listed
+};
+
+// A [model NAME] section of a host's configuration, and the id it
+// names the model by in requests.
+struct GuiModel {
+    Str name;
+    Str id;
+};
+
 // A role a host's configuration has, for a new session there.
 struct GuiRole {
     Str name;
@@ -446,8 +464,18 @@ struct GuiHost {
     b32        modelsgot;  // models is its answer since it came up
     Str        modelserr;  // why there is no answer
     // And its roles, from the same answer, for a new session there (none
-    // from an engine older than config.get's roles)
+    // from an engine older than config.get's roles), and its [model]
+    // sections with their ids
     Slice<GuiRole> roles;
+    Slice<GuiModel> confs;
+    // Its endpoints' listings (models), for the model pickers: the latest
+    // answer, shown while another is asked for, with the defaults then
+    Slice<GuiEndpoint> eps;
+    Str        epdflt;     // the default endpoint, a name or a URL
+    Str        modeldflt;  // and model, either empty if none
+    i64        listid;     // its models in flight, 0 if none
+    b32        listgot;    // eps is an answer
+    Str        listsig;    // that answer, to tell when it changed
 };
 
 struct AttBox;
@@ -825,6 +853,7 @@ struct Import {
     b32      modelwait;  // its models were yet to come
     GuiHost *to;         // where it goes, as what the dialog said
     Str      newcwd;
+    Str      newep;
     Str      newmodel;
     b32      newnofolder;
     Str      token;      // the upload's, once the first part is in
@@ -1087,7 +1116,11 @@ struct Gui {
 
     // Dialogs and settings
     char              *newcwd;     // the new session's fields
-    char              *newmodel;
+    char              *newmodel;   // its model, as picked or typed
+    char              *newep;      // and endpoint: both empty for the defaults
+    char              *newfilter;  // the model picker's text
+    b32                newcheck;   // keep the pick only if still listed
+    GuiHost           *newlisted;  // the host the dialog asked for models
     Str                firstcwd;   // newcwd's first, a directory here
     Str                newerr;
     u64                browseask;  // its Browse dialog's latest ask
@@ -1193,6 +1226,8 @@ struct Gui {
                                    // window fits, else the primary's
     b32                firstlayout;
     b32                firstrun;   // no layout file: Help floats in front
+    b32                firstextras;  // and Settings and Hosts with it, till
+                                     // the main host's endpoints list a model
     b32                configured; // a model or remote host (cfgconfigured)
     i32                jobsfocus;  // frames until the Jobs tab is selected
     i32                helpfocus;  // and the Help tab, on a first run
@@ -1289,6 +1324,10 @@ struct Gui {
     Str                cfgsnap;      // the config file before an edit
     GuiSession        *drivesess;    // the session OP_MARKSESS remembered
     b32                modelsshown;  // /model's list drew
+    i32                picksframe;   // the new session's model list drew then
+    Str                pickwant;     // its first pick other than the default
+                                     // model (RECT_NEWPICK), "ENDPOINT/MODEL"
+    Str                picked;       // what Create sent, "ENDPOINT/MODEL"
     i64                tailseen;     // tool.out records for running rows
     b32                drive;
     i32                drivepc;
@@ -1666,6 +1705,23 @@ static Slice<GuiRole> replyroles(Arena *a, Json *j)
     return r;
 }
 
+// The [model NAME] sections in a config.get reply, each with its id,
+// which the reply gives in effect, else the name.
+static Slice<GuiModel> replyconfs(Arena *a, Json *j)
+{
+    Slice<GuiModel> r = {};
+    for (Json *s = jsonget(j, "settings")->child; s; s = s->next) {
+        Str name = jsonstr(jsonget(s, "name"));
+        if (jsonstr(jsonget(s, "kind"))=="model" && name.len &&
+                jsonstr(jsonget(s, "key"))=="id") {
+            Str      id = trim(jsonstr(jsonget(s, "value")));
+            GuiModel m  = {name, id.len ? id : name};
+            r = push(a, r, m);
+        }
+    }
+    return r;
+}
+
 // A host's answer to hostmodels, kept anew only when it changed.
 static void onhostmodels(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok, Str err)
 {
@@ -1697,7 +1753,222 @@ static void onhostmodels(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok, Str
             h->roles = push(&g->perm, h->roles, c);
         }
     }
+    Slice<GuiModel> confs = ok ? replyconfs(&scratch, j) : Slice<GuiModel>{};
+    same = confs.len == h->confs.len;
+    for (iz i = 0; same && i < confs.len; i++) {
+        same = confs[i].name==h->confs[i].name && confs[i].id==h->confs[i].id;
+    }
+    if (!same) {
+        h->confs = {};
+        for (iz i = 0; i < confs.len; i++) {
+            GuiModel c = {clone(&g->perm, confs[i].name), clone(&g->perm, confs[i].id)};
+            h->confs = push(&g->perm, h->confs, c);
+        }
+    }
     scheddirty(&g->sched);
+}
+
+static b32  hostcan(GuiHost *, Str);
+static void firstlisted(Gui *, GuiHost *);
+
+// Ask a host's engine for its endpoints' models (models), unless asked
+// already: when a new session's dialog shows it, and the main host's
+// once as it comes up. An engine without the command keeps the text
+// field and its configuration's models.
+static void hostlist(Gui *g, GuiHost *h)
+{
+    if (h->listid || !h->up || !hostcan(h, "models") || !engineup(g) ||
+            (h->kind!=GH_ENGINE && (!h->r || h->closing))) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 64);
+    EvOut w = cmdopen(g, &b, CMD_MODELS, 0, h);
+    h->listid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// A host's answer to hostlist, kept anew only when it changed. A failed
+// command keeps the answer before it.
+static void onhostlist(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok)
+{
+    h->listid = 0;
+    if (!ok) {
+        return;
+    }
+    // What the answer says, as one string to compare
+    Json *eps = jsonget(j, "endpoints");
+    Buf   sig(&scratch, 1<<12);
+    print(&sig, jsonstr(jsonget(j, "endpoint")));
+    putbyte(&sig, 0);
+    print(&sig, jsonstr(jsonget(j, "model")));
+    for (Json *e = eps->child; e; e = e->next) {
+        putbyte(&sig, 1);
+        print(&sig, jsonstr(jsonget(e, "name")));
+        putbyte(&sig, 0);
+        print(&sig, jsonstr(jsonget(e, "url")));
+        putbyte(&sig, 0);
+        print(&sig, jsonint(jsonget(e, "ok"), 0));
+        print(&sig, jsonstr(jsonget(e, "err")));
+        for (Json *m = jsonget(e, "models")->child; m; m = m->next) {
+            putbyte(&sig, 0);
+            print(&sig, jsonstr(m));
+        }
+    }
+    Str now = finish(&sig);
+    b32 was = h->listgot;
+    h->listgot = 1;
+    if (was && now==h->listsig) {
+        return;
+    }
+    Arena *a = &g->perm;
+    h->listsig   = clone(a, now);
+    h->epdflt    = clone(a, jsonstr(jsonget(j, "endpoint")));
+    h->modeldflt = clone(a, jsonstr(jsonget(j, "model")));
+    h->eps       = {};
+    for (Json *e = eps->child; e; e = e->next) {
+        GuiEndpoint ep = {};
+        ep.name = clone(a, jsonstr(jsonget(e, "name")));
+        ep.url  = clone(a, jsonstr(jsonget(e, "url")));
+        ep.ok   = jsonint(jsonget(e, "ok"), 0) != 0;
+        ep.err  = clone(a, jsonstr(jsonget(e, "err")));
+        for (Json *m = jsonget(e, "models")->child; m; m = m->next) {
+            Str id = jsonstr(m);
+            if (id.len) {
+                ep.models = push(a, ep.models, clone(a, id));
+            }
+        }
+        h->eps = push(a, h->eps, ep);
+    }
+    if (!was && h==g->main) {
+        firstlisted(g, h);
+    }
+    scheddirty(&g->sched);
+}
+
+// A model to pick for a new session, or to switch a session to.
+struct ModelPick {
+    Str endpoint;  // an endpoint's name, or the default's (maybe a URL)
+    Str model;
+    Str label;     // as shown: ENDPOINT/MODEL
+    Str err;       // an endpoint that failed: a row of its own, disabled
+    b32 dflt;      // the defaults, which go first
+};
+
+// The models a host's endpoints list, as picks: the defaults first, then
+// for each endpoint in the engine's order, the configuration's [model]
+// sections that it lists by name or by id, then the rest of its ids;
+// last, the [model] sections that none lists.
+static Slice<ModelPick> modelpicks(Gui *g, Arena *a, GuiHost *h)
+{
+    Slice<ModelPick> r     = {};
+    Slice<GuiModel>  confs = h==g->main ? replyconfs(a, g->cfg) : h->confs;
+    if (h->modeldflt.len) {
+        ModelPick p = {};
+        p.endpoint = h->epdflt;
+        p.model    = h->modeldflt;
+        p.label    = h->epdflt.len ? concat(a, concat(a, h->epdflt, "/"), h->modeldflt)
+                                   : h->modeldflt;
+        p.dflt     = 1;
+        r = push(a, r, p);
+    }
+    for (iz i = 0; i < h->eps.len; i++) {
+        GuiEndpoint *ep = &h->eps[i];
+        if (!ep->ok || !ep->models.len) {
+            ModelPick p = {};
+            p.endpoint = ep->name;
+            p.err      = !ep->ok && ep->err.len ? ep->err :
+                         !ep->ok ? Str("failed") : Str("lists no models");
+            p.label    = concat(a, concat(a, ep->name, ": "), p.err);
+            r = push(a, r, p);
+            continue;
+        }
+        iz from = r.len;
+        for (iz k = 0; k < confs.len; k++) {
+            b32 listed = 0;
+            for (iz m = 0; !listed && m < ep->models.len; m++) {
+                listed = ep->models[m]==confs[k].name || ep->models[m]==confs[k].id;
+            }
+            if (listed) {
+                ModelPick p = {};
+                p.endpoint = ep->name;
+                p.model    = confs[k].name;
+                p.label    = concat(a, concat(a, ep->name, "/"), p.model);
+                r = push(a, r, p);
+            }
+        }
+        for (iz m = 0; m < ep->models.len; m++) {
+            b32 dup = 0;
+            for (iz k = from; !dup && k < r.len; k++) {
+                dup = r[k].model == ep->models[m];
+            }
+            if (!dup) {
+                ModelPick p = {};
+                p.endpoint = ep->name;
+                p.model    = ep->models[m];
+                p.label    = concat(a, concat(a, ep->name, "/"), p.model);
+                r = push(a, r, p);
+            }
+        }
+    }
+    // Last, the [model] sections none lists, by name: at the default
+    // endpoint, or for a session at its own
+    for (iz k = 0; k < confs.len; k++) {
+        b32 dup = 0;
+        for (iz i = 0; !dup && i < r.len; i++) {
+            dup = !r[i].dflt && r[i].model==confs[k].name;
+        }
+        if (!dup) {
+            ModelPick p = {};
+            p.model = p.label = confs[k].name;
+            r = push(a, r, p);
+        }
+    }
+    return r;
+}
+
+// A model typed for a host, MODEL or ENDPOINT/MODEL, split as the engine
+// splits it: only where ENDPOINT names an endpoint it listed.
+static ModelPick modeltyped(GuiHost *h, Str text)
+{
+    ModelPick p = {};
+    p.model = text;
+    Cut c = cut(text, '/');
+    for (iz i = 0; c.ok && c.head.len && c.tail.len && i<h->eps.len; i++) {
+        if (h->eps[i].name == c.head) {
+            p.endpoint = c.head;
+            p.model    = c.tail;
+        }
+    }
+    return p;
+}
+
+// The main host's first listing, on a first run that showed Settings
+// and Hosts because nothing was configured: a default model, as the
+// endpoints listed one, is enough to start with, so they close again.
+static void firstlisted(Gui *g, GuiHost *h)
+{
+    if (!g->firstextras) {
+        return;
+    }
+    g->firstextras = 0;
+    if (h->modeldflt.len) {
+        g->configured           = 1;
+        g->panes[PANE_SETTINGS] = 0;
+        g->panes[PANE_HOSTS]    = 0;
+    }
+}
+
+// A session's model as a host's picks name it: ENDPOINT/MODEL, its
+// endpoint's URL taken back to that endpoint's name, else the model.
+static Str modelshown(Arena *a, GuiHost *h, Str url, Str model)
+{
+    for (iz i = 0; url.len && i < h->eps.len; i++) {
+        if (h->eps[i].url == url) {
+            return concat(a, concat(a, h->eps[i].name, "/"), model);
+        }
+    }
+    return model;
 }
 
 // Change one setting; a null value removes it.
@@ -2316,19 +2587,29 @@ static void imgdrop(Gui *g, GuiSession *s)
 }
 
 // A new session in cwd, or with nofolder in a folder of its own, with
-// the given model or the configured one, and a role ([role NAME]), if
-// named, in plan mode if asked.
-static void guinew(Gui *g, GuiHost *h, Str cwd, Str model, Str role = {}, b32 plan = 0,
-                   b32 nofolder = 0)
+// the given endpoint and model, else the defaults, and a role ([role
+// NAME]), if named, in plan mode if asked. With neither named, nor a
+// role, whose own may differ, the defaults the host's endpoints listed
+// go along, which the engine would pick alike, given those listings.
+static void guinew(Gui *g, GuiHost *h, Str cwd, Str endpoint, Str model, Str role = {},
+                   b32 plan = 0, b32 nofolder = 0)
 {
+    if (!endpoint.len && !model.len && !role.len && h->listgot) {
+        endpoint = h->epdflt;
+        model    = h->modeldflt;
+    }
     Arena a = newarena(g->cmdr);
-    Buf   b(&a, 512 + cwd.len + model.len + role.len);
+    Buf   b(&a, 512 + cwd.len + endpoint.len + model.len + role.len);
     EvOut w = cmdopen(g, &b, CMD_NEW, 0, h);
     if (nofolder) {
         putintkey(&w.json, "nofolder", 1);
     } else {
         putkey(&w.json, "cwd");
         putstr(&w.json, cwd);
+    }
+    if (endpoint.len) {
+        putkey(&w.json, "endpoint");
+        putstr(&w.json, endpoint);
     }
     if (model.len) {
         putkey(&w.json, "model");
@@ -2538,13 +2819,17 @@ static void guirename(Gui *g, GuiSession *s, Str title)
 
 // Another model for the rest of the session: a name as the session's
 // endpoint lists it, or ENDPOINT/MODEL.
-static void guimodel(Gui *g, GuiSession *s, Str model)
+static void guimodel(Gui *g, GuiSession *s, Str model, Str endpoint = {})
 {
     Arena a = newarena(g->cmdr);
-    Buf   b(&a, 256 + model.len);
+    Buf   b(&a, 256 + model.len + endpoint.len);
     EvOut w = cmdopen(g, &b, CMD_MODEL, s);
     putkey(&w.json, "model");
     putstr(&w.json, model);
+    if (endpoint.len) {
+        putkey(&w.json, "endpoint");
+        putstr(&w.json, endpoint);
+    }
     s->cmdid   = g->nextid;
     s->cmdtext = {};
     s->note    = {};
@@ -3287,7 +3572,7 @@ static void opendirnew(Gui *g, Str dir, Str why)
     g->newhost = g->main;
     fieldput(g->newcwd, dir);
     guilog(g, concat(&a, concat(&a, concat(&a, "a new session in ", dir), ", as "), why));
-    guinew(g, g->main, dir, {});
+    guinew(g, g->main, dir, {}, {});
 }
 
 // A dropped file, attached to the draft shown. A directory has a new
@@ -3665,6 +3950,12 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             }
             g->lasterr = clone(&g->perm, err);
             guilog(g, g->lasterr);
+        }
+        return;
+
+    case CMD_MODELS:
+        if (q.h && q.h->listid==id) {
+            onhostlist(g, q.h, scratch, j, ok);  // a failure keeps the last
         }
         return;
 
@@ -4461,6 +4752,9 @@ static b32 guirecord(Gui *g, GuiHost *h, Str line)
             g->engineok = 1;
             h->up       = 1;
         }
+        if (h==g->main && !h->listgot) {
+            hostlist(g, h);  // for the new session dialog, and first runs
+        }
         return 1;
     case EV_SESSIONS:
         onsessions(g, h, r.root);
@@ -4913,6 +5207,10 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
         h->opens++;
         h->modelsid  = 0;  // its configuration may differ now
         h->modelsgot = 0;
+        h->listid    = 0;  // its reply may have gone with the link
+        if (h==g->main && !h->listgot) {
+            hostlist(g, h);
+        }
         if (h->updating == UPD_RESTART) {
             h->updating = UPD_DONE;
             h->updmsg   = clone(&g->perm, concat(&a, "Updated: the engine there is ", h->version));
@@ -5517,13 +5815,16 @@ static void importnext(Gui *g)
         cmdsend(g, &w, a);
         return;
     }
-    Buf   b(&a, 256 + x->newcwd.len + x->newmodel.len);
+    Buf   b(&a, 256 + x->newcwd.len + x->newep.len + x->newmodel.len);
     EvOut w = cmdopen(g, &b, CMD_IMPORT, 0, x->to);
     putstrkey(&w.json, "token", x->token);
     if (x->newnofolder) {
         putintkey(&w.json, "nofolder", 1);
     } else {
         putstrkey(&w.json, "cwd", x->newcwd);
+    }
+    if (x->newep.len) {
+        putstrkey(&w.json, "endpoint", x->newep);
     }
     if (x->newmodel.len) {
         putstrkey(&w.json, "model", x->newmodel);
@@ -5535,12 +5836,13 @@ static void importnext(Gui *g)
 
 // The dialog's Import: the log goes to the host, from its start, to
 // work in cwd, or with nofolder in a folder of its own.
-static void importbegin(Gui *g, GuiHost *h, Str cwd, Str model, b32 nofolder)
+static void importbegin(Gui *g, GuiHost *h, Str cwd, Str endpoint, Str model, b32 nofolder)
 {
     Import *x = &g->imp;
     x->to       = h;
     x->newnofolder = nofolder;
     x->newcwd   = clone(&x->mem, cwd);
+    x->newep    = clone(&x->mem, endpoint);
     x->newmodel = clone(&x->mem, model);
     x->token    = {};
     x->off      = 0;
@@ -7933,6 +8235,8 @@ enum : i32 {
     T_NAMED,       // the item whose name (itemnamed) starts with text
     T_USERMSG,     // the latest user message drawn in the transcript
     T_SIDELINK,    // a side chat's link back to its original
+    T_NEWMODEL,    // the new session dialog's model combo
+    T_NEWPICK,     // its first pick other than the default model
 };
 
 enum : i32 {
@@ -8174,6 +8478,10 @@ enum : i32 {
                       // drawn, and the agent went on: nothing more to move
     CHK_BGTASKS,      // the task rows at work offer Run in background beside
                       // their Open subagent
+    CHK_NEWPICKS,     // the new session's model list drew: the defaults
+                      // first, then text's models (text "fake/")
+    CHK_NEWPICKED,    // the combo shows the pick (pickwant)
+    CHK_SESSPICKED,   // the session shown has the pick's endpoint and model
     CHK_COUNT,
 };
 
@@ -8383,6 +8691,9 @@ static Str chknames[] = {
     "the running command's row offers Run in background",
     "Cmd+B moved the command to the background as a job, and the agent went on",
     "the task rows at work offer Run in background, and their subagents",
+    "the model list has the defaults first, then the endpoint's models",
+    "the model combo shows the model picked",
+    "the new session has the endpoint and model picked",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -10890,6 +11201,31 @@ static DriveOp launchops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_SESSDIR, 0, 0, 0, "/pick/alpha/two/deep"},
     {OP_SHOT, 0, 0, 0, 300, "launch-6-completed"},
+    // The model, from the endpoints' listings: the defaults first, then
+    // fake's models; one picked is the new session's, at that endpoint
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_MOVE, T_NEWMODEL, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_NEWPICKS, 0, 0, 0, "fake/"},
+    {OP_SHOT, 0, 0, 0, 300, "launch-7-models"},
+    {OP_MOVE, T_NEWPICK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NEWPICKED, 0, 0, 0, ""},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SESSPICKED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "launch-8-picked"},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
@@ -11463,6 +11799,8 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_CMEDITOR:      return rectcenter(g->rects[RECT_CMEDITOR]);
     case T_EDITCANCEL:    return rectcenter(g->rects[RECT_EDITCANCEL]);
     case T_MODEL0:        return rectcenter(g->rects[RECT_MODEL0]);
+    case T_NEWMODEL:      return rectcenter(g->rects[RECT_NEWMODEL]);
+    case T_NEWPICK:       return rectcenter(g->rects[RECT_NEWPICK]);
     case T_NAMED: {
         Str text = g->ops[g->drivepc-1].text;
         for (i32 i = 0; i < g->nnamed; i++) {
@@ -13693,6 +14031,32 @@ static b32 drivecheck(Gui *g, i32 chk)
                find(m->text, "the user moved it to the background")>=0 &&
                !g->bgshown && !canbackground(g->sess);
     }
+    case CHK_NEWPICKS: {
+        Arena            a  = g->frame;
+        GuiHost         *h  = g->main;
+        DriveOp         *op = &g->ops[g->drivepc-1];
+        Slice<ModelPick> p  = modelpicks(g, &a, h);
+        b32 ok = g->picksframe>=ImGui::GetFrameCount()-1 && h->listgot &&
+                 p.len>=2 && p[0].dflt && g->pickwant.len &&
+                 p[0].label==concat(&a, op->text, h->modeldflt);
+        for (iz i = 1; ok && i < p.len; i++) {
+            ok = !p[i].dflt && !p[i].err.len && startswith(p[i].label, op->text);
+        }
+        return ok;
+    }
+    case CHK_NEWPICKED: {
+        Arena a  = g->frame;
+        Str   ep = {(u8 *)g->newep, (iz)__builtin_strlen(g->newep)};
+        Str   m  = {(u8 *)g->newmodel, (iz)__builtin_strlen(g->newmodel)};
+        return ImGui::GetTopMostPopupModal() && g->pickwant.len &&
+               concat(&a, concat(&a, ep, "/"), m)==g->pickwant;
+    }
+    case CHK_SESSPICKED: {
+        Arena a = g->frame;
+        return g->sess && v && g->sess->host==g->main && g->pickwant.len &&
+               g->picked==g->pickwant &&
+               modelshown(&a, g->main, v->endpoint, v->model)==g->pickwant;
+    }
     case CHK_REMOTEFAILED: {
         GuiHost *h = findhost(g, GH_REMOTE, "bad");
         return h && h->state==RS_FAILED && !h->r && g->failshown &&
@@ -14031,7 +14395,7 @@ static void drivestep(Gui *g)
         fakecmd(g, FAKE_STOP, "");
         break;
     case OP_NEWSESSION:
-        guinew(g, g->main, g->drivecwd, {}, op->text);  // in a role, if named
+        guinew(g, g->main, g->drivecwd, {}, {}, op->text);  // in a role, if named
         break;
     case OP_TOUCH: {
         Arena a = g->frame;
@@ -14909,6 +15273,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->exp.tools  = 1;
     g->exp.output = 0;
     g->newmodel   = alloc<char>(&g->perm, FIELD_MAX);
+    g->newep      = alloc<char>(&g->perm, FIELD_MAX);
+    g->newfilter  = alloc<char>(&g->perm, FIELD_MAX);
     g->denynote   = alloc<char>(&g->perm, FIELD_MAX);
     g->addname    = alloc<char>(&g->perm, FIELD_MAX);
     g->cfgpbuf    = alloc<u8>(&g->perm, FIELD_MAX);
@@ -15060,6 +15426,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     if (g->firstrun) {
         g->panes[PANE_SETTINGS] = !g->configured;
         g->panes[PANE_HOSTS]    = !g->configured;
+        g->firstextras          = !g->configured;
     }
 
     g->sched = newsched(os_ticks(os), 16667);

@@ -1848,6 +1848,9 @@ static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v)
     Str   why = g->enginekind==ENGINE_FAKE ? Str("No engine") :
                 sesswhy(g, s, "model", !planwaits(v), 0);
     Str   now = v->model.len ? v->model : s->model;
+    if (now.len && hostcan(s->host, "models")) {
+        now = modelshown(&a, s->host, v->endpoint, now);  // ENDPOINT/MODEL
+    }
     ImGui::SameLine();
     // A button that looks the part, its list a popup: a combo's own
     // popup would begin inside the disabled block
@@ -4160,10 +4163,134 @@ static Slice<Str> cfgmodels(Gui *g, Arena *a)
     return r;
 }
 
+// Rows of a host's model picks (modelpicks), those whose label has the
+// filter in it, ignoring case, in a list of their own that scrolls past
+// a dozen, a failed endpoint's row disabled, the defaults' marked. Row
+// cur is checked, and row mark's place kept as rect. Returns the row
+// clicked, else -1.
+static i32 pickrows(Gui *g, Arena a, Slice<ModelPick> picks, Str filter, i32 cur,
+                    i32 mark, i32 rect)
+{
+    f32 w = 280*g->scale;
+    i32 n = 0;
+    for (iz i = 0; i < picks.len; i++) {
+        Str label = picks[i].dflt ? concat(&a, picks[i].label, "  (default)") : picks[i].label;
+        if (!filter.len || contains(picks[i].label, filter)) {
+            f32 lw = ImGui::CalcTextSize(cstr0(&a, label)).x;
+            w = lw>w ? lw : w;
+            n++;
+        }
+    }
+    if (!n) {
+        ImGui::TextDisabled(filter.len ? "None has that: Enter takes it as typed"
+                                       : "No models listed");
+        return -1;
+    }
+    ImGuiStyle &st  = ImGui::GetStyle();
+    f32         row = ImGui::GetTextLineHeightWithSpacing();
+    f32         h   = (f32)(n<12 ? n : 12)*row + 2*st.WindowPadding.y;
+    i32         hit = -1;
+    f32         cw  = w + 2*st.WindowPadding.x + st.ScrollbarSize;
+    f32         av  = ImGui::GetContentRegionAvail().x;
+    ImGui::BeginChild("##picks", v2(cw>av ? cw : av, h));  // a combo's width
+    for (iz i = 0; i < picks.len; i++) {
+        ModelPick *p = &picks[i];
+        if (filter.len && !contains(p->label, filter)) {
+            continue;
+        }
+        Str label = p->dflt ? concat(&a, p->label, "  (default)") : p->label;
+        ImGui::PushID((i32)i);
+        ImGui::BeginDisabled(p->err.len > 0);
+        if (ImGui::Selectable(cstr0(&a, label), i==cur) && !p->err.len) {
+            hit = (i32)i;
+        }
+        ImGui::EndDisabled();
+        if (i == cur) {
+            ImGui::SetItemDefaultFocus();
+        }
+        itemnamed(g, p->dflt ? Str("model (default)") : concat(&a, "model ", p->model));
+        if (i == mark) {
+            itemrect(g, rect);
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    return hit;
+}
+
+// An endpoint of a host's listing, by name, as its URL; else as given
+// (the default endpoint may be a URL).
+static Str pickurl(GuiHost *h, Str endpoint)
+{
+    for (iz i = 0; i < h->eps.len; i++) {
+        if (h->eps[i].name == endpoint) {
+            return h->eps[i].url;
+        }
+    }
+    return endpoint;
+}
+
+// The models to switch to, as the host's endpoints list them (models):
+// a field to filter them, or for another model, MODEL or ENDPOINT/MODEL,
+// then the list. Each goes to the engine as ENDPOINT/MODEL, which it
+// splits.
+static void listitems(Gui *g, Arena a, GuiSession *s)
+{
+    View    *v   = s->view;
+    GuiHost *h   = s->host;
+    Str      now = v && v->model.len ? v->model : s->model;
+    Str      url = v ? v->endpoint : Str{};
+    if (ImGui::IsWindowAppearing()) {
+        hostlist(g, h);  // anew, the last answer shown meanwhile
+        g->modelbuf[0] = 0;
+    }
+    ImGui::SetNextItemWidth(280*g->scale);
+    Str filter = {};
+    if (ImGui::InputTextWithHint("##other", "filter, or another model, Enter", g->modelbuf,
+                                 FIELD_MAX, ImGuiInputTextFlags_EnterReturnsTrue)) {
+        Str m = trim({(u8 *)g->modelbuf, (iz)__builtin_strlen(g->modelbuf)});
+        if (m.len) {
+            s->note = {};
+            guimodel(g, s, m);
+            g->modelbuf[0] = 0;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    filter = trim({(u8 *)g->modelbuf, (iz)__builtin_strlen(g->modelbuf)});
+    if (!h->listgot) {
+        ImGui::TextDisabled("Asking the endpoints for their models...");
+    }
+    Slice<ModelPick> picks = modelpicks(g, &a, h);
+    i32 cur = -1, mark = -1;
+    for (iz i = 0; i < picks.len; i++) {
+        ModelPick *p  = &picks[i];
+        b32        is = !p->err.len && p->model==now && (!url.len || pickurl(h, p->endpoint)==url);
+        cur  = cur<0 && is && !p->dflt ? (i32)i : cur;
+        mark = mark<0 && !is && !p->err.len ? (i32)i : mark;
+    }
+    i32 hit = pickrows(g, a, picks, filter, cur, mark, RECT_MODEL0);
+    if (hit >= 0) {
+        ModelPick *p = &picks[hit];
+        s->note = {};
+        if (pickurl(h, p->endpoint) != p->endpoint) {
+            guimodel(g, s, concat(&a, concat(&a, p->endpoint, "/"), p->model));
+        } else {
+            guimodel(g, s, p->model, p->endpoint);  // the default's, by URL
+        }
+        g->modelbuf[0] = 0;
+        ImGui::CloseCurrentPopup();
+    }
+}
+
 // The models to switch to, as menu items, then a field for another: a
 // host's other than the main one's as its own configuration has them.
+// An engine that lists its endpoints' models has those instead.
 static void modelitems(Gui *g, Arena a, GuiSession *s)
 {
+    if (hostcan(s->host, "models")) {
+        listitems(g, a, s);
+        return;
+    }
     Str        now    = s->view && s->view->model.len ? s->view->model : s->model;
     GuiHost   *h      = s->host;
     b32        theirs = h != g->main;  // its engine's configuration
@@ -5330,7 +5457,30 @@ static void importfill(Gui *g, GuiHost *h)
             return;
         }
     }
+    if (x->modelwait && hostcan(h, "models")) {
+        // At the endpoint that lists it, else as configured, else none
+        hostlist(g, h);
+        if (!h->listgot) {
+            return;
+        }
+        x->modelwait = 0;
+        g->newcheck  = 0;
+        Slice<ModelPick> picks = modelpicks(g, &a, h);
+        Slice<GuiModel>  confs = h==g->main ? replyconfs(&a, g->cfg) : h->confs;
+        ModelPick        got   = {};
+        for (iz i = 0; !got.model.len && i < picks.len; i++) {
+            got = x->model.len && !picks[i].err.len && !picks[i].dflt &&
+                  picks[i].model==x->model ? picks[i] : got;
+        }
+        for (iz i = 0; !got.model.len && i < confs.len; i++) {
+            got.model = x->model.len && confs[i].name==x->model ? x->model : Str{};
+        }
+        fieldput(g->newep, got.endpoint);
+        fieldput(g->newmodel, got.model);
+        return;
+    }
     if (x->modelwait) {
+        g->newep[0] = 0;
         x->modelwait = 0;
         Slice<Str> models = h==g->main ? cfgmodels(g, &a) : h->models;
         b32        known  = 0;
@@ -5590,6 +5740,103 @@ static void pathafter(Gui *g, PathField *f, char *buf)
     ImGui::End();
 }
 
+// The new session dialog's model. For a host whose engine lists its
+// endpoints' models, a combo of them, the defaults first, with a field
+// to filter them, or for another, MODEL or ENDPOINT/MODEL, which Enter
+// takes. Its pick (newep, newmodel) holds for the run while listed;
+// both empty are the defaults. An older engine's is a field to type
+// a model in, by default the configured one.
+static void drawnewmodel(Gui *g, Arena a, GuiHost *host)
+{
+    ImGui::SetNextItemWidth(-1);
+    if (!hostcan(host, "models")) {
+        Str dflt = {};
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            if (!r->kind.len && r->key=="model") {
+                dflt = r->value;
+            }
+        }
+        char const *hint = host->kind==GH_REMOTE ? "as configured there" :
+                           dflt.len ? cstr0(&a, concat(&a, "configured: ", dflt)) :
+                           "the model's name";
+        ImGui::InputTextWithHint("##model", hint, g->newmodel, FIELD_MAX);
+        g->newep[0] = 0;
+        return;
+    }
+
+    Slice<ModelPick> picks = modelpicks(g, &a, host);
+    Str ep = {(u8 *)g->newep, (iz)__builtin_strlen(g->newep)};
+    Str m  = {(u8 *)g->newmodel, (iz)__builtin_strlen(g->newmodel)};
+    if (g->newcheck && host->listgot && !host->listid) {
+        // The last pick, as the fresh listing has it, or the defaults
+        g->newcheck = 0;
+        b32 listed  = !m.len;
+        for (iz i = 0; i < picks.len; i++) {
+            ModelPick *p = &picks[i];
+            listed |= !p->err.len && !p->dflt && p->endpoint==ep && p->model==m;
+        }
+        if (!listed) {
+            g->newep[0] = g->newmodel[0] = 0;
+            ep = m = {};
+        }
+    }
+    i32 cur = -1, mark = -1;
+    for (iz i = 0; i < picks.len; i++) {
+        ModelPick *p  = &picks[i];
+        b32        is = m.len ? !p->dflt && !p->err.len && p->endpoint==ep && p->model==m
+                              : p->dflt;
+        cur  = cur<0 && is ? (i32)i : cur;
+        mark = mark<0 && !p->err.len && !p->dflt && p->model!=host->modeldflt ? (i32)i : mark;
+    }
+    if (mark >= 0 && g->pickwant!=picks[mark].label) {
+        g->pickwant = clone(&g->perm, picks[mark].label);
+    }
+    Str shown = cur>=0 && picks[cur].dflt ? concat(&a, picks[cur].label, "  (default)") :
+                cur >= 0                  ? picks[cur].label :
+                m.len && ep.len           ? concat(&a, concat(&a, ep, "/"), m) :
+                m.len                     ? m :
+                !host->listgot            ? Str("Asking the endpoints for their models...") :
+                Str("No model listed: type one");
+
+    ImVec2 at = ImGui::GetCursorScreenPos();
+    f32    w  = ImGui::GetContentRegionAvail().x;
+    if (ImGui::BeginCombo("##model", cstr0(&a, shown), ImGuiComboFlags_HeightLargest)) {
+        g->picksframe = ImGui::GetFrameCount();
+        if (ImGui::IsWindowAppearing()) {
+            g->newfilter[0] = 0;
+            ImGui::SetKeyboardFocusHere();
+        }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputTextWithHint("##modelfilter", "filter, or a model to type, Enter",
+                                     g->newfilter, FIELD_MAX,
+                                     ImGuiInputTextFlags_EnterReturnsTrue)) {
+            Str t = trim({(u8 *)g->newfilter, (iz)__builtin_strlen(g->newfilter)});
+            if (t.len) {
+                ModelPick p = modeltyped(host, t);
+                fieldput(g->newep, p.endpoint);
+                fieldput(g->newmodel, p.model);
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        itemnamed(g, "model filter");
+        Str filter = trim({(u8 *)g->newfilter, (iz)__builtin_strlen(g->newfilter)});
+        if (host->listid) {
+            ImGui::TextDisabled("Asking the endpoints for their models...");
+        }
+        i32 hit = pickrows(g, a, picks, filter, cur, mark, RECT_NEWPICK);
+        if (hit >= 0) {
+            ModelPick *p = &picks[hit];
+            fieldput(g->newep, p->dflt ? Str{} : p->endpoint);
+            fieldput(g->newmodel, p->dflt ? Str{} : p->model);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndCombo();
+    }
+    g->rects[RECT_NEWMODEL] = {at.x, at.y, at.x+w, at.y+ImGui::GetFrameHeight()};
+    itemnamed(g, "new model");
+}
+
 // The new session dialog: a working directory, typed or from those of
 // earlier sessions, and a model, by default the configured one. For an
 // import, it says what is imported, filled from it (importfill), and
@@ -5605,6 +5852,8 @@ static void drawnew(Gui *g)
         g->newplan = 0;
         g->newnofolder = 0;
         g->newrole = {};
+        g->newlisted = 0;  // its host's models asked for anew
+        g->newcheck  = !import;
         g->pc.shown = g->pc.refocus = 0;
         g->pc.sel = -1;
     }
@@ -5730,17 +5979,11 @@ static void drawnew(Gui *g)
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Model");
-    ImGui::SetNextItemWidth(-1);
-    Str dflt = {};
-    for (iz i = 0; i < g->cfgrows.len; i++) {
-        CfgRow *r = &g->cfgrows[i];
-        if (!r->kind.len && r->key=="model") {
-            dflt = r->value;
-        }
+    if (g->newlisted != host) {
+        g->newlisted = host;
+        hostlist(g, host);
     }
-    char const *hint = host->kind==GH_REMOTE ? "as configured there" :
-                       dflt.len ? cstr0(&a, concat(&a, "configured: ", dflt)) : "the model's name";
-    ImGui::InputTextWithHint("##model", hint, g->newmodel, FIELD_MAX);
+    drawnewmodel(g, a, host);
 
     // A role, as the host's configuration has them, or none: the usual
     // session, with its usual tools
@@ -5804,11 +6047,14 @@ static void drawnew(Gui *g)
     itemrect(g, RECT_NEWCREATE);
     if (create) {
         Str cwd   = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
+        Str ep    = trim({(u8 *)g->newep, (iz)__builtin_strlen(g->newep)});
         Str model = trim({(u8 *)g->newmodel, (iz)__builtin_strlen(g->newmodel)});
+        Str both  = concat(&a, concat(&a, ep, "/"), model);
+        g->picked = g->picked==both ? g->picked : clone(&g->perm, both);
         if (import) {
-            importbegin(g, host, cwd, model, nofolder);
+            importbegin(g, host, cwd, ep, model, nofolder);
         } else {
-            guinew(g, host, cwd, model, hasrole ? g->newrole : Str{},
+            guinew(g, host, cwd, ep, model, hasrole ? g->newrole : Str{},
                    plan && g->newplan && !hasrole, nofolder);
         }
         ImGui::CloseCurrentPopup();

@@ -201,11 +201,15 @@ def config(url, model, ask=3, extra=""):
 
 
 def firstconfig(url):
-    """The firstrun mode's: an endpoint, but no model and no remote."""
+    """The firstrun mode's: an endpoint, but no model and no remote, and
+    the endpoint lists none, nothing listening there (one that listed a
+    model would be enough to start with, closing Settings and Hosts)."""
     return (
-        "# A first run's configuration: nothing says which model\n"
+        "# A first run's configuration: nothing says which model, and the\n"
+        "# endpoint lists none\n"
         "[endpoint fake]\n"
-        f"url = {url}/\n"
+        "url = http://127.0.0.1:9/\n"
+        "connect_timeout = 2\n"
     )
 
 
