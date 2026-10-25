@@ -224,12 +224,16 @@ if(APPLE AND PROSPERO_GUI)
   # desktop helper beside it, where the harness looks. The bundle is
   # put together, and signed, after both are built, since its signature
   # seals the helper in it, ad hoc unless PROSPERO_SIGN_IDENTITY. Its
-  # Info.plist names the bundle identifier and the version.
+  # Info.plist names the bundle identifier and the version, and its
+  # build number (CFBundleVersion) is the time of the build, in seconds:
+  # LaunchServices prefers the highest, so that "open -a Prospero" runs
+  # the newest of the copies it knows, as in old worktrees.
   configure_file(assets/Info.plist ${CMAKE_BINARY_DIR}/Info.plist @ONLY)
   add_custom_command(OUTPUT Prospero.app/Contents/MacOS/prospero
     COMMAND ${CMAKE_COMMAND} -E make_directory Prospero.app/Contents/MacOS
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_BINARY_DIR}/Info.plist Prospero.app/Contents/Info.plist
+    COMMAND sh -c "plutil -replace CFBundleVersion -string \"$(date +%s)\" Prospero.app/Contents/Info.plist"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:prospero-desktop> Prospero.app/Contents/MacOS/prospero-desktop
     COMMAND ${CMAKE_COMMAND} -E copy

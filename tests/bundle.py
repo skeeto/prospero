@@ -15,7 +15,8 @@ real app's grants that then refused the real app. The identifier is
 com.nullprogram.prospero only for a signed build (--signed: built with
 PROSPERO_SIGN_IDENTITY), else com.nullprogram.prospero.dev, unless
 PROSPERO_BUNDLE_ID (--bundle-id) names one; the desktop helper's is that
-plus ".desktop". This checks the bundle's Info.plist, and the signatures
+plus ".desktop". This checks the bundle's Info.plist, its build number
+the build's time in seconds, and the signatures
 of the bundle, of the helper in it, and of the helper beside it, by
 codesign -d, which only reads.
 """
@@ -58,6 +59,9 @@ def main():
     if info.get("CFBundleShortVersionString") != args.version:
         problems.append(f"Info.plist: version {info.get('CFBundleShortVersionString')}, "
                         f"not {args.version}")
+    build = str(info.get("CFBundleVersion", ""))
+    if not build.isdigit() or int(build) < 1700000000:
+        problems.append(f"Info.plist: CFBundleVersion {build!r}, not the build's time")
     for path, ident in ((args.app, want),
                         (f"{args.app}/Contents/MacOS/prospero-desktop", desk),
                         (args.helper, desk)):
