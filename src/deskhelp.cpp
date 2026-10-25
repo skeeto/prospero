@@ -1,10 +1,13 @@
 // Desktop helper: prospero-desktop, which sees and drives a desktop
 //
-// A small program of its own, apart from the harness, so that the one
-// executable with the operating system's grant to watch the screen and
-// send input (macOS asks for it by program) can keep a stable identity
-// however often the harness is rebuilt. It started as winctl (the
-// user's sshd, ~/src/sshd), whose command set it keeps:
+// A process of its own, apart from the harness, which the turn can stop
+// and whose failures stay its own. On macOS and Linux it is a program of
+// its own too: on macOS so that the one executable with the operating
+// system's grant to watch the screen and send input (macOS asks for it
+// by program) keeps its identity, and on Linux because it loads X11 and
+// the portal's libraries, which a static engine cannot. On Windows it is
+// prospero.exe itself, run as "prospero desktop". It started as winctl
+// (the user's sshd, ~/src/sshd), whose command set it keeps:
 //
 //   list [-a] [WINDOW]              visible top-level windows (-a: all)
 //   shot [-s EDGE PIXELS] [WINDOW [X Y W H]]
@@ -57,6 +60,12 @@
 // implements the dk_* functions below for its desktop.
 //
 // This is free and unencumbered software released into the public domain.
+
+// How it names itself in messages: a program of its own, or a command
+// of prospero's on Windows, where the harness holds it (main_win32.cpp)
+#ifndef DK_NAME
+#  define DK_NAME "prospero-desktop"
+#endif
 
 enum : i32 {
     DK_OK      = 0,
@@ -1022,7 +1031,7 @@ static void dkcmdrun(DkCtx *c, DkArgs *a)
         if (c->serving) {
             print(&c->out, finish(&b));
         } else {
-            dk_write(c->dk, 2, "prospero-desktop: warning: ");
+            dk_write(c->dk, 2, DK_NAME ": warning: ");
             dk_write(c->dk, 2, finish(&b));
         }
     }
@@ -1042,8 +1051,8 @@ static void dkcmdaccess(DkCtx *c, DkArgs *a)
 }
 
 static Str dkusage =
-"usage: prospero-desktop COMMAND [ARGS]\n"
-"       prospero-desktop --serve | --version\n"
+"usage: " DK_NAME " COMMAND [ARGS]\n"
+"       " DK_NAME " --serve | --version\n"
 "  list [-a] [WINDOW]           list visible top-level windows (-a: all)\n"
 "  shot [-s EDGE PIXELS] [WINDOW [X Y W H]]\n"
 "                               PNG of the screen under WINDOW to stdout,\n"
@@ -1220,7 +1229,7 @@ static i32 dkserve(Dk *dk, Arena scratch)
         }
         u32 len = dkget32le(head);
         if (len > DK_REQMAX) {
-            dk_write(dk, 2, "prospero-desktop: request too long\n");
+            dk_write(dk, 2, DK_NAME ": request too long\n");
             return 1;
         }
         u8 *buf = allocbytes(&a, len);
@@ -1259,7 +1268,7 @@ static i32 dkmain(Dk *dk, Arena scratch, Str *args, i32 nargs)
     if (c.status) {
         Str msg = finish(&c.err);
         Buf b(&scratch, 32 + msg.len);
-        print(&b, "prospero-desktop: ");
+        print(&b, DK_NAME ": ");
         print(&b, msg);
         putbyte(&b, '\n');
         dk_write(dk, 2, finish(&b));

@@ -177,38 +177,23 @@ class D(R.T):
         """A desktop helper of the local platform in the engines
         directory: tests/fake_desktop.py behind a script that answers
         --version as the real one does, or, unless works, fails it."""
-        name = f"prospero-desktop-{self.version}-{self.platform}{self.exe}"
+        name = f"prospero-desktop-{self.version}-{self.platform}"
         dst = os.path.join(self.engines, name)
-        if os.name == "nt":
-            # The shim, running a script of its own per build (works,
-            # extra), so that each build is another program
-            out = (f'sys.stdout.write("prospero-desktop {self.version}\\n"); sys.exit(0)'
-                   if works else 'sys.stderr.write("cannot load libc\\n"); sys.exit(1)')
-            text = (f"# {extra}\nimport subprocess, sys\n"
-                    f'if sys.argv[1:2] == ["--version"]:\n    {out}\n'
-                    f"sys.exit(subprocess.call([sys.executable, {FAKE_DESKTOP!r}] + "
-                    "sys.argv[1:]))\n")
-            build = hashlib.sha256(text.encode()).hexdigest()[:16]
-            script = os.path.join(self.root, f"helper-{build}.py")
-            with open(script, "w", newline="") as f:
-                f.write(text)
-            R.shim(self.args, dst, [sys.executable, "-I", script])
-        else:
-            version = (f'echo "prospero-desktop {self.version}"; exit 0' if works
-                       else 'echo "cannot load libc" >&2; exit 1')
-            text = (f"#!/bin/sh\n# {extra}\n"
-                    f'if [ "$1" = --version ]; then {version}; fi\n'
-                    f"exec {shlex.quote(sys.executable)} {shlex.quote(FAKE_DESKTOP)} \"$@\"\n")
-            with open(dst, "w", newline="") as f:
-                f.write(text)
-            os.chmod(dst, 0o755)
+        version = (f'echo "prospero-desktop {self.version}"; exit 0' if works
+                   else 'echo "cannot load libc" >&2; exit 1')
+        text = (f"#!/bin/sh\n# {extra}\n"
+                f'if [ "$1" = --version ]; then {version}; fi\n'
+                f"exec {shlex.quote(sys.executable)} {shlex.quote(FAKE_DESKTOP)} \"$@\"\n")
+        with open(dst, "w", newline="") as f:
+            f.write(text)
+        os.chmod(dst, 0o755)
         with open(dst + ".sha256", "w", newline="") as f:
             f.write(f"{sha256(dst)}  {name}\n")
         return dst
 
     def helperdeployed(self):
         return os.path.join(self.home, ".prospero",
-                            f"desktop-0-{self.version}-{self.platform}{self.exe}")
+                            f"desktop-0-{self.version}-{self.platform}")
 
     def deploy(self, *extra, env=None, target="here"):
         argv = [self.prospero, "deploy", target, "--ssh-program", self.ssh,
@@ -554,7 +539,9 @@ def desktop(t):
     """A desktop helper in the engines directory goes beside the engine,
     as desktop-PROTO-VERSION-OS-ARCH, is recorded, and is uploaded again
     only when missing there; the engine connected to then runs it as its
-    desktop tool's helper."""
+    desktop tool's helper. Not on Windows, whose engine is its own."""
+    if os.name == "nt":
+        return "skip"
     t.engine()
     src = t.helper()
     p = t.deploy()
@@ -607,7 +594,9 @@ def desktop_warn(t):
     """A helper that does not run there, or another build of it, is only
     a warning: the engine is deployed and recorded all the same, and a
     helper that does not run is removed again; --force replaces another
-    build."""
+    build. Not on Windows, whose engine is its own helper."""
+    if os.name == "nt":
+        return "skip"
     t.engine()
     t.helper(works=False)
     p = t.deploy()
@@ -634,7 +623,7 @@ def desktop_warn(t):
 def desktop_self(t):
     """No engine in the engines directory, so this program serves, and
     its own helper next to it goes with it."""
-    mine = os.path.join(os.path.dirname(t.prospero), "prospero-desktop" + t.exe)
+    mine = os.path.join(os.path.dirname(t.prospero), "prospero-desktop")
     if not os.path.isfile(mine):
         return "skip"
     p = t.deploy()

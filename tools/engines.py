@@ -25,13 +25,12 @@ writes it:
                   machine's NSS module, which a static program loads
                   only where glibc's version matches
 
-Beside each Windows and Linux engine goes its desktop helper,
-prospero-desktop-VERSION-OS-ARCH[.exe], which deploy puts beside the
-engine there: on Windows CRT-free, its imports checked against XP SP3
-(kernel32, user32 and gdi32); on Linux linked dynamically, since it
-loads the X11 libraries at run time, and run once (--version). macOS
-gets none: its helper's privacy grants belong to Prospero.app, inside
-which it lives.
+Beside each Linux engine goes its desktop helper,
+prospero-desktop-VERSION-OS-ARCH, which deploy puts beside the engine
+there: linked dynamically, since it loads the X11 libraries at run
+time, and run once (--version). A Windows engine is its own helper
+("prospero desktop"). macOS gets none: its helper's privacy grants
+belong to Prospero.app, inside which it lives.
 
 With no PLATFORM it builds them all, except that without a HOST it
 leaves out the Linux ones, and says so.
@@ -122,15 +121,12 @@ def windows(args, ver, arch):
     plat = f"windows-{arch}"
     tc = "Toolchain-Mingw64.cmake" if arch == "x86_64" else "Toolchain-Mingw32.cmake"
     b = os.path.join(args.work, plat)
+    # Its own desktop helper, "prospero desktop"
     cmakebuild(b, [f"-DCMAKE_TOOLCHAIN_FILE={ROOT}/cmake/{tc}",
-                   "-DCMAKE_EXE_LINKER_FLAGS=-s"], ("prospero", "prospero-desktop"))
+                   "-DCMAKE_EXE_LINKER_FLAGS=-s"])
     exe = os.path.join(b, "prospero.exe")
-    desk = os.path.join(b, "prospero-desktop.exe")
-    imports = os.path.join(ROOT, "tests", "imports.py")
-    run(["uv", "run", imports, exe])
-    run(["uv", "run", imports, "--dlls", "kernel32,user32,gdi32", desk])
+    run(["uv", "run", os.path.join(ROOT, "tests", "imports.py"), exe])
     publish(args.out, ver, plat, exe)
-    publish(args.out, ver, plat, desk, "desktop")
 
 
 def sources():

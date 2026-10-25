@@ -6,13 +6,11 @@
 """Check a Windows program's imports against Windows XP's.
 
   uv run tests/imports.py build-xp/prospero.exe
-  uv run tests/imports.py --dlls kernel32,user32,gdi32 build-xp/prospero-desktop.exe
   uv run tests/imports.py --exports kernel32.dll advapi32.dll winhttp.dll
 
 The headless engine (PROSPERO_GUI=OFF), i686 or x86_64, may import only
-from KERNEL32, ADVAPI32 and WINHTTP, and the desktop helper
-(prospero-desktop) only from KERNEL32, USER32 and GDI32 (--dlls), only
-by name, and only functions that Windows XP SP3's copies of those DLLs
+from KERNEL32, ADVAPI32 and WINHTTP, and USER32 and GDI32 for its
+desktop helper ("prospero desktop"), or those --dlls names, only by name, and only functions that Windows XP SP3's copies of those DLLs
 export. Anything newer must be looked up at run time (GetProcAddress)
 with a fallback. It must also declare an OS and subsystem version that
 XP loads (5.1 at most, or 5.2 for x86_64, XP x64), and have no
@@ -153,9 +151,10 @@ def main():
     ap.add_argument("--exports", action="store_true",
                     help="print the export lists of the given DLLs instead")
     ap.add_argument("-v", action="store_true", help="list every import")
-    ap.add_argument("--dlls", default="kernel32,advapi32,winhttp",
+    ap.add_argument("--dlls", default="kernel32,advapi32,winhttp,user32,gdi32",
                     help="the DLLs it may import from, separated by commas "
-                    "(default: the engine's, kernel32,advapi32,winhttp)")
+                    "(default: the engine's, kernel32,advapi32,winhttp,"
+                    "user32,gdi32)")
     ap.add_argument("files", nargs="+")
     args = ap.parse_args()
 

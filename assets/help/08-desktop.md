@@ -37,9 +37,11 @@ denied.
 
 ## The helper
 
-The work is done by a helper program, `prospero-desktop`, next to
-`prospero`, which the harness starts for a turn. Run alone, it takes
-the same commands on its command line (`prospero-desktop -h`).
+The work is done by a helper, which the harness starts for a turn: on
+Windows `prospero.exe` itself, and elsewhere a program of its own,
+`prospero-desktop`, next to `prospero`. Run alone, it takes the same
+commands on its command line (`prospero desktop -h` on Windows,
+`prospero-desktop -h` elsewhere).
 
 - **macOS** (15.2 and later): the helper is in
   `Prospero.app/Contents/MacOS`. macOS asks for two permissions, in
@@ -47,7 +49,7 @@ the same commands on its command line (`prospero-desktop -h`).
   screenshots (quit and reopen Prospero after granting it), and
   Accessibility, for input and for windows. `prospero-desktop access`
   lists what is missing, and `access -ask` asks for it.
-- **Windows**: XP and later.
+- **Windows**: XP and later, with nothing else to install.
 - **Linux on X11**: the display that `DISPLAY` names.
 - **Linux on Wayland**: through the desktop's portal, which asks once
   in a dialog, and remembers the answer. Listing, raising and closing

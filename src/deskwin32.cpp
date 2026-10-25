@@ -1,14 +1,19 @@
 // Desktop helper, Win32 platform layer: no CRT and no headers
-// $ c++ -std=c++20 -nostartfiles -o prospero-desktop.exe
-//       src/main_desktop_win32.cpp -luser32 -lgdi32
+//
+// Not a program of its own, but prospero.exe's "desktop" command
+// (main_win32.cpp), so that Windows needs only the one executable. It
+// is a translation unit of its own, since its Win32 declarations are
+// not the harness's, with one entry point, prospero_desktop. The
+// harness provides memcpy and the like, or the CRT does in the GUI.
 //
 // Imports only kernel32, user32 and gdi32, with nothing newer than
-// Windows XP SP3, so one i686 build runs everywhere (tests/imports.py
+// Windows XP SP3, so the i686 engine runs everywhere (tests/imports.py
 // checks it). Newer functions, DPI awareness and the DWM's frame bounds,
 // are looked up at run time. The window, input and capture code is
 // winctl's (~/src/sshd/src/winctl.cpp).
 //
 // This is free and unencumbered software released into the public domain.
+#define DK_NAME "prospero desktop"
 #include "base.cpp"
 #include "wide.cpp"
 #include "png.cpp"
@@ -191,36 +196,6 @@ W32(b32,    DeleteObject(uz));
 W32(b32,    GdiFlush());
 W32(uz,     SelectObject(uz, uz));
 
-// GCC emits calls to these even without a CRT. Defining them keeps
-// msvcrt.dll out of the imports.
-#if defined(__x86_64__) || defined(__i386__)
-extern "C" void *memcpy(void *dst, void const *src, uz len)
-{
-    void *r = dst;
-    __asm volatile ("rep movsb" : "+D"(dst), "+S"(src), "+c"(len) : : "memory");
-    return r;
-}
-
-extern "C" void *memset(void *dst, i32 c, uz len)
-{
-    void *r = dst;
-    __asm volatile ("rep stosb" : "+D"(dst), "+c"(len) : "a"(c) : "memory");
-    return r;
-}
-
-extern "C" i32 memcmp(void const *a, void const *b, uz len)
-{
-    u8 *x = (u8 *)a;
-    u8 *y = (u8 *)b;
-    for (uz i = 0; i < len; i++) {
-        if (x[i] != y[i]) {
-            return x[i] - y[i];
-        }
-    }
-    return 0;
-}
-#endif
-
 struct Dk {
     uz  std[3];
     // From Vista on, else null
@@ -242,7 +217,7 @@ static b32 writeall(uz h, Str s)
 
 [[noreturn]] static void os_oom()
 {
-    writeall(GetStdHandle(STD_ERROR_HANDLE), "prospero-desktop: out of memory\n");
+    writeall(GetStdHandle(STD_ERROR_HANDLE), DK_NAME ": out of memory\n");
     ExitProcess(DK_FAIL);
 }
 
@@ -795,8 +770,10 @@ static void initdpi()
     }
 }
 
-extern "C" __attribute((force_align_arg_pointer))
-void mainCRTStartup()
+// "prospero desktop ARGS...": the helper's own args, "desktop" first in
+// place of a program name, from the command line, which the harness has
+// only looked at. Exits, as the program it once was did.
+extern "C" [[noreturn]] void prospero_desktop()
 {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     Dk dk = {};
@@ -823,5 +800,5 @@ void mainCRTStartup()
     iz   len = 0;
     for (; cmd[len]; len++) {}
     Slice<Str> args = splitcmdline(&a, fromwide(&a, cmd, len));
-    ExitProcess((u32)dkmain(&dk, a, args.data, (i32)args.len));
+    ExitProcess((u32)dkmain(&dk, a, args.data+1, (i32)args.len-1));
 }

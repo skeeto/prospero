@@ -74,7 +74,7 @@ engines it builds.
 
 ## Releases
 
-Each release on GitHub carries ten files:
+Each release on GitHub carries eight files:
 
 - `prospero-VERSION.tar.gz`: the source, with every dependency unpacked
   under `deps/`, so that it builds with no network:
@@ -84,30 +84,28 @@ Each release on GitHub carries ten files:
       $ cmake --build build
 
 - `prospero-VERSION-windows-x86_64.exe`: the Windows program, the GUI
-  with its engine.
+  with its engine and desktop helper, all there is to install.
 - `prospero-engine-VERSION-windows-x86_64.exe` and
   `prospero-engine-VERSION-windows-i686.exe`: headless engines for
-  Windows, the i686 one for XP.
+  Windows, the i686 one for XP, each its own desktop helper too.
 - `prospero-engine-VERSION-linux-x86_64` and
   `prospero-engine-VERSION-linux-aarch64`: headless engines for Linux,
   linked statically.
-- `prospero-desktop-VERSION-OS-ARCH[.exe]`, for each engine's platform:
-  the desktop helper (Desktop control). The Windows ones import only
-  what XP has; the Linux ones load X11 at run time, so they link the C
-  library dynamically, and need glibc 2.34 or later.
+- `prospero-desktop-VERSION-linux-x86_64` and
+  `prospero-desktop-VERSION-linux-aarch64`: the desktop helper for
+  Linux (Desktop control). It loads X11 at run time, so it links the C
+  library dynamically, and needs glibc 2.34 or later.
 
 The engines and helpers are named as `prospero deploy` expects to find
 them, in an `engines` directory next to the executable, which puts each
 helper beside its engine on the remote machine. To use a helper on the
-machine itself, save it next to `prospero.exe` (or `prospero`) as
-`prospero-desktop.exe` (or `prospero-desktop`). There is no macOS
-build; build it from source.
+machine itself, save it next to `prospero` as `prospero-desktop`. There
+is no macOS build; build it from source.
 
 The release workflow (`.github/workflows/release.yml`) builds every
 program from the source tarball alone. The Windows programs are built
 on Linux by [w64devkit][]'s GCC under Wine, the same programs it builds
-on Windows, stripped and with no timestamp, then signed, the helpers
-too, with an Authenticode signature (Azure Artifact Signing), which
+on Windows, stripped and with no timestamp, then signed, with an Authenticode signature (Azure Artifact Signing), which
 Windows shows in the file's Properties, under Digital Signatures.
 `tools/dist.py` makes
 the source tarball from any commit, the same commit always giving the
@@ -517,15 +515,18 @@ mouse, scrolling, keys and text, which includes `observe`; and
 `windows` for focusing and closing them. Starting a program is asked
 about every time. `ask = false` asks about nothing at all.
 
-The work is done by a helper, `prospero-desktop`, next to `prospero`,
-which the harness starts for a turn and talks to over pipes: a program
-of its own, so that the one program the system lets watch the screen
-keeps its identity however often Prospero is rebuilt. So far it exists
+The work is done by a helper, which the harness starts for a turn and
+talks to over pipes. On Windows it is `prospero.exe` itself, run as
+`prospero desktop`. On macOS and Linux it is a program of its own,
+`prospero-desktop`, next to `prospero`: on macOS so that the one program
+the system lets watch the screen keeps its identity however often
+Prospero is rebuilt, and on Linux because it loads the X11 and portal
+libraries, which the static engines cannot. So far it exists
 for Windows (XP and later), macOS (15.2 and later) and Linux, on X11
 or Wayland;
 run alone, it takes the same commands on its command line
 (`prospero-desktop shot screen > s.png`, `list`, `click WINDOW X Y` and
-so on; `prospero-desktop -h`). An engine that `prospero deploy` put on
+so on; `prospero-desktop -h`; on Windows `prospero desktop`). An engine that `prospero deploy` put on
 another machine uses the helper deployed beside it (Remote and
 background hosts).
 
@@ -630,8 +631,9 @@ A desktop helper there for the platform,
 `prospero-desktop-VERSION-OS-ARCH`, goes too, as
 `desktop-PROTO-VERSION-OS-ARCH` beside the engine, where the engine
 looks for it first; with the executable itself as the engine, its own
-`prospero-desktop` goes. `tools/engines.py` builds the Windows and Linux
-helpers beside their engines. The engine works without a helper, so one
+`prospero-desktop` goes. A Windows engine is its own helper, so none
+goes there. `tools/engines.py` builds the Linux helpers beside their
+engines. The engine works without a helper, so one
 that cannot be put there, or does not run there, is only a warning.
 
 ## Windows notes
@@ -710,10 +712,10 @@ from this one: `--host` runs Prospero on a Windows host over ssh,
 `--xp` on Windows XP, and `--ssh` connects and deploys to a real
 remote host. `tests/gui.py` drives the GUI through a scripted
 checklist, which fails on a stale frame, and `tests/imports.py` checks
-a headless Windows engine's imports, and the desktop helper's, against
-what XP exports (CTest runs it in those builds). The scenario
-`desktop_xp`, run by name with `--xp`, drives Notepad on XP's desktop
-with the real helper. Each script's header says how to run it.
+a headless Windows engine's imports, its desktop helper's among them,
+against what XP exports (CTest runs it in those builds). The scenario
+`desktop_xp`, run by name with `--xp` and `PROSPERO_TEST_XP_DESKTOP=1`,
+drives Notepad on XP's desktop with the real helper. Each script's header says how to run it.
 
 ## License
 

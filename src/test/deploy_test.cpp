@@ -154,17 +154,11 @@ static void test_deploy(Test *t)
         expect(t, "deploy.names.linux", l.desktop,
                concat(&a, concat(&a, "prospero-desktop-", v), "-linux-x86_64"));
 
-        Slice<Str> h = deskhelpers(&a, concat(&a, "C:\\Users\\u\\.prospero\\", re), 1);
-        expect(t, "deploy.helpers.n", istr(&a, h.len), "2");
-        expect(t, "deploy.helpers.deployed", h[0],
-               concat(&a, "C:\\Users\\u\\.prospero/", rd));
-        expect(t, "deploy.helpers.beside", h[1],
-               "C:\\Users\\u\\.prospero/prospero-desktop.exe");
-        h = deskhelpers(&a, "/home/u/.prospero/engine-0-1.2.3-linux-aarch64", 0);
+        Slice<Str> h = deskhelpers(&a, "/home/u/.prospero/engine-0-1.2.3-linux-aarch64");
         expect(t, "deploy.helpers.sh", istr(&a, h.len==2 &&
                h[0]=="/home/u/.prospero/desktop-0-1.2.3-linux-aarch64" &&
                h[1]=="/home/u/.prospero/prospero-desktop"), "1");
-        h = deskhelpers(&a, "/opt/prospero/prospero", 0);
+        h = deskhelpers(&a, "/opt/prospero/prospero");
         expect(t, "deploy.helpers.build",
                istr(&a, h.len==1 && h[0]=="/opt/prospero/prospero-desktop"), "1");
     }

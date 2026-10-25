@@ -4751,10 +4751,11 @@ enum : i64 {
 };
 
 // Where the helper may be for an executable, first to last: for an
-// engine deployed as engine-PROTO-VERSION-OS-ARCH[.exe] (deploy.cpp),
-// the helper deployed beside it, desktop-PROTO-VERSION-OS-ARCH[.exe];
-// then prospero-desktop[.exe] next to it, as a build leaves it.
-static Slice<Str> deskhelpers(Arena *a, Str exe, b32 windows)
+// engine deployed as engine-PROTO-VERSION-OS-ARCH (deploy.cpp), the
+// helper deployed beside it, desktop-PROTO-VERSION-OS-ARCH; then
+// prospero-desktop next to it, as a build leaves it. Not on Windows,
+// where the engine is its own helper.
+static Slice<Str> deskhelpers(Arena *a, Str exe)
 {
     Slice<Str> r    = {};
     Str        dir  = parentdir(exe);
@@ -4763,13 +4764,13 @@ static Slice<Str> deskhelpers(Arena *a, Str exe, b32 windows)
         Str name = concat(a, "desktop-", cuthead(base, 7));
         r = push(a, r, join(a, dir, name));
     }
-    Str name = windows ? Str("prospero-desktop.exe") : Str("prospero-desktop");
-    r = push(a, r, join(a, dir, name));
+    r = push(a, r, join(a, dir, "prospero-desktop"));
     return r;
 }
 
-// The helper's command line: the first of deskhelpers there, or for
-// tests the JSON array of strings in PROSPERO_TEST_DESKTOP. Empty if
+// The helper's command line: on Windows this executable's desktop
+// command (deskwin32.cpp), elsewhere the first of deskhelpers there, or
+// for tests the JSON array of strings in PROSPERO_TEST_DESKTOP. Empty if
 // none.
 static Slice<Str> deskhelper(Engine *e, Arena *a)
 {
@@ -4783,8 +4784,14 @@ static Slice<Str> deskhelper(Engine *e, Arena *a)
             }
         }
         return r;
+    } else if (HOST_WINDOWS) {
+        if (!e->te.exe.len) {
+            return r;
+        }
+        r = push(a, r, e->te.exe);
+        return push(a, r, Str("desktop"));
     }
-    Slice<Str> paths = deskhelpers(a, e->te.exe, e->te.windows);
+    Slice<Str> paths = deskhelpers(a, e->te.exe);
     for (iz i = 0; i < paths.len; i++) {
         if (os_stat(e->os, *a, paths[i]).type == STAT_FILE) {
             return push(a, r, paths[i]);

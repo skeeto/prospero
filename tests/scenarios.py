@@ -8272,15 +8272,14 @@ def desktop_cancel(t):
 
 @scenario(conf=DESKALL, bound=180)
 def desktop_xp(t):
-    """The real helper on Windows XP's desktop, with --xp, run by name
-    with PROSPERO_TEST_XP_DESKTOP naming the helper there: Notepad is
-    started, typed into in Unicode, clicked, captured, and closed without
-    saving. The screenshots it sent go to PROSPERO_TEST_XP_SHOTS, a
-    directory here, to look at."""
-    helper = os.environ.get("PROSPERO_TEST_XP_DESKTOP")
-    if not isinstance(t.host, XpHost) or not helper:
-        raise Skip("drives XP's desktop: needs --xp and PROSPERO_TEST_XP_DESKTOP")
-    r = t.run(timeout=170, env={"PROSPERO_TEST_DESKTOP": json.dumps([helper])})
+    """The real helper, the engine itself ("prospero desktop"), on Windows
+    XP's desktop, with --xp, run by name with PROSPERO_TEST_XP_DESKTOP=1:
+    Notepad is started, typed into in Unicode, clicked, captured, and
+    closed without saving. The screenshots it sent go to
+    PROSPERO_TEST_XP_SHOTS, a directory here, to look at."""
+    if not isinstance(t.host, XpHost) or not os.environ.get("PROSPERO_TEST_XP_DESKTOP"):
+        raise Skip("drives XP's desktop: needs --xp and PROSPERO_TEST_XP_DESKTOP=1")
+    r = t.run(timeout=170)
     ends = [(e["status"], e["text"][:160]) for e in r.all("tool.end")]
     t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {ends}")
     t.check(len(ends) == 13 and all(s == "ok" for s, _ in ends), f"every step: {ends}")

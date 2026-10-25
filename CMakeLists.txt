@@ -102,17 +102,20 @@ if(WIN32 AND PROSPERO_GUI)
   target_compile_options(prospero_gui PRIVATE
     -fno-exceptions -fno-rtti -Wa,-I${PROJECT_SOURCE_DIR}
   )
-  add_executable(prospero WIN32 src/main_win32.cpp)
+  # The desktop helper is a command of this program, "prospero desktop",
+  # in a translation unit of its own (src/deskwin32.cpp)
+  add_executable(prospero WIN32 src/main_win32.cpp src/deskwin32.cpp)
   target_link_libraries(prospero PRIVATE
     prospero_gui imgui md4c kernel32 advapi32 winhttp comdlg32 ole32
+    user32 gdi32
   )
   target_link_options(prospero PRIVATE -static -municode)
 elseif(WIN32)
   # CRT-free: system DLLs only. Static libgcc keeps its helpers (e.g.
   # 64-bit division on i686) from adding a DLL dependency.
-  add_executable(prospero src/main_win32.cpp)
+  add_executable(prospero src/main_win32.cpp src/deskwin32.cpp)
   target_link_options(prospero PRIVATE -nostartfiles -static-libgcc)
-  target_link_libraries(prospero PRIVATE kernel32 advapi32 winhttp)
+  target_link_libraries(prospero PRIVATE kernel32 advapi32 winhttp user32 gdi32)
 else()
   # HTTP goes through the httpedge object, the one translation unit
   # with the C++ standard library (and so libc++/libstdc++ at link).
@@ -240,18 +243,8 @@ if(APPLE AND PROSPERO_GUI)
     DEPENDS ${CMAKE_BINARY_DIR}/Prospero.app/Contents/MacOS/prospero)
 endif()
 
-if(WIN32)
-  # The desktop helper, a program of its own (src/deskhelp.cpp), which
-  # the desktop tool runs from next to the harness: CRT-free, importing
-  # kernel32, user32 and gdi32 only, as old as Windows XP
-  add_executable(prospero-desktop src/main_desktop_win32.cpp)
-  target_link_options(prospero-desktop PRIVATE -nostartfiles -static-libgcc
-    -Wl,--no-insert-timestamp)
-  target_link_libraries(prospero-desktop PRIVATE prospero_core_flags
-    kernel32 user32 gdi32)
-  set_target_properties(prospero-desktop PROPERTIES
-    OUTPUT_NAME ${PROSPERO_NAME}-desktop)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# On Windows the desktop helper is prospero.exe itself (above)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # On X11 and Wayland (src/main_desktop_x11.cpp, src/deskwayland.cpp):
   # libX11, libXext and libXtst, and libei, libxkbcommon and libpipewire,
   # are loaded at run time, as SDL3 loads them, so it builds without
@@ -273,13 +266,6 @@ if(WIN32 AND NOT PROSPERO_GUI AND UV)
   enable_testing()
   add_test(NAME imports COMMAND ${UV} run
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/imports.py $<TARGET_FILE:prospero>)
-endif()
-if(WIN32 AND UV)
-  # So does the desktop helper, from its own DLLs
-  enable_testing()
-  add_test(NAME imports_desktop COMMAND ${UV} run
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/imports.py --dlls kernel32,user32,gdi32
-    $<TARGET_FILE:prospero-desktop>)
 endif()
 
 if(NOT CMAKE_CROSSCOMPILING)

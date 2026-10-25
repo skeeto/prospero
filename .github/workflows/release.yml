@@ -1,21 +1,23 @@
 # On a version tag (v1.2.3, which must equal the project VERSION in
 # CMakeLists.txt, which is PROSPERO_VERSION), build, test, and publish a
-# release of ten assets: the source tarball, and programs built from it
+# release of eight assets: the source tarball, and programs built from it
 # alone, with FetchContent disconnected.
 #
 #   prospero-VERSION.tar.gz                      the source, every dependency
 #                                                unpacked under deps/
 #                                                (tools/dist.py), deterministic
-#   prospero-VERSION-windows-x86_64.exe          the GUI, engine included
+#   prospero-VERSION-windows-x86_64.exe          the GUI, engine and desktop
+#                                                helper included
 #   prospero-engine-VERSION-windows-x86_64.exe   headless engines, named as
 #   prospero-engine-VERSION-windows-i686.exe       "prospero deploy" finds
 #   prospero-engine-VERSION-linux-x86_64           them; i686 is the XP engine,
-#   prospero-engine-VERSION-linux-aarch64          and Linux ones are static
-#   prospero-desktop-VERSION-windows-x86_64.exe  the desktop helpers, one
-#   prospero-desktop-VERSION-windows-i686.exe      beside each engine, which
-#   prospero-desktop-VERSION-linux-x86_64          deploy puts beside it there
-#   prospero-desktop-VERSION-linux-aarch64         (Linux ones load X11 at run
-#                                                  time, so link libc
+#   prospero-engine-VERSION-linux-aarch64          and Linux ones are static;
+#                                                  Windows ones are their own
+#                                                  desktop helpers
+#   prospero-desktop-VERSION-linux-x86_64        the Linux desktop helpers,
+#   prospero-desktop-VERSION-linux-aarch64         which deploy puts beside
+#                                                  each engine (they load X11
+#                                                  at run time, so link libc
 #                                                  dynamically)
 #
 # The Windows programs are built here on Linux by a pinned w64devkit's
@@ -148,9 +150,9 @@ jobs:
           cp "$exe" "dist/prospero-engine-$V-linux-x86_64"
           cp build-engine/prospero-desktop "dist/prospero-desktop-$V-linux-x86_64"
 
-      # The engines import only what Windows XP has (tests/imports.py), as
-      # do the desktop helpers, from their own DLLs, and each program runs
-      # under Wine far enough to tell its version
+      # The engines, their desktop helpers included, import only what
+      # Windows XP has (tests/imports.py), and each program runs under
+      # Wine far enough to tell its version
       - name: Windows programs
         run: |
           # (The engines fetch nothing, so they ignore the last option)
@@ -162,27 +164,20 @@ jobs:
           cmake -S "$SRC" -B build-x86 "${w[@]}" -DPROSPERO_GUI=OFF -DW64DEVKIT_ARCH=i686
           cmake --build build-gui --target prospero
           for b in build-x64 build-x86; do
-              cmake --build "$b" --target prospero prospero-desktop
+              cmake --build "$b" --target prospero
           done
           python3 -I tools/pecheck.py --machine x86_64 --subsystem gui build-gui/prospero.exe
           python3 -I tools/pecheck.py --machine x86_64 --subsystem console \
-              build-x64/prospero.exe build-x64/prospero-desktop.exe
+              build-x64/prospero.exe
           python3 -I tools/pecheck.py --machine i686 --subsystem console \
-              build-x86/prospero.exe build-x86/prospero-desktop.exe
+              build-x86/prospero.exe
           python3 -I tests/imports.py build-x64/prospero.exe build-x86/prospero.exe
-          python3 -I tests/imports.py --dlls kernel32,user32,gdi32 \
-              build-x64/prospero-desktop.exe build-x86/prospero-desktop.exe
           for b in build-gui build-x64 build-x86; do
               test "$(wine "$b/prospero.exe" --version)" = "prospero $V"
-          done
-          for b in build-x64 build-x86; do
-              test "$(wine "$b/prospero-desktop.exe" --version)" = "prospero-desktop $V"
           done
           cp build-gui/prospero.exe "dist/prospero-$V-windows-x86_64.exe"
           cp build-x64/prospero.exe "dist/prospero-engine-$V-windows-x86_64.exe"
           cp build-x86/prospero.exe "dist/prospero-engine-$V-windows-i686.exe"
-          cp build-x64/prospero-desktop.exe "dist/prospero-desktop-$V-windows-x86_64.exe"
-          cp build-x86/prospero-desktop.exe "dist/prospero-desktop-$V-windows-i686.exe"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -250,7 +245,7 @@ jobs:
         with:
           path: artifacts
 
-      # Exactly the ten assets, the aarch64 programs' source the same
+      # Exactly the eight assets, the aarch64 programs' source the same
       - name: Gather the assets
         run: |
           mkdir dist
@@ -269,8 +264,6 @@ jobs:
                    "prospero-engine-$V-windows-i686.exe" \
                    "prospero-engine-$V-linux-x86_64" \
                    "prospero-engine-$V-linux-aarch64" \
-                   "prospero-desktop-$V-windows-x86_64.exe" \
-                   "prospero-desktop-$V-windows-i686.exe" \
                    "prospero-desktop-$V-linux-x86_64" \
                    "prospero-desktop-$V-linux-aarch64"; do
               if [ ! -f "dist/$f" ]; then
@@ -279,8 +272,8 @@ jobs:
               fi
           done
           all=(dist/*)
-          if [ "${#all[@]}" -ne 10 ]; then
-              echo "::error::dist/ holds more than the ten assets"
+          if [ "${#all[@]}" -ne 8 ]; then
+              echo "::error::dist/ holds more than the eight assets"
               exit 1
           fi
           # As built, for the check after signing
@@ -300,8 +293,6 @@ jobs:
             dist/prospero-${{ env.V }}-windows-x86_64.exe
             dist/prospero-engine-${{ env.V }}-windows-x86_64.exe
             dist/prospero-engine-${{ env.V }}-windows-i686.exe
-            dist/prospero-desktop-${{ env.V }}-windows-x86_64.exe
-            dist/prospero-desktop-${{ env.V }}-windows-i686.exe
 
       # Each signature is Authenticode's, by the expected signer, for the
       # file's own digest, and verifies; and with it taken out, each

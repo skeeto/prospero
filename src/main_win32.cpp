@@ -1,8 +1,10 @@
 // Win32 platform layer: no CRT and no headers
 // $ cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain-Mingw64.cmake
-// $ c++ -std=c++20 -nostartfiles -o prospero.exe src/main_win32.cpp -ladvapi32
+// $ c++ -std=c++20 -nostartfiles -o prospero.exe src/main_win32.cpp
+//       src/deskwin32.cpp -ladvapi32 -lwinhttp -luser32 -lgdi32
 //
 // Imports only kernel32.dll, advapi32.dll (RtlGenRandom), and winhttp.dll,
+// and user32.dll and gdi32.dll for the desktop helper (deskwin32.cpp),
 // with nothing newer than Windows XP SP3, so the XP engine, an i686 build
 // with PROSPERO_GUI off, comes from this file too. tests/imports.py checks
 // the imports against XP's own export lists. Newer functions are looked
@@ -3255,6 +3257,9 @@ static void os_httpfree(Os *, Http *h)
 #endif
 
 
+// The desktop helper, "prospero desktop" (deskwin32.cpp), which never returns
+extern "C" [[noreturn]] void prospero_desktop();
+
 #if PROSPERO_GUI
 // GUI builds start in the CRT, whose wWinMain (gui_win32.cpp) calls this.
 extern "C" void prospero_main()
@@ -3293,6 +3298,9 @@ void mainCRTStartup()
     for (; cmd[len]; len++) {}
     Slice<Str> args = splitcmdline(&a, fromwide(&a, cmd, len));
 
+    if (args.len>1 && args[1]=="desktop") {
+        prospero_desktop();
+    }
     #if PROSPERO_GUI
     if (guiwanted(args.data, (i32)args.len)) {
         ExitProcess(gui_main(&os, a, args.data, (i32)args.len));
