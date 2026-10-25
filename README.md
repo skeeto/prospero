@@ -197,7 +197,11 @@ agent is told to leave files alone. The prompt box keeps a draft
 per session, with the engine, has the session's earlier prompts on Up
 and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
 else `$VISUAL` or `$EDITOR`), and takes `/compact`, `/model`,
-`/rename`, `/fork`, `/side`, `/export`, `/plan` and a skill's `/NAME`. An ask may be answered "always",
+`/rename`, `/fork`, `/side`, `/export`, `/plan`, `/background` and a skill's
+`/NAME`. Run in background (Ctrl+B, Cmd+B on macOS) moves a running
+command to a job, or a subagent at work on by itself, so that the
+agent goes on and can be talked to; it is told when either ends, a
+subagent's report coming as a notice that wakes the parent. An ask may be answered "always",
 with the button set apart from Allow, which allows that directory, for
 reads or for writes too, for the rest of the session and its subagents,
 even after it is opened again. Each session has a scratch directory in the system's

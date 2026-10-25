@@ -23,6 +23,10 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 - **Shift+Enter** starts a new line.
 - **Esc** cancels the running turn (from the Sessions, Transcript and
   Prompt panes, while no dialog or menu is open).
+- **Ctrl+B** moves what the turn waits for to the background, a
+  running command or its subagents, as Run in background does (from
+  the same panes); the agent goes on, and you may talk to it. See
+  [Jobs, todo and subagents](help:jobs).
 - **Up**, on an empty box, recalls the session's earlier prompts,
   newest first; **Up** and **Down** go back and forth, and **Esc**
   returns to the empty draft.

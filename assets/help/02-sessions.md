@@ -32,6 +32,12 @@ until the agent reads it at its next step (or marked "queued", for a
 turn of its own), and its Withdraw button takes it back into the box. Stop, or Esc, cancels the turn and kills
 any command it runs.
 
+A long command or subagent keeps the agent from reading what you
+send until it ends. Run in background, on its row, or Ctrl+B (also in
+the Session menu and as `/background`) lets it go on by itself while
+the agent goes on with you; the agent is told when it ends. See
+[Jobs, todo and subagents](help:jobs).
+
 A message starting with a command runs it instead of going to the
 agent (Tab completes the name):
 
@@ -43,6 +49,8 @@ agent (Tab completes the name):
 - `/side` starts a side chat (below);
 - `/export [raw]` saves the transcript as Markdown, or its raw log;
 - `/plan` and `/plan off` turn Plan mode on and off;
+- `/background` moves the running command or subagents to the
+  background, as Ctrl+B does;
 - `/NAME [args]` uses the skill NAME (see
   [Instructions and skills](help:instructions)).
 
