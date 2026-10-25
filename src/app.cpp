@@ -1281,6 +1281,7 @@ struct Gui {
     i64                deltamark;    // the shown session's deltas, as marked
     Str                driverwd;     // --rcwd: the remote one
     b32                kidlinkshown; // a task row asked to answer its subagent
+    i32                bgshown;      // tool rows' Run in background drawn
     i64                rewsent;      // rewinds sent
     i32                drivewait;    // W_* condition it waits for
     i64                holduntil;    // µs: the inbox is left alone until
@@ -2455,6 +2456,51 @@ static void guicancel(Gui *g, GuiSession *s)
     cmdsend(g, &w, a);
 }
 
+// A tool row the user may move to the background: a command running in
+// the foreground, or a task whose subagent is at work.
+static b32 bgrow(ViewTool *t)
+{
+    return t->status==VTOOL_RUNNING && !t->job && (t->name=="shell" || t->name=="task");
+}
+
+// Whether the session's turn waits for something the user may move to
+// the background now (background), as its host can: such a row among
+// the newest, where any running call is.
+static b32 canbackground(GuiSession *s)
+{
+    View *v = s ? s->view : 0;
+    if (!v || !v->busy || s->readonly || !hostcap(s->host, "background")) {
+        return 0;
+    }
+    for (iz i = v->msgs.len-1; i>=0 && i>=v->msgs.len-256; i--) {
+        if (v->msgs[i].role==VIEW_TOOL && bgrow(v->msgs[i].tool)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Move what the turn waits for to the background: the running command,
+// becoming a job, or the subagents at work, only call's if given. The
+// agent goes on, told of each as it ends.
+static void guibackground(Gui *g, GuiSession *s, Str call)
+{
+    if (!canbackground(s)) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + call.len);
+    EvOut w = cmdopen(g, &b, CMD_BACKGROUND, s);
+    if (call.len) {
+        putkey(&w.json, "call");
+        putstr(&w.json, call);
+    }
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
+    cmdsend(g, &w, a);
+}
+
 // The session operations the compose box's slash commands and the
 // session menus run alike: the reply's outcome becomes the session's
 // note above the box, and a failed command's text, kept in cmdtext by
@@ -3358,6 +3404,10 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
         setnote(g, s, "renamed", 0);
         guilist(g, h);
         break;
+    case CMD_BACKGROUND:
+        setnote(g, s, "moved to the background: the agent goes on, and is "
+                "told when it ends", 0);
+        break;
     case CMD_MODEL: {
         Str  model = jsonstr(jsonget(j, "model"));
         Buf  b(&scratch, 256 + model.len + note.len);
@@ -3554,6 +3604,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_MODEL:
     case CMD_MODE:
     case CMD_FORK:
+    case CMD_BACKGROUND:
         onsesscmd(g, h, scratch, &q, r);
         return;
 
@@ -8117,6 +8168,12 @@ enum : i32 {
     CHK_CFGEDITED,    // the editor gone, Settings lists [model text], no error
     CHK_SIDECHAT,     // a side chat of the session the checklist made is
                       // shown, idle, under it, its box the selection quoted
+    CHK_BGBTN,        // the running command's row offers Run in background,
+                      // and so does the Session menu
+    CHK_BGMOVED,      // that row went to the background as a job, its chip
+                      // drawn, and the agent went on: nothing more to move
+    CHK_BGTASKS,      // the task rows at work offer Run in background beside
+                      // their Open subagent
     CHK_COUNT,
 };
 
@@ -8323,6 +8380,9 @@ static Str chknames[] = {
     "Open in editor has the configuration file out in the editor",
     "the configuration file as the editor left it is read again, in Settings",
     "the side chat is shown, idle, under its original, the selection quoted",
+    "the running command's row offers Run in background",
+    "Cmd+B moved the command to the background as a job, and the agent went on",
+    "the task rows at work offer Run in background, and their subagents",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9148,6 +9208,7 @@ static DriveOp m3ops[] = {
     {OP_PROMPT, 0, 0, 0, 0, "Start subagents."},
     {OP_WAIT, W_TASKS, 0, 0, 10000, ""},
     {OP_CHECK, CHK_TASKSTATE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_BGTASKS, 0, 0, 0, ""},
     {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
     {OP_CHECK, CHK_NESTED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "7-subagents"},
@@ -9243,6 +9304,23 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
     {OP_WAIT, W_SAID, 0, 0, 20000, "Done, while the side chat waited."},
+    // Run in background: a long command's row offers it, and Cmd+B in
+    // the transcript moves the command to a job, the agent going on at
+    // once; the job's end brings the agent back by itself
+    {OP_PROMPT, 0, 0, 0, 0, "Run a long command."},
+    {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_BGBTN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "10-bgbtn"},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_B, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_B, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "It runs as a job."},
+    {OP_CHECK, CHK_BGMOVED, 0, 0, 0, ""},
+    {OP_WAIT, W_SAID, 0, 0, 15000, "The long command ended."},
     // Then dark. The latest write undone from its row, the turn rewound
     // into a conflict with a change made outside, then forced
     {OP_SYSTHEME, 0, 1, 0, 1000, ""},
@@ -13589,6 +13667,31 @@ static b32 drivecheck(Gui *g, i32 chk)
         return under && sessside(s)==m->sid && !s->view->busy && m->view->busy &&
                startswith(quote, "> ") && draftstr(s)==quote &&
                endswith(sesstitle(s), "(side chat)");
+    }
+    case CHK_BGBTN: {
+        ViewMsg *m = lastof(v, VIEW_TOOL);
+        return m && m->tool->name=="shell" && bgrow(m->tool) && g->bgshown==1 &&
+               canbackground(g->sess);
+    }
+    case CHK_BGTASKS: {
+        i32 rows = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            rows += v->msgs[i].role==VIEW_TOOL && v->msgs[i].tool->name=="task" &&
+                    bgrow(v->msgs[i].tool);
+        }
+        return rows==2 && g->bgshown==2 && g->rects[RECT_TASKLINK].x1>0;
+    }
+    case CHK_BGMOVED: {
+        // The same row, now a job's, and the agent's reply after it
+        ViewMsg *m = 0;
+        for (iz i = v->msgs.len-1; !m && i >= 0; i--) {
+            ViewTool *t = v->msgs[i].tool;
+            m = v->msgs[i].role==VIEW_TOOL && t->name=="shell" ? &v->msgs[i] : 0;
+        }
+        ViewJob *jb = m ? findjob(v, m->tool->job) : 0;
+        return m && m->tool->status==VTOOL_BACKGROUND && jb && jb->call==m->tool->call &&
+               find(m->text, "the user moved it to the background")>=0 &&
+               !g->bgshown && !canbackground(g->sess);
     }
     case CHK_REMOTEFAILED: {
         GuiHost *h = findhost(g, GH_REMOTE, "bad");

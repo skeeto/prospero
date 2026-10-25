@@ -2177,7 +2177,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Think briefly", "Answer at length", "Write outside for good",
                "Start a desktop subagent", "Type on the desktop as a subagent",
                "Start a subagent that messages", "Message the parent as a subagent",
-               "Describe the images", "Ask on the side")
+               "Describe the images", "Ask on the side", "Run a long command")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2426,6 +2426,17 @@ def sc_gui(model, n, req):
             killed = any("the user stopped it" in c for c in seen)
             yield from answer(model, "The second job was killed." if killed
                               else "A job ended.")
+    elif "Run a long command" in prompt:
+        # Until the user moves it to the background (Cmd+B), whose job's
+        # end brings the agent back by itself
+        if step == 0:
+            yield from tool(model, n, "shell", {"command": "echo long; sleep 5; echo done",
+                                                "timeout": 60})
+        elif step == 1:
+            moved = "the user moved it to the background" in str(last.get("content", ""))
+            yield from answer(model, "It runs as a job." if moved else "It ran to its end.")
+        else:
+            yield from answer(model, "The long command ended.")
     elif "Start a subagent that messages" in prompt:
         # Its message waits for the parent's next step, after the report
         if step == 0:

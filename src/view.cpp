@@ -354,7 +354,8 @@ struct ViewMsg {
     i64       ts0;        // reasoning: its first and last deltas, epoch
     i64       ts1;        //   ms, or 0 where it did not stream
     Str       label;      // the header, if not the role's name
-    Str       from;       // a message's sender, a session's id
+    Str       from;       // a message's sender, a session's id, or the
+    b32       fromkid;    // subagent whose report it is (kind task)
     ViewTool *tool;       // tool rows and asks
     ViewCard *card;       // compactions and rewinds
     Slice<ViewImage> images;  // the user's, attached
@@ -1498,6 +1499,12 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             v->msgs[i].seq        = r->seq;
             v->msgs[i].label      = "Resumed by itself";
             v->msgs[i].startsturn = v->turn;
+        } else if (via == "task") {
+            i32 i = addmsg(v, VIEW_NOTE, "A subagent moved to the background "
+                           "finished, so the agent went on without a prompt.");
+            v->msgs[i].seq        = r->seq;
+            v->msgs[i].label      = "Resumed by itself";
+            v->msgs[i].startsturn = v->turn;
         } else if (via == "compact") {
             // Asked for by the user (compact), with no message of its
             // own: its card (EV_COMPACT) says what it did
@@ -1845,6 +1852,14 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             m->label     = oneline(&v->aux, concat(&scratch, "Message from ", name));
             m->from      = clone(&v->aux, from);
             m->collapsed = 0;
+        } else if (kind == "task") {
+            // A subagent's report from the background, linked to it
+            Str kid   = jsonstr(jsonget(j, "child"));
+            Str title = jsonstr(jsonget(j, "child_title"));
+            Str name  = title.len ? title : kid.len ? kid : Str("a subagent");
+            m->label   = oneline(&v->aux, concat(&scratch, "To the agent: the report of ", name));
+            m->from    = clone(&v->aux, kid);
+            m->fromkid = 1;
         } else {
             m->label = kind=="rewind"       ? Str("To the agent: files rewound") :
                        kind=="instructions" ? Str("To the agent: instruction files") :

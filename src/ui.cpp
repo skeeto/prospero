@@ -1022,6 +1022,9 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             GuiSession *k = taskchild(g, g->sess, t);
             if (k && k->view && k->view->asks) {
                 pen(p, "  needs an answer", STYLE_BOLD, pal->amber);
+            } else if (t->status==VTOOL_BACKGROUND && k && k->view &&
+                       (k->view->busy || k->view->jobsrun)) {
+                pen(p, "  subagent still at work", STYLE_BOLD, pal->active);
             }
         }
         pen(p, "  ", 0, dim);
@@ -1207,6 +1210,20 @@ static GuiSession *taskchild(Gui *g, GuiSession *parent, ViewTool *t)
     return 0;
 }
 
+// Whether the user moved subagent v to the background (its call's row in
+// parent p, if shown here, says so).
+static b32 kidinbg(GuiSession *p, View *v)
+{
+    View *pv = p ? p->view : 0;
+    for (iz i = pv ? pv->msgs.len-1 : -1; i >= 0; i--) {
+        ViewTool *t = pv->msgs[i].tool;
+        if (pv->msgs[i].role==VIEW_TOOL && t->call==v->pcall) {
+            return t->status == VTOOL_BACKGROUND;
+        }
+    }
+    return 0;
+}
+
 // Whether a session's host takes commands: the engine while it runs and
 // this process does not host, or another host while connected.
 static b32 hostlive(Gui *g, GuiSession *s)
@@ -1231,6 +1248,7 @@ enum : i32 {
     ACT_REWIND,   // put back the files to the start of a turn
     ACT_OPEN,     // show a task's subagent
     ACT_OUTPUT,   // show a call's whole output (its spill file)
+    ACT_BACKGROUND, // move a running command or subagent to the background
 };
 
 struct MsgAction {
@@ -1239,7 +1257,13 @@ struct MsgAction {
     f32         w;
     b32         amber;  // it waits for the user
     GuiSession *child;
+    f32         bgw;    // a running task's Run in background too, to the
+                        // left of its Open subagent: its width, else 0
 };
+
+static char const bglabel[] = "Run in background";
+static char const *cmdkey(Gui *, Arena *, Str);
+static void itemnamed(Gui *, Str);
 
 // The action at the right of a message's header, if any.
 static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
@@ -1259,7 +1283,8 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
         r.child = findsess(g, s->host, m->from.len ? m->from : t->child);
         if (r.child) {
             r.kind  = ACT_OPEN;
-            r.label = m->from.len ? "Open sender" : "Open session";
+            r.label = m->fromkid ? "Open subagent" :
+                      m->from.len ? "Open sender" : "Open session";
         }
     } else if (m->role == VIEW_TOOL) {
         ViewSnap *sn = rowsnap(v, t);
@@ -1274,10 +1299,28 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
         r.kind  = ACT_REWIND;
         r.label = "Rewind to here";
     }
+    f32 pad = 2*ImGui::GetStyle().FramePadding.x;
     if (r.kind) {
-        r.w = ImGui::CalcTextSize(r.label).x + 2*ImGui::GetStyle().FramePadding.x;
+        r.w = ImGui::CalcTextSize(r.label).x + pad;
+    }
+    if (m->role==VIEW_TOOL && s==g->sess && bgrow(t) && canbackground(s)) {
+        f32 w = ImGui::CalcTextSize(bglabel).x + pad;
+        if (r.kind) {
+            r.bgw = w;
+        } else {
+            r.kind  = ACT_BACKGROUND;
+            r.label = bglabel;
+            r.w     = w;
+        }
     }
     return r;
+}
+
+// The room a message's actions take at the right of its header.
+static f32 actwidth(MsgAction *act)
+{
+    f32 gap = ImGui::GetStyle().ItemSpacing.x;
+    return act->kind ? act->w + (act->bgw>0 ? act->bgw + gap : 0) : 0;
 }
 
 // Ask before rewinding: the confirmation lists the files (drawrewind).
@@ -1327,6 +1370,22 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
         ImGui::SetItemTooltip("Show the whole output, from its host:\n%s (%s)",
                               cstr0(&a, p), cstr0(&a, bytesize(&a, t->bytes)));
         if (go) showfile(g, s, t->spill);
+    } break;
+    case ACT_BACKGROUND: {
+        // Its shortcut moves everything the turn waits for at once
+        itemnamed(g, bglabel);
+        g->bgshown++;
+        Arena a = g->frame;
+        if (t->name == "task") {
+            ImGui::SetItemTooltip("Let the subagent go on by itself, and the agent with "
+                                  "it: the report comes to the agent once the subagent "
+                                  "is done (%s)", cmdkey(g, &a, "B"));
+        } else {
+            ImGui::SetItemTooltip("Let the command go on as a background job, and the "
+                                  "agent with it: it is told when the job ends (%s)",
+                                  cmdkey(g, &a, "B"));
+        }
+        if (go) guibackground(g, s, t->call);
     } break;
     }
 }
@@ -1852,6 +1911,11 @@ static void drawsessbar(Gui *g)
         }
         itemrect(g, RECT_PARENTLINK);
         ImGui::SetItemTooltip("Back to the session that started this subagent");
+        if (kidinbg(p, v) && (v->busy || v->jobsrun)) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("in the background: it reports when done");
+            itemnamed(g, "reports in the background");
+        }
     } else if (sessside(s).len) {
         // A side chat names its original in place of its own title
         Str         o = sessside(s);
@@ -2671,6 +2735,7 @@ static void drawtranscript(Gui *g)
     g->rects[RECT_CODEBLOCK] = {};
     g->rects[RECT_CODECOPY]  = {};
     g->copiedshown = 0;
+    g->bgshown     = 0;
     sp->Split(dl, CH_COUNT);
     for (i32 i = d0; i>=0 && i <= d1; i++) {
         if (msghidden(v, &v->msgs[i])) {
@@ -2706,7 +2771,7 @@ static void drawtranscript(Gui *g)
 
         sp->SetCurrentChannel(dl, CH_TEXT);
         MsgAction act = msgaction(g, g->sess, v, m);
-        f32       actw = act.kind ? act.w + 8*sc : 0;
+        f32       actw = act.kind ? actwidth(&act) + 8*sc : 0;
         Pen p = {dl, &g->fonts, x, y + pad/4, x + width - actw, g->fonts.size*0.85f};
         drawheader(g, &p, v, m, nowms);
         if (!m->collapsed) {
@@ -2734,6 +2799,14 @@ static void drawtranscript(Gui *g)
         if (act.kind) {
             ImGui::SetCursorScreenPos(v2(x + width - act.w, y + pad/4));
             drawaction(g, gs, m, &act);
+        }
+        if (act.bgw > 0) {
+            MsgAction bg = {};
+            bg.kind  = ACT_BACKGROUND;
+            bg.label = bglabel;
+            bg.w     = act.bgw;
+            ImGui::SetCursorScreenPos(v2(x + width - actwidth(&act), y + pad/4));
+            drawaction(g, gs, m, &bg);
         }
         Thumb th = msgthumb(v, m);
         if (th.h > 0) {
@@ -2808,6 +2881,17 @@ static void escapecancel(Gui *g)
     if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && !g->findactive &&
             ImGui::Shortcut(ImGuiKey_Escape, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
         guicancel(g, g->sess);
+    }
+}
+
+// Cmd+B (Ctrl+B) moves to the background whatever the shown session's
+// turn waits for, its command or its subagents, from the same windows
+// as Esc and gated alike.
+static void backgroundkey(Gui *g)
+{
+    if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && !g->findactive &&
+            ImGui::Shortcut(ImGuiMod_Ctrl|ImGuiKey_B, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
+        guibackground(g, g->sess, {});
     }
 }
 
@@ -3178,6 +3262,15 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
         guimode(g, s, sl.off ? Str("default") : Str("plan"));
         sent = 1;
     } break;
+    case SLASH_BACKGROUND:
+        // As Cmd+B, everything the turn waits for
+        if (hostcap(h, "background") && !canbackground(s)) {
+            setnote(g, s, "/background: nothing running can go to the background", 1);
+            return;
+        } else if ((sent = hostcap(h, "background"))) {
+            guibackground(g, s, {});
+        }
+        break;
     }
     if (!sent) {
         Arena a = g->frame;
@@ -3439,6 +3532,7 @@ static void drawprompt(Gui *g)
     if (!s->hist) {
         escapecancel(g);
     }
+    backgroundkey(g);
     // Ctrl+G opens the draft in the editor: Ctrl on every platform, as
     // in terminal tools, which ImGui calls Super on macOS. The active
     // box owns the keys, so they are read as they are, with the focus
@@ -7452,6 +7546,15 @@ static void drawmenubar(Gui *g)
             importstart(g, 0);
         }
         ImGui::SetItemTooltip("A session from its raw log, exported here or elsewhere");
+        ImGui::Separator();
+        // What the shown session's turn waits for, as Cmd+B moves it
+        if (ImGui::MenuItem(bglabel, cmdkey(g, &a, "B"), false, canbackground(g->sess))) {
+            guibackground(g, g->sess, {});
+        }
+        itemnamed(g, "menu Run in background");
+        ImGui::SetItemTooltip("Let the running command go on as a background job, or "
+                              "the subagents on by themselves, and the agent with them: "
+                              "it is told as each ends");
         // The session operations, on the session shown, as its context
         // menu in the sidebar has them
         ImGui::Separator();
@@ -7867,6 +7970,7 @@ static void dockwindows(Gui *g)
     if (show[PANE_SESSIONS]) {
         if (beginpane(g, PANE_SESSIONS)) {
             escapecancel(g);
+            backgroundkey(g);
             drawsessions(g);
         }
         ImGui::End();
@@ -7897,6 +8001,7 @@ static void dockwindows(Gui *g)
     if (show[PANE_TRANSCRIPT]) {
         if (beginpane(g, PANE_TRANSCRIPT)) {
             escapecancel(g);
+            backgroundkey(g);
             drawtranscript(g);
         }
         ImGui::End();

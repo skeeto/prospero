@@ -452,6 +452,7 @@ enum {
     GKEY_UP,
     GKEY_DOWN,
     GKEY_V,
+    GKEY_B,
 };
 struct GuiEvent {
     i32 kind;

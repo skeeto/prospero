@@ -1007,6 +1007,17 @@ static void test_viewpanels(Test *t)
         m = &v->msgs[3];
         expect(t, "panels.msgnofrom", concat(&a, concat(&a, m->label, "|"), m->from),
                "Message from another session|");
+        // A subagent's report from the background, and the turn it began
+        apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"turn","n":2,"via":"task"})");
+        apply(v, a, R"({"sid":"s","seq":7,"ts":0,"ev":"notice","kind":"task","child":"k2",)"
+                    R"("child_title":"Slow child","text":"The subagent finished."})");
+        m = &v->msgs[4];
+        expect(t, "panels.bgturn", concat(&a, m->label, istr(&a, m->startsturn)),
+               "Resumed by itself2");
+        m = &v->msgs[5];
+        expect(t, "panels.bgreport", concat(&a, concat(&a, m->label, "|"),
+               concat(&a, m->from, istr(&a, m->fromkid*10 + m->collapsed))),
+               "To the agent: the report of Slow child|k211");
     }
 }
 

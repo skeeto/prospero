@@ -22,6 +22,7 @@ enum : i32 {
     SLASH_EXPORT,
     SLASH_PLAN,
     SLASH_SIDE,
+    SLASH_BACKGROUND,
     SLASH_COUNT,
 };
 
@@ -41,6 +42,7 @@ static SlashInfo slashinfo[] = {
     {"/plan",    "[off]",   "Plan mode: the agent plans for you to approve before it changes anything"},
     {"/side",    "",        "Start a side chat: a copy of this session to ask about it, "
                             "while its agent works on"},
+    {"/background", "",     "Let the running command or subagents go on in the background, and the agent with them"},
 };
 static_assert(countof(slashinfo) == SLASH_COUNT);
 
@@ -103,6 +105,11 @@ static Slash parseslash(Str text)
     case SLASH_SIDE:
         if (r.arg.len) {
             r.err = "/side takes nothing: select text in the transcript to quote it";
+        }
+        break;
+    case SLASH_BACKGROUND:
+        if (r.arg.len) {
+            r.err = "/background takes nothing";
         }
         break;
     }
