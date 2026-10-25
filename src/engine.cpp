@@ -4809,14 +4809,33 @@ static Str deskoffer(Engine *e)
     return trim(cfgget(e->cfg, "desktop", "", "offer", 0));
 }
 
+// Whether the desktop tool could work here, for offering it: there is a
+// helper, and on POSIX but macOS a display for it (DISPLAY or
+// WAYLAND_DISPLAY), which an engine reached over ssh, on a server say,
+// does not have. A test's helper (PROSPERO_TEST_DESKTOP) always could.
+static b32 deskusable(Engine *e, Arena scratch)
+{
+    if (os_getenv(e->os, &scratch, "PROSPERO_TEST_DESKTOP").len) {
+        return 1;
+    } else if (!deskhelper(e, &scratch).len) {
+        return 0;
+    }
+    #if defined(_WIN32) || defined(__APPLE__)
+    return 1;
+    #else
+    return os_getenv(e->os, &scratch, "DISPLAY").len ||
+           os_getenv(e->os, &scratch, "WAYLAND_DISPLAY").len;
+    #endif
+}
+
 // The desktop bit of a new session's tools denied: offered to a role
 // that lists it, unless offer is none, and to a session without a role
-// only when offer is all.
-static u32 deskdeny(Engine *e, b32 role)
+// only when offer is all, the default; never where it could not work.
+static u32 deskdeny(Engine *e, Arena scratch, b32 role)
 {
     Str offer = deskoffer(e);
     b32 ok    = role ? offer!="none" : offer=="all";
-    return ok ? 0 : (u32)TOOL_OFFMASK;
+    return ok && deskusable(e, scratch) ? 0 : (u32)TOOL_OFFMASK;
 }
 
 struct DeskLimits {
@@ -7720,13 +7739,13 @@ static Role findrole(Engine *e, Str name)
     return r;
 }
 
-// The roles a task may give, for the task tool's description and its
-// enum: the built-in ones, then the configuration's in its order.
-static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
+// The roles there are: the built-in ones, then the configuration's in
+// its order.
+static Slice<Str> rolenames(Engine *e, Arena *a)
 {
     Slice<Str> names = {};
     for (i32 i = 0; i < countof(builtinroles); i++) {
-        names = push(&scratch, names, builtinroles[i].name);
+        names = push(a, names, builtinroles[i].name);
     }
     for (IniSection *s = inifirst(e->ini, "role"); s; s = ininext(s)) {
         b32 seen = !s->name.len;
@@ -7734,9 +7753,45 @@ static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
             seen |= names[i] == s->name;
         }
         if (!seen) {
-            names = push(&scratch, names, s->name);
+            names = push(a, names, s->name);
         }
     }
+    return names;
+}
+
+// The roles, for config.get's reply, which the GUI offers for a new
+// session: roles [{name, description, tools: [...]}], the tools a
+// session in it would have (but the desktop's offer and the skills').
+// Its names go in the output's own arena, not a copy of it, which the
+// output would grow over.
+static void putroles(Engine *e, JsonOut *w)
+{
+    Slice<Str> names = rolenames(e, w->b->a);
+    putkey(w, "roles");
+    putarray(w);
+    for (iz i = 0; i < names.len; i++) {
+        Role r = findrole(e, names[i]);
+        putobject(w);
+        putstrkey(w, "name", r.name);
+        putstrkey(w, "description", r.desc);
+        putkey(w, "tools");
+        putarray(w);
+        for (i32 t = 0; t < TOOL_COUNT; t++) {
+            if (!(r.deny>>t & 1) && !((u32)TOOL_PLANMASK>>t & 1)) {
+                putstr(w, toolnames[t]);
+            }
+        }
+        putend(w);
+        putend(w);
+    }
+    putend(w);
+}
+
+// The roles a task may give, for the task tool's description and its
+// enum.
+static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
+{
+    Slice<Str> names = rolenames(e, &scratch);
 
     Buf text(&scratch, 1024);
     for (iz i = 0; i < names.len; i++) {
@@ -7891,7 +7946,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->rolepr  = clone(&s->perm, r.prompt);
     s->depth   = p->depth + 1;
     s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
-                 deskdeny(e, 1) | skilldeny(e) | TOOL_PLANMASK;
+                 deskdeny(e, scratch, 1) | skilldeny(e) | TOOL_PLANMASK;
     s->psid    = clone(&s->perm, p->sid);
     s->pcall   = clone(&s->perm, c->id);
     s->intask  = 1;
@@ -8906,7 +8961,8 @@ static Str unknowntools(Str list)
         rest = cuthead(rest, i);
         for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
         Str word = takehead(rest, i);
-        if (word.len && toolfind(word)==TOOL_NONE) {
+        Str name = word.len>1 && word[0]=='-' ? cuthead(word, 1) : word;
+        if (word.len && !toolbits(name) && toolfind(name)==TOOL_NONE) {
             return word;
         }
         rest = cuthead(rest, i);
@@ -9022,7 +9078,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->role       = clone(&s->perm, role.name);
     s->rolepr     = clone(&s->perm, role.prompt);
     s->te.deny    = role.deny | (tools.data ? tooldeny(tools) : 0) |
-                    deskdeny(e, role.ok) | skilldeny(e);
+                    deskdeny(e, scratch, role.ok) | skilldeny(e);
     s->stepmax    = steps<STEP_HARD ? steps : 0;
     s->projinstr  = instr == "project";
     s->nofallback = !fall;
@@ -11195,6 +11251,7 @@ static void replyconfig(Engine *e, Arena scratch, i64 id, i32 cmd, CfgSet *r)
     }
     if (cmd == CMD_CONFIGGET) {
         putcfg(&w.json, c);
+        putroles(e, &w.json);
     } else {
         putcfgset(&w.json, c, r);
     }

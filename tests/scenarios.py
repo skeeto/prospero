@@ -3236,6 +3236,59 @@ def task_cancel(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+ROLEWORDS = """[role every]
+tools = *
+[role gui]
+description = Builds programs and looks at them
+tools = default desktop
+[role lean]
+tools = * -shell, -job_kill
+[role odd]
+tools = read -bogus
+"""
+
+
+@scenario(conf={"_extra": ROLEWORDS}, bound=15)
+def role_words(t):
+    """A role's tools read left to right: * is every tool, default those
+    of a role that names none, and -NAME takes one away. config.get lists
+    the roles, built-in ones first, with the tools each gives, and a new
+    session takes one."""
+    h = t.headless(env=deskenv(t))
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        cfg = h.call("config.get")
+        roles = {r["name"]: r for r in cfg.get("roles", [])}
+        t.check(list(roles) == ["explore", "general", "every", "gui", "lean", "odd"],
+                f"roles {list(roles)}")
+        default = ["read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
+                   "job_output", "job_kill", "task", "skill", "sessions", "send_message"]
+        every = default[:11] + ["desktop"] + default[11:]
+        t.check(roles["general"]["tools"] == default, f"general {roles['general']}")
+        t.check(roles["every"]["tools"] == every, f"* {roles['every']}")
+        t.check(roles["gui"]["tools"] == every and
+                roles["gui"]["description"] == "Builds programs and looks at them",
+                f"default desktop {roles['gui']}")
+        t.check(roles["lean"]["tools"] == [x for x in every if x not in ("shell", "job_kill")],
+                f"* -shell, -job_kill {roles['lean']}")
+        t.check(roles["odd"]["tools"] == ["read"], f"read -bogus {roles['odd']}")
+        diags = [d["message"] for d in cfg.get("diags", [])]
+        t.check(any('unknown value "-bogus"' in d for d in diags) and
+                not any("-shell" in d or "-job_kill" in d for d in diags), f"diags {diags}")
+
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", role="gui")
+        t.check("sid" in r, f"new {r}")
+        sid = r["sid"]
+        rec = h.all("session", sid)[0]
+        t.check(rec["role"] == "gui" and "desktop" in rec["tools"] and
+                "enter_plan_mode" not in rec["tools"], f"session {rec}")
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", tools="* -bogus")
+        t.check(r.get("ok") == 0 and r.get("err") == "no such tool: -bogus", f"bad word {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 ROLES = """[role reader]
 description = Reads files
 prompt = You only read files. ROLE-MARK
@@ -7887,10 +7940,10 @@ def desktop_flow(t):
     t.check(len(fake_provider.desk_images(reqs[-1])) == 2, "both screenshots kept")
 
 
-@scenario(bound=10)
+@scenario(conf={"_desktop": {"offer": "none"}}, bound=10)
 def desktop_off(t):
-    """By default the tool is offered to nobody, and a call to it is an
-    unknown tool's."""
+    """With offer none the tool is offered to nobody, and a call to it is
+    an unknown tool's."""
     r = t.run(env=deskenv(t))
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     req = t.requests()[0]["body"]
@@ -7899,6 +7952,18 @@ def desktop_off(t):
     t.check(end["status"] == "error" and "not available in this session" in end["text"],
             f"refused {end}")
     t.check(not desklog(t), "no helper started")
+
+
+@scenario(bound=10)
+def desktop_nodisplay(t):
+    """Offered by default only where it could work: on X11 and Wayland, not
+    to an engine with no display, as one reached over ssh."""
+    if not sys.platform.startswith("linux") or not isinstance(t.host, LocalHost):
+        raise Skip("a display is X11's or Wayland's: Linux, on this machine")
+    r = t.run(env={"DISPLAY": "", "WAYLAND_DISPLAY": ""})
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    req = t.requests()[0]["body"]
+    t.check("desktop" not in fake_provider.tool_names(req), "not offered")
 
 
 @scenario(conf=DESKALL, bound=15)
@@ -7918,9 +7983,10 @@ def desktop_plan(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
-@scenario(conf={"_desktop": {"offer": "all"}}, bound=10)
+@scenario(bound=10)
 def desktop_policy(t):
-    """Unattended with ask left on: denied by policy, and the turn goes on."""
+    """By default every session is offered the tool, and asks: unattended,
+    denied by policy, and the turn goes on."""
     r = t.run(env=deskenv(t))
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     ask = r.last("ask")

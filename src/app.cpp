@@ -400,6 +400,13 @@ enum : i32 {
     GH_REMOTE,  // a [remote NAME] over ssh
 };
 
+// A role a host's configuration has, for a new session there.
+struct GuiRole {
+    Str name;
+    Str desc;
+    Str tools;  // the tools it gives, as a line
+};
+
 struct GuiHost {
     GuiHost *next;
     i32      kind;
@@ -437,6 +444,9 @@ struct GuiHost {
     i64        modelsid;   // its config.get in flight, 0 if none
     b32        modelsgot;  // models is its answer since it came up
     Str        modelserr;  // why there is no answer
+    // And its roles, from the same answer, for a new session there (none
+    // from an engine older than config.get's roles)
+    Slice<GuiRole> roles;
 };
 
 struct AttBox;
@@ -1085,6 +1095,7 @@ struct Gui {
     b32                opennew;
     b32                newplan;    // in plan mode
     b32                newnofolder;// in a folder of its own, not newcwd
+    Str                newrole;    // in this role, if any
     PathComp           pc;         // newcwd's completion
     i64                newid;      // the new command in flight
     char              *denynote;   // "Deny with note"
@@ -1627,6 +1638,27 @@ static Slice<Str> replymodels(Arena *a, Json *j)
     return r;
 }
 
+// The roles in a config.get reply, each one's tools as a line.
+static Slice<GuiRole> replyroles(Arena *a, Json *j)
+{
+    Slice<GuiRole> r = {};
+    for (Json *k = jsonget(j, "roles")->child; k; k = k->next) {
+        GuiRole role = {};
+        role.name = jsonstr(jsonget(k, "name"));
+        role.desc = jsonstr(jsonget(k, "description"));
+        Buf b(a, 128);
+        for (Json *t = jsonget(k, "tools")->child; t; t = t->next) {
+            print(&b, b.len ? Str(", ") : Str(""));
+            print(&b, jsonstr(t));
+        }
+        role.tools = finish(&b);
+        if (role.name.len) {
+            r = push(a, r, role);
+        }
+    }
+    return r;
+}
+
 // A host's answer to hostmodels, kept anew only when it changed.
 static void onhostmodels(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok, Str err)
 {
@@ -1642,6 +1674,20 @@ static void onhostmodels(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok, Str
         h->models = {};
         for (iz i = 0; i < m.len; i++) {
             h->models = push(&g->perm, h->models, clone(&g->perm, m[i]));
+        }
+    }
+    Slice<GuiRole> roles = ok ? replyroles(&scratch, j) : Slice<GuiRole>{};
+    same = roles.len == h->roles.len;
+    for (iz i = 0; same && i < roles.len; i++) {
+        same = roles[i].name==h->roles[i].name && roles[i].desc==h->roles[i].desc &&
+               roles[i].tools==h->roles[i].tools;
+    }
+    if (!same) {
+        h->roles = {};
+        for (iz i = 0; i < roles.len; i++) {
+            GuiRole c = {clone(&g->perm, roles[i].name), clone(&g->perm, roles[i].desc),
+                         clone(&g->perm, roles[i].tools)};
+            h->roles = push(&g->perm, h->roles, c);
         }
     }
     scheddirty(&g->sched);

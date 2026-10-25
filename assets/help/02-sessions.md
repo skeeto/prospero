@@ -15,6 +15,9 @@ here... in a host's menu in the sidebar, opens the New session dialog:
   the sidebar. It has only your own instructions and skills, none of a
   project's.
 - **Model**: empty for the configured one.
+- **Role**, when the configuration has roles: start in one, with its
+  instructions, model and tools (see [Subagents](help:jobs)). A
+  session with a role cannot use Plan mode.
 - **Plan mode**: start in Plan mode (below).
 
 A folder dropped on the window opens the dialog with that folder

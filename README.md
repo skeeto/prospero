@@ -3,7 +3,7 @@
 Prospero is a coding harness: a desktop program in which a language
 model, the agent, works on code through tools. It runs the turn loop,
 the tools (read, write, edit, shell, grep, glob, a todo list,
-background jobs, subagents, and where the configuration offers it, the
+background jobs, subagents, and control of the
 desktop), and the processes they start, and
 shows the conversation as it streams. It speaks the OpenAI Chat
 Completions API, so it works with llama.cpp, vLLM, LiteLLM, and hosted
@@ -495,18 +495,25 @@ alone. `[skills] enabled = false` turns them off.
 The desktop tool lets the agent see the screen and use the mouse and
 keyboard: screenshots of the screen or of one window, clicks, drags,
 scrolling, keys and Unicode text, the list of windows, and starting,
-waiting for and closing programs. It is off unless your own
-configuration offers it, to sessions with a role that lists `desktop`
-in its tools, or to every session, and every action, screenshots
-included, asks you first, denied if you do not answer in time:
+waiting for and closing programs. Every session is offered it where
+it could work, where its helper is found and there is a screen (on
+Linux, an X11 or Wayland display), and every action, screenshots
+included, asks you first, denied if you do not answer in time. Your own
+configuration may keep it to sessions with a role that lists `desktop`
+in its tools, or turn it off with `offer = none`:
 
     [desktop]
     offer = roles
     ask = true
 
-    [role desktop]
-    description = Uses programs on the screen, with the mouse and keys
-    tools = desktop read write
+    [role gui]
+    description = Builds programs and tries them on the screen
+    tools = default desktop
+
+A role's `tools` are read left to right: `*` is every tool, `default`
+those of a role that names none (every tool but desktop), and `-NAME`
+takes one away, as in `* -shell`. The New session dialog's Role starts
+a session in a role, as `-r ROLE` does on the command line.
 
 An ask may instead allow its action's class for the rest of the session
 and its subagents ("Allow input for this session"): `observe` for

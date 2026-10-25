@@ -129,8 +129,32 @@ static b32 tooloffered(ToolEnv *te, i32 tool)
     return tool!=TOOL_NONE && !(te->deny>>tool & 1);
 }
 
+// A role's tools when it names none: all but the desktop's and plan
+// mode's. As a word of a tool list, "default".
+#define TOOLS_DEFAULT "read write edit shell grep glob todo_write jobs " \
+                      "job_output job_kill task skill sessions send_message"
+
+// The tools a word of a tool list names, as bits: a tool's own, "*" for
+// every tool a role may have (the default's and the desktop's), and
+// "default" for TOOLS_DEFAULT. Zero for none, and for a leading "-",
+// which tooldeny takes off first.
+static u32 toolbits(Str word)
+{
+    u32 all = (((u32)1<<TOOL_COUNT) - 1) & ~(u32)TOOL_PLANMASK;
+    if (word == "*") {
+        return all;
+    } else if (word == "default") {
+        return all & ~(u32)TOOL_OFFMASK;
+    }
+    i32 t = toolfind(word);
+    return t==TOOL_NONE ? 0 : (u32)1<<t;
+}
+
 // The tools a list names, separated by blanks or commas, as the bits of
-// those it does not name. Unknown names are left out (config.cpp warns).
+// those it does not name, read left to right: each word adds its tools
+// (toolbits), and with a leading "-" takes them away again, as in
+// "* -shell" or "default desktop". Unknown words are left out
+// (config.cpp warns).
 static u32 tooldeny(Str list)
 {
     u32 have = 0;
@@ -139,9 +163,11 @@ static u32 tooldeny(Str list)
         for (; i<rest.len && (whitespace(rest[i]) || rest[i]==','); i++) {}
         rest = cuthead(rest, i);
         for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
-        i32 t = toolfind(takehead(rest, i));
-        have |= t==TOOL_NONE ? 0 : (u32)1<<t;
-        rest  = cuthead(rest, i);
+        Str word = takehead(rest, i);
+        b32 less = word.len>1 && word[0]=='-';
+        u32 bits = toolbits(less ? cuthead(word, 1) : word);
+        have = less ? have & ~bits : have | bits;
+        rest = cuthead(rest, i);
     }
     return (((u32)1<<TOOL_COUNT) - 1) & ~have;
 }

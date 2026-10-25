@@ -1932,6 +1932,7 @@ def sc_desktop_off(model, n, req):
 
 
 sc_desktop_policy = sc_desktop_off
+sc_desktop_nodisplay = sc_desktop_off
 
 
 def sc_desktop_ask(model, n, req):

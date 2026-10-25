@@ -37,6 +37,12 @@ once. Each runs in a role:
   changes nothing;
 - any `[role NAME]` in the configuration.
 
+A role's `tools` are read left to right: `*` is every tool, `default`
+those a role has when it names none (every tool but desktop), and
+`-NAME` takes one away. So `tools = default desktop` adds the desktop
+tool, and `tools = * -shell` gives every tool but the shell. The New
+session dialog's Role starts a session in a role, too.
+
 A subagent shows under its parent in the sidebar, folded away by its
 arrow. In the parent's transcript, its task row has Open subagent (or
 Answer the subagent, when it asks something), and the subagent's own

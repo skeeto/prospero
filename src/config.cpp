@@ -360,12 +360,11 @@ static CfgKey cfgschema[] = {
      "Model for the role, MODEL or ENDPOINT/MODEL, by default the "
      "session's, or for a subagent its parent's [model] subagent_model, "
      "else the parent's own"},
-    {"role", "tools", CFG_LIST,
-     "read write edit shell grep glob todo_write jobs job_output job_kill task "
-     "skill sessions send_message", {},
-     "read write edit shell grep glob todo_write jobs job_output job_kill task "
-     "desktop skill sessions send_message",
-     "role", "Tools the role may use; desktop also needs [desktop] offer"},
+    {"role", "tools", CFG_LIST, TOOLS_DEFAULT, {}, TOOLS_DEFAULT " desktop * default",
+     "role", "Tools the role may use, read left to right: * is every tool, "
+     "default those a role has unless it says, and -NAME takes one away, "
+     "as in \"default desktop\" or \"* -shell\"; desktop also needs "
+     "[desktop] offer"},
 
     {"guard", "roots", CFG_PATHS, "", {}, {}, "guard",
      "More directories the file tools may use, separated by ;"},
@@ -417,9 +416,10 @@ static CfgKey cfgschema[] = {
      "More directories of skills, each holding NAME/SKILL.md, separated "
      "by ;, after the project's and before the user's"},
 
-    {"desktop", "offer", CFG_ENUM, "none", {}, "none roles all", "desktop",
-     "Which sessions get the desktop tool: none, roles whose tools list "
-     "desktop, or all (sessions without a role too)"},
+    {"desktop", "offer", CFG_ENUM, "all", {}, "none roles all", "desktop",
+     "Which sessions get the desktop tool, where it can work (a display "
+     "and a helper): none, roles whose tools list desktop, or all, "
+     "sessions without a role too"},
     {"desktop", "ask", CFG_BOOL, "true", {}, {}, "desktop",
      "Ask the user before every desktop action, denying it when nobody "
      "answers in time; false lets the agent act unattended"},
@@ -700,6 +700,13 @@ static Str cfgnextword(Str *s)
     return w;
 }
 
+// A list's word as its choices have it: "-NAME", which takes NAME away
+// (as a role's tools may), is NAME.
+static Str cfglistword(Str w)
+{
+    return w.len>1 && w[0]=='-' ? cuthead(w, 1) : w;
+}
+
 static b32 cfghasword(Str words, Str w)
 {
     for (Str rest = words; rest.len;) {
@@ -790,7 +797,7 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
         return shared ? CFG_BAD : CFG_ODD;
     case CFG_LIST:
         for (Str rest = v; rest.len;) {
-            Str w = cfgnextword(&rest);
+            Str w = cfglistword(cfgnextword(&rest));
             if (w.len && !cfghasword(k->choices, w)) {
                 return CFG_ODD;
             }
@@ -858,7 +865,7 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
         Str bad = v;
         for (Str rest = v; k->type==CFG_LIST && rest.len;) {
             Str w = cfgnextword(&rest);
-            if (w.len && !cfghasword(k->choices, w)) {
+            if (w.len && !cfghasword(k->choices, cfglistword(w))) {
                 bad = w;
                 break;
             }

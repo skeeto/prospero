@@ -5,17 +5,19 @@ keyboard: screenshots of the screen or of one window, clicks, drags,
 scrolling, keys and text, the list of windows, and starting, waiting
 for and closing programs. Screenshots go to the model as images.
 
-It is off unless your own configuration offers it, to sessions whose
-role lists `desktop` in its tools, or to every session:
+Every session is offered it where it could work: where its helper is
+found and there is a screen, on Linux an X11 or Wayland display (not,
+say, over ssh). `offer = roles` keeps it to sessions whose role lists
+`desktop` in its tools, and `offer = none` turns it off:
 
     [desktop]
     offer = roles
 
-    [role desktop]
-    description = Uses programs on the screen, with the mouse and keys
-    tools = desktop read write
+    [role gui]
+    description = Builds programs and tries them on the screen
+    tools = default desktop
 
-An included file cannot turn it on.
+An included file cannot change `[desktop]`.
 
 ## Asks
 

@@ -5418,6 +5418,7 @@ static void drawnew(Gui *g)
         g->opennew = 0;
         g->newplan = 0;
         g->newnofolder = 0;
+        g->newrole = {};
         g->pc.shown = g->pc.refocus = 0;
         g->pc.sel = -1;
     }
@@ -5554,13 +5555,57 @@ static void drawnew(Gui *g)
     char const *hint = host->kind==GH_REMOTE ? "as configured there" :
                        dflt.len ? cstr0(&a, concat(&a, "configured: ", dflt)) : "the model's name";
     ImGui::InputTextWithHint("##model", hint, g->newmodel, FIELD_MAX);
+
+    // A role, as the host's configuration has them, or none: the usual
+    // session, with its usual tools
+    Slice<GuiRole> roles = import ? Slice<GuiRole>{} :
+                           host==g->main ? replyroles(&a, g->cfg) : host->roles;
+    if (host != g->main) {
+        hostmodels(g, host);  // its roles come with its models
+    }
+    b32 hasrole = 0;
+    for (iz i = 0; i < roles.len; i++) {
+        hasrole |= roles[i].name == g->newrole;
+    }
+    if (roles.len) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Role");
+        ImGui::SetNextItemWidth(-1);
+        Str shown = hasrole ? g->newrole : Str("None");
+        if (ImGui::BeginCombo("##role", cstr0(&a, shown))) {
+            if (ImGui::Selectable("None", !hasrole)) {
+                g->newrole = {};
+            }
+            ImGui::SetItemTooltip("No role: the usual session, with its usual tools");
+            for (iz i = 0; i < roles.len; i++) {
+                GuiRole *r = &roles[i];
+                ImGui::PushID((i32)i);
+                if (ImGui::Selectable(cstr0(&a, r->name), r->name==g->newrole)) {
+                    g->newrole = clone(&g->perm, r->name);
+                }
+                Buf tb(&a, 256);
+                print(&tb, r->desc.len ? r->desc : Str("(no description)"));
+                print(&tb, "\nTools: ");
+                print(&tb, r->tools.len ? r->tools : Str("none"));
+                ImGui::SetItemTooltip("%s", cstr0(&a, finish(&tb)));
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        itemnamed(g, "new role");
+    }
     b32 plan = !import && hostcap(host, "plan");
     if (plan) {
+        // Plan mode's tools are never a role's
         ImGui::Spacing();
-        checkbox("Plan mode", &g->newplan);
+        ImGui::BeginDisabled(hasrole);
+        b32 off = 0;
+        checkbox("Plan mode", hasrole ? &off : &g->newplan);
+        ImGui::EndDisabled();
         itemnamed(g, "new plan");
-        ImGui::SetItemTooltip("The agent explores and writes a plan for you to approve "
-                              "before it changes anything");
+        whytip(hasrole ? Str("Not in a role: plan mode is for sessions without one")
+                       : Str("The agent explores and writes a plan for you to approve "
+                             "before it changes anything"));
     }
     if (g->newerr.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
@@ -5577,7 +5622,8 @@ static void drawnew(Gui *g)
         if (import) {
             importbegin(g, host, cwd, model, nofolder);
         } else {
-            guinew(g, host, cwd, model, {}, plan && g->newplan, nofolder);
+            guinew(g, host, cwd, model, hasrole ? g->newrole : Str{},
+                   plan && g->newplan && !hasrole, nofolder);
         }
         ImGui::CloseCurrentPopup();
     }
