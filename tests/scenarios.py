@@ -2443,7 +2443,7 @@ def hello_caps(t):
         want = ["hello", "list", "new", "open", "close", "prompt", "steer", "cancel",
                 "answer", "config.get", "config.set", "quit", "rewind", "job.kill",
                 "status", "stop", "file"] + m8 + ["skills", "mode", "unqueue", "dir",
-                                                   "background"]
+                                                   "background", "models"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -2451,7 +2451,7 @@ def hello_caps(t):
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
-                 "message", "bypass", "nofolder", "dir", "config.create", "side", "background"} <= set(caps)
+                 "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -6556,6 +6556,84 @@ def dir_listing(t):
         r = h.call("dir", path=big, dirs=1)
         t.check(r.get("ok") == 1 and entries(r) == {"sub": 1} and r.get("more") == 0,
                 f"its one directory: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+# An endpoint where nothing listens, after the fake one
+CLOSED = "[endpoint closed]\nurl = http://127.0.0.1:9/\nconnect_timeout = 2\n"
+
+
+@scenario(conf={"_extra": CLOSED + "[model {model}]\ncontext = 100000\n"
+                          "[model {model2}]\ncontext = 100000\n"}, bound=15)
+def models_defaults(t):
+    """With no defaults configured, new takes the first endpoint with a
+    URL and the first [model]; models lists each endpoint, the fake one
+    with its ids, the closed one failed; new splits ENDPOINT/MODEL."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        hello = h.all("hello")[0]
+        t.check("models" in hello.get("caps", []) and "models" in hello.get("cmds", []),
+                f"the models cap: {hello}")
+        url = f"{t.host.url}/"
+
+        r = h.call("new", cwd=t.work)
+        t.check(r.get("ok") == 1, f"new with nothing named: {r}")
+        s = h.all("session", r["sid"])[0]
+        t.check(s.get("model") == t.model and s.get("endpoint") == url,
+                f"the first endpoint and [model]: {s}")
+
+        r = h.call("new", cwd=t.work, model=f"fake/{t.model2}")
+        t.check(r.get("ok") == 1, f"new with fake/MODEL: {r}")
+        s = h.all("session", r["sid"])[0]
+        t.check(s.get("model") == t.model2 and s.get("endpoint") == url,
+                f"split at the endpoint's name: {s}")
+
+        r = h.call("models", timeout=15)
+        eps = r.get("endpoints", [])
+        t.check(r.get("ok") == 1 and [e.get("name") for e in eps] == ["fake", "closed"],
+                f"models: {r}")
+        fake, closed = eps
+        t.check(fake.get("ok") == 1 and fake.get("url") == url and
+                fake.get("kind") == "openai" and t.model in fake.get("models", []) and
+                "err" not in fake, f"the fake endpoint: {fake}")
+        t.check(closed.get("ok") == 0 and closed.get("err") and
+                closed.get("models") == [], f"the closed endpoint: {closed}")
+        t.check(r.get("endpoint") == "fake" and r.get("model") == t.model,
+                f"the defaults: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def models_listed(t):
+    """With no [model] and no default, new has no model until models
+    has listed the endpoint's, then takes the first it listed."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        r = h.call("new", cwd=t.work)
+        t.check(r.get("ok") == 0 and r.get("err", "").startswith("no model:"),
+                f"no model yet: {r}")
+        r = h.call("models", timeout=15)
+        eps = r.get("endpoints", [])
+        t.check(r.get("ok") == 1 and len(eps) == 1 and eps[0].get("ok") == 1 and
+                t.model in eps[0].get("models", []), f"models: {r}")
+        first = eps[0]["models"][0]
+        t.check(r.get("endpoint") == "fake" and r.get("model") == first,
+                f"the default is the first listed: {r}")
+        r = h.call("new", cwd=t.work)
+        t.check(r.get("ok") == 1, f"new after models: {r}")
+        s = h.all("session", r["sid"])[0]
+        t.check(s.get("model") == first, f"the listed model: {s}")
+        # A model named alone is the default endpoint's, as it was
+        r = h.call("new", cwd=t.work, model=t.model)
+        s = h.all("session", r.get("sid"))
+        t.check(r.get("ok") == 1 and s and s[0].get("model") == t.model,
+                f"a model by name: {r} {s}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

@@ -1112,6 +1112,33 @@ static b32 cfgconfigured(Config *c)
     return 0;
 }
 
+// The defaults for a new session that names no endpoint or no model,
+// trimmed, either empty if there is none: Defaults' endpoint, else the
+// first [endpoint] section with a URL, and Defaults' model, else the
+// first [model] section's. The engine adds the endpoint's listing.
+struct CfgDefaults {
+    Str endpoint;
+    Str model;
+};
+
+static CfgDefaults cfgdefaults(Config *c)
+{
+    CfgDefaults r = {};
+    r.endpoint = trim(cfgget(c, "", "", "endpoint", 0));
+    IniSection *s = inifirst(c->ini, "endpoint");
+    for (; !r.endpoint.len && s; s = ininext(s)) {
+        Str url = trim(cfgget(c, "endpoint", s->name, "url", 0));
+        if (s->name.len && parseurl(url).ok) {
+            r.endpoint = s->name;
+        }
+    }
+    r.model = trim(cfgget(c, "", "", "model", 0));
+    for (s = inifirst(c->ini, "model"); !r.model.len && s; s = ininext(s)) {
+        r.model = s->name;
+    }
+    return r;
+}
+
 // A named section's setting only where a file sets it, and validly for
 // a schema key: null when unset, empty or bad, for a caller with
 // defaults of its own (a built-in role's).

@@ -252,6 +252,31 @@ static void testcfgseed(Test *t)
         cfgfree(c);
     }
 
+    // The defaults of a new session: Defaults', else the first endpoint
+    // with a URL and the first [model], trimmed
+    struct {
+        Str ini;
+        Str want;  // "ENDPOINT MODEL"
+    } dflts[] = {
+        {"", " "},
+        {"endpoint = \" e \"\nmodel = \" m \"\n[endpoint x]\nurl = http://x/\n"
+         "[model y]\n", "e m"},
+        {"[endpoint nourl]\nkind = openai\n[endpoint bad]\nurl = nope\n"
+         "[endpoint a]\nurl = http://a/\n[endpoint b]\nurl = http://b/\n", "a "},
+        {"[model]\n[model first]\n[endpoint a]\nurl = http://a/\n[model second]\n",
+         "a first"},
+        {"endpoint = http://u/\n[endpoint a]\nurl = http://a/\n", "http://u/ "},
+        {"model =\n[role r]\nmodel = m\n", " "},
+    };
+    for (i32 i = 0; i < countof(dflts); i++) {
+        os_write(v.os, a, "/c/x.ini", dflts[i].ini);
+        c = newconfig(v.os, &a, v.scratch, "/c/x.ini", 0);
+        CfgDefaults d = cfgdefaults(c);
+        expect(t, "cfgdefaults", concat(&a, concat(&a, d.endpoint, " "), d.model),
+               dflts[i].want);
+        cfgfree(c);
+    }
+
     // No location at all
     c = newconfig(v.os, &a, v.scratch, {}, 1);
     expect(t, "seed.nowhere", inidiags(&a, c->ini),

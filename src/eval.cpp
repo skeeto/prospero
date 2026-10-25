@@ -2394,9 +2394,10 @@ static i32 evalmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     if (!cfg) {
         return 2;
     }
-    Str defep = endpoint.len ? endpoint : trim(iniget(cfg->ini, "", "", "endpoint"));
+    CfgDefaults dflt  = cfgdefaults(cfg);
+    Str         defep = endpoint.len ? endpoint : dflt.endpoint;
     if (!models.len) {
-        Str m = trim(iniget(cfg->ini, "", "", "model"));
+        Str m = dflt.model;
         if (!m.len) {
             os_print(os, 2, "prospero: no model: give one with -m, or set model "
                             "in the configuration\n");

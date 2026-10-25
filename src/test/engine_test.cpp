@@ -443,6 +443,32 @@ static void testtargets(Test *t)
     expect(t, "submodel listed anew", submodel(e, &a, v.scratch, "nope", url), "");
     expect(t, "submodel listed no more", istr(&a,
            submodel(e, &a, v.scratch, "listed", url).len > 0), "1");
+
+    // A new session's defaults: the configuration's, else the first
+    // model its endpoint listed, the one named or the first with a URL
+    os_write(v.os, a, "/r/d.ini",
+             "[endpoint Qwen]\nkind = openai\n"
+             "[endpoint fast]\nurl = http://fast/v1\n"
+             "[endpoint slow]\nurl = http://slow/\n");
+    e->cfg       = newconfig(v.os, &a, v.scratch, "/r/d.ini", 0);
+    e->ini       = e->cfg->ini;
+    e->listings  = 0;
+    CfgDefaults d = defaults(e, v.scratch, {});
+    expect(t, "defaults unlisted", concat(&a, concat(&a, d.endpoint, "|"), d.model),
+           "fast|");
+    notekinds(e, v.scratch, url, "{\"data\":[{\"id\":\"one\"},{\"id\":\"two\"}]}");
+    d = defaults(e, v.scratch, {});
+    expect(t, "defaults listed", concat(&a, concat(&a, d.endpoint, "|"), d.model),
+           "fast|one");
+    d = defaults(e, v.scratch, "slow");
+    expect(t, "defaults elsewhere", concat(&a, concat(&a, d.endpoint, "|"), d.model),
+           "slow|");
+    os_write(v.os, a, "/r/d.ini", "model = m\n[endpoint fast]\nurl = http://fast/v1\n");
+    e->cfg = newconfig(v.os, &a, v.scratch, "/r/d.ini", 0);
+    e->ini = e->cfg->ini;
+    d = defaults(e, v.scratch, {});
+    expect(t, "defaults configured", concat(&a, concat(&a, d.endpoint, "|"), d.model),
+           "fast|m");
 }
 
 // A typed directory's leading ~ (new, import): this host's home, else

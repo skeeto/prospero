@@ -147,6 +147,7 @@ enum : i32 {
     CMD_UNQUEUE, // withdraw a queued message not yet taken in
     CMD_DIR,     // a directory's entries, for completing a path typed
     CMD_BACKGROUND,  // the running command or subagents, to the background
+    CMD_MODELS,  // the models each endpoint lists, and the defaults
     CMD_COUNT,
 };
 
@@ -156,7 +157,7 @@ static Str cmdnames[] = {
     "job.kill", "status", "stop", "file", "rename", "delete", "archive",
     "group", "fork", "compact", "model", "draft", "upload", "import",
     "skills", "mode",
-    "unqueue", "dir", "background",
+    "unqueue", "dir", "background", "models",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -204,6 +205,9 @@ static Str capnames[] = {
     "background",      // background: the user moves a running command to a
                        // job, or subagents on, their reports as notices
                        // of kind task (turn via "task")
+    "models",          // models, each endpoint's listing and the defaults;
+                       // new and import split ENDPOINT/MODEL, and default
+                       // to the first endpoint and model there are
 };
 
 static Str evname(i32 ev)

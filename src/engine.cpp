@@ -651,6 +651,32 @@ struct Session {
     b32          forget;     // closed: drop it from memory once idle
 };
 
+// One endpoint's listing for the models command (cmdmodels).
+struct EpListing {
+    Str   name;
+    Str   url;
+    Str   kind;
+    Http *http;    // while it runs
+    u64   rid;     // its request's id
+    i32   status;
+    Buf   body;
+    Str   err;     // why it failed, null if it did not
+    b32   done;
+};
+
+// A models command's listings, in a reservation of its own, released
+// once every request has ended. Its reply goes when they all have, or
+// at the deadline with what is known, the rest cancelled.
+struct Lister {
+    Lister        *next;
+    Region        *mem;
+    Arena          arena;    // in mem: the bodies and errors
+    i64            id;       // the command's
+    i64            by;       // ticks: reply then at the latest
+    b32            replied;
+    Slice<EpListing> eps;
+};
+
 // Engine functions take scratch by value, so that whatever a caller has
 // allocated in its own scratch stays intact below them.
 struct Engine {
@@ -688,6 +714,7 @@ struct Engine {
     i32         ncfgwait;
     Slice<Str>  tempdirs; // the system's (os_tempdirs), for [guard] temp
     Str         scratchbase;  // os_scratchdir, null until made
+    Lister     *listers;  // models commands at work
 };
 
 
@@ -7037,6 +7064,22 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     return 1;
 }
 
+// The endpoint and model of a new session that names one or neither:
+// the endpoint given, else the configuration's (cfgdefaults), and the
+// configuration's model, else the first that endpoint listed when last
+// asked (models, or a session's discover), else none.
+static CfgDefaults defaults(Engine *e, Arena scratch, Str which)
+{
+    CfgDefaults d  = cfgdefaults(e->cfg);
+    Endpoint    ep = {};
+    d.endpoint = which.len ? which : d.endpoint;
+    if (!d.model.len && d.endpoint.len && endpointconf(e, &scratch, d.endpoint, &ep)) {
+        Str *list = upsert(&e->listings, ep.url, (Arena *)0);
+        d.model = list ? cut(*list, '\n').head : Str{};
+    }
+    return d;
+}
+
 static void modelconf(Engine *e, Arena *perm, Str model, ModelConf *mc)
 {
     static Str const sampling[] = {
@@ -9092,6 +9135,10 @@ static void sweeptrash(Engine *e, Arena scratch)
 
 // Commands
 
+// Why a new session has no model, nothing naming one.
+static Str const NOMODEL = "no model: give one, or set model in the config "
+                           "(an endpoint's own models count once listed)";
+
 static void reply(Engine *e, Arena scratch, i64 id, b32 ok, Str err, Str sid)
 {
     Buf   b(&scratch, 256 + err.len);
@@ -9172,8 +9219,8 @@ static Str unknowntools(Str list)
 static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str  cwd   = jsonstr(jsonget(j, "cwd"));
-    Str  model = jsonstr(jsonget(j, "model"));
-    Str  which = jsonstr(jsonget(j, "endpoint"));
+    Str  model = trim(jsonstr(jsonget(j, "model")));
+    Str  which = trim(jsonstr(jsonget(j, "endpoint")));
     Str  name  = jsonstr(jsonget(j, "role"));
     Str  fmt   = trim(jsonstr(jsonget(j, "edit_format")));
     Str  tools = jsonstr(jsonget(j, "tools"));
@@ -9219,10 +9266,15 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         Target t = targetof(e, role.model, role.endpoint);  // ENDPOINT/MODEL?
         model = t.model;
         which = which.len ? which : t.which;
+    } else if (model.len && !which.len) {
+        Target t = targetof(e, model, {});  // ENDPOINT/MODEL?
+        model = t.model;
+        which = t.which;
     }
     if (!which.len) which = role.endpoint;
-    if (!which.len) which = iniget(e->ini, "", "", "endpoint");
-    if (!model.len) model = iniget(e->ini, "", "", "model");
+    CfgDefaults dflt = defaults(e, scratch, which);
+    which = dflt.endpoint;
+    model = model.len ? model : dflt.model;
     Slice<Str> roots = {};
     for (Json *r = jsonget(j, "roots")->child; r; r = r->next) {
         Str root = jsonstr(r);
@@ -9241,7 +9293,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "cwd must name an existing directory", {});
         return;
     } else if (!model.len) {
-        reply(e, scratch, id, 0, "no model: give one, or set model in the config", {});
+        reply(e, scratch, id, 0, NOMODEL, {});
         return;
     }
     Endpoint probe = {};
@@ -11342,16 +11394,18 @@ static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "cwd must name an existing directory", {});
         return;
     }
-    Str dflt = iniget(e->ini, "", "", "endpoint");
-    if (!spec.len) {
-        spec  = iniget(e->ini, "", "", "model");
-        which = which.len ? which : dflt;
+    if (spec.len && !which.len) {
+        Target t = targetof(e, spec, {});  // ENDPOINT/MODEL?
+        spec  = t.model;
+        which = t.which;
     }
+    CfgDefaults dflt = defaults(e, scratch, which);
+    if (!spec.len) spec = dflt.model;
     if (!spec.len) {
-        reply(e, scratch, id, 0, "no model: give one, or set model in the config", {});
+        reply(e, scratch, id, 0, NOMODEL, {});
         return;
     }
-    Target   t  = which.len ? Target{which, spec} : targetof(e, spec, dflt);
+    Target   t  = {dflt.endpoint, spec};
     Endpoint ep = {};
     if (!t.which.len || !endpointconf(e, &scratch, t.which, &ep)) {
         reply(e, scratch, id, 0, "no usable endpoint: give a URL or a configured name", {});
@@ -11396,6 +11450,218 @@ static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
     putintkey(&w.json, "ok", 1);
     putstrkey(&w.json, "from", li.from);
     emit(e, evend(&w));
+}
+
+// Whether every listing of a models command has ended.
+static b32 listersettled(Lister *l)
+{
+    for (iz i = 0; i < l->eps.len; i++) {
+        if (!l->eps[i].done) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Answer a models command with its listings as they are, each ended
+// one's ids noted (notekinds) for defaults, which the reply then names.
+static void listerreply(Engine *e, Arena scratch, Lister *l)
+{
+    l->replied = 1;
+    Buf   b(&scratch, 1<<12);
+    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", l->id);
+    putintkey(&w.json, "ok", 1);
+    putkey(&w.json, "endpoints");
+    putarray(&w.json);
+    for (iz i = 0; i < l->eps.len; i++) {
+        EpListing *p    = &l->eps[i];
+        Str      body = finish(&p->body);
+        Str      err  = p->err;
+        Json    *ms   = 0;
+        if (!p->done) {
+            err = "no answer in 5 s";
+        } else if (!err.data) {
+            ms  = jsonget(jsonparse(&scratch, body).root, "data");
+            err = ms->type==JSON_ARRAY ? Str{} : Str("not a model listing");
+        }
+        if (!err.data) {
+            notekinds(e, scratch, p->url, body);
+        }
+        putobject(&w.json);
+        putstrkey(&w.json, "name", p->name);
+        putstrkey(&w.json, "url", p->url);
+        putstrkey(&w.json, "kind", p->kind);
+        putintkey(&w.json, "ok", !err.data);
+        if (err.data) {
+            putstrkey(&w.json, "err", err);
+        }
+        putkey(&w.json, "models");
+        putarray(&w.json);
+        for (Json *m = err.data ? 0 : ms->child; m; m = m->next) {
+            Str id = jsonstr(jsonget(m, "id"));
+            if (id.len) {
+                putstr(&w.json, id);
+            }
+        }
+        putend(&w.json);
+        putend(&w.json);
+    }
+    putend(&w.json);
+    CfgDefaults dflt = defaults(e, scratch, {});
+    putstrkey(&w.json, "endpoint", dflt.endpoint);
+    putstrkey(&w.json, "model", dflt.model);
+    emit(e, evend(&w));
+}
+
+// Let a models command go once replied and every request has ended.
+static void listerend(Engine *e, Lister *l)
+{
+    if (!l->replied || !listersettled(l)) {
+        return;
+    }
+    for (Lister **p = &e->listers; *p; p = &(*p)->next) {
+        if (*p == l) {
+            *p = l->next;
+            break;
+        }
+    }
+    os_release(e->os, l->mem);
+}
+
+// models: every [endpoint] section with a URL asked at once for its
+// listing, /v1/models with its key, which loads no model. The reply,
+// once all have answered or after 5 s, lists them in order, each as
+// {name, url, kind, ok, err?, models: [ids]}, with the defaults a new
+// session naming neither would get, endpoint and model, empty if none.
+static void cmdmodels(Engine *e, Arena scratch, i64 id)
+{
+    i32 n = 0;
+    for (Lister *l = e->listers; l; l = l->next) {
+        n++;
+    }
+    if (n >= 8) {
+        reply(e, scratch, id, 0, "too many model listings at once", {});
+        return;
+    }
+    Region *mem = os_reserve(e->os, (iz)1<<(sizeof(void *)==8 ? 30 : 26));
+    if (!mem) {
+        reply(e, scratch, id, 0, "out of memory", {});
+        return;
+    }
+    Arena   a = newarena(mem);
+    Lister *l = alloc<Lister>(&a);
+    l->mem   = mem;
+    l->arena = a;
+    l->id    = id;
+    l->by    = os_ticks(e->os) + 5*SEC;
+    for (IniSection *s = inifirst(e->ini, "endpoint"); s; s = ininext(s)) {
+        Endpoint ep = {};
+        if (s->name.len && !parseurl(s->name).ok &&
+                endpointconf(e, &l->arena, s->name, &ep)) {
+            EpListing p = {};
+            p.name = ep.name;
+            p.url  = ep.url;
+            p.kind = ep.kind==EP_ANTHROPIC ? Str("anthropic") : Str("openai");
+            l->eps = push(&l->arena, l->eps, p);
+        }
+    }
+    for (iz i = 0; i < l->eps.len; i++) {
+        EpListing *p  = &l->eps[i];
+        Arena    t  = scratch;
+        Endpoint ep = {};
+        endpointconf(e, &t, p->name, &ep);
+        HttpReq r = {};
+        r.method    = "GET";
+        r.url       = apiurl(&t, ep.url, ep.kind==EP_ANTHROPIC ?
+                             Str("models?limit=1000") : Str("models"));
+        r.headers   = authheaders(&t, &ep, "application/json");
+        r.connectms = ep.connectms;
+        r.readms    = 5000;
+        r.maxbytes  = 1 << 20;
+        r.mbox      = e->in;
+        r.id        = p->rid = ++e->nextid;
+        p->body     = Buf(&l->arena, 1<<12);
+        p->http     = os_http(e->os, &r, t);
+        if (!p->http) {
+            p->err  = clone(&l->arena, os_lasterr(e->os, &t));
+            p->done = 1;
+        }
+    }
+    l->next    = e->listers;
+    e->listers = l;
+    if (listersettled(l)) {
+        listerreply(e, scratch, l);
+        listerend(e, l);
+    }
+}
+
+// A record of a models command's request. Returns 0 if it is not one.
+static b32 onlister(Engine *e, Arena scratch, Record r)
+{
+    Lister  *l = 0;
+    EpListing *p = 0;
+    for (Lister *k = e->listers; r.id && !p && k; k = k->next) {
+        for (iz i = 0; !p && i < k->eps.len; i++) {
+            l = k;
+            p = k->eps[i].rid==r.id ? &k->eps[i] : 0;
+        }
+    }
+    if (!p) {
+        return 0;
+    }
+    switch (r.type) {
+    case HTTP_HEAD:
+        p->status = get32(r.data);
+        break;
+    case HTTP_BODY:
+        if (!l->replied && p->body.len+r.data.len<=1<<20) {
+            print(&p->body, r.data);
+        }
+        break;
+    case HTTP_DONE: {
+        os_httpfree(e->os, p->http);
+        p->http = 0;
+        p->done = 1;
+        i32 err = get32(r.data);
+        Str why = cuthead(r.data, 4);
+        Buf b(&scratch, 64 + why.len);
+        if (err == HTTP_ECONNECT) {
+            print(&b, "cannot connect");
+            print(&b, why.len ? Str(": ") : Str(""));
+            print(&b, why);
+        } else if (err != HTTP_OK) {
+            print(&b, why.len ? why : Str("failed"));
+        } else if (p->status != 200) {
+            print(&b, "HTTP ");
+            print(&b, (i64)p->status);
+        }
+        if (b.len && !l->replied) {
+            p->err = clone(&l->arena, finish(&b));
+        }
+        if (!l->replied && listersettled(l)) {
+            listerreply(e, scratch, l);
+        }
+        listerend(e, l);
+    } break;
+    }
+    return 1;
+}
+
+// Reply to the models commands whose time is up, cancelling what is
+// still under way.
+static void listertimeout(Engine *e, Arena scratch, i64 now)
+{
+    for (Lister *l = e->listers; l; l = l->next) {
+        if (!l->replied && l->by<=now) {
+            listerreply(e, scratch, l);
+            for (iz i = 0; i < l->eps.len; i++) {
+                if (l->eps[i].http) {
+                    os_httpcancel(e->os, l->eps[i].http);
+                }
+            }
+        }
+    }
 }
 
 // After the configuration reloads: each session takes up its endpoint's
@@ -11592,6 +11858,7 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_IMPORT:
         case CMD_MODE:
         case CMD_BACKGROUND:
+        case CMD_MODELS:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -11698,6 +11965,9 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_DIR:
         cmddir(e, scratch, id, j);
+        return;
+    case CMD_MODELS:
+        cmdmodels(e, scratch, id);
         return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});
@@ -11863,7 +12133,7 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         reply(e, scratch, (i64)r.id, 0, "command too long", {});
         return;
     } else if (onconfig(e, scratch, r) || onprobe(e, scratch, r) ||
-               onctl(e, scratch, r)) {
+               onctl(e, scratch, r) || onlister(e, scratch, r)) {
         return;
     }
 
@@ -12044,6 +12314,9 @@ static void enginethread(void *arg)
         i64 next = e->quitting ? e->quitby : I64MAX;
         next = e->admat && e->admat<next ? e->admat : next;
         next = cfgnext(e->cfg)<next ? cfgnext(e->cfg) : next;
+        for (Lister *l = e->listers; l; l = l->next) {
+            next = !l->replied && l->by<next ? l->by : next;
+        }
         for (Session *s = e->sessions; s; s = s->next) {
             for (i32 t = 0; t < T_COUNT; t++) {
                 if (s->timers[t] && s->timers[t]<next) next = s->timers[t];
@@ -12083,6 +12356,7 @@ static void enginethread(void *arg)
                 pump(e, p);
             }
         }
+        listertimeout(e, newarena(e->scratch), now);
         if (cfgnext(e->cfg) <= now) {
             i64 rev = e->cfg->rev;
             cfgtimeout(e->cfg, newarena(e->scratch));
