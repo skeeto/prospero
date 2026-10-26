@@ -2250,6 +2250,22 @@ def sc_mcp_subagent(model, n, req):
         yield from answer(model, " / ".join(tool_results(req)))
 
 
+def sc_mcp_project(model, n, req):
+    # A project's server "proj": where it runs, then an echo; again on
+    # a later turn
+    yield from mcp_steps(model, n, req, [
+        ("mcp__proj__where", {}),
+        ("mcp__proj__echo", {"text": "first"}),
+        "Done once.",
+        ("mcp__proj__echo", {"text": "second"}),
+        "Done again."])
+
+
+sc_mcp_project_policy = sc_mcp_project
+sc_mcp_project_always = sc_mcp_project
+sc_mcp_project_config = sc_mcp_project
+
+
 # The GUI's checklist (prospero gui --drive, run by tests/gui.py): the
 # prompt that began the turn picks the reply, and the step is how many
 # responses the turn has had so far.

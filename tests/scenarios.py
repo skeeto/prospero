@@ -8160,6 +8160,155 @@ def mcp_subagent(t):
     t.check(len(inits) == 1, f"one server for all: {len(inits)}")
 
 
+def mcpproject(t, rel=".mcp.json", **extra):
+    """A .mcp.json naming the fake server as "proj", with extra servers."""
+    servers = {"proj": {"command": sys.executable,
+                        "args": [FAKE_MCP, "${NOT_SET_ANYWHERE:-x}"],
+                        "env": {"FAKE_MCP_WORD": "${MCP_WORD}"}}, **extra}
+    t.put(rel, json.dumps({"mcpServers": servers}))
+
+
+def projcalls(h, sid):
+    return [(e["status"], e["text"]) for e in h.all("tool.end", sid)]
+
+
+@scenario(bound=15)
+def mcp_project_policy(t):
+    """Unattended, a project's servers are asked about, denied by policy
+    with a warning, never started, and their tools not offered; one of a
+    transport not supported is left out, with a warning of its own."""
+    mcpproject(t, old={"type": "sse", "url": "http://127.0.0.1:1/sse"})
+    r = t.run(env=mcpenv(t, MCP_WORD="w"))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ask = r.last("ask")
+    t.check(ask.get("kind") == "mcp.project" and ask.get("scope") == "mcp.project" and
+            ask.get("path", "").endswith(".mcp.json") and "call" not in ask and
+            ask.get("detail", "").startswith("proj: ") and FAKE_MCP in ask.get("detail", ""),
+            f"ask {ask}")
+    ans = r.last("answer")
+    t.check(ans.get("decision") == "deny" and ans.get("by") == "policy", f"answer {ans}")
+    warns = [n["text"] for n in r.all("note") if n.get("level") == "warn"]
+    t.check(any("SSE transport" in w for w in warns) and
+            any("were not started" in w for w in warns), f"warnings {warns}")
+    names = fake_provider.tool_names(t.requests()[0]["body"])
+    t.check(not [x for x in names if x.startswith("mcp__")], f"nothing offered {names}")
+    t.check(not mcplog(t), "never started")
+
+
+@scenario(bound=30)
+def mcp_project(t):
+    """Attended: allowed for the session, the server runs in the folder of
+    its .mcp.json (the repository's root, above the session's folder),
+    with the file's environment expanded, and its calls ask as any MCP
+    call. Another process keeps the approval, from the session's log."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.host.mkdir(t.host.join(t.work, "sub"))
+    mcpproject(t)
+    env = mcpenv(t, MCP_WORD="expanded")
+    sub = t.host.join(t.work, "sub")
+    h = t.headless(env=env)
+    b = None
+    try:
+        sid = h.call("new", cwd=sub, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ask = nextask(h, sid)
+        t.check(ask["kind"] == "mcp.project", f"the project's ask first: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        for _ in range(2):
+            a = nextask(h, sid, ask["seq"])
+            t.check(a["kind"] == "mcp" and a["server"] == "proj", f"a call's ask {a}")
+            h.call("answer", sid=sid, req=a["req"], decision="allow")
+            ask = a
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        st = projcalls(h, sid)
+        t.check([x for x, _ in st] == ["ok", "ok"], f"statuses {st}")
+        where = st[0][1].split("\n")
+        t.check(os.path.realpath(where[0]) == os.path.realpath(t.work) and
+                where[1] == "expanded", f"where {where}")
+        g = [e for e in logged(t, sid) if e["ev"] == "grant"]
+        t.check(len(g) == 1 and g[0].get("mcp", "").startswith("project:"), f"grant {g}")
+        t.check(not os.path.exists(os.path.join(t.state, "mcp", "projects.json")),
+                "nothing kept for later sessions")
+        t.check(h.close() == 0, "the first exits")
+        h = None
+
+        b = t.headless(env=env)
+        t.check(b.call("open", sid=sid, attended=1).get("ok") == 1, "open")
+        b.send("prompt", sid=sid, text="again")
+        a = nextask(b, sid, max(e["seq"] for e in logged(t, sid)))
+        t.check(a["kind"] == "mcp", f"only the call asks: {a}")
+        b.call("answer", sid=sid, req=a["req"], decision="allow")
+        t.check(ended(b, sid, 2)["why"] == "done", "the second turn ends")
+    finally:
+        rc = h.close() if h else 0
+        rc2 = b.close() if b else 0
+    t.check(rc == 0 and rc2 == 0, f"headless exit {rc} {rc2}")
+
+
+@scenario(bound=30)
+def mcp_project_always(t):
+    """Always holds for later sessions in the folder, until the file
+    changes the server; deny holds for the session."""
+    mcpproject(t)
+    env = mcpenv(t, MCP_WORD="w")
+    h = t.headless(env=env)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ask = nextask(h, sid)
+        r = h.call("answer", sid=sid, req=ask["req"], decision="always")
+        t.check(r.get("ok") == 1, f"always {r}")
+        h.call("cancel", sid=sid)
+        ended(h, sid, 1)
+        kept = json.loads(t.host.read(t.host.join(t.state, "mcp", "projects.json")))
+        t.check([x["name"] for x in kept["approved"]] == ["proj"], f"kept {kept}")
+
+        # A new session: no ask for the server
+        s2 = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=s2, text="go")
+        a = nextask(h, s2)
+        t.check(a["kind"] == "mcp", f"a later session asks only for calls: {a}")
+        h.call("cancel", sid=s2)
+        ended(h, s2, 1)
+
+        # The file changes the server: asked again, and denied
+        mcpproject(t, more={"command": sys.executable, "args": [FAKE_MCP]})
+        servers = json.loads(t.file(".mcp.json"))["mcpServers"]
+        servers["proj"]["args"].append("--changed")
+        t.put(".mcp.json", json.dumps({"mcpServers": servers}))
+        s3 = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=s3, text="go")
+        a = nextask(h, s3)
+        t.check(a["kind"] == "mcp.project" and a["detail"].count("\n") == 1 and
+                "--changed" in a["detail"], f"asked again for both: {a}")
+        h.call("answer", sid=s3, req=a["req"], decision="deny")
+        t.check(ended(h, s3, 1)["why"] == "done", "the turn goes on without them")
+        names = fake_provider.tool_names(t.requests()[-1]["body"])
+        t.check(not [x for x in names if x.startswith("mcp__")], f"none offered {names}")
+        h.send("prompt", sid=s3, text="again")
+        t.check(ended(h, s3, 2)["why"] == "done", "the second turn")
+        t.check(len([e for e in h.all("ask", s3) if e["kind"] == "mcp.project"]) == 1,
+                "not asked again in the session")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=mcpconf(trust="yes"), bound=15)
+def mcp_project_config(t):
+    """A configuration section of the same name wins over the project's
+    server, with no ask."""
+    mcpproject(t, proj={"command": "/nonexistent/server"})
+    servers = json.loads(t.file(".mcp.json"))["mcpServers"]
+    servers["fake"] = servers.pop("proj")
+    t.put(".mcp.json", json.dumps({"mcpServers": servers}))
+    r = t.run(env=mcpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(not r.all("ask"), f"nothing asked: {r.all('ask')}")
+    names = fake_provider.tool_names(t.requests()[0]["body"])
+    t.check("mcp__fake__echo" in names, f"the configuration's server {names}")
+
+
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")
 
 

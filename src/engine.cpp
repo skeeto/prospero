@@ -434,6 +434,7 @@ struct Ask {
     i32       gclass;   // a desktop ask's DESKC_*, with grant its name
     u64       plansum;  // a plan's: the hash of the text put to the user
     b32       mcp;      // an MCP tool's, its name in grant
+    b32       project;  // a project's MCP servers' (mcpasking)
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
@@ -666,6 +667,11 @@ struct Session {
     Slice<Str>   mcpwarned;  // servers whose failure it was told
     McpServer   *mcpsrv;     // the server of the call running, if MCP's
     i64          mcpcall;    // that call's request id, -1 until it is sent
+    Slice<McpDef> mcpdefs;   // its folders' .mcp.json servers, read once
+    b32          mcpfound;   // and they were read
+    Slice<Str>   mcpsaid;    // project servers decided without a grant,
+                             // "ok:KEY" or "no:KEY" (bypass, policy)
+    Slice<Str>   mcpasking;  // the keys of those its ask is about
 };
 
 // One endpoint's listing for the models command (cmdmodels).
@@ -1704,6 +1710,7 @@ static b32  taskwake(Session *);
 static i64  parkafter(Engine *);
 static b32  deskrun(Session *, Arena, DeskArgs *);
 static void mcpresolve(Session *, Arena, b32 allow, i32 by, Str note, i64 wait);
+static void mcpprojresolve(Session *, Arena, b32 allow, i32 by, b32 always);
 static Str  deskdenial(Arena *, i32 by, Str note, i64 wait);
 static Slice<Msg> deskimages(Session *, Arena *);
 static void toolsessions(Session *, Arena);
@@ -3756,7 +3763,6 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
 {
     Engine *e = s->e;
     Ask    *k = &s->ask;
-    Block  *c = &s->calls[s->callidx];
     i64     t = os_ticks(e->os);
     disarm(s, T_ASK);
     if (s->state == S_ASK) {
@@ -3785,6 +3791,11 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         }
         ssend(s, &w);
     }
+    if (k->project) {
+        mcpprojresolve(s, scratch, allow, by, always);
+        return;  // no call: the caller's nexttool goes on to the request
+    }
+    Block *c = &s->calls[s->callidx];
     if (allow && always && k->grant.len) {
         Grant g = {};
         if (k->mcp) {
@@ -6302,7 +6313,8 @@ static i64 mcprequest(Engine *e, Arena scratch, McpServer *m, i32 kind, Str meth
 static void mcpconf(Engine *e, McpServer *m)
 {
     Config *c  = e->cfg;
-    m->trust   = cfgbool(trim(cfgget(c, "mcp", m->name, "trust", 0))) == 1;
+    m->trust   = !m->project.len &&
+                 cfgbool(trim(cfgget(c, "mcp", m->name, "trust", 0))) == 1;
     m->startms = cfgms(c, "mcp", m->name, "startup_timeout", 0);
     m->callms  = cfgms(c, "mcp", m->name, "timeout", 0);
     m->config  = inisection(e->ini, "mcp", m->name) != 0;
@@ -6332,7 +6344,7 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     m->err      = {};
     m->state    = MCP_STARTING;
     mcpconf(e, m);
-    Str only    = trim(cfgget(e->cfg, "mcp", m->name, "tools", 0));
+    Str only    = m->project.len ? Str{} : trim(cfgget(e->cfg, "mcp", m->name, "tools", 0));
     m->only     = only.len ? clone(&m->arena, only) : Str{};
     i64 now     = os_ticks(e->os);
     m->startedat = now;
@@ -6341,7 +6353,12 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
 
     Config  *c    = e->cfg;
     b32      win  = s->te.windows;
-    McpWords w    = mcpwords(&m->arena, trim(cfgget(c, "mcp", m->name, "command", 0)));
+    McpWords w    = {};
+    if (m->project.len) {
+        w.words = m->argv;
+    } else {
+        w = mcpwords(&m->arena, trim(cfgget(c, "mcp", m->name, "command", 0)));
+    }
     if (w.err.len) {
         m->state   = MCP_FAILED;
         m->err     = concat(&e->perm, "its command cannot be split into words: ", w.err);
@@ -6349,8 +6366,8 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
         return;
     }
     Slice<Str> env = engineenv(e, &scratch, win);
-    for (IniEntry *k = inisection(e->ini, "mcp", m->name)
-                       ? inisection(e->ini, "mcp", m->name)->keys : 0; k; k = k->next) {
+    IniSection *sec = m->project.len ? 0 : inisection(e->ini, "mcp", m->name);
+    for (IniEntry *k = sec ? sec->keys : 0; k; k = k->next) {
         if (!startswith(k->key, "env.") || k->key.len<5) {
             continue;
         }
@@ -6360,6 +6377,9 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
         }
         env = push(&scratch, env, concat(&scratch, concat(&scratch, cuthead(k->key, 4), "="), v));
     }
+    for (iz i = 0; m->project.len && i < m->env.len; i++) {
+        env = push(&scratch, env, m->env[i]);
+    }
 
     // On Windows a name with no extension that is no .exe is tried as
     // .cmd and .bat, as npx is npx.cmd, which run through cmd.exe
@@ -6367,10 +6387,12 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     if (HOST_WINDOWS && find(argv[0], "/")<0 && find(argv[0], "\\")<0 &&
             find(argv[0], ".")<0) {
         Str path = envpath(env, 1);
-        if (!findpath(e->os, &scratch, scratch, path, concat(&scratch, argv[0], ".exe"), 1).len) {
-            Str script = findpath(e->os, &scratch, scratch, path, concat(&scratch, argv[0], ".cmd"), 1);
-            script = script.len ? script : findpath(e->os, &scratch, scratch, path,
-                                                    concat(&scratch, argv[0], ".bat"), 1);
+        Str dotexe = concat(&scratch, argv[0], ".exe");
+        Str dotcmd = concat(&scratch, argv[0], ".cmd");
+        Str dotbat = concat(&scratch, argv[0], ".bat");
+        if (!findpath(e->os, &scratch, scratch, path, dotexe, 1).len) {
+            Str script = findpath(e->os, &scratch, scratch, path, dotcmd, 1);
+            script = script.len ? script : findpath(e->os, &scratch, scratch, path, dotbat, 1);
             if (script.len) {
                 for (iz i = 1; i < argv.len; i++) {
                     Str bad = mcpcmdbad(argv[i]);
@@ -6432,20 +6454,40 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
 
 // A server for a session, by name: started if it is not running and may
 // be. Null if the configuration has no such server.
+static McpDef *mcpdefof(Session *s, Arena scratch, Str name);
+
 static McpServer *mcpserver(Session *s, Arena scratch, Str name)
 {
     Engine    *e   = s->e;
-    Str        cwd = mcpcwd(s, &scratch, name);
+    b32        cfg = trim(cfgget(e->cfg, "mcp", name, "command", 0)).len > 0;
+    McpDef    *d   = cfg ? 0 : mcpdefof(s, scratch, name);
+    if (!cfg && !d) {
+        return 0;
+    }
+    Str        cwd = d ? d->dir : mcpcwd(s, &scratch, name);
     McpServer *m   = mcpfind(e, name, cwd);
     if (!m) {
-        if (!trim(cfgget(e->cfg, "mcp", name, "command", 0)).len) {
-            return 0;
-        }
         m = alloc<McpServer>(&e->perm);
         m->name = clone(&e->perm, name);
         m->cwd  = clone(&e->perm, cwd);
         m->next = e->mcp;
         e->mcp  = m;
+    }
+    if (d && (m->project!=d->file || m->raw!=d->raw)) {
+        // Its definition, kept apart from any session's (and from those
+        // of an earlier one, should the file have changed)
+        m->project = clone(&e->perm, d->file);
+        m->raw     = clone(&e->perm, d->raw);
+        m->argv    = {};
+        m->env     = {};
+        for (iz i = 0; i < d->argv.len; i++) {
+            m->argv = push(&e->perm, m->argv, clone(&e->perm, d->argv[i]));
+        }
+        for (iz i = 0; i < d->env.len; i++) {
+            m->env = push(&e->perm, m->env, clone(&e->perm, d->env[i]));
+        }
+    } else if (!d) {
+        m->project = {};
     }
     i64 now = os_ticks(e->os);
     m->lastuse = now;
@@ -6462,11 +6504,20 @@ static void mcpoffer(Session *s, Arena scratch)
 {
     Engine    *e     = s->e;
     Slice<Str> names = mcpnames(e, &scratch);
+    for (iz i = 0; i < s->mcpdefs.len; i++) {
+        if (mcpdefof(s, scratch, s->mcpdefs[i].name) == &s->mcpdefs[i]) {
+            names = push(&scratch, names, s->mcpdefs[i].name);
+        }
+    }
     for (iz i = 0; i < s->mcptools.len; i++) {
         names = push(&scratch, names, s->mcptools[i].server);
     }
     for (iz i = 0; i < names.len; i++) {
-        if (!mcpanyallowed(s->mcpfilter, names[i])) {
+        b32 seen = 0;
+        for (iz k = 0; k < i; k++) {
+            seen |= names[k] == names[i];
+        }
+        if (seen || !mcpanyallowed(s->mcpfilter, names[i])) {
             continue;
         }
         McpServer *m = mcpserver(s, scratch, names[i]);
@@ -6500,6 +6551,319 @@ static McpServer *mcpsrvof(Session *s, Str server)
     return 0;
 }
 
+// Project servers (.mcp.json)
+//
+// A session reads the .mcp.json files of its folder and each parent up
+// to the repository's root once, when it is in memory and about to make
+// its first request; the nearest file wins a name, and a configuration
+// section wins over them all. Before any of a file's servers starts,
+// the user approves it: an ask with no call (kind mcp.project), whose
+// allow and deny hold for the session tree as grants ("project:KEY",
+// "project-deny:KEY"), and whose always also holds for later sessions,
+// in <state>/mcp/projects.json, until the definition changes: KEY is the
+// SHA-256 of the file's path, the server's name and its definition.
+
+static Str mcpprojkey(Arena *a, McpDef *d)
+{
+    Buf b(a, 64 + d->file.len + d->name.len + d->raw.len);
+    print(&b, d->file);
+    putbyte(&b, '\n');
+    print(&b, d->name);
+    putbyte(&b, '\n');
+    print(&b, d->raw);
+    return cfgsha256(a, finish(&b));
+}
+
+static Str mcpprojpath(Engine *e, Arena *a)
+{
+    return join(a, join(a, e->statedir, "mcp"), "projects.json");
+}
+
+// Whether the user approved a key for good.
+static b32 mcpprojknown(Engine *e, Arena scratch, Str key)
+{
+    Read rd = os_read(e->os, &scratch, mcpprojpath(e, &scratch), 1<<22);
+    if (rd.err != READ_OK) {
+        return 0;
+    }
+    JsonDoc d = jsonparse(&scratch, rd.data);
+    for (Json *x = jsonget(d.root, "approved")->child; x; x = x->next) {
+        if (jsonstr(jsonget(x, "sha256")) == key) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Add approvals for good, with what each was, for a reader.
+static void mcpprojremember(Engine *e, Arena scratch, Slice<McpDef *> defs,
+                            Slice<Str> keys)
+{
+    Str  path = mcpprojpath(e, &scratch);
+    Read rd   = os_read(e->os, &scratch, path, 1<<22);
+    JsonDoc d = jsonparse(&scratch, rd.err==READ_OK ? rd.data : Str("{}"));
+    Buf     b(&scratch, 1024 + rd.data.len);
+    JsonOut w = {&b};
+    putobject(&w);
+    putkey(&w, "approved");
+    putarray(&w);
+    for (Json *x = jsonget(d.root, "approved")->child; x; x = x->next) {
+        putjson(&w, x);
+    }
+    for (iz i = 0; i < defs.len; i++) {
+        putobject(&w);
+        putstrkey(&w, "file", defs[i]->file);
+        putstrkey(&w, "name", defs[i]->name);
+        putstrkey(&w, "sha256", keys[i]);
+        putintkey(&w, "at", os_time(e->os));
+        putend(&w);
+    }
+    putend(&w);
+    putend(&w);
+    putbyte(&b, '\n');
+    Str dir = join(&scratch, e->statedir, "mcp");
+    os_mkdirs(e->os, scratch, dir);
+    Str out = finish(&b);
+    os_write(e->os, scratch, path, out);
+}
+
+// A session's decision on a key: 1 allowed, -1 denied, 0 not yet.
+static i32 mcpprojdecided(Session *s, Arena scratch, Str key)
+{
+    Grant g = {};
+    g.mcp = concat(&scratch, "project:", key);
+    if (hasgrant(s, g)) {
+        return 1;
+    }
+    g.mcp = concat(&scratch, "project-deny:", key);
+    if (hasgrant(s, g)) {
+        return -1;
+    }
+    for (iz i = 0; i < s->mcpsaid.len; i++) {
+        if (cuthead(s->mcpsaid[i], 3) == key) {
+            return startswith(s->mcpsaid[i], "ok:") ? 1 : -1;
+        }
+    }
+    return 0;
+}
+
+// The project's server of a name that the session may start: the
+// nearest file's, approved, when no section of the configuration has
+// that name. Null if none.
+static McpDef *mcpdefof(Session *s, Arena scratch, Str name)
+{
+    if (inisection(s->e->ini, "mcp", name)) {
+        return 0;
+    }
+    for (iz i = 0; i < s->mcpdefs.len; i++) {
+        McpDef *d = &s->mcpdefs[i];
+        if (d->name == name) {
+            Str key = mcpprojkey(&scratch, d);
+            return !d->err.len && mcpprojdecided(s, scratch, key)>0 ? d : 0;
+        }
+    }
+    return 0;
+}
+
+// Read the .mcp.json files, nearest first, once.
+static void mcpprojread(Session *s, Arena scratch)
+{
+    Engine *e   = s->e;
+    b32     win = s->te.windows;
+    s->mcpfound = 1;
+    Slice<Str> env  = engineenv(e, &scratch, win);
+    Str        root = instrroot(e->os, &scratch, s->cwd, win);
+    for (Str dir = s->cwd;;) {
+        Str  file = join(&scratch, dir, ".mcp.json");
+        Read rd   = os_read(e->os, &scratch, file, 1<<20);
+        if (rd.err == READ_OK) {
+            Slice<McpDef> defs = mcpprojects(&scratch, file, dir, rd.data, env, win);
+            for (iz i = 0; i < defs.len; i++) {
+                McpDef *d    = &defs[i];
+                b32     seen = 0;
+                for (iz k = 0; d->name.len && k < s->mcpdefs.len; k++) {
+                    seen |= s->mcpdefs[k].name == d->name;
+                }
+                if (!d->name.len) {
+                    Str msg = concat(&scratch, concat(&scratch, file, " is left out: "), d->err);
+                    note(s, scratch, "warn", msg);
+                    continue;
+                } else if (seen) {
+                    continue;
+                }
+                McpDef c = {};
+                c.name = clone(&s->perm, d->name);
+                c.file = clone(&s->perm, d->file);
+                c.dir  = clone(&s->perm, d->dir);
+                c.url  = clone(&s->perm, d->url);
+                c.raw  = clone(&s->perm, d->raw);
+                c.err  = clone(&s->perm, d->err);
+                for (iz k = 0; k < d->argv.len; k++) {
+                    c.argv = push(&s->perm, c.argv, clone(&s->perm, d->argv[k]));
+                }
+                for (iz k = 0; k < d->env.len; k++) {
+                    c.env = push(&s->perm, c.env, clone(&s->perm, d->env[k]));
+                }
+                for (iz k = 0; k < d->headers.len; k++) {
+                    c.headers = push(&s->perm, c.headers, clone(&s->perm, d->headers[k]));
+                }
+                s->mcpdefs = push(&s->perm, s->mcpdefs, c);
+            }
+        }
+        Str up = normpath(&scratch, dir, "..", win);
+        if (dir==root || up==dir) {
+            break;
+        }
+        dir = up;
+    }
+}
+
+// Before a request: the project's servers read, and those not yet
+// decided put to the user. Returns 0 while it asks.
+static b32 mcpprojgate(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    if (!s->mcpfound) {
+        mcpprojread(s, scratch);
+    }
+    Slice<McpDef *> ask  = {};
+    Slice<Str>      keys = {};
+    for (iz i = 0; i < s->mcpdefs.len; i++) {
+        McpDef *d = &s->mcpdefs[i];
+        if (inisection(e->ini, "mcp", d->name)) {
+            continue;  // the configuration's own
+        } else if (d->err.len) {
+            Str  what = concat(&scratch, "project:", d->name);
+            b32  told = 0;
+            for (iz k = 0; k < s->mcpwarned.len; k++) {
+                told |= s->mcpwarned[k] == what;
+            }
+            if (!told) {
+                s->mcpwarned = push(&s->perm, s->mcpwarned, clone(&s->perm, what));
+                Buf b(&scratch, 256);
+                print(&b, "The MCP server ");
+                print(&b, d->name);
+                print(&b, " of ");
+                print(&b, d->file);
+                print(&b, " is left out: ");
+                print(&b, d->err);
+                note(s, scratch, "warn", finish(&b));
+            }
+            continue;
+        }
+        Str key = mcpprojkey(&scratch, d);
+        if (mcpprojdecided(s, scratch, key)) {
+            continue;
+        } else if (mcpprojknown(e, scratch, key) || bypassing(s)) {
+            s->mcpsaid = push(&s->perm, s->mcpsaid, concat(&s->perm, "ok:", key));
+            continue;
+        }
+        ask  = push(&scratch, ask, d);
+        keys = push(&scratch, keys, key);
+    }
+    if (!ask.len) {
+        return 1;
+    }
+
+    s->mcpasking = {};
+    for (iz i = 0; i < keys.len; i++) {
+        s->mcpasking = push(&s->perm, s->mcpasking, clone(&s->perm, keys[i]));
+    }
+    Ask *k = &s->ask;
+    *k = {};
+    {
+        Buf b(&scratch, 64);
+        print(&b, "mcp.project/");
+        print(&b, os_time(e->os));
+        k->req = clone(&s->perm, finish(&b));
+    }
+    k->tool    = TOOL_NONE;
+    k->project = 1;
+    k->grant   = "project";
+    k->opened  = os_ticks(e->os);
+    b32 steer = s->steers.len > 0;
+    b32 wait  = attending(s) && !steer;
+    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    if (wait) {
+        arm(s, T_ASK, delay);
+    }
+    {
+        Buf files(&scratch, 256);
+        Buf lines(&scratch, 256);
+        for (iz i = 0; i < ask.len; i++) {
+            b32 again = 0;
+            for (iz j = 0; j < i; j++) {
+                again |= ask[j]->file == ask[i]->file;
+            }
+            if (!again) {
+                print(&files, files.len ? Str("\n") : Str(""));
+                print(&files, ask[i]->file);
+            }
+            print(&lines, i ? Str("\n") : Str(""));
+            print(&lines, mcpshowdef(&scratch, ask[i]));
+        }
+        Str   path   = finish(&files);
+        Str   detail = finish(&lines);
+        Buf   b(&scratch, 512 + path.len + detail.len);
+        EvOut w = sbegin(s, &b, EV_ASK);
+        putstrkey(&w.json, "req", k->req);
+        putstrkey(&w.json, "kind", "mcp.project");
+        putstrkey(&w.json, "path", path);
+        putstrkey(&w.json, "detail", detail);
+        putstrkey(&w.json, "always", "project");
+        putstrkey(&w.json, "scope", "mcp.project");
+        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putstrkey(&w.json, "dflt", "deny");
+        ssend(s, &w);
+    }
+    if (!wait) {
+        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        return 1;
+    }
+    setstate(s, S_ASK);
+    return 0;
+}
+
+// The project's ask answered (resolve). A cancel decides nothing, so
+// that the next turn asks again.
+static void mcpprojresolve(Session *s, Arena scratch, b32 allow, i32 by, b32 always)
+{
+    Engine *e = s->e;
+    Slice<Str> keys = s->mcpasking;
+    s->mcpasking = {};
+    if (by == DENY_CANCEL) {
+        return;
+    }
+    // The user's answer holds for the tree, and in the session's log;
+    // the rest only while it is in memory
+    Slice<McpDef *> defs = {};
+    Slice<Str>      good = {};
+    for (iz i = 0; i < keys.len; i++) {
+        if (by == DENY_USER) {
+            Grant g = {};
+            g.mcp = concat(&scratch, allow ? Str("project:") : Str("project-deny:"), keys[i]);
+            usergrant(s, scratch, g, s->ask.req, "user");
+        } else {
+            Str said = concat(&s->perm, allow ? Str("ok:") : Str("no:"), keys[i]);
+            s->mcpsaid = push(&s->perm, s->mcpsaid, said);
+        }
+        for (iz k = 0; always && allow && k < s->mcpdefs.len; k++) {
+            if (mcpprojkey(&scratch, &s->mcpdefs[k]) == keys[i]) {
+                defs = push(&scratch, defs, &s->mcpdefs[k]);
+                good = push(&scratch, good, keys[i]);
+                break;
+            }
+        }
+    }
+    if (defs.len) {
+        mcpprojremember(e, scratch, defs, good);
+    }
+    if (!allow && by==DENY_POLICY) {
+        note(s, scratch, "warn", "The project's MCP servers were not started: the "
+             "user must approve them, and nobody is there to.");
+    }
+}
+
 static void logprefix(Session *, Arena);
 
 // Before a request: the session's servers started, and while its tools
@@ -6510,6 +6874,8 @@ static b32 mcpgate(Session *s, Arena scratch)
 {
     if (s->readonly) {
         return 1;
+    } else if (!mcpprojgate(s, scratch)) {
+        return 0;  // asking about them
     }
     mcpoffer(s, scratch);
     if (!s->mcpfixed) {

@@ -174,4 +174,59 @@ static void test_mcp(Test *t)
            mcpresultshow(&a, "{\"content\":[{\"type\":\"text\",\"text\":\"t\"}],"
                              "\"structuredContent\":{\"x\":1}}"),
            "t images=0 image= mime=");
+
+    // .mcp.json: expansion, then definitions
+    {
+        Slice<Str> env = {};
+        env = push(&a, env, Str("HOME=/home/u"));
+        env = push(&a, env, Str("EMPTY="));
+        Str miss = {};
+        expect(t, "mcp expand", mcpexpand(&a, "${HOME}/x ${NOPE:-dflt} ${EMPTY:-e} $HOME ${",
+                                          env, 0, &miss), "/home/u/x dflt e $HOME ${");
+        expect(t, "mcp expand ok", miss, "");
+        mcpexpand(&a, "a ${NOPE} ${ALSO}", env, 0, &miss);
+        expect(t, "mcp expand missing", miss, "NOPE");
+
+        Str json = "{\"mcpServers\":{"
+                   "\"a\":{\"command\":\"${HOME}/bin/srv\",\"args\":[\"--x\",\"a b\"],"
+                   "\"env\":{\"K\":\"${HOME}\"}},"
+                   "\"h\":{\"type\":\"http\",\"url\":\"https://x/mcp\",\"headers\":"
+                   "{\"Authorization\":\"Bearer ${TOKEN:-none}\"}},"
+                   "\"u\":{\"url\":\"https://y/mcp\"},"
+                   "\"s\":{\"type\":\"sse\",\"url\":\"https://z/sse\"},"
+                   "\"m\":{\"command\":\"x\",\"args\":[\"${GONE}\"]},"
+                   "\"n\":{\"args\":[]},"
+                   "\"w\":{\"type\":\"websocket\"}}}";
+        Slice<McpDef> d = mcpprojects(&a, "/p/.mcp.json", "/p", json, env, 0);
+        Buf b(&a, 1024);
+        for (iz i = 0; i < d.len; i++) {
+            print(&b, mcpshowdef(&a, &d[i]));
+            for (iz k = 0; k < d[i].env.len; k++) {
+                print(&b, " env ");
+                print(&b, d[i].env[k]);
+            }
+            for (iz k = 0; k < d[i].headers.len; k++) {
+                print(&b, " header ");
+                print(&b, d[i].headers[k]);
+            }
+            if (d[i].err.len) {
+                print(&b, " error ");
+                print(&b, d[i].err);
+            }
+            putbyte(&b, '\n');
+        }
+        expect(t, "mcp projects", finish(&b),
+               "a: /home/u/bin/srv --x \"a b\" env K=/home/u\n"
+               "h: https://x/mcp header Authorization: Bearer none\n"
+               "u: https://y/mcp\n"
+               "s:  error the SSE transport is not supported, only stdio and HTTP\n"
+               "m: x \"\" error it uses ${GONE}, which is not set\n"
+               "n:  error it has no command\n"
+               "w:  error its type is not one this harness knows: websocket\n");
+        expect(t, "mcp projects dir", d[0].dir, "/p");
+        expect(t, "mcp projects raw", takehead(d[1].raw, 14), "{\"type\":\"http\"");
+        Slice<McpDef> bad = mcpprojects(&a, "/p/.mcp.json", "/p", "[1]", env, 0);
+        expect(t, "mcp projects bad", concat(&a, istr(&a, bad.len), concat(&a, " ", bad[0].err)),
+               "1 it is not a JSON object with mcpServers");
+    }
 }

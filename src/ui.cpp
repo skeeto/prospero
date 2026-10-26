@@ -1141,6 +1141,11 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         } else if (plan) {
             pen(p, "Plan first, changing nothing until you approve?  ",
                 STYLE_BOLD, pal->amber);
+        } else if (t->kind == "mcp.project") {
+            // The servers, in its text, are the project's to run
+            pen(p, "Start the MCP servers of ", STYLE_BOLD, pal->amber);
+            pen(p, t->path, STYLE_CODE, pal->summary);
+            pen(p, "?  ", STYLE_BOLD, pal->amber);
         } else {
             Buf b(&a, 256);
             print(&b, t->tool);
@@ -1557,13 +1562,19 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         guianswer(g, s, t->req, "allow", {});
     }
     if (latest) itemrect(g, RECT_ALLOW);
-    ImGui::SetItemTooltip("Let the %s go ahead", t->tool.len ? cstr0(&a, t->tool) : "tool");
+    b32 proj = t->scope == "mcp.project";
+    if (proj) {
+        ImGui::SetItemTooltip("Start these servers for this session and its subagents, "
+                              "whose agents may then ask to use their tools");
+    } else {
+        ImGui::SetItemTooltip("Let the %s go ahead", t->tool.len ? cstr0(&a, t->tool) : "tool");
+    }
 
     b32 desk   = t->scope == "desktop";
     b32 mcp    = t->scope == "mcp";
     b32 always = t->grant.len &&
                  hostcap(s->host, desk ? Str("answer.always.desktop") :
-                                  mcp  ? Str("mcp") : Str("answer.always"));
+                                  mcp || proj ? Str("mcp") : Str("answer.always"));
     if (always) {
         f32 sp = ImGui::GetStyle().ItemSpacing.x;
         f32 h  = ImGui::GetFrameHeight();
@@ -1581,6 +1592,8 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
             runs[0] = "Allow ";
             runs[1] = t->grant;
             runs[2] = " for this session";
+        } else if (proj) {
+            runs[0] = "Always for this project";
         } else if (mcp) {
             // The tool's own name, after mcp__SERVER__, cut if long
             Str tool = t->grant;
@@ -1616,6 +1629,9 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
             ImGui::SetItemTooltip("Allow this action, and every %s action from now on in "
                                   "this session and its subagents, without asking",
                                   cstr0(&a, t->grant));
+        } else if (proj) {
+            ImGui::SetItemTooltip("Start these servers now, and in later sessions here "
+                                  "without asking, until the file changes them");
         } else if (mcp) {
             ImGui::SetItemTooltip("Allow this, and every call to %s from now on in this "
                                   "session and its subagents, without asking",

@@ -116,6 +116,8 @@ struct McpServer {
     i32               killstage; // 0 before it is asked, 1 after
     b32               stopping;
     b32               config;    // still in the configuration
+    Str               project;   // a project's: its .mcp.json, else null
+    Str               raw;       // and its definition there
 };
 
 
@@ -562,4 +564,147 @@ static McpResult mcpresult(Arena *a, Json *res)
     }
     r.text = finish(&b);
     return r;
+}
+
+
+// Project servers: .mcp.json
+//
+// As Claude Code reads it: {"mcpServers": {NAME: {"command", "args",
+// "env"} or {"type": "http", "url", "headers"}}}, with ${VAR} and
+// ${VAR:-default} expanded in each string from the environment that the
+// engine gives its children (which leaves out the configuration's
+// secrets). A stdio server runs in the file's folder.
+
+struct McpDef {
+    Str        name;
+    Str        file;     // the .mcp.json
+    Str        dir;      // its folder
+    Slice<Str> argv;     // stdio
+    Slice<Str> env;      // NAME=value, for stdio
+    Str        url;      // HTTP
+    Slice<Str> headers;  // "Name: value", for HTTP
+    Str        raw;      // the definition as written, for its approval
+    Str        err;      // why it cannot be used, or null
+};
+
+static Str mcpenvget(Slice<Str> env, Str name, b32 win)
+{
+    for (iz i = 0; i < env.len; i++) {
+        if (envnameis(env[i], name, win)) {
+            return cuthead(env[i], name.len+1);
+        }
+    }
+    return {};
+}
+
+// A string with ${VAR} and ${VAR:-default} expanded. A variable that is
+// not set, with no default, makes missing its name.
+static Str mcpexpand(Arena *a, Str s, Slice<Str> env, b32 win, Str *missing)
+{
+    if (find(s, "${") < 0) {
+        return s;
+    }
+    Buf b(a, s.len + 64);
+    for (iz i = 0; i < s.len;) {
+        if (s[i]!='$' || i+1>=s.len || s[i+1]!='{') {
+            putbyte(&b, s[i++]);
+            continue;
+        }
+        Str rest = cuthead(s, i+2);
+        iz  end  = find(rest, "}");
+        if (end < 0) {
+            print(&b, cuthead(s, i));
+            break;
+        }
+        Str inner = takehead(rest, end);
+        iz  dash  = find(inner, ":-");
+        Str name  = dash<0 ? inner : takehead(inner, dash);
+        Str value = mcpenvget(env, name, win);
+        if (!value.len && dash>=0) {
+            value = cuthead(inner, dash+2);
+        } else if (!value.data && missing && !missing->len) {
+            *missing = name;
+        }
+        print(&b, value);
+        i += 2 + end + 1;
+    }
+    return finish(&b);
+}
+
+// A .mcp.json's servers, in its order. A file that cannot be read as
+// one gives a single entry with no name and the error.
+static Slice<McpDef> mcpprojects(Arena *a, Str file, Str dir, Str text, Slice<Str> env,
+                                 b32 win)
+{
+    Slice<McpDef> r = {};
+    JsonDoc d = jsonparse(a, text);
+    Json   *servers = jsonget(d.root, "mcpServers");
+    if (d.root->type!=JSON_OBJECT || servers->type!=JSON_OBJECT) {
+        McpDef x = {};
+        x.file = file;
+        x.err  = "it is not a JSON object with mcpServers";
+        return push(a, r, x);
+    }
+    for (Json *s = servers->child; s; s = s->next) {
+        McpDef x = {};
+        x.name = s->key;
+        x.file = file;
+        x.dir  = dir;
+        x.raw  = s->raw;
+        Str missing = {};
+        Str type    = jsonstr(jsonget(s, "type"));
+        Str url     = jsonstr(jsonget(s, "url"));
+        Str command = jsonstr(jsonget(s, "command"));
+        if (s->type != JSON_OBJECT) {
+            x.err = "its definition is not an object";
+        } else if (type=="sse") {
+            x.err = "the SSE transport is not supported, only stdio and HTTP";
+        } else if (type=="http" || type=="streamable-http" || (!type.len && url.len && !command.len)) {
+            x.url = mcpexpand(a, url, env, win, &missing);
+            x.err = x.url.len ? Str{} : Str("it has no url");
+            for (Json *h = jsonget(s, "headers")->child; h; h = h->next) {
+                Str v  = mcpexpand(a, jsonstr(h), env, win, &missing);
+                x.headers = push(a, x.headers, concat(a, concat(a, h->key, ": "), v));
+            }
+        } else if (type.len && type!="stdio") {
+            x.err = concat(a, "its type is not one this harness knows: ", type);
+        } else if (!command.len) {
+            x.err = "it has no command";
+        } else {
+            x.argv = push(a, x.argv, mcpexpand(a, command, env, win, &missing));
+            for (Json *v = jsonget(s, "args")->child; v; v = v->next) {
+                x.argv = push(a, x.argv, mcpexpand(a, jsonstr(v), env, win, &missing));
+            }
+            for (Json *v = jsonget(s, "env")->child; v; v = v->next) {
+                Str val = mcpexpand(a, jsonstr(v), env, win, &missing);
+                x.env   = push(a, x.env, concat(a, concat(a, v->key, "="), val));
+            }
+        }
+        if (!x.err.len && missing.len) {
+            x.err = concat(a, concat(a, "it uses ${", missing), "}, which is not set");
+        }
+        r = push(a, r, x);
+    }
+    return r;
+}
+
+// A project server as its ask shows it: its name, and its command line
+// or URL.
+static Str mcpshowdef(Arena *a, McpDef *x)
+{
+    Buf b(a, 128);
+    print(&b, x->name);
+    print(&b, ": ");
+    if (x->url.len) {
+        print(&b, x->url);
+    }
+    for (iz i = 0; i < x->argv.len; i++) {
+        Str w   = x->argv[i];
+        b32 odd = !w.len || find(w, " ")>=0 || find(w, "\"")>=0;
+        print(&b, i ? Str(" ") : Str(""));
+        print(&b, odd ? Str("\"") : Str(""));
+        print(&b, w);
+        print(&b, odd ? Str("\"") : Str(""));
+    }
+    return finish(&b);
 }
