@@ -6161,14 +6161,15 @@ static McpServer *mcpbyproc(Engine *e, u64 id)
 }
 
 // The servers of the configuration a new session may offer: enabled,
-// with a command, in its order.
+// with a command or a url, in its order.
 static Slice<Str> mcpnames(Engine *e, Arena *a)
 {
     Slice<Str> r = {};
     for (IniSection *t = inifirst(e->ini, "mcp"); t; t = ininext(t)) {
         Str name = t->name;
         if (name.len && cfgbool(trim(cfgget(e->cfg, "mcp", name, "enabled", 0)))!=0 &&
-                trim(cfgget(e->cfg, "mcp", name, "command", 0)).len) {
+                (trim(cfgget(e->cfg, "mcp", name, "command", 0)).len ||
+                 trim(cfgget(e->cfg, "mcp", name, "url", 0)).len)) {
             r = push(a, r, name);
         }
     }
@@ -6226,6 +6227,8 @@ static Str mcplogtail(Engine *e, Arena *a, McpServer *m)
 }
 
 static void mcpcallfail(Engine *e, Arena scratch, McpPending *p, Str why);
+static b32  mcphttppost(Engine *, Arena, McpServer *, i64 rpc, Str body,
+                        Str method = "POST", b32 retried = 0);
 
 // Stop a server: its input closed, so that it ends by itself, and the
 // kills to follow (mcptick). The calls waiting on it fail with why.
@@ -6243,6 +6246,15 @@ static void mcpstop(Engine *e, Arena scratch, McpServer *m, Str why)
         m->stopping  = 1;
         m->killstage = 0;
         m->killat    = os_ticks(e->os) + MCP_SOFT;
+    }
+    for (McpHttp *q = m->http; q; q = q->next) {
+        if (q->rpc) {
+            os_httpcancel(e->os, q->h);
+        }
+    }
+    if (m->session.len) {
+        mcphttppost(e, scratch, m, 0, {}, "DELETE");  // as the server asks
+        m->session = {};
     }
     if (m->state != MCP_FAILED) {
         m->state = MCP_STOPPED;
@@ -6284,13 +6296,78 @@ static void mcpfail(Engine *e, Arena scratch, McpServer *m, Str why)
     mcpwake(e, scratch, m);
 }
 
+// POST a message to a server over HTTP (or DELETE its session), rpc the
+// request it carries, if any: 0 if it could not go.
+static b32 mcphttppost(Engine *e, Arena scratch, McpServer *m, i64 rpc, Str body,
+                       Str method, b32 retried)
+{
+    Region *mem = os_reserve(e->os, MCP_REGION);
+    if (!mem) {
+        return 0;
+    }
+    Arena    a = newarena(mem);
+    McpHttp *q = alloc<McpHttp>(&a);
+    q->mem     = mem;
+    q->rpc     = rpc;
+    q->method  = method;
+    q->retried = retried;
+    q->body    = clone(&a, body);
+    q->in      = Buf(&a, 1<<12);
+    q->arena   = a;
+
+    Buf h(&scratch, 512 + m->headers.len + m->session.len);
+    if (method == "POST") {
+        print(&h, "Content-Type: application/json\r\n"
+                  "Accept: application/json, text/event-stream\r\n");
+    }
+    if (m->session.len) {
+        print(&h, "Mcp-Session-Id: ");
+        print(&h, m->session);
+        print(&h, "\r\n");
+    }
+    if (m->version.len) {
+        print(&h, "MCP-Protocol-Version: ");
+        print(&h, m->version);
+        print(&h, "\r\n");
+    }
+    print(&h, m->headers);
+    HttpReq r = {};
+    r.method    = method;
+    r.url       = m->url;
+    r.headers   = finish(&h);
+    r.body      = q->body;
+    r.connectms = 15000;
+    r.maxbytes  = 4*MCP_FRAMEMAX;
+    r.mbox      = e->in;
+    r.id        = q->hid = ++e->nextid;
+    q->h = os_http(e->os, &r, scratch);
+    if (!q->h) {
+        os_release(e->os, mem);
+        return 0;
+    }
+    q->next = m->http;
+    m->http = q;
+    return 1;
+}
+
+// Send a message, a line as mcpmessage makes them, rpc its request's id
+// if it is one: 0 if it could not go.
+static b32 mcpsendraw(Engine *e, Arena scratch, McpServer *m, i64 rpc, Str line)
+{
+    if (m->url.len) {
+        b32 up = m->state!=MCP_STOPPED && m->state!=MCP_FAILED;
+        return up && mcphttppost(e, scratch, m, rpc, line);
+    } else if (!m->proc || m->stopping) {
+        return 0;
+    }
+    return os_procwrite(e->os, m->proc, line);
+}
+
 // Send a request (id nonzero) or notification. 0 if it could not go.
 static b32 mcpsend(Engine *e, Arena scratch, McpServer *m, i64 id, Str method, Str params)
 {
-    if (!m->proc || m->stopping) {
-        return 0;
-    }
-    return os_procwrite(e->os, m->proc, mcpmessage(&scratch, id, method, params));
+    Str line = mcpmessage(&scratch, id, method, params);
+    return mcpsendraw(e, scratch, m, id, line);
 }
 
 // A request awaiting its response, by kind.
@@ -6350,6 +6427,44 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     m->startedat = now;
     m->readyby  = now + m->startms*MS;
     m->lastuse  = now;
+    m->session  = {};
+
+    if (!m->project.len) {
+        Str url = trim(cfgget(e->cfg, "mcp", m->name, "url", 0));
+        m->url  = url.len ? clone(&m->arena, url) : Str{};
+        if (url.len) {
+            Buf         h   = Buf(&m->arena, 256);
+            IniSection *sec = inisection(e->ini, "mcp", m->name);
+            for (IniEntry *k = sec ? sec->keys : 0; k; k = k->next) {
+                if (!startswith(k->key, "header.") || k->key.len<8) {
+                    continue;
+                }
+                Str v = trim(k->value);
+                if (startswith(v, "env:")) {
+                    v = os_getenv(e->os, &scratch, trim(cuthead(v, 4)));
+                }
+                print(&h, cuthead(k->key, 7));
+                print(&h, ": ");
+                print(&h, v);
+                print(&h, "\r\n");
+            }
+            Str token = cfgsecret(e->cfg, &scratch, "mcp", m->name, "token");
+            if (token.len) {
+                print(&h, "Authorization: Bearer ");
+                print(&h, token);
+                print(&h, "\r\n");
+            }
+            m->headers = finish(&h);
+        }
+    }
+    if (m->url.len) {
+        Str init = mcpinitparams(&scratch);
+        if (!mcprequest(e, scratch, m, MCPREQ_INIT, "initialize", init)) {
+            mcpfail(e, scratch, m, concat(&scratch, "its url could not be requested: ",
+                                          os_lasterr(e->os, &scratch)));
+        }
+        return;
+    }
 
     Config  *c    = e->cfg;
     b32      win  = s->te.windows;
@@ -6459,12 +6574,15 @@ static McpDef *mcpdefof(Session *s, Arena scratch, Str name);
 static McpServer *mcpserver(Session *s, Arena scratch, Str name)
 {
     Engine    *e   = s->e;
-    b32        cfg = trim(cfgget(e->cfg, "mcp", name, "command", 0)).len > 0;
+    Str        url = trim(cfgget(e->cfg, "mcp", name, "url", 0));
+    b32        cfg = url.len || trim(cfgget(e->cfg, "mcp", name, "command", 0)).len;
     McpDef    *d   = cfg ? 0 : mcpdefof(s, scratch, name);
     if (!cfg && !d) {
         return 0;
     }
-    Str        cwd = d ? d->dir : mcpcwd(s, &scratch, name);
+    // An HTTP server is one for every folder
+    Str        cwd = d ? (d->url.len ? Str("") : d->dir) :
+                     url.len ? Str("") : mcpcwd(s, &scratch, name);
     McpServer *m   = mcpfind(e, name, cwd);
     if (!m) {
         m = alloc<McpServer>(&e->perm);
@@ -6486,6 +6604,13 @@ static McpServer *mcpserver(Session *s, Arena scratch, Str name)
         for (iz i = 0; i < d->env.len; i++) {
             m->env = push(&e->perm, m->env, clone(&e->perm, d->env[i]));
         }
+        Buf h(&scratch, 256);
+        for (iz i = 0; i < d->headers.len; i++) {
+            print(&h, d->headers[i]);
+            print(&h, "\r\n");
+        }
+        m->url     = clone(&e->perm, d->url);
+        m->headers = clone(&e->perm, finish(&h));
     } else if (!d) {
         m->project = {};
     }
@@ -7097,6 +7222,11 @@ static void mcpcancel(Session *s, Arena scratch, Str status, Str text)
 {
     McpServer *m = s->mcpsrv;
     if (m && s->mcpcall > 0) {
+        for (McpHttp *q = m->http; q; q = q->next) {
+            if (q->rpc == s->mcpcall) {
+                os_httpcancel(s->e->os, q->h);
+            }
+        }
         for (iz i = 0; i < m->pending.len; i++) {
             if (m->pending[i].id == s->mcpcall) {
                 m->pending.data[i] = m->pending[m->pending.len-1];
@@ -7399,9 +7529,7 @@ static void mcpline(Engine *e, Arena scratch, McpServer *m, Str line)
         Str out = jsonstr(method)=="ping"
                 ? mcpresponse(&scratch, id->raw, "{}", 0, {})
                 : mcpresponse(&scratch, id->raw, {}, -32601, "method not supported");
-        if (m->proc && !m->stopping) {
-            os_procwrite(e->os, m->proc, out);
-        }
+        mcpsendraw(e, scratch, m, 0, out);
         return;
     }
     i64 n = jsonint(id, 0);
@@ -7500,6 +7628,153 @@ static void mcprecord(Engine *e, Arena scratch, McpServer *m, Record r)
     }
 }
 
+// A server's HTTP request, by its record's id, or null.
+static McpServer *mcpbyhttp(Engine *e, u64 id, McpHttp **out)
+{
+    for (McpServer *m = e->mcp; id && m; m = m->next) {
+        for (McpHttp *q = m->http; q; q = q->next) {
+            if (q->hid == id) {
+                *out = q;
+                return m;
+            }
+        }
+    }
+    return 0;
+}
+
+static b32 mcpwaiting(McpServer *m, i64 rpc)
+{
+    for (iz i = 0; i < m->pending.len; i++) {
+        if (m->pending[i].id == rpc) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// An HTTP request ended. A request it carried that got no response
+// fails, after one retry for a status that invites one; a session the
+// server forgot (404) fails the server, to be initialized again at once.
+static void mcphttpdone(Engine *e, Arena scratch, McpServer *m, McpHttp *q, i32 err, Str why)
+{
+    McpHttp **pp = &m->http;
+    for (; *pp != q; pp = &(*pp)->next) {}
+    *pp = q->next;
+
+    i32 st = q->status;
+    if (!err && st/100==2 && !q->sse && trim(Str{q->in.data, q->in.len}).len) {
+        mcpline(e, scratch, m, Str{q->in.data, q->in.len});
+    }
+    if (q->rpc && mcpwaiting(m, q->rpc)) {
+        b32 again = !q->retried && !err && (st==408 || st==429 || st>=500);
+        if (again && mcphttppost(e, scratch, m, q->rpc, q->body, "POST", 1)) {
+            os_httpfree(e->os, q->h);
+            os_release(e->os, q->mem);
+            return;
+        }
+        Buf b(&scratch, 512);
+        b32 forgot = !err && st==404 && m->session.len;
+        if (err == HTTP_ECONNECT) {
+            print(&b, "it could not be reached");
+            print(&b, why.len ? Str(": ") : Str(""));
+            print(&b, why);
+        } else if (err == HTTP_ETRUST) {
+            print(&b, "its certificate was refused");
+            print(&b, why.len ? Str(": ") : Str(""));
+            print(&b, why);
+        } else if (err) {
+            print(&b, "its response broke off");
+            print(&b, why.len ? Str(": ") : Str(""));
+            print(&b, why);
+        } else if (forgot) {
+            print(&b, "it no longer knows this client's session (HTTP 404), so it "
+                      "starts again for the next call");
+        } else if (st==401 || st==403) {
+            print(&b, "it needs authorization (HTTP ");
+            print(&b, (i64)st);
+            print(&b, ")");
+        } else if (st/100 == 2) {
+            print(&b, "it ended its response without answering");
+        } else {
+            print(&b, "HTTP ");
+            print(&b, (i64)st);
+            Str body = trim(Str{q->in.data, q->in.len});
+            if (body.len) {
+                print(&b, ": ");
+                print(&b, utf8head(body, 300));
+            }
+        }
+        Str msg = finish(&b);
+        McpPending p = {};
+        for (iz i = 0; i < m->pending.len; i++) {
+            if (m->pending[i].id == q->rpc) {
+                p = m->pending[i];
+            }
+        }
+        if (p.kind==MCPREQ_CALL && !forgot) {
+            for (iz i = 0; i < m->pending.len; i++) {
+                if (m->pending[i].id == q->rpc) {
+                    m->pending.data[i] = m->pending[m->pending.len-1];
+                    m->pending.len--;
+                    break;
+                }
+            }
+            Str full = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
+                              concat(&scratch, " failed the call: ", msg));
+            mcpcallfail(e, scratch, &p, full);
+        } else {
+            mcpfail(e, scratch, m, msg);
+            if (forgot) {
+                m->retryat = os_ticks(e->os);
+            }
+        }
+    }
+    os_httpfree(e->os, q->h);
+    os_release(e->os, q->mem);
+}
+
+static void mcphttprecord(Engine *e, Arena scratch, McpServer *m, McpHttp *q, Record r)
+{
+    switch (r.type) {
+    case HTTP_HEAD: {
+        q->status = get32(r.data);
+        Str head  = cuthead(r.data, 4);
+        Str type  = headervalue(head, "Content-Type");
+        Str sid   = headervalue(head, "Mcp-Session-Id");
+        type   = trim(type);
+        q->sse = q->status/100==2 && equalfold(takehead(type, type.len<17 ? type.len : 17),
+                                                "text/event-stream");
+        if (q->sse) {
+            q->events = newsse(&q->arena, MCP_FRAMEMAX);
+        }
+        if (sid.len && q->status/100==2 && !m->session.len) {
+            m->session = clone(&m->arena, sid);
+        }
+    } return;
+    case HTTP_BODY:
+        if (q->sse) {
+            Arena tmp = scratch;
+            Slice<SseEvent> evs = ssefeed(&q->events, r.data, &tmp);
+            for (iz i = 0; i < evs.len; i++) {
+                if (evs[i].kind == SSE_EVENT) {
+                    mcpline(e, tmp, m, evs[i].data);
+                }
+            }
+            if (q->events.err) {
+                os_httpcancel(e->os, q->h);
+            }
+        } else if (q->in.len+r.data.len <= (q->status/100==2 ? MCP_FRAMEMAX : (i64)4096)) {
+            print(&q->in, r.data);
+        } else if (q->status/100 == 2) {
+            os_httpcancel(e->os, q->h);  // too big
+        }
+        return;
+    case HTTP_DONE:
+        mcphttpdone(e, scratch, m, q, get32(r.data), cuthead(r.data, 4));
+        return;
+    }
+}
+
 // The engine's clock: servers too slow to start fail, stopping ones are
 // killed, and those no session offers stop.
 static i64 mcpnext(Engine *e)
@@ -7551,6 +7826,9 @@ static void mcptick(Engine *e, Arena scratch, i64 now)
 static void mcpquit(Engine *e)
 {
     for (McpServer *m = e->mcp; m; m = m->next) {
+        for (McpHttp *q = m->http; q; q = q->next) {
+            os_httpcancel(e->os, q->h);
+        }
         if (m->proc) {
             os_procwrite(e->os, m->proc, {});
             os_procfree(e->os, m->proc);
@@ -13708,6 +13986,14 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         Session *js = jobbyproc(e, r.id, &j);
         if (js) {
             jobrecord(js, scratch, j, r);
+            return;
+        }
+    }
+    if (r.type>=HTTP_HEAD && r.type<=HTTP_DONE) {
+        McpHttp   *q  = 0;
+        McpServer *ms = mcpbyhttp(e, r.id, &q);
+        if (ms) {
+            mcphttprecord(e, scratch, ms, q, r);
             return;
         }
     }

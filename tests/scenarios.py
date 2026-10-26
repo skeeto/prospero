@@ -8309,6 +8309,151 @@ def mcp_project_config(t):
     t.check("mcp__fake__echo" in names, f"the configuration's server {names}")
 
 
+class McpHttpServer:
+    """tests/fake_mcp.py --http, run for a scenario, logging to t.mcplog."""
+
+    def __init__(self, t, **env):
+        self.p = subprocess.Popen([sys.executable, FAKE_MCP, "--http"],
+                                  stdout=subprocess.PIPE, text=True,
+                                  env={**os.environ, "FAKE_MCP_LOG": t.mcplog, **env})
+        line = self.p.stdout.readline()
+        if not line.strip().isdigit():
+            self.close()
+            raise Failure(f"the fake HTTP server did not start: {line!r}")
+        self.url = f"http://127.0.0.1:{int(line)}/mcp"
+
+    def close(self):
+        self.p.terminate()
+        try:
+            self.p.wait(5)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+
+
+def addconf(t, text):
+    t.host.write(t.config, t.host.read(t.config) + text)
+
+
+@scenario(bound=30)
+def mcp_http(t):
+    """A server over Streamable HTTP: JSON responses and streams of events,
+    its session id on every request after initialize, the protocol
+    version and the section's headers; the server's ping answered from
+    within a stream; a 503 retried once; a session the server forgot
+    fails that call, deletes it, and the next call starts again."""
+    env = mcpenv(t, EXTRA_VAL="extra!")
+    srv = McpHttpServer(t)
+    try:
+        addconf(t, f"[mcp web]\nurl = {srv.url}\nheader.X-Extra = env:EXTRA_VAL\ntrust = yes\n")
+        r = t.run(env=env)
+    finally:
+        srv.close()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    st = [(e["status"], e["text"][:90]) for e in r.all("tool.end")]
+    t.check([x for x, _ in st] == ["ok", "ok", "error", "ok", "ok", "error", "ok"],
+            f"statuses {st}")
+    t.check(st[0][1] == "echo: over http" and st[3][1] == "steady now", f"texts {st}")
+    t.check(r.all("tool.end")[1].get("image", "").endswith(".png"), "the image")
+    t.check("no, thanks" in st[2][1], f"refused {st[2]}")
+    t.check("no longer knows this client's session" in st[5][1], f"forgotten {st[5]}")
+    t.check(st[6][1] == "echo: again", f"again {st[6]}")
+    log = mcplog(t)
+    posts = [m for m in log if "_delete" not in m]
+    sids = [m["_http"]["Mcp-Session-Id"] for m in posts if m.get("method") != "initialize"]
+    t.check(sids and all(sids), f"a session id on each later request: {sids[:3]}")
+    t.check(all(m["_http"]["X-Extra"] == "extra!" for m in posts), "the section's header")
+    t.check(all(m["_http"]["MCP-Protocol-Version"] == "2025-06-18" for m in posts
+                if m.get("method") not in ("initialize",)), "the protocol version after")
+    t.check(all("text/event-stream" in m["_http"]["Accept"] for m in posts), "accepts both")
+    pings = [m for m in posts if str(m.get("id", "")).startswith("ping-") and "result" in m]
+    t.check(len(pings) == 6, f"pings answered: {len(pings)}")
+    flaky = [m for m in posts if (m.get("params") or {}).get("name") == "flaky"]
+    t.check(len(flaky) == 2 and flaky[0]["id"] == flaky[1]["id"], f"retried once {flaky}")
+    inits = [m for m in posts if m.get("method") == "initialize"]
+    t.check(len(inits) == 2, f"initialized again: {len(inits)}")
+    t.check(len([m for m in log if "_delete" in m]) == 1, "the forgotten session deleted")
+
+
+@scenario(bound=15)
+def mcp_http_auth(t):
+    """A server that wants a token, without one: it fails, saying so."""
+    env = mcpenv(t)
+    srv = McpHttpServer(t, FAKE_MCP_TOKEN="s3cret")
+    try:
+        addconf(t, f"[mcp web]\nurl = {srv.url}\ntrust = yes\n")
+        r = t.run(env=env)
+    finally:
+        srv.close()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    warns = [n["text"] for n in r.all("note") if "MCP server web failed" in n["text"]]
+    t.check(len(warns) == 1 and "needs authorization (HTTP 401)" in warns[0], f"warned {warns}")
+
+
+@scenario(bound=15)
+def mcp_http_token(t):
+    """The section's token, from the environment, as a bearer token."""
+    env = mcpenv(t, WEB_TOKEN="s3cret")
+    srv = McpHttpServer(t, FAKE_MCP_TOKEN="s3cret")
+    try:
+        addconf(t, f"[mcp web]\nurl = {srv.url}\ntoken = env:WEB_TOKEN\ntrust = yes\n")
+        r = t.run(env=env)
+    finally:
+        srv.close()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.last("tool.end")
+    t.check(end["status"] == "ok" and end["text"] == "echo: hi", f"called {end}")
+    t.check(all(m["_http"]["Authorization"] == "Bearer s3cret" for m in mcplog(t)), "the token")
+
+
+@scenario(bound=15)
+def mcp_http_timeout(t):
+    """A call over HTTP past its timeout: its request given up, the
+    server told."""
+    env = mcpenv(t)
+    srv = McpHttpServer(t)
+    try:
+        addconf(t, f"[mcp web]\nurl = {srv.url}\ntrust = yes\ntimeout = 1\n")
+        r = t.run(env=env)
+    finally:
+        srv.close()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.last("tool.end")
+    t.check(end["status"] == "timeout", f"timed out {end}")
+    can = [m for m in mcplog(t) if m.get("method") == "notifications/cancelled"]
+    t.check(len(can) == 1, f"told {can}")
+
+
+@scenario(bound=20)
+def mcp_project_http(t):
+    """A project's HTTP server, with its headers expanded, once allowed."""
+    env = mcpenv(t, EXTRA_VAL="from env")
+    srv = McpHttpServer(t)
+    try:
+        t.put(".mcp.json", json.dumps({"mcpServers": {"web": {
+            "type": "http", "url": srv.url, "headers": {"X-Extra": "${EXTRA_VAL}"}}}}))
+        h = t.headless(env=env)
+        try:
+            sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+            h.send("prompt", sid=sid, text="go")
+            ask = nextask(h, sid)
+            t.check(ask["kind"] == "mcp.project" and ask["detail"] == "web: " + srv.url,
+                    f"the project's ask {ask}")
+            h.call("answer", sid=sid, req=ask["req"], decision="allow")
+            call = nextask(h, sid, ask["seq"])
+            h.call("answer", sid=sid, req=call["req"], decision="allow")
+            t.check(ended(h, sid, 1)["why"] == "done", "the turn ends")
+            end = h.all("tool.end", sid)[-1]
+            t.check(end["status"] == "ok" and end["text"] == "echo: hi", f"called {end}")
+        finally:
+            rc = h.close()
+        t.check(rc == 0, f"headless exit {rc}")
+    finally:
+        srv.close()
+    t.check(all(m["_http"]["X-Extra"] == "from env" for m in mcplog(t) if "_http" in m),
+            "the file's header")
+
+
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")
 
 

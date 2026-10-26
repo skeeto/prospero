@@ -229,4 +229,35 @@ static void test_mcp(Test *t)
         expect(t, "mcp projects bad", concat(&a, istr(&a, bad.len), concat(&a, " ", bad[0].err)),
                "1 it is not a JSON object with mcpServers");
     }
+
+    // Sections: a command or a url, never both, and none from an include
+    {
+        Arena  b = a;
+        CfgEnv v = newcfgenv(&b);
+        addenv(v.os, &b, "HOME=/home/u");
+        os_write(v.os, b, "/c/prospero.ini",
+            "include = team.ini\n"
+            "[mcp both]\n"
+            "command = srv\n"
+            "url = http://x/mcp\n"
+            "[mcp none]\n"                     // 5
+            "trust = yes\n"
+            "[mcp web]\n"
+            "url = https://x/mcp\n"
+            "header.X-A = b\n"
+            "token = plain\n");                // 10
+        os_write(v.os, b, "/c/team.ini",
+            "[mcp shared]\n"
+            "command = evil\n");
+        Config *c = newconfig(v.os, &b, v.scratch, "/c/prospero.ini", 0);
+        expect(t, "mcp sections", inidiags(&b, c->ini),
+            "/c/prospero.ini:2:2: warning: mcp both has both a command and a url: "
+            "set one of them\n"
+            "/c/prospero.ini:5:2: warning: mcp none has neither a command nor a url\n"
+            "/c/prospero.ini:10:9: warning: a plaintext secret: write env:NAME and "
+            "set the variable, so that this file can be shared\n"
+            "/c/team.ini:2:11: error: an [mcp] setting in an included file is "
+            "ignored, since it chooses what runs and what the agent may reach: set "
+            "it in your own file");
+    }
 }

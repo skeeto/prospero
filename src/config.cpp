@@ -507,6 +507,15 @@ static CfgKey cfgschema[] = {
      "The server's program and its arguments, run without a shell (quote "
      "words with blanks in them), speaking MCP on its standard input and "
      "output"},
+    {"mcp", "url", CFG_STRING, "", {}, {}, "mcp",
+     "Instead of a command, the URL of a server that speaks MCP over HTTP "
+     "(Streamable HTTP)"},
+    {"mcp", "header.", CFG_STRING, "", {}, {}, "mcp",
+     "header.NAME = VALUE: a header for a url's requests, VALUE env:VAR to "
+     "take it from the environment"},
+    {"mcp", "token", CFG_SECRET, "", {}, {}, "mcp",
+     "A url's bearer token, as env:NAME, for servers that take one in "
+     "place of signing in"},
     {"mcp", "cwd", CFG_STRING, "", {}, {}, "mcp",
      "Where the command runs, by default the session's folder"},
     {"mcp", "env.", CFG_STRING, "", {}, {}, "mcp",
@@ -1338,7 +1347,10 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniLine *l)
     b32      named   = k && !k->named && l->value.len;
     b32      nourl   = k && l->key=="endpoint" && l->value.len &&
                        !inientry(l->section, "url");
-    if (k && !unnamed && !named && !nourl) {
+    b32      mcpcmd  = k && l->key=="mcp" && inientry(l->section, "command");
+    b32      mcpurl  = k && l->key=="mcp" && inientry(l->section, "url");
+    b32      mcpbad  = k && l->key=="mcp" && l->value.len && mcpcmd==mcpurl;
+    if (k && !unnamed && !named && !nourl && !mcpbad) {
         return;
     } else if (cfgmuted(f)) {
         cfgreport(ini, perm, f, l, INI_WARNING, 0, {});
@@ -1362,6 +1374,11 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniLine *l)
         print(&b, "[");
         print(&b, l->key);
         print(&b, "] takes no name, or its settings are unused");
+    } else if (mcpbad) {
+        print(&b, "mcp ");
+        print(&b, l->value);
+        print(&b, mcpcmd ? Str(" has both a command and a url: set one of them")
+                         : Str(" has neither a command nor a url"));
     } else {
         print(&b, "endpoint ");
         print(&b, l->value);

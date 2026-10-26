@@ -24,7 +24,21 @@ roots/list request, and logs the responses. Every message it reads, and
 those responses, is appended as a JSON line to the file FAKE_MCP_LOG
 names, if set. FAKE_MCP_VERSION sets the protocol version it answers.
 
-Run as the harness would: uv run tests/fake_mcp.py
+With --http it serves Streamable HTTP instead, on 127.0.0.1 at a port
+it picks and prints as its first line: a POST for each message, JSON
+responses but for tools/call, whose response is a stream of events (a
+notification, a ping to the client, then the result). initialize gives
+a session id, which every later request must carry (404 otherwise), and
+DELETE ends. Logged messages carry the request's headers as "_http".
+More tools there:
+
+  forget {}         answers, then forgets every session
+  flaky {}          HTTP 503 the first time for its request id
+
+With FAKE_MCP_TOKEN set, a request without "Authorization: Bearer
+TOKEN" gets 401.
+
+Run as the harness would: uv run tests/fake_mcp.py [--http]
 """
 
 import json
@@ -56,6 +70,10 @@ TOOLS = [
      "inputSchema": {"type": "object"}},
     {"name": "where", "description": "Say where it runs.",
      "inputSchema": {"type": "object"}},
+]
+HTTP_TOOLS = [
+    {"name": "forget", "description": "Forget the sessions.", "inputSchema": {}},
+    {"name": "flaky", "description": "Fail once.", "inputSchema": {}},
 ]
 PAGE = 2
 
@@ -180,5 +198,152 @@ def main():
     sys.stderr.write("fake mcp: input closed\n")
 
 
+# Streamable HTTP
+
+SESSIONS = set()
+FLAKED = set()
+
+
+def serve_http():
+    import http.server
+    import uuid
+
+    version = os.environ.get("FAKE_MCP_VERSION", "2025-06-18")
+    token = os.environ.get("FAKE_MCP_TOKEN")
+    tools = TOOLS + HTTP_TOOLS
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def reply(self, status, body=b"", ctype="application/json", extra=()):
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in extra:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def heads(self):
+            return {k: self.headers.get(k) for k in
+                    ("Mcp-Session-Id", "MCP-Protocol-Version", "Authorization", "Accept",
+                     "Content-Type", "X-Extra")}
+
+        def authorized(self):
+            if token and self.headers.get("Authorization") != f"Bearer {token}":
+                self.reply(401, b'{"error":"unauthorized"}', extra=[
+                    ("WWW-Authenticate", 'Bearer realm="fake"')])
+                return False
+            return True
+
+        def do_DELETE(self):
+            log({"_http": self.heads(), "_delete": 1})
+            with LOCK:
+                SESSIONS.discard(self.headers.get("Mcp-Session-Id"))
+            self.reply(200)
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            msg = json.loads(self.rfile.read(n))
+            log({**msg, "_http": self.heads()})
+            if not self.authorized():
+                return
+            method, rid = msg.get("method"), msg.get("id")
+            sid = self.headers.get("Mcp-Session-Id")
+            if method != "initialize":
+                with LOCK:
+                    known = sid in SESSIONS
+                if not known:
+                    self.reply(404 if sid else 400, b'{"error":"no session"}')
+                    return
+            if method is None or rid is None:
+                if method == "notifications/cancelled":
+                    with LOCK:
+                        CANCELLED.add(msg["params"]["requestId"])
+                self.reply(202)
+                return
+            if method == "initialize":
+                sid = uuid.uuid4().hex
+                with LOCK:
+                    SESSIONS.add(sid)
+                res = {"protocolVersion": version, "capabilities": {"tools": {}},
+                       "serverInfo": {"name": "fake-http", "version": "1"},
+                       "instructions": "Over HTTP."}
+                self.reply(200, json.dumps({"jsonrpc": "2.0", "id": rid,
+                                            "result": res}).encode(),
+                           extra=[("Mcp-Session-Id", sid)])
+            elif method == "tools/list":
+                at = int((msg.get("params") or {}).get("cursor") or 0)
+                res = {"tools": tools[at:at+PAGE]}
+                if at + PAGE < len(tools):
+                    res["nextCursor"] = str(at + PAGE)
+                self.reply(200, json.dumps({"jsonrpc": "2.0", "id": rid,
+                                            "result": res}).encode())
+            elif method == "tools/call":
+                self.call(rid, msg.get("params") or {})
+            else:
+                self.reply(200, json.dumps({"jsonrpc": "2.0", "id": rid, "error": {
+                    "code": -32601, "message": "method not found"}}).encode())
+
+        def call(self, rid, params):
+            name = params.get("name")
+            if name == "flaky":
+                with LOCK:
+                    first = rid not in FLAKED
+                    FLAKED.add(rid)
+                if first:
+                    self.reply(503, b"busy, try again")
+                    return
+                r = text("steady now")
+            elif name == "forget":
+                with LOCK:
+                    SESSIONS.clear()
+                r = text("forgotten")
+            elif name == "refuse":
+                r = None
+            else:
+                try:
+                    r = call(rid, name, params.get("arguments") or {})
+                except KeyError:
+                    r = None
+            # A stream: a notification, a ping, then the result
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            events = [{"jsonrpc": "2.0", "method": "notifications/progress",
+                       "params": {"progressToken": 1, "progress": 1}},
+                      {"jsonrpc": "2.0", "id": f"ping-{rid}", "method": "ping"}]
+            if r is not None:
+                events.append({"jsonrpc": "2.0", "id": rid, "result": r})
+            elif name != "slow":  # a slow call is None when cancelled
+                events.append({"jsonrpc": "2.0", "id": rid, "error": {
+                    "code": -32000, "message": "no, thanks"}})
+            try:
+                for ev in events:
+                    self.wfile.write(b"event: message\ndata: " + json.dumps(ev).encode() +
+                                     b"\n\n")
+                    self.wfile.flush()
+            except OSError:
+                pass
+            self.close_connection = True
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    sys.stdout.write(f"{srv.server_address[1]}\n")
+    sys.stdout.flush()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    if "--http" in sys.argv[1:]:
+        serve_http()
+    else:
+        main()

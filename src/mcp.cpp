@@ -75,6 +75,25 @@ enum : i32 {
     MCPREQ_CALL,
 };
 
+// An HTTP request to a server: a message POSTed, its response a JSON
+// body or a stream of events, in a region of its own, released once it
+// is done.
+struct McpHttp {
+    McpHttp *next;
+    Region  *mem;
+    Arena    arena;
+    Http    *h;
+    u64      hid;
+    i64      rpc;      // the request it carries, 0 for any other message
+    Str      body;     // what it sent, for a retry
+    Str      method;
+    i32      status;
+    b32      sse;      // the response is a stream of events
+    b32      retried;
+    Buf      in;       // a JSON response, or an error's start
+    Sse      events;
+};
+
 // A request awaiting the server's response.
 struct McpPending {
     i64 id;
@@ -118,6 +137,10 @@ struct McpServer {
     b32               config;    // still in the configuration
     Str               project;   // a project's: its .mcp.json, else null
     Str               raw;       // and its definition there
+    Str               url;       // over HTTP: its endpoint, else null
+    Str               headers;   // and its own headers, "Name: value\r\n"
+    Str               session;   // Mcp-Session-Id, once it gave one
+    McpHttp          *http;      // requests under way
 };
 
 

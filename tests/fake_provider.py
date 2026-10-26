@@ -2266,6 +2266,30 @@ sc_mcp_project_always = sc_mcp_project
 sc_mcp_project_config = sc_mcp_project
 
 
+def sc_mcp_http(model, n, req):
+    yield from mcp_steps(model, n, req, [
+        ("mcp__web__echo", {"text": "over http"}),
+        ("mcp__web__image", {}),
+        ("mcp__web__refuse", {}),
+        ("mcp__web__flaky", {}),
+        ("mcp__web__forget", {}),
+        ("mcp__web__echo", {"text": "forgotten"}),
+        ("mcp__web__echo", {"text": "again"}),
+        "Done over HTTP."])
+
+
+def sc_mcp_http_auth(model, n, req):
+    yield from mcp_steps(model, n, req, [("mcp__web__echo", {"text": "hi"})])
+
+
+sc_mcp_http_token = sc_mcp_http_auth
+sc_mcp_project_http = sc_mcp_http_auth
+
+
+def sc_mcp_http_timeout(model, n, req):
+    yield from mcp_steps(model, n, req, [("mcp__web__slow", {"seconds": 30})])
+
+
 # The GUI's checklist (prospero gui --drive, run by tests/gui.py): the
 # prompt that began the turn picks the reply, and the step is how many
 # responses the turn has had so far.
