@@ -1003,6 +1003,27 @@ def empty(t):
     t.check(r.text() == "Finally something.", f"text {r.text()!r}")
 
 
+@scenario(conf={"_extra": "[model {model}]\nempty_retries = 3\n"}, bound=8)
+def empty_more(t):
+    """empty_retries: three reminders after empty responses, not two."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    nudges = [(n["kind"], n["cap"]) for n in r.all("nudge")]
+    t.check(nudges == [("empty", 3)] * 3, f"nudges {nudges}")
+    t.check(r.text() == "Third time lucky.", f"text {r.text()!r}")
+
+
+@scenario(conf={"_extra": "[model {model}]\nempty_retries = 0\n"}, bound=8)
+def empty_none(t):
+    """empty_retries = 0: the turn ends at the first empty response."""
+    r = t.run()
+    end = r.last("turn.end")
+    t.check(r.rc == 1 and end.get("why") == "error" and
+            "kept returning empty responses" in end.get("err", ""), f"end {end}")
+    t.check(not r.all("nudge"), "no reminders")
+    t.check(len(t.requests()) == 1, "one request")
+
+
 @scenario(bound=8)
 def length_think(t):
     r = t.run()

@@ -1140,6 +1140,12 @@ static void addassistant(Session *s, Arena scratch, Slice<Block> blocks,
 static b32 nudge(Session *s, Arena scratch, i32 kind, Str text)
 {
     i32 cap = nudgeinfo[kind].cap;
+    if (kind == N_EMPTY) {
+        // The model's empty_retries, at most 100
+        Str v = trim(cfgget(s->e->cfg, "model", s->model, "empty_retries", 0));
+        Int n = parseint(v);
+        cap = n.ok && n.val>=0 ? (i32)(n.val<100 ? n.val : 100) : cap;
+    }
     if (s->nudges[kind] >= cap) {
         return 0;
     }

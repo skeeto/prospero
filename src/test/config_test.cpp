@@ -972,6 +972,7 @@ static void testcfgjson(Test *t)
         "model/m/image_edge=*\n"
         "model/m/image_pixels=*\n"
         "model/m/edit_format=replace*\n"
+        "model/m/empty_retries=2*\n"
         "model/m/max_concurrent=*\n"
         "model/m/temperature=*\n"
         "model/m/top_p=*\n"

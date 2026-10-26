@@ -333,6 +333,9 @@ static CfgKey cfgschema[] = {
      "model", "How the model's edit tool changes files: replace (old and "
      "new text), patch (an apply_patch envelope) or hashline (line "
      "numbers checked against a tag that read shows)"},
+    {"model", "empty_retries", CFG_INT, "2", {}, {}, "model",
+     "Times the model is reminded to go on after an empty response, "
+     "before the turn ends; 0 ends it at the first"},
     {"model", "max_concurrent", CFG_INT, "", {}, {}, "capacity",
      "Most requests for this model at once, by default the server's "
      "slots, else 4"},

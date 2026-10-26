@@ -520,6 +520,24 @@ def sc_empty(model, n, req):
         yield from answer(model, "Finally something.")
 
 
+def sc_empty_more(model, n, req):
+    # Three empty responses, which empty_retries = 3 allows
+    if n < 3:
+        yield S.head()
+        yield from finish(model, "stop", completion=1)
+    else:
+        yield from answer(model, "Third time lucky.")
+
+
+def sc_empty_none(model, n, req):
+    # empty_retries = 0: the first empty response ends the turn
+    if n == 0:
+        yield S.head()
+        yield from finish(model, "stop", completion=1)
+    else:
+        yield from answer(model, "Never reached.")
+
+
 def sc_length_think(model, n, req):
     if n == 0:
         yield S.head()
