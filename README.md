@@ -119,6 +119,27 @@ directory against them all at once:
           --jq '.assets[] | .digest[7:] + "  " + .name' |
           sha256sum -c --ignore-missing
 
+### The engines zip
+
+`tools/engines.py --docker --zip` builds every engine and helper into
+one file, `prospero-engines-VERSION.zip`, with Docker, on any machine
+it runs on: the Linux and Windows programs in an image of cross
+compilers that `tools/toolchain/Dockerfile` builds from sources pinned
+by SHA-256 (GCC 16 and binutils as [w64devkit][] has them, musl with
+its security patches, mingw-w64, and Debian 10's glibc 2.28), and the
+macOS engine on the Mac itself. All are optimized for size:
+
+- the Linux engines link musl statically, so they run with any C
+  library, or none;
+- the Linux desktop helpers need glibc 2.28 or later;
+- the Windows engines are the same CRT-free programs as above;
+- the macOS engine, for Apple Silicon, needs macOS 11 or later.
+
+The same sources build the same zip, byte for byte. Its `engines`
+directory goes next to the program, or beside `prospero.ini` (see
+Settings), which suits a macOS app in /Applications, whose signed
+bundle stays as it is. Its README.txt lists the files.
+
 ## Usage
 
     prospero [gui [options]]
@@ -639,11 +660,13 @@ records where it went, for connecting. With `deploy = auto` in its
 section, connecting deploys one when the machine has none; with the
 default, `ask`, a failed connection offers Deploy engine in the Hosts
 pane. Engines come
-from the `engines` directory next to the executable, named
+from the `engines` directory next to the executable, else the one
+beside the default `prospero.ini`, named
 `prospero-engine-VERSION-OS-ARCH`, or are the executable itself when it
 is built for that platform. `tools/engines.py` builds them: macOS
 arm64, Windows x86-64 and i686, and Linux aarch64 and x86-64 (static,
-built on a Linux host given with `--linux HOST`, else left out).
+in the Docker image with `--docker`, or else on a Linux host given
+with `--linux HOST`, else left out).
 A remote whose engine is older than this program shows the operations
 it lacks disabled, and a host's menu has Update engine, which deploys
 this version's engine there and reconnects to it once nothing runs.

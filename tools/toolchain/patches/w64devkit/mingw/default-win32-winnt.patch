@@ -1,0 +1,19 @@
+headers: default 32-bit x86 to Windows XP
+
+The x86_64 multilib toolchain shares one header tree between its 64-bit
+and 32-bit targets. Keep the configured mingw-w64 default for x86_64 and
+other architectures, but preserve w64devkit's Windows XP default when
+the compiler targets i686. An explicit user definition still takes
+precedence through the existing outer guard.
+
+--- a/mingw-w64-headers/crt/_mingw.h.in
++++ b/mingw-w64-headers/crt/_mingw.h.in
+@@ -255,3 +255,7 @@
+ #ifndef _WIN32_WINNT
+-#define _WIN32_WINNT @DEFAULT_WIN32_WINNT@
++# if defined(__i386__)
++#  define _WIN32_WINNT 0x0501
++# else
++#  define _WIN32_WINNT @DEFAULT_WIN32_WINNT@
++# endif
+ #endif
