@@ -18,8 +18,9 @@
 //    variables instead, after a uname of its own (Git's) if it has one,
 //    else with the processor architecture, then ver's version line.
 // 2. Choose prospero-engine-VERSION-OS-ARCH[.exe] from the engines
-//    directory ("engines" next to this executable, else beside the
-//    default prospero.ini, unless given; built by tools/engines.py),
+//    directory (the first with one of "engines" next to this
+//    executable and beside the default prospero.ini, unless given;
+//    built by tools/engines.py),
 //    checked against its .sha256 file. With none
 //    there for the platform, this executable serves when it is built
 //    for that platform.
@@ -558,6 +559,29 @@ static Slice<Str> linkenv(Arena *a, Slice<Str> env, b32 wsl)
     return push(a, r, Str("WSL_UTF8=1"));
 }
 
+// wsl.exe's own messages as UTF-8: an inbox wsl.exe (WSL not installed)
+// writes UTF-16 (little endian) whatever WSL_UTF8 says, as older ones
+// do. Text that does not look like UTF-16, a NUL second, is as it was.
+static Str wslutf8(Arena *a, Str s)
+{
+    b32 bom  = s.len>=2 && s[0]==0xff && s[1]==0xfe;
+    b32 wide = bom || (s.len>=2 && s[0] && !s[1]);
+    if (!wide) {
+        return s;
+    }
+    Buf b(a, s.len/2*3);
+    for (iz i = bom ? 2 : 0; i+1 < s.len; i += 2) {
+        i32 c = s[i] | s[i+1]<<8;
+        c = c>=0xd800 && c<0xe000 ? 0xfffd : c;  // a pair's halves: rare
+        u8  e[4];
+        iz  n = utf8encode(e, c);
+        for (iz k = 0; k < n; k++) {
+            putbyte(&b, e[k]);
+        }
+    }
+    return finish(&b);
+}
+
 struct DeployRun {
     Str out;      // standard output
     Str err;      // standard error
@@ -696,9 +720,9 @@ static DeployRun deployrun(Deploy *d, Arena *a, Slice<Str> argv, i64 timeout,
     }
     os_procfree(os, p);
     r.code = exited && !killed ? code : -1;
-    r.out  = finish(&out);
+    r.out  = wslutf8(a, finish(&out));
     Read rd = os_read(os, a, d->errpath, 1<<16);
-    r.err = rd.err==READ_OK ? rd.data : Str{};
+    r.err = rd.err==READ_OK ? wslutf8(a, rd.data) : Str{};
     return r;
 }
 
@@ -715,15 +739,17 @@ static b32 hasline(Str out, Str word)
     return 0;
 }
 
-// The last line of some output, for messages, but for wsl.exe's own
-// "Error code: Wsl/..." after its message.
+// The last line of some output, for messages, but for what wsl.exe
+// writes after its message: "Error code: Wsl/...", or where to read
+// more.
 static Str lastsaid(Str out)
 {
     Str last = {};
     for (Str rest = out; rest.len;) {
         Cut l = cut(rest, '\n');
         Str t = trim(l.head);
-        if (t.len && !startswith(t, "Error code: Wsl/")) last = t;
+        if (t.len && !startswith(t, "Error code: Wsl/") &&
+                !startswith(t, "For more information")) last = t;
         rest = l.tail;
     }
     return last;
@@ -748,6 +774,7 @@ static b32 deploypermanent(DeployRun *r)
            find(err, "Name or service not known")>=0 ||
            find(err, "No such file or directory")>=0 ||
            find(out, "Error code: Wsl/")>=0 ||
+           find(err, "Windows Subsystem for Linux is not installed")>=0 ||
            find(err, "cannot run ")>=0;
 }
 
@@ -848,21 +875,24 @@ struct DeployFile {
     b32 self;   // it is self, not from dir
 };
 
-// The engines directory, unless given: "engines" next to this program,
-// else "engines" in the configuration directory, beside prospero.ini,
-// where the release's engines zip unpacks wherever the program lives:
-// a macOS app in /Applications, say, whose bundle stays as signed.
-static Str enginesdir(Os *os, Arena *a, Str exe)
+// The engines directories, unless given, in the order they are looked
+// in: "engines" next to this program, then "engines" in the
+// configuration directory, beside prospero.ini, where the release's
+// engines zip unpacks wherever the program lives: a macOS app in
+// /Applications, say, whose bundle stays as signed. Each platform's
+// engine comes from the first that has one.
+static Slice<Str> enginesdirs(Os *os, Arena *a, Str exe)
 {
-    Str here = join(a, parentdir(exe), "engines");
-    Str cfg  = cfgdefault(os, a);
-    if (cfg.len && os_stat(os, *a, here).type!=STAT_DIR) {
+    Slice<Str> r   = {};
+    Str        cfg = cfgdefault(os, a);
+    r = push(a, r, join(a, parentdir(exe), "engines"));
+    if (cfg.len) {
         Str there = join(a, parentdir(cfg), "engines");
-        if (os_stat(os, *a, there).type == STAT_DIR) {
-            return there;
+        if (there!=r[0] && os_stat(os, *a, there).type==STAT_DIR) {
+            r = push(a, r, there);
         }
     }
-    return here;
+    return r;
 }
 
 // Read a program to upload, from dir/file, or else from self when it
@@ -1143,23 +1173,39 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     Str ext  = win ? Str(".exe") : Str("");
     Str exe  = os_exepath(os, &scratch);
     Str self = pf.name==deployself() ? exe : Str{};  // this program serves
-    Str from = conf->engines.len ? conf->engines : enginesdir(os, &scratch, exe);
+    Slice<Str> dirs = {};
+    dirs = conf->engines.len ? push(&scratch, dirs, conf->engines)
+                             : enginesdirs(os, &scratch, exe);
     DeployNames names = deploynames(&scratch, pf.name, ext);
 
-    DeployFile eng = {};
-    eng.what = "engine";
-    eng.prog = "prospero";
-    Str err  = deployread(os, &scratch, &eng, from, names.engine, self, names.rengine,
-                          pf.shell);
+    // The engine from the first directory with one, else this program
+    // when it serves; its helper from the same place
+    DeployFile eng  = {};
+    Str        from = {};
+    Str        err  = {};
+    eng.err = READ_NOTFOUND;
+    for (iz i = 0; i<dirs.len && eng.err==READ_NOTFOUND; i++) {
+        eng      = {};
+        eng.what = "engine";
+        eng.prog = "prospero";
+        from     = dirs[i];
+        err      = deployread(os, &scratch, &eng, from, names.engine,
+                              i+1==dirs.len ? self : Str{}, names.rengine, pf.shell);
+    }
     if (eng.err == READ_NOTFOUND) {
-        b = Buf(&scratch, 256);
+        b = Buf(&scratch, 512);
         print(&b, "no engine for ");
         print(&b, pf.name);
         print(&b, " (");
         print(&b, pf.about);
         print(&b, "): ");
-        print(&b, join(&scratch, from, names.engine));
-        print(&b, " is missing (tools/engines.py builds it)");
+        print(&b, names.engine);
+        print(&b, " is in neither ");
+        for (iz i = 0; i < dirs.len; i++) {
+            print(&b, i ? Str(" nor ") : Str(""));
+            print(&b, dirs[i]);
+        }
+        print(&b, " (tools/engines.py builds it)");
         return deployfail(&d, perm, scratch, finish(&b));
     } else if (err.len) {
         return deployfail(&d, perm, scratch, err);
@@ -1268,18 +1314,8 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
 // as WSL allows.
 static Slice<Str> wsldistros(Arena *a, Str out)
 {
-    b32 bom  = out.len>=2 && out[0]==0xff && out[1]==0xfe;
-    b32 wide = bom || (out.len>=2 && out[1]==0);
-    Buf b(a, out.len);
-    for (iz i = bom ? 2 : 0; i < out.len; i += wide ? 2 : 1) {
-        u8 c = out[i];
-        if (wide && (i+1==out.len || out[i+1])) {
-            c = 0x80;  // beyond ASCII: no plain name
-        }
-        putbyte(&b, c);
-    }
     Slice<Str> r = {};
-    for (Str rest = finish(&b); rest.len;) {
+    for (Str rest = wslutf8(a, out); rest.len;) {
         Cut l    = cut(rest, '\n');
         Str name = trim(l.head);
         rest = l.tail;

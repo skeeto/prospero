@@ -666,8 +666,8 @@ records where it went, for connecting. With `deploy = auto` in its
 section, connecting deploys one when the machine has none; with the
 default, `ask`, a failed connection offers Deploy engine in the Hosts
 pane. Engines come
-from the `engines` directory next to the executable, else the one
-beside the default `prospero.ini`, named
+from the `engines` directory next to the executable, or when it has
+none for the platform, the one beside the default `prospero.ini`, named
 `prospero-engine-VERSION-OS-ARCH`, or are the executable itself when it
 is built for that platform. `tools/engines.py` builds them: macOS
 arm64, Windows x86-64 and i686, and Linux aarch64 and x86-64 (static,
@@ -692,10 +692,12 @@ that cannot be put there, or does not run there, is only a warning.
 ## Windows notes
 
 The GUI build's `prospero.exe` is a GUI program, so at an interactive
-cmd or PowerShell prompt it prints nothing and the prompt returns at
-once. Pipe or redirect its output instead: `prospero --version | more`,
-or `prospero --version >out.txt`. Over ssh and in scripts it works as
-usual, and it serves as the headless engine there too. The headless
+cmd or PowerShell prompt the prompt returns at once, without waiting
+for a command such as `prospero deploy`: its messages still show in
+that console, after the prompt, but its exit status is lost. Pipe or
+redirect its output to wait for it: `prospero deploy pi | more`, or in
+PowerShell `prospero deploy pi | Out-Host`. Over ssh and in scripts it
+works as usual, and it serves as the headless engine there too. The headless
 build (`-DPROSPERO_GUI=OFF`), which is the XP engine and the engine
 deployed to Windows machines, is a console program, and works as usual
 at a prompt as well.

@@ -433,6 +433,19 @@ def config_engines(t):
     p = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=t.env)
     t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
     t.check(sha256(t.deployed()) == sha256(src), "the engine beside prospero.ini is there")
+    # An engines directory next to the program without this platform's
+    # engine: the one beside prospero.ini still serves, and where neither
+    # has one (nor is this program built for it), the failure names both
+    os.makedirs(os.path.join(bindir, "engines"))
+    q = subprocess.run(argv + ["--force"], capture_output=True, text=True, timeout=120,
+                       env=t.env)
+    t.check(q.returncode == 0, f"exit {q.returncode}: {q.stderr}")
+    q = subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                       env=dict(t.env, FAKEUNAME="Linux sparc64"))
+    said = q.stderr.replace("\\", "/")  # Windows' paths, joined with /
+    t.check(q.returncode != 0 and "is in neither" in said and
+            os.path.join(bindir, "engines").replace("\\", "/") in said and
+            there.replace("\\", "/") in said, f"neither: {q.stderr}")
 
 
 @scenario

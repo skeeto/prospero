@@ -63,8 +63,8 @@ left out of the sidebar until connected.
 The remote machine needs Prospero built for it. `prospero deploy NAME`
 uploads an engine with scp to `~/.prospero` there, and records where
 it went, for connecting. Engines come from an `engines` directory next
-to the executable, else from one beside `prospero.ini` (Settings shows
-where), as releases name them, or are the executable itself when it
+to the executable, or from one beside `prospero.ini` (Settings shows
+where) when the first has none for the platform, as releases name them, or are the executable itself when it
 is built for that platform. The engines zip (`tools/engines.py --zip`)
 unpacks into either place. With `deploy = auto` in the
 remote's section, connecting deploys one when the machine has none.

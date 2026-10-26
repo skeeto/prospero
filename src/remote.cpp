@@ -470,14 +470,8 @@ static b32 remotestart(Remote *r, Arena scratch)
 // The last line ssh wrote to its log, if any, as why it ended.
 static Str remotesshsaid(Remote *r, Arena *a)
 {
-    Read rd   = os_read(r->os, a, remotelog(r, a), 1<<16);
-    Str  last = {};
-    for (Str rest = rd.data; rest.len;) {
-        Cut l = cut(rest, '\n');
-        if (trim(l.head).len) last = trim(l.head);
-        rest = l.tail;
-    }
-    return last;
+    Read rd = os_read(r->os, a, remotelog(r, a), 1<<16);
+    return lastsaid(wslutf8(a, rd.data));  // wsl.exe's may be UTF-16
 }
 
 // Stop the current stream, if any; its late records are ignored.
@@ -919,7 +913,7 @@ static void remoteframes(Remote *r, Arena scratch, Str data)
         // wsl.exe's own failure, on its output: no such distro, say,
         // which no second try fixes
         remotestop(r, 1);
-        r->why = concat(&r->perm, "wsl: ", lastsaid(raw));
+        r->why = concat(&r->perm, "wsl: ", lastsaid(wslutf8(&scratch, raw)));
         remoteend(r, scratch, RS_FAILED, r->why);
     } else if (r->dec.bad) {
         remotedown(r, scratch, "garbage on the stream", -1);
@@ -1035,6 +1029,12 @@ static void remotethread(void *arg)
                     i32  need = ours ? remoteneed(log.data, code) : NEED_NONE;
                     if (need) {
                         remoteneeded(r, a, need, remotesshsaid(r, &a));
+                    } else if (r->conf.wsl.len &&
+                               find(why, "Linux is not installed")>=0) {
+                        // No WSL here, which no second try fixes
+                        remotestop(r, 1);
+                        r->why = concat(&r->perm, "wsl: ", why);
+                        remoteend(r, a, RS_FAILED, r->why);
                     } else {
                         remotedown(r, a, why, code);
                     }

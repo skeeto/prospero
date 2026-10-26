@@ -334,3 +334,31 @@ static void test_deploywsl(Test *t)
     expect(t, "deploy.wsl.hostsnone", showhosts(&a, wslhosts(&a, distros, {})),
            "Debian=Debian Ubuntu=Ubuntu Arch=Arch Fedora=Fedora");
 }
+
+// wsl.exe's own messages: UTF-16 from an inbox wsl.exe, whatever
+// WSL_UTF8 says, and the line worth showing
+static void test_deploywslsaid(Test *t)
+{
+    Arena a   = t->perm;
+    Str   msg = "The Windows Subsystem for Linux is not installed.\r\n"
+                "For more information please visit https://aka.ms/wslinstall\r\n";
+    Buf   b(&a, 512);
+    for (iz i = 0; i < msg.len; i++) {
+        putbyte(&b, msg[i]);
+        putbyte(&b, 0);
+    }
+    Str wide = finish(&b);
+    expect(t, "deploy.wslutf8", wslutf8(&a, wide), msg);
+    expect(t, "deploy.wslutf8.same", wslutf8(&a, msg), msg);
+    Buf bom(&a, 4);
+    putbyte(&bom, 0xff);
+    putbyte(&bom, 0xfe);
+    putbyte(&bom, 'A');
+    putbyte(&bom, 0);
+    expect(t, "deploy.wslutf8.bom", wslutf8(&a, finish(&bom)), "A");
+    expect(t, "deploy.wslsaid", lastsaid(wslutf8(&a, wide)),
+           "The Windows Subsystem for Linux is not installed.");
+    DeployRun r = {};
+    r.err = msg;
+    expect(t, "deploy.wslpermanent", deploypermanent(&r) ? Str("yes") : Str("no"), "yes");
+}

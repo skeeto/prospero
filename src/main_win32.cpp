@@ -3260,6 +3260,31 @@ static void os_httpfree(Os *, Http *h)
 #endif
 
 
+#if PROSPERO_GUI
+// A GUI program run as a command at a console prompt has no standard
+// output or error, so its messages would go nowhere: use its parent's
+// console for those it lacks, as ctrlbreak does. The prompt has not
+// waited for it, so they come after it. Redirected ones stay.
+static void guiconsole(Os *os)
+{
+    b32 attached = 0;
+    for (i32 fd = 1; fd < 3; fd++) {
+        uz h = os->std[fd];
+        if (h && h!=INVALID_HANDLE_VALUE && GetFileType(h)) {
+            continue;
+        } else if (!attached && !(attached = AttachConsole(ATTACH_PARENT_PROCESS))) {
+            return;  // none: started from a desktop, say
+        }
+        h = CreateFileW((c16 *)u"CONOUT$", GENERIC_READ|GENERIC_WRITE, FILE_SHARE_ALL,
+                        0, OPEN_EXISTING, 0, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            os->std[fd] = h;
+            SetStdHandle(-10 - fd, h);
+        }
+    }
+}
+#endif
+
 // The desktop helper, "prospero desktop" (deskwin32.cpp), which never returns
 extern "C" [[noreturn]] void prospero_desktop();
 
@@ -3308,6 +3333,7 @@ void mainCRTStartup()
     if (guiwanted(args.data, (i32)args.len)) {
         ExitProcess(gui_main(&os, a, args.data, (i32)args.len));
     }
+    guiconsole(&os);
     #endif
     ExitProcess(app_main(&os, a, args.data, (i32)args.len));
 }
