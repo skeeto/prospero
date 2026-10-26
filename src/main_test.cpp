@@ -593,6 +593,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/instructions_test.cpp"
 #include "test/skills_test.cpp"
 #include "test/config_test.cpp"
+#include "test/mcp_test.cpp"
 #include "test/engine_test.cpp"  // after config's test platform
 #include "test/deploy_test.cpp"
 #include "test/eval_test.cpp"
@@ -660,6 +661,7 @@ int main()
     test_skills(&t);
     test_engine(&t);
     test_config(&t);
+    test_mcp(&t);
     test_deploy(&t);
     test_deploywsl(&t);
     test_deploywslsaid(&t);

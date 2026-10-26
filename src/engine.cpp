@@ -149,11 +149,12 @@ enum : i32 {
     S_ASK,       // waiting for the user to answer an ask
     S_QUEUED,    // waiting for its turn at the endpoint
     S_TASK,      // waiting for subagents to report
+    S_MCP,       // waiting for MCP servers to start, before a request
 };
 
 static Str statenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "queued", "task",
+    "ask", "queued", "task", "mcp",
 };
 
 enum : i32 {
@@ -432,6 +433,7 @@ struct Ask {
     b32       gwrite;   // and for writes too, not only reads
     i32       gclass;   // a desktop ask's DESKC_*, with grant its name
     u64       plansum;  // a plan's: the hash of the text put to the user
+    b32       mcp;      // an MCP tool's, its name in grant
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
@@ -439,9 +441,16 @@ struct Ask {
 // or a class of desktop actions, in the session and every session of
 // its tree (see "Grants").
 struct Grant {
-    Str path;   // null for a desktop grant
+    Str path;   // null for a desktop or MCP grant
     b32 write;
     u32 desk;   // a desktop grant's class, as its bit (1<<DESKC_*)
+    Str mcp;    // an MCP tool's name (mcp__SERVER__TOOL)
+};
+
+// An image converted for a request (topng).
+struct Converted {
+    Str png;  // null on failure
+    Str err;
 };
 
 // A summary compaction under way (REQ_COMPACT).
@@ -649,6 +658,14 @@ struct Session {
     b32          nofolder;   // works in a folder of its own, sessions/SID/work,
                              // not a project's (new {nofolder})
     b32          forget;     // closed: drop it from memory once idle
+    // MCP servers (see "MCP servers")
+    Slice<McpTool>    mcptools;   // offered, as its prefix has them
+    Slice<McpServer *> mcpsrvs;   // the servers it offers
+    Str          mcpfilter;  // its role's tools, null for every MCP tool
+    b32          mcpfixed;   // its tools were fixed by a request
+    Slice<Str>   mcpwarned;  // servers whose failure it was told
+    McpServer   *mcpsrv;     // the server of the call running, if MCP's
+    i64          mcpcall;    // that call's request id, -1 until it is sent
 };
 
 // One endpoint's listing for the models command (cmdmodels).
@@ -715,6 +732,7 @@ struct Engine {
     Slice<Str>  tempdirs; // the system's (os_tempdirs), for [guard] temp
     Str         scratchbase;  // os_scratchdir, null until made
     Lister     *listers;  // models commands at work
+    McpServer  *mcp;      // MCP servers, running or not (see "MCP servers")
 };
 
 
@@ -1685,6 +1703,7 @@ static b32  taskbudget(Session *, Arena);
 static b32  taskwake(Session *);
 static i64  parkafter(Engine *);
 static b32  deskrun(Session *, Arena, DeskArgs *);
+static void mcpresolve(Session *, Arena, b32 allow, i32 by, Str note, i64 wait);
 static Str  deskdenial(Arena *, i32 by, Str note, i64 wait);
 static Slice<Msg> deskimages(Session *, Arena *);
 static void toolsessions(Session *, Arena);
@@ -3602,7 +3621,10 @@ static b32 hasgrant(Session *s, Grant want)
     }
     for (iz i = 0; i < s->grants.len; i++) {
         Grant *g = &s->grants[i];
-        if (!g->desk && g->path==want.path && (g->write || !want.write)) {
+        if (want.mcp.len && g->mcp==want.mcp) {
+            return 1;
+        } else if (!want.mcp.len && !g->desk && !g->mcp.len && g->path==want.path &&
+                   (g->write || !want.write)) {
             return 1;
         }
     }
@@ -3615,7 +3637,7 @@ static void guardgrants(Session *s, Arena *perm, Guard *g)
     for (iz i = 0; i < s->grants.len; i++) {
         Grant *t     = &s->grants[i];
         i32    flags = ROOT_HIDDEN | ROOT_MISSING | (t->write ? 0 : ROOT_READ);
-        if (!t->desk) {
+        if (!t->desk && !t->mcp.len) {
             guardadd(s->e->os, perm, g, t->path, flags);
         }
     }
@@ -3628,9 +3650,10 @@ static b32 addgrant(Session *s, Grant g)
     if (hasgrant(s, g)) {
         return 0;
     }
-    g.path = g.desk ? Str{} : clone(&s->perm, g.path);
+    g.path = g.desk || g.mcp.len ? Str{} : clone(&s->perm, g.path);
+    g.mcp  = g.mcp.len ? clone(&s->perm, g.mcp) : Str{};
     s->grants = push(&s->perm, s->grants, g);
-    if (!g.desk) {
+    if (!g.desk && !g.mcp.len) {
         i32 flags = ROOT_HIDDEN | ROOT_MISSING | (g.write ? 0 : ROOT_READ);
         guardadd(s->e->os, &s->perm, &s->guard, g.path, flags);
     }
@@ -3643,7 +3666,10 @@ static Grant grantof(Json *j)
 {
     Grant g = {};
     Str   d = jsonstr(jsonget(j, "desktop"));
-    if (d.data) {
+    Str   m = jsonstr(jsonget(j, "mcp"));
+    if (m.len) {
+        g.mcp = m;
+    } else if (d.data) {
         i32 c = deskclassfind(d);
         g.desk = c>=0 && deskcovers(c) ? 1u<<c : 0;
     } else {
@@ -3673,7 +3699,9 @@ static void loggrant(Session *s, Arena scratch, Grant g, Str by, Str req, Str fr
     }
     Buf   b(&scratch, 256 + g.path.len + req.len + from.len);
     EvOut w = sbegin(s, &b, EV_GRANT);
-    if (g.desk) {
+    if (g.mcp.len) {
+        putstrkey(&w.json, "mcp", g.mcp);
+    } else if (g.desk) {
         putstrkey(&w.json, "desktop", grantclass(g));
     } else {
         putstrkey(&w.json, "path", g.path);
@@ -3759,7 +3787,9 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
     }
     if (allow && always && k->grant.len) {
         Grant g = {};
-        if (k->tool == TOOL_DESKTOP) {
+        if (k->mcp) {
+            g.mcp   = k->grant;
+        } else if (k->tool == TOOL_DESKTOP) {
             g.desk  = 1u << k->gclass;
         } else {
             g.path  = k->grant;
@@ -3773,6 +3803,10 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         return;
     }
     toolstart(s, scratch);
+    if (k->mcp) {
+        mcpresolve(s, scratch, allow, by, note, (t - k->opened + SEC/2) / SEC);
+        return;
+    }
     if (allow && k->tool==TOOL_DESKTOP) {
         Args args = parseargs(&scratch, k->tool, c->args, s->te.edit);
         deskrun(s, scratch, &args.desk);  // which may go on
@@ -6058,12 +6092,1118 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
 
 // Run one call. Returns 1 if it finished, 0 if it goes on (a command or
 // a search, or an ask waiting for the user).
+// MCP servers (mcp.cpp)
+//
+// The engine keeps every server it started in e->mcp, by name and
+// working directory, whether running or not, so that the sessions that
+// offer it share it. A server starts when a session that offers it is
+// about to make a request, and stops a minute after the last session
+// in memory that offers it is gone (parked, forgotten, or closed and
+// idle): its standard input closed, asked to stop 2 s later, killed
+// 5 s after that. One that fails, or exits, fails the calls waiting on
+// it with the end of what it wrote to standard error, and starts again
+// for the next call that needs it, at most every 30 s (both times
+// follow e->minute, which tests shorten).
+
+enum : i64 {
+    MCP_SOFT   = 2*SEC,    // standard input closed, then asked to stop
+    MCP_HARD   = 5*SEC,    // then killed
+    MCP_REGION = (i64)1 << (sizeof(void *)==8 ? 28 : 26),
+};
+
+// Where a server runs for a session: its section's cwd, from the
+// session's folder or the home directory, else the session's folder.
+static Str mcpcwd(Session *s, Arena *a, Str name)
+{
+    Engine *e   = s->e;
+    Str     dir = trim(cfgget(e->cfg, "mcp", name, "cwd", 0));
+    if (!dir.len) {
+        return s->cwd;
+    }
+    dir = expandhome(a, dir, e->home, s->te.windows);
+    return normpath(a, s->cwd, dir, s->te.windows);
+}
+
+static Str       findpath(Os *, Arena *, Arena, Str path, Str name, b32 win);
+static Session  *findsession(Engine *, Str sid);
+static Converted topng(Os *, Arena *, Str data, b32 big, i64 edge, i64 pixels);
+static iz        base64len(iz n);
+
+static McpServer *mcpfind(Engine *e, Str name, Str cwd)
+{
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->name==name && m->cwd==cwd) {
+            return m;
+        }
+    }
+    return 0;
+}
+
+static McpServer *mcpbyproc(Engine *e, u64 id)
+{
+    for (McpServer *m = e->mcp; id && m; m = m->next) {
+        if (m->procid == id) {
+            return m;
+        }
+    }
+    return 0;
+}
+
+// The servers of the configuration a new session may offer: enabled,
+// with a command, in its order.
+static Slice<Str> mcpnames(Engine *e, Arena *a)
+{
+    Slice<Str> r = {};
+    for (IniSection *t = inifirst(e->ini, "mcp"); t; t = ininext(t)) {
+        Str name = t->name;
+        if (name.len && cfgbool(trim(cfgget(e->cfg, "mcp", name, "enabled", 0)))!=0 &&
+                trim(cfgget(e->cfg, "mcp", name, "command", 0)).len) {
+            r = push(a, r, name);
+        }
+    }
+    return r;
+}
+
+// Whether a session's filter could offer any tool of a server: every
+// tool, its whole server, or one of its tools.
+static b32 mcpanyallowed(Str filter, Str server)
+{
+    if (!filter.data) {
+        return 1;
+    }
+    for (Str rest = filter; rest.len;) {
+        iz i = 0;
+        for (; i<rest.len && (whitespace(rest[i]) || rest[i]==','); i++) {}
+        rest = cuthead(rest, i);
+        for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
+        Str w = takehead(rest, i);
+        rest  = cuthead(rest, i);
+        if (w == "*") {
+            return 1;
+        } else if (!startswith(w, "mcp__")) {
+            continue;
+        }
+        Str name = cuthead(w, 5);
+        iz  at   = find(name, "__");
+        name = at<0 ? name : takehead(name, at);
+        b32 same = name.len == server.len;
+        for (iz k = 0; same && k<name.len; k++) {
+            u8 x = server[k];
+            same = name[k] == (alnum(x) || x=='_' || x=='-' ? x : (u8)'_');
+        }
+        if (same) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The tail of a server's standard error, for messages, or null.
+static Str mcplogtail(Engine *e, Arena *a, McpServer *m)
+{
+    Read rd = os_read(e->os, a, m->log, 1<<20);
+    if (rd.err != READ_OK) {
+        return {};
+    }
+    Str t = trim(rd.data);
+    if (t.len > MCP_ERRTAIL) {
+        iz cut = t.len - MCP_ERRTAIL;
+        for (; cut<t.len && (t[cut]&0xc0)==0x80; cut++) {}
+        t = concat(a, "...", cuthead(t, cut));
+    }
+    return t;
+}
+
+static void mcpcallfail(Engine *e, Arena scratch, McpPending *p, Str why);
+
+// Stop a server: its input closed, so that it ends by itself, and the
+// kills to follow (mcptick). The calls waiting on it fail with why.
+static void mcpstop(Engine *e, Arena scratch, McpServer *m, Str why)
+{
+    Slice<McpPending> pend = m->pending;
+    m->pending = {};
+    for (iz i = 0; i < pend.len; i++) {
+        if (pend[i].kind == MCPREQ_CALL) {
+            mcpcallfail(e, scratch, &pend[i], why);
+        }
+    }
+    if (m->proc && !m->stopping) {
+        os_procwrite(e->os, m->proc, {});
+        m->stopping  = 1;
+        m->killstage = 0;
+        m->killat    = os_ticks(e->os) + MCP_SOFT;
+    }
+    if (m->state != MCP_FAILED) {
+        m->state = MCP_STOPPED;
+    }
+}
+
+// Let a stopped server's process go.
+static void mcpfree(Engine *e, McpServer *m)
+{
+    if (m->proc) {
+        os_kill(e->os, m->proc, 1);
+        os_procfree(e->os, m->proc);
+    }
+    m->proc     = 0;
+    m->procid   = 0;
+    m->stopping  = 0;
+    m->killstage = 0;
+    m->killat    = 0;
+}
+
+static void mcpwake(Engine *e, Arena scratch, McpServer *m);
+
+// A server failed: why, with what it wrote to standard error.
+static void mcpfail(Engine *e, Arena scratch, McpServer *m, Str why)
+{
+    Str  tail = mcplogtail(e, &scratch, m);
+    Buf  b(&scratch, 256 + why.len + tail.len);
+    print(&b, why);
+    if (tail.len) {
+        print(&b, ". It said: ");
+        print(&b, tail);
+    }
+    m->state   = MCP_FAILED;
+    m->err     = clone(&e->perm, finish(&b));
+    m->retryat = os_ticks(e->os) + e->minute/2;
+    Str told = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
+                      concat(&scratch, " failed: ", m->err));
+    mcpstop(e, scratch, m, told);
+    mcpwake(e, scratch, m);
+}
+
+// Send a request (id nonzero) or notification. 0 if it could not go.
+static b32 mcpsend(Engine *e, Arena scratch, McpServer *m, i64 id, Str method, Str params)
+{
+    if (!m->proc || m->stopping) {
+        return 0;
+    }
+    return os_procwrite(e->os, m->proc, mcpmessage(&scratch, id, method, params));
+}
+
+// A request awaiting its response, by kind.
+static i64 mcprequest(Engine *e, Arena scratch, McpServer *m, i32 kind, Str method,
+                      Str params, Str sid = {}, Str call = {})
+{
+    McpPending p = {};
+    p.id   = ++m->nextid;
+    p.kind = kind;
+    p.sid  = sid.len ? clone(&m->arena, sid) : Str{};
+    p.call = call.len ? clone(&m->arena, call) : Str{};
+    if (!mcpsend(e, scratch, m, p.id, method, params)) {
+        return 0;
+    }
+    m->pending = push(&m->arena, m->pending, p);
+    return p.id;
+}
+
+// A server's settings as the configuration has them now.
+static void mcpconf(Engine *e, McpServer *m)
+{
+    Config *c  = e->cfg;
+    m->trust   = cfgbool(trim(cfgget(c, "mcp", m->name, "trust", 0))) == 1;
+    m->startms = cfgms(c, "mcp", m->name, "startup_timeout", 0);
+    m->callms  = cfgms(c, "mcp", m->name, "timeout", 0);
+    m->config  = inisection(e->ini, "mcp", m->name) != 0;
+}
+
+// Start a server: its command, its environment, then initialize. A
+// failure to start fails it at once.
+static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
+{
+    if (!m->mem) {
+        m->mem = os_reserve(e->os, MCP_REGION);
+        if (!m->mem) {
+            m->state = MCP_FAILED;
+            m->err   = "out of memory";
+            return;
+        }
+    }
+    mcpfree(e, m);
+    m->arena    = newarena(m->mem);
+    m->in       = Buf(&m->arena, 1<<14);
+    m->pending  = {};
+    m->tools    = {};
+    m->instr    = {};
+    m->version  = {};
+    m->cursor   = {};
+    m->pages    = 0;
+    m->err      = {};
+    m->state    = MCP_STARTING;
+    mcpconf(e, m);
+    Str only    = trim(cfgget(e->cfg, "mcp", m->name, "tools", 0));
+    m->only     = only.len ? clone(&m->arena, only) : Str{};
+    i64 now     = os_ticks(e->os);
+    m->startedat = now;
+    m->readyby  = now + m->startms*MS;
+    m->lastuse  = now;
+
+    Config  *c    = e->cfg;
+    b32      win  = s->te.windows;
+    McpWords w    = mcpwords(&m->arena, trim(cfgget(c, "mcp", m->name, "command", 0)));
+    if (w.err.len) {
+        m->state   = MCP_FAILED;
+        m->err     = concat(&e->perm, "its command cannot be split into words: ", w.err);
+        m->retryat = now + e->minute/2;
+        return;
+    }
+    Slice<Str> env = engineenv(e, &scratch, win);
+    for (IniEntry *k = inisection(e->ini, "mcp", m->name)
+                       ? inisection(e->ini, "mcp", m->name)->keys : 0; k; k = k->next) {
+        if (!startswith(k->key, "env.") || k->key.len<5) {
+            continue;
+        }
+        Str v = trim(k->value);
+        if (startswith(v, "env:")) {
+            v = os_getenv(e->os, &scratch, trim(cuthead(v, 4)));
+        }
+        env = push(&scratch, env, concat(&scratch, concat(&scratch, cuthead(k->key, 4), "="), v));
+    }
+
+    // On Windows a name with no extension that is no .exe is tried as
+    // .cmd and .bat, as npx is npx.cmd, which run through cmd.exe
+    Slice<Str> argv = w.words;
+    if (HOST_WINDOWS && find(argv[0], "/")<0 && find(argv[0], "\\")<0 &&
+            find(argv[0], ".")<0) {
+        Str path = envpath(env, 1);
+        if (!findpath(e->os, &scratch, scratch, path, concat(&scratch, argv[0], ".exe"), 1).len) {
+            Str script = findpath(e->os, &scratch, scratch, path, concat(&scratch, argv[0], ".cmd"), 1);
+            script = script.len ? script : findpath(e->os, &scratch, scratch, path,
+                                                    concat(&scratch, argv[0], ".bat"), 1);
+            if (script.len) {
+                for (iz i = 1; i < argv.len; i++) {
+                    Str bad = mcpcmdbad(argv[i]);
+                    if (bad.len) {
+                        m->state   = MCP_FAILED;
+                        m->err     = clone(&e->perm, bad);
+                        m->retryat = now + e->minute/2;
+                        return;
+                    }
+                }
+                Str comspec = os_getenv(e->os, &scratch, "COMSPEC");
+                Slice<Str> cmd = {};
+                cmd = push(&scratch, cmd, comspec.len ? comspec : Str("cmd.exe"));
+                cmd = push(&scratch, cmd, Str("/d"));
+                cmd = push(&scratch, cmd, Str("/s"));
+                cmd = push(&scratch, cmd, Str("/c"));
+                cmd = push(&scratch, cmd, script);
+                for (iz i = 1; i < argv.len; i++) {
+                    cmd = push(&scratch, cmd, argv[i]);
+                }
+                argv = cmd;
+            }
+        }
+    }
+
+    Str logdir = join(&scratch, e->statedir, "mcp");
+    logdir     = join(&scratch, logdir, "logs");
+    os_mkdirs(e->os, scratch, logdir);
+    Buf lb(&scratch, 128);
+    print(&lb, mcpident(&scratch, m->name));
+    putbyte(&lb, '-');
+    printhex(&lb, hash(m->cwd), 8);
+    print(&lb, ".log");
+    m->log = clone(&e->perm, join(&scratch, logdir, finish(&lb)));
+    os_write(e->os, scratch, m->log, {});  // this start's only
+
+    Spawn sp = {};
+    sp.argv      = argv;
+    sp.cwd       = m->cwd;
+    sp.env       = env;
+    sp.outpath   = m->log;
+    sp.mbox      = e->in;
+    sp.id        = m->procid = ++e->nextid;
+    sp.breakaway = 1;
+    m->proc = os_spawnio(e->os, &sp, scratch);
+    if (!m->proc) {
+        m->procid  = 0;
+        m->state   = MCP_FAILED;
+        m->err     = concat(&e->perm, "its command could not be started: ",
+                            os_lasterr(e->os, &scratch));
+        m->retryat = now + e->minute/2;
+        return;
+    }
+    Str init = mcpinitparams(&scratch);
+    if (!mcprequest(e, scratch, m, MCPREQ_INIT, "initialize", init)) {
+        mcpfail(e, scratch, m, "it did not take its first message");
+    }
+}
+
+// A server for a session, by name: started if it is not running and may
+// be. Null if the configuration has no such server.
+static McpServer *mcpserver(Session *s, Arena scratch, Str name)
+{
+    Engine    *e   = s->e;
+    Str        cwd = mcpcwd(s, &scratch, name);
+    McpServer *m   = mcpfind(e, name, cwd);
+    if (!m) {
+        if (!trim(cfgget(e->cfg, "mcp", name, "command", 0)).len) {
+            return 0;
+        }
+        m = alloc<McpServer>(&e->perm);
+        m->name = clone(&e->perm, name);
+        m->cwd  = clone(&e->perm, cwd);
+        m->next = e->mcp;
+        e->mcp  = m;
+    }
+    i64 now = os_ticks(e->os);
+    m->lastuse = now;
+    if ((m->state==MCP_STOPPED || (m->state==MCP_FAILED && now>=m->retryat)) &&
+            !s->readonly) {
+        mcpstart(e, scratch, m, s);
+    }
+    return m;
+}
+
+// The servers a session offers: those of its tools, and the
+// configuration's that its role may use. Started where they may be.
+static void mcpoffer(Session *s, Arena scratch)
+{
+    Engine    *e     = s->e;
+    Slice<Str> names = mcpnames(e, &scratch);
+    for (iz i = 0; i < s->mcptools.len; i++) {
+        names = push(&scratch, names, s->mcptools[i].server);
+    }
+    for (iz i = 0; i < names.len; i++) {
+        if (!mcpanyallowed(s->mcpfilter, names[i])) {
+            continue;
+        }
+        McpServer *m = mcpserver(s, scratch, names[i]);
+        b32        have = !m;
+        for (iz k = 0; m && k < s->mcpsrvs.len; k++) {
+            have |= s->mcpsrvs[k] == m;
+        }
+        if (!have) {
+            s->mcpsrvs = push(&s->perm, s->mcpsrvs, m);
+        }
+    }
+}
+
+static McpTool *mcptoolof(Session *s, Str name)
+{
+    for (iz i = 0; i < s->mcptools.len; i++) {
+        if (s->mcptools[i].name == name) {
+            return &s->mcptools[i];
+        }
+    }
+    return 0;
+}
+
+static McpServer *mcpsrvof(Session *s, Str server)
+{
+    for (iz i = 0; i < s->mcpsrvs.len; i++) {
+        if (s->mcpsrvs[i]->name == server) {
+            return s->mcpsrvs[i];
+        }
+    }
+    return 0;
+}
+
+static void logprefix(Session *, Arena);
+
+// Before a request: the session's servers started, and while its tools
+// are not fixed, waited for (S_MCP) until each is ready or failed. Then
+// the tools of those ready that it lacks join its prefix, logged anew.
+// Returns 0 while it waits: mcpwake goes on, through prepare.
+static b32 mcpgate(Session *s, Arena scratch)
+{
+    if (s->readonly) {
+        return 1;
+    }
+    mcpoffer(s, scratch);
+    if (!s->mcpfixed) {
+        for (iz i = 0; i < s->mcpsrvs.len; i++) {
+            i32 st = s->mcpsrvs[i]->state;
+            if (st==MCP_STARTING || st==MCP_LISTING) {
+                setstate(s, S_MCP);
+                return 0;
+            }
+        }
+    }
+    if (s->state == S_MCP) {
+        setstate(s, S_IDLE);
+    }
+
+    Slice<McpTool> add   = {};
+    Slice<Str>     intro = {};  // servers with instructions, new to it
+    b32            had   = s->mcptools.len > 0;
+    for (iz i = 0; i < s->mcpsrvs.len; i++) {
+        McpServer *m = s->mcpsrvs[i];
+        if (m->state == MCP_FAILED) {
+            b32 told = 0;
+            for (iz k = 0; k < s->mcpwarned.len; k++) {
+                told |= s->mcpwarned[k] == m->name;
+            }
+            if (!told) {
+                s->mcpwarned = push(&s->perm, s->mcpwarned, clone(&s->perm, m->name));
+                Str msg = concat(&scratch, concat(&scratch, "MCP server ", m->name),
+                                 concat(&scratch, " failed: ", m->err));
+                note(s, scratch, "warn", msg);
+            }
+            continue;
+        } else if (m->state != MCP_READY) {
+            continue;
+        }
+        b32 any = 0;
+        for (iz k = 0; k < m->tools.len; k++) {
+            McpTool *t = &m->tools[k];
+            if (!mcpallowed(s->mcpfilter, m->name, t->name) || mcptoolof(s, t->name)) {
+                continue;
+            }
+            b32 clash = toolfind(t->name) != TOOL_NONE;
+            for (iz j = 0; j < add.len; j++) {
+                clash |= add[j].name == t->name;
+            }
+            if (clash) {
+                Str msg = concat(&scratch, "an MCP tool's name is taken already, so "
+                                 "it is left out: ", t->name);
+                note(s, scratch, "warn", msg);
+                continue;
+            }
+            McpTool c = *t;
+            c.name   = clone(&s->perm, t->name);
+            c.server = clone(&s->perm, t->server);
+            c.tool   = clone(&s->perm, t->tool);
+            c.desc   = clone(&s->perm, t->desc);
+            c.schema = clone(&s->perm, t->schema);
+            add      = push(&scratch, add, c);
+            any      = 1;
+        }
+        if (any && m->instr.len) {
+            intro = push(&scratch, intro, m->name);
+        }
+    }
+    b32 fixed = s->mcpfixed;
+    s->mcpfixed = 1;  // logged with the tools, if any: else the session
+    if (!add.len) {   // opened again waits for its servers once more
+        return 1;
+    }
+    for (iz i = 0; i < add.len; i++) {
+        s->mcptools = push(&s->perm, s->mcptools, add[i]);
+    }
+    s->tools = clone(&s->perm, mcpaddtools(&scratch, s->tools, add));
+    for (iz i = 0; i < intro.len; i++) {
+        McpServer *m = mcpsrvof(s, intro[i]);
+        b32 first = find(s->system, "\n# MCP server instructions\n") < 0;
+        s->system = concat(&s->perm, s->system, mcpinstructions(&scratch, m->name, m->instr, first));
+    }
+    if (fixed || had || s->turn>1) {
+        // Mid-session: the agent is told what it has now
+        Buf b(&scratch, 256);
+        print(&b, "New tools from MCP servers are available now:");
+        for (iz i = 0; i < add.len; i++) {
+            print(&b, i ? Str(", ") : Str(" "));
+            print(&b, add[i].name);
+        }
+        putbyte(&b, '.');
+        notify(s, "mcp", finish(&b), 0);
+    }
+    logprefix(s, scratch);
+    return 1;
+}
+
+// A server became ready, or failed: the sessions waiting for it go on,
+// and a call waiting for it is sent, or fails.
+static void mcpcallsend(Session *s, Arena scratch);
+
+static void mcpwake(Engine *e, Arena scratch, McpServer *m)
+{
+    for (Session *s = e->sessions; s; s = s->next) {
+        Arena a = scratch;
+        if (s->state == S_MCP) {
+            b32 mine = 0;
+            for (iz i = 0; i < s->mcpsrvs.len; i++) {
+                mine |= s->mcpsrvs[i] == m;
+            }
+            if (mine) {
+                prepare(s, a);
+            }
+        } else if (s->state==S_TOOL && s->mcpsrv==m && s->mcpcall<0) {
+            mcpcallsend(s, a);
+        }
+    }
+}
+
+
+// Calls
+
+// End the current call of a session, and go on to its next.
+static void mcpend(Session *s, Arena scratch, Str status, Str text)
+{
+    disarm(s, T_TOOL);
+    s->mcpsrv  = 0;
+    s->mcpcall = 0;
+    setstate(s, S_IDLE);
+    toolend(s, scratch, status, text, 0, 0, {}, 0);
+    nexttool(s, scratch);
+}
+
+// A call that cannot be answered: its session, if still waiting, hears
+// why.
+static void mcpcallfail(Engine *e, Arena scratch, McpPending *p, Str why)
+{
+    Session *s = findsession(e, p->sid);
+    if (s && s->state==S_TOOL && s->mcpsrv && s->mcpcall==p->id &&
+            s->calls[s->callidx].id==p->call) {
+        mcpend(s, scratch, "error", why);
+    }
+}
+
+// Send the current call to its server, ready by now: 0 if it could not
+// go, and the call is ended.
+static void mcpcallsend(Session *s, Arena scratch)
+{
+    Engine    *e = s->e;
+    McpServer *m = s->mcpsrv;
+    Block     *c = &s->calls[s->callidx];
+    McpTool   *t = mcptoolof(s, c->name);
+    if (!t || m->state!=MCP_READY) {
+        Str why = m->state==MCP_FAILED
+                ? concat(&scratch, concat(&scratch, "The MCP server ", m->name),
+                         concat(&scratch, " failed, so the call was not made: ", m->err))
+                : concat(&scratch, concat(&scratch, "The MCP server ", m->name),
+                         Str(" is not running, so the call was not made."));
+        mcpend(s, scratch, "error", why);
+        return;
+    }
+    Repair  r = repairargs(&scratch, c->args);
+    Buf     b(&scratch, 256 + c->args.len);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "name", t->tool);
+    putkey(&w, "arguments");
+    if (r.root->type == JSON_OBJECT) {
+        putjson(&w, r.root);
+    } else {
+        putobject(&w);
+        putend(&w);
+    }
+    putend(&w);
+    i64 id = mcprequest(e, scratch, m, MCPREQ_CALL, "tools/call", finish(&b), s->sid, c->id);
+    if (!id) {
+        mcpfail(e, scratch, m, "it stopped taking messages");
+        return;  // which ended the call, as no request waits for it
+    }
+    s->mcpcall = id;
+    arm(s, T_TOOL, m->callms*MS);
+}
+
+// Run the current call, allowed: sent to its server, or once it is
+// ready. Returns 1 if it ended already, 0 if it waits.
+static b32 mcprun(Session *s, Arena scratch, McpTool *t)
+{
+    Engine    *e = s->e;
+    McpServer *m = mcpserver(s, scratch, t->server);
+    if (!m) {
+        Str why = concat(&scratch, concat(&scratch, "The MCP server ", t->server),
+                         Str(" is no longer in the configuration, so the call was not made."));
+        toolend(s, scratch, "error", why, 0, 0, {}, 0);
+        return 1;
+    }
+    b32 have = 0;
+    for (iz i = 0; i < s->mcpsrvs.len; i++) {
+        have |= s->mcpsrvs[i] == m;
+    }
+    if (!have) {
+        s->mcpsrvs = push(&s->perm, s->mcpsrvs, m);
+    }
+    if (m->state == MCP_FAILED) {
+        Str why = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
+                         concat(&scratch, " failed, so the call was not made: ", m->err));
+        toolend(s, scratch, "error", why, 0, 0, {}, 0);
+        return 1;
+    }
+    s->mcpsrv  = m;
+    s->mcpcall = -1;
+    setstate(s, S_TOOL);
+    if (m->state == MCP_READY) {
+        mcpcallsend(s, scratch);
+    } else {
+        i64 left = m->readyby - os_ticks(e->os);
+        arm(s, T_TOOL, (left>0 ? left : 0) + m->callms*MS);
+    }
+    return s->state != S_TOOL;
+}
+
+// The current call ran out of time: the server is told, as for a cancel.
+static void mcpcancel(Session *s, Arena scratch, Str status, Str text)
+{
+    McpServer *m = s->mcpsrv;
+    if (m && s->mcpcall > 0) {
+        for (iz i = 0; i < m->pending.len; i++) {
+            if (m->pending[i].id == s->mcpcall) {
+                m->pending.data[i] = m->pending[m->pending.len-1];
+                m->pending.len--;
+                break;
+            }
+        }
+        Buf     b(&scratch, 128);
+        JsonOut w = {&b};
+        putobject(&w);
+        putintkey(&w, "requestId", s->mcpcall);
+        putstrkey(&w, "reason", status=="cancelled" ? Str("the user cancelled")
+                                                    : Str("timed out"));
+        putend(&w);
+        mcpsend(s->e, scratch, m, 0, "notifications/cancelled", finish(&b));
+    }
+    mcpend(s, scratch, status, text);
+}
+
+static void mcptimeout(Session *s, Arena scratch)
+{
+    McpServer *m = s->mcpsrv;
+    Buf b(&scratch, 256);
+    if (s->mcpcall < 0) {
+        print(&b, "The MCP server ");
+        print(&b, m->name);
+        print(&b, " did not start in time, so the call was not made.");
+    } else {
+        print(&b, "Timed out: the MCP server ");
+        print(&b, m->name);
+        print(&b, " did not answer within ");
+        printduration(&b, m->callms/1000);
+        print(&b, ", so the call was cancelled. It may have done part of it.");
+    }
+    mcpcancel(s, scratch, "timeout", finish(&b));
+}
+
+// The answer to a session's call.
+static void mcpanswer(Session *s, Arena scratch, McpServer *m, Json *msg)
+{
+    Engine *e = s->e;
+    Json   *err = jsonget(msg, "error");
+    if (err->type != JSON_MISSING) {
+        Str why = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
+                         concat(&scratch, " refused the call: ", mcperror(&scratch, err)));
+        mcpend(s, scratch, "error", why);
+        return;
+    }
+    McpResult r    = mcpresult(&scratch, jsonget(msg, "result"));
+    Buf       b(&scratch, 256 + r.text.len);
+    print(&b, r.text);
+    if (r.image.len) {
+        Str note = {};
+        if (s->mc.novision) {
+            note = "[an image, not shown: this model takes no images]";
+        } else {
+            DeskLimits l   = desklimits(s);
+            ImageKind  k   = imagekind(scratch, r.image);
+            Str        png = r.image;
+            b32        big = k.w>l.edge || k.h>l.edge || (i64)k.w*k.h>l.pixels;
+            if (k.w<1 || k.h<1) {
+                note = "[an image that cannot be read]";
+            } else if (big || k.kind!=IMAGE_PNG || base64len(png.len)>ATTACH_BYTES) {
+                Converted z = topng(e->os, &scratch, r.image, big, l.edge, l.pixels);
+                png  = z.png;
+                note = z.png.data ? Str{} : concat(&scratch, "[an image that cannot be shown: ",
+                                                   concat(&scratch, z.err, "]"));
+            }
+            if (png.data && !note.len) {
+                ImageKind p   = imagekind(scratch, png);
+                Str       rel = {};
+                Str       out = spillfile(s, scratch, s->calls[s->callidx].id, &rel, ".png");
+                if (os_write(e->os, scratch, out, png)) {
+                    s->callimage = rel;
+                    s->callimgw  = p.w;
+                    s->callimgh  = p.h;
+                } else {
+                    note = "[an image that could not be saved to show you]";
+                }
+            }
+        }
+        if (note.len) {
+            print(&b, b.len ? Str("\n") : Str(""));
+            print(&b, note);
+        }
+    }
+    Str text = finish(&b);
+    if (!text.len && !s->callimage.len) {
+        text = r.error ? Str("The tool failed, and said nothing.") : Str("(no output)");
+    }
+    Str spill = {};
+    i64 bytes = 0;
+    if (text.len > MCP_TEXTMAX) {
+        Str rel  = {};
+        Str path = spillfile(s, scratch, s->calls[s->callidx].id, &rel);
+        if (os_write(e->os, scratch, path, text)) {
+            spill = rel;
+            bytes = text.len;
+            Buf t(&scratch, MCP_TEXTMAX + 256);
+            print(&t, utf8head(text, MCP_TEXTMAX));
+            print(&t, "\n[cut: the whole result, ");
+            print(&t, (i64)text.len);
+            print(&t, " bytes, is in ");
+            print(&t, path);
+            putbyte(&t, ']');
+            text = finish(&t);
+        }
+    }
+    disarm(s, T_TOOL);
+    s->mcpsrv  = 0;
+    s->mcpcall = 0;
+    setstate(s, S_IDLE);
+    toolend(s, scratch, r.error ? Str("error") : Str("ok"), text, 0, 0, spill, bytes);
+    nexttool(s, scratch);
+}
+
+// Why an MCP call was not made, for the agent.
+static Str mcpdenial(Arena *a, i32 by, Str note)
+{
+    Buf b(a, 256 + note.len);
+    switch (by) {
+    case DENY_POLICY:
+        print(&b, "Not run: MCP tools need the user's approval, and nobody is "
+                  "there to give it in this run");
+        if (note.len) {
+            print(&b, " (");
+            print(&b, note);
+            putbyte(&b, ')');
+        }
+        print(&b, ". Do what you can without it, and say what you would have done.");
+        break;
+    case DENY_USER:
+        print(&b, "Not run: the user denied this call.");
+        if (note.len) {
+            print(&b, " The user's note: ");
+            print(&b, note);
+        } else {
+            print(&b, " Do not try it again unless the user asks.");
+        }
+        break;
+    case DENY_TIMEOUT:
+        print(&b, "Not run: nobody answered the request to run it in time. "
+                  "Do something else, or try it later.");
+        break;
+    case DENY_STEER:
+        print(&b, "Not run: the user sent a message instead, which follows.");
+        break;
+    default:
+        print(&b, "Not run: the user cancelled the turn.");
+    }
+    return finish(&b);
+}
+
+// The current call's ask answered, its tool.start logged (resolve).
+static void mcpresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note, i64 wait)
+{
+    (void)wait;
+    Block   *c = &s->calls[s->callidx];
+    McpTool *t = mcptoolof(s, c->name);
+    if (allow && t) {
+        mcprun(s, scratch, t);  // which may go on
+        return;
+    }
+    Str why = mcpdenial(&scratch, by, note);
+    toolend(s, scratch, by==DENY_CANCEL ? Str("cancelled") : Str("denied"), why, 0, 0, {}, 0);
+}
+
+// What a call would do, for the user who is asked: the server, the
+// tool, and its arguments, cut.
+static Str mcpwhat(Arena *a, McpTool *t, Str args)
+{
+    Repair r = repairargs(a, args);
+    Buf    b(a, 256 + args.len);
+    print(&b, "MCP ");
+    print(&b, t->server);
+    print(&b, ": ");
+    print(&b, t->tool);
+    Str shown = r.root->type==JSON_OBJECT && !r.root->len ? Str{} : trim(args);
+    if (shown.len) {
+        putbyte(&b, ' ');
+        print(&b, utf8head(shown, 1000));
+        print(&b, shown.len>1000 ? Str("...") : Str(""));
+    }
+    return finish(&b);
+}
+
+// A call to an MCP tool: refused in plan mode unless it only reads,
+// asked about unless its server is trusted, a grant covers it, or the
+// session bypasses. Returns 1 if the call finished, 0 if it goes on.
+static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
+{
+    Engine    *e = s->e;
+    Block     *c = &s->calls[s->callidx];
+    McpServer *m = mcpsrvof(s, t->server);
+    Repair     r = repairargs(&scratch, c->args);
+    if (r.root->type!=JSON_OBJECT && trim(c->args).len) {
+        toolstart(s, scratch);
+        s->callfail = "args";
+        toolend(s, scratch, "error", "Not run: the arguments must be a JSON object.",
+                0, 0, {}, 0);
+        return 1;
+    } else if (planning(s) && !t->ro) {
+        toolstart(s, scratch);
+        toolend(s, scratch, "denied", "Not run: plan mode is on, and this MCP tool "
+                "does not say that it only reads.", 0, 0, {}, 0);
+        return 1;
+    }
+    if (m) {
+        mcpconf(e, m);  // trust as the configuration says now
+    }
+    Grant g = {};
+    g.mcp = t->name;
+    if (bypassing(s) || (m && m->trust) || hasgrant(s, g)) {
+        toolstart(s, scratch);
+        return mcprun(s, scratch, t);
+    }
+
+    Ask *k = &s->ask;
+    *k = {};
+    k->req    = clone(&s->perm, concat(&scratch, c->id, "/ask"));
+    k->tool   = TOOL_NONE;
+    k->mcp    = 1;
+    k->grant  = t->name;  // the session's own
+    k->opened = os_ticks(e->os);
+    b32 steer = s->steers.len > 0;
+    b32 wait  = attending(s) && !steer;
+    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    if (wait) {
+        arm(s, T_ASK, delay);
+    }
+    {
+        Str   what = mcpwhat(&scratch, t, c->args);
+        Buf   b(&scratch, 512 + what.len);
+        EvOut w = sbegin(s, &b, EV_ASK);
+        putstrkey(&w.json, "req", k->req);
+        putstrkey(&w.json, "call", c->id);
+        putstrkey(&w.json, "kind", "mcp");
+        putstrkey(&w.json, "tool", t->name);
+        putstrkey(&w.json, "server", t->server);
+        putstrkey(&w.json, "detail", what);
+        putstrkey(&w.json, "always", t->name);
+        putstrkey(&w.json, "scope", "mcp");
+        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putstrkey(&w.json, "dflt", "deny");
+        ssend(s, &w);
+    }
+    if (!wait) {
+        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        return 1;
+    }
+    setstate(s, S_ASK);
+    return 0;
+}
+
+
+// The servers' records
+
+static void mcplisted(Engine *e, Arena scratch, McpServer *m, Json *res)
+{
+    for (Json *t = jsonget(res, "tools")->child; t; t = t->next) {
+        McpTool x = mcptool(&m->arena, m->name, t);
+        if (x.tool.len && mcponly(m->only, x.tool)) {
+            m->tools = push(&m->arena, m->tools, x);
+        }
+    }
+    Str next = jsonstr(jsonget(res, "nextCursor"));
+    if (next.len && ++m->pages<MCP_PAGES) {
+        Buf     b(&scratch, 64 + next.len);
+        JsonOut w = {&b};
+        putobject(&w);
+        putstrkey(&w, "cursor", next);
+        putend(&w);
+        if (!mcprequest(e, scratch, m, MCPREQ_LIST, "tools/list", finish(&b))) {
+            mcpfail(e, scratch, m, "it stopped taking messages");
+        }
+        return;
+    }
+    m->state = MCP_READY;
+    mcpwake(e, scratch, m);
+}
+
+// One message from a server: a response to one of ours, a request of
+// its own (ping is answered, the rest refused), or a notification.
+static void mcpline(Engine *e, Arena scratch, McpServer *m, Str line)
+{
+    if (!trim(line).len) {
+        return;
+    }
+    JsonDoc d = jsonparse(&scratch, line);
+    Json   *j = d.root;
+    if (j->type != JSON_OBJECT) {
+        return;  // not a message: perhaps a stray line of logging
+    }
+    Json *method = jsonget(j, "method");
+    Json *id     = jsonget(j, "id");
+    if (method->type == JSON_STRING) {
+        if (id->type==JSON_MISSING || id->type==JSON_NULL) {
+            return;  // a notification: logging, progress, list_changed
+        }
+        Str out = jsonstr(method)=="ping"
+                ? mcpresponse(&scratch, id->raw, "{}", 0, {})
+                : mcpresponse(&scratch, id->raw, {}, -32601, "method not supported");
+        if (m->proc && !m->stopping) {
+            os_procwrite(e->os, m->proc, out);
+        }
+        return;
+    }
+    i64 n = jsonint(id, 0);
+    McpPending p = {};
+    for (iz i = 0; i < m->pending.len; i++) {
+        if (m->pending[i].id == n) {
+            p = m->pending[i];
+            m->pending.data[i] = m->pending[m->pending.len-1];
+            m->pending.len--;
+            break;
+        }
+    }
+    if (!p.id) {
+        return;  // a call given up on
+    }
+    Json *err = jsonget(j, "error");
+    Json *res = jsonget(j, "result");
+    switch (p.kind) {
+    case MCPREQ_INIT: {
+        if (err->type != JSON_MISSING) {
+            Str why = concat(&scratch, "it refused to start: ", mcperror(&scratch, err));
+            mcpfail(e, scratch, m, why);
+            return;
+        }
+        Str v = jsonstr(jsonget(res, "protocolVersion"));
+        if (!mcpversionok(v)) {
+            Str why = concat(&scratch, "it speaks a protocol version this harness does "
+                             "not: ", v.len ? v : Str("(none)"));
+            mcpfail(e, scratch, m, why);
+            return;
+        }
+        m->version = clone(&m->arena, v);
+        m->instr   = clone(&m->arena, utf8head(trim(jsonstr(jsonget(res, "instructions"))),
+                                               MCP_INSTRMAX));
+        m->state   = MCP_LISTING;
+        mcpsend(e, scratch, m, 0, "notifications/initialized", {});
+        if (!mcprequest(e, scratch, m, MCPREQ_LIST, "tools/list", "{}")) {
+            mcpfail(e, scratch, m, "it stopped taking messages");
+        }
+    } return;
+    case MCPREQ_LIST:
+        if (err->type != JSON_MISSING) {
+            Str why = concat(&scratch, "it would not list its tools: ",
+                             mcperror(&scratch, err));
+            mcpfail(e, scratch, m, why);
+            return;
+        }
+        mcplisted(e, scratch, m, res);
+        return;
+    case MCPREQ_CALL: {
+        Session *s = findsession(e, p.sid);
+        if (s && s->state==S_TOOL && s->mcpsrv==m && s->mcpcall==p.id &&
+                s->calls[s->callidx].id==p.call) {
+            mcpanswer(s, scratch, m, j);
+        }
+    } return;
+    }
+}
+
+static void mcprecord(Engine *e, Arena scratch, McpServer *m, Record r)
+{
+    if (r.type==PROC_TAIL || r.type==PROC_LIMIT) {
+        return;
+    } else if (r.type != PROC_DATA) {
+        if (m->stopping) {
+            if (r.type == PROC_EXIT) {
+                mcpfree(e, m);
+            }
+        } else if (m->state != MCP_FAILED) {
+            mcpfail(e, scratch, m, "it exited");
+        }
+        return;
+    }
+    print(&m->in, r.data);
+    // Whole lines out, the rest kept, before any is acted upon
+    Slice<Str> lines = {};
+    for (;;) {
+        Str buf = {m->in.data, m->in.len};
+        iz  n   = find(buf, "\n");
+        if (n < 0) {
+            if (buf.len > MCP_FRAMEMAX) {
+                mcpfail(e, scratch, m, "it sent a message too large");
+                return;
+            }
+            break;
+        }
+        lines = push(&scratch, lines, clone(&scratch, takehead(buf, n)));
+        for (iz i = n+1; i < buf.len; i++) {
+            m->in.data[i-n-1] = m->in.data[i];
+        }
+        m->in.len -= n + 1;
+    }
+    u64 id = m->procid;
+    for (iz i = 0; i<lines.len && m->procid==id && !m->stopping; i++) {
+        mcpline(e, scratch, m, lines[i]);
+    }
+}
+
+// The engine's clock: servers too slow to start fail, stopping ones are
+// killed, and those no session offers stop.
+static i64 mcpnext(Engine *e)
+{
+    i64 next = I64MAX;
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        i64 at = m->stopping ? m->killat :
+                 m->state==MCP_STARTING || m->state==MCP_LISTING ? m->readyby :
+                 m->state==MCP_READY ? m->lastuse + e->minute : 0;
+        next = at && at<next ? at : next;
+    }
+    return next;
+}
+
+static void mcptick(Engine *e, Arena scratch, i64 now)
+{
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        // Offered by a session in memory: in use
+        for (Session *s = e->sessions; s; s = s->next) {
+            if (s->forget && !busy(s)) {
+                continue;
+            }
+            for (iz i = 0; i < s->mcpsrvs.len; i++) {
+                m->lastuse = s->mcpsrvs[i]==m ? now : m->lastuse;
+            }
+        }
+        if (m->stopping && now>=m->killat && !m->killstage++) {
+            os_kill(e->os, m->proc, 0);  // asked to stop, then killed
+            m->killat = now + MCP_HARD - MCP_SOFT;
+        } else if (m->stopping && now>=m->killat) {
+            mcpfree(e, m);
+        }
+    }
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if ((m->state==MCP_STARTING || m->state==MCP_LISTING) && now>=m->readyby) {
+            Buf b(&scratch, 128);
+            print(&b, "it did not start within ");
+            printduration(&b, m->startms/1000);
+            print(&b, " (its startup_timeout)");
+            mcpfail(e, scratch, m, finish(&b));
+        } else if (m->state==MCP_READY && now>=m->lastuse+e->minute) {
+            mcpstop(e, scratch, m, "The MCP server stopped.");
+        }
+    }
+}
+
+// The engine stops: every server's input closed, and its process let
+// go, for the reapers to end.
+static void mcpquit(Engine *e)
+{
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->proc) {
+            os_procwrite(e->os, m->proc, {});
+            os_procfree(e->os, m->proc);
+            m->proc = 0;
+        }
+    }
+}
+
+
 static b32 runtool(Session *s, Arena scratch)
 {
     Engine *e    = s->e;
     Block  *c    = &s->calls[s->callidx];
     i32     tool = toolfind(c->name);
     Args    args = {};
+    McpTool *mt  = s->blocked ? 0 : mcptoolof(s, c->name);
+    if (mt) {
+        return mcpcall(s, scratch, mt);  // asks before it starts
+    }
     if (!tooloffered(&s->te, tool)) {
         tool = TOOL_NONE;  // one the role leaves out is unknown
     } else {
@@ -6691,6 +7831,8 @@ static void prepare(Session *s, Arena scratch)
         return;
     } else if (s->intask && !taskbudget(s, scratch)) {
         return;
+    } else if (!mcpgate(s, scratch)) {
+        return;  // its MCP servers are starting: mcpwake goes on
     }
     deliver(s, scratch);
     s->wake = 0;
@@ -6950,7 +8092,11 @@ static void cancelturn(Session *s, Arena scratch)
     }
     switch (s->state) {
     case S_TOOL:
-        if (s->desk.busy && s->desk.action==DESK_DRAG) {
+        if (s->mcpsrv) {
+            mcpcancel(s, scratch, "cancelled", "Stopped: the user cancelled the "
+                      "turn, perhaps after the MCP server did some of it.");
+            return;
+        } else if (s->desk.busy && s->desk.action==DESK_DRAG) {
             return;  // its button released first: the rest end after it
         } else if (s->desk.busy) {
             deskkill(s);
@@ -7528,7 +8674,7 @@ static void logprefix(Session *s, Arena scratch)
     if (s->readonly) {
         return;
     }
-    Buf   b(&scratch, 1024 + 2*(s->system.len + s->tools.len));
+    Buf   b(&scratch, 1024 + 2*(s->system.len + s->tools.len) + 256*s->mcptools.len);
     EvOut w = sbegin(s, &b, EV_PREFIX);
     putstrkey(&w.json, "system", s->system);
     putstrkey(&w.json, "tools", s->tools);
@@ -7542,6 +8688,28 @@ static void logprefix(Session *s, Arena scratch)
     }
     if (s->skillson) {
         putskills(&w.json, s->skillseen, 0);
+    }
+    if (s->mcpfixed) {
+        putintkey(&w.json, "mcp_fixed", 1);
+    }
+    if (s->mcpfilter.data) {
+        putstrkey(&w.json, "mcp_filter", s->mcpfilter);
+    }
+    if (s->mcptools.len) {
+        putkey(&w.json, "mcp");
+        putarray(&w.json);
+        for (iz i = 0; i < s->mcptools.len; i++) {
+            McpTool *t = &s->mcptools[i];
+            putobject(&w.json);
+            putstrkey(&w.json, "name", t->name);
+            putstrkey(&w.json, "server", t->server);
+            putstrkey(&w.json, "tool", t->tool);
+            if (t->ro) {
+                putintkey(&w.json, "ro", 1);
+            }
+            putend(&w.json);
+        }
+        putend(&w.json);
     }
     ssend(s, &w);
 }
@@ -7750,6 +8918,7 @@ struct Role {
     Str model;     // empty for the session's own, or the parent's
     Str endpoint;
     u32 deny;      // tools not offered
+    Str mcp;       // the tools it names, null if none: MCP tools by name
     b32 ok;
 };
 
@@ -7804,6 +8973,8 @@ static Role findrole(Engine *e, Str name)
     r.model    = trim(cfgget(c, "role", name, "model", 0));
     r.endpoint = trim(cfgget(c, "role", name, "endpoint", 0));
     r.deny     = tooldeny(tools);
+    r.mcp      = cfgown(c, "role", name, "tools").data ? tools :
+                 b>=0 && builtinroles[b].tools.data ? builtinroles[b].tools : Str{};
     r.ok       = 1;
     return r;
 }
@@ -8004,7 +9175,8 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->scratch = p->scratch.len ? clone(&s->perm, p->scratch) : Str{};
     for (iz i = 0; i < p->grants.len; i++) {
         Grant g = p->grants[i];
-        g.path = g.desk ? Str{} : clone(&s->perm, g.path);
+        g.path = g.desk || g.mcp.len ? Str{} : clone(&s->perm, g.path);
+        g.mcp  = g.mcp.len ? clone(&s->perm, g.mcp) : Str{};
         s->grants = push(&s->perm, s->grants, g);
     }
     s->model = clone(&s->perm, model);
@@ -8016,6 +9188,8 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->depth   = p->depth + 1;
     s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
                  deskdeny(e, scratch, 1) | skilldeny(e) | TOOL_PLANMASK;
+    s->mcpfilter = r.mcp.data ? clone(&s->perm, r.mcp) :
+                   p->mcpfilter.data ? clone(&s->perm, p->mcpfilter) : Str{};
     s->psid    = clone(&s->perm, p->sid);
     s->pcall   = clone(&s->perm, c->id);
     s->intask  = 1;
@@ -9318,6 +10492,8 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->rolepr     = clone(&s->perm, role.prompt);
     s->te.deny    = role.deny | (tools.data ? tooldeny(tools) : 0) |
                     deskdeny(e, scratch, role.ok) | skilldeny(e);
+    s->mcpfilter  = tools.data ? clone(&s->perm, tools) :
+                    role.mcp.data ? clone(&s->perm, role.mcp) : Str{};
     s->stepmax    = steps<STEP_HARD ? steps : 0;
     s->projinstr  = instr == "project";
     s->nofallback = !fall;
@@ -9622,8 +10798,9 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             // "Always allow", as the guard has it from then on, or a
             // class of desktop actions
             Grant g = grantof(j);
-            if ((g.desk || g.path.len) && !hasgrant(s, g)) {
-                g.path = g.desk ? Str{} : clone(&s->perm, g.path);
+            if ((g.desk || g.path.len || g.mcp.len) && !hasgrant(s, g)) {
+                g.path = g.desk || g.mcp.len ? Str{} : clone(&s->perm, g.path);
+                g.mcp  = g.mcp.len ? clone(&s->perm, g.mcp) : Str{};
                 s->grants = push(&s->perm, s->grants, g);
             }
         } break;
@@ -9711,6 +10888,20 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->system.data   = s->system.data ? s->system.data : (u8 *)"";
             s->skillson      = jsonget(j, "skills")->type == JSON_ARRAY;
             skillseenfrom(s, jsonget(j, "skills"));
+            s->mcpfixed      = jsonflag(jsonget(j, "mcp_fixed"), 0);
+            s->mcpfilter     = jsonget(j, "mcp_filter")->type==JSON_STRING
+                               ? clone(&s->perm, jsonstr(jsonget(j, "mcp_filter"))) : Str{};
+            s->mcptools      = {};
+            for (Json *k = jsonget(j, "mcp")->child; k; k = k->next) {
+                McpTool t = {};
+                t.name   = clone(&s->perm, jsonstr(jsonget(k, "name")));
+                t.server = clone(&s->perm, jsonstr(jsonget(k, "server")));
+                t.tool   = clone(&s->perm, jsonstr(jsonget(k, "tool")));
+                t.ro     = jsonflag(jsonget(k, "ro"), 0);
+                if (t.name.len && t.server.len && t.tool.len) {
+                    s->mcptools = push(&s->perm, s->mcptools, t);
+                }
+            }
             prefixed         = 1;
             break;
         }
@@ -10989,11 +12180,6 @@ static iz base64len(iz n)
     return (n + 2)/3 * 4;
 }
 
-struct Converted {
-    Str png;  // null on failure
-    Str err;
-};
-
 // An image as a PNG that fits the APIs: decoded, within edge pixels on
 // each side and pixels in all, then smaller until its base64 is within
 // ATTACH_BYTES.
@@ -12142,6 +13328,11 @@ static void onrecord(Engine *e, Arena scratch, Record r)
 
     b32 proc = r.type>=PROC_TAIL && r.type<=PROC_DATA;
     if (proc) {
+        McpServer *ms = mcpbyproc(e, r.id);
+        if (ms) {
+            mcprecord(e, scratch, ms, r);
+            return;
+        }
         Session *ds = deskbyid(e, r.id);
         if (ds) {
             deskrecord(ds, scratch, r);
@@ -12250,7 +13441,10 @@ static void ontimer(Session *s, Arena scratch, i32 t)
         sendreq(s, scratch);
         return;
     case T_TOOL:
-        if (s->sh.tool != TOOL_SHELL) {
+        if (s->mcpsrv) {
+            mcptimeout(s, scratch);
+            return;
+        } else if (s->sh.tool != TOOL_SHELL) {
             // A search out of time: keep what it found
             s->sh.timedout = 1;
             os_kill(e->os, s->proc, 1);
@@ -12317,6 +13511,7 @@ static void enginethread(void *arg)
         i64 next = e->quitting ? e->quitby : I64MAX;
         next = e->admat && e->admat<next ? e->admat : next;
         next = cfgnext(e->cfg)<next ? cfgnext(e->cfg) : next;
+        next = mcpnext(e)<next ? mcpnext(e) : next;
         for (Lister *l = e->listers; l; l = l->next) {
             next = !l->replied && l->by<next ? l->by : next;
         }
@@ -12360,6 +13555,9 @@ static void enginethread(void *arg)
             }
         }
         listertimeout(e, newarena(e->scratch), now);
+        if (mcpnext(e) <= now) {
+            mcptick(e, newarena(e->scratch), now);
+        }
         if (cfgnext(e->cfg) <= now) {
             i64 rev = e->cfg->rev;
             cfgtimeout(e->cfg, newarena(e->scratch));
@@ -12396,6 +13594,7 @@ static void enginethread(void *arg)
                 }
             }
             e->parked = {};
+            mcpquit(e);
             mailpost(e->out, MAIL_QUIT, 0, {}, 1);
             return;
         }

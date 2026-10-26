@@ -224,6 +224,7 @@ static CfgKind cfgkinds[] = {
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"host",     0, "The engine as a background host (prospero serve)"},
     {"remote",   1, "An engine on another machine, reached over ssh, or in a WSL distro"},
+    {"mcp",      1, "An MCP server, whose tools the agent may use"},
 };
 
 // A key ending in a dot names a family: any key with that prefix, as
@@ -373,7 +374,9 @@ static CfgKey cfgschema[] = {
      "role", "Tools the role may use, read left to right: * is every tool, "
      "default those a role has unless it says, and -NAME takes one away, "
      "as in \"default desktop\" or \"* -shell\"; desktop also needs "
-     "[desktop] offer"},
+     "[desktop] offer. MCP tools come with a role that names no tools; "
+     "one that does names them, mcp__SERVER for a server's every tool or "
+     "mcp__SERVER__TOOL for one, or * for all"},
 
     {"guard", "roots", CFG_PATHS, "", {}, {}, "guard",
      "More directories the file tools may use, separated by ;"},
@@ -499,6 +502,28 @@ static CfgKey cfgschema[] = {
     {"remote", "list", CFG_ENUM, "always", {}, "always connected", "remote",
      "When the session list shows the host: always, or connected, which "
      "keeps it out of the list while it is disconnected"},
+
+    {"mcp", "command", CFG_STRING, "", {}, {}, "mcp",
+     "The server's program and its arguments, run without a shell (quote "
+     "words with blanks in them), speaking MCP on its standard input and "
+     "output"},
+    {"mcp", "cwd", CFG_STRING, "", {}, {}, "mcp",
+     "Where the command runs, by default the session's folder"},
+    {"mcp", "env.", CFG_STRING, "", {}, {}, "mcp",
+     "env.NAME = VALUE: an environment variable for the command, VALUE "
+     "env:VAR to take it from this one's"},
+    {"mcp", "trust", CFG_BOOL, "false", {}, {}, "mcp",
+     "Let the agent use the server's tools without asking first"},
+    {"mcp", "tools", CFG_STRING, "", {}, {}, "mcp",
+     "Only these of the server's tools, by its names for them, separated "
+     "by blanks; by default all"},
+    {"mcp", "enabled", CFG_BOOL, "true", {}, {}, "mcp",
+     "Offer the server's tools to new sessions"},
+    {"mcp", "startup_timeout", CFG_SECONDS, "30", {}, {}, "mcp",
+     "Seconds a server may take to start and list its tools, which a "
+     "session's first request waits for"},
+    {"mcp", "timeout", CFG_SECONDS, "600", {}, {}, "mcp",
+     "Seconds a tool call may take"},
 };
 
 // Value judgments
@@ -780,6 +805,12 @@ static b32 cfgruns(CfgKey *k, Str v)
     return k->kind=="ui" && (k->key=="editor" || k->key=="terminal");
 }
 
+// A role's tools may name MCP tools: mcp__SERVER, or mcp__SERVER__TOOL.
+static b32 cfgmcpword(CfgKey *k, Str w)
+{
+    return k->kind=="role" && k->key=="tools" && startswith(w, "mcp__") && w.len>5;
+}
+
 // How a value fares as a setting of its key. A shared value comes from
 // an included file. An empty value means the default, and is fine.
 static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
@@ -787,7 +818,7 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     v = trim(v);
     if (!v.len) {
         return CFG_OK;
-    } else if (shared && (k->kind=="remote" || k->kind=="desktop")) {
+    } else if (shared && (k->kind=="remote" || k->kind=="desktop" || k->kind=="mcp")) {
         return CFG_BAD;  // what runs on the user's machines, and where,
     } else if (shared && cfgruns(k, v)) {  // and what may use the screen
         return CFG_BAD;
@@ -818,7 +849,7 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     case CFG_LIST:
         for (Str rest = v; rest.len;) {
             Str w = cfglistword(cfgnextword(&rest));
-            if (w.len && !cfghasword(k->choices, w)) {
+            if (w.len && !cfghasword(k->choices, w) && !cfgmcpword(k, w)) {
                 return CFG_ODD;
             }
         }
@@ -853,6 +884,10 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     if (shared && k->kind=="remote") {
         return "a [remote] setting in an included file is ignored, since it "
                "chooses what runs where: set it in your own file";
+    } else if (shared && k->kind=="mcp") {
+        return "an [mcp] setting in an included file is ignored, since it "
+               "chooses what runs and what the agent may reach: set it in "
+               "your own file";
     } else if (shared && k->kind=="desktop") {
         return "a [desktop] setting in an included file is ignored, since it "
                "lets the agent use the screen: set it in your own file";
@@ -885,7 +920,8 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
         Str bad = v;
         for (Str rest = v; k->type==CFG_LIST && rest.len;) {
             Str w = cfgnextword(&rest);
-            if (w.len && !cfghasword(k->choices, cfglistword(w))) {
+            if (w.len && !cfghasword(k->choices, cfglistword(w)) &&
+                    !cfgmcpword(k, cfglistword(w))) {
                 bad = w;
                 break;
             }

@@ -7864,6 +7864,302 @@ def bypass_plan(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+# MCP servers, with tests/fake_mcp.py as the server "fake" (on this
+# machine only, as the fake desktop helper)
+
+FAKE_MCP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_mcp.py")
+
+
+def mcpconf(**kw):
+    # Single quotes: a value that begins with a double quote is the INI's
+    sec = {"command": f"'{sys.executable}' '{FAKE_MCP}'", **kw}
+    return {"_mcp fake": {k: v for k, v in sec.items() if v is not None}}
+
+
+def mcpenv(t, **kw):
+    if not isinstance(t.host, LocalHost):
+        raise Skip("the fake MCP server runs on this machine only")
+    t.mcplog = t.host.join(t.base, "mcp.log")
+    return {"FAKE_MCP_LOG": t.mcplog, **kw}
+
+
+def mcplog(t):
+    text = t.host.read(t.mcplog) or ""
+    return [json.loads(x) for x in text.splitlines()]
+
+
+def mcpcalls(t):
+    return [m["params"] for m in mcplog(t) if m.get("method") == "tools/call"]
+
+
+def tooldef(req, name):
+    for x in req.get("tools", []):
+        if x["function"]["name"] == name:
+            return x["function"]
+    return None
+
+
+@scenario(conf=mcpconf(trust="yes", **{"env.FAKE_MCP_WORD": "env:MCP_WORD"}), bound=20)
+def mcp_flow(t):
+    """A trusted server's tools, offered beside the built-ins, called with
+    no ask: text, an image for the next request, a failure, structured
+    content, a refusal, big text spilled, and where it runs, with the
+    section's environment. The protocol as it went: initialize, the
+    tools listed page by page, the server's ping answered and its other
+    request refused."""
+    r = t.run(env=mcpenv(t, MCP_WORD="hello"))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')} {r.stderr}")
+    t.check(not r.all("ask"), "nothing asked: trusted")
+    ends = r.all("tool.end")
+    st = [(e["status"], e["text"][:70]) for e in ends]
+    t.check([s for s, _ in st] == ["ok", "ok", "error", "ok", "error", "ok", "ok"],
+            f"statuses {st}")
+    t.check(ends[0]["text"] == "echo: hi", f"echo {ends[0]['text']!r}")
+    t.check(ends[1]["text"].startswith("A red square.") and
+            ends[1].get("image", "").endswith(".png"), f"image {ends[1]}")
+    t.check(ends[2]["text"] == "it went wrong", f"fail {ends[2]['text']!r}")
+    t.check(json.loads(ends[3]["text"]) == {"answer": 42}, f"structured {ends[3]['text']!r}")
+    t.check("refused the call" in ends[4]["text"] and "no, thanks" in ends[4]["text"],
+            f"refuse {ends[4]['text']!r}")
+    t.check(ends[5].get("spill", "").startswith("out/") and len(ends[5]["text"]) < 60000,
+            f"big spilled: {ends[5].get('spill')} {len(ends[5]['text'])}")
+    where = ends[6]["text"].split("\n")
+    t.check(os.path.realpath(where[0]) == os.path.realpath(t.work) and where[1] == "hello",
+            f"where {where}")
+
+    reqs = [q["body"] for q in t.requests()]
+    names = fake_provider.tool_names(reqs[0])
+    want = ["mcp__fake__" + x for x in ("echo", "image", "big", "slow", "fail", "refuse",
+                                       "crash", "structured", "where")]
+    t.check(names[-len(want):] == want and "read" in names, f"offered {names}")
+    echo = tooldef(reqs[0], "mcp__fake__echo")
+    t.check(echo["description"] == "(The MCP server fake) Repeat the text." and
+            "$schema" not in echo["parameters"] and echo["parameters"]["required"] == ["text"],
+            f"echo's definition {echo}")
+    img = tooldef(reqs[0], "mcp__fake__image")
+    t.check(img["parameters"] == {"type": "object", "properties": {}}, f"image's {img}")
+    sysp = fake_provider.system_of(reqs[0])
+    t.check("# MCP server instructions" in sysp and "## fake" in sysp and
+            "Use echo to repeat things." in sysp, "the server's instructions")
+    t.check(len(fake_provider.desk_images(reqs[2])) == 1, "the image reached the next request")
+    for a, b in zip(reqs, reqs[1:]):
+        t.check(a["tools"] == b["tools"], "the tools hold still")
+
+    log = mcplog(t)
+    methods = [m.get("method") for m in log]
+    t.check(methods[:2] == ["initialize", "notifications/initialized"] and
+            methods.count("tools/list") == 5, f"methods {methods}")
+    init = log[0]["params"]
+    t.check(init["protocolVersion"] == "2025-06-18" and
+            init["clientInfo"]["name"] == "prospero", f"initialize {init}")
+    resp = {m["id"]: m for m in log if "method" not in m}
+    t.check(resp.get("s1", {}).get("result") == {} and
+            resp.get("s2", {}).get("error", {}).get("code") == -32601,
+            f"answers to the server: {resp}")
+    calls = mcpcalls(t)
+    t.check(calls[0] == {"name": "echo", "arguments": {"text": "hi"}}, f"calls {calls[:1]}")
+
+
+@scenario(conf=mcpconf(), bound=15)
+def mcp_policy(t):
+    """Untrusted, unattended: the call is asked, denied by policy, and
+    never reaches the server."""
+    r = t.run(env=mcpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ask = r.last("ask")
+    t.check(ask.get("kind") == "mcp" and ask.get("tool") == "mcp__fake__echo" and
+            ask.get("server") == "fake" and ask.get("scope") == "mcp" and
+            ask.get("always") == "mcp__fake__echo" and
+            ask.get("detail") == 'MCP fake: echo {"text": "hi"}', f"ask {ask}")
+    ans = r.last("answer")
+    t.check(ans.get("decision") == "deny" and ans.get("by") == "policy", f"answer {ans}")
+    end = r.last("tool.end")
+    t.check(end["status"] == "denied" and "need the user's approval" in end["text"],
+            f"denied {end}")
+    t.check(not mcpcalls(t), "nothing called")
+
+
+@scenario(conf=mcpconf(command="/nonexistent/mcp-server"), bound=15)
+def mcp_broken(t):
+    """A server that cannot start: the session says so once and goes on
+    without its tools."""
+    r = t.run(env=mcpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    warns = [n["text"] for n in r.all("note") if "MCP server fake failed" in n["text"]]
+    t.check(len(warns) == 1, f"warned once: {[n['text'] for n in r.all('note')]}")
+    req = t.requests()[0]["body"]
+    t.check(not [x for x in fake_provider.tool_names(req) if x.startswith("mcp__")],
+            "nothing offered")
+    end = r.last("tool.end")
+    t.check(end["status"] == "error", f"an unknown tool {end}")
+
+
+@scenario(conf=mcpconf(enabled="no"), bound=10)
+def mcp_off(t):
+    """A disabled server is not started or offered."""
+    r = t.run(env=mcpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    req = t.requests()[0]["body"]
+    t.check(not [x for x in fake_provider.tool_names(req) if x.startswith("mcp__")],
+            "nothing offered")
+    t.check(not mcplog(t), "never started")
+
+
+@scenario(conf=mcpconf(tools="echo, image"), bound=15)
+def mcp_plan(t):
+    """The tools key offers only those named; in plan mode a tool that
+    does not say it only reads is refused, and one that does is asked."""
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", plan=1,
+                     attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ask = nextask(h, sid)
+        t.check(ask["tool"] == "mcp__fake__echo", f"echo asked {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 1)
+        st = [(e["status"], e["text"][:60]) for e in h.all("tool.end", sid)]
+        t.check([s for s, _ in st[:3]] == ["ok", "denied", "error"], f"statuses {st}")
+        t.check("plan mode" in st[1][1], f"why {st[1]}")
+        names = fake_provider.tool_names(t.requests()[0]["body"])
+        t.check([x for x in names if x.startswith("mcp__")] ==
+                ["mcp__fake__echo", "mcp__fake__image"], f"offered {names}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=mcpconf(), bound=30)
+def mcp_ask(t):
+    """Attended: a call allowed once, then always for that tool, which
+    stops its asks, but not another tool's, denied with a note. Another
+    process keeps the grant and the tools, from the session's prefix."""
+    env = mcpenv(t)
+    h = t.headless(env=env)
+    b = None
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        one = nextask(h, sid)
+        h.call("answer", sid=sid, req=one["req"], decision="allow")
+        two = nextask(h, sid, one["seq"])
+        t.check(two["detail"] == 'MCP fake: echo {"text": "two"}', f"two {two}")
+        r = h.call("answer", sid=sid, req=two["req"], decision="always")
+        t.check(r.get("ok") == 1, f"always {r}")
+        img = nextask(h, sid, two["seq"])
+        t.check(img["tool"] == "mcp__fake__image" and img["detail"] == "MCP fake: image",
+                f"the image asked, three not: {img}")
+        h.call("answer", sid=sid, req=img["req"], decision="deny", note="no pictures")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        st = [(e["status"], e["text"][:60]) for e in h.all("tool.end", sid)]
+        t.check([s for s, _ in st] == ["ok", "ok", "ok", "denied"], f"statuses {st}")
+        t.check("no pictures" in h.all("tool.end", sid)[-1]["text"], "the note")
+        g = [e for e in logged(t, sid) if e["ev"] == "grant"]
+        t.check(len(g) == 1 and g[0].get("mcp") == "mcp__fake__echo" and g[0]["by"] == "user",
+                f"the grant {g}")
+        pre = [e for e in logged(t, sid) if e["ev"] == "prefix"]
+        t.check(pre and [x["name"] for x in pre[-1].get("mcp", [])][:2] ==
+                ["mcp__fake__echo", "mcp__fake__image"], f"the prefix's table {pre[-1:]}")
+        t.check(h.close() == 0, "the first exits")
+        h = None
+
+        b = t.headless(env=env)
+        o = b.call("open", sid=sid, attended=1)
+        t.check(o.get("ok") == 1, f"open {o}")
+        b.send("prompt", sid=sid, text="again")
+        fail = nextask(b, sid, max(e["seq"] for e in logged(t, sid)))
+        t.check(fail["tool"] == "mcp__fake__fail", f"only fail asks: {fail}")
+        b.call("answer", sid=sid, req=fail["req"], decision="allow")
+        t.check(ended(b, sid, 2)["why"] == "done", "the second turn ends")
+        texts = [c["arguments"].get("text") for c in mcpcalls(t) if c["name"] == "echo"]
+        t.check(texts == ["one", "two", "three", "four"], f"echoed {texts}")
+        reqs = [q["body"] for q in t.requests()]
+        t.check(reqs[0]["tools"] == reqs[-1]["tools"], "the same tools in the later process")
+        inits = [m for m in mcplog(t) if m.get("method") == "initialize"]
+        t.check(len(inits) == 2, f"a server for each process: {len(inits)}")
+    finally:
+        rc = h.close() if h else 0
+        rc2 = b.close() if b else 0
+    t.check(rc == 0 and rc2 == 0, f"headless exit {rc} {rc2}")
+
+
+@scenario(conf=mcpconf(trust="yes", timeout=1), bound=15)
+def mcp_timeout(t):
+    """A call past the section's timeout is cancelled, and the server told."""
+    r = t.run(env=mcpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.last("tool.end")
+    t.check(end["status"] == "timeout" and "did not answer within" in end["text"],
+            f"timed out {end}")
+    can = [m for m in mcplog(t) if m.get("method") == "notifications/cancelled"]
+    call = [m for m in mcplog(t) if m.get("method") == "tools/call"]
+    t.check(len(can) == 1 and can[0]["params"]["requestId"] == call[0]["id"],
+            f"cancelled {can}")
+
+
+@scenario(conf=mcpconf(trust="yes"), bound=15)
+def mcp_cancel(t):
+    """A turn cancelled during a call tells the server."""
+    h = t.headless(env=mcpenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        deadline = time.monotonic() + 10
+        while not mcpcalls(t) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        h.call("cancel", sid=sid)
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "cancel", f"cancelled {end}")
+        te = h.all("tool.end", sid)
+        t.check(te and te[-1]["status"] == "cancelled", f"the call {te}")
+        deadline = time.monotonic() + 5
+        while (not [m for m in mcplog(t) if m.get("method") == "notifications/cancelled"]
+               and time.monotonic() < deadline):
+            time.sleep(0.05)
+        can = [m for m in mcplog(t) if m.get("method") == "notifications/cancelled"]
+        t.check(len(can) == 1 and can[0]["params"]["reason"] == "the user cancelled",
+                f"told {can}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf=mcpconf(trust="yes"), bound=20)
+def mcp_crash(t):
+    """A server that exits fails its call with what it wrote to standard
+    error, and the next call too while it may not start again; after
+    that, a call starts it again."""
+    r = t.run(env=mcpenv(t, PROSPERO_TEST_MINUTE_MS="2000"))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    st = [(e["status"], e["text"]) for e in r.all("tool.end")]
+    t.check([s for s, _ in st] == ["error", "error", "ok"], f"statuses {st}")
+    t.check("it exited" in st[0][1] and "crashing as asked" in st[0][1], f"crash {st[0]}")
+    t.check("failed, so the call was not made" in st[1][1], f"too soon {st[1]}")
+    t.check(st[2][1] == "echo: again", f"again {st[2]}")
+    inits = [m for m in mcplog(t) if m.get("method") == "initialize"]
+    t.check(len(inits) == 2, f"started twice: {len(inits)}")
+
+
+@scenario(conf={**mcpconf(trust="yes"),
+                "_extra": "[role picky]\ndescription = Picks\ntools = read, mcp__fake__echo\n"},
+          bound=20)
+def mcp_subagent(t):
+    """Subagents have their parent's MCP tools, a role with a tools list
+    only those it names, and they share the parent's server."""
+    r = t.run(env=mcpenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    sid, _ = r.sessions()
+    said = [e["text"] for e in r.all("tool.end", sid)]
+    every = ",".join("mcp__fake__" + x for x in ("echo", "image", "big", "slow", "fail",
+                                                  "refuse", "crash", "structured", "where"))
+    t.check(said == [every, "mcp__fake__echo"], f"offered: {said}")
+    texts = sorted(c["arguments"]["text"] for c in mcpcalls(t))
+    t.check(texts == ["general", "picky"], f"both called it: {texts}")
+    inits = [m for m in mcplog(t) if m.get("method") == "initialize"]
+    t.check(len(inits) == 1, f"one server for all: {len(inits)}")
+
+
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")
 
 

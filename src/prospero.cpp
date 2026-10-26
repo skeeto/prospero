@@ -582,6 +582,7 @@ static Arena newarena(Region *r)
 #include "instructions.cpp"
 #include "skills.cpp"
 #include "config.cpp"
+#include "mcp.cpp"
 #include "admit.cpp"
 #include "compact.cpp"
 #include "engine.cpp"

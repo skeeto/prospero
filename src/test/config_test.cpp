@@ -371,7 +371,7 @@ static void testcfgvalidate(Test *t)
         "*, default\n"
         "/c/prospero.ini:21:2: warning: unknown section kind \"provider\", "
         "expected endpoint, model, role, guard, tools, instructions, skills, "
-        "ui, desktop, host or remote\n"
+        "ui, desktop, host, remote or mcp\n"
         "/c/prospero.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "

@@ -176,6 +176,7 @@ enum : i32 {
     LIVE_ASK,
     LIVE_QUEUED,      // waiting for its turn at the endpoint
     LIVE_TASK,        // waiting for its subagents
+    LIVE_MCP,         // waiting for its MCP servers to start
     LIVE_COMPACTING,  // a summary request runs
     LIVE_CLOSED,
     LIVE_COUNT,
@@ -183,7 +184,7 @@ enum : i32 {
 
 static Str livenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "queued", "task", "compacting", "closed",
+    "ask", "queued", "task", "mcp", "compacting", "closed",
 };
 static_assert(countof(livenames) == LIVE_COUNT);
 

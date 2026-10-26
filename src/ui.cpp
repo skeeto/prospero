@@ -616,7 +616,8 @@ static Str livelabel(View *v, i32 state)
     if (v && v->busy && state==LIVE_IDLE) {
         return "working";
     }
-    return state==LIVE_TASK ? Str("subagents") : livenames[state];
+    return state==LIVE_TASK ? Str("subagents") :
+           state==LIVE_MCP  ? Str("starting MCP servers") : livenames[state];
 }
 
 // A whole number with thousands separated: 12,345.
@@ -1559,8 +1560,10 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
     ImGui::SetItemTooltip("Let the %s go ahead", t->tool.len ? cstr0(&a, t->tool) : "tool");
 
     b32 desk   = t->scope == "desktop";
+    b32 mcp    = t->scope == "mcp";
     b32 always = t->grant.len &&
-                 hostcap(s->host, desk ? Str("answer.always.desktop") : Str("answer.always"));
+                 hostcap(s->host, desk ? Str("answer.always.desktop") :
+                                  mcp  ? Str("mcp") : Str("answer.always"));
     if (always) {
         f32 sp = ImGui::GetStyle().ItemSpacing.x;
         f32 h  = ImGui::GetFrameHeight();
@@ -1578,6 +1581,17 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
             runs[0] = "Allow ";
             runs[1] = t->grant;
             runs[2] = " for this session";
+        } else if (mcp) {
+            // The tool's own name, after mcp__SERVER__, cut if long
+            Str tool = t->grant;
+            iz  at   = find(cuthead(tool, 5), "__");
+            tool = startswith(tool, "mcp__") && at>=0 ? cuthead(tool, 5+at+2) : tool;
+            if (tool.len > 24) {
+                tool = concat(&a, utf8head(tool, 23), "\xe2\x80\xa6");
+            }
+            runs[0] = "Always allow ";
+            runs[1] = tool;
+            runs[2] = "";
         } else {
             // Its last name, cut to its end if long, so that the
             // buttons fit; the tooltip has the whole path
@@ -1601,6 +1615,10 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         if (desk) {
             ImGui::SetItemTooltip("Allow this action, and every %s action from now on in "
                                   "this session and its subagents, without asking",
+                                  cstr0(&a, t->grant));
+        } else if (mcp) {
+            ImGui::SetItemTooltip("Allow this, and every call to %s from now on in this "
+                                  "session and its subagents, without asking",
                                   cstr0(&a, t->grant));
         } else {
             ImGui::SetItemTooltip("Allow this, and every %s in %s from now on in this "

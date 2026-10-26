@@ -2162,6 +2162,94 @@ def sc_desktop_cancel(model, n, req):
         yield from answer(model, "Should not be reached.")
 
 
+# MCP: tests/fake_mcp.py as the server "fake", its tools mcp__fake__*.
+# A step is a call (name, args), a call after a pause (secs, name, args),
+# or the text of an answer that ends the turn.
+
+def mcp_steps(model, n, req, steps):
+    k = step(req)
+    act = steps[k] if k < len(steps) else None
+    if act is None:
+        yield from answer(model, "Heard: " + " | ".join(desk_results(req)))
+    elif isinstance(act, str):
+        yield from answer(model, act)
+    elif len(act) == 3:
+        yield S.head()
+        yield S.sleep(act[0])
+        yield from call(model, 0, f"call_{n}", act[1], act[2], 2)
+        yield from finish(model, "tool_calls")
+    else:
+        yield from tool(model, n, *act)
+
+
+def sc_mcp_flow(model, n, req):
+    yield from mcp_steps(model, n, req, [
+        ("mcp__fake__echo", {"text": "hi"}),
+        ("mcp__fake__image", {}),
+        ("mcp__fake__fail", {}),
+        ("mcp__fake__structured", {}),
+        ("mcp__fake__refuse", {}),
+        ("mcp__fake__big", {"n": 60000}),
+        ("mcp__fake__where", {}),
+        "Done with MCP."])
+
+
+def sc_mcp_policy(model, n, req):
+    yield from mcp_steps(model, n, req, [("mcp__fake__echo", {"text": "hi"})])
+
+
+sc_mcp_broken = sc_mcp_policy
+sc_mcp_off = sc_mcp_policy
+sc_mcp_plan = sc_mcp_flow
+
+
+def sc_mcp_ask(model, n, req):
+    # Two turns, the second in a later process
+    yield from mcp_steps(model, n, req, [
+        ("mcp__fake__echo", {"text": "one"}),
+        ("mcp__fake__echo", {"text": "two"}),
+        ("mcp__fake__echo", {"text": "three"}),
+        ("mcp__fake__image", {}),
+        "Done once.",
+        ("mcp__fake__echo", {"text": "four"}),
+        ("mcp__fake__fail", {}),
+        "Done again."])
+
+
+def sc_mcp_timeout(model, n, req):
+    yield from mcp_steps(model, n, req, [("mcp__fake__slow", {"seconds": 30})])
+
+
+sc_mcp_cancel = sc_mcp_timeout
+
+
+def sc_mcp_crash(model, n, req):
+    # The restart waits for half of PROSPERO_TEST_MINUTE_MS, 1 s here
+    yield from mcp_steps(model, n, req, [
+        ("mcp__fake__crash", {}),
+        ("mcp__fake__echo", {"text": "too soon"}),
+        (1.5, "mcp__fake__echo", {"text": "again"})])
+
+
+def sc_mcp_subagent(model, n, req):
+    # A subagent of each role: general has every MCP tool, "picky" only
+    # echo, and each says which it was offered
+    k = step(req)
+    if "# Subagent" in system_of(req):
+        if k == 0:
+            yield from tool(model, n, "mcp__fake__echo", {"text": task_prompt(req)})
+        else:
+            mine = [x for x in tool_names(req) if x.startswith("mcp__")]
+            yield from answer(model, ",".join(mine))
+        return
+    if k == 0:
+        yield from calls(model, n, [
+            ("task", {"description": "Any", "prompt": "general", "role": "general"}),
+            ("task", {"description": "Picky", "prompt": "picky", "role": "picky"})])
+    else:
+        yield from answer(model, " / ".join(tool_results(req)))
+
+
 # The GUI's checklist (prospero gui --drive, run by tests/gui.py): the
 # prompt that began the turn picks the reply, and the step is how many
 # responses the turn has had so far.

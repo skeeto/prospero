@@ -205,6 +205,8 @@ static Str capnames[] = {
     "background",      // background: the user moves a running command to a
                        // job, or subagents on, their reports as notices
                        // of kind task (turn via "task")
+    "mcp",             // MCP servers' tools, asks of kind mcp whose always
+                       // is the tool, grants by mcp, and the state "mcp"
     "models",          // models, each endpoint's listing and the defaults;
                        // new and import split ENDPOINT/MODEL, and default
                        // to the first endpoint and model there are
