@@ -9140,7 +9140,8 @@ enum : i32 {
     CHK_NOFOLDER,     // the session shown is in a folder of its own
     CHK_PATHPICK,     // the directory's dropdown lists dx folders, the first
                       // text if any (0: not drawn)
-    CHK_NEWCWD,       // the directory's field is --cwd and text (drivepath)
+    CHK_NEWCWD,       // the directory's field is --cwd and text (drivepath),
+                      // or with dx, ends with text
     CHK_SESSDIR,      // the session shown works in a directory ending in text
     CHK_FIRSTSIZE,    // the window opened at its first size, or maximized
     CHK_FIRSTRUN,     // Help floats centered, selected; Settings and Hosts
@@ -12020,6 +12021,12 @@ static DriveOp launchops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    // A recent directory fills the field, the dialog staying open
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new recent"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_NEWCWD, 1, 0, 0, "/work/opened"},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
     {OP_MOVE, T_NAMED, 0, 0, 100, "new nofolder"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
@@ -14788,7 +14795,13 @@ static b32 drivecheck(Gui *g, i32 chk)
         Arena    a  = g->frame;
         DriveOp *op = &g->ops[g->drivepc-1];
         Str      f  = {(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)};
-        return ImGui::GetTopMostPopupModal() && f==drivepath(g, &a, op->text);
+        Str      w  = drivepath(g, &a, op->text);
+        if (op->dx != 0) {
+            // A session's directory, symlinks resolved: its end alone
+            w = cuthead(w, w.len - op->text.len);
+            return ImGui::GetTopMostPopupModal() && endswith(f, w);
+        }
+        return ImGui::GetTopMostPopupModal() && f==w;
     }
     case CHK_SESSDIR: {
         Arena    a   = g->frame;

@@ -6268,9 +6268,13 @@ static void drawnew(Gui *g)
         ImGui::TextDisabled("Recent");
         for (iz i = 0; i < recent.len; i++) {
             ImGui::PushID((i32)i);
+            // Only fills the field: a Selectable would close the dialog
             Str shown = homeshow(&a, host, recent[i]);  // ~ as the host has it
-            if (ImGui::Selectable(cstr0(&a, shown))) {
+            if (ImGui::Selectable(cstr0(&a, shown), false, ImGuiSelectableFlags_NoAutoClosePopups)) {
                 fieldput(g->newcwd, shown);
+            }
+            if (!i) {
+                itemnamed(g, "new recent");
             }
             ImGui::PopID();
         }
