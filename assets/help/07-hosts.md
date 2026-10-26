@@ -43,9 +43,9 @@ after it ("Debian (WSL)"), reached through `wsl.exe` rather than ssh:
 nothing to set up in the distro but an engine, which deploying puts
 there as for any Linux machine (with `cat`, as a distro has no scp).
 Look again in the Hosts pane lists them anew. Docker Desktop's own
-distros are left out. An unconfigured distro shows in the sidebar only
-while connected; its Settings button in the Hosts pane gives it a
-`[remote NAME]` section with `wsl = DISTRO`, to change its settings.
+distros are left out. An unconfigured distro's Settings button in the
+Hosts pane gives it a `[remote NAME]` section with `wsl = DISTRO`, to
+change its settings.
 A section with `wsl = DISTRO` in place of `ssh` names one yourself,
 under another name, and `prospero connect NAME` and `prospero deploy
 NAME` take a distro's name too. The engine runs in the distro's home

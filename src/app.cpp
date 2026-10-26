@@ -1129,6 +1129,7 @@ struct Gui {
     char              *newfilter;  // the model picker's text
     b32                newcheck;   // keep the pick only if still listed
     GuiHost           *newlisted;  // the host the dialog asked for models
+    b32                picklisted; // the open model picker's host was asked
     Str                firstcwd;   // newcwd's first, a directory here
     Str                newerr;
     u64                browseask;  // its Browse dialog's latest ask
@@ -1786,18 +1787,23 @@ static void firstlisted(Gui *, GuiHost *);
 // Ask a host's engine for its endpoints' models (models), unless asked
 // already: when a new session's dialog shows it, and the main host's
 // once as it comes up. An engine without the command keeps the text
-// field and its configuration's models.
-static void hostlist(Gui *g, GuiHost *h)
+// field and its configuration's models. Returns whether a listing is
+// under way: not for a host that cannot be asked yet (connecting, its
+// hello unanswered), which a caller asks again.
+static b32 hostlist(Gui *g, GuiHost *h)
 {
-    if (h->listid || !h->up || !hostcan(h, "models") || !engineup(g) ||
+    if (h->listid) {
+        return 1;
+    } else if (!h->up || !hostcan(h, "models") || !engineup(g) ||
             (h->kind!=GH_ENGINE && (!h->r || h->closing))) {
-        return;
+        return 0;
     }
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 64);
     EvOut w = cmdopen(g, &b, CMD_MODELS, 0, h);
     h->listid = g->nextid;
     cmdsend(g, &w, a);
+    return 1;
 }
 
 // A host's answer to hostlist, kept anew only when it changed. A failed
@@ -5128,16 +5134,13 @@ static LinkTo *wslautohost(Gui *g, Str name)
 }
 
 // A remote's setting, as remoterow, or for an unconfigured WSL distro
-// as if [remote NAME] said wsl = DISTRO and list = connected: in the
-// sidebar only while connected, so that idle distros do not crowd it.
+// as if [remote NAME] said wsl = DISTRO.
 static Str remoteset(Gui *g, Str name, Str key)
 {
     Str     v = remoterow(g, name, key);
     LinkTo *w = v.len ? 0 : wslautohost(g, name);
     if (w && key=="wsl" && !remoterow(g, name, "ssh").len) {
         return w->wsl;
-    } else if (w && key=="list") {
-        return "connected";
     }
     return v;
 }
@@ -8662,10 +8665,12 @@ enum : i32 {
     CHK_QUEUETAIL,    // the first queued message is drawn below the last
                       // message, inside the transcript
     CHK_QUEUEKEPT,    // queued messages left the tail untaken dx times
-    CHK_WSLLISTED,    // the WSL distro Deb is a remote, not in the sidebar
-                      // until connected, and docker-desktop is none
+    CHK_WSLLISTED,    // the WSL distro Deb is a remote, in the sidebar, and
+                      // docker-desktop is none
     CHK_WSLFAILED,    // Deb, with no engine there, failed offering to deploy
     CHK_WSLSECTION,   // Deb's Settings wrote [remote Deb] wsl = Deb
+    CHK_NEWLISTED,    // the new session dialog's remote host listed its
+                      // models, with the dialog open all along
     CHK_COUNT,
 };
 
@@ -8880,9 +8885,10 @@ static Str chknames[] = {
     "the new session has the endpoint and model picked",
     "the queued message shows in the transcript, below its last message",
     "a queued message left the transcript only when withdrawn or taken in",
-    "the WSL distro is listed as a remote, outside the sidebar, Docker's not",
+    "the WSL distro is listed as a remote, in the sidebar too, Docker's not",
     "the WSL distro with no engine in it failed, offering to deploy one",
     "the WSL distro's Settings wrote a section of its own for it",
+    "the dialog's remote host's models came, the dialog open all along",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -8943,6 +8949,7 @@ enum : i32 {
     W_WSLLISTED,  // WSL distros were listed
     W_WSLFAILED,  // the WSL distro Deb failed
     W_WSLSECTION, // the configuration has [remote Deb]
+    W_NEWLISTED,  // the new session dialog's host listed its models
 };
 
 static Str waitnames[] = {
@@ -8959,9 +8966,9 @@ static Str waitnames[] = {
     "a named item", "a launch to hand off", "the import", "the export",
     "the plan", "the menu's pick", "the drafts kept", "the offer to deploy",
     "the side chat", "the WSL distros", "the WSL distro to fail",
-    "the WSL distro's section",
+    "the WSL distro's section", "the dialog's host's models",
 };
-static_assert(countof(waitnames) == W_WSLSECTION+1);
+static_assert(countof(waitnames) == W_NEWLISTED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -10949,7 +10956,7 @@ static DriveOp remoteops[] = {
     {OP_WAIT, W_DEPLOYOFFER, 0, 0, 30000, ""},
     {OP_CHECK, CHK_DEPLOYOFFER, 0, 0, 0, ""},
     // An installed WSL distro, through a stand-in for wsl.exe: a remote
-    // by itself, kept from the sidebar, Docker Desktop's left out. With
+    // by itself, in the sidebar, Docker Desktop's left out. With
     // no engine in it, it fails, offering to deploy one; its Settings
     // begin a section of its own
     {OP_IFWSL, 0, 15, 0, 0, ""},
@@ -10982,6 +10989,8 @@ static DriveOp remoteops[] = {
     {OP_MOVE, T_HOSTITEM, 0, 0, 100, "r"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_NEWLISTED, 0, 0, 15000, ""},
+    {OP_CHECK, CHK_NEWLISTED, 0, 0, 0, ""},
     {OP_CHECK, CHK_BROWSEOFF, 0, 0, 0, ""},
     {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -12546,6 +12555,8 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_WSLSECTION:
         return cfghas(g, "remote", "Deb");
+    case W_NEWLISTED:
+        return g->newhost && g->newhost->listgot;
     case W_DEPLOYOFFER: {
         GuiHost *h = findhost(g, GH_REMOTE, "missing");
         return !hasremote(g, "missing") || (h && h->state==RS_FAILED && h->deploys);
@@ -14304,7 +14315,7 @@ static b32 drivecheck(Gui *g, i32 chk)
             docker |= startswith(Str{g->named[i].name, g->named[i].len}, "connect docker");
         }
         return deb && !docker && wslautohost(g, "Deb") && !wslautohost(g, "docker-desktop") &&
-               remoteset(g, "Deb", "wsl")=="Deb" && !remotelisted(g, 0, "Deb");
+               remoteset(g, "Deb", "wsl")=="Deb" && remotelisted(g, 0, "Deb");
     }
     case CHK_WSLFAILED: {
         Arena    a = g->frame;
@@ -14315,8 +14326,14 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_WSLSECTION:
         return cfghas(g, "remote", "Deb") && remoterow(g, "Deb", "wsl")=="Deb" &&
-               remoterow(g, "Deb", "list")=="connected" && !wslautohost(g, "Deb") &&
+               !remoterow(g, "Deb", "list").len && !wslautohost(g, "Deb") &&
                remoteset(g, "Deb", "wsl")=="Deb" && g->cfgpname=="Deb";
+    case CHK_NEWLISTED: {
+        GuiHost *h = g->newhost;
+        ImGuiWindow *w = ImGui::GetTopMostPopupModal();
+        return h && h->kind==GH_REMOTE && h->listgot && !h->listid && w &&
+               find({(u8 *)w->Name, (iz)__builtin_strlen(w->Name)}, "New session")>=0;
+    }
     case CHK_REMOTEFAILED: {
         GuiHost *h = findhost(g, GH_REMOTE, "bad");
         return h && h->state==RS_FAILED && !h->r && g->failshown &&

@@ -31,7 +31,8 @@
 //
 // Several clients may attach at once, and each receives what it asks
 // for. Commands go to the engine with ids of the host's own, and their
-// replies come back, in order, to whoever asked under the asker's ids;
+// replies come back, in order (but for models, which answers once its
+// endpoints do), to whoever asked under the asker's ids;
 // records without a session (the sessions list) go to the asker of the
 // command they answer. Session records go to the clients that opened
 // the session (open or new), or one it is a subagent of, under the
@@ -89,6 +90,7 @@ static_assert(HOST_KEEPMAX >= FRAME_HEAD + FRAME_MAX + HOST_KEEPMAX/32);
 
 enum : i32 {
     HOST_CMDS = 4096,  // commands awaiting replies, at most
+    HOST_LATE = 64,    // of those, models, whose replies come out of order
 };
 
 // Records other threads post to a host's inbox (hoststop)
@@ -308,6 +310,8 @@ struct Host {
     HostCmd        *cmds;      // a ring of HOST_CMDS
     i32             cmdhead;
     i32             cmdlen;
+    HostCmd        *late;      // models commands, oldest first, apart
+    i32             latelen;   // from the ring, as they reply late
     i64             nextid;
     i64             idle;      // ticks of quiet before exiting
     i64             grace;     // ticks a client keeps its place without a stream
@@ -442,16 +446,36 @@ static HostCmd *hostcmdat(Host *h, i32 i)
     return &h->cmds[(h->cmdhead + i) % HOST_CMDS];
 }
 
+static void hostreply(Host *, HostClient *, Arena, i64, b32, Str, Str);
+
 // Send a command to the engine under a fresh id, the line as a parsed
 // object with id replaced, and with from and attended replaced where
-// given (from < 0 drops it). Null if too many wait already.
+// given (from < 0 drops it). Null if too many wait already. A models
+// command replies once its endpoints answer, after those sent later, so
+// it waits apart from the ring, whose replies come in order; a full
+// list of them gives up on the oldest, whose reply must have been lost.
 static HostCmd *hostforward(Host *h, Arena scratch, Json *j, i32 cmd, i32 kind,
                             i64 from, i32 attended)
 {
-    if (h->cmdlen == HOST_CMDS) {
+    HostCmd *q = 0;
+    if (cmd == CMD_MODELS) {
+        if (h->latelen == HOST_LATE) {
+            HostCmd old = h->late[0];
+            if (old.client) {
+                hostreply(h, old.client, scratch, old.cid, 0,
+                          "the reply was lost: try again", {});
+            }
+            h->latelen--;
+            for (i32 i = 0; i < h->latelen; i++) {
+                h->late[i] = h->late[i+1];
+            }
+        }
+        q = &h->late[h->latelen++];
+    } else if (h->cmdlen == HOST_CMDS) {
         return 0;
+    } else {
+        q = hostcmdat(h, h->cmdlen++);
     }
-    HostCmd *q = hostcmdat(h, h->cmdlen++);
     *q = {};
     q->id   = ++h->nextid;
     q->kind = kind;
@@ -636,6 +660,11 @@ static void hostdrop(Host *h, HostClient *c, Arena scratch)
         HostCmd *q = hostcmdat(h, i);
         if (q->client == c) {
             q->client = 0;  // its reply goes nowhere
+        }
+    }
+    for (i32 i = 0; i < h->latelen; i++) {
+        if (h->late[i].client == c) {
+            h->late[i].client = 0;
         }
     }
     for (HostClient **p = &h->clients; *p; p = &(*p)->next) {
@@ -845,6 +874,19 @@ static void hostreplied(Host *h, Arena scratch, EvRec *r, Str line)
 {
     i64 id = jsonint(jsonget(r->root, "id"), 0);
     i64 ok = jsonint(jsonget(r->root, "ok"), 0);
+    for (i32 i = 0; i < h->latelen; i++) {
+        HostCmd q = h->late[i];
+        if (q.id == id) {
+            h->latelen--;
+            for (i32 k = i; k < h->latelen; k++) {
+                h->late[k] = h->late[k+1];
+            }
+            if (q.client) {
+                hostmust(h, q.client, scratch, hostreid(&scratch, r->root, q.cid));
+            }
+            return;
+        }
+    }
     if (!h->cmdlen || id<hostcmdat(h, 0)->id) {
         return;  // not one of the host's
     }
@@ -1408,6 +1450,7 @@ static Host *newhost(Os *os, Arena *perm, Arena scratch, HostConf *hc, Str *err)
     h->endpoint = os_endpoint(os, perm, h->statedir, hostname(perm, HOST_PROTO));
     h->scratch  = os_reserve(os, HOST_SCRATCH);
     h->cmds     = alloc<HostCmd>(perm, HOST_CMDS);
+    h->late     = alloc<HostCmd>(perm, HOST_LATE);
     h->idle     = hc->idle;
     h->grace    = hostticks(h->cfg, "grace");
     h->busyat   = os_ticks(os);

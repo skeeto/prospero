@@ -4347,8 +4347,11 @@ static void listitems(Gui *g, Arena a, GuiSession *s)
     Str      now = v && v->model.len ? v->model : s->model;
     Str      url = v ? v->endpoint : Str{};
     if (ImGui::IsWindowAppearing()) {
-        hostlist(g, h);  // anew, the last answer shown meanwhile
+        g->picklisted  = 0;  // anew, the last answer shown meanwhile
         g->modelbuf[0] = 0;
+    }
+    if (!g->picklisted) {
+        g->picklisted = hostlist(g, h);  // once it can be asked
     }
     ImGui::SetNextItemWidth(280*g->scale);
     Str filter = {};
@@ -4816,8 +4819,8 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
             b32 b = ImGui::SmallButton(cbtn);
             ImGui::EndDisabled();
             itemnamed(g, concat(&a, "connect ", r->key));
-            ImGui::SetItemTooltip(live ? "Leave it: its sessions run on there" :
-                                         "Connect over ssh, starting a host there if none runs");
+            ImGui::SetItemTooltip("%s", live ? "Leave it: its sessions run on there" :
+                                               connecttip(g, r->key));
             if (b && live) {
                 hostclose(g, h);
             } else if (b) {
@@ -6085,9 +6088,8 @@ static void drawnew(Gui *g)
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Model");
-    if (g->newlisted != host) {
-        g->newlisted = host;
-        hostlist(g, host);
+    if (g->newlisted!=host && hostlist(g, host)) {
+        g->newlisted = host;  // asked, or else again once it can be
     }
     drawnewmodel(g, a, host);
 
@@ -6481,7 +6483,6 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         ImGui::SameLine();
         if (ImGui::SmallButton("Settings")) {
             guiconfigset(g, "remote", name, "wsl", auto_->wsl);
-            guiconfigset(g, "remote", name, "list", "connected");
             cfgselect(g, "remote", name);
             g->cfgshowsel = 1;
             setpane(g, PANE_SETTINGS, 1);
