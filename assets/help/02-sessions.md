@@ -60,6 +60,12 @@ agent (Tab completes the name):
 - `/NAME [args]` uses the skill NAME (see
   [Instructions and skills](help:instructions)).
 
+A change to the session, a model switched, a mode, a new title, shows
+in the transcript as a line between messages, kept with the session;
+the agent does not see it. What a command or an editor came to shows
+over the foot of the transcript: an error until you type or close it,
+anything else for a few seconds.
+
 ## Modes
 
 The mode list below Send has three modes:

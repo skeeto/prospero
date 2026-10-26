@@ -85,6 +85,7 @@ enum : i32 {
     VIEW_ASK,
     VIEW_COMPACT,  // a compaction's card
     VIEW_REWIND,   // a rewind's card
+    VIEW_MARK,     // a change to the session, one line: its label, then text
 };
 
 // How tool rows fold ([ui] tools)
@@ -358,6 +359,7 @@ struct ViewMsg {
     i64       ts1;        //   ms, or 0 where it did not stream
     Str       label;      // the header, if not the role's name
     Str       from;       // a message's sender, a session's id, or the
+                          // endpoint's URL of a mark of a model, or the
     b32       fromkid;    // subagent whose report it is (kind task)
     ViewTool *tool;       // tool rows and asks
     ViewCard *card;       // compactions and rewinds
@@ -647,6 +649,17 @@ static i32 addmsg(View *v, i32 role, Str text)
     v->provmixed |= v->prov >= 0;
     v->stream     = -1;  // later deltas start a new message after it
     return (i32)v->msgs.len - 1;
+}
+
+// A change to the session, as a line of the transcript that the agent
+// does not see: what changed (label) and to what (text).
+static i32 addmark(View *v, i64 seq, Str label, Str text)
+{
+    i32 i = addmsg(v, VIEW_MARK, text);
+    v->msgs[i].seq       = seq;
+    v->msgs[i].label     = label;
+    v->msgs[i].collapsed = 1;  // the header alone
+    return i;
 }
 
 // Replace a message's text.
@@ -1429,18 +1442,32 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
 
     case EV_TITLE:
         v->title = clone(&v->aux, jsonstr(jsonget(j, "text")));
+        if (jsonstr(jsonget(j, "by")) == "user") {
+            addmark(v, r->seq, "Renamed", v->title);
+        }
         return 1;
 
-    case EV_MODEL:
+    case EV_MODEL: {
         // Switched for the rest of the session (model)
         v->model    = clone(&v->aux, jsonstr(jsonget(j, "model")));
         v->endpoint = clone(&v->aux, jsonstr(jsonget(j, "endpoint")));
-        return 1;
+        i32 i = addmark(v, r->seq, "Model", v->model);
+        v->msgs[i].from = v->endpoint;
+    } return 1;
 
     case EV_MODE: {
-        Str path = jsonstr(jsonget(j, "path"));
-        v->plan     = jsonstr(jsonget(j, "mode")) == "plan";
-        v->bypass   = jsonstr(jsonget(j, "mode")) == "bypass";
+        Str path   = jsonstr(jsonget(j, "path"));
+        b32 plan   = jsonstr(jsonget(j, "mode")) == "plan";
+        b32 bypass = jsonstr(jsonget(j, "mode")) == "bypass";
+        if (plan!=v->plan || bypass!=v->bypass) {
+            addmark(v, r->seq, plan   ? Str("Plan mode")   :
+                               bypass ? Str("Bypass mode") : Str("Build mode"),
+                    plan   ? Str("the agent changes nothing but its plan") :
+                    bypass ? Str("the agent asks nothing, inside or outside its directory") :
+                             Str("plan mode and Bypass are off"));
+        }
+        v->plan     = plan;
+        v->bypass   = bypass;
         v->planpath = path==v->planpath ? v->planpath : clone(&v->aux, path);
         v->planver++;
     } return 1;

@@ -963,6 +963,17 @@ static void printage(Gui *g, Buf *b, i64 ms)
 static GuiSession *taskchild(Gui *, GuiSession *, ViewTool *);
 
 // A message's header line: who, or what a tool did, or an ask's state.
+// What a mark of a change to the session says after its label: a model
+// as the pickers name it, ENDPOINT/MODEL.
+static Str markwhat(Gui *g, Arena *a, ViewMsg *m)
+{
+    GuiSession *s = g->sess;
+    if (m->label=="Model" && s && hostcan(s->host, "models")) {
+        return modelshown(a, s->host, m->from, m->text);
+    }
+    return m->text;
+}
+
 static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
 {
     Arena     a   = g->frame;
@@ -1191,6 +1202,20 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
                       t->by=="interrupted" ? Str(": the harness stopped while asking") :
                       t->by=="stopped" ? Str(": the engine stopped") : Str(""));
             pen(p, finish(&c), STYLE_BOLD, ok ? pal->ok : pal->bad);
+        }
+    } break;
+    case VIEW_MARK: {
+        // A divider: a rule, what changed, to what, and the rule on
+        f32 mid  = p->y + p->size*0.6f;
+        f32 sc   = g->scale;
+        u32 rule = pal->rule;
+        p->dl->AddLine(v2(p->x, mid), v2(p->x + 14*sc, mid), rule, sc);
+        p->x += 20*sc;
+        pen(p, m->label, STYLE_BOLD, dim);
+        pen(p, m->label=="Model" ? Str("  ") : Str(": "), 0, dim);
+        pen(p, markwhat(g, &a, m), m->label=="Model" ? STYLE_CODE : 0, dim);
+        if (p->x + 6*sc < p->right) {
+            p->dl->AddLine(v2(p->x + 6*sc, mid), v2(p->right, mid), rule, sc);
         }
     } break;
     default:
@@ -2669,6 +2694,78 @@ static void drawqueue(Gui *g, GuiSession *s, Slice<QueueShow> shows, f64 y,
     }
 }
 
+// The session's note, what the latest command from the box came to, or
+// the editor at work on its draft: a toast over the foot of the
+// transcript (r0 to r1), which moves nothing. A note that is not an
+// error fades after a few seconds; an error stays until the next is
+// typed, or its x dismisses it.
+static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
+{
+    enum : i64 { LIFE = 6*1000*1000 };  // µs, as the scheduler counts
+    g->toasted   = 1;
+    g->editshown = 0;
+    Arena a       = g->frame;
+    f32   sc      = g->scale;
+    b32   editing = g->edsess && g->edsess==s && !g->edplan;
+    b32   fresh   = s->noteerr || g->sched.now-s->noteat<LIFE;
+    if (s->note.len && !s->noteerr && fresh) {
+        schedat(&g->sched, s->noteat + LIFE, DUE_CLOCK);
+    }
+    if (!editing && !(s->note.len && fresh)) {
+        return;
+    }
+
+    ImGuiStyle &st   = ImGui::GetStyle();
+    f32         pad  = 8*sc;
+    f32         room = r1.x - r0.x - st.ScrollbarSize - 24*sc;
+    f32         w    = 560*sc<room ? 560*sc : room;
+    if (w < 120*sc) {
+        return;  // no room
+    }
+    Str  text = editing ? concat(&a, concat(&a, "Editing in ", g->edname), "...") : s->note;
+    Str  btn  = editing ? Str("Cancel") : Str("\xc3\x97");  // a multiplication sign
+    f32  bw   = ImGui::CalcTextSize(cstr0(&a, btn)).x + 2*st.FramePadding.x;
+    f32  tw   = w - 2*pad - bw - st.ItemSpacing.x;
+    f32  th   = ImGui::CalcTextSize(cstr0(&a, text), 0, false, tw).y;
+    f32  fh   = ImGui::GetFrameHeight();
+    f32  h    = (th>fh ? th : fh) + 2*pad;
+    u32  edge = s->noteerr && !editing ? g->pal->bad : g->pal->rule;
+    ImGui::SetCursorScreenPos(v2(r0.x + 12*sc, r1.y - h - 10*sc));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, g->pal->frame);
+    ImGui::PushStyleColor(ImGuiCol_Border, edge);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6*sc);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, v2(pad, pad));
+    ImGui::BeginChild("##toast", v2(w, h), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                      ImGuiWindowFlags_NoSavedSettings);
+    ImGui::SetCursorPos(v2(pad, pad + (fh>th ? (fh-th)/2 : 0)));
+    ImGui::PushStyleColor(ImGuiCol_Text, editing      ? g->pal->paneltext :
+                                         s->noteerr   ? g->pal->bad : g->pal->paneldim);
+    ImGui::PushTextWrapPos(pad + tw);
+    ImGui::TextUnformatted(cstr0(&a, text));
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+    itemnamed(g, "toast");
+    ImGui::SetCursorPos(v2(w - pad - bw, pad));
+    if (editing) {
+        if (ImGui::Button("Cancel")) {
+            editcancel(g);
+        }
+        ImGui::SetItemTooltip("Stop the editor, leaving the draft as it was");
+        itemrect(g, RECT_EDITCANCEL);
+        g->editshown = 1;
+    } else {
+        if (ImGui::Button(cstr0(&a, concat(&a, btn, "##toastx")))) {
+            s->note = {};
+        }
+        itemnamed(g, "dismiss");
+        ImGui::SetItemTooltip("Dismiss");
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+}
+
 static void drawtranscript(Gui *g)
 {
     GuiSession *gs = g->sess ? g->sess : &g->nosession;
@@ -3024,6 +3121,9 @@ static void drawtranscript(Gui *g)
     gs->stick = scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh;
     ImGui::EndChild();
     ImGui::PopID();
+    if (g->sess == gs) {
+        drawtoast(g, gs, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    }
 
     if (g->opendeny) {
         ImGui::OpenPopup("##denynote");
@@ -3618,13 +3718,18 @@ static void drawprompt(Gui *g)
     g->slashshown  = 0;
     g->cmenushown  = 0;
     g->histshown   = 0;
-    g->editshown   = 0;
     g->attshown    = 0;
     g->attready    = 0;
     drawstrip(g);
 
-    // A line for the editor at work, else the latest command's outcome
-    if (editing) {
+    // A line for the editor at work, else the latest command's outcome,
+    // where the transcript is not shown to have its toast (drawtoast)
+    b32 toasted = g->toasted;
+    g->toasted  = 0;
+    if (!toasted) {
+        g->editshown = 0;
+    }
+    if (!toasted && editing) {
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("editing in %s...", cstr0(&a, g->edname));
         ImGui::SameLine();
@@ -3635,7 +3740,7 @@ static void drawprompt(Gui *g)
         ImGui::SetItemTooltip("Stop the editor, leaving the draft as it was");
         itemrect(g, RECT_EDITCANCEL);
         g->editshown = 1;
-    } else if (s->note.len) {
+    } else if (!toasted && s->note.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, s->noteerr ? g->pal->bad : g->pal->paneldim);
         ImGui::PushTextWrapPos(0);
         ImGui::TextUnformatted(cstr0(&a, s->note));

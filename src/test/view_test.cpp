@@ -833,6 +833,29 @@ static void test_viewpanels(Test *t)
         apply(v, a, R"({"sid":"s","seq":11,"ts":0,"ev":"title","text":"Mine","by":"user"})");
         expect(t, "panels.switched", concat(&a, concat(&a, v->model, v->endpoint), v->title),
                "nhttp://b/Mine");
+
+        // Each change a mark: a mode only as it changes, a title only
+        // the user's
+        apply(v, a, R"({"sid":"s","seq":12,"ts":0,"ev":"mode","mode":"plan","by":"user"})");
+        apply(v, a, R"({"sid":"s","seq":13,"ts":0,"ev":"mode","mode":"plan","by":"agent"})");
+        apply(v, a, R"({"sid":"s","seq":14,"ts":0,"ev":"title","text":"Auto","by":"auto"})");
+        apply(v, a, R"({"sid":"s","seq":15,"ts":0,"ev":"mode","mode":"none","by":"approved"})");
+        Buf marks(&a, 256);
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewMsg *m = &v->msgs[i];
+            if (m->role == VIEW_MARK) {
+                print(&marks, m->label);
+                putbyte(&marks, '=');
+                print(&marks, m->text);
+                print(&marks, m->from.len ? concat(&a, "@", m->from) : Str{});
+                print(&marks, istr(&a, m->collapsed));
+                putbyte(&marks, '|');
+            }
+        }
+        expect(t, "panels.marks", finish(&marks),
+               "Model=n@http://b/1|Renamed=Mine1|"
+               "Plan mode=the agent changes nothing but its plan1|"
+               "Build mode=plan mode and Bypass are off1|");
     }
 
     // A steer too late for its turn stays queued through the turn's end,

@@ -520,6 +520,7 @@ struct GuiSession {
     i32          histmsg;   // its message in the view
     Str          note;      // what the latest command from the box came to
     b32          noteerr;
+    i64          noteat;    // when, in sched µs: a note not an error fades
     Str          cmdtext;   // that command, put back in the box if it fails
     i64          unqueue;   // the queued message being withdrawn, else 0
     i64          cmdid;
@@ -1407,6 +1408,7 @@ struct Gui {
                                      // 4 cut and copy, 8 paste, 16 editor
     i32                histshown;    // the box showed history entry N/M
     b32                editshown;    // it said an editor was at work
+    b32                toasted;      // the transcript showed the note this frame
     i32                queueshown;   // queued messages in the transcript's tail
     i32                queuedrops;   // times the tail shrank, none taken in
     void              *queueview;    // the view of the tail as last drawn,
@@ -4001,7 +4003,7 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
         setnote(g, s, "compacting: summarizing the older messages", 0);
         break;
     case CMD_RENAME:
-        setnote(g, s, "renamed", 0);
+        s->note = {};  // the transcript's mark says so
         guilist(g, h);
         break;
     case CMD_BACKGROUND:
@@ -4009,26 +4011,15 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
                 "told when it ends", 0);
         break;
     case CMD_MODEL: {
-        Str  model = jsonstr(jsonget(j, "model"));
-        Buf  b(&scratch, 256 + model.len + note.len);
-        print(&b, "switched model");
-        if (model.len) {
-            print(&b, " to ");
-            print(&b, model);
-        }
+        // The transcript's mark names the model: here, what changes
+        s->note = {};
         if (note.len) {
-            print(&b, ": ");
-            print(&b, note);
+            setnote(g, s, concat(&scratch, "switched model: ", note), 0);
         }
-        setnote(g, s, finish(&b), 0);
         guilist(g, h);
     } break;
     case CMD_MODE: {
-        Str mode = jsonstr(jsonget(j, "mode"));
-        setnote(g, s, mode=="plan"   ? Str("plan mode: the agent changes nothing but its plan") :
-                      mode=="bypass" ? Str("Bypass mode: the agent asks nothing, inside or "
-                                           "outside its directory") :
-                                       Str("build mode: plan mode and Bypass are off"), 0);
+        s->note = {};  // the transcript's mark says so
     } break;
     case CMD_FORK: {
         // {ok, sid:<new>, from, turn, next?}
@@ -4579,12 +4570,14 @@ static void setdraft(Gui *g, GuiSession *s, Str text)
     draftsend(g, s);
 }
 
-// What the latest command from the box came to, shown above it until
-// the next is typed.
+// What the latest command from the box came to, shown in a toast at the
+// foot of the transcript (drawtoast): an error until the next is typed,
+// else for a few seconds.
 static void setnote(Gui *g, GuiSession *s, Str note, b32 err)
 {
     s->note    = clone(&g->perm, note);
     s->noteerr = err;
+    s->noteat  = g->sched.now;
     scheddirty(&g->sched);
 }
 
@@ -9092,6 +9085,7 @@ enum : i32 {
     CHK_EDITING,
     CHK_NOTEDITING,
     CHK_NOTE,         // the session's note has text in it
+    CHK_MARK,         // the transcript's last change to the session says it
     CHK_SLASH,        // the slash popup lists dx commands, skills aside (0: none)
     CHK_SLASHSEL,     // its pick is text
     CHK_TITLE,        // the session's title is text
@@ -9332,6 +9326,7 @@ static Str chknames[] = {
     "the box is read-only, saying an editor is at work",
     "no editor at work, and the box is writable",
     "the session's note says how the command went",
+    "the transcript's last change to the session says what changed",
     "the slash popup lists the commands it should",
     "the slash popup's pick moved",
     "the session's title is as renamed",
@@ -9458,6 +9453,7 @@ enum : i32 {
     W_TURNS,      // the session shown is idle after dx turns
     W_EDITED,     // no editor runs
     W_NOTE,       // the session shown has a note
+    W_MARK,       // the transcript's last change to the session says text
     W_COMPACTED,  // it has a compaction card, and is idle
     W_NAMED,      // an item named starting with text drew
     W_RAISED,     // dx launches handed off to this window, and it is up
@@ -9490,7 +9486,8 @@ static Str waitnames[] = {
     "the window to come back", "a background host", "the remote host",
     "the link to drop", "the remote to close", "the output", "a file",
     "the includes", "the thumbnails", "the screenshot", "reasoning",
-    "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
+    "a pause in reasoning", "turns", "the editor", "a note",
+    "a change to the session", "a compaction card",
     "a named item", "a launch to hand off", "the import", "the export",
     "the plan", "the menu's pick", "the drafts kept", "the offer to deploy",
     "the side chat", "the WSL distros", "the WSL distro to fail",
@@ -11931,9 +11928,9 @@ static DriveOp planops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "session mode Plan"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
-    {OP_WAIT, W_NOTE, 0, 0, 5000, ""},
+    {OP_WAIT, W_MARK, 0, 0, 5000, "Plan mode"},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
-    {OP_CHECK, CHK_NOTE, 0, 0, 0, "plan mode:"},
+    {OP_CHECK, CHK_MARK, 0, 0, 0, "Plan mode: the agent changes nothing"},
     {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-6-toggle"},
     {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
@@ -11942,9 +11939,9 @@ static DriveOp planops[] = {
     {OP_TEXT, 0, 0, 0, 300, "/plan off"},
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
-    {OP_WAIT, W_NOTE, 0, 0, 5000, ""},
+    {OP_WAIT, W_MARK, 0, 0, 5000, "Build mode"},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
-    {OP_CHECK, CHK_NOTE, 0, 0, 0, "build mode:"},
+    {OP_CHECK, CHK_MARK, 0, 0, 0, "Build mode: plan mode and Bypass are off"},
     {OP_CHECK, CHK_PLANMODE, 0, 0, 0, ""},
     {OP_CHECK, CHK_BYPASS, 0, 0, 0, ""},
     // Bypass from the list, in red, then Plan, whose approval is Build
@@ -11955,10 +11952,10 @@ static DriveOp planops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "session mode Bypass"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
-    {OP_WAIT, W_NOTE, 0, 0, 5000, ""},
+    {OP_WAIT, W_MARK, 0, 0, 5000, "Bypass mode"},
     {OP_WAIT, W_NAMED, 0, 0, 5000, "bypass chip"},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
-    {OP_CHECK, CHK_NOTE, 0, 0, 0, "Bypass mode:"},
+    {OP_CHECK, CHK_MARK, 0, 0, 0, "Bypass mode: the agent asks nothing"},
     {OP_CHECK, CHK_BYPASS, 1, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "plan-8-bypass"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "session mode"},
@@ -11967,7 +11964,7 @@ static DriveOp planops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "session mode Plan"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
-    {OP_WAIT, W_NOTE, 0, 0, 5000, ""},
+    {OP_WAIT, W_MARK, 0, 0, 5000, "Plan mode"},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
     {OP_CHECK, CHK_BYPASS, 0, 0, 0, ""},
@@ -12270,8 +12267,7 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_SLASH, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 200, "Session A"},
     KEY(GKEY_ENTER, 0, 300),
-    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
-    {OP_CHECK, CHK_NOTE, 0, 0, 0, "renamed"},
+    {OP_WAIT, W_MARK, 0, 0, 10000, "Renamed: Session A"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_TITLE, 0, 0, 0, "Session A"},
@@ -12307,8 +12303,8 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_MODELS, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "compose-models"},
     CLICK(T_MODEL0, "", 300),
-    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
-    {OP_CHECK, CHK_NOTE, 0, 0, 0, "switched"},
+    {OP_WAIT, W_MARK, 0, 0, 10000, "Model"},
+    {OP_CHECK, CHK_MARK, 0, 0, 0, "Model: "},
     // /fork shows the new session, renamed here so that "Session A"
     // still names one; /export saves it as Markdown, as the menus do
     CLICK(T_PROMPT, "", 200),
@@ -12322,8 +12318,7 @@ static DriveOp composeops[] = {
     CLICK(T_PROMPT, "", 200),
     {OP_TEXT, 0, 0, 0, 200, "/rename Forked"},
     KEY(GKEY_ENTER, 0, 300),
-    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
-    {OP_CHECK, CHK_NOTE, 0, 0, 0, "renamed"},
+    {OP_WAIT, W_MARK, 0, 0, 10000, "Renamed: Forked"},
     CLICK(T_SESSTITLE, "Session A", 500),
     CLICK(T_PROMPT, "", 200),
     SELALL,
@@ -12350,7 +12345,7 @@ static DriveOp composeops[] = {
     CLICK(T_PROMPT, "", 200),
     {OP_TEXT, 0, 0, 0, 200, "/rename Session B"},
     KEY(GKEY_ENTER, 0, 300),
-    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_WAIT, W_MARK, 0, 0, 10000, "Renamed: Session B"},
     {OP_TEXT, 0, 0, 0, 200, "Draft for B"},
     CLICK(T_SESSTITLE, "Session A", 500),
     {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, "Draft for B"},
@@ -13151,6 +13146,21 @@ static b32 hasremote(Gui *g, Str name)
     return 0;
 }
 
+// The last mark of a change in the shown session's transcript, as it
+// reads there: "LABEL: TEXT", or null.
+static Str lastmark(Gui *g)
+{
+    View *v = g->sess ? g->sess->view : 0;
+    for (iz i = v ? v->msgs.len-1 : -1; i >= 0; i--) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role == VIEW_MARK) {
+            Str what = markwhat(g, &g->frame, m);
+            return concat(&g->frame, concat(&g->frame, m->label, ": "), what);
+        }
+    }
+    return {};
+}
+
 static b32 drivewaitdone(Gui *g)
 {
     View *v = g->view;
@@ -13173,6 +13183,8 @@ static b32 drivewaitdone(Gui *g)
         return !g->edproc;
     case W_NOTE:
         return g->sess && g->sess->note.len;
+    case W_MARK:
+        return g->sess && find(lastmark(g), g->ops[g->drivepc-1].text) >= 0;
     case W_SIDECHAT:
         return g->sess && sessside(g->sess).len && g->sess->view &&
                !g->sess->openid && v->lastseq;
@@ -13580,6 +13592,10 @@ static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
         got = s->note;
         ok  = got.len && find(got, want)>=0;
         break;
+    case CHK_MARK:
+        got = lastmark(g);
+        ok  = got.len && find(got, want)>=0;
+        break;
     case CHK_SLASH: {
         // Commands only: the user's own skills may be listed too
         i32 n = slashcount(slashmatches(promptstr(g)));
@@ -13946,6 +13962,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_SELALL:
     case CHK_CLIPBOARD:
     case CHK_NOTE:
+    case CHK_MARK:
     case CHK_SLASH:
     case CHK_SLASHSEL:
     case CHK_TITLE:
