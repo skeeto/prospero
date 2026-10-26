@@ -34,15 +34,19 @@ calls for it.
 
 Skills are looked for in:
 
-1. `.claude/skills` and `.agents/skills` in each directory from the
-   working directory up to the root of the repository;
+1. `.claude/skills`, `.agents/skills`, `.cursor/skills` and
+   `.codex/skills` in each directory from the working directory up to
+   the root of the repository;
 2. `[skills] paths`, separated by `;`;
 3. each `--skillsdir DIR` given when starting Prospero, in order;
 4. `skills` next to the default configuration file, such as
    `~/.config/prospero/skills`, even when `-c` names another file;
-5. `~/.claude/skills`, then `~/.agents/skills`.
+5. `~/.claude/skills`, `~/.agents/skills`, `~/.cursor/skills`, then
+   `~/.codex/skills`.
 
-The first skill of a name wins.
+The first skill of a name wins. A skill may sit below folders that
+group skills, as in `.cursor/skills/frontend/lint/SKILL.md`, as Cursor
+allows.
 
 Type `/NAME args` in the prompt box to use a skill yourself: its
 `SKILL.md` goes to the agent with the args. A skill with

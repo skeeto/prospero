@@ -132,6 +132,32 @@ static void test_skills(Test *t)
     expect(t, "tool text", text, "Base directory for this skill: "
            "/r/sub/.claude/skills/near\n\nNear body.\n\nARGUMENTS: now");
 
+    // Below folders that group skills, as Cursor allows: a skill's own
+    // directory is not searched further, nor past SKILL_DEPTH levels, and
+    // the first by path wins
+    {
+        static Str const nest[] = {
+            "/n", "/n/a", "/n/a/lint", "/n/a/lint/inner", "/n/b", "/n/b/lint",
+            "/n/top", "/n/d1", "/n/d1/d2", "/n/d1/d2/d3", "/n/d1/d2/d3/ok",
+            "/n/d1/d2/d3/d4", "/n/d1/d2/d3/d4/deep",
+        };
+        for (iz i = 0; i < countof(nest); i++) {
+            os_mkdirs(os, *a, nest[i]);
+        }
+        os_write(os, *a, "/n/a/lint/SKILL.md", "---\ndescription: a's\n---\n");
+        os_write(os, *a, "/n/a/lint/inner/SKILL.md", "x\n");
+        os_write(os, *a, "/n/b/lint/SKILL.md", "---\ndescription: b's\n---\n");
+        os_write(os, *a, "/n/top/SKILL.md", "x\n");
+        os_write(os, *a, "/n/d1/d2/d3/ok/SKILL.md", "x\n");
+        os_write(os, *a, "/n/d1/d2/d3/d4/deep/SKILL.md", "x\n");
+        Slice<SkillDir> nd = {};
+        nd = push(a, nd, SkillDir{"/n", {}});
+        Skills ns = skillfind(os, a, nd, 0);
+        expect(t, "nested", skillnames(a, ns.list), "lint ok top");
+        expect(t, "nested first", skillbyname(ns.list, "lint")->dir, "/n/a/lint");
+        expect(t, "nested skipped", istr(a, ns.skipped.len), "0");
+    }
+
     // A long description is cut, and too many skills are left out
     {
         os_mkdirs(os, *a, "/many");

@@ -3,13 +3,15 @@
 // A skill is a directory holding SKILL.md: frontmatter between --- lines
 // that names it and says when to use it, then instructions, which the
 // agent reads when it uses the skill (the skill tool), or which the
-// user's prompt carries when the user invokes it (/name). Skills sit one
-// level down in skill directories, DIR/NAME/SKILL.md, which the harness
-// looks through in this order: .claude/skills and .agents/skills in
-// each directory from the working directory up to the repository root
-// (instrroot), then [skills] paths, then the user's own: skills next to
-// the configuration (~/.config/prospero/skills), ~/.claude/skills and
-// ~/.agents/skills. A skill found earlier wins over a later one of the
+// user's prompt carries when the user invokes it (/name). Skills sit in
+// skill directories, DIR/NAME/SKILL.md, or below folders that group
+// them, DIR/GROUP/NAME/SKILL.md, as Cursor allows. The harness looks
+// through skill directories in this order: .claude/skills,
+// .agents/skills, .cursor/skills and .codex/skills in each directory
+// from the working directory up to the repository root (instrroot),
+// then [skills] paths, then the user's own: skills next to the
+// configuration (~/.config/prospero/skills), then the same four under
+// ~. A skill found earlier wins over a later one of the
 // same name: nearer the working directory, the project's over the
 // user's. A project's skill must lie within the project, symlinks
 // resolved, as its instruction files must.
@@ -30,6 +32,8 @@ enum : i64 {
     SKILL_BYTES = 256 << 10,  // largest SKILL.md
     SKILL_HEAD  = 16 << 10,   // its frontmatter ends within this
     SKILL_NAME  = 64,         // bytes of a name
+    SKILL_DEPTH = 4,          // levels a skill may sit below its skills directory
+    SKILL_DIRS  = 1000,       // directories listed in one skills directory
 };
 
 struct Skill {
@@ -285,6 +289,48 @@ static b32 skillless(Skill *a, Skill *b)
     return compare(a->name, b->name) < 0;
 }
 
+// The directories under a skills directory that hold a SKILL.md, in a
+// fixed order. A skill may sit below folders that group skills, as
+// Cursor allows, down to SKILL_DEPTH levels, though a skill's own
+// directory is not searched further. A bound on directories listed keeps
+// a stray tree, or a symlink loop, cheap.
+static Slice<Str> skillwalk(Os *os, Arena *a, Str root, b32 win)
+{
+    Slice<Str> r     = {};
+    Slice<Str> stack = {};  // directories to list, deepest last
+    Slice<i32> depth = {};
+    stack = push(a, stack, root);
+    depth = push(a, depth, 1);
+    for (iz listed = 0; stack.len && listed<SKILL_DIRS; listed++) {
+        Str dir = stack[stack.len-1];
+        i32 dep = depth[depth.len-1];
+        stack.len--;
+        depth.len--;
+        Slice<Dirent *> ents = {};
+        for (Dirent *e = os_list(os, a, dir); e; e = e->next) {
+            if (e->isdir && e->name.len && e->name[0]!='.') {
+                ents = push(a, ents, e);
+            }
+        }
+        sort(ents.data, ents.len, dirless, *a);  // the same skips each time
+        Slice<Str> sub = {};
+        for (iz k = 0; k < ents.len; k++) {
+            Str d    = normpath(a, dir, ents[k]->name, win);
+            Str file = normpath(a, d, "SKILL.md", win);
+            if (os_stat(os, *a, file).type == STAT_FILE) {
+                r = push(a, r, d);
+            } else if (dep < SKILL_DEPTH) {
+                sub = push(a, sub, d);
+            }
+        }
+        for (iz k = sub.len-1; k >= 0; k--) {  // first listed first
+            stack = push(a, stack, sub[k]);
+            depth = push(a, depth, dep+1);
+        }
+    }
+    return r;
+}
+
 // The skills of these directories, by precedence: the first of a name
 // wins, the rest are dropped.
 static Skills skillfind(Os *os, Arena *a, Slice<SkillDir> dirs, b32 win)
@@ -297,22 +343,12 @@ static Skills skillfind(Os *os, Arena *a, Slice<SkillDir> dirs, b32 win)
                 (d->inside.len && !instrinside(os, *a, d->inside, d->path, win))) {
             continue;
         }
-        Slice<Dirent *> ents = {};
-        for (Dirent *e = os_list(os, a, d->path); e; e = e->next) {
-            if (e->isdir && e->name.len && e->name[0]!='.') {
-                ents = push(a, ents, e);
-            }
-        }
-        sort(ents.data, ents.len, dirless, *a);  // the same skips each time
-        for (iz k = 0; k < ents.len; k++) {
-            Dirent *e    = ents[k];
-            Str     dir  = normpath(a, d->path, e->name, win);
-            Str     path = normpath(a, dir, "SKILL.md", win);
-            Stat    st   = os_stat(os, *a, path);
-            if (st.type != STAT_FILE) {
-                continue;  // not a skill
-            }
-            Str why = {};
+        Slice<Str> found = skillwalk(os, a, d->path, win);
+        for (iz k = 0; k < found.len; k++) {
+            Str  dir  = found[k];
+            Str  path = normpath(a, dir, "SKILL.md", win);
+            Stat st   = os_stat(os, *a, path);
+            Str  why  = {};
             if (r.list.len >= SKILL_MAX) {
                 r.skipped = push(a, r.skipped, concat(a, d->path,
                                  ": more than 200 skills, so the rest were left out"));
@@ -333,7 +369,7 @@ static Skills skillfind(Os *os, Arena *a, Slice<SkillDir> dirs, b32 win)
                 m   = skillparse(a, rd.data);
                 why = m.err;
             }
-            Str name = m.name.data ? m.name : e->name;
+            Str name = m.name.data ? m.name : basename(dir);
             if (!why.data && !skillname(name)) {
                 why = "its directory's name must be letters, digits, - _ and . "
                       "(or its frontmatter must give a name)";

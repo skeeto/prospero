@@ -5839,6 +5839,13 @@ static Slice<Str> skillsdirarg(Os *os, Arena *perm, Slice<Str> dirs, Str dir)
 // the project's skills alone, [skills] paths and --skillsdir. One in a
 // folder of its own (new {nofolder}) is in no project: [skills] paths,
 // --skillsdir and the user's.
+// Where harnesses keep skills, in a project and in the home directory:
+// Claude Code's, the shared .agents, Cursor's and Codex's, which Cursor
+// also reads.
+static Str skillhomes[] = {
+    ".claude/skills", ".agents/skills", ".cursor/skills", ".codex/skills",
+};
+
 static Slice<SkillDir> skilldirs(Session *s, Arena *a)
 {
     Engine         *e    = s->e;
@@ -5847,10 +5854,10 @@ static Slice<SkillDir> skilldirs(Session *s, Arena *a)
     Str             cwd  = normpath(a, s->cwd, ".", win);
     Str             root = s->nofolder ? Str{} : instrroot(e->os, a, cwd, win);
     for (Str d = cwd; root.len;) {
-        SkillDir c = {normpath(a, d, ".claude/skills", win), root};
-        SkillDir g = {normpath(a, d, ".agents/skills", win), root};
-        r = push(a, r, c);
-        r = push(a, r, g);
+        for (iz i = 0; i < countof(skillhomes); i++) {
+            SkillDir x = {normpath(a, d, skillhomes[i], win), root};
+            r = push(a, r, x);
+        }
         Str up = normpath(a, d, "..", win);
         if (d.len<=root.len || up==d) break;
         d = up;
@@ -5864,14 +5871,13 @@ static Slice<SkillDir> skilldirs(Session *s, Arena *a)
         SkillDir x = {e->skillsdirs[i], {}};
         r = push(a, r, x);
     }
-    Str user[] = {
-        e->skilldir,
-        e->home.len ? normpath(a, e->home, ".claude/skills", win) : Str{},
-        e->home.len ? normpath(a, e->home, ".agents/skills", win) : Str{},
-    };
-    for (iz i = 0; i<countof(user) && !s->projinstr; i++) {
-        SkillDir u = {user[i], {}};
-        r = user[i].len ? push(a, r, u) : r;
+    if (!s->projinstr && e->skilldir.len) {
+        SkillDir u = {e->skilldir, {}};
+        r = push(a, r, u);
+    }
+    for (iz i = 0; i<countof(skillhomes) && !s->projinstr && e->home.len; i++) {
+        SkillDir u = {normpath(a, e->home, skillhomes[i], win), {}};
+        r = push(a, r, u);
     }
     return r;
 }

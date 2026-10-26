@@ -1923,6 +1923,11 @@ def skills(t):
     proj = t.host.join(t.work, ".claude", "skills")
     skillput(t, proj, "pdf", "---\ndescription: Project PDF\n---\nPROJECT-PDF\n")
     skillput(t, proj, "broken", "---\nname: broken\ndescription: never closed\n")
+    # Cursor's, below a folder that groups them, and Codex's in the home
+    skillput(t, t.host.join(t.base, ".cursor", "skills", "team"), "deploy",
+             "---\ndescription: Cursor deploy\n---\n")
+    skillput(t, t.host.join(env["HOME"], ".codex", "skills"), "codex",
+             "---\ndescription: Codex skill\n---\n")
 
     r = t.run(env=env)
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
@@ -1930,7 +1935,8 @@ def skills(t):
     system = fake_provider.system_of(reqs[0])
     t.check("# Skills" in system and "skill" in fake_provider.tool_names(reqs[0]), "offered")
     listed = [x for x in system.split("\n") if x.startswith("- ")]
-    for want in ("- lint: Near lint", "- notes: Take notes: carefully", "- pdf: Project PDF"):
+    for want in ("- lint: Near lint", "- notes: Take notes: carefully", "- pdf: Project PDF",
+                 "- deploy: Cursor deploy", "- codex: Codex skill"):
         t.check(want in listed, f"{want!r} in {listed}")
     for unwanted in ("User PDF", "Far lint", "- review:", "- broken:"):
         t.check(unwanted not in system, f"{unwanted} not in the system prompt")

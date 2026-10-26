@@ -423,8 +423,9 @@ static CfgKey cfgschema[] = {
      "found in each, separated by blanks"},
 
     {"skills", "enabled", CFG_BOOL, "true", {}, {}, "skills",
-     "Offer skills: SKILL.md files in .claude/skills and .agents/skills "
-     "of the project, and in the user's own skill directories"},
+     "Offer skills: SKILL.md files in .claude/skills, .agents/skills, "
+     ".cursor/skills and .codex/skills of the project, and in the "
+     "user's own skill directories"},
     {"skills", "paths", CFG_PATHS, "", {}, {}, "skills",
      "More directories of skills, each holding NAME/SKILL.md, separated "
      "by ;, after the project's and before the user's"},
