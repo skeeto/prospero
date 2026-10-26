@@ -142,40 +142,6 @@ static u8 *pathmarks(Arena *a, Str name, Str filter)
     return m;
 }
 
-static b32 driveletter(u8 c)
-{
-    return (c>='a' && c<='z') || (c>='A' && c<='Z');
-}
-
-// A Windows path typed for a WSL distro, as the distro has it under the
-// default automount root: a drive's "C:\" or "C:/" becomes "/mnt/c/",
-// "C:" alone "/mnt/c", and under a drive's /mnt/X a backslash becomes a
-// slash, as no Windows name holds one. Any other text as it is, such as
-// a drive-relative "C:x". The length may change only at its head.
-static Str wslpath(Arena *a, Str t)
-{
-    Str rest = {};
-    u8  d    = 0;
-    if (t.len>=2 && driveletter(t[0]) && t[1]==':' && (t.len==2 || t[2]=='\\' || t[2]=='/')) {
-        d    = t[0] | 0x20;
-        rest = cuthead(t, 2);
-    } else if (t.len>=6 && takehead(t, 5)=="/mnt/" && driveletter(t[5]) &&
-               (t.len==6 || t[6]=='\\' || t[6]=='/')) {
-        d    = t[5];
-        rest = cuthead(t, 6);
-    }
-    if (!d || (t[0]=='/' && find(rest, "\\")<0)) {
-        return t;
-    }
-    Buf b(a, 6 + rest.len);
-    print(&b, "/mnt/");
-    putbyte(&b, d);
-    for (iz i = 0; i < rest.len; i++) {
-        putbyte(&b, rest[i]=='\\' ? '/' : rest[i]);
-    }
-    return finish(&b);
-}
-
 // The text accepting a pick makes: a folder's path ends with the
 // separator its own folder was typed with, to list it next.
 static Str pathaccept(Arena *a, PathQuery q, PathPick p)

@@ -8,7 +8,8 @@
 //
 // A Remote speaks to an engine host (host.cpp) as the in-process engine
 // would to its frontend: protocol v0 commands in (remotecmd), records
-// out as MAIL_OUT records in the frontend's mailbox, then MAIL_QUIT. In
+// out as MAIL_OUT records in the frontend's mailbox, then MAIL_QUIT, all
+// with the id it was given (outid), for a frontend of several. In
 // between it keeps one framed link (frame.cpp) over whatever stream it
 // has now: ssh running "PATH attach" on the remote machine, with
 //
@@ -135,6 +136,8 @@ struct RemoteConf {
     Str scp;       // for deploying: scp itself, "scp" if empty
     Str engines;   // for deploying: the engines, if not next to this program
     Str envpath;   // PATH for ssh and scp, if not this process's
+    Str logname;   // ssh's errors go to remote/LOGNAME.log, else NAME.log
+    u64 outid;     // the id of every record posted to the frontend's mailbox
     b32 deploy;    // deploy an engine when the one there is missing or another
 };
 
@@ -201,7 +204,7 @@ struct Remote {
 
 static void remoteemit(Remote *r, Str line)
 {
-    mailpost(r->out, MAIL_OUT, 0, line, 1);
+    mailpost(r->out, MAIL_OUT, r->conf.outid, line, 1);
 }
 
 static void remotestatus(Remote *r, Arena scratch, i32 state, Str msg, i64 retry)
@@ -343,11 +346,11 @@ static b32 remotearg(Buf *b, Str s)
     return 1;
 }
 
-// Where ssh's errors go: <state>/remote/NAME.log, the name made safe
-// for a file name anywhere.
+// Where ssh's errors go: <state>/remote/NAME.log (or LOGNAME.log), the
+// name made safe for a file name anywhere.
 static Str remotelog(Remote *r, Arena *a)
 {
-    Str name = clone(a, r->conf.name);
+    Str name = clone(a, r->conf.logname.len ? r->conf.logname : r->conf.name);
     for (iz i = 0; i < name.len; i++) {
         u8  c  = name[i];
         b32 ok = alnum(c) || c=='-' || c=='_' || c=='@' || (c=='.' && i);
@@ -517,7 +520,7 @@ static void remoteend(Remote *r, Arena scratch, i32 state, Str why)
         }
     }
     r->held.len = 0;
-    mailpost(r->out, MAIL_QUIT, 0, {}, 1);
+    mailpost(r->out, MAIL_QUIT, r->conf.outid, {}, 1);
     r->done = 1;
 }
 
@@ -1134,6 +1137,8 @@ static Remote *newremote(Os *os, Arena *perm, RemoteConf *conf, Mailbox *out)
     r->conf.scp        = clone(&r->perm, conf->scp);
     r->conf.engines    = clone(&r->perm, conf->engines);
     r->conf.envpath    = clone(&r->perm, conf->envpath);
+    r->conf.logname    = clone(&r->perm, conf->logname);
+    r->conf.outid      = conf->outid;
     r->conf.deploy     = conf->deploy;
     if (!r->conf.name.len) {
         r->conf.name = "local";

@@ -1397,6 +1397,37 @@ def restart_unattended(t):
 
 
 @scenario
+def reopen_unattended(t):
+    """Opened again unattended by a client that attended it, a session is
+    no longer attended by that client: while another attends it, an ask
+    there waits; once none does, the ask is denied at once."""
+    t.write_config(t.args.url, "[guard]\nask_timeout = 60\ntemp = ask\n")
+    a = Client(t)
+    sa = a.attach()
+    a.call("hello")
+    r = a.call("new", cwd=t.work, model=t.model("ask"), attended=1)
+    t.check(r.get("ok") == 1, f"new: {r}")
+    sid = r["sid"]
+    b = Client(t)
+    sb = b.attach(reconnect=True)
+    b.call("hello")
+    t.check(b.call("open", sid=sid, attended=1).get("ok") == 1, "B opened it attended")
+    t.check(b.call("open", sid=sid, attended=0).get("ok") == 1, "B opened it unattended")
+    t.check(a.call("prompt", sid=sid, text="write outside").get("ok") == 1, "prompted")
+    sa.wait(lambda r: r.get("ev") == "ask" and r.get("sid") == sid, what="the ask")
+    time.sleep(1)
+    t.check(not any(r.get("ev") == "answer" and r.get("sid") == sid for r in sa.records),
+            "the ask was answered while A attends the session")
+    t.check(a.call("open", sid=sid, attended=0).get("ok") == 1, "A opened it unattended")
+    ans = sa.wait(lambda r: r.get("ev") == "answer" and r.get("sid") == sid,
+                  what="the answer", timeout=10)
+    t.check(ans.get("decision") == "deny" and ans.get("by") == "policy", f"answer: {ans}")
+    sa.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid, what="turn.end")
+    for s in (sa, sb):
+        s.disconnect()
+
+
+@scenario
 def version_mismatch(t):
     """A host of another protocol: a clear error, and the end."""
     env = dict(t.env, PROSPERO_TEST_PROTO="7")

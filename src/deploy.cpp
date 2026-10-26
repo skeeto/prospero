@@ -1362,6 +1362,84 @@ static Slice<Str> wsllist(Os *os, Arena *perm, Arena scratch, Str program, Str d
     return r.code==0 ? wsldistros(perm, r.out) : Slice<Str>{};
 }
 
+static b32 driveletter(u8 c)
+{
+    return (c>='a' && c<='z') || (c>='A' && c<='Z');
+}
+
+// A Windows path typed for a WSL distro, as the distro has it under the
+// default automount root: a drive's "C:\" or "C:/" becomes "/mnt/c/",
+// "C:" alone "/mnt/c", and under a drive's /mnt/X a backslash becomes a
+// slash, as no Windows name holds one. Any other text as it is, such as
+// a drive-relative "C:x". The length may change only at its head.
+static Str wslpath(Arena *a, Str t)
+{
+    Str rest = {};
+    u8  d    = 0;
+    if (t.len>=2 && driveletter(t[0]) && t[1]==':' && (t.len==2 || t[2]=='\\' || t[2]=='/')) {
+        d    = t[0] | 0x20;
+        rest = cuthead(t, 2);
+    } else if (t.len>=6 && takehead(t, 5)=="/mnt/" && driveletter(t[5]) &&
+               (t.len==6 || t[6]=='\\' || t[6]=='/')) {
+        d    = t[5];
+        rest = cuthead(t, 6);
+    }
+    if (!d || (t[0]=='/' && find(rest, "\\")<0)) {
+        return t;
+    }
+    Buf b(a, 6 + rest.len);
+    print(&b, "/mnt/");
+    putbyte(&b, d);
+    for (iz i = 0; i < rest.len; i++) {
+        putbyte(&b, rest[i]=='\\' ? '/' : rest[i]);
+    }
+    return finish(&b);
+}
+
+// The head of a Windows path up to its first separator.
+static Str winpart(Str s)
+{
+    iz i = 0;
+    for (; i<s.len && !issep(s[i], 1); i++) {}
+    return takehead(s, i);
+}
+
+// A Windows path into a distro's own files, \\wsl.localhost\D\x or the
+// older \\wsl$\D\x, with either slash and without case, as that distro
+// has it: "/x", or "/" for its root. Null for any other path, one into
+// another distro included.
+static Str wsluncpath(Arena *a, Str t, Str distro)
+{
+    if (t.len<2 || !issep(t[0], 1) || !issep(t[1], 1)) {
+        return {};
+    }
+    Str rest   = cuthead(t, 2);
+    Str server = winpart(rest);
+    if (!equalfold(server, "wsl.localhost") && !equalfold(server, "wsl$")) {
+        return {};
+    }
+    rest = cuthead(rest, server.len);
+    rest = rest.len ? cuthead(rest, 1) : rest;
+    Str share = winpart(rest);
+    if (!distro.len || !equalfold(share, distro)) {
+        return {};
+    }
+    rest = cuthead(rest, share.len);
+    Buf b(a, 1 + rest.len);
+    putbyte(&b, '/');
+    for (iz i = rest.len && issep(rest[0], 1); i < rest.len; i++) {
+        putbyte(&b, rest[i]=='\\' ? '/' : rest[i]);
+    }
+    return finish(&b);
+}
+
+// The program that reaches a remote, ssh or wsl.exe, by name if empty,
+// unless a test's stand-in: PROSPERO_TEST_SSH, PROSPERO_TEST_WSL.
+static Str linkstandin(Os *os, Arena *a, b32 wsl)
+{
+    return os_getenv(os, a, wsl ? Str("PROSPERO_TEST_WSL") : Str("PROSPERO_TEST_SSH"));
+}
+
 // How a remote reaches its machine.
 struct LinkTo {
     Str name;  // the remote's

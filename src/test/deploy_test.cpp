@@ -333,6 +333,31 @@ static void test_deploywsl(Test *t)
            "Ubuntu-wsl=Ubuntu Arch=Arch Fedora=Fedora");
     expect(t, "deploy.wsl.hostsnone", showhosts(&a, wslhosts(&a, distros, {})),
            "Debian=Debian Ubuntu=Ubuntu Arch=Arch Fedora=Fedora");
+
+    // A Windows path typed for a WSL distro
+    expect(t, "wsl.drive", wslpath(&a, "C:\\Users\\me"), "/mnt/c/Users/me");
+    expect(t, "wsl.slash", wslpath(&a, "d:/src"), "/mnt/d/src");
+    expect(t, "wsl.bare", wslpath(&a, "C:"), "/mnt/c");
+    expect(t, "wsl.root", wslpath(&a, "C:\\"), "/mnt/c/");
+    expect(t, "wsl.relative", wslpath(&a, "C:x"), "C:x");
+    expect(t, "wsl.typing", wslpath(&a, "/mnt/c/Users\\"), "/mnt/c/Users/");
+    expect(t, "wsl.mnt", wslpath(&a, "/mnt/c\\x"), "/mnt/c/x");
+    expect(t, "wsl.mntonly", wslpath(&a, "/mnt/c"), "/mnt/c");
+    expect(t, "wsl.notdrive", wslpath(&a, "/mnt/cd\\x"), "/mnt/cd\\x");
+    expect(t, "wsl.linux", wslpath(&a, "/home/u\\x"), "/home/u\\x");
+    expect(t, "wsl.home", wslpath(&a, "~/src"), "~/src");
+
+    // And one into the distro's own files
+    expect(t, "wsl.unc", wsluncpath(&a, "\\\\wsl.localhost\\Deb\\home\\u", "Deb"), "/home/u");
+    expect(t, "wsl.uncold", wsluncpath(&a, "\\\\wsl$\\Deb\\x", "Deb"), "/x");
+    expect(t, "wsl.uncslash", wsluncpath(&a, "//WSL.LocalHost/deb/x/y", "Deb"), "/x/y");
+    expect(t, "wsl.uncroot", wsluncpath(&a, "\\\\wsl.localhost\\Deb", "Deb"), "/");
+    expect(t, "wsl.uncroot2", wsluncpath(&a, "\\\\wsl.localhost\\Deb\\", "Deb"), "/");
+    expect(t, "wsl.uncother", wsluncpath(&a, "\\\\wsl.localhost\\Arch\\x", "Deb"), "");
+    expect(t, "wsl.uncprefix", wsluncpath(&a, "\\\\wsl.localhost\\Debian\\x", "Deb"), "");
+    expect(t, "wsl.uncserver", wsluncpath(&a, "\\\\server\\Deb\\x", "Deb"), "");
+    expect(t, "wsl.uncdrive", wsluncpath(&a, "C:\\Users", "Deb"), "");
+    expect(t, "wsl.uncnone", wsluncpath(&a, "\\\\wsl.localhost\\x", {}), "");
 }
 
 // wsl.exe's own messages: UTF-16 from an inbox wsl.exe, whatever

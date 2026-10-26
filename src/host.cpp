@@ -382,11 +382,11 @@ static HostSub *hostsub(HostClient *c, Str sid, i64 from, b32 attended)
 
 static void hostunsub(Host *, HostClient *, Arena scratch, Str sid);
 
-// Whether any client attends the session.
-static b32 hostattended(Host *h, Str sid)
+// Whether any client attends the session, leaving out but, if given.
+static b32 hostattended(Host *h, Str sid, HostClient *but = 0)
 {
     for (HostClient *c = h->clients; c; c = c->next) {
-        HostSub *s = findsub(c, sid);
+        HostSub *s = c==but ? 0 : findsub(c, sid);
         if (s && s->attended) {
             return 1;
         }
@@ -395,17 +395,20 @@ static b32 hostattended(Host *h, Str sid)
 }
 
 // A session's parent, as records passing through told, else as its
-// log's first record says, kept from then on. Empty for none.
+// log's first record says, kept from then on. Empty for none, and for
+// a subagent of a session on another host ("remote"), whose parent is
+// not here: a session here of the same sid is no kin of it.
 static Str hostparent(Host *h, Arena scratch, Str sid)
 {
     HostSess *ss = upsert(&h->sess, sid, (Arena *)0);
     if (ss && ss->parent.len) {
         return ss->parent;
     }
-    Str  dir  = join(&scratch, join(&scratch, h->statedir, "sessions"), sid);
-    Read rd   = os_readat(h->os, &scratch, join(&scratch, dir, "events.jsonl"), 0, 4096);
-    Cut  line = cut(rd.data, '\n');
-    Str  p    = jsonstr(jsonget(evparse(&scratch, line.head).root, "parent"));
+    Str   dir  = join(&scratch, join(&scratch, h->statedir, "sessions"), sid);
+    Read  rd   = os_readat(h->os, &scratch, join(&scratch, dir, "events.jsonl"), 0, 4096);
+    Cut   line = cut(rd.data, '\n');
+    Json *root = evparse(&scratch, line.head).root;
+    Str   p    = jsonflag(jsonget(root, "remote"), 0) ? Str{} : jsonstr(jsonget(root, "parent"));
     if (line.ok && validsid(p)) {
         hostsess(h, sid)->parent = clone(&h->perm, p);
         return hostsess(h, sid)->parent;
@@ -782,10 +785,12 @@ static void hostcommand(Host *h, HostClient *c, Arena scratch, Str line)
             hostreply(h, c, scratch, cid, 0, "invalid session id", {});
             return;
         }
+        // Attended as the others have it, and as this client has it
+        // now: opened again unattended, it is no longer attended by it
         i64 from = jsonint(jsonget(j, "from"), 0);
         b32 att  = jsonflag(jsonget(j, "attended"), 0);
         q = hostforward(h, scratch, j, cmd, HOSTCMD_CLIENT, I64MAX,
-                        att || hostattended(h, sid));
+                        att || hostattended(h, sid, c));
         if (q) {
             q->from     = from>0 ? from : 0;
             q->attended = att;
@@ -969,8 +974,9 @@ static void hostrecord(Host *h, Arena scratch, Str line)
     HostSess *ss = hostsess(h, r.sid);
     if (r.ev == EV_LIVE) {
         ss->busy = !(jsonstr(jsonget(r.root, "state")) == "idle");
-    } else if (r.ev==EV_SESSION && r.seq==1) {
-        // A subagent's session: for whoever has its parent open
+    } else if (r.ev==EV_SESSION && r.seq==1 && !jsonflag(jsonget(r.root, "remote"), 0)) {
+        // A subagent's session: for whoever has its parent open (unless
+        // that parent is on another host)
         Str parent = jsonstr(jsonget(r.root, "parent"));
         if (validsid(parent)) {
             ss->parent = clone(&h->perm, parent);

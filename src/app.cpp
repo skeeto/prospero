@@ -5492,10 +5492,10 @@ static void wslremotes(Gui *g)
 }
 
 // The program that reaches a remote: ssh, or wsl.exe for a WSL distro,
-// unless a test's stand-in (PROSPERO_TEST_SSH, PROSPERO_TEST_WSL).
+// unless a test's stand-in (linkstandin).
 static Str linkprogram(Gui *g, Arena *a, b32 wsl)
 {
-    return os_getenv(g->os, a, wsl ? Str("PROSPERO_TEST_WSL") : Str("PROSPERO_TEST_SSH"));
+    return linkstandin(g->os, a, wsl);
 }
 
 // Opening a terminal in a session's folder: on this machine, or on a
