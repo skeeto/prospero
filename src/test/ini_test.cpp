@@ -1327,6 +1327,14 @@ static void testiniwrite(Test *t)
         {"# only comments\n", "", "", "y", "2", 0,
          "# only comments\ny = 2\n", 2, 1},
         {"", "", "", "y", "2", 0, "y = 2\n", 1, 1},
+        // ... but under a commented-out example of it, past any include
+        {"x = 1\n# y = 9\n#y=8\n\n[s]\n", "", "", "y", "2", 0,
+         "x = 1\n# y = 9\ny = 2\n#y=8\n\n[s]\n", 3, 1},
+        {"# ys = 1\n# y is\n\n[s]\n", "", "", "y", "2", 0,
+         "# ys = 1\n# y is\n\ny = 2\n\n[s]\n", 4, 1},
+        {"# y = 9\ninclude = t.ini\n", "", "", "y", "2", 0,
+         "# y = 9\ninclude = t.ini\ny = 2\n", 3, 1},
+        {"[s]\n# y = 9\n", "", "", "y", "2", 0, "y = 2\n\n[s]\n# y = 9\n", 1, 1},
 
         // Remove: every definition in the section, nothing else
         {"[s]\na = 1 # c\nb = 2\n", "s", "", "a", {}, 1, "[s]\nb = 2\n", 0, 1},

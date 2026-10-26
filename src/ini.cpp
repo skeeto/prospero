@@ -1242,9 +1242,10 @@ static b32 iniin(IniLine *l, Str kind, Str name)
 //   wins over an include that also defines it.
 // - A new key goes after the section's last key in the file, or after
 //   its header, with the same indentation. A new top-level key goes
-//   after the last top-level key or include, or else before the
-//   comments leading into the first section header, with a blank line
-//   after it.
+//   after a commented-out example of it (# key = ...) past the last
+//   include, else after the last top-level key or include, or else
+//   before the comments leading into the first section header, with a
+//   blank line after it.
 // - A new section goes at the end, after a blank line.
 // - Removing drops every definition of the key in the section.
 //
@@ -1273,11 +1274,13 @@ static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
         enc = finish(&v);
     }
 
-    iz n      = f->lines.len;
-    iz last   = -1;  // the definition in effect
-    iz anchor = -1;  // the line a new key follows
-    iz header = -1;  // the section's last header
-    iz first  = -1;  // the first line that starts any section
+    iz n       = f->lines.len;
+    iz last    = -1;  // the definition in effect
+    iz anchor  = -1;  // the line a new key follows
+    iz header  = -1;  // the section's last header
+    iz first   = -1;  // the first line that starts any section
+    iz incl    = -1;  // the last include
+    iz example = -1;  // a top-level comment "# key = ..."
     for (iz i = 0; i < n; i++) {
         IniLine *l  = &f->lines[i];
         b32      in = iniin(l, kind, name);
@@ -1286,8 +1289,14 @@ static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
             last   = l->key==key ? i : last;
         } else if (l->type==INI_INCLUDE && top) {
             anchor = i;
+            incl   = i;
         } else if (l->type==INI_SECTION && in) {
             header = i;
+        } else if (l->type==INI_COMMENT && top && first<0 && example<0) {
+            Str c = trimleft(cuthead(trimleft(l->raw), 1));
+            if (startswith(c, key) && startswith(trimleft(cuthead(c, key.len)), "=")) {
+                example = i;
+            }
         }
         if (first<0 && startswith(trimleft(l->raw), "[")) {
             first = i;
@@ -1314,6 +1323,8 @@ static IniEdit iniedit(Arena *perm, IniFile *f, Str kind, Str name,
         Str      was = span(l->raw.data+l->valbeg, l->raw.data+l->valend);
         r.line    = last + 1;
         r.changed = quote<0 ? !(l->value == value) : !(was == enc);
+    } else if (top && example>incl) {
+        at = example + 1;
     } else if (anchor>=0 || header>=0) {
         iz after = anchor>=0 ? anchor : header;
         at = after + 1;

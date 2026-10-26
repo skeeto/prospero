@@ -1710,7 +1710,11 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         ImGui::EndDisabled();
         itemnamed(g, "Terminal");
         whytip(why.len ? why : Str("Open a terminal in this folder"));
-        inforow("Model", v->model);
+        Str model = v->model;
+        if (model.len && hostcan(s->host, "models")) {
+            model = modelshown(&a, s->host, v->endpoint, model);  // ENDPOINT/MODEL
+        }
+        inforow("Model", model);
         inforow("Endpoint", v->endpoint);
         if (v->role.len) {
             inforow("Role", v->role);

@@ -194,7 +194,7 @@ static void testcfgseed(Test *t)
     expect(t, "seed.diags", inidiags(&a, c->ini), "");
     expect(t, "seed.exists", istr(&a, c->user != 0), "1");
     expect(t, "seed.rev", istr(&a, c->rev), "1");
-    expect(t, "seed.endpoint", cfgget(c, "", "", "endpoint", 0), "local");
+    expect(t, "seed.endpoint", cfgdefaults(c).endpoint, "local");
     expect(t, "seed.url", cfgget(c, "endpoint", "local", "url", 1),
            "http://localhost/");
     expect(t, "seed.configured", istr(&a, cfgconfigured(c)), "0");
@@ -256,7 +256,7 @@ static void testcfgseed(Test *t)
     // with a URL and the first [model], trimmed
     struct {
         Str ini;
-        Str want;  // "ENDPOINT MODEL"
+        Str want;  // "ENDPOINT MODEL", then q if qualified, g if guessed
     } dflts[] = {
         {"", " "},
         {"endpoint = \" e \"\nmodel = \" m \"\n[endpoint x]\nurl = http://x/\n"
@@ -264,16 +264,33 @@ static void testcfgseed(Test *t)
         {"[endpoint nourl]\nkind = openai\n[endpoint bad]\nurl = nope\n"
          "[endpoint a]\nurl = http://a/\n[endpoint b]\nurl = http://b/\n", "a "},
         {"[model]\n[model first]\n[endpoint a]\nurl = http://a/\n[model second]\n",
-         "a first"},
+         "a first g"},
         {"endpoint = http://u/\n[endpoint a]\nurl = http://a/\n", "http://u/ "},
         {"model =\n[role r]\nmodel = m\n", " "},
+        // A model named with its endpoint, which wins over endpoint
+        {"model = b/Org/M-1\n[endpoint a]\nurl = http://a/\n"
+         "[endpoint b]\nurl = http://b/\n", "b Org/M-1 q"},
+        {"endpoint = a\nmodel = b/m\n[endpoint a]\nurl = http://a/\n"
+         "[endpoint b]\nurl = http://b/\n", "b m q"},
+        // A slash that names no endpoint is the model's own
+        {"model = Qwen/Qwen3-8B\n[endpoint a]\nurl = http://a/\n",
+         "a Qwen/Qwen3-8B g"},
+        {"endpoint = a\nmodel = nourl/m\n[endpoint a]\nurl = http://a/\n"
+         "[endpoint nourl]\nkind = openai\n", "a nourl/m"},
     };
     for (i32 i = 0; i < countof(dflts); i++) {
         os_write(v.os, a, "/c/x.ini", dflts[i].ini);
         c = newconfig(v.os, &a, v.scratch, "/c/x.ini", 0);
         CfgDefaults d = cfgdefaults(c);
-        expect(t, "cfgdefaults", concat(&a, concat(&a, d.endpoint, " "), d.model),
-               dflts[i].want);
+        Str got = concat(&a, concat(&a, d.endpoint, " "), d.model);
+        got = d.qualified ? concat(&a, got, " q") : got;
+        got = d.guessed && d.model.len ? concat(&a, got, " g") : got;
+        expect(t, "cfgdefaults", got, dflts[i].want);
+        if (i == countof(dflts)-3) {
+            expect(t, "cfgdefaults.conflict", inidiags(&a, c->ini),
+                   "/c/x.ini:1:12: warning: model names endpoint b, so this is "
+                   "ignored");
+        }
         cfgfree(c);
     }
 
@@ -626,7 +643,8 @@ static void testcfgset(Test *t)
         Str     want = "model = m\n";
         if (seed) {
             Str s   = cfgseed();
-            iz  at  = find(s, "endpoint = local\n") + 17;
+            Str ex  = "# model = local/qwen3-coder\n";  // set under its example
+            iz  at  = find(s, ex) + ex.len;
             want = concat(&a, takehead(s, at), want);
             want = concat(&a, want, cuthead(s, at));
         }

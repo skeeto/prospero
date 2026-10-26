@@ -34,12 +34,14 @@ with a model, the first run needs no settings at all.
    file: set `key` to `env:NAME`, and Prospero reads it from the
    environment variable NAME, or to `file:PATH`, a file holding the
    key.
-3. Optionally, on the Defaults page, set `endpoint` to that
-   endpoint's name, and `model` to the model's name, as the endpoint
-   lists it. Without them, a new session gets the first endpoint with
-   a url, and the first `[model]` section, else the first model that
-   endpoint lists. The New session dialog lists every endpoint's
-   models, to pick another for one session.
+3. Optionally, on the Defaults page, set `model` to the endpoint's
+   name and the model's, as `ENDPOINT/MODEL`, such as
+   `local/qwen3-coder`. Without it, a new session gets the first
+   `[model]` section, else the first model the endpoint lists. A model
+   without its endpoint goes to Defaults' `endpoint`, else to an
+   endpoint that listed it, else to the first endpoint with a url. The
+   New session dialog lists every endpoint's models, to pick another
+   for one session.
 
 Changes apply while Prospero runs. A mistake is reported in the
 settings' Diagnostics page, and a bad value falls back to its default.

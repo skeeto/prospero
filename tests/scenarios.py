@@ -3279,6 +3279,26 @@ def fallback(t):
     t.check(r.text() == "Back on the primary.", f"text {r.text()!r}")
 
 
+@scenario(bound=8)
+def default_qualified(t):
+    """A default model named with its endpoint, ENDPOINT/MODEL, goes to
+    that endpoint, over a default endpoint that names another, which is
+    warned about."""
+    t.host.write(t.config,
+                 "endpoint = dead\n"
+                 f"model = live/{t.model}\n"
+                 "[endpoint dead]\nurl = http://127.0.0.1:9/\nconnect_timeout = 1\n"
+                 f"[endpoint live]\nurl = {t.host.url}/\n"
+                 "[guard]\ntemp = ask\n")
+    t.args = lambda extra=(): ["-C", t.work, "--state", t.state, "-c", t.config] + list(extra)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(r.events[0].get("model") == t.model, f"session {r.events[0]}")
+    t.check(r.text() == "Default qualified.", f"text {r.text()!r}")
+    t.check("model names endpoint live, so this is ignored" in r.stderr,
+            f"warned: {r.stderr!r}")
+
+
 @scenario(conf={"_extra": "[model {model}]\nfallback = fake/{model2}\n"}, bound=8)
 def limit(t):
     """A usage limit goes straight to the fallback, here given as

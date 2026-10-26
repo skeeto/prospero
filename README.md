@@ -333,10 +333,14 @@ for usage errors. Options: `-C DIR` (working directory), `-e ENDPOINT`,
 `-m MODEL` (or `ENDPOINT/MODEL`), `-r ROLE`, `-c FILE` (configuration)
 and `--state DIR`.
 
-A session that names no endpoint gets the configuration's `endpoint`,
-else the first `[endpoint]` section with a URL; one that names no model
-gets the configuration's `model`, else the first `[model]` section,
-else the first model its endpoint listed when last asked. The New
+A session that names no model gets the configuration's `model`, else
+the first `[model]` section, else the first model its endpoint listed
+when last asked. A `model` of `ENDPOINT/MODEL`, where ENDPOINT is a
+configured endpoint's name, names its endpoint too, and a configured
+`endpoint` naming another is ignored, with a warning. Otherwise a
+session that names no endpoint gets the configuration's `endpoint`,
+else the first endpoint that listed the model when last asked, else
+the first `[endpoint]` section with a URL. The New
 session dialog asks every endpoint for its listing (`/v1/models`, which
 loads nothing) and offers what they serve as `ENDPOINT/MODEL`.
 

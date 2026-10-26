@@ -2112,9 +2112,8 @@ struct Target {
 static Target targetof(Engine *e, Str spec, Str dflt)
 {
     Target t = {dflt, spec};
-    Cut    c = cut(spec, '/');
-    if (c.ok && c.head.len && c.tail.len &&
-            trim(cfgget(e->cfg, "endpoint", c.head, "url", 0)).len) {
+    Cut    c = cfgqualified(e->cfg, spec);
+    if (c.ok) {
         t.which = c.head;
         t.model = c.tail;
     }
@@ -9702,11 +9701,37 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
 // The endpoint and model of a new session that names one or neither:
 // the endpoint given, else the configuration's (cfgdefaults), and the
 // configuration's model, else the first that endpoint listed when last
-// asked (models, or a session's discover), else none.
+// asked (models, or a session's discover), else none. A model named
+// with its endpoint is not taken to another endpoint given. One named
+// without, with no endpoint named either, goes to the first endpoint
+// that listed it when last asked, else the first configured.
 static CfgDefaults defaults(Engine *e, Arena scratch, Str which)
 {
     CfgDefaults d  = cfgdefaults(e->cfg);
     Endpoint    ep = {};
+    if (which.len && d.qualified && which!=d.endpoint) {
+        d.model = {};
+    }
+    if (!which.len && d.guessed && d.model.len) {
+        Str id = cfgmodelid(e->cfg, d.model);
+        for (IniSection *s = inifirst(e->cfg->ini, "endpoint"); s; s = ininext(s)) {
+            Arena tmp = scratch;
+            if (!s->name.len || !endpointconf(e, &tmp, s->name, &ep)) {
+                continue;
+            }
+            Str *list = upsert(&e->listings, ep.url, (Arena *)0);
+            b32  has  = 0;
+            for (Str rest = list ? *list : Str{}; !has && rest.len;) {
+                Cut c = cut(rest, '\n');
+                has  = c.head==d.model || c.head==id;
+                rest = c.tail;
+            }
+            if (has) {
+                d.endpoint = s->name;
+                break;
+            }
+        }
+    }
     d.endpoint = which.len ? which : d.endpoint;
     if (!d.model.len && d.endpoint.len && endpointconf(e, &scratch, d.endpoint, &ep)) {
         Str *list = upsert(&e->listings, ep.url, (Arena *)0);

@@ -520,6 +520,10 @@ def sc_empty(model, n, req):
         yield from answer(model, "Finally something.")
 
 
+def sc_default_qualified(model, n, req):
+    yield from answer(model, "Default qualified.")
+
+
 def sc_empty_more(model, n, req):
     # Three empty responses, which empty_retries = 3 allows
     if n < 3:

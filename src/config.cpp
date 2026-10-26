@@ -245,7 +245,8 @@ static CfgKey cfgschema[] = {
     {"", "endpoint", CFG_STRING, "", {}, {}, "general",
      "Endpoint for new sessions: an [endpoint] name or a URL"},
     {"", "model", CFG_STRING, "", {}, {}, "general",
-     "Model for new sessions, as the endpoint names it"},
+     "Model for new sessions: ENDPOINT/MODEL, or MODEL as the endpoint "
+     "names it, at the endpoint above, else at one that lists it"},
 
     {"endpoint", "url", CFG_URL, "", {}, {}, "endpoint",
      "Base URL: chat requests go to URL/v1/chat/completions, or for kind "
@@ -1191,28 +1192,51 @@ static b32 cfgconfigured(Config *c)
 }
 
 // The defaults for a new session that names no endpoint or no model,
-// trimmed, either empty if there is none: Defaults' endpoint, else the
-// first [endpoint] section with a URL, and Defaults' model, else the
-// first [model] section's. The engine adds the endpoint's listing.
+// trimmed, either empty if there is none. Defaults' model, else the
+// first [model] section's, may name its endpoint, ENDPOINT/MODEL, where
+// ENDPOINT is a configured endpoint's name, since a model's own name may
+// hold a slash (Qwen/Qwen3-8B). Otherwise the endpoint is Defaults'
+// endpoint, else the first [endpoint] section with a URL, a guess the
+// engine may better with its listings.
 struct CfgDefaults {
     Str endpoint;
     Str model;
+    b32 qualified;  // the model named its endpoint
+    b32 guessed;    // no endpoint named: the first configured
 };
+
+// MODEL split from ENDPOINT/MODEL, where ENDPOINT is a configured
+// endpoint's name, else null.
+static Cut cfgqualified(Config *c, Str spec)
+{
+    Cut m = cut(spec, '/');
+    m.ok = m.ok && m.head.len && m.tail.len &&
+           trim(cfgget(c, "endpoint", m.head, "url", 0)).len;
+    return m;
+}
 
 static CfgDefaults cfgdefaults(Config *c)
 {
     CfgDefaults r = {};
+    r.model = trim(cfgget(c, "", "", "model", 0));
+    for (IniSection *s = inifirst(c->ini, "model"); !r.model.len && s; s = ininext(s)) {
+        r.model = s->name;
+    }
+    Cut m = cfgqualified(c, r.model);
+    if (m.ok) {
+        r.endpoint  = m.head;
+        r.model     = m.tail;
+        r.qualified = 1;
+        return r;
+    }
     r.endpoint = trim(cfgget(c, "", "", "endpoint", 0));
     IniSection *s = inifirst(c->ini, "endpoint");
     for (; !r.endpoint.len && s; s = ininext(s)) {
         Str url = trim(cfgget(c, "endpoint", s->name, "url", 0));
         if (s->name.len && parseurl(url).ok) {
             r.endpoint = s->name;
+            r.guessed  = 1;
         }
-    }
-    r.model = trim(cfgget(c, "", "", "model", 0));
-    for (s = inifirst(c->ini, "model"); !r.model.len && s; s = ininext(s)) {
-        r.model = s->name;
     }
     return r;
 }
@@ -1619,6 +1643,21 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
                     if (!cfgmuted(e->file)) {
                         msg = concat(perm, "environment variable ", name);
                         msg = concat(perm, msg, " is not set");
+                    }
+                    cfgreport(ini, perm, e->file, e->line, INI_WARNING,
+                              e->line->valbeg, msg);
+                }
+            }
+            if (!s->kind.len && e->key=="endpoint" && v.len) {
+                // A default model that names another endpoint wins
+                IniEntry *me = inilookup(ini, "", "", "model");
+                Cut       m  = cut(me ? trim(me->value) : Str{}, '/');
+                if (m.ok && m.head.len && m.tail.len && m.head!=v &&
+                        inientry(inisection(ini, "endpoint", m.head), "url")) {
+                    Str msg = {};
+                    if (!cfgmuted(e->file)) {
+                        msg = concat(perm, "model names endpoint ", m.head);
+                        msg = concat(perm, msg, ", so this is ignored");
                     }
                     cfgreport(ini, perm, e->file, e->line, INI_WARNING,
                               e->line->valbeg, msg);
