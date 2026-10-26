@@ -4677,6 +4677,24 @@ def an_cache(t):
     t.check(all(u["in"] > u["cached"] + u.get("written", 0) for u in us), f"in: {us}")
 
 
+@scenario(conf=dict(AN, key="file:~/fake.key"), bound=8)
+def an_keyfile(t):
+    """A key read from a file where the engine runs (key = file:PATH),
+    as on a WSL or ssh host whose environment cannot be set, trimmed
+    of its newline; a missing file is named in the hint."""
+    r = t.run()
+    end = r.last("turn.end")
+    t.check(r.rc == 1 and "fake.key, which cannot be read where the engine runs"
+            in end.get("err", ""), f"missing: {end}")
+    keyfile = t.host.join(t.home, "fake.key")
+    t.host.write(keyfile, fake_provider.AN_KEY + "\n")
+    r = t.run()
+    anok(t, r)
+    t.check(r.text() == "Keyed from a file.", f"text {r.text()!r}")
+    t.check(fake_provider.AN_KEY not in json.dumps(r.events) and
+            fake_provider.AN_KEY not in r.stderr, "the key is never shown")
+
+
 @scenario(conf=AN, bound=8)
 def an_auth(t):
     """A key refused is fatal at once, with a hint naming the setting and

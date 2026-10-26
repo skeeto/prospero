@@ -441,17 +441,19 @@ time, and its Open in editor opens the whole file in your editor, read
 again once the editor exits.
 
 API keys never go in the file: `key = env:NAME` reads one from the
-environment when it is needed. Above the first section, `include = `
-adds a shared file, such as a team's endpoints and models, whose
-settings this file can override. An include may be a path or an http
-or https URL, which is fetched at startup, cached, and refreshed in the
-background, and may be pinned to a SHA-256. Nothing in an included file
-can make Prospero run a command: its plaintext secrets, `[remote]` and
-`[desktop]` settings, `[tools] path_prepend` and `path_append`, a
+environment when it is needed, and `key = file:PATH` from a file
+holding just the key, for an engine whose environment you cannot set,
+such as one on a remote host or in WSL (its own configuration names a
+file there). Above the first section, `include = ` adds a shared file,
+such as a team's endpoints and models, whose settings this file can
+override. An include may be a path or an http or https URL, which is
+fetched at startup, cached, and refreshed in the background, and may
+be pinned to a SHA-256. Nothing in an included file can make Prospero
+run a command: its plaintext secrets and `file:` secrets, `[remote]`
+and `[desktop]` settings, `[tools] path_prepend` and `path_append`, a
 `[tools] shell` other than a keyword, and `[ui] editor` and `terminal`
-are ignored. A
-server whose certificate is not trusted fails the turn at once, saying
-why, rather than being retried.
+are ignored. A server whose certificate is not trusted fails the turn
+at once, saying why, rather than being retried.
 
 Prospero started from Spotlight, the Finder, the Start menu or a desktop
 menu has a shorter PATH than a shell gives it. `[tools] path_prepend`

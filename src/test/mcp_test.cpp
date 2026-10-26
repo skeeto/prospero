@@ -255,7 +255,7 @@ static void test_mcp(Test *t)
             "set one of them\n"
             "/c/prospero.ini:5:2: warning: mcp none has neither a command nor a url\n"
             "/c/prospero.ini:10:9: warning: a plaintext secret: write env:NAME and "
-            "set the variable, so that this file can be shared\n"
+            "set the variable, or file:PATH, so that this file can be shared\n"
             "/c/team.ini:2:11: error: an [mcp] setting in an included file is "
             "ignored, since it chooses what runs and what the agent may reach: set "
             "it in your own file");

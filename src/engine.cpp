@@ -1389,6 +1389,11 @@ static Str keyhint(Engine *e, Arena *a, Endpoint *ep)
             print(&b, ", which is ");
             print(&b, ep->key.len ? Str("set")
                                   : Str("not set where the engine runs"));
+        } else if (startswith(set, "file:")) {
+            print(&b, "] key = ");
+            print(&b, set);
+            print(&b, ep->key.len ? Str(", which was read")
+                                  : Str(", which cannot be read where the engine runs"));
         } else {
             print(&b, "] key, written out in the file");
         }

@@ -42,7 +42,8 @@ SHA-256.
 The Settings pane never edits an included file. An included file
 cannot choose what runs, so these are ignored in one:
 
-- plaintext secrets (a `key` not written as `env:NAME`);
+- plaintext secrets (a `key` not written as `env:NAME`), and secrets
+  read from files (`file:PATH`);
 - `[remote]` and `[desktop]` settings;
 - `[tools] path_prepend` and `path_append`;
 - a `[tools] shell` other than `auto`, `sh`, `powershell` or `cmd`;
@@ -51,7 +52,11 @@ cannot choose what runs, so these are ignored in one:
 ## Settings worth knowing
 
 - **API keys** never go in the file: `key = env:NAME` reads one from
-  the environment variable NAME.
+  the environment variable NAME, and `key = file:PATH` from a file
+  holding just the key (PATH absolute or under `~`). A file suits an
+  engine whose environment you cannot set, such as one on a remote
+  host or in WSL, where the host's own configuration names a file
+  there. Keep it private (`chmod 600`).
 - **`[tools] path_prepend` and `path_append`**: directories, separated
   by `;`, added before and after PATH, for the agent's commands, its
   shell and ripgrep, and for the editor and ssh. Prospero started from

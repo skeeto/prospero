@@ -355,7 +355,7 @@ static void testcfgvalidate(Test *t)
         "/c/prospero.ini:8:1: warning: unknown key \"idle_timout\" in "
         "[endpoint]; did you mean idle_timeout?\n"
         "/c/prospero.ini:9:7: warning: a plaintext secret: write env:NAME and "
-        "set the variable, so that this file can be shared\n"
+        "set the variable, or file:PATH, so that this file can be shared\n"
         "/c/prospero.ini:10:2: warning: endpoint broken has no url\n"
         "/c/prospero.ini:12:2: warning: a section needs a name, as in "
         "[endpoint NAME], or its settings are unused\n"
@@ -469,6 +469,39 @@ static void testcfgvalidate(Test *t)
     expect(t, "env.empty", cfgsecret(c, &a, "endpoint", "b", "key"), "");
     cfgfree(c);
 
+    // Secrets read from files where the engine runs, from the user's own
+    // file only, since an include could name any file to be sent
+    addenv(v.os, &a, "HOME=/home/u");
+    os_write(v.os, a, "/home/u/k.key", "sk-from-file\n");
+    os_write(v.os, a, "/c/k.key", "  sk-abs  \n");
+    os_write(v.os, a, "/c/files.ini",
+             "include = files-team.ini\n"
+             "[endpoint a]\nurl = http://a/\nkey = file:~/k.key\n"
+             "[endpoint b]\nurl = http://b/\nkey = file: /c/k.key\n"   // 7
+             "[endpoint c]\nurl = http://c/\nkey = file:/c/none.key\n"
+             "[endpoint d]\nurl = http://d/\nkey = file:k.key\n");     // 13
+    os_write(v.os, a, "/c/files-team.ini",
+             "[endpoint e]\nurl = http://e/\nkey = file:/c/k.key\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/files.ini", 0);
+    expect(t, "file.diags", inidiags(&a, c->ini),
+        "/c/files.ini:13:7: error: expected file:PATH, with PATH absolute or "
+        "under ~\n"
+        "/c/files-team.ini:3:7: error: a secret from a file in an included "
+        "file is ignored, since it could send any of your files: set it in "
+        "your own file\n"
+        "/c/files.ini:10:7: warning: /c/none.key cannot be read, or is empty");
+    static struct { Str name, want; } files[] = {
+        {"a", "sk-from-file"}, {"b", "sk-abs"}, {"c", "(null)"},
+        {"d", "(null)"}, {"e", "(null)"},
+    };
+    for (iz i = 0; i < countof(files); i++) {
+        Str got = cfgsecret(c, &a, "endpoint", files[i].name, "key");
+        expect(t, concat(&a, "file.secret ", files[i].name),
+               got.len ? got : Str("(null)"), files[i].want);
+    }
+    expect(t, "file.secrets", showlist(&a, cfgsecrets(c, &a)), "");
+    cfgfree(c);
+
     // The variables of every secret setting, overridden ones too, which
     // the agent's commands do not get
     os_write(v.os, a, "/c/secrets.ini",
@@ -548,7 +581,9 @@ static void testcfgset(Test *t)
         {"endpoint", "local", "idle_timeout", "soon",
          "expected seconds, a number above 0, so the default applies"},
         {"endpoint", "local", "key", "sk-x",
-         "a secret must be a reference such as env:NAME"},
+         "a secret must be a reference such as env:NAME or file:PATH"},
+        {"endpoint", "local", "key", "file:rel/k", "expected file:PATH, with "
+         "PATH absolute or under ~"},
         {"endpoint", "local", "key", "env:", "expected env:NAME, with NAME "
          "an environment variable"},
         {"endpoint", "", "url", "http://x/",

@@ -3617,6 +3617,10 @@ def sc_an_auth(model, n, req):
     yield from an_answer(model, req, "Never reached: the key is wrong.")
 
 
+def sc_an_keyfile(model, n, req):
+    yield from an_answer(model, req, "Keyed from a file.")
+
+
 def sc_an_between(model, n, req):
     yield from an_answer(model, req, "Thinking only between tools.")
 

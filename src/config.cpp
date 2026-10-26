@@ -15,15 +15,16 @@
 // file, line and column. Nothing stops the harness from starting: a bad
 // value is an error and falls back to its default, while an unknown
 // key, section kind or enum value is a warning. Secrets are references,
-// key = env:NAME, resolved when used. A plaintext secret in the user's
-// own file is used, with a warning; in an included (shared) file it is
-// an error and ignored, as is any setting of a [remote] section, which
-// chooses a program to run and where (ssh, path, state, config, deploy),
-// or of the [desktop] section, which lets the agent use the screen, and
-// any other setting that chooses a program to run here (cfgruns): [tools]
-// path_prepend and path_append, which say where programs are found, a
-// [tools] shell other than a keyword (auto, sh, powershell, cmd), and
-// [ui] editor.
+// key = env:NAME or key = file:PATH, resolved when used. A plaintext
+// secret in the user's own file is used, with a warning; in an included
+// (shared) file it is an error and ignored, as is file:PATH there,
+// which could send any of the user's files, and any setting of a
+// [remote] section, which chooses a program to run and where (ssh,
+// path, state, config, deploy), or of the [desktop] section, which lets
+// the agent use the screen, and any other setting that chooses a
+// program to run here (cfgruns): [tools] path_prepend and path_append,
+// which say where programs are found, a [tools] shell other than a
+// keyword (auto, sh, powershell, cmd), and [ui] editor.
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -189,7 +190,7 @@ enum : i32 {
     CFG_BOOL,     // true/false, yes/no, on/off, 1/0
     CFG_ENUM,     // one of the choices
     CFG_URL,      // http:// or https://
-    CFG_SECRET,   // env:NAME
+    CFG_SECRET,   // env:NAME, or file:PATH
     CFG_LIST,     // words from the choices, separated by blanks or commas
     CFG_PATHS,    // absolute or ~ paths, separated by ;
     CFG_TIMES,    // seconds, each above 0, separated by blanks
@@ -253,7 +254,7 @@ static CfgKey cfgschema[] = {
      "The API it speaks: openai (Chat Completions) or anthropic (Messages)"},
     {"endpoint", "key", CFG_SECRET, "", {}, {}, "endpoint",
      "API key sent as a bearer token, or as x-api-key for kind anthropic, "
-     "as env:NAME"},
+     "as env:NAME, or file:PATH to read it from a file"},
     {"endpoint", "connect_timeout", CFG_SECONDS, "15", "5", {}, "timeouts",
      "Seconds to connect"},
     {"endpoint", "first_byte_timeout", CFG_SECONDS, "300", "1800", {},
@@ -514,13 +515,13 @@ static CfgKey cfgschema[] = {
      "header.NAME = VALUE: a header for a url's requests, VALUE env:VAR to "
      "take it from the environment"},
     {"mcp", "token", CFG_SECRET, "", {}, {}, "mcp",
-     "A url's bearer token, as env:NAME, for servers that take one in "
-     "place of signing in"},
+     "A url's bearer token, as env:NAME or file:PATH, for servers that "
+     "take one in place of signing in"},
     {"mcp", "client_id", CFG_STRING, "", {}, {}, "mcp",
      "Signing in to a url: the OAuth client to sign in as, for servers that "
      "do not register clients themselves"},
     {"mcp", "client_secret", CFG_SECRET, "", {}, {}, "mcp",
-     "That client's secret, as env:NAME, if it has one"},
+     "That client's secret, as env:NAME or file:PATH, if it has one"},
     {"mcp", "scope", CFG_STRING, "", {}, {}, "mcp",
      "Signing in: the scopes to ask for, separated by blanks, by default "
      "those the server names"},
@@ -861,6 +862,9 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     case CFG_SECRET:
         if (startswith(v, "env:")) {
             return cfgenvname(trim(cuthead(v, 4))) ? CFG_OK : CFG_BAD;
+        } else if (startswith(v, "file:")) {
+            Str p = trim(cuthead(v, 5));
+            return !shared && (iniroot(p) || cfgtilde(p)) ? CFG_OK : CFG_BAD;
         }
         return shared ? CFG_BAD : CFG_ODD;
     case CFG_LIST:
@@ -957,12 +961,18 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     case CFG_SECRET:
         if (startswith(v, "env:")) {
             print(&b, "expected env:NAME, with NAME an environment variable");
+        } else if (startswith(v, "file:") && shared) {
+            print(&b, "a secret from a file in an included file is ignored, "
+                      "since it could send any of your files: set it in your "
+                      "own file");
+        } else if (startswith(v, "file:")) {
+            print(&b, "expected file:PATH, with PATH absolute or under ~");
         } else if (shared) {
             print(&b, "a plaintext secret in an included file is ignored: "
                       "write env:NAME and set the variable");
         } else {
             print(&b, "a plaintext secret: write env:NAME and set the "
-                      "variable, so that this file can be shared");
+                      "variable, or file:PATH, so that this file can be shared");
         }
         return finish(&b);
     case CFG_PATHS:
@@ -1225,13 +1235,42 @@ static i64 cfgms(Config *c, Str kind, Str name, Str key, b32 local)
     return ms>0 ? ms : 1;
 }
 
-// A secret setting, resolved: env:NAME reads the environment. Null when
-// unset, when the variable is unset, or when ignored (cfgjudge).
+// A secret setting, resolved: env:NAME reads the environment, and
+// file:PATH a file on this machine, for an engine whose environment
+// nobody sets, as a remote's is. Null when unset, when the variable is
+// unset or the file unreadable, or when ignored (cfgjudge).
+static Str userhome(Os *, Arena *);
+
+// The file a file:PATH secret names, ~ the home directory, or null if
+// the value names none.
+static Str cfgsecretfile(Os *os, Arena *perm, Str v)
+{
+    Str p = trim(cuthead(trim(v), 5));
+    if (!startswith(trim(v), "file:") || !p.len) {
+        return {};
+    } else if (cfgtilde(p)) {
+        Str home = userhome(os, perm);
+        return home.len ? concat(perm, home, cuthead(p, 1)) : Str{};
+    }
+    return p;
+}
+
+// A secret file's contents, trimmed, as a key is written to one: null
+// if it cannot be read.
+static Str cfgreadsecret(Os *os, Arena *perm, Str path)
+{
+    Read r = os_read(os, perm, path, 64<<10);
+    return r.err==READ_OK ? trim(r.data) : Str{};
+}
+
 static Str cfgsecret(Config *c, Arena *perm, Str kind, Str name, Str key)
 {
     Str v = trim(cfgget(c, kind, name, key, 0));
     if (startswith(v, "env:")) {
         return os_getenv(c->os, perm, trim(cuthead(v, 4)));
+    } else if (startswith(v, "file:")) {
+        Str path = cfgsecretfile(c->os, perm, v);
+        return path.len ? cfgreadsecret(c->os, perm, path) : Str{};
     }
     return v.len ? clone(perm, v) : Str{};
 }
@@ -1552,6 +1591,21 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
             }
             if (s->kind=="model" && e->key=="like" && v.len) {
                 cfglikecheck(ini, perm, s->name, e);
+            }
+            if (k && k->type==CFG_SECRET && startswith(v, "file:") &&
+                    cfgjudge(k, v, e->file!=user)==CFG_OK) {
+                Str   path = cfgsecretfile(c->os, perm, v);
+                Arena tmp  = *perm;  // the key itself kept nowhere
+                if (!path.len || !cfgreadsecret(c->os, &tmp, path).len) {
+                    Str msg = {};
+                    if (!cfgmuted(e->file)) {
+                        msg = concat(perm, path.len ? path : trim(cuthead(v, 5)),
+                                     path.len ? Str(" cannot be read, or is empty")
+                                              : Str(": no home directory is known"));
+                    }
+                    cfgreport(ini, perm, e->file, e->line, INI_WARNING,
+                              e->line->valbeg, msg);
+                }
             }
             if (k && k->type==CFG_SECRET && startswith(v, "env:") &&
                     cfgjudge(k, v, 0)==CFG_OK) {
@@ -2613,8 +2667,8 @@ static CfgSet cfgset(Config *c, Arena *perm, Str kind, Str name, Str key,
         r.err = cfgproblem(perm, s, value, 0);
         return r;
     } else if (value.data && s->type==CFG_SECRET && trim(value).len &&
-               !startswith(trim(value), "env:")) {
-        r.err = "a secret must be a reference such as env:NAME";
+               !startswith(trim(value), "env:") && !startswith(trim(value), "file:")) {
+        r.err = "a secret must be a reference such as env:NAME or file:PATH";
         return r;
     } else if (!c->path.len) {
         r.err = "no configuration file location";
@@ -2825,7 +2879,7 @@ static void putcfgrow(JsonOut *w, Config *c, CfgKey *k, Str kind, Str name,
         value  = e->value;
         valid  = cfgjudge(k, v, e->file!=c->user) != CFG_BAD;
         isdflt = 0;
-        if (k->type==CFG_SECRET && !startswith(v, "env:")) {
+        if (k->type==CFG_SECRET && !startswith(v, "env:") && !startswith(v, "file:")) {
             value = "(hidden)";
         }
     } else if (kind=="model" && key=="id") {

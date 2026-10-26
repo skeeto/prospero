@@ -32,7 +32,8 @@ with a model, the first run needs no settings at all.
 2. Under Endpoints, pick `local` and edit its url, or use Add
    endpoint... for another server. An API key is never written in the
    file: set `key` to `env:NAME`, and Prospero reads it from the
-   environment variable NAME.
+   environment variable NAME, or to `file:PATH`, a file holding the
+   key.
 3. Optionally, on the Defaults page, set `endpoint` to that
    endpoint's name, and `model` to the model's name, as the endpoint
    lists it. Without them, a new session gets the first endpoint with
