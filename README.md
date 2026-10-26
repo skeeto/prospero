@@ -328,7 +328,8 @@ may send at most twenty.
 `prospero run` runs one turn with no window and exits when it ends,
 printing its records as JSON lines, or readable text with `--pretty`.
 Nobody answers its asks, so they are denied. It exits 0 when the turn
-is done, 1 on error, 3 at the step budget, 130 when cancelled, and 2
+is done, 1 on error, 3 at the step budget (`[tools] turn_budget`, 300
+model requests unless set, 0 for none), 130 when cancelled, and 2
 for usage errors. Options: `-C DIR` (working directory), `-e ENDPOINT`,
 `-m MODEL` (or `ENDPOINT/MODEL`), `-r ROLE`, `-c FILE` (configuration)
 and `--state DIR`.

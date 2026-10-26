@@ -512,6 +512,19 @@ def sc_cycle(model, n, req):
         yield from answer(model, "Checked it.")
 
 
+def sc_turn_budget(model, n, req):
+    # Searches, each another, until the budget of 3 ends the turn
+    yield from calls(model, n, [("glob", {"pattern": f"x{n}*"})])
+
+
+def sc_turn_unlimited(model, n, req):
+    # Past the default's 300 requests, which turn_budget = 0 allows
+    if n < 305:
+        yield from calls(model, n, [("glob", {"pattern": f"x{n}*"})])
+    else:
+        yield from answer(model, "No limit.")
+
+
 def sc_empty(model, n, req):
     if n < 2:
         yield S.head()

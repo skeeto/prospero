@@ -33,7 +33,8 @@
 //   told to the agent at its next request, and an idle session starts
 //   a turn for it, a few times an hour at most. Stopping a command asks
 //   first (TERM, or CTRL_BREAK), then kills after a grace period.
-// - Budgets: a note at 200 steps, the end of the turn at 300.
+// - Budgets: the end of the turn at [tools] turn_budget steps (300,
+//   or none), with a note at 200 steps when it ends later.
 //
 // Unattended runs must not get stuck, nor give up early, so:
 //
@@ -651,7 +652,7 @@ struct Session {
     Slice<TaskRun> tasks;    // the subagents of the calls running
     b32          parkme;     // idle long enough: park it (enginethread)
     // Limits a frontend set (new), as an eval does
-    i64          stepmax;    // model requests a turn, 0 for STEP_HARD
+    i64          stepmax;    // model requests a turn at most, else 0
     b32          projinstr;  // the project's instruction files, not the user's
     b32          nofallback; // never a fallback model: the one asked, or none
     b32          tempask;    // asks for the temporary directories, whatever
@@ -9184,6 +9185,16 @@ static void compacted(Session *s, Arena scratch, Partial *p)
 
 // Steps and turns
 
+// The model requests a turn may make, 0 for no limit: [tools]
+// turn_budget, read anew at each step, else STEP_HARD, and at most the
+// session's own (new's steps).
+static i64 stephard(Session *s)
+{
+    Int v = parseint(trim(cfgget(s->e->cfg, "tools", "", "turn_budget", 0)));
+    i64 h = v.ok && v.val>=0 ? v.val : STEP_HARD;
+    return s->stepmax && (!h || s->stepmax<h) ? s->stepmax : h;
+}
+
 static void finalize(Session *s, Arena scratch)
 {
     Partial *p = s->part;
@@ -9324,13 +9335,13 @@ static void prepare(Session *s, Arena scratch)
 
     s->steps++;
     s->retries = 0;
-    i64 hard = s->stepmax ? s->stepmax : STEP_HARD;
+    i64 hard = stephard(s);
     if (s->steps==STEP_SOFT && hard>STEP_SOFT) {
         Buf b(&scratch, 128);
         print(&b, "this turn has made 200 model requests; it ends at ");
         print(&b, hard);
         note(s, scratch, "warn", finish(&b));
-    } else if (s->steps > hard) {
+    } else if (hard && s->steps>hard) {
         Buf b(&scratch, 128);
         print(&b, "the turn reached its limit of ");
         print(&b, hard);
@@ -12005,7 +12016,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
                     deskdeny(e, scratch, role.ok) | skilldeny(e);
     s->mcpfilter  = tools.data ? clone(&s->perm, tools) :
                     role.mcp.data ? clone(&s->perm, role.mcp) : Str{};
-    s->stepmax    = steps<STEP_HARD ? steps : 0;
+    s->stepmax    = steps>0 ? steps : 0;
     s->projinstr  = instr == "project";
     s->nofallback = !fall;
     s->tempask    = temp == "ask";
@@ -12271,7 +12282,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             // Its edit format as it began: absent, the first one
             s->te.edit = editformat(jsonstr(jsonget(j, "edit_format")));
             i64 steps  = jsonint(jsonget(j, "steps"), 0);
-            s->stepmax = steps>0 && steps<STEP_HARD ? steps : 0;
+            s->stepmax = steps>0 ? steps : 0;
             s->tempask  = jsonstr(jsonget(j, "temp")) == "ask";
             s->nofolder = jsonflag(jsonget(j, "nofolder"), 0);
         } break;

@@ -1003,6 +1003,29 @@ def empty(t):
     t.check(r.text() == "Finally something.", f"text {r.text()!r}")
 
 
+@scenario(conf={"_tools": {"turn_budget": 3}}, bound=8)
+def turn_budget(t):
+    """[tools] turn_budget ends a turn at that many model requests."""
+    r = t.run()
+    end = r.last("turn.end")
+    t.check(r.rc == 3 and end.get("why") == "budget" and
+            end.get("err") == "the turn reached its limit of 3 model requests",
+            f"exit {r.rc}, end {end}")
+    t.check(len(t.requests()) == 3, f"{len(t.requests())} requests")
+
+
+@scenario(conf={"_tools": {"turn_budget": 0}}, bound=60)
+def turn_unlimited(t):
+    """turn_budget = 0: no limit, past the default's 300 requests, and no
+    note at 200 of an end to come."""
+    r = t.run(timeout=120)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')}")
+    t.check(len(t.requests()) == 306, f"{len(t.requests())} requests")
+    t.check(not any("model requests" in n.get("text", "") for n in r.all("note")),
+            "no budget note")
+    t.check(r.text() == "No limit.", f"text {r.text()!r}")
+
+
 @scenario(conf={"_extra": "[model {model}]\nempty_retries = 3\n"}, bound=8)
 def empty_more(t):
     """empty_retries: three reminders after empty responses, not two."""
