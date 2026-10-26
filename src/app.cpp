@@ -223,7 +223,7 @@ enum : i32 {
     RECT_REMADD,
     RECT_OUTPUT,     // the latest tool row's Output
     RECT_THUMB,      // the latest screenshot's thumbnail drawn
-    RECT_SHOTCLOSE,  // the Screenshot window's Close
+    RECT_SHOTCLOSE,  // the Screenshot window's title bar X, floating
     RECT_REFRESHINC, // the settings window's Refresh includes
     RECT_CODEBLOCK,  // the code block aimed at (selectcode), else the latest
     RECT_CODECOPY,   // and its Copy button, while shown
@@ -1318,6 +1318,8 @@ struct Gui {
     Anchor             driveanchor;  // the top edge before a resize
     i32                drivefound;   // the find hit first current
     b32                shotshown;    // the Screenshot window drew its image
+    ImVec2             shotsize;     // at this size
+    ImVec2             shotroom;     // in a child this big
     b32                downshown;    // a host's countdown to its next try
     b32                elseshown;    // closing said what runs on elsewhere
     b32                failshown;    // the Hosts panel said why one failed
@@ -8383,7 +8385,7 @@ enum : i32 {
     T_OUTPUT,      // the latest tool row's Output
     T_REFRESHINC,  // the settings' Refresh includes
     T_THUMB,       // the latest screenshot thumbnail drawn
-    T_SHOTCLOSE,   // the Screenshot window's Close
+    T_SHOTCLOSE,   // the Screenshot window's title bar X
     T_THINKHDR,    // the latest reasoning's header drawn
     T_CODEBLOCK,   // the code block selectcode chose, as drawn
     T_CODECOPY,    // and its Copy button
@@ -8524,6 +8526,7 @@ enum : i32 {
     CHK_THUMBS,
     CHK_SHOTOPEN,
     CHK_SHOTCLOSED,
+    CHK_SHOTFIT,
     CHK_IMGQUIET,
     CHK_THINKFOLD,
     CHK_THINKGREW,
@@ -8756,6 +8759,7 @@ static Str chknames[] = {
     "screenshots show as thumbnails on their tool rows",
     "a thumbnail's click opened the screenshot whole, at its size",
     "closed, the Screenshot window let its texture go",
+    "Fit made the screenshot as wide or as tall as its window",
     "no frames while screenshots show, once loaded",
     "reasoning streams folded to one header with its count and clock",
     "the folded header's count grew as it streamed",
@@ -11802,9 +11806,10 @@ static DriveOp composeops[] = {
     {OP_WAIT, W_SHOT, 0, 0, 10000, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 800, ""},
     {OP_CHECK, CHK_SHOTOPEN, 0, 0, 0, ""},
-    {OP_MOVE, T_SHOTCLOSE, 0, 0, 100, ""},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 1000, ""},
+    CLICK(T_NAMED, "Fit", 300),
+    {OP_CHECK, CHK_SHOTFIT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "compose-fit"},
+    KEY(GKEY_ESCAPE, 0, 1000),
     {OP_CHECK, CHK_SHOTCLOSED, 0, 0, 0, ""},
     // C: enough of a conversation for /compact, with a focus
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
@@ -13032,6 +13037,13 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_SHOTCLOSED: {
         ImGuiWindow *w = ImGui::FindWindowByName("Screenshot");
         return !g->img.view.open && !g->img.view.tex && !g->img.dying && (!w || !w->Active);
+    }
+    case CHK_SHOTFIT: {
+        // Fit either way: larger or smaller than the window
+        ImVec2 z = g->shotsize, r = g->shotroom;
+        f32    dx = z.x - r.x, dy = z.y - r.y;
+        return g->img.view.open && g->img.view.fit && dx<1 && dy<1 &&
+               ((dx>-1 && dx<1) || (dy>-1 && dy<1));
     }
     case CHK_THINKFOLD:
     case CHK_THINKGREW: {
