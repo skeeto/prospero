@@ -598,6 +598,7 @@ static Arena newarena(Region *r)
 #include "door.cpp"
 #include "deploy.cpp"
 #include "remote.cpp"
+#include "hostlink.cpp"
 #include "selftest.cpp"
 #include "selftest_io.cpp"
 #include "eval.cpp"  // after selftest.cpp: tempdir, removeall

@@ -1921,6 +1921,427 @@ def ssh_offline(t):
         remote_sh(a, f"rm -rf {rstate} {rconf}")
 
 
+# Subagents on other hosts: a headless engine here (X), whose agent
+# starts subagents on y, a host of this machine's (Y, the scenario's
+# own state and configuration) reached through a fake ssh, or a fake
+# wsl.exe. Y starts first, as for connect_reconnect.
+
+F = fake_provider
+
+
+FARHOST = ["y"]  # the host the scripts name, for the scenario running
+
+
+def sc_far_task(model, n, req):
+    """Two subagents on y in one response, then what the parent heard."""
+    if F.step(req) == 0:
+        yield from F.calls(model, n, [
+            ("task", {"description": "One", "prompt": "First job.", "host": FARHOST[0],
+                      "cwd": os.environ.get("FAR_WORK", "~"), "model": F.second(model)}),
+            ("task", {"description": "Two", "prompt": "Second job.", "host": FARHOST[0],
+                      "cwd": os.environ.get("FAR_WORK", "~"), "model": F.second(model)})])
+    else:
+        yield from F.answer(model, "Parent heard: " + " / ".join(F.tool_results(req)))
+
+
+def sc_far_task_b(model, n, req):
+    where = "wsl" if "Windows on this machine" in F.system_of(req) else "ssh"
+    yield from F.answer(model, f"Done ({where}): {F.task_prompt(req)}")
+
+
+def sc_far_fallback(model, n, req):
+    """No model given: the parent's own, which y has, runs it there."""
+    if "# Subagent" in F.system_of(req):
+        yield from F.answer(model, "On the parent's model.")
+    elif F.step(req) == 0:
+        yield from F.tool(model, n, "task", {"description": "Plain", "prompt": "Go.",
+                                             "host": "y", "cwd": os.environ["FAR_WORK"]})
+    else:
+        yield from F.answer(model, "Heard: " + F.tool_results(req)[0])
+
+
+def sc_far_sleep(model, n, req):
+    """One subagent on y, which sleeps; the parent says what it heard."""
+    if F.step(req) == 0:
+        yield from F.tool(model, n, "task", {"description": "Sleep", "prompt": "Sleep.",
+                                             "host": "y", "cwd": os.environ["FAR_WORK"],
+                                             "model": F.second(model)})
+    else:
+        yield from F.answer(model, "Heard: " + F.last_user(req)[:300])
+
+
+def sc_far_sleep_b(model, n, req):
+    if F.step(req) == 0:
+        yield from F.tool(model, n, "shell", {"command": "echo $$ > far.pid; exec sleep 30",
+                                              "timeout": 60})
+    else:
+        yield from F.answer(model, "Slept.")
+
+
+def sc_far_flag_b(model, n, req):
+    """Waits for a flag file, then reports."""
+    if F.step(req) == 0:
+        yield from F.tool(model, n, "shell", {
+            "command": "while [ ! -f flag ]; do sleep 0.1; done; echo flagged",
+            "timeout": 60})
+    else:
+        yield from F.answer(model, "Saw the flag.")
+
+
+def sc_far_ask_b(model, n, req):
+    """Writes outside its directory, which asks."""
+    if F.step(req) == 0:
+        yield from F.tool(model, n, "write", {"path": "../far-outside.txt", "content": "x"})
+    else:
+        yield from F.answer(model, "Wrote: " + F.tool_results(req)[0][:80])
+
+
+for _name in ("far_task", "far_task_b", "far_fallback", "far_sleep", "far_sleep_b"):
+    fake_provider.SCENARIOS[_name] = globals()["sc_" + _name]
+for _name in ("far_cancel", "far_quit", "far_restart"):
+    fake_provider.SCENARIOS[_name] = sc_far_sleep
+    fake_provider.SCENARIOS[_name + "_b"] = sc_far_sleep_b
+fake_provider.SCENARIOS["far_background"] = sc_far_sleep
+fake_provider.SCENARIOS["far_background_b"] = sc_far_flag_b
+fake_provider.SCENARIOS["far_attend"] = sc_far_sleep
+fake_provider.SCENARIOS["far_attend_b"] = sc_far_ask_b
+for _name in ("far_old", "far_never", "far_wsl"):
+    fake_provider.SCENARIOS[_name] = sc_far_task
+    fake_provider.SCENARIOS[_name + "_b"] = sc_far_task_b
+
+FAKEWSL = FAKE + r"""
+# wsl.exe: -l -q lists Ubuntu in UTF-16, as it does by default; -d
+# Ubuntu --cd ~ --exec /bin/sh -c CMD runs CMD here
+args = sys.argv[1:]
+if args == ["-l", "-q"]:
+    sys.stdout.buffer.write("Ubuntu\r\n".encode("utf-16-le"))
+    sys.exit(0)
+if len(args) != 8 or args[:2] != ["-d", "Ubuntu"] or args[6] != "-c":
+    sys.stderr.write(f"fakewsl: unexpected {args}\n")
+    sys.exit(2)
+run(["/bin/sh", "-c", args[7]])
+"""
+
+
+class Far:
+    """Y, the host of this scenario's state directory, then X, a headless
+    engine of its own whose [remote y] reaches Y through a fake ssh."""
+
+    def __init__(self, t, scenario, yenv=None, ypath=None, wsl=False):
+        self.t = t
+        self.model = t.model(scenario)
+        y = Client(t)
+        y.attach(env=yenv)
+        y.call("hello")
+        y.stream.disconnect()
+        self.xstate = os.path.join(t.root, "xstate")
+        self.xconfig = os.path.join(t.root, "x.ini")
+        os.makedirs(os.path.join(self.xstate, "remote"))
+        prog, self.sshpids = fakessh(t)
+        section = "[remote Ubuntu]\n" if wsl else "[remote y]\nssh = here\n"
+        with open(self.xconfig, "w", newline="") as f:
+            f.write(f"endpoint = fake\nmodel = {self.model}\n"
+                    f"[endpoint fake]\nurl = {t.args.url}/\nfirst_byte_timeout = 5\n"
+                    f"idle_timeout = 5\nprogress_timeout = 10\nconnect_timeout = 2\n"
+                    f"{section}path = {ypath or t.prospero}\nstate = {t.state}\n"
+                    f"config = {t.config}\n")
+        FARHOST[0] = "Ubuntu" if wsl else "y"
+        env = dict(t.env, PROSPERO_TEST_SSH=prog, FAR_WORK=t.work)
+        if wsl:
+            env["PROSPERO_TEST_WSL"] = program(t, "fakewsl", FAKEWSL)
+            with open(os.path.join(self.xstate, "remote", "wsl.list"), "w") as f:
+                f.write("Ubuntu\n")  # as listed when it last ran
+        p = subprocess.Popen([t.prospero, "--headless", "-C", t.work, "--state", self.xstate,
+                              "-c", self.xconfig, "-e", "fake", "-m", self.model],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env, text=True, bufsize=1)
+        t.procs.append(p)
+        self.x = Lines(p)
+        os.environ["FAR_WORK"] = t.work  # the provider's scripts, in this process
+
+    def parent(self, attended=1, prompt="go"):
+        r = self.x.call("new", cwd=self.t.work, model=self.model, endpoint="fake",
+                        attended=attended)
+        self.t.check(r.get("ok") == 1, f"new: {r}")
+        self.x.send("prompt", sid=r["sid"], text=prompt)
+        return r["sid"]
+
+    def ends(self, sid, n=1, timeout=40):
+        return self.x.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid
+                           and r.get("turn") == n, timeout, f"turn {n} end")
+
+    def ylog(self, sid):
+        return [json.loads(x) for x in self.t.log(sid)]
+
+    def ykids(self):
+        out = []
+        root = os.path.join(self.t.state, "sessions")
+        for sid in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+            path = os.path.join(root, sid, "events.jsonl")
+            if os.path.exists(path):
+                first = self.ylog(sid)[0]
+                if first.get("remote") == 1:
+                    out.append(first)
+        return out
+
+    def quit(self):
+        if self.x.p.poll() is not None:
+            return  # quit already
+        try:
+            self.x.call("quit", timeout=10)
+            self.x.close(timeout=15)
+        except (Failure, OSError, ValueError):
+            pass
+
+
+@scenario
+def far_task(t):
+    """Two subagents on another host in one response: each is a session
+    there, a subagent of the parent here, whose report is its call's
+    result; the parent's log says where each ran (task.host)."""
+    f = Far(t, "far_task")
+    try:
+        sid = f.parent()
+        end = f.ends(sid)
+        t.check(end.get("why") == "done", f"turn end {end}")
+        te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(len(te) == 2 and all(r["status"] == "ok" and r.get("host") == "y"
+                                     for r in te), f"tool.ends {te}")
+        t.check([r["text"] for r in te] == ["Done (ssh): First job.", "Done (ssh): Second job."],
+                f"reports {[r['text'] for r in te]}")
+        kids = f.ykids()
+        t.check(len(kids) == 2 and all(k["parent"] == sid and k["via"] == "ssh"
+                                       for k in kids), f"y's sessions {kids}")
+        t.check({r.get("child") for r in te} == {k["sid"] for k in kids}, "named")
+        hosts = [r for r in f.x.records if r.get("ev") == "task.host" and r.get("sid") == sid]
+        t.check(len(hosts) == 2 and {h["child"] for h in hosts} == {k["sid"] for k in kids},
+                f"task.host {hosts}")
+        for k in kids:
+            reps = [r for r in f.ylog(k["sid"]) if r.get("ev") == "task.report"]
+            t.check(len(reps) == 1 and reps[0]["status"] == "ok", f"y's report {reps}")
+        tools = [x for q in fake_provider.STATE.log(f.model)[:1]
+                 for x in q["body"].get("tools", []) if x["function"]["name"] == "task"]
+        desc = tools[0]["function"]["description"] if tools else ""
+        t.check("- y: another machine over ssh" in desc and
+                "host" in tools[0]["function"]["parameters"]["properties"], f"told {desc!r}")
+    finally:
+        f.quit()
+
+
+@scenario
+def far_fallback(t):
+    """No model in the call: the parent's own, as y has its endpoint."""
+    f = Far(t, "far_fallback")
+    try:
+        sid = f.parent()
+        f.ends(sid)
+        te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(te and te[0]["text"] == "On the parent's model.", f"tool.end {te}")
+        kids = f.ykids()
+        t.check(kids and kids[0]["model"] == f.model, f"y's model {kids}")
+    finally:
+        f.quit()
+
+
+def farpid(t, within=20):
+    path = os.path.join(t.work, "far.pid")
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        pids = P.read(path) if os.path.exists(path) else []
+        if pids:
+            return pids[0]
+        time.sleep(0.1)
+    raise Failure("the subagent there never started its command")
+
+
+def ycommand(t, pid):
+    """Whether pid is the sleep a subagent on Y started: ours, a sleep."""
+    return P.mine(pid) and "sleep" in P.command(pid)
+
+
+@scenario
+def far_cancel(t):
+    """Cancelling the parent ends the call at once, and the subagent
+    there is cancelled: its command stops."""
+    f = Far(t, "far_cancel")
+    try:
+        sid = f.parent()
+        pid = farpid(t)
+        f.x.call("cancel", sid=sid)
+        te = f.x.wait(lambda r: r.get("ev") == "tool.end" and r.get("sid") == sid,
+                      10, "the call's end")
+        t.check(te["status"] == "cancelled" and te.get("host") == "y", f"tool.end {te}")
+        t.check(gone(pid, 10), "the command there stopped")
+        kid = f.ykids()[0]
+        rep = None
+        deadline = time.monotonic() + 10
+        while not rep and time.monotonic() < deadline:
+            rep = [r for r in f.ylog(kid["sid"]) if r.get("ev") == "task.report"]
+            time.sleep(0.1)
+        t.check(rep and rep[0]["status"] == "cancelled", f"y's report {rep}")
+    finally:
+        f.quit()
+
+
+@scenario
+def far_background(t):
+    """Moved to the background, the call ends; once the subagent there
+    finishes, its report comes to the parent as a notice, naming the
+    host, which starts its turn."""
+    f = Far(t, "far_background")
+    try:
+        sid = f.parent()
+        f.x.wait(lambda r: r.get("ev") == "task.host" and r.get("sid") == sid, 20, "named")
+        r = f.x.call("background", sid=sid)
+        t.check(r.get("ok") == 1, f"background {r}")
+        f.ends(sid, 1)
+        te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(te and te[0]["status"] == "background" and "continues on y" in te[0]["text"],
+                f"tool.end {te}")
+        with open(os.path.join(t.work, "flag"), "w") as fl:
+            fl.write("go\n")
+        n = f.x.wait(lambda r: r.get("ev") == "notice" and r.get("sid") == sid
+                     and r.get("kind") == "task", 30, "the notice")
+        t.check(n.get("host") == "y" and "Saw the flag." in n["text"] and " on y)" in n["text"],
+                f"notice {n}")
+        end = f.ends(sid, 2)
+        t.check(end.get("why") == "done", f"turn 2 {end}")
+    finally:
+        f.quit()
+
+
+@scenario
+def far_old(t):
+    """A host whose engine lacks task.remote: the calls fail, saying to
+    update it, and nothing is made there."""
+    f = Far(t, "far_old", yenv=dict(t.env, PROSPERO_TEST_DROPCAP="task.remote"))
+    try:
+        sid = f.parent()
+        f.ends(sid)
+        te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(len(te) == 2 and all(r["status"] == "error" and "too old" in r["text"]
+                                     and "update the engine" in r["text"] for r in te),
+                f"tool.ends {te}")
+        t.check(not f.ykids(), "nothing made there")
+    finally:
+        f.quit()
+
+
+@scenario
+def far_never(t):
+    """A host never reached: the calls fail with why, and a call soon
+    after fails at once."""
+    f = Far(t, "far_never", ypath=os.path.join(t.root, "nonexistent", "prospero"))
+    try:
+        sid = f.parent()
+        f.ends(sid, timeout=90)
+        te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(len(te) == 2 and all(r["status"] == "error" and
+                                     r["text"].startswith("No subagent was started on y")
+                                     for r in te), f"tool.ends {te}")
+    finally:
+        f.quit()
+
+
+@scenario
+def far_restart(t):
+    """The host there killed while the subagent works: the link starts
+    another, which opens the subagent again, and its report says it was
+    interrupted."""
+    f = Far(t, "far_restart")
+    try:
+        sid = f.parent()
+        pid = farpid(t)
+        f.x.wait(lambda r: r.get("ev") == "task.host" and r.get("sid") == sid, 20, "named")
+        for h in t.hostpids():
+            signal_ours(h, P.KILL, t.ownhost, "host")
+        te = f.x.wait(lambda r: r.get("ev") == "tool.end" and r.get("sid") == sid,
+                      60, "the call's end")
+        t.check(te["status"] == "error" and "stopped while it worked" in te["text"],
+                f"tool.end {te}")
+        if not gone(pid, 1):
+            signal_ours(pid, P.KILL, lambda p: ycommand(t, p), "sleep")
+    finally:
+        f.quit()
+
+
+@scenario
+def far_quit(t):
+    """Quitting the engine here cancels the subagent there, and does not
+    wait long for it."""
+    f = Far(t, "far_quit")
+    try:
+        f.parent()
+        pid = farpid(t)
+        kid = f.ykids()[0]["sid"]
+        t0 = time.monotonic()
+        f.x.call("quit", timeout=10)
+        t.check(f.x.close(timeout=15) == 0, "exits 0")
+        t.check(time.monotonic() - t0 < 8, f"quit in {time.monotonic() - t0:.1f} s")
+        t.check(gone(pid, 10), "the command there stopped")
+        ends = [r for r in f.ylog(kid) if r.get("ev") == "turn.end"]
+        t.check(ends and ends[-1]["why"] == "cancel", f"y's turn end {ends}")
+    finally:
+        f.quit()
+
+
+@scenario
+def far_attend(t):
+    """Attended while its parent is: the subagent's ask waits there; once
+    the parent is closed here, it is denied at once."""
+    t.write_config(t.args.url, "[guard]\nask_timeout = 60\ntemp = ask\n")
+    f = Far(t, "far_attend")
+    try:
+        sid = f.parent(attended=1)
+        f.x.wait(lambda r: r.get("ev") == "task.host" and r.get("sid") == sid, 20, "named")
+        kid = f.ykids()[0]["sid"]
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not any(
+                r.get("ev") == "ask" for r in f.ylog(kid)):
+            time.sleep(0.1)
+        time.sleep(1)
+        log = f.ylog(kid)
+        t.check(any(r.get("ev") == "ask" for r in log) and
+                not any(r.get("ev") == "answer" for r in log), "the ask waits")
+        f.x.call("close", sid=sid)
+        deadline = time.monotonic() + 10
+        ans = []
+        while time.monotonic() < deadline and not ans:
+            ans = [r for r in f.ylog(kid) if r.get("ev") == "answer"]
+            time.sleep(0.1)
+        t.check(ans and ans[0]["by"] == "policy" and ans[0]["decision"] == "deny",
+                f"answered {ans}")
+    finally:
+        f.quit()
+
+
+@scenario
+def far_wsl(t):
+    """A WSL distro as listed by wsl.exe (here a stand-in), a host with no
+    ssh: the tool lists it, the subagent there is told it works for an
+    agent in Windows, and its session names the distro."""
+    if os.name == "nt":
+        return "skip"
+    f = Far(t, "far_wsl", wsl=True)
+    try:
+        sid = f.parent()
+        f.ends(sid)
+        te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(len(te) == 2 and all(r["status"] == "ok" and r.get("host") == "Ubuntu"
+                                     for r in te), f"tool.ends {te}")
+        t.check(te[0]["text"] == "Done (wsl): First job.", f"report {te[0]['text']}")
+        kids = f.ykids()
+        t.check(len(kids) == 2 and all(k["via"] == "wsl" and k["distro"] == "Ubuntu"
+                                       for k in kids), f"y's sessions {kids}")
+        tools = [x for q in fake_provider.STATE.log(f.model)[:1]
+                 for x in q["body"].get("tools", []) if x["function"]["name"] == "task"]
+        desc = tools[0]["function"]["description"] if tools else ""
+        t.check("- Ubuntu: Linux (WSL) on this machine" in desc and
+                "\\\\wsl.localhost\\Ubuntu\\" in desc, f"told {desc!r}")
+    finally:
+        f.quit()
+
+
 def lanaddress(host):
     """This machine's address on the network that reaches host."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

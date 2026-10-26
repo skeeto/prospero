@@ -224,6 +224,8 @@ static Str capnames[] = {
                        // MCP servers listed, signed in to, started again
     "task.remote",     // new {task}: a subagent of a session on another
                        // host, which reads its durable task.report
+    "task.host",       // the task tool's host: subagents on other hosts,
+                       // task.host records, and host on tool.end and notices
 };
 
 static Str evname(i32 ev)

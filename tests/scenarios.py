@@ -2514,7 +2514,7 @@ def hello_caps(t):
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
-                 "mcp", "mcp.auth", "task.remote"} <= set(caps)
+                 "mcp", "mcp.auth", "task.remote", "task.host"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 

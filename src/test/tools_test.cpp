@@ -199,6 +199,16 @@ static void test_tools(Test *t)
         Args tc = parseargs(a, TOOL_TASK, "{\"description\":\"x\"}", EDIT_REPLACE);
         expect(t, "task no prompt", tc.issues.len ? tc.issues[0] : Str{},
                "prompt: required string is missing");
+        // host and cwd: a cwd only with a host
+        Args td = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"host\":\" deb \","
+                            "\"cwd\":\"/home/me\"}", EDIT_REPLACE);
+        expect(t, "task host", concat(a, concat(a, td.host, "|"), td.cwd), "deb|/home/me");
+        expect(t, "task host no issues", istr(a, td.issues.len), "0");
+        Args tf = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"cwd\":\"/x\"}", EDIT_REPLACE);
+        expect(t, "task cwd without host", tf.issues.len ? tf.issues[0] : Str{},
+               "cwd: only with host: here, a subagent works in your working directory");
+        Args tg = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"host\":\"\"}", EDIT_REPLACE);
+        expect(t, "task empty host", istr(a, !tg.host.data && !tg.issues.len), "1");
 
         // send_message: a target and some text, at most 16 KiB of it
         Args ma = parseargs(a, TOOL_MESSAGE, "{\"to\":\" k1 \",\"text\":\"hi\"}", EDIT_REPLACE);
@@ -617,6 +627,24 @@ static void test_tools(Test *t)
         expect(t, "task roles enum", istr(a, jsonlen(jsonget(role, "enum"))), "2");
         expect(t, "task roles described", istr(a, find(jsonstr(jsonget(task, "description")),
                "Roles:\n- explore: reads")>0), "1");
+        Json *props = jsonget(jsonget(task, "parameters"), "properties");
+        expect(t, "task no hosts", istr(a, jsonget(props, "host")->type==JSON_MISSING &&
+               jsonget(props, "cwd")->type==JSON_MISSING &&
+               find(jsonstr(jsonget(task, "description")), "Hosts:")<0), "1");
+
+        // With hosts: listed, and host and cwd offered
+        te.hosts = "\n- deb: Linux (WSL) on this machine";
+        JsonDoc h = jsonparse(a, tooljson(a, &te));
+        Json *ht  = jsonget(jsonat(h.root, 2), "function");
+        Json *hp  = jsonget(jsonget(ht, "parameters"), "properties");
+        expect(t, "task hosts params", istr(a, jsonget(hp, "host")->type==JSON_OBJECT &&
+               jsonget(hp, "cwd")->type==JSON_OBJECT), "1");
+        Str hd = jsonstr(jsonget(ht, "description"));
+        expect(t, "task hosts described", istr(a, endswith(hd, "\nHosts: a subagent runs "
+               "here unless host names one of these. There it works under that host's "
+               "own settings and permissions, in cwd, and only its report comes back; "
+               "role and model are that host's.\n- deb: Linux (WSL) on this machine")), "1");
+        te.hosts = {};
         Str sys = systemprompt(a, "/w", &te);
         expect(t, "system prompt for a role", istr(a, find(sys, "grep and glob")<0 &&
                find(sys, "another session")<0), "1");

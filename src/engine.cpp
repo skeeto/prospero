@@ -97,6 +97,7 @@ enum : u32 {
     MAIL_OUT,         // engine to frontend: one protocol record line
     MAIL_QUIT,        // engine to frontend: the engine has stopped
     MAIL_TOOLONG,     // frontend to engine: a command too long, by its id
+    MAIL_DISTROS,     // the WSL distros, a line each (farinit)
 };
 
 enum : i64 {
@@ -271,6 +272,7 @@ struct Notice {
     b32 skills;  // its record lists the skills the agent knows now
     Str from;    // for "message": the sender's sid and title; for
     Str ftitle;  // "task": the subagent's
+    Str host;    // and for "task", its host, if another
     i32 hop;     // and its hop count (see "Messages")
 };
 
@@ -363,6 +365,8 @@ struct TaskRun {
     Str text;
     Str spill;   // the whole report, when the text was cut
     i64 bytes;
+    u64 far;     // a subagent on another host: its HostKid's serial
+    Str host;    // and that host's name
 };
 
 // A session parked while idle (park): what its log does not hold, for
@@ -388,6 +392,7 @@ struct Endpoint {
 };
 
 struct Engine;
+struct HostLink;
 
 struct ShellRun {
     Str  spill;     // absolute path of the output file
@@ -746,6 +751,9 @@ struct Engine {
     Lister     *listers;  // models commands at work
     McpServer  *mcp;      // MCP servers, running or not (see "MCP servers")
     McpAuth    *mcpauths; // MCP sign-ins under way
+    HostLink   *links;    // to other hosts, for subagents there (hostlink.cpp)
+    u64         farserial;
+    Slice<Str>  distros;  // the WSL distros installed, as last listed
 };
 
 
@@ -1257,6 +1265,9 @@ static void deliver(Session *s, Arena scratch)
         if (n->kind == "task") {
             putstrkey(&w.json, "child", n->from);
             putstrkey(&w.json, "child_title", n->ftitle);
+            if (n->host.len) {
+                putstrkey(&w.json, "host", n->host);
+            }
         }
         if (n->kind == "mode") {
             putstrkey(&w.json, "mode", modenames[n->mode]);
@@ -1722,6 +1733,22 @@ static i32  get32(Str);
 static i64  get64(Str);
 static void starttasks(Session *, Arena);
 static void taskcancel(Session *, Arena);
+
+// Subagents on other hosts (hostlink.cpp)
+static b32  farstart(Session *, Arena, iz, Args *, TaskRun *);
+static void farcancel(Session *, Arena);
+static b32  farbg(Session *, Arena *, Str);
+static void farstop(Engine *, Arena, b32);
+static i64  farcount(Engine *);
+static b32  farbusy(Engine *);
+static i64  farnext(Engine *);
+static void fartick(Engine *, Arena, i64);
+static void farinit(Engine *, Arena);
+static void fardistros(Engine *, Str);
+static void farattend(Engine *, Arena);
+static Str  farhostsdesc(Engine *, Arena *, Arena);
+static HostLink *farbyout(Engine *, u64);
+static void farmail(Engine *, Arena, HostLink *, Record);
 static void taskcheck(Session *, Arena, Str why, Str err);
 static b32  taskbudget(Session *, Arena);
 static b32  taskwake(Session *);
@@ -2731,7 +2758,7 @@ static Str callrepair(Arena *a, Block *c, Str fix)
 // eval can count them by kind.
 static void toolend(Session *s, Arena scratch, Str status, Str text,
                     i32 code, b32 hascode, Str spill, i64 bytes, i64 job = 0,
-                    Str child = {})
+                    Str child = {}, Str host = {})
 {
     Engine *e      = s->e;
     Block  *c      = &s->calls[s->callidx];
@@ -2756,6 +2783,9 @@ static void toolend(Session *s, Arena scratch, Str status, Str text,
     }
     if (job) {
         putintkey(&w.json, "job", job);
+    }
+    if (host.len) {
+        putstrkey(&w.json, "host", host);  // child is there, once named
     }
     if (child.len) {
         putstrkey(&w.json, "child", child);
@@ -10110,6 +10140,7 @@ static void buildprefix(Session *s, Arena scratch)
     s->te.vision    = !s->mc.novision;
     if (tooloffered(&s->te, TOOL_TASK)) {
         taskroles(e, &s->perm, scratch, &s->te);
+        s->te.hosts = farhostsdesc(e, &s->perm, scratch);
     }
     s->system = systemprompt(&s->perm, s->cwd, &s->te, s->nofolder);
     s->tools  = tooljson(&s->perm, &s->te);
@@ -10795,17 +10826,20 @@ static void starttasks(Session *s, Arena scratch)
         t.start = os_ticks(e->os);
         Args     args = parseargs(&a, TOOL_TASK, s->calls[k].args, s->te.edit);
         Session *c    = 0;
+        b32      far  = 0;
         if (args.issues.len) {
             t.text = argserror(&s->perm, "task", s->calls[k].args, &args);
         } else if (k-s->callidx >= TASK_BATCH) {
             t.text = "Not started: one response may start at most 16 "
                      "subagents. Start the rest once these have reported.";
+        } else if (args.host.len) {
+            far = farstart(s, a, k, &args, &t);  // on another host
         } else {
             c = newchild(s, a, k, &args, &t.text);
         }
         if (c) {
             t.child = clone(&s->perm, c->sid);
-        } else {
+        } else if (!far) {
             t.done   = 1;
             t.status = "error";
         }
@@ -10989,7 +11023,8 @@ static void taskflush(Session *s, Arena scratch)
         Arena    a = scratch;
         TaskRun *t = &s->tasks[i];
         s->callstart = t->start;
-        toolend(s, a, t->status, t->text, 0, 0, t->spill, t->bytes, 0, t->child);
+        toolend(s, a, t->status, t->text, 0, 0, t->spill, t->bytes, 0, t->child,
+                t->host);
     }
     for (iz i = 0; i < s->tasks.len; i++) {
         if (!s->tasks[i].done) {
@@ -11018,7 +11053,8 @@ static void taskcancel(Session *s, Arena scratch)
 {
     Engine *e = s->e;
     for (iz i = 0; i < s->tasks.len; i++) {
-        Session *c = s->tasks[i].done ? 0 : findsession(e, s->tasks[i].child);
+        TaskRun *t = &s->tasks[i];
+        Session *c = t->done || t->far ? 0 : findsession(e, t->child);
         if (!c) {
             continue;
         }
@@ -11030,6 +11066,7 @@ static void taskcancel(Session *s, Arena scratch)
             taskreport(c, a, "cancel", {});
         }
     }
+    farcancel(s, scratch);  // those on other hosts end at once
 }
 
 
@@ -11049,47 +11086,52 @@ static Session *loadsession(Engine *, Arena, Str sid, Str model, Str which,
                             i64 *firstnew, iz held);
 static void forget(Engine *, Session *);
 
-// A subagent in the background is done: tell its parent.
-static void bgreport(Session *c, Arena scratch, Str why, Str err)
+// The parent of a subagent in the background, to be given its report:
+// in memory, revived, or loaded (closed, as no frontend has it open).
+// Null if it cannot be opened here for writing.
+static Session *bgparent(Engine *e, Arena scratch, Str psid)
 {
-    Engine *e = c->e;
-    c->bgtask = 0;
-    if (e->quitting) {
-        return;
-    }
     i64      first = 0;
     b32      fresh = 0;
-    Session *p     = findsession(e, c->psid);
-    p = p ? p : revive(e, scratch, c->psid, {}, {}, &first);
+    Session *p     = findsession(e, psid);
+    p = p ? p : revive(e, scratch, psid, {}, {}, &first);
     if (!p) {
-        p     = loadsession(e, scratch, c->psid, {}, {}, &first, -1);
+        p     = loadsession(e, scratch, psid, {}, {}, &first, -1);
         fresh = p != 0;
     }
     if (!p || p->readonly) {
         if (fresh) {
             forget(e, p);
         }
-        note(c, scratch, "warn", "the parent session could not be opened "
-             "here, so it was not given this report");
-        return;
+        return 0;
     } else if (fresh) {
         p->closed = 1;  // as it was: no frontend has it open
     }
+    return p;
+}
 
-    Str status = {};
-    Str spill  = {};
-    i64 bytes  = 0;
-    Str text   = reporttext(c, &scratch, why, err, &status);
-    text = reportcut(p, &scratch, c->pcall, text, &spill, &bytes);
-    Buf b(&scratch, 512 + c->title.len + text.len);
+// Give a parent the report of a subagent in the background (session sid
+// on host, if another, for call), status and text as reporttext's, as
+// a notice of kind task, which starts its turn if it is idle.
+static void bgnotice(Session *p, Arena scratch, Str call, Str sid, Str title,
+                     Str host, Str status, Str text)
+{
+    Str spill = {};
+    i64 bytes = 0;
+    text = reportcut(p, &scratch, call, text, &spill, &bytes);
+    Buf b(&scratch, 512 + title.len + host.len + text.len);
     print(&b, "The subagent ");
-    if (c->title.len) {
+    if (title.len) {
         print(&b, "\"");
-        print(&b, c->title);
+        print(&b, title);
         print(&b, "\" ");
     }
     print(&b, "(session ");
-    print(&b, c->sid);
+    print(&b, sid);
+    if (host.len) {
+        print(&b, " on ");
+        print(&b, host);
+    }
     print(&b, "), which the user moved to the background, ");
     print(&b, status=="ok" ? Str("finished. Its report:\n\n")
                            : Str("ended before it finished:\n\n"));
@@ -11098,12 +11140,32 @@ static void bgreport(Session *c, Arena scratch, Str why, Str err)
     Notice n = {};
     n.kind   = "task";
     n.text   = clone(&p->perm, finish(&b));
-    n.from   = clone(&p->perm, c->sid);
-    n.ftitle = clone(&p->perm, c->title);
+    n.from   = clone(&p->perm, sid);
+    n.ftitle = clone(&p->perm, title);
+    n.host   = clone(&p->perm, host);
     p->notices = push(&p->perm, p->notices, n);
     if (!busy(p)) {
         beginturn(p, scratch, "task");
     }  // else read at its next step, or its turn's end starts one
+}
+
+// A subagent in the background is done: tell its parent.
+static void bgreport(Session *c, Arena scratch, Str why, Str err)
+{
+    Engine *e = c->e;
+    c->bgtask = 0;
+    if (e->quitting) {
+        return;
+    }
+    Session *p = bgparent(e, scratch, c->psid);
+    if (!p) {
+        note(c, scratch, "warn", "the parent session could not be opened "
+             "here, so it was not given this report");
+        return;
+    }
+    Str status = {};
+    Str text   = reporttext(c, &scratch, why, err, &status);
+    bgnotice(p, scratch, c->pcall, c->sid, c->title, {}, status, text);
 }
 
 // Whether a subagent's report waits that may start a turn.
@@ -11144,7 +11206,7 @@ static Str movebg(Session *s, Arena *a, Str call)
     b32 moved = 0;
     for (iz i = 0; s->state==S_TASK && i<s->tasks.len; i++) {
         TaskRun *t = &s->tasks[i];
-        Session *c = t->done ? 0 : findsession(e, t->child);
+        Session *c = t->done || t->far ? 0 : findsession(e, t->child);
         if (!c || (call.len && call!=s->calls[t->call].id)) {
             continue;
         }
@@ -11162,6 +11224,7 @@ static Str movebg(Session *s, Arena *a, Str call)
         note(c, *a, "info", "moved to the background by the user: the "
              "parent went on, and is given the report as a notice");
     }
+    moved |= farbg(s, a, call);
     if (!moved) {
         return call.len ? Str("no such call running that can go to the background")
                         : Str("nothing running that can go to the background");
@@ -14843,6 +14906,7 @@ static void command(Engine *e, Arena scratch, Str line)
             cancelturn(t, scratch);
             stopjobs(t, scratch, 1);
         }
+        farstop(e, scratch, 1);
         reply(e, scratch, id, 1, {}, {});
     } return;
     case CMD_CONFIGGET:
@@ -14851,8 +14915,9 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_STATUS: {
         // What runs: turns (asks and queued requests included) and
-        // commands, those being stopped too, over every open session
-        i64 open = 0, turns = 0, jobs = 0;
+        // commands, those being stopped too, over every open session,
+        // and subagents on other hosts, counted as turns
+        i64 open = 0, turns = farcount(e), jobs = 0;
         for (Session *t = e->sessions; t; t = t->next) {
             open++;
             turns += busy(t);
@@ -14877,6 +14942,7 @@ static void command(Engine *e, Arena scratch, Str line)
             cancelturn(t, scratch);
             stopjobs(t, scratch, 0);
         }
+        farstop(e, scratch, 0);
         reply(e, scratch, id, 1, {}, {});
         return;
     case CMD_ARCHIVE:
@@ -15086,6 +15152,13 @@ static void onrecord(Engine *e, Arena scratch, Record r)
 {
     if (r.type == MAIL_CMD) {
         command(e, scratch, r.data);
+        farattend(e, scratch);  // as the parents are attended now
+        return;
+    } else if (r.type == MAIL_DISTROS) {
+        fardistros(e, r.data);
+        return;
+    } else if ((r.type==MAIL_OUT || r.type==MAIL_QUIT) && farbyout(e, r.id)) {
+        farmail(e, scratch, farbyout(e, r.id), r);  // a link's, to another host
         return;
     } else if (r.type == MAIL_TOOLONG) {
         reply(e, scratch, (i64)r.id, 0, "command too long", {});
@@ -15287,12 +15360,14 @@ static void enginethread(void *arg)
     cfgrefresh(e->cfg, newarena(e->scratch), 0);  // what loaded from a cache
     sweeptrash(e, newarena(e->scratch));
     sweepuploads(e, newarena(e->scratch));
+    farinit(e, newarena(e->scratch));
     for (;;) {
         i64 now  = os_ticks(e->os);
         i64 next = e->quitting ? e->quitby : I64MAX;
         next = e->admat && e->admat<next ? e->admat : next;
         next = cfgnext(e->cfg)<next ? cfgnext(e->cfg) : next;
         next = mcpnext(e)<next ? mcpnext(e) : next;
+        next = farnext(e)<next ? farnext(e) : next;
         for (Lister *l = e->listers; l; l = l->next) {
             next = !l->replied && l->by<next ? l->by : next;
         }
@@ -15339,6 +15414,9 @@ static void enginethread(void *arg)
         if (mcpnext(e) <= now) {
             mcptick(e, newarena(e->scratch), now);
         }
+        if (farnext(e) <= now) {
+            fartick(e, newarena(e->scratch), now);
+        }
         if (cfgnext(e->cfg) <= now) {
             i64 rev = e->cfg->rev;
             cfgtimeout(e->cfg, newarena(e->scratch));
@@ -15361,7 +15439,7 @@ static void enginethread(void *arg)
 
         // Cancelling ends turns at once, but should a turn linger, the
         // engine stops anyway once the wait is over
-        if (e->quitting && (allidle(e) || now>=e->quitby)) {
+        if (e->quitting && ((allidle(e) && !farbusy(e)) || now>=e->quitby)) {
             for (Session *s = e->sessions; s; s = s->next) {
                 logclose(&s->log);
                 if (s->lock >= 0) {

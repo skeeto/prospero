@@ -108,6 +108,7 @@ struct ToolEnv {
     u32 deny;        // tools not offered (a role's), as bits 1<<TOOL_*
     Str roles;       // the roles task may give, a line for each
     Str roleenum;    // their names, as a JSON schema's enum member
+    Str hosts;       // the other hosts task may run on, a line for each
     i32 edit;        // EDIT_*: the edit tool's format (edit.cpp)
     i32 coords;      // COORDS_*: how the desktop tool takes points
     b32 vision;      // the model takes images, which read then shows
@@ -308,6 +309,13 @@ static Str taskdesc(Arena *a, ToolEnv *te)
         print(&b, " Roles:");
         print(&b, te->roles);
     }
+    if (te->hosts.len) {
+        print(&b, "\nHosts: a subagent runs here unless host names one of "
+                  "these. There it works under that host's own settings and "
+                  "permissions, in cwd, and only its report comes back; role "
+                  "and model are that host's.");
+        print(&b, te->hosts);
+    }
     return finish(&b);
 }
 
@@ -451,6 +459,13 @@ static Str tooljson(Arena *a, ToolEnv *te)
                  "what to report", 1, {}},
                 {"role", "string", "Default general", 0, te->roleenum},
                 {"model", "string", "Only when asked for one", 0, {}},
+                // Only where there are hosts, else as before
+                {te->hosts.len ? Str("host") : Str{}, "string",
+                 "A host above, to run it there; default here", 0, {}},
+                {te->hosts.len ? Str("cwd") : Str{}, "string",
+                 "With host: its working directory there, as that host writes "
+                 "paths; default: for WSL yours as it sees it when on a drive, "
+                 "else its home", 0, {}},
             },
         },
         {
@@ -732,6 +747,8 @@ struct Args {
     Str             prompt;
     Str             role;       // null if absent
     Str             model;
+    Str             host;       // task: another host's name, null if here
+    Str             cwd;        // task: its directory there, null if absent
     i64             offset;     // 0 if absent
     i64             limit;      // 0 if absent
     i64             timeout;    // -1 if absent
@@ -1236,6 +1253,14 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
         r.model  = trim(argstr(a, &r, j, "model", 0));
         r.role   = r.role.len ? r.role : Str{};
         r.model  = r.model.len ? r.model : Str{};
+        r.host   = trim(argstr(a, &r, j, "host", 0));
+        r.cwd    = trim(argstr(a, &r, j, "cwd", 0));
+        r.host   = r.host.len ? r.host : Str{};
+        r.cwd    = r.cwd.len ? r.cwd : Str{};
+        if (r.cwd.len && !r.host.len) {
+            issue(a, &r, "cwd", "only with host: here, a subagent works in your "
+                                "working directory");
+        }
         if (r.prompt.data && !trim(r.prompt).len) {
             issue(a, &r, "prompt", "must not be empty");
         } else if (r.prompt.len > TASK_PROMPT) {

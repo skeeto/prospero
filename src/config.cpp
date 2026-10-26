@@ -510,6 +510,10 @@ static CfgKey cfgschema[] = {
     {"remote", "list", CFG_ENUM, "always", {}, "always connected", "remote",
      "When the session list shows the host: always, or connected, which "
      "keeps it out of the list while it is disconnected"},
+    {"remote", "subagents", CFG_BOOL, "true", {}, {}, "remote",
+     "Whether this machine's agents may start subagents there (the task "
+     "tool's host), as their shell may run ssh or wsl.exe; an installed "
+     "WSL distro is such a host too, unless its section says no"},
 
     {"mcp", "command", CFG_STRING, "", {}, {}, "mcp",
      "The server's program and its arguments, run without a shell (quote "
