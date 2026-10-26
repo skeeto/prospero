@@ -1236,12 +1236,13 @@ int main(void)
 
 # wsl.exe, as far as the harness uses it: two distros, Deb and Docker
 # Desktop's, listed in UTF-16, and a command in Deb run here, where it
-# finds no prospero, as in a new distro
+# finds no prospero, as in a new distro; also Far, unlisted, which a
+# section names, its command run here too
 FAKEWSL = ("#!/bin/sh\n"
            "if [ \"$1\" = -l ]; then printf '"
            + "".join(f"\\{b:03o}" for b in "Deb\r\ndocker-desktop\r\n".encode("utf-16-le"))
            + "'; exit 0; fi\n"
-           "if [ \"$2\" != Deb ]; then\n"
+           "if [ \"$2\" != Deb ] && [ \"$2\" != Far ]; then\n"
            "  printf 'There is no distribution with the supplied name.\\r\\n'\n"
            "  printf 'Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND\\r\\n'\n"
            "  exit 255\n"
@@ -1329,7 +1330,11 @@ class Far:
                 + (f"\n# One with no engine there (no path, and none on PATH\n"
                    f"# here), which offers to deploy one\n"
                    f"[remote missing]\nssh = {dest}\nstate = {self.state}-missing\n"
-                   f"config = {self.config}\n" if self.local else ""))
+                   f"config = {self.config}\n" if self.local else "")
+                + (f"\n# The same host, through the stand-in for wsl.exe\n"
+                   f"[remote rw]\nwsl = Far\npath = {self.prospero}\n"
+                   f"state = {self.state}\nconfig = {self.config}\n"
+                   if self.local and not self.windows else ""))
 
     def env(self):
         if not self.local:

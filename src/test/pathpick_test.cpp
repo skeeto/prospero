@@ -106,4 +106,17 @@ static void test_pathpick(Test *t)
     expect(t, "accept.file", pathaccept(&a, pathquery("/s/harb", 0), file), "/s/harbor.txt");
     // On POSIX a backslash is a name's: "a\b" is listed as /x/'s
     expect(t, "posix.back", pickstr(&a, ents, "/s\\ze", 0, 1), "");
+
+    // A Windows path typed for a WSL distro
+    expect(t, "wsl.drive", wslpath(&a, "C:\\Users\\me"), "/mnt/c/Users/me");
+    expect(t, "wsl.slash", wslpath(&a, "d:/src"), "/mnt/d/src");
+    expect(t, "wsl.bare", wslpath(&a, "C:"), "/mnt/c");
+    expect(t, "wsl.root", wslpath(&a, "C:\\"), "/mnt/c/");
+    expect(t, "wsl.relative", wslpath(&a, "C:x"), "C:x");
+    expect(t, "wsl.typing", wslpath(&a, "/mnt/c/Users\\"), "/mnt/c/Users/");
+    expect(t, "wsl.mnt", wslpath(&a, "/mnt/c\\x"), "/mnt/c/x");
+    expect(t, "wsl.mntonly", wslpath(&a, "/mnt/c"), "/mnt/c");
+    expect(t, "wsl.notdrive", wslpath(&a, "/mnt/cd\\x"), "/mnt/cd\\x");
+    expect(t, "wsl.linux", wslpath(&a, "/home/u\\x"), "/home/u\\x");
+    expect(t, "wsl.home", wslpath(&a, "~/src"), "~/src");
 }

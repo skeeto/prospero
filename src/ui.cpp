@@ -4121,6 +4121,13 @@ static Slice<Str> remotenames(Gui *g, Arena *a)
     return names;
 }
 
+// Whether a host is a WSL distro, reached through wsl.exe.
+static b32 hostwsl(Gui *g, GuiHost *h)
+{
+    return h && h->kind==GH_REMOTE && !remoteset(g, h->name, "ssh").len &&
+           remoteset(g, h->name, "wsl").len;
+}
+
 // How Connect reaches a remote, for its tooltip.
 static char const *connecttip(Gui *g, Str name)
 {
@@ -5615,6 +5622,7 @@ struct PathCb {
     Slice<PathPick> picks;
     Arena           scratch;   // past the picks, for pathcb and pathafter
     b32             accepted;  // Tab accepted a pick
+    b32             wsl;       // a Windows path typed becomes the distro's
 };
 
 struct PathField {
@@ -5645,6 +5653,18 @@ static i32 pathcb(ImGuiInputTextCallbackData *d)
             d->InsertChars(0, t.cdata, t.cdata+t.len);
             c->accepted = 1;
         }
+    } else if (d->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
+        byte  mem[FIELD_MAX+8];
+        Arena a = {mem, mem+sizeof(mem)};
+        Str   t = {(u8 *)d->Buf, (iz)d->BufTextLen};
+        Str   w = wslpath(&a, t);
+        if (w.data!=t.data && w.len<d->BufSize) {
+            i32 at = d->CursorPos + (i32)(w.len - t.len);
+            d->DeleteChars(0, d->BufTextLen);
+            d->InsertChars(0, w.cdata, w.cdata+w.len);
+            d->CursorPos = at<0 ? 0 : at>(i32)w.len ? (i32)w.len : at;
+            d->ClearSelection();
+        }
     }
     return 0;
 }
@@ -5658,6 +5678,10 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off)
     f.cb.g  = g;
     f.id    = ImGui::GetID("##cwd");
     f.flags = ImGuiInputTextFlags_AutoSelectAll;
+    f.cb.wsl = hostwsl(g, h);
+    if (f.cb.wsl) {
+        f.flags |= ImGuiInputTextFlags_CallbackEdit;  // C:\ typed is /mnt/c/
+    }
     b32 active = ImGui::GetActiveID() == f.id;
     if (!active && !pc->refocus) {
         pc->shown = 0;
@@ -6155,6 +6179,7 @@ static void drawnew(Gui *g)
     itemrect(g, RECT_NEWCREATE);
     if (create) {
         Str cwd   = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
+        cwd       = hostwsl(g, host) ? wslpath(&a, cwd) : cwd;
         Str ep    = trim({(u8 *)g->newep, (iz)__builtin_strlen(g->newep)});
         Str model = trim({(u8 *)g->newmodel, (iz)__builtin_strlen(g->newmodel)});
         Str both  = concat(&a, concat(&a, ep, "/"), model);

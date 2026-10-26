@@ -49,7 +49,9 @@ change its settings.
 A section with `wsl = DISTRO` in place of `ssh` names one yourself,
 under another name, and `prospero connect NAME` and `prospero deploy
 NAME` take a distro's name too. The engine runs in the distro's home
-directory; Windows' drives are under `/mnt`, as `/mnt/c`.
+directory; Windows' drives are under `/mnt`, as `/mnt/c`, and a Windows
+path typed for a new session's folder there, as `C:\Users`, becomes
+the distro's, `/mnt/c/Users`.
 
 ## Sessions on a remote
 

@@ -8671,6 +8671,7 @@ enum : i32 {
     CHK_WSLSECTION,   // Deb's Settings wrote [remote Deb] wsl = Deb
     CHK_NEWLISTED,    // the new session dialog's remote host listed its
                       // models, with the dialog open all along
+    CHK_WSLCWD,       // C:\Users\ typed for the WSL host rw is the distro's
     CHK_COUNT,
 };
 
@@ -8889,6 +8890,7 @@ static Str chknames[] = {
     "the WSL distro with no engine in it failed, offering to deploy one",
     "the WSL distro's Settings wrote a section of its own for it",
     "the dialog's remote host's models came, the dialog open all along",
+    "a Windows path typed for a WSL distro became the distro's",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -8950,6 +8952,8 @@ enum : i32 {
     W_WSLFAILED,  // the WSL distro Deb failed
     W_WSLSECTION, // the configuration has [remote Deb]
     W_NEWLISTED,  // the new session dialog's host listed its models
+    W_NAMEDUP,    // the remote named by text is up
+    W_NAMEDCLOSED,// the remote named by text is closed
 };
 
 static Str waitnames[] = {
@@ -8967,8 +8971,9 @@ static Str waitnames[] = {
     "the plan", "the menu's pick", "the drafts kept", "the offer to deploy",
     "the side chat", "the WSL distros", "the WSL distro to fail",
     "the WSL distro's section", "the dialog's host's models",
+    "the named remote to come up", "the named remote to close",
 };
-static_assert(countof(waitnames) == W_NEWLISTED+1);
+static_assert(countof(waitnames) == W_NAMEDCLOSED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -10976,6 +10981,44 @@ static DriveOp remoteops[] = {
     {OP_WAIT, W_WSLSECTION, 0, 0, 10000, ""},
     {OP_CHECK, CHK_WSLSECTION, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-1-hosts"},
+    // A configured distro, Far, the remote host again through the
+    // stand-in: a Windows path typed for its new session's folder is
+    // the distro's, under /mnt
+    {OP_IFWSL, 0, 34, 0, 0, ""},
+    {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect rw"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NAMEDUP, 0, 0, 90000, "rw"},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_MOVE, T_HOSTCOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_HOSTITEM, 0, 0, 100, "rw"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
+    {OP_TEXT, 0, 0, 0, 1000, "C:\\Users\\"},
+    {OP_CHECK, CHK_WSLCWD, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_CHECK, CHK_PATHPICK, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect rw"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NAMEDCLOSED, 0, 0, 30000, "rw"},
     // A session there, through the dialog
     {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -12557,6 +12600,14 @@ static b32 drivewaitdone(Gui *g)
         return cfghas(g, "remote", "Deb");
     case W_NEWLISTED:
         return g->newhost && g->newhost->listgot;
+    case W_NAMEDUP: {
+        GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
+        return h && h->up;
+    }
+    case W_NAMEDCLOSED: {
+        GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
+        return h && !h->r && h->state==RS_CLOSED;
+    }
     case W_DEPLOYOFFER: {
         GuiHost *h = findhost(g, GH_REMOTE, "missing");
         return !hasremote(g, "missing") || (h && h->state==RS_FAILED && h->deploys);
@@ -14328,6 +14379,11 @@ static b32 drivecheck(Gui *g, i32 chk)
         return cfghas(g, "remote", "Deb") && remoterow(g, "Deb", "wsl")=="Deb" &&
                !remoterow(g, "Deb", "list").len && !wslautohost(g, "Deb") &&
                remoteset(g, "Deb", "wsl")=="Deb" && g->cfgpname=="Deb";
+    case CHK_WSLCWD: {
+        Str f = {(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)};
+        return g->newhost && g->newhost->name=="rw" && hostwsl(g, g->newhost) &&
+               f=="/mnt/c/Users/";
+    }
     case CHK_NEWLISTED: {
         GuiHost *h = g->newhost;
         ImGuiWindow *w = ImGui::GetTopMostPopupModal();
