@@ -38,7 +38,17 @@ More tools there:
 With FAKE_MCP_TOKEN set, a request without "Authorization: Bearer
 TOKEN" gets 401.
 
-Run as the harness would: uv run tests/fake_mcp.py [--http]
+With --oauth too, the server at /mcp wants a token that it issued
+itself, as MCP's authorization has it: a 401 names its protected
+resource metadata, which names an authorization server at /as, whose
+metadata gives /as/register (dynamic registration), /as/authorize
+(redirecting at once to the client's redirect with a code and the
+state, or with error=access_denied when FAKE_MCP_DENY is set) and
+/as/token (codes, checked against their PKCE challenge, and refresh
+tokens). Tokens last until the tool "expire" revokes the access
+tokens. These requests are logged as {"_oauth": PATH, ...}.
+
+Run as the harness would: uv run tests/fake_mcp.py [--http [--oauth]]
 """
 
 import json
@@ -202,6 +212,7 @@ def main():
 
 SESSIONS = set()
 FLAKED = set()
+OAUTH = {"clients": {}, "codes": {}, "access": set(), "refresh": set(), "n": 0}
 
 
 def serve_http():
@@ -211,6 +222,11 @@ def serve_http():
     version = os.environ.get("FAKE_MCP_VERSION", "2025-06-18")
     token = os.environ.get("FAKE_MCP_TOKEN")
     tools = TOOLS + HTTP_TOOLS
+    oauth = "--oauth" in sys.argv[1:]
+    if oauth:
+        tools = tools + [{"name": "expire", "description": "Expire the tokens.",
+                          "inputSchema": {}}]
+    base = {}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -233,6 +249,16 @@ def serve_http():
                      "Content-Type", "X-Extra")}
 
         def authorized(self):
+            if oauth:
+                got = self.headers.get("Authorization") or ""
+                with LOCK:
+                    ok = got.startswith("Bearer ") and got[7:] in OAUTH["access"]
+                if not ok:
+                    meta = base["url"] + "/.well-known/oauth-protected-resource/mcp"
+                    self.reply(401, b'{"error":"invalid_token"}', extra=[
+                        ("WWW-Authenticate",
+                         f'Bearer error="invalid_token", resource_metadata="{meta}"')])
+                return ok
             if token and self.headers.get("Authorization") != f"Bearer {token}":
                 self.reply(401, b'{"error":"unauthorized"}', extra=[
                     ("WWW-Authenticate", 'Bearer realm="fake"')])
@@ -245,8 +271,112 @@ def serve_http():
                 SESSIONS.discard(self.headers.get("Mcp-Session-Id"))
             self.reply(200)
 
+        def do_GET(self):
+            import urllib.parse
+            u = urllib.parse.urlsplit(self.path)
+            q = dict(urllib.parse.parse_qsl(u.query))
+            log({"_oauth": u.path, **q})
+            b = base["url"]
+            if not oauth:
+                self.reply(404)
+            elif u.path == "/.well-known/oauth-protected-resource/mcp":
+                self.json(200, {"resource": b + "/mcp", "authorization_servers": [b + "/as"],
+                                "scopes_supported": ["tools", "more"]})
+            elif u.path == "/.well-known/oauth-authorization-server/as":
+                self.json(200, {"issuer": b + "/as",
+                                "authorization_endpoint": b + "/as/authorize",
+                                "token_endpoint": b + "/as/token",
+                                "registration_endpoint": b + "/as/register",
+                                "code_challenge_methods_supported": ["S256"]})
+            elif u.path == "/as/authorize":
+                with LOCK:
+                    c = OAUTH["clients"].get(q.get("client_id"))
+                redirect = q.get("redirect_uri", "")
+                if (not c or redirect not in c["redirect_uris"] or
+                        q.get("response_type") != "code" or
+                        q.get("code_challenge_method") != "S256" or
+                        q.get("resource") != b + "/mcp" or not q.get("state")):
+                    self.reply(400, b'{"error":"invalid_request"}')
+                    return
+                if os.environ.get("FAKE_MCP_DENY"):
+                    to = redirect + "?" + urllib.parse.urlencode(
+                        {"error": "access_denied", "state": q["state"]})
+                else:
+                    with LOCK:
+                        OAUTH["n"] += 1
+                        code = f"code-{OAUTH['n']}"
+                        OAUTH["codes"][code] = {
+                            "client": q["client_id"], "redirect": redirect,
+                            "challenge": q.get("code_challenge"), "scope": q.get("scope")}
+                    to = redirect + "?" + urllib.parse.urlencode(
+                        {"code": code, "state": q["state"]})
+                self.send_response(302)
+                self.send_header("Location", to)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self.reply(404)
+
+        def json(self, status, obj):
+            self.reply(status, json.dumps(obj).encode())
+
+        def tokens(self):
+            with LOCK:
+                OAUTH["n"] += 1
+                n = OAUTH["n"]
+                OAUTH["access"].add(f"at-{n}")
+            return f"at-{n}", n
+
+        def oauthpost(self, path, body):
+            import base64
+            import hashlib
+            import urllib.parse
+            if path == "/as/register":
+                req = json.loads(body)
+                log({"_oauth": path, **req})
+                with LOCK:
+                    OAUTH["n"] += 1
+                    cid = f"client-{OAUTH['n']}"
+                    OAUTH["clients"][cid] = req
+                self.json(201, {"client_id": cid, **req})
+                return
+            form = dict(urllib.parse.parse_qsl(body.decode()))
+            log({"_oauth": path, **form})
+            if form.get("resource") != base["url"] + "/mcp":
+                self.json(400, {"error": "invalid_target"})
+            elif form.get("grant_type") == "authorization_code":
+                with LOCK:
+                    c = OAUTH["codes"].pop(form.get("code"), None)
+                v = form.get("code_verifier", "").encode()
+                want = base64.urlsafe_b64encode(hashlib.sha256(v).digest()).rstrip(b"=")
+                if (not c or c["client"] != form.get("client_id") or
+                        c["redirect"] != form.get("redirect_uri") or
+                        want.decode() != c["challenge"]):
+                    self.json(400, {"error": "invalid_grant",
+                                    "error_description": "that code is not for you"})
+                    return
+                access, n = self.tokens()
+                with LOCK:
+                    OAUTH["refresh"].add(f"rt-{n}")
+                self.json(200, {"access_token": access, "token_type": "Bearer",
+                                "expires_in": 3600, "refresh_token": f"rt-{n}"})
+            elif form.get("grant_type") == "refresh_token":
+                with LOCK:
+                    known = form.get("refresh_token") in OAUTH["refresh"]
+                if not known:
+                    self.json(400, {"error": "invalid_grant"})
+                    return
+                access, _ = self.tokens()
+                self.json(200, {"access_token": access, "token_type": "Bearer",
+                                "expires_in": 3600})
+            else:
+                self.json(400, {"error": "unsupported_grant_type"})
+
         def do_POST(self):
             n = int(self.headers.get("Content-Length") or 0)
+            if oauth and self.path.startswith("/as/"):
+                self.oauthpost(self.path, self.rfile.read(n))
+                return
             msg = json.loads(self.rfile.read(n))
             log({**msg, "_http": self.heads()})
             if not self.authorized():
@@ -298,6 +428,10 @@ def serve_http():
                     self.reply(503, b"busy, try again")
                     return
                 r = text("steady now")
+            elif name == "expire":
+                with LOCK:
+                    OAUTH["access"].clear()
+                r = text("expired")
             elif name == "forget":
                 with LOCK:
                     SESSIONS.clear()
@@ -334,6 +468,7 @@ def serve_http():
 
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     srv.daemon_threads = True
+    base["url"] = f"http://127.0.0.1:{srv.server_address[1]}"
     sys.stdout.write(f"{srv.server_address[1]}\n")
     sys.stdout.flush()
     try:

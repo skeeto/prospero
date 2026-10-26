@@ -260,4 +260,39 @@ static void test_mcp(Test *t)
             "ignored, since it chooses what runs and what the agent may reach: set "
             "it in your own file");
     }
+
+    // Signing in: PKCE (RFC 7636's own example), encodings, challenges
+    expect(t, "mcp pkce",
+           mcpchallenge(&a, "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+           "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    expect(t, "mcp base64url", base64url(&a, "\xfb\xff\xfe"), "-__-");
+    expect(t, "mcp base64url pad", base64url(&a, "ab"), "YWI");
+    expect(t, "mcp pct", pctencode(&a, "a b/c?d=é~"), "a%20b%2Fc%3Fd%3D%C3%A9~");
+    expect(t, "mcp pct back", pctdecode(&a, "a%20b+c%2fd%zz%4"), "a b c/d%zz%4");
+    expect(t, "mcp query", mcpquery(&a, "?code=a%2Bb&state=x+y", "code"), "a+b");
+    expect(t, "mcp query 2", mcpquery(&a, "code=1&state=x+y", "state"), "x y");
+    expect(t, "mcp query empty", mcpquery(&a, "code=&state=1", "code").data ? Str("set") : Str("null"), "set");
+    expect(t, "mcp query none", mcpquery(&a, "code=1", "state").data ? Str("set") : Str("null"), "null");
+    {
+        Str h = "Bearer realm=\"x\", error=\"invalid_token\", "
+                "resource_metadata=\"https://h/.well-known/oauth-protected-resource/mcp\", scope=a";
+        expect(t, "mcp challenge", mcpchallengeparam(&a, h, "resource_metadata"),
+               "https://h/.well-known/oauth-protected-resource/mcp");
+        expect(t, "mcp challenge bare", mcpchallengeparam(&a, h, "scope"), "a");
+        expect(t, "mcp challenge none", mcpchallengeparam(&a, h, "metadata").data ? Str("set") : Str("null"), "null");
+    }
+    expect(t, "mcp origin", urlorigin("https://h:8080/a/b?q"), "https://h:8080");
+    expect(t, "mcp path", urlpath("https://h:8080/a/b/?q"), "/a/b");
+    expect(t, "mcp path root", urlpath("https://h"), "");
+    {
+        Slice<Str> u = mcpprmurls(&a, "https://h/v1/mcp", {});
+        expect(t, "mcp prm urls", istr(&a, u.len), "2");
+        expect(t, "mcp prm 0", u[0], "https://h/.well-known/oauth-protected-resource/v1/mcp");
+        expect(t, "mcp prm 1", u[1], "https://h/.well-known/oauth-protected-resource");
+        Slice<Str> m = mcpasmurls(&a, "https://h/tenant");
+        expect(t, "mcp asm 0", m[0], "https://h/.well-known/oauth-authorization-server/tenant");
+        expect(t, "mcp asm 2", m[2], "https://h/tenant/.well-known/openid-configuration");
+        m = mcpasmurls(&a, "https://h/");
+        expect(t, "mcp asm root", m[0], "https://h/.well-known/oauth-authorization-server");
+    }
 }

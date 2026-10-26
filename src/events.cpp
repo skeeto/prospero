@@ -148,6 +148,11 @@ enum : i32 {
     CMD_DIR,     // a directory's entries, for completing a path typed
     CMD_BACKGROUND,  // the running command or subagents, to the background
     CMD_MODELS,  // the models each endpoint lists, and the defaults
+    CMD_MCP,     // the MCP servers, as they are now
+    CMD_MCPAUTH, // sign in to an MCP server: the browser's URL, late
+    CMD_MCPCODE, // what the browser brought back, for tokens, late
+    CMD_MCPLOGOUT,   // an MCP server's tokens forgotten
+    CMD_MCPRESTART,  // an MCP server started again
     CMD_COUNT,
 };
 
@@ -157,7 +162,8 @@ static Str cmdnames[] = {
     "job.kill", "status", "stop", "file", "rename", "delete", "archive",
     "group", "fork", "compact", "model", "draft", "upload", "import",
     "skills", "mode",
-    "unqueue", "dir", "background", "models",
+    "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
+    "mcp.logout", "mcp.restart",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -210,6 +216,8 @@ static Str capnames[] = {
     "models",          // models, each endpoint's listing and the defaults;
                        // new and import split ENDPOINT/MODEL, and default
                        // to the first endpoint and model there are
+    "mcp.auth",        // mcp, mcp.auth, mcp.code, mcp.logout, mcp.restart:
+                       // MCP servers listed, signed in to, started again
 };
 
 static Str evname(i32 ev)

@@ -90,6 +90,7 @@ struct McpHttp {
     i32      status;
     b32      sse;      // the response is a stream of events
     b32      retried;
+    Str      challenge; // a 401's WWW-Authenticate
     Buf      in;       // a JSON response, or an error's start
     Sse      events;
 };
@@ -141,6 +142,11 @@ struct McpServer {
     Str               headers;   // and its own headers, "Name: value\r\n"
     Str               session;   // Mcp-Session-Id, once it gave one
     McpHttp          *http;      // requests under way
+    Str               bearer;    // signed in: its Authorization header
+    b32               needauth;  // failed, until the user signs in
+    b32               refreshed; // its tokens refreshed since it was ready
+    Str               prm;       // a 401's resource_metadata, and scope
+    Str               chscope;
 };
 
 
@@ -731,3 +737,277 @@ static Str mcpshowdef(Arena *a, McpDef *x)
     }
     return finish(&b);
 }
+
+
+// Signing in (OAuth 2.1, as MCP's authorization asks for it)
+//
+// A server over HTTP that answers 401 wants a token. Its protected
+// resource metadata (RFC 9728) names its authorization server, whose
+// metadata (RFC 8414, or OpenID's) gives the endpoints; a client
+// registers itself there (RFC 7591), unless its section names one, and
+// the user signs in through the browser with PKCE (S256), the redirect
+// coming back to a listener on this machine's loopback. The resource
+// parameter (RFC 8707) names the server's URL throughout.
+
+enum : i32 {
+    MCPAUTH_PRM,      // the protected resource's metadata
+    MCPAUTH_ASM,      // the authorization server's
+    MCPAUTH_REG,      // registering the client
+    MCPAUTH_WAIT,     // the user signs in, in the browser
+    MCPAUTH_TOKEN,    // the code exchanged for tokens
+    MCPAUTH_REFRESH,  // a refresh token exchanged for new ones
+};
+
+// A sign-in under way, or a refresh: in a region of its own.
+struct McpAuth {
+    McpAuth   *next;
+    Region    *mem;
+    Arena      arena;
+    Str        name;      // the server's
+    Str        resource;  // and its URL
+    i32        stage;     // MCPAUTH_*
+    Slice<Str> tries;     // metadata URLs to try, in order
+    i32        at;
+    Str        redirect;
+    Str        issuer;
+    Str        authz;     // endpoints
+    Str        tokenurl;
+    Str        reg;
+    Str        scope;
+    Str        client;
+    Str        secret;
+    Str        refresh;   // the refresh token, refreshing
+    Str        verifier;  // PKCE
+    Str        state;
+    i64        cmd;       // the command that waits for it, 0 if none
+    i64        by;        // ticks: given up then
+    Http      *h;
+    u64        hid;
+    i32        status;
+    Buf        body;
+};
+
+static Str base64url(Arena *a, Str s)
+{
+    Str r = base64(a, s);
+    while (r.len && r[r.len-1]=='=') {
+        r.len--;
+    }
+    for (iz i = 0; i < r.len; i++) {
+        r[i] = r[i]=='+' ? (u8)'-' : r[i]=='/' ? (u8)'_' : r[i];
+    }
+    return r;
+}
+
+static i32 hexval(u8 c)  // -1 if not one
+{
+    return c>='0' && c<='9' ? c-'0'
+         : c>='a' && c<='f' ? c-'a'+10
+         : c>='A' && c<='F' ? c-'A'+10
+         : -1;
+}
+
+// SHA-256 of s, its 32 bytes.
+static Str mcpsha256(Arena *a, Str s)
+{
+    Str hex = cfgsha256(a, s);
+    Str r   = {alloc<u8>(a, 32), 32};
+    for (iz i = 0; i < 32; i++) {
+        r[i] = (u8)(hexval(hex[2*i])<<4 | hexval(hex[2*i+1]));
+    }
+    return r;
+}
+
+// PKCE's S256 challenge of a verifier.
+static Str mcpchallenge(Arena *a, Str verifier)
+{
+    return base64url(a, mcpsha256(a, verifier));
+}
+
+// Percent-encoded, as a query's or a form's value: all but the
+// unreserved characters.
+static Str pctencode(Arena *a, Str s)
+{
+    Buf b(a, s.len + 16);
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (alnum(c) || c=='-' || c=='.' || c=='_' || c=='~') {
+            putbyte(&b, c);
+        } else {
+            putbyte(&b, '%');
+            putbyte(&b, "0123456789ABCDEF"[c>>4]);
+            putbyte(&b, "0123456789ABCDEF"[c&15]);
+        }
+    }
+    return finish(&b);
+}
+
+static Str pctdecode(Arena *a, Str s)
+{
+    Buf b(a, s.len);
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        i32 hi = c=='%' && i+2<s.len ? hexval(s[i+1]) : -1;
+        i32 lo = hi>=0 ? hexval(s[i+2]) : -1;
+        if (lo >= 0) {
+            putbyte(&b, (u8)(hi<<4 | lo));
+            i += 2;
+        } else {
+            putbyte(&b, c=='+' ? (u8)' ' : c);
+        }
+    }
+    return finish(&b);
+}
+
+// A value of a query (or a form), decoded: null if absent.
+static Str mcpquery(Arena *a, Str query, Str key)
+{
+    if (startswith(query, "?")) {
+        query = cuthead(query, 1);
+    }
+    for (Str rest = query; rest.len;) {
+        Cut c  = cut(rest, '&');
+        rest   = c.tail;
+        Cut kv = cut(c.head, '=');
+        if (pctdecode(a, kv.head) == key) {
+            Str v = pctdecode(a, kv.tail);
+            return v.data ? v : Str("");
+        }
+    }
+    return {};
+}
+
+// A parameter of a WWW-Authenticate challenge (Bearer key="value", or
+// key=token), or null.
+static Str mcpchallengeparam(Arena *a, Str header, Str key)
+{
+    for (iz i = 0; i < header.len; i++) {
+        b32 start = !i || header[i-1]==' ' || header[i-1]==',' || header[i-1]=='\t';
+        if (!start || header.len-i<key.len+1 ||
+                !equalfold(Str{header.data+i, key.len}, key) || header[i+key.len]!='=') {
+            continue;
+        }
+        iz j = i + key.len + 1;
+        Buf b(a, 64);
+        if (j<header.len && header[j]=='"') {
+            for (j++; j<header.len && header[j]!='"'; j++) {
+                if (header[j]=='\\' && j+1<header.len) {
+                    j++;
+                }
+                putbyte(&b, header[j]);
+            }
+        } else {
+            for (; j<header.len && header[j]!=',' && !whitespace(header[j]); j++) {
+                putbyte(&b, header[j]);
+            }
+        }
+        return finish(&b);
+    }
+    return {};
+}
+
+// A URL's scheme and authority (https://host:port), and its path.
+static Str urlorigin(Str url)
+{
+    iz s = find(url, "://");
+    if (s < 0) {
+        return {};
+    }
+    iz p = s + 3;
+    for (; p<url.len && url[p]!='/' && url[p]!='?' && url[p]!='#'; p++) {}
+    return takehead(url, p);
+}
+
+static Str urlpath(Str url)
+{
+    Str o = urlorigin(url);
+    Str p = cuthead(url, o.len);
+    iz  q = 0;
+    for (; q<p.len && p[q]!='?' && p[q]!='#'; q++) {}
+    p = takehead(p, q);
+    while (p.len && p[p.len-1]=='/') {
+        p.len--;
+    }
+    return p;
+}
+
+// Where a server's protected resource metadata may be: where its 401
+// said, else at the well-known path under its path, then the root's.
+static Slice<Str> mcpprmurls(Arena *a, Str url, Str said)
+{
+    Slice<Str> r = {};
+    if (said.len) {
+        return push(a, r, said);
+    }
+    Str o = urlorigin(url), p = urlpath(url);
+    if (p.len) {
+        r = push(a, r, concat(a, concat(a, o, "/.well-known/oauth-protected-resource"), p));
+    }
+    return push(a, r, concat(a, o, "/.well-known/oauth-protected-resource"));
+}
+
+// Where an authorization server's metadata may be, as RFC 8414 and
+// OpenID put it for an issuer with or without a path.
+static Slice<Str> mcpasmurls(Arena *a, Str issuer)
+{
+    Slice<Str> r = {};
+    Str o = urlorigin(issuer), p = urlpath(issuer);
+    if (p.len) {
+        r = push(a, r, concat(a, concat(a, o, "/.well-known/oauth-authorization-server"), p));
+        r = push(a, r, concat(a, concat(a, o, "/.well-known/openid-configuration"), p));
+        r = push(a, r, concat(a, concat(a, o, p), "/.well-known/openid-configuration"));
+    } else {
+        r = push(a, r, concat(a, o, "/.well-known/oauth-authorization-server"));
+        r = push(a, r, concat(a, o, "/.well-known/openid-configuration"));
+    }
+    return r;
+}
+
+// The authorization request's URL, for the browser.
+static Str mcpauthurl(Arena *a, McpAuth *x, Str challenge)
+{
+    Buf b(a, 512);
+    print(&b, x->authz);
+    putbyte(&b, find(x->authz, "?")<0 ? '?' : '&');
+    print(&b, "response_type=code&client_id=");
+    print(&b, pctencode(a, x->client));
+    print(&b, "&redirect_uri=");
+    print(&b, pctencode(a, x->redirect));
+    print(&b, "&code_challenge=");
+    print(&b, challenge);
+    print(&b, "&code_challenge_method=S256&state=");
+    print(&b, pctencode(a, x->state));
+    print(&b, "&resource=");
+    print(&b, pctencode(a, x->resource));
+    if (x->scope.len) {
+        print(&b, "&scope=");
+        print(&b, pctencode(a, x->scope));
+    }
+    return finish(&b);
+}
+
+// The loopback listener's (os_loopback): the target of a request for
+// /callback, from its head, else null; and what it answers.
+static Str loopbacktarget(Str head)
+{
+    Cut line = cut(head, '\n');
+    Cut verb = cut(trim(line.head), ' ');
+    Cut tgt  = cut(verb.tail, ' ');
+    b32 ok   = verb.head=="GET" && (tgt.head=="/callback" || startswith(tgt.head, "/callback?"));
+    return ok ? tgt.head : Str{};
+}
+
+static Str const loopbackpage =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/html; charset=utf-8\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "<!doctype html><title>Prospero</title>"
+    "<p style=\"font:16px sans-serif;margin:3em\">Prospero has the sign-in. "
+    "You may close this tab.</p>\n";
+
+static Str const loopbackmissing =
+    "HTTP/1.1 404 Not Found\r\n"
+    "Content-Length: 0\r\n"
+    "Connection: close\r\n"
+    "\r\n";

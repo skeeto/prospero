@@ -2283,6 +2283,15 @@ def sc_mcp_http_auth(model, n, req):
 
 
 sc_mcp_http_token = sc_mcp_http_auth
+
+
+def sc_mcp_oauth(model, n, req):
+    yield from mcp_steps(model, n, req, [
+        ("mcp__web__echo", {"text": "one"}),
+        ("mcp__web__expire", {}),
+        ("mcp__web__echo", {"text": "two"})])
+
+
 sc_mcp_project_http = sc_mcp_http_auth
 
 
@@ -2306,7 +2315,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Start a desktop subagent", "Type on the desktop as a subagent",
                "Start a subagent that messages", "Message the parent as a subagent",
                "Describe the images", "Ask on the side", "Run a long command",
-               "Stream, then pause")
+               "Stream, then pause", "Call the MCP server")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2531,6 +2540,11 @@ def sc_gui(model, n, req):
         # Slow enough for the parent's strip to count them at work
         yield S.sleep(1.5)
         yield from answer(model, "Subagent report: " + prompt[-4:])
+    elif "Call the MCP server" in prompt:
+        if step == 0:
+            yield from tool(model, n, "mcp__web__echo", {"text": "from the window"})
+        else:
+            yield from answer(model, "Called.")
     elif "Plan it with a todo list" in prompt:
         # The list as it goes: one item at a time in progress, a pause
         # in the middle for the checklist to look, then all done

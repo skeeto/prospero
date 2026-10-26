@@ -739,6 +739,7 @@ struct Engine {
     Str         scratchbase;  // os_scratchdir, null until made
     Lister     *listers;  // models commands at work
     McpServer  *mcp;      // MCP servers, running or not (see "MCP servers")
+    McpAuth    *mcpauths; // MCP sign-ins under way
 };
 
 
@@ -6226,7 +6227,69 @@ static Str mcplogtail(Engine *e, Arena *a, McpServer *m)
     return t;
 }
 
+struct McpTokens {
+    Str url;
+    Str issuer;
+    Str tokenurl;
+    Str client;
+    Str secret;
+    Str access;
+    Str refresh;
+    i64 expires;  // Unix seconds, 0 if not known
+};
+
+static Str mcpauthpath(Engine *e, Arena *a, Str name, Str url)
+{
+    Buf b(a, 128);
+    print(&b, mcpident(a, name));
+    putbyte(&b, '-');
+    printhex(&b, hash(url), 8);
+    print(&b, ".json");
+    Str dir = join(a, join(a, e->statedir, "mcp"), "auth");
+    return join(a, dir, finish(&b));
+}
+
+// A server's stored tokens, null url if none for that URL.
+static McpTokens mcptokens(Engine *e, Arena *a, Str name, Str url)
+{
+    McpTokens t    = {};
+    Str       path = mcpauthpath(e, a, name, url);
+    Read      r    = os_read(e->os, a, path, 1<<16);
+    if (r.err != READ_OK) {
+        return t;
+    }
+    Json *j = jsonparse(a, r.data).root;
+    if (jsonstr(jsonget(j, "url")) != url) {
+        return t;
+    }
+    t.url      = url;
+    t.issuer   = jsonstr(jsonget(j, "issuer"));
+    t.tokenurl = jsonstr(jsonget(j, "token_endpoint"));
+    t.client   = jsonstr(jsonget(j, "client_id"));
+    t.secret   = jsonstr(jsonget(j, "client_secret"));
+    t.access   = jsonstr(jsonget(j, "access_token"));
+    t.refresh  = jsonstr(jsonget(j, "refresh_token"));
+    t.expires  = jsonint(jsonget(j, "expires_at"), 0);
+    return t;
+}
+
+// Whether a server's own headers authorize it (a token, or a header
+// given), so that a 401 is no call to sign in.
+static b32 mcpauthorizes(McpServer *m)
+{
+    for (Str rest = m->headers; rest.len;) {
+        Cut c = cut(rest, '\n');
+        rest  = c.tail;
+        if (c.head.len>=14 && equalfold(takehead(c.head, 14), "authorization:")) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void mcpcallfail(Engine *e, Arena scratch, McpPending *p, Str why);
+static void mcpunauthorized(Engine *, Arena, McpServer *, McpHttp *);
+static void reply(Engine *, Arena, i64 id, b32 ok, Str err, Str sid);
 static b32  mcphttppost(Engine *, Arena, McpServer *, i64 rpc, Str body,
                         Str method = "POST", b32 retried = 0);
 
@@ -6331,6 +6394,7 @@ static b32 mcphttppost(Engine *e, Arena scratch, McpServer *m, i64 rpc, Str body
         print(&h, "\r\n");
     }
     print(&h, m->headers);
+    print(&h, m->bearer);
     HttpReq r = {};
     r.method    = method;
     r.url       = m->url;
@@ -6457,11 +6521,20 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
             m->headers = finish(&h);
         }
     }
+    m->bearer = {};
+    if (m->url.len && !mcpauthorizes(m)) {
+        McpTokens t = mcptokens(e, &scratch, m->name, m->url);
+        if (t.access.len) {
+            m->bearer = concat(&m->arena, concat(&m->arena, "Authorization: Bearer ",
+                               t.access), Str("\r\n"));
+        }
+    }
     if (m->url.len) {
         Str init = mcpinitparams(&scratch);
         if (!mcprequest(e, scratch, m, MCPREQ_INIT, "initialize", init)) {
-            mcpfail(e, scratch, m, concat(&scratch, "its url could not be requested: ",
-                                          os_lasterr(e->os, &scratch)));
+            Str why = concat(&scratch, "its url could not be requested: ",
+                             os_lasterr(e->os, &scratch));
+            mcpfail(e, scratch, m, why);
         }
         return;
     }
@@ -7504,7 +7577,8 @@ static void mcplisted(Engine *e, Arena scratch, McpServer *m, Json *res)
         }
         return;
     }
-    m->state = MCP_READY;
+    m->state     = MCP_READY;
+    m->refreshed = 0;
     mcpwake(e, scratch, m);
 }
 
@@ -7672,6 +7746,12 @@ static void mcphttpdone(Engine *e, Arena scratch, McpServer *m, McpHttp *q, i32 
             os_release(e->os, q->mem);
             return;
         }
+        if (!err && st==401 && !mcpauthorizes(m)) {
+            mcpunauthorized(e, scratch, m, q);
+            os_httpfree(e->os, q->h);
+            os_release(e->os, q->mem);
+            return;
+        }
         Buf b(&scratch, 512);
         b32 forgot = !err && st==404 && m->session.len;
         if (err == HTTP_ECONNECT) {
@@ -7747,6 +7827,9 @@ static void mcphttprecord(Engine *e, Arena scratch, McpServer *m, McpHttp *q, Re
         if (q->sse) {
             q->events = newsse(&q->arena, MCP_FRAMEMAX);
         }
+        if (q->status == 401) {
+            q->challenge = clone(&q->arena, headervalue(head, "WWW-Authenticate"));
+        }
         if (sid.len && q->status/100==2 && !m->session.len) {
             m->session = clone(&m->arena, sid);
         }
@@ -7786,11 +7869,24 @@ static i64 mcpnext(Engine *e)
                  m->state==MCP_READY ? m->lastuse + e->minute : 0;
         next = at && at<next ? at : next;
     }
+    for (McpAuth *x = e->mcpauths; x; x = x->next) {
+        next = x->by<next ? x->by : next;
+    }
     return next;
 }
 
+static void mcpauthfail(Engine *e, Arena scratch, McpAuth *x, Str why);
+
 static void mcptick(Engine *e, Arena scratch, i64 now)
 {
+    for (McpAuth *x = e->mcpauths, *next; x; x = next) {
+        next = x->next;
+        if (now >= x->by) {
+            mcpauthfail(e, scratch, x, x->stage==MCPAUTH_WAIT
+                        ? Str("nobody signed in within 10 minutes")
+                        : Str("the server took too long to answer"));
+        }
+    }
     for (McpServer *m = e->mcp; m; m = m->next) {
         // Offered by a session in memory: in use
         for (Session *s = e->sessions; s; s = s->next) {
@@ -7825,6 +7921,11 @@ static void mcptick(Engine *e, Arena scratch, i64 now)
 // go, for the reapers to end.
 static void mcpquit(Engine *e)
 {
+    for (McpAuth *x = e->mcpauths; x; x = x->next) {
+        if (x->h) {
+            os_httpcancel(e->os, x->h);
+        }
+    }
     for (McpServer *m = e->mcp; m; m = m->next) {
         for (McpHttp *q = m->http; q; q = q->next) {
             os_httpcancel(e->os, q->h);
@@ -7835,6 +7936,730 @@ static void mcpquit(Engine *e)
             m->proc = 0;
         }
     }
+}
+
+// Signing in
+//
+// An HTTP server that answers 401 needs a token: a refresh first when
+// one is stored and it has not been tried since the server was last
+// ready, else the server fails until the user signs in (mcp.auth, then
+// mcp.code with what the browser brought back to the frontend's
+// loopback listener). Tokens are kept in <state>/mcp/auth, one file per
+// server name and URL, readable only by the user, and are sent only to
+// that URL.
+
+static b32 mcpsavetokens(Engine *e, Arena scratch, Str name, McpTokens *t)
+{
+    Str path = mcpauthpath(e, &scratch, name, t->url);
+    Str dir  = join(&scratch, join(&scratch, e->statedir, "mcp"), "auth");
+    os_mkdirs(e->os, scratch, dir);
+    Buf     b(&scratch, 1<<12);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "url", t->url);
+    putstrkey(&w, "issuer", t->issuer);
+    putstrkey(&w, "token_endpoint", t->tokenurl);
+    putstrkey(&w, "client_id", t->client);
+    if (t->secret.len) {
+        putstrkey(&w, "client_secret", t->secret);
+    }
+    putstrkey(&w, "access_token", t->access);
+    if (t->refresh.len) {
+        putstrkey(&w, "refresh_token", t->refresh);
+    }
+    if (t->expires) {
+        putintkey(&w, "expires_at", t->expires);
+    }
+    putend(&w);
+    print(&b, "\n");
+    return os_writemode(e->os, scratch, path, finish(&b), 0600);
+}
+
+// The message for a server that needs a sign-in.
+static Str mcpsigninmsg(Arena *a, Str name)
+{
+    Buf b(a, 128 + 2*name.len);
+    print(&b, "it needs you to sign in: in Settings, at mcp ");
+    print(&b, name);
+    print(&b, ", Sign in, or run: prospero mcp auth ");
+    print(&b, name);
+    return finish(&b);
+}
+
+static void mcpneedauth(Engine *e, Arena scratch, McpServer *m)
+{
+    Str why  = mcpsigninmsg(&scratch, m->name);
+    Str told = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
+                      concat(&scratch, " failed: ", why));
+    mcpstop(e, scratch, m, told);
+    m->state    = MCP_FAILED;
+    m->needauth = 1;
+    m->err      = clone(&e->perm, why);
+    m->retryat  = I64MAX;  // not until signed in
+    mcpwake(e, scratch, m);
+}
+
+static void mcpauthfree(Engine *e, McpAuth *x)
+{
+    for (McpAuth **p = &e->mcpauths; *p; p = &(*p)->next) {
+        if (*p == x) {
+            *p = x->next;
+            break;
+        }
+    }
+    if (x->h) {
+        os_httpcancel(e->os, x->h);
+        os_httpfree(e->os, x->h);
+    }
+    os_release(e->os, x->mem);
+}
+
+// The servers by that name and URL, started again, signed in now.
+static void mcprestartall(Engine *e, Arena scratch, Str name, Str url)
+{
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->name==name && m->url==url) {
+            Str why = concat(&scratch, concat(&scratch, "The MCP server ", name),
+                             Str(" started again."));
+            mcpstop(e, scratch, m, why);
+            m->state    = MCP_STOPPED;
+            m->needauth = 0;
+            mcpstart(e, scratch, m, 0);
+        }
+    }
+}
+
+// A sign-in or refresh ended badly: whoever waits hears why.
+static void mcpauthfail(Engine *e, Arena scratch, McpAuth *x, Str why)
+{
+    if (x->cmd) {
+        Str msg = concat(&scratch, "signing in failed: ", why);
+        reply(e, scratch, x->cmd, 0, msg, {});
+    }
+    if (x->stage == MCPAUTH_REFRESH) {
+        for (McpServer *m = e->mcp; m; m = m->next) {
+            if (m->name==x->name && m->url==x->resource && m->state!=MCP_FAILED) {
+                mcpneedauth(e, scratch, m);
+            }
+        }
+    }
+    mcpauthfree(e, x);
+}
+
+static b32 mcpauthhttp(Engine *e, Arena scratch, McpAuth *x, Str method, Str url,
+                       Str type, Str body)
+{
+    if (x->h) {
+        os_httpfree(e->os, x->h);
+        x->h = 0;
+    }
+    Buf h(&scratch, 128);
+    print(&h, "Accept: application/json\r\n");
+    if (type.len) {
+        print(&h, "Content-Type: ");
+        print(&h, type);
+        print(&h, "\r\n");
+    }
+    x->status   = 0;
+    x->body.len = 0;
+    HttpReq r = {};
+    r.method    = method;
+    r.url       = clone(&x->arena, url);
+    r.headers   = finish(&h);
+    r.body      = clone(&x->arena, body);
+    r.connectms = 15000;
+    r.maxbytes  = 1<<20;
+    r.mbox      = e->in;
+    r.id        = x->hid = ++e->nextid;
+    x->h = os_http(e->os, &r, scratch);
+    return x->h != 0;
+}
+
+// The next metadata URL of this stage, or 0 if none is left.
+static b32 mcpauthtry(Engine *e, Arena scratch, McpAuth *x)
+{
+    while (x->at < x->tries.len) {
+        Str url = x->tries[x->at++];
+        if (mcpauthhttp(e, scratch, x, "GET", url, {}, {})) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void mcpauthasm(Engine *e, Arena scratch, McpAuth *x);
+static void mcpauthreg(Engine *e, Arena scratch, McpAuth *x);
+static void mcpauthgo(Engine *e, Arena scratch, McpAuth *x);
+
+// The token endpoint's form, its client's credentials added.
+static Str mcpauthform(Arena *a, McpAuth *x, Str grant)
+{
+    Buf b(a, 512);
+    print(&b, grant);
+    print(&b, "&client_id=");
+    print(&b, pctencode(a, x->client));
+    if (x->secret.len) {
+        print(&b, "&client_secret=");
+        print(&b, pctencode(a, x->secret));
+    }
+    print(&b, "&resource=");
+    print(&b, pctencode(a, x->resource));
+    return finish(&b);
+}
+
+// The protected resource's metadata gave its authorization server, or
+// nothing did, and its URL's origin stands in for one.
+static void mcpauthprm(Engine *e, Arena scratch, McpAuth *x, Json *j)
+{
+    Str as = j ? jsonstr(jsonget(j, "authorization_servers")->child) : Str{};
+    x->issuer = clone(&x->arena, as.len ? as : urlorigin(x->resource));
+    if (!x->scope.len && j) {
+        Buf b(&scratch, 256);
+        for (Json *k = jsonget(j, "scopes_supported")->child; k; k = k->next) {
+            print(&b, b.len ? Str(" ") : Str(""));
+            print(&b, jsonstr(k));
+        }
+        x->scope = clone(&x->arena, finish(&b));
+    }
+    x->stage = MCPAUTH_ASM;
+    x->tries = mcpasmurls(&x->arena, x->issuer);
+    x->at    = 0;
+    if (!mcpauthtry(e, scratch, x)) {
+        mcpauthasm(e, scratch, x);
+    }
+}
+
+// The authorization server's metadata, or none, and its endpoints are
+// guessed as MCP's first authorization did.
+static void mcpauthasm(Engine *e, Arena scratch, McpAuth *x)
+{
+    Json *j = 0;
+    if (x->status == 200) {
+        j = jsonparse(&scratch, Str{x->body.data, x->body.len}).root;
+    }
+    Str authz = jsonstr(jsonget(j, "authorization_endpoint"));
+    Str token = jsonstr(jsonget(j, "token_endpoint"));
+    if (!authz.len || !token.len) {
+        Str o = urlorigin(x->issuer);
+        x->authz    = concat(&x->arena, o, "/authorize");
+        x->tokenurl = concat(&x->arena, o, "/token");
+        x->reg      = concat(&x->arena, o, "/register");
+    } else {
+        x->authz    = clone(&x->arena, authz);
+        x->tokenurl = clone(&x->arena, token);
+        x->reg      = clone(&x->arena, jsonstr(jsonget(j, "registration_endpoint")));
+    }
+    mcpauthreg(e, scratch, x);
+}
+
+// Register as a client, unless the configuration names one.
+static void mcpauthreg(Engine *e, Arena scratch, McpAuth *x)
+{
+    if (x->client.len) {
+        mcpauthgo(e, scratch, x);
+        return;
+    } else if (!x->reg.len) {
+        mcpauthfail(e, scratch, x, "the server registers no clients: set its "
+                                   "client_id in the configuration");
+        return;
+    }
+    Buf     b(&scratch, 512);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "client_name", "Prospero");
+    putkey(&w, "redirect_uris");
+    putarray(&w);
+    putstr(&w, x->redirect);
+    putend(&w);
+    putkey(&w, "grant_types");
+    putarray(&w);
+    putstr(&w, "authorization_code");
+    putstr(&w, "refresh_token");
+    putend(&w);
+    putkey(&w, "response_types");
+    putarray(&w);
+    putstr(&w, "code");
+    putend(&w);
+    putstrkey(&w, "token_endpoint_auth_method", "none");
+    if (x->scope.len) {
+        putstrkey(&w, "scope", x->scope);
+    }
+    putend(&w);
+    x->stage = MCPAUTH_REG;
+    if (!mcpauthhttp(e, scratch, x, "POST", x->reg, "application/json", finish(&b))) {
+        Str why = concat(&scratch, "registering could not be requested: ",
+                         os_lasterr(e->os, &scratch));
+        mcpauthfail(e, scratch, x, why);
+    }
+}
+
+static Str mcprandom(Engine *e, Arena *a, i32 words)
+{
+    Str r = {alloc<u8>(a, 8*words), 8*words};
+    for (i32 i = 0; i < words; i++) {
+        u64 v = os_random(e->os);
+        for (i32 k = 0; k < 8; k++) {
+            r[8*i+k] = (u8)(v >> (8*k));
+        }
+    }
+    return base64url(a, r);
+}
+
+// Everything known: the browser's URL to the frontend, which brings
+// back the code (mcp.code).
+static void mcpauthgo(Engine *e, Arena scratch, McpAuth *x)
+{
+    x->verifier = mcprandom(e, &x->arena, 4);  // 43 characters
+    x->state    = mcprandom(e, &x->arena, 2);
+    x->stage    = MCPAUTH_WAIT;
+    x->by       = os_ticks(e->os) + 10*60*SEC;
+    Str url     = mcpauthurl(&scratch, x, mcpchallenge(&scratch, x->verifier));
+    Buf   b(&scratch, 256 + url.len);
+    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", x->cmd);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "url", url);
+    emit(e, evend(&w));
+    x->cmd = 0;
+}
+
+// Tokens came: kept, and the servers started again with them.
+static void mcpauthtokens(Engine *e, Arena scratch, McpAuth *x, Json *j)
+{
+    McpTokens t = {};
+    t.url      = x->resource;
+    t.issuer   = x->issuer;
+    t.tokenurl = x->tokenurl;
+    t.client   = x->client;
+    t.secret   = x->secret;
+    t.access   = jsonstr(jsonget(j, "access_token"));
+    t.refresh  = jsonstr(jsonget(j, "refresh_token"));
+    t.refresh  = t.refresh.len ? t.refresh : x->refresh;  // kept unless replaced
+    i64 in     = jsonint(jsonget(j, "expires_in"), 0);
+    t.expires  = in>0 ? os_time(e->os)/1000 + in : 0;
+    if (!t.access.len) {
+        mcpauthfail(e, scratch, x, "the server's response gave no access token");
+        return;
+    } else if (!mcpsavetokens(e, scratch, x->name, &t)) {
+        Str why = concat(&scratch, "the tokens could not be saved: ", os_lasterr(e->os, &scratch));
+        mcpauthfail(e, scratch, x, why);
+        return;
+    }
+    if (x->cmd) {
+        reply(e, scratch, x->cmd, 1, {}, {});
+    }
+    Str name = clone(&scratch, x->name), url = clone(&scratch, x->resource);
+    mcpauthfree(e, x);
+    mcprestartall(e, scratch, name, url);
+}
+
+// An OAuth error response's words, for a message.
+static Str mcpautherr(Arena *a, McpAuth *x)
+{
+    Str  body = Str{x->body.data, x->body.len};
+    Json *j   = jsonparse(a, body).root;
+    Str  err  = jsonstr(jsonget(j, "error"));
+    Str  desc = jsonstr(jsonget(j, "error_description"));
+    Buf  b(a, 256);
+    print(&b, "HTTP ");
+    print(&b, (i64)x->status);
+    if (err.len) {
+        print(&b, ": ");
+        print(&b, err);
+        print(&b, desc.len ? Str(", ") : Str(""));
+        print(&b, utf8head(desc, 300));
+    } else if (trim(body).len) {
+        print(&b, ": ");
+        print(&b, utf8head(trim(body), 300));
+    }
+    return finish(&b);
+}
+
+static void mcpauthrecord(Engine *e, Arena scratch, McpAuth *x, Record r)
+{
+    switch (r.type) {
+    case HTTP_HEAD:
+        x->status = get32(r.data);
+        return;
+    case HTTP_BODY:
+        if (x->body.len + r.data.len <= 1<<20) {
+            print(&x->body, r.data);
+        }
+        return;
+    }
+    i32  err  = get32(r.data);
+    Str  why  = cuthead(r.data, 4);
+    Json *j   = 0;
+    if (!err && x->status==200) {
+        j = jsonparse(&scratch, Str{x->body.data, x->body.len}).root;
+        j = j->type==JSON_OBJECT ? j : 0;
+    }
+    switch (x->stage) {
+    case MCPAUTH_PRM:
+        if (j && jsonget(j, "authorization_servers")->child) {
+            mcpauthprm(e, scratch, x, j);
+        } else if (!mcpauthtry(e, scratch, x)) {
+            mcpauthprm(e, scratch, x, 0);
+        }
+        return;
+    case MCPAUTH_ASM:
+        if (!j && mcpauthtry(e, scratch, x)) {
+            return;
+        }
+        mcpauthasm(e, scratch, x);
+        return;
+    }
+    if (err) {
+        Str msg = concat(&scratch, x->stage==MCPAUTH_REG ? Str("registering: ") :
+                         Str("the token request: "), why.len ? why : Str("no response"));
+        mcpauthfail(e, scratch, x, msg);
+        return;
+    }
+    switch (x->stage) {
+    case MCPAUTH_REG: {
+        if (x->status/100 == 2) {
+            j = jsonparse(&scratch, Str{x->body.data, x->body.len}).root;
+        }
+        Str id = j ? jsonstr(jsonget(j, "client_id")) : Str{};
+        if (!id.len) {
+            Str why = concat(&scratch, "registering: ", mcpautherr(&scratch, x));
+            mcpauthfail(e, scratch, x, why);
+            return;
+        }
+        x->client = clone(&x->arena, id);
+        x->secret = clone(&x->arena, jsonstr(jsonget(j, "client_secret")));
+        mcpauthgo(e, scratch, x);
+    } return;
+    case MCPAUTH_TOKEN:
+    case MCPAUTH_REFRESH:
+        if (!j) {
+            Str why = concat(&scratch, "the token request: ", mcpautherr(&scratch, x));
+            mcpauthfail(e, scratch, x, why);
+            return;
+        }
+        mcpauthtokens(e, scratch, x, j);
+        return;
+    }
+}
+
+static McpAuth *mcpauthbyhttp(Engine *e, u64 id)
+{
+    for (McpAuth *x = e->mcpauths; id && x; x = x->next) {
+        if (x->hid == id) {
+            return x;
+        }
+    }
+    return 0;
+}
+
+static McpAuth *mcpauthnew(Engine *e, Str name, Str url)
+{
+    for (McpAuth *x = e->mcpauths; x; x = x->next) {
+        if (x->name == name) {
+            Arena a = newarena(e->scratch);
+            mcpauthfail(e, a, x, "another sign-in began");
+            break;
+        }
+    }
+    Region *mem = os_reserve(e->os, MCP_REGION);
+    if (!mem) {
+        return 0;
+    }
+    Arena    a = newarena(mem);
+    McpAuth *x = alloc<McpAuth>(&a);
+    x->mem      = mem;
+    x->name     = clone(&a, name);
+    x->resource = clone(&a, url);
+    x->body     = Buf(&a, 1<<12);
+    x->by       = os_ticks(e->os) + 10*60*SEC;
+    x->arena    = a;
+    x->next     = e->mcpauths;
+    e->mcpauths = x;
+    return x;
+}
+
+// A server answered 401: its tokens refreshed, if it has any not tried
+// yet, else it needs the user to sign in. A call it carried fails.
+static void mcpunauthorized(Engine *e, Arena scratch, McpServer *m, McpHttp *q)
+{
+    Str rm = mcpchallengeparam(&scratch, q->challenge, "resource_metadata");
+    Str sc = mcpchallengeparam(&scratch, q->challenge, "scope");
+    m->prm     = rm.len ? clone(&e->perm, rm) : m->prm;
+    m->chscope = sc.len ? clone(&e->perm, sc) : m->chscope;
+    McpTokens t = mcptokens(e, &scratch, m->name, m->url);
+    if (!m->bearer.len || !t.refresh.len || !t.tokenurl.len || m->refreshed) {
+        mcpneedauth(e, scratch, m);
+        return;
+    }
+    McpAuth *x = mcpauthnew(e, m->name, m->url);
+    if (!x) {
+        mcpneedauth(e, scratch, m);
+        return;
+    }
+    m->refreshed = 1;
+    x->stage    = MCPAUTH_REFRESH;
+    x->issuer   = clone(&x->arena, t.issuer);
+    x->tokenurl = clone(&x->arena, t.tokenurl);
+    x->client   = clone(&x->arena, t.client);
+    x->secret   = clone(&x->arena, t.secret);
+    x->refresh  = clone(&x->arena, t.refresh);
+    Str grant   = concat(&scratch, "grant_type=refresh_token&refresh_token=",
+                         pctencode(&scratch, t.refresh));
+    Str form    = mcpauthform(&scratch, x, grant);
+    // The call refused waits for the server to start again, then goes
+    for (iz i = 0; i < m->pending.len; i++) {
+        McpPending *p = &m->pending[i];
+        Session    *s = p->id==q->rpc && p->kind==MCPREQ_CALL ? findsession(e, p->sid) : 0;
+        if (s && s->state==S_TOOL && s->mcpsrv==m && s->mcpcall==p->id) {
+            s->mcpcall = -1;
+            m->pending.data[i] = m->pending[m->pending.len-1];
+            m->pending.len--;
+            break;
+        }
+    }
+    Str why     = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
+                         Str(" signs in again; try the call again."));
+    mcpstop(e, scratch, m, why);
+    m->state   = MCP_STARTING;  // until it is started again
+    m->readyby = os_ticks(e->os) + m->startms*MS;
+    if (!mcpauthhttp(e, scratch, x, "POST", x->tokenurl,
+                     "application/x-www-form-urlencoded", form)) {
+        mcpauthfail(e, scratch, x, "the token request could not be made");
+    }
+}
+
+// The URL of a server by name: its section's, else that of a project's
+// server running by that name. Null if it has none.
+static Str mcpurlof(Engine *e, Str name)
+{
+    Str url = trim(cfgget(e->cfg, "mcp", name, "url", 0));
+    if (url.len || inisection(e->ini, "mcp", name)) {
+        return url;
+    }
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->name==name && m->url.len) {
+            return m->url;
+        }
+    }
+    return {};
+}
+
+// mcp.auth {name, redirect}: replies, late, with the URL the browser
+// is to visit, its redirect to the given one, on the frontend's machine.
+static void cmdmcpauth(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str name     = jsonstr(jsonget(j, "name"));
+    Str redirect = jsonstr(jsonget(j, "redirect"));
+    Str url      = mcpurlof(e, name);
+    if (!url.len) {
+        Str why = concat(&scratch, "no MCP server over HTTP is named ",
+                         name.len ? name : Str("\"\""));
+        reply(e, scratch, id, 0, why, {});
+        return;
+    } else if (!redirect.len) {
+        reply(e, scratch, id, 0, "no redirect was given", {});
+        return;
+    }
+    McpAuth *x = mcpauthnew(e, name, url);
+    if (!x) {
+        reply(e, scratch, id, 0, "out of memory", {});
+        return;
+    }
+    x->cmd      = id;
+    x->redirect = clone(&x->arena, redirect);
+    Str client  = trim(cfgget(e->cfg, "mcp", name, "client_id", 0));
+    Str secret  = cfgsecret(e->cfg, &scratch, "mcp", name, "client_secret");
+    Str scope   = trim(cfgget(e->cfg, "mcp", name, "scope", 0));
+    Str said    = {};
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->name==name && m->url==url) {
+            said  = m->prm;
+            scope = scope.len ? scope : m->chscope;
+        }
+    }
+    x->client = clone(&x->arena, client);
+    x->secret = clone(&x->arena, secret);
+    x->scope  = clone(&x->arena, scope);
+    x->stage  = MCPAUTH_PRM;
+    x->tries  = mcpprmurls(&x->arena, url, clone(&x->arena, said));
+    if (!mcpauthtry(e, scratch, x)) {
+        Str why = concat(&scratch, "its metadata could not be requested: ",
+                         os_lasterr(e->os, &scratch));
+        mcpauthfail(e, scratch, x, why);
+    }
+}
+
+// mcp.code {name, code, state}, or {name, error}: what the browser
+// brought back, exchanged for tokens. Replies late.
+static void cmdmcpcode(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str      name = jsonstr(jsonget(j, "name"));
+    McpAuth *x    = 0;
+    for (McpAuth *k = e->mcpauths; k; k = k->next) {
+        x = k->name==name && k->stage==MCPAUTH_WAIT ? k : x;
+    }
+    if (!x) {
+        Str why = concat(&scratch, "no sign-in waits for ", name);
+        reply(e, scratch, id, 0, why, {});
+        return;
+    }
+    Str error = jsonstr(jsonget(j, "error"));
+    Str code  = jsonstr(jsonget(j, "code"));
+    x->cmd = id;
+    if (error.len) {
+        Str desc = jsonstr(jsonget(j, "error_description"));
+        Str msg  = desc.len ? concat(&scratch, concat(&scratch, error, ": "), desc) : error;
+        Str why = concat(&scratch, "the server said ", msg);
+        mcpauthfail(e, scratch, x, why);
+        return;
+    } else if (jsonstr(jsonget(j, "state")) != x->state) {
+        mcpauthfail(e, scratch, x, "the browser came back from another sign-in");
+        return;
+    } else if (!code.len) {
+        mcpauthfail(e, scratch, x, "the browser brought back no code");
+        return;
+    }
+    Buf g(&scratch, 256 + code.len);
+    print(&g, "grant_type=authorization_code&code=");
+    print(&g, pctencode(&scratch, code));
+    print(&g, "&redirect_uri=");
+    print(&g, pctencode(&scratch, x->redirect));
+    print(&g, "&code_verifier=");
+    print(&g, x->verifier);
+    Str form = mcpauthform(&scratch, x, finish(&g));
+    x->stage = MCPAUTH_TOKEN;
+    if (!mcpauthhttp(e, scratch, x, "POST", x->tokenurl,
+                     "application/x-www-form-urlencoded", form)) {
+        mcpauthfail(e, scratch, x, "the token request could not be made");
+    }
+}
+
+// mcp.logout {name}: its tokens forgotten, and it needs signing in.
+static void cmdmcplogout(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str name = jsonstr(jsonget(j, "name"));
+    Str url  = mcpurlof(e, name);
+    if (!url.len) {
+        Str why = concat(&scratch, "no MCP server over HTTP is named ",
+                         name.len ? name : Str("\"\""));
+        reply(e, scratch, id, 0, why, {});
+        return;
+    }
+    Str path = mcpauthpath(e, &scratch, name, url);
+    if (os_stat(e->os, scratch, path).type!=STAT_MISSING && !os_remove(e->os, scratch, path)) {
+        Str why = concat(&scratch, "its tokens could not be removed: ",
+                         os_lasterr(e->os, &scratch));
+        reply(e, scratch, id, 0, why, {});
+        return;
+    }
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->name==name && m->url==url && m->bearer.len) {
+            m->bearer = {};
+            if (m->state != MCP_STOPPED) {
+                mcpneedauth(e, scratch, m);
+            }
+        }
+    }
+    reply(e, scratch, id, 1, {}, {});
+}
+
+// mcp.restart {name}: started again now, over HTTP, or at a session's
+// next use, a program; a failed one also, without waiting.
+static void cmdmcprestart(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str name = jsonstr(jsonget(j, "name"));
+    b32 any  = 0;
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->name != name) {
+            continue;
+        }
+        any = 1;
+        Str why = concat(&scratch, concat(&scratch, "The MCP server ", name),
+                         Str(" started again."));
+        mcpstop(e, scratch, m, why);
+        m->state    = MCP_STOPPED;
+        m->needauth = 0;
+        if (m->url.len) {
+            mcpstart(e, scratch, m, 0);
+        }
+    }
+    if (!any && !inisection(e->ini, "mcp", name)) {
+        Str why = concat(&scratch, "no MCP server is named ", name.len ? name : Str("\"\""));
+        reply(e, scratch, id, 0, why, {});
+        return;
+    }
+    reply(e, scratch, id, 1, {}, {});
+}
+
+static Str mcpstatename(McpServer *m)
+{
+    switch (m ? m->state : MCP_STOPPED) {
+    case MCP_STARTING:
+    case MCP_LISTING:  return "starting";
+    case MCP_READY:    return "ready";
+    case MCP_FAILED:   return m->needauth ? Str("auth") : Str("failed");
+    }
+    return "stopped";
+}
+
+static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServer *m)
+{
+    Str url = m ? m->url : trim(cfgget(e->cfg, "mcp", name, "url", 0));
+    putobject(w);
+    putstrkey(w, "name", name);
+    putstrkey(w, "source", m && m->project.len ? Str("project") : Str("config"));
+    if (m && m->project.len) {
+        putstrkey(w, "file", m->project);
+    }
+    if (m && m->cwd.len) {
+        putstrkey(w, "cwd", m->cwd);
+    }
+    putstrkey(w, "transport", url.len ? Str("http") : Str("stdio"));
+    if (url.len) {
+        putstrkey(w, "url", url);
+        McpTokens t = mcptokens(e, &scratch, name, url);
+        putintkey(w, "signedin", t.access.len > 0);
+    }
+    putstrkey(w, "state", mcpstatename(m));
+    putintkey(w, "tools", m && m->state==MCP_READY ? m->tools.len : 0);
+    if (m && m->state==MCP_FAILED && m->err.len) {
+        putstrkey(w, "err", m->err);
+    }
+    if (m && m->log.len) {
+        putstrkey(w, "log", m->log);
+    }
+    putend(w);
+}
+
+// mcp: the servers, those of the configuration first, each once by
+// name, then any of projects', as they are now.
+static void cmdmcp(Engine *e, Arena scratch, i64 id)
+{
+    Buf   b(&scratch, 1<<14);
+    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putkey(&w.json, "servers");
+    putarray(&w.json);
+    for (IniSection *s = inifirst(e->ini, "mcp"); s; s = ininext(s)) {
+        if (!s->name.len) {
+            continue;
+        }
+        McpServer *best = 0;
+        for (McpServer *m = e->mcp; m; m = m->next) {
+            if (m->name==s->name && !m->project.len) {
+                best = !best || m->state>best->state ? m : best;
+            }
+        }
+        putmcpserver(e, scratch, &w.json, s->name, best);
+    }
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->project.len) {
+            putmcpserver(e, scratch, &w.json, m->name, m);
+        }
+    }
+    putend(&w.json);
+    emit(e, evend(&w));
 }
 
 
@@ -13692,6 +14517,9 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_MODE:
         case CMD_BACKGROUND:
         case CMD_MODELS:
+        case CMD_MCPAUTH:
+        case CMD_MCPCODE:
+        case CMD_MCPRESTART:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -13801,6 +14629,21 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_MODELS:
         cmdmodels(e, scratch, id);
+        return;
+    case CMD_MCP:
+        cmdmcp(e, scratch, id);
+        return;
+    case CMD_MCPAUTH:
+        cmdmcpauth(e, scratch, id, j);
+        return;
+    case CMD_MCPCODE:
+        cmdmcpcode(e, scratch, id, j);
+        return;
+    case CMD_MCPLOGOUT:
+        cmdmcplogout(e, scratch, id, j);
+        return;
+    case CMD_MCPRESTART:
+        cmdmcprestart(e, scratch, id, j);
         return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});
@@ -13992,8 +14835,12 @@ static void onrecord(Engine *e, Arena scratch, Record r)
     if (r.type>=HTTP_HEAD && r.type<=HTTP_DONE) {
         McpHttp   *q  = 0;
         McpServer *ms = mcpbyhttp(e, r.id, &q);
+        McpAuth   *ma = ms ? 0 : mcpauthbyhttp(e, r.id);
         if (ms) {
             mcphttprecord(e, scratch, ms, q, r);
+            return;
+        } else if (ma) {
+            mcpauthrecord(e, scratch, ma, r);
             return;
         }
     }

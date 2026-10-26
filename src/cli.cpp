@@ -689,3 +689,210 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
         }
     }
 }
+
+
+// prospero mcp: the MCP servers, and signing in to those over HTTP
+//
+//   prospero mcp list            the servers the configuration names
+//   prospero mcp auth NAME       sign in, through a browser
+//   prospero mcp logout NAME     forget its tokens
+//
+// These drive an engine of their own, as run does, with the commands
+// the window sends (mcp, mcp.auth, mcp.code, mcp.logout). The sign-in
+// prints the URL to visit and takes the browser's return at a loopback
+// listener of its own, waiting 10 minutes at most.
+
+static Str mcpusage =
+"usage: prospero mcp list [options]\n"
+"       prospero mcp auth NAME [options]\n"
+"       prospero mcp logout NAME [options]\n"
+"options:\n"
+"  -c FILE       configuration file\n"
+"  --state DIR   state directory\n";
+
+enum : u32 { MCPCLI_LOOP = 200 };
+
+// Send a command and wait for its reply, or for the loopback's record
+// when loop is given: the reply's object, or null with *target set.
+static Json *mcpcliwait(Cli *c, Arena *a, Str line, i64 id, Str *target)
+{
+    if (line.len) {
+        enginecmd(c->e, line);
+    }
+    for (;;) {
+        mailwait(c->out, -1);
+        Mail m = mailtake(c->out);
+        for (Record r; (r = mailnext(&m)).ok;) {
+            if (r.type == MCPCLI_LOOP && target) {
+                *target = clone(a, r.data);
+                return 0;
+            } else if (r.type == MAIL_QUIT) {
+                return 0;
+            } else if (r.type != MAIL_OUT) {
+                continue;
+            }
+            EvRec e = evparse(a, r.data);
+            if (e.ev==EV_REPLY && jsonint(jsonget(e.root, "id"), 0)==id) {
+                return e.root;
+            }
+        }
+    }
+}
+
+static Str mcpcmdline(Arena *a, i32 cmd, i64 id, Str name, Json *more = 0)
+{
+    Buf   b(a, 512);
+    EvOut w = cmdbegin(&b, cmd, id);
+    if (name.len) {
+        putstrkey(&w.json, "name", name);
+    }
+    for (Json *k = more ? more->child : 0; k; k = k->next) {
+        putkey(&w.json, k->key);
+        putjson(&w.json, k);
+    }
+    return cuttail(evend(&w), 1);
+}
+
+static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
+{
+    Cli c = {};
+    c.os = os;
+    Str verb = nargs>2 ? args[2] : Str{};
+    Str name = {}, config = {}, state = {};
+    for (i32 i = 3; i < nargs; i++) {
+        Str a = args[i];
+        if (a=="-c" && i+1<nargs) {
+            config = args[++i];
+        } else if (a=="--state" && i+1<nargs) {
+            state = args[++i];
+        } else if (!name.data && verb!="list" && (!a.len || a[0]!='-')) {
+            name = a;
+        } else {
+            os_print(os, 2, mcpusage);
+            return 2;
+        }
+    }
+    if ((verb!="list" && verb!="auth" && verb!="logout") ||
+            (verb!="list" && !name.len)) {
+        os_print(os, 2, mcpusage);
+        return 2;
+    }
+
+    c.statedir  = state.len ? state : defaultstate(os, &perm);
+    Config *cfg = cliconfig(os, &perm, scratch, config, c.statedir, CFG_NETWAIT);
+    if (!cfg) {
+        return 2;
+    }
+    c.out = newmailbox(&perm, 4<<20, 0, 0);
+    c.e   = c.out ? newengine(os, &perm, cfg, c.statedir, c.out, {}) : 0;
+    if (!c.e || !enginestart(c.e)) {
+        os_print(os, 2, "prospero: cannot start the engine\n");
+        return 2;
+    }
+
+    i32  code = 0;
+    Buf  out(&scratch, 1<<12);
+    if (verb == "list") {
+        Arena a = scratch;
+        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCP, 1, {}), 1, 0);
+        for (Json *s = jsonget(r, "servers")->child; s; s = s->next) {
+            Str url = jsonstr(jsonget(s, "url"));
+            print(&out, jsonstr(jsonget(s, "name")));
+            print(&out, url.len ? Str(": ") : Str(": a program"));
+            print(&out, url);
+            if (url.len) {
+                print(&out, jsonint(jsonget(s, "signedin"), 0) ? Str(", signed in")
+                                                               : Str(", not signed in"));
+            }
+            print(&out, jsonstr(jsonget(s, "source"))=="project" ? Str(" (a project's)") : Str(""));
+            putbyte(&out, '\n');
+        }
+        os_print(os, 1, finish(&out));
+    } else if (verb == "logout") {
+        Arena a = scratch;
+        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPLOGOUT, 1, name), 1, 0);
+        if (!jsonint(jsonget(r, "ok"), 0)) {
+            print(&out, "prospero: ");
+            print(&out, jsonstr(jsonget(r, "err")));
+            putbyte(&out, '\n');
+            os_print(os, 2, finish(&out));
+            code = 1;
+        } else {
+            print(&out, "Signed out of ");
+            print(&out, name);
+            print(&out, ".\n");
+            os_print(os, 1, finish(&out));
+        }
+    } else {
+        Arena a    = scratch;
+        i32   port = 0;
+        if (!os_loopback(os, c.out, MCPCLI_LOOP, 0, 10*60*1000, &port)) {
+            os_print(os, 2, "prospero: cannot listen on the loopback for the browser\n");
+            return 1;
+        }
+        Buf rb(&a, 64);
+        print(&rb, "http://127.0.0.1:");
+        print(&rb, (i64)port);
+        print(&rb, "/callback");
+        Buf     mb(&a, 128);
+        JsonOut w = {&mb};
+        putobject(&w);
+        putstrkey(&w, "redirect", finish(&rb));
+        putend(&w);
+        Json *more = jsonparse(&a, finish(&mb)).root;
+        Json *r    = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPAUTH, 1, name, more), 1, 0);
+        Str   url  = jsonstr(jsonget(r, "url"));
+        if (!jsonint(jsonget(r, "ok"), 0) || !url.len) {
+            print(&out, "prospero: ");
+            print(&out, jsonstr(jsonget(r, "err")));
+            putbyte(&out, '\n');
+            os_print(os, 2, finish(&out));
+            code = 1;
+        } else {
+            print(&out, "To sign in to ");
+            print(&out, name);
+            print(&out, ", visit this in a browser on this machine:\n\n  ");
+            print(&out, url);
+            print(&out, "\n\n");
+            os_print(os, 1, finish(&out));
+            out.len = 0;
+            Str target = {};
+            mcpcliwait(&c, &a, {}, 0, &target);
+            Str q = cut(target, '?').tail;
+            Buf cb(&a, 256 + q.len);
+            JsonOut cw = {&cb};
+            putobject(&cw);
+            Str keys[] = {"code", "state", "error", "error_description"};
+            for (iz i = 0; i < countof(keys); i++) {
+                Str v = mcpquery(&a, q, keys[i]);
+                if (v.data) {
+                    putstrkey(&cw, keys[i], v);
+                }
+            }
+            putend(&cw);
+            if (!target.len) {
+                os_print(os, 2, "prospero: nobody signed in within 10 minutes\n");
+                code = 1;
+            } else {
+                more = jsonparse(&a, finish(&cb)).root;
+                r    = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPCODE, 2, name, more), 2, 0);
+                if (!jsonint(jsonget(r, "ok"), 0)) {
+                    print(&out, "prospero: ");
+                    print(&out, jsonstr(jsonget(r, "err")));
+                    putbyte(&out, '\n');
+                    os_print(os, 2, finish(&out));
+                    code = 1;
+                } else {
+                    print(&out, "Signed in to ");
+                    print(&out, name);
+                    print(&out, ".\n");
+                    os_print(os, 1, finish(&out));
+                }
+            }
+        }
+    }
+
+    Arena a = scratch;
+    mcpcliwait(&c, &a, mcpcmdline(&a, CMD_QUIT, 99, {}), -1, 0);
+    return code;
+}

@@ -131,6 +131,12 @@ static Str     os_getenv(Os *, Arena *, Str name);
 // this same binary again.
 static Str     os_exepath(Os *, Arena *);
 
+// Listen at 127.0.0.1, on a port the system picks (*port), on a thread
+// of its own, for an HTTP request for /callback, as a browser makes
+// coming back from a sign-in: its target (path and query) is posted to
+// mbox as a record of that type and id, and the browser told it may
+// close the tab. After ms with none, the record is empty. 0 on failure.
+static b32     os_loopback(Os *, Mailbox *, u32 type, u64 id, i32 ms, i32 *port);
 // Start a detached thread running fn(arg). Returns 0 on failure.
 static b32     os_thread(Os *, void (*fn)(void *), void *arg);
 static void    os_lockinit(Lock *);
@@ -271,7 +277,6 @@ static iz      os_lockfile(Os *, Arena, Str path);
 static void    os_unlockfile(Os *, iz lock);
 static b32     os_lockheld(Os *, Arena, Str path);
 
-static b32     os_openurl(Os *, Arena, Str url);
 static void    os_busy(Os *, i32 state);
 
 // (M5) Local endpoints: byte streams between processes of one user on
@@ -537,6 +542,8 @@ static b32     os_guireveal(Os *, Arena scratch, Str dir);
 // its directory as os_guireveal shows it. Returns 0 on failure, where
 // the platform knows of it before the file manager takes over.
 static b32     os_guishow(Os *, Arena scratch, Str file);
+// Open a web page in the user's browser. Returns 0 on failure.
+static b32     os_guiopenurl(Os *, Arena scratch, Str url);
 // (M8) What the window system keeps from the window, as GUI_* flags.
 // Wayland's compositor places windows, so a window neither knows nor
 // sets its place, and cannot leave being minimized by itself
@@ -609,6 +616,7 @@ static Str usage =
 "       prospero connect NAME | --ssh DEST | --local [options]\n"
 "       prospero deploy NAME|DEST [--force] [options]\n"
 "       prospero eval [options] SUITE...\n"
+"       prospero mcp list | auth NAME | logout NAME [options]\n"
 #if PROSPERO_DESKTOP
 "       prospero desktop COMMAND [ARGS]  (prospero desktop -h)\n"
 #endif
@@ -656,6 +664,8 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
         return deploymain(os, perm, scratch, args, nargs);
     } else if (nargs>1 && args[1]=="eval") {
         return evalmain(os, perm, scratch, args, nargs);
+    } else if (nargs>1 && args[1]=="mcp") {
+        return mcpmain(os, perm, scratch, args, nargs);
     }
 
     for (i32 i = 1; i < nargs; i++) {

@@ -1714,6 +1714,12 @@ static b32 os_guireveal(Os *, Arena scratch, Str dir)
     return w32gui_reveal((unsigned short *)towide(&scratch, dir).data);
 }
 
+// ShellExecuteW's "open", as for a directory, gives a URL to the browser
+static b32 os_guiopenurl(Os *, Arena scratch, Str url)
+{
+    return w32gui_reveal((unsigned short *)towide(&scratch, url).data);
+}
+
 static b32 os_guishow(Os *, Arena scratch, Str file)
 {
     Str16 w = towide(&scratch, file);

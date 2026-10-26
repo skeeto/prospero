@@ -2453,7 +2453,9 @@ def hello_caps(t):
         want = ["hello", "list", "new", "open", "close", "prompt", "steer", "cancel",
                 "answer", "config.get", "config.set", "quit", "rewind", "job.kill",
                 "status", "stop", "file"] + m8 + ["skills", "mode", "unqueue", "dir",
-                                                   "background", "models"]
+                                                   "background", "models", "mcp",
+                                                   "mcp.auth", "mcp.code", "mcp.logout",
+                                                   "mcp.restart"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -2461,7 +2463,8 @@ def hello_caps(t):
                  "subagents", "rename", "title.by", "archive", "group", "draft",
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
-                 "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models"} <= set(caps)
+                 "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
+                 "mcp", "mcp.auth"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -8312,8 +8315,9 @@ def mcp_project_config(t):
 class McpHttpServer:
     """tests/fake_mcp.py --http, run for a scenario, logging to t.mcplog."""
 
-    def __init__(self, t, **env):
-        self.p = subprocess.Popen([sys.executable, FAKE_MCP, "--http"],
+    def __init__(self, t, oauth=False, **env):
+        flags = ["--http"] + (["--oauth"] if oauth else [])
+        self.p = subprocess.Popen([sys.executable, FAKE_MCP] + flags,
                                   stdout=subprocess.PIPE, text=True,
                                   env={**os.environ, "FAKE_MCP_LOG": t.mcplog, **env})
         line = self.p.stdout.readline()
@@ -8387,7 +8391,116 @@ def mcp_http_auth(t):
         srv.close()
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     warns = [n["text"] for n in r.all("note") if "MCP server web failed" in n["text"]]
-    t.check(len(warns) == 1 and "needs authorization (HTTP 401)" in warns[0], f"warned {warns}")
+    t.check(len(warns) == 1 and "needs you to sign in" in warns[0] and
+            "prospero mcp auth web" in warns[0], f"warned {warns}")
+
+
+def prun(t, args, env=None, timeout=30):
+    """prospero ARGS, run to its end: exit code, output and errors."""
+    p = t.host.popen(args, t.work, env=dict(t.tmpenv, **(env or {})))
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, err = p.communicate()
+    return p.returncode, out, err
+
+
+def authfiles(t, prefix=""):
+    d = os.path.join(t.state, "mcp", "auth")
+    names = sorted(os.listdir(d)) if os.path.isdir(d) else []
+    return [os.path.join(d, n) for n in names if n.startswith(prefix)]
+
+
+def mcpauth(t, name, env=None, browse=True):
+    """prospero mcp auth NAME, its URL visited as a browser would, the
+    redirect to its loopback listener followed: its exit code, output
+    and errors."""
+    import urllib.request
+    p = t.host.popen(["mcp", "auth", name, "--state", t.state, "-c", t.config], t.work,
+                     env=dict(t.tmpenv, **(env or {})))
+    killer = threading.Timer(30, p.kill)
+    killer.start()
+    try:
+        out = []
+        for line in p.stdout:
+            out.append(line)
+            m = re.search(r"(https?://\S+/authorize\?\S+)", line)
+            if m and browse:
+                urllib.request.urlopen(m.group(1), timeout=10).read()
+                break
+        rest, err = p.communicate()
+    finally:
+        killer.cancel()
+    return p.returncode, "".join(out) + rest, err
+
+
+@scenario(bound=40)
+def mcp_oauth(t):
+    """Signing in to a server through prospero mcp auth: its protected
+    resource's metadata, the authorization server's, a client registered,
+    the browser sent to sign in with PKCE and back to the loopback; its
+    tokens kept privately, sent with each request; a token the server
+    revoked refreshed while the call waits; signed out, the server needs
+    signing in again."""
+    env = mcpenv(t)
+    srv = McpHttpServer(t, oauth=True)
+    try:
+        addconf(t, f"[mcp web]\nurl = {srv.url}\ntrust = yes\n")
+        rc, out, err = mcpauth(t, "web", env)
+        t.check(rc == 0 and "Signed in to web." in out, f"signed in: {rc} {out} {err}")
+        files = authfiles(t, "web-")
+        t.check(len(files) == 1, f"tokens kept: {files}")
+        if files and os.name != "nt":
+            mode = os.stat(files[0]).st_mode & 0o777
+            t.check(mode == 0o600, f"privately: {oct(mode)}")
+        keep = json.loads(open(files[0]).read()) if files else {}
+        t.check(keep.get("url") == srv.url and keep.get("refresh_token"), f"kept {keep}")
+        _, ls, _ = prun(t, ["mcp", "list", "--state", t.state, "-c", t.config])
+        t.check(f"web: {srv.url}, signed in" in ls, f"listed {ls!r}")
+        r = t.run(env=env)
+        rc, out, err = prun(t, ["mcp", "logout", "web", "--state", t.state, "-c", t.config])
+        t.check(rc == 0 and "Signed out of web." in out, f"signed out: {rc} {out} {err}")
+        t.check(not authfiles(t), "forgotten")
+    finally:
+        srv.close()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    st = [(e["status"], e["text"][:90]) for e in r.all("tool.end")]
+    t.check(st == [("ok", "echo: one"), ("ok", "expired"), ("ok", "echo: two")],
+            f"calls {st}")
+    log = mcplog(t)
+    oauth = [m["_oauth"] for m in log if "_oauth" in m]
+    t.check(oauth[:5] == ["/.well-known/oauth-protected-resource/mcp",
+                          "/.well-known/oauth-authorization-server/as", "/as/register",
+                          "/as/authorize", "/as/token"], f"the flow {oauth}")
+    grants = [m.get("grant_type") for m in log if m.get("_oauth") == "/as/token"]
+    t.check(grants == ["authorization_code", "refresh_token"], f"grants {grants}")
+    reg = [m for m in log if m.get("_oauth") == "/as/register"]
+    t.check(reg and reg[0]["redirect_uris"][0].startswith("http://127.0.0.1:") and
+            reg[0]["redirect_uris"][0].endswith("/callback"), f"registered {reg}")
+    auths = [m["_http"]["Authorization"] for m in log if "_http" in m and "_delete" not in m]
+    t.check(auths and auths[0] == "Bearer " + keep.get("access_token", "?"),
+            f"the token sent {auths[:2]}")
+    t.check(auths and auths[-1] != auths[0] and auths[-1].startswith("Bearer at-"),
+            f"the refreshed token sent {auths[-3:]}")
+
+
+@scenario(bound=20)
+def mcp_oauth_denied(t):
+    """A sign-in the user refused, and one never finished elsewhere:
+    prospero mcp auth says so; no tokens are kept."""
+    mcpenv(t)
+    srv = McpHttpServer(t, oauth=True, FAKE_MCP_DENY="1")
+    try:
+        addconf(t, f"[mcp web]\nurl = {srv.url}\n")
+        rc, out, err = mcpauth(t, "web")
+        t.check(rc == 1 and "access_denied" in err, f"refused: {rc} {out} {err}")
+        rc, out, err = mcpauth(t, "nosuch")
+        t.check(rc == 1 and "no MCP server over HTTP is named nosuch" in err,
+                f"unknown: {rc} {err}")
+    finally:
+        srv.close()
+    t.check(not authfiles(t), "nothing kept")
 
 
 @scenario(bound=15)

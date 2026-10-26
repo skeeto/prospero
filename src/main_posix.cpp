@@ -14,7 +14,9 @@
 // This is free and unencumbered software released into the public domain.
 #include <dirent.h>
 #include <errno.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -2938,6 +2940,93 @@ static Listener *os_listen(Os *os, Arena scratch, Str endpoint, Mailbox *mbox)
 
 // The socket file goes first, so that nobody new finds this listener,
 // and with it any link in /tmp that led there (os_endpoint).
+struct Loopback {
+    i32      fd;
+    Mailbox *mbox;
+    u32      type;
+    u64      id;
+    i64      by;  // ticks
+};
+
+static i64 loopleft(Loopback *l)  // ms
+{
+    i64 now = monotonic();
+    return l->by>now ? (l->by-now+999)/1000 : 0;
+}
+
+static void loopthread(void *arg)
+{
+    Loopback *l      = (Loopback *)arg;
+    Str       target = {};
+    char      buf[1<<13];
+    while (!target.data) {
+        struct pollfd p = {l->fd, POLLIN, 0};
+        i64 left = loopleft(l);
+        if (!left || poll(&p, 1, (int)left)<=0) {
+            break;
+        }
+        i32 c = accept(l->fd, 0, 0);
+        if (c < 0) {
+            continue;
+        }
+        iz len = 0;
+        while (len < (iz)sizeof(buf)) {
+            struct pollfd q = {c, POLLIN, 0};
+            if (poll(&q, 1, 5000) <= 0) {
+                break;
+            }
+            ssize_t n = read(c, buf+len, sizeof(buf)-(uz)len);
+            if (n <= 0) {
+                break;
+            }
+            len += n;
+            if (find(Str{(u8 *)buf, len}, "\r\n\r\n") >= 0) {
+                break;
+            }
+        }
+        Str t   = loopbacktarget(Str{(u8 *)buf, len});
+        Str ans = t.data ? loopbackpage : loopbackmissing;
+        (void)!write(c, ans.data, (uz)ans.len);
+        close(c);
+        target = t;
+    }
+    close(l->fd);
+    mailpost(l->mbox, l->type, l->id, target.data ? target : Str{}, 1);
+    free(l);
+}
+
+static b32 os_loopback(Os *os, Mailbox *mbox, u32 type, u64 id, i32 ms, i32 *port)
+{
+    i32 fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    struct sockaddr_in sa = {};
+    sa.sin_family      = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t salen    = sizeof(sa);
+    Loopback *l        = 0;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) || listen(fd, 4) ||
+            getsockname(fd, (struct sockaddr *)&sa, &salen) ||
+            !(l = (Loopback *)malloc(sizeof(Loopback)))) {
+        close(fd);
+        return 0;
+    }
+    l->fd   = fd;
+    l->mbox = mbox;
+    l->type = type;
+    l->id   = id;
+    l->by   = monotonic() + (i64)ms*1000;
+    if (!os_thread(os, loopthread, l)) {
+        close(fd);
+        free(l);
+        return 0;
+    }
+    *port = ntohs(sa.sin_port);
+    return 1;
+}
+
 static void os_unlisten(Os *, Listener *l)
 {
     struct sockaddr_un sa = l->addr;

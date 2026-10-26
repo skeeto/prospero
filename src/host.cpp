@@ -310,7 +310,7 @@ struct Host {
     HostCmd        *cmds;      // a ring of HOST_CMDS
     i32             cmdhead;
     i32             cmdlen;
-    HostCmd        *late;      // models commands, oldest first, apart
+    HostCmd        *late;      // late commands, oldest first, apart
     i32             latelen;   // from the ring, as they reply late
     i64             nextid;
     i64             idle;      // ticks of quiet before exiting
@@ -453,14 +453,15 @@ static void hostreply(Host *, HostClient *, Arena, i64, b32, Str, Str);
 // Send a command to the engine under a fresh id, the line as a parsed
 // object with id replaced, and with from and attended replaced where
 // given (from < 0 drops it). Null if too many wait already. A models
-// command replies once its endpoints answer, after those sent later, so
-// it waits apart from the ring, whose replies come in order; a full
-// list of them gives up on the oldest, whose reply must have been lost.
+// command replies once its endpoints answer, and mcp.auth and mcp.code
+// once their servers do, after those sent later, so each waits apart
+// from the ring, whose replies come in order; a full list of them gives
+// up on the oldest, whose reply must have been lost.
 static HostCmd *hostforward(Host *h, Arena scratch, Json *j, i32 cmd, i32 kind,
                             i64 from, i32 attended)
 {
     HostCmd *q = 0;
-    if (cmd == CMD_MODELS) {
+    if (cmd==CMD_MODELS || cmd==CMD_MCPAUTH || cmd==CMD_MCPCODE) {
         if (h->latelen == HOST_LATE) {
             HostCmd old = h->late[0];
             if (old.client) {

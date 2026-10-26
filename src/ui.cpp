@@ -6979,6 +6979,8 @@ static Str cfgkindlabel(Arena *a, Str kind, b32 plural)
         return "Defaults";
     } else if (kind=="ui" && !plural) {
         return "Interface";
+    } else if (kind == "mcp") {
+        return plural ? Str("MCP servers") : Str("MCP server");
     }
     Buf b(a, kind.len + 2);
     putbyte(&b, kind[0]>='a' && kind[0]<='z' ? (u8)(kind[0] - 'a' + 'A') : kind[0]);
@@ -7121,7 +7123,7 @@ static void drawcfglist(Gui *g, b32 combo)
         }
         Buf ab(&a, 64);
         print(&ab, "Add ");
-        print(&ab, kind);
+        print(&ab, kind=="mcp" ? Str("MCP server") : kind);
         print(&ab, "...");
         Rect at  = {};
         b32  add = cfgitem(g, combo, finish(&ab), 0, jsonstr(jsonget(k, "desc")),
@@ -7307,9 +7309,91 @@ static void drawcfgdiags(Gui *g)
     ImGui::PopTextWrapPos();
 }
 
+// An MCP server's state, on its page: as the main host's engine has it,
+// with Sign in and Sign out for one over HTTP, and Restart.
+static void drawmcp(Gui *g, Arena a, Str name)
+{
+    f32         sc  = g->scale;
+    ImGuiStyle &st  = ImGui::GetStyle();
+    b32         can = hostcan(g->main, "mcp.auth");
+    if (can) {
+        mcplisting(g);
+    }
+    Json *m       = mcpof(g, name);
+    Str   state   = jsonstr(jsonget(m, "state"));
+    b32   http    = jsonstr(jsonget(m, "url")).len || mcprow(g, name, "url").len;
+    b32   signed_ = jsonint(jsonget(m, "signedin"), 0) != 0;
+    u32   dot     = g->pal->dim;
+    Str   line    = mcpstatus(g, &a, name, &dot);
+    pushstr(concat(&a, "mcp ", name));
+    ImVec2 p  = ImGui::GetCursorScreenPos();
+    f32    lh = ImGui::GetTextLineHeight();
+    drawdot(ImGui::GetWindowDrawList(), v2(p.x + 4*sc, p.y + lh/2 + st.FramePadding.y),
+            3.5f*sc, dot);
+    ImGui::Dummy(v2(10*sc, 0));
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushTextWrapPos(0);
+    text(line);
+    ImGui::PopTextWrapPos();
+    itemnamed(g, concat(&a, "mcp state ", name));
+
+    Str busy = g->mcpname.len ? concat(&a, concat(&a, "Signing in to ", g->mcpname),
+                                       Str(" already")) : Str{};
+    if (http) {
+        Str why = !can ? Str("The engine is too old to sign in") : busy;
+        ImGui::BeginDisabled(why.len > 0);
+        b32 in = ImGui::SmallButton(signed_ ? "Sign in again" : "Sign in");
+        ImGui::EndDisabled();
+        itemnamed(g, concat(&a, "mcp signin ", name));
+        if (why.len) {
+            whytip(why);
+        } else {
+            ImGui::SetItemTooltip("Sign in through the browser, for a token the "
+                                  "server takes, kept in the state directory");
+        }
+        if (in) {
+            mcpsignin(g, name);
+        }
+        if (signed_) {
+            ImGui::SameLine();
+            b32 out = ImGui::SmallButton("Sign out");
+            itemnamed(g, concat(&a, "mcp signout ", name));
+            ImGui::SetItemTooltip("Forget the server's tokens");
+            if (out) {
+                mcpcmd(g, CMD_MCPLOGOUT, name);
+            }
+        }
+        ImGui::SameLine();
+    }
+    ImGui::BeginDisabled(!can || !m);
+    b32 again = ImGui::SmallButton("Restart");
+    ImGui::EndDisabled();
+    itemnamed(g, concat(&a, "mcp restart ", name));
+    ImGui::SetItemTooltip("%s", http ? "Connect to it again now"
+                                     : "Stop it, to start again for the next session "
+                                       "that uses it");
+    if (again) {
+        mcpcmd(g, CMD_MCPRESTART, name);
+    }
+    Str err = jsonstr(jsonget(m, "err"));
+    if (state=="failed" && err.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextWrapped("%s", cstr0(&a, err));
+        ImGui::PopStyleColor();
+    }
+    if (g->mcpmsg.len && g->mcpmsgfor==name) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->mcpbad ? g->pal->bad : g->pal->dim);
+        ImGui::TextWrapped("%s", cstr0(&a, g->mcpmsg));
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopID();
+}
+
 // The page shown: its section's name and what it is for, Delete for a
-// named one of the user's own file, Connect for a remote, its settings,
-// and a model's template argument.
+// named one of the user's own file, Connect for a remote, an MCP
+// server's state and sign-in, its settings, and a model's template
+// argument.
 static void drawcfgpage(Gui *g)
 {
     Arena       a  = g->frame;
@@ -7394,6 +7478,8 @@ static void drawcfgpage(Gui *g)
     }
     if (kind == "remote") {
         drawremote(g, a, name, RECT_PAGECONNECT);
+    } else if (kind=="mcp" && name.len) {
+        drawmcp(g, a, name);
     }
     ImGui::Spacing();
     if (named && !cfghas(g, kind, name)) {
@@ -7412,10 +7498,13 @@ static void cfgseed(Str kind, Str name, Str *key, Str *val)
 {
     *key = kind=="endpoint" ? Str("url") :
            kind=="model"    ? Str("reasoning") :
-           kind=="remote"   ? Str("ssh") : Str("tools");
+           kind=="remote"   ? Str("ssh") :
+           kind=="mcp"      ? Str("url") : Str("tools");
     *val = kind=="endpoint" ? Str("http://localhost/") :
            kind=="model"    ? Str("reasoning_content") :
-           kind=="remote"   ? name : Str("read write edit shell");
+           kind=="remote"   ? name :
+           kind=="mcp"      ? Str("https://mcp.example.com/mcp") :
+                              Str("read write edit shell");
 }
 
 // A new named section: its name, then its page.

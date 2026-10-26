@@ -169,6 +169,7 @@ enum : u32 {
     TASK_ATTACH,        // the attach dialog's image path, likewise
     TASK_BROWSED,       // the new session dialog's directory, likewise
     TASK_WSL,           // the installed WSL distros, a line each (wsllist)
+    TASK_MCPBACK,       // a sign-in's browser came back: its target (os_loopback)
 };
 
 // Item rectangles the scripted checklist aims at
@@ -1209,6 +1210,22 @@ struct Gui {
     Str                revealed;   // the file guishow showed last, for
     i64                reveals;    //   the checklist, and how many
     b32                realreveal; // the checklist's show the file manager
+    // MCP servers, as the main host's engine has them, for their pages
+    // in Settings (mcp), and a sign-in to one under way
+    Region            *mcpmem;     // the listing's, made anew each time
+    Json              *mcplist;    // its servers, null until one came
+    i64                mcplistid;  // a listing under way
+    i64                mcplistat;  // ms: the last one asked then
+    Str                mcpname;    // the server signing in, null if none
+    i64                mcpcmd;     // its mcp.auth or mcp.code under way
+    u64                mcpback;    // its loopback's records' id
+    Str                mcpmsg;     // how its sign-in went, for its page
+    Str                mcpmsgfor;  // whose page
+    b32                mcpbad;     // a failure, shown red
+    i64                mcpsignins; // signed in, for the checklist
+    Http              *mcpbrowser; // the checklist's stand-in browser
+    u64                mcpbrowseid;
+    Str                mcpnext;    // where its redirect goes
     b32                realterm;   // and its open terminals
     Proc              *edproc;
     u64                edid;
@@ -1814,6 +1831,271 @@ static b32 hostlist(Gui *g, GuiHost *h)
     h->listid = g->nextid;
     cmdsend(g, &w, a);
     return 1;
+}
+
+// MCP servers, for Settings: the main host's engine lists them (mcp),
+// at most every 2 s while a page of one shows, and signs in to one
+// over HTTP: the window listens on its loopback for the browser's
+// return (os_loopback), asks the engine for the URL to visit (mcp.auth)
+// with that as its redirect, opens the browser there, and hands what
+// comes back to the engine (mcp.code). The checklist's browser is a
+// stand-in, which fetches the URL and follows its redirect.
+
+static void mcplisting(Gui *g)
+{
+    i64 now = os_time(g->os);
+    if (g->mcplistid || !engineup(g) || !hostcan(g->main, "mcp.auth")) {
+        return;
+    } else if (g->mcplist && now-g->mcplistat < 2000) {
+        schedat(&g->sched, g->sched.now + (2000 - (now-g->mcplistat))*1000, DUE_CLOCK);
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 64);
+    EvOut w = cmdopen(g, &b, CMD_MCP, 0, g->main);
+    g->mcplistid = g->nextid;
+    g->mcplistat = now;
+    cmdsend(g, &w, a);
+}
+
+static void onmcplist(Gui *g, Str line, b32 ok)
+{
+    g->mcplistid = 0;
+    if (!ok) {
+        return;
+    }
+    Region *mem = os_reserve(g->os, (iz)1<<24);
+    if (!mem) {
+        return;
+    }
+    if (g->mcpmem) {
+        os_release(g->os, g->mcpmem);
+    }
+    Arena a = newarena(mem);
+    g->mcpmem  = mem;
+    g->mcplist = jsonget(jsonparse(&a, clone(&a, line)).root, "servers");
+    scheddirty(&g->sched);
+}
+
+// A server of the listing, by name, or null.
+static Json *mcpof(Gui *g, Str name)
+{
+    for (Json *s = g->mcplist ? g->mcplist->child : 0; s; s = s->next) {
+        if (jsonstr(jsonget(s, "name"))==name && jsonstr(jsonget(s, "source"))=="config") {
+            return s;
+        }
+    }
+    return 0;
+}
+
+// A value an [mcp NAME] section sets, null if none.
+static Str mcprow(Gui *g, Str name, Str key)
+{
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind=="mcp" && r->name==name && r->key==key && !r->isdflt && r->valid) {
+            return r->value;
+        }
+    }
+    return {};
+}
+
+// Its state, as its page puts it (and the checklist reads it), with
+// its dot's color.
+static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
+{
+    Json *m      = mcpof(g, name);
+    Str   state  = jsonstr(jsonget(m, "state"));
+    b32   http   = jsonstr(jsonget(m, "url")).len || mcprow(g, name, "url").len;
+    i64   tools  = jsonint(jsonget(m, "tools"), 0);
+    Buf   b(a, 256);
+    print(&b, name);
+    print(&b, ": ");
+    *dot = g->pal->dim;
+    if (!hostcan(g->main, "mcp.auth")) {
+        print(&b, "the engine is too old to show it");
+    } else if (!m) {
+        print(&b, g->mcplist ? Str("not in the configuration the engine has") : Str("..."));
+    } else if (state == "ready") {
+        print(&b, "running, ");
+        print(&b, tools);
+        print(&b, tools==1 ? Str(" tool") : Str(" tools"));
+        *dot = g->pal->ok;
+    } else if (state == "starting") {
+        print(&b, "starting");
+        *dot = g->pal->amber;
+    } else if (state == "auth") {
+        print(&b, "needs you to sign in");
+        *dot = g->pal->amber;
+    } else if (state == "failed") {
+        print(&b, "failed");
+        *dot = g->pal->bad;
+    } else {
+        print(&b, "not running: it starts for a session that uses it");
+    }
+    if (m && http && state!="auth") {
+        print(&b, jsonint(jsonget(m, "signedin"), 0) ? Str("; signed in")
+                                                    : Str("; not signed in"));
+    }
+    return finish(&b);
+}
+
+static void mcpsay(Gui *g, Str name, Str msg, b32 bad)
+{
+    g->mcpmsg    = clone(&g->perm, msg);
+    g->mcpmsgfor = clone(&g->perm, name);
+    g->mcpbad    = bad;
+    guilog(g, concat(&g->frame, concat(&g->frame, name, ": "), msg));
+    scheddirty(&g->sched);
+}
+
+// A sign-in that ended, however it went.
+static void mcpsigned(Gui *g, Str msg, b32 bad)
+{
+    Str name = g->mcpname;
+    g->mcpname = {};
+    g->mcpcmd  = 0;
+    g->mcpback++;  // a late return is no longer this one's
+    if (g->mcpbrowser) {
+        os_httpcancel(g->os, g->mcpbrowser);
+        os_httpfree(g->os, g->mcpbrowser);
+        g->mcpbrowser = 0;
+    }
+    mcpsay(g, name, msg, bad);
+    g->mcplistat = 0;  // listed again at once
+}
+
+static void mcpbrowse(Gui *g, Str url)
+{
+    if (g->mcpbrowser) {
+        os_httpfree(g->os, g->mcpbrowser);
+    }
+    Arena   a = g->frame;
+    HttpReq r = {};
+    r.method    = "GET";
+    r.url       = url;
+    r.connectms = 5000;
+    r.maxbytes  = 1<<16;
+    r.mbox      = g->tasks;
+    r.id        = g->mcpbrowseid = ++g->nextid;
+    g->mcpnext    = {};
+    g->mcpbrowser = os_http(g->os, &r, a);
+    if (!g->mcpbrowser) {
+        mcpsigned(g, "the checklist's browser could not fetch the page", 1);
+    }
+}
+
+static void mcpsignin(Gui *g, Str name)
+{
+    if (g->mcpname.len) {
+        return;
+    }
+    i32 port = 0;
+    u64 back = ++g->mcpback;
+    if (!os_loopback(g->os, g->tasks, TASK_MCPBACK, back, 10*60*1000, &port)) {
+        mcpsay(g, name, "Cannot listen on this computer's loopback for the browser", 1);
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   r(&a, 64);
+    print(&r, "http://127.0.0.1:");
+    print(&r, (i64)port);
+    print(&r, "/callback");
+    Buf   b(&a, 256);
+    EvOut w = cmdopen(g, &b, CMD_MCPAUTH, 0, g->main);
+    putkey(&w.json, "name");
+    putstr(&w.json, name);
+    putkey(&w.json, "redirect");
+    putstr(&w.json, finish(&r));
+    g->mcpname = clone(&g->perm, name);
+    g->mcpcmd  = g->nextid;
+    mcpsay(g, name, "Asking the server where to sign in...", 0);
+    cmdsend(g, &w, a);
+}
+
+// mcp.auth's reply: the browser sent to sign in.
+static void onmcpauth(Gui *g, Json *j, b32 ok, Str err)
+{
+    Str url = jsonstr(jsonget(j, "url"));
+    if (!ok || !url.len) {
+        mcpsigned(g, err.len ? err : Str("the engine gave no page to sign in at"), 1);
+        return;
+    }
+    g->mcpcmd = 0;
+    mcpsay(g, g->mcpname, "Sign in in the browser, which then comes back here", 0);
+    if (g->drive && !g->realreveal) {
+        mcpbrowse(g, url);
+    } else if (!os_guiopenurl(g->os, g->frame, url)) {
+        mcpsigned(g, concat(&g->frame, "the browser could not be opened: visit ", url), 1);
+    }
+}
+
+// The browser came back to the loopback, or never did.
+static void mcpback(Gui *g, Record r)
+{
+    if (r.id!=g->mcpback || !g->mcpname.len) {
+        return;
+    } else if (!r.data.len) {
+        mcpsigned(g, "nobody signed in within 10 minutes", 1);
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Str   q = cut(r.data, '?').tail;
+    Buf   b(&a, 512 + q.len);
+    EvOut w = cmdopen(g, &b, CMD_MCPCODE, 0, g->main);
+    putkey(&w.json, "name");
+    putstr(&w.json, g->mcpname);
+    Str keys[] = {"code", "state", "error", "error_description"};
+    for (iz i = 0; i < countof(keys); i++) {
+        Str v = mcpquery(&a, q, keys[i]);
+        if (v.data) {
+            putkey(&w.json, keys[i]);
+            putstr(&w.json, v);
+        }
+    }
+    g->mcpcmd = g->nextid;
+    mcpsay(g, g->mcpname, "Signing in...", 0);
+    cmdsend(g, &w, a);
+}
+
+static void onmcpcode(Gui *g, b32 ok, Str err)
+{
+    if (ok) {
+        g->mcpsignins++;
+    }
+    mcpsigned(g, ok ? Str("Signed in") : err, !ok);
+}
+
+// The stand-in browser's records: a redirect followed once.
+static void mcpbrowsed(Gui *g, Record r)
+{
+    if (r.id != g->mcpbrowseid) {
+        return;
+    } else if (r.type == HTTP_HEAD) {
+        i32 status = get32(r.data);
+        Str to     = trim(headervalue(cuthead(r.data, 4), "Location"));
+        g->mcpnext = status/100==3 && to.len ? clone(&g->perm, to) : Str{};
+    } else if (r.type == HTTP_DONE) {
+        if (g->mcpnext.len) {
+            mcpbrowse(g, g->mcpnext);
+        } else if (g->mcpbrowser) {
+            os_httpfree(g->os, g->mcpbrowser);
+            g->mcpbrowser = 0;
+        }
+    }
+}
+
+// Sign out, or start again: then listed again.
+static void mcpcmd(Gui *g, i32 cmd, Str name)
+{
+    g->mcpmsg    = {};
+    g->mcpmsgfor = clone(&g->perm, name);
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256);
+    EvOut w = cmdopen(g, &b, cmd, 0, g->main);
+    putkey(&w.json, "name");
+    putstr(&w.json, name);
+    cmdsend(g, &w, a);
 }
 
 // A host's answer to hostlist, kept anew only when it changed. A failed
@@ -3990,6 +4272,30 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         if (q.h && q.h->listid==id) {
             onhostlist(g, q.h, scratch, j, ok);  // a failure keeps the last
         }
+        return;
+
+    case CMD_MCP:
+        if (id == g->mcplistid) {
+            onmcplist(g, line, ok);
+        }
+        return;
+    case CMD_MCPAUTH:
+        if (id==g->mcpcmd && g->mcpname.len) {
+            onmcpauth(g, j, ok, err);
+        }
+        return;
+    case CMD_MCPCODE:
+        if (id==g->mcpcmd && g->mcpname.len) {
+            onmcpcode(g, ok, err);
+        }
+        return;
+    case CMD_MCPLOGOUT:
+    case CMD_MCPRESTART:
+        if (!ok) {
+            mcpsay(g, g->mcpmsgfor, err, 1);
+        }
+        g->mcplistat = 0;
+        scheddirty(&g->sched);
         return;
 
     case CMD_CONFIGGET:
@@ -6317,6 +6623,14 @@ static void ontask(Gui *g, Record r)
         return;
     case TASK_WSL:
         wslgot(g, r.data);
+        return;
+    case TASK_MCPBACK:
+        mcpback(g, r);
+        return;
+    case HTTP_HEAD:
+    case HTTP_BODY:
+    case HTTP_DONE:
+        mcpbrowsed(g, r);
         return;
     case TASK_DEPLOYED: {
         GuiHost *h = 0;
@@ -8870,6 +9184,9 @@ enum : i32 {
     CHK_NEWLISTED,    // the new session dialog's remote host listed its
                       // models, with the dialog open all along
     CHK_WSLCWD,       // C:\Users\ typed for the WSL host rw is the distro's
+    CHK_MCPSTATE,     // the MCP server web's page says text
+    CHK_MCPSIGNED,    // the sign-in to web succeeded, once, through the browser
+    CHK_MCPCALL,      // the session's call to web's echo tool came back
     CHK_COUNT,
 };
 
@@ -9093,6 +9410,8 @@ static Str chknames[] = {
     "the WSL distro's Settings wrote a section of its own for it",
     "the dialog's remote host's models came, the dialog open all along",
     "a Windows path typed for a WSL distro became the distro's",
+    "the MCP server's page says what it is", "signed in through the browser",
+    "the MCP server's tool answered the session",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9157,6 +9476,8 @@ enum : i32 {
     W_NAMEDUP,    // the remote named by text is up
     W_NAMEDCLOSED,// the remote named by text is closed
     W_NAMEDUPDATED,// the remote named by text is updated, or failed to be
+    W_MCPSTATE,   // the MCP server web's page says what text begins
+    W_MCPSIGNED,  // a sign-in to an MCP server ended
 };
 
 static Str waitnames[] = {
@@ -9175,9 +9496,9 @@ static Str waitnames[] = {
     "the side chat", "the WSL distros", "the WSL distro to fail",
     "the WSL distro's section", "the dialog's host's models",
     "the named remote to come up", "the named remote to close",
-    "the named remote's update",
+    "the named remote's update", "the MCP server's state", "the MCP sign-in",
 };
-static_assert(countof(waitnames) == W_NAMEDUPDATED+1);
+static_assert(countof(waitnames) == W_MCPSIGNED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -11412,6 +11733,59 @@ static DriveOp remoteops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// MCP (--mcp, tests/gui.py --mode mcp): the page of [mcp web], a fake
+// server over HTTP that wants a sign-in, says it is not signed in; Sign
+// in, through the checklist's stand-in browser, signs in; a session's
+// call to its echo tool goes through, which the page shows running;
+// Sign out leaves it needing a sign-in.
+static DriveOp mcpops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    SHOWPANE("Settings"),
+    {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 5000, ""},
+    // Narrow, its pages in a combo: opened, then the page picked
+    {OP_SHOWPAGE, 0, 0, 0, 300, "mcp web"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "mcp web"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "mcp web"},
+    {OP_MOVE, T_PAGEITEM, 0, 0, 100, "mcp web"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "mcp web"},
+    {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: not running"},
+    {OP_CHECK, CHK_MCPSTATE, 0, 0, 0,
+     "web: not running: it starts for a session that uses it; not signed in"},
+    {OP_SHOT, 0, 0, 0, 300, "mcp-1-page"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "mcp signin web"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_MCPSIGNED, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_MCPSIGNED, 0, 0, 0, ""},
+    {OP_WAIT, W_MCPSTATE, 0, 0, 10000,
+     "web: not running: it starts for a session that uses it; signed in"},
+    {OP_SHOT, 0, 0, 0, 300, "mcp-2-signed"},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Call the MCP server."},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    {OP_MARK, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_MCPCALL, 0, 0, 0, ""},
+    {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: running, "},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "mcp signout web"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: needs you to sign in"},
+    {OP_SHOT, 0, 0, 0, 300, "mcp-3-signedout"},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // Plan mode (--plan): a new session in plan mode from its dialog, the
 // chip in its bar; the agent refused a change, asking to approve its
 // plan, which the Plan window shows, its text selected and copied, the
@@ -12853,6 +13227,12 @@ static b32 drivewaitdone(Gui *g)
         GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
         return h && !h->r && h->state==RS_CLOSED;
     }
+    case W_MCPSTATE: {
+        u32 dot = 0;
+        return startswith(mcpstatus(g, &g->frame, "web", &dot), g->ops[g->drivepc-1].text);
+    }
+    case W_MCPSIGNED:
+        return !g->mcpname.len && g->mcpmsgfor=="web" && g->mcpmsg.len;
     case W_NAMEDUPDATED: {
         GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
         return h && (h->updating==UPD_FAILED ||
@@ -14654,6 +15034,23 @@ static b32 drivecheck(Gui *g, i32 chk)
         return cfghas(g, "remote", "Deb") && remoterow(g, "Deb", "wsl")=="Deb" &&
                !remoterow(g, "Deb", "list").len && !wslautohost(g, "Deb") &&
                remoteset(g, "Deb", "wsl")=="Deb" && g->cfgpname=="Deb";
+    case CHK_MCPSTATE: {
+        u32 dot = 0;
+        return mcpstatus(g, &g->frame, "web", &dot) == g->ops[g->drivepc-1].text;
+    }
+    case CHK_MCPSIGNED:
+        return g->mcpsignins==1 && g->mcpmsg=="Signed in" && !g->mcpbad;
+    case CHK_MCPCALL: {
+        GuiSession *s = g->sess;
+        View       *v = s ? s->view : 0;
+        for (iz i = 0; v && i < v->msgs.len; i++) {
+            ViewMsg *m = &v->msgs[i];
+            if (m->role==VIEW_TOOL && m->tool->name=="mcp__web__echo") {
+                return m->tool->status == VTOOL_OK;
+            }
+        }
+        return 0;
+    }
     case CHK_WSLCWD: {
         Str f = {(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)};
         return g->newhost && g->newhost->name=="rw" && hostwsl(g, g->newhost) &&
@@ -15387,7 +15784,7 @@ static void drivestep(Gui *g)
 static b32 guiwanted(Str *args, i32 nargs)
 {
     static Str const cmds[] = {
-        "run", "serve", "attach", "hosts", "connect", "deploy", "eval",
+        "run", "serve", "attach", "hosts", "connect", "deploy", "eval", "mcp",
     };
     if (nargs<2 || args[1]=="gui") {
         return 1;
@@ -15521,6 +15918,8 @@ static Str guiusage =
 "  --compose-again  its drafts after a restart, in the same directories\n"
 "  --plan         plan mode's checklist: the dialog, the plan's ask, the\n"
 "                 Plan window, the toggle and /plan\n"
+"  --mcp          an MCP server's page in Settings: its state, Sign in\n"
+"                 (a stand-in browser), a call from a session, Sign out\n"
 "  --launch       prospero DIR's checklist: DIR's session, another launch's\n"
 "                 handed off (tests/gui.py drives it), a session with no folder\n"
 "  --firstrun     a first run's layout, with nothing configured (with\n"
@@ -15699,7 +16098,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
-    b32 launch = 0, first = 0;
+    b32 launch = 0, first = 0, mcp = 0;
     i64 history = 0;
     Str opendir = {};  // prospero DIR, as given
     i32 bench   = 0;
@@ -15742,6 +16141,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             launch = probe = 1;
         } else if (a == "--plan") {
             plan = probe = 1;
+        } else if (a == "--mcp") {
+            mcp = probe = 1;
         } else if (a == "--firstrun") {
             first = probe = 1;
         } else if (a == "--compose-again") {
@@ -15810,9 +16211,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
             background || attach || remote || compose || sidebar || plan || launch ||
-            first) {
+            first || mcp) {
         g->drive = 1;
-        if (first) {
+        if (mcp) {
+            g->ops  = mcpops;
+            g->nops = countof(mcpops);
+        } else if (first) {
             g->ops  = firstops;
             g->nops = countof(firstops);
         } else if (launch) {

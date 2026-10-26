@@ -317,6 +317,7 @@ W32(uz,     GetModuleHandleW(c16 *));
 W32(i32,    ResumeThread(uz));
 W32(i32,    SetErrorMode(i32));
 W32(b32,    SetHandleInformation(uz, i32, i32));
+W32(uz,     LoadLibraryW(c16 *));
 W32(b32,    SetInformationJobObject(uz, i32, void *, i32));
 W32(b32,    TerminateJobObject(uz, i32));
 W32(b32,    TerminateProcess(uz, i32));
@@ -2504,6 +2505,151 @@ static void listenthread(void *arg)
         newconn(&os, h, l->mbox, ++l->nextid, 1);
     }
     listenrelease(l);
+}
+
+// The loopback listener (os_loopback) through Winsock, loaded at run
+// time so that the engine imports no more than it did.
+struct WsAddr {
+    c16 family;
+    c16 port;  // network order
+    u32 addr;
+    u8  zero[8];
+};
+
+struct WsSet {
+    u32 count;
+    uz  socks[1];
+};
+
+struct WsTime {
+    i32 sec;
+    i32 usec;
+};
+
+struct Winsock {
+    i32 (__stdcall *startup)(c16, void *);
+    uz  (__stdcall *socket)(i32, i32, i32);
+    i32 (__stdcall *bind)(uz, WsAddr *, i32);
+    i32 (__stdcall *listen)(uz, i32);
+    i32 (__stdcall *getsockname)(uz, WsAddr *, i32 *);
+    i32 (__stdcall *select)(i32, WsSet *, WsSet *, WsSet *, WsTime *);
+    uz  (__stdcall *accept)(uz, WsAddr *, i32 *);
+    i32 (__stdcall *recv)(uz, u8 *, i32, i32);
+    i32 (__stdcall *send)(uz, u8 *, i32, i32);
+    i32 (__stdcall *closesocket)(uz);
+};
+
+static Winsock *winsock()
+{
+    static Winsock ws;
+    static i32     state;  // 0 unknown, 1 ready, -1 missing
+    if (!state) {
+        uz   dll = LoadLibraryW((c16 *)u"ws2_32.dll");
+        u8   data[1024];
+        void **f = (void **)&ws;
+        static char const *const names[] = {
+            "WSAStartup", "socket", "bind", "listen", "getsockname", "select",
+            "accept", "recv", "send", "closesocket",
+        };
+        state = dll ? 1 : -1;
+        for (iz i = 0; state==1 && i < countof(names); i++) {
+            f[i]  = GetProcAddress(dll, (char *)names[i]);
+            state = f[i] ? 1 : -1;
+        }
+        state = state==1 && !ws.startup(0x0202, data) ? 1 : -1;
+    }
+    return state==1 ? &ws : 0;
+}
+
+struct Loopback {
+    Os      *os;
+    uz       sock;
+    Mailbox *mbox;
+    u32      type;
+    u64      id;
+    i64      by;  // ticks
+};
+
+// Wait up to ms for a socket to be readable.
+static b32 wsready(Winsock *ws, uz sock, i64 ms)
+{
+    WsSet  set = {1, {sock}};
+    WsTime t   = {(i32)(ms/1000), (i32)(ms%1000*1000)};
+    return ws->select(0, &set, 0, 0, &t) > 0;
+}
+
+static void loopthread(void *arg)
+{
+    Loopback *l      = (Loopback *)arg;
+    Winsock  *ws     = winsock();
+    Str       target = {};
+    u8        buf[1<<13];
+    while (!target.data) {
+        i64 left = (l->by - os_ticks(l->os)) / 1000;
+        if (left<=0 || !wsready(ws, l->sock, left)) {
+            break;
+        }
+        uz c = ws->accept(l->sock, 0, 0);
+        if (c == (uz)-1) {
+            continue;
+        }
+        iz len = 0;
+        while (len<(iz)sizeof(buf) && wsready(ws, c, 5000)) {
+            i32 n = ws->recv(c, buf+len, (i32)(sizeof(buf)-(uz)len), 0);
+            if (n <= 0) {
+                break;
+            }
+            len += n;
+            if (find(Str{buf, len}, "\r\n\r\n") >= 0) {
+                break;
+            }
+        }
+        Str t   = loopbacktarget(Str{buf, len});
+        Str ans = t.data ? loopbackpage : loopbackmissing;
+        ws->send(c, ans.data, (i32)ans.len, 0);
+        ws->closesocket(c);
+        target = t;
+    }
+    ws->closesocket(l->sock);
+    mailpost(l->mbox, l->type, l->id, target.data ? target : Str{}, 1);
+    HeapFree(GetProcessHeap(), 0, l);
+}
+
+static b32 os_loopback(Os *os, Mailbox *mbox, u32 type, u64 id, i32 ms, i32 *port)
+{
+    Winsock *ws = winsock();
+    if (!ws) {
+        return 0;
+    }
+    uz sock = ws->socket(2, 1, 6);  // AF_INET, SOCK_STREAM, IPPROTO_TCP
+    if (sock == (uz)-1) {
+        return 0;
+    }
+    SetHandleInformation(sock, HANDLE_FLAG_INHERIT, 0);
+    WsAddr    sa  = {};
+    i32       len = sizeof(sa);
+    Loopback *l   = 0;
+    sa.family = 2;
+    sa.addr   = 0x0100007f;  // 127.0.0.1, in network order
+    if (ws->bind(sock, &sa, sizeof(sa)) || ws->listen(sock, 4) ||
+            ws->getsockname(sock, &sa, &len) ||
+            !(l = (Loopback *)HeapAlloc(GetProcessHeap(), 0, sizeof(Loopback)))) {
+        ws->closesocket(sock);
+        return 0;
+    }
+    l->os   = os;
+    l->sock = sock;
+    l->mbox = mbox;
+    l->type = type;
+    l->id   = id;
+    l->by   = os_ticks(os) + (i64)ms*1000;
+    if (!os_thread(os, loopthread, l)) {
+        ws->closesocket(sock);
+        HeapFree(GetProcessHeap(), 0, l);
+        return 0;
+    }
+    *port = (i32)((sa.port&0xff)<<8 | sa.port>>8);
+    return 1;
 }
 
 static Listener *os_listen(Os *os, Arena scratch, Str endpoint, Mailbox *mbox)

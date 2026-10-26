@@ -58,7 +58,10 @@ launch with one hands off to it as a new session shown, an open event makes anot
 and the new session dialog one with no folder, and one in a directory
 completed as typed (Tab, Esc, Down, Enter, a click); then, here on POSIX,
 two launches with no window both detach at once, leaving one window
-with both sessions, which is then told to quit.
+with both sessions, which is then told to quit. The mcp mode shows an
+MCP server's page in Settings, a fake server over HTTP that wants a
+sign-in: Sign in, through the window's stand-in browser, then a call
+from a session, which sends the token it got, then Sign out.
 
 Every checklist starts as a first run, its state directory fresh: the
 window at its first size, and Help in front, then Reset layout. The
@@ -1421,7 +1424,8 @@ def main():
     ap.add_argument("--mode", default="drive",
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
-                             "compose", "sessions", "plan", "launch", "firstrun"])
+                             "compose", "sessions", "plan", "launch", "firstrun",
+                             "mcp"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1502,6 +1506,19 @@ def main():
             host.write(editor, PLAN_EDITOR)
             extra += f"\n# Edit plan's editor, a test script\n[ui]\neditor = sh {shword(editor)}\n"
         before = config(curl, model, 60, extra)
+    elif args.mode == "mcp":
+        # A fake MCP server over HTTP that wants a sign-in (OAuth), here,
+        # where the window's stand-in browser fetches from
+        if args.host:
+            ap.error("--mode mcp runs only here: its fake server listens on this machine")
+        mcpsrv = subprocess.Popen(
+            [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "fake_mcp.py"), "--http", "--oauth"],
+            stdout=subprocess.PIPE, text=True,
+            env={**os.environ, "FAKE_MCP_LOG": host.path("mcp.log")})
+        mcpport = int(mcpsrv.stdout.readline())
+        before = config(curl, model, 60,
+                        f"\n[mcp web]\nurl = http://127.0.0.1:{mcpport}/mcp\ntrust = yes\n")
     elif args.mode == "sessions":
         # A model to switch to; a remote listed always, never reached,
         # and one listed only while connected
@@ -1629,8 +1646,21 @@ def main():
         else:
             print(f"the URL include was fetched {fetched} times")
         problems += far.close(args.keep)
+    if args.mode == "mcp":
+        mcpsrv.terminate()
+        mcpsrv.wait(5)
+        log = [json.loads(l) for l in (host.read(host.path("mcp.log")) or "").splitlines()]
+        grants = [m.get("grant_type") for m in log if m.get("_oauth") == "/as/token"]
+        if grants != ["authorization_code"]:
+            problems.append(f"the token requests: {grants}")
+        calls = [m for m in log if m.get("method") == "tools/call"]
+        if len(calls) != 1 or not (calls[0]["_http"].get("Authorization") or "").startswith(
+                "Bearer at-"):
+            problems.append(f"the call, with its token: {calls}")
+        else:
+            print("mcp: signed in through the stand-in browser, the call sent its token")
     if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
-                     "firstrun"):
+                     "firstrun", "mcp"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")

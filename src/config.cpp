@@ -516,6 +516,14 @@ static CfgKey cfgschema[] = {
     {"mcp", "token", CFG_SECRET, "", {}, {}, "mcp",
      "A url's bearer token, as env:NAME, for servers that take one in "
      "place of signing in"},
+    {"mcp", "client_id", CFG_STRING, "", {}, {}, "mcp",
+     "Signing in to a url: the OAuth client to sign in as, for servers that "
+     "do not register clients themselves"},
+    {"mcp", "client_secret", CFG_SECRET, "", {}, {}, "mcp",
+     "That client's secret, as env:NAME, if it has one"},
+    {"mcp", "scope", CFG_STRING, "", {}, {}, "mcp",
+     "Signing in: the scopes to ask for, separated by blanks, by default "
+     "those the server names"},
     {"mcp", "cwd", CFG_STRING, "", {}, {}, "mcp",
      "Where the command runs, by default the session's folder"},
     {"mcp", "env.", CFG_STRING, "", {}, {}, "mcp",

@@ -1420,6 +1420,11 @@ static b32 os_guireveal(Os *, Arena scratch, Str dir)
     return SDL_OpenURL(fileurl(&scratch, dir));
 }
 
+static b32 os_guiopenurl(Os *, Arena scratch, Str url)
+{
+    return SDL_OpenURL(cstr(&scratch, url));
+}
+
 #if defined(__APPLE__)
 extern "C" void *objc_autoreleasePoolPush();
 extern "C" void  objc_autoreleasePoolPop(void *);
