@@ -1815,7 +1815,12 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     i32 flags = CREATE_SUSPENDED | CREATE_NO_WINDOW |
                 CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP |
                 os->breakaway;
+    // Held until the child is in its job: exiting takes it too, so no
+    // child is left suspended outside one, holding what it inherited
     EnterCriticalSection(&os->spawn);
+    for (i32 fd = 0; fd < 3; fd++) {
+        SetHandleInformation(os->std[fd], HANDLE_FLAG_INHERIT, 0);  // as in detach
+    }
     SetHandleInformation(si.input, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     SetHandleInformation(si.output, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     SetHandleInformation(si.error, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
@@ -1823,18 +1828,20 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     i32 err = GetLastError();
     uz child[] = {nul, pw, ir, io ? file : 0};
     closeall(child, countof(child));
-    LeaveCriticalSection(&os->spawn);
     if (io) {
         file    = 0;
         mine[1] = 0;
     }
     if (!ok) {
+        LeaveCriticalSection(&os->spawn);
         closeall(mine, countof(mine));
         SetLastError(err);
         return 0;
     }
-    if (job && !AssignProcessToJobObject(job, pi.process)) {
-        err = GetLastError();
+    b32 joined = !job || AssignProcessToJobObject(job, pi.process);
+    err = GetLastError();
+    LeaveCriticalSection(&os->spawn);
+    if (!joined) {
         TerminateProcess(pi.process, 1);
         uz hs[] = {pi.thread, pi.process};
         closeall(hs, countof(hs));
@@ -3478,6 +3485,14 @@ static void guiconsole(Os *os)
 // The desktop helper, "prospero desktop" (deskwin32.cpp), which never returns
 extern "C" [[noreturn]] void prospero_desktop();
 
+// Exits once no spawn is under way, so that each child is in its job,
+// whose closing then ends it
+[[noreturn]] static void osexit(Os *os, i32 code)
+{
+    EnterCriticalSection(&os->spawn);
+    ExitProcess(code);
+}
+
 #if PROSPERO_GUI
 // GUI builds start in the CRT, whose wWinMain (gui_win32.cpp) calls this.
 extern "C" void prospero_main()
@@ -3521,9 +3536,9 @@ void mainCRTStartup()
     }
     #if PROSPERO_GUI
     if (guiwanted(args.data, (i32)args.len)) {
-        ExitProcess(gui_main(&os, a, args.data, (i32)args.len));
+        osexit(&os, gui_main(&os, a, args.data, (i32)args.len));
     }
     guiconsole(&os);
     #endif
-    ExitProcess(app_main(&os, a, args.data, (i32)args.len));
+    osexit(&os, app_main(&os, a, args.data, (i32)args.len));
 }
