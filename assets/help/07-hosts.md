@@ -36,6 +36,23 @@ the connection. ssh runs in batch mode, so it cannot ask for a
 password: use a key, or an ssh agent. A connection that breaks is
 taken up again, and the host keeps your place for three hours.
 
+## WSL distros
+
+On Windows, each installed WSL distro is a remote host by itself, named
+after it ("Debian (WSL)"), reached through `wsl.exe` rather than ssh:
+nothing to set up in the distro but an engine, which deploying puts
+there as for any Linux machine (with `cat`, as a distro has no scp).
+Look again in the Hosts pane lists them anew. Docker Desktop's own
+distros are left out. An unconfigured distro shows in the sidebar only
+while connected; its Settings button in the Hosts pane gives it a
+`[remote NAME]` section with `wsl = DISTRO`, to change its settings.
+A section with `wsl = DISTRO` in place of `ssh` names one yourself,
+under another name, and `prospero connect NAME` and `prospero deploy
+NAME` take a distro's name too. The engine runs in the distro's home
+directory; Windows' drives are under `/mnt`, as `/mnt/c`.
+
+## Sessions on a remote
+
 A host's menu in the sidebar also has New session here... and Import
 session here.... A remote's sessions use the models of its own
 configuration. With `list = connected` in its section, a remote is

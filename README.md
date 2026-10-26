@@ -650,7 +650,13 @@ outlives the ssh session. A link that breaks is taken up again from
 where it was, and the host keeps a client's place for three hours. A
 window closed with "Keep running in background" makes its own process
 such a host, and keeps the state directory, so a later launch brings
-that window back. A window on a state directory that `prospero serve`
+that window back. On Windows, a WSL distro is a remote too, reached
+through `wsl.exe -d DISTRO --cd ~ --exec /bin/sh -c ...` instead of
+ssh: every installed distro is listed (`wsl.exe -l -q`) as a remote of
+its own name, Docker Desktop's left out, and a section with `wsl =
+DISTRO` in place of `ssh` names one. Deploying into a distro sends the
+engine on `cat`'s input, as it has no scp, and records it as
+`wsl:DISTRO`. A window on a state directory that `prospero serve`
 hosts lists the sessions the host holds and attaches to them.
 
 A remote machine needs an engine built for its platform, which

@@ -2,6 +2,7 @@
 //
 //   prospero connect NAME [options]            a [remote NAME] host
 //   prospero connect --ssh DEST [options]      a host over ssh
+//   prospero connect --wsl DISTRO [options]    a host in a WSL distro
 //   prospero connect --local [options]         this machine's host
 //   prospero connect --endpoint EP [options]   the one at EP, if it runs
 //
@@ -16,6 +17,9 @@
 //
 // where -- ends ssh's options for good: without it, ssh reads options
 // again after HOST, and a PATH like -oProxyCommand=... would run here.
+// In a WSL distro, wsl.exe runs it instead (linkargv, deploy.cpp):
+//
+//   wsl.exe -d DISTRO --cd ~ --exec /bin/sh -c 'PATH attach'
 //
 // spawned through os_spawnio, or for this machine's own host a local
 // connection (os_connect), starting the host when none runs. A stream
@@ -117,7 +121,8 @@ static Str remoteneeds[] = {"", "missing", "mismatch"};
 struct RemoteConf {
     Str name;      // the remote's name, in the sessions list
     Str ssh;       // destination for ssh, empty for this machine's host
-    Str program;   // the ssh program, "ssh" if empty
+    Str wsl;       // else a WSL distro, reached through wsl.exe
+    Str program;   // the ssh or wsl.exe program, by name if empty
     Str path;      // the harness there, "prospero" if empty
     Str state;     // its state directory there (--state), if not its own
     Str rconfig;   // its configuration file there (-c), if not its own
@@ -374,7 +379,7 @@ static b32 remotestart(Remote *r, Arena scratch)
         r->live = 1;
         linkconnect(&r->link, now);
         return 1;
-    } else if (!r->conf.ssh.len) {
+    } else if (!r->conf.ssh.len && !r->conf.wsl.len) {
         Str state    = r->conf.localstate;
         Str run      = join(&scratch, state, "run");
         Str name     = hostname(&scratch, HOST_PROTO);
@@ -403,7 +408,8 @@ static b32 remotestart(Remote *r, Arena scratch)
     // The harness there: configured, or deployed for this protocol
     Str path = r->conf.path;
     if (!path.len) {
-        DeployRec dr = deployrecord(os, &scratch, r->conf.localstate, r->conf.ssh);
+        Str       dest = linkdest(&scratch, r->conf.ssh, r->conf.wsl);
+        DeployRec dr   = deployrecord(os, &scratch, r->conf.localstate, dest);
         path = dr.ok && dr.proto==HOST_PROTO ? dr.path : Str("prospero");
     }
     Buf cmd(&scratch, 256);
@@ -429,29 +435,19 @@ static b32 remotestart(Remote *r, Arena scratch)
                                  "a control character, or a backslash doubled or at "
                                  "its end, which its shell cannot take");
         return 0;
-    } else if (r->conf.ssh[0] == '-') {
-        // ssh would take it for an option, which may run a command here
-        r->why = clone(&r->perm, "an ssh destination cannot begin with -");
+    } else if (linkbad(r->conf.ssh, r->conf.wsl).len) {
+        r->why = clone(&r->perm, linkbad(r->conf.ssh, r->conf.wsl));
         return 0;
     }
-    Slice<Str> argv = {};
-    argv = push(&scratch, argv, r->conf.program.len ? r->conf.program : Str("ssh"));
-    argv = push(&scratch, argv, Str("-T"));
-    for (iz i = 0; i < countof(deployopts); i++) {
-        argv = push(&scratch, argv, deployopts[i]);
-    }
-    argv = push(&scratch, argv, Str("-o"));
-    argv = push(&scratch, argv, Str("EscapeChar=none"));
-    argv = push(&scratch, argv, Str("--"));
-    argv = push(&scratch, argv, r->conf.ssh);
-    argv = push(&scratch, argv, cuthead(finish(&cmd), 1));
+    Slice<Str> argv = linkargv(&scratch, r->conf.program, r->conf.ssh, r->conf.wsl,
+                               cuthead(finish(&cmd), 1));
 
     Str dir = join(&scratch, r->conf.localstate, "remote");
     os_mkdirs(os, scratch, dir);
     Spawn sp = {};
     sp.argv    = argv;
     sp.cwd     = r->conf.localstate;
-    sp.env     = os_environ(os, &scratch);
+    sp.env     = linkenv(&scratch, os_environ(os, &scratch), r->conf.wsl.len>0);
     if (r->conf.envpath.len) {
         sp.env = envsetpath(&scratch, sp.env, r->conf.envpath, HOST_WINDOWS);
     }
@@ -461,7 +457,9 @@ static b32 remotestart(Remote *r, Arena scratch)
     r->proc = os_spawnio(os, &sp, scratch);
     if (!r->proc) {
         Str err = os_lasterr(os, &scratch);
-        r->why = concat(&r->perm, "cannot run ssh: ", err);
+        Str msg = concat(&scratch, "cannot run ", argv[0]);
+        msg    = concat(&scratch, msg, ": ");
+        r->why = concat(&r->perm, msg, err);
         return 0;
     }
     r->live = 1;
@@ -563,6 +561,7 @@ static void remotedeploy(Remote *r, Arena scratch, Str why)
     rd->r               = r;
     rd->conf.name       = r->conf.name;
     rd->conf.ssh        = r->conf.ssh;
+    rd->conf.wsl        = r->conf.wsl;
     rd->conf.program    = r->conf.program;
     rd->conf.scp        = r->conf.scp;
     rd->conf.engines    = r->conf.engines;
@@ -781,7 +780,7 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
         if (jsonint(jsonget(rec.root, "proto"), -1) != HOST_PROTO) {
             // Goodbye, then the end, or deploying one of this protocol,
             // which starts beside that host (one per protocol)
-            b32 ssh = r->conf.ssh.len && !r->conf.path.len;
+            b32 ssh = (r->conf.ssh.len || r->conf.wsl.len) && !r->conf.path.len;
             Buf b(&scratch, 256);
             print(&b, "Prospero on ");
             print(&b, r->conf.name);
@@ -888,6 +887,7 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
 
 static void remoteframes(Remote *r, Arena scratch, Str data)
 {
+    Str raw = data;
     i64 now = os_ticks(r->os);
     if (data.len) {
         linkheard(&r->link, now);  // a frame in pieces counts too
@@ -915,7 +915,13 @@ static void remoteframes(Remote *r, Arena scratch, Str data)
             return;
         }
     }
-    if (r->dec.bad) {
+    if (r->dec.bad && r->conf.wsl.len && find(raw, "Error code: Wsl/")>=0) {
+        // wsl.exe's own failure, on its output: no such distro, say,
+        // which no second try fixes
+        remotestop(r, 1);
+        r->why = concat(&r->perm, "wsl: ", lastsaid(raw));
+        remoteend(r, scratch, RS_FAILED, r->why);
+    } else if (r->dec.bad) {
         remotedown(r, scratch, "garbage on the stream", -1);
     }
 }
@@ -928,7 +934,8 @@ static Str remoteexit(Remote *r, Arena *a, i32 code)
         return said;
     }
     Buf b(a, 64);
-    print(&b, code==255 ? Str("ssh failed") : Str("the stream ended"));
+    b32 ssh = code==255 && !r->conf.wsl.len;
+    print(&b, ssh ? Str("ssh failed") : Str("the stream ended"));
     print(&b, ", exit status ");
     print(&b, (i64)code);
     return finish(&b);
@@ -1112,8 +1119,10 @@ static Remote *newremote(Os *os, Arena *perm, RemoteConf *conf, Mailbox *out)
     r->link  = newlink(&r->perm, os_random(os), REMOTE_KEEPMAX, REMOTE_KEEPCOUNT);
     r->held  = Buf(&r->perm, 1<<12);
     r->fresh = 1;  // starting a host, if none runs
-    r->conf.name       = clone(&r->perm, conf->name.len ? conf->name : conf->ssh);
+    r->conf.name       = conf->name.len ? clone(&r->perm, conf->name)
+                                        : linkdest(&r->perm, conf->ssh, conf->wsl);
     r->conf.ssh        = clone(&r->perm, conf->ssh);
+    r->conf.wsl        = clone(&r->perm, conf->wsl);
     r->conf.program    = clone(&r->perm, conf->program);
     r->conf.path       = clone(&r->perm, conf->path);
     r->conf.state      = clone(&r->perm, conf->state);
@@ -1185,18 +1194,22 @@ static void remotedrop(Remote *r)
 static Str connectusage =
 "usage: prospero connect NAME [options]\n"
 "       prospero connect --ssh DEST [options]\n"
+"       prospero connect --wsl DISTRO [options]\n"
 "       prospero connect --local [options]\n"
 "       prospero connect --endpoint EP [options]\n"
 "Protocol v0 on standard I/O, as prospero --headless, with the engine\n"
-"a host on another machine ([remote NAME], or --ssh), or on this one\n"
+"a host on another machine ([remote NAME], --ssh, or a WSL distro), or\n"
+"on this one\n"
 "(starting one if none runs, or only the one at EP, as prospero hosts\n"
 "lists it). When standard input ends, the link ends: the host runs on.\n"
 "options:\n"
 "  --ssh DEST          ssh destination: [user@]host\n"
+"  --wsl DISTRO        a WSL distro, through wsl.exe\n"
 "  --path PATH         the prospero executable there (default: prospero)\n"
 "  --remote-state DIR  its state directory there\n"
 "  --remote-config F   its configuration file there\n"
 "  --ssh-program PROG  ssh itself (default: ssh)\n"
+"  --wsl-program PROG  wsl.exe itself (default: wsl.exe)\n"
 "  --deploy            deploy an engine there if it has none, or one of\n"
 "                      another protocol (as prospero deploy)\n"
 "  --engines DIR       the engines to deploy (default: engines next to\n"
@@ -1249,13 +1262,15 @@ static void connectstdin(void *arg)
 static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 {
     RemoteConf rc = {};
-    Str name = {}, config = {}, state = {};
+    Str name = {}, config = {}, state = {}, sshprog = {}, wslprog = {};
     b32 local = 0;
     for (i32 i = 2; i < nargs; i++) {
         Str a    = args[i];
         b32 more = i+1 < nargs;
         if (a=="--ssh" && more) {
             rc.ssh = args[++i];
+        } else if (a=="--wsl" && more) {
+            rc.wsl = args[++i];
         } else if (a=="--path" && more) {
             rc.path = args[++i];
         } else if (a=="--remote-state" && more) {
@@ -1263,7 +1278,9 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         } else if (a=="--remote-config" && more) {
             rc.rconfig = args[++i];
         } else if (a=="--ssh-program" && more) {
-            rc.program = args[++i];
+            sshprog = args[++i];
+        } else if (a=="--wsl-program" && more) {
+            wslprog = args[++i];
         } else if (a=="--scp-program" && more) {
             rc.scp = args[++i];
         } else if (a=="--engines" && more) {
@@ -1287,7 +1304,10 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             return 2;
         }
     }
-    if (local + (rc.ssh.len || name.len) + (rc.endpoint.len>0) != 1) {
+    if (rc.ssh.len && rc.wsl.len) {
+        os_print(os, 2, connectusage);
+        return 2;
+    } else if (local + (rc.ssh.len || rc.wsl.len || name.len) + (rc.endpoint.len>0) != 1) {
         os_print(os, 2, connectusage);
         return 2;
     }
@@ -1297,13 +1317,21 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     if (!cfg) {
         return 2;
     }
+    if (!os_mkdirs(os, scratch, rc.localstate)) {
+        Str err = os_lasterr(os, &scratch);
+        hostsay(os, scratch, "cannot create the state directory", err);
+        return 2;
+    }
     if (name.len) {
-        Str dest = cfgget(cfg, "remote", name, "ssh", 0);
-        if (!rc.ssh.len && !dest.len) {
-            hostsay(os, scratch, "no such remote, or it has no ssh", name);
-            return 2;
+        if (!rc.ssh.len && !rc.wsl.len) {
+            LinkTo to = linkto(os, &perm, scratch, cfg, name, wslprog, rc.localstate);
+            if (!to.ssh.len && !to.wsl.len) {
+                hostsay(os, scratch, "no such remote, or it has no ssh or wsl", name);
+                return 2;
+            }
+            rc.ssh = to.ssh;
+            rc.wsl = to.wsl;
         }
-        rc.ssh   = rc.ssh.len ? rc.ssh : dest;
         rc.path  = rc.path.len ? rc.path : cfgown(cfg, "remote", name, "path");
         rc.state = rc.state.len ? rc.state : cfgget(cfg, "remote", name, "state", 0);
         rc.rconfig = rc.rconfig.len ? rc.rconfig
@@ -1311,13 +1339,9 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         rc.name  = name;
         rc.deploy |= cfgget(cfg, "remote", name, "deploy", 0) == "auto";
     }
+    rc.program = rc.wsl.len ? wslprog : sshprog;
     rc.config  = config;
     rc.envpath = cfgownpath(cfg, &perm);
-    if (!os_mkdirs(os, scratch, rc.localstate)) {
-        Str err = os_lasterr(os, &scratch);
-        hostsay(os, scratch, "cannot create the state directory", err);
-        return 2;
-    }
 
     Mailbox *out = newmailbox(&perm, 4<<20, 0, 0);
     Remote  *r   = out ? newremote(os, &perm, &rc, out) : 0;

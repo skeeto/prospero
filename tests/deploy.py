@@ -116,6 +116,29 @@ if n <= int(os.environ.get("FAKESCP_CORRUPT", "0")):
         f.write(b"x")
 """
 
+FAKEWSL = R.FAKE + r"""
+# wsl.exe here: -l -q lists $FAKEDISTROS (comma-separated) in UTF-16 as
+# it does by default; -d DISTRO --cd ~ --exec /bin/sh -c CMD runs CMD in
+# $FAKEHOME, its input passed through (cat, for uploads), for one of
+# them, else says what wsl.exe says of an unknown one, on its output
+args = sys.argv[1:]
+with open(os.path.join(os.environ["FAKELOG"], "wsl.log"), "a", newline="") as f:
+    f.write(" ".join(args) + f" WSL_UTF8={os.environ.get('WSL_UTF8')}\n")
+distros = [d for d in os.environ.get("FAKEDISTROS", "").split(",") if d]
+if args == ["-l", "-q"]:
+    sys.stdout.buffer.write("".join(d + "\r\n" for d in distros).encode("utf-16-le"))
+    sys.exit(0)
+if len(args) != 8 or args[0] != "-d" or args[2:7] != ["--cd", "~", "--exec", "/bin/sh", "-c"]:
+    sys.stderr.write(f"fakewsl: unexpected {args}\n")
+    sys.exit(2)
+if args[1] not in distros:
+    sys.stdout.buffer.write(b"There is no distribution with the supplied name.\r\n"
+                            b"Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND\r\n")
+    sys.exit(-1)
+os.chdir(os.environ["FAKEHOME"])
+run(["sh" if os.name == "nt" else "/bin/sh", "-c", args[7]])
+"""
+
 
 def localplatform():
     if os.name == "nt":
@@ -147,6 +170,7 @@ class D(R.T):
             os.makedirs(d)
         self.ssh = R.program(self, "fakessh", FAKESSH)
         self.scp = R.program(self, "fakescp", FAKESCP)
+        self.wsl = R.program(self, "fakewsl", FAKEWSL)
         out = subprocess.run([self.prospero, "--version"], capture_output=True,
                              text=True).stdout.split()
         self.version = out[1]
@@ -154,7 +178,8 @@ class D(R.T):
         self.exe = ".exe" if os.name == "nt" else ""
         self.ename = f"prospero-engine-{self.version}-{self.platform}{self.exe}"
         self.rname = f"engine-0-{self.version}-{self.platform}{self.exe}"
-        self.env = dict(self.env, FAKEHOME=self.home, FAKELOG=self.fakelog)
+        self.env = dict(self.env, FAKEHOME=self.home, FAKELOG=self.fakelog,
+                        FAKEDISTROS="Deb,docker-desktop")
         # An empty configuration, never the user's own
         conf = os.path.join(self.root, "config")
         os.makedirs(conf)
@@ -228,8 +253,23 @@ class D(R.T):
         except OSError:
             return ""
 
-    def record(self):
-        path = os.path.join(self.local, "deploy", "here.ini")
+    def wsldeploy(self, *extra, env=None, target=None):
+        """Deploy into the fake distro Deb, or to a target by name."""
+        argv = [self.prospero, "deploy"] + ([target] if target else ["--wsl", "Deb"])
+        argv += ["--wsl-program", self.wsl, "--ssh-program", self.ssh, "--scp-program",
+                 self.scp, "--engines", self.engines, "--state", self.local] + list(extra)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                              env=env or self.env)
+
+    def wsllog(self):
+        try:
+            with open(os.path.join(self.fakelog, "wsl.log")) as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def record(self, name="here"):
+        path = os.path.join(self.local, "deploy", name + ".ini")
         out = {}
         with open(path) as f:
             for line in f:
@@ -667,6 +707,82 @@ def desktop_self(t):
 
 
 # Over real ssh
+
+@scenario
+def wsl_fresh(t):
+    """Deploy into a WSL distro: through wsl.exe, the upload on cat's
+    input (no scp), recorded as wsl:DISTRO; then again: nothing to
+    upload."""
+    src = t.engine()
+    p = t.wsldeploy()
+    t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    t.check(p.stdout == f"~/.prospero/{t.rname}\n", f"stdout {p.stdout!r}")
+    t.check(sha256(t.deployed()) == sha256(src), "the engine is there")
+    t.check(t.scps() == 0 and not t.sshlog(), "ssh or scp ran")
+    log = t.wsllog()
+    t.check(f"cat > .prospero/{t.rname}.part" in log, f"no upload in {log!r}")
+    t.check("WSL_UTF8=None" not in log, f"WSL_UTF8 unset: {log!r}")
+    rec = t.record("wsl_Deb")
+    t.check(rec.get("host") == "wsl:Deb" and rec.get("sha256") == sha256(src),
+            f"record {rec}")
+    t.check("probing Deb" in p.stderr, f"stderr {p.stderr!r}")
+    q = t.wsldeploy()
+    t.check(q.returncode == 0 and "already deployed" in q.stderr, f"again: {q.stderr}")
+    t.check(t.wsllog().count(".part") == log.count(".part"), "uploaded again")
+
+
+@scenario
+def wsl_name(t):
+    """A distro by name, with no section, is found by wsl -l -q; Docker
+    Desktop's own distro is not one, so its name is an ssh destination."""
+    t.engine()
+    p = t.wsldeploy(target="Deb")
+    t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    t.check("-l -q" in t.wsllog() and not t.sshlog(), f"wsl {t.wsllog()!r}")
+    t.check(t.record("wsl_Deb").get("host") == "wsl:Deb", "recorded")
+    q = t.wsldeploy(target="docker-desktop")
+    t.check("-d docker-desktop" not in t.wsllog() and " docker-desktop uname" in t.sshlog(),
+            f"docker-desktop: {t.wsllog()!r} {t.sshlog()!r}")
+
+
+@scenario
+def wsl_missing_distro(t):
+    """A distro that is not installed: deploying fails at once, with
+    wsl.exe's own message, and no second try."""
+    t.engine()
+    p = t.wsldeploy(env=dict(t.env, FAKEDISTROS=""))
+    t.check(p.returncode != 0, f"exit {p.returncode}")
+    t.check("There is no distribution with the supplied name" in p.stderr,
+            f"stderr {p.stderr!r}")
+    t.check(t.wsllog().count("-d Deb") == 1, f"tries {t.wsllog()!r}")
+
+
+@scenario
+def wsl_connect_deploy(t):
+    """[remote w] wsl = Deb with deploy = auto: connect deploys into the
+    distro, then a turn runs through it; a section of a missing distro
+    fails for good, saying so."""
+    t.engine()
+    with open(t.config, "a") as f:
+        f.write("[remote w]\nwsl = Deb\ndeploy = auto\n"
+                "[remote gone]\nwsl = Nope\n")
+    common = ["-c", t.config, "--wsl-program", t.wsl, "--engines", t.engines,
+              "--remote-state", t.state, "--remote-config", t.config, "--state", t.local]
+    c = R.connect(t, ["w"] + common)
+    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up",
+           timeout=60)
+    t.check(os.path.isfile(t.deployed()), "deployed")
+    t.check(f".prospero/{t.rname} attach" in t.wsllog(), f"wsl ran {t.wsllog()!r}")
+    t.turn(c)
+    c.call("quit")
+    t.check(c.close() == 0, "connect exits 0")
+    c = R.connect(t, ["gone"] + common)
+    f = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "failed",
+               what="failed", timeout=20)
+    t.check("There is no distribution" in f.get("msg", ""), f"failed {f}")
+    t.check(c.p.wait(10) == 2, "exit 2")
+    t.check(t.wsllog().count("-d Nope") == 1, f"tries {t.wsllog()!r}")
+
 
 def rsh(a, script):
     """A script in the remote host's sh: its own, or w64devkit's."""

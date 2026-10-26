@@ -655,6 +655,7 @@ int main()
     test_engine(&t);
     test_config(&t);
     test_deploy(&t);
+    test_deploywsl(&t);
     test_eval(&t);
     test_desktop(&t);
     test_image(&t);

@@ -4,7 +4,9 @@
 //
 // Puts an engine built for the remote machine's platform in ~/.prospero
 // there, over ssh and scp, where "prospero connect" (remote.cpp) then
-// runs it:
+// runs it. A WSL distro is reached through wsl.exe instead (linkargv),
+// which runs the same commands in its /bin/sh, and takes uploads on
+// standard input, as it has no scp:
 //
 // 1. Probe, with one command that sh and cmd.exe both take:
 //
@@ -25,7 +27,7 @@
 //    the engine's place, .prospero/engine-PROTO-VERSION-OS-ARCH[.exe]:
 //    the same engine means nothing to upload. With no tool there to
 //    compute a SHA-256 (below), deploying fails at once, for good.
-// 4. Upload with scp to that name plus ".part", again after a dropped
+// 4. Upload with scp (into WSL: cat) to that name plus ".part", again after a dropped
 //    link (an XP laptop's Wi-Fi stalls), and verify its SHA-256 there
 //    (sha256sum, shasum -a 256 or openssl; certutil -hashfile in cmd).
 //    A damaged copy is uploaded again.
@@ -39,7 +41,8 @@
 //    engine, where the engine looks for it (deskhelpers, engine.cpp).
 //    The engine works without it, so a helper that cannot be put there
 //    or does not run there (--version) is only a warning.
-// 7. Record where it went in <state>/deploy/DEST.ini, for connecting:
+// 7. Record where it went in <state>/deploy/DEST.ini (for WSL, DEST is
+//    wsl:DISTRO, linkdest), for connecting:
 //    host, platform, shell, path (for the remote shell), sha256,
 //    desktop (the helper's path, if deployed), version, proto, and
 //    deployed (Unix epoch ms).
@@ -95,7 +98,8 @@ static Str deployprobe =
 struct DeployConf {
     Str       name;        // for messages: the remote's name, or ssh
     Str       ssh;         // ssh destination
-    Str       program;     // ssh itself, "ssh" if empty
+    Str       wsl;         // else a WSL distro, reached through wsl.exe
+    Str       program;     // ssh or wsl.exe itself, by name if empty
     Str       scp;         // scp itself, "scp" if empty
     Str       engines;     // directory of engines, if not next to this program
     Str       envpath;     // PATH for ssh and scp, if not this process's
@@ -486,7 +490,73 @@ static DeployRec deployrecord(Os *os, Arena *a, Str localstate, Str dest)
 }
 
 
-// Running ssh and scp
+// Running ssh and scp, or wsl.exe
+
+// A remote machine's key for its deploy record and errors: the ssh
+// destination, or wsl:DISTRO, which no ssh destination looks like.
+static Str linkdest(Arena *a, Str ssh, Str wsl)
+{
+    return wsl.len ? concat(a, "wsl:", wsl) : ssh;
+}
+
+// Why a link cannot start, or null: a destination or distro that ssh or
+// wsl.exe would take for an option, which may run a command here.
+static Str linkbad(Str ssh, Str wsl)
+{
+    if (wsl.len) {
+        return startswith(wsl, "-") ? Str("a WSL distro name cannot begin with -")
+                                    : Str{};
+    }
+    return startswith(ssh, "-") ? Str("an ssh destination cannot begin with -") : Str{};
+}
+
+// The command line that runs a shell command there: ssh, whose login
+// shell takes it; or for a WSL distro, wsl.exe straight into /bin/sh,
+// in the home directory as an ssh login starts (else it starts in this
+// process's directory, under /mnt).
+static Slice<Str> linkargv(Arena *a, Str program, Str ssh, Str wsl, Str command)
+{
+    Slice<Str> r = {};
+    if (wsl.len) {
+        r = push(a, r, program.len ? program : Str("wsl.exe"));
+        r = push(a, r, Str("-d"));
+        r = push(a, r, wsl);
+        r = push(a, r, Str("--cd"));
+        r = push(a, r, Str("~"));
+        r = push(a, r, Str("--exec"));
+        r = push(a, r, Str("/bin/sh"));
+        r = push(a, r, Str("-c"));
+        r = push(a, r, command);
+        return r;
+    }
+    r = push(a, r, program.len ? program : Str("ssh"));
+    r = push(a, r, Str("-T"));
+    for (iz i = 0; i < countof(deployopts); i++) {
+        r = push(a, r, deployopts[i]);
+    }
+    r = push(a, r, Str("-o"));
+    r = push(a, r, Str("EscapeChar=none"));
+    r = push(a, r, Str("--"));  // no options after it
+    r = push(a, r, ssh);
+    r = push(a, r, command);
+    return r;
+}
+
+// The environment for a link's program: for wsl.exe, which otherwise
+// writes its own messages in UTF-16, asking for UTF-8.
+static Slice<Str> linkenv(Arena *a, Slice<Str> env, b32 wsl)
+{
+    if (!wsl) {
+        return env;
+    }
+    Slice<Str> r = {};
+    for (iz i = 0; i < env.len; i++) {
+        if (!envnameis(env[i], "WSL_UTF8", HOST_WINDOWS)) {
+            r = push(a, r, env[i]);
+        }
+    }
+    return push(a, r, Str("WSL_UTF8=1"));
+}
 
 struct DeployRun {
     Str out;      // standard output
@@ -553,8 +623,10 @@ static b32 deploynap(Deploy *d, i64 wait)
     return !deploycancelled(d);
 }
 
-// Run a child to its end, its input closed, keeping its output.
-static DeployRun deployrun(Deploy *d, Arena *a, Slice<Str> argv, i64 timeout)
+// Run a child to its end, given input and then its input closed,
+// keeping its output.
+static DeployRun deployrun(Deploy *d, Arena *a, Slice<Str> argv, i64 timeout,
+                           Str input = {})
 {
     DeployRun r  = {};
     Os       *os = d->os;
@@ -574,6 +646,9 @@ static DeployRun deployrun(Deploy *d, Arena *a, Slice<Str> argv, i64 timeout)
         msg   = concat(a, msg, ": ");
         r.err = concat(a, msg, err);
         return r;
+    }
+    if (input.len) {
+        os_procwrite(os, p, input);
     }
     os_procwrite(os, p, {});
 
@@ -640,46 +715,52 @@ static b32 hasline(Str out, Str word)
     return 0;
 }
 
-// The last line of a child's errors, else of its output, for messages.
-static Str deploysaid(DeployRun *r)
+// The last line of some output, for messages, but for wsl.exe's own
+// "Error code: Wsl/..." after its message.
+static Str lastsaid(Str out)
 {
     Str last = {};
-    Str from = trim(r->err).len ? r->err : r->out;
-    for (Str rest = from; rest.len;) {
+    for (Str rest = out; rest.len;) {
         Cut l = cut(rest, '\n');
-        if (trim(l.head).len) last = trim(l.head);
+        Str t = trim(l.head);
+        if (t.len && !startswith(t, "Error code: Wsl/")) last = t;
         rest = l.tail;
     }
     return last;
 }
 
-// Failures that trying again never fixes.
-static b32 deploypermanent(Str err)
+// The last line of a child's errors, else of its output (where wsl.exe
+// writes its own), for messages.
+static Str deploysaid(DeployRun *r)
 {
+    return lastsaid(trim(r->err).len ? r->err : r->out);
+}
+
+// Failures that trying again never fixes: ssh's, in its errors, and
+// wsl.exe's, in its output.
+static b32 deploypermanent(DeployRun *r)
+{
+    Str err = r->err;
+    Str out = r->out;
     return find(err, "Permission denied")>=0 ||
            find(err, "Could not resolve hostname")>=0 ||
            find(err, "Host key verification failed")>=0 ||
            find(err, "Name or service not known")>=0 ||
-           find(err, "No such file or directory")>=0;
+           find(err, "No such file or directory")>=0 ||
+           find(out, "Error code: Wsl/")>=0 ||
+           find(err, "cannot run ")>=0;
 }
 
 // Run a command there, again while ssh itself fails (status 255), with
-// a note for the step on each failure.
+// a note for the step on each failure. Into WSL, once: its failures are
+// not a dropped network.
 static DeployRun deployssh(Deploy *d, Arena *a, Str step, Str command)
 {
     DeployConf *c = d->conf;
     for (i32 n = 1;; n++) {
-        Slice<Str> argv = {};
-        argv = push(a, argv, c->program.len ? c->program : Str("ssh"));
-        argv = push(a, argv, Str("-T"));
-        for (iz i = 0; i < countof(deployopts); i++) {
-            argv = push(a, argv, deployopts[i]);
-        }
-        argv = push(a, argv, Str("--"));  // no options after it (remote.cpp)
-        argv = push(a, argv, c->ssh);
-        argv = push(a, argv, command);
-        DeployRun r = deployrun(d, a, argv, DEPLOY_STEPTIME);
-        if (r.code!=255 || n>=DEPLOY_TRIES || deploypermanent(r.err)) {
+        Slice<Str> argv = linkargv(a, c->program, c->ssh, c->wsl, command);
+        DeployRun  r    = deployrun(d, a, argv, DEPLOY_STEPTIME);
+        if (c->wsl.len || r.code!=255 || n>=DEPLOY_TRIES || deploypermanent(&r)) {
             return r;
         }
         i64 wait = deploywaits[n-1];
@@ -843,7 +924,8 @@ static DeployPut deployput(Deploy *d, Arena *perm, Arena scratch, Platform *pf,
                            DeployFile *f, i64 stamp)
 {
     DeployConf *conf = d->conf;
-    Str         name = conf->name.len ? conf->name : conf->ssh;
+    Str         name = conf->name.len ? conf->name : linkdest(&scratch, conf->ssh,
+                                                              conf->wsl);
 
     Str       cmd    = deploycmd(&scratch, pf->shell, DEPLOY_PREPARE, f->rpath, stamp);
     DeployRun prep   = deployssh(d, &scratch, "probe", cmd);
@@ -893,19 +975,27 @@ static DeployPut deployput(Deploy *d, Arena *perm, Arena scratch, Platform *pf,
         }
         deploynote(d, scratch, "upload", finish(&b));
 
-        Arena      a    = scratch;
-        Slice<Str> argv = {};
-        argv = push(&a, argv, conf->scp.len ? conf->scp : Str("scp"));
-        argv = push(&a, argv, Str("-q"));
-        for (iz i = 0; i < countof(deployopts); i++) {
-            argv = push(&a, argv, deployopts[i]);
+        Arena      a     = scratch;
+        Slice<Str> argv  = {};
+        Str        input = {};
+        if (conf->wsl.len) {
+            // No scp there: the data on cat's input
+            Str cat = concat(&a, "cat > ", f->upath);
+            argv  = linkargv(&a, conf->program, {}, conf->wsl, cat);
+            input = f->data;
+        } else {
+            argv = push(&a, argv, conf->scp.len ? conf->scp : Str("scp"));
+            argv = push(&a, argv, Str("-q"));
+            for (iz i = 0; i < countof(deployopts); i++) {
+                argv = push(&a, argv, deployopts[i]);
+            }
+            argv = push(&a, argv, Str("--"));
+            argv = push(&a, argv, f->local);
+            Str dest = concat(&a, conf->ssh, ":");
+            argv = push(&a, argv, concat(&a, dest, f->upath));
         }
-        argv = push(&a, argv, Str("--"));
-        argv = push(&a, argv, f->local);
-        Str dest = concat(&a, conf->ssh, ":");
-        argv = push(&a, argv, concat(&a, dest, f->upath));
         i64       limit = DEPLOY_UPTIME + f->data.len/DEPLOY_UPRATE*SEC;
-        DeployRun up    = deployrun(d, &a, argv, limit);
+        DeployRun up    = deployrun(d, &a, argv, limit, input);
         Str       why   = {};
         if (deploycancelled(d)) {
             return deployputfail(perm, "cancelled");
@@ -920,7 +1010,7 @@ static DeployPut deployput(Deploy *d, Arena *perm, Arena scratch, Platform *pf,
                 print(&b, ")");
             }
             why = finish(&b);
-            if (deploypermanent(up.err)) {
+            if (deploypermanent(&up)) {
                 return deployputfail(perm, why);
             }
         } else {
@@ -1009,21 +1099,22 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     d.os   = os;
     d.conf = conf;
     d.mb   = newmailbox(perm, 1<<16, 0, 0);  // children may outlive a call
-    d.env  = os_environ(os, perm);
+    d.env  = linkenv(perm, os_environ(os, perm), conf->wsl.len>0);
     if (conf->envpath.len) {
         d.env = envsetpath(perm, d.env, conf->envpath, HOST_WINDOWS);
     }
-    Str name = conf->name.len ? conf->name : conf->ssh;
+    Str dest = linkdest(perm, conf->ssh, conf->wsl);
+    Str name = conf->name.len ? conf->name : dest;
     Str dir  = join(&scratch, conf->localstate, "deploy");
-    if (startswith(conf->ssh, "-")) {
-        // ssh and scp would take it for an option, which may run a command here
-        return deployfail(&d, perm, scratch, "an ssh destination cannot begin with -");
+    Str bad  = linkbad(conf->ssh, conf->wsl);
+    if (bad.len) {
+        return deployfail(&d, perm, scratch, bad);
     } else if (!d.mb || !os_mkdirs(os, scratch, dir)) {
         Str err = os_lasterr(os, &scratch);
         Str why = concat(&scratch, "cannot create the state directory: ", err);
         return deployfail(&d, perm, scratch, why);
     }
-    d.errpath = deployfile(perm, conf->localstate, conf->ssh, ".err");
+    d.errpath = deployfile(perm, conf->localstate, dest, ".err");
 
     // The platform
     Buf b(&scratch, 256);
@@ -1126,7 +1217,7 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     // Recorded, for connecting
     b = Buf(&scratch, 512);
     print(&b, "host = ");
-    print(&b, conf->ssh);
+    print(&b, dest);
     print(&b, "\nplatform = ");
     print(&b, pf.name);
     print(&b, "\nshell = ");
@@ -1144,7 +1235,7 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
     print(&b, "\ndeployed = ");
     print(&b, os_time(os));
     putbyte(&b, '\n');
-    Str rec = deployfile(&scratch, conf->localstate, conf->ssh, ".ini");
+    Str rec = deployfile(&scratch, conf->localstate, dest, ".ini");
     if (!os_write(os, scratch, rec, finish(&b))) {
         Str err = os_lasterr(os, &scratch);
         Str why = concat(&scratch, "cannot record the deployment: ", err);
@@ -1168,28 +1259,176 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
 }
 
 
+// WSL distros as remotes
+
+// The distros in wsl.exe -l -q's output, which is UTF-16 (little
+// endian) unless it honors WSL_UTF8, as older ones do not, else UTF-8.
+// Docker Desktop's own (docker-desktop, docker-desktop-data) are left
+// out, as is anything but a plain name: letters, digits, ., - and _,
+// as WSL allows.
+static Slice<Str> wsldistros(Arena *a, Str out)
+{
+    b32 bom  = out.len>=2 && out[0]==0xff && out[1]==0xfe;
+    b32 wide = bom || (out.len>=2 && out[1]==0);
+    Buf b(a, out.len);
+    for (iz i = bom ? 2 : 0; i < out.len; i += wide ? 2 : 1) {
+        u8 c = out[i];
+        if (wide && (i+1==out.len || out[i+1])) {
+            c = 0x80;  // beyond ASCII: no plain name
+        }
+        putbyte(&b, c);
+    }
+    Slice<Str> r = {};
+    for (Str rest = finish(&b); rest.len;) {
+        Cut l    = cut(rest, '\n');
+        Str name = trim(l.head);
+        rest = l.tail;
+        if (startswith(name, "\xef\xbb\xbf")) {
+            name = cuthead(name, 3);  // a BOM, in UTF-8
+        }
+        b32 ok = name.len > 0;
+        for (iz i = 0; ok && i<name.len; i++) {
+            u8 c = name[i];
+            ok = alnum(c) || c=='.' || c=='-' || c=='_';
+        }
+        if (ok && !startswith(name, "docker-desktop")) {
+            r = push(a, r, name);
+        }
+    }
+    return r;
+}
+
+// The installed WSL distros, by wsl.exe (or program) -l -q, which
+// starts none of them. None where it cannot run or fails: no WSL, no
+// distros, or not Windows (unless program, a test's stand-in). It runs
+// in dir. Since a child given up on may write late, the records go to
+// perm.
+static Slice<Str> wsllist(Os *os, Arena *perm, Arena scratch, Str program, Str dir)
+{
+    if (!program.len && !HOST_WINDOWS) {
+        return {};
+    }
+    DeployConf c = {};
+    c.localstate = dir;
+    Deploy d = {};
+    d.os   = os;
+    d.conf = &c;
+    d.mb   = newmailbox(perm, 1<<16, 0, 0);
+    d.env  = linkenv(&scratch, os_environ(os, &scratch), 1);
+    if (!d.mb) {
+        return {};
+    }
+    Slice<Str> argv = {};
+    argv = push(&scratch, argv, program.len ? program : Str("wsl.exe"));
+    argv = push(&scratch, argv, Str("-l"));
+    argv = push(&scratch, argv, Str("-q"));
+    DeployRun r = deployrun(&d, &scratch, argv, 15*SEC);
+    return r.code==0 ? wsldistros(perm, r.out) : Slice<Str>{};
+}
+
+// How a remote reaches its machine.
+struct LinkTo {
+    Str name;  // the remote's
+    Str ssh;
+    Str wsl;
+};
+
+// The installed distros as remotes, but for those a [remote] claims
+// (wsl = DISTRO, without ssh, which wins), each named after its distro,
+// or DISTRO-wsl where a remote of that name reaches something else.
+// remotes are the configured ones.
+static Slice<LinkTo> wslhosts(Arena *a, Slice<Str> distros, Slice<LinkTo> remotes)
+{
+    Slice<LinkTo> r = {};
+    for (iz i = 0; i < distros.len; i++) {
+        Str  d       = distros[i];
+        b32  claimed = 0;
+        b32  taken   = 0;
+        for (iz n = 0; n < remotes.len; n++) {
+            LinkTo *o = &remotes[n];
+            claimed |= !o->ssh.len && o->wsl==d;
+            taken   |= o->name==d && (o->ssh.len || o->wsl.len);
+        }
+        if (!claimed) {
+            LinkTo h = {};
+            h.name = taken ? concat(a, d, "-wsl") : d;
+            h.wsl  = d;
+            r = push(a, r, h);
+        }
+    }
+    return r;
+}
+
+// The configured remotes, each as its settings reach it: ssh, else wsl.
+static Slice<LinkTo> cfgremotes(Arena *a, Config *cfg)
+{
+    Slice<LinkTo> r = {};
+    for (IniSection *s = cfg->ini->sections; s; s = s->next) {
+        if (s->kind=="remote" && s->name.len) {
+            LinkTo t = {};
+            t.name = s->name;
+            t.ssh  = trim(cfgget(cfg, "remote", s->name, "ssh", 0));
+            t.wsl  = t.ssh.len ? Str{} : trim(cfgget(cfg, "remote", s->name, "wsl", 0));
+            r = push(a, r, t);
+        }
+    }
+    return r;
+}
+
+// How the remote of a name reaches its machine: as configured, or else
+// an installed distro (wsllist, with program) of that name (wslhosts).
+// Neither ssh nor wsl when there is no such remote.
+static LinkTo linkto(Os *os, Arena *perm, Arena scratch, Config *cfg, Str name,
+                     Str program, Str dir)
+{
+    Slice<LinkTo> remotes = cfgremotes(&scratch, cfg);
+    for (iz i = 0; i < remotes.len; i++) {
+        if (remotes[i].name==name && (remotes[i].ssh.len || remotes[i].wsl.len)) {
+            LinkTo r = remotes[i];
+            r.ssh = clone(perm, r.ssh);
+            r.wsl = clone(perm, r.wsl);
+            return r;
+        }
+    }
+    Slice<Str>    distros = wsllist(os, perm, scratch, program, dir);
+    Slice<LinkTo> hosts   = wslhosts(&scratch, distros, remotes);
+    LinkTo        r       = {};
+    r.name = name;
+    for (iz i = 0; i < hosts.len; i++) {
+        if (hosts[i].name == name) {
+            r.wsl = clone(perm, hosts[i].wsl);
+        }
+    }
+    return r;
+}
+
+
 // prospero deploy
 
 static Str deployusage =
 "usage: prospero deploy NAME|DEST [--force] [options]\n"
-"Put an engine for the platform of a remote machine, a [remote NAME] or\n"
-"an ssh destination, in ~/.prospero there, over ssh and scp, where\n"
-"\"prospero connect\" then runs it, and its desktop helper beside it if\n"
-"the engines directory has one. Prints where the engine went.\n"
+"       prospero deploy --wsl DISTRO [--force] [options]\n"
+"Put an engine for the platform of a remote machine, a [remote NAME],\n"
+"an ssh destination, or a WSL distro, in ~/.prospero there, over ssh and\n"
+"scp (or wsl.exe), where \"prospero connect\" then runs it, and its\n"
+"desktop helper beside it if the engines directory has one. Prints\n"
+"where the engine went.\n"
 "options:\n"
 "  --force             replace another build of this version there\n"
 "  --engines DIR       the engines to choose from (default: engines\n"
 "                      next to this program, else engines beside the\n"
 "                      default prospero.ini)\n"
+"  --wsl DISTRO        a WSL distro, through wsl.exe\n"
 "  --ssh-program PROG  ssh itself (default: ssh)\n"
 "  --scp-program PROG  scp itself (default: scp)\n"
+"  --wsl-program PROG  wsl.exe itself (default: wsl.exe)\n"
 "  -c FILE             configuration file\n"
 "  --state DIR         session storage directory here\n";
 
 static i32 deploymain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 {
     DeployConf dc = {};
-    Str target = {}, config = {}, state = {};
+    Str target = {}, config = {}, state = {}, sshprog = {}, wslprog = {};
     for (i32 i = 2; i < nargs; i++) {
         Str a    = args[i];
         b32 more = i+1 < nargs;
@@ -1197,8 +1436,12 @@ static i32 deploymain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             dc.force = 1;
         } else if (a=="--engines" && more) {
             dc.engines = args[++i];
+        } else if (a=="--wsl" && more) {
+            dc.wsl = args[++i];
         } else if (a=="--ssh-program" && more) {
-            dc.program = args[++i];
+            sshprog = args[++i];
+        } else if (a=="--wsl-program" && more) {
+            wslprog = args[++i];
         } else if (a=="--scp-program" && more) {
             dc.scp = args[++i];
         } else if (a=="-c" && more) {
@@ -1212,7 +1455,7 @@ static i32 deploymain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             return 2;
         }
     }
-    if (!target.len) {
+    if (!target.len == !dc.wsl.len) {
         os_print(os, 2, deployusage);
         return 2;
     }
@@ -1222,10 +1465,17 @@ static i32 deploymain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     if (!cfg) {
         return 2;
     }
-    // A remote's name, or else a destination
-    Str dest = cfgget(cfg, "remote", target, "ssh", 0);
-    dc.ssh     = dest.len ? dest : target;
-    dc.name    = target;
+    // A remote's name (a distro's, unconfigured), or else a destination
+    if (!dc.wsl.len) {
+        LinkTo to = {};
+        if (os_mkdirs(os, scratch, dc.localstate)) {
+            to = linkto(os, &perm, scratch, cfg, target, wslprog, dc.localstate);
+        }
+        dc.ssh = to.ssh.len || to.wsl.len ? to.ssh : target;
+        dc.wsl = to.wsl;
+    }
+    dc.name    = target.len ? target : dc.wsl;
+    dc.program = dc.wsl.len ? wslprog : sshprog;
     dc.envpath = cfgownpath(cfg, &perm);
     dc.verbose = 1;
 

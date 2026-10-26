@@ -241,3 +241,96 @@ static void test_deploy(Test *t)
         expect(t, finish(&name), got, args[i].want);
     }
 }
+
+static Str joinwords(Arena *a, Slice<Str> s)
+{
+    Buf b(a, 256);
+    for (iz i = 0; i < s.len; i++) {
+        if (i) putbyte(&b, '|');
+        print(&b, s[i]);
+    }
+    return finish(&b);
+}
+
+static Str showhosts(Arena *a, Slice<LinkTo> s)
+{
+    Buf b(a, 256);
+    for (iz i = 0; i < s.len; i++) {
+        if (i) putbyte(&b, ' ');
+        print(&b, s[i].name);
+        putbyte(&b, '=');
+        print(&b, s[i].wsl);
+    }
+    return finish(&b);
+}
+
+// WSL: its command lines, the listing of distros as wsl.exe writes it,
+// and the distros as remotes beside configured ones
+static void test_deploywsl(Test *t)
+{
+    Arena a = t->perm;
+
+    Slice<Str> w = linkargv(&a, {}, {}, "Debian", "prospero attach");
+    expect(t, "deploy.wsl.argv", joinwords(&a, w),
+           "wsl.exe|-d|Debian|--cd|~|--exec|/bin/sh|-c|prospero attach");
+    w = linkargv(&a, "fakewsl", "host", "Deb", "x");
+    expect(t, "deploy.wsl.program", joinwords(&a, w),
+           "fakewsl|-d|Deb|--cd|~|--exec|/bin/sh|-c|x");
+    Slice<Str> s = linkargv(&a, {}, "pi", {}, "uname");
+    expect(t, "deploy.ssh.argv", joinwords(&a, s),
+           "ssh|-T|-o|BatchMode=yes|-o|ConnectTimeout=15|-o|ServerAliveInterval=15|"
+           "-o|ServerAliveCountMax=3|-o|EscapeChar=none|--|pi|uname");
+    expect(t, "deploy.wsl.dest", linkdest(&a, "pi", {}), "pi");
+    expect(t, "deploy.wsl.dest2", linkdest(&a, {}, "Debian"), "wsl:Debian");
+    expect(t, "deploy.wsl.bad", linkbad({}, "-x"), "a WSL distro name cannot begin with -");
+    expect(t, "deploy.wsl.good", linkbad({}, "Debian"), "");
+    expect(t, "deploy.ssh.bad", linkbad("-oX", {}), "an ssh destination cannot begin with -");
+
+    Slice<Str> env = {};
+    env = push(&a, env, Str("PATH=/bin"));
+    env = push(&a, env, Str("WSL_UTF8=0"));
+    expect(t, "deploy.wsl.env", joinwords(&a, linkenv(&a, env, 1)), "PATH=/bin|WSL_UTF8=1");
+    expect(t, "deploy.wsl.env2", joinwords(&a, linkenv(&a, env, 0)), "PATH=/bin|WSL_UTF8=0");
+
+    // wsl.exe -l -q: UTF-16, with or without a BOM, unless WSL_UTF8
+    Str utf8 = "Debian\r\ndocker-desktop\r\nUbuntu-24.04\r\ndocker-desktop-data\r\n";
+    Buf u16(&a, 256);
+    for (iz i = 0; i < utf8.len; i++) {
+        putbyte(&u16, utf8[i]);
+        putbyte(&u16, 0);
+    }
+    Str wide = finish(&u16);
+    Str bom  = concat(&a, "\xff\xfe", wide);
+    expect(t, "deploy.wsl.list8", joinwords(&a, wsldistros(&a, utf8)), "Debian|Ubuntu-24.04");
+    expect(t, "deploy.wsl.list16", joinwords(&a, wsldistros(&a, wide)), "Debian|Ubuntu-24.04");
+    expect(t, "deploy.wsl.listbom", joinwords(&a, wsldistros(&a, bom)), "Debian|Ubuntu-24.04");
+    expect(t, "deploy.wsl.listbom8",
+           joinwords(&a, wsldistros(&a, "\xef\xbb\xbf" "Debian\n")), "Debian");
+    expect(t, "deploy.wsl.listodd",
+           joinwords(&a, wsldistros(&a, "Arch Linux\nok.1\n\n")), "ok.1");
+    expect(t, "deploy.wsl.listnone", joinwords(&a, wsldistros(&a, "")), "");
+    // a character beyond ASCII in UTF-16: not a plain name
+    Buf na(&a, 16);
+    u8  units[] = {'D', 0, 0xe9, 1, 'b', 0, '\n', 0, 'X', 0};
+    for (iz i = 0; i < countof(units); i++) {
+        putbyte(&na, units[i]);
+    }
+    Str nonascii = finish(&na);
+    expect(t, "deploy.wsl.listwide", joinwords(&a, wsldistros(&a, nonascii)), "X");
+
+    // Distros as remotes: claimed by a section, renamed beside another
+    Slice<Str> distros = {};
+    distros = push(&a, distros, Str("Debian"));
+    distros = push(&a, distros, Str("Ubuntu"));
+    distros = push(&a, distros, Str("Arch"));
+    distros = push(&a, distros, Str("Fedora"));
+    Slice<LinkTo> remotes = {};
+    remotes = push(&a, remotes, LinkTo{"deb", {}, "Debian"});      // claims Debian
+    remotes = push(&a, remotes, LinkTo{"Ubuntu", "ubuntu.lan", {}});  // the name, by ssh
+    remotes = push(&a, remotes, LinkTo{"Arch", {}, {}});          // its settings only
+    remotes = push(&a, remotes, LinkTo{"x", "Fedora", {}});        // ssh, not a claim
+    expect(t, "deploy.wsl.hosts", showhosts(&a, wslhosts(&a, distros, remotes)),
+           "Ubuntu-wsl=Ubuntu Arch=Arch Fedora=Fedora");
+    expect(t, "deploy.wsl.hostsnone", showhosts(&a, wslhosts(&a, distros, {})),
+           "Debian=Debian Ubuntu=Ubuntu Arch=Arch Fedora=Fedora");
+}

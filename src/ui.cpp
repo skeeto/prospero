@@ -4094,7 +4094,8 @@ static Str hostkey(Arena *a, GuiHost *h, Str remote)
     return concat(a, "remote:", h->name);
 }
 
-// The configured remotes' names, in the configuration's order.
+// The configured remotes' names, in the configuration's order, then
+// the unconfigured WSL distros'.
 static Slice<Str> remotenames(Gui *g, Arena *a)
 {
     Slice<Str> names = {};
@@ -4108,7 +4109,24 @@ static Slice<Str> remotenames(Gui *g, Arena *a)
             names = push(a, names, r->name);
         }
     }
+    for (iz i = 0; i < g->wslauto.len; i++) {
+        b32 seen = 0;
+        for (iz n = 0; !seen && n < names.len; n++) {
+            seen = names[n] == g->wslauto[i].name;
+        }
+        if (!seen) {
+            names = push(a, names, g->wslauto[i].name);
+        }
+    }
     return names;
+}
+
+// How Connect reaches a remote, for its tooltip.
+static char const *connecttip(Gui *g, Str name)
+{
+    return remoteset(g, name, "ssh").len || !remoteset(g, name, "wsl").len
+         ? "Connect over ssh, starting a host there if none runs"
+         : "Connect through wsl.exe, starting a host in the distro if none runs";
 }
 
 // Whether a remote shows in the sidebar while not connected: unless its
@@ -4639,7 +4657,7 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
                                                                : Str{})) {
                 remoteconnect(g, a, name);
             }
-            ImGui::SetItemTooltip("Connect over ssh, starting a host there if none runs");
+            ImGui::SetItemTooltip("%s", connecttip(g, name));
         }
     }
     Str why = h && hostready(g, h) ? Str{} : Str("It is not connected");
@@ -6407,6 +6425,9 @@ static b32 samelineif(f32 w)
 }
 
 
+static b32  cfghas(Gui *, Str, Str);
+static void cfgselect(Gui *, Str, Str);
+
 // Hosts
 
 // A configured remote host's line: a dot in the color of its connection,
@@ -6445,13 +6466,30 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         itemrect(g, rect);
     }
     itemnamed(g, concat(&a, "connect ", name));
-    ImGui::SetItemTooltip(live ? "Leave it: its sessions run on there" :
-                          closing ? "Connect again once it has let go" :
-                                    "Connect over ssh, starting a host there if none runs");
+    ImGui::SetItemTooltip("%s", live ? "Leave it: its sessions run on there" :
+                                closing ? "Connect again once it has let go" :
+                                          connecttip(g, name));
     if (click && live) {
         hostclose(g, h);
     } else if (click) {
         remoteconnect(g, a, name);
+    }
+    // An unconfigured WSL distro: settings of its own begin a section,
+    // which says what it was until then
+    LinkTo *auto_ = rect!=RECT_PAGECONNECT ? wslautohost(g, name) : 0;
+    if (auto_ && !cfghas(g, "remote", name)) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Settings")) {
+            guiconfigset(g, "remote", name, "wsl", auto_->wsl);
+            guiconfigset(g, "remote", name, "list", "connected");
+            cfgselect(g, "remote", name);
+            g->cfgshowsel = 1;
+            setpane(g, PANE_SETTINGS, 1);
+        }
+        itemnamed(g, concat(&a, "settings ", name));
+        ImGui::SetItemTooltip("Give it a [remote %s] section of its own, with "
+                              "wsl = %s, and show it in Settings",
+                              cstr0(&a, name), cstr0(&a, auto_->wsl));
     }
     if (h && h->msg.len && h->state!=RS_UP) {
         ImGui::PushStyleColor(ImGuiCol_Text, h->state==RS_FAILED ? g->pal->bad : g->pal->amber);
@@ -6485,9 +6523,11 @@ static void drawhosts(Gui *g)
     }
     if (ImGui::SmallButton("Look again")) {
         findhosts(g, a);
+        findwsl(g);
         guiconfigget(g);
     }
-    ImGui::SetItemTooltip("Find background hosts again, and read the remotes from the configuration");
+    ImGui::SetItemTooltip("Find background hosts and WSL distros again, and read the "
+                          "remotes from the configuration");
 
     // This process
     ImGui::SeparatorText("This computer");
@@ -6535,19 +6575,9 @@ static void drawhosts(Gui *g)
         ImGui::PopID();
     }
 
-    // Remotes, as configured
+    // Remotes, as configured, and WSL distros
     ImGui::SeparatorText("Remote hosts");
-    Slice<Str> names = {};
-    for (iz i = 0; i < g->cfgrows.len; i++) {
-        CfgRow *r = &g->cfgrows[i];
-        b32 seen = r->kind != "remote";
-        for (iz n = 0; !seen && n < names.len; n++) {
-            seen = names[n] == r->name;
-        }
-        if (!seen) {
-            names = push(&a, names, r->name);
-        }
-    }
+    Slice<Str> names = remotenames(g, &a);
     for (GuiHost *h = g->hosts; h; h = h->next) {
         b32 seen = h->kind != GH_REMOTE;
         for (iz n = 0; !seen && n < names.len; n++) {

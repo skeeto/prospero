@@ -223,7 +223,7 @@ static CfgKind cfgkinds[] = {
     {"ui",       0, "How the GUI looks"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"host",     0, "The engine as a background host (prospero serve)"},
-    {"remote",   1, "An engine on another machine, reached over ssh"},
+    {"remote",   1, "An engine on another machine, reached over ssh, or in a WSL distro"},
 };
 
 // A key ending in a dot names a family: any key with that prefix, as
@@ -474,6 +474,9 @@ static CfgKey cfgschema[] = {
 
     {"remote", "ssh", CFG_STRING, "", {}, {}, "remote",
      "Where ssh reaches the machine: [user@]host, or a Host of ~/.ssh/config"},
+    {"remote", "wsl", CFG_STRING, "", {}, {}, "remote",
+     "Instead of ssh, a WSL distro on this Windows machine, by its name as "
+     "wsl --list shows it, reached through wsl.exe"},
     {"remote", "path", CFG_STRING, "prospero", {}, {}, "remote",
      "The prospero executable there, a path or a name on its PATH; unset, "
      "the engine prospero deploy put there, else prospero"},
@@ -1466,6 +1469,16 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
                     msg = concat(perm, msg, "] with a url, and not a URL");
                 }
                 cfgreport(ini, perm, e->file, e->line, INI_WARNING,
+                          e->line->valbeg, msg);
+            }
+            if (s->kind=="remote" && e->key=="wsl" && v.len && inientry(s, "ssh") &&
+                    trim(inientry(s, "ssh")->value).len) {
+                Str msg = {};
+                if (!cfgmuted(e->file)) {
+                    msg = "ssh is set too, which reaches the machine, so this "
+                          "is ignored";
+                }
+                cfgreport(ini, perm, e->file, e->line, INI_ERROR,
                           e->line->valbeg, msg);
             }
             if (s->kind=="model" && e->key=="like" && v.len) {

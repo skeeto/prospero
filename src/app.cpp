@@ -168,6 +168,7 @@ enum : u32 {
     TASK_OPENED,        // an open dialog's path (id its ask), empty if cancelled
     TASK_ATTACH,        // the attach dialog's image path, likewise
     TASK_BROWSED,       // the new session dialog's directory, likewise
+    TASK_WSL,           // the installed WSL distros, a line each (wsllist)
 };
 
 // Item rectangles the scripted checklist aims at
@@ -1080,6 +1081,11 @@ struct Gui {
     Str                hosterr;    // why this process could not host
     Str                whynobg;    // why it cannot, as the close dialog opened
     i32                hostfound;  // background hosts found at startup
+    Slice<Str>         distros;    // the installed WSL distros, as last listed
+    Slice<LinkTo>      wslauto;    // those as remotes of no section (wslhosts),
+                                   // in cfgmem
+    b32                wsllisting; // a listing runs
+    i32                wsllists;   // listings done
     char              *remname;    // the Hosts panel's new remote
     char              *remssh;
     char              *rempath;
@@ -3069,6 +3075,8 @@ static void setcfgstr(Gui *g, Str *dst, CfgRow r)
     }
 }
 
+static void wslremotes(Gui *);
+
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
 static void loadcfg(Gui *g, Str line)
@@ -3144,6 +3152,7 @@ static void loadcfg(Gui *g, Str line)
         copybytes(r.buf, v.data, v.len);
         g->cfgrows = push(a, g->cfgrows, r);
     }
+    wslremotes(g);
 }
 
 static void guiopen(Gui *, GuiSession *);
@@ -5094,7 +5103,7 @@ static b32 hostconnect(Gui *g, GuiHost *h, RemoteConf *rc, Arena scratch)
 
 // A setting of a [remote NAME] section, from the latest config.get: not
 // one ignored, as any is in an included file (config.cpp).
-static Str remoteset(Gui *g, Str name, Str key)
+static Str remoterow(Gui *g, Str name, Str key)
 {
     for (iz i = 0; i < g->cfgrows.len; i++) {
         CfgRow *r = &g->cfgrows[i];
@@ -5104,6 +5113,144 @@ static Str remoteset(Gui *g, Str name, Str key)
         }
     }
     return {};
+}
+
+// An installed WSL distro that is a remote of its own, unconfigured, by
+// the remote's name, or null.
+static LinkTo *wslautohost(Gui *g, Str name)
+{
+    for (iz i = 0; i < g->wslauto.len; i++) {
+        if (g->wslauto[i].name == name) {
+            return &g->wslauto[i];
+        }
+    }
+    return 0;
+}
+
+// A remote's setting, as remoterow, or for an unconfigured WSL distro
+// as if [remote NAME] said wsl = DISTRO and list = connected: in the
+// sidebar only while connected, so that idle distros do not crowd it.
+static Str remoteset(Gui *g, Str name, Str key)
+{
+    Str     v = remoterow(g, name, key);
+    LinkTo *w = v.len ? 0 : wslautohost(g, name);
+    if (w && key=="wsl" && !remoterow(g, name, "ssh").len) {
+        return w->wsl;
+    } else if (w && key=="list") {
+        return "connected";
+    }
+    return v;
+}
+
+// The configured remotes, as they reach their machines.
+static Slice<LinkTo> guiremotes(Gui *g, Arena *a)
+{
+    Slice<LinkTo> r = {};
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *row  = &g->cfgrows[i];
+        b32     seen = row->kind != "remote";
+        for (iz n = 0; !seen && n < r.len; n++) {
+            seen = r[n].name == row->name;
+        }
+        if (!seen) {
+            LinkTo t = {};
+            t.name = row->name;
+            t.ssh  = trim(remoterow(g, row->name, "ssh"));
+            t.wsl  = t.ssh.len ? Str{} : trim(remoterow(g, row->name, "wsl"));
+            r = push(a, r, t);
+        }
+    }
+    return r;
+}
+
+// The installed distros as remotes, again: after a listing, or a load
+// of the configuration, which may claim some.
+static void wslremotes(Gui *g)
+{
+    Arena *a  = &g->cfgmem;
+    g->wslauto = wslhosts(a, g->distros, guiremotes(g, a));
+}
+
+// The program that reaches a remote: ssh, or wsl.exe for a WSL distro,
+// unless a test's stand-in (PROSPERO_TEST_SSH, PROSPERO_TEST_WSL).
+static Str linkprogram(Gui *g, Arena *a, b32 wsl)
+{
+    return os_getenv(g->os, a, wsl ? Str("PROSPERO_TEST_WSL") : Str("PROSPERO_TEST_SSH"));
+}
+
+struct GuiWsl {
+    Os      *os;
+    Mailbox *done;
+    Str      program;
+    Str      dir;
+    Region  *perm;
+    Region  *scratch;
+};
+
+static void guiwslthread(void *arg)
+{
+    GuiWsl    *w       = (GuiWsl *)arg;
+    Arena      perm    = newarena(w->perm);
+    Arena      scratch = newarena(w->scratch);
+    Slice<Str> names   = wsllist(w->os, &perm, scratch, w->program, w->dir);
+    Buf b(&perm, 1<<12);
+    for (iz i = 0; i < names.len; i++) {
+        print(&b, names[i]);
+        putbyte(&b, '\n');
+    }
+    mailpost(w->done, TASK_WSL, 0, finish(&b), 1);
+    os_release(w->os, w->scratch);
+    os_release(w->os, w->perm);
+}
+
+// List the installed WSL distros in the background (TASK_WSL): on
+// Windows, or with a test's stand-in for wsl.exe.
+static void findwsl(Gui *g)
+{
+    Str program = linkprogram(g, &g->perm, 1);
+    if (g->wsllisting || (!HOST_WINDOWS && !program.len)) {
+        return;
+    }
+    GuiWsl *w = alloc<GuiWsl>(&g->perm);
+    w->os      = g->os;
+    w->done    = g->tasks;
+    w->program = program;
+    w->dir     = g->statedir;
+    w->perm    = os_reserve(g->os, (iz)1<<20);
+    w->scratch = os_reserve(g->os, (iz)1<<22);
+    if (!w->perm || !w->scratch || !os_thread(g->os, guiwslthread, w)) {
+        if (w->perm) os_release(g->os, w->perm);
+        if (w->scratch) os_release(g->os, w->scratch);
+        return;
+    }
+    g->wsllisting = 1;
+}
+
+// A listing's distros, a line each.
+static void wslgot(Gui *g, Str data)
+{
+    Slice<Str> d = {};
+    for (Str rest = data; rest.len;) {
+        Cut l = cut(rest, '\n');
+        rest = l.tail;
+        if (l.head.len) {
+            d = push(&g->frame, d, l.head);
+        }
+    }
+    b32 same = d.len == g->distros.len;
+    for (iz i = 0; same && i<d.len; i++) {
+        same = d[i] == g->distros[i];
+    }
+    if (!same) {
+        g->distros = {};
+        for (iz i = 0; i < d.len; i++) {
+            g->distros = push(&g->perm, g->distros, clone(&g->perm, d[i]));
+        }
+        wslremotes(g);
+    }
+    g->wsllisting = 0;
+    g->wsllists++;
+    scheddirty(&g->sched);
 }
 
 // Whether a [remote NAME] setting is written, but ignored.
@@ -5119,8 +5266,10 @@ static b32 remoteignored(Gui *g, Str name, Str key)
     return 0;
 }
 
-// Connect to a [remote NAME] over ssh, as its section says. The ssh
-// program is "ssh", or PROSPERO_TEST_SSH (a test hook).
+// Connect to a [remote NAME] over ssh, or into its WSL distro, as its
+// section says, or to an unconfigured distro (wslauto). The program is
+// "ssh" or "wsl.exe", or PROSPERO_TEST_SSH or PROSPERO_TEST_WSL (test
+// hooks).
 // With deploy, an engine is deployed there if it has none or one of
 // another protocol, as [remote NAME] deploy = auto has it always.
 static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
@@ -5133,21 +5282,23 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
     RemoteConf rc = {};
     rc.name       = name;
     rc.ssh        = remoteset(g, name, "ssh");
+    rc.wsl        = rc.ssh.len ? Str{} : remoteset(g, name, "wsl");
     rc.path       = remoteset(g, name, "path");
     rc.state      = remoteset(g, name, "state");
     rc.rconfig    = remoteset(g, name, "config");
-    rc.program    = os_getenv(g->os, &scratch, "PROSPERO_TEST_SSH");
+    rc.program    = linkprogram(g, &scratch, rc.wsl.len>0);
     rc.localstate = g->statedir;
     rc.deploy     = deploy || remoteset(g, name, "deploy")=="auto";
     h->deploys    = 0;
-    if (!rc.ssh.len && remoteignored(g, name, "ssh")) {
+    if (!rc.ssh.len && !rc.wsl.len &&
+            (remoteignored(g, name, "ssh") || remoteignored(g, name, "wsl"))) {
         h->state = RS_FAILED;
-        h->msg   = "its ssh is set in an included file, which cannot choose "
-                   "what runs where: set it in your own file";
+        h->msg   = "its ssh or wsl is set in an included file, which cannot "
+                   "choose what runs where: set it in your own file";
         return h;
-    } else if (!rc.ssh.len) {
+    } else if (!rc.ssh.len && !rc.wsl.len) {
         h->state = RS_FAILED;
-        h->msg   = "no ssh destination: set ssh in its section";
+        h->msg   = "no ssh destination: set ssh (or wsl) in its section";
         return h;
     }
     hostconnect(g, h, &rc, scratch);
@@ -5329,8 +5480,16 @@ static Str hostlabel(Gui *g, Arena *a, GuiHost *h)
         break;
     case GH_REMOTE: {
         Str ssh = remoteset(g, h->name, "ssh");
+        Str wsl = ssh.len ? Str{} : remoteset(g, h->name, "wsl");
         print(&b, h->name);
-        if (ssh.len && ssh!=h->name) {
+        if (wsl.len) {
+            print(&b, " (WSL");
+            if (wsl != h->name) {
+                print(&b, ": ");
+                print(&b, wsl);
+            }
+            putbyte(&b, ')');
+        } else if (ssh.len && ssh!=h->name) {
             print(&b, " (");
             print(&b, ssh);
             putbyte(&b, ')');
@@ -6002,6 +6161,9 @@ static void ontask(Gui *g, Record r)
             g->browsed++;
         }
         return;
+    case TASK_WSL:
+        wslgot(g, r.data);
+        return;
     case TASK_DEPLOYED: {
         GuiHost *h = 0;
         for (GuiHost *k = g->hosts; k; k = k->next) {
@@ -6058,9 +6220,10 @@ static void guiupdate(Gui *g, GuiHost *h)
         return;
     }
     Str ssh = remoteset(g, h->name, "ssh");
-    if (!ssh.len) {
+    Str wsl = ssh.len ? Str{} : remoteset(g, h->name, "wsl");
+    if (!ssh.len && !wsl.len) {
         h->updating = UPD_FAILED;
-        h->updmsg   = "no ssh destination: set ssh in its section";
+        h->updmsg   = "no ssh destination: set ssh (or wsl) in its section";
         return;
     }
     GuiDeploy *d = alloc<GuiDeploy>(&g->perm);  // kept: the thread may outlive a frame
@@ -6071,7 +6234,8 @@ static void guiupdate(Gui *g, GuiHost *h)
     d->scratch         = os_reserve(g->os, 3*DEPLOY_MAXSIZE);
     d->conf.name       = clone(&g->perm, h->name);
     d->conf.ssh        = clone(&g->perm, ssh);
-    d->conf.program    = os_getenv(g->os, &g->perm, "PROSPERO_TEST_SSH");
+    d->conf.wsl        = clone(&g->perm, wsl);
+    d->conf.program    = linkprogram(g, &g->perm, wsl.len>0);
     d->conf.envpath    = guipath(g, &g->perm);
     d->conf.localstate = g->statedir;
     d->conf.force      = 1;  // another build of this version, as a developer's
@@ -8137,6 +8301,8 @@ enum : i32 {
     OP_MARKSESS,  // remember the session shown, for CHK_DRAFTFILE
     OP_IFROLE,    // unless the configuration has role text, skip dx ops
     OP_IFEDITOR,  // unless [ui] editor is set, skip dx ops
+    OP_IFWSL,     // unless wsl.exe has a stand-in (PROSPERO_TEST_WSL), skip
+                  // dx ops
     OP_MAXIMIZE,  // maximize the window (macOS: zoom), as its button would;
                   // dx 1: fill the primary display unmaximized (macOS's
                   // Fill), else skip the next op where that is no maximum
@@ -8496,6 +8662,10 @@ enum : i32 {
     CHK_QUEUETAIL,    // the first queued message is drawn below the last
                       // message, inside the transcript
     CHK_QUEUEKEPT,    // queued messages left the tail untaken dx times
+    CHK_WSLLISTED,    // the WSL distro Deb is a remote, not in the sidebar
+                      // until connected, and docker-desktop is none
+    CHK_WSLFAILED,    // Deb, with no engine there, failed offering to deploy
+    CHK_WSLSECTION,   // Deb's Settings wrote [remote Deb] wsl = Deb
     CHK_COUNT,
 };
 
@@ -8710,6 +8880,9 @@ static Str chknames[] = {
     "the new session has the endpoint and model picked",
     "the queued message shows in the transcript, below its last message",
     "a queued message left the transcript only when withdrawn or taken in",
+    "the WSL distro is listed as a remote, outside the sidebar, Docker's not",
+    "the WSL distro with no engine in it failed, offering to deploy one",
+    "the WSL distro's Settings wrote a section of its own for it",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -8767,6 +8940,9 @@ enum : i32 {
     W_DRAFTS,     // every draft sent was answered, so kept
     W_DEPLOYOFFER,// the remote "missing" failed, offering to deploy
     W_SIDECHAT,   // a side chat is shown, open, its replay applied
+    W_WSLLISTED,  // WSL distros were listed
+    W_WSLFAILED,  // the WSL distro Deb failed
+    W_WSLSECTION, // the configuration has [remote Deb]
 };
 
 static Str waitnames[] = {
@@ -8782,9 +8958,10 @@ static Str waitnames[] = {
     "a pause in reasoning", "turns", "the editor", "a note", "a compaction card",
     "a named item", "a launch to hand off", "the import", "the export",
     "the plan", "the menu's pick", "the drafts kept", "the offer to deploy",
-    "the side chat",
+    "the side chat", "the WSL distros", "the WSL distro to fail",
+    "the WSL distro's section",
 };
-static_assert(countof(waitnames) == W_SIDECHAT+1);
+static_assert(countof(waitnames) == W_WSLSECTION+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -10771,6 +10948,26 @@ static DriveOp remoteops[] = {
     {OP_UP, 0, 0, 0, 100, ""},
     {OP_WAIT, W_DEPLOYOFFER, 0, 0, 30000, ""},
     {OP_CHECK, CHK_DEPLOYOFFER, 0, 0, 0, ""},
+    // An installed WSL distro, through a stand-in for wsl.exe: a remote
+    // by itself, kept from the sidebar, Docker Desktop's left out. With
+    // no engine in it, it fails, offering to deploy one; its Settings
+    // begin a section of its own
+    {OP_IFWSL, 0, 15, 0, 0, ""},
+    {OP_WAIT, W_WSLLISTED, 0, 0, 15000, ""},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_WSLLISTED, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect Deb"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_WSLFAILED, 0, 0, 30000, ""},
+    {OP_MARK, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_WSLFAILED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "remote-1-wsl"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "settings Deb"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_WSLSECTION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_WSLSECTION, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-1-hosts"},
     // A session there, through the dialog
     {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
@@ -12341,6 +12538,14 @@ static b32 drivewaitdone(Gui *g)
         GuiHost *h = drivehost(g, GH_REMOTE);
         return h && h->up;
     }
+    case W_WSLLISTED:
+        return g->wsllists > 0;
+    case W_WSLFAILED: {
+        GuiHost *h = findhost(g, GH_REMOTE, "Deb");
+        return h && h->state==RS_FAILED;
+    }
+    case W_WSLSECTION:
+        return cfghas(g, "remote", "Deb");
     case W_DEPLOYOFFER: {
         GuiHost *h = findhost(g, GH_REMOTE, "missing");
         return !hasremote(g, "missing") || (h && h->state==RS_FAILED && h->deploys);
@@ -14092,6 +14297,26 @@ static b32 drivecheck(Gui *g, i32 chk)
                g->picked==g->pickwant &&
                modelshown(&a, g->main, v->endpoint, v->model)==g->pickwant;
     }
+    case CHK_WSLLISTED: {
+        b32 deb = 0, docker = 0;
+        for (i32 i = 0; i < g->nnamed; i++) {
+            deb    |= Str{g->named[i].name, g->named[i].len} == "connect Deb";
+            docker |= startswith(Str{g->named[i].name, g->named[i].len}, "connect docker");
+        }
+        return deb && !docker && wslautohost(g, "Deb") && !wslautohost(g, "docker-desktop") &&
+               remoteset(g, "Deb", "wsl")=="Deb" && !remotelisted(g, 0, "Deb");
+    }
+    case CHK_WSLFAILED: {
+        Arena    a = g->frame;
+        GuiHost *h = findhost(g, GH_REMOTE, "Deb");
+        return h && h->state==RS_FAILED && !h->r && h->deploys &&
+               find(h->msg, "no engine on Deb")>=0 &&
+               hostlabel(g, &a, h)=="Deb (WSL)";
+    }
+    case CHK_WSLSECTION:
+        return cfghas(g, "remote", "Deb") && remoterow(g, "Deb", "wsl")=="Deb" &&
+               remoterow(g, "Deb", "list")=="connected" && !wslautohost(g, "Deb") &&
+               remoteset(g, "Deb", "wsl")=="Deb" && g->cfgpname=="Deb";
     case CHK_REMOTEFAILED: {
         GuiHost *h = findhost(g, GH_REMOTE, "bad");
         return h && h->state==RS_FAILED && !h->r && g->failshown &&
@@ -14718,6 +14943,12 @@ static void drivestep(Gui *g)
     case OP_IFEDITOR:
         if (!g->editor.len) {
             guilog(g, "drive: skip, with no [ui] editor");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
+    case OP_IFWSL:
+        if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_WSL").len) {
+            guilog(g, "drive: skip, with no stand-in for wsl.exe");
             g->drivepc += (i32)op->dx;
         }
         break;
@@ -15501,6 +15732,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     }
     if (!fake) {
         findhosts(g, g->frame);  // background hosts of the state directory
+        findwsl(g);              // and WSL distros, as remotes
     }
     if (history) {
         g->histreq = os_ticks(os);
