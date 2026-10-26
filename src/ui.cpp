@@ -961,6 +961,8 @@ static void printage(Gui *g, Buf *b, i64 ms)
 }
 
 static GuiSession *taskchild(Gui *, GuiSession *, ViewTool *);
+static b32 kidnamed(Gui *, Arena, GuiSession *, Str);
+static Str kidlink(Gui *, Arena *, ViewTool *, i64);
 
 // A message's header line: who, or what a tool did, or an ask's state.
 // What a mark of a change to the session says after its label: a model
@@ -1029,6 +1031,19 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         }
         if (t->elided) {
             pen(p, "  elided", STYLE_BOLD, dim);
+        }
+        if (t->name=="task" && g->sess && t->host.len) {
+            pen(p, "  on ", 0, dim);
+            pen(p, t->host, STYLE_BOLD, dim);
+            if (g->sess->host->kind == GH_REMOTE) {
+                pen(p, concat(&a, ", as ", g->sess->host->name), 0, dim);
+                pen(p, " names it", 0, dim);
+            } else if (t->status==VTOOL_RUNNING && kidnamed(g, a, g->sess, t->host)) {
+                Str st = kidlink(g, &a, t, nowms);
+                if (st.len) {
+                    pen(p, concat(&a, "  ", st), STYLE_BOLD, pal->amber);
+                }
+            }
         }
         if (t->name=="task" && g->sess) {
             GuiSession *k = taskchild(g, g->sess, t);
@@ -1227,6 +1242,14 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
 // call while it works.
 static GuiSession *taskchild(Gui *g, GuiSession *parent, ViewTool *t)
 {
+    if (t->host.len) {
+        // On another host, named by task.host: only one this window
+        // reaches by that name, as the parent's engine shares its
+        // configuration (kidnamed)
+        b32      own = parent->host->kind != GH_REMOTE;
+        GuiHost *h   = own ? findhost(g, GH_REMOTE, t->host) : 0;
+        return h && t->child.len ? findsess(g, h, t->child) : 0;
+    }
     if (t->child.len) {
         GuiSession *c = findsess(g, parent->host, t->child);
         if (c) return c;
@@ -1239,6 +1262,124 @@ static GuiSession *taskchild(Gui *g, GuiSession *parent, ViewTool *t)
         }
     }
     return 0;
+}
+
+// Subagents on other hosts (hostlink.cpp)
+//
+// The parent's engine starts one through its own link to that host, by
+// a name from its configuration, which is this window's when the parent
+// runs here: in the engine, or a background host of this machine. The
+// window then reaches the subagent through its own link, by the same
+// name, to show it and answer its asks; the engine relays nothing.
+
+static Slice<Str> remotenames(Gui *, Arena *);
+
+// Whether this window reaches a task's host by its name.
+static b32 kidnamed(Gui *g, Arena a, GuiSession *parent, Str host)
+{
+    if (!host.len || parent->host->kind==GH_REMOTE) {
+        return 0;  // another host's names are its own
+    }
+    Slice<Str> names = remotenames(g, &a);
+    for (iz i = 0; i < names.len; i++) {
+        if (names[i] == host) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Connect to a task's host, and once it is up, open its subagent there,
+// attended, as a local subagent of a session open here is: shown too if
+// the user asked (want). Unless the user asks, not a host the user
+// disconnected, nor one that failed.
+static void kidreach(Gui *g, Arena a, ViewTool *t, b32 user)
+{
+    GuiHost *h = findhost(g, GH_REMOTE, t->host);
+    if (!user && h && (h->userclosed || h->state==RS_FAILED)) {
+        return;
+    } else if (!h || !h->r || h->closing || h->state==RS_FAILED) {
+        remoteconnect(g, a, t->host);
+        return;
+    } else if (!h->up) {
+        return;  // drainmail sweeps again once it is
+    }
+    GuiSession *k = findsess(g, h, t->child);
+    k = k ? k : addsess(g, h, t->child);
+    if (!k->view) {
+        guiopen(g, k);
+    }
+    t->opened = 1;
+    if (t->want) {
+        t->want = 0;
+        setcur(g, k);
+    }
+}
+
+// Open subagent, for one on another host: reached first if need be.
+static void kidopen(Gui *g, ViewTool *t)
+{
+    t->want = 1;
+    kidreach(g, g->frame, t, 1);
+}
+
+// Each drainmail: the subagents on other hosts of the parents open here
+// whose calls run, each reached once (opened). One in the background
+// only while its host, already up, lists it at work.
+static void kidsweep(Gui *g)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        View *v = s->view;
+        if (!v || !v->hostcalls || s->readonly || s->host->kind==GH_REMOTE) {
+            continue;
+        }
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewTool *t = v->msgs[i].tool;
+            if (v->msgs[i].role!=VIEW_TOOL || !t->host.len || !t->child.len ||
+                    (t->opened && !t->want) || !kidnamed(g, g->frame, s, t->host)) {
+                continue;
+            } else if (t->want || t->status==VTOOL_RUNNING) {
+                kidreach(g, g->frame, t, t->want);
+            } else if (t->status == VTOOL_BACKGROUND) {
+                GuiHost    *h = findhost(g, GH_REMOTE, t->host);
+                b32         up = h && h->r && !h->closing && h->up;
+                GuiSession *k = up ? findsess(g, h, t->child) : 0;
+                if (k && k->listed && k->state!=LIVE_IDLE && k->state!=LIVE_CLOSED) {
+                    kidreach(g, g->frame, t, 0);
+                }
+            }
+        }
+    }
+}
+
+// How the window's link to a running task's host is, if not up.
+static Str kidlink(Gui *g, Arena *a, ViewTool *t, i64 nowms)
+{
+    GuiHost *h = findhost(g, GH_REMOTE, t->host);
+    if (h && h->userclosed && (!h->r || h->closing)) {
+        return "disconnected: its asks are denied";
+    } else if (!h || h->state==RS_CONNECTING || h->state==RS_CLOSED) {
+        return "connecting";
+    }
+    switch (h->state) {
+    case RS_DEPLOYING:
+        return "deploying an engine there";
+    case RS_DOWN: {
+        i64 left = countdown(g, h->retryat, nowms);
+        Buf b(a, 64);
+        print(&b, "reconnecting");
+        if (left > 0) {
+            print(&b, " in ");
+            print(&b, left);
+            print(&b, " s");
+        }
+        return finish(&b);
+    }
+    case RS_FAILED:
+        return h->deploys ? Str("no engine of this version there (Deploy engine, in its menu)")
+                          : concat(a, "cannot connect: ", h->msg);
+    }
+    return {};
 }
 
 // Whether the user moved subagent v to the background (its call's row in
@@ -1303,15 +1444,17 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
     ViewTool *t = m->tool;
     if (m->role==VIEW_TOOL && t->name=="task" && s) {
         r.child = taskchild(g, s, t);
-        if (r.child) {
-            r.amber = r.child->view && r.child->view->asks;
+        if (r.child || (t->child.len && kidnamed(g, g->frame, s, t->host))) {
+            r.amber = r.child && r.child->view && r.child->view->asks;
             r.kind  = ACT_OPEN;
             r.label = r.amber ? "Answer the subagent" : "Open subagent";
         }
     } else if (s && ((m->role==VIEW_TOOL && t->name=="send_message" && t->child.len) ||
                      (m->role==VIEW_NOTE && m->from.len))) {
         // A message's other session, if this window knows it
-        r.child = findsess(g, s->host, m->from.len ? m->from : t->child);
+        GuiHost *h = m->fromhost.len ? findhost(g, GH_REMOTE, m->fromhost) : s->host;
+        b32      ok = !m->fromhost.len || (h && kidnamed(g, g->frame, s, m->fromhost));
+        r.child = ok && h ? findsess(g, h, m->from.len ? m->from : t->child) : 0;
         if (r.child) {
             r.kind  = ACT_OPEN;
             r.label = m->fromkid ? "Open subagent" :
@@ -1373,12 +1516,18 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
     case ACT_OPEN:
         if (t && t->name=="task") {
             itemrect(g, RECT_TASKLINK);
-            ImGui::SetItemTooltip("Show the subagent's own transcript");
+            ImGui::SetItemTooltip(t->host.len ? "Show the subagent's own transcript, "
+                                                "on its host"
+                                              : "Show the subagent's own transcript");
         } else {
             itemrect(g, RECT_MSGLINK);
             ImGui::SetItemTooltip("Show that session's transcript");
         }
-        if (go) guiselect(g, act->child);
+        if (go && t && t->name=="task" && t->host.len) {
+            kidopen(g, t);
+        } else if (go) {
+            guiselect(g, act->child);
+        }
         break;
     case ACT_UNDO:
         itemrect(g, RECT_UNDO);
@@ -1748,8 +1897,9 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
             inforow("Tools", v->tools);
         }
         if (v->parent.len) {
-            GuiSession *p = findsess(g, s->host, v->parent);
-            inforow("Parent", p ? sesstitle(p) : v->parent);
+            GuiSession *p = sessup(g, s);
+            inforow("Parent", p ? sesstitle(p) : v->remote ? concat(&a, v->parent, " (on another host)")
+                                                           : v->parent);
         }
         if (s->host->kind != GH_ENGINE) {
             inforow("Host", hostlabel(g, &a, s->host));
@@ -1975,8 +2125,12 @@ static void drawsessbar(Gui *g)
     f32         rw    = ImGui::CalcTextSize(rl).x + 2*st.FramePadding.x;
     f32         rest  = (gw>0 ? gw + gap : 0) + tw + gap + rw + gap + infow;
     f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rest;
-    if (v->parent.len) {
-        GuiSession *p = findsess(g, s->host, v->parent);
+    if (v->parent.len && v->remote && !sessup(g, s)) {
+        ImGui::TextDisabled(v->role.len ? "Subagent (%s) of a session on another host"
+                                        : "Subagent%s of a session on another host",
+                            cstr0(&a, v->role));
+    } else if (v->parent.len) {
+        GuiSession *p = sessup(g, s);
         ImGui::TextDisabled(v->role.len ? "Subagent (%s) of" : "Subagent%s of",
                             cstr0(&a, v->role));
         ImGui::SameLine();
@@ -3931,7 +4085,7 @@ static void drawprompt(Gui *g)
         whytip(why.len ? why : Str("Attach an image, PNG, JPEG, GIF, WebP or BMP, to the next message: "
                                    "or drop one on the window, or paste one"));
     }
-    if (g->sess && hostcap(s->host, "plan") && !v->parent.len) {
+    if (g->sess && hostcap(s->host, "plan") && (!v->parent.len || v->remote)) {
         // The session's mode, one of these, as wide as the buttons, and
         // in red while nothing is asked (Bypass), which only the user
         // picks here, trusted to know what it does
@@ -4051,6 +4205,13 @@ static b32 sidafter(GuiSession **a, GuiSession **b)
 static Str sessparent(GuiSession *s)
 {
     return s->view && s->view->parent.len ? s->view->parent : s->parent;
+}
+
+// Whether a subagent's parent is on another host: then its mode is its
+// own to change, as its host has no parent for it.
+static b32 sessremote(GuiSession *s)
+{
+    return s->view ? s->view->remote : s->remote;
 }
 
 // A side chat's original session, else empty.
@@ -4339,7 +4500,7 @@ static Str modewhy(Gui *g, GuiSession *s, Str mode)
     View *v    = s->view;
     b32   plan = mode=="plan" || !v || v->plan;
     Str   cap  = mode=="bypass" ? Str("bypass") : Str("plan");
-    Str   why  = sesswhy(g, s, cap, plan && (!v || !v->asks), 1);
+    Str   why  = sesswhy(g, s, cap, plan && (!v || !v->asks), !sessremote(s));
     if (why.len || !v) {
         return why;
     }
@@ -4386,6 +4547,13 @@ static void sessclose(Gui *g, GuiSession *s)
 {
     if (!s->view) {
         return;
+    }
+    // Its subagents on other hosts with it, but the one shown
+    for (GuiSession *k = g->sessions; k; k = k->next) {
+        if (k!=s && k!=g->sess && k->view && k->host->kind==GH_REMOTE &&
+                sessremote(k) && sessup(g, k)==s) {
+            sessclose(g, k);
+        }
     }
     if (hostlive(g, s)) {
         guiclose(g, s);
@@ -4817,7 +4985,7 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
     if (!h || h->kind==GH_REMOTE) {
         if (live) {
             if (menuitem(g, a, "Disconnect", {})) {
-                hostclose(g, h);
+                hostleave(g, h);
             }
             ImGui::SetItemTooltip("Leave it: its sessions run on there");
         } else {
@@ -4996,7 +5164,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
             ImGui::SetItemTooltip("%s", live ? "Leave it: its sessions run on there" :
                                                connecttip(g, r->key));
             if (b && live) {
-                hostclose(g, h);
+                hostleave(g, h);
             } else if (b) {
                 remoteconnect(g, a, h ? h->name : remote);
             }
@@ -5039,6 +5207,9 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
         print(&tip, cwd);
         putbyte(&tip, '\n');
         print(&tip, s->sid);
+        if (sessremote(s) && !sessup(g, s)) {
+            print(&tip, "\nA subagent of a session on another host");
+        }
         if (v && gaugewidth(g, v)>0) {
             putbyte(&tip, '\n');
             gaugetip(&tip, v);
@@ -5089,8 +5260,15 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
     if (sessparent(s).len && v && v->role.len) {
         pen(&b, v->role, 0, g->pal->dim);
         pen(&b, "  ", 0, g->pal->dim);
+    } else if (sessremote(s) && !sessup(g, s)) {
+        pen(&b, "subagent", STYLE_BOLD, g->pal->dim);
+        pen(&b, "  ", 0, g->pal->dim);
     } else if (!sessparent(s).len && sessside(s).len) {
         pen(&b, "side", STYLE_BOLD, g->pal->dim);
+        pen(&b, "  ", 0, g->pal->dim);
+    }
+    if (r->away) {
+        pen(&b, concat(&a, "on ", s->host->name), STYLE_BOLD, g->pal->active);
         pen(&b, "  ", 0, g->pal->dim);
     }
     if (s->host->kind == GH_LOCAL) {
@@ -5207,6 +5385,17 @@ static void drawsessions(Gui *g)
             e.host     = (i32)i;
             e.sid      = s->sid;
             e.parent   = sessnest(g, s);
+            if (sessremote(s)) {
+                // Under its parent on this machine's host, if listed
+                GuiSession *up = sessup(g, s);
+                e.parent = {};
+                for (iz n = 0; up && n < refs.len; n++) {
+                    if (refs[n].h == up->host) {
+                        e.parent = up->sid;
+                        e.phost  = (i32)n + 1;
+                    }
+                }
+            }
             e.group    = s->group;
             e.archived = s->archived;
             e.asks     = v && v->asks && !s->readonly;
@@ -5234,6 +5423,7 @@ static void drawsessions(Gui *g)
             case SROW_SESSION: print(&d, "S "); print(&d, sesstitle(sess[r->sess])); break;
             case SROW_ARCHIVED: print(&d, "A"); break;
             }
+            print(&d, r->away ? Str("@") : Str(""));
             print(&d, r->folded ? Str("+\n") : Str("\n"));
         }
         Str t = finish(&d);
@@ -5371,7 +5561,7 @@ static void drawsessdialogs(Gui *g)
                 if (s->gone) continue;
                 // Not held open by this client: its views go first
                 for (GuiSession *k = g->sessions; k; k = k->next) {
-                    if (k->view && k->host==s->host && sessroot(g, k)==s) {
+                    if (k->view && sessroot(g, k)==s) {
                         sessclose(g, k);
                     }
                 }
@@ -6685,7 +6875,7 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
                                 closing ? "Connect again once it has let go" :
                                           connecttip(g, name));
     if (click && live) {
-        hostclose(g, h);
+        hostleave(g, h);
     } else if (click) {
         remoteconnect(g, a, name);
     }

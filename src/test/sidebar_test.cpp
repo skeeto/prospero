@@ -3,8 +3,8 @@
 // what folds and what stays open.
 
 // The rows, one a line: indentation, then G group, H host, S sid or A
-// for Archived, with + folded, ! open regardless, and the count of a
-// heading.
+// for Archived, with + folded, ! open regardless, @ away, and the count
+// of a heading.
 static Str siderows(Arena *a, SideIn *in, Slice<SideRow> rows)
 {
     Buf b(a, 512);
@@ -36,6 +36,7 @@ static Str siderows(Arena *a, SideIn *in, Slice<SideRow> rows)
         }
         print(&b, r->folded ? Str("+") : Str(""));
         print(&b, r->forced ? Str("!") : Str(""));
+        print(&b, r->away ? Str("@") : Str(""));
         putbyte(&b, '\n');
     }
     return finish(&b);
@@ -164,6 +165,59 @@ static void test_sidebar(Test *t)
            "  S b1\n"
            "   S b1k\n");
     two.sess[2].asks = 0;
+
+    // Subagents on another host than their parent's (phost), under it in
+    // its group and heading, marked away; one whose parent is not here
+    // a root on its own host; and the same sid on each host kept apart
+    SideIn far = {};
+    far.heads = 1;
+    far.hosts = push(&a, far.hosts, SideHost{"this", 1});
+    far.hosts = push(&a, far.hosts, SideHost{"remote:r", 1});
+    far.sess  = push(&a, far.sess, sidesess(0, "p", {}, "work", 0));
+    far.sess  = push(&a, far.sess, sidesess(1, "k2", "p", {}, 0));
+    far.sess  = push(&a, far.sess, sidesess(1, "k1", "p", {}, 0));
+    far.sess  = push(&a, far.sess, sidesess(1, "o", {}, {}, 0));
+    far.sess  = push(&a, far.sess, sidesess(1, "p", {}, {}, 0));
+    far.sess  = push(&a, far.sess, sidesess(1, "q", "p", {}, 0));
+    far.sess[1].phost = 1;
+    far.sess[2].phost = 1;
+    Slice<SideRow> frows = sidetree(&a, &far);
+    expect(t, "sidebar.away", siderows(&a, &far, frows),
+           "G work 3\n"
+           " H this 3\n"
+           "  S p\n"
+           "   S k1@\n"
+           "   S k2@\n"
+           "H this 0\n"
+           "H remote:r 3\n"
+           " S o\n"
+           " S p\n"
+           "  S q\n");
+    expect(t, "sidebar.awayhost", istr(&a, frows[3].host), "1");
+
+    // Folded under its parent, unless one asks
+    *upsert(&far.folds, "s:this:p", &a) = 1;
+    expect(t, "sidebar.awayfold", siderows(&a, &far, sidetree(&a, &far)),
+           "G work 3\n"
+           " H this 3\n"
+           "  S p+\n"
+           "H this 0\n"
+           "H remote:r 3\n"
+           " S o\n"
+           " S p\n"
+           "  S q\n");
+    far.sess[1].asks = 1;
+    expect(t, "sidebar.awayask", siderows(&a, &far, sidetree(&a, &far)),
+           "G work 3!\n"
+           " H this 3!\n"
+           "  S p!\n"
+           "   S k1@\n"
+           "   S k2@\n"
+           "H this 0\n"
+           "H remote:r 3\n"
+           " S o\n"
+           " S p\n"
+           "  S q\n");
 
     // Parents in a cycle still show, each once, after the roots (one
     // its own parent is one)

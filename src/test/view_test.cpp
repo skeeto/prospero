@@ -1034,6 +1034,40 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.background", istr(&a, v->msgs[1].tool->job*10 + v->msgs[1].collapsed), "40");
     }
 
+    // A subagent on another host: its host from the call's arguments,
+    // its sid from task.host, kept by a tool.end that names none; and a
+    // report from the background names its host
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"t1","name":"task","args":"{\"description\":\"Build\",\"host\":\"wsl\"}"},)"
+                    R"({"t":"call","id":"t2","name":"task","args":"{\"description\":\"Here\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"tool.start","call":"t1","name":"task",)"
+                    R"("args":"{\"description\":\"Build\",\"host\":\"wsl\"}"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"tool.start","call":"t2","name":"task",)"
+                    R"("args":"{\"description\":\"Here\"}"})");
+        ViewTool *t1 = v->msgs[0].tool;
+        expect(t, "panels.farhost", concat(&a, t1->host, istr(&a, v->hostcalls)), "wsl1");
+        expect(t, "panels.farunnamed", concat(&a, t1->child, "|"), "|");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":0,"ev":"task.host","call":"t1","host":"wsl","child":"far1"})");
+        expect(t, "panels.farnamed", concat(&a, t1->child, istr(&a, v->hostcalls)), "far11");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"tool.end","call":"t1","status":"error",)"
+                    R"("text":"Lost.","host":"wsl","ms":5})");
+        expect(t, "panels.farend", concat(&a, t1->child, t1->host), "far1wsl");
+        expect(t, "panels.nothost", concat(&a, v->msgs[1].tool->host, "|"), "|");
+        apply(v, a, R"({"sid":"s","seq":6,"ts":0,"ev":"notice","kind":"task","child":"far2",)"
+                    R"("host":"pi","text":"The subagent finished."})");
+        ViewMsg *m = &v->msgs[v->msgs.len-1];
+        expect(t, "panels.farreport", concat(&a, m->from, m->fromhost), "far2pi");
+
+        // The child's own view: its parent on another host
+        View *k = testview(&a);
+        apply(k, a, R"({"sid":"far1","seq":1,"ts":0,"ev":"session","cwd":"/w","model":"m",)"
+                    R"("parent":"s","call":"t1","depth":1,"remote":1,"via":"wsl","distro":"Ubuntu"})");
+        expect(t, "panels.farchild", concat(&a, k->parent, istr(&a, k->remote)), "s1");
+    }
+
     // Messages between sessions: the sender's row names the target as
     // given, then by its title; a message read shows open, its sender
     // named, and linked by sid

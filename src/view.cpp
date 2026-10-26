@@ -238,6 +238,9 @@ struct ViewTool {
     i64  job;       // the background job it started, 0 if none
     Str  child;     // a task's subagent, once it reported, or a
                     // message's target
+    Str  host;      // the host a task's subagent runs on, if not this one
+    b32  opened;    // the window reached that subagent (kidsweep), once
+    b32  want;      // the user asked to see it: shown once reached
     i32  snap;      // the file it changed: index+1 in the view's snaps
     b32  elided;    // pruned: the agent sees only where its output is
     Str  image;     // a screenshot, relative to the session directory
@@ -361,6 +364,7 @@ struct ViewMsg {
     Str       from;       // a message's sender, a session's id, or the
                           // endpoint's URL of a mark of a model, or the
     b32       fromkid;    // subagent whose report it is (kind task)
+    Str       fromhost;   // and the host it ran on, if not this one
     ViewTool *tool;       // tool rows and asks
     ViewCard *card;       // compactions and rewinds
     Slice<ViewImage> images;  // the user's, attached
@@ -455,7 +459,9 @@ struct View {
     Str             role;
     Str             parent;     // a subagent's parent session, else empty
     Str             pcall;      // and the parent's task call
+    b32             remote;     // that parent is on another host
     i32             depth;
+    i32             hostcalls;  // task calls with a host, for kidsweep
     Str             tools;      // those offered, if restricted: blank separated
     Str             roleprompt;
     Str             scratch;    // its scratch directory, if any
@@ -1349,6 +1355,15 @@ static i32 addcall(View *v, Arena scratch, Str id, Str name, Str args)
     return i;
 }
 
+// The host a task call's subagent runs on, once known.
+static void taskhost(View *v, ViewTool *t, Str host)
+{
+    if (host.len && !t->host.len) {
+        t->host = clone(&v->aux, host);
+        v->hostcalls++;
+    }
+}
+
 // The body of a finished call: a diff for edits and writes that worked,
 // otherwise the result the agent read. Where the whole output is, which
 // the agent's text names in a last line, the row's Output action has.
@@ -1421,6 +1436,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->role     = clone(&v->aux, jsonstr(jsonget(j, "role")));
         v->parent   = clone(&v->aux, jsonstr(jsonget(j, "parent")));
         v->pcall    = clone(&v->aux, jsonstr(jsonget(j, "call")));
+        v->remote   = jsonint(jsonget(j, "remote"), 0) == 1;
         v->depth    = (i32)jsonint(jsonget(j, "depth"), 0);
         v->roleprompt = clone(&v->aux, jsonstr(jsonget(j, "prompt")));
         v->scratch    = clone(&v->aux, jsonstr(jsonget(j, "scratch")));
@@ -1662,6 +1678,26 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         m->tool->status   = VTOOL_RUNNING;
         m->tool->start    = r->ts;
         m->tool->startseq = r->seq;
+        if (m->tool->name == "task") {
+            Json *args = jsonparse(&scratch, m->tool->args).root;
+            taskhost(v, m->tool, jsonstr(jsonget(args, "host")));
+        }
+        m->ver++;
+    } return 1;
+
+    case EV_TASKHOST: {
+        // A task's subagent named by the host it runs on
+        i32 i = findcall(v, jsonstr(jsonget(j, "call")));
+        if (i < 0) {
+            return 0;
+        }
+        ViewMsg  *m   = &v->msgs[i];
+        ViewTool *t   = m->tool;
+        Str       kid = jsonstr(jsonget(j, "child"));
+        taskhost(v, t, jsonstr(jsonget(j, "host")));
+        if (kid.len) {
+            t->child = clone(&v->aux, kid);
+        }
         m->ver++;
     } return 1;
 
@@ -1702,7 +1738,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->spill   = clone(&v->aux, jsonstr(jsonget(j, "spill")));
         t->bytes   = jsonint(jsonget(j, "bytes"), 0);
         t->job     = jsonint(jsonget(j, "job"), t->job);
-        t->child   = clone(&v->aux, jsonstr(jsonget(j, "child")));
+        Str kid    = jsonstr(jsonget(j, "child"));
+        t->child   = kid.len ? clone(&v->aux, kid) : t->child;  // task.host's
+        taskhost(v, t, jsonstr(jsonget(j, "host")));
         Str to     = jsonstr(jsonget(j, "to"));
         Str title  = jsonstr(jsonget(j, "to_title"));
         if (t->name=="send_message" && (to.len || title.len)) {
@@ -1888,8 +1926,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             Str title = jsonstr(jsonget(j, "child_title"));
             Str name  = title.len ? title : kid.len ? kid : Str("a subagent");
             m->label   = oneline(&v->aux, concat(&scratch, "To the agent: the report of ", name));
-            m->from    = clone(&v->aux, kid);
-            m->fromkid = 1;
+            m->from     = clone(&v->aux, kid);
+            m->fromkid  = 1;
+            m->fromhost = clone(&v->aux, jsonstr(jsonget(j, "host")));
         } else {
             m->label = kind=="rewind"       ? Str("To the agent: files rewound") :
                        kind=="instructions" ? Str("To the agent: instruction files") :

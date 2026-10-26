@@ -1267,13 +1267,48 @@ def fakewsl(home):
             "PATH=/usr/bin:/bin exec sh -c \"$1\"\n")
 
 
+# --mode hosttask: the parent, this window's session, starts a subagent
+# on the remote far, as the prompt asks, and says what it heard; the
+# subagent there writes outside its directory, which asks, or sleeps
+def sc_hosttask(model, n, req):
+    F = fake_provider
+    msgs = req.get("messages", [])
+    if msgs and msgs[-1].get("role") == "tool":
+        yield from F.answer(model, "Heard: " + F.tool_results(req)[0][:200])
+        return
+    slow = "slow" in str(F.last_user(req))
+    yield from F.tool(model, n, "task", {
+        "description": "Sleep there" if slow else "Write there",
+        "prompt": "Sleep." if slow else "Write outside.",
+        "host": "far", "cwd": os.environ["HOSTTASK_WORK"], "model": F.second(model)})
+
+
+def sc_hosttask_b(model, n, req):
+    F = fake_provider
+    slow = F.task_prompt(req).startswith("Sleep")
+    if F.step(req) == 0 and slow:
+        yield from F.tool(model, n, "shell", {"command": "sleep 12", "timeout": 60})
+    elif F.step(req) == 0:
+        yield from F.tool(model, n, "write", {"path": "../hosttask-outside.txt",
+                                              "content": "from far\n"})
+    elif slow:
+        yield from F.answer(model, "Slept.")
+    else:
+        said = F.tool_results(req)
+        yield from F.answer(model, "Wrote: " + (said[0][:80] if said else "?"))
+
+
+fake_provider.SCENARIOS["hosttask"] = sc_hosttask
+fake_provider.SCENARIOS["hosttask_b"] = sc_hosttask_b
+
+
 class Far:
     """The remote host of --mode remote: over real ssh (--ssh), with the
     harness built there, or this machine itself through a fake ssh, its
     host started here for the test. Either way, in directories of its own
     that go at the end."""
 
-    def __init__(self, args, host, url, model, nonce):
+    def __init__(self, args, host, url, model, nonce, ask=3):
         self.args = args
         self.host = host
         self.local = not args.ssh
@@ -1288,7 +1323,7 @@ class Far:
         self.state = self.root + "/state"
         self.work = self.root + "/work"
         self.config = self.root + "/prospero.ini"
-        cfg = config(url, model) + "\n# Its host goes soon after its last client\n" \
+        cfg = config(url, model, ask) + "\n# Its host goes soon after its last client\n" \
                                    "[host]\nidle_exit = 5\n" \
                                    "\n# A model only it has, for its sessions' picker\n" \
                                    f"[model fake:far:{nonce}]\ncontext = 100000\n"
@@ -1359,9 +1394,17 @@ class Far:
                    f"state = {self.state}\nconfig = {self.config}\n"
                    if self.local and not self.windows else ""))
 
+    def hostsection(self):
+        """--mode hosttask's: the remote far, this machine through the
+        fake ssh, which the engine's subagents reach too."""
+        return (f"\n# Subagents' remote host\n[remote far]\nssh = here\n"
+                f"path = {self.prospero}\nstate = {self.state}\nconfig = {self.config}\n")
+
     def env(self):
         if not self.local:
             return {}
+        elif self.args.mode == "hosttask":
+            return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_SCP": self.scp}
         elif self.windows:
             return {"PROSPERO_TEST_SSH": self.ssh}
         # Engines started through the fake ssh leave out a cap, as an
@@ -1425,7 +1468,7 @@ def main():
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
                              "compose", "sessions", "plan", "launch", "firstrun",
-                             "mcp"])
+                             "mcp", "hosttask"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1447,6 +1490,8 @@ def main():
     if args.mode == "signals":
         return signals(args)
 
+    if args.mode == "hosttask" and (args.host or args.ssh):
+        ap.error("--mode hosttask runs only here, through the fake ssh")
     if args.mode == "remote" and args.ssh and not args.remote_prospero:
         ap.error("--ssh needs --remote-prospero")
     if args.mode == "e2e" and not args.model:
@@ -1536,6 +1581,12 @@ def main():
                 [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                               "fake_desktop.py")])
             before += DESKROLE
+    elif args.mode == "hosttask":
+        # The parent's model, and its subagent's, which far has too
+        model = f"fake:hosttask:{nonce}"
+        fake_provider.STATE.register(model)
+        fake_provider.STATE.register(fake_provider.second(model))
+        before = config(curl, model)
     elif args.mode == "firstrun":
         before = firstconfig(curl)
     elif args.mode == "drive" and not args.fake:
@@ -1560,6 +1611,11 @@ def main():
         # An include by URL, to fetch again from the settings window
         head, _, rest = before.partition("\n")
         before = f"{head}\ninclude = {curl}/fake/include.ini\n{rest}" + far.section()
+    elif args.mode == "hosttask":
+        # Its subagent's ask waits for the checklist to answer it
+        far = Far(args, host, curl, model, nonce, ask=60)
+        before += far.hostsection()
+        os.environ["HOSTTASK_WORK"] = far.work
     host.write(ini, before)
 
     holder = None
@@ -1637,6 +1693,8 @@ def main():
     elif status != 0:
         problems.append(f"exit status {status}")
     out = "".join(lines)
+    if args.mode == "hosttask":
+        problems += far.close(args.keep)
     if args.mode == "remote":
         problems += summaryproblems(status, lines, "the window")
         with fake_provider.STATE.lock:
@@ -1660,7 +1718,7 @@ def main():
         else:
             print("mcp: signed in through the stand-in browser, the call sent its token")
     if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
-                     "firstrun", "mcp"):
+                     "firstrun", "mcp", "hosttask"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")

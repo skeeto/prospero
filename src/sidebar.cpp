@@ -9,7 +9,9 @@
 // under each group and the Archived heading too, where that host has
 // sessions; at the top level every host listed always shows, empty or
 // not. Within a host, roots are newest first and subagents oldest first
-// under their parents, as the engine lists them.
+// under their parents, as the engine lists them. A subagent on another
+// host than its parent's (phost) goes under that parent, in its
+// section and host heading, marked away.
 //
 // Every heading folds, and so does a session with subagents. The user's
 // choices are kept by key (folds: 1 folded, 0 open); without one, the
@@ -44,6 +46,7 @@ struct SideSess {
     i32  host;      // index into the hosts
     Str  sid;
     Str  parent;    // a subagent's, else empty
+    i32  phost;     // that parent's host index + 1, if another host's
     Str  group;     // its group, if any: only a root's counts
     b32  archived;  // only a root's counts
     b32  active;    // runs a turn
@@ -73,6 +76,7 @@ struct SideRow {
     b32 folded;   // its rows below are left out
     b32 forced;   // open whatever the user chose
     b32 kids;     // a session with subagents
+    b32 away;     // SROW_SESSION: on another host than its root
     i32 count;    // sessions under it, subagents included (headings)
     b32 asks;     // something under it asks (headings)
 };
@@ -139,6 +143,7 @@ static void sideemit(SideTree *t, i32 i, i32 depth, Str group, i32 level)
     r.sess   = i;
     r.group  = group;
     r.kids   = any && level<SIDE_DEPTH;
+    r.away   = s->host != t->in->sess[t->root[i]].host;
     r.count  = t->size[i];
     r.asks   = t->asks[i];
     if (r.kids) {
@@ -267,7 +272,7 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
         parent[i] = -1;
         if (s->parent.len) {
             Buf key(a, 8 + s->parent.len);
-            print(&key, (i64)s->host);
+            print(&key, (i64)(s->phost ? s->phost-1 : s->host));
             putbyte(&key, ':');
             print(&key, s->parent);
             i32 *p = upsert(&bysid, finish(&key), (Arena *)0);

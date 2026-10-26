@@ -442,6 +442,7 @@ struct GuiHost {
     i64      retryat;   // epoch ms: it tries again then, while down
     b32      up;        // it answered hello
     b32      closing;   // asked to close: its records are let go
+    b32      userclosed; // the user disconnected it: kidsweep leaves it be
     b32      reconnect; // asked to connect while closing: once it has ended
     b32      own;       // this process's own host, after the window came back
     i64      pid;       // GH_LOCAL: the host's process
@@ -504,6 +505,7 @@ struct GuiSession {
     b32          nofolder;  // cwd is a folder of its own, from the list
     Str          model;
     Str          parent;    // a subagent's, from the list until opened
+    b32          remote;    // and that parent is on another host
     Str          sideof;    // a side chat's original, from the list until opened
     i64          mtime;
     i64          jobs;      // running background jobs, from the list
@@ -3530,6 +3532,7 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         s->nofolder = jsonint(jsonget(e, "nofolder"), 0) == 1;
         s->model  = s->model==model   ? s->model  : clone(&g->perm, model);
         s->parent = s->parent==parent ? s->parent : clone(&g->perm, parent);
+        s->remote = jsonint(jsonget(e, "remote"), 0) == 1;
         s->mtime  = jsonint(jsonget(e, "mtime"), 0);
         s->jobs   = jsonint(jsonget(e, "jobs"), 0);
         s->locked = jsonint(jsonget(e, "locked"), 0) != 0;
@@ -5717,6 +5720,7 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
 {
     GuiHost *h = findhost(g, GH_REMOTE, name);
     h = h ? h : addhost(g, GH_REMOTE, name);
+    h->userclosed = 0;
     if (h->r && !h->closing) {
         return h;
     }
@@ -5755,6 +5759,14 @@ static void hostclose(Gui *g, GuiHost *h)
         remoteclose(h->r);
         scheddirty(&g->sched);
     }
+}
+
+// The user's Disconnect: and no subagent's link reaches it again until
+// the user connects (kidsweep).
+static void hostleave(Gui *g, GuiHost *h)
+{
+    h->userclosed = 1;
+    hostclose(g, h);
 }
 
 // The background hosts of the state directory, as registered, but not
@@ -5998,12 +6010,26 @@ static Str hoststatus(Gui *g, Arena *a, GuiHost *h, i64 left)
 
 static b32 hostcap(GuiHost *, Str);
 
+// A subagent's parent, if known here: on its own host, or, for one
+// started from another host (hostlink.cpp), a session of this machine's
+// hosts, whose engine linked to it. Another host's links are its own.
+static GuiSession *sessup(Gui *g, GuiSession *s)
+{
+    Str p      = s->view && s->view->parent.len ? s->view->parent : s->parent;
+    b32 remote = s->view ? s->view->remote : s->remote;
+    if (!p.len) {
+        return 0;
+    } else if (!remote) {
+        return findsess(g, s->host, p);
+    }
+    return s->host->kind==GH_REMOTE ? findlocal(g, p) : 0;
+}
+
 // The session a subagent belongs to, at the top of its parents here.
 static GuiSession *sessroot(Gui *g, GuiSession *s)
 {
     for (i32 n = 0; n < 16; n++) {
-        Str         p  = s->view && s->view->parent.len ? s->view->parent : s->parent;
-        GuiSession *up = p.len ? findsess(g, s->host, p) : 0;
+        GuiSession *up = sessup(g, s);
         if (!up || up==s) break;
         s = up;
     }
@@ -7509,6 +7535,8 @@ static b32 drivewaitdone(Gui *g);
 // them at most STREAM_PERIOD apart however many frames run between;
 // anything else applies at once, after the records held back before it.
 // Lost records come back from the logs.
+static void kidsweep(Gui *);
+
 static void drainmail(Gui *g, i64 now)
 {
     g->woke |= WOKE_MAIL;
@@ -7620,6 +7648,7 @@ static void drainmail(Gui *g, i64 now)
         flushdeltas(g);
         enginestopped(g);
     }
+    kidsweep(g);  // subagents on other hosts, as the records name them
     if (g->drive && g->drivewait && drivewaitdone(g)) {
         other = 1;
     }
@@ -8815,6 +8844,7 @@ enum : i32 {
     OP_CLIPBACK,  // the clipboard's text put back
     OP_OPENDIR,   // an open event (macOS: open -a) for the directory text
                   // in --cwd, or the launch's (prospero DIR) if empty
+    OP_CLOSEMAIN, // close the session the checklist made, as Close does
     OP_FLOAT,     // float the pane named text, dx by dy, centered; dx 0
                   // docks it back where it was before it first floated
 };
@@ -9182,6 +9212,14 @@ enum : i32 {
     CHK_MCPSTATE,     // the MCP server web's page says text
     CHK_MCPSIGNED,    // the sign-in to web succeeded, once, through the browser
     CHK_MCPCALL,      // the session's call to web's echo tool came back
+    CHK_FARKID,       // the latest task's subagent is open on far, under its
+                      // parent in the sidebar, marked away, the row on far
+    CHK_FARREPORT,    // its ask allowed from here, the file written there,
+                      // and the parent heard its report
+    CHK_FARLEFT,      // far disconnected stays so, the running task's row
+                      // saying that its asks are denied
+    CHK_FARSHOWN,     // the subagent on far is shown, linked to its parent
+    CHK_FARCLOSED,    // the parent closed, and its subagents' views on far
     CHK_COUNT,
 };
 
@@ -9408,6 +9446,11 @@ static Str chknames[] = {
     "a Windows path typed for a WSL distro became the distro's",
     "the MCP server's page says what it is", "signed in through the browser",
     "the MCP server's tool answered the session",
+    "the subagent on far was opened here, under its parent, its row on far",
+    "its ask, answered here, let it write there, and the parent heard",
+    "a host the user disconnected stays so, the task row saying so",
+    "Open subagent connected again and showed it, linked to its parent",
+    "closing the parent closed its subagent's view on far",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9475,6 +9518,8 @@ enum : i32 {
     W_NAMEDUPDATED,// the remote named by text is updated, or failed to be
     W_MCPSTATE,   // the MCP server web's page says what text begins
     W_MCPSIGNED,  // a sign-in to an MCP server ended
+    W_FARKID,     // the latest subagent on far is open here, at work
+    W_FARSHOWN,   // a session on far is shown, open, its replay applied
 };
 
 static Str waitnames[] = {
@@ -9495,8 +9540,9 @@ static Str waitnames[] = {
     "the WSL distro's section", "the dialog's host's models",
     "the named remote to come up", "the named remote to close",
     "the named remote's update", "the MCP server's state", "the MCP sign-in",
+    "the subagent on far", "the subagent on far shown",
 };
-static_assert(countof(waitnames) == W_MCPSIGNED+1);
+static_assert(countof(waitnames) == W_FARSHOWN+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -11731,6 +11777,73 @@ static DriveOp remoteops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// Subagents on another host (--hosttask, tests/gui.py --mode hosttask):
+// the parent's engine, this window's, starts each on the remote far (the
+// Far stand-in), and the window reaches it there by the same name. One
+// that asks: opened here and nested under its parent, its ask answered
+// from its card. One that sleeps: far disconnected by the user stays so,
+// the task row saying so, until Open subagent connects again; its link
+// leads back. Closing the parent closes its subagents' views.
+static DriveOp hosttaskops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    SHOWPANE("Hosts"),
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_SESSION, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "Start a subagent on far that asks."},
+    {OP_WAIT, W_KIDASK, 0, 0, 60000, ""},
+    {OP_MARK, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_FARKID, 0, 0, 0, ""},
+    {OP_CHECK, CHK_KIDASK, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "hosttask-1-ask"},
+    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_WAIT, W_ASK, 0, 0, 5000, ""},
+    {OP_SHOT, 0, 0, 0, 300, "hosttask-2-child"},
+    {OP_MOVE, T_ALLOW, 0, 0, 150, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MAIN, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_FARREPORT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "hosttask-3-report"},
+    // Disconnected by the user while one sleeps there
+    {OP_PROMPT, 0, 0, 0, 0, "Start a slow subagent on far."},
+    {OP_WAIT, W_FARKID, 0, 0, 60000, ""},
+    {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect far"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NAMEDCLOSED, 0, 0, 15000, "far"},
+    {OP_MAIN, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_FARLEFT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "hosttask-4-disconnected"},
+    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_FARSHOWN, 0, 0, 30000, ""},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FARSHOWN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "hosttask-5-reopened"},
+    {OP_MOVE, T_PARENTLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    // Closing the parent closes its subagents' views
+    {OP_CLOSEMAIN, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_FARCLOSED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // MCP (--mcp, tests/gui.py --mode mcp): the page of [mcp web], a fake
 // server over HTTP that wants a sign-in, says it is not signed in; Sign
 // in, through the checklist's stand-in browser, signs in; a session's
@@ -13242,6 +13355,10 @@ static b32 drivewaitdone(Gui *g)
         GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
         return h && h->up;
     }
+    case W_FARKID: {
+        GuiSession *k = drivekid(g, 0);
+        return k && k->host->kind==GH_REMOTE && k->host->name=="far" && k->view->busy;
+    }
     case W_NAMEDCLOSED: {
         GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
         return h && !h->r && h->state==RS_CLOSED;
@@ -13321,6 +13438,9 @@ static b32 drivewaitdone(Gui *g)
         return !running(g);
     case W_OPENED:
         return g->sess && g->sess->view && !g->sess->openid && v->lastseq;
+    case W_FARSHOWN:
+        return g->sess && g->sess->view && !g->sess->openid && v->lastseq &&
+               g->sess->host->kind==GH_REMOTE && g->sess->host->name=="far";
     case W_AMBER:
         return g->ambershown;
     case W_BACKOFF:
@@ -14458,6 +14578,47 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->drivemain && g->sess!=g->drivemain && v->parent==g->drivemain->sid &&
                task && g->rects[RECT_PARENTLINK].x1>0;
     }
+    case CHK_FARKID: {
+        Arena       a    = g->frame;
+        GuiSession *k    = drivekid(g, 0);
+        GuiSession *p    = g->drivemain;
+        ViewMsg    *m    = p && p->view ? lastof(p->view, VIEW_TOOL) : 0;
+        Str         dump = {g->sidedump, g->sidelen};
+        Str         line = concat(&a, concat(&a, "S ", sesstitle(k ? k : p)), "@\n");
+        return k && p && k->host->kind==GH_REMOTE && k->host->name=="far" &&
+               k->view->remote && sessup(g, k)==p && m && m->tool->name=="task" &&
+               m->tool->host=="far" && m->tool->child==k->sid && find(dump, line)>0;
+    }
+    case CHK_FARREPORT: {
+        Arena       a = g->frame;
+        GuiSession *k = drivekid(g, 0);
+        ViewMsg    *q = k ? lastof(k->view, VIEW_ASK) : 0;
+        ViewMsg    *m = lastof(v, VIEW_ASSISTANT);
+        Str         f = join(&a, g->driverwd, "../hosttask-outside.txt");
+        return g->sess==g->drivemain && q && q->tool->answer==VASK_ALLOWED &&
+               q->tool->by=="user" && m && find(m->text, "Heard: Wrote")>=0 &&
+               os_stat(g->os, a, f).type==STAT_FILE;
+    }
+    case CHK_FARLEFT: {
+        Arena    a = g->frame;
+        GuiHost *h = findhost(g, GH_REMOTE, "far");
+        ViewMsg *m = g->drivemain && g->drivemain->view
+                   ? lastof(g->drivemain->view, VIEW_TOOL) : 0;
+        return h && !h->r && h->userclosed && m && m->tool->status==VTOOL_RUNNING &&
+               kidlink(g, &a, m->tool, os_time(g->os))=="disconnected: its asks are denied";
+    }
+    case CHK_FARSHOWN: {
+        GuiSession *s = g->sess;
+        return s && s!=g->drivemain && s->host->kind==GH_REMOTE && s->host->name=="far" &&
+               v->remote && sessup(g, s)==g->drivemain && g->rects[RECT_PARENTLINK].x1>0;
+    }
+    case CHK_FARCLOSED: {
+        i32 open = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            open += s->view && s->host->kind==GH_REMOTE && sessup(g, s)==g->drivemain;
+        }
+        return g->drivemain && !g->drivemain->view && !open;
+    }
     case CHK_PARENTSHOWN:
         return g->sess && g->sess==g->drivemain;
     case CHK_MSGNOTE:
@@ -15571,6 +15732,11 @@ static void drivestep(Gui *g)
     case OP_SUMMARY:
         drivesummary(g);
         break;
+    case OP_CLOSEMAIN:
+        if (g->drivemain) {
+            sessclose(g, g->drivemain);
+        }
+        break;
     case OP_MAIN:
         if (g->drivemain) {
             guiselect(g, g->drivemain);
@@ -15950,6 +16116,8 @@ static Str guiusage =
 "                 Plan window, the toggle and /plan\n"
 "  --mcp          an MCP server's page in Settings: its state, Sign in\n"
 "                 (a stand-in browser), a call from a session, Sign out\n"
+"  --hosttask     subagents on another host: opened and answered here, a\n"
+"                 Disconnect kept, Open subagent, the parent closed\n"
 "  --launch       prospero DIR's checklist: DIR's session, another launch's\n"
 "                 handed off (tests/gui.py drives it), a session with no folder\n"
 "  --firstrun     a first run's layout, with nothing configured (with\n"
@@ -16128,7 +16296,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
-    b32 launch = 0, first = 0, mcp = 0;
+    b32 launch = 0, first = 0, mcp = 0, hosttask = 0;
     i64 history = 0;
     Str opendir = {};  // prospero DIR, as given
     i32 bench   = 0;
@@ -16173,6 +16341,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             plan = probe = 1;
         } else if (a == "--mcp") {
             mcp = probe = 1;
+        } else if (a == "--hosttask") {
+            hosttask = probe = 1;
         } else if (a == "--firstrun") {
             first = probe = 1;
         } else if (a == "--compose-again") {
@@ -16241,9 +16411,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
             background || attach || remote || compose || sidebar || plan || launch ||
-            first || mcp) {
+            first || mcp || hosttask) {
         g->drive = 1;
-        if (mcp) {
+        if (hosttask) {
+            g->ops  = hosttaskops;
+            g->nops = countof(hosttaskops);
+        } else if (mcp) {
             g->ops  = mcpops;
             g->nops = countof(mcpops);
         } else if (first) {
