@@ -497,8 +497,121 @@ static void testtilde(Test *t)
     }
 }
 
+// A subagent of another host's session (new {task}): the task as new
+// gives it, its model, and its list entry, a root here even where its
+// parent's sid names a session here too.
+static void testremotetask(Test *t)
+{
+    Arena a = t->perm;
+    struct { Str json; Str want; } tasks[] = {
+        {"{}", "none"},
+        {"{\"task\":null}", "none"},
+        {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
+         "\"prompt\":\"go\",\"via\":\"ssh\"}}", "ok|20260101-000000-aaaa|c1|ssh||1|0|0"},
+        {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
+         "\"prompt\":\"go\",\"via\":\"wsl\",\"distro\":\"Ubuntu-24.04\",\"depth\":9,"
+         "\"hop\":-3,\"plan\":true,\"title\":\"T\",\"prefer\":\" e/m \"}}",
+         "ok|20260101-000000-aaaa|c1|wsl|Ubuntu-24.04|2|0|1"},
+        {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
+         "\"prompt\":\"go\",\"via\":\"wsl\",\"depth\":0,\"hop\":99}}",
+         "ok|20260101-000000-aaaa|c1|wsl||1|8|0"},
+        {"{\"task\":\"go\"}", "!task must be an object"},
+        {"{\"task\":{\"parent\":\"../x\",\"call\":\"c1\",\"prompt\":\"go\","
+         "\"via\":\"ssh\"}}", "!task.parent must be a session id"},
+        {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"prompt\":\"go\","
+         "\"via\":\"ssh\"}}", "!task.call must name the task call"},
+        {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
+         "\"prompt\":\" \",\"via\":\"ssh\"}}", "!task.prompt is empty"},
+        {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
+         "\"prompt\":\"go\",\"via\":\"door\"}}", "!task.via must be wsl or ssh"},
+        {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
+         "\"prompt\":\"go\",\"via\":\"ssh\",\"distro\":\"U\"}}",
+         "!task.distro must be a WSL distro's name"},
+        {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
+         "\"prompt\":\"go\",\"via\":\"wsl\",\"distro\":\"a/b\"}}",
+         "!task.distro must be a WSL distro's name"},
+        {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
+         "\"prompt\":\"go\",\"via\":\"wsl\",\"distro\":\"-x\"}}",
+         "!task.distro must be a WSL distro's name"},
+    };
+    for (iz i = 0; i < countof(tasks); i++) {
+        JsonDoc d = jsonparse(&a, tasks[i].json);
+        NewTask r = newtaskof(jsonget(d.root, "task"));
+        Buf     b(&a, 256);
+        if (r.err.len) {
+            print(&b, "!");
+            print(&b, r.err);
+        } else if (!r.ok) {
+            print(&b, "none");
+        } else {
+            Str parts[] = {r.parent, r.call, r.via, r.distro};
+            print(&b, "ok");
+            for (iz k = 0; k < countof(parts); k++) {
+                putbyte(&b, '|');
+                print(&b, parts[k]);
+            }
+            i64 nums[] = {r.depth, r.hop, r.plan};
+            for (iz k = 0; k < countof(nums); k++) {
+                putbyte(&b, '|');
+                print(&b, nums[k]);
+            }
+        }
+        expect(t, concat(&a, "newtaskof ", tasks[i].json), finish(&b), tasks[i].want);
+    }
+
+    // The call's model, else the role's (new's own), else the parent's
+    // where this host has its endpoint, else the default
+    CfgEnv v = newcfgenv(&a);
+    os_write(v.os, a, "/r/h.ini", "[endpoint fast]\nurl = http://fast/v1\n");
+    Config *c = newconfig(v.os, &a, v.scratch, "/r/h.ini", 0);
+    struct { Str model, role, prefer, want; } models[] = {
+        {"x",   "r", "fast/m", "x"},
+        {"",    "r", "fast/m", ""},
+        {"",    "",  "fast/m", "fast/m"},
+        {"",    "",  "slow/m", ""},
+        {"",    "",  "m",      ""},
+        {"",    "",  "",       ""},
+    };
+    for (iz i = 0; i < countof(models); i++) {
+        Str got = taskmodel(c, models[i].model, models[i].role, models[i].prefer);
+        Str tag = concat(&a, concat(&a, models[i].model, "|"), models[i].prefer);
+        expect(t, concat(&a, "taskmodel ", tag), got, models[i].want);
+    }
+
+    Engine *e = alloc<Engine>(&a);
+    e->os       = v.os;
+    e->out      = newmailbox(&a, 1<<16, 0, 0);
+    e->statedir = "/s";
+    MadeSession made[] = {{"20260101-000000-aaaa", {}}};
+    makesessions(v.os, &a, {made, countof(made)});
+    os_mkdirs(v.os, a, "/s/sessions/20260101-000001-bbbb");
+    os_write(v.os, a, "/s/sessions/20260101-000001-bbbb/events.jsonl",
+             "{\"sid\":\"20260101-000001-bbbb\",\"seq\":1,\"ts\":0,\"ev\":\"session\","
+             "\"cwd\":\"/w\",\"model\":\"m\",\"parent\":\"20260101-000000-aaaa\","
+             "\"call\":\"c1\",\"depth\":1,\"remote\":1,\"via\":\"ssh\"}\n");
+    {
+        Arena    tmp = v.scratch;
+        SessScan sc  = scansessions(e, &tmp);
+        expect(t, "remote child no kid here", istr(&tmp, sc.list[0].kids.len), "0");
+        expect(t, "remote child a root here", sc.list[1].parent, "");
+    }
+    cmdlist(e, v.scratch, 1);
+    Mail m    = mailtake(e->out);
+    Str  line = mailnext(&m).data;
+    JsonDoc d = jsonparse(&a, line);
+    Json   *x = jsonat(jsonget(d.root, "list"), 0);
+    Buf     entry(&a, 1024);
+    JsonOut w = {&entry};
+    putjson(&w, x);
+    expect(t, "list remote child entry", finish(&entry),
+           "{\"sid\":\"20260101-000001-bbbb\",\"title\":\"\",\"cwd\":\"/w\","
+           "\"model\":\"m\",\"state\":\"closed\",\"mtime\":0,\"locked\":0,\"jobs\":0,"
+           "\"parent\":\"20260101-000000-aaaa\",\"remote\":1}");
+}
+
 static void test_engine(Test *t)
 {
+    testremotetask(t);
     testtilde(t);
     testroles(t);
     testlist(t);

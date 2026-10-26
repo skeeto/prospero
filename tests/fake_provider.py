@@ -2904,6 +2904,53 @@ def sc_task_killwait_b(model, n, req):
         yield from answer(model, "Stopped my job; done.")
 
 
+# Subagents of a session on another host (new {task}), this engine alone
+
+def sc_task_remote(model, n, req):
+    sysp = system_of(req)
+    if step(req) == 0:
+        yield from tool(model, n, "shell", {"command": "pwd"})
+    else:
+        where = ("wsl" if "\\\\wsl.localhost\\Ubuntu\\home\\x" in sysp else
+                 "ssh" if "shares no files" in sysp else "none")
+        yield from answer(model, f"Remote report ({where}): {task_prompt(req)}")
+
+
+def sc_task_remote_plan(model, n, req):
+    yield from answer(model, "Planned.")
+
+
+def sc_task_remote_depth(model, n, req):
+    yield from answer(model, "Deep." if "task" not in tool_names(req) else "Can delegate.")
+
+
+def sc_task_remote_prefer(model, n, req):
+    yield from answer(model, "The default.")
+
+
+def sc_task_remote_prefer_b(model, n, req):
+    yield from answer(model, "The parent's model.")
+
+
+def sc_task_remote_cancel_idle(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "shell", {"command": "echo $$ > job.pid; exec sleep 30",
+                                            "background": True})
+    else:
+        yield from answer(model, "Waiting for my job.")
+
+
+def sc_task_remote_repair(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, "shell", {"command": "echo $$ > fg.pid; exec sleep 30",
+                                            "timeout": 60})
+    else:
+        yield from answer(model, "Not reached.")
+
+
+sc_task_remote_quit = sc_task_remote_repair
+
+
 def sc_fallback_limit(model, n, req):
     # The primary is down for its quick retries, then back
     if n < 11:

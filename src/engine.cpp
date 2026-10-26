@@ -129,6 +129,7 @@ enum : i64 {
     PARK_IDLE    = 7*60*SEC,      // idle this long, a session is parked
     TASK_SOFT    = 200,           // a subagent's requests, by default
     HOP_MAX      = 8,             // messages since user input that wake
+    FARREPORT_MAX = 512 << 10,    // bytes of a task.report's text
     MSG_TURN     = 20,            // send_message calls a turn
     SESS_SHOWN   = 50,            // unrelated sessions the sessions tool lists
     // Images attached to a message (upload, prompt)
@@ -643,6 +644,10 @@ struct Session {
     i32          depth;      // 0 for a session of the user's
     Str          psid;       // a subagent's parent, else empty
     Str          pcall;      // and the call that started it
+    Str          rparent;    // or a parent on another host (new {task}),
+                             // which reads the task.report, with pcall
+    Str          rvia;       // and how that host reaches this one: wsl, ssh
+    Str          rdistro;    // with wsl, this distro's name there
     Session     *parent;     // the parent, while both are in memory
     b32          intask;     // the parent waits for this one's report
     b32          bgtask;     // or no longer: the user moved it to the
@@ -3140,7 +3145,7 @@ static Str bypassrules(Session *s, Arena *a)
 {
     Buf b(a, 1024 + s->e->statedir.len);
     print(&b, s->modeheard==MODE_PLAN ? Str("Plan mode is off. ") : Str(""));
-    print(&b, s->depth ? Str("Bypass mode is on: the user allows the agent "
+    print(&b, s->psid.len ? Str("Bypass mode is on: the user allows the agent "
                              "you work for, and you, to work without asking. ")
                        : Str("Bypass mode is on: the user allows you to work "
                              "without asking. "));
@@ -10124,6 +10129,25 @@ static void buildprefix(Session *s, Arena scratch)
             "paths and details it needs, and anything you could not do. "
             "When you are told to wrap up, finish at once with your report.");
     }
+    if (s->rparent.len && s->rvia=="wsl") {
+        Str d = s->rdistro.len ? s->rdistro : Str("DISTRO");
+        s->system = concat(&s->perm, s->system,
+            "\n\nThat agent runs in Windows on this machine, outside this "
+            "Linux distro. It sees this distro's files only as "
+            "\\\\wsl.localhost\\");
+        s->system = concat(&s->perm, s->system, d);
+        s->system = concat(&s->perm, s->system,
+            "\\..., so /home/x is \\\\wsl.localhost\\");
+        s->system = concat(&s->perm, s->system, d);
+        s->system = concat(&s->perm, s->system,
+            "\\home\\x there, and the Windows drives are under /mnt here "
+            "(C:\\ is /mnt/c). Give it paths it can use.");
+    } else if (s->rparent.len) {
+        s->system = concat(&s->perm, s->system,
+            "\n\nThat agent runs on another machine, which shares no files "
+            "with this one: what it needs from your work must be in your "
+            "report.");
+    }
     // Tell the agent about the other places it may work
     Buf b(&s->perm, 256);
     for (iz i = 1; i < s->guard.roots.len; i++) {
@@ -10147,7 +10171,7 @@ static void buildprefix(Session *s, Arena scratch)
                            "test inputs, output you will not keep) in ");
         s->system = concat(&s->perm, s->system, dir);
         s->system = concat(&s->perm, s->system,
-                           s->depth ? Str(", which your parent agent shares")
+                           s->psid.len ? Str(", which your parent agent shares")
                                     : Str(", which is this session's own"));
         s->system = concat(&s->perm, s->system,
                            s->te.windows ? Str(", never in the working directory "
@@ -10377,6 +10401,15 @@ static void logsession(Session *s, Arena scratch)
         putstrkey(&w.json, "parent", s->psid);
         putstrkey(&w.json, "call", s->pcall);
         putintkey(&w.json, "depth", s->depth);
+    } else if (s->rparent.len) {
+        putstrkey(&w.json, "parent", s->rparent);
+        putstrkey(&w.json, "call", s->pcall);
+        putintkey(&w.json, "depth", s->depth);
+        putintkey(&w.json, "remote", 1);
+        putstrkey(&w.json, "via", s->rvia);
+        if (s->rdistro.len) {
+            putstrkey(&w.json, "distro", s->rdistro);
+        }
     }
     // Plan mode's tools go without saying: never a role's
     u32 plain = TOOL_OFFMASK | (s->role.len ? (u32)TOOL_PLANMASK : 0);
@@ -10822,6 +10855,10 @@ static Str reporttext(Session *c, Arena *a, Str why, Str err, Str *status)
     } else if (why == "cancel") {
         *status = "cancelled";
         print(&b, "The subagent was cancelled before it finished.");
+    } else if (why == "interrupted") {
+        *status = "error";
+        print(&b, "The subagent's harness stopped while it worked, so it "
+                  "did not finish.");
     } else if (why == "budget") {
         *status = "error";
         print(&b, "The subagent was stopped before it finished, at the end "
@@ -10838,6 +10875,24 @@ static Str reporttext(Session *c, Arena *a, Str why, Str err, Str *status)
         print(&b, report);
     }
     return finish(&b);
+}
+
+// The report of a subagent whose parent is on another host, durable in
+// its own log, where that host's engine reads it (task.report). why and
+// err are as reporttext's.
+static void logtaskreport(Session *c, Arena scratch, Str why, Str err)
+{
+    Str status = {};
+    Str text   = reporttext(c, &scratch, why, err, &status);
+    if (text.len > FARREPORT_MAX) {
+        text = concat(&scratch, utf8head(text, FARREPORT_MAX),
+                      "\n\n[The report was cut here at 512 KiB.]");
+    }
+    Buf   b(&scratch, 256 + text.len + text.len/8);
+    EvOut w = sbegin(c, &b, EV_TASKREPORT);
+    putstrkey(&w.json, "status", status);
+    putstrkey(&w.json, "text", text);
+    ssend(c, &w);
 }
 
 // A report over TASK_REPORT: all of it in a file of the parent's named
@@ -10878,7 +10933,13 @@ static void bgreport(Session *, Arena, Str why, Str err);
 static void taskreport(Session *c, Arena scratch, Str why, Str err)
 {
     c->intask = 0;
-    if (c->bgtask) {
+    if (c->rparent.len) {
+        // Not as the engine quits: opened again, it reports interrupted
+        if (!c->e->quitting && !c->readonly) {
+            logtaskreport(c, scratch, why, err);
+        }
+        return;
+    } else if (c->bgtask) {
         bgreport(c, scratch, why, err);
         return;
     }
@@ -10938,6 +10999,17 @@ static void taskflush(Session *s, Arena scratch)
     s->tasks = {};
     setstate(s, S_IDLE);
     nexttool(s, scratch);
+}
+
+// A subagent of another host's session, cancelled or closed while it
+// waits for its background jobs, which no turn may end now: its report
+// says cancelled, and its jobs stop.
+static void taskquit(Session *s, Arena scratch)
+{
+    if (s->rparent.len && s->intask && !busy(s)) {
+        stopjobs(s, scratch, s->e->quitting);
+        taskreport(s, scratch, "cancel", {});
+    }
 }
 
 // Cancel the subagents still at work: each reports at once, and their
@@ -11357,6 +11429,7 @@ struct ListEntry {
     Str       cwd;
     Str       model;
     Str       parent;  // a subagent's, else empty
+    Str       rparent; // or its parent's sid on another host
     Str       sideof;  // a side chat's original, else empty
     Str       group;   // empty if in none
     Str       scratch; // its scratch directory, if any
@@ -11405,6 +11478,10 @@ static SessScan scansessions(Engine *e, Arena *a)
         en.cwd      = jsonstr(jsonget(rec.root, "cwd"));
         en.model    = mod.len ? mod : jsonstr(jsonget(rec.root, "model"));
         en.parent   = jsonstr(jsonget(rec.root, "parent"));
+        if (jsonint(jsonget(rec.root, "remote"), 0) == 1) {
+            en.rparent = en.parent;  // on another host: here, a root
+            en.parent  = {};
+        }
         en.sideof   = jsonstr(jsonget(rec.root, "side_of"));
         en.scratch  = jsonstr(jsonget(rec.root, "scratch"));
         en.group    = sidecarget(e, a, d->name, "group", GROUP_MAX);
@@ -11900,6 +11977,79 @@ static Str unknowntools(Str list)
     return {};
 }
 
+// new {task}: the session is a subagent of a session on another host,
+// whose engine made it (see "Subagents on other hosts").
+struct NewTask {
+    b32 ok;      // a task was given
+    Str err;     // and why it will not do, else null
+    Str parent;  // the parent's sid there
+    Str call;    // its task call
+    Str title;
+    Str prefer;  // the parent's ENDPOINT/MODEL, if this host has ENDPOINT
+    Str via;     // how that host reaches this one: wsl or ssh
+    Str distro;  // with wsl, this distro's name there
+    Str prompt;
+    i32 depth;   // 1..TASK_DEPTH
+    i32 hop;     // 0..HOP_MAX
+    b32 plan;    // the parent plans
+};
+
+// A WSL distro's name, as wsl.exe lists it: no path, no spaces.
+static b32 plainname(Str s)
+{
+    b32 ok = s.len>0 && s.len<=64 && s[0]!='.' && s[0]!='-';
+    for (iz i = 0; ok && i<s.len; i++) {
+        u8 c = s[i];
+        ok = digit(c) || (c>='a' && c<='z') || (c>='A' && c<='Z') ||
+             c=='.' || c=='-' || c=='_';
+    }
+    return ok;
+}
+
+static NewTask newtaskof(Json *t)
+{
+    NewTask r = {};
+    if (t->type==JSON_MISSING || t->type==JSON_NULL) {
+        return r;
+    }
+    r.ok     = 1;
+    r.parent = jsonstr(jsonget(t, "parent"));
+    r.call   = jsonstr(jsonget(t, "call"));
+    r.title  = jsonstr(jsonget(t, "title"));
+    r.prefer = trim(jsonstr(jsonget(t, "prefer")));
+    r.via    = jsonstr(jsonget(t, "via"));
+    r.distro = jsonstr(jsonget(t, "distro"));
+    r.prompt = jsonstr(jsonget(t, "prompt"));
+    r.plan   = jsonflag(jsonget(t, "plan"), 0);
+    i64 depth = jsonint(jsonget(t, "depth"), 1);
+    i64 hop   = jsonint(jsonget(t, "hop"), 0);
+    r.depth = (i32)(depth<1 ? 1 : depth>TASK_DEPTH ? TASK_DEPTH : depth);
+    r.hop   = (i32)(hop<0 ? 0 : hop>HOP_MAX ? HOP_MAX : hop);
+    r.err   = t->type!=JSON_OBJECT ? Str("task must be an object") :
+              !validsid(r.parent)  ? Str("task.parent must be a session id") :
+              !r.call.len || r.call.len>256
+                                   ? Str("task.call must name the task call") :
+              !trim(r.prompt).len  ? Str("task.prompt is empty") :
+              r.via!="wsl" && r.via!="ssh"
+                                   ? Str("task.via must be wsl or ssh") :
+              r.distro.len && (r.via!="wsl" || !plainname(r.distro))
+                                   ? Str("task.distro must be a WSL distro's name")
+                                   : Str{};
+    return r;
+}
+
+// The model of a subagent for another host's session, as new names
+// one, when the call gave none (model) and the role has none: the
+// parent's own, prefer, as ENDPOINT/MODEL where this host's
+// configuration has that endpoint, else none, for the default.
+static Str taskmodel(Config *c, Str model, Str rolemodel, Str prefer)
+{
+    if (model.len || rolemodel.len) {
+        return model;
+    }
+    return cfgqualified(c, prefer).ok ? prefer : Str{};
+}
+
 // new {cwd, model?, endpoint?, role?, roots?, attended?, prompt?,
 //      edit_format?, tools?, steps?, instructions?, fallback?, temp?}: the
 // model and endpoint given, else the role's, else the configuration's.
@@ -11914,7 +12064,11 @@ static Str unknowntools(Str list)
 // A leading ~ in cwd is this host's home directory (tildepath). With
 // nofolder 1 instead of a cwd, the session works in a folder of its own,
 // its directory's work, which goes with it: no project's, so no
-// project's instruction files or skills either, only the user's.
+// project's instruction files or skills either, only the user's. With
+// task (NewTask), the session is the subagent of a session on another
+// host: of role general unless one is given, on the model the call gave,
+// else the role's, else the parent's own if this host has its endpoint
+// (taskmodel), its first turn the task's, its report a task.report.
 static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str  cwd   = jsonstr(jsonget(j, "cwd"));
@@ -11929,8 +12083,28 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     Str  temp  = jsonstr(jsonget(j, "temp"));
     b32  plan  = jsonflag(jsonget(j, "plan"), 0);
     b32  nofolder = jsonflag(jsonget(j, "nofolder"), 0);
+    NewTask task = newtaskof(jsonget(j, "task"));
+    if (task.err.len) {
+        reply(e, scratch, id, 0, task.err, {});
+        return;
+    }
+    name = task.ok && !name.len ? Str("general") : name;
     Role role  = name.len ? findrole(e, name) : Role{};
-    if (name.len && !role.ok) {
+    if (name.len && !role.ok && task.ok) {
+        Buf b(&scratch, 512);
+        print(&b, "no role is named \"");
+        print(&b, name);
+        print(&b, "\" there: give one of ");
+        Slice<Str> names = rolenames(e, &scratch);
+        for (iz i = 0; i < names.len; i++) {
+            print(&b, i ? Str(", ") : Str(""));
+            print(&b, names[i]);
+        }
+        print(&b, ", or none for general");
+        Str err = finish(&b);
+        reply(e, scratch, id, 0, err, {});
+        return;
+    } else if (name.len && !role.ok) {
         Str err = concat(&scratch, "no such role: ", name);
         reply(e, scratch, id, 0, err, {});
         return;
@@ -11960,6 +12134,10 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     } else if (plan && (role.deny | (tools.data ? tooldeny(tools) : 0))>>TOOL_PLANEXIT & 1) {
         reply(e, scratch, id, 0, "plan mode needs the exit_plan_mode tool", {});
         return;
+    }
+    Str asked = model;  // a task's call's
+    if (task.ok) {
+        model = taskmodel(e->cfg, model, role.model, task.prefer);
     }
     if (!model.len && role.model.len) {
         Target t = targetof(e, role.model, role.endpoint);  // ENDPOINT/MODEL?
@@ -12000,6 +12178,16 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "no usable endpoint: give a URL or a configured name", {});
         return;
     }
+    if (task.ok && asked.len) {
+        // Kept apart from the scratch that submodel works in
+        byte *mem  = alloc<byte>(&scratch, 1<<16);
+        Arena keep = {mem, mem + (1<<16)};
+        bad = submodel(e, &keep, scratch, model, probe.url);
+    }
+    if (bad.len) {
+        reply(e, scratch, id, 0, bad, {});
+        return;
+    }
 
     Str      sid = freshsid(e, &scratch);
     Session *s   = newsession(e, scratch, sid);
@@ -12014,6 +12202,17 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     s->rolepr     = clone(&s->perm, role.prompt);
     s->te.deny    = role.deny | (tools.data ? tooldeny(tools) : 0) |
                     deskdeny(e, scratch, role.ok) | skilldeny(e);
+    if (task.ok) {
+        // A subagent, as newchild makes one, of a parent on that host
+        s->depth    = task.depth;
+        s->rparent  = clone(&s->perm, task.parent);
+        s->pcall    = clone(&s->perm, task.call);
+        s->rvia     = clone(&s->perm, task.via);
+        s->rdistro  = clone(&s->perm, task.distro);
+        s->intask   = 1;
+        s->hop      = task.hop;
+        s->te.deny |= (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) | TOOL_PLANMASK;
+    }
     s->mcpfilter  = tools.data ? clone(&s->perm, tools) :
                     role.mcp.data ? clone(&s->perm, role.mcp) : Str{};
     s->stepmax    = steps>0 ? steps : 0;
@@ -12047,11 +12246,20 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     logprefix(s, scratch);
     if (plan) {
         setmode(s, scratch, MODE_PLAN, "new");
+    } else if (task.plan) {
+        setmode(s, scratch, MODE_PLAN, "parent");  // read-only for its task
+    }
+    if (task.ok) {
+        Str title = task.title.len ? task.title : task.prompt;
+        title = cleantitle(&scratch, title, TITLE_MAX);
+        settitle(s, scratch, title, "auto");
     }
     reply(e, scratch, id, 1, {}, s->sid);
 
     Str prompt = jsonstr(jsonget(j, "prompt"));
-    if (prompt.len) {
+    if (task.ok) {
+        startturn(s, scratch, task.prompt, "task");  // at its parent's hop
+    } else if (prompt.len) {
         startturn(s, scratch, prompt, "prompt");
     }
 }
@@ -12244,6 +12452,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
     Str storedmodel = {};
     Str storedurl   = {};
     b32 prefixed    = 0;
+    b32 reported    = 0;  // a task.report, by a subagent of another host's
     for (iz i = 0; i < rp.lines.len; i++) {
         Arena t = scratch;
         EvRec r = evparse(&t, rp.lines[i]);
@@ -12262,7 +12471,15 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             // Its role and place among subagents, as it began
             s->role   = clone(&s->perm, jsonstr(jsonget(j, "role")));
             s->rolepr = clone(&s->perm, jsonstr(jsonget(j, "prompt")));
-            s->psid   = clone(&s->perm, jsonstr(jsonget(j, "parent")));
+            // A parent on another host is no session here
+            Str parent = clone(&s->perm, jsonstr(jsonget(j, "parent")));
+            if (jsonflag(jsonget(j, "remote"), 0)) {
+                s->rparent = parent;
+                s->rvia    = clone(&s->perm, jsonstr(jsonget(j, "via")));
+                s->rdistro = clone(&s->perm, jsonstr(jsonget(j, "distro")));
+            } else {
+                s->psid = parent;
+            }
             s->pcall  = clone(&s->perm, jsonstr(jsonget(j, "call")));
             i64 depth = jsonint(jsonget(j, "depth"), 0);
             s->depth  = (i32)(depth<0 ? 0 : depth>TASK_DEPTH ? TASK_DEPTH : depth);
@@ -12326,6 +12543,9 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 s->grants = push(&s->perm, s->grants, g);
             }
         } break;
+        case EV_TASKREPORT:
+            reported = 1;
+            break;
         case EV_TURN:
             s->turn = jsonint(jsonget(j, "n"), s->turn);
             break;
@@ -12448,6 +12668,10 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
     instrlogstart(s, scratch);
     if (!prefixed) {
         logprefix(s, scratch);  // a log from before prefix records
+    }
+    if (s->rparent.len && !reported && !s->readonly) {
+        // Its engine stopped before it reported: its parent waits still
+        logtaskreport(s, scratch, "interrupted", {});
     }
     return s;
 }
@@ -12970,6 +13194,9 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     if (en->parent.len) {
         putstrkey(w, "parent", en->parent);
         putintkey(w, "depth", depth);
+    } else if (en->rparent.len) {
+        putstrkey(w, "parent", en->rparent);
+        putintkey(w, "remote", 1);
     }
     if (en->sideof.len) {
         putstrkey(w, "side_of", en->sideof);
@@ -13234,7 +13461,7 @@ static void cmdmode(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     b32 own  = s->state==S_ASK && (s->ask.tool==TOOL_PLANENTER ||
                                    s->ask.tool==TOOL_PLANEXIT);
     Str err  = mode<0   ? Str("mode must be plan, bypass or default") :
-               s->depth ? Str("a subagent's mode is its parent's") :
+               s->psid.len ? Str("a subagent's mode is its parent's") :
                mode==MODE_PLAN && !tooloffered(&s->te, TOOL_PLANEXIT)
                         ? Str("this session has no exit_plan_mode tool") :
                own      ? Str("the agent asks about plan mode: answer that instead") :
@@ -14730,6 +14957,7 @@ static void command(Engine *e, Arena scratch, Str line)
         if (!s->readonly) {
             s->closed = 1;
             stopjobs(s, scratch, 0);
+            taskquit(s, scratch);
         }
         if (s->state==S_ASK && !attending(s)) {
             resolve(s, scratch, 0, DENY_POLICY, "the user closed the session");
@@ -14813,6 +15041,7 @@ static void command(Engine *e, Arena scratch, Str line)
     case CMD_CANCEL:
         reply(e, scratch, id, 1, {}, sid);
         cancelturn(s, scratch);
+        taskquit(s, scratch);
         return;
     case CMD_BACKGROUND:
         cmdbackground(e, s, scratch, id, j);

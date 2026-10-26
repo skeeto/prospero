@@ -222,6 +222,8 @@ static Str capnames[] = {
                        // to the first endpoint and model there are
     "mcp.auth",        // mcp, mcp.auth, mcp.code, mcp.logout, mcp.restart:
                        // MCP servers listed, signed in to, started again
+    "task.remote",     // new {task}: a subagent of a session on another
+                       // host, which reads its durable task.report
 };
 
 static Str evname(i32 ev)

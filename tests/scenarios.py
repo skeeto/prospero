@@ -2514,7 +2514,7 @@ def hello_caps(t):
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
-                 "mcp", "mcp.auth"} <= set(caps)
+                 "mcp", "mcp.auth", "task.remote"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -3926,6 +3926,232 @@ def task_killwait(t):
     r = t.run(timeout=14)
     t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')}")
     t.check("Stopped my job; done." in r.text(), f"the parent heard: {r.text()!r}")
+
+
+# Subagents of a session on another host: new {task}, as that host's
+# engine sends it, here alone (tests/remote.py has both engines)
+
+FARPARENT = "20260101-000000-aaaa"
+
+
+def fartask(**over):
+    task = {"parent": FARPARENT, "call": "call_7_0", "depth": 1, "hop": 0,
+            "title": "Remote job", "via": "ssh", "prompt": "Do the thing."}
+    task.update(over)
+    return task
+
+
+def farreport(h, sid, timeout=20):
+    return h.wait(lambda e: e.get("ev") == "task.report" and e.get("sid") == sid,
+                  timeout)
+
+
+@scenario(bound=15)
+def task_remote(t):
+    """A subagent of a session on another host: its session record names
+    the parent and call there, its title is the task's, its prompt says
+    where its parent works, its turn is the task's, and its report is a
+    durable task.report. The list shows it as a root here, marked
+    remote, and its user may put it in Bypass mode."""
+    h = t.headless()
+    try:
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                   task=fartask(via="wsl", distro="Ubuntu"))
+        t.check(r.get("ok") == 1, f"new {r}")
+        sid = r["sid"]
+        rep = farreport(h, sid)
+        t.check(rep["status"] == "ok" and
+                rep["text"] == "Remote report (wsl): Do the thing.", f"report {rep}")
+        ses = h.all("session", sid)[0]
+        want = {"parent": FARPARENT, "call": "call_7_0", "depth": 1, "remote": 1,
+                "via": "wsl", "distro": "Ubuntu", "role": "general"}
+        t.check(all(ses.get(k) == v for k, v in want.items()), f"session {ses}")
+        title = h.all("title", sid)
+        t.check(title and title[0]["text"] == "Remote job" and title[0]["by"] == "auto",
+                f"title {title}")
+        user = h.all("user", sid)
+        t.check(user and user[0].get("via") == "task", f"user {user}")
+        sysp = t.requests()[0]["body"]["messages"][0]["content"]
+        t.check("# Subagent" in sysp and "Windows on this machine" in sysp, "told of WSL")
+        tools = [x["function"]["name"] for x in t.requests()[0]["body"]["tools"]]
+        t.check("task" in tools and "exit_plan_mode" not in tools, f"tools {tools}")
+        h.call("list")
+        entry = [e for e in h.all("sessions")[-1]["list"] if e["sid"] == sid]
+        t.check(entry and entry[0].get("parent") == FARPARENT and
+                entry[0].get("remote") == 1 and "depth" not in entry[0], f"listed {entry}")
+        r = h.call("mode", sid=sid, mode="bypass")
+        t.check(r.get("ok") == 1 and r.get("mode") == "bypass", f"bypass {r}")
+
+        # Over ssh, the prompt says nothing is shared
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", task=fartask())
+        rep = farreport(h, r["sid"])
+        t.check(rep["text"] == "Remote report (ssh): Do the thing.", f"report {rep}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def task_remote_plan(t):
+    """A task from a parent in plan mode starts in plan mode, by its
+    parent; on this host its user may still take it out."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
+                     task=fartask(plan=1))["sid"]
+        rep = farreport(h, sid)
+        t.check(rep["text"] == "Planned.", f"report {rep}")
+        t.check(modes(h, sid) == ["plan/parent"], f"modes {modes(h, sid)}")
+        r = h.call("mode", sid=sid, mode="default")
+        t.check(r.get("ok") == 1 and r.get("mode") == "default", f"off {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def task_remote_depth(t):
+    """A subagent as deep as subagents go has no task tool."""
+    h = t.headless()
+    try:
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
+                   task=fartask(depth=2))["sid"]
+        t.check(farreport(h, a)["text"] == "Deep.", "no task tool at depth 2")
+        b = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
+                   task=fartask(depth=1))["sid"]
+        t.check(farreport(h, b)["text"] == "Can delegate.", "a task tool at depth 1")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def task_remote_errors(t):
+    """What new refuses of a task: a role this host lacks (naming those
+    it has), a malformed task, a model not listed, a missing directory."""
+    h = t.headless()
+    try:
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", role="nope",
+                   task=fartask())
+        t.check(r.get("ok") == 0 and r["err"].startswith('no role is named "nope" there') and
+                "explore" in r["err"], f"role {r}")
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
+                   task=fartask(via="carrier pigeon"))
+        t.check(r.get("ok") == 0 and r["err"] == "task.via must be wsl or ssh", f"via {r}")
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
+                   task=fartask(prompt=""))
+        t.check(r.get("ok") == 0 and r["err"] == "task.prompt is empty", f"prompt {r}")
+        r = h.call("new", cwd=t.host.join(t.work, "nowhere"), model=t.model,
+                   endpoint="fake", task=fartask())
+        t.check(r.get("ok") == 0 and "cwd" in r["err"], f"cwd {r}")
+        h.call("models")  # this host's listing, which new checks
+        r = h.call("new", cwd=t.work, model="fake:nothing:here", endpoint="fake",
+                   task=fartask())
+        t.check(r.get("ok") == 0 and "no model" in r.get("err", ""), f"model {r}")
+        t.check(not h.all("task.report"), "nothing started")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def task_remote_prefer(t):
+    """With no model from the call or the role, the parent's model, where
+    this host has its endpoint; else this host's default."""
+    h = t.headless()
+    try:
+        a = h.call("new", cwd=t.work, task=fartask(prefer=f"fake/{t.model2}"))["sid"]
+        t.check(farreport(h, a)["text"] == "The parent's model.", "the parent's")
+        b = h.call("new", cwd=t.work, task=fartask(prefer=f"far/{t.model2}"))["sid"]
+        ses = h.all("session", b)[0]
+        t.check(farreport(h, b) and ses["model"] != t.model2, f"the default {ses['model']}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15, posix=True)
+def task_remote_cancel_idle(t):
+    """A subagent that waits for its background job, cancelled: it
+    reports cancelled, and its job stops."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
+                     task=fartask())["sid"]
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not t.pids("job.pid"):
+            time.sleep(0.05)
+        pids = t.pids("job.pid")
+        t.check(pids and not h.all("task.report"), "waiting for its job")
+        h.call("cancel", sid=sid)
+        rep = farreport(h, sid)
+        t.check(rep["status"] == "cancelled" and "Waiting for my job." in rep["text"],
+                f"report {rep}")
+        t.check(t.gone(pids), "its job stopped")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20, posix=True)
+def task_remote_repair(t):
+    """The engine killed while a subagent works: opened again, it reports
+    that it was interrupted, once."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
+                     task=fartask())["sid"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not t.pids("fg.pid"):
+            time.sleep(0.05)
+        pids = t.pids("fg.pid")
+    finally:
+        t.host.killhard(h.p)
+        h.close()
+    t.check(pids and t.gone(pids), "its command died with the harness")
+    for n in range(2):
+        h = t.headless()
+        try:
+            o = h.call("open", sid=sid, **{"from": 0})
+            t.check(o.get("ok") == 1, f"open {o}")
+            h.wait(lambda e: e.get("ev") == "session" and e.get("sid") == sid)
+            time.sleep(0.3)
+            reps = list({e["seq"]: e for e in h.all("task.report", sid)}.values())
+            t.check(len(reps) == 1 and reps[0]["status"] == "error" and
+                    "stopped while it worked" in reps[0]["text"], f"open {n}: {reps}")
+        finally:
+            h.call("quit")
+            h.close()
+
+
+@scenario(bound=20, posix=True)
+def task_remote_quit(t):
+    """The engine quits while a subagent works: it writes no report then,
+    since it did not finish, and opened again it reports interrupted."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
+                     task=fartask())["sid"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not t.pids("fg.pid"):
+            time.sleep(0.05)
+        pids = t.pids("fg.pid")
+        h.send("quit")
+        rc = h.exit()
+    finally:
+        h.close()
+    t.check(rc == 0 and pids and t.gone(pids), f"quit {rc}, its command stopped")
+    t.check(not h.all("task.report"), "no report as it quit")
+    h = t.headless()
+    try:
+        h.call("open", sid=sid, **{"from": 0})
+        h.wait(lambda e: e.get("ev") == "task.report" and e.get("sid") == sid)
+        reps = list({e["seq"]: e for e in h.all("task.report", sid)}.values())
+        t.check(len(reps) == 1 and reps[0]["status"] == "error", f"report {reps}")
+    finally:
+        h.call("quit")
+        h.close()
 
 
 @scenario(conf={"_extra": "[model {model}]\nfallback = {model2}\n"}, bound=15)
