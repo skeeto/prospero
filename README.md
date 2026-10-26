@@ -153,6 +153,7 @@ bundle stays as it is. Its README.txt lists the files.
     prospero connect NAME | --ssh DEST | --local [options]
     prospero deploy NAME|DEST [--force] [options]
     prospero eval [options] SUITE...
+    prospero mcp list | auth NAME | logout NAME [options]
 
 With no arguments, Prospero opens its window: sessions in a sidebar,
 subagents under their parents; the transcript, with markdown, code
@@ -637,6 +638,49 @@ so that the prompt cache keeps hitting between steps. A model gives points in pi
 `[model] coordinates = norm1000`, in thousandths of its width and
 height, as Qwen-VL and Gemini do; the harness maps them back to the
 screen. A model that takes no images is marked `vision = false`.
+
+## MCP servers
+
+MCP servers give the agent more tools, offered beside the built-in
+ones as `mcp__SERVER__TOOL`. Each is an `[mcp NAME]` section: a
+`command` that speaks MCP over its standard input and output, or the
+`url` of a server over HTTP (Streamable HTTP; not the old SSE
+transport).
+
+    [mcp stars]
+    command = uv run tools/starsmcp.py
+    cwd = ~/src/StarsVM
+    startup_timeout = 120
+
+    [mcp docs]
+    url = https://mcp.example.com/mcp
+
+A command is split into words with `'...'` or `"..."` quoting, and
+runs without a shell. Begin it with `'`, since a value beginning with
+`"` is quoted whole. It runs in the session's folder by default, is
+started for the sessions that use it, and stops a minute after the
+last one has gone. Its standard error is logged in the state
+directory's `mcp/logs`. `tools` keeps only some of a server's tools,
+`trust = yes` runs them without asking, and a role with a tools list
+names them as `mcp__NAME` or `mcp__NAME__TOOL`. Otherwise each call
+asks first, with an "always" for that tool. An included file cannot
+set `[mcp]`.
+
+A project's `.mcp.json`, in Claude Code's format, with `${VAR}` and
+`${VAR:-default}` expanded, is read once as a session starts, from its
+folder up to the repository's root. Its servers start only once you
+allow them, for the session or always for that project until their
+definitions change. Your own section of the same name wins.
+
+A server over HTTP may take a bearer `token` (as `env:NAME`) or
+`header.NAME` values, or want you to sign in with OAuth. Settings, on
+its page, has Sign in, which opens the browser and takes its return on
+a loopback port; `prospero mcp auth NAME` does the same without a
+window, printing the address to visit. Prospero discovers the
+authorization server, registers itself as a client unless `client_id`
+is set, and uses PKCE. It keeps the tokens in the state directory's
+`mcp/auth`, mode 0600, and refreshes them when the server refuses
+one. `prospero mcp logout NAME`, or Sign out, forgets them.
 
 ## Remote and background hosts
 

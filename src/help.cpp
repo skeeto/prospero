@@ -37,13 +37,16 @@ static u8 const help08[] = {
     #embed "../assets/help/08-desktop.md"
 };
 static u8 const help09[] = {
-    #embed "../assets/help/09-config.md"
+    #embed "../assets/help/09-mcp.md"
 };
 static u8 const help10[] = {
-    #embed "../assets/help/10-keys.md"
+    #embed "../assets/help/10-config.md"
 };
 static u8 const help11[] = {
-    #embed "../assets/help/11-trouble.md"
+    #embed "../assets/help/11-keys.md"
+};
+static u8 const help12[] = {
+    #embed "../assets/help/12-trouble.md"
 };
 #ifdef __clang__
 #  pragma clang diagnostic pop
@@ -58,6 +61,7 @@ enum : i32 {
     HELP_JOBS,
     HELP_HOSTS,
     HELP_DESKTOP,
+    HELP_MCP,
     HELP_CONFIG,
     HELP_KEYS,
     HELP_TROUBLE,
@@ -66,7 +70,7 @@ enum : i32 {
 
 static char const *helpnames[] = {
     "start", "sessions", "permissions", "plan", "instructions", "jobs",
-    "hosts", "desktop", "config", "keys", "trouble",
+    "hosts", "desktop", "mcp", "config", "keys", "trouble",
 };
 static_assert(countof(helpnames) == HELP_COUNT);
 
@@ -82,9 +86,10 @@ static Str helptext(i32 i)
     case HELP_JOBS:         return {(u8 *)help06, countof(help06)};
     case HELP_HOSTS:        return {(u8 *)help07, countof(help07)};
     case HELP_DESKTOP:      return {(u8 *)help08, countof(help08)};
-    case HELP_CONFIG:       return {(u8 *)help09, countof(help09)};
-    case HELP_KEYS:         return {(u8 *)help10, countof(help10)};
-    case HELP_TROUBLE:      return {(u8 *)help11, countof(help11)};
+    case HELP_MCP:          return {(u8 *)help09, countof(help09)};
+    case HELP_CONFIG:       return {(u8 *)help10, countof(help10)};
+    case HELP_KEYS:         return {(u8 *)help11, countof(help11)};
+    case HELP_TROUBLE:      return {(u8 *)help12, countof(help12)};
     }
     return {};
 }
