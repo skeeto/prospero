@@ -60,6 +60,13 @@ session here.... A remote's sessions use the models of its own
 configuration. With `list = connected` in its section, a remote is
 left out of the sidebar until connected.
 
+## Subagents there
+
+The agent may start a subagent on a remote host, or in a WSL distro,
+which works there and reports back: see
+[Subagents on other hosts](help:jobs). Its engine deploys there as
+connecting does, waiting for any deploy already under way.
+
 ## Deploying an engine
 
 The remote machine needs Prospero built for it. `prospero deploy NAME`

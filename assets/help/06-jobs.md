@@ -73,6 +73,26 @@ it does jobs: stop it from its own session. Quitting or restarting
 Prospero stops it as it stops any turn, and then its parent is not
 told.
 
+### Subagents on other hosts
+
+A task may run on one of your [remote hosts](help:hosts) instead: the
+agent's task tool names it as `host`, and on Windows that includes
+each WSL distro, as when the agent works in Windows but needs Linux.
+The subagent is a session there, under that host's own configuration,
+tools and permissions, and only its report comes back. Its role and
+model are that host's, and it starts in Plan mode if its parent plans,
+else in Build. In a WSL distro it works in its parent's folder as the
+distro sees it (`C:\work` is `/mnt/c/work`); over ssh, in its home
+directory, sharing no files with this machine.
+
+Its parent's engine reaches the host itself, as its shell could run
+`ssh` or `wsl.exe`, so this needs no window. The window reaches it
+too, by the same name, to show it under its parent, marked "on NAME",
+and to answer its asks. After Disconnect, the window leaves that host
+alone, and the task row says that the subagent's asks are denied;
+Open subagent connects again. `subagents = no` in a `[remote NAME]`
+section keeps the agent off that host.
+
 A subagent may start subagents of its own, but theirs cannot. It is
 told to wrap up after `[tools] task_budget` model requests (200 by
 default), and stopped at half as many again.

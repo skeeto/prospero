@@ -733,6 +733,22 @@ Its sessions' model picker lists the models of the remote's own
 configuration. `list = connected` leaves a remote out of the sidebar
 until it is connected.
 
+The agent's task tool may start a subagent on a remote, or on Windows
+in a WSL distro, by its name (`host`), with `cwd` there. The parent's
+engine links to it as the window would, with `new {task}`, so this
+works with no window too: the subagent is a session there, under that
+host's configuration, tools and asks, in Plan mode if its parent plans
+and else Build, with that host's role and model (the call's, the
+role's, the parent's ENDPOINT/MODEL if it has that endpoint, else its
+default). In a distro it starts in the parent's directory as the
+distro sees it, under `/mnt`; over ssh in its home. It writes its
+report in its log (`task.report`), and the parent's call ends with it.
+The window reaches the subagent by the same name, nests it under its
+parent, and answers its asks; with no window to show it, they are
+denied at their deadline. `subagents = no` leaves a remote out.
+Deploys to one destination take turns, so the window and an engine
+never upload over each other.
+
 A desktop helper there for the platform,
 `prospero-desktop-VERSION-OS-ARCH`, goes too, as
 `desktop-PROTO-VERSION-OS-ARCH` beside the engine, where the engine
