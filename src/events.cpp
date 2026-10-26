@@ -320,8 +320,9 @@ static Str evend(EvOut *r)
 }
 
 // What hello says the engine speaks: cmds, every command it takes, and
-// caps (capnames), with "host" from an engine behind a host (host.cpp).
-static void putcaps(JsonOut *w, b32 host)
+// caps (capnames), with "host" from an engine behind a host (host.cpp),
+// but drop, which a test names to stand in for an older engine's.
+static void putcaps(JsonOut *w, b32 host, Str drop = {})
 {
     putkey(w, "cmds");
     putarray(w);
@@ -332,12 +333,56 @@ static void putcaps(JsonOut *w, b32 host)
     putkey(w, "caps");
     putarray(w);
     for (iz i = 0; i < countof(capnames); i++) {
-        putstr(w, capnames[i]);
+        if (!(capnames[i] == drop)) {
+            putstr(w, capnames[i]);
+        }
     }
     if (host) {
         putstr(w, "host");
     }
     putend(w);
+}
+
+// Whether version a is before b, each as numbers between dots, compared
+// in turn (missing ones are 0), anything after the numbers ignored.
+static b32 versionless(Str a, Str b)
+{
+    for (i32 part = 0; part < 8; part++) {
+        i64 x = 0, y = 0;
+        for (; a.len && digit(a[0]); a = cuthead(a, 1)) x = x*10 + (a[0]-'0');
+        for (; b.len && digit(b[0]); b = cuthead(b, 1)) y = y*10 + (b[0]-'0');
+        if (x != y) {
+            return x < y;
+        }
+        a = a.len && a[0]=='.' ? cuthead(a, 1) : Str{};
+        b = b.len && b[0]=='.' ? cuthead(b, 1) : Str{};
+        if (!a.len && !b.len) {
+            break;
+        }
+    }
+    return 0;
+}
+
+// Whether an engine whose hello said version and caps is older than
+// this program's: an earlier version, or of this one (as every build
+// from source is "0.0.0") without a feature this one has.
+static b32 engineolder(Str version, Slice<Str> caps)
+{
+    if (versionless(version, PROSPERO_VERSION)) {
+        return 1;
+    } else if (versionless(PROSPERO_VERSION, version)) {
+        return 0;
+    }
+    for (iz i = 0; i < countof(capnames); i++) {
+        b32 has = 0;
+        for (iz k = 0; k < caps.len && !has; k++) {
+            has = caps[k] == capnames[i];
+        }
+        if (!has) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // A record read back.

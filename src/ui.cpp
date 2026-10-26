@@ -4696,15 +4696,23 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
         importstart(g, h);
     }
     ImGui::SetItemTooltip("A session from its raw log, exported here or elsewhere");
-    if (h && h->kind==GH_REMOTE) {
+    if (!h || h->kind==GH_REMOTE) {
         ImGui::Separator();
-        Str busy = updating(h) ? Str("Updating already") :
-                   !h->up      ? Str("It is not connected") : Str{};
-        if (menuitem(g, a, "Update engine", busy)) {
-            guiupdate(g, h);
+        Str why = deploywhy(g, h, name);
+        if (h && h->up) {
+            if (menuitem(g, a, "Update engine", why)) {
+                guiupdate(g, h);
+            }
+            ImGui::SetItemTooltip("Deploy this version's engine there, then start it "
+                                  "once nothing runs");
+        } else {
+            why = why.len || !h || !h->r ? why : Str("Connecting already");
+            if (menuitem(g, a, "Deploy engine", why)) {
+                guideploy(g, name);
+            }
+            ImGui::SetItemTooltip("Copy this version's engine there, as prospero deploy "
+                                  "does, then connect to it");
         }
-        ImGui::SetItemTooltip("Deploy this version's engine there, then start it once "
-                              "nothing runs");
     }
 }
 
@@ -6556,14 +6564,39 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         ImGui::PopStyleColor();
         g->failshown |= h->state == RS_FAILED;
     }
-    // [remote NAME] deploy = ask: offered here, once it is known to help
-    if (h && h->deploys && !live && !closing) {
+    // Deploying's progress, then Deploy engine whenever not connected, or
+    // Update engine for an older engine there
+    if (h && h->updating!=UPD_NONE && h->updmsg.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, h->updating==UPD_FAILED ? g->pal->bad
+                                                                     : g->pal->dim);
+        ImGui::TextWrapped("%s", cstr0(&a, h->updmsg));
+        ImGui::PopStyleColor();
+    }
+    // Not with a path in its section, which names the engine there
+    Str why = deploywhy(g, h, name);
+    if (!live && !closing && !(h && h->r) && !remoteset(g, name, "path").len) {
+        ImGui::BeginDisabled(why.len > 0);
         if (ImGui::SmallButton("Deploy engine")) {
-            remoteconnect(g, a, name, 1);
+            guideploy(g, name);
         }
-        itemnamed(g, "deploy engine");
-        ImGui::SetItemTooltip("Copy this version's engine there, as prospero deploy "
-                              "does, then connect to it");
+        ImGui::EndDisabled();
+        itemnamed(g, concat(&a, "deploy engine ", name));
+        ImGui::SetItemTooltip("%s", why.len ? cstr0(&a, why)
+                                            : "Copy this version's engine there, as "
+                                              "prospero deploy does, then connect to it");
+    } else if (live && hostolder(h)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+        ImGui::TextWrapped("The engine there is older than this program");
+        ImGui::PopStyleColor();
+        ImGui::BeginDisabled(why.len > 0);
+        if (ImGui::SmallButton("Update engine")) {
+            guiupdate(g, h);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, concat(&a, "update engine ", name));
+        ImGui::SetItemTooltip("%s", why.len ? cstr0(&a, why)
+                                            : "Deploy this version's engine there, then "
+                                              "start it once nothing runs");
     }
     ImGui::PopID();
 }

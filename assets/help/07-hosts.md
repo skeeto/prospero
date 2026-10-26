@@ -70,10 +70,17 @@ where) when the first has none for the platform, as releases name them, or are t
 is built for that platform. The engines zip (`tools/engines.py --zip`)
 unpacks into either place. With `deploy = auto` in the
 remote's section, connecting deploys one when the machine has none.
-Otherwise (`deploy = ask`, the default) the connection fails, and the
-Hosts pane offers Deploy engine under the reason, which deploys one and
-connects; `prospero deploy NAME` does the same from a terminal.
+Otherwise (`deploy = ask`, the default) the connection fails, saying
+why.
 
-A remote whose engine is older than this program shows what it cannot
-do disabled, and its menu has Update engine, which deploys this
-version's engine and starts it once nothing runs there.
+Deploy engine, in the Hosts pane under a remote that is not connected
+and in its menu in the sidebar, deploys this version's engine there and
+then connects; `prospero deploy NAME` deploys from a terminal. A remote
+whose section names its engine with `path` has none to deploy.
+
+A remote whose engine is older than this program (an earlier version,
+or the same one lacking something this program knows) shows what it
+cannot do disabled. The Hosts pane says so under it, and Update engine
+there and in its menu deploys this version's engine and starts it once
+nothing runs there. With `deploy = auto`, connecting to an older engine
+updates it by itself.

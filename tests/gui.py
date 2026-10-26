@@ -1190,12 +1190,23 @@ def lanaddress(host):
         s.close()
 
 
-FAKESSH = ("#!/bin/sh\n"
-           "# ssh, as far as the harness uses it: the command, here\n"
-           "while [ $# -gt 1 ]; do\n"
-           "  case \"$1\" in -o) shift 2;; -*) shift;; *) shift; break;; esac\n"
-           "done\n"
-           "exec sh -c \"$1\"\n")
+def fakessh(home):
+    """ssh, as far as the harness uses it: the command, here, in a home
+    directory of the test's own, where deploying puts an engine."""
+    return ("#!/bin/sh\n"
+            "while [ $# -gt 1 ]; do\n"
+            "  case \"$1\" in -o) shift 2;; -*) shift;; *) shift; break;; esac\n"
+            "done\n"
+            f"HOME='{home}'; export HOME; cd \"$HOME\" || exit 255\n"
+            "exec sh -c \"$1\"\n")
+
+
+def fakescp(home):
+    """scp, as deploying uses it: the last two words, a file here and
+    DEST:PATH, that path from the same home directory as fakessh's."""
+    return ("#!/bin/sh\n"
+            "for a; do src=$dst; dst=$a; done\n"
+            f"exec cp \"$src\" '{home}'/\"${{dst#*:}}\"\n")
 
 # The same for Windows, built there with w64devkit: the remote command
 # is a command line of its own, run as is with standard I/O inherited.
@@ -1238,17 +1249,19 @@ int main(void)
 # Desktop's, listed in UTF-16, and a command in Deb run here, where it
 # finds no prospero, as in a new distro; also Far, unlisted, which a
 # section names, its command run here too
-FAKEWSL = ("#!/bin/sh\n"
-           "if [ \"$1\" = -l ]; then printf '"
-           + "".join(f"\\{b:03o}" for b in "Deb\r\ndocker-desktop\r\n".encode("utf-16-le"))
-           + "'; exit 0; fi\n"
-           "if [ \"$2\" != Deb ] && [ \"$2\" != Far ]; then\n"
-           "  printf 'There is no distribution with the supplied name.\\r\\n'\n"
-           "  printf 'Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND\\r\\n'\n"
-           "  exit 255\n"
-           "fi\n"
-           "shift 7\n"
-           "PATH=/usr/bin:/bin exec sh -c \"$1\"\n")
+def fakewsl(home):
+    return ("#!/bin/sh\n"
+            "if [ \"$1\" = -l ]; then printf '"
+            + "".join(f"\\{b:03o}" for b in "Deb\r\ndocker-desktop\r\n".encode("utf-16-le"))
+            + "'; exit 0; fi\n"
+            "if [ \"$2\" != Deb ] && [ \"$2\" != Far ]; then\n"
+            "  printf 'There is no distribution with the supplied name.\\r\\n'\n"
+            "  printf 'Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND\\r\\n'\n"
+            "  exit 255\n"
+            "fi\n"
+            "shift 7\n"
+            f"HOME='{home}'; export HOME; cd \"$HOME\" || exit 255\n"
+            "PATH=/usr/bin:/bin exec sh -c \"$1\"\n")
 
 
 class Far:
@@ -1287,11 +1300,18 @@ class Far:
                 host.write(host.path("fakessh.c"), FAKESSH_C)
                 host.h.sh(f"cd {host.root} && gcc -O2 -o fakessh.exe fakessh.c -lshell32")
             else:
+                # Its home directory, not this user's: deploying there
+                # writes .prospero
+                home = os.path.join(host.root, "fakehome")
+                host.mkdir(home)
                 self.ssh = os.path.join(host.root, "fakessh")
-                host.write(self.ssh, FAKESSH)
+                host.write(self.ssh, fakessh(home))
                 os.chmod(self.ssh, 0o755)
+                self.scp = os.path.join(host.root, "fakescp")
+                host.write(self.scp, fakescp(home))
+                os.chmod(self.scp, 0o755)
                 self.wsl = os.path.join(host.root, "fakewsl")
-                host.write(self.wsl, FAKEWSL)
+                host.write(self.wsl, fakewsl(home))
                 os.chmod(self.wsl, 0o755)
             # The host first, here: started through the fake ssh, it would
             # descend from the GUI's reaper (Linux: a subreaper), or stay
@@ -1341,7 +1361,10 @@ class Far:
             return {}
         elif self.windows:
             return {"PROSPERO_TEST_SSH": self.ssh}
-        return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_WSL": self.wsl}
+        # Engines started through the fake ssh leave out a cap, as an
+        # older one would; this one's host, started here, does not
+        return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_WSL": self.wsl,
+                "PROSPERO_TEST_SCP": self.scp, "PROSPERO_TEST_DROPCAP": "bypass"}
 
     def hosts(self):
         """The hosts running for its state directory, as JSONL lines."""

@@ -383,6 +383,25 @@ static void testlogimport(Test *t)
     expect(t, "logimport long", r.err, "its session record is too long to be listed: over 4 KiB");
 }
 
+// Versions in order, and an engine older for an earlier version or,
+// of the same, for a feature it lacks.
+static void testolder(Test *t)
+{
+    Arena a = t->perm;
+    expect(t, "version.less", istr(&a, versionless("0.9.9", "1.0.0")), "1");
+    expect(t, "version.more", istr(&a, versionless("1.10.0", "1.9.3")), "0");
+    expect(t, "version.same", istr(&a, versionless("1.2.3", "1.2.3")), "0");
+    expect(t, "version.short", istr(&a, versionless("1.2", "1.2.1")), "1");
+    expect(t, "version.suffix", istr(&a, versionless("1.2.3-dev", "1.2.3")), "0");
+    Slice<Str> all = {capnames, countof(capnames), countof(capnames)};
+    expect(t, "older.same", istr(&a, engineolder(PROSPERO_VERSION, all)), "0");
+    Slice<Str> less = {capnames, countof(capnames)-1, countof(capnames)-1};
+    expect(t, "older.cap", istr(&a, engineolder(PROSPERO_VERSION, less)), "1");
+    expect(t, "older.version", istr(&a, engineolder("0.0.0-1", all)), "0");
+    Slice<Str> none = {};
+    expect(t, "older.newer", istr(&a, engineolder("999.0.0", none)), "0");
+}
+
 static void test_events(Test *t)
 {
     Arena perm    = t->perm;
@@ -991,4 +1010,5 @@ static void test_events(Test *t)
     testlogcopy(t);
     testlogside(t);
     testlogimport(t);
+    testolder(t);
 }

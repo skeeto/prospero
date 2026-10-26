@@ -323,6 +323,8 @@ struct Host {
     b32             quitting;  // the engine was told to stop
     i32             proto;     // the version in hello (a test hook changes it)
     iz              keepmax;   // bytes kept per client (a test hook changes it)
+    Str             dropcap;   // a cap hello leaves out (a test hook), as an
+                               // older engine would
     u64             nextconn;
 };
 
@@ -732,7 +734,7 @@ static void hosthello(Host *h, HostClient *c, Arena scratch, i64 id, Json *j)
     EvOut w = evbegin(&b, {}, 0, os_time(h->os), EV_HELLO);
     putintkey(&w.json, "proto", h->proto);
     putstrkey(&w.json, "version", PROSPERO_VERSION);
-    putcaps(&w.json, 1);
+    putcaps(&w.json, 1, h->dropcap);
     Str home = userhome(h->os, &scratch);  // the engine's, where ~ is
     if (home.len) {
         putstrkey(&w.json, "home", home);
@@ -1436,9 +1438,11 @@ static Host *newhost(Os *os, Arena *perm, Arena scratch, HostConf *hc, Str *err)
         *err = concat(perm, "a host already runs for this state directory: ", h->statedir);
         return 0;
     }
-    // Test hooks: another protocol, to test a mismatch, and a small
-    // queue per client, to test one that falls behind
+    // Test hooks: another protocol, to test a mismatch, a small queue
+    // per client, to test one that falls behind, and a cap left out, to
+    // pass for an older engine
     Int proto = parseint(os_getenv(os, &scratch, "PROSPERO_TEST_PROTO"));
+    h->dropcap = clone(perm, os_getenv(os, &scratch, "PROSPERO_TEST_DROPCAP"));
     Int keep  = parseint(os_getenv(os, &scratch, "PROSPERO_TEST_KEEPMAX"));
     h->proto   = proto.ok ? (i32)proto.val : h->proto;
     h->keepmax = HOST_KEEPMAX;

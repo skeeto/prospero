@@ -460,6 +460,8 @@ struct GuiHost {
     // again (UPD_*)
     i32        updating;
     Str        updmsg;  // how it goes, or went
+    b32        thenconnect;  // Deploy engine: connect once it is deployed
+    b32        autoupdated;  // deploy = auto updated it once already
     // The models its own configuration names, for its sessions' model
     // picker where it is not the main host (hostmodels)
     Slice<Str> models;
@@ -4642,6 +4644,12 @@ static b32 hostcap(GuiHost *h, Str name)
     return 0;
 }
 
+// Whether a connected remote runs an engine older than this program.
+static b32 hostolder(GuiHost *h)
+{
+    return h->kind==GH_REMOTE && h->up && engineolder(h->version, h->caps);
+}
+
 // Whether paths on a host are Windows': this machine's, or a remote's by
 // its home directory (hello's home), which then has a drive.
 static b32 hostwin(GuiHost *h)
@@ -5421,6 +5429,7 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
     rc.state      = remoteset(g, name, "state");
     rc.rconfig    = remoteset(g, name, "config");
     rc.program    = linkprogram(g, &scratch, rc.wsl.len>0);
+    rc.scp        = os_getenv(g->os, &scratch, "PROSPERO_TEST_SCP");
     rc.localstate = g->statedir;
     rc.deploy     = deploy || remoteset(g, name, "deploy")=="auto";
     h->deploys    = 0;
@@ -5481,6 +5490,9 @@ static void findhosts(Gui *g, Arena a)
     }
 }
 
+static b32  updating(GuiHost *);
+static void guiupdate(Gui *, GuiHost *);
+
 // A host's connection changed: connecting, up, down until a retry,
 // failed or closed, as the library says.
 static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
@@ -5510,6 +5522,14 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
         if (h->updating == UPD_RESTART) {
             h->updating = UPD_DONE;
             h->updmsg   = clone(&g->perm, concat(&a, "Updated: the engine there is ", h->version));
+        }
+        // deploy = auto: an older engine is updated, once, so that one
+        // that stays older (the engine deployed is no newer) is let be
+        if (hostolder(h) && !updating(h) && !h->autoupdated &&
+                remoteset(g, h->name, "deploy")=="auto" &&
+                !remoteset(g, h->name, "path").len) {
+            h->autoupdated = 1;
+            guiupdate(g, h);
         }
         guilist(g, h);
         ImgFetch *f = &g->img.fetch;
@@ -6308,9 +6328,16 @@ static void ontask(Gui *g, Record r)
         }
         Str msg = cuthead(r.data, 1);
         if (!r.data[0]) {
-            h->updating = UPD_FAILED;
+            h->thenconnect = 0;
+            h->updating    = UPD_FAILED;
             h->updmsg   = clone(&g->perm, concat(&g->frame, "Not deployed: ", msg));
             guilog(g, concat(&g->frame, concat(&g->frame, h->name, ": "), h->updmsg));
+            return;
+        } else if (!h->up && h->thenconnect && !h->r) {
+            h->thenconnect = 0;
+            h->updating    = UPD_DONE;
+            h->updmsg      = clone(&g->perm, concat(&g->frame, msg, " deployed"));
+            remoteconnect(g, g->frame, h->name);
             return;
         } else if (!h->up) {
             h->updating = UPD_DONE;
@@ -6370,6 +6397,7 @@ static void guiupdate(Gui *g, GuiHost *h)
     d->conf.ssh        = clone(&g->perm, ssh);
     d->conf.wsl        = clone(&g->perm, wsl);
     d->conf.program    = linkprogram(g, &g->perm, wsl.len>0);
+    d->conf.scp        = os_getenv(g->os, &g->perm, "PROSPERO_TEST_SCP");
     d->conf.envpath    = guipath(g, &g->perm);
     d->conf.localstate = g->statedir;
     d->conf.force      = 1;  // another build of this version, as a developer's
@@ -6384,6 +6412,39 @@ static void guiupdate(Gui *g, GuiHost *h)
     h->updating = UPD_DEPLOYING;
     h->updmsg   = "deploying the engine";
     scheddirty(&g->sched);
+}
+
+// Deploy engine, for a remote not connected: this version's engine
+// deployed there, then connected to.
+static void guideploy(Gui *g, Str name)
+{
+    GuiHost *h = findhost(g, GH_REMOTE, name);
+    h = h ? h : addhost(g, GH_REMOTE, name);
+    if (h->r || updating(h)) {
+        return;
+    }
+    h->thenconnect = 1;
+    guiupdate(g, h);
+    h->thenconnect = h->updating == UPD_DEPLOYING;
+}
+
+// Why Deploy engine or Update engine cannot run for a remote, or null:
+// one under way, or a path in its section naming the engine there,
+// which connecting uses instead of a deployed one.
+static Str deploywhy(Gui *g, GuiHost *h, Str name)
+{
+    Str ssh = remoteset(g, name, "ssh");
+    Str wsl = ssh.len ? Str{} : remoteset(g, name, "wsl");
+    if (h && updating(h)) {
+        return "Deploying already";
+    } else if (!ssh.len && !wsl.len) {
+        return "Its section has no ssh destination (or wsl)";
+    } else if (linkbad(ssh, wsl).len) {
+        return linkbad(ssh, wsl);
+    } else if (remoteset(g, name, "path").len) {
+        return "Its section's path names the engine there, which connecting runs instead";
+    }
+    return {};
 }
 
 
@@ -8437,6 +8498,7 @@ enum : i32 {
     OP_IFEDITOR,  // unless [ui] editor is set, skip dx ops
     OP_IFWSL,     // unless wsl.exe has a stand-in (PROSPERO_TEST_WSL), skip
                   // dx ops
+    OP_IFSCP,     // unless scp has a stand-in (PROSPERO_TEST_SCP), skip dx ops
     OP_MAXIMIZE,  // maximize the window (macOS: zoom), as its button would;
                   // dx 1: fill the primary display unmaximized (macOS's
                   // Fill), else skip the next op where that is no maximum
@@ -8781,6 +8843,9 @@ enum : i32 {
     CHK_HELPCOPY,     // the clipboard has Help's page, selected whole
     CHK_DEPLOYOFFER,  // the remote "missing" failed with no engine there,
                       // Deploy engine offered; "bad" not offered it
+    CHK_DEPLOYED,     // Deploy engine deployed to "missing" and connected,
+                      // its engine older (a cap left out), Update engine shown
+    CHK_UPDATED,      // Update engine deployed again and restarted it
     CHK_CFGEDITING,   // the configuration file is out in the editor
     CHK_CFGEDITED,    // the editor gone, Settings lists [model text], no error
     CHK_SIDECHAT,     // a side chat of the session the checklist made is
@@ -9010,6 +9075,8 @@ static Str chknames[] = {
     "Help's topics are a combo when narrow, else a list beside the page",
     "Help's page, selected whole, copied as its text",
     "a remote with no engine there failed, and Deploy engine is offered",
+    "Deploy engine deployed one and connected, which is older, offering Update engine",
+    "Update engine deployed one again and restarted it",
     "Open in editor has the configuration file out in the editor",
     "the configuration file as the editor left it is read again, in Settings",
     "the side chat is shown, idle, under its original, the selection quoted",
@@ -9089,6 +9156,7 @@ enum : i32 {
     W_NEWLISTED,  // the new session dialog's host listed its models
     W_NAMEDUP,    // the remote named by text is up
     W_NAMEDCLOSED,// the remote named by text is closed
+    W_NAMEDUPDATED,// the remote named by text is updated, or failed to be
 };
 
 static Str waitnames[] = {
@@ -9107,8 +9175,9 @@ static Str waitnames[] = {
     "the side chat", "the WSL distros", "the WSL distro to fail",
     "the WSL distro's section", "the dialog's host's models",
     "the named remote to come up", "the named remote to close",
+    "the named remote's update",
 };
-static_assert(countof(waitnames) == W_NAMEDCLOSED+1);
+static_assert(countof(waitnames) == W_NAMEDUPDATED+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -11104,6 +11173,26 @@ static DriveOp remoteops[] = {
     {OP_UP, 0, 0, 0, 100, ""},
     {OP_WAIT, W_DEPLOYOFFER, 0, 0, 30000, ""},
     {OP_CHECK, CHK_DEPLOYOFFER, 0, 0, 0, ""},
+    // Deploy engine there (into a fake home, through a stand-in for scp),
+    // then connected: its engine leaves out a cap (PROSPERO_TEST_DROPCAP),
+    // so is older, and Update engine deploys again and restarts it
+    {OP_IFSCP, 0, 16, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "deploy engine missing"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NAMEDUP, 0, 0, 90000, "missing"},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_DEPLOYED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "remote-deployed"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "update engine missing"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NAMEDUPDATED, 0, 0, 90000, "missing"},
+    {OP_CHECK, CHK_UPDATED, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect missing"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_WAIT, W_NAMEDCLOSED, 0, 0, 30000, "missing"},
     // An installed WSL distro, through a stand-in for wsl.exe: a remote
     // by itself, in the sidebar, Docker Desktop's left out. With
     // no engine in it, it fails, offering to deploy one; its Settings
@@ -12763,6 +12852,11 @@ static b32 drivewaitdone(Gui *g)
     case W_NAMEDCLOSED: {
         GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
         return h && !h->r && h->state==RS_CLOSED;
+    }
+    case W_NAMEDUPDATED: {
+        GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
+        return h && (h->updating==UPD_FAILED ||
+                     (h->up && h->updating==UPD_DONE && startswith(h->updmsg, "Updated")));
     }
     case W_DEPLOYOFFER: {
         GuiHost *h = findhost(g, GH_REMOTE, "missing");
@@ -14444,10 +14538,22 @@ static b32 drivecheck(Gui *g, i32 chk)
         GuiHost *bad = findhost(g, GH_REMOTE, "bad");
         b32      btn = 0;
         for (i32 i = 0; i < g->nnamed; i++) {
-            btn |= Str{g->named[i].name, g->named[i].len} == "deploy engine";
+            btn |= Str{g->named[i].name, g->named[i].len} == "deploy engine missing";
         }
         return h && h->state==RS_FAILED && !h->r && h->deploys &&
                bad && !bad->deploys && btn;
+    }
+    case CHK_DEPLOYED: {
+        GuiHost *h   = findhost(g, GH_REMOTE, "missing");
+        b32      btn = 0;
+        for (i32 i = 0; i < g->nnamed; i++) {
+            btn |= Str{g->named[i].name, g->named[i].len} == "update engine missing";
+        }
+        return h && h->up && h->updating==UPD_DONE && hostolder(h) && btn;
+    }
+    case CHK_UPDATED: {
+        GuiHost *h = findhost(g, GH_REMOTE, "missing");
+        return h && h->up && h->updating==UPD_DONE && startswith(h->updmsg, "Updated");
     }
     case CHK_CFGEDITING:
         return g->edcfg && g->edproc && !g->edsess && g->edpath.len &&
@@ -15191,6 +15297,12 @@ static void drivestep(Gui *g)
     case OP_IFWSL:
         if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_WSL").len) {
             guilog(g, "drive: skip, with no stand-in for wsl.exe");
+            g->drivepc += (i32)op->dx;
+        }
+        break;
+    case OP_IFSCP:
+        if (!os_getenv(g->os, &g->frame, "PROSPERO_TEST_SCP").len) {
+            guilog(g, "drive: skip, with no stand-in for scp");
             g->drivepc += (i32)op->dx;
         }
         break;
