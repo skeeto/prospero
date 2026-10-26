@@ -46,6 +46,8 @@ enum : i32 {
     EV_MODEL,   // (M8) the session's model from here on
     EV_GRANT,   // (M8) an "always allow" from the user
     EV_MODE,    // plan mode, Bypass mode, or neither, from here on
+    EV_TASKHOST,    // a task's subagent, on another host, named there
+    EV_TASKREPORT,  // a subagent's report to its parent on another host
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -97,6 +99,8 @@ static EvInfo evinfo[] = {
     {"model",      1, 0},
     {"grant",      1, 0},  // lost to a power cut, it is asked again
     {"mode",       1, 0},
+    {"task.host",  1, 0},
+    {"task.report", 1, 1},  // the parent's call ends by it
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -550,6 +554,7 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
     Slice<Str>    ended    = {};  // since the last assistant record
     Slice<LogAsk> asks     = {};  // not answered
     Slice<LogAsk> jobs     = {};  // started, not ended: {job, call}
+    Slice<LogAsk> kids     = {};  // subagents on other hosts: {line, call}
     Str           asst     = {};  // the last assistant record
     Str           cwd      = {};  // raw, from the session record
     b32           turnopen = 0;
@@ -618,6 +623,12 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
                 jobs = push(&scratch, jobs, k);
             }
         } break;
+        case EV_TASKHOST:
+            if (call.data) {
+                LogAsk k = {c.head, call};
+                kids = push(&scratch, kids, k);
+            }
+            break;
         case EV_JOBEND: {
             Str n = jsonget(rec.root, "job")->raw;
             for (iz i = 0; i < jobs.len; i++) {
@@ -658,6 +669,16 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
 
     Buf b(&scratch, 1<<10);
     for (iz i = 0; i < tools.len; i++) {
+        // A subagent on another host, named there, may have finished
+        Str host  = {};
+        Str child = {};
+        for (iz n = kids.len-1; n>=0 && !child.len; n--) {
+            if (kids[n].call == tools[i]) {
+                Json *k = evparse(&scratch, kids[n].req).root;
+                host  = jsonstr(jsonget(k, "host"));
+                child = jsonstr(jsonget(k, "child"));
+            }
+        }
         b.len = 0;
         EvOut w = logbegin(&r, &b, EV_TOOLEND);
         putkey(&w.json, "call");
@@ -665,7 +686,21 @@ static EventLog logopen(Os *os, Arena *perm, Arena scratch, Str path,
         putkey(&w.json, "status");
         putstr(&w.json, "unknown");
         putkey(&w.json, "text");
-        putstr(&w.json, "outcome unknown: the harness stopped while this ran");
+        if (child.len) {
+            Buf t(&scratch, 256 + host.len + child.len);
+            print(&t, "outcome unknown: the harness stopped while this subagent "
+                      "ran on ");
+            print(&t, host);
+            print(&t, " (session ");
+            print(&t, child);
+            print(&t, " there), so its report never came here; it may have "
+                      "finished there");
+            putstr(&w.json, finish(&t));
+            putstrkey(&w.json, "child", child);
+            putstrkey(&w.json, "host", host);
+        } else {
+            putstr(&w.json, "outcome unknown: the harness stopped while this ran");
+        }
         if (!logappend(&r, &w).data) {
             logclose(&r);
             return r;
@@ -1415,8 +1450,8 @@ static b32 importdrops(i32 ev, Str key)
         return key == "images";
     }
     return key=="spill" || key=="bytes" || key=="image" || key=="width" ||
-           key=="height" || key=="shot" || key=="child" || key=="job" ||
-           key=="to";
+           key=="height" || key=="shot" || key=="child" || key=="host" ||
+           key=="job" || key=="to";
 }
 
 // A tool result, notice or user record without the fields an import

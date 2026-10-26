@@ -428,8 +428,10 @@ static void test_events(Test *t)
         expect(t, "durable events", finish(&durable),
                "session title user turn attempt assistant tool.start "
                "tool.end ask answer retry nudge turn.end note compact job.start "
-               "job.end todo snap rewind instructions notice prefix model grant mode ");
-        expect(t, "synced events", finish(&sync), "tool.start ask answer turn.end rewind ");
+               "job.end todo snap rewind instructions notice prefix model grant mode "
+               "task.host task.report ");
+        expect(t, "synced events", finish(&sync),
+               "tool.start ask answer turn.end rewind task.report ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
         expect(t, "empty event", istr(a, evfind("")), istr(a, EV_NONE));
         for (i32 cmd = 1; cmd < CMD_COUNT; cmd++) {
@@ -618,6 +620,34 @@ static void test_events(Test *t)
             "\"status\":\"unknown\",\"text\":\"outcome unknown: the harness stopped while this ran\"}\n"
             "{\"sid\":\"s1\",\"seq\":7,\"ts\":2000,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"interrupted\"}\n");
         expect(t, "log after recovery", vcontents(os, a, path), after);
+
+        // A task on another host, its subagent named there: the repair
+        // names both, so the parent knows where it may have finished
+        {
+            Str kid =
+                "{\"sid\":\"k1\",\"seq\":1,\"ts\":1000,\"ev\":\"session\",\"cwd\":\"/w\"}\n"
+                "{\"sid\":\"k1\",\"seq\":2,\"ts\":1000,\"ev\":\"turn\",\"n\":1}\n"
+                "{\"sid\":\"k1\",\"seq\":3,\"ts\":1000,\"ev\":\"tool.start\",\"call\":\"t1\"}\n"
+                "{\"sid\":\"k1\",\"seq\":4,\"ts\":1000,\"ev\":\"tool.start\",\"call\":\"t2\"}\n"
+                "{\"sid\":\"k1\",\"seq\":5,\"ts\":1000,\"ev\":\"task.host\",\"call\":\"t1\","
+                "\"host\":\"Deb\",\"child\":\"20261026-101500-ab12\"}\n";
+            os_write(os, scratch, "k1.jsonl", kid);
+            EventLog k = logopen(os, a, scratch, "k1.jsonl", "k1", 1<<20);
+            expect(t, "task.host recovered", logshow(a, &k),
+                   "ok=1 seq=8 turn=1 torn=0 bad=0 synth=3");
+            logclose(&k);
+            expect(t, "task.host repair", vcontents(os, a, "k1.jsonl"), concat(a, kid,
+                "{\"sid\":\"k1\",\"seq\":6,\"ts\":2000,\"ev\":\"tool.end\",\"call\":\"t1\","
+                "\"status\":\"unknown\",\"text\":\"outcome unknown: the harness stopped "
+                "while this subagent ran on Deb (session 20261026-101500-ab12 there), so "
+                "its report never came here; it may have finished there\","
+                "\"child\":\"20261026-101500-ab12\",\"host\":\"Deb\"}\n"
+                "{\"sid\":\"k1\",\"seq\":7,\"ts\":2000,\"ev\":\"tool.end\",\"call\":\"t2\","
+                "\"status\":\"unknown\",\"text\":\"outcome unknown: the harness stopped "
+                "while this ran\"}\n"
+                "{\"sid\":\"k1\",\"seq\":8,\"ts\":2000,\"ev\":\"turn.end\",\"turn\":1,"
+                "\"why\":\"interrupted\"}\n"));
+        }
 
         // Sequence numbers continue, and recovery is idempotent
         line = addrec(&log, a, EV_TURN, "n", "2");
@@ -965,7 +995,8 @@ static void test_events(Test *t)
                "session=0 title=0 user=0 turn=0 attempt=0 assistant=0 "
                "tool.start=1 tool.end=0 ask=1 answer=1 retry=0 nudge=0 "
                "turn.end=1 note=0 compact=0 job.start=0 job.end=0 todo=0 snap=0 "
-               "rewind=1 instructions=0 notice=0 prefix=0 model=0 grant=0 mode=0 ");
+               "rewind=1 instructions=0 notice=0 prefix=0 model=0 grant=0 mode=0 "
+               "task.host=0 task.report=1 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";
