@@ -48,6 +48,11 @@
 //    desktop (the helper's path, if deployed), version, proto, and
 //    deployed (Unix epoch ms).
 //
+// Deploys to one destination take turns, through a lock file beside its
+// record, so the window and an engine linking to the same host never
+// upload over each other; the one that waits notes it, and usually
+// finds the engine already there.
+//
 // A new version gets a new name, so a running engine is never replaced
 // or stopped: a host of another protocol starts beside the old one (a
 // host listens per protocol, host.cpp), and old sessions keep their
@@ -1120,6 +1125,8 @@ static DeployPut deployput(Deploy *d, Arena *perm, Arena scratch, Platform *pf,
     return r;
 }
 
+static Deployed deploysteps(Deploy, Arena *, Arena, Str, Str);
+
 // Deploy an engine as described at the top, and its desktop helper if
 // there is one. Blocks until done; another thread may cancel through
 // conf->cancel.
@@ -1145,6 +1152,39 @@ static Deployed deploy(Os *os, Arena *perm, Arena scratch, DeployConf *conf)
         return deployfail(&d, perm, scratch, why);
     }
     d.errpath = deployfile(perm, conf->localstate, dest, ".err");
+
+    // One deploy to a destination at a time, across processes: the
+    // window and an engine's link to the same host would race on its
+    // .part files. The holder's own timeouts bound the wait.
+    Str lockpath = deployfile(&scratch, conf->localstate, dest, ".lock");
+    iz  lock     = os_lockfile(os, scratch, lockpath);
+    if (lock<0 && os_lockheld(os, scratch, lockpath)) {
+        Buf b(&scratch, 256);
+        print(&b, "waiting for another deploy to ");
+        print(&b, name);
+        deploynote(&d, scratch, "probe", finish(&b));
+        for (;;) {
+            if (!deploynap(&d, 250*MS)) {
+                return deployfail(&d, perm, scratch, "cancelled");
+            }
+            lock = os_lockfile(os, scratch, lockpath);
+            if (lock>=0 || !os_lockheld(os, scratch, lockpath)) {
+                break;  // without a lock if it cannot be had at all
+            }
+        }
+    }
+    Deployed r = deploysteps(d, perm, scratch, dest, name);
+    if (lock >= 0) {
+        os_unlockfile(os, lock);
+    }
+    return r;
+}
+
+// The steps of deploy, under its lock.
+static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str name)
+{
+    Os         *os   = d.os;
+    DeployConf *conf = d.conf;
 
     // The platform
     Buf b(&scratch, 256);

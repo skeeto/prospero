@@ -82,8 +82,9 @@ run(["sh" if os.name == "nt" else "/bin/sh", "-c", cmd])
 
 FAKESCP = r"""
 # scp here, into $FAKEHOME: the first $FAKESCP_FAIL calls fail as a
-# dropped link would, and the first $FAKESCP_CORRUPT arrive damaged
-import os, shutil, sys
+# dropped link would, and the first $FAKESCP_CORRUPT arrive damaged;
+# each takes $FAKESCP_SLEEP seconds
+import os, shutil, sys, time
 args = sys.argv[1:]
 log = os.environ["FAKELOG"]
 with open(os.path.join(log, "scp.log"), "a", newline="") as f:
@@ -95,6 +96,7 @@ except OSError:
     n = 1
 with open(os.path.join(log, "scp.count"), "w", newline="") as f:
     f.write(f"{n}\n")
+time.sleep(float(os.environ.get("FAKESCP_SLEEP", "0")))
 if n <= int(os.environ.get("FAKESCP_FAIL", "0")):
     sys.stderr.write("Connection closed by 10.0.0.1 port 22\n")
     sys.exit(255)
@@ -337,6 +339,37 @@ def retry(t):
     t.check(p.stderr.count("trying again") == 2 and "Connection closed" in p.stderr,
             f"stderr {p.stderr}")
     t.check("try 3" in p.stderr, "the third try is named")
+
+
+@scenario
+def concurrent(t):
+    """Two deploys to one destination at once: the second waits for the
+    first, then finds it there, so there is one upload."""
+    t.engine()
+    env = dict(t.env, FAKESCP_SLEEP="2")
+    argv = [t.prospero, "deploy", "here", "--ssh-program", t.ssh, "--scp-program",
+            t.scp, "--engines", t.engines, "--state", t.local]
+    first = subprocess.Popen(argv, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             text=True, env=env)
+    try:
+        log = os.path.join(t.fakelog, "scp.log")
+        deadline = time.monotonic() + 30
+        while not os.path.exists(log):  # the first is uploading
+            t.check(time.monotonic() < deadline and first.poll() is None,
+                    "the first deploy never uploaded")
+            time.sleep(0.05)
+        q = t.deploy(env=env)
+        _, err = first.communicate(timeout=60)
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.wait()
+    t.check(first.returncode == 0, f"first: exit {first.returncode}: {err}")
+    t.check(q.returncode == 0, f"second: exit {q.returncode}: {q.stderr}")
+    t.check("waiting for another deploy to here" in q.stderr, f"second: {q.stderr}")
+    t.check("already deployed" in q.stderr, f"second: {q.stderr}")
+    t.check("waiting" not in err, f"first: {err}")
+    t.check(t.scps() == 1, f"{t.scps()} uploads")
 
 
 @scenario
