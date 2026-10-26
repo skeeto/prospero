@@ -464,6 +464,14 @@ static CfgKey cfgschema[] = {
      "has no shell environment: no $VISUAL, no $EDITOR, and its PATH may "
      "lack the editor, so name it in full here, or add its directory to "
      "[tools] path_prepend"},
+    {"ui", "terminal", CFG_STRING, "", {}, {}, "ui",
+     "The terminal that a session's Open in terminal opens in its folder: "
+     "on macOS an application's name (Terminal, iTerm, Ghostty), elsewhere "
+     "a program (wt.exe, konsole, kitty). Empty: Terminal on macOS, Windows "
+     "Terminal or else a console of its own on Windows, and elsewhere "
+     "$TERMINAL or the first found of ptyxis, gnome-terminal, kgx, konsole, "
+     "xfce4-terminal, x-terminal-emulator, alacritty, kitty, wezterm, foot, "
+     "ghostty and xterm"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "
@@ -762,14 +770,14 @@ static b32 cfgtilde(Str p)
 // Whether a value, trimmed, chooses a program for this machine to run,
 // which only the user's own file may: where programs are found ([tools]
 // path_prepend and path_append), a shell by its path or name rather than
-// a keyword, or the editor's command.
+// a keyword, or the editor's or the terminal's command.
 static b32 cfgruns(CfgKey *k, Str v)
 {
     if (k->kind == "tools") {
         return k->key=="path_prepend" || k->key=="path_append" ||
                (k->key=="shell" && !cfghasword("auto sh powershell cmd", v));
     }
-    return k->kind=="ui" && k->key=="editor";
+    return k->kind=="ui" && (k->key=="editor" || k->key=="terminal");
 }
 
 // How a value fares as a setting of its key. A shared value comes from

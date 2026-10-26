@@ -216,6 +216,39 @@ static void testbulk(ProcTest *p, Arena scratch)
     say(os, "bulk output done");
 }
 
+// A program launched apart, as a terminal is: it runs in the folder
+// given, with the environment given, and no one waits for it.
+static void testlaunch(ProcTest *p, Arena scratch)
+{
+    Selftest *t = p->t;
+    Os       *os = p->os;
+    if (p->te.shellkind != SHELL_SH && p->te.shellkind != SHELL_BUSYBOX) {
+        return;
+    }
+    Slice<Str> argv = {};
+    argv = push(&scratch, argv, p->te.shell);
+    if (p->te.shellkind == SHELL_BUSYBOX) {
+        argv = push(&scratch, argv, Str("sh"));
+    }
+    argv = push(&scratch, argv, Str("-c"));
+    argv = push(&scratch, argv, Str("echo launched >launch.tmp && mv launch.tmp launch.txt"));
+    Str out = join(&scratch, p->dir, "launch.txt");
+    if (!check(t, os_launch(os, scratch, argv, p->dir, p->env), "os_launch of the shell")) {
+        say(os, os_lasterr(os, &scratch));
+        return;
+    }
+    Read rd = {};
+    for (i32 i = 0; i < 100; i++) {
+        rd = os_read(os, &scratch, out, 1<<10);
+        if (rd.err == READ_OK) {
+            break;
+        }
+        mailwait(p->mb, 50);
+    }
+    check(t, rd.err==READ_OK && trim(rd.data)=="launched",
+          "a launched program runs in its folder");
+}
+
 static void testholder(ProcTest *p, Arena scratch)
 {
     Selftest *t   = p->t;
@@ -732,6 +765,7 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     testspawn(p, scratch);
     testbulk(p, scratch);
     testholder(p, scratch);
+    testlaunch(p, scratch);
     testladder(p, scratch);
     testoverhead(p, scratch);
     testresponsible(p, scratch);

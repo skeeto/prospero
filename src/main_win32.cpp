@@ -78,6 +78,7 @@ enum : i32 {
     WAIT_OBJECT_0                     = 0,
     // Processes
     CREATE_NEW_PROCESS_GROUP          = 0x00000200,
+    CREATE_NEW_CONSOLE                = 0x00000010,
     CREATE_NO_WINDOW                  = 0x08000000,
     CREATE_SUSPENDED                  = 0x00000004,
     CREATE_UNICODE_ENVIRONMENT        = 0x00000400,
@@ -714,6 +715,11 @@ static b32 os_write(Os *os, Arena scratch, Str path, Str data)
         DeleteFileW(tmp);
     }
     return ok;
+}
+
+static b32 os_writemode(Os *os, Arena scratch, Str path, Str data, i32)
+{
+    return os_write(os, scratch, path, data);
 }
 
 static b32 os_mkdirs(Os *, Arena scratch, Str path)
@@ -2933,6 +2939,44 @@ static Detached os_detach(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Str e
     CloseHandle(pi.process);
     r.pid = pi.pid;
     return r;
+}
+
+// A console of its own, or none for a GUI program (Windows Terminal),
+// out of this process's job where the job allows, inheriting no handles.
+static b32 os_launch(Os *os, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env)
+{
+    if (!argv.len || hasnul(cwd)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    Str found = childpath(os, &scratch, env, argv[0]);
+    if (found.len) {
+        Slice<Str> copy = {};
+        copy = push(&scratch, copy, found);
+        for (iz i = 1; i < argv.len; i++) {
+            copy = push(&scratch, copy, argv[i]);
+        }
+        argv = copy;
+    }
+    c16 *cmd = towide(&scratch, quoteargv(&scratch, argv)).data;
+    c16 *dir = cwd.len ? towide(&scratch, cwd).data : 0;
+    c16 *eb  = envblock(&scratch, env);
+
+    ProcessInfo pi = {};
+    StartupInfo si = {};
+    si.cb = sizeof(si);
+    i32 flags = CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB;
+    b32 ok    = CreateProcessW(0, cmd, 0, 0, 0, flags, eb, dir, &si, &pi);
+    if (!ok && GetLastError()==ERROR_ACCESS_DENIED) {
+        flags &= ~CREATE_BREAKAWAY_FROM_JOB;
+        ok = CreateProcessW(0, cmd, 0, 0, 0, flags, eb, dir, &si, &pi);
+    }
+    if (!ok) {
+        return 0;
+    }
+    CloseHandle(pi.thread);
+    CloseHandle(pi.process);
+    return 1;
 }
 
 

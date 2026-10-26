@@ -1667,6 +1667,15 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         inforow("Session", s->sid);
         inforow("Title", sesstitle(s));
         inforow("Directory", v->nofolder ? Str("No folder") : v->cwd);
+        Str why = termplan(g, &a, s).why;
+        ImGui::SameLine();
+        ImGui::BeginDisabled(why.len);
+        if (ImGui::SmallButton("Terminal")) {
+            termopen(g, a, s);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "Terminal");
+        whytip(why.len ? why : Str("Open a terminal in this folder"));
         inforow("Model", v->model);
         inforow("Endpoint", v->endpoint);
         if (v->role.len) {
@@ -4546,6 +4555,13 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
             g->lasterr = clone(&g->perm, concat(&a, "cannot show ", dir));
         }
     }
+    Str term = termplan(g, &a, s).why;
+    if (menuitem(g, a, "Open in terminal", term)) {
+        termopen(g, a, s);
+    }
+    ImGui::SetItemTooltip("%s", h->kind==GH_REMOTE
+                                ? "A shell in its folder there, in a terminal here"
+                                : "A shell in its folder, in a terminal");
     Str close = !s->view ? Str("It is not open here") :
                 s->view->busy && !s->readonly ? Str("Close it once its turn ends") : Str{};
     if (menuitem(g, a, "Close", close)) {
@@ -7979,6 +7995,7 @@ static void drawmenubar(Gui *g)
             ImGui::MenuItem("Archive");
             ImGui::MenuItem("Delete...");
             ImGui::Separator();
+            ImGui::MenuItem("Open in terminal");
             ImGui::MenuItem("Close");
             ImGui::EndDisabled();
         }

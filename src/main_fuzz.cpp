@@ -98,6 +98,7 @@ static Read os_read(Os *os, Arena *a, Str, iz max)
 }
 
 static b32     os_write(Os *, Arena, Str, Str) { return 0; }
+static b32     os_writemode(Os *, Arena, Str, Str, i32) { return 0; }
 static b32     os_mkdirs(Os *, Arena, Str) { return 0; }
 static Dirent *os_list(Os *, Arena *, Str) { return 0; }
 static Listing os_listall(Os *, Arena *, Str, b32, iz) { return {}; }
@@ -156,6 +157,7 @@ static iz    os_stdin(Os *, u8 *, iz) { return 0; }
 static Str   os_realpath(Os *, Arena *, Str) { return {}; }
 static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
 static Proc *os_spawnio(Os *, Spawn *, Arena) { return 0; }
+static b32 os_launch(Os *, Arena, Slice<Str>, Str, Slice<Str>) { return 0; }
 static b32   os_procwrite(Os *, Proc *, Str) { return 0; }
 static void  os_kill(Os *, Proc *, b32) {}
 static void  os_procfree(Os *, Proc *) {}

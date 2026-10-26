@@ -445,3 +445,160 @@ static Str editortext(Str text)
     }
     return text;
 }
+
+
+// An external terminal, opened in a session's folder
+
+enum : i32 {
+    TERM_MAC,    // an application's name, for open -a
+    TERM_WIN,    // Windows Terminal, else a console of its own
+    TERM_LINUX,  // an X11 or Wayland terminal program
+};
+
+// How a terminal program takes its folder and the command to run there,
+// by its file name. Those not listed take "-e" and only the working
+// directory they start in.
+struct TermKind {
+    Str name;
+    Str dir;    // its folder option, "=" ending it when joined
+    Str start;  // words ahead of everything else, or null
+    Str run;    // ahead of the command's words, or null for none
+};
+
+static TermKind termkinds[] = {
+    {"ptyxis",         "--working-directory=", "--new-window", "--"},
+    {"gnome-terminal", "--working-directory=", {},             "--"},
+    {"kgx",            "--working-directory=", {},             "--"},
+    {"konsole",        "--workdir",            {},             "-e"},
+    {"xfce4-terminal", "--working-directory=", {},             "-x"},
+    {"alacritty",      "--working-directory",  {},             "-e"},
+    {"kitty",          "--directory",          {},             {}},
+    {"wezterm",        "--cwd",                "start",        "--"},
+    {"foot",           "--working-directory=", {},             {}},
+    {"ghostty",        "--working-directory=", {},             "-e"},
+};
+
+// Those looked for on the PATH, in order, when [ui] terminal and
+// $TERMINAL name none.
+static Str termsearch[] = {
+    "ptyxis", "gnome-terminal", "kgx", "konsole", "xfce4-terminal",
+    "x-terminal-emulator", "alacritty", "kitty", "wezterm", "foot",
+    "ghostty", "xterm",
+};
+
+struct TermRun {
+    Slice<Str> argv;    // to launch, in the folder
+    Str        script;  // TERM_MAC with a command: a .command file's text,
+                        // whose path goes last in argv
+};
+
+// What opens a terminal in dir: prog the terminal (TERM_MAC an
+// application, TERM_WIN Windows Terminal's path or null for a console),
+// cmd what it runs there, if not the user's shell (ssh, wsl). On macOS
+// a command goes in a script that removes itself, which Terminal runs
+// without asking for control of it.
+static TermRun termargv(Arena *a, i32 os, Str prog, Str dir, Slice<Str> cmd)
+{
+    TermRun r = {};
+    if (os == TERM_MAC) {
+        r.argv = push(a, r.argv, Str("open"));
+        r.argv = push(a, r.argv, Str("-a"));
+        r.argv = push(a, r.argv, prog.len ? prog : Str("Terminal"));
+        if (!cmd.len) {
+            r.argv = push(a, r.argv, dir);
+            return r;
+        }
+        Buf b(a, 256);
+        print(&b, "#!/bin/sh\nrm -f \"$0\"\nexec");
+        for (iz i = 0; i < cmd.len; i++) {
+            putbyte(&b, ' ');
+            print(&b, shquote(a, cmd[i]));
+        }
+        putbyte(&b, '\n');
+        r.script = finish(&b);
+        return r;
+    }
+
+    Str name = basename(prog);
+    if (os==TERM_WIN && name.len>4 && equalfold(cuthead(name, name.len-4), ".exe")) {
+        name = takehead(name, name.len-4);
+    }
+    if (os==TERM_WIN && !prog.len) {
+        // A console of its own: the command, else cmd.exe, in dir
+        if (cmd.len) {
+            r.argv = cmd;
+        } else {
+            r.argv = push(a, r.argv, Str("cmd.exe"));
+        }
+        return r;
+    } else if (os==TERM_WIN && equalfold(name, "wt")) {
+        // Windows Terminal splits its own command line on semicolons
+        r.argv = push(a, r.argv, prog);
+        r.argv = push(a, r.argv, Str("-d"));
+        r.argv = push(a, r.argv, dir);
+        for (iz i = 0; i < cmd.len; i++) {
+            Buf b(a, cmd[i].len + 8);
+            for (iz k = 0; k < cmd[i].len; k++) {
+                if (cmd[i][k] == ';') {
+                    putbyte(&b, '\\');
+                }
+                putbyte(&b, cmd[i][k]);
+            }
+            r.argv = push(a, r.argv, finish(&b));
+        }
+        return r;
+    }
+
+    TermKind k = {name, {}, {}, "-e"};
+    for (iz i = 0; i < countof(termkinds); i++) {
+        if (termkinds[i].name == name) {
+            k = termkinds[i];
+        }
+    }
+    r.argv = push(a, r.argv, prog);
+    if (k.start.len) {
+        r.argv = push(a, r.argv, k.start);
+    }
+    if (k.dir.len && k.dir[k.dir.len-1]=='=') {
+        r.argv = push(a, r.argv, concat(a, k.dir, dir));
+    } else if (k.dir.len) {
+        r.argv = push(a, r.argv, k.dir);
+        r.argv = push(a, r.argv, dir);
+    }
+    if (cmd.len && k.run.len) {
+        r.argv = push(a, r.argv, k.run);
+    }
+    for (iz i = 0; i < cmd.len; i++) {
+        r.argv = push(a, r.argv, cmd[i]);
+    }
+    return r;
+}
+
+// The command that opens a shell in dir on a remote over ssh: a login
+// shell there, or on Windows cmd.exe, in a terminal of its own (-t).
+static Slice<Str> termssh(Arena *a, Str ssh, Str dest, Str dir, b32 windows)
+{
+    Slice<Str> r = {};
+    r = push(a, r, ssh);
+    r = push(a, r, Str("-t"));
+    r = push(a, r, Str("--"));
+    r = push(a, r, dest);
+    if (windows) {
+        r = push(a, r, concat(a, concat(a, "cmd /k cd /d \"", dir), "\""));
+    } else {
+        r = push(a, r, concat(a, concat(a, "cd ", shquote(a, dir)), " && exec \"$SHELL\" -l"));
+    }
+    return r;
+}
+
+// The command that opens a shell in dir in a WSL distro.
+static Slice<Str> termwsl(Arena *a, Str wsl, Str distro, Str dir)
+{
+    Slice<Str> r = {};
+    r = push(a, r, wsl);
+    r = push(a, r, Str("-d"));
+    r = push(a, r, distro);
+    r = push(a, r, Str("--cd"));
+    r = push(a, r, dir);
+    return r;
+}

@@ -46,7 +46,7 @@ cannot choose what runs, so these are ignored in one:
 - `[remote]` and `[desktop]` settings;
 - `[tools] path_prepend` and `path_append`;
 - a `[tools] shell` other than `auto`, `sh`, `powershell` or `cmd`;
-- `[ui] editor`.
+- `[ui] editor` and `[ui] terminal`.
 
 ## Settings worth knowing
 
@@ -73,6 +73,10 @@ cannot choose what runs, so these are ignored in one:
   else on macOS the default text editor, which you then quit. Started
   from the Finder or a desktop menu, Prospero has no `$VISUAL` or
   `$EDITOR`: set this, with a full path if need be.
+- **`[ui] terminal`**: the terminal that Open in terminal opens: on
+  macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
+  (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its
+  folder and command Prospero knows; another gets `-e`.
 - **`[ui] font_size`**: the text's size in pixels, 8 to 40 (15 by
   default). The View menu's zoom scales it until Prospero exits.
 - **`[ui] theme`**: `system`, `dark` or `light`, also in View → Theme.

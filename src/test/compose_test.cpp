@@ -25,6 +25,17 @@ static Str histstr(Arena *a, HistKey k)
     return finish(&b);
 }
 
+// Arguments joined by '|', to compare as one string.
+static Str argstr(Arena *a, Slice<Str> argv)
+{
+    Buf b(a, 256);
+    for (iz i = 0; i < argv.len; i++) {
+        print(&b, i ? Str("|") : Str(""));
+        print(&b, argv[i]);
+    }
+    return finish(&b);
+}
+
 static void test_compose(Test *t)
 {
     Arena a = t->perm;
@@ -152,4 +163,46 @@ static void test_compose(Test *t)
            "notepad \"C:\\Temp\\d.md\"");
     expect(t, "editor.text", editortext("line one\nline two\r\n\n"), "line one\nline two");
     expect(t, "editor.keep", editortext("  indented\n\nend"), "  indented\n\nend");
+    // The terminal: its arguments by platform and program, and the
+    // commands for a remote's shell
+    Slice<Str> none = {};
+    Slice<Str> ssh  = termssh(&a, "ssh", "me@box", "/home/me/it's", 0);
+    expect(t, "term.ssh", argstr(&a, ssh),
+           "ssh|-t|--|me@box|cd '/home/me/it'\\''s' && exec \"$SHELL\" -l");
+    expect(t, "term.sshwin", argstr(&a, termssh(&a, "ssh", "box", "C:\\w", 1)),
+           "ssh|-t|--|box|cmd /k cd /d \"C:\\w\"");
+    Slice<Str> wsl = termwsl(&a, "wsl.exe", "Debian", "/mnt/c/w");
+    expect(t, "term.wsl", argstr(&a, wsl), "wsl.exe|-d|Debian|--cd|/mnt/c/w");
+    TermRun tr = termargv(&a, TERM_MAC, {}, "/p", none);
+    expect(t, "term.mac", argstr(&a, tr.argv), "open|-a|Terminal|/p");
+    tr = termargv(&a, TERM_MAC, "iTerm", "/p", termssh(&a, "ssh", "me@box", "/home/me", 0));
+    expect(t, "term.macssh", argstr(&a, tr.argv), "open|-a|iTerm");
+    expect(t, "term.script", tr.script,
+           "#!/bin/sh\nrm -f \"$0\"\nexec 'ssh' '-t' '--' 'me@box' "
+           "'cd '\\''/home/me'\\'' && exec \"$SHELL\" -l'\n");
+    tr = termargv(&a, TERM_WIN, "C:\\x\\wt.exe", "C:\\p", none);
+    expect(t, "term.wt", argstr(&a, tr.argv), "C:\\x\\wt.exe|-d|C:\\p");
+    Slice<Str> semi = {};
+    semi = push(&a, semi, Str("a;b"));
+    tr = termargv(&a, TERM_WIN, "wt.exe", "C:\\p", semi);
+    expect(t, "term.wtsemi", argstr(&a, tr.argv), "wt.exe|-d|C:\\p|a\\;b");
+    tr = termargv(&a, TERM_WIN, {}, "C:\\p", none);
+    expect(t, "term.console", argstr(&a, tr.argv), "cmd.exe");
+    tr = termargv(&a, TERM_WIN, {}, "C:\\p", wsl);
+    expect(t, "term.consolecmd", argstr(&a, tr.argv), "wsl.exe|-d|Debian|--cd|/mnt/c/w");
+    tr = termargv(&a, TERM_LINUX, "/usr/bin/gnome-terminal", "/p", none);
+    expect(t, "term.gnome", argstr(&a, tr.argv), "/usr/bin/gnome-terminal|--working-directory=/p");
+    tr = termargv(&a, TERM_LINUX, "ptyxis", "/p", wsl);
+    expect(t, "term.ptyxis", argstr(&a, tr.argv),
+           "ptyxis|--new-window|--working-directory=/p|--|wsl.exe|-d|Debian|--cd|/mnt/c/w");
+    tr = termargv(&a, TERM_LINUX, "konsole", "/p", semi);
+    expect(t, "term.konsole", argstr(&a, tr.argv), "konsole|--workdir|/p|-e|a;b");
+    tr = termargv(&a, TERM_LINUX, "wezterm", "/p", semi);
+    expect(t, "term.wezterm", argstr(&a, tr.argv), "wezterm|start|--cwd|/p|--|a;b");
+    tr = termargv(&a, TERM_LINUX, "kitty", "/p", semi);
+    expect(t, "term.kitty", argstr(&a, tr.argv), "kitty|--directory|/p|a;b");
+    tr = termargv(&a, TERM_LINUX, "xterm", "/p", semi);
+    expect(t, "term.xterm", argstr(&a, tr.argv), "xterm|-e|a;b");
+    tr = termargv(&a, TERM_LINUX, "st", "/p", none);
+    expect(t, "term.unknown", argstr(&a, tr.argv), "st");
 }

@@ -447,7 +447,8 @@ or https URL, which is fetched at startup, cached, and refreshed in the
 background, and may be pinned to a SHA-256. Nothing in an included file
 can make Prospero run a command: its plaintext secrets, `[remote]` and
 `[desktop]` settings, `[tools] path_prepend` and `path_append`, a
-`[tools] shell` other than a keyword, and `[ui] editor` are ignored. A
+`[tools] shell` other than a keyword, and `[ui] editor` and `terminal`
+are ignored. A
 server whose certificate is not trusted fails the turn at once, saying
 why, rather than being retried.
 

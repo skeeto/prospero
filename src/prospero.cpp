@@ -104,6 +104,9 @@ static Read    os_read(Os *, Arena *, Str path, iz max);
 // Replace a file atomically: write a temporary sibling, then rename it
 // over the target.
 static b32     os_write(Os *, Arena, Str path, Str data);
+// The same, the file's permissions mode (POSIX), as 0600 for a private
+// file or 0700 for a script; Windows leaves them to its directory.
+static b32     os_writemode(Os *, Arena, Str path, Str data, i32 mode);
 // Create a directory and all its parents.
 static b32     os_mkdirs(Os *, Arena, Str path);
 // List a directory, excluding "." and "..", symlinks, and special files.
@@ -252,6 +255,11 @@ static Proc   *os_spawnio(Os *, Spawn *, Arena scratch);
 // os_procfree. Returns 0 if the input is closed or broken (the child
 // stopped reading), or too much is queued already.
 static b32     os_procwrite(Os *, Proc *, Str);
+// A program started apart from this one, to outlive it, as a terminal
+// window is: neither waited for nor killed with it, its output nowhere,
+// in its own session (POSIX) or console (Windows). argv[0] is found on
+// env's PATH. Returns 0 on failure, explained by os_lasterr.
+static b32     os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env);
 
 // (M3) Session locks: an exclusive lock on a file, created if missing,
 // held until os_unlockfile or until the process ends, by any means. The

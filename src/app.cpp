@@ -1191,6 +1191,11 @@ struct Gui {
     // Compose box: the editor a draft is out in (one at a time), and
     // what the box's popups have open
     Str                editor;     // [ui] editor
+    Str                terminal;   // [ui] terminal
+    Str                termline;   // the latest terminal's launch, then << and a
+                                   // script's command (macOS), as the
+                                   // checklist sees it: argv by spaces
+    i32                terms;      // and how many
     Str                pathpre;    // [tools] path_prepend, as written
     Str                pathpost;   // [tools] path_append
     Mailbox           *edbox;      // its process's records
@@ -1202,6 +1207,7 @@ struct Gui {
     Str                revealed;   // the file guishow showed last, for
     i64                reveals;    //   the checklist, and how many
     b32                realreveal; // the checklist's show the file manager
+    b32                realterm;   // and its open terminals
     Proc              *edproc;
     u64                edid;
     Str                edpath;     // the draft's file, the plan file, or the
@@ -3142,6 +3148,8 @@ static void loadcfg(Gui *g, Str line)
             setfontbase(g, r.value);
         } else if (r.kind=="ui" && r.key=="editor") {
             setcfgstr(g, &g->editor, r);
+        } else if (r.kind=="ui" && r.key=="terminal") {
+            setcfgstr(g, &g->terminal, r);
         } else if (r.kind=="tools" && r.key=="path_prepend") {
             setcfgstr(g, &g->pathpre, r);
         } else if (r.kind=="tools" && r.key=="path_append") {
@@ -5181,6 +5189,127 @@ static void wslremotes(Gui *g)
 static Str linkprogram(Gui *g, Arena *a, b32 wsl)
 {
     return os_getenv(g->os, a, wsl ? Str("PROSPERO_TEST_WSL") : Str("PROSPERO_TEST_SSH"));
+}
+
+// Opening a terminal in a session's folder: on this machine, or on a
+// remote over ssh or WSL, in [ui] terminal or the platform's own.
+
+struct TermPlan {
+    TermRun    run;
+    Slice<Str> cmd;  // what it runs there, if not a shell here
+    Str     dir;  // where it starts here: the folder, if this machine's
+    Str     why;  // why it cannot, else null
+};
+
+static i32 termos(Gui *g)
+{
+    return g->mac ? TERM_MAC : HOST_WINDOWS ? TERM_WIN : TERM_LINUX;
+}
+
+// The terminal program: [ui] terminal, else the platform's. Null where
+// none is found (TERM_WIN: a console of its own).
+static Str termprog(Gui *g, Arena *a)
+{
+    if (trim(g->terminal).len || g->mac) {
+        return trim(g->terminal);
+    }
+    Str path = guipath(g, a);
+    if (HOST_WINDOWS) {
+        return findpath(g->os, a, *a, path, "wt.exe", 1);
+    }
+    Str env = trim(os_getenv(g->os, a, "TERMINAL"));
+    if (env.len) {
+        return env;
+    }
+    for (iz i = 0; i < countof(termsearch); i++) {
+        Str found = findpath(g->os, a, *a, path, termsearch[i], 0);
+        if (found.len) {
+            return found;
+        }
+    }
+    return {};
+}
+
+static TermPlan termplan(Gui *g, Arena *a, GuiSession *s)
+{
+    TermPlan r   = {};
+    View    *v   = s->view;
+    GuiHost *h   = s->host;
+    Str      dir = v && v->cwd.len ? v->cwd : s->cwd;
+    Str      prog = termprog(g, a);
+    if (!dir.len) {
+        r.why = "Its folder is not known yet";
+        return r;
+    } else if (!prog.len && termos(g)==TERM_LINUX) {
+        r.why = "No terminal found: set [ui] terminal in the settings";
+        return r;
+    }
+    Slice<Str> cmd = {};
+    if (h->kind == GH_REMOTE) {
+        Str ssh = remoteset(g, h->name, "ssh");
+        Str wsl = ssh.len ? Str{} : remoteset(g, h->name, "wsl");
+        if (ssh.len) {
+            cmd = termssh(a, Str("ssh"), ssh, dir, hostwin(h));
+        } else if (wsl.len) {
+            cmd = termwsl(a, Str("wsl.exe"), wsl, dir);
+        } else {
+            r.why = "Its section names no ssh destination";
+            return r;
+        }
+    } else {
+        r.dir = dir;
+    }
+    r.cmd = cmd;
+    r.run = termargv(a, termos(g), prog, dir, cmd);
+    return r;
+}
+
+// Open it, or in the checklist note what would run, unless asked to run
+// it (PROSPERO_TEST_TERMINAL).
+static void termopen(Gui *g, Arena a, GuiSession *s)
+{
+    TermPlan p = termplan(g, &a, s);
+    if (p.why.len) {
+        g->lasterr = clone(&g->perm, p.why);
+        return;
+    }
+    Slice<Str> argv = p.run.argv;
+    if (p.run.script.len) {
+        // macOS: Terminal runs a .command file it is given
+        Str dir  = join(&a, g->statedir, "terminal");
+        Buf b(&a, 64);
+        print(&b, "open-");
+        printhex(&b, os_random(g->os), 16);
+        print(&b, ".command");
+        Str path = join(&a, dir, finish(&b));
+        if (!os_mkdirs(g->os, a, dir) ||
+                !os_writemode(g->os, a, path, p.run.script, 0700)) {
+            g->lasterr = clone(&g->perm, concat(&a, "cannot write ", path));
+            return;
+        }
+        argv = push(&a, argv, path);
+    }
+    Buf b(&a, 256);
+    for (iz i = 0; i < argv.len; i++) {
+        print(&b, i ? Str(" ") : Str(""));
+        print(&b, argv[i]);
+    }
+    if (p.run.script.len) {
+        print(&b, " <<");
+        for (iz i = 0; i < p.cmd.len; i++) {
+            print(&b, " ");
+            print(&b, p.cmd[i]);
+        }
+    }
+    g->termline = clone(&g->perm, finish(&b));
+    g->terms++;
+    if (!g->drive || g->realterm) {
+        Str dir = p.dir.len ? p.dir : userhome(g->os, &a);
+        if (!os_launch(g->os, a, argv, dir, guienv(g, &a))) {
+            g->lasterr = clone(&g->perm, concat(&a, "cannot open a terminal: ",
+                                                os_lasterr(g->os, &a)));
+        }
+    }
 }
 
 struct GuiWsl {
@@ -8628,6 +8757,7 @@ enum : i32 {
     CHK_PLANEDITING,  // the plan is out in the editor, Approve held
     CHK_PLANEDITED,   // the plan's ask shows the file as edited, with text
     CHK_PLANREVEAL,   // Reveal showed the plan file, once
+    CHK_TERMRAN,      // dx terminals opened, the latest's launch with text
     CHK_PLANPLAIN,    // the plan is out in the editor, no plan waiting
     CHK_PLANQUIET,    // the session is idle, asking nothing
     CHK_PLANREVISED,  // the agent heard the plan approved was revised by hand
@@ -8860,6 +8990,7 @@ static Str chknames[] = {
     "the plan is open in the editor, Approve held meanwhile",
     "the plan's ask shows the plan as the editor left it",
     "Reveal showed the plan file in the file manager",
+    "Open in terminal opened one in its folder, as said",
     "the plan is open in the editor, with no plan waiting",
     "the session is idle and asks nothing: the agent was not told",
     "the agent heard that the plan it carries out was revised by hand",
@@ -10523,6 +10654,15 @@ static DriveOp sessionsops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Start subagents.\n  S "},
+    // A terminal in its folder, from its context menu (noted, not opened)
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Say hello."},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_POPUP, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Open in terminal"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TERMRAN, 1, 0, 0, ""},
     // Renamed from its context menu
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Say hello."},
     {OP_RDOWN, 0, 0, 0, 60, ""},
@@ -11056,6 +11196,17 @@ static DriveOp remoteops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SESSION, 0, 0, 30000, ""},
     {OP_CHECK, CHK_REMOTESESSION, 0, 0, 0, ""},
+    // A terminal in its folder there, over ssh, from its Info
+    {OP_MOVE, T_INFOBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Terminal"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_TERMRAN, 1, 0, 0, "ssh -t -- here cd "},
+    {OP_SHOT, 0, 0, 0, 300, "remote-terminal"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     // Its model picker lists the models of the host's own configuration
     {OP_MOVE, T_NAMED, 0, 0, 100, "model picker"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -14092,6 +14243,12 @@ static b32 drivecheck(Gui *g, i32 chk)
                !g->edreq.len && planask(v)<0;
     case CHK_PLANQUIET:
         return g->sess && !v->busy && !v->asks;
+    case CHK_TERMRAN: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        Arena    a  = g->frame;
+        guilog(g, concat(&a, "drive: terminal: ", g->termline));
+        return g->terms==(i32)op->dx && g->termline.len && find(g->termline, op->text)>=0;
+    }
     case CHK_PLANREVEAL: {
         Arena a = g->frame;
         guilog(g, concat(&a, "drive: Reveal showed ", g->revealed));
@@ -15327,6 +15484,7 @@ static void readconfig(Gui *g, Arena scratch)
     g->toolset = tools<0 ? TOOLS_AUTO : tools;
     setfontbase(g, cfgget(cfg, "ui", "", "font_size", 0));
     g->editor     = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
+    g->terminal   = clone(&g->perm, cfgget(cfg, "ui", "", "terminal", 0));
     g->pathpre    = clone(&g->perm, cfgget(cfg, "tools", "", "path_prepend", 0));
     g->pathpost   = clone(&g->perm, cfgget(cfg, "tools", "", "path_append", 0));
     g->configured = cfgconfigured(cfg);
@@ -15611,6 +15769,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     {
         Arena a = g->frame;
         g->realreveal = g->drive && os_getenv(os, &a, "PROSPERO_TEST_REVEAL").len;
+        g->realterm   = g->drive && os_getenv(os, &a, "PROSPERO_TEST_TERMINAL").len;
     }
     g->nosession.stick = 1;
     g->nosession.view  = newview(&g->perm, g->vcache, os_reserve(os, 16*mb),

@@ -98,6 +98,12 @@ Right-click a session in the sidebar, or open the Session menu, for:
 - **Delete...**: remove it, with its subagents, for good.
 - **Copy session id**, **Reveal folder** (the session's folder in the
   state directory) and **Close**.
+- **Open in terminal**: a terminal window with a shell in the folder
+  the session works in, as is the Info popup's Terminal button. On a
+  remote it is a shell there, over ssh (`ssh -t`, so it may ask for a
+  password) or WSL. The terminal is `[ui] terminal`, else Terminal on
+  macOS, Windows Terminal (or a console) on Windows, and elsewhere
+  `$TERMINAL` or the first of the usual ones found.
 
 Most of these wait until the turn ends.
 

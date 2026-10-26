@@ -967,6 +967,7 @@ static void testcfgjson(Test *t)
         "ui//tools=auto*\n"
         "ui//font_size=17*\n"
         "ui//editor=*\n"
+        "ui//terminal=*\n"
         "desktop//offer=all*\n"
         "desktop//ask=true*\n"
         "desktop//ask_timeout=60*\n"

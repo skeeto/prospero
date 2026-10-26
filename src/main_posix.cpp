@@ -309,8 +309,9 @@ static Read os_read(Os *, Arena *a, Str path, iz max)
 
 // The temporary sibling has a random name so that concurrent writers of
 // the same path never share one. It takes the permissions of the file
-// it replaces, and reaches the disk before the rename makes it visible.
-static b32 os_write(Os *os, Arena scratch, Str path, Str data)
+// it replaces, or mode if given, and reaches the disk before the rename
+// makes it visible.
+static b32 writeas(Os *os, Arena scratch, Str path, Str data, i32 mode)
 {
     if (hasnul(path)) {
         return 0;
@@ -323,12 +324,14 @@ static b32 os_write(Os *os, Arena scratch, Str path, Str data)
     char *tmp = cstr(&scratch, finish(&b));
     char *dst = cstr(&scratch, path);
 
-    i32 fd = open(tmp, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0666);
+    i32 fd = open(tmp, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, mode ? mode : 0666);
     if (fd < 0) {
         return 0;
     }
     struct stat st;
-    if (!stat(dst, &st)) {
+    if (mode) {
+        fchmod(fd, (mode_t)mode);
+    } else if (!stat(dst, &st)) {
         fchmod(fd, st.st_mode & 0777);
     }
     b32 ok = writeall(fd, data) && !fsync(fd);
@@ -338,6 +341,16 @@ static b32 os_write(Os *os, Arena scratch, Str path, Str data)
         unlink(tmp);
     }
     return ok;
+}
+
+static b32 os_write(Os *os, Arena scratch, Str path, Str data)
+{
+    return writeas(os, scratch, path, data, 0);
+}
+
+static b32 os_writemode(Os *os, Arena scratch, Str path, Str data, i32 mode)
+{
+    return writeas(os, scratch, path, data, mode);
 }
 
 static b32 os_mkdirs(Os *, Arena scratch, Str path)
@@ -1622,6 +1635,78 @@ static Proc *os_spawn(Os *os, Spawn *sp, Arena scratch)
 static Proc *os_spawnio(Os *os, Spawn *sp, Arena scratch)
 {
     return spawnproc(os, sp, scratch, 1);
+}
+
+// A grandchild, so nothing waits for it and no reaper sweeps it: the
+// child starts a session, forks it, and exits at once. Between fork and
+// exec only async-signal-safe calls, everything prepared ahead.
+static b32 os_launch(Os *, Arena scratch, Slice<Str> argv, Str cwd, Slice<Str> env)
+{
+    if (!argv.len || hasnul(cwd)) {
+        errno = EINVAL;
+        return 0;
+    }
+    Str prog = argv[0];
+    if (find(prog, "/") < 0) {
+        Str path = {};
+        for (iz i = 0; i < env.len; i++) {
+            if (startswith(env[i], "PATH=")) {
+                path = cuthead(env[i], 5);
+            }
+        }
+        for (Str rest = path; rest.len && prog==argv[0];) {
+            Cut c = cut(rest, ':');
+            rest = c.tail;
+            Arena a = scratch;
+            Str   p = join(&a, c.head.len ? c.head : Str("."), argv[0]);
+            if (!access(cstr(&a, p), X_OK)) {
+                prog = clone(&scratch, p);
+            }
+        }
+    }
+    char **av = alloc<char *>(&scratch, argv.len+1);
+    for (iz i = 0; i < argv.len; i++) {
+        av[i] = cstr(&scratch, argv[i]);
+    }
+    char **ev = alloc<char *>(&scratch, env.len+1);
+    for (iz i = 0; i < env.len; i++) {
+        ev[i] = cstr(&scratch, env[i]);
+    }
+    char *file = cstr(&scratch, prog);
+    char *dir  = cstr(&scratch, cwd);
+    if (access(file, X_OK)) {
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 0;
+    } else if (!pid) {
+        setsid();
+        if (fork()) {
+            _exit(0);
+        }
+        i32 null = open("/dev/null", O_RDWR);
+        if (null >= 0) {
+            dup2(null, 0);
+            dup2(null, 1);
+            dup2(null, 2);
+        }
+        for (i32 fd = 3; fd < 1024; fd++) {
+            close(fd);
+        }
+        if (dir[0] && chdir(dir)) {
+            _exit(127);
+        }
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, 0);
+        execve(file, av, ev);
+        _exit(127);
+    }
+    i32 status = 0;
+    while (waitpid(pid, &status, 0)<0 && errno==EINTR) {}
+    return 1;
 }
 
 static b32 os_procwrite(Os *, Proc *p, Str data)
