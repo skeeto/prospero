@@ -12687,7 +12687,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->tools         = clone(&s->perm, jsonstr(jsonget(j, "tools")));
             s->te.jobtimeout = jsonint(jsonget(j, "job_timeout"), 0);
             s->te.jobmax     = jsonint(jsonget(j, "job_timeout_max"), 0);
-            prefixshell(s, scratch, j);
+            prefixshell(s, t, j);  // above j, in t
             s->te.coords     = jsonstr(jsonget(j, "coordinates"))=="norm1000"
                                ? COORDS_NORM1000 : COORDS_PIXELS;
             s->system.data   = s->system.data ? s->system.data : (u8 *)"";

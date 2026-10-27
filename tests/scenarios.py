@@ -8346,11 +8346,17 @@ def mcp_plan(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
-@scenario(conf=mcpconf(), bound=30)
+# A long path to /bin/sh: reading the prefix again once stat a path
+# that long over the record's own parse, losing its MCP tools
+LONGSH = {"_tools": {"shell": "/bin" + "/../bin"*48 + "/sh"}} if os.name != "nt" else {}
+
+
+@scenario(conf={**mcpconf(), **LONGSH}, bound=30)
 def mcp_ask(t):
     """Attended: a call allowed once, then always for that tool, which
     stops its asks, but not another tool's, denied with a note. Another
-    process keeps the grant and the tools, from the session's prefix."""
+    process keeps the grant and the tools, from the session's prefix,
+    whatever its shell's path."""
     env = mcpenv(t)
     h = t.headless(env=env)
     b = None
