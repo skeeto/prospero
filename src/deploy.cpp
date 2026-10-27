@@ -1368,7 +1368,7 @@ static Slice<Str> wsldistros(Arena *a, Str out)
             ok = alnum(c) || c=='.' || c=='-' || c=='_';
         }
         if (ok && !startswith(name, "docker-desktop")) {
-            r = push(a, r, name);
+            r = push(a, r, clone(a, name));  // out may be the caller's scratch
         }
     }
     return r;

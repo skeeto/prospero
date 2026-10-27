@@ -1450,17 +1450,20 @@ struct Gui {
 static void guilog(Gui *g, Str msg)
 {
     scheddirty(&g->sched);
-    msg = clone(&g->perm, msg);  // first: msg may be in frame scratch
-    Arena a = g->frame;
-    Buf   b(&a, msg.len+64);
-    print(&b, "prospero: ");
+    // The whole line in perm, the Log window's entry inside it: msg may
+    // be in the caller's frame scratch, which a frame copy would be over
+    Str pre = "prospero: ";
+    Buf b(&g->perm, pre.len+msg.len+1);
+    print(&b, pre);
     print(&b, msg);
     putbyte(&b, '\n');
+    Str line = finish(&b);
+    msg = takehead(cuthead(line, pre.len), msg.len);
     if (!g->detached) {
-        os_print(g->os, 2, finish(&b));  // else it is the log already
+        os_print(g->os, 2, line);  // else it is the log already
     }
     if (g->logfd >= 0) {
-        os_logwrite(g->os, g->logfd, finish(&b));
+        os_logwrite(g->os, g->logfd, line);
     }
     if (g->logs.len >= GUILOG_MAX) {
         for (iz i = 1; i < g->logs.len; i++) {
@@ -4137,7 +4140,7 @@ static void ondir(Gui *, Arena, i64 id, Json *, b32 ok, Str err);
 static void onimport(Gui *, GuiHost *, Arena, Request *, EvRec *);
 static void sessgone(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
-static void cfgeditrun(Gui *, Str path);
+static void cfgeditrun(Gui *, Arena, Str path);
 
 static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 {
@@ -4401,7 +4404,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             // The file is there now: out to the editor
             g->cfgcreate = 0;
             if (ok) {
-                cfgeditrun(g, jsonstr(jsonget(j, "path")));
+                cfgeditrun(g, scratch, jsonstr(jsonget(j, "path")));
             } else {
                 g->cfgstatus = clone(&g->perm, concat(&scratch, "Not created: ", err));
                 g->cfgok     = 0;
@@ -4757,9 +4760,9 @@ static Proc *editrun(Gui *g, Arena a, Str cmd, Str path, Str dir, Str log)
     return os_spawn(g->os, &sp, a);
 }
 
-static void editstart(Gui *g, GuiSession *s)
+// The draft of session s in the editor, a its scratch.
+static void editstart(Gui *g, Arena a, GuiSession *s)
 {
-    Arena a   = g->frame;
     Str   why = editorwhy(g, s, &a);
     if (why.len) {
         setnote(g, s, why, 1);
@@ -4806,10 +4809,9 @@ static i32 planask(View *v)
 }
 
 // Edit plan: the plan file at path, in the editor, in place, for the
-// plan's ask req, else with none waiting.
-static void planedit(Gui *g, GuiSession *s, Str path, Str req)
+// plan's ask req, else with none waiting. Its scratch is a.
+static void planedit(Gui *g, Arena a, GuiSession *s, Str path, Str req)
 {
-    Arena a   = g->frame;
     Str   why = editorwhy(g, s, &a);
     if (why.len) {
         setnote(g, s, why, 1);
@@ -4836,10 +4838,9 @@ static void planedit(Gui *g, GuiSession *s, Str path, Str req)
 }
 
 // The configuration file at path, which exists, in the editor, in
-// place. What goes wrong is Settings' status.
-static void cfgeditrun(Gui *g, Str path)
+// place, a its scratch. What goes wrong is Settings' status.
+static void cfgeditrun(Gui *g, Arena a, Str path)
 {
-    Arena a   = g->frame;
     Str   why = editorwhy(g, 0, &a);
     Str   err = {};
     Proc *p   = 0;
@@ -4874,10 +4875,11 @@ static void cfgeditrun(Gui *g, Str path)
 
 // Open in editor, from Settings: the configuration file at path, made
 // first by the engine, as its first edit would, if it does not exist.
-static void cfgedit(Gui *g, Str path, b32 exists)
+// Its scratch is a.
+static void cfgedit(Gui *g, Arena a, Str path, b32 exists)
 {
     if (exists) {
-        cfgeditrun(g, path);
+        cfgeditrun(g, a, path);
     } else if (!g->cfgcreate) {
         guiconfigcreate(g);
     }

@@ -1677,7 +1677,7 @@ static void planeditbutton(Gui *g, GuiSession *s, Str path, Str req, char const 
     Str why = planeditwhy(g, s, path, &a);
     ImGui::BeginDisabled(why.len != 0);
     if (ImGui::Button(label)) {
-        planedit(g, s, path, req);
+        planedit(g, a, s, path, req);
     }
     ImGui::EndDisabled();
     itemnamed(g, named);
@@ -3861,8 +3861,8 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
 
 // The slash popup, above the box while its first word is typed: each
 // command and skill that word may become, with what it does, the pick
-// marked.
-static void drawslash(Gui *g, Str text, Slice<SkillItem> skills, ImVec2 at)
+// marked. Its scratch is a, after what the caller keeps there (picks).
+static void drawslash(Gui *g, Arena a, Str text, Slice<SkillItem> skills, ImVec2 at)
 {
     ImGui::SetNextWindowPos(at, ImGuiCond_Always, v2(0, 1));
     ImGuiWindowFlags f = ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoTitleBar |
@@ -3871,7 +3871,6 @@ static void drawslash(Gui *g, Str text, Slice<SkillItem> skills, ImVec2 at)
                          ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
                          ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoDocking;
     if (ImGui::Begin("##slash", 0, f)) {
-        Arena         a     = g->frame;
         Slice<i32>    picks = slashpicks(&a, text, skills);
         Slice<char *> heads = {};
         f32           w     = ImGui::CalcTextSize("/compact [focus]").x;
@@ -4074,7 +4073,7 @@ static void drawprompt(Gui *g)
     ImGuiKey ctrl = g->mac ? ImGuiMod_Super : ImGuiMod_Ctrl;
     if (!editing && io.KeyMods==ctrl && ImGui::IsKeyPressed(ImGuiKey_G, false) &&
             ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows)) {
-        editstart(g, s);
+        editstart(g, a, s);
         editing = g->edsess==s && !g->edplan;
     }
 
@@ -4148,7 +4147,7 @@ static void drawprompt(Gui *g)
         ImGui::ActivateItemByID(id);
     }
     if (slash && ImGui::GetActiveID()==id) {
-        drawslash(g, draftstr(s), s->skills, v2(r0.x, r0.y));
+        drawslash(g, a, draftstr(s), s->skills, v2(r0.x, r0.y));
     }
 
     // The context menu
@@ -4181,7 +4180,7 @@ static void drawprompt(Gui *g)
         ImGui::Separator();
         b32 ed = !g->edproc && editorcmd(g, &a).len;
         if (ImGui::MenuItem("Open in editor", "Ctrl+G", false, ed)) {
-            editstart(g, s);
+            editstart(g, a, s);
         }
         itemrect(g, RECT_CMEDITOR);
         if (!editorcmd(g, &a).len) {
@@ -7448,11 +7447,11 @@ static Str cfgpagekey(Arena *a, Str kind, Str name)
 // One page in the list: selected on a click. In the combo its label is
 // whole, the popup as wide as it needs; in the list it is cut to fit,
 // whole in its tooltip then. Its rectangle goes to rect, if not null.
-static b32 cfgitem(Gui *g, b32 combo, Str label, b32 selected, Str tip,
+// Its scratch is a, after what the caller keeps there (label).
+static b32 cfgitem(Gui *g, Arena a, b32 combo, Str label, b32 selected, Str tip,
                    u32 color, Rect *rect)
 {
-    Arena a     = g->frame;
-    b32   click = 0;
+    b32 click = 0;
     if (color) {
         ImGui::PushStyleColor(ImGuiCol_Text, color);
     }
@@ -7508,9 +7507,8 @@ static void cfgreveal(Gui *g, Str key, b32 sel)
     }
 }
 
-static void cfgheading(Gui *g, b32 combo, Str label)
+static void cfgheading(Gui *g, Arena a, b32 combo, Str label)
 {
-    Arena a = g->frame;
     ImGui::Spacing();
     textfit(a, label, combo ? 1e6f : ImGui::GetContentRegionAvail().x,
             ImGui::GetColorU32(ImGuiCol_TextDisabled));
@@ -7523,7 +7521,7 @@ static void drawcfglist(Gui *g, b32 combo)
     Arena a     = g->frame;
     f32   sc    = g->scale;
     Json *kinds = jsonget(g->cfg, "kinds");
-    cfgheading(g, combo, "General");
+    cfgheading(g, a, combo, "General");
     ImGui::Indent(8*sc);
     for (Json *k = kinds->child; k; k = k->next) {
         Str kind = jsonstr(jsonget(k, "kind"));
@@ -7538,7 +7536,8 @@ static void drawcfglist(Gui *g, b32 combo)
         b32 sel = !g->cfgdiag && g->cfgpkind==kind && !g->cfgpname.len;
         Str tip = jsonstr(jsonget(k, "desc"));
         pushstr(kind);
-        if (cfgitem(g, combo, cfgkindlabel(&a, kind, 0), sel, tip, 0, first ? &first->page : 0)) {
+        Str label = cfgkindlabel(&a, kind, 0);
+        if (cfgitem(g, a, combo, label, sel, tip, 0, first ? &first->page : 0)) {
             cfgselect(g, kind, "");
         }
         cfgreveal(g, kind, sel);
@@ -7552,7 +7551,8 @@ static void drawcfglist(Gui *g, b32 combo)
         if (!jsonint(jsonget(k, "named"), 0)) {
             continue;
         }
-        cfgheading(g, combo, cfgkindlabel(&a, kind, 1));
+        Str heading = cfgkindlabel(&a, kind, 1);
+        cfgheading(g, a, combo, heading);
         ImGui::Indent(8*sc);
         pushstr(kind);
         for (iz i = 0; i < g->cfgrows.len; i++) {
@@ -7564,7 +7564,7 @@ static void drawcfglist(Gui *g, b32 combo)
             }
             b32 sel = !g->cfgdiag && g->cfgpkind==kind && g->cfgpname==r->name;
             pushstr(r->name);
-            if (cfgitem(g, combo, r->name, sel, {}, 0, &r->page)) {
+            if (cfgitem(g, a, combo, r->name, sel, {}, 0, &r->page)) {
                 cfgselect(g, kind, r->name);
             }
             cfgreveal(g, cfgpagekey(&a, kind, r->name), sel);
@@ -7574,9 +7574,10 @@ static void drawcfglist(Gui *g, b32 combo)
         print(&ab, "Add ");
         print(&ab, kind=="mcp" ? Str("MCP server") : kind);
         print(&ab, "...");
-        Rect at  = {};
-        b32  add = cfgitem(g, combo, finish(&ab), 0, jsonstr(jsonget(k, "desc")),
-                           ImGui::GetColorU32(ImGuiCol_TextDisabled), &at);
+        Rect at   = {};
+        Str  what = finish(&ab);
+        b32  add  = cfgitem(g, a, combo, what, 0, jsonstr(jsonget(k, "desc")),
+                            ImGui::GetColorU32(ImGuiCol_TextDisabled), &at);
         if (group < 4) {
             g->rects[RECT_ADDOPEN+group] = at;
         }
@@ -7605,8 +7606,9 @@ static void drawcfglist(Gui *g, b32 combo)
         print(&db, jsonlen(diags));
         putbyte(&db, ')');
     }
-    Rect at = {};
-    if (cfgitem(g, combo, finish(&db), g->cfgdiag, "Problems found in the files, "
+    Rect at    = {};
+    Str  label = finish(&db);
+    if (cfgitem(g, a, combo, label, g->cfgdiag, "Problems found in the files, "
                 "with where each is", color, &at)) {
         g->cfgdiag = 1;
     }
@@ -8090,10 +8092,10 @@ static Str cfgeditwhy(Gui *g, Str path, b32 exists, Arena *a)
 }
 
 // The configuration file in the editor (cfgedit), beside Reload: its
-// button, or while it is out, which editor and a Cancel.
-static void cfgeditbutton(Gui *g, Str path, b32 exists)
+// button, or while it is out, which editor and a Cancel. Its scratch is
+// a, after what the caller keeps there.
+static void cfgeditbutton(Gui *g, Arena a, Str path, b32 exists)
 {
-    Arena       a  = g->frame;
     ImGuiStyle &st = ImGui::GetStyle();
     if (g->edcfg) {
         char *what = cstr0(&a, concat(&a, concat(&a, "editing in ", g->edname), "..."));
@@ -8113,7 +8115,7 @@ static void cfgeditbutton(Gui *g, Str path, b32 exists)
     samelineif(ImGui::CalcTextSize(label).x + 2*st.FramePadding.x);
     ImGui::BeginDisabled(why.len != 0);
     if (ImGui::SmallButton(label)) {
-        cfgedit(g, path, exists);
+        cfgedit(g, a, path, exists);
     }
     ImGui::EndDisabled();
     itemnamed(g, "config editor");
@@ -8147,7 +8149,7 @@ static void drawsettings(Gui *g)
     if (ImGui::SmallButton("Reload")) {
         guiconfigget(g);
     }
-    cfgeditbutton(g, path, jsonint(jsonget(j, "exists"), 0) != 0);
+    cfgeditbutton(g, a, path, jsonint(jsonget(j, "exists"), 0) != 0);
     i32 urls = (i32)jsonlen(jsonget(j, "includes"));
     if (urls) {
         // Fetching each URL include again, which the reply waits for
