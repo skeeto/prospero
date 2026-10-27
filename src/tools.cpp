@@ -102,8 +102,9 @@ enum : i32 {
     SHELL_CMD,      // cmd.exe /d /s /c "COMMAND"
     SHELL_PWSH,     // PowerShell 7: pwsh -Command BOOT, command in PSBOOTVAR
     SHELL_PS,       // Windows PowerShell 5.1, as SHELL_PWSH
+    SHELL_WSL,      // wsl.exe [-d DISTRO] --exec sh -c COMMAND
 };
-static Str const shellkinds[] = {"sh", "busybox", "cmd", "pwsh", "powershell"};
+static Str const shellkinds[] = {"sh", "busybox", "cmd", "pwsh", "powershell", "wsl"};
 
 // What a POSIX sh on Windows is, as the files beside it tell: only its
 // description differs.
@@ -123,6 +124,8 @@ struct Shell {
     b32 fallback;  // cmd.exe, for want of any other
     b32 login;     // started as a login shell, as its section says now
     Str desc;      // its section's description, for the agent
+    Str distro;    // wsl: its section's distribution, empty for the default
+    Str prelude;   // wsl: its section's PATH, set before the command
 };
 
 // What the tools need to know about where they run.
@@ -330,6 +333,20 @@ static void shellintro(Buf *b, Shell *sh)
         print(b, "The command fails if its last statement does, with a "
                  "native program's exit status ($LASTEXITCODE) when it has "
                  "one.");
+        break;
+    case SHELL_WSL:
+        print(b, "Run a command in WSL, Linux under Windows, with sh -c in ");
+        if (sh->distro.len) {
+            print(b, "its ");
+            print(b, sh->distro);
+            print(b, " distribution");
+        } else {
+            print(b, "its default distribution");
+        }
+        print(b, ": use Linux tools, and Windows programs by their .exe "
+                 "names. The shell names drives as /mnt/c/x. Give the file "
+                 "tools Windows paths: C:/x for /mnt/c/x, and for Linux "
+                 "paths, like ~ or /tmp, what wslpath -m prints.");
         break;
     }
 }
@@ -2389,6 +2406,17 @@ static Str envpath(Slice<Str> env, b32 windows)
     return {};
 }
 
+// The value of an environment's variable name, the first one, or null.
+static Str envget(Slice<Str> env, Str name, b32 windows)
+{
+    for (iz i = 0; i < env.len; i++) {
+        if (envnameis(env[i], name, windows)) {
+            return cuthead(env[i], name.len+1);
+        }
+    }
+    return {};
+}
+
 // An environment with its PATH set to path, the first entry replaced
 // where it is, under its own name (Path on Windows, say), or added: env
 // itself when it says so already.
@@ -2473,7 +2501,20 @@ struct ShellCmd {
     Slice<Str> argv;
     Str        cmdline;  // Windows cmd.exe only
     Str        env;      // PowerShell: NAME=value to add to the environment
+    b32        holdin;   // WSL: input held open, as Spawn.holdin
 };
+
+// How WSL runs a command, in sh -c, the command its $1. wsl.exe ended,
+// its Linux processes would go on, so its input, held open (holdin),
+// ends only when it does, and a watchdog then kills the process group,
+// the command's background processes included. The input reaches the
+// watchdog on 3, as sh gives a background command /dev/null for its
+// own, and the watchdog outlasts the soft stop (CTRL_BREAK, which WSL
+// passes on as SIGINT) for the kill that may follow. The command itself
+// reads nothing.
+static char const wslboot[] =
+    "exec 3<&0; (trap '' INT TERM HUP; cat <&3 >/dev/null 2>&1; kill -KILL 0) "
+    ">/dev/null 2>&1 & exec 3<&-; eval \"$1\" </dev/null";
 
 // PowerShell takes the command from this variable rather than its command
 // line, which has no quoting to get wrong and holds 32K characters, and
@@ -2496,8 +2537,9 @@ static char const psboot[] =
     "try{. $__b|Out-Default}catch{[Console]::Error.WriteLine(($_|Out-String).Trim());exit 1};"
     "if($global:__ok){exit 0};if($LASTEXITCODE){exit $LASTEXITCODE};exit 1";
 
-// How a shell runs a command: as a login shell (sh -l, PowerShell with
-// its profile, cmd with its AutoRun) only if its section says so.
+// How a shell runs a command: as a login shell (sh -l, in WSL too,
+// PowerShell with its profile, cmd with its AutoRun) only if its section
+// says so.
 static ShellCmd shellcmd(Arena *a, Shell *sh, b32 windows, Str command)
 {
     ShellCmd r = {};
@@ -2539,6 +2581,25 @@ static ShellCmd shellcmd(Arena *a, Shell *sh, b32 windows, Str command)
         r.argv = push(a, r.argv, Str("-Command"));
         r.argv = push(a, r.argv, Str(psboot));
         r.env  = concat(a, PSBOOTVAR "=", command);
+        break;
+    case SHELL_WSL:
+        // --exec runs sh itself, not the command through the user's
+        // shell, which would take it apart again
+        r.argv = push(a, r.argv, sh->path);
+        if (sh->distro.len) {
+            r.argv = push(a, r.argv, Str("-d"));
+            r.argv = push(a, r.argv, sh->distro);
+        }
+        r.argv = push(a, r.argv, Str("--exec"));
+        r.argv = push(a, r.argv, Str("sh"));
+        if (sh->login) {
+            r.argv = push(a, r.argv, Str("-l"));
+        }
+        r.argv   = push(a, r.argv, Str("-c"));
+        r.argv   = push(a, r.argv, Str(wslboot));
+        r.argv   = push(a, r.argv, Str("sh"));
+        r.argv   = push(a, r.argv, concat(a, sh->prelude, command));
+        r.holdin = 1;
         break;
     }
     return r;

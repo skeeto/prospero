@@ -90,6 +90,21 @@ cannot choose what runs, so these are ignored in one:
       env.MSYSTEM = UCRT64
       description = MSYS2 UCRT64, with pacman to install packages
 
+  On Windows, `program = wsl` runs commands in WSL, in the `sh` of
+  the distro that `distro` names (by default the default one), in the
+  working directory as WSL sees it (`/mnt/c/...`). Its `path_prepend`
+  and `path_append` are Linux directories, `~` for the distro's home,
+  and its `env.NAME` reach Linux through `WSLENV`. A command stopped or
+  killed ends its Linux processes too. To run a whole session inside a
+  distro, its files and tools Linux's, connect to the distro as a host
+  instead (Hosts):
+
+      [shell debian]
+      program = wsl
+      distro = Debian
+      path_prepend = ~/.local/bin
+      description = Debian, with apt to install packages
+
 - **`[tools] shells`**: shells the agent may pick per command, by name,
   separated by blanks. The shell tool then lists them and takes one by
   name. A name not found is left out, with a warning.

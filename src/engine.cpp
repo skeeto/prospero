@@ -4351,10 +4351,54 @@ static Slice<Str> engineenv(Engine *e, Arena *a, b32 win)
     return envsetpath(a, env, enginepath(e, a, win), win);
 }
 
+// The start of a WSL command that sets PATH, from a section's
+// path_prepend and path_append, ; separated Linux directories, ~ for
+// $HOME: empty without them.
+static Str wslprelude(Arena *a, Str pre, Str post)
+{
+    Slice<Str> dirs[2] = {splitpaths(a, pre, {}), splitpaths(a, post, {})};
+    if (!dirs[0].len && !dirs[1].len) {
+        return {};
+    }
+    Buf b(a, 64 + 2*(pre.len+post.len));
+    print(&b, "PATH=");
+    for (i32 k = 0; k < 2; k++) {
+        for (iz i = 0; i < dirs[k].len; i++) {
+            Str d = dirs[k][i];
+            if (k || i) {
+                putbyte(&b, ':');
+            }
+            if (cfgtilde(d)) {
+                print(&b, "\"$HOME\"");
+                d = cuthead(d, 1);
+            }
+            if (d.len) {
+                putbyte(&b, '\'');
+                for (iz j = 0; j < d.len; j++) {
+                    if (d[j] == '\'') {
+                        print(&b, "'\\''");
+                    } else {
+                        putbyte(&b, d[j]);
+                    }
+                }
+                putbyte(&b, '\'');
+            }
+        }
+        if (!k) {
+            print(&b, dirs[0].len ? Str(":\"$PATH\"") : Str("\"$PATH\""));
+        }
+    }
+    print(&b, "; export PATH; ");
+    return finish(&b);
+}
+
 // A command's environment in shell sh, its section's settings as the
 // configuration now says: engineenv's, with PATH wrapped in the
 // section's path_prepend and path_append, then its env.NAME, and sh's
-// login set. A login sh on Windows gets these first, for MSYS2's and
+// login set. In WSL those directories are Linux's, set in sh's prelude
+// instead, its distro comes from the section too, its env.NAME cross
+// into Linux by WSLENV, and WSL_UTF8=1 has wsl.exe's own messages in
+// UTF-8 rather than UTF-16. A login sh on Windows gets these first, for MSYS2's and
 // Git's /etc/profile: CHERE_INVOKING=1, which keeps it in the working
 // directory, and MSYS2_PATH_TYPE=inherit, without ORIGINAL_PATH, which
 // keep this PATH after its own directories. MSYS2's default replaces
@@ -4371,7 +4415,10 @@ static Slice<Str> shellenvfor(Session *s, Arena *a, Shell *sh)
     }
     Str pre  = cfgget(e->cfg, "shell", sh->name, "path_prepend", 0);
     Str post = cfgget(e->cfg, "shell", sh->name, "path_append", 0);
-    if (pre.len || post.len) {
+    if (sh->kind == SHELL_WSL) {
+        sh->distro  = clone(a, trim(cfgget(e->cfg, "shell", sh->name, "distro", 0)));
+        sh->prelude = wslprelude(a, pre, post);
+    } else if (pre.len || post.len) {
         Str path = searchpath(a, pre, enginepath(e, a, win), post, e->home, win);
         env = envsetpath(a, env, path, win);
     }
@@ -4384,6 +4431,16 @@ static Slice<Str> shellenvfor(Session *s, Arena *a, Shell *sh)
     Slice<CfgPair> pairs = cfgpairs(e->cfg, a, "shell", sh->name, "env.");
     for (iz i = 0; i < pairs.len; i++) {
         env = envset(a, env, pairs[i].name, pairs[i].value, win);
+    }
+    if (sh->kind == SHELL_WSL) {
+        Str wslenv = envget(env, "WSLENV", win);
+        for (iz i = 0; i < pairs.len; i++) {
+            wslenv = concat(a, wslenv.len ? concat(a, wslenv, ":") : Str{}, pairs[i].name);
+        }
+        if (wslenv.len) {
+            env = envset(a, env, "WSLENV", wslenv, win);
+        }
+        env = envset(a, env, "WSL_UTF8", "1", win);
     }
     return env;
 }
@@ -4440,12 +4497,14 @@ static ShellCmd sessioncmd(Session *s, Arena *a, Shell *in, Str command,
 
 // Spawn a process for the current call, its output into spill.
 static Proc *spawncall(Session *s, Arena scratch, Slice<Str> argv, Str cmdline,
-                       Slice<Str> env, Str cwd, Str spill, i64 maxbytes, u64 *id)
+                       b32 holdin, Slice<Str> env, Str cwd, Str spill, i64 maxbytes,
+                       u64 *id)
 {
     Engine *e  = s->e;
     Spawn   sp = {};
     sp.argv     = argv;
     sp.cmdline  = cmdline;
+    sp.holdin   = holdin;
     sp.cwd      = cwd;
     sp.env      = env;
     sp.outpath  = spill;
@@ -4846,8 +4905,8 @@ static void startjob(Session *s, Arena scratch, Args *args)
     Slice<Str> env = {};
     ShellCmd   sc  = sessioncmd(s, &scratch, callshell(s, args), args->command, &env);
     u64        id  = 0;
-    Proc      *p   = spawncall(s, scratch, sc.argv, sc.cmdline, env, s->cwd, spill,
-                               SHELL_OUTMAX, &id);
+    Proc      *p   = spawncall(s, scratch, sc.argv, sc.cmdline, sc.holdin, env, s->cwd,
+                               spill, SHELL_OUTMAX, &id);
     if (!p) {
         Str err  = os_lasterr(e->os, &scratch);
         Str text = concat(&scratch, "The shell could not be started: ", err);
@@ -5078,8 +5137,8 @@ static b32 startshell(Session *s, Arena scratch, Args *args)
 
     Slice<Str> env = {};
     ShellCmd   sc  = sessioncmd(s, &scratch, callshell(s, args), args->command, &env);
-    s->proc = spawncall(s, scratch, sc.argv, sc.cmdline, env, s->cwd, s->sh.spill,
-                        SHELL_OUTMAX, &s->procid);
+    s->proc = spawncall(s, scratch, sc.argv, sc.cmdline, sc.holdin, env, s->cwd,
+                        s->sh.spill, SHELL_OUTMAX, &s->procid);
     if (!s->proc) {
         return 0;
     }
@@ -5129,7 +5188,7 @@ static b32 startsearch(Session *s, Arena scratch, i32 tool, Str path, Args *args
     Slice<Str> argv = searchargv(&scratch, &s->te, tool, path, target, args);
     i64        max  = tool==TOOL_GLOB ? SEARCH_GLOBMAX : SEARCH_OUTMAX;
     Slice<Str> env = engineenv(e, &scratch, s->te.windows);
-    s->proc = spawncall(s, scratch, argv, {}, env, root, s->sh.spill, max, &s->procid);
+    s->proc = spawncall(s, scratch, argv, {}, 0, env, root, s->sh.spill, max, &s->procid);
     if (!s->proc) {
         Str err  = os_lasterr(e->os, &scratch);
         Str text = concat(&scratch, "The search could not be started: ", err);
@@ -10369,6 +10428,8 @@ static i32 shellkindof(Str path, b32 win)
         return SHELL_CMD;
     } else if (startswith(name, "busybox")) {
         return SHELL_BUSYBOX;
+    } else if (win && equalfold(name, "wsl")) {
+        return SHELL_WSL;
     }
     return SHELL_SH;
 }
@@ -10483,10 +10544,12 @@ static Shell findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
     return sh;
 }
 
-// The keyword a kind of shell goes by: sh, powershell or cmd.
+// The keyword a kind of shell goes by: sh, powershell or cmd, and wsl
+// for WSL's, which is found as a program.
 static Str shellkeyword(i32 kind)
 {
     switch (kind) {
+    case SHELL_WSL:  return "wsl";
     case SHELL_CMD:  return "cmd";
     case SHELL_PWSH:
     case SHELL_PS:   return "powershell";
@@ -10558,8 +10621,9 @@ static Shell shellnamed(Engine *e, Arena *perm, Arena scratch, Str name,
         sh.name = base;
     }
     if (own) {
-        sh.name = clone(perm, name);
-        sh.desc = clone(perm, trim(cfgget(e->cfg, "shell", name, "description", 0)));
+        sh.name   = clone(perm, name);
+        sh.desc   = clone(perm, trim(cfgget(e->cfg, "shell", name, "description", 0)));
+        sh.distro = clone(perm, trim(cfgget(e->cfg, "shell", name, "distro", 0)));
     } else {
         sh.name = clone(perm, sh.name);
     }
@@ -10649,8 +10713,10 @@ static Shell shellrec(Engine *e, Arena *perm, Arena scratch, Json *j, Str key,
             sh = shellat(e->os, scratch, clone(perm, path), k, HOST_WINDOWS);
             sh.name = name.len ? clone(perm, name) : Str(shellkeyword(k));
             if (cfgownsection(e->cfg, "shell", sh.name)) {
-                Str d   = cfgget(e->cfg, "shell", sh.name, "description", 0);
-                sh.desc = clone(perm, trim(d));
+                Str d     = cfgget(e->cfg, "shell", sh.name, "description", 0);
+                Str w     = cfgget(e->cfg, "shell", sh.name, "distro", 0);
+                sh.desc   = clone(perm, trim(d));
+                sh.distro = clone(perm, trim(w));
             }
         }
     }

@@ -1441,7 +1441,8 @@ struct Proc {
     // os_spawnio
     b32        io;
     Lock       lock;
-    uz         input;     // input pipe write end, owned by the writer
+    uz         input;     // input pipe write end, owned by the writer, or
+                          // held (Spawn.holdin) until the Proc is freed
     Event      wake;      // for the writer
     ProcChunk *head;      // under lock: the input queue
     ProcChunk *last;      // under lock
@@ -1509,6 +1510,8 @@ static void procrelease(Proc *p)
         CloseHandle(p->process);
         if (p->io) {
             DeleteCriticalSection((CriticalSection *)p->lock.opaque);
+        } else if (p->input) {
+            CloseHandle(p->input);  // held, so the child read no end before
         }
         HeapFree(GetProcessHeap(), 0, p);
     }
@@ -1751,7 +1754,8 @@ static Str childpath(Os *os, Arena *a, Slice<Str> env, Str name)
 
 // Spawn into a new job. With io, input is a pipe from the writer
 // thread, errors go to outpath (or NUL) directly, and the reader passes
-// output on as records instead of into the file.
+// output on as records instead of into the file. Otherwise input is NUL,
+// or with holdin a pipe whose write end the Proc holds.
 static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
 {
     if (!sp->argv.len || hasnul(sp->cwd) || hasnul(sp->outpath)) {
@@ -1787,7 +1791,8 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     uz    pr = 0, pw = 0, ir = 0, iw = 0;
     Event wake = {};
     ok = ok && CreatePipe(&pr, &pw, 0, 1<<16) &&
-         (!io || (CreatePipe(&ir, &iw, 0, 1<<16) && os_eventinit(&wake)));
+         (!io || (CreatePipe(&ir, &iw, 0, 1<<16) && os_eventinit(&wake))) &&
+         (io || !sp->holdin || CreatePipe(&ir, &iw, 0, 1<<16));
     if (ok && job) {
         JobLimits lim = {};
         lim.flags = JOB_KILL_ON_JOB_CLOSE | JOB_DIE_ON_UNHANDLED_EXCEPTION |
@@ -1809,7 +1814,7 @@ static Proc *spawnproc(Os *os, Spawn *sp, Arena scratch, b32 io)
     StartupInfo si = {};
     si.cb     = sizeof(si);
     si.flags  = STARTF_USESTDHANDLES;
-    si.input  = io ? ir : nul;
+    si.input  = ir ? ir : nul;
     si.output = pw;
     si.error  = !io ? pw : file ? file : nul;
     i32 flags = CREATE_SUSPENDED | CREATE_NO_WINDOW |

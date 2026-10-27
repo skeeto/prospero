@@ -437,7 +437,11 @@ static CfgKey cfgschema[] = {
 
     {"shell", "program", CFG_STRING, "", {}, {}, "shell",
      "Its executable, by its path or its name on PATH, or sh, powershell "
-     "or cmd as [tools] shell finds them; by default the section's name"},
+     "or cmd as [tools] shell finds them; by default the section's name. "
+     "wsl runs commands in WSL's sh"},
+    {"shell", "distro", CFG_STRING, "", {}, {}, "shell",
+     "For program = wsl: the WSL distribution to run in, by its name as "
+     "wsl -l lists it; by default the default one"},
     {"shell", "login", CFG_BOOL, "false", {}, {}, "shell",
      "Start it as a login shell: a POSIX sh with -l, so /etc/profile and "
      "~/.profile set it up; PowerShell with your profile; cmd with its "
@@ -447,10 +451,11 @@ static CfgKey cfgschema[] = {
      "env:VAR to take it from this one's"},
     {"shell", "path_prepend", CFG_PATHS, "", {}, {}, "shell",
      "Directories to find programs in, its own too, before [tools] "
-     "path_prepend's and PATH, separated by ;"},
+     "path_prepend's and PATH, separated by ;. For wsl, Linux directories "
+     "before its PATH"},
     {"shell", "path_append", CFG_PATHS, "", {}, {}, "shell",
      "Directories to find programs in after PATH and [tools] path_append's, "
-     "separated by ;"},
+     "separated by ;. For wsl, Linux directories after its PATH"},
     {"shell", "description", CFG_STRING, "", {}, {}, "shell",
      "What the agent is told of it, after what Prospero says of its kind: "
      "what it is for, and what it has"},

@@ -207,6 +207,8 @@ struct Spawn {
     u64        id;
     b32        breakaway; // Windows: its job lets processes leave it, as
                           // the programs the desktop helper starts do
+    b32        holdin;    // Windows: input a pipe that sends nothing, held
+                          // open until the Proc is freed, not NUL
 };
 // Null on failure, explained by os_lasterr. The process is not waited
 // for, and its records may arrive before this returns.

@@ -368,6 +368,28 @@ def sc_shell_login_msys(model, n, req):
         yield from answer(model, "Ran in a login bash.")
 
 
+def sc_shell_wsl(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "shell", {"command":
+                        'echo "FOO=$FOO"; pwd; uname -s; prospero_wsl_tool; '
+                        "printf 'h\\303\\251llo\\n'; exit 3"})
+    elif n == 1:
+        # Deaf to the soft stop, so that only the kill after it ends it
+        yield from tool(model, n, "shell", {"command": "trap '' INT TERM HUP; sleep 37.25",
+                                            "background": True})
+    elif n == 2:
+        yield S.sleep(1)
+        yield from tool(model, n, "job_kill", {"job": 1})
+    elif n == 3:
+        # [.] so that this command's own text is no match
+        yield from tool(model, n, "shell", {"command":
+                        "for i in 1 2 3 4 5 6 7 8 9 10; do "
+                        "pgrep -f 'sleep 37[.]25' >/dev/null || { echo none-left; exit 0; }; "
+                        "sleep 1; done; echo still-running"})
+    else:
+        yield from answer(model, "Ran in WSL.")
+
+
 def sc_shell_switch(model, n, req):
     # The prompt among the user's messages since the last answer (a
     # notice comes after it): run a command, start a subagent to, or

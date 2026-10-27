@@ -648,6 +648,28 @@ static void test_tools(Test *t)
         te.shell.kind = SHELL_PWSH;
         c = shellcmd(a, &te.shell, 0, "ls");
         expect(t, "pwsh login argv", istr(a, c.argv.len==5 && c.argv[2]=="-NonInteractive"), "1");
+        // WSL: sh run directly, in a distribution or the default one, the
+        // section's PATH before the command
+        te.shell         = {};
+        te.shell.path    = "C:\\Windows\\System32\\wsl.exe";
+        te.shell.kind    = SHELL_WSL;
+        c = shellcmd(a, &te.shell, 1, "ls \"a b\"");
+        expect(t, "wsl argv", istr(a, c.argv.len==7 && c.argv[1]=="--exec" &&
+               c.argv[2]=="sh" && c.argv[3]=="-c" && c.argv[4]==Str(wslboot) &&
+               c.argv[5]=="sh" && c.argv[6]=="ls \"a b\"" && c.holdin), "1");
+        expect(t, "wsl description, default", istr(a, find(shelldesc(a, &te),
+               "in its default distribution: use Linux tools")>0 &&
+               find(shelldesc(a, &te), "wslpath -m")>0), "1");
+        te.shell.distro  = "Debian";
+        te.shell.login   = 1;
+        te.shell.prelude = "PATH=/x:\"$PATH\"; export PATH; ";
+        c = shellcmd(a, &te.shell, 1, "ls");
+        expect(t, "wsl distro login argv", istr(a, c.argv.len==10 && c.argv[1]=="-d" &&
+               c.argv[2]=="Debian" && c.argv[3]=="--exec" && c.argv[5]=="-l" &&
+               c.argv[9]=="PATH=/x:\"$PATH\"; export PATH; ls"), "1");
+        expect(t, "wsl description, distro", istr(a, find(shelldesc(a, &te),
+               "in its Debian distribution")>0), "1");
+
         te.shell        = {};
         te.shell.path   = "/bin/zsh";
         te.shell.kind   = SHELL_SH;

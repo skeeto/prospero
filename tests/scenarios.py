@@ -2412,6 +2412,55 @@ def shell_login_msys(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+def wslready():
+    """Whether wsl.exe runs a command in a default distribution."""
+    try:
+        return subprocess.run(["wsl.exe", "--exec", "true"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+@scenario(bound=60)
+def shell_wsl(t):
+    """A [shell] whose program is wsl.exe runs commands in WSL's sh, in
+    the working directory as /mnt/c/x, with its env.NAME, its
+    path_prepend as Linux directories, UTF-8 output and the exit status;
+    and a job killed, deaf to the soft stop, so that wsl.exe is ended,
+    ends its Linux processes too.
+    Windows, with WSL and a distribution."""
+    if not (t.host.windows and isinstance(t.host, LocalHost) and wslready()):
+        t.note("Windows, with WSL, only")
+        return
+
+    def linux(p):
+        p = p.replace("\\", "/")
+        return f"/mnt/{p[0].lower()}{p[2:]}" if p[1:2] == ":" else p
+    bin = t.host.join(t.base, "wslbin")
+    t.host.mkdir(bin)
+    with open(os.path.join(bin, "prospero_wsl_tool"), "w", newline="\n") as f:
+        f.write("#!/bin/sh\necho wsl-tool-ran\n")
+    t.host.write(t.config, t.host.read(t.config) +
+                 "[tools]\nshell = linux\n"
+                 f"[shell linux]\nprogram = wsl\npath_prepend = {linux(bin)}\n"
+                 "env.FOO = bar\n")
+    r = t.run(timeout=90)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = [e["text"] for e in r.all("tool.end")]
+    t.check(len(ends) == 4, f"{len(ends)} calls: {ends}")
+    if len(ends) < 4:
+        return
+    lines = [x.strip().rstrip("/") for x in ends[0].splitlines()]
+    t.check("FOO=bar" in lines and "Linux" in lines and "wsl-tool-ran" in lines and
+            "h\u00e9llo" in lines, f"ran in WSL: {ends[0]!r}")
+    t.check(linux(t.work).rstrip("/") in lines, f"in {linux(t.work)}: {ends[0]!r}")
+    t.check("[exit code 3, after " in ends[0], f"its status: {ends[0]!r}")
+    t.check("none-left" in ends[3], f"the killed job's processes: {ends[3]!r}")
+    tools = json.dumps(t.requests()[0]["body"].get("tools"))
+    t.check("Run a command in WSL" in tools, "the shell tool describes WSL")
+
+
 @scenario(bound=40)
 def shell_switch(t):
     """shells lists the user's [shell] sections, found or not, and the

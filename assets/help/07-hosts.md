@@ -51,7 +51,9 @@ under another name, and `prospero connect NAME` and `prospero deploy
 NAME` take a distro's name too. The engine runs in the distro's home
 directory; Windows' drives are under `/mnt`, as `/mnt/c`, and a Windows
 path typed for a new session's folder there, as `C:\Users`, becomes
-the distro's, `/mnt/c/Users`.
+the distro's, `/mnt/c/Users`. To have only the commands of a session
+on Windows run in a distro, give it a `[shell]` with `program = wsl`
+instead (Configuration).
 
 ## Sessions on a remote
 

@@ -2021,7 +2021,14 @@ static void testcfgpath(Test *t)
                  "[shell ps]\n"
                  "program = powershell\n"
                  "[shell gone]\n"
-                 "program = /nowhere/x\n");
+                 "program = /nowhere/x\n"
+                 "[shell deb]\n"
+                 "program = /c/wsl.exe\n"
+                 "distro = Debian\n"
+                 "path_prepend = ~/bin; /opt/it's\n"
+                 "path_append = /post\n"
+                 "env.FOO = bar\n");
+        os_write(v.os, a, "/c/wsl.exe", "");
         addenv(v.os, &a, "SH_TEST=42");
         Config *c = newconfig(v.os, &a, v.scratch, "/c/s.ini", 0);
         Engine *e = alloc<Engine>(&a);
@@ -2078,6 +2085,24 @@ static void testcfgpath(Test *t)
         all = showlist(&a, env);
         expect(t, "shellenv.plain", istr(&a, !plain.login && startswith(all, "PATH=/usr/bin|") &&
                find(all, "FOO")<0), "1");
+
+        // WSL: its distro, its directories Linux's, before the command,
+        // and its env.NAME passed into Linux
+        Str   werr = {};
+        Shell deb  = shellnamed(e, &a, v.scratch, "deb", 0, 1, &werr);
+        expect(t, "wsl shellnamed", concat(&a, shellkinds[deb.kind], concat(&a, " ", deb.distro)),
+               "wsl Debian");
+        s->te.windows = 1;
+        env = shellenvfor(s, &a, &deb);
+        all = showlist(&a, env);
+        expect(t, "wsl shellenv", istr(&a, startswith(all, "PATH=/usr/bin|") &&
+               endswith(all, "|FOO=bar|WSLENV=FOO|WSL_UTF8=1")), "1");
+        expect(t, "wsl prelude", deb.prelude,
+               "PATH=\"$HOME\"'/bin':'/opt/it'\\''s':\"$PATH\":'/post'; export PATH; ");
+        e->env = push(&a, e->env, Str("WSLENV=USERPROFILE/p"));
+        env = shellenvfor(s, &a, &deb);
+        expect(t, "wsl shellenv, WSLENV kept", istr(&a, find(showlist(&a, env),
+               "|WSLENV=USERPROFILE/p:FOO|")>0), "1");
         cfgfree(c);
     }
 }
