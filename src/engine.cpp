@@ -3591,7 +3591,7 @@ static void shellheed(Session *s, Arena scratch)
     s->notices.len = n;
     if (s->shellheard.path.len && !sameshell(&s->te.shell, &s->shellheard)) {
         Str text = shellnotice(&scratch, &s->te.shell, &s->shellpre,
-                               &s->shellmiss, s->shelluser);
+                               &s->shellmiss, s->shelluser, s->te.shells);
         notify(s, "shell", text, 0);
         s->notices[s->notices.len-1].shell = s->te.shell;
     }
@@ -4382,10 +4382,48 @@ static Slice<Str> shellenvfor(Session *s, Arena *a, Shell *sh)
     return env;
 }
 
-// How a command runs in the session's shell: its argv and environment.
-static ShellCmd sessioncmd(Session *s, Arena *a, Str command, Slice<Str> *env)
+// The shell a call runs in: the one it names (shellcall), else the
+// session's.
+static Shell *callshell(Session *s, Args *args)
 {
-    Shell    sh = s->te.shell;
+    for (iz i = 0; args->shell.len && i < s->te.shells.len; i++) {
+        if (s->te.shells[i].name == args->shell) {
+            return &s->te.shells[i];
+        }
+    }
+    return &s->te.shell;
+}
+
+// Whether a call's shell is one it may name, or the session's own:
+// else its result says which it may.
+static b32 shellcall(Session *s, Arena scratch, Args *args)
+{
+    if (callshell(s, args)!=&s->te.shell || args->shell==s->te.shell.name) {
+        return 1;
+    }
+    Buf b(&scratch, 256);
+    print(&b, "There is no shell \"");
+    print(&b, args->shell);
+    if (!s->te.shells.len) {
+        print(&b, "\": leave shell out, as commands run in the session's.");
+    } else {
+        print(&b, "\": give one of");
+        for (iz i = 0; i < s->te.shells.len; i++) {
+            print(&b, i ? Str(", ") : Str(" "));
+            print(&b, s->te.shells[i].name);
+        }
+        print(&b, ", or leave shell out.");
+    }
+    s->callfail = "args";
+    toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
+    return 0;
+}
+
+// How a command runs in a shell: its argv and environment.
+static ShellCmd sessioncmd(Session *s, Arena *a, Shell *in, Str command,
+                           Slice<Str> *env)
+{
+    Shell    sh = *in;
     *env = shellenvfor(s, a, &sh);
     ShellCmd sc = shellcmd(a, &sh, s->te.windows, command);
     if (sc.env.len) {
@@ -4800,7 +4838,7 @@ static void startjob(Session *s, Arena scratch, Args *args)
     Str      rel   = {};
     Str      spill = spillfile(s, scratch, c->id, &rel);
     Slice<Str> env = {};
-    ShellCmd   sc  = sessioncmd(s, &scratch, args->command, &env);
+    ShellCmd   sc  = sessioncmd(s, &scratch, callshell(s, args), args->command, &env);
     u64        id  = 0;
     Proc      *p   = spawncall(s, scratch, sc.argv, sc.cmdline, env, s->cwd, spill,
                                SHELL_OUTMAX, &id);
@@ -5033,7 +5071,7 @@ static b32 startshell(Session *s, Arena scratch, Args *args)
     s->sh = sh;
 
     Slice<Str> env = {};
-    ShellCmd   sc  = sessioncmd(s, &scratch, args->command, &env);
+    ShellCmd   sc  = sessioncmd(s, &scratch, callshell(s, args), args->command, &env);
     s->proc = spawncall(s, scratch, sc.argv, sc.cmdline, env, s->cwd, s->sh.spill,
                         SHELL_OUTMAX, &s->procid);
     if (!s->proc) {
@@ -9193,6 +9231,9 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_PLANENTER: assert(0);  // plancall has these
     case TOOL_PLANEXIT:  assert(0);
     }
+    if (args.shell.len && !shellcall(s, scratch, &args)) {
+        return 1;
+    }
     if (args.background) {
         startjob(s, scratch, &args);
         return 1;
@@ -10535,6 +10576,56 @@ static Shell defaultshell(Engine *e, Arena *perm, Arena scratch, b32 win, Str *w
     return sh;
 }
 
+// The shells of [tools] shells that a command may name, first, the
+// session's: none unless another is found. A name not found goes into
+// *warn, with why.
+static Slice<Shell> listshells(Engine *e, Arena *perm, Arena scratch, Shell first,
+                               b32 win, Str *warn)
+{
+    Slice<Shell> r     = {};
+    Str          names = cfgget(e->cfg, "tools", "", "shells", 0);
+    Buf          miss(&scratch, 256);
+    r = push(perm, r, first);
+    for (Str rest = names; rest.len;) {
+        Str name = cfgnextword(&rest);
+        b32 dup  = 0;
+        for (iz i = 0; i < r.len; i++) {
+            dup |= r[i].name == name;
+        }
+        if (!name.len || dup) {
+            continue;
+        }
+        Str   err = {};
+        Shell sh  = shellnamed(e, perm, scratch, name, 0, win, &err);
+        if (sh.path.len) {
+            r = push(perm, r, sh);
+        } else {
+            print(&miss, miss.len ? Str("; ") : Str("[tools] shells: "));
+            print(&miss, err);
+        }
+    }
+    if (miss.len) {
+        Str w = finish(&miss);
+        *warn = warn->len ? concat(perm, concat(&scratch, *warn, ". "), w)
+                          : clone(perm, w);
+    }
+    return r.len>1 ? r : Slice<Shell>{};
+}
+
+// The enum member of a JSON schema for the shells' names.
+static Str shellsenum(Arena *perm, Arena scratch, Slice<Shell> shells)
+{
+    Buf     en(&scratch, 256);
+    JsonOut w = {&en};
+    print(&en, "\"enum\":");
+    putarray(&w);
+    for (iz i = 0; i < shells.len; i++) {
+        putstr(&w, shells[i].name);
+    }
+    putend(&w);
+    return clone(perm, finish(&en));
+}
+
 // A shell as a record has it, its name, path and kind, with its
 // flavor and its section's description as they are now. Without a path
 // if its kind is unknown here.
@@ -10581,6 +10672,13 @@ static void prefixshell(Session *s, Arena scratch, Json *j)
     }
     s->shellpre   = sh;
     s->shellheard = s->shellheard.path.len ? s->shellheard : sh;
+    s->te.shells  = {};
+    for (Json *k = jsonget(j, "shells")->child; k; k = k->next) {
+        Shell x = shellrec(s->e, &s->perm, scratch, k, "path", "kind", "name");
+        if (x.path.len) {
+            s->te.shells = push(&s->perm, s->te.shells, x);
+        }
+    }
     if (!s->shellset) {
         useshell(s, scratch, sh);
     }
@@ -10652,6 +10750,9 @@ static void buildprefix(Session *s, Arena scratch)
                       defaultshell(e, &s->perm, scratch, s->te.windows, &s->shellwarn);
     s->shellpre     = s->te.shell;
     s->shellheard   = s->te.shell;
+    s->te.shells    = listshells(e, &s->perm, scratch, s->te.shell, s->te.windows,
+                                 &s->shellwarn);
+    s->te.shellenum = shellsenum(&s->perm, scratch, s->te.shells);
     s->te.coords    = s->mc.coords;
     s->te.vision    = !s->mc.novision;
     if (tooloffered(&s->te, TOOL_TASK)) {
@@ -10780,6 +10881,18 @@ static void logprefix(Session *s, Arena scratch)
     putstrkey(&w.json, "shell", s->shellpre.path);
     putstrkey(&w.json, "shell_kind", shellkinds[s->shellpre.kind]);
     putstrkey(&w.json, "shell_name", s->shellpre.name);
+    if (s->te.shells.len) {
+        putkey(&w.json, "shells");
+        putarray(&w.json);
+        for (iz i = 0; i < s->te.shells.len; i++) {
+            putobject(&w.json);
+            putstrkey(&w.json, "name", s->te.shells[i].name);
+            putstrkey(&w.json, "path", s->te.shells[i].path);
+            putstrkey(&w.json, "kind", shellkinds[s->te.shells[i].kind]);
+            putend(&w.json);
+        }
+        putend(&w.json);
+    }
     if (tooloffered(&s->te, TOOL_DESKTOP)) {
         putstrkey(&w.json, "coordinates", s->te.coords==COORDS_NORM1000
                                           ? Str("norm1000") : Str("pixels"));

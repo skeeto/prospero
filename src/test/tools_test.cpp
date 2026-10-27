@@ -771,6 +771,44 @@ static void test_tools(Test *t)
                "own settings and permissions, in cwd, and only its report comes back; "
                "role and model are that host's.\n- deb: Linux (WSL) on this machine")), "1");
         te.hosts = {};
+
+        // With shells to pick: the shell tool lists them, and takes one
+        // last, by its enum; else, no shell parameter
+        te.deny = tooldeny("shell");
+        JsonDoc ns = jsonparse(a, tooljson(a, &te));
+        Json   *np = jsonget(jsonget(jsonget(jsonat(ns.root, 0), "function"),
+                                     "parameters"), "properties");
+        expect(t, "shell no shells", istr(a, ns.ok && jsonget(np, "shell")->type==JSON_MISSING), "1");
+        Shell sv[2] = {};
+        sv[0].name = "sh";  sv[0].path = "/bin/sh";  sv[0].kind = SHELL_SH;
+        sv[1].name = "zsh"; sv[1].path = "/bin/zsh"; sv[1].kind = SHELL_SH;
+        sv[1].desc = "With Homebrew";
+        te.shells    = {sv, 2, 2};
+        te.shellenum = "\"enum\":[\"sh\",\"zsh\"]";
+        JsonDoc ss = jsonparse(a, tooljson(a, &te));
+        Json   *sf = jsonget(jsonat(ss.root, 0), "function");
+        Json   *sp = jsonget(jsonget(sf, "parameters"), "properties");
+        Json   *last = 0;
+        for (Json *k = sp->child; k; k = k->next) {
+            last = k;
+        }
+        expect(t, "shell shells params", istr(a, ss.ok && last && last->key=="shell" &&
+               jsonlen(jsonget(last, "enum"))==2), "1");
+        expect(t, "shell shells described", istr(a, endswith(jsonstr(jsonget(sf, "description")),
+               "\n\nShells: by default commands run in sh, as above. Give shell to "
+               "run one in another:\n- zsh: Run a command with /bin/zsh -c. With "
+               "Homebrew.")), "1");
+        expect(t, "shell notice, listed", shellnotice(a, &sv[1], &sv[0], &sv[0]+0, 1, te.shells),
+               "Your shell, sh (/bin/sh), is not found now, so commands run in zsh, "
+               "one of the shells the shell tool lists, for commands that name none "
+               "from now on.");
+        Shell none = {};
+        expect(t, "shell notice, listed by the user", shellnotice(a, &sv[1], &sv[0], &none, 1, te.shells),
+               "The user switched your shell to zsh, one of the shells the shell tool "
+               "lists, for commands that name none from now on.");
+        te.shells    = {};
+        te.shellenum = {};
+        te.deny      = tooldeny("read glob task");
         Str sys = systemprompt(a, "/w", &te);
         expect(t, "system prompt for a role", istr(a, find(sys, "grep and glob")<0 &&
                find(sys, "another session")<0), "1");

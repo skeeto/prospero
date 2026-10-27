@@ -1009,6 +1009,7 @@ static void testcfgjson(Test *t)
         "tools//auto_resume=5*\n"
         "tools//stop_grace=*\n"
         "tools//shell=auto*\n"
+        "tools//shells=*\n"
         "tools//path_prepend=*\n"
         "tools//path_append=*\n"
         "tools//use_rg=true*\n"

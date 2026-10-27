@@ -128,6 +128,9 @@ struct Shell {
 // What the tools need to know about where they run.
 struct ToolEnv {
     Shell shell;
+    Slice<Shell> shells;  // [tools] shells, which a command may name, the
+                          // prefix's shell first; none for fewer than 2
+    Str shellenum;   // their names, as a JSON schema's enum member
     b32 windows;     // path rules and the environment's case
     Str rg;          // ripgrep's absolute path, empty if not used
     Str exe;         // this executable, for the built-in search
@@ -352,10 +355,15 @@ static b32 sameshell(Shell *a, Shell *b)
 
 // The notice of shell now, which commands run in from here on, to an
 // agent told of another: pre is the one the shell tool describes, gone
-// the one it had if that is not found now, and user whether the user
-// switched to now.
-static Str shellnotice(Arena *a, Shell *now, Shell *pre, Shell *gone, b32 user)
+// the one it had if that is not found now, user whether the user
+// switched to now, and listed the shells the tool lists too (shells).
+static Str shellnotice(Arena *a, Shell *now, Shell *pre, Shell *gone, b32 user,
+                       Slice<Shell> listed = {})
 {
+    b32 named = 0;
+    for (iz i = 1; i < listed.len; i++) {
+        named |= sameshell(now, &listed[i]);
+    }
     Buf b(a, 1024 + now->path.len + now->desc.len + gone->path.len);
     if (gone->path.len) {
         print(&b, "Your shell, ");
@@ -371,6 +379,9 @@ static Str shellnotice(Arena *a, Shell *now, Shell *pre, Shell *gone, b32 user)
     print(&b, now->name);
     if (sameshell(now, pre)) {
         print(&b, ", the one the shell tool names, from now on.");
+    } else if (named) {
+        print(&b, ", one of the shells the shell tool lists, for commands "
+                  "that name none from now on.");
     } else {
         print(&b, ". It replaces the one the shell tool names, whose other "
                   "rules still hold. ");
@@ -403,6 +414,18 @@ static Str shelldesc(Arena *a, ToolEnv *te)
               "sleep for it. Processes a command leaves running are killed "
               "when it ends, unless it is a job. The user cannot undo what "
               "commands change.");
+    if (te->shells.len) {
+        print(&b, "\n\nShells: by default commands run in ");
+        print(&b, te->shells[0].name);
+        print(&b, ", as above. Give shell to run one in another:");
+        for (iz i = 1; i < te->shells.len; i++) {
+            print(&b, "\n- ");
+            print(&b, te->shells[i].name);
+            print(&b, ": ");
+            shellintro(&b, &te->shells[i]);
+            shellabout(&b, &te->shells[i]);
+        }
+    }
     return finish(&b);
 }
 
@@ -529,6 +552,10 @@ static Str tooljson(Arena *a, ToolEnv *te)
                  "background, 1 to 600 (default 120); with background, "
                  "seconds the job may run", 0, {}},
                 {"background", "boolean", "Start it as a job at once", 0, {}},
+                // Only where there are shells to pick, else as before
+                {te->shells.len ? Str("shell") : Str{}, "string",
+                 "A shell above for this command; default the current one",
+                 0, te->shellenum},
             },
         },
         {
@@ -914,6 +941,7 @@ struct Args {
     Str             role;       // null if absent
     Str             model;
     Str             host;       // task: another host's name, null if here
+    Str             shell;      // shell: a shell of [tools] shells, by name
     Str             cwd;        // task: its directory there, null if absent
     i64             offset;     // 0 if absent
     i64             limit;      // 0 if absent
@@ -1408,6 +1436,7 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
         r.command    = argstr(a, &r, j, "command", 1);
         r.timeout    = argint(a, &r, j, "timeout", -1);
         r.background = argbool(a, &r, j, "background");
+        r.shell      = trim(argstr(a, &r, j, "shell", 0));
         i64 max = r.background ? JOB_MAX : SHELL_MAX;
         if (r.command.data && !trim(r.command).len) {
             issue(a, &r, "command", "must not be empty");

@@ -383,6 +383,21 @@ def sc_shell_switch(model, n, req):
         yield from answer(model, "Nothing to do.")
 
 
+def sc_shell_list(model, n, req):
+    show = 'echo "WHICH=${WHICH-default}"'
+    calls = [
+        {"command": show},
+        {"command": show, "shell": "other"},
+        {"command": show, "shell": "bogus"},
+        {"command": 'echo "WHICH=${WHICH-default}" > job.txt', "shell": "other",
+         "background": True},
+    ]
+    if n < len(calls):
+        yield from tool(model, n, "shell", calls[n])
+    else:
+        yield from answer(model, "Ran them.")
+
+
 def sc_bytewise(model, n, req):
     yield S.bytewise()
     if n == 0:

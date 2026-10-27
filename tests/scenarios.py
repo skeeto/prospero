@@ -2434,6 +2434,45 @@ def shell_switch(t):
                 h.close()
 
 
+@scenario(bound=20)
+def shell_list(t):
+    """[tools] shells: the shell tool lists the shells found, and takes
+    one by name, last, as an enum with the session's first; a command
+    that names one runs there, background jobs too, and one without in
+    the session's; a name not listed is an error that lists them; a
+    shell not found is left out, with a warning."""
+    t.host.write(t.config, t.host.read(t.config) +
+                 "[tools]\nshells = other nowhere\n"
+                 "[shell other]\nprogram = sh\nenv.WHICH = other\n"
+                 "description = The other shell\n"
+                 "[shell nowhere]\nprogram = prospero-no-such-shell\n")
+    r = t.run(timeout=60)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = [e["text"] for e in r.all("tool.end")]
+    t.check(len(ends) == 4, f"{len(ends)} shell calls")
+    if len(ends) == 4:
+        t.check("WHICH=default" in ends[0], f"the session's: {ends[0]!r}")
+        t.check("WHICH=other" in ends[1], f"named: {ends[1]!r}")
+        t.check('There is no shell "bogus": give one of sh, other, or leave shell out.'
+                in ends[2], f"a bad name: {ends[2]!r}")
+    tools = t.requests()[0]["body"].get("tools")
+    sh = next(x["function"] for x in tools if x["function"]["name"] == "shell")
+    props = sh["parameters"]["properties"]
+    t.check(list(props)[-1] == "shell" and props["shell"].get("enum") == ["sh", "other"],
+            f"the enum {props.get('shell')}")
+    t.check("\n- other: Run a command with " in sh["description"] and
+            "The other shell." in sh["description"], "described")
+    warns = [n.get("text", "") for n in r.all("note")]
+    t.check(any("[tools] shells: prospero-no-such-shell is not found" in w for w in warns),
+            f"a warning: {warns}")
+    job = t.host.join(t.work, "job.txt")
+    for _ in range(50):
+        if t.host.read(job):
+            break
+        time.sleep(0.1)
+    t.check("WHICH=other" in (t.host.read(job) or ""), f"the job's shell: {t.host.read(job)!r}")
+
+
 def skillput(t, parent, name, text):
     d = t.host.join(parent, name)
     t.host.mkdir(d)

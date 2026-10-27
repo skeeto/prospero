@@ -415,6 +415,10 @@ static CfgKey cfgschema[] = {
      "[shell] section by its name, or an executable, by its path or its "
      "name on PATH. auto is a POSIX sh, or on Windows sh.exe or busybox.exe "
      "next to Prospero or on PATH, then PowerShell, then cmd"},
+    {"tools", "shells", CFG_STRING, "", {}, {}, "tools",
+     "Shells the agent may run a command in, besides the session's: "
+     "[shell] sections or sh, powershell and cmd, by name, separated by "
+     "blanks"},
     {"tools", "path_prepend", CFG_PATHS, "", {}, {}, "tools",
      "Directories to find programs in before PATH, separated by ;: for the "
      "agent's commands, its shell, ripgrep, and what Prospero runs itself "
@@ -863,6 +867,7 @@ static b32 cfgruns(CfgKey *k, Str v)
 {
     if (k->kind == "tools") {
         return k->key=="path_prepend" || k->key=="path_append" ||
+               k->key=="shells" ||
                (k->key=="shell" && !cfghasword("auto sh powershell cmd", v));
     }
     return k->kind=="ui" && (k->key=="editor" || k->key=="terminal");
