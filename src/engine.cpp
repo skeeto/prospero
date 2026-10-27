@@ -6844,19 +6844,12 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
         Str url = trim(cfgget(e->cfg, "mcp", m->name, "url", 0));
         m->url  = url.len ? clone(&m->arena, url) : Str{};
         if (url.len) {
-            Buf         h   = Buf(&m->arena, 256);
-            IniSection *sec = inisection(e->ini, "mcp", m->name);
-            for (IniEntry *k = sec ? sec->keys : 0; k; k = k->next) {
-                if (!startswith(k->key, "header.") || k->key.len<8) {
-                    continue;
-                }
-                Str v = trim(k->value);
-                if (startswith(v, "env:")) {
-                    v = os_getenv(e->os, &scratch, trim(cuthead(v, 4)));
-                }
-                print(&h, cuthead(k->key, 7));
+            Buf            h  = Buf(&m->arena, 256);
+            Slice<CfgPair> hs = cfgpairs(e->cfg, &scratch, "mcp", m->name, "header.");
+            for (iz i = 0; i < hs.len; i++) {
+                print(&h, hs[i].name);
                 print(&h, ": ");
-                print(&h, v);
+                print(&h, hs[i].value);
                 print(&h, "\r\n");
             }
             Str token = cfgsecret(e->cfg, &scratch, "mcp", m->name, "token");
@@ -6900,17 +6893,12 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
         m->retryat = now + e->minute/2;
         return;
     }
-    Slice<Str> env = engineenv(e, &scratch, win);
-    IniSection *sec = m->project.len ? 0 : inisection(e->ini, "mcp", m->name);
-    for (IniEntry *k = sec ? sec->keys : 0; k; k = k->next) {
-        if (!startswith(k->key, "env.") || k->key.len<5) {
-            continue;
-        }
-        Str v = trim(k->value);
-        if (startswith(v, "env:")) {
-            v = os_getenv(e->os, &scratch, trim(cuthead(v, 4)));
-        }
-        env = push(&scratch, env, concat(&scratch, concat(&scratch, cuthead(k->key, 4), "="), v));
+    Slice<Str>     env   = engineenv(e, &scratch, win);
+    Slice<CfgPair> pairs = m->project.len ? Slice<CfgPair>{}
+                                          : cfgpairs(c, &scratch, "mcp", m->name, "env.");
+    for (iz i = 0; i < pairs.len; i++) {
+        env = push(&scratch, env, concat(&scratch, concat(&scratch, pairs[i].name, "="),
+                                         pairs[i].value));
     }
     for (iz i = 0; m->project.len && i < m->env.len; i++) {
         env = push(&scratch, env, m->env[i]);

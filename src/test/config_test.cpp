@@ -1875,6 +1875,35 @@ static void testcfgpath(Test *t)
            "/home/u/bin:/opt/x/bin:/late");
     cfgfree(c);
 
+    // A family of keys, [mcp] env.NAME: an included file's are left
+    // out, empty or not, as validation says
+    os_write(v.os, a, "/c/mcp.ini",
+             "[mcp srv]\n"
+             "env.A = 1\n"
+             "env.B =\n"
+             "header.X = y\n");
+    os_write(v.os, a, "/c/h.ini",
+             "include = mcp.ini\n"
+             "[mcp srv]\n"
+             "command = srv\n"
+             "env.C = 3\n"
+             "env.A = 4\n"
+             "env. = 5\n");
+    c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
+    {
+        Buf            b(&a, 64);
+        Slice<CfgPair> p = cfgpairs(c, &a, "mcp", "srv", "env.");
+        for (iz i = 0; i < p.len; i++) {
+            print(&b, p[i].name);
+            putbyte(&b, '=');
+            print(&b, p[i].value);
+            putbyte(&b, ' ');
+        }
+        expect(t, "pairs.own", finish(&b), "A=4 C=3 ");
+        expect(t, "pairs.shared", istr(&a, cfgpairs(c, &a, "mcp", "srv", "header.").len), "0");
+    }
+    cfgfree(c);
+
     // Windows: ; between, backslashes in the directories added
     os_write(v.os, a, "/c/w.ini",
              "[tools]\n"

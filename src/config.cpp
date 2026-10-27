@@ -842,6 +842,14 @@ static b32 cfgruns(CfgKey *k, Str v)
     return k->kind=="ui" && (k->key=="editor" || k->key=="terminal");
 }
 
+// Whether only the user's own file may give a key a value: what runs on
+// the user's machines, and where, and what may use the screen.
+static b32 cfgownonly(CfgKey *k, Str v)
+{
+    return k->kind=="remote" || k->kind=="desktop" || k->kind=="mcp" ||
+           cfgruns(k, trim(v));
+}
+
 // A role's tools may name MCP tools: mcp__SERVER, or mcp__SERVER__TOOL.
 static b32 cfgmcpword(CfgKey *k, Str w)
 {
@@ -855,9 +863,7 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     v = trim(v);
     if (!v.len) {
         return CFG_OK;
-    } else if (shared && (k->kind=="remote" || k->kind=="desktop" || k->kind=="mcp")) {
-        return CFG_BAD;  // what runs on the user's machines, and where,
-    } else if (shared && cfgruns(k, v)) {  // and what may use the screen
+    } else if (shared && cfgownonly(k, v)) {
         return CFG_BAD;
     }
     switch (k->type) {
@@ -1337,6 +1343,34 @@ static Slice<Str> cfgsecrets(Config *c, Arena *perm)
                 }
             }
         }
+    }
+    return r;
+}
+
+// A section's family of keys, such as [mcp X]'s env.NAME, as NAME and
+// value pairs. A key from an included file that only the user's own may
+// set is left out, as validation says, empty or not. A value written
+// env:VAR is VAR's, from the environment.
+struct CfgPair {
+    Str name;
+    Str value;
+};
+
+static Slice<CfgPair> cfgpairs(Config *c, Arena *a, Str kind, Str name, Str prefix)
+{
+    Slice<CfgPair> r   = {};
+    IniSection    *sec = inisection(c->ini, kind, name);
+    for (IniEntry *e = sec ? sec->keys : 0; e; e = e->next) {
+        CfgKey *k = cfgkey(kind, e->key);
+        if (!startswith(e->key, prefix) || e->key.len==prefix.len ||
+                (e->file!=c->user && k && cfgownonly(k, e->value))) {
+            continue;
+        }
+        CfgPair p = {cuthead(e->key, prefix.len), trim(e->value)};
+        if (startswith(p.value, "env:")) {
+            p.value = os_getenv(c->os, a, trim(cuthead(p.value, 4)));
+        }
+        r = push(a, r, p);
     }
     return r;
 }
