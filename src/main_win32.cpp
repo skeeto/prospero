@@ -2437,14 +2437,19 @@ static Str os_endpoint(Os *os, Arena *a, Str statedir, Str name)
     if (!sid.len) {
         return {};
     }
-    Buf b(a, 128 + sid.len + name.len);
+    Buf b(&tmp, 128 + sid.len + name.len);
     print(&b, "\\\\.\\pipe\\prospero-");
     print(&b, sid);
     putbyte(&b, '-');
     printhex(&b, h, 16);
     putbyte(&b, '-');
     print(&b, name);
-    return finish(&b);
+
+    // Built behind the scratch, then moved down to the front
+    Str r   = finish(&b);
+    u8 *out = allocbytes(a, r.len);
+    __builtin_memmove(out, r.data, (uz)r.len);
+    return {out, r.len};
 }
 
 // A new instance of a listener's pipe, the first of its name or not.

@@ -994,14 +994,16 @@ static Str os_realpath(Os *, Arena *a, Str path)
     if (hasnul(path)) {
         return {};
     }
+    char *out = (char *)allocbytes(a, 4096);  // PATH_MAX
     Arena tmp = *a;
-    char *out = (char *)allocbytes(&tmp, 4096);  // PATH_MAX
     if (!realpath(cstr(&tmp, path), out)) {
+        a->beg = (byte *)out;
         return {};
     }
     Str r = {(u8 *)out, 0};
     while (r.data[r.len]) r.len++;
-    return clone(a, r);
+    a->beg = (byte *)(r.data + r.len);
+    return r;
 }
 
 // Session locks: flock, which the kernel releases when the descriptor
