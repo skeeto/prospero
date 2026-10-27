@@ -608,8 +608,15 @@ static void handlereopen(u32 trayevent)
 // which the core decides, and takes their clicks, by their identifier,
 // "PID.ID", since every process of the bundle shares the center. As a
 // click and a refusal come on threads of their own, so do their events.
+//
+// Once they are refused the center still takes requests, without error,
+// and shows nothing, so a toast is refused here while the latest word of
+// the center (mactoastok) is no: the core asks for attention instead.
+// Each toast asks again, for the next, so that one turned on in System
+// Settings works without a restart.
 static u32   mactoastevent;
 static void *mactoastcenter;
+static i32   mactoastok = 1;  // atomic: the center's latest word
 
 template<typename R, typename... A>
 static R objcsend(void *o, char const *sel, A... a)
@@ -678,6 +685,27 @@ static void macident(char (&buf)[32], i32 id)
     finish(&b);
 }
 
+// Ask the center whether toasts are allowed, for the next one, and with
+// tell, say why not: refused in System Settings, or never asked because
+// macOS asks only for an app it started itself (Finder, the Dock, open).
+static void macaskstatus(b32 tell)
+{
+    void (^got)(void *) = ^(void *settings) {
+        iz  status = objcsend<iz>(settings, "authorizationStatus");
+        b32 ok     = status>=2;  // authorized, provisional, ephemeral
+        __atomic_store_n(&mactoastok, ok, __ATOMIC_RELAXED);
+        if (tell && status==1) {
+            mactoastpush(-1, "they are off for Prospero in System Settings, "
+                             "Notifications");
+        } else if (tell && !ok) {
+            mactoastpush(-1, "macOS asks to allow them only of Prospero.app "
+                             "started as an app (Finder, the Dock, open)");
+        }
+    };
+    objcsend<void>(mactoastcenter, "getNotificationSettingsWithCompletionHandler:",
+                   (void *)got);
+}
+
 static Str mactoastprep()
 {
     void *pool   = objc_autoreleasePoolPush();
@@ -710,8 +738,8 @@ static Str mactoastprep()
         objcsend<void>(mactoastcenter, "setDelegate:", dlg);
         void (^asked)(ObjcBool, void *) = ^(ObjcBool ok, void *) {
             if (!ok) {
-                mactoastpush(-1, "they are off for Prospero in System Settings, "
-                                 "Notifications");
+                __atomic_store_n(&mactoastok, 0, __ATOMIC_RELAXED);
+                macaskstatus(1);
             }
         };
         objcsend<void>(mactoastcenter, "requestAuthorizationWithOptions:completionHandler:",
@@ -725,6 +753,11 @@ static Str mactoastprep()
 static b32 mactoast(i32 id, char const *title, char const *body)
 {
     if (!mactoastcenter) {
+        return 0;
+    }
+    b32 allowed = __atomic_load_n(&mactoastok, __ATOMIC_RELAXED);
+    macaskstatus(0);
+    if (!allowed) {
         return 0;
     }
     void *pool = objc_autoreleasePoolPush();
