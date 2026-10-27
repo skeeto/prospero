@@ -222,12 +222,12 @@ static void testlaunch(ProcTest *p, Arena scratch)
 {
     Selftest *t = p->t;
     Os       *os = p->os;
-    if (p->te.shellkind != SHELL_SH && p->te.shellkind != SHELL_BUSYBOX) {
+    if (p->te.shell.kind != SHELL_SH && p->te.shell.kind != SHELL_BUSYBOX) {
         return;
     }
     Slice<Str> argv = {};
-    argv = push(&scratch, argv, p->te.shell);
-    if (p->te.shellkind == SHELL_BUSYBOX) {
+    argv = push(&scratch, argv, p->te.shell.path);
+    if (p->te.shell.kind == SHELL_BUSYBOX) {
         argv = push(&scratch, argv, Str("sh"));
     }
     argv = push(&scratch, argv, Str("-c"));
@@ -749,16 +749,17 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     p->dir = dir;
     Str exe = os_exepath(os, perm);
     Str path = os_getenv(os, perm, "PATH");
-    p->te  = findshell(os, perm, scratch, parentdir(exe), path, HOST_WINDOWS, {});
+    p->te.windows = HOST_WINDOWS;
+    p->te.shell   = findshell(os, perm, scratch, parentdir(exe), path, HOST_WINDOWS, {});
     p->env = shellenv(perm, os_environ(os, perm), HOST_WINDOWS, {});
     if (!check(t, p->mb!=0, "newmailbox")) return;
     {
         Buf b(&scratch, 256);
         print(&b, "shell ");
-        print(&b, p->te.shell);
+        print(&b, p->te.shell.path);
         say(os, finish(&b));
     }
-    if (p->te.shellkind!=SHELL_SH && p->te.shellkind!=SHELL_BUSYBOX) {
+    if (p->te.shell.kind!=SHELL_SH && p->te.shell.kind!=SHELL_BUSYBOX) {
         say(os, "no POSIX shell: process tests skipped");
         return;
     }

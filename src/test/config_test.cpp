@@ -1923,15 +1923,46 @@ static void testcfgpath(Test *t)
         os_write(v.os, a, "/bb/busybox.exe", "MZ");
         os_write(v.os, a, "/opt/bin/zsh", "#!");
         os_write(v.os, a, "/w/bin/nu.exe", "MZ");
-        ToolEnv te = findshell(v.os, &a, v.scratch, "/exe", "C:/nowhere;/bb", 1, "auto");
-        expect(t, "findshell.busybox", te.shell, "/bb/busybox.exe");
-        expect(t, "findshell.busybox.kind", istr(&a, te.shellkind), istr(&a, SHELL_BUSYBOX));
-        te = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin:/opt/bin", 0, "zsh");
-        expect(t, "findshell.name", te.shell, "/opt/bin/zsh");
-        te = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin", 0, "zsh");
-        expect(t, "findshell.name.missing", te.shell, "/bin/sh");
-        te = findshell(v.os, &a, v.scratch, "/exe", "/w/bin", 1, "nu");
-        expect(t, "findshell.name.exe", te.shell, "/w/bin/nu.exe");
+        Shell sh = findshell(v.os, &a, v.scratch, "/exe", "C:/nowhere;/bb", 1, "auto");
+        expect(t, "findshell.busybox", sh.path, "/bb/busybox.exe");
+        expect(t, "findshell.busybox.kind", istr(&a, sh.kind), istr(&a, SHELL_BUSYBOX));
+        expect(t, "findshell.busybox.flavor", istr(&a, sh.flavor), istr(&a, FLAVOR_BUSYBOX));
+        sh = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin:/opt/bin", 0, "zsh");
+        expect(t, "findshell.name", sh.path, "/opt/bin/zsh");
+        sh = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin", 0, "zsh");
+        expect(t, "findshell.name.missing", sh.path, "/bin/sh");
+        sh = findshell(v.os, &a, v.scratch, "/exe", "/w/bin", 1, "nu");
+        expect(t, "findshell.name.exe", sh.path, "/w/bin/nu.exe");
+
+        // What a sh on Windows is, by the files beside it
+        os_write(v.os, a, "/w64/bin/sh.exe", "MZ");
+        os_write(v.os, a, "/w64/bin/busybox.exe", "MZ");
+        os_write(v.os, a, "/msys/usr/bin/bash.exe", "MZ");
+        os_write(v.os, a, "/msys/usr/bin/msys-2.0.dll", "MZ");
+        os_write(v.os, a, "/git/bin/bash.exe", "MZ");
+        os_write(v.os, a, "/git/usr/bin/msys-2.0.dll", "MZ");
+        os_write(v.os, a, "/cyg/bin/bash.exe", "MZ");
+        os_write(v.os, a, "/cyg/bin/cygwin1.dll", "MZ");
+        os_write(v.os, a, "/other/bin/sh.exe", "MZ");
+        struct { Str path; b32 win; i32 flavor; } fl[] = {
+            {"/w64/bin/sh.exe",        1, FLAVOR_BUSYBOX},
+            {"/msys/usr/bin/bash.exe", 1, FLAVOR_MSYS},
+            {"/git/bin/bash.exe",      1, FLAVOR_MSYS},
+            {"/cyg/bin/bash.exe",      1, FLAVOR_CYGWIN},
+            {"/other/bin/sh.exe",      1, FLAVOR_NONE},
+            {"/w64/bin/sh.exe",        0, FLAVOR_NONE},
+        };
+        for (iz i = 0; i < countof(fl); i++) {
+            sh = findshell(v.os, &a, v.scratch, "/exe", "", fl[i].win, fl[i].path);
+            expect(t, concat(&a, "findshell.flavor ", fl[i].path),
+                   istr(&a, sh.flavor), istr(&a, fl[i].flavor));
+        }
+
+        // cmd as chosen, or for want of any other
+        sh = findshell(v.os, &a, v.scratch, "/exe", "C:/nowhere", 1, "cmd");
+        expect(t, "findshell.cmd", istr(&a, sh.kind*10 + sh.fallback), istr(&a, SHELL_CMD*10));
+        sh = findshell(v.os, &a, v.scratch, "/exe", "C:/nowhere", 1, "auto");
+        expect(t, "findshell.cmd.fallback", istr(&a, sh.kind*10 + sh.fallback), istr(&a, SHELL_CMD*10 + 1));
     }
 }
 

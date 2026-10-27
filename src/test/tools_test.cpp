@@ -570,32 +570,65 @@ static void test_tools(Test *t)
         expect(t, "env windows", istr(a, !gitdir && drive && utf8 && !key), "1");
 
         ToolEnv te = {};
-        te.shell     = "C:\\bb\\busybox.exe";
-        te.shellkind = SHELL_BUSYBOX;
-        te.windows   = 1;
+        te.shell.path = "C:\\bb\\busybox.exe";
+        te.shell.kind = SHELL_BUSYBOX;
+        te.windows    = 1;
         ShellCmd c = shellcmd(a, &te, "ls -l");
         expect(t, "busybox argv", istr(a, c.argv.len==4 && c.argv[1]=="sh" && c.argv[3]=="ls -l"), "1");
-        te.shell     = "C:\\Windows\\System32\\cmd.exe";
-        te.shellkind = SHELL_CMD;
+        te.shell.path = "C:\\Windows\\System32\\cmd.exe";
+        te.shell.kind = SHELL_CMD;
         c = shellcmd(a, &te, "dir \"a b\" & echo %X%");
         expect(t, "cmd line", c.cmdline,
                "\"C:\\Windows\\System32\\cmd.exe\" /d /s /c \"dir \"a b\" & echo %X%\"");
-        expect(t, "cmd description", istr(a, find(shelldesc(a, &te), "No POSIX shell")>0), "1");
-        te.shell     = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
-        te.shellkind = SHELL_PS;
+        expect(t, "cmd description, chosen", istr(a, find(shelldesc(a, &te), "No POSIX shell")<0 &&
+               find(shelldesc(a, &te), "use cmd syntax")>0), "1");
+        te.shell.fallback = 1;
+        expect(t, "cmd description, fallen back", istr(a, find(shelldesc(a, &te), "No POSIX shell")>0), "1");
+        te.shell = {};
+        te.shell.path = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+        te.shell.kind = SHELL_PS;
         c = shellcmd(a, &te, "echo \"a b\"; exit 3");
-        expect(t, "ps argv", istr(a, c.argv.len==8 && c.argv[0]==te.shell &&
+        expect(t, "ps argv", istr(a, c.argv.len==8 && c.argv[0]==te.shell.path &&
                c.argv[5]=="Bypass" && c.argv[6]=="-Command" && !c.cmdline.len), "1");
         expect(t, "ps env", c.env, "PROSPERO_COMMAND=echo \"a b\"; exit 3");
         expect(t, "ps boot quoting", istr(a, find(c.argv[7], "\"")<0), "1");
         expect(t, "ps description", istr(a, find(shelldesc(a, &te), "no && or ||")>0), "1");
-        te.shell     = "/usr/bin/pwsh";
-        te.shellkind = SHELL_PWSH;
-        te.windows   = 0;
+        te.shell.path = "/usr/bin/pwsh";
+        te.shell.kind = SHELL_PWSH;
+        te.windows    = 0;
         c = shellcmd(a, &te, "ls");
         expect(t, "pwsh argv", istr(a, c.argv.len==6 && c.argv[4]=="-Command"), "1");
         expect(t, "pwsh description", istr(a, find(shelldesc(a, &te), "PowerShell 7")>0 &&
                find(shelldesc(a, &te), "no &&")<0), "1");
+
+        // A POSIX sh is said to be one by its name; on Windows, by what
+        // it is, its paths
+        struct { Str path; i32 flavor; Str has; Str hasnt; } sh[] = {
+            {"/bin/sh",                        FLAVOR_NONE,    "/bin/sh -c (a POSIX shell). Each", "busybox"},
+            {"/usr/bin/zsh",                   FLAVOR_NONE,    "/usr/bin/zsh -c. Each", "POSIX shell"},
+            {"C:\\w64devkit\\bin\\sh.exe",     FLAVOR_BUSYBOX, "It is not bash", "cygpath"},
+            {"C:\\w64devkit\\bin\\sh.exe",     FLAVOR_BUSYBOX, "/c/x and /cygdrive/c/x do not exist", "(a POSIX"},
+            {"C:\\msys64\\usr\\bin\\bash.exe", FLAVOR_MSYS,    "an MSYS2 shell", "do not exist"},
+            {"C:\\msys64\\usr\\bin\\bash.exe", FLAVOR_MSYS,    "cygpath -m prints", "/cygdrive/c/x"},
+            {"C:\\cygwin64\\bin\\bash.exe",    FLAVOR_CYGWIN,  "drives as /cygdrive/c/x", "MSYS2"},
+        };
+        for (iz i = 0; i < countof(sh); i++) {
+            te.shell        = {};
+            te.shell.path   = sh[i].path;
+            te.shell.kind   = SHELL_SH;
+            te.shell.flavor = sh[i].flavor;
+            Str desc = shelldesc(a, &te);
+            expect(t, concat(a, "sh description has: ", sh[i].has),
+                   istr(a, find(desc, sh[i].has)>=0), "1");
+            expect(t, concat(a, "sh description lacks: ", sh[i].hasnt),
+                   istr(a, find(desc, sh[i].hasnt)<0), "1");
+        }
+        te.shell        = {};
+        te.shell.path   = "C:\\bb\\busybox.exe";
+        te.shell.kind   = SHELL_BUSYBOX;
+        te.shell.flavor = FLAVOR_BUSYBOX;
+        expect(t, "busybox description", istr(a, find(shelldesc(a, &te),
+               "busybox.exe sh -c, busybox-w32's ash")>0), "1");
         te.windows   = 1;
         te.jobtimeout = 90;
         te.jobmax     = 3600;
@@ -607,7 +640,7 @@ static void test_tools(Test *t)
     // Tools JSON: byte-stable, and valid
     {
         ToolEnv te = {};
-        te.shell = "/bin/sh";
+        te.shell.path = "/bin/sh";
         Str     j1 = tooljson(a, &te);
         Str     j2 = tooljson(a, &te);
         JsonDoc d  = jsonparse(a, j1);

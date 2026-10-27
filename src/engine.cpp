@@ -10254,6 +10254,42 @@ static i32 shellkindof(Str path, b32 win)
     return SHELL_SH;
 }
 
+// What a POSIX sh on Windows is, by the files beside it: busybox-w32
+// (w64devkit's sh.exe), MSYS2 (Git Bash's bin/bash.exe starts the one in
+// usr/bin), or Cygwin. Only its description differs.
+static i32 shellflavor(Os *os, Arena scratch, Str path, i32 kind, b32 win)
+{
+    if (kind == SHELL_BUSYBOX) {
+        return FLAVOR_BUSYBOX;
+    } else if (!win || kind!=SHELL_SH) {
+        return FLAVOR_NONE;
+    }
+    Str dir = parentdir(path);
+    struct { Str dir; Str file; i32 flavor; } marks[] = {
+        {dir,            "busybox.exe",          FLAVOR_BUSYBOX},
+        {dir,            "msys-2.0.dll",         FLAVOR_MSYS},
+        {parentdir(dir), "usr/bin/msys-2.0.dll", FLAVOR_MSYS},
+        {dir,            "cygwin1.dll",          FLAVOR_CYGWIN},
+    };
+    for (iz i = 0; i < countof(marks); i++) {
+        Arena a = scratch;
+        if (os_stat(os, a, join(&a, marks[i].dir, marks[i].file)).type == STAT_FILE) {
+            return marks[i].flavor;
+        }
+    }
+    return FLAVOR_NONE;
+}
+
+// A shell as found: its kind by its name, and its flavor.
+static Shell shellat(Os *os, Arena scratch, Str path, i32 kind, b32 win)
+{
+    Shell sh = {};
+    sh.path   = path;
+    sh.kind   = kind;
+    sh.flavor = shellflavor(os, scratch, path, kind, win);
+    return sh;
+}
+
 // Find the agent's shell by the [tools] shell setting: auto, sh,
 // powershell, cmd, or an executable, by its path or by its name on
 // path, the PATH that programs are found by. A POSIX sh comes first, as
@@ -10261,18 +10297,14 @@ static i32 shellkindof(Str path, b32 win)
 // next to the executable, then on path. Then PowerShell 7 (pwsh on
 // path), Windows PowerShell, and last cmd.exe. A choice not found is as
 // auto.
-static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
-                         Str path, b32 win, Str pref)
+static Shell findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
+                       Str path, b32 win, Str pref)
 {
-    ToolEnv te = {};
-    te.windows = win;
     pref = trim(pref);
     b32 named = pref.len && pref!="auto" && pref!="sh" &&
                 pref!="powershell" && pref!="cmd";
     if (named && os_stat(os, scratch, pref).type==STAT_FILE) {
-        te.shell     = clone(perm, pref);
-        te.shellkind = shellkindof(pref, win);
-        return te;
+        return shellat(os, scratch, clone(perm, pref), shellkindof(pref, win), win);
     } else if (named && basename(pref)==pref) {
         Str name = pref;
         if (win && find(name, ".")<0) {
@@ -10280,9 +10312,7 @@ static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
         }
         Str found = findpath(os, perm, scratch, path, name, win);
         if (found.len) {
-            te.shell     = found;
-            te.shellkind = shellkindof(found, win);
-            return te;
+            return shellat(os, scratch, found, shellkindof(found, win), win);
         }
     }
     b32 wantps  = pref == "powershell";
@@ -10290,9 +10320,7 @@ static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
 
     if (!wantps && !wantcmd) {
         if (!win) {
-            te.shell     = "/bin/sh";
-            te.shellkind = SHELL_SH;
-            return te;
+            return shellat(os, scratch, "/bin/sh", SHELL_SH, win);
         }
         Slice<Str> dirs = {};
         dirs = push(&scratch, dirs, exedir);
@@ -10305,15 +10333,11 @@ static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
             Arena a  = scratch;
             Str   sh = join(&a, dirs[i], "sh.exe");
             if (os_stat(os, a, sh).type == STAT_FILE) {
-                te.shell     = clone(perm, sh);
-                te.shellkind = SHELL_SH;
-                return te;
+                return shellat(os, scratch, clone(perm, sh), SHELL_SH, win);
             }
             Str bb = join(&a, dirs[i], "busybox.exe");
             if (os_stat(os, a, bb).type == STAT_FILE) {
-                te.shell     = clone(perm, bb);
-                te.shellkind = SHELL_BUSYBOX;
-                return te;
+                return shellat(os, scratch, clone(perm, bb), SHELL_BUSYBOX, win);
             }
         }
     }
@@ -10323,26 +10347,20 @@ static ToolEnv findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
     if (!wantcmd) {
         Str pwsh = findpath(os, perm, scratch, path, win ? Str("pwsh.exe") : Str("pwsh"), win);
         if (pwsh.len) {
-            te.shell     = pwsh;
-            te.shellkind = SHELL_PWSH;
-            return te;
+            return shellat(os, scratch, pwsh, SHELL_PWSH, win);
         }
         Str ps = concat(&scratch, root, "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
         if (win && os_stat(os, scratch, ps).type==STAT_FILE) {
-            te.shell     = clone(perm, ps);
-            te.shellkind = SHELL_PS;
-            return te;
+            return shellat(os, scratch, clone(perm, ps), SHELL_PS, win);
         }
     }
     if (!win) {
-        te.shell     = "/bin/sh";
-        te.shellkind = SHELL_SH;
-        return te;
+        return shellat(os, scratch, "/bin/sh", SHELL_SH, win);
     }
-    Str cmd = concat(&scratch, root, "\\System32\\cmd.exe");
-    te.shell     = clone(perm, cmd);
-    te.shellkind = SHELL_CMD;
-    return te;
+    Shell sh = shellat(os, scratch, clone(perm, concat(&scratch, root, "\\System32\\cmd.exe")),
+                       SHELL_CMD, win);
+    sh.fallback = !wantcmd;
+    return sh;
 }
 
 // The shell the session's prefix describes, as it began, if it is
@@ -10353,8 +10371,9 @@ static void prefixshell(Session *s, Arena scratch, Json *j)
     Str kind  = jsonstr(jsonget(j, "shell_kind"));
     for (i32 k = 0; shell.len && k<countof(shellkinds); k++) {
         if (kind==shellkinds[k] && os_stat(s->e->os, scratch, shell).type==STAT_FILE) {
-            s->te.shell     = clone(&s->perm, shell);
-            s->te.shellkind = k;
+            s->te.shell      = {};
+            s->te.shell.path = clone(&s->perm, shell);
+            s->te.shell.kind = k;
         }
     }
 }
@@ -10421,10 +10440,8 @@ static void buildprefix(Session *s, Arena scratch)
     Engine *e = s->e;
     jobconf(s);
     Str     path = enginepath(e, &scratch, s->te.windows);
-    ToolEnv sh   = findshell(e->os, &s->perm, scratch, e->exedir, path,
-                             s->te.windows, cfgget(e->cfg, "tools", "", "shell", 0));
-    s->te.shell     = sh.shell;
-    s->te.shellkind = sh.shellkind;
+    s->te.shell     = findshell(e->os, &s->perm, scratch, e->exedir, path,
+                                s->te.windows, cfgget(e->cfg, "tools", "", "shell", 0));
     s->te.coords    = s->mc.coords;
     s->te.vision    = !s->mc.novision;
     if (tooloffered(&s->te, TOOL_TASK)) {
@@ -10550,8 +10567,8 @@ static void logprefix(Session *s, Arena scratch)
     putstrkey(&w.json, "tools", s->tools);
     putintkey(&w.json, "job_timeout", s->te.jobtimeout);
     putintkey(&w.json, "job_timeout_max", s->te.jobmax);
-    putstrkey(&w.json, "shell", s->te.shell);
-    putstrkey(&w.json, "shell_kind", shellkinds[s->te.shellkind]);
+    putstrkey(&w.json, "shell", s->te.shell.path);
+    putstrkey(&w.json, "shell_kind", shellkinds[s->te.shell.kind]);
     if (tooloffered(&s->te, TOOL_DESKTOP)) {
         putstrkey(&w.json, "coordinates", s->te.coords==COORDS_NORM1000
                                           ? Str("norm1000") : Str("pixels"));
@@ -15809,8 +15826,9 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
     }
     Arena scratch = newarena(e->scratch);
     Str   path    = enginepath(e, &scratch, HOST_WINDOWS);
-    e->te       = findshell(os, &e->perm, scratch, e->exedir, path, HOST_WINDOWS,
-                            cfgget(cfg, "tools", "", "shell", 0));
+    e->te.windows = HOST_WINDOWS;
+    e->te.shell   = findshell(os, &e->perm, scratch, e->exedir, path, HOST_WINDOWS,
+                              cfgget(cfg, "tools", "", "shell", 0));
     e->te.exe   = exe;
     e->te.rg    = findrg(e, &e->perm, newarena(e->scratch));
     // The user's own instructions, next to the configuration

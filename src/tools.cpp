@@ -105,10 +105,26 @@ enum : i32 {
 };
 static Str const shellkinds[] = {"sh", "busybox", "cmd", "pwsh", "powershell"};
 
+// What a POSIX sh on Windows is, as the files beside it tell: only its
+// description differs.
+enum : i32 {
+    FLAVOR_NONE,
+    FLAVOR_BUSYBOX,  // busybox-w32's ash: w64devkit's sh.exe, or busybox.exe
+    FLAVOR_MSYS,     // MSYS2's, Git Bash's among them: drives as /c/x
+    FLAVOR_CYGWIN,   // Cygwin's: drives as /cygdrive/c/x
+};
+
+// A shell the agent's commands run in.
+struct Shell {
+    Str path;      // the executable, absolute
+    i32 kind;      // SHELL_*
+    i32 flavor;    // FLAVOR_*
+    b32 fallback;  // cmd.exe, for want of any other
+};
+
 // What the tools need to know about where they run.
 struct ToolEnv {
-    Str shell;       // absolute path of the shell executable
-    i32 shellkind;
+    Shell shell;
     b32 windows;     // path rules and the environment's case
     Str rg;          // ripgrep's absolute path, empty if not used
     Str exe;         // this executable, for the built-in search
@@ -246,45 +262,82 @@ static void printelapsed(Buf *b, i64 ms)
     }
 }
 
+static Str basename(Str path);
+
+// What a shell is, in whole sentences: how it runs a command, and what
+// it takes for a path where that is not plain.
+static void shellintro(Buf *b, Shell *sh)
+{
+    switch (sh->kind) {
+    case SHELL_SH:
+    case SHELL_BUSYBOX:
+        print(b, "Run a command with ");
+        print(b, sh->path);
+        print(b, sh->kind==SHELL_BUSYBOX ? Str(" sh -c") : Str(" -c"));
+        switch (sh->flavor) {
+        case FLAVOR_BUSYBOX:
+            print(b, ", busybox-w32's ash with the usual Unix tools built "
+                     "in. It is not bash: write POSIX sh ([ ] not [[ ]], no "
+                     "arrays or {1..3}). Paths are Windows paths, C:/x or "
+                     "relative ones; /c/x and /cygdrive/c/x do not exist "
+                     "here.");
+            break;
+        case FLAVOR_MSYS:
+            print(b, ", an MSYS2 shell, as Git Bash is. It names drives as "
+                     "/c/x, and converts the paths it passes to Windows "
+                     "programs. Give the file tools Windows paths: C:/x for "
+                     "/c/x, and for its own paths, like /tmp or ~, what "
+                     "cygpath -m prints.");
+            break;
+        case FLAVOR_CYGWIN:
+            print(b, ", a Cygwin shell. It names drives as /cygdrive/c/x. "
+                     "Give the file tools Windows paths: C:/x for "
+                     "/cygdrive/c/x, and for its own paths, like /tmp or ~, "
+                     "what cygpath -m prints.");
+            break;
+        default:
+            if (equalfold(basename(sh->path), "sh") ||
+                    equalfold(basename(sh->path), "sh.exe")) {
+                print(b, " (a POSIX shell)");
+            }
+            putbyte(b, '.');
+        }
+        break;
+    case SHELL_CMD:
+        print(b, sh->fallback ? Str("Run a command with cmd.exe /d /s /c. No POSIX "
+                                    "shell was found, so use cmd syntax and "
+                                    "Windows commands.")
+                              : Str("Run a command with cmd.exe /d /s /c: use "
+                                    "cmd syntax and Windows commands."));
+        break;
+    case SHELL_PWSH:
+    case SHELL_PS:
+        print(b, sh->kind==SHELL_PWSH ? Str("Run a command with PowerShell 7 (")
+                                      : Str("Run a command with Windows PowerShell 5.1 ("));
+        print(b, sh->path);
+        print(b, "), as a script: use PowerShell syntax and cmdlets, and "
+                 "$env:NAME for environment variables. ");
+        if (sh->kind == SHELL_PS) {
+            print(b, "This version has no && or ||: separate commands with "
+                     "; or newlines, and test $? or $LASTEXITCODE. ");
+        }
+        print(b, "The command fails if its last statement does, with a "
+                 "native program's exit status ($LASTEXITCODE) when it has "
+                 "one.");
+        break;
+    }
+}
+
 static Str shelldesc(Arena *a, ToolEnv *te)
 {
     i64 job = te->jobtimeout ? te->jobtimeout : JOB_DEFAULT;
     i64 max = te->jobmax ? te->jobmax : JOB_MAX;
     Buf b(a, 1024);
-    switch (te->shellkind) {
-    case SHELL_SH:
-        print(&b, "Run a command with ");
-        print(&b, te->shell);
-        print(&b, " -c (a POSIX shell)");
-        break;
-    case SHELL_BUSYBOX:
-        print(&b, "Run a command with the busybox-w32 POSIX shell (");
-        print(&b, te->shell);
-        print(&b, " sh -c), which has the usual Unix tools built in");
-        break;
-    case SHELL_CMD:
-        print(&b, "Run a command with cmd.exe /d /s /c. No POSIX shell was "
-                  "found, so use cmd syntax and Windows commands");
-        break;
-    case SHELL_PWSH:
-    case SHELL_PS:
-        print(&b, te->shellkind==SHELL_PWSH ? Str("Run a command with PowerShell 7 (")
-                                            : Str("Run a command with Windows PowerShell 5.1 ("));
-        print(&b, te->shell);
-        print(&b, "), as a script: use PowerShell syntax and cmdlets, and "
-                  "$env:NAME for environment variables. ");
-        if (te->shellkind == SHELL_PS) {
-            print(&b, "This version has no && or ||: separate commands with "
-                      "; or newlines, and test $? or $LASTEXITCODE. ");
-        }
-        print(&b, "The command fails if its last statement does, with a "
-                  "native program's exit status ($LASTEXITCODE) when it "
-                  "has one");
-        break;
-    }
-    print(&b, " in the working directory, a fresh shell each call (cd does "
-              "not carry over). There is no input or terminal: use "
-              "non-interactive flags. GIT_EDITOR is true. Output is cut to "
+    shellintro(&b, &te->shell);
+    print(&b, " Each command runs in the working directory, in a fresh "
+              "shell (cd does not carry over). There is no input or "
+              "terminal: use non-interactive flags. GIT_EDITOR is true. "
+              "Output is cut to "
               "its first 20 KiB and last 30 KiB, all of it saved to a file. "
               "A command still running after timeout seconds (default 120, "
               "at most 600) becomes a background job and keeps running; "
@@ -2333,23 +2386,23 @@ static char const psboot[] =
 static ShellCmd shellcmd(Arena *a, ToolEnv *te, Str command)
 {
     ShellCmd r = {};
-    switch (te->shellkind) {
+    switch (te->shell.kind) {
     case SHELL_BUSYBOX:
-        r.argv = push(a, r.argv, te->shell);
+        r.argv = push(a, r.argv, te->shell.path);
         r.argv = push(a, r.argv, Str("sh"));
         r.argv = push(a, r.argv, Str("-c"));
         r.argv = push(a, r.argv, command);
         break;
     case SHELL_SH:
-        r.argv = push(a, r.argv, te->shell);
+        r.argv = push(a, r.argv, te->shell.path);
         r.argv = push(a, r.argv, Str("-c"));
         r.argv = push(a, r.argv, command);
         break;
     case SHELL_CMD: {
-        r.argv = push(a, r.argv, te->shell);
-        Buf b(a, command.len + te->shell.len + 32);
+        r.argv = push(a, r.argv, te->shell.path);
+        Buf b(a, command.len + te->shell.path.len + 32);
         putbyte(&b, '"');
-        print(&b, te->shell);
+        print(&b, te->shell.path);
         print(&b, "\" /d /s /c \"");
         print(&b, command);
         putbyte(&b, '"');
@@ -2357,7 +2410,7 @@ static ShellCmd shellcmd(Arena *a, ToolEnv *te, Str command)
     } break;
     case SHELL_PWSH:
     case SHELL_PS:
-        r.argv = push(a, r.argv, te->shell);
+        r.argv = push(a, r.argv, te->shell.path);
         r.argv = push(a, r.argv, Str("-NoLogo"));
         r.argv = push(a, r.argv, Str("-NoProfile"));
         r.argv = push(a, r.argv, Str("-NonInteractive"));
