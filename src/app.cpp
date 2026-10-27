@@ -2260,10 +2260,18 @@ struct ModelPick {
     b32 dflt;      // the defaults, which go first
 };
 
+// Whether picks begin with the defaults, as endpoint and model.
+static b32 isdefault(Slice<ModelPick> picks, Str endpoint, Str model)
+{
+    return picks.len && picks[0].dflt && picks[0].endpoint==endpoint &&
+           picks[0].model==model;
+}
+
 // The models a host's endpoints list, as picks: the defaults first, then
 // for each endpoint in the engine's order, the configuration's [model]
 // sections that it lists by name or by id, then the rest of its ids;
-// last, the [model] sections that none lists.
+// last, the [model] sections that none lists. Each model goes once: the
+// defaults' row stands for that model where its endpoint lists it too.
 static Slice<ModelPick> modelpicks(Gui *g, Arena *a, GuiHost *h)
 {
     Slice<ModelPick> r     = {};
@@ -2294,7 +2302,7 @@ static Slice<ModelPick> modelpicks(Gui *g, Arena *a, GuiHost *h)
             for (iz m = 0; !listed && m < ep->models.len; m++) {
                 listed = ep->models[m]==confs[k].name || ep->models[m]==confs[k].id;
             }
-            if (listed) {
+            if (listed && !isdefault(r, ep->name, confs[k].name)) {
                 ModelPick p = {};
                 p.endpoint = ep->name;
                 p.model    = confs[k].name;
@@ -2303,7 +2311,7 @@ static Slice<ModelPick> modelpicks(Gui *g, Arena *a, GuiHost *h)
             }
         }
         for (iz m = 0; m < ep->models.len; m++) {
-            b32 dup = 0;
+            b32 dup = isdefault(r, ep->name, ep->models[m]);
             for (iz k = from; !dup && k < r.len; k++) {
                 dup = r[k].model == ep->models[m];
             }
@@ -2321,7 +2329,7 @@ static Slice<ModelPick> modelpicks(Gui *g, Arena *a, GuiHost *h)
     for (iz k = 0; k < confs.len; k++) {
         b32 dup = 0;
         for (iz i = 0; !dup && i < r.len; i++) {
-            dup = !r[i].dflt && r[i].model==confs[k].name;
+            dup = r[i].model == confs[k].name;
         }
         if (!dup) {
             ModelPick p = {};
@@ -15800,7 +15808,8 @@ static b32 drivecheck(Gui *g, i32 chk)
                  p.len>=2 && p[0].dflt && g->pickwant.len &&
                  p[0].label==concat(&a, op->text, h->modeldflt);
         for (iz i = 1; ok && i < p.len; i++) {
-            ok = !p[i].dflt && !p[i].err.len && startswith(p[i].label, op->text);
+            ok = !p[i].dflt && !p[i].err.len && startswith(p[i].label, op->text) &&
+                 !(p[i].endpoint==p[0].endpoint && p[i].model==p[0].model);
         }
         return ok;
     }
