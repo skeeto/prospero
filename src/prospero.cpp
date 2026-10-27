@@ -378,7 +378,9 @@ static void    os_wake(Os *);
 // of a pick from the tray icon's menu (TRAY_*), gui_placed of the
 // window moved, resized, maximized or restored (WinGeom, below), and
 // gui_drop of a file dropped on the window, by its path, or opened in
-// the application as a whole (macOS: Finder, the Dock, open -a).
+// the application as a whole (macOS: Finder, the Dock, open -a), and
+// gui_toasted and gui_toastfail of a desktop notification clicked or
+// refused (os_guitoast).
 struct Gui;
 // Open the main window with ImGui's platform and renderer backends, or
 // open it again after os_guished. Returns 0 on failure.
@@ -424,6 +426,31 @@ enum {
 };
 static b32     os_trayopen(Os *, Str tip);
 static void    os_trayclose(Os *);
+// Desktop notifications (toasts): macOS's Notification Center (only as
+// Prospero.app, asking the user's leave once, in os_guitoastprep),
+// Windows' notification area (a balloon, which Windows 10 and later show
+// as a toast, from an icon there while one is out), and a Linux
+// desktop's org.freedesktop.Notifications. A toast of id, the core's,
+// replaces any earlier one of that id, and alerts again; os_guiuntoast
+// withdraws it. Returns 0 if none can be shown now. A click on one comes
+// back through the event loop as gui_toasted, and a refusal found later,
+// as the user's turning them off, as gui_toastfail (id -1 for all).
+// The scripted checklist shows none, but with PROSPERO_TEST_TOAST.
+// os_guitoastprep, as the window opens, says why none can be, if so.
+static Str     os_guitoastprep(Os *, Arena *);
+static b32     os_guitoast(Os *, Arena scratch, i32 id, Str title, Str body);
+static void    os_guiuntoast(Os *, i32 id);
+// Ask for the user's attention without a toast, as a toast refused
+// does: the taskbar button flashes, the Dock's icon bounces, or the
+// window is marked urgent. FLASH_CANCEL stops it.
+enum {
+    FLASH_CANCEL,
+    FLASH_BRIEFLY,
+    FLASH_UNTILFOCUSED,
+};
+static void    os_guiflash(Os *, i32 how);
+// Whether the window has the keyboard focus, and is not minimized.
+static b32     os_guifocused(Os *);
 
 // Synthetic input for the scripted checklist (gui --drive), posted to
 // the window's own event queue so that it takes the path real input
@@ -446,6 +473,8 @@ enum {
     GEV_TRAY,       // the tray icon's menu item x (TRAY_*) is picked,
                     // tray or not, window or not
     GEV_DROP,       // a file, its path the text, is dropped on the window
+    GEV_TOAST,      // toast x is clicked (y 0), or was refused (y 1),
+                    // shown or not, by the platform's own path
 };
 enum {
     GKEY_TAB,

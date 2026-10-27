@@ -119,6 +119,16 @@ cannot choose what runs, so these are ignored in one:
   macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
   (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its
   folder and command Prospero knows; another gets `-e`.
+- **`[ui] notify`**: desktop notifications while the window is in the
+  background, minimized, or showing another session: `allow` when a
+  permission ask waits for your answer, `done` when a session stops by
+  itself (finished, failed, or out of budget, not stopped by you), or
+  `none`. Both by default. Clicking one brings the window to that
+  session, and one that no longer matters goes away by itself. A window
+  kept running in the background still tells of sessions done. Where
+  notifications are off or unavailable, the window asks for attention
+  instead (a flashing taskbar button, a bouncing Dock icon). On macOS
+  only Prospero.app can show them, after you allow it once.
 - **`[ui] font_size`**: the text's size in pixels, 8 to 40 (15 by
   default). The View menu's zoom scales it until Prospero exits.
 - **`[ui] theme`**: `system`, `dark` or `light`, also in View → Theme.

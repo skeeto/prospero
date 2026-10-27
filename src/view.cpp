@@ -165,6 +165,15 @@ enum : i32 {
     VASK_DENIED,
 };
 
+// How a turn ended, as a desktop notification tells of it (endwhy):
+// the ends the session came to by itself, and the rest
+enum : i32 {
+    END_OTHER,   // cancelled by the user, a side chat's start, a crash
+    END_DONE,
+    END_ERROR,
+    END_BUDGET,
+};
+
 // What a session is doing, from live records ("closed": not loaded)
 enum : i32 {
     LIVE_IDLE,
@@ -522,6 +531,20 @@ struct View {
     Str              memdir;    // the project's memory, empty if none
     Slice<ViewMem>   mems;      // its index, as the agent knows it
     i64              cutseq;    // records before it are summarized
+
+    // What a desktop notification may be about (app.cpp, toastpass): the
+    // latest ask and turn end, by their records, which a replay writes
+    // again the same
+    i64             askseq;      // the last ask's record
+    i64             askts;
+    i32             askmsg;      // and its message
+    i64             endseq;      // the last turn.end's record
+    i64             endts;
+    i32             endwhy;      // END_*
+    Str             enderr;
+    b32             endresume;   // the next turn began by itself
+    b32             endcompact;  // a compaction's turn (compact) ended
+    b32             turncompact; // the running turn is one
 };
 
 static ViewCache *newviewcache(Arena *perm, Region *r, iz max)
@@ -1606,6 +1629,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->busy    = 1;
         v->turnts  = r->ts;
         v->pdone   = v->ptotal = 0;
+        v->turncompact = jsonstr(jsonget(j, "via")) == "compact";
         // The message that began it: a prompt just before, or, for a
         // turn the session began by itself, a note saying why
         Str via = jsonstr(jsonget(j, "via"));
@@ -1868,6 +1892,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->msgs[i].tool = t;
         v->msgs[i].seq  = r->seq;
         v->msgs[i].md   = t->kind == "plan";  // the plan, in Markdown
+        v->askseq = r->seq;
+        v->askts  = r->ts;
+        v->askmsg = i;
         v->planver     += t->kind == "plan";
         v->asks++;
         i32 c = findcall(v, t->call);
@@ -2271,6 +2298,15 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         viewgauge(v, j);
         Str why = jsonstr(jsonget(j, "why"));
         Str err = jsonstr(jsonget(j, "err"));
+        v->endseq     = r->seq;
+        v->endts      = r->ts;
+        v->endwhy     = why=="done"   ? END_DONE   :
+                        why=="error"  ? END_ERROR  :
+                        why=="budget" ? END_BUDGET : END_OTHER;
+        v->enderr     = clone(&v->aux, err);
+        v->endresume  = jsonflag(jsonget(j, "resume"), 0);
+        v->endcompact = v->turncompact;
+        v->turncompact = 0;
         if (why != "done") {
             Arena a = scratch;
             Buf   b(&a, 128 + err.len);
@@ -3349,4 +3385,112 @@ static void viewexport(Buf *b, View *v, Str sid, b32 think, b32 tools, b32 outpu
         }
         last = m->role;
     }
+}
+
+// Desktop notifications ([ui] notify): the events a list of words names,
+// as NOTIFY_* bits, read left to right, each word adding its event and,
+// with a leading "-", taking it away again. "none" names nothing, and is
+// there so that a list may say so (an empty one means the default).
+// Unknown words are left out (config.cpp warns).
+enum : u32 {
+    NOTIFY_ALLOW = 1<<0,  // an ask waits for an answer
+    NOTIFY_DONE  = 1<<1,  // a session stopped by itself
+};
+
+static u32 notifyparse(Str words)
+{
+    u32 r = 0;
+    for (Str rest = words; rest.len;) {
+        Str w    = cfgnextword(&rest);
+        b32 less = w.len>1 && w[0]=='-';
+        w = cfglistword(w);
+        u32 bit = w=="allow" ? (u32)NOTIFY_ALLOW : w=="done" ? (u32)NOTIFY_DONE : 0;
+        r = less ? r&~bit : r|bit;
+    }
+    return r;
+}
+
+// A notification's title for a session: its title, else the one listed
+// for it, else its folder's name, else the application's.
+static Str toasttitle(Arena *a, View *v, Str listed)
+{
+    Str dir = v->cwd;
+    for (; dir.len>1 && (dir[dir.len-1]=='/' || dir[dir.len-1]=='\\'); dir.len--) {}
+    Str t = v->title.len  ? v->title :
+            listed.len    ? listed   :
+            !v->nofolder  ? basename(dir) : Str{};
+    return t.len ? oneline(a, t) : Str("Prospero");
+}
+
+// What an ask wants, as its card's header says it (ui.cpp).
+static Str askheadline(Arena *a, ViewTool *t)
+{
+    if (t->kind == "plan") {
+        return "Approve the plan?";
+    } else if (t->kind == "plan.enter") {
+        return "Plan first, changing nothing until you approve?";
+    }
+    Buf b(a, 64 + t->tool.len + t->path.len);
+    if (t->kind == "mcp.project") {
+        print(&b, "Start the MCP servers of ");
+        print(&b, t->path);
+    } else {
+        print(&b, "Allow ");
+        print(&b, t->tool);
+        if (t->path.len) {
+            print(&b, " ");
+            print(&b, t->path);
+        }
+    }
+    print(&b, "?");
+    return oneline(a, finish(&b));
+}
+
+// A notification's text for the asks waiting in a session's tree: one,
+// t, from the session named who (a subagent's, else empty), at epoch ms
+// now; or how many.
+static Str toastaskbody(Arena *a, ViewTool *t, Str who, i32 pending, i64 now)
+{
+    Buf b(a, 512);
+    if (pending > 1) {
+        print(&b, (i64)pending);
+        print(&b, " requests wait for your answer");
+        return finish(&b);
+    }
+    if (who.len) {
+        print(&b, who);
+        print(&b, ": ");
+    }
+    print(&b, askheadline(a, t));
+    if (!t->deadline) {
+        print(&b, "\nWaiting for you");
+    } else {
+        i64 secs = (t->deadline - now + 999) / 1000;
+        print(&b, "\nDenied in ");
+        print(&b, secs>0 ? secs : 0);
+        print(&b, " s unless allowed");
+    }
+    return finish(&b);
+}
+
+// A notification's text for a session that stopped by itself (endwhy):
+// the first line of its last reply, or why it stopped.
+static Str toastdonebody(Arena *a, View *v)
+{
+    switch (v->endwhy) {
+    case END_ERROR:
+        return v->enderr.len ? concat(a, "Stopped: ", oneline(a, v->enderr))
+                             : Str("Stopped by an error");
+    case END_BUDGET:
+        return "Stopped at the step budget";
+    }
+    for (iz i = v->msgs.len-1; i >= 0; i--) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role == VIEW_USER) {
+            break;  // nothing said since the prompt
+        } else if (m->role==VIEW_ASSISTANT && trim(m->text).len) {
+            return oneline(a, m->text);
+        }
+    }
+    return "Finished";
 }

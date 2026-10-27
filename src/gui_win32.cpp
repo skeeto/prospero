@@ -49,6 +49,7 @@ struct W32Hooks {
     void (*tray)(void *gui, int item);    // a pick from the tray's menu
     void (*placed)(void *gui, int const *geom);  // moved, resized: GEOM_*
     void (*drop)(void *gui, unsigned short const *path);  // a file dropped
+    void (*toasted)(void *gui, int id, int refused);      // a toast clicked
     int    drive;                         // scripted: never take focus
 };
 
@@ -77,6 +78,13 @@ extern "C" void      w32gui_newframe(void *);
 extern "C" void      w32gui_present(void *, int present, unsigned clear);
 extern "C" long long w32gui_refresh(void *);
 extern "C" void      w32gui_raise(void *);
+extern "C" void      w32gui_flash(void *, int how);  // FLASH_*
+extern "C" int       w32gui_focused(void *);
+// A notification, as the tray icon's balloon (a toast since Windows 10),
+// replacing any other; 0 if none can show. Its click comes as toasted.
+extern "C" int       w32gui_toast(void *, int id, unsigned short const *title,
+                                  unsigned short const *body);
+extern "C" void      w32gui_untoast(void *, int id);
 extern "C" void      w32gui_inject(void *, int kind, float x, float y,
                                    int button, int down, int key, int ctrl,
                                    int shift, unsigned short const *text);
@@ -139,16 +147,28 @@ extern "C" void      w32gui_letfront(unsigned long pid);  // AllowSetForegroundW
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
-// Resources: the manifest (per-monitor DPI awareness v2, common
-// controls v6, the Windows versions it targets), from assets/ by the
-// assembler's include path (-Wa,-I, set by CMake). The pattern is
-// platform/gui_windows.c in skeeto/tugz, https://github.com/skeeto/tugz.
+// Resources: the version information, for the name that notifications
+// and Task Manager show (FileDescription), and the manifest (per-monitor
+// DPI awareness v2, common controls v6, the Windows versions it
+// targets), from assets/ by the assembler's include path (-Wa,-I, set
+// by CMake). The pattern is platform/gui_windows.c in skeeto/tugz,
+// https://github.com/skeeto/tugz. Strings are UTF-16, as numbers.
 __asm__(
     "    .section .rsrc,\"dr\"\n"
     "    .p2align 2\n"
     ".Lroot: .long 0, 0\n"
-    "    .short 0, 0, 0, 1\n"
+    "    .short 0, 0, 0, 2\n"
+    "    .long 16, 0x80000000 + (.Lvers - .Lroot)\n"    // RT_VERSION
     "    .long 24, 0x80000000 + (.Lmans - .Lroot)\n"    // RT_MANIFEST
+    ".Lvers: .long 0, 0\n"
+    "    .short 0, 0, 0, 1\n"
+    "    .long 1, 0x80000000 + (.Lverid - .Lroot)\n"
+    ".Lverid: .long 0, 0\n"
+    "    .short 0, 0, 0, 1\n"
+    "    .long 0x409, .Lverdata - .Lroot\n"
+    ".Lverdata:\n"
+    "    .rva .Lvi\n"
+    "    .long .Lviend - .Lvi, 0, 0\n"
     ".Lmans: .long 0, 0\n"
     "    .short 0, 0, 0, 1\n"
     "    .long 1, 0x80000000 + (.Lmanid - .Lroot)\n"
@@ -161,13 +181,56 @@ __asm__(
     "    .p2align 3\n"
     ".Lman: .incbin \"assets/prospero.manifest\"\n"
     ".Lmanend:\n"
+    "    .p2align 2\n"
+    ".Lvi: .short .Lviend - .Lvi, 52, 0\n"
+    "    .short 86, 83, 95, 86, 69, 82, 83, 73, 79, 78, 95, 73, 78, 70, 79, 0\n"
+    "    .p2align 2\n"
+    "    .long 0xfeef04bd, 0x10000, 0, 0, 0, 0, 0x3f, 0, 0x40004, 1, 0, 0, 0\n"
+    ".Lsfi: .short .Lsfiend - .Lsfi, 0, 1\n"
+    "    .short 83, 116, 114, 105, 110, 103, 70, 105, 108, 101, 73, 110, 102, 111, 0\n"
+    "    .p2align 2\n"
+    ".Lst: .short .Lstend - .Lst, 0, 1\n"
+    "    .short 48, 52, 48, 57, 48, 52, 66, 48, 0\n"
+    "    .p2align 2\n"
+    ".Ls0: .short .Ls0end - .Ls0, 9, 1\n"
+    "    .short 70, 105, 108, 101, 68, 101, 115, 99, 114, 105, 112, 116, 105, 111, 110, 0\n"
+    "    .p2align 2\n"
+    "    .short 80, 114, 111, 115, 112, 101, 114, 111, 0\n"
+    ".Ls0end:\n"
+    "    .p2align 2\n"
+    ".Ls1: .short .Ls1end - .Ls1, 9, 1\n"
+    "    .short 80, 114, 111, 100, 117, 99, 116, 78, 97, 109, 101, 0\n"
+    "    .p2align 2\n"
+    "    .short 80, 114, 111, 115, 112, 101, 114, 111, 0\n"
+    ".Ls1end:\n"
+    "    .p2align 2\n"
+    ".Lstend:\n"
+    ".Lsfiend:\n"
+    ".Lvfi: .short .Lvfiend - .Lvfi, 0, 1\n"
+    "    .short 86, 97, 114, 70, 105, 108, 101, 73, 110, 102, 111, 0\n"
+    "    .p2align 2\n"
+    ".Lvar: .short .Lvarend - .Lvar, 4, 0\n"
+    "    .short 84, 114, 97, 110, 115, 108, 97, 116, 105, 111, 110, 0\n"
+    "    .p2align 2\n"
+    "    .short 0x409, 1200\n"
+    ".Lvarend:\n"
+    ".Lvfiend:\n"
+    ".Lviend:\n"
     "    .text\n"
 );
+
+// mingw declares these only for newer NTDDI_VERSIONs
+enum {
+    NIN_BALLOONUSERCLICK_     = WM_USER + 5,
+    NIIF_LARGE_ICON_          = 0x20,
+    NIIF_RESPECT_QUIET_TIME_  = 0x80,
+};
 
 enum {
     WM_APP_WAKE = WM_APP + 1,
     WM_APP_TRAY,              // the tray icon's notifications
     WM_APP_FRONT,             // the save dialog (wp) to bring forward
+    WM_APP_TOAST,             // toast wp clicked, or refused (lp 1)
     TIMER_MODAL = 1,
     TRAY_ID     = 1,
     TRAY_CMD    = 100,        // + the TRAY_* item, as a menu command
@@ -178,7 +241,9 @@ struct W32Gui {
     HWND                    hwnd;        // null while shed
     HWND                    msgwin;      // hidden, for wakes and the tray
     NOTIFYICONDATAW         nid;
-    int                     trayon;
+    int                     trayon;      // the icon is there
+    int                     trayheld;    // as w32gui_trayopen asked
+    int                     toastid;     // the balloon's, while one is out
     UINT                    taskbarmsg;  // Explorer started (again): add the icon
     HANDLE                  timer;       // high-resolution waitable timer
     ID3D11Device           *device;
@@ -446,6 +511,7 @@ static LRESULT CALLBACK msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (msg && msg==w->taskbarmsg) {
         // Explorer started over, and lost every icon: this one again
         if (w->trayon) {
+            w->nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
             Shell_NotifyIconW(NIM_ADD, &w->nid);
         }
         return 0;
@@ -466,11 +532,19 @@ static LRESULT CALLBACK msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     } return 0;
     case WM_APP_TRAY:
         switch (LOWORD(lp)) {
+        case NIN_BALLOONUSERCLICK_:
+            if (w->toastid) {
+                h->toasted(h->gui, w->toastid, 0);
+            }
+            return 0;
         case WM_LBUTTONUP:
             h->tray(h->gui, 0);  // TRAY_OPEN
             return 0;
         case WM_RBUTTONUP:
         case WM_CONTEXTMENU: {
+            if (!w->trayheld) {
+                return 0;  // there for a balloon alone
+            }
             HMENU m = CreatePopupMenu();
             AppendMenuW(m, MF_STRING, TRAY_CMD+0, L"Open Prospero");
             AppendMenuW(m, MF_STRING, TRAY_CMD+1, L"Stop all sessions");
@@ -484,6 +558,9 @@ static LRESULT CALLBACK msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             DestroyMenu(m);
         } return 0;
         }
+        return 0;
+    case WM_APP_TOAST:
+        h->toasted(h->gui, (int)wp, (int)lp);
         return 0;
     case WM_COMMAND:
         if (LOWORD(wp)>=TRAY_CMD && LOWORD(wp)<TRAY_CMD+3) {
@@ -734,33 +811,119 @@ extern "C" void w32gui_place(void *p, int const *geom)
     }
 }
 
+// The tray icon, there while held (w32gui_trayopen) or while a balloon
+// is out, its tip as given, else the program's name.
+static int trayup(W32Gui *w, unsigned short const *tip)
+{
+    NOTIFYICONDATAW *n = &w->nid;
+    if (!w->trayon) {
+        *n = {};
+        n->cbSize           = sizeof(*n);
+        n->hWnd             = w->msgwin;
+        n->uID              = TRAY_ID;
+        n->uFlags           = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        n->uCallbackMessage = WM_APP_TRAY;
+        n->hIcon            = LoadIconW(0, (LPCWSTR)IDI_APPLICATION);
+    }
+    if (tip || !w->trayon) {
+        tip = tip ? tip : (unsigned short const *)L"Prospero";
+        int i = 0;
+        for (; tip[i] && i<(int)(sizeof(n->szTip)/2)-1; i++) {
+            n->szTip[i] = tip[i];
+        }
+        n->szTip[i] = 0;
+    }
+    n->uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    if (!w->trayon) {
+        w->trayon = Shell_NotifyIconW(NIM_ADD, n) != 0;
+    } else {
+        Shell_NotifyIconW(NIM_MODIFY, n);
+    }
+    return w->trayon;
+}
+
+static void traydown(W32Gui *w)
+{
+    if (w->trayon) {
+        Shell_NotifyIconW(NIM_DELETE, &w->nid);
+        w->trayon = 0;
+    }
+}
+
 extern "C" int w32gui_trayopen(void *p, unsigned short const *tip)
 {
     W32Gui *w = (W32Gui *)p;
-    if (w->trayon) {
-        return 1;
-    }
-    NOTIFYICONDATAW *n = &w->nid;
-    *n = {};
-    n->cbSize           = sizeof(*n);
-    n->hWnd             = w->msgwin;
-    n->uID              = TRAY_ID;
-    n->uFlags           = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    n->uCallbackMessage = WM_APP_TRAY;
-    n->hIcon            = LoadIconW(0, (LPCWSTR)IDI_APPLICATION);
-    for (int i = 0; tip && tip[i] && i<(int)(sizeof(n->szTip)/2)-1; i++) {
-        n->szTip[i] = tip[i];
-    }
-    w->trayon = Shell_NotifyIconW(NIM_ADD, n) != 0;
-    return w->trayon;
+    w->trayheld = trayup(w, tip);
+    return w->trayheld;
 }
 
 extern "C" void w32gui_trayclose(void *p)
 {
     W32Gui *w = (W32Gui *)p;
-    if (w->trayon) {
-        Shell_NotifyIconW(NIM_DELETE, &w->nid);
-        w->trayon = 0;
+    w->trayheld = 0;
+    if (!w->toastid) {
+        traydown(w);
+    }
+}
+
+// Copy UTF-16 into a field of cap units, never splitting a surrogate pair.
+static void wcopy(WCHAR *dst, int cap, unsigned short const *src)
+{
+    int i = 0;
+    for (; src && src[i] && i<cap-1; i++) {
+        dst[i] = src[i];
+    }
+    if (i && dst[i-1]>=0xd800 && dst[i-1]<=0xdbff) {
+        i--;  // the pair's first half alone
+    }
+    dst[i] = 0;
+}
+
+extern "C" int w32gui_toast(void *p, int id, unsigned short const *title,
+                            unsigned short const *body)
+{
+    W32Gui *w  = (W32Gui *)p;
+    DWORD   on = 1, size = sizeof(on);
+    RegGetValueW(HKEY_CURRENT_USER,
+                 L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+                 L"EnableBalloonTips", RRF_RT_REG_DWORD, 0, &on, &size);
+    if (!on) {
+        return 0;  // turned off by policy
+    }
+    if (w->toastid && w->toastid!=id && !w->trayheld) {
+        traydown(w);  // a new icon: no late click to take for this one
+    }
+    w->toastid = id;
+    if (!trayup(w, 0)) {
+        w->toastid = 0;
+        return 0;
+    }
+    NOTIFYICONDATAW *n = &w->nid;
+    n->uFlags      = NIF_INFO;
+    n->dwInfoFlags = NIIF_INFO | NIIF_LARGE_ICON_ | NIIF_RESPECT_QUIET_TIME_;
+    wcopy(n->szInfoTitle, sizeof(n->szInfoTitle)/2, title);
+    wcopy(n->szInfo, sizeof(n->szInfo)/2, body && body[0] ? body : (unsigned short const *)L" ");
+    int ok = Shell_NotifyIconW(NIM_MODIFY, n) != 0;
+    if (!ok) {
+        w32gui_untoast(w, id);
+    }
+    return ok;
+}
+
+extern "C" void w32gui_untoast(void *p, int id)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (!w->toastid || w->toastid!=id) {
+        return;
+    }
+    w->toastid = 0;
+    if (!w->trayheld) {
+        traydown(w);
+    } else if (w->trayon) {
+        NOTIFYICONDATAW *n = &w->nid;
+        n->uFlags    = NIF_INFO;
+        n->szInfo[0] = 0;  // the balloon goes
+        Shell_NotifyIconW(NIM_MODIFY, n);
     }
 }
 
@@ -889,6 +1052,9 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
     if (kind == 11) {  // a tray menu pick, tray or not, window or not
         PostMessageW(w->msgwin, WM_COMMAND, TRAY_CMD + (int)x, 0);
         return;
+    } else if (kind == 13) {  // a toast clicked or refused
+        PostMessageW(w->msgwin, WM_APP_TOAST, (WPARAM)(int)x, (LPARAM)(int)y);
+        return;
     } else if (!w->hwnd) {
         return;
     }
@@ -1002,6 +1168,34 @@ extern "C" void w32gui_raise(void *p)
     }
 }
 
+extern "C" void w32gui_flash(void *p, int how)
+{
+    W32Gui *w = (W32Gui *)p;
+    if (!w->hwnd) {
+        return;
+    }
+    FLASHWINFO f = {};
+    f.cbSize  = sizeof(f);
+    f.hwnd    = w->hwnd;
+    f.dwFlags = how==0 ? FLASHW_STOP :
+                how==1 ? FLASHW_ALL : FLASHW_ALL|FLASHW_TIMERNOFG;
+    f.uCount  = how==1 ? 3 : 0;
+    FlashWindowEx(&f);
+}
+
+// The foreground window is ours, and not minimized.
+extern "C" int w32gui_focused(void *p)
+{
+    W32Gui *w  = (W32Gui *)p;
+    HWND    fg = GetForegroundWindow();
+    DWORD   pid = 0;
+    if (!w->hwnd || !fg || IsIconic(w->hwnd)) {
+        return 0;
+    }
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
 extern "C" void w32gui_letfront(unsigned long pid)
 {
     AllowSetForegroundWindow(pid);
@@ -1041,6 +1235,7 @@ extern "C" void w32gui_close(void *p)
 {
     W32Gui *w = (W32Gui *)p;
     w32gui_shed(w);
+    w->toastid = 0;
     w32gui_trayclose(w);
     SetWindowLongPtrW(w->msgwin, GWLP_USERDATA, 0);
     DestroyWindow(w->msgwin);
@@ -1323,8 +1518,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 static_assert((i32)W32IN_MOVE==(i32)INPUT_MOVE && (i32)W32IN_OTHER==(i32)INPUT_OTHER);
 static_assert(GEV_MOVE==0 && GEV_RESIZE==5 && GEV_MODALSIZE==6 && GEV_DPI==7 &&
               GEV_CLOSE==8 && GEV_MINIMIZE==9 && GEV_SYSTHEME==10 && GEV_TRAY==11 &&
-              GEV_DROP==12);
+              GEV_DROP==12 && GEV_TOAST==13);
 static_assert(TRAY_OPEN==0 && TRAY_STOPALL==1 && TRAY_QUIT==2);
+static_assert(FLASH_CANCEL==0 && FLASH_BRIEFLY==1 && FLASH_UNTILFOCUSED==2);
 
 W32(i32, GetCurrentThreadId());
 
@@ -1338,6 +1534,14 @@ static void hookmodal(void *g, int m)    { gui_modal((Gui *)g, m); }
 static void hookclose(void *g)           { gui_close((Gui *)g); }
 static void hooksystheme(void *g, int d) { gui_systheme((Gui *)g, d); }
 static void hooktray(void *g, int item)  { gui_tray((Gui *)g, item); }
+static void hooktoasted(void *g, int id, int refused)
+{
+    if (refused) {
+        gui_toastfail((Gui *)g, id, "refused");
+    } else {
+        gui_toasted((Gui *)g, id);
+    }
+}
 
 static WinGeom fromgeom(int const *geom)
 {
@@ -1455,6 +1659,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     h.close     = hookclose;
     h.systheme  = hooksystheme;
     h.tray      = hooktray;
+    h.toasted   = hooktoasted;
     h.placed    = hookplaced;
     h.drop      = hookdrop;
     h.drive     = g->drive;
@@ -1514,6 +1719,40 @@ static void os_guiraise(Os *os)
 }
 
 static void os_guitoken(Os *, Str) {}
+
+static void os_guiflash(Os *os, i32 how)
+{
+    if (os->gui) {
+        w32gui_flash(os->gui, how);
+    }
+}
+
+static b32 os_guifocused(Os *os)
+{
+    return os->gui && w32gui_focused(os->gui);
+}
+
+static Str os_guitoastprep(Os *, Arena *)
+{
+    return {};
+}
+
+static b32 os_guitoast(Os *os, Arena scratch, i32 id, Str title, Str body)
+{
+    if (!os->gui) {
+        return 0;
+    }
+    unsigned short *t = (unsigned short *)towide(&scratch, title).data;
+    unsigned short *b = (unsigned short *)towide(&scratch, body).data;
+    return w32gui_toast(os->gui, id, t, b);
+}
+
+static void os_guiuntoast(Os *os, i32 id)
+{
+    if (os->gui) {
+        w32gui_untoast(os->gui, id);
+    }
+}
 
 static void os_guiletfront(Os *, i64 pid)
 {

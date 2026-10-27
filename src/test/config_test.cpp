@@ -104,6 +104,10 @@ static void testcfgschema(Test *t)
         {"ui", "editor", "code --wait", CFG_OK, 0},
         {"ui", "editor", "code --wait", CFG_BAD, 1},
         {"ui", "theme", "dark", CFG_OK, 1},
+        {"ui", "notify", "allow, done", CFG_OK, 0},
+        {"ui", "notify", "none", CFG_OK, 0},
+        {"ui", "notify", "done bell", CFG_ODD, 0},
+        {"ui", "notify", "allow done -done", CFG_OK, 1},
     };
     for (iz i = 0; i < countof(judge); i++) {
         CfgKey *k = cfgkey(judge[i].kind, judge[i].key);
@@ -1027,6 +1031,7 @@ static void testcfgjson(Test *t)
         "ui//font_size=17*\n"
         "ui//editor=*\n"
         "ui//terminal=*\n"
+        "ui//notify=allow done*\n"
         "desktop//offer=all*\n"
         "desktop//ask=true*\n"
         "desktop//ask_timeout=60*\n"

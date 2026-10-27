@@ -228,7 +228,10 @@ with the button set apart from Allow, which allows that directory, for
 reads or for writes too, for the rest of the session and its subagents,
 even after it is opened again. Each session has a scratch directory in the system's
 temporary directory, which tools may use freely, as they may the rest
-of it unless `[guard] temp = ask`.
+of it unless `[guard] temp = ask`. While you look elsewhere (another
+app, the window minimized, another session shown), a desktop
+notification tells of an ask waiting for you and of a session that
+stopped by itself, and a click on it brings you there (`[ui] notify`).
 
 Import session, in the Session menu and a host's menu, makes a new
 session from a raw log exported here or on another machine, on the

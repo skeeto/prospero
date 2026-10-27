@@ -32,6 +32,12 @@
 // waits for events on a window, and with none it polls instead, every
 // millisecond (3-4% of a core): a hidden window stands in while shed.
 //
+// Desktop notifications: on macOS UserNotifications, through the
+// Objective-C runtime, which serves only the app bundle; on Linux the
+// desktop's org.freedesktop.Notifications, from a thread with a D-Bus
+// connection of its own (libdbus, as the portal watch loads it). Their
+// clicks and refusals come back as events of our own (toastevent).
+//
 // SDL reports the system's theme (macOS: the app's effective appearance;
 // Linux: the desktop portal's color-scheme, unknown without one, taken
 // as dark) and its changes as events. On macOS the window's frame takes
@@ -62,9 +68,8 @@
 //
 // This is free and unencumbered software released into the public domain.
 
-#ifdef __linux__
-#  include <dlfcn.h>
-#endif
+#include <dlfcn.h>
+#include <unistd.h>
 
 #ifdef __APPLE__
 // The Objective-C runtime and AppKit's appearance names, declared by
@@ -160,6 +165,8 @@ struct GuiSdl {
     TrayItem      items[3];
     u32           wakeevent;
     u32           trayevent;   // a tray menu pick: code is the TRAY_* item
+    u32           toastevent;  // a toast's click, code its id, or its
+                               // refusal, data1 why (a literal)
     i32           wakeflag;    // atomic: a wake event is queued
     b32           inwatch;     // drawing from the event watch
     i32           framedark;   // the frame's theme: -1 unset, 0 light, 1 dark
@@ -594,6 +601,173 @@ static void handlereopen(u32 trayevent)
                         (void *)shouldreopen, reopentypes);
     }
 }
+
+// Toasts through UserNotifications (macOS 10.14+), which serves only an
+// application bundle: a bare binary has none. The center's delegate, a
+// class made at run time, shows them while Prospero is in front too,
+// which the core decides, and takes their clicks, by their identifier,
+// "PID.ID", since every process of the bundle shares the center. As a
+// click and a refusal come on threads of their own, so do their events.
+static u32   mactoastevent;
+static void *mactoastcenter;
+
+template<typename R, typename... A>
+static R objcsend(void *o, char const *sel, A... a)
+{
+    using F = R (*)(void *, void *, A...);
+    return ((F)(void *)objc_msgSend)(o, sel_registerName(sel), a...);
+}
+
+extern "C" void *objc_allocateClassPair(void *, char const *, uz);
+extern "C" void  objc_registerClassPair(void *);
+extern "C" void *objc_getProtocol(char const *);
+extern "C" bool  class_addProtocol(void *, void *);
+
+static void mactoastpush(i32 id, char const *why)
+{
+    SDL_Event e = {};
+    e.type       = mactoastevent;
+    e.user.code  = id;
+    e.user.data1 = (void *)why;
+    e.common.timestamp = SDL_GetTicksNS();
+    SDL_PushEvent(&e);
+}
+
+static void *nsstring(char const *s)
+{
+    return objcsend<void *>(objc_getClass("NSString"), "stringWithUTF8String:", s);
+}
+
+static char const *cstring(void *ns)
+{
+    return ns ? objcsend<char const *>(ns, "UTF8String") : 0;
+}
+
+static void macwillpresent(void *, void *, void *, void *, void (^done)(uz))
+{
+    done(2|8|16);  // sound, list, banner
+}
+
+static void macdidreceive(void *, void *, void *, void *resp, void (^done)())
+{
+    char const *act = cstring(objcsend<void *>(resp, "actionIdentifier"));
+    void       *req = objcsend<void *>(objcsend<void *>(resp, "notification"), "request");
+    char const *ids = cstring(objcsend<void *>(req, "identifier"));
+    Str         id  = {(u8 *)ids, ids ? (iz)__builtin_strlen(ids) : 0};
+    Cut         c   = cut(id, '.');
+    Int         pid = parseint(c.head);
+    Int         n   = parseint(c.tail);
+    if (act && !__builtin_strcmp(act, "com.apple.UNNotificationDefaultActionIdentifier") &&
+            c.ok && pid.ok && pid.val==getpid() && n.ok) {
+        mactoastpush((i32)n.val, 0);
+    }
+    done();
+}
+
+// A toast's identifier: "PID.ID"
+static void macident(char (&buf)[32], i32 id)
+{
+    Arena a = {};
+    a.beg = (byte *)buf;
+    a.end = (byte *)buf + countof(buf);
+    Buf b(&a, countof(buf));
+    print(&b, (i64)getpid());
+    print(&b, ".");
+    print(&b, (i64)id);
+    putbyte(&b, 0);
+    finish(&b);
+}
+
+static Str mactoastprep()
+{
+    void *pool   = objc_autoreleasePoolPush();
+    void *bundle = objcsend<void *>(objc_getClass("NSBundle"), "mainBundle");
+    char const *path = cstring(bundle ? objcsend<void *>(bundle, "bundlePath") : 0);
+    Str   why    = {};
+    if (!bundle || !objcsend<void *>(bundle, "bundleIdentifier") || !path ||
+            !endswith({(u8 *)path, (iz)__builtin_strlen(path)}, ".app")) {
+        why = "macOS shows them for Prospero.app, not for a bare binary";
+    } else if (!dlopen("/System/Library/Frameworks/UserNotifications.framework/"
+                       "UserNotifications", RTLD_NOW)) {
+        why = "the UserNotifications framework would not load";
+    } else if (!(mactoastcenter = objcsend<void *>(objc_getClass("UNUserNotificationCenter"),
+                                                   "currentNotificationCenter"))) {
+        why = "macOS has no notification center for Prospero";
+    } else {
+        void *cls = objc_allocateClassPair(objc_getClass("NSObject"), "ProsperoToasts", 0);
+        class_addMethod(cls, sel_registerName("userNotificationCenter:"
+                        "willPresentNotification:withCompletionHandler:"),
+                        (void *)macwillpresent, "v@:@@@?");
+        class_addMethod(cls, sel_registerName("userNotificationCenter:"
+                        "didReceiveNotificationResponse:withCompletionHandler:"),
+                        (void *)macdidreceive, "v@:@@@?");
+        void *proto = objc_getProtocol("UNUserNotificationCenterDelegate");
+        if (proto) {
+            class_addProtocol(cls, proto);
+        }
+        objc_registerClassPair(cls);
+        void *dlg = objcsend<void *>(objcsend<void *>(cls, "alloc"), "init");  // kept
+        objcsend<void>(mactoastcenter, "setDelegate:", dlg);
+        void (^asked)(ObjcBool, void *) = ^(ObjcBool ok, void *) {
+            if (!ok) {
+                mactoastpush(-1, "they are off for Prospero in System Settings, "
+                                 "Notifications");
+            }
+        };
+        objcsend<void>(mactoastcenter, "requestAuthorizationWithOptions:completionHandler:",
+                       (uz)(2|4), (void *)asked);  // sound, alert
+    }
+    objc_autoreleasePoolPop(pool);
+    return why;
+}
+
+// The center tells of a failure later, if at all, with the toast shown.
+static b32 mactoast(i32 id, char const *title, char const *body)
+{
+    if (!mactoastcenter) {
+        return 0;
+    }
+    void *pool = objc_autoreleasePoolPush();
+    char ident[32];
+    macident(ident, id);
+    void *content = objcsend<void *>(objcsend<void *>(objc_getClass("UNMutableNotificationContent"),
+                                                      "alloc"), "init");
+    objcsend<void>(content, "setTitle:", nsstring(title));
+    objcsend<void>(content, "setBody:", nsstring(body));
+    objcsend<void>(content, "setSound:",
+                   objcsend<void *>(objc_getClass("UNNotificationSound"), "defaultSound"));
+    void *req = objcsend<void *>(objc_getClass("UNNotificationRequest"),
+                                 "requestWithIdentifier:content:trigger:",
+                                 nsstring(ident), content, (void *)0);
+    objcsend<void>(content, "release");
+    void (^added)(void *) = ^(void *err) {
+        if (err) {
+            mactoastpush(id, "macOS refused it");
+        }
+    };
+    b32 ok = req != 0;
+    if (ok) {
+        objcsend<void>(mactoastcenter, "addNotificationRequest:withCompletionHandler:",
+                       req, (void *)added);
+    }
+    objc_autoreleasePoolPop(pool);
+    return ok;
+}
+
+static void macuntoast(i32 id)
+{
+    if (!mactoastcenter) {
+        return;
+    }
+    void *pool = objc_autoreleasePoolPush();
+    char ident[32];
+    macident(ident, id);
+    void *one = nsstring(ident);
+    void *ids = objcsend<void *>(objc_getClass("NSArray"), "arrayWithObject:", one);
+    objcsend<void>(mactoastcenter, "removeDeliveredNotificationsWithIdentifiers:", ids);
+    objcsend<void>(mactoastcenter, "removePendingNotificationRequestsWithIdentifiers:", ids);
+    objc_autoreleasePoolPop(pool);
+}
 #endif
 
 static b32 os_guiopen(Os *os, Gui *g, Str title)
@@ -635,8 +809,9 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         return 0;
     }
-    p->wakeevent = SDL_RegisterEvents(2);
-    p->trayevent = p->wakeevent + 1;
+    p->wakeevent  = SDL_RegisterEvents(3);
+    p->trayevent  = p->wakeevent + 1;
+    p->toastevent = p->wakeevent + 2;
     p->framedark = -1;
     #ifdef __APPLE__
     handlereopen(p->trayevent);
@@ -766,6 +941,13 @@ static void dispatch(Os *os, GuiSdl *p, SDL_Event *e)
         return;
     } else if (e->type == p->trayevent) {
         gui_tray(g, e->user.code);
+        return;
+    } else if (e->type == p->toastevent) {
+        if (e->user.data1) {
+            gui_toastfail(g, e->user.code, inistr((char const *)e->user.data1));
+        } else {
+            gui_toasted(g, e->user.code);
+        }
         return;
     } else if (!p->window) {
         // Shed: what is left is quitting (a signal, a logout)
@@ -922,6 +1104,47 @@ static void os_guitoken(Os *os, Str token)
 
 static void os_guiletfront(Os *, i64) {}
 
+static void os_guiflash(Os *os, i32 how)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p || !p->window || (how==FLASH_CANCEL && wayland())) {
+        return;  // Wayland's cancel would itself ask for attention
+    }
+    SDL_FlashWindow(p->window, how==FLASH_CANCEL  ? SDL_FLASH_CANCEL :
+                               how==FLASH_BRIEFLY ? SDL_FLASH_BRIEFLY :
+                                                    SDL_FLASH_UNTIL_FOCUSED);
+}
+
+static b32 os_guifocused(Os *os)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    if (!p || !p->window) {
+        return 0;
+    }
+    SDL_WindowFlags f = SDL_GetWindowFlags(p->window);
+    return (f & SDL_WINDOW_INPUT_FOCUS) && !(f & SDL_WINDOW_MINIMIZED);
+}
+
+// A toast's text as the platforms take it: valid UTF-8 without NULs,
+// what is not replaced (U+FFFD), at most max bytes, cut on a code point,
+// null-terminated.
+static char const *toastclean(Arena *a, Str s, iz max)
+{
+    Buf b(a, max+1);
+    for (iz i = 0; i < s.len;) {
+        iz  at = i;
+        i32 c  = utf8strict(s, &i);
+        Str ch = c>0 && (c<0xd800 || c>0xdfff) ? Str{s.data+at, i-at}
+                                               : Str("\xef\xbf\xbd");
+        if (b.len+ch.len > max) {
+            break;
+        }
+        print(&b, ch);
+    }
+    putbyte(&b, 0);
+    return finish(&b).cdata;
+}
+
 static i64 os_guirefresh(Os *os)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
@@ -938,6 +1161,13 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         // As a pick from its menu sends it, tray or not
         e.type      = p->trayevent;
         e.user.code = (i32)ge->x;
+        SDL_PushEvent(&e);
+        return;
+    } else if (ge->kind == GEV_TOAST) {
+        // As the platform's click or refusal sends it
+        e.type       = p->toastevent;
+        e.user.code  = (i32)ge->x;
+        e.user.data1 = ge->y!=0 ? (void *)(ge->text.len ? ge->text.cdata : "refused") : 0;
         SDL_PushEvent(&e);
         return;
     } else if (!p->window) {
@@ -1526,6 +1756,348 @@ static void showthread(void *arg)
     SDL_free(sf);
 }
 
+// Toasts through the desktop's notification server (Notify, on the
+// session bus), from a thread of their own with its own connection: the
+// GUI thread queues what to show and withdraw, waking it through a
+// pipe, and it waits on that and the bus at once. A notification
+// replaces the toast's last, by its number there; a click on it comes as
+// the server's ActionInvoked, "default", and its closing unmaps it.
+using DbusFd   = u32 (*)(void *, i32 *);
+using DbusSend = u32 (*)(void *, void *, u32 *);
+
+enum : i32 {
+    TOASTQ    = 16,  // requests queued, at most
+    TOASTLIVE = 32,  // toasts the thread knows the server's numbers of
+};
+
+struct ToastReq {
+    i32   id;
+    char *title;  // SDL_malloc'd, the body after it; null to withdraw
+    char *body;
+};
+
+struct Toaster {
+    GuiSdl      *p;
+    Lock         lock;
+    Event        wake;
+    ToastReq     q[TOASTQ];
+    i32          head;
+    i32          len;
+    i32          failed;  // atomic: the server is not there
+    i32          ids[TOASTLIVE];
+    u32          nids[TOASTLIVE];
+    b32          markup;  // the server reads the body as markup
+    DbusGet      get;
+    DbusExit     exitondisc;
+    DbusMatch    match;
+    DbusRead     read;
+    DbusPop      pop;
+    DbusIsSignal issignal;
+    DbusIterInit iterinit;
+    DbusIterNext iternext;
+    DbusIterType itertype;
+    DbusIterSub  itersub;
+    DbusIterGet  iterget;
+    DbusUnref    unref;
+    DbusFlush    flush;
+    DbusNewCall  newcall;
+    DbusIterApp  args;
+    DbusIterOpen nest;
+    DbusIterEnd  unnest;
+    DbusIterPut  put;
+    DbusCallWait callw;
+    DbusSend     send;
+    DbusFd       fd;
+};
+static Toaster *toaster;
+
+static void toasterpush(Toaster *t, i32 id, char const *why)
+{
+    SDL_Event e = {};
+    e.type       = t->p->toastevent;
+    e.user.code  = id;
+    e.user.data1 = (void *)why;
+    e.common.timestamp = SDL_GetTicksNS();
+    SDL_PushEvent(&e);
+}
+
+static i32 toasterslot(Toaster *t, i32 id, u32 nid)
+{
+    for (i32 i = 0; i < TOASTLIVE; i++) {
+        if ((id && t->ids[i]==id) || (!id && t->nids[i]==nid)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// The server's capabilities: whether it is there, and reads markup.
+static b32 toastercaps(Toaster *t, void *conn)
+{
+    void *m = t->newcall("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                         "org.freedesktop.Notifications", "GetCapabilities");
+    void *r = m ? t->callw(conn, m, 5000, 0) : 0;
+    if (m) {
+        t->unref(m);
+    }
+    if (!r) {
+        return 0;
+    }
+    DbusIter it  = {};
+    DbusIter arr = {};
+    if (t->iterinit(r, &it) && t->itertype(&it)=='a') {
+        t->itersub(&it, &arr);
+        for (b32 more = 1; more && t->itertype(&arr)=='s'; more = t->iternext(&arr)) {
+            char const *cap = 0;
+            t->iterget(&arr, &cap);
+            t->markup |= cap && !__builtin_strcmp(cap, "body-markup");
+        }
+    }
+    t->unref(r);
+    return 1;
+}
+
+// Notify, replacing the server's notification nid, if any: the new one's
+// number, 0 if refused.
+static u32 toasternotify(Toaster *t, void *conn, u32 nid, char const *title, char const *body)
+{
+    char esc[5*1024 + 1];
+    if (t->markup) {
+        iz n = 0;
+        for (char const *c = body; *c && n<(iz)sizeof(esc)-6; c++) {
+            char const *e = *c=='&' ? "&amp;" : *c=='<' ? "&lt;" : *c=='>' ? "&gt;" : 0;
+            if (!e) {
+                esc[n++] = *c;
+            }
+            for (; e && *e; e++) {
+                esc[n++] = *e;
+            }
+        }
+        esc[n] = 0;
+        body = esc;
+    }
+    void *m = t->newcall("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                         "org.freedesktop.Notifications", "Notify");
+    if (!m) {
+        return 0;
+    }
+    char const *app     = "Prospero";
+    char const *icon    = "";
+    char const *acts[]  = {"default", "Open"};
+    i32         expire  = -1;
+    DbusIter    it = {}, arr = {}, dict = {};
+    t->args(m, &it);
+    b32 ok = t->put(&it, 's', &app) && t->put(&it, 'u', &nid) && t->put(&it, 's', &icon) &&
+             t->put(&it, 's', &title) && t->put(&it, 's', &body) &&
+             t->nest(&it, 'a', "s", &arr) && t->put(&arr, 's', &acts[0]) &&
+             t->put(&arr, 's', &acts[1]) && t->unnest(&it, &arr) &&
+             t->nest(&it, 'a', "{sv}", &dict) && t->unnest(&it, &dict) &&
+             t->put(&it, 'i', &expire);
+    void *r = ok ? t->callw(conn, m, 5000, 0) : 0;
+    t->unref(m);
+    u32 got = 0;
+    if (r) {
+        DbusIter ri = {};
+        if (t->iterinit(r, &ri) && t->itertype(&ri)=='u') {
+            t->iterget(&ri, &got);
+        }
+        t->unref(r);
+    }
+    return got;
+}
+
+static void toasterclose(Toaster *t, void *conn, u32 nid)
+{
+    void *m = t->newcall("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                         "org.freedesktop.Notifications", "CloseNotification");
+    if (m) {
+        DbusIter it = {};
+        t->args(m, &it);
+        if (t->put(&it, 'u', &nid)) {
+            t->send(conn, m, 0);
+        }
+        t->unref(m);
+    }
+}
+
+// The first two arguments of a signal: a number, and a string if any.
+static u32 toasterargs(Toaster *t, void *m, char const **s)
+{
+    DbusIter it  = {};
+    u32      nid = 0;
+    *s = 0;
+    if (t->iterinit(m, &it) && t->itertype(&it)=='u') {
+        t->iterget(&it, &nid);
+        if (t->iternext(&it) && t->itertype(&it)=='s') {
+            t->iterget(&it, s);
+        }
+    }
+    return nid;
+}
+
+static void toasterthread(void *arg)
+{
+    Toaster *t    = (Toaster *)arg;
+    void    *conn = t->get(0, 0);  // the session bus, privately
+    if (!conn || !toastercaps(t, conn)) {
+        __atomic_store_n(&t->failed, 1, __ATOMIC_RELEASE);
+        toasterpush(t, -1, conn ? "no notification server answers"
+                                : "there is no session bus");
+        return;
+    }
+    t->exitondisc(conn, 0);
+    t->match(conn, "type='signal',sender='org.freedesktop.Notifications',"
+                   "path='/org/freedesktop/Notifications'", 0);
+    t->flush(conn);
+    i32 busfd = -1;
+    t->fd(conn, &busfd);
+    for (;;) {
+        ToastReq reqs[TOASTQ];
+        os_lock(&t->lock);
+        i32 n = t->len;
+        for (i32 i = 0; i < n; i++) {
+            reqs[i] = t->q[(t->head + i) % TOASTQ];
+        }
+        t->head = (t->head + n) % TOASTQ;
+        t->len  = 0;
+        os_unlock(&t->lock);
+
+        for (i32 i = 0; i < n; i++) {
+            ToastReq *r    = &reqs[i];
+            i32       slot = toasterslot(t, r->id, 0);
+            if (r->title) {
+                u32 nid = toasternotify(t, conn, slot<0 ? 0 : t->nids[slot],
+                                        r->title, r->body);
+                slot = slot<0 ? toasterslot(t, 0, 0) : slot;  // a free one
+                if (!nid) {
+                    toasterpush(t, r->id, "the notification server refused it");
+                } else if (slot >= 0) {
+                    t->ids[slot]  = r->id;
+                    t->nids[slot] = nid;
+                }
+                SDL_free(r->title);
+            } else if (slot >= 0) {
+                toasterclose(t, conn, t->nids[slot]);
+                t->ids[slot]  = 0;
+                t->nids[slot] = 0;
+            }
+        }
+        t->flush(conn);
+
+        if (!t->read(conn, 0)) {
+            return;  // the bus went away
+        }
+        for (void *m; (m = t->pop(conn));) {
+            char const *s = 0;
+            if (t->issignal(m, "org.freedesktop.Notifications", "ActionInvoked")) {
+                i32 slot = toasterslot(t, 0, toasterargs(t, m, &s));
+                if (slot>=0 && t->nids[slot] && s && !__builtin_strcmp(s, "default")) {
+                    toasterpush(t, t->ids[slot], 0);
+                }
+            } else if (t->issignal(m, "org.freedesktop.Notifications", "NotificationClosed")) {
+                i32 slot = toasterslot(t, 0, toasterargs(t, m, &s));
+                if (slot>=0 && t->nids[slot]) {
+                    t->ids[slot]  = 0;
+                    t->nids[slot] = 0;
+                }
+            }
+            t->unref(m);
+        }
+
+        struct pollfd fds[2] = {};
+        fds[0].fd     = busfd;
+        fds[0].events = POLLIN;
+        fds[1].fd     = (i32)t->wake.h[0];
+        fds[1].events = POLLIN;
+        if (poll(fds, busfd<0 ? 1 : 2, -1)<0 && errno!=EINTR) {
+            return;
+        }
+        os_wait(&t->wake, 0);  // drain the pipe
+    }
+}
+
+static Str linuxtoastprep(Os *os, GuiSdl *p)
+{
+    if (toaster) {
+        return {};
+    }
+    void *h = dlopen("libdbus-1.so.3", RTLD_NOW|RTLD_LOCAL);
+    if (!h) {
+        return "libdbus is not installed";
+    }
+    Toaster *t    = alloc<Toaster>(&p->gui->perm);
+    DbusInit init = (DbusInit)dlsym(h, "dbus_threads_init_default");
+    t->p          = p;
+    t->get        = (DbusGet)dlsym(h, "dbus_bus_get_private");
+    t->exitondisc = (DbusExit)dlsym(h, "dbus_connection_set_exit_on_disconnect");
+    t->match      = (DbusMatch)dlsym(h, "dbus_bus_add_match");
+    t->read       = (DbusRead)dlsym(h, "dbus_connection_read_write");
+    t->pop        = (DbusPop)dlsym(h, "dbus_connection_pop_message");
+    t->issignal   = (DbusIsSignal)dlsym(h, "dbus_message_is_signal");
+    t->iterinit   = (DbusIterInit)dlsym(h, "dbus_message_iter_init");
+    t->iternext   = (DbusIterNext)dlsym(h, "dbus_message_iter_next");
+    t->itertype   = (DbusIterType)dlsym(h, "dbus_message_iter_get_arg_type");
+    t->itersub    = (DbusIterSub)dlsym(h, "dbus_message_iter_recurse");
+    t->iterget    = (DbusIterGet)dlsym(h, "dbus_message_iter_get_basic");
+    t->unref      = (DbusUnref)dlsym(h, "dbus_message_unref");
+    t->flush      = (DbusFlush)dlsym(h, "dbus_connection_flush");
+    t->newcall    = (DbusNewCall)dlsym(h, "dbus_message_new_method_call");
+    t->args       = (DbusIterApp)dlsym(h, "dbus_message_iter_init_append");
+    t->nest       = (DbusIterOpen)dlsym(h, "dbus_message_iter_open_container");
+    t->unnest     = (DbusIterEnd)dlsym(h, "dbus_message_iter_close_container");
+    t->put        = (DbusIterPut)dlsym(h, "dbus_message_iter_append_basic");
+    t->callw      = (DbusCallWait)dlsym(h, "dbus_connection_send_with_reply_and_block");
+    t->send       = (DbusSend)dlsym(h, "dbus_connection_send");
+    t->fd         = (DbusFd)dlsym(h, "dbus_connection_get_unix_fd");
+    b32 ok = init && t->get && t->exitondisc && t->match && t->read && t->pop &&
+             t->issignal && t->iterinit && t->iternext && t->itertype && t->itersub &&
+             t->iterget && t->unref && t->flush && t->newcall && t->args && t->nest &&
+             t->unnest && t->put && t->callw && t->send && t->fd;
+    if (!ok || !init()) {
+        return "libdbus lacks what notifications need";
+    }
+    os_lockinit(&t->lock);
+    if (!os_eventinit(&t->wake) || !os_thread(os, toasterthread, t)) {
+        return "notifications could not start";
+    }
+    toaster = t;
+    return {};
+}
+
+// Queue a request for the thread: 0 if the queue is full, or there is
+// no server.
+static b32 linuxtoastreq(i32 id, char const *title, char const *body)
+{
+    Toaster *t = toaster;
+    if (!t || __atomic_load_n(&t->failed, __ATOMIC_ACQUIRE)) {
+        return 0;
+    }
+    ToastReq r = {id, 0, 0};
+    if (title) {
+        size_t tl = SDL_strlen(title) + 1;
+        size_t bl = SDL_strlen(body) + 1;
+        r.title = (char *)SDL_malloc(tl + bl);
+        if (!r.title) {
+            return 0;
+        }
+        r.body = r.title + tl;
+        SDL_memcpy(r.title, title, tl);
+        SDL_memcpy(r.body, body, bl);
+    }
+    os_lock(&t->lock);
+    b32 ok = t->len < TOASTQ;
+    if (ok) {
+        t->q[(t->head + t->len++) % TOASTQ] = r;
+    }
+    os_unlock(&t->lock);
+    if (!ok) {
+        SDL_free(r.title);
+        return 0;
+    }
+    os_signal(&t->wake);
+    return 1;
+}
+
 static b32 os_guishow(Os *os, Arena scratch, Str file)
 {
     iz i = file.len;
@@ -1558,6 +2130,45 @@ static b32 os_guishow(Os *os, Arena scratch, Str file)
     return os_guireveal(os, scratch, takehead(file, i>1 ? i-1 : i));
 }
 #endif
+
+static Str os_guitoastprep(Os *os, Arena *)
+{
+    GuiSdl *p = (GuiSdl *)os->gui;
+    #ifdef __APPLE__
+    mactoastevent = p->toastevent;
+    return mactoastprep();
+    #elif defined(__linux__)
+    return linuxtoastprep(os, p);
+    #else
+    (void)p;
+    return "this platform has no toasts here";
+    #endif
+}
+
+static b32 os_guitoast(Os *, Arena scratch, i32 id, Str title, Str body)
+{
+    char const *t = toastclean(&scratch, title, 256);
+    char const *m = toastclean(&scratch, body, 1024);
+    #ifdef __APPLE__
+    return mactoast(id, t, m);
+    #elif defined(__linux__)
+    return linuxtoastreq(id, t, m);
+    #else
+    (void)id, (void)t, (void)m;
+    return 0;
+    #endif
+}
+
+static void os_guiuntoast(Os *, i32 id)
+{
+    #ifdef __APPLE__
+    macuntoast(id);
+    #elif defined(__linux__)
+    linuxtoastreq(id, 0, 0);
+    #else
+    (void)id;
+    #endif
+}
 
 static void os_guiclose(Os *os)
 {

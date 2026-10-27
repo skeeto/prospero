@@ -170,6 +170,7 @@ enum : u32 {
     TASK_BROWSED,       // the new session dialog's directory, likewise
     TASK_WSL,           // the installed WSL distros, a line each (wsllist)
     TASK_MCPBACK,       // a sign-in's browser came back: its target (os_loopback)
+    TASK_TOAST,         // the background host's session stopped by itself (hosttoasts)
 };
 
 // Item rectangles the scripted checklist aims at
@@ -243,6 +244,7 @@ enum : i32 {
     RECT_DELCANCEL,
     RECT_PAGECONNECT,// a remote's page's Connect or Disconnect
     RECT_ROOTS,      // the guard page's roots field
+    RECT_NOTIFY,     // the ui page's notify field
     RECT_SESSMENU,   // the menu bar's Session menu
     RECT_ZOOMRESET,  // View's Actual size
     RECT_EDITCANCEL, // the compose box's Cancel of the editor
@@ -548,6 +550,16 @@ struct GuiSession {
     b32          gone;      // deleted: shown nowhere
     Slice<SkillItem> skills;  // what /name invokes, as its engine lists them
     i64          skillsid;  // that list's skills in flight, 0 if none
+    // Desktop notifications (toastpass): its history, as of its open, its
+    // records up to histseq (else written by histts) being no news; the
+    // last ask and turn end judged, by record; and a root's toast
+    i64          histseq;
+    i64          histts;
+    i64          askmark;
+    i64          endmark;
+    i32          toastid;   // its toasts' id, given as the first is shown
+    i32          toastkind; // TOAST_*: what the one out tells of
+    GuiSession  *toastsel;  // what a click on it selects, under it
 };
 
 // A command awaiting its reply.
@@ -1229,6 +1241,22 @@ struct Gui {
     Str                revealed;   // the file guishow showed last, for
     i64                reveals;    //   the checklist, and how many
     b32                realreveal; // the checklist's show the file manager
+    // Desktop notifications ([ui] notify, toastpass)
+    u32                notify;     // NOTIFY_*
+    i32                toastids;   // the last id given a root
+    b32                toastprep;  // the platform made ready
+    Str                toastwhy;   // the latest refusal, said in the log
+    i64                toastclicks;  // for the checklist: clicked
+    i32                drivefocus; // checklist: 1 focused, 2 not, 0 as it is
+    b32                realtoast;  // the checklist's show them (PROSPERO_TEST_TOAST)
+    i64                toastsshown;  // for the checklist: toasts shown,
+    i64                drivetoasts;  //   as at OP_TOASTMARK,
+    i64                drivegone;    //   and withdrawn then
+    i64                toastsgone;   //   withdrawn,
+    i64                toastsflash;  //   and attention asked for instead
+    i32                toastlast;  // the latest's id,
+    Str                toasthead;  //   title,
+    Str                toastbody;  //   and text
     // MCP servers, as the main host's engine has them, for their pages
     // in Settings (mcp), and a sign-in to one under way
     Region            *mcpmem;     // the listing's, made anew each time
@@ -3456,6 +3484,7 @@ static void setcfgstr(Gui *g, Str *dst, CfgRow r)
 }
 
 static void wslremotes(Gui *);
+static void setnotify(Gui *, u32);
 
 // The settings window's rows, from a config.get reply line, and the
 // theme they set.
@@ -3516,6 +3545,8 @@ static void loadcfg(Gui *g, Str line)
             setcfgstr(g, &g->editor, r);
         } else if (r.kind=="ui" && r.key=="terminal") {
             setcfgstr(g, &g->terminal, r);
+        } else if (r.kind=="ui" && r.key=="notify") {
+            setnotify(g, notifyparse(r.valid && r.value.len ? r.value : r.dflt));
         } else if (r.kind=="tools" && r.key=="path_prepend") {
             setcfgstr(g, &g->pathpre, r);
         } else if (r.kind=="tools" && r.key=="path_append") {
@@ -4249,6 +4280,8 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             return;
         }
         s->openid = 0;
+        s->histseq = jsonint(jsonget(j, "lastseq"), 0);  // toasts tell of none
+        s->histts  = r->ts;
         if (s->view) {
             // The engine here replays before it replies. A host replays
             // after, from the log, which may skip numbers (an import
@@ -6709,6 +6742,8 @@ static void updatestatus(Gui *g, GuiHost *h, b32 idle)
 
 static void fieldput(char *, Str);
 
+static void toastbg(Gui *, Str);
+
 // What another thread finished: a save or open dialog answered, a
 // deployment's progress and outcome, a launch that handed off to this
 // window.
@@ -6754,6 +6789,9 @@ static void ontask(Gui *g, Record r)
         return;
     case TASK_MCPBACK:
         mcpback(g, r);
+        return;
+    case TASK_TOAST:
+        toastbg(g, r.data);
         return;
     case HTTP_HEAD:
     case HTTP_BODY:
@@ -6945,6 +6983,314 @@ static void hostthread(void *arg)
     os_wake(g->os);
 }
 
+// Desktop notifications ([ui] notify): a toast when a session wants the
+// user while they look elsewhere, at an ask waiting for an answer, and
+// at a session stopped by itself (finished, failed, or out of budget,
+// never cancelled), its next turn not begun. One toast at a time tells
+// of a root and its subagents, under the root's id, a newer replacing
+// it; a click brings the window to the session; and it is withdrawn
+// once moot: the asks answered, the session at work again, or shown in
+// the window in front. What the view's records were as the session
+// opened is history, told of by nobody; and what the user sees now is
+// news to nobody. The checklist only notes toasts, and the platform's
+// clicks, but with PROSPERO_TEST_TOAST.
+enum {
+    TOAST_NONE,
+    TOAST_ASK,
+    TOAST_DONE,
+};
+
+static void gui_tray(Gui *, i32);
+
+// Whether a record of s, by its seq and epoch ms ts, was history as s
+// was opened: the replay before an open's reply, else what the reply
+// says it had (lastseq), else what was written by then. A subagent
+// opened by way of its root's records goes by the root's open.
+static b32 toasthistory(GuiSession *s, GuiSession *root, i64 seq, i64 ts)
+{
+    if (s->openid || root->openid) {
+        return 1;
+    } else if (s->histseq) {
+        return seq <= s->histseq;
+    }
+    i64 by = s->histts>root->histts ? s->histts : root->histts;
+    return ts <= by;
+}
+
+// Whether the user sees root's sessions now: the window has the focus,
+// and shows one of them.
+static b32 toastlooking(Gui *g, GuiSession *root)
+{
+    b32 focused = g->drivefocus ? g->drivefocus==1 : os_guifocused(g->os);
+    return focused && !g->sched.minimized && !g->bg && g->sess &&
+           sessroot(g, g->sess)==root;
+}
+
+// The asks waiting for the user in root's tree, not history nor as good
+// as denied, at epoch ms now: how many, and the latest one's session
+// and ask, if wanted.
+static i32 toastasks(Gui *g, GuiSession *root, i64 now, GuiSession **who, ViewTool **ask)
+{
+    i32 n      = 0;
+    i64 latest = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        View *v = s->view;
+        if (!v || !v->asks || s->readonly || s->gone || sessroot(g, s)!=root) {
+            continue;
+        }
+        i32 left = v->asks;
+        for (iz i = v->msgs.len-1; i>=0 && left; i--) {
+            ViewTool *t = v->msgs[i].tool;
+            if (v->msgs[i].role!=VIEW_ASK || !t || t->answer!=VASK_PENDING) {
+                continue;
+            }
+            left--;
+            i64 seq = v->msgs[i].seq;
+            if ((t->deadline && t->deadline<=now) ||
+                    s->openid || (s->histseq && seq<=s->histseq)) {
+                continue;  // denied any moment, or left over in history
+            }
+            n++;
+            if (seq > latest) {
+                latest = seq;
+                if (who) *who = s;
+                if (ask) *ask = t;
+            }
+        }
+    }
+    return n;
+}
+
+// A refusal: said once in the log for each cause.
+static void toastrefused(Gui *g, Str why)
+{
+    if (why != g->toastwhy) {
+        g->toastwhy = clone(&g->perm, why);
+        guilog(g, concat(&g->frame, "desktop notifications: ", g->toastwhy));
+    }
+}
+
+// Make the platform ready for toasts, once they are wanted.
+static void toastready(Gui *g)
+{
+    if (g->toastprep || !g->notify || (g->drive && !g->realtoast)) {
+        return;
+    }
+    g->toastprep = 1;
+    Arena a   = g->frame;
+    Str   why = os_guitoastprep(g->os, &a);
+    if (why.len) {
+        toastrefused(g, why);
+    }
+}
+
+// Tell of root by a toast of kind, or, where none can be shown, by
+// asking for attention: until the window has the focus for an ask.
+static void toastshow(Gui *g, Arena scratch, GuiSession *root, i32 kind, Str title, Str body)
+{
+    root->toastid   = root->toastid ? root->toastid : ++g->toastids;
+    root->toastkind = kind;
+    g->toastsshown++;
+    g->toastlast = root->toastid;
+    if (g->drive) {
+        g->toasthead = clone(&g->perm, title);
+        g->toastbody = clone(&g->perm, body);
+        guilog(g, concat(&scratch, concat(&scratch, concat(&scratch, "toast: ", title), " | "), body));
+        if (!g->realtoast) {
+            return;
+        }
+    }
+    if (!os_guitoast(g->os, scratch, root->toastid, title, body)) {
+        g->toastsflash++;
+        os_guiflash(g->os, kind==TOAST_ASK ? FLASH_UNTILFOCUSED : FLASH_BRIEFLY);
+    } else if (HOST_WINDOWS && kind==TOAST_ASK) {
+        // Windows 11 keeps no balloon once it goes: the taskbar's button
+        // tells of the ask until it is answered
+        os_guiflash(g->os, FLASH_UNTILFOCUSED);
+    }
+}
+
+// Withdraw root's toast, if one is out.
+static void toastgone(Gui *g, GuiSession *root)
+{
+    if (!root->toastkind) {
+        return;
+    }
+    root->toastkind = TOAST_NONE;
+    root->toastsel  = 0;
+    g->toastsgone++;
+    if (!g->drive || g->realtoast) {
+        os_guiuntoast(g->os, root->toastid);
+    }
+}
+
+static void toastclear(Gui *g)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        toastgone(g, s);
+    }
+}
+
+// Whether a subagent of root is at work.
+static b32 kidsbusy(Gui *g, GuiSession *root)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s!=root && s->view && s->view->busy && !s->gone && sessroot(g, s)==root) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// After the mail: toasts for the asks and turn ends news to the user,
+// and none for those moot.
+static void toastpass(Gui *g)
+{
+    i64 now = os_time(g->os);
+    // First those out, which may be moot now
+    for (GuiSession *r = g->sessions; r; r = r->next) {
+        if (!r->toastkind) {
+            continue;
+        }
+        b32 moot = r->gone || toastlooking(g, r);
+        if (r->toastkind == TOAST_ASK) {
+            moot |= !(g->notify & NOTIFY_ALLOW) || !toastasks(g, r, now, 0, 0);
+        } else {
+            moot |= !(g->notify & NOTIFY_DONE) || (r->view && r->view->busy);
+        }
+        if (moot) {
+            toastgone(g, r);
+        }
+    }
+
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        View *v = s->view;
+        if (!v || (v->askseq<=s->askmark && v->endseq<=s->endmark)) {
+            continue;
+        }
+        GuiSession *root = sessroot(g, s);
+        if (v->askseq > s->askmark) {
+            s->askmark = v->askseq;
+            ViewMsg  *m = v->askmsg<v->msgs.len ? &v->msgs[v->askmsg] : 0;
+            ViewTool *t = m && m->seq==v->askseq ? m->tool : 0;
+            b32 news = t && t->answer==VASK_PENDING && !s->readonly &&
+                       (g->notify & NOTIFY_ALLOW) &&
+                       !(t->deadline && t->deadline-v->askts<2000) &&
+                       !toasthistory(s, root, v->askseq, v->askts);
+            if (news && !toastlooking(g, root)) {
+                Arena       a   = g->frame;
+                GuiSession *who = s;
+                ViewTool   *ask = t;
+                i32         n   = toastasks(g, root, now, &who, &ask);
+                Str by = who==root ? Str{} : toasttitle(&a, who->view, who->title);
+                Str ti = toasttitle(&a, root->view ? root->view : v, root->title);
+                Str bo = toastaskbody(&a, ask, by, n, now);
+                toastshow(g, a, root, TOAST_ASK, ti, bo);
+                root->toastsel = who;
+            }
+        }
+        if (v->endseq > s->endmark) {
+            s->endmark = v->endseq;
+            b32 news = !v->parent.len && !s->readonly && (g->notify & NOTIFY_DONE) &&
+                       v->endwhy!=END_OTHER && !v->endcompact && !v->endresume &&
+                       !v->busy && !v->queue.len && !v->asks &&
+                       !toasthistory(s, s, v->endseq, v->endts);
+            if (news && !kidsbusy(g, s) && !toastasks(g, s, now, 0, 0) && !toastlooking(g, s)) {
+                Arena a  = g->frame;
+                Str   ti = toasttitle(&a, v, s->title);
+                Str   bo = toastdonebody(&a, v);
+                toastshow(g, a, s, TOAST_DONE, ti, bo);
+            }
+        }
+    }
+}
+
+// Each frame: the shown session's toast goes once the user sees it.
+static void toastlook(Gui *g)
+{
+    GuiSession *root = g->sess ? sessroot(g, g->sess) : 0;
+    if (root && root->toastkind && toastlooking(g, root)) {
+        toastgone(g, root);
+    }
+}
+
+// A toast clicked: the window, on the session it told of, the one that
+// asks if any still does.
+static void gui_toasted(Gui *g, i32 id)
+{
+    GuiSession *root = 0;
+    for (GuiSession *s = g->sessions; s && !root; s = s->next) {
+        root = s->toastid==id ? s : 0;
+    }
+    if (!root) {
+        return;
+    }
+    GuiSession *sel = root;
+    if (root->toastkind == TOAST_ASK) {
+        GuiSession *who = root->toastsel;
+        if (toastasks(g, root, os_time(g->os), &who, 0)) {
+            sel = who;
+        }
+    }
+    toastgone(g, root);
+    g->toastclicks++;
+    guilog(g, "a toast was clicked: to its session");
+    gui_tray(g, TRAY_OPEN);  // back from the background, or raised
+    if (!sel->gone) {
+        guiselect(g, sel);
+    }
+    scheddirty(&g->sched);
+}
+
+// A toast refused after it was shown (id), or all of them (id -1): the
+// user turned them off, or nothing shows them here.
+static void gui_toastfail(Gui *g, i32 id, Str why)
+{
+    toastrefused(g, why);
+    for (GuiSession *s = g->sessions; s && id>0; s = s->next) {
+        if (s->toastid==id && s->toastkind) {
+            g->toastsflash++;
+            os_guiflash(g->os, s->toastkind==TOAST_ASK ? FLASH_UNTILFOCUSED : FLASH_BRIEFLY);
+        }
+    }
+}
+
+// While the window is gone (shed), the host tells of a session that
+// stopped by itself ("SID\nWHY\nSEQ\nTEXT"): a toast, whose click brings
+// the window back on it. The turn's end is marked as told of, so that
+// the window, back, does not tell of it again.
+static void toastbg(Gui *g, Str msg)
+{
+    Cut sid  = cut(msg, '\n');
+    Cut why  = cut(sid.tail, '\n');
+    Cut seq  = cut(why.tail, '\n');
+    Str text = seq.tail;
+    GuiSession *s = 0;
+    for (GuiSession *k = g->sessions; k && !s; k = k->next) {
+        s = k->sid==sid.head && !k->gone ? k : 0;
+    }
+    if (!s || !g->bg || !(g->notify & NOTIFY_DONE)) {
+        return;
+    }
+    Int n = parseint(seq.head);
+    s->endmark = n.ok && n.val>s->endmark ? n.val : s->endmark;
+    Arena a  = g->frame;
+    Str   ti = s->view ? toasttitle(&a, s->view, s->title)
+                       : s->title.len ? s->title : Str("Prospero");
+    Str   bo = why.head=="budget" ? Str("Stopped at the step budget") :
+               why.head=="error"  ? (text.len ? concat(&a, "Stopped: ", text)
+                                              : Str("Stopped by an error")) :
+               text.len           ? text : Str("Finished");
+    toastshow(g, a, s, TOAST_DONE, ti, bo);
+}
+
+// [ui] notify, as read or set
+static void setnotify(Gui *g, u32 notify)
+{
+    g->notify = notify;
+    toastready(g);
+}
+
 // The window goes, and the tray icon stays, if there is one. Never from
 // inside a frame (shedlater).
 static void shed(Gui *g)
@@ -6954,6 +7300,7 @@ static void shed(Gui *g)
     }
     saveini(g, 0);
     flushdeltas(g);
+    toastclear(g);  // its asks are denied now, unattended
     g->bg     = 1;
     g->shedat = g->total.frames;
     schedminimize(&g->sched, 1);  // no frames, whatever is owed or busy
@@ -6981,6 +7328,11 @@ static b32 gobackground(Gui *g)
         hc.idle     = g->hostidle ? g->hostidle : hostticks(g->config, "idle_exit");
         hc.firstid  = g->nextid + (1<<20);
         hc.held     = -1;
+        if (g->notify & NOTIFY_DONE) {
+            hc.toasts     = g->tasks;
+            hc.toasttype  = TASK_TOAST;
+            hc.toastsince = os_time(g->os);
+        }
         Arena hp = newarena(os_reserve(g->os, (iz)1<<30));
         g->host  = hp.beg ? newhost(g->os, &hp, g->frame, &hc, &why) : 0;
         why      = g->host ? Str{} : why.len ? why : Str("out of memory");
@@ -7758,6 +8110,7 @@ static void drainmail(Gui *g, i64 now)
         enginestopped(g);
     }
     kidsweep(g);  // subagents on other hosts, as the records name them
+    toastpass(g);
     if (g->drive && g->drivewait && drivewaitdone(g)) {
         other = 1;
     }
@@ -8366,6 +8719,7 @@ static void gui_frame(Gui *g)
     if (!schedbegin(s)) {
         return;
     }
+    toastlook(g);
     i64 t0 = s->now;
     g->frame.beg = g->framebase;
     if (g->exp.want) {
@@ -8956,6 +9310,10 @@ enum : i32 {
     OP_CLOSEMAIN, // close the session the checklist made, as Close does
     OP_FLOAT,     // float the pane named text, dx by dy, centered; dx 0
                   // docks it back where it was before it first floated
+    OP_FOCUS,     // the window has the focus as dx says: 1 it does, 2 not
+    OP_NOTIFY,    // [ui] notify is dx (NOTIFY_*), as a setting would
+    OP_TOASTMARK, // remember the toasts shown and withdrawn so far
+    OP_TOASTCLICK,// click the latest toast, which gives the window focus
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -9038,6 +9396,7 @@ enum : i32 {
     T_DELOK,       // its confirmation's Delete and Cancel
     T_DELCANCEL,
     T_ROOTS,       // the guard page's roots field
+    T_NOTIFY,      // the ui page's notify field
     T_SPLITFROM,   // where the dock splitter was before the first drag
     T_SESSMENU,    // the menu bar's Session menu
     T_ZOOMRESET,   // View's Actual size
@@ -9329,6 +9688,12 @@ enum : i32 {
                       // saying that its asks are denied
     CHK_FARSHOWN,     // the subagent on far is shown, linked to its parent
     CHK_FARCLOSED,    // the parent closed, and its subagents' views on far
+    CHK_TOAST,        // a toast since OP_TOASTMARK, the latest with text in
+                      // its title or body
+    CHK_NOTOAST,      // no toast since OP_TOASTMARK
+    CHK_UNTOASTED,    // the latest toast was withdrawn
+    CHK_TOASTSEL,     // its click showed a subagent (dx 1) or a root (0)
+    CHK_NOTIFY,       // [ui] notify is dx
     CHK_COUNT,
 };
 
@@ -9560,6 +9925,9 @@ static Str chknames[] = {
     "a host the user disconnected stays so, the task row saying so",
     "Open subagent connected again and showed it, linked to its parent",
     "closing the parent closed its subagent's view on far",
+    "a toast told of it", "no toast told of anything",
+    "the toast was withdrawn", "the toast's click showed its session",
+    "[ui] notify is as set",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -9629,6 +9997,7 @@ enum : i32 {
     W_MCPSIGNED,  // a sign-in to an MCP server ended
     W_FARKID,     // the latest subagent on far is open here, at work
     W_FARSHOWN,   // a session on far is shown, open, its replay applied
+    W_TOAST,      // a toast since OP_TOASTMARK
 };
 
 static Str waitnames[] = {
@@ -9649,9 +10018,9 @@ static Str waitnames[] = {
     "the WSL distro's section", "the dialog's host's models",
     "the named remote to come up", "the named remote to close",
     "the named remote's update", "the MCP server's state", "the MCP sign-in",
-    "the subagent on far", "the subagent on far shown",
+    "the subagent on far", "the subagent on far shown", "a toast",
 };
-static_assert(countof(waitnames) == W_FARSHOWN+1);
+static_assert(countof(waitnames) == W_TOAST+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -10339,17 +10708,30 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_GAUGE, 0, 0, 1500, ""},
     {OP_SHOT, 0, 0, 0, 300, "24-gauge"},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
-    // An ask, allowed through its card
+    // An ask, allowed through its card, while the window has no focus:
+    // a toast tells of it, withdrawn as it is allowed, and another of
+    // the turn's end, withdrawn once the window has the focus again
+    {OP_FOCUS, 0, 2, 0, 0, ""},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Write outside the workspace, ask, and be allowed."},
     {OP_WAIT, W_ASK, 0, 0, 10000, ""},
+    {OP_WAIT, W_TOAST, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "Allow write "},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "s unless allowed"},
     {OP_MARK, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_ASKCARD, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "2-ask"},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_MOVE, T_ALLOW, 0, 0, 200, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_CHECK, CHK_ASKALLOWED, 0, 0, 0, ""},
+    {OP_WAIT, W_TOAST, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "Written outside, as allowed."},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
+    {OP_FOCUS, 0, 1, 0, 300, ""},
+    {OP_CHECK, CHK_UNTOASTED, 0, 0, 0, ""},
     // An ask allowed for good through its Always button, past a rule
     // from Allow: a directory of its own (tests/gui.py), so that later
     // asks still ask, written twice with one ask
@@ -10365,14 +10747,25 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_ALWAYSPATH, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "2-allowedalways"},
     // An ask nobody answers, denied at its deadline, its countdown
-    // drawn by deadlines alone
+    // drawn by deadlines alone; its toast goes with it, the window
+    // minimized meanwhile (as far as toasts go)
+    {OP_FOCUS, 0, 2, 0, 0, ""},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Write outside the workspace, ask, and wait for nobody."},
     {OP_WAIT, W_ASK, 0, 0, 10000, ""},
+    {OP_WAIT, W_TOAST, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "Allow write "},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
     {OP_MARK, 0, 0, 0, 0, ""},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     {OP_IDLE, 0, 0, 0, 0, "an ask counting down to its deadline"},
     {OP_CHECK, CHK_ASKTIMEOUT, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "Denied, so I wrote inside.txt"},
+    {OP_FOCUS, 0, 1, 0, 300, ""},
+    {OP_CHECK, CHK_UNTOASTED, 0, 0, 0, ""},
+    // The window focused on the session at work: nothing to tell
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     // Sending while a turn runs steers it
     {OP_PROMPT, 0, 0, 0, 100, "Steer me: run a slow command, then answer."},
     {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
@@ -10384,8 +10777,10 @@ static DriveOp m3ops[] = {
     {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     {OP_CHECK, CHK_STEERED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOTOAST, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "3-steer"},
-    // A second session streams while the first is shown again
+    // A second session streams while the first is shown again, focused:
+    // a toast tells of its end, until it is shown
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_PROMPT, 0, 0, 0, 500, "Stream slowly for a while."},
@@ -10395,6 +10790,13 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_SWITCHED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "6-sessions"},
     {OP_WAIT, W_ALLIDLE, 0, 0, 20000, ""},
+    {OP_WAIT, W_TOAST, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "slow0 slow1 "},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
+    {OP_TOASTCLICK, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TOASTSEL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_UNTOASTED, 0, 0, 0, ""},
+    {OP_MAIN, 0, 0, 0, 500, ""},
     // M4, in the light theme first. Two subagents, counted at work in
     // their parent's strip, then listed under it; the parent's task row
     // shows one, and the subagent's own link goes back
@@ -10430,14 +10832,18 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
-    // A subagent asks: its parent's row and task row say so, and the
-    // task row leads to its card, answered before the deadline
+    // A subagent asks while the window has no focus: its parent's row
+    // and task row say so, and the toast, under the parent's title,
+    // leads to its card, answered before the deadline
+    {OP_FOCUS, 0, 2, 0, 0, ""},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 0, "Start a subagent that asks."},
     {OP_WAIT, W_KIDASK, 0, 0, 10000, ""},
     {OP_CHECK, CHK_KIDASK, 0, 0, 0, ""},
-    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
-    {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_WAIT, W_TOAST, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, ": Allow write "},
+    {OP_TOASTCLICK, 0, 0, 0, 400, ""},
+    {OP_CHECK, CHK_TOASTSEL, 1, 0, 0, ""},
     {OP_WAIT, W_ASK, 0, 0, 2000, ""},
     {OP_MOVE, T_ALLOW, 0, 0, 150, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -10604,6 +11010,8 @@ static DriveOp m3ops[] = {
     {OP_MAIN, 0, 0, 0, 500, ""},
     // Esc abandons an edit in a settings field, leaving the turn alone,
     // and from the session's own windows cancels the turn mid-tool
+    {OP_FOCUS, 0, 2, 0, 0, ""},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Cancel me: run a very slow command."},
     {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
     {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
@@ -10633,13 +11041,18 @@ static DriveOp m3ops[] = {
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_CHECK, CHK_CANCELLED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOTOAST, 0, 0, 0, ""},  // the user stopped it
     // Records lost to a full inbox (--inbox-cap): held while a fast
-    // stream fills it, then resynced from the log
+    // stream fills it, then resynced from the log; with toasts off
+    {OP_NOTIFY, 0, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Stream fast."},
     {OP_HOLD, 0, 3000, 0, 3200, ""},
     {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
     {OP_CHECK, CHK_OVERFLOWED, 0, 0, 0, ""},
     {OP_CHECK, CHK_RESYNC, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOTOAST, 0, 0, 0, ""},
+    {OP_NOTIFY, 0, NOTIFY_ALLOW|NOTIFY_DONE, 0, 0, ""},
+    {OP_FOCUS, 0, 1, 0, 0, ""},
     // A settings edit: one line of the file changes
     {OP_SNAPCFG, 0, 0, 0, 100, ""},
     {OP_MOVE, T_SETTINGSTAB, 0, 0, 100, ""},
@@ -11039,6 +11452,18 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_THEMEQUIET, 0, 0, 0, ""},
     {OP_SYSTHEME, 0, -1, 0, 300, ""},
     {OP_CHECK, CHK_NOSTALE, 0, 0, 0, ""},
+    // Toasts for asks alone, typed over the default's hint
+    {OP_CHECK, CHK_NOTIFY, NOTIFY_ALLOW|NOTIFY_DONE, 0, 0, ""},
+    {OP_REVEAL, RECT_NOTIFY, 0, 0, 500, ""},
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_NOTIFY, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "allow"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_NOTIFY, NOTIFY_ALLOW, 0, 0, ""},
     // The guard's roots, one a line, saved as the field is left
     {OP_SHOWPAGE, 0, 0, 0, 300, "guard"},
     {OP_MOVE, T_PAGEITEM, 0, 0, 100, "guard"},
@@ -11181,6 +11606,10 @@ static DriveOp sessionsops[] = {
     {OP_PROMPT, 0, 0, 0, 100, "Start subagents."},
     {OP_WAIT, W_SAID, 0, 0, 20000, "Both"},
     {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
+    // Sessions opened, forked and imported tell of nothing in their
+    // history, though the window has no focus (toasts)
+    {OP_FOCUS, 0, 2, 0, 0, ""},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     // The tree: this computer and the remote, the hidden one left out,
     // the subagents under their parent
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "H this\n S Start subagents.\n  S "},
@@ -11435,6 +11864,8 @@ static DriveOp sessionsops[] = {
     {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Say hello."},
     {OP_CHECK, CHK_MODEL, 0, 0, 0, "fake:gui_b:"},
     {OP_SHOT, 0, 0, 0, 300, "sessions-imported"},
+    {OP_CHECK, CHK_NOTOAST, 0, 0, 0, ""},
+    {OP_FOCUS, 0, 1, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Say hello again."},
     {OP_WAIT, W_SAID, 0, 0, 10000, "Hello"},
     {OP_CHECK, CHK_LASTUSER, 0, 0, 0, "Say hello again."},
@@ -11483,12 +11914,19 @@ static DriveOp stopops[] = {
     {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
     {OP_NEWSESSION, 0, 0, 0, 500, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_FOCUS, 0, 2, 0, 0, ""},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Write outside the workspace, ask, and wait for nobody."},
     {OP_WAIT, W_ASK, 0, 0, 10000, ""},
+    {OP_WAIT, W_TOAST, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "Allow write "},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_KILLENGINE, 0, 0, 0, 0, ""},
     {OP_WAIT, W_GONE, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_ENGINESTOPPED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_UNTOASTED, 0, 0, 0, ""},  // its ask is moot
+    {OP_CHECK, CHK_NOTOAST, 0, 0, 0, ""},    // and the stop no news
     {OP_SHOT, 0, 0, 0, 300, "stopped"},
     {OP_MARK, 0, 0, 0, 2000, ""},
     {OP_IDLE, 0, 0, 0, 0, "2 s after the engine stopped"},
@@ -11507,8 +11945,10 @@ static DriveOp stopops[] = {
 // key, until tests/gui.py launches the GUI again on that state directory,
 // which hands off to this process and exits: the window comes back, a
 // client of its own host, showing the turn finished. Another launch,
-// and the tray's Open, then raise it. A new session there starts a
-// turn, and closing the window leaves the host and the turn running;
+// and the tray's Open, then raise it. Each turn that ends while the
+// window is gone is told of by a toast. A new session there starts a
+// turn, which ends with the window closed, and its toast's click brings
+// the window back; closed again, the host and another turn run on, and
 // the tray's Stop all stops the turn, and the host, with nothing to do,
 // ends this process after its idle time (--host-idle). Light first,
 // then dark.
@@ -11524,6 +11964,7 @@ static DriveOp bgops[] = {
     {OP_CHECK, CHK_SESSION, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Stream in the background."},
     {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_GEOMMARK, 0, 0, 0, 0, ""},
     {OP_MARK, 0, 0, 0, 800, ""},
     {OP_CLOSE, 0, 0, 0, 1000, ""},
@@ -11552,6 +11993,8 @@ static DriveOp bgops[] = {
     {OP_CHECK, CHK_SHEDQUIET, 0, 0, 0, ""},
     {OP_CHECK, CHK_GEOMKEPT, 0, 0, 0, ""},
     {OP_CHECK, CHK_BGDONE, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "bg0 bg1 "},  // told of while gone
+    {OP_CHECK, CHK_UNTOASTED, 0, 0, 0, ""},      // and shown now
     {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "bg-3-reopened"},
     {OP_TRAY, 0, TRAY_OPEN, 0, 1000, ""},  // shown already: raised
@@ -11569,10 +12012,24 @@ static DriveOp bgops[] = {
     {OP_CHECK, CHK_OWNNEW, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Stream slowly for a while."},
     {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
-    // Closing the window of a host: it goes, the host and the turn stay,
-    // until the tray stops it all; then the host has nothing to do, and
-    // ends after its idle time (tests/gui.py gives it 20 s), as does this
-    // process
+    // Closing the window of a host: it goes, the host and the turn stay.
+    // The turn ends with the window gone, told of by a toast, whose
+    // click brings the window back on the session
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
+    {OP_CLOSE, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SHED, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_SHED, 0, 0, 0, ""},
+    {OP_WAIT, W_TOAST, 0, 0, 15000, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "slow0 slow1 "},
+    {OP_TOASTCLICK, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_REOPENED, 0, 0, 15000, ""},
+    {OP_CHECK, CHK_TOASTSEL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_UNTOASTED, 0, 0, 0, ""},
+    // Closed again with a turn running, until the tray stops it all;
+    // then the host has nothing to do, and ends after its idle time
+    // (tests/gui.py gives it 20 s), as does this process
+    {OP_PROMPT, 0, 0, 0, 100, "Stream slowly for a while."},
+    {OP_WAIT, W_STREAMING, 0, 0, 10000, ""},
     {OP_CLOSE, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SHED, 0, 0, 10000, ""},
     {OP_CHECK, CHK_SHED, 0, 0, 0, ""},
@@ -12054,10 +12511,15 @@ static DriveOp planops[] = {
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_WAIT, W_NAMED, 0, 0, 10000, "plan chip"},
     {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
+    {OP_FOCUS, 0, 2, 0, 0, ""},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 200, "Make inside.txt."},
     {OP_WAIT, W_ASK, 0, 0, 30000, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_PLANASK, 0, 0, 0, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "Approve the plan?\nWaiting for you"},
+    {OP_FOCUS, 0, 1, 0, 300, ""},
+    {OP_CHECK, CHK_UNTOASTED, 0, 0, 0, ""},
     // The chip shows the Plan window, beside the todo list
     {OP_MOVE, T_NAMED, 0, 0, 100, "plan chip"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -12888,6 +13350,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_DELOK:         return rectcenter(g->rects[RECT_DELOK]);
     case T_DELCANCEL:     return rectcenter(g->rects[RECT_DELCANCEL]);
     case T_ROOTS:         return rectcenter(g->rects[RECT_ROOTS]);
+    case T_NOTIFY:        return rectcenter(g->rects[RECT_NOTIFY]);
     case T_SPLITFROM:     return v2(g->splitx, targetpos(g, T_SPLITTER).y);
     case T_PAGEITEM:
     case T_ADDOPEN: {
@@ -13450,6 +13913,8 @@ static b32 drivewaitdone(Gui *g)
         return !g->bg && !g->raisereq && g->raises>=(i32)g->ops[g->drivepc-1].dx;
     case W_SHED:
         return g->bg;
+    case W_TOAST:
+        return g->toastsshown > g->drivetoasts;
     case W_REOPENED:
         return !g->bg && g->main->own && g->main->up && g->sess &&
                g->sess->host==g->main && !g->sess->openid;
@@ -15027,6 +15492,28 @@ static b32 drivecheck(Gui *g, i32 chk)
                !g->edreq.len && planask(v)<0;
     case CHK_PLANQUIET:
         return g->sess && !v->busy && !v->asks;
+    case CHK_TOAST: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        Arena    a  = g->frame;
+        Str      t  = concat(&a, concat(&a, g->toasthead, "\n"), g->toastbody);
+        return g->toastsshown>g->drivetoasts && find(t, op->text)>=0;
+    }
+    case CHK_NOTOAST:
+        return g->toastsshown == g->drivetoasts;
+    case CHK_UNTOASTED: {
+        b32 out = 0;
+        for (GuiSession *s = g->sessions; s; s = s->next) {
+            out |= s->toastid==g->toastlast && s->toastkind;
+        }
+        return g->toastlast && g->toastsgone>g->drivegone && !out;
+    }
+    case CHK_TOASTSEL: {
+        DriveOp *op = &g->ops[g->drivepc-1];
+        return g->toastclicks && g->sess && v &&
+               (v->parent.len!=0) == (op->dx!=0);
+    }
+    case CHK_NOTIFY:
+        return g->notify == (u32)g->ops[g->drivepc-1].dx;
     case CHK_TERMRAN: {
         DriveOp *op = &g->ops[g->drivepc-1];
         Arena    a  = g->frame;
@@ -15980,6 +16467,22 @@ static void drivestep(Gui *g)
         e.x    = op->dx;
         os_guiinject(g->os, &e);
         break;
+    case OP_FOCUS:
+        g->drivefocus = (i32)op->dx;
+        break;
+    case OP_NOTIFY:
+        setnotify(g, (u32)op->dx);
+        break;
+    case OP_TOASTMARK:
+        g->drivetoasts = g->toastsshown;
+        g->drivegone   = g->toastsgone;
+        break;
+    case OP_TOASTCLICK:
+        g->drivefocus = 1;  // as the window comes forward
+        e.kind = GEV_TOAST;
+        e.x    = (f32)g->toastlast;
+        os_guiinject(g->os, &e);
+        break;
     case OP_DROPLINK:
         if (g->sess && g->sess->host->r) {
             guilog(g, "drive: dropping the link to the session's host");
@@ -16300,6 +16803,7 @@ static Str cstrclone(Arena *a, Str s)
 // latter leaves that to the engine. The fake agent has none.
 static void readconfig(Gui *g, Arena scratch)
 {
+    g->notify = NOTIFY_ALLOW | NOTIFY_DONE;  // [ui] notify, unless read
     if (g->enginekind == ENGINE_FAKE) {
         return;
     }
@@ -16320,6 +16824,7 @@ static void readconfig(Gui *g, Arena scratch)
     setfontbase(g, cfgget(cfg, "ui", "", "font_size", 0));
     g->editor     = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
     g->terminal   = clone(&g->perm, cfgget(cfg, "ui", "", "terminal", 0));
+    g->notify     = notifyparse(cfgget(cfg, "ui", "", "notify", 0));
     g->pathpre    = clone(&g->perm, cfgget(cfg, "tools", "", "path_prepend", 0));
     g->pathpost   = clone(&g->perm, cfgget(cfg, "tools", "", "path_append", 0));
     g->configured = cfgconfigured(cfg);
@@ -16614,6 +17119,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     {
         Arena a = g->frame;
         g->realreveal = g->drive && os_getenv(os, &a, "PROSPERO_TEST_REVEAL").len;
+        g->realtoast  = g->drive && os_getenv(os, &a, "PROSPERO_TEST_TOAST").len;
+        g->drivefocus = g->drive;  // focused, until a step says not
         g->realterm   = g->drive && os_getenv(os, &a, "PROSPERO_TEST_TERMINAL").len;
     }
     g->nosession.stick = 1;
@@ -16792,6 +17299,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         return 1;
     }
     g->sched.pace = os_guirefresh(os);
+    toastready(g);
 
     switch (g->enginekind) {
     case ENGINE_FAKE:
@@ -16868,6 +17376,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         print(&b, " ms");
         guilog(g, finish(&b));
     }
+    toastclear(g);  // nothing left to click through to
     os_guiclose(os);
     if (g->proc) {
         // It stopped, or had its chance: the rest of its tree goes now

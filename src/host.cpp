@@ -267,8 +267,19 @@ struct HostConn {
 
 // What the host knows of a session from records passing through.
 struct HostSess {
-    Str parent;  // a subagent's parent session
-    b32 busy;    // its live state is other than idle
+    Str       sid;
+    Str       parent;   // a subagent's parent session
+    b32       busy;     // its live state is other than idle
+    // For a desktop notification of a session that stopped by itself
+    // (HostConf.toasts): its turn's end, and the first line of its
+    // last reply, while queued (next) to be told of once idle
+    b32       compact;  // its turn is a compaction's
+    Str       why;      // done, error or budget: a literal
+    i64       seq;
+    u8        text[160];
+    i32       textlen;
+    b32       queued;
+    HostSess *next;
 };
 
 enum : i32 {
@@ -307,6 +318,10 @@ struct Host {
     HostClient     *dead;      // dropped this round, to release
     HostConn       *deadconns; // ended this round, to release
     Map<HostSess>  *sess;
+    HostSess       *done;      // sessions stopped by themselves, to tell of
+    Mailbox        *toasts;    // which go here, as toasttype (HostConf)
+    u32             toasttype;
+    i64             toastsince;// epoch ms: records before then are old news
     HostCmd        *cmds;      // a ring of HOST_CMDS
     i32             cmdhead;
     i32             cmdlen;
@@ -332,7 +347,9 @@ static HostSess *hostsess(Host *h, Str sid)
 {
     HostSess *s = upsert(&h->sess, sid, (Arena *)0);
     if (!s) {
-        s = upsert(&h->sess, clone(&h->perm, sid), &h->perm);
+        Str key = clone(&h->perm, sid);
+        s = upsert(&h->sess, key, &h->perm);
+        s->sid = key;
     }
     return s;
 }
@@ -955,6 +972,84 @@ static void hostreplied(Host *h, Arena scratch, EvRec *r, Str line)
     }
 }
 
+// What a desktop notification needs of a record: a root's turn ended
+// by itself, live (not replayed for an open), then the reply's first
+// line; a new turn, or a turn's compaction, makes it moot.
+static void hostnoted(Host *h, HostSess *ss, EvRec *r)
+{
+    switch (r->ev) {
+    case EV_TURN:
+        ss->compact = jsonstr(jsonget(r->root, "via")) == "compact";
+        ss->why     = {};
+        break;
+    case EV_ASSISTANT:
+        for (Json *b = jsonget(r->root, "blocks")->child; b; b = b->next) {
+            Str t = trim(jsonstr(jsonget(b, "text")));
+            if (jsonstr(jsonget(b, "t"))=="text" && t.len) {
+                t = cut(t, '\n').head;
+                iz n = t.len<(iz)sizeof(ss->text) ? t.len : (iz)sizeof(ss->text);
+                for (; n<t.len && n>0 && (t[n]&0xc0)==0x80; n--) {}  // a whole code point
+                copybytes(ss->text, t.data, n);
+                ss->textlen = (i32)n;
+            }
+        }
+        break;
+    case EV_TURNEND: {
+        Str why = jsonstr(jsonget(r->root, "why"));
+        why = why=="done" ? Str("done") : why=="error" ? Str("error") :
+              why=="budget" ? Str("budget") : Str{};
+        if (why=="error") {
+            Str err = cut(trim(jsonstr(jsonget(r->root, "err"))), '\n').head;
+            iz  n   = err.len<(iz)sizeof(ss->text) ? err.len : (iz)sizeof(ss->text);
+            for (; n<err.len && n>0 && (err[n]&0xc0)==0x80; n--) {}
+            copybytes(ss->text, err.data, n);
+            ss->textlen = (i32)n;
+        }
+        b32 news = why.len && !ss->parent.len && !ss->compact && r->ts>=h->toastsince &&
+                   !jsonflag(jsonget(r->root, "resume"), 0);
+        ss->why = news ? why : Str{};
+        ss->seq = r->seq;
+        if (news && !ss->queued) {
+            ss->queued = 1;
+            ss->next   = h->done;
+            h->done    = ss;
+        }
+        ss->compact = 0;
+    } break;
+    }
+}
+
+// Tell of the sessions that stopped by themselves and are idle, at the
+// end of a batch of records, keeping those not idle yet, and forgetting
+// those at work again.
+static void hosttoasts(Host *h, Arena scratch)
+{
+    HostSess *keep = 0;
+    for (HostSess *ss = h->done, *next; ss; ss = next) {
+        next = ss->next;
+        if (ss->why.len && ss->busy) {
+            ss->next = keep;  // its idle state yet to come
+            keep     = ss;
+            continue;
+        }
+        ss->queued = 0;
+        if (ss->why.len) {
+            Arena a = scratch;
+            Buf   b(&a, 512);
+            print(&b, ss->sid);
+            putbyte(&b, '\n');
+            print(&b, ss->why);
+            putbyte(&b, '\n');
+            print(&b, ss->seq);
+            putbyte(&b, '\n');
+            print(&b, Str{ss->text, ss->textlen});
+            mailpost(h->toasts, h->toasttype, 0, finish(&b), 0);
+        }
+        ss->why = {};
+    }
+    h->done = keep;
+}
+
 static void hostrecord(Host *h, Arena scratch, Str line)
 {
     EvRec r = evparse(&scratch, line);
@@ -973,6 +1068,9 @@ static void hostrecord(Host *h, Arena scratch, Str line)
     }
 
     HostSess *ss = hostsess(h, r.sid);
+    if (h->toasts) {
+        hostnoted(h, ss, &r);
+    }
     if (r.ev == EV_LIVE) {
         ss->busy = !(jsonstr(jsonget(r.root, "state")) == "idle");
     } else if (r.ev==EV_SESSION && r.seq==1 && !jsonflag(jsonget(r.root, "remote"), 0)) {
@@ -1363,6 +1461,9 @@ static i32 hostloop(Host *h)
             }
         }
 
+        if (h->toasts) {
+            hosttoasts(h, newarena(h->scratch));
+        }
         now = os_ticks(os);
         hosttimers(h, now);
         for (HostClient *c = h->clients; c; c = c->next) {
@@ -1429,6 +1530,9 @@ struct HostConf {
     i64      idle;     // ticks
     i64      firstid;
     iz       held;     // the lock, or -1
+    Mailbox *toasts;   // sessions that stopped by themselves, told here
+    u32      toasttype;//   as this: "SID\nWHY\nSEQ\nTEXT" (hosttoasts)
+    i64      toastsince;// epoch ms: what came before is old news
 };
 
 static Host *newhost(Os *os, Arena *perm, Arena scratch, HostConf *hc, Str *err)
@@ -1440,6 +1544,9 @@ static Host *newhost(Os *os, Arena *perm, Arena scratch, HostConf *hc, Str *err)
     h->statedir = hc->statedir;
     h->e        = hc->e;
     h->inbox    = hc->inbox;
+    h->toasts     = hc->toasts;
+    h->toasttype  = hc->toasttype;
+    h->toastsince = hc->toastsince;
     h->nextid   = hc->firstid>0 ? hc->firstid : 0;
     h->held     = hc->held>=0 ? hc->held : hostlock(os, perm, scratch, h->statedir);
     if (h->held < 0) {

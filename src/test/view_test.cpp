@@ -335,6 +335,74 @@ static void test_view(Test *t)
         expect(t, "view.deniedopen", istr(&a, v->msgs[0].collapsed), "0");
     }
 
+    // Toasts: what asks and turn ends mark, and what they say
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":5,"ev":"session","cwd":"/w/proj/"})");
+        expect(t, "toast.folder", toasttitle(&a, v, {}), "proj");
+        expect(t, "toast.listed", toasttitle(&a, v, "Listed"), "Listed");
+        v->nofolder = 1;
+        expect(t, "toast.app", toasttitle(&a, v, {}), "Prospero");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":6,"ev":"user","text":"go","via":"prompt"})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":7,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":8,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+                    R"({"t":"call","id":"c1","name":"write","args":"{\"path\":\"/x/y\"}"}]})");
+        apply(v, a, R"({"sid":"s","seq":5,"ts":1000,"ev":"ask","req":"c1/ask","call":"c1","kind":"path",)"
+                    R"("tool":"write","path":"/x/y","detail":"outside","deadline":31000,"dflt":"deny"})");
+        expect(t, "toast.askmark", istr(&a, v->askseq*10000 + v->askts), "51000");
+        ViewTool *k = v->msgs[v->askmsg].tool;
+        expect(t, "toast.askbody", toastaskbody(&a, k, {}, 1, 1500),
+               "Allow write /x/y?\nDenied in 30 s unless allowed");
+        expect(t, "toast.askwho", toastaskbody(&a, k, "helper", 1, 40000),
+               "helper: Allow write /x/y?\nDenied in 0 s unless allowed");
+        expect(t, "toast.asks", toastaskbody(&a, k, {}, 3, 0),
+               "3 requests wait for your answer");
+        apply(v, a, R"({"sid":"s","seq":6,"ts":1100,"ev":"answer","req":"c1/ask","decision":"allow","by":"user"})");
+        apply(v, a, R"({"sid":"s","seq":7,"ts":1200,"ev":"assistant","turn":1,"attempt":2,"blocks":[)"
+                    R"({"t":"text","text":"\n  All written.\nMore here."}]})");
+        apply(v, a, R"({"sid":"s","seq":8,"ts":1300,"ev":"turn.end","turn":1,"why":"done"})");
+        expect(t, "toast.endmark", istr(&a, v->endseq*10 + v->endwhy), "8" "1");
+        expect(t, "toast.done", toastdonebody(&a, v), "All written.\xe2\x80\xa6");
+
+        apply(v, a, R"({"sid":"s","seq":9,"ts":1400,"ev":"user","text":"again","via":"prompt"})");
+        apply(v, a, R"({"sid":"s","seq":10,"ts":1500,"ev":"turn","n":2})");
+        apply(v, a, R"({"sid":"s","seq":11,"ts":1600,"ev":"turn.end","turn":2,"why":"done"})");
+        expect(t, "toast.silent", toastdonebody(&a, v), "Finished");
+        apply(v, a, R"({"sid":"s","seq":12,"ts":1700,"ev":"turn","n":3})");
+        apply(v, a, R"({"sid":"s","seq":13,"ts":1800,"ev":"turn.end","turn":3,"why":"error","err":"HTTP 500\nbody"})");
+        expect(t, "toast.error", toastdonebody(&a, v), "Stopped: HTTP 500\xe2\x80\xa6");
+        apply(v, a, R"({"sid":"s","seq":14,"ts":1900,"ev":"turn","n":4})");
+        apply(v, a, R"({"sid":"s","seq":15,"ts":2000,"ev":"turn.end","turn":4,"why":"budget"})");
+        expect(t, "toast.budget", toastdonebody(&a, v), "Stopped at the step budget");
+        apply(v, a, R"({"sid":"s","seq":16,"ts":2100,"ev":"turn","n":5})");
+        apply(v, a, R"({"sid":"s","seq":17,"ts":2200,"ev":"turn.end","turn":5,"why":"cancel"})");
+        expect(t, "toast.cancel", istr(&a, v->endwhy), "0");
+        apply(v, a, R"({"sid":"s","seq":18,"ts":2300,"ev":"turn","n":6,"via":"compact"})");
+        apply(v, a, R"({"sid":"s","seq":19,"ts":2400,"ev":"turn.end","turn":6,"why":"done"})");
+        expect(t, "toast.compact", istr(&a, v->endcompact*10 + v->endresume), "10");
+        apply(v, a, R"({"sid":"s","seq":20,"ts":2500,"ev":"turn","n":7})");
+        apply(v, a, R"({"sid":"s","seq":21,"ts":2600,"ev":"turn.end","turn":7,"why":"done","resume":true})");
+        expect(t, "toast.resume", istr(&a, v->endcompact*10 + v->endresume), "1");
+
+        ViewTool plan = {};
+        plan.kind = "plan";
+        expect(t, "toast.plan", toastaskbody(&a, &plan, {}, 1, 0),
+               "Approve the plan?\nWaiting for you");
+        ViewTool mcp = {};
+        mcp.kind     = "mcp.project";
+        mcp.path     = "/w";
+        mcp.deadline = 2000;
+        expect(t, "toast.mcp", toastaskbody(&a, &mcp, {}, 1, 1001),
+               "Start the MCP servers of /w?\nDenied in 1 s unless allowed");
+
+        expect(t, "notify.empty", istr(&a, notifyparse("")), "0");
+        expect(t, "notify.both", istr(&a, notifyparse("allow, done")), "3");
+        expect(t, "notify.none", istr(&a, notifyparse("none")), "0");
+        expect(t, "notify.odd", istr(&a, notifyparse("done bell")), "2");
+        expect(t, "notify.less", istr(&a, notifyparse("allow done -done")), "1");
+    }
+
     // Always: the ask offers a grant, the answer allows it for good, and
     // the grant record that follows changes nothing shown; a fork's
     // session record names its original

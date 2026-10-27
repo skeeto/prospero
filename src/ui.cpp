@@ -7681,6 +7681,8 @@ static void drawcfgtable(Gui *g, Str kind, Str name)
             target = RECT_THEMECOMBO;
         } else if (kind=="guard" && r->key=="roots") {
             target = RECT_ROOTS;
+        } else if (kind=="ui" && r->key=="notify") {
+            target = RECT_NOTIFY;
         } else if (r->value.len >= FIELD_MAX) {
             target = RECT_LONGFIELD;  // more than the slack
         }

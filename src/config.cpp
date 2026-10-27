@@ -228,7 +228,7 @@ static CfgKind cfgkinds[] = {
     {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
     {"skills",   0, "Skills: SKILL.md instructions the agent uses as a task calls for them"},
     {"memory",   0, "Project memory: the agent's notes for later sessions in a project"},
-    {"ui",       0, "How the GUI looks"},
+    {"ui",       0, "How the GUI looks, and when it tells you of a session"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"host",     0, "The engine as a background host (prospero serve)"},
     {"remote",   1, "An engine on another machine, reached over ssh, or in a WSL distro"},
@@ -526,6 +526,10 @@ static CfgKey cfgschema[] = {
      "$TERMINAL or the first found of ptyxis, gnome-terminal, kgx, konsole, "
      "xfce4-terminal, x-terminal-emulator, alacritty, kitty, wezterm, foot, "
      "ghostty and xterm"},
+    {"ui", "notify", CFG_LIST, "allow done", {}, "allow done none", "ui",
+     "Desktop notifications while you look elsewhere: allow when a "
+     "permission ask waits for you, done when a session stops by itself "
+     "(finished, failed or out of budget); none for neither"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",
      "Seconds a host waits with no client connected and nothing running, "
