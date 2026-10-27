@@ -13628,6 +13628,7 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
         putintkey(&w.json, "id", id);
         putintkey(&w.json, "ok", 1);
         putintkey(&w.json, "readonly", s->readonly);
+        putintkey(&w.json, "lastseq", s->log.seq);  // the last of its history
         if (!pass && draft.len) {
             putstrkey(&w.json, "draft", draft);
         }

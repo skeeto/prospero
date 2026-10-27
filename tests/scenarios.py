@@ -3586,6 +3586,7 @@ def crash_ask(t):
                          ("tool.start", None), ("tool.end", "cancelled"),
                          ("turn.end", "interrupted")], f"repaired: {tail}")
         t.check([e["seq"] for e in log] == list(range(1, len(log) + 1)), "in order")
+        t.check(r.get("lastseq") == log[-1]["seq"], f"history ends at {r.get('lastseq')}")
         b.call("prompt", sid=sid, text="go on")
         end = b.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid
                      and e.get("why") != "interrupted")
