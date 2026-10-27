@@ -194,6 +194,23 @@ static Str expandhome(Arena *a, Str path, Str home, b32 win)
     return path;  // "~user" is a plain name
 }
 
+// A drive as MSYS2 and Git Bash print it, "/c/x" or "/c", or as Cygwin
+// does, "/cygdrive/c/x", in Windows' form, "c:/x". Win32 would root
+// these on the current drive instead, in a folder named c. Anything
+// else, "/mnt/c" or "\c" among them, is as it is.
+static Str msysdrive(Arena *a, Str path)
+{
+    Str p = startswith(path, "/cygdrive/") ? cuthead(path, 9) : path;
+    if (p.len<2 || p[0]!='/' || !letter(p[1]) || (p.len>2 && p[2]!='/')) {
+        return path;
+    }
+    Buf b(a, p.len + 2);
+    putbyte(&b, p[1]);
+    putbyte(&b, ':');
+    print(&b, p.len>2 ? cuthead(p, 2) : Str("/"));
+    return finish(&b);
+}
+
 // The other way: a path in the home directory as "~" or "~/x", else as
 // it is. A home with a drive (C:) is a Windows path, compared without
 // case, its separators either. The path keeps its own separators.
@@ -356,6 +373,7 @@ static GuardPath guardpath(Os *os, Arena *a, Guard *g, Str path, b32 read)
         r.path = path;
         return r;  // names nothing: never inside
     }
+    path   = g->win ? msysdrive(a, path) : path;
     r.path = normpath(a, g->cwd, expandhome(a, path, g->home, g->win), g->win);
 
     // Lexically, against either form of each root: the real path of a

@@ -208,6 +208,8 @@ static void test_guard(Test *t)
         {"/s/sess/out/c1.log",      0, "/s/sess/out/c1.log O"},
         {"/s/sess/events.jsonl",    0, "/s/sess/events.jsonl O"},
         {"src/../../w/src/x.c",     1, "/w/src/x.c I"},
+        {"/c/x",                    1, "/c/x O"},  // no drives off Windows
+        {"/cygdrive/c/x",           1, "/cygdrive/c/x O"},
     };
     for (iz i = 0; i < countof(cases); i++) {
         GuardPath gp = guardpath(os, a, &g, cases[i].path, cases[i].read);
@@ -292,6 +294,19 @@ static void test_guard(Test *t)
         {"\\\\.\\pipe\\x",              "//./pipe/x O"},
         {"~\\x",                        "C:/Users/me/x O"},
         {"C:/W2/x",                     "C:/W2/x O"},
+        // Drives as MSYS2, Git Bash and Cygwin print them
+        {"/c/W/Sub/f.txt",              "C:/W/Sub/f.txt I"},
+        {"/C/W/Sub",                    "C:/W/Sub I"},
+        {"/cygdrive/c/W/Sub/f.txt",     "C:/W/Sub/f.txt I"},
+        {"/d/x",                        "D:/x O"},
+        {"/c",                          "C:/ O"},
+        {"/cygdrive/d",                 "D:/ O"},
+        {"/cygdrive/",                  "C:/cygdrive O"},
+        {"/mnt/c/x",                    "C:/mnt/c/x O"},
+        {"/cx/y",                       "C:/cx/y O"},
+        {"/tmp/x",                      "C:/tmp/x O"},
+        {"\\c\\x",                      "C:/c/x O"},
+        {"//c/x",                       "//c/x/ O"},
     };
     for (iz i = 0; i < countof(wcases); i++) {
         GuardPath gp = guardpath(wos, a, &wg, wcases[i].path, 0);
