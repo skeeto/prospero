@@ -173,18 +173,37 @@ static void test_arenacheck(Test *t)
         expect(t, "arenacheck.committed", istr(&a, arenafaults()), "1");
     }
 
-    // A hand-off into a struct, which takes the identity along
+    // A hand-off into a struct from a copy that then ends, whose bytes
+    // are the struct's now
     {
-        struct { Arena perm; } s;
+        struct { Arena perm; } h;
         Arena o = carve(&a, 1<<16);
-        Arena l = o;
-        allocbytes(&l, 100);
-        s.perm = l;
-        allocbytes(&s.perm, 10);
+        u8   *p = 0;
+        {
+            Arena l = o;
+            p = allocbytes(&l, 100);
+            h.perm = l;
+        }
+        allocbytes(&h.perm, 10);
         expect(t, "arenacheck.handoff", istr(&a, arenafaults()), "0");
-        allocbytes(&o, 50);
-        allocbytes(&s.perm, 10);
-        expect(t, "arenacheck.handoff watched", istr(&a, arenafaults()), "1");
+        #if ARENA_ASAN
+        expect(t, "arenacheck.handoff kept", istr(&a, __asan_address_is_poisoned(p+8)), "0");
+        #else
+        (void)p;
+        #endif
+    }
+
+    // A copy made early and set again from the original, which has put
+    // things in itself meanwhile, keeps them
+    {
+        Arena o = carve(&a, 1<<16);
+        Arena x = o;
+        Str   f = clone(&o, "kept by the original");
+        x = o;
+        allocbytes(&x, 8);
+        x = o;
+        allocbytes(&x, 8);
+        expect(t, "arenacheck.recopy keeps", f, "kept by the original");
     }
 
     // A copy re-pointed again and again, and an arena reset
@@ -251,6 +270,46 @@ static void test_arenacheck(Test *t)
         os_release(os, r);
         expect(t, "arenacheck.forgotten", istr(&a, !!arenarec(aid)), "0");
     }
+
+    #if ARENA_ASAN
+    // Memory no arena holds is poisoned: a copy's once it ends or is
+    // re-pointed, what a restore gives back, and a region's fresh space
+    {
+        Arena base = carve(&a, 1<<16);
+        u8   *p    = 0;
+        {
+            Arena c = base;
+            p = allocbytes(&c, 64);
+            expect(t, "arenacheck.poison allocated", istr(&a, __asan_address_is_poisoned(p+8)), "0");
+        }
+        expect(t, "arenacheck.poison ended", istr(&a, __asan_address_is_poisoned(p+8)), "1");
+        u8 *q = allocbytes(&base, 64);
+        expect(t, "arenacheck.poison taken again", istr(&a, q==p && !__asan_address_is_poisoned(p+8)), "1");
+
+        Arena save = base;
+        u8   *r    = allocbytes(&base, 64);
+        base = save;
+        expect(t, "arenacheck.poison restored", istr(&a, __asan_address_is_poisoned(r+8)), "1");
+
+        Arena c = base;
+        u8   *x = allocbytes(&c, 64);
+        c = base;
+        expect(t, "arenacheck.poison re-pointed", istr(&a, __asan_address_is_poisoned(x+8)), "1");
+
+        Arena keep = base;
+        u8   *k    = allocbytes(&keep, 64);
+        base = keep;  // a commit: nothing given back
+        expect(t, "arenacheck.poison committed", istr(&a, __asan_address_is_poisoned(k+8)), "0");
+
+        Os     *os = newos(&a, 1<<12);
+        Region *rg = os_reserve(os, 1<<22);
+        Arena   g  = newarena(rg);
+        u8     *f  = allocbytes(&g, 16);
+        expect(t, "arenacheck.poison fresh", istr(&a, __asan_address_is_poisoned(f+16)), "1");
+        expect(t, "arenacheck.poison fresh taken", istr(&a, __asan_address_is_poisoned(f)), "0");
+        os_release(os, rg);
+    }
+    #endif
 
     expect(t, "arenacheck.stray", istr(&a, arenafaults()), "0");
     arenacheck.record = prev;

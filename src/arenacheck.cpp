@@ -31,12 +31,51 @@
 //
 // A fault is reported through os_arenafault and traps, unless tests
 // set arenacheck.record to count them instead.
+//
+// Under AddressSanitizer, arena memory that no live arena holds is also
+// poisoned, so that ASan reports a read or write of it: space fresh in a
+// region, the claim of a copy that ended or was re-pointed, and what a
+// restore gave back. Only bytes whose hint is still the arena giving
+// them up are poisoned, as others took the rest since, and only within
+// spans known not to be the stack (regions, and what tests add), whose
+// frames ASan would find poisoned once reused.
+
+#if defined(__SANITIZE_ADDRESS__)
+#  define ARENA_ASAN 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define ARENA_ASAN 1
+#  endif
+#endif
+#ifndef ARENA_ASAN
+#  define ARENA_ASAN 0
+#endif
+
+#if ARENA_ASAN
+extern "C" void __asan_poison_memory_region(void const volatile *, uz);
+extern "C" void __asan_unpoison_memory_region(void const volatile *, uz);
+extern "C" i32  __asan_address_is_poisoned(void const volatile *);
+
+// Regions and the test arena are never freed as a whole. Weak, as a
+// program may have two translation units (Linux's with the X11 helper),
+// yet still over the runtime's, which the program's own definition wins.
+extern "C" __attribute__((weak, used)) char const *__asan_default_options()
+{
+    return "detect_leaks=0";
+}
+#endif
 
 enum : u32 {
     ARENA_SLOTS = 1u<<15,
     ARENA_HINTS = 1u<<20,
     ARENA_DEAD  = 0xffffffffu,  // a destroyed arena's aid
     ARENA_SPAN  = 1u<<12,       // granules checked in full per allocation
+    ARENA_SPANS = 1u<<10,       // poisonable spans
+};
+
+struct ArenaSpan {
+    byte *lo;
+    byte *hi;
 };
 
 // Another arena allocated over [lo, hi) of this one's claim.
@@ -56,6 +95,7 @@ struct ArenaRec {
     byte        *beg;
     char const  *file;
     i32          line;
+    b32          given; // assigned from: its bytes may be another's now
     ArenaOver    over;  // the first overlap noted, if any (over.hi)
 };
 
@@ -66,17 +106,19 @@ static void os_arenafault(Str);
 // as Windows' does with its desktop helper (inline linkage), since a
 // struct with an Arena in it copies through either's code.
 struct ArenaCheck {
-    i32      lock;
-    b32      record;   // tests: count faults instead of trapping
-    i32      faults;
-    u8       last[512];
-    iz       lastlen;
-    u32      used;     // slots ever used
-    u32      nfree;
-    u32      evict;
-    u32      free[ARENA_SLOTS];
-    u32      hints[ARENA_HINTS];
-    ArenaRec recs[ARENA_SLOTS];
+    i32       lock;
+    b32       record;   // tests: count faults instead of trapping
+    i32       faults;
+    u8        last[512];
+    iz        lastlen;
+    u32       used;     // slots ever used
+    u32       nfree;
+    u32       evict;
+    u32       free[ARENA_SLOTS];
+    u32       hints[ARENA_HINTS];
+    ArenaRec  recs[ARENA_SLOTS];
+    ArenaSpan spans[ARENA_SPANS];
+    u32       nspans;
 };
 inline ArenaCheck arenacheck;
 
@@ -155,13 +197,131 @@ inline void arenagranules(byte *lo, byte *hi, F f)
     }
     uz first = (uz)lo >> 4;
     uz last  = (uz)(hi - 1) >> 4;
-    uz step  = (last - first)/ARENA_SPAN + 1;
+    uz step  = ARENA_ASAN ? 1 : (last - first)/ARENA_SPAN + 1;  // exact for poisoning
     for (uz g = first; g <= last; g += step) {
         f((byte *)(g << 4));
     }
     if ((last - first) % step) {
         f((byte *)(last << 4));
     }
+}
+
+
+// Poisoning (ARENA_ASAN), all of it under the lock
+
+// Note a span of memory that is never the stack.
+inline void arenaspan(void *lo, void *hi)
+{
+    for (u32 i = 0; i < arenacheck.nspans; i++) {
+        if (arenacheck.spans[i].lo == lo) {
+            arenacheck.spans[i].hi = (byte *)hi;
+            return;
+        }
+    }
+    if (arenacheck.nspans < ARENA_SPANS) {
+        arenacheck.spans[arenacheck.nspans++] = {(byte *)lo, (byte *)hi};
+    }
+}
+
+inline b32 arenaspanned(byte *p)
+{
+    for (u32 i = 0; i < arenacheck.nspans; i++) {
+        if (p>=arenacheck.spans[i].lo && p<arenacheck.spans[i].hi) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// ASan's shadow tells only how much of an 8-byte granule leads with
+// addressable bytes: poisoning takes whole granules within a range, and
+// unpoisoning whole granules over it.
+inline void arenaasanpoison(byte *lo, byte *hi)
+{
+#if ARENA_ASAN
+    lo = (byte *)(((uz)lo + 7) & ~(uz)7);
+    hi = (byte *)((uz)hi & ~(uz)7);
+    if (lo < hi) {
+        __asan_poison_memory_region(lo, (uz)(hi - lo));
+    }
+#else
+    (void)lo; (void)hi;
+#endif
+}
+
+inline void arenapoison(byte *lo, byte *hi)
+{
+    if (lo<hi && arenaspanned(lo)) {
+        arenaasanpoison(lo, hi);
+    }
+}
+
+inline void arenaunpoison(byte *lo, byte *hi)
+{
+#if ARENA_ASAN
+    if (lo < hi) {
+        lo = (byte *)((uz)lo & ~(uz)7);
+        hi = (byte *)(((uz)hi + 7) & ~(uz)7);
+        __asan_unpoison_memory_region(lo, (uz)(hi - lo));
+    }
+#else
+    (void)lo; (void)hi;
+#endif
+}
+
+// Poison what r gives up of [lo, hi): the granules it was last to take.
+inline void arenabury(ArenaRec *r, byte *lo, byte *hi)
+{
+#if ARENA_ASAN
+    if (lo>=hi || !arenaspanned(lo)) {
+        return;
+    }
+    byte *run = 0;
+    byte *top = 0;
+    for (byte *g = (byte *)((uz)lo & ~(uz)15); g < hi; g += 16) {
+        byte *glo = g<lo ? lo : g;
+        byte *ghi = g+16<hi ? g+16 : hi;
+        if (*arenahint(g) == r->aid) {
+            run = run ? run : glo;
+            top = ghi;
+        } else if (run) {
+            arenaasanpoison(run, top);
+            run = 0;
+        }
+    }
+    if (run) {
+        arenaasanpoison(run, top);
+    }
+#else
+    (void)r; (void)lo; (void)hi;
+#endif
+}
+
+// Memory for arenas, never the stack, poisoned until allocated: a block
+// of the caller's, such as the unit tests' arena.
+inline void arenablank(void *lo, void *hi)
+{
+#if ARENA_ASAN
+    arenalock();
+    arenaspan(lo, hi);
+    arenapoison((byte *)lo, (byte *)hi);
+    arenaunlock();
+#else
+    (void)lo; (void)hi;
+#endif
+}
+
+// Space new to an arena, from a region: poisoned until allocated.
+inline void arenafresh(Region *r, byte *lo, byte *hi)
+{
+#if ARENA_ASAN
+    arenalock();
+    arenaspan(r->base, r->base+r->cap);
+    arenapoison(lo, hi);
+    arenaunlock();
+#else
+    (void)r; (void)lo; (void)hi;
+#endif
 }
 
 
@@ -245,6 +405,7 @@ inline void arenacheck_alloc(Arena *a, byte *p, iz n, void *pc)
         return;
     }
 
+    arenaunpoison(p, p+n);
     arenalock();
     byte     *old = a->beg;
     byte     *hi  = p + n;
@@ -312,54 +473,43 @@ inline Arena &Arena::operator=(Arena const &a)
     if (this == &a) {
         return *this;
     }
-    if (aid || a.aid) {
-        arenalock();
-        ArenaRec *d = arenaown(this);
-        ArenaRec *s = arenaown(&a);
-        if (d && a.parent==aid) {
-            // A copy of this one given back: a commit or a restore. This
-            // claim now ends where the copy's did, and the copy's bytes
-            // are this one's.
-            d->beg = a.beg;
-            d->lo  = a.beg<d->lo ? a.beg : d->lo;
-            if (s) {
-                u32 from = s->aid;
-                arenagranules(s->lo, s->beg, [&](byte *g) {
-                    u32 *h = arenahint(g);
-                    *h = *h==from ? d->aid : *h;
-                });
-                d->over = d->over.hi ? d->over : s->over;
-                s->lo   = s->beg = a.beg;
-                s->over = {};
-            }
-        } else if (!d || beg<=d->lo) {
-            // This one holds nothing: a hand-off, which takes the other's
-            // identity, claim and all
-            if (d) {
-                arenafree(d);
-            }
-            aid = 0;
-            if (s) {
-                aid     = s->aid;
-                s->self = this;
-                a.aid   = 0;
-            }
-            parent = a.parent;
-            file   = a.file;
-            line   = a.line;
-        } else {
-            // Re-pointed elsewhere: what this one held is dropped, and it
-            // starts over as a copy of the other
+    arenalock();
+    ArenaRec *d = arenaown(this);
+    ArenaRec *s = arenaown(&a);
+    if (d && a.parent==aid) {
+        // A copy of this one given back: a commit or a restore. This
+        // claim now ends where the copy's did, and the copy's bytes
+        // are this one's.
+        arenabury(d, a.beg, d->beg);
+        d->beg = a.beg;
+        d->lo  = a.beg<d->lo ? a.beg : d->lo;
+        if (s) {
+            u32 from = s->aid;
+            arenagranules(s->lo, s->beg, [&](byte *g) {
+                u32 *h = arenahint(g);
+                *h = *h==from ? d->aid : *h;
+            });
+            d->over = d->over.hi ? d->over : s->over;
+            s->lo   = s->beg = a.beg;
+            s->over = {};
+        }
+    } else {
+        // Re-pointed, or handed off (s->perm = perm), which look the
+        // same, as the other may go on: what this one held is dropped,
+        // and it starts over as a copy of the other. The other is not
+        // buried when it ends, as what it held may be this one's now.
+        if (d) {
+            arenabury(d, d->lo, d->beg);
             d->lo   = d->beg = a.beg;
             d->over = {};
-            parent  = a.aid && a.aid!=ARENA_DEAD ? a.aid : a.parent;
         }
-        arenaunlock();
-    } else {
-        parent = a.parent;
-        file   = a.file;
-        line   = a.line;
+        s = s ? s : a.aid!=ARENA_DEAD ? arenanew(&a, a.beg) : 0;
+        if (s) {
+            s->given = 1;
+        }
+        parent = s ? s->aid : a.parent;
     }
+    arenaunlock();
     beg    = a.beg;
     end    = a.end;
     region = a.region;
@@ -374,6 +524,9 @@ inline Arena::~Arena()
     if (aid && aid!=ARENA_DEAD) {
         arenalock();
         ArenaRec *r = arenaown(this);
+        if (r && parent && !r->given) {
+            arenabury(r, r->lo, r->beg);  // a copy's scratch, now unused
+        }
         if (r) {
             arenafree(r);
         }
@@ -386,7 +539,15 @@ inline Arena::~Arena()
 // gone with it, never destroyed.
 inline void arenaforget(void *lo, void *hi)
 {
+    arenaunpoison((byte *)lo, (byte *)hi);
     arenalock();
+    for (u32 i = 0; i < arenacheck.nspans; i++) {
+        ArenaSpan *s = arenacheck.spans + i;
+        if ((void *)s->lo>=lo && (void *)s->lo<hi) {
+            *s = arenacheck.spans[--arenacheck.nspans];
+            i--;
+        }
+    }
     for (u32 i = 0; i < arenacheck.used; i++) {
         ArenaRec *r = arenacheck.recs + i;
         if (r->aid && (void *)r->self>=lo && (void *)r->self<hi) {

@@ -851,6 +851,13 @@ holds, or an allocation through an arena already destroyed. Each is
 reported on stderr as an "arena fault", with where the arenas were
 made, and traps; the suites fail on one.
 
+Where the toolchain has AddressSanitizer (not Windows, nor a static
+build), Debug builds also run under it (`-DPROSPERO_ASAN=OFF` to leave
+it out), and arena memory that no live arena holds is poisoned: a
+region's fresh space, a copy's allocations once the copy ends, and what
+a restore gives back. ASan then reports a read of results left in a
+callee's scratch, or of anything after its arena moved on.
+
 The Python suites need [uv][]. They also run against other machines
 from this one: `--host` runs Prospero on a Windows host over ssh,
 `--xp` on Windows XP, and `--ssh` connects and deploys to a real

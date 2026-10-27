@@ -55,10 +55,28 @@ if(PROSPERO_TRAP AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(i.86|x86)$")
   # GCC, whose alignment check then demands 8 of its own locals.
   list(APPEND PROSPERO_TRAP -fno-sanitize=alignment)
 endif()
+
+# Debug builds also run under AddressSanitizer where the toolchain has
+# it, which arenacheck.cpp tells of arena memory not allocated: fresh
+# space, a copy's once it ends, and what a restore gives back. Not on
+# Windows (no ASan in mingw) nor in a static build.
+option(PROSPERO_ASAN "AddressSanitizer in Debug builds, where available" ON)
+set(PROSPERO_ASANFLAGS "")
+if(PROSPERO_ASAN AND NOT WIN32 AND NOT PROSPERO_STATIC)
+  check_linker_flag(CXX -fsanitize=address PROSPERO_HAS_ASAN)
+  check_cxx_compiler_flag(-fsanitize-trap=undefined PROSPERO_HAS_TRAPUB)
+  if(PROSPERO_HAS_ASAN AND (PROSPERO_HAS_TRAPUB OR NOT PROSPERO_HAS_TRAP))
+    set(PROSPERO_ASANFLAGS -fsanitize=address -fno-omit-frame-pointer)
+    if(PROSPERO_HAS_TRAP)
+      # Undefined behavior still traps, but ASan reports
+      list(TRANSFORM PROSPERO_TRAP REPLACE "^-fsanitize-trap$" "-fsanitize-trap=undefined")
+    endif()
+  endif()
+endif()
 target_compile_options(prospero_core_flags INTERFACE
-  "$<$<CONFIG:Debug>:-g3;-Og;${PROSPERO_TRAP}>")
+  "$<$<CONFIG:Debug>:-g3;-Og;${PROSPERO_TRAP};${PROSPERO_ASANFLAGS}>")
 target_link_options(prospero_core_flags INTERFACE
-  "$<$<CONFIG:Debug>:${PROSPERO_TRAP}>")
+  "$<$<CONFIG:Debug>:${PROSPERO_TRAP};${PROSPERO_ASANFLAGS}>")
 
 # Debug builds check arenas for aliasing (src/arenacheck.cpp), as the
 # unit tests always do: an arena allocating again over bytes another

@@ -76,6 +76,7 @@ static b32 os_commit(Region *, iz upto);
 
 #if PROSPERO_ARENACHECK
 inline void arenacheck_alloc(Arena *, byte *, iz, void *pc);
+inline void arenafresh(Region *, byte *, byte *);
 #endif
 
 // Extend a region-backed arena so that count objects of the given size
@@ -90,9 +91,15 @@ static void arenagrow(Arena *a, iz pad, iz count, iz size)
     iz upto  = a->beg - r->base + pad + (count+1)*size;
     upto += -upto & (grain - 1);
     upto  = upto<r->cap ? upto : r->cap;
+#if PROSPERO_ARENACHECK
+    iz was = r->committed;
+#endif
     if (upto>r->committed && !os_commit(r, upto)) {
         os_oom();
     }
+#if PROSPERO_ARENACHECK
+    arenafresh(r, r->base+was, r->base+r->committed);
+#endif
     a->end = r->base + r->committed;
 }
 
@@ -167,6 +174,9 @@ static Arena newarena(Region *r ARENASITE)
 #if PROSPERO_ARENACHECK
     a.file = file;
     a.line = line;
+    if (r) {
+        arenafresh(r, a.beg, a.end);
+    }
 #endif
     return a;
 }

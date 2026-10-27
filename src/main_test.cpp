@@ -649,6 +649,7 @@ int main()
     byte *mem = (byte *)malloc((uz)cap);
     Test  t   = {};
     t.perm = {mem, mem+cap};
+    arenablank(mem, mem+cap);
 
     test_base(&t);
     test_arenacheck(&t);
