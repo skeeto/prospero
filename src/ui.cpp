@@ -865,6 +865,9 @@ static b32 penbutton(Gui *g, char const *id, Str *runs, i32 *styles, i32 n)
     f32         w    = 0;
     for (i32 i = 0; i < n; i++) {
         Str s = runs[i];
+        if (!s.len) {
+            continue;  // may be null, which ImGui would strlen
+        }
         w += stylefont(&g->fonts, styles[i])->CalcTextSizeA(size, 1e9f, 0, s.cdata,
                                                              s.cdata+s.len).x;
     }
