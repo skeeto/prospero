@@ -1957,9 +1957,49 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         ImGui::TextDisabled("%s%s", cstr0(&a, showpath(v, k->path)),
                             k->hidden ? ", for you alone: not offered to the agent" : "");
     }
+
+    // Memory: the project's, its index as the agent knows it
+    ImGui::Separator();
+    ImGui::TextUnformatted("Memory");
+    if (!hostcap(s->host, "memory")) {
+        ImGui::TextDisabled("None: this host's engine is too old for memory.");
+    } else if (!v->memdir.len) {
+        ImGui::TextDisabled("None: memory is for your own sessions in a project, "
+                            "while [memory] is on.");
+    } else {
+        text(v->memdir);
+        ImGui::SameLine();
+        Str why = s->host->kind==GH_REMOTE
+                ? concat(&a, "The memory is on ", concat(&a, s->host->name,
+                         ": only a file on this computer shows in its file manager"))
+                : !v->mems.len ? Str("Nothing is saved yet") : Str{};
+        ImGui::BeginDisabled(why.len != 0);
+        if (ImGui::SmallButton("Reveal")) {
+            guishow(g, join(&a, v->memdir, "MEMORY.md"));
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "memory reveal");
+        whytip(why.len ? why : Str("Show MEMORY.md, the index of the memories, in the "
+                                   "file manager"));
+        if (!v->mems.len) {
+            ImGui::TextDisabled("Nothing is saved yet: the agent saves what later "
+                                "sessions here should know, and what you ask it to "
+                                "remember.");
+        }
+        for (iz i = 0; i < v->mems.len; i++) {
+            ViewMem *m = &v->mems[i];
+            ImGui::Bullet();
+            text(m->name);
+            if (m->desc.len) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", cstr0(&a, m->desc));
+            }
+        }
+    }
     ImGui::PopTextWrapPos();
     g->infoshown = (i32)v->instr.len;
     g->infoagents = agents;
+    g->infomems = (i32)v->mems.len;
 }
 
 // The context gauge: a thin bar of the tokens the context holds, on the

@@ -334,6 +334,12 @@ struct ViewInstr {
     Str importer;   // the file that imported it, if any
 };
 
+// A memory in the project's index, MEMORY.md: its line's link and words.
+struct ViewMem {
+    Str name;
+    Str desc;
+};
+
 // An image the user attached to a message, in the session directory.
 struct ViewImage {
     Str name;  // img/N.png or img/N.jpg
@@ -510,6 +516,8 @@ struct View {
     Slice<ViewInstr> instr;     // instruction files, by path
     Slice<Str>       skipped;   // instruction files not loaded
     Str              instrtext; // what went into the system prompt
+    Str              memdir;    // the project's memory, empty if none
+    Slice<ViewMem>   mems;      // its index, as the agent knows it
     i64              cutseq;    // records before it are summarized
 };
 
@@ -985,6 +993,37 @@ static Str oneline(Arena *a, Str s)
 
 // What a call is about, from its arguments: the command or the path, a
 // path inside the working directory relative to it.
+// The memories of an index: each line linking NAME.md, its words after
+// the link. Lines the user wrote otherwise are not memories.
+static Slice<ViewMem> viewmems(Arena *a, Str index)
+{
+    Slice<ViewMem> r = {};
+    for (Str rest = index; rest.len;) {
+        Cut c = cut(rest, '\n');
+        rest = c.tail;
+        Str line = trim(c.head);
+        iz  beg  = find(line, "[");
+        iz  mid  = find(line, "](");
+        if (beg<0 || mid<beg) {
+            continue;
+        }
+        Str link = cuthead(line, mid+2);
+        iz  end  = find(link, ".md)");
+        if (end < 0) {
+            continue;
+        }
+        ViewMem m = {};
+        m.name = clone(a, takehead(link, end));
+        Str desc = trim(cuthead(link, end+4));
+        if (startswith(desc, "\xe2\x80\x94") || startswith(desc, "-") || startswith(desc, ":")) {
+            desc = trim(cuthead(desc, startswith(desc, "\xe2") ? 3 : 1));
+        }
+        m.desc = clone(a, desc);
+        r = push(a, r, m);
+    }
+    return r;
+}
+
 static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
 {
     Json *j     = jsonparse(&scratch, args).root;
@@ -1026,6 +1065,10 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
         // The target as given, until the result names its title
         Str to = jsonstr(jsonget(j, "to"));
         return oneline(perm, concat(&scratch, "Message \xe2\x86\x92 ", to));
+    } else if (name == "memory") {
+        Str act = jsonstr(jsonget(j, "action"));
+        Str mem = jsonstr(jsonget(j, "name"));
+        return oneline(perm, concat(&scratch, act=="forget" ? Str("Forget ") : Str("Save "), mem));
     } else if (name=="edit" && patch->type==JSON_STRING) {
         // The files the patch names, as it names them
         Slice<Str> paths = patchpaths(&scratch, patch->str);
@@ -1935,6 +1978,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                        kind=="skills"       ? Str("To the agent: skills") :
                        kind=="budget"       ? Str("To the agent: wrap up") :
                        kind=="side"         ? Str("To the agent: a side chat") :
+                       kind=="memory"       ? Str("To the agent: memory") :
                        Str("To the agent");
         }
     } return 1;
@@ -2166,6 +2210,11 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             v->instrtext = clone(&v->aux, text);
         }
     } return 1;
+
+    case EV_MEMORY:
+        v->memdir = clone(&v->aux, jsonstr(jsonget(j, "dir")));
+        v->mems   = viewmems(&v->aux, jsonstr(jsonget(j, "text")));
+        return 1;
 
     case EV_QUEUE: {
         Json       *items = jsonget(j, "items");

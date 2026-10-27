@@ -2467,7 +2467,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Start a desktop subagent", "Type on the desktop as a subagent",
                "Start a subagent that messages", "Message the parent as a subagent",
                "Describe the images", "Ask on the side", "Run a long command",
-               "Stream, then pause", "Call the MCP server")
+               "Stream, then pause", "Call the MCP server", "Remember the hosts")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2552,6 +2552,13 @@ def sc_gui(model, n, req):
         ok = all(base64.b64decode(data).startswith(magic.get(mime, b"?"))
                  for mime, data in images)
         yield from answer(model, f"I see {len(images)} images{'' if ok else ', some broken'}.")
+    elif "Remember the hosts" in prompt:
+        if step == 0:
+            yield from tool(model, n, "memory", {
+                "action": "save", "name": "hosts", "description": "The test hosts",
+                "type": "reference", "text": "biron.local: Windows 11.\n"})
+        else:
+            yield from answer(model, "Remembered the hosts.")
     elif "Stream in the background" in prompt:
         # About 8 s: the window goes partway through, and the rest
         # streams to nobody but the log

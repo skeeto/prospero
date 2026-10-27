@@ -1021,6 +1021,28 @@ static void test_viewpanels(Test *t)
         }
         expect(t, "panels.instr", finish(&b), "/w/AGENTS.md changed 12;/w/x.md start 5;");
         expect(t, "panels.instrtext", concat(&a, v->instrtext, v->skipped[0]), "T/w/y.md");
+
+        // Memory: the index's memories as last told, hand-written lines not
+        View *mv = testview(&a);
+        apply(mv, a, R"({"sid":"s","seq":1,"ts":0,"ev":"memory","why":"start","dir":"/m/-w",)"
+                     R"("text":"# Mine\n- [hosts](hosts.md) — Test hosts\n"})");
+        apply(mv, a, R"({"sid":"s","seq":2,"ts":0,"ev":"memory","why":"saved","dir":"/m/-w",)"
+                     R"("text":"# Mine\n- [hosts](hosts.md) — Test hosts\n- [b](b.md): B\n"})");
+        apply(mv, a, R"({"sid":"s","seq":3,"ts":0,"ev":"notice","kind":"memory","text":"Changed"})");
+        b.len = 0;
+        for (iz i = 0; i < mv->mems.len; i++) {
+            print(&b, mv->mems[i].name);
+            putbyte(&b, '=');
+            print(&b, mv->mems[i].desc);
+            putbyte(&b, ';');
+        }
+        expect(t, "panels.mems", concat(&a, mv->memdir, finish(&b)), "/m/-whosts=Test hosts;b=B;");
+        expect(t, "panels.memnotice", mv->msgs.len ? mv->msgs[mv->msgs.len-1].label : Str{},
+               "To the agent: memory");
+        expect(t, "panels.memsave", toolsummary(&a, a, "memory",
+               "{\"action\":\"save\",\"name\":\"hosts\"}", "/w"), "Save hosts");
+        expect(t, "panels.memforget", toolsummary(&a, a, "memory",
+               "{\"action\":\"forget\",\"name\":\"hosts\"}", "/w"), "Forget hosts");
         apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
                     R"({"t":"call","id":"t1","name":"task","args":"{\"description\":\"Look\"}"},)"
                     R"({"t":"call","id":"s1","name":"shell","args":"{\"command\":\"sleep 9\"}"}]})");

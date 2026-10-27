@@ -1329,6 +1329,7 @@ struct Gui {
     i32                jobsshown;    // jobs the jobs panel drew
     i32                infoshown;    // instruction files the info listed
     i32                infoagents;   // of them AGENTS.md
+    i32                infomems;     // memories the info listed
     i32                bgbadge;      // the session shown was badged background
     b32                outshown;     // the Output window showed text
     i32                thumbsdrawn;  // thumbnails drawn with their image
@@ -10441,7 +10442,9 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_REWOUND, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FORCED, 0, 0, 0, ""},
-    // The session's info: its instruction file
+    // The session's info: its instruction file, and a memory saved
+    {OP_PROMPT, 0, 0, 0, 0, "Remember the hosts."},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "Remembered the hosts."},
     {OP_MOVE, T_INFOBTN, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 600, ""},
@@ -14801,7 +14804,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         return m && m->card->kind=="prune" && m->card->count>=3 && elided==m->card->count;
     }
     case CHK_INFO:
-        return c.OpenPopupStack.Size>0 && g->infoshown>=1 && g->infoagents>=1;
+        return c.OpenPopupStack.Size>0 && g->infoshown>=1 && g->infoagents>=1 &&
+               g->infomems>=1;
     case CHK_QUEUED:
         return g->queuedshown && v->state==LIVE_QUEUED && v->queuepos==1;
     case CHK_FALLBACK:
