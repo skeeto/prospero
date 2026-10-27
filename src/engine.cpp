@@ -4354,8 +4354,12 @@ static Slice<Str> engineenv(Engine *e, Arena *a, b32 win)
 // A command's environment in shell sh, its section's settings as the
 // configuration now says: engineenv's, with PATH wrapped in the
 // section's path_prepend and path_append, then its env.NAME, and sh's
-// login set. A login sh on Windows gets CHERE_INVOKING=1 first, which
-// keeps MSYS2's and Git's /etc/profile in the working directory.
+// login set. A login sh on Windows gets these first, for MSYS2's and
+// Git's /etc/profile: CHERE_INVOKING=1, which keeps it in the working
+// directory, and MSYS2_PATH_TYPE=inherit, without ORIGINAL_PATH, which
+// keep this PATH after its own directories. MSYS2's default replaces
+// PATH with System32 and a few others, and an ORIGINAL_PATH inherited
+// from a Git Bash or MSYS2 terminal would stand in for this one.
 static Slice<Str> shellenvfor(Session *s, Arena *a, Shell *sh)
 {
     Engine    *e   = s->e;
@@ -4374,6 +4378,8 @@ static Slice<Str> shellenvfor(Session *s, Arena *a, Shell *sh)
     sh->login = cfgbool(cfgget(e->cfg, "shell", sh->name, "login", 0)) == 1;
     if (sh->login && win && (sh->kind==SHELL_SH || sh->kind==SHELL_BUSYBOX)) {
         env = envset(a, env, "CHERE_INVOKING", "1", win);
+        env = envset(a, env, "MSYS2_PATH_TYPE", "inherit", win);
+        env = envdel(a, env, "ORIGINAL_PATH", win);
     }
     Slice<CfgPair> pairs = cfgpairs(e->cfg, a, "shell", sh->name, "env.");
     for (iz i = 0; i < pairs.len; i++) {

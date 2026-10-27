@@ -2430,6 +2430,18 @@ static Slice<Str> envset(Arena *a, Slice<Str> env, Str name, Str value, b32 wind
     return put ? r : push(a, r, set);
 }
 
+// env without any variable NAME.
+static Slice<Str> envdel(Arena *a, Slice<Str> env, Str name, b32 windows)
+{
+    Slice<Str> r = {};
+    for (iz i = 0; i < env.len; i++) {
+        if (!envnameis(env[i], name, windows)) {
+            r = push(a, r, env[i]);
+        }
+    }
+    return r;
+}
+
 // A PATH of the directories pre, then path, then post, each joined by
 // the platform's separator, empty ones left out. On Windows the extra
 // directories take backslashes, which cmd.exe's own search wants.

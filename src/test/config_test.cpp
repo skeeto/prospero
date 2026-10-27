@@ -2031,6 +2031,7 @@ static void testcfgpath(Test *t)
         e->home   = "/home/u";
         e->exedir = "/exe";
         e->env    = push(&a, e->env, Str("PATH=/usr/bin"));
+        e->env    = push(&a, e->env, Str("ORIGINAL_PATH=/c/stale"));
 
         struct { Str name; b32 prog; Str want; } cases[] = {
             {"zsh",          0, "zsh /opt/bin/zsh Zsh here"},
@@ -2066,7 +2067,9 @@ static void testcfgpath(Test *t)
                endswith(all, "|FOO=bar|MINE=42") && find(all, "EVIL")<0), "1");
         s->te.windows = 1;
         env = shellenvfor(s, &a, &sh);
-        expect(t, "shellenv.windows", istr(&a, find(showlist(&a, env), "|CHERE_INVOKING=1|FOO=bar")>0), "1");
+        all = showlist(&a, env);
+        expect(t, "shellenv.windows", istr(&a, find(all, "|CHERE_INVOKING=1|MSYS2_PATH_TYPE=inherit|FOO=bar")>0 &&
+               find(all, "ORIGINAL_PATH")<0), "1");
         Shell plain = {};
         plain.name  = "sh";
         plain.login = 1;

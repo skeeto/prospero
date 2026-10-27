@@ -2335,6 +2335,56 @@ def shell_profile(t):
             f"a warning for a missing shell: {warns}")
 
 
+def gitbash():
+    """The bash of the Git for Windows on PATH (its sh, in a copy without
+    bash.exe), whose /etc/profile is MSYS2's but for its default PATH
+    type, inherit rather than minimal: else None."""
+    git = shutil.which("git")
+    if not git:
+        return None
+    d = os.path.dirname(os.path.realpath(git))
+    for root in (os.path.dirname(d), os.path.dirname(os.path.dirname(d))):
+        for name in ("bash.exe", "sh.exe"):
+            sh = os.path.join(root, "usr", "bin", name)
+            if os.path.isfile(sh) and os.path.isfile(os.path.join(root, "etc", "profile")):
+                return sh.replace("\\", "/")
+    return None
+
+
+@scenario(bound=30)
+def shell_login_msys(t):
+    """A login shell of MSYS2's kind, Git's bash here, keeps the working
+    directory and Prospero's PATH, its path_prepend included, though
+    Prospero itself has an ORIGINAL_PATH from a Git Bash terminal, which
+    the profile would take instead; env.MSYS2_PATH_TYPE = minimal, as
+    stock MSYS2 has it, drops that PATH. Windows, with Git's bash."""
+    sh = gitbash() if t.host.windows and isinstance(t.host, LocalHost) else None
+    if not sh:
+        t.note("Windows, with Git's bash, only")
+        return
+    bin = t.host.join(t.base, "loginbin")
+    t.host.mkdir(bin)
+    t.host.write(t.host.join(bin, "prospero_login_tool"), "#!/bin/sh\necho login-tool-ran\n")
+    base = t.host.read(t.config) + ("[tools]\nshell = gitbash\n"
+                                    f"[shell gitbash]\nprogram = {sh}\nlogin = true\n"
+                                    f"path_prepend = {bin}\n")
+    work = t.work.replace("\\", "/").rstrip("/").lower()
+    for extra, kind, ran in (("", "inherit", True),
+                             ("env.MSYS2_PATH_TYPE = minimal\n", "minimal", False)):
+        t.host.write(t.config, base + extra)
+        r = t.run(timeout=60, env={"ORIGINAL_PATH": "/c/prospero-stale"})
+        t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+        ends = [e["text"] for e in r.all("tool.end")]
+        t.check(len(ends) == 1, f"{len(ends)} shell calls")
+        if len(ends) != 1:
+            continue
+        lines = [x.strip().replace("\\", "/").rstrip("/").lower() for x in ends[0].splitlines()]
+        t.check(f"type={kind}" in ends[0], f"{kind}: {ends[0]!r}")
+        t.check(("login-tool-ran" in ends[0]) == ran,
+                f"{kind}: path_prepend {'kept' if ran else 'dropped'}: {ends[0]!r}")
+        t.check(work in lines, f"{kind}: in {work}: {ends[0]!r}")
+
+
 @scenario(bound=40)
 def shell_switch(t):
     """shells lists the user's [shell] sections, found or not, and the

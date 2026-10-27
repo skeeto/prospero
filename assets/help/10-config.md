@@ -76,7 +76,10 @@ cannot choose what runs, so these are ignored in one:
   and the shell picker. `program` is a path, a name on PATH, or `sh`,
   `powershell` or `cmd`, and defaults to NAME. `login = true` starts
   it as a login shell (`sh -l`, PowerShell with your profile, cmd with
-  its AutoRun). `env.NAME` sets a variable for its commands (a value,
+  its AutoRun). On Windows, MSYS2's and Git's profile then keep the
+  working directory and Prospero's PATH, after their own directories
+  (`env.MSYS2_PATH_TYPE = minimal` for MSYS2's own default, which
+  drops it). `env.NAME` sets a variable for its commands (a value,
   or `env:VAR` from Prospero's own environment). `path_prepend` and
   `path_append` add directories around `[tools]`'s, and `description`
   tells the agent what the shell is for:

@@ -359,6 +359,15 @@ def sc_shell_profile(model, n, req):
         yield from answer(model, "Ran in the profile.")
 
 
+def sc_shell_login_msys(model, n, req):
+    # Each of the scenario's runs: one command, then the answer
+    if req["messages"][-1].get("role") != "tool":
+        yield from tool(model, n, "shell", {"command":
+                        'echo "type=$MSYS2_PATH_TYPE"; prospero_login_tool; pwd -W'})
+    else:
+        yield from answer(model, "Ran in a login bash.")
+
+
 def sc_shell_switch(model, n, req):
     # The prompt among the user's messages since the last answer (a
     # notice comes after it): run a command, start a subagent to, or
