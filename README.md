@@ -521,6 +521,15 @@ the first of `AGENTS.md` or `CLAUDE.md` (`[instructions] files`) in
 each directory from the root of the repository down to the working
 directory, and more below it as the agent works there.
 
+Memory is the agent's own, as Claude Code's auto memory is: for each
+project, below `memory` in the state directory, a `MEMORY.md` index of
+one line per memory, given to each new session in the project, and a
+file for each, which the agent saves and forgets with its memory tool,
+on its own judgment and when asked. A repository's worktrees share
+one. To remember something for every project on this machine, the
+agent adds it to the user's own `AGENTS.md`, asking first.
+`[memory] enabled = false` turns it off.
+
 Skills are the same as in Claude Code and other harnesses: a directory
 holding `SKILL.md`, whose frontmatter gives its `name` and
 `description`, with any files it refers to beside it, perhaps below
