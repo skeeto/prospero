@@ -207,6 +207,35 @@ static void printduration(Buf *b, i64 secs)
     }
 }
 
+// A measured duration for people, from milliseconds: "46 ms", "3.2 s",
+// "3 min 12 s", "2 h 5 min".
+static void printelapsed(Buf *b, i64 ms)
+{
+    i64 tenths = (ms + 50) / 100;
+    i64 secs   = (ms + 500) / 1000;
+    if (ms < 1000) {
+        print(b, ms);
+        print(b, " ms");
+    } else if (tenths < 600) {
+        print(b, tenths/10);
+        if (tenths%10) {
+            putbyte(b, '.');
+            print(b, tenths%10);
+        }
+        print(b, " s");
+    } else if (secs < 3600) {
+        print(b, secs/60);
+        print(b, " min ");
+        print(b, secs%60);
+        print(b, " s");
+    } else {
+        print(b, secs/3600);
+        print(b, " h ");
+        print(b, secs/60%60);
+        print(b, " min");
+    }
+}
+
 static Str shelldesc(Arena *a, ToolEnv *te)
 {
     i64 job = te->jobtimeout ? te->jobtimeout : JOB_DEFAULT;
@@ -2251,12 +2280,13 @@ struct ShellEnd {
     i64  timeout;   // seconds
     i64  job;       // moved to the background as this job, or 0
     b32  moved;     // and moved there by the user, not at its timeout
-    i64  elapsed;   // seconds it had run then
+    i64  ms;        // how long it ran, to its exit if it exited
     b32  nojob;     // timed out, but too many jobs ran to move it
 };
 
 // What the agent sees of a finished command: an excerpt of the cleaned
-// output and how it ended. Reads the spill file in pieces.
+// output, how it ended, and after how long. Reads the spill file in
+// pieces.
 static ToolOut shellresult(Os *os, Arena *a, Str spill, ShellEnd *e)
 {
     ToolOut r    = {};
@@ -2287,11 +2317,13 @@ static ToolOut shellresult(Os *os, Arena *a, Str spill, ShellEnd *e)
     }
 
     if (e->cancelled) {
-        print(&b, "[cancelled by the user: the command was killed]");
+        print(&b, "[cancelled by the user after ");
+        printelapsed(&b, e->ms);
+        print(&b, ": the command was killed]");
     } else if (e->job) {
         if (e->moved) {
             print(&b, "[the user moved it to the background after ");
-            printduration(&b, e->elapsed);
+            printelapsed(&b, e->ms);
             print(&b, ", so it continues as job ");
         } else {
             print(&b, "[still running after ");
@@ -2313,14 +2345,20 @@ static ToolOut shellresult(Os *os, Arena *a, Str spill, ShellEnd *e)
                            : Str(". Run long jobs with a larger timeout, or "
                                  "in smaller steps]"));
     } else if (e->limited) {
-        print(&b, "[the output passed 1 GiB, so the command was killed]");
+        print(&b, "[the output passed 1 GiB after ");
+        printelapsed(&b, e->ms);
+        print(&b, ", so the command was killed]");
     } else if (e->signal) {
         print(&b, "[killed by signal ");
         print(&b, (i64)e->signal);
+        print(&b, ", after ");
+        printelapsed(&b, e->ms);
         putbyte(&b, ']');
     } else {
         print(&b, "[exit code ");
         print(&b, (i64)e->code);
+        print(&b, ", after ");
+        printelapsed(&b, e->ms);
         putbyte(&b, ']');
         r.ok = !e->code;
     }

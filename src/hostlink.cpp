@@ -515,6 +515,7 @@ static void farend(Engine *e, Arena scratch, HostLink *l, HostKid *k,
         text = reportcut(p, &scratch, call, text, &t->spill, &t->bytes);
         t->status = clone(&p->perm, status);
         t->text   = clone(&p->perm, text);
+        t->took   = os_ticks(e->os) - t->start;
         t->done   = 1;
         arm(p, T_TASK, 0);
         live(p);  // one fewer at work
@@ -829,6 +830,7 @@ static void farcancel(Session *s, Arena scratch)
         print(&b, " was cancelled before it finished.");
         t->status = "cancelled";
         t->text   = finish(&b);
+        t->took   = os_ticks(e->os) - t->start;
         t->done   = 1;
     }
     arm(s, T_TASK, 0);

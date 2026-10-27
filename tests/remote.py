@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -427,6 +428,17 @@ def durable(lines, sid):
         if r.get("sid") == sid and "seq" in r:
             out.append(ln)
     return out
+
+
+# The last line of a subagent's call: how long it worked.
+WORKED = re.compile(r"\n\n\[The subagent worked for [0-9][0-9. a-z]*\.\]\Z")
+
+
+def report(text):
+    """A subagent's call's text without its last line, how long the
+    subagent worked, or None if that line is missing."""
+    m = WORKED.search(text)
+    return text[:m.start()] if m else None
 
 
 def checklog(t, lines, sid, what):
@@ -2107,7 +2119,8 @@ def far_task(t):
         te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
         t.check(len(te) == 2 and all(r["status"] == "ok" and r.get("host") == "y"
                                      for r in te), f"tool.ends {te}")
-        t.check([r["text"] for r in te] == ["Done (ssh): First job.", "Done (ssh): Second job."],
+        t.check([report(r["text"]) for r in te] == ["Done (ssh): First job.",
+                                                    "Done (ssh): Second job."],
                 f"reports {[r['text'] for r in te]}")
         kids = f.ykids()
         t.check(len(kids) == 2 and all(k["parent"] == sid and k["via"] == "ssh"
@@ -2136,7 +2149,7 @@ def far_fallback(t):
         sid = f.parent()
         f.ends(sid)
         te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
-        t.check(te and te[0]["text"] == "On the parent's model.", f"tool.end {te}")
+        t.check(te and report(te[0]["text"]) == "On the parent's model.", f"tool.end {te}")
         kids = f.ykids()
         t.check(kids and kids[0]["model"] == f.model, f"y's model {kids}")
     finally:
@@ -2329,7 +2342,7 @@ def far_wsl(t):
         te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
         t.check(len(te) == 2 and all(r["status"] == "ok" and r.get("host") == "Ubuntu"
                                      for r in te), f"tool.ends {te}")
-        t.check(te[0]["text"] == "Done (wsl): First job.", f"report {te[0]['text']}")
+        t.check(report(te[0]["text"]) == "Done (wsl): First job.", f"report {te[0]['text']}")
         kids = f.ykids()
         t.check(len(kids) == 2 and all(k["via"] == "wsl" and k["distro"] == "Ubuntu"
                                        for k in kids), f"y's sessions {kids}")

@@ -746,6 +746,17 @@ def compact(names):
     return out
 
 
+# The last line of a subagent's call: how long it worked.
+WORKED = re.compile(r"\n\n\[The subagent worked for [0-9][0-9. a-z]*\.\]\Z")
+
+
+def report(text):
+    """A subagent's call's text without its last line, how long the
+    subagent worked, or None if that line is missing."""
+    m = WORKED.search(text)
+    return text[:m.start()] if m else None
+
+
 # Scenarios
 
 SCENARIOS = {}
@@ -786,7 +797,7 @@ def read_edit_shell(t):
     t.check([e["status"] for e in ends] == ["ok", "ok", "ok"],
             f"statuses {[e['status'] for e in ends]}")
     t.check(t.file("hello.txt") == "hello there\n", "the edit landed")
-    t.check("hello there" in ends[2]["text"] and "[exit code 0]" in ends[2]["text"],
+    t.check("hello there" in ends[2]["text"] and "[exit code 0, after " in ends[2]["text"],
             "the shell saw the edit")
     t.check(ends[2].get("spill", "").startswith("out/"), "shell output spilled")
     # The prompt prefix is byte-stable: each request extends the last
@@ -1355,7 +1366,7 @@ def bg_shell(t):
         end = h.wait(lambda e: e.get("ev") == "tool.end" and e.get("sid") == sid)
         t.check(end["status"] == "background" and end.get("job") == 1 and
                 "started" in end["text"] and end["ms"] < 3000, f"the call ended: {end}")
-        t.check(re.search(r"\[the user moved it to the background after [12] seconds?, so "
+        t.check(re.search(r"\[the user moved it to the background after [12](\.[0-9])? s, so "
                           r"it continues as job 1\. You will be told when it ends: do not "
                           r"poll it or wait for it\.", end["text"]), f"its text: {end['text']!r}")
         js = h.all("job.start", sid)
@@ -1873,12 +1884,12 @@ def powershell(t):
     if len(ends) < 5:
         return
     t.check("h\u00e9llo" in ends[0] and "w\u00e9ll" in ends[0]
-            and "[exit code 0]" in ends[0], f"UTF-8 output: {ends[0]!r}")
-    t.check("[exit code 1]" in ends[1], f"a failed cmdlet: {ends[1]!r}")
-    t.check("[exit code 3]" in ends[2], f"a native status: {ends[2]!r}")
+            and "[exit code 0, after " in ends[0], f"UTF-8 output: {ends[0]!r}")
+    t.check("[exit code 1, after " in ends[1], f"a failed cmdlet: {ends[1]!r}")
+    t.check("[exit code 3, after " in ends[2], f"a native status: {ends[2]!r}")
     t.check("PROSPERO_COMMAND" not in ends[3] and "end" in ends[3]
-            and "[exit code 0]" in ends[3], f"variable removed: {ends[3]!r}")
-    t.check("[exit code 1]" in ends[4] and "line:1" in ends[4]
+            and "[exit code 0, after " in ends[3], f"variable removed: {ends[3]!r}")
+    t.check("[exit code 1, after " in ends[4] and "line:1" in ends[4]
             and "__ok" not in ends[4], f"a parse error: {ends[4]!r}")
     tools = json.dumps(t.requests()[0]["body"].get("tools"))
     t.check("PowerShell" in tools, "the shell tool describes PowerShell")
@@ -1919,9 +1930,9 @@ def path_settings(t):
     t.check(len(ends) == 5, f"{len(ends)} shell calls")
     if len(ends) < 5:
         return
-    t.check("pre-tool-ran" in ends[0] and "[exit code 0]" in ends[0],
+    t.check("pre-tool-ran" in ends[0] and "[exit code 0, after " in ends[0],
             f"prepended: {ends[0]!r}")
-    t.check("post-tool-ran" in ends[1] and "[exit code 0]" in ends[1],
+    t.check("post-tool-ran" in ends[1] and "[exit code 0, after " in ends[1],
             f"appended: {ends[1]!r}")
     t.check("both-from-pre" in ends[2], f"prepended first: {ends[2]!r}")
     t.check("the real cat" in ends[3] and "appended-cat" not in ends[3],
@@ -3436,13 +3447,16 @@ def task_parallel(t):
     ends = r.all("tool.end", own)
     t.check([e["status"] for e in ends] == ["ok", "ok"], f"statuses {ends}")
     t.check([e["call"] for e in ends] == calls, "in call order")
-    t.check([e["text"] for e in ends] == ["Report: a.txt has 3 lines.",
-                                          "Report: b.txt has 2 lines."], f"reports {ends}")
+    t.check([report(e["text"]) for e in ends] == ["Report: a.txt has 3 lines.",
+                                                  "Report: b.txt has 2 lines."],
+            f"reports {ends}")
     bysid = {k["sid"]: k["call"] for k in kids}
     t.check(all(bysid.get(e.get("child")) == e["call"] for e in ends), "each names its child")
     t.check(r.last("turn.end", own).get("why") == "done", "the parent ends done")
-    t.check("Both reported: Report: a.txt has 3 lines. / Report: b.txt has 2 lines."
-            == r.last("assistant", own)["blocks"][0]["text"], "the parent read both")
+    heard = re.sub(r"\n\n\[The subagent worked for [^]]*\]", "",
+                   r.last("assistant", own)["blocks"][0]["text"])
+    t.check(heard == "Both reported: Report: a.txt has 3 lines. / Report: b.txt has 2 lines.",
+            "the parent read both")
 
     firsts = first_steps(t.requests(t.model2))
     t.check(len(firsts) == 2, f"two conversations {len(firsts)}, retries "
@@ -3489,8 +3503,10 @@ def task_depth(t):
     refused = r.all("tool.end", two["sid"])
     t.check(len(refused) == 1 and refused[0]["status"] == "error" and
             "not available in this session" in refused[0]["text"], f"refused {refused}")
-    t.check(r.last("assistant", own)["blocks"][0]["text"] ==
-            "Top heard: Level 1 heard: Level 2 done; its task was refused.",
+    # Each level's report ends with how long it worked
+    heard = re.sub(r"\n\n\[The subagent worked for [^]]*\]", "",
+                   r.last("assistant", own)["blocks"][0]["text"])
+    t.check(heard == "Top heard: Level 1 heard: Level 2 done; its task was refused.",
             f"reports {r.last('assistant', own)}")
 
 
@@ -3515,9 +3531,9 @@ def task_budget(t):
         t.check(len(notes) == 1, f"one wrap-up notice: {notes}")
     ends = r.all("tool.end", own)
     t.check([e["status"] for e in ends] == ["ok", "error"], f"statuses {ends}")
-    t.check(ends[0]["text"] == "Obedient final report.", f"obeyed {ends[0]}")
+    t.check(report(ends[0]["text"]) == "Obedient final report.", f"obeyed {ends[0]}")
     t.check("budget of 6 model requests" in ends[1]["text"] and
-            ends[1]["text"].endswith("Working on step 5."), f"stopped {ends[1]['text']!r}")
+            report(ends[1]["text"]).endswith("Working on step 5."), f"stopped {ends[1]['text']!r}")
     stub = [k["sid"] for k in kids if k["call"] == ends[1]["call"]][0]
     t.check(r.last("turn.end", stub).get("why") == "budget", "its turn ended at the budget")
     t.check(r.last("turn.end", own).get("why") == "done", "the parent goes on")
@@ -3658,7 +3674,7 @@ def role_tools(t):
     t.check([e["status"] for e in ends] == ["ok", "ok", "error"], f"statuses {ends}")
     t.check(ends[0]["text"].startswith("Explore report: The tool \"shell\" is not "
                                        "available"), f"explore {ends[0]['text']!r}")
-    t.check(ends[1]["text"] == "Fast report.", f"fast {ends[1]}")
+    t.check(report(ends[1]["text"]) == "Fast report.", f"fast {ends[1]}")
     t.check("No role is named \"nope\"" in ends[2]["text"] and "child" not in ends[2],
             f"nope {ends[2]}")
 
@@ -3743,7 +3759,7 @@ def task_ask(t):
         t.check(ans and ans[0]["by"] == "user" and ans[0]["decision"] == "allow", f"{ans}")
         t.check(outside_file(t) == "from the child\n", "written outside")
         te = h.all("tool.end", sid)
-        t.check(te and te[0]["text"] == "The child wrote it.", f"report {te}")
+        t.check(te and report(te[0]["text"]) == "The child wrote it.", f"report {te}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -3766,7 +3782,7 @@ def task_close(t):
         end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
         t.check(end["why"] == "done", f"the parent ends {end}")
         te = h.all("tool.end", sid)
-        t.check(te and te[0]["text"] == "The child was refused.", f"report {te}")
+        t.check(te and report(te[0]["text"]) == "The child was refused.", f"report {te}")
         t.check(outside_file(t) is None, "nothing written outside")
     finally:
         rc = h.close()
@@ -3792,7 +3808,7 @@ def task_long(t):
     t.check(te["bytes"] == len(full), f"bytes {te['bytes']}")
     t.check(t.host.read(path) == full, "the whole report kept")
     line = full[:51200].count("\n") + 1
-    t.check(te["text"].endswith(f"where this part ends at line {line}.]"),
+    t.check(report(te["text"]).endswith(f"where this part ends at line {line}.]"),
             f"its line: {te['text'][-80:]!r}")
     msgs = t.requests()[1]["body"]["messages"]
     t.check(msgs[-1]["role"] == "tool" and msgs[-1]["content"] == te["text"],
@@ -3808,7 +3824,7 @@ def task_unattended(t):
     ans = r.all("answer", kids[0]["sid"])
     t.check(ans and ans[0]["by"] == "policy" and ans[0]["decision"] == "deny", f"{ans}")
     t.check(outside_file(t) is None, "nothing written outside")
-    t.check(r.last("tool.end", own).get("text") == "The child was refused.",
+    t.check(report(r.last("tool.end", own).get("text")) == "The child was refused.",
             f"report {r.last('tool.end', own)}")
 
 
@@ -5884,7 +5900,7 @@ def task_model(t):
             f"their models {[k['model'] for k in kids]}")
     ends = r.all("tool.end", own)
     t.check([e["status"] for e in ends] == ["ok", "ok", "ok", "error"], f"statuses {ends}")
-    t.check([e["text"] for e in ends[:3]] ==
+    t.check([report(e["text"]) for e in ends[:3]] ==
             [f"Child on {t.model2}.", f"Child on {t.model}.", f"Child on {t.model2}."],
             f"reports {ends}")
     err = ends[3]["text"]
@@ -8473,7 +8489,7 @@ def mcp_subagent(t):
     r = t.run(env=mcpenv(t))
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     sid, _ = r.sessions()
-    said = [e["text"] for e in r.all("tool.end", sid)]
+    said = [report(e["text"]) for e in r.all("tool.end", sid)]
     every = ",".join("mcp__fake__" + x for x in ("echo", "image", "big", "slow", "fail",
                                                   "refuse", "crash", "structured", "where"))
     t.check(said == [every, "mcp__fake__echo"], f"offered: {said}")

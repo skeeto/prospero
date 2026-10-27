@@ -713,11 +713,11 @@ static void test_tools(Test *t)
                "continues in the background as job 3. You will be told when it ends: "
                "do not poll it or wait for it. Use job_output to read more of its "
                "output, and job_kill to stop it]");
-        e.moved   = 1;
-        e.elapsed = 7;
+        e.moved = 1;
+        e.ms    = 7300;
         o = shellresult(os, a, "/s/none.log", &e);
         expect(t, "moved by the user", o.text, "[the user moved it to the background "
-               "after 7 seconds, so it continues as job 3. You will be told when it "
+               "after 7.3 s, so it continues as job 3. You will be told when it "
                "ends: do not poll it or wait for it. Use job_output to read more of "
                "its output, and job_kill to stop it]");
         e = {};
@@ -726,5 +726,42 @@ static void test_tools(Test *t)
         e.timeout  = 5;
         o = shellresult(os, a, "/s/none.log", &e);
         expect(t, "no room for a job", istr(a, find(o.text, "too many background jobs")>0), "1");
+
+        e = {};
+        e.ms = 3249;
+        o = shellresult(os, a, "/s/none.log", &e);
+        expect(t, "exit after", o.text, "[exit code 0, after 3.2 s]");
+        e.code = 2;
+        o = shellresult(os, a, "/s/none.log", &e);
+        expect(t, "failed after", istr(a, o.text=="[exit code 2, after 3.2 s]" && !o.ok), "1");
+        e.signal = 9;
+        e.ms     = 46;
+        o = shellresult(os, a, "/s/none.log", &e);
+        expect(t, "signal after", o.text, "[killed by signal 9, after 46 ms]");
+        e.limited = 1;
+        e.ms      = 41000;
+        o = shellresult(os, a, "/s/none.log", &e);
+        expect(t, "limit after", o.text, "[the output passed 1 GiB after 41 s, so the "
+               "command was killed]");
+        e.cancelled = 1;
+        e.ms        = 12000;
+        o = shellresult(os, a, "/s/none.log", &e);
+        expect(t, "cancel after", o.text, "[cancelled by the user after 12 s: the "
+               "command was killed]");
+    }
+
+    {
+        // Measured durations: ms, tenths of a second, then whole seconds
+        struct { i64 ms; Str want; } cases[] = {
+            {0, "0 ms"}, {46, "46 ms"}, {999, "999 ms"}, {1000, "1 s"},
+            {3249, "3.2 s"}, {3250, "3.3 s"}, {59949, "59.9 s"},
+            {59950, "1 min 0 s"}, {192000, "3 min 12 s"},
+            {3599499, "59 min 59 s"}, {7500000, "2 h 5 min"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Buf b(a, 64);
+            printelapsed(&b, cases[i].ms);
+            expect(t, "printelapsed", finish(&b), cases[i].want);
+        }
     }
 }

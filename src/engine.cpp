@@ -314,6 +314,7 @@ struct Job {
     i64   deadline;  // ticks: stopped then
     i64   killat;    // ticks: killed then, once stopping
     i64   drainat;   // ticks: done waiting for its output, once exited
+    i64   exitat;    // ticks: when it exited, once it has
     i64   total;
     i32   code;
     i32   signal;
@@ -367,6 +368,7 @@ struct TaskRun {
     i64 bytes;
     u64 far;     // a subagent on another host: its HostKid's serial
     Str host;    // and that host's name
+    i64 took;    // ticks it worked, once it reported or was cancelled
 };
 
 // A session parked while idle (park): what its log does not hold, for
@@ -398,6 +400,7 @@ struct ShellRun {
     Str  spill;     // absolute path of the output file
     Str  rel;       // relative to the session directory
     i64  start;
+    i64  exitat;    // when it exited, once it has
     i64  timeout;   // seconds
     i64  total;
     i32  code;
@@ -4030,27 +4033,6 @@ static Proc *spawncall(Session *s, Arena scratch, Slice<Str> argv, Str cmdline,
     return p;
 }
 
-// A duration for people: "45 s", "3 min 12 s", "2 h 5 min".
-static void printelapsed(Buf *b, i64 ticks)
-{
-    i64 secs = (ticks + SEC/2) / SEC;
-    if (secs < 60) {
-        print(b, secs);
-        print(b, " s");
-    } else if (secs < 3600) {
-        print(b, secs/60);
-        print(b, " min ");
-        print(b, secs%60);
-        print(b, " s");
-    } else {
-        print(b, secs/3600);
-        print(b, " h ");
-        print(b, secs/60%60);
-        print(b, " min");
-    }
-}
-
-
 // Background jobs
 //
 // A job is a command left running: one still running at its timeout,
@@ -4225,7 +4207,7 @@ static Str jobnotice(Session *s, Arena *a, Job *j, i64 bytes)
     }
     if (j->ran) {  // unknown for a job lost in a crash
         print(&b, ", after ");
-        printelapsed(&b, j->ran);
+        printelapsed(&b, j->ran/MS);
     }
     print(&b, ".\nCommand: ");
     print(&b, j->command);
@@ -4260,7 +4242,7 @@ static void jobend(Session *s, Arena scratch, Job *j)
     j->procid  = 0;
     j->state   = JOB_DONE;
     j->drainat = 0;
-    j->ran     = os_ticks(os) - j->start;
+    j->ran     = (j->exited ? j->exitat : os_ticks(os)) - j->start;
     jobarm(s);
     if (j->hidden) {
         for (Job **p = &s->jobs; *p; p = &(*p)->next) {
@@ -4342,6 +4324,7 @@ static void jobrecord(Session *s, Arena scratch, Job *j, Record r)
         return;
     case PROC_EXIT:
         j->exited = 1;
+        j->exitat = os_ticks(os);
         j->code   = get32(r.data);
         j->signal = get32(cuthead(r.data, 4));
         if (j->eof) {
@@ -4467,6 +4450,7 @@ static void jobadopt(Session *s, Job *j)
     j->eof    = s->sh.eof;
     j->total  = s->sh.total;
     j->exited = s->sh.exited;
+    j->exitat = s->sh.exitat;
     j->code   = s->sh.code;
     j->signal = s->sh.signal;
     if (s->sh.limited && j->state==JOB_RUN) {
@@ -4478,13 +4462,19 @@ static void jobadopt(Session *s, Job *j)
     }
 }
 
+// Milliseconds the current command ran: to its exit, or until now.
+static i64 shellran(Session *s)
+{
+    i64 end = s->sh.exited ? s->sh.exitat : os_ticks(s->e->os);
+    return (end - s->sh.start) / MS;
+}
+
 // A foreground command still running at its timeout becomes a job, as
 // does one the user moved to the background (background).
 static void movetojob(Session *s, Arena scratch, b32 user)
 {
     Engine *e = s->e;
     Block  *c = &s->calls[s->callidx];
-    i64     t = os_ticks(e->os) - s->sh.start;
     disarm(s, T_TOOL);
     disarm(s, T_KILL);
     disarm(s, T_DRAIN);
@@ -4499,7 +4489,7 @@ static void movetojob(Session *s, Arena scratch, b32 user)
     end.job     = j->n;
     end.timeout = s->sh.timeout;
     end.moved   = user;
-    end.elapsed = (t + SEC/2) / SEC;
+    end.ms      = shellran(s);
     ToolOut o  = shellresult(e->os, &scratch, s->sh.spill, &end);
     Stat    st = os_stat(e->os, scratch, s->sh.spill);
     toolend(s, scratch, "background", o.text, 0, 0, s->sh.rel, st.size, j->n);
@@ -4531,9 +4521,9 @@ static void tooljobs(Session *s, Arena scratch)
         switch (j->state) {
         case JOB_RUN:
             print(&b, "running for ");
-            printelapsed(&b, now - j->start);
+            printelapsed(&b, (now - j->start)/MS);
             print(&b, " (stopped at its limit in ");
-            printelapsed(&b, j->deadline>now ? j->deadline-now : 0);
+            printelapsed(&b, (j->deadline>now ? j->deadline-now : 0)/MS);
             putbyte(&b, ')');
             break;
         case JOB_STOP:
@@ -4775,6 +4765,7 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled)
     end.cancelled = cancelled;
     end.timeout   = s->sh.timeout;
     end.nojob     = s->sh.nojob;
+    end.ms        = shellran(s);
     ToolOut o = shellresult(e->os, &scratch, s->sh.spill, &end);
     Str status = cancelled    ? Str("cancelled") :
                  end.timedout ? Str("timeout")   :
@@ -10989,6 +10980,7 @@ static void taskreport(Session *c, Arena scratch, Str why, Str err)
     Str text = reporttext(c, &scratch, why, err, &t->status);
     text = reportcut(p, &scratch, p->calls[t->call].id, text, &t->spill, &t->bytes);
     t->text = clone(&p->perm, text);
+    t->took = os_ticks(p->e->os) - t->start;
     t->done = 1;
     arm(p, T_TASK, 0);
     live(p);  // one fewer at work
@@ -11022,8 +11014,17 @@ static void taskflush(Session *s, Arena scratch)
         }
         Arena    a = scratch;
         TaskRun *t = &s->tasks[i];
+        Str      text = t->text;
+        if (t->took) {
+            Buf b(&a, text.len + 64);
+            print(&b, text);
+            print(&b, "\n\n[The subagent worked for ");
+            printelapsed(&b, t->took/MS);
+            print(&b, ".]");
+            text = finish(&b);
+        }
         s->callstart = t->start;
-        toolend(s, a, t->status, t->text, 0, 0, t->spill, t->bytes, 0, t->child,
+        toolend(s, a, t->status, text, 0, 0, t->spill, t->bytes, 0, t->child,
                 t->host);
     }
     for (iz i = 0; i < s->tasks.len; i++) {
@@ -15232,6 +15233,7 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         break;
     case PROC_EXIT:
         s->sh.exited = 1;
+        s->sh.exitat = os_ticks(e->os);
         s->sh.code   = get32(r.data);
         s->sh.signal = get32(cuthead(r.data, 4));
         if (s->sh.eof) {
