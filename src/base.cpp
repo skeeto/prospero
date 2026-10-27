@@ -36,10 +36,36 @@ struct Region {
 // Arenas with a region grow by committing more of it. Only the arena at
 // the top of a region may grow: when splitting one, clear the region on
 // every part but the last.
+#if PROSPERO_ARENACHECK
+// Where an arena came to be, for the checker's reports (arenacheck.cpp)
+#  define ARENASITE , char const *file = __builtin_FILE(), i32 line = __builtin_LINE()
+#else
+#  define ARENASITE
+#endif
+
 struct Arena {
     byte   *beg    = {};
     byte   *end    = {};
     Region *region = {};
+#if PROSPERO_ARENACHECK
+    // The checker's view: an identity once it allocates, the arena it
+    // was copied from, and the block a carve was lent by its parent.
+    mutable u32  aid    = 0;
+    u32          parent = 0;
+    u32          lender = 0;
+    byte        *lentlo = {};
+    byte        *lenthi = {};
+    char const  *file   = {};
+    i32          line   = 0;
+
+    constexpr Arena(char const *file = __builtin_FILE(), i32 line = __builtin_LINE())
+        : file{file}, line{line} {}
+    constexpr Arena(byte *beg, byte *end, Region *region = 0 ARENASITE)
+        : beg{beg}, end{end}, region{region}, file{file}, line{line} {}
+    Arena(Arena const &, char const * = __builtin_FILE(), i32 = __builtin_LINE());
+    Arena &operator=(Arena const &);
+    ~Arena();
+#endif
 };
 
 // Provided by the platform layer: report out-of-memory and exit.
@@ -47,6 +73,10 @@ struct Arena {
 // Provided by the platform layer: commit a region from its base up to
 // the given size, updating committed. Returns 0 on failure.
 static b32 os_commit(Region *, iz upto);
+
+#if PROSPERO_ARENACHECK
+inline void arenacheck_alloc(Arena *, byte *, iz, void *pc);
+#endif
 
 // Extend a region-backed arena so that count objects of the given size
 // fit after pad bytes, or report out-of-memory.
@@ -82,6 +112,9 @@ static T *alloc(Arena *a, iz count = 1)
         arenagrow(a, pad, count, size);
     }
     T *r = (T *)(a->beg + pad);
+#if PROSPERO_ARENACHECK
+    arenacheck_alloc(a, (byte *)r, count*size, __builtin_return_address(0));
+#endif
     a->beg += pad + count*size;
     for (iz i = 0; i < count; i++) {
         new (r+i) T();
@@ -96,6 +129,9 @@ static u8 *allocbytes(Arena *a, iz count)
         arenagrow(a, 0, count, 1);
     }
     u8 *r = (u8 *)a->beg;
+#if PROSPERO_ARENACHECK
+    arenacheck_alloc(a, a->beg, count, __builtin_return_address(0));
+#endif
     a->beg += count;
     return r;
 }
@@ -104,12 +140,35 @@ static u8 *allocbytes(Arena *a, iz count)
 // whose results go in a itself: passing a as both, by pointer and by
 // value, would have its scratch overwrite results made before it was
 // done. It cannot grow.
-static Arena carve(Arena *a, iz cap)
+static Arena carve(Arena *a, iz cap ARENASITE)
 {
     Arena r = {};
     r.beg = (byte *)allocbytes(a, cap);
     r.end = r.beg + cap;
+#if PROSPERO_ARENACHECK
+    r.lender = a->aid;
+    r.lentlo = r.beg;
+    r.lenthi = r.end;
+    r.file   = file;
+    r.line   = line;
+#endif
     return r;
+}
+
+// A growable arena over a reservation, or a null arena given null.
+static Arena newarena(Region *r ARENASITE)
+{
+    Arena a = {};
+    if (r) {
+        a.beg    = r->base;
+        a.end    = r->base + r->committed;
+        a.region = r;
+    }
+#if PROSPERO_ARENACHECK
+    a.file = file;
+    a.line = line;
+#endif
+    return a;
 }
 
 static void copybytes(void *dst, void *src, iz len)
@@ -811,3 +870,8 @@ static void sort(T *a, iz n, b32 (*less)(T *, T *), Arena scratch)
         }
     }
 }
+
+
+#if PROSPERO_ARENACHECK
+#  include "arenacheck.cpp"
+#endif

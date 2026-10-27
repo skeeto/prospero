@@ -74,6 +74,13 @@ struct Os {
 };
 
 [[noreturn]] static void os_oom() { __builtin_trap(); }  // a bug at these sizes
+
+#if PROSPERO_ARENACHECK
+static void os_arenafault(Str msg)
+{
+    write(2, msg.data, (uz)msg.len);
+}
+#endif
 static b32 os_commit(Region *, iz) { return 0; }
 static Region *os_reserve(Os *, iz) { return 0; }
 static void os_release(Os *, Region *) {}

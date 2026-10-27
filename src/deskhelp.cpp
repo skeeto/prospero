@@ -708,10 +708,7 @@ static void dkcmdwait(DkCtx *c, DkArgs *a)
     // Each poll lists windows into an arena of its own, reset every
     // time, apart from the output and the original window
     Arena *keep = c->a;
-    Arena  poll = {};
-    iz     cap  = (iz)4 << 20;
-    poll.beg = (byte *)allocbytes(keep, cap);
-    poll.end = poll.beg + cap;
+    Arena  poll = carve(keep, (iz)4<<20);
     for (;;) {
         Arena scratch = poll;
         c->a = &scratch;

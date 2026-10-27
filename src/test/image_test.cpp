@@ -509,9 +509,7 @@ static void test_image(Test *t)
         expect(t, "refused, nothing kept", istr(a, a->beg==at), "1");
 
         // More than the arena holds fails, rather than running out
-        Arena small = {};
-        small.beg = alloc<byte>(a, 1<<22);
-        small.end = small.beg + (1<<22);
+        Arena small = carve(a, 1<<22);
         at = small.beg;
         Image p = imgdecode(&small, big, (i64)1<<40);
         expect(t, "png out of memory", p.err, "out of memory to decode it");

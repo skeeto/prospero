@@ -77,6 +77,11 @@ static VFile *vfind(Os *os, Str path, b32 create)
 
 [[noreturn]] static void os_oom() { __builtin_trap(); }
 
+static void os_arenafault(Str msg)
+{
+    fwrite(msg.data, 1, (uz)msg.len, stderr);
+}
+
 // Reservations come from the C heap, with commits only bookkeeping.
 static Region *os_reserve(Os *, iz cap)
 {
@@ -97,7 +102,11 @@ static b32 os_commit(Region *r, iz upto)
     return 1;
 }
 
-static void os_release(Os *, Region *r) { free(r); }
+static void os_release(Os *, Region *r)
+{
+    arenaforget(r, r->base+r->cap);
+    free(r);
+}
 
 static i64 os_ticks(Os *os) { return os->now; }
 static i64 os_time(Os *os) { return os->now / 1000; }
@@ -531,8 +540,7 @@ static VRoute *vroute(Os *os, Str url, i32 status, Str headers, Str body)
 static Os *newos(Arena *a, iz cap)
 {
     Os *os = alloc<Os>(a);
-    os->mem.beg = (byte *)allocbytes(a, cap);
-    os->mem.end = os->mem.beg + cap;
+    os->mem = carve(a, cap);
     return os;
 }
 
@@ -575,6 +583,7 @@ static Str istr(Arena *a, i64 v)
 }
 
 #include "test/base_test.cpp"
+#include "test/arenacheck_test.cpp"
 #include "test/wide_test.cpp"
 #include "test/reap_test.cpp"
 #include "test/json_test.cpp"
@@ -642,6 +651,7 @@ int main()
     t.perm = {mem, mem+cap};
 
     test_base(&t);
+    test_arenacheck(&t);
     test_wide(&t);
     test_reap(&t);
     test_json(&t);

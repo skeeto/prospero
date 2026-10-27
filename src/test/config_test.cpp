@@ -12,8 +12,7 @@ static CfgEnv newcfgenv(Arena *a)
 {
     CfgEnv r = {};
     r.os = newos(a, 1<<20);
-    r.scratch.beg = (byte *)allocbytes(a, 1<<22);
-    r.scratch.end = r.scratch.beg + (1<<22);
+    r.scratch = carve(a, 1<<22);
     return r;
 }
 
@@ -1202,8 +1201,7 @@ static void testcfgengine(Test *t)
     // settings it had, as another reload finds them still gone
     Session *s = alloc<Session>(&a);
     s->e        = e;
-    s->perm.beg = (byte *)allocbytes(&a, 1<<20);
-    s->perm.end = s->perm.beg + (1<<20);
+    s->perm     = carve(&a, 1<<20);
     s->model    = "m";
     s->cwd      = "/w";
     endpointconf(e, &s->perm, "local", &s->ep);

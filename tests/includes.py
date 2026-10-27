@@ -213,7 +213,7 @@ class Engine:
             self.p.wait()
             raise Failure("the harness did not exit")
         err = self.p.stderr.read()
-        if "ThreadSanitizer" in err or "AddressSanitizer" in err:
+        if "ThreadSanitizer" in err or "AddressSanitizer" in err or "arena fault" in err:
             raise Failure("sanitizer report:\n" + err[:4000])
         return self.p.returncode
 

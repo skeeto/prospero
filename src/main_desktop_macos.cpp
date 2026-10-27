@@ -162,6 +162,14 @@ static b32 writeall(i32 fd, Str s)
     _exit(DK_FAIL);
 }
 
+#if PROSPERO_ARENACHECK
+static void os_arenafault(Str msg)
+{
+    writeall(2, "prospero-desktop: ");
+    writeall(2, msg);
+}
+#endif
+
 static iz pagesize()
 {
     return (iz)sysconf(_SC_PAGESIZE);
@@ -196,15 +204,6 @@ static Region *reserve(iz cap)
     r->cap       = cap - hdr;
     r->committed = page - hdr;
     return r;
-}
-
-static Arena newarena(Region *r)
-{
-    Arena a = {};
-    a.beg    = r->base;
-    a.end    = r->base + r->committed;
-    a.region = r;
-    return a;
 }
 
 static char *cstr(Arena *a, Str s)

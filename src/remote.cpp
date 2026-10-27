@@ -393,9 +393,7 @@ static b32 remotestart(Remote *r, Arena scratch)
             r->why = concat(&r->perm, "cannot find the host's endpoint: ", err);
             return 0;
         }
-        Arena err = {};  // for the error, apart from the scratch below
-        err.beg = (byte *)allocbytes(&scratch, 1<<14);
-        err.end = err.beg + (1<<14);
+        Arena err = carve(&scratch, 1<<14);  // apart from the scratch below
         HostStart hs = hoststart(os, &err, scratch, state, r->conf.config,
                                  r->conf.idle, endpoint, r->in, r->tid);
         if (!hs.c) {

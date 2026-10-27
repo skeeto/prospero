@@ -406,10 +406,9 @@ static void testtargets(Test *t)
              "[endpoint fast]\nurl = http://fast/v1\n"
              "[endpoint Qwen]\nkind = openai\n"  // no url: not an endpoint
              "[model small]\n[model big]\n");
-    Engine *e   = alloc<Engine>(&a);
-    byte   *mem = alloc<byte>(&a, 1<<16);
+    Engine *e = alloc<Engine>(&a);
     e->os   = v.os;
-    e->perm = {mem, mem + (1<<16)};
+    e->perm = carve(&a, 1<<16);
     e->cfg  = newconfig(v.os, &a, v.scratch, "/r/h.ini", 0);
     e->ini  = e->cfg->ini;
 

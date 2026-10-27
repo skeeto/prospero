@@ -150,6 +150,14 @@ static b32 writeall(i32 fd, Str s)
     _exit(2);
 }
 
+#if PROSPERO_ARENACHECK
+static void os_arenafault(Str msg)
+{
+    writeall(2, "prospero: ");
+    writeall(2, msg);
+}
+#endif
+
 // Reservations are mapped inaccessible and made writable as committed.
 static Region *os_reserve(Os *, iz cap)
 {
@@ -189,6 +197,9 @@ static b32 os_commit(Region *r, iz upto)
 static void os_release(Os *, Region *r)
 {
     byte *p = (byte *)r;
+#if PROSPERO_ARENACHECK
+    arenaforget(p, r->base+r->cap);
+#endif
     munmap(p, (uz)(r->base + r->cap - p));
 }
 

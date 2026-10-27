@@ -236,6 +236,14 @@ static b32 writeall(uz h, Str s)
     ExitProcess(DK_FAIL);
 }
 
+#if PROSPERO_ARENACHECK
+static void os_arenafault(Str msg)
+{
+    writeall(GetStdHandle(STD_ERROR_HANDLE), DK_NAME ": ");
+    writeall(GetStdHandle(STD_ERROR_HANDLE), msg);
+}
+#endif
+
 static b32 os_commit(Region *r, iz upto)
 {
     if (upto <= r->committed) {
@@ -263,15 +271,6 @@ static Region *reserve(iz cap)
     r->cap       = cap - hdr;
     r->committed = page - hdr;
     return r;
-}
-
-static Arena newarena(Region *r)
-{
-    Arena a = {};
-    a.beg    = r->base;
-    a.end    = r->base + r->committed;
-    a.region = r;
-    return a;
 }
 
 

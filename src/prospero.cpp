@@ -560,19 +560,6 @@ static u32     os_guilimits(Os *);
 #endif
 
 
-// A growable arena over a reservation, or a null arena given null.
-static Arena newarena(Region *r)
-{
-    Arena a = {};
-    if (r) {
-        a.beg    = r->base;
-        a.end    = r->base + r->committed;
-        a.region = r;
-    }
-    return a;
-}
-
-
 #include "json.cpp"
 #include "sse.cpp"
 #include "ini.cpp"

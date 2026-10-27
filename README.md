@@ -839,6 +839,17 @@ The suites:
   HTTP layer (`src/main_edgetest.cpp`), with certificates that openssl
   makes for the test and that are never installed. With `--net`, real
   servers too, badssl.com's bad ones among them.
+- `arenalint`: the sources, for one arena given to a call both as the
+  place for its results and, by value, as its scratch (`f(&a, a)`),
+  and for a Buf left bound to a local arena (`tests/arenalint.py`).
+
+Debug builds, and `unit` always, check arenas for aliasing as they run
+(`src/arenacheck.cpp`; `-DPROSPERO_ARENACHECK=OFF` to leave it out): an
+arena allocating again over bytes another one allocated over while it
+held them, a copy allocating over what a live copy of the same arena
+holds, or an allocation through an arena already destroyed. Each is
+reported on stderr as an "arena fault", with where the arenas were
+made, and traps; the suites fail on one.
 
 The Python suites need [uv][]. They also run against other machines
 from this one: `--host` runs Prospero on a Windows host over ssh,

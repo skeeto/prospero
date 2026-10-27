@@ -470,6 +470,14 @@ static Str16 widepath(Arena *a, Str path)
     ExitProcess(2);
 }
 
+#if PROSPERO_ARENACHECK
+static void os_arenafault(Str msg)
+{
+    writeall(GetStdHandle(STD_ERROR_HANDLE), "prospero: ");
+    writeall(GetStdHandle(STD_ERROR_HANDLE), msg);
+}
+#endif
+
 // Reservations are committed on demand, a page at a time at minimum.
 static Region *os_reserve(Os *, iz cap)
 {
@@ -506,6 +514,9 @@ static b32 os_commit(Region *r, iz upto)
 
 static void os_release(Os *, Region *r)
 {
+#if PROSPERO_ARENACHECK
+    arenaforget(r, r->base+r->cap);
+#endif
     VirtualFree((uz)r, 0, MEM_RELEASE);
 }
 
@@ -985,39 +996,39 @@ static Str os_getenv(Os *, Arena *a, Str name)
             return {};
         }
 
-        u8 *out = allocbytes(a, 3*(iz)cap);
+        Arena o   = carve(a, 3*(iz)cap);
+        byte *out = o.beg;
         tmp   = *a;
         wname = towide(&tmp, name).data;
         c16 *buf = alloc<c16>(&tmp, cap);
         SetLastError(0);
         i32 len = GetEnvironmentVariableW(wname, buf, cap);
         if (!len && GetLastError()) {
-            a->beg = (byte *)out;
+            a->beg = out;
             return {};  // removed meanwhile
         } else if (len < cap) {
-            Arena o = {(byte *)out, (byte *)out + 3*(iz)cap};
-            Str   r = fromwide(&o, buf, len);  // non-null even when empty
+            Str r = fromwide(&o, buf, len);  // non-null even when empty  // non-null even when empty
             a->beg = (byte *)(r.data + r.len);
             return r;
         }
-        a->beg = (byte *)out;  // grew meanwhile: retry
+        a->beg = out;  // grew meanwhile: retry
     }
 }
 
 static Str os_exepath(Os *, Arena *a)
 {
     for (i32 cap = 260; cap <= 1<<16; cap *= 4) {
-        u8   *out = allocbytes(a, 3*(iz)cap);
+        Arena o   = carve(a, 3*(iz)cap);
+        byte *out = o.beg;
         Arena tmp = *a;
         c16  *buf = alloc<c16>(&tmp, cap);
         i32   len = GetModuleFileNameW(0, buf, cap);
         if (len>0 && len<cap) {
-            Arena o = {(byte *)out, (byte *)out + 3*(iz)cap};
-            Str   r = fromwide(&o, buf, len);
+            Str r = fromwide(&o, buf, len);
             a->beg = (byte *)(r.data + r.len);
             return r;
         }
-        a->beg = (byte *)out;
+        a->beg = out;
         if (!len) {
             break;
         }

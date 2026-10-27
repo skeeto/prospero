@@ -617,12 +617,11 @@ static void test_remoteask(Test *t)
 // and caps (strings only), cloned again only when they change.
 static void test_remotehello(Test *t)
 {
-    Arena   a   = t->perm;
-    Remote *r   = alloc<Remote>(&a);
-    byte   *mem = (byte *)allocbytes(&a, 1<<16);
+    Arena   a = t->perm;
+    Remote *r = alloc<Remote>(&a);
+    r->perm      = carve(&a, 1<<16);
     r->os        = newos(&a, 1<<12);
     r->out       = newmailbox(&a, 1<<14, 0, 0);
-    r->perm      = {mem, mem + (1<<16)};
     r->held      = Buf(&r->perm, 256);
     r->link      = newlink(&r->perm, 1, 1<<12, 16);
     r->conf.name = "vm";

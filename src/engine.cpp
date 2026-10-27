@@ -12970,8 +12970,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     }
     if (task.ok && asked.len) {
         // Kept apart from the scratch that submodel works in
-        byte *mem  = alloc<byte>(&scratch, 1<<16);
-        Arena keep = {mem, mem + (1<<16)};
+        Arena keep = carve(&scratch, 1<<16);
         bad = submodel(e, &keep, scratch, model, probe.url);
     }
     if (bad.len) {
@@ -15588,9 +15587,7 @@ static void listertimeout(Engine *e, Arena scratch, i64 now)
 static void reconfigure(Engine *e, Arena scratch)
 {
     e->ini = e->cfg->ini;
-    Arena found = {};  // apart from the scratch findrg uses
-    found.beg = (byte *)allocbytes(&scratch, 1<<16);
-    found.end = found.beg + (1<<16);
+    Arena found = carve(&scratch, 1<<16);  // apart from findrg's scratch
     Str rg = findrg(e, &found, scratch);
     if (rg != e->te.rg) {
         e->te.rg = clone(&e->perm, rg);

@@ -365,6 +365,14 @@ static i32 onxioerror(Display *)
     _exit(DK_FAIL);
 }
 
+#if PROSPERO_ARENACHECK
+static void os_arenafault(Str msg)
+{
+    writeall(2, "prospero-desktop: ");
+    writeall(2, msg);
+}
+#endif
+
 static iz pagesize()
 {
     iz page = sysconf(_SC_PAGESIZE);
@@ -399,15 +407,6 @@ static Region *reserve(iz cap)
     r->cap       = cap - hdr;
     r->committed = page - hdr;
     return r;
-}
-
-static Arena newarena(Region *r)
-{
-    Arena a = {};
-    a.beg    = r->base;
-    a.end    = r->base + r->committed;
-    a.region = r;
-    return a;
 }
 
 static char *cstr(Arena *a, Str s)
@@ -2687,10 +2686,7 @@ static b32 haswindow(Dk *dk, u32 pid)
         return 1;  // its window may be Wayland's, which cannot be seen
     }
     Arena a = dk->tmp;
-    Arena t = {};  // apart from the list, which grows in a
-    iz    n = (iz)1 << 20;
-    t.beg = (byte *)allocbytes(&a, n);
-    t.end = t.beg + n;
+    Arena t = carve(&a, 1<<20);  // apart from the list, which grows in a
     Slice<Xid> ids = toplevels(dk, &a, t);
     for (iz i = 0; i < ids.len; i++) {
         Card c = getcard(dk, ids[i], dk->atom[A_PID], XA_CARDINAL);

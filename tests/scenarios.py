@@ -603,7 +603,7 @@ class T:
         finally:
             killer.cancel()
         err = p.stderr.read()
-        if "ThreadSanitizer" in err or "AddressSanitizer" in err:
+        if "ThreadSanitizer" in err or "AddressSanitizer" in err or "arena fault" in err:
             raise Failure("sanitizer report:\n" + err[:4000])
         return Result(p.returncode, lines, err, time.monotonic() - t0)
 
@@ -732,7 +732,7 @@ class Headless:
             self.p.wait()
         self.reader.join(2)
         err = self.p.stderr.read()
-        if "ThreadSanitizer" in err or "AddressSanitizer" in err:
+        if "ThreadSanitizer" in err or "AddressSanitizer" in err or "arena fault" in err:
             raise Failure("sanitizer report:\n" + err[:4000])
         return self.p.returncode
 

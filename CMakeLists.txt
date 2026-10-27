@@ -60,6 +60,15 @@ target_compile_options(prospero_core_flags INTERFACE
 target_link_options(prospero_core_flags INTERFACE
   "$<$<CONFIG:Debug>:${PROSPERO_TRAP}>")
 
+# Debug builds check arenas for aliasing (src/arenacheck.cpp), as the
+# unit tests always do: an arena allocating again over bytes another
+# allocated over meanwhile, or allocating once destroyed.
+option(PROSPERO_ARENACHECK "Check arenas for aliasing in Debug builds" ON)
+if(PROSPERO_ARENACHECK)
+  target_compile_definitions(prospero_core_flags INTERFACE
+    "$<$<CONFIG:Debug>:PROSPERO_ARENACHECK=1>")
+endif()
+
 check_linker_flag(CXX -nostdlib++ PROSPERO_HAS_NOSTDLIBXX)
 
 # __FILE__, which ImGui's assertions log even in Release (src/imconfig.h),
@@ -286,6 +295,7 @@ if(NOT CMAKE_CROSSCOMPILING)
   enable_testing()
   add_executable(prospero_test src/main_test.cpp)
   target_link_libraries(prospero_test PRIVATE prospero_core_flags wuffs)
+  target_compile_definitions(prospero_test PRIVATE PROSPERO_ARENACHECK=1)
   if(PROSPERO_GUI)
     # The GUI's pure modules: scheduler, markdown, layout, view model.
     target_link_libraries(prospero_test PRIVATE md4c)

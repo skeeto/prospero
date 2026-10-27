@@ -62,9 +62,7 @@ static void ssestatus(Buf *b, b32 err, b32 cutoff, i64 retry)
 static Str ssetrace(Arena *a, Str src, iz *cuts, iz ncuts, iz max)
 {
     iz    cap     = (iz)1<<20;
-    Arena scratch = {};
-    scratch.beg = (byte *)allocbytes(a, cap);
-    scratch.end = scratch.beg + cap;
+    Arena scratch = carve(a, cap);
 
     Sse s = newsse(a, max);
     Buf b(a, 256);
@@ -597,9 +595,7 @@ static void test_sse(Test *t)
     {
         Arena tmp   = a;
         iz    size  = 1<<13;
-        Arena state = {};
-        state.beg = (byte *)allocbytes(&tmp, size);
-        state.end = state.beg + size;
+        Arena state = carve(&tmp, size);
         Sse   s    = newsse(&state, 1<<20);
         byte *mark = state.beg;
 
@@ -651,9 +647,7 @@ static void test_sse(Test *t)
         Arena tmp     = a;
         iz    max     = 1<<20;
         iz    cap     = (iz)1<<21;  // roomy: a regression fails, not traps
-        Arena scratch = {};
-        scratch.beg = (byte *)allocbytes(&tmp, cap);
-        scratch.end = scratch.beg + cap;
+        Arena scratch = carve(&tmp, cap);
         Sse s = newsse(&tmp, max);
 
         Buf id(&tmp, max+(1<<10));
@@ -684,9 +678,7 @@ static void test_sse(Test *t)
         Arena tmp   = a;
         iz    max   = ((iz)1<<16) + 8;
         iz    size  = 16*max;  // roomy: a regression fails, not traps
-        Arena state = {};
-        state.beg = (byte *)allocbytes(&tmp, size);
-        state.end = state.beg + size;
+        Arena state = carve(&tmp, size);
         byte *mark = state.beg;
         Sse   s    = newsse(&state, max);
 

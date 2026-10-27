@@ -33,9 +33,7 @@ static Str searchshow(Os *os, Arena *a, i32 mode, Str root, Str pattern,
     o.glob    = glob;
     o.fold    = fold;
     o.literal = literal;
-    Arena scratch = {};
-    scratch.beg = (byte *)allocbytes(a, 1<<20);
-    scratch.end = scratch.beg + (1<<20);
+    Arena scratch = carve(a, 1<<20);
     Buf out(a, 1<<12);
     iz  found = 0;
     Str err   = searchrun(os, a, scratch, &o, &out, 1, &found);
