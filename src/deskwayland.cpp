@@ -905,7 +905,8 @@ static void savetoken(Wl *wl, Arena scratch, Str token)
     if (!path.len) {
         return;
     }
-    mkdirs(scratch, statedir(&scratch));
+    Str dir = statedir(&scratch);
+    mkdirs(scratch, dir);
     Str tmp = concat(&scratch, path, ".new");
     if (!token.len) {
         unlink(cstr(&scratch, path));

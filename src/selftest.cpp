@@ -696,7 +696,8 @@ static void testfiles(Selftest *t, Arena scratch, Str dir)
     // A file in the way of a directory
     check(t, !os_mkdirs(os, scratch, fb), "os_mkdirs over a file fails");
     a = scratch;
-    check(t, !os_mkdirs(os, a, join(&a, fb, "x")),
+    Str under = join(&a, fb, "x");
+    check(t, !os_mkdirs(os, a, under),
           "os_mkdirs under a file fails");
 
     check(t, os_remove(os, scratch, fb), "os_remove");

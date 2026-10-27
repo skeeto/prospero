@@ -1031,7 +1031,8 @@ static void remotethread(void *arg)
                     b32  ours = !r->conf.path.len && !r->closing && !r->quitting;
                     i32  need = ours ? remoteneed(log.data, code) : NEED_NONE;
                     if (need) {
-                        remoteneeded(r, a, need, remotesshsaid(r, &a));
+                        Str said = remotesshsaid(r, &a);
+                        remoteneeded(r, a, need, said);
                     } else if (r->conf.wsl.len &&
                                find(why, "Linux is not installed")>=0) {
                         // No WSL here, which no second try fixes

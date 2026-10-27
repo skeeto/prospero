@@ -303,7 +303,8 @@ static void farlistthread(void *arg)
     }
     Str list = finish(&b);
     if (os_mkdirs(f->os, scratch, f->dir)) {
-        os_write(f->os, scratch, join(&scratch, f->dir, "wsl.list"), list);
+        Str path = join(&scratch, f->dir, "wsl.list");
+        os_write(f->os, scratch, path, list);
     }
     mailpost(f->mb, MAIL_DISTROS, 0, list, 1);
 }

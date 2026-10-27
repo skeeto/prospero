@@ -5700,7 +5700,8 @@ static void termopen(Gui *g, Arena a, GuiSession *s)
     g->terms++;
     if (!g->drive || g->realterm) {
         Str dir = p.dir.len ? p.dir : userhome(g->os, &a);
-        if (!os_launch(g->os, a, argv, dir, guienv(g, &a))) {
+        Slice<Str> env = guienv(g, &a);
+        if (!os_launch(g->os, a, argv, dir, env)) {
             g->lasterr = clone(&g->perm, concat(&a, "cannot open a terminal: ",
                                                 os_lasterr(g->os, &a)));
         }
@@ -15694,8 +15695,9 @@ static void drivestep(Gui *g)
         guinew(g, g->main, g->drivecwd, {}, {}, op->text);  // in a role, if named
         break;
     case OP_TOUCH: {
-        Arena a = g->frame;
-        if (!os_write(g->os, a, join(&a, g->drivecwd, op->text), "changed elsewhere\n")) {
+        Arena a    = g->frame;
+        Str   path = join(&a, g->drivecwd, op->text);
+        if (!os_write(g->os, a, path, "changed elsewhere\n")) {
             guilog(g, "drive: FAIL could not change the file");
             g->drivechecks++;
             g->drivefails++;

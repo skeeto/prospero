@@ -830,7 +830,8 @@ static void testcfgpoll(Test *t)
     CfgEnv v = newcfgenv(&a);
     v.os->now = 100 * 1000000;
     Str head = "include = t.ini\ninclude = later.ini\n[endpoint e]\n";
-    os_write(v.os, a, "/c/h.ini", concat(&a, head, "url = http://e/\n"));
+    Str ini = concat(&a, head, "url = http://e/\n");
+    os_write(v.os, a, "/c/h.ini", ini);
     os_write(v.os, a, "/c/t.ini", "[model m]\ntemperature = 1\n");
     Config *c = newconfig(v.os, &a, v.scratch, "/c/h.ini", 0);
     expect(t, "poll.watch", showlist(&a, c->watch),
@@ -846,7 +847,8 @@ static void testcfgpoll(Test *t)
     v.os->now += 2000000;
     got[1] = cfgpoll(c, v.scratch, 0);
 
-    os_write(v.os, a, "/c/h.ini", concat(&a, head, "url = http://f/\n"));
+    ini = concat(&a, head, "url = http://f/\n");
+    os_write(v.os, a, "/c/h.ini", ini);
     v.os->now += 2000000;
     got[2] = cfgpoll(c, v.scratch, 0);
     expect(t, "poll.url", cfgget(c, "endpoint", "e", "url", 0), "http://f/");
@@ -1442,8 +1444,9 @@ static void testcfgurls(Test *t)
     Str zeros = "0000000000000000000000000000000000000000000000000000000000000000";
     Str sha   = cfgsha256(&a, team);
     Str copy  = cfgcached(&a, os, url);
-    os_write(os, a, "/c/h.ini", concat(&a, concat(&a,
-             "include = https://team.example/h.ini sha256=", zeros), "\n"));
+    Str ini = concat(&a, concat(&a,
+             "include = https://team.example/h.ini sha256=", zeros), "\n");
+    os_write(os, a, "/c/h.ini", ini);
     i32 before = os->requests;
     cfgpoll(c, v.scratch, 1);
     cfgdrain(c, v.scratch);
@@ -1459,8 +1462,9 @@ static void testcfgurls(Test *t)
     // The right pin: the cached copy, with no fetch
     before = os->requests;
     os->now += s;  // a new mtime: the edit is the same size
-    os_write(os, a, "/c/h.ini", concat(&a, concat(&a,
-             "include = https://team.example/h.ini sha256=", sha), "\n"));
+    ini = concat(&a, concat(&a,
+             "include = https://team.example/h.ini sha256=", sha), "\n");
+    os_write(os, a, "/c/h.ini", ini);
     cfgpoll(c, v.scratch, 1);
     cfgdrain(c, v.scratch);
     expect(t, "pinned.requests", istr(&a, os->requests - before), "0");
@@ -1512,8 +1516,8 @@ static void testcfgurls(Test *t)
          "skipped"},
     };
     for (iz i = 0; i < countof(redirects); i++) {
-        os_write(os, a, "/c/r.ini", concat(&a, concat(&a, "include = ",
-                 redirects[i].url), "\n"));
+        Str ini = concat(&a, concat(&a, "include = ", redirects[i].url), "\n");
+        os_write(os, a, "/c/r.ini", ini);
         Config *r = newconfig(os, &a, v.scratch, "/c/r.ini", 0, "/s", 1);
         Str got = concat(&a, concat(&a, cfgget(r, "", "", "model", 0), " "),
                          inidiags(&a, r->ini));
@@ -1538,8 +1542,8 @@ static void testcfgurls(Test *t)
         {"https://f.example/none", "not supported in tests"},
     };
     for (iz i = 0; i < countof(fails); i++) {
-        os_write(os, a, "/c/f.ini", concat(&a, concat(&a, "include = ",
-                 fails[i].url), "\n"));
+        Str ini = concat(&a, concat(&a, "include = ", fails[i].url), "\n");
+        os_write(os, a, "/c/f.ini", ini);
         Config *f = newconfig(os, &a, v.scratch, "/c/f.ini", 0, "/s", 1);
         Str want = concat(&a, "/c/f.ini:1:11: warning: cannot fetch ",
                           fails[i].url);

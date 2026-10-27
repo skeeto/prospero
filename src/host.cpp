@@ -890,7 +890,8 @@ static void hostreplied(Host *h, Arena scratch, EvRec *r, Str line)
                 h->late[k] = h->late[k+1];
             }
             if (q.client) {
-                hostmust(h, q.client, scratch, hostreid(&scratch, r->root, q.cid));
+                Str line = hostreid(&scratch, r->root, q.cid);
+                hostmust(h, q.client, scratch, line);
             }
             return;
         }

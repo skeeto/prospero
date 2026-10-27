@@ -10384,8 +10384,9 @@ static i32 shellflavor(Os *os, Arena scratch, Str path, i32 kind, b32 win)
         {dir,            "cygwin1.dll",          FLAVOR_CYGWIN},
     };
     for (iz i = 0; i < countof(marks); i++) {
-        Arena a = scratch;
-        if (os_stat(os, a, join(&a, marks[i].dir, marks[i].file)).type == STAT_FILE) {
+        Arena a    = scratch;
+        Str   path = join(&a, marks[i].dir, marks[i].file);
+        if (os_stat(os, a, path).type == STAT_FILE) {
             return marks[i].flavor;
         }
     }
@@ -14931,7 +14932,8 @@ static Attached attachstaged(Engine *e, Arena *a, Str sid, Str path)
     putbyte(&b, '.');
     print(&b, k.ext);
     Str name = finish(&b);
-    if (!os_mkdirs(os, *a, dir) || !os_write(os, *a, join(a, sdir, name), data)) {
+    Str file = join(a, sdir, name);
+    if (!os_mkdirs(os, *a, dir) || !os_write(os, *a, file, data)) {
         r.err = "cannot keep the image in the session's directory";
         return r;
     }

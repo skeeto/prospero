@@ -180,7 +180,8 @@ static void test_deploy(Test *t)
         expect(t, "deploy.record.platform", r.platform, "linux-aarch64");
         expect(t, "deploy.record.proto", r.proto==0 ? Str("0") : Str("?"), "0");
         // Another destination that maps to the same file name
-        os_write(os, a, deployfile(&a, "/st", "x:y", ".ini"), "host = x_y\npath = p\n");
+        Str file = deployfile(&a, "/st", "x:y", ".ini");
+        os_write(os, a, file, "host = x_y\npath = p\n");
         r = deployrecord(os, &a, "/st", "x:y");
         expect(t, "deploy.record.other", r.ok ? Str("ok") : Str("no"), "no");
         r = deployrecord(os, &a, "/st", "nowhere");
