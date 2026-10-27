@@ -44,8 +44,8 @@ cannot choose what runs, so these are ignored in one:
 
 - plaintext secrets (a `key` not written as `env:NAME`), and secrets
   read from files (`file:PATH`);
-- `[remote]` and `[desktop]` settings;
-- `[tools] path_prepend` and `path_append`;
+- `[remote]`, `[shell]`, `[mcp]` and `[desktop]` settings;
+- `[tools] path_prepend`, `path_append` and `shells`;
 - a `[tools] shell` other than `auto`, `sh`, `powershell` or `cmd`;
 - `[ui] editor` and `[ui] terminal`.
 
@@ -69,8 +69,27 @@ cannot choose what runs, so these are ignored in one:
 - **`[tools] shell`**: the agent's shell for new sessions: `auto` (a
   POSIX `sh`; on Windows, `sh.exe` or `busybox.exe` next to Prospero
   or on PATH, else PowerShell, then `cmd`), `sh`, `powershell`, `cmd`,
-  or a program by its path or name. A session keeps the shell it began
-  with.
+  a `[shell]` section's name, or a program by its path or name. A
+  session keeps the shell it began with, until you switch it (see
+  Sessions and modes).
+- **`[shell NAME]`**: a shell you name, for `[tools] shell`, `shells`
+  and the shell picker. `program` is a path, a name on PATH, or `sh`,
+  `powershell` or `cmd`, and defaults to NAME. `login = true` starts
+  it as a login shell (`sh -l`, PowerShell with your profile, cmd with
+  its AutoRun). `env.NAME` sets a variable for its commands (a value,
+  or `env:VAR` from Prospero's own environment). `path_prepend` and
+  `path_append` add directories around `[tools]`'s, and `description`
+  tells the agent what the shell is for:
+
+      [shell msys2]
+      program = C:/msys64/usr/bin/bash.exe
+      login = true
+      env.MSYSTEM = UCRT64
+      description = MSYS2 UCRT64, with pacman to install packages
+
+- **`[tools] shells`**: shells the agent may pick per command, by name,
+  separated by blanks. The shell tool then lists them and takes one by
+  name. A name not found is left out, with a warning.
 - **`[ui] editor`**: the command that opens a draft (Ctrl+G) or a plan
   in an editor, given the file as one more word. It must wait until
   you are done and open a window of its own, as `code --wait`,

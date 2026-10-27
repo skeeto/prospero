@@ -50,6 +50,7 @@ agent (Tab completes the name):
 - `/compact [focus]` summarizes older messages now, keeping what the
   focus names;
 - `/model [NAME]` switches the model, or picks one from a list;
+- `/shell [NAME]` switches the shell, or picks one from a list;
 - `/rename TITLE` sets the title;
 - `/fork [TURN]` forks the session, or only its first turns;
 - `/side` starts a side chat (below);
@@ -97,6 +98,13 @@ Right-click a session in the sidebar, or open the Session menu, for:
   (below).
 - **Compact**: summarize the conversation now.
 - **Switch model**: a configured model, or another typed in.
+- **Switch shell**: a `[shell]` section of your configuration, or `sh`,
+  `powershell` or `cmd` where found, as the picker beside the model's
+  offers. Commands run there from then on; the agent is told at its
+  next request, once, and again after a compaction. A subagent starts
+  in its parent's shell. If the shell's program is gone when the
+  session opens again, commands run in the default shell, and the
+  agent is told.
 - **Export**: Markdown..., with or without reasoning and tool calls, to
   a file or the clipboard; or Raw log..., the session's log as it is.
 - **Archive**: move it under Archived, at the end of the sidebar.
