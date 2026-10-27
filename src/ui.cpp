@@ -136,15 +136,25 @@ static f32 stylesize(Fonts *f, i32 style)
     return (f32)(i32)(size + 0.5f);
 }
 
+// The font for a style, at the display's density. ImGui tells a font
+// its density only while it is pushed, and these are drawn and measured
+// without that (ImDrawList::AddText, GetFontBaked): one never pushed
+// would stay at 1, its glyphs rasterized at half size on a Retina
+// display and scaled up, blurred.
 static ImFont *stylefont(Fonts *f, i32 style)
 {
-    b32 bold   = style&(STYLE_BOLD|STYLE_HEADER|STYLE_HMASK);
-    b32 italic = style&STYLE_ITALIC;
+    b32     bold   = style&(STYLE_BOLD|STYLE_HEADER|STYLE_HMASK);
+    b32     italic = style&STYLE_ITALIC;
+    ImFont *font   = 0;
     if (style & STYLE_CODE) {
-        return bold ? f->monobold : f->mono;
+        font = bold ? f->monobold : f->mono;
+    } else {
+        font = bold&&italic ? f->bolditalic : bold ? f->bold :
+               italic ? f->italic : f->prose;
     }
-    return bold&&italic ? f->bolditalic : bold ? f->bold :
-           italic ? f->italic : f->prose;
+    f32 density = ImGui::GetIO().DisplayFramebufferScale.x;
+    font->CurrentRasterizerDensity = density>0 ? density : 1;
+    return font;
 }
 
 // Baked fonts per style, looked up once per frame: switching sizes
