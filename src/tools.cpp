@@ -2467,7 +2467,9 @@ struct ShellCmd {
 // line, which has no quoting to get wrong and holds 32K characters, and
 // runs it as a script. The script fails if its last statement does, with
 // the status of a native program when there was one. It is parsed alone
-// first, so that a syntax error shows the agent's own text.
+// first, so that a syntax error shows the agent's own text. Its output
+// goes through Out-Default before the exit, which would otherwise end
+// PowerShell before it wrote out objects formatted as a table.
 #define PSBOOTVAR "PROSPERO_COMMAND"
 static char const psboot[] =
     "$ProgressPreference='SilentlyContinue';"
@@ -2479,7 +2481,7 @@ static char const psboot[] =
     "[Console]::Error.WriteLine($__e.Message);exit 1};"
     "$__b=[ScriptBlock]::Create($__c+[char]10+'$global:__ok=$?');"
     "$global:__ok=$false;$global:LASTEXITCODE=0;"
-    "try{. $__b}catch{[Console]::Error.WriteLine(($_|Out-String).Trim());exit 1};"
+    "try{. $__b|Out-Default}catch{[Console]::Error.WriteLine(($_|Out-String).Trim());exit 1};"
     "if($global:__ok){exit 0};if($LASTEXITCODE){exit $LASTEXITCODE};exit 1";
 
 // How a shell runs a command: as a login shell (sh -l, PowerShell with

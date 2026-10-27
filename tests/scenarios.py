@@ -2213,15 +2213,16 @@ def skillhome(t):
 def powershell(t):
     """[tools] shell = powershell on Windows: the command goes through an
     environment variable, output is UTF-8, and the exit status is the last
-    statement's, or its native program's."""
+    statement's, or its native program's. Objects formatted as a table
+    are written out before PowerShell exits."""
     if not t.host.windows:
         t.note("Windows only")
         return
     r = t.run(timeout=60)
     t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
     ends = [e["text"] for e in r.all("tool.end")]
-    t.check(len(ends) == 5, f"{len(ends)} shell calls")
-    if len(ends) < 5:
+    t.check(len(ends) == 6, f"{len(ends)} shell calls")
+    if len(ends) < 6:
         return
     t.check("h\u00e9llo" in ends[0] and "w\u00e9ll" in ends[0]
             and "[exit code 0, after " in ends[0], f"UTF-8 output: {ends[0]!r}")
@@ -2231,6 +2232,8 @@ def powershell(t):
             and "[exit code 0, after " in ends[3], f"variable removed: {ends[3]!r}")
     t.check("[exit code 1, after " in ends[4] and "line:1" in ends[4]
             and "__ok" not in ends[4], f"a parse error: {ends[4]!r}")
+    t.check("Path" in ends[5] and "----" in ends[5]
+            and "[exit code 0, after " in ends[5], f"a table: {ends[5]!r}")
     tools = json.dumps(t.requests()[0]["body"].get("tools"))
     t.check("PowerShell" in tools, "the shell tool describes PowerShell")
 

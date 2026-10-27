@@ -326,6 +326,7 @@ def sc_powershell(model, n, req):
         "cmd /c exit 3",
         "$env:PROSPERO_COMMAND; Write-Output end",
         "if (",
+        "Get-Location",
     ]
     if n < len(commands):
         yield from tool(model, n, "shell", {"command": commands[n]})
