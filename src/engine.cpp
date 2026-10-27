@@ -8872,12 +8872,11 @@ static McpAuth *mcpauthbyhttp(Engine *e, u64 id)
     return 0;
 }
 
-static McpAuth *mcpauthnew(Engine *e, Str name, Str url)
+static McpAuth *mcpauthnew(Engine *e, Arena scratch, Str name, Str url)
 {
     for (McpAuth *x = e->mcpauths; x; x = x->next) {
         if (x->name == name) {
-            Arena a = newarena(e->scratch);
-            mcpauthfail(e, a, x, "another sign-in began");
+            mcpauthfail(e, scratch, x, "another sign-in began");
             break;
         }
     }
@@ -8911,7 +8910,7 @@ static void mcpunauthorized(Engine *e, Arena scratch, McpServer *m, McpHttp *q)
         mcpneedauth(e, scratch, m);
         return;
     }
-    McpAuth *x = mcpauthnew(e, m->name, m->url);
+    McpAuth *x = mcpauthnew(e, scratch, m->name, m->url);
     if (!x) {
         mcpneedauth(e, scratch, m);
         return;
@@ -8980,7 +8979,7 @@ static void cmdmcpauth(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, "no redirect was given", {});
         return;
     }
-    McpAuth *x = mcpauthnew(e, name, url);
+    McpAuth *x = mcpauthnew(e, scratch, name, url);
     if (!x) {
         reply(e, scratch, id, 0, "out of memory", {});
         return;
