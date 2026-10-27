@@ -498,7 +498,12 @@ class Local:
         # group is the new session started for it here, signaled only
         # while p is not reaped, as the wait below may have done already
         # (signal_group checks)
-        killer = threading.Timer(timeout + 5, lambda: P.signal_group(p, signal.SIGKILL))
+        killed = threading.Event()
+
+        def kill():
+            if P.signal_group(p, P.KILL):
+                killed.set()
+        killer = threading.Timer(timeout + 5, kill)
         killer.start()
         try:
             for line in p.stdout:
@@ -522,12 +527,12 @@ class Local:
         if p.poll() is None:
             # Still running past the deadline: its group, unreaped
             try:
-                P.signal_group(p, signal.SIGKILL)
+                P.signal_group(p, P.KILL)
             except OSError:
                 pass
             p.wait()
             return None, lines
-        if p.returncode == -getattr(signal, "SIGKILL", 9):  # none on Windows
+        if killed.is_set():
             return None, lines  # the timer's, which killed the whole group
         return p.returncode, lines
 
@@ -552,7 +557,7 @@ class Local:
             found = P.parse(line.split()[0])
             if found:
                 try:
-                    P.signal_ours(found[0], signal.SIGKILL, lambda q: ours(q, self.root))
+                    P.signal_ours(found[0], P.KILL, lambda q: ours(q, self.root))
                 except (OSError, P.Refused):
                     pass
         return left
@@ -897,7 +902,7 @@ def detaching(host, plain):
         try:
             out, _ = p.communicate(timeout=20)
         except subprocess.TimeoutExpired:
-            P.signal_group(p, signal.SIGKILL)
+            P.signal_group(p, P.KILL)
             out, _ = p.communicate()
             problems.append(f"detaching launch {i} did not return")
         for line in out.splitlines():
@@ -942,7 +947,7 @@ def detaching(host, plain):
         if not waitfor(lambda: not alive(pid), 20, 0.5):
             problems.append(f"the detached window {pid} did not quit")
             try:
-                P.signal_ours(pid, signal.SIGKILL, lambda q: ours(q, host.root))
+                P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root))
             except (OSError, P.Refused):
                 pass
     return problems, lines

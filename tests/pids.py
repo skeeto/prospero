@@ -199,6 +199,10 @@ def winapi():
     k32.GetProcessTimes.argtypes = [w.HANDLE] + [ptr(w.FILETIME)] * 4
     k32.TerminateProcess.argtypes = [w.HANDLE, w.UINT]
     k32.GetCurrentProcess.restype = w.HANDLE
+    k32.CreateToolhelp32Snapshot.restype = w.HANDLE
+    k32.CreateToolhelp32Snapshot.argtypes = [w.DWORD, w.DWORD]
+    k32.Process32FirstW.argtypes = [w.HANDLE, ctypes.c_void_p]
+    k32.Process32NextW.argtypes = [w.HANDLE, ctypes.c_void_p]
     adv.OpenProcessToken.argtypes = [w.HANDLE, w.DWORD, ptr(w.HANDLE)]
     adv.GetTokenInformation.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p,
                                         w.DWORD, ptr(w.DWORD)]
@@ -337,6 +341,46 @@ def winopen(pid):
 
 WINOPEN = winopen  # the selftest's recorder instead, while it runs
 
+DEPTH = 8  # generations below a process of the test's own that Windows ends
+
+
+def winkids(root, depth=DEPTH):
+    """Windows: the pids that a snapshot of every process shows below
+    root, at most depth generations down, nearest first. Candidates
+    only: a pid there may be another process's by the time it is used,
+    so each is confirmed (descends) right before its kill."""
+    import ctypes
+    from ctypes import wintypes as w
+
+    class Entry(ctypes.Structure):  # PROCESSENTRY32W
+        _fields_ = [("size", w.DWORD), ("usage", w.DWORD), ("pid", w.DWORD),
+                    ("heap", ctypes.c_size_t), ("module", w.DWORD),
+                    ("threads", w.DWORD), ("ppid", w.DWORD), ("base", w.LONG),
+                    ("flags", w.DWORD), ("exe", w.WCHAR * 260)]
+    k32 = winapi()[0]
+    snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snap in (None, ctypes.c_void_p(-1).value):
+        return []
+    kids = {}
+    try:
+        e = Entry()
+        e.size = ctypes.sizeof(e)
+        more = k32.Process32FirstW(snap, ctypes.byref(e))
+        while more:
+            kids.setdefault(e.ppid, []).append(e.pid)
+            more = k32.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        k32.CloseHandle(snap)
+    found, level = [], [root]
+    for _ in range(depth):
+        level = [q for up in level for q in kids.get(up, [])
+                 if 1 < q <= PIDMAX and q != root and q not in found]
+        found += level
+    return found
+
+
+WINKIDS = winkids  # the selftest's stand-in, while it runs
+
 
 def signal_group(proc, sig):
     """Signal the process group that proc, a Popen of the test's own
@@ -346,10 +390,28 @@ def signal_group(proc, sig):
     id. Once reaped, the group may be gone and its id another's: then
     nothing. Returns whether it signaled. (Another thread of the test
     reaping proc meanwhile, as Popen.send_signal allows too, could still
-    race this.)"""
+    race this.)
+
+    Windows has no process groups. There proc is terminated through the
+    handle its Popen holds (sig ignored), then each process below it,
+    the deepest first, confirmed by descends right before its kill
+    (signal_ours), since one that holds proc's output pipe would keep a
+    reader of it waiting. Popen's handle keeps proc's pid its own while
+    the Popen lasts, reaped or not, and the deepest go first so that
+    each one's parent, the link that confirms it, is still there."""
     if proc.returncode is not None:
         return False
-    os.killpg(checked(proc.pid, "group"), sig)
+    root = checked(proc.pid, "group")
+    if os.name != "nt":
+        os.killpg(root, sig)
+        return True
+    kids = WINKIDS(root)
+    proc.kill()
+    for pid in reversed(kids):
+        try:
+            signal_ours(pid, sig, lambda q: descends(q, root, DEPTH), "child")
+        except (OSError, Refused):
+            pass  # gone already, or no longer below proc
     return True
 
 
@@ -374,6 +436,10 @@ def selftest():
     class Fake:
         pid = 0
         returncode = None
+
+        @classmethod
+        def kill(cls):  # Windows: Popen's own TerminateProcess, recorded
+            sent.append(("terminate", cls.pid, 9))
     sent = []
     real = os.kill, getattr(os, "killpg", None)  # none on Windows
     os.kill = lambda pid, sig: sent.append(("kill", pid, sig))
@@ -388,8 +454,11 @@ def selftest():
 
         def close(self):
             pass
-    global WINOPEN
+    global WINOPEN, WINKIDS
     WINOPEN = Handle
+    # Windows: a pid below the group's, unconfirmed, since no Windows pid
+    # is odd, so 4243 is no process's parent there
+    WINKIDS = lambda root: [4244]
     try:
         for pid in bad:
             try:
@@ -418,10 +487,11 @@ def selftest():
             assert not signal_group(Fake, 9), f"signal_group of a reaped proc ({code})"
     finally:
         os.kill, os.killpg = real
-        WINOPEN = winopen
+        WINOPEN, WINKIDS = winopen, winkids
         if not real[1]:
             del os.killpg
-    assert sent == [("kill", 4242, 9), ("killpg", 4243, 9)], sent
+    group = ("killpg" if os.name != "nt" else "terminate", 4243, 9)
+    assert sent == [("kill", 4242, 9), group], sent
     # Reading this process, which signals nothing
     me = os.getpid()
     assert abs(started(me) - time.time()) < 3600 and mine(me), started(me)
