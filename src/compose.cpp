@@ -480,14 +480,6 @@ static TermKind termkinds[] = {
     {"ghostty",        "--working-directory=", {},             "-e"},
 };
 
-// Those looked for on the PATH, in order, when [ui] terminal and
-// $TERMINAL name none.
-static Str termsearch[] = {
-    "ptyxis", "gnome-terminal", "kgx", "konsole", "xfce4-terminal",
-    "x-terminal-emulator", "alacritty", "kitty", "wezterm", "foot",
-    "ghostty", "xterm",
-};
-
 struct TermRun {
     Slice<Str> argv;    // to launch, in the folder
     Str        script;  // TERM_MAC with a command: a .command file's text,

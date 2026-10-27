@@ -5616,6 +5616,13 @@ static Str termprog(Gui *g, Arena *a)
     if (env.len) {
         return env;
     }
+    // Those looked for on the PATH, in order, when [ui] terminal and
+    // $TERMINAL name none (here, since Windows' build drops the loop)
+    static Str termsearch[] = {
+        "ptyxis", "gnome-terminal", "kgx", "konsole", "xfce4-terminal",
+        "x-terminal-emulator", "alacritty", "kitty", "wezterm", "foot",
+        "ghostty", "xterm",
+    };
     for (iz i = 0; i < countof(termsearch); i++) {
         Str found = findpath(g->os, a, *a, path, termsearch[i], 0);
         if (found.len) {
