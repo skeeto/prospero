@@ -1565,10 +1565,11 @@ def main():
         before = config(curl, model, 60,
                         f"\n[mcp web]\nurl = http://127.0.0.1:{mcpport}/mcp\ntrust = yes\n")
     elif args.mode == "sessions":
-        # A model to switch to; a remote listed always, never reached,
-        # and one listed only while connected
+        # A model and a shell to switch to; a remote listed always,
+        # never reached, and one listed only while connected
         before = config(curl, model, 60,
                         f"\n[model fake:gui_b:{nonce}]\ntemperature = 0.5\n"
+                        "\n[shell other]\nprogram = sh\ndescription = A second shell\n"
                         "\n[remote far]\nssh = far.invalid\n"
                         "\n[remote hidden]\nssh = hidden.invalid\nlist = connected\n")
         if isinstance(host, Local):

@@ -23,6 +23,7 @@ enum : i32 {
     SLASH_PLAN,
     SLASH_SIDE,
     SLASH_BACKGROUND,
+    SLASH_SHELL,
     SLASH_COUNT,
 };
 
@@ -43,6 +44,7 @@ static SlashInfo slashinfo[] = {
     {"/side",    "",        "Start a side chat: a copy of this session to ask about it, "
                             "while its agent works on"},
     {"/background", "",     "Let the running command or subagents go on in the background, and the agent with them"},
+    {"/shell",   "[NAME]",  "Switch this session's shell, or pick one from a list"},
 };
 static_assert(countof(slashinfo) == SLASH_COUNT);
 

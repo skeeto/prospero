@@ -462,6 +462,9 @@ struct View {
     b32             nofolder;   // cwd is a folder of the session's own
     Str             model;
     Str             endpoint;
+    Str             shell;      // the shell commands run in, by name
+    Str             shellpath;  // and its program
+    b32             shellset;   // by a shell record, not the prefix
     Str             role;
     Str             parent;     // a subagent's parent session, else empty
     Str             pcall;      // and the parent's task call
@@ -1031,7 +1034,11 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
     Str   p     = jsonstr(jsonget(j, "path"));
     Str   desc  = jsonstr(jsonget(j, "description"));
     Json *patch = jsonget(j, "patch");
-    if (name=="shell" && cmd.data) {
+    Str   shell = jsonstr(jsonget(j, "shell"));
+    if (name=="shell" && cmd.data && shell.len) {
+        // A call that named a shell of [tools] shells says which
+        return concat(perm, concat(&scratch, "in ", shell), concat(&scratch, ": ", oneline(&scratch, cmd)));
+    } else if (name=="shell" && cmd.data) {
         return oneline(perm, cmd);
     } else if (name == "todo_write") {
         // The list may come as a string holding JSON
@@ -1512,6 +1519,26 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->endpoint = clone(&v->aux, jsonstr(jsonget(j, "endpoint")));
         i32 i = addmark(v, r->seq, "Model", v->model);
         v->msgs[i].from = v->endpoint;
+    } return 1;
+
+    case EV_PREFIX:
+        // The shell it began in, until a shell record: a prefix record
+        // written again later (MCP tools) names that one still
+        if (!v->shellset) {
+            Str path = jsonstr(jsonget(j, "shell"));
+            Str name = jsonstr(jsonget(j, "shell_name"));
+            v->shellpath = clone(&v->aux, path);
+            v->shell     = clone(&v->aux, name.len ? name : basename(path));
+        }
+        return 1;
+
+    case EV_SHELL: {
+        // Switched for the rest of the session (shell)
+        v->shell     = clone(&v->aux, jsonstr(jsonget(j, "name")));
+        v->shellpath = clone(&v->aux, jsonstr(jsonget(j, "path")));
+        v->shellset  = 1;
+        i32 i = addmark(v, r->seq, "Shell", v->shell);
+        v->msgs[i].from = v->shellpath;
     } return 1;
 
     case EV_MODE: {

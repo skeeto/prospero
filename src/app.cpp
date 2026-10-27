@@ -416,6 +416,15 @@ struct GuiEndpoint {
     Slice<Str> models;  // ids, as listed
 };
 
+// A shell a host's engine listed (shells), for the shell picker.
+struct GuiShell {
+    Str name;
+    Str path;
+    Str desc;
+    b32 ok;
+    Str err;   // why not, if not
+};
+
 // A [model NAME] section of a host's configuration, and the id it
 // names the model by in requests.
 struct GuiModel {
@@ -483,6 +492,13 @@ struct GuiHost {
     i64        listid;     // its models in flight, 0 if none
     b32        listgot;    // eps is an answer
     Str        listsig;    // that answer, to tell when it changed
+    // Its shells (shells), asked anew each time a shell picker opens,
+    // the latest answer shown while the next is asked for
+    Slice<GuiShell> shells;
+    Str        shelldflt;  // what new sessions start in
+    i64        shellsid;   // its shells in flight, 0 if none
+    b32        shellsgot;  // shells is an answer
+    Str        shellserr;  // why the latest asking failed
 };
 
 struct AttBox;
@@ -1238,6 +1254,7 @@ struct Gui {
     Str                edname;     // as the box names it
     i32                slashsel;   // the slash popup's pick, among its matches
     GuiSession        *pickmodel;  // /model's list is open for it
+    GuiSession        *pickshell;  // /shell's list is open for it
     i32                menuact;    // a context menu pick waiting for the box
     i32                menuwait;   // frames it has waited
     i32                draftsout;  // drafts sent, not yet answered
@@ -1836,6 +1853,48 @@ static b32 hostlist(Gui *g, GuiHost *h)
     h->listid = g->nextid;
     cmdsend(g, &w, a);
     return 1;
+}
+
+// Ask a host's engine for the shells its sessions may switch to
+// (shells), unless asked already.
+static void hostshells(Gui *g, GuiHost *h)
+{
+    if (h->shellsid || !h->up || !hostcan(h, "shell") || !engineup(g) ||
+            (h->kind!=GH_ENGINE && (!h->r || h->closing))) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 64);
+    EvOut w = cmdopen(g, &b, CMD_SHELLS, 0, h);
+    h->shellsid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// A host's answer to hostshells. A failed command keeps the answer
+// before it, and says why.
+static void onhostshells(Gui *g, GuiHost *h, Json *j, b32 ok)
+{
+    h->shellsid = 0;
+    if (!ok) {
+        h->shellserr = clone(&g->perm, jsonstr(jsonget(j, "err")));
+        return;
+    }
+    Slice<GuiShell> list = {};
+    for (Json *k = jsonget(j, "shells")->child; k; k = k->next) {
+        GuiShell sh = {};
+        sh.name = clone(&g->perm, jsonstr(jsonget(k, "name")));
+        sh.path = clone(&g->perm, jsonstr(jsonget(k, "path")));
+        sh.desc = clone(&g->perm, jsonstr(jsonget(k, "desc")));
+        sh.ok   = jsonflag(jsonget(k, "ok"), 0);
+        sh.err  = clone(&g->perm, jsonstr(jsonget(k, "error")));
+        if (sh.name.len) {
+            list = push(&g->perm, list, sh);
+        }
+    }
+    h->shells    = list;
+    h->shelldflt = clone(&g->perm, jsonstr(jsonget(j, "default")));
+    h->shellsgot = 1;
+    h->shellserr = {};
 }
 
 // MCP servers, for Settings: the main host's engine lists them (mcp),
@@ -3151,6 +3210,21 @@ static void guimodel(Gui *g, GuiSession *s, Str model, Str endpoint = {})
     cmdsend(g, &w, a);
 }
 
+// Another shell for the rest of the session, by name: the agent hears
+// of it at its next request.
+static void guishell(Gui *g, GuiSession *s, Str shell)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128 + shell.len);
+    EvOut w = cmdopen(g, &b, CMD_SHELL, s);
+    putkey(&w.json, "shell");
+    putstr(&w.json, shell);
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
+    cmdsend(g, &w, a);
+}
+
 // The session's mode, "plan", "bypass" or "default" (Build): the agent
 // hears of it at its next request.
 static void guimode(Gui *g, GuiSession *s, Str mode)
@@ -4025,6 +4099,9 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
     case CMD_MODE: {
         s->note = {};  // the transcript's mark says so
     } break;
+    case CMD_SHELL:
+        s->note = {};  // the transcript's mark says so
+        break;
     case CMD_FORK: {
         // {ok, sid:<new>, from, turn, next?}
         Str sid = jsonstr(jsonget(j, "sid"));
@@ -4198,6 +4275,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_RENAME:
     case CMD_MODEL:
     case CMD_MODE:
+    case CMD_SHELL:
     case CMD_FORK:
     case CMD_BACKGROUND:
         onsesscmd(g, h, scratch, &q, r);
@@ -4260,6 +4338,12 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             }
             g->lasterr = clone(&g->perm, err);
             guilog(g, g->lasterr);
+        }
+        return;
+
+    case CMD_SHELLS:
+        if (q.h && q.h->shellsid==id) {
+            onhostshells(g, q.h, j, ok);
         }
         return;
 
@@ -5828,6 +5912,7 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
         h->modelsid  = 0;  // its configuration may differ now
         h->modelsgot = 0;
         h->listid    = 0;  // its reply may have gone with the link
+        h->shellsid  = 0;
         if (h==g->main && !h->listgot) {
             hostlist(g, h);
         }
@@ -11174,6 +11259,17 @@ static DriveOp sessionsops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1500, ""},
     {OP_CHECK, CHK_MODEL, 0, 0, 0, "fake:gui_b:"},
+    // Its shell, from the picker beside it: the configuration's second
+    // (tests/gui.py), and the transcript's mark of it
+    {OP_MOVE, T_NAMED, 0, 0, 100, "shell picker"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-shellpick"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "shell other"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_WAIT, W_MARK, 0, 0, 5000, "Shell"},
+    {OP_CHECK, CHK_MARK, 0, 0, 0, "Shell: other"},
     // Exported: Markdown, then the raw log
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
     {OP_RDOWN, 0, 0, 0, 60, ""},

@@ -1893,6 +1893,10 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         }
         inforow("Model", model);
         inforow("Endpoint", v->endpoint);
+        if (v->shell.len) {
+            inforow("Shell", v->shellpath.len && v->shellpath!=v->shell
+                             ? concat(&a, concat(&a, v->shell, ", "), v->shellpath) : v->shell);
+        }
         if (v->role.len) {
             inforow("Role", v->role);
         }
@@ -2146,6 +2150,83 @@ static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v)
     }
 }
 
+// The shells a host lists (shells), as menu items: the current one
+// checked, one not found disabled, with why. Asked for anew each time
+// the list opens.
+static void shellitems(Gui *g, Arena a, GuiSession *s, b32 opened)
+{
+    GuiHost *h   = s->host;
+    View    *v   = s->view;
+    Str      now = v ? v->shell : Str{};
+    if (opened) {
+        hostshells(g, h);
+    }
+    if (!h->shellsgot) {
+        ImGui::TextDisabled(h->shellserr.len ? "The host's shells: %s"
+                                             : "Asking the host for its shells...",
+                            cstr0(&a, h->shellserr));
+    }
+    for (iz i = 0; i < h->shells.len; i++) {
+        GuiShell *sh  = &h->shells[i];
+        b32       cur = sh->name == now;
+        Str       lbl = sh->name==h->shelldflt ? concat(&a, sh->name, "  (default)")
+                                               : sh->name;
+        if (ImGui::MenuItem(cstr0(&a, lbl), 0, cur, sh->ok && !cur)) {
+            s->note = {};
+            guishell(g, s, sh->name);
+        }
+        itemnamed(g, concat(&a, "shell ", sh->name));
+        Str tip = !sh->ok      ? sh->err :
+                  sh->desc.len ? concat(&a, concat(&a, sh->path, "\n"), sh->desc)
+                               : sh->path;
+        if (tip.len) {
+            ImGui::SetItemTooltip("%s", cstr0(&a, tip));
+        }
+    }
+}
+
+// The session's shell, a list of those its host has to switch to
+// (shell) while idle, on hosts whose engine can.
+static void drawshellpick(Gui *g, Arena a, GuiSession *s, View *v)
+{
+    if (!hostcap(s->host, "shell") || !v->shell.len) {
+        if (g->pickshell == s) {
+            setnote(g, s, "/shell: this host's engine is too old for it", 1);
+            g->pickshell = 0;
+        }
+        return;
+    }
+    Str why = g->enginekind==ENGINE_FAKE ? Str("No engine") :
+              sesswhy(g, s, "shell", !planwaits(v), 0);
+    ImGui::SameLine();
+    Str label = concat(&a, shorten(&a, v->shell, 24),
+                       "  \xe2\x96\xbe##shellpick");  // a small down triangle
+    if (why.len) {
+        ImGui::BeginDisabled();
+    }
+    b32 click = ImGui::Button(cstr0(&a, label));
+    if (why.len) {
+        ImGui::EndDisabled();
+    }
+    itemnamed(g, "shell picker");
+    whytip(why.len ? why : concat(&a, "The shell commands run in, ", v->shellpath));
+    b32 opened = 0;
+    if (click || (g->pickshell==s && !why.len)) {
+        ImGui::OpenPopup("##shellpop");
+        opened = 1;
+    }
+    if (g->pickshell == s) {
+        if (why.len) {
+            setnote(g, s, concat(&a, "/shell: ", why), 1);
+        }
+        g->pickshell = 0;
+    }
+    if (ImGui::BeginPopup("##shellpop")) {
+        shellitems(g, a, s, opened);
+        ImGui::EndPopup();
+    }
+}
+
 // A line above the transcript: the session, or a subagent's parent to
 // go back to, its context gauge, the toggles that open all its tool
 // output and reasoning, and the session's details in a popup.
@@ -2201,6 +2282,7 @@ static void drawsessbar(Gui *g)
         itemrect(g, RECT_SIDELINK);
         ImGui::SetItemTooltip("Back to the session this side chat began from");
         drawmodelpick(g, a, s, v);
+        drawshellpick(g, a, s, v);
     } else {
         Buf b(&a, 256);
         print(&b, shorten(&a, sesstitle(s), 60));
@@ -2211,6 +2293,7 @@ static void drawsessbar(Gui *g)
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
         drawmodelpick(g, a, s, v);
+        drawshellpick(g, a, s, v);
     }
     if (v->plan) {
         // A chip that shows the plan
@@ -3704,6 +3787,16 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
             guimodel(g, s, sl.arg);
         }
         break;
+    case SLASH_SHELL:
+        if (!sl.arg.len) {
+            g->pickshell = s;  // the session bar's shell picker
+            draftput(g, s, "");
+            drafttyped(&s->dclock, g->sched.now);
+            return;
+        } else if ((sent = hostcan(h, "shell"))) {
+            guishell(g, s, sl.arg);
+        }
+        break;
     case SLASH_RENAME:
         if ((sent = hostcan(h, "rename"))) {
             guirename(g, s, sl.arg);
@@ -4223,7 +4316,7 @@ static void drawprompt(Gui *g)
             draftput(g, s, "");
             s->note = {};
         }
-        if (!g->pickmodel && !g->openexport) {
+        if (!g->pickmodel && !g->pickshell && !g->openexport) {
             // To type the next, unless a popup of another window's
             // opens (/model, /export), which the box would close
             ImGui::ActivateItemByID(id);
@@ -4868,6 +4961,16 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
     whytip(why);
     if (sub) {
         modelitems(g, a, s);
+        ImGui::EndMenu();
+    }
+    why = sesswhy(g, s, "shell", 1, 0);
+    older |= !hostcap(h, "shell");
+    why = why.len || (s->view && s->view->shell.len) ? why : Str("Open the session first");
+    sub = ImGui::BeginMenu("Switch shell", !why.len);
+    itemnamed(g, "Switch shell");
+    whytip(why);
+    if (sub) {
+        shellitems(g, a, s, ImGui::IsWindowAppearing());
         ImGui::EndMenu();
     }
     sub = ImGui::BeginMenu("Export");
@@ -7839,16 +7942,18 @@ static void drawcfgpage(Gui *g)
 }
 
 // The kind of section's first key, which a new one is written with: a
-// remote's ssh is an alias of its name.
+// remote's ssh and a shell's program are aliases of its name.
 static void cfgseed(Str kind, Str name, Str *key, Str *val)
 {
     *key = kind=="endpoint" ? Str("url") :
            kind=="model"    ? Str("reasoning") :
            kind=="remote"   ? Str("ssh") :
+           kind=="shell"    ? Str("program") :
            kind=="mcp"      ? Str("url") : Str("tools");
     *val = kind=="endpoint" ? Str("http://localhost/") :
            kind=="model"    ? Str("reasoning_content") :
            kind=="remote"   ? name :
+           kind=="shell"    ? name :
            kind=="mcp"      ? Str("https://mcp.example.com/mcp") :
                               Str("read write edit shell");
 }
