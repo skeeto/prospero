@@ -20,11 +20,13 @@
 // (shared) file it is an error and ignored, as is file:PATH there,
 // which could send any of the user's files, and any setting of a
 // [remote] section, which chooses a program to run and where (ssh,
-// path, state, config, deploy), or of the [desktop] section, which lets
-// the agent use the screen, and any other setting that chooses a
-// program to run here (cfgruns): [tools] path_prepend and path_append,
-// which say where programs are found, a [tools] shell other than a
-// keyword (auto, sh, powershell, cmd), and [ui] editor.
+// path, state, config, deploy), of a [shell] or an [mcp] section, which
+// choose programs to run, or of the [desktop] section, which lets the
+// agent use the screen, and any other setting that chooses a program to
+// run here (cfgruns): [tools] path_prepend and path_append, which say
+// where programs are found, a [tools] shell other than a keyword (auto,
+// sh, powershell, cmd), and [ui] editor. A [shell] section counts only
+// where the user's own file has its header (cfgownsection).
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -64,11 +66,12 @@
 //   is an error and is ignored, never cached, so a cached copy that does
 //   match stays in use; a cached copy that does not match is never used.
 //
-// Only the user's own file chooses what runs: its [remote] sections, a
-// shell, the editor, and where programs are found. An included file's
-// [remote] and [desktop] settings, those of cfgruns and plaintext secrets
-// are ignored, so a shared file, local or from the web, can at most
-// point the harness at endpoints and models.
+// Only the user's own file chooses what runs: its [remote], [shell] and
+// [mcp] sections, a shell, the editor, and where programs are found. An
+// included file's [remote], [shell], [mcp] and [desktop] settings,
+// those of cfgruns and plaintext secrets are ignored, so a shared file,
+// local or from the web, can at most point the harness at endpoints and
+// models.
 // (A shared [role] may list desktop in its tools, which matters only
 // once the user's own [desktop] offer says roles.)
 //
@@ -117,7 +120,9 @@
 // lists every file read, in load order. Settings list every schema key
 // of the top level and of the unnamed kinds ([guard], [tools],
 // [instructions], [skills], [ui] and [host]), and of each named [endpoint],
-// [model], [role] and [remote] section that exists, in schema order. A
+// [model], [role], [shell], [remote] and [mcp] section that exists, in
+// schema order, but for families of keys (env.NAME), which only a
+// model's templates (template.NAME) show. A
 // value is the one in effect as written, or its default ("default":1,
 // with file "" and line 0, or where the key is set empty); "valid":0
 // marks one ignored for its default. A file may be a URL, and then the
@@ -219,6 +224,7 @@ static CfgKind cfgkinds[] = {
     {"role",     1, "Instructions, a model and tools for one kind of work"},
     {"guard",    0, "Where the file tools may go without asking"},
     {"tools",    0, "Background jobs, stopping commands, and search"},
+    {"shell",    1, "A shell for the agent's commands: its program, environment and description"},
     {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
     {"skills",   0, "Skills: SKILL.md instructions the agent uses as a task calls for them"},
     {"memory",   0, "Project memory: the agent's notes for later sessions in a project"},
@@ -405,10 +411,10 @@ static CfgKey cfgschema[] = {
      "Seconds between asking a command to stop (SIGTERM, or CTRL_BREAK on "
      "Windows) and killing it (default: 2, or 3 on Windows)"},
     {"tools", "shell", CFG_STRING, "auto", {}, {}, "tools",
-     "The agent's shell for new sessions: auto, sh, powershell, cmd, or an "
-     "executable, by its path or its name on PATH. auto is a POSIX sh, or "
-     "on Windows sh.exe or busybox.exe next to Prospero or on PATH, then "
-     "PowerShell, then cmd"},
+     "The agent's shell for new sessions: auto, sh, powershell, cmd, a "
+     "[shell] section by its name, or an executable, by its path or its "
+     "name on PATH. auto is a POSIX sh, or on Windows sh.exe or busybox.exe "
+     "next to Prospero or on PATH, then PowerShell, then cmd"},
     {"tools", "path_prepend", CFG_PATHS, "", {}, {}, "tools",
      "Directories to find programs in before PATH, separated by ;: for the "
      "agent's commands, its shell, ripgrep, and what Prospero runs itself "
@@ -424,6 +430,26 @@ static CfgKey cfgschema[] = {
     {"tools", "task_budget", CFG_INT, "200", {}, {}, "tools",
      "Model requests a subagent may make before it is told to wrap up and "
      "report; it is stopped at half as many again"},
+
+    {"shell", "program", CFG_STRING, "", {}, {}, "shell",
+     "Its executable, by its path or its name on PATH, or sh, powershell "
+     "or cmd as [tools] shell finds them; by default the section's name"},
+    {"shell", "login", CFG_BOOL, "false", {}, {}, "shell",
+     "Start it as a login shell: a POSIX sh with -l, so /etc/profile and "
+     "~/.profile set it up; PowerShell with your profile; cmd with its "
+     "AutoRun"},
+    {"shell", "env.", CFG_STRING, "", {}, {}, "shell",
+     "env.NAME = VALUE: an environment variable for its commands, VALUE "
+     "env:VAR to take it from this one's"},
+    {"shell", "path_prepend", CFG_PATHS, "", {}, {}, "shell",
+     "Directories to find programs in, its own too, before [tools] "
+     "path_prepend's and PATH, separated by ;"},
+    {"shell", "path_append", CFG_PATHS, "", {}, {}, "shell",
+     "Directories to find programs in after PATH and [tools] path_append's, "
+     "separated by ;"},
+    {"shell", "description", CFG_STRING, "", {}, {}, "shell",
+     "What the agent is told of it, after what Prospero says of its kind: "
+     "what it is for, and what it has"},
 
     {"instructions", "files", CFG_STRING, "AGENTS.md CLAUDE.md", {}, {},
      "instructions", "File names to load from each directory, the first "
@@ -847,7 +873,7 @@ static b32 cfgruns(CfgKey *k, Str v)
 static b32 cfgownonly(CfgKey *k, Str v)
 {
     return k->kind=="remote" || k->kind=="desktop" || k->kind=="mcp" ||
-           cfgruns(k, trim(v));
+           k->kind=="shell" || cfgruns(k, trim(v));
 }
 
 // A role's tools may name MCP tools: mcp__SERVER, or mcp__SERVER__TOOL.
@@ -934,6 +960,9 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
         return "an [mcp] setting in an included file is ignored, since it "
                "chooses what runs and what the agent may reach: set it in "
                "your own file";
+    } else if (shared && k->kind=="shell") {
+        return "a [shell] setting in an included file is ignored, since it "
+               "chooses what runs: set it in your own file";
     } else if (shared && k->kind=="desktop") {
         return "a [desktop] setting in an included file is ignored, since it "
                "lets the agent use the screen: set it in your own file";
@@ -1345,6 +1374,20 @@ static Slice<Str> cfgsecrets(Config *c, Arena *perm)
         }
     }
     return r;
+}
+
+// Whether the user's own file has a [KIND NAME] header: a section an
+// included file alone defines chooses nothing that runs.
+static b32 cfgownsection(Config *c, Str kind, Str name)
+{
+    IniFile *f = c->user;
+    for (iz i = 0; f && i < f->lines.len; i++) {
+        IniSection *s = f->lines[i].type==INI_SECTION ? f->lines[i].section : 0;
+        if (s && s->kind==kind && s->name==name) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // A section's family of keys, such as [mcp X]'s env.NAME, as NAME and

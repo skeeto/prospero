@@ -573,11 +573,11 @@ static void test_tools(Test *t)
         te.shell.path = "C:\\bb\\busybox.exe";
         te.shell.kind = SHELL_BUSYBOX;
         te.windows    = 1;
-        ShellCmd c = shellcmd(a, &te, "ls -l");
+        ShellCmd c = shellcmd(a, &te.shell, te.windows, "ls -l");
         expect(t, "busybox argv", istr(a, c.argv.len==4 && c.argv[1]=="sh" && c.argv[3]=="ls -l"), "1");
         te.shell.path = "C:\\Windows\\System32\\cmd.exe";
         te.shell.kind = SHELL_CMD;
-        c = shellcmd(a, &te, "dir \"a b\" & echo %X%");
+        c = shellcmd(a, &te.shell, te.windows, "dir \"a b\" & echo %X%");
         expect(t, "cmd line", c.cmdline,
                "\"C:\\Windows\\System32\\cmd.exe\" /d /s /c \"dir \"a b\" & echo %X%\"");
         expect(t, "cmd description, chosen", istr(a, find(shelldesc(a, &te), "No POSIX shell")<0 &&
@@ -587,7 +587,7 @@ static void test_tools(Test *t)
         te.shell = {};
         te.shell.path = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
         te.shell.kind = SHELL_PS;
-        c = shellcmd(a, &te, "echo \"a b\"; exit 3");
+        c = shellcmd(a, &te.shell, te.windows, "echo \"a b\"; exit 3");
         expect(t, "ps argv", istr(a, c.argv.len==8 && c.argv[0]==te.shell.path &&
                c.argv[5]=="Bypass" && c.argv[6]=="-Command" && !c.cmdline.len), "1");
         expect(t, "ps env", c.env, "PROSPERO_COMMAND=echo \"a b\"; exit 3");
@@ -596,7 +596,7 @@ static void test_tools(Test *t)
         te.shell.path = "/usr/bin/pwsh";
         te.shell.kind = SHELL_PWSH;
         te.windows    = 0;
-        c = shellcmd(a, &te, "ls");
+        c = shellcmd(a, &te.shell, te.windows, "ls");
         expect(t, "pwsh argv", istr(a, c.argv.len==6 && c.argv[4]=="-Command"), "1");
         expect(t, "pwsh description", istr(a, find(shelldesc(a, &te), "PowerShell 7")>0 &&
                find(shelldesc(a, &te), "no &&")<0), "1");
@@ -629,6 +629,44 @@ static void test_tools(Test *t)
         te.shell.flavor = FLAVOR_BUSYBOX;
         expect(t, "busybox description", istr(a, find(shelldesc(a, &te),
                "busybox.exe sh -c, busybox-w32's ash")>0), "1");
+
+        // A login shell, and a description from its section
+        te.shell.login = 1;
+        c = shellcmd(a, &te.shell, 1, "ls");
+        expect(t, "busybox login argv", istr(a, c.argv.len==5 && c.argv[1]=="sh" &&
+               c.argv[2]=="-l" && c.argv[3]=="-c"), "1");
+        te.shell.kind = SHELL_SH;
+        te.shell.path = "/bin/bash";
+        c = shellcmd(a, &te.shell, 0, "ls");
+        expect(t, "sh login argv", istr(a, c.argv.len==4 && c.argv[1]=="-l"), "1");
+        te.shell.path = "C:\\Windows\\System32\\cmd.exe";
+        te.shell.kind = SHELL_CMD;
+        c = shellcmd(a, &te.shell, 1, "dir");
+        expect(t, "cmd login line", c.cmdline,
+               "\"C:\\Windows\\System32\\cmd.exe\" /s /c \"dir\"");
+        te.shell.path = "/usr/bin/pwsh";
+        te.shell.kind = SHELL_PWSH;
+        c = shellcmd(a, &te.shell, 0, "ls");
+        expect(t, "pwsh login argv", istr(a, c.argv.len==5 && c.argv[2]=="-NonInteractive"), "1");
+        te.shell        = {};
+        te.shell.path   = "/bin/zsh";
+        te.shell.kind   = SHELL_SH;
+        te.shell.desc   = "zsh, with the Homebrew tools";
+        expect(t, "description, period added", istr(a, find(shelldesc(a, &te),
+               "/bin/zsh -c. zsh, with the Homebrew tools. Each")>0), "1");
+        te.shell.desc   = "Has GCC!";
+        expect(t, "description, own ending", istr(a, find(shelldesc(a, &te),
+               "-c. Has GCC! Each")>0), "1");
+
+        Slice<Str> ev = {};
+        ev = push(a, ev, Str("Path=C:\\x"));
+        ev = push(a, ev, Str("A=1"));
+        ev = envset(a, ev, "PATH", "C:\\y", 1);
+        ev = envset(a, ev, "B", "2", 1);
+        expect(t, "envset windows", istr(a, ev.len==3 && ev[0]=="PATH=C:\\y" &&
+               ev[2]=="B=2"), "1");
+        ev = envset(a, ev, "a", "3", 0);
+        expect(t, "envset posix is exact", istr(a, ev.len==4 && ev[1]=="A=1"), "1");
         te.windows   = 1;
         te.jobtimeout = 90;
         te.jobmax     = 3600;

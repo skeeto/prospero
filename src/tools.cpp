@@ -116,10 +116,13 @@ enum : i32 {
 
 // A shell the agent's commands run in.
 struct Shell {
+    Str name;      // a [shell] section's, a keyword, or a program's base name
     Str path;      // the executable, absolute
     i32 kind;      // SHELL_*
     i32 flavor;    // FLAVOR_*
     b32 fallback;  // cmd.exe, for want of any other
+    b32 login;     // started as a login shell, as its section says now
+    Str desc;      // its section's description, for the agent
 };
 
 // What the tools need to know about where they run.
@@ -328,12 +331,27 @@ static void shellintro(Buf *b, Shell *sh)
     }
 }
 
+// What the user says of a shell, its section's description, as a
+// sentence after its intro.
+static void shellabout(Buf *b, Shell *sh)
+{
+    Str d = trim(sh->desc);
+    if (d.len) {
+        putbyte(b, ' ');
+        print(b, d);
+        if (d[d.len-1]!='.' && d[d.len-1]!='!' && d[d.len-1]!='?') {
+            putbyte(b, '.');
+        }
+    }
+}
+
 static Str shelldesc(Arena *a, ToolEnv *te)
 {
     i64 job = te->jobtimeout ? te->jobtimeout : JOB_DEFAULT;
     i64 max = te->jobmax ? te->jobmax : JOB_MAX;
     Buf b(a, 1024);
     shellintro(&b, &te->shell);
+    shellabout(&b, &te->shell);
     print(&b, " Each command runs in the working directory, in a fresh "
               "shell (cd does not carry over). There is no input or "
               "terminal: use non-interactive flags. GIT_EDITOR is true. "
@@ -2331,6 +2349,23 @@ static Slice<Str> envsetpath(Arena *a, Slice<Str> env, Str path, b32 windows)
     return r;
 }
 
+// env with NAME=value in place of every variable NAME, else added.
+static Slice<Str> envset(Arena *a, Slice<Str> env, Str name, Str value, b32 windows)
+{
+    Str        set = concat(a, concat(a, name, "="), value);
+    Slice<Str> r   = {};
+    b32        put = 0;
+    for (iz i = 0; i < env.len; i++) {
+        if (!envnameis(env[i], name, windows)) {
+            r = push(a, r, env[i]);
+        } else if (!put) {
+            r   = push(a, r, set);
+            put = 1;
+        }
+    }
+    return put ? r : push(a, r, set);
+}
+
 // A PATH of the directories pre, then path, then post, each joined by
 // the platform's separator, empty ones left out. On Windows the extra
 // directories take backslashes, which cmd.exe's own search wants.
@@ -2383,38 +2418,43 @@ static char const psboot[] =
     "try{. $__b}catch{[Console]::Error.WriteLine(($_|Out-String).Trim());exit 1};"
     "if($global:__ok){exit 0};if($LASTEXITCODE){exit $LASTEXITCODE};exit 1";
 
-static ShellCmd shellcmd(Arena *a, ToolEnv *te, Str command)
+// How a shell runs a command: as a login shell (sh -l, PowerShell with
+// its profile, cmd with its AutoRun) only if its section says so.
+static ShellCmd shellcmd(Arena *a, Shell *sh, b32 windows, Str command)
 {
     ShellCmd r = {};
-    switch (te->shell.kind) {
+    switch (sh->kind) {
     case SHELL_BUSYBOX:
-        r.argv = push(a, r.argv, te->shell.path);
-        r.argv = push(a, r.argv, Str("sh"));
-        r.argv = push(a, r.argv, Str("-c"));
-        r.argv = push(a, r.argv, command);
-        break;
     case SHELL_SH:
-        r.argv = push(a, r.argv, te->shell.path);
+        r.argv = push(a, r.argv, sh->path);
+        if (sh->kind == SHELL_BUSYBOX) {
+            r.argv = push(a, r.argv, Str("sh"));
+        }
+        if (sh->login) {
+            r.argv = push(a, r.argv, Str("-l"));
+        }
         r.argv = push(a, r.argv, Str("-c"));
         r.argv = push(a, r.argv, command);
         break;
     case SHELL_CMD: {
-        r.argv = push(a, r.argv, te->shell.path);
-        Buf b(a, command.len + te->shell.path.len + 32);
+        r.argv = push(a, r.argv, sh->path);
+        Buf b(a, command.len + sh->path.len + 32);
         putbyte(&b, '"');
-        print(&b, te->shell.path);
-        print(&b, "\" /d /s /c \"");
+        print(&b, sh->path);
+        print(&b, sh->login ? Str("\" /s /c \"") : Str("\" /d /s /c \""));
         print(&b, command);
         putbyte(&b, '"');
         r.cmdline = finish(&b);
     } break;
     case SHELL_PWSH:
     case SHELL_PS:
-        r.argv = push(a, r.argv, te->shell.path);
+        r.argv = push(a, r.argv, sh->path);
         r.argv = push(a, r.argv, Str("-NoLogo"));
-        r.argv = push(a, r.argv, Str("-NoProfile"));
+        if (!sh->login) {
+            r.argv = push(a, r.argv, Str("-NoProfile"));
+        }
         r.argv = push(a, r.argv, Str("-NonInteractive"));
-        if (te->windows) {
+        if (windows) {
             r.argv = push(a, r.argv, Str("-ExecutionPolicy"));
             r.argv = push(a, r.argv, Str("Bypass"));
         }

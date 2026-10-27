@@ -1190,7 +1190,7 @@ static void evalfail(Eval *ev, Arena scratch, EvalRun *run, Str error)
 static b32 evalspawn(Eval *ev, Arena scratch, EvalRun *run, Str command, Str log)
 {
     EvalTask  *t   = run->task;
-    ShellCmd   sc  = shellcmd(&scratch, &ev->te, command);
+    ShellCmd   sc  = shellcmd(&scratch, &ev->te.shell, ev->te.windows, command);
     Slice<Str> env = shellenv(&scratch, ev->env, ev->te.windows, ev->secrets);
     if (sc.env.len) {
         env = push(&scratch, env, sc.env);

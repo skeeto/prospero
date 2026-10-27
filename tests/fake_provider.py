@@ -347,6 +347,17 @@ def sc_path_settings(model, n, req):
         yield from answer(model, "Found them.")
 
 
+def sc_shell_profile(model, n, req):
+    commands = [
+        "prospero_profile_tool",
+        'echo "FOO=$FOO SHARED=${SHARED-unset}"',
+    ]
+    if n < len(commands):
+        yield from tool(model, n, "shell", {"command": commands[n]})
+    else:
+        yield from answer(model, "Ran in the profile.")
+
+
 def sc_bytewise(model, n, req):
     yield S.bytewise()
     if n == 0:

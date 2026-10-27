@@ -2288,6 +2288,50 @@ def path_settings(t):
             f"PATH from {norm(pre)} to {norm(post)}: {line!r}")
 
 
+@scenario(bound=20)
+def shell_profile(t):
+    """[tools] shell names a [shell] section: commands find programs in
+    its path_prepend and see its env.NAME, the shell tool carries its
+    description. An included file's
+    [shell] settings are ignored. A [tools] shell that is not found
+    leaves a warning, and commands run in auto's shell."""
+    bin = t.host.join(t.base, "profbin")
+    t.host.mkdir(bin)
+    if t.host.windows:
+        t.host.write(t.host.join(bin, "prospero_profile_tool.bat"), "@echo profile-tool-ran\r\n")
+    else:
+        p = t.host.join(bin, "prospero_profile_tool")
+        t.host.write(p, "#!/bin/sh\necho profile-tool-ran\n")
+        os.chmod(p, 0o755)
+    shared = t.host.join(t.base, "shared.ini")
+    t.host.write(shared, "[shell mine]\nenv.SHARED = leaked\n")
+    base = t.host.read(t.config)
+    t.host.write(t.config, f"include = {shared}\n" + base +
+                 "[tools]\nshell = mine\n"
+                 f"[shell mine]\nprogram = sh\npath_prepend = {bin}\n"
+                 "env.FOO = from-profile\n"
+                 "description = The profile's own words\n")
+
+    r = t.run(timeout=60)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = [e["text"] for e in r.all("tool.end")]
+    t.check(len(ends) == 2, f"{len(ends)} shell calls")
+    if len(ends) == 2:
+        t.check("profile-tool-ran" in ends[0], f"its path_prepend: {ends[0]!r}")
+        t.check("FOO=from-profile SHARED=unset" in ends[1], f"its env: {ends[1]!r}")
+    tools = json.dumps(t.requests()[0]["body"].get("tools"))
+    t.check("The profile's own words." in tools, "the shell tool has its description")
+    t.check(not any("[tools] shell" in n.get("text", "") for n in r.all("note")),
+            "no warning for a shell found")
+
+    t.host.write(t.config, base + "[tools]\nshell = prospero-no-such-shell\n")
+    r = t.run(timeout=60)
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    warns = [n.get("text", "") for n in r.all("note") if "[tools] shell" in n.get("text", "")]
+    t.check(len(warns) == 1 and "prospero-no-such-shell is not found, so commands run in" in warns[0],
+            f"a warning for a missing shell: {warns}")
+
+
 def skillput(t, parent, name, text):
     d = t.host.join(parent, name)
     t.host.mkdir(d)

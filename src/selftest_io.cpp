@@ -78,7 +78,7 @@ struct ProcTest {
 
 static Proc *spawnsh(ProcTest *p, Arena scratch, Str command, Str out, i64 max)
 {
-    ShellCmd sc = shellcmd(&scratch, &p->te, command);
+    ShellCmd sc = shellcmd(&scratch, &p->te.shell, p->te.windows, command);
     Spawn    sp = {};
     sp.argv     = sc.argv;
     sp.cmdline  = sc.cmdline;
@@ -393,7 +393,7 @@ static void testoverhead(ProcTest *p, Arena scratch)
     Selftest *t  = p->t;
     Os       *os = p->os;
 
-    ShellCmd   sc   = shellcmd(&scratch, &p->te, "exit 0");
+    ShellCmd   sc   = shellcmd(&scratch, &p->te.shell, p->te.windows, "exit 0");
     Str        tr[] = {"true"};
     Slice<Str> argv = HOST_WINDOWS ? sc.argv : Slice<Str>{tr, 1, 1};
     Timing     tt   = timespawn(p, scratch, argv, sc.cmdline, 21);
@@ -498,7 +498,7 @@ static void testspawnio(ProcTest *p, Arena scratch)
 
     // cat: everything written comes back, in order, once input closes
     Str      errs = join(&scratch, p->dir, "io.err");
-    ShellCmd sc   = shellcmd(&scratch, &p->te, "cat; echo done 1>&2");
+    ShellCmd sc   = shellcmd(&scratch, &p->te.shell, p->te.windows, "cat; echo done 1>&2");
     Proc    *pr   = spawnio(p, scratch, sc.argv, sc.cmdline, errs);
     if (!check(t, pr!=0, "os_spawnio of cat")) {
         say(os, os_lasterr(os, &scratch));
@@ -533,7 +533,7 @@ static void testspawnio(ProcTest *p, Arena scratch)
     report(os, scratch, "8 MiB through cat in", millis(os_ticks(os)-t0), 0, " ms");
 
     // A child that does not read: input breaks once it exits
-    sc = shellcmd(&scratch, &p->te, "exit 0");
+    sc = shellcmd(&scratch, &p->te.shell, p->te.windows, "exit 0");
     pr = spawnio(p, scratch, sc.argv, sc.cmdline, {});
     if (!check(t, pr!=0, "os_spawnio of a child that does not read")) return;
     ProcWatch x = {};

@@ -387,8 +387,8 @@ static void testcfgvalidate(Test *t)
         "job_output, job_kill, task, skill, sessions, send_message, memory, "
         "desktop, *, default\n"
         "/c/prospero.ini:21:2: warning: unknown section kind \"provider\", "
-        "expected endpoint, model, role, guard, tools, instructions, skills, "
-        "memory, ui, desktop, host, remote or mcp\n"
+        "expected endpoint, model, role, guard, tools, shell, instructions, "
+        "skills, memory, ui, desktop, host, remote or mcp\n"
         "/c/prospero.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "
@@ -1992,6 +1992,85 @@ static void testcfgpath(Test *t)
         expect(t, "findshell.cmd", istr(&a, sh.kind*10 + sh.fallback), istr(&a, SHELL_CMD*10));
         sh = findshell(v.os, &a, v.scratch, "/exe", "C:/nowhere", 1, "auto");
         expect(t, "findshell.cmd.fallback", istr(&a, sh.kind*10 + sh.fallback), istr(&a, SHELL_CMD*10 + 1));
+    }
+
+    // Shells by name: [shell] sections of the user's own file only, a
+    // program found along a section's own path, keywords that must find
+    // their kind, and a command's environment from its section
+    {
+        os_write(v.os, a, "/c/shared.ini",
+                 "[shell evil]\n"
+                 "program = /opt/bin/zsh\n"
+                 "[shell zsh]\n"
+                 "env.EVIL = 1\n");
+        os_write(v.os, a, "/c/s.ini",
+                 "include = shared.ini\n"
+                 "[tools]\n"
+                 "shell = zsh\n"
+                 "[shell zsh]\n"
+                 "path_prepend = /opt/bin\n"
+                 "env.FOO = bar\n"
+                 "env.MINE = env:SH_TEST\n"
+                 "login = true\n"
+                 "description = Zsh here\n"
+                 "[shell ps]\n"
+                 "program = powershell\n"
+                 "[shell gone]\n"
+                 "program = /nowhere/x\n");
+        addenv(v.os, &a, "SH_TEST=42");
+        Config *c = newconfig(v.os, &a, v.scratch, "/c/s.ini", 0);
+        Engine *e = alloc<Engine>(&a);
+        e->os     = v.os;
+        e->cfg    = c;
+        e->ini    = c->ini;
+        e->home   = "/home/u";
+        e->exedir = "/exe";
+        e->env    = push(&a, e->env, Str("PATH=/usr/bin"));
+
+        struct { Str name; b32 prog; Str want; } cases[] = {
+            {"zsh",          0, "zsh /opt/bin/zsh Zsh here"},
+            {"evil",         0, "(there is no [shell evil] in your configuration)"},
+            {"sh",           0, "sh /bin/sh "},
+            {"auto",         0, "sh /bin/sh "},
+            {"",             0, "sh /bin/sh "},
+            {"ps",           0, "(powershell is not found here)"},
+            {"cmd",          0, "(cmd is not found here)"},
+            {"gone",         0, "(/nowhere/x is not found)"},
+            {"/opt/bin/zsh", 1, "zsh /opt/bin/zsh "},
+            {"/opt/bin/zsh", 0, "(there is no [shell /opt/bin/zsh] in your configuration)"},
+            {"bash",         1, "(bash is not found)"},
+        };
+        for (iz i = 0; i < countof(cases); i++) {
+            Str   err = {};
+            Shell sh  = shellnamed(e, &a, v.scratch, cases[i].name, cases[i].prog, 0, &err);
+            Str   got = sh.path.len
+                ? concat(&a, concat(&a, concat(&a, sh.name, " "), concat(&a, sh.path, " ")), sh.desc)
+                : concat(&a, concat(&a, "(", err), ")");
+            expect(t, concat(&a, "shellnamed ", cases[i].name), got, cases[i].want);
+        }
+        Str   warn = {};
+        Shell sh   = defaultshell(e, &a, v.scratch, 0, &warn);
+        expect(t, "defaultshell", concat(&a, sh.name, warn), "zsh");
+
+        Session *s = alloc<Session>(&a);
+        s->e = e;
+        Slice<Str> env = shellenvfor(s, &a, &sh);
+        expect(t, "shellenv.login", istr(&a, sh.login), "1");
+        Str all = showlist(&a, env);
+        expect(t, "shellenv", istr(&a, startswith(all, "PATH=/opt/bin:/usr/bin|") &&
+               endswith(all, "|FOO=bar|MINE=42") && find(all, "EVIL")<0), "1");
+        s->te.windows = 1;
+        env = shellenvfor(s, &a, &sh);
+        expect(t, "shellenv.windows", istr(&a, find(showlist(&a, env), "|CHERE_INVOKING=1|FOO=bar")>0), "1");
+        Shell plain = {};
+        plain.name  = "sh";
+        plain.login = 1;
+        s->te.windows = 0;
+        env = shellenvfor(s, &a, &plain);
+        all = showlist(&a, env);
+        expect(t, "shellenv.plain", istr(&a, !plain.login && startswith(all, "PATH=/usr/bin|") &&
+               find(all, "FOO")<0), "1");
+        cfgfree(c);
     }
 }
 

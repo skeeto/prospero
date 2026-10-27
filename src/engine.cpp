@@ -513,6 +513,7 @@ struct Session {
     Str          system;
     Str          tools;
     ToolEnv      te;
+    Str          shellwarn;  // [tools] shell was not found (buildprefix)
     Guard        guard;
     EventLog     log;
     iz           lock;       // os_lockfile handle, -1 if not held
@@ -4313,19 +4314,59 @@ static Slice<Str> engineenv(Engine *e, Arena *a, b32 win)
     return envsetpath(a, env, enginepath(e, a, win), win);
 }
 
+// A command's environment in shell sh, its section's settings as the
+// configuration now says: engineenv's, with PATH wrapped in the
+// section's path_prepend and path_append, then its env.NAME, and sh's
+// login set. A login sh on Windows gets CHERE_INVOKING=1 first, which
+// keeps MSYS2's and Git's /etc/profile in the working directory.
+static Slice<Str> shellenvfor(Session *s, Arena *a, Shell *sh)
+{
+    Engine    *e   = s->e;
+    b32        win = s->te.windows;
+    Slice<Str> env = engineenv(e, a, win);
+    sh->login = 0;
+    if (!sh->name.len || !cfgownsection(e->cfg, "shell", sh->name)) {
+        return env;
+    }
+    Str pre  = cfgget(e->cfg, "shell", sh->name, "path_prepend", 0);
+    Str post = cfgget(e->cfg, "shell", sh->name, "path_append", 0);
+    if (pre.len || post.len) {
+        Str path = searchpath(a, pre, enginepath(e, a, win), post, e->home, win);
+        env = envsetpath(a, env, path, win);
+    }
+    sh->login = cfgbool(cfgget(e->cfg, "shell", sh->name, "login", 0)) == 1;
+    if (sh->login && win && (sh->kind==SHELL_SH || sh->kind==SHELL_BUSYBOX)) {
+        env = envset(a, env, "CHERE_INVOKING", "1", win);
+    }
+    Slice<CfgPair> pairs = cfgpairs(e->cfg, a, "shell", sh->name, "env.");
+    for (iz i = 0; i < pairs.len; i++) {
+        env = envset(a, env, pairs[i].name, pairs[i].value, win);
+    }
+    return env;
+}
+
+// How a command runs in the session's shell: its argv and environment.
+static ShellCmd sessioncmd(Session *s, Arena *a, Str command, Slice<Str> *env)
+{
+    Shell    sh = s->te.shell;
+    *env = shellenvfor(s, a, &sh);
+    ShellCmd sc = shellcmd(a, &sh, s->te.windows, command);
+    if (sc.env.len) {
+        *env = push(a, *env, sc.env);
+    }
+    return sc;
+}
+
 // Spawn a process for the current call, its output into spill.
 static Proc *spawncall(Session *s, Arena scratch, Slice<Str> argv, Str cmdline,
-                       Str envadd, Str cwd, Str spill, i64 maxbytes, u64 *id)
+                       Slice<Str> env, Str cwd, Str spill, i64 maxbytes, u64 *id)
 {
     Engine *e  = s->e;
     Spawn   sp = {};
     sp.argv     = argv;
     sp.cmdline  = cmdline;
     sp.cwd      = cwd;
-    sp.env      = engineenv(e, &scratch, s->te.windows);
-    if (envadd.len) {
-        sp.env = push(&scratch, sp.env, envadd);
-    }
+    sp.env      = env;
     sp.outpath  = spill;
     sp.maxbytes = maxbytes;
     sp.mbox     = e->in;
@@ -4721,9 +4762,10 @@ static void startjob(Session *s, Arena scratch, Args *args)
     }
     Str      rel   = {};
     Str      spill = spillfile(s, scratch, c->id, &rel);
-    ShellCmd sc    = shellcmd(&scratch, &s->te, args->command);
-    u64      id    = 0;
-    Proc    *p     = spawncall(s, scratch, sc.argv, sc.cmdline, sc.env, s->cwd, spill,
+    Slice<Str> env = {};
+    ShellCmd   sc  = sessioncmd(s, &scratch, args->command, &env);
+    u64        id  = 0;
+    Proc      *p   = spawncall(s, scratch, sc.argv, sc.cmdline, env, s->cwd, spill,
                                SHELL_OUTMAX, &id);
     if (!p) {
         Str err  = os_lasterr(e->os, &scratch);
@@ -4953,8 +4995,9 @@ static b32 startshell(Session *s, Arena scratch, Args *args)
     sh.spill   = spillfile(s, scratch, c->id, &sh.rel);
     s->sh = sh;
 
-    ShellCmd sc = shellcmd(&scratch, &s->te, args->command);
-    s->proc = spawncall(s, scratch, sc.argv, sc.cmdline, sc.env, s->cwd, s->sh.spill,
+    Slice<Str> env = {};
+    ShellCmd   sc  = sessioncmd(s, &scratch, args->command, &env);
+    s->proc = spawncall(s, scratch, sc.argv, sc.cmdline, env, s->cwd, s->sh.spill,
                         SHELL_OUTMAX, &s->procid);
     if (!s->proc) {
         return 0;
@@ -5004,7 +5047,8 @@ static b32 startsearch(Session *s, Arena scratch, i32 tool, Str path, Args *args
 
     Slice<Str> argv = searchargv(&scratch, &s->te, tool, path, target, args);
     i64        max  = tool==TOOL_GLOB ? SEARCH_GLOBMAX : SEARCH_OUTMAX;
-    s->proc = spawncall(s, scratch, argv, {}, {}, root, s->sh.spill, max, &s->procid);
+    Slice<Str> env = engineenv(e, &scratch, s->te.windows);
+    s->proc = spawncall(s, scratch, argv, {}, env, root, s->sh.spill, max, &s->procid);
     if (!s->proc) {
         Str err  = os_lasterr(e->os, &scratch);
         Str text = concat(&scratch, "The search could not be started: ", err);
@@ -10351,17 +10395,112 @@ static Shell findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
     return sh;
 }
 
+// The keyword a kind of shell goes by: sh, powershell or cmd.
+static Str shellkeyword(i32 kind)
+{
+    switch (kind) {
+    case SHELL_CMD:  return "cmd";
+    case SHELL_PWSH:
+    case SHELL_PS:   return "powershell";
+    }
+    return "sh";
+}
+
+// A shell by name: a [shell NAME] section of the user's own file, whose
+// program (by default NAME) is a keyword or an executable found along
+// its own search path; else a keyword, auto, sh, powershell or cmd; else,
+// if prog, an executable, by its path or its name on PATH, named by its
+// base name. A keyword other than auto must find its own kind. A miss
+// returns a shell without a path, and err says why.
+static Shell shellnamed(Engine *e, Arena *perm, Arena scratch, Str name,
+                        b32 prog, b32 win, Str *err)
+{
+    name = trim(name);
+    name = name.len ? name : Str("auto");
+    b32 own  = cfgownsection(e->cfg, "shell", name);
+    Str want = name;
+    Str path = enginepath(e, &scratch, win);
+    if (own) {
+        Str p = trim(cfgget(e->cfg, "shell", name, "program", 0));
+        want  = p.len ? p : name;
+        Str pre  = cfgget(e->cfg, "shell", name, "path_prepend", 0);
+        Str post = cfgget(e->cfg, "shell", name, "path_append", 0);
+        path = searchpath(&scratch, pre, path, post, e->home, win);
+    }
+
+    Shell sh = {};
+    b32   kw = want=="auto" || want=="sh" || want=="powershell" || want=="cmd";
+    if (kw) {
+        sh = findshell(e->os, perm, scratch, e->exedir, path, win, want);
+        b32 ok = want=="auto" || shellkeyword(sh.kind)==want;
+        if (!ok) {
+            *err = concat(perm, want, " is not found here");
+            return {};
+        }
+        sh.name = want=="auto" ? shellkeyword(sh.kind) : want;
+    } else if (!own && !prog) {
+        *err = concat(perm, concat(&scratch, "there is no [shell ", name),
+                      "] in your configuration");
+        return {};
+    } else {
+        Str found = {};
+        if (os_stat(e->os, scratch, want).type == STAT_FILE) {
+            found = clone(perm, want);
+        } else if (basename(want) == want) {
+            Str file = win && find(want, ".")<0 ? concat(&scratch, want, ".exe") : want;
+            found = findpath(e->os, perm, scratch, path, file, win);
+        }
+        if (!found.len) {
+            *err = concat(perm, want, " is not found");
+            return {};
+        }
+        sh = shellat(e->os, scratch, found, shellkindof(found, win), win);
+        Str base = basename(want);
+        if (win && base.len>4 && equalfold(taketail(base, 4), ".exe")) {
+            base = cuttail(base, 4);
+        }
+        sh.name = base;
+    }
+    if (own) {
+        sh.name = clone(perm, name);
+        sh.desc = clone(perm, trim(cfgget(e->cfg, "shell", name, "description", 0)));
+    } else {
+        sh.name = clone(perm, sh.name);
+    }
+    return sh;
+}
+
+// The shell [tools] shell names, else auto's: when it is not found, a
+// warning for the session in *warn, if given.
+static Shell defaultshell(Engine *e, Arena *perm, Arena scratch, b32 win, Str *warn)
+{
+    Str   pref = cfgget(e->cfg, "tools", "", "shell", 0);
+    Str   err  = {};
+    Shell sh   = shellnamed(e, perm, scratch, pref, 1, win, &err);
+    if (!sh.path.len) {
+        sh = shellnamed(e, perm, scratch, "auto", 0, win, &err);
+        if (warn) {
+            Str w = concat(&scratch, "[tools] shell: ", err);
+            w     = concat(&scratch, w, ", so commands run in ");
+            *warn = concat(perm, w, sh.name);
+        }
+    }
+    return sh;
+}
+
 // The shell the session's prefix describes, as it began, if it is
 // still there: else the session goes on with the engine's.
 static void prefixshell(Session *s, Arena scratch, Json *j)
 {
     Str shell = jsonstr(jsonget(j, "shell"));
     Str kind  = jsonstr(jsonget(j, "shell_kind"));
+    Str name  = jsonstr(jsonget(j, "shell_name"));
     for (i32 k = 0; shell.len && k<countof(shellkinds); k++) {
         if (kind==shellkinds[k] && os_stat(s->e->os, scratch, shell).type==STAT_FILE) {
             s->te.shell      = {};
             s->te.shell.path = clone(&s->perm, shell);
             s->te.shell.kind = k;
+            s->te.shell.name = name.len ? clone(&s->perm, name) : Str(shellkeyword(k));
         }
     }
 }
@@ -10427,9 +10566,8 @@ static void buildprefix(Session *s, Arena scratch)
 {
     Engine *e = s->e;
     jobconf(s);
-    Str     path = enginepath(e, &scratch, s->te.windows);
-    s->te.shell     = findshell(e->os, &s->perm, scratch, e->exedir, path,
-                                s->te.windows, cfgget(e->cfg, "tools", "", "shell", 0));
+    s->shellwarn    = {};
+    s->te.shell     = defaultshell(e, &s->perm, scratch, s->te.windows, &s->shellwarn);
     s->te.coords    = s->mc.coords;
     s->te.vision    = !s->mc.novision;
     if (tooloffered(&s->te, TOOL_TASK)) {
@@ -10557,6 +10695,7 @@ static void logprefix(Session *s, Arena scratch)
     putintkey(&w.json, "job_timeout_max", s->te.jobmax);
     putstrkey(&w.json, "shell", s->te.shell.path);
     putstrkey(&w.json, "shell_kind", shellkinds[s->te.shell.kind]);
+    putstrkey(&w.json, "shell_name", s->te.shell.name);
     if (tooloffered(&s->te, TOOL_DESKTOP)) {
         putstrkey(&w.json, "coordinates", s->te.coords==COORDS_NORM1000
                                           ? Str("norm1000") : Str("pixels"));
@@ -11095,6 +11234,9 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     instrlogstart(s, scratch);
     memlogstart(s, scratch);
     logprefix(s, scratch);
+    if (s->shellwarn.len) {
+        note(s, scratch, "warn", s->shellwarn);
+    }
     for (iz i = 0; i < s->grants.len; i++) {
         loggrant(s, scratch, s->grants[i], "parent", {}, {});
     }
@@ -12619,6 +12761,9 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     instrlogstart(s, scratch);
     memlogstart(s, scratch);
     logprefix(s, scratch);
+    if (s->shellwarn.len) {
+        note(s, scratch, "warn", s->shellwarn);
+    }
     if (plan) {
         setmode(s, scratch, MODE_PLAN, "new");
     } else if (task.plan) {
@@ -15813,10 +15958,8 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
         e->home = os_getenv(os, &e->perm, "USERPROFILE");
     }
     Arena scratch = newarena(e->scratch);
-    Str   path    = enginepath(e, &scratch, HOST_WINDOWS);
     e->te.windows = HOST_WINDOWS;
-    e->te.shell   = findshell(os, &e->perm, scratch, e->exedir, path, HOST_WINDOWS,
-                              cfgget(cfg, "tools", "", "shell", 0));
+    e->te.shell   = defaultshell(e, &e->perm, scratch, HOST_WINDOWS, 0);
     e->te.exe   = exe;
     e->te.rg    = findrg(e, &e->perm, newarena(e->scratch));
     // The user's own instructions, next to the configuration
