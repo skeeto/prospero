@@ -1606,6 +1606,67 @@ def instructions_changed(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=15)
+def instructions_own(t):
+    """The agent's own write to an instruction file: logged as changed,
+    and the agent is not told its own change back."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("AGENTS.md", "Rule one.\n")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="first")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        h.send("prompt", sid=sid, text="second")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 2)
+        t.check(t.file("AGENTS.md") == "Rule two.\n", "written")
+        reqs = [x["body"]["messages"] for x in t.requests()]
+        told = [m for r in reqs for m in r if "Instruction files changed" in str(m.get("content"))]
+        t.check(not told, f"not told: {told}")
+        ins = h.all("instructions", sid)
+        t.check([i["why"] for i in ins] == ["start", "changed"], f"records {ins}")
+        t.check(ins[1]["files"][0]["bytes"] == len("Rule two.\n"), f"restamped {ins[1]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def instructions_gone_reopen(t):
+    """An instruction file removed: the agent is told once, and not again
+    after the session is opened in another process."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("AGENTS.md", "Rule one.\n")
+    gone = "This file is gone"
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="first")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        h.send("prompt", sid=sid, text="second")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 2)
+        ins = h.all("instructions", sid)
+        t.check([i["why"] for i in ins] == ["start", "changed"], f"records {ins}")
+        t.check(ins[1]["files"][0]["mtime"] == -1, f"gone: {ins[1]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    t.check(t.file("AGENTS.md") is None, "removed")
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        h.send("prompt", sid=sid, text="third")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 3)
+        ins = h.all("instructions", sid)
+        t.check([i["why"] for i in ins] == ["start", "changed"], f"no new record: {ins}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = [x["body"]["messages"] for x in t.requests()]
+    told = [i for i, r in enumerate(reqs) if gone in str(r[-1].get("content"))]
+    t.check(len(reqs) == 4 and told == [2], f"told once, in turn 2: {told} of {len(reqs)}")
+
+
 SEARCH_FILES = {
     ".gitignore": "ignored/\n*.log\n",
     "src/a.c": "int main(void)\n{\n    // TODO: fix\n}\n",

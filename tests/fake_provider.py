@@ -770,6 +770,20 @@ def sc_instructions_changed(model, n, req):
     yield from answer(model, f"Answer number {n}.")
 
 
+def sc_instructions_own(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "write", {"path": "AGENTS.md", "content": "Rule two.\n"})
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
+def sc_instructions_gone_reopen(model, n, req):
+    if n == 0:
+        yield from tool(model, n, "shell", {"command": "rm AGENTS.md"})
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
 def sc_soft_stop(model, n, req):
     if n == 0:
         yield from tool(model, n, "shell", {"command": "echo $$ > softpid; sleep 30"})

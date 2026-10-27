@@ -3076,8 +3076,8 @@ static void instrcheck(Session *s, Arena scratch)
         k->mtime = file ? st.mtime : -1;
         InstrFile f = {};
         f.path  = k->path;
-        f.size  = st.size;
-        f.mtime = st.mtime;
+        f.size  = k->size;
+        f.mtime = k->mtime;  // -1 when gone, so a reopen doesn't tell again
         changed = push(&scratch, changed, f);
         print(&b, "\n\n## ");
         print(&b, k->path);
@@ -3101,6 +3101,29 @@ static void instrcheck(Session *s, Arena scratch)
     Str text = finish(&t);
     loginstr(s, scratch, changed, {}, "changed", {});
     notify(s, "instructions", text, 0);
+}
+
+// After the session's own write, edit or removal of a loaded instruction
+// file: the agent made the change, so the file is restamped and logged
+// as changed without telling the agent its own change.
+static void instrown(Session *s, Arena scratch, Str path)
+{
+    for (iz i = 0; i < s->instrfiles.len; i++) {
+        InstrStamp *k = &s->instrfiles[i];
+        if (k->path != path) {
+            continue;
+        }
+        Stat st   = os_stat(s->e->os, scratch, path);
+        b32  file = st.type == STAT_FILE;
+        k->size  = file ? st.size : 0;
+        k->mtime = file ? st.mtime : -1;
+        InstrFile f = {};
+        f.path  = k->path;
+        f.size  = k->size;
+        f.mtime = k->mtime;
+        loginstr(s, scratch, {&f, 1, 1}, {}, "changed", {});
+        return;
+    }
 }
 
 
@@ -3566,6 +3589,7 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
         if (!ok) {
             break;
         }
+        instrown(s, scratch, c->path);
         instrlazy(s, scratch, c->path);
     }
     if (made < plan.changes.len) {
@@ -3630,6 +3654,9 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     }
     if (tool==TOOL_WRITE || tool==TOOL_EDIT) {
         snapafter(s, scratch, path, &pre, o.wrote, 0);
+    }
+    if (o.ok && (tool==TOOL_WRITE || tool==TOOL_EDIT)) {
+        instrown(s, scratch, path);
     }
     if (o.ok) {
         instrlazy(s, scratch, path);
