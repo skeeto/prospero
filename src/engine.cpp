@@ -7038,9 +7038,10 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
         Str dotexe = concat(&scratch, argv[0], ".exe");
         Str dotcmd = concat(&scratch, argv[0], ".cmd");
         Str dotbat = concat(&scratch, argv[0], ".bat");
-        if (!findpath(e->os, &scratch, scratch, path, dotexe, 1).len) {
-            Str script = findpath(e->os, &scratch, scratch, path, dotcmd, 1);
-            script = script.len ? script : findpath(e->os, &scratch, scratch, path, dotbat, 1);
+        Arena tmp  = carve(&scratch, 1<<20);
+        if (!findpath(e->os, &scratch, tmp, path, dotexe, 1).len) {
+            Str script = findpath(e->os, &scratch, tmp, path, dotcmd, 1);
+            script = script.len ? script : findpath(e->os, &scratch, tmp, path, dotbat, 1);
             if (script.len) {
                 for (iz i = 1; i < argv.len; i++) {
                     Str bad = mcpcmdbad(argv[i]);
@@ -14291,8 +14292,9 @@ static void cmdshell(Engine *e, Arena scratch, i64 id, Json *j)
                                      : Str{};
     Shell    sh        = {};
     if (!err.len) {
-        sh = shellnamed(e, &scratch, scratch, name, 0, s->te.windows, &err);
-        Shell prog = sh.path.len ? Shell{} : shellprog(e, &scratch, scratch, s->te.windows);
+        Arena tmp = carve(&scratch, 1<<20);
+        sh = shellnamed(e, &scratch, tmp, name, 0, s->te.windows, &err);
+        Shell prog = sh.path.len ? Shell{} : shellprog(e, &scratch, tmp, s->te.windows);
         sh  = prog.path.len && prog.name==name ? prog : sh;
         err = sh.path.len ? Str{} : concat(&scratch, "no shell: ", err);
     }
@@ -14363,7 +14365,8 @@ static void cmdshells(Engine *e, Arena scratch, i64 id)
 {
     b32        win   = e->te.windows;
     Slice<Str> names = cfgownnames(e->cfg, &scratch, "shell");
-    Shell      def   = defaultshell(e, &scratch, scratch, win, 0);
+    Arena      tmp   = carve(&scratch, 1<<20);
+    Shell      def   = defaultshell(e, &scratch, tmp, win, 0);
 
     Buf   b(&scratch, 4096);
     EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
@@ -14374,7 +14377,7 @@ static void cmdshells(Engine *e, Arena scratch, i64 id)
     putarray(&w.json);
     for (iz i = 0; i < names.len; i++) {
         Str   err = {};
-        Shell sh  = shellnamed(e, &scratch, scratch, names[i], 0, win, &err);
+        Shell sh  = shellnamed(e, &scratch, tmp, names[i], 0, win, &err);
         putshell(&w.json, names[i], &sh, err);
     }
     Str kw[] = {"sh", "powershell", "cmd"};
@@ -14384,12 +14387,12 @@ static void cmdshells(Engine *e, Arena scratch, i64 id)
             dup |= names[k] == kw[i];
         }
         Str   err = {};
-        Shell sh  = dup ? Shell{} : shellnamed(e, &scratch, scratch, kw[i], 0, win, &err);
+        Shell sh  = dup ? Shell{} : shellnamed(e, &scratch, tmp, kw[i], 0, win, &err);
         if (sh.path.len) {
             putshell(&w.json, kw[i], &sh, {});
         }
     }
-    Shell prog = shellprog(e, &scratch, scratch, win);
+    Shell prog = shellprog(e, &scratch, tmp, win);
     if (prog.path.len) {
         putshell(&w.json, prog.name, &prog, {});
     }

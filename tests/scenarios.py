@@ -2357,7 +2357,9 @@ def shell_login_msys(t):
     directory and Prospero's PATH, its path_prepend included, though
     Prospero itself has an ORIGINAL_PATH from a Git Bash terminal, which
     the profile would take instead; env.MSYS2_PATH_TYPE = minimal, as
-    stock MSYS2 has it, drops that PATH. Windows, with Git's bash."""
+    stock MSYS2 has it, drops that PATH. A session switched to it, as
+    /shell does, runs it from the same path that shells lists. Windows,
+    with Git's bash."""
     sh = gitbash() if t.host.windows and isinstance(t.host, LocalHost) else None
     if not sh:
         t.note("Windows, with Git's bash, only")
@@ -2365,9 +2367,9 @@ def shell_login_msys(t):
     bin = t.host.join(t.base, "loginbin")
     t.host.mkdir(bin)
     t.host.write(t.host.join(bin, "prospero_login_tool"), "#!/bin/sh\necho login-tool-ran\n")
-    base = t.host.read(t.config) + ("[tools]\nshell = gitbash\n"
-                                    f"[shell gitbash]\nprogram = {sh}\nlogin = true\n"
-                                    f"path_prepend = {bin}\n")
+    first = t.host.read(t.config)
+    section = f"[shell gitbash]\nprogram = {sh}\nlogin = true\npath_prepend = {bin}\n"
+    base = first + "[tools]\nshell = gitbash\n" + section
     work = t.work.replace("\\", "/").rstrip("/").lower()
     for extra, kind, ran in (("", "inherit", True),
                              ("env.MSYS2_PATH_TYPE = minimal\n", "minimal", False)):
@@ -2383,6 +2385,31 @@ def shell_login_msys(t):
         t.check(("login-tool-ran" in ends[0]) == ran,
                 f"{kind}: path_prepend {'kept' if ran else 'dropped'}: {ends[0]!r}")
         t.check(work in lines, f"{kind}: in {work}: {ends[0]!r}")
+
+    # Switched to, in a session begun in the default shell: a section as
+    # plain as can be, its program by a path with backslashes, which
+    # resolving it must not overwrite
+    t.host.write(t.config, first + f"[shell bash]\nprogram = {sh.replace('/', chr(92))}\n"
+                 "login = true\ndescription = Git Bash\n")
+    h = t.headless()
+    try:
+        listed = {x["name"]: x for x in h.call("shells").get("shells", [])}
+        path = listed.get("bash", {}).get("path", "")
+        t.check(path.replace("\\", "/").lower() == sh.lower(), f"listed {listed.get('bash')}")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        r = h.call("shell", sid=sid, shell="bash")
+        t.check(r.get("ok") == 1 and r.get("path", "").replace("\\", "/").lower() == sh.lower(),
+                f"switched {r}")
+        h.send("prompt", sid=sid, text="go")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == 2)
+        ends = [e["text"] for e in h.all("tool.end", sid)]
+        t.check(len(ends) == 2 and "type=inherit" in ends[1] and "[exit code 0, " in ends[1],
+                f"switched: {ends}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 @scenario(bound=40)

@@ -100,6 +100,18 @@ static u8 *allocbytes(Arena *a, iz count)
     return r;
 }
 
+// A scratch arena of cap bytes taken off the front of a, for a callee
+// whose results go in a itself: passing a as both, by pointer and by
+// value, would have its scratch overwrite results made before it was
+// done. It cannot grow.
+static Arena carve(Arena *a, iz cap)
+{
+    Arena r = {};
+    r.beg = (byte *)allocbytes(a, cap);
+    r.end = r.beg + cap;
+    return r;
+}
+
 static void copybytes(void *dst, void *src, iz len)
 {
     if (len) __builtin_memcpy(dst, src, (uz)len);
