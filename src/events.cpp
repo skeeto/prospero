@@ -49,6 +49,7 @@ enum : i32 {
     EV_TASKHOST,    // a task's subagent, on another host, named there
     EV_TASKREPORT,  // a subagent's report to its parent on another host
     EV_MEMORY,      // the project's memory, as the agent knows it
+    EV_SHELL,       // the agent's shell from here on, by the user
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -103,6 +104,7 @@ static EvInfo evinfo[] = {
     {"task.host",  1, 0},
     {"task.report", 1, 1},  // the parent's call ends by it
     {"memory",     1, 0},
+    {"shell",      1, 0},
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -159,6 +161,8 @@ enum : i32 {
     CMD_MCPCODE, // what the browser brought back, for tokens, late
     CMD_MCPLOGOUT,   // an MCP server's tokens forgotten
     CMD_MCPRESTART,  // an MCP server started again
+    CMD_SHELL,   // another shell for the agent's commands from here on
+    CMD_SHELLS,  // the shells there are to switch to, and the default
     CMD_COUNT,
 };
 
@@ -169,7 +173,7 @@ static Str cmdnames[] = {
     "group", "fork", "compact", "model", "draft", "upload", "import",
     "skills", "mode",
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
-    "mcp.logout", "mcp.restart",
+    "mcp.logout", "mcp.restart", "shell", "shells",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -230,6 +234,9 @@ static Str capnames[] = {
                        // task.host records, and host on tool.end and notices
     "memory",          // the memory tool, memory records, and notices of
                        // kind memory
+    "shell",           // shell and shells: the user switches a session's
+                       // shell, the shell record, shell_name on prefix
+                       // records, and notices of kind shell
 };
 
 static Str evname(i32 ev)

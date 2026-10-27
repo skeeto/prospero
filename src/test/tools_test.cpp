@@ -658,6 +658,27 @@ static void test_tools(Test *t)
         expect(t, "description, own ending", istr(a, find(shelldesc(a, &te),
                "-c. Has GCC! Each")>0), "1");
 
+        // The notices of a shell: switched to by the user, back to the
+        // tool's own, and in place of one gone
+        {
+            Shell pre = {}, now = {}, gone = {};
+            pre.name = "sh";   pre.path = "/bin/sh";   pre.kind = SHELL_SH;
+            now.name = "zsh";  now.path = "/bin/zsh";  now.kind = SHELL_SH;
+            now.desc = "Zsh here";
+            expect(t, "shell notice, user", shellnotice(a, &now, &pre, &gone, 1),
+                   "The user switched your shell to zsh. It replaces the one the "
+                   "shell tool names, whose other rules still hold. Run a command "
+                   "with /bin/zsh -c. Zsh here.");
+            expect(t, "shell notice, back", shellnotice(a, &pre, &pre, &gone, 1),
+                   "The user switched your shell to sh, the one the shell tool "
+                   "names, from now on.");
+            gone = now;
+            expect(t, "shell notice, gone", shellnotice(a, &pre, &pre, &gone, 0),
+                   "Your shell, zsh (/bin/zsh), is not found now, so commands run "
+                   "in sh, the one the shell tool names, from now on.");
+            expect(t, "sameshell", istr(a, sameshell(&pre, &pre)*10 + sameshell(&pre, &now)), "10");
+        }
+
         Slice<Str> ev = {};
         ev = push(a, ev, Str("Path=C:\\x"));
         ev = push(a, ev, Str("A=1"));

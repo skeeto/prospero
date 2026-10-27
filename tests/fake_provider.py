@@ -358,6 +358,31 @@ def sc_shell_profile(model, n, req):
         yield from answer(model, "Ran in the profile.")
 
 
+def sc_shell_switch(model, n, req):
+    # The prompt among the user's messages since the last answer (a
+    # notice comes after it): run a command, start a subagent to, or
+    # take a while; once a call's result is in, answer
+    said = set()
+    for m in reversed(req.get("messages", [])):
+        if m.get("role") == "assistant" and not m.get("tool_calls"):
+            break
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            said.add(m["content"].strip())
+    if since_user(req):
+        yield from answer(model, "Done.")
+    elif "slow" in said:
+        yield S.head()
+        yield S.sleep(1.5)
+        yield from text(model, "Slowly.")
+        yield from finish(model)
+    elif "task" in said:
+        yield from tool(model, n, "task", {"description": "Run it", "prompt": "run"})
+    elif "run" in said:
+        yield from tool(model, n, "shell", {"command": 'echo "WHICH=${WHICH-default}"'})
+    else:
+        yield from answer(model, "Nothing to do.")
+
+
 def sc_bytewise(model, n, req):
     yield S.bytewise()
     if n == 0:

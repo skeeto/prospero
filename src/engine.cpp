@@ -265,10 +265,11 @@ static i32 modefind(Str name)
 // in the background.
 struct Notice {
     Str kind;    // "job", "rewind", "instructions", "skills", "budget",
-                 // "mode", "message", "task"
+                 // "mode", "message", "task", "shell"
     Str text;
     i64 job;     // for "job"
     i32 mode;    // for "mode": MODE_*, the one it tells
+    Shell shell; // for "shell": the one it tells
     b32 skills;  // its record lists the skills the agent knows now
     Str from;    // for "message": the sender's sid and title; for
     Str ftitle;  // "task": the subagent's
@@ -512,8 +513,14 @@ struct Session {
     b32          discovered;  // this turn
     Str          system;
     Str          tools;
-    ToolEnv      te;
+    ToolEnv      te;         // te.shell: the shell commands run in now
     Str          shellwarn;  // [tools] shell was not found (buildprefix)
+    Shell        shellpre;   // the shell the prefix describes
+    Shell        shellheard; // the shell the agent was last told of
+    Shell        shellmiss;  // the shell it had, not found now, untold
+    Shell        shellfrom;  // a subagent's: its parent's, to start in
+    b32          shellset;   // a shell record replayed (loadsession)
+    b32          shelluser;  // the user switched it, untold
     Guard        guard;
     EventLog     log;
     iz           lock;       // os_lockfile handle, -1 if not held
@@ -1252,9 +1259,11 @@ static void userinput(Session *s)
 // again sends the same history. The mode is looked at anew, as a
 // subagent's follows its parent's.
 static void planheed(Session *, Arena);
+static void shellheed(Session *, Arena);
 static void deliver(Session *s, Arena scratch)
 {
     planheed(s, scratch);
+    shellheed(s, scratch);
     for (iz i = 0; i < s->notices.len; i++) {
         Notice *n = &s->notices[i];
         Arena   a = scratch;
@@ -1280,6 +1289,10 @@ static void deliver(Session *s, Arena scratch)
         if (n->kind == "mode") {
             putstrkey(&w.json, "mode", modenames[n->mode]);
         }
+        if (n->kind == "shell") {
+            putstrkey(&w.json, "shell", n->shell.name);
+            putstrkey(&w.json, "path", n->shell.path);
+        }
         putstrkey(&w.json, "text", n->text);
         if (n->skills) {
             putskills(&w.json, s->skillseen, 0);
@@ -1292,6 +1305,11 @@ static void deliver(Session *s, Arena scratch)
         addmsg(s, m);
         if (n->kind == "mode") {
             s->modeheard = n->mode;
+        }
+        if (n->kind == "shell") {
+            s->shellheard = n->shell;
+            s->shellmiss  = {};
+            s->shelluser  = 0;
         }
     }
     s->notices = {};
@@ -3558,6 +3576,25 @@ static void setmode(Session *s, Arena scratch, i32 mode, Str by)
         s->modeheard = mode;
     }
     planheed(s, scratch);
+}
+
+// Queue the notice of the shell, unless the agent knows it as it is: a
+// notice of it queued before goes, as the shell changed since.
+static void shellheed(Session *s, Arena scratch)
+{
+    iz n = 0;
+    for (iz i = 0; i < s->notices.len; i++) {
+        if (!(s->notices[i].kind == "shell")) {
+            s->notices[n++] = s->notices[i];
+        }
+    }
+    s->notices.len = n;
+    if (s->shellheard.path.len && !sameshell(&s->te.shell, &s->shellheard)) {
+        Str text = shellnotice(&scratch, &s->te.shell, &s->shellpre,
+                               &s->shellmiss, s->shelluser);
+        notify(s, "shell", text, 0);
+        s->notices[s->notices.len-1].shell = s->te.shell;
+    }
 }
 
 // Whether a normalized absolute path is the session's plan file.
@@ -9520,6 +9557,8 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     // request that follows
     s->modeheard = MODE_BUILD;
     planheed(s, scratch);
+    s->shellheard = s->shellpre;  // and a shell other than the tool's
+    shellheed(s, scratch);
     if (modeof(s)!=MODE_BUILD && cp.why!=CW_MANUAL) {
         deliver(s, scratch);
     }
@@ -10406,6 +10445,14 @@ static Str shellkeyword(i32 kind)
     return "sh";
 }
 
+// Whether a name is a keyword of [tools] shell's: auto, sh, powershell
+// or cmd. Empty is auto.
+static b32 shellkw(Str name)
+{
+    return !name.len || name=="auto" || name=="sh" || name=="powershell" ||
+           name=="cmd";
+}
+
 // A shell by name: a [shell NAME] section of the user's own file, whose
 // program (by default NAME) is a keyword or an executable found along
 // its own search path; else a keyword, auto, sh, powershell or cmd; else,
@@ -10429,7 +10476,7 @@ static Shell shellnamed(Engine *e, Arena *perm, Arena scratch, Str name,
     }
 
     Shell sh = {};
-    b32   kw = want=="auto" || want=="sh" || want=="powershell" || want=="cmd";
+    b32   kw = shellkw(want);
     if (kw) {
         sh = findshell(e->os, perm, scratch, e->exedir, path, win, want);
         b32 ok = want=="auto" || shellkeyword(sh.kind)==want;
@@ -10488,20 +10535,54 @@ static Shell defaultshell(Engine *e, Arena *perm, Arena scratch, b32 win, Str *w
     return sh;
 }
 
-// The shell the session's prefix describes, as it began, if it is
-// still there: else the session goes on with the engine's.
+// A shell as a record has it, its name, path and kind, with its
+// flavor and its section's description as they are now. Without a path
+// if its kind is unknown here.
+static Shell shellrec(Engine *e, Arena *perm, Arena scratch, Json *j, Str key,
+                      Str kindkey, Str namekey)
+{
+    Str   path = jsonstr(jsonget(j, key));
+    Str   kind = jsonstr(jsonget(j, kindkey));
+    Str   name = jsonstr(jsonget(j, namekey));
+    Shell sh   = {};
+    for (i32 k = 0; path.len && k<countof(shellkinds); k++) {
+        if (kind == shellkinds[k]) {
+            sh = shellat(e->os, scratch, clone(perm, path), k, HOST_WINDOWS);
+            sh.name = name.len ? clone(perm, name) : Str(shellkeyword(k));
+            if (cfgownsection(e->cfg, "shell", sh.name)) {
+                Str d   = cfgget(e->cfg, "shell", sh.name, "description", 0);
+                sh.desc = clone(perm, trim(d));
+            }
+        }
+    }
+    return sh;
+}
+
+// The shell commands run in from a record of it on: else, if it is not
+// found now, [tools] shell's, and the agent is told why (shellheed).
+static void useshell(Session *s, Arena scratch, Shell sh)
+{
+    if (sh.path.len && os_stat(s->e->os, scratch, sh.path).type==STAT_FILE) {
+        s->te.shell  = sh;
+        s->shellmiss = {};
+    } else if (sh.path.len) {
+        s->te.shell  = defaultshell(s->e, &s->perm, scratch, s->te.windows, 0);
+        s->shellmiss = sh;
+    }
+}
+
+// The shell the session's prefix describes, as it began, which commands
+// run in until a shell record says otherwise (useshell).
 static void prefixshell(Session *s, Arena scratch, Json *j)
 {
-    Str shell = jsonstr(jsonget(j, "shell"));
-    Str kind  = jsonstr(jsonget(j, "shell_kind"));
-    Str name  = jsonstr(jsonget(j, "shell_name"));
-    for (i32 k = 0; shell.len && k<countof(shellkinds); k++) {
-        if (kind==shellkinds[k] && os_stat(s->e->os, scratch, shell).type==STAT_FILE) {
-            s->te.shell      = {};
-            s->te.shell.path = clone(&s->perm, shell);
-            s->te.shell.kind = k;
-            s->te.shell.name = name.len ? clone(&s->perm, name) : Str(shellkeyword(k));
-        }
+    Shell sh = shellrec(s->e, &s->perm, scratch, j, "shell", "shell_kind", "shell_name");
+    if (!sh.path.len) {
+        return;
+    }
+    s->shellpre   = sh;
+    s->shellheard = s->shellheard.path.len ? s->shellheard : sh;
+    if (!s->shellset) {
+        useshell(s, scratch, sh);
     }
 }
 
@@ -10567,7 +10648,10 @@ static void buildprefix(Session *s, Arena scratch)
     Engine *e = s->e;
     jobconf(s);
     s->shellwarn    = {};
-    s->te.shell     = defaultshell(e, &s->perm, scratch, s->te.windows, &s->shellwarn);
+    s->te.shell     = s->shellfrom.path.len ? s->shellfrom :
+                      defaultshell(e, &s->perm, scratch, s->te.windows, &s->shellwarn);
+    s->shellpre     = s->te.shell;
+    s->shellheard   = s->te.shell;
     s->te.coords    = s->mc.coords;
     s->te.vision    = !s->mc.novision;
     if (tooloffered(&s->te, TOOL_TASK)) {
@@ -10693,9 +10777,9 @@ static void logprefix(Session *s, Arena scratch)
     putstrkey(&w.json, "tools", s->tools);
     putintkey(&w.json, "job_timeout", s->te.jobtimeout);
     putintkey(&w.json, "job_timeout_max", s->te.jobmax);
-    putstrkey(&w.json, "shell", s->te.shell.path);
-    putstrkey(&w.json, "shell_kind", shellkinds[s->te.shell.kind]);
-    putstrkey(&w.json, "shell_name", s->te.shell.name);
+    putstrkey(&w.json, "shell", s->shellpre.path);
+    putstrkey(&w.json, "shell_kind", shellkinds[s->shellpre.kind]);
+    putstrkey(&w.json, "shell_name", s->shellpre.name);
     if (tooloffered(&s->te, TOOL_DESKTOP)) {
         putstrkey(&w.json, "coordinates", s->te.coords==COORDS_NORM1000
                                           ? Str("norm1000") : Str("pixels"));
@@ -11223,6 +11307,10 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->nofallback = p->nofallback;
     s->tempask    = p->tempask;
     s->nofolder   = p->nofolder;  // in the parent's folder
+    s->shellfrom  = p->te.shell;    // in the parent's shell, as now
+    s->shellfrom.name = clone(&s->perm, p->te.shell.name);
+    s->shellfrom.path = clone(&s->perm, p->te.shell.path);
+    s->shellfrom.desc = clone(&s->perm, p->te.shell.desc);
     Str why = opensession(s, scratch);
     if (why.data) {
         dropsession(e, s);
@@ -13060,8 +13148,24 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 // The mode it told, else (an older record) the mode then
                 i32 told = modefind(jsonstr(jsonget(j, "mode")));
                 s->modeheard = told<0 ? s->mode : told;
+            } else if (jsonstr(jsonget(j, "kind")) == "shell") {
+                // Only its name and path matter (sameshell)
+                s->shellheard      = {};
+                s->shellheard.name = clone(&s->perm, jsonstr(jsonget(j, "shell")));
+                s->shellheard.path = clone(&s->perm, jsonstr(jsonget(j, "path")));
+                s->shellmiss       = {};
+                s->shelluser       = 0;
             }
             break;
+        case EV_SHELL: {
+            // Switched (shell): the shell from here on, if it is found
+            Shell sh = shellrec(e, &s->perm, t, j, "path", "kind", "name");
+            if (sh.path.len) {
+                s->shellset  = 1;
+                s->shelluser = jsonstr(jsonget(j, "by")) == "user";
+                useshell(s, t, sh);
+            }
+        } break;
         case EV_GRANT: {
             // "Always allow", as the guard has it from then on, or a
             // class of desktop actions
@@ -13099,7 +13203,8 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             }
             countbytes(s);
             s->thinkfrom = r.seq;
-            s->modeheard = MODE_BUILD;  // told again (compacted)
+            s->modeheard  = MODE_BUILD;  // told again (compacted)
+            s->shellheard = s->shellpre;
         } break;
         case EV_ASSISTANT:
             m.seq  = r.seq;
@@ -13194,6 +13299,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
     replayjobs(s, scratch);
     sessionready(s, scratch);
     planheed(s, scratch);  // a notice of the mode lost with its process
+    shellheed(s, scratch);  // and of the shell
     instrlogstart(s, scratch);
     memlogstart(s, scratch);
     if (!prefixed) {
@@ -14019,6 +14125,155 @@ static void cmdmode(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     putintkey(&w.json, "id", id);
     putintkey(&w.json, "ok", 1);
     putstrkey(&w.json, "mode", modenames[s->mode]);
+    emit(e, evend(&w));
+}
+
+// [tools] shell when it names a program, found, and not by a name that
+// a section or a keyword has: by that name, a session may switch back.
+static Shell shellprog(Engine *e, Arena *perm, Arena scratch, b32 win)
+{
+    Str   pref = trim(cfgget(e->cfg, "tools", "", "shell", 0));
+    Str   err  = {};
+    Shell sh   = {};
+    if (shellkw(pref) || cfgownsection(e->cfg, "shell", pref)) {
+        return {};
+    }
+    sh = shellnamed(e, perm, scratch, pref, 1, win, &err);
+    if (shellkw(sh.name) || cfgownsection(e->cfg, "shell", sh.name)) {
+        return {};
+    }
+    return sh;
+}
+
+// shell {sid, shell}: the shell the agent's commands run in from here
+// on, by name as shellnamed takes one, but no bare program: when the
+// session could switch its model (cmdmodel). The shell record keeps it,
+// and the agent hears of it in a notice (shellheed) before its next
+// request. The reply names the shell, and its path.
+static void cmdshell(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str sid  = jsonstr(jsonget(j, "sid"));
+    Str name = trim(jsonstr(jsonget(j, "shell")));
+    if (!validsid(sid)) {
+        reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    } else if (!name.len) {
+        reply(e, scratch, id, 0, "shell is required", sid);
+        return;
+    }
+    b32      transient = 0;
+    Session *s         = borrow(e, scratch, sid, &transient);
+    b32      planask   = s && s->state==S_ASK && s->ask.tool==TOOL_PLANEXIT;
+    Str      err       = !s          ? Str("no such session") :
+                         s->readonly ? Str("open in another process") :
+                         (busy(s) && !planask) || s->intask
+                                     ? Str("busy: switch once the turn ends")
+                                     : Str{};
+    Shell    sh        = {};
+    if (!err.len) {
+        sh = shellnamed(e, &scratch, scratch, name, 0, s->te.windows, &err);
+        Shell prog = sh.path.len ? Shell{} : shellprog(e, &scratch, scratch, s->te.windows);
+        sh  = prog.path.len && prog.name==name ? prog : sh;
+        err = sh.path.len ? Str{} : concat(&scratch, "no shell: ", err);
+    }
+    if (err.len) {
+        if (transient) {
+            forget(e, s);
+        }
+        reply(e, scratch, id, 0, err, sid);
+        return;
+    }
+
+    s->te.shell      = sh;
+    s->te.shell.name = clone(&s->perm, sh.name);
+    s->te.shell.path = clone(&s->perm, sh.path);
+    s->te.shell.desc = clone(&s->perm, sh.desc);
+    s->shellmiss     = {};
+    s->shelluser     = 1;
+    {
+        Arena a = scratch;
+        Buf   b(&a, 256 + sh.name.len + sh.path.len);
+        EvOut w = sbegin(s, &b, EV_SHELL);
+        putstrkey(&w.json, "name", sh.name);
+        putstrkey(&w.json, "path", sh.path);
+        putstrkey(&w.json, "kind", shellkinds[sh.kind]);
+        putstrkey(&w.json, "by", "user");
+        ssend(s, &w);
+    }
+    shellheed(s, scratch);
+
+    Buf   b(&scratch, 256 + sh.name.len + sh.path.len);
+    EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "shell", sh.name);
+    putstrkey(&w.json, "path", sh.path);
+    Str line = evend(&w);  // in scratch, before s may go
+    if (transient) {
+        forget(e, s);
+    }
+    emit(e, line);
+}
+
+// One shell of a shells reply, found or not.
+static void putshell(JsonOut *w, Str name, Shell *sh, Str err)
+{
+    putobject(w);
+    putstrkey(w, "name", name);
+    if (sh->path.len) {
+        putstrkey(w, "path", sh->path);
+        putstrkey(w, "kind", shellkinds[sh->kind]);
+    }
+    if (sh->desc.len) {
+        putstrkey(w, "desc", sh->desc);
+    }
+    putkey(w, "ok");
+    putbool(w, sh->path.len > 0);
+    if (!sh->path.len) {
+        putstrkey(w, "error", err);
+    }
+    putend(w);
+}
+
+// shells {}: the shells a session may switch to (cmdshell), on this
+// machine: the user's [shell] sections, found or not, then sh,
+// powershell and cmd where found and not a section's name, then [tools]
+// shell when it is a program. default is what new sessions start in.
+static void cmdshells(Engine *e, Arena scratch, i64 id)
+{
+    b32        win   = e->te.windows;
+    Slice<Str> names = cfgownnames(e->cfg, &scratch, "shell");
+    Shell      def   = defaultshell(e, &scratch, scratch, win, 0);
+
+    Buf   b(&scratch, 4096);
+    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "default", def.name);
+    putkey(&w.json, "shells");
+    putarray(&w.json);
+    for (iz i = 0; i < names.len; i++) {
+        Str   err = {};
+        Shell sh  = shellnamed(e, &scratch, scratch, names[i], 0, win, &err);
+        putshell(&w.json, names[i], &sh, err);
+    }
+    Str kw[] = {"sh", "powershell", "cmd"};
+    for (iz i = 0; i < countof(kw); i++) {
+        b32 dup = 0;
+        for (iz k = 0; k < names.len; k++) {
+            dup |= names[k] == kw[i];
+        }
+        Str   err = {};
+        Shell sh  = dup ? Shell{} : shellnamed(e, &scratch, scratch, kw[i], 0, win, &err);
+        if (sh.path.len) {
+            putshell(&w.json, kw[i], &sh, {});
+        }
+    }
+    Shell prog = shellprog(e, &scratch, scratch, win);
+    if (prog.path.len) {
+        putshell(&w.json, prog.name, &prog, {});
+    }
+    putend(&w.json);
     emit(e, evend(&w));
 }
 
@@ -15330,6 +15585,7 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_MCPAUTH:
         case CMD_MCPCODE:
         case CMD_MCPRESTART:
+        case CMD_SHELL:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -15442,6 +15698,12 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_MODELS:
         cmdmodels(e, scratch, id);
+        return;
+    case CMD_SHELL:
+        cmdshell(e, scratch, id, j);
+        return;
+    case CMD_SHELLS:
+        cmdshells(e, scratch, id);
         return;
     case CMD_MCP:
         cmdmcp(e, scratch, id);

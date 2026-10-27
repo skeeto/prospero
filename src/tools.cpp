@@ -345,6 +345,41 @@ static void shellabout(Buf *b, Shell *sh)
     }
 }
 
+static b32 sameshell(Shell *a, Shell *b)
+{
+    return a->path==b->path && a->name==b->name;
+}
+
+// The notice of shell now, which commands run in from here on, to an
+// agent told of another: pre is the one the shell tool describes, gone
+// the one it had if that is not found now, and user whether the user
+// switched to now.
+static Str shellnotice(Arena *a, Shell *now, Shell *pre, Shell *gone, b32 user)
+{
+    Buf b(a, 1024 + now->path.len + now->desc.len + gone->path.len);
+    if (gone->path.len) {
+        print(&b, "Your shell, ");
+        print(&b, gone->name);
+        print(&b, " (");
+        print(&b, gone->path);
+        print(&b, "), is not found now, so commands run in ");
+    } else if (user) {
+        print(&b, "The user switched your shell to ");
+    } else {
+        print(&b, "Commands run in ");
+    }
+    print(&b, now->name);
+    if (sameshell(now, pre)) {
+        print(&b, ", the one the shell tool names, from now on.");
+    } else {
+        print(&b, ". It replaces the one the shell tool names, whose other "
+                  "rules still hold. ");
+        shellintro(&b, now);
+        shellabout(&b, now);
+    }
+    return finish(&b);
+}
+
 static Str shelldesc(Arena *a, ToolEnv *te)
 {
     i64 job = te->jobtimeout ? te->jobtimeout : JOB_DEFAULT;

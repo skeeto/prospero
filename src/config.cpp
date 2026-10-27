@@ -1390,6 +1390,25 @@ static b32 cfgownsection(Config *c, Str kind, Str name)
     return 0;
 }
 
+// The names of the user's own file's [KIND NAME] sections, each once,
+// in the order of the file.
+static Slice<Str> cfgownnames(Config *c, Arena *a, Str kind)
+{
+    Slice<Str> r = {};
+    IniFile   *f = c->user;
+    for (iz i = 0; f && i < f->lines.len; i++) {
+        IniSection *s = f->lines[i].type==INI_SECTION ? f->lines[i].section : 0;
+        b32 dup = 0;
+        for (iz k = 0; s && k < r.len; k++) {
+            dup |= r[k] == s->name;
+        }
+        if (s && s->kind==kind && s->name.len && !dup) {
+            r = push(a, r, s->name);
+        }
+    }
+    return r;
+}
+
 // A section's family of keys, such as [mcp X]'s env.NAME, as NAME and
 // value pairs. A key from an included file that only the user's own may
 // set is left out, as validation says, empty or not. A value written

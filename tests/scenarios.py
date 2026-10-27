@@ -2332,6 +2332,108 @@ def shell_profile(t):
             f"a warning for a missing shell: {warns}")
 
 
+@scenario(bound=40)
+def shell_switch(t):
+    """shells lists the user's [shell] sections, found or not, and the
+    keywords found; shell switches a session's shell while idle, kept
+    in a shell record, and the agent hears of it once, in a notice,
+    also after the session is opened again; a subagent starts in its
+    parent's shell; a shell not found is refused, and one gone by the
+    time the session opens again is told of, its commands in the
+    default shell."""
+    gone = t.host.join(t.base, "gone-sh")
+    if not t.host.windows:
+        t.host.write(gone, '#!/bin/sh\nexec /bin/sh "$@"\n')
+        os.chmod(gone, 0o755)
+    t.host.write(t.config, t.host.read(t.config) +
+                 "[shell other]\nprogram = sh\nenv.WHICH = other\n"
+                 "description = The other shell\n"
+                 "[shell nowhere]\nprogram = prospero-no-such-shell\n"
+                 f"[shell gone]\nprogram = {gone}\nenv.WHICH = gone\n")
+    a = b = c = None
+
+    def which(h, sid, turn):
+        ended(h, sid, turn)
+        ends = [e["text"] for e in h.all("tool.end", sid)]
+        return ends[-1] if ends else ""
+
+    def told(sid):
+        return [x for x in logged(t, sid) if x.get("ev") == "notice" and x.get("kind") == "shell"]
+    try:
+        a = t.headless()
+        r = a.call("shells")
+        names = {x["name"]: x for x in r.get("shells", [])}
+        t.check(r.get("ok") == 1 and r.get("default") == "sh", f"shells {r}")
+        t.check(names.get("other", {}).get("ok") and
+                names["other"].get("desc") == "The other shell", f"other {names.get('other')}")
+        t.check(names.get("nowhere", {}).get("ok") is False and
+                "not found" in names["nowhere"].get("error", ""), f"nowhere {names.get('nowhere')}")
+        t.check("sh" in names and "cmd" not in names or t.host.windows, f"keywords {list(names)}")
+
+        sid = a.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        a.send("prompt", sid=sid, text="run")
+        t.check("WHICH=default" in which(a, sid, 1), "the default shell first")
+        r = a.call("shell", sid=sid, shell="nowhere")
+        t.check(r.get("ok") == 0 and "not found" in r.get("err", ""), f"refused {r}")
+        r = a.call("shell", sid=sid, shell="other")
+        t.check(r.get("ok") == 1 and r.get("shell") == "other", f"switched {r}")
+        rec = [x for x in logged(t, sid) if x.get("ev") == "shell"]
+        t.check(len(rec) == 1 and rec[0].get("name") == "other" and
+                rec[0].get("by") == "user", f"shell record {rec}")
+
+        a.send("prompt", sid=sid, text="run")
+        t.check("WHICH=other" in which(a, sid, 2), "the other shell's command")
+        n = told(sid)
+        t.check(len(n) == 1 and n[0].get("shell") == "other" and
+                "The user switched your shell to other. It replaces" in n[0].get("text", "") and
+                "The other shell." in n[0].get("text", ""), f"the notice {n}")
+        a.send("prompt", sid=sid, text="run")
+        which(a, sid, 3)
+        t.check(len(told(sid)) == 1, "told once")
+
+        a.send("prompt", sid=sid, text="slow")
+        a.wait(lambda e: e.get("ev") == "attempt" and e.get("sid") == sid and e.get("turn") == 4)
+        r = a.call("shell", sid=sid, shell="sh")
+        t.check(r.get("ok") == 0 and "busy" in r.get("err", ""), f"busy {r}")
+        ended(a, sid, 4)
+
+        # A subagent starts in the parent's shell
+        a.send("prompt", sid=sid, text="task")
+        ended(a, sid, 5)
+        kids = [e["text"] for e in a.all("tool.end") if e.get("sid") != sid]
+        t.check(any("WHICH=other" in k for k in kids), f"the subagent's shell {kids}")
+        t.check(a.close() == 0, "the first exits")
+        a = None
+
+        # Opened again: the shell kept, not told again
+        b = t.headless()
+        b.call("open", sid=sid)
+        b.send("prompt", sid=sid, text="run")
+        t.check("WHICH=other" in which(b, sid, 6), "kept")
+        t.check(len(told(sid)) == 1, "not told again")
+        if not t.host.windows:
+            r = b.call("shell", sid=sid, shell="gone")
+            t.check(r.get("ok") == 1, f"to gone {r}")
+        t.check(b.close() == 0, "the second exits")
+        b = None
+
+        if not t.host.windows:
+            # Its program gone: told, and commands run in the default
+            os.remove(gone)
+            c = t.headless()
+            c.call("open", sid=sid)
+            c.send("prompt", sid=sid, text="run")
+            t.check("WHICH=default" in which(c, sid, 7), "the default once gone")
+            n = told(sid)
+            t.check(len(n) == 2 and "Your shell, gone (" in n[1].get("text", "") and
+                    "is not found now, so commands run in sh" in n[1].get("text", ""),
+                    f"told it is gone {n[-1:]}")
+    finally:
+        for h in (a, b, c):
+            if h:
+                h.close()
+
+
 def skillput(t, parent, name, text):
     d = t.host.join(parent, name)
     t.host.mkdir(d)
@@ -2900,7 +3002,7 @@ def hello_caps(t):
                 "status", "stop", "file"] + m8 + ["skills", "mode", "unqueue", "dir",
                                                    "background", "models", "mcp",
                                                    "mcp.auth", "mcp.code", "mcp.logout",
-                                                   "mcp.restart"]
+                                                   "mcp.restart", "shell", "shells"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -2909,7 +3011,7 @@ def hello_caps(t):
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
-                 "mcp", "mcp.auth", "task.remote", "task.host", "memory"} <= set(caps)
+                 "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
