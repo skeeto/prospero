@@ -1308,6 +1308,8 @@ struct Gui {
                                    // window fits, else the primary's
     b32                firstlayout;
     b32                firstrun;   // no layout file: Help floats in front
+    b32                restored;   // read the layout file: the panes as they
+                                   // first appear leave its tabs selected
     b32                firstextras;  // and Settings and Hosts with it, till
                                      // the main host's endpoints list a model
     b32                configured; // a model or remote host (cfgconfigured)
@@ -17292,6 +17294,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         if (rd.err == READ_OK) {
             ImGui::LoadIniSettingsFromMemory((char *)rd.data.data, (uz)rd.data.len);
             g->firstrun = 0;
+            g->restored = 1;
         }
     }
     if (g->firstrun) {

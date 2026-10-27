@@ -8869,8 +8869,15 @@ static b32 beginpane(Gui *g, i32 pane)
         }
         ImGui::SetNextWindowFocus();
     }
+    // A window focused as it appears selects its tab in its dock node,
+    // over the tab the layout file saved, which the panes of the first
+    // frame would otherwise take from each other, the last one winning
+    ImGuiWindowFlags flags = 0;
+    if (g->restored && ImGui::GetFrameCount()<=1) {
+        flags |= ImGuiWindowFlags_NoFocusOnAppearing;
+    }
     bool open = 1;
-    b32  vis  = ImGui::Begin(panenames[pane], &open);
+    b32  vis  = ImGui::Begin(panenames[pane], &open, flags);
     if (!open) {
         setpane(g, pane, 0);
     }
