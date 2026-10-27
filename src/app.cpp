@@ -5156,24 +5156,16 @@ static void ondir(Gui *g, Arena a, i64 id, Json *j, b32 ok, Str err)
     scheddirty(&g->sched);
 }
 
-// Apply one record from a host. Returns 1 if what shows changed.
-static b32 guirecord(Gui *g, GuiHost *h, Str line)
+// Apply one parsed record from a host, with scratch past its parse.
+// Returns 1 if what shows changed.
+static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
 {
-    Arena a  = g->frame;
-    i64   t0 = g->histreq ? os_ticks(g->os) : 0;
-    EvRec r  = evparse(&a, line);
-    if (g->histreq) {
-        g->histparseus += os_ticks(g->os) - t0;
-    }
-    if (!r.ok) {
-        return 0;
-    }
-    switch (r.ev) {
+    switch (r->ev) {
     case EV_REPLY:
-        onreply(g, h, a, &r, line);
+        onreply(g, h, a, r, line);
         return 1;
     case EV_HELLO:
-        hostcaps(g, h, r.root);
+        hostcaps(g, h, r->root);
         if (h->kind == GH_ENGINE) {
             g->engineok = 1;
             h->up       = 1;
@@ -5183,13 +5175,13 @@ static b32 guirecord(Gui *g, GuiHost *h, Str line)
         }
         return 1;
     case EV_SESSIONS:
-        onsessions(g, h, r.root);
+        onsessions(g, h, r->root);
         return 1;
     case EV_REMOTE:
-        onremote(g, h, a, &r);
+        onremote(g, h, a, r);
         return 1;
     case EV_OVERFLOW:
-        if (!r.sid.len && h->kind==GH_ENGINE) {
+        if (!r->sid.len && h->kind==GH_ENGINE) {
             // The engine process lost records, replies among them
             g->overflows++;
             g->reissuing = 1;
@@ -5199,11 +5191,11 @@ static b32 guirecord(Gui *g, GuiHost *h, Str line)
             return 1;
         }
     }
-    if (!r.sid.len) {
+    if (!r->sid.len) {
         return 0;
     }
 
-    GuiSession *s = findsess(g, h, r.sid);
+    GuiSession *s = findsess(g, h, r->sid);
     if (!s || !s->view) {
         // A view begins with its session's first record: one made here,
         // or a subagent. Any record will do for a listed subagent of a
@@ -5212,11 +5204,11 @@ static b32 guirecord(Gui *g, GuiHost *h, Str line)
         // command on a session not open here, are not shown: an open
         // makes its view before it asks for any.
         GuiSession *p = s && s->parent.len ? findsess(g, h, s->parent) : 0;
-        b32 first = r.ev==EV_SESSION && r.seq==1;
-        if (!first && !(r.seq && p && p->view)) {
+        b32 first = r->ev==EV_SESSION && r->seq==1;
+        if (!first && !(r->seq && p && p->view)) {
             return 0;
         }
-        s = s ? s : addsess(g, h, r.sid);
+        s = s ? s : addsess(g, h, r->sid);
         sessview(g, s);
         if (!g->sess && g->enginekind!=ENGINE_FAKE) {
             setcur(g, s);
@@ -5228,30 +5220,30 @@ static b32 guirecord(Gui *g, GuiHost *h, Str line)
     b32   busy  = v->busy;
     i32   jobs  = v->jobsrun;
     i32   qpos  = v->queuepos;
-    if (r.seq && v->lost) {
+    if (r->seq && v->lost) {
         // The resync brings it, in order: applied now, in a replay's
         // loose order, it would move lastseq past the records lost
         return 0;
     }
-    if (r.seq && s->openid && !v->lastseq && r.seq!=1) {
+    if (r->seq && s->openid && !v->lastseq && r->seq!=1) {
         // Written as its host opened it (instructions changed, as for an
         // imported session), ahead of the replay from its start, which
         // brings it too: applied now, in the replay's loose order, the
         // replay's records would seem applied already
         return 0;
     }
-    if (r.ev==EV_TOOLOUT) {
-        i32 i = findcall(v, jsonstr(jsonget(r.root, "call")));
+    if (r->ev==EV_TOOLOUT) {
+        i32 i = findcall(v, jsonstr(jsonget(r->root, "call")));
         g->tailseen += i>=0 && v->msgs[i].tool->status==VTOOL_RUNNING;
     }
-    b32 changed = viewrecord(v, a, &r);
-    if (r.ev==EV_ASK && changed) {
+    b32 changed = viewrecord(v, a, r);
+    if (r->ev==EV_ASK && changed) {
         s->stick = 1;  // an ask needs seeing: scroll to it
     }
-    if (r.ev==EV_TURNEND && s==g->sess) {
+    if (r->ev==EV_TURNEND && s==g->sess) {
         guiskills(g, s);  // skills may have come or gone meanwhile
     }
-    if (r.ev == EV_JOBOUT) {
+    if (r->ev == EV_JOBOUT) {
         // Applied, so that the Jobs window is current once shown, but
         // drawn only while it shows, and a few times a second at most:
         // a job may print for hours with nobody watching (drainmail)
@@ -5262,12 +5254,32 @@ static b32 guirecord(Gui *g, GuiHost *h, Str line)
         // Only the sidebar shows it, and the rows of its parent's tasks
         return state!=v->state || asks!=v->asks || busy!=v->busy ||
                jobs!=v->jobsrun || qpos!=v->queuepos ||
-               r.ev==EV_TITLE || r.ev==EV_SESSION || r.ev==EV_TOOLEND;
+               r->ev==EV_TITLE || r->ev==EV_SESSION || r->ev==EV_TOOLEND;
     }
-    if (g->histreq && r.ev==EV_NOTE && find(line, "history loaded")>=0) {
+    if (g->histreq && r->ev==EV_NOTE && find(line, "history loaded")>=0) {
         g->histdone = 1;
     }
     return changed;
+}
+
+// Apply one record from a host. Returns 1 if what shows changed. It is
+// parsed in the frame itself, so that copies of the frame taken while it
+// is applied start past the parse, which is given back after unless more
+// was put in the frame meanwhile.
+static b32 guirecord(Gui *g, GuiHost *h, Str line)
+{
+    byte *base = g->frame.beg;
+    i64   t0   = g->histreq ? os_ticks(g->os) : 0;
+    EvRec r    = evparse(&g->frame, line);
+    byte *top  = g->frame.beg;
+    if (g->histreq) {
+        g->histparseus += os_ticks(g->os) - t0;
+    }
+    b32 shown = r.ok && guiapply(g, h, g->frame, &r, line);
+    if (g->frame.beg == top) {
+        g->frame.beg = base;
+    }
+    return shown;
 }
 
 // Records shown on content frames only: model output and tool output,
@@ -13376,14 +13388,14 @@ static b32 hasremote(Gui *g, Str name)
 
 // The last mark of a change in the shown session's transcript, as it
 // reads there: "LABEL: TEXT", or null.
-static Str lastmark(Gui *g)
+static Str lastmark(Gui *g, Arena *a)
 {
     View *v = g->sess ? g->sess->view : 0;
     for (iz i = v ? v->msgs.len-1 : -1; i >= 0; i--) {
         ViewMsg *m = &v->msgs[i];
         if (m->role == VIEW_MARK) {
-            Str what = markwhat(g, &g->frame, m);
-            return concat(&g->frame, concat(&g->frame, m->label, ": "), what);
+            Str what = markwhat(g, a, m);
+            return concat(a, concat(a, m->label, ": "), what);
         }
     }
     return {};
@@ -13411,8 +13423,10 @@ static b32 drivewaitdone(Gui *g)
         return !g->edproc;
     case W_NOTE:
         return g->sess && g->sess->note.len;
-    case W_MARK:
-        return g->sess && find(lastmark(g), g->ops[g->drivepc-1].text) >= 0;
+    case W_MARK: {
+        Arena a = g->frame;
+        return g->sess && find(lastmark(g, &a), g->ops[g->drivepc-1].text) >= 0;
+    }
     case W_SIDECHAT:
         return g->sess && sessside(g->sess).len && g->sess->view &&
                !g->sess->openid && v->lastseq;
@@ -13828,7 +13842,7 @@ static b32 composecheck(Gui *g, i32 chk, DriveOp *op)
         ok  = got.len && find(got, want)>=0;
         break;
     case CHK_MARK:
-        got = lastmark(g);
+        got = lastmark(g, &a);
         ok  = got.len && find(got, want)>=0;
         break;
     case CHK_SLASH: {
