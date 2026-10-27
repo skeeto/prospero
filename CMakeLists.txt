@@ -377,6 +377,10 @@ if(NOT CMAKE_CROSSCOMPILING)
       add_test(NAME signcheck COMMAND ${UV} run
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/signcheck.py)
     endif()
+    # The sources, for one arena given to a call twice: as the place for
+    # its results and, by value, as its scratch
+    add_test(NAME arenalint COMMAND ${UV} run
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/arenalint.py)
     # The suites bound how long the harness takes, which a machine kept
     # busy by other suites can miss through no fault of the harness's: a
     # Raspberry Pi's SD card stalls for seconds under writes from several

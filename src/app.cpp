@@ -5608,9 +5608,10 @@ static Str termprog(Gui *g, Arena *a)
     if (trim(g->terminal).len || g->mac) {
         return trim(g->terminal);
     }
-    Str path = guipath(g, a);
+    Str   path = guipath(g, a);
+    Arena tmp  = carve(a, 1<<20);
     if (HOST_WINDOWS) {
-        return findpath(g->os, a, *a, path, "wt.exe", 1);
+        return findpath(g->os, a, tmp, path, "wt.exe", 1);
     }
     Str env = trim(os_getenv(g->os, a, "TERMINAL"));
     if (env.len) {
@@ -5624,7 +5625,7 @@ static Str termprog(Gui *g, Arena *a)
         "ghostty", "xterm",
     };
     for (iz i = 0; i < countof(termsearch); i++) {
-        Str found = findpath(g->os, a, *a, path, termsearch[i], 0);
+        Str found = findpath(g->os, a, tmp, path, termsearch[i], 0);
         if (found.len) {
             return found;
         }

@@ -6906,8 +6906,8 @@ static b32 mcphttppost(Engine *e, Arena scratch, McpServer *m, i64 rpc, Str body
     q->method  = method;
     q->retried = retried;
     q->body    = clone(&a, body);
-    q->in      = Buf(&a, 1<<12);
     q->arena   = a;
+    q->in      = Buf(&q->arena, 1<<12);
 
     Buf h(&scratch, 512 + m->headers.len + m->session.len);
     if (method == "POST") {
@@ -8890,9 +8890,9 @@ static McpAuth *mcpauthnew(Engine *e, Str name, Str url)
     x->mem      = mem;
     x->name     = clone(&a, name);
     x->resource = clone(&a, url);
-    x->body     = Buf(&a, 1<<12);
     x->by       = os_ticks(e->os) + 10*60*SEC;
     x->arena    = a;
+    x->body     = Buf(&x->arena, 1<<12);
     x->next     = e->mcpauths;
     e->mcpauths = x;
     return x;

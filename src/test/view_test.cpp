@@ -77,7 +77,8 @@ static void test_view(Test *t)
         Arena a     = perm;
         Str   patch = "{\"patch\":\"*** Begin Patch\\n*** Update File: a.c\\n@@ f\\n-x\\n+y\\n"
                       "*** Delete File: b.c\\n*** End Patch\"}";
-        expect(t, "view.patch summary", toolsummary(&a, a, "edit", patch, "/w"), "a.c, b.c");
+        Arena tmp   = carve(&a, 1<<16);
+        expect(t, "view.patch summary", toolsummary(&a, tmp, "edit", patch, "/w"), "a.c, b.c");
         expect(t, "view.patch diff", tooldiff(&a, "edit", patch, "ok"),
                "```diff\n--- a.c\n+++ a.c\n@@ f\n-x\n+y\n--- b.c\n+++ /dev/null\n```\n");
         Str lines = "{\"path\":\"a.c\",\"tag\":\"AB12\",\"edits\":[{\"op\":\"replace\",\"line\":2,"
@@ -1039,9 +1040,10 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.mems", concat(&a, mv->memdir, finish(&b)), "/m/-whosts=Test hosts;b=B;");
         expect(t, "panels.memnotice", mv->msgs.len ? mv->msgs[mv->msgs.len-1].label : Str{},
                "To the agent: memory");
-        expect(t, "panels.memsave", toolsummary(&a, a, "memory",
+        Arena tmp = carve(&a, 1<<16);
+        expect(t, "panels.memsave", toolsummary(&a, tmp, "memory",
                "{\"action\":\"save\",\"name\":\"hosts\"}", "/w"), "Save hosts");
-        expect(t, "panels.memforget", toolsummary(&a, a, "memory",
+        expect(t, "panels.memforget", toolsummary(&a, tmp, "memory",
                "{\"action\":\"forget\",\"name\":\"hosts\"}", "/w"), "Forget hosts");
         apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
                     R"({"t":"call","id":"t1","name":"task","args":"{\"description\":\"Look\"}"},)"
