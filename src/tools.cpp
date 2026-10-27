@@ -1,6 +1,6 @@
 // Tools: read, write, edit, shell, grep, glob, todo_write, jobs,
 // job_output, job_kill, task, desktop, skill, enter_plan_mode,
-// exit_plan_mode, sessions, send_message
+// exit_plan_mode, sessions, send_message, memory
 //
 // Every call ends in exactly one result the agent reads. Invalid calls
 // are never executed, and their results say how to fix them. File tools
@@ -15,8 +15,10 @@
 // offered only where the configuration says. skill gives the agent a
 // skill's instructions (skills.cpp). The plan mode tools ask the user
 // to begin planning and to approve the plan (engine.cpp). sessions and
-// send_message reach the other sessions of the engine (engine.cpp). A
-// role may offer fewer tools, and a call to one it does not is unknown.
+// send_message reach the other sessions of the engine (engine.cpp).
+// memory saves and forgets the agent's notes for later sessions in the
+// project (memory.cpp), in the user's own sessions only. A role may
+// offer fewer tools, and a call to one it does not is unknown.
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -39,21 +41,25 @@ enum : i32 {
     TOOL_PLANEXIT,
     TOOL_SESSIONS,
     TOOL_MESSAGE,
+    TOOL_MEMORY,
     TOOL_COUNT,
 };
 
 static Str toolnames[] = {
     "read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
     "job_output", "job_kill", "task", "desktop", "skill", "enter_plan_mode",
-    "exit_plan_mode", "sessions", "send_message",
+    "exit_plan_mode", "sessions", "send_message", "memory",
 };
 static_assert(countof(toolnames) == TOOL_COUNT);
 
 // Tools a session lacks unless something offers them: the desktop.
-// Plan mode's are the user's own sessions', never a role's.
+// Plan mode's are the user's own sessions', never a role's. Memory is
+// offered only to sessions that have it (engine.cpp), whatever else
+// their tools say.
 enum : u32 {
     TOOL_OFFMASK  = (u32)1 << TOOL_DESKTOP,
     TOOL_PLANMASK = (u32)1<<TOOL_PLANENTER | (u32)1<<TOOL_PLANEXIT,
+    TOOL_MEMMASK  = (u32)1 << TOOL_MEMORY,
 };
 
 enum : i64 {
@@ -85,6 +91,9 @@ enum : i64 {
     TASK_REPORT    = 50 << 10,        // bytes of a subagent's report shown
     TASK_PROMPT    = 256 << 10,       // longest task prompt
     MESSAGE_MAX    = 16 << 10,        // longest message to a session
+    MEM_NAMEMAX    = 64,              // a memory's name
+    MEM_DESCMAX    = 300,             // its description, one line
+    MEM_TEXTMAX    = 32 << 10,        // its text
 };
 
 enum : i32 {
@@ -133,7 +142,8 @@ static b32 tooloffered(ToolEnv *te, i32 tool)
 // A role's tools when it names none: all but the desktop's and plan
 // mode's. As a word of a tool list, "default".
 #define TOOLS_DEFAULT "read write edit shell grep glob todo_write jobs " \
-                      "job_output job_kill task skill sessions send_message"
+                      "job_output job_kill task skill sessions send_message " \
+                      "memory"
 
 // The tools a word of a tool list names, as bits: a tool's own, "*" for
 // every tool a role may have (the default's and the desktop's), and
@@ -563,6 +573,26 @@ static Str tooljson(Arena *a, ToolEnv *te)
                 {"text", "string", "At most 16 KiB", 1, {}},
             },
         },
+        {
+            "memory",
+            "Save or forget a memory, a note for later sessions in this "
+            "project, as # Memory says. save writes NAME.md and its line in "
+            "MEMORY.md, replacing the memory of that name if there is one; "
+            "forget removes both.",
+            {
+                {"action", "string", "", 1, "\"enum\":[\"save\",\"forget\"]"},
+                {"name", "string", "Its file's name without .md: lowercase "
+                 "letters, digits, - and _, as in build-steps", 1, {}},
+                {"description", "string", "For save: its line in MEMORY.md, "
+                 "saying what it holds specifically enough to tell when it "
+                 "matters, at most 300 bytes", 0, {}},
+                {"type", "string", "For save", 0,
+                 "\"enum\":[\"user\",\"feedback\",\"project\",\"reference\"]"},
+                {"text", "string", "For save: the memory itself. A feedback "
+                 "or project memory ends with a Why: line and a How to "
+                 "apply: line", 0, {}},
+            },
+        },
     };
     static_assert(countof(defs) == TOOL_COUNT);
 
@@ -772,7 +802,8 @@ struct Args {
     Str             pattern;
     Str             glob;
     Str             from;       // job_output: "head" or "tail"
-    Str             desc;       // task: what the subagent does, in brief
+    Str             desc;       // task: what the subagent does, in brief;
+                                // memory: its line in the index
     Str             prompt;
     Str             role;       // null if absent
     Str             model;
@@ -792,10 +823,12 @@ struct Args {
     Slice<HashEdit> hedits;
     Patch           patch;      // edit as patch
     DeskArgs        desk;       // desktop
-    Str             name;       // skill
+    Str             name;       // skill, memory
     Str             args;       // skill: its arguments, null if none
     Str             to;         // send_message: a session's id or title
-    Str             text;       // send_message
+    Str             text;       // send_message, memory
+    Str             action;     // memory: save or forget
+    Str             kind;       // memory: its type
     Slice<Str>      issues;
     Str             repaired;   // what repairargs fixed, if anything
 };
@@ -1148,6 +1181,73 @@ static Slice<HashEdit> arghedits(Arena *a, Args *r, Json *root)
     return edits;
 }
 
+static Str memtypes[] = {"user", "feedback", "project", "reference"};
+
+// Why a memory's name is no good, or null if it is.
+static Str memnamebad(Str name)
+{
+    if (!name.len) {
+        return "must not be empty";
+    } else if (name.len > MEM_NAMEMAX) {
+        return "too long: at most 64 bytes";
+    } else if (name == "memory") {
+        return "memory is MEMORY.md's own name: choose another";
+    }
+    for (iz i = 0; i < name.len; i++) {
+        u8 c = name[i];
+        if (!((c>='a' && c<='z') || (c>='0' && c<='9') || c=='-' || c=='_')) {
+            return "only lowercase letters, digits, - and _, as in build-steps";
+        }
+    }
+    return {};
+}
+
+// The memory tool's arguments: a save's are all required.
+static void argmemory(Arena *a, Args *r, Json *j)
+{
+    r->action = trim(argstr(a, r, j, "action", 1));
+    r->name   = trim(argstr(a, r, j, "name", 1));
+    if (endswith(r->name, ".md")) {
+        r->name = takehead(r->name, r->name.len-3);  // the file's name
+    }
+    b32 save = r->action == "save";
+    if (r->action.data && !save && r->action!="forget") {
+        issue(a, r, "action", "must be save or forget");
+    }
+    Str bad = r->name.data ? memnamebad(r->name) : Str{};
+    if (bad.data) {
+        issue(a, r, "name", bad);
+    }
+    if (!save) {
+        return;
+    }
+    r->desc = trim(argstr(a, r, j, "description", 1));
+    r->kind = trim(argstr(a, r, j, "type", 1));
+    r->text = argstr(a, r, j, "text", 1);
+    if (r->desc.data && !r->desc.len) {
+        issue(a, r, "description", "must not be empty");
+    } else if (r->desc.len > MEM_DESCMAX) {
+        issue(a, r, "description", "too long: at most 300 bytes");
+    } else if (cut(r->desc, '\n').ok || cut(r->desc, '\r').ok) {
+        issue(a, r, "description", "must be one line");
+    }
+    b32 known = 0;
+    for (iz i = 0; i < countof(memtypes); i++) {
+        known |= r->kind == memtypes[i];
+    }
+    if (r->kind.data && !known) {
+        issue(a, r, "type", "must be user, feedback, project or reference");
+    }
+    if (r->text.data && !trim(r->text).len) {
+        issue(a, r, "text", "must not be empty");
+    } else if (r->text.len > MEM_TEXTMAX) {
+        issue(a, r, "text", "too long: at most 32 KiB");
+    }
+    if (cut(r->desc, 0).ok || cut(r->text, 0).ok) {
+        issue(a, r, "text", "no argument may hold a null character");
+    }
+}
+
 // Arguments for a tool, edit's as the session's format (EDIT_*) takes
 // them.
 static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
@@ -1328,6 +1428,9 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
             issue(a, &r, "text", "too long: at most 16 KiB");
         }
         break;
+    case TOOL_MEMORY:
+        argmemory(a, &r, j);
+        break;
     }
     if (r.path.data && !r.path.len) {
         issue(a, &r, "path", "must not be empty");
@@ -1388,7 +1491,8 @@ static Str unknowntool(Arena *a, Str name, u32 deny)
         {"enterplanmode", "enter_plan_mode"},
         {"exitplanmode", "exit_plan_mode"},
         {"list_sessions", "sessions"}, {"message", "send_message"},
-        {"sendmessage", "send_message"},
+        {"sendmessage", "send_message"}, {"remember", "memory"},
+        {"save_memory", "memory"}, {"forget", "memory"},
     };
     ToolEnv te = {};
     te.deny = deny;

@@ -48,6 +48,7 @@ enum : i32 {
     EV_MODE,    // plan mode, Bypass mode, or neither, from here on
     EV_TASKHOST,    // a task's subagent, on another host, named there
     EV_TASKREPORT,  // a subagent's report to its parent on another host
+    EV_MEMORY,      // the project's memory, as the agent knows it
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -101,6 +102,7 @@ static EvInfo evinfo[] = {
     {"mode",       1, 0},
     {"task.host",  1, 0},
     {"task.report", 1, 1},  // the parent's call ends by it
+    {"memory",     1, 0},
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -226,6 +228,8 @@ static Str capnames[] = {
                        // host, which reads its durable task.report
     "task.host",       // the task tool's host: subagents on other hosts,
                        // task.host records, and host on tool.end and notices
+    "memory",          // the memory tool, memory records, and notices of
+                       // kind memory
 };
 
 static Str evname(i32 ev)

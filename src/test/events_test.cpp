@@ -335,6 +335,7 @@ static void testlogimport(Test *t)
         "{\"sid\":\"N\",\"seq\":20,\"ts\":100,\"ev\":\"title\",\"text\":\"First (imported)\","
         "\"by\":\"auto\"}\n";
     expect(t, "logimport", r.log, want);
+    expect(t, "logimport memory", istr(&a, importkeeps(EV_MEMORY)), "0");
     expect(t, "logimport err", r.err, "");
     expect(t, "logimport from", r.from, "A");
     expect(t, "logimport title", r.title, "First (imported)");
@@ -429,7 +430,7 @@ static void test_events(Test *t)
                "session title user turn attempt assistant tool.start "
                "tool.end ask answer retry nudge turn.end note compact job.start "
                "job.end todo snap rewind instructions notice prefix model grant mode "
-               "task.host task.report ");
+               "task.host task.report memory ");
         expect(t, "synced events", finish(&sync),
                "tool.start ask answer turn.end rewind task.report ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
@@ -461,7 +462,7 @@ static void test_events(Test *t)
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
                "\"delete\",\"fork\",\"config.delete\",\"import\","
-               "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\",\"nofolder\",\"dir\",\"config.create\",\"side\",\"background\",\"mcp\",\"models\",\"mcp.auth\",\"task.remote\",\"task.host\"]}");
+               "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\",\"nofolder\",\"dir\",\"config.create\",\"side\",\"background\",\"mcp\",\"models\",\"mcp.auth\",\"task.remote\",\"task.host\",\"memory\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);
@@ -996,7 +997,7 @@ static void test_events(Test *t)
                "tool.start=1 tool.end=0 ask=1 answer=1 retry=0 nudge=0 "
                "turn.end=1 note=0 compact=0 job.start=0 job.end=0 todo=0 snap=0 "
                "rewind=1 instructions=0 notice=0 prefix=0 model=0 grant=0 mode=0 "
-               "task.host=0 task.report=1 ");
+               "task.host=0 task.report=1 memory=0 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";

@@ -784,6 +784,109 @@ def sc_instructions_gone_reopen(model, n, req):
         yield from answer(model, f"Answer number {n}.")
 
 
+def memsave(name, desc, kind="project", text=None):
+    return ("memory", {"action": "save", "name": name, "description": desc,
+                       "type": kind, "text": text or f"About {name}.\nWhy: a test.\n"
+                       "How to apply: in tests."})
+
+
+def sc_memory_save(model, n, req):
+    k = step(req)
+    if k == 0:
+        yield from tool(model, n, *memsave("hosts", "Test hosts on the LAN", "reference",
+                                           "biron.local: Windows 11.\n"))
+    elif k == 1:
+        yield from tool(model, n, *memsave("hosts", "Test hosts", "reference",
+                                           "biron.local: Windows 11, x86-64.\n"))
+    else:
+        yield from answer(model, "Remembered.")
+
+
+def sc_memory_recall(model, n, req):
+    if n == 0:
+        yield from tool(model, n, *memsave("style", "Tabs, not spaces", "feedback"))
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
+def sc_memory_forget(model, n, req):
+    k = step(req)
+    if k == 0:
+        yield from tool(model, n, *memsave("tmp", "A passing note"))
+    elif k == 1:
+        yield from tool(model, n, "memory", {"action": "forget", "name": "tmp"})
+    elif k == 2:
+        yield from tool(model, n, "memory", {"action": "forget", "name": "nope"})
+    else:
+        yield from answer(model, "Forgotten.")
+
+
+def sc_memory_notice(model, n, req):
+    if n == 1:
+        yield from tool(model, n, *memsave("froma", "From A"))
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
+def sc_memory_notice_b(model, n, req):
+    if n == 0:
+        yield from tool(model, n, *memsave("fromb", "From B"))
+    else:
+        yield from answer(model, f"B's answer number {n}.")
+
+
+def sc_memory_off(model, n, req):
+    yield from answer(model, "No memory here.")
+
+
+def sc_memory_worktree(model, n, req):
+    if n == 0:
+        yield from tool(model, n, *memsave("shared", "Shared by worktrees"))
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
+def sc_memory_scope(model, n, req):
+    if last_user(req) == "delegate" and step(req) == 0:
+        yield from tool(model, n, "task", {"description": "Look", "prompt": "Look around.",
+                                           "model": second(model)})
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
+def sc_memory_scope_b(model, n, req):
+    yield from answer(model, "Report: nothing to see.")
+
+
+def sc_memory_plan(model, n, req):
+    if step(req) == 0:
+        yield from tool(model, n, *memsave("plan-note", "Saved while planning"))
+    else:
+        yield from answer(model, "Saved, still planning.")
+
+
+def sc_memory_limits(model, n, req):
+    if n in (0, 2):
+        yield from tool(model, n, *memsave(f"m{n}", f"Memory {n}"))
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
+def sc_memory_machine(model, n, req):
+    # Writes the path the system prompt gives for the user's own file
+    system = req["messages"][0]["content"]
+    m = re.search(r"the user's own instructions, (.+?), which every session", system)
+    if step(req) == 0 and last_user(req) == "remember" and m:
+        yield from tool(model, n, "write", {"path": m.group(1),
+                                            "content": "Rule one.\nMachine rule.\n"})
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
+def sc_memory_machine_b(model, n, req):
+    yield from answer(model, f"B's answer number {n}.")
+
+
 def sc_soft_stop(model, n, req):
     if n == 0:
         yield from tool(model, n, "shell", {"command": "echo $$ > softpid; sleep 30"})

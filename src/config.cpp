@@ -221,6 +221,7 @@ static CfgKind cfgkinds[] = {
     {"tools",    0, "Background jobs, stopping commands, and search"},
     {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
     {"skills",   0, "Skills: SKILL.md instructions the agent uses as a task calls for them"},
+    {"memory",   0, "Project memory: the agent's notes for later sessions in a project"},
     {"ui",       0, "How the GUI looks"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"host",     0, "The engine as a background host (prospero serve)"},
@@ -435,6 +436,13 @@ static CfgKey cfgschema[] = {
     {"skills", "paths", CFG_PATHS, "", {}, {}, "skills",
      "More directories of skills, each holding NAME/SKILL.md, separated "
      "by ;, after the project's and before the user's"},
+
+    {"memory", "enabled", CFG_BOOL, "true", {}, {}, "memory",
+     "Give new sessions in a project the memory tool and the project's "
+     "memory: notes the agent saves for later sessions there"},
+    {"memory", "path", CFG_PATHS, "", {}, {}, "memory",
+     "Directory of every project's memory, by default memory in the state "
+     "directory"},
 
     {"desktop", "offer", CFG_ENUM, "all", {}, "none roles all", "desktop",
      "Which sessions get the desktop tool, where it can work (a display "

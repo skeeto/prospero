@@ -514,6 +514,52 @@ static void printhex(Buf *b, u64 v, i32 digits)
     }
 }
 
+// A moment in UTC, from epoch milliseconds: the proleptic Gregorian
+// calendar's date, and the time of day.
+struct Civil {
+    i64 year, month, day;
+    i64 hour, min, sec;
+};
+
+static Civil civil(i64 ms)
+{
+    i64 secs = (ms>=0 ? ms : ms-999) / 1000;
+    i64 days = (secs>=0 ? secs : secs-86399) / 86400;
+    i64 rem  = secs - days*86400;
+    i64 z    = days + 719468;
+    i64 era  = (z >= 0 ? z : z - 146096) / 146097;
+    i64 doe  = z - era*146097;
+    i64 yoe  = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    i64 doy  = doe - (365*yoe + yoe/4 - yoe/100);
+    i64 mp   = (5*doy + 2)/153;
+    Civil c  = {};
+    c.day   = doy - (153*mp + 2)/5 + 1;
+    c.month = mp<10 ? mp+3 : mp-9;
+    c.year  = yoe + era*400 + (c.month <= 2);
+    c.hour  = rem / 3600;
+    c.min   = rem / 60 % 60;
+    c.sec   = rem % 60;
+    return c;
+}
+
+// ISO 8601 in UTC, to the second: 2026-10-26T14:05:09Z.
+static void printiso(Buf *b, i64 ms)
+{
+    Civil c = civil(ms);
+    printpad(b, c.year, 4);
+    putbyte(b, '-');
+    printpad(b, c.month, 2);
+    putbyte(b, '-');
+    printpad(b, c.day, 2);
+    putbyte(b, 'T');
+    printpad(b, c.hour, 2);
+    putbyte(b, ':');
+    printpad(b, c.min, 2);
+    putbyte(b, ':');
+    printpad(b, c.sec, 2);
+    putbyte(b, 'Z');
+}
+
 // Escape & < > for HTML text content.
 static void printhtml(Buf *b, Str s)
 {

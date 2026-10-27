@@ -1667,6 +1667,285 @@ def instructions_gone_reopen(t):
     t.check(len(reqs) == 4 and told == [2], f"told once, in turn 2: {told} of {len(reqs)}")
 
 
+DASH = "—"
+
+
+def memdir(t, events):
+    """The memory directory of a run's first memory record, checked to be
+    the state directory's, under its project's key."""
+    recs = [e for e in events if e.get("ev") == "memory"]
+    t.check(recs, "a memory record")
+    d = recs[0]["dir"]
+    t.check("/memory/" in d.replace("\\", "/") and d.replace("\\", "/").endswith("-work"),
+            f"the directory: {d}")
+    return d
+
+
+def memfiles(t, d):
+    return t.host.read(t.host.join(d, "MEMORY.md"))
+
+
+@scenario(bound=15)
+def memory_save(t):
+    """The memory tool saves a memory without asking, as its file and a
+    line in MEMORY.md, then updates it in place; the system prompt has
+    the section, empty, and the user's own instructions' path."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check(not r.all("ask"), f"no ask: {r.all('ask')}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok"], f"statuses {ends}")
+    t.check(ends[0]["text"].startswith("Saved hosts in ") and
+            ends[0]["text"].endswith("with a line in MEMORY.md."), f"saved: {ends[0]['text']}")
+    t.check(ends[1]["text"].startswith("Updated hosts in ") and
+            ends[1]["text"].endswith("and its line in MEMORY.md."), f"updated: {ends[1]['text']}")
+    d = memdir(t, r.events)
+    t.check([e["why"] for e in r.all("memory")] == ["start", "saved", "saved"],
+            f"records {r.all('memory')}")
+    t.check(memfiles(t, d) == f"- [hosts](hosts.md) {DASH} Test hosts\n", f"index {memfiles(t, d)!r}")
+    t.check(r.last("memory")["text"] == memfiles(t, d), "the record knows the index")
+    f = t.host.read(t.host.join(d, "hosts.md"))
+    t.check(f.startswith('---\nname: hosts\ndescription: "Test hosts"\ntype: reference\nmodified: ')
+            and f.endswith("---\n\nbiron.local: Windows 11, x86-64.\n") and "\nsession: " in f,
+            f"the file: {f!r}")
+    reqs = t.requests()
+    system = reqs[0]["body"]["messages"][0]["content"]
+    t.check("\n\n# Memory\n\nYou have a memory for this project" in system and d in system and
+            system.endswith("MEMORY.md:\n\n(empty: no memories yet)"), f"the section: {system[-300:]!r}")
+    t.check("the user's own instructions, " in system and
+            "prospero" in system.split("the user's own instructions, ")[1].split(",")[0],
+            "the user's own file named")
+    tools = [x["function"]["name"] for x in reqs[0]["body"]["tools"]]
+    t.check(tools[-1] == "memory", f"tools {tools}")
+    t.check(all(q["body"]["messages"][0]["content"] == system for q in reqs), "the prompt stays")
+
+
+@scenario(bound=15)
+def memory_recall(t):
+    """A new session in the project has the index in its system prompt."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    r2 = t.run()
+    t.check(r2.rc == 0, f"exit {r2.rc}: {r2.stderr}")
+    t.check(memdir(t, r.events) == memdir(t, r2.events), "one directory")
+    reqs = t.requests()
+    t.check(len(reqs) == 3, f"requests {len(reqs)}")
+    line = f"- [style](style.md) {DASH} Tabs, not spaces"
+    t.check(line not in reqs[0]["body"]["messages"][0]["content"], "not yet")
+    t.check(reqs[2]["body"]["messages"][0]["content"].endswith("MEMORY.md:\n\n" + line),
+            "recalled")
+    t.check(r2.all("memory")[0]["text"] == line + "\n", f"record {r2.all('memory')}")
+
+
+@scenario(bound=15)
+def memory_forget(t):
+    """forget removes the memory's file and line; one not there is an
+    error."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok", "error"], f"statuses {ends}")
+    t.check(ends[1]["text"] == "Forgot tmp: its file and its line in MEMORY.md are gone.",
+            f"forgot: {ends[1]['text']}")
+    t.check(ends[2]["text"].startswith("No memory is named nope"), f"none: {ends[2]['text']}")
+    d = memdir(t, r.events)
+    t.check(memfiles(t, d) == "" and t.host.read(t.host.join(d, "tmp.md")) is None,
+            "both gone")
+    t.check([e["why"] for e in r.all("memory")] == ["start", "saved", "forgot"],
+            f"records {r.all('memory')}")
+
+
+@scenario(bound=30)
+def memory_notice(t):
+    """Another session's save reaches a running session at its next turn,
+    as a notice; its own save does not, and a session opened again does
+    not hear of either again."""
+    h = t.headless()
+
+    def turn(sid, text, n):
+        h.send("prompt", sid=sid, text=text)
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid and e.get("turn") == n)
+
+    try:
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        b = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        turn(a, "one", 1)
+        turn(b, "one", 1)
+        turn(a, "two", 2)
+        turn(a, "three", 3)
+        t.check([e["status"] for e in h.all("tool.end", b)] == ["ok"], "B saved")
+        t.check([e["status"] for e in h.all("tool.end", a)] == ["ok"], "A saved")
+        whys = [e["why"] for e in h.all("memory", a)]
+        t.check(whys == ["start", "changed", "saved"], f"A's records {whys}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=a).get("ok") == 1, "reopened")
+        turn(a, "four", 4)
+        whys = [e["why"] for e in h.all("memory", a)]
+        t.check(whys == ["start", "changed", "saved"], f"no more records {whys}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = [x["body"]["messages"] for x in t.requests()]
+    t.check(len(reqs) == 5, f"A's requests {len(reqs)}")
+    told = [i for i, m in enumerate(reqs) if "MEMORY.md, changed" in str(m[-1].get("content"))]
+    t.check(told == [1], f"told once, in turn 2: {told}")
+    notice = reqs[1][-1]["content"]
+    t.check(f"\n\nAdded:\n- [fromb](fromb.md) {DASH} From B" in notice and "Removed" not in notice,
+            f"the notice: {notice!r}")
+    t.check([m[-1]["content"] for m in reqs[3:]] == ["three", "four"], "nothing more")
+    breqs = [x["body"]["messages"] for x in t.requests(t.model2)]
+    t.check(not [m for r in breqs for m in r if "MEMORY.md, changed" in str(m.get("content"))],
+            "B not told of its own")
+
+
+@scenario(bound=20)
+def memory_worktree(t):
+    """A worktree's sessions share its repository's memory."""
+    git = t.host.join(t.work, ".git")
+    wt = t.host.join(t.base, "wt")
+    t.host.mkdir(t.host.join(git, "worktrees", "wt"))
+    t.host.write(t.host.join(git, "worktrees", "wt", "commondir"), "../..\n")
+    t.host.mkdir(wt)
+    t.host.write(t.host.join(wt, ".git"), f"gitdir: {t.host.join(git, 'worktrees', 'wt')}\n")
+    h = t.headless()
+    try:
+        for cwd in (wt, t.work):
+            sid = h.call("new", cwd=cwd, model=t.model, endpoint="fake")["sid"]
+            h.send("prompt", sid=sid, text="go")
+            h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        dirs = {e["dir"] for e in h.all("memory")}
+        t.check(len(dirs) == 1, f"one directory: {dirs}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = t.requests()
+    t.check(reqs[-1]["body"]["messages"][0]["content"].endswith(
+            f"MEMORY.md:\n\n- [shared](shared.md) {DASH} Shared by worktrees"), "shared")
+
+
+@scenario(conf={"_memory": {"enabled": "false"}}, bound=10)
+def memory_off(t):
+    """[memory] enabled = false: no tool, no section, no record."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    req = t.requests()[0]["body"]
+    t.check("memory" not in [x["function"]["name"] for x in req["tools"]], "no tool")
+    t.check("# Memory" not in req["messages"][0]["content"], "no section")
+    t.check(not r.all("memory"), "no record")
+
+
+@scenario(bound=20)
+def memory_scope(t):
+    """Memory is the user's own sessions' in a project: not a subagent's,
+    nor a folder of its own's, which still hears of the user's file, nor
+    one with only the project's instructions, nor one whose tools leave
+    it out."""
+    h = t.headless()
+
+    def ask(text, **kw):
+        sid = h.call("new", model=t.model, endpoint="fake", **kw)["sid"]
+        h.send("prompt", sid=sid, text=text)
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        return t.requests()[-1]["body"]
+
+    try:
+        own = ask("go", nofolder=1)
+        proj = ask("go", cwd=t.work, instructions="project")
+        some = ask("go", cwd=t.work, tools="read write")
+        ask("delegate", cwd=t.work)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    names = lambda q: [x["function"]["name"] for x in q["tools"]]
+    system = lambda q: q["messages"][0]["content"]
+    t.check("memory" not in names(own) and "# Memory" in system(own) and
+            "You have a memory" not in system(own) and
+            "the user's own instructions, " in system(own), f"no folder: {system(own)[-400:]!r}")
+    t.check("memory" not in names(proj) and "# Memory" not in system(proj), "project's only")
+    t.check("memory" not in names(some) and "You have a memory" not in system(some), "tools")
+    kid = t.requests(t.model2)[0]["body"]
+    t.check("memory" not in names(kid) and "# Memory" not in system(kid), "no subagent's")
+
+
+@scenario(bound=15)
+def memory_plan(t):
+    """A save in plan mode, which changes no project file."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                     plan=1)["sid"]
+        h.send("prompt", sid=sid, text="plan")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        ends = h.all("tool.end", sid)
+        t.check([e["status"] for e in ends] == ["ok"], f"saved: {ends}")
+        t.check(not h.all("ask", sid), "no ask")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def memory_limits(t):
+    """Past 200 lines the prompt shows the first 200 with a note, and a
+    save says that the rest is lost to new sessions."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    d = memdir(t, r.events)
+    lines = "".join(f"- [x{i}](x{i}.md) {DASH} Extra {i}\n" for i in range(210))
+    t.host.write(t.host.join(d, "MEMORY.md"), memfiles(t, d) + lines)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    reqs = t.requests()
+    system = reqs[2]["body"]["messages"][0]["content"]
+    t.check("[MEMORY.md has 211 lines, " in system and "Extra 198\n" in system and
+            "Extra 199" not in system, f"cut: {system[-300:]!r}")
+    end = r.last("tool.end")
+    t.check(end["status"] == "ok" and "now has 212 lines, " in end["text"] and
+            "a new session sees only its first 200 lines" in end["text"], f"warned: {end}")
+
+
+@scenario(bound=20)
+def memory_machine(t):
+    """Remembering for every project: the agent writes the user's own
+    AGENTS.md, as the prompt names it, which asks; another running
+    session is told the new text, and the writer is not."""
+    mine = t.host.join(t.home, ".config", "prospero", "AGENTS.md")
+    t.host.mkdir(t.host.join(t.home, ".config", "prospero"))
+    t.host.write(mine, "Rule one.\n")
+    h = t.headless()
+    try:
+        b = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        h.send("prompt", sid=b, text="first")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == b)
+        a = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=a, text="remember")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == a)
+        path = ask.get("path", "")
+        t.check(ask.get("tool") == "write" and
+                path.replace("\\", "/") == mine.replace("\\", "/"), f"the ask: {ask}")
+        h.call("answer", sid=a, req=ask["req"], decision="allow")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == a)
+        t.check(t.host.read(path) == "Rule one.\nMachine rule.\n", "written")
+        h.send("prompt", sid=b, text="second")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == b and e.get("turn") == 2)
+        h.send("prompt", sid=a, text="again")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == a and e.get("turn") == 2)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    breqs = [x["body"]["messages"] for x in t.requests(t.model2)]
+    last = breqs[-1][-1]["content"]
+    t.check(last.startswith("Instruction files changed") and "Machine rule." in last,
+            f"B told: {last!r}")
+    areqs = [x["body"]["messages"] for x in t.requests()]
+    t.check(not [m for r in areqs for m in r if "Instruction files changed" in str(m.get("content"))],
+            "A not told its own")
+
+
 SEARCH_FILES = {
     ".gitignore": "ignored/\n*.log\n",
     "src/a.c": "int main(void)\n{\n    // TODO: fix\n}\n",
@@ -2586,7 +2865,7 @@ def hello_caps(t):
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
-                 "mcp", "mcp.auth", "task.remote", "task.host"} <= set(caps)
+                 "mcp", "mcp.auth", "task.remote", "task.host", "memory"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -3660,7 +3939,8 @@ def role_words(t):
         t.check(list(roles) == ["explore", "general", "every", "gui", "lean", "odd"],
                 f"roles {list(roles)}")
         default = ["read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
-                   "job_output", "job_kill", "task", "skill", "sessions", "send_message"]
+                   "job_output", "job_kill", "task", "skill", "sessions", "send_message",
+                   "memory"]
         every = default[:11] + ["desktop"] + default[11:]
         t.check(roles["general"]["tools"] == default, f"general {roles['general']}")
         t.check(roles["every"]["tools"] == every, f"* {roles['every']}")

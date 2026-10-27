@@ -373,6 +373,15 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
         }
         print(&b, "]\n");
         break;
+    case EV_MEMORY:
+        if (jsonstr(jsonget(j, "why")) != "start") {
+            return;  // the tool's call shows it
+        }
+        prettyline(c);
+        print(&b, "[memory: ");
+        print(&b, jsonstr(jsonget(j, "dir")));
+        print(&b, "]\n");
+        break;
     default:
         return;
     }

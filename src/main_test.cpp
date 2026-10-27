@@ -592,6 +592,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/compact_test.cpp"
 #include "test/search_test.cpp"
 #include "test/instructions_test.cpp"
+#include "test/memory_test.cpp"
 #include "test/skills_test.cpp"
 #include "test/config_test.cpp"
 #include "test/mcp_test.cpp"
@@ -660,6 +661,7 @@ int main()
     test_compact(&t);
     test_search(&t);
     test_instructions(&t);
+    test_memory(&t);
     test_skills(&t);
     test_engine(&t);
     test_config(&t);

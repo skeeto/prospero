@@ -172,11 +172,11 @@ static void test_tools(Test *t)
                ~((u32)1<<TOOL_READ | (u32)1<<TOOL_GREP | (u32)1<<TOOL_GLOB)));
         expect(t, "tooldeny all but desktop", istr(a, tooldeny("read write edit "
                "shell grep glob todo_write jobs job_output job_kill task skill sessions "
-               "send_message")),
+               "send_message memory")),
                istr(a, TOOL_OFFMASK|TOOL_PLANMASK));
         expect(t, "tooldeny all", istr(a, tooldeny("read write edit shell grep glob "
                "todo_write jobs job_output job_kill task desktop skill sessions "
-               "send_message")),
+               "send_message memory")),
                istr(a, TOOL_PLANMASK));
         expect(t, "tooldeny none", istr(a, tooldeny("")), istr(a, ((u32)1<<TOOL_COUNT) - 1));
         expect(t, "unknown for the role", unknowntool(a, "write", deny),
@@ -228,6 +228,40 @@ static void test_tools(Test *t)
                "text: too long: at most 16 KiB");
         expect(t, "message alias", istr(a, find(unknowntool(a, "sendmessage", 0),
                "Did you mean \"send_message\"")>0), "1");
+    }
+
+    // memory: a save takes everything, a forget a name
+    {
+        Args ma = parseargs(a, TOOL_MEMORY, "{\"action\":\"save\",\"name\":\"hosts.md\","
+                            "\"description\":\" Test hosts \",\"type\":\"reference\","
+                            "\"text\":\"biron\"}", EDIT_REPLACE);
+        expect(t, "memory save", concat(a, concat(a, concat(a, ma.name, "|"), ma.desc),
+               concat(a, "|", ma.kind)), "hosts|Test hosts|reference");
+        expect(t, "memory save ok", istr(a, ma.issues.len), "0");
+        Args mb = parseargs(a, TOOL_MEMORY, "{\"action\":\"forget\",\"name\":\"hosts\"}",
+                            EDIT_REPLACE);
+        expect(t, "memory forget ok", istr(a, mb.issues.len), "0");
+        Args mc = parseargs(a, TOOL_MEMORY, "{\"action\":\"save\",\"name\":\"Hosts\","
+                            "\"description\":\"a\\nb\",\"type\":\"fact\"}", EDIT_REPLACE);
+        Buf b(a, 256);
+        for (iz i = 0; i < mc.issues.len; i++) {
+            print(&b, mc.issues[i]);
+            print(&b, "|");
+        }
+        expect(t, "memory issues", finish(&b),
+               "name: only lowercase letters, digits, - and _, as in build-steps|"
+               "text: required string is missing|description: must be one line|"
+               "type: must be user, feedback, project or reference|");
+        Args md = parseargs(a, TOOL_MEMORY, "{\"action\":\"keep\",\"name\":\"memory\"}",
+                            EDIT_REPLACE);
+        expect(t, "memory action", concat(a, concat(a, md.issues[0], "|"), md.issues[1]),
+               "action: must be save or forget|"
+               "name: memory is MEMORY.md's own name: choose another");
+        ToolEnv te = {};
+        te.deny = TOOL_OFFMASK;
+        expect(t, "memory offered", istr(a, find(tooljson(a, &te), "\"name\":\"memory\"")>0), "1");
+        te.deny |= TOOL_MEMMASK;
+        expect(t, "memory not offered", istr(a, find(tooljson(a, &te), "\"memory\"")), "-1");
     }
 
     // Output cleaning

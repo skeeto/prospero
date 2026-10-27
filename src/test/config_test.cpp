@@ -384,11 +384,11 @@ static void testcfgvalidate(Test *t)
         "ignored\n"
         "/c/prospero.ini:20:9: warning: unknown value \"fly\", expected any "
         "of: read, write, edit, shell, grep, glob, todo_write, jobs, "
-        "job_output, job_kill, task, skill, sessions, send_message, desktop, "
-        "*, default\n"
+        "job_output, job_kill, task, skill, sessions, send_message, memory, "
+        "desktop, *, default\n"
         "/c/prospero.ini:21:2: warning: unknown section kind \"provider\", "
         "expected endpoint, model, role, guard, tools, instructions, skills, "
-        "ui, desktop, host, remote or mcp\n"
+        "memory, ui, desktop, host, remote or mcp\n"
         "/c/prospero.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "
@@ -1017,6 +1017,8 @@ static void testcfgjson(Test *t)
         "instructions//files=AGENTS.md CLAUDE.md*\n"
         "skills//enabled=true*\n"
         "skills//paths=*\n"
+        "memory//enabled=true*\n"
+        "memory//path=*\n"
         "ui//theme=system*\n"
         "ui//thinking=fold*\n"
         "ui//tools=auto*\n"
@@ -1042,7 +1044,7 @@ static void testcfgjson(Test *t)
     expect(t, "json.schema.local", jsonstr(jsonget(ft, "local")), "1800");
     iz    ti    = cfgkey("role", "tools") - cfgschema;
     Json *tools = jsonget(jsonat(schema, ti), "choices");
-    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "17");
+    expect(t, "json.schema.choices", istr(&a, jsonlen(tools)), "18");
     expect(t, "json.kinds", istr(&a, jsonlen(jsonget(j, "kinds"))),
            istr(&a, countof(cfgkinds)));
     Buf hb(&a, 256);
