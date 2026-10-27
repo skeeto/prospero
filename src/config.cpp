@@ -419,7 +419,7 @@ static CfgKey cfgschema[] = {
      "path_prepend"},
     {"tools", "use_rg", CFG_BOOL, "true", {}, {}, "tools",
      "Search with ripgrep (rg on PATH) when found, else the built-in search"},
-    {"tools", "turn_budget", CFG_INT, "300", {}, {}, "tools",
+    {"tools", "turn_budget", CFG_INT, "0", {}, {}, "tools",
      "Model requests a turn may make before it ends; 0 for no limit"},
     {"tools", "task_budget", CFG_INT, "200", {}, {}, "tools",
      "Model requests a subagent may make before it is told to wrap up and "

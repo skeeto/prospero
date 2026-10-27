@@ -518,7 +518,7 @@ def sc_turn_budget(model, n, req):
 
 
 def sc_turn_unlimited(model, n, req):
-    # Past the default's 300 requests, which turn_budget = 0 allows
+    # Past 300 requests, which the default of no turn_budget allows
     if n < 305:
         yield from calls(model, n, [("glob", {"pattern": f"x{n}*"})])
     else:

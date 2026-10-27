@@ -1025,9 +1025,9 @@ def turn_budget(t):
     t.check(len(t.requests()) == 3, f"{len(t.requests())} requests")
 
 
-@scenario(conf={"_tools": {"turn_budget": 0}}, bound=60)
+@scenario(bound=60)
 def turn_unlimited(t):
-    """turn_budget = 0: no limit, past the default's 300 requests, and no
+    """No turn_budget by default: no limit, past 300 requests, and no
     note at 200 of an end to come."""
     r = t.run(timeout=120)
     t.check(r.rc == 0, f"exit {r.rc}: {r.last('turn.end')}")

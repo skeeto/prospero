@@ -33,8 +33,8 @@
 //   told to the agent at its next request, and an idle session starts
 //   a turn for it, a few times an hour at most. Stopping a command asks
 //   first (TERM, or CTRL_BREAK), then kills after a grace period.
-// - Budgets: the end of the turn at [tools] turn_budget steps (300,
-//   or none), with a note at 200 steps when it ends later.
+// - Budgets: the end of the turn at [tools] turn_budget steps (none
+//   by default), with a note at 200 steps when it ends later.
 //
 // Unattended runs must not get stuck, nor give up early, so:
 //
@@ -9517,12 +9517,12 @@ static void compacted(Session *s, Arena scratch, Partial *p)
 // Steps and turns
 
 // The model requests a turn may make, 0 for no limit: [tools]
-// turn_budget, read anew at each step, else STEP_HARD, and at most the
+// turn_budget, read anew at each step, else none, and at most the
 // session's own (new's steps).
 static i64 stephard(Session *s)
 {
     Int v = parseint(trim(cfgget(s->e->cfg, "tools", "", "turn_budget", 0)));
-    i64 h = v.ok && v.val>=0 ? v.val : STEP_HARD;
+    i64 h = v.ok && v.val>=0 ? v.val : 0;
     return s->stepmax && (!h || s->stepmax<h) ? s->stepmax : h;
 }
 

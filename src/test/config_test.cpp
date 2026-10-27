@@ -1012,7 +1012,7 @@ static void testcfgjson(Test *t)
         "tools//path_prepend=*\n"
         "tools//path_append=*\n"
         "tools//use_rg=true*\n"
-        "tools//turn_budget=300*\n"
+        "tools//turn_budget=0*\n"
         "tools//task_budget=200*\n"
         "instructions//files=AGENTS.md CLAUDE.md*\n"
         "skills//enabled=true*\n"
