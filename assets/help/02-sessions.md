@@ -223,8 +223,11 @@ nested under its session, its first prompt giving its title.
 - **Archived or deleted**: once every session working in a worktree is,
   it is removed if git calls it clean, and its branch deleted only if
   merged into the branch it was cut from. A worktree with uncommitted
-  changes is kept, and a note says so. Unarchiving the session, or
-  starting a turn in it, checks the branch out again at the same place.
+  changes is kept, and a note says so. On Windows, files in use (as by
+  a program still running there) stay behind in its folder, which must
+  be deleted before the worktree can be made there again. Unarchiving
+  the session, or starting a turn in it, checks the branch out again
+  at the same place.
 
 Bring the work back as with any branch, such as with `git merge` in
 the main checkout.

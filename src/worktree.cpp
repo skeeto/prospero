@@ -204,6 +204,15 @@ static Slice<GitTree> wtlist(GitWork *w, Arena *a, Arena scratch, WtAsk *q, Str 
     return err->len ? Slice<GitTree>{} : gitparsetrees(a, r.out);
 }
 
+// Whether a folder is what a removal left, its .git gone but files that
+// were in use still there.
+static b32 wtleftover(Os *os, Arena scratch, Str path)
+{
+    Str git = join(&scratch, path, ".git");
+    return os_stat(os, scratch, path).type==STAT_DIR &&
+           os_stat(os, scratch, git).type==STAT_MISSING && os_list(os, &scratch, path);
+}
+
 // The worktrees' folder's .gitignore, unless it has one.
 static void wtignore(Os *os, Arena scratch, Str path)
 {
@@ -254,6 +263,10 @@ static WtDone wtmake(GitWork *w, Arena *a, Arena scratch, WtAsk *q, Str prog)
         return d;
     } else if (ours && ours->locked) {
         d.err = concat(a, q->path, " is registered and locked: git worktree unlock it");
+        return d;
+    } else if (!ours && wtleftover(os, scratch, q->path)) {
+        d.err = concat(a, q->path, " still has files left from its removal, which were "
+                                   "in use then: delete the folder, then try again");
         return d;
     }
 
@@ -325,13 +338,23 @@ static WtDone wtremove(GitWork *w, Arena *a, Arena scratch, WtAsk *q, Str prog)
         args = wtargs(&scratch, args, q->path);
         GitRun r   = wtgit(w, a, scratch, q, prog, args, WT_REMOVEWAIT);
         Str    err = wtfailed(&scratch, &r, prog, "worktree remove", WT_REMOVEWAIT);
-        if (err.len) {
+        Str    git = join(&scratch, q->path, ".git");
+        if (err.len && os_stat(os, scratch, git).type!=STAT_MISSING) {
             d.did = "kept";
             d.why = wtwhy(err);
             d.err = clone(a, err);
             return d;
+        } else if (err.len) {
+            // Part of the way: git found it clean, then deleted until a
+            // file in use (Windows) stopped it, its .git first. What is
+            // left is committed, so only in the way of making it again.
+            d.why = "leftover";
+            d.err = clone(a, err);
         }
         d.did = "removed";
+    } else if (!ours && wtleftover(os, scratch, q->path)) {
+        d.did = "removed";
+        d.why = "leftover";
     } else if (!ours && os_stat(os, scratch, q->path).type!=STAT_MISSING) {
         d.did = "kept";
         d.why = "error";
@@ -1343,7 +1366,7 @@ static void wtsweep(Engine *e, Arena scratch)
                 parks = push(&t, parks, s);
             }
         }
-        b32 there = os_stat(e->os, t, wt->path).type != STAT_MISSING;
+        b32 there = wtexists(e, t, wt);  // not what a removal left
         b32 kept  = sid.len && gitclean(sidecarget(e, &t, sid, "worktree", 128))=="kept";
         if (!ok || (!named[c] && marked && (!there || kept))) {
             continue;  // as the engine starts: removed, or kept, before

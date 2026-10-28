@@ -12626,7 +12626,7 @@ def worktree_probe(t):
                     packed.append(f"{oid} refs/heads/prospero/{name}\n")
                 else:
                     os.makedirs(os.path.join(t.work, ".prospero", "worktrees", name))
-        with open(os.path.join(t.work, ".git", "packed-refs"), "w") as f:
+        with open(os.path.join(t.work, ".git", "packed-refs"), "w", newline="\n") as f:
             f.write("# pack-refs with: peeled fully-peeled sorted \n" + "".join(sorted(packed)))
         t.check(gitrun(t, env, "rev-parse", "prospero/calm-otter") == oid, "packed")
         r = h.call("git", cwd=t.work)
@@ -12814,12 +12814,13 @@ def worktree_side(t):
         pre = lambda rs: [e["system"] for e in rs if e.get("ev") == "prefix"]
         t.check(pre(recs) == pre(sessionlog(t, parent)), "the prefix, the same")
         instr = [e for e in recs if e.get("ev") == "instructions"]
-        t.check(any(os.path.join(path, "AGENTS.md") == f["path"] for e in instr
+        slash = lambda p: p.replace("\\", "/")
+        t.check(any(slash(os.path.join(path, "AGENTS.md")) == slash(f["path"]) for e in instr
                     for f in e["files"]), f"stamps in the worktree: {instr}")
         told = [e for e in recs if e.get("ev") == "notice" and e.get("kind") == "instructions"]
         t.check(not told, f"no instructions notice: {told}")
         body = t.requests(wtmodel(t))[-1]["body"]
-        t.check(path in json.dumps(body["messages"]), "the request tells it")
+        t.check(json.dumps(path)[1:-1] in json.dumps(body["messages"]), "the request tells it")
         t.check(gitrun(t, env, "status", "--porcelain") == "M README\n?? untracked.txt",
                 f"the original's changes stay: {gitrun(t, env, 'status', '--porcelain')!r}")
 
@@ -12927,6 +12928,33 @@ def worktree_remove(t):
         n = news("clean", 4)
         t.check(n.get("did") == "removed" and n.get("branch") == "unmerged", f"unmerged: {n}")
         t.check(gitrun(t, env, "rev-parse", "prospero/clean") == tip, "its branch stays")
+
+        # Files left from a removal git could not finish (on Windows, a
+        # file in use): not made over them, but once they are gone
+        os.makedirs(wtdir("clean"))
+        with open(os.path.join(wtdir("clean"), "held.txt"), "w") as f:
+            f.write("x\n")
+        h.call("archive", sid=a, on=0)
+        n = news("clean", 5)
+        t.check(n.get("did") == "failed" and "left from its removal" in n.get("err", ""),
+                f"not over leftovers: {n}")
+        shutil.rmtree(wtdir("clean"))
+        wtturn(t, h, a, "again")
+        n = news("clean", 6)
+        t.check(n.get("did") == "made" and
+                gitrun(t, env, "rev-parse", "HEAD", cwd=wtdir("clean")) == tip, f"made: {n}")
+        h.call("archive", sid=a, on=1)
+        t.check(news("clean", 7).get("did") == "removed", "removed again")
+
+        # Windows: a file held open stops git part of the way through,
+        # its .git already gone, so it is removed but for what was held
+        if os.name == "nt":
+            e = make("held")
+            with open(os.path.join(wtdir("held"), "README")):
+                h.call("archive", sid=e, on=1)
+                n = news("held", 2)
+            t.check(n.get("did") == "removed" and n.get("why") == "leftover" and
+                    not os.path.exists(os.path.join(wtdir("held"), ".git")), f"leftover: {n}")
 
         # Dirty: kept
         b = make("dirty")

@@ -3543,6 +3543,10 @@ static void onworktree(Gui *g, GuiHost *h, Arena a, Json *j)
                   branch=="unmerged"  ? Str(", its branch kept, as not merged") :
                   branch=="elsewhere" ? Str(", its branch kept, checked out elsewhere")
                                       : Str{});
+        if (why == "leftover") {
+            print(&b, "; files in use then stay in its folder, to delete");
+            bad = 1;
+        }
     } else {
         print(&b, " kept: ");
         print(&b, why=="dirty"      ? Str("it has uncommitted changes") :
