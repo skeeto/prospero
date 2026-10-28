@@ -8357,12 +8357,28 @@ static void drawsettings(Gui *g)
         g->cfgfindkey = 0;
     }
     ImGui::SetNextItemWidth(-1);
+    ImGui::SetNextItemAllowOverlap();
     b32 enter = ImGui::InputTextWithHint("##find", "Search settings", g->cfgfind, FIELD_MAX,
                                          ImGuiInputTextFlags_EnterReturnsTrue|
                                          ImGuiInputTextFlags_EscapeClearsAll);
     itemrect(g, RECT_CFGFIND);
     if (ImGui::IsItemActivated() || ImGui::IsItemEdited()) {
         g->cfgfindhid = 0;
+    }
+    if (*g->cfgfind) {
+        // An X at the field's end empties it, as Escape does, and gives
+        // the field the keyboard back
+        ImVec2 mx = ImGui::GetItemRectMax();
+        ImVec2 mn = ImGui::GetItemRectMin();
+        f32    fs = ImGui::GetFontSize();
+        ImVec2 at = v2(mx.x - ImGui::GetStyle().FramePadding.x - fs,
+                       mn.y + (mx.y - mn.y - fs)/2);
+        if (ImGui::CloseButton(ImGui::GetID("##findclear"), at)) {
+            *g->cfgfind   = 0;
+            g->cfgfindkey = 1;
+        }
+        ImGui::SetItemTooltip("Clear the search");
+        g->rects[RECT_CFGCLEAR] = {at.x, at.y, at.x+fs, at.y+fs};
     }
     Str        query = trim({(u8 *)g->cfgfind, (iz)__builtin_strlen(g->cfgfind)});
     b32        find  = query.len > 0;

@@ -236,6 +236,7 @@ enum : i32 {
     RECT_PAGECOMBO,  // its pages as a combo, when narrow
     RECT_DIAGPAGE,   // its Diagnostics page in the list
     RECT_CFGFIND,    // its search field
+    RECT_CFGCLEAR,   // and the X that empties it
     RECT_ADDOPEN,    // its Add for each named kind, in order: endpoint,
     RECT_ADDOPEN1,   // model, role, remote
     RECT_ADDOPEN2,
@@ -9419,6 +9420,7 @@ enum : i32 {
     T_DELCANCEL,
     T_ROOTS,       // the guard page's roots field
     T_CFGFIND,     // the settings' search field
+    T_CFGCLEAR,    // the X that empties it
     T_NOTIFY,      // the ui page's notify field
     T_SPLITFROM,   // where the dock splitter was before the first drag
     T_SESSMENU,    // the menu bar's Session menu
@@ -11427,7 +11429,8 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
     {OP_SHOT, 0, 0, 0, 300, "settings-wide"},
     // The search: names before descriptions, and Enter goes to the
-    // first, scrolled to on its page; Escape empties it, the list back
+    // first, scrolled to on its page; Escape or its X empties it, the
+    // list back
     {OP_MOVE, T_CFGFIND, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 200, ""},
@@ -11454,11 +11457,9 @@ static DriveOp settingsops[] = {
     {OP_KEYUP, 0, GKEY_ENTER, 0, 800, ""},
     {OP_CHECK, CHK_CFGFOCUS, 0, 0, 0, "endpoint fake idle_timeout"},
     {OP_SHOT, 0, 0, 0, 300, "settings-found"},
-    {OP_MOVE, T_CFGFIND, 0, 0, 100, ""},
+    {OP_MOVE, T_CFGCLEAR, 0, 0, 100, ""},  // the X, as Escape
     {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 200, ""},
-    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
-    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_CFGFIND, 0, 0, 0, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
     // The long value: whole in its field, and whole once edited there
@@ -13434,6 +13435,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_DELCANCEL:     return rectcenter(g->rects[RECT_DELCANCEL]);
     case T_ROOTS:         return rectcenter(g->rects[RECT_ROOTS]);
     case T_CFGFIND:       return rectcenter(g->rects[RECT_CFGFIND]);
+    case T_CFGCLEAR:      return rectcenter(g->rects[RECT_CFGCLEAR]);
     case T_NOTIFY:        return rectcenter(g->rects[RECT_NOTIFY]);
     case T_SPLITFROM:     return v2(g->splitx, targetpos(g, T_SPLITTER).y);
     case T_PAGEITEM:

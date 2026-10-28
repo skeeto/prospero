@@ -23,8 +23,8 @@ The search field above the pages (Ctrl+F, or Cmd+F on macOS, while
 Settings has the focus) finds a setting by name: keys that match come
 first, then those whose section's name matches, then those whose
 description does. Every word typed must match. Pick a result, or press
-Enter for the first, to go to that setting on its page; Escape empties
-the field.
+Enter for the first, to go to that setting on its page. Escape, or
+the X at the field's end, empties it.
 
 **Open in editor**, beside Reload, opens the file itself in your
 editor (`[ui] editor`, else `$VISUAL` or `$EDITOR`), to edit it by
