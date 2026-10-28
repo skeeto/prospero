@@ -15834,27 +15834,25 @@ static void cmdmodel(Engine *e, Arena scratch, i64 id, Json *j)
 }
 
 // mode {sid, mode}: plan mode ("plan"), Bypass mode ("bypass") or
-// neither ("default"), which the agent reads in a notice at its next
-// request (Plan mode, Bypass mode). Into or out of plan mode only while
-// idle, or while an ask waits, but not the agent's own asks about plan
-// mode, which their answers settle; between Build and Bypass at any
-// time. A subagent's mode is its parent's, and a session without
-// exit_plan_mode is never in plan mode. Into Bypass, the path and
-// desktop asks waiting in the session's tree are allowed, by "bypass";
-// the agent's questions keep waiting for the user.
+// neither ("default"), at any time, even mid-turn: the turn goes on,
+// its permissions the new mode's from its next call, and the agent
+// reads of it in a notice at its next request (Plan mode, Bypass mode).
+// Not while the agent's own asks about plan mode wait, which their
+// answers settle. A subagent's mode is its parent's: those running
+// follow into and out of plan mode, as they follow Bypass. A session
+// without exit_plan_mode is never in plan mode. Into Bypass, the path
+// and desktop asks waiting in the session's tree are allowed, by
+// "bypass"; the agent's questions keep waiting for the user.
 static void cmdmode(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
 {
     i32 mode = modefind(jsonstr(jsonget(j, "mode")));
-    b32 plan = mode==MODE_PLAN || planning(s);
     b32 own  = s->state==S_ASK && (s->ask.tool==TOOL_PLANENTER ||
                                    s->ask.tool==TOOL_PLANEXIT);
     Str err  = mode<0   ? Str("mode must be plan, bypass or default") :
                s->psid.len ? Str("a subagent's mode is its parent's") :
                mode==MODE_PLAN && !tooloffered(&s->te, TOOL_PLANEXIT)
                         ? Str("this session has no exit_plan_mode tool") :
-               own      ? Str("the agent asks about plan mode: answer that instead") :
-               plan && busy(s) && s->state!=S_ASK
-                        ? Str("busy: change the mode once the turn ends, or while it asks")
+               own      ? Str("the agent asks about plan mode: answer that instead")
                         : Str{};
     if (err.len) {
         reply(e, scratch, id, 0, err, s->sid);
@@ -15862,6 +15860,13 @@ static void cmdmode(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     }
     if (mode != s->mode) {
         setmode(s, scratch, mode, "user");
+    }
+    // Subagents running now plan, or stop planning, with it
+    i32 kids = mode==MODE_PLAN ? MODE_PLAN : MODE_BUILD;
+    for (Session *t = e->sessions; t; t = t->next) {
+        if (t!=s && busy(t) && treeroot(t)==s && t->mode!=kids) {
+            setmode(t, scratch, kids, "parent");
+        }
     }
     for (Session *t = e->sessions; mode==MODE_BYPASS && t; t = t->next) {
         b32 asks = t->state==S_ASK && (t->ask.tool!=TOOL_PLANENTER &&

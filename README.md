@@ -308,7 +308,9 @@ the next prompt), and its Withdraw button puts it back in the draft.
 Plan mode has the agent explore and write a plan before it changes
 anything: the New session dialog's Plan mode box, `/plan` (and `/plan
 off`) or the mode list above the transcript (Build, Plan or Bypass) turns it on, and the agent may ask to
-turn it on itself. While planning, its file tools may write only the
+turn it on itself. The mode may change at any time, mid-turn too: the
+turn goes on, each call after the change held to the new mode, and the
+agent told at its next step; running subagents follow. While planning, its file tools may write only the
 session's plan file, `plan.md` in the session's directory, the desktop
 tool may only look, and subagents plan too. When it is done it asks for
 approval, showing the plan: Approve plan lets it go ahead, and Keep

@@ -1852,6 +1852,26 @@ def sc_plan(model, n, req):
 
 
 sc_plan_new = sc_plan_keep = sc_plan_reopen = sc_plan_mode = sc_plan_enter = sc_plan
+
+
+def sc_plan_midturn(model, n, req):
+    # Streams slowly, for the mode to change meanwhile, then writes: the
+    # write goes as the mode is by then
+    msgs = req.get("messages", [])
+    res = last_tool_result(req)
+    if msgs and msgs[-1].get("role") == "user" and \
+            str(msgs[-1].get("content", "")).startswith("Write slowly"):
+        yield S.head()
+        for i in range(40):
+            yield from text(model, f"slow{i} ")
+            yield S.sleep(0.02)
+        yield from call(model, 0, f"call_{n}", "write",
+                        {"path": "inside.txt", "content": "done"})
+        yield from finish(model, "tool_calls")
+    elif res.startswith("Not done: plan mode is on"):
+        yield from answer(model, "Planning.")
+    else:
+        yield from answer(model, "Done.")
 sc_plan_model = sc_plan_model_b = sc_plan_gui = sc_plan_gui_b = sc_plan_revised = sc_plan
 
 

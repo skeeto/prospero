@@ -5304,15 +5304,14 @@ static b32 planwaits(View *v)
 }
 
 // Why the session cannot change to mode ("plan", "bypass" or "default")
-// now, or empty: as the engine's mode command has it, into or out of
-// plan mode idle or while an ask waits, between Build and Bypass at any
-// time, but never while the agent asks about plan mode itself.
+// now, or empty: as the engine's mode command has it, at any time, even
+// mid-turn, which goes on in the new mode, but never while the agent
+// asks about plan mode itself.
 static Str modewhy(Gui *g, GuiSession *s, Str mode)
 {
-    View *v    = s->view;
-    b32   plan = mode=="plan" || !v || v->plan;
-    Str   cap  = mode=="bypass" ? Str("bypass") : Str("plan");
-    Str   why  = sesswhy(g, s, cap, plan && (!v || !v->asks), !sessremote(s));
+    View *v   = s->view;
+    Str   cap = mode=="bypass" ? Str("bypass") : Str("plan");
+    Str   why = sesswhy(g, s, cap, 0, !sessremote(s));
     if (why.len || !v) {
         return why;
     }

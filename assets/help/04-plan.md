@@ -7,6 +7,11 @@ transcript, or with
 `/plan` (`/plan off` turns it off). The agent may also ask to plan
 first: Plan first agrees, and Go ahead without lets it work as before.
 
+The mode may change at any time, mid-turn too ("Oops, I want to be
+planning"). The turn goes on: its next tool call is held to the new
+mode, so a write after Plan is picked is refused, and the agent is
+told of the change at its next step. Subagents running then follow.
+
 ## While planning
 
 - The file tools may write only the session's plan file, `plan.md` in

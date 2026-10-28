@@ -8689,6 +8689,44 @@ def plan_mode(t):
 
 
 @scenario(bound=15)
+def plan_midturn(t):
+    """The mode changed while the agent streams: the turn goes on, its
+    next call held to the new mode, and the agent told at its next
+    request. Into plan mode, the write is refused; out of it, written."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="Write slowly.")
+        h.wait(lambda e: e.get("ev") == "delta" and e.get("sid") == sid)
+        r = h.call("mode", sid=sid, mode="plan")
+        t.check(r.get("ok") == 1 and r.get("mode") == "plan", f"on, mid-turn: {r}")
+        ended(h, sid, 1)
+        said = [b.get("text", "") for e in h.all("assistant", sid)
+                for b in e.get("blocks", []) if b.get("t") == "text"]
+        t.check(said and said[0].startswith("slow0 ") and "slow39" in said[0],
+                f"the stream went on: {said[:1]}")
+        t.check(t.file("inside.txt") is None, "not written while planning")
+        t.check(lastsaid(h, sid) == "Planning.", f"said {lastsaid(h, sid)}")
+        msgs = t.requests()[-1]["body"]["messages"]
+        told = [m for m in msgs if str(m.get("content", "")).startswith("Plan mode is on")]
+        t.check(len(told) == 1, f"told at its next request: {msgs[-2:]}")
+
+        seen = {id(e) for e in list(h.events)}
+        h.send("prompt", sid=sid, text="Write slowly, again.")
+        h.wait(lambda e: e.get("ev") == "delta" and e.get("sid") == sid and
+               id(e) not in seen)
+        r = h.call("mode", sid=sid, mode="default")
+        t.check(r.get("ok") == 1 and r.get("mode") == "default", f"off, mid-turn: {r}")
+        ended(h, sid, 2)
+        t.check(t.file("inside.txt") == "done\n", "written once out of plan mode")
+        t.check(lastsaid(h, sid) == "Done.", f"said {lastsaid(h, sid)}")
+        t.check(modes(h, sid) == ["plan/user", "default/user"], f"modes {modes(h, sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
 def plan_revised(t):
     """The plan file revised by hand while its ask waits (the GUI's Edit
     plan): approved, the agent carries out the file as it is then, told
