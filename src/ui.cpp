@@ -2463,8 +2463,9 @@ static b32  planwaits(View *);
 static Str  modewhy(Gui *, GuiSession *, Str mode);
 
 // The session's model, a combo of those configured to switch to (model)
-// while idle, and what the latest switch's reply noted.
-static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v)
+// while idle, and what the latest switch's reply noted: the line's first
+// item, or after what is on it.
+static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v, b32 first)
 {
     Str   why = g->enginekind==ENGINE_FAKE ? Str("No engine") :
                 sesswhy(g, s, "model", !planwaits(v), 0);
@@ -2472,7 +2473,9 @@ static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v)
     if (now.len && hostcan(s->host, "models")) {
         now = modelshown(&a, s->host, v->endpoint, now);  // ENDPOINT/MODEL
     }
-    ImGui::SameLine();
+    if (!first) {
+        ImGui::SameLine();
+    }
     // A button that looks the part, its list a popup: a combo's own
     // popup would begin inside the disabled block
     Str label = concat(&a, shorten(&a, now.len ? now : Str("(model)"), 40),
@@ -2579,9 +2582,83 @@ static void drawshellpick(Gui *g, Arena a, GuiSession *s, View *v)
     }
 }
 
-// A line above the transcript: the session, or a subagent's parent to
-// go back to, its context gauge, the toggles that open all its tool
-// output and reasoning, and the session's details in a popup.
+// The session's mode, Build, Plan or Bypass, a list of them like the
+// model's and shell's: amber in Plan, where the list also shows the
+// plan, and red in Bypass, which only the user picks, trusted to know
+// what it does.
+static void drawmodepick(Gui *g, Arena a, GuiSession *s, View *v)
+{
+    static struct { Str name; Str mode; Str tip; } const modes[] = {
+        {"Build",  "default", "Build: the agent works on the task, changing files as "
+                              "it goes (/plan off)"},
+        {"Plan",   "plan",    "Plan: the agent explores and writes a plan for you to "
+                              "approve before it changes anything (/plan)"},
+        {"Bypass", "bypass",  "Bypass: the agent reads, writes and acts anywhere, outside "
+                              "its working directory and on the desktop, without asking "
+                              "you. Only for an agent working alone somewhere it can do "
+                              "no harm"},
+    };
+    iz  cur = v->bypass ? 2 : v->plan ? 1 : 0;
+    iz  n   = hostcap(s->host, "bypass") ? 3 : 2;
+    Str why = {};  // why no other mode can be picked, if none can
+    b32 any = 0;
+    for (iz i = 0; i < n; i++) {
+        Str off = i==cur ? Str{} : modewhy(g, s, modes[i].mode);
+        any |= i!=cur && !off.len;
+        why  = why.len || i==cur ? why : off;
+    }
+    why = any ? Str{} : why;
+
+    ImGui::SameLine();
+    u32 color = cur==2 ? g->pal->bad : cur==1 ? g->pal->amber : ImGui::GetColorU32(ImGuiCol_Text);
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
+    g->modetext = ImGui::GetColorU32(ImGuiCol_Text);  // for CHK_BYPASS
+    Str label = concat(&a, modes[cur].name, "  \xe2\x96\xbe##modepick");  // a small down triangle
+    // Plan's list still shows the plan while no mode can be picked
+    b32 off = why.len && cur!=1;
+    if (off) {
+        ImGui::BeginDisabled();
+    }
+    b32 click = ImGui::Button(cstr0(&a, label));
+    if (off) {
+        ImGui::EndDisabled();
+    }
+    ImGui::PopStyleColor();
+    itemnamed(g, "session mode");
+    whytip(why.len ? why : modes[cur].tip);
+    if (click) {
+        ImGui::OpenPopup("##modepop");
+    }
+    if (ImGui::BeginPopup("##modepop")) {
+        for (iz i = 0; i < n; i++) {
+            b32 on   = i == cur;
+            Str nope = on ? Str{} : modewhy(g, s, modes[i].mode);
+            ImGui::BeginDisabled(nope.len > 0);
+            if (i == 2) {
+                ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+            }
+            if (ImGui::Selectable(cstr0(&a, modes[i].name), on) && !on) {
+                guimode(g, s, modes[i].mode);
+            }
+            if (i == 2) {
+                ImGui::PopStyleColor();
+            }
+            ImGui::EndDisabled();
+            itemnamed(g, concat(&a, Str("session mode "), modes[i].name));
+            whytip(nope.len ? nope : modes[i].tip);
+        }
+        if (v->plan) {
+            ImGui::Separator();
+            if (ImGui::Selectable("Show the plan")) {
+                setpane(g, PANE_PLAN, 1);
+            }
+            itemnamed(g, "show the plan");
+            ImGui::SetItemTooltip("The plan the agent writes, for you to approve");
+        }
+        ImGui::EndPopup();
+    }
+}
+
 // The session's branch, on the session bar's first line after what is
 // there, cut in its middle to end by end (window x): dim, or amber while
 // a rebase, a merge or the like is under way, and a toggle of the
@@ -2661,6 +2738,10 @@ static void drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end)
     }
 }
 
+// A line above the transcript: a subagent's parent to go back to, or a
+// side chat's original; the session's model, shell and mode; its branch,
+// context gauge, the toggles that open all its tool output and
+// reasoning, and its details in a popup.
 static void drawsessbar(Gui *g)
 {
     GuiSession *s = g->sess;
@@ -2712,21 +2793,22 @@ static void drawsessbar(Gui *g)
         }
         itemrect(g, RECT_SIDELINK);
         ImGui::SetItemTooltip("Back to the session this side chat began from");
-        drawmodelpick(g, a, s, v);
+        drawmodelpick(g, a, s, v, 0);
         drawshellpick(g, a, s, v);
     } else {
-        Buf b(&a, 256);
-        print(&b, shorten(&a, sesstitle(s), 60));
+        // Its title is the sidebar's selected row: only a role here
         if (v->role.len) {
-            print(&b, "  \xc2\xb7  role ");
-            print(&b, v->role);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("Role %s", cstr0(&a, shorten(&a, v->role, 40)));
         }
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
-        drawmodelpick(g, a, s, v);
+        drawmodelpick(g, a, s, v, !v->role.len);
         drawshellpick(g, a, s, v);
     }
-    if (v->plan) {
+    // A subagent's mode is its parent's, unless that is not here
+    b32 picks = (!v->parent.len || v->remote) && hostcap(s->host, "plan");
+    if (picks) {
+        drawmodepick(g, a, s, v);
+    } else if (v->plan) {
         // A chip that shows the plan
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
@@ -2747,7 +2829,7 @@ static void drawsessbar(Gui *g)
         itemnamed(g, "bypass chip");
         ImGui::SetItemTooltip("Bypass mode: the agent reads and writes outside its working "
                               "directory, and acts on the desktop, without asking you. "
-                              "Change it in the mode list by Send.");
+                              "Change it in its session's mode list.");
     }
     // The branch in what room is left before them, else on the line
     b32 fits = right > rightof();
@@ -4819,64 +4901,6 @@ static void drawprompt(Gui *g)
         whytip(why.len ? why : Str("Attach an image, PNG, JPEG, GIF, WebP or BMP, to the next message: "
                                    "or drop one on the window, or paste one"));
     }
-    if (g->sess && hostcap(s->host, "plan") && (!v->parent.len || v->remote)) {
-        // The session's mode, one of these, as wide as the buttons, and
-        // in red while nothing is asked (Bypass), which only the user
-        // picks here, trusted to know what it does
-        static struct { Str name; Str mode; Str tip; } const modes[] = {
-            {"Build",  "default", "Build: the agent works on the task, changing files as "
-                                  "it goes (/plan off)"},
-            {"Plan",   "plan",    "Plan: the agent explores and writes a plan for you to "
-                                  "approve before it changes anything (/plan)"},
-            {"Bypass", "bypass",  "Bypass: the agent reads, writes and acts anywhere, outside "
-                                  "its working directory and on the desktop, without asking "
-                                  "you. Only for an agent working alone somewhere it can do "
-                                  "no harm"},
-        };
-        iz  cur  = v->bypass ? 2 : v->plan ? 1 : 0;
-        iz  n    = hostcap(s->host, "bypass") ? 3 : 2;
-        Str why  = {};  // why no other mode can be picked, if none can
-        b32 any  = 0;
-        for (iz i = 0; i < n; i++) {
-            Str off = i==cur ? Str{} : modewhy(g, s, modes[i].mode);
-            any |= i!=cur && !off.len;
-            why  = why.len || i==cur ? why : off;
-        }
-        why = any ? Str{} : why;
-        ImGui::BeginDisabled(why.len > 0);
-        ImGui::SetNextItemWidth(bw);
-        if (cur == 2) {
-            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
-        }
-        g->modetext = ImGui::GetColorU32(ImGuiCol_Text);  // for CHK_BYPASS
-        b32 open = ImGui::BeginCombo("##mode", cstr0(&a, modes[cur].name));
-        if (cur == 2) {
-            ImGui::PopStyleColor();
-        }
-        itemnamed(g, "session mode");
-        whytip(why.len ? why : modes[cur].tip);
-        if (open) {
-            for (iz i = 0; i < n; i++) {
-                b32 on  = i == cur;
-                Str off = on ? Str{} : modewhy(g, s, modes[i].mode);
-                ImGui::BeginDisabled(off.len > 0);
-                if (i == 2) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
-                }
-                if (ImGui::Selectable(cstr0(&a, modes[i].name), on) && !on) {
-                    guimode(g, s, modes[i].mode);
-                }
-                if (i == 2) {
-                    ImGui::PopStyleColor();
-                }
-                ImGui::EndDisabled();
-                itemnamed(g, concat(&a, Str("session mode "), modes[i].name));
-                whytip(off.len ? off : modes[i].tip);
-            }
-            ImGui::EndCombo();
-        }
-        ImGui::EndDisabled();
-    }
     if (s->hist) {
         // Which of the session's messages the box holds: oldest is 1
         i32 m = histcount(v);
@@ -5125,6 +5149,17 @@ static b32 menuitem(Gui *g, Arena a, Str label, Str why, char const *key = 0)
     b32   r = ImGui::MenuItem(cstr0(&a, label), key, false, !why.len);
     itemnamed(g, label);
     whytip(why);
+    return r;
+}
+
+// One with a tooltip, tip, saying what it does while it can. It takes
+// the caller's arena, where its strings may be made in the same call.
+static b32 menutip(Gui *g, Arena *a, Str label, Str why, Str tip)
+{
+    b32 r = menuitem(g, *a, label, why);
+    if (!why.len) {
+        ImGui::SetItemTooltip("%s", cstr0(a, tip));
+    }
     return r;
 }
 
@@ -5516,7 +5551,8 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
     GuiHost *h     = s->host;
     b32      older = 0;  // an item lacks the engine's support
 
-    if (menuitem(g, a, "Rename...", sesswhy(g, s, "rename", 0, 0))) {
+    if (menutip(g, &a, "Rename...", sesswhy(g, s, "rename", 0, 0),
+                "Give it a title of your own, in place of its first prompt's")) {
         namedialog(g, NAME_RENAME, s, {}, sesstitle(s));
     }
     older |= !hostcap(h, "rename");
@@ -5540,28 +5576,27 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
         if (g->groups.len) {
             ImGui::Separator();
         }
-        if (menuitem(g, a, "New group...", {})) {
+        if (menutip(g, &a, "New group...", {}, "Name a new group and move it there")) {
             namedialog(g, NAME_NEWGROUP, s, {}, {});
         }
-        if (menuitem(g, a, "Remove from group", s->group.len ? Str{} : Str("It is in no group"))) {
+        if (menutip(g, &a, "Remove from group", s->group.len ? Str{} : Str("It is in no group"),
+                    "Back among the sessions in no group")) {
             guigroup(g, s, {});
         }
         ImGui::EndMenu();
     }
     ImGui::Separator();
 
-    if (menuitem(g, a, "Fork", sesswhy(g, s, "fork", 1, 1))) {
+    if (menutip(g, &a, "Fork", sesswhy(g, s, "fork", 1, 1),
+                "A new session with a copy of this conversation, in Build mode")) {
         guifork(g, s, -1);
     }
     older |= !hostcap(h, "fork");
-    if (menuitem(g, a, "Start a side chat", sidewhy(g, s))) {
+    if (menutip(g, &a, "Start a side chat", sidewhy(g, s),
+                "A fork to ask about this session in, even while its agent works")) {
         guiside(g, s, {});
     }
     older |= !hostcap(h, "side");
-    if (menuitem(g, a, "Compact", sesswhy(g, s, "compact", 1, 0))) {
-        guicompact(g, s, {});
-    }
-    older |= !hostcap(h, "compact");
     why = sesswhy(g, s, "model", 1, 0);
     older |= !hostcap(h, "model");
     sub = ImGui::BeginMenu("Switch model", !why.len);
@@ -5584,14 +5619,15 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
     sub = ImGui::BeginMenu("Export");
     itemnamed(g, "Export");
     if (sub) {
-        if (menuitem(g, a, "Markdown...", {})) {
+        if (menutip(g, &a, "Markdown...", {},
+                    "The conversation as Markdown, to a file or the clipboard")) {
             g->exportsess = s;
             g->openexport = 1;
         }
         Str raw = h->kind!=GH_REMOTE || hostcap(h, "file.base64") ? Str{} :
                   Str("The engine there is too old to send the log");
         raw = raw.len || h->kind!=GH_REMOTE || hostlive(g, s) ? raw : Str("Its host is not connected");
-        if (menuitem(g, a, "Raw log...", raw)) {
+        if (menutip(g, &a, "Raw log...", raw, "The session's log of records, as it is")) {
             guiexport(g, s, EXPORT_RAW, 0);
         }
         ImGui::EndMenu();
@@ -5599,37 +5635,54 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
     ImGui::Separator();
 
     b32 arch = s->archived;
-    if (menuitem(g, a, arch ? Str("Unarchive") : Str("Archive"), sesswhy(g, s, "archive", 0, 1))) {
+    if (menutip(g, &a, arch ? Str("Unarchive") : Str("Archive"), sesswhy(g, s, "archive", 0, 1),
+                arch ? Str("Back among the sessions above")
+                     : Str("Under Archived, at the end of the sidebar"))) {
         guiarchive(g, s, !arch);
     }
     older |= !hostcap(h, "archive");
-    if (menuitem(g, a, "Delete...", sesswhy(g, s, "delete", 1, 0))) {
+    if (menutip(g, &a, "Delete...", sesswhy(g, s, "delete", 1, 0),
+                "Remove it and its subagents for good, once you confirm")) {
         Slice<GuiSession *> one = {};
         one = push(&a, one, s);
         askdelete(g, one, {});
     }
     older |= !hostcap(h, "delete");
     ImGui::Separator();
-    if (menuitem(g, a, "Copy session id", {})) {
+    if (menutip(g, &a, "Copy session ID", {}, concat(&a, "Copy ", s->sid))) {
         ImGui::SetClipboardText(cstr0(&a, s->sid));
     }
-    Str reveal = h->kind==GH_REMOTE ? Str("Its files are on another computer") : Str{};
-    if (menuitem(g, a, "Reveal folder", reveal)) {
+    // Its two folders: where it works, and where its records are
+    Str there = h->kind==GH_REMOTE ? Str("Its files are on another computer") : Str{};
+    Str cwd   = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+    Str work  = there.len ? there : cwd.len ? Str{} : Str("Its folder is not known yet");
+    if (menutip(g, &a, "Open working folder", work,
+                concat(&a, "Open the folder it works in, ", cwd))) {
+        if (!os_guireveal(g->os, a, cwd)) {
+            g->lasterr = clone(&g->perm, concat(&a, "cannot show ", cwd));
+        }
+    }
+    if (menutip(g, &a, "Open session records", there,
+                "Open its folder in the state directory: its log, plan and "
+                "command output")) {
         Str dir = sessdir(g, &a, s->sid);
         if (!os_guireveal(g->os, a, dir)) {
             g->lasterr = clone(&g->perm, concat(&a, "cannot show ", dir));
         }
     }
     Str term = termplan(g, &a, s).why;
-    if (menuitem(g, a, "Open in terminal", term)) {
+    if (menutip(g, &a, "Open in terminal", term,
+                h->kind==GH_REMOTE ? Str("A shell in its folder there, in a terminal here")
+                                   : Str("Its shell in its folder, in a terminal"))) {
         termopen(g, a, s);
     }
-    ImGui::SetItemTooltip("%s", h->kind==GH_REMOTE
-                                ? "A shell in its folder there, in a terminal here"
-                                : "A shell in its folder, in a terminal");
     Str close = !s->view ? Str("It is not open here") :
                 s->view->busy && !s->readonly ? Str("Close it once its turn ends") : Str{};
-    if (menuitem(g, a, "Close", close)) {
+    if (menutip(g, &a, "Close", close,
+                s->readonly
+                    ? Str("Let it go from memory here")
+                    : Str("Stop its background jobs and subagents, deny what it asks "
+                          "from now on, and let it go from memory here"))) {
         sessclose(g, s);
     }
     if (older && h->kind==GH_REMOTE) {
@@ -9731,7 +9784,6 @@ static void drawmenubar(Gui *g)
             ImGui::BeginDisabled();
             ImGui::MenuItem("Rename...");
             ImGui::MenuItem("Fork");
-            ImGui::MenuItem("Compact");
             ImGui::MenuItem("Switch model...");
             ImGui::MenuItem("Export...");
             ImGui::Separator();

@@ -495,6 +495,7 @@ struct View {
     Str             endpoint;
     Str             shell;      // the shell commands run in, by name
     Str             shellpath;  // and its program
+    Str             shellkind;  // and its kind (tools.cpp shellkinds)
     b32             shellset;   // by a shell record, not the prefix
     Str             role;
     Str             parent;     // a subagent's parent session, else empty
@@ -1711,6 +1712,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             Str name = jsonstr(jsonget(j, "shell_name"));
             v->shellpath = clone(&v->aux, path);
             v->shell     = clone(&v->aux, name.len ? name : basename(path));
+            v->shellkind = clone(&v->aux, jsonstr(jsonget(j, "shell_kind")));
         }
         return 1;
 
@@ -1718,6 +1720,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         // Switched for the rest of the session (shell)
         v->shell     = clone(&v->aux, jsonstr(jsonget(j, "name")));
         v->shellpath = clone(&v->aux, jsonstr(jsonget(j, "path")));
+        v->shellkind = clone(&v->aux, jsonstr(jsonget(j, "kind")));
         v->shellset  = 1;
         i32 i = addmark(v, r->seq, "Shell", v->shell);
         v->msgs[i].from = v->shellpath;

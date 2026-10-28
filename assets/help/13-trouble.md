@@ -15,8 +15,8 @@
   error a turn ended with.
 - **The Metrics pane** (View → Metrics) shows the window's own
   workings, frames and wakes, for when the window itself misbehaves.
-- **Session → Reveal folder** opens a session's folder in the state
-  directory, with its log.
+- **Session → Open session records** opens a session's folder in the
+  state directory, with its log.
 
 ## Common problems
 

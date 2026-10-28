@@ -205,4 +205,26 @@ static void test_compose(Test *t)
     expect(t, "term.xterm", argstr(&a, tr.argv), "xterm|-e|a;b");
     tr = termargv(&a, TERM_LINUX, "st", "/p", none);
     expect(t, "term.unknown", argstr(&a, tr.argv), "st");
+
+    // A session's own shell, by hand: none for a POSIX /bin/sh, else as
+    // a login shell, and on macOS changing to its folder first
+    expect(t, "term.binsh", argstr(&a, termshell(&a, "sh", "/bin/sh", 0)), "");
+    expect(t, "term.noshell", argstr(&a, termshell(&a, "sh", {}, 1)), "");
+    expect(t, "term.w64sh", argstr(&a, termshell(&a, "sh", "C:/w64devkit/bin/sh.exe", 1)),
+           "C:/w64devkit/bin/sh.exe|-l");
+    expect(t, "term.busybox", argstr(&a, termshell(&a, "busybox", "C:/bb/busybox.exe", 1)),
+           "C:/bb/busybox.exe|sh|-l");
+    expect(t, "term.pwsh", argstr(&a, termshell(&a, "pwsh", "C:/ps/pwsh.exe", 1)),
+           "C:/ps/pwsh.exe|-NoLogo");
+    expect(t, "term.cmd", argstr(&a, termshell(&a, "cmd", "C:\\W\\cmd.exe", 1)),
+           "C:\\W\\cmd.exe");
+    expect(t, "term.zsh", argstr(&a, termshell(&a, "sh", "/bin/zsh", 0)), "/bin/zsh|-l");
+    Slice<Str> zsh = termshell(&a, "sh", "/bin/zsh", 0);
+    tr = termargv(&a, TERM_WIN, "wt.exe", "C:\\p", termshell(&a, "sh", "C:/w/sh.exe", 1), 1);
+    expect(t, "term.wtshell", argstr(&a, tr.argv), "wt.exe|-d|C:\\p|C:/w/sh.exe|-l");
+    tr = termargv(&a, TERM_MAC, {}, "/p/it's", zsh, 1);
+    expect(t, "term.machere", argstr(&a, tr.argv), "open|-a|Terminal");
+    expect(t, "term.macherescript", tr.script,
+           "#!/bin/sh\nrm -f \"$0\"\ncd -- '/p/it'\\''s' || exit\n"
+           "exec '/bin/zsh' '-l'\n");
 }

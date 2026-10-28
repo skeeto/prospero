@@ -69,11 +69,13 @@ anything else for a few seconds.
 
 ## Modes
 
-The mode list below Send has three modes:
+The mode list above the transcript, beside the model and the shell,
+has three modes:
 
 - **Build**: the agent works on the task, changing files as it goes.
 - **Plan**: the agent explores and writes a plan for you to approve
-  before it changes anything. See [Plan mode](help:plan).
+  before it changes anything, shown amber; the list then also shows
+  the plan. See [Plan mode](help:plan).
 - **Bypass**, in red: the agent reads, writes and acts anywhere
   without asking. See [Permissions and asks](help:permissions) before
   using it.
@@ -117,7 +119,6 @@ Right-click a session in the sidebar, or open the Session menu, for:
   a copy of its folder.
 - **Start a side chat**: a fork you can make while the agent works
   (below).
-- **Compact**: summarize the conversation now.
 - **Switch model**: a configured model, or another typed in.
 - **Switch shell**: a `[shell]` section of your configuration, or `sh`,
   `powershell` or `cmd` where found, as the picker beside the model's
@@ -131,14 +132,21 @@ Right-click a session in the sidebar, or open the Session menu, for:
 - **Archive**: move it under Archived, at the end of the sidebar.
   Unarchive brings it back.
 - **Delete...**: remove it, with its subagents, for good.
-- **Copy session id**, **Reveal folder** (the session's folder in the
-  state directory) and **Close**.
-- **Open in terminal**: a terminal window with a shell in the folder
-  the session works in, as is the Info popup's Terminal button. On a
-  remote it is a shell there, over ssh (`ssh -t`, so it may ask for a
-  password) or WSL. The terminal is `[ui] terminal`, else Terminal on
-  macOS, Windows Terminal (or a console) on Windows, and elsewhere
-  `$TERMINAL` or the first of the usual ones found.
+- **Copy session ID**.
+- **Open working folder**: the folder the session works in, in Finder
+  or Explorer. **Open session records**: its folder in the state
+  directory, with its log, plan and command output.
+- **Open in terminal**: a terminal window in the folder the session
+  works in, as is the Info popup's Terminal button, running the
+  session's shell (a POSIX sh as a login shell), or where that is
+  `/bin/sh`, the terminal's own. On a remote it is a shell there, over
+  ssh (`ssh -t`, so it may ask for a password) or WSL. The terminal is
+  `[ui] terminal`, else Terminal on macOS, Windows Terminal (or a
+  console) on Windows, and elsewhere `$TERMINAL` or the first of the
+  usual ones found.
+- **Close**: stop its background jobs and subagents, deny what it asks
+  from then on, and let it go from memory in this window. Opening it
+  again reads it back.
 
 Most of these wait until the turn ends.
 

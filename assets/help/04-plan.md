@@ -2,7 +2,8 @@
 
 In Plan mode the agent explores and writes a plan before it changes
 anything, and you approve it first. Turn it on with the New session
-dialog's Plan mode box, with Plan in the mode list below Send, or with
+dialog's Plan mode box, with Plan in the mode list above the
+transcript, or with
 `/plan` (`/plan off` turns it off). The agent may also ask to plan
 first: Plan first agrees, and Go ahead without lets it work as before.
 

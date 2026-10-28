@@ -6008,10 +6008,14 @@ static TermPlan termplan(Gui *g, Arena *a, GuiSession *s)
             return r;
         }
     } else {
+        // Here, the session's own shell, if any but the default
         r.dir = dir;
+        if (v) {
+            cmd = termshell(a, v->shellkind, v->shellpath, HOST_WINDOWS);
+        }
     }
     r.cmd = cmd;
-    r.run = termargv(a, termos(g), prog, dir, cmd);
+    r.run = termargv(a, termos(g), prog, dir, cmd, r.dir.len > 0);
     return r;
 }
 
@@ -9992,7 +9996,7 @@ enum : i32 {
     CHK_PLANPLAIN,    // the plan is out in the editor, no plan waiting
     CHK_PLANQUIET,    // the session is idle, asking nothing
     CHK_PLANREVISED,  // the agent heard the plan approved was revised by hand
-    CHK_BYPASS,       // dx 1: the session shown is in Bypass, chip and label red; 0 not
+    CHK_BYPASS,       // dx 1: the session shown is in Bypass, its mode in red; 0 not
     CHK_LAUNCHDIR,    // the session shown is in the launch's directory (DIR)
     CHK_OPENED,       // dx sessions asked for by launches and open events,
                       // the one shown in a directory ending in text, if any
@@ -12281,15 +12285,20 @@ static DriveOp sessionsops[] = {
     {OP_WAIT, W_FILE, 0, 0, 5000, "Greeting.jsonl"},
     {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Greeting.jsonl|\"ev\":\"session\""},
     {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Greeting.jsonl|\"ev\":\"model\""},
-    // The Session menu: compacting so short a session is refused, with
-    // its reason in the note above the box
+    // The Session menu, then /compact: compacting so short a session is
+    // refused, with its reason in the note above the box
     {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_SHOT, 0, 0, 0, 300, "sessions-sessmenu"},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Compact"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_MOVE, T_PROMPT, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
-    {OP_UP, 0, 0, 0, 100, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_TEXT, 0, 0, 0, 300, "/compact"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 100, ""},
     {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
     {OP_CHECK, CHK_NOTE, 0, 0, 0, "too little"},
     // The remote's heading connects (there is no such host)
@@ -13043,7 +13052,7 @@ static DriveOp planops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
-    {OP_WAIT, W_NAMED, 0, 0, 10000, "plan chip"},
+    {OP_WAIT, W_NAMED, 0, 0, 10000, "session mode"},
     {OP_CHECK, CHK_PLANMODE, 1, 0, 0, ""},
     {OP_FOCUS, 0, 2, 0, 0, ""},
     {OP_TOASTMARK, 0, 0, 0, 0, ""},
@@ -13054,8 +13063,11 @@ static DriveOp planops[] = {
     {OP_CHECK, CHK_TOAST, 0, 0, 0, "Approve the plan?\nWaiting for you"},
     {OP_FOCUS, 0, 1, 0, 300, ""},
     {OP_CHECK, CHK_UNTOASTED, 0, 0, 0, ""},
-    // The chip shows the Plan window, beside the todo list
-    {OP_MOVE, T_NAMED, 0, 0, 100, "plan chip"},
+    // The mode list shows the Plan window, beside the todo list
+    {OP_MOVE, T_NAMED, 0, 0, 100, "session mode"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "show the plan"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_PLAN, 0, 0, 10000, "# Plan"},
@@ -13185,7 +13197,6 @@ static DriveOp planops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_MARK, 0, 0, 5000, "Bypass mode"},
-    {OP_WAIT, W_NAMED, 0, 0, 5000, "bypass chip"},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_MARK, 0, 0, 0, "Bypass mode: the agent asks nothing"},
     {OP_CHECK, CHK_BYPASS, 1, 0, 0, ""},
@@ -16108,14 +16119,10 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_PLANMODE:
         return g->sess && v->plan==(b32)g->ops[g->drivepc-1].dx;
     case CHK_BYPASS: {
-        // In Bypass, its chip drawn and the mode list's label in red
+        // In Bypass, the session bar's mode list's label in red
         b32 want = (b32)g->ops[g->drivepc-1].dx;
-        b32 chip = 0;
-        for (i32 i = 0; i < g->nnamed; i++) {
-            chip |= Str{g->named[i].name, g->named[i].len} == "bypass chip";
-        }
-        b32 red = (g->modetext & 0xffffff) == (g->pal->bad & 0xffffff);
-        return g->sess && v->bypass==want && red==want && (chip || !want);
+        b32 red  = (g->modetext & 0xffffff) == (g->pal->bad & 0xffffff);
+        return g->sess && v->bypass==want && red==want;
     }
     case CHK_PLANASK: {
         ViewMsg *m = lastmsg(g, VIEW_ASK);

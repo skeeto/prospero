@@ -489,10 +489,12 @@ struct TermRun {
 
 // What opens a terminal in dir: prog the terminal (TERM_MAC an
 // application, TERM_WIN Windows Terminal's path or null for a console),
-// cmd what it runs there, if not the user's shell (ssh, wsl). On macOS
-// a command goes in a script that removes itself, which Terminal runs
-// without asking for control of it.
-static TermRun termargv(Arena *a, i32 os, Str prog, Str dir, Slice<Str> cmd)
+// cmd what it runs there, if not the user's shell (ssh, wsl, the
+// session's shell). On macOS a command goes in a script that removes
+// itself, which Terminal runs without asking for control of it, and
+// which first changes to dir if the command runs here.
+static TermRun termargv(Arena *a, i32 os, Str prog, Str dir, Slice<Str> cmd,
+                        b32 here = 0)
 {
     TermRun r = {};
     if (os == TERM_MAC) {
@@ -504,7 +506,13 @@ static TermRun termargv(Arena *a, i32 os, Str prog, Str dir, Slice<Str> cmd)
             return r;
         }
         Buf b(a, 256);
-        print(&b, "#!/bin/sh\nrm -f \"$0\"\nexec");
+        print(&b, "#!/bin/sh\nrm -f \"$0\"\n");
+        if (here) {
+            print(&b, "cd -- ");
+            print(&b, shquote(a, dir));
+            print(&b, " || exit\n");
+        }
+        print(&b, "exec");
         for (iz i = 0; i < cmd.len; i++) {
             putbyte(&b, ' ');
             print(&b, shquote(a, cmd[i]));
@@ -595,5 +603,27 @@ static Slice<Str> termwsl(Arena *a, Str wsl, Str distro, Str dir)
     r = push(a, r, distro);
     r = push(a, r, Str("--cd"));
     r = push(a, r, dir);
+    return r;
+}
+
+// The command that opens a session's shell by hand, as its records give
+// its kind (tools.cpp shellkinds) and program: a POSIX sh as a login
+// shell, so its profile sets it up. None for a POSIX system's /bin/sh,
+// the default, where the terminal's own shell, the user's, is better.
+static Slice<Str> termshell(Arena *a, Str kind, Str path, b32 win)
+{
+    Slice<Str> r = {};
+    if (!path.len || (!win && kind=="sh" && path=="/bin/sh")) {
+        return r;
+    }
+    r = push(a, r, path);
+    if (kind == "sh") {
+        r = push(a, r, Str("-l"));
+    } else if (kind == "busybox") {
+        r = push(a, r, Str("sh"));
+        r = push(a, r, Str("-l"));
+    } else if (kind=="pwsh" || kind=="powershell") {
+        r = push(a, r, Str("-NoLogo"));
+    }
     return r;
 }

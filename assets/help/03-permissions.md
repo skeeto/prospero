@@ -61,7 +61,7 @@ separated by `;`, with `~` for the home directory:
 
 ## Bypass
 
-Bypass mode, picked in red from the mode list below Send, is for an
+Bypass mode, picked in red from the mode list above the transcript, is for an
 agent left to work alone somewhere it can do no harm. Nothing is
 asked, attended or not: the file tools read and write outside the
 working directory, the desktop tool acts, starting programs too, and
