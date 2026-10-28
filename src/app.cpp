@@ -18024,8 +18024,10 @@ static ImFont *addfont(Str data, i32 flags, b32 merge)
 
 // Codicons, buttons' icons (fonts.cpp), over their own range alone.
 // Its glyphs stand on the baseline, as tall as the em, which would reach
-// above a small button's frame: smaller (13 to the text's 15) and a
-// little lower, an icon sits centered in the line of text.
+// above a small button's frame: smaller (13 to the text's 15) and 2 px
+// lower, an icon's ink sits centered in a button, within a pixel at 1x
+// and 2x, as a capital's does (measured on screenshots: 1 clipped the
+// top, 3 sat low).
 static void addicons(i32 flags)
 {
     static ImWchar const range[] = {0xea60, 0xf102, 0};
@@ -18034,7 +18036,7 @@ static void addicons(i32 flags)
     cfg.FontLoaderFlags      = (u32)flags & ~(u32)ImGuiFreeTypeLoaderFlags_Oblique;
     cfg.MergeMode            = 1;
     cfg.GlyphRanges          = range;
-    cfg.GlyphOffset          = v2(0, 1);
+    cfg.GlyphOffset          = v2(0, 2);
     Str data = fonticons();
     ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void *)data.data, (i32)data.len, 13, &cfg);
 }
