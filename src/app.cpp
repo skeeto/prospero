@@ -11441,6 +11441,13 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "idle_timeout idle_timeout"},
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    // Many results, long tooltips: the list's scratch clear of it
+    {OP_TEXT, 0, 0, 0, 500, "model"},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "model model max_models max_models "
+                                      "subagent_model"},
+    {OP_SHOT, 0, 0, 0, 300, "settings-find-many"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     {OP_TEXT, 0, 0, 0, 500, "idle fake"},
     {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "idle_timeout"},
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},

@@ -7756,10 +7756,9 @@ static void cfggoto(Gui *g, CfgRow *r)
 
 // The search's results, in place of the page list: each a setting's
 // key over its page, dimmed, with the setting's tooltip. Enter in the
-// field (enter) goes to the first.
-static void drawcfgfind(Gui *g, Slice<i32> found, b32 enter)
+// field (enter) goes to the first. Its scratch is a, after found.
+static void drawcfgfind(Gui *g, Arena a, Slice<i32> found, b32 enter)
 {
-    Arena a = g->frame;
     if (!found.len) {
         ImGui::TextDisabled("No setting matches");
         return;
@@ -8382,7 +8381,7 @@ static void drawsettings(Gui *g)
         lw = lw<130*sc ? 130*sc : lw>220*sc ? 220*sc : lw;
         if (ImGui::BeginChild("##pages", v2(lw, 0), ImGuiChildFlags_Borders)) {
             if (find) {
-                drawcfgfind(g, found, enter);
+                drawcfgfind(g, a, found, enter);
             } else {
                 drawcfglist(g, 0);
             }
@@ -8393,7 +8392,7 @@ static void drawsettings(Gui *g)
     } else if (find && !g->cfgfindhid) {
         // In place of the combo and the page, until one is picked
         if (ImGui::BeginChild("##found", v2(0, 0), ImGuiChildFlags_Borders)) {
-            drawcfgfind(g, found, enter);
+            drawcfgfind(g, a, found, enter);
         }
         ImGui::EndChild();
     } else {
