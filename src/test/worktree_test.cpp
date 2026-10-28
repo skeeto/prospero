@@ -109,5 +109,52 @@ static void test_worktree(Test *t)
         expect(t, "wtpath", wtpath(a, "/r", "brisk-otter", 0),
                "/r/.prospero/worktrees/brisk-otter");
         expect(t, "wtpath win", wtpath(a, "C:\\r", "x", 1), "C:\\r\\.prospero\\worktrees\\x");
+
+        // A managed worktree of /r, and a directory there git knows not
+        os_mkdirs(os, *a, "/r/.prospero");
+        os_mkdirs(os, *a, "/r/.prospero/worktrees");
+        os_mkdirs(os, *a, "/r/.prospero/worktrees/ok");
+        os_mkdirs(os, *a, "/r/.prospero/worktrees/ok/sub");
+        os_mkdirs(os, *a, "/r/.prospero/worktrees/stray");
+        os_mkdirs(os, *a, "/r/.git/worktrees/ok");
+        os_write(os, *a, "/r/.git/worktrees/ok/commondir", "../..\n");
+        os_write(os, *a, "/r/.prospero/worktrees/ok/.git", "gitdir: /r/.git/worktrees/ok\n");
+        struct { Str path; Str want; } mains[] = {
+            {"/r/.prospero/worktrees/ok/sub/.mcp.json", "/r/sub/.mcp.json"},
+            {"/r/.prospero/worktrees/ok/.mcp.json",     "/r/.mcp.json"},
+            {"/r/.prospero/worktrees/ok",               "/r"},
+            {"/r/.prospero/worktrees/stray/.mcp.json",  "/r/.prospero/worktrees/stray/.mcp.json"},
+            {"/r/.prospero/worktrees/../x/.mcp.json",   "/r/.prospero/worktrees/../x/.mcp.json"},
+            {"/r/sub/.mcp.json",                        "/r/sub/.mcp.json"},
+            {"/w/sub/.mcp.json",                        "/w/sub/.mcp.json"},
+        };
+        for (iz i = 0; i < countof(mains); i++) {
+            expect(t, concat(a, "wtmainof ", mains[i].path),
+                   wtmainof(os, a, mains[i].path, 0), mains[i].want);
+        }
+
+        // A main checkout's session asks before going into its
+        // worktrees, but a grant there holds, as does the worktree's own
+        // session in its tree
+        Guard g = newguard(os, a, "/r", "/home/u", {}, "", 0);
+        guardhole(os, a, &g, "/r/.prospero/worktrees");
+        guardadd(os, a, &g, "/r/.prospero/worktrees/ok/sub", ROOT_HIDDEN|ROOT_MISSING);
+        Guard o = newguard(os, a, "/r/.prospero/worktrees/ok", "/home/u", {}, "", 0);
+        guardhole(os, a, &o, "/r/.prospero/worktrees/ok/.prospero/worktrees");
+        struct { Guard *g; Str path; Str want; } holes[] = {
+            {&g, "src/x.c",                             "/r/src/x.c I"},
+            {&g, ".prospero/worktrees/ok/x.c",          "/r/.prospero/worktrees/ok/x.c O"},
+            {&g, ".prospero/worktrees",                 "/r/.prospero/worktrees O"},
+            {&g, ".prospero/x",                         "/r/.prospero/x I"},
+            {&g, ".prospero/worktrees/ok/sub/x.c",      "/r/.prospero/worktrees/ok/sub/x.c I"},
+            {&o, "x.c",                                 "/r/.prospero/worktrees/ok/x.c I"},
+            {&o, "sub/x.c",                             "/r/.prospero/worktrees/ok/sub/x.c I"},
+            {&o, "/r/src/x.c",                          "/r/src/x.c O"},
+        };
+        for (iz i = 0; i < countof(holes); i++) {
+            GuardPath gp = guardpath(os, a, holes[i].g, holes[i].path, 0);
+            Str got = concat(a, gp.path, gp.inside ? Str(" I") : gp.diverged ? Str(" D") : Str(" O"));
+            expect(t, concat(a, "hole ", holes[i].path), got, holes[i].want);
+        }
     }
 }

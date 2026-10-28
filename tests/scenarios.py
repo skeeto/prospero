@@ -12833,6 +12833,46 @@ def worktree_side(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=40)
+def worktree_hole(t):
+    """A session in the main checkout asks before writing into a worktree
+    session's tree, and the answer holds there, while the worktree
+    session writes in its own tree freely."""
+    env = gitrepo(t)
+    main = os.path.realpath(t.work)
+    h = t.headless(env={k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")})
+    try:
+        parent = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        wtturn(t, h, parent, "the original")
+        r = h.call("fork", sid=parent, side=1, worktree={"name": "hole-one"})
+        sid = r["sid"]
+        path = os.path.join(main, ".prospero", "worktrees", "hole-one")
+        made = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == path, 60)
+        t.check(made.get("did") == "made", f"made: {made}")
+
+        mine = os.path.join(main, "mine.txt")
+        wtturn(t, h, parent, f"write {mine}")
+        t.check(not h.all("ask", parent), f"no ask in its own checkout: {h.all('ask', parent)}")
+        theirs = os.path.join(path, "theirs.txt")
+        h.send("prompt", sid=parent, text=f"write {theirs}")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == parent)
+        t.check(ask.get("tool") == "write" and
+                os.path.realpath(ask.get("path", "")) == os.path.realpath(theirs),
+                f"the ask: {ask}")
+        h.call("answer", sid=parent, req=ask["req"], decision="allow")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == parent and
+               e.get("turn") == 3)
+        t.check(os.path.exists(theirs), "written once allowed")
+
+        h.call("open", sid=sid)
+        wtturn(t, h, sid, f"write {os.path.join(path, 'own.txt')}")
+        t.check(not h.all("ask", sid), f"no ask in its own tree: {h.all('ask', sid)}")
+        t.check(os.path.exists(os.path.join(path, "own.txt")), "written in its own tree")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=60)
 def worktree_remove(t):
     """A worktree goes once every session in it is archived or deleted:

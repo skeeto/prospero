@@ -967,6 +967,16 @@ def sc_memory_machine(model, n, req):
         yield from answer(model, f"Answer number {n}.")
 
 
+def sc_worktree_hole(model, n, req):
+    # "write PATH" writes PATH, else a plain answer
+    said = last_user_text(req) or ""
+    m = re.search(r"write (\S+)$", said)
+    if req["messages"][-1].get("role") == "user" and m:
+        yield from tool(model, n, "write", {"path": m.group(1), "content": "x\n"})
+    else:
+        yield from answer(model, f"Answer number {n}.")
+
+
 def sc_memory_machine_b(model, n, req):
     yield from answer(model, f"B's answer number {n}.")
 

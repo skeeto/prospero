@@ -95,6 +95,21 @@ static void test_instructions(Test *t)
         expect(t, "nested none", istr(a, n.files.len), "0");
         n = instrnested(os, a, "/r/sub", "/r/x.c", names, loaded, "", 0);
         expect(t, "nested outside", istr(a, n.files.len), "0");
+
+        // Not from another session's worktree, but in its own
+        os_mkdirs(os, *a, "/r/.prospero");
+        os_mkdirs(os, *a, "/r/.prospero/worktrees");
+        os_mkdirs(os, *a, "/r/.prospero/worktrees/x");
+        os_write(os, *a, "/r/.prospero/worktrees/x/AGENTS.md", "tree rules\n");
+        os_write(os, *a, "/r/.prospero/worktrees/x/.git", "gitdir: /r/.git/worktrees/x\n");
+        n = instrnested(os, a, "/r", "/r/.prospero/worktrees/x/sub/f.c", names, loaded, "", 0);
+        expect(t, "nested not in a worktree", istr(a, n.files.len), "0");
+        os_mkdirs(os, *a, "/r/.prospero/worktrees/x/sub");
+        os_write(os, *a, "/r/.prospero/worktrees/x/sub/AGENTS.md", "sub tree rules\n");
+        n = instrnested(os, a, "/r/.prospero/worktrees/x", "/r/.prospero/worktrees/x/sub/f.c",
+                        names, {}, "", 0);
+        expect(t, "nested in its own worktree", instrfiles(a, n.files),
+               "/r/.prospero/worktrees/x/sub/AGENTS.md");
     }
 
     // Five hops of imports at most

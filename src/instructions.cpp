@@ -316,8 +316,11 @@ static Instructions instrnested(Os *os, Arena *a, Str cwd, Str path,
                                 Str home, b32 win)
 {
     Instructions r = {};
-    if (!within(cwd, path, win) || path.len==cwd.len) {
-        return r;
+    Str          root  = instrroot(os, a, cwd, win);
+    Str          trees = normpath(a, root, ".prospero/worktrees", win);
+    if (!within(cwd, path, win) || path.len==cwd.len ||
+            (within(trees, path, win) && !within(trees, cwd, win))) {
+        return r;  // nor in other sessions' worktrees (worktree.cpp)
     }
     for (iz i = 0; i < loaded.len; i++) {
         InstrFile f = {};
@@ -333,7 +336,6 @@ static Instructions instrnested(Os *os, Arena *a, Str cwd, Str path,
         if (up == d) break;
         d = up;
     }
-    Str root = instrroot(os, a, cwd, win);
     for (iz i = dirs.len-1; i >= 0; i--) {
         for (iz k = 0; k < names.len; k++) {
             Str file = join(a, dirs[i], names[k]);

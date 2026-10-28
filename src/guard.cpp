@@ -301,8 +301,10 @@ struct GuardRoot {
 // The workspace of one session.
 struct Guard {
     Slice<GuardRoot> roots;
-    Str              cwd;   // normalized
-    Str              home;  // for "~", empty if unknown
+    Slice<GuardRoot> holes;  // carved out of the roots holding them: the
+                             // worktrees of a repository (worktree.cpp)
+    Str              cwd;    // normalized
+    Str              home;   // for "~", empty if unknown
     b32              win;
 };
 
@@ -334,6 +336,30 @@ static void guardadd(Os *os, Arena *perm, Guard *g, Str path, i32 flags)
     if (r.real.data) {
         g->roots = push(perm, g->roots, r);
     }
+}
+
+// A directory carved out of whichever roots hold it, but not out of one
+// inside it (a grant there): its files are asked about as outside.
+static void guardhole(Os *os, Arena *perm, Guard *g, Str path)
+{
+    GuardRoot h = {};
+    h.lex  = normpath(perm, g->cwd, path, g->win);
+    h.real = realpathof(os, perm, h.lex, g->win);
+    h.real = h.real.data ? h.real : h.lex;
+    g->holes = push(perm, g->holes, h);
+}
+
+// Whether a hole takes path out of root t.
+static b32 guardholed(Guard *g, GuardRoot *t, Str real)
+{
+    for (iz i = 0; i < g->holes.len; i++) {
+        GuardRoot *h = &g->holes[i];
+        if (within(t->real, h->real, g->win) && !(t->real == h->real) &&
+                within(h->real, real, g->win)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void guardroot(Os *os, Arena *perm, Guard *g, Str path, b32 read)
@@ -390,12 +416,15 @@ static GuardPath guardpath(Os *os, Arena *a, Guard *g, Str path, b32 read)
     }
 
     r.real = realpathof(os, a, r.path, g->win);
+    b32 holed = 0;
     for (iz i = 0; i<g->roots.len && !r.inside; i++) {
-        GuardRoot *t = &g->roots[i];
-        r.inside = (!t->read || read) && r.real.data &&
-                   within(t->real, r.real, g->win);
+        GuardRoot *t  = &g->roots[i];
+        b32        in = (!t->read || read) && r.real.data && within(t->real, r.real, g->win);
+        b32        cut = in && guardholed(g, t, r.real);
+        holed   |= cut;
+        r.inside = in && !cut;
     }
-    r.diverged = !r.inside;
+    r.diverged = !r.inside && !holed;
     return r;
 }
 

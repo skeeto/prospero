@@ -609,6 +609,8 @@ static McpResult mcpresult(Arena *a, Json *res)
 struct McpDef {
     Str        name;
     Str        file;     // the .mcp.json
+    Str        keyfile;  // its path for approvals: a worktree's, as in
+                         // the main checkout (wtmainof)
     Str        dir;      // its folder
     Slice<Str> argv;     // stdio
     Slice<Str> env;      // NAME=value, for stdio

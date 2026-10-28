@@ -563,6 +563,7 @@ struct Session {
     Str          cwd;
     Slice<Str>   roots;     // extra workspace roots
     WtSess       wt;        // its worktree, if a worktree session's
+    b32          wtfresh;   // its worktree made since its guard was built
     b32          wtdefer;   // its worktree was missing as it opened: its
                             // instructions, memory and prefix wait for it
     Str          scratch;   // its scratch directory, null if none: a
@@ -1954,6 +1955,7 @@ static void wtquit(Engine *);
 static void wtprobe(Engine *, Arena, i64, Json *);
 static b32  wtexists(Engine *, Arena, WtSess *);
 static b32  wtgate(Session *, Arena, b32 turn = 1);
+static Str  wtmainof(Os *, Arena *, Str path, b32 win);
 static Str  wtnew(Session *, Arena, Json *, Str cwd);
 static void wtrecord(Session *, JsonOut *);
 static void wtload(Session *, Json *);
@@ -8766,12 +8768,15 @@ static McpServer *mcpsrvof(Session *s, Str server)
 // allow and deny hold for the session tree as grants ("project:KEY",
 // "project-deny:KEY"), and whose always also holds for later sessions,
 // in <state>/mcp/projects.json, until the definition changes: KEY is the
-// SHA-256 of the file's path, the server's name and its definition.
+// SHA-256 of the file's path, the server's name and its definition. A
+// file in a worktree in .prospero/worktrees is keyed by its path in the
+// main checkout, so approvals hold in both.
 
 static Str mcpprojkey(Arena *a, McpDef *d)
 {
-    Buf b(a, 64 + d->file.len + d->name.len + d->raw.len);
-    print(&b, d->file);
+    Str file = d->keyfile.len ? d->keyfile : d->file;
+    Buf b(a, 64 + file.len + d->name.len + d->raw.len);
+    print(&b, file);
     putbyte(&b, '\n');
     print(&b, d->name);
     putbyte(&b, '\n');
@@ -8917,6 +8922,7 @@ static void mcpprojread(Session *s, Arena scratch)
                 McpDef c = {};
                 c.name = clone(&s->perm, d->name);
                 c.file = clone(&s->perm, d->file);
+                c.keyfile = wtmainof(e->os, &s->perm, c.file, win);
                 c.dir  = clone(&s->perm, d->dir);
                 c.url  = clone(&s->perm, d->url);
                 c.raw  = clone(&s->perm, d->raw);
@@ -11953,6 +11959,11 @@ static Guard sessionguard(Session *s, Arena *perm)
         }
     }
     guardgrants(s, perm, &g);
+    if (!s->nofolder) {
+        // The worktrees of its repository, other sessions' (worktree.cpp)
+        Str root = instrroot(e->os, perm, s->cwd, s->te.windows);
+        guardhole(e->os, perm, &g, join(perm, root, ".prospero/worktrees"));
+    }
     return g;
 }
 

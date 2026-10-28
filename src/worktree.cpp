@@ -520,6 +520,32 @@ static Str wtpath(Arena *a, Str main, Str name, b32 win)
     return concat(a, dir, name);
 }
 
+// A path inside a worktree in MAIN/.prospero/worktrees, as the same path
+// in MAIN, so that what is approved for one checkout of a repository
+// holds for all. Any other path as it is. It is a worktree only if git
+// says it is one of MAIN's.
+static Str wtmainof(Os *os, Arena *a, Str path, b32 win)
+{
+    Str seg = win ? Str("\\.prospero\\worktrees\\") : Str("/.prospero/worktrees/");
+    Str sep = win ? Str("\\") : Str("/");
+    iz  at  = find(path, seg);
+    if (at <= 0) {
+        return path;
+    }
+    Str main = takehead(path, at);
+    Str rest = cuthead(path, at+seg.len);
+    Cut c    = cut(rest, sep[0]);
+    if (!wtname(c.head)) {
+        return path;
+    }
+    Arena t   = *a;
+    Str   top = memmain(os, &t, wtpath(&t, main, c.head, win), win);
+    if (!top.len || (top!=main && os_realpath(os, &t, top)!=os_realpath(os, &t, main))) {
+        return path;
+    }
+    return c.ok ? concat(a, concat(a, main, sep), c.tail) : main;
+}
+
 // Where a worktree session can start from a folder: the repository's
 // main checkout, the folder's place below its own checkout's root, and
 // the commit and branch the new branch would be cut from. Else why not.
@@ -1102,11 +1128,15 @@ static void wtrestamp(Session *s, Arena scratch)
 // its instructions, memory and prefix.
 static void wtready(Session *s, Arena scratch)
 {
-    Engine *e = s->e;
-    if (!s->readonly && os_stat(e->os, scratch, s->cwd).type==STAT_MISSING) {
+    Engine *e    = s->e;
+    b32     made = !s->readonly && os_stat(e->os, scratch, s->cwd).type==STAT_MISSING;
+    if (made) {
         os_mkdirs(e->os, scratch, s->cwd);
     }
-    s->guard = sessionguard(s, &s->perm);
+    if (made || s->wtdefer || s->wtfresh) {
+        s->guard   = sessionguard(s, &s->perm);  // its roots' real paths, now there
+        s->wtfresh = 0;
+    }
     wtrestamp(s, scratch);
     if (!s->wtdefer) {
         return;
@@ -1202,7 +1232,9 @@ static void wtmade(Engine *e, Arena scratch, Str sid, Str path, b32 ok, Str err)
         Arena a = scratch;
         if (s->wt.path != path) {
             continue;
-        } else if (s->state != S_WORKTREE) {
+        }
+        s->wtfresh |= ok;  // its guard, built while it was missing
+        if (s->state != S_WORKTREE) {
             if (ok && s->wtdefer) {
                 wtready(s, a);
             }
