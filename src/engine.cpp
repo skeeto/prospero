@@ -11939,10 +11939,18 @@ static i32 shellkindof(Str path, b32 win)
 // What a POSIX sh on Windows is, by the files beside it: busybox-w32
 // (w64devkit's sh.exe), MSYS2 (Git Bash's bin/bash.exe starts the one in
 // usr/bin), or Cygwin. Only its description differs.
+static b32 onmacos(Os *os, Arena scratch, b32 win)
+{
+    Str plist = "/System/Library/CoreServices/SystemVersion.plist";
+    return !win && os_stat(os, scratch, plist).type==STAT_FILE;
+}
+
 static i32 shellflavor(Os *os, Arena scratch, Str path, i32 kind, b32 win)
 {
     if (kind == SHELL_BUSYBOX) {
         return FLAVOR_BUSYBOX;
+    } else if (!win && kind==SHELL_SH && path=="/bin/bash" && onmacos(os, scratch, win)) {
+        return FLAVOR_BASH3;
     } else if (!win || kind!=SHELL_SH) {
         return FLAVOR_NONE;
     }
@@ -11977,7 +11985,8 @@ static Shell shellat(Os *os, Arena scratch, Str path, i32 kind, b32 win)
 // powershell, cmd, or an executable, by its path or by its name on
 // path, the PATH that programs are found by. A POSIX sh comes first, as
 // the one models know best: elsewhere than Windows bash on path, which
-// they expect most, then /bin/sh, even where that is bash; on Windows
+// they expect most (on macOS a newer one, Homebrew's or MacPorts', ahead
+// of its own bash 3.2), then /bin/sh, even where that is bash; on Windows
 // sh.exe or busybox.exe next to the executable, then on path. Then
 // PowerShell 7 (pwsh on path), Windows PowerShell, and last cmd.exe. A
 // choice not found is as auto.
@@ -12005,6 +12014,14 @@ static Shell findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
     if (!wantps && !wantcmd) {
         if (!win && pref!="sh") {
             Str bash = findpath(os, perm, scratch, path, "bash", win);
+            Str newer[] = {"/opt/homebrew/bin/bash", "/usr/local/bin/bash",
+                           "/opt/local/bin/bash"};
+            for (iz i = 0; bash=="/bin/bash" && i<countof(newer); i++) {
+                if (os_stat(os, scratch, newer[i]).type==STAT_FILE &&
+                        onmacos(os, scratch, win)) {
+                    bash = newer[i];
+                }
+            }
             if (bash.len) {
                 return shellat(os, scratch, bash, SHELL_SH, win);
             }

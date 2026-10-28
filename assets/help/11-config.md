@@ -93,6 +93,8 @@ cannot choose what runs, so these are ignored in one:
 
 - **[`[tools] shell`](settings:tools#shell)**: the agent's shell for new sessions: `auto` (on
   Linux and macOS `bash` on PATH, which models expect, else `/bin/sh`;
+  on macOS a Homebrew or MacPorts bash ahead of the system's own bash
+  3.2, whose limits the agent is told;
   on Windows, `sh.exe` or `busybox.exe` next to Prospero or on PATH,
   else PowerShell, then `cmd`), `sh` (`/bin/sh`, even where that is
   bash), `bash` (not a keyword on Windows, where it is a program),

@@ -625,6 +625,9 @@ static void test_tools(Test *t)
             {"C:\\msys64\\usr\\bin\\bash.exe", FLAVOR_MSYS,    "an MSYS2 shell", "do not exist"},
             {"C:\\msys64\\usr\\bin\\bash.exe", FLAVOR_MSYS,    "cygpath -m prints", "/cygdrive/c/x"},
             {"C:\\cygwin64\\bin\\bash.exe",    FLAVOR_CYGWIN,  "drives as /cygdrive/c/x", "MSYS2"},
+            {"/bin/bash",                      FLAVOR_BASH3,   "/bin/bash -c, macOS's own bash, version 3.2", "POSIX shell"},
+            {"/bin/bash",                      FLAVOR_BASH3,   "no associative arrays (declare -A), mapfile", "cygpath"},
+            {"/opt/homebrew/bin/bash",         FLAVOR_NONE,    "/opt/homebrew/bin/bash -c. Each", "3.2"},
         };
         for (iz i = 0; i < countof(sh); i++) {
             te.shell        = {};

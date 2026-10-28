@@ -129,13 +129,14 @@ enum : i32 {
 };
 static Str const shellkinds[] = {"sh", "busybox", "cmd", "pwsh", "powershell", "wsl"};
 
-// What a POSIX sh on Windows is, as the files beside it tell: only its
-// description differs.
+// What a POSIX sh is, as the files beside it tell: only its description
+// differs.
 enum : i32 {
     FLAVOR_NONE,
     FLAVOR_BUSYBOX,  // busybox-w32's ash: w64devkit's sh.exe, or busybox.exe
     FLAVOR_MSYS,     // MSYS2's, Git Bash's among them: drives as /c/x
     FLAVOR_CYGWIN,   // Cygwin's: drives as /cygdrive/c/x
+    FLAVOR_BASH3,    // macOS's /bin/bash, bash 3.2 for good (GPLv2)
 };
 
 // A shell the agent's commands run in.
@@ -327,6 +328,11 @@ static void shellintro(Buf *b, Shell *sh)
                      "Give the file tools Windows paths: C:/x for "
                      "/cygdrive/c/x, and for its own paths, like /tmp or ~, "
                      "what cygpath -m prints.");
+            break;
+        case FLAVOR_BASH3:
+            print(b, ", macOS's own bash, version 3.2, which lacks what bash 4 "
+                     "added: no associative arrays (declare -A), mapfile or "
+                     "readarray, ${v,,} or ${v^^}, |& or &>>, or ** globs.");
             break;
         default:
             if (equalfold(basename(sh->path), "sh") ||

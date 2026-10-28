@@ -2014,6 +2014,27 @@ static void testcfgpath(Test *t)
         expect(t, "findshell.cmd", istr(&a, sh.kind*10 + sh.fallback), istr(&a, SHELL_CMD*10));
         sh = findshell(v.os, &a, v.scratch, "/exe", "C:/nowhere", 1, "auto");
         expect(t, "findshell.cmd.fallback", istr(&a, sh.kind*10 + sh.fallback), istr(&a, SHELL_CMD*10 + 1));
+
+        // macOS's /bin/bash is bash 3.2, said so, and a newer one goes
+        // ahead of it: only on macOS, as its SystemVersion.plist tells
+        Str plist = "/System/Library/CoreServices/SystemVersion.plist";
+        os_write(v.os, a, "/bin/bash", "\x7f" "ELF");
+        sh = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin:/bin", 0, "auto");
+        expect(t, "findshell.bash.linux", concat(&a, sh.path, istr(&a, sh.flavor)),
+               concat(&a, "/bin/bash", istr(&a, FLAVOR_NONE)));
+        os_write(v.os, a, plist, "<plist/>");
+        sh = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin:/bin", 0, "auto");
+        expect(t, "findshell.bash.macos", concat(&a, sh.path, istr(&a, sh.flavor)),
+               concat(&a, "/bin/bash", istr(&a, FLAVOR_BASH3)));
+        os_write(v.os, a, "/opt/homebrew/bin/bash", "\xcf\xfa\xed\xfe");
+        sh = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin:/bin", 0, "bash");
+        expect(t, "findshell.bash.newer", concat(&a, sh.path, istr(&a, sh.flavor)),
+               concat(&a, "/opt/homebrew/bin/bash", istr(&a, FLAVOR_NONE)));
+        sh = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin:/bin", 0, "sh");
+        expect(t, "findshell.bash.sh", sh.path, "/bin/sh");
+        os_remove(v.os, a, "/opt/homebrew/bin/bash");
+        os_remove(v.os, a, plist);
+        os_remove(v.os, a, "/bin/bash");
     }
 
     // Shells by name: [shell] sections of the user's own file only, a
