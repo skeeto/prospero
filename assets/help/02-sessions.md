@@ -234,11 +234,11 @@ the main checkout.
 
 ## Undo and rewind
 
-A tool row that changed a file has an Undo button, which puts back the
-file as it was before that call, and every file changed after it. A
-message that began a turn has Rewind to here, which puts back every
-file the agent's file tools wrote or edited from that turn on. Both
-ask first. Files that commands changed are not tracked, and cannot be
+A tool row that changed a file has an Undo button (a curved arrow) at
+its right, which puts back the file as it was before that call, and
+every file changed after it. A message that began a turn has Rewind to
+here (a clock), which puts back every file the agent's file tools
+wrote or edited from that turn on. Both ask first. Files that commands changed are not tracked, and cannot be
 put back this way.
 
 ## Import

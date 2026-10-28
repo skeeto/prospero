@@ -78,7 +78,7 @@ static void test_fonts(Test *t)
         }
     }
     expect(t, "fonts.invisible.drawn", istr(&a, drawn), "0");
-    expect(t, "fonts.icons.count", istr(&a, icons), "16");
+    expect(t, "fonts.icons.count", istr(&a, icons), "21");
 
     // Emoji: those models write in Twemoji's subset, and what a font
     // ahead of it has left out of it, to stay text

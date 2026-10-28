@@ -63,6 +63,11 @@ static Str fontemoji()   { return {(u8 *)emojittf, countof(emojittf)}; }
 
 // The icons buttons show, by their Codicons names
 #define ICON_ADD        "\xee\xa9\xa0"  // U+EA60
+#define ICON_TRASH      "\xee\xaa\x81"  // U+EA81
+#define ICON_HISTORY    "\xee\xaa\x82"  // U+EA82
+#define ICON_CHECK      "\xee\xaa\xb2"  // U+EAB2
+#define ICON_DISCARD    "\xee\xab\xa2"  // U+EAE2
+#define ICON_EXTERNAL   "\xee\xac\x94"  // U+EB14, link-external
 #define ICON_LIGHTBULB  "\xee\xa9\xa1"  // U+EA61
 #define ICON_INFO       "\xee\xa9\xb4"  // U+EA74
 #define ICON_CLOSE      "\xee\xa9\xb6"  // U+EA76
@@ -81,7 +86,7 @@ static Str fontemoji()   { return {(u8 *)emojittf, countof(emojittf)}; }
 
 // Their characters, for the unit tests
 static Str fonticonsused =
-    ICON_ADD ICON_LIGHTBULB ICON_INFO ICON_CLOSE ICON_FILE ICON_REPLY
+    ICON_ADD ICON_TRASH ICON_HISTORY ICON_CHECK ICON_DISCARD ICON_EXTERNAL ICON_LIGHTBULB ICON_INFO ICON_CLOSE ICON_FILE ICON_REPLY
     ICON_TERMINAL ICON_DISCONNECT ICON_STOP ICON_FOLDER ICON_PLUG
     ICON_REFRESH ICON_TOOLS ICON_COPY ICON_SEND ICON_ATTACH;
 

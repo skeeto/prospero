@@ -59,7 +59,7 @@ The transcript, the Plan pane and these Help pages select alike:
   the selection in the side chat's box).
 
 A code block's Copy button, at its corner while the mouse is over it,
-copies its code exactly. A click on a tool row's or reasoning's header
+copies its code exactly, and shows a check mark for a moment. A click on a tool row's or reasoning's header
 opens or folds it.
 
 ## Finding

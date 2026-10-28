@@ -1461,6 +1461,27 @@ enum : i32 {
     ACT_BACKGROUND, // move a running command or subagent to the background
 };
 
+// An icon button's width: the same for every icon, which all share
+// one advance.
+static f32 iconw()
+{
+    return ImGui::CalcTextSize(ICON_ADD).x + 2*ImGui::GetStyle().FramePadding.x;
+}
+
+// A button that shows an icon, as tall as a combo or a text field beside
+// it, so that the icon has room above and below; highlighted while on.
+static b32 iconbutton(char const *label, b32 on = 0)
+{
+    if (on) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+    }
+    b32 r = ImGui::Button(label, v2(iconw(), 0));
+    if (on) {
+        ImGui::PopStyleColor();
+    }
+    return r;
+}
+
 struct MsgAction {
     i32         kind;
     char const *label;
@@ -1469,6 +1490,7 @@ struct MsgAction {
     GuiSession *child;
     f32         bgw;    // a running task's Run in background too, to the
                         // left of its Open subagent: its width, else 0
+    b32         icon;   // label is an icon (Undo, Output, Rewind)
 };
 
 static char const bglabel[] = "Run in background";
@@ -1502,18 +1524,21 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
         ViewSnap *sn = rowsnap(v, t);
         if (sn && !sn->undone && canrewind(g, s)) {
             r.kind  = ACT_UNDO;
-            r.label = "Undo";
+            r.label = ICON_DISCARD "###undo";
+            r.icon  = 1;
         } else if (s && t->spill.len && t->status>=VTOOL_OK && hostlive(g, s)) {
             r.kind  = ACT_OUTPUT;
-            r.label = "Output";
+            r.label = ICON_EXTERNAL "###output";
+            r.icon  = 1;
         }
     } else if (m->startsturn && canrewind(g, s) && turnrewinds(v, m->startsturn)) {
         r.kind  = ACT_REWIND;
-        r.label = "Rewind to here";
+        r.label = ICON_HISTORY "###rewind";
+        r.icon  = 1;
     }
     f32 pad = 2*ImGui::GetStyle().FramePadding.x;
     if (r.kind) {
-        r.w = ImGui::CalcTextSize(r.label).x + pad;
+        r.w = r.icon ? iconw() : ImGui::CalcTextSize(r.label, 0, 1).x + pad;
     }
     if (m->role==VIEW_TOOL && s==g->sess && bgrow(t) && canbackground(s)) {
         f32 w = ImGui::CalcTextSize(bglabel).x + pad;
@@ -1549,7 +1574,11 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
 {
     ViewTool *t = m->tool;
     g->kidlinkshown |= act->amber;
-    b32 go = ImGui::SmallButton(act->label);
+    // A header line tall, as a small button, but as wide as act says
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        v2(ImGui::GetStyle().FramePadding.x, 0));
+    b32 go = ImGui::Button(act->label, v2(act->w, 0));
+    ImGui::PopStyleVar();
     switch (act->kind) {
     case ACT_OPEN:
         if (t && t->name=="task") {
@@ -1569,14 +1598,14 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
         break;
     case ACT_UNDO:
         itemrect(g, RECT_UNDO);
-        ImGui::SetItemTooltip("Put back the file as it was before this call, and "
-                              "every file changed after it");
+        ImGui::SetItemTooltip("Undo: put back the file as it was before this call, "
+                              "and every file changed after it");
         if (go) askrewind(g, s, t->call, 0, 0);
         break;
     case ACT_REWIND:
         itemrect(g, RECT_REWINDTURN);
-        ImGui::SetItemTooltip("Put back every file write and edit changed from "
-                              "this turn on");
+        ImGui::SetItemTooltip("Rewind to here: put back every file write and edit "
+                              "changed from this turn on");
         if (go) askrewind(g, s, {}, m->startsturn, 0);
         break;
     case ACT_OUTPUT: {
@@ -1585,7 +1614,7 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
         Arena a = g->frame;
         Str   d = s->view ? s->view->dir : Str{};
         Str   p = d.len ? join(&a, d, t->spill) : t->spill;
-        ImGui::SetItemTooltip("Show the whole output, from its host:\n%s (%s)",
+        ImGui::SetItemTooltip("Output: show all of it, from its host:\n%s (%s)",
                               cstr0(&a, p), cstr0(&a, bytesize(&a, t->bytes)));
         if (go) showfile(g, s, t->spill);
     } break;
@@ -2233,7 +2262,7 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         Str why = termplan(g, &a, s).why;
         ImGui::SameLine();
         ImGui::BeginDisabled(why.len);
-        if (ImGui::SmallButton(ICON_TERMINAL "##terminal")) {
+        if (iconbutton(ICON_TERMINAL "##terminal")) {
             termopen(g, a, s);
         }
         ImGui::EndDisabled();
@@ -2292,7 +2321,7 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         ImGui::TextDisabled("Not loaded: %s", cstr0(&a, showpath(v, v->skipped[i])));
     }
     if (v->instrtext.len) {
-        if (ImGui::SmallButton(ICON_COPY "##instrcopy")) {
+        if (iconbutton(ICON_COPY "##instrcopy")) {
             ImGui::SetClipboardText(cstr0(&a, v->instrtext));
         }
         itemnamed(g, "instructions copy");
@@ -2337,7 +2366,7 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
                          ": only a file on this computer shows in its file manager"))
                 : !v->mems.len ? Str("Nothing is saved yet") : Str{};
         ImGui::BeginDisabled(why.len != 0);
-        if (ImGui::SmallButton(ICON_FOLDER "##memreveal")) {
+        if (iconbutton(ICON_FOLDER "##memreveal")) {
             guishow(g, join(&a, v->memdir, "MEMORY.md"));
         }
         ImGui::EndDisabled();
@@ -2434,18 +2463,6 @@ static void drawgauge(Gui *g, View *v, f32 w)
 }
 
 // A toggle button, highlighted while on.
-static b32 togglebutton(char const *label, b32 on)
-{
-    if (on) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-    }
-    b32 r = ImGui::SmallButton(label);
-    if (on) {
-        ImGui::PopStyleColor();
-    }
-    return r;
-}
-
 // A shortcut's name: Cmd on macOS, Ctrl elsewhere.
 static char const *shortcutname(Gui *g, i32 which)
 {
@@ -2760,9 +2777,9 @@ static void drawsessbar(Gui *g)
     f32         gw    = gaugewidth(g, v);
     char const *tl    = ICON_TOOLS;      // Tool output
     char const *rl    = ICON_LIGHTBULB;  // Reasoning
-    f32         infow = ImGui::CalcTextSize(ICON_INFO).x + 2*st.FramePadding.x;
-    f32         tw    = ImGui::CalcTextSize(tl).x + 2*st.FramePadding.x;
-    f32         rw    = ImGui::CalcTextSize(rl).x + 2*st.FramePadding.x;
+    f32         infow = iconw();
+    f32         tw    = iconw();
+    f32         rw    = iconw();
     f32         rest  = (gw>0 ? gw + gap : 0) + tw + gap + rw + gap + infow;
     f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rest;
     if (v->parent.len && v->remote && !sessup(g, s)) {
@@ -2848,21 +2865,21 @@ static void drawsessbar(Gui *g)
         drawgauge(g, v, gw);
         ImGui::SameLine();
     }
-    if (togglebutton(tl, v->showtools)) {
+    if (iconbutton(tl, v->showtools)) {
         setsessiontools(g, s, !v->showtools);
     }
     itemrect(g, RECT_TOOLSBTN);
     ImGui::SetItemTooltip("Tool output: open every tool row's output in this session, "
                           "or fold them again as the settings say (%s)", shortcutname(g, 0));
     ImGui::SameLine();
-    if (togglebutton(rl, v->showthink)) {
+    if (iconbutton(rl, v->showthink)) {
         setsessionthink(g, s, !v->showthink);
     }
     itemrect(g, RECT_THINKBTN);
     ImGui::SetItemTooltip("Reasoning: show all of it in this session, even hidden, or "
                           "fold it again as the settings say (%s)", shortcutname(g, 1));
     ImGui::SameLine();
-    if (ImGui::SmallButton(ICON_INFO)) {
+    if (iconbutton(ICON_INFO)) {
         ImGui::OpenPopup("##sessinfo");
     }
     itemrect(g, RECT_INFOBTN);
@@ -2948,9 +2965,9 @@ static Marks msgmarks(Gui *g, View *v, i32 msg)
 
 // A code block's Copy button, at its top right while the mouse is over
 // the block, which it overlaps as the headers' toggles overlap the text:
-// the code byte for byte, as selecting the block whole copies it. It says
-// "Copied" for a moment after, until a deadline. With aim, the one the
-// checklist chose is where it can find it.
+// the code byte for byte, as selecting the block whole copies it. It
+// shows a check mark for a moment after, until a deadline. With aim, the
+// one the checklist chose is where it can find it.
 static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f32 top,
                          b32 dragging, b32 aim)
 {
@@ -2983,12 +3000,11 @@ static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f3
     if (copied) {
         schedat(&g->sched, until + 1000, DUE_APP);
     }
-    // As wide as its longer label, so that it stays under the mouse, and
-    // one ID for both, so that what the mouse is over stays the same and
-    // no hover delays start again with the change
-    char const *label = copied ? "Copied###copy" : "Copy###copy";
+    // One ID for both icons, so that what the mouse is over stays the same
+    // and no hover delays start again with the change
+    char const *label = copied ? ICON_CHECK "###copy" : ICON_COPY "###copy";
     ImGuiStyle &st    = ImGui::GetStyle();
-    f32         bw    = ImGui::CalcTextSize("Copied", 0, 1).x + 2*st.FramePadding.x;
+    f32         bw    = iconw();
     f32         by    = (a.y>top ? a.y : top) + 4*sc;
     ImGui::SetCursorScreenPos(v2(z.x - bw - 4*sc, by));
     ImGui::PushID(pl->block);
@@ -2996,6 +3012,7 @@ static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f3
     b32 go = ImGui::Button(label, v2(bw, 0));
     ImGui::PopStyleVar();
     ImGui::PopID();
+    ImGui::SetItemTooltip("Copy the code");
     if (aimed) {
         itemrect(g, RECT_CODECOPY);
     }
@@ -3472,7 +3489,7 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
     ImGui::SameLine();
-    b32 close = ImGui::SmallButton(ICON_CLOSE "##findclose");
+    b32 close = iconbutton(ICON_CLOSE "##findclose");
     itemnamed(g, "find close");
     ImGui::SetItemTooltip("Close the find bar (Esc)");
     if (esc || close) {
@@ -4976,11 +4993,9 @@ static void drawprompt(Gui *g)
         itemnamed(g, "attach");
         whytip(why.len ? why :
                hostcap(s->host, "files")
-               ? Str("Attach a file to the next message: a text file, which the agent "
-                     "gets as its read tool shows it, or an image (PNG, JPEG, GIF, WebP or "
-                     "BMP). Or drop one on the window, or paste one.")
-               : Str("Attach an image, PNG, JPEG, GIF, WebP or BMP, to the next message: "
-                     "or drop one on the window, or paste one"));
+               ? Str("Attach a text file or an image (PNG, JPEG, GIF, WebP, BMP) "
+                     "to the next message")
+               : Str("Attach an image (PNG, JPEG, GIF, WebP, BMP) to the next message"));
     }
     if (s->hist) {
         // Which of the session's messages the box holds: oldest is 1
@@ -5963,9 +5978,9 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     char const *cbtn    = live ? ICON_DISCONNECT : ICON_PLUG;  // Disconnect, Connect
     f32         bw      = 0;
     if (r->kind == SROW_HOST) {
-        bw += ImGui::CalcTextSize(ICON_ADD).x + 2*st.FramePadding.x + st.ItemSpacing.x;
+        bw += iconw() + st.ItemSpacing.x;
         if (remote1) {
-            bw += ImGui::CalcTextSize(cbtn).x + 2*st.FramePadding.x + st.ItemSpacing.x;
+            bw += iconw() + st.ItemSpacing.x;
         }
     }
 
@@ -6040,7 +6055,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         f32 y = p.y + (lineh + 4*sc - ImGui::GetFrameHeight())/2;
         ImGui::SetCursorScreenPos(v2(p.x + w - bw + st.ItemSpacing.x, y));
         ImGui::BeginDisabled(!h || !hostready(g, h));
-        if (ImGui::SmallButton(ICON_ADD)) {
+        if (iconbutton(ICON_ADD)) {
             g->newhost = h;
             newsession(g);
         }
@@ -6051,7 +6066,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
             ImGui::SameLine();
             b32 closing = h && h->r && h->closing;
             ImGui::BeginDisabled(closing && h->reconnect);
-            b32 b = ImGui::SmallButton(cbtn);
+            b32 b = iconbutton(cbtn);
             ImGui::EndDisabled();
             itemnamed(g, concat(&a, "connect ", r->key));
             ImGui::SetItemTooltip("%s", live ? "Disconnect: leave it, its sessions running "
@@ -6227,7 +6242,7 @@ static void drawsessions(Gui *g)
         ImGui::MarkIniSettingsDirty();
     }
     ImGui::BeginDisabled(!cannew(g));
-    if (ImGui::SmallButton(ICON_ADD)) {
+    if (iconbutton(ICON_ADD)) {
         g->newhost = 0;  // the default host
         newsession(g);
     }
@@ -6236,7 +6251,7 @@ static void drawsessions(Gui *g)
     whytip(cannew(g) ? Str("A new session, on this computer") : Str{});
     if (g->enginekind != ENGINE_FAKE) {
         ImGui::SameLine();
-        if (ImGui::SmallButton(ICON_REFRESH "##refresh")) {
+        if (iconbutton(ICON_REFRESH "##refresh")) {
             guilistall(g);
         }
         itemnamed(g, "sessions refresh");
@@ -6633,7 +6648,7 @@ static void drawplan(Gui *g)
                          ": only a file on this computer shows in its file manager"))
                 : Str{};
         ImGui::BeginDisabled(why.len != 0);
-        if (ImGui::Button(ICON_FOLDER "##planreveal")) {
+        if (iconbutton(ICON_FOLDER "##planreveal")) {
             guishow(g, v->planpath);
         }
         ImGui::EndDisabled();
@@ -6770,7 +6785,7 @@ static void drawchanges(Gui *g)
 
     // The branch, its operation and upstream, then Refresh at the right
     ImGuiStyle &st = ImGui::GetStyle();
-    f32         bw = ImGui::CalcTextSize(ICON_REFRESH).x + 2*st.FramePadding.x;
+    f32         bw = iconw();
     f32         rx = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw;
     Str         name = c->branch.len ? c->branch : w->branch;
     if (!c->branch.len && w->detached) {
@@ -6829,7 +6844,7 @@ static void drawchanges(Gui *g)
     }
     b32 busy = c->id && c->id==w->id;
     ImGui::BeginDisabled(busy);
-    if (ImGui::Button(ICON_REFRESH "##refresh")) {
+    if (iconbutton(ICON_REFRESH "##refresh")) {
         w->statusat = 0;
         gitstale(g, s);
     }
@@ -8290,7 +8305,7 @@ static void drawhosts(Gui *g)
         ImGui::TextDisabled("No engine: the fake agent has no hosts.");
         return;
     }
-    if (ImGui::SmallButton(ICON_REFRESH "##lookagain")) {
+    if (iconbutton(ICON_REFRESH "##lookagain")) {
         findhosts(g, a);
         findwsl(g);
         guiconfigget(g);
@@ -9239,8 +9254,7 @@ static void drawcfgpage(Gui *g)
             CfgHead *h = &g->cfgheads[i];
             other |= h->kind==kind && h->name==name && !h->own;
         }
-        Str      label = "Delete...";
-        f32      bw    = ImGui::CalcTextSize(label.cdata).x + 2*st.FramePadding.x;
+        f32      bw    = iconw();
         f32      avail = ImGui::GetContentRegionAvail().x;
         f32      tw    = ImGui::CalcTextSize(title.cdata, title.cdata+title.len).x;
         ImGui::AlignTextToFramePadding();
@@ -9266,14 +9280,14 @@ static void drawcfgpage(Gui *g)
             print(&why, "The engine is too old to delete a section");
         }
         ImGui::BeginDisabled(why.len > 0);
-        b32 del = ImGui::Button(label.cdata);
+        b32 del = iconbutton(ICON_TRASH "##delete");
         ImGui::EndDisabled();
         itemrect(g, RECT_DELETE);
         if (why.len) {
             ImGui::SetItemTooltip("%s", cstr0(&a, finish(&why)));
         } else {
             Buf tb(&a, 256);
-            print(&tb, "Delete ");
+            print(&tb, "Delete...: remove ");
             print(&tb, title);
             print(&tb, " from ");
             print(&tb, basename(own->file));
@@ -9469,7 +9483,7 @@ static void cfgeditbutton(Gui *g, Arena a, Str path, b32 exists)
                    ImGui::CalcTextSize("Cancel").x + 2*st.FramePadding.x);
         ImGui::TextDisabled("%s", what);
         ImGui::SameLine();
-        if (ImGui::SmallButton("Cancel##cfgedit")) {
+        if (ImGui::Button("Cancel##cfgedit")) {
             editcancel(g);
         }
         itemnamed(g, "cancel config editor");
@@ -9480,7 +9494,7 @@ static void cfgeditbutton(Gui *g, Arena a, Str path, b32 exists)
     Str         why   = cfgeditwhy(g, path, exists, &a);
     samelineif(ImGui::CalcTextSize(label).x + 2*st.FramePadding.x);
     ImGui::BeginDisabled(why.len != 0);
-    if (ImGui::SmallButton(label)) {
+    if (ImGui::Button(label)) {
         cfgedit(g, a, path, exists);
     }
     ImGui::EndDisabled();
@@ -9514,7 +9528,7 @@ static void drawsettings(Gui *g)
     ImGui::PushTextWrapPos(0);
     ImGui::TextDisabled("Edits go to %s", path.len ? cstr0(&a, path) : "(no file)");
     ImGui::PopTextWrapPos();
-    if (ImGui::SmallButton(ICON_REFRESH "##reload")) {
+    if (iconbutton(ICON_REFRESH "##reload")) {
         guiconfigget(g);
     }
     itemnamed(g, "settings reload");
@@ -9526,7 +9540,7 @@ static void drawsettings(Gui *g)
         char const *label = g->cfgrefresh ? "Fetching..." : "Refresh includes";
         samelineif(ImGui::CalcTextSize(label).x + 2*ImGui::GetStyle().FramePadding.x);
         ImGui::BeginDisabled(g->cfgrefresh != 0);
-        b32 refresh = ImGui::SmallButton(label);
+        b32 refresh = ImGui::Button(label);
         itemrect(g, RECT_REFRESHINC);
         ImGui::EndDisabled();
         ImGui::SetItemTooltip("Fetch the %d URL include%s again, rather than wait for the "
@@ -9546,7 +9560,7 @@ static void drawsettings(Gui *g)
         samelineif(ImGui::CalcTextSize(label.cdata, label.cdata+label.len).x +
                    2*ImGui::GetStyle().FramePadding.x);
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
-        if (ImGui::SmallButton(cstr0(&a, label))) {
+        if (ImGui::Button(cstr0(&a, label))) {
             g->cfgdiag = 1;
         }
         ImGui::PopStyleColor();
