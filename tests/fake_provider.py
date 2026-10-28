@@ -2678,6 +2678,8 @@ static int greet(char const *name)
 
 > ⚠️ Edits outside the workspace ask first.
 
+Status: ✅ built, ❌ one test, 🚀 shipped, 🐛 fixed, ✔ checked, ★ starred, **bold ✅🎉**, *slanted 🔥💡*, `code ✅🧪`.
+
 """
 
 GUI_FAILED = set()  # (model, messages so far): turns that failed once

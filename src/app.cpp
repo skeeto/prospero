@@ -17551,6 +17551,21 @@ static void addicons(i32 flags)
     ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void *)data.data, (i32)data.len, 13, &cfg);
 }
 
+// Emoji (fonts.cpp), in color, last, so that what a font ahead has stays
+// text. Neither bold nor oblique: a synthetic slant or weight smears
+// the layers.
+static void addemoji(i32 flags)
+{
+    ImFontConfig cfg;
+    cfg.FontDataOwnedByAtlas = 0;
+    cfg.FontLoaderFlags      = ((u32)flags & ~(u32)(ImGuiFreeTypeLoaderFlags_Oblique |
+                                                    ImGuiFreeTypeLoaderFlags_Bold)) |
+                               ImGuiFreeTypeLoaderFlags_LoadColor;
+    cfg.MergeMode            = 1;
+    Str data = fontemoji();
+    ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void *)data.data, (i32)data.len, 15, &cfg);
+}
+
 static ImFont *addface(Str data, i32 flags)
 {
     ImFont *f = addfont(data, flags, 0);
@@ -17560,6 +17575,7 @@ static ImFont *addface(Str data, i32 flags)
     addfont(fontsymbols(), flags, 1);
     addfont(fontmath(), flags, 1);
     addicons(flags);
+    addemoji(flags);
     for (auto r : fontinvisible) {
         for (i32 cp = r[0]; cp <= r[1]; cp++) {
             f->AddRemapCodepoint((ImWchar)cp, 0xfeff);

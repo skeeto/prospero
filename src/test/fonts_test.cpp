@@ -79,4 +79,27 @@ static void test_fonts(Test *t)
     }
     expect(t, "fonts.invisible.drawn", istr(&a, drawn), "0");
     expect(t, "fonts.icons.count", istr(&a, icons), "16");
+
+    // Emoji: those models write in Twemoji's subset, and what a font
+    // ahead of it has left out of it, to stay text
+    Buf noemoji(&a, 256);
+    i32 emoji = 0;
+    for (iz i = 0; i < fontemojiused.len;) {
+        i32 cp = utf8decode(fontemojiused, &i);
+        if (cp == ' ') {
+            continue;
+        }
+        emoji++;
+        if (!fontcovers(fontemoji(), cp)) {
+            print(&noemoji, "U+");
+            printhex(&noemoji, (u64)cp, 4);
+            putbyte(&noemoji, ' ');
+        }
+    }
+    expect(t, "fonts.emoji.missing", finish(&noemoji), "");
+    expect(t, "fonts.emoji.count", istr(&a, emoji > 50), "1");
+    expect(t, "fonts.emoji.text", istr(&a, fontcovers(fontemoji(), 0x2714) ||
+                                           fontcovers(fontemoji(), 0x26a0) ||
+                                           fontcovers(fontemoji(), 0x2605)), "0");
+    expect(t, "fonts.emoji.prose", istr(&a, fontprose(0x2705) && fontprose(0x1f680)), "1");
 }

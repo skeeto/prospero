@@ -12,10 +12,17 @@
 // use range alone (U+EA60-F102), so it shadows nothing; ICON_* name the
 // ones used, as UTF-8.
 //
+// Emoji are a subset of Twemoji (Mozilla's COLRv0 build: layers of
+// outlines, colored from a palette, which FreeType draws with the
+// loader's LoadColor), merged last, so a symbol any font ahead of it has
+// (✔ ★ ⚠) stays text, as in a terminal; tools/symbols.py leaves those
+// out of it, and the sequences (flags, skin tones, joined families),
+// which ImGui, without shaping, cannot form.
+//
 // fontcovers reads a TrueType file's character map (cmap formats 4 and
 // 12), so that the unit tests can check the fonts against the symbols
-// models commonly write (fontsymbolsused) without ImGui or FreeType. Emoji
-// are not among them: they need color glyphs, out of scope.
+// models commonly write (fontsymbolsused) without ImGui or FreeType, and
+// the emoji they do (fontemojiused).
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -38,6 +45,9 @@ static u8 const mathttf[] = {
 static u8 const codiconttf[] = {
     #embed "../assets/codicon.ttf"
 };
+static u8 const emojittf[] = {
+    #embed "../assets/TwemojiMozilla-subset.ttf"
+};
 #ifdef __clang__
 #  pragma clang diagnostic pop
 #endif
@@ -49,6 +59,7 @@ static Str fontmono()    { return {(u8 *)monottf, countof(monottf)}; }
 static Str fontsymbols() { return {(u8 *)symbolsttf, countof(symbolsttf)}; }
 static Str fontmath()    { return {(u8 *)mathttf, countof(mathttf)}; }
 static Str fonticons()   { return {(u8 *)codiconttf, countof(codiconttf)}; }
+static Str fontemoji()   { return {(u8 *)emojittf, countof(emojittf)}; }
 
 // The icons buttons show, by their Codicons names
 #define ICON_ADD        "\xee\xa9\xa0"  // U+EA60
@@ -81,6 +92,12 @@ static Str fontsymbolsused =
     "→ ← ↑ ↓ ↔ ⇒ ⇐ ⇔ ↵ ↳ ↻ ⟶ ✓ ✗ ✔ ✘ • … ≤ ≥ ≠ ≈ × ± ° ∞ √ ≡ ∈ ∅ "
     "▶ ▸ ▾ ▼ ▲ ◀ ● ○ ■ □ ◆ ★ ☆ ☐ ☑ ☒ ⚠ ⏳ ✎ ✂ "
     "⌘ ⇧ ⌥ ⌃ ⏎ ⌫ ⇥ ─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼ ═ ║ — – ‘ ’ “ ” « » ′ ″";
+
+// Emoji models commonly write, each of which Twemoji's subset must have
+static Str fontemojiused =
+    "✅ ❌ ❎ ✨ ❗ ❓ ⭐ ⛔ ➕ ➖ 🚀 🎉 🔥 👍 👎 👀 💡 🐛 🔧 🔨 📝 📌 📎 📁 📄 "
+    "📊 📈 📦 🔍 🔒 🔑 🔗 💻 🧪 🧹 🧩 🎯 🏁 ⏰ 🟢 🟡 🔴 🟥 🟩 🚧 🛑 🤔 🤖 😀 😅 🙂 "
+    "💬 🔄 🗑 💾 🌐 🧠 🦀";
 
 // Code points that draw nothing: variation selectors (U+FE0F after ⚠
 // asks for its emoji form, which ImGui, without shaping, cannot pick),
@@ -186,5 +203,6 @@ static b32 fontcovers(Str ttf, i32 cp)
 static b32 fontprose(i32 cp)
 {
     return fontcovers(fontroboto(), cp) || fontcovers(fontmono(), cp) ||
-           fontcovers(fontsymbols(), cp) || fontcovers(fontmath(), cp);
+           fontcovers(fontsymbols(), cp) || fontcovers(fontmath(), cp) ||
+           fontcovers(fontemoji(), cp);
 }

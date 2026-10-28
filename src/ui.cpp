@@ -9578,6 +9578,8 @@ static void drawfontcredits()
     ImGui::BulletText("Noto Sans Symbols 2, Noto Sans Math: Copyright 2022 "
                       "The Noto Project Authors, Google (OFL 1.1)");
     ImGui::BulletText("Codicons: Copyright Microsoft Corporation (CC BY 4.0)");
+    ImGui::BulletText("Twemoji: Copyright 2020 Twitter, Inc and other contributors "
+                      "(CC BY 4.0)");
 }
 
 // A Help topic picked, from its list or a link: shown from its top, and

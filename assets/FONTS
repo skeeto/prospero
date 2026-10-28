@@ -38,3 +38,16 @@ codicon.ttf
     License, Copyright (C) 2019-2026 Microsoft Corporation".
     SHA-256 2bb558cb693451e73c28c33fe64aa89bc19b1a4b70f95948322c243f93476920
             codicon.ttf
+
+TwemojiMozilla-subset.ttf
+    A subset of Twemoji as Mozilla builds it, version 0.7.0 (COLRv0:
+    color layers of outlines), made by tools/symbols.py from the
+    Twemoji.Mozilla.ttf of github.com/mozilla/twemoji-colr's v0.7.0
+    release at the SHA-256 digest it names: the emoji models commonly
+    write, merged last, in color, into the transcript's fonts.
+    Copyright 2020 Twitter, Inc and other contributors
+    Graphics licensed under Creative Commons Attribution 4.0
+    International (https://creativecommons.org/licenses/by/4.0/)
+    https://github.com/twitter/twemoji
+    SHA-256 a7f64bf216ff36e3e88bbfd2a59430090a4e1f57d7edc6f303e3b9e3678a0a12
+            TwemojiMozilla-subset.ttf
