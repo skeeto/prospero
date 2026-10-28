@@ -1566,6 +1566,7 @@ struct Gui {
                                      // checklist's paste to restore
     Str                clippng;      // and the image it put there
     b32                promptfocus;  // activate the box when next drawn
+    b32                promptactive; // the box was active when last drawn
 };
 
 // Log to standard error, the log file, and the Log window, which then
@@ -4459,7 +4460,8 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         return;
 
     case CMD_NEW: {
-        if (id == g->newid) {
+        b32 mine = id && id==g->newid;  // made here: its prompt is typed next
+        if (mine) {
             g->newid = 0;
         }
         if (!ok) {
@@ -4471,6 +4473,9 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         s = s ? s : addsess(g, h, r->sid);
         sessview(g, s);
         setcur(g, s);
+        if (mine) {
+            g->promptfocus = 1;
+        }
         guilist(g, h);
         guiskills(g, s);
     } return;
@@ -10003,6 +10008,7 @@ enum : i32 {
     CHK_HANDEDDIR,    // the session shown is in --cwd, as a launch handed off
     CHK_NOFOLDERBOX,  // the new session dialog's No folder is ticked
     CHK_NOFOLDER,     // the session shown is in a folder of its own
+    CHK_NEWTYPED,     // the session shown's draft is text, its box active
     CHK_PATHPICK,     // the directory's dropdown lists dx folders, the first
                       // text if any (0: not drawn)
     CHK_NEWCWD,       // the directory's field is --cwd and text (drivepath),
@@ -10270,6 +10276,7 @@ static Str chknames[] = {
     "the second launch's directory has the session shown, the window up",
     "No folder is ticked, the directory's field and Browse off",
     "the session shown works in a folder of its own, shown as No folder",
+    "typing straight after it was made went to the new session's prompt",
     "the directory's dropdown lists the folders the text picks, best first",
     "the directory's field holds the path completed",
     "the session shown works in the directory completed",
@@ -13296,8 +13303,9 @@ static DriveOp launchops[] = {
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_CHECK, CHK_HANDEDDIR, 0, 0, 0, ""},
     {OP_CHECK, CHK_OPENED, 2, 0, 0, ""},
-    {OP_SHOT, 0, 0, 0, 300, "launch-2-handed"},
-    // An open event for a directory not seen yet: a session there
+    {OP_SHOT, 0, 0, 0, 1100, "launch-2-handed"},
+    // An open event for a directory not seen yet: a session there, a
+    // second on, so that its ID, made to the second, sorts after the last
     {OP_OPENDIR, 0, 0, 0, 300, "opened"},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_CHECK, CHK_OPENED, 3, 0, 0, "/opened"},
@@ -13324,9 +13332,23 @@ static DriveOp launchops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
-    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_NOFOLDER, 0, 0, 0, ""},
+    // Its prompt has the focus: what's typed next is its first message
+    {OP_TEXT, 0, 0, 0, 300, "first words"},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "first words"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_SHOT, 0, 0, 0, 300, "launch-4-session"},
+    // Session, New session, no folder: no dialog, the prompt focused
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "New session, no folder"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_NOFOLDER, 0, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 300, "straight away"},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "straight away"},
     // The directory's completion, in a tree tests/gui.py made: a path
     // typed in part lists the folders it picks, not dot folders nor
     // files; Tab completes the first; Esc closes the list, not the
@@ -16307,6 +16329,8 @@ static b32 drivecheck(Gui *g, i32 chk)
                       normpath(&a, v->cwd, ".", HOST_WINDOWS), HOST_WINDOWS) &&
                sesswhere(&a, g->sess)=="No folder" && !g->sess->readonly;
     }
+    case CHK_NEWTYPED:
+        return g->sess && g->promptactive && draftstr(g->sess)==g->ops[g->drivepc-1].text;
     case CHK_PLANMODEL:
         return g->sess && v->busy && planwaits(v) &&
                !sesswhy(g, g->sess, "model", !planwaits(v), 0).len;

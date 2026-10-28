@@ -52,8 +52,9 @@ To run the agent on another machine, add it in the Hosts pane; see
 ## Starting a session
 
 Session → New session... (Ctrl+N, Cmd+N on macOS) asks for the working
-directory and, optionally, a model from those the endpoints list. Type a prompt in the box at the
-bottom and press Enter. Shift+Enter starts a new line.
+directory and, optionally, a model from those the endpoints list. The
+prompt box at the bottom then has the keyboard: type a prompt and press
+Enter. Shift+Enter starts a new line.
 
 From a terminal, `prospero DIR`, such as `prospero .`, opens a new
 session in that directory, in Build mode with the default model. If

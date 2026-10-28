@@ -25,6 +25,13 @@ here... in a host's menu in the sidebar, opens the New session dialog:
   session with a role cannot use Plan mode.
 - **Plan mode**: start in Plan mode (below).
 
+Once the session is made, the prompt box has the keyboard, so its first
+message may be typed at once.
+
+Session → New session, no folder (Ctrl+Shift+N, Cmd+Shift+N on macOS)
+skips the dialog: a No folder session on this computer, with the
+default model, its prompt box ready. Type `/plan` there for Plan mode.
+
 A folder dropped on the window opens the dialog with that folder
 filled in. `prospero DIR` in a terminal starts a session in DIR at
 once.

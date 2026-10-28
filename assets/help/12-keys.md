@@ -5,7 +5,10 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 
 ## Anywhere
 
-- **Ctrl+N**: New session.
+- **Ctrl+N**: New session. Once it's made, the prompt box has the
+  keyboard.
+- **Ctrl+Shift+N**: New session, no folder, with the default model:
+  no dialog, straight to its prompt box.
 - **Ctrl+F**: find in the transcript.
 - **Ctrl+Shift+T**: open, or fold again, all of the session's tool
   output (the Tool output button above the transcript).

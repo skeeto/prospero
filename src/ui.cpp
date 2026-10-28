@@ -4815,10 +4815,12 @@ static void drawprompt(Gui *g)
         s->note = {};
         drafttyped(&s->dclock, g->sched.now);
     }
-    if (cb.escaped || (g->promptfocus && g->sess==s)) {
+    // Not from under a dialog: the focus waits until it closes
+    if (cb.escaped || (g->promptfocus && g->sess==s && !ImGui::GetTopMostPopupModal())) {
         ImGui::ActivateItemByID(id);
         g->promptfocus = 0;
     }
+    g->promptactive = ImGui::GetActiveID() == id;
     SlashInfo c = pick ? slashpickinfo(&a, pick, s->skills) : SlashInfo{};
     if (pick && (cb.tab || (send && text!=c.name))) {
         // Completed rather than sent, the box kept active
@@ -5154,9 +5156,9 @@ static b32 menuitem(Gui *g, Arena a, Str label, Str why, char const *key = 0)
 
 // One with a tooltip, tip, saying what it does while it can. It takes
 // the caller's arena, where its strings may be made in the same call.
-static b32 menutip(Gui *g, Arena *a, Str label, Str why, Str tip)
+static b32 menutip(Gui *g, Arena *a, Str label, Str why, Str tip, char const *key = 0)
 {
-    b32 r = menuitem(g, *a, label, why);
+    b32 r = menuitem(g, *a, label, why, key);
     if (!why.len) {
         ImGui::SetItemTooltip("%s", cstr0(a, tip));
     }
@@ -7503,7 +7505,9 @@ static void drawnew(Gui *g)
         checkbox("No folder", &g->newnofolder);
         itemnamed(g, "new nofolder");
         ImGui::SetItemTooltip("No project: the session works in a folder of its own, "
-                              "kept with it and deleted with it");
+                              "kept with it and deleted with it. %s, Session \xe2\x86\x92 "
+                              "New session, no folder, starts one straight away",
+                              cmdkey(g, &a, "Shift+N"));
         nofolder = g->newnofolder;
     }
     ImGui::BeginDisabled(nofolder);
@@ -9688,6 +9692,28 @@ static void newsession(Gui *g)
     g->newerr  = {};
 }
 
+// Why a session with no folder can't start straight away, here with
+// the defaults, or empty if it can.
+static Str newfreewhy(Gui *g)
+{
+    if (!cannew(g) || !g->main) {
+        return "No engine";
+    }
+    if (!hostcap(g->main, "nofolder")) {
+        return "This engine can't start a session with no folder";
+    }
+    return {};
+}
+
+// A session with no folder, with the defaults and no dialog: its
+// prompt takes the focus once it's made, for its first message.
+static void newfree(Gui *g)
+{
+    if (!newfreewhy(g).len) {
+        guinew(g, g->main, {}, {}, {}, {}, 0, 1);
+    }
+}
+
 // The menus' shortcuts, wherever the focus is (a global route, which a
 // focused field's own use of a key goes ahead of): a new session, zoom
 // by key or by Ctrl+wheel (Cmd on macOS), find and the session's
@@ -9699,6 +9725,9 @@ static void menukeys(Gui *g)
     ImGuiKeyChord   ctrl = ImGuiMod_Ctrl;
     if (cannew(g) && ImGui::Shortcut(ctrl|ImGuiKey_N, glob)) {
         newsession(g);
+    }
+    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_N, glob)) {
+        newfree(g);
     }
     if (ImGui::Shortcut(ctrl|ImGuiKey_Equal, glob) ||
             ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_Equal, glob) ||
@@ -9759,6 +9788,11 @@ static void drawmenubar(Gui *g)
         ImGui::SetItemTooltip("Start a session in a working directory");
         if (add) {
             newsession(g);
+        }
+        if (menutip(g, &a, "New session, no folder", newfreewhy(g),
+                    "Start a session with no working folder, with the default "
+                    "model, and type its prompt", cmdkey(g, &a, "Shift+N"))) {
+            newfree(g);
         }
         Str iwhy = !cannew(g) ? Str("No engine") : importwhy(g, g->main);
         if (menuitem(g, a, "Import session...", iwhy)) {

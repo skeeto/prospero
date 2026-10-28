@@ -283,7 +283,10 @@ dialogs, gives it a folder of its own instead, `sessions/SID/work` in
 the state directory, for general help with the machine. The agent works
 there freely, a fork gets a copy of it, and it is deleted with the
 session. Such a session has only your own instructions and skills,
-none of a project's, and shows as "No folder" in the sidebar.
+none of a project's, and shows as "No folder" in the sidebar. Session
+→ New session, no folder (Ctrl+Shift+N, Cmd+Shift+N on macOS) makes one
+at once, with the default model and no dialog. A new session's prompt
+box has the keyboard, for its first message.
 
 A message sent while a turn runs waits, dimmed, at the end of the
 transcript until the agent takes it in at its next step (or, too late for this turn, runs as
