@@ -608,6 +608,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/mcp_test.cpp"
 #include "test/engine_test.cpp"  // after config's test platform
 #include "test/git_test.cpp"     // after engine's: makesessions
+#include "test/worktree_test.cpp"
 #include "test/deploy_test.cpp"
 #include "test/hostlink_test.cpp"
 #include "test/eval_test.cpp"
@@ -681,6 +682,7 @@ int main()
     test_helpskill(&t);
     test_engine(&t);
     test_git(&t);
+    test_worktree(&t);
     test_config(&t);
     test_mcp(&t);
     test_deploy(&t);

@@ -229,6 +229,7 @@ static CfgKind cfgkinds[] = {
     {"instructions", 0, "Instruction files for the agent: AGENTS.md and the like"},
     {"skills",   0, "Skills: SKILL.md instructions the agent uses as a task calls for them"},
     {"memory",   0, "Project memory: the agent's notes for later sessions in a project"},
+    {"worktree", 0, "Worktree sessions: each in a git worktree and branch of its own"},
     {"ui",       0, "How the GUI looks, and when it tells you of a session"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"web",      0, "Web search and reading web pages: the web_search and web_fetch tools"},
@@ -484,6 +485,10 @@ static CfgKey cfgschema[] = {
     {"memory", "path", CFG_PATHS, "", {}, {}, "memory",
      "Directory of every project's memory, by default memory in the state "
      "directory"},
+
+    {"worktree", "branch_prefix", CFG_STRING, "prospero/", {}, {}, "worktree",
+     "What a worktree session's branch name begins with, before its own "
+     "name, as prospero/ in prospero/brisk-otter"},
 
     {"desktop", "offer", CFG_ENUM, "all", {}, "none roles all", "desktop",
      "Which sessions get the desktop tool, where it can work (a display "
@@ -949,6 +954,35 @@ static b32 cfgmcpword(CfgKey *k, Str w)
     return k->kind=="role" && k->key=="tools" && startswith(w, "mcp__") && w.len>5;
 }
 
+// Whether a branch name may begin with this, by git's rules for ref
+// names (git check-ref-format), a little stricter: ASCII letters, digits
+// and ._-/ only, no component beginning with a dot or ending in .lock,
+// no "..", and neither beginning with '/' or '-' nor ending with '.'.
+static b32 cfgrefprefix(Str v)
+{
+    if (!v.len || v.len>64 || v[0]=='/' || v[0]=='-' || v[v.len-1]=='.') {
+        return 0;
+    }
+    for (iz i = 0; i < v.len; i++) {
+        u8  c  = v[i];
+        b32 ok = (c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') ||
+                 c=='.' || c=='_' || c=='-' || c=='/';
+        b32 begins = !i || v[i-1]=='/';
+        if (!ok || (begins && c=='.') || (c=='/' && v[i-1]=='/') ||
+                (c=='.' && i && v[i-1]=='.')) {
+            return 0;
+        }
+    }
+    for (Str rest = v; rest.len;) {
+        Cut c = cut(rest, '/');
+        rest = c.tail;
+        if (endswith(c.head, ".lock")) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 // How a value fares as a setting of its key. A shared value comes from
 // an included file. An empty value means the default, and is fine.
 static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
@@ -958,6 +992,9 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
         return CFG_OK;
     } else if (shared && cfgownonly(k, v)) {
         return CFG_BAD;
+    }
+    if (k->kind=="worktree" && k->key=="branch_prefix") {
+        return cfgrefprefix(v) ? CFG_OK : CFG_BAD;
     }
     switch (k->type) {
     case CFG_STRING:

@@ -936,6 +936,7 @@ struct GitAsk {
     Str        home;
     Str        errpath;  // for git's standard error
     Slice<Str> env;
+    Str        worktree; // a probe's, as JSON, for its reply
     b32        done;     // answered in this batch
 };
 
@@ -951,6 +952,7 @@ static GitAsk gitparseask(Arena *a, Str record)
     q.git     = jsonstr(jsonget(d.root, "git"));
     q.home    = jsonstr(jsonget(d.root, "home"));
     q.errpath = jsonstr(jsonget(d.root, "errpath"));
+    q.worktree = jsonget(d.root, "worktree")->raw;
     for (Json *e = jsonget(d.root, "env")->child; e; e = e->next) {
         q.env = push(a, q.env, jsonstr(e));
     }
@@ -1039,6 +1041,9 @@ static Str gitanswer(GitWork *w, Arena *a, Arena scratch, Slice<GitAsk> asks, iz
             putarray(&o);
             putint(&o, asks[i].id);
             putstr(&o, asks[i].sid);
+            if (asks[i].worktree.len) {
+                putraw(&o, asks[i].worktree);
+            }
             putend(&o);
         }
     }
@@ -1131,7 +1136,7 @@ static Str gitsessdir(Engine *e, Arena *a, Str sid, b32 *nofolder)
 
 // Queue a request for the worker: null if queued, else why not.
 static Str gitqueue(Engine *e, Arena scratch, i64 id, Str sid, Str cwd,
-                    Str ceiling, Str root)
+                    Str ceiling, Str root, Str worktree = {})
 {
     GitWork *w = gitwork(e);
     if (!w) {
@@ -1159,6 +1164,10 @@ static Str gitqueue(Engine *e, Arena scratch, i64 id, Str sid, Str cwd,
     putstrkey(&o, "git", trim(cfgget(e->cfg, "tools", "", "git", 0)));
     putstrkey(&o, "home", e->home);
     putstrkey(&o, "errpath", errpath);
+    if (worktree.len) {
+        putkey(&o, "worktree");
+        putraw(&o, worktree);
+    }
     putkey(&o, "env");
     putarray(&o);
     for (iz i = 0; i < env.len; i++) {
@@ -1176,10 +1185,15 @@ static Str gitqueue(Engine *e, Arena scratch, i64 id, Str sid, Str cwd,
 // git {sid, status?}: the branch of a session's working tree, open here
 // or not, read from its files, and with status, its changes as git
 // tells them, in a reply once git is done (late, as models' is).
+// git {cwd, status?}, with no sid, probes a folder for a new session:
+// the same, and whether a worktree session can start there (wtprobe).
 static void cmdgit(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str sid = jsonstr(jsonget(j, "sid"));
-    if (!validsid(sid)) {
+    if (jsonget(j, "sid")->type==JSON_MISSING && jsonget(j, "cwd")->type!=JSON_MISSING) {
+        wtprobe(e, scratch, id, j);
+        return;
+    } else if (!validsid(sid)) {
         reply(e, scratch, id, 0, "invalid session id", {});
         return;
     }
@@ -1232,6 +1246,10 @@ static void gitdone(Engine *e, Arena scratch, Str answer)
         putjson(&w.json, head);
         putkey(&w.json, "status");
         putjson(&w.json, status);
+        if (jsonat(k, 2)->type != JSON_MISSING) {
+            putkey(&w.json, "worktree");
+            putjson(&w.json, jsonat(k, 2));
+        }
         emit(e, evend(&w));
     }
 }

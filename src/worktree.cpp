@@ -422,6 +422,300 @@ static void wtthread(void *arg)
 }
 
 
+// Names and places
+//
+// A worktree's name is its folder's, MAIN/.prospero/worktrees/NAME, and
+// its branch's after [worktree] branch_prefix: a word or two of [a-z0-9]
+// joined by '-', which neither the shell nor Windows minds. MAIN is the
+// main checkout of the repository holding the folder chosen, also when
+// that is itself a worktree. Nothing of a worktree's place comes from a
+// client but its name, so no path escapes MAIN.
+
+enum : iz {
+    WT_NAMEMAX = 24,
+    WT_TRIES   = 16,  // random names tried for a free one
+};
+
+static Str const wtadjs[] = {
+    "amber", "bold", "brisk", "calm", "clever", "crisp", "dapper", "deft",
+    "eager", "fair", "fleet", "gentle", "glad", "golden", "hardy", "jolly",
+    "keen", "kind", "lively", "lucky", "merry", "mild", "nimble", "noble",
+    "plucky", "proud", "quick", "quiet", "rapid", "ready", "robust", "rosy",
+    "sage", "shiny", "sleek", "snappy", "spry", "steady", "sturdy", "sunny",
+    "swift", "tidy", "trusty", "vivid", "warm", "wise", "witty", "zesty",
+};
+
+static Str const wtnouns[] = {
+    "badger", "beaver", "bison", "crane", "falcon", "ferret", "finch", "fox",
+    "gecko", "heron", "ibex", "jay", "kestrel", "koala", "lark", "lemur",
+    "lynx", "marten", "mink", "moose", "newt", "ocelot", "orca", "osprey",
+    "otter", "owl", "panda", "pika", "plover", "puffin", "quail", "raven",
+    "robin", "salmon", "seal", "shrike", "sparrow", "stoat", "swift", "tapir",
+    "tern", "thrush", "trout", "vole", "walrus", "wombat", "wren", "yak",
+};
+
+// Whether a worktree may be named so: 1 to WT_NAMEMAX of [a-z0-9-], not
+// beginning or ending with '-', nor with two in a row, and no device
+// name of Windows.
+static b32 wtname(Str s)
+{
+    if (!s.len || s.len>WT_NAMEMAX || s[0]=='-' || s[s.len-1]=='-') {
+        return 0;
+    }
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s[i];
+        if (!((c>='a' && c<='z') || (c>='0' && c<='9') || c=='-') ||
+                (c=='-' && s[i-1]=='-')) {
+            return 0;
+        }
+    }
+    static Str const devices[] = {"con", "prn", "aux", "nul"};
+    for (iz i = 0; i < countof(devices); i++) {
+        if (s == devices[i]) {
+            return 0;
+        }
+    }
+    b32 port = s.len==4 && (startswith(s, "com") || startswith(s, "lpt")) && digit(s[3]);
+    return !port;
+}
+
+// Why a name will not do, for a client.
+static Str wtnamewhy(Str s)
+{
+    if (!s.len) {
+        return "the worktree needs a name";
+    } else if (s.len > WT_NAMEMAX) {
+        return "a worktree's name is at most 24 characters";
+    }
+    return "a worktree's name is lowercase letters, digits and single "
+           "hyphens between them";
+}
+
+// A random name, as brisk-otter.
+static Str wtrandom(Arena *a, u64 r)
+{
+    Str adj  = wtadjs[(r & 0xffffffff) % countof(wtadjs)];
+    Str noun = wtnouns[(r >> 32) % countof(wtnouns)];
+    return concat(a, concat(a, adj, "-"), noun);
+}
+
+// A path in the host's own form: on Windows with '\'.
+static Str wtnative(Arena *a, Str path, b32 win)
+{
+    if (!win) {
+        return path;
+    }
+    Str r = clone(a, path);
+    for (iz i = 0; i < r.len; i++) {
+        r.data[i] = r[i]=='/' ? '\\' : r[i];
+    }
+    return r;
+}
+
+// The folder of a worktree, by its name, in MAIN.
+static Str wtpath(Arena *a, Str main, Str name, b32 win)
+{
+    Str dir = concat(a, main, win ? Str("\\.prospero\\worktrees\\")
+                                  : Str("/.prospero/worktrees/"));
+    return concat(a, dir, name);
+}
+
+// Where a worktree session can start from a folder: the repository's
+// main checkout, the folder's place below its own checkout's root, and
+// the commit and branch the new branch would be cut from. Else why not.
+struct WtPlace {
+    Str err;
+    Str main;    // the main checkout, in the host's form
+    Str sub;     // the folder below its checkout's root, '/' separated
+    Str common;  // the git directory the worktrees share
+    Str base;    // the branch HEAD is on, null if detached
+    Str oid;     // HEAD's commit
+    GitHead h;
+};
+
+static WtPlace wtplace(Os *os, Arena *a, Str cwd, b32 win)
+{
+    WtPlace p = {};
+    p.h = githead(os, a, cwd, {}, win);
+    GitHead *h = &p.h;
+    if (!h->repo) {
+        p.err = "the folder is not in a git repository";
+        return p;
+    } else if (h->reftable) {
+        p.err = "the repository keeps its refs in a reftable, which "
+                "Prospero cannot read yet";
+        return p;
+    } else if (h->op.len) {
+        p.err = concat(a, concat(a, "a ", h->op), " is under way in the folder");
+        return p;
+    }
+
+    // The main checkout: the root itself when its .git is the git
+    // directory, else what its worktree's .git leads to
+    Str root = normpath(a, h->root, ".", win);
+    Str gd   = normpath(a, h->gitdir, ".", win);
+    Str own  = normpath(a, root, ".git", win);
+    Str main = (win ? equalfold(gd, own) : gd==own) ? root : memmain(os, a, root, win);
+    if (!main.len) {
+        p.err = "the folder is in a submodule, or a worktree of a bare "
+                "repository: open its own repository instead";
+        return p;
+    }
+    p.main   = wtnative(a, main, win);
+    p.common = gitcommon(os, a, h->gitdir, win);
+    Str dir  = normpath(a, cwd, ".", win);
+    p.sub    = dir.len>root.len ? cuthead(dir, root.len + !endswith(root, "/")) : Str{};
+
+    if (h->detached) {
+        p.oid = h->oid;
+    } else if (startswith(h->branch, "refs/")) {
+        p.oid = gitrefoid(os, a, p.common, h->branch);  // HEAD on another ref
+    } else {
+        p.base = h->branch;
+        p.oid  = gitrefoid(os, a, p.common, concat(a, "refs/heads/", h->branch));
+    }
+    if (!p.oid.len) {
+        p.err = p.base.len ? concat(a, concat(a, "the branch ", p.base), " has no commits yet")
+                           : Str("HEAD names no commit");
+    }
+    return p;
+}
+
+// The configured branch prefix, as a valid one.
+static Str wtprefix(Engine *e)
+{
+    Str v = trim(cfgget(e->cfg, "worktree", "", "branch_prefix", 0));
+    return v.len && cfgrefprefix(v) ? v : Str("prospero/");
+}
+
+// Whether a session, archived or not, records a worktree of MAIN by
+// this name, which then stays reserved for it.
+static b32 wtrecorded(Engine *e, Arena scratch, Str main, Str name, b32 win)
+{
+    Str dir = join(&scratch, e->statedir, "sessions");
+    for (Dirent *d = os_list(e->os, &scratch, dir); d; d = d->next) {
+        if (!d->isdir) continue;
+        Arena t    = scratch;
+        Str   path = join(&t, join(&t, dir, d->name), "events.jsonl");
+        Read  rd   = os_readat(e->os, &t, path, 0, 4096);
+        EvRec rec  = evparse(&t, cut(rd.data, '\n').head);
+        Json *wt   = jsonget(rec.root, "worktree");
+        Str   m    = jsonstr(jsonget(wt, "main"));
+        if (rec.ok && rec.ev==EV_SESSION && jsonstr(jsonget(wt, "name"))==name &&
+                (win ? equalfold(m, main) : m==main)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether a worktree cannot be made by this name: its folder exists,
+// its branch does, or a session has it.
+enum : i32 {WT_FREE, WT_HASDIR, WT_HASBRANCH, WT_HASSESSION};
+
+static i32 wttaken(Engine *e, Arena scratch, WtPlace *p, Str name)
+{
+    b32 win = HOST_WINDOWS;
+    Str ref = concat(&scratch, concat(&scratch, "refs/heads/", wtprefix(e)), name);
+    Str dir = wtpath(&scratch, p->main, name, win);
+    if (os_stat(e->os, scratch, dir).type != STAT_MISSING) {
+        return WT_HASDIR;
+    } else if (gitrefoid(e->os, &scratch, p->common, ref).len) {
+        return WT_HASBRANCH;
+    } else if (wtrecorded(e, scratch, p->main, name, win)) {
+        return WT_HASSESSION;
+    }
+    return WT_FREE;
+}
+
+// Why a name is taken, for a client.
+static Str wttakenwhy(Engine *e, Arena *a, i32 taken, Str name)
+{
+    switch (taken) {
+    case WT_HASDIR:
+        return concat(a, name, " is taken: its folder exists");
+    case WT_HASBRANCH:
+        return concat(a, concat(a, concat(a, "the branch ", wtprefix(e)), name), " exists");
+    case WT_HASSESSION:
+        return concat(a, name, " is taken by another session");
+    }
+    return {};
+}
+
+// A free name, random, else null.
+static Str wtsuggest(Engine *e, Arena *a, Arena scratch, WtPlace *p)
+{
+    for (i32 i = 0; i < WT_TRIES; i++) {
+        Str name = wtrandom(a, os_random(e->os));
+        if (wttaken(e, scratch, p, name) == WT_FREE) {
+            return name;
+        }
+    }
+    return {};
+}
+
+// The worktree object of a probe's reply: whether one can start there,
+// else why not, and if so, a free name and what it would be cut from.
+static Str wtprobejson(Engine *e, Arena *a, Arena scratch, WtPlace *p)
+{
+    Str name = p->err.len ? Str{} : wtsuggest(e, a, scratch, p);
+    Buf b(a, 1024 + p->main.len + p->err.len);
+    JsonOut w = {&b};
+    putobject(&w);
+    if (p->err.len) {
+        putintkey(&w, "ok", 0);
+        putstrkey(&w, "why", p->err);
+    } else {
+        putintkey(&w, "ok", 1);
+        putstrkey(&w, "main", p->main);
+        putstrkey(&w, "prefix", wtprefix(e));
+        if (name.len) putstrkey(&w, "name", name);
+        if (p->base.len) putstrkey(&w, "base", p->base);
+        putstrkey(&w, "oid", p->oid);
+    }
+    putend(&w);
+    return finish(&b);
+}
+
+// git {cwd, status?}: a folder probed for a new session, its head, its
+// changes with status, and whether a worktree session can start there.
+static void wtprobe(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str      cwd = jsonstr(jsonget(j, "cwd"));
+    HomePath hp  = tildepath(&scratch, cwd, e->home, HOST_WINDOWS);
+    Str      dir = hp.err.len ? Str{} : os_realpath(e->os, &scratch, hp.path);
+    if (!dir.len || os_stat(e->os, scratch, dir).type!=STAT_DIR) {
+        reply(e, scratch, id, 0, "cwd must name an existing directory", {});
+        return;
+    }
+    Arena   keep = carve(&scratch, 1<<16);
+    WtPlace p    = wtplace(e->os, &keep, dir, HOST_WINDOWS);
+    Str     wt   = wtprobejson(e, &keep, scratch, &p);
+    Str     head = githeadjson(&keep, &p.h);
+    Str     status = {};
+    if (p.h.repo && jsonflag(jsonget(j, "status"), 0)) {
+        Str err = gitqueue(e, scratch, id, {}, dir, {}, p.h.root, wt);
+        if (!err.len) {
+            return;  // gitdone replies
+        }
+        status = gitfailjson(&keep, err);
+    }
+    Buf   b(&scratch, 256 + head.len + status.len + wt.len);
+    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putkey(&w.json, "head");
+    putraw(&w.json, head);
+    if (status.len) {
+        putkey(&w.json, "status");
+        putraw(&w.json, status);
+    }
+    putkey(&w.json, "worktree");
+    putraw(&w.json, wt);
+    emit(e, evend(&w));
+}
+
+
 // The engine's side
 
 static GitWork *wtwork(Engine *e)

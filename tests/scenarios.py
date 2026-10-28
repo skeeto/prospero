@@ -12555,6 +12555,106 @@ def git_status(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+# Worktree sessions: each in a git worktree of its own, made and removed
+# by the engine
+
+def gitrun(t, env, *args, cwd=None):
+    """git's output, run as a test runs it, in t.work by default."""
+    return subprocess.run([shutil.which("git"), *args], cwd=cwd or t.work, env=env,
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def wtwords():
+    """The words of worktrees' random names, from worktree.cpp."""
+    src = open(os.path.join(os.path.dirname(__file__), "..", "src", "worktree.cpp")).read()
+    lists = re.findall(r"static Str const wt(?:adjs|nouns)\[\] = \{(.*?)\};", src, re.S)
+    return [re.findall(r'"([a-z]+)"', s) for s in lists]
+
+
+def gitrepo(t):
+    """A repository in t.work on main, with a commit and a subdirectory,
+    and the environment to run git in it. Here only, with git."""
+    if not shutil.which("git") or not isinstance(t.host, LocalHost):
+        raise Skip("needs git, here")
+    env = gitenv(t)
+    gitrun(t, env, "init", "-q")
+    gitrun(t, env, "symbolic-ref", "HEAD", "refs/heads/main")
+    t.put("README", "hello\n")
+    t.host.mkdir(t.host.join(t.work, "src"))
+    t.put("src/main.c", "int main(void) { return 0; }\n")
+    gitrun(t, env, "add", ".")
+    gitrun(t, env, "commit", "-q", "-m", "first")
+    return env
+
+
+@scenario(bound=20)
+def worktree_probe(t):
+    """git {cwd} probes a folder for a new session: its head, its changes
+    with status, and whether a worktree session can start there, with a
+    free name, the main checkout, and the branch and commit it would be
+    cut from. Not outside a repository, nor in an unborn one; from a
+    linked worktree, the main checkout is its repository's. A name is
+    never one taken by a folder or a branch."""
+    env = gitrepo(t)
+    oid = gitrun(t, env, "rev-parse", "HEAD")
+    main = os.path.realpath(t.work)
+    h = t.headless(env={k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")})
+    try:
+        r = h.call("git", cwd=t.host.join(t.work, "src"))
+        wt = r.get("worktree", {})
+        t.check(r.get("ok") == 1 and r["head"].get("branch") == "main" and
+                "status" not in r, f"a probe: {r}")
+        t.check(wt.get("ok") == 1 and wt.get("main") == main and wt.get("base") == "main" and
+                wt.get("oid") == oid and wt.get("prefix") == "prospero/" and
+                re.fullmatch(r"[a-z]+-[a-z]+", wt.get("name", "")), f"its worktree: {wt}")
+
+        t.put("src/dirty.c", "x\n")
+        r = h.call("git", cwd=t.work, status=1, timeout=30)
+        t.check(r.get("ok") == 1 and r.get("status", {}).get("count") == 1 and
+                r.get("worktree", {}).get("ok") == 1, f"with status: {r}")
+
+        # Every name taken but one, by folders and by packed branches, so
+        # that the name is that one or none
+        adjs, nouns = wtwords()
+        packed = []
+        for i, adj in enumerate(adjs):
+            for noun in nouns:
+                name = f"{adj}-{noun}"
+                if name == "zesty-yak":
+                    continue
+                elif i % 2:
+                    packed.append(f"{oid} refs/heads/prospero/{name}\n")
+                else:
+                    os.makedirs(os.path.join(t.work, ".prospero", "worktrees", name))
+        with open(os.path.join(t.work, ".git", "packed-refs"), "w") as f:
+            f.write("# pack-refs with: peeled fully-peeled sorted \n" + "".join(sorted(packed)))
+        t.check(gitrun(t, env, "rev-parse", "prospero/calm-otter") == oid, "packed")
+        r = h.call("git", cwd=t.work)
+        t.check(r["worktree"].get("name") in (None, "zesty-yak"), f"no taken name: {r}")
+
+        other = t.host.join(t.base, "linked")
+        gitrun(t, env, "worktree", "add", "-q", "--detach", other)
+        r = h.call("git", cwd=other)
+        wt = r.get("worktree", {})
+        t.check(wt.get("ok") == 1 and wt.get("main") == main and "base" not in wt and
+                wt.get("oid") == oid, f"from a linked worktree: {wt}")
+
+        r = h.call("git", cwd=t.base)
+        t.check(r.get("worktree") == {"ok": 0, "why": "the folder is not in a git repository"},
+                f"no repository: {r}")
+        unborn = t.host.join(t.base, "unborn")
+        t.host.mkdir(unborn)
+        gitrun(t, env, "init", "-q", "-b", "trunk", cwd=unborn)
+        r = h.call("git", cwd=unborn)
+        t.check(r.get("worktree") == {"ok": 0, "why": "the branch trunk has no commits yet"},
+                f"unborn: {r}")
+        r = h.call("git", cwd=t.host.join(t.base, "nowhere"))
+        t.check(r.get("ok") == 0, f"no folder: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 # The soak: sessions under 10% random faults for a while
 
 def soak(host, minutes, workers):

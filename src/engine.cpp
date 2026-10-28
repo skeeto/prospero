@@ -1931,6 +1931,7 @@ static void gitquit(Engine *);
 static void wtdone(Engine *, Arena, Str);
 static b32  wtbusy(Engine *);
 static void wtquit(Engine *);
+static void wtprobe(Engine *, Arena, i64, Json *);
 static void taskcheck(Session *, Arena, Str why, Str err);
 static b32  taskbudget(Session *, Arena);
 static b32  taskwake(Session *);
