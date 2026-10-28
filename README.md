@@ -164,8 +164,8 @@ streams, which a click opens; `[ui] thinking = open` shows it whole,
 and `hide` leaves it out of the transcript (the session log keeps it,
 and the model still gets it back). Tool rows fold by kind and outcome,
 or all of them with `[ui] tools = fold` or `open`, and a session's
-Tool output and Reasoning buttons open everything for that session
-alone. Cmd/Ctrl+F finds text in the transcript, folded rows included,
+Tool output and Reasoning buttons (a wrench and screwdriver, a light
+bulb, above the transcript) open everything for that session alone. Cmd/Ctrl+F finds text in the transcript, folded rows included,
 and a code block's Copy button copies its code exactly. A bar above the
 transcript shows how full the context is. A file tool that goes outside the session's working directory,
 or the roots the configuration adds, asks first, and an answer not

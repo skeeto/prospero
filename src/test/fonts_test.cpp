@@ -51,4 +51,20 @@ static void test_fonts(Test *t)
     }
     expect(t, "fonts.gui.missing", finish(&lacking), "");
     expect(t, "fonts.gui.branch", istr(&a, fontcovers(fontmono(), 0xe0a0)), "1");
+
+    // Buttons' icons: each in Codicons, in its range, and in no font
+    // merged ahead of it, which would draw its own glyph instead
+    Buf bad(&a, 256);
+    i32 icons = 0;
+    for (iz i = 0; i < fonticonsused.len;) {
+        i32 cp = utf8decode(fonticonsused, &i);
+        icons++;
+        if (!fontcovers(fonticons(), cp) || cp<0xea60 || cp>0xf102 || fontprose(cp)) {
+            print(&bad, "U+");
+            printhex(&bad, (u64)cp, 4);
+            putbyte(&bad, ' ');
+        }
+    }
+    expect(t, "fonts.icons.bad", finish(&bad), "");
+    expect(t, "fonts.icons.count", istr(&a, icons), "16");
 }

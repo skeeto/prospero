@@ -11927,7 +11927,7 @@ static DriveOp settingsops[] = {
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     // Many results, long tooltips: the list's scratch clear of it
     {OP_TEXT, 0, 0, 0, 500, "model"},
-    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "model model max_models max_models "
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "model model model max_models max_models "
                                       "subagent_model"},
     {OP_SHOT, 0, 0, 0, 300, "settings-find-many"},
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
@@ -17433,6 +17433,23 @@ static ImFont *addfont(Str data, i32 flags, b32 merge)
     );
 }
 
+// Codicons, buttons' icons (fonts.cpp), over their own range alone.
+// Its glyphs stand on the baseline, as tall as the em, which would reach
+// above a small button's frame: smaller (13 to the text's 15) and a
+// little lower, an icon sits centered in the line of text.
+static void addicons(i32 flags)
+{
+    static ImWchar const range[] = {0xea60, 0xf102, 0};
+    ImFontConfig cfg;
+    cfg.FontDataOwnedByAtlas = 0;
+    cfg.FontLoaderFlags      = (u32)flags & ~(u32)ImGuiFreeTypeLoaderFlags_Oblique;
+    cfg.MergeMode            = 1;
+    cfg.GlyphRanges          = range;
+    cfg.GlyphOffset          = v2(0, 1);
+    Str data = fonticons();
+    ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void *)data.data, (i32)data.len, 13, &cfg);
+}
+
 static ImFont *addface(Str data, i32 flags)
 {
     ImFont *f = addfont(data, flags, 0);
@@ -17441,6 +17458,7 @@ static ImFont *addface(Str data, i32 flags)
     }
     addfont(fontsymbols(), flags, 1);
     addfont(fontmath(), flags, 1);
+    addicons(flags);
     return f;
 }
 

@@ -8,6 +8,10 @@
 // into one ImFont in that order (app.cpp, loadfonts). assets/FONTS says
 // where each comes from; tools/symbols.py makes the subsets.
 //
+// Buttons' icons are Codicons, merged after them all over its private
+// use range alone (U+EA60-F102), so it shadows nothing; ICON_* name the
+// ones used, as UTF-8.
+//
 // fontcovers reads a TrueType file's character map (cmap formats 4 and
 // 12), so that the unit tests can check the fonts against the symbols
 // models commonly write (fontsymbolsused) without ImGui or FreeType. Emoji
@@ -31,6 +35,9 @@ static u8 const symbolsttf[] = {
 static u8 const mathttf[] = {
     #embed "../assets/NotoSansMath-subset.ttf"
 };
+static u8 const codiconttf[] = {
+    #embed "../assets/codicon.ttf"
+};
 #ifdef __clang__
 #  pragma clang diagnostic pop
 #endif
@@ -41,6 +48,31 @@ static Str fontroboto()  { return {(u8 *)robotottf, countof(robotottf)}; }
 static Str fontmono()    { return {(u8 *)monottf, countof(monottf)}; }
 static Str fontsymbols() { return {(u8 *)symbolsttf, countof(symbolsttf)}; }
 static Str fontmath()    { return {(u8 *)mathttf, countof(mathttf)}; }
+static Str fonticons()   { return {(u8 *)codiconttf, countof(codiconttf)}; }
+
+// The icons buttons show, by their Codicons names
+#define ICON_ADD        "\xee\xa9\xa0"  // U+EA60
+#define ICON_LIGHTBULB  "\xee\xa9\xa1"  // U+EA61
+#define ICON_INFO       "\xee\xa9\xb4"  // U+EA74
+#define ICON_CLOSE      "\xee\xa9\xb6"  // U+EA76
+#define ICON_FILE       "\xee\xa9\xbb"  // U+EA7B
+#define ICON_REPLY      "\xee\xa9\xbd"  // U+EA7D
+#define ICON_TERMINAL   "\xee\xaa\x85"  // U+EA85
+#define ICON_DISCONNECT "\xee\xab\x90"  // U+EAD0, debug-disconnect
+#define ICON_STOP       "\xee\xab\x97"  // U+EAD7, debug-stop
+#define ICON_FOLDER     "\xee\xab\xb7"  // U+EAF7, folder-opened
+#define ICON_PLUG       "\xee\xac\xad"  // U+EB2D
+#define ICON_REFRESH    "\xee\xac\xb7"  // U+EB37
+#define ICON_TOOLS      "\xee\xad\xad"  // U+EB6D
+#define ICON_COPY       "\xee\xaf\x8c"  // U+EBCC
+#define ICON_SEND       "\xee\xb0\x8f"  // U+EC0F
+#define ICON_ATTACH     "\xee\xb0\xb4"  // U+EC34
+
+// Their characters, for the unit tests
+static Str fonticonsused =
+    ICON_ADD ICON_LIGHTBULB ICON_INFO ICON_CLOSE ICON_FILE ICON_REPLY
+    ICON_TERMINAL ICON_DISCONNECT ICON_STOP ICON_FOLDER ICON_PLUG
+    ICON_REFRESH ICON_TOOLS ICON_COPY ICON_SEND ICON_ATTACH;
 
 // Symbols models commonly write in prose: arrows, check marks and
 // crosses, bullets, math, shapes, ballot boxes, keyboard symbols, box

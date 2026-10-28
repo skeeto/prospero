@@ -2232,12 +2232,12 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         Str why = termplan(g, &a, s).why;
         ImGui::SameLine();
         ImGui::BeginDisabled(why.len);
-        if (ImGui::SmallButton("Terminal")) {
+        if (ImGui::SmallButton(ICON_TERMINAL "##terminal")) {
             termopen(g, a, s);
         }
         ImGui::EndDisabled();
         itemnamed(g, "Terminal");
-        whytip(why.len ? why : Str("Open a terminal in this folder"));
+        whytip(why.len ? why : Str("Terminal: open one in this folder"));
         Str model = v->model;
         if (model.len && hostcan(s->host, "models")) {
             model = modelshown(&a, s->host, v->endpoint, model);  // ENDPOINT/MODEL
@@ -2291,9 +2291,12 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         ImGui::TextDisabled("Not loaded: %s", cstr0(&a, showpath(v, v->skipped[i])));
     }
     if (v->instrtext.len) {
-        if (ImGui::SmallButton("Copy what the agent was given")) {
+        if (ImGui::SmallButton(ICON_COPY "##instrcopy")) {
             ImGui::SetClipboardText(cstr0(&a, v->instrtext));
         }
+        itemnamed(g, "instructions copy");
+        ImGui::SetItemTooltip("Copy what the agent was given: these files' text, as its "
+                              "system prompt has it");
     }
 
     // Skills, as its engine last listed them: /name invokes one
@@ -2333,13 +2336,13 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
                          ": only a file on this computer shows in its file manager"))
                 : !v->mems.len ? Str("Nothing is saved yet") : Str{};
         ImGui::BeginDisabled(why.len != 0);
-        if (ImGui::SmallButton("Reveal")) {
+        if (ImGui::SmallButton(ICON_FOLDER "##memreveal")) {
             guishow(g, join(&a, v->memdir, "MEMORY.md"));
         }
         ImGui::EndDisabled();
         itemnamed(g, "memory reveal");
-        whytip(why.len ? why : Str("Show MEMORY.md, the index of the memories, in the "
-                                   "file manager"));
+        whytip(why.len ? why : Str("Reveal: show MEMORY.md, the index of the memories, in "
+                                   "the file manager"));
         if (!v->mems.len) {
             ImGui::TextDisabled("Nothing is saved yet: the agent saves what later "
                                 "sessions here should know, and what you ask it to "
@@ -2754,9 +2757,9 @@ static void drawsessbar(Gui *g)
     ImGuiStyle &st    = ImGui::GetStyle();
     f32         gap   = st.ItemSpacing.x;
     f32         gw    = gaugewidth(g, v);
-    char const *tl    = "Tool output";
-    char const *rl    = "Reasoning";
-    f32         infow = ImGui::CalcTextSize("Info").x + 2*st.FramePadding.x;
+    char const *tl    = ICON_TOOLS;      // Tool output
+    char const *rl    = ICON_LIGHTBULB;  // Reasoning
+    f32         infow = ImGui::CalcTextSize(ICON_INFO).x + 2*st.FramePadding.x;
     f32         tw    = ImGui::CalcTextSize(tl).x + 2*st.FramePadding.x;
     f32         rw    = ImGui::CalcTextSize(rl).x + 2*st.FramePadding.x;
     f32         rest  = (gw>0 ? gw + gap : 0) + tw + gap + rw + gap + infow;
@@ -2848,21 +2851,21 @@ static void drawsessbar(Gui *g)
         setsessiontools(g, s, !v->showtools);
     }
     itemrect(g, RECT_TOOLSBTN);
-    ImGui::SetItemTooltip("Open every tool row's output in this session, or fold them "
-                          "again as the settings say (%s)", shortcutname(g, 0));
+    ImGui::SetItemTooltip("Tool output: open every tool row's output in this session, "
+                          "or fold them again as the settings say (%s)", shortcutname(g, 0));
     ImGui::SameLine();
     if (togglebutton(rl, v->showthink)) {
         setsessionthink(g, s, !v->showthink);
     }
     itemrect(g, RECT_THINKBTN);
-    ImGui::SetItemTooltip("Show all reasoning in this session, even hidden, or fold it "
-                          "again as the settings say (%s)", shortcutname(g, 1));
+    ImGui::SetItemTooltip("Reasoning: show all of it in this session, even hidden, or "
+                          "fold it again as the settings say (%s)", shortcutname(g, 1));
     ImGui::SameLine();
-    if (ImGui::SmallButton("Info")) {
+    if (ImGui::SmallButton(ICON_INFO)) {
         ImGui::OpenPopup("##sessinfo");
     }
     itemrect(g, RECT_INFOBTN);
-    ImGui::SetItemTooltip("The session's model, role and instruction files");
+    ImGui::SetItemTooltip("Info: the session's model, role and instruction files");
     if (ImGui::BeginPopup("##sessinfo")) {
         drawinfo(g, s, v);
         ImGui::EndPopup();
@@ -3468,7 +3471,8 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
     ImGui::SameLine();
-    b32 close = ImGui::SmallButton("Close");
+    b32 close = ImGui::SmallButton(ICON_CLOSE "##findclose");
+    itemnamed(g, "find close");
     ImGui::SetItemTooltip("Close the find bar (Esc)");
     if (esc || close) {
         gui_find_close(g);
@@ -4677,7 +4681,6 @@ static void drawattached(Gui *g, GuiSession *s)
 
 static void drawprompt(Gui *g)
 {
-    f32         sc  = g->scale;
     View       *v   = g->view;
     GuiSession *s   = g->sess ? g->sess : &g->nosession;
     b32         can = g->sess && g->sess->view && !g->sess->readonly && !g->quitting &&
@@ -4799,7 +4802,7 @@ static void drawprompt(Gui *g)
         g->promptfocus = 1;
     }
 
-    f32 bw = 80*sc;
+    f32 bw = 1.5f*ImGui::GetFrameHeight();  // its buttons' icons
     ImVec2 size = v2(ImGui::GetContentRegionAvail().x - bw - ImGui::GetStyle().ItemSpacing.x,
                      ImGui::GetContentRegionAvail().y);
     ImGui::PushID(s);
@@ -4882,20 +4885,23 @@ static void drawprompt(Gui *g)
     ImGui::SameLine();
     ImGui::BeginGroup();
     ImGui::BeginDisabled(!can || editing);
-    send |= ImGui::Button(v->busy ? "Steer" : "Send", v2(bw, 0));
-    ImGui::SetItemTooltip(v->busy ? "Send to the running turn: the agent reads it at its next step (Enter)"
+    send |= ImGui::Button(v->busy ? ICON_REPLY "##send" : ICON_SEND "##send", v2(bw, 0));
+    itemnamed(g, "send");
+    ImGui::SetItemTooltip(v->busy ? "Steer: send to the running turn, which the agent reads "
+                                    "at its next step (Enter)"
                                   : "Send the prompt (Enter; Shift+Enter for a new line)");
     if (v->busy) {
-        if (ImGui::Button("Stop", v2(bw, 0))) {
+        if (ImGui::Button(ICON_STOP "##stop", v2(bw, 0))) {
             guicancel(g, g->sess);
         }
-        ImGui::SetItemTooltip("Cancel the turn, killing any command it runs (Esc)");
+        itemnamed(g, "stop");
+        ImGui::SetItemTooltip("Stop: cancel the turn, killing any command it runs (Esc)");
     }
     ImGui::EndDisabled();
     if (g->sess && hostcap(s->host, "images")) {
         Str why = attachwhy(s);
         ImGui::BeginDisabled(why.len>0 || editing);
-        if (ImGui::Button("Image...", v2(bw, 0))) {
+        if (ImGui::Button(ICON_ATTACH "##attach", v2(bw, 0))) {
             attachpick(g, s);
         }
         ImGui::EndDisabled();
@@ -5876,10 +5882,10 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     // Buttons at the right of a host's heading
     b32         remote1 = r->kind==SROW_HOST && (!h || h->kind==GH_REMOTE);
     b32         live    = h && h->r && !h->closing;
-    char const *cbtn    = live ? "Disconnect" : "Connect";
+    char const *cbtn    = live ? ICON_DISCONNECT : ICON_PLUG;  // Disconnect, Connect
     f32         bw      = 0;
     if (r->kind == SROW_HOST) {
-        bw += ImGui::CalcTextSize("+").x + 2*st.FramePadding.x + st.ItemSpacing.x;
+        bw += ImGui::CalcTextSize(ICON_ADD).x + 2*st.FramePadding.x + st.ItemSpacing.x;
         if (remote1) {
             bw += ImGui::CalcTextSize(cbtn).x + 2*st.FramePadding.x + st.ItemSpacing.x;
         }
@@ -5956,7 +5962,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         f32 y = p.y + (lineh + 4*sc - ImGui::GetFrameHeight())/2;
         ImGui::SetCursorScreenPos(v2(p.x + w - bw + st.ItemSpacing.x, y));
         ImGui::BeginDisabled(!h || !hostready(g, h));
-        if (ImGui::SmallButton("+")) {
+        if (ImGui::SmallButton(ICON_ADD)) {
             g->newhost = h;
             newsession(g);
         }
@@ -5970,8 +5976,8 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
             b32 b = ImGui::SmallButton(cbtn);
             ImGui::EndDisabled();
             itemnamed(g, concat(&a, "connect ", r->key));
-            ImGui::SetItemTooltip("%s", live ? "Leave it: its sessions run on there" :
-                                               connecttip(g, r->key));
+            ImGui::SetItemTooltip("%s", live ? "Disconnect: leave it, its sessions running "
+                                               "on there" : connecttip(g, r->key));
             if (b && live) {
                 hostleave(g, h);
             } else if (b) {
@@ -6136,7 +6142,7 @@ static void drawsessions(Gui *g)
         ImGui::MarkIniSettingsDirty();
     }
     ImGui::BeginDisabled(!cannew(g));
-    if (ImGui::SmallButton("+")) {
+    if (ImGui::SmallButton(ICON_ADD)) {
         g->newhost = 0;  // the default host
         newsession(g);
     }
@@ -6145,10 +6151,11 @@ static void drawsessions(Gui *g)
     whytip(cannew(g) ? Str("A new session, on this computer") : Str{});
     if (g->enginekind != ENGINE_FAKE) {
         ImGui::SameLine();
-        if (ImGui::SmallButton("Refresh")) {
+        if (ImGui::SmallButton(ICON_REFRESH "##refresh")) {
             guilistall(g);
         }
-        ImGui::SetItemTooltip("List the sessions again");
+        itemnamed(g, "sessions refresh");
+        ImGui::SetItemTooltip("Refresh: list the sessions again");
     }
 
     // The hosts to list: every one reached, and every configured remote
@@ -6541,17 +6548,17 @@ static void drawplan(Gui *g)
                          ": only a file on this computer shows in its file manager"))
                 : Str{};
         ImGui::BeginDisabled(why.len != 0);
-        if (ImGui::Button("Reveal")) {
+        if (ImGui::Button(ICON_FOLDER "##planreveal")) {
             guishow(g, v->planpath);
         }
         ImGui::EndDisabled();
         itemnamed(g, "plan reveal");
         #if defined(__APPLE__)
-        whytip(why.len ? why : Str("Show the plan file in Finder"));
+        whytip(why.len ? why : Str("Reveal: show the plan file in Finder"));
         #elif defined(_WIN32)
-        whytip(why.len ? why : Str("Show the plan file in File Explorer"));
+        whytip(why.len ? why : Str("Reveal: show the plan file in File Explorer"));
         #else
-        whytip(why.len ? why : Str("Show the plan file in the file manager"));
+        whytip(why.len ? why : Str("Reveal: show the plan file in the file manager"));
         #endif
     }
     char const *mode = v->plan ? "Plan mode: changing nothing until you approve"
@@ -6678,7 +6685,7 @@ static void drawchanges(Gui *g)
 
     // The branch, its operation and upstream, then Refresh at the right
     ImGuiStyle &st = ImGui::GetStyle();
-    f32         bw = ImGui::CalcTextSize("Refresh").x + 2*st.FramePadding.x;
+    f32         bw = ImGui::CalcTextSize(ICON_REFRESH).x + 2*st.FramePadding.x;
     f32         rx = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw;
     Str         name = c->branch.len ? c->branch : w->branch;
     if (!c->branch.len && w->detached) {
@@ -6737,15 +6744,15 @@ static void drawchanges(Gui *g)
     }
     b32 busy = c->id && c->id==w->id;
     ImGui::BeginDisabled(busy);
-    if (ImGui::Button("Refresh")) {
+    if (ImGui::Button(ICON_REFRESH "##refresh")) {
         w->statusat = 0;
         gitstale(g, s);
     }
     ImGui::EndDisabled();
     itemnamed(g, "changes refresh");
     ImGui::SetItemTooltip(busy ? "Reading the changes" :
-                          "Read the changes again. They are read as the agent's "
-                          "tools finish, and as this window takes the focus back.");
+                          "Refresh: read the changes again. They are read as the "
+                          "agent's tools finish, and as this window takes the focus back.");
     Str root = homeshow(&a, s->host, w->root);
     cut = midcut(&a, root, ImGui::GetContentRegionAvail().x, &m, 0);
     ImGui::TextDisabled("%s", cstr0(&a, cut.len ? cut : root));
@@ -8046,13 +8053,14 @@ static void drawhosts(Gui *g)
         ImGui::TextDisabled("No engine: the fake agent has no hosts.");
         return;
     }
-    if (ImGui::SmallButton("Look again")) {
+    if (ImGui::SmallButton(ICON_REFRESH "##lookagain")) {
         findhosts(g, a);
         findwsl(g);
         guiconfigget(g);
     }
-    ImGui::SetItemTooltip("Find background hosts and WSL distros again, and read the "
-                          "remotes from the configuration");
+    itemnamed(g, "hosts look again");
+    ImGui::SetItemTooltip("Look again: find background hosts and WSL distros again, and "
+                          "read the remotes from the configuration");
 
     // This process
     ImGui::SeparatorText("This computer");
@@ -9269,9 +9277,11 @@ static void drawsettings(Gui *g)
     ImGui::PushTextWrapPos(0);
     ImGui::TextDisabled("Edits go to %s", path.len ? cstr0(&a, path) : "(no file)");
     ImGui::PopTextWrapPos();
-    if (ImGui::SmallButton("Reload")) {
+    if (ImGui::SmallButton(ICON_REFRESH "##reload")) {
         guiconfigget(g);
     }
+    itemnamed(g, "settings reload");
+    ImGui::SetItemTooltip("Reload: read the configuration's files again");
     cfgeditbutton(g, a, path, jsonint(jsonget(j, "exists"), 0) != 0);
     i32 urls = (i32)jsonlen(jsonget(j, "includes"));
     if (urls) {
@@ -9543,6 +9553,7 @@ static void drawfontcredits()
     ImGui::BulletText("JetBrains Mono: Copyright 2020 JetBrains (OFL 1.1)");
     ImGui::BulletText("Noto Sans Symbols 2, Noto Sans Math: Copyright 2022 "
                       "The Noto Project Authors, Google (OFL 1.1)");
+    ImGui::BulletText("Codicons: Copyright Microsoft Corporation (CC BY 4.0)");
 }
 
 // A Help topic picked, from its list or a link: shown from its top, and

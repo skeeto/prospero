@@ -38,12 +38,15 @@ once.
 
 ## Talking to the agent
 
-Enter sends the prompt. While the agent works, the Send button becomes
-Steer: what you send then waits at the end of the transcript, dimmed
-and marked "Next step", until the agent reads it at its next step (or
-marked "Queued", for a turn of its own, as it is when sent too late for
-this turn), and its Withdraw button takes it back into the box. Stop,
-or Esc, cancels the turn and kills any command it runs.
+Enter sends the prompt. The buttons beside the prompt box are icons,
+named in their tooltips: Send (a paper plane), and Attach (a paper
+clip). While the agent works, Send becomes Steer (a curved arrow), and
+Stop (a square) shows below it. What you send while it works waits at
+the end of the transcript, dimmed and marked "Next step", until the
+agent reads it at its next step (or marked "Queued", for a turn of its
+own, as it is when sent too late for this turn), and its Withdraw
+button takes it back into the box. Stop, or Esc, cancels the turn and
+kills any command it runs.
 
 A long command or subagent keeps the agent from reading what you
 send until it ends. Run in background, on its row, or Ctrl+B (also in
@@ -106,7 +109,7 @@ Above them are the branch, its upstream, and the commits ahead (↑)
 and behind (↓) it.
 
 git runs only while the pane shows: as the agent's tools finish, as
-the window takes the focus back, and on Refresh, less often for a slow
+the window takes the focus back, and on Refresh (the circular arrow), less often for a slow
 repository, without taking git's locks or changing its index. It is
 `[tools] git`, else the git on PATH (see
 [Configuration](help:config)). A session on another host has its

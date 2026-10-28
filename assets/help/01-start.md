@@ -7,6 +7,9 @@ sections that have them all take the topics' place, headings that
 match first. Click one to go there, or press Enter for the first.
 Escape, or the X, brings the topics back.
 
+Buttons drawn as icons say what they do in their tooltips: hold the
+mouse over one to see its name.
+
 Prospero is a coding harness. A language model, the agent, works on
 code through tools: it reads, writes and edits files, runs commands,
 searches, keeps a todo list, starts background jobs and subagents. The

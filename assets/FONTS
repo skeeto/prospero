@@ -25,3 +25,16 @@ NotoSansSymbols2-subset.ttf, NotoSansMath-subset.ttf
             NotoSansSymbols2-subset.ttf
     SHA-256 7fb88435205f87de14836b5097be625f9e8d31757c0934c3e81c6324ba4d2b46
             NotoSansMath-subset.ttf
+
+codicon.ttf
+    Codicons, version 1.15, the icon font of Visual Studio Code,
+    decompressed unchanged from dcmake's src/icon_font.hpp: the icons of
+    buttons, merged after the others over U+EA60-F102 only.
+    Copyright Microsoft Corporation
+    https://github.com/microsoft/vscode-codicons
+    Its repository licenses the icons under Creative Commons Attribution
+    4.0 International (https://creativecommons.org/licenses/by/4.0/) and
+    its code under the MIT License; dcmake's copy is headed "MIT
+    License, Copyright (C) 2019-2026 Microsoft Corporation".
+    SHA-256 2bb558cb693451e73c28c33fe64aa89bc19b1a4b70f95948322c243f93476920
+            codicon.ttf

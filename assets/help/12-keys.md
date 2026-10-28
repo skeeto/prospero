@@ -12,9 +12,10 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 - **Ctrl+F**: find in the transcript. In Help or Settings, while it has
   the focus, its search field instead.
 - **Ctrl+Shift+T**: open, or fold again, all of the session's tool
-  output (the Tool output button above the transcript).
+  output (the Tool output button above the transcript, a wrench and
+  screwdriver).
 - **Ctrl+Shift+R**: show, or fold again, all of its reasoning (the
-  Reasoning button).
+  Reasoning button, a light bulb).
 - **Ctrl+=** and **Ctrl+-** zoom the text in and out, and **Ctrl+0**
   resets it; so does the mouse wheel with Ctrl held. The zoom lasts
   until Prospero exits: `[ui] font_size` sets the size for good.

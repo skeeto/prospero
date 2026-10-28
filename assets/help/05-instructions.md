@@ -21,8 +21,9 @@ files, in order:
 
 A No folder session gets only your own file, none of a project's.
 
-The session bar's Info button lists the instruction files the agent
-was given, and Copy what the agent was given copies their text.
+The session bar's Info button (the circled i) lists the instruction
+files the agent was given, and its copy icon, Copy what the agent was
+given, copies their text.
 
 ## Memory
 
