@@ -110,13 +110,19 @@ jobs:
           echo "V=$v" >>"$GITHUB_ENV"
           echo "version=$v" >>"$GITHUB_OUTPUT"
 
-      # Wine, uv for the Python suites, and w64devkit, the last two pinned
-      # by SHA-256. w64devkit's GCC is multilib, so -m32 builds the i686
-      # engine, and only 64-bit Windows programs run under Wine.
+      # Wine, the headers SDL builds its X11 and Wayland video against
+      # (it loads the libraries at run time), uv for the Python suites,
+      # and w64devkit, the last two pinned by SHA-256. w64devkit's GCC is
+      # multilib, so -m32 builds the i686 engine, and only 64-bit Windows
+      # programs run under Wine.
       - name: Install the tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wine
+          sudo apt-get install -y --no-install-recommends wine \
+              libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+              libxfixes-dev libxss-dev libxtst-dev libwayland-dev \
+              libxkbcommon-dev wayland-protocols libdecor-0-dev libegl-dev \
+              libgl-dev
           u=uv-x86_64-unknown-linux-gnu
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/$u.tar.gz" \
               "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$u.tar.gz"
