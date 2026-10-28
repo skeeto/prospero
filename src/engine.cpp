@@ -851,6 +851,8 @@ struct Engine {
     GitWork    *wt;       // runs git for worktrees (worktree.cpp)
     Slice<WtJob> wtjobs;  // worktree jobs not yet answered
     i64         wtserial;
+    Slice<Str>  wtdue;    // sessions whose worktrees may go now, "" for all
+    Slice<WtSess> wtgone; // worktrees of sessions deleted
 };
 
 
@@ -1963,6 +1965,9 @@ static Str  wtforked(Engine *, Arena, Str sid, WtSess *);
 static void wtsay(Engine *, Arena, Str sid, Str path, Str did, Str why, Str err,
                   Str branch);
 static void wtheed(Session *, Arena);
+static void wtsweep(Engine *, Arena);
+static void wtrestore(Engine *, Arena, Str sid);
+static WtJob *wtjobfor(Engine *, Str path);
 static void taskcheck(Session *, Arena, Str why, Str err);
 static b32  taskbudget(Session *, Arena);
 static b32  taskwake(Session *);
@@ -11458,6 +11463,7 @@ static Str cleantitle(Arena *a, Str text, iz max)
 }
 
 static Str sidecarput(Engine *, Arena, Str sid, Str name, Str data);
+static Str sidecarget(Engine *, Arena *, Str sid, Str name, iz max);
 
 // Title the session, by "auto" (its first prompt, or a subagent's task)
 // or by "user" (rename), which no automatic title replaces.
@@ -11636,6 +11642,11 @@ static void endturn(Session *s, Arena scratch, Str why, Str err)
     }
     if (!busy(s)) {
         arm(s, T_PARK, parkafter(s->e));
+    }
+    if (!busy(s) && s->wt.name.len &&
+            sidecarget(s->e, &scratch, s->sid, "archived", 16).data) {
+        // Archived while it worked: its worktree may go now
+        s->e->wtdue = push(&s->e->perm, s->e->wtdue, clone(&s->e->perm, s->sid));
     }
     taskcheck(s, scratch, why, err);
 }
@@ -13855,6 +13866,8 @@ struct ListEntry {
     b32       parked;
     b32       archived;
     b32       nofolder;  // in a folder of its own
+    WtSess    wt;        // a worktree session's worktree
+    b32       wtgone;    // and it is not there
     b32       shown;
     Slice<iz> kids;    // its subagents, oldest first
 };
@@ -13904,6 +13917,8 @@ static SessScan scansessions(Engine *e, Arena *a)
         en.group    = sidecarget(e, a, d->name, "group", GROUP_MAX);
         en.archived = sidecarget(e, a, d->name, "archived", 16).data != 0;
         en.nofolder = jsonint(jsonget(rec.root, "nofolder"), 0) == 1;
+        en.wt       = wtfrom(a, jsonget(rec.root, "worktree"));
+        en.wtgone   = en.wt.name.len && !wtexists(e, *a, &en.wt);
         en.mtime    = d->mtime;
         en.parked   = !s && parkedat(e, d->name)>=0;  // its lock is ours
         en.locked   = (!s || s->readonly) && !en.parked &&
@@ -15380,6 +15395,9 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     if (busy(s)) {
         reply(e, scratch, id, 0, "the session is busy: cancel its turn first", s->sid);
         return;
+    } else if (s->wt.name.len && (!wtexists(e, scratch, &s->wt) || wtjobfor(e, s->wt.path))) {
+        reply(e, scratch, id, 0, "its worktree is not there: a prompt makes it again", s->sid);
+        return;
     } else if (to->type == JSON_STRING) {
         // Newest first, as frontends find a call, should an old log have
         // a model's id more than once
@@ -15714,6 +15732,17 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     if (en->group.len) {
         putstrkey(w, "group", en->group);
     }
+    if (en->wt.name.len) {
+        putkey(w, "worktree");
+        putobject(w);
+        putstrkey(w, "name", en->wt.name);
+        putstrkey(w, "branch", en->wt.branch);
+        putstrkey(w, "path", en->wt.path);
+        if (en->wtgone) {
+            putintkey(w, "gone", 1);  // removed, or not yet made
+        }
+        putend(w);
+    }
     putend(w);
     for (iz k = 0; k<en->kids.len && depth<=TASK_DEPTH+8; k++) {
         listput(e, w, list, en->kids[k], depth+1);
@@ -15799,6 +15828,11 @@ static void cmdsidecar(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
     case CMD_ARCHIVE: {
         b32 on = jsonflag(jsonget(j, "on"), 1);
         err = sidecarput(e, scratch, sid, "archived", on ? Str("1") : Str{});
+        if (!err.len && on) {
+            e->wtdue = push(&e->perm, e->wtdue, clone(&e->perm, sid));
+        } else if (!err.len) {
+            wtrestore(e, scratch, sid);
+        }
     } break;
     case CMD_GROUP: {
         Json *n    = jsonget(j, "name");
@@ -16288,6 +16322,19 @@ static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
 
     Slice<Str> deleted = {};
     Slice<Str> mines   = {};  // their scratch directories
+    for (iz n = 0; n < tree.len; n++) {
+        WtSess *wt = &sc.list[tree[n]].wt;
+        if (wt->name.len) {
+            WtSess keep = {};
+            keep.name   = clone(&e->perm, wt->name);
+            keep.main   = clone(&e->perm, wt->main);
+            keep.branch = clone(&e->perm, wt->branch);
+            keep.base   = clone(&e->perm, wt->base);
+            keep.oid    = clone(&e->perm, wt->oid);
+            keep.path   = clone(&e->perm, wt->path);
+            e->wtgone   = push(&e->perm, e->wtgone, keep);  // swept once it goes
+        }
+    }
     for (iz n = tree.len-1; n>=0 && !err.len; n--) {
         ListEntry *en   = &sc.list[tree[n]];
         Str        msid = en->sid;
@@ -18235,6 +18282,7 @@ static void enginethread(void *arg)
     sweeptrash(e, newarena(e->scratch));
     sweepuploads(e, newarena(e->scratch));
     farinit(e, newarena(e->scratch));
+    e->wtdue = push(&e->perm, e->wtdue, Str{});  // left by an engine before
     for (;;) {
         i64 now  = os_ticks(e->os);
         i64 next = e->quitting ? e->quitby : I64MAX;
@@ -18242,6 +18290,7 @@ static void enginethread(void *arg)
         next = cfgnext(e->cfg)<next ? cfgnext(e->cfg) : next;
         next = mcpnext(e)<next ? mcpnext(e) : next;
         next = farnext(e)<next ? farnext(e) : next;
+        next = e->wtdue.len || e->wtgone.len ? now : next;
         for (Lister *l = e->listers; l; l = l->next) {
             next = !l->replied && l->by<next ? l->by : next;
         }
@@ -18309,6 +18358,9 @@ static void enginethread(void *arg)
                 s->parkme = 0;
                 p = &s->next;
             }
+        }
+        if ((e->wtdue.len || e->wtgone.len) && !e->quitting) {
+            wtsweep(e, newarena(e->scratch));  // worktrees no session needs
         }
 
         // Cancelling ends turns at once, but should a turn linger, the

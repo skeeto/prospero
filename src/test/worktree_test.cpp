@@ -22,7 +22,8 @@ static Str wtplacestr(Os *os, Arena *a, Str cwd)
 
 static void test_worktree(Test *t)
 {
-    Arena *a = &t->perm;
+    Arena  mem = t->perm;  // let go as it returns
+    Arena *a   = &mem;
 
     {
         static Str const good[] = {

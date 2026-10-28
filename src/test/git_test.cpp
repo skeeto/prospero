@@ -572,7 +572,8 @@ static void testgitcmd(Test *t)
 // worktree list's porcelain.
 static void testgitrefs(Test *t)
 {
-    Arena *a = &t->perm;
+    Arena  mem = t->perm;  // let go as it returns
+    Arena *a   = &mem;
     Str    x = "1111111111111111111111111111111111111111";
     Str    y = "2222222222222222222222222222222222222222";
     Str    z = "3333333333333333333333333333333333333333";

@@ -12834,6 +12834,128 @@ def worktree_side(t):
 
 
 @scenario(bound=60)
+def worktree_remove(t):
+    """A worktree goes once every session in it is archived or deleted:
+    removed if git calls it clean, its branch deleted only if merged, and
+    made again on unarchive, its branch from the commit it was at. A
+    dirty one is kept, and so is one a session open in another engine
+    works in, until an engine starts with none. The sessions list says
+    which are gone."""
+    env = gitrepo(t)
+    main = os.path.realpath(t.work)
+    keep = {k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")}
+    wtdir = lambda name: os.path.join(main, ".prospero", "worktrees", name)
+    branches = lambda: gitrun(t, env, "branch", "--format=%(refname:short)").split()
+    h = t.headless(env=keep)
+
+    def make(name):
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake", worktree={"name": name})
+        t.check(r.get("ok") == 1, f"new {name}: {r}")
+        h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == wtdir(name) and
+               e.get("did") == "made", 60)
+        return r["sid"]
+
+    def news(name, n=1, timeout=30):
+        h.wait(lambda e: len([x for x in h.all("worktree") if x.get("path") == wtdir(name)])
+               >= n, timeout)
+        return [x for x in h.all("worktree") if x.get("path") == wtdir(name)][n - 1]
+
+    try:
+        # Clean, its branch merged: both go; unarchived, both come back
+        a = make("clean")
+        wtturn(t, h, a)
+        h.call("archive", sid=a, on=1)
+        n = news("clean", 2)
+        t.check(n.get("did") == "removed" and n.get("branch") == "deleted", f"removed: {n}")
+        t.check(not os.path.exists(wtdir("clean")) and "prospero/clean" not in branches(),
+                f"gone: {branches()}")
+        h.call("list")
+        lst = {e["sid"]: e for e in h.all("sessions")[-1]["list"]}
+        t.check(lst[a].get("worktree") == {"name": "clean", "branch": "prospero/clean",
+                                           "path": wtdir("clean"), "gone": 1},
+                f"listed gone: {lst[a]}")
+        h.call("archive", sid=a, on=0)
+        n = news("clean", 3, 60)
+        t.check(n.get("did") == "made" and os.path.exists(os.path.join(wtdir("clean"), "README")),
+                f"made again: {n}")
+        t.check("prospero/clean" in branches(), "its branch again")
+
+        # A commit of its own: the worktree goes, its branch stays
+        gitrun(t, env, "commit", "-q", "--allow-empty", "-m", "mine", cwd=wtdir("clean"))
+        tip = gitrun(t, env, "rev-parse", "prospero/clean")
+        h.call("archive", sid=a, on=1)
+        n = news("clean", 4)
+        t.check(n.get("did") == "removed" and n.get("branch") == "unmerged", f"unmerged: {n}")
+        t.check(gitrun(t, env, "rev-parse", "prospero/clean") == tip, "its branch stays")
+
+        # Dirty: kept
+        b = make("dirty")
+        with open(os.path.join(wtdir("dirty"), "new.txt"), "w") as f:
+            f.write("work\n")
+        h.call("archive", sid=b, on=1)
+        n = news("dirty", 2)
+        t.check(n.get("did") == "kept" and n.get("why") == "dirty" and
+                os.path.exists(os.path.join(wtdir("dirty"), "new.txt")), f"kept dirty: {n}")
+
+        # Two sessions in one worktree: it goes with the second
+        c = make("shared")
+        wtturn(t, h, c)
+        d = h.call("fork", sid=c)["sid"]
+        h.call("archive", sid=c, on=1)
+        time.sleep(1)
+        t.check(len([x for x in h.all("worktree") if x.get("path") == wtdir("shared")]) == 1,
+                "kept for the other")
+        h.call("archive", sid=d, on=1)
+        t.check(news("shared", 2).get("did") == "removed", "removed with the second")
+
+        # Deleted
+        g = make("deleted")
+        h.call("delete", sid=g)
+        t.check(news("deleted", 2).get("did") == "removed", "removed on delete")
+
+        # A session in it open in another engine holds it
+        k = make("locked")
+        wtturn(t, h, k)
+        f = h.call("fork", sid=k)["sid"]
+        h.call("close", sid=k, forget=1)  # its lock let go, for h2 to take
+        time.sleep(0.5)
+        h2 = t.headless(env=keep)
+        try:
+            r = h2.call("open", sid=k)
+            t.check(r.get("ok") == 1, f"open in h2: {r}")
+            h.call("archive", sid=f, on=1)
+            time.sleep(1)
+            t.check(os.path.exists(wtdir("locked")) and not
+                    [x for x in h.all("worktree") if x.get("path") == wtdir("locked")][1:],
+                    "kept while open elsewhere")
+            r = h2.call("archive", sid=k, on=1)
+            t.check(r.get("ok") == 1, f"archived in h2: {r}")
+            n = h2.wait(lambda e: e.get("ev") == "worktree" and e.get("did") == "removed", 30)
+            t.check(n.get("path") == wtdir("locked"), f"removed by h2: {n}")
+        finally:
+            h2.close()
+
+        # Archived with no engine to see it: an engine starting removes it
+        z = make("startup")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    with open(os.path.join(t.state, "sessions", z, "archived"), "w") as f:
+        f.write("1")
+    h = t.headless(env=keep)
+    try:
+        h.call("list")
+        n = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == wtdir("startup"), 30)
+        t.check(n.get("did") == "removed", f"removed as an engine starts: {n}")
+        time.sleep(1)
+        others = [x for x in h.all("worktree") if x.get("path") != wtdir("startup")]
+        t.check(not others, f"nothing else tried again: {others}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=60)
 def worktree_quit(t):
     """Quitting while git makes a worktree, its post-checkout hook slow:
     git is asked to stop, and the engine waits a while for it, then

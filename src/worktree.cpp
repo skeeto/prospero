@@ -1168,11 +1168,36 @@ static b32 wtgate(Session *s, Arena scratch, b32 turn)
     return 0;
 }
 
+// The sessions recording a worktree, by their records.
+static Slice<Str> wtrecorders(Engine *e, Arena *a, Str path)
+{
+    Slice<Str> r   = {};
+    Str        dir = join(a, e->statedir, "sessions");
+    for (Dirent *d = os_list(e->os, a, dir); d; d = d->next) {
+        if (!d->isdir || !validsid(d->name)) continue;
+        Arena  t   = *a;
+        Str    log = join(&t, join(&t, dir, d->name), "events.jsonl");
+        Read   rd  = os_readat(e->os, &t, log, 0, 4096);
+        EvRec  rec = evparse(&t, cut(rd.data, '\n').head);
+        WtSess wt  = rec.ok && rec.ev==EV_SESSION ? wtfrom(&t, jsonget(rec.root, "worktree"))
+                                                  : WtSess{};
+        if (wt.path == path) {
+            r = push(a, r, d->name);
+        }
+    }
+    return r;
+}
+
 // A worktree made, or not: the sessions in it go on, and those waiting
-// for it begin their turns, or end them with git's reason.
+// for it begin their turns, or end them with git's reason. Made, it is
+// no longer marked as removed or kept.
 static void wtmade(Engine *e, Arena scratch, Str sid, Str path, b32 ok, Str err)
 {
     wtsay(e, scratch, sid, path, ok ? Str("made") : Str("failed"), {}, err, {});
+    Slice<Str> sids = ok ? wtrecorders(e, &scratch, path) : Slice<Str>{};
+    for (iz i = 0; i < sids.len; i++) {
+        sidecarput(e, scratch, sids[i], "worktree", {});
+    }
     for (Session *s = e->sessions; s; s = s->next) {
         Arena a = scratch;
         if (s->wt.path != path) {
@@ -1191,14 +1216,147 @@ static void wtmade(Engine *e, Arena scratch, Str sid, Str path, b32 ok, Str err)
     }
 }
 
-// A worktree removed, or kept, and its branch.
+// A worktree removed, or kept, and its branch: the sessions recording it
+// are marked so (the worktree sidecar), with the branch's commit then, or
+// "kept", which only an archive or a delete tries again. Turns waiting
+// for the removal ask for the worktree again.
 static void wtremoved(Engine *e, Arena scratch, Json *answer)
 {
-    b32 ok  = jsonint(jsonget(answer, "ok"), 0) == 1;
-    Str did = ok ? jsonstr(jsonget(answer, "did")) : Str("kept");
-    Str why = ok ? jsonstr(jsonget(answer, "why")) : Str("error");
-    wtsay(e, scratch, jsonstr(jsonget(answer, "sid")), jsonstr(jsonget(answer, "path")),
-          did, why, jsonstr(jsonget(answer, "err")), jsonstr(jsonget(answer, "branch")));
+    b32 ok   = jsonint(jsonget(answer, "ok"), 0) == 1;
+    Str did  = ok ? jsonstr(jsonget(answer, "did")) : Str("kept");
+    Str why  = ok ? jsonstr(jsonget(answer, "why")) : Str("error");
+    Str path = jsonstr(jsonget(answer, "path"));
+    Str tip  = jsonstr(jsonget(answer, "tip"));
+    wtsay(e, scratch, jsonstr(jsonget(answer, "sid")), path, did, why,
+          jsonstr(jsonget(answer, "err")), jsonstr(jsonget(answer, "branch")));
+    Str        mark = did=="kept" ? Str("kept") : gitoid(tip) ? tip : Str("gone");
+    Slice<Str> sids = wtrecorders(e, &scratch, path);
+    for (iz i = 0; i < sids.len; i++) {
+        sidecarput(e, scratch, sids[i], "worktree", mark);
+    }
+    for (Session *s = e->sessions; s; s = s->next) {
+        if (s->wt.path==path && s->state==S_WORKTREE) {
+            Arena a = scratch;
+            setstate(s, S_IDLE);
+            turnready(s, a);
+        }
+    }
+}
+
+// Worktrees no session needs any longer, removed: those of the sessions
+// due (wtdue), or of all sessions ("" in it, as the engine starts), and
+// of those deleted (wtgone). One goes once every session recording it,
+// or working in it, is archived (it or an ancestor) or deleted, open in
+// no other process, and idle here, which is then parked, so that its MCP
+// servers let go of the folder. As the engine starts, a worktree marked
+// removed or kept (the worktree sidecar) is left alone, unless it is
+// back, made again by hand.
+static void wtsweep(Engine *e, Arena scratch)
+{
+    b32 win = HOST_WINDOWS;
+    b32 all = 0;
+    for (iz i = 0; i < e->wtdue.len; i++) {
+        all |= !e->wtdue[i].len;
+    }
+    SessScan       sc    = scansessions(e, &scratch);
+    Slice<WtSess>  cands = {};
+    Slice<b32>     named = {};  // by a session due, or deleted
+    for (iz k = 0; k < sc.list.len + e->wtgone.len; k++) {
+        WtSess *wt   = k<sc.list.len ? &sc.list[k].wt : &e->wtgone[k-sc.list.len];
+        b32     gone = k >= sc.list.len;
+        iz      at   = -1;
+        for (iz i = 0; wt->name.len && at<0 && i<cands.len; i++) {
+            at = (win ? equalfold(cands[i].path, wt->path) : cands[i].path==wt->path) ? i : -1;
+        }
+        if (wt->name.len && at<0) {
+            cands = push(&scratch, cands, *wt);
+            named = push(&scratch, named, gone);
+        } else if (at >= 0) {
+            named[at] |= gone;
+        }
+    }
+    for (iz d = 0; d < e->wtdue.len; d++) {
+        iz *at = e->wtdue[d].len ? upsert(&sc.bysid, e->wtdue[d], (Arena *)0) : 0;
+        Str cwd = at ? normpath(&scratch, sc.list[*at].cwd, ".", win) : Str{};
+        for (iz i = 0; at && i<cands.len; i++) {
+            Str p = normpath(&scratch, cands[i].path, ".", win);
+            named[i] |= sc.list[*at].wt.path==cands[i].path || within(p, cwd, win);
+        }
+    }
+    e->wtdue.len  = 0;
+    e->wtgone.len = 0;
+
+    for (iz c = 0; c < cands.len; c++) {
+        WtSess *wt = &cands[c];
+        if ((!all && !named[c]) || wtjobfor(e, wt->path)) {
+            continue;
+        }
+        Arena           t      = scratch;
+        Str             p      = normpath(&t, wt->path, ".", win);
+        b32             ok     = 1;
+        b32             marked = 1;  // every session recording it is
+        Str             sid    = {};
+        Slice<Session*> parks  = {};
+        for (iz i = 0; ok && i<sc.list.len; i++) {
+            ListEntry *en  = &sc.list[i];
+            b32        rec = en->wt.path == wt->path;
+            if (!rec && !within(p, normpath(&t, en->cwd, ".", win), win)) {
+                continue;
+            }
+            sid     = rec && !sid.len ? en->sid : sid;
+            marked &= !rec || sidecarget(e, &t, en->sid, "worktree", 128).data!=0;
+            Session *s = findsession(e, en->sid);
+            ok = scanarchived(&sc, i) && !en->locked && (!s || (!s->readonly && parkable(s)));
+            if (s && ok) {
+                parks = push(&t, parks, s);
+            }
+        }
+        b32 there = os_stat(e->os, t, wt->path).type != STAT_MISSING;
+        b32 kept  = sid.len && gitclean(sidecarget(e, &t, sid, "worktree", 128))=="kept";
+        if (!ok || (!named[c] && marked && (!there || kept))) {
+            continue;  // as the engine starts: removed, or kept, before
+        }
+        for (iz i = 0; i < parks.len; i++) {
+            park(e, parks[i]);
+        }
+        WtSpec sp = {};
+        sp.sid    = sid;
+        sp.main   = wt->main;
+        sp.path   = wt->path;
+        sp.branch = wt->branch;
+        sp.base   = wt->base;
+        sp.oid    = wt->oid;
+        wtqueue(e, t, WT_REMOVE, &sp);  // if it cannot, the next sweep tries
+    }
+}
+
+// An archive undone: its worktree made again, if gone, its branch from
+// the commit it was at when removed, should it be gone too.
+static void wtrestore(Engine *e, Arena scratch, Str sid)
+{
+    Session *s = findsession(e, sid);
+    if (s) {
+        wtgate(s, scratch, 0);
+        return;
+    }
+    Str    log = sidecarpath(&scratch, e, sid, "events.jsonl");
+    Read   rd  = os_readat(e->os, &scratch, log, 0, 4096);
+    EvRec  rec = evparse(&scratch, cut(rd.data, '\n').head);
+    WtSess wt  = rec.ok && rec.ev==EV_SESSION ? wtfrom(&scratch, jsonget(rec.root, "worktree"))
+                                              : WtSess{};
+    if (!wt.name.len || (wtexists(e, scratch, &wt) && !wtjobfor(e, wt.path))) {
+        return;
+    }
+    WtSpec sp = {};
+    sp.sid    = sid;
+    sp.main   = wt.main;
+    sp.path   = wt.path;
+    sp.branch = wt.branch;
+    sp.base   = wt.base;
+    sp.oid    = wt.oid;
+    sp.tip    = gitclean(sidecarget(e, &scratch, sid, "worktree", 128));
+    sp.tip    = gitoid(sp.tip) ? sp.tip : Str{};
+    wtqueue(e, scratch, WT_MAKE, &sp);
 }
 
 // The worker's answer to a job.

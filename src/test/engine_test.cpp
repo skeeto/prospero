@@ -267,6 +267,7 @@ static void testsidecars(Test *t)
     Engine *e = alloc<Engine>(&a);
     e->os       = v.os;
     e->statedir = "/s";
+    e->perm     = carve(&a, 1<<16);  // an archive's sessions due a sweep
     MadeSession made[] = {
         {"20260101-000000-aaaa", {}},  // closed
         {"20260101-000001-bbbb", {}},  // open in another process
