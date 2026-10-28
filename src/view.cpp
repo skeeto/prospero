@@ -714,10 +714,29 @@ static i32 addmsg(View *v, i32 role, Str text)
         m.collapsed = thinkfolded(v);
     }
     v->msgs = push(&v->meta, v->msgs, m);
-    v->topsdirty  = 1;
-    v->provmixed |= v->prov >= 0;
-    v->stream     = -1;  // later deltas start a new message after it
-    return (i32)v->msgs.len - 1;
+    v->topsdirty = 1;
+    if (v->prov<0 || v->stream<0) {
+        v->provmixed |= v->prov >= 0;
+        v->stream     = -1;  // later deltas start a new message after it
+        return (i32)v->msgs.len - 1;
+    }
+
+    // While a stream is live it goes ahead of the provisional run, where
+    // it stays once the response is committed, so the stream goes on in
+    // its blocks rather than splitting around it. (After a failed
+    // attempt, faded, it follows.) Its text lies past the run's, which is
+    // then not reclaimed (provmixed).
+    for (iz k = v->msgs.len-1; k > v->prov; k--) {
+        v->msgs[k] = v->msgs[k-1];
+    }
+    v->msgs[v->prov] = m;
+    Pos *ps[] = {&v->sel.anchor, &v->sel.anchor1, &v->sel.focus};
+    for (iz k = 0; v->sel.active && k < countof(ps); k++) {
+        ps[k]->msg += ps[k]->msg >= v->prov;
+    }
+    v->provmixed = 1;
+    v->stream   += v->stream >= 0;
+    return v->prov++;
 }
 
 // A change to the session, as a line of the transcript that the agent

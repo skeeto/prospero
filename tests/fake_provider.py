@@ -2676,7 +2676,7 @@ static int greet(char const *name)
 }
 ```
 
-> Edits outside the workspace ask first.
+> ⚠️ Edits outside the workspace ask first.
 
 """
 

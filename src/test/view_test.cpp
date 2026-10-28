@@ -12,7 +12,7 @@ static View *testview(Arena *a)
 static Str msgsshow(Arena *a, View *v)
 {
     Buf b(a, 256);
-    static char const roles[] = "UATXNKCR";
+    static char const roles[] = "UATXNKCRM";
     for (iz i = 0; i < v->msgs.len; i++) {
         ViewMsg *m = &v->msgs[i];
         putbyte(&b, (u8)roles[m->role]);
@@ -136,18 +136,38 @@ static void test_view(Test *t)
         expect(t, "view.garbage", istr(&a, changed), "0");
     }
 
-    // A note arriving mid-stream survives the commit that replaces the
-    // provisional messages around it
+    // A note arriving mid-stream goes ahead of it, where it stays once
+    // the commit replaces the provisional messages, so the stream goes
+    // on in one message
     {
         Arena a = perm;
         View *v = testview(&a);
         apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"kind":"text","text":"ab"})");
         apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"note","level":"info","text":"retrying"})");
         apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"kind":"text","text":"cd"})");
-        expect(t, "view.midnote", msgsshow(&a, v), "A~:ab;N:retrying;A~:cd;");
+        expect(t, "view.midnote", msgsshow(&a, v), "N:retrying;A~:abcd;");
         apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"assistant","turn":1,)"
                     R"("blocks":[{"t":"text","text":"abcd"}]})");
         expect(t, "view.midnotekept", msgsshow(&a, v), "N:retrying;A:abcd;");
+    }
+
+    // Likewise a mode change in the middle of reasoning, a selection in
+    // the stream moving with it
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"q"})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"kind":"think","text":"hm, "})");
+        selset(v, 1, 0, 1, 2);
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"mode","mode":"plan","by":"user"})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"kind":"think","text":"so"})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"kind":"text","text":"ok"})");
+        expect(t, "view.midmode", msgsshow(&a, v), "U:q;M:the agent changes nothing but its plan;T~:hm, so;A~:ok;");
+        Range r = selrange(&v->sel);
+        expect(t, "view.midmodesel", istr(&a, r.beg.msg*100 + r.end.msg), "202");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"assistant","turn":1,)"
+                    R"("blocks":[{"t":"think","text":"hm, so"},{"t":"text","text":"ok"}]})");
+        expect(t, "view.midmodekept", msgsshow(&a, v), "U:q;M:the agent changes nothing but its plan;T:hm, so;A:ok;");
     }
 
     // An interrupted turn drops its provisional text, and a selection

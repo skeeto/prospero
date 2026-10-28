@@ -17560,6 +17560,11 @@ static ImFont *addface(Str data, i32 flags)
     addfont(fontsymbols(), flags, 1);
     addfont(fontmath(), flags, 1);
     addicons(flags);
+    for (auto r : fontinvisible) {
+        for (i32 cp = r[0]; cp <= r[1]; cp++) {
+            f->AddRemapCodepoint((ImWchar)cp, 0xfeff);
+        }
+    }
     return f;
 }
 

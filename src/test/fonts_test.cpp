@@ -66,5 +66,17 @@ static void test_fonts(Test *t)
         }
     }
     expect(t, "fonts.icons.bad", finish(&bad), "");
+
+    // What draws nothing draws as U+FEFF, which each face's first font
+    // has (zero-width there); none of it is a glyph of its own anywhere
+    expect(t, "fonts.invisible.feff",
+           istr(&a, fontcovers(fontroboto(), 0xfeff) && fontcovers(fontmono(), 0xfeff)), "1");
+    i32 drawn = 0;
+    for (auto r : fontinvisible) {
+        for (i32 cp = r[0]; cp <= r[1]; cp++) {
+            drawn += fontprose(cp);
+        }
+    }
+    expect(t, "fonts.invisible.drawn", istr(&a, drawn), "0");
     expect(t, "fonts.icons.count", istr(&a, icons), "16");
 }

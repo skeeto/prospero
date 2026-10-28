@@ -82,6 +82,16 @@ static Str fontsymbolsused =
     "▶ ▸ ▾ ▼ ▲ ◀ ● ○ ■ □ ◆ ★ ☆ ☐ ☑ ☒ ⚠ ⏳ ✎ ✂ "
     "⌘ ⇧ ⌥ ⌃ ⏎ ⌫ ⇥ ─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼ ═ ║ — – ‘ ’ “ ” « » ′ ″";
 
+// Code points that draw nothing: variation selectors (U+FE0F after ⚠
+// asks for its emoji form, which ImGui, without shaping, cannot pick),
+// joiners, invisible operators and tags. Each face draws them as U+FEFF,
+// which Roboto and JetBrains Mono both have, empty and zero-width
+// (app.cpp, addface), rather than as the "?" of a missing glyph.
+static i32 const fontinvisible[][2] = {
+    {0x200c, 0x200d}, {0x2060, 0x2064}, {0xfe00, 0xfe0f},
+    {0xe0020, 0xe007f}, {0xe0100, 0xe01ef},
+};
+
 static u32 fontbe16(Str s, iz at)
 {
     return at<0 || at+2>s.len ? 0 : (u32)s[at]<<8 | s[at+1];
