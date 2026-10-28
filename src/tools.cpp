@@ -46,6 +46,7 @@ enum : i32 {
     TOOL_MEMORY,
     TOOL_WEBSEARCH,
     TOOL_WEBFETCH,
+    TOOL_ASKUSER,
     TOOL_COUNT,
 };
 
@@ -53,7 +54,7 @@ static Str toolnames[] = {
     "read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
     "job_output", "job_kill", "task", "desktop", "skill", "enter_plan_mode",
     "exit_plan_mode", "sessions", "send_message", "memory", "web_search",
-    "web_fetch",
+    "web_fetch", "ask_user",
 };
 static_assert(countof(toolnames) == TOOL_COUNT);
 
@@ -61,11 +62,15 @@ static_assert(countof(toolnames) == TOOL_COUNT);
 // Plan mode's are the user's own sessions', never a role's. Memory is
 // offered only to sessions that have it (engine.cpp), whatever else
 // their tools say. The web's are offered only as [web] says (webdeny).
+// Questions to the user likewise: only the engine offers ask_user, to
+// a session the user attends as it begins (cmdnew), and no tool list
+// names it.
 enum : u32 {
     TOOL_OFFMASK  = (u32)1 << TOOL_DESKTOP,
     TOOL_PLANMASK = (u32)1<<TOOL_PLANENTER | (u32)1<<TOOL_PLANEXIT,
     TOOL_MEMMASK  = (u32)1 << TOOL_MEMORY,
     TOOL_WEBMASK  = (u32)1<<TOOL_WEBSEARCH | (u32)1<<TOOL_WEBFETCH,
+    TOOL_ASKMASK  = (u32)1 << TOOL_ASKUSER,
 };
 
 enum : i64 {
@@ -90,6 +95,13 @@ enum : i64 {
     SEARCH_GLOBMAX = (i64)8 << 20,    // ripgrep listing every file
     TODO_ITEMS     = 50,
     TODO_TEXTMAX   = 500,             // bytes of one item
+    ASK_QUESTIONS  = 4,               // ask_user: questions in one call
+    ASK_OPTIONS    = 4,               // options of one question
+    ASK_TEXTMAX    = 1000,            // bytes of a question
+    ASK_HEADMAX    = 40,              // its header
+    ASK_LABELMAX   = 120,             // an option's label
+    ASK_DESCMAX    = 600,             // its description
+    ASK_ANSWERMAX  = 8 << 10,         // an answer in the user's own words
     PATH_BYTES     = 4096,            // longest path argument
     PATH_PARTS     = 256,             // most components in one
     TASK_DEPTH     = 2,               // a session this deep starts no subagents
@@ -188,14 +200,14 @@ static b32 tooloffered(ToolEnv *te, i32 tool)
 // which tooldeny takes off first.
 static u32 toolbits(Str word)
 {
-    u32 all = (((u32)1<<TOOL_COUNT) - 1) & ~(u32)TOOL_PLANMASK;
+    u32 all = (((u32)1<<TOOL_COUNT) - 1) & ~(u32)(TOOL_PLANMASK|TOOL_ASKMASK);
     if (word == "*") {
         return all;
     } else if (word == "default") {
         return all & ~(u32)TOOL_OFFMASK;
     }
     i32 t = toolfind(word);
-    return t==TOOL_NONE ? 0 : (u32)1<<t;
+    return t==TOOL_NONE || t==TOOL_ASKUSER ? 0 : (u32)1<<t;
 }
 
 // The tools a list names, separated by blanks or commas, as the bits of
@@ -559,6 +571,23 @@ static Str tooljson(Arena *a, ToolEnv *te)
         "\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"pending\","
         "\"in_progress\",\"done\"]}},\"required\":[\"content\",\"status\"],"
         "\"additionalProperties\":false}";
+    Str askitem =
+        "\"items\":{\"type\":\"object\",\"properties\":{\"question\":{"
+        "\"type\":\"string\",\"description\":\"The whole question, ending "
+        "with a question mark\"},\"header\":{\"type\":\"string\","
+        "\"description\":\"Its label, a word or two of at most 12 "
+        "characters: Database, Scope\"},\"options\":{\"type\":\"array\","
+        "\"description\":\"2 to 4 real alternatives\",\"items\":{\"type\":"
+        "\"object\",\"properties\":{\"label\":{\"type\":\"string\","
+        "\"description\":\"1 to 5 words\"},\"description\":{\"type\":"
+        "\"string\",\"description\":\"What choosing it means: its "
+        "trade-off\"},\"recommended\":{\"type\":\"boolean\",\"description\":"
+        "\"The option you recommend: one per question, unless "
+        "multi_select\"}},\"required\":[\"label\",\"description\"],"
+        "\"additionalProperties\":false}},\"multi_select\":{\"type\":"
+        "\"boolean\",\"description\":\"The user may pick several\"}},"
+        "\"required\":[\"question\",\"header\",\"options\"],"
+        "\"additionalProperties\":false}";
     Def defs[] = {
         {
             "read",
@@ -798,6 +827,24 @@ static Str tooljson(Arena *a, ToolEnv *te)
                  "from an earlier result's last line (default 0)", 0, {}},
             },
         },
+        {
+            "ask_user",
+            "Ask the user 1 to 4 multiple-choice questions and wait for the "
+            "answers. Use it when a decision is the user's to make and "
+            "changes what you do: an approach, the scope, a trade-off, a "
+            "preference that neither the code nor the request settles. Ask "
+            "while planning, before you write the plan, all at once, as the "
+            "only call in your response. Not for permission (tools ask for "
+            "that themselves), not to approve a plan (exit_plan_mode), not "
+            "for what you can find out yourself. Give each question 2 to 4 "
+            "real alternatives, each a short label and what choosing it "
+            "means; list the one you recommend first, marked recommended. "
+            "The user may always answer in their own words, so add no "
+            "\"Other\" option.",
+            {
+                {"questions", "array", "1 to 4", 1, askitem},
+            },
+        },
     };
     static_assert(countof(defs) == TOOL_COUNT);
 
@@ -943,13 +990,19 @@ static Str systemprompt(Arena *a, Str cwd, ToolEnv *te, b32 nofolder = 0)
         "You are a coding agent. You work through tools on the user's "
         "machine: read and change files, run commands, and check your work "
         "by running it. Work until the task is done, then reply with a "
-        "short summary of what you did. The user is not watching and "
-        "cannot answer questions");
-    print(&b, tooloffered(te, TOOL_PLANEXIT)
-              ? Str(", except to approve a plan in plan mode")
-              : Str(""));
+        "short summary of what you did. ");
+    if (tooloffered(te, TOOL_ASKUSER)) {
+        print(&b, "The user may not be watching. When a decision is theirs "
+                  "to make, ask with ask_user, best while planning; otherwise "
+                  "make reasonable assumptions and state them.\n\n");
+    } else {
+        print(&b, "The user is not watching and cannot answer questions");
+        print(&b, tooloffered(te, TOOL_PLANEXIT)
+                  ? Str(", except to approve a plan in plan mode")
+                  : Str(""));
+        print(&b, ": make reasonable assumptions and state them.\n\n");
+    }
     print(&b,
-        ": make reasonable assumptions and state them.\n\n"
         "Guidelines:\n"
         "- Read files before editing them, and keep edits small and exact.\n");
     if (tooloffered(te, TOOL_GREP) && tooloffered(te, TOOL_GLOB)) {
@@ -1006,6 +1059,32 @@ struct TodoItem {
     i32 status;  // TODO_*
 };
 
+// ask_user's questions: each with its options, of which the agent
+// recommends one (or, with multi, several), and the user's answers, as
+// option indices and words of their own.
+struct AskOption {
+    Str label;
+    Str desc;   // may be empty
+    b32 rec;    // recommended
+};
+
+struct AskQuestion {
+    Str               text;
+    Str               header;
+    b32               multi;  // the user may pick several
+    Slice<AskOption>  opts;
+};
+
+struct QAnswer {
+    Slice<i32> pick;  // option indices
+    Str        text;  // in the user's own words, or null
+};
+
+struct QAnswers {
+    Slice<QAnswer> a;     // one for each question
+    b32            dflt;  // the recommended options, as nobody picked any
+};
+
 struct Args {
     Str             path;
     Str             content;
@@ -1045,6 +1124,7 @@ struct Args {
     Str             kind;       // memory: its type
     Str             query;      // web_search
     Str             url;        // web_fetch; its offset is offset
+    Slice<AskQuestion> questions;  // ask_user
     Slice<Str>      issues;
     Str             repaired;   // what repairargs fixed, if anything
 };
@@ -1464,6 +1544,362 @@ static void argmemory(Arena *a, Args *r, Json *j)
     }
 }
 
+// Where in ask_user's arguments, for an issue: "questions[1].options[0]".
+static Str askwhere(Arena *a, iz q, iz o, Str key)
+{
+    Buf b(a, 64 + key.len);
+    print(&b, "questions[");
+    print(&b, (i64)q);
+    putbyte(&b, ']');
+    if (o >= 0) {
+        print(&b, ".options[");
+        print(&b, (i64)o);
+        putbyte(&b, ']');
+    }
+    if (key.len) {
+        putbyte(&b, '.');
+        print(&b, key);
+    }
+    return finish(&b);
+}
+
+// A label with Claude Code's mark of the recommended option, a trailing
+// "(Recommended)", taken off: whether it had one.
+static b32 cutrecommended(Str *label)
+{
+    Str s = trimright(*label);
+    Str m = "(recommended)";
+    if (s.len<=m.len || !equalfold(cuthead(s, s.len-m.len), m)) {
+        return 0;
+    }
+    s = trimright(takehead(s, s.len-m.len));
+    if (s.len && (s[s.len-1]=='-' || s[s.len-1]==':')) {
+        s = trimright(takehead(s, s.len-1));
+    }
+    *label = s;
+    return 1;
+}
+
+// ask_user's questions: an array of them, or such an array encoded as a
+// string, or one question alone. An option may be a bare label. An
+// "Other" option goes, as the user may always answer in their own
+// words, if two others are left.
+static Slice<AskQuestion> argquestions(Arena *a, Args *r, Json *root)
+{
+    Slice<AskQuestion> qs = {};
+    Json *v = jsonget(root, "questions");
+    if (v->type == JSON_STRING) {
+        JsonDoc d = jsonparse(a, trim(v->str));
+        v = d.ok ? d.root : v;
+    }
+    if (v->type==JSON_MISSING || v->type==JSON_NULL) {
+        issue(a, r, "questions", "required array is missing");
+        return qs;
+    }
+    Json one = {};
+    if (v->type == JSON_OBJECT) {
+        Json *k = alloc<Json>(a);
+        *k = *v;
+        k->next   = 0;
+        one.type  = JSON_ARRAY;
+        one.child = k;
+        one.len   = 1;
+        v = &one;
+    } else if (v->type != JSON_ARRAY) {
+        issue(a, r, "questions", "must be an array of {question, header, options} objects");
+        return qs;
+    }
+    iz n = 0;
+    for (Json *e = v->child; e; e = e->next, n++) {
+        if (e->type != JSON_OBJECT) {
+            issue(a, r, askwhere(a, n, -1, {}), "must be an object with question, header and options");
+            continue;
+        }
+        AskQuestion q = {};
+        q.text   = trim(jsonstr(jsonget(e, "question")));
+        q.header = trim(jsonstr(jsonget(e, "header")));
+        Json *m  = jsonget(e, "multi_select");
+        m = m->type==JSON_MISSING ? jsonget(e, "multiSelect") : m;
+        q.multi  = jsonbool(m, 0) || (m->type==JSON_STRING && equalfold(trim(m->str), "true"));
+        b32 ok = 1;
+        if (!q.text.len) {
+            issue(a, r, askwhere(a, n, -1, "question"), "must be a non-empty string");
+            ok = 0;
+        } else if (q.text.len > ASK_TEXTMAX) {
+            issue(a, r, askwhere(a, n, -1, "question"), "too long: at most 1000 bytes");
+            ok = 0;
+        }
+        if (!q.header.len) {
+            issue(a, r, askwhere(a, n, -1, "header"), "must be a non-empty string, a word or two");
+            ok = 0;
+        } else if (q.header.len > ASK_HEADMAX) {
+            issue(a, r, askwhere(a, n, -1, "header"), "too long: a word or two, at most 40 bytes");
+            ok = 0;
+        }
+
+        Json *os = jsonget(e, "options");
+        if (os->type != JSON_ARRAY) {
+            issue(a, r, askwhere(a, n, -1, "options"), "must be an array of 2 to 4 {label, description} objects");
+            continue;
+        }
+        iz  k     = 0;
+        b32 other = 0;
+        for (Json *o = os->child; o; o = o->next, k++) {
+            AskOption opt = {};
+            if (o->type == JSON_STRING) {
+                opt.label = trim(o->str);
+            } else if (o->type == JSON_OBJECT) {
+                opt.label = trim(jsonstr(jsonget(o, "label")));
+                opt.desc  = trim(jsonstr(jsonget(o, "description")));
+                Json *rec = jsonget(o, "recommended");
+                opt.rec   = jsonbool(rec, 0) ||
+                            (rec->type==JSON_STRING && equalfold(trim(rec->str), "true"));
+            } else {
+                issue(a, r, askwhere(a, n, k, {}), "must be an object with label and description");
+                ok = 0;
+                continue;
+            }
+            opt.rec |= cutrecommended(&opt.label);
+            if (!opt.label.len) {
+                issue(a, r, askwhere(a, n, k, "label"), "must be a non-empty string");
+                ok = 0;
+                continue;
+            } else if (opt.label.len > ASK_LABELMAX) {
+                issue(a, r, askwhere(a, n, k, "label"), "too long: 1 to 5 words");
+                ok = 0;
+                continue;
+            } else if (opt.desc.len > ASK_DESCMAX) {
+                issue(a, r, askwhere(a, n, k, "description"), "too long: at most 600 bytes");
+                ok = 0;
+                continue;
+            } else if (equalfold(opt.label, "other")) {
+                other = 1;  // the user's own words are always offered
+                continue;
+            }
+            for (iz i = 0; i < q.opts.len; i++) {
+                if (equalfold(q.opts[i].label, opt.label)) {
+                    issue(a, r, askwhere(a, n, k, "label"), "repeats another option's label");
+                    ok = 0;
+                }
+            }
+            q.opts = push(a, q.opts, opt);
+        }
+        if (q.opts.len<2 || q.opts.len>ASK_OPTIONS) {
+            issue(a, r, askwhere(a, n, -1, "options"),
+                  other ? Str("must be 2 to 4 alternatives besides Other, which the "
+                              "user always has: leave it out")
+                        : Str("must be 2 to 4 alternatives"));
+            ok = 0;
+        }
+        iz recs = 0;
+        for (iz i = 0; i < q.opts.len; i++) {
+            recs += q.opts[i].rec;
+        }
+        if (!q.multi && recs>1) {
+            issue(a, r, askwhere(a, n, -1, "options"),
+                  "recommend at most one option, unless multi_select");
+            ok = 0;
+        }
+        if (ok) {
+            qs = push(a, qs, q);
+        }
+    }
+    if (!n) {
+        issue(a, r, "questions", "must hold 1 to 4 questions");
+    } else if (n > ASK_QUESTIONS) {
+        issue(a, r, "questions", "too many: at most 4, the rest in a later call if they still matter");
+    }
+    return qs;
+}
+
+// The questions as the ask record keeps them, normalized.
+static void putquestions(JsonOut *w, Slice<AskQuestion> qs)
+{
+    putarray(w);
+    for (iz i = 0; i < qs.len; i++) {
+        AskQuestion *q = &qs[i];
+        putobject(w);
+        putstrkey(w, "question", q->text);
+        putstrkey(w, "header", q->header);
+        if (q->multi) {
+            putkey(w, "multi_select");
+            putbool(w, 1);
+        }
+        putkey(w, "options");
+        putarray(w);
+        for (iz k = 0; k < q->opts.len; k++) {
+            putobject(w);
+            putstrkey(w, "label", q->opts[k].label);
+            putstrkey(w, "description", q->opts[k].desc);
+            if (q->opts[k].rec) {
+                putkey(w, "recommended");
+                putbool(w, 1);
+            }
+            putend(w);
+        }
+        putend(w);
+        putend(w);
+    }
+    putend(w);
+}
+
+// The questions in plain text, for frontends that know only generic
+// asks, which answer with Allow, Deny or a note.
+static Str questiondetail(Arena *a, Slice<AskQuestion> qs)
+{
+    Buf b(a, 1024);
+    for (iz i = 0; i < qs.len; i++) {
+        AskQuestion *q = &qs[i];
+        print(&b, q->header);
+        print(&b, ": ");
+        print(&b, q->text);
+        print(&b, q->multi ? Str(" (any of these)\n") : Str("\n"));
+        for (iz k = 0; k < q->opts.len; k++) {
+            print(&b, "  ");
+            print(&b, (i64)k+1);
+            print(&b, ". ");
+            print(&b, q->opts[k].label);
+            print(&b, q->opts[k].rec ? Str(" (recommended)") : Str(""));
+            if (q->opts[k].desc.len) {
+                print(&b, ": ");
+                print(&b, q->opts[k].desc);
+            }
+            putbyte(&b, '\n');
+        }
+    }
+    print(&b, "\nAllow takes the recommended options; Deny with a note "
+              "answers in your own words.");
+    return finish(&b);
+}
+
+// The answers an allow would give when nobody picked: the recommended
+// options, none for a question without one.
+static QAnswers dfltanswers(Arena *a, Slice<AskQuestion> qs)
+{
+    QAnswers r = {};
+    r.dflt = 1;
+    for (iz i = 0; i < qs.len; i++) {
+        QAnswer an = {};
+        for (iz k = 0; k < qs[i].opts.len; k++) {
+            if (qs[i].opts[k].rec && (qs[i].multi || !an.pick.len)) {
+                an.pick = push(a, an.pick, (i32)k);
+            }
+        }
+        r.a = push(a, r.a, an);
+    }
+    return r;
+}
+
+// An answer to ask_user's questions, checked: answers is an answer
+// command's, allow its decision. Without answers an allow takes the
+// recommended options; a deny (a skip) takes none.
+struct QCheck {
+    Str      err;  // null if fine
+    QAnswers qa;
+};
+
+static QCheck checkanswers(Arena *a, Slice<AskQuestion> qs, Json *answers, b32 allow)
+{
+    QCheck r    = {};
+    b32    none = answers->type==JSON_MISSING || answers->type==JSON_NULL;
+    if (!allow) {
+        if (!none) {
+            r.err = "a skip takes no answers: send words of your own as its note";
+        }
+        return r;
+    } else if (none) {
+        r.qa = dfltanswers(a, qs);
+        return r;
+    } else if (answers->type != JSON_ARRAY) {
+        r.err = "answers must be an array, one {pick, text} for each question";
+        return r;
+    } else if (answers->len != qs.len) {
+        Buf b(a, 96);
+        print(&b, "answers must have one {pick, text} for each of the ");
+        print(&b, (i64)qs.len);
+        print(&b, qs.len==1 ? Str(" question") : Str(" questions"));
+        r.err = finish(&b);
+        return r;
+    }
+    iz i = 0;
+    for (Json *e = answers->child; e; e = e->next, i++) {
+        AskQuestion *q  = &qs[i];
+        QAnswer      an = {};
+        Buf at(a, 32);
+        print(&at, "answers[");
+        print(&at, (i64)i);
+        print(&at, "]: ");
+        Str where = finish(&at);
+        if (e->type != JSON_OBJECT) {
+            r.err = concat(a, where, "must be an object with pick or text");
+            return r;
+        }
+        Json *p = jsonget(e, "pick");
+        if (p->type!=JSON_MISSING && p->type!=JSON_NULL && p->type!=JSON_ARRAY) {
+            r.err = concat(a, where, "pick must be an array of option indices");
+            return r;
+        }
+        for (Json *k = p->type==JSON_ARRAY ? p->child : 0; k; k = k->next) {
+            i64 idx = jsonint(k, -1);
+            if (k->type!=JSON_NUMBER || idx<0 || idx>=q->opts.len) {
+                r.err = concat(a, where, "pick holds an index that names no option");
+                return r;
+            }
+            for (iz j = 0; j < an.pick.len; j++) {
+                if (an.pick[j] == idx) {
+                    r.err = concat(a, where, "pick names an option twice");
+                    return r;
+                }
+            }
+            an.pick = push(a, an.pick, (i32)idx);
+        }
+        Json *t = jsonget(e, "text");
+        if (t->type!=JSON_MISSING && t->type!=JSON_NULL && t->type!=JSON_STRING) {
+            r.err = concat(a, where, "text must be a string");
+            return r;
+        }
+        an.text = trim(jsonstr(t));
+        an.text = an.text.len ? an.text : Str{};
+        if (an.text.len > ASK_ANSWERMAX) {
+            r.err = concat(a, where, "text is too long: at most 8 KiB");
+            return r;
+        } else if (!q->multi && an.pick.len>1) {
+            r.err = concat(a, where, "this question takes one answer: pick one option");
+            return r;
+        } else if (!q->multi && an.pick.len && an.text.len) {
+            r.err = concat(a, where, "this question takes one answer: pick an "
+                                     "option or give text, not both");
+            return r;
+        } else if (!an.pick.len && !an.text.len) {
+            r.err = concat(a, where, "no answer: pick an option or give text");
+            return r;
+        }
+        r.qa.a = push(a, r.qa.a, an);
+    }
+    return r;
+}
+
+// The answers as the answer record keeps them.
+static void putanswers(JsonOut *w, QAnswers *qa)
+{
+    putarray(w);
+    for (iz i = 0; i < qa->a.len; i++) {
+        QAnswer *an = &qa->a[i];
+        putobject(w);
+        putkey(w, "pick");
+        putarray(w);
+        for (iz k = 0; k < an->pick.len; k++) {
+            putint(w, an->pick[k]);
+        }
+        putend(w);
+        if (an->text.len) {
+            putstrkey(w, "text", an->text);
+        }
+        putend(w);
+    }
+    putend(w);
+}
+
 // Arguments for a tool, edit's as the session's format (EDIT_*) takes
 // them.
 static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
@@ -1668,6 +2104,9 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
         }
         if (r.offset < 0) issue(a, &r, "offset", "must be 0 or more");
         break;
+    case TOOL_ASKUSER:
+        r.questions = argquestions(a, &r, j);
+        break;
     }
     if (r.path.data && !r.path.len) {
         issue(a, &r, "path", "must not be empty");
@@ -1735,6 +2174,10 @@ static Str unknowntool(Arena *a, Str name, u32 deny)
         {"webfetch", "web_fetch"}, {"fetch", "web_fetch"},
         {"fetch_url", "web_fetch"}, {"browse", "web_fetch"},
         {"open_url", "web_fetch"}, {"read_url", "web_fetch"},
+        {"askuserquestion", "ask_user"}, {"ask_user_question", "ask_user"},
+        {"question", "ask_user"}, {"ask", "ask_user"}, {"askuser", "ask_user"},
+        {"request_user_input", "ask_user"},
+        {"ask_followup_question", "ask_user"},
     };
     ToolEnv te = {};
     te.deny = deny;
@@ -1758,17 +2201,24 @@ static Str unknowntool(Arena *a, Str name, u32 deny)
         }
     }
     putbyte(&b, '.');
+    Str n = name;
+    Cut c = cut(n, '.');  // namespaced, as in "functions.bash"
+    if (c.ok) n = c.tail;
+    b32 asks = n == "ask_user";
     for (iz i = 0; i < countof(aliases); i++) {
-        Str n = name;
-        Cut c = cut(n, '.');  // namespaced, as in "functions.bash"
-        if (c.ok) n = c.tail;
-        if (equalfold(n, aliases[i][0]) &&
-                tooloffered(&te, toolfind(aliases[i][1]))) {
+        if (!equalfold(n, aliases[i][0])) {
+            continue;
+        } else if (tooloffered(&te, toolfind(aliases[i][1]))) {
             print(&b, " Did you mean \"");
             print(&b, aliases[i][1]);
             print(&b, "\"?");
             break;
         }
+        asks |= toolfind(aliases[i][1]) == TOOL_ASKUSER;
+    }
+    if (asks && !tooloffered(&te, TOOL_ASKUSER)) {
+        print(&b, " You cannot ask the user questions here: decide for "
+                  "yourself, and state your assumptions.");
     }
     return finish(&b);
 }

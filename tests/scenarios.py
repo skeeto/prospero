@@ -8421,10 +8421,12 @@ def plan_new(t):
         msgs = first["messages"]
         t.check(msgs[-1]["role"] == "user" and msgs[-1]["content"].startswith("Plan mode is on")
                 and plan in msgs[-1]["content"], f"told: {msgs[-1]}")
-        t.check("except to approve a plan in plan mode" in msgs[0]["content"],
-                "the system prompt says plan mode exists")
+        t.check("ask with ask_user" in msgs[0]["content"] and
+                "ask with ask_user before you write the plan" in msgs[-1]["content"],
+                "the agent is told to ask with ask_user")
         names = fake_provider.tool_names(first)
-        t.check("enter_plan_mode" in names and "exit_plan_mode" in names, f"tools: {names}")
+        t.check("enter_plan_mode" in names and "exit_plan_mode" in names and
+                "ask_user" in names, f"tools: {names}")
 
         h.call("answer", sid=sid, req=ask["req"], decision="deny", note="Also test it.")
         again = planask(h, sid, ask["seq"])
@@ -8982,6 +8984,414 @@ def bypass_plan(t):
         te = h.all("tool.end", sid)
         t.check(te[-1]["status"] == "ok" and te[-1]["text"].startswith("Replaced"),
                 f"carried out: {te[-1]}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+# Questions to the user (ask_user): fake_provider.sc_question asks three,
+# Database (PostgreSQL recommended, by its label), Features (several,
+# Auth and Search recommended, "Other" dropped) and Color (none
+# recommended), then says the result back.
+
+def questioned(t, h, prompt="Ask me.", **new):
+    """An attended session whose agent asks its questions: (sid, ask)."""
+    sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1, **new)["sid"]
+    h.send("prompt", sid=sid, text=prompt)
+    ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+    h.wait(lambda e: e.get("ev") == "live" and e.get("state") == "ask" and e.get("sid") == sid)
+    return sid, ask
+
+
+def offered(t, n=-1):
+    """The tools offered in request n, by name."""
+    return fake_provider.tool_names(t.requests()[n]["body"])
+
+
+@scenario(bound=10)
+def question_answer(t):
+    """The questions asked with no deadline, normalized: the recommended
+    option marked by its label is so marked, and "Other" is dropped.
+    Answered with picks, words of the user's own and a note, the answer
+    record keeps them and the agent reads them all."""
+    h = t.headless()
+    try:
+        r = h.call("hello", proto=0, client="scenarios")
+        t.check("question" in h.all("hello")[0].get("caps", []), "the cap")
+        sid, ask = questioned(t, h)
+        t.check(ask["kind"] == "question" and ask["tool"] == "ask_user" and
+                ask["deadline"] == 0 and ask["dflt"] == "deny", f"the ask: {ask}")
+        qs = ask["questions"]
+        t.check([q["header"] for q in qs] == ["Database", "Features", "Color"], f"{qs}")
+        t.check(qs[0]["options"] == [
+                    {"label": "PostgreSQL", "description": "", "recommended": True},
+                    {"label": "SQLite", "description": "A file, no server"}] and
+                not qs[0].get("multi_select"), f"database: {qs[0]}")
+        t.check([o["label"] for o in qs[1]["options"]] == ["Auth", "Search", "Export"] and
+                qs[1].get("multi_select") is True, f"features: {qs[1]}")
+        t.check(not any(o.get("recommended") for o in qs[2]["options"]), f"color: {qs[2]}")
+        t.check("Which database?" in ask["detail"] and "PostgreSQL" in ask["detail"],
+                f"detail: {ask['detail']}")
+        t.check(not h.all("tool.start", sid), "nothing starts while asking")
+        names = offered(t, 0)
+        t.check("ask_user" in names, f"offered: {names}")
+        t.check("ask with ask_user" in t.requests()[0]["body"]["messages"][0]["content"],
+                "the system prompt says so")
+        rec = h.all("session", sid)[0]
+        t.check(rec.get("questions") == 1 and "ask_user" not in rec.get("tools", []),
+                f"recorded: {rec}")
+
+        r = h.call("answer", sid=sid, req=ask["req"], decision="allow", note="Keep it small.",
+                   answers=[{"pick": [1]}, {"pick": [0, 2], "text": "Billing"},
+                            {"text": "Green"}])
+        t.check(r.get("ok") == 1, f"answered: {r}")
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "done", f"done: {end}")
+        ans = h.all("answer", sid)[-1]
+        t.check(ans["decision"] == "allow" and ans["by"] == "user" and
+                ans["answers"] == [{"pick": [1]}, {"pick": [0, 2], "text": "Billing"},
+                                   {"pick": [], "text": "Green"}] and
+                "recommended" not in ans, f"the answer record: {ans}")
+        te = h.all("tool.end", sid)[-1]
+        t.check(te["status"] == "ok", f"ok: {te}")
+        said = lastsaid(h, sid)
+        t.check(said == te["text"], f"the agent read it: {said!r}")
+        t.check(said.startswith("The user answered:\n\n1. Database: Which database?\n"
+                                "   - SQLite\n") and
+                "2. Features: Which features?\n   - Auth\n   - Export\n"
+                "   - in their own words: Billing\n" in said and
+                "3. Color: Which color?\n   - in their own words: Green\n" in said and
+                "The user's note: Keep it small." in said and
+                said.endswith("Go on with these answers."), f"the result: {said!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def question_default(t):
+    """A plain allow, as an older frontend sends, takes the recommended
+    options, and none for a question with no recommendation."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 1)
+        ans = h.all("answer", sid)[-1]
+        t.check(ans["answers"] == [{"pick": [0]}, {"pick": [0, 1]}, {"pick": []}] and
+                ans.get("recommended") == 1, f"the answer record: {ans}")
+        said = lastsaid(h, sid)
+        t.check(said.startswith("The user accepted your recommended options:") and
+                "   - PostgreSQL\n" in said and "   - Auth\n   - Search\n" in said and
+                "No answer, as you recommended none" in said, f"the result: {said!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def question_skip(t):
+    """Skipped (deny) with a note, the agent reads the user's words; with
+    none, it is told to go with its recommendations. Not the end of the
+    turn either way."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        h.call("answer", sid=sid, req=ask["req"], decision="deny", note="Use MySQL.")
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "done", f"done: {end}")
+        te = h.all("tool.end", sid)[-1]
+        t.check(te["status"] == "denied" and te["text"] == "The user skipped your "
+                "questions, and wrote instead: Use MySQL.", f"result: {te}")
+        ans = h.all("answer", sid)[-1]
+        t.check(ans["decision"] == "deny" and "answers" not in ans, f"{ans}")
+        h.send("prompt", sid=sid, text="Ask me.")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid and
+                     e["seq"] > ask["seq"])
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(h, sid, 2)
+        te = h.all("tool.end", sid)[-1]
+        t.check(te["status"] == "denied" and "go with your recommended options" in te["text"]
+                and "Do not ask these again." in te["text"], f"result: {te}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def question_invalid(t):
+    """Each bad answer is refused, and the questions still wait."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        bad = [
+            dict(decision="always"),
+            dict(decision="trust"),
+            dict(decision="deny", answers=[{"pick": [0]}] * 3),
+            dict(decision="allow", answers={"pick": [0]}),
+            dict(decision="allow", answers=[{"pick": [0]}]),
+            dict(decision="allow", answers=[{"pick": [0, 1]}, {"pick": [0]}, {"pick": [0]}]),
+            dict(decision="allow", answers=[{"pick": [0]}, {"pick": [0, 0]}, {"pick": [0]}]),
+            dict(decision="allow", answers=[{"pick": [2]}, {"pick": [0]}, {"pick": [0]}]),
+            dict(decision="allow", answers=[{"pick": [-1]}, {"pick": [0]}, {"pick": [0]}]),
+            dict(decision="allow", answers=[{"pick": [0], "text": "x"}, {"pick": [0]},
+                                            {"pick": [0]}]),
+            dict(decision="allow", answers=[{"pick": [0]}, {}, {"pick": [0]}]),
+            dict(decision="allow", answers=[{"pick": [0]}, {"text": "  "}, {"pick": [0]}]),
+            dict(decision="allow", answers=[{"pick": [0]}, {"pick": [0]}, {"text": 5}]),
+            dict(decision="allow", answers=[{"pick": [0]}, {"pick": [0]},
+                                            {"text": "x" * 9000}]),
+            dict(decision="allow", answers=[1, 2, 3]),
+        ]
+        for b in bad:
+            r = h.call("answer", sid=sid, req=ask["req"], **b)
+            t.check(r.get("ok") == 0 and r.get("err"), f"refused {b}: {r}")
+        t.check(not h.all("answer", sid), "no answer record")
+        r = h.call("answer", sid=sid, req=ask["req"], decision="allow",
+                   answers=[{"pick": [0]}, {"pick": [2]}, {"pick": [1]}])
+        t.check(r.get("ok") == 1, f"then a good one: {r}")
+        ended(h, sid, 1)
+        # answers for another kind of ask
+        sid2, ask2 = questioned(t, h, "Plan first.")
+        t.check(ask2["kind"] == "plan.enter", f"{ask2}")
+        r = h.call("answer", sid=sid2, req=ask2["req"], decision="allow", answers=[])
+        t.check(r.get("ok") == 0 and "ask_user" in r.get("err", ""), f"not a question: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def question_args(t):
+    """Bad arguments are the agent's to fix, asked nothing; a string of
+    JSON is read as the array."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="Ask badly.")
+        ended(h, sid, 1)
+        te = h.all("tool.end", sid)[-1]
+        t.check(te["status"] == "error" and "options" in te["text"], f"refused: {te}")
+        t.check(not h.all("ask", sid), "nothing asked")
+        h.send("prompt", sid=sid, text="Ask as a string.")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        t.check([q["header"] for q in ask["questions"]] == ["Database"], f"{ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 2)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def question_steer(t):
+    """A message instead of an answer: the agent reads it next."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        h.call("steer", sid=sid, text="Stop.")
+        ended(h, sid, 1)
+        ans = h.all("answer", sid)[-1]
+        t.check(ans["by"] == "steer", f"by the steer: {ans}")
+        te = h.all("tool.end", sid)[-1]
+        t.check(te["status"] == "denied" and "sent a new message" in te["text"], f"{te}")
+        t.check(lastsaid(h, sid) == "Stopped.", f"said {lastsaid(h, sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def question_cancel(t):
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        h.call("cancel", sid=sid)
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "cancel", f"cancelled: {end}")
+        te = h.all("tool.end", sid)[-1]
+        t.check(te["status"] == "cancelled", f"{te}")
+        t.check(h.all("answer", sid)[-1]["by"] == "cancel", "by the cancel")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def question_close(t):
+    """Closed while the questions wait, nobody can answer: the agent goes
+    on with its recommendations."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        h.call("close", sid=sid)
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "done", f"goes on unattended: {end}")
+        ans = h.all("answer", sid)[-1]
+        t.check(ans["decision"] == "deny" and ans["by"] == "policy", f"{ans}")
+        te = h.all("tool.end", sid)[-1]
+        t.check(te["status"] == "denied" and te["text"].startswith("Nobody can answer now: "
+                "go with your recommended options"), f"{te}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def question_bypass(t):
+    """Bypass mode answers no questions: they still wait for the user."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        r = h.call("mode", sid=sid, mode="bypass")
+        t.check(r.get("ok") == 1, f"bypass: {r}")
+        time.sleep(0.2)
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 1)
+        t.check(h.all("answer", sid)[-1]["by"] == "user", "answered by the user")
+        r = h.call("mode", sid=sid, mode="plan")
+        t.check(r.get("ok") == 1, f"then plan mode: {r}")
+        h.send("prompt", sid=sid, text="Ask me.")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid and
+                     e["seq"] > ask["seq"])
+        t.check(ask["kind"] == "question", f"asked in plan mode too: {ask}")
+        r = h.call("mode", sid=sid, mode="default")
+        t.check(r.get("ok") == 1, f"the mode may change while asked: {r}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
+        ended(h, sid, 2)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=10)
+def question_switch(t):
+    """The model and the shell may change while the questions wait, and
+    the new model reads the answers."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        n = len(t.requests())
+        r = h.call("model", sid=sid, model=t.model2)
+        t.check(r.get("ok") == 1 and r.get("model") == t.model2, f"switched: {r}")
+        shells = h.call("shells").get("shells", [])
+        if shells:
+            r = h.call("shell", sid=sid, shell=shells[0]["name"])
+            t.check(r.get("ok") == 1, f"the shell too: {r}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 1)
+        t.check(len(t.requests()) == n, "the old model is asked no more")
+        after = t.requests(t.model2)
+        t.check(after and "recommended options" in after[0]["body"]["messages"][-1]["content"],
+                "the new model reads the answers")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def question_offered(t):
+    """Only sessions of the user's own, attended as they begin, with every
+    tool: never a role's, a tools list's, an unattended new's or a run's,
+    and never named in a tools list. Plan mode has it."""
+    h = t.headless()
+    try:
+        def tools_of(prompt="Ask me.", **new):
+            r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", **new)
+            sid = r["sid"]
+            n = len(t.requests())
+            h.send("prompt", sid=sid, text=prompt)
+            ended(h, sid, 1)
+            body = t.requests()[n]["body"]
+            return sid, fake_provider.tool_names(body), body["messages"][0]["content"]
+
+        sid, names, sys = tools_of(attended=1, role="general")
+        t.check("ask_user" not in names and "cannot answer questions" in sys, f"role {names}")
+        te = h.all("tool.end", sid)[-1]
+        t.check(te["status"] == "error" and "cannot ask the user" in te["text"],
+                f"refused as unknown: {te}")
+        sid, names, _ = tools_of(attended=1, tools="read write")
+        t.check("ask_user" not in names, f"tools list {names}")
+        sid, names, _ = tools_of()
+        t.check("ask_user" not in names, f"unattended {names}")
+        sid, names, sys = tools_of(attended=1, plan=1, prompt="Hello.")
+        t.check("ask_user" in names and "ask with ask_user before you write the plan" in
+                t.requests()[-1]["body"]["messages"][-2]["content"] + json.dumps(
+                    t.requests()[-1]["body"]["messages"]), f"plan mode {names}")
+        r = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1,
+                   tools="read ask_user")
+        t.check(r.get("ok") == 0 and "ask_user" in r.get("err", ""), f"never named: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    r = t.run("Ask me.")
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    t.check("ask_user" not in offered(t), "a run has none")
+
+
+@scenario(bound=20)
+def question_reopen(t):
+    """Opened again, the questions still wait and are answered. Ended
+    with the process, a reopened session keeps ask_user, and an
+    unattended one never gets it."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        r = h.call("open", sid=sid, **{"from": 1 << 40})
+        t.check(r.get("ok") == 1, f"reopened: {r}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 1)
+        h.send("prompt", sid=sid, text="Ask me.")
+        h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid and e["seq"] > ask["seq"])
+        old = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+    finally:
+        h.close()
+    def asked_with(prompt):
+        """The tools of the request that carried prompt."""
+        for q in t.requests():
+            msgs = q["body"]["messages"]
+            if any(m.get("role") == "user" and m.get("content") == prompt for m in msgs):
+                return fake_provider.tool_names(q["body"])
+        return None
+
+    h = t.headless()
+    try:
+        # Opened, each replays its records: wait for the new turn's end
+        h.call("open", sid=sid)
+        h.send("prompt", sid=sid, text="Hello again.")
+        ended(h, sid, 3)
+        t.check(h.all("answer", sid) and h.all("answer", sid)[-1]["decision"] == "deny",
+                f"the old ask ended: {h.all('answer', sid)}")
+        t.check("ask_user" in (asked_with("Hello again.") or []), "kept after a restart")
+        h.call("open", sid=old)
+        h.send("prompt", sid=old, text="Hello, nobody.")
+        ended(h, old, 1)
+        names = asked_with("Hello, nobody.")
+        t.check(names is not None and "ask_user" not in names,
+                f"never for a session nobody attended: {names}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def question_fork(t):
+    """A fork and an import keep ask_user as the session had it."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 1)
+        r = h.call("fork", sid=sid, turn=1)
+        t.check(r.get("ok") == 1, f"forked: {r}")
+        rec = logged(t, r["sid"])[0]
+        t.check(rec.get("questions") == 1, f"the fork's record: {rec}")
+        raw = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+        r = importlog(t, h, raw, part=4000, model=t.model, endpoint="fake")
+        t.check(r.get("ok") == 1, f"imported: {r}")
+        rec = logged(t, r["sid"])[0]
+        t.check(rec.get("questions") == 1, f"the import's record: {rec}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

@@ -268,6 +268,10 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
             os_print(os, 1, "[asking to approve the plan:]\n");
             prettyexcerpt(c, scratch, jsonstr(jsonget(j, "detail")));
             return;
+        } else if (jsonstr(jsonget(j, "kind")) == "question") {
+            os_print(os, 1, "[asking you:]\n");
+            prettyexcerpt(c, scratch, jsonstr(jsonget(j, "detail")));
+            return;
         }
         print(&b, "[asking: ");
         print(&b, jsonstr(jsonget(j, "detail")));
@@ -285,8 +289,15 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
     case EV_ANSWER: {
         prettyline(c);
         Str note = jsonstr(jsonget(j, "note"));
-        print(&b, jsonstr(jsonget(j, "decision"))=="allow" ? Str("[allowed by ")
-                                                           : Str("[denied by "));
+        if (jsonget(j, "answers")->type == JSON_ARRAY) {
+            // The tool's result says the rest
+            print(&b, jsonflag(jsonget(j, "recommended"), 0)
+                      ? Str("[answered as recommended, by ")
+                      : Str("[answered by "));
+        } else {
+            print(&b, jsonstr(jsonget(j, "decision"))=="allow" ? Str("[allowed by ")
+                                                               : Str("[denied by "));
+        }
         print(&b, jsonstr(jsonget(j, "by")));
         if (note.len) {
             print(&b, ": ");

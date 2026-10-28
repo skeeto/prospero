@@ -3570,15 +3570,20 @@ static Str planrules(Session *s, Arena *a)
     print(&b, ", which stays after plan mode ends. Write your plan there in "
               "Markdown: the goal, the changes file by file, and how to "
               "verify them. Once it is complete, call exit_plan_mode to ask "
-              "the user to approve it. If you need the user to decide "
-              "something first, end your turn with the question.");
+              "the user to approve it. ");
+    print(&b, tooloffered(&s->te, TOOL_ASKUSER)
+              ? Str("If the user must decide something first, ask with "
+                    "ask_user before you write the plan.")
+              : Str("If you need the user to decide something first, end "
+                    "your turn with the question."));
     return finish(&b);
 }
 
 // Bypass mode
 //
 // A session in Bypass mode asks the user nothing but the agent's own
-// asks about plan mode, which are decisions, not permissions: its file
+// asks about plan mode and its questions (ask_user), which are
+// decisions, not permissions: its file
 // tools read and write outside the roots, patches change files there,
 // many at once, and the desktop tool acts in every class, run's too,
 // attended or not, as for an agent left to work alone somewhere that
@@ -3864,9 +3869,13 @@ static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
             if (leave) {
                 print(&b, "\n\nRevise the plan in ");
                 print(&b, s->planfile);
-                print(&b, ", then call exit_plan_mode again; or, if you "
-                          "need the user to decide something, end your "
-                          "turn with the question.");
+                print(&b, tooloffered(&s->te, TOOL_ASKUSER)
+                          ? Str(", then call exit_plan_mode again; or, if "
+                                "the user must decide something first, ask "
+                                "with ask_user.")
+                          : Str(", then call exit_plan_mode again; or, if "
+                                "you need the user to decide something, end "
+                                "your turn with the question."));
             }
             break;
         case DENY_POLICY:
@@ -3898,6 +3907,102 @@ static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         }
     }
     toolend(s, scratch, allow ? Str("ok") : Str("denied"), finish(&b), 0, 0, {}, 0);
+}
+
+// The result of ask_user, as the agent reads it: the answers to qs (qa,
+// for an allow), or why there are none. A cancel has its own.
+static Str questiontext(Arena *a, Slice<AskQuestion> qs, QAnswers *qa,
+                        b32 allow, i32 by, Str note)
+{
+    iz cap = 512 + note.len;
+    for (iz i = 0; i < qs.len; i++) {
+        cap += 160 + qs[i].text.len + qs[i].header.len;
+        for (iz k = 0; k < qs[i].opts.len; k++) {
+            cap += 8 + qs[i].opts[k].label.len;
+        }
+    }
+    for (iz i = 0; allow && i < qa->a.len; i++) {
+        cap += 32 + qa->a[i].text.len;
+    }
+    Buf b(a, cap);
+
+    if (!allow) {
+        switch (by) {
+        case DENY_STEER:
+            print(&b, "Not done: the user sent a new message instead of "
+                      "answering. Read that message (it follows these "
+                      "results) and do what it says.");
+            break;
+        case DENY_USER:
+            if (note.len) {
+                print(&b, "The user skipped your questions, and wrote "
+                          "instead: ");
+                print(&b, note);
+                break;
+            }
+            print(&b, "The user skipped your questions: ");
+            goto assume;
+        default:
+            print(&b, "Nobody can answer now: ");
+        assume:
+            print(&b, "go with your recommended options, or your best "
+                      "judgment where you recommended none, and state them "
+                      "as assumptions. Do not ask these again.");
+        }
+        return finish(&b);
+    }
+
+    print(&b, qa->dflt ? Str("The user accepted your recommended options:\n")
+                       : Str("The user answered:\n"));
+    for (iz i = 0; i < qs.len && i < qa->a.len; i++) {
+        AskQuestion *q  = &qs[i];
+        QAnswer     *an = &qa->a[i];
+        print(&b, "\n");
+        print(&b, (i64)i+1);
+        print(&b, ". ");
+        print(&b, q->header);
+        print(&b, ": ");
+        print(&b, q->text);
+        print(&b, "\n");
+        for (iz k = 0; k < an->pick.len; k++) {
+            print(&b, "   - ");
+            print(&b, q->opts[an->pick[k]].label);
+            print(&b, "\n");
+        }
+        if (an->text.len) {
+            print(&b, "   - in their own words: ");
+            print(&b, an->text);
+            print(&b, "\n");
+        }
+        if (!an->pick.len && !an->text.len) {
+            print(&b, "   No answer, as you recommended none: decide "
+                      "yourself, and say what you chose.\n");
+        }
+    }
+    if (note.len) {
+        print(&b, "\nThe user's note: ");
+        print(&b, note);
+        print(&b, "\n");
+    }
+    print(&b, "\nGo on with these answers.");
+    return finish(&b);
+}
+
+// The answer to an ask of ask_user (resolve), whose call starts and
+// ends here: qa is the answers of an allow.
+static void questionresolve(Session *s, Arena scratch, b32 allow, i32 by,
+                            Str note, QAnswers *qa)
+{
+    Block *c    = &s->calls[s->callidx];
+    Args   args = parseargs(&scratch, TOOL_ASKUSER, c->args, s->te.edit);
+    toolstart(s, scratch);
+    if (by == DENY_CANCEL) {
+        toolend(s, scratch, "cancelled", "Not run: the user cancelled the turn.",
+                0, 0, {}, 0);
+        return;
+    }
+    Str text = questiontext(&scratch, args.questions, qa, allow, by, note);
+    toolend(s, scratch, allow ? Str("ok") : Str("denied"), text, 0, 0, {}, 0);
 }
 
 
@@ -4391,14 +4496,23 @@ static void usergrant(Session *s, Arena scratch, Grant g, Str req, Str by)
 // end it with the denial as its result. The caller moves on to the next
 // call (nexttool). With always, the answer allows it for good (Grants),
 // which old frontends take as a plain allow. With trust as well, an
-// MCP ask's project server is trusted for good (mcpprojtrust).
+// MCP ask's project server is trusted for good (mcpprojtrust). qa is
+// the answers to an ask of ask_user, checked; an allow without them
+// takes the recommended options.
 static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
-                    b32 always = 0, b32 trust = 0)
+                    b32 always = 0, b32 trust = 0, QAnswers *qa = 0)
 {
     Engine *e = s->e;
     Ask    *k = &s->ask;
     i64     t = os_ticks(e->os);
     disarm(s, T_ASK);
+    QAnswers dq = {};
+    if (k->tool==TOOL_ASKUSER && allow && !qa) {
+        Block *c = &s->calls[s->callidx];
+        Args   q = parseargs(&scratch, TOOL_ASKUSER, c->args, s->te.edit);
+        dq = dfltanswers(&scratch, q.questions);
+        qa = &dq;
+    }
     if (s->state == S_ASK) {
         setstate(s, S_IDLE);
     }
@@ -4425,6 +4539,13 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         }
         if (trust) {
             putintkey(&w.json, "trust", 1);
+        }
+        if (qa) {
+            putkey(&w.json, "answers");
+            putanswers(&w.json, qa);
+            if (qa->dflt) {
+                putintkey(&w.json, "recommended", 1);
+            }
         }
         ssend(s, &w);
     }
@@ -4454,6 +4575,9 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
 
     if (k->tool==TOOL_PLANENTER || k->tool==TOOL_PLANEXIT) {
         planresolve(s, scratch, allow, by, note, (t - k->opened + SEC/2) / SEC);
+        return;
+    } else if (k->tool == TOOL_ASKUSER) {
+        questionresolve(s, scratch, allow, by, note, qa);
         return;
     }
     toolstart(s, scratch);
@@ -7835,6 +7959,43 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
     return 0;
 }
 
+// ask_user: its questions wait for the user's answers, with no
+// deadline, unless nobody can answer now. Returns 1 if the call
+// finished, 0 if the session now waits for an answer.
+static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
+{
+    Engine *e = s->e;
+    Block  *c = &s->calls[s->callidx];
+    Ask    *k = &s->ask;
+    *k = {};
+    k->req    = clone(&s->perm, concat(&scratch, c->id, "/ask"));
+    k->tool   = TOOL_ASKUSER;
+    k->opened = os_ticks(e->os);
+    b32 steer = s->steers.len > 0;
+    b32 wait  = attending(s) && !steer;
+    {
+        Str   what = questiondetail(&scratch, qs);
+        Buf   b(&scratch, 1024 + 3*what.len);
+        EvOut w = sbegin(s, &b, EV_ASK);
+        putstrkey(&w.json, "req", k->req);
+        putstrkey(&w.json, "call", c->id);
+        putstrkey(&w.json, "kind", "question");
+        putstrkey(&w.json, "tool", toolnames[TOOL_ASKUSER]);
+        putstrkey(&w.json, "detail", what);
+        putkey(&w.json, "questions");
+        putquestions(&w.json, qs);
+        putintkey(&w.json, "deadline", wait ? 0 : os_time(e->os));
+        putstrkey(&w.json, "dflt", "deny");
+        ssend(s, &w);
+    }
+    if (!wait) {
+        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        return 1;
+    }
+    setstate(s, S_ASK);
+    return 0;
+}
+
 // Run one call. Returns 1 if it finished, 0 if it goes on (a command or
 // a search, or an ask waiting for the user).
 // MCP servers (mcp.cpp)
@@ -10504,6 +10665,9 @@ static b32 runtool(Session *s, Arena scratch)
     if (!s->blocked && (tool==TOOL_PLANENTER || tool==TOOL_PLANEXIT) && !args.issues.len) {
         return plancall(s, scratch, tool);  // asks before it starts
     }
+    if (!s->blocked && tool==TOOL_ASKUSER && !args.issues.len) {
+        return askusercall(s, scratch, args.questions);  // asks first
+    }
 
     if (!s->blocked && (tool==TOOL_WEBSEARCH || tool==TOOL_WEBFETCH) && !args.issues.len) {
         return webcall(s, scratch, tool, &args);  // asks before it starts
@@ -10558,6 +10722,7 @@ static b32 runtool(Session *s, Arena scratch)
     case TOOL_DESKTOP:   assert(0);  // deskcall has these
     case TOOL_PLANENTER: assert(0);  // plancall has these
     case TOOL_PLANEXIT:  assert(0);
+    case TOOL_ASKUSER:   assert(0);  // askusercall has these
     }
     if (args.shell.len && !shellcall(s, scratch, &args)) {
         return 1;
@@ -12420,18 +12585,23 @@ static void logsession(Session *s, Arena scratch)
         }
     }
     // Plan mode's tools go without saying: never a role's. Memory's, by
-    // the memory record. The web's are listed when offered, so that a
-    // session from before them replays without them.
+    // the memory record; questions to the user, by questions. The web's
+    // are listed when offered, so that a session from before them
+    // replays without them.
     u32 plain = TOOL_OFFMASK | TOOL_WEBMASK | (s->role.len ? (u32)TOOL_PLANMASK : 0);
-    if ((s->te.deny | TOOL_MEMMASK) != (plain | TOOL_MEMMASK)) {
+    u32 aside = TOOL_MEMMASK | TOOL_ASKMASK;
+    if ((s->te.deny | aside) != (plain | aside)) {
         putkey(&w.json, "tools");
         putarray(&w.json);
         for (i32 t = 0; t < TOOL_COUNT; t++) {
-            if (tooloffered(&s->te, t) && t!=TOOL_MEMORY) {
+            if (tooloffered(&s->te, t) && t!=TOOL_MEMORY && t!=TOOL_ASKUSER) {
                 putstr(&w.json, toolnames[t]);
             }
         }
         putend(&w.json);
+    }
+    if (tooloffered(&s->te, TOOL_ASKUSER)) {
+        putintkey(&w.json, "questions", 1);
     }
     if (s->rolepr.len) {
         putstrkey(&w.json, "prompt", s->rolepr);
@@ -12582,7 +12752,7 @@ static void putroles(Engine *e, JsonOut *w)
         putkey(w, "tools");
         putarray(w);
         for (i32 t = 0; t < TOOL_COUNT; t++) {
-            if (!(r.deny>>t & 1) && !((u32)TOOL_PLANMASK>>t & 1)) {
+            if (!(r.deny>>t & 1) && !((u32)(TOOL_PLANMASK|TOOL_ASKMASK)>>t & 1)) {
                 putstr(w, toolnames[t]);
             }
         }
@@ -12605,7 +12775,7 @@ static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
         print(&text, r.name);
         print(&text, ": ");
         print(&text, r.desc.len ? utf8head(r.desc, 300) : Str("(no description)"));
-        if (!(r.deny & ~(TOOL_OFFMASK|TOOL_PLANMASK))) {
+        if (!(r.deny & ~(TOOL_OFFMASK|TOOL_PLANMASK|TOOL_ASKMASK))) {
             print(&text, " (every tool)");
             continue;
         }
@@ -12755,7 +12925,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     s->depth   = p->depth + 1;
     s->te.deny = r.deny | (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) |
                  deskdeny(e, scratch, 1) | skilldeny(e) | webdeny(e) |
-                 TOOL_PLANMASK;
+                 TOOL_PLANMASK | TOOL_ASKMASK;
     s->mcpfilter = r.mcp.data ? clone(&s->perm, r.mcp) :
                    p->mcpfilter.data ? clone(&s->perm, p->mcpfilter) : Str{};
     s->psid    = clone(&s->perm, p->sid);
@@ -14036,7 +14206,8 @@ static Str unknowntools(Str list)
         for (i = 0; i<rest.len && !whitespace(rest[i]) && rest[i]!=','; i++) {}
         Str word = takehead(rest, i);
         Str name = word.len>1 && word[0]=='-' ? cuthead(word, 1) : word;
-        if (word.len && !toolbits(name) && toolfind(name)==TOOL_NONE) {
+        i32  t    = toolfind(name);
+        if (word.len && !toolbits(name) && (t==TOOL_NONE || t==TOOL_ASKUSER)) {
             return word;
         }
         rest = cuthead(rest, i);
@@ -14279,6 +14450,10 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         s->hop      = task.hop;
         s->te.deny |= (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) | TOOL_PLANMASK;
     }
+    // Questions to the user only where the user is there to answer: a
+    // session of their own, attended as it begins, with every tool
+    b32 asks = s->attended && !task.ok && !role.ok && !tools.data;
+    s->te.deny |= asks ? 0 : (u32)TOOL_ASKMASK;
     s->mcpfilter  = tools.data ? clone(&s->perm, tools) :
                     role.mcp.data ? clone(&s->perm, role.mcp) : Str{};
     s->stepmax    = steps>0 ? steps : 0;
@@ -14585,6 +14760,11 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->stepmax = steps>0 ? steps : 0;
             s->tempask  = jsonstr(jsonget(j, "temp")) == "ask";
             s->nofolder = jsonflag(jsonget(j, "nofolder"), 0);
+            // Questions to the user only as the record says: never for
+            // sessions from before the flag, or nobody's to answer
+            b32 asks    = jsonflag(jsonget(j, "questions"), 0);
+            s->te.deny  = asks ? s->te.deny & ~(u32)TOOL_ASKMASK
+                               : s->te.deny |  (u32)TOOL_ASKMASK;
         } break;
         case EV_TITLE:
             s->title     = clone(&s->perm, jsonstr(jsonget(j, "text")));
@@ -15464,8 +15644,10 @@ static void cmdmodel(Engine *e, Arena scratch, i64 id, Json *j)
     }
     b32      transient = 0;
     Session *s         = borrow(e, scratch, sid, &transient);
-    // While the user is asked to approve a plan, a model to carry it out
-    b32      planask   = s && s->state==S_ASK && s->ask.tool==TOOL_PLANEXIT;
+    // While the user is asked to approve a plan, or the agent's questions,
+    // a model to go on with
+    b32      planask   = s && s->state==S_ASK && (s->ask.tool==TOOL_PLANEXIT ||
+                                                    s->ask.tool==TOOL_ASKUSER);
     Str      err       = !s          ? Str("no such session") :
                          s->readonly ? Str("open in another process") :
                          (busy(s) && !planask) || s->intask
@@ -15564,7 +15746,8 @@ static void cmdmodel(Engine *e, Arena scratch, i64 id, Json *j)
 // mode, which their answers settle; between Build and Bypass at any
 // time. A subagent's mode is its parent's, and a session without
 // exit_plan_mode is never in plan mode. Into Bypass, the path and
-// desktop asks waiting in the session's tree are allowed, by "bypass".
+// desktop asks waiting in the session's tree are allowed, by "bypass";
+// the agent's questions keep waiting for the user.
 static void cmdmode(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
 {
     i32 mode = modefind(jsonstr(jsonget(j, "mode")));
@@ -15588,7 +15771,8 @@ static void cmdmode(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     }
     for (Session *t = e->sessions; mode==MODE_BYPASS && t; t = t->next) {
         b32 asks = t->state==S_ASK && (t->ask.tool!=TOOL_PLANENTER &&
-                                       t->ask.tool!=TOOL_PLANEXIT);
+                                       t->ask.tool!=TOOL_PLANEXIT &&
+                                       t->ask.tool!=TOOL_ASKUSER);
         if (asks && treeroot(t)==s && bypassing(t)) {
             Arena a = scratch;
             resolve(t, a, 1, DENY_BYPASS, {});
@@ -15638,7 +15822,8 @@ static void cmdshell(Engine *e, Arena scratch, i64 id, Json *j)
     }
     b32      transient = 0;
     Session *s         = borrow(e, scratch, sid, &transient);
-    b32      planask   = s && s->state==S_ASK && s->ask.tool==TOOL_PLANEXIT;
+    b32      planask   = s && s->state==S_ASK && (s->ask.tool==TOOL_PLANEXIT ||
+                                                    s->ask.tool==TOOL_ASKUSER);
     Str      err       = !s          ? Str("no such session") :
                          s->readonly ? Str("open in another process") :
                          (busy(s) && !planask) || s->intask
@@ -17339,6 +17524,25 @@ static void command(Engine *e, Arena scratch, Str line)
             reply(e, scratch, id, 0, "this ask offers no always: allow or deny it", sid);
         } else if (decision=="trust" && !s->ask.trust.len) {
             reply(e, scratch, id, 0, "this ask offers no trust: allow or deny it", sid);
+        } else if (s->ask.tool == TOOL_ASKUSER) {
+            // The agent's questions: the answers checked against them,
+            // re-read from the call, and the ask kept on a bad one
+            Block *c    = &s->calls[s->callidx];
+            Args   args = parseargs(&scratch, TOOL_ASKUSER, c->args, s->te.edit);
+            QCheck q    = checkanswers(&scratch, args.questions,
+                                       jsonget(j, "answers"), decision!="deny");
+            if (q.err.len) {
+                reply(e, scratch, id, 0, q.err, sid);
+            } else {
+                reply(e, scratch, id, 1, {}, sid);
+                Str note = jsonstr(jsonget(j, "note"));
+                resolve(s, scratch, decision!="deny", DENY_USER, note, 0, 0,
+                        decision!="deny" ? &q.qa : 0);
+                nexttool(s, scratch);
+            }
+        } else if (jsonget(j, "answers")->type != JSON_MISSING) {
+            reply(e, scratch, id, 0, "answers are only for the agent's "
+                  "questions (ask_user)", sid);
         } else {
             reply(e, scratch, id, 1, {}, sid);
             Str note  = jsonstr(jsonget(j, "note"));

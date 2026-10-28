@@ -515,6 +515,19 @@ struct GuiHost {
 
 struct AttBox;
 
+// The user's answers to the agent's questions (ask_user) as they fill
+// in its form (ui.cpp): for the ask req, the options picked, and words
+// of their own, each in a field of FIELD_MAX bytes, and a note. A new
+// ask starts it over with its recommended options picked.
+struct QForm {
+    Str   req;
+    b32   pick[4][4];
+    b32   other[4];   // their own words answer it
+    char *own[4];
+    char *note;
+    b32   sent;       // until the reply, or for good once accepted
+};
+
 // A session the GUI knows: listed by the engine, or opened here.
 struct GuiSession {
     GuiSession  *next;
@@ -571,6 +584,8 @@ struct GuiSession {
     i32          toastid;   // its toasts' id, given as the first is shown
     i32          toastkind; // TOAST_*: what the one out tells of
     GuiSession  *toastsel;  // what a click on it selects, under it
+    QForm       *qform;     // the answers to the agent's questions, null
+                            // until it first asks
 };
 
 // A command awaiting its reply.
@@ -1212,6 +1227,8 @@ struct Gui {
     b32                findopen;
     b32                findfocus;  // focus its field next frame
     b32                findactive; // its field had the keyboard
+    b32                askactive;  // a question form's field had it
+    f32                qformdrawn; // the latest question form's height, drawn
     b32                findjump;   // scroll to the current hit
     b32                findwant;   // the current hit is the first found
     i32                findfrom;   //   from this message on
@@ -3416,6 +3433,50 @@ static void guianswer(Gui *g, GuiSession *s, Str req, Str decision, Str note)
     cmdsend(g, &w, a);
 }
 
+// Answers to the agent's questions, from their form: picks and words of
+// the user's own for each, and the note; or, skip, the note alone.
+static void guianswerq(Gui *g, GuiSession *s, ViewTool *t, QForm *f, b32 skip)
+{
+    Arena a    = newarena(g->cmdr);
+    Str   note = trim(Str{(u8 *)f->note, (iz)__builtin_strlen(f->note)});
+    Buf   b(&a, 512 + t->req.len + note.len + 4*FIELD_MAX);
+    EvOut w = cmdopen(g, &b, CMD_ANSWER, s);
+    putkey(&w.json, "req");
+    putstr(&w.json, t->req);
+    putkey(&w.json, "decision");
+    putstr(&w.json, skip ? Str("deny") : Str("allow"));
+    if (note.len) {
+        putkey(&w.json, "note");
+        putstr(&w.json, note);
+    }
+    if (!skip) {
+        putkey(&w.json, "answers");
+        putarray(&w.json);
+        for (iz i = 0; i < t->qs.len; i++) {
+            ViewQuestion *q   = &t->qs[i];
+            Str           own = trim(Str{(u8 *)f->own[i], (iz)__builtin_strlen(f->own[i])});
+            b32           mine = f->other[i] && own.len;
+            putobject(&w.json);
+            putkey(&w.json, "pick");
+            putarray(&w.json);
+            for (iz k = 0; k<q->opts.len && !(mine && !q->multi); k++) {
+                if (f->pick[i][k]) {
+                    putint(&w.json, k);
+                }
+            }
+            putend(&w.json);
+            if (mine) {
+                putkey(&w.json, "text");
+                putstr(&w.json, own);
+            }
+            putend(&w.json);
+        }
+        putend(&w.json);
+    }
+    f->sent = 1;
+    cmdsend(g, &w, a);
+}
+
 // Put back the files write and edit changed: from a call's on (call),
 // or from a turn's on, overwriting conflicts if forced. A rewind record
 // tells how each went.
@@ -4193,6 +4254,9 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
     b32 mine = s->cmdid == q->id;
     s->cmdid = mine ? 0 : s->cmdid;
     if (!ok) {
+        if (q->cmd==CMD_ANSWER && s->qform) {
+            s->qform->sent = 0;  // to fix and send again
+        }
         setnote(g, s, err.len ? err : Str("the command failed"), 1);
         if (mine && s->cmdtext.len && !draftstr(s).len) {
             setdraft(g, s, s->cmdtext);
@@ -9745,6 +9809,10 @@ enum : i32 {
     CHK_LIVETAIL,
     CHK_ASKCARD,
     CHK_ASKALLOWED,
+    CHK_QCARD,      // the agent's questions: the form as reserved
+    CHK_QWAITING,   // and as picked and typed, still waiting
+    CHK_QANSWERED,  // the agent read the answers
+    CHK_QSKIPPED,   // a skip, the note its words
     CHK_ASKTIMEOUT,
     CHK_STEERED,
     CHK_CANCELLED,
@@ -10016,6 +10084,9 @@ static Str chknames[] = {
     "tool rows for read, edit and shell, each ok, with exit code and output file",
     "the edit shows a highlighted diff", "shell output showed while it ran",
     "an ask card with its buttons", "allowed by the user, and the agent went on",
+    "the questions' form, at its reserved height, recommended options picked",
+    "the questions picked and typed, still waiting",
+    "the agent read the answers", "skipped with a note, which the agent read",
     "denied at its deadline, and the agent went on",
     "a steer reached the agent mid-turn", "Esc cancelled the turn mid-tool",
     "the small inbox overflowed", "the view matches a replay of the log",
@@ -11059,6 +11130,51 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
     {OP_CHECK, CHK_ALWAYSPATH, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "2-allowedalways"},
+    // The agent's questions, while the window has no focus: a toast
+    // tells of them, waiting with no deadline. The form, drawn at the
+    // height reserved, starts with the recommended options picked;
+    // another option, words of the user's own in a field, and Esc
+    // there, which leaves it and the turn going on; then Submit, and
+    // the agent reads the answers. Asked again, a skip with a note.
+    {OP_FOCUS, 0, 2, 0, 0, ""},
+    {OP_TOASTMARK, 0, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Ask me questions."},
+    {OP_WAIT, W_ASK, 0, 0, 10000, ""},
+    {OP_WAIT, W_TOAST, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "Database"},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "Waiting for you"},
+    {OP_FOCUS, 0, 1, 0, 300, ""},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_QCARD, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "2-questions"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "question 1 option 2"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "question 2 other"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 300, "Billing"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_QWAITING, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "2-questions-picked"},
+    {OP_MOVE, T_ALLOW, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_QANSWERED, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Ask me questions again."},
+    {OP_WAIT, W_ASK, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "question note"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 300, "Use MySQL."},
+    {OP_MOVE, T_DENY, 0, 0, 200, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_QSKIPPED, 0, 0, 0, ""},
     // An ask nobody answers, denied at its deadline, its countdown
     // drawn by deadlines alone; its toast goes with it, the window
     // minimized meanwhile (as far as toasts go)
@@ -15377,6 +15493,39 @@ static b32 drivecheck(Gui *g, i32 chk)
         Rect     r = g->rects[RECT_ALLOW];
         return m && m->tool->answer==VASK_PENDING && m->tool->deadline &&
                r.x1>r.x0 && m->text.len;
+    }
+    case CHK_QCARD: {
+        // Waiting with no deadline, drawn at the height reserved for
+        // it, the recommended options picked
+        ViewMsg *m = lastmsg(g, VIEW_ASK);
+        QForm   *f = g->sess ? g->sess->qform : 0;
+        Rect     r = g->rects[RECT_ALLOW];
+        return m && m->tool->answer==VASK_PENDING && !m->tool->deadline &&
+               m->tool->qs.len==2 && m->tool->formh>0 &&
+               g->qformdrawn==m->tool->formh && r.x1>r.x0 &&
+               f && f->req==m->tool->req && f->pick[0][0] && !f->pick[0][1] &&
+               f->pick[1][0] && !f->pick[1][1] && !f->pick[1][2];
+    }
+    case CHK_QWAITING: {
+        ViewMsg *m = lastmsg(g, VIEW_ASK);
+        QForm   *f = g->sess ? g->sess->qform : 0;
+        return m && m->tool->answer==VASK_PENDING && g->view->busy && !g->askactive &&
+               f && !f->pick[0][0] && f->pick[0][1] && f->pick[1][0] && f->other[1] &&
+               Str{(u8 *)f->own[1], (iz)__builtin_strlen(f->own[1])}=="Billing" &&
+               g->qformdrawn==m->tool->formh;
+    }
+    case CHK_QANSWERED: {
+        ViewMsg *k = lastmsg(g, VIEW_ASK);
+        ViewMsg *a = lastmsg(g, VIEW_ASSISTANT);
+        return k && k->tool->answer==VASK_ALLOWED && k->tool->by=="user" &&
+               find(k->text, "SQLite")>=0 && a && find(a->text, "SQLite")>=0 &&
+               find(a->text, "Auth")>=0 && find(a->text, "Billing")>=0;
+    }
+    case CHK_QSKIPPED: {
+        ViewMsg *k = lastmsg(g, VIEW_ASK);
+        ViewMsg *a = lastmsg(g, VIEW_ASSISTANT);
+        return k && k->tool->answer==VASK_DENIED && k->tool->by=="user" &&
+               k->tool->note=="Use MySQL." && a && find(a->text, "Use MySQL.")>=0;
     }
     case CHK_ASKALLOWED: {
         ViewMsg *k = lastmsg(g, VIEW_ASK);

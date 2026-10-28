@@ -308,11 +308,25 @@ plan's Edit plan; otherwise the agent is not told), and Reveal shows it
 in Finder, Explorer or the file manager; both only for a plan on this
 computer.
 
+When a decision is yours, the agent may ask (its `ask_user` tool),
+most often while planning: one card shows up to four questions, each
+with a few options, the recommended one marked and picked, and a field
+for an answer in your own words, then a note, Submit answers and Skip.
+A skip, or nobody there to answer, has the agent go with its
+recommendations. The questions wait with no countdown, and a
+notification tells of them (`[ui] notify` `allow`). Only the sessions
+you start yourself, attended, get the tool: never subagents, roles, a
+`tools` list or command-line runs. Over the protocol, an ask of kind
+`question` carries `questions`, and `answer {decision:"allow",
+answers:[{pick:[...], text?}, ...]}` answers it, one entry per question
+(cap `question`).
+
 Bypass mode, in red in the same mode list, is for an agent left to
 work alone somewhere it can do no harm: nothing is asked, attended or
 not, so its file tools read and write outside the working directory, a
 patch may change many files there, and the desktop tool acts, running
-programs too. Only the agent's own asks about plan mode remain, and
+programs too. Only the agent's own asks about plan mode and its
+questions remain, and
 writes under the state directory (but the plan file) are refused, as
 are paths that name nothing. Only you turn it on, from the list, never
 a new session, the agent or the configuration. It stays through

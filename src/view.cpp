@@ -226,6 +226,22 @@ enum : iz {
 };
 
 // A tool call's row, or an ask's card.
+// One of the agent's questions (ask_user), and the user's answer to it.
+struct ViewOption {
+    Str label;
+    Str desc;   // may be empty
+    b32 rec;    // recommended
+};
+
+struct ViewQuestion {
+    Str               text;
+    Str               header;
+    b32               multi;   // the user may pick several
+    Slice<ViewOption> opts;
+    Slice<i32>        picked;  // as answered: option indices
+    Str               own;     // and words of the user's own
+};
+
 struct ViewTool {
     Str  call;      // call id
     Str  name;      // tool name
@@ -274,6 +290,9 @@ struct ViewTool {
     b32  trusted;   // and it was
     Str  by;
     Str  note;
+    Slice<ViewQuestion> qs;  // kind question's, empty if unreadable
+    b32  dflt;      // answered with the recommended options
+    f32  formh;     // their form's height, measured (ui.cpp), else 0
 };
 
 // A compaction (kind "summary" or "prune") or a rewind, as a card.
@@ -1095,6 +1114,28 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
             print(&b, " in progress");
         }
         return finish(&b);
+    } else if (name == "ask_user") {
+        // "2 questions: Database, Features", which may come as a string
+        Json *q = jsonget(j, "questions");
+        if (q->type == JSON_STRING) {
+            q = jsonparse(&scratch, q->str).root;
+        }
+        q = q->type==JSON_OBJECT ? j : q;
+        Buf b(&scratch, 256);
+        i64 n = 0;
+        for (Json *e = q->type==JSON_ARRAY ? q->child : 0; e; e = e->next, n++) {}
+        print(&b, n);
+        print(&b, n==1 ? Str(" question") : Str(" questions"));
+        Str sep = ": ";
+        for (Json *e = q->type==JSON_ARRAY ? q->child : 0; e; e = e->next) {
+            Str h = jsonstr(jsonget(e, "header"));
+            if (h.len) {
+                print(&b, sep);
+                print(&b, h);
+                sep = ", ";
+            }
+        }
+        return oneline(perm, finish(&b));
     } else if (name=="task" && desc.len) {
         return oneline(perm, desc);
     } else if (name == "skill") {
@@ -1307,6 +1348,104 @@ static i32 findcall(View *v, Str call)
         }
     }
     return -1;
+}
+
+// A question ask's questions, as the engine normalized them, or none
+// if they are not as it writes them: then the ask shows its detail.
+static Slice<ViewQuestion> viewquestions(Arena *a, Json *qs)
+{
+    Slice<ViewQuestion> r = {};
+    if (qs->type!=JSON_ARRAY || qs->len<1 || qs->len>4) {
+        return {};
+    }
+    for (Json *e = qs->child; e; e = e->next) {
+        ViewQuestion q = {};
+        q.text   = clone(a, jsonstr(jsonget(e, "question")));
+        q.header = clone(a, jsonstr(jsonget(e, "header")));
+        q.multi  = jsonflag(jsonget(e, "multi_select"), 0);
+        Json *os = jsonget(e, "options");
+        if (!q.text.len || !q.header.len || os->type!=JSON_ARRAY ||
+                os->len<2 || os->len>4) {
+            return {};
+        }
+        for (Json *o = os->child; o; o = o->next) {
+            ViewOption opt = {};
+            opt.label = clone(a, jsonstr(jsonget(o, "label")));
+            opt.desc  = clone(a, jsonstr(jsonget(o, "description")));
+            opt.rec   = jsonflag(jsonget(o, "recommended"), 0);
+            if (!opt.label.len) {
+                return {};
+            }
+            q.opts = push(a, q.opts, opt);
+        }
+        r = push(a, r, q);
+    }
+    return r;
+}
+
+// An answer record's answers, onto the questions they answer.
+static void viewanswers(Arena *a, ViewTool *t, Json *answers)
+{
+    iz i = 0;
+    for (Json *e = answers->child; e && i<t->qs.len; e = e->next, i++) {
+        ViewQuestion *q = &t->qs[i];
+        q->picked = {};
+        for (Json *k = jsonget(e, "pick")->child; k; k = k->next) {
+            i64 at = jsonint(k, -1);
+            if (at>=0 && at<q->opts.len) {
+                q->picked = push(a, q->picked, (i32)at);
+            }
+        }
+        q->own = clone(a, jsonstr(jsonget(e, "text")));
+    }
+}
+
+// A question ask's text once it is over: each question, and the answer
+// to it, if any; a skip's note follows them.
+static Str questionsummary(Arena *a, ViewTool *t)
+{
+    iz cap = 64 + t->note.len;
+    for (iz i = 0; i < t->qs.len; i++) {
+        ViewQuestion *q = &t->qs[i];
+        cap += 16 + q->header.len + q->text.len + q->own.len;
+        for (iz k = 0; k < q->opts.len; k++) {
+            cap += 4 + q->opts[k].label.len;
+        }
+    }
+    Buf b(a, cap);
+    b32 allowed = t->answer == VASK_ALLOWED;
+    for (iz i = 0; i < t->qs.len; i++) {
+        ViewQuestion *q = &t->qs[i];
+        if (i) {
+            print(&b, "\n");
+        }
+        print(&b, q->header);
+        print(&b, ": ");
+        print(&b, q->text);
+        if (!allowed) {
+            continue;
+        }
+        print(&b, "\n  \xe2\x86\x92 ");
+        Str sep = "";
+        for (iz k = 0; k < q->picked.len; k++) {
+            print(&b, sep);
+            print(&b, q->opts[q->picked[k]].label);
+            sep = ", ";
+        }
+        if (q->own.len) {
+            print(&b, sep);
+            print(&b, "\xe2\x80\x9c");
+            print(&b, q->own);
+            print(&b, "\xe2\x80\x9d");
+        } else if (!q->picked.len) {
+            print(&b, "(no answer)");
+        }
+    }
+    if (t->note.len && t->by=="user") {
+        print(&b, allowed ? Str("\n\nNote: ") : Str("\n\nInstead: "));
+        print(&b, t->note);
+    }
+    return finish(&b);
 }
 
 static i32 findask(View *v, Str req)
@@ -1877,6 +2016,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             if (k->role==VIEW_ASK && k->tool->call==call && k->tool->answer==VASK_PENDING) {
                 k->tool->answer = VASK_DENIED;
                 k->tool->by     = "interrupted";
+                if (k->tool->qs.len) {
+                    settext(v, k, questionsummary(&scratch, k->tool), 0);
+                }
                 k->ver++;
                 v->asks--;
                 v->topsdirty = 1;
@@ -1910,6 +2052,14 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->access   = clone(&v->aux, jsonstr(jsonget(j, "access")));
         t->scope    = clone(&v->aux, jsonstr(jsonget(j, "scope")));
         t->trust    = clone(&v->aux, jsonstr(jsonget(j, "trust")));
+        if (t->kind == "question") {
+            // The card shows the questions; once answered, the text
+            // says them with the answers
+            t->qs = viewquestions(&v->aux, jsonget(j, "questions"));
+            if (t->qs.len) {
+                settext(v, &v->msgs[i], {}, 0);
+            }
+        }
         v->msgs[i].tool = t;
         v->msgs[i].seq  = r->seq;
         v->msgs[i].md   = t->kind == "plan";  // the plan, in Markdown
@@ -1941,6 +2091,11 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->note   = clone(&v->aux, jsonstr(jsonget(j, "note")));
         t->always = allow && jsonflag(jsonget(j, "always"), 0);
         t->trusted = allow && jsonflag(jsonget(j, "trust"), 0);
+        if (t->qs.len) {
+            viewanswers(&v->aux, t, jsonget(j, "answers"));
+            t->dflt = jsonflag(jsonget(j, "recommended"), 0);
+            settext(v, m, questionsummary(&scratch, t), 0);
+        }
         m->ver++;
         v->topsdirty = 1;  // no more buttons
     } return 1;
@@ -2561,6 +2716,15 @@ static f32 msgfoot(View *v, ViewMsg *m)
     }
     b32 ask   = m->role==VIEW_ASK && m->tool->answer==VASK_PENDING;
     b32 force = m->role==VIEW_REWIND && m->card->latest && m->card->conflicts;
+    if (ask && m->tool->qs.len) {
+        // The questions' form, shown read-only too: as measured, else a
+        // row for each question, option and field until it is
+        f32 rows = 2;
+        for (iz i = 0; i < m->tool->qs.len; i++) {
+            rows += 2 + (f32)m->tool->qs[i].opts.len;
+        }
+        return m->tool->formh>0 ? m->tool->formh : rows*v->foot;
+    }
     Thumb th  = msgthumb(v, m);
     if (th.h > 0) {
         return th.h + v->thumbpad;
@@ -2576,7 +2740,8 @@ static MsgLayout *msglayout(View *v, i32 i, Measure *ms, f32 width, f32 scale)
     ViewCache *c = v->c;
     if (m->layoutver!=m->ver || m->layoutgen!=c->gen || m->layoutw!=width ||
             !m->measured) {
-        if (m->collapsed || msghidden(v, m)) {
+        if (m->collapsed || msghidden(v, m) || (m->role==VIEW_ASK && !m->text.len)) {
+            // An ask with no text (questions, which their form shows)
             m->layout = {};
             m->layout.width = width;
         } else {
@@ -2600,7 +2765,7 @@ static MsgLayout *msglayout(View *v, i32 i, Measure *ms, f32 width, f32 scale)
 // bytes wrapped at a typical character width.
 static f32 estimate(ViewMsg *m, f32 width, f32 charw, f32 lineh)
 {
-    if (m->collapsed) {
+    if (m->collapsed || (m->role==VIEW_ASK && !m->text.len)) {
         return 0;
     }
     i64 perline = width>charw ? (i64)(width/charw) : 1;
@@ -3494,6 +3659,16 @@ static Str askheadline(Arena *a, ViewTool *t)
         return "Approve the plan?";
     } else if (t->kind == "plan.enter") {
         return "Plan first, changing nothing until you approve?";
+    } else if (t->qs.len == 1) {
+        return oneline(a, t->qs[0].text);
+    } else if (t->qs.len) {
+        Buf b(a, 256);
+        print(&b, "Questions for you: ");
+        for (iz i = 0; i < t->qs.len; i++) {
+            print(&b, i ? Str(", ") : Str(""));
+            print(&b, t->qs[i].header);
+        }
+        return oneline(a, finish(&b));
     }
     Buf b(a, 64 + t->tool.len + t->path.len);
     if (t->kind == "mcp.project") {

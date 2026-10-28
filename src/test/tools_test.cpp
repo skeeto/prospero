@@ -173,11 +173,11 @@ static void test_tools(Test *t)
         expect(t, "tooldeny all but desktop", istr(a, tooldeny("read write edit "
                "shell grep glob todo_write jobs job_output job_kill task skill sessions "
                "send_message memory web_search web_fetch")),
-               istr(a, TOOL_OFFMASK|TOOL_PLANMASK));
+               istr(a, TOOL_OFFMASK|TOOL_PLANMASK|TOOL_ASKMASK));
         expect(t, "tooldeny all", istr(a, tooldeny("read write edit shell grep glob "
                "todo_write jobs job_output job_kill task desktop skill sessions "
                "send_message memory web_search web_fetch")),
-               istr(a, TOOL_PLANMASK));
+               istr(a, TOOL_PLANMASK|TOOL_ASKMASK));
         expect(t, "tooldeny none", istr(a, tooldeny("")), istr(a, ((u32)1<<TOOL_COUNT) - 1));
         expect(t, "unknown for the role", unknowntool(a, "write", deny),
                "The tool \"write\" is not available in this session, so nothing "
@@ -834,6 +834,103 @@ static void test_tools(Test *t)
         Str sys = systemprompt(a, "/w", &te);
         expect(t, "system prompt for a role", istr(a, find(sys, "grep and glob")<0 &&
                find(sys, "another session")<0), "1");
+    }
+
+    // Questions to the user (ask_user)
+    {
+        Str  qs   = R"j({"questions":[{"question":"Which?","header":"DB",)j"
+                    R"j("options":["PostgreSQL (Recommended)",{"label":"SQLite",)j"
+                    R"j("description":"A file"},"Other"]},{"question":"And?",)j"
+                    R"j("header":"Feat","multiSelect":true,"options":[)j"
+                    R"j({"label":"A","recommended":true},{"label":"B","recommended":"true"}]}]})j";
+        Args q = parseargs(a, TOOL_ASKUSER, qs, EDIT_REPLACE);
+        expect(t, "ask parsed", istr(a, q.issues.len*100 + q.questions.len*10 +
+                                        q.questions[0].opts.len), "22");
+        expect(t, "ask recommended by label", istr(a, q.questions[0].opts[0].rec*10 +
+               q.questions[0].opts[1].rec), "10");
+        expect(t, "ask label cut", q.questions[0].opts[0].label, "PostgreSQL");
+        expect(t, "ask multi", istr(a, q.questions[1].multi*10 + q.questions[1].opts[1].rec), "11");
+        Args one = parseargs(a, TOOL_ASKUSER, R"j({"questions":"{\"question\":\"Q\",\"header\":\"H\",\"options\":[\"x\",\"y\"]}"})j", EDIT_REPLACE);
+        expect(t, "ask one object in a string", istr(a, one.questions.len*10 + one.issues.len), "10");
+
+        struct { Str raw; Str want; } bad[] = {
+            {"{}", "questions: required array is missing; "},
+            {R"j({"questions":[]})j", "questions: must hold 1 to 4 questions; "},
+            {R"j({"questions":[{"question":"Q","header":"H","options":["x"]}]})j",
+             "questions[0].options: must be 2 to 4 alternatives; "},
+            {R"j({"questions":[{"question":"Q","header":"H","options":["x","Other"]}]})j",
+             "questions[0].options: must be 2 to 4 alternatives besides Other, which "
+             "the user always has: leave it out; "},
+            {R"j({"questions":[{"question":"Q","header":"H","options":["x","X"]}]})j",
+             "questions[0].options[1].label: repeats another option's label; "},
+            {R"j({"questions":[{"question":"","header":"","options":["x","y"]}]})j",
+             "questions[0].question: must be a non-empty string; questions[0].header: "
+             "must be a non-empty string, a word or two; "},
+            {R"j({"questions":[{"question":"Q","header":"H","options":["x (Recommended)",)j"
+             R"j({"label":"y","recommended":true}]}]})j",
+             "questions[0].options: recommend at most one option, unless multi_select; "},
+        };
+        for (iz i = 0; i < countof(bad); i++) {
+            expect(t, "ask issues", argsshow(a, TOOL_ASKUSER, bad[i].raw), bad[i].want);
+        }
+        Str five = R"j({"questions":[)j";
+        for (i32 i = 0; i < 5; i++) {
+            five = concat(a, five, i ? Str(",") : Str(""));
+            five = concat(a, five, R"j({"question":"Q","header":"H","options":["x","y"]})j");
+        }
+        five = concat(a, five, "]}");
+        expect(t, "ask too many", istr(a, find(argsshow(a, TOOL_ASKUSER, five), "too many")>=0), "1");
+
+        // Answers
+        auto check = [&](Str raw, b32 allow) {
+            JsonDoc d = jsonparse(a, raw.len ? raw : Str("null"));
+            Json   *j = raw.len ? d.root : jsonget(d.root, "none");
+            QCheck  c = checkanswers(a, q.questions, j, allow);
+            if (c.err.len) {
+                return c.err;
+            }
+            Buf      b(a, 256);
+            JsonOut  w = {&b};
+            putanswers(&w, &c.qa);
+            return concat(a, c.qa.dflt ? Str("dflt ") : Str(""), finish(&b));
+        };
+        expect(t, "answers", check(R"j([{"pick":[1]},{"pick":[0,1],"text":" more "}])j", 1),
+               R"j([{"pick":[1]},{"pick":[0,1],"text":"more"}])j");
+        expect(t, "answers default", check({}, 1), R"j(dflt [{"pick":[0]},{"pick":[0,1]}])j");
+        expect(t, "answers skip", check({}, 0), "[]");
+        expect(t, "answers on a skip", check(R"j([])j", 0),
+               "a skip takes no answers: send words of your own as its note");
+        expect(t, "answers count", check(R"j([{"pick":[0]}])j", 1),
+               "answers must have one {pick, text} for each of the 2 questions");
+        expect(t, "answers range", check(R"j([{"pick":[2]},{"pick":[0]}])j", 1),
+               "answers[0]: pick holds an index that names no option");
+        expect(t, "answers twice", check(R"j([{"pick":[0]},{"pick":[1,1]}])j", 1),
+               "answers[1]: pick names an option twice");
+        expect(t, "answers single", check(R"j([{"pick":[0,1]},{"pick":[0]}])j", 1),
+               "answers[0]: this question takes one answer: pick one option");
+        expect(t, "answers both", check(R"j([{"pick":[0],"text":"x"},{"pick":[0]}])j", 1),
+               "answers[0]: this question takes one answer: pick an option or give text, not both");
+        expect(t, "answers none", check(R"j([{"pick":[0]},{"text":" "}])j", 1),
+               "answers[1]: no answer: pick an option or give text");
+
+        expect(t, "ask detail", istr(a, find(questiondetail(a, q.questions), "Which?")>=0 &&
+               find(questiondetail(a, q.questions), "Allow takes the recommended")>=0), "1");
+
+        // Offered only by the engine: no tool list names it
+        expect(t, "ask in no list", istr(a, (tooldeny("*") & TOOL_ASKMASK) != 0 &&
+               toolbits("ask_user")==0), "1");
+        ToolEnv qe = {};
+        qe.deny = TOOL_OFFMASK;
+        Str with = systemprompt(a, "/w", &qe);
+        qe.deny |= TOOL_ASKMASK;
+        Str without = systemprompt(a, "/w", &qe);
+        expect(t, "ask in the system prompt", istr(a, find(with, "ask with ask_user")>=0 &&
+               find(without, "cannot answer questions")>=0 && find(without, "ask_user")<0), "1");
+        expect(t, "ask alias", istr(a, find(unknowntool(a, "AskUserQuestion", TOOL_ASKMASK),
+                                            "cannot ask the user")>=0), "1");
+        expect(t, "ask in tooljson", istr(a, find(tooljson(a, &qe), "\"ask_user\"")<0), "1");
+        qe.deny &= ~(u32)TOOL_ASKMASK;
+        expect(t, "ask in tooljson offered", istr(a, find(tooljson(a, &qe), "\"ask_user\"")>=0), "1");
     }
 
     // Todo lists

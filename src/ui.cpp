@@ -1189,7 +1189,11 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
     } break;
     case VIEW_ASK: {
         b32 plan = t->kind=="plan" || t->kind=="plan.enter";
-        if (t->kind == "plan") {
+        b32 ques = t->kind == "question";
+        if (ques) {
+            pen(p, t->qs.len==1 ? Str("A question for you  ") : Str("Questions for you  "),
+                STYLE_BOLD, pal->amber);
+        } else if (t->kind == "plan") {
             pen(p, "Approve the plan?  ", STYLE_BOLD, pal->amber);
         } else if (plan) {
             pen(p, "Plan first, changing nothing until you approve?  ",
@@ -1232,7 +1236,12 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         } else {
             b32 ok = t->answer == VASK_ALLOWED;
             Buf c(&a, 256);
-            print(&c, t->kind=="plan" ? (ok ? Str("approved") : Str("kept planning")) :
+            print(&c, ques && t->by=="user"
+                                      ? (!ok    ? Str("skipped") :
+                                         t->dflt ? Str("answered as recommended")
+                                                 : Str("answered")) :
+                      ques            ? Str("not answered") :
+                      t->kind=="plan" ? (ok ? Str("approved") : Str("kept planning")) :
                       plan            ? (ok ? Str("agreed") : Str("declined")) :
                       ok              ? Str("allowed") : Str("denied"));
             print(&c, t->trusted       ? Str(" (trusted) by you") :
@@ -1707,6 +1716,287 @@ static void planeditbutton(Gui *g, GuiSession *s, Str path, Str req, char const 
     ImGui::EndDisabled();
     itemnamed(g, named);
     whytip(why.len ? why : tip);
+}
+
+// The form for a session's waiting questions, started over for each new
+// ask with its recommended options picked.
+static QForm *qformof(Gui *g, GuiSession *s, ViewTool *t)
+{
+    QForm *f = s->qform;
+    if (!f) {
+        f = s->qform = alloc<QForm>(&g->perm);
+        for (i32 i = 0; i < 4; i++) {
+            f->own[i] = alloc<char>(&g->perm, FIELD_MAX);
+        }
+        f->note = alloc<char>(&g->perm, FIELD_MAX);
+    }
+    if (f->req != t->req) {
+        f->req = clone(&g->perm, t->req);
+        for (i32 i = 0; i < 4; i++) {
+            ViewQuestion *q = i<t->qs.len ? &t->qs[i] : 0;
+            for (i32 k = 0; k < 4; k++) {
+                f->pick[i][k] = q && k<q->opts.len && q->opts[k].rec;
+            }
+            f->other[i]  = 0;
+            f->own[i][0] = 0;
+        }
+        f->note[0] = 0;
+        f->sent    = 0;
+    }
+    return f;
+}
+
+// Before a question form's field id is drawn: Esc leaves it, keeping
+// what was typed, where ImGui's own would undo the edit, and is not the
+// turn's cancel (escapecancel) for this frame either. Returns whether
+// Enter was pressed in it.
+static b32 askfield(Gui *g, char const *id)
+{
+    if (ImGui::GetActiveID() != ImGui::GetID(id)) {
+        return 0;
+    }
+    g->askactive = 1;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        ImGui::ClearActiveID();
+    }
+    return ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+           ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+}
+
+static ImVec2 textsize(ImFont *f, f32 size, Str s, f32 wrap)
+{
+    return f->CalcTextSizeA(size, 1e9f, wrap, s.cdata, s.cdata+s.len);
+}
+
+// The agent's questions (ask_user) as a form below their card: for each,
+// its header in a chip and the question, then its options, each a row
+// to click with a radio or a check, the label, a Recommended badge and
+// the description, then a field for words of the user's own; below them
+// a note, Submit and Skip. Without draw it only measures: the height
+// comes from the text and the width alone, never from what is picked or
+// typed, so that the transcript reserves it (msgfoot) before the form
+// is drawn. Returns the height.
+static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
+                        b32 latest)
+{
+    ViewTool   *t      = m->tool;
+    Palette    *pal    = g->pal;
+    Arena       a      = g->frame;
+    f32         sc     = g->scale;
+    f32         size   = g->fonts.size;
+    f32         small  = size*0.85f;
+    ImFont     *bold   = stylefont(&g->fonts, STYLE_BOLD);
+    ImFont     *prose  = stylefont(&g->fonts, 0);
+    f32         frame  = ImGui::GetFrameHeight();
+    f32         indent = 26*sc;
+    f32         gap    = 6*sc;
+    Str         rec    = "Recommended";
+    ImVec2      bs     = textsize(prose, small, rec, 0);
+    f32         badgew = bs.x + 10*sc;
+    ImVec2      o      = draw ? ImGui::GetCursorScreenPos() : v2(0, 0);
+    ImDrawList *dl     = draw ? ImGui::GetWindowDrawList() : 0;
+    QForm      *f      = draw ? qformof(g, s, t) : 0;
+    b32         off    = s->view->readonly || (f && f->sent);
+    Str         need   = {};
+    b32         entered = 0;
+    f32         y      = 0;
+
+    for (iz i = 0; i < t->qs.len; i++) {
+        ViewQuestion *q = &t->qs[i];
+        if (i) {
+            y += 2*gap;
+        }
+
+        // The header's chip, and the question beside it
+        ImVec2 hs    = textsize(bold, small, q->header, 0);
+        f32    chipw = hs.x + 12*sc;
+        f32    chiph = hs.y + 4*sc;
+        f32    qwrap = width - chipw - 8*sc;
+        ImVec2 qs    = textsize(bold, size, q->text, qwrap);
+        if (draw) {
+            dl->AddRectFilled(v2(o.x, o.y+y), v2(o.x+chipw, o.y+y+chiph),
+                              fade(pal->amber, 0.18f), 4*sc);
+            dl->AddText(bold, small, v2(o.x+6*sc, o.y+y+2*sc), pal->amber,
+                        q->header.cdata, q->header.cdata+q->header.len);
+            dl->AddText(bold, size, v2(o.x+chipw+8*sc, o.y+y), pal->text,
+                        q->text.cdata, q->text.cdata+q->text.len, qwrap);
+        }
+        y += (chiph>qs.y ? chiph : qs.y) + gap;
+
+        // Its options
+        b32 answered = 0;
+        for (iz k = 0; k < q->opts.len; k++) {
+            ViewOption *opt   = &q->opts[k];
+            f32         lwrap = width - indent - (opt->rec ? badgew+6*sc : 0);
+            ImVec2      ls    = textsize(bold, size, opt->label, lwrap);
+            ImVec2      ds    = opt->desc.len ? textsize(prose, small, opt->desc, width-indent)
+                                              : v2(0, 0);
+            f32         body  = ls.y + (opt->desc.len ? 2*sc + ds.y : 0);
+            f32         rowh  = (frame>body ? frame : body) + 4*sc;
+            if (draw) {
+                b32 on = f->pick[i][k];
+                answered |= on;
+                ImGui::PushID((i32)(i*8 + k));
+                ImGui::SetCursorScreenPos(v2(o.x, o.y+y));
+                ImGui::BeginDisabled(off);
+                if (ImGui::InvisibleButton("##opt", v2(width, rowh))) {
+                    if (q->multi) {
+                        f->pick[i][k] = !on;
+                    } else {
+                        for (iz j = 0; j < 4; j++) {
+                            f->pick[i][j] = j == k;
+                        }
+                        f->other[i] = 0;
+                    }
+                }
+                ImGui::EndDisabled();
+                Buf nb(&a, 64);
+                print(&nb, "question ");
+                print(&nb, (i64)i+1);
+                print(&nb, " option ");
+                print(&nb, (i64)k+1);
+                itemnamed(g, finish(&nb));
+                if (!off && ImGui::IsItemHovered()) {
+                    dl->AddRectFilled(v2(o.x-4*sc, o.y+y), v2(o.x+width, o.y+y+rowh),
+                                      fade(pal->amber, 0.10f), 4*sc);
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                }
+                // The radio or the check, beside the label's first line
+                u32    col = off ? pal->dim : pal->link;
+                ImVec2 c   = v2(o.x + 11*sc, o.y + y + 2*sc + size*0.6f);
+                if (q->multi) {
+                    ImVec2 c0 = v2(c.x-6*sc, c.y-6*sc), c1 = v2(c.x+6*sc, c.y+6*sc);
+                    if (f->pick[i][k]) {
+                        dl->AddRectFilled(c0, c1, col, 2*sc);
+                        ImVec2 tick[3] = {v2(c.x-3.5f*sc, c.y), v2(c.x-1*sc, c.y+2.5f*sc),
+                                          v2(c.x+3.5f*sc, c.y-3*sc)};
+                        dl->AddPolyline(tick, 3, pal->panel, 1.8f*sc);
+                    } else {
+                        dl->AddRect(c0, c1, col, 2*sc, 1.5f*sc);
+                    }
+                } else {
+                    dl->AddCircle(c, 6*sc, col, 0, 1.5f*sc);
+                    if (f->pick[i][k]) {
+                        dl->AddCircleFilled(c, 3.5f*sc, col);
+                    }
+                }
+                dl->AddText(bold, size, v2(o.x+indent, o.y+y+2*sc),
+                            off ? pal->dim : pal->text,
+                            opt->label.cdata, opt->label.cdata+opt->label.len, lwrap);
+                if (opt->rec) {
+                    f32 lx = textsize(bold, size, opt->label, 0).x;
+                    lx = lx<lwrap ? lx : lwrap;
+                    ImVec2 b0 = v2(o.x+indent+lx+6*sc, o.y+y+2*sc + (size-bs.y)/2 - 1*sc);
+                    ImVec2 b1 = v2(b0.x+badgew, b0.y+bs.y+2*sc);
+                    dl->AddRectFilled(b0, b1, fade(pal->link, 0.16f), 3*sc);
+                    dl->AddText(prose, small, v2(b0.x+5*sc, b0.y+1*sc), pal->link,
+                                rec.cdata, rec.cdata+rec.len);
+                }
+                if (opt->desc.len) {
+                    dl->AddText(prose, small, v2(o.x+indent, o.y+y+2*sc+ls.y+2*sc), pal->dim,
+                                opt->desc.cdata, opt->desc.cdata+opt->desc.len, width-indent);
+                }
+                ImGui::PopID();
+            }
+            y += rowh;
+        }
+
+        // Words of the user's own, which typing chooses
+        if (draw) {
+            ImGui::PushID((i32)i);
+            u32    col = off ? pal->dim : pal->link;
+            ImVec2 c   = v2(o.x + 11*sc, o.y + y + 2*sc + frame/2);
+            ImGui::SetCursorScreenPos(v2(o.x, o.y+y+2*sc));
+            ImGui::BeginDisabled(off);
+            if (ImGui::InvisibleButton("##otherpick", v2(indent, frame))) {
+                f->other[i] = !f->other[i];
+                for (iz j = 0; j<4 && f->other[i] && !q->multi; j++) {
+                    f->pick[i][j] = 0;
+                }
+            }
+            if (q->multi) {
+                ImVec2 c0 = v2(c.x-6*sc, c.y-6*sc), c1 = v2(c.x+6*sc, c.y+6*sc);
+                if (f->other[i]) {
+                    dl->AddRectFilled(c0, c1, col, 2*sc);
+                    ImVec2 tick[3] = {v2(c.x-3.5f*sc, c.y), v2(c.x-1*sc, c.y+2.5f*sc),
+                                      v2(c.x+3.5f*sc, c.y-3*sc)};
+                    dl->AddPolyline(tick, 3, pal->panel, 1.8f*sc);
+                } else {
+                    dl->AddRect(c0, c1, col, 2*sc, 1.5f*sc);
+                }
+            } else {
+                dl->AddCircle(c, 6*sc, col, 0, 1.5f*sc);
+                if (f->other[i]) {
+                    dl->AddCircleFilled(c, 3.5f*sc, col);
+                }
+            }
+            ImGui::SameLine(0, 0);
+            ImGui::SetNextItemWidth(width - indent);
+            entered |= askfield(g, "##own");
+            if (ImGui::InputTextWithHint("##own", "Other: answer in your own words",
+                                         f->own[i], FIELD_MAX) && f->own[i][0]) {
+                f->other[i] = 1;
+                for (iz j = 0; j<4 && !q->multi; j++) {
+                    f->pick[i][j] = 0;
+                }
+            }
+            g->askactive |= ImGui::IsItemActive();
+            ImGui::EndDisabled();
+            Buf nb(&a, 64);
+            print(&nb, "question ");
+            print(&nb, (i64)i+1);
+            print(&nb, " other");
+            itemnamed(g, finish(&nb));
+            ImGui::PopID();
+            Str own = trim(Str{(u8 *)f->own[i], (iz)__builtin_strlen(f->own[i])});
+            answered |= f->other[i] && own.len;
+            if (!answered && !need.len) {
+                need = concat(&a, "Answer every question first: ", q->header);
+            }
+        }
+        y += frame + 4*sc;
+    }
+
+    // A note for the agent, then Submit and Skip
+    y += gap;
+    if (draw) {
+        ImGui::SetCursorScreenPos(v2(o.x, o.y+y));
+        ImGui::BeginDisabled(off);
+        ImGui::SetNextItemWidth(width);
+        entered |= askfield(g, "##qnote");
+        ImGui::InputTextWithHint("##qnote", "Note for the agent (optional)", f->note, FIELD_MAX);
+        g->askactive |= ImGui::IsItemActive();
+        itemnamed(g, "question note");
+        ImGui::EndDisabled();
+    }
+    y += frame + gap;
+    if (draw) {
+        // Enter in a field submits, once every question has an answer
+        b32 enter = entered && !need.len && !off;
+        ImGui::SetCursorScreenPos(v2(o.x, o.y+y));
+        ImGui::BeginDisabled(off || need.len);
+        if (ImGui::Button(t->qs.len==1 ? "Submit answer" : "Submit answers") || enter) {
+            guianswerq(g, s, t, f, 0);
+        }
+        ImGui::EndDisabled();
+        if (latest) itemrect(g, RECT_ALLOW);
+        whytip(f->sent ? Str("Sent: waiting for the agent") :
+               need.len ? need : Str("Send your answers to the agent"));
+        ImGui::SameLine();
+        ImGui::BeginDisabled(off);
+        if (ImGui::Button("Skip")) {
+            guianswerq(g, s, t, f, 1);
+        }
+        ImGui::EndDisabled();
+        if (latest) itemrect(g, RECT_DENY);
+        ImGui::SetItemTooltip("Answer none of them: the agent goes with its "
+                              "recommendations, or with your note instead");
+    }
+    y += frame;
+    if (draw) {
+        g->qformdrawn = y;
+    }
+    return y;
 }
 
 // An open ask's buttons, below its text. Always, where the ask offers
@@ -3402,6 +3692,20 @@ static void drawtranscript(Gui *g)
     v->thumbw   = thumbw;
     v->thumbh   = thumbh;
     v->thumbpad = pad/2;
+    // A waiting question's form, measured before the tops are, so that
+    // no frame draws it at another height than they leave it
+    g->askactive = 0;
+    for (iz i = v->msgs.len-1; v->asks && i >= 0; i--) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role==VIEW_ASK && m->tool->answer==VASK_PENDING) {
+            if (m->tool->qs.len) {
+                f32 h = questionform(g, gs, m, width, 0, 0);
+                v->topsdirty |= h != m->tool->formh;
+                m->tool->formh = h;
+            }
+            break;
+        }
+    }
 
     // Where the view is: last frame's scroll, or where the wheel just
     // sent it.
@@ -3675,6 +3979,9 @@ static void drawtranscript(Gui *g)
                           v2(x + t.x, y + head + m->h + pad/4 + t.y), {t.w, t.h}, top, bot);
                 ImGui::PopID();
             }
+        } else if (mfoot>0 && m->role==VIEW_ASK && m->tool->qs.len) {
+            ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
+            questionform(g, gs, m, width, 1, i==lastask);
         } else if (mfoot>0 && m->role==VIEW_ASK) {
             ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
             drawaskbuttons(g, gs, m, i==lastask);
@@ -3737,7 +4044,7 @@ static void drawtranscript(Gui *g)
 static void escapecancel(Gui *g)
 {
     if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && !g->findactive &&
-            ImGui::Shortcut(ImGuiKey_Escape, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
+            !g->askactive && ImGui::Shortcut(ImGuiKey_Escape, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
         guicancel(g, g->sess);
     }
 }
@@ -3748,7 +4055,7 @@ static void escapecancel(Gui *g)
 static void backgroundkey(Gui *g)
 {
     if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && !g->findactive &&
-            ImGui::Shortcut(ImGuiMod_Ctrl|ImGuiKey_B, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
+            !g->askactive && ImGui::Shortcut(ImGuiMod_Ctrl|ImGuiKey_B, ImGuiInputFlags_RouteFocused|ImGuiInputFlags_RouteOverActive)) {
         guibackground(g, g->sess, {});
     }
 }
@@ -4922,7 +5229,7 @@ static b32 planwaits(View *v)
     for (iz i = v->msgs.len-1; v->asks && i >= 0; i--) {
         ViewMsg *m = &v->msgs[i];
         if (m->role==VIEW_ASK && m->tool->answer==VASK_PENDING) {
-            return m->tool->kind == "plan";
+            return m->tool->kind=="plan" || m->tool->kind=="question";
         }
     }
     return 0;

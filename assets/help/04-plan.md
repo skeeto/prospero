@@ -35,6 +35,29 @@ shows it:
 A plan approval has no countdown: it waits for you. The model may be
 switched from the session bar while it waits.
 
+## Questions from the agent
+
+When a decision is yours, such as an approach, the scope or a
+trade-off, the agent may ask, most often while planning. A card shows
+up to four questions at once, each with a few options and the one the
+agent recommends marked **Recommended** and already picked:
+
+- Click an option to pick it; a question marked with checkboxes takes
+  several.
+- **Other** takes an answer in your own words: typing in it picks it.
+- The note below the questions goes to the agent with your answers.
+- **Submit answers** sends them, once every question has one.
+- **Skip** answers none: the agent goes with its recommendations, or
+  with your note instead, if you wrote one.
+
+You may also answer in a message instead, from the prompt box. The
+questions have no countdown and a notification tells of them while you
+look elsewhere (`[ui] notify`). While they wait, the model, the shell
+and the mode may change, and Bypass mode leaves them for you. Only the
+sessions you start yourself get questions: never subagents, roles, or
+runs from the command line, where the agent decides for itself and
+says what it assumed.
+
 ## The Plan pane
 
 The Plan pane (View → Plan) shows the plan file, which stays after

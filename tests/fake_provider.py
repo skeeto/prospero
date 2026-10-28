@@ -1914,6 +1914,61 @@ sc_bypass_state = sc_bypass_fork = sc_bypass_task = sc_bypass_task_b = sc_bypass
 sc_bypass_plan = sc_plan
 
 
+# ask_user: "Ask me." asks three questions, a single-select one whose
+# recommended option is marked as Claude Code marks it, a multi-select
+# one marked by the field, and one with no recommendation; "Ask badly."
+# asks with one option. The agent then says the result back, whole.
+
+QUESTIONS = [
+    {"question": "Which database?", "header": "Database",
+     "options": ["PostgreSQL (Recommended)",
+                 {"label": "SQLite", "description": "A file, no server"}]},
+    {"question": "Which features?", "header": "Features", "multiSelect": True,
+     "options": [{"label": "Auth", "recommended": True},
+                 {"label": "Search", "description": "Full text", "recommended": True},
+                 {"label": "Export"}, {"label": "Other"}]},
+    {"question": "Which color?", "header": "Color",
+     "options": ["Red", "Blue"]},
+]
+
+
+def sc_question(model, n, req):
+    msgs = req.get("messages", [])
+    last = str(msgs[-1].get("content", "")) if msgs else ""
+    name, _ = last_call(req)
+    # The prompt, which a notice (of plan mode, say) may follow
+    since = []
+    for m in reversed(msgs):
+        if m.get("role") != "user":
+            break
+        since.append(str(m.get("content", "")))
+    last = "Ask me." if "Ask me." in since else last
+    if msgs and msgs[-1].get("role") == "tool" and name == "ask_user":
+        yield from answer(model, last, pieces=1)
+    elif msgs and msgs[-1].get("role") == "tool":
+        yield from answer(model, "Done.")
+    elif last == "Plan first.":
+        yield from tool(model, n, "enter_plan_mode", {})
+    elif last == "Ask me.":
+        yield from tool(model, n, "ask_user", {"questions": QUESTIONS})
+    elif last == "Ask badly.":
+        yield from tool(model, n, "ask_user", {"questions": [
+            {"question": "Which?", "header": "One", "options": ["Only"]}]})
+    elif last == "Ask as a string.":
+        yield from tool(model, n, "ask_user", {"questions": json.dumps(QUESTIONS[:1])})
+    elif last == "Stop.":
+        yield from answer(model, "Stopped.")
+    else:
+        yield from answer(model, "Done.")
+
+
+sc_question_answer = sc_question_default = sc_question_skip = sc_question
+sc_question_invalid = sc_question_args = sc_question_steer = sc_question
+sc_question_cancel = sc_question_close = sc_question_bypass = sc_question
+sc_question_switch = sc_question_switch_b = sc_question_offered = sc_question
+sc_question_reopen = sc_question_fork = sc_question_gui = sc_question
+
+
 # Agents for prospero eval (tests/scenarios.py, eval_*): scripted good
 # and bad agents, so that an eval's numbers are known. Every run of a
 # model shares its name, so these decide from the conversation alone:
@@ -2582,7 +2637,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Start a subagent that messages", "Message the parent as a subagent",
                "Describe the images", "Ask on the side", "Run a long command",
                "Stream, then pause", "Call the MCP server", "Remember the hosts",
-               "Answer with links")
+               "Answer with links", "Ask me questions")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2676,6 +2731,22 @@ def sc_gui(model, n, req):
                           "- [effort](settings:model/nope#effort)\n"
                           "- [a web page](https://example.com/)\n"
                           "- [another to drag from](https://example.org/drag)\n")
+    elif "Ask me questions" in prompt:
+        # Decisions for the user (ask_user), then the answers said back
+        if step == 0:
+            yield from tool(model, n, "ask_user", {"questions": [
+                {"question": "Which database should the service use?", "header": "Database",
+                 "options": [{"label": "PostgreSQL (Recommended)",
+                              "description": "A server, for many writers at once"},
+                             {"label": "SQLite",
+                              "description": "A single file: nothing to run"}]},
+                {"question": "Which features go in the first release?",
+                 "header": "Features", "multi_select": True,
+                 "options": [{"label": "Auth", "recommended": True},
+                             {"label": "Search", "description": "Full text, indexed"},
+                             {"label": "Export"}]}]})
+        else:
+            yield from answer(model, "Answers: " + tool_results(req)[-1])
     elif "Remember the hosts" in prompt:
         if step == 0:
             yield from tool(model, n, "memory", {

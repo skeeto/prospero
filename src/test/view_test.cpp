@@ -352,6 +352,40 @@ static void test_view(Test *t)
         expect(t, "view.deniedopen", istr(&a, v->msgs[0].collapsed), "0");
     }
 
+    // The agent's questions: no text while they wait, the form's height
+    // below, read-only too; answered, the questions with the answers
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        v->foot = 30;
+        apply(v, a, R"j({"sid":"s","seq":1,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)j"
+                    R"j({"t":"call","id":"c4","name":"ask_user","args":"{\"questions\":[{\"header\":\"DB\"},{\"header\":\"Feat\"}]}"}]})j");
+        apply(v, a, R"j({"sid":"s","seq":2,"ts":0,"ev":"ask","req":"c4/ask","call":"c4","kind":"question",)j"
+                    R"j("tool":"ask_user","detail":"d","deadline":0,"dflt":"deny","questions":[)j"
+                    R"j({"question":"Which?","header":"DB","options":[{"label":"Pg","description":"",)j"
+                    R"j("recommended":true},{"label":"Lite","description":"A file"}]},)j"
+                    R"j({"question":"And?","header":"Feat","multi_select":true,"options":[)j"
+                    R"j({"label":"A","description":""},{"label":"B","description":""}]}]})j");
+        ViewMsg  *m = &v->msgs[1];
+        ViewTool *k = m->tool;
+        expect(t, "view.question", msgsshow(&a, v), "X[ask_user 2 questions: DB, Feat asking]:;K:;");
+        expect(t, "view.qparsed", istr(&a, k->qs.len*100 + k->qs[0].opts[0].rec*10 +
+                                           k->qs[1].multi), "211");
+        expect(t, "view.qguess", istr(&a, (i64)msgfoot(v, m)), "300");
+        k->formh = 123;
+        expect(t, "view.qfoot", istr(&a, (i64)msgfoot(v, m)), "123");
+        v->readonly = 1;
+        expect(t, "view.qfootro", istr(&a, (i64)msgfoot(v, m)), "123");
+        v->readonly = 0;
+        expect(t, "view.qheadline", askheadline(&a, k), "Questions for you: DB, Feat");
+        apply(v, a, R"j({"sid":"s","seq":3,"ts":0,"ev":"answer","req":"c4/ask","decision":"allow",)j"
+                    R"j("by":"user","note":"n","answers":[{"pick":[1]},{"pick":[0],"text":"C"}]})j");
+        expect(t, "view.qanswered", m->text,
+               "DB: Which?\n  \xe2\x86\x92 Lite\nFeat: And?\n  \xe2\x86\x92 A, \xe2\x80\x9c"
+               "C\xe2\x80\x9d\n\nNote: n");
+        expect(t, "view.qnofoot", istr(&a, (i64)msgfoot(v, m)), "0");
+    }
+
     // Toasts: what asks and turn ends mark, and what they say
     {
         Arena a = perm;

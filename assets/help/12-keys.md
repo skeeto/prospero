@@ -22,7 +22,9 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 - **Enter** sends; while the agent works, it steers.
 - **Shift+Enter** starts a new line.
 - **Esc** cancels the running turn (from the Sessions, Transcript and
-  Prompt panes, while no dialog or menu is open).
+  Prompt panes, while no dialog or menu is open). In a field of the
+  agent's questions, Esc first leaves the field, keeping what you
+  typed, and Enter submits the answers once each question has one.
 - **Ctrl+B** moves what the turn waits for to the background, a
   running command or its subagents, as Run in background does (from
   the same panes); the agent goes on, and you may talk to it. See

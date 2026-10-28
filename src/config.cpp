@@ -558,8 +558,9 @@ static CfgKey cfgschema[] = {
      "xfce4-terminal, x-terminal-emulator, alacritty, kitty, wezterm, foot, "
      "ghostty and xterm"},
     {"ui", "notify", CFG_LIST, "allow done", {}, "allow done none", "ui",
-     "Desktop notifications while you look elsewhere: allow when a "
-     "permission ask waits for you, done when a session stops by itself "
+     "Desktop notifications while you look elsewhere: allow when an "
+     "ask waits for you (a permission, a plan to approve, the agent's "
+     "questions), done when a session stops by itself "
      "(finished, failed or out of budget); none for neither"},
 
     {"host", "idle_exit", CFG_SECONDS, "600", {}, {}, "host",

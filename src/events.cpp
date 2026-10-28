@@ -248,6 +248,10 @@ static Str capnames[] = {
     "web",             // web_search and web_fetch: asks of kind web, with
                        // query and service or url and host, and grants by
                        // web ("search", or "fetch" with a host)
+    "question",        // the ask_user tool: asks of kind question with
+                       // questions, answer {answers}, answers on the answer
+                       // record, questions on the session record; model
+                       // and shell while asked
 };
 
 static Str evname(i32 ev)
@@ -1514,7 +1518,8 @@ static Str importstrip(Arena *a, EvRec *rec, Str line)
 static Str importsession(Arena *a, EvRec *rec, Str cwd, Str model,
                          Str endpoint, Str scratch, b32 nofolder)
 {
-    static Str const kept[] = {"role", "prompt", "tools", "edit_format", "steps"};
+    static Str const kept[] = {"role", "prompt", "tools", "edit_format", "steps",
+                               "questions"};
     Json *j = rec->root;
     Buf   b(a, 1024 + cwd.len + model.len + endpoint.len + scratch.len);
     EvOut w = evbegin(&b, rec->sid, rec->seq, rec->ts, EV_SESSION);
