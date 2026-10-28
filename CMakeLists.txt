@@ -101,7 +101,8 @@ endif()
 
 # The core embeds the seed configuration (config.cpp), the Help pages
 # and the built-in skill (help.cpp) with #embed, and the GUI its fonts
-# (fonts.cpp), which not every compiler lists as dependencies.
+# (fonts.cpp) and, on X11 and Wayland, its window icon (gui_sdl.cpp),
+# which not every compiler lists as dependencies.
 file(GLOB prospero_help CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/assets/help/*.md)
 set_property(SOURCE src/main_posix.cpp src/main_win32.cpp src/main_test.cpp
   APPEND PROPERTY OBJECT_DEPENDS ${prospero_help}
@@ -111,7 +112,8 @@ set_property(SOURCE src/main_posix.cpp src/main_win32.cpp src/main_test.cpp
   ${PROJECT_SOURCE_DIR}/assets/JetBrainsMono-Regular.ttf
   ${PROJECT_SOURCE_DIR}/assets/NotoSansSymbols2-subset.ttf
   ${PROJECT_SOURCE_DIR}/assets/NotoSansMath-subset.ttf
-  ${PROJECT_SOURCE_DIR}/assets/codicon.ttf)
+  ${PROJECT_SOURCE_DIR}/assets/codicon.ttf
+  ${PROJECT_SOURCE_DIR}/assets/prospero.png)
 
 # Every program with the core decodes images (src/wuffs.c)
 include(FetchWuffs)
@@ -124,8 +126,11 @@ if(WIN32 AND PROSPERO_GUI)
   # The GUI build has CRT startup, since FreeType, md4c and ImGui need a
   # CRT, though the core still never calls it. windows.h, D3D11 and the
   # ImGui Win32 backends stay in the gui_win32.cpp edge, which embeds
-  # the manifest (assets/, through -Wa,-I).
+  # the icon and the manifest (assets/, through -Wa,-I).
   add_library(prospero_gui OBJECT src/gui_win32.cpp)
+  set_property(SOURCE src/gui_win32.cpp APPEND PROPERTY OBJECT_DEPENDS
+    ${PROJECT_SOURCE_DIR}/assets/prospero.ico
+    ${PROJECT_SOURCE_DIR}/assets/prospero.manifest)
   target_link_libraries(prospero_gui PRIVATE imgui)
   target_compile_definitions(prospero_gui PRIVATE PROSPERO_GUIEDGE=1)
   target_compile_options(prospero_gui PRIVATE
@@ -259,19 +264,25 @@ if(APPLE AND PROSPERO_GUI)
   # Info.plist names the bundle identifier and the version, and its
   # build number (CFBundleVersion) is the time of the build, in seconds:
   # LaunchServices prefers the highest, so that "open -a Prospero" runs
-  # the newest of the copies it knows, as in old worktrees.
+  # the newest of the copies it knows, as in old worktrees. The icon is
+  # assets/prospero.icns (tools/icons.py).
   configure_file(assets/Info.plist ${CMAKE_BINARY_DIR}/Info.plist @ONLY)
   add_custom_command(OUTPUT Prospero.app/Contents/MacOS/prospero
     COMMAND ${CMAKE_COMMAND} -E make_directory Prospero.app/Contents/MacOS
+            Prospero.app/Contents/Resources
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_BINARY_DIR}/Info.plist Prospero.app/Contents/Info.plist
     COMMAND sh -c "plutil -replace CFBundleVersion -string \"$(date +%s)\" Prospero.app/Contents/Info.plist"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${PROJECT_SOURCE_DIR}/assets/prospero.icns
+            Prospero.app/Contents/Resources/prospero.icns
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:prospero-desktop> Prospero.app/Contents/MacOS/prospero-desktop
     COMMAND ${CMAKE_COMMAND} -E copy
             $<TARGET_FILE:prospero> Prospero.app/Contents/MacOS/prospero
     COMMAND codesign --force --timestamp=none --sign ${prospero_sign} Prospero.app
     DEPENDS prospero prospero-desktop ${CMAKE_BINARY_DIR}/Info.plist
+            ${PROJECT_SOURCE_DIR}/assets/prospero.icns
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     VERBATIM
   )

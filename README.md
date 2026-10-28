@@ -1,5 +1,7 @@
 # Prospero: a desktop coding harness for local and remote LLMs
 
+<p align="center"><img src="docs/staff.png" width="700" alt="Prospero's staff: a gnarled wooden staff, its grip wrapped in cloth, whose clawed head holds a glowing blue gem"></p>
+
 Prospero is a coding harness: a desktop program in which a language
 model, the agent, works on code through tools. It runs the turn loop,
 the tools (read, write, edit, shell, grep, glob, a todo list,

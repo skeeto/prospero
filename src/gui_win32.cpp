@@ -147,19 +147,48 @@ extern "C" void      w32gui_letfront(unsigned long pid);  // AllowSetForegroundW
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
-// Resources: the version information, for the name that notifications
-// and Task Manager show (FileDescription), and the manifest (per-monitor
-// DPI awareness v2, common controls v6, the Windows versions it
-// targets), from assets/ by the assembler's include path (-Wa,-I, set
-// by CMake). The pattern is platform/gui_windows.c in skeeto/tugz,
-// https://github.com/skeeto/tugz. Strings are UTF-16, as numbers.
+// Resources: the icon (assets/prospero.ico, by tools/icons.py: BMPs to
+// 64, then a 256 PNG) and its group, the version information, for the
+// name that notifications and Task Manager show (FileDescription), and
+// the manifest (per-monitor DPI awareness v2, common controls v6, the
+// Windows versions it targets), from assets/ by the assembler's include
+// path (-Wa,-I, set by CMake). The pattern is platform/gui_windows.c in
+// skeeto/tugz, https://github.com/skeeto/tugz. Each .incbin of the icon
+// is a slice at its offset in the file, which tools/icons.py --offsets
+// prints, and must follow it. Strings are UTF-16, as numbers.
 __asm__(
     "    .section .rsrc,\"dr\"\n"
     "    .p2align 2\n"
     ".Lroot: .long 0, 0\n"
-    "    .short 0, 0, 0, 2\n"
+    "    .short 0, 0, 0, 4\n"
+    "    .long 3, 0x80000000 + (.Licons - .Lroot)\n"    // RT_ICON
+    "    .long 14, 0x80000000 + (.Lgroups - .Lroot)\n"  // RT_GROUP_ICON
     "    .long 16, 0x80000000 + (.Lvers - .Lroot)\n"    // RT_VERSION
     "    .long 24, 0x80000000 + (.Lmans - .Lroot)\n"    // RT_MANIFEST
+    ".Licons: .long 0, 0\n"
+    "    .short 0, 0, 0, 8\n"
+    "    .irp i, 1, 2, 3, 4, 5, 6, 7, 8\n"
+    "    .long \\i, 0x80000000 + (.Licon\\i - .Lroot)\n"
+    "    .endr\n"
+    "    .irp i, 1, 2, 3, 4, 5, 6, 7, 8\n"
+    ".Licon\\i: .long 0, 0\n"
+    "    .short 0, 0, 0, 1\n"
+    "    .long 0, .Licondata\\i - .Lroot\n"            // language neutral
+    "    .endr\n"
+    ".Lgroups: .long 0, 0\n"
+    "    .short 0, 0, 0, 1\n"
+    "    .long 1, 0x80000000 + (.Lgroup - .Lroot)\n"
+    ".Lgroup: .long 0, 0\n"
+    "    .short 0, 0, 0, 1\n"
+    "    .long 0, .Lgroupdata - .Lroot\n"
+    "    .irp i, 1, 2, 3, 4, 5, 6, 7, 8\n"
+    ".Licondata\\i:\n"
+    "    .rva .Lico\\i\n"
+    "    .long .Lico\\i\\()end - .Lico\\i, 0, 0\n"
+    "    .endr\n"
+    ".Lgroupdata:\n"
+    "    .rva .Lgrp\n"
+    "    .long .Lgrpend - .Lgrp, 0, 0\n"
     ".Lvers: .long 0, 0\n"
     "    .short 0, 0, 0, 1\n"
     "    .long 1, 0x80000000 + (.Lverid - .Lroot)\n"
@@ -178,6 +207,51 @@ __asm__(
     ".Lmandata:\n"
     "    .rva .Lman\n"
     "    .long .Lmanend - .Lman, 0, 0\n"
+    // The group: each icon's entry in the file but for its offset, then
+    // its ID; then the icons, at their offsets in the file, the PNG last
+    "    .p2align 2\n"
+    ".Lgrp: .short 0, 1, 8\n"
+    "    .incbin \"assets/prospero.ico\", 6, 12\n"
+    "    .short 1\n"
+    "    .incbin \"assets/prospero.ico\", 22, 12\n"
+    "    .short 2\n"
+    "    .incbin \"assets/prospero.ico\", 38, 12\n"
+    "    .short 3\n"
+    "    .incbin \"assets/prospero.ico\", 54, 12\n"
+    "    .short 4\n"
+    "    .incbin \"assets/prospero.ico\", 70, 12\n"
+    "    .short 5\n"
+    "    .incbin \"assets/prospero.ico\", 86, 12\n"
+    "    .short 6\n"
+    "    .incbin \"assets/prospero.ico\", 102, 12\n"
+    "    .short 7\n"
+    "    .incbin \"assets/prospero.ico\", 118, 12\n"
+    "    .short 8\n"
+    ".Lgrpend:\n"
+    "    .p2align 3\n"
+    ".Lico1: .incbin \"assets/prospero.ico\", 134, 1128\n"    // 16x16
+    ".Lico1end:\n"
+    "    .p2align 3\n"
+    ".Lico2: .incbin \"assets/prospero.ico\", 1262, 1720\n"   // 20x20
+    ".Lico2end:\n"
+    "    .p2align 3\n"
+    ".Lico3: .incbin \"assets/prospero.ico\", 2982, 2440\n"   // 24x24
+    ".Lico3end:\n"
+    "    .p2align 3\n"
+    ".Lico4: .incbin \"assets/prospero.ico\", 5422, 4264\n"   // 32x32
+    ".Lico4end:\n"
+    "    .p2align 3\n"
+    ".Lico5: .incbin \"assets/prospero.ico\", 9686, 6760\n"   // 40x40
+    ".Lico5end:\n"
+    "    .p2align 3\n"
+    ".Lico6: .incbin \"assets/prospero.ico\", 16446, 9640\n"  // 48x48
+    ".Lico6end:\n"
+    "    .p2align 3\n"
+    ".Lico7: .incbin \"assets/prospero.ico\", 26086, 16936\n" // 64x64
+    ".Lico7end:\n"
+    "    .p2align 3\n"
+    ".Lico8: .incbin \"assets/prospero.ico\", 43022\n"        // 256x256, PNG
+    ".Lico8end:\n"
     "    .p2align 3\n"
     ".Lman: .incbin \"assets/prospero.manifest\"\n"
     ".Lmanend:\n"
@@ -259,6 +333,15 @@ struct W32Gui {
     int                     drivetheme;  // the checklist's system theme:
                                          // 1 light, 2 dark, 0 the real one
 };
+
+// The program's icon (resources, above) at a system metric's size,
+// shared: loaded once, never destroyed.
+static HICON appicon(int metric)
+{
+    int n = GetSystemMetrics(metric);
+    return (HICON)LoadImageW(GetModuleHandleW(0), MAKEINTRESOURCEW(1),
+                             IMAGE_ICON, n, n, LR_SHARED);
+}
 
 // Whether apps should be dark, as Settings > Personalization > Colors
 // says, or as the checklist pretends. Light where unset, as before
@@ -626,6 +709,8 @@ extern "C" void *w32gui_open(W32Hooks *hooks, unsigned short const *title,
     wc.lpfnWndProc   = wndproc;
     wc.hInstance     = inst;
     wc.hCursor       = LoadCursorW(0, (LPCWSTR)IDC_ARROW);
+    wc.hIcon         = appicon(SM_CXICON);
+    wc.hIconSm       = appicon(SM_CXSMICON);
     wc.lpszClassName = L"prospero";
     RegisterClassExW(&wc);
 
@@ -823,7 +908,7 @@ static int trayup(W32Gui *w, unsigned short const *tip)
         n->uID              = TRAY_ID;
         n->uFlags           = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         n->uCallbackMessage = WM_APP_TRAY;
-        n->hIcon            = LoadIconW(0, (LPCWSTR)IDI_APPLICATION);
+        n->hIcon            = appicon(SM_CXSMICON);
     }
     if (tip || !w->trayon) {
         tip = tip ? tip : (unsigned short const *)L"Prospero";

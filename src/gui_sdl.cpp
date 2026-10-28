@@ -803,6 +803,40 @@ static void macuntoast(i32 id)
 }
 #endif
 
+// The program's icon, 256 pixels (tools/icons.py)
+#ifdef __clang__
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wc23-extensions"
+#endif
+static u8 const iconpng[] = {
+    #embed "../assets/prospero.png"
+};
+#ifdef __clang__
+#  pragma clang diagnostic pop
+#endif
+
+// The program's icon, halved until at most n pixels, as an SDL surface
+// of its own, which the window and the tray copy; null if it fails.
+static SDL_Surface *appicon(Arena scratch, i32 n)
+{
+    Image im = imgdecode(&scratch, {(u8 *)iconpng, countof(iconpng)}, 256*256);
+    if (!im.rgba) {
+        return 0;
+    }
+    SDL_Surface *view = SDL_CreateSurfaceFrom(im.width, im.height,
+                                              SDL_PIXELFORMAT_RGBA32,
+                                              im.rgba, 4*im.width);
+    SDL_Surface *s    = view ? SDL_DuplicateSurface(view) : 0;
+    SDL_DestroySurface(view);
+    while (s && s->w>n) {
+        // Halving with linear filtering averages each 2x2 block
+        SDL_Surface *h = SDL_ScaleSurface(s, s->w/2, s->h/2, SDL_SCALEMODE_LINEAR);
+        SDL_DestroySurface(s);
+        s = h;
+    }
+    return s;
+}
+
 static b32 os_guiopen(Os *os, Gui *g, Str title)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
@@ -893,6 +927,15 @@ static b32 sdlwindow(Os *os, Gui *g, GuiSdl *p, Str title)
     if (!p->window) {
         return 0;
     }
+    #ifndef __APPLE__
+    // On macOS the window's icon would replace the Dock's, which is the
+    // bundle's (assets/prospero.icns), on a tile
+    SDL_Surface *icon = appicon(t, 256);
+    if (icon) {
+        SDL_SetWindowIcon(p->window, icon);
+        SDL_DestroySurface(icon);
+    }
+    #endif
     if (geom.ok) {
         sdlplace(os, p, geom);
     } else {
@@ -1373,30 +1416,6 @@ static void SDLCALL traypick(void *ud, SDL_TrayEntry *)
     SDL_PushEvent(&e);
 }
 
-// A blue round icon of n by n pixels, for the tray: an SDL surface of
-// its own, which the tray copies.
-static SDL_Surface *trayicon(i32 n)
-{
-    SDL_Surface *s = SDL_CreateSurface(n, n, SDL_PIXELFORMAT_RGBA32);
-    if (!s) {
-        return 0;
-    }
-    f32 c = (f32)n/2;
-    for (i32 y = 0; y < n; y++) {
-        u8 *row = (u8 *)s->pixels + (iz)y*s->pitch;
-        for (i32 x = 0; x < n; x++) {
-            f32 dx = (f32)x + 0.5f - c, dy = (f32)y + 0.5f - c;
-            f32 d  = c - 1 - __builtin_sqrtf(dx*dx + dy*dy);  // inside if > 0
-            f32 a  = d>1 ? 1 : d<0 ? 0 : d;
-            row[4*x+0] = 0x2f;
-            row[4*x+1] = 0x6f;
-            row[4*x+2] = 0xd0;
-            row[4*x+3] = (u8)(a*255);
-        }
-    }
-    return s;
-}
-
 static b32 os_trayopen(Os *os, Str tip)
 {
     GuiSdl *p = (GuiSdl *)os->gui;
@@ -1404,7 +1423,7 @@ static b32 os_trayopen(Os *os, Str tip)
         return p && p->tray;
     }
     Arena        a    = p->gui->frame;
-    SDL_Surface *icon = trayicon(32);
+    SDL_Surface *icon = appicon(a, 32);
     p->tray = SDL_CreateTray(icon, cstr0(&a, tip));
     SDL_DestroySurface(icon);
     SDL_TrayMenu *menu = p->tray ? SDL_CreateTrayMenu(p->tray) : 0;

@@ -16,12 +16,13 @@ com.nullprogram.prospero only for a signed build (--signed: built with
 PROSPERO_SIGN_IDENTITY), else com.nullprogram.prospero.dev, unless
 PROSPERO_BUNDLE_ID (--bundle-id) names one; the desktop helper's is that
 plus ".desktop". This checks the bundle's Info.plist, its build number
-the build's time in seconds, and the signatures
+the build's time in seconds, its icon, and the signatures
 of the bundle, of the helper in it, and of the helper beside it, by
 codesign -d, which only reads.
 """
 
 import argparse
+import os
 import plistlib
 import re
 import subprocess
@@ -62,6 +63,9 @@ def main():
     build = str(info.get("CFBundleVersion", ""))
     if not build.isdigit() or int(build) < 1700000000:
         problems.append(f"Info.plist: CFBundleVersion {build!r}, not the build's time")
+    icon = f"{args.app}/Contents/Resources/{info.get('CFBundleIconFile')}.icns"
+    if not os.path.isfile(icon):
+        problems.append(f"Info.plist: CFBundleIconFile names no {icon}")
     for path, ident in ((args.app, want),
                         (f"{args.app}/Contents/MacOS/prospero-desktop", desk),
                         (args.helper, desk)):
