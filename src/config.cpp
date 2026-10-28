@@ -25,8 +25,9 @@
 // agent use the screen, and any other setting that chooses a program to
 // run here (cfgruns): [tools] path_prepend and path_append, which say
 // where programs are found, a [tools] shell other than a keyword (auto,
-// sh, powershell, cmd), and [ui] editor. A [shell] section counts only
-// where the user's own file has its header (cfgownsection).
+// sh, powershell, cmd), [tools] shells and git, and [ui] editor and
+// terminal. A [shell] section counts only where the user's own file has
+// its header (cfgownsection).
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -67,11 +68,11 @@
 //   match stays in use; a cached copy that does not match is never used.
 //
 // Only the user's own file chooses what runs: its [remote], [shell] and
-// [mcp] sections, a shell, the editor, and where programs are found. An
-// included file's [remote], [shell], [mcp] and [desktop] settings,
-// those of cfgruns and plaintext secrets are ignored, so a shared file,
-// local or from the web, can at most point the harness at endpoints and
-// models.
+// [mcp] sections, a shell, git, the editor, and where programs are
+// found. An included file's [remote], [shell], [mcp] and [desktop]
+// settings, those of cfgruns and plaintext secrets are ignored, so a
+// shared file, local or from the web, can at most point the harness at
+// endpoints and models.
 // (A shared [role] may list desktop in its tools, which matters only
 // once the user's own [desktop] offer says roles.)
 //
@@ -429,6 +430,10 @@ static CfgKey cfgschema[] = {
      "path_prepend"},
     {"tools", "use_rg", CFG_BOOL, "true", {}, {}, "tools",
      "Search with ripgrep (rg on PATH) when found, else the built-in search"},
+    {"tools", "git", CFG_STRING, "", {}, {}, "tools",
+     "The git that shows a session's changes (the Changes pane), by its "
+     "path or its name on PATH; empty for git on PATH. The branch is read "
+     "without it"},
     {"tools", "turn_budget", CFG_INT, "0", {}, {}, "tools",
      "Model requests a turn may make before it ends; 0 for no limit"},
     {"tools", "task_budget", CFG_INT, "200", {}, {}, "tools",
@@ -871,12 +876,12 @@ static b32 cfgtilde(Str p)
 // Whether a value, trimmed, chooses a program for this machine to run,
 // which only the user's own file may: where programs are found ([tools]
 // path_prepend and path_append), a shell by its path or name rather than
-// a keyword, or the editor's or the terminal's command.
+// a keyword, git, or the editor's or the terminal's command.
 static b32 cfgruns(CfgKey *k, Str v)
 {
     if (k->kind == "tools") {
         return k->key=="path_prepend" || k->key=="path_append" ||
-               k->key=="shells" ||
+               k->key=="shells" || k->key=="git" ||
                (k->key=="shell" && !cfghasword("auto sh powershell cmd", v));
     }
     return k->kind=="ui" && (k->key=="editor" || k->key=="terminal");

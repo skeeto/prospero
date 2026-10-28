@@ -52,7 +52,7 @@ cannot choose what runs, so these are ignored in one:
 - plaintext secrets (a `key` not written as `env:NAME`), and secrets
   read from files (`file:PATH`);
 - `[remote]`, `[shell]`, `[mcp]` and `[desktop]` settings;
-- `[tools] path_prepend`, `path_append` and `shells`;
+- `[tools] path_prepend`, `path_append`, `shells` and `git`;
 - a `[tools] shell` other than `auto`, `sh`, `powershell` or `cmd`;
 - `[ui] editor` and `[ui] terminal`.
 
@@ -115,6 +115,13 @@ cannot choose what runs, so these are ignored in one:
 - **`[tools] shells`**: shells the agent may pick per command, by name,
   separated by blanks. The shell tool then lists them and takes one by
   name. A name not found is left out, with a warning.
+- **`[tools] git`**: the git that the Changes pane runs (see
+  [Sessions and modes](help:sessions)), by its path or its name on
+  PATH (with `path_prepend` and `path_append`); empty for `git`. On
+  macOS, `/usr/bin/git` without the Command Line Tools counts as
+  missing, rather than asking to install them. The branch on the
+  session bar needs no git. A remote host's engine uses its own
+  configuration's.
 - **`[ui] editor`**: the command that opens a draft (Ctrl+G) or a plan
   in an editor, given the file as one more word. It must wait until
   you are done and open a window of its own, as `code --wait`,

@@ -163,6 +163,7 @@ enum : i32 {
     CMD_MCPRESTART,  // an MCP server started again
     CMD_SHELL,   // another shell for the agent's commands from here on
     CMD_SHELLS,  // the shells there are to switch to, and the default
+    CMD_GIT,     // a session's git branch, and with status its changes, late
     CMD_COUNT,
 };
 
@@ -173,7 +174,7 @@ static Str cmdnames[] = {
     "group", "fork", "compact", "model", "draft", "upload", "import",
     "skills", "mode",
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
-    "mcp.logout", "mcp.restart", "shell", "shells",
+    "mcp.logout", "mcp.restart", "shell", "shells", "git",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -237,6 +238,8 @@ static Str capnames[] = {
     "shell",           // shell and shells: the user switches a session's
                        // shell, the shell record, shell_name on prefix
                        // records, and notices of kind shell
+    "git",             // git: a session's branch (head) and, with status,
+                       // its changes
 };
 
 static Str evname(i32 ev)

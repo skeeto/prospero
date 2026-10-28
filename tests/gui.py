@@ -26,6 +26,7 @@ by quitting are gone, with no engine process left behind.
   uv run tests/gui.py --prospero build/prospero --mode plan [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode launch [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode firstrun [--shots DIR]
+  uv run tests/gui.py --prospero build/prospero --mode changes [--shots DIR]
 
 The settings mode edits a value longer than a field's slack and picks
 the theme, dark then light, from its list over a transcript that shows
@@ -61,7 +62,13 @@ two launches with no window both detach at once, leaving one window
 with both sessions, which is then told to quit. The mcp mode shows an
 MCP server's page in Settings, a fake server over HTTP that wants a
 sign-in: Sign in, through the window's stand-in browser, then a call
-from a session, which sends the token it got, then Sign out.
+from a session, which sends the token it got, then Sign out. The
+changes mode's working directory is a git repository on a long branch,
+a file changed and one new: the session bar shows the branch, cut in
+its middle, and a click on it the Changes pane, which lists both, with
+no frames while idle; a file
+made while the window is away shows once it is back, and another
+click hides the pane. Without git it is skipped.
 
 Every checklist starts as a first run, its state directory fresh: the
 window at its first size, and Help in front, then Reset layout. The
@@ -267,6 +274,28 @@ DESKROLE = (
 M4MODELS = {"gui_b": {}, "guifail": {}, "guifail_b": {},
             "gui_small": {"meta": {"n_ctx": 24000, "n_ctx_train": 262144}},
             "gui_prune": {"meta": {"n_ctx": 100000, "n_ctx_train": 262144}}}
+
+
+# The changes mode's branch, longer than the session bar's room for it
+LONG_BRANCH = "feature/a-branch-whose-name-goes-on-and-on-well-past-the-room-the-session-bar-has-for-it-at-its-end"
+
+
+def gitrepo(work):
+    """work a repository on LONG_BRANCH, hello.txt committed and then changed,
+    a line for a line, and new.txt new, of two lines. git as configured
+    here could hide untracked files, so neither git here nor the one the
+    window's engine runs reads any configuration but the repository's."""
+    os.environ.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    for args in (["init", "-q"], ["symbolic-ref", "HEAD", "refs/heads/" + LONG_BRANCH],
+                 ["add", "hello.txt"], ["commit", "-q", "-m", "hello"]):
+        subprocess.run(["git", "-C", work, *args], env=env, check=True,
+                       capture_output=True)
+    with open(os.path.join(work, "hello.txt"), "w") as f:
+        f.write("hello there\n")
+    with open(os.path.join(work, "new.txt"), "w") as f:
+        f.write("one\ntwo\n")
 
 
 def bigfiles(host, prefix, n, lines):
@@ -1473,7 +1502,7 @@ def main():
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
                              "compose", "sessions", "plan", "launch", "firstrun",
-                             "mcp", "hosttask"])
+                             "mcp", "hosttask", "changes"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1497,6 +1526,11 @@ def main():
 
     if args.mode == "hosttask" and (args.host or args.ssh):
         ap.error("--mode hosttask runs only here, through the fake ssh")
+    if args.mode == "changes" and args.host:
+        ap.error("--mode changes runs only here, its repository made by git here")
+    if args.mode == "changes" and not shutil.which("git"):
+        print("changes: skipped, no git")
+        return 0
     if args.mode == "remote" and args.ssh and not args.remote_prospero:
         ap.error("--ssh needs --remote-prospero")
     if args.mode == "e2e" and not args.model:
@@ -1595,6 +1629,9 @@ def main():
         before = config(curl, model)
     elif args.mode == "firstrun":
         before = firstconfig(curl)
+    elif args.mode == "changes":
+        gitrepo(work)
+        before = config(curl, model)
     elif args.mode == "drive" and not args.fake:
         before = config(curl, model, extra=m4config(curl, nonce))
         if not args.host:
@@ -1724,7 +1761,7 @@ def main():
         else:
             print("mcp: signed in through the stand-in browser, the call sent its token")
     if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
-                     "firstrun", "mcp", "hosttask"):
+                     "firstrun", "mcp", "hosttask", "changes"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")
@@ -1761,6 +1798,10 @@ def main():
                          "settings-narrowest"):
                 if not os.path.exists(os.path.join(args.shots, name + ".png")):
                     problems.append(f"no {name}.png")
+    if args.mode == "changes" and args.shots:
+        for name in ("changes-branch", "changes"):
+            if not os.path.exists(os.path.join(args.shots, name + ".png")):
+                problems.append(f"no {name}.png")
     if args.mode == "sessions" and args.shots and not args.host:
         for name in ("sessions-tree", "sessions-folded", "sessions-menu", "sessions-group",
                      "sessions-archived", "sessions-picker", "sessions-export",

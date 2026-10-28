@@ -82,6 +82,27 @@ Only you turn on Bypass, from this list. A subagent has its parent's
 mode. Plan mode turns on or off only while the session is idle or
 waiting on an ask.
 
+## The branch and its changes
+
+In a git repository, the session bar shows the branch the session's
+folder is on, cut in the middle if it is long (the commit, if
+detached), and in amber anything under way, such as a rebase or a
+merge, with its step. It is read from the repository's files: nothing
+runs for it.
+
+Click the branch for the Changes pane, and again to hide it. It lists
+what `git status` does, conflicts first: each file changed, staged or
+not, with the lines added and deleted, then new files not yet added.
+Above them are the branch, its upstream, and the commits ahead (↑)
+and behind (↓) it.
+
+git runs only while the pane shows: as the agent's tools finish, as
+the window takes the focus back, and on Refresh, less often for a slow
+repository, without taking git's locks or changing its index. It is
+`[tools] git`, else the git on PATH (see
+[Configuration](help:config)). A session on another host has its
+host's git run there.
+
 ## The session's menu
 
 Right-click a session in the sidebar, or open the Session menu, for:

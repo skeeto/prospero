@@ -98,6 +98,7 @@ enum : u32 {
     MAIL_QUIT,        // engine to frontend: the engine has stopped
     MAIL_TOOLONG,     // frontend to engine: a command too long, by its id
     MAIL_DISTROS,     // the WSL distros, a line each (farinit)
+    MAIL_GIT,         // git's answer for a repository (git.cpp)
 };
 
 enum : i64 {
@@ -396,6 +397,7 @@ struct Endpoint {
 
 struct Engine;
 struct HostLink;
+struct GitWork;
 
 struct ShellRun {
     Str  spill;     // absolute path of the output file
@@ -769,6 +771,7 @@ struct Engine {
     HostLink   *links;    // to other hosts, for subagents there (hostlink.cpp)
     u64         farserial;
     Slice<Str>  distros;  // the WSL distros installed, as last listed
+    GitWork    *git;      // runs git for sessions' changes, once asked
 };
 
 
@@ -1775,6 +1778,11 @@ static void farattend(Engine *, Arena);
 static Str  farhostsdesc(Engine *, Arena *, Arena);
 static HostLink *farbyout(Engine *, u64);
 static void farmail(Engine *, Arena, HostLink *, Record);
+
+// A session's branch and changes (git.cpp)
+static void cmdgit(Engine *, Arena, i64, Json *);
+static void gitdone(Engine *, Arena, Str);
+static void gitquit(Engine *);
 static void taskcheck(Session *, Arena, Str why, Str err);
 static b32  taskbudget(Session *, Arena);
 static b32  taskwake(Session *);
@@ -14860,13 +14868,15 @@ static Str uploadpath(Arena *a, Engine *e, Str token, b32 done)
     return join(a, join(a, e->statedir, "tmp"), name);
 }
 
-// Staged uploads left untouched for a while, removed.
+// Staged uploads left untouched for a while, removed, and the files of
+// git's standard error that engines no longer running left (git.cpp).
 static void sweepuploads(Engine *e, Arena scratch)
 {
     Str dir = join(&scratch, e->statedir, "tmp");
     i64 now = os_time(e->os);
     for (Dirent *d = os_list(e->os, &scratch, dir); d; d = d->next) {
-        if (!d->isdir && startswith(d->name, "import-") && now-d->mtime>UPLOAD_STALE) {
+        b32 ours = startswith(d->name, "import-") || startswith(d->name, "git-");
+        if (!d->isdir && ours && now-d->mtime>UPLOAD_STALE) {
             Str path = join(&scratch, dir, d->name);
             os_remove(e->os, scratch, path);
         }
@@ -15773,6 +15783,7 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_MCPCODE:
         case CMD_MCPRESTART:
         case CMD_SHELL:
+        case CMD_GIT:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
             return;
         }
@@ -15864,6 +15875,9 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_DELETE:
         cmddelete(e, scratch, id, j);  // on a session open here or not
+        return;
+    case CMD_GIT:
+        cmdgit(e, scratch, id, j);  // likewise, and read-only ones too
         return;
     case CMD_FORK:
         cmdfork(e, scratch, id, j);
@@ -16072,6 +16086,9 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         return;
     } else if (r.type == MAIL_DISTROS) {
         fardistros(e, r.data);
+        return;
+    } else if (r.type == MAIL_GIT) {
+        gitdone(e, scratch, r.data);
         return;
     } else if ((r.type==MAIL_OUT || r.type==MAIL_QUIT) && farbyout(e, r.id)) {
         farmail(e, scratch, farbyout(e, r.id), r);  // a link's, to another host
@@ -16371,6 +16388,7 @@ static void enginethread(void *arg)
             }
             e->parked = {};
             mcpquit(e);
+            gitquit(e);
             mailpost(e->out, MAIL_QUIT, 0, {}, 1);
             return;
         }

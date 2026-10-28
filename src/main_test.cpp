@@ -606,6 +606,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/config_test.cpp"
 #include "test/mcp_test.cpp"
 #include "test/engine_test.cpp"  // after config's test platform
+#include "test/git_test.cpp"     // after engine's: makesessions
 #include "test/deploy_test.cpp"
 #include "test/hostlink_test.cpp"
 #include "test/eval_test.cpp"
@@ -675,6 +676,7 @@ int main()
     test_memory(&t);
     test_skills(&t);
     test_engine(&t);
+    test_git(&t);
     test_config(&t);
     test_mcp(&t);
     test_deploy(&t);

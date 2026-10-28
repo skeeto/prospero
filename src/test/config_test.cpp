@@ -101,6 +101,9 @@ static void testcfgschema(Test *t)
         {"tools", "shell", "zsh", CFG_BAD, 1},
         {"tools", "shell", " powershell ", CFG_OK, 1},
         {"tools", "shell", "auto", CFG_OK, 1},
+        {"tools", "git", "/opt/homebrew/bin/git", CFG_OK, 0},
+        {"tools", "git", "git", CFG_BAD, 1},
+        {"tools", "git", " ", CFG_OK, 1},
         {"ui", "editor", "code --wait", CFG_OK, 0},
         {"ui", "editor", "code --wait", CFG_BAD, 1},
         {"ui", "theme", "dark", CFG_OK, 1},
@@ -209,13 +212,15 @@ static void testcfgseed(Test *t)
     }
     cfgfree(c);
 
-    // Every key in the schema is documented in the seed
+    // Every key in the schema is documented in the seed ("git" is in
+    // "digits" too, so it is looked for as the seed lists it)
     for (iz i = 0; i < countof(cfgschema); i++) {
         Str key = cfgschema[i].key;
         if (find(cfgseed(), key) < 0) {
             expect(t, "seed documents", key, "");
         }
     }
+    expect(t, "seed documents git", istr(&a, find(cfgseed(), "#   git ") >= 0), "1");
 
     // An existing file is left alone, and no seed without permission
     os_write(v.os, a, path, "# mine\n");
@@ -1018,6 +1023,7 @@ static void testcfgjson(Test *t)
         "tools//path_prepend=*\n"
         "tools//path_append=*\n"
         "tools//use_rg=true*\n"
+        "tools//git=*\n"
         "tools//turn_budget=0*\n"
         "tools//task_budget=200*\n"
         "instructions//files=AGENTS.md CLAUDE.md*\n"

@@ -184,6 +184,12 @@ static f32 fontadvance(void *ctx, i32 style, i32 cp)
     return stylebaked(f, style)->GetCharAdvance((ImWchar)cp);
 }
 
+// ImGui's font as its widgets draw text now, for midcut on their labels.
+static f32 widgetadvance(void *, i32, i32 cp)
+{
+    return ImGui::GetFontBaked()->GetCharAdvance((ImWchar)cp);
+}
+
 static FontMetrics fontmetrics(void *ctx, i32 style)
 {
     Fonts      *f = (Fonts *)ctx;
@@ -2240,6 +2246,85 @@ static void drawshellpick(Gui *g, Arena a, GuiSession *s, View *v)
 // A line above the transcript: the session, or a subagent's parent to
 // go back to, its context gauge, the toggles that open all its tool
 // output and reasoning, and the session's details in a popup.
+// The session's branch, on the session bar's first line after what is
+// there, cut in its middle to end by end (window x): dim, or amber while
+// a rebase, a merge or the like is under way, and a toggle of the
+// Changes pane. Nothing outside a repository, nor where its engine
+// can't tell, nor where too little of it would fit.
+static void drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end)
+{
+    GitWatch *w = &s->git;
+    if (w->state!=GITW_REPO || !hostcap(s->host, "git")) {
+        return;
+    }
+    Str name = w->detached ? takehead(w->oid, 7) : w->branch;
+    Buf op(a, 64 + w->op.len);
+    if (w->op.len) {
+        print(&op, "  ");
+        print(&op, w->op);
+        if (w->steps) {
+            putbyte(&op, ' ');
+            print(&op, w->step);
+            putbyte(&op, '/');
+            print(&op, w->steps);
+        }
+    }
+    Str         tail  = finish(&op);
+    Str         glyph = name.len ? Str("\xee\x82\xa0 ") : Str("\xee\x82\xa0");  // a branch
+    ImGuiStyle &st    = ImGui::GetStyle();
+    f32         fixed = 2*st.FramePadding.x + ImGui::CalcTextSize(cstr0(a, glyph)).x +
+                        ImGui::CalcTextSize(cstr0(a, tail)).x;
+    f32         room  = end - rightof() - fixed;
+    f32         least = ImGui::CalcTextSize("ab\xe2\x80\xa6yz").x;
+    Measure     m     = {};
+    m.advance = widgetadvance;
+    Str shown = midcut(a, name, room, &m, 0);
+    if (room<0 || (shown.len!=name.len && (room<least || !shown.len))) {
+        return;
+    }
+    g->branchcut = shown.len != name.len;
+    b32 open = g->changesshown;
+    u32 col  = w->op.len ? g->pal->amber : ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    Str label = concat(a, concat(a, glyph, shown), concat(a, tail, "###gitbranch"));
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::PushStyleColor(ImGuiCol_Button, open ? ImGui::GetColorU32(ImGuiCol_ButtonActive) : 0);
+    b32 click = ImGui::SmallButton(cstr0(a, label));
+    ImGui::PopStyleColor(2);
+    itemnamed(g, "git branch");
+    if (ImGui::BeginItemTooltip()) {
+        Buf b(a, 256 + w->branch.len + w->root.len);
+        if (w->detached) {
+            print(&b, "Detached at ");
+            print(&b, w->oid);
+        } else if (w->branch.len) {
+            print(&b, "On ");
+            print(&b, w->branch);
+        } else {
+            print(&b, "On a branch only git can name: its refs are in a reftable");
+        }
+        if (w->op.len) {
+            print(&b, "\n");
+            print(&b, w->op=="am" ? Str("Applying patches (git am)") :
+                      w->op=="bisect" ? Str("Bisecting") : concat(a, "In a ", w->op));
+            if (w->steps) {
+                print(&b, ", step ");
+                print(&b, w->step);
+                print(&b, " of ");
+                print(&b, w->steps);
+            }
+        }
+        print(&b, "\n");
+        print(&b, homeshow(a, s->host, w->root));
+        text(finish(&b));
+        ImGui::TextDisabled(open ? "Click to hide its changes" : "Click to show its changes");
+        ImGui::EndTooltip();
+    }
+    if (click) {
+        setpane(g, PANE_CHANGES, !open);
+    }
+}
+
 static void drawsessbar(Gui *g)
 {
     GuiSession *s = g->sess;
@@ -2328,7 +2413,10 @@ static void drawsessbar(Gui *g)
                               "directory, and acts on the desktop, without asking you. "
                               "Change it in the mode list by Send.");
     }
-    if (right > rightof()) {
+    // The branch in what room is left before them, else on the line
+    b32 fits = right > rightof();
+    drawbranch(g, &a, s, fits ? right - gap : right + rest);
+    if (fits) {
         ImGui::SameLine(right);
     } else if (right > ImGui::GetCursorPosX()) {
         ImGui::SetCursorPosX(right);  // too narrow: a line of their own
@@ -4605,7 +4693,8 @@ static b32 remotelisted(Gui *g, GuiHost *h, Str name)
 // Why a session operation cannot be done now, or empty if it can: the
 // host's engine names it in its caps (cap), the host takes commands,
 // the session is its own here, and, where idle matters, nothing runs.
-static Str sesswhy(Gui *g, GuiSession *s, Str cap, b32 idle, b32 rootonly)
+// Why a session's host can't do what cap names now, else empty.
+static Str hostwhy(Gui *g, GuiSession *s, Str cap)
 {
     if (cap.len && !hostcap(s->host, cap)) {
         return s->host->kind==GH_REMOTE && s->host->up
@@ -4613,6 +4702,15 @@ static Str sesswhy(Gui *g, GuiSession *s, Str cap, b32 idle, b32 rootonly)
              : Str("This host's engine is too old for this");
     } else if (!hostlive(g, s)) {
         return "Its host is not connected";
+    }
+    return {};
+}
+
+static Str sesswhy(Gui *g, GuiSession *s, Str cap, b32 idle, b32 rootonly)
+{
+    Str why = hostwhy(g, s, cap);
+    if (why.len) {
+        return why;
     } else if (s->readonly || (!s->view && s->locked)) {
         return "Another process holds it";
     } else if (rootonly && sessparent(s).len) {
@@ -5919,6 +6017,288 @@ static void drawplan(Gui *g)
     drawdoc(g, f->doc, "##plan");
     itemnamed(g, "plan text");
     g->planshown = (i32)f->doc->v->msgs[0].text.len;
+}
+
+// A changed file's status as one letter: U for a conflict, else its
+// status in the index, else in the worktree.
+static u8 changeletter(ChangeRow *r)
+{
+    b32 conflict = r->x=='U' || r->y=='U' || (r->x=='A' && r->y=='A') ||
+                   (r->x=='D' && r->y=='D');
+    return conflict ? 'U' : r->x!='.' ? r->x : r->y;
+}
+
+static Str changeword(u8 c)
+{
+    switch (c) {
+    case 'M': return "modified";
+    case 'T': return "type changed";
+    case 'A': return "added";
+    case 'D': return "deleted";
+    case 'R': return "renamed";
+    case 'C': return "copied";
+    }
+    return "changed";
+}
+
+// What a changed file's row says on hover: its path whole, where it
+// came from, and how it stands in the index and in the worktree.
+static Str changetip(Arena *a, ChangeRow *r)
+{
+    static char const *conflicts[][2] = {
+        {"DD", "both deleted"},  {"AU", "added by us"},    {"UD", "deleted by them"},
+        {"UA", "added by them"}, {"DU", "deleted by us"},  {"AA", "both added"},
+        {"UU", "both modified"},
+    };
+    Buf b(a, 128 + r->path.len + r->orig.len);
+    print(&b, r->path);
+    if (r->orig.len) {
+        print(&b, "\nfrom ");
+        print(&b, r->orig);
+    }
+    if (changeletter(r) == 'U') {
+        Str how = "in conflict";
+        for (i32 i = 0; i < countof(conflicts); i++) {
+            if (r->x==conflicts[i][0][0] && r->y==conflicts[i][0][1]) {
+                how = Str{(u8 *)conflicts[i][1], (iz)__builtin_strlen(conflicts[i][1])};
+            }
+        }
+        print(&b, "\nUnmerged: ");
+        print(&b, how);
+        return finish(&b);
+    } else if (r->x == '?') {
+        print(&b, "\nUntracked");
+        return finish(&b);
+    }
+    if (r->x != '.') {
+        print(&b, "\nStaged: ");
+        print(&b, changeword(r->x));
+    }
+    if (r->y != '.') {
+        print(&b, "\nNot staged: ");
+        print(&b, changeword(r->y));
+    }
+    return finish(&b);
+}
+
+// Lines added and deleted, as "+a −d".
+static Str changecounts(Arena *a, i64 add, i64 del)
+{
+    Buf b(a, 48);
+    putbyte(&b, '+');
+    print(&b, add);
+    print(&b, " \xe2\x88\x92");  // a minus sign
+    print(&b, del);
+    return finish(&b);
+}
+
+// The Changes pane: the shown session's changes as git status has them
+// (guigit, ongit), asked for only while this shows. Its branch, and its
+// upstream if any, over its folder; a row a file, of its status, its
+// path cut in its middle, and the lines added and deleted; the totals.
+static void drawchanges(Gui *g)
+{
+    GuiSession *s    = g->sess;
+    Changes    *c    = &g->changes;
+    Arena       a    = g->frame;
+    Palette    *pal  = g->pal;
+    Str         why  = s ? hostwhy(g, s, "git") : Str("No session");
+    GitWatch   *w    = s ? &s->git : 0;
+    Str         note = why;
+    if (!note.len && w->state==GITW_NONE) {
+        note = "Not in a git repository";
+    } else if (!note.len && (w->state==GITW_UNKNOWN || c->s!=s)) {
+        note = "Reading\xe2\x80\xa6";
+    }
+    if (note.len) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("%s", cstr0(&a, note));
+        ImGui::PopTextWrapPos();
+        return;
+    }
+
+    // The branch, its operation and upstream, then Refresh at the right
+    ImGuiStyle &st = ImGui::GetStyle();
+    f32         bw = ImGui::CalcTextSize("Refresh").x + 2*st.FramePadding.x;
+    f32         rx = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw;
+    Str         name = c->branch.len ? c->branch : w->branch;
+    if (!c->branch.len && w->detached) {
+        name = concat(&a, "Detached at ", takehead(w->oid, 12));
+    }
+    Measure m = {};
+    m.advance = widgetadvance;
+    Str head  = concat(&a, "\xee\x82\xa0 ", name.len ? name : Str("HEAD"));
+    Str cut   = midcut(&a, head, rx - st.ItemSpacing.x - ImGui::GetCursorPosX(), &m, 0);
+    ImGui::AlignTextToFramePadding();
+    text(cut.len ? cut : head);
+    if (cut.len != head.len) {
+        ImGui::SetItemTooltip("%s", cstr0(&a, name));
+    }
+    if (w->op.len) {
+        Buf b(&a, 64);
+        print(&b, w->op);
+        if (w->steps) {
+            putbyte(&b, ' ');
+            print(&b, w->step);
+            putbyte(&b, '/');
+            print(&b, w->steps);
+        }
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, pal->amber);
+        text(finish(&b));
+        ImGui::PopStyleColor();
+    }
+    if (c->unborn) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("no commits yet");
+    }
+    if (c->upstream.len) {
+        Buf b(&a, 64 + c->upstream.len);
+        print(&b, "\xe2\x86\x92 ");  // an arrow
+        print(&b, c->upstream);
+        if (c->ab && c->ahead) {
+            print(&b, "  \xe2\x86\x91");  // up: commits to push
+            print(&b, c->ahead);
+        }
+        if (c->ab && c->behind) {
+            print(&b, "  \xe2\x86\x93");  // down: to pull
+            print(&b, c->behind);
+        }
+        Str up = finish(&b);
+        samelineif(ImGui::CalcTextSize(cstr0(&a, up)).x);
+        ImGui::TextDisabled("%s", cstr0(&a, up));
+        if (c->ab) {
+            ImGui::SetItemTooltip("%lld ahead of %s, %lld behind it",
+                                  (long long)c->ahead, cstr0(&a, c->upstream),
+                                  (long long)c->behind);
+        }
+    }
+    if (rx > rightof()) {
+        ImGui::SameLine(rx);
+    }
+    b32 busy = c->id && c->id==w->id;
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("Refresh")) {
+        w->statusat = 0;
+        gitstale(g, s);
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, "changes refresh");
+    ImGui::SetItemTooltip(busy ? "Reading the changes" :
+                          "Read the changes again. They are read as the agent's "
+                          "tools finish, and as this window takes the focus back.");
+    Str root = homeshow(&a, s->host, w->root);
+    cut = midcut(&a, root, ImGui::GetContentRegionAvail().x, &m, 0);
+    ImGui::TextDisabled("%s", cstr0(&a, cut.len ? cut : root));
+    if (cut.len != root.len) {
+        ImGui::SetItemTooltip("%s", cstr0(&a, root));
+    }
+
+    if (c->err.len) {
+        Str err = c->err;
+        if (s->host->kind == GH_REMOTE) {
+            err = concat(&a, concat(&a, "On ", s->host->name), concat(&a, ": ", err));
+        }
+        ImGui::PushTextWrapPos(0);
+        ImGui::PushStyleColor(ImGuiCol_Text, pal->bad);
+        text(err);
+        ImGui::PopStyleColor();
+        ImGui::PopTextWrapPos();
+        return;
+    } else if (!c->count) {
+        ImGui::TextDisabled("No changes");
+        return;
+    }
+
+    // The rows, the counts' column as wide as its widest
+    i64 maxadd = 0;
+    i64 maxdel = 0;
+    b32 counts = 0;
+    b32 bin    = 0;
+    for (iz i = 0; i < c->rows.len; i++) {
+        ChangeRow *r = &c->rows[i];
+        maxadd  = r->add>maxadd ? r->add : maxadd;
+        maxdel  = r->del>maxdel ? r->del : maxdel;
+        counts |= r->counted && !r->bin;
+        bin    |= r->bin;
+    }
+    f32 cw = counts ? ImGui::CalcTextSize(cstr0(&a, changecounts(&a, maxadd, maxdel))).x : 0;
+    f32 bw2 = bin ? ImGui::CalcTextSize("bin").x : 0;
+    cw = cw>bw2 ? cw : bw2;
+    f32 lw   = ImGui::CalcTextSize("W").x;
+    f32 foot = ImGui::GetTextLineHeightWithSpacing();
+    ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
+                            ImGuiTableFlags_SizingFixedFit;
+    if (ImGui::BeginTable("##changes", cw>0 ? 3 : 2, flags, v2(0, -foot))) {
+        ImGui::TableSetupColumn("##status", ImGuiTableColumnFlags_WidthFixed, lw);
+        ImGui::TableSetupColumn("##path", ImGuiTableColumnFlags_WidthStretch);
+        if (cw > 0) {
+            ImGui::TableSetupColumn("##lines", ImGuiTableColumnFlags_WidthFixed, cw);
+        }
+        ImGuiListClipper clip;
+        clip.Begin((i32)c->rows.len);
+        while (clip.Step()) {
+            for (i32 i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+                ChangeRow *r = &c->rows[i];
+                u8         l = changeletter(r);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                u32 col = l=='A' || l=='?' ? pal->ok : l=='D' || l=='U' ? pal->bad
+                                                                       : pal->paneltext;
+                ImGui::PushStyleColor(ImGuiCol_Text, col);
+                text(Str{&l, 1});
+                ImGui::PopStyleColor();
+                ImGui::TableNextColumn();
+                Str path = midcut(&a, r->path, ImGui::GetContentRegionAvail().x, &m, 0);
+                text(path.len ? path : Str("\xe2\x80\xa6"));
+                if (ImGui::BeginItemTooltip()) {
+                    text(changetip(&a, r));
+                    ImGui::EndTooltip();
+                }
+                if (cw<=0 || !r->counted) {
+                    continue;
+                }
+                ImGui::TableNextColumn();
+                Str n = r->bin ? Str("bin") : changecounts(&a, r->add, r->del);
+                f32 x = ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(cstr0(&a, n)).x;
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (x>0 ? x : 0));
+                if (r->bin) {
+                    ImGui::TextDisabled("bin");
+                    continue;
+                }
+                // Each in its color, but dim where none
+                iz  sp  = find(n, " ");
+                u32 dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+                ImGui::PushStyleColor(ImGuiCol_Text, r->add ? pal->ok : dim);
+                text(takehead(n, sp));
+                ImGui::PopStyleColor();
+                ImGui::SameLine(0, 0);
+                ImGui::PushStyleColor(ImGuiCol_Text, r->del ? pal->bad : dim);
+                text(cuthead(n, sp));
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    // The totals, and what they leave out
+    Buf b(&a, 160);
+    print(&b, c->count);
+    print(&b, c->count==1 ? Str(" file") : Str(" files"));
+    if (counts) {
+        print(&b, ", ");
+        print(&b, changecounts(&a, c->add, c->del));
+    }
+    if (c->more) {
+        print(&b, "  \xc2\xb7  ");
+        print(&b, c->more);
+        print(&b, " more not listed");
+    }
+    if (c->partial) {
+        print(&b, "  \xc2\xb7  new files' lines partly counted");
+    }
+    ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+    ImGui::SetItemTooltip("git took %lld ms", (long long)c->ms);
 }
 
 // The last n lines of s.
@@ -8911,7 +9291,7 @@ static void drawmenubar(Gui *g)
             // they are, and join the jobs
             for (i32 i = 0; i < PANE_COUNT; i++) {
                 b32 extra = i==PANE_HELP || i==PANE_SETTINGS || i==PANE_HOSTS;
-                setpane(g, i, extra ? g->panes[i] : i!=PANE_METRICS);
+                setpane(g, i, extra ? g->panes[i] : !panehidden(i));
             }
             g->panefocus    = 0;
             g->resetpending = 1;
@@ -9094,10 +9474,10 @@ static void placefirst(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
 
 // The layout, in the dock space id of a size at pos: the sessions over
 // the todo list at the left, the transcript over the prompt, and at the
-// right the jobs and the log, Jobs selected, over the plan. Help,
-// Settings and Hosts join the jobs, when shown now or later; on a first
-// run, those shown float in front instead, centered, Help selected.
-// Metrics floats, when shown.
+// right the jobs and the log, Jobs selected, over the plan and the
+// changes. Help, Settings and Hosts join the jobs, when shown now or
+// later; on a first run, those shown float in front instead, centered,
+// Help selected. Metrics floats, when shown.
 static void buildlayout(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
 {
     ImGuiID first = ImGui::GetID("FirstRun");
@@ -9120,6 +9500,7 @@ static void buildlayout(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
     ImGui::DockBuilderDockWindow("Jobs", rtop);
     ImGui::DockBuilderDockWindow("Log", rtop);
     ImGui::DockBuilderDockWindow("Plan", rbot);
+    ImGui::DockBuilderDockWindow("Changes", rbot);
     ImGui::DockBuilderFinish(id);
     g->jobsfocus = 2;
 
@@ -9238,6 +9619,19 @@ static void dockwindows(Gui *g)
         }
         if (beginpane(g, PANE_PLAN)) {
             drawplan(g);
+        }
+        ImGui::End();
+    }
+    g->changesshown = 0;
+    if (show[PANE_CHANGES]) {
+        near = saveddock("Plan");
+        near = near ? near : saveddock("Log");
+        if (near) {
+            ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
+        }
+        g->changesshown = beginpane(g, PANE_CHANGES);
+        if (g->changesshown) {
+            drawchanges(g);
         }
         ImGui::End();
     }

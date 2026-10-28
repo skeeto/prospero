@@ -107,7 +107,7 @@ class LocalHost:
         if self.windows:
             # Through a \\?\ path, which reaches past MAX_PATH (deep_unicode)
             root = "\\\\?\\" + os.path.abspath(root)
-        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(root, onerror=writable)
 
     def leftovers(self):
         """What close left: the root, or links in /tmp into it."""
@@ -423,6 +423,16 @@ def tmplinks(root):
         except OSError:
             pass  # gone meanwhile, or no link
     return out
+
+
+def writable(func, path, exc):
+    """rmtree's retry of a read-only file, which Windows won't delete
+    (git's objects), made writable first; other errors are ignored."""
+    try:
+        os.chmod(path, 0o600)
+        func(path)
+    except OSError:
+        pass
 
 
 def leftbehind(host):
@@ -3170,7 +3180,8 @@ def hello_caps(t):
                 "status", "stop", "file"] + m8 + ["skills", "mode", "unqueue", "dir",
                                                    "background", "models", "mcp",
                                                    "mcp.auth", "mcp.code", "mcp.logout",
-                                                   "mcp.restart", "shell", "shells"]
+                                                   "mcp.restart", "shell", "shells",
+                                                   "git"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -3179,7 +3190,8 @@ def hello_caps(t):
                  "compact", "model", "gauge", "answer.always", "scratch", "delete",
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
-                 "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell"} <= set(caps)
+                 "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
+                 "git"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -11249,6 +11261,202 @@ def an_desktop_cache_before(t):
     us = [e["usage"] for e in r.all("assistant")]
     t.note(f"cache reads: {cached}; in all, read {sum(cached)}, written "
            f"{sum(u.get('written', 0) for u in us)}, prompt {sum(u['in'] for u in us)}")
+
+
+# Git: a session's branch, read from the repository's files, and its
+# changes, from git run by the engine's worker
+
+def sessioncwd(h, sid):
+    """A session's directory, as the engine has it."""
+    ev = h.wait(lambda e: e.get("ev") == "session" and e.get("sid") == sid)
+    return ev["cwd"]
+
+
+@scenario(bound=15)
+def git_head(t):
+    """The git command reads a session's branch from its .git, with no
+    git: none outside a repository, a branch, a commit when detached, a
+    rebase under way with its branch and steps, and a worktree's .git
+    file. Its status, of a .git that git takes for no repository, or
+    with no git on the host, is an error of the status alone."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        root = sessioncwd(h, sid)
+        r = h.call("git", sid=sid)
+        t.check(r.get("ok") == 1 and r.get("head") == {"repo": 0}, f"no repository: {r}")
+
+        git = t.host.join(t.work, ".git")
+        t.host.mkdir(git)
+        t.host.write(t.host.join(git, "HEAD"), "ref: refs/heads/feature/one\n")
+        r = h.call("git", sid=sid)
+        t.check(r.get("head") == {"repo": 1, "root": root, "branch": "feature/one"},
+                f"a branch: {r}")
+
+        oid = "0123456789abcdef0123456789abcdef01234567"
+        t.host.write(t.host.join(git, "HEAD"), oid + "\n")
+        r = h.call("git", sid=sid)
+        t.check(r.get("head") == {"repo": 1, "root": root, "detached": 1, "oid": oid},
+                f"detached: {r}")
+
+        rebase = t.host.join(git, "rebase-merge")
+        t.host.mkdir(rebase)
+        t.host.write(t.host.join(rebase, "head-name"), "refs/heads/topic\n")
+        t.host.write(t.host.join(rebase, "msgnum"), "2\n")
+        t.host.write(t.host.join(rebase, "end"), "5\n")
+        r = h.call("git", sid=sid)
+        t.check(r.get("head") == {"repo": 1, "root": root, "branch": "topic",
+                                  "op": "rebase", "step": 2, "steps": 5}, f"a rebase: {r}")
+
+        # A worktree, whose .git file leads to its git directory
+        wt = t.host.join(t.base, "wt")
+        t.host.mkdir(wt)
+        t.host.mkdir(t.host.join(git, "worktrees", "wt"))
+        t.host.write(t.host.join(git, "worktrees", "wt", "HEAD"), "ref: refs/heads/side\n")
+        t.host.write(t.host.join(wt, ".git"), "gitdir: ../work/.git/worktrees/wt\n")
+        wsid = h.call("new", cwd=wt, model=t.model, endpoint="fake")["sid"]
+        r = h.call("git", sid=wsid)
+        t.check(r.get("head") == {"repo": 1, "root": sessioncwd(h, wsid), "branch": "side"},
+                f"a worktree: {r}")
+
+        r = h.call("git", sid=sid, status=1, timeout=30)
+        st = r.get("status", {})
+        t.check(r.get("ok") == 1 and r.get("head", {}).get("repo") == 1 and
+                st.get("ok") == 0 and st.get("err"), f"no repository to git: {r}")
+        t.note(f"git said: {st.get('err')}")
+
+        r = h.call("git", sid="20260101-000000-none")
+        t.check(r.get("ok") == 0 and r.get("err") == "no such session", f"no session: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+def gitenv(t):
+    """git as a test runs it: no user's or system's configuration."""
+    return dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                GIT_COMMITTER_EMAIL="t@t", HOME=t.home)
+
+
+def reapers(pid):
+    """The reapers a harness has running now (POSIX)."""
+    out = subprocess.run(["ps", "-A", "-o", "ppid=,command="], capture_output=True,
+                         text=True).stdout
+    return [line for line in out.splitlines()
+            if line.split(None, 1)[0] == str(pid) and "--reap" in line]
+
+
+@scenario(bound=30)
+def git_status(t):
+    """The changes as git tells them: before the first commit, lines
+    added and removed, a staged rename, a deletion, a binary file and a
+    new one, ahead of and behind the upstream, and detached. git writes
+    no index (no optional locks), nothing is left running, and [tools]
+    git set to a missing program says so. Here only, with git."""
+    git = shutil.which("git")
+    if not git or not isinstance(t.host, LocalHost):
+        raise Skip("needs git, here")
+    env = gitenv(t)
+
+    def g(*args, cwd=None):
+        return subprocess.run([git, *args], cwd=cwd or t.work, env=env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    g("init", "-q")
+    g("symbolic-ref", "HEAD", "refs/heads/main")
+    t.put("first.txt", "one\ntwo\n")
+    g("add", "first.txt")
+    h = t.headless(env={k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")})
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        root = sessioncwd(h, sid)
+
+        def status():
+            r = h.call("git", sid=sid, status=1, timeout=30)
+            t.check(r.get("ok") == 1 and r["status"].get("ok") == 1, f"status: {r}")
+            return r["status"]
+
+        st = status()
+        t.check(st.get("unborn") == 1 and st.get("branch") == "main" and
+                st["files"] == [{"xy": "A.", "path": "first.txt", "add": 2, "del": 0}],
+                f"before the first commit: {st}")
+
+        t.put("hello.txt", "a\nb\n")
+        t.put("old.txt", "moving\n")
+        t.put("gone.txt", "1\n2\n3\n")
+        with open(os.path.join(t.work, "bin.dat"), "wb") as f:
+            f.write(b"\0\1\2")
+        g("add", ".")
+        g("commit", "-q", "-m", "first")
+        bare = t.host.join(t.base, "remote.git")
+        g("init", "-q", "--bare", bare)
+        g("remote", "add", "origin", bare)
+        g("push", "-q", "-u", "origin", "main")
+        t.put("hello.txt", "a\nb\nmore\n")
+        g("commit", "-q", "-am", "second")
+        g("push", "-q")
+        g("reset", "-q", "--hard", "HEAD~1")
+        t.put("other.txt", "x\n")
+        g("add", "other.txt")
+        g("commit", "-q", "-m", "diverged")
+
+        # Changes of every kind, and an index that a status would
+        # refresh: a file touched, its contents the same
+        t.put("hello.txt", "a\nc\nd\n")
+        g("mv", "old.txt", "moved.txt")
+        os.remove(os.path.join(t.work, "gone.txt"))
+        with open(os.path.join(t.work, "bin.dat"), "wb") as f:
+            f.write(b"\0\3")
+        t.put("new.txt", "x\ny\nz")
+        later = time.time() + 5
+        os.utime(os.path.join(t.work, "other.txt"), (later, later))
+        index = os.path.join(t.work, ".git", "index")
+        before = os.stat(index).st_mtime_ns
+
+        st = status()
+        files = {f["path"]: f for f in st["files"]}
+        t.check(st.get("upstream") == "origin/main" and st.get("ahead") == 1 and
+                st.get("behind") == 1, f"ahead and behind: {st}")
+        t.check([f["path"] for f in st["files"]] ==
+                ["bin.dat", "gone.txt", "hello.txt", "moved.txt", "new.txt"],
+                f"tracked, then new: {st['files']}")
+        t.check(files["hello.txt"] == {"xy": ".M", "path": "hello.txt", "add": 2, "del": 1},
+                f"lines: {files['hello.txt']}")
+        t.check(files["moved.txt"] == {"xy": "R.", "path": "moved.txt", "orig": "old.txt",
+                                       "add": 0, "del": 0}, f"a rename: {files['moved.txt']}")
+        t.check(files["gone.txt"] == {"xy": ".D", "path": "gone.txt", "add": 0, "del": 3},
+                f"a deletion: {files['gone.txt']}")
+        t.check(files["bin.dat"] == {"xy": ".M", "path": "bin.dat", "bin": 1},
+                f"binary: {files['bin.dat']}")
+        t.check(files["new.txt"] == {"xy": "??", "path": "new.txt", "add": 3, "del": 0},
+                f"a new file: {files['new.txt']}")
+        t.check(st.get("count") == 5 and st.get("add") == 5 and st.get("del") == 4 and
+                st.get("more") == 0 and "partial" not in st and "cut" not in st and
+                isinstance(st.get("ms"), int), f"totals: {st}")
+        t.check(os.stat(index).st_mtime_ns == before and
+                not os.path.exists(index + ".lock"), "git wrote no index")
+        t.note(f"status took {st['ms']} ms")
+
+        g("checkout", "-q", "--detach", "HEAD")
+        r = h.call("git", sid=sid, status=1, timeout=30)
+        t.check(r["head"].get("detached") == 1 and r["status"].get("detached") == 1 and
+                "branch" not in r["status"], f"detached: {r}")
+
+        if os.name != "nt":
+            time.sleep(2)
+            left = reapers(h.p.pid)
+            t.check(not left, f"nothing left running: {left}")
+
+        r = h.call("config.set", kind="tools", key="git", value="/nonexistent/git")
+        t.check(r.get("ok") == 1, f"config.set: {r}")
+        r = h.call("git", sid=sid, status=1, timeout=30)
+        t.check(r["status"] == {"ok": 0, "err": "[tools] git, /nonexistent/git, was not found"},
+                f"a missing git: {r}")
+        t.check(r["head"].get("root") == root, f"the head still: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
 
 
 # The soak: sessions under 10% random faults for a while

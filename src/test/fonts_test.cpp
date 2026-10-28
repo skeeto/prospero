@@ -37,4 +37,18 @@ static void test_fonts(Test *t)
     }
     expect(t, "fonts.symbols.missing", finish(&missing), "");
     expect(t, "fonts.symbols.count", istr(&a, n > 60), "1");
+
+    // The GUI's own: the branch, ahead and behind, deletions, a cut
+    // (ui.cpp drawbranch, drawchanges)
+    i32 const gui[] = {0xe0a0, 0x2191, 0x2193, 0x2212, 0x2026, 0x2192, 0xb7};
+    Buf lacking(&a, 64);
+    for (i32 cp : gui) {
+        if (!fontprose(cp)) {
+            print(&lacking, "U+");
+            printhex(&lacking, (u64)cp, 4);
+            putbyte(&lacking, ' ');
+        }
+    }
+    expect(t, "fonts.gui.missing", finish(&lacking), "");
+    expect(t, "fonts.gui.branch", istr(&a, fontcovers(fontmono(), 0xe0a0)), "1");
 }

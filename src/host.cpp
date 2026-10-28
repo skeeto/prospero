@@ -32,7 +32,8 @@
 // Several clients may attach at once, and each receives what it asks
 // for. Commands go to the engine with ids of the host's own, and their
 // replies come back, in order (but for models, which answers once its
-// endpoints do), to whoever asked under the asker's ids;
+// endpoints do, and git once git is done), to whoever asked under the
+// asker's ids;
 // records without a session (the sessions list) go to the asker of the
 // command they answer. Session records go to the clients that opened
 // the session (open or new), or one it is a subagent of, under the
@@ -473,15 +474,16 @@ static void hostreply(Host *, HostClient *, Arena, i64, b32, Str, Str);
 // Send a command to the engine under a fresh id, the line as a parsed
 // object with id replaced, and with from and attended replaced where
 // given (from < 0 drops it). Null if too many wait already. A models
-// command replies once its endpoints answer, and mcp.auth and mcp.code
-// once their servers do, after those sent later, so each waits apart
-// from the ring, whose replies come in order; a full list of them gives
-// up on the oldest, whose reply must have been lost.
+// command replies once its endpoints answer, mcp.auth and mcp.code once
+// their servers do, and git with status once git is done, after those
+// sent later, so each waits apart from the ring, whose replies come in
+// order; a full list of them gives up on the oldest, whose reply must
+// have been lost.
 static HostCmd *hostforward(Host *h, Arena scratch, Json *j, i32 cmd, i32 kind,
                             i64 from, i32 attended)
 {
     HostCmd *q = 0;
-    if (cmd==CMD_MODELS || cmd==CMD_MCPAUTH || cmd==CMD_MCPCODE) {
+    if (cmd==CMD_MODELS || cmd==CMD_MCPAUTH || cmd==CMD_MCPCODE || cmd==CMD_GIT) {
         if (h->latelen == HOST_LATE) {
             HostCmd old = h->late[0];
             if (old.client) {

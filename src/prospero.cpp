@@ -612,6 +612,7 @@ static u32     os_guilimits(Os *);
 #include "admit.cpp"
 #include "compact.cpp"
 #include "engine.cpp"
+#include "git.cpp"
 #include "cli.cpp"
 #include "host.cpp"
 #include "door.cpp"

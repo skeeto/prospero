@@ -265,7 +265,7 @@ enum : i32 {
     RECT_LASTMSG,    // the transcript's last message, if drawn
     RECT_THEME0,     // the theme's choices in its open list
     RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
-    RECT_COUNT = RECT_PANE0 + 11,
+    RECT_COUNT = RECT_PANE0 + 12,
 };
 
 // The panes, which the View menu shows and hides
@@ -275,6 +275,7 @@ enum : i32 {
     PANE_PROMPT,
     PANE_TODO,
     PANE_PLAN,
+    PANE_CHANGES,
     PANE_JOBS,
     PANE_LOG,
     PANE_HOSTS,
@@ -285,10 +286,17 @@ enum : i32 {
 };
 
 static char const *panenames[] = {
-    "Sessions", "Transcript", "Prompt", "Todo", "Plan", "Jobs", "Log", "Hosts",
-    "Settings", "Help", "Metrics",
+    "Sessions", "Transcript", "Prompt", "Todo", "Plan", "Changes", "Jobs", "Log",
+    "Hosts", "Settings", "Help", "Metrics",
 };
 static_assert(countof(panenames) == PANE_COUNT);
+
+// The panes hidden until asked for: the metrics, and the changes, which
+// a click on the session bar's branch shows (ui.cpp drawbranch).
+static b32 panehidden(i32 pane)
+{
+    return pane==PANE_METRICS || pane==PANE_CHANGES;
+}
 
 // The layout's splits (buildlayout), each a share of the node split: the
 // right column's of the width, the left column's of the rest, the
@@ -552,6 +560,7 @@ struct GuiSession {
     b32          gone;      // deleted: shown nowhere
     Slice<SkillItem> skills;  // what /name invokes, as its engine lists them
     i64          skillsid;  // that list's skills in flight, 0 if none
+    GitWatch     git;       // its branch, and asking for it (guigit)
     // Desktop notifications (toastpass): its history, as of its open, its
     // records up to histseq (else written by histts) being no news; the
     // last ask and turn end judged, by record; and a root's toast
@@ -687,6 +696,43 @@ struct PlanFile {
     DocView    *doc;    // null until first shown
     i32         docgot; // the read it shows
     View       *docv;   // and whose plan that is
+};
+
+// A file the Changes pane lists, as git.cpp's gitstatusjson gives it.
+struct ChangeRow {
+    u8  x;        // its status in the index
+    u8  y;        // and in the worktree
+    Str path;
+    Str orig;     // renamed or copied from, else empty
+    i64 add;
+    i64 del;
+    b32 counted;  // add and del are known
+    b32 bin;
+};
+
+// The Changes pane's: the changes of the session shown, as its latest
+// status reply gave them (ongit), in a reservation of its own made as
+// it is first needed and emptied for each reply.
+struct Changes {
+    GuiSession      *s;      // whose these are, else none yet
+    i64              id;     // the status in flight, any session's, else 0
+    i64              sent;   // when it went, epoch ms
+    Str              err;    // why there are none
+    Str              branch; // as git says, else none (detached)
+    Str              upstream;
+    i64              ahead;
+    i64              behind;
+    b32              ab;     // ahead and behind are known
+    b32              unborn; // no commit yet
+    Slice<ChangeRow> rows;
+    i64              count;  // files changed, listed or not
+    i64              add;
+    i64              del;
+    i64              more;   // files changed but not listed
+    b32              partial;// add and del leave out some new files' lines
+    i64              ms;     // how long git took
+    Arena            mem;
+    byte            *base;
 };
 
 // One setting in the settings window, from config.get.
@@ -1025,6 +1071,10 @@ struct Gui {
     i64                lastkey;
     i64                lastcontent;
     b32                jobsvisible;  // the Jobs window drew last frame
+    b32                changesshown; // the Changes pane drew last frame
+    b32                gitfocused;   // the window had the focus (guigit)
+    b32                gitpane;      // and the Changes pane showed
+    b32                branchcut;    // the session bar's branch was cut short
     b32                jobsdirty;    // job output it has not shown
     i64                lastjobs;     // when it last showed new output
     Arena              pendmem;    // deltas held back until a content frame
@@ -1130,6 +1180,7 @@ struct Gui {
     GuiHost           *newhost;    // the new session's host
     OutFile            out;        // the Output window's file
     PlanFile           plan;       // the Plan window's
+    Changes            changes;    // the Changes pane's
     i32                helppage;   // the Help window's topic (HELP_*)
     DocView           *helpdoc;    // and its page, null until first shown
     i32                helpshown;  // the topic in helpdoc, plus one
@@ -1604,6 +1655,9 @@ static void setcur(Gui *g, GuiSession *s)
     }
     g->sess = s;
     g->view = s && s->view ? s->view : g->nosession.view;
+    if (s) {
+        s->git.stale = 1;  // its branch, asked for again (guigit)
+    }
     scheddirty(&g->sched);
 }
 
@@ -4192,6 +4246,123 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
 static void onexportfile(Gui *, Arena, Json *, b32 ok, Str err);
 static void ondir(Gui *, Arena, i64 id, Json *, b32 ok, Str err);
 static void onimport(Gui *, GuiHost *, Arena, Request *, EvRec *);
+// A session's branch and changes (git.cpp): its branch for the session
+// bar, and its changes for the Changes pane while that shows it, asked
+// for (guigit) only as they may have changed (gitstale): as the session
+// is shown, as tools, jobs and turns end on its host, as its host comes
+// up, as the pane comes into view, and as the window takes the focus
+// back, git perhaps used elsewhere meanwhile. How often is gitnext's to
+// say.
+enum : iz {
+    CHANGES_MEM  = (iz)1<<24,  // the pane's reservation
+    CHANGES_ROWS = 1<<14,      // the most files it lists
+};
+
+static void gitstale(Gui *g, GuiSession *s)
+{
+    s->git.stale = 1;
+    if (s == g->sess) {
+        scheddirty(&g->sched);
+    }
+}
+
+// s kept in perm only as it changes, which a branch seldom does.
+static void gitkeep(Gui *g, Str *dst, Str s)
+{
+    if (s != *dst) {
+        *dst = clone(&g->perm, s);
+    }
+}
+
+// The Changes pane's, from a status (git.cpp gitstatusjson) for s: what
+// it lists, in the pane's arena, emptied first. The files it can't hold
+// count as more.
+static void gitchanges(Gui *g, GuiSession *s, Json *st)
+{
+    Changes *c = &g->changes;
+    if (!c->base) {
+        c->mem  = newarena(os_reserve(g->os, CHANGES_MEM));
+        c->base = c->mem.beg;
+    }
+    c->mem.beg  = c->base;
+    Arena *m    = &c->mem;
+    b32    ok   = jsonint(jsonget(st, "ok"), 0) != 0;
+    Str    err  = jsonstr(jsonget(st, "err"));
+    c->s        = s;
+    c->err      = ok ? Str{} : clone(m, err.len ? err : Str("git failed"));
+    c->branch   = clone(m, jsonstr(jsonget(st, "branch")));
+    c->upstream = clone(m, jsonstr(jsonget(st, "upstream")));
+    c->ahead    = jsonint(jsonget(st, "ahead"), -1);
+    c->behind   = jsonint(jsonget(st, "behind"), -1);
+    c->ab       = c->ahead>=0 && c->behind>=0;
+    c->unborn   = jsonint(jsonget(st, "unborn"), 0) != 0;
+    c->rows     = {};
+    c->count    = jsonint(jsonget(st, "count"), 0);
+    c->add      = jsonint(jsonget(st, "add"), 0);
+    c->del      = jsonint(jsonget(st, "del"), 0);
+    c->partial  = jsonint(jsonget(st, "partial"), 0) != 0;
+    c->ms       = jsonint(jsonget(st, "ms"), 0);
+    Json *files = jsonget(st, "files");
+    iz    given = ok && files->type==JSON_ARRAY ? jsonlen(files) : 0;
+    iz    n     = given<CHANGES_ROWS ? given : CHANGES_ROWS;
+    n = fits(m, n*(iz)sizeof(ChangeRow)) ? n : 0;
+    c->rows.data = alloc<ChangeRow>(m, n);
+    c->rows.cap  = n;
+    for (Json *k = files->child; k && c->rows.len<n; k = k->next) {
+        Str path = jsonstr(jsonget(k, "path"));
+        Str orig = jsonstr(jsonget(k, "orig"));
+        Str xy   = jsonstr(jsonget(k, "xy"));
+        if (!fits(m, path.len + orig.len)) {
+            break;
+        }
+        ChangeRow *r = &c->rows.data[c->rows.len++];
+        r->x       = xy.len>0 ? xy[0] : '?';
+        r->y       = xy.len>1 ? xy[1] : '?';
+        r->path    = clone(m, path);
+        r->orig    = clone(m, orig);
+        r->bin     = jsonint(jsonget(k, "bin"), 0) != 0;
+        r->add     = jsonint(jsonget(k, "add"), -1);
+        r->del     = jsonint(jsonget(k, "del"), -1);
+        r->counted = r->bin || (r->add>=0 && r->del>=0);
+    }
+    c->more = ok ? jsonint(jsonget(st, "more"), 0) + given - c->rows.len : 0;
+}
+
+// A reply to git (guigit): the session's branch, and its changes, if
+// asked for, which the pane takes whichever session it shows now. One
+// that failed, as when its host went, leaves what was known.
+static void ongit(Gui *g, GuiSession *s, i64 id, Json *j, b32 ok)
+{
+    GitWatch *w = &s->git;
+    Changes  *c = &g->changes;
+    c->id = c->id==id ? 0 : c->id;
+    if (w->id != id) {
+        return;  // lost, and asked for again since
+    }
+    w->id = 0;
+    scheddirty(&g->sched);
+    if (!ok) {
+        w->state = w->state==GITW_UNKNOWN ? GITW_NONE : w->state;
+        return;
+    }
+    Json *h = jsonget(j, "head");
+    w->state = jsonint(jsonget(h, "repo"), 0) ? GITW_REPO : GITW_NONE;
+    gitkeep(g, &w->root,   jsonstr(jsonget(h, "root")));
+    gitkeep(g, &w->branch, jsonstr(jsonget(h, "branch")));
+    gitkeep(g, &w->oid,    jsonstr(jsonget(h, "oid")));
+    gitkeep(g, &w->op,     jsonstr(jsonget(h, "op")));
+    w->detached = jsonint(jsonget(h, "detached"), 0) != 0;
+    w->reftable = jsonint(jsonget(h, "reftable"), 0) != 0;
+    w->step     = jsonint(jsonget(h, "step"), 0);
+    w->steps    = jsonint(jsonget(h, "steps"), 0);
+    Json *st = jsonget(j, "status");
+    if (st->type == JSON_OBJECT) {
+        b32 good = jsonint(jsonget(st, "ok"), 0) != 0;
+        w->statusat = gitstatusat(w->sent, jsonint(jsonget(st, "ms"), 0), good);
+        gitchanges(g, s, st);
+    }
+}
+
 static void sessgone(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
 static void cfgeditrun(Gui *, Arena, Str path);
@@ -4230,6 +4401,12 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         if (q.s && q.s->skillsid==id) {
             q.s->skillsid = 0;
             onskills(g, q.s, j, ok);
+        }
+        return;
+
+    case CMD_GIT:
+        if (q.s) {
+            ongit(g, q.s, id, j, ok);
         }
         return;
 
@@ -5224,6 +5401,9 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
         return 1;
     case EV_HELLO:
         hostcaps(g, h, r->root);
+        if (g->sess && g->sess->host==h) {
+            gitstale(g, g->sess);  // up again, with git perhaps
+        }
         if (h->kind == GH_ENGINE) {
             g->engineok = 1;
             h->up       = 1;
@@ -5300,6 +5480,10 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
     }
     if (r->ev==EV_TURNEND && s==g->sess) {
         guiskills(g, s);  // skills may have come or gone meanwhile
+    }
+    if ((r->ev==EV_TOOLEND || r->ev==EV_JOBEND || r->ev==EV_TURNEND) &&
+            g->sess && g->sess->host==h) {
+        gitstale(g, g->sess);  // any session's tools may change its files
     }
     if (r->ev == EV_JOBOUT) {
         // Applied, so that the Jobs window is current once shown, but
@@ -5468,6 +5652,13 @@ static void reissue(Gui *g)
         case CMD_CONFIGGET: g->cfgget = 0; guiconfigget(g); break;
         case CMD_OPEN:      if (q.s && q.s->openid==q.id) guiopen(g, q.s); break;
         case CMD_NEW:       g->newid = 0; break;  // it shows in the list
+        case CMD_GIT:
+            g->changes.id = g->changes.id==q.id ? 0 : g->changes.id;
+            if (q.s && q.s->git.id==q.id) {
+                q.s->git.id = 0;
+                gitstale(g, q.s);
+            }
+            break;
         case CMD_DIR:
             for (i32 k = 0; k < DIRLISTS; k++) {
                 DirList *l = &g->pc.lists[k];
@@ -6279,6 +6470,9 @@ static void sessgone(Gui *g, GuiSession *s)
     if (g->plan.s == s) {
         g->plan.s = 0;
     }
+    if (g->changes.s == s) {
+        g->changes.s = 0;
+    }
     if (g->exp.s == s) {
         g->exp.s     = 0;
         g->exp.state = EXP_IDLE;
@@ -7040,13 +7234,19 @@ static b32 toasthistory(GuiSession *s, GuiSession *root, i64 seq, i64 ts)
     return ts <= by;
 }
 
+// Whether the user may be looking: the window has the focus (as the
+// checklist says, when it says), and shows.
+static b32 guifocused(Gui *g)
+{
+    b32 focused = g->drivefocus ? g->drivefocus==1 : os_guifocused(g->os);
+    return focused && !g->sched.minimized && !g->bg;
+}
+
 // Whether the user sees root's sessions now: the window has the focus,
 // and shows one of them.
 static b32 toastlooking(Gui *g, GuiSession *root)
 {
-    b32 focused = g->drivefocus ? g->drivefocus==1 : os_guifocused(g->os);
-    return focused && !g->sched.minimized && !g->bg && g->sess &&
-           sessroot(g, g->sess)==root;
+    return guifocused(g) && g->sess && sessroot(g, g->sess)==root;
 }
 
 // The asks waiting for the user in root's tree, not history nor as good
@@ -7235,6 +7435,46 @@ static void toastlook(Gui *g)
     if (root && root->toastkind && toastlooking(g, root)) {
         toastgone(g, root);
     }
+}
+
+// Each frame, after drawing: the shown session's branch, or its changes
+// too while the Changes pane shows, asked for as gitnext says once they
+// may have changed (gitstale), else a frame wanted when it allows.
+static void guigit(Gui *g)
+{
+    GuiSession *s       = g->sess;
+    b32         focused = guifocused(g);
+    b32         pane    = g->changesshown;
+    if (s && ((focused && !g->gitfocused) || (pane && !g->gitpane))) {
+        s->git.stale = 1;
+    }
+    g->gitfocused = focused;
+    g->gitpane    = pane;
+    if (!s || s->gone || g->quitting || !hostcap(s->host, "git") || !hostlive(g, s)) {
+        return;
+    }
+    Changes *c    = &g->changes;
+    i64      now  = os_time(g->os);
+    i64      busy = c->id && c->id!=s->git.id ? c->sent : 0;
+    GitNext  n    = gitnext(&s->git, pane, c->s==s, busy, now);
+    if (n.wake) {
+        schedat(&g->sched, g->sched.now + (n.wake - now)*1000, DUE_APP);
+    }
+    if (!n.ask) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_GIT, s);
+    if (n.ask == GITASK_STATUS) {
+        putintkey(&w.json, "status", 1);
+        c->id   = g->nextid;
+        c->sent = now;
+    }
+    s->git.id    = g->nextid;
+    s->git.sent  = now;
+    s->git.stale = 0;
+    cmdsend(g, &w, a);
 }
 
 // A toast clicked: the window, on the session it told of, the one that
@@ -8821,6 +9061,7 @@ static void gui_frame(Gui *g)
         busy |= BUSY_TEX;
     }
     draftpoll(g, s);
+    guigit(g);
     if (g->quitat) {
         schedat(s, g->quitat, DUE_APP);
     }
@@ -9721,6 +9962,9 @@ enum : i32 {
     CHK_NOTIFY,       // [ui] notify is dx
     CHK_CFGFIND,      // the settings' search lists first the keys text
                       // names, in order; nothing listed if text is ""
+    CHK_GITBRANCH,    // the session bar shows the branch text, cut if dx
+    CHK_CHANGES,      // the Changes pane lists text: "M path +a -d; ..."
+    CHK_GITQUIET,     // no frames since OP_MARK, the Changes pane shown
     CHK_CFGFOCUS,     // a result went to the setting text names: its
                       // page as CHK_PAGE, then its key, in view
     CHK_COUNT,
@@ -9958,6 +10202,9 @@ static Str chknames[] = {
     "the toast was withdrawn", "the toast's click showed its session",
     "[ui] notify is as set",
     "the settings' search listed as expected",
+    "the session bar shows the branch",
+    "the Changes pane lists the changes",
+    "no frames while idle, the Changes pane shown",
     "a search result showed its setting",
 };
 static_assert(countof(chknames) == CHK_COUNT);
@@ -10029,6 +10276,7 @@ enum : i32 {
     W_FARKID,     // the latest subagent on far is open here, at work
     W_FARSHOWN,   // a session on far is shown, open, its replay applied
     W_TOAST,      // a toast since OP_TOASTMARK
+    W_CHANGES,    // the Changes pane shows the session's, a file text among them
 };
 
 static Str waitnames[] = {
@@ -10050,8 +10298,9 @@ static Str waitnames[] = {
     "the named remote to come up", "the named remote to close",
     "the named remote's update", "the MCP server's state", "the MCP sign-in",
     "the subagent on far", "the subagent on far shown", "a toast",
+    "the changes",
 };
-static_assert(countof(waitnames) == W_TOAST+1);
+static_assert(countof(waitnames) == W_CHANGES+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -12766,6 +13015,52 @@ static DriveOp planops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// The branch and the Changes pane (tests/gui.py --mode changes, with
+// --cwd a repository on a long branch, hello.txt changed and new.txt
+// new): the branch on the session bar, cut in its middle, a click on it
+// showing the pane, which lists
+// both, no frames while idle with it shown, a file made elsewhere listed
+// once the window has the focus back and not before, another click
+// hiding the pane.
+static DriveOp changesops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 10000, "git branch"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_GITBRANCH, 1, 0, 0, "feature/a-branch-whose-name-goes-on-and-on-well-past-the-room-the-session-bar-has-for-it-at-its-end"},
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Changes"},
+    {OP_SHOT, 0, 0, 0, 300, "changes-branch"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "git branch"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CHANGES, 0, 0, 10000, "new.txt"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Changes"},
+    {OP_CHECK, CHK_CHANGES, 0, 0, 0, "M hello.txt +1 -1; ? new.txt +2 -0"},
+    {OP_SHOT, 0, 0, 0, 300, "changes"},
+    {OP_MARK, 0, 0, 0, 3000, ""},
+    {OP_CHECK, CHK_GITQUIET, 0, 0, 0, ""},
+    // Changed elsewhere while the window is away: read once it is back
+    {OP_FOCUS, 0, 2, 0, 300, ""},
+    {OP_TOUCH, 0, 0, 0, 2000, "elsewhere.txt"},
+    {OP_CHECK, CHK_CHANGES, 0, 0, 0, "M hello.txt +1 -1; ? new.txt +2 -0"},
+    {OP_FOCUS, 0, 1, 0, 0, ""},
+    {OP_WAIT, W_CHANGES, 0, 0, 10000, "elsewhere.txt"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CHANGES, 0, 0, 0,
+     "M hello.txt +1 -1; ? elsewhere.txt +1 -0; ? new.txt +2 -0"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "git branch"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Changes"},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // prospero DIR (tests/gui.py --mode launch, which starts this window as
 // "prospero gui --launch DIR"): the session in DIR made after hello,
 // macOS's open event for the same DIR ignored, another launch's directory
@@ -13703,6 +13998,7 @@ static b32 docktreecheck(Gui *g)
         {PANE_JOBS,       rtop},
         {PANE_LOG,        rtop},
         {PANE_PLAN,       right->ChildNodes[1]},
+        {PANE_CHANGES,    right->ChildNodes[1]},
         {PANE_HELP,       rtop},
         {PANE_SETTINGS,   rtop},
         {PANE_HOSTS,      rtop},
@@ -14063,6 +14359,15 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_OUTPUT:
         return g->out.s && !g->out.id && (g->out.text.len || g->out.err.len);
+    case W_CHANGES: {
+        Changes *c = &g->changes;
+        Str      f = g->ops[g->drivepc-1].text;
+        b32      has = 0;
+        for (iz i = 0; i < c->rows.len; i++) {
+            has |= c->rows[i].path == f;
+        }
+        return g->sess && c->s==g->sess && !c->id && g->changesshown && has;
+    }
     case W_PLAN: {
         PlanFile *f = &g->plan;
         return g->sess && f->s==g->sess && !f->id && f->ver==v->planver &&
@@ -15576,6 +15881,40 @@ static b32 drivecheck(Gui *g, i32 chk)
                m->md && find(m->text, "# Plan")==0 && g->rects[RECT_ALLOW].x1>0 &&
                g->rects[RECT_DENY].x1>0;
     }
+    case CHK_GITBRANCH: {
+        GuiSession *s     = g->sess;
+        b32         drawn = 0;
+        for (i32 i = 0; i < g->nnamed; i++) {
+            drawn |= Str{g->named[i].name, g->named[i].len} == "git branch";
+        }
+        return s && s->git.state==GITW_REPO && s->git.branch==g->ops[g->drivepc-1].text &&
+               drawn && g->branchcut==(g->ops[g->drivepc-1].dx != 0);
+    }
+    case CHK_CHANGES: {
+        // Each file's letter, path and lines, as the pane shows them
+        Changes *c = &g->changes;
+        Arena    a = g->frame;
+        Buf      b(&a, 256);
+        for (iz i = 0; i < c->rows.len; i++) {
+            ChangeRow *r = &c->rows[i];
+            if (i) print(&b, "; ");
+            putbyte(&b, changeletter(r));
+            putbyte(&b, ' ');
+            print(&b, r->path);
+            if (r->counted) {
+                print(&b, " +");
+                print(&b, r->add);
+                print(&b, " -");
+                print(&b, r->del);
+            }
+        }
+        Str got = finish(&b);
+        guilog(g, concat(&a, "drive: changes: ", got));
+        return g->sess && c->s==g->sess && g->changesshown && !c->err.len &&
+               got==g->ops[g->drivepc-1].text;
+    }
+    case CHK_GITQUIET:
+        return g->changesshown && drivequiet(g, "idle with the changes shown", 2);
     case CHK_PLANTEXT:
         return tabselected("Plan") && g->planshown>0 && g->plan.doc &&
                find(g->plan.doc->v->msgs[0].text, g->ops[g->drivepc-1].text)>=0;
@@ -16873,6 +17212,8 @@ static Str guiusage =
 "  --compose-again  its drafts after a restart, in the same directories\n"
 "  --plan         plan mode's checklist: the dialog, the plan's ask, the\n"
 "                 Plan window, the toggle and /plan\n"
+"  --changes      the branch on the session bar and the Changes pane, in a\n"
+"                 --cwd that is a git repository\n"
 "  --mcp          an MCP server's page in Settings: its state, Sign in\n"
 "                 (a stand-in browser), a call from a session, Sign out\n"
 "  --hosttask     subagents on another host: opened and answered here, a\n"
@@ -17044,7 +17385,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->zoom     = 1;
     g->fontbase = FONT_BASE;
     for (i32 i = 0; i < PANE_COUNT; i++) {
-        g->panes[i] = i != PANE_METRICS;  // the metrics only when asked for
+        g->panes[i] = !panehidden(i);
     }
     #ifdef __APPLE__
     g->mac = 1;
@@ -17057,7 +17398,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
-    b32 launch = 0, first = 0, mcp = 0, hosttask = 0;
+    b32 launch = 0, first = 0, mcp = 0, hosttask = 0, changes = 0;
     i64 history = 0;
     Str opendir = {};  // prospero DIR, as given
     i32 bench   = 0;
@@ -17100,6 +17441,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             launch = probe = 1;
         } else if (a == "--plan") {
             plan = probe = 1;
+        } else if (a == "--changes") {
+            changes = probe = 1;
         } else if (a == "--mcp") {
             mcp = probe = 1;
         } else if (a == "--hosttask") {
@@ -17172,7 +17515,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
             background || attach || remote || compose || sidebar || plan || launch ||
-            first || mcp || hosttask) {
+            first || mcp || hosttask || changes) {
         g->drive = 1;
         if (hosttask) {
             g->ops  = hosttaskops;
@@ -17189,6 +17532,9 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         } else if (plan) {
             g->ops  = planops;
             g->nops = countof(planops);
+        } else if (changes) {
+            g->ops  = changesops;
+            g->nops = countof(changesops);
         } else if (compose) {
             g->ops  = compose==1 ? composeops : compose2ops;
             g->nops = compose==1 ? countof(composeops) : countof(compose2ops);

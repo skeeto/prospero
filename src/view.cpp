@@ -3536,3 +3536,127 @@ static Str toastdonebody(Arena *a, View *v)
     }
     return "Finished";
 }
+
+// s cut in its middle to fit in width, measured in style: whole if it
+// fits, else "…" between as much of its head and its tail as fits,
+// taken a code point at a time from each end in turn, tail first, as
+// what tells a branch or a path from another is as often at its end.
+// Empty if not even a code point of each fits around the "…".
+static Str midcut(Arena *a, Str s, f32 width, Measure *m, i32 style)
+{
+    f32 w = 0;
+    for (iz i = 0; i < s.len;) {
+        w += m->advance(m->ctx, style, utf8decode(s, &i));
+    }
+    if (w <= width) {
+        return s;
+    }
+    f32 room = width - m->advance(m->ctx, style, 0x2026);
+    iz  head = 0;     // s[0, head) kept
+    iz  tail = s.len; // and s[tail, len)
+    for (b32 back = 1; head < tail; back = !back) {
+        iz  at = head;
+        i32 cp = back ? utf8prev(s, tail, &at) : utf8decode(s, &at);
+        f32 cw = m->advance(m->ctx, style, cp);
+        if (cw>room || (back ? at<head : at>tail)) {
+            break;
+        }
+        room -= cw;
+        if (back) {
+            tail = at;
+        } else {
+            head = at;
+        }
+    }
+    if (!head || tail==s.len) {
+        return {};
+    }
+    Buf b(a, head + 3 + s.len - tail);
+    print(&b, takehead(s, head));
+    print(&b, "\xe2\x80\xa6");
+    print(&b, cuthead(s, tail));
+    return finish(&b);
+}
+
+// A session's branch as its engine last read it (git.cpp githead), and
+// the GUI's asking for it and for its changes (gitnext).
+enum : i32 {
+    GITW_UNKNOWN,  // not yet asked
+    GITW_NONE,     // not in a repository
+    GITW_REPO,
+};
+
+struct GitWatch {
+    i32 state;     // GITW_*
+    Str root;
+    Str branch;    // else the whole ref, unless reftable or detached
+    Str oid;       // detached at
+    Str op;        // in progress: "rebase", "merge", "am", ...
+    i64 step;      // its step of steps, if it counts them
+    i64 steps;
+    b32 detached;
+    b32 reftable;  // HEAD names no branch git's files can tell
+    b32 stale;     // it may have changed since last asked
+    i64 id;        // the request in flight, else 0
+    i64 sent;      // when the last went, epoch ms
+    i64 statusat;  // no status sooner (gitstatusat)
+};
+
+enum : i32 {
+    GITASK_NONE,
+    GITASK_HEAD,    // the branch
+    GITASK_STATUS,  // and the changes
+};
+
+enum : i64 {
+    GITW_LOST   = 30*1000,  // a request unanswered this long was lost
+    GITW_GAP    = 1000,     // the least time between a session's requests
+    GITW_MAXGAP = 60*1000,  // the most between its status requests
+};
+
+struct GitNext {
+    i32 ask;   // GITASK_*
+    i64 wake;  // else when to look again, epoch ms, or 0 for no sooner
+               // than the next change
+};
+
+// What to ask a session's engine as of now (epoch ms): its branch, or
+// its changes too (status) while the Changes pane shows it. Only once
+// they may have changed (stale), with its own last request answered or
+// lost, once a second at most, and with no status in flight for
+// another session (busy: when that one went, else 0). A status waits
+// out the gap its last one asked for (statusat) only if the pane has
+// that one to show meanwhile (have).
+static GitNext gitnext(GitWatch *w, b32 status, b32 have, i64 busy, i64 now)
+{
+    GitNext r = {};
+    if (!w->stale) {
+        return r;
+    }
+    i64 at = w->sent + GITW_GAP;
+    if (w->id) {
+        at = at>w->sent+GITW_LOST ? at : w->sent+GITW_LOST;
+    }
+    if (status && have) {
+        at = at>w->statusat ? at : w->statusat;
+    }
+    if (status && busy) {
+        at = at>busy+GITW_LOST ? at : busy+GITW_LOST;
+    }
+    if (now < at) {
+        r.wake = at;
+    } else {
+        r.ask = status ? GITASK_STATUS : GITASK_HEAD;
+    }
+    return r;
+}
+
+// When a session may ask for its changes again after a reply to the
+// request sent at sent: five times what git took (ms) later, from 1 s
+// to 60 s, or 60 s after a failure, which asking again soon won't fix.
+static i64 gitstatusat(i64 sent, i64 ms, b32 ok)
+{
+    i64 gap = ok ? 5*ms : GITW_MAXGAP;
+    gap = gap<GITW_GAP ? GITW_GAP : gap>GITW_MAXGAP ? GITW_MAXGAP : gap;
+    return sent + gap;
+}

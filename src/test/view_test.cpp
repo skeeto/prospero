@@ -47,6 +47,19 @@ static void selset(View *v, i32 m0, i32 s, i32 m1, i32 e)
     v->sel.focus  = {m1, e};
 }
 
+// gitnext's decision: "head", "status" or "none", and "@" its wake.
+static Str gitnextstr(Arena *a, GitWatch w, b32 status, b32 have, i64 busy, i64 now)
+{
+    GitNext n = gitnext(&w, status, have, busy, now);
+    Buf     b(a, 32);
+    print(&b, n.ask==GITASK_HEAD ? Str("head") : n.ask==GITASK_STATUS ? Str("status") : Str("none"));
+    if (n.wake) {
+        putbyte(&b, '@');
+        print(&b, n.wake);
+    }
+    return finish(&b);
+}
+
 static void test_view(Test *t)
 {
     Arena perm = t->perm;
@@ -413,6 +426,46 @@ static void test_view(Test *t)
         expect(t, "find.empty", istr(&a, cfgfindrank("url", d, "endpoint x", "  ")), "0");
         expect(t, "find.words", istr(&a, cfgfindrank("url", d, "endpoint falstaff", "url falstaff")), "5");
         expect(t, "find.allwords", istr(&a, cfgfindrank("url", d, "endpoint falstaff", "url nope")), "0");
+
+        // A branch or a path cut in its middle, every character 10 wide
+        Measure m = fixedmeasure();
+        expect(t, "midcut.fits", midcut(&a, "main", 40, &m, 0), "main");
+        expect(t, "midcut.empty", midcut(&a, "", 0, &m, 0), "");
+        expect(t, "midcut.cut", midcut(&a, "main", 39, &m, 0), "m\xe2\x80\xa6n");
+        expect(t, "midcut.exact", midcut(&a, "abcd", 30, &m, 0), "a\xe2\x80\xa6" "d");
+        expect(t, "midcut.long", midcut(&a, "feature/long-branch-name", 100, &m, 0),
+               "feat\xe2\x80\xa6-name");
+        expect(t, "midcut.narrow", midcut(&a, "feature", 25, &m, 0), "");
+        expect(t, "midcut.utf8", midcut(&a, "\xc3\xbcn\xc3\xaf" "c\xc3\xb8" "d\xc3\xa9", 50, &m, 0),
+               "\xc3\xbcn\xe2\x80\xa6" "d\xc3\xa9");
+        expect(t, "midcut.wide", midcut(&a, "# heading", 60, &m, STYLE_HMASK), "#\xe2\x80\xa6g");
+
+        // When to ask for a session's branch and changes
+        GitWatch w = {};
+        w.sent = 1000;
+        expect(t, "gitnext.fresh", gitnextstr(&a, w, 1, 0, 0, 5000), "none");
+        w.stale = 1;
+        expect(t, "gitnext.head", gitnextstr(&a, w, 0, 0, 0, 5000), "head");
+        expect(t, "gitnext.status", gitnextstr(&a, w, 1, 0, 0, 5000), "status");
+        expect(t, "gitnext.second", gitnextstr(&a, w, 0, 0, 0, 1999), "none@2000");
+        w.statusat = 9000;
+        expect(t, "gitnext.gap", gitnextstr(&a, w, 1, 1, 0, 5000), "none@9000");
+        expect(t, "gitnext.gapdone", gitnextstr(&a, w, 1, 1, 0, 9000), "status");
+        expect(t, "gitnext.nothing", gitnextstr(&a, w, 1, 0, 0, 5000), "status");
+        expect(t, "gitnext.headgap", gitnextstr(&a, w, 0, 1, 0, 5000), "head");
+        w.statusat = 0;
+        w.id = 7;
+        expect(t, "gitnext.flight", gitnextstr(&a, w, 1, 0, 0, 5000), "none@31000");
+        expect(t, "gitnext.lost", gitnextstr(&a, w, 1, 0, 0, 31000), "status");
+        w.id = 0;
+        expect(t, "gitnext.busy", gitnextstr(&a, w, 1, 0, 2000, 5000), "none@32000");
+        expect(t, "gitnext.busyhead", gitnextstr(&a, w, 0, 0, 2000, 5000), "head");
+        expect(t, "gitnext.busylost", gitnextstr(&a, w, 1, 0, 2000, 32000), "status");
+
+        expect(t, "gitnext.quick", istr(&a, gitstatusat(1000, 24, 1)), "2000");
+        expect(t, "gitnext.slow", istr(&a, gitstatusat(1000, 3000, 1)), "16000");
+        expect(t, "gitnext.slowest", istr(&a, gitstatusat(1000, 50000, 1)), "61000");
+        expect(t, "gitnext.failed", istr(&a, gitstatusat(1000, 5, 0)), "61000");
     }
 
     // Always: the ask offers a grant, the answer allows it for good, and
