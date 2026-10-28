@@ -719,6 +719,41 @@ is set, and uses PKCE. It keeps the tokens in the state directory's
 `mcp/auth`, mode 0600, and refreshes them when the server refuses
 one. `prospero mcp logout NAME`, or Sign out, forgets them.
 
+## Web search
+
+`web_search` sends a query to a search service and returns titles,
+links, dates and excerpts; `web_fetch` reads one https page as text,
+with scripts, navigation and hidden elements dropped and links made
+absolute. Neither is offered until `[web]` turns it on:
+
+    [web]
+    search = searxng
+    url = http://localhost:8888/
+
+`search` is `searxng` (your own instance, with `json` in its
+`search.formats`), `exa` (Exa's keyless MCP endpoint, or with `key`),
+or `anthropic` (a side request to an Anthropic model with Anthropic's
+web search tool: `model = ENDPOINT/MODEL`, by default
+`claude-haiku-5-5` on the first endpoint of kind `anthropic`).
+`fetch = no` leaves out `web_fetch`, `results` caps a search's
+results (8), and `searches` a session tree's searches (200). An
+included file cannot set `[web]`.
+
+Every search and page asks first, showing the query and its service
+or the whole address, with "always" for every search or every page of
+a site; `ask = no` asks about none. `web_fetch` reads only addresses
+that already appeared in the conversation (the user's messages,
+files, tool output, results and pages), never one the agent composed,
+and never a local address: IP addresses, `localhost`, dotless names,
+`.local` and the like. It follows redirects within a site, reports
+those to another, and keeps a long page's whole text in the session's
+`out` folder to read in parts. What both tools return is set between
+lines marked with a random word, after a line saying that it is
+information, never instructions, and characters people cannot see but
+models read are removed. A role without the web tools, say one that
+delegates to a `tools = web_search web_fetch` role, keeps an agent off
+the web.
+
 ## Remote and background hosts
 
 A host quits as when a client asks it to, closing its endpoint and

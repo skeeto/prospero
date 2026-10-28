@@ -64,14 +64,17 @@ separated by `;`, with `~` for the home directory:
 Bypass mode, picked in red from the mode list below Send, is for an
 agent left to work alone somewhere it can do no harm. Nothing is
 asked, attended or not: the file tools read and write outside the
-working directory, and the desktop tool acts, starting programs too.
+working directory, the desktop tool acts, starting programs too, and
+the web tools search and read pages ([Web search](help:web)).
 Asks already waiting when you pick it are allowed.
 
 Even in Bypass, the agent's own asks about plan mode remain, and the
 harness still refuses:
 
 - writes under the state directory, other than the plan file;
-- a path that names nothing (one with a NUL byte).
+- a path that names nothing (one with a NUL byte);
+- a web page whose address never appeared in the conversation, or a
+  local one.
 
 Only you turn Bypass on, never a new session, the agent or the
 configuration. It stays through reopening and restarts, and subagents

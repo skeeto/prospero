@@ -67,7 +67,7 @@ cannot choose what runs, so these are ignored in one:
 
 - plaintext secrets (a `key` not written as `env:NAME`), and secrets
   read from files (`file:PATH`);
-- `[remote]`, `[shell]`, `[mcp]` and `[desktop]` settings;
+- `[remote]`, `[shell]`, `[mcp]`, `[desktop]` and `[web]` settings;
 - `[tools] path_prepend`, `path_append`, `shells` and `git`;
 - a `[tools] shell` other than `auto`, `sh`, `powershell` or `cmd`;
 - `[ui] editor` and `[ui] terminal`.
@@ -172,3 +172,4 @@ cannot choose what runs, so these are ignored in one:
 - **`[remote NAME]`** and **`[host]`**: see
   [Hosts and remotes](help:hosts).
 - **`[desktop]`**: see [Desktop control](help:desktop).
+- **`[web]`**: see [Web search](help:web).

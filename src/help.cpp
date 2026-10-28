@@ -62,13 +62,16 @@ static u8 const help09[] = {
     #embed "../assets/help/09-mcp.md"
 };
 static u8 const help10[] = {
-    #embed "../assets/help/10-config.md"
+    #embed "../assets/help/10-web.md"
 };
 static u8 const help11[] = {
-    #embed "../assets/help/11-keys.md"
+    #embed "../assets/help/11-config.md"
 };
 static u8 const help12[] = {
-    #embed "../assets/help/12-trouble.md"
+    #embed "../assets/help/12-keys.md"
+};
+static u8 const help13[] = {
+    #embed "../assets/help/13-trouble.md"
 };
 static u8 const helpskillbytes[] = {
     #embed "../assets/skills/prospero/SKILL.md"
@@ -87,6 +90,7 @@ enum : i32 {
     HELP_HOSTS,
     HELP_DESKTOP,
     HELP_MCP,
+    HELP_WEB,
     HELP_CONFIG,
     HELP_KEYS,
     HELP_TROUBLE,
@@ -95,7 +99,7 @@ enum : i32 {
 
 static Str helpnames[] = {
     "start", "sessions", "permissions", "plan", "instructions", "jobs",
-    "hosts", "desktop", "mcp", "config", "keys", "trouble",
+    "hosts", "desktop", "mcp", "web", "config", "keys", "trouble",
 };
 static_assert(countof(helpnames) == HELP_COUNT);
 
@@ -112,9 +116,10 @@ static Str helptext(i32 i)
     case HELP_HOSTS:        return {(u8 *)help07, countof(help07)};
     case HELP_DESKTOP:      return {(u8 *)help08, countof(help08)};
     case HELP_MCP:          return {(u8 *)help09, countof(help09)};
-    case HELP_CONFIG:       return {(u8 *)help10, countof(help10)};
-    case HELP_KEYS:         return {(u8 *)help11, countof(help11)};
-    case HELP_TROUBLE:      return {(u8 *)help12, countof(help12)};
+    case HELP_WEB:          return {(u8 *)help10, countof(help10)};
+    case HELP_CONFIG:       return {(u8 *)help11, countof(help11)};
+    case HELP_KEYS:         return {(u8 *)help12, countof(help12)};
+    case HELP_TROUBLE:      return {(u8 *)help13, countof(help13)};
     }
     return {};
 }
