@@ -14,6 +14,11 @@ here... in a host's menu in the sidebar, opens the New session dialog:
   the state directory, deleted with it, and shows as "No folder" in
   the sidebar. It has only your own instructions and skills, none of a
   project's.
+- **New worktree**: the session works in a new git worktree of the
+  folder's repository, on a branch of its own (see Worktree sessions,
+  below). Its name is suggested, and may be changed. The line below it
+  says what the branch starts from, and how many uncommitted changes
+  stay behind in the folder.
 - **Model**: the models the endpoints list, as `ENDPOINT/MODEL`: the
   default first, then each endpoint's, its `[model]` sections first.
   An endpoint that cannot be reached shows why, greyed out. Type in
@@ -72,6 +77,8 @@ agent (Tab completes the name):
 - `/rename TITLE` sets the title;
 - `/fork [TURN]` forks the session, or only its first turns;
 - `/side` starts a side chat (below);
+- `/worktree [NAME]` starts a worktree session (below), named NAME,
+  else through its dialog;
 - `/export [raw]` saves the transcript as Markdown, or its raw log;
 - `/plan` and `/plan off` turn Plan mode on and off;
 - `/background` moves the running command or subagents to the
@@ -137,6 +144,8 @@ Right-click a session in the sidebar, or open the Session menu, for:
   a copy of its folder.
 - **Start a side chat**: a fork you can make while the agent works
   (below).
+- **Start a worktree session...**: the same, working in a worktree of
+  its own (below).
 - **Switch model**: a configured model, or another typed in.
 - **Switch shell**: a `[shell]` section of your configuration, or
   `bash` (not on Windows), `sh`, `powershell` or `cmd` where found, as the picker beside the model's
@@ -188,6 +197,37 @@ main agent may still be working, so that it changes no files unless
 you ask. It has every tool all the same. Calls the main agent had
 under way are closed in the copy as still running there, and its
 background jobs run on there alone.
+
+## Worktree sessions
+
+A worktree session works in a git worktree that Prospero makes for it,
+on a branch of its own, so that it can change and commit files while
+other sessions work in the folder. Start one from a folder with New
+worktree in the New session dialog, or from a session with Start a
+worktree session... in the transcript's right-click menu or the Session
+menu, or `/worktree [NAME]`. The second is a side chat in a worktree:
+a copy of the whole conversation, made even while the agent works,
+nested under its session, its first prompt giving its title.
+
+- **Where**: `.prospero/worktrees/NAME` in the repository's main
+  checkout, on branch `prospero/NAME` (`[worktree] branch_prefix`),
+  at the same subdirectory as the folder. A `.gitignore` there keeps
+  the worktrees out of git status and searches.
+- **From**: the folder's HEAD, or the session's, as the session is
+  made. Uncommitted changes stay behind.
+- **Making it**: git checks it out in the background; the session is
+  there at once, and its first turn waits, "making the worktree".
+- **The agent** is told where it works and on which branch, to commit
+  there, and to leave the main checkout alone. Sessions in the main
+  checkout ask before changing files in a worktree.
+- **Archived or deleted**: once every session working in a worktree is,
+  it is removed if git calls it clean, and its branch deleted only if
+  merged into the branch it was cut from. A worktree with uncommitted
+  changes is kept, and a note says so. Unarchiving the session, or
+  starting a turn in it, checks the branch out again at the same place.
+
+Bring the work back as with any branch, such as with `git merge` in
+the main checkout.
 
 ## Undo and rewind
 

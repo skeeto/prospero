@@ -224,11 +224,14 @@ context menu forks at a message: before a prompt, which then waits in
 the fork's prompt box, or after a turn. A side chat, from that menu,
 the Session menu or `/side`, is a fork made even while the agent
 works, nested under its session, the selection quoted in its box; its
-agent is told to leave files alone. The prompt box keeps a draft
+agent is told to leave files alone. A worktree session, from the New
+session dialog's New worktree, that menu, or `/worktree`, works in a
+git worktree Prospero makes in `.prospero/worktrees`, on a branch of
+its own, and removes once its sessions are archived, if clean. The prompt box keeps a draft
 per session, with the engine, has the session's earlier prompts on Up
 and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
 else `$VISUAL` or `$EDITOR`), and takes `/compact`, `/model`,
-`/rename`, `/fork`, `/side`, `/export`, `/plan`, `/background` and a skill's
+`/rename`, `/fork`, `/side`, `/worktree`, `/export`, `/plan`, `/background` and a skill's
 `/NAME`. Run in background (Ctrl+B, Cmd+B on macOS) moves a running
 command to a job, or a subagent at work on by itself, so that the
 agent goes on and can be talked to; it is told when either ends, a
