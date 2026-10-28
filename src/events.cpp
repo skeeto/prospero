@@ -240,6 +240,9 @@ static Str capnames[] = {
                        // records, and notices of kind shell
     "git",             // git: a session's branch (head) and, with status,
                        // its changes
+    "answer.trust",    // an MCP ask's always is its server's (mcp__SERVER),
+                       // and a project server's ask offers trust, which
+                       // answer {decision:"trust"} keeps for good
 };
 
 static Str evname(i32 ev)

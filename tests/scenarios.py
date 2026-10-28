@@ -3191,7 +3191,7 @@ def hello_caps(t):
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
-                 "git"} <= set(caps)
+                 "git", "answer.trust"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -8970,7 +8970,7 @@ def mcp_policy(t):
     ask = r.last("ask")
     t.check(ask.get("kind") == "mcp" and ask.get("tool") == "mcp__fake__echo" and
             ask.get("server") == "fake" and ask.get("scope") == "mcp" and
-            ask.get("always") == "mcp__fake__echo" and
+            ask.get("always") == "mcp__fake" and "trust" not in ask and
             ask.get("detail") == 'MCP fake: echo {"text": "hi"}', f"ask {ask}")
     ans = r.last("answer")
     t.check(ans.get("decision") == "deny" and ans.get("by") == "policy", f"answer {ans}")
@@ -9037,10 +9037,10 @@ LONGSH = {"_tools": {"shell": "/bin" + "/../bin"*48 + "/sh"}} if os.name != "nt"
 
 @scenario(conf={**mcpconf(), **LONGSH}, bound=30)
 def mcp_ask(t):
-    """Attended: a call allowed once, then always for that tool, which
-    stops its asks, but not another tool's, denied with a note. Another
-    process keeps the grant and the tools, from the session's prefix,
-    whatever its shell's path."""
+    """Attended: a call denied with a note, one allowed once, then always,
+    which stops the asks of every tool of that server. Another process
+    keeps the grant and the tools, from the session's prefix, whatever
+    its shell's path. A configuration's server offers no trust."""
     env = mcpenv(t)
     h = t.headless(env=env)
     b = None
@@ -9048,21 +9048,23 @@ def mcp_ask(t):
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
         h.send("prompt", sid=sid, text="go")
         one = nextask(h, sid)
-        h.call("answer", sid=sid, req=one["req"], decision="allow")
+        t.check(one["always"] == "mcp__fake" and "trust" not in one, f"one {one}")
+        r = h.call("answer", sid=sid, req=one["req"], decision="trust")
+        t.check(r.get("ok") == 0 and "no trust" in r.get("err", ""), f"no trust {r}")
+        h.call("answer", sid=sid, req=one["req"], decision="deny", note="not yet")
         two = nextask(h, sid, one["seq"])
         t.check(two["detail"] == 'MCP fake: echo {"text": "two"}', f"two {two}")
-        r = h.call("answer", sid=sid, req=two["req"], decision="always")
+        h.call("answer", sid=sid, req=two["req"], decision="allow")
+        three = nextask(h, sid, two["seq"])
+        r = h.call("answer", sid=sid, req=three["req"], decision="always")
         t.check(r.get("ok") == 1, f"always {r}")
-        img = nextask(h, sid, two["seq"])
-        t.check(img["tool"] == "mcp__fake__image" and img["detail"] == "MCP fake: image",
-                f"the image asked, three not: {img}")
-        h.call("answer", sid=sid, req=img["req"], decision="deny", note="no pictures")
         t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        t.check(len(h.all("ask", sid)) == 3, "the image not asked")
         st = [(e["status"], e["text"][:60]) for e in h.all("tool.end", sid)]
-        t.check([s for s, _ in st] == ["ok", "ok", "ok", "denied"], f"statuses {st}")
-        t.check("no pictures" in h.all("tool.end", sid)[-1]["text"], "the note")
+        t.check([s for s, _ in st] == ["denied", "ok", "ok", "ok"], f"statuses {st}")
+        t.check("not yet" in h.all("tool.end", sid)[0]["text"], "the note")
         g = [e for e in logged(t, sid) if e["ev"] == "grant"]
-        t.check(len(g) == 1 and g[0].get("mcp") == "mcp__fake__echo" and g[0]["by"] == "user",
+        t.check(len(g) == 1 and g[0].get("mcp") == "mcp__fake" and g[0]["by"] == "user",
                 f"the grant {g}")
         pre = [e for e in logged(t, sid) if e["ev"] == "prefix"]
         t.check(pre and [x["name"] for x in pre[-1].get("mcp", [])][:2] ==
@@ -9073,13 +9075,14 @@ def mcp_ask(t):
         b = t.headless(env=env)
         o = b.call("open", sid=sid, attended=1)
         t.check(o.get("ok") == 1, f"open {o}")
+        last = max(e["seq"] for e in logged(t, sid))
         b.send("prompt", sid=sid, text="again")
-        fail = nextask(b, sid, max(e["seq"] for e in logged(t, sid)))
-        t.check(fail["tool"] == "mcp__fake__fail", f"only fail asks: {fail}")
-        b.call("answer", sid=sid, req=fail["req"], decision="allow")
         t.check(ended(b, sid, 2)["why"] == "done", "the second turn ends")
+        asked = [e for e in b.all("ask", sid) if e["seq"] > last]
+        t.check(not asked, f"nothing asked: {asked}")
         texts = [c["arguments"].get("text") for c in mcpcalls(t) if c["name"] == "echo"]
-        t.check(texts == ["one", "two", "three", "four"], f"echoed {texts}")
+        t.check(texts == ["two", "three", "four"], f"echoed {texts}")
+        t.check([c["name"] for c in mcpcalls(t)][-2:] == ["echo", "fail"], "fail called")
         reqs = [q["body"] for q in t.requests()]
         t.check(reqs[0]["tools"] == reqs[-1]["tools"], "the same tools in the later process")
         inits = [m for m in mcplog(t) if m.get("method") == "initialize"]
@@ -9296,6 +9299,52 @@ def mcp_project_always(t):
         t.check(ended(h, s3, 2)["why"] == "done", "the second turn")
         t.check(len([e for e in h.all("ask", s3) if e["kind"] == "mcp.project"]) == 1,
                 "not asked again in the session")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
+def mcp_project_trust(t):
+    """A project's server allowed for the session offers trust on its
+    calls: trusted, it asks no more, in later sessions neither for the
+    server nor its calls, until the file changes it."""
+    mcpproject(t)
+    env = mcpenv(t, MCP_WORD="w")
+    h = t.headless(env=env)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        ask = nextask(h, sid)
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        a = nextask(h, sid, ask["seq"])
+        t.check(a["kind"] == "mcp" and a.get("trust") == "proj" and
+                a["always"] == "mcp__proj", f"trust offered {a}")
+        r = h.call("answer", sid=sid, req=a["req"], decision="trust")
+        t.check(r.get("ok") == 1, f"trust {r}")
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn ends")
+        t.check(len(h.all("ask", sid)) == 2, f"echo not asked: {h.all('ask', sid)}")
+        ans = h.all("answer", sid)[-1]
+        t.check(ans.get("trust") == 1 and ans.get("always") == 1, f"answer {ans}")
+        kept = json.loads(t.host.read(t.host.join(t.state, "mcp", "projects.json")))
+        t.check([(x["name"], x.get("trust")) for x in kept["approved"]] == [("proj", 1)],
+                f"kept {kept}")
+
+        s2 = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=s2, text="go")
+        t.check(ended(h, s2, 1)["why"] == "done", "a later session's turn ends")
+        t.check(not h.all("ask", s2), f"nothing asked later: {h.all('ask', s2)}")
+        t.check([x for x, _ in projcalls(h, s2)] == ["ok", "ok"], "its calls ran")
+
+        servers = json.loads(t.file(".mcp.json"))["mcpServers"]
+        servers["proj"]["args"].append("--changed")
+        t.put(".mcp.json", json.dumps({"mcpServers": servers}))
+        s3 = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=s3, text="go")
+        a = nextask(h, s3)
+        t.check(a["kind"] == "mcp.project", f"changed, asked again: {a}")
+        h.call("cancel", sid=s3)
+        ended(h, s3, 1)
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

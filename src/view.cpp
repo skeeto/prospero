@@ -265,10 +265,13 @@ struct ViewTool {
     i64  deadline;  // epoch ms, 0 for none (a plan's)
     i32  answer;    // VASK_*
     Str  grant;     // what always would allow: a directory or a file,
-                    // or a desktop class (scope "desktop")
+                    // or a desktop class (scope "desktop"), or an MCP
+                    // server's tools (mcp__SERVER) or one tool's
     Str  access;    // and for what: read or write
     Str  scope;     // "desktop" for a class, else a path
     b32  always;    // allowed for good (a grant)
+    Str  trust;     // an MCP project server that may be trusted for good
+    b32  trusted;   // and it was
     Str  by;
     Str  note;
 };
@@ -1889,6 +1892,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->grant    = clone(&v->aux, jsonstr(jsonget(j, "always")));
         t->access   = clone(&v->aux, jsonstr(jsonget(j, "access")));
         t->scope    = clone(&v->aux, jsonstr(jsonget(j, "scope")));
+        t->trust    = clone(&v->aux, jsonstr(jsonget(j, "trust")));
         v->msgs[i].tool = t;
         v->msgs[i].seq  = r->seq;
         v->msgs[i].md   = t->kind == "plan";  // the plan, in Markdown
@@ -1919,6 +1923,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         t->by     = clone(&v->aux, jsonstr(jsonget(j, "by")));
         t->note   = clone(&v->aux, jsonstr(jsonget(j, "note")));
         t->always = allow && jsonflag(jsonget(j, "always"), 0);
+        t->trusted = allow && jsonflag(jsonget(j, "trust"), 0);
         m->ver++;
         v->topsdirty = 1;  // no more buttons
     } return 1;
@@ -3349,7 +3354,8 @@ static void viewexport(Buf *b, View *v, Str sid, b32 think, b32 tools, b32 outpu
                 print(b, more ? Str("\xe2\x80\xa6") : Str(""));
             }
             if (ask) {
-                print(b, t->always                 ? Str(" (allowed always)") :
+                print(b, t->trusted                ? Str(" (trusted)") :
+                         t->always                 ? Str(" (allowed always)") :
                          t->answer==VASK_ALLOWED ? Str(" (allowed)") :
                          t->answer==VASK_DENIED  ? Str(" (denied)")  : Str(""));
             } else if (t->status != VTOOL_OK) {

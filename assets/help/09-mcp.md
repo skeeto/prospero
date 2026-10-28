@@ -40,8 +40,11 @@ and choose what the agent may reach.
 
 A call asks you first, as a write does, showing the server, the tool
 and its arguments, unless the section says `trust = yes` or the
-session is in Bypass mode. "Always allow TOOL" allows that tool for
-the rest of the session and its subagents. In Plan mode, only tools
+session is in Bypass mode. "Always allow SERVER" allows every tool of
+that server for the rest of the session and its subagents. A
+project's server also offers "Trust SERVER in this project", which
+allows its tools in later sessions too, until the `.mcp.json` changes
+its definition. In Plan mode, only tools
 the server marks read-only may run. See
 [Permissions and asks](help:permissions).
 
@@ -63,6 +66,7 @@ Since such a file comes with the project, a session asks before it
 starts any of them: "Start the MCP servers of PATH?", listing each
 one's command or URL. Allow covers the session, and "Always for this
 project" covers the project until a server's definition changes.
+Starting a server is not using it: its calls still ask, as above.
 A session nobody is watching (`prospero run`) does not start them, and
 says so. A session reads the file once, as it starts.
 

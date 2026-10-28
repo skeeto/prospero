@@ -18,7 +18,9 @@
 // its content (text, images) becomes the call's result. Every MCP tool
 // asks the user first, as a write outside the workspace does, unless the
 // server's section says trust = yes or the session is in Bypass mode; an
-// "always" answer covers that tool for the session's tree. Plan mode
+// "always" answer covers every tool of that server for the session's
+// tree, and a project's server may be trusted for good ("trust"), until
+// its definition changes. Plan mode
 // refuses a tool whose server does not say it only reads (readOnlyHint).
 //
 // Servers are shared by the sessions that offer them: one per name and

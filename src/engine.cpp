@@ -446,8 +446,10 @@ struct Ask {
     b32       gwrite;   // and for writes too, not only reads
     i32       gclass;   // a desktop ask's DESKC_*, with grant its name
     u64       plansum;  // a plan's: the hash of the text put to the user
-    b32       mcp;      // an MCP tool's, its name in grant
+    b32       mcp;      // an MCP tool's, its server's in grant (mcpevery)
     b32       project;  // a project's MCP servers' (mcpasking)
+    Str       trust;    // an MCP ask's project server, which "trust"
+                        // trusts for good, or null
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
@@ -458,7 +460,8 @@ struct Grant {
     Str path;   // null for a desktop or MCP grant
     b32 write;
     u32 desk;   // a desktop grant's class, as its bit (1<<DESKC_*)
-    Str mcp;    // an MCP tool's name (mcp__SERVER__TOOL)
+    Str mcp;    // an MCP tool's name (mcp__SERVER__TOOL), or every tool
+                // of a server (mcp__SERVER)
 };
 
 // An image converted for a request (topng).
@@ -1789,6 +1792,7 @@ static b32  taskwake(Session *);
 static i64  parkafter(Engine *);
 static b32  deskrun(Session *, Arena, DeskArgs *);
 static void mcpresolve(Session *, Arena, b32 allow, i32 by, Str note, i64 wait);
+static void mcpprojtrust(Session *, Arena, Str server);
 static void mcpprojresolve(Session *, Arena, b32 allow, i32 by, b32 always);
 static Str  deskdenial(Arena *, i32 by, Str note, i64 wait);
 static Slice<Msg> deskimages(Session *, Arena *);
@@ -4157,9 +4161,10 @@ static void usergrant(Session *s, Arena scratch, Grant g, Str req, Str by)
 // Resolve the current call's ask: log the answer, then run the call, or
 // end it with the denial as its result. The caller moves on to the next
 // call (nexttool). With always, the answer allows it for good (Grants),
-// which old frontends take as a plain allow.
+// which old frontends take as a plain allow. With trust as well, an
+// MCP ask's project server is trusted for good (mcpprojtrust).
 static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
-                    b32 always = 0)
+                    b32 always = 0, b32 trust = 0)
 {
     Engine *e = s->e;
     Ask    *k = &s->ask;
@@ -4189,7 +4194,13 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         if (always) {
             putintkey(&w.json, "always", 1);
         }
+        if (trust) {
+            putintkey(&w.json, "trust", 1);
+        }
         ssend(s, &w);
+    }
+    if (allow && trust && k->trust.len) {
+        mcpprojtrust(s, scratch, k->trust);
     }
     if (k->project) {
         mcpprojresolve(s, scratch, allow, by, always);
@@ -7305,25 +7316,28 @@ static Str mcpprojpath(Engine *e, Arena *a)
     return join(a, join(a, e->statedir, "mcp"), "projects.json");
 }
 
-// Whether the user approved a key for good.
-static b32 mcpprojknown(Engine *e, Arena scratch, Str key)
+// Whether the user approved a key for good: 0 not, 1 approved, 2 its
+// tools trusted too.
+static i32 mcpprojknown(Engine *e, Arena scratch, Str key)
 {
     Read rd = os_read(e->os, &scratch, mcpprojpath(e, &scratch), 1<<22);
     if (rd.err != READ_OK) {
         return 0;
     }
     JsonDoc d = jsonparse(&scratch, rd.data);
+    i32     r = 0;
     for (Json *x = jsonget(d.root, "approved")->child; x; x = x->next) {
         if (jsonstr(jsonget(x, "sha256")) == key) {
-            return 1;
+            r = jsonint(jsonget(x, "trust"), 0) ? 2 : r>1 ? r : 1;
         }
     }
-    return 0;
+    return r;
 }
 
-// Add approvals for good, with what each was, for a reader.
+// Add approvals for good, with what each was, for a reader. With trust,
+// their tools are trusted too, replacing an approval of the same key.
 static void mcpprojremember(Engine *e, Arena scratch, Slice<McpDef *> defs,
-                            Slice<Str> keys)
+                            Slice<Str> keys, b32 trust = 0)
 {
     Str  path = mcpprojpath(e, &scratch);
     Read rd   = os_read(e->os, &scratch, path, 1<<22);
@@ -7333,15 +7347,30 @@ static void mcpprojremember(Engine *e, Arena scratch, Slice<McpDef *> defs,
     putobject(&w);
     putkey(&w, "approved");
     putarray(&w);
+    b32 *had = alloc<b32>(&scratch, defs.len);
     for (Json *x = jsonget(d.root, "approved")->child; x; x = x->next) {
-        putjson(&w, x);
+        b32 again = 0;
+        for (iz i = 0; i < keys.len; i++) {
+            b32 same = jsonstr(jsonget(x, "sha256")) == keys[i];
+            had[i] |= same;
+            again  |= same;
+        }
+        if (!again || !trust) {
+            putjson(&w, x);
+        }
     }
     for (iz i = 0; i < defs.len; i++) {
+        if (had[i] && !trust) {
+            continue;  // kept as it was
+        }
         putobject(&w);
         putstrkey(&w, "file", defs[i]->file);
         putstrkey(&w, "name", defs[i]->name);
         putstrkey(&w, "sha256", keys[i]);
         putintkey(&w, "at", os_time(e->os));
+        if (trust) {
+            putintkey(&w, "trust", 1);
+        }
         putend(&w);
     }
     putend(&w);
@@ -8014,9 +8043,33 @@ static Str mcpwhat(Arena *a, McpTool *t, Str args)
     return finish(&b);
 }
 
+// The grant of every tool of a server, as a role's tools list names
+// them all.
+static Str mcpevery(Arena *a, Str server)
+{
+    return concat(a, "mcp__", server);
+}
+
+// A project's server, approved in the session, trusted for good: from
+// this call on, its calls do not ask, in later sessions too, until its
+// definition changes. An approval of the same key is replaced.
+static void mcpprojtrust(Session *s, Arena scratch, Str server)
+{
+    McpDef *d = mcpdefof(s, scratch, server);
+    if (!d) {
+        return;
+    }
+    Slice<McpDef *> defs = {};
+    Slice<Str>      keys = {};
+    defs = push(&scratch, defs, d);
+    keys = push(&scratch, keys, mcpprojkey(&scratch, d));
+    mcpprojremember(s->e, scratch, defs, keys, 1);
+}
+
 // A call to an MCP tool: refused in plan mode unless it only reads,
-// asked about unless its server is trusted, a grant covers it, or the
-// session bypasses. Returns 1 if the call finished, 0 if it goes on.
+// asked about unless its server is trusted (by its section, or a
+// project's for good), a grant covers it or its server, or the session
+// bypasses. Returns 1 if the call finished, 0 if it goes on.
 static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
 {
     Engine    *e = s->e;
@@ -8038,9 +8091,15 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
     if (m) {
         mcpconf(e, m);  // trust as the configuration says now
     }
-    Grant g = {};
-    g.mcp = t->name;
-    if (bypassing(s) || (m && m->trust) || hasgrant(s, g)) {
+    Grant one = {};
+    one.mcp = t->name;  // an older session's grant
+    Grant all = {};
+    all.mcp = mcpevery(&scratch, t->server);
+    McpDef *d   = m && m->project.len ? mcpdefof(s, scratch, t->server) : 0;
+    Str     key = d ? mcpprojkey(&scratch, d) : Str{};
+    b32 trusted = d && mcpprojknown(e, scratch, key)==2;
+    if (bypassing(s) || (m && m->trust) || trusted ||
+        hasgrant(s, one) || hasgrant(s, all)) {
         toolstart(s, scratch);
         return mcprun(s, scratch, t);
     }
@@ -8050,7 +8109,8 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
     k->req    = clone(&s->perm, concat(&scratch, c->id, "/ask"));
     k->tool   = TOOL_NONE;
     k->mcp    = 1;
-    k->grant  = t->name;  // the session's own
+    k->grant  = clone(&s->perm, all.mcp);
+    k->trust  = d ? clone(&s->perm, t->server) : Str{};
     k->opened = os_ticks(e->os);
     b32 steer = s->steers.len > 0;
     b32 wait  = attending(s) && !steer;
@@ -8068,8 +8128,11 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
         putstrkey(&w.json, "tool", t->name);
         putstrkey(&w.json, "server", t->server);
         putstrkey(&w.json, "detail", what);
-        putstrkey(&w.json, "always", t->name);
+        putstrkey(&w.json, "always", k->grant);
         putstrkey(&w.json, "scope", "mcp");
+        if (k->trust.len) {
+            putstrkey(&w.json, "trust", k->trust);
+        }
         putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
@@ -16050,14 +16113,20 @@ static void command(Engine *e, Arena scratch, Str line)
         } else if (req != s->ask.req) {
             Str err = concat(&scratch, "no such request: the one waiting is ", s->ask.req);
             reply(e, scratch, id, 0, err, sid);
-        } else if (decision!="allow" && decision!="deny" && decision!="always") {
-            reply(e, scratch, id, 0, "decision must be \"allow\", \"always\" or \"deny\"", sid);
+        } else if (decision!="allow" && decision!="deny" && decision!="always" &&
+                   decision!="trust") {
+            reply(e, scratch, id, 0, "decision must be \"allow\", \"always\", "
+                  "\"trust\" or \"deny\"", sid);
         } else if (decision=="always" && !s->ask.grant.len) {
             reply(e, scratch, id, 0, "this ask offers no always: allow or deny it", sid);
+        } else if (decision=="trust" && !s->ask.trust.len) {
+            reply(e, scratch, id, 0, "this ask offers no trust: allow or deny it", sid);
         } else {
             reply(e, scratch, id, 1, {}, sid);
-            Str note = jsonstr(jsonget(j, "note"));
-            resolve(s, scratch, decision!="deny", DENY_USER, note, decision=="always");
+            Str note  = jsonstr(jsonget(j, "note"));
+            b32 trust = decision == "trust";
+            resolve(s, scratch, decision!="deny", DENY_USER, note,
+                    decision=="always" || trust, trust);
             nexttool(s, scratch);
         }
     } return;

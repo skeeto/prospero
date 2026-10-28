@@ -1227,7 +1227,8 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             print(&c, t->kind=="plan" ? (ok ? Str("approved") : Str("kept planning")) :
                       plan            ? (ok ? Str("agreed") : Str("declined")) :
                       ok              ? Str("allowed") : Str("denied"));
-            print(&c, t->always        ? Str(" (always) by you") :
+            print(&c, t->trusted       ? Str(" (trusted) by you") :
+                      t->always        ? Str(" (always) by you") :
                       t->by=="user"    ? Str(" by you") :
                       t->by=="timeout" ? Str(": nobody answered in time") :
                       t->by=="steer"   ? Str(": you sent a message instead") :
@@ -1788,10 +1789,12 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         } else if (proj) {
             runs[0] = "Always for this project";
         } else if (mcp) {
-            // The tool's own name, after mcp__SERVER__, cut if long
+            // The server's name, or an older engine's tool's own, after
+            // mcp__ or mcp__SERVER__, cut if long
             Str tool = t->grant;
             iz  at   = find(cuthead(tool, 5), "__");
-            tool = startswith(tool, "mcp__") && at>=0 ? cuthead(tool, 5+at+2) : tool;
+            tool = !startswith(tool, "mcp__") ? tool :
+                   at>=0                      ? cuthead(tool, 5+at+2) : cuthead(tool, 5);
             if (tool.len > 24) {
                 tool = concat(&a, utf8head(tool, 23), "\xe2\x80\xa6");
             }
@@ -1825,6 +1828,10 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         } else if (proj) {
             ImGui::SetItemTooltip("Start these servers now, and in later sessions here "
                                   "without asking, until the file changes them");
+        } else if (mcp && find(cuthead(t->grant, 5), "__")<0) {
+            ImGui::SetItemTooltip("Allow this, and every call to a tool of %s from now on "
+                                  "in this session and its subagents, without asking",
+                                  cstr0(&a, cuthead(t->grant, 5)));
         } else if (mcp) {
             ImGui::SetItemTooltip("Allow this, and every call to %s from now on in this "
                                   "session and its subagents, without asking",
@@ -1835,6 +1842,19 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
                                   t->access=="write" ? "read and write" : "read",
                                   cstr0(&a, t->grant));
         }
+    }
+
+    // A project's server, trusted for good
+    if (mcp && t->trust.len && hostcap(s->host, "answer.trust")) {
+        ImGui::SameLine();
+        Str runs[3]   = {"Trust ", t->trust, " in this project"};
+        i32 styles[3] = {0, STYLE_CODE, 0};
+        if (penbutton(g, "##trust", runs, styles, countof(runs))) {
+            guianswer(g, s, t->req, "trust", {});
+        }
+        ImGui::SetItemTooltip("Allow this, and every call to a tool of %s from now on, "
+                              "in later sessions too, without asking, until the "
+                              "project's file changes the server", cstr0(&a, t->trust));
     }
 
     ImGui::SameLine();

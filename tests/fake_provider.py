@@ -2498,6 +2498,7 @@ def sc_mcp_project(model, n, req):
 
 sc_mcp_project_policy = sc_mcp_project
 sc_mcp_project_always = sc_mcp_project
+sc_mcp_project_trust = sc_mcp_project
 sc_mcp_project_config = sc_mcp_project
 
 

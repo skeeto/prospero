@@ -683,14 +683,16 @@ last one has gone. Its standard error is logged in the state
 directory's `mcp/logs`. `tools` keeps only some of a server's tools,
 `trust = yes` runs them without asking, and a role with a tools list
 names them as `mcp__NAME` or `mcp__NAME__TOOL`. Otherwise each call
-asks first, with an "always" for that tool. An included file cannot
-set `[mcp]`.
+asks first, with an "always" for all of that server's tools. An
+included file cannot set `[mcp]`.
 
 A project's `.mcp.json`, in Claude Code's format, with `${VAR}` and
 `${VAR:-default}` expanded, is read once as a session starts, from its
 folder up to the repository's root. Its servers start only once you
 allow them, for the session or always for that project until their
-definitions change. Your own section of the same name wins.
+definitions change. A call to one may also trust its server in that
+project, from then on, under the same condition. Your own section of
+the same name wins.
 
 A server over HTTP may take a bearer `token` (as `env:NAME`) or
 `header.NAME` values, or want you to sign in with OAuth. Settings, on
