@@ -22,6 +22,7 @@ enum : i32 {
     SLASH_EXPORT,
     SLASH_PLAN,
     SLASH_SIDE,
+    SLASH_WORKTREE,
     SLASH_BACKGROUND,
     SLASH_SHELL,
     SLASH_COUNT,
@@ -43,6 +44,8 @@ static SlashInfo slashinfo[] = {
     {"/plan",    "[off]",   "Plan mode: the agent plans for you to approve before it changes anything"},
     {"/side",    "",        "Start a side chat: a copy of this session to ask about it, "
                             "while its agent works on"},
+    {"/worktree", "[NAME]", "Start a worktree session: a copy of this session that works "
+                            "in a new worktree, on a branch of its own"},
     {"/background", "",     "Let the running command or subagents go on in the background, and the agent with them"},
     {"/shell",   "[NAME]",  "Switch this session's shell, or pick one from a list"},
 };

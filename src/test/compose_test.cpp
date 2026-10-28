@@ -111,7 +111,7 @@ static void test_compose(Test *t)
             putbyte(&b, ' ');
         }
         expect(t, "skill.picks", finish(&b),
-               "/compact /model /rename /fork /export /plan /side /background /shell /pdf /review ");
+               "/compact /model /rename /fork /export /plan /side /worktree /background /shell /pdf /review ");
         p = slashpicks(&a, "/pd", sk);  // not /plan
         expect(t, "skill.pick", istr(&a, p.len), "1");
         expect(t, "skill.pickdesc", slashpickinfo(&a, p[0], sk).desc, "Read PDFs");

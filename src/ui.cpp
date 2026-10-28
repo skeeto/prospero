@@ -632,8 +632,9 @@ static Str livelabel(View *v, i32 state)
     if (v && v->busy && state==LIVE_IDLE) {
         return "working";
     }
-    return state==LIVE_TASK ? Str("subagents") :
-           state==LIVE_MCP  ? Str("starting MCP servers") : livenames[state];
+    return state==LIVE_TASK     ? Str("subagents") :
+           state==LIVE_MCP      ? Str("starting MCP servers") :
+           state==LIVE_WORKTREE ? Str("making the worktree") : livenames[state];
 }
 
 // A whole number with thousands separated: 12,345.
@@ -3521,8 +3522,32 @@ static Str sidewhy(Gui *g, GuiSession *s)
     return sesswhy(g, s, "side", 0, 1);
 }
 
+// Why a session cannot have a worktree session now, or empty if it
+// can: as for a side chat, and it has a folder, a repository's.
+static Str wtwhy(Gui *g, GuiSession *s)
+{
+    Str why = sidewhy(g, s);
+    if (why.len) {
+        return why;
+    } else if (sessnofolder(s)) {
+        return "A session of no folder has no repository to make a worktree of";
+    } else if (!hostcap(s->host, "worktree")) {
+        return "This host's engine is too old for worktree sessions: update the engine";
+    }
+    return {};
+}
+
+// The worktree session dialog (drawwt), for s, its draft the quote.
+static void wtdialog(Gui *g, GuiSession *s, Str quote)
+{
+    g->wtsess  = s;
+    g->wtquote = quote.len ? clone(&g->perm, quote) : Str{};
+    g->openwt  = 1;
+}
+
 // The transcript's menu's side chat: a copy of the whole session, at
-// work or not, the selection quoted in its box (sidequote).
+// work or not, the selection quoted in its box (sidequote). And the
+// same in a worktree of its own.
 static void sideitem(Gui *g, View *v, b32 sep)
 {
     GuiSession *s   = g->sess;
@@ -3539,6 +3564,15 @@ static void sideitem(Gui *g, View *v, b32 sep)
             ? "A new session of this conversation, to ask about it while its agent works on"
             : "A new session of this conversation, to ask about it while its agent "
               "works on, the selection quoted in its box");
+    }
+    Str wwhy = wtwhy(g, s);
+    if (menuitem(g, a, "Start a worktree session\xe2\x80\xa6", wwhy, 0)) {
+        wtdialog(g, s, sidequote(&a, copysel(v, &a, COPY_MARKDOWN)));
+    }
+    if (!wwhy.len) {
+        ImGui::SetItemTooltip("A new session of this conversation that works in a new "
+                              "worktree, on a branch of its own from this folder's HEAD, "
+                              "while this one works on");
     }
 }
 
@@ -4500,6 +4534,20 @@ static void runslash(Gui *g, GuiSession *s, Slash sl, Str text)
             guiside(g, s, {});
         }
         break;
+    case SLASH_WORKTREE: {
+        Str why = wtwhy(g, s);
+        if (why.len) {
+            setnote(g, s, concat(&g->frame, "/worktree: ", why), 1);
+            return;
+        } else if (!sl.arg.len) {
+            draftput(g, s, "");
+            drafttyped(&s->dclock, g->sched.now);
+            wtdialog(g, s, {});
+            return;
+        }
+        sent = 1;
+        guiworktree(g, s, sl.arg, {});
+    } break;
     case SLASH_EXPORT:
         // As the Session menu's Export does: Markdown's options first
         draftput(g, s, "");
@@ -5629,6 +5677,12 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
         guiside(g, s, {});
     }
     older |= !hostcap(h, "side");
+    if (menutip(g, &a, "Start a worktree session\xe2\x80\xa6", wtwhy(g, s),
+                "A fork that works in a new worktree, on a branch of its own, even "
+                "while this session's agent works")) {
+        wtdialog(g, s, {});
+    }
+    older |= !hostcap(h, "worktree");
     why = sesswhy(g, s, "model", 1, 0);
     older |= !hostcap(h, "model");
     sub = ImGui::BeginMenu("Switch model", !why.len);
@@ -6044,6 +6098,13 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
         Buf tip(&a, 256);
         print(&tip, cwd);
+        if (s->wtname.len) {
+            print(&tip, "\nIn worktree ");
+            print(&tip, s->wtname);
+            print(&tip, ", on ");
+            print(&tip, s->wtbranch);
+            print(&tip, s->wtgone ? Str(" (removed: made again as it is opened)") : Str{});
+        }
         putbyte(&tip, '\n');
         print(&tip, s->sid);
         if (sessremote(s) && !sessup(g, s)) {
@@ -7456,6 +7517,123 @@ static void drawnewmodel(Gui *g, Arena a, GuiHost *host)
 // earlier sessions, and a model, by default the configured one. For an
 // import, it says what is imported, filled from it (importfill), and
 // lists only the hosts that can import.
+// A worktree's name, prefilled with the probe's suggestion, and below it
+// what it starts from, as the probe of cwd on host says: the base, and
+// the uncommitted changes that stay behind. Whether the probe allows it.
+static b32 wtfields(Gui *g, Arena a, GuiHost *host, Str cwd)
+{
+    WtProbe *p    = &g->wtp;
+    b32      have = p->got && p->h==host && p->cwd==cwd;
+    ImGui::TextUnformatted("Name");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1);
+    if (g->wtfill) {
+        // A field with the keyboard shows its own copy: the suggestion
+        // replaces it, all selected, to be typed over
+        ImGuiInputTextState *st = ImGui::GetInputTextState(ImGui::GetID("##wtname"));
+        if (st) {
+            st->ReloadUserBufAndSelectAll();
+        }
+        g->wtfill = 0;
+    }
+    if (ImGui::InputText("##wtname", g->wtname, FIELD_MAX)) {
+        g->wtnamed = g->wtname[0] != 0;
+    }
+    itemnamed(g, "worktree name");
+    ImGui::SetItemTooltip("Its folder's name in .prospero/worktrees, and its branch's after "
+                          "the prefix: lowercase letters, digits and single hyphens");
+    if (!have) {
+        ImGui::TextDisabled("Looking at the folder\xe2\x80\xa6");
+        return 1;
+    } else if (!p->ok) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextWrapped("No worktree here: %s", cstr0(&a, p->why));
+        ImGui::PopStyleColor();
+        return 0;
+    }
+    Str field = trim({(u8 *)g->wtname, (iz)__builtin_strlen(g->wtname)});
+    Buf b(&a, 512);
+    print(&b, "Branch ");
+    print(&b, p->prefix);
+    print(&b, field.len ? field : Str("NAME"));
+    print(&b, ", from ");
+    if (p->branch.len) {
+        print(&b, p->branch);
+        print(&b, " at ");
+    }
+    print(&b, takehead(p->oid, 7));
+    if (p->dirty > 0) {
+        print(&b, " \xc2\xb7 ");
+        print(&b, p->dirty);
+        print(&b, p->dirty==1 ? Str(" uncommitted change stays") : Str(" uncommitted changes stay"));
+        print(&b, " in the folder");
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, g->pal->paneldim);
+    ImGui::TextWrapped("%s", cstr0(&a, finish(&b)));
+    ImGui::PopStyleColor();
+    return 1;
+}
+
+// A worktree session of g->wtsess (fork {side, worktree}): its name, and
+// what it starts from.
+static void drawwt(Gui *g)
+{
+    f32         sc   = g->scale;
+    char const *name = "Start a worktree session";
+    if (g->openwt) {
+        ImGui::OpenPopup(name);
+        g->openwt     = 0;
+        g->wtname[0]  = 0;
+        g->wtnamed    = 0;
+        g->wtp.cwd    = {};  // probed anew, for a fresh name
+    }
+    ImGui::SetNextWindowSize(v2(520*sc, 0));
+    if (!ImGui::BeginPopupModal(name, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    Arena       a     = g->frame;
+    b32         enter = modalenter();
+    GuiSession *s     = g->wtsess;
+    Str         why   = s && !s->gone ? wtwhy(g, s) : Str("The session is gone");
+    if (why.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextWrapped("%s", cstr0(&a, why));
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->paneldim);
+        ImGui::TextWrapped("A copy of \"%s\" that works in a new worktree, on a branch of its "
+                           "own, while this session works on",
+                           cstr0(&a, shorten(&a, sesstitle(s), 60)));
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+    Str cwd = s ? (s->view && s->view->cwd.len ? s->view->cwd : s->cwd) : Str{};
+    if (!why.len) {
+        guiwtprobe(g, s->host, cwd);
+    }
+    if (ImGui::IsWindowAppearing()) {
+        ImGui::SetKeyboardFocusHere();
+    }
+    b32 ok = !why.len && wtfields(g, a, s ? s->host : g->main, cwd);
+    ImGui::Spacing();
+    ImGui::BeginDisabled(!ok);
+    b32 start = ImGui::Button("Start", v2(120*sc, 0)) || (ok && enter);
+    ImGui::EndDisabled();
+    itemnamed(g, "worktree start");
+    if (start) {
+        Str field = trim({(u8 *)g->wtname, (iz)__builtin_strlen(g->wtname)});
+        guiworktree(g, s, field, g->wtquote);
+        g->wtquote = {};
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", v2(120*sc, 0)) || modalkey(ImGuiKey_Escape)) {
+        g->wtquote = {};
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 static void drawnew(Gui *g)
 {
     f32         sc     = g->scale;
@@ -7467,6 +7645,12 @@ static void drawnew(Gui *g)
         g->newplan = 0;
         g->newnofolder = 0;
         g->newrole = {};
+        if (!g->newerr.len) {
+            g->newwt     = 0;  // as it was, should the engine have refused it
+            g->wtname[0] = 0;
+            g->wtnamed   = 0;
+        }
+        g->wtp.cwd = {};  // probed anew
         g->newlisted = 0;  // its host's models asked for anew
         g->newcheck  = !import;
         g->pc.shown = g->pc.refocus = 0;
@@ -7598,6 +7782,33 @@ static void drawnew(Gui *g)
     }
     ImGui::EndDisabled();
 
+    // Or in a new worktree of its repository (worktree.cpp)
+    b32 canwt  = !import && hostcap(host, "worktree");
+    b32 wt     = canwt && g->newwt && !nofolder;
+    b32 wtok   = 1;
+    Str wtname = {};
+    if (canwt) {
+        ImGui::Spacing();
+        ImGui::BeginDisabled(nofolder);
+        b32 off = 0;
+        checkbox("New worktree", nofolder ? &off : &g->newwt);
+        ImGui::EndDisabled();
+        itemnamed(g, "new worktree");
+        whytip(nofolder ? Str("Not with No folder: a worktree is of a folder's repository")
+                        : Str("The session works in a new git worktree of the folder's "
+                              "repository, on a branch of its own from the folder's HEAD. "
+                              "Archived, it is removed, if git calls it clean"));
+        if (wt) {
+            Str cwd = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
+            cwd     = hostwsl(g, host) ? wslpath(&a, cwd) : cwd;
+            guiwtprobe(g, host, cwd);
+            ImGui::Indent();
+            wtok   = wtfields(g, a, host, cwd);
+            wtname = trim({(u8 *)g->wtname, (iz)__builtin_strlen(g->wtname)});
+            ImGui::Unindent();
+        }
+    }
+
     ImGui::Spacing();
     ImGui::TextUnformatted("Model");
     if (g->newlisted!=host && hostlist(g, host)) {
@@ -7663,7 +7874,9 @@ static void drawnew(Gui *g)
     }
 
     ImGui::Spacing();
-    b32 create = ImGui::Button(import ? "Import" : "Create", v2(120*sc, 0)) || enter;
+    ImGui::BeginDisabled(!wtok);
+    b32 create = ImGui::Button(import ? "Import" : "Create", v2(120*sc, 0)) || (wtok && enter);
+    ImGui::EndDisabled();
     itemrect(g, RECT_NEWCREATE);
     if (create) {
         Str cwd   = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
@@ -7676,7 +7889,7 @@ static void drawnew(Gui *g)
             importbegin(g, host, cwd, ep, model, nofolder);
         } else {
             guinew(g, host, cwd, ep, model, hasrole ? g->newrole : Str{},
-                   plan && g->newplan && !hasrole, nofolder);
+                   plan && g->newplan && !hasrole, nofolder, wt, wtname);
         }
         ImGui::CloseCurrentPopup();
     }
@@ -10581,6 +10794,7 @@ static void drawdialogs(Gui *g)
         ImGui::EndPopup();
     }
     drawnew(g);
+    drawwt(g);
     drawclose(g);
     drawsessdialogs(g);
     drawlayoutdialogs(g);

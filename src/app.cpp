@@ -508,6 +508,9 @@ struct GuiSession {
     Str          parent;    // a subagent's, from the list until opened
     b32          remote;    // and that parent is on another host
     Str          sideof;    // a side chat's original, from the list until opened
+    Str          wtname;    // its worktree's name, from the list, else null
+    Str          wtbranch;  // and branch
+    b32          wtgone;    // and it is not there now, removed
     i64          mtime;
     i64          jobs;      // running background jobs, from the list
     i64          openid;    // the open in flight, 0 if none
@@ -711,6 +714,25 @@ struct Changes {
     i64              ms;     // how long git took
     Arena            mem;
     byte            *base;
+};
+
+// A folder probed for a worktree session (guiwtprobe): whether one can
+// start there, from what, and a name the engine suggests.
+struct WtProbe {
+    Arena    mem;
+    byte    *base;
+    i64      id;      // the probe in flight, else 0
+    GuiHost *h;       // asked of
+    Str      cwd;     // for, as typed
+    b32      got;     // answered
+    b32      ok;      // a worktree session can start there
+    Str      why;     // else why not
+    Str      main;    // the main checkout
+    Str      prefix;  // its branches' prefix
+    Str      name;    // a free name
+    Str      branch;  // the branch it would be cut from, null if detached
+    Str      oid;     // the commit
+    i64      dirty;   // uncommitted changes left behind, -1 unknown
 };
 
 // One setting in the settings window, from config.get.
@@ -1217,6 +1239,14 @@ struct Gui {
     b32                opennew;
     b32                newplan;    // in plan mode
     b32                newnofolder;// in a folder of its own, not newcwd
+    b32                newwt;      // in a new worktree of newcwd's repository
+    char              *wtname;     // the worktree's name, in either dialog
+    b32                wtnamed;    // typed, so a probe's suggestion stays out
+    b32                wtfill;     // a suggestion just put in wtname
+    WtProbe            wtp;        // the folder's, for either dialog
+    GuiSession        *wtsess;     // the worktree session dialog's original
+    Str                wtquote;    // and the draft it gets
+    b32                openwt;
     Str                newrole;    // in this role, if any
     PathComp           pc;         // newcwd's completion
     i64                newid;      // the new command in flight
@@ -3081,7 +3111,7 @@ static void imgdrop(Gui *g, GuiSession *s)
 // role, whose own may differ, the defaults the host's endpoints listed
 // go along, which the engine would pick alike, given those listings.
 static void guinew(Gui *g, GuiHost *h, Str cwd, Str endpoint, Str model, Str role = {},
-                   b32 plan = 0, b32 nofolder = 0)
+                   b32 plan = 0, b32 nofolder = 0, b32 wt = 0, Str wtname = {})
 {
     if (!endpoint.len && !model.len && !role.len && h->listgot) {
         endpoint = h->epdflt;
@@ -3111,6 +3141,12 @@ static void guinew(Gui *g, GuiHost *h, Str cwd, Str endpoint, Str model, Str rol
     if (plan) {
         putkey(&w.json, "plan");
         putint(&w.json, 1);
+    }
+    if (wt && !nofolder) {
+        putkey(&w.json, "worktree");
+        putobject(&w.json);
+        if (wtname.len) putstrkey(&w.json, "name", wtname);
+        putend(&w.json);
     }
     putkey(&w.json, "attended");
     putint(&w.json, 1);
@@ -3393,6 +3429,130 @@ static void guiside(Gui *g, GuiSession *s, Str quote)
     s->cmdtext = {};
     s->note    = {};
     cmdsend(g, &w, a);
+}
+
+static b32  hostready(Gui *, GuiHost *);
+static void fieldput(char *, Str);
+static void setnote(Gui *, GuiSession *, Str, b32);
+
+// A worktree session of a session, busy or not (fork {side:1,
+// worktree}): a side chat that works in a new worktree, on a branch cut
+// from its original's HEAD, named so, else as the engine picks. Shown
+// once made, idle, with the quote, if any, as its draft (onsesscmd).
+static void guiworktree(Gui *g, GuiSession *s, Str name, Str quote)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + name.len);
+    EvOut w = cmdopen(g, &b, CMD_FORK, s);
+    putintkey(&w.json, "side", 1);
+    putkey(&w.json, "worktree");
+    putobject(&w.json);
+    if (name.len) putstrkey(&w.json, "name", name);
+    putend(&w.json);
+    for (i32 i = 0; quote.len && i<REQ_MAX; i++) {
+        if (g->reqs[i].id == g->nextid) {
+            g->reqs[i].quote = clone(&g->perm, quote);
+        }
+    }
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
+    cmdsend(g, &w, a);
+}
+
+// The worktree dialogs' folder, probed (git {cwd, status} with no sid):
+// whether a worktree session can start there, from what, with how many
+// uncommitted changes left behind, and a free name. One probe at a time:
+// one for a folder since typed goes once the last is answered.
+static void guiwtprobe(Gui *g, GuiHost *h, Str cwd)
+{
+    WtProbe *p = &g->wtp;
+    if (p->id || !cwd.len || !hostcap(h, "worktree") || !hostready(g, h) ||
+            (p->h==h && p->cwd==cwd)) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + cwd.len);
+    EvOut w = cmdopen(g, &b, CMD_GIT, 0, h);
+    putstrkey(&w.json, "cwd", cwd);
+    putintkey(&w.json, "status", 1);
+    p->id  = g->nextid;
+    p->h   = h;
+    p->cwd = clone(&g->perm, cwd);
+    p->got = 0;
+    cmdsend(g, &w, a);
+}
+
+// A probe's answer, kept in its own small arena, and a name suggested
+// unless one was typed.
+static void onwtprobe(Gui *g, Json *j, b32 ok, Str err)
+{
+    WtProbe *p = &g->wtp;
+    if (!p->base) {
+        p->mem  = newarena(os_reserve(g->os, 1<<16));
+        p->base = p->mem.beg;
+    }
+    p->mem.beg = p->base;
+    Arena *m   = &p->mem;
+    Json  *wt  = jsonget(j, "worktree");
+    Json  *st  = jsonget(j, "status");
+    p->id     = 0;
+    p->got    = 1;
+    p->ok     = ok && jsonint(jsonget(wt, "ok"), 0)==1;
+    p->why    = clone(m, ok ? jsonstr(jsonget(wt, "why")) : err);
+    p->main   = clone(m, jsonstr(jsonget(wt, "main")));
+    p->prefix = clone(m, jsonstr(jsonget(wt, "prefix")));
+    p->name   = clone(m, jsonstr(jsonget(wt, "name")));
+    p->branch = clone(m, jsonstr(jsonget(wt, "base")));
+    p->oid    = clone(m, jsonstr(jsonget(wt, "oid")));
+    p->dirty  = jsonint(jsonget(st, "ok"), 0) ? jsonint(jsonget(st, "count"), 0) : -1;
+    if (!g->wtnamed && p->name.len) {
+        fieldput(g->wtname, p->name);
+        g->wtfill = 1;  // into the field, should it have the keyboard
+    }
+    scheddirty(&g->sched);
+}
+
+// A worktree made, removed or kept (EV_WORKTREE), told in a note: on its
+// session if shown, else on the session shown, as one archived or deleted
+// is not.
+static void onworktree(Gui *g, GuiHost *h, Arena a, Json *j)
+{
+    Str did    = jsonstr(jsonget(j, "did"));
+    Str why    = jsonstr(jsonget(j, "why"));
+    Str err    = jsonstr(jsonget(j, "err"));
+    Str branch = jsonstr(jsonget(j, "branch"));
+    Str name   = basename(jsonstr(jsonget(j, "path")));
+    GuiSession *s = findsess(g, h, jsonstr(jsonget(j, "session")));
+    s = s && s==g->sess ? s : g->sess && g->sess->host==h ? g->sess : s;
+    h->relist = 1;
+    if (!s || did=="made") {
+        return;  // the session bar's state said so
+    }
+    Buf b(&a, 256 + name.len + err.len);
+    b32 bad = 0;
+    print(&b, "worktree ");
+    print(&b, name);
+    if (did == "failed") {
+        print(&b, " could not be made: ");
+        print(&b, err);
+        bad = 1;
+    } else if (did == "removed") {
+        print(&b, " removed");
+        print(&b, branch=="deleted"   ? Str(", its branch deleted, as merged") :
+                  branch=="unmerged"  ? Str(", its branch kept, as not merged") :
+                  branch=="elsewhere" ? Str(", its branch kept, checked out elsewhere")
+                                      : Str{});
+    } else {
+        print(&b, " kept: ");
+        print(&b, why=="dirty"      ? Str("it has uncommitted changes") :
+                  why=="submodules" ? Str("it has submodules") :
+                  why=="locked"     ? Str("git has it locked") :
+                  why=="in use"     ? Str("its files are in use") :
+                  err.len           ? err : Str("git would not remove it"));
+        bad = 1;
+    }
+    setnote(g, s, finish(&b), bad);
 }
 
 static void guianswer(Gui *g, GuiSession *s, Str req, Str decision, Str note)
@@ -3769,6 +3929,12 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         s->sideof = s->sideof==sideof ? s->sideof : clone(&g->perm, sideof);
         s->cwd    = s->cwd==cwd       ? s->cwd    : clone(&g->perm, cwd);
         s->nofolder = jsonint(jsonget(e, "nofolder"), 0) == 1;
+        Json *wt    = jsonget(e, "worktree");
+        Str   wname = jsonstr(jsonget(wt, "name"));
+        Str   wbr   = jsonstr(jsonget(wt, "branch"));
+        s->wtname   = s->wtname==wname  ? s->wtname   : clone(&g->perm, wname);
+        s->wtbranch = s->wtbranch==wbr  ? s->wtbranch : clone(&g->perm, wbr);
+        s->wtgone   = jsonint(jsonget(wt, "gone"), 0) != 0;
         s->model  = s->model==model   ? s->model  : clone(&g->perm, model);
         s->parent = s->parent==parent ? s->parent : clone(&g->perm, parent);
         s->remote = jsonint(jsonget(e, "remote"), 0) == 1;
@@ -4347,8 +4513,18 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
             f->sideof = clone(&g->perm, s->sid);  // until the list says
             setdraft(g, f, q->quote);
             g->promptfocus = 1;
-            Str title = shorten(&scratch, sesstitle(s), 60);
-            setnote(g, f, concat(&scratch, "side chat of ", title), 0);
+            Str  title = shorten(&scratch, sesstitle(s), 60);
+            Json *wt   = jsonget(j, "worktree");
+            if (wt->type == JSON_OBJECT) {
+                Buf nb(&scratch, 256 + title.len);
+                print(&nb, "worktree session of ");
+                print(&nb, title);
+                print(&nb, ", on ");
+                print(&nb, jsonstr(jsonget(wt, "branch")));
+                setnote(g, f, finish(&nb), 0);
+            } else {
+                setnote(g, f, concat(&scratch, "side chat of ", title), 0);
+            }
             guilist(g, h);
             break;
         }
@@ -4529,6 +4705,8 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_GIT:
         if (q.s) {
             ongit(g, q.s, id, j, ok);
+        } else if (id && id==g->wtp.id) {
+            onwtprobe(g, j, ok, err);
         }
         return;
 
@@ -5552,6 +5730,9 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
     case EV_REMOTE:
         onremote(g, h, a, r);
         return 1;
+    case EV_WORKTREE:
+        onworktree(g, h, a, r->root);
+        return 1;
     case EV_OVERFLOW:
         if (!r->sid.len && h->kind==GH_ENGINE) {
             // The engine process lost records, replies among them
@@ -5787,6 +5968,10 @@ static void reissue(Gui *g)
         case CMD_OPEN:      if (q.s && q.s->openid==q.id) guiopen(g, q.s); break;
         case CMD_NEW:       g->newid = 0; break;  // it shows in the list
         case CMD_GIT:
+            if (g->wtp.id == q.id) {
+                g->wtp.id  = 0;  // asked again when wanted
+                g->wtp.cwd = {};
+            }
             g->changes.id = g->changes.id==q.id ? 0 : g->changes.id;
             if (q.s && q.s->git.id==q.id) {
                 q.s->git.id = 0;
@@ -10188,6 +10373,8 @@ enum : i32 {
     CHK_HELPSECTION,  // Help shows the page that begins with text, scrolled
                       // to a section a link named
     CHK_LINKWEB,      // the web link last followed is text
+    CHK_WTPROBE,      // the worktree dialogs' probe allows one, dx changes left
+    CHK_WORKTREE,     // the session shown works in a worktree, on branch text...
     CHK_COUNT,
 };
 
@@ -10437,6 +10624,8 @@ static Str chknames[] = {
     "no frames while idle, the Changes pane shown",
     "a search result showed its setting",
     "Help scrolled to the link's section", "the web link was followed",
+    "the folder can have a worktree, its changes counted",
+    "the session works in its worktree, on its branch",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -10508,6 +10697,8 @@ enum : i32 {
     W_FARSHOWN,   // a session on far is shown, open, its replay applied
     W_TOAST,      // a toast since OP_TOASTMARK
     W_CHANGES,    // the Changes pane shows the session's, a file text among them
+    W_WTPROBE,    // the worktree dialogs' probe answered, a name suggested
+    W_WORKTREE,   // the session shown is on a branch starting with text
 };
 
 static Str waitnames[] = {
@@ -10529,9 +10720,9 @@ static Str waitnames[] = {
     "the named remote to come up", "the named remote to close",
     "the named remote's update", "the MCP server's state", "the MCP sign-in",
     "the subagent on far", "the subagent on far shown", "a toast",
-    "the changes",
+    "the changes", "the folder's probe", "the worktree's branch",
 };
-static_assert(countof(waitnames) == W_CHANGES+1);
+static_assert(countof(waitnames) == W_WORKTREE+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -13449,6 +13640,53 @@ static DriveOp changesops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Changes"},
+    // A worktree session from the new session dialog: the folder's
+    // branch and changes told, a name suggested; made, it works there
+    // on a branch of its own
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXTCWD, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new worktree"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_WTPROBE, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_WTPROBE, 3, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "changes-worktree-new"},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "In the worktree."},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    {OP_WAIT, W_WORKTREE, 0, 0, 10000, "prospero/"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_WORKTREE, 0, 0, 0, "prospero/"},
+    // And one from it, as a side chat in a worktree of its own
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Start a worktree session"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_WAIT, W_WTPROBE, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_WTPROBE, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "changes-worktree-side"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "worktree start"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SIDECHAT, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 0, "In another worktree."},
+    {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
+    {OP_WAIT, W_WORKTREE, 0, 0, 10000, "prospero/"},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_WORKTREE, 0, 0, 0, "prospero/"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
@@ -14930,6 +15168,11 @@ static b32 drivewaitdone(Gui *g)
         }
         return g->sess && c->s==g->sess && !c->id && g->changesshown && has;
     }
+    case W_WTPROBE:
+        return g->wtp.got && !g->wtp.id && g->wtname[0];
+    case W_WORKTREE:
+        return g->sess && g->sess->git.state==GITW_REPO && !g->sess->openid &&
+               startswith(g->sess->git.branch, g->ops[g->drivepc-1].text);
     case W_PLAN: {
         PlanFile *f = &g->plan;
         return g->sess && f->s==g->sess && !f->id && f->ver==v->planver &&
@@ -16634,6 +16877,21 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_NOFOLDERBOX:
         return g->newnofolder && g->cwdoff && ImGui::GetTopMostPopupModal();
+    case CHK_WTPROBE:
+        return ImGui::GetTopMostPopupModal() && g->wtp.got && g->wtp.ok &&
+               g->wtp.dirty==(i64)g->ops[g->drivepc-1].dx && g->wtp.oid.len==40;
+    case CHK_WORKTREE: {
+        // Its folder in the main checkout's .prospero/worktrees, and the
+        // list says so, with the branch's name
+        GuiSession *s    = g->sess;
+        Str         want = g->ops[g->drivepc-1].text;
+        Str         cwd  = v->cwd;
+        b32         in   = find(cwd, "/.prospero/worktrees/")>=0 ||
+                           find(cwd, "\\.prospero\\worktrees\\")>=0;
+        return s && in && s->git.state==GITW_REPO && startswith(s->git.branch, want) &&
+               s->wtbranch==s->git.branch && s->wtname.len &&
+               endswith(s->git.branch, s->wtname);
+    }
     case CHK_PATHPICK: {
         DriveOp *op    = &g->ops[g->drivepc-1];
         Str      first = {(u8 *)g->pc.first, (iz)__builtin_strlen(g->pc.first)};
@@ -18265,6 +18523,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->view       = g->nosession.view;
     g->edbox      = newmailbox(&g->perm, 1<<14, wakegui, os);
     g->newcwd     = alloc<char>(&g->perm, FIELD_MAX);
+    g->wtname     = alloc<char>(&g->perm, FIELD_MAX);
     g->namebuf    = alloc<char>(&g->perm, FIELD_MAX);
     g->layoutbuf  = alloc<char>(&g->perm, FIELD_MAX);
     g->modelbuf   = alloc<char>(&g->perm, FIELD_MAX);
