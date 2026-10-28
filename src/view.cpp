@@ -630,9 +630,9 @@ static b32 msghidden(View *v, ViewMsg *m)
 }
 
 // Whether a tool row folds by its kind and outcome (tools = auto): reads,
-// writes and todo lists fold; once it ends, a failure opens, the start of
-// a background job folds, as the Jobs panel has it, and so does a shell
-// command's output past 24 lines.
+// writes, todo lists and the web tools fold; once it ends, a failure
+// opens, the start of a background job folds, as the Jobs panel has it,
+// and so does a shell command's output past 24 lines.
 static b32 toolauto(ViewMsg *m)
 {
     ViewTool *t = m->tool;
@@ -645,7 +645,8 @@ static b32 toolauto(ViewMsg *m)
             return m->nl > 24;
         }
     }
-    return t->name=="read" || t->name=="write" || t->name=="todo_write";
+    return t->name=="read" || t->name=="write" || t->name=="todo_write" ||
+           t->name=="web_search" || t->name=="web_fetch";
 }
 
 // Whether a tool row folds: as the user chose, else as the session's
@@ -1112,6 +1113,12 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
         Str act = jsonstr(jsonget(j, "action"));
         Str mem = jsonstr(jsonget(j, "name"));
         return oneline(perm, concat(&scratch, act=="forget" ? Str("Forget ") : Str("Save "), mem));
+    } else if (name == "web_search") {
+        Str q = jsonstr(jsonget(j, "query"));
+        return oneline(perm, concat(&scratch, concat(&scratch, "\"", q), "\""));
+    } else if (name == "web_fetch") {
+        Str url = jsonstr(jsonget(j, "url"));
+        return oneline(perm, url.len ? url : args);
     } else if (name=="edit" && patch->type==JSON_STRING) {
         // The files the patch names, as it names them
         Slice<Str> paths = patchpaths(&scratch, patch->str);

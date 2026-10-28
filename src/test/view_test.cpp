@@ -92,6 +92,10 @@ static void test_view(Test *t)
                       "*** Delete File: b.c\\n*** End Patch\"}";
         Arena tmp   = carve(&a, 1<<16);
         expect(t, "view.patch summary", toolsummary(&a, tmp, "edit", patch, "/w"), "a.c, b.c");
+        expect(t, "view.web_search summary", toolsummary(&a, tmp, "web_search",
+               "{\"query\":\"zlib 1.3 release\"}", "/w"), "\"zlib 1.3 release\"");
+        expect(t, "view.web_fetch summary", toolsummary(&a, tmp, "web_fetch",
+               "{\"url\":\"https://zlib.net/\",\"offset\":10}", "/w"), "https://zlib.net/");
         expect(t, "view.patch diff", tooldiff(&a, "edit", patch, "ok"),
                "```diff\n--- a.c\n+++ a.c\n@@ f\n-x\n+y\n--- b.c\n+++ /dev/null\n```\n");
         Str lines = "{\"path\":\"a.c\",\"tag\":\"AB12\",\"edits\":[{\"op\":\"replace\",\"line\":2,"

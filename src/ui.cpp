@@ -1774,9 +1774,11 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
 
     b32 desk   = t->scope == "desktop";
     b32 mcp    = t->scope == "mcp";
+    b32 web    = t->scope == "web";
     b32 always = t->grant.len &&
                  hostcap(s->host, desk ? Str("answer.always.desktop") :
-                                  mcp || proj ? Str("mcp") : Str("answer.always"));
+                                  mcp || proj ? Str("mcp") :
+                                  web ? Str("web") : Str("answer.always"));
     if (always) {
         f32 sp = ImGui::GetStyle().ItemSpacing.x;
         f32 h  = ImGui::GetFrameHeight();
@@ -1796,6 +1798,13 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
             runs[2] = " for this session";
         } else if (proj) {
             runs[0] = "Always for this project";
+        } else if (web && t->grant=="search") {
+            runs[0] = "Always allow web searches";
+        } else if (web) {
+            runs[0] = "Always allow ";
+            runs[1] = t->grant.len<=32 ? t->grant :  // a host
+                      concat(&a, utf8head(t->grant, 31), "\xe2\x80\xa6");
+            runs[2] = "";
         } else if (mcp) {
             // The server's name, or an older engine's tool's own, after
             // mcp__ or mcp__SERVER__, cut if long
@@ -1836,6 +1845,14 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         } else if (proj) {
             ImGui::SetItemTooltip("Start these servers now, and in later sessions here "
                                   "without asking, until the file changes them");
+        } else if (web && t->grant=="search") {
+            ImGui::SetItemTooltip("Allow this, and every web search from now on in this "
+                                  "session and its subagents, without asking: their "
+                                  "queries go to the search service unseen");
+        } else if (web) {
+            ImGui::SetItemTooltip("Allow this, and reading every page of %s from now on "
+                                  "in this session and its subagents, without asking",
+                                  cstr0(&a, t->grant));
         } else if (mcp && find(cuthead(t->grant, 5), "__")<0) {
             ImGui::SetItemTooltip("Allow this, and every call to a tool of %s from now on "
                                   "in this session and its subagents, without asking",
