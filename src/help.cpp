@@ -230,6 +230,119 @@ static Str helpsection(Arena *a, i32 page, Str section)
     return {};
 }
 
+// A section of Help that a search found: a page's opening (empty head)
+// or one of its headings, with the first line of its text that matched.
+struct HelpHit {
+    i32 page;
+    Str head;     // the heading, as helpsection gives it, empty for the top
+    Str snippet;  // a line of it with a word searched for, if any
+    i32 rank;     // 1 best
+};
+
+// How well a section matches each word of query, 1 best: a heading
+// starting with a word, else having it, else its page's title having
+// it, else its text. 0 if a word is in none of them.
+static i32 helprank(Str head, Str title, Str body, Str query)
+{
+    i32 rank = 0;
+    for (Str rest = query; rest.len;) {
+        Cut c = cut(trimleft(rest), ' ');
+        Str w = trim(c.head);
+        rest  = c.tail;
+        if (!w.len) {
+            continue;
+        }
+        iz  at = findfold(head, w);
+        i32 r  = at==0 ? 1 : at>0 ? 2 : findfold(title, w)>=0 ? 3 :
+                 findfold(body, w)>=0 ? 4 : 0;
+        if (!r) {
+            return 0;
+        }
+        rank = r>rank ? r : rank;
+    }
+    return rank;
+}
+
+// The first line of body with the most words of query, its list marker
+// dropped, or empty if none has one. Headings are not lines of it.
+static Str helpsnippet(Str body, Str query)
+{
+    Str best  = {};
+    i32 count = 0;
+    for (Str rest = body; rest.len;) {
+        Cut c    = cut(rest, '\n');
+        Str line = trim(c.head);
+        rest = c.tail;
+        if (!line.len || line[0]=='#') {
+            continue;
+        }
+        i32 n = 0;
+        for (Str q = query; q.len;) {
+            Cut qc = cut(trimleft(q), ' ');
+            Str w  = trim(qc.head);
+            q = qc.tail;
+            n += w.len && findfold(line, w)>=0;
+        }
+        if (n > count) {
+            best  = line;
+            count = n;
+        }
+    }
+    if (startswith(best, "- ") || startswith(best, "* ")) {
+        best = trimleft(cuthead(best, 2));
+    }
+    return best;
+}
+
+static b32 hitbefore(HelpHit *a, HelpHit *b)
+{
+    return a->rank < b->rank;
+}
+
+// The sections of every page that have each word of query, whatever its
+// case, best first and in the pages' order within a rank, at most max.
+static Slice<HelpHit> helpsearch(Arena *a, Str query, iz max)
+{
+    Slice<HelpHit> r = {};
+    query = trim(query);
+    if (!query.len) {
+        return r;
+    }
+    for (i32 p = 0; p < HELP_COUNT; p++) {
+        Str             md    = helptext(p);
+        Str             title = helptitle(p);
+        Slice<HelpHead> heads = helpheads(a, md);
+        // The opening, to the first heading under the title, then each
+        // heading to the next
+        iz start = 0;
+        Str head = {};
+        for (iz i = 0; i <= heads.len; i++) {
+            if (i<heads.len && heads[i].level==1) {
+                start = heads[i].off;
+                continue;
+            }
+            iz  end  = i<heads.len ? heads[i].off : md.len;
+            Str body = {md.data+start, end-start};
+            i32 rank = helprank(head, title, body, query);
+            if (rank) {
+                HelpHit h = {};
+                h.page    = p;
+                h.head    = head;
+                h.snippet = helpsnippet(body, query);
+                h.rank    = rank;
+                r = push(a, r, h);
+            }
+            if (i < heads.len) {
+                start = heads[i].off;
+                head  = heads[i].text;
+            }
+        }
+    }
+    sort(r.data, r.len, hitbefore, *a);
+    r.len = r.len<max ? r.len : max;
+    return r;
+}
+
 // The panes a view: link shows, in the order of app.cpp's PANE_*.
 static Str viewnames[] = {
     "sessions", "transcript", "prompt", "todo", "plan", "changes", "jobs", "log",

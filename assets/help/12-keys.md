@@ -9,7 +9,8 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
   keyboard.
 - **Ctrl+Shift+N**: New session, no folder, with the default model:
   no dialog, straight to its prompt box.
-- **Ctrl+F**: find in the transcript.
+- **Ctrl+F**: find in the transcript. In Help or Settings, while it has
+  the focus, its search field instead.
 - **Ctrl+Shift+T**: open, or fold again, all of the session's tool
   output (the Tool output button above the transcript).
 - **Ctrl+Shift+R**: show, or fold again, all of its reasoning (the

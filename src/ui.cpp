@@ -9579,11 +9579,78 @@ static void drawhelp(Gui *g)
         g->helpsect         = {};
     }
 
+    // The search: Ctrl+F (Cmd+F) to it while Help has the focus, as in
+    // Settings; Escape or its X empties it, Enter takes the best hit
+    if (ImGui::Shortcut(ImGuiMod_Ctrl|ImGuiKey_F)) {
+        g->helpfindkey = 1;
+    }
+    if (g->helpfindkey) {
+        ImGui::SetKeyboardFocusHere();
+        g->helpfindkey = 0;
+    }
+    ImGui::SetNextItemWidth(-1);
+    ImGui::SetNextItemAllowOverlap();
+    b32 enter = ImGui::InputTextWithHint("##helpfind", "Search help", g->helpfind, FIELD_MAX,
+                                         ImGuiInputTextFlags_EnterReturnsTrue|
+                                         ImGuiInputTextFlags_EscapeClearsAll);
+    itemnamed(g, "help search");
+    if (*g->helpfind) {
+        ImVec2 mx = ImGui::GetItemRectMax();
+        ImVec2 mn = ImGui::GetItemRectMin();
+        f32    fs = ImGui::GetFontSize();
+        ImVec2 at = v2(mx.x - st.FramePadding.x - fs, mn.y + (mx.y - mn.y - fs)/2);
+        if (ImGui::CloseButton(ImGui::GetID("##helpclear"), at)) {
+            *g->helpfind   = 0;
+            g->helpfindkey = 1;
+        }
+        ImGui::SetItemTooltip("Clear the search");
+        namedrect(g, "help search clear", at, v2(at.x+fs, at.y+fs));
+    }
+    Str            query = trim({(u8 *)g->helpfind, (iz)__builtin_strlen(g->helpfind)});
+    Slice<HelpHit> hits  = helpsearch(&a, query, 50);
+    i32            hit   = enter && hits.len ? 0 : -1;
+
     i32 pick = -1;
     f32 w    = ImGui::GetContentRegionAvail().x;
     g->helpnarrow = w < 40*ImGui::GetFontSize();
     g->helpframe  = g->total.frames;
-    if (!g->helpnarrow) {
+    if (query.len) {
+        // The hits in place of the topics: beside the page, or above it
+        // in a narrow pane, each its heading and a line that matched
+        f32    fs   = ImGui::GetFontSize();
+        ImVec2 size = g->helpnarrow ? v2(0, 10*ImGui::GetTextLineHeightWithSpacing())
+                                    : v2(w*0.4f < 22*fs ? w*0.4f : 22*fs, 0);
+        if (ImGui::BeginChild("##hits", size, ImGuiChildFlags_Borders)) {
+            if (!hits.len) {
+                ImGui::TextDisabled("No matches");
+            }
+            for (iz i = 0; i < hits.len; i++) {
+                HelpHit *h     = &hits[i];
+                Str      title = helptitle(h->page);
+                Str      label = h->head.len ? h->head : title;
+                Str      more  = h->head.len ? title : Str{};
+                if (h->snippet.len) {
+                    more = more.len ? concat(&a, concat(&a, more, " \xc2\xb7 "), h->snippet)
+                                    : h->snippet;
+                }
+                ImGui::PushID((i32)i);
+                if (ImGui::Selectable(cstr0(&a, label))) {
+                    hit = (i32)i;
+                }
+                itemnamed(g, concat(&a, "help hit ", label));
+                if (more.len) {
+                    ImGui::Indent();
+                    ImGui::TextDisabled("%s", cstr0(&a, more));
+                    ImGui::Unindent();
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndChild();
+        if (!g->helpnarrow) {
+            ImGui::SameLine();
+        }
+    } else if (!g->helpnarrow) {
         f32 lw = 0;
         for (i32 i = 0; i < HELP_COUNT; i++) {
             Str t = helptitle(i);
@@ -9622,6 +9689,18 @@ static void drawhelp(Gui *g)
     Str link = drawdoc(g, g->helpdoc, "##helppage");
     itemnamed(g, "help text");
     helppick(g, pick);
+    if (hit >= 0) {
+        // Its page, at its heading, or from the top for a page's opening;
+        // the search stays, for the next hit
+        HelpHit *h = &hits[hit];
+        if (h->head.len) {
+            g->helpsect = clone(&g->perm, h->head);
+        } else if (h->page == cur) {
+            g->helpdoc->scrollto = 0;
+        }
+        helppick(g, h->page);
+        scheddirty(&g->sched);
+    }
     if (link.len) {
         followlink(g, link);
     }

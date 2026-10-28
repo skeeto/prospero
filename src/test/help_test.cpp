@@ -93,4 +93,50 @@ static void test_help(Test *t)
     expect(t, "help.at.in", doclinkat(d, 6), "help:plan");
     expect(t, "help.at.out", doclinkat(d, 0), "");
     expect(t, "help.at.after", doclinkat(d, 24), "");
+
+    // The search: a heading first, its section's line; every word, any
+    // case; a page's opening by its title; nothing for nonsense
+    {
+        Slice<HelpHit> h = helpsearch(&a, "  approving  ", 50);
+        expect(t, "help.find.head", h.len ? h[0].head : Str("none"), "Approving");
+        expect(t, "help.find.page", istr(&a, h.len ? h[0].page : -1), istr(&a, HELP_PLAN));
+        expect(t, "help.find.rank", istr(&a, h.len ? h[0].rank : 0), "1");
+
+        h = helpsearch(&a, "APPROVE PLAN keep", 50);
+        b32 all = h.len > 0;
+        for (iz i = 0; i < h.len; i++) {
+            Str s = helptext(h[i].page);
+            all &= findfold(s, "approve")>=0 && findfold(s, "keep")>=0;
+        }
+        expect(t, "help.find.words", istr(&a, all), "1");
+        b32 card = 0;
+        for (iz i = 0; i < h.len; i++) {
+            card |= h[i].page==HELP_PLAN && h[i].head=="Approving" &&
+                    findfold(h[i].snippet, "approve")>=0;
+        }
+        expect(t, "help.find.snippet", istr(&a, card), "1");
+
+        h = helpsearch(&a, "keyboard", 50);
+        b32 top = 0;
+        for (iz i = 0; i < h.len; i++) {
+            top |= h[i].page==HELP_KEYS && !h[i].head.len && h[i].rank==3;
+        }
+        expect(t, "help.find.title", istr(&a, top), "1");
+
+        h = helpsearch(&a, "zqxjv", 50);
+        expect(t, "help.find.none", istr(&a, h.len), "0");
+        h = helpsearch(&a, "   ", 50);
+        expect(t, "help.find.empty", istr(&a, h.len), "0");
+        h = helpsearch(&a, "the", 3);
+        expect(t, "help.find.max", istr(&a, h.len), "3");
+
+        // Ranked, best first, the pages in order within a rank
+        h = helpsearch(&a, "session", 50);
+        b32 order = 1;
+        for (iz i = 1; i < h.len; i++) {
+            order &= h[i-1].rank<h[i].rank ||
+                     (h[i-1].rank==h[i].rank && h[i-1].page<=h[i].page);
+        }
+        expect(t, "help.find.order", istr(&a, order), "1");
+    }
 }

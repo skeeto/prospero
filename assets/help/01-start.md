@@ -2,6 +2,11 @@
 
 **Close any pane you do not need, this one too: the View menu shows each again, and Reset layout puts them all back.**
 
+The field above these topics searches every page: type words, and the
+sections that have them all take the topics' place, headings that
+match first. Click one to go there, or press Enter for the first.
+Escape, or the X, brings the topics back.
+
 Prospero is a coding harness. A language model, the agent, works on
 code through tools: it reads, writes and edits files, runs commands,
 searches, keeps a todo list, starts background jobs and subagents. The

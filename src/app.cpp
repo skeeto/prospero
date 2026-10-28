@@ -1205,6 +1205,8 @@ struct Gui {
     b32                helpnarrow; // its topics were a combo, not a list
     i64                helpframe;  // the frame they were last drawn in
     Str                helpsect;   // a section a link asked for, to scroll to
+    char              *helpfind;   // Help's search, FIELD_MAX
+    b32                helpfindkey;// put the keyboard there (Ctrl+F)
     u64                linkpress;  // the transcript's link pressed (hash), 0 if none
     i32                linkmsg;    // in this message
     Str                linkopened; // a web link followed under the checklist
@@ -11598,6 +11600,24 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Getting started\n\n**Close any pane"},
     {OP_SHOT, 0, 0, 0, 300, "help-wide"},
+    // The search: its hits in place of the topics, one clicked going to
+    // its page at its heading; the X empties it, the topics back
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help search"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_TEXT, 0, 0, 0, 500, "includes"},
+    {OP_SHOT, 0, 0, 0, 300, "help-search"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help hit Includes"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_HELPSECTION, 0, 0, 0, "# Configuration\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help search clear"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "help topic Getting started"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_HELPPAGE, 0, 0, 0, "# Getting started\n\n**Close any pane"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "help text"},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 300, ""},
@@ -17890,6 +17910,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->addname    = alloc<char>(&g->perm, FIELD_MAX);
     g->cfgpbuf    = alloc<u8>(&g->perm, FIELD_MAX);
     g->cfgfind    = alloc<char>(&g->perm, FIELD_MAX);
+    g->helpfind   = alloc<char>(&g->perm, FIELD_MAX);
     g->cfgfbuf    = alloc<u8>(&g->perm, 3*FIELD_MAX);
     g->tplname    = alloc<char>(&g->perm, FIELD_MAX);
     g->tplval     = alloc<char>(&g->perm, FIELD_MAX);
