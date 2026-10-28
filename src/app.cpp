@@ -235,6 +235,7 @@ enum : i32 {
     RECT_GAUGE,      // the context gauge
     RECT_PAGECOMBO,  // its pages as a combo, when narrow
     RECT_DIAGPAGE,   // its Diagnostics page in the list
+    RECT_CFGFIND,    // its search field
     RECT_ADDOPEN,    // its Add for each named kind, in order: endpoint,
     RECT_ADDOPEN1,   // model, role, remote
     RECT_ADDOPEN2,
@@ -1200,6 +1201,17 @@ struct Gui {
     b32                cfgshowsel; // scroll the list to it
     b32                cfgtwopane; // the page list was drawn beside the page
     b32                cfgcombo;   // or as a combo, which is open
+    char              *cfgfind;    // the settings' search, FIELD_MAX
+    b32                cfgfindkey; // put the keyboard there (Ctrl+F)
+    b32                cfgfindhid; // a pick hid the results, when narrow
+    b32                cfgfound;   // results were listed in the last frame
+    Str                cfgfkind;   // the setting a result went to: its
+    Str                cfgfname;   // section's kind and name, and its key,
+    Str                cfgfkey;    // in cfgfbuf, 3*FIELD_MAX bytes
+    u8                *cfgfbuf;
+    b32                cfgfscroll; // scroll its page to it, once
+    i64                cfgmarkend; // when its mark has faded (µs)
+    b32                cfgfseen;   // it was whole in the page's view
     f32                cfghscroll; // room the settings had to scroll sideways
     i64                cfgframe;   // the frame they were last drawn in
     f32                hostshscroll; // and the Hosts panel, likewise
@@ -9406,6 +9418,7 @@ enum : i32 {
     T_DELOK,       // its confirmation's Delete and Cancel
     T_DELCANCEL,
     T_ROOTS,       // the guard page's roots field
+    T_CFGFIND,     // the settings' search field
     T_NOTIFY,      // the ui page's notify field
     T_SPLITFROM,   // where the dock splitter was before the first drag
     T_SESSMENU,    // the menu bar's Session menu
@@ -9704,6 +9717,10 @@ enum : i32 {
     CHK_UNTOASTED,    // the latest toast was withdrawn
     CHK_TOASTSEL,     // its click showed a subagent (dx 1) or a root (0)
     CHK_NOTIFY,       // [ui] notify is dx
+    CHK_CFGFIND,      // the settings' search lists first the keys text
+                      // names, in order; nothing listed if text is ""
+    CHK_CFGFOCUS,     // a result went to the setting text names: its
+                      // page as CHK_PAGE, then its key, in view
     CHK_COUNT,
 };
 
@@ -9938,6 +9955,8 @@ static Str chknames[] = {
     "a toast told of it", "no toast told of anything",
     "the toast was withdrawn", "the toast's click showed its session",
     "[ui] notify is as set",
+    "the settings' search listed as expected",
+    "a search result showed its setting",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -11407,6 +11426,34 @@ static DriveOp settingsops[] = {
     {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
     {OP_SHOT, 0, 0, 0, 300, "settings-wide"},
+    // The search: names before descriptions, and Enter goes to the
+    // first, scrolled to on its page; Escape empties it, the list back
+    {OP_MOVE, T_CFGFIND, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 500, "timeout"},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "ask_timeout job_timeout job_timeout_max "
+                                      "ask_timeout connect_timeout"},
+    {OP_SHOT, 0, 0, 0, 300, "settings-find"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_TEXT, 0, 0, 0, 500, "silence"},  // in a description only
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "idle_timeout idle_timeout"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_TEXT, 0, 0, 0, 500, "idle fake"},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "idle_timeout"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 800, ""},
+    {OP_CHECK, CHK_CFGFOCUS, 0, 0, 0, "endpoint fake idle_timeout"},
+    {OP_SHOT, 0, 0, 0, 300, "settings-found"},
+    {OP_MOVE, T_CFGFIND, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
     // The long value: whole in its field, and whole once edited there
     {OP_SHOWPAGE, 0, 0, 0, 300, "role long"},
     {OP_MOVE, T_PAGEITEM, 0, 0, 100, "role long"},
@@ -11572,6 +11619,25 @@ static DriveOp settingsops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 1000, ""},
     {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "settings-narrowest-model"},
+    // The search there: its results in place of the page, which a pick
+    // shows
+    {OP_MOVE, T_CFGFIND, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 500, "theme"},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "theme"},
+    {OP_SHOT, 0, 0, 0, 300, "settings-narrowest-find"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 800, ""},
+    {OP_CHECK, CHK_CFGFOCUS, 0, 0, 0, "ui theme"},
+    {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "settings-narrowest-found"},
+    {OP_MOVE, T_CFGFIND, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, ""},
     // The Hosts panel there too, its new remote's fields one a line
     {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -13360,6 +13426,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_DELOK:         return rectcenter(g->rects[RECT_DELOK]);
     case T_DELCANCEL:     return rectcenter(g->rects[RECT_DELCANCEL]);
     case T_ROOTS:         return rectcenter(g->rects[RECT_ROOTS]);
+    case T_CFGFIND:       return rectcenter(g->rects[RECT_CFGFIND]);
     case T_NOTIFY:        return rectcenter(g->rects[RECT_NOTIFY]);
     case T_SPLITFROM:     return v2(g->splitx, targetpos(g, T_SPLITTER).y);
     case T_PAGEITEM:
@@ -15057,6 +15124,49 @@ static b32 drivecheck(Gui *g, i32 chk)
         print(&b, (i64)g->cfghscroll);
         guilog(g, finish(&b));
         return g->cfghscroll<=0 && g->cfgframe+3>=g->total.frames;
+    }
+    case CHK_CFGFIND: {
+        Arena      a     = g->frame;
+        Str        want  = g->ops[g->drivepc-1].text;
+        Str        query = trim({(u8 *)g->cfgfind, (iz)__builtin_strlen(g->cfgfind)});
+        Slice<i32> found = cfgfindlist(g, &a, query);
+        Buf        b(&a, 4096);
+        print(&b, "drive: settings search \"");
+        print(&b, query);
+        print(&b, "\" lists");
+        for (iz i = 0; i < found.len && i < 40; i++) {
+            CfgRow *r = &g->cfgrows[found[i]];
+            putbyte(&b, ' ');
+            print(&b, r->key);
+            putbyte(&b, '[');
+            print(&b, cfgpagekey(&a, r->kind, r->name));
+            putbyte(&b, ']');
+        }
+        guilog(g, finish(&b));
+        if (!want.len) {
+            return !query.len && !g->cfgfound && g->cfgframe+3>=g->total.frames;
+        }
+        iz i = 0;
+        for (Str rest = want; rest.len; i++) {
+            Str w = cfgnextword(&rest);
+            if (!w.len) {
+                break;
+            } else if (i>=found.len || g->cfgrows[found[i]].key!=w) {
+                return 0;
+            }
+        }
+        return g->cfgfound && g->cfgframe+3>=g->total.frames;
+    }
+    case CHK_CFGFOCUS: {
+        Arena a    = g->frame;
+        Str   want = g->ops[g->drivepc-1].text;
+        iz    sp   = want.len - 1;
+        for (; sp>=0 && want[sp]!=' '; sp--) {}
+        Str   page = cfgpagekey(&a, g->cfgpkind, g->cfgpname);
+        return sp>0 && !g->cfgdiag && page==Str{want.data, sp} &&
+               g->cfgfkey==cuthead(want, sp+1) && g->cfgfkind==g->cfgpkind &&
+               g->cfgfname==g->cfgpname && !g->cfgfscroll && g->cfgfseen &&
+               g->cfgframe+3>=g->total.frames;
     }
     case CHK_PAGE: {
         Arena a    = g->frame;
@@ -17151,6 +17261,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->denynote   = alloc<char>(&g->perm, FIELD_MAX);
     g->addname    = alloc<char>(&g->perm, FIELD_MAX);
     g->cfgpbuf    = alloc<u8>(&g->perm, FIELD_MAX);
+    g->cfgfind    = alloc<char>(&g->perm, FIELD_MAX);
+    g->cfgfbuf    = alloc<u8>(&g->perm, 3*FIELD_MAX);
     g->tplname    = alloc<char>(&g->perm, FIELD_MAX);
     g->tplval     = alloc<char>(&g->perm, FIELD_MAX);
     g->remname    = alloc<char>(&g->perm, FIELD_MAX);

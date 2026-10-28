@@ -401,6 +401,18 @@ static void test_view(Test *t)
         expect(t, "notify.none", istr(&a, notifyparse("none")), "0");
         expect(t, "notify.odd", istr(&a, notifyparse("done bell")), "2");
         expect(t, "notify.less", istr(&a, notifyparse("allow done -done")), "1");
+
+        Str d = "Seconds without a byte before giving up";
+        expect(t, "find.exact", istr(&a, cfgfindrank("timeout", d, "endpoint x", "Timeout")), "1");
+        expect(t, "find.prefix", istr(&a, cfgfindrank("timeout_idle", d, "", "time")), "2");
+        expect(t, "find.part", istr(&a, cfgfindrank("idle_timeout", d, "", "time")), "3");
+        expect(t, "find.inside", istr(&a, cfgfindrank("idletimeout", d, "", "time")), "4");
+        expect(t, "find.page", istr(&a, cfgfindrank("url", d, "endpoint falstaff", "falst")), "5");
+        expect(t, "find.desc", istr(&a, cfgfindrank("url", d, "endpoint x", "byte")), "6");
+        expect(t, "find.none", istr(&a, cfgfindrank("url", d, "endpoint x", "nope")), "0");
+        expect(t, "find.empty", istr(&a, cfgfindrank("url", d, "endpoint x", "  ")), "0");
+        expect(t, "find.words", istr(&a, cfgfindrank("url", d, "endpoint falstaff", "url falstaff")), "5");
+        expect(t, "find.allwords", istr(&a, cfgfindrank("url", d, "endpoint falstaff", "url nope")), "0");
     }
 
     // Always: the ask offers a grant, the answer allows it for good, and

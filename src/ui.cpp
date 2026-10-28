@@ -7244,9 +7244,10 @@ static void drawhosts(Gui *g)
 // has anything to scroll to sideways.
 
 enum : i32 {
-    CFG_TWOPANE = 480,  // width at scale 1 for the list beside the page
-    CFG_MINVAL  = 160,  // the value column's least, at scale 1, for a
-                        // column of where each is set beside it
+    CFG_TWOPANE = 480,      // width at scale 1 for the list beside the page
+    CFG_MINVAL  = 160,      // the value column's least, at scale 1, for a
+                            // column of where each is set beside it
+    CFG_MARK_US = 1500000,  // how long a search's setting stays marked
 };
 
 // "from prospero.ini:12" from a path and line, or "default", which is
@@ -7289,23 +7290,47 @@ static Str provenance(Gui *g, Arena *a, CfgRow *r, i64 now)
 // are picked from their choices, paths edited one a line, and the rest
 // typed. The checklist's target row records its field's rectangle
 // (RECT_*, or -1 for none).
+// A setting's tooltip: its description, type and default.
+static Str cfgrowtip(Arena *a, CfgRow *r)
+{
+    Buf b(a, 128);
+    print(&b, r->desc);
+    print(&b, "\n(");
+    print(&b, r->type);
+    print(&b, ", default ");
+    print(&b, r->dflt.len ? r->dflt : Str("none"));
+    putbyte(&b, ')');
+    return finish(&b);
+}
+
+// Whether a row is the setting a search result went to.
+static b32 cfgfocused(Gui *g, CfgRow *r)
+{
+    return g->cfgfkey.len && r->key==g->cfgfkey && r->kind==g->cfgfkind &&
+           r->name==g->cfgfname;
+}
+
 static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
 {
     Arena a = g->frame;
     ImGui::TableNextRow();
+    b32 focus = cfgfocused(g, r);
+    if (focus && g->sched.now<g->cfgmarkend) {
+        // Marked a while, fading, so that the eye finds it
+        f32 t = (f32)(g->cfgmarkend - g->sched.now) / (f32)CFG_MARK_US;
+        t = t<1 ? t : 1;
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
+                               ImGui::GetColorU32(ImGuiCol_Header, t));
+        schedat(&g->sched, g->sched.now + 16000, DUE_APP);
+    }
     ImGui::TableNextColumn();
-    Buf tb(&a, 128);
-    print(&tb, r->desc);
-    print(&tb, "\n(");
-    print(&tb, r->type);
-    print(&tb, ", default ");
-    print(&tb, r->dflt.len ? r->dflt : Str("none"));
-    putbyte(&tb, ')');
+    Str tip  = cfgrowtip(&a, r);
     f32 cw   = ImGui::GetContentRegionAvail().x;
     Str from = r->valid ? provenance(g, &a, r, os_time(g->os)) : Str("invalid: default used");
     u32 fc   = r->valid ? ImGui::GetColorU32(ImGuiCol_TextDisabled) : g->pal->bad;
     ImGui::AlignTextToFramePadding();
-    textfit(a, r->key, cw, 0, finish(&tb));
+    textfit(a, r->key, cw, 0, tip);
+    ImVec2 rowtop = ImGui::GetItemRectMin();
     if (!wide) {
         textfit(a, from, cw, fc);
     }
@@ -7393,6 +7418,22 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
     if (target>=0 && target==g->reveal) {
         ImGui::SetScrollHereY(0.5f);  // for the checklist, which aims here
         g->reveal = -1;
+    }
+    if (focus) {
+        // Scrolled to once if not already in view, but not in the
+        // page's first frame, whose places are not settled
+        ImGuiWindow *w   = ImGui::GetCurrentWindow();
+        f32          bot = ImGui::GetItemRectMax().y;
+        g->cfgfseen = rowtop.y>=w->InnerRect.Min.y && bot<=w->InnerRect.Max.y;
+        if (g->cfgfscroll && ImGui::IsWindowAppearing()) {
+            scheddirty(&g->sched);
+        } else if (g->cfgfscroll) {
+            if (!g->cfgfseen) {
+                ImGui::SetScrollFromPosY(rowtop.y - w->Pos.y, 0.25f);
+            }
+            g->cfgfscroll = 0;
+            g->cfgmarkend = g->sched.now + CFG_MARK_US;
+        }
     }
     ImGui::PopID();
     if (wide) {
@@ -7651,6 +7692,105 @@ static Str cfgtitle(Arena *a, Str kind, Str name)
     }
     putbyte(&b, ']');
     return finish(&b);
+}
+
+// A setting's page as a search result names it: "Interface", or
+// "Endpoint local" for a named section.
+static Str cfgfindpage(Arena *a, Str kind, Str name)
+{
+    Str label = cfgkindlabel(a, kind, 0);
+    return name.len ? concat(a, concat(a, label, " "), name) : label;
+}
+
+// The settings a search finds, as indexes into cfgrows: the best
+// matches first (cfgfindrank), and among equals in the page list's
+// order, General's pages before the named sections.
+static Slice<i32> cfgfindlist(Gui *g, Arena *a, Str query)
+{
+    Slice<i32> r = {};
+    if (!g->cfgrows.len) {
+        return r;
+    }
+    i32 *ranks = alloc<i32>(a, g->cfgrows.len);
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        Arena   t    = *a;
+        CfgRow *row  = &g->cfgrows[i];
+        Str     page = concat(&t, concat(&t, cfgfindpage(&t, row->kind, row->name), " "),
+                              row->kind);
+        ranks[i] = cfgfindrank(row->key, row->desc, page, query);
+    }
+    r.data = alloc<i32>(a, g->cfgrows.len);
+    for (i32 rank = 1; rank <= 6; rank++) {
+        for (i32 named = 0; named < 2; named++) {
+            for (iz i = 0; i < g->cfgrows.len; i++) {
+                if (ranks[i]==rank && (g->cfgrows[i].name.len>0)==named) {
+                    r.data[r.len++] = (i32)i;
+                }
+            }
+        }
+    }
+    r.cap = r.len;
+    return r;
+}
+
+// Go to a setting: its page, scrolled to it, marked a while.
+static void cfggoto(Gui *g, CfgRow *r)
+{
+    cfgselect(g, r->kind, r->name);
+    if (r->kind.len+r->name.len+r->key.len <= 3*FIELD_MAX) {
+        u8 *p = g->cfgfbuf;
+        copybytes(p, r->kind.data, r->kind.len);
+        g->cfgfkind = {p, r->kind.len};
+        p += r->kind.len;
+        copybytes(p, r->name.data, r->name.len);
+        g->cfgfname = {p, r->name.len};
+        p += r->name.len;
+        copybytes(p, r->key.data, r->key.len);
+        g->cfgfkey  = {p, r->key.len};
+    }
+    g->cfgfscroll = 1;
+    g->cfgfseen   = 0;
+    g->cfgfindhid = !g->cfgtwopane;
+    scheddirty(&g->sched);
+}
+
+// The search's results, in place of the page list: each a setting's
+// key over its page, dimmed, with the setting's tooltip. Enter in the
+// field (enter) goes to the first.
+static void drawcfgfind(Gui *g, Slice<i32> found, b32 enter)
+{
+    Arena a = g->frame;
+    if (!found.len) {
+        ImGui::TextDisabled("No setting matches");
+        return;
+    }
+    if (enter) {
+        cfggoto(g, &g->cfgrows[found[0]]);
+    }
+    f32 lh  = ImGui::GetTextLineHeight();
+    f32 gap = ImGui::GetStyle().ItemSpacing.y;
+    u32 dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    for (iz i = 0; i < found.len; i++) {
+        Arena   t    = a;
+        CfgRow *r    = &g->cfgrows[found[i]];
+        Str     page = cfgfindpage(&t, r->kind, r->name);
+        ImVec2  p    = ImGui::GetCursorScreenPos();
+        f32     w    = ImGui::GetContentRegionAvail().x;
+        ImGui::PushID((int)i);
+        if (ImGui::Selectable("##found", cfgfocused(g, r), 0, v2(0, 2*lh + gap/2))) {
+            cfggoto(g, r);
+        }
+        ImGui::SetItemTooltip("%s", cstr0(&t, cfgrowtip(&t, r)));
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        ImGui::RenderTextEllipsis(dl, p, v2(p.x+w, p.y+lh), p.x+w,
+                                  r->key.cdata, r->key.cdata+r->key.len, 0);
+        ImGui::PushStyleColor(ImGuiCol_Text, dim);
+        ImVec2 q = v2(p.x, p.y + lh + gap/2);
+        ImGui::RenderTextEllipsis(dl, q, v2(p.x+w, q.y+lh), p.x+w,
+                                  page.cdata, page.cdata+page.len, 0);
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+    }
 }
 
 // The settings of one section, in a table: three columns when the
@@ -8208,6 +8348,31 @@ static void drawsettings(Gui *g)
         g->cfgshowsel = 1;
     }
 
+    // The search: Ctrl+F (Cmd+F) to it while Settings has the focus,
+    // ahead of the transcript's find; Escape empties it
+    if (ImGui::Shortcut(ImGuiMod_Ctrl|ImGuiKey_F)) {
+        g->cfgfindkey = 1;
+    }
+    if (g->cfgfindkey) {
+        ImGui::SetKeyboardFocusHere();
+        g->cfgfindkey = 0;
+    }
+    ImGui::SetNextItemWidth(-1);
+    b32 enter = ImGui::InputTextWithHint("##find", "Search settings", g->cfgfind, FIELD_MAX,
+                                         ImGuiInputTextFlags_EnterReturnsTrue|
+                                         ImGuiInputTextFlags_EscapeClearsAll);
+    itemrect(g, RECT_CFGFIND);
+    if (ImGui::IsItemActivated() || ImGui::IsItemEdited()) {
+        g->cfgfindhid = 0;
+    }
+    Str        query = trim({(u8 *)g->cfgfind, (iz)__builtin_strlen(g->cfgfind)});
+    b32        find  = query.len > 0;
+    Slice<i32> found = find ? cfgfindlist(g, &a, query) : Slice<i32>{};
+    if (!find && g->cfgfound) {
+        g->cfgshowsel = 1;  // the list back, at the page shown
+    }
+    g->cfgfound = find;
+
     f32 hs = 0;  // room to scroll sideways, for the checklist
     f32 w  = ImGui::GetContentRegionAvail().x;
     g->cfgtwopane = w >= (f32)CFG_TWOPANE*sc;
@@ -8216,11 +8381,21 @@ static void drawsettings(Gui *g)
         f32 lw = w*0.3f;
         lw = lw<130*sc ? 130*sc : lw>220*sc ? 220*sc : lw;
         if (ImGui::BeginChild("##pages", v2(lw, 0), ImGuiChildFlags_Borders)) {
-            drawcfglist(g, 0);
+            if (find) {
+                drawcfgfind(g, found, enter);
+            } else {
+                drawcfglist(g, 0);
+            }
             hs = ImGui::GetScrollMaxX();
         }
         ImGui::EndChild();
         ImGui::SameLine();
+    } else if (find && !g->cfgfindhid) {
+        // In place of the combo and the page, until one is picked
+        if (ImGui::BeginChild("##found", v2(0, 0), ImGuiChildFlags_Borders)) {
+            drawcfgfind(g, found, enter);
+        }
+        ImGui::EndChild();
     } else {
         Str    key  = cfgpagekey(&a, g->cfgpkind, g->cfgpname);
         Str    show = g->cfgdiag ? Str("Diagnostics") :
@@ -8234,12 +8409,14 @@ static void drawsettings(Gui *g)
         }
         g->rects[RECT_PAGECOMBO] = {at.x, at.y, at.x+w, at.y+ImGui::GetFrameHeight()};
     }
-    if (ImGui::BeginChild("##page", v2(0, 0))) {
-        drawcfgpage(g);
-        f32 m = ImGui::GetScrollMaxX();
-        hs = hs>m ? hs : m;
+    if (!(find && !g->cfgtwopane && !g->cfgfindhid)) {
+        if (ImGui::BeginChild("##page", v2(0, 0))) {
+            drawcfgpage(g);
+            f32 m = ImGui::GetScrollMaxX();
+            hs = hs>m ? hs : m;
+        }
+        ImGui::EndChild();
     }
-    ImGui::EndChild();
     drawcfgadd(g);
     drawcfgdel(g);
     f32 m = ImGui::GetScrollMaxX();

@@ -3410,6 +3410,48 @@ static u32 notifyparse(Str words)
     return r;
 }
 
+// How well a setting matches a Settings search, best first: 1 its key
+// is the word, 2 the key starts with it, 3 a part of the key after "_",
+// "." or "-" starts with it, 4 the key has it anywhere, 5 its page's
+// label (kind, section name or General's heading) has it, 6 its
+// description does. Case doesn't count. Every word of the query must
+// match, and the weakest match is the rank. 0 is no match, as is an
+// empty query.
+static i32 cfgfindrank(Str key, Str desc, Str page, Str query)
+{
+    i32 rank = 0;
+    for (Str rest = query; rest.len;) {
+        Str w = cfgnextword(&rest);
+        if (!w.len) {
+            continue;
+        }
+        i32 r   = 0;
+        iz  at  = findfold(key, w);
+        if (at < 0) {
+            r = findfold(page, w)>=0 ? 5 : findfold(desc, w)>=0 ? 6 : 0;
+        } else if (w.len == key.len) {
+            r = 1;
+        } else if (at == 0) {
+            r = 2;
+        } else {
+            r = 4;
+            for (iz i = 1; i+w.len <= key.len; i++) {
+                u8 c = key[i-1];
+                if ((c=='_' || c=='.' || c=='-') &&
+                    equalfold(Str{key.data+i, w.len}, w)) {
+                    r = 3;
+                    break;
+                }
+            }
+        }
+        if (!r) {
+            return 0;
+        }
+        rank = r>rank ? r : rank;
+    }
+    return rank;
+}
+
 // A notification's title for a session: its title, else the one listed
 // for it, else its folder's name, else the application's.
 static Str toasttitle(Arena *a, View *v, Str listed)

@@ -19,6 +19,13 @@ comments. Its top line says which file it edits. Diagnostics, at the
 end of its list, shows each problem found in the files, with where it
 is; a bad value falls back to its default.
 
+The search field above the pages (Ctrl+F, or Cmd+F on macOS, while
+Settings has the focus) finds a setting by name: keys that match come
+first, then those whose section's name matches, then those whose
+description does. Every word typed must match. Pick a result, or press
+Enter for the first, to go to that setting on its page; Escape empties
+the field.
+
 **Open in editor**, beside Reload, opens the file itself in your
 editor (`[ui] editor`, else `$VISUAL` or `$EDITOR`), to edit it by
 hand. A missing file is first created: from the built-in copy, as on
