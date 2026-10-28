@@ -8064,16 +8064,36 @@ static void drawoutput(Gui *g)
         print(&b, ": ");
         print(&b, bytesize(&a, o->size));
     }
+    Str t = finish(&o->text);
+    // Copy at the right, a check mark for a moment after, as a code
+    // block's (drawcodecopy)
+    i64 until  = o->copiedat + COPIED_US;
+    b32 copied = o->copiedat && g->sched.now<until;
+    if (copied) {
+        schedat(&g->sched, until + 1000, DUE_APP);
+    }
+    f32 right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - iconw();
+    ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
     if (o->more) {
         ImGui::SameLine();
         ImGui::BeginDisabled(o->id != 0);
-        if (ImGui::SmallButton("More")) {
+        if (ImGui::Button("More")) {
             guifile(g);
         }
         ImGui::EndDisabled();
         ImGui::SetItemTooltip("The next part of it");
     }
+    ImGui::SameLine(right > rightof() ? right : 0);
+    ImGui::BeginDisabled(!t.len);
+    if (iconbutton(copied ? ICON_CHECK "###outcopy" : ICON_COPY "###outcopy")) {
+        ImGui::SetClipboardText((char *)t.data);
+        o->copiedat = g->sched.now;
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, "output copy");
+    ImGui::SetItemTooltip(o->more ? "Copy what is shown: More shows the rest"
+                                  : "Copy the output");
     if (o->err.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
         ImGui::TextWrapped("%s", cstr0(&a, o->err));
@@ -8081,15 +8101,14 @@ static void drawoutput(Gui *g)
     } else if (o->id && !o->text.len) {
         ImGui::TextDisabled("Loading...");
     }
-    ImGui::BeginChild("##out", v2(0, 0), ImGuiChildFlags_Borders);
+    // A read-only text field, so that the text can be selected and copied
     ImGui::PushFont(g->fonts.mono, 0);
-    Str t = finish(&o->text);
     if (t.len) {
-        ImGui::TextUnformatted((char *)t.data, (char *)t.data + t.len);
+        ImGui::InputTextMultiline("##out", (char *)t.data, (size_t)t.len + 1, v2(-FLT_MIN, -FLT_MIN),
+                                  ImGuiInputTextFlags_ReadOnly);
         g->outshown = 1;
     }
     ImGui::PopFont();
-    ImGui::EndChild();
 }
 
 // Fitting a narrow window, which then has nothing to scroll to sideways

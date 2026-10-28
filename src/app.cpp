@@ -571,6 +571,7 @@ struct OutFile {
     b32         more;
     i64         id;     // the command in flight, 0 if none
     Str         err;
+    i64         copiedat;  // µs its Copy was clicked, 0 if not since shown
     Arena       mem;
     byte       *base;
 };
@@ -2670,6 +2671,8 @@ static void showfile(Gui *g, GuiSession *s, Str path)
     o->more    = 0;
     o->id      = 0;
     o->err      = {};
+    o->copiedat = 0;
+    o->text.data[0] = 0;
     g->outopen  = 1;
     g->outfocus = 1;
     guifile(g);
@@ -2720,6 +2723,8 @@ static void onfile(Gui *g, Json *j, b32 ok, Str err)
         return;
     }
     print(&o->text, text);
+    reserve(&o->text, 1);
+    o->text.data[o->text.len] = 0;  // for the text field that shows it
     o->off  = jsonint(jsonget(j, "off"), o->off);
     o->size = jsonint(jsonget(j, "size"), 0);
     o->more = jsonint(jsonget(j, "more"), 0) != 0;
@@ -10181,6 +10186,7 @@ enum : i32 {
     CHK_REMOTEDOWN,
     CHK_REMOTEOK,
     CHK_OUTPUT,
+    CHK_OUTCOPY,      // the Output window's Copy put its text on the clipboard
     CHK_REMOTECLOSED,
     CHK_REFRESHED,
     CHK_OWNNEW,
@@ -10458,6 +10464,7 @@ static Str chknames[] = {
     "the dropped link showed reconnecting, counting down",
     "reconnected: the answer whole, each delta once",
     "a call's whole output, read through its host, in the Output window",
+    "the Output window's Copy put what it shows on the clipboard, with a check mark",
     "disconnected: the remote's sessions say so",
     "the URL includes were fetched again",
     "a new session went to this process's own host",
@@ -13205,6 +13212,10 @@ static DriveOp remoteops[] = {
     {OP_CHECK, CHK_OUTPUT, 0, 0, 0, ""},
     {OP_CHECK, CHK_DARK, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-3-output"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "output copy"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_OUTCOPY, 0, 0, 0, ""},
     // Its raw log exported, and imported there again from the Session
     // menu, the dialog filled with its directory there: the copy shown
     // with its transcript, though its log skips the numbers of the
@@ -17052,6 +17063,10 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_OUTPUT:
         return g->outshown && g->out.s==g->sess && g->sess->host->kind!=GH_ENGINE &&
                find(finish(&g->out.text), "line 6")>=0 && !g->out.err.len;
+    case CHK_OUTCOPY: {
+        Str t = finish(&g->out.text);
+        return t.len && driveclipboard(g, t)==t && g->out.copiedat;
+    }
     case CHK_REMOTECLOSED: {
         GuiHost *h = drivehost(g, GH_REMOTE);
         b32      any = 0;
