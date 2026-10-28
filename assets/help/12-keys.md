@@ -16,6 +16,8 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
   screwdriver).
 - **Ctrl+Shift+R**: show, or fold again, all of its reasoning (the
   Reasoning button, a light bulb).
+- **Ctrl+1** to **Ctrl+9**: a layout, as View → Layout lists them:
+  Standard, Compact, Focus, then those you saved.
 - **Ctrl+=** and **Ctrl+-** zoom the text in and out, and **Ctrl+0**
   resets it; so does the mouse wheel with Ctrl held. The zoom lasts
   until Prospero exits: `[ui] font_size` sets the size for good.

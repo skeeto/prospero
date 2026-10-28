@@ -2239,6 +2239,23 @@ static f32 rightof()
     return x + ImGui::GetStyle().ItemSpacing.x;
 }
 
+// The folder a session works in, which Open working folder shows: else
+// null, and why in *why.
+static Str sesswork(GuiSession *s, Str *why)
+{
+    Str cwd = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+    *why = s->host->kind==GH_REMOTE ? Str("Its files are on another computer") :
+           !cwd.len                 ? Str("Its folder is not known yet") : Str{};
+    return why->len ? Str{} : cwd;
+}
+
+static void workopen(Gui *g, Arena a, Str cwd)
+{
+    if (!os_guireveal(g->os, a, cwd)) {
+        g->lasterr = clone(&g->perm, concat(&a, "cannot show ", cwd));
+    }
+}
+
 static void inforow(char const *key, Str value)
 {
     ImGui::TableNextRow();
@@ -2777,10 +2794,7 @@ static void drawsessbar(Gui *g)
     f32         gw    = gaugewidth(g, v);
     char const *tl    = ICON_TOOLS;      // Tool output
     char const *rl    = ICON_LIGHTBULB;  // Reasoning
-    f32         infow = iconw();
-    f32         tw    = iconw();
-    f32         rw    = iconw();
-    f32         rest  = (gw>0 ? gw + gap : 0) + tw + gap + rw + gap + infow;
+    f32         rest  = (gw>0 ? gw + gap : 0) + 5*iconw() + 4*gap;
     f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rest;
     if (v->parent.len && v->remote && !sessup(g, s)) {
         ImGui::TextDisabled(v->role.len ? "Subagent (%s) of a session on another host"
@@ -2863,6 +2877,30 @@ static void drawsessbar(Gui *g)
     g->gaugeshown = 0;
     if (gw > 0) {
         drawgauge(g, v, gw);
+        ImGui::SameLine();
+    }
+    // Its terminal and its folder, as the Session menu opens them
+    {
+        Str why = termplan(g, &a, s).why;
+        ImGui::BeginDisabled(why.len > 0);
+        if (iconbutton(ICON_TERMINAL "##barterm")) {
+            termopen(g, a, s);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "bar terminal");
+        whytip(why.len ? why : s->host->kind==GH_REMOTE
+                   ? Str("Open in terminal: a shell in its folder there, in a terminal here")
+                   : Str("Open in terminal: its shell in its folder"));
+        ImGui::SameLine();
+        Str wwhy = {};
+        Str cwd  = sesswork(s, &wwhy);
+        ImGui::BeginDisabled(wwhy.len > 0);
+        if (iconbutton(ICON_FOLDER "##barfolder")) {
+            workopen(g, a, cwd);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "bar folder");
+        whytip(wwhy.len ? wwhy : concat(&a, "Open working folder: ", cwd));
         ImGui::SameLine();
     }
     if (iconbutton(tl, v->showtools)) {
@@ -5755,13 +5793,11 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
     }
     // Its two folders: where it works, and where its records are
     Str there = h->kind==GH_REMOTE ? Str("Its files are on another computer") : Str{};
-    Str cwd   = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
-    Str work  = there.len ? there : cwd.len ? Str{} : Str("Its folder is not known yet");
+    Str work  = {};
+    Str cwd   = sesswork(s, &work);
     if (menutip(g, &a, "Open working folder", work,
                 concat(&a, "Open the folder it works in, ", cwd))) {
-        if (!os_guireveal(g->os, a, cwd)) {
-            g->lasterr = clone(&g->perm, concat(&a, "cannot show ", cwd));
-        }
+        workopen(g, a, cwd);
     }
     if (menutip(g, &a, "Open session records", there,
                 "Open its folder in the state directory: its log, plan and "
@@ -10018,6 +10054,8 @@ static void drawfaketools(Gui *g)
 }
 
 // A shortcut as the menus show it: Cmd on macOS, else Ctrl.
+static b32 picklayoutnum(Gui *, i32);
+
 static char const *cmdkey(Gui *g, Arena *a, Str key)
 {
     return cstr0(a, concat(a, g->mac ? Str("Cmd+") : Str("Ctrl+"), key));
@@ -10094,6 +10132,12 @@ static void menukeys(Gui *g)
     }
     if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_R, glob)) {
         setsessionthink(g, 0, !sessionthink(g));
+    }
+    // Layouts by number, as the View menu's Layout lists them
+    for (i32 n = 0; n < 9; n++) {
+        if (ImGui::Shortcut(ctrl|(ImGuiKey)(ImGuiKey_1 + n), glob)) {
+            picklayoutnum(g, n);
+        }
     }
     #if !defined(_WIN32) && !defined(__APPLE__)
     if (ImGui::Shortcut(ctrl|ImGuiKey_Q, glob)) {
@@ -10411,6 +10455,32 @@ static void picklayout(Gui *g, DockLayout *l)
 
 // View's Layout menu: the presets, the user's layouts, and saving and
 // deleting those, each item named for the checklist.
+// Layout number n from 0: the presets, then the user's saved layouts,
+// as the View menu lists them and Ctrl/Cmd+1 to +9 pick them. False if
+// there is none so numbered.
+static b32 picklayoutnum(Gui *g, i32 n)
+{
+    if (n < PRESET_COUNT) {
+        DockLayout l = dockpreset(n);
+        picklayout(g, &l);
+        return 1;
+    } else if (n-PRESET_COUNT < g->layouts.len) {
+        picklayout(g, &g->layouts[n-PRESET_COUNT]);
+        return 1;
+    }
+    return 0;
+}
+
+// A layout's shortcut by its number from 0, Cmd/Ctrl+1 to +9, or null.
+static char const *layoutkey(Gui *g, Arena *a, i32 n)
+{
+    if (n >= 9) {
+        return 0;
+    }
+    char d[2] = {(char)('1' + n), 0};
+    return cmdkey(g, a, Str{(u8 *)d, 1});
+}
+
 static void drawlayoutmenu(Gui *g)
 {
     b32 menu = ImGui::BeginMenu("Layout");
@@ -10420,7 +10490,7 @@ static void drawlayoutmenu(Gui *g)
     }
     Arena a = g->frame;
     for (i32 i = 0; i < PRESET_COUNT; i++) {
-        b32 pick = ImGui::MenuItem(presetnames[i].cdata);
+        b32 pick = ImGui::MenuItem(presetnames[i].cdata, layoutkey(g, &a, i));
         itemnamed(g, concat(&a, "layout ", presetnames[i]));
         ImGui::SetItemTooltip("%s", presettips[i].cdata);
         if (pick) {
@@ -10433,7 +10503,8 @@ static void drawlayoutmenu(Gui *g)
     }
     for (iz i = 0; i < g->layouts.len; i++) {
         ImGui::PushID((i32)i);
-        b32 pick = ImGui::MenuItem(cstr0(&a, g->layouts[i].name));
+        b32 pick = ImGui::MenuItem(cstr0(&a, g->layouts[i].name),
+                                   layoutkey(g, &a, PRESET_COUNT + (i32)i));
         ImGui::PopID();
         itemnamed(g, concat(&a, "layout ", g->layouts[i].name));
         if (pick) {
@@ -10653,6 +10724,9 @@ static void drawmenubar(Gui *g)
     menu = ImGui::BeginMenu("View");
     itemrect(g, RECT_MENU);
     if (menu) {
+        // Layouts first, the quickest to reach, then the panes
+        drawlayoutmenu(g);
+        ImGui::Separator();
         for (i32 i = 0; i < PANE_COUNT; i++) {
             if (!paneoffered(i)) {
                 continue;
@@ -10710,7 +10784,6 @@ static void drawmenubar(Gui *g)
             }
             ImGui::EndMenu();
         }
-        drawlayoutmenu(g);
         if (g->enginekind == ENGINE_FAKE) {
             ImGui::SeparatorText("Debug");
             b32 modal = ImGui::MenuItem("Modal dialog...");

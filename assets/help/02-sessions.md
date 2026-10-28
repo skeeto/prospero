@@ -161,10 +161,11 @@ Right-click a session in the sidebar, or open the Session menu, for:
 - **Delete...**: remove it, with its subagents, for good.
 - **Copy session ID**.
 - **Open working folder**: the folder the session works in, in Finder
-  or Explorer. **Open session records**: its folder in the state
+  or Explorer, as the folder button above the transcript opens it. **Open session records**: its folder in the state
   directory, with its log, plan and command output.
 - **Open in terminal**: a terminal window in the folder the session
-  works in, as is the Info popup's Terminal button, running the
+  works in, as the terminal button above the transcript and the Info
+  popup's open one, running the
   session's shell (a POSIX sh as a login shell), or where that is
   `/bin/sh` or bash on Linux and macOS, the terminal's own. On a remote it is a shell there, over
   ssh (`ssh -t`, so it may ask for a password) or WSL. The terminal is

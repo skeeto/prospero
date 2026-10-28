@@ -190,9 +190,10 @@ compositor decides focus. A different `--statedir` (or
 shows and hides the panes and zooms the text for the run (Ctrl+=,
 Ctrl+- and Ctrl+0, Cmd on macOS, or the wheel with the key held);
 `[ui] font_size` (17 pixels by default) sets its size for good. View
-→ Layout arranges the panes as Standard, Compact (no right column) or
-Focus (one session), or as a layout saved under a name of its own,
-kept with the window's layout in the state directory. The window
+→ Layout, View's first item, arranges the panes as Standard, Compact
+(no right column) or Focus (one session), or as a layout saved under a
+name of its own, kept with the window's layout in the state directory;
+Ctrl+1 to Ctrl+9 (Cmd on macOS) pick them in that order. The window
 opens where it was last, fitted to the displays there are; the first
 time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings

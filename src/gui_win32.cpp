@@ -1162,7 +1162,7 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         static WORD const vks[] = {
             VK_TAB, VK_CONTROL, VK_ESCAPE, VK_RETURN, 'C', VK_SHIFT, 'A',
             VK_END, VK_CONTROL, VK_OEM_PLUS, VK_OEM_MINUS, '0', 'F', 'G', 'T',
-            'R', VK_UP, VK_DOWN, 'V', 'B',
+            'R', VK_UP, VK_DOWN, 'V', 'B', '2',
         };
         BYTE state[256];
         GetKeyboardState(state);

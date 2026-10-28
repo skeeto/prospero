@@ -70,7 +70,9 @@ a window is open already, the session starts there.
 
 ## Layouts
 
-View → Layout arranges every pane at once:
+View → Layout, the first item of View, arranges every pane at once.
+Ctrl+1 to Ctrl+9 (Cmd on macOS) pick its layouts in the order listed,
+so Ctrl+1 is Standard and Ctrl+4 the first you saved:
 
 - **Standard**: sessions on the left over the todo list, the
   transcript over the prompt in the middle, and the jobs over the
