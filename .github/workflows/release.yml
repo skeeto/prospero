@@ -1,6 +1,6 @@
 # On a version tag (v1.2.3, which must equal the project VERSION in
 # CMakeLists.txt, which is PROSPERO_VERSION), build, test, and publish a
-# release of eight assets: the source tarball, and programs built from it
+# release of nine assets: the source tarball, and programs built from it
 # alone, with FetchContent disconnected.
 #
 #   prospero-VERSION.tar.gz                      the source, every dependency
@@ -8,6 +8,9 @@
 #                                                (tools/dist.py), deterministic
 #   prospero-VERSION-windows-x86_64.exe          the GUI, engine and desktop
 #                                                helper included
+#   prospero-VERSION-macos-arm64.dmg             Prospero.app, the same, on
+#                                                a disk image beside a link
+#                                                to /Applications
 #   prospero-engine-VERSION-windows-x86_64.exe   headless engines, named as
 #   prospero-engine-VERSION-windows-i686.exe       "prospero deploy" finds
 #   prospero-engine-VERSION-linux-x86_64           them; i686 is the XP engine,
@@ -28,14 +31,30 @@
 # and publishes what the build jobs made. GitHub records each asset's
 # SHA-256 digest.
 #
+# The macOS app is built and tested on a macOS runner, signed ad hoc,
+# then signed again with the Developer ID Application certificate in a
+# job of its own that only signs, packs and notarizes it: the
+# certificate, a .p12 in base64 (MACOS_CERTIFICATE, with
+# MACOS_CERTIFICATE_PASSWORD), goes into a keychain made for the job,
+# and an App Store Connect API key (MACOS_NOTARY_KEY, the .p8's text,
+# with MACOS_NOTARY_KEY_ID and MACOS_NOTARY_ISSUER) notarizes the disk
+# image through cmake/notarize.cmake, which staples it.
+#
 # Run by hand (workflow_dispatch), only the build jobs run: nothing is
 # signed or published, and the programs are left as the run's artifacts.
+# With sign-macos, the disk image is also signed and notarized, and left
+# as an artifact, to try the macOS signing short of a release.
 name: release
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      sign-macos:
+        description: Also sign and notarize the macOS disk image
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -224,9 +243,142 @@ jobs:
           path: out/
           if-no-files-found: error
 
+  macos:
+    name: macOS arm64
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+
+      # From a source tarball of its own, as for Linux aarch64. Tested in
+      # a build of its own, then built as released: the real bundle
+      # identifier, which a build signed ad hoc otherwise never claims
+      # (CMakeLists.txt), since the next job signs it.
+      - name: Build and test, macOS arm64
+        run: |
+          v=$(sed -n 's/^project(prospero VERSION \([0-9.]*\) .*/\1/p' CMakeLists.txt)
+          python3 -I tools/dist.py -o "$RUNNER_TEMP/src.tar.gz" "$GITHUB_SHA"
+          tar xzf "$RUNNER_TEMP/src.tar.gz" -C "$RUNNER_TEMP"
+          src=$RUNNER_TEMP/prospero-$v
+          n=$(sysctl -n hw.ncpu)
+          cmake -S "$src" -B build -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+          cmake --build build -j"$n"
+          ctest --test-dir build -j"$n" --output-on-failure
+          cmake -S "$src" -B build-app -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+              -DPROSPERO_BUNDLE_ID=com.nullprogram.prospero
+          cmake --build build-app -j"$n" --target prospero-app
+          exe=build-app/Prospero.app/Contents/MacOS/prospero
+          test "$($exe --version)" = "prospero $v"
+          vtool -show-build "$exe" | grep -q 'minos 13\.0'
+          mkdir out
+          tar czf out/Prospero.app.tar.gz -C build-app Prospero.app
+          echo "$v" >out/version
+          gzip -dc "$RUNNER_TEMP/src.tar.gz" | shasum -a 256 | cut -d' ' -f1 >out/source.sha256
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: macos-app
+          path: out/
+          if-no-files-found: error
+
+  macos-sign:
+    name: Sign and notarize, macOS
+    needs: macos
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      inputs.sign-macos
+    runs-on: macos-26
+    timeout-minutes: 45
+    environment: release
+    env:
+      IDENTITY: 'Developer ID Application: Christopher Wellons (A7AR282GVM)'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: macos-app
+          path: app
+
+      # A keychain of the job's own, with a random password, which
+      # codesign may use without asking, searched ahead of the others
+      - name: Import the certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          kc=$RUNNER_TEMP/signing.keychain-db
+          pw=$(openssl rand -hex 24)
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          printf %s "$MACOS_CERTIFICATE" | base64 -d >"$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" \
+              -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+              -s -k "$pw" "$kc" >/dev/null
+          # shellcheck disable=SC2046  # the list, one keychain per word
+          security list-keychains -d user -s "$kc" \
+              $(security list-keychains -d user | tr -d '"')
+          if ! security find-identity -v -p codesigning "$kc" | grep -qF "\"$IDENTITY\""; then
+              echo "::error::no identity \"$IDENTITY\" in the certificate"
+              exit 1
+          fi
+
+      # As CMakeLists.txt signs with a Developer ID: the hardened runtime
+      # and a secure timestamp, the helper with its fixed identifier, and
+      # then the bundle, which seals the helper and signs the harness
+      - name: Sign the app and make the disk image
+        run: |
+          v=$(cat app/version)
+          mkdir "$RUNNER_TEMP/dmg"
+          tar xzf app/Prospero.app.tar.gz -C "$RUNNER_TEMP/dmg"
+          a=$RUNNER_TEMP/dmg/Prospero.app
+          codesign --force --options runtime --timestamp \
+              --identifier com.nullprogram.prospero.desktop \
+              --sign "$IDENTITY" "$a/Contents/MacOS/prospero-desktop"
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" "$a"
+          codesign --verify --deep --strict --verbose=2 "$a"
+          ln -s /Applications "$RUNNER_TEMP/dmg/Applications"
+          mkdir out
+          hdiutil create -volname Prospero -srcfolder "$RUNNER_TEMP/dmg" \
+              -format UDZO "out/prospero-$v-macos-arm64.dmg"
+          echo "DMG=out/prospero-$v-macos-arm64.dmg" >>"$GITHUB_ENV"
+          cp app/source.sha256 out/
+
+      # Signs the disk image too, then notarizes, staples and checks it
+      - name: Notarize
+        env:
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          PROSPERO_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          PROSPERO_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          export PROSPERO_NOTARY_KEY=$RUNNER_TEMP/notary.p8
+          printf '%s\n' "$MACOS_NOTARY_KEY" >"$PROSPERO_NOTARY_KEY"
+          cmake -DCPACK_PACKAGE_FILES="$PWD/$DMG" \
+                -DCPACK_PROSPERO_SIGN_IDENTITY="$IDENTITY" \
+                -P cmake/notarize.cmake
+
+      - name: Remove the keychain and key
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: macos
+          path: out/
+          if-no-files-found: error
+
   release:
     name: Sign and publish
-    needs: [build, linux-aarch64]
+    needs: [build, linux-aarch64, macos-sign]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -245,21 +397,25 @@ jobs:
         with:
           path: artifacts
 
-      # Exactly the eight assets, the aarch64 programs' source the same
+      # Exactly the nine assets, the aarch64 and macOS programs' source
+      # the same
       - name: Gather the assets
         run: |
           mkdir dist
           mv artifacts/build/* dist/
           mv "artifacts/linux-aarch64/prospero-engine-$V-linux-aarch64" \
              "artifacts/linux-aarch64/prospero-desktop-$V-linux-aarch64" dist/
-          want=$(cat artifacts/linux-aarch64/source.sha256)
+          mv "artifacts/macos/prospero-$V-macos-arm64.dmg" dist/
           got=$(gzip -dc "dist/prospero-$V.tar.gz" | sha256sum | cut -d' ' -f1)
-          if [ "$want" != "$got" ]; then
-              echo "::error::the aarch64 engine's source tarball differs"
-              exit 1
-          fi
+          for a in linux-aarch64 macos; do
+              if [ "$(cat "artifacts/$a/source.sha256")" != "$got" ]; then
+                  echo "::error::the $a programs' source tarball differs"
+                  exit 1
+              fi
+          done
           for f in "prospero-$V.tar.gz" \
                    "prospero-$V-windows-x86_64.exe" \
+                   "prospero-$V-macos-arm64.dmg" \
                    "prospero-engine-$V-windows-x86_64.exe" \
                    "prospero-engine-$V-windows-i686.exe" \
                    "prospero-engine-$V-linux-x86_64" \
@@ -272,8 +428,8 @@ jobs:
               fi
           done
           all=(dist/*)
-          if [ "${#all[@]}" -ne 8 ]; then
-              echo "::error::dist/ holds more than the eight assets"
+          if [ "${#all[@]}" -ne 9 ]; then
+              echo "::error::dist/ holds more than the nine assets"
               exit 1
           fi
           # As built, for the check after signing

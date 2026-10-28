@@ -102,7 +102,7 @@ architecture.
 
 ## Releases
 
-Each release on GitHub carries eight files:
+Each release on GitHub carries nine files:
 
 - `prospero-VERSION.tar.gz`: the source, with every dependency unpacked
   under `deps/`, so that it builds with no network:
@@ -113,6 +113,9 @@ Each release on GitHub carries eight files:
 
 - `prospero-VERSION-windows-x86_64.exe`: the Windows program, the GUI
   with its engine and desktop helper, all there is to install.
+- `prospero-VERSION-macos-arm64.dmg`: the macOS app, for Apple
+  silicon and macOS 13 or later, signed and notarized. Drag
+  `Prospero.app` to `/Applications`.
 - `prospero-engine-VERSION-windows-x86_64.exe` and
   `prospero-engine-VERSION-windows-i686.exe`: headless engines for
   Windows, the i686 one for XP, each its own desktop helper too.
@@ -127,14 +130,15 @@ Each release on GitHub carries eight files:
 The engines and helpers are named as `prospero deploy` expects to find
 them, in an `engines` directory next to the executable, which puts each
 helper beside its engine on the remote machine. To use a helper on the
-machine itself, save it next to `prospero` as `prospero-desktop`. There
-is no macOS build; build it from source, or a disk image of it (above).
+machine itself, save it next to `prospero` as `prospero-desktop`.
 
 The release workflow (`.github/workflows/release.yml`) builds every
 program from the source tarball alone. The Windows programs are built
 on Linux by [w64devkit][]'s GCC under Wine, the same programs it builds
 on Windows, stripped and with no timestamp, then signed, with an Authenticode signature (Azure Artifact Signing), which
 Windows shows in the file's Properties, under Digital Signatures.
+The macOS app is built and tested on a macOS runner, then signed with
+a Developer ID certificate and notarized by Apple.
 `tools/dist.py` makes
 the source tarball from any commit, the same commit always giving the
 same tar file.
