@@ -246,7 +246,7 @@ session is titled "(imported)" and remembers the session it came from.
 
 Images go with a message, for a model that takes them: drop PNG,
 JPEG, GIF, WebP or BMP files on the window, paste one (or a copied
-image file), or pick them with the Image button. They wait as
+image file), or pick them with the Attach button. They wait as
 thumbnails above the prompt box until sent, at most ten to a message.
 A PNG or JPEG goes as it is; a GIF (its first frame), WebP or BMP goes
 as a PNG, and so does a large image, shrunk to fit. Images are decoded
@@ -254,6 +254,15 @@ by [Wuffs][], which is memory-safe against hostile files.
 The session keeps them, so they go back to the model on every request,
 show in the transcript and come with a fork, but not with an export.
 `[model] vision = false` turns them off for a model that has none.
+
+Any other file attached the same way (the Attach button, a paper clip,
+picks any file) goes as text, as `read` shows it: numbered lines, cut
+at read's limits with a note to read on. The session keeps a copy in
+its folder (`files/N-NAME`, at most 16 MiB), which the agent may read
+without asking, and the text is put before the message on every
+request, so it needs no vision. A file with a NUL byte in its first
+8 KiB is binary, and is refused, as `read` refuses it. The transcript
+notes the files under their message, folded.
 
 The agent can look at image files on its own, too: `read` shows a PNG,
 JPEG, GIF, WebP or BMP file to a model that takes images, as an image,

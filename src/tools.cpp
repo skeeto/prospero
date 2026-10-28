@@ -2368,69 +2368,30 @@ struct ToolOut {
     b32 ok;     // the call did what was asked
 };
 
-// Read a file, under its [PATH#TAG] header if tagged (hashline edits).
-static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args, b32 tagged)
+// Whether a file is binary, as read has it: a NUL in its first 8 KiB.
+static b32 readbinary(Str data)
 {
-    ToolOut r  = {};
-    Stat    st = os_stat(os, *a, path);
-    if (st.type == STAT_MISSING) {
-        r.text = notfound(os, a, cwd, path);
-        return r;
-    } else if (st.type == STAT_DIR) {
-        r.text = listdir(os, a, cwd, path);
-        r.ok   = 1;
-        return r;
-    } else if (st.type != STAT_FILE) {
-        r.text = "Not a regular file, so it was not read.";
-        return r;
-    }
-
-    Read rd = os_read(os, a, path, (iz)FILE_MAX);
-    if (rd.err == READ_TOOBIG) {
-        Buf b(a, 200);
-        print(&b, "The file is ");
-        print(&b, rd.size);
-        print(&b, " bytes, too large to read with this tool. Use the shell "
-                  "to look at parts of it (head, tail, sed -n, grep).");
-        r.text = finish(&b);
-        return r;
-    } else if (rd.err) {
-        r.text = "The file could not be read.";
-        return r;
-    }
-    Str data = rd.data;
     for (iz i = 0; i<data.len && i<8192; i++) {
         if (!data[i]) {
-            Buf b(a, 160);
-            print(&b, "This is a binary file (");
-            print(&b, (i64)data.len);
-            print(&b, " bytes), so it is not shown.");
-            r.text = finish(&b);
-            return r;
+            return 1;
         }
     }
-    Str head = {};
-    if (tagged) {
-        Buf h(a, 64 + path.len);
-        putbyte(&h, '[');
-        print(&h, showpath(cwd, path));
-        putbyte(&h, '#');
-        print(&h, filetag(a, data));
-        print(&h, "]\n");
-        head = finish(&h);
-    }
+    return 0;
+}
+
+// A text file's lines from first, at most limit of them and READ_BYTES
+// in all, each numbered, after head, then a note of where to go on if
+// more are left: read's output, and an attached file's.
+static Str readbody(Arena *a, Str data, Str head, iz first, iz limit)
+{
     if (startswith(data, "\xef\xbb\xbf")) {
         data = cuthead(data, 3);
     }
     if (!data.len) {
-        r.text = concat(a, head, "(empty file)");
-        r.ok   = 1;
-        return r;
+        return concat(a, head, "(empty file)");
     }
 
-    iz total  = countlines(data);
-    iz first  = args->offset ? (iz)args->offset : 1;
-    iz limit  = args->limit && args->limit<READ_LINES ? (iz)args->limit : (iz)READ_LINES;
+    iz total = countlines(data);
     if (first > total) {
         Buf b(a, 160);
         print(&b, "The file has only ");
@@ -2438,9 +2399,7 @@ static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args, b32 tag
         print(&b, " lines, so offset ");
         print(&b, (i64)first);
         print(&b, " is past its end.");
-        r.text = finish(&b);
-        r.ok   = 1;
-        return r;
+        return finish(&b);
     }
 
     Buf b(a, 4096);
@@ -2490,7 +2449,61 @@ static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args, b32 tag
         print(&b, (i64)last+1);
         print(&b, ".]\n");
     }
-    r.text = finish(&b);
+    return finish(&b);
+}
+
+// Read a file, under its [PATH#TAG] header if tagged (hashline edits).
+static ToolOut toolread(Os *os, Arena *a, Str cwd, Str path, Args *args, b32 tagged)
+{
+    ToolOut r  = {};
+    Stat    st = os_stat(os, *a, path);
+    if (st.type == STAT_MISSING) {
+        r.text = notfound(os, a, cwd, path);
+        return r;
+    } else if (st.type == STAT_DIR) {
+        r.text = listdir(os, a, cwd, path);
+        r.ok   = 1;
+        return r;
+    } else if (st.type != STAT_FILE) {
+        r.text = "Not a regular file, so it was not read.";
+        return r;
+    }
+
+    Read rd = os_read(os, a, path, (iz)FILE_MAX);
+    if (rd.err == READ_TOOBIG) {
+        Buf b(a, 200);
+        print(&b, "The file is ");
+        print(&b, rd.size);
+        print(&b, " bytes, too large to read with this tool. Use the shell "
+                  "to look at parts of it (head, tail, sed -n, grep).");
+        r.text = finish(&b);
+        return r;
+    } else if (rd.err) {
+        r.text = "The file could not be read.";
+        return r;
+    }
+    Str data = rd.data;
+    if (readbinary(data)) {
+        Buf b(a, 160);
+        print(&b, "This is a binary file (");
+        print(&b, (i64)data.len);
+        print(&b, " bytes), so it is not shown.");
+        r.text = finish(&b);
+        return r;
+    }
+    Str head = {};
+    if (tagged) {
+        Buf h(a, 64 + path.len);
+        putbyte(&h, '[');
+        print(&h, showpath(cwd, path));
+        putbyte(&h, '#');
+        print(&h, filetag(a, data));
+        print(&h, "]\n");
+        head = finish(&h);
+    }
+    iz first = args->offset ? (iz)args->offset : 1;
+    iz limit = args->limit && args->limit<READ_LINES ? (iz)args->limit : (iz)READ_LINES;
+    r.text = readbody(a, data, head, first, limit);
     r.ok   = 1;
     return r;
 }

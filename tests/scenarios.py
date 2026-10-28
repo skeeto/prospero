@@ -8333,6 +8333,158 @@ def attach_copies(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+def upfile(t, h, sid, data, name, part=1 << 19):
+    """Upload a text file to a session, part by part; the last reply."""
+    token, off = None, 0
+    while True:
+        chunk = data[off:off + part]
+        last = off + len(chunk) >= len(data)
+        args = {"kind": "file", "sid": sid, "data": base64.b64encode(chunk).decode(),
+                "off": off}
+        if token:
+            args["token"] = token
+        if last:
+            args["done"] = 1
+            args["name"] = name
+        r = h.call("upload", timeout=60, **args)
+        if not last or r.get("ok") != 1:
+            t.check(r.get("ok") == 1 or last, f"upload at {off}: {r}")
+        if last or r.get("ok") != 1:
+            return r
+        token, off = r["token"], r["off"]
+
+
+@scenario(conf={"_extra": "[model {model2}]\nvision = false\n"}, bound=15)
+def attach_text(t):
+    """A text file is uploaded in parts and kept in its session's files/
+    as files/N-NAME, its name made safe; a prompt names it, the user
+    record lists it with its bytes and lines, and the request has it as
+    read shows it, numbered, where it is kept, before the message's
+    text. A model without vision takes it. A binary file, by read's
+    measure, is refused, as are names upload did not make."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        caps = h.all("hello")[0].get("caps", [])
+        t.check("files" in caps, f"caps: {caps}")
+        sid = h.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
+        data = b"alpha\nbeta\r\ngamma\n"
+        r = upfile(t, h, sid, data, "my notes.txt", part=5)
+        t.check(r.get("ok") == 1 and r.get("name") == "files/1-my_notes.txt" and
+                r.get("bytes") == len(data) and r.get("lines") == 3, f"the first: {r}")
+        kept = t.host.join(t.state, "sessions", sid, "files", "1-my_notes.txt")
+        t.check(t.host.read(kept) == data.decode(), "kept as sent")
+        r2 = upfile(t, h, sid, b"x = 1\n", "dir/b.py")
+        t.check(r2.get("name") == "files/2-b.py", f"the second: {r2}")
+
+        r = h.call("prompt", sid=sid, text="what is in these?",
+                   files=[r["name"], r2["name"]])
+        t.check(r.get("ok") == 1, f"prompt: {r}")
+        ended(h, sid, 1)
+        user = h.all("user", sid)[0]
+        t.check(user["text"] == "what is in these?" and user["files"] == [
+            {"name": "files/1-my_notes.txt", "bytes": len(data), "lines": 3},
+            {"name": "files/2-b.py", "bytes": 6, "lines": 1}], f"the user record: {user}")
+        said = fake_provider.user_text_all(t.requests(t.model2)[-1]["body"])
+        t.check("[Attached file my_notes.txt, kept at " in said and
+                "     1\talpha\n     2\tbeta\n     3\tgamma\n" in said and
+                "     1\tx = 1\n" in said and said.endswith("what is in these?"),
+                f"the request: {said[:400]}")
+        t.check(lastsaid(h, sid) == "I see 4 lines, 0 lost.", f"said: {lastsaid(h, sid)}")
+
+        # A file alone needs no text
+        r = h.call("prompt", sid=sid, text="", files=["files/2-b.py"])
+        t.check(r.get("ok") == 1, f"a file alone: {r}")
+        ended(h, sid, 2)
+
+        def refused(r, err):
+            t.check(r.get("ok") == 0 and r.get("err", "").startswith(err), f"{err}: {r}")
+
+        refused(upfile(t, h, sid, b"\x7fELF\x00\x01", "a.out"),
+                "a.out is a binary file (6 bytes), so it is not attached")
+        refused(h.call("upload", kind="file", sid=sid, data="", off=0, done=1),
+                "a file's last part needs its name")
+        refused(h.call("prompt", sid=sid, text="x", files=["../events.jsonl"]),
+                "a file must be named as upload named it")
+        refused(h.call("prompt", sid=sid, text="x", files=["files/9-none.txt"]),
+                "no such file in the session")
+        refused(h.call("prompt", sid=sid, text="x", files="files/2-b.py"),
+                "files must be an array")
+        t.check(t.host.read(t.host.join(t.state, "sessions", sid, "files", "3-a.out")) is None,
+                "nothing kept of the binary")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def attach_text_long(t):
+    """A long file is cut as read cuts it, with where it goes on; the
+    agent reads the rest where it is kept, in its session's directory,
+    without an ask."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        data = "".join(f"line {i}\n" for i in range(1, 3001)).encode()
+        r = upfile(t, h, sid, data, "long.log")
+        t.check(r.get("ok") == 1 and r.get("lines") == 3000, f"uploaded: {r}")
+        h.call("prompt", sid=sid, text="look", files=[r["name"]])
+        ended(h, sid, 1)
+        said = fake_provider.user_text_all(t.requests()[0]["body"])
+        t.check("[Showing lines 1-2000 of 3000. To read more, call read with offset=2001.]"
+                in said, f"cut: {said[-300:]}")
+        t.check(lastsaid(h, sid) == "read on: yes", f"said: {lastsaid(h, sid)}")
+        t.check(not h.all("ask", sid), f"no ask: {h.all('ask', sid)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def attach_text_replay(t):
+    """Opened again, a session reads its attached files again from their
+    files; one gone becomes a note in its place, the turn going on. A
+    fork copies them; an import drops them."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        a = upfile(t, h, sid, b"one\ntwo\n", "a.txt")["name"]
+        b = upfile(t, h, sid, b"three\n", "b.txt")["name"]
+        h.call("prompt", sid=sid, text="one", files=[a, b])
+        ended(h, sid, 1)
+    finally:
+        h.close()
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        h.call("prompt", sid=sid, text="two")
+        ended(h, sid, 2)
+        t.check(lastsaid(h, sid) == "I see 3 lines, 0 lost.", f"said: {lastsaid(h, sid)}")
+
+        r = h.call("fork", sid=sid)
+        new = r.get("sid")
+        t.check(r.get("ok") == 1 and new, f"fork: {r}")
+        h.call("open", sid=new)
+        h.call("prompt", sid=new, text="forked")
+        ended(h, new, 2)
+        t.check(lastsaid(h, new) == "I see 3 lines, 0 lost.", f"forked: {lastsaid(h, new)}")
+
+        rmfile(t, t.host.join(t.state, "sessions", sid, "files", "2-b.txt"))
+        h.call("prompt", sid=sid, text="three")
+        ended(h, sid, 3)
+        t.check(lastsaid(h, sid) == "I see 2 lines, 1 lost.", f"said: {lastsaid(h, sid)}")
+
+        raw = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+        r = importlog(t, h, raw, model=t.model, endpoint="fake")
+        imp = r.get("sid")
+        t.check(r.get("ok") == 1, f"imported: {r}")
+        users = [e for e in logged(t, imp) if e["ev"] == "user"]
+        t.check(users and not any("files" in e for e in users), f"stripped: {users}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=15)
 def attach_steer(t):
     """A steer and a prompt with images, sent while a response streams,

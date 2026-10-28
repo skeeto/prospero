@@ -600,6 +600,26 @@ static void test_desktop(Test *t)
                "110000");
     }
 
+    // Attached text files' names, and a file's own made safe for one
+    {
+        Buf b(a, 64);
+        Str names[] = {"files/1-a.txt", "files/12-notes_v2.md", "files/0-a.txt",
+                       "files/1-", "files/-a", "files/1-a/b", "files/1-..x", "files/x-a",
+                       "img/1-a.txt", "files/1-a b"};
+        for (Str n : names) {
+            print(&b, validfile(n));
+        }
+        expect(t, "file names", finish(&b), "1100001000");
+        expect(t, "file safe", filesafe(a, "C:\\dir/my notes (1).txt"), "my_notes__1_.txt");
+        expect(t, "file safe empty", filesafe(a, "dir/"), "file");
+        expect(t, "file safe dots", filesafe(a, ".."), "file");
+        expect(t, "file safe long", istr(a, filesafe(a, concat(a, Str(
+               "0123456789012345678901234567890123456789"),
+               "0123456789012345678901234567890123456789")).len), "64");
+        Str made = concat(a, "files/3-", filesafe(a, "weird:name?.c"));
+        expect(t, "file safe valid", istr(a, validfile(made)), "1");
+    }
+
     // Screenshots leave in steps: none until keep+slack, then back to keep
     {
         Buf b(a, 128);

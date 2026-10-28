@@ -252,6 +252,9 @@ static Str capnames[] = {
                        // questions, answer {answers}, answers on the answer
                        // record, questions on the session record; model
                        // and shell while asked
+    "files",           // upload {kind:"file", name}, prompt and steer
+                       // {files}, and files on the user record: text files
+                       // attached, which take no vision
 };
 
 static Str evname(i32 ev)
@@ -991,16 +994,16 @@ static b32 nameend(u8 c)
            c=='[' || c==']' || c=='{' || c=='}' || c=='|' || c=='*' || c=='?';
 }
 
-// The out/, snap/ and img/ files a log names, as "out/NAME": in a relative
+// The out/, snap/, img/ and files/ files a log names, as "out/NAME": in a relative
 // path or after the session directory, with either separator, and also
 // without the dots that may end a sentence. Some may name nothing.
 static Slice<Str> lognames(Arena *a, Str log)
 {
-    static Str const dirs[] = {"out/", "snap/", "img/", "out\\\\", "snap\\\\"};
+    static Str const dirs[] = {"out/", "snap/", "img/", "files/", "out\\\\", "snap\\\\"};
     Slice<Str> r    = {};
     Map<b32>  *seen = 0;
     for (iz i = 0; i < log.len; i++) {
-        if (log[i]!='o' && log[i]!='s' && log[i]!='i') {
+        if (log[i]!='o' && log[i]!='s' && log[i]!='i' && log[i]!='f') {
             continue;
         }
         for (iz k = 0; k < countof(dirs); k++) {
@@ -1012,7 +1015,8 @@ static Slice<Str> lognames(Arena *a, Str log)
             iz end = beg;
             for (; end<log.len && !nameend(log[end]); end++) {}
             Str name = span(log.data+beg, log.data+end);
-            Str dir  = d[0]=='o' ? Str("out/") : d[0]=='i' ? Str("img/") : Str("snap/");
+            Str dir  = d[0]=='o' ? Str("out/") : d[0]=='i' ? Str("img/") :
+                       d[0]=='f' ? Str("files/") : Str("snap/");
             for (i32 pass = 0; pass<2 && name.len; pass++) {
                 Str  rel = concat(a, dir, name);
                 b32 *got = upsert(&seen, rel, a);
@@ -1471,7 +1475,8 @@ static b32 importkeeps(i32 ev)
 // Whether an import drops a field: of a tool result, one naming a file
 // or a session of the old state directory (spill, image, child, a
 // message's target), or describing one; of a message's notice, its
-// sender, whose title and text stay; of a user record, its images. The
+// sender, whose title and text stay; of a user record, its images and
+// files. The
 // URLs one session vouched for to another (urls) go too, as grants do.
 static b32 importdrops(i32 ev, Str key)
 {
@@ -1481,7 +1486,7 @@ static b32 importdrops(i32 ev, Str key)
     if (ev == EV_NOTICE) {
         return key == "from";
     } else if (ev == EV_USER) {
-        return key == "images";
+        return key=="images" || key=="files";
     }
     return key=="spill" || key=="bytes" || key=="image" || key=="width" ||
            key=="height" || key=="shot" || key=="child" || key=="host" ||

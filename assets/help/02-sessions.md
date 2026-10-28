@@ -48,6 +48,14 @@ own, as it is when sent too late for this turn), and its Withdraw
 button takes it back into the box. Stop, or Esc, cancels the turn and
 kills any command it runs.
 
+Attach adds files to the message: drop them on the window, paste them,
+or pick them with the paper clip. Images go to a model that takes
+them, as pictures. Any other file goes as text, as `read` shows it:
+numbered lines, the first 2000 or so, then a note to read on. The
+session keeps a copy in its own folder, so the agent can read the rest
+without asking. A binary file (one with a NUL byte) is refused. The
+transcript shows a folded "Attached:" line under the message.
+
 A long command or subagent keeps the agent from reading what you
 send until it ends. Run in background, on its row, or Ctrl+B (also in
 the Session menu and as `/background`) lets it go on by itself while

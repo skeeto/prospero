@@ -1483,7 +1483,7 @@ static b32 os_guisave(Os *os, Arena scratch, Str title, Str name, Mailbox *mb,
     return 1;
 }
 
-// The same for a file to open, a raw log or an image, answered as
+// The same for a file to open, a raw log or a file to attach, answered as
 // savedone does.
 static b32 os_guiopenfile(Os *os, Arena scratch, Str title, i32 kind, Mailbox *mb,
                           u32 type, u64 id)
@@ -1492,11 +1492,11 @@ static b32 os_guiopenfile(Os *os, Arena scratch, Str title, i32 kind, Mailbox *m
         {"Session logs (*.jsonl)", "jsonl"},
         {"All files", "*"},
     };
-    static SDL_DialogFileFilter const images[] = {
-        {"Images (*.png, *.jpg, *.gif, *.webp, *.bmp)", "png;jpg;jpeg;gif;webp;bmp"},
+    static SDL_DialogFileFilter const attach[] = {
         {"All files", "*"},
+        {"Images (*.png, *.jpg, *.gif, *.webp, *.bmp)", "png;jpg;jpeg;gif;webp;bmp"},
     };
-    SDL_DialogFileFilter const *filters = kind==OPEN_IMAGE ? images : logs;
+    SDL_DialogFileFilter const *filters = kind==OPEN_ATTACH ? attach : logs;
     GuiSdl  *p = (GuiSdl *)os->gui;
     SdlSave *s = (SdlSave *)SDL_malloc(sizeof(SdlSave));
     if (!p || !p->window || !s) {

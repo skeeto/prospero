@@ -108,7 +108,7 @@ extern "C" int       w32gui_save(void *, unsigned short const *title,
                                  void (*done)(void *ctx, unsigned short const *path),
                                  void const *ctx, int ctxlen);
 // The open dialog likewise, for a session's raw log (*.jsonl), or for
-// an image (images)
+// a file to attach, any or an image (images)
 extern "C" int       w32gui_openfile(void *, unsigned short const *title, int images,
                                      void (*done)(void *ctx, unsigned short const *path),
                                      void const *ctx, int ctxlen);
@@ -1261,7 +1261,7 @@ struct W32Save {
     HWND    main;    // the window, for its place at the call
     HWND    msgwin;  // the GUI thread's hidden window
     int     open;    // an open dialog, not a save dialog
-    int     images;  // and for an image
+    int     images;  // and for a file to attach, any or an image
     int     dir;     // or for a directory, starting in path
 };
 
@@ -1345,8 +1345,8 @@ static DWORD WINAPI savethread(void *arg)
                       OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
     if (s->open) {
         ofn.lpstrFilter = s->images
-                        ? L"Images (*.png, *.jpg, *.gif, *.webp, *.bmp)\0"
-                          L"*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp\0All files\0*.*\0"
+                        ? L"All files\0*.*\0Images (*.png, *.jpg, *.gif, *.webp, *.bmp)\0"
+                          L"*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp\0"
                         : L"Session logs (*.jsonl)\0*.jsonl\0All files\0*.*\0";
         ofn.Flags       = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
                           OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
@@ -1822,7 +1822,7 @@ static b32 os_guiopenfile(Os *os, Arena scratch, Str title, i32 kind, Mailbox *m
 {
     W32SaveCtx c = {mb, type, id};
     return w32gui_openfile(os->gui, (unsigned short *)towide(&scratch, title).data,
-                           kind==OPEN_IMAGE, savedone, &c, (int)sizeof(c));
+                           kind==OPEN_ATTACH, savedone, &c, (int)sizeof(c));
 }
 
 static b32 os_guiopendir(Os *os, Arena scratch, Str title, Str at, Mailbox *mb,

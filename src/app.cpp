@@ -981,6 +981,7 @@ enum : i32 {
     ATT_SENDING,    // and then the prompt or steer naming them
 };
 
+// An attachment: an image, or a text file (file).
 struct AttImage {
     Region *r;      // what follows, until sent or removed
     Arena   mem;
@@ -990,7 +991,10 @@ struct AttImage {
     i32     h;
     GuiTex *tex;    // its thumbnail, null if it did not decode
     Str     label;  // where it came from: a file's name, else empty
-    Str     name;   // as uploaded, img/N.png or img/N.jpg
+    Str     name;   // as uploaded, img/N.png or img/N.jpg, or files/N-NAME
+    b32     file;   // a text file, not an image
+    i64     bytes;  // and its size
+    i64     lines;
 };
 
 struct AttBox {
@@ -3836,20 +3840,22 @@ static Str  shorten(Arena *, Str, iz);
 
 // Attachments (AttBox, above Gui)
 
-// Why the session takes no image now, or empty if it does.
+// Why the session takes no attachment now, or empty if it does: a text
+// file, if its engine takes them ("files"), else an image, if its
+// model has vision.
 static Str attachwhy(GuiSession *s)
 {
     AttBox *x = s ? s->att : 0;
     if (!s || !s->view || s->readonly) {
-        return "Open a session to attach images to its next message";
+        return "Open a session to attach files to its next message";
     } else if (!hostcap(s->host, "images")) {
-        return "This host's engine is too old to take images: update the engine";
-    } else if (s->view->novision) {
+        return "This host's engine is too old to take attachments: update the engine";
+    } else if (s->view->novision && !hostcap(s->host, "files")) {
         return "This model takes no images: [model] vision is off for it";
     } else if (x && x->state!=ATT_IDLE) {
-        return "Wait for the images being sent";
+        return "Wait for the attachments being sent";
     } else if (x && x->len==ATTACH_MAX) {
-        return "At most 10 images go in a message";
+        return "At most 10 files go in a message";
     }
     return {};
 }
@@ -3882,18 +3888,47 @@ static GuiTex *attthumb(Gui *g, Str data)
     return t;
 }
 
-// Attach an image, PNG, JPEG, GIF, WebP or BMP, its bytes copied, which
-// the engine converts to a PNG if not a PNG or JPEG. Returns why not, or
-// empty if attached.
+// Attach an image, PNG, JPEG, GIF, WebP or BMP, which the engine
+// converts to a PNG if not a PNG or JPEG, or else a text file, which the
+// agent gets as read shows it, its bytes copied. A binary file, by read's
+// measure, is refused. Returns why not, or empty if attached.
 static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
 {
     Str why = attachwhy(s);
     if (why.len) {
         return why;
     }
-    ImageKind k = imagekind(g->frame, data);
-    if (!k.mime.len) {
-        return "not an image: only PNG, JPEG, GIF, WebP and BMP can be attached";
+    ImageKind k    = imagekind(g->frame, data);
+    Str       name = label.len ? label : Str("the pasted file");
+    if (!k.mime.len && !hostcap(s->host, "files")) {
+        return "not an image: only PNG, JPEG, GIF, WebP and BMP can be attached "
+               "here, as this host's engine is too old to take text files";
+    } else if (!k.mime.len && readbinary(data)) {
+        return concat(&g->frame, name, " is a binary file: only text files and "
+                                       "images can be attached");
+    } else if (!k.mime.len && data.len>ATTACH_FILE) {
+        return "too large to attach: a text file is at most 16 MiB";
+    } else if (!k.mime.len) {
+        Region *r = os_reserve(g->os, data.len + label.len + 4096);
+        if (!r) {
+            return "out of memory to attach it";
+        }
+        if (!s->att) {
+            s->att = alloc<AttBox>(&g->perm);
+        }
+        AttImage *m = s->att->imgs + s->att->len++;
+        *m = {};
+        m->r     = r;
+        m->mem   = newarena(r);
+        m->data  = clone(&m->mem, data);
+        m->label = clone(&m->mem, label.len ? label : Str("pasted.txt"));
+        m->file  = 1;
+        m->bytes = data.len;
+        m->lines = countlines(startswith(data, "\xef\xbb\xbf") ? cuthead(data, 3) : data);
+        scheddirty(&g->sched);
+        return {};
+    } else if (s->view->novision) {
+        return "This model takes no images: [model] vision is off for it";
     } else if (k.w<1 || k.h<1) {
         return concat(&g->frame, concat(&g->frame, "a damaged ", k.name),
                       concat(&g->frame, ": its size cannot be read: ", k.err));
@@ -3921,7 +3956,7 @@ static Str attachadd(Gui *g, GuiSession *s, Str data, Str label)
     return {};
 }
 
-// Attach an image file, by its path.
+// Attach a file, an image or text, by its path.
 static Str attachfile(Gui *g, GuiSession *s, Str path)
 {
     Str why = attachwhy(s);
@@ -3939,7 +3974,7 @@ static Str attachfile(Gui *g, GuiSession *s, Str path)
     Str   name = cuthead(path, i);
     Str   err  = {};
     if (rd.err == READ_TOOBIG) {
-        err = "too large to attach: an image is at most 64 MiB";
+        err = "too large to attach: an image is at most 64 MiB, a text file 16 MiB";
     } else if (rd.err != READ_OK) {
         err = concat(&g->frame, "cannot read ", path);
     } else {
@@ -3947,6 +3982,31 @@ static Str attachfile(Gui *g, GuiSession *s, Str path)
     }
     os_release(g->os, r);
     return err;
+}
+
+// A text file the queue gave back, already in the session's directory.
+static void attachnamedfile(Gui *g, GuiSession *s, Json *k)
+{
+    Str name = jsonstr(jsonget(k, "name"));
+    if (attachwhy(s).len || !startswith(name, "files/") || name.len>128) {
+        return;
+    }
+    Region *r = os_reserve(g->os, 4096);
+    if (!r) {
+        return;
+    }
+    if (!s->att) {
+        s->att = alloc<AttBox>(&g->perm);
+    }
+    AttImage *m = s->att->imgs + s->att->len++;
+    *m = {};
+    m->r     = r;
+    m->mem   = newarena(r);
+    m->name  = clone(&m->mem, name);
+    m->label = cut(cuthead(m->name, 6), '-').tail;
+    m->file  = 1;
+    m->bytes = jsonint(jsonget(k, "bytes"), 0);
+    m->lines = jsonint(jsonget(k, "lines"), 0);
 }
 
 // An image the queue gave back, already in the session's directory.
@@ -4037,7 +4097,7 @@ static void attachnext(Gui *g, GuiSession *s)
         Str       data = base64(&a, Str{m->data.data+x->off, n});
         Buf       b(&a, 256 + data.len);
         EvOut     w    = cmdopen(g, &b, CMD_UPLOAD, s);
-        putstrkey(&w.json, "kind", "image");
+        putstrkey(&w.json, "kind", m->file ? Str("file") : Str("image"));
         if (x->toklen) {
             putstrkey(&w.json, "token", Str{x->token, x->toklen});
         }
@@ -4045,6 +4105,9 @@ static void attachnext(Gui *g, GuiSession *s)
         putintkey(&w.json, "off", x->off);
         if (x->off+n == m->data.len) {
             putintkey(&w.json, "done", 1);
+            if (m->file) {
+                putstrkey(&w.json, "name", m->label);  // its own, made safe there
+            }
         }
         x->state = ATT_UPLOADING;
         x->cur   = i;
@@ -4052,15 +4115,30 @@ static void attachnext(Gui *g, GuiSession *s)
         cmdsend(g, &w, a);
         return;
     }
-    Buf   b(&a, 256 + 2*x->text.len + 32*x->len);
+    Buf   b(&a, 256 + 2*x->text.len + 160*x->len);
     EvOut w = cmdopen(g, &b, s->view->busy ? CMD_STEER : CMD_PROMPT, s);
     putstrkey(&w.json, "text", x->text);
+    // The images, and the text files only if any, which older engines refuse
+    b32 files = 0;
     putkey(&w.json, "images");
     putarray(&w.json);
     for (i32 k = 0; k < x->len; k++) {
-        putstr(&w.json, x->imgs[k].name);
+        files |= x->imgs[k].file;
+        if (!x->imgs[k].file) {
+            putstr(&w.json, x->imgs[k].name);
+        }
     }
     putend(&w.json);
+    if (files) {
+        putkey(&w.json, "files");
+        putarray(&w.json);
+        for (i32 k = 0; k < x->len; k++) {
+            if (x->imgs[k].file) {
+                putstr(&w.json, x->imgs[k].name);
+            }
+        }
+        putend(&w.json);
+    }
     x->state = ATT_SENDING;
     x->id    = g->nextid;
     s->cmdid = g->nextid;  // its failure puts the text back (onsesscmd)
@@ -4080,7 +4158,7 @@ static void attachsend(Gui *g, GuiSession *s, Str text)
     attachnext(g, s);
 }
 
-// A reply to an upload of an attached image: on to the next part.
+// A reply to an upload of an attachment: on to the next part.
 static void onattach(Gui *g, GuiSession *s, EvRec *r)
 {
     AttBox   *x     = s->att;
@@ -4095,7 +4173,7 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
         attachfail(g, s, err.len ? err : Str("the upload failed"));
         return;
     } else if (token.len!=countof(x->token) || off<=x->off || off>m->data.len ||
-               (off==m->data.len && (!name.len || name.len>64))) {
+               (off==m->data.len && (!name.len || name.len>128))) {
         attachfail(g, s, "the host's answer to an upload came garbled");
         return;
     }
@@ -4110,12 +4188,12 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
     attachnext(g, s);
 }
 
-// Ask for an image file to attach (TASK_ATTACH).
+// Ask for a file to attach (TASK_ATTACH): text, or an image.
 static void attachpick(Gui *g, GuiSession *s)
 {
     g->attask++;
     g->attsess = s;
-    if (!os_guiopenfile(g->os, g->frame, "Attach an image", OPEN_IMAGE, g->tasks,
+    if (!os_guiopenfile(g->os, g->frame, "Attach a file", OPEN_ATTACH, g->tasks,
                         TASK_ATTACH, g->attask)) {
         setnote(g, s, "cannot ask for a file here", 1);
     }
@@ -4195,8 +4273,8 @@ static void gui_drop(Gui *g, Str path, b32 app)
     scheddirty(&g->sched);
 }
 
-// Paste: the clipboard's image, or its image file, attached. Returns 0
-// if it holds neither, for the box to paste its text.
+// Paste: the clipboard's image, or its file, attached, an image or
+// text. Returns 0 if it holds neither, for the box to paste its text.
 static b32 attachpaste(Gui *g, GuiSession *s)
 {
     Region *r = os_reserve(g->os, ATTACH_UPLOAD + 4096);
@@ -4212,26 +4290,14 @@ static b32 attachpaste(Gui *g, GuiSession *s)
                   "input (no real input's serial): pasting what the checklist put there");
         c.data = g->clippng;
     }
-    Str       ext = {};
-    for (iz i = c.path.len; i > 0; i--) {
-        if (c.path[i-1] == '.') {
-            ext = cuthead(c.path, i);
-            break;
-        }
-    }
-    u8  low[4] = {};
-    b32 img    = ext.len==3 || ext.len==4;
-    for (iz i = 0; img && i < ext.len; i++) {
-        low[i] = (u8)(ext[i]>='A' && ext[i]<='Z' ? ext[i]+32 : ext[i]);
-    }
-    ext = {low, ext.len};
-    img = img && (ext=="png" || ext=="jpg" || ext=="jpeg" || ext=="gif" ||
-                  ext=="webp" || ext=="bmp");
-    Str err = {};
-    b32 got = c.data.len>0 || img;
+    // A file of any kind, as an image's has always been; a folder is no
+    // attachment, so its path pastes as text
+    b32 file = c.path.len && os_stat(g->os, a, c.path).type==STAT_FILE;
+    Str err  = {};
+    b32 got  = c.data.len>0 || file;
     if (c.data.len) {
         err = attachadd(g, s, c.data, {});
-    } else if (img) {
+    } else if (file) {
         err = attachfile(g, s, c.path);
     }
     os_release(g->os, r);
@@ -4629,6 +4695,9 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
                                        : text);
             for (Json *k = jsonget(j, "images")->child; k; k = k->next) {
                 attachnamed(g, q.s, k);  // and its images, attached again
+            }
+            for (Json *k = jsonget(j, "files")->child; k; k = k->next) {
+                attachnamedfile(g, q.s, k);  // and its text files
             }
             g->promptfocus = q.s == g->sess;
         } else if (q.s) {
@@ -9669,7 +9738,7 @@ enum : i32 {
     OP_MAXIMIZE,  // maximize the window (macOS: zoom), as its button would;
                   // dx 1: fill the primary display unmaximized (macOS's
                   // Fill), else skip the next op where that is no maximum
-    OP_DROP,      // write a dx by dy PNG to --cwd as text, and drop it there
+    OP_DROP,      // write a dx by dy PNG (or dy lines, .txt) to --cwd as text, drop it
                   // (a flat gray JPEG if text ends in .jpg)
     OP_CLIPPNG,   // the clipboard's text kept, a dx by dy PNG put there
     OP_CLIPBACK,  // the clipboard's text put back
@@ -9994,6 +10063,7 @@ enum : i32 {
     CHK_MSGSENDER,    // the link showed the sender, whose row links back
     CHK_ATTACHED,     // dx images attached to the draft, their thumbnails drawn
     CHK_USERIMAGES,   // the latest user message has dx images, drawn
+    CHK_USERFILES,    // the latest attached-files note is labeled text
     CHK_BROWSED,      // Browse put its directory in the new session dialog
     CHK_BROWSEOFF,    // Browse is off for a remote host's directory
     CHK_PLANEDITING,  // the plan is out in the editor, Approve held
@@ -10263,6 +10333,7 @@ static Str chknames[] = {
     "the link showed the subagent, its message row linking back",
     "the images attached show above the box",
     "the message shows the images sent with it",
+    "the message notes the files sent with it",
     "Browse put the directory chosen in the field",
     "Browse is off for a directory on a remote host",
     "the plan is open in the editor, Approve held meanwhile",
@@ -13757,6 +13828,22 @@ static DriveOp composeops[] = {
     {OP_SHOT, 0, 0, 0, 300, "compose-fit"},
     KEY(GKEY_ESCAPE, 0, 1000),
     {OP_CHECK, CHK_SHOTCLOSED, 0, 0, 0, ""},
+    // E2: a text file dropped is attached as a file, its chip in the box,
+    // its lines read by the agent, a folded note on the message
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_DROP, 0, 0, 3, 800, "notes.txt"},
+    {OP_CHECK, CHK_ATTACHED, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "compose-file"},
+    CLICK(T_PROMPT, "", 200),
+    {OP_TEXT, 0, 0, 0, 200, "Describe the files."},
+    KEY(GKEY_ENTER, 0, 300),
+    {OP_WAIT, W_TURNS, 1, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 600, ""},
+    {OP_CHECK, CHK_ATTACHED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_USERIMAGES, 0, 0, 0, "I see 3 lines, 0 lost."},
+    {OP_CHECK, CHK_USERFILES, 0, 0, 0, "Attached: notes.txt"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-filesent"},
     // C: enough of a conversation for /compact, with a focus
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
@@ -15442,6 +15529,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         return m && m->images.len==(iz)op->dx && g->userthumbs==(i32)op->dx &&
                (!op->text.len || (a && a->text==op->text));
     }
+    case CHK_USERFILES: {
+        ViewMsg *m = lastmsg(g, VIEW_NOTE);
+        return m && m->fold && m->label==g->ops[g->drivepc-1].text;
+    }
     case CHK_QUEUESHOWN: {
         DriveOp *op = &g->ops[g->drivepc-1];
         return g->sess && v->queue.len==(iz)op->dx && g->queueshown==(i32)op->dx &&
@@ -16995,8 +17086,18 @@ static void drivestep(Gui *g)
                 p[3] = 255;
             }
         }
+        // A .txt is dy numbered lines of text instead
         Str png = endswith(op->text, ".jpg") ? flatjpeg(&a, w, h) :
                   pngencodez(&a, px, w, h, 0);
+        if (endswith(op->text, ".txt")) {
+            Buf t(&a, 64*(iz)op->dy);
+            for (i32 i = 1; i <= (i32)op->dy; i++) {
+                print(&t, "Line ");
+                print(&t, (i64)i);
+                print(&t, " of the dropped notes.\n");
+            }
+            png = finish(&t);
+        }
         if (op->op == OP_CLIPPNG) {
             char const *t = ImGui::GetClipboardText();
             g->clipkept = t ? clone(&g->perm, Str{(u8 *)t, (iz)__builtin_strlen(t)}) : Str{};

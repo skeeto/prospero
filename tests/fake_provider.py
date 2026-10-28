@@ -2637,7 +2637,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Start a subagent that messages", "Message the parent as a subagent",
                "Describe the images", "Ask on the side", "Run a long command",
                "Stream, then pause", "Call the MCP server", "Remember the hosts",
-               "Answer with links", "Ask me questions")
+               "Answer with links", "Ask me questions", "Describe the files")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2722,6 +2722,9 @@ def sc_gui(model, n, req):
         ok = all(base64.b64decode(data).startswith(magic.get(mime, b"?"))
                  for mime, data in images)
         yield from answer(model, f"I see {len(images)} images{'' if ok else ', some broken'}.")
+    elif "Describe the files" in prompt:
+        # Attached as text: its numbered lines, as read shows them
+        yield from sc_attach_text(model, n, req)
     elif "Answer with links" in prompt:
         # Each kind of link the window follows, one a line, at its start
         yield from answer(model, "Links:\n\n"
@@ -4606,6 +4609,46 @@ def sc_attach_steer(model, n, req):
 
 def sc_an_attach(model, n, req):
     yield from an_answer(model, req, f"I see {len(user_images(req))} images.")
+
+
+def user_text_all(req):
+    """All the text of a request's user messages, joined."""
+    out = []
+    for m in req.get("messages", []):
+        c = m.get("content")
+        if m.get("role") != "user":
+            continue
+        if isinstance(c, list):
+            out += [p.get("text", "") for p in c if p.get("type") == "text"]
+        else:
+            out.append(str(c or ""))
+    return "\n".join(out)
+
+
+def sc_attach_text(model, n, req):
+    # How many numbered lines of attached files the request has
+    lines = re.findall(r"(?m)^ +\d+\t", user_text_all(req))
+    lost = user_text_all(req).count(" lost: its file could not be read]")
+    yield from answer(model, f"I see {len(lines)} lines, {lost} lost.")
+
+
+sc_attach_text_replay = sc_attach_text
+sc_attach_text_b = sc_attach_text  # its model without vision
+
+
+def sc_attach_text_long(model, n, req):
+    # The file cut, the agent reads on from where it is kept
+    msgs = req.get("messages", [])
+    if msgs and msgs[-1].get("role") == "tool":
+        got = str(msgs[-1].get("content", ""))
+        yield from answer(model, "read on: " + ("yes" if "  2500\tline 2500" in got else "no"))
+        return
+    m = re.search(r"kept at (.*?), where read continues it", user_text_all(req))
+    cut = re.search(r"call read with offset=(\d+)", user_text_all(req))
+    if not m or not cut:
+        yield from answer(model, "no path")
+        return
+    yield from tool(model, n, "read", {"path": m.group(1), "offset": int(cut.group(1))})
 
 
 def sc_nofolder(model, n, req):

@@ -1773,6 +1773,33 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->msgs[i].label = via=="steer" ? Str("You (steering)") :
                            via=="queue" ? Str("You (queued)") :
                            via=="task"  ? Str("Task from the parent agent") : Str{};
+        // Its text files, as a folded note: their names, and where each is
+        // kept, as the agent was told
+        Json *files = jsonget(j, "files");
+        if (files->child) {
+            Buf names(&scratch, 256);
+            Buf body(&scratch, 512);
+            for (Json *k = files->child; k; k = k->next) {
+                Str name = jsonstr(jsonget(k, "name"));
+                i64 n    = jsonint(jsonget(k, "lines"), 0);
+                print(&names, names.len ? Str(", ") : Str(""));
+                print(&names, cut(cuthead(name, 6), '-').tail);
+                print(&body, "- `");
+                print(&body, name);
+                print(&body, "`: ");
+                print(&body, n);
+                print(&body, n==1 ? Str(" line, ") : Str(" lines, "));
+                print(&body, jsonint(jsonget(k, "bytes"), 0));
+                print(&body, " bytes\n");
+            }
+            print(&body, "\nThe agent has each as its read tool shows it, before the "
+                         "message, and reads on from the session's folder.");
+            i32 k = addmsg(v, VIEW_NOTE, finish(&body));
+            v->msgs[k].seq       = r->seq;
+            v->msgs[k].fold      = 1;
+            v->msgs[k].collapsed = 1;
+            v->msgs[k].label     = concat(&v->aux, "Attached: ", finish(&names));
+        }
         if (skill.len) {
             iz  end  = find(text, "\n</skill>");
             Str body = end<0 ? text : takehead(text, end + 9);

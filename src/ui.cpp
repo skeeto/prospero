@@ -4608,13 +4608,28 @@ static void drawattached(Gui *g, GuiSession *s)
         cx += box + gap;
         dl->AddRectFilled(c0, c1, g->pal->codebg, 4*sc);
 
-        // The image fit in the box: its own thumbnail, else as uploaded
+        // The image fit in the box: its own thumbnail, else as uploaded;
+        // a text file, its icon and its name, as much as fits
         ImTextureData *td = m->tex ? &m->tex->td : 0;
-        if (!td && m->name.len) {
+        if (m->file) {
+            f32 fs = ImGui::GetFontSize();
+            ImU32 col = busy ? g->pal->dim : ImGui::GetColorU32(ImGuiCol_Text);
+            dl->AddText(ImGui::GetFont(), 1.6f*fs, v2(c0.x + (box - 1.6f*fs)/2, c0.y + 6*sc),
+                        col, ICON_FILE);
+            dl->PushClipRect(v2(c0.x+3*sc, c0.y), v2(c1.x-3*sc, c1.y), true);
+            Str    t  = m->label;
+            ImVec2 ts = ImGui::CalcTextSize(t.cdata, t.cdata+t.len);
+            f32    tx = ts.x < box-6*sc ? c0.x + (box - ts.x)/2 : c0.x + 3*sc;
+            dl->AddText(v2(tx, c1.y - fs - 6*sc), col, t.cdata, t.cdata+t.len);
+            dl->PopClipRect();
+            g->attready++;
+        } else if (!td && m->name.len) {
             ImgSlot *sl = imgslot(g, s, m->name);
             td = sl && sl->state==IMG_READY ? &sl->tex->td : 0;
         }
-        if (td) {
+        if (m->file) {
+            // drawn above
+        } else if (td) {
             f32 iw = (f32)td->Width;
             f32 ih = (f32)td->Height;
             f32 k  = box/iw < box/ih ? box/iw : box/ih;
@@ -4653,14 +4668,19 @@ static void drawattached(Gui *g, GuiSession *s)
             Buf b(&a, 128 + m->label.len);
             print(&b, m->label.len ? m->label : Str("Pasted"));
             print(&b, ", ");
-            print(&b, (i64)m->w);
-            putbyte(&b, 'x');
-            print(&b, (i64)m->h);
-            putbyte(&b, ' ');
-            print(&b, imagename(m->mime));
-            if (m->data.len) {
+            if (m->file) {
+                print(&b, m->lines);
+                print(&b, m->lines==1 ? Str(" line of text") : Str(" lines of text"));
+            } else {
+                print(&b, (i64)m->w);
+                putbyte(&b, 'x');
+                print(&b, (i64)m->h);
+                putbyte(&b, ' ');
+                print(&b, imagename(m->mime));
+            }
+            if (m->data.len || m->bytes) {
                 print(&b, ", ");
-                print(&b, bytesize(&a, m->data.len));
+                print(&b, bytesize(&a, m->data.len ? m->data.len : m->bytes));
             }
             print(&b, busy ? Str(": being sent") : Str(": sent with the next message"));
             ImGui::SetTooltip("%s", cstr0(&a, finish(&b)));
@@ -4671,7 +4691,7 @@ static void drawattached(Gui *g, GuiSession *s)
     ImGui::SetCursorScreenPos(p);
     ImGui::Dummy(v2(maxw, cy + box));
     if (busy) {
-        ImGui::TextDisabled(x->state==ATT_UPLOADING ? "sending the images..." : "sending...");
+        ImGui::TextDisabled(x->state==ATT_UPLOADING ? "sending the attachments..." : "sending...");
     }
     g->attshown = x->len;
     if (drop >= 0) {
@@ -4906,8 +4926,13 @@ static void drawprompt(Gui *g)
         }
         ImGui::EndDisabled();
         itemnamed(g, "attach");
-        whytip(why.len ? why : Str("Attach an image, PNG, JPEG, GIF, WebP or BMP, to the next message: "
-                                   "or drop one on the window, or paste one"));
+        whytip(why.len ? why :
+               hostcap(s->host, "files")
+               ? Str("Attach a file to the next message: a text file, which the agent "
+                     "gets as its read tool shows it, or an image (PNG, JPEG, GIF, WebP or "
+                     "BMP). Or drop one on the window, or paste one.")
+               : Str("Attach an image, PNG, JPEG, GIF, WebP or BMP, to the next message: "
+                     "or drop one on the window, or paste one"));
     }
     if (s->hist) {
         // Which of the session's messages the box holds: oldest is 1

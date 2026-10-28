@@ -377,6 +377,20 @@ static void test_tools(Test *t)
         os_write(os, *a, "/w/bin", Str{(u8 *)"a\0b", 3});
         o = toolread(os, a, "/w", "/w/bin", &none, 0);
         expect(t, "read binary", istr(a, !o.ok && startswith(o.text, "This is a binary file")), "1");
+
+        // read's body and its binary test, as attached files have them
+        expect(t, "readbinary nul", istr(a, readbinary(Str{(u8 *)"a\0b", 3})), "1");
+        expect(t, "readbinary text", istr(a, readbinary("plain\n")), "0");
+        {
+            Buf late(a, 9000);
+            for (i32 i = 0; i < 8192; i++) putbyte(&late, 'x');
+            putbyte(&late, 0);
+            expect(t, "readbinary late nul", istr(a, readbinary(finish(&late))), "0");
+        }
+        expect(t, "readbody head", readbody(a, "\xef\xbb\xbfone\ntwo\n", "[H]\n", 1, 1),
+               "[H]\n     1\tone\n[Showing lines 1-1 of 2. To read more, call read with "
+               "offset=2.]\n");
+        expect(t, "readbody empty", readbody(a, "", "[H]\n", 1, 10), "[H]\n(empty file)");
         Buf longline(a, 5000);
         for (i32 i = 0; i < 2500; i++) putbyte(&longline, 'x');
         os_write(os, *a, "/w/long.txt", finish(&longline));

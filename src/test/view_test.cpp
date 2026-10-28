@@ -1172,6 +1172,23 @@ static void test_viewpanels(Test *t)
                "To the agent: skill pdf1");
     }
 
+    // Text files attached: a folded note of them after the message
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"user","via":"prompt","text":"look",)"
+                    R"("files":[{"name":"files/1-a.txt","bytes":12,"lines":2},)"
+                    R"({"name":"files/2-b_c.md","bytes":5,"lines":1}]})");
+        expect(t, "panels.files", msgsshow(&a, v),
+               "U:look;N:- `files/1-a.txt`: 2 lines, 12 bytes\n- `files/2-b_c.md`: 1 line, "
+               "5 bytes\n\nThe agent has each as its read tool shows it, before the message, "
+               "and reads on from the session's folder.;");
+        expect(t, "panels.filesnote", concat(&a, v->msgs[1].label, istr(&a, v->msgs[1].collapsed)),
+               "Attached: a.txt, b_c.md1");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"user","via":"prompt","text":"none"})");
+        expect(t, "panels.nofiles", istr(&a, v->msgs.len), "3");
+    }
+
     // Instruction files, each once as last told; a task's report as
     // markdown, its subagent named; a command moved to the background
     {

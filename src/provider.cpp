@@ -211,6 +211,15 @@ struct MsgImage {
     Str alt;   // with this text in its place (its file is lost)
 };
 
+// A text file the user attached to a message, kept in the session's
+// directory: a request has it, as read shows it, before the message's
+// own text.
+struct MsgFile {
+    Str name;   // relative to the session's directory: files/N-NAME
+    i64 bytes;
+    i64 lines;
+};
+
 struct Msg {
     i32          role;
     Str          text;    // user and tool messages
@@ -229,6 +238,7 @@ struct Msg {
     Str          imgalt;  // with this text in its place
     i32          floor;   // FLOOR_*: a cache breakpoint just before it
     Slice<MsgImage> images;  // user messages: those attached
+    Slice<MsgFile>  files;   // and the text files
 };
 
 // Where a request's prefix stops matching the one before, at a step of

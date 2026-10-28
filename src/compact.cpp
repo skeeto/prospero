@@ -72,6 +72,12 @@ static i64 msgbytes(Msg *m)
         n += 16 + b->text.len + b->sig.len + b->args.len + b->name.len +
              b->id.len;
     }
+    for (iz i = 0; i < m->files.len; i++) {
+        // As much as read shows of it, with its lines' numbers
+        MsgFile *f = &m->files[i];
+        n += 128 + (f->bytes<READ_BYTES ? f->bytes : (i64)READ_BYTES) +
+             8*(f->lines<READ_LINES ? f->lines : (i64)READ_LINES);
+    }
     return n;
 }
 

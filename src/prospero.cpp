@@ -546,7 +546,7 @@ static b32     os_guisave(Os *, Arena scratch, Str title, Str name, Mailbox *,
 // record of the type with id. Returns 0 if no dialog can be shown.
 enum : i32 {
     OPEN_LOG,    // a session's raw log (*.jsonl)
-    OPEN_IMAGE,  // an image to attach (*.png, *.jpg, *.jpeg, *.gif, *.webp, *.bmp)
+    OPEN_ATTACH, // a file to attach: any, or an image (*.png, *.jpg, ...)
 };
 static b32     os_guiopenfile(Os *, Arena scratch, Str title, i32 kind,
                               Mailbox *, u32 type, u64 id);
