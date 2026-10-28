@@ -1060,10 +1060,10 @@ static void hostrecord(Host *h, Arena scratch, Str line)
     } else if (r.ev == EV_REPLY) {
         hostreplied(h, scratch, &r, line);
         return;
-    } else if (r.ev == EV_CONFIG) {
-        // The configuration loaded again: for every client, but a client
-        // behind misses it (it asks for the configuration when it next
-        // shows it)
+    } else if (r.ev==EV_CONFIG || r.ev==EV_WORKTREE) {
+        // The configuration loaded again, or a worktree's news: for
+        // every client, but a client behind misses it (it asks for the
+        // configuration when it next shows it, and lists sessions)
         for (HostClient *c = h->clients; c; c = c->next) {
             if (!c->gone) {
                 hostput(c, line, hostreserve(c));

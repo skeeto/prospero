@@ -99,6 +99,7 @@ enum : u32 {
     MAIL_TOOLONG,     // frontend to engine: a command too long, by its id
     MAIL_DISTROS,     // the WSL distros, a line each (farinit)
     MAIL_GIT,         // git's answer for a repository (git.cpp)
+    MAIL_WORKTREE,    // a worktree job's answer (worktree.cpp)
 };
 
 enum : i64 {
@@ -778,6 +779,14 @@ struct Lister {
     Slice<EpListing> eps;
 };
 
+// A worktree job posted and not yet answered (worktree.cpp).
+struct WtJob {
+    i64 id;
+    i32 kind;
+    Str path;
+    Str sid;
+};
+
 // Engine functions take scratch by value, so that whatever a caller has
 // allocated in its own scratch stays intact below them.
 struct Engine {
@@ -822,6 +831,9 @@ struct Engine {
     u64         farserial;
     Slice<Str>  distros;  // the WSL distros installed, as last listed
     GitWork    *git;      // runs git for sessions' changes, once asked
+    GitWork    *wt;       // runs git for worktrees (worktree.cpp)
+    Slice<WtJob> wtjobs;  // worktree jobs not yet answered
+    i64         wtserial;
 };
 
 
@@ -1914,6 +1926,11 @@ static void farmail(Engine *, Arena, HostLink *, Record);
 static void cmdgit(Engine *, Arena, i64, Json *);
 static void gitdone(Engine *, Arena, Str);
 static void gitquit(Engine *);
+
+// Worktree sessions (worktree.cpp)
+static void wtdone(Engine *, Arena, Str);
+static b32  wtbusy(Engine *);
+static void wtquit(Engine *);
 static void taskcheck(Session *, Arena, Str why, Str err);
 static b32  taskbudget(Session *, Arena);
 static b32  taskwake(Session *);
@@ -17581,6 +17598,7 @@ static void command(Engine *e, Arena scratch, Str line)
             stopjobs(t, scratch, 1);
         }
         farstop(e, scratch, 1);
+        wtquit(e);  // a job under way is asked to stop, and waited for
         reply(e, scratch, id, 1, {}, {});
     } return;
     case CMD_CONFIGGET:
@@ -17871,6 +17889,9 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         return;
     } else if (r.type == MAIL_GIT) {
         gitdone(e, scratch, r.data);
+        return;
+    } else if (r.type == MAIL_WORKTREE) {
+        wtdone(e, scratch, r.data);
         return;
     } else if ((r.type==MAIL_OUT || r.type==MAIL_QUIT) && farbyout(e, r.id)) {
         farmail(e, scratch, farbyout(e, r.id), r);  // a link's, to another host
@@ -18163,7 +18184,7 @@ static void enginethread(void *arg)
 
         // Cancelling ends turns at once, but should a turn linger, the
         // engine stops anyway once the wait is over
-        if (e->quitting && ((allidle(e) && !farbusy(e)) || now>=e->quitby)) {
+        if (e->quitting && ((allidle(e) && !farbusy(e) && !wtbusy(e)) || now>=e->quitby)) {
             for (Session *s = e->sessions; s; s = s->next) {
                 logclose(&s->log);
                 if (s->lock >= 0) {
@@ -18179,6 +18200,7 @@ static void enginethread(void *arg)
             e->parked = {};
             mcpquit(e);
             gitquit(e);
+            wtquit(e);
             mailpost(e->out, MAIL_QUIT, 0, {}, 1);
             return;
         }

@@ -65,6 +65,7 @@ enum : i32 {
     EV_DEPLOY,  // (M5) progress deploying an engine to a remote machine
     EV_QUEUE,   // what the user sent that waits to be taken in
     EV_CONFIG,  // the configuration was loaded again (rev)
+    EV_WORKTREE,  // a worktree made, failed, removed or kept
     EV_COUNT,
 };
 
@@ -120,6 +121,7 @@ static EvInfo evinfo[] = {
     {"deploy",     0, 0},
     {"queue",      0, 0},
     {"config",     0, 0},
+    {"worktree",   0, 0},
 };
 static_assert(countof(evinfo) == EV_COUNT);
 

@@ -615,6 +615,7 @@ static u32     os_guilimits(Os *);
 #include "help.cpp"   // after config.cpp and mcp.cpp: cfgkinds, hexval
 #include "engine.cpp"
 #include "git.cpp"
+#include "worktree.cpp"
 #include "cli.cpp"
 #include "host.cpp"
 #include "door.cpp"

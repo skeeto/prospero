@@ -33,6 +33,7 @@
 enum : i64 {
     GIT_WALKMAX    = 256,        // directories walked up to a repository
     GIT_HEADMAX    = 1 << 10,    // bytes of HEAD and the files beside it
+    GIT_PACKEDMAX  = 64 << 20,   // bytes of packed-refs
     GIT_OUTMAX     = 4 << 20,    // bytes of git's output kept
     GIT_FILESMAX   = 100000,     // files taken from it, which bounds memory
     GIT_ERRMAX     = 16 << 10,   // bytes of its standard error read
@@ -271,6 +272,96 @@ static Str githeadjson(Arena *a, GitHead *h)
     }
     putend(&w);
     return finish(&b);
+}
+
+// The git directory a repository's worktrees share: the one a worktree's
+// own names in its commondir, else the git directory itself.
+static Str gitcommon(Os *os, Arena *a, Str gitdir, b32 win)
+{
+    Str rel = gitline(os, a, join(a, gitdir, "commondir"));
+    return rel.len ? normpath(a, gitdir, rel, win) : gitdir;
+}
+
+// The commit a ref names (refs/heads/NAME), from the files as git keeps
+// them, loose, else packed, or null if neither has it. A reftable's
+// refs are not read here.
+static Str gitrefoid(Os *os, Arena *a, Str common, Str ref)
+{
+    Str loose = gitline(os, a, join(a, common, ref));
+    if (gitoid(loose)) {
+        return loose;
+    }
+    Read rd = os_read(os, a, join(a, common, "packed-refs"), GIT_PACKEDMAX);
+    for (Str rest = rd.err ? Str{} : rd.data; rest.len;) {
+        Cut c    = cut(rest, '\n');
+        Cut line = cut(gitclean(c.head), ' ');  // "OID REF", or "^OID" peeled
+        rest = c.tail;
+        if (line.ok && line.tail==ref && gitoid(line.head)) {
+            return line.head;
+        }
+    }
+    return {};
+}
+
+// One of git worktree list --porcelain's entries.
+struct GitTree {
+    Str path;
+    Str oid;
+    Str branch;    // refs/heads/..., null if detached or bare
+    b32 bare;
+    b32 locked;
+    b32 prunable;  // its directory is gone
+};
+
+// git worktree list --porcelain: attribute lines, an entry's ended by a
+// blank line. Paths point into out.
+static Slice<GitTree> gitparsetrees(Arena *a, Str out)
+{
+    Slice<GitTree> r  = {};
+    GitTree        t  = {};
+    b32            in = 0;
+    for (Str rest = out;;) {
+        Cut c    = cut(rest, '\n');
+        Str line = c.head;
+        rest = c.tail;
+        line = endswith(line, "\r") ? takehead(line, line.len-1) : line;
+        if (!line.len) {
+            if (in) {
+                r  = push(a, r, t);
+                t  = {};
+                in = 0;
+            }
+            if (!c.ok) {
+                return r;
+            }
+            continue;
+        }
+        Cut kv = cut(line, ' ');
+        if (kv.head == "worktree") {
+            if (in) {
+                r = push(a, r, t);  // no blank line between
+                t = {};
+            }
+            t.path = kv.tail;
+            in     = 1;
+        } else if (kv.head == "HEAD") {
+            t.oid = kv.tail;
+        } else if (kv.head == "branch") {
+            t.branch = kv.tail;
+        } else if (kv.head == "bare") {
+            t.bare = 1;
+        } else if (kv.head == "locked") {
+            t.locked = 1;
+        } else if (kv.head == "prunable") {
+            t.prunable = 1;
+        }
+        if (!c.ok) {
+            if (in) {
+                r = push(a, r, t);
+            }
+            return r;
+        }
+    }
 }
 
 
@@ -736,6 +827,7 @@ struct GitWork {
     u64      procid;   // the latest child's
     i32      pending;  // engine thread: requests not yet answered
     b32      started;  // engine thread: its thread runs
+    i32      running;  // atomic: a job runs (worktree.cpp)
 };
 
 static b32 gitquitting(GitWork *w)
@@ -746,8 +838,12 @@ static b32 gitquitting(GitWork *w)
 // Run git to its end, with its input closed, keeping its output: given
 // up on past wait, or once the engine stops, and killed then, or when
 // its output passes GIT_OUTMAX. Whatever it leaves behind is killed too.
+// Gently, for git that changes things (worktree.cpp): asked to stop
+// first, so that it can clean up after itself, then killed GIT_DRAIN
+// later, also when the engine stops, which then waits for it.
 static GitRun gitrun(GitWork *w, Arena *a, Arena scratch, Slice<Str> argv,
-                     Str cwd, Slice<Str> env, Str errpath, i64 wait)
+                     Str cwd, Slice<Str> env, Str errpath, i64 wait,
+                     b32 gently = 0)
 {
     GitRun r  = {};
     Os    *os = w->os;
@@ -772,18 +868,23 @@ static GitRun gitrun(GitWork *w, Arena *a, Arena scratch, Slice<Str> argv,
     i32 code     = -1;
     b32 exited   = 0;
     b32 eof      = 0;
-    b32 killed   = 0;
+    i32 killed   = 0;  // 1: asked to stop (gently), 2: killed
     i64 deadline = os_ticks(os) + wait;
     while (!exited || !eof) {
-        i64 now = os_ticks(os);
-        r.quit = gitquitting(w);
-        if (r.quit) {
+        i64 now  = os_ticks(os);
+        b32 quit = gitquitting(w);
+        r.quit |= quit;
+        if (quit && !gently) {
             break;
-        } else if (!killed && (now>=deadline || r.cut)) {
-            os_kill(os, p, 1);
-            killed    = 1;
-            r.timeout = !r.cut;
+        } else if (!killed && (now>=deadline || r.cut || quit)) {
+            killed    = gently ? 1 : 2;
+            r.timeout = !r.cut && !quit;
+            os_kill(os, p, killed==2);
             deadline  = now + GIT_DRAIN;  // for the kill to show
+        } else if (killed==1 && now>=deadline) {
+            killed   = 2;
+            os_kill(os, p, 1);
+            deadline = now + GIT_DRAIN;
         } else if (now >= deadline) {
             break;  // given up on: its late records are skipped
         }

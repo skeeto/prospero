@@ -568,8 +568,64 @@ static void testgitcmd(Test *t)
     expect(t, "git pending", istr(&a, e->git ? e->git->pending : -1), "0");
 }
 
+// Refs from loose and packed files, the common git directory, and git
+// worktree list's porcelain.
+static void testgitrefs(Test *t)
+{
+    Arena *a = &t->perm;
+    Str    x = "1111111111111111111111111111111111111111";
+    Str    y = "2222222222222222222222222222222222222222";
+    Str    z = "3333333333333333333333333333333333333333";
+    {
+        Os *os = newos(a, 1<<20);
+        os_mkdirs(os, *a, "/r/.git/refs/heads/prospero");
+        os_write(os, *a, "/r/.git/refs/heads/prospero/a", concat(a, x, "\n"));
+        os_write(os, *a, "/r/.git/packed-refs",
+                 concat(a, concat(a, concat(a, concat(a,
+                 "# pack-refs with: peeled fully-peeled sorted\r\n", y),
+                 " refs/heads/prospero/a\n"), z), " refs/heads/b\n^4444\n"));
+        os_mkdirs(os, *a, "/r/.git/worktrees/w");
+        os_write(os, *a, "/r/.git/worktrees/w/commondir", "../..\n");
+        expect(t, "refoid loose first", gitrefoid(os, a, "/r/.git", "refs/heads/prospero/a"), x);
+        expect(t, "refoid packed", gitrefoid(os, a, "/r/.git", "refs/heads/b"), z);
+        expect(t, "refoid none", gitrefoid(os, a, "/r/.git", "refs/heads/c"), "");
+        expect(t, "refoid prefix", gitrefoid(os, a, "/r/.git", "refs/heads/prospero"), "");
+        expect(t, "common of worktree", gitcommon(os, a, "/r/.git/worktrees/w", 0), "/r/.git");
+        expect(t, "common of main", gitcommon(os, a, "/r/.git", 0), "/r/.git");
+    }
+
+    {
+        Str out =
+            "worktree /r\nHEAD 1111\nbranch refs/heads/master\n\n"
+            "worktree /r/.prospero/worktrees/brisk-otter\nHEAD 2222\n"
+            "branch refs/heads/prospero/brisk-otter\nlocked\n\n"
+            "worktree /gone\r\nHEAD 3333\r\ndetached\r\nprunable gitdir file points to non-existent location\r\n\r\n"
+            "worktree /bare\nbare\n"
+            "worktree /last\nHEAD 4444\nbranch refs/heads/x";
+        Slice<GitTree> ts = gitparsetrees(a, out);
+        Buf b(a, 1024);
+        for (iz i = 0; i < ts.len; i++) {
+            print(&b, ts[i].path);
+            putbyte(&b, ' ');
+            print(&b, ts[i].oid);
+            putbyte(&b, ' ');
+            print(&b, ts[i].branch);
+            print(&b, ts[i].bare ? Str(" bare") : Str{});
+            print(&b, ts[i].locked ? Str(" locked") : Str{});
+            print(&b, ts[i].prunable ? Str(" prunable") : Str{});
+            putbyte(&b, '|');
+        }
+        expect(t, "parsetrees", finish(&b),
+               "/r 1111 refs/heads/master|"
+               "/r/.prospero/worktrees/brisk-otter 2222 refs/heads/prospero/brisk-otter locked|"
+               "/gone 3333  prunable|/bare   bare|/last 4444 refs/heads/x|");
+        expect(t, "parsetrees empty", istr(a, gitparsetrees(a, "").len), "0");
+    }
+}
+
 static void test_git(Test *t)
 {
+    testgitrefs(t);
     testgithead(t);
     testgitparse(t);
     testgitrun(t);
