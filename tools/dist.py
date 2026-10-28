@@ -22,7 +22,8 @@ Each dependency comes from a file in --cache DIR with the pinned SHA-256,
 if one is there, or else from its pinned URLs, tried in order, a few
 times each, and saved into DIR when given. Either way it must match the
 pin. It is unpacked as FetchContent unpacks it: a lone top-level
-directory is stripped.
+directory is stripped. One with DOWNLOAD_NO_EXTRACT, a file rather
+than an archive, is kept as it is, under its URL's file name.
 
 The tarball is deterministic: entries in path order, directories before
 what they hold, every one owned by root and dated COMMIT's commit time,
@@ -69,7 +70,9 @@ def version(commit):
 
 
 def pins(commit):
-    """[(name, dir, [url, ...], sha256)] from the commit's cmake/Fetch*.cmake."""
+    """[(name, dir, [url, ...], sha256, file)] from the commit's
+    cmake/Fetch*.cmake, file the name to keep it under when it is not
+    an archive (DOWNLOAD_NO_EXTRACT), else None."""
     r = []
     names = git("ls-tree", "--name-only", commit, "cmake/").decode().split()
     for path in sorted(n for n in names if re.fullmatch(r"cmake/Fetch\w*\.cmake", n)):
@@ -80,7 +83,7 @@ def pins(commit):
             if name not in dirs:
                 sys.exit(f"dist: {path}: {name} has no fetch_content_bundled, "
                          "so deps/ could not supply it")
-            urls, digest = [], None
+            urls, digest, file = [], None, None
             for i, w in enumerate(words):
                 if w == "URL":
                     for u in words[i+1:]:
@@ -90,9 +93,14 @@ def pins(commit):
                 elif w == "URL_HASH" and i+1 < len(words):
                     h = re.fullmatch(r"SHA256=([0-9a-f]{64})", words[i+1])
                     digest = h.group(1) if h else None
+                elif w == "DOWNLOAD_NO_EXTRACT" and i+1 < len(words):
+                    if words[i+1].upper() in ("TRUE", "ON", "YES", "1"):
+                        file = True
             if not urls or not digest:
                 sys.exit(f"dist: {path}: {name} needs URL and URL_HASH SHA256=")
-            r.append((name, dirs[name], urls, digest))
+            if file:
+                file = urls[0].rstrip("/").rsplit("/", 1)[-1]
+            r.append((name, dirs[name], urls, digest, file))
     if not r:
         sys.exit("dist: no FetchContent_Declare in cmake/Fetch*.cmake")
     return r
@@ -116,7 +124,7 @@ def index(cache):
 
 def fetch(dep, cache, cached):
     """The dependency's tarball, checked against its pin."""
-    name, d, urls, digest = dep
+    name, d, urls, digest, _ = dep
     if digest in cached:
         with open(cached[digest], "rb") as fp:
             data = fp.read()
@@ -202,6 +210,11 @@ def build(commit, cache):
     cached = index(cache)
     for dep in pins(commit):
         data = fetch(dep, cache, cached)
+        if dep[4]:
+            info = tarfile.TarInfo(dep[4])
+            info.mode = 0o644
+            add(entries, ["deps", dep[1], dep[4]], info, data)
+            continue
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
             got = members(tar)
         tops = {parts[0] for parts, _, _ in got}
