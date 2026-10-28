@@ -928,7 +928,8 @@ static b32 cfgruns(CfgKey *k, Str v)
     if (k->kind == "tools") {
         return k->key=="path_prepend" || k->key=="path_append" ||
                k->key=="shells" || k->key=="git" ||
-               (k->key=="shell" && !cfghasword("auto sh powershell cmd", v));
+               (k->key=="shell" && !cfghasword("auto sh powershell cmd", v) &&
+                (HOST_WINDOWS || v!="bash"));
     }
     return k->kind=="ui" && (k->key=="editor" || k->key=="terminal");
 }
@@ -1039,7 +1040,7 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     } else if (shared && cfgruns(k, v) && k->key=="shell") {
         return "a shell by its path or name in an included file is ignored, "
                "since it chooses what runs: set it in your own file, or "
-               "here one of auto, sh, powershell, cmd";
+               "here one of auto, sh, bash, powershell, cmd";
     } else if (shared && cfgruns(k, v)) {
         Buf b(a, 128);
         print(&b, "[");

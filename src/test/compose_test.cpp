@@ -209,6 +209,7 @@ static void test_compose(Test *t)
     // A session's own shell, by hand: none for a POSIX /bin/sh, else as
     // a login shell, and on macOS changing to its folder first
     expect(t, "term.binsh", argstr(&a, termshell(&a, "sh", "/bin/sh", 0)), "");
+    expect(t, "term.bash", argstr(&a, termshell(&a, "sh", "/opt/homebrew/bin/bash", 0)), "");
     expect(t, "term.noshell", argstr(&a, termshell(&a, "sh", {}, 1)), "");
     expect(t, "term.w64sh", argstr(&a, termshell(&a, "sh", "C:/w64devkit/bin/sh.exe", 1)),
            "C:/w64devkit/bin/sh.exe|-l");

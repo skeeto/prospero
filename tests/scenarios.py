@@ -2502,7 +2502,13 @@ def shell_switch(t):
         a = t.headless()
         r = a.call("shells")
         names = {x["name"]: x for x in r.get("shells", [])}
-        t.check(r.get("ok") == 1 and r.get("default") == "sh", f"shells {r}")
+        # Elsewhere than Windows bash comes first, when found, and sh is
+        # /bin/sh as its own keyword
+        dflt = "bash" if "bash" in names else "sh"
+        t.check(r.get("ok") == 1 and r.get("default") == dflt, f"shells {r}")
+        t.check(("bash" not in names) if t.host.windows else
+                names.get("sh", {}).get("path") == "/bin/sh" and
+                names.get(dflt, {}).get("path", "").endswith("/" + dflt), f"bash, sh {names}")
         t.check(names.get("other", {}).get("ok") and
                 names["other"].get("desc") == "The other shell", f"other {names.get('other')}")
         t.check(names.get("nowhere", {}).get("ok") is False and
@@ -2565,7 +2571,7 @@ def shell_switch(t):
             t.check("WHICH=default" in which(c, sid, 7), "the default once gone")
             n = told(sid)
             t.check(len(n) == 2 and "Your shell, gone (" in n[1].get("text", "") and
-                    "is not found now, so commands run in sh" in n[1].get("text", ""),
+                    f"is not found now, so commands run in {dflt}" in n[1].get("text", ""),
                     f"told it is gone {n[-1:]}")
     finally:
         for h in (a, b, c):
@@ -2592,12 +2598,14 @@ def shell_list(t):
     if len(ends) == 4:
         t.check("WHICH=default" in ends[0], f"the session's: {ends[0]!r}")
         t.check("WHICH=other" in ends[1], f"named: {ends[1]!r}")
-        t.check('There is no shell "bogus": give one of sh, other, or leave shell out.'
-                in ends[2], f"a bad name: {ends[2]!r}")
+        t.check('There is no shell "bogus": give one of ' in ends[2] and
+                ', other, or leave shell out.' in ends[2], f"a bad name: {ends[2]!r}")
     tools = t.requests()[0]["body"].get("tools")
     sh = next(x["function"] for x in tools if x["function"]["name"] == "shell")
     props = sh["parameters"]["properties"]
-    t.check(list(props)[-1] == "shell" and props["shell"].get("enum") == ["sh", "other"],
+    dflt = (props.get("shell", {}).get("enum") or ["?"])[0]
+    t.check(dflt == "sh" if t.host.windows else dflt in ("bash", "sh"), f"default {dflt}")
+    t.check(list(props)[-1] == "shell" and props["shell"].get("enum") == [dflt, "other"],
             f"the enum {props.get('shell')}")
     t.check("\n- other: Run a command with " in sh["description"] and
             "The other shell." in sh["description"], "described")

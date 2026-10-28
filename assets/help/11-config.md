@@ -69,7 +69,8 @@ cannot choose what runs, so these are ignored in one:
   read from files (`file:PATH`);
 - `[remote]`, `[shell]`, `[mcp]`, `[desktop]` and `[web]` settings;
 - `[tools] path_prepend`, `path_append`, `shells` and `git`;
-- a `[tools] shell` other than `auto`, `sh`, `powershell` or `cmd`;
+- a `[tools] shell` other than `auto`, `sh`, `bash`, `powershell` or
+  `cmd`;
 - `[ui] editor` and `[ui] terminal`.
 
 ## Settings worth knowing
@@ -90,10 +91,13 @@ cannot choose what runs, so these are ignored in one:
       [tools]
       path_prepend = ~/.local/bin; /opt/homebrew/bin
 
-- **[`[tools] shell`](settings:tools#shell)**: the agent's shell for new sessions: `auto` (a
-  POSIX `sh`; on Windows, `sh.exe` or `busybox.exe` next to Prospero
-  or on PATH, else PowerShell, then `cmd`), `sh`, `powershell`, `cmd`,
-  a `[shell]` section's name, or a program by its path or name. A
+- **[`[tools] shell`](settings:tools#shell)**: the agent's shell for new sessions: `auto` (on
+  Linux and macOS `bash` on PATH, which models expect, else `/bin/sh`;
+  on Windows, `sh.exe` or `busybox.exe` next to Prospero or on PATH,
+  else PowerShell, then `cmd`), `sh` (`/bin/sh`, even where that is
+  bash), `bash` (not a keyword on Windows, where it is a program),
+  `powershell`, `cmd`, a `[shell]` section's name, or a program by its
+  path or name. A
   session keeps the shell it began with, until you switch it (see
   Sessions and modes).
 - **`[shell NAME]`**: a shell you name, for `[tools] shell`, `shells`

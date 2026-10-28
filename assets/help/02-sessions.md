@@ -138,8 +138,8 @@ Right-click a session in the sidebar, or open the Session menu, for:
 - **Start a side chat**: a fork you can make while the agent works
   (below).
 - **Switch model**: a configured model, or another typed in.
-- **Switch shell**: a `[shell]` section of your configuration, or `sh`,
-  `powershell` or `cmd` where found, as the picker beside the model's
+- **Switch shell**: a `[shell]` section of your configuration, or
+  `bash` (not on Windows), `sh`, `powershell` or `cmd` where found, as the picker beside the model's
   offers. Commands run there from then on; the agent is told at its
   next request, once, and again after a compaction. A subagent starts
   in its parent's shell. If the shell's program is gone when the
@@ -157,7 +157,7 @@ Right-click a session in the sidebar, or open the Session menu, for:
 - **Open in terminal**: a terminal window in the folder the session
   works in, as is the Info popup's Terminal button, running the
   session's shell (a POSIX sh as a login shell), or where that is
-  `/bin/sh`, the terminal's own. On a remote it is a shell there, over
+  `/bin/sh` or bash on Linux and macOS, the terminal's own. On a remote it is a shell there, over
   ssh (`ssh -t`, so it may ask for a password) or WSL. The terminal is
   `[ui] terminal`, else Terminal on macOS, Windows Terminal (or a
   console) on Windows, and elsewhere `$TERMINAL` or the first of the

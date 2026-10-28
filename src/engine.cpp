@@ -11973,19 +11973,20 @@ static Shell shellat(Os *os, Arena scratch, Str path, i32 kind, b32 win)
     return sh;
 }
 
-// Find the agent's shell by the [tools] shell setting: auto, sh,
+// Find the agent's shell by the [tools] shell setting: auto, sh, bash,
 // powershell, cmd, or an executable, by its path or by its name on
 // path, the PATH that programs are found by. A POSIX sh comes first, as
-// the one models know best: /bin/sh, or on Windows sh.exe or busybox.exe
-// next to the executable, then on path. Then PowerShell 7 (pwsh on
-// path), Windows PowerShell, and last cmd.exe. A choice not found is as
-// auto.
+// the one models know best: elsewhere than Windows bash on path, which
+// they expect most, then /bin/sh, even where that is bash; on Windows
+// sh.exe or busybox.exe next to the executable, then on path. Then
+// PowerShell 7 (pwsh on path), Windows PowerShell, and last cmd.exe. A
+// choice not found is as auto.
 static Shell findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
                        Str path, b32 win, Str pref)
 {
     pref = trim(pref);
     b32 named = pref.len && pref!="auto" && pref!="sh" &&
-                pref!="powershell" && pref!="cmd";
+                pref!="powershell" && pref!="cmd" && (win || pref!="bash");
     if (named && os_stat(os, scratch, pref).type==STAT_FILE) {
         return shellat(os, scratch, clone(perm, pref), shellkindof(pref, win), win);
     } else if (named && basename(pref)==pref) {
@@ -12002,6 +12003,12 @@ static Shell findshell(Os *os, Arena *perm, Arena scratch, Str exedir,
     b32 wantcmd = win && pref=="cmd";
 
     if (!wantps && !wantcmd) {
+        if (!win && pref!="sh") {
+            Str bash = findpath(os, perm, scratch, path, "bash", win);
+            if (bash.len) {
+                return shellat(os, scratch, bash, SHELL_SH, win);
+            }
+        }
         if (!win) {
             return shellat(os, scratch, "/bin/sh", SHELL_SH, win);
         }
@@ -12059,12 +12066,23 @@ static Str shellkeyword(i32 kind)
     return "sh";
 }
 
+// The keyword a shell as found goes by: as its kind's, but bash for
+// a POSIX sh named bash elsewhere than Windows. /bin/sh stays sh, though
+// it may be bash, since auto finds bash by its name first.
+static Str shellkeywordof(Shell *sh, b32 win)
+{
+    if (!win && sh->kind==SHELL_SH && basename(sh->path)=="bash") {
+        return "bash";
+    }
+    return shellkeyword(sh->kind);
+}
+
 // Whether a name is a keyword of [tools] shell's: auto, sh, powershell
-// or cmd. Empty is auto.
-static b32 shellkw(Str name)
+// or cmd, and elsewhere than Windows bash. Empty is auto.
+static b32 shellkw(Str name, b32 win)
 {
     return !name.len || name=="auto" || name=="sh" || name=="powershell" ||
-           name=="cmd";
+           name=="cmd" || (!win && name=="bash");
 }
 
 // A shell by name: a [shell NAME] section of the user's own file, whose
@@ -12090,15 +12108,15 @@ static Shell shellnamed(Engine *e, Arena *perm, Arena scratch, Str name,
     }
 
     Shell sh = {};
-    b32   kw = shellkw(want);
+    b32   kw = shellkw(want, win);
     if (kw) {
         sh = findshell(e->os, perm, scratch, e->exedir, path, win, want);
-        b32 ok = want=="auto" || shellkeyword(sh.kind)==want;
-        if (!ok) {
+        Str got = shellkeywordof(&sh, win);
+        if (want!="auto" && got!=want) {
             *err = concat(perm, want, " is not found here");
             return {};
         }
-        sh.name = want=="auto" ? shellkeyword(sh.kind) : want;
+        sh.name = got;
     } else if (!own && !prog) {
         *err = concat(perm, concat(&scratch, "there is no [shell ", name),
                       "] in your configuration");
@@ -12213,7 +12231,7 @@ static Shell shellrec(Engine *e, Arena *perm, Arena scratch, Json *j, Str key,
     for (i32 k = 0; path.len && k<countof(shellkinds); k++) {
         if (kind == shellkinds[k]) {
             sh = shellat(e->os, scratch, clone(perm, path), k, HOST_WINDOWS);
-            sh.name = name.len ? clone(perm, name) : Str(shellkeyword(k));
+            sh.name = name.len ? clone(perm, name) : shellkeywordof(&sh, HOST_WINDOWS);
             if (cfgownsection(e->cfg, "shell", sh.name)) {
                 Str d     = cfgget(e->cfg, "shell", sh.name, "description", 0);
                 Str w     = cfgget(e->cfg, "shell", sh.name, "distro", 0);
@@ -15870,11 +15888,11 @@ static Shell shellprog(Engine *e, Arena *perm, Arena scratch, b32 win)
     Str   pref = trim(cfgget(e->cfg, "tools", "", "shell", 0));
     Str   err  = {};
     Shell sh   = {};
-    if (shellkw(pref) || cfgownsection(e->cfg, "shell", pref)) {
+    if (shellkw(pref, win) || cfgownsection(e->cfg, "shell", pref)) {
         return {};
     }
     sh = shellnamed(e, perm, scratch, pref, 1, win, &err);
-    if (shellkw(sh.name) || cfgownsection(e->cfg, "shell", sh.name)) {
+    if (shellkw(sh.name, win) || cfgownsection(e->cfg, "shell", sh.name)) {
         return {};
     }
     return sh;
@@ -15973,8 +15991,9 @@ static void putshell(JsonOut *w, Str name, Shell *sh, Str err)
 }
 
 // shells {}: the shells a session may switch to (cmdshell), on this
-// machine: the user's [shell] sections, found or not, then sh,
-// powershell and cmd where found and not a section's name, then [tools]
+// machine: the user's [shell] sections, found or not, then bash (not
+// on Windows), sh, powershell and cmd where found and not a section's
+// name, then [tools]
 // shell when it is a program. default is what new sessions start in.
 static void cmdshells(Engine *e, Arena scratch, i64 id)
 {
@@ -15995,8 +16014,8 @@ static void cmdshells(Engine *e, Arena scratch, i64 id)
         Shell sh  = shellnamed(e, &scratch, tmp, names[i], 0, win, &err);
         putshell(&w.json, names[i], &sh, err);
     }
-    Str kw[] = {"sh", "powershell", "cmd"};
-    for (iz i = 0; i < countof(kw); i++) {
+    Str kw[] = {"bash", "sh", "powershell", "cmd"};
+    for (iz i = win; i < countof(kw); i++) {
         b32 dup = 0;
         for (iz k = 0; k < names.len; k++) {
             dup |= names[k] == kw[i];

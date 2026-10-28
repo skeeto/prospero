@@ -1861,7 +1861,7 @@ static void testcfgpath(Test *t)
         "is ignored, since it chooses what runs: set it in your own file\n"
         "/c/shared.ini:4:9: error: a shell by its path or name in an included "
         "file is ignored, since it chooses what runs: set it in your own "
-        "file, or here one of auto, sh, powershell, cmd\n"
+        "file, or here one of auto, sh, bash, powershell, cmd\n"
         "/c/shared.ini:6:10: error: [ui] editor in an included file is "
         "ignored, since it chooses what runs: set it in your own file");
     expect(t, "path.shared.prepend", cfgget(c, "tools", "", "path_prepend", 0), "");
@@ -2068,7 +2068,7 @@ static void testcfgpath(Test *t)
             {"gone",         0, "(/nowhere/x is not found)"},
             {"/opt/bin/zsh", 1, "zsh /opt/bin/zsh "},
             {"/opt/bin/zsh", 0, "(there is no [shell /opt/bin/zsh] in your configuration)"},
-            {"bash",         1, "(bash is not found)"},
+            {"bash",         1, "(bash is not found here)"},
         };
         for (iz i = 0; i < countof(cases); i++) {
             Str   err = {};
@@ -2078,6 +2078,27 @@ static void testcfgpath(Test *t)
                 : concat(&a, concat(&a, "(", err), ")");
             expect(t, concat(&a, "shellnamed ", cases[i].name), got, cases[i].want);
         }
+        // bash on PATH: auto's first, by name; sh stays /bin/sh. On
+        // Windows bash is a program, not a keyword
+        {
+            os_write(v.os, a, "/usr/bin/bash", "");
+            struct { Str name; b32 win; Str want; } bash[] = {
+                {"auto", 0, "bash /usr/bin/bash "},
+                {"bash", 0, "bash /usr/bin/bash "},
+                {"sh",   0, "sh /bin/sh "},
+                {"bash", 1, "(there is no [shell bash] in your configuration)"},
+            };
+            for (iz i = 0; i < countof(bash); i++) {
+                Str   err = {};
+                Shell sh  = shellnamed(e, &a, v.scratch, bash[i].name, 0, bash[i].win, &err);
+                Str   got = sh.path.len
+                    ? concat(&a, concat(&a, concat(&a, sh.name, " "), concat(&a, sh.path, " ")), sh.desc)
+                    : concat(&a, concat(&a, "(", err), ")");
+                expect(t, concat(&a, "shellnamed.bash ", bash[i].name), got, bash[i].want);
+            }
+            os_remove(v.os, a, "/usr/bin/bash");
+        }
+
         Str   warn = {};
         Shell sh   = defaultshell(e, &a, v.scratch, 0, &warn);
         expect(t, "defaultshell", concat(&a, sh.name, warn), "zsh");
