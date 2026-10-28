@@ -24,6 +24,10 @@
 // keys are ignored. A SKILL.md with malformed frontmatter is skipped,
 // as is one too large, and the skills past SKILL_MAX.
 //
+// One skill is built in, Prospero's own (help.cpp), listed after those
+// found unless one of the user's own has its name. A project's may not:
+// a repository cannot pass its instructions off as Prospero's.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i64 {
@@ -38,11 +42,15 @@ enum : i64 {
 
 struct Skill {
     Str name;
-    Str desc;    // one line, at most SKILL_DESC bytes
-    Str dir;     // its directory, normalized
-    Str path;    // its SKILL.md
-    b32 hidden;  // disable-model-invocation: the user's alone
+    Str desc;     // one line, at most SKILL_DESC bytes
+    Str dir;      // its directory, normalized; null if built in
+    Str path;     // its SKILL.md; null if built in
+    b32 hidden;   // disable-model-invocation: the user's alone
+    b32 builtin;  // Prospero's own (help.cpp), with no files
 };
+
+// The built-in skill's name, which only the user's own skills may take.
+static Str skillbuiltin = "prospero";
 
 struct Skills {
     Slice<Skill> list;     // by name
@@ -373,6 +381,9 @@ static Skills skillfind(Os *os, Arena *a, Slice<SkillDir> dirs, b32 win)
             if (!why.data && !skillname(name)) {
                 why = "its directory's name must be letters, digits, - _ and . "
                       "(or its frontmatter must give a name)";
+            } else if (!why.data && d->inside.len && name==skillbuiltin) {
+                why = "prospero is Prospero's own skill, which only your own "
+                      "skills may replace, not a project's";
             }
             if (why.data) {
                 r.skipped = push(a, r.skipped, concat(a, concat(a, path, ": "), why));
@@ -426,13 +437,14 @@ static Str skilltext(Arena *a, Skill *k, Str body, Str args)
 }
 
 // The text of a prompt that invokes a skill: its instructions in a
-// skill block, then what the user typed after /name.
+// skill block, which names its directory if it has one, then what the
+// user typed after /name.
 static Str skillprompt(Arena *a, Skill *k, Str body, Str args)
 {
     Buf b(a, 256 + body.len + args.len);
     print(&b, "<skill name=\"");
     print(&b, k->name);
-    print(&b, "\" dir=\"");
+    print(&b, k->dir.len ? Str("\" dir=\"") : Str(""));
     for (iz i = 0; i < k->dir.len; i++) {
         if (k->dir[i] == '"') {
             print(&b, "&quot;");

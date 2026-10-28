@@ -197,8 +197,9 @@ static b32 slashcompletes(Str text, i32 cmd)
 struct SkillItem {
     Str name;
     Str desc;
-    Str path;    // its SKILL.md
-    b32 hidden;  // never offered to the agent: the user's alone
+    Str path;     // its SKILL.md, empty if built in
+    b32 hidden;   // never offered to the agent: the user's alone
+    b32 builtin;  // Prospero's own
 };
 
 // Whether a command has a skill's name, which it then keeps.

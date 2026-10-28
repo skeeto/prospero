@@ -735,6 +735,25 @@ static b32 cfgfamily(CfgKey *k)
     return k->key.len && k->key[k->key.len-1]=='.';
 }
 
+// A kind of section as the settings window's page list names it: the top level is
+// Defaults, [ui] Interface, and others their own, capitalized, and with
+// plural for a group of named ones.
+static Str cfgkindlabel(Arena *a, Str kind, b32 plural)
+{
+    if (!kind.len) {
+        return "Defaults";
+    } else if (kind=="ui" && !plural) {
+        return "Interface";
+    } else if (kind == "mcp") {
+        return plural ? Str("MCP servers") : Str("MCP server");
+    }
+    Buf b(a, kind.len + 2);
+    putbyte(&b, kind[0]>='a' && kind[0]<='z' ? (u8)(kind[0] - 'a' + 'A') : kind[0]);
+    print(&b, cuthead(kind, 1));
+    print(&b, plural ? Str("s") : Str(""));
+    return finish(&b);
+}
+
 // A key's schema entry, a family's for a key with its prefix.
 static CfgKey *cfgkey(Str kind, Str key)
 {

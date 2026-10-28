@@ -1097,7 +1097,12 @@ static Str toolsummary(Arena *perm, Arena scratch, Str name, Str args, Str cwd)
     } else if (name=="task" && desc.len) {
         return oneline(perm, desc);
     } else if (name == "skill") {
+        // With what it was given, as the built-in skill's topics
         Str skill = jsonstr(jsonget(j, "name"));
+        Str given = trim(jsonstr(jsonget(j, "args")));
+        if (skill.len && given.len) {
+            skill = concat(&scratch, concat(&scratch, skill, ": "), given);
+        }
         return oneline(perm, skill.len ? skill : args);
     } else if (name == "send_message") {
         // The target as given, until the result names its title

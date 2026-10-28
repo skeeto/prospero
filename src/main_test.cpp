@@ -624,7 +624,6 @@ static Str istr(Arena *a, i64 v)
 #  include "view.cpp"
 #  include "theme.cpp"
 #  include "fonts.cpp"
-#  include "help.cpp"
 #  include "place.cpp"
 #  include "compose.cpp"
 #  include "pathpick.cpp"
@@ -675,6 +674,7 @@ int main()
     test_instructions(&t);
     test_memory(&t);
     test_skills(&t);
+    test_helpskill(&t);
     test_engine(&t);
     test_git(&t);
     test_config(&t);

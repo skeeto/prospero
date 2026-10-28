@@ -64,6 +64,7 @@ enum : i32 {
     EV_REMOTE,  // (M5) a client library's connection to its host
     EV_DEPLOY,  // (M5) progress deploying an engine to a remote machine
     EV_QUEUE,   // what the user sent that waits to be taken in
+    EV_CONFIG,  // the configuration was loaded again (rev)
     EV_COUNT,
 };
 
@@ -118,6 +119,7 @@ static EvInfo evinfo[] = {
     {"remote",     0, 0},
     {"deploy",     0, 0},
     {"queue",      0, 0},
+    {"config",     0, 0},
 };
 static_assert(countof(evinfo) == EV_COUNT);
 

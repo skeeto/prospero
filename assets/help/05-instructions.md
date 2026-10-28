@@ -83,6 +83,15 @@ The first skill of a name wins. A skill may sit below folders that
 group skills, as in `.cursor/skills/frontend/lint/SKILL.md`, as Cursor
 allows.
 
+Prospero has a skill of its own, `prospero`, in every session but an
+eval's: this Help and every setting, for the agent to answer questions
+about Prospero and change its settings
+([Configuration](help:config#the-agent-changes-it)). It is served from
+Prospero itself, and always matches the engine running the session.
+Only a skill of your own named `prospero` (2 to 5 above) replaces it; a
+project's is left out, with a warning, since a repository must not
+pass its instructions off as Prospero's.
+
 Type `/NAME args` in the prompt box to use a skill yourself: its
 `SKILL.md` goes to the agent with the args. A skill with
 `disable-model-invocation: true` in its frontmatter is for that alone,

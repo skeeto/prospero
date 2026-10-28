@@ -724,6 +724,8 @@ static void drawmarks(Gui *g, ImDrawList *dl, Marks *mk, Piece *pieces, Run *r,
 }
 
 // Draw one placed block of a message whose content starts at origin.
+static void namedrect(Gui *, Str, ImVec2, ImVec2);
+
 static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
                       Doc *d, i32 msg, Placed *p, ImVec2 origin, Range sel,
                       Marks *mk, f32 cliptop, f32 clipbot, f32 alpha)
@@ -831,6 +833,12 @@ static void drawblock(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp,
                 f32 y = pc->style&STYLE_STRIKE ? ly + l->base - bk->Ascent*0.35f
                                                : ly + l->base + 1;
                 dl->AddLine(v2(ox+r->x, y), v2(ox+r->x+r->w, y), col, 1);
+            }
+            if (g->drive && pc->link>=0) {
+                // Where the checklist clicks a link: "link " and where to
+                Arena a = g->frame;
+                namedrect(g, concat(&a, "link ", d->links[pc->link]),
+                          v2(ox+r->x, ly), v2(ox+r->x+r->w, ly+l->h));
             }
         }
     }
@@ -1997,7 +2005,8 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
             ImGui::SetItemTooltip("%s", cstr0(&a, k->desc));
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("%s%s", cstr0(&a, showpath(v, k->path)),
+        Str where = k->builtin ? Str("built into Prospero") : showpath(v, k->path);
+        ImGui::TextDisabled("%s%s", cstr0(&a, where),
                             k->hidden ? ", for you alone: not offered to the agent" : "");
     }
 
@@ -2630,6 +2639,7 @@ struct TextArea {
 struct TextHit {
     Pos at;
     b32 hit;
+    b32 body;  // in the message's text, not its header nor folded
 };
 
 // The mouse over a view's text: an invisible button over the visible
@@ -2672,7 +2682,8 @@ static TextHit textmouse(Gui *g, TextArea *ta)
             r.at.off = ly<0 || m->collapsed ? 0 :
                        msghit(&g->measure, msgdoc(v, i), ml, io.MousePos.x - wpos.x - ta->pad, ly);
             if (ly > m->h) r.at.off = (i32)m->text.len;
-            r.hit = 1;
+            r.hit  = 1;
+            r.body = ly>=0 && ly<=m->h && !m->collapsed;
         }
     }
 
@@ -2783,11 +2794,144 @@ static void drawmsgtext(Gui *g, ImDrawList *dl, ImDrawListSplitter *sp, TextArea
     ImGui::PopID();
 }
 
+// Links in a view's text (help.cpp's helpdest says where each goes):
+// a tooltip saying where, and followed when let go of where pressed,
+// without a drag between, since a press alone may begin a selection.
+
+static void helppick(Gui *, i32);
+
+// Where a link goes, in the window's words.
+static Str linktip(Arena *a, Str link)
+{
+    Dest d = helpdest(a, link);
+    switch (d.kind) {
+    case DEST_HELP: {
+        if (d.page < 0) {
+            return concat(a, "No Help topic is named ", cut(cuthead(link, 5), '#').head);
+        }
+        Str r   = concat(a, "Help \xe2\x86\x92 ", helptitle(d.page));
+        Str sec = d.section.len ? helpsection(a, d.page, d.section) : Str{};
+        return sec.len ? concat(a, concat(a, r, " \xe2\x80\xba "), sec) : r;
+    }
+    case DEST_SETTINGS: {
+        if (d.whole) {
+            return "Settings";
+        } else if (d.diag) {
+            return "Settings \xe2\x86\x92 Diagnostics";
+        }
+        Buf b(a, 128);
+        print(&b, "Settings \xe2\x86\x92 ");
+        print(&b, d.known ? cfgkindlabel(a, d.cfgkind, d.named) : d.cfgkind);
+        if (d.cfgname.len) {
+            print(&b, " \xe2\x86\x92 ");
+            print(&b, d.cfgname);
+        }
+        if (d.cfgkey.len) {
+            print(&b, " \xe2\x86\x92 ");
+            print(&b, d.cfgkey);
+        }
+        return finish(&b);
+    }
+    case DEST_VIEW:
+        return d.pane<0 ? concat(a, "Prospero has no pane named ", cuthead(link, 5))
+                        : concat(a, "View \xe2\x86\x92 ", Str{(u8 *)panenames[d.pane],
+                                     (iz)__builtin_strlen(panenames[d.pane])});
+    case DEST_WEB:
+        return link;
+    }
+    return concat(a, link, " (Prospero does not open this link)");
+}
+
+// Go where a link goes. A settings: link waits in cfglink for the
+// configuration (drawsettings), a section of Help for its page's layout
+// (drawdoc). Under the checklist, a web link is only noted.
+static void followlink(Gui *g, Str link)
+{
+    Arena a = g->frame;
+    Dest  d = helpdest(&a, link);
+    switch (d.kind) {
+    case DEST_HELP:
+        if (d.page >= 0) {
+            helppick(g, d.page);
+            g->helpsect = d.section.len ? clone(&g->perm, d.section) : Str{};
+            setpane(g, PANE_HELP, 1);
+        }
+        break;
+    case DEST_SETTINGS:
+        d.cfgkind = clone(&g->perm, d.cfgkind);
+        d.cfgname = clone(&g->perm, d.cfgname);
+        d.cfgkey  = clone(&g->perm, d.cfgkey);
+        d.find    = clone(&g->perm, d.find);
+        d.section = {};
+        g->cfglink    = d;
+        g->cfglinked  = 1;
+        g->cfglinkget = 0;
+        setpane(g, PANE_SETTINGS, 1);
+        break;
+    case DEST_VIEW:
+        if (d.pane >= 0) {
+            setpane(g, d.pane, 1);
+        }
+        break;
+    case DEST_WEB:
+        if (g->drive && !g->realreveal) {
+            g->linkopened = clone(&g->perm, link);
+        } else {
+            os_guiopenurl(g->os, a, link);
+        }
+        break;
+    }
+    scheddirty(&g->sched);
+}
+
+// The link under the mouse in a view's text, right after textmouse made
+// its item: the hand cursor and the link's tooltip over it. Returns a
+// link to follow, let go of in the message and at the link it was
+// pressed on (press, a hash, and pressmsg keep which).
+static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg)
+{
+    Arena a    = g->frame;
+    Str   link = {};
+    if (hit.hit && hit.body && ImGui::IsItemHovered()) {
+        link = doclinkat(msgdoc(v, hit.at.msg), hit.at.off);
+    }
+    if (link.len) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            ImGui::SetTooltip("%s", cstr0(&a, linktip(&a, link)));
+        }
+    }
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        b32 on = link.len && !ImGui::GetIO().KeyShift &&
+                 ImGui::GetMouseClickedCount(ImGuiMouseButton_Left)==1;
+        *press    = on ? hash(link)|1 : 0;
+        *pressmsg = hit.at.msg;
+    }
+    Str r = {};
+    if (*press && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        b32 same = link.len && (hash(link)|1)==*press && hit.at.msg==*pressmsg;
+        r = same && !ImGui::IsMouseDragPastThreshold(ImGuiMouseButton_Left) ? link : Str{};
+        *press = 0;
+    }
+    return r;
+}
+
+// The text of a document's block, as shown.
+static Str blocktext(Arena *a, Doc *d, DocBlock *b)
+{
+    Buf t(a, 128);
+    for (i32 i = 0; i < b->npiece; i++) {
+        print(&t, d->pieces[b->piece0+i].text);
+    }
+    return finish(&t);
+}
+
 // A document (DocView) in a child window filling the rest of the window
 // at the cursor: laid out at its width whole, as a document is short,
 // its text selectable, with the text's context menu, and its keys while
-// the window has focus. Returns the destination of a link clicked, if
-// any, which is the caller's to follow.
+// the window has focus, scrolled to its section heading named d->section
+// once laid out. Returns the destination of a link clicked, if any,
+// which is the caller's to follow.
 static Str drawdoc(Gui *g, DocView *d, char const *id)
 {
     View       *v     = d->v;
@@ -2809,6 +2953,23 @@ static Str drawdoc(Gui *g, DocView *d, char const *id)
     }
     f64 total = viewtops(v, width, charw, fm.lineh);
 
+    if (d->section.len && v->msgs.len && !ImGui::IsWindowAppearing()) {
+        // The heading, whose letters and digits the section's are
+        Arena      a   = g->frame;
+        Doc       *doc = msgdoc(v, 0);
+        MsgLayout *ml  = msglayout(v, 0, &g->measure, width, sc);
+        for (iz k = 0; k < doc->blocks.len; k++) {
+            DocBlock *b = &doc->blocks[k];
+            if (b->type==DOC_HEADING && helpsame(blocktext(&a, doc, b), d->section)) {
+                d->scrollto = v->msgs[0].top + msgy(doc, ml, b->off0);
+                break;
+            }
+        }
+        d->section = {};
+    } else if (d->section.len) {
+        scheddirty(&g->sched);  // laid out at its size in a later frame
+    }
+
     ImGui::SetNextWindowContentSize(v2(0, (f32)total + 2*pad));
     if (d->scrollto >= 0) {
         ImGui::SetNextWindowScroll(v2(-1, (f32)d->scrollto));
@@ -2820,15 +2981,7 @@ static Str drawdoc(Gui *g, DocView *d, char const *id)
     TextArea ta   = {v, wpos, ImGui::GetWindowHeight(), width, pad, pad,
                      ImGui::GetScrollY(), &d->dragging, &d->scrollto};
     TextHit hit  = textmouse(g, &ta);
-    Str     link = {};
-    if (hit.hit && ImGui::IsItemHovered()) {
-        link = doclinkat(msgdoc(v, hit.at.msg), hit.at.off);
-        if (link.len) {
-            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        }
-    }
-    b32 follow = link.len && ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
-                 !ImGui::GetIO().KeyShift;
+    Str     link = textlink(g, v, hit, &d->press, &d->pressmsg);
     if (begintextmenu(g, v, -1)) {
         endtextmenu(g, v);
     }
@@ -2850,7 +3003,7 @@ static Str drawdoc(Gui *g, DocView *d, char const *id)
     sp->Merge(dl);
     ImGui::EndChild();
     textkeys(g, v);  // the window's, as its child's
-    return follow ? link : Str{};
+    return link;
 }
 
 // The find bar, open over the transcript: the text to find, the hits
@@ -3369,8 +3522,12 @@ static void drawtranscript(Gui *g)
     // Mouse: an invisible button over the visible area, which the
     // headers' toggles and the asks' buttons, made later, overlap.
     TextArea ta  = {v, wpos, winh, width, pad, head, scrolly, &g->dragging, &g->scrollto};
-    TextHit  hit = textmouse(g, &ta);
+    TextHit  hit  = textmouse(g, &ta);
+    Str      link = textlink(g, v, hit, &g->linkpress, &g->linkmsg);
     itemrect(g, RECT_TRANSCRIPT);
+    if (link.len) {
+        followlink(g, link);
+    }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
         g->menumsg = hit.hit ? hit.at.msg : -1;  // the popup takes the hover from here on
     }
@@ -6034,7 +6191,10 @@ static void drawplan(Gui *g)
     if (!shown) {
         return;  // on its way
     }
-    drawdoc(g, f->doc, "##plan");
+    Str link = drawdoc(g, f->doc, "##plan");
+    if (link.len) {
+        followlink(g, link);
+    }
     itemnamed(g, "plan text");
     g->planshown = (i32)f->doc->v->msgs[0].text.len;
 }
@@ -7869,25 +8029,6 @@ static void cfgselect(Gui *g, Str kind, Str name)
     g->cfgpname = {g->cfgpbuf+kind.len, name.len};
 }
 
-// A kind of section as the page list names it: the top level is
-// Defaults, [ui] Interface, and others their own, capitalized, and with
-// plural for a group of named ones.
-static Str cfgkindlabel(Arena *a, Str kind, b32 plural)
-{
-    if (!kind.len) {
-        return "Defaults";
-    } else if (kind=="ui" && !plural) {
-        return "Interface";
-    } else if (kind == "mcp") {
-        return plural ? Str("MCP servers") : Str("MCP server");
-    }
-    Buf b(a, kind.len + 2);
-    putbyte(&b, kind[0]>='a' && kind[0]<='z' ? (u8)(kind[0] - 'a' + 'A') : kind[0]);
-    print(&b, cuthead(kind, 1));
-    print(&b, plural ? Str("s") : Str(""));
-    return finish(&b);
-}
-
 // What a page is called for the checklist and in the combo: "endpoint
 // local" for a named section, else its kind, "" for the top level.
 static Str cfgpagekey(Arena *a, Str kind, Str name)
@@ -8151,6 +8292,54 @@ static void cfggoto(Gui *g, CfgRow *r)
     g->cfgfscroll = 1;
     g->cfgfseen   = 0;
     g->cfgfindhid = !g->cfgtwopane;
+    scheddirty(&g->sched);
+}
+
+// Go where a settings: link points (cfglink, followlink): Diagnostics, a
+// section's page, or a setting on it, a named kind's first section if
+// the link names none. One not there may be in a file changed since the
+// configuration came, so it is asked for once more, then the link's
+// words go in the search, which lists what is nearest.
+static void cfgfollow(Gui *g)
+{
+    Dest *d    = &g->cfglink;
+    Str   kind = d->cfgkind;
+    Str   name = d->cfgname;
+    if (d->whole || d->diag) {
+        g->cfgdiag  |= d->diag;
+        g->cfglinked = 0;
+        return;
+    }
+    for (iz i = 0; i<g->cfgrows.len && d->named && !name.len; i++) {
+        name = g->cfgrows[i].kind==kind ? g->cfgrows[i].name : name;
+    }
+    b32     page = 0;
+    CfgRow *row  = 0;
+    for (iz i = 0; i<g->cfgrows.len && !row; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind==kind && r->name==name) {
+            page = 1;
+            row  = d->cfgkey.len && r->key==d->cfgkey ? r : 0;
+        }
+    }
+    if (d->known && page && (row || !d->cfgkey.len)) {
+        if (row) {
+            cfggoto(g, row);
+        } else {
+            cfgselect(g, kind, name);
+            g->cfgshowsel = 1;
+        }
+    } else if (!g->cfglinkget) {
+        g->cfglinkget = 1;
+        guiconfigget(g);
+        return;
+    } else {
+        iz n = d->find.len<FIELD_MAX ? d->find.len : FIELD_MAX-1;
+        copybytes(g->cfgfind, d->find.data, n);
+        g->cfgfind[n] = 0;
+        g->cfgfindhid = 0;
+    }
+    g->cfglinked = 0;
     scheddirty(&g->sched);
 }
 
@@ -8683,10 +8872,12 @@ static void drawsettings(Gui *g)
     f32   sc = g->scale;
     if (g->enginekind == ENGINE_FAKE) {
         ImGui::TextDisabled("No engine: the fake agent has no settings.");
+        g->cfglinked = 0;
         return;
     }
     if (ImGui::IsWindowAppearing() || (!g->cfg && !g->cfgget)) {
         guiconfigget(g);  // the file may have changed by hand
+        g->cfglinkget = 1;
     }
     if (!g->cfg) {
         ImGui::TextDisabled("Loading...");
@@ -8737,6 +8928,10 @@ static void drawsettings(Gui *g)
         ImGui::PushStyleColor(ImGuiCol_Text, g->cfgok ? g->pal->ok : g->pal->bad);
         ImGui::TextWrapped("%s", cstr0(&a, g->cfgstatus));
         ImGui::PopStyleColor();
+    }
+
+    if (g->cfglinked && !g->cfgset && !g->cfgget) {
+        cfgfollow(g);
     }
 
     // A named section's page gone, deleted or never added, gives way to
@@ -8837,6 +9032,10 @@ static void drawsettings(Gui *g)
     f32 m = ImGui::GetScrollMaxX();
     g->cfghscroll = hs>m ? hs : m;
     g->cfgframe   = g->total.frames;
+    if (ImGui::GetIO().WantTextInput &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+        g->cfgtyped = g->total.frames;  // a reload would undo the typing
+    }
 }
 
 // Metrics overlay and log
@@ -8994,6 +9193,10 @@ static void drawhelp(Gui *g)
         g->helpdoc->scrollto    = 0;
         g->helpshown            = cur + 1;
     }
+    if (g->helpsect.len) {
+        g->helpdoc->section = g->helpsect;  // a link's, once laid out
+        g->helpsect         = {};
+    }
 
     i32 pick = -1;
     f32 w    = ImGui::GetContentRegionAvail().x;
@@ -9037,7 +9240,10 @@ static void drawhelp(Gui *g)
     }
     Str link = drawdoc(g, g->helpdoc, "##helppage");
     itemnamed(g, "help text");
-    helppick(g, pick>=0 ? pick : helplink(link));
+    helppick(g, pick);
+    if (link.len) {
+        followlink(g, link);
+    }
 }
 
 

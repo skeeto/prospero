@@ -86,6 +86,7 @@ struct Doc {
     Slice<DocBlock> blocks;
     Slice<Piece> pieces;
     Slice<Str>   links;
+    Slice<i32>   images;  // the links that are images' sources
     i32          ntables;
     b32          plain;  // parsed as plain text
 };
@@ -610,6 +611,7 @@ static int mdenterspan(MD_SPANTYPE type, void *detail, void *ud)
         Str src = clone(p->perm, {(u8 *)img->src.text, (iz)img->src.size});
         p->doc->links = push(p->perm, p->doc->links, src);
         p->link = (i32)p->doc->links.len - 1;
+        p->doc->images = push(p->perm, p->doc->images, p->link);
         p->italic++;
     } break;
     case MD_SPAN_FOOTNOTE_REF: {
@@ -714,12 +716,18 @@ static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo)
     return d;
 }
 
-// The destination of the link at source offset off, empty if none.
+// The destination of the link at source offset off, empty if none. An
+// image's source is no link to follow.
 static Str doclinkat(Doc *d, i32 off)
 {
     for (iz i = 0; i < d->pieces.len; i++) {
         Piece *pc = &d->pieces[i];
         if (pc->link>=0 && off>=pc->off && off<pc->off+pc->len) {
+            for (iz k = 0; k < d->images.len; k++) {
+                if (d->images[k] == pc->link) {
+                    return {};
+                }
+            }
             return d->links[pc->link];
         }
     }

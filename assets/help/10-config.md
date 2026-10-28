@@ -13,11 +13,12 @@ from its built-in copy, whose comments document every section and
 key: read it there for the full list. Changes take effect while
 Prospero runs.
 
-The Settings pane (View → Settings) edits the file in place, a page
-for each section, changing only the lines it sets and keeping your
-comments. Its top line says which file it edits. Diagnostics, at the
-end of its list, shows each problem found in the files, with where it
-is; a bad value falls back to its default.
+The Settings pane ([View → Settings](view:settings)) edits the file in
+place, a page for each section, changing only the lines it sets and
+keeping your comments. Its top line says which file it edits.
+[Diagnostics](settings:diagnostics), at the end of its list, shows each
+problem found in the files, with where it is; a bad value falls back to
+its default.
 
 The search field above the pages (Ctrl+F, or Cmd+F on macOS, while
 Settings has the focus) finds a setting by name: keys that match come
@@ -37,6 +38,21 @@ The state directory holds the sessions, the window's layout and
 `~/.local/state/prospero`. On Windows `%LOCALAPPDATA%\prospero` is
 used while there is none under home. `--statedir DIR` names another,
 for a separate instance.
+
+## The agent changes it
+
+Ask the agent about Prospero, or to change a setting, and it reads
+Prospero's own skill ([Skills](help:instructions#skills)): this Help,
+and every setting with its type, default and meaning. Its answers link
+what they name, a Help topic, a setting or a pane, and a click there
+goes to it.
+
+It changes the file with its edit and write tools. Each change asks
+you first, with no Always, even where its writes need no asking, but
+not in Bypass mode ([Permissions](help:permissions)). Once written,
+Prospero reads the configuration again at once: the agent is told of
+any problem in what it wrote, and Settings and the window show the
+change. A session on a remote host changes that host's file.
 
 ## Includes
 
@@ -64,7 +80,8 @@ cannot choose what runs, so these are ignored in one:
   engine whose environment you cannot set, such as one on a remote
   host or in WSL, where the host's own configuration names a file
   there. Keep it private (`chmod 600`).
-- **`[tools] path_prepend` and `path_append`**: directories, separated
+- **[`[tools] path_prepend`](settings:tools#path_prepend) and
+  [`path_append`](settings:tools#path_append)**: directories, separated
   by `;`, added before and after PATH, for the agent's commands, its
   shell and ripgrep, and for the editor and ssh. Prospero started from
   the Finder, the Dock, the Start menu or a desktop menu has a shorter
@@ -73,7 +90,7 @@ cannot choose what runs, so these are ignored in one:
       [tools]
       path_prepend = ~/.local/bin; /opt/homebrew/bin
 
-- **`[tools] shell`**: the agent's shell for new sessions: `auto` (a
+- **[`[tools] shell`](settings:tools#shell)**: the agent's shell for new sessions: `auto` (a
   POSIX `sh`; on Windows, `sh.exe` or `busybox.exe` next to Prospero
   or on PATH, else PowerShell, then `cmd`), `sh`, `powershell`, `cmd`,
   a `[shell]` section's name, or a program by its path or name. A
@@ -112,28 +129,28 @@ cannot choose what runs, so these are ignored in one:
       path_prepend = ~/.local/bin
       description = Debian, with apt to install packages
 
-- **`[tools] shells`**: shells the agent may pick per command, by name,
+- **[`[tools] shells`](settings:tools#shells)**: shells the agent may pick per command, by name,
   separated by blanks. The shell tool then lists them and takes one by
   name. A name not found is left out, with a warning.
-- **`[tools] git`**: the git that the Changes pane runs (see
+- **[`[tools] git`](settings:tools#git)**: the git that the Changes pane runs (see
   [Sessions and modes](help:sessions)), by its path or its name on
   PATH (with `path_prepend` and `path_append`); empty for `git`. On
   macOS, `/usr/bin/git` without the Command Line Tools counts as
   missing, rather than asking to install them. The branch on the
   session bar needs no git. A remote host's engine uses its own
   configuration's.
-- **`[ui] editor`**: the command that opens a draft (Ctrl+G) or a plan
+- **[`[ui] editor`](settings:ui#editor)**: the command that opens a draft (Ctrl+G) or a plan
   in an editor, given the file as one more word. It must wait until
   you are done and open a window of its own, as `code --wait`,
   `subl -w` or `gvim -f` do. Empty, it is `$VISUAL`, else `$EDITOR`,
   else on macOS the default text editor, which you then quit. Started
   from the Finder or a desktop menu, Prospero has no `$VISUAL` or
   `$EDITOR`: set this, with a full path if need be.
-- **`[ui] terminal`**: the terminal that Open in terminal opens: on
+- **[`[ui] terminal`](settings:ui#terminal)**: the terminal that Open in terminal opens: on
   macOS an application's name (`iTerm`, `Ghostty`), elsewhere a program
   (`wt.exe`, `konsole`, `kitty`, `wezterm`), whose options for its
   folder and command Prospero knows; another gets `-e`.
-- **`[ui] notify`**: desktop notifications while the window is in the
+- **[`[ui] notify`](settings:ui#notify)**: desktop notifications while the window is in the
   background, minimized, or showing another session: `allow` when a
   permission ask waits for your answer, `done` when a session stops by
   itself (finished, failed, or out of budget, not stopped by you), or
@@ -143,9 +160,10 @@ cannot choose what runs, so these are ignored in one:
   notifications are off or unavailable, the window asks for attention
   instead (a flashing taskbar button, a bouncing Dock icon). On macOS
   only Prospero.app can show them, after you allow it once.
-- **`[ui] font_size`**: the text's size in pixels, 8 to 40 (15 by
-  default). The View menu's zoom scales it until Prospero exits.
-- **`[ui] theme`**: `system`, `dark` or `light`, also in View → Theme.
+- **[`[ui] font_size`](settings:ui#font_size)**: the text's size in
+  pixels, 8 to 40 (17 by default). The View menu's zoom scales it until Prospero exits.
+- **[`[ui] theme`](settings:ui#theme)**: `system`, `dark` or `light`,
+  also in View → Theme.
 - **`[ui] thinking`** and **`[ui] tools`**: whether reasoning and tool
   output show folded or open in the transcript.
 - **`[guard]`**: see [Permissions and asks](help:permissions).

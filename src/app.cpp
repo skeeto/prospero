@@ -67,7 +67,6 @@
 #include "view.cpp"
 #include "theme.cpp"
 #include "fonts.cpp"
-#include "help.cpp"
 #include "place.cpp"
 #include "compose.cpp"
 #include "pathpick.cpp"
@@ -290,6 +289,7 @@ static char const *panenames[] = {
     "Hosts", "Settings", "Help", "Metrics",
 };
 static_assert(countof(panenames) == PANE_COUNT);
+static_assert(countof(viewnames) == PANE_COUNT);  // help.cpp's view: names
 
 // The panes hidden until asked for: the metrics, and the changes, which
 // a click on the session bar's branch shows (ui.cpp drawbranch).
@@ -653,6 +653,9 @@ struct DocView {
     ImGuiWindow *win;       // its child window, last frame
     f64          scrollto;  // a scroll to set, -1 if none
     b32          dragging;  // a selection being dragged
+    u64          press;     // the link pressed (hash), 0 if none
+    i32          pressmsg;  // in this message
+    Str          section;   // a heading to scroll to once laid out
 };
 
 static DocView *newdocview(Arena *perm, Os *os, ViewCache *c)
@@ -999,7 +1002,7 @@ enum : i32 {
 // Item rectangles by name, for the checklist: menu items by label,
 // headings and fold arrows by what they are for.
 enum : i32 {
-    NAMED_MAX    = 96,
+    NAMED_MAX    = 256,
     SIDEDUMP_MAX = 1<<14,  // bytes of the sidebar's tree as text
 };
 
@@ -1186,6 +1189,10 @@ struct Gui {
     i32                helpshown;  // the topic in helpdoc, plus one
     b32                helpnarrow; // its topics were a combo, not a list
     i64                helpframe;  // the frame they were last drawn in
+    Str                helpsect;   // a section a link asked for, to scroll to
+    u64                linkpress;  // the transcript's link pressed (hash), 0 if none
+    i32                linkmsg;    // in this message
+    Str                linkopened; // a web link followed under the checklist
     Images             img;        // screenshots
     b32                outopen;
     b32                outfocus;   // brought to the front next frame
@@ -1262,6 +1269,11 @@ struct Gui {
     Str                cfgfkey;    // in cfgfbuf, 3*FIELD_MAX bytes
     u8                *cfgfbuf;
     b32                cfgfscroll; // scroll its page to it, once
+    Dest               cfglink;    // a settings: link to go to once loaded
+    b32                cfglinked;  // one is waiting
+    b32                cfglinkget; // the configuration was asked for again for it
+    b32                cfgstale;   // the engine loaded it again (config event)
+    i64                cfgtyped;   // the last frame typing in Settings
     i64                cfgmarkend; // when its mark has faded (µs)
     b32                cfgfseen;   // it was whole in the page's view
     f32                cfghscroll; // room the settings had to scroll sideways
@@ -3175,7 +3187,8 @@ static void onskills(Gui *g, GuiSession *s, Json *j, b32 ok)
         same = t->name==jsonstr(jsonget(k, "name")) &&
                t->desc==jsonstr(jsonget(k, "description")) &&
                t->path==jsonstr(jsonget(k, "path")) &&
-               t->hidden==(jsonget(k, "hidden")->boolean != 0);
+               t->hidden==(jsonget(k, "hidden")->boolean != 0) &&
+               t->builtin==(jsonget(k, "builtin")->boolean != 0);
     }
     if (!ok || same) {
         return;
@@ -3186,7 +3199,8 @@ static void onskills(Gui *g, GuiSession *s, Json *j, b32 ok)
         t.name   = clone(&g->perm, jsonstr(jsonget(k, "name")));
         t.desc   = clone(&g->perm, jsonstr(jsonget(k, "description")));
         t.path   = clone(&g->perm, jsonstr(jsonget(k, "path")));
-        t.hidden = jsonget(k, "hidden")->boolean != 0;
+        t.hidden  = jsonget(k, "hidden")->boolean != 0;
+        t.builtin = jsonget(k, "builtin")->boolean != 0;
         s->skills = push(&g->perm, s->skills, t);
     }
     scheddirty(&g->sched);
@@ -5414,6 +5428,15 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
         return 1;
     case EV_SESSIONS:
         onsessions(g, h, r->root);
+        return 1;
+    case EV_CONFIG:
+        // The main engine's configuration loaded again: Settings and the
+        // [ui] settings as the file now says, once no field is mid-edit
+        if (h==g->main && g->cfg &&
+                jsonint(jsonget(r->root, "rev"), 0)!=jsonint(jsonget(g->cfg, "rev"), 0)) {
+            g->cfgstale = 1;
+            scheddirty(&g->sched);
+        }
         return 1;
     case EV_REMOTE:
         onremote(g, h, a, r);
@@ -8779,7 +8802,8 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
         out->append("\n");
     }
     if (g->helppage) {
-        out->appendf("[Prospero][Help]\nPage=%s\n\n", helpnames[g->helppage]);
+        Str page = helpnames[g->helppage];
+        out->appendf("[Prospero][Help]\nPage=%.*s\n\n", (int)page.len, page.cdata);
     }
 }
 
@@ -9026,6 +9050,11 @@ static void gui_frame(Gui *g)
     i32          packed = atlas->Builder ? atlas->Builder->RectsPackedCount : 0;
     i64          laid   = g->view->laidout;
     g->benchtex0 = atlas->TexData ? atlas->TexData->Width : 0;
+
+    if (g->cfgstale && !g->cfgget && !g->cfgset && g->cfgtyped<g->total.frames-1) {
+        g->cfgstale = 0;
+        guiconfigget(g);  // the file changed: Settings and [ui] as it says
+    }
 
     imgreap(g);  // before this frame lists the textures
     os_guinewframe(g->os);
@@ -9967,6 +9996,9 @@ enum : i32 {
     CHK_GITQUIET,     // no frames since OP_MARK, the Changes pane shown
     CHK_CFGFOCUS,     // a result went to the setting text names: its
                       // page as CHK_PAGE, then its key, in view
+    CHK_HELPSECTION,  // Help shows the page that begins with text, scrolled
+                      // to a section a link named
+    CHK_LINKWEB,      // the web link last followed is text
     CHK_COUNT,
 };
 
@@ -10206,6 +10238,7 @@ static Str chknames[] = {
     "the Changes pane lists the changes",
     "no frames while idle, the Changes pane shown",
     "a search result showed its setting",
+    "Help scrolled to the link's section", "the web link was followed",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -11501,6 +11534,58 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 1500, ""},
     {OP_MARK, 0, 0, 0, 2000, ""},
     {OP_CHECK, CHK_KEYLOST, 0, 0, 0, ""},
+    // Links in a reply: a setting's shows Settings at it, marked; a Help
+    // section's its topic scrolled there; a pane's the pane; one to a
+    // setting not there leaves its key in the search; a web link is
+    // followed (only noted here). A drag from a link selects instead.
+    {OP_PROMPT, 0, 0, 0, 1500, "Answer with links."},
+    {OP_WAIT, W_IDLE, 0, 0, 10000, ""},
+    {OP_SHOT, 0, 0, 0, 300, "links"},
+    {OP_MOVE, T_NAMED, 0, 0, 800, "link settings:ui#editor"},
+    {OP_CHECK, CHK_TOOLTIP, 0, 0, 0, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Settings"},
+    {OP_CHECK, CHK_CFGFOCUS, 0, 0, 0, "ui editor"},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link help:config#includes"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Help"},
+    {OP_CHECK, CHK_HELPSECTION, 0, 0, 0, "# Configuration\n"},
+    {OP_SHOT, 0, 0, 0, 300, "link-help"},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link view:hosts"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 700, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Hosts"},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link settings:model/nope#effort"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Settings"},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "effort"},
+    {OP_MOVE, T_CFGCLEAR, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link https://example.com/"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_LINKWEB, 0, 0, 0, "https://example.com/"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "link https://example.org/drag"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_MOVE, T_NAMED, 80, 0, 100, "link https://example.org/drag"},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_LINKWEB, 0, 0, 0, "https://example.com/"},
     // Closing with a turn running asks first; Cancel goes back, and
     // stopping quits
     {OP_PROMPT, 0, 0, 0, 100, "Close me: run a very slow command."},
@@ -15482,6 +15567,14 @@ static b32 drivecheck(Gui *g, i32 chk)
                g->cfgfname==g->cfgpname && !g->cfgfscroll && g->cfgfseen &&
                g->cfgframe+3>=g->total.frames;
     }
+    case CHK_HELPSECTION: {
+        DocView *d    = g->helpdoc;
+        Str      want = g->ops[g->drivepc-1].text;
+        return d && d->win && d->win->Scroll.y>0 && !d->section.len && !g->helpsect.len &&
+               g->helpshown==g->helppage+1 && startswith(helptext(g->helppage), want);
+    }
+    case CHK_LINKWEB:
+        return g->linkopened == g->ops[g->drivepc-1].text;
     case CHK_PAGE: {
         Arena a    = g->frame;
         Str   want = g->ops[g->drivepc-1].text;

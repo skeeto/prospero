@@ -448,6 +448,13 @@ Prospero from starting. The settings window edits the file a line at a
 time, and its Open in editor opens the whole file in your editor, read
 again once the editor exits.
 
+The agent can change the file too, through Prospero's own skill (see
+Skills). A write or edit of the file, or of a local file it includes,
+asks every time, with no "always", even inside an allowed directory
+(Bypass mode aside); once written, the configuration is read again at
+once, the agent is told of any problem in what it wrote, and the
+window takes up the change.
+
 API keys never go in the file: `key = env:NAME` reads one from the
 environment when it is needed, and `key = file:PATH` from a file
 holding just the key, for an engine whose environment you cannot set,
@@ -549,6 +556,14 @@ also lets it read the skill's directory, and hears of skills added or
 changed as it works. `/NAME args` in the prompt box uses a skill
 directly, and one with `disable-model-invocation: true` is for that
 alone. `[skills] enabled = false` turns them off.
+
+One skill is built in: `prospero`, Prospero's Help and every setting,
+served by the engine itself, so that the agent can answer questions
+about Prospero and change its settings. Its replies link Help topics
+(`help:NAME#SECTION`), settings (`settings:KIND/NAME#KEY`) and panes
+(`view:PANE`), which a click in the window opens. A skill of the
+user's own named `prospero` replaces it, never a project's, and eval
+sessions do without it.
 
 ## Desktop control
 

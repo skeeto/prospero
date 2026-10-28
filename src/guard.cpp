@@ -363,6 +363,7 @@ struct GuardPath {
     Str real;      // symlinks resolved; null unless lexically inside
     b32 inside;    // allowed without asking
     b32 diverged;  // inside lexically, but a symlink leads out
+    b32 config;    // Prospero's own configuration: asked about each time
 };
 
 // Resolve a tool's path argument and judge it.

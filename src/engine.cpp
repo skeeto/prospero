@@ -1234,6 +1234,10 @@ static void putskills(JsonOut *w, Slice<Skill> list, b32 all)
             putstrkey(w, "path", list[i].path);
             putkey(w, "hidden");
             putbool(w, list[i].hidden);
+            if (list[i].builtin) {
+                putkey(w, "builtin");
+                putbool(w, 1);
+            }
         }
         putend(w);
     }
@@ -3810,13 +3814,122 @@ static void planresolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
 }
 
 
+// Prospero's own configuration, changed by the file tools: the user's
+// file and the local files it includes. Each change is asked about,
+// even inside the roots, as the file chooses what runs and where the
+// agent may go (but not in Bypass mode). Once written, the files are
+// loaded again at once, and the agent told what is wrong in them.
+
+// Where a path leads: through its links, else as it is (a file not
+// there yet), normalized.
+static Str cfgreal(Session *s, Arena *a, Str path)
+{
+    Str real = os_realpath(s->e->os, a, path);
+    return normpath(a, {}, real.len ? real : path, s->te.windows);
+}
+
+// Whether two such paths are the same file, on Windows in any case.
+static b32 cfgsame(Session *s, Str a, Str b)
+{
+    return s->te.windows ? equalfold(a, b) : a==b;
+}
+
+// Whether a path is one of the configuration's files.
+static b32 cfgfile(Session *s, Arena scratch, Str path)
+{
+    Config *c = s->e->cfg;
+    if (!c || !c->path.len || cut(path, 0).ok) {
+        return 0;
+    }
+    Str real = cfgreal(s, &scratch, path);
+    for (iz i = 0; i < c->watch.len; i++) {
+        if (cfgsame(s, cfgreal(s, &scratch, c->watch[i]), real)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// A load of the configuration put to use: by the sessions, and by the
+// window, which a config event tells to ask for it again.
+static void reconfigure(Engine *, Arena);
+
+static void cfgapply(Engine *e, Arena scratch)
+{
+    reconfigure(e, scratch);
+    Buf   b(&scratch, 128);
+    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_CONFIG);
+    putintkey(&w.json, "rev", e->cfg->rev);
+    emit(e, evend(&w));
+}
+
+// After a file tool wrote paths: if any is the configuration's, load
+// and apply it, and say in the tool's result, text, whether the files
+// written have problems. A fetch's failure is not among them: the
+// agent cannot fix it in the file.
+static Str cfgwrote(Session *s, Arena *a, Slice<Str> paths, Str text)
+{
+    Engine    *e     = s->e;
+    Slice<Str> reals = {};
+    for (iz i = 0; i < paths.len; i++) {
+        if (cfgfile(s, *a, paths[i])) {
+            reals = push(a, reals, cfgreal(s, a, paths[i]));
+        }
+    }
+    if (!reals.len) {
+        return text;
+    }
+    cfgload(e->cfg, *a);
+    cfgapply(e, *a);
+
+    Ini *ini = e->cfg->ini;
+    Buf  b(a, text.len + 4096);
+    print(&b, text);
+    i32  n = 0;
+    for (iz i = 0; i < ini->diags.len; i++) {
+        IniDiag *d    = &ini->diags[i];
+        b32      mine = 0;
+        for (iz k = 0; k<reals.len && !mine && d->file.len && !iniurl(d->file); k++) {
+            mine = cfgsame(s, cfgreal(s, a, d->file), reals[k]);
+        }
+        for (IniFile *f = ini->files; mine && f; f = f->next) {
+            if (f->via && f->via->num==d->line && iniurl(f->path) &&
+                    f->parent && f->parent->path==d->file) {
+                mine = 0;  // the include line of a URL: its fetch
+            }
+        }
+        if (!mine) {
+            continue;
+        } else if (n++ == 20) {
+            print(&b, "\n(and more)");
+            break;
+        }
+        print(&b, n==1 ? Str("\n\nProspero read its configuration again and "
+                             "found problems in what was written:")
+                       : Str(""));
+        print(&b, "\n");
+        print(&b, d->file);
+        if (d->line) {
+            putbyte(&b, ':');
+            print(&b, (i64)d->line);
+        }
+        print(&b, d->severity==INI_ERROR ? Str(": error: ") : Str(": warning: "));
+        print(&b, d->msg);
+    }
+    if (!n) {
+        print(&b, "\n\nProspero read its configuration again: no problems.");
+    }
+    return finish(&b);
+}
+
+
 // Searches (search.cpp) and file tools
 
 static b32 startsearch(Session *, Arena, i32 tool, Str path, Args *);
 
 // The files a patch names, judged by the guard: those outside the roots,
-// unless the user allowed one, to be asked about (out), and at most one
-// such (many is set). In Bypass mode none is asked about, but the patch
+// or Prospero's configuration (cfgfile), unless the user allowed one, to
+// be asked about (out), and at most one such (many is set). In Bypass mode none is asked about, but the patch
 // is refused for the first that names nothing (nul), or else for the
 // first under the state directory (state).
 struct PatchGuard {
@@ -3840,7 +3953,8 @@ static PatchGuard patchguard(Session *s, Arena *a, Patch *p, Str allowed)
             } else {
                 f->file = g.path;
             }
-            if (g.inside || g.path==allowed || g.path==r.out.path ||
+            g.config = !bypassing(s) && cfgfile(s, *a, g.path);
+            if ((g.inside && !g.config) || g.path==allowed || g.path==r.out.path ||
                     isplanfile(s, g.path)) {
                 continue;
             } else if (r.out.path.data) {
@@ -3934,7 +4048,12 @@ static void runpatch(Session *s, Arena scratch, Args *args, Str allowed)
         toolend(s, scratch, "error", finish(&b), 0, 0, {}, 0);
         return;
     }
-    toolend(s, scratch, "ok", plan.text, 0, 0, {}, 0);
+    Slice<Str> wrote = {};
+    for (iz i = 0; i < plan.changes.len; i++) {
+        wrote = push(&scratch, wrote, plan.changes[i].path);
+    }
+    Str text = cfgwrote(s, &scratch, wrote, plan.text);
+    toolend(s, scratch, "ok", text, 0, 0, {}, 0);
 }
 
 static b32 readimage(Session *, Arena, Str);
@@ -3987,6 +4106,11 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     }
     if (o.ok) {
         instrlazy(s, scratch, path);
+    }
+    if (o.ok && (tool==TOOL_WRITE || tool==TOOL_EDIT)) {
+        Slice<Str> wrote = {};
+        wrote  = push(&scratch, wrote, path);
+        o.text = cfgwrote(s, &scratch, wrote, o.text);
     }
     s->callfail = tool==TOOL_EDIT && !o.ok ? Str("miss") : Str{};
     s->callfix  = o.fix;
@@ -4275,7 +4399,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     // directory the path is in
     b32 search = tool==TOOL_GREP || tool==TOOL_GLOB;
     b32 isdir  = search && os_stat(e->os, scratch, gp->path).type==STAT_DIR;
-    Str grant  = guardgrant(&scratch, &s->guard, gp, isdir);
+    Str grant  = gp->config ? Str{} : guardgrant(&scratch, &s->guard, gp, isdir);
 
     Ask *k = &s->ask;
     *k = {};
@@ -4286,6 +4410,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     k->gp.path     = clone(&s->perm, gp->path);
     k->gp.real     = gp->real.data ? clone(&s->perm, gp->real) : Str{};
     k->gp.diverged = gp->diverged;
+    k->gp.config   = gp->config;
     k->hint.path   = h.path.data ? clone(&s->perm, h.path) : Str{};
     k->hint.exists = h.exists;
     k->opened      = os_ticks(e->os);
@@ -4302,6 +4427,11 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     }
     {
         Str   why = guardwhy(&scratch, toolnames[tool], gp, s->guard.cwd);
+        if (gp->config) {
+            why = concat(&scratch, why, " It is Prospero's own configuration, "
+                         "which chooses what runs and where the agent may go, "
+                         "so each change to it is asked about.");
+        }
         Buf   b(&scratch, 512 + why.len);
         EvOut w = sbegin(s, &b, EV_ASK);
         putstrkey(&w.json, "req", k->req);
@@ -6421,13 +6551,45 @@ static Slice<SkillDir> skilldirs(Session *s, Arena *a)
     return r;
 }
 
-// A session's skills as they are now: none while [skills] is off.
+// A session's skills as they are now: none while [skills] is off. The
+// built-in one too, unless one of the user's own has its name, or the
+// session follows only its project's instructions.
 static Skills sessskills(Session *s, Arena *a)
 {
     if (skilldeny(s->e)) {
         return {};
     }
-    return skillfind(s->e->os, a, skilldirs(s, a), s->te.windows);
+    Skills r = skillfind(s->e->os, a, skilldirs(s, a), s->te.windows);
+    if (!s->projinstr && !skillbyname(r.list, skillbuiltin)) {
+        r.list = push(a, r.list, helpskill(a));
+        sort(r.list.data, r.list.len, skillless, *a);
+    }
+    return r;
+}
+
+// The built-in skill's instructions, as this engine fills them.
+static Str builtinbody(Engine *e, Arena *a)
+{
+    HelpSelf self = {};
+    self.version = PROSPERO_VERSION;
+    self.config  = e->cfg && e->cfg->path.len ? cfgdest(e->cfg, a) : Str{};
+    self.state   = e->statedir;
+    self.agents  = e->global;
+    self.skills  = e->skilldir;
+    return helpskillbody(a, &self);
+}
+
+// What the skill tool gives for the built-in skill: the topics its args
+// name, else its instructions, which list them.
+static Str builtintext(Engine *e, Arena *a, Str args)
+{
+    HelpPick p = trim(args).len ? helpargs(a, e->cfg, args) : HelpPick{};
+    Str      r = p.text.len ? p.text : builtinbody(e, a);
+    if (p.missed.len) {
+        Str no = concat(a, concat(a, "No topic is named ", p.missed), ".");
+        r = concat(a, concat(a, no, p.text.len ? Str(" ") : Str("\n\n")), r);
+    }
+    return r;
 }
 
 // What the agent knows of skills from now on: those it may use.
@@ -6547,6 +6709,10 @@ static void toolskill(Session *s, Arena scratch, Args *args)
         s->callfail = "skill";
         toolend(s, scratch, "error", text, 0, 0, {}, 0);
         return;
+    } else if (k->builtin) {
+        Str text = builtintext(s->e, &scratch, args->args);
+        toolend(s, scratch, "ok", text, 0, 0, {}, 0);
+        return;
     }
     SkillMeta m = skillload(s->e->os, &scratch, k);
     if (m.err.data) {
@@ -6575,6 +6741,9 @@ static SkillUse skillinvoke(Session *s, Arena *a, Str name, Str args)
     Skill   *k  = skillbyname(sk.list, name);
     if (!k) {
         r.err = concat(a, "no such skill: ", utf8head(name, SKILL_NAME));
+        return r;
+    } else if (k->builtin) {
+        r.text = skillprompt(a, k, builtinbody(s->e, a), args);
         return r;
     }
     SkillMeta m = skillload(s->e->os, a, k);
@@ -9297,7 +9466,10 @@ static b32 runtool(Session *s, Arena scratch)
         Str       want = args.path.data ? args.path : Str(".");
         GuardPath g    = guardpath(e->os, &scratch, &s->guard, want, toolreads(tool));
         b32       mine = isplanfile(s, g.path);  // the harness's own file
-        if (!g.inside && !mine && !(planning(s) && !toolreads(tool)) && !bypass) {
+        b32       plan = planning(s) && !toolreads(tool);  // refused
+        g.config = !toolreads(tool) && !mine && !plan && !bypass &&
+                   cfgfile(s, scratch, g.path);
+        if ((!g.inside || g.config) && !mine && !plan && !bypass) {
             return askcall(s, scratch, tool, &g);
         }
         toolstart(s, scratch);
@@ -15729,7 +15901,7 @@ static b32 onconfig(Engine *e, Arena scratch, Record r)
         return 0;
     }
     if (e->cfg->rev != rev) {
-        reconfigure(e, scratch);
+        cfgapply(e, scratch);
     }
     configwaiters(e, scratch);
     return 1;
@@ -15753,7 +15925,7 @@ static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
             if (cfgbusy(c) && e->ncfgwait<countof(e->cfgwait)) {
                 e->cfgwait[e->ncfgwait++] = id;
                 if (c->rev != rev) {
-                    reconfigure(e, scratch);
+                    cfgapply(e, scratch);
                 }
                 return;
             }
@@ -15787,7 +15959,7 @@ static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
         }
     }
     if (c->rev != rev) {
-        reconfigure(e, scratch);
+        cfgapply(e, scratch);
     }
     replyconfig(e, scratch, id, cmd, &r);
 }
@@ -16391,7 +16563,7 @@ static void enginethread(void *arg)
         // Records mean work: catch up with configuration edits first
         Mail m = mailtake(e->in);
         if (m.len && cfgpoll(e->cfg, newarena(e->scratch), 0)) {
-            reconfigure(e, newarena(e->scratch));
+            cfgapply(e, newarena(e->scratch));
         }
         for (Record r; (r = mailnext(&m)).ok;) {
             onrecord(e, newarena(e->scratch), r);
@@ -16424,7 +16596,7 @@ static void enginethread(void *arg)
             i64 rev = e->cfg->rev;
             cfgtimeout(e->cfg, newarena(e->scratch));
             if (e->cfg->rev != rev) {
-                reconfigure(e, newarena(e->scratch));
+                cfgapply(e, newarena(e->scratch));
             }
             configwaiters(e, newarena(e->scratch));
         }

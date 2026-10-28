@@ -195,5 +195,103 @@ static void test_skills(Test *t)
         c = skillcalled(skillprompt(a, &k, "", ""));
         expect(t, "called bare", concat(a, istr(a, c.ok), c.name), "1pdf");
         expect(t, "not called", istr(a, skillcalled("<skill name=\"x\">no end").ok), "0");
+
+        Skill b = helpskill(a);
+        p = skillprompt(a, &b, "Body.", "how?");
+        expect(t, "prompt builtin", p, "<skill name=\"prospero\">\nBody.\n</skill>\n\nhow?");
+        c = skillcalled(p);
+        expect(t, "called builtin", concat(a, concat(a, istr(a, c.ok), c.name), c.args), "1prosperohow?");
     }
+
+    // A project's skill may not take the built-in one's name, by its
+    // directory or its frontmatter, but the user's may
+    {
+        static Str const own[] = {
+            "/o", "/o/.git", "/o/.claude", "/o/.claude/skills",
+            "/o/.claude/skills/prospero", "/o/.claude/skills/other",
+            "/ou", "/ou/prospero",
+        };
+        for (iz i = 0; i < countof(own); i++) {
+            os_mkdirs(os, *a, own[i]);
+        }
+        os_write(os, *a, "/o/.claude/skills/prospero/SKILL.md", "x\n");
+        os_write(os, *a, "/o/.claude/skills/other/SKILL.md", "---\nname: prospero\n---\n");
+        os_write(os, *a, "/ou/prospero/SKILL.md", "---\ndescription: mine\n---\n");
+        Slice<SkillDir> od = {};
+        od = push(a, od, SkillDir{"/o/.claude/skills", "/o"});
+        Skills os1 = skillfind(os, a, od, 0);
+        expect(t, "project builtin", skillnames(a, os1.list), "");
+        expect(t, "project builtin skipped", istr(a, os1.skipped.len), "2");
+        od = push(a, od, SkillDir{"/ou", {}});
+        Skills os2 = skillfind(os, a, od, 0);
+        expect(t, "user builtin", skillbyname(os2.list, "prospero")->desc, "mine");
+    }
+}
+
+// The built-in skill: its description, its body filled, and the topics
+// its tool's args name
+static void test_helpskill(Test *t)
+{
+    Arena *a = &t->perm;
+
+    Skill k = helpskill(a);
+    expect(t, "name", k.name, skillbuiltin);
+    expect(t, "builtin", istr(a, k.builtin), "1");
+    expect(t, "desc", k.desc, "Prospero, the coding harness this session runs "
+           "in: its help pages, every setting in prospero.ini, its panes and "
+           "keys, and how to change them. Use when the user asks about "
+           "Prospero, how to do something in it, or to change its settings.");
+
+    HelpSelf self = {"9.9", "/c/prospero.ini", "/s", "/c/AGENTS.md", "/c/skills"};
+    Str body = helpskillbody(a, &self);
+    expect(t, "filled", istr(a, find(body, "{{") < 0 && find(body, "(unknown)") < 0), "1");
+    expect(t, "no end tag", istr(a, find(body, "\n</skill>")), "-1");
+    expect(t, "version", istr(a, find(body, "Prospero 9.9,") > 0), "1");
+    expect(t, "topics", istr(a, find(body, "`config`") > 0), "1");
+    HelpSelf none = {};
+    expect(t, "unknown", istr(a, find(helpskillbody(a, &none), "from (unknown)") > 0), "1");
+
+    HelpPick p = helpargs(a, 0, "config");
+    expect(t, "page", istr(a, startswith(p.text, "Help topic `config` (help:config):\n\n# ")), "1");
+    expect(t, "page missed", p.missed, "");
+    p = helpargs(a, 0, "\"Configuration\", help:config#includes");
+    expect(t, "page once", istr(a, find(p.text, "---")), "-1");
+    p = helpargs(a, 0, "settings ui");
+    expect(t, "kind", istr(a, find(p.text, "(settings:ui#editor)") > 0), "1");
+    expect(t, "kind only", istr(a, find(p.text, "settings:model")), "-1");
+    p = helpargs(a, 0, "settings Interface");
+    expect(t, "kind label", istr(a, find(p.text, "(settings:ui#editor)") > 0), "1");
+    p = helpargs(a, 0, "settings");
+    expect(t, "index", istr(a, find(p.text, "settings:diagnostics") > 0), "1");
+    p = helpargs(a, 0, "settings config");
+    expect(t, "index, page", istr(a, find(p.text, "help:config") > 0 &&
+                                     find(p.text, "settings:diagnostics") > 0), "1");
+    p = helpargs(a, 0, "nope, config");
+    expect(t, "missed", p.missed, "nope");
+    p = helpargs(a, 0, "nope");
+    expect(t, "none", istr(a, !p.text.data), "1");
+
+    // Where links go
+    Dest d = helpdest(a, "help:config#Settings-worth-knowing");
+    expect(t, "help", istr(a, d.kind==DEST_HELP && d.page==helpnamed("config")), "1");
+    expect(t, "help section", d.section, "Settings-worth-knowing");
+    expect(t, "help none", istr(a, helpdest(a, "help:nope").page), "-1");
+    d = helpdest(a, "settings:ui#editor");
+    expect(t, "settings", concat(a, concat(a, d.cfgkind, "|"), d.cfgkey), "ui|editor");
+    expect(t, "settings known", istr(a, d.known && !d.cfgname.data), "1");
+    d = helpdest(a, "settings:model/a%2Fb.c#effort");
+    expect(t, "settings named", concat(a, concat(a, d.cfgkind, "|"), d.cfgname), "model|a/b.c");
+    d = helpdest(a, "settings:Interface");
+    expect(t, "settings label", d.cfgkind, "ui");
+    d = helpdest(a, "settings:defaults#theme");
+    expect(t, "settings top", istr(a, d.known && !d.cfgkind.len), "1");
+    expect(t, "settings diag", istr(a, helpdest(a, "settings:diagnostics").diag), "1");
+    expect(t, "settings whole", istr(a, helpdest(a, "settings:").whole), "1");
+    d = helpdest(a, "settings:nope/x#y");
+    expect(t, "settings unknown", concat(a, istr(a, d.known), d.find), "0y");
+    d = helpdest(a, "view:Hosts");
+    expect(t, "view", istr(a, d.kind==DEST_VIEW && d.pane==8), "1");
+    expect(t, "view none", istr(a, helpdest(a, "view:nope").pane), "-1");
+    expect(t, "web", istr(a, helpdest(a, "HTTPS://example.com/").kind), istr(a, DEST_WEB));
+    expect(t, "other", istr(a, helpdest(a, "file:///etc/passwd").kind), istr(a, DEST_NONE));
 }

@@ -30,6 +30,13 @@ seconds (30 by default). Its buttons:
 Sending a message while an ask waits denies it, and the agent reads
 your message.
 
+A write or edit of Prospero's own configuration (its file, and the
+local files it includes) asks every time, even inside the working
+directory, the roots or a directory you always allowed, and offers no
+Always: the file chooses what runs and where the agent may go. Only
+Bypass mode writes it unasked. See
+[Configuration](help:config#the-agent-changes-it).
+
 ## Attended and unattended
 
 A session is attended while a window has it open. One nobody is

@@ -1032,6 +1032,35 @@ def sc_skill_prompt(model, n, req):
     yield from answer(model, f"Answer number {n}.")
 
 
+def sc_prospero_skill(model, n, req):
+    # The built-in skill: its instructions, then each topic the prompt
+    # names, separated by |; a prompt invoking a skill is just answered
+    u = last_user_text(req) or ""
+    k = since_user(req)
+    calls = [] if u.startswith("<skill") else \
+        [{"name": "prospero"}] + [{"name": "prospero", "args": a} for a in u.split("|")]
+    if k < len(calls):
+        yield from tool(model, n, "skill", calls[k])
+    else:
+        yield from answer(model, "Read.")
+
+
+def sc_config_write(model, n, req):
+    # The calls the prompt gives as JSON, one after another (a notice may
+    # follow the prompt)
+    calls = []
+    for m in reversed(req.get("messages", [])):
+        c = m.get("content")
+        if m.get("role") == "user" and isinstance(c, str) and c.startswith("[["):
+            calls = json.loads(c)
+            break
+    k = since_user(req)
+    if k < len(calls):
+        yield from tool(model, n, *calls[k])
+    else:
+        yield from answer(model, "Done.")
+
+
 def sc_skill_task(model, n, req):
     if step(req) == 0:
         yield from tool(model, n, "task", {"description": "Use a skill",
@@ -2551,7 +2580,8 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Start a desktop subagent", "Type on the desktop as a subagent",
                "Start a subagent that messages", "Message the parent as a subagent",
                "Describe the images", "Ask on the side", "Run a long command",
-               "Stream, then pause", "Call the MCP server", "Remember the hosts")
+               "Stream, then pause", "Call the MCP server", "Remember the hosts",
+               "Answer with links")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2636,6 +2666,15 @@ def sc_gui(model, n, req):
         ok = all(base64.b64decode(data).startswith(magic.get(mime, b"?"))
                  for mime, data in images)
         yield from answer(model, f"I see {len(images)} images{'' if ok else ', some broken'}.")
+    elif "Answer with links" in prompt:
+        # Each kind of link the window follows, one a line, at its start
+        yield from answer(model, "Links:\n\n"
+                          "- [Settings \u2192 Interface \u2192 editor](settings:ui#editor)\n"
+                          "- [Includes](help:config#includes)\n"
+                          "- [View \u2192 Hosts](view:hosts)\n"
+                          "- [effort](settings:model/nope#effort)\n"
+                          "- [a web page](https://example.com/)\n"
+                          "- [another to drag from](https://example.org/drag)\n")
     elif "Remember the hosts" in prompt:
         if step == 0:
             yield from tool(model, n, "memory", {

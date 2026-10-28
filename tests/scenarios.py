@@ -2722,10 +2722,14 @@ def skill_prompt(t):
     try:
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
         sk = h.call("skills", sid=sid)
-        got = [(k["name"], k["description"], k["hidden"]) for k in sk.get("skills", [])]
+        got = [(k["name"], k["description"], k["hidden"]) for k in sk.get("skills", [])
+               if not k.get("builtin")]
         t.check(sk.get("ok") == 1 and sk.get("sid") == sid and
                 got == [("pdf", "Read PDFs", False), ("review", "Review a change", True)] and
-                all(k["path"].endswith("SKILL.md") for k in sk["skills"]), f"skills {sk}")
+                all(k["path"].endswith("SKILL.md") for k in sk["skills"]
+                    if not k.get("builtin")) and
+                [k["name"] for k in sk["skills"] if k.get("builtin")] == ["prospero"],
+                f"skills {sk}")
         bad = h.call("prompt", sid=sid, text="x", skill="nope")
         t.check(bad.get("ok") == 0 and "no such skill" in bad.get("err", ""), f"nope {bad}")
         h.send("prompt", sid=sid, text="src/a.c", skill="review")
@@ -2750,7 +2754,7 @@ def skill_prompt(t):
         t.check(fake_provider.system_of(reqs[1]) == system, "the system prompt stays")
         notices = [n for n in h.all("notice", sid) if n.get("kind") == "skills"]
         t.check(len(notices) == 1 and [k["name"] for k in notices[0].get("skills", [])] ==
-                ["fresh", "pdf"], f"notices {notices}")
+                ["fresh", "pdf", "prospero"], f"notices {notices}")
         seen = notices[0]["seq"]
     finally:
         rc = h.close()
@@ -2768,6 +2772,66 @@ def skill_prompt(t):
         t.check(len(msgs) == 1, f"told once: {len(msgs)}")
         again = [n for n in h.all("notice", sid) if n.get("kind") == "skills" and n["seq"] > seen]
         t.check(not again, f"no notice after reopening: {again}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def prospero_skill(t):
+    """The built-in prospero skill, in every session: its instructions
+    name this engine's configuration file, its args the Help topics and
+    settings to read, and /prospero invokes it. A project's skill of its
+    name is left out with a warning; the user's own replaces it."""
+    env = skillhome(t)
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    skillput(t, t.host.join(t.work, ".claude", "skills"), "prospero",
+             "---\ndescription: Not Prospero's\n---\nFAKE\n")
+    h = t.headless(env)
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        sk = h.call("skills", sid=sid)
+        got = [(k["name"], k.get("builtin", False), k["path"]) for k in sk.get("skills", [])]
+        t.check(got == [("prospero", True, "")], f"skills {sk}")
+
+        h.send("prompt", sid=sid, text="config|settings ui|settings model|nope")
+        t.check(ended(h, sid, 1)["why"] == "done", "the turn ends")
+        ends = h.all("tool.end", sid)
+        t.check([e["status"] for e in ends] == ["ok"]*5, f"statuses {ends}")
+        texts = [e["text"] for e in ends]
+        t.check(texts[0].startswith("# Prospero\n") and "prospero.ini" in texts[0] and
+                "{{" not in texts[0] and "(unknown)" not in texts[0] and
+                "Base directory" not in texts[0] and "- `config`: Configuration" in texts[0],
+                f"instructions {texts[0][:400]!r}")
+        t.check(texts[1].startswith("Help topic `config` (help:config):\n\n# Configuration"),
+                f"config {texts[1][:200]!r}")
+        t.check("(settings:ui#editor)" in texts[2] and "settings:model" not in texts[2],
+                f"settings ui {texts[2][:200]!r}")
+        t.check("This configuration has none." in texts[3] and
+                "(settings:model/NAME#effort)" in texts[3], f"settings model {texts[3][:300]!r}")
+        t.check(texts[4].startswith("No topic is named nope.\n\n# Prospero"),
+                f"nope {texts[4][:200]!r}")
+        reqs = [q["body"] for q in t.requests()]
+        system = fake_provider.system_of(reqs[0])
+        t.check("- prospero: Prospero, the coding harness this session runs in" in system and
+                "Not Prospero's" not in system, "listed")
+        warns = [n["text"] for n in h.all("note", sid)
+                 if n.get("level") == "warn" and "skill left out" in n["text"]]
+        t.check(len(warns) == 1 and "Prospero's own skill" in warns[0], f"warned {warns}")
+
+        h.send("prompt", sid=sid, text="how?", skill="prospero")
+        ended(h, sid, 2)
+        last = t.requests()[-1]["body"]["messages"][-1]["content"]
+        t.check(last.startswith("<skill name=\"prospero\">\n# Prospero\n") and
+                last.endswith("</skill>\n\nhow?"), f"prompt {last[:200]!r}")
+        user = h.all("user", sid)
+        t.check(user[-1].get("skill") == "prospero", f"user {user[-1]}")
+
+        mine = t.host.join(env["XDG_CONFIG_HOME"], "prospero", "skills")
+        skillput(t, mine, "prospero", "---\ndescription: Mine\n---\nMINE\n")
+        sk = h.call("skills", sid=sid)
+        got = [(k["name"], k["description"], k.get("builtin", False)) for k in sk["skills"]]
+        t.check(got == [("prospero", "Mine", False)], f"the user's {sk}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -3682,6 +3746,62 @@ def config_roots(t):
         st = [e["status"] for e in h.all("tool.end", sid)]
         t.check(st == ["ok"], f"written: {st}")
         t.check(outside_file(t) == "outside\n", "the file is in the new root")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def config_write(t):
+    """The agent's edit of the configuration file asks each time, with no
+    always offered, though its directory was always allowed; allowed, the
+    file is loaded again at once, the result names the problems in what
+    was written, and a config event with the new revision reaches the
+    client. In Bypass mode it is edited unasked."""
+    conf = t.config
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+
+        def go(*calls):
+            h.send("prompt", sid=sid, text=json.dumps(calls))
+
+        go(["write", {"path": "../beside.txt", "content": "x\n"}])
+        ask = nextask(h, sid)
+        t.check(ask.get("always"), f"always offered beside it: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="always")
+        ended(h, sid, 1)
+        rev = h.call("config.get").get("rev", 0)
+
+        go(["edit", {"path": conf, "old_string": "[guard]",
+                     "new_string": "[ui]\ncolour = blue\n\n[guard]"}])
+        ask = nextask(h, sid, ask["seq"])
+        t.check(ask.get("tool") == "edit" and "always" not in ask and
+                "Prospero's own configuration" in ask.get("detail", ""), f"asked: {ask}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 2)
+        end = h.all("tool.end", sid)[-1]
+        t.check(end["status"] == "ok" and "found problems in what was written:" in end["text"]
+                and "colour" in end["text"], f"the result: {end}")
+        evs = h.all("config")
+        t.check(evs and evs[-1].get("rev", 0) > rev and "sid" not in evs[-1], f"events {evs}")
+
+        go(["edit", {"path": conf, "old_string": "colour = blue", "new_string": "theme = dark"}])
+        ask = nextask(h, sid, ask["seq"])
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 3)
+        end = h.all("tool.end", sid)[-1]
+        t.check(end["text"].endswith("Prospero read its configuration again: no problems."),
+                f"fixed: {end}")
+        t.check("[ui]\ntheme = dark\n" in (t.host.read(conf) or ""), "written")
+
+        r = h.call("mode", sid=sid, mode="bypass")
+        t.check(r.get("ok") == 1, f"bypass {r}")
+        asks = len(h.all("ask", sid))
+        go(["edit", {"path": conf, "old_string": "theme = dark", "new_string": "theme = light"}])
+        ended(h, sid, 4)
+        t.check(len(h.all("ask", sid)) == asks and "theme = light" in t.host.read(conf),
+                "edited unasked")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -5856,6 +5976,8 @@ def eval_formats(t):
     models = [good, flaky, bad, badpatch]
     rc, recs, out, err = evalrun(t, suite, models, ["-f", "all", "-n", "2", "-j", "3"])
     t.check(rc == 0, f"exit {rc}: {err[-2000:]}")
+    system = fake_provider.system_of(t.requests(good)[0]["body"])
+    t.check("- prospero:" not in system, f"no built-in skill in an eval: {system!r}")
     t.check(len(recs) == 48 and not any("error" in r for r in recs),
             f"{len(recs)} records: {[r for r in recs if 'error' in r][:2]}")
     t.check({(r["task"], r["rep"]) for r in recs} ==
