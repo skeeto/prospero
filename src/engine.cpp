@@ -11936,14 +11936,17 @@ static i32 shellkindof(Str path, b32 win)
     return SHELL_SH;
 }
 
-// What a POSIX sh on Windows is, by the files beside it: busybox-w32
-// (w64devkit's sh.exe), MSYS2 (Git Bash's bin/bash.exe starts the one in
-// usr/bin), or Cygwin. Only its description differs.
+// Whether this is macOS, by a file only it has, which tests can fake.
 static b32 onmacos(Os *os, Arena scratch, b32 win)
 {
     Str plist = "/System/Library/CoreServices/SystemVersion.plist";
     return !win && os_stat(os, scratch, plist).type==STAT_FILE;
 }
+
+// What a POSIX sh on Windows is, by the files beside it: busybox-w32
+// (w64devkit's sh.exe), MSYS2 (Git Bash's bin/bash.exe starts the one in
+// usr/bin), or Cygwin; on macOS, whether it is Apple's bash 3.2. Only
+// its description differs.
 
 static i32 shellflavor(Os *os, Arena scratch, Str path, i32 kind, b32 win)
 {

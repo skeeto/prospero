@@ -583,6 +583,33 @@ static void test_tools(Test *t)
         }
         expect(t, "env windows", istr(a, !gitdir && drive && utf8 && !key), "1");
 
+        // A window the desktop started: the login shell's environment
+        expect(t, "login wanted", istr(a, loginwanted("/usr/bin:/bin:/usr/sbin:/sbin")), "1");
+        expect(t, "login not wanted", istr(a, loginwanted("/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")), "0");
+        Slice<Str> la = loginargv(a, "/bin/zsh");
+        expect(t, "login argv", istr(a, la.len==5 && la[0]=="/bin/zsh" && la[1]=="-l" &&
+               la[2]=="-i" && la[3]=="-c" && find(la[4], "/usr/bin/env -0")>0), "1");
+        expect(t, "login argv fish", istr(a, loginargv(a, "/opt/homebrew/bin/fish").len), "5");
+        expect(t, "login argv csh", istr(a, loginargv(a, "/bin/tcsh").len), "0");
+        expect(t, "login argv nu", istr(a, loginargv(a, "/opt/homebrew/bin/nu").len), "0");
+        expect(t, "login argv relative", istr(a, loginargv(a, "zsh").len), "0");
+        expect(t, "login argv empty", istr(a, loginargv(a, "").len), "0");
+
+        u8 printed[] = "Welcome!\n--prospero-login-environment--PATH=/opt/homebrew/bin:/usr/bin\0"
+                       "PWD=/\0SHLVL=2\0_=/usr/bin/env\0MULTI=a\nb\0bad name=x\0=x\0"
+                       "1X=y\0PROSPERO_RESOLVING_ENVIRONMENT=1\0EMPTY=\0X_1=z\0"
+                       "--prospero-login-environment--trailing";
+        Slice<Str> le = loginenv(a, {printed, countof(printed)-1});
+        Buf lb(a, 1024);
+        for (iz i = 0; i < le.len; i++) {
+            print(&lb, le[i]);
+            putbyte(&lb, '|');
+        }
+        expect(t, "login env", finish(&lb), "PATH=/opt/homebrew/bin:/usr/bin|MULTI=a\nb|EMPTY=|X_1=z|");
+        u8 cutoff[] = "--prospero-login-environment--PATH=/x\0";
+        expect(t, "login env cut off", istr(a, loginenv(a, {cutoff, countof(cutoff)-1}).len), "0");
+        expect(t, "login env no marks", istr(a, loginenv(a, "PATH=/x").len), "0");
+
         ToolEnv te = {};
         te.shell.path = "C:\\bb\\busybox.exe";
         te.shell.kind = SHELL_BUSYBOX;

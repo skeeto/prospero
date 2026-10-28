@@ -84,9 +84,12 @@ cannot choose what runs, so these are ignored in one:
 - **[`[tools] path_prepend`](settings:tools#path_prepend) and
   [`path_append`](settings:tools#path_append)**: directories, separated
   by `;`, added before and after PATH, for the agent's commands, its
-  shell and ripgrep, and for the editor and ssh. Prospero started from
-  the Finder, the Dock, the Start menu or a desktop menu has a shorter
-  PATH than a shell gives it:
+  shell and ripgrep, and for the editor and ssh. On macOS, Prospero
+  started from the Finder, the Dock or Spotlight takes its environment
+  from your login shell, as a terminal would have it (a profile can
+  tell by `PROSPERO_RESOLVING_ENVIRONMENT=1`; one taking over five
+  seconds is stopped). Started from the Start menu or a desktop menu,
+  it has a shorter PATH than a shell gives it:
 
       [tools]
       path_prepend = ~/.local/bin; /opt/homebrew/bin

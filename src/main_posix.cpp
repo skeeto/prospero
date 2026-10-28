@@ -36,6 +36,7 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #  include <dlfcn.h>       // dlsym, for the responsibility functions
+#  include <pwd.h>         // getpwuid, for loginenviron
 #  include <libproc.h>     // proc_listpids, proc_pidinfo
 #  include <sys/event.h>   // EVFILT_PROC
 #  include <sys/sysctl.h>  // KERN_PROC_UID
@@ -3435,6 +3436,114 @@ static void os_httpfree(Os *, Http *h)
 #  include "gui_sdl.cpp"
 #endif
 
+#if PROSPERO_GUI && defined(__APPLE__)
+// A window the desktop started takes its login shell's environment
+// (loginwanted): $SHELL, else the account's, else zsh, run once with
+// PROSPERO_RESOLVING_ENVIRONMENT=1 so a profile can tell. Here, before
+// any thread starts, so setenv races nothing. Five seconds at most: a
+// profile that waits on a terminal is killed, and the window keeps
+// launchd's environment.
+static void loginenviron(Os *os, Arena scratch)
+{
+    if (!loginwanted(os_getenv(os, &scratch, "PATH"))) {
+        return;
+    }
+    Str shell = os_getenv(os, &scratch, "SHELL");
+    if (!shell.len) {
+        struct passwd *pw = getpwuid(getuid());
+        shell = pw && pw->pw_shell ? clone(&scratch, inistr(pw->pw_shell)) : Str{};
+    }
+    Slice<Str> args = loginargv(&scratch, shell.len ? shell : Str("/bin/zsh"));
+    if (!args.len) {
+        return;
+    }
+    char **argv = alloc<char *>(&scratch, args.len+1);
+    for (iz i = 0; i < args.len; i++) {
+        argv[i] = cstr(&scratch, args[i]);
+    }
+    iz n = 0;
+    for (; environ[n]; n++) {}
+    char **envp = alloc<char *>(&scratch, n+2);
+    for (iz i = 0; i < n; i++) {
+        envp[i] = environ[i];
+    }
+    envp[n] = (char *)"PROSPERO_RESOLVING_ENVIRONMENT=1";
+
+    i32 out[2];
+    i32 null = open("/dev/null", O_RDWR|O_CLOEXEC);
+    if (null < 0) {
+        return;
+    } else if (!cloexecpipe(out)) {
+        close(null);
+        return;
+    }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, null, 0);
+    posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+    posix_spawn_file_actions_adddup2(&fa, null, 2);
+    posix_spawnattr_t attr;
+    childsignals(&attr, POSIX_SPAWN_SETPGROUP|POSIX_SPAWN_CLOEXEC_DEFAULT, 1);
+    posix_spawnattr_setpgroup(&attr, 0);
+    pid_t pid = 0;
+    i32   err = posix_spawn(&pid, argv[0], &fa, &attr, argv, envp);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    close(null);
+    close(out[1]);
+    if (err) {
+        close(out[0]);
+        return;
+    }
+
+    // All of it, or nothing if it runs out of time or room
+    iz  cap = (iz)1 << 22;
+    u8 *buf = alloc<u8>(&scratch, cap);
+    iz  len = 0;
+    b32 ok  = 0;
+    i64 by  = monotonic() + 5*1000000;
+    for (;;) {
+        i64 now = monotonic();
+        struct pollfd p = {out[0], POLLIN, 0};
+        if (now>=by || poll(&p, 1, (int)((by-now+999)/1000))<=0 || len==cap) {
+            break;
+        }
+        ssize_t r = read(out[0], buf+len, (uz)(cap-len));
+        if (r < 0 && errno==EINTR) {
+            continue;
+        } else if (r <= 0) {
+            ok = !r;
+            break;
+        }
+        len += r;
+    }
+    close(out[0]);
+    i32 status = 0;
+    i32 reaped = 0;
+    while (ok && !reaped && monotonic()<by) {
+        reaped = (i32)waitpid(pid, &status, WNOHANG);
+        reaped = reaped<0 && errno==EINTR ? 0 : reaped;
+        if (!reaped) {
+            poll(0, 0, 10);
+        }
+    }
+    if (!reaped) {
+        sendsignal(pid, SIGKILL, 1);  // its own group, its children too
+        sendsignal(pid, SIGKILL, 0);
+        while (waitpid(pid, 0, 0)<0 && errno==EINTR) {}
+        return;
+    } else if (reaped<0 || !WIFEXITED(status)) {
+        return;
+    }
+
+    Slice<Str> env = loginenv(&scratch, {buf, len});
+    for (iz i = 0; i < env.len; i++) {
+        Cut kv = cut(env[i], '=');
+        setenv(cstr(&scratch, kv.head), cstr(&scratch, kv.tail), 1);
+    }
+}
+#endif
+
 
 #if PROSPERO_DESKTOP
 // The desktop helper, "prospero desktop" (main_desktop_x11.cpp)
@@ -3499,6 +3608,9 @@ int main(int argc, char **argv)
     }
     #if PROSPERO_GUI
     if (guiwanted(args, argc)) {
+        #ifdef __APPLE__
+        loginenviron(&os, a);
+        #endif
         // For sigthread (gui_sdl.cpp) alone: every thread inherits this
         sigset_t quit;
         sigemptyset(&quit);

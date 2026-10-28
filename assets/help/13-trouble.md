@@ -50,7 +50,9 @@ with no engine needs one deployed: Deploy engine in the Hosts pane,
 
 **A program is not found when started from the Finder, Dock or Start
 menu.** Prospero started that way has a shorter PATH than a terminal
-gives it, and no `$VISUAL` or `$EDITOR`. Add directories with
+gives it, and no `$VISUAL` or `$EDITOR`. On macOS it asks your login
+shell for its environment, so check that your profile sets PATH, runs
+without a terminal, and takes under five seconds. Add directories with
 `[tools] path_prepend` or `path_append`, and set `[ui] editor`, with a
 full path if need be. See [Configuration](help:config).
 

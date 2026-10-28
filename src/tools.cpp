@@ -2976,6 +2976,86 @@ static Str envget(Slice<Str> env, Str name, b32 windows)
     return {};
 }
 
+// A window the desktop started on macOS (Dock, Spotlight, Finder) gets
+// launchd's environment, with this PATH and nothing from the user's
+// profile, so Homebrew's programs, say, are not found. Seeing it, the
+// window takes its login shell's environment instead (loginenviron in
+// main_posix.cpp), as VS Code does. A terminal's PATH is never this.
+static b32 loginwanted(Str path)
+{
+    return path == "/usr/bin:/bin:/usr/sbin:/sbin";
+}
+
+// The marks around the environment a login shell prints, so that what
+// its profile prints too is passed over.
+static Str const loginmark = "--prospero-login-environment--";
+
+// The arguments by which a login shell prints its environment between
+// loginmarks, interactive as a terminal's is, since many profiles set
+// PATH in .zshrc or .bashrc; none for a shell not known to take them
+// (csh, nu).
+static Slice<Str> loginargv(Arena *a, Str shell)
+{
+    Str  name  = basename(shell);
+    Str  ok[]  = {"zsh", "bash", "sh", "ksh", "dash", "fish"};
+    b32  known = 0;
+    for (iz i = 0; !known && i<countof(ok); i++) {
+        known = name == ok[i];
+    }
+    if (!known || shell[0]!='/') {
+        return {};
+    }
+    Buf b(a, 128);
+    print(&b, "printf %s ");
+    print(&b, loginmark);
+    print(&b, "; /usr/bin/env -0; printf %s ");
+    print(&b, loginmark);
+    Slice<Str> r = {};
+    r = push(a, r, shell);
+    r = push(a, r, Str("-l"));
+    r = push(a, r, Str("-i"));
+    r = push(a, r, Str("-c"));
+    r = push(a, r, finish(&b));
+    return r;
+}
+
+// The variables in what loginargv's shell printed, NUL separated
+// between loginmarks, less those that describe that shell itself: none
+// if the marks are not there, as when it was cut off.
+static Slice<Str> loginenv(Arena *a, Str out)
+{
+    iz beg = find(out, loginmark);
+    if (beg < 0) {
+        return {};
+    }
+    out = cuthead(out, beg+loginmark.len);
+    iz end = find(out, loginmark);
+    if (end < 0) {
+        return {};
+    }
+    out = takehead(out, end);
+    Str skip[] = {"PWD", "OLDPWD", "SHLVL", "_", "PROSPERO_RESOLVING_ENVIRONMENT"};
+    Slice<Str> r = {};
+    while (out.len) {
+        Cut  c    = cut(out, 0);
+        Cut  kv   = cut(c.head, '=');
+        b32  good = kv.ok && kv.head.len;
+        for (iz i = 0; good && i<kv.head.len; i++) {
+            u8 ch = kv.head[i];
+            good = ch=='_' || (ch>='A' && ch<='Z') || (ch>='a' && ch<='z') ||
+                   (i && ch>='0' && ch<='9');
+        }
+        for (iz i = 0; good && i<countof(skip); i++) {
+            good = kv.head != skip[i];
+        }
+        if (good) {
+            r = push(a, r, c.head);
+        }
+        out = c.tail;
+    }
+    return r;
+}
+
 // An environment with its PATH set to path, the first entry replaced
 // where it is, under its own name (Path on Windows, say), or added: env
 // itself when it says so already.

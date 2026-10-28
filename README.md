@@ -507,8 +507,14 @@ and `[desktop]` settings, `[tools] path_prepend` and `path_append`, a
 are ignored. A server whose certificate is not trusted fails the turn
 at once, saying why, rather than being retried.
 
-Prospero started from Spotlight, the Finder, the Start menu or a desktop
-menu has a shorter PATH than a shell gives it. `[tools] path_prepend`
+On macOS, Prospero started from Spotlight, the Finder or the Dock gets
+launchd's environment, with a PATH of only the system's directories, so
+it takes its login shell's environment instead: once, at start, `$SHELL
+-l -i -c` printing `env`, as VS Code does, with
+`PROSPERO_RESOLVING_ENVIRONMENT=1` so a profile can tell. A profile that
+takes over five seconds is stopped, and the window keeps what it had.
+Started from the Start menu or a desktop menu elsewhere, it has a
+shorter PATH than a shell gives it. `[tools] path_prepend`
 and `path_append` add directories, separated by `;`, before and after
 it: for the agent's commands, its shell and ripgrep, and for what the
 GUI runs itself, the editor and ssh. A change applies to the next
