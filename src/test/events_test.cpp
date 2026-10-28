@@ -193,6 +193,62 @@ static void testlogcopy(Test *t)
     expect(t, "logcopy no session", istr(&a, c.err.len>0 && !c.log.data), "1");
 }
 
+// A side chat in a worktree (CopyWt): its own cwd and worktree in its
+// session record, the paths of snapshots, grants and instruction files
+// below the original's checkout remapped to the worktree (on Windows in
+// either separator and case), others left, its notice, and no title.
+static void testlogwt(Test *t)
+{
+    Arena a       = t->perm;
+    Arena scratch = t->perm;
+    scratch.beg  += (scratch.end - scratch.beg)/2;
+    Str src[] = {
+        "{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"proto\":0,\"cwd\":\"/r/sub\","
+        "\"worktree\":{\"name\":\"old\"}}\n",
+        "{\"sid\":\"A\",\"seq\":2,\"ts\":5,\"ev\":\"instructions\",\"why\":\"start\",\"files\":["
+        "{\"path\":\"/r/AGENTS.md\",\"bytes\":3,\"mtime\":9},"
+        "{\"path\":\"/home/u/AGENTS.md\",\"bytes\":4,\"mtime\":8}],\"text\":\"x\"}\n",
+        "{\"sid\":\"A\",\"seq\":3,\"ts\":6,\"ev\":\"title\",\"text\":\"Work\",\"by\":\"auto\"}\n",
+        "{\"sid\":\"A\",\"seq\":4,\"ts\":6,\"ev\":\"snap\",\"call\":\"c\",\"path\":\"/r/sub/a.c\"}\n",
+        "{\"sid\":\"A\",\"seq\":5,\"ts\":6,\"ev\":\"grant\",\"path\":\"/r\",\"access\":\"write\"}\n",
+        "{\"sid\":\"A\",\"seq\":6,\"ts\":6,\"ev\":\"grant\",\"path\":\"/rx/a\",\"access\":\"read\"}\n",
+        "{\"sid\":\"A\",\"seq\":7,\"ts\":6,\"ev\":\"user\",\"text\":\"edit /r/sub/a.c\"}\n",
+    };
+    Slice<Str> lines = {src, countof(src), countof(src)};
+    CopyWt     wt    = {};
+    wt.cwd    = "/r/.prospero/worktrees/w/sub";
+    wt.record = "{\"name\":\"w\",\"src\":\"/r\"}";
+    wt.src    = "/r";
+    wt.path   = "/r/.prospero/worktrees/w";
+    wt.notice = "Here.";
+    LogCopy c = logcopy(&a, scratch, lines, "A", "B", {}, {}, -1, 100, 0, COPY_SIDE, &wt);
+    expect(t, "logwt title", istr(&a, c.title.len), "0");
+    expect(t, "logwt", c.log,
+        "{\"sid\":\"B\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"forked_from\":\"A\","
+        "\"fork_turn\":0,\"side_of\":\"A\",\"cwd\":\"/r/.prospero/worktrees/w/sub\","
+        "\"worktree\":{\"name\":\"w\",\"src\":\"/r\"},\"proto\":0}\n"
+        "{\"sid\":\"B\",\"seq\":2,\"ts\":5,\"ev\":\"instructions\",\"why\":\"start\",\"files\":["
+        "{\"path\":\"/r/.prospero/worktrees/w/AGENTS.md\",\"bytes\":3,\"mtime\":9},"
+        "{\"path\":\"/home/u/AGENTS.md\",\"bytes\":4,\"mtime\":8}],\"text\":\"x\"}\n"
+        "{\"sid\":\"B\",\"seq\":3,\"ts\":6,\"ev\":\"title\",\"text\":\"Work\",\"by\":\"auto\"}\n"
+        "{\"sid\":\"B\",\"seq\":4,\"ts\":6,\"ev\":\"snap\",\"call\":\"c\","
+        "\"path\":\"/r/.prospero/worktrees/w/sub/a.c\"}\n"
+        "{\"sid\":\"B\",\"seq\":5,\"ts\":6,\"ev\":\"grant\",\"path\":\"/r/.prospero/worktrees/w\","
+        "\"access\":\"write\"}\n"
+        "{\"sid\":\"B\",\"seq\":6,\"ts\":6,\"ev\":\"grant\",\"path\":\"/rx/a\",\"access\":\"read\"}\n"
+        "{\"sid\":\"B\",\"seq\":7,\"ts\":6,\"ev\":\"user\",\"text\":\"edit /r/sub/a.c\"}\n"
+        "{\"sid\":\"B\",\"seq\":8,\"ts\":100,\"ev\":\"notice\",\"kind\":\"worktree\","
+        "\"text\":\"Here.\"}\n"
+        "{\"sid\":\"B\",\"seq\":9,\"ts\":100,\"ev\":\"title\",\"text\":\"\",\"by\":\"auto\"}\n");
+
+    expect(t, "remap win", copyremap(&a, "c:\\R\\Sub\\a.c", "C:/r", "C:/r/.p/w", 1),
+           "C:\\r\\.p\\w\\Sub\\a.c");
+    expect(t, "remap win slash", copyremap(&a, "C:/R/x", "C:\\r", "C:\\r\\.p\\w", 1),
+           "C:/r/.p/w/x");
+    expect(t, "remap posix case", copyremap(&a, "/R/x", "/r", "/w", 0), "");
+    expect(t, "remap self", copyremap(&a, "/r", "/r", "/w", 0), "/w");
+}
+
 // A side chat's copy (COPY_SIDE), cut into a turn at work: a result for
 // the call running there, an answer and a result for the one asking,
 // the job still running ended as forked, without a notice, then the
@@ -1044,6 +1100,7 @@ static void test_events(Test *t)
 
     testlogcopy(t);
     testlogside(t);
+    testlogwt(t);
     testlogimport(t);
     testolder(t);
 }

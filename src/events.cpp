@@ -1056,6 +1056,98 @@ static Str sidenotice(Arena *a, Str from, Str title)
     return finish(&b);
 }
 
+// A side chat in a worktree of its own (worktree.cpp): its working
+// directory and worktree for its session record, the original's
+// checkout, whose paths in snapshot, grant and instruction records name
+// the same files in the worktree, path, and what it is told.
+struct CopyWt {
+    Str cwd;
+    Str record;  // the worktree object, as JSON
+    Str src;     // the original's checkout
+    Str path;    // the worktree
+    Str notice;
+};
+
+// A path below src as the same below to, in its own separators, else
+// null. With win, either separator, and in any case.
+static Str copyremap(Arena *a, Str p, Str src, Str to, b32 win)
+{
+    if (p.len < src.len) {
+        return {};
+    }
+    for (iz i = 0; i < src.len; i++) {
+        u8  x  = p[i];
+        u8  y  = src[i];
+        b32 eq = x==y || (win && (x=='/' || x=='\\') && (y=='/' || y=='\\')) ||
+                 (win && x>='A' && x<='Z' && x+32==y) || (win && y>='A' && y<='Z' && y+32==x);
+        if (!eq) {
+            return {};
+        }
+    }
+    Str rest = cuthead(p, src.len);
+    if (rest.len && rest[0]!='/' && !(win && rest[0]=='\\')) {
+        return {};
+    }
+    Str r = concat(a, to, rest);
+    u8  c = find(p, "\\")>=0 && find(p, "/")<0 ? '\\' : '/';
+    for (iz i = 0; win && i<r.len; i++) {
+        r.data[i] = r[i]=='/' || r[i]=='\\' ? c : r[i];
+    }
+    return r;
+}
+
+// A record whose paths below wt->src are remapped, anew, else null if it
+// names none: a snapshot's or a grant's path, an instruction record's
+// files' paths.
+static Str copyremapped(Arena *a, Arena scratch, EvRec *rec, CopyWt *wt, Str to,
+                        b32 win)
+{
+    b32 snap  = rec->ev==EV_SNAP || rec->ev==EV_GRANT;
+    b32 instr = rec->ev == EV_INSTRUCTIONS;
+    if (!wt || (!snap && !instr)) {
+        return {};
+    }
+    b32 any = 0;
+    Buf     b(a, 1024);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "sid", to);
+    for (Json *m = rec->root->child; m; m = m->next) {
+        if (m->key == "sid") {
+            continue;
+        }
+        putkey(&w, m->key);
+        if (snap && m->key=="path" && m->type==JSON_STRING) {
+            Str to = copyremap(&scratch, m->str, wt->src, wt->path, win);
+            any |= to.len > 0;
+            putstr(&w, to.len ? to : m->str);
+        } else if (instr && m->key=="files" && m->type==JSON_ARRAY) {
+            putarray(&w);
+            for (Json *f = m->child; f; f = f->next) {
+                putobject(&w);
+                for (Json *k = f->child; k; k = k->next) {
+                    putkey(&w, k->key);
+                    Str to = k->key=="path" && k->type==JSON_STRING
+                             ? copyremap(&scratch, k->str, wt->src, wt->path, win) : Str{};
+                    any |= to.len > 0;
+                    if (to.len) {
+                        putstr(&w, to);
+                    } else {
+                        putjson(&w, k);
+                    }
+                }
+                putend(&w);
+            }
+            putend(&w);
+        } else {
+            putjson(&w, m);
+        }
+    }
+    putend(&w);
+    putbyte(&b, '\n');
+    return any ? finish(&b) : Str{};
+}
+
 // An id and the call it goes with, as raw JSON text, while copying.
 struct CopyRef {
     Str id;
@@ -1069,7 +1161,7 @@ struct CopyRef {
 // and a side chat's (COPY_SIDE) is whole and closes its open turn.
 static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
                        Str to, Slice<Str> olds, Slice<Str> news, i64 turn,
-                       i64 now, b32 win, i32 kind = COPY_FORK)
+                       i64 now, b32 win, i32 kind = COPY_FORK, CopyWt *wt = 0)
 {
     b32 imported = kind == COPY_IMPORT;
     b32 side     = kind == COPY_SIDE;
@@ -1274,6 +1366,7 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
         Arena t    = scratch;
         Str   line = lines[i];
         EvRec rec  = evparse(&t, line);
+        Str   re   = {};
         last = rec.seq;
         if (i == 0) {
             // Where it came from, early in the session record
@@ -1288,16 +1381,24 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
                     putstrkey(&w.json, "side_of", from);
                 }
             }
+            if (wt) {
+                putstrkey(&w.json, "cwd", wt->cwd);
+                putkey(&w.json, "worktree");
+                putraw(&w.json, wt->record);
+            }
             for (Json *m = rec.root->child; m; m = m->next) {
                 if (m->key=="sid" || m->key=="seq" || m->key=="ts" || m->key=="ev" ||
                         m->key=="forked_from" || m->key=="fork_turn" ||
-                        m->key=="side_of") {
+                        m->key=="side_of" ||
+                        (wt && (m->key=="cwd" || m->key=="worktree"))) {
                     continue;
                 }
                 putkey(&w.json, m->key);
                 putjson(&w.json, m);
             }
             line = evend(&w);
+        } else if (wt && (re = copyremapped(&t, carve(&t, 1<<16), &rec, wt, to, win)).len) {
+            line = re;  // its paths in the original's checkout, in the worktree's
         } else if (startswith(line, head)) {
             line = concat(&t, newhead, cuthead(line, head.len));
         } else {
@@ -1406,14 +1507,16 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
     }
     if (side) {
         // What it is, durable, so that its first request has it
-        Str   text = sidenotice(&scratch, from, title);
+        Str   text = wt ? wt->notice : sidenotice(&scratch, from, title);
         Buf   b(&scratch, 256 + text.len + text.len/8);
         EvOut w = evbegin(&b, to, ++last, now, EV_NOTICE);
-        putstrkey(&w.json, "kind", "side");
+        putstrkey(&w.json, "kind", wt ? Str("worktree") : Str("side"));
         putstrkey(&w.json, "text", text);
         print(&out, evend(&w));
     }
     {
+        // A worktree's, untitled, is titled by its first prompt
+        r.title = wt ? Str{} : r.title;
         Buf   b(&scratch, 256 + r.title.len);
         EvOut w = evbegin(&b, to, last+1, now, EV_TITLE);
         putstrkey(&w.json, "text", r.title);

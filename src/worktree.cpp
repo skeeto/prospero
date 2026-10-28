@@ -854,18 +854,17 @@ static b32 wtexists(Engine *e, Arena scratch, WtSess *wt)
     return os_stat(e->os, scratch, git).type != STAT_MISSING;
 }
 
-// A new session's worktree, as asked (new {worktree: {name?}}), from
-// the folder chosen, cwd: its record, and its working directory, the
-// same place below the worktree's root. Null if it can be, else why
-// not, in the session's arena.
-static Str wtnew(Session *s, Arena scratch, Json *ask, Str cwd)
+// A worktree as asked ({name?}) from a folder, cwd, in a's arena: what
+// the session record keeps, and the working directory, the same place
+// below the worktree's root, also in a. Null if it can be, else why not.
+static Str wtplan(Engine *e, Arena *a, Arena scratch, Json *ask, Str cwd, WtSess *wt,
+                  Str *wcwd)
 {
-    Engine *e    = s->e;
     b32     win  = HOST_WINDOWS;
     Arena   keep = carve(&scratch, 1<<16);
     WtPlace p    = wtplace(e->os, &keep, cwd, win);
     if (p.err.len) {
-        return clone(&s->perm, p.err);
+        return clone(a, p.err);
     }
     Json *jn   = jsonget(ask, "name");
     Str   name = jsonstr(jn);
@@ -879,40 +878,137 @@ static Str wtnew(Session *s, Arena scratch, Json *ask, Str cwd)
     }
     i32 taken = wttaken(e, scratch, &p, name);
     if (taken != WT_FREE) {
-        return wttakenwhy(e, &s->perm, taken, name);
+        return wttakenwhy(e, a, taken, name);
     }
 
-    WtSess *wt = &s->wt;
-    wt->name   = clone(&s->perm, name);
-    wt->main   = clone(&s->perm, p.main);
-    wt->branch = concat(&s->perm, wtprefix(e), name);
-    wt->base   = clone(&s->perm, p.base);
-    wt->oid    = clone(&s->perm, p.oid);
-    wt->path   = wtpath(&s->perm, wt->main, name, win);
-    s->cwd     = wt->path;
+    wt->name   = clone(a, name);
+    wt->main   = clone(a, p.main);
+    wt->branch = concat(a, wtprefix(e), name);
+    wt->base   = clone(a, p.base);
+    wt->oid    = clone(a, p.oid);
+    wt->src    = clone(a, p.h.root);
+    wt->path   = wtpath(a, wt->main, name, win);
+    *wcwd      = wt->path;
     if (p.sub.len) {
         Str sub = wtnative(&keep, p.sub, win);
-        s->cwd = concat(&s->perm, concat(&s->perm, wt->path, win ? Str("\\") : Str("/")), sub);
+        *wcwd = concat(a, concat(a, wt->path, win ? Str("\\") : Str("/")), sub);
     }
     wtignore(e->os, scratch, wt->path);
     return {};
 }
 
-// A session record's worktree.
-static void wtrecord(Session *s, JsonOut *w)
+// A new session's worktree (new {worktree: {name?}}), from the folder
+// chosen: null if it can be, else why not, in the session's arena.
+static Str wtnew(Session *s, Arena scratch, Json *ask, Str cwd)
 {
-    WtSess *wt = &s->wt;
-    if (!wt->name.len) {
-        return;
-    }
-    putkey(w, "worktree");
+    Str err = wtplan(s->e, &s->perm, scratch, ask, cwd, &s->wt, &s->cwd);
+    s->wt.src = {};  // only a side chat's original has one
+    return err;
+}
+
+// A session record's worktree.
+static void wtput(JsonOut *w, WtSess *wt)
+{
     putobject(w);
     putstrkey(w, "name", wt->name);
     putstrkey(w, "main", wt->main);
     putstrkey(w, "branch", wt->branch);
     if (wt->base.len) putstrkey(w, "base", wt->base);
     putstrkey(w, "oid", wt->oid);
+    if (wt->src.len) putstrkey(w, "src", wt->src);
     putend(w);
+}
+
+static void wtrecord(Session *s, JsonOut *w)
+{
+    if (s->wt.name.len) {
+        putkey(w, "worktree");
+        wtput(w, &s->wt);
+    }
+}
+
+// What a side chat in a worktree is told as it begins, and again after
+// a compaction: what it is a copy of, where it works now, and to leave
+// the original's checkout alone.
+static Str wtnotice(Arena *a, WtSess *wt, Str from, Str title)
+{
+    Buf b(a, 1024 + 2*wt->src.len + wt->path.len + title.len);
+    print(&b, "You work in a git worktree of your own, ");
+    print(&b, wt->path);
+    print(&b, ", on the branch ");
+    print(&b, wt->branch);
+    print(&b, ", cut from ");
+    if (wt->base.len) {
+        print(&b, wt->base);
+        print(&b, " at ");
+    }
+    print(&b, takehead(wt->oid, 10));
+    print(&b, ". This session began as a copy of the session ");
+    if (title.len) {
+        putbyte(&b, '"');
+        print(&b, title);
+        print(&b, "\" (");
+        print(&b, from);
+        putbyte(&b, ')');
+    } else {
+        print(&b, from);
+    }
+    print(&b, ", which goes on working in ");
+    print(&b, wt->src);
+    print(&b, ". Paths under ");
+    print(&b, wt->src);
+    print(&b, " earlier in this conversation are the same files under ");
+    print(&b, wt->path);
+    print(&b, " here, as committed: changes not committed there did not come "
+              "along. Never change files under ");
+    print(&b, wt->src);
+    print(&b, ": work here, and commit on your branch.");
+    return finish(&b);
+}
+
+// A side chat in a worktree (fork {side, worktree: {name?}}) of the
+// session from, titled title, working in pcwd: its worktree, and what
+// logcopy needs of it, in a. Null if it can be, else why not.
+static Str wtfork(Engine *e, Arena *a, Arena scratch, Json *ask, Str from, Str title,
+                  Str pcwd, WtSess *wt, CopyWt *cw)
+{
+    Str cwd = {};
+    Str err = wtplan(e, a, scratch, ask, pcwd, wt, &cwd);
+    if (err.len) {
+        return err;
+    }
+    Buf     b(a, 1024);
+    JsonOut w = {&b};
+    wtput(&w, wt);
+    cw->record = finish(&b);
+    cw->cwd    = cwd;
+    cw->src    = wt->src;
+    cw->path   = wt->path;
+    cw->notice = wtnotice(a, wt, from, title);
+    return {};
+}
+
+// A side chat in a worktree, made: git makes its worktree now.
+static Str wtforked(Engine *e, Arena scratch, Str sid, WtSess *wt)
+{
+    WtSpec sp = {};
+    sp.sid    = sid;
+    sp.main   = wt->main;
+    sp.path   = wt->path;
+    sp.branch = wt->branch;
+    sp.base   = wt->base;
+    sp.oid    = wt->oid;
+    return wtqueue(e, scratch, WT_MAKE, &sp);
+}
+
+// After a compaction, which may have left it out: a side chat in a
+// worktree is told again where it works.
+static void wtheed(Session *s, Arena scratch)
+{
+    if (s->wt.src.len && validsid(s->wt.from)) {
+        Str title = sidecarget(s->e, &scratch, s->wt.from, "title", 1024);
+        notify(s, "worktree", wtnotice(&scratch, &s->wt, s->wt.from, title), 0);
+    }
 }
 
 // A worktree from a session record, its folder computed again: none if
@@ -932,13 +1028,17 @@ static WtSess wtfrom(Arena *a, Json *j)
     wt.branch = clone(a, br);
     wt.base   = clone(a, jsonstr(jsonget(j, "base")));
     wt.oid    = clone(a, oid);
+    wt.src    = clone(a, jsonstr(jsonget(j, "src")));
     wt.path   = wtpath(a, wt.main, name, HOST_WINDOWS);
     return wt;
 }
 
-static void wtload(Session *s, Json *j)
+// A session's worktree, from its record, and for a side chat in one,
+// the session it began as a copy of.
+static void wtload(Session *s, Json *rec)
 {
-    s->wt = wtfrom(&s->perm, j);
+    s->wt = wtfrom(&s->perm, jsonget(rec, "worktree"));
+    s->wt.from = s->wt.src.len ? clone(&s->perm, jsonstr(jsonget(rec, "side_of"))) : Str{};
 }
 
 // The system prompt's line for a new worktree session.
@@ -962,6 +1062,41 @@ static Str wtpromptline(Session *s, Arena *a)
     return finish(&b);
 }
 
+// A side chat in a worktree read its instruction files in its original's
+// checkout, and its stamps name them in the worktree (logcopy), where a
+// checkout gives them other times: those as they are in the original
+// are stamped anew, logged but not told, so that only a file the
+// original changed since its last commit is told of, as changed.
+static void wtrestamp(Session *s, Arena scratch)
+{
+    Os              *os  = s->e->os;
+    b32              win = HOST_WINDOWS;
+    Slice<InstrFile> re  = {};
+    for (iz i = 0; s->wt.src.len && i<s->instrfiles.len; i++) {
+        InstrStamp *k  = &s->instrfiles[i];
+        Stat        st = os_stat(os, scratch, k->path);
+        Str         at = copyremap(&scratch, k->path, s->wt.path, s->wt.src, win);
+        if (!at.len || st.type!=STAT_FILE || (st.size==k->size && st.mtime==k->mtime)) {
+            continue;
+        }
+        Read here  = os_readat(os, &scratch, k->path, 0, (iz)INSTR_MAX);
+        Read there = os_readat(os, &scratch, at, 0, (iz)INSTR_MAX);
+        if (here.err || there.err || !(here.data == there.data)) {
+            continue;
+        }
+        k->size  = st.size;
+        k->mtime = st.mtime;
+        InstrFile f = {};
+        f.path  = k->path;
+        f.size  = st.size;
+        f.mtime = st.mtime;
+        re = push(&scratch, re, f);
+    }
+    if (re.len && !s->readonly) {
+        loginstr(s, scratch, re, {}, "changed", {});
+    }
+}
+
 // What waited for the worktree, now there: the working directory,
 // should the commit lack it, the guard, and as the session opened,
 // its instructions, memory and prefix.
@@ -972,6 +1107,7 @@ static void wtready(Session *s, Arena scratch)
         os_mkdirs(e->os, scratch, s->cwd);
     }
     s->guard = sessionguard(s, &s->perm);
+    wtrestamp(s, scratch);
     if (!s->wtdefer) {
         return;
     }

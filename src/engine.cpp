@@ -546,6 +546,8 @@ struct WtSess {
     Str branch;
     Str base;    // the branch it was cut from, null if detached
     Str oid;     // the commit it was cut from
+    Str src;     // a side chat's: its original's checkout
+    Str from;    // and that session
     Str path;
 };
 
@@ -1955,6 +1957,12 @@ static void wtrecord(Session *, JsonOut *);
 static void wtload(Session *, Json *);
 static Str  wtpromptline(Session *, Arena *);
 static WtSess wtfrom(Arena *, Json *);
+static Str  wtfork(Engine *, Arena *, Arena, Json *, Str from, Str title, Str pcwd,
+                   WtSess *, CopyWt *);
+static Str  wtforked(Engine *, Arena, Str sid, WtSess *);
+static void wtsay(Engine *, Arena, Str sid, Str path, Str did, Str why, Str err,
+                  Str branch);
+static void wtheed(Session *, Arena);
 static void taskcheck(Session *, Arena, Str why, Str err);
 static b32  taskbudget(Session *, Arena);
 static b32  taskwake(Session *);
@@ -11204,6 +11212,7 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     planheed(s, scratch);
     s->shellheard = s->shellpre;  // and a shell other than the tool's
     shellheed(s, scratch);
+    wtheed(s, scratch);  // and a side chat in a worktree, where it works
     if (modeof(s)!=MODE_BUILD && cp.why!=CW_MANUAL) {
         deliver(s, scratch);
     }
@@ -14916,7 +14925,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             storedmodel = clone(&s->perm, jsonstr(jsonget(j, "model")));
             storedurl   = clone(&s->perm, jsonstr(jsonget(j, "endpoint")));
             s->scratch  = clone(&s->perm, jsonstr(jsonget(j, "scratch")));
-            wtload(s, jsonget(j, "worktree"));
+            wtload(s, j);
             for (Json *k = jsonget(j, "roots")->child; k; k = k->next) {
                 Str root = clone(&s->perm, jsonstr(k));
                 s->roots = push(&s->perm, s->roots, root);
@@ -16383,6 +16392,14 @@ static b32 copytree(Os *os, Arena scratch, Str from, Str to, i32 depth)
 // made also while the original is at work, its turn closed in the copy
 // and its agent told what it is (logcopy, COPY_SIDE). It starts idle, its
 // mode Build, and its reply has side:1 and no next.
+//
+// fork {sid, side:1, worktree: {name?}}: a side chat in a worktree of its
+// own (cap "worktree"), on a branch cut from the original's HEAD, at the
+// same place below its root: its record names the worktree, the paths of
+// its snapshots, grants and instruction files are the worktree's, its
+// notice says where it works, and its first prompt titles it. git makes
+// the worktree in the background, which its first turn waits for. The
+// reply has worktree: {name, branch, path}.
 static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Os   *os   = e->os;
@@ -16391,8 +16408,14 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     b32   side = jsonflag(jsonget(j, "side"), 0);
     b32   all  = tj->type==JSON_MISSING || tj->type==JSON_NULL;
     i64   turn = all ? -1 : jsonint(tj, -1);
+    Json *wtj  = jsonget(j, "worktree");
+    b32   inwt = wtj->type != JSON_MISSING;
     if (!validsid(sid)) {
         reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    } else if (inwt && (!side || wtj->type!=JSON_OBJECT)) {
+        reply(e, scratch, id, 0, "a worktree session is a side chat: give side:1, "
+              "and worktree as an object", sid);
         return;
     } else if (side && !all) {
         reply(e, scratch, id, 0, "a side chat takes the whole session, not a turn", sid);
@@ -16432,8 +16455,27 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
         olds = push(&scratch, olds, real);
         news = push(&scratch, news, concat(&scratch, cuttail(real, sid.len), to));
     }
+    // A worktree of its own, from the original's folder
+    WtSess wt = {};
+    CopyWt cw = {};
+    if (inwt) {
+        Json *rec   = evparse(&scratch, rp.lines[0]).root;
+        Str   pcwd  = jsonstr(jsonget(rec, "cwd"));
+        Str   title = s ? s->title : sidecarget(e, &scratch, sid, "title", 1024);
+        if (jsonflag(jsonget(rec, "nofolder"), 0)) {
+            reply(e, scratch, id, 0, "a session of no folder has no worktree", sid);
+            return;
+        }
+        Arena keep = carve(&scratch, 1<<18);
+        Str   err  = wtfork(e, &scratch, keep, wtj, sid, title, pcwd, &wt, &cw);
+        if (err.len) {
+            reply(e, scratch, id, 0, err, sid);
+            return;
+        }
+    }
     LogCopy c = logcopy(&lines, scratch, rp.lines, sid, to, olds, news, turn,
-                        os_time(os), HOST_WINDOWS, side ? COPY_SIDE : COPY_FORK);
+                        os_time(os), HOST_WINDOWS, side ? COPY_SIDE : COPY_FORK,
+                        inwt ? &cw : 0);
     if (c.err.len) {
         reply(e, scratch, id, 0, c.err, sid);
         return;
@@ -16482,7 +16524,7 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
         ok = copytree(os, scratch, work, wcopy, 0);
     }
     Str group = sidecarget(e, &scratch, sid, "group", GROUP_MAX);
-    ok = ok && sidecarwrite(e, scratch, to, "title", c.title);
+    ok = ok && (!c.title.len || sidecarwrite(e, scratch, to, "title", c.title));
     ok = ok && (!group.len || sidecarwrite(e, scratch, to, "group", group));
     ok = ok && (!c.model.len || sidecarwrite(e, scratch, to, "model", c.model));
     ok = ok && os_write(os, scratch, log, c.log);
@@ -16502,6 +16544,14 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
         putintkey(&w.json, "ok", 1);
         putstrkey(&w.json, "from", sid);
         putintkey(&w.json, "turn", c.turn);
+        if (inwt) {
+            putkey(&w.json, "worktree");
+            putobject(&w.json);
+            putstrkey(&w.json, "name", wt.name);
+            putstrkey(&w.json, "branch", wt.branch);
+            putstrkey(&w.json, "path", wt.path);
+            putend(&w.json);
+        }
         if (side) {
             putintkey(&w.json, "side", 1);
         } else if (!pass && c.next.len) {
@@ -16511,6 +16561,12 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
         if (pass || line.len<=mailmax(e->out)) {
             emit(e, line);
             break;
+        }
+    }
+    if (inwt) {
+        Str err = wtforked(e, scratch, to, &wt);
+        if (err.len) {
+            wtsay(e, scratch, to, wt.path, "failed", {}, err, {});  // its turn asks again
         }
     }
 }

@@ -12757,6 +12757,82 @@ def worktree_new(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=40)
+def worktree_side(t):
+    """fork {side, worktree}: a side chat in a worktree of its own, on a
+    branch cut from its original's HEAD, at the same subdirectory. The
+    original's uncommitted changes stay behind. The copy's record names
+    the worktree and its original's checkout, its notice says where it
+    works, its prefix is the original's byte for byte, and its first
+    prompt titles it. Its instruction files, the same as the original's,
+    are stamped anew without a notice. Not for a session of no folder,
+    nor without side."""
+    env = gitrepo(t)
+    t.put("AGENTS.md", "Be brief.\n")
+    gitrun(t, env, "add", "AGENTS.md")
+    gitrun(t, env, "commit", "-q", "-m", "second")
+    oid = gitrun(t, env, "rev-parse", "HEAD")
+    main = os.path.realpath(t.work)
+    h = t.headless(env={k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")})
+    try:
+        r = h.call("new", cwd=t.host.join(t.work, "src"), model=wtmodel(t), endpoint="fake")
+        parent = r["sid"]
+        wtturn(t, h, parent, "the original")
+        t.put("README", "changed, not committed\n")
+        t.put("untracked.txt", "x\n")
+
+        r = h.call("fork", sid=parent, side=1, worktree={"name": "side-one"})
+        t.check(r.get("ok") == 1 and r.get("side") == 1, f"fork: {r}")
+        sid = r["sid"]
+        path = os.path.join(main, ".prospero", "worktrees", "side-one")
+        t.check(r.get("worktree") == {"name": "side-one", "branch": "prospero/side-one",
+                                      "path": path}, f"its worktree: {r}")
+        made = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == path, 60)
+        t.check(made.get("did") == "made", f"made: {made}")
+        t.check(gitrun(t, env, "rev-parse", "prospero/side-one") == oid, "cut from HEAD")
+        with open(os.path.join(path, "README")) as f:
+            t.check(f.read() == "hello\n", "committed, not the change")
+        t.check(not os.path.exists(os.path.join(path, "untracked.txt")), "nothing untracked")
+
+        recs = sessionlog(t, sid)
+        first = recs[0]
+        t.check(first.get("cwd") == os.path.join(path, "src") and
+                first.get("side_of") == parent and
+                first["worktree"].get("src") == main and
+                first["worktree"].get("oid") == oid, f"its record: {first}")
+        notes = [e for e in recs if e.get("ev") == "notice" and e.get("kind") == "worktree"]
+        t.check(len(notes) == 1 and path in notes[0]["text"] and
+                "prospero/side-one" in notes[0]["text"], f"its notice: {notes}")
+        t.check(not os.path.exists(os.path.join(t.state, "sessions", sid, "title")),
+                "no title sidecar")
+
+        h.call("open", sid=sid)
+        wtturn(t, h, sid, "the side work")
+        recs = sessionlog(t, sid)
+        titles = [e.get("text") for e in recs if e.get("ev") == "title"]
+        t.check(titles[-1] == "the side work", f"titled by its prompt: {titles}")
+        pre = lambda rs: [e["system"] for e in rs if e.get("ev") == "prefix"]
+        t.check(pre(recs) == pre(sessionlog(t, parent)), "the prefix, the same")
+        instr = [e for e in recs if e.get("ev") == "instructions"]
+        t.check(any(os.path.join(path, "AGENTS.md") == f["path"] for e in instr
+                    for f in e["files"]), f"stamps in the worktree: {instr}")
+        told = [e for e in recs if e.get("ev") == "notice" and e.get("kind") == "instructions"]
+        t.check(not told, f"no instructions notice: {told}")
+        body = t.requests(wtmodel(t))[-1]["body"]
+        t.check(path in json.dumps(body["messages"]), "the request tells it")
+        t.check(gitrun(t, env, "status", "--porcelain") == "M README\n?? untracked.txt",
+                f"the original's changes stay: {gitrun(t, env, 'status', '--porcelain')!r}")
+
+        r = h.call("fork", sid=parent, worktree={})
+        t.check(r.get("ok") == 0 and "side:1" in r.get("err", ""), f"without side: {r}")
+        nf = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake", nofolder=1)["sid"]
+        r = h.call("fork", sid=nf, side=1, worktree={})
+        t.check(r.get("ok") == 0 and "no folder" in r.get("err", ""), f"no folder: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=60)
 def worktree_quit(t):
     """Quitting while git makes a worktree, its post-checkout hook slow:
