@@ -837,10 +837,222 @@ static void wtsay(Engine *e, Arena scratch, Str sid, Str path, Str did, Str why,
     emit(e, evend(&w));
 }
 
-// A worktree made, or not.
+
+
+// Sessions
+//
+// A worktree session's record keeps worktree: {name, main, branch, base,
+// oid}, from which its folder follows. Its worktree is made after the
+// session, in the background, and each turn waits for it at its start
+// (wtgate), which asks for it again should it be gone. While it is
+// missing as the session opens, what reads it waits too: instructions,
+// memory, and for a new session, its prefix (wtready).
+
+static b32 wtexists(Engine *e, Arena scratch, WtSess *wt)
+{
+    Str git = join(&scratch, wt->path, ".git");
+    return os_stat(e->os, scratch, git).type != STAT_MISSING;
+}
+
+// A new session's worktree, as asked (new {worktree: {name?}}), from
+// the folder chosen, cwd: its record, and its working directory, the
+// same place below the worktree's root. Null if it can be, else why
+// not, in the session's arena.
+static Str wtnew(Session *s, Arena scratch, Json *ask, Str cwd)
+{
+    Engine *e    = s->e;
+    b32     win  = HOST_WINDOWS;
+    Arena   keep = carve(&scratch, 1<<16);
+    WtPlace p    = wtplace(e->os, &keep, cwd, win);
+    if (p.err.len) {
+        return clone(&s->perm, p.err);
+    }
+    Json *jn   = jsonget(ask, "name");
+    Str   name = jsonstr(jn);
+    if (jn->type == JSON_MISSING) {
+        name = wtsuggest(e, &keep, scratch, &p);
+        if (!name.len) {
+            return "no free name was found for the worktree: give one";
+        }
+    } else if (!wtname(name)) {
+        return wtnamewhy(name);
+    }
+    i32 taken = wttaken(e, scratch, &p, name);
+    if (taken != WT_FREE) {
+        return wttakenwhy(e, &s->perm, taken, name);
+    }
+
+    WtSess *wt = &s->wt;
+    wt->name   = clone(&s->perm, name);
+    wt->main   = clone(&s->perm, p.main);
+    wt->branch = concat(&s->perm, wtprefix(e), name);
+    wt->base   = clone(&s->perm, p.base);
+    wt->oid    = clone(&s->perm, p.oid);
+    wt->path   = wtpath(&s->perm, wt->main, name, win);
+    s->cwd     = wt->path;
+    if (p.sub.len) {
+        Str sub = wtnative(&keep, p.sub, win);
+        s->cwd = concat(&s->perm, concat(&s->perm, wt->path, win ? Str("\\") : Str("/")), sub);
+    }
+    wtignore(e->os, scratch, wt->path);
+    return {};
+}
+
+// A session record's worktree.
+static void wtrecord(Session *s, JsonOut *w)
+{
+    WtSess *wt = &s->wt;
+    if (!wt->name.len) {
+        return;
+    }
+    putkey(w, "worktree");
+    putobject(w);
+    putstrkey(w, "name", wt->name);
+    putstrkey(w, "main", wt->main);
+    putstrkey(w, "branch", wt->branch);
+    if (wt->base.len) putstrkey(w, "base", wt->base);
+    putstrkey(w, "oid", wt->oid);
+    putend(w);
+}
+
+// A worktree from a session record, its folder computed again: none if
+// it is not one that wtnew would have made.
+static WtSess wtfrom(Arena *a, Json *j)
+{
+    WtSess wt   = {};
+    Str    name = jsonstr(jsonget(j, "name"));
+    Str    main = jsonstr(jsonget(j, "main"));
+    Str    br   = jsonstr(jsonget(j, "branch"));
+    Str    oid  = jsonstr(jsonget(j, "oid"));
+    if (!wtname(name) || !main.len || !br.len || !gitoid(oid)) {
+        return wt;
+    }
+    wt.name   = clone(a, name);
+    wt.main   = clone(a, main);
+    wt.branch = clone(a, br);
+    wt.base   = clone(a, jsonstr(jsonget(j, "base")));
+    wt.oid    = clone(a, oid);
+    wt.path   = wtpath(a, wt.main, name, HOST_WINDOWS);
+    return wt;
+}
+
+static void wtload(Session *s, Json *j)
+{
+    s->wt = wtfrom(&s->perm, j);
+}
+
+// The system prompt's line for a new worktree session.
+static Str wtpromptline(Session *s, Arena *a)
+{
+    WtSess *wt = &s->wt;
+    Buf     b(a, 512 + 2*wt->main.len + wt->branch.len);
+    print(&b, "\n\nThe working directory is in a git worktree made for this "
+              "session, on its own branch, ");
+    print(&b, wt->branch);
+    print(&b, ", cut from ");
+    if (wt->base.len) {
+        print(&b, wt->base);
+        print(&b, " at ");
+    }
+    print(&b, takehead(wt->oid, 10));
+    print(&b, ". The repository's main checkout is ");
+    print(&b, wt->main);
+    print(&b, ": work and commit here, on this branch, and leave the main "
+              "checkout and other worktrees alone.");
+    return finish(&b);
+}
+
+// What waited for the worktree, now there: the working directory,
+// should the commit lack it, the guard, and as the session opened,
+// its instructions, memory and prefix.
+static void wtready(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    if (!s->readonly && os_stat(e->os, scratch, s->cwd).type==STAT_MISSING) {
+        os_mkdirs(e->os, scratch, s->cwd);
+    }
+    s->guard = sessionguard(s, &s->perm);
+    if (!s->wtdefer) {
+        return;
+    }
+    s->wtdefer = 0;
+    instrstart(s, scratch);
+    memstart(s, scratch);
+    b32 built = !s->system.data;
+    if (built) {
+        buildprefix(s, scratch);
+    }
+    instrlogstart(s, scratch);
+    memlogstart(s, scratch);
+    if (built) {
+        logprefix(s, scratch);
+    }
+    if (built && s->shellwarn.len) {
+        note(s, scratch, "warn", s->shellwarn);
+    }
+}
+
+// Ask git to make a session's worktree: null if asked, else why not.
+static Str wtask(Session *s, Arena scratch)
+{
+    WtSess *wt = &s->wt;
+    WtSpec  sp = {};
+    sp.sid    = s->sid;
+    sp.main   = wt->main;
+    sp.path   = wt->path;
+    sp.branch = wt->branch;
+    sp.base   = wt->base;
+    sp.oid    = wt->oid;
+    sp.tip    = sidecarget(s->e, &scratch, s->sid, "worktree", 128);
+    sp.tip    = gitoid(gitclean(sp.tip)) ? gitclean(sp.tip) : Str{};
+    return wtqueue(s->e, scratch, WT_MAKE, &sp);
+}
+
+// Whether a worktree session's worktree is there, as a turn begins,
+// and no job for it is under way. If not, git is asked to make it, and
+// the turn waits (S_WORKTREE) for wtmade. Outside a turn, it is only
+// asked for.
+static b32 wtgate(Session *s, Arena scratch, b32 turn)
+{
+    Engine *e = s->e;
+    if (!s->wt.name.len || s->readonly) {
+        return 1;
+    } else if (wtexists(e, scratch, &s->wt) && !wtjobfor(e, s->wt.path)) {
+        wtready(s, scratch);
+        return 1;
+    }
+    Str err = wtask(s, scratch);
+    if (err.len && turn) {
+        endturn(s, scratch, "error", concat(&scratch, "the worktree cannot be made: ", err));
+    } else if (err.len) {
+        note(s, scratch, "warn", concat(&scratch, "the worktree cannot be made: ", err));
+    } else if (turn) {
+        setstate(s, S_WORKTREE);
+    }
+    return 0;
+}
+
+// A worktree made, or not: the sessions in it go on, and those waiting
+// for it begin their turns, or end them with git's reason.
 static void wtmade(Engine *e, Arena scratch, Str sid, Str path, b32 ok, Str err)
 {
     wtsay(e, scratch, sid, path, ok ? Str("made") : Str("failed"), {}, err, {});
+    for (Session *s = e->sessions; s; s = s->next) {
+        Arena a = scratch;
+        if (s->wt.path != path) {
+            continue;
+        } else if (s->state != S_WORKTREE) {
+            if (ok && s->wtdefer) {
+                wtready(s, a);
+            }
+        } else if (ok) {
+            setstate(s, S_IDLE);
+            turnready(s, a);  // through the gate again, as it may be gone
+        } else {
+            setstate(s, S_IDLE);
+            endturn(s, a, "error", concat(&a, "the worktree cannot be made: ", err));
+        }
+    }
 }
 
 // A worktree removed, or kept, and its branch.

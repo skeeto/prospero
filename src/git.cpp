@@ -1116,11 +1116,12 @@ static GitWork *gitwork(Engine *e)
 
 // A session's directory, open here or not, and whether it works in a
 // folder of its own; null if there is no such session.
-static Str gitsessdir(Engine *e, Arena *a, Str sid, b32 *nofolder)
+static Str gitsessdir(Engine *e, Arena *a, Str sid, b32 *nofolder, Str *ceiling)
 {
     Session *s = findsession(e, sid);
     if (s) {
         *nofolder = s->nofolder;
+        *ceiling  = s->nofolder ? s->cwd : s->wt.path;
         return s->cwd;
     }
     Str   path = sidecarpath(a, e, sid, "events.jsonl");
@@ -1131,7 +1132,9 @@ static Str gitsessdir(Engine *e, Arena *a, Str sid, b32 *nofolder)
         return {};
     }
     *nofolder = jsonint(jsonget(rec.root, "nofolder"), 0) == 1;
-    return jsonstr(jsonget(rec.root, "cwd"));
+    Str cwd   = jsonstr(jsonget(rec.root, "cwd"));
+    *ceiling  = *nofolder ? cwd : wtfrom(a, jsonget(rec.root, "worktree")).path;
+    return cwd;
 }
 
 // Queue a request for the worker: null if queued, else why not.
@@ -1198,12 +1201,12 @@ static void cmdgit(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     }
     b32 nofolder = 0;
-    Str cwd      = gitsessdir(e, &scratch, sid, &nofolder);
+    Str ceiling  = {};  // a folder of its own's, a worktree's
+    Str cwd      = gitsessdir(e, &scratch, sid, &nofolder, &ceiling);
     if (!cwd.len) {
         reply(e, scratch, id, 0, "no such session", sid);
         return;
     }
-    Str     ceiling = nofolder ? cwd : Str{};
     GitHead h       = githead(e->os, &scratch, cwd, ceiling, HOST_WINDOWS);
     Str     status  = {};
     if (h.repo && jsonflag(jsonget(j, "status"), 0)) {

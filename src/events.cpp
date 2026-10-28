@@ -257,6 +257,9 @@ static Str capnames[] = {
     "files",           // upload {kind:"file", name}, prompt and steer
                        // {files}, and files on the user record: text files
                        // attached, which take no vision
+    "worktree",        // new {worktree}, git {cwd}: a worktree session, the
+                       // state "worktree", worktree on the session record,
+                       // and transient worktree records
 };
 
 static Str evname(i32 ev)

@@ -156,11 +156,12 @@ enum : i32 {
     S_QUEUED,    // waiting for its turn at the endpoint
     S_TASK,      // waiting for subagents to report
     S_MCP,       // waiting for MCP servers to start, before a request
+    S_WORKTREE,  // waiting for git to make its worktree, before a turn
 };
 
 static Str statenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "queued", "task", "mcp",
+    "ask", "queued", "task", "mcp", "worktree",
 };
 
 enum : i32 {
@@ -537,6 +538,17 @@ struct Queued {
     Slice<MsgFile>  files;
 };
 
+// A worktree session's worktree, as its session record has it, and its
+// folder, MAIN/.prospero/worktrees/NAME (worktree.cpp). No name: none.
+struct WtSess {
+    Str name;
+    Str main;    // the main checkout, git's place to run
+    Str branch;
+    Str base;    // the branch it was cut from, null if detached
+    Str oid;     // the commit it was cut from
+    Str path;
+};
+
 struct Session {
     Session     *next;
     Engine      *e;
@@ -548,6 +560,9 @@ struct Session {
     Str          outdir;    // dir/out
     Str          cwd;
     Slice<Str>   roots;     // extra workspace roots
+    WtSess       wt;        // its worktree, if a worktree session's
+    b32          wtdefer;   // its worktree was missing as it opened: its
+                            // instructions, memory and prefix wait for it
     Str          scratch;   // its scratch directory, null if none: a
                             // subagent's is its parent's
     Slice<Grant> grants;    // "always allow" answers, inherited too
@@ -1900,6 +1915,7 @@ static void nexttool(Session *, Arena);
 static void sendcompact(Session *, Arena);
 static void compact(Session *, Arena, i64 enough, i64 goal, i32 why);
 static void beginturn(Session *, Arena, Str via);
+static void turnready(Session *, Arena);
 static b32  busy(Session *);
 static i32  get32(Str);
 static i64  get64(Str);
@@ -1932,6 +1948,13 @@ static void wtdone(Engine *, Arena, Str);
 static b32  wtbusy(Engine *);
 static void wtquit(Engine *);
 static void wtprobe(Engine *, Arena, i64, Json *);
+static b32  wtexists(Engine *, Arena, WtSess *);
+static b32  wtgate(Session *, Arena, b32 turn = 1);
+static Str  wtnew(Session *, Arena, Json *, Str cwd);
+static void wtrecord(Session *, JsonOut *);
+static void wtload(Session *, Json *);
+static Str  wtpromptline(Session *, Arena *);
+static WtSess wtfrom(Arena *, Json *);
 static void taskcheck(Session *, Arena, Str why, Str err);
 static b32  taskbudget(Session *, Arena);
 static b32  taskwake(Session *);
@@ -11475,6 +11498,17 @@ static void beginturn(Session *s, Arena scratch, Str via)
     s->discovered = s->info.learned || (s->info.found && !s->info.llamacpp);
     s->sentest    = estimate(s);  // the gauge until the request (live)
     resetnudges(s, 1);
+    turnready(s, scratch);
+}
+
+// A turn begun, once its worktree is there, if a worktree session's
+// (wtgate): what changed of its instructions, skills and memory, then
+// its first request.
+static void turnready(Session *s, Arena scratch)
+{
+    if (!wtgate(s, scratch)) {
+        return;  // git makes it: wtmade goes on
+    }
     instrcheck(s, scratch);
     skillcheck(s, scratch);
     memcheck(s, scratch);
@@ -12394,6 +12428,8 @@ static void buildprefix(Session *s, Arena scratch)
         s->te.hosts = farhostsdesc(e, &s->perm, scratch);
     }
     s->system = systemprompt(&s->perm, s->cwd, &s->te, s->nofolder);
+    s->system = s->wt.name.len ? concat(&s->perm, s->system, wtpromptline(s, &scratch))
+                               : s->system;
     s->tools  = tooljson(&s->perm, &s->te);
     if (s->rolepr.len) {
         s->system = concat(&s->perm, s->system, "\n\n# Your role: ");
@@ -12612,16 +12648,23 @@ static void sessionready(Session *s, Arena scratch)
             os_mkdirs(e->os, scratch, s->cwd);
         }
     }
-    instrstart(s, scratch);
+    // A worktree session's instructions, memory and prefix wait for its
+    // worktree, should it be missing (wtready)
+    s->wtdefer = s->wt.name.len && !wtexists(e, scratch, &s->wt);
+    if (!s->wtdefer) {
+        instrstart(s, scratch);
+    }
     Str dir = os_realpath(e->os, &scratch, s->dir);  // as the guard has paths
     if (dir.len) {
         s->planfile = clone(&s->perm, normpath(&scratch, dir, "plan.md", HOST_WINDOWS));
     }
     s->home      = s->ep.name.len ? s->ep.name : s->ep.url;
     s->homemodel = s->model;
-    memstart(s, scratch);
+    if (!s->wtdefer) {
+        memstart(s, scratch);
+    }
     s->guard     = sessionguard(s, &s->perm);
-    if (!s->system.data) {
+    if (!s->system.data && !s->wtdefer) {
         buildprefix(s, scratch);
     }
     s->next = e->sessions;
@@ -12745,6 +12788,7 @@ static void logsession(Session *s, Arena scratch)
     if (s->nofolder) {
         putintkey(&w.json, "nofolder", 1);
     }
+    wtrecord(s, &w.json);
     ssend(s, &w);
 }
 
@@ -14552,6 +14596,17 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         reply(e, scratch, id, 0, bad, {});
         return;
     }
+    Json *wtask = jsonget(j, "worktree");
+    if (wtask->type != JSON_MISSING) {
+        if (wtask->type != JSON_OBJECT) {
+            reply(e, scratch, id, 0, "worktree must be an object", {});
+            return;
+        } else if (nofolder || task.ok) {
+            reply(e, scratch, id, 0, nofolder ? Str("a session of no folder has no worktree")
+                                              : Str("a subagent has no worktree of its own"), {});
+            return;
+        }
+    }
 
     Str      sid = freshsid(e, &scratch);
     Session *s   = newsession(e, scratch, sid);
@@ -14594,6 +14649,14 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     endpointconf(e, &s->perm, which, &s->ep);
     modelconf(e, &s->perm, model, &s->mc);
     s->te.edit = fmt.len ? editformat(fmt) : s->mc.edit;
+    if (wtask->type != JSON_MISSING) {
+        Str err = wtnew(s, scratch, wtask, real);  // in the session's arena
+        if (err.len) {
+            reply(e, scratch, id, 0, err, {});
+            dropsession(e, s);
+            return;
+        }
+    }
 
     Str why = opensession(s, scratch);
     if (!why.data && nofolder) {
@@ -14612,9 +14675,14 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     logsession(s, scratch);
     instrlogstart(s, scratch);
     memlogstart(s, scratch);
-    logprefix(s, scratch);
+    if (!s->wtdefer) {
+        logprefix(s, scratch);  // else once its worktree is there
+    }
     if (s->shellwarn.len) {
         note(s, scratch, "warn", s->shellwarn);
+    }
+    if (s->wtdefer) {
+        wtgate(s, scratch, 0);  // made now, before its first turn
     }
     if (plan) {
         setmode(s, scratch, MODE_PLAN, "new");
@@ -14848,6 +14916,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             storedmodel = clone(&s->perm, jsonstr(jsonget(j, "model")));
             storedurl   = clone(&s->perm, jsonstr(jsonget(j, "endpoint")));
             s->scratch  = clone(&s->perm, jsonstr(jsonget(j, "scratch")));
+            wtload(s, jsonget(j, "worktree"));
             for (Json *k = jsonget(j, "roots")->child; k; k = k->next) {
                 Str root = clone(&s->perm, jsonstr(k));
                 s->roots = push(&s->perm, s->roots, root);
@@ -15084,8 +15153,11 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
     shellheed(s, scratch);  // and of the shell
     instrlogstart(s, scratch);
     memlogstart(s, scratch);
-    if (!prefixed) {
+    if (!prefixed && !s->wtdefer) {
         logprefix(s, scratch);  // a log from before prefix records
+    }
+    if (s->wtdefer && !sidecarget(e, &scratch, s->sid, "archived", 16).data) {
+        wtgate(s, scratch, 0);  // its worktree gone: made again, ahead of a turn
     }
     if (s->rparent.len && !reported && !s->readonly) {
         // Its engine stopped before it reported: its parent waits still

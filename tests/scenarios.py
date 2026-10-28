@@ -12655,6 +12655,151 @@ def worktree_probe(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+def sessionlog(t, sid):
+    """A session's records, from its log."""
+    path = os.path.join(t.state, "sessions", sid, "events.jsonl")
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def wtmodel(t):
+    """The fake provider's plain answer, for a scenario's sessions."""
+    return f"fake:plain:{t.nonce}"
+
+
+def wtturn(t, h, sid, prompt="hi", why="done", timeout=30):
+    """A turn of a session, and its turn.end."""
+    done = len(h.all("turn.end", sid))
+    h.call("prompt", sid=sid, text=prompt)
+    h.wait(lambda e: len(h.all("turn.end", sid)) > done, timeout)
+    end = h.all("turn.end", sid)[-1]
+    t.check(end.get("why") == why, f"the turn ended {why}: {end}")
+    return end
+
+
+@scenario(bound=40)
+def worktree_new(t):
+    """new {worktree} from a subdirectory: the session works in a worktree
+    of its own on a new branch, at the same subdirectory, made in the
+    background, with a .gitignore keeping the worktrees out of the main
+    checkout's status. Its prefix is logged once, when the worktree is
+    there, and names it. Names are checked: bad ones, and those taken by
+    a folder, a branch or a session, are refused, as is a session of no
+    folder. A worktree removed by hand is made again as a turn begins."""
+    env = gitrepo(t)
+    oid = gitrun(t, env, "rev-parse", "HEAD")
+    main = os.path.realpath(t.work)
+    h = t.headless(env={k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")})
+    try:
+        src = t.host.join(t.work, "src")
+        r = h.call("new", cwd=src, model=wtmodel(t), endpoint="fake",
+                   worktree={"name": "brisk-otter"})
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        path = os.path.join(main, ".prospero", "worktrees", "brisk-otter")
+        rec = h.wait(lambda e: e.get("ev") == "session" and e.get("sid") == sid)
+        t.check(rec.get("cwd") == os.path.join(path, "src") and
+                rec.get("worktree") == {"name": "brisk-otter", "main": main,
+                                        "branch": "prospero/brisk-otter", "base": "main",
+                                        "oid": oid}, f"the session record: {rec}")
+        made = h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == path, 60)
+        t.check(made.get("did") == "made" and made.get("session") == sid, f"made: {made}")
+        t.check(gitrun(t, env, "rev-parse", "--abbrev-ref", "HEAD", cwd=path) ==
+                "prospero/brisk-otter", "on its branch")
+        t.check(os.path.exists(os.path.join(path, "src", "main.c")), "checked out")
+        with open(os.path.join(main, ".prospero", "worktrees", ".gitignore")) as f:
+            t.check(f.read() == "*\n", "the worktrees ignored")
+        t.check(gitrun(t, env, "status", "--porcelain") == "", "the main checkout clean")
+
+        wtturn(t, h, sid)
+        recs = sessionlog(t, sid)
+        prefixes = [e for e in recs if e.get("ev") == "prefix"]
+        t.check(len(prefixes) == 1 and "prospero/brisk-otter" in prefixes[0]["system"] and
+                main in prefixes[0]["system"], f"one prefix, naming it: {len(prefixes)}")
+        sys = t.requests(wtmodel(t))[-1]["body"]["messages"][0]["content"]
+        t.check("git worktree made for this session" in json.dumps(sys), "the prompt says so")
+
+        # Names refused
+        for name, why in [("../x", "lowercase"), ("-x", "lowercase"), ("con", "lowercase"),
+                          ("x" * 25, "at most 24"), ("brisk-otter", "folder exists")]:
+            r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake", worktree={"name": name})
+            t.check(r.get("ok") == 0 and why in r.get("err", ""), f"{name!r}: {r}")
+        gitrun(t, env, "branch", "prospero/taken")
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake", worktree={"name": "taken"})
+        t.check(r.get("ok") == 0 and "the branch prospero/taken exists" == r.get("err"),
+                f"a branch: {r}")
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake", nofolder=1, worktree={})
+        t.check(r.get("ok") == 0 and "no folder" in r.get("err", ""), f"no folder: {r}")
+        r = h.call("new", cwd=t.base, model=wtmodel(t), endpoint="fake", worktree={})
+        t.check(r.get("ok") == 0 and "not in a git repository" in r.get("err", ""),
+                f"no repository: {r}")
+
+        # A random name, at the root, made again after it is removed by hand
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake", worktree={})
+        sid2 = r["sid"]
+        rec = h.wait(lambda e: e.get("ev") == "session" and e.get("sid") == sid2)
+        name = rec["worktree"]["name"]
+        path2 = os.path.join(main, ".prospero", "worktrees", name)
+        t.check(rec["cwd"] == path2, f"at its root: {rec}")
+        h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == path2, 60)
+        shutil.rmtree(path2)
+        before = len(h.all("worktree"))
+        wtturn(t, h, sid2)
+        again = h.all("worktree")[before:]
+        t.check([e.get("did") for e in again] == ["made"], f"made again: {again}")
+        states = [e.get("state") for e in h.all("live", sid2)]
+        t.check("worktree" in states, f"the turn waited for it: {states}")
+        t.check(os.path.exists(os.path.join(path2, "README")), "there again")
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake", worktree={"name": name})
+        t.check(r.get("ok") == 0, f"its name is still taken: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=60)
+def worktree_quit(t):
+    """Quitting while git makes a worktree, its post-checkout hook slow:
+    git is asked to stop, and the engine waits a while for it, then
+    exits. Opened again, the session's first turn makes what is missing
+    and runs."""
+    if os.name == "nt":
+        raise Skip("a hook in sh")
+    env = gitrepo(t)
+    hook = os.path.join(t.work, ".git", "hooks", "post-checkout")
+    with open(hook, "w") as f:
+        f.write("#!/bin/sh\nsleep 30\n")
+    os.chmod(hook, 0o755)
+    keep = {k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")}
+    h = t.headless(env=keep)
+    try:
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake",
+                   worktree={"name": "slow"})
+        sid = r["sid"]
+        time.sleep(1.5)
+        start = time.monotonic()
+        h.send("quit")
+        rc = h.exit(20)
+        took = time.monotonic() - start
+        t.check(rc == 0 and took < 12, f"exited {rc} after {took:.1f} s")
+        news = [(e.get("did"), e.get("err")) for e in h.all("worktree")]
+        t.check(news in ([], [("failed", "Prospero stopped first")]), f"the news: {news}")
+    finally:
+        h.close()
+    os.remove(hook)
+    h = t.headless(env=keep)
+    try:
+        h.call("open", sid=sid)
+        wtturn(t, h, sid, timeout=60)
+        path = os.path.join(os.path.realpath(t.work), ".prospero", "worktrees", "slow")
+        t.check(gitrun(t, env, "rev-parse", "--abbrev-ref", "HEAD", cwd=path) ==
+                "prospero/slow", "made")
+        t.note(f"git worktree list: {gitrun(t, env, 'worktree', 'list')!r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 # The soak: sessions under 10% random faults for a while
 
 def soak(host, minutes, workers):
