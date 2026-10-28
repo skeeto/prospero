@@ -172,11 +172,11 @@ static void test_tools(Test *t)
                ~((u32)1<<TOOL_READ | (u32)1<<TOOL_GREP | (u32)1<<TOOL_GLOB)));
         expect(t, "tooldeny all but desktop", istr(a, tooldeny("read write edit "
                "shell grep glob todo_write jobs job_output job_kill task skill sessions "
-               "send_message memory")),
+               "send_message memory web_search web_fetch")),
                istr(a, TOOL_OFFMASK|TOOL_PLANMASK));
         expect(t, "tooldeny all", istr(a, tooldeny("read write edit shell grep glob "
                "todo_write jobs job_output job_kill task desktop skill sessions "
-               "send_message memory")),
+               "send_message memory web_search web_fetch")),
                istr(a, TOOL_PLANMASK));
         expect(t, "tooldeny none", istr(a, tooldeny("")), istr(a, ((u32)1<<TOOL_COUNT) - 1));
         expect(t, "unknown for the role", unknowntool(a, "write", deny),

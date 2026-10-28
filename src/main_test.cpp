@@ -589,6 +589,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/json_test.cpp"
 #include "test/sse_test.cpp"
 #include "test/ini_test.cpp"
+#include "test/web_test.cpp"
 #include "test/mailbox_test.cpp"
 #include "test/events_test.cpp"
 #include "test/frame_test.cpp"
@@ -658,6 +659,7 @@ int main()
     test_json(&t);
     test_sse(&t);
     test_ini(&t);
+    test_web(&t);
     test_mailbox(&t);
     test_events(&t);
     test_frame(&t);

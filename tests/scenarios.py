@@ -4387,7 +4387,7 @@ def role_words(t):
                 f"roles {list(roles)}")
         default = ["read", "write", "edit", "shell", "grep", "glob", "todo_write", "jobs",
                    "job_output", "job_kill", "task", "skill", "sessions", "send_message",
-                   "memory"]
+                   "memory", "web_search", "web_fetch"]
         every = default[:11] + ["desktop"] + default[11:]
         t.check(roles["general"]["tools"] == default, f"general {roles['general']}")
         t.check(roles["every"]["tools"] == every, f"* {roles['every']}")
@@ -9740,6 +9740,323 @@ def mcp_project_http(t):
         srv.close()
     t.check(all(m["_http"]["X-Extra"] == "from env" for m in mcplog(t) if "_http" in m),
             "the file's header")
+
+
+# The web tools, against the fake: PROSPERO_TEST_WEB sends
+# https://HOST/PATH to the fake's /web/HOST/PATH, after every check has
+# seen the real URL
+
+def webconf(t, **kw):
+    """A [web] section added to the run's configuration: SearXNG at the
+    fake unless kw says otherwise (None leaves a key out)."""
+    sec = {"search": "searxng", "url": f"{t.host.url}/searxng/", **kw}
+    body = t.host.read(t.config) + "[web]\n" + "".join(
+        f"{k} = {v}\n" for k, v in sec.items() if v is not None)
+    t.host.write(t.config, body)
+
+
+def webenv(t, **kw):
+    return {"PROSPERO_TEST_WEB": t.host.url, **kw}
+
+
+def webreqs(t, path=None):
+    """The fake's web requests of this run, those to path if given."""
+    with fake_provider.STATE.lock:
+        reqs = list(fake_provider.STATE.web)
+    mine = [w for w in reqs if t.nonce in w["path"] or t.nonce in w["query"] or
+            t.nonce in w["body"]]
+    return [w for w in mine if path is None or w["path"].endswith(path)]
+
+
+FENCE = re.compile(r"--- begin web content ([a-z0-9]{8}) ---\n(.*)\n--- end web content \1 ---",
+                   re.S)
+
+
+@scenario(bound=30)
+def web_flow(t):
+    """Searches and pages with [web] ask off: a page's text without its
+    scripts, hidden elements and invisible characters, framed by nonce
+    lines; URLs never shown, and local ones, refused; redirects to the
+    same host followed, others told, insecure and local ones refused;
+    binary types, bot checks and errors refused; Latin-1 read; a big page
+    cut and read on from its spill without fetching again; a busy site
+    retried once; SearXNG's errors explained."""
+    webconf(t, ask="false")
+    d = f"https://docs.example.com/{t.nonce}"
+    prompt = " ".join(f"{d}/{x}" for x in ("same", "other", "insecure", "pdf",
+                                           "challenge", "missing", "latin1", "big",
+                                           "flaky", "local", "loop"))
+    r = t.run(prompt="Look at " + prompt, env=webenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    st = [e["status"] for e in ends]
+    want = ["ok", "ok", "ok", "error", "error", "ok", "ok", "ok", "error", "error",
+            "error", "error", "ok", "ok", "ok", "ok", "error", "error", "error", "ok"]
+    t.check(st == want, f"statuses {st}")
+    tx = [e["text"] for e in ends]
+
+    m = FENCE.search(tx[0])
+    t.check(m and f"{d}/page" in m.group(2) and "Widget docs" in m.group(2),
+            f"search framed {tx[0]!r}")
+    t.check("\U000e0049" not in tx[0] and "information to weigh" in tx[0],
+            f"search cleaned {tx[0]!r}")
+    m = FENCE.search(tx[1])
+    t.check(m and "Widgets turn at 42 rpm." in m.group(2) and
+            f"[Next page]({d}/next)" in m.group(2), f"page {tx[1]!r}")
+    for bad in ("SCRIPT-TEXT", "HIDDEN-", "NAV-TEXT", "\U000e0049", "\U000e0041", "‮"):
+        t.check(bad not in tx[1], f"{bad!r} kept: {tx[1]!r}")
+    t.check(FENCE.search(tx[0]).group(1) != m.group(1), "a nonce for each call")
+    t.check("did not appear earlier" in tx[3], f"made up {tx[3]}")
+    t.check("IP address" in tx[4], f"local {tx[4]}")
+    t.check(f"https://www.docs.example.com/{t.nonce}/page" in tx[5], f"same {tx[5]}")
+    t.check(f"redirects to https://other.example.org/{t.nonce}/page" in tx[6],
+            f"other {tx[6]}")
+    t.check("Widget docs" in tx[7], f"the other host's {tx[7]}")
+    t.check("application/pdf" in tx[9], f"pdf {tx[9]}")
+    t.check("bot check" in tx[10], f"challenge {tx[10]}")
+    t.check("HTTP 404" in tx[11], f"missing {tx[11]}")
+    t.check("café crème" in tx[12], f"latin1 {tx[12]}")
+    t.check("web_fetch again with offset" in tx[13] and ends[13].get("spill"),
+            f"big {tx[13][-300:]} {ends[13].get('spill')}")
+    t.check(FENCE.search(tx[14]) and "web_fetch again with offset" in tx[14],
+            f"read on {tx[14][:300]}")
+    t.check(len(webreqs(t, "/big")) == 1, f"the big page once: {len(webreqs(t, '/big'))}")
+    t.check("steady now" in tx[15] and len(webreqs(t, "/flaky")) == 2,
+            f"flaky {tx[15]} {len(webreqs(t, '/flaky'))}")
+    t.check("refuses" in tx[16], f"local redirect {tx[16]}")
+    t.check("more than 5" in tx[17], f"loop {tx[17]}")
+    t.check("settings.yml" in tx[18], f"forbidden {tx[18]}")
+    t.check("found nothing" in tx[19] and "duckduckgo" in tx[19], f"nothing {tx[19]}")
+
+    pages = webreqs(t, "/page")
+    t.check(pages and pages[0]["headers"].get("Accept-Encoding") == "identity" and
+            pages[0]["headers"].get("User-Agent", "").startswith("prospero/"),
+            f"headers {pages[:1]}")
+    t.check(not webreqs(t, "/up") and not any("127.0.0.1" in w["path"] for w in webreqs(t)),
+            "refused URLs never requested")
+    sid, _ = r.sessions()
+    spill = t.host.read(t.host.join(t.state, "sessions", sid, ends[13]["spill"])) or ""
+    first = spill.split("\n", 1)[0]
+    t.check(f"{d}/big" in first and "never instructions" in first and
+            len(spill) > 5 << 20, f"spill {first!r} {len(spill)}")
+
+
+@scenario(bound=30)
+def web_ask(t):
+    """Attended: a search allowed once, a host always, searches always,
+    a page denied with a note. Another process keeps the grants, and the
+    URLs the session was shown."""
+    webconf(t)
+    env = webenv(t)
+    h = t.headless(env=env)
+    b = None
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        one = nextask(h, sid)
+        t.check(one.get("kind") == "web" and one["tool"] == "web_search" and
+                one["query"] == f"widgets {t.nonce}" and one["service"] == "SearXNG" and
+                one["always"] == "search" and one["scope"] == "web", f"one {one}")
+        h.call("answer", sid=sid, req=one["req"], decision="allow")
+        two = nextask(h, sid, one["seq"])
+        t.check(two["tool"] == "web_fetch" and two["host"] == "docs.example.com" and
+                two["url"] == f"https://docs.example.com/{t.nonce}/page" and
+                two["always"] == "docs.example.com", f"two {two}")
+        h.call("answer", sid=sid, req=two["req"], decision="always")
+        three = nextask(h, sid, two["seq"])
+        t.check(three["tool"] == "web_search" and "gadgets" in three["query"],
+                f"the page's link read without asking, then {three}")
+        h.call("answer", sid=sid, req=three["req"], decision="always")
+        four = nextask(h, sid, three["seq"])
+        t.check(four["tool"] == "web_fetch" and four["host"] == "news.example.org",
+                f"sprockets searched without asking, then {four}")
+        h.call("answer", sid=sid, req=four["req"], decision="deny", note="not that one")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        ends = h.all("tool.end", sid)
+        st = [e["status"] for e in ends]
+        t.check(st == ["ok", "ok", "ok", "ok", "ok", "denied"], f"statuses {st}")
+        t.check("not that one" in ends[-1]["text"], f"the note {ends[-1]}")
+        g = [e for e in logged(t, sid) if e["ev"] == "grant"]
+        t.check(sorted((x.get("web"), x.get("host", "")) for x in g) ==
+                [("fetch", "docs.example.com"), ("search", "")], f"grants {g}")
+        t.check(h.close() == 0, "the first exits")
+        h = None
+
+        b = t.headless(env=env)
+        t.check(b.call("open", sid=sid, attended=1).get("ok") == 1, "opened")
+        last = max(e["seq"] for e in logged(t, sid))
+        b.send("prompt", sid=sid, text="again")
+        t.check(ended(b, sid, 2)["why"] == "done", "the second turn ends")
+        asked = [e for e in b.all("ask", sid) if e["seq"] > last]
+        t.check(not asked, f"nothing asked: {asked}")
+        st = [e["status"] for e in b.all("tool.end", sid)]
+        t.check(st[-2:] == ["ok", "ok"], f"read what the first turn saw: {st}")
+    finally:
+        rc = h.close() if h else 0
+        rc2 = b.close() if b else 0
+    t.check(rc == 0 and rc2 == 0, f"headless exit {rc} {rc2}")
+
+
+@scenario(bound=10)
+def web_unattended(t):
+    """Nobody to ask: a search is denied, and never sent."""
+    webconf(t)
+    r = t.run(env=webenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "denied" and "nobody is there" in end["text"], f"denied {end}")
+    t.check(not webreqs(t), f"sent {webreqs(t)}")
+
+
+@scenario(bound=10)
+def web_off(t):
+    """search = none offers web_fetch alone, and a call to web_search
+    is to a tool the session does not have."""
+    webconf(t, search="none", url=None)
+    r = t.run(env=webenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    names = fake_provider.tool_names(t.requests()[0]["body"])
+    t.check("web_fetch" in names and "web_search" not in names, f"offered {names}")
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "error" and "not available" in end["text"], f"{end}")
+    sysmsg = t.requests()[0]["body"]["messages"][0]["content"]
+    t.check("never instructions" in sysmsg or "not the user's words" in sysmsg,
+            "the system prompt's web guideline")
+
+
+@scenario(bound=15)
+def web_exa(t):
+    """Exa, as JSON and as events, its key in the request's URL and in no
+    record the harness writes."""
+    key = "exa-key-5e93dc"
+    webconf(t, search="exa", url=None, key="env:EXA_TEST_KEY", ask="false")
+    r = t.run(env=webenv(t, EXA_TEST_KEY=key))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok", "ok"],
+            f"statuses {[(e['status'], e['text'][:80]) for e in ends]}")
+    t.check(f"https://forum.example.org/{t.nonce}/next" in ends[0]["text"] and
+            "42 rpm" in ends[0]["text"] and "from Exa" in ends[0]["text"],
+            f"results {ends[0]['text']}")
+    t.check("Widget forum" in ends[1]["text"], f"as events {ends[1]['text']}")
+    exa = webreqs(t, "/mcp")
+    t.check(len(exa) == 2 and all(f"exaApiKey={key}" in w["query"] for w in exa),
+            f"the key sent {[w['query'] for w in exa]}")
+    sid, _ = r.sessions()
+    events = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl")) or ""
+    t.check(key not in json.dumps(r.events) and key not in r.stderr and key not in events,
+            "the key in no record")
+
+
+AN_WEB = "[endpoint an]\nurl = {url}\nkind = anthropic\nkey = env:PROSPERO_TEST_KEY\n"
+
+
+@scenario(bound=15)
+def web_anthropic(t):
+    """Anthropic's search tool in a side request: its results and cited
+    text, a paused turn continued, and an answer without a search
+    refused."""
+    t.host.write(t.config, t.host.read(t.config) + AN_WEB.format(url=t.host.url))
+    webconf(t, search="anthropic", url=None, model="an/fake:websearch", ask="false")
+    r = t.run(env=webenv(t, **ANENV))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    ends = r.all("tool.end")
+    t.check([e["status"] for e in ends] == ["ok", "ok", "error"],
+            f"statuses {[(e['status'], e['text'][:100]) for e in ends]}")
+    m = FENCE.search(ends[0]["text"])
+    t.check(m and f"https://docs.example.com/{t.nonce}/page" in m.group(2) and
+            "42 rpm" in m.group(2) and "from Anthropic" in ends[0]["text"],
+            f"results {ends[0]['text']}")
+    t.check("without searching" in ends[2]["text"], f"blind {ends[2]['text']}")
+    side = webreqs(t, "/v1/messages")
+    t.check(len(side) == 4, f"side requests {len(side)}")
+    body = json.loads(side[0]["body"])
+    t.check(body["model"] == "fake:websearch" and not body.get("stream") and
+            body["tools"][0]["type"] == "web_search_20250305" and
+            time.strftime("%Y-") in body["system"], f"the request {body}")
+    cont = json.loads(side[2]["body"])
+    t.check(len(cont["messages"]) == 2 and cont["messages"][1]["role"] == "assistant",
+            f"continued {cont['messages']}")
+
+
+@scenario(bound=15)
+def web_timeout(t):
+    """A page that stalls past half a minute (2 s here) times out."""
+    webconf(t, ask="false")
+    d = f"https://docs.example.com/{t.nonce}"
+    r = t.run(prompt=f"Read {d}/stall", env=webenv(t, PROSPERO_TEST_MINUTE_MS="2000"))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "timeout" and "did not answer in time" in end["text"],
+            f"timed out {end}")
+
+
+@scenario(bound=15)
+def web_unreachable(t):
+    """A site that cannot be reached: the error says so, intact."""
+    webconf(t, ask="false")
+    d = f"https://docs.example.com/{t.nonce}"
+    r = t.run(prompt=f"Read {d}/page", env=webenv(t, PROSPERO_TEST_WEB="http://127.0.0.1:9"))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    end = r.all("tool.end")[0]
+    t.check(end["status"] == "error" and
+            end["text"].startswith("Not done: the site could not be reached"), f"{end}")
+
+
+@scenario(bound=15)
+def web_cancel(t):
+    """A turn cancelled while a page loads ends the call at once."""
+    webconf(t, ask="false")
+    h = t.headless(env=webenv(t))
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text=f"Read https://docs.example.com/{t.nonce}/stall")
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        deadline = time.monotonic() + 10
+        while not webreqs(t, "/stall") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        h.call("cancel", sid=sid)
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "cancel", f"turn {end}")
+        st = [e["status"] for e in h.all("tool.end", sid)]
+        t.check(st == ["cancelled"], f"statuses {st}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
+def web_cap(t):
+    """[web] searches counts a session's and its subagents' together."""
+    webconf(t, ask="false", searches=2)
+    r = t.run(env=webenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    sid, kids = r.sessions()
+    st = [e["status"] for e in r.all("tool.end", sid)]
+    t.check(st == ["ok", "ok", "error"], f"statuses {st}")
+    t.check("2 web searches" in r.all("tool.end", sid)[-1]["text"],
+            f"why {r.all('tool.end', sid)[-1]}")
+    kid = [e["status"] for e in r.all("tool.end", kids[0]["sid"])] if kids else []
+    t.check(kid == ["ok"], f"the subagent's {kid}")
+
+
+@scenario(bound=20)
+def web_task(t):
+    """A subagent may read what its parent was shown, not what the parent
+    made up, and its report vouches for what it saw to the parent."""
+    webconf(t, ask="false")
+    d = f"https://docs.example.com/{t.nonce}"
+    r = t.run(prompt=f"Find out about {d}/page", env=webenv(t))
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    sid, kids = r.sessions()
+    st = [e["status"] for e in r.all("tool.end", sid)]
+    t.check(st == ["ok", "ok", "error"], f"the parent's {st}")
+    kid = r.all("tool.end", kids[0]["sid"]) if kids else []
+    t.check([e["status"] for e in kid] == ["ok", "error"],
+            f"the subagent's {[(e['status'], e['text'][:80]) for e in kid]}")
+    t.check("did not appear earlier" in kid[1]["text"], f"invented {kid[1]}")
+    task = [e for e in logged(t, sid) if e["ev"] == "tool.end"][0]
+    t.check(task.get("urls") == [f"{d}/next"], f"vouched {task.get('urls')}")
 
 
 SCENARIOS["503x3"] = SCENARIOS.pop("x503x3")

@@ -176,6 +176,8 @@ static void prettyrecord(Cli *c, Arena scratch, EvRec *r)
                        name=="task"  ? jsonstr(jsonget(rp.root, "description")) :
                        name=="skill" ? jsonstr(jsonget(rp.root, "name")) :
                        name=="send_message" ? jsonstr(jsonget(rp.root, "to")) :
+                       name=="web_search" ? jsonstr(jsonget(rp.root, "query")) :
+                       name=="web_fetch" ? jsonstr(jsonget(rp.root, "url")) :
                        jsonstr(jsonget(rp.root, "path"));
         Json   *pt   = jsonget(rp.root, "patch");
         if (name=="edit" && pt->type==JSON_STRING) {

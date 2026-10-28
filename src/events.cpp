@@ -245,6 +245,9 @@ static Str capnames[] = {
     "answer.trust",    // an MCP ask's always is its server's (mcp__SERVER),
                        // and a project server's ask offers trust, which
                        // answer {decision:"trust"} keeps for good
+    "web",             // web_search and web_fetch: asks of kind web, with
+                       // query and service or url and host, and grants by
+                       // web ("search", or "fetch" with a host)
 };
 
 static Str evname(i32 ev)
@@ -1464,9 +1467,13 @@ static b32 importkeeps(i32 ev)
 // Whether an import drops a field: of a tool result, one naming a file
 // or a session of the old state directory (spill, image, child, a
 // message's target), or describing one; of a message's notice, its
-// sender, whose title and text stay; of a user record, its images.
+// sender, whose title and text stay; of a user record, its images. The
+// URLs one session vouched for to another (urls) go too, as grants do.
 static b32 importdrops(i32 ev, Str key)
 {
+    if (key == "urls") {
+        return 1;
+    }
     if (ev == EV_NOTICE) {
         return key == "from";
     } else if (ev == EV_USER) {

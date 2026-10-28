@@ -592,6 +592,7 @@ static u32     os_guilimits(Os *);
 #include "json.cpp"
 #include "sse.cpp"
 #include "ini.cpp"
+#include "web.cpp"
 #include "mailbox.cpp"
 #include "events.cpp"
 #include "frame.cpp"

@@ -231,6 +231,7 @@ static CfgKind cfgkinds[] = {
     {"memory",   0, "Project memory: the agent's notes for later sessions in a project"},
     {"ui",       0, "How the GUI looks, and when it tells you of a session"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
+    {"web",      0, "Web search and reading web pages: the web_search and web_fetch tools"},
     {"host",     0, "The engine as a background host (prospero serve)"},
     {"remote",   1, "An engine on another machine, reached over ssh, or in a WSL distro"},
     {"mcp",      1, "An MCP server, whose tools the agent may use"},
@@ -493,6 +494,31 @@ static CfgKey cfgschema[] = {
      "answers in time; false lets the agent act unattended"},
     {"desktop", "ask_timeout", CFG_SECONDS, "60", {}, {}, "desktop",
      "Seconds to wait for an answer to a desktop action, then deny"},
+
+    {"web", "search", CFG_ENUM, "none", {}, "none searxng exa anthropic", "web",
+     "The service web_search uses: none (no web_search), searxng (an "
+     "instance at url), exa (Exa's MCP endpoint, which needs no key) or "
+     "anthropic (a model of an anthropic endpoint searches, as model says)"},
+    {"web", "url", CFG_URL, "", {}, {}, "web",
+     "For searxng: the instance's URL, with json among the formats in its "
+     "settings.yml (search: formats)"},
+    {"web", "key", CFG_SECRET, "", {}, {}, "web",
+     "For exa: an API key, as env:NAME or file:PATH, for more searches "
+     "than Exa allows without one"},
+    {"web", "model", CFG_STRING, "", {}, {}, "web",
+     "For anthropic: the model that searches, ENDPOINT/MODEL at an "
+     "endpoint of kind anthropic, by default claude-haiku-5-5 at the "
+     "first such endpoint"},
+    {"web", "fetch", CFG_BOOL, "true", {}, {}, "web",
+     "Offer web_fetch, which reads a page whose URL appeared in the "
+     "conversation"},
+    {"web", "ask", CFG_BOOL, "true", {}, {}, "web",
+     "Ask before each search and each page read, denying it when nobody "
+     "answers in time; false lets the agent search and read unattended"},
+    {"web", "results", CFG_INT, "8", {}, {}, "web",
+     "Results a search returns, at most 20"},
+    {"web", "searches", CFG_INT, "200", {}, {}, "web",
+     "Searches a session and its subagents may make while it is open"},
     {"desktop", "images", CFG_INT, "3", {}, {}, "desktop",
      "Screenshots and image files read kept in the conversation, the "
      "latest; older ones are left out of requests"},
@@ -907,11 +933,12 @@ static b32 cfgruns(CfgKey *k, Str v)
 }
 
 // Whether only the user's own file may give a key a value: what runs on
-// the user's machines, and where, and what may use the screen.
+// the user's machines, and where, what may use the screen, and where
+// the agent's searches go and what it may read on the web.
 static b32 cfgownonly(CfgKey *k, Str v)
 {
     return k->kind=="remote" || k->kind=="desktop" || k->kind=="mcp" ||
-           k->kind=="shell" || cfgruns(k, trim(v));
+           k->kind=="shell" || k->kind=="web" || cfgruns(k, trim(v));
 }
 
 // A role's tools may name MCP tools: mcp__SERVER, or mcp__SERVER__TOOL.
@@ -1004,6 +1031,10 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     } else if (shared && k->kind=="desktop") {
         return "a [desktop] setting in an included file is ignored, since it "
                "lets the agent use the screen: set it in your own file";
+    } else if (shared && k->kind=="web") {
+        return "a [web] setting in an included file is ignored, since it "
+               "chooses where searches go and what the agent may read: set "
+               "it in your own file";
     } else if (shared && cfgruns(k, v) && k->key=="shell") {
         return "a shell by its path or name in an included file is ignored, "
                "since it chooses what runs: set it in your own file, or "
@@ -1573,7 +1604,10 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniLine *l)
     b32      mcpcmd  = k && l->key=="mcp" && inientry(l->section, "command");
     b32      mcpurl  = k && l->key=="mcp" && inientry(l->section, "url");
     b32      mcpbad  = k && l->key=="mcp" && l->value.len && mcpcmd==mcpurl;
-    if (k && !unnamed && !named && !nourl && !mcpbad) {
+    IniEntry *search = k && l->key=="web" ? inientry(l->section, "search") : 0;
+    b32      webbad  = search && trim(search->value)=="searxng" &&
+                       !inientry(l->section, "url");
+    if (k && !unnamed && !named && !nourl && !mcpbad && !webbad) {
         return;
     } else if (cfgmuted(f)) {
         cfgreport(ini, perm, f, l, INI_WARNING, 0, {});
@@ -1602,6 +1636,9 @@ static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniLine *l)
         print(&b, l->value);
         print(&b, mcpcmd ? Str(" has both a command and a url: set one of them")
                          : Str(" has neither a command nor a url"));
+    } else if (webbad) {
+        print(&b, "[web] search is searxng but has no url: set it to the "
+                  "instance's URL");
     } else {
         print(&b, "endpoint ");
         print(&b, l->value);

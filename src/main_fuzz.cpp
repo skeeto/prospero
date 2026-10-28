@@ -3,8 +3,9 @@
 // or with -DFUZZ_PROVIDER the engine's parsers of untrusted text, or with
 // -DFUZZ_FRAMES the framing of remote links (frame.cpp), or with
 // -DFUZZ_IMAGE an image's intake: its kind, its decode through Wuffs
-// (image.cpp, wuffs.c), shrinking and PNG encoding. Every target links
-// Wuffs, from the release file CMake fetched:
+// (image.cpp, wuffs.c), shrinking and PNG encoding, or with -DFUZZ_WEB
+// the web tools' text work (web.cpp). Every target links Wuffs, from the
+// release file CMake fetched:
 //   $ afl-clang-fast -O2 -g3 -fsanitize=address,undefined \
 //         -fsanitize-trap=undefined -I build/_deps/wuffs-src \
 //         -c -o wuffs.o src/wuffs.c
@@ -14,8 +15,8 @@
 //   $ mkdir i && printf '{"a":[1,"\\u00e9",null]}' >i/doc
 //   $ afl-fuzz -i i -o o ./fuzzjson
 //
-// Likewise with -DFUZZ_EVENTS, -DFUZZ_PROVIDER, -DFUZZ_FRAMES or
-// -DFUZZ_IMAGE for the other targets.
+// Likewise with -DFUZZ_EVENTS, -DFUZZ_PROVIDER, -DFUZZ_FRAMES,
+// -DFUZZ_IMAGE or -DFUZZ_WEB for the other targets.
 //
 // JSON: an input either fails at an offset inside it, or parses to a root
 // spanning the input less surrounding whitespace, and writes canonical
@@ -41,6 +42,15 @@
 // as it was, or gives pixels within the limit, of the size the header
 // alone gives, which shrink to a quarter, and which encode as a PNG
 // that decodes back to the same pixels.
+//
+// Web: a page, read as HTML in its charset, becomes clean text and a
+// clean title, and when the input holds no ']' or '&' to forge one, each
+// "](" in the text opens a link target that is a canonical URL. URLs
+// taken from text, bare or not, are canonical; refusals and redirects
+// never fault, and a redirect that passes leads to a canonical URL that
+// is not refused. The search services' replies parse without fault into
+// canonical hit URLs and clean, cut texts, merged as well, and a window
+// of a page's text is valid UTF-8.
 //
 // Without AFL++ it runs one input from standard input.
 //
@@ -628,6 +638,118 @@ static void fuzzframes(Arena a, Str src)
     }
 }
 
+static b32 fuzzutf8(Str s)  // whether s is valid UTF-8
+{
+    for (iz i = 0; i < s.len;) {
+        i32 c = utf8strict(s, &i);
+        if (c<0 || (c>=0xd800 && c<=0xdfff)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void fuzzhits(Arena *a, WebHits *h, i32 max)
+{
+    assert(h->hits.len <= max);
+    for (iz i = 0; i < h->hits.len; i++) {
+        WebHit *x = &h->hits[i];
+        assert(weburl(a, x->url) == x->url);
+        assert(webclean(a, x->title) == x->title);
+        assert(webclean(a, x->excerpt) == x->excerpt);
+        assert(x->title.len<=WEB_TITLEMAX && x->excerpt.len<=WEB_EXCERPTMAX);
+    }
+    assert(webclean(a, h->summary) == h->summary);
+}
+
+static void fuzzweb(Arena a, Str src)
+{
+    // A page: clean text, its links' targets canonical
+    {
+        Arena   t    = a;
+        Str     html = webutf8(&t, "text/html", src, 1);
+        WebPage p    = webhtml(&t, html, "https://example.com/a/b");
+        assert(fuzzutf8(html));
+        assert(webclean(&t, p.text) == p.text);
+        assert(webclean(&t, p.title) == p.title);
+        assert(p.title.len <= WEB_TITLEMAX);
+        // Without these in the input, every "](" opens a link's target,
+        // which runs to some ')' before any whitespace
+        b32 own = find(src, "]")<0 && find(src, "&")<0;
+        for (Str rest = p.text; own;) {
+            iz k = find(rest, "](");
+            if (k < 0) {
+                break;
+            }
+            rest = cuthead(rest, k+2);
+            b32 ok = 0;
+            for (iz e = 0; e<rest.len && !whitespace(rest[e]) && !ok; e++) {
+                Str url = takehead(rest, e);
+                ok = rest[e]==')' && weburl(&t, url)==url;
+            }
+            assert(ok);
+        }
+        Str latin = webutf8(&t, "text/plain; charset=latin1", src, 0);
+        assert(fuzzutf8(latin));
+    }
+
+    // URLs from text, refusals and redirects
+    for (i32 bare = 0; bare < 2; bare++) {
+        Arena      t    = a;
+        Slice<Str> urls = weburls(&t, src, bare);
+        for (iz i = 0; i < urls.len; i++) {
+            assert(weburl(&t, urls[i]) == urls[i]);
+            assert(iniurlclean(&t, urls[i]) == urls[i]);
+            webrefuse(urls[i]);
+        }
+    }
+    {
+        Arena t   = a;
+        Str   url = weburl(&t, src);
+        if (url.data) {
+            assert(weburl(&t, url) == url);
+            assert(iniurlclean(&t, url) == url);
+            webrefuse(url);
+        }
+        WebRedirect r = webredirect(&t, "https://example.com/a", src);
+        if (r.kind == WEBR_BAD) {
+            assert(r.why.len);
+        } else {
+            assert(weburl(&t, r.url) == r.url);
+            assert(!webrefuse(r.url).data);
+        }
+        webkind(src, src);
+    }
+
+    // Search replies
+    {
+        Arena   t      = a;
+        WebHits hits[] = {
+            websearxng(&t, src, 5),
+            webexa(&t, src, 5),
+            webanthropic(&t, src, 5),
+        };
+        WebHits acc = {};
+        for (iz i = 0; i < countof(hits); i++) {
+            fuzzhits(&t, hits+i, 5);
+            webmerge(&t, &acc, hits[i], 8);
+        }
+        fuzzhits(&t, &acc, 8);
+        websearchtext(&t, src, "S", "D", &acc, webnonce(&t, 1));
+    }
+
+    // A window of a page's text
+    {
+        Arena t    = a;
+        Str   text = webclean(&t, src);
+        iz    off  = src.len<2 ? 0 : (src[0] | src[1]<<8) % (text.len ? text.len : 1);
+        iz    max  = src.len<3 ? 64 : 1 + src[2]*5;
+        Str   out  = webfetchtext(&t, "https://example.com/", "T", "text/plain",
+                                  text, off, max, "nonce123");
+        assert(fuzzutf8(out));
+    }
+}
+
 #if FUZZ_IMAGE
 static void fuzzimage(Arena a, Str src)
 {
@@ -680,6 +802,8 @@ int main()
         fuzzframes(a, {src, len});
         #elif FUZZ_IMAGE
         fuzzimage(a, {src, len});
+        #elif FUZZ_WEB
+        fuzzweb(a, {src, len});
         #else
         fuzzjson(a, {src, len});
         #endif
