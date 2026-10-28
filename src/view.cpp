@@ -649,12 +649,17 @@ static b32 toolauto(ViewMsg *m)
 }
 
 // Whether a tool row folds: as the user chose, else as the session's
-// toggle or [ui] tools says. Arguments still arriving have no body yet.
+// toggle or [ui] tools says. Arguments still arriving have no body yet,
+// and a skill's instructions, pages the agent reads, stay folded but
+// for a failure.
 static b32 toolfolded(View *v, ViewMsg *m)
 {
+    ViewTool *t = m->tool;
     if (m->chosen) {
         return m->collapsed;
-    } else if (m->tool->status == VTOOL_STREAMING) {
+    } else if (t->status == VTOOL_STREAMING) {
+        return 1;
+    } else if (t->name=="skill" && !(t->ended && t->status!=VTOOL_OK)) {
         return 1;
     } else if (v->showtools) {
         return 0;

@@ -1509,6 +1509,37 @@ static void test_viewtranscript(Test *t)
         expect(t, "toggle.off", foldshow(&a, v), "h;f*;f*;f*;");
     }
 
+    // A skill's instructions fold in every mode and with the toggle on,
+    // but a failure to load one shows, and the user may open it
+    {
+        Str recs[] = {
+            R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"go"})",
+            R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})",
+            R"({"sid":"s","seq":3,"ts":0,"ev":"attempt","turn":1,"n":1})",
+            R"({"sid":"s","seq":4,"ts":0,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
+            R"({"t":"call","id":"c1","name":"skill","args":"{\"name\":\"a\"}"},)"
+            R"({"t":"call","id":"c2","name":"skill","args":"{\"name\":\"b\"}"}]})",
+            R"({"sid":"s","seq":5,"ts":0,"ev":"tool.start","call":"c1","name":"skill","args":"{}"})",
+            R"({"sid":"s","seq":6,"ts":0,"ev":"tool.end","call":"c1","status":"ok","text":"<skill>a</skill>"})",
+            R"({"sid":"s","seq":7,"ts":0,"ev":"tool.start","call":"c2","name":"skill","args":"{}"})",
+            R"({"sid":"s","seq":8,"ts":0,"ev":"tool.end","call":"c2","status":"error","text":"no skill b"})",
+        };
+        Str want[] = {"f;o;", "f;f;", "f;o;"};
+        for (i32 mode = 0; mode < TOOLS_COUNT; mode++) {
+            Arena a = perm;
+            View *v = testview(&a);
+            viewtools(v, mode);
+            for (iz i = 0; i < countof(recs); i++) apply(v, a, recs[i]);
+            expect(t, concat(&a, "skill.", toolsnames[mode]), foldshow(&a, v), want[mode]);
+            if (mode == TOOLS_AUTO) {
+                viewshowtools(v, 1);
+                expect(t, "skill.toggle", foldshow(&a, v), "f;o;");
+                togglemsg(v, 1);
+                expect(t, "skill.opened", foldshow(&a, v), "o*;o;");
+            }
+        }
+    }
+
     // A provisional call the user opened stays open once committed
     {
         Arena a = perm;

@@ -64,7 +64,8 @@ A skill is a directory holding `SKILL.md`, whose frontmatter gives its
 `name` and `description`, with any files it refers to beside it, as in
 Claude Code and other harnesses. The agent is told each skill's name
 and description, and reads one through its skill tool when a task
-calls for it.
+calls for it. The skill it read shows folded in the transcript, even
+with tool output shown: click it to read it.
 
 Skills are looked for in:
 
