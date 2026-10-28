@@ -655,6 +655,8 @@ static void test_tools(Test *t)
             {"/bin/bash",                      FLAVOR_BASH3,   "/bin/bash -c, macOS's own bash, version 3.2", "POSIX shell"},
             {"/bin/bash",                      FLAVOR_BASH3,   "no associative arrays (declare -A), mapfile", "cygpath"},
             {"/opt/homebrew/bin/bash",         FLAVOR_NONE,    "/opt/homebrew/bin/bash -c. Each", "3.2"},
+            {"/bin/zsh",                       FLAVOR_ZSH,     "/bin/zsh -c, zsh, not bash: a glob", "POSIX shell"},
+            {"/bin/zsh",                       FLAVOR_ZSH,     "arrays count from 1", "3.2"},
         };
         for (iz i = 0; i < countof(sh); i++) {
             te.shell        = {};

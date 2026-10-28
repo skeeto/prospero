@@ -137,6 +137,7 @@ enum : i32 {
     FLAVOR_MSYS,     // MSYS2's, Git Bash's among them: drives as /c/x
     FLAVOR_CYGWIN,   // Cygwin's: drives as /cygdrive/c/x
     FLAVOR_BASH3,    // macOS's /bin/bash, bash 3.2 for good (GPLv2)
+    FLAVOR_ZSH,      // zsh, which models take for bash
 };
 
 // A shell the agent's commands run in.
@@ -333,6 +334,12 @@ static void shellintro(Buf *b, Shell *sh)
             print(b, ", macOS's own bash, version 3.2, which lacks what bash 4 "
                      "added: no associative arrays (declare -A), mapfile or "
                      "readarray, ${v,,} or ${v^^}, |& or &>>, or ** globs.");
+            break;
+        case FLAVOR_ZSH:
+            print(b, ", zsh, not bash: a glob that matches nothing is an "
+                     "error (quote it, or add (N) to allow none), an unquoted "
+                     "$var is not split into words (use ${=var}), and arrays "
+                     "count from 1.");
             break;
         default:
             if (equalfold(basename(sh->path), "sh") ||

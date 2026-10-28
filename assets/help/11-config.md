@@ -101,7 +101,8 @@ cannot choose what runs, so these are ignored in one:
   on Windows, `sh.exe` or `busybox.exe` next to Prospero or on PATH,
   else PowerShell, then `cmd`), `sh` (`/bin/sh`, even where that is
   bash), `bash` (not a keyword on Windows, where it is a program),
-  `powershell`, `cmd`, a `[shell]` section's name, or a program by its
+  `zsh` (likewise; the agent is told it is not bash, though it is
+  never auto's choice), `powershell`, `cmd`, a `[shell]` section's name, or a program by its
   path or name. A
   session keeps the shell it began with, until you switch it (see
   Sessions and modes).

@@ -2036,6 +2036,18 @@ static void testcfgpath(Test *t)
         os_remove(v.os, a, "/opt/homebrew/bin/bash");
         os_remove(v.os, a, plist);
         os_remove(v.os, a, "/bin/bash");
+
+        // zsh by its name, a keyword elsewhere than Windows, told apart
+        // from bash in its description, never auto's
+        os_write(v.os, a, "/bin/zsh", "\x7f" "ELF");
+        sh = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin:/bin", 0, "zsh");
+        expect(t, "findshell.zsh", concat(&a, sh.path, istr(&a, sh.flavor)),
+               concat(&a, "/bin/zsh", istr(&a, FLAVOR_ZSH)));
+        expect(t, "findshell.zsh.keyword", shellkeywordof(&sh, 0), "zsh");
+        sh = findshell(v.os, &a, v.scratch, "/exe", "/usr/bin:/bin", 0, "auto");
+        expect(t, "findshell.zsh.auto", sh.path, "/bin/sh");
+        expect(t, "shellkw.zsh", istr(&a, shellkw("zsh", 0)*10 + shellkw("zsh", 1)), "10");
+        os_remove(v.os, a, "/bin/zsh");
     }
 
     // Shells by name: [shell] sections of the user's own file only, a

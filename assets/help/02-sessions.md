@@ -148,7 +148,7 @@ Right-click a session in the sidebar, or open the Session menu, for:
   its own (below).
 - **Switch model**: a configured model, or another typed in.
 - **Switch shell**: a `[shell]` section of your configuration, or
-  `bash` (not on Windows), `sh`, `powershell` or `cmd` where found, as the picker beside the model's
+  `bash` or `zsh` (not on Windows), `sh`, `powershell` or `cmd` where found, as the picker beside the model's
   offers. Commands run there from then on; the agent is told at its
   next request, once, and again after a compaction. A subagent starts
   in its parent's shell. If the shell's program is gone when the

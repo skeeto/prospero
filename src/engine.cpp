@@ -12029,14 +12029,15 @@ static b32 onmacos(Os *os, Arena scratch, b32 win)
 // What a POSIX sh on Windows is, by the files beside it: busybox-w32
 // (w64devkit's sh.exe), MSYS2 (Git Bash's bin/bash.exe starts the one in
 // usr/bin), or Cygwin; on macOS, whether it is Apple's bash 3.2. Only
-// its description differs.
-
+// its description differs. zsh is told apart from bash anywhere.
 static i32 shellflavor(Os *os, Arena scratch, Str path, i32 kind, b32 win)
 {
     if (kind == SHELL_BUSYBOX) {
         return FLAVOR_BUSYBOX;
     } else if (!win && kind==SHELL_SH && path=="/bin/bash" && onmacos(os, scratch, win)) {
         return FLAVOR_BASH3;
+    } else if (!win && kind==SHELL_SH && basename(path)=="zsh") {
+        return FLAVOR_ZSH;
     } else if (!win || kind!=SHELL_SH) {
         return FLAVOR_NONE;
     }
@@ -12169,23 +12170,24 @@ static Str shellkeyword(i32 kind)
     return "sh";
 }
 
-// The keyword a shell as found goes by: as its kind's, but bash for
-// a POSIX sh named bash elsewhere than Windows. /bin/sh stays sh, though
-// it may be bash, since auto finds bash by its name first.
+// The keyword a shell as found goes by: as its kind's, but bash or zsh
+// for a POSIX sh so named elsewhere than Windows. /bin/sh stays sh,
+// though it may be bash, since auto finds bash by its name first.
 static Str shellkeywordof(Shell *sh, b32 win)
 {
-    if (!win && sh->kind==SHELL_SH && basename(sh->path)=="bash") {
-        return "bash";
+    Str base = basename(sh->path);
+    if (!win && sh->kind==SHELL_SH && (base=="bash" || base=="zsh")) {
+        return base;
     }
     return shellkeyword(sh->kind);
 }
 
 // Whether a name is a keyword of [tools] shell's: auto, sh, powershell
-// or cmd, and elsewhere than Windows bash. Empty is auto.
+// or cmd, and elsewhere than Windows bash and zsh. Empty is auto.
 static b32 shellkw(Str name, b32 win)
 {
     return !name.len || name=="auto" || name=="sh" || name=="powershell" ||
-           name=="cmd" || (!win && name=="bash");
+           name=="cmd" || (!win && (name=="bash" || name=="zsh"));
 }
 
 // A shell by name: a [shell NAME] section of the user's own file, whose
@@ -16183,8 +16185,8 @@ static void cmdshells(Engine *e, Arena scratch, i64 id)
         Shell sh  = shellnamed(e, &scratch, tmp, names[i], 0, win, &err);
         putshell(&w.json, names[i], &sh, err);
     }
-    Str kw[] = {"bash", "sh", "powershell", "cmd"};
-    for (iz i = win; i < countof(kw); i++) {
+    Str kw[] = {"bash", "zsh", "sh", "powershell", "cmd"};
+    for (iz i = win ? 2 : 0; i < countof(kw); i++) {
         b32 dup = 0;
         for (iz k = 0; k < names.len; k++) {
             dup |= names[k] == kw[i];
