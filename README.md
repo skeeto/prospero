@@ -74,8 +74,31 @@ With `-DPROSPERO_GUI=OFF`, `-DPROSPERO_STATIC=ON` links the headless
 engine fully statically, as `tools/engines.py` does for the Linux
 engines it builds.
 
-`-DPROSPERO_DEVTOOLS=OFF` leaves the developer tools out of the GUI,
-the Metrics pane for now, as releases are built.
+The GUI's developer tools, the Metrics pane for now, are in Debug
+builds only, unless `-DPROSPERO_DEVTOOLS=ON` adds them to another, such
+as one for measuring performance.
+
+### A signed macOS disk image
+
+With a Developer ID Application identity in the keychain, and a
+notarytool profile stored for it (`xcrun notarytool store-credentials
+PROFILE`), three commands build a signed, notarized and stapled disk
+image, `prospero-VERSION-macos-arm64.dmg`, holding `Prospero.app` and a
+link to `/Applications`:
+
+    $ cmake -B build -DPROSPERO_SIGN_IDENTITY="Developer ID Application: NAME (TEAM)" \
+            -DPROSPERO_NOTARY_PROFILE=PROFILE
+    $ cmake --build build
+    $ cmake --build build --target package
+
+A Developer ID identity signs with the hardened runtime and a secure
+timestamp, which notarization requires. Without a notary profile the
+image is signed but not notarized; in CI an App Store Connect API key
+serves instead, through `PROSPERO_NOTARY_KEY` (the `.p8` file),
+`PROSPERO_NOTARY_KEY_ID` and `PROSPERO_NOTARY_ISSUER` in the
+environment (`cmake/notarize.cmake`). The build targets macOS 13 and
+later (`CMAKE_OSX_DEPLOYMENT_TARGET`), for the build machine's own
+architecture.
 
 ## Releases
 
@@ -105,7 +128,7 @@ The engines and helpers are named as `prospero deploy` expects to find
 them, in an `engines` directory next to the executable, which puts each
 helper beside its engine on the remote machine. To use a helper on the
 machine itself, save it next to `prospero` as `prospero-desktop`. There
-is no macOS build; build it from source.
+is no macOS build; build it from source, or a disk image of it (above).
 
 The release workflow (`.github/workflows/release.yml`) builds every
 program from the source tarball alone. The Windows programs are built

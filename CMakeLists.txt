@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.25)
+# The oldest macOS the build runs on, rather than the build machine's own
+# (a cache variable that project() reads, so it is set before it)
+if(NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
+  set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0 CACHE STRING "Oldest macOS to run on")
+endif()
 project(prospero VERSION 0.0.0 LANGUAGES C CXX)
 
 # Unity build: each executable is one translation unit, a platform layer
@@ -12,7 +17,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 set(PROSPERO_NAME prospero CACHE STRING "Executable name")
 option(PROSPERO_GUI "Build the GUI (OFF: the headless engine only)" ON)
-option(PROSPERO_DEVTOOLS "The GUI's developer tools, the Metrics pane (OFF for releases)" ON)
+option(PROSPERO_DEVTOOLS "The GUI's developer tools, the Metrics pane (always in Debug builds)" OFF)
 option(PROSPERO_STATIC "Link fully statically (Linux: deployed engines)" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -189,9 +194,8 @@ if(WIN32)
 endif()
 if(PROSPERO_GUI)
   target_compile_definitions(prospero PRIVATE PROSPERO_GUI=1)
-  if(PROSPERO_DEVTOOLS)
-    target_compile_definitions(prospero PRIVATE PROSPERO_DEVTOOLS=1)
-  endif()
+  target_compile_definitions(prospero PRIVATE
+    $<$<OR:$<BOOL:${PROSPERO_DEVTOOLS}>,$<CONFIG:Debug>>:PROSPERO_DEVTOOLS=1>)
 endif()
 if(APPLE)
   # A code-signing identity from the keychain (its name, as listed by
@@ -227,10 +231,18 @@ if(APPLE)
   else()
     set(prospero_sign -)
   endif()
+  # A Developer ID signs for distribution, which notarization requires
+  # to have the hardened runtime and a secure timestamp. Others sign for
+  # this machine alone, with no round trip to Apple's timestamp server.
+  if(PROSPERO_SIGN_IDENTITY MATCHES "^Developer ID Application")
+    set(prospero_signopts --options runtime --timestamp)
+  else()
+    set(prospero_signopts --timestamp=none)
+  endif()
 endif()
 if(APPLE AND PROSPERO_SIGN_IDENTITY)
   add_custom_command(TARGET prospero POST_BUILD
-    COMMAND codesign --force --timestamp=none
+    COMMAND codesign --force ${prospero_signopts}
             --sign ${PROSPERO_SIGN_IDENTITY} $<TARGET_FILE:prospero>
     VERBATIM
   )
@@ -252,7 +264,7 @@ if(APPLE)
   # A fixed identifier too, which the grants name when it runs as its
   # own responsible process, rather than one made from its file name
   add_custom_command(TARGET prospero-desktop POST_BUILD
-    COMMAND codesign --force --timestamp=none
+    COMMAND codesign --force ${prospero_signopts}
             --identifier ${prospero_desktop_id}
             --sign ${prospero_sign} $<TARGET_FILE:prospero-desktop>
     VERBATIM
@@ -284,7 +296,7 @@ if(APPLE AND PROSPERO_GUI)
             $<TARGET_FILE:prospero-desktop> Prospero.app/Contents/MacOS/prospero-desktop
     COMMAND ${CMAKE_COMMAND} -E copy
             $<TARGET_FILE:prospero> Prospero.app/Contents/MacOS/prospero
-    COMMAND codesign --force --timestamp=none --sign ${prospero_sign} Prospero.app
+    COMMAND codesign --force ${prospero_signopts} --sign ${prospero_sign} Prospero.app
     DEPENDS prospero prospero-desktop ${CMAKE_BINARY_DIR}/Info.plist
             ${PROJECT_SOURCE_DIR}/assets/prospero.icns
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
@@ -292,6 +304,29 @@ if(APPLE AND PROSPERO_GUI)
   )
   add_custom_target(prospero-app ALL
     DEPENDS ${CMAKE_BINARY_DIR}/Prospero.app/Contents/MacOS/prospero)
+
+  # The bundle, signed as built, is what installs, and "cmake --build
+  # build --target package" puts it on a disk image beside a link to
+  # /Applications. With a Developer ID identity, cmake/notarize.cmake
+  # then signs the image too and, given PROSPERO_NOTARY_PROFILE (a
+  # profile from "xcrun notarytool store-credentials") or an App Store
+  # Connect API key in the environment, notarizes and staples it. The
+  # dependencies have install rules of their own, for their headers and
+  # libraries, so it holds only the component "prospero".
+  install(DIRECTORY ${CMAKE_BINARY_DIR}/Prospero.app DESTINATION .
+          USE_SOURCE_PERMISSIONS COMPONENT prospero)
+  set(PROSPERO_NOTARY_PROFILE "" CACHE STRING
+      "notarytool keychain profile for notarizing the package (empty: none)")
+  set(CPACK_GENERATOR DragNDrop)
+  set(CPACK_PACKAGE_NAME Prospero)
+  set(CPACK_PACKAGE_FILE_NAME
+      prospero-${PROJECT_VERSION}-macos-${CMAKE_SYSTEM_PROCESSOR})
+  set(CPACK_DMG_VOLUME_NAME Prospero)
+  set(CPACK_INSTALL_CMAKE_PROJECTS "${CMAKE_BINARY_DIR};prospero;prospero;/")
+  set(CPACK_PROSPERO_SIGN_IDENTITY ${PROSPERO_SIGN_IDENTITY})
+  set(CPACK_PROSPERO_NOTARY_PROFILE ${PROSPERO_NOTARY_PROFILE})
+  set(CPACK_POST_BUILD_SCRIPTS ${PROJECT_SOURCE_DIR}/cmake/notarize.cmake)
+  include(CPack)
 endif()
 
 # On Windows the desktop helper is prospero.exe itself (above), and so
@@ -315,6 +350,14 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   endif()
   set_target_properties(prospero-desktop PROPERTIES
     OUTPUT_NAME ${PROSPERO_NAME}-desktop)
+endif()
+# Elsewhere the programs install as they are, to bin (as the component
+# "prospero", apart from the dependencies' headers and libraries)
+if(NOT (APPLE AND PROSPERO_GUI))
+  install(TARGETS prospero COMPONENT prospero)
+  if(TARGET prospero-desktop)
+    install(TARGETS prospero-desktop COMPONENT prospero)
+  endif()
 endif()
 
 find_program(UV uv)
