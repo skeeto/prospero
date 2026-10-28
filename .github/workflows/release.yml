@@ -159,7 +159,7 @@ jobs:
           w=(-G Ninja -DCMAKE_TOOLCHAIN_FILE="$SRC/cmake/Toolchain-W64devkit-Wine.cmake"
              -DCMAKE_EXE_LINKER_FLAGS=-s --no-warn-unused-cli
              -DFETCHCONTENT_FULLY_DISCONNECTED=ON)
-          cmake -S "$SRC" -B build-gui "${w[@]}"
+          cmake -S "$SRC" -B build-gui "${w[@]}" -DPROSPERO_DEVTOOLS=OFF
           cmake -S "$SRC" -B build-x64 "${w[@]}" -DPROSPERO_GUI=OFF
           cmake -S "$SRC" -B build-x86 "${w[@]}" -DPROSPERO_GUI=OFF -DW64DEVKIT_ARCH=i686
           cmake --build build-gui --target prospero

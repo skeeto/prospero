@@ -1,6 +1,6 @@
 # Getting started
 
-**Close any pane you do not need, this one too: the View menu shows each again, and Reset layout puts them all back.**
+**Close any pane you do not need, this one too: the View menu shows each again, and View → Layout → Standard puts them all back.**
 
 The field above these topics searches every page: type words, and the
 sections that have them all take the topics' place, headings that
@@ -67,6 +67,25 @@ Enter. Shift+Enter starts a new line.
 From a terminal, `prospero DIR`, such as `prospero .`, opens a new
 session in that directory, in Build mode with the default model. If
 a window is open already, the session starts there.
+
+## Layouts
+
+View → Layout arranges every pane at once:
+
+- **Standard**: sessions on the left over the todo list, the
+  transcript over the prompt in the middle, and the jobs over the
+  plan on the right.
+- **Compact**: no right column. The plan is a tab beside the
+  transcript, and the jobs a tab beside the todo list.
+- **Focus**: one session only. The transcript, todo list and plan are
+  tabs over the prompt, and nothing else is open.
+
+Arrange the panes as you like, by dragging their tabs and the borders
+between them, then View → Layout → Save layout... keeps that
+arrangement under a name of your own, listed after the built-in
+three. It keeps which panes are open, where each one is, and the tab
+in front. Saving under a name already used replaces that layout, and
+Delete layout removes one.
 
 ## More
 

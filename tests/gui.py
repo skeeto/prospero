@@ -71,7 +71,7 @@ made while the window is away shows once it is back, and another
 click hides the pane. Without git it is skipped.
 
 Every checklist starts as a first run, its state directory fresh: the
-window at its first size, and Help in front, then Reset layout. The
+window at its first size, and Help in front, then View → Layout → Standard. The
 firstrun mode's configuration names no model and no remote host, so
 Settings and Hosts are in front with Help, and its display is too
 small for the first size (--display), so the window opens maximized.

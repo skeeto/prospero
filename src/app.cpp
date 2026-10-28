@@ -71,6 +71,7 @@
 #include "compose.cpp"
 #include "pathpick.cpp"
 #include "sidebar.cpp"
+#include "dock.cpp"
 
 enum : i64 {
     STREAM_PERIOD = 1000000/30,  // µs between frames showing new deltas
@@ -264,51 +265,10 @@ enum : i32 {
     RECT_LASTMSG,    // the transcript's last message, if drawn
     RECT_THEME0,     // the theme's choices in its open list
     RECT_PANE0 = RECT_THEME0 + THEME_COUNT,  // View's toggle of each pane
-    RECT_COUNT = RECT_PANE0 + 12,
+    RECT_COUNT = RECT_PANE0 + PANE_COUNT,
 };
 
-// The panes, which the View menu shows and hides
-enum : i32 {
-    PANE_SESSIONS,
-    PANE_TRANSCRIPT,
-    PANE_PROMPT,
-    PANE_TODO,
-    PANE_PLAN,
-    PANE_CHANGES,
-    PANE_JOBS,
-    PANE_LOG,
-    PANE_HOSTS,
-    PANE_SETTINGS,
-    PANE_HELP,
-    PANE_METRICS,
-    PANE_COUNT,
-};
-
-static char const *panenames[] = {
-    "Sessions", "Transcript", "Prompt", "Todo", "Plan", "Changes", "Jobs", "Log",
-    "Hosts", "Settings", "Help", "Metrics",
-};
-static_assert(countof(panenames) == PANE_COUNT);
 static_assert(countof(viewnames) == PANE_COUNT);  // help.cpp's view: names
-
-// The panes hidden until asked for: the metrics, and the changes, which
-// a click on the session bar's branch shows (ui.cpp drawbranch).
-static b32 panehidden(i32 pane)
-{
-    return pane==PANE_METRICS || pane==PANE_CHANGES;
-}
-
-// The layout's splits (buildlayout), each a share of the node split: the
-// right column's of the width, the left column's of the rest, the
-// prompt's of the center's height, and the lower node's of each column.
-// At the first window's 1700 pixels wide, the side columns are 425 and
-// about 280 wide; at 1280, 320 and about 210.
-static f32 const LAYOUT_RIGHT  = 0.25f;
-static f32 const LAYOUT_LEFT   = 0.22f;
-static f32 const LAYOUT_PROMPT = 0.28f;
-static f32 const LAYOUT_PLAN   = 0.5f;
-static f32 const LAYOUT_TODO   = 0.25f;
-static_assert((i32)RECT_COUNT == (i32)RECT_PANE0 + (i32)PANE_COUNT);
 
 // Zoom steps, as browsers have them: the View menu's, and Ctrl+wheel's
 static f32 zoomsteps[] = {
@@ -1390,7 +1350,6 @@ struct Gui {
     i32                tps;
     b32                bursts;
     b32                pauses;
-    b32                showdemo;
     b32                panes[PANE_COUNT];  // shown, as the View menu says
     i32                panefocus;  // PANE_*+1 to bring to the front, else 0
     i32                floatpane;  // PANE_*+1 to float or dock back (OP_FLOAT)
@@ -1412,13 +1371,25 @@ struct Gui {
     b32                firstextras;  // and Settings and Hosts with it, till
                                      // the main host's endpoints list a model
     b32                configured; // a model or remote host (cfgconfigured)
-    i32                jobsfocus;  // frames until the Jobs tab is selected
-    i32                helpfocus;  // and the Help tab, on a first run
+    i32                helpfocus;  // frames until Help is focused, on a first run
     ImGuiID            firstpane;  // the first run's floating dock node,
     ImVec2             firstspace; // centered in a dock space this size,
     Rect               firstbox;   // there, until moved
-    b32                resetpending;
-    b32                resetlayout;
+    DockLayout         layout;     // the layout picked, to apply (dock.cpp)
+    b32                layoutpending;  // picked this frame
+    b32                layoutnow;  // to apply this frame
+    b32                layoutquiet;  // panes appearing take no focus
+    i32                layoutfocus;  // frames left to hand the focus to fronts
+    Slice<DockLayout>  layouts;    // the user's, kept in the layout file
+    DockLayout        *readlayout; // its section being read
+    DockRect           floatat[PANE_COUNT];  // a layout's floating panes,
+    u32                floatwait;  // placed there as next drawn
+    ImVec2             dockpos;    // the dock space, this frame
+    ImVec2             docksize;
+    char              *layoutbuf;  // Save layout's name field
+    b32                opensavelayout;
+    b32                opendellayout;
+    i32                dellayout;  // the layout to delete, +1
     b32                openmodal;
 
     // Files and log
@@ -8836,21 +8807,38 @@ static void saveini(Gui *g, b32 last)
 //   Opened=a
 //   [Prospero][Help]
 //   Page=plan
+//   [Prospero][Layout Review]
+//   Shown=Sessions,Transcript,Prompt
+//   Split=X,0.22
+//   Tabs=Sessions
+//   Split=Y,0.72
+//   Center=Transcript
+//   Tabs=Prompt
 //
 // A pane missing (a layout older than it) keeps its default, and the
 // window's place is fitted to the displays as they are (place.cpp). The
 // sidebar keeps its groups' order, empty ones included, and each fold
 // the user chose by its key (sidebar.cpp), folded or opened. Help keeps
-// its topic by name (help.cpp), an unknown one the first.
+// its topic by name (help.cpp), an unknown one the first. Each layout
+// the user saved has a section, in the order saved (dock.cpp); one
+// that cannot be read, or named as one before it, is dropped (iniapply).
 
 static Str inistr(char const *s)
 {
     return {(u8 *)s, s ? (iz)__builtin_strlen(s) : 0};
 }
 
-static void *iniopen(ImGuiContext *, ImGuiSettingsHandler *, char const *name)
+static void *iniopen(ImGuiContext *, ImGuiSettingsHandler *h, char const *name)
 {
-    Str n = inistr(name);
+    Gui *g = (Gui *)h->UserData;
+    Str  n = inistr(name);
+    if (startswith(n, "Layout ")) {
+        DockLayout l = {};
+        l.name = clone(&g->perm, trim(cuthead(n, 7)));
+        g->layouts    = push(&g->perm, g->layouts, l);
+        g->readlayout = &g->layouts[g->layouts.len-1];  // until the next push
+        return (void *)5;
+    }
     return n=="Panes"   ? (void *)1 : n=="Window" ? (void *)2 :
            n=="Sidebar" ? (void *)3 : n=="Help"   ? (void *)4 : 0;
 }
@@ -8860,6 +8848,9 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
     Gui *g  = (Gui *)h->UserData;
     Cut  kv = cut(inistr(line), '=');
     if (!kv.ok) {
+        return;
+    } else if (entry == (void *)5) {
+        dockline(g->readlayout, kv.head, kv.tail);
         return;
     }
     Int v = parseint(kv.tail);
@@ -8880,7 +8871,7 @@ static void iniline(ImGuiContext *, ImGuiSettingsHandler *h, void *entry, char c
     } else if (entry == (void *)1) {
         for (i32 i = 0; i < PANE_COUNT; i++) {
             if (v.ok && kv.head==inistr(panenames[i])) {
-                g->panes[i] = v.val != 0;
+                g->panes[i] = v.val!=0 && paneoffered(i);
             }
         }
         return;
@@ -8949,6 +8940,48 @@ static void iniwrite(ImGuiContext *, ImGuiSettingsHandler *h, ImGuiTextBuffer *o
         Str page = helpnames[g->helppage];
         out->appendf("[Prospero][Help]\nPage=%.*s\n\n", (int)page.len, page.cdata);
     }
+    Arena a = g->frame;
+    for (iz i = 0; i < g->layouts.len; i++) {
+        DockLayout *l = &g->layouts[i];
+        Buf         b(&a, 1024);
+        print(&b, "[Prospero][Layout ");
+        print(&b, l->name);
+        print(&b, "]\n");
+        dockwrite(&b, l);
+        putbyte(&b, '\n');
+        out->append((char *)b.data, (char *)b.data + b.len);
+    }
+}
+
+// After the layout file is read: the saved layouts that can be had, the
+// first of each name.
+static void iniapply(ImGuiContext *, ImGuiSettingsHandler *h)
+{
+    Gui *g = (Gui *)h->UserData;
+    iz   n = 0;
+    for (iz i = 0; i < g->layouts.len; i++) {
+        DockLayout *l   = &g->layouts[i];
+        b32         dup = 0;
+        for (iz k = 0; k < n; k++) {
+            dup |= equalfold(g->layouts[k].name, l->name);
+        }
+        Str why = dup                      ? Str("a layout before it has its name") :
+                  docknamewhy(l->name).len ? Str("its name cannot be had") :
+                  !dockdone(l)             ? Str("it cannot be read") : Str("");
+        if (why.len) {
+            Arena a = g->frame;
+            Buf   b(&a, 128);
+            print(&b, "the layout file's layout ");
+            print(&b, l->name);
+            print(&b, " is dropped: ");
+            print(&b, why);
+            guilog(g, finish(&b));
+        } else {
+            g->layouts[n++] = *l;
+        }
+    }
+    g->layouts.len = n;
+    g->readlayout  = 0;
 }
 
 // Read and write the window's settings with the layout file's.
@@ -8960,6 +8993,7 @@ static void addinihandler(Gui *g)
     h.ReadOpenFn = iniopen;
     h.ReadLineFn = iniline;
     h.WriteAllFn = iniwrite;
+    h.ApplyAllFn = iniapply;
     h.UserData   = g;
     ImGui::AddSettingsHandler(&h);
 }
@@ -8968,6 +9002,7 @@ static void addinihandler(Gui *g)
 // the front, its tab selected.
 static void setpane(Gui *g, i32 pane, b32 show)
 {
+    show = show && paneoffered(pane);
     if (g->panes[pane] != show) {
         g->panes[pane] = show;
         ImGui::MarkIniSettingsDirty();
@@ -10036,6 +10071,7 @@ enum : i32 {
     CHK_SIDE,
     CHK_NOSIDE,
     CHK_SIDEINI,
+    CHK_NOINI,        // the layout file lacks text
     CHK_MODEL,
     CHK_EXPORTED,
     CHK_LASTERR,
@@ -10090,6 +10126,9 @@ enum : i32 {
     CHK_FIRSTRUN,     // Help floats centered, selected; Settings and Hosts
                       // with it if dx, else closed
     CHK_DOCKTREE,     // the docked layout, as built, Jobs selected
+    CHK_COMPACT,      // the Compact layout, as built
+    CHK_FOCUSED,      // the Focus layout, as built
+    CHK_LAYOUTBACK,   // the layout saved as text is back as saved
     CHK_HELPPAGE,     // Help shows the topic whose page starts with text
     CHK_HELPNARROW,   // dx 1: Help's topics are a combo above the page; 0 a list
     CHK_HELPCOPY,     // the clipboard has Help's page, selected whole
@@ -10307,6 +10346,7 @@ static Str chknames[] = {
     "the sidebar shows it",
     "the sidebar does not show it",
     "the layout file keeps the sidebar's state",
+    "the layout file no longer has it",
     "the session switched model",
     "the export was written with what it should hold",
     "the error says why",
@@ -10356,6 +10396,9 @@ static Str chknames[] = {
     "the window opened at its first size, maximized on a small display",
     "a first run's Help floats centered in front, its tab selected",
     "the layout is as built: its panes' places and shares, Jobs selected",
+    "the Compact layout is as built: two columns, Plan with Transcript",
+    "the Focus layout is as built: one session, four panes",
+    "the layout saved is back as it was saved",
     "Help shows the topic picked, its page from the top",
     "Help's topics are a combo when narrow, else a list beside the page",
     "Help's page, selected whole, copied as its text",
@@ -10504,18 +10547,22 @@ struct DriveOp {
     Str text;
 };
 
+// A layout picked from View, Layout, by its name
+#define LAYOUT(name) \
+    {OP_MOVE, T_MENU, 0, 0, 100, ""}, {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 500, ""}, \
+    {OP_MOVE, T_NAMED, 0, 0, 500, "menu Layout"}, \
+    {OP_MOVE, T_NAMED, 0, 0, 100, "layout " name}, {OP_DOWN, 0, 0, 0, 60, ""}, \
+    {OP_UP, 0, 0, 0, 800, ""}
 // A first run, as every checklist's is (in a fresh state directory):
 // the window at its first size, Help in front with Settings and Hosts
-// if extras (nothing configured), else they are closed. Then View's
-// Reset layout docks it all as built, Help and the rest with the jobs.
+// if extras (nothing configured), else they are closed. Then the
+// Standard layout docks it all as built, Help and the rest with the jobs.
 #define FIRSTRUN(extras) \
     {OP_CHECK, CHK_FIRSTSIZE, 0, 0, 0, ""}, \
     {OP_CHECK, CHK_FIRSTRUN, extras, 0, 0, ""}, \
     {OP_SHOT, 0, 0, 0, 300, "firstrun"}, \
-    {OP_MOVE, T_MENU, 0, 0, 100, ""}, {OP_DOWN, 0, 0, 0, 60, ""}, \
-    {OP_UP, 0, 0, 0, 500, ""}, \
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Reset layout"}, {OP_DOWN, 0, 0, 0, 60, ""}, \
-    {OP_UP, 0, 0, 0, 800, ""}, \
+    LAYOUT("Standard"), \
     {OP_CHECK, CHK_DOCKTREE, 0, 0, 0, ""}
 // A pane shown from the View menu, its tab selected
 #define SHOWPANE(name) \
@@ -10932,6 +10979,41 @@ static DriveOp m3ops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Todo"},
+    // Layouts: this one saved by name, the other two built-in, then the
+    // saved one back as it was, and deleted
+    {OP_MOVE, T_MENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 500, "menu Layout"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Save layout..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_TEXT, 0, 0, 0, 300, "Drive"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_SIDEINI, 0, 0, 0, "[Prospero][Layout Drive]\n"},
+    LAYOUT("Compact"),
+    {OP_CHECK, CHK_COMPACT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "18-layoutcompact"},
+    LAYOUT("Focus"),
+    {OP_CHECK, CHK_FOCUSED, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "18-layoutfocus"},
+    LAYOUT("Drive"),
+    {OP_CHECK, CHK_LAYOUTBACK, 0, 0, 0, "Drive"},
+    {OP_MOVE, T_MENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 500, "menu Layout"},
+    {OP_MOVE, T_NAMED, 0, 0, 500, "menu Delete layout"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "delete Drive"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "layout delete"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOPOPUP, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NOINI, 0, 0, 0, "[Prospero][Layout Drive]"},
     // Zoom, by keys (Cmd on macOS, else Ctrl), by the wheel with the
     // key held, and back from the View menu, each in a few frames
     {OP_MOVE, T_TRANSCRIPT, 0, 0, 100, ""},
@@ -13897,7 +13979,7 @@ static DriveOp compose2ops[] = {
 };
 // A first run with nothing configured, on a display too small for the
 // first size (--display): maximized, Help in front with Settings and
-// Hosts, which Reset layout puts with the jobs.
+// Hosts, which the Standard layout puts with the jobs.
 static DriveOp firstops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -13914,6 +13996,7 @@ static DriveOp firstops[] = {
 #undef SELALL
 #undef CTRLG
 #undef FIRSTRUN
+#undef LAYOUT
 #undef SHOWPANE
 
 static DriveOp idleops[] = {
@@ -14298,8 +14381,43 @@ static b32 firstruncheck(Gui *g, b32 extras)
     return ok && front && front->RootWindowDockTree==n->HostWindow->RootWindowDockTree;
 }
 
-// The layout buildlayout makes: the shares of each split, the panes in
-// their places, Help, Settings and Hosts with the jobs, Jobs selected.
+// A pane and the dock node that is its home.
+struct DockPlace {
+    i32            pane;
+    ImGuiDockNode *n;
+};
+
+// Whether each pane is at home, logging the first that is not.
+static b32 dockplacescheck(Gui *g, DockPlace *places, i32 len)
+{
+    for (i32 i = 0; i < len; i++) {
+        ImGuiDockNode *n = places[i].n;
+        if (!n || panedock(places[i].pane)!=n->ID) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, "drive: out of place: ",
+                             inistr(panenames[places[i].pane])));
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Whether exactly the panes in mask are shown, logging the first not.
+static b32 dockshowncheck(Gui *g, u32 mask)
+{
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        if (!g->panes[i] != !(mask & 1u<<i)) {
+            Arena a = g->frame;
+            guilog(g, concat(&a, g->panes[i] ? Str("drive: shown: ") : Str("drive: hidden: "),
+                             inistr(panenames[i])));
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// The Standard layout, as applied: the shares of each split, the panes
+// in their places, Help, Settings and Hosts with the jobs, Jobs selected.
 static b32 docktreecheck(Gui *g)
 {
     ImGuiDockNode *root = ImGui::DockBuilderGetNode(g->dockspace);
@@ -14331,7 +14449,7 @@ static b32 docktreecheck(Gui *g)
         return 0;
     }
     ImGuiDockNode *rtop = right->ChildNodes[0];
-    struct { i32 pane; ImGuiDockNode *n; } places[] = {
+    DockPlace places[] = {
         {PANE_SESSIONS,   left->ChildNodes[0]},
         {PANE_TODO,       left->ChildNodes[1]},
         {PANE_TRANSCRIPT, center->ChildNodes[0]},
@@ -14344,16 +14462,119 @@ static b32 docktreecheck(Gui *g)
         {PANE_SETTINGS,   rtop},
         {PANE_HOSTS,      rtop},
     };
-    for (i32 i = 0; i < countof(places); i++) {
-        ImGuiDockNode *n = places[i].n;
-        if (!n || panedock(places[i].pane)!=n->ID) {
-            Arena a = g->frame;
-            guilog(g, concat(&a, "drive: out of place: ",
-                             inistr(panenames[places[i].pane])));
-            return 0;
+    return dockplacescheck(g, places, countof(places)) &&
+           tabselected("Jobs") && !g->panes[PANE_METRICS];
+}
+
+// The layout saved under the name text, back as it was saved: the same
+// tree, panes and fronts, its shares within a little for the rounding.
+static b32 layoutbackcheck(Gui *g, Str name)
+{
+    DockLayout *want = 0;
+    for (iz i = 0; i < g->layouts.len; i++) {
+        want = g->layouts[i].name==name ? &g->layouts[i] : want;
+    }
+    b32        ok  = 0;
+    DockLayout got = capturelayout(g, &ok);
+    ok = ok && want && got.nparts==want->nparts && got.shown==want->shown &&
+         got.floats==want->floats;
+    for (i32 i = 0; ok && i < got.nparts; i++) {
+        DockPart *a = got.parts + i;
+        DockPart *b = want->parts + i;
+        f32 off = a->share - b->share;
+        ok = a->kind==b->kind && a->ntabs==b->ntabs && a->central==b->central &&
+             off<0.01f && off>-0.01f &&
+             dockfront(a, got.shown)==dockfront(b, want->shown);
+        for (i32 t = 0; ok && t < a->ntabs; t++) {
+            ok = a->tabs[t] == b->tabs[t];
         }
     }
-    return tabselected("Jobs") && !g->panes[PANE_METRICS];
+    if (!ok) {
+        Arena a = g->frame;
+        Buf   b(&a, 4096);
+        print(&b, "drive: the layout now:\n");
+        dockwrite(&b, &got);
+        if (want) {
+            print(&b, "drive: the layout saved:\n");
+            dockwrite(&b, want);
+        }
+        guilog(g, finish(&b));
+    }
+    return ok;
+}
+
+// The Compact layout, as applied: Standard's left column at its width,
+// over the jobs; the center with Plan and the extras as tabs; no right.
+static b32 compactcheck(Gui *g)
+{
+    ImGuiDockNode *root = ImGui::DockBuilderGetNode(g->dockspace);
+    ImGuiDockNode *left = root ? root->ChildNodes[0] : 0;
+    ImGuiDockNode *center = root ? root->ChildNodes[1] : 0;
+    ImGuiDockNode *top = center ? center->ChildNodes[0] : 0;
+    if (!left || !top) {
+        guilog(g, "drive: the dock space is not split in two columns");
+        return 0;
+    }
+    if (!dockshare(root, ImGuiAxis_X, 0, LAYOUT_LEFT*(1-LAYOUT_RIGHT)) ||
+        !dockshare(left, ImGuiAxis_Y, 1, LAYOUT_TODO) ||
+        !dockshare(center, ImGuiAxis_Y, 1, LAYOUT_PROMPT)) {
+        guilog(g, "drive: the compact layout's splits are not in their shares");
+        return 0;
+    }
+    DockPlace places[] = {
+        {PANE_SESSIONS,   left->ChildNodes[0]},
+        {PANE_TODO,       left->ChildNodes[1]},
+        {PANE_JOBS,       left->ChildNodes[1]},
+        {PANE_LOG,        left->ChildNodes[1]},
+        {PANE_TRANSCRIPT, top},
+        {PANE_PLAN,       top},
+        {PANE_CHANGES,    top},
+        {PANE_HELP,       top},
+        {PANE_SETTINGS,   top},
+        {PANE_HOSTS,      top},
+        {PANE_PROMPT,     center->ChildNodes[1]},
+    };
+    return dockplacescheck(g, places, countof(places)) &&
+           top->IsCentralNode() && tabselected("Todo") &&
+           tabselected("Transcript") && g->panes[PANE_JOBS] &&
+           g->panes[PANE_PLAN] && !g->panes[PANE_LOG];
+}
+
+// The Focus layout, as applied: Transcript, Todo and Plan as tabs in
+// that order over Prompt, only those four shown, every pane's home on
+// top but Prompt's.
+static b32 focuscheck(Gui *g)
+{
+    ImGuiDockNode *root = ImGui::DockBuilderGetNode(g->dockspace);
+    ImGuiDockNode *top = root ? root->ChildNodes[0] : 0;
+    ImGuiDockNode *bottom = root ? root->ChildNodes[1] : 0;
+    if (!top || !bottom || !top->IsLeafNode() || !bottom->IsLeafNode() ||
+        !dockshare(root, ImGuiAxis_Y, 1, LAYOUT_PROMPT)) {
+        guilog(g, "drive: the dock space is not split once, as Focus");
+        return 0;
+    }
+    u32 shown = 1u<<PANE_TRANSCRIPT | 1u<<PANE_TODO | 1u<<PANE_PLAN |
+                1u<<PANE_PROMPT;
+    DockPlace places[PANE_COUNT];
+    i32 len = 0;
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        if (i != PANE_METRICS) {
+            places[len++] = {i, i==PANE_PROMPT ? bottom : top};
+        }
+    }
+    if (!dockshowncheck(g, shown) || !dockplacescheck(g, places, len)) {
+        return 0;
+    }
+    i32 order[] = {PANE_TRANSCRIPT, PANE_TODO, PANE_PLAN};
+    ImGuiTabBar *bar = top->TabBar;
+    b32 ok = bar && bar->Tabs.Size==countof(order);
+    for (i32 i = 0; ok && i < countof(order); i++) {
+        ok = bar->Tabs[i].Window == ImGui::FindWindowByName(panenames[order[i]]);
+    }
+    if (!ok) {
+        guilog(g, "drive: the focus layout's tabs are not in order");
+    }
+    return ok && top->IsCentralNode() && tabselected("Transcript");
 }
 
 // The compose box's text, the session shown's draft.
@@ -15437,10 +15658,11 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_SIDE:
     case CHK_NOSIDE:
     case CHK_SIDEINI:
+    case CHK_NOINI:
     case CHK_LASTERR: {
         Str text = g->ops[g->drivepc-1].text;
         Str in   = {g->sidedump, g->sidelen};
-        if (chk == CHK_SIDEINI) {
+        if (chk==CHK_SIDEINI || chk==CHK_NOINI) {
             uz len = 0;
             char const *ini = ImGui::SaveIniSettingsToMemory(&len);
             in = {(u8 *)ini, (iz)len};
@@ -15448,12 +15670,13 @@ static b32 drivecheck(Gui *g, i32 chk)
             in = g->lasterr;
         }
         b32 found = find(in, text) >= 0;
-        if ((chk==CHK_NOSIDE) == found) {
+        b32 absent = chk==CHK_NOSIDE || chk==CHK_NOINI;
+        if (absent == found) {
             Arena a = g->frame;
             guilog(g, concat(&a, "drive: the sidebar:\n", Str{g->sidedump, g->sidelen}));
             guilog(g, concat(&a, "drive: the latest error: ", g->lasterr));
         }
-        return (chk==CHK_NOSIDE) != found;
+        return absent != found;
     }
     case CHK_MODEL:
         return g->sess && startswith(g->view->model, g->ops[g->drivepc-1].text);
@@ -15562,6 +15785,9 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_FIRSTSIZE:     return firstsizecheck(g);
     case CHK_FIRSTRUN:      return firstruncheck(g, g->ops[g->drivepc-1].dx != 0);
     case CHK_DOCKTREE:      return docktreecheck(g);
+    case CHK_COMPACT:       return compactcheck(g);
+    case CHK_FOCUSED:       return focuscheck(g);
+    case CHK_LAYOUTBACK:    return layoutbackcheck(g, g->ops[g->drivepc-1].text);
     case CHK_HELPTAB:       return tabselected("Help");
     case CHK_TRANSCRIPTTAB: return tabselected("Transcript");
     case CHK_JOBSTAB:       return tabselected("Jobs") && g->jobsvisible;
@@ -17815,6 +18041,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->inboxcap = INBOX_CAP;
     g->reveal   = -1;
     g->firstlayout = 1;
+    g->layout   = dockpreset(PRESET_STANDARD);
     g->zoom     = 1;
     g->fontbase = FONT_BASE;
     for (i32 i = 0; i < PANE_COUNT; i++) {
@@ -18039,6 +18266,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->edbox      = newmailbox(&g->perm, 1<<14, wakegui, os);
     g->newcwd     = alloc<char>(&g->perm, FIELD_MAX);
     g->namebuf    = alloc<char>(&g->perm, FIELD_MAX);
+    g->layoutbuf  = alloc<char>(&g->perm, FIELD_MAX);
     g->modelbuf   = alloc<char>(&g->perm, FIELD_MAX);
     g->exp.think  = 0;
     g->exp.tools  = 1;

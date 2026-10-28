@@ -13,8 +13,6 @@
   files, with where it is.
 - **The transcript** notes each retry of a failed request, and the
   error a turn ended with.
-- **The Metrics pane** (View → Metrics) shows the window's own
-  workings, frames and wakes, for when the window itself misbehaves.
 - **Session → Open session records** opens a session's folder in the
   state directory, with its log.
 
@@ -64,4 +62,5 @@ is watching. See [Permissions and asks](help:permissions).
 window runs per state directory, even while it runs in the
 background. Use `--statedir DIR` for a separate instance.
 
-**The panes are in a mess.** View → Reset layout puts them back.
+**The panes are in a mess.** View → Layout → Standard puts them back,
+or pick a layout you saved.

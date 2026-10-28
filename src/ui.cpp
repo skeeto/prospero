@@ -9889,6 +9889,451 @@ static void menukeys(Gui *g)
     }
 }
 
+
+// Layouts (dock.cpp)
+
+// The dock node a window is in, or was in when the layout was saved;
+// 0 if neither.
+static ImGuiID saveddock(char const *name)
+{
+    ImGuiWindow *w = ImGui::FindWindowByName(name);
+    if (w) {
+        return w->DockId;
+    }
+    ImGuiWindowSettings *s = ImGui::FindWindowSettingsByID(ImHashStr(name));
+    return s ? s->DockId : 0;
+}
+
+// The id of a pane's tab, which its dock node selects
+static ImGuiID panetab(i32 pane)
+{
+    return ImHashStr("#TAB", 0, ImHashStr(panenames[pane]));
+}
+
+// A pane's place among its dock node's tabs that appear with it, which
+// ImGui sorts them by: its window's, or its settings' until it has one.
+static void paneorder(i32 pane, i32 order)
+{
+    ImGuiWindow *w = ImGui::FindWindowByName(panenames[pane]);
+    if (w) {
+        w->DockOrder = (short)order;
+    } else if (ImGuiWindowSettings *s = ImGui::FindWindowSettingsByID(ImHashStr(panenames[pane]))) {
+        s->DockOrder = (short)order;
+    }
+}
+
+// The first run's pane, the floating dock node id, centered in a dock
+// space of a size at pos, most of it but not too big to read.
+static void placefirst(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
+{
+    f32    sc = g->scale;
+    ImVec2 fs = v2(size.x*0.6f, size.y*0.7f);
+    fs.x = fs.x<1100*sc ? fs.x : 1100*sc;
+    fs.y = fs.y<800*sc ? fs.y : 800*sc;
+    ImVec2 at = v2(pos.x + (size.x - fs.x)/2, pos.y + (size.y - fs.y)/2);
+    ImGui::DockBuilderSetNodePos(id, at);
+    ImGui::DockBuilderSetNodeSize(id, fs);
+    g->firstpane = id;
+    g->firstspace = size;
+    g->firstbox   = {at.x, at.y, at.x + fs.x, at.y + fs.y};
+}
+
+// Build the layout's subtree at part *i in the dock node id: each leaf
+// the home of its panes, the front one of those shown selected (before
+// DockBuilderFinish, which makes the tab bars from it). A split hands
+// the central node to its side opposite the direction split toward.
+static void applypart(DockLayout *l, i32 *i, ImGuiID id, u32 shown, ImGuiID *center)
+{
+    i32       at = (*i)++;
+    DockPart *p  = l->parts + at;
+    if (p->kind == DOCK_LEAF) {
+        for (i32 t = 0; t < p->ntabs; t++) {
+            ImGui::DockBuilderDockWindow(panenames[p->tabs[t]], id);
+            paneorder(p->tabs[t], t);
+        }
+        i32 front = dockfront(p, shown);
+        ImGui::DockBuilderGetNode(id)->SelectedTabId = front<0 ? 0 : panetab(front);
+        *center = p->central ? id : *center;
+        return;
+    }
+    b32      lead = dockcentered(l, at+1);  // the center is in the first child
+    ImGuiDir dir  = p->kind==DOCK_X ? (lead ? ImGuiDir_Right : ImGuiDir_Left)
+                                    : (lead ? ImGuiDir_Down  : ImGuiDir_Up);
+    ImGui::DockBuilderSplitNode(id, dir, lead ? 1-p->share : p->share, 0, 0);
+    ImGuiDockNode *n      = ImGui::DockBuilderGetNode(id);
+    ImGuiID        first  = n->ChildNodes[0]->ID;  // left or top
+    ImGuiID        second = n->ChildNodes[1]->ID;
+    applypart(l, i, first, shown, center);
+    applypart(l, i, second, shown, center);
+}
+
+// Windows other than panes, which stay in the dock space if docked
+// there when a layout is applied, in its center
+static char const *dockguests[] = {"Output", "Screenshot"};
+
+// Apply the layout picked (g->layout) in the dock space id, of a size
+// at pos: its tree, each pane's home in it, shown or not, and each
+// leaf's front tab. The panes it does not place float, at its place
+// for them if it has one, as they are next drawn (beginpane). On a
+// first run, Help and those of Settings and Hosts shown float in front
+// instead, centered, Help selected.
+static void applylayout(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
+{
+    DockLayout *l = &g->layout;
+    b32 guests[countof(dockguests)] = {};
+    for (i32 i = 0; i < countof(dockguests); i++) {
+        ImGuiDockNode *n = ImGui::DockBuilderGetNode(saveddock(dockguests[i]));
+        guests[i] = n && ImGui::DockNodeGetRootNode(n)->ID==id;
+    }
+
+    ImGuiID first = ImGui::GetID("FirstRun");
+    ImGui::DockBuilderRemoveNode(first);
+    ImGui::DockBuilderRemoveNode(id);
+    ImGui::DockBuilderAddNode(id, ImGuiDockNodeFlags_DockSpace);
+    ImGui::DockBuilderSetNodeSize(id, size);
+    u32 shown = 0;
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        shown |= g->panes[i] ? 1u<<i : 0;
+    }
+    i32     at     = 0;
+    ImGuiID center = id;
+    applypart(l, &at, id, shown, &center);
+    for (i32 i = 0; i < countof(dockguests); i++) {
+        if (guests[i]) {
+            ImGui::DockBuilderDockWindow(dockguests[i], center);
+        }
+    }
+    u32 homed = dockplaced(l) & ~l->floats;
+    g->floatwait = l->floats;
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        g->floatat[i] = l->place[i];
+        if (!(homed>>i & 1)) {
+            ImGui::DockBuilderDockWindow(panenames[i], 0);
+        }
+    }
+
+    i32 extras[] = {PANE_HELP, PANE_SETTINGS, PANE_HOSTS};
+    b32 floats   = g->firstrun && g->panes[PANE_HELP];
+    g->firstpane = 0;
+    if (floats) {
+        ImGui::DockBuilderAddNode(first, ImGuiDockNodeFlags_None);
+        placefirst(g, first, pos, size);
+        for (i32 i = 0; i < countof(extras); i++) {
+            if (g->panes[extras[i]]) {
+                ImGui::DockBuilderDockWindow(panenames[extras[i]], first);
+                paneorder(extras[i], i);
+            }
+        }
+        ImGui::DockBuilderGetNode(first)->SelectedTabId = panetab(PANE_HELP);
+        g->helpfocus = 2;
+    }
+    ImGui::DockBuilderFinish(id);
+    if (floats) {
+        ImGui::DockBuilderFinish(first);
+    }
+    g->firstrun = 0;
+    g->layoutfocus = floats ? 0 : 4;
+}
+
+// A dock node selects the tab of the window focused, so a pane focused
+// but not in front in its leaf hands the focus to the one that is. This
+// runs for a few frames after a layout is applied, since the menu it
+// was picked from gives the focus back as it closes.
+static void layoutrefocus(Gui *g)
+{
+    g->layoutfocus--;
+    scheddirty(&g->sched);
+    DockLayout  *l     = &g->layout;
+    ImGuiWindow *nav   = GImGui->NavWindow ? GImGui->NavWindow->RootWindow : 0;
+    i32          pane  = -1;
+    u32          shown = 0;
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        pane   = nav && ImGui::FindWindowByName(panenames[i])==nav ? i : pane;
+        shown |= g->panes[i] ? 1u<<i : 0;
+    }
+    for (i32 i = 0; pane>=0 && i < l->nparts; i++) {
+        DockPart *p = l->parts + i;
+        for (i32 t = 0; p->kind==DOCK_LEAF && t < p->ntabs; t++) {
+            i32 front = dockfront(p, shown);
+            if (p->tabs[t]==pane && front>=0 && front!=pane) {
+                ImGuiWindow *w = ImGui::FindWindowByName(panenames[front]);
+                if (w) {
+                    ImGui::FocusWindow(w);
+                }
+            }
+        }
+    }
+}
+
+// A split's first child's share of it, as ImGui sizes them: the side
+// holding the central node takes what the other leaves it, else they
+// share by the sizes they ask for (SizeRef, which a hidden child keeps
+// while its Size goes stale).
+static f32 splitshare(ImGuiDockNode *n)
+{
+    ImGuiStyle    &st    = ImGui::GetStyle();
+    ImGuiDockNode *a     = n->ChildNodes[0];
+    ImGuiDockNode *b     = n->ChildNodes[1];
+    i32            axis  = n->SplitAxis;
+    f32            avail = n->Size[axis] - st.DockingSeparatorSize;
+    f32            least = ImTrunc(ImMin(avail, st.WindowMinSize[axis]*2)*0.5f);
+    if (avail>0 && b->HasCentralNodeChild && a->SizeRef[axis]>0) {
+        return ImMin(avail - least, a->SizeRef[axis]) / avail;
+    } else if (avail>0 && a->HasCentralNodeChild && b->SizeRef[axis]>0) {
+        return 1 - ImMin(avail - least, b->SizeRef[axis]) / avail;
+    }
+    f32 sum = a->SizeRef[axis] + b->SizeRef[axis];
+    return sum>0 ? a->SizeRef[axis]/sum : 0.5f;
+}
+
+// The dock space's subtree at n, in pre-order: each leaf with the panes
+// it is home to, those shown in their tabs' order, then the rest.
+static void captureparts(DockLayout *l, ImGuiDockNode *n, ImGuiDockNode **home)
+{
+    if (n->IsSplitNode()) {
+        docksplit(l, n->SplitAxis==ImGuiAxis_X ? DOCK_X : DOCK_Y, splitshare(n));
+        captureparts(l, n->ChildNodes[0], home);
+        captureparts(l, n->ChildNodes[1], home);
+        return;
+    }
+    DockPart *p = dockpart(l, DOCK_LEAF);
+    if (!p) {
+        return;
+    }
+    p->central = n->IsCentralNode();
+    i32 ntabs  = n->TabBar ? n->TabBar->Tabs.Size : n->Windows.Size;
+    for (i32 i = 0; i < ntabs; i++) {
+        ImGuiWindow *w    = n->TabBar ? n->TabBar->Tabs[i].Window : n->Windows[i];
+        i32          pane = w ? panenamed({(u8 *)w->Name, (iz)__builtin_strlen(w->Name)}) : -1;
+        if (pane>=0 && home[pane]==n) {
+            docktab(p, pane);
+        }
+    }
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        if (home[i] == n) {
+            docktab(p, i);
+        }
+    }
+    for (i32 t = 0; t < p->ntabs; t++) {
+        p->front = panetab(p->tabs[t])==n->SelectedTabId ? p->tabs[t] : p->front;
+    }
+}
+
+// The layout as the window has it, for Save layout...: the panes shown,
+// the dock space's tree with each pane's home in it, and the others'
+// places floating, as shares of the dock space: their floating dock
+// node's, or their own.
+static DockLayout capturelayout(Gui *g, b32 *ok)
+{
+    DockLayout     l    = {};
+    ImGuiDockNode *root = ImGui::DockBuilderGetNode(g->dockspace);
+    ImGuiDockNode *home[PANE_COUNT] = {};
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        ImGuiDockNode *n = ImGui::DockBuilderGetNode(saveddock(panenames[i]));
+        b32 inside = root && n && n->IsLeafNode() && ImGui::DockNodeGetRootNode(n)==root;
+        home[i]  = inside ? n : 0;
+        l.shown |= g->panes[i] ? 1u<<i : 0;
+    }
+    if (root) {
+        captureparts(&l, root, home);
+    }
+
+    ImVec2 vp = ImGui::GetMainViewport()->Pos;
+    for (i32 i = 0; root && i < PANE_COUNT; i++) {
+        if (home[i]) {
+            continue;
+        }
+        ImGuiDockNode       *n  = ImGui::DockBuilderGetNode(saveddock(panenames[i]));
+        ImGuiWindow         *w  = ImGui::FindWindowByName(panenames[i]);
+        ImGuiWindowSettings *ws = ImGui::FindWindowSettingsByID(ImHashStr(panenames[i]));
+        n = n ? ImGui::DockNodeGetRootNode(n) : 0;
+        ImVec2 at = {}, size = {};
+        if (n && n->IsFloatingNode()) {
+            at   = n->Pos;
+            size = n->Size;
+        } else if (w) {
+            at   = w->Pos;
+            size = w->SizeFull;
+        } else if (ws) {
+            at   = v2(vp.x + ws->Pos.x, vp.y + ws->Pos.y);
+            size = v2(ws->Size.x, ws->Size.y);
+        }
+        ImVec2 o = root->Pos, s = root->Size;
+        if (size.x>0 && size.y>0 && s.x>0 && s.y>0) {
+            dockfloat(&l, i, (at.x - o.x)/s.x, (at.y - o.y)/s.y, size.x/s.x, size.y/s.y);
+        }
+    }
+    *ok = root && dockdone(&l);
+    return l;
+}
+
+// Pick a layout: the panes shown and hidden as it says, then the layout
+// applied the next frame, once the panes just shown are drawn
+// (dockwindows).
+static void picklayout(Gui *g, DockLayout *l)
+{
+    g->layout = *l;
+    for (i32 i = 0; i < PANE_COUNT; i++) {
+        if (!(l->keep>>i & 1)) {
+            setpane(g, i, l->shown>>i & 1);
+        }
+    }
+    g->panefocus     = 0;
+    g->layoutpending = 1;
+}
+
+// View's Layout menu: the presets, the user's layouts, and saving and
+// deleting those, each item named for the checklist.
+static void drawlayoutmenu(Gui *g)
+{
+    b32 menu = ImGui::BeginMenu("Layout");
+    itemnamed(g, "menu Layout");
+    if (!menu) {
+        return;
+    }
+    Arena a = g->frame;
+    for (i32 i = 0; i < PRESET_COUNT; i++) {
+        b32 pick = ImGui::MenuItem(presetnames[i].cdata);
+        itemnamed(g, concat(&a, "layout ", presetnames[i]));
+        ImGui::SetItemTooltip("%s", presettips[i].cdata);
+        if (pick) {
+            DockLayout l = dockpreset(i);
+            picklayout(g, &l);
+        }
+    }
+    if (g->layouts.len) {
+        ImGui::Separator();
+    }
+    for (iz i = 0; i < g->layouts.len; i++) {
+        ImGui::PushID((i32)i);
+        b32 pick = ImGui::MenuItem(cstr0(&a, g->layouts[i].name));
+        ImGui::PopID();
+        itemnamed(g, concat(&a, "layout ", g->layouts[i].name));
+        if (pick) {
+            picklayout(g, &g->layouts[i]);
+        }
+    }
+    ImGui::Separator();
+    b32 save = ImGui::MenuItem("Save layout...");
+    itemnamed(g, "Save layout...");
+    if (save) {
+        g->opensavelayout = 1;
+    }
+    b32 del = ImGui::BeginMenu("Delete layout", g->layouts.len>0);
+    itemnamed(g, "menu Delete layout");
+    if (del) {
+        for (iz i = 0; i < g->layouts.len; i++) {
+            ImGui::PushID((i32)i);
+            b32 pick = ImGui::MenuItem(cstr0(&a, g->layouts[i].name));
+            ImGui::PopID();
+            itemnamed(g, concat(&a, "delete ", g->layouts[i].name));
+            if (pick) {
+                g->dellayout     = (i32)i + 1;
+                g->opendellayout = 1;
+            }
+        }
+        ImGui::EndMenu();
+    }
+    ImGui::EndMenu();
+}
+
+// Save layout...'s dialog, which names the layout as it is now, and
+// Delete layout's, which confirms.
+static void drawlayoutdialogs(Gui *g)
+{
+    Arena a  = g->frame;
+    f32   sc = g->scale;
+    if (g->opensavelayout) {
+        g->opensavelayout = 0;
+        g->layoutbuf[0]   = 0;
+        ImGui::OpenPopup("Save layout");
+    }
+    ImGui::SetNextWindowSize(v2(400*sc, 0));
+    if (ImGui::BeginPopupModal("Save layout", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextUnformatted("The panes as they are now, to return to from the "
+                               "View menu's Layout:");
+        ImGui::PopTextWrapPos();
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        ImGui::SetNextItemWidth(-1);
+        b32 enter = ImGui::InputTextWithHint("##layoutname", "Name", g->layoutbuf, FIELD_MAX,
+                                             ImGuiInputTextFlags_EnterReturnsTrue);
+        itemnamed(g, "layout name");
+        Str name = trim({(u8 *)g->layoutbuf, (iz)__builtin_strlen(g->layoutbuf)});
+        Str why  = docknamewhy(name);
+        b32 dup  = 0;
+        for (iz i = 0; i < g->layouts.len; i++) {
+            dup |= equalfold(g->layouts[i].name, name);
+        }
+        if (name.len && why.len) {
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+            ImGui::TextWrapped("%s", cstr0(&a, why));
+            ImGui::PopStyleColor();
+        } else if (dup) {
+            ImGui::TextDisabled("It replaces the layout saved by that name.");
+        }
+        ImGui::Spacing();
+        ImGui::BeginDisabled(why.len > 0);
+        b32 save = ImGui::Button(dup ? "Replace" : "Save", v2(120*sc, 0));
+        ImGui::EndDisabled();
+        itemnamed(g, "layout save");
+        ImGui::SameLine();
+        b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || modalkey(ImGuiKey_Escape);
+        if ((save || enter) && !why.len) {
+            b32        ok = 0;
+            DockLayout l  = capturelayout(g, &ok);
+            if (ok) {
+                l.name = clone(&g->perm, name);
+                iz i = 0;
+                for (; i<g->layouts.len && !equalfold(g->layouts[i].name, name); i++) {}
+                if (i < g->layouts.len) {
+                    g->layouts[i] = l;  // in its place in the menu
+                } else {
+                    g->layouts = push(&g->perm, g->layouts, l);
+                }
+                ImGui::MarkIniSettingsDirty();
+            } else {
+                guilog(g, "the layout could not be saved: its dock nodes make no layout");
+            }
+            ImGui::CloseCurrentPopup();
+        } else if (cancel) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (g->opendellayout) {
+        g->opendellayout = 0;
+        ImGui::OpenPopup("Delete layout?");
+    }
+    if (ImGui::BeginPopupModal("Delete layout?", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        iz  i     = g->dellayout - 1;
+        b32 there = i>=0 && i<g->layouts.len;
+        ImGui::Text("Delete the layout %s?", there ? cstr0(&a, g->layouts[i].name) : "");
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Button, fade(g->pal->bad, 0.6f));
+        b32 del = ImGui::Button("Delete", v2(120*sc, 0));
+        ImGui::PopStyleColor();
+        itemnamed(g, "layout delete");
+        ImGui::SameLine();
+        b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || modalkey(ImGuiKey_Escape);
+        if (del && there) {
+            for (; i < g->layouts.len-1; i++) {
+                g->layouts[i] = g->layouts[i+1];
+            }
+            g->layouts.len--;
+            ImGui::MarkIniSettingsDirty();
+        }
+        if (del || cancel) {
+            g->dellayout = 0;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 static void drawmenubar(Gui *g)
 {
     if (!ImGui::BeginMainMenuBar()) {
@@ -9982,7 +10427,9 @@ static void drawmenubar(Gui *g)
     itemrect(g, RECT_MENU);
     if (menu) {
         for (i32 i = 0; i < PANE_COUNT; i++) {
-            if (i == PANE_HELP) {
+            if (!paneoffered(i)) {
+                continue;
+            } else if (i == PANE_HELP) {
                 ImGui::Separator();
             }
             bool on = g->panes[i];
@@ -10036,24 +10483,9 @@ static void drawmenubar(Gui *g)
             }
             ImGui::EndMenu();
         }
-        b32 relayout = ImGui::MenuItem("Reset layout");
-        itemnamed(g, "Reset layout");
-        if (relayout) {
-            // The docked panes, while Help, Settings and Hosts stay as
-            // they are, and join the jobs
-            for (i32 i = 0; i < PANE_COUNT; i++) {
-                b32 extra = i==PANE_HELP || i==PANE_SETTINGS || i==PANE_HOSTS;
-                setpane(g, i, extra ? g->panes[i] : !panehidden(i));
-            }
-            g->panefocus    = 0;
-            g->resetpending = 1;
-        }
-        ImGui::SeparatorText("Debug");
-        bool demo = g->showdemo;
-        if (ImGui::MenuItem("ImGui demo window", 0, &demo)) {
-            g->showdemo = demo;
-        }
+        drawlayoutmenu(g);
         if (g->enginekind == ENGINE_FAKE) {
+            ImGui::SeparatorText("Debug");
             b32 modal = ImGui::MenuItem("Modal dialog...");
             itemrect(g, RECT_MODALITEM);
             if (modal) {
@@ -10151,18 +10583,7 @@ static void drawdialogs(Gui *g)
     drawnew(g);
     drawclose(g);
     drawsessdialogs(g);
-}
-
-// The dock node a window is in, or was in when the layout was saved;
-// 0 if neither.
-static ImGuiID saveddock(char const *name)
-{
-    ImGuiWindow *w = ImGui::FindWindowByName(name);
-    if (w) {
-        return w->DockId;
-    }
-    ImGuiWindowSettings *s = ImGui::FindWindowSettingsByID(ImHashStr(name));
-    return s ? s->DockId : 0;
+    drawlayoutdialogs(g);
 }
 
 // Begin a pane shown: its tab's close button hides it, until the View
@@ -10193,11 +10614,21 @@ static b32 beginpane(Gui *g, i32 pane)
         }
         ImGui::SetNextWindowFocus();
     }
+    if (g->floatwait>>pane & 1) {
+        // A layout's floating pane, at its place in the dock space
+        g->floatwait &= ~(1u << pane);
+        DockRect r = g->floatat[pane];
+        ImVec2   o = g->dockpos, s = g->docksize;
+        ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+        ImGui::SetNextWindowPos(v2(o.x + r.x*s.x, o.y + r.y*s.y), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(v2(r.w*s.x, r.h*s.y), ImGuiCond_Always);
+    }
     // A window focused as it appears selects its tab in its dock node,
-    // over the tab the layout file saved, which the panes of the first
-    // frame would otherwise take from each other, the last one winning
+    // over the tab the layout file saved, or a layout applied, which the
+    // panes appearing together would otherwise take from each other, the
+    // last one winning
     ImGuiWindowFlags flags = 0;
-    if (g->restored && ImGui::GetFrameCount()<=1) {
+    if ((g->restored && ImGui::GetFrameCount()<=1) || g->layoutquiet) {
         flags |= ImGuiWindowFlags_NoFocusOnAppearing;
     }
     bool open = 1;
@@ -10206,73 +10637,6 @@ static b32 beginpane(Gui *g, i32 pane)
         setpane(g, pane, 0);
     }
     return vis;
-}
-
-// The first run's pane, the floating dock node id, centered in a dock
-// space of a size at pos, most of it but not too big to read.
-static void placefirst(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
-{
-    f32    sc = g->scale;
-    ImVec2 fs = v2(size.x*0.6f, size.y*0.7f);
-    fs.x = fs.x<1100*sc ? fs.x : 1100*sc;
-    fs.y = fs.y<800*sc ? fs.y : 800*sc;
-    ImVec2 at = v2(pos.x + (size.x - fs.x)/2, pos.y + (size.y - fs.y)/2);
-    ImGui::DockBuilderSetNodePos(id, at);
-    ImGui::DockBuilderSetNodeSize(id, fs);
-    g->firstpane = id;
-    g->firstspace = size;
-    g->firstbox   = {at.x, at.y, at.x + fs.x, at.y + fs.y};
-}
-
-// The layout, in the dock space id of a size at pos: the sessions over
-// the todo list at the left, the transcript over the prompt, and at the
-// right the jobs and the log, Jobs selected, over the plan and the
-// changes. Help, Settings and Hosts join the jobs, when shown now or
-// later; on a first run, those shown float in front instead, centered,
-// Help selected. Metrics floats, when shown.
-static void buildlayout(Gui *g, ImGuiID id, ImVec2 pos, ImVec2 size)
-{
-    ImGuiID first = ImGui::GetID("FirstRun");
-    ImGui::DockBuilderRemoveNode(first);
-    ImGui::DockBuilderRemoveNode(id);
-    ImGui::DockBuilderAddNode(id, ImGuiDockNodeFlags_DockSpace);
-    ImGui::DockBuilderSetNodeSize(id, size);
-    ImGuiID left = 0, rest = 0, right = 0, center = 0;
-    ImGuiID top = 0, bottom = 0, rtop = 0, rbot = 0;
-    ImGuiID ltop = 0, lbot = 0;
-    ImGui::DockBuilderSplitNode(id, ImGuiDir_Right, LAYOUT_RIGHT, &right, &rest);
-    ImGui::DockBuilderSplitNode(rest, ImGuiDir_Left, LAYOUT_LEFT, &left, &center);
-    ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, LAYOUT_PROMPT, &bottom, &top);
-    ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, LAYOUT_PLAN, &rbot, &rtop);
-    ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, LAYOUT_TODO, &lbot, &ltop);
-    ImGui::DockBuilderDockWindow("Sessions", ltop);
-    ImGui::DockBuilderDockWindow("Todo", lbot);
-    ImGui::DockBuilderDockWindow("Transcript", top);
-    ImGui::DockBuilderDockWindow("Prompt", bottom);
-    ImGui::DockBuilderDockWindow("Jobs", rtop);
-    ImGui::DockBuilderDockWindow("Log", rtop);
-    ImGui::DockBuilderDockWindow("Plan", rbot);
-    ImGui::DockBuilderDockWindow("Changes", rbot);
-    ImGui::DockBuilderFinish(id);
-    g->jobsfocus = 2;
-
-    i32 extras[] = {PANE_HELP, PANE_SETTINGS, PANE_HOSTS};
-    b32 floats   = g->firstrun && g->panes[PANE_HELP];
-    g->firstpane = 0;
-    if (floats) {
-        ImGui::DockBuilderAddNode(first, ImGuiDockNodeFlags_None);
-        placefirst(g, first, pos, size);
-        g->helpfocus = 3;  // after Jobs
-    }
-    for (i32 i = 0; i < countof(extras); i++) {
-        i32 pane = extras[i];
-        b32 here = floats && g->panes[pane];
-        ImGui::DockBuilderDockWindow(panenames[pane], here ? first : rtop);
-    }
-    if (floats) {
-        ImGui::DockBuilderFinish(first);
-    }
-    g->firstrun = 0;
 }
 
 static void dockwindows(Gui *g)
@@ -10308,16 +10672,24 @@ static void dockwindows(Gui *g)
                  ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBackground);
     ImGuiID id = ImGui::GetID("DockSpace");
     g->dockspace = id;
+    g->dockpos   = pos;
+    g->docksize  = size;
 
-    // A reset waits a frame, so windows just shown again are submitted
-    // before the builder places them.
-    if (g->resetpending) {
-        g->resetpending = 0;
-        g->resetlayout  = 1;
-    } else if (g->resetlayout || (g->firstlayout && !ImGui::DockBuilderGetNode(id))) {
+    // A layout picked waits a frame, so that windows just shown again
+    // are submitted before the builder places them. In neither frame do
+    // the panes appearing take the focus (beginpane).
+    g->layoutquiet = 0;
+    if (g->layoutpending) {
+        g->layoutpending = 0;
+        g->layoutnow     = 1;
+        g->layoutquiet   = 1;
+    } else if (g->layoutnow || (g->firstlayout && !ImGui::DockBuilderGetNode(id))) {
         g->firstlayout = 0;
-        g->resetlayout = 0;
-        buildlayout(g, id, pos, size);
+        g->layoutnow   = 0;
+        g->layoutquiet = 1;
+        applylayout(g, id, pos, size);
+    } else if (g->layoutfocus > 0) {
+        layoutrefocus(g);
     } else if (g->firstpane) {
         // The first run's pane stays centered while the window settles
         // (a window manager maximizing it, say), until it is moved,
@@ -10418,7 +10790,7 @@ static void dockwindows(Gui *g)
         ImGui::End();
     }
     g->metricsshown = 0;
-    if (show[PANE_METRICS]) {
+    if (PROSPERO_DEVTOOLS && show[PANE_METRICS]) {
         g->metricsshown = beginpane(g, PANE_METRICS);
         if (g->metricsshown) {
             drawmetrics(g);
@@ -10471,17 +10843,12 @@ static void dockwindows(Gui *g)
             imgclose(g);
         }
     }
-    // The tab selected in its node, rather than the log: a node selects
-    // the window focused last, which a new window is as it appears, so
-    // Jobs is focused once, the frame after its windows first appear
+    // Windows that a layout saved before them lacks join a neighbor
     near = saveddock("Log");
     g->jobsvisible = 0;
     if (show[PANE_JOBS]) {
         if (near) {
             ImGui::SetNextWindowDockID(near, ImGuiCond_FirstUseEver);
-        }
-        if (g->jobsfocus && !--g->jobsfocus) {
-            ImGui::SetNextWindowFocus();
         }
         g->jobsvisible = beginpane(g, PANE_JOBS);
         if (g->jobsvisible) {
@@ -10494,10 +10861,5 @@ static void dockwindows(Gui *g)
             drawlog(g);
         }
         ImGui::End();
-    }
-    if (g->showdemo) {
-        bool open = 1;
-        ImGui::ShowDemoWindow(&open);
-        g->showdemo = open;
     }
 }

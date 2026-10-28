@@ -10,6 +10,7 @@
 #define IMGUI_ENABLE_FREETYPE
 #define IMGUI_DISABLE_STB_TRUETYPE
 #define IMGUI_DISABLE_OBSOLETE_FUNCTIONS
+#define IMGUI_DISABLE_DEMO_WINDOWS  // imgui_demo.cpp: empty stubs only
 
 // A failed assertion goes to prospero_imassert (app.cpp), which logs it.
 // Debug builds then trap. Release builds continue: the engine shares the

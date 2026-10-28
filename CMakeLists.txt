@@ -12,6 +12,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 set(PROSPERO_NAME prospero CACHE STRING "Executable name")
 option(PROSPERO_GUI "Build the GUI (OFF: the headless engine only)" ON)
+option(PROSPERO_DEVTOOLS "The GUI's developer tools, the Metrics pane (OFF for releases)" ON)
 option(PROSPERO_STATIC "Link fully statically (Linux: deployed engines)" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -188,6 +189,9 @@ if(WIN32)
 endif()
 if(PROSPERO_GUI)
   target_compile_definitions(prospero PRIVATE PROSPERO_GUI=1)
+  if(PROSPERO_DEVTOOLS)
+    target_compile_definitions(prospero PRIVATE PROSPERO_DEVTOOLS=1)
+  endif()
 endif()
 if(APPLE)
   # A code-signing identity from the keychain (its name, as listed by
