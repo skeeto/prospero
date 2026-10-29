@@ -123,7 +123,9 @@ one with the Developer ID, packed, then embedded in `Prospero.app`
 (built in the toolchain image, signed with `aas-sign`). Without
 `aas-sign`, the Developer ID in the keychain, or notary credentials
 (`--notary-profile`, from `xcrun notarytool store-credentials`), it
-builds nothing. `--push` uploads the two with [butler][].
+builds nothing. `--push` uploads the two with [butler][], which needs
+an itch.io API key, from `butler login` or in `BUTLER_API_KEY`; without
+one, it builds nothing either.
 
 [w64devkit]: https://github.com/skeeto/w64devkit
 [itch]: https://skeeto.itch.io/prospero

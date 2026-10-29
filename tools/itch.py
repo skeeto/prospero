@@ -30,7 +30,8 @@ DIR (default: build-itch) gets prospero-VERSION-macos-arm64.dmg,
 prospero-VERSION-windows-x86_64.exe and the engines zip, with .sha256
 files. --push then uploads the two programs with butler, to the
 channels mac and windows of skeeto/prospero, at the version; without
-it, the commands that would are printed.
+it, the commands that would are printed. It needs an itch.io API key,
+from "butler login" or in BUTLER_API_KEY, checked before the build.
 """
 
 import argparse
@@ -79,8 +80,13 @@ def checks(args):
     if not args.notary_profile and not os.environ.get("PROSPERO_NOTARY_KEY"):
         sys.exit("itch: no notary credentials: --notary-profile NAME, or "
                  "PROSPERO_NOTARY_KEY, PROSPERO_NOTARY_KEY_ID and PROSPERO_NOTARY_ISSUER")
-    if args.push and not shutil.which("butler"):
-        sys.exit("itch: --push needs butler (https://itch.io/docs/butler/)")
+    if args.push:
+        if not shutil.which("butler"):
+            sys.exit("itch: --push needs butler (https://itch.io/docs/butler/)")
+        creds = os.path.expanduser("~/Library/Application Support/itch/butler_creds")
+        if not os.environ.get("BUTLER_API_KEY") and not os.path.exists(creds):
+            sys.exit("itch: --push needs an itch.io API key: \"butler login\", "
+                     "or BUTLER_API_KEY")
     if args.commit == "HEAD":
         dirty = subprocess.run(["git", "-C", ROOT, "status", "--porcelain",
                                 "--untracked-files=no"],
