@@ -6,8 +6,9 @@
 #   prospero-VERSION.tar.gz                the source, every dependency
 #                                          unpacked under deps/
 #                                          (tools/dist.py), deterministic
-#   prospero-VERSION-windows-x86_64.exe    the GUI, engine and desktop
-#                                          helper included
+#   prospero-VERSION-windows-x86_64.zip    Prospero.exe, the GUI,
+#                                          engine and desktop helper
+#                                          included (tools/winzip.py)
 #   prospero-VERSION-macos-arm64.dmg       Prospero.app, the same, on a
 #                                          disk image beside a link to
 #                                          /Applications
@@ -31,7 +32,8 @@
 # signed through Azure Artifact Signing (aas-sign, by OIDC, with the
 # release environment's secrets) in a job of their own, which only signs,
 # packs and publishes what the build jobs made: the engines zip is packed
-# there, after signing, so that it holds the signed Windows engines.
+# there, after signing, so that it holds the signed Windows engines, as
+# is the GUI's zip.
 # GitHub records each asset's SHA-256 digest.
 #
 # The macOS app is built and tested on a macOS runner, signed ad hoc,
@@ -623,8 +625,9 @@ jobs:
       # The engines, the Windows ones signed, into one zip, as
       # tools/engines.py --zip packs them, with the licenses of what is
       # linked into them (the Linux engines' C runtime from this runner,
-      # as the build jobs' was), leaving the six assets
-      - name: Pack the engines
+      # as the build jobs' was); then the GUI, as Prospero.exe in a zip,
+      # leaving the six assets
+      - name: Pack the engines and the Windows program
         run: |
           mkdir stage
           mv dist/prospero-engine-* dist/prospero-desktop-* stage/
@@ -638,6 +641,10 @@ jobs:
               exit 1
           fi
           mv "stage/$z" dist/
+          python3 -I tools/winzip.py "dist/prospero-$V-windows-x86_64.exe" \
+              "dist/prospero-$V-windows-x86_64.zip"
+          rm "dist/prospero-$V-windows-x86_64.exe"
+          test "$(unzip -Z1 "dist/prospero-$V-windows-x86_64.zip")" = Prospero.exe
           all=(dist/*)
           if [ "${#all[@]}" -ne 6 ]; then
               echo "::error::dist/ holds other than the six assets"

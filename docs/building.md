@@ -61,8 +61,10 @@ Each release on GitHub carries six files:
       $ cmake -S prospero-VERSION -B build -DFETCHCONTENT_FULLY_DISCONNECTED=ON
       $ cmake --build build
 
-- `prospero-VERSION-windows-x86_64.exe`: the Windows program, the GUI
-  with its engine and desktop helper, all there is to install.
+- `prospero-VERSION-windows-x86_64.zip`: the Windows program,
+  `Prospero.exe`, the GUI with its engine and desktop helper, all there
+  is to install. Unpack it over an older `Prospero.exe`, of either
+  edition, to upgrade.
 - `prospero-VERSION-macos-arm64.dmg`: the macOS app, for Apple
   silicon and macOS 13 or later, signed and notarized. Drag
   `Prospero.app` to `/Applications`.
@@ -120,7 +122,8 @@ Windows, on a Mac with Docker, from a source tarball of a commit: the
 engines as above, the Windows ones signed with `aas-sign` and the macOS
 one with the Developer ID, packed, then embedded in `Prospero.app`
 (signed, tested, on a notarized disk image) and in the Windows program
-(built in the toolchain image, signed with `aas-sign`). Without
+(built in the toolchain image, signed with `aas-sign`, as `Prospero.exe`
+in a zip). Without
 `aas-sign`, the Developer ID in the keychain, or notary credentials
 (`--notary-profile`, from `xcrun notarytool store-credentials`), it
 builds nothing. `--push` uploads the two with [butler][], which needs

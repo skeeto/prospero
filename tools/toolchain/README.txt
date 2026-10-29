@@ -10,7 +10,7 @@ pane). Put this zip's engines directory in either place:
   Prospero.app is installed
 
   next to the Prospero program itself, as when you unpack this zip next
-  to prospero-VERSION-windows-x86_64.exe (this place comes first)
+  to Prospero.exe (this place comes first)
 
 The engines' version must match the program's.
 

@@ -21,13 +21,14 @@ whose tracked files must be committed), as the GitHub release is:
      and staples (with --notary-profile, a profile from "xcrun notarytool
      store-credentials", or the PROSPERO_NOTARY_KEY variables);
   3. the Windows program with it embedded, built in the toolchain image
-     (tools/toolchain), signed with aas-sign.
+     (tools/toolchain), signed with aas-sign, as Prospero.exe in a zip
+     (tools/winzip.py), as the GitHub release has it.
 
 Everything that signs must work: no aas-sign, no Developer ID identity
 in the keychain, or no notary credentials, and nothing is built.
 
 DIR (default: build-itch) gets prospero-VERSION-macos-arm64.dmg,
-prospero-VERSION-windows-x86_64.exe and the engines zip, with .sha256
+prospero-VERSION-windows-x86_64.zip and the engines zip, with .sha256
 files. --push then uploads the two programs with butler, to the
 channels mac and windows of skeeto/prospero, at the version; without
 it, the commands that would are printed. It needs an itch.io API key,
@@ -173,7 +174,7 @@ def macos(args, src, ver, zip):
 
 def windows(args, src, ver, zip):
     """The Windows program, in the toolchain image (engines.py built it
-    from this source), then signed here."""
+    from this source), then signed here, and zipped."""
     w = os.path.join(args.work, "windows")
     if os.path.exists(w):
         shutil.rmtree(w)
@@ -197,7 +198,9 @@ def windows(args, src, ver, zip):
     os.replace(os.path.join(w, "prospero.exe"), exe)
     pecheck(src, "--machine", "x86_64", "--subsystem", "gui", exe)
     aassign(src, [exe])
-    return exe
+    zip = os.path.join(w, f"prospero-{ver}-windows-x86_64.zip")
+    run(["uv", "run", os.path.join(src, "tools", "winzip.py"), exe, zip])
+    return zip
 
 
 def main():
@@ -219,11 +222,11 @@ def main():
     src, ver = source(args)
     zip = engines(args, src, ver)
     dmg = macos(args, src, ver, zip)
-    exe = windows(args, src, ver, zip)
+    win = windows(args, src, ver, zip)
 
     os.makedirs(args.out, exist_ok=True)
     made = []
-    for path in (dmg, exe, zip):
+    for path in (dmg, win, zip):
         dst = os.path.join(args.out, os.path.basename(path))
         shutil.copyfile(path, dst)
         name = os.path.basename(dst)
