@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.25)
 if(NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
   set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0 CACHE STRING "Oldest macOS to run on")
 endif()
-project(prospero VERSION 0.0.0 LANGUAGES C CXX)
+project(prospero VERSION 0.8.0 LANGUAGES C CXX)
 
 # Unity build: each executable is one translation unit, a platform layer
 # (src/main_*.cpp) that includes the portable core (src/prospero.cpp). The

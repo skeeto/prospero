@@ -454,7 +454,7 @@ static void testolder(Test *t)
     expect(t, "older.same", istr(&a, engineolder(PROSPERO_VERSION, all)), "0");
     Slice<Str> less = {capnames, countof(capnames)-1, countof(capnames)-1};
     expect(t, "older.cap", istr(&a, engineolder(PROSPERO_VERSION, less)), "1");
-    expect(t, "older.version", istr(&a, engineolder("0.0.0-1", all)), "0");
+    expect(t, "older.version", istr(&a, engineolder(PROSPERO_VERSION "-1", all)), "0");
     Slice<Str> none = {};
     expect(t, "older.newer", istr(&a, engineolder("999.0.0", none)), "0");
 }
