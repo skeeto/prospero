@@ -135,7 +135,12 @@ def engines(args, src, ver):
     out = os.path.join(args.work, "engines")
     if os.path.exists(out):
         shutil.rmtree(out)
+    # Its build directories too: each run's source is a fresh tarball,
+    # whose directory is named for the version, which a cache from an
+    # earlier one would not match
     work = os.path.join(args.work, "engines-work")
+    if os.path.exists(work):
+        shutil.rmtree(work)
     run(["uv", "run", os.path.join(src, "tools", "engines.py"), "--docker",
          "--out", out, "--work", work])
     aassign(src, sorted(glob.glob(os.path.join(out, f"prospero-engine-{ver}-windows-*.exe"))))
