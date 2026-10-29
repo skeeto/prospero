@@ -297,13 +297,14 @@ jobs:
           path: source
 
       # The headers SDL builds its X11 and Wayland video against, as in
-      # the build job
+      # the build job, and pkg-config, without which SDL quietly leaves
+      # out Wayland
       - name: Install the tools
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl gnupg \
-              ninja-build binutils \
+              ninja-build binutils pkg-config \
               libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
               libxfixes-dev libxss-dev libxtst-dev libwayland-dev \
               libxkbcommon-dev wayland-protocols libdecor-0-dev libegl-dev \
@@ -337,10 +338,18 @@ jobs:
           ctest --test-dir build -R 'unit|selftest' --output-on-failure
           test "$(build/prospero --version)" = "prospero $V"
 
-      # Only glibc's own libraries, and none of its symbols past 2.34
+      # Only glibc's own libraries, and none of its symbols past 2.34;
+      # and SDL's Wayland and X11 video, which load their libraries by
+      # these names
       - name: Check the floor
         run: |
           exe=build/prospero
+          for lib in libwayland-client.so.0 libdecor-0.so.0 libX11.so.6; do
+              if ! grep -qF "$lib" "$exe"; then
+                  echo "::error::the GUI lacks SDL's video through $lib"
+                  exit 1
+              fi
+          done
           bad=$(readelf -dW "$exe" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' |
                 grep -Ev '^(libc|libm|libdl|libpthread|librt|ld-linux[-a-z0-9_]*)\.so\.[0-9]+$' || true)
           if [ -n "$bad" ]; then
