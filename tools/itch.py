@@ -29,9 +29,9 @@ in the keychain, or no notary credentials, and nothing is built.
 
 DIR (default: build-itch) gets prospero-VERSION-macos-arm64.dmg,
 prospero-VERSION-windows-x86_64.zip and the engines zip, with .sha256
-files. --push then uploads the two programs with butler, to the
-channels mac and windows of skeeto/prospero, at the version; without
-it, the commands that would are printed. It needs an itch.io API key,
+files. --push then uploads the dmg and the Windows zip, kept a zip,
+with butler, to the channels mac and windows of skeeto/prospero, at
+the version; without it, the commands that would are printed. It needs an itch.io API key,
 from "butler login" or in BUTLER_API_KEY, checked before the build.
 """
 
@@ -240,8 +240,16 @@ def main():
         made.append(dst)
         say(f"{name}: {os.path.getsize(dst)} bytes, sha256 {sha256(dst)}")
 
+    # The Windows zip as a zip: butler unpacks a pushed .zip, or a
+    # directory of just one, into its files, unless --no-auto-unzip
+    winpush = os.path.join(args.work, "push-windows")
+    if os.path.exists(winpush):
+        shutil.rmtree(winpush)
+    os.makedirs(winpush)
+    shutil.copy2(made[1], winpush)
     pushes = [["butler", "push", made[0], f"{GAME}:mac", "--userversion", ver],
-              ["butler", "push", made[1], f"{GAME}:windows", "--userversion", ver]]
+              ["butler", "push", "--no-auto-unzip", winpush, f"{GAME}:windows",
+               "--userversion", ver]]
     for argv in pushes:
         if args.push:
             run(argv)
