@@ -7277,9 +7277,10 @@ static Str webspillread(Session *s, Arena *a, Str url, WebSpill *sp, i64 offset)
     if (r.err != READ_OK) {
         return {};
     }
-    Str text = cut(r.data, '\n').tail;  // past the line naming it
+    Str text  = cut(r.data, '\n').tail;  // past the line naming it
     Str nonce = webnonce(a, os_random(s->e->os));
-    return webfetchtext(a, url, sp->title, sp->ctype, text, offset, WEB_SHOW, nonce);
+    iz  off   = offset<0 ? 0 : offset<text.len ? (iz)offset : text.len;  // iz: 32 bits on i686
+    return webfetchtext(a, url, sp->title, sp->ctype, text, off, WEB_SHOW, nonce);
 }
 
 // A web_search or web_fetch call, its arguments checked (parseargs).
@@ -7579,8 +7580,8 @@ static void webpage(Session *s, Arena scratch)
         rel = {};
     }
     Str nonce = webnonce(&scratch, os_random(e->os));
-    Str shown = webfetchtext(&scratch, w->url, title, w->ctype, text, w->offset,
-                             WEB_SHOW, nonce);
+    iz  off   = w->offset<0 ? 0 : w->offset<text.len ? (iz)w->offset : text.len;
+    Str shown = webfetchtext(&scratch, w->url, title, w->ctype, text, off, WEB_SHOW, nonce);
     webcallend(s, scratch, "ok", shown, rel, whole.len);
 }
 
@@ -7727,7 +7728,7 @@ static void webrecord(Session *s, Arena scratch, Record r)
         if (w->cut) {
             return;
         } else if (r.data.len > room) {
-            print(&w->body, takehead(r.data, room));
+            print(&w->body, takehead(r.data, (iz)room));  // under r.data.len
             w->cut = 1;
             os_httpcancel(s->e->os, w->http);  // ends with HTTP_ECANCEL
             return;
