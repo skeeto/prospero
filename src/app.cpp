@@ -1425,6 +1425,7 @@ struct Gui {
 
     // Files and log
     Str                statedir;
+    Str                opensid;    // --session SID: shown once listed
     Str                inipath;
     Saver             *saver;      // writes inipath, or null: written here
     iz                 logfd;
@@ -1456,6 +1457,7 @@ struct Gui {
     b32                trace;      // log every frame
     Str                shotdir;    // --shots: where screenshots go
     Str                shotpath;   // the next presented frame goes here
+    Str                shotfile;   // --shot: the frame at --quit-after
     i32                layoutstreak;
     f32                widthadj;   // benchmark: subtracted from the width
 
@@ -3972,6 +3974,11 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         if (back) {
             guilist(g, g->hosts);
         }
+    }
+    GuiSession *want = g->opensid.len ? findlocal(g, g->opensid) : 0;
+    if (want) {
+        g->opensid = {};
+        guiselect(g, want);
     }
 }
 
@@ -9574,7 +9581,15 @@ static void gui_frame(Gui *g)
         schedat(s, g->nextsnap, DUE_CLOCK);
     }
     if (g->quitat && s->now>=g->quitat) {
-        g->quit = 1;
+        if (g->shotfile.len) {
+            // Present one more frame to capture, then quit
+            g->shotpath = g->shotfile;
+            g->shotfile = {};
+            g->quitat   = s->now + 250000;
+            schedforce(s);
+        } else {
+            g->quit = 1;
+        }
     }
     if (g->quitting && s->now>=g->quitby) {
         g->quit = 1;  // the engine did not stop in time
@@ -18133,6 +18148,7 @@ static Str guiusage =
 "  -c FILE        configuration file (default: prospero.ini, as for run)\n"
 "  --statedir DIR sessions, layout file and log (default: the state dir)\n"
 "  --skillsdir DIR more skills, in DIR (repeatable)\n"
+"  --session SID  show that session, once the engine lists it\n"
 "  --engine=MODE  inproc (default) or subprocess: \"prospero --headless\"\n"
 "  --fake         a fake agent instead of an engine, for measurements:\n"
 "    --tps N        its tokens per second (default 100)\n"
@@ -18179,7 +18195,8 @@ static Str guiusage =
 "  --trace-drive  log where the checklist's presses land\n"
 "  --display WxH  the usable size of the display a first window fits\n"
 "                 (nothing saved), as if the primary's\n"
-"  --quit-after S quit after S seconds\n";
+"  --quit-after S quit after S seconds\n"
+"  --shot FILE    at --quit-after, save the window as a PNG first (SDL only)\n";
 
 extern "C" void prospero_imassert(char const *expr, char const *file, int line)
 {
@@ -18429,6 +18446,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             g->quitat = s<0 ? 0 : g->started + s*1000000;
         } else if (a=="--statedir" && i+1<nargs) {
             g->statedir = args[++i];
+        } else if (a=="--shot" && i+1<nargs) {
+            g->shotfile = args[++i];
+        } else if (a=="--session" && i+1<nargs) {
+            g->opensid = args[++i];
         } else if (a=="-c" && i+1<nargs) {
             g->cfgpath = args[++i];
         } else if (a=="--skillsdir" && i+1<nargs) {

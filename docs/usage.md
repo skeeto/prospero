@@ -39,7 +39,8 @@ on the same one, even while its window is in the background, brings that
 window forward and exits, as does opening the app again on macOS. Under
 Wayland a window already open may only ask for attention, as the
 compositor decides focus. A different `--statedir` (or `XDG_STATE_HOME`)
-is a separate instance. The View menu shows and hides the panes and zooms
+is a separate instance. `--session SID` opens the window on that session.
+The View menu shows and hides the panes and zooms
 the text for the run (Ctrl+=, Ctrl+- and Ctrl+0, Cmd on macOS, or the
 wheel with the key held); `[ui] font_size` (17 pixels by default) sets its
 size for good. View → Layout, View's first item, arranges the panes as

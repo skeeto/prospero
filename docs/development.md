@@ -65,6 +65,16 @@ against what XP exports (CTest runs it in those builds). The scenario
 `desktop_xp`, run by name with `--xp` and `PROSPERO_TEST_XP_DESKTOP=1`,
 drives Notepad on XP's desktop with the real helper. Each script's header says how to run it.
 
+`tools/showcase.py` makes the state behind the README's screenshot: a
+small C project and four sessions, with subagents, a plan, a todo list
+and images, recorded against the fake provider. It then opens the GUI
+on that state, and with `--shot` saves the window as a PNG (`prospero
+gui --quit-after S --shot FILE`, SDL builds only):
+
+    $ uv run tools/showcase.py --prospero build/Prospero.app --work ~/src/mandel build-showcase
+    $ uv run tools/showcase.py --prospero build/Prospero.app build-showcase --open --shot docs/screenshot.png
+    $ sips -Z 1728 docs/screenshot.png
+
 ## Evals
 
 `prospero eval` measures models on a suite of tasks: how often each

@@ -10,6 +10,8 @@ Completions API, used by llama.cpp, vLLM, LiteLLM, and providers with a
 compatible API. Also Anthropic's Messages API, with extended thinking and
 prompt caching. No providers are configured out of the box.
 
+<p align="center"><img src="docs/screenshot.png" alt="Prospero on macOS in its Standard layout: sessions with subagents on the left above a finished todo list, a transcript in the middle showing a rendered Mandelbrot image and a summary table, and the session's plan on the right"></p>
+
 The UI is highly flexible, and you can rearrange the panes as you please
 with dragging and docking. Save your layouts for later in View -> Layouts.
 Unlike conventional ImGui applications, rendering is passive and will not
