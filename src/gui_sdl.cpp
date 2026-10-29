@@ -861,6 +861,9 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     // The window may go while a tray icon keeps the program running
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+    // The display may sleep and the screen saver start: SDL otherwise
+    // holds them off for as long as it runs, as a game would want
+    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
     // A trackpad's flick goes on scrolling after the fingers lift, as
     // elsewhere on macOS: SDL turns that off unless asked, as it reads
     // the hint once, in SDL_Init
