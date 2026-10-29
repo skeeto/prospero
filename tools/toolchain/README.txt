@@ -15,10 +15,10 @@ pane). Put this zip's engines directory in either place:
 The engines' version must match the program's.
 
 engines/
-  prospero-engine-VERSION-linux-x86_64        Linux, static: any C library
+  prospero-engine-VERSION-linux-x86_64        Linux, static
   prospero-engine-VERSION-linux-aarch64
   prospero-desktop-VERSION-linux-x86_64       Linux desktop helpers (Desktop
-  prospero-desktop-VERSION-linux-aarch64      control), glibc 2.28 or later
+  prospero-desktop-VERSION-linux-aarch64      control), glibc @GLIBC@ or later
   prospero-engine-VERSION-windows-x86_64.exe  64-bit Windows, x86-64 (and
                                               Arm, under emulation)
   prospero-engine-VERSION-windows-i686.exe    Windows XP and later, x86

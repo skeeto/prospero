@@ -1,35 +1,38 @@
 # On a version tag (v1.2.3, which must equal the project VERSION in
 # CMakeLists.txt, which is PROSPERO_VERSION), build, test, and publish a
-# release of nine assets: the source tarball, and programs built from it
+# release of six assets: the source tarball, and programs built from it
 # alone, with FetchContent disconnected.
 #
-#   prospero-VERSION.tar.gz                      the source, every dependency
-#                                                unpacked under deps/
-#                                                (tools/dist.py), deterministic
-#   prospero-VERSION-windows-x86_64.exe          the GUI, engine and desktop
-#                                                helper included
-#   prospero-VERSION-macos-arm64.dmg             Prospero.app, the same, on
-#                                                a disk image beside a link
-#                                                to /Applications
-#   prospero-engine-VERSION-windows-x86_64.exe   headless engines, named as
-#   prospero-engine-VERSION-windows-i686.exe       "prospero deploy" finds
-#   prospero-engine-VERSION-linux-x86_64           them; i686 is the XP engine,
-#   prospero-engine-VERSION-linux-aarch64          and Linux ones are static;
-#                                                  Windows ones are their own
-#                                                  desktop helpers
-#   prospero-desktop-VERSION-linux-x86_64        the Linux desktop helpers,
-#   prospero-desktop-VERSION-linux-aarch64         which deploy puts beside
-#                                                  each engine (they load X11
-#                                                  at run time, so link libc
-#                                                  dynamically)
+#   prospero-VERSION.tar.gz                the source, every dependency
+#                                          unpacked under deps/
+#                                          (tools/dist.py), deterministic
+#   prospero-VERSION-windows-x86_64.exe    the GUI, engine and desktop
+#                                          helper included
+#   prospero-VERSION-macos-arm64.dmg       Prospero.app, the same, on a
+#                                          disk image beside a link to
+#                                          /Applications
+#   prospero-VERSION-linux-x86_64.tar.gz   the GUI for Linux, in a
+#   prospero-VERSION-linux-aarch64.tar.gz    directory of its own, built
+#                                            in an Ubuntu 22.04 container
+#                                            so that it needs only glibc
+#                                            2.34 or later
+#   prospero-engines-VERSION.zip           the headless engines that
+#                                          "prospero deploy" puts on other
+#                                          machines, as
+#                                          tools/engines.py --zip packs
+#                                          them: Windows x86_64 and i686
+#                                          (XP), Linux x86_64 and aarch64
+#                                          (static) with their desktop
+#                                          helpers, and macOS arm64
 #
 # The Windows programs are built here on Linux by a pinned w64devkit's
 # GCC under Wine (cmake/Toolchain-W64devkit-Wine.cmake), since Ubuntu's
 # Mingw-w64 lacks #embed. They are stripped, with zero PE timestamps, and
 # signed through Azure Artifact Signing (aas-sign, by OIDC, with the
-# release environment's secrets) in a job of their own, which only signs
-# and publishes what the build jobs made. GitHub records each asset's
-# SHA-256 digest.
+# release environment's secrets) in a job of their own, which only signs,
+# packs and publishes what the build jobs made: the engines zip is packed
+# there, after signing, so that it holds the signed Windows engines.
+# GitHub records each asset's SHA-256 digest.
 #
 # The macOS app is built and tested on a macOS runner, signed ad hoc,
 # then signed again with the Developer ID Application certificate in a
@@ -38,7 +41,9 @@
 # MACOS_CERTIFICATE_PASSWORD), goes into a keychain made for the job,
 # and an App Store Connect API key (MACOS_NOTARY_KEY, the .p8's text,
 # with MACOS_NOTARY_KEY_ID and MACOS_NOTARY_ISSUER) notarizes the disk
-# image through cmake/notarize.cmake, which staples it.
+# image through cmake/notarize.cmake, which staples it. The macOS engine
+# is signed the same way, but not notarized: a bare program can't be
+# stapled, and deploy copies it over ssh, where no quarantine applies.
 #
 # Run by hand (workflow_dispatch), only the build jobs run: nothing is
 # signed or published, and the programs are left as the run's artifacts.
@@ -210,6 +215,13 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      # Again on its own, for the Linux GUI
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: source
+          path: dist/prospero-${{ steps.version.outputs.version }}.tar.gz
+          if-no-files-found: error
+
   linux-aarch64:
     name: Linux aarch64
     runs-on: ubuntu-26.04-arm
@@ -249,6 +261,117 @@ jobs:
           path: out/
           if-no-files-found: error
 
+  # The GUI links libstdc++ and libgcc statically, its dependencies are
+  # static, and SDL loads X11, Wayland and GL at run time, so the only
+  # floor is the glibc it was built against: Ubuntu 22.04's, pinned by
+  # digest, with Clang from apt.llvm.org (for #embed) and Kitware's CMake
+  # (Ubuntu's 3.22 is too old), pinned by SHA-256. The source is the
+  # build job's tarball. It needs nothing past GLIBC_2.34 (checked), for
+  # Ubuntu 22.04, Debian 12, Fedora 35 and RHEL 10, and later.
+  linux-gui:
+    name: Linux GUI ${{ matrix.arch }}
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-26.04
+            cmake: ed85135c5a5135b45e50423cb406dea04ca3338da0b8ef3c9ede963559680be0
+          - arch: aarch64
+            runner: ubuntu-26.04-arm
+            cmake: 301d5063ab259577c1b57ce5490b1aab9ea5c56dc4c822f73499553dab94925f
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04@sha256:e0f80c829509ef4df9e76bd8944eb7b8ec25cbb379b112a7f9448b2c77a77c9b
+    timeout-minutes: 45
+    env:
+      V: ${{ needs.build.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      CMAKE_VERSION: 4.4.5
+      CMAKE_SHA256: ${{ matrix.cmake }}
+      # apt.llvm.org's signing key
+      LLVM_KEY: 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: source
+          path: source
+
+      # The headers SDL builds its X11 and Wayland video against, as in
+      # the build job
+      - name: Install the tools
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+              ninja-build binutils \
+              libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+              libxfixes-dev libxss-dev libxtst-dev libwayland-dev \
+              libxkbcommon-dev wayland-protocols libdecor-0-dev libegl-dev \
+              libgl-dev
+          k=/usr/share/keyrings/llvm.gpg
+          curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o "$k"
+          if [ "$(gpg --show-keys --with-colons "$k" | awk -F: '$1 == "fpr" {print $10; exit}')" != "$LLVM_KEY" ]; then
+              echo "::error::apt.llvm.org's key is not $LLVM_KEY"
+              exit 1
+          fi
+          echo "deb [signed-by=$k] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-20 main" \
+              >/etc/apt/sources.list.d/llvm.list
+          apt-get update
+          apt-get install -y --no-install-recommends clang-20
+          c=cmake-$CMAKE_VERSION-linux-$ARCH
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$c.tar.gz" \
+              "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/$c.tar.gz"
+          echo "$CMAKE_SHA256  $RUNNER_TEMP/$c.tar.gz" | sha256sum -c
+          tar xzf "$RUNNER_TEMP/$c.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$c/bin" >>"$GITHUB_PATH"
+
+      - name: Build and test
+        run: |
+          tar xzf "source/prospero-$V.tar.gz" -C "$RUNNER_TEMP"
+          src=$RUNNER_TEMP/prospero-$V
+          echo "SRC=$src" >>"$GITHUB_ENV"
+          CC=clang-20 CXX=clang++-20 cmake -S "$src" -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS=-s \
+              -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+          cmake --build build
+          ctest --test-dir build -R 'unit|selftest' --output-on-failure
+          test "$(build/prospero --version)" = "prospero $V"
+
+      # Only glibc's own libraries, and none of its symbols past 2.34
+      - name: Check the floor
+        run: |
+          exe=build/prospero
+          bad=$(readelf -dW "$exe" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' |
+                grep -Ev '^(libc|libm|libdl|libpthread|librt|ld-linux[-a-z0-9_]*)\.so\.[0-9]+$' || true)
+          if [ -n "$bad" ]; then
+              echo "::error::the GUI needs $bad"
+              exit 1
+          fi
+          max=$(readelf -VW "$exe" | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1)
+          echo "newest: $max"
+          if [ "$(printf '%s\n' "$max" GLIBC_2.34 | sort -V | tail -1)" != GLIBC_2.34 ]; then
+              echo "::error::the GUI needs $max"
+              exit 1
+          fi
+
+      - name: Pack
+        run: |
+          d=prospero-$V-linux-$ARCH
+          mkdir -p "out/$d"
+          cp build/prospero "out/$d/"
+          cp "$SRC/assets/prospero.desktop" "$SRC/assets/prospero.png" \
+             "$SRC/assets/linux-README.txt" "out/$d/"
+          mv "out/$d/linux-README.txt" "out/$d/README.txt"
+          sh "$SRC/tools/licenses.sh" "$SRC" "out/$d/LICENSES" gui
+          tar czf "out/$d.tar.gz" -C out --owner=0 --group=0 --numeric-owner "$d"
+          rm -r "out/${d:?}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: linux-gui-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+
   macos:
     name: macOS arm64
     runs-on: macos-26
@@ -280,6 +403,17 @@ jobs:
           vtool -show-build "$exe" | grep -q 'minos 13\.0'
           mkdir out
           tar czf out/Prospero.app.tar.gz -C build-app Prospero.app
+          # The headless engine, as tools/engines.py builds it
+          cmake -S "$src" -B build-engine -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+              -DCMAKE_BUILD_TYPE=Release -DPROSPERO_GUI=OFF \
+              -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+              -DCMAKE_C_FLAGS_RELEASE="-Os -DNDEBUG" -DCMAKE_CXX_FLAGS_RELEASE="-Os -DNDEBUG" \
+              -DCMAKE_EXE_LINKER_FLAGS="-Wl,-dead_strip"
+          cmake --build build-engine -j"$n" --target prospero
+          exe=build-engine/prospero
+          test "$($exe --version)" = "prospero $v"
+          vtool -show-build "$exe" | grep -q 'minos 11\.0'
+          cp "$exe" "out/prospero-engine-$v-macos-arm64"
           echo "$v" >out/version
           gzip -dc "$RUNNER_TEMP/src.tar.gz" | shasum -a 256 | cut -d' ' -f1 >out/source.sha256
 
@@ -352,6 +486,12 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$a"
           ln -s /Applications "$RUNNER_TEMP/dmg/Applications"
           mkdir out
+          e=prospero-engine-$v-macos-arm64
+          cp "app/$e" out/
+          codesign --force --options runtime --timestamp \
+              --identifier com.nullprogram.prospero.engine \
+              --sign "$IDENTITY" "out/$e"
+          codesign --verify --strict --verbose=2 "out/$e"
           hdiutil create -volname Prospero -srcfolder "$RUNNER_TEMP/dmg" \
               -format UDZO "out/prospero-$v-macos-arm64.dmg"
           echo "DMG=out/prospero-$v-macos-arm64.dmg" >>"$GITHUB_ENV"
@@ -384,7 +524,7 @@ jobs:
 
   release:
     name: Sign and publish
-    needs: [build, linux-aarch64, macos-sign]
+    needs: [build, linux-aarch64, linux-gui, macos-sign]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -403,15 +543,18 @@ jobs:
         with:
           path: artifacts
 
-      # Exactly the nine assets, the aarch64 and macOS programs' source
-      # the same
+      # The assets and engines, exactly, the aarch64 and macOS programs'
+      # source the same
       - name: Gather the assets
         run: |
           mkdir dist
           mv artifacts/build/* dist/
           mv "artifacts/linux-aarch64/prospero-engine-$V-linux-aarch64" \
-             "artifacts/linux-aarch64/prospero-desktop-$V-linux-aarch64" dist/
-          mv "artifacts/macos/prospero-$V-macos-arm64.dmg" dist/
+             "artifacts/linux-aarch64/prospero-desktop-$V-linux-aarch64" \
+             "artifacts/macos/prospero-engine-$V-macos-arm64" dist/
+          mv "artifacts/macos/prospero-$V-macos-arm64.dmg" \
+             "artifacts/linux-gui-x86_64/prospero-$V-linux-x86_64.tar.gz" \
+             "artifacts/linux-gui-aarch64/prospero-$V-linux-aarch64.tar.gz" dist/
           got=$(gzip -dc "dist/prospero-$V.tar.gz" | sha256sum | cut -d' ' -f1)
           for a in linux-aarch64 macos; do
               if [ "$(cat "artifacts/$a/source.sha256")" != "$got" ]; then
@@ -422,10 +565,13 @@ jobs:
           for f in "prospero-$V.tar.gz" \
                    "prospero-$V-windows-x86_64.exe" \
                    "prospero-$V-macos-arm64.dmg" \
+                   "prospero-$V-linux-x86_64.tar.gz" \
+                   "prospero-$V-linux-aarch64.tar.gz" \
                    "prospero-engine-$V-windows-x86_64.exe" \
                    "prospero-engine-$V-windows-i686.exe" \
                    "prospero-engine-$V-linux-x86_64" \
                    "prospero-engine-$V-linux-aarch64" \
+                   "prospero-engine-$V-macos-arm64" \
                    "prospero-desktop-$V-linux-x86_64" \
                    "prospero-desktop-$V-linux-aarch64"; do
               if [ ! -f "dist/$f" ]; then
@@ -434,8 +580,8 @@ jobs:
               fi
           done
           all=(dist/*)
-          if [ "${#all[@]}" -ne 9 ]; then
-              echo "::error::dist/ holds more than the nine assets"
+          if [ "${#all[@]}" -ne 12 ]; then
+              echo "::error::dist/ holds more than the twelve files"
               exit 1
           fi
           # As built, for the check after signing
@@ -464,6 +610,30 @@ jobs:
         run: |
           python3 -I tools/pecheck.py --signed --unsigned "$RUNNER_TEMP/unsigned" \
               --signer "CN=Christopher Wellons" dist/*.exe
+
+      # The engines, the Windows ones signed, into one zip, as
+      # tools/engines.py --zip packs them, with the licenses of what is
+      # linked into them (the Linux engines' C runtime from this runner,
+      # as the build jobs' was), leaving the six assets
+      - name: Pack the engines
+        run: |
+          mkdir stage
+          mv dist/prospero-engine-* dist/prospero-desktop-* stage/
+          tar xzf "dist/prospero-$V.tar.gz" -C "$RUNNER_TEMP"
+          sh tools/licenses.sh "$RUNNER_TEMP/prospero-$V" "$RUNNER_TEMP/LICENSES"
+          python3 -I tools/engines.py --pack --out stage --licenses "$RUNNER_TEMP/LICENSES"
+          z=prospero-engines-$V.zip
+          n=$(unzip -Z1 "stage/$z" | grep '/engines/' | grep -cv '\.sha256$' || true)
+          if [ "$n" -ne 7 ]; then
+              echo "::error::$z holds $n programs, not 7"
+              exit 1
+          fi
+          mv "stage/$z" dist/
+          all=(dist/*)
+          if [ "${#all[@]}" -ne 6 ]; then
+              echo "::error::dist/ holds other than the six assets"
+              exit 1
+          fi
 
       - name: Publish
         env:

@@ -7,6 +7,7 @@
 
   uv run tools/engines.py [--out DIR] [--linux HOST] [PLATFORM ...]
   uv run tools/engines.py --docker [--zip] [--out DIR] [PLATFORM ...]
+  uv run tools/engines.py --pack --licenses LIC [--out DIR] [PLATFORM ...]
 
 With --docker, as for a release, the Linux and Windows builds run in
 the toolchain image (tools/toolchain/Dockerfile, built first, with
@@ -15,6 +16,12 @@ glibc 2.28 for their desktop helpers, and mingw-w64 as w64devkit has
 it for Windows, all optimized for size. The macOS engine is built here.
 --zip then packs them all as prospero-engines-VERSION.zip in DIR, to
 unpack next to the program (tools/toolchain/README.txt).
+
+  uv run tools/engines.py --pack --licenses LIC [--out DIR] [PLATFORM ...]
+
+With --pack, it builds nothing and packs the engines and helpers already
+in DIR the same way, with the licenses in LIC: how a release packs the
+ones CI built, after signing the Windows ones.
 
 Without it:
 
@@ -186,31 +193,61 @@ def docker(args, ver, plats):
                     "desktop")
 
 
-def pack(args, ver, plats):
-    """prospero-engines-VERSION.zip: the engines and helpers with their
-    hashes under engines/, as deploy looks for them beside the program,
-    and the licenses of what is linked into them. Sorted, with fixed
+def glibc(paths):
+    """The newest glibc the dynamically linked programs at paths need,
+    from the symbol versions they name, as "2.N"."""
+    best = None
+    for path in paths:
+        with open(path, "rb") as f:
+            for m in re.finditer(rb"GLIBC_2\.(\d+)", f.read()):
+                best = max(best or 0, int(m.group(1)))
+    return best and f"2.{best}"
+
+
+def pack(out, ver, plats, lic):
+    """prospero-engines-VERSION.zip: the engines and helpers in out with
+    their hashes under engines/, as deploy looks for them beside the
+    program, and the licenses in lic of what is linked into them. The
+    hashes are written now, of the files as they ship. Sorted, with fixed
     times, so that the same files make the same zip."""
     top = f"prospero-engines-{ver}"
-    files = []
-    for name in sorted(os.listdir(args.out)):
-        m = re.match(rf"prospero-(engine|desktop)-{re.escape(ver)}-([a-z0-9_]+-[a-z0-9_]+)", name)
-        if m and m.group(2) in plats:
-            files.append((f"{top}/engines/{name}", os.path.join(args.out, name)))
-    lic = os.path.join(args.work, "docker", "out", "LICENSES")
+    files, helpers = [], []
+    for name in sorted(os.listdir(out)):
+        m = re.fullmatch(rf"prospero-(engine|desktop)-{re.escape(ver)}-([a-z0-9_]+-[a-z0-9_]+)"
+                         r"(\.exe)?", name)
+        if not m or m.group(2) not in plats:
+            continue
+        path = os.path.join(out, name)
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        with open(path + ".sha256", "w") as f:
+            f.write(f"{digest}  {name}\n")
+        files.append((f"{top}/engines/{name}", path))
+        files.append((f"{top}/engines/{name}.sha256", path + ".sha256"))
+        if m.group(1) == "desktop":
+            helpers.append(path)
+    if not files:
+        sys.exit(f"engines: no engines for version {ver} in {out}")
     for name in sorted(os.listdir(lic)):
         files.append((f"{top}/LICENSES/{name}", os.path.join(lic, name)))
-    files.append((f"{top}/README.txt", os.path.join(ROOT, "tools", "toolchain", "README.txt")))
-    dst = os.path.join(args.out, f"{top}.zip")
+    with open(os.path.join(ROOT, "tools", "toolchain", "README.txt")) as f:
+        readme = f.read()
+    floor = glibc(helpers)
+    if helpers and not floor:
+        sys.exit("engines: no glibc version in the desktop helpers")
+    readme = readme.replace("@GLIBC@", floor or "2.28").encode()
+    dst = os.path.join(out, f"{top}.zip")
     with zipfile.ZipFile(dst + ".tmp", "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        for arc, path in sorted(files):
+        for arc, data in sorted(files + [(f"{top}/README.txt", readme)]):
             info = zipfile.ZipInfo(arc, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.create_system = 3  # Unix, for the mode bits
             exe = "/engines/" in arc and not arc.endswith(".sha256")
             info.external_attr = (0o100755 if exe else 0o100644) << 16
-            with open(path, "rb") as f:
-                z.writestr(info, f.read())
+            if isinstance(data, str):
+                with open(data, "rb") as f:
+                    data = f.read()
+            z.writestr(info, data)
     os.replace(dst + ".tmp", dst)
     with open(dst, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()
@@ -279,6 +316,10 @@ def main():
     ap.add_argument("--zip", action="store_true",
                     help="then pack them as prospero-engines-VERSION.zip in --out "
                          "(needs --docker)")
+    ap.add_argument("--pack", action="store_true",
+                    help="build nothing: pack the engines already in --out, as "
+                         "--zip does (a release's, built and signed by CI)")
+    ap.add_argument("--licenses", help="for --pack: the LICENSES directory to include")
     ap.add_argument("platforms", nargs="*", help=" ".join(PLATFORMS))
     args = ap.parse_args()
     plats = args.platforms or PLATFORMS
@@ -287,6 +328,11 @@ def main():
             sys.exit(f"engines: unknown platform {p}: one of {' '.join(PLATFORMS)}")
     if args.zip and not args.docker:
         sys.exit("engines: --zip needs --docker")
+    if args.pack:
+        if not args.licenses:
+            sys.exit("engines: --pack needs --licenses DIR")
+        pack(args.out, version(), plats, args.licenses)
+        return
     lin = [p for p in plats if p.startswith("linux-")]
     if args.docker:
         if args.deps:
@@ -297,7 +343,7 @@ def main():
             macos(args, ver)
         docker(args, ver, [p for p in plats if p != "macos-arm64"])
         if args.zip:
-            pack(args, ver, plats)
+            pack(args.out, ver, plats, os.path.join(args.work, "docker", "out", "LICENSES"))
         say(f"done: {args.out}")
         return
     if lin and not args.linux:

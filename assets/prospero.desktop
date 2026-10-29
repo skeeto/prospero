@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Prospero
+Comment=Run and supervise coding agents
+Exec=prospero
+Icon=prospero
+Terminal=false
+Categories=Development;
+StartupWMClass=prospero

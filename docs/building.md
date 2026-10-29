@@ -45,7 +45,7 @@ as one for measuring performance.
 
 ## Releases
 
-Each release on GitHub carries nine files:
+Each release on GitHub carries six files:
 
 - `prospero-VERSION.tar.gz`: the source, with every dependency unpacked
   under `deps/`, so that it builds with no network:
@@ -59,26 +59,33 @@ Each release on GitHub carries nine files:
 - `prospero-VERSION-macos-arm64.dmg`: the macOS app, for Apple
   silicon and macOS 13 or later, signed and notarized. Drag
   `Prospero.app` to `/Applications`.
-- `prospero-engine-VERSION-windows-x86_64.exe` and
-  `prospero-engine-VERSION-windows-i686.exe`: headless engines for
-  Windows, the i686 one for XP, each its own desktop helper too.
-- `prospero-engine-VERSION-linux-x86_64` and
-  `prospero-engine-VERSION-linux-aarch64`: headless engines for Linux,
-  linked statically.
-- `prospero-desktop-VERSION-linux-x86_64` and
-  `prospero-desktop-VERSION-linux-aarch64`: the desktop helper for
-  Linux ([Desktop control](desktop.md)). It loads X11 at run time, so
-  it links the C library dynamically, and needs glibc 2.34 or later.
+- `prospero-VERSION-linux-x86_64.tar.gz` and
+  `prospero-VERSION-linux-aarch64.tar.gz`: the Linux program, the same,
+  in a directory with a `.desktop` file, its icon, and a README.txt. It
+  is built in an Ubuntu 22.04 container, with everything but glibc
+  linked statically, so it needs glibc 2.34 or later (Ubuntu 22.04,
+  Debian 12, Fedora 35, RHEL 10), and shows its window through Wayland
+  or X11, which it loads at run time.
+- `prospero-engines-VERSION.zip`: headless engines for other machines,
+  which `prospero deploy` puts there (see below): Windows x86-64 and
+  i686 (for XP), each its own desktop helper; Linux x86-64 and aarch64,
+  linked statically, with their desktop helpers ([Desktop
+  control](desktop.md)), which link the C library dynamically, since
+  they load X11 at run time; and macOS arm64, signed. Its `engines`
+  directory goes next to the program, or beside `prospero.ini` (see
+  Settings), which suits a macOS app in /Applications. Its README.txt
+  lists the files and what each needs.
 
 The engines and helpers are named as `prospero deploy` expects to find
-them, in an `engines` directory next to the executable, which puts each
-helper beside its engine on the remote machine. To use a helper on the
-machine itself, save it next to `prospero` as `prospero-desktop`.
+them, and it puts each helper beside its engine on the remote machine.
+To use a helper on the machine itself, save it next to `prospero` as
+`prospero-desktop`.
 
-Windows builds are made on Linux by [w64devkit][] in Wine, and signed with
-Azure Artifact Signing. The macOS app is built and tested on a macOS
-runner, then signed with a Developer ID certificate and notarized by
-Apple.
+Windows builds are made on Linux by [w64devkit][] in Wine, and signed
+with Azure Artifact Signing before the engines are packed, by
+`tools/engines.py --pack`. The macOS app is built and tested on a
+macOS runner, then signed with a Developer ID certificate and notarized
+by Apple.
 
 ### The engines zip
 
@@ -96,9 +103,7 @@ macOS engine on the Mac itself. All are optimized for size:
 - the Windows engines are the same CRT-free programs as above;
 - the macOS engine, for Apple Silicon, needs macOS 11 or later.
 
-The same sources build the same zip, byte for byte. Its `engines`
-directory goes next to the program, or beside `prospero.ini` (see
-Settings), which suits a macOS app in /Applications, whose signed
-bundle stays as it is. Its README.txt lists the files.
+The same sources build the same zip, byte for byte, laid out as a
+release's.
 
 [w64devkit]: https://github.com/skeeto/w64devkit
