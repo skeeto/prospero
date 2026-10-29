@@ -617,6 +617,10 @@ static CfgKey cfgschema[] = {
      "do not register clients themselves"},
     {"mcp", "client_secret", CFG_SECRET, "", {}, {}, "mcp",
      "That client's secret, as env:NAME or file:PATH, if it has one"},
+    {"mcp", "redirect_uri", CFG_STRING, "", {}, {}, "mcp",
+     "Signing in: where the browser comes back, http://127.0.0.1:PORT/PATH "
+     "or http://localhost:PORT/PATH, for a client_id registered with that "
+     "one; by default a port the system picks, and /callback"},
     {"mcp", "scope", CFG_STRING, "", {}, {}, "mcp",
      "Signing in: the scopes to ask for, separated by blanks, by default "
      "those the server names"},
@@ -983,6 +987,20 @@ static b32 cfgrefprefix(Str v)
     return 1;
 }
 
+// A sign-in's redirect_uri, as the loopback listener can take it: http,
+// to 127.0.0.1 or localhost, at a port it names, with a path and no
+// query or fragment. Not ok otherwise.
+static Url loopbackuri(Str v)
+{
+    Url u    = parseurl(v);
+    Str auth = u.ok ? cut(cuthead(v, find(v, "://")+3), '/').head : Str{};
+    b32 ok   = u.ok && u.scheme=="http" && (u.host=="127.0.0.1" || u.host=="localhost") &&
+               cut(auth, ':').ok && u.path.len<=200 &&
+               !cut(u.path, '?').ok && !cut(u.path, '#').ok;
+    u.ok = ok;
+    return u;
+}
+
 // How a value fares as a setting of its key. A shared value comes from
 // an included file. An empty value means the default, and is fine.
 static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
@@ -995,6 +1013,8 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     }
     if (k->kind=="worktree" && k->key=="branch_prefix") {
         return cfgrefprefix(v) ? CFG_OK : CFG_BAD;
+    } else if (k->kind=="mcp" && k->key=="redirect_uri") {
+        return loopbackuri(v).ok ? CFG_OK : CFG_BAD;
     }
     switch (k->type) {
     case CFG_STRING:
@@ -1087,6 +1107,9 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
         print(&b, " in an included file is ignored, since it chooses what "
                   "runs: set it in your own file");
         return finish(&b);
+    }
+    if (k->kind=="mcp" && k->key=="redirect_uri") {
+        return "expected http://127.0.0.1:PORT/PATH or http://localhost:PORT/PATH";
     }
     Buf b(a, 128);
     switch (k->type) {

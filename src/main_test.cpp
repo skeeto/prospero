@@ -473,7 +473,7 @@ static void  os_httpfree(Os *, Http *) {}
 static Str   os_lasterr(Os *, Arena *) { return "not supported in tests"; }
 static Str   os_endpoint(Os *, Arena *, Str, Str) { return {}; }
 static Listener *os_listen(Os *, Arena, Str, Mailbox *) { return 0; }
-static b32 os_loopback(Os *, Mailbox *, u32, u64, i32, i32 *) { return 0; }
+static b32 os_loopback(Os *, Mailbox *, u32, u64, i32, Str, i32 *) { return 0; }
 static void  os_unlisten(Os *, Listener *) {}
 static Conn *os_connect(Os *, Arena, Str, Mailbox *, u64) { return 0; }
 static b32   os_listening(Os *, Arena, Str) { return 0; }

@@ -2596,6 +2596,8 @@ struct Loopback {
     u32      type;
     u64      id;
     i64      by;  // ticks
+    iz       pathlen;
+    u8       path[256];
 };
 
 // Wait up to ms for a socket to be readable.
@@ -2632,7 +2634,7 @@ static void loopthread(void *arg)
                 break;
             }
         }
-        Str t   = loopbacktarget(Str{buf, len});
+        Str t   = loopbacktarget(Str{buf, len}, Str{l->path, l->pathlen});
         Str ans = t.data ? loopbackpage : loopbackmissing;
         ws->send(c, ans.data, (i32)ans.len, 0);
         ws->closesocket(c);
@@ -2643,10 +2645,10 @@ static void loopthread(void *arg)
     HeapFree(GetProcessHeap(), 0, l);
 }
 
-static b32 os_loopback(Os *os, Mailbox *mbox, u32 type, u64 id, i32 ms, i32 *port)
+static b32 os_loopback(Os *os, Mailbox *mbox, u32 type, u64 id, i32 ms, Str path, i32 *port)
 {
     Winsock *ws = winsock();
-    if (!ws) {
+    if (!ws || path.len>(iz)sizeof(Loopback::path)) {
         return 0;
     }
     uz sock = ws->socket(2, 1, 6);  // AF_INET, SOCK_STREAM, IPPROTO_TCP
@@ -2659,6 +2661,7 @@ static b32 os_loopback(Os *os, Mailbox *mbox, u32 type, u64 id, i32 ms, i32 *por
     Loopback *l   = 0;
     sa.family = 2;
     sa.addr   = 0x0100007f;  // 127.0.0.1, in network order
+    sa.port   = (c16)((*port&0xff)<<8 | (*port>>8&0xff));
     if (ws->bind(sock, &sa, sizeof(sa)) || ws->listen(sock, 4) ||
             ws->getsockname(sock, &sa, &len) ||
             !(l = (Loopback *)HeapAlloc(GetProcessHeap(), 0, sizeof(Loopback)))) {
@@ -2671,6 +2674,8 @@ static b32 os_loopback(Os *os, Mailbox *mbox, u32 type, u64 id, i32 ms, i32 *por
     l->type = type;
     l->id   = id;
     l->by   = os_ticks(os) + (i64)ms*1000;
+    l->pathlen = path.len;
+    copybytes(l->path, path.data, path.len);
     if (!os_thread(os, loopthread, l)) {
         ws->closesocket(sock);
         HeapFree(GetProcessHeap(), 0, l);

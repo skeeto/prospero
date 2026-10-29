@@ -140,12 +140,13 @@ static Str     os_getenv(Os *, Arena *, Str name);
 // this same binary again.
 static Str     os_exepath(Os *, Arena *);
 
-// Listen at 127.0.0.1, on a port the system picks (*port), on a thread
-// of its own, for an HTTP request for /callback, as a browser makes
-// coming back from a sign-in: its target (path and query) is posted to
-// mbox as a record of that type and id, and the browser told it may
-// close the tab. After ms with none, the record is empty. 0 on failure.
-static b32     os_loopback(Os *, Mailbox *, u32 type, u64 id, i32 ms, i32 *port);
+// Listen at 127.0.0.1, on *port, or one the system picks (*port) when
+// it's 0, on a thread of its own, for an HTTP request for path (at most
+// 255 bytes), as a browser makes coming back from a sign-in: its target
+// (path and query) is posted to mbox as a record of that type and id,
+// and the browser told it may close the tab. After ms with none, the
+// record is empty. 0 on failure.
+static b32     os_loopback(Os *, Mailbox *, u32 type, u64 id, i32 ms, Str path, i32 *port);
 // Start a detached thread running fn(arg). Returns 0 on failure.
 static b32     os_thread(Os *, void (*fn)(void *), void *arg);
 static void    os_lockinit(Lock *);

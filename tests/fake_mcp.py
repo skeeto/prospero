@@ -213,6 +213,12 @@ def main():
 SESSIONS = set()
 FLAKED = set()
 OAUTH = {"clients": {}, "codes": {}, "access": set(), "refresh": set(), "n": 0}
+# A client registered beforehand, as FAKE_MCP_CLIENT's JSON object:
+# client_id, redirect_uris, and any client_secret the token requests
+# must then carry.
+if os.environ.get("FAKE_MCP_CLIENT"):
+    _c = json.loads(os.environ["FAKE_MCP_CLIENT"])
+    OAUTH["clients"][_c["client_id"]] = _c
 
 
 def serve_http():
@@ -349,8 +355,11 @@ def serve_http():
                     c = OAUTH["codes"].pop(form.get("code"), None)
                 v = form.get("code_verifier", "").encode()
                 want = base64.urlsafe_b64encode(hashlib.sha256(v).digest()).rstrip(b"=")
+                with LOCK:
+                    secret = OAUTH["clients"].get(form.get("client_id"), {}).get("client_secret")
                 if (not c or c["client"] != form.get("client_id") or
                         c["redirect"] != form.get("redirect_uri") or
+                        (secret and secret != form.get("client_secret")) or
                         want.decode() != c["challenge"]):
                     self.json(400, {"error": "invalid_grant",
                                     "error_description": "that code is not for you"})

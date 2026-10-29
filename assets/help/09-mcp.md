@@ -85,7 +85,10 @@ only to that server's URL, and refreshed as they expire. **Sign out**
 (or `prospero mcp logout NAME`) forgets them. A server that does not
 register clients itself needs `client_id`, and perhaps
 `client_secret`, from its provider; `scope` asks for particular
-scopes.
+scopes. If that client was registered with one address for the
+browser to come back to, set it as `redirect_uri`, such as
+`http://127.0.0.1:19876/callback`: Prospero then listens on that port
+and path rather than on one the system picks.
 
 The page also shows whether a server is running and with how many
 tools, or why it failed; **Restart** starts it again.

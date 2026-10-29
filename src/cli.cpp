@@ -847,15 +847,29 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         }
     } else {
         Arena a    = scratch;
-        i32   port = 0;
-        if (!os_loopback(os, c.out, MCPCLI_LOOP, 0, 10*60*1000, &port)) {
-            os_print(os, 2, "prospero: cannot listen on the loopback for the browser\n");
+        Str   uri  = trim(cfgget(cfg, "mcp", name, "redirect_uri", 0));
+        Url   at   = loopbackuri(uri);
+        i32   port = at.ok ? at.port : 0;
+        if (uri.len && !at.ok) {
+            os_print(os, 2, "prospero: its redirect_uri is not http://127.0.0.1:PORT/PATH "
+                            "or http://localhost:PORT/PATH\n");
+            return 1;
+        } else if (!os_loopback(os, c.out, MCPCLI_LOOP, 0, 10*60*1000,
+                                at.ok ? at.path : Str("/callback"), &port)) {
+            print(&out, "prospero: cannot listen on the loopback for the browser");
+            print(&out, at.ok ? concat(&a, Str(": "), uri) : Str(""));
+            putbyte(&out, '\n');
+            os_print(os, 2, finish(&out));
             return 1;
         }
-        Buf rb(&a, 64);
-        print(&rb, "http://127.0.0.1:");
-        print(&rb, (i64)port);
-        print(&rb, "/callback");
+        Buf rb(&a, 64 + uri.len);
+        if (at.ok) {
+            print(&rb, uri);
+        } else {
+            print(&rb, "http://127.0.0.1:");
+            print(&rb, (i64)port);
+            print(&rb, "/callback");
+        }
         Buf     mb(&a, 128);
         JsonOut w = {&mb};
         putobject(&w);

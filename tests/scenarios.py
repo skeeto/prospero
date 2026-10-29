@@ -10268,6 +10268,45 @@ def mcp_oauth(t):
             f"the refreshed token sent {auths[-3:]}")
 
 
+@scenario(bound=40)
+def mcp_oauth_client(t):
+    """A client registered beforehand, with a secret and a redirect_uri
+    of its own (as Figma needs): no registering, the browser sent back
+    to that address exactly, the secret sent for the tokens. A
+    redirect_uri the loopback cannot take is a configuration error."""
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    redirect = f"http://127.0.0.1:{port}/mcp/oauth/callback"
+    client = {"client_id": "pre-1", "client_secret": "sh!", "redirect_uris": [redirect]}
+    env = mcpenv(t, WEB_SECRET="sh!")
+    srv = McpHttpServer(t, oauth=True, FAKE_MCP_CLIENT=json.dumps(client))
+    try:
+        addconf(t, f"[mcp web]\nurl = {srv.url}\nclient_id = pre-1\n"
+                   f"client_secret = env:WEB_SECRET\nredirect_uri = {redirect}\n")
+        rc, out, err = mcpauth(t, "web", env)
+        t.check(rc == 0 and "Signed in to web." in out, f"signed in: {rc} {out} {err}")
+        addconf(t, "[mcp bad]\nurl = http://127.0.0.1:1/mcp\n"
+                   "redirect_uri = https://127.0.0.1:1/callback\n")
+        rc2, out2, err2 = mcpauth(t, "bad", env, browse=False)
+        t.check(rc2 != 0 and "expected http://127.0.0.1:PORT/PATH" in err2,
+                f"refused: {rc2} {out2} {err2}")
+    finally:
+        srv.close()
+    t.check(len(authfiles(t, "web-")) == 1, "tokens kept")
+    log = mcplog(t)
+    oauth = [m["_oauth"] for m in log if "_oauth" in m]
+    t.check("/as/register" not in oauth and "/as/token" in oauth, f"the flow {oauth}")
+    auth = [m for m in log if m.get("_oauth") == "/as/authorize"]
+    t.check(auth and auth[0].get("redirect_uri") == redirect and
+            auth[0].get("client_id") == "pre-1", f"authorize {auth}")
+    tok = [m for m in log if m.get("_oauth") == "/as/token"]
+    t.check(tok and tok[0].get("client_secret") == "sh!" and
+            tok[0].get("redirect_uri") == redirect, "the token request")
+
+
 @scenario(bound=20)
 def mcp_oauth_denied(t):
     """A sign-in the user refused, and one never finished elsewhere:

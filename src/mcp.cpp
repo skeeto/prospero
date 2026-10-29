@@ -991,13 +991,13 @@ static Str mcpauthurl(Arena *a, McpAuth *x, Str challenge)
 }
 
 // The loopback listener's (os_loopback): the target of a request for
-// /callback, from its head, else null; and what it answers.
-static Str loopbacktarget(Str head)
+// its path, from its head, else null; and what it answers.
+static Str loopbacktarget(Str head, Str path)
 {
     Cut line = cut(head, '\n');
     Cut verb = cut(trim(line.head), ' ');
     Cut tgt  = cut(verb.tail, ' ');
-    b32 ok   = verb.head=="GET" && (tgt.head=="/callback" || startswith(tgt.head, "/callback?"));
+    b32 ok   = verb.head=="GET" && cut(tgt.head, '?').head==path;
     return ok ? tgt.head : Str{};
 }
 

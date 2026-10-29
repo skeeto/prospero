@@ -2960,6 +2960,8 @@ struct Loopback {
     u32      type;
     u64      id;
     i64      by;  // ticks
+    iz       pathlen;
+    u8       path[256];
 };
 
 static i64 loopleft(Loopback *l)  // ms
@@ -2998,7 +3000,7 @@ static void loopthread(void *arg)
                 break;
             }
         }
-        Str t   = loopbacktarget(Str{(u8 *)buf, len});
+        Str t   = loopbacktarget(Str{(u8 *)buf, len}, Str{l->path, l->pathlen});
         Str ans = t.data ? loopbackpage : loopbackmissing;
         (void)!write(c, ans.data, (uz)ans.len);
         close(c);
@@ -3009,16 +3011,24 @@ static void loopthread(void *arg)
     free(l);
 }
 
-static b32 os_loopback(Os *os, Mailbox *mbox, u32 type, u64 id, i32 ms, i32 *port)
+static b32 os_loopback(Os *os, Mailbox *mbox, u32 type, u64 id, i32 ms, Str path, i32 *port)
 {
+    if (path.len > (iz)sizeof(Loopback::path)) {
+        return 0;
+    }
     i32 fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return 0;
     }
     fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (*port) {
+        int one = 1;  // the last sign-in's connections may linger there
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    }
     struct sockaddr_in sa = {};
     sa.sin_family      = AF_INET;
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port        = htons((uint16_t)*port);
     socklen_t salen    = sizeof(sa);
     Loopback *l        = 0;
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) || listen(fd, 4) ||
@@ -3032,6 +3042,8 @@ static b32 os_loopback(Os *os, Mailbox *mbox, u32 type, u64 id, i32 ms, i32 *por
     l->type = type;
     l->id   = id;
     l->by   = monotonic() + (i64)ms*1000;
+    l->pathlen = path.len;
+    copybytes(l->path, path.data, path.len);
     if (!os_thread(os, loopthread, l)) {
         close(fd);
         free(l);

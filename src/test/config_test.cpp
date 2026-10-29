@@ -140,6 +140,23 @@ static void testcfgschema(Test *t)
     }
 }
 
+// A sign-in's redirect_uri: the loopback, at a port, with a path.
+static void testloopbackuri(Test *t)
+{
+    Url u = loopbackuri("http://127.0.0.1:19876/mcp/oauth/callback");
+    expect(t, "loopbackuri.ok", u.ok && u.port==19876 && u.path=="/mcp/oauth/callback" ? "1" : "0", "1");
+    u = loopbackuri("http://localhost:8080");
+    expect(t, "loopbackuri.root", u.ok && u.port==8080 && u.path=="/" ? "1" : "0", "1");
+    Str bad[] = {
+        "", "127.0.0.1:1/x", "https://127.0.0.1:1/x", "http://127.0.0.1/x",
+        "http://example.com:1/x", "http://[::1]:1/x", "http://127.0.0.1:0/x",
+        "http://127.0.0.1:1/x?a=b", "http://127.0.0.1:1/x#y", "http://u@127.0.0.1:1/x",
+    };
+    for (iz i = 0; i < countof(bad); i++) {
+        expect(t, concat(&t->perm, "loopbackuri.bad ", bad[i]), loopbackuri(bad[i]).ok ? "1" : "0", "0");
+    }
+}
+
 static void testcfgdefault(Test *t)
 {
     static struct { Str env[2]; Str want; } cases[] = {
@@ -2185,6 +2202,7 @@ static void test_config(Test *t)
     testcfgsha256(t);
     testcfgurls(t);
     testcfgschema(t);
+    testloopbackuri(t);
     testcfgdefault(t);
     testcfgseed(t);
     testcfgvalidate(t);

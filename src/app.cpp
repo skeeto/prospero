@@ -2206,17 +2206,30 @@ static void mcpsignin(Gui *g, Str name)
     if (g->mcpname.len) {
         return;
     }
-    i32 port = 0;
+    Str uri  = trim(mcprow(g, name, "redirect_uri"));
+    Url at   = loopbackuri(uri);
+    i32 port = at.ok ? at.port : 0;
     u64 back = ++g->mcpback;
-    if (!os_loopback(g->os, g->tasks, TASK_MCPBACK, back, 10*60*1000, &port)) {
-        mcpsay(g, name, "Cannot listen on this computer's loopback for the browser", 1);
+    if (uri.len && !at.ok) {
+        mcpsay(g, name, "Its redirect_uri is not http://127.0.0.1:PORT/PATH "
+                        "or http://localhost:PORT/PATH", 1);
+        return;
+    } else if (!os_loopback(g->os, g->tasks, TASK_MCPBACK, back, 10*60*1000,
+                            at.ok ? at.path : Str("/callback"), &port)) {
+        Arena a = newarena(g->cmdr);
+        Str   why = "Cannot listen on this computer's loopback for the browser";
+        mcpsay(g, name, at.ok ? concat(&a, why, concat(&a, ": ", uri)) : why, 1);
         return;
     }
     Arena a = newarena(g->cmdr);
-    Buf   r(&a, 64);
-    print(&r, "http://127.0.0.1:");
-    print(&r, (i64)port);
-    print(&r, "/callback");
+    Buf   r(&a, 64 + uri.len);
+    if (at.ok) {
+        print(&r, uri);
+    } else {
+        print(&r, "http://127.0.0.1:");
+        print(&r, (i64)port);
+        print(&r, "/callback");
+    }
     Buf   b(&a, 256);
     EvOut w = cmdopen(g, &b, CMD_MCPAUTH, 0, g->main);
     putkey(&w.json, "name");
