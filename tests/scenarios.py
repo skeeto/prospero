@@ -11658,14 +11658,17 @@ XPROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xprobe.py")
 
 class Xvfb:
     """An X server on a display it picks itself, stopped by its group,
-    which its own spawn leads (pids.py)."""
+    which its own spawn leads (pids.py). With -noreset: by default it
+    resets when its last client leaves, as when a probe window closes
+    between helper commands, and refuses the next client meanwhile,
+    which on a loaded machine is long enough to fail a test."""
 
     def __init__(self):
         r, w = os.pipe()
         try:
             self.proc = subprocess.Popen(
                 ["Xvfb", "-displayfd", str(w), "-screen", "0", "1024x768x24",
-                 "-nolisten", "tcp"],
+                 "-nolisten", "tcp", "-noreset"],
                 pass_fds=(w,), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True)
         finally:
@@ -12286,9 +12289,9 @@ def desktop_x11_run(t):
             rc, out, err = xrun(xenv, helper, "list", win)
             t.check(rc == 0 and f"Probe {name}".encode() in out, f"apart: its window: {out} {err}")
             rc, _, err = xrun(xenv, helper, "close", win)
-            rc2, _, _ = xrun(xenv, helper, "wait", "-gone", "-t", "20", win)
+            rc2, _, err2 = xrun(xenv, helper, "wait", "-gone", "-t", "20", win)
             t.check(rc == 0 and rc2 == 0 and waitfor(lambda: not P.alive(pid), 10),
-                    f"apart: closed: {err}")
+                    f"apart: closed: {rc} {err} {rc2} {err2}")
     finally:
         x.close()
 
