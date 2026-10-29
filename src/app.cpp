@@ -420,6 +420,8 @@ struct GuiHost {
     i32      state;     // RS_*, from its "remote" records
     Str      msg;       // why it is down, or failed
     b32      deploys;   // failed, where deploying an engine would help
+    b32      deployfail; // a deployment there failed, said in the deploy toast
+    i32      deployfrom; // the pane its latest deployment began from (PANE_*)
     i64      retryat;   // epoch ms: it tries again then, while down
     b32      up;        // it answered hello
     b32      closing;   // asked to close: its records are let go
@@ -1386,6 +1388,12 @@ struct Gui {
     b32                bursts;
     b32                pauses;
     b32                panes[PANE_COUNT];  // shown, as the View menu says
+    i64                panedrawn[PANE_COUNT];  // total.frames when last drawn
+    i32                inpane;     // PANE_*+1 while drawing it, else 0
+    // A failed deployment (deployfailed), told in a toast in the pane it
+    // began from, or the other where that is not shown (drawdeploytoast)
+    u64                dtoasthost;  // its host's uid, 0 if none
+    Str                dtoasttext;
     i32                panefocus;  // PANE_*+1 to bring to the front, else 0
     i32                floatpane;  // PANE_*+1 to float or dock back (OP_FLOAT)
     ImVec2             floatsize;  // its size floating, 0 wide to dock back
@@ -6180,6 +6188,13 @@ static Str remoteset(Gui *g, Str name, Str key)
     return v;
 }
 
+// Whether connecting to a remote deploys an engine there as needed:
+// unless its section says deploy = ask (the default is auto).
+static b32 remotedeploys(Gui *g, Str name)
+{
+    return trim(remoterow(g, name, "deploy")) != "ask";
+}
+
 // The configured remotes, as they reach their machines.
 static Slice<LinkTo> guiremotes(Gui *g, Arena *a)
 {
@@ -6438,6 +6453,29 @@ static b32 remoteignored(Gui *g, Str name, Str key)
     return 0;
 }
 
+// A deployment to h begins, or may (a connect that deploys as needed):
+// from the pane being drawn, if a click there began it, whose toast
+// tells if it fails; and an earlier failure's toast there goes.
+static void deploystart(Gui *g, GuiHost *h)
+{
+    if (g->inpane) {
+        h->deployfrom = g->inpane - 1;
+    }
+    h->deployfail = 0;
+    if (g->dtoasthost == h->uid) {
+        g->dtoasthost = 0;
+    }
+}
+
+// A deployment to h failed: why, in the deploy toast, which replaces
+// any other's.
+static void deployfailed(Gui *g, GuiHost *h, Str why)
+{
+    h->deployfail = 1;
+    g->dtoasthost = h->uid;
+    g->dtoasttext = clone(&g->perm, why);
+}
+
 // Connect to a [remote NAME] over ssh, or into its WSL distro, as its
 // section says, or to an unconfigured distro (wslauto). The program is
 // "ssh" or "wsl.exe", or PROSPERO_TEST_SSH or PROSPERO_TEST_WSL (test
@@ -6462,8 +6500,11 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
     rc.program    = linkprogram(g, &scratch, rc.wsl.len>0);
     rc.scp        = os_getenv(g->os, &scratch, "PROSPERO_TEST_SCP");
     rc.localstate = g->statedir;
-    rc.deploy     = deploy || remoteset(g, name, "deploy")=="auto";
+    rc.deploy     = deploy || remotedeploys(g, name);
     h->deploys    = 0;
+    if (rc.deploy) {
+        deploystart(g, h);
+    }
     if (!rc.ssh.len && !rc.wsl.len &&
             (remoteignored(g, name, "ssh") || remoteignored(g, name, "wsl"))) {
         h->state = RS_FAILED;
@@ -6547,8 +6588,17 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
     h->deploys = h->state==RS_FAILED && jsonstr(jsonget(r->root, "deploy")).len;
     h->up      = h->state == RS_UP;
     h->downs  += h->state==RS_DOWN && was!=RS_DOWN;
+    if (h->state==RS_FAILED && was==RS_DEPLOYING) {
+        // A connect's deployment failed: its library says why ("cannot
+        // deploy an engine: ...")
+        deployfailed(g, h, concat(&a, concat(&a, h->name, ": "), msg));
+    }
     if (h->up) {
         hostcaps(g, h, r->root);
+        h->deployfail = 0;
+        if (g->dtoasthost == h->uid) {
+            g->dtoasthost = 0;
+        }
     }
     if (h->up && was!=RS_UP) {
         h->opens++;
@@ -6566,7 +6616,7 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
         // deploy = auto: an older engine is updated, once, so that one
         // that stays older (the engine deployed is no newer) is let be
         if (hostolder(h) && !updating(h) && !h->autoupdated &&
-                remoteset(g, h->name, "deploy")=="auto" &&
+                remotedeploys(g, h->name) &&
                 !remoteset(g, h->name, "path").len) {
             h->autoupdated = 1;
             guiupdate(g, h);
@@ -6722,7 +6772,7 @@ static Str hoststatus(Gui *g, Arena *a, GuiHost *h, i64 left)
         return finish(&b);
     }
     case RS_DEPLOYING:  return "deploying an engine";
-    case RS_FAILED:     return "failed";
+    case RS_FAILED:     return h->deployfail ? Str("deploy failed") : Str("failed");
     }
     return "not connected";
 }
@@ -7402,6 +7452,9 @@ static void ontask(Gui *g, Record r)
             h->updating    = UPD_FAILED;
             h->updmsg   = clone(&g->perm, concat(&g->frame, "Not deployed: ", msg));
             guilog(g, concat(&g->frame, concat(&g->frame, h->name, ": "), h->updmsg));
+            Arena f = g->frame;
+            deployfailed(g, h, concat(&f, concat(&f, concat(&f, "Not deployed to ", h->name),
+                                                 ": "), msg));
             return;
         } else if (!h->up && h->thenconnect && !h->r) {
             h->thenconnect = 0;
@@ -7481,6 +7534,7 @@ static void guiupdate(Gui *g, GuiHost *h)
     }
     h->updating = UPD_DEPLOYING;
     h->updmsg   = "deploying the engine";
+    deploystart(g, h);
     scheddirty(&g->sched);
 }
 

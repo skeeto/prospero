@@ -1420,9 +1420,9 @@ class Far:
                 f"\n# One that fails: ssh would take its destination for an option\n"
                 f"[remote bad]\nssh = -oProxyCommand=false\n"
                 + (f"\n# One with no engine there (no path, and none on PATH\n"
-                   f"# here), which offers to deploy one\n"
+                   f"# here), which offers to deploy one, as asked\n"
                    f"[remote missing]\nssh = {dest}\nstate = {self.state}-missing\n"
-                   f"config = {self.config}\n" if self.local else "")
+                   f"config = {self.config}\ndeploy = ask\n" if self.local else "")
                 + (f"\n# The same host, through the stand-in for wsl.exe\n"
                    f"[remote rw]\nwsl = Far\npath = {self.prospero}\n"
                    f"state = {self.state}\nconfig = {self.config}\n"

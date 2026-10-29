@@ -617,6 +617,30 @@ def auto_config(t):
 
 
 @scenario
+def auto_default(t):
+    """A [remote NAME] that says nothing of deploy deploys, auto being
+    the default; deploy = ask fails instead, saying deploying would help."""
+    t.engine()
+    with open(t.config, "a") as f:
+        f.write("[remote here]\nssh = here\n\n[remote asks]\nssh = here\ndeploy = ask\n")
+    common = ["-c", t.config, "--ssh-program", t.ssh, "--scp-program", t.scp,
+              "--engines", t.engines, "--remote-state", t.state, "--remote-config",
+              t.config, "--state", t.local]
+    c = R.connect(t, ["asks"] + common)
+    f = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "failed",
+               what="failed", timeout=20)
+    t.check(f.get("deploy") == "missing", f"ask: failed {f}")
+    t.check(c.p.wait(10) == 2, "ask: exit 2")
+    t.check(not os.path.isfile(t.deployed()), "ask: deployed")
+    c = R.connect(t, ["here"] + common)
+    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up",
+           timeout=60)
+    t.check(os.path.isfile(t.deployed()), "deployed by default")
+    c.call("quit")
+    t.check(c.close() == 0, "connect exits 0")
+
+
+@scenario
 def mismatch(t):
     """A host of another protocol: without --deploy, failed with the hint;
     with it, goodbye, the engine deployed (already there), and since that

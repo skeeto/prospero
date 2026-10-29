@@ -23,10 +23,12 @@ hosts lists the sessions the host holds and attaches to them.
 A remote machine needs an engine built for its platform, which
 `prospero deploy` uploads with scp to `~/.prospero` there, as
 `engine-PROTO-VERSION-OS-ARCH`, verifies it by its SHA-256, and
-records where it went, for connecting. With `deploy = auto` in its
-section, connecting deploys one when the machine has none; with the
-default, `ask`, a failed connection offers Deploy engine in the Hosts
-pane. Engines come
+records where it went, for connecting. Connecting deploys one by
+itself when the machine has none, or one of another protocol (`deploy
+= auto`, the default); with `deploy = ask` in its section, a failed
+connection offers Deploy engine in the Hosts pane instead. A deploy
+that fails says why in a toast, in the Sessions or Hosts pane, where
+it began. Engines come
 from the `engines` directory next to the executable, or when it has
 none for the platform, the one beside the default `prospero.ini`, named
 `prospero-engine-VERSION-OS-ARCH`, or are the executable itself when it

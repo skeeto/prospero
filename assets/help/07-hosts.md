@@ -78,10 +78,12 @@ to the executable, or from one beside `prospero.ini` (Settings shows
 where) when the first has none for the platform, as releases name them, or are the executable itself when it
 is built for that platform. The engines zip (`tools/engines.py --zip`)
 unpacks into either place. The itch.io build of Prospero has every
-engine built in, so it needs neither. With `deploy = auto` in the
-remote's section, connecting deploys one when the machine has none.
-Otherwise (`deploy = ask`, the default) the connection fails, saying
-why.
+engine built in, so it needs neither. Connecting deploys one by itself
+when the machine has none, or one of another protocol (`deploy = auto`,
+the default), as for a WSL distro the first time. A deploy that fails
+says why in a toast, at the foot of the Sessions or Hosts pane, where
+it began. With `deploy = ask` in the remote's section, the connection
+fails instead, saying why.
 
 Deploy engine, in the Hosts pane under a remote that is not connected
 and in its menu in the sidebar, deploys this version's engine there and
@@ -92,5 +94,5 @@ A remote whose engine is older than this program (an earlier version,
 or the same one lacking something this program knows) shows what it
 cannot do disabled. The Hosts pane says so under it, and Update engine
 there and in its menu deploys this version's engine and starts it once
-nothing runs there. With `deploy = auto`, connecting to an older engine
-updates it by itself.
+nothing runs there. Unless its section says `deploy = ask`, connecting
+to an older engine updates it by itself, once nothing runs there.

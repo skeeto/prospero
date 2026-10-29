@@ -587,10 +587,10 @@ static CfgKey cfgschema[] = {
      "The state directory there, by default its own"},
     {"remote", "config", CFG_STRING, "", {}, {}, "remote",
      "The configuration file there, by default its own"},
-    {"remote", "deploy", CFG_ENUM, "ask", {}, "ask auto", "remote",
-     "When the machine has no engine, or one of another protocol: ask, "
-     "where the Hosts pane offers Deploy engine once connecting fails, or "
-     "deploy it unasked (auto)"},
+    {"remote", "deploy", CFG_ENUM, "auto", {}, "ask auto", "remote",
+     "When the machine has no engine, or one of another protocol: deploy "
+     "this version's engine there as connecting (auto), or ask, where the "
+     "Hosts pane offers Deploy engine once connecting fails"},
     {"remote", "list", CFG_ENUM, "always", {}, "always connected", "remote",
      "When the session list shows the host: always, or connected, which "
      "keeps it out of the list while it is disconnected"},

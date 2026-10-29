@@ -1307,11 +1307,16 @@ static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str 
         print(&b, pf.about);
         print(&b, "): ");
         print(&b, names.engine);
-        print(&b, " is in neither ");
+        print(&b, dirs.len==1 ? Str(" is not in ") : Str(" is in neither "));
         for (iz i = 0; i < dirs.len; i++) {
             print(&b, i ? Str(" nor ") : Str(""));
             print(&b, dirs[i]);
         }
+#if !PROSPERO_ITCH
+        // As a Community build finds it: the engines come apart
+        print(&b, ": unpack prospero-engines-" PROSPERO_VERSION ".zip, from the "
+                  "release, into an engines directory beside prospero.ini");
+#endif
         print(&b, " (tools/engines.py builds it)");
         return deployfail(&d, perm, scratch, finish(&b));
     } else if (err.len) {

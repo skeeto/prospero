@@ -449,7 +449,7 @@ static HostLink *farlink(Engine *e, Arena scratch, FarHost *h)
     rc.envpath    = enginepath(e, &scratch, HOST_WINDOWS);
     rc.logname    = concat(&scratch, "engine-", h->name);
     rc.outid      = l->outid = ++e->nextid;
-    rc.deploy     = trim(cfgown(c, "remote", h->name, "deploy")) == "auto";
+    rc.deploy     = trim(cfgown(c, "remote", h->name, "deploy")) != "ask";
     // Its own memory, never let go: the library's thread may outlive
     // its MAIL_QUIT
     Arena   ra = newarena(os_reserve(e->os, (iz)1<<22));

@@ -3743,19 +3743,22 @@ static b32 toastbox(Gui *g, Str text, u32 color, u32 edge, Str btn, Str name,
     f32         pad  = 8*sc;
     f32         room = r1.x - r0.x - st.ScrollbarSize - 24*sc;
     f32         w    = 560*sc<room ? 560*sc : room;
-    if (w < 120*sc) {
+    if (w < 100*sc) {
         return 0;  // no room
     }
     Str  label = concat(&a, btn, "##toastx");
     f32  bw    = ImGui::CalcTextSize(cstr0(&a, btn)).x + 2*st.FramePadding.x;
-    if (fit) {
+    // Narrow, as in the Sessions pane: the button goes under the text,
+    // which takes the whole width, rather than squeeze it
+    b32  stack = w < 360*sc;
+    if (fit && !stack) {
         f32 need = ImGui::CalcTextSize(cstr0(&a, text)).x + 2*pad + bw + st.ItemSpacing.x;
         w = need<w ? need : w;
     }
-    f32  tw    = w - 2*pad - bw - st.ItemSpacing.x;
+    f32  tw    = stack ? w - 2*pad : w - 2*pad - bw - st.ItemSpacing.x;
     f32  th    = ImGui::CalcTextSize(cstr0(&a, text), 0, false, tw).y;
     f32  fh    = ImGui::GetFrameHeight();
-    f32  h     = (th>fh ? th : fh) + 2*pad;
+    f32  h     = stack ? th + st.ItemSpacing.y + fh + 2*pad : (th>fh ? th : fh) + 2*pad;
     f32  x     = fit ? r1.x - st.ScrollbarSize - 12*sc - w : r0.x + 12*sc;
     ImGui::SetCursorScreenPos(v2(x, r1.y - h - 10*sc));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, g->pal->frame);
@@ -3765,14 +3768,14 @@ static b32 toastbox(Gui *g, Str text, u32 color, u32 edge, Str btn, Str name,
     ImGui::BeginChild("##toast", v2(w, h), ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                       ImGuiWindowFlags_NoSavedSettings);
-    ImGui::SetCursorPos(v2(pad, pad + (fh>th ? (fh-th)/2 : 0)));
+    ImGui::SetCursorPos(v2(pad, pad + (fh>th && !stack ? (fh-th)/2 : 0)));
     ImGui::PushStyleColor(ImGuiCol_Text, color);
     ImGui::PushTextWrapPos(pad + tw);
     ImGui::TextUnformatted(cstr0(&a, text));
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
     itemnamed(g, "toast");
-    ImGui::SetCursorPos(v2(w - pad - bw, pad));
+    ImGui::SetCursorPos(v2(w - pad - bw, stack ? pad + th + st.ItemSpacing.y : pad));
     b32 pressed = ImGui::Button(cstr0(&a, label));
     if (name.len) {
         itemnamed(g, name);
@@ -3817,6 +3820,38 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
             s->note = {};
         }
     }
+}
+
+// A failed deployment's toast (deployfailed), over the foot of a pane:
+// the one its deployment began from (Sessions, unless it was Hosts), or
+// the other where that one was not drawn last frame, as when the user
+// has gone to another tab. It stays until dismissed, or until the host
+// is reached or deployed to again. The pane's window scrolls as a
+// whole, so its content keeps the extent it had without the toast.
+static void drawdeploytoast(Gui *g, i32 pane)
+{
+    GuiHost *h = 0;
+    for (GuiHost *k = g->hosts; k && g->dtoasthost; k = k->next) {
+        h = k->uid==g->dtoasthost ? k : h;
+    }
+    if (!h) {
+        return;
+    }
+    i32 home  = h->deployfrom==PANE_HOSTS ? PANE_HOSTS : PANE_SESSIONS;
+    i32 other = home==PANE_HOSTS ? PANE_SESSIONS : PANE_HOSTS;
+    b32 shown = g->panedrawn[home] >= g->total.frames-1;
+    if (pane != (shown ? home : other)) {
+        return;
+    }
+    ImGuiWindow *w    = ImGui::GetCurrentWindow();
+    ImVec2       maxp = w->DC.CursorMaxPos;
+    ImVec2       r0   = ImGui::GetWindowPos();
+    ImVec2       r1   = v2(r0.x + ImGui::GetWindowWidth(), r0.y + ImGui::GetWindowHeight());
+    if (toastbox(g, g->dtoasttext, g->pal->bad, g->pal->bad, "\xc3\x97", "deploy dismiss",
+                 "Dismiss", -1, r0, r1)) {  // a multiplication sign
+        g->dtoasthost = 0;
+    }
+    w->DC.CursorMaxPos = maxp;
 }
 
 #if !PROSPERO_ITCH
@@ -6221,7 +6256,10 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         pen(&t, h ? hostlabel(g, &a, h) : remote, STYLE_BOLD, g->pal->text);
         pen(&t, "  ", 0, g->pal->dim);
         Str status = h ? hoststatus(g, &a, h, left) : Str("not connected");
-        if (h && h->updating!=UPD_NONE && h->updmsg.len) {
+        if (h && h->deployfail) {
+            status = "deploy failed";  // why, in the deploy toast
+            dot    = g->pal->bad;
+        } else if (h && h->updating!=UPD_NONE && h->updmsg.len) {
             status = h->updmsg;
             dot    = h->updating==UPD_FAILED ? g->pal->bad : g->pal->amber;
         }
@@ -8506,7 +8544,8 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
                               "wsl = %s, and show it in Settings",
                               cstr0(&a, name), cstr0(&a, auto_->wsl));
     }
-    if (h && h->msg.len && h->state!=RS_UP) {
+    // Not a failed deployment's, which its toast tells (drawdeploytoast)
+    if (h && h->msg.len && h->state!=RS_UP && !h->deployfail) {
         ImGui::PushStyleColor(ImGuiCol_Text, h->state==RS_FAILED ? g->pal->bad : g->pal->amber);
         ImGui::TextWrapped("%s", cstr0(&a, h->msg));
         ImGui::PopStyleColor();
@@ -8514,7 +8553,7 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
     }
     // Deploying's progress, then Deploy engine whenever not connected, or
     // Update engine for an older engine there
-    if (h && h->updating!=UPD_NONE && h->updmsg.len) {
+    if (h && h->updating!=UPD_NONE && h->updmsg.len && !h->deployfail) {
         ImGui::PushStyleColor(ImGuiCol_Text, h->updating==UPD_FAILED ? g->pal->bad
                                                                      : g->pal->dim);
         ImGui::TextWrapped("%s", cstr0(&a, h->updmsg));
@@ -11174,6 +11213,12 @@ static b32 beginpane(Gui *g, i32 pane)
     if (!open) {
         setpane(g, pane, 0);
     }
+    // What is drawn now is this pane's, which a deployment begun from it
+    // notes (deploystart); and it was shown this frame (drawdeploytoast)
+    g->inpane = pane + 1;
+    if (vis) {
+        g->panedrawn[pane] = g->total.frames;
+    }
     return vis;
 }
 
@@ -11259,6 +11304,7 @@ static void dockwindows(Gui *g)
             escapecancel(g);
             backgroundkey(g);
             drawsessions(g);
+            drawdeploytoast(g, PANE_SESSIONS);
         }
         ImGui::End();
     }
@@ -11350,6 +11396,7 @@ static void dockwindows(Gui *g)
         }
         if (beginpane(g, PANE_HOSTS)) {
             drawhosts(g);
+            drawdeploytoast(g, PANE_HOSTS);
         }
         ImGui::End();
     }
@@ -11400,4 +11447,5 @@ static void dockwindows(Gui *g)
         }
         ImGui::End();
     }
+    g->inpane = 0;
 }
