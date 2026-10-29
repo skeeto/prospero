@@ -11099,7 +11099,6 @@ static void drawdialogs(Gui *g)
         b32 enter = modalenter();
         ImGui::Text("Prospero %s", PROSPERO_VERSION);
         ImGui::TextUnformatted("A coding harness: the agent's turns, tools and sessions.");
-        ImGui::TextUnformatted("Free and unencumbered software released into the public domain.");
         ImGui::Spacing();
         ImGui::SeparatorText("Third-party software");
         ImGui::BulletText("Dear ImGui: Copyright 2014 Omar Cornut (MIT)");
