@@ -10260,7 +10260,8 @@ def mcp_oauth(t):
     t.check(grants == ["authorization_code", "refresh_token"], f"grants {grants}")
     reg = [m for m in log if m.get("_oauth") == "/as/register"]
     t.check(reg and reg[0]["redirect_uris"][0].startswith("http://127.0.0.1:") and
-            reg[0]["redirect_uris"][0].endswith("/callback"), f"registered {reg}")
+            reg[0]["redirect_uris"][0].endswith("/callback") and
+            reg[0]["client_name"] == "Prospero", f"registered {reg}")
     auths = [m["_http"]["Authorization"] for m in log if "_http" in m and "_delete" not in m]
     t.check(auths and auths[0] == "Bearer " + keep.get("access_token", "?"),
             f"the token sent {auths[:2]}")
@@ -10305,6 +10306,22 @@ def mcp_oauth_client(t):
     tok = [m for m in log if m.get("_oauth") == "/as/token"]
     t.check(tok and tok[0].get("client_secret") == "sh!" and
             tok[0].get("redirect_uri") == redirect, "the token request")
+
+
+@scenario(bound=30)
+def mcp_oauth_name(t):
+    """A client_name of the section's own, registered under in place of
+    Prospero."""
+    env = mcpenv(t)
+    srv = McpHttpServer(t, oauth=True)
+    try:
+        addconf(t, f"[mcp web]\nurl = {srv.url}\nclient_name = Other (web)\n")
+        rc, out, err = mcpauth(t, "web", env)
+        t.check(rc == 0 and "Signed in to web." in out, f"signed in: {rc} {out} {err}")
+    finally:
+        srv.close()
+    reg = [m for m in mcplog(t) if m.get("_oauth") == "/as/register"]
+    t.check([m.get("client_name") for m in reg] == ["Other (web)"], f"registered {reg}")
 
 
 @scenario(bound=20)

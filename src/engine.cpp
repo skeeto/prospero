@@ -10232,7 +10232,7 @@ static void mcpauthreg(Engine *e, Arena scratch, McpAuth *x)
     Buf     b(&scratch, 512);
     JsonOut w = {&b};
     putobject(&w);
-    putstrkey(&w, "client_name", "Prospero");
+    putstrkey(&w, "client_name", x->clientname.len ? x->clientname : Str("Prospero"));
     putkey(&w, "redirect_uris");
     putarray(&w);
     putstr(&w, x->redirect);
@@ -10535,6 +10535,7 @@ static void cmdmcpauth(Engine *e, Arena scratch, i64 id, Json *j)
     Str client  = trim(cfgget(e->cfg, "mcp", name, "client_id", 0));
     Str secret  = cfgsecret(e->cfg, &scratch, "mcp", name, "client_secret");
     Str scope   = trim(cfgget(e->cfg, "mcp", name, "scope", 0));
+    Str cname   = trim(cfgget(e->cfg, "mcp", name, "client_name", 0));
     Str said    = {};
     for (McpServer *m = e->mcp; m; m = m->next) {
         if (m->name==name && m->url==url) {
@@ -10544,6 +10545,7 @@ static void cmdmcpauth(Engine *e, Arena scratch, i64 id, Json *j)
     }
     x->client = clone(&x->arena, client);
     x->secret = clone(&x->arena, secret);
+    x->clientname = clone(&x->arena, cname);
     x->scope  = clone(&x->arena, scope);
     x->stage  = MCPAUTH_PRM;
     x->tries  = mcpprmurls(&x->arena, url, clone(&x->arena, said));

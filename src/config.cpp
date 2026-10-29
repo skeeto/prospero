@@ -615,6 +615,9 @@ static CfgKey cfgschema[] = {
     {"mcp", "client_id", CFG_STRING, "", {}, {}, "mcp",
      "Signing in to a url: the OAuth client to sign in as, for servers that "
      "do not register clients themselves"},
+    {"mcp", "client_name", CFG_STRING, "", {}, {}, "mcp",
+     "Signing in: the name Prospero registers as a client under, by "
+     "default Prospero, for servers that admit clients by name"},
     {"mcp", "client_secret", CFG_SECRET, "", {}, {}, "mcp",
      "That client's secret, as env:NAME or file:PATH, if it has one"},
     {"mcp", "redirect_uri", CFG_STRING, "", {}, {}, "mcp",

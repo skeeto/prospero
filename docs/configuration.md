@@ -180,7 +180,7 @@ its page, has Sign in, which opens the browser and takes its return on
 a loopback port; `prospero mcp auth NAME` does the same without a
 window, printing the address to visit. Prospero discovers the
 authorization server, registers itself as a client unless `client_id`
-is set, and uses PKCE. The browser comes back to
+is set (as "Prospero", or as `client_name`), and uses PKCE. The browser comes back to
 `http://127.0.0.1:PORT/callback`, at a port the system picks, unless
 `redirect_uri` names one (`http://127.0.0.1:PORT/PATH` or
 `localhost`): a client registered beforehand with one fixed address,

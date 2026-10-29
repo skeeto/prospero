@@ -779,6 +779,7 @@ struct McpAuth {
     Str        reg;
     Str        scope;
     Str        client;
+    Str        clientname;  // registering
     Str        secret;
     Str        refresh;   // the refresh token, refreshing
     Str        verifier;  // PKCE
