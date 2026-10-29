@@ -68,6 +68,14 @@ static void test_sidebar(Test *t)
     expect(t, "sidebar.flat", siderows(&a, &in, sidetree(&a, &in)),
            "S s3\nS s2\n S s2a\n S s2b\nS s1\n");
 
+    // While a session is dragged, Archived is there to drop it on
+    in.archive = 1;
+    Slice<SideRow> drag = sidetree(&a, &in);
+    expect(t, "sidebar.dragarchive", siderows(&a, &in, drag),
+           "S s3\nS s2\n S s2a\n S s2b\nS s1\nA 0+\n");
+    expect(t, "sidebar.dragarchived", istr(&a, drag[5].archived*10 + drag[0].archived), "10");
+    in.archive = 0;
+
     // A session with subagents folds, by its key
     *upsert(&in.folds, "s:this:s2", &a) = 1;
     Slice<SideRow> rows = sidetree(&a, &in);

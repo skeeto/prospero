@@ -73,7 +73,9 @@ The sidebar is a tree: groups, then hosts, then sessions with their
 subagents, and archived sessions folded away at the end. A session's
 context menu, and the Session menu, rename it, move it to a group,
 fork it, compact it now, switch its model, export it (Markdown or the
-raw log), archive or delete it (with its subagents). The transcript's
+raw log), archive or delete it (with its subagents). Dragging a session
+onto a group, onto Archived, or below the list moves it there too, on
+its own host. The transcript's
 context menu forks at a message: before a prompt, which then waits in
 the fork's prompt box, or after a turn. A side chat, from that menu,
 the Session menu or `/side`, is a fork made even while the agent

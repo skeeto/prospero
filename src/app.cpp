@@ -1124,6 +1124,9 @@ struct Gui {
     Slice<Str>         groups;     // the groups' order, empty ones included
     b32                sidedirty;  // folds or groups changed: kept with the layout
     GuiSession        *menusess;   // the session the context menu is for
+    b32                dragcancel; // a session's drag ended by Escape: none
+                                   // again until the button is up
+    char               droplabel[FIELD_MAX]; // where the dragged session would go, this frame
     char              *namebuf;    // the naming dialog's field
     i32                nameask;    // NAME_*
     GuiSession        *namesess;
@@ -10798,6 +10801,12 @@ struct DriveOp {
     Str text;
 };
 
+// A session's row pressed and moved past the drag threshold: dragged,
+// for a move to a target and a release
+#define DRAGSESS(title) \
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, title}, {OP_DOWN, 0, 0, 0, 100, ""}, \
+    {OP_MOVE, T_SESSTITLE, 4, 3, 100, title}, {OP_MOVE, T_SESSTITLE, 14, 8, 300, title}
+
 // A layout picked from View, Layout, by its name
 #define LAYOUT(name) \
     {OP_MOVE, T_MENU, 0, 0, 100, ""}, {OP_DOWN, 0, 0, 0, 60, ""}, \
@@ -12675,6 +12684,37 @@ static DriveOp sessionsops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "Unarchive"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Work\n H this\n  S Greeting\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nA"},
+    // Dragged below the rows, out of its group; onto the group again
+    DRAGSESS("Greeting"),
+    {OP_MOVE, T_NAMED, 0, 0, 300, "sessions empty"},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Work\nH this\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Greeting\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "  S Greeting"},
+    DRAGSESS("Greeting"),
+    {OP_MOVE, T_NAMED, 0, 0, 300, "head g:Work"},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Work\n H this\n  S Greeting\n"},
+    // Archived, there to drop on while dragging; then back to the group
+    DRAGSESS("Greeting"),
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nA"},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "head a"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-drag"},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "A\n H this\n  S Greeting\n"},
+    DRAGSESS("Greeting"),
+    {OP_MOVE, T_NAMED, 0, 0, 300, "head g:Work"},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Work\n H this\n  S Greeting\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nA"},
+    // Escape ends a drag: nothing dropped
+    DRAGSESS("Greeting"),
+    {OP_MOVE, T_NAMED, 0, 0, 300, "head a"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Work\n H this\n  S Greeting\n"},
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nA"},
     // Its model, from the session bar's picker

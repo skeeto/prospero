@@ -138,7 +138,11 @@ Right-click a session in the sidebar, or open the Session menu, for:
   rename it.
 - **Move to group**: an existing group, New group..., or Remove from
   group. Groups head the sidebar; a group's own menu renames,
-  archives, ungroups, reorders or deletes it.
+  archives, ungroups, reorders or deletes it. Or drag the session, with
+  its subagents, onto a group's heading, onto Archived (shown while you
+  drag), onto another session to join it there, or below the list to
+  take it out of its group. Escape cancels a drag. A session never moves
+  to another host, and the sidebar stays newest first.
 - **Fork**: a new session with a copy of this conversation, titled
   "(fork)", which starts in Build mode. A No folder session's fork gets
   a copy of its folder.

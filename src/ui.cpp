@@ -6015,6 +6015,85 @@ static void foldrow(Gui *g, SideRow *r)
     scheddirty(&g->sched);
 }
 
+// Dragging sessions in the sidebar: a root, with its subagents, onto a
+// group's heading, Archived, a host's heading or another session, which
+// puts it in that section, or below the rows, out of its group. Never
+// to another host: a heading or a session there is no target. No
+// order and no parent changes: the sections stay newest first.
+static Str dragwhy(Gui *g, GuiSession *s)
+{
+    Str why = sesswhy(g, s, "group", 0, 1);
+    return why.len ? why : sesswhy(g, s, "archive", 0, 1);
+}
+
+// The session being dragged, else null.
+static GuiSession *dragged()
+{
+    ImGuiPayload const *p = ImGui::GetDragDropPayload();
+    return p && p->IsDataType("SESS") ? *(GuiSession **)p->Data : 0;
+}
+
+// Whether s dropped into a section (group, or archived) on host h (any
+// if null) would change anything there.
+static b32 dropok(GuiSession *s, GuiHost *h, Str group, b32 archived)
+{
+    if (s->gone || (h && h!=s->host)) {
+        return 0;
+    }
+    return archived ? !s->archived : s->archived || !(s->group==group);
+}
+
+// The session's row just drawn, as the source of a drag, if it may go
+// anywhere; else, dragged, why not.
+static void dragsource(Gui *g, Arena a, GuiSession *s)
+{
+    Str why = dragwhy(g, s);
+    if (why.len) {
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            ImGui::SetTooltip("%s", cstr0(&a, why));
+        }
+        return;
+    }
+    if (!g->dragcancel && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoPreviewTooltip)) {
+        ImGui::SetDragDropPayload("SESS", &s, sizeof(s));
+        ImGui::EndDragDropSource();
+    }
+}
+
+// The item just drawn as a place to drop a session: into group, or
+// Archived, on host h (any if null). It takes the session only where
+// that changes something; label says where, for the drag's tooltip.
+static void droptarget(Gui *g, Arena a, GuiHost *h, Str group, b32 archived, Str label)
+{
+    GuiSession *s = dragged();
+    if (!s) {
+        return;
+    } else if (!dropok(s, h, group, archived)) {
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                h && h!=s->host) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_NotAllowed);
+            fieldput(g->droplabel, concat(&a, "not to ", h->name));
+        }
+        return;
+    }
+    if (ImGui::BeginDragDropTarget()) {
+        ImGuiPayload const *p = ImGui::AcceptDragDropPayload(
+            "SESS", ImGuiDragDropFlags_AcceptBeforeDelivery);
+        if (p) {
+            fieldput(g->droplabel, concat(&a, "\xe2\x86\x92 ", label));  // a rightwards arrow
+        }
+        if (p && p->IsDelivery()) {
+            if (!archived && !(s->group==group)) {
+                guigroup(g, s, group);
+            }
+            if (!s->archived != !archived) {
+                guiarchive(g, s, archived);
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
+}
+
 // A heading: a group, a host, or Archived. It folds by a click, and has
 // a menu by a right click; a host's heading has buttons for what is
 // done there most.
@@ -6055,6 +6134,21 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     }
     if (click) {
         foldrow(g, r);
+    }
+    switch (r->kind) {
+    case SROW_GROUP:
+        droptarget(g, a, 0, r->group, 0, r->group);
+        break;
+    case SROW_ARCHIVED:
+        droptarget(g, a, 0, {}, 1, "Archived");
+        break;
+    case SROW_HOST:
+        if (h) {  // a remote never reached lists nothing to go there
+            droptarget(g, a, h, r->group, r->archived,
+                       r->archived ? Str("Archived") : r->group.len ? r->group
+                                                                   : Str("out of groups"));
+        }
+        break;
     }
     b32 menu = r->kind!=SROW_ARCHIVED && ImGui::BeginPopupContextItem("##headmenu");
     if (menu) {
@@ -6192,6 +6286,9 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
         sessitems(g, a, s);
         ImGui::EndPopup();
     }
+    dragsource(g, a, s);
+    droptarget(g, a, s->host, r->group, r->archived,
+               r->archived ? Str("Archived") : r->group.len ? r->group : Str("out of groups"));
 
     f32 x = p.x + 4*sc + (f32)r->depth*12*sc;
     if (r->kids) {
@@ -6287,12 +6384,53 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
     ImGui::PopID();
 }
 
+// While a session is dragged: the space below the rows, out of its
+// group; the drag's tooltip; and the pane scrolled near its edges.
+static void dragrest(Gui *g, Arena a, GuiSession *s)
+{
+    f32 sc    = g->scale;
+    f32 lineh = ImGui::GetTextLineHeight();
+    f32 rest  = ImGui::GetContentRegionAvail().y;
+    ImGui::InvisibleButton("##dropout", v2(ImGui::GetContentRegionAvail().x,
+                                           rest>2*lineh ? rest : 2*lineh));
+    itemnamed(g, "sessions empty");
+    droptarget(g, a, s->host, {}, 0, "out of groups");
+
+    Str   t     = shorten(&a, sesstitle(s), 60);
+    Str   where = {(u8 *)g->droplabel, (iz)__builtin_strlen(g->droplabel)};
+    ImGui::SetTooltip("%s", cstr0(&a, where.len ? concat(&a, concat(&a, t, "  "), where) : t));
+
+    ImGuiWindow *w    = ImGui::GetCurrentWindow();
+    f32          y    = ImGui::GetIO().MousePos.y;
+    f32          band = 2*lineh;
+    f32          step = 0;
+    if (y < w->InnerRect.Min.y+band && ImGui::GetScrollY() > 0) {
+        step = -8*sc;
+    } else if (y > w->InnerRect.Max.y-band && ImGui::GetScrollY() < ImGui::GetScrollMaxY()) {
+        step = 8*sc;
+    }
+    if (step != 0) {
+        ImGui::SetScrollY(ImGui::GetScrollY() + step);
+        schedat(&g->sched, g->sched.now + 16000, DUE_APP);  // on, the mouse still
+    }
+}
+
 // The sidebar: a "+" for a new session, then the tree (sidebar.cpp) of
 // groups, hosts, sessions and subagents, and the archived.
 static void drawsessions(Gui *g)
 {
     Arena a     = g->frame;
     i64   nowms = os_time(g->os);
+    GuiSession *drag = dragged();
+    g->droplabel[0] = 0;
+    if (g->dragcancel && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        g->dragcancel = 0;
+    }
+    if (drag && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        ImGui::ClearDragDrop();  // nothing is dropped as the button comes up
+        g->dragcancel = 1;
+        drag = 0;
+    }
     if (g->sidedirty) {
         g->sidedirty = 0;
         ImGui::MarkIniSettingsDirty();
@@ -6336,9 +6474,10 @@ static void drawsessions(Gui *g)
             in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, 0, names[i]), 1});
         }
     }
-    in.heads  = in.hosts.len > 1;
-    in.groups = g->groups;
-    in.folds  = g->folds;
+    in.heads   = in.hosts.len > 1;
+    in.groups  = g->groups;
+    in.folds   = g->folds;
+    in.archive = drag != 0;
 
     // Its sessions, each host's newest first
     Slice<GuiSession *> sess = {};
@@ -6416,6 +6555,9 @@ static void drawsessions(Gui *g)
     }
     if (!sess.len) {
         ImGui::TextDisabled("No sessions yet.");
+    }
+    if (drag) {
+        dragrest(g, a, drag);
     }
 }
 

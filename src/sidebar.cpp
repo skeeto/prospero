@@ -64,6 +64,8 @@ struct SideIn {
     Slice<Str>      groups;  // in order, empty ones included
     Map<b32>       *folds;   // the user's choices: 1 folded, 0 open
     b32             heads;   // host headings shown
+    b32             archive; // the Archived heading shown even if empty,
+                             // as a place to drop a session
 };
 
 struct SideRow {
@@ -72,6 +74,7 @@ struct SideRow {
     i32 host;     // SROW_HOST and SROW_SESSION: index into the hosts
     i32 sess;     // SROW_SESSION: index into the sessions, else -1
     Str group;    // SROW_GROUP: its name; else the group it is in, if any
+    b32 archived; // under the Archived heading, or it
     Str key;      // its fold key, empty if it does not fold
     b32 folded;   // its rows below are left out
     b32 forced;   // open whatever the user chose
@@ -128,7 +131,7 @@ static void sideplace(SideTree *t, i32 i, i32 root, i32 depth)
 }
 
 // A session's row, then its subagents', unless folded.
-static void sideemit(SideTree *t, i32 i, i32 depth, Str group, i32 level)
+static void sideemit(SideTree *t, i32 i, i32 depth, Str group, b32 archived, i32 level)
 {
     SideSess *s   = &t->in->sess[i];
     SideHost *h   = &t->in->hosts[s->host];
@@ -141,8 +144,9 @@ static void sideemit(SideTree *t, i32 i, i32 depth, Str group, i32 level)
     r.depth  = depth;
     r.host   = s->host;
     r.sess   = i;
-    r.group  = group;
-    r.kids   = any && level<SIDE_DEPTH;
+    r.group    = group;
+    r.archived = archived;
+    r.kids     = any && level<SIDE_DEPTH;
     r.away   = s->host != t->in->sess[t->root[i]].host;
     r.count  = t->size[i];
     r.asks   = t->asks[i];
@@ -161,7 +165,7 @@ static void sideemit(SideTree *t, i32 i, i32 depth, Str group, i32 level)
     Slice<i32> k = t->kids[i];
     for (iz n = 0; n < k.len; n++) {
         if (t->under[k[n]] == i) {
-            sideemit(t, k[n], depth+1, group, level+1);
+            sideemit(t, k[n], depth+1, group, archived, level+1);
         }
     }
 }
@@ -216,8 +220,9 @@ static void sidesection(SideTree *t, Slice<i32> roots, i32 depth, b32 archived,
             r.depth  = depth;
             r.host   = h;
             r.sess   = -1;
-            r.group  = group;
-            r.key    = sidekey(t->a, prefix, sidekey(t->a, "h:", in->hosts[h].key));
+            r.group    = group;
+            r.archived = archived;
+            r.key      = sidekey(t->a, prefix, sidekey(t->a, "h:", in->hosts[h].key));
             r.count  = sum.count;
             r.asks   = sum.asks;
             r.forced = sum.asks;
@@ -230,7 +235,7 @@ static void sidesection(SideTree *t, Slice<i32> roots, i32 depth, b32 archived,
         for (iz n = 0; n < roots.len; n++) {
             SideSess *s = &in->sess[roots[n]];
             if (s->host==h && sidein(s, archived, group)) {
-                sideemit(t, roots[n], depth + (in->heads ? 1 : 0), group, 0);
+                sideemit(t, roots[n], depth + (in->heads ? 1 : 0), group, archived, 0);
             }
         }
     }
@@ -343,9 +348,10 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
 
     // Archived, folded unless opened
     SideSum sum = sidesum(&t, roots, -1, 1, {});
-    if (sum.any) {
+    if (sum.any || in->archive) {
         SideRow r = {};
-        r.kind   = SROW_ARCHIVED;
+        r.kind     = SROW_ARCHIVED;
+        r.archived = 1;
         r.sess   = -1;
         r.key    = "a";
         r.count  = sum.count;
