@@ -3727,43 +3727,37 @@ static void drawqueue(Gui *g, GuiSession *s, Slice<QueueShow> shows, f64 y,
     }
 }
 
-// The session's note, what the latest command from the box came to, or
-// the editor at work on its draft: a toast over the foot of the
-// transcript (r0 to r1), which moves nothing. A note that is not an
-// error fades after a few seconds; an error stays until the next is
-// typed, or its x dismisses it.
-static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
-{
-    enum : i64 { LIFE = 6*1000*1000 };  // µs, as the scheduler counts
-    g->toasted   = 1;
-    g->editshown = 0;
-    Arena a       = g->frame;
-    f32   sc      = g->scale;
-    b32   editing = g->edsess && g->edsess==s && !g->edplan;
-    b32   fresh   = s->noteerr || g->sched.now-s->noteat<LIFE;
-    if (s->note.len && !s->noteerr && fresh) {
-        schedat(&g->sched, s->noteat + LIFE, DUE_CLOCK);
-    }
-    if (!editing && !(s->note.len && fresh)) {
-        return;
-    }
+enum : i64 { TOAST_LIFE = 6*1000*1000 };  // µs, as the scheduler counts
 
+// A toast at the foot of r0 to r1, over what is there, which moves
+// nothing: text, and a button at its right (btn, named name, with tip),
+// with the button's rect as which, or -1. With fit, it is only as wide
+// as its text needs, at the right. True when the button is pressed, or
+// false, also when there is no room.
+static b32 toastbox(Gui *g, Str text, u32 color, u32 edge, Str btn, Str name,
+                    char const *tip, i32 which, ImVec2 r0, ImVec2 r1, b32 fit = 0)
+{
+    Arena       a    = g->frame;
+    f32         sc   = g->scale;
     ImGuiStyle &st   = ImGui::GetStyle();
     f32         pad  = 8*sc;
     f32         room = r1.x - r0.x - st.ScrollbarSize - 24*sc;
     f32         w    = 560*sc<room ? 560*sc : room;
     if (w < 120*sc) {
-        return;  // no room
+        return 0;  // no room
     }
-    Str  text = editing ? concat(&a, concat(&a, "Editing in ", g->edname), "...") : s->note;
-    Str  btn  = editing ? Str("Cancel") : Str("\xc3\x97");  // a multiplication sign
-    f32  bw   = ImGui::CalcTextSize(cstr0(&a, btn)).x + 2*st.FramePadding.x;
-    f32  tw   = w - 2*pad - bw - st.ItemSpacing.x;
-    f32  th   = ImGui::CalcTextSize(cstr0(&a, text), 0, false, tw).y;
-    f32  fh   = ImGui::GetFrameHeight();
-    f32  h    = (th>fh ? th : fh) + 2*pad;
-    u32  edge = s->noteerr && !editing ? g->pal->bad : g->pal->rule;
-    ImGui::SetCursorScreenPos(v2(r0.x + 12*sc, r1.y - h - 10*sc));
+    Str  label = concat(&a, btn, "##toastx");
+    f32  bw    = ImGui::CalcTextSize(cstr0(&a, btn)).x + 2*st.FramePadding.x;
+    if (fit) {
+        f32 need = ImGui::CalcTextSize(cstr0(&a, text)).x + 2*pad + bw + st.ItemSpacing.x;
+        w = need<w ? need : w;
+    }
+    f32  tw    = w - 2*pad - bw - st.ItemSpacing.x;
+    f32  th    = ImGui::CalcTextSize(cstr0(&a, text), 0, false, tw).y;
+    f32  fh    = ImGui::GetFrameHeight();
+    f32  h     = (th>fh ? th : fh) + 2*pad;
+    f32  x     = fit ? r1.x - st.ScrollbarSize - 12*sc - w : r0.x + 12*sc;
+    ImGui::SetCursorScreenPos(v2(x, r1.y - h - 10*sc));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, g->pal->frame);
     ImGui::PushStyleColor(ImGuiCol_Border, edge);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6*sc);
@@ -3772,31 +3766,57 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                       ImGuiWindowFlags_NoSavedSettings);
     ImGui::SetCursorPos(v2(pad, pad + (fh>th ? (fh-th)/2 : 0)));
-    ImGui::PushStyleColor(ImGuiCol_Text, editing      ? g->pal->paneltext :
-                                         s->noteerr   ? g->pal->bad : g->pal->paneldim);
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
     ImGui::PushTextWrapPos(pad + tw);
     ImGui::TextUnformatted(cstr0(&a, text));
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
     itemnamed(g, "toast");
     ImGui::SetCursorPos(v2(w - pad - bw, pad));
-    if (editing) {
-        if (ImGui::Button("Cancel")) {
-            editcancel(g);
-        }
-        ImGui::SetItemTooltip("Stop the editor, leaving the draft as it was");
-        itemrect(g, RECT_EDITCANCEL);
-        g->editshown = 1;
-    } else {
-        if (ImGui::Button(cstr0(&a, concat(&a, btn, "##toastx")))) {
-            s->note = {};
-        }
-        itemnamed(g, "dismiss");
-        ImGui::SetItemTooltip("Dismiss");
+    b32 pressed = ImGui::Button(cstr0(&a, label));
+    if (name.len) {
+        itemnamed(g, name);
+    }
+    ImGui::SetItemTooltip("%s", tip);
+    if (which >= 0) {
+        itemrect(g, which);
     }
     ImGui::EndChild();
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(2);
+    return pressed;
+}
+
+// The session's note, what the latest command from the box came to, or
+// the editor at work on its draft: a toast over the foot of the
+// transcript (r0 to r1). A note that is not an error fades after a few
+// seconds; an error stays until the next is typed, or its x dismisses
+// it.
+static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
+{
+    g->toasted   = 1;
+    g->editshown = 0;
+    Arena a       = g->frame;
+    b32   editing = g->edsess && g->edsess==s && !g->edplan;
+    b32   fresh   = s->noteerr || g->sched.now-s->noteat<TOAST_LIFE;
+    if (s->note.len && !s->noteerr && fresh) {
+        schedat(&g->sched, s->noteat + TOAST_LIFE, DUE_CLOCK);
+    }
+    if (editing) {
+        Str text = concat(&a, concat(&a, "Editing in ", g->edname), "...");
+        if (toastbox(g, text, g->pal->paneltext, g->pal->rule, "Cancel", "",
+                     "Stop the editor, leaving the draft as it was",
+                     RECT_EDITCANCEL, r0, r1)) {
+            editcancel(g);
+        }
+        g->editshown = 1;
+    } else if (s->note.len && fresh) {
+        if (toastbox(g, s->note, s->noteerr ? g->pal->bad : g->pal->paneldim,
+                     s->noteerr ? g->pal->bad : g->pal->rule,
+                     "\xc3\x97", "dismiss", "Dismiss", -1, r0, r1)) {  // a multiplication sign
+            s->note = {};
+        }
+    }
 }
 
 static void drawtranscript(Gui *g)
@@ -9159,8 +9179,7 @@ static void drawcfgtemplate(Gui *g, Str model)
         Str val  = trim({(u8 *)g->tplval, (iz)__builtin_strlen(g->tplval)});
         Str key  = startswith(name, "template.") ? name : concat(&a, "template.", name);
         if (!name.len) {
-            g->cfgstatus = "A template argument needs a name";
-            g->cfgok     = 0;
+            cfgsay(g, "A template argument needs a name", 0);
         } else {
             guiconfigset(g, "model", model, key, val.len ? val : Str(""));
             g->tplname[0] = g->tplval[0] = 0;
@@ -9448,8 +9467,7 @@ static void drawcfgadd(Gui *g)
             Buf eb(&a, 128);
             print(&eb, cfgtitle(&a, kind, name));
             print(&eb, " already exists");
-            g->cfgstatus = clone(&g->perm, finish(&eb));
-            g->cfgok     = 0;
+            cfgsay(g, finish(&eb), 0);
             cfgselect(g, kind, name);
             g->cfgshowsel = 1;
             ImGui::CloseCurrentPopup();
@@ -9561,6 +9579,25 @@ static void cfgeditbutton(Gui *g, Arena a, Str path, b32 exists)
                                         "edit it by hand in your editor"));
 }
 
+// What the latest change in Settings came to, as a toast over the foot
+// of the page (r0 to r1), as the transcript's (drawtoast): an error stays until
+// dismissed or replaced, and anything else fades.
+static void drawcfgtoast(Gui *g, ImVec2 r0, ImVec2 r1)
+{
+    b32 fresh = !g->cfgok || g->sched.now-g->cfgstatusat<TOAST_LIFE;
+    if (!g->cfgstatus.len || !fresh) {
+        return;
+    }
+    if (g->cfgok) {
+        schedat(&g->sched, g->cfgstatusat + TOAST_LIFE, DUE_CLOCK);
+    }
+    u32 c = g->cfgok ? g->pal->ok : g->pal->bad;
+    if (toastbox(g, g->cfgstatus, c, g->cfgok ? g->pal->rule : c,
+                 "\xc3\x97", "settings dismiss", "Dismiss", -1, r0, r1, 1)) {  // a multiplication sign
+        g->cfgstatus = {};
+    }
+}
+
 static void drawsettings(Gui *g)
 {
     Arena a  = g->frame;
@@ -9620,11 +9657,6 @@ static void drawsettings(Gui *g)
         }
         ImGui::PopStyleColor();
         ImGui::SetItemTooltip("Show the problems found in the files, with where each is");
-    }
-    if (g->cfgstatus.len) {
-        ImGui::PushStyleColor(ImGuiCol_Text, g->cfgok ? g->pal->ok : g->pal->bad);
-        ImGui::TextWrapped("%s", cstr0(&a, g->cfgstatus));
-        ImGui::PopStyleColor();
     }
 
     if (g->cfglinked && !g->cfgset && !g->cfgget) {
@@ -9716,6 +9748,9 @@ static void drawsettings(Gui *g)
         }
         g->rects[RECT_PAGECOMBO] = {at.x, at.y, at.x+w, at.y+ImGui::GetFrameHeight()};
     }
+    // The toast goes over the page, clear of the list, else the window
+    ImVec2 t0 = ImGui::GetWindowPos();
+    ImVec2 t1 = v2(t0.x + ImGui::GetWindowSize().x, t0.y + ImGui::GetWindowSize().y);
     if (!(find && !g->cfgtwopane && !g->cfgfindhid)) {
         if (ImGui::BeginChild("##page", v2(0, 0))) {
             drawcfgpage(g);
@@ -9723,7 +9758,10 @@ static void drawsettings(Gui *g)
             hs = hs>m ? hs : m;
         }
         ImGui::EndChild();
+        t0 = ImGui::GetItemRectMin();
+        t1 = ImGui::GetItemRectMax();
     }
+    drawcfgtoast(g, t0, t1);
     drawcfgadd(g);
     drawcfgdel(g);
     f32 m = ImGui::GetScrollMaxX();

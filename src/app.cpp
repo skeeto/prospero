@@ -1311,6 +1311,7 @@ struct Gui {
     i64                cfgcreate;  // config.set {create} in flight, 0 if none
     Str                cfgstatus;  // the latest config.set outcome
     b32                cfgok;      // and whether it worked
+    i64                cfgstatusat; // µs, when (cfgsay)
 
     // Compose box: the editor a draft is out in (one at a time), and
     // what the box's popups have open
@@ -3442,6 +3443,15 @@ static b32  hostready(Gui *, GuiHost *);
 static void fieldput(char *, Str);
 static void setnote(Gui *, GuiSession *, Str, b32);
 
+// What a change in Settings came to, shown as a toast (drawcfgtoast).
+static void cfgsay(Gui *g, Str text, b32 ok)
+{
+    g->cfgstatus   = clone(&g->perm, text);
+    g->cfgok       = ok;
+    g->cfgstatusat = g->sched.now;
+    scheddirty(&g->sched);
+}
+
 // A worktree session of a session, busy or not (fork {side:1,
 // worktree}): a side chat that works in a new worktree, on a branch cut
 // from its original's HEAD, named so, else as the engine picks. Shown
@@ -4943,8 +4953,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         if (g->cfgrefresh == id) {
             g->cfgrefresh = 0;
             g->cfgrefreshed++;
-            g->cfgstatus = ok ? Str("Includes fetched again") : clone(&g->perm, err);
-            g->cfgok     = ok;
+            cfgsay(g, ok ? Str("Includes fetched again") : err, ok);
         }
         if (ok) {
             loadcfg(g, line);
@@ -4958,8 +4967,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             if (ok) {
                 cfgeditrun(g, scratch, jsonstr(jsonget(j, "path")));
             } else {
-                g->cfgstatus = clone(&g->perm, concat(&scratch, "Not created: ", err));
-                g->cfgok     = 0;
+                cfgsay(g, concat(&scratch, "Not created: ", err), 0);
             }
             guiconfigget(g);
             return;
@@ -4972,18 +4980,17 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             g->cfgdelid = 0;
         }
         g->cfgsets++;
-        g->cfgok = ok;
         Buf b(&scratch, 256);
         if (ok && del) {
             print(&b, "Deleted ");
             print(&b, g->cfgdelwhat);
             print(&b, " from ");
-            print(&b, jsonstr(jsonget(j, "path")));
+            print(&b, basename(jsonstr(jsonget(j, "path"))));  // the full path is above
         } else if (ok) {
             Str path = jsonstr(jsonget(j, "path"));
             i64 at   = jsonint(jsonget(j, "line"), 0);
             print(&b, at ? Str("Saved: ") : Str("Removed from "));
-            print(&b, path);
+            print(&b, basename(path));
             if (at) {
                 putbyte(&b, ':');
                 print(&b, at);
@@ -4992,7 +4999,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             print(&b, "Not saved: ");
             print(&b, err);
         }
-        g->cfgstatus = clone(&g->perm, finish(&b));
+        cfgsay(g, finish(&b), ok);
         guiconfigget(g);
     } return;
     }
@@ -5407,9 +5414,7 @@ static void cfgeditrun(Gui *g, Arena a, Str path)
         err = concat(&a, "cannot start the editor: ", os_lasterr(g->os, &a));
     }
     if (!p) {
-        g->cfgstatus = clone(&g->perm, err);
-        g->cfgok     = 0;
-        scheddirty(&g->sched);
+        cfgsay(g, err, 0);
         return;
     }
     g->edsess    = 0;
@@ -5517,8 +5522,7 @@ static void editend(Gui *g, i32 status)
             putbyte(&b, ')');
         }
         if (g->edcfg) {
-            g->cfgstatus = clone(&g->perm, finish(&b));
-            g->cfgok     = 0;
+            cfgsay(g, finish(&b), 0);
         } else {
             setnote(g, s, finish(&b), 1);
         }
