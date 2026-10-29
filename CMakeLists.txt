@@ -19,6 +19,28 @@ set(PROSPERO_NAME prospero CACHE STRING "Executable name")
 option(PROSPERO_GUI "Build the GUI (OFF: the headless engine only)" ON)
 option(PROSPERO_DEVTOOLS "The GUI's developer tools, the Metrics pane (always in Debug builds)" OFF)
 option(PROSPERO_STATIC "Link fully statically (Linux: deployed engines)" OFF)
+# The edition: "community", what a source build and the GitHub releases
+# are, or "itch", the itch.io builds (tools/itch.py), named plain
+# "Prospero", with the engines zip (tools/engines.py) embedded, so that
+# deploy needs no engines directory
+set(PROSPERO_EDITION community CACHE STRING "Edition: community or itch")
+set_property(CACHE PROSPERO_EDITION PROPERTY STRINGS community itch)
+set(PROSPERO_ENGINES_ZIP "" CACHE FILEPATH
+    "For the itch edition: prospero-engines-VERSION.zip, embedded")
+if(PROSPERO_EDITION STREQUAL "community")
+  set(prospero_display_name "Prospero Community Edition")
+elseif(PROSPERO_EDITION STREQUAL "itch")
+  set(prospero_display_name "Prospero")
+  if(NOT PROSPERO_GUI)
+    message(FATAL_ERROR "the itch edition is a GUI build")
+  endif()
+  if(NOT IS_ABSOLUTE "${PROSPERO_ENGINES_ZIP}" OR NOT EXISTS "${PROSPERO_ENGINES_ZIP}")
+    message(FATAL_ERROR "the itch edition needs PROSPERO_ENGINES_ZIP, the "
+                        "engines zip's absolute path")
+  endif()
+else()
+  message(FATAL_ERROR "PROSPERO_EDITION is community or itch, not ${PROSPERO_EDITION}")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -191,6 +213,10 @@ if(WIN32)
   # the link time, so the same sources link the same program with any
   # GNU toolchain. Releases check it (tools/pecheck.py).
   target_link_options(prospero PRIVATE -Wl,--no-insert-timestamp)
+endif()
+if(PROSPERO_EDITION STREQUAL "itch")
+  target_compile_definitions(prospero PRIVATE PROSPERO_ITCH=1
+    "PROSPERO_ENGINES_ZIP=\"${PROSPERO_ENGINES_ZIP}\"")
 endif()
 if(PROSPERO_GUI)
   target_compile_definitions(prospero PRIVATE PROSPERO_GUI=1)

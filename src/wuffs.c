@@ -201,3 +201,42 @@ char const *wuffsdecode(void *state, uint8_t *rgba, uint8_t *work, ptrdiff_t wor
     st = frame(s, d, &pb, wuffs_base__make_slice_u8(work, (size_t)worklen));
     return st.repr ? errof(st) : 0;
 }
+
+// Bytes of zeroed, 16-byte aligned state for wuffsinflate.
+ptrdiff_t wuffsinflatestate(void)
+{
+    return (ptrdiff_t)sizeof__wuffs_deflate__decoder();
+}
+
+// Inflate raw DEFLATE (RFC 1951) from src into dst, which it must fill
+// to exactly dstlen bytes, in state, zeroed, of wuffsinflatestate()
+// bytes. dst has room for one byte more, so that a stream longer than
+// dstlen is told from one that ends just there. Returns Wuffs' error, or
+// one of its own, null if none.
+char const *wuffsinflate(void *state, uint8_t *dst, ptrdiff_t dstlen,
+                         uint8_t *src, ptrdiff_t srclen)
+{
+    wuffs_base__status st = wuffs_deflate__decoder__initialize(
+        state, (size_t)wuffsinflatestate(), WUFFS_VERSION,
+        WUFFS_INITIALIZE__ALREADY_ZEROED
+    );
+    if (!wuffs_base__status__is_ok(&st)) {
+        return errof(st);
+    }
+    wuffs_base__io_buffer in  = wuffs_base__ptr_u8__reader(src, (size_t)srclen, 1);
+    wuffs_base__io_buffer out = wuffs_base__ptr_u8__writer(dst, (size_t)dstlen + 1);
+    uint8_t work[WUFFS_DEFLATE__DECODER_WORKBUF_LEN_MAX_INCL_WORST_CASE + 1];
+    st = wuffs_deflate__decoder__transform_io(
+        state, &out, &in, wuffs_base__make_slice_u8(work, sizeof(work))
+    );
+    if (st.repr == wuffs_base__suspension__short_write) {
+        return "#wuffs: inflates to more than expected";
+    } else if (st.repr == wuffs_base__suspension__short_read) {
+        return "#wuffs: cut short";
+    } else if (!wuffs_base__status__is_ok(&st)) {
+        return errof(st);
+    } else if (out.meta.wi != (size_t)dstlen) {
+        return "#wuffs: inflates to less than expected";
+    }
+    return 0;
+}

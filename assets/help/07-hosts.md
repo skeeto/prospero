@@ -77,7 +77,8 @@ it went, for connecting. Engines come from an `engines` directory next
 to the executable, or from one beside `prospero.ini` (Settings shows
 where) when the first has none for the platform, as releases name them, or are the executable itself when it
 is built for that platform. The engines zip (`tools/engines.py --zip`)
-unpacks into either place. With `deploy = auto` in the
+unpacks into either place. The itch.io build of Prospero has every
+engine built in, so it needs neither. With `deploy = auto` in the
 remote's section, connecting deploys one when the machine has none.
 Otherwise (`deploy = ask`, the default) the connection fails, saying
 why.

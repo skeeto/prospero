@@ -155,7 +155,14 @@ def windows(args, ver, arch):
 
 
 def sources():
-    """The working tree's files: tracked, and untracked but not ignored."""
+    """The working tree's files: tracked, and untracked but not ignored;
+    or, in an unpacked source tarball (tools/dist.py), which is no git
+    checkout, every file there, its deps/ included."""
+    if not os.path.exists(os.path.join(ROOT, ".git")):
+        names = []
+        for d, _, files in os.walk(ROOT):
+            names += [os.path.relpath(os.path.join(d, f), ROOT) for f in files]
+        return sorted(names)
     out = subprocess.run(["git", "-C", ROOT, "ls-files", "-z", "--cached", "--others",
                           "--exclude-standard"], capture_output=True, check=True).stdout
     names = sorted({n for n in out.decode().split("\0") if n})

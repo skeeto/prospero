@@ -615,6 +615,7 @@ static Str istr(Arena *a, i64 v)
 #include "deskhelp.cpp"
 #include "test/desktop_test.cpp"
 #include "test/image_test.cpp"  // after deskhelp.cpp: dkpng
+#include "test/zip_test.cpp"
 #include "dbus.cpp"
 #include "test/dbus_test.cpp"
 #include "test/door_test.cpp"
@@ -692,6 +693,7 @@ int main()
     test_eval(&t);
     test_desktop(&t);
     test_image(&t);
+    test_zip(&t);
     test_dbus(&t);
     test_door(&t);
     #if PROSPERO_GUI

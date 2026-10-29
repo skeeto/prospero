@@ -30,6 +30,11 @@ extern "C" {
     // Decode the first frame into width*height RGBA pixels, zeroed where
     // it does not cover them. Wuffs' error, or null.
     char const *wuffsdecode(void *state, u8 *rgba, u8 *work, iz worklen);
+    // Bytes of zeroed, 16-byte aligned state for an inflate.
+    iz          wuffsinflatestate(void);
+    // Inflate raw DEFLATE into exactly dstlen bytes of dst, which has room
+    // for dstlen+1. Wuffs' error, or null.
+    char const *wuffsinflate(void *state, u8 *dst, iz dstlen, u8 *src, iz srclen);
 }
 
 enum : i32 {

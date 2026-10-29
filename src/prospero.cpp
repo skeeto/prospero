@@ -13,6 +13,15 @@
 #  define PROSPERO_VERSION "0.0.0"
 #endif
 
+// The edition (CMakeLists.txt): the itch.io builds are plain Prospero,
+// and source builds, as the GitHub releases, the Community Edition
+#if PROSPERO_ITCH
+#  define PROSPERO_TITLE "Prospero"
+#else
+#  define PROSPERO_TITLE "Prospero Community Edition"
+#endif
+#define PROSPERO_ITCH_URL "https://skeeto.itch.io/prospero"
+
 
 // Platform API
 //
@@ -602,6 +611,7 @@ static u32     os_guilimits(Os *);
 #include "edit.cpp"
 #include "png.cpp"
 #include "image.cpp"
+#include "zip.cpp"    // after png.cpp and image.cpp: zcrc32, wuffsinflate
 #include "desktop.cpp"
 #include "tools.cpp"
 #include "guard.cpp"

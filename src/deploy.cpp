@@ -880,6 +880,63 @@ struct DeployFile {
     b32 self;   // it is self, not from dir
 };
 
+// The engines zip an itch.io build embeds (CMakeLists.txt), else none
+#ifdef PROSPERO_ENGINES_ZIP
+#  ifdef __clang__
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wc23-extensions"
+#  endif
+static u8 const engineszipbytes[] = {
+    #embed PROSPERO_ENGINES_ZIP
+};
+#  ifdef __clang__
+#    pragma clang diagnostic pop
+#  endif
+static Str engineszip()
+{
+    return Str((u8 *)engineszipbytes, countof(engineszipbytes));
+}
+#else
+static Str engineszip()
+{
+    return {};
+}
+#endif
+
+// The embedded engine for a platform, its helper, and their hashes,
+// extracted into dir (in the state directory), unless there already,
+// for deployread to take as from any engines directory. Null if ok,
+// none in it included, else why not, in perm.
+static Str deployunpack(Os *os, Arena *perm, Arena scratch, Str zip, Str dir,
+                        DeployNames *names)
+{
+    Str top    = "prospero-engines-" PROSPERO_VERSION "/engines/";
+    Str want[] = {names->engine, names->desktop};
+    for (iz i = 0; i < countof(want); i++) {
+        for (i32 sums = 0; sums < 2; sums++) {
+            Arena   a    = scratch;
+            Str     name = sums ? concat(&a, want[i], ".sha256") : want[i];
+            ZipRead zr   = zipread(&a, zip, concat(&a, top, name), DEPLOY_MAXSIZE);
+            if (zr.missing) {
+                break;  // no such engine, helper or hash
+            } else if (zr.err.len) {
+                return concat(perm, "the built-in engines: ", zr.err);
+            }
+            Str  path = join(&a, dir, name);
+            Read have = os_read(os, &a, path, DEPLOY_MAXSIZE);
+            if (have.err==READ_OK && have.data==zr.data) {
+                continue;
+            }
+            if (!os_mkdirs(os, a, dir) ||
+                    !os_writemode(os, a, path, zr.data, sums ? 0644 : 0755)) {
+                Str why = concat(&a, "cannot write ", path);
+                return concat(perm, why, concat(&a, ": ", os_lasterr(os, &a)));
+            }
+        }
+    }
+    return {};
+}
+
 // The engines directories, unless given, in the order they are looked
 // in: "engines" next to this program, then "engines" in the
 // configuration directory, beside prospero.ini, where the release's
@@ -1217,6 +1274,16 @@ static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str 
     dirs = conf->engines.len ? push(&scratch, dirs, conf->engines)
                              : enginesdirs(os, &scratch, exe);
     DeployNames names = deploynames(&scratch, pf.name, ext);
+    // Last, the built-in engines, if this build has them (itch.io's)
+    Str zip = engineszip();
+    if (zip.len && !conf->engines.len) {
+        Str built = join(&scratch, conf->localstate, "deploy/engines");
+        Str why   = deployunpack(os, perm, scratch, zip, built, &names);
+        if (why.len) {
+            return deployfail(&d, perm, scratch, why);
+        }
+        dirs = push(&scratch, dirs, built);
+    }
 
     // The engine from the first directory with one, else this program
     // when it serves; its helper from the same place
@@ -1571,7 +1638,8 @@ static Str deployusage =
 "  --force             replace another build of this version there\n"
 "  --engines DIR       the engines to choose from (default: engines\n"
 "                      next to this program, else engines beside the\n"
-"                      default prospero.ini)\n"
+"                      default prospero.ini, else those built in, in\n"
+"                      an itch.io build)\n"
 "  --wsl DISTRO        a WSL distro, through wsl.exe\n"
 "  --ssh-program PROG  ssh itself (default: ssh)\n"
 "  --scp-program PROG  scp itself (default: scp)\n"

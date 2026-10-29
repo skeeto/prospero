@@ -43,6 +43,13 @@ The GUI's developer tools, the Metrics pane for now, are in Debug
 builds only, unless `-DPROSPERO_DEVTOOLS=ON` adds them to another, such
 as one for measuring performance.
 
+A source build is the Community Edition, as the GitHub releases are:
+its window title says so, and an empty transcript asks those who use
+Prospero professionally to buy the [itch.io][itch] build. That build,
+`-DPROSPERO_EDITION=itch`, is plain Prospero, and needs
+`-DPROSPERO_ENGINES_ZIP=PATH`, the engines zip (below), which it
+carries built in, so that deploy needs no engines directory.
+
 ## Releases
 
 Each release on GitHub carries six files:
@@ -106,4 +113,18 @@ macOS engine on the Mac itself. All are optimized for size:
 The same sources build the same zip, byte for byte, laid out as a
 release's.
 
+### itch.io builds
+
+`tools/itch.py` builds the [itch.io][itch] edition, for macOS and
+Windows, on a Mac with Docker, from a source tarball of a commit: the
+engines as above, the Windows ones signed with `aas-sign` and the macOS
+one with the Developer ID, packed, then embedded in `Prospero.app`
+(signed, tested, on a notarized disk image) and in the Windows program
+(built in the toolchain image, signed with `aas-sign`). Without
+`aas-sign`, the Developer ID in the keychain, or notary credentials
+(`--notary-profile`, from `xcrun notarytool store-credentials`), it
+builds nothing. `--push` uploads the two with [butler][].
+
 [w64devkit]: https://github.com/skeeto/w64devkit
+[itch]: https://skeeto.itch.io/prospero
+[butler]: https://itch.io/docs/butler/

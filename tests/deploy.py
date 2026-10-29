@@ -32,6 +32,10 @@ turn with a shell command in it. Engines it put in ~/.prospero there, and
   uv run tests/deploy.py --prospero build/prospero --ssh XPHOST \\
       --no-tunnel --shell "sh -s" \\
       --remote-root C:/DOCUME~1/USER/LOCALS~1/Temp/prospero-deploy real
+
+With --builtin, "real" deploys the engines built into the program (an
+itch.io build, tools/itch.py), as they are extracted into its state
+directory, rather than an engines directory.
 """
 
 import argparse
@@ -849,8 +853,16 @@ def real(t):
     before = rsh(a, "ls -a .prospero 2>/dev/null; echo end")
     madedir = "end" in before and not before.strip().startswith(".")
     argv = [t.prospero, "deploy", a.ssh, "--engines", engines, "--state", t.local]
+    env = None
+    if a.builtin:
+        # An itch.io build's own engines, extracted into the state
+        # directory, as no engines directory is given, and none is beside
+        # the default prospero.ini, in a configuration directory of ours
+        engines = os.path.join(t.local, "deploy", "engines")
+        argv = [t.prospero, "deploy", a.ssh, "--state", t.local]
+        env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(t.root, "config"))
     t0 = time.monotonic()
-    p = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=900, env=env)
     took = time.monotonic() - t0
     t.check(p.returncode == 0, f"deploy exit {p.returncode}: {p.stderr}")
     shown = p.stdout.strip()
@@ -870,7 +882,7 @@ def real(t):
     t.check(rec.get("sha256") == sha256(local), f"record {rec}")
     there = rsh(a, f"sha256sum .prospero/{name}")
     t.check(there.split()[:1] == [sha256(local)], f"there: {there!r}")
-    q = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+    q = subprocess.run(argv, capture_output=True, text=True, timeout=600, env=env)
     t.check(q.returncode == 0 and "already deployed" in q.stderr, f"again: {q.stderr}")
     t.check("uploading" not in q.stderr, "uploaded again")
 
@@ -962,6 +974,9 @@ def main():
     ap.add_argument("--no-tunnel", action="store_true",
                     help="the ssh host cannot forward a port back")
     ap.add_argument("--shim", help="Windows: the program of tests/shim_win32.c")
+    ap.add_argument("--builtin", action="store_true",
+                    help="real: deploy the engines built into the program "
+                         "(an itch.io build), not those next to it")
     ap.add_argument("-v", action="store_true")
     ap.add_argument("names", nargs="*")
     args = ap.parse_args()

@@ -30,7 +30,9 @@ pane. Engines come
 from the `engines` directory next to the executable, or when it has
 none for the platform, the one beside the default `prospero.ini`, named
 `prospero-engine-VERSION-OS-ARCH`, or are the executable itself when it
-is built for that platform. `tools/engines.py` builds them: macOS
+is built for that platform. An itch.io build carries every engine
+built in, used when neither directory has one: it extracts it into the
+state directory's `deploy/engines`, and deploys it from there. `tools/engines.py` builds them: macOS
 arm64, Windows x86-64 and i686, and Linux aarch64 and x86-64 (static,
 in the Docker image with `--docker`, or else on a Linux host given
 with `--linux HOST`, else left out).

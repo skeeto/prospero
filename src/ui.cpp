@@ -3819,6 +3819,36 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
     }
 }
 
+#if !PROSPERO_ITCH
+// The Community Edition's greeting, in an empty transcript: drawn here
+// alone, never an event of the session, so no model, export or engine
+// sees it. The itch.io builds leave the transcript blank.
+static void drawgreeting(Gui *g, ImVec2 wpos, f32 winh, f32 width)
+{
+    f32 sc   = g->scale;
+    f32 wrap = width<480*sc ? width : 480*sc;
+    f32 x    = wpos.x + (width - wrap)/2;
+    // A group, whose lines all begin at its left
+    ImGui::SetCursorScreenPos(v2(x, wpos.y + winh/3));
+    ImGui::BeginGroup();
+    ImGui::PushTextWrapPos(x + wrap - wpos.x + ImGui::GetScrollX());
+    ImGui::TextUnformatted("Welcome to Prospero Community Edition.");
+    ImGui::Dummy(v2(0, 6*sc));
+    ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
+    ImGui::TextUnformatted("If you use Prospero professionally, please consider");
+    ImGui::PopStyleColor();
+    if (ImGui::TextLink("buying a copy at itch.io")) {
+        followlink(g, PROSPERO_ITCH_URL);
+    }
+    ImGui::SameLine(0, 0);
+    ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
+    ImGui::TextUnformatted(" to support the project.");
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+    ImGui::EndGroup();
+}
+#endif
+
 static void drawtranscript(Gui *g)
 {
     GuiSession *gs = g->sess ? g->sess : &g->nosession;
@@ -4190,6 +4220,11 @@ static void drawtranscript(Gui *g)
     if (shows.len) {
         drawqueue(g, g->sess, shows, tail0, wpos, scrolly, winh, width, pad);
     }
+#if !PROSPERO_ITCH
+    if (!v->msgs.len && !shows.len) {
+        drawgreeting(g, wpos, winh, width + 2*pad);
+    }
+#endif
     textkeys(g, v);
 
     gs->stick = scrolly >= ImGui::GetScrollMaxY()-2 || total<=winh;

@@ -8016,7 +8016,7 @@ static void reopen(Gui *g)
         return;
     }
     i64 frames = g->total.frames;  // before the opening draws any
-    if (!os_guiopen(g->os, g, "Prospero")) {
+    if (!os_guiopen(g->os, g, PROSPERO_TITLE)) {
         guilog(g, "cannot open a window");
         return;
     }
@@ -18828,7 +18828,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->sched = newsched(os_ticks(os), 16667);
     g->sched.probing    = probe;
     g->sched.aggressive = aggressive;
-    if (!os_guiopen(os, g, "Prospero")) {
+    if (!os_guiopen(os, g, PROSPERO_TITLE)) {
         os_print(os, 2, "prospero: could not open a window\n");
         return 1;
     }
