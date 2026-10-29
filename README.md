@@ -1,53 +1,58 @@
-# Prospero: a desktop coding harness for local and remote LLMs
+# Prospero: a bloat-free, native AI coding harness with ImGui
 
 <p align="center"><img src="docs/staff.png" width="700" alt="Prospero's staff: a gnarled wooden staff, its grip wrapped in cloth, whose clawed head holds a glowing blue gem"></p>
 
-Prospero is a coding harness: a desktop program in which a language
-model, the agent, works on code through tools. It runs the turn loop,
-the tools (read, write, edit, shell, grep, glob, a todo list,
-background jobs, subagents, and control of the
-desktop), and the processes they start, and
-shows the conversation as it streams. It speaks the OpenAI Chat
-Completions API, so it works with llama.cpp, vLLM, LiteLLM, and hosted
-providers with a compatible API, and Anthropic's Messages API, with
-extended thinking and prompt caching (`[endpoint NAME] kind =
-anthropic`). It is built
-first for models served on your own machines, whose servers are slow
-to start, run out of context, and stall: the harness, not the agent,
-retries, compacts, queues requests at a busy server, and keeps a turn
-from getting stuck.
+Prospero is a native GUI application for Windows, macOS, and Linux that
+connects to an AI model provider, local or remote, allowing AI agents to
+drive your computer to develop software. It plows through intermittent
+errors and keeps at its task while unattended. It speaks the OpenAI Chat
+Completions API, used by llama.cpp, vLLM, LiteLLM, and providers with a
+compatible API. Also Anthropic's Messages API, with extended thinking and
+prompt caching. No providers are configured out of the box.
 
-It is one executable. The engine runs in the same process as the
-window, and needs no daemon or server. The same executable runs
-headless, on another machine over ssh, or in the background after its
-window closes. Each session is an append-only log, from which it
-recovers after a crash. Undo and rewind put back the files the harness
-changed.
+The UI is highly flexible, and you can rearrange the panes as you please
+with dragging and docking. Save your layouts for later in View -> Layouts.
+Unlike conventional ImGui applications, rendering is passive and will not
+consume resources while idle.
+
+It is a single executable, written in C++. In the typical case the engine
+runs in the same process as the window, and needs no daemon or server. The
+same executable can run headless, on another machine over ssh, or in the
+background after its window closes. The engine is lean and portable, and
+runs on computers and operating systems a quarter century old. Imagine a
+coding harness on Windows XP.
+
+Once it's connected to a provider, **you can ask Prospero for help with
+itself**. It will read its own embedded documentation, self-configure, and
+navigate you to any place in its UI.
+
+Prospero's desktop control features allow it to effectively develop, test,
+and debug native GUI applications. On Windows, it especially works well in
+[w64devkit][], making use of its shell and tools if available.
+
+You can start new sessions from the command line, even if there's already
+an instance, by invoking Prospero with a path where the new session will
+be rooted. For example, to start a session here:
+
+    $ prospero .
+
+After no arguments, this is the second most common way to run Prospero.
 
 ## Build
 
-CMake 3.25 or later and a C++20 compiler with `#embed` (GCC 15 or
-later, or a recent Clang):
+CMake 3.25 or later and a C++20 compiler with `#embed`, on macOS, Windows
+([w64devkit][]), or Linux:
 
     $ cmake -B build
     $ cmake --build build
 
-The default build type is Release. Debug builds trap on undefined
-behavior (UBSan), failed assertions included. Dependencies are fetched
-at configure time, each pinned by URL and SHA-256: Dear ImGui (docking
-branch), md4c, FreeType and SDL3 for the GUI, mbedTLS with
-cpp-httplib for HTTP on macOS and Linux, and Wuffs's single-file
+Dependencies are fetched at configure time, pinned by URL and SHA-256:
+Dear ImGui (docking branch), md4c, FreeType and SDL3 for the GUI, mbedTLS
+with cpp-httplib for HTTP on macOS and Linux, and Wuffs's single-file
 release for decoding images everywhere. To build offline, or with a
 modified dependency, put its source under `deps/` (`deps/imgui`,
 `deps/md4c`, `deps/freetype`, `deps/sdl3`, `deps/mbedtls`,
-`deps/cpp-httplib`, and `deps/wuffs` holding `wuffs-v0.4.c`), and it
-is used instead.
-
-On Windows, build the same way from a [w64devkit][] shell, with CMake
-and Ninja on the PATH:
-
-    $ cmake -B build -G Ninja
-    $ cmake --build build
+`deps/cpp-httplib`, and `deps/wuffs` holding `wuffs-v0.4.c`).
 
 The Windows GUI is its own Win32 layer over Direct3D 11, and HTTP goes
 through WinHTTP, so it uses the system's certificates and proxies. The
@@ -68,37 +73,15 @@ advapi32 and winhttp. The i686 build of it is the Windows XP engine:
 On macOS the build also wraps the executable as `Prospero.app` in the
 build directory. There Prospero asks the system whether to trust each
 server's certificate, as Safari does, so a root that a user or an
-administrator added, such as a corporate proxy's, is trusted. On Linux, SDL3 loads X11, Wayland and GL at run time,
-so the GUI build still runs headless where no display libraries exist.
-With `-DPROSPERO_GUI=OFF`, `-DPROSPERO_STATIC=ON` links the headless
-engine fully statically, as `tools/engines.py` does for the Linux
-engines it builds.
+administrator added, such as a corporate proxy's, is trusted. On Linux,
+SDL3 loads X11, Wayland and GL at run time, so the GUI build still runs
+headless where no display libraries exist. With `-DPROSPERO_GUI=OFF`,
+`-DPROSPERO_STATIC=ON` links the headless engine fully statically, as
+`tools/engines.py` does for the Linux engines it builds.
 
 The GUI's developer tools, the Metrics pane for now, are in Debug
 builds only, unless `-DPROSPERO_DEVTOOLS=ON` adds them to another, such
 as one for measuring performance.
-
-### A signed macOS disk image
-
-With a Developer ID Application identity in the keychain, and a
-notarytool profile stored for it (`xcrun notarytool store-credentials
-PROFILE`), three commands build a signed, notarized and stapled disk
-image, `prospero-VERSION-macos-arm64.dmg`, holding `Prospero.app` and a
-link to `/Applications`:
-
-    $ cmake -B build -DPROSPERO_SIGN_IDENTITY="Developer ID Application: NAME (TEAM)" \
-            -DPROSPERO_NOTARY_PROFILE=PROFILE
-    $ cmake --build build
-    $ cmake --build build --target package
-
-A Developer ID identity signs with the hardened runtime and a secure
-timestamp, which notarization requires. Without a notary profile the
-image is signed but not notarized; in CI an App Store Connect API key
-serves instead, through `PROSPERO_NOTARY_KEY` (the `.p8` file),
-`PROSPERO_NOTARY_KEY_ID` and `PROSPERO_NOTARY_ISSUER` in the
-environment (`cmake/notarize.cmake`). The build targets macOS 13 and
-later (`CMAKE_OSX_DEPLOYMENT_TARGET`), for the build machine's own
-architecture.
 
 ## Releases
 
@@ -132,24 +115,10 @@ them, in an `engines` directory next to the executable, which puts each
 helper beside its engine on the remote machine. To use a helper on the
 machine itself, save it next to `prospero` as `prospero-desktop`.
 
-The release workflow (`.github/workflows/release.yml`) builds every
-program from the source tarball alone. The Windows programs are built
-on Linux by [w64devkit][]'s GCC under Wine, the same programs it builds
-on Windows, stripped and with no timestamp, then signed, with an Authenticode signature (Azure Artifact Signing), which
-Windows shows in the file's Properties, under Digital Signatures.
-The macOS app is built and tested on a macOS runner, then signed with
-a Developer ID certificate and notarized by Apple.
-`tools/dist.py` makes
-the source tarball from any commit, the same commit always giving the
-same tar file.
-
-GitHub records each file's SHA-256 digest, shown on the release page
-next to the file. To check the files downloaded into the current
-directory against them all at once:
-
-    $ gh release view vVERSION -R skeeto/prospero --json assets \
-          --jq '.assets[] | .digest[7:] + "  " + .name' |
-          sha256sum -c --ignore-missing
+Windows builds are made on Linux by [w64devkit][] in Wine, and signed with
+Azure Artifact Signing. The macOS app is built and tested on a macOS
+runner, then signed with a Developer ID certificate and notarized by
+Apple.
 
 ### The engines zip
 
@@ -192,44 +161,43 @@ subagents under their parents; the transcript, with markdown, code
 highlighting and selection; tool calls with Undo, and Rewind to any
 message that began a turn; the todo list and background jobs; and the
 prompt. The model's reasoning folds to one line that counts it as it
-streams, which a click opens; `[ui] thinking = open` shows it whole,
-and `hide` leaves it out of the transcript (the session log keeps it,
-and the model still gets it back). Tool rows fold by kind and outcome,
-or all of them with `[ui] tools = fold` or `open`, and a session's
-Tool output and Reasoning buttons (a wrench and screwdriver, a light
-bulb, above the transcript) open everything for that session alone. Cmd/Ctrl+F finds text in the transcript, folded rows included,
-and a code block's Copy button copies its code exactly. A bar above the
-transcript shows how full the context is. A file tool that goes outside the session's working directory,
-or the roots the configuration adds, asks first, and an answer not
-given in time denies it. The settings window edits the configuration
-file in place, changing only the lines it sets, with a page for each
-section. Endpoints, models, roles and remotes are added there, and
-deleted, with the comment just above them, when your own file rather
-than an included one defines them. Closing the window
-while turns run asks whether to stop them, or to keep running in the
-background, with a tray icon to bring the window back. One window
-runs per state directory: launching Prospero again on the same one,
-even while its window is in the background, brings that window
-forward and exits, as does opening the app again on macOS. Under
+streams, which a click opens; `[ui] thinking = open` shows it whole, and
+`hide` leaves it out of the transcript (the session log keeps it, and the
+model still gets it back). Tool rows fold by kind and outcome, or all of
+them with `[ui] tools = fold` or `open`, and a session's Tool output and
+Reasoning buttons (a wrench and screwdriver, a light bulb, above the
+transcript) open everything for that session alone. Cmd/Ctrl+F finds text
+in the transcript, folded rows included, and a code block's Copy button
+copies its code exactly. A bar above the transcript shows how full the
+context is. A file tool that goes outside the session's working directory,
+or the roots the configuration adds, asks first, and an answer not given
+in time denies it. The settings window edits the configuration file in
+place, changing only the lines it sets, with a page for each section.
+Endpoints, models, roles and remotes are added there, and deleted, with
+the comment just above them, when your own file rather than an included
+one defines them. Closing the window while turns run asks whether to stop
+them, or to keep running in the background, with a tray icon to bring the
+window back. One window runs per state directory: launching Prospero again
+on the same one, even while its window is in the background, brings that
+window forward and exits, as does opening the app again on macOS. Under
 Wayland a window already open may only ask for attention, as the
-compositor decides focus. A different `--statedir` (or
-`XDG_STATE_HOME`) is a separate instance. The View menu
-shows and hides the panes and zooms the text for the run (Ctrl+=,
-Ctrl+- and Ctrl+0, Cmd on macOS, or the wheel with the key held);
-`[ui] font_size` (17 pixels by default) sets its size for good. View
-→ Layout, View's first item, arranges the panes as Standard, Compact
-(no right column) or Focus (one session), or as a layout saved under a
-name of its own, kept with the window's layout in the state directory;
-Ctrl+1 to Ctrl+9 (Cmd on macOS) pick them in that order. The window
-opens where it was last, fitted to the displays there are; the first
-time, 1700 by 900 at the display's scale, or maximized on a display
-too small for that. The first run shows Help in front, with Settings
-and Hosts when the configuration names no model and no remote host,
-and none of its endpoints lists a model either; close them once read, as the View menu shows each again. Help → Help
-shows a page on each topic, from getting started to troubleshooting,
-built in from `assets/help`. Its search field (Ctrl+F while Help has the
-focus) lists the sections that have every word typed, headings first,
-and a click goes to that section.
+compositor decides focus. A different `--statedir` (or `XDG_STATE_HOME`)
+is a separate instance. The View menu shows and hides the panes and zooms
+the text for the run (Ctrl+=, Ctrl+- and Ctrl+0, Cmd on macOS, or the
+wheel with the key held); `[ui] font_size` (17 pixels by default) sets its
+size for good. View → Layout, View's first item, arranges the panes as
+Standard, Compact (no right column) or Focus (one session), or as a layout
+saved under a name of its own, kept with the window's layout in the state
+directory; Ctrl+1 to Ctrl+9 (Cmd on macOS) pick them in that order. The
+window opens where it was last, fitted to the displays there are; the
+first time, 1700 by 900 at the display's scale, or maximized on a display
+too small for that. The first run shows Help in front, with Settings and
+Hosts when the configuration names no model and no remote host, and none
+of its endpoints lists a model either; close them once read, as the View
+menu shows each again. Help → Help shows a page on each topic, from
+getting started to troubleshooting, built in from `assets/help`. Its
+search field (Ctrl+F while Help has the focus) lists the sections that
+have every word typed, headings first, and a click goes to that section.
 
 `prospero DIR`, such as `prospero .` in a terminal, opens a new
 session in that directory, in Build mode with the default model,
