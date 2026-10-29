@@ -12835,6 +12835,65 @@ def worktree_side(t):
 
 
 @scenario(bound=40)
+def worktree_from(t):
+    """new {worktree, side_of}: a fresh worktree session started from
+    another, with none of its conversation, listed under it (side_of on
+    its record and in the list), its system prompt naming that session
+    and send_message to report back with, as again once reopened.
+    side_of needs a worktree, and must name a session."""
+    env = gitrepo(t)
+    genv = {k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")}
+    main = os.path.realpath(t.work)
+    h = t.headless(env=genv)
+    try:
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake")
+        parent = r["sid"]
+        wtturn(t, h, parent, "the original's secret")
+
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake",
+                   worktree={"name": "from-one"}, side_of=parent)
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        path = os.path.join(main, ".prospero", "worktrees", "from-one")
+        h.wait(lambda e: e.get("ev") == "worktree" and e.get("path") == path, 60)
+        first = sessionlog(t, sid)[0]
+        t.check(first.get("side_of") == parent and first.get("cwd") == path and
+                "src" not in first.get("worktree", {}) and "forked_from" not in first,
+                f"its record: {first}")
+        h.call("list")
+        entry = [e for e in h.all("sessions")[-1]["list"] if e["sid"] == sid]
+        t.check(entry and entry[0].get("side_of") == parent, f"listed under it: {entry}")
+
+        wtturn(t, h, sid, "the fresh work")
+        msgs = t.requests(wtmodel(t))[-1]["body"]["messages"]
+        text = json.dumps(msgs)
+        t.check("the original's secret" not in text, "none of the conversation")
+        system = json.dumps(msgs[0]["content"])
+        t.check(parent in system and "send_message" in system and
+                "prospero/from-one" in system, "the prompt names its session")
+
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake", side_of=parent)
+        t.check(r.get("ok") == 0 and "worktree" in r.get("err", ""), f"no worktree: {r}")
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake", worktree={},
+                   side_of="20990101-000000-dead")
+        t.check(r.get("ok") == 0 and "must name a session" in r.get("err", ""),
+                f"no such session: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+    h = t.headless(env=genv)
+    try:
+        h.call("open", sid=sid)
+        wtturn(t, h, sid, "reopened")
+        system = json.dumps(t.requests(wtmodel(t))[-1]["body"]["messages"][0]["content"])
+        t.check(parent in system and "send_message" in system, "told again once reopened")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=40)
 def worktree_hole(t):
     """A session in the main checkout asks before writing into a worktree
     session's tree, and the answer holds there, while the worktree

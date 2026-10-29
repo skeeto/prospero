@@ -81,7 +81,9 @@ works, nested under its session, the selection quoted in its box; its
 agent is told to leave files alone. A worktree session, from the New
 session dialog's New worktree, that menu, or `/worktree`, works in a
 git worktree Prospero makes in `.prospero/worktrees`, on a branch of
-its own, and removes once its sessions are archived, if clean. The prompt box keeps a draft
+its own, and removes once its sessions are archived, if clean. One
+started from a session begins fresh, nested under it, and reports its
+branch back to it with `send_message` when asked. The prompt box keeps a draft
 per session, with the engine, has the session's earlier prompts on Up
 and Down, opens the draft in an editor with Ctrl+G (`[ui] editor`,
 else `$VISUAL` or `$EDITOR`), and takes `/compact`, `/model`,

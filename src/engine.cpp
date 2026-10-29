@@ -12822,6 +12822,9 @@ static void logsession(Session *s, Arena scratch)
         putintkey(&w.json, "nofolder", 1);
     }
     wtrecord(s, &w.json);
+    if (s->wt.from.len && !s->wt.src.len) {
+        putstrkey(&w.json, "side_of", s->wt.from);  // a fork's copy has its own
+    }
     ssend(s, &w);
 }
 
@@ -14515,6 +14518,11 @@ static Str taskmodel(Config *c, Str model, Str rolemodel, Str prefer)
 // host: of role general unless one is given, on the model the call gave,
 // else the role's, else the parent's own if this host has its endpoint
 // (taskmodel), its first turn the task's, its report a task.report.
+// With worktree {name?}, it works in a worktree of its own (wtnew), and
+// with side_of SID as well, it is a worktree session started from that
+// session, under which a sidebar shows it: fresh, with none of its
+// conversation, but told that session's id, to report its work to it
+// for merging (wtpromptline).
 static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str  cwd   = jsonstr(jsonget(j, "cwd"));
@@ -14644,6 +14652,19 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
             return;
         }
     }
+    Json *sidej  = jsonget(j, "side_of");
+    Str   sideof = jsonstr(sidej);
+    if (sidej->type != JSON_MISSING) {
+        Str rec = join(&scratch, join(&scratch, join(&scratch, e->statedir, "sessions"),
+                                      sideof), "events.jsonl");
+        if (wtask->type == JSON_MISSING) {
+            reply(e, scratch, id, 0, "side_of is for a worktree session: give worktree too", {});
+            return;
+        } else if (!validsid(sideof) || os_stat(e->os, scratch, rec).type!=STAT_FILE) {
+            reply(e, scratch, id, 0, "side_of must name a session", {});
+            return;
+        }
+    }
 
     Str      sid = freshsid(e, &scratch);
     Session *s   = newsession(e, scratch, sid);
@@ -14693,6 +14714,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
             dropsession(e, s);
             return;
         }
+        s->wt.from = clone(&s->perm, sideof);
     }
 
     Str why = opensession(s, scratch);

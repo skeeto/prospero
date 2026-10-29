@@ -144,8 +144,8 @@ Right-click a session in the sidebar, or open the Session menu, for:
   a copy of its folder.
 - **Start a side chat**: a fork you can make while the agent works
   (below).
-- **Start a worktree session...**: the same, working in a worktree of
-  its own (below).
+- **Start a worktree session...**: a fresh session, nested under this
+  one, working in a worktree of its own (below).
 - **Switch model**: a configured model, or another typed in.
 - **Switch shell**: a `[shell]` section of your configuration, or
   `bash` or `zsh` (not on Windows), `sh`, `powershell` or `cmd` where found, as the picker beside the model's
@@ -206,9 +206,12 @@ on a branch of its own, so that it can change and commit files while
 other sessions work in the folder. Start one from a folder with New
 worktree in the New session dialog, or from a session with Start a
 worktree session... in the transcript's right-click menu or the Session
-menu, or `/worktree [NAME]`. The second is a side chat in a worktree:
-a copy of the whole conversation, made even while the agent works,
-nested under its session, its first prompt giving its title.
+menu, or `/worktree [NAME]`. The second starts fresh, with none of
+the session's conversation, on the session's model, nested under it,
+made even while its agent works; the selection, if any, is quoted in
+its box, and its first prompt gives its title. Its agent knows which
+session it came from: once its work is done, ask it to report to that
+session, which can then review and merge its branch.
 
 - **Where**: `.prospero/worktrees/NAME` in the repository's main
   checkout, on branch `prospero/NAME` (`[worktree] branch_prefix`),
@@ -219,7 +222,9 @@ nested under its session, its first prompt giving its title.
 - **Making it**: git checks it out in the background; the session is
   there at once, and its first turn waits, "making the worktree".
 - **The agent** is told where it works and on which branch, to commit
-  there, and to leave the main checkout alone. Sessions in the main
+  there, and to leave the main checkout alone. One started from a
+  session is told that session's id, and to report its branch and
+  commits there with `send_message` when done or asked. Sessions in the main
   checkout ask before changing files in a worktree.
 - **Archived or deleted**: once every session working in a worktree is,
   it is removed if git calls it clean, and its branch deleted only if

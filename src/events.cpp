@@ -260,6 +260,8 @@ static Str capnames[] = {
     "worktree",        // new {worktree}, git {cwd}: a worktree session, the
                        // state "worktree", worktree on the session record,
                        // and transient worktree records
+    "worktree.side",   // new {worktree, side_of}: a fresh worktree session
+                       // started from another, side_of in its record
 };
 
 static Str evname(i32 ev)

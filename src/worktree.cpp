@@ -1082,12 +1082,12 @@ static WtSess wtfrom(Arena *a, Json *j)
     return wt;
 }
 
-// A session's worktree, from its record, and for a side chat in one,
-// the session it began as a copy of.
+// A session's worktree, from its record, and the session it was started
+// from, if any: a side chat's original, or a fresh one's (new {side_of}).
 static void wtload(Session *s, Json *rec)
 {
     s->wt = wtfrom(&s->perm, jsonget(rec, "worktree"));
-    s->wt.from = s->wt.src.len ? clone(&s->perm, jsonstr(jsonget(rec, "side_of"))) : Str{};
+    s->wt.from = s->wt.name.len ? clone(&s->perm, jsonstr(jsonget(rec, "side_of"))) : Str{};
 }
 
 // The system prompt's line for a new worktree session.
@@ -1108,6 +1108,15 @@ static Str wtpromptline(Session *s, Arena *a)
     print(&b, wt->main);
     print(&b, ": work and commit here, on this branch, and leave the main "
               "checkout and other worktrees alone.");
+    if (s->wt.from.len && !s->wt.src.len) {
+        // Started fresh from another session (new {side_of})
+        print(&b, " This session was started from the session ");
+        print(&b, s->wt.from);
+        print(&b, ", and has none of its conversation. When your work is done, "
+                  "or when asked, report it to that session with send_message: "
+                  "the branch, its commits and what they change, so that it "
+                  "can review and merge them.");
+    }
     return finish(&b);
 }
 

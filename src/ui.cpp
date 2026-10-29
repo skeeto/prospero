@@ -3625,9 +3625,9 @@ static void sideitem(Gui *g, View *v, b32 sep)
         wtdialog(g, s, sidequote(&a, copysel(v, &a, COPY_MARKDOWN)));
     }
     if (!wwhy.len) {
-        ImGui::SetItemTooltip("A new session of this conversation that works in a new "
+        ImGui::SetItemTooltip("A fresh session under this one that works in a new "
                               "worktree, on a branch of its own from this folder's HEAD, "
-                              "while this one works on");
+                              "and can report its work back here");
     }
 }
 
@@ -5751,8 +5751,8 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
     }
     older |= !hostcap(h, "side");
     if (menutip(g, &a, "Start a worktree session\xe2\x80\xa6", wtwhy(g, s),
-                "A fork that works in a new worktree, on a branch of its own, even "
-                "while this session's agent works")) {
+                "A fresh session under this one that works in a new worktree, on a "
+                "branch of its own, and can report its work back here")) {
         wtdialog(g, s, {});
     }
     older |= !hostcap(h, "worktree");
@@ -7645,8 +7645,8 @@ static b32 wtfields(Gui *g, Arena a, GuiHost *host, Str cwd)
     return 1;
 }
 
-// A worktree session of g->wtsess (fork {side, worktree}): its name, and
-// what it starts from.
+// A worktree session of g->wtsess (guiworktree): its name, and what it
+// starts from.
 static void drawwt(Gui *g)
 {
     f32         sc   = g->scale;
@@ -7672,8 +7672,12 @@ static void drawwt(Gui *g)
         ImGui::PopStyleColor();
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->paneldim);
-        ImGui::TextWrapped("A copy of \"%s\" that works in a new worktree, on a branch of its "
-                           "own, while this session works on",
+        ImGui::TextWrapped(hostcap(s->host, "worktree.side")
+                           ? "A fresh session under \"%s\", with none of its conversation, "
+                             "that works in a new worktree, on a branch of its own, and can "
+                             "report its work back to it"
+                           : "A copy of \"%s\" that works in a new worktree, on a branch of "
+                             "its own, while this session works on",
                            cstr0(&a, shorten(&a, sesstitle(s), 60)));
         ImGui::PopStyleColor();
         ImGui::Spacing();

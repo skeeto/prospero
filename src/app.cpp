@@ -3452,26 +3452,42 @@ static void cfgsay(Gui *g, Str text, b32 ok)
     scheddirty(&g->sched);
 }
 
-// A worktree session of a session, busy or not (fork {side:1,
-// worktree}): a side chat that works in a new worktree, on a branch cut
-// from its original's HEAD, named so, else as the engine picks. Shown
-// once made, idle, with the quote, if any, as its draft (onsesscmd).
+// A worktree session of a session, busy or not: a fresh session, none
+// of the original's conversation, in a new worktree on a branch cut
+// from its HEAD, named so, else as the engine picks, on the original's
+// model, shown under it (new {worktree, side_of}), and told its id to
+// report back to. Shown once made, idle, with the quote, if any, as its
+// draft (onreply). An engine from before worktree.side makes a side
+// chat in a worktree instead, a copy of the conversation (fork {side:1,
+// worktree}, onsesscmd).
 static void guiworktree(Gui *g, GuiSession *s, Str name, Str quote)
 {
-    Arena a = newarena(g->cmdr);
-    Buf   b(&a, 256 + name.len);
-    EvOut w = cmdopen(g, &b, CMD_FORK, s);
-    putintkey(&w.json, "side", 1);
+    Arena a    = newarena(g->cmdr);
+    b32   side = hostcap(s->host, "worktree.side");
+    Str   ep   = side && s->view ? s->view->endpoint : Str{};
+    Str   mod  = side && s->view ? s->view->model : Str{};
+    Buf   b(&a, 512 + name.len + s->cwd.len + ep.len + mod.len);
+    EvOut w = side ? cmdopen(g, &b, CMD_NEW, 0, s->host) : cmdopen(g, &b, CMD_FORK, s);
+    if (side) {
+        putstrkey(&w.json, "cwd", s->view ? s->view->cwd : s->cwd);
+        if (ep.len) putstrkey(&w.json, "endpoint", ep);
+        if (mod.len) putstrkey(&w.json, "model", mod);
+        putstrkey(&w.json, "side_of", s->sid);
+        putintkey(&w.json, "attended", 1);
+    } else {
+        putintkey(&w.json, "side", 1);
+    }
     putkey(&w.json, "worktree");
     putobject(&w.json);
     if (name.len) putstrkey(&w.json, "name", name);
     putend(&w.json);
-    for (i32 i = 0; quote.len && i<REQ_MAX; i++) {
+    for (i32 i = 0; i < REQ_MAX; i++) {
         if (g->reqs[i].id == g->nextid) {
-            g->reqs[i].quote = clone(&g->perm, quote);
+            g->reqs[i].s     = s;  // the original, for a new's reply
+            g->reqs[i].quote = quote.len ? clone(&g->perm, quote) : Str{};
         }
     }
-    s->cmdid   = g->nextid;
+    s->cmdid   = side ? 0 : g->nextid;
     s->cmdtext = {};
     s->note    = {};
     cmdsend(g, &w, a);
@@ -4705,7 +4721,10 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         if (mine) {
             g->newid = 0;
         }
-        if (!ok) {
+        if (!ok && q.s) {
+            setnote(g, q.s, concat(&scratch, "No worktree session: ", err), 1);
+            return;
+        } else if (!ok) {
             g->newerr  = clone(&g->perm, err);
             g->opennew = 1;
             return;
@@ -4714,7 +4733,15 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         s = s ? s : addsess(g, h, r->sid);
         sessview(g, s);
         setcur(g, s);
-        if (mine) {
+        if (q.s) {
+            // A worktree session of q.s (guiworktree): under it, idle,
+            // the quote to write under, the box ready for it
+            s->sideof = clone(&g->perm, q.s->sid);  // until the list says
+            setdraft(g, s, q.quote);
+            setnote(g, s, concat(&scratch, "worktree session of ",
+                                 shorten(&scratch, sesstitle(q.s), 60)), 0);
+        }
+        if (mine || q.s) {
             g->promptfocus = 1;
         }
         guilist(g, h);
@@ -10404,6 +10431,8 @@ enum : i32 {
     CHK_LINKWEB,      // the web link last followed is text
     CHK_WTPROBE,      // the worktree dialogs' probe allows one, dx changes left
     CHK_WORKTREE,     // the session shown works in a worktree, on branch text...
+    CHK_WTFRESH,      // the session shown, from the worktree dialog, is fresh,
+                      // nested under its original
     CHK_COUNT,
 };
 
@@ -10656,6 +10685,7 @@ static Str chknames[] = {
     "Help scrolled to the link's section", "the web link was followed",
     "the folder can have a worktree, its changes counted",
     "the session works in its worktree, on its branch",
+    "the worktree session starts fresh, under its original",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -13711,7 +13741,7 @@ static DriveOp changesops[] = {
     {OP_WAIT, W_WORKTREE, 0, 0, 10000, "prospero/"},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_WORKTREE, 0, 0, 0, "prospero/"},
-    // And one from it, as a side chat in a worktree of its own
+    // And one from it, fresh, under it, in a worktree of its own
     {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
@@ -13726,6 +13756,8 @@ static DriveOp changesops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_SIDECHAT, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
+    {OP_CHECK, CHK_WTFRESH, 0, 0, 0, ""},
     {OP_PROMPT, 0, 0, 0, 0, "In another worktree."},
     {OP_WAIT, W_IDLE, 0, 0, 30000, ""},
     {OP_WAIT, W_WORKTREE, 0, 0, 10000, "prospero/"},
@@ -16924,6 +16956,12 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_WTPROBE:
         return ImGui::GetTopMostPopupModal() && g->wtp.got && g->wtp.ok &&
                g->wtp.dirty==(i64)g->ops[g->drivepc-1].dx && g->wtp.oid.len==40;
+    case CHK_WTFRESH: {
+        GuiSession *s = g->sess;
+        GuiSession *o = g->wtsess;
+        return s && o && s!=o && sessside(s)==o->sid && sessnest(g, s)==o->sid &&
+               !lastof(v, VIEW_USER) && !lastof(v, VIEW_ASSISTANT);
+    }
     case CHK_WORKTREE: {
         // Its folder in the main checkout's .prospero/worktrees, and the
         // list says so, with the branch's name
