@@ -1494,6 +1494,17 @@ static ViewJob *findjob(View *v, i64 n)
     return 0;
 }
 
+// A job's output's end, in a buffer of its own kept for the updates.
+static void jobtailput(View *v, ViewJob *jb, Str tail)
+{
+    if (tail.len > jb->tailcap) {
+        jb->tailcap = tail.len>4096 ? tail.len : 4096;
+        jb->tail    = allocbytes(&v->aux, jb->tailcap);
+    }
+    copybytes(jb->tail, tail.data, tail.len);
+    jb->taillen = tail.len;
+}
+
 static i32 vjobstatus(Str s)
 {
     for (i32 i = 0; i < VJOB_COUNT; i++) {
@@ -2364,14 +2375,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         if (!jb || jb->status!=VJOB_RUNNING) {
             return 0;  // ended already
         }
-        Str tail = jsonstr(jsonget(j, "tail"));
-        if (tail.len > jb->tailcap) {
-            jb->tailcap = tail.len>4096 ? tail.len : 4096;
-            jb->tail    = allocbytes(&v->aux, jb->tailcap);
-        }
-        copybytes(jb->tail, tail.data, tail.len);
-        jb->taillen = tail.len;
-        jb->bytes   = jsonint(jsonget(j, "bytes"), jb->bytes);
+        jobtailput(v, jb, jsonstr(jsonget(j, "tail")));
+        jb->bytes = jsonint(jsonget(j, "bytes"), jb->bytes);
     } return 1;
 
     case EV_JOBEND: {
@@ -2396,6 +2401,10 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         jb->killing = 0;
         Str spill = jsonstr(jsonget(j, "spill"));
         jb->spill = spill.len ? clone(&v->aux, spill) : jb->spill;
+        Str tail = jsonstr(jsonget(j, "tail"));  // none from older engines
+        if (tail.len) {
+            jobtailput(v, jb, tail);
+        }
     } return 1;
 
     case EV_SNAP: {

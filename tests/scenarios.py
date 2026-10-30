@@ -1128,6 +1128,7 @@ def job_notice(t):
     je = r.last("job.end")
     t.check(je.get("status") == "exited" and je.get("exit") == 0 and je.get("resume") == 1,
             f"job.end {je}")
+    t.check(je.get("tail") == "done-42\n", f"its output's end, for the Jobs pane: {je}")
     text = r.last("notice").get("text", "")
     t.check("exited with code 0" in text and "done-42" in text, f"notice {text!r}")
     t.check("Saw: Background job 1 ended: it exited with code 0" in r.text(),

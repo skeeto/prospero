@@ -5417,7 +5417,7 @@ static void jobend(Session *s, Arena scratch, Job *j)
     b32  resume = tell && !busy(s) && canresume(s);
     {
         Arena a = scratch;
-        Buf   b(&a, 512);
+        Buf   b(&a, 512 + JOB_NOTICE);
         EvOut w = sbegin(s, &b, EV_JOBEND);
         putintkey(&w.json, "job", j->n);
         putstrkey(&w.json, "call", j->call);
@@ -5432,6 +5432,11 @@ static void jobend(Session *s, Arena scratch, Job *j)
         putintkey(&w.json, "ms", j->ran/MS);
         putintkey(&w.json, "notice", tell);
         putintkey(&w.json, "resume", resume);
+        // Its output's end, as the Jobs pane shows it after a reload
+        Str tail = jobtail(os, &a, j->spill);
+        if (tail.len) {
+            putstrkey(&w.json, "tail", tail);
+        }
         ssend(s, &w);
     }
     if (!tell) {

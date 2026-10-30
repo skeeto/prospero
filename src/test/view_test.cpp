@@ -901,6 +901,12 @@ static void test_viewpanels(Test *t)
         out = apply(v, a, R"({"sid":"s","ts":0,"ev":"job.out","job":1,"call":"c1","tail":"late","bytes":9})");
         expect(t, "panels.jobended", concat(&a, istr(&a, out), vjobnames[j->status]), "0exited");
         expect(t, "panels.jobexit", istr(&a, j->hasexit*10 + j->exit + j->ms), "510");
+        expect(t, "panels.jobkept", Str{j->tail, j->taillen}, "one\ntwo\n");
+        // A reloaded log has no job.out, but its end has the output's end
+        apply(v, a, R"({"sid":"s","seq":7,"ts":0,"ev":"job.end","job":3,"call":"c3","status":"exited",)"
+                    R"("exit":0,"bytes":4,"spill":"out/c3.log","ms":5,"tail":"x\ny\n"})");
+        ViewJob *j3 = findjob(v, 3);
+        expect(t, "panels.jobtail", Str{j3->tail, j3->taillen}, "x\ny\n");
         viewstopped(v);
         expect(t, "panels.jobstopped", vjobnames[findjob(v, 2)->status], "unknown");
         expect(t, "panels.jobnone", istr(&a, v->jobsrun), "0");
