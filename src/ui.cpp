@@ -3377,19 +3377,20 @@ static Str blocktext(Arena *a, Doc *d, DocBlock *b)
 }
 
 // A document (DocView) in a child window filling the rest of the window
-// at the cursor: laid out at its width whole, as a document is short,
-// its text selectable, with the text's context menu, and its keys while
-// the window has focus, scrolled to its section heading named d->section
+// at the cursor, or with fit, one fit wide and as tall as the document,
+// unscrolled: laid out at its width whole, as a document is short, its
+// text selectable, with the text's context menu, and its keys while the
+// window has focus, scrolled to its section heading named d->section
 // once laid out. Returns the destination of a link clicked, if any,
 // which is the caller's to follow.
-static Str drawdoc(Gui *g, DocView *d, char const *id)
+static Str drawdoc(Gui *g, DocView *d, char const *id, f32 fit = 0)
 {
     View       *v     = d->v;
     f32         sc    = g->scale;
     ImGuiStyle &st    = ImGui::GetStyle();
     ImVec2      avail = ImGui::GetContentRegionAvail();
     f32         pad   = 4*sc;
-    f32         width = avail.x - st.ScrollbarSize - 2*pad;
+    f32         width = fit>0 ? fit - 2*pad : avail.x - st.ScrollbarSize - 2*pad;
     width = (f32)(i32)(width<50*sc ? 50*sc : width);
     FontMetrics fm    = fontmetrics(&g->fonts, 0);
     f32         charw = fontadvance(&g->fonts, 0, 'n');
@@ -3425,7 +3426,12 @@ static Str drawdoc(Gui *g, DocView *d, char const *id)
         ImGui::SetNextWindowScroll(v2(-1, (f32)d->scrollto));
         d->scrollto = -1;
     }
-    ImGui::BeginChild(id, v2(0, 0));
+    if (fit > 0) {
+        ImGui::BeginChild(id, v2(fit, (f32)total + 2*pad), 0,
+                          ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse);
+    } else {
+        ImGui::BeginChild(id, v2(0, 0));
+    }
     d->win = ImGui::GetCurrentWindow();
     ImVec2   wpos = ImGui::GetWindowPos();
     TextArea ta   = {v, wpos, ImGui::GetWindowHeight(), width, pad, pad,
@@ -3954,35 +3960,34 @@ static void drawtrashtoast(Gui *g, i32 pane, f32 lift)
 }
 
 #if !PROSPERO_ITCH
-// The Community Edition's greeting, in an empty transcript: drawn here
-// alone, never an event of the session, so no model, export or engine
-// sees it. The itch.io builds leave the transcript blank.
+#ifdef __clang__
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wc23-extensions"
+#endif
+static u8 const greetingmd[] = {
+    #embed "../assets/greeting.md"
+};
+#ifdef __clang__
+#  pragma clang diagnostic pop
+#endif
+
+// The Community Edition's greeting, assets/greeting.md, in an empty
+// transcript: drawn here alone, never an event of the session, so no
+// model, export or engine sees it. The itch.io builds leave the
+// transcript blank.
 static void drawgreeting(Gui *g, ImVec2 wpos, f32 winh, f32 width)
 {
     f32 sc   = g->scale;
     f32 wrap = width<480*sc ? width : 480*sc;
-    f32 x    = wpos.x + (width - wrap)/2;
-    // A group, whose lines all begin at its left
-    ImGui::SetCursorScreenPos(v2(x, wpos.y + winh/3));
-    ImGui::BeginGroup();
-    ImGui::PushTextWrapPos(x + wrap - wpos.x + ImGui::GetScrollX());
-    ImGui::TextUnformatted("Welcome to Prospero Community Edition.");
-    ImGui::Dummy(v2(0, 6*sc));
-    ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
-    ImGui::TextUnformatted("If you use Prospero professionally, please consider");
-    ImGui::PopStyleColor();
-    if (ImGui::TextLink("buying a copy at itch.io")) {
-        followlink(g, PROSPERO_ITCH_URL);
+    if (!g->greeting) {
+        g->greeting = newdocview(&g->perm, g->os, g->vcache);
+        docset(g->greeting, {(u8 *)greetingmd, countof(greetingmd)});
     }
-    ImGui::SameLine(0, 0);
-    ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
-    ImGui::TextUnformatted(" to support the project.");
-    ImGui::Dummy(v2(0, 6*sc));
-    ImGui::TextUnformatted("The Professional Edition can deploy agents across "
-                           "operating systems and architectures.");
-    ImGui::PopStyleColor();
-    ImGui::PopTextWrapPos();
-    ImGui::EndGroup();
+    ImGui::SetCursorScreenPos(v2(wpos.x + (width - wrap)/2, wpos.y + winh/3));
+    Str link = drawdoc(g, g->greeting, "##greeting", wrap);
+    if (link.len) {
+        followlink(g, link);
+    }
 }
 #endif
 

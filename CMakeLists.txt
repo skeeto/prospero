@@ -129,12 +129,14 @@ endif()
 
 # The core embeds the seed configuration (config.cpp), the Help pages
 # and the built-in skill (help.cpp) with #embed, and the GUI its fonts
-# (fonts.cpp) and, on X11 and Wayland, its window icon (gui_sdl.cpp),
-# which not every compiler lists as dependencies.
+# (fonts.cpp), the Community Edition's greeting (ui.cpp) and, on X11
+# and Wayland, its window icon (gui_sdl.cpp), which not every compiler
+# lists as dependencies.
 file(GLOB prospero_help CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/assets/help/*.md)
 set_property(SOURCE src/main_posix.cpp src/main_win32.cpp src/main_test.cpp
   APPEND PROPERTY OBJECT_DEPENDS ${prospero_help}
   ${PROJECT_SOURCE_DIR}/assets/skills/prospero/SKILL.md
+  ${PROJECT_SOURCE_DIR}/assets/greeting.md
   ${PROJECT_SOURCE_DIR}/assets/prospero.ini
   ${PROJECT_SOURCE_DIR}/assets/Roboto-Medium.ttf
   ${PROJECT_SOURCE_DIR}/assets/JetBrainsMono-Regular.ttf

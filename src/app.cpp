@@ -1238,6 +1238,7 @@ struct Gui {
     Changes            changes;    // the Changes pane's
     i32                helppage;   // the Help window's topic (HELP_*)
     DocView           *helpdoc;    // and its page, null until first shown
+    DocView           *greeting;   // the Community Edition's, null until shown
     i32                helpshown;  // the topic in helpdoc, plus one
     b32                helpnarrow; // its topics were a combo, not a list
     i64                helpframe;  // the frame they were last drawn in

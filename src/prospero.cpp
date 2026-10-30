@@ -20,7 +20,6 @@
 #else
 #  define PROSPERO_TITLE "Prospero Community Edition"
 #endif
-#define PROSPERO_ITCH_URL "https://skeeto.itch.io/prospero"
 
 
 // Platform API
