@@ -73,7 +73,10 @@ gui --quit-after S --shot FILE`, SDL builds only):
 
     $ uv run tools/showcase.py --prospero build/Prospero.app --work ~/src/mandel build-showcase
     $ uv run tools/showcase.py --prospero build/Prospero.app build-showcase --open --shot docs/screenshot.png
-    $ sips -Z 1728 docs/screenshot.png
+    $ sips -Z 1440 docs/screenshot.png
+
+`--theme dark` takes the same shot in dark colors, as
+`docs/screenshot-dark.png`, which the itch.io page shows.
 
 ## Evals
 

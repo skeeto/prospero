@@ -19,15 +19,17 @@ the real engine: its tools really read, edit, build and run the
 project. The session in front planned in plan mode (a plan approved
 here), keeps a todo list, ran two subagents, and read the renders before
 and after its change, which the transcript shows as images. Others
-round out the sidebar, one with subagents of its own.
+round out the sidebar, one with subagents of its own. Two background
+jobs, a large render and a few timings, fill the Jobs pane.
 
 --open serves the same model again and opens the window on DIR's state,
 on the session in front, which keeps the window's size and layout from
 one opening to the next: arranged once, the screenshot can be taken
 again from the same state. --shot FILE then has the GUI save its window
-as a PNG after --wait seconds (SDL builds only), and quit. The PNG is
-uncompressed at the display's scale; for the README, scale it to 1728
-pixels wide, which also compresses it (macOS: sips -Z 1728 FILE). Making DIR anew needs
+as a PNG after --wait seconds (SDL builds only), and quit; --theme dark
+takes it in dark colors. The PNG is uncompressed at the display's
+scale; for the README, scale it to 1440 pixels wide, which also
+compresses it (macOS: sips -Z 1440 FILE). Making DIR anew needs
 a C compiler, git, and an empty or missing DIR.
 """
 
@@ -193,16 +195,29 @@ the hard bands in `renders/banded.bmp`.
 
 SUMMARY = """## 🌈 Smooth coloring is in
 
-The bands are gone: shades follow the **normalized iteration count**.
+The bands are gone. Each pixel's shade now follows the **normalized
+iteration count**, μ = n + 1 − log₂(log |z|), so pixels one iteration
+apart differ by a fraction of a shade instead of jumping across the
+palette, and the larger escape radius keeps μ accurate.
 
 | | Before | After |
 |---|---|---|
 | Coloring | `palette[n % 16]` | cosine gradient at √(μ/512) |
 | Escape radius | 2 | 256 |
-| Render, 960×600 | 0.21 s | 0.22 s ⏰ |
+| Render, 960×600 | 0.18 s | 0.20 s ⏰ |
+
+- `renders/smooth.bmp` is the default view. `renders/smooth-4k.bmp`, from
+  job 1, is the same view at 3840×2400, where the spirals of the seahorse
+  tails show the most detail.
+- Job 2's five timings agree with the first: `log2` and `cos` run once a
+  pixel, after the iteration loop, so the cost stays within the noise.
 
 Next, a `-p` flag to pick among palettes? 🎨
 """
+
+# The background jobs the session in front starts once it builds
+JOB_4K = "./mandel 3840 2400 >renders/smooth-4k.bmp && du -h renders/smooth-4k.bmp"
+JOB_TIME = "TIMEFORMAT='%R s'; for i in 1 2 3 4 5; do time ./mandel >/dev/null; done"
 
 # Each conversation by a phrase of its first prompt, and its step: how
 # many responses it has had so far
@@ -331,12 +346,21 @@ def sc_showcase(model, n, req):
             yield from do(model, n, req, [("shell", {
                 "command": "make && time ./mandel >renders/smooth.bmp"})])
         elif s == 10:
-            yield from do(model, n, req, [("todo_write", {"todos": todo(5, 0, TODO)})],
-                          said="Built clean, 0.22 s against 0.21 s before.\n")
+            yield from do(model, n, req, [
+                ("shell", {"command": JOB_4K, "background": True}),
+                ("shell", {"command": JOB_TIME, "background": True})],
+                said="Built clean, 0.20 s against 0.18 s before. A full-size render "
+                     "and a few more timings can run in the background meanwhile.\n")
         elif s == 11:
+            # Long enough for both jobs to end, whose notices then come
+            # with the next request, not as turns of their own
+            yield F.S.sleep(6)
+            yield from do(model, n, req, [("todo_write", {"todos": todo(5, 0, TODO)})])
+        elif s == 12:
             yield from do(model, n, req, [("read", {"path": "renders/smooth.bmp"})],
-                          thought="Last, the render itself, to see that the bands are "
-                                  "gone. A palette flag is a separate change; I'll ask.")
+                          thought="Both jobs ended cleanly, and the timings agree. Last, "
+                                  "the render itself, to see that the bands are gone. A "
+                                  "palette flag is a separate change; I'll ask.")
         else:
             yield from say(model, req, SUMMARY)
     elif k == SURVEY:
@@ -495,7 +519,7 @@ class Engine:
             self.p.wait()
 
 
-def config(url):
+def config(url, theme="light"):
     return ("# The showcase's configuration (tools/showcase.py)\n"
             "endpoint = local\n"
             f"model = {MODEL}\n"
@@ -503,6 +527,7 @@ def config(url):
             "# Tool rows open, for the renders' thumbnails\n"
             "[ui]\n"
             "tools = open\n"
+            f"theme = {theme}\n"
             "\n"
             "[endpoint local]\n"
             f"url = {url}\n"
@@ -590,7 +615,7 @@ def open_(args, prospero, d):
     serve()
     srv, url = F.start()
     with open(ini, "w") as f:
-        f.write(config(url + "/v1"))
+        f.write(config(url + "/v1", args.theme))
     env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(d, "config"))
     with open(os.path.join(d, "showcase.json")) as f:
         info = json.load(f)
@@ -636,8 +661,10 @@ def main():
     ap.add_argument("--open", action="store_true", help="open the window on DIR")
     ap.add_argument("--shot", help="with --open: save the window to this PNG, and quit")
     ap.add_argument("--wait", type=int, default=8, help="seconds before --shot")
-    ap.add_argument("--size", default="1714,1045",
-                    help="the window's first size, in points (default: 1714,1045)")
+    ap.add_argument("--size", default="1440,1045",
+                    help="the window's first size, in points (default: 1440,1045)")
+    ap.add_argument("--theme", default="light", choices=("light", "dark"),
+                    help="the window's colors (default: light)")
     ap.add_argument("--work", help="where to make the project (default: DIR/work/mandel)")
     ap.add_argument("dir")
     args = ap.parse_args()
