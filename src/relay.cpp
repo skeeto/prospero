@@ -190,7 +190,7 @@ static Relay *newrelay(Os *os, Arena *perm)
 {
     Relay *r    = alloc<Relay>(perm);
     Int    part = parseint(os_getenv(os, perm, "PROSPERO_TEST_RELAY_PART"));
-    r->part = part.ok && part.val>=64 && part.val<RELAY_PART ? (iz)part.val : RELAY_PART;
+    r->part = part.ok && part.val>=64 && part.val<RELAY_PART ? (iz)part.val : (iz)RELAY_PART;
     return r;
 }
 
@@ -1488,7 +1488,7 @@ static Str relayout(Engine *e, Arena *a, RelayServe *v, Str key)
         putstrkey(&w.json, "headers", v->headers);
         putend(&w.json);
     } else if (key == "body") {
-        iz n = v->held<RELAY_PART ? v->held : RELAY_PART;
+        iz n = v->held<RELAY_PART ? v->held : (iz)RELAY_PART;
         putstr(&w.json, base64(a, Str(v->hold, n)));
     } else {
         putobject(&w.json);
@@ -1523,7 +1523,7 @@ static b32 relayserveout(Engine *e, Arena scratch, RelayServe *v)
     while (v->held) {
         Arena a = scratch;
         if (!relayemit(e, relayout(e, &a, v, "body"), v)) return 0;
-        iz n = v->held<RELAY_PART ? v->held : RELAY_PART;
+        iz n = v->held<RELAY_PART ? v->held : (iz)RELAY_PART;
         v->held -= n;
         copybytes(v->hold, v->hold+n, v->held);  // memmove
     }
