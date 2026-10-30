@@ -33,6 +33,7 @@ its scripts:
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import os
 import random
@@ -393,6 +394,11 @@ class T:
         return P.mine(pid) and " serve " in cmd and state in cmd
 
     def cleanup(self):
+        if os.environ.get("RELAYDEBUG"):
+            for root, _, files in os.walk(self.state):
+                for f in files:
+                    if f.endswith(".log"):
+                        print(open(os.path.join(root, f), errors="replace").read()[-3000:])
         for pid in self.hostpids():
             try:
                 signal_ours(pid, P.KILL, self.ownhost, "host")
@@ -2360,6 +2366,510 @@ def far_wsl(t):
                 "\\\\wsl.localhost\\Ubuntu\\" in desc, f"told {desc!r}")
     finally:
         f.quit()
+
+
+# Thin hosts: model calls relayed through a client (relay.cpp)
+
+def deltaapply(base, ops, n):
+    """delta.cpp's ops applied to base: n bytes, or None if unsound."""
+    out = bytearray()
+    i = 0
+
+    def getv():
+        nonlocal i
+        v, shift = 0, 0
+        while True:
+            c = ops[i]
+            i += 1
+            v |= (c & 0x7f) << shift
+            shift += 7
+            if not c & 0x80:
+                return v
+    try:
+        while i < len(ops):
+            v = getv()
+            m = v >> 1
+            if v & 1:
+                off = getv()
+                if off + m > len(base):
+                    return None
+                out += base[off:off + m]
+            else:
+                out += ops[i:i + m]
+                i += m
+    except IndexError:
+        return None
+    return bytes(out) if len(out) == n else None
+
+
+def thinconfig(t, extra=""):
+    """A thin host's configuration: no endpoint of its own."""
+    with open(t.config, "w", newline="") as f:
+        f.write("[host]\n" + extra)
+
+
+def offer(t, model, machine="testbox", budget=None, name="fake"):
+    ep = {"name": name, "kind": "openai", "first_byte_timeout": "5",
+          "idle_timeout": "5", "progress_timeout": "10", "models": []}
+    if budget:
+        ep["slow_retry_budget"] = str(budget)
+    return {"machine": machine, "endpoint": name, "model": model, "endpoints": [ep],
+            "models": [{"name": model, "settings": {"context": "100000"}}]}
+
+
+class Relayer:
+    """A client relaying a thin host's calls: each relay record's call made
+    here, at the fake provider, its response sent back as relay.data."""
+
+    def __init__(self, t, client):
+        self.t, self.c = t, client
+        self.parts = {}       # rid: (first part, [data, ...])
+        self.bases = {}       # session: the last turn body
+        self.calls = []       # (first part, body), as made
+        self.cancelled = set()
+        self.lock = threading.Lock()
+        self.seen = 0
+        self.stop = False
+        self.mute = False     # takes calls, answers none
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def send(self, obj):
+        obj["cmd"] = "relay.data"
+        self.c.stream.command(obj)
+
+    def run(self):
+        while not self.stop:
+            recs = self.c.all()
+            new, self.seen = recs[self.seen:], len(recs)
+            for r in new:
+                if r.get("ev") != "relay":
+                    continue
+                rid = r["rid"]
+                if r.get("cancel"):
+                    self.cancelled.add(rid)
+                    continue
+                if r["part"] == 0:
+                    self.parts[rid] = (r, [])
+                head, data = self.parts.get(rid, (None, None))
+                if head is None:
+                    continue
+                data.append(base64.b64decode(r["data"]))
+                if r["part"] == r["parts"] - 1:
+                    del self.parts[rid]
+                    threading.Thread(target=self.make, args=(rid, head, b"".join(data)),
+                                     daemon=True).start()
+            time.sleep(0.02)
+
+    def make(self, rid, head, payload):
+        if head.get("zlen"):
+            payload = zlib.decompress(payload, -15)
+        sid = head.get("session", "")
+        if head.get("base"):
+            base = self.bases.get(sid)
+            body = deltaapply(base, payload, head["len"]) if base else None
+            if body is None or "%016x" % fnv(base) != head["base"]:
+                self.send({"rid": rid, "done": {"err": "nobase", "text": "no base"}})
+                return
+        else:
+            body = payload
+        if head.get("keep"):
+            self.bases[sid] = body
+        with self.lock:
+            self.calls.append((head, body))
+        if self.mute:
+            return
+        host, port = self.t.args.url.split("//")[1].rstrip("/").split(":")
+        try:
+            conn = http.client.HTTPConnection(host, int(port), timeout=30)
+            conn.request(head["method"], "/" + head["path"],
+                         body if head["method"] == "POST" else None,
+                         {"Content-Type": "application/json", "Accept": head["accept"]})
+            resp = conn.getresponse()
+            hdrs = "".join(f"{k}: {v}\r\n" for k, v in resp.getheaders())
+            self.send({"rid": rid, "head": {"status": resp.status, "headers": hdrs}})
+            while rid not in self.cancelled:
+                piece = resp.read1(1 << 16)
+                if not piece:
+                    break
+                self.send({"rid": rid, "body": base64.b64encode(piece).decode()})
+            conn.close()
+            if rid not in self.cancelled:
+                self.send({"rid": rid, "done": {"err": "ok", "text": ""}})
+        except OSError as e:
+            self.send({"rid": rid, "done": {"err": "connect", "text": str(e)}})
+
+
+def fnv(data):
+    """base.cpp's hash."""
+    h = 0x100
+    for c in data:
+        h = ((h ^ c) * 1111111111111111111) & 0xffffffffffffffff
+    return h
+
+
+def relayclient(t, model, **kw):
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    r = c.call("relay.offer", offer=offer(t, model, **kw))
+    t.check(r.get("ok") == 1 and r.get("thin") == 1, f"relay.offer: {r}")
+    return c, Relayer(t, c)
+
+
+@scenario
+def relay_turn(t):
+    """A thin host's turn, its calls relayed through the client: listing,
+    then a turn body whole, then the next as a delta against it, its
+    live records naming the computer relaying."""
+    thinconfig(t)
+    model = t.model("remote_tool")
+    c, rl = relayclient(t, model)
+    try:
+        r = c.call("new", cwd=t.work, prompt="go")
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        t.check(finaltext(c.all(), sid).startswith("w0 w1"), "the answer")
+        posts = [(h, b) for h, b in rl.calls if h["method"] == "POST"]
+        t.check(any(h["method"] == "GET" and h["path"].startswith("v1/models")
+                    for h, b in rl.calls), "a listing relayed")
+        t.check(len(posts) == 2 and not posts[0][0].get("base") and posts[1][0].get("base"),
+                f"bodies: {[h.get('base') for h, b in posts]}")
+        h1 = posts[1][0]
+        t.check(h1["size"] < h1["len"] // 4, f"a delta of {h1['size']} for {h1['len']}")
+        t.check(json.loads(posts[1][1])["model"] == model, "the model sent")
+        live = [x for x in c.all() if x.get("ev") == "live" and x.get("sid") == sid
+                and x.get("relay")]
+        t.check(live and live[0]["relay"] == "testbox", "live names the relay")
+    finally:
+        rl.stop = True
+
+
+@scenario
+def relay_pause(t):
+    """No computer relays: the turn pauses, and goes on once one offers.
+    An offer whose computer went still names the endpoint and model."""
+    thinconfig(t)
+    model = t.model("remote_slow")
+    a, rla = relayclient(t, model)
+    rla.stop = True
+    a.stream.disconnect()  # gone: its offer stays, chosen by none
+    b = Client(t)
+    b.attach(reconnect=True)
+    b.call("hello")
+    r = b.call("new", cwd=t.work, prompt="go")
+    t.check(r.get("ok") == 1, f"new: {r}")
+    sid = r["sid"]
+    b.stream.wait(lambda r: r.get("ev") == "live" and r.get("sid") == sid and
+                  r.get("state") == "relay", what="the pause")
+    note = b.stream.wait(lambda r: r.get("ev") == "note" and r.get("sid") == sid,
+                         what="its note")
+    t.check("no connected computer" in note.get("text", ""), f"note {note}")
+    r = b.call("relay.offer", offer=offer(t, model, machine="second"))
+    t.check(r.get("thin") == 1, f"relay.offer {r}")
+    rlb = Relayer(t, b)
+    try:
+        end = b.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+    finally:
+        rlb.stop = True
+
+
+@scenario
+def relay_deadline(t):
+    """Paused past the endpoint's slow_retry_budget: the turn ends."""
+    thinconfig(t)
+    model = t.model("remote_slow")
+    a, rla = relayclient(t, model, budget=2)
+    rla.stop = True
+    a.stream.disconnect()
+    b = Client(t)
+    b.attach(reconnect=True)
+    b.call("hello")
+    sid = b.call("new", cwd=t.work, prompt="go")["sid"]
+    t0 = time.monotonic()
+    end = b.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                        timeout=15, what="turn.end")
+    t.check(end.get("why") == "error" and "relayed" in end.get("err", ""), f"turn.end {end}")
+    t.check(1.5 < time.monotonic() - t0 < 6, "after its budget")
+
+
+@scenario
+def relay_lost(t):
+    """The computer relaying goes in the middle of a response: the turn
+    goes on through another, continuing what was cut off."""
+    thinconfig(t)
+    model = t.model("remote_slow")
+    a, rla = relayclient(t, model, machine="first")
+    b, rlb = relayclient(t, model, machine="second")  # the newest: chosen
+    try:
+        sid = a.call("new", cwd=t.work, prompt="go")["sid"]
+        a.stream.wait(lambda r: r.get("ev") == "delta" and r.get("sid") == sid,
+                      what="output")
+        t.check(not rla.calls or all(h["method"] == "GET" for h, _ in rla.calls),
+                "the newest relays")
+        rlb.stop = True
+        b.stream.disconnect()
+        end = a.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=40, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        t.check(any(h["method"] == "POST" for h, _ in rla.calls), "the other took over")
+        nudged = [x for x in a.all() if x.get("ev") == "nudge" and x.get("sid") == sid]
+        t.check(nudged, "a continue after the interruption")
+    finally:
+        rla.stop = rlb.stop = True
+
+
+@scenario
+def relay_big(t):
+    """A body of many parts goes one part at a time, each as the host makes
+    room for it, through a client whose link holds little (test hooks
+    shrink parts and the link)."""
+    thinconfig(t)
+    model = t.model("remote_tool")
+    c = Client(t)
+    c.attach(env=dict(t.env, PROSPERO_TEST_RELAY_PART="2048",
+                      PROSPERO_TEST_KEEPMAX=str(256 << 10)))
+    c.call("hello")
+    r = c.call("relay.offer", offer=offer(t, model))
+    t.check(r.get("thin") == 1, f"relay.offer {r}")
+    rl = Relayer(t, c)
+    try:
+        sid = c.call("new", cwd=t.work, prompt="go " * 3000)["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=40, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        posts = [h for h, b in rl.calls if h["method"] == "POST"]
+        t.check(posts and posts[0]["parts"] > 2,
+                f"parts: {[(h['parts'], h['len'], h['size'], h.get('zlen')) for h in posts]}")
+        q = fake_provider.STATE.log(model)
+        t.check(q and "go go go" in json.dumps(q[0]["body"]), "the prompt arrived whole")
+    finally:
+        rl.stop = True
+
+
+@scenario
+def relay_queued(t):
+    """The call waits in line at the computer relaying it: no watchdog runs
+    meanwhile, live tells the place, and it goes on once sent."""
+    thinconfig(t)
+    model = t.model("remote_slow")
+    c, rl = relayclient(t, model)
+    rl.mute = True
+    try:
+        sid = c.call("new", cwd=t.work, prompt="go")["sid"]
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not any(h["method"] == "POST" for h, _ in rl.calls):
+            time.sleep(0.05)
+        head = [h for h, _ in rl.calls if h["method"] == "POST"][0]
+        rid = [r for r in c.all() if r.get("ev") == "relay" and r.get("part") == 0
+               and r.get("method") == "POST"][0]["rid"]
+        rl.send({"rid": rid, "queued": {"pos": 2, "len": 3}})
+        live = c.stream.wait(lambda r: r.get("ev") == "live" and r.get("sid") == sid
+                             and r.get("queue_pos") == 2, what="the place in line")
+        t.check(live.get("queue_len") == 3 and live.get("relay") == "testbox", f"live {live}")
+        time.sleep(6)  # past first_byte_timeout
+        t.check(not [r for r in c.all() if r.get("ev") == "retry" and r.get("sid") == sid],
+                "no watchdog fired while queued")
+        rl.send({"rid": rid, "sent": 1})
+        rl.mute = False
+        body = [b for h, b in rl.calls if h["rid"] == rid][0]
+        threading.Thread(target=rl.make, args=(rid, dict(head, base=None, zlen=None), body),
+                         daemon=True).start()
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+    finally:
+        rl.stop = True
+
+
+@scenario
+def relay_restart(t):
+    """A thin host started again, with no offers yet: a session on a
+    relayed endpoint keeps it, pauses, and goes on once one is offered."""
+    thinconfig(t)
+    model = t.model("remote_slow")
+    c, rl = relayclient(t, model)
+    sid = c.call("new", cwd=t.work, prompt="go")["sid"]
+    c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                  timeout=30, what="the first turn")
+    rl.stop = True
+    t.check(c.call("quit").get("ok") == 1, "quit")
+    c.stream.close()
+    time.sleep(1)
+    d = Client(t)
+    d.attach()
+    d.call("hello")
+    t.check(d.call("open", sid=sid).get("ok") == 1, "open")
+    d.call("prompt", sid=sid, text="again")
+    d.stream.wait(lambda r: r.get("ev") == "live" and r.get("sid") == sid and
+                  r.get("state") == "relay", what="the pause")
+    r = d.call("relay.offer", offer=offer(t, model))
+    t.check(r.get("thin") == 1, f"relay.offer {r}")
+    rl2 = Relayer(t, d)
+    try:
+        ends = lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and len([r for r in d.all() if ends(r)]) < 2:
+            time.sleep(0.1)
+        end = [r for r in d.all() if ends(r)][-1]
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        att = [r for r in d.all() if r.get("ev") == "attempt" and r.get("sid") == sid]
+        t.check(att and att[-1]["endpoint"] == "relay://fake", f"attempts {att[-1:]}")
+    finally:
+        rl2.stop = True
+
+
+def varint(v):
+    out = bytearray()
+    while True:
+        c = v & 0x7f
+        v >>= 7
+        out.append(c | (0x80 if v else 0))
+        if not v:
+            return bytes(out)
+
+
+def simpledelta(base, body):
+    """Ops that copy the common prefix and add the rest."""
+    p = 0
+    while p < min(len(base), len(body)) and base[p] == body[p]:
+        p += 1
+    ops = varint(p << 1 | 1) + varint(0) if p else b""
+    if len(body) > p:
+        ops += varint((len(body) - p) << 1) + body[p:]
+    return ops
+
+
+class Served:
+    """relay.call, as a client passes a thin engine's call on to its own
+    engine, and the relay.data records that answer it."""
+
+    def __init__(self, t, c):
+        self.t, self.c = t, c
+        self.next = 0
+
+    def call(self, body, path="v1/chat/completions", base=None, keep=1,
+             endpoint="fake", model=None, session="s1", deflate=False, parts=1):
+        self.next += 1
+        cid = self.next
+        data = body if base is None else simpledelta(base, body)
+        size = len(data)
+        z = None
+        if deflate:
+            co = zlib.compressobj(9, zlib.DEFLATED, -15)
+            z = co.compress(data) + co.flush()
+            data = z
+        n = (len(data) + parts - 1) // parts if parts > 1 else len(data)
+        pieces = [data[i:i + n] for i in range(0, len(data), n)] if parts > 1 else [data]
+        for k, piece in enumerate(pieces):
+            obj = {"cmd": "relay.call", "cid": cid, "origin": "thin", "part": k,
+                   "parts": len(pieces), "data": base64.b64encode(piece).decode()}
+            if k == 0:
+                obj.update(session=session, endpoint=endpoint, anthropic=0, path=path,
+                           method="POST", accept="text/event-stream", model=model or "",
+                           readms=0, keep=keep, len=len(body), size=size)
+                if z is not None:
+                    obj["zlen"] = len(z)
+                if base is not None:
+                    obj["base"] = "%016x" % fnv(base)
+            self.c.stream.command(obj)
+        return cid
+
+    def records(self, cid):
+        return [r for r in self.c.all() if r.get("ev") == "relay.data" and r.get("cid") == cid]
+
+    def done(self, cid, timeout=20):
+        r = self.c.stream.wait(lambda r: r.get("ev") == "relay.data" and r.get("cid") == cid
+                               and "done" in r, timeout, f"call {cid}'s end")
+        return r["done"]
+
+    def text(self, cid):
+        body = b"".join(base64.b64decode(r["body"]) for r in self.records(cid) if "body" in r)
+        return body.decode("utf-8", "replace")
+
+
+def chatbody(model, text):
+    return json.dumps({"model": model, "stream": True,
+                       "messages": [{"role": "user", "content": text}]}).encode()
+
+
+@scenario
+def relay_serve(t):
+    """An engine makes a thin engine's calls at its own endpoint: whole,
+    as a delta against its last body for the session, deflated, in
+    parts; a delta without its base is refused as nobase, and calls
+    outside the API's, or to endpoints it lacks, are refused."""
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    sv = Served(t, c)
+    model = t.model("remote_slow")
+    b1 = chatbody(model, "first")
+    a = sv.call(b1, model=model)
+    d = sv.done(a)
+    t.check(d["err"] == "ok", f"whole: {d}")
+    heads = [r for r in sv.records(a) if "head" in r]
+    t.check(heads and heads[0]["head"]["status"] == 200, f"head {heads}")
+    t.check("w39" in sv.text(a), "the response")
+    cid = c.alllines() and c.all()[-1].get("origin")
+    t.check(cid == "thin", f"its origin as given: {cid!r}")
+
+    b2 = chatbody(model, "first, then more")
+    d = sv.done(sv.call(b2, base=b1, model=model, deflate=True))
+    t.check(d["err"] == "ok", f"delta: {d}")
+    q = fake_provider.STATE.log(model)
+    t.check(q and q[-1]["body"]["messages"][0]["content"] == "first, then more",
+            "the delta made the body")
+
+    big = chatbody(model, "x" * 1500000)
+    d = sv.done(sv.call(big, model=model, parts=3))
+    t.check(d["err"] == "ok", f"parts: {d}")
+
+    d = sv.done(sv.call(b2, base=b"something else", model=model))
+    t.check(d["err"] == "nobase", f"no base: {d}")
+    d = sv.done(sv.call(b2, path="v1/embeddings", model=model))
+    t.check(d["err"] == "connect" and "may make" in d["text"], f"path: {d}")
+    d = sv.done(sv.call(b2, endpoint="nowhere", model=model))
+    t.check(d["err"] == "connect" and "nowhere" in d["text"], f"endpoint: {d}")
+
+    # Cancelled while it streams
+    e = sv.call(chatbody(model, "slow"), model=model)
+    c.stream.wait(lambda r: r.get("ev") == "relay.data" and r.get("cid") == e
+                  and "body" in r, what="a body")
+    c.stream.command({"cmd": "relay.call", "cid": e, "origin": "thin", "cancel": 1})
+    d = sv.done(e)
+    t.check(d["err"] == "cancel", f"cancel: {d}")
+
+
+@scenario
+def relay_offer(t):
+    """offer: this engine's endpoints, with the settings a thin engine
+    needs and never a URL or key, its models flattened through like."""
+    with open(t.config, "a") as f:
+        f.write("key = sk-secret-1234\n[model base]\ncontext = 1000\n"
+                "template.enable_thinking = false\n"
+                "[model kid]\nlike = base\nreasoning_budget = 50\nmax_concurrent = 3\n")
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    r = c.call("offer")
+    t.check(r.get("ok") == 1, f"offer {r}")
+    o = r["offer"]
+    text = json.dumps(o)
+    t.check("sk-secret" not in text and t.args.url.split("//")[1] not in text,
+            "no key, no URL")
+    eps = o["endpoints"]
+    t.check(len(eps) == 1 and eps[0]["name"] == "fake" and eps[0]["kind"] == "openai"
+            and eps[0]["first_byte_timeout"] == "5", f"endpoints {eps}")
+    kid = [m for m in o["models"] if m["name"] == "kid"][0]["settings"]
+    t.check(kid.get("context") == "1000" and kid.get("reasoning_budget") == "50" and
+            kid.get("template.enable_thinking") == "false" and "max_concurrent" not in kid
+            and "like" not in kid, f"kid {kid}")
+    t.check(o.get("endpoint") == "fake", f"default {o.get('endpoint')}")
 
 
 def lanaddress(host):

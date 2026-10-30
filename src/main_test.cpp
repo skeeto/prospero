@@ -481,6 +481,7 @@ static b32   os_connwrite(Os *, Conn *, Str) { return 0; }
 static void  os_connclose(Os *, Conn *) {}
 static Detached os_detach(Os *, Arena, Slice<Str>, Str, Str) { return {}; }
 static i32   os_pid(Os *) { return 1; }
+static Str   os_hostname(Os *, Arena *) { return "test-host.example"; }
 static b32   os_onquit(Os *, Mailbox *, u32) { return 1; }
 static i32   os_responsible(Os *, i32) { return 0; }
 
@@ -617,6 +618,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/image_test.cpp"  // after deskhelp.cpp: dkpng
 #include "test/zip_test.cpp"
 #include "test/delta_test.cpp"
+#include "test/relay_test.cpp"  // after config's test platform
 #include "dbus.cpp"
 #include "test/dbus_test.cpp"
 #include "test/door_test.cpp"
@@ -696,6 +698,7 @@ int main()
     test_image(&t);
     test_zip(&t);
     test_delta(&t);
+    test_relay(&t);
     test_dbus(&t);
     test_door(&t);
     #if PROSPERO_GUI

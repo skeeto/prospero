@@ -99,6 +99,46 @@ static Url parseurl(Str s)
     return r;
 }
 
+// A thin engine's endpoint, whose model calls a connected computer makes
+// (relay.cpp): relay://NAME for kind openai, relay+anthropic://NAME for
+// anthropic, NAME being the [endpoint] section it offered. The URL is
+// the endpoint's identity, the kind included.
+struct RelayUrl {
+    Str name;
+    b32 anthropic;
+    b32 ok;
+};
+
+static b32 relayname(Str name)
+{
+    b32 ok = name.len && name.len<=64;
+    for (iz i = 0; ok && i < name.len; i++) {
+        u8 c = name[i];
+        ok = (c>='a' && c<='z') || (c>='A' && c<='Z') || digit(c) ||
+             c=='.' || c=='_' || c=='-';
+    }
+    return ok;
+}
+
+static RelayUrl relayurl(Str s)
+{
+    RelayUrl r = {};
+    if (startswith(s, "relay://")) {
+        r.name = cuthead(s, 8);
+    } else if (startswith(s, "relay+anthropic://")) {
+        r.name      = cuthead(s, 18);
+        r.anthropic = 1;
+    }
+    r.ok = relayname(r.name);
+    return r;
+}
+
+// An endpoint's URL, real or relayed.
+static b32 endpointurl(Str s)
+{
+    return parseurl(s).ok || relayurl(s).ok;
+}
+
 // The origin with the port always explicit: scheme://host:port.
 static Str urlorigin(Arena *a, Url u)
 {
@@ -1055,6 +1095,7 @@ enum : i32 {
     CLASS_LOOP,           // the model is repeating itself
     CLASS_CANCEL,         // the user stopped it
     CLASS_LIMIT,          // a usage limit: spending, quota
+    CLASS_RELAY,          // the computer relaying it lost it (relay.cpp)
 };
 
 static Str classname(i32 c)
@@ -1066,6 +1107,7 @@ static Str classname(i32 c)
     case CLASS_FATAL:         return "fatal";
     case CLASS_LOOP:          return "loop";
     case CLASS_LIMIT:         return "limit";
+    case CLASS_RELAY:         return "relay";
     }
     return "cancel";
 }

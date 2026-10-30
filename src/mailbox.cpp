@@ -185,6 +185,20 @@ static b32 mailpost(Mailbox *m, u32 type, u64 id, Str data, b32 block)
     return 1;
 }
 
+// Whether a record of len bytes fits with half the buffer left free after
+// it (or, one too large for that, into an empty buffer), and nothing was
+// dropped since the last take: for a producer that holds its records
+// back rather than make the mailbox drop others' (relay.cpp).
+static b32 mailroom(Mailbox *m, iz len)
+{
+    iz need = MAIL_HEADER + len + (-len & 7);
+    os_lock(&m->lock);
+    b32 r = !m->overflow && need<=m->cap &&
+            (need <= m->cap - m->cap/2 - m->len || !m->len);
+    os_unlock(&m->lock);
+    return r;
+}
+
 // Take every record posted since the last take. They remain valid until
 // the next take, which hands their buffer back to producers.
 static Mail mailtake(Mailbox *m)

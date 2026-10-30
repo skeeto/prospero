@@ -734,6 +734,11 @@ struct CfgSlot {
     iz      len;
 };
 
+struct CfgLayer {
+    Str name;  // as diagnostics name it
+    Str text;
+};
+
 struct Config {
     Os         *os;
     Str         path;        // the user's file, normalized; null if none
@@ -761,6 +766,12 @@ struct Config {
     i64         every;       // os_ticks between refreshes while live
     i64         waitby;      // os_ticks: no fetch at startup goes past it
     i64         loading;     // the rev of the load under way
+
+    // A thin engine's relay layer (relay.cpp): the offers of connected
+    // computers, each INI text, oldest first, read before the user's
+    // file while that, with its includes, defines no endpoint of its own
+    Slice<CfgLayer> layers;  // set by the engine, which keeps the text
+    b32         thin;        // the last load defined no endpoint but these
 };
 
 
@@ -1048,6 +1059,9 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
     case CFG_ENUM:
         return cfghasword(k->choices, v) ? CFG_OK : CFG_ODD;
     case CFG_URL:
+        if (k->kind=="endpoint" && k->key=="url") {
+            return endpointurl(v) ? CFG_OK : CFG_BAD;  // relayed too
+        }
         return parseurl(v).ok ? CFG_OK : CFG_BAD;
     case CFG_SECRET:
         if (startswith(v, "env:")) {
@@ -1430,7 +1444,7 @@ static CfgDefaults cfgdefaults(Config *c)
     IniSection *s = inifirst(c->ini, "endpoint");
     for (; !r.endpoint.len && s; s = ininext(s)) {
         Str url = trim(cfgget(c, "endpoint", s->name, "url", 0));
-        if (s->name.len && parseurl(url).ok) {
+        if (s->name.len && endpointurl(url)) {
             r.endpoint = s->name;
             r.guessed  = 1;
         }
@@ -2721,12 +2735,64 @@ static u64 cfgfingerprint(Os *os, Slice<Str> paths, Arena scratch)
     return h | 1;
 }
 
-// Load afresh into the idle region and make it current.
+// Whether ini defines no endpoint of its own: no [endpoint] url, nor a
+// top-level endpoint, that is a real URL outside the relay layer, whose
+// files are the first nlayer.
+static b32 cfgthin(Ini *ini, i32 nlayer)
+{
+    IniFile *own = ini->files;
+    for (i32 i = 0; own && i < nlayer; i++) {
+        own = own->next;
+    }
+    for (IniSection *s = ini->sections; s; s = s->next) {
+        if (!(s->kind=="endpoint") && !(s->kind=="" && s->name=="")) {
+            continue;
+        }
+        Str key = s->kind=="endpoint" ? Str("url") : Str("endpoint");
+        for (IniEntry *e = inientry(s, key); e; e = e->older) {
+            b32 layer = 1;
+            for (IniFile *f = own; layer && f; f = f->next) {
+                layer = f != e->file;
+            }
+            if (!layer && parseurl(trim(e->value)).ok) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static b32 cfgloadini(Config *, Arena scratch, Arena *, Ini *, i32 nlayer);
+
+// Load afresh into the idle region and make it current. With a relay
+// layer, the load goes again once, into the same region, if it guessed
+// wrong whether the user's file is thin, which only an edit changes:
+// the load before stays intact, as callers may still hold its strings.
 static void cfgload(Config *c, Arena scratch)
 {
+    for (i32 pass = 0;; pass++) {
+        i32  nlayer = c->thin ? (i32)c->layers.len : 0;
+        Arena a     = newarena(c->regions[c->cur ^ 1]);
+        Ini  *ini   = alloc<Ini>(&a);
+        for (i32 i = 0; i < nlayer; i++) {
+            Str name = clone(&a, c->layers[i].name);
+            iniparse(ini, &a, name, clone(&a, c->layers[i].text));
+        }
+        ini->nbytes = 0;  // the file's budget is its own
+        b32 thin = cfgloadini(c, scratch, &a, ini, nlayer);
+        if (thin==c->thin || !c->layers.len || pass) {
+            c->thin = thin;
+            break;
+        }
+        c->thin = thin;
+        c->cur ^= 1;  // undone, to be made again
+        c->rev--;
+    }
+}
+
+static b32 cfgloadini(Config *c, Arena scratch, Arena *a, Ini *ini, i32 nlayer)
+{
     i32      next = c->cur ^ 1;
-    Arena    a    = newarena(c->regions[next]);
-    Ini     *ini  = alloc<Ini>(&a);
     IniFile *user = 0;
     Stat     pre  = {};
     ini->fetch    = cfgsource;
@@ -2736,29 +2802,29 @@ static void cfgload(Config *c, Arena scratch)
         // The default file need not exist: none is empty, quietly
         pre = os_stat(c->os, scratch, c->path);
         if (!c->seed || pre.type!=STAT_MISSING) {
-            user = iniload(ini, c->os, &a, c->path);
+            user = iniload(ini, c->os, a, c->path);
         }
     } else {
         Str msg = "no configuration file: none of XDG_CONFIG_HOME, HOME "
                   "or APPDATA is set";
-        inidiag(ini, &a, {}, 0, 0, INI_WARNING, msg);
+        inidiag(ini, a, {}, 0, 0, INI_WARNING, msg);
     }
-    cfgvalidate(c, ini, user, &a);
+    cfgvalidate(c, ini, user, a);
 
     // The files to watch: the user's, and every include target, read
     // or not, so that creating a missing one counts as a change. URLs
     // are watched by refreshing them.
     Slice<Str> watch = {};
     if (c->path.len) {
-        watch = push(&a, watch, c->path);
+        watch = push(a, watch, c->path);
     }
     for (IniFile *f = ini->files; f; f = f->next) {
         for (iz i = 0; i<f->lines.len && !iniurl(f->path); i++) {
             IniLine *l = &f->lines[i];
             if (l->type==INI_INCLUDE && !iniurl(l->value) &&
                     !inidevice(l->value)) {
-                Str p = inipath(&a, inidir(f->path), l->value);
-                watch = push(&a, watch, p);
+                Str p = inipath(a, inidir(f->path), l->value);
+                watch = push(a, watch, p);
             }
         }
     }
@@ -2779,6 +2845,7 @@ static void cfgload(Config *c, Arena scratch)
         }
     }
     cfgrefresh(c, scratch, 0);
+    return cfgthin(ini, nlayer);
 }
 
 // Where writes to the user's file go: through a symbolic link to its

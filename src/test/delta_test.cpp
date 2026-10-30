@@ -21,7 +21,8 @@ static Str deltabytes(Arena *a, u64 *s, iz len)
 
 static b32 deltaround(Arena scratch, Str base, Str next, iz *opslen)
 {
-    Str ops = deltamake(&scratch, scratch, base, next);
+    Arena tmp = carve(&scratch, 4*(base.len + next.len) + (1<<16));
+    Str   ops = deltamake(&scratch, tmp, base, next);
     Str got = deltaapply(&scratch, base, ops, next.len);
     *opslen = ops.len;
     return got.data && got==next;

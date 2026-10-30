@@ -66,6 +66,9 @@ enum : i32 {
     EV_QUEUE,   // what the user sent that waits to be taken in
     EV_CONFIG,  // the configuration was loaded again (rev)
     EV_WORKTREE,  // a worktree made, failed, removed or kept
+    EV_RELAY,     // a thin engine's model call, for a client to make
+    EV_RELAYDATA, // the response to a relay.call, part by part
+    EV_OFFER,     // what this engine's models are, for a thin engine
     EV_COUNT,
 };
 
@@ -122,6 +125,9 @@ static EvInfo evinfo[] = {
     {"queue",      0, 0},
     {"config",     0, 0},
     {"worktree",   0, 0},
+    {"relay",      0, 0},
+    {"relay.data", 0, 0},
+    {"offer",      0, 0},
 };
 static_assert(countof(evinfo) == EV_COUNT);
 
@@ -170,6 +176,12 @@ enum : i32 {
     CMD_GIT,     // a session's git branch, and with status its changes, late
     CMD_TRASH,   // a session to the Trash, or back
     CMD_TRASHEMPTY,  // every session in the Trash, for good
+    CMD_RELAYOFFER,  // a client's models, which a thin engine relays to it
+    CMD_RELAYDATA,   // part of the response to a thin engine's call
+    CMD_RELAYMORE,   // the host has room for a call's next part
+    CMD_RELAYPEER,   // the host's news of a client: away, back or gone
+    CMD_RELAYCALL,   // a thin engine's call, for this engine to make
+    CMD_OFFER,       // this engine's models as relay.offer gives them
     CMD_COUNT,
 };
 
@@ -181,7 +193,8 @@ static Str cmdnames[] = {
     "skills", "mode",
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
-    "trash.empty",
+    "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
+    "relay.call", "offer",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -268,6 +281,9 @@ static Str capnames[] = {
     "trash",           // trash {sid, on} and trash.empty: a session to the
                        // Trash and back, or out of it for good; list
                        // {trash}, its trashed (epoch ms) and trash_days
+    "relay",           // thin engines: relay.offer from a client, relay
+                       // records for it to make, relay.data back; and
+                       // offer and relay.call for the client's own engine
 };
 
 static Str evname(i32 ev)

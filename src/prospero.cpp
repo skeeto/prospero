@@ -198,6 +198,9 @@ enum : i32 {
     HTTP_ETOOBIG,   // the response passed maxbytes
     HTTP_ETRUST,    // the server's certificate was refused: not trusted,
                     // expired, or for another name
+    // A thin engine's relayed calls (relay.cpp), never the platform's
+    HTTP_ELOST,     // the computer relaying it went, or a hop overflowed
+    HTTP_ENOBASE,   // it has no base for the delta: send the body whole
 };
 
 // (M2) Child processes: null stdin, merged stdout and stderr pumped into
@@ -341,6 +344,8 @@ struct Detached {
 static Detached  os_detach(Os *, Arena scratch, Slice<Str> argv, Str cwd, Str errpath);
 // (M5) This process's id.
 static i32       os_pid(Os *);
+// The computer's name, as the system gives it, or null.
+static Str       os_hostname(Os *, Arena *);
 // (M7) Post a record of the given type to the mailbox whenever this
 // process is asked to quit: SIGTERM, SIGINT or SIGHUP (POSIX), or its
 // console's Ctrl+C, Ctrl+Break or closing (Windows). Call it before
@@ -627,6 +632,7 @@ static u32     os_guilimits(Os *);
 #include "compact.cpp"
 #include "help.cpp"   // after config.cpp and mcp.cpp: cfgkinds, hexval
 #include "engine.cpp"
+#include "relay.cpp"
 #include "git.cpp"
 #include "worktree.cpp"
 #include "cli.cpp"

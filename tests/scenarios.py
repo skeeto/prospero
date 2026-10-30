@@ -3253,7 +3253,10 @@ def hello_caps(t):
                                                    "background", "models", "mcp",
                                                    "mcp.auth", "mcp.code", "mcp.logout",
                                                    "mcp.restart", "shell", "shells",
-                                                   "git", "trash", "trash.empty"]
+                                                   "git", "trash", "trash.empty",
+                                                   "relay.offer", "relay.data",
+                                                   "relay.more", "relay.peer",
+                                                   "relay.call", "offer"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and

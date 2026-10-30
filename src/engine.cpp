@@ -157,11 +157,12 @@ enum : i32 {
     S_TASK,      // waiting for subagents to report
     S_MCP,       // waiting for MCP servers to start, before a request
     S_WORKTREE,  // waiting for git to make its worktree, before a turn
+    S_RELAY,     // waiting for a computer to relay its model calls
 };
 
 static Str statenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "queued", "task", "mcp", "worktree",
+    "ask", "queued", "task", "mcp", "worktree", "relay",
 };
 
 enum : i32 {
@@ -180,6 +181,7 @@ enum : i32 {
     T_TASK,      // a subagent reported: end the calls that may end
     T_PARK,      // idle so long: free its memory
     T_DESK,      // the desktop helper's answer is due
+    T_RELAY,     // no computer relayed its calls in time: the turn ends
     T_COUNT,
 };
 
@@ -392,6 +394,7 @@ struct Parked {
 struct Endpoint {
     Str name;       // its configured section, empty if none
     Str url;
+    Str relay;      // relayed (relay.cpp): the name its URL gives, else null
     Str key;        // bearer token (x-api-key for Anthropic), empty if none
     i64 firstbyte;  // watchdogs, in ticks
     i64 idle;
@@ -403,6 +406,16 @@ struct Endpoint {
 struct Engine;
 struct HostLink;
 struct GitWork;
+struct RelayCall;
+struct Relay;
+
+// A model call's request: made here (os_http), or relayed through a
+// connected computer (relay.cpp), whose records arrive just the same.
+struct EHttp {
+    EHttp     *next;   // reuse
+    Http      *os;
+    RelayCall *relay;
+};
 
 struct ShellRun {
     Str  spill;     // absolute path of the output file
@@ -619,7 +632,7 @@ struct Session {
     i64          queueid;    // the latest queued's id
     Ask          ask;        // with S_ASK
     // The current request
-    Http        *http;
+    EHttp       *http;
     u64          httpid;
     i64          sent;       // ticks
     i32          status;
@@ -680,11 +693,19 @@ struct Session {
     b32          slowing;    // waiting slowly: start over from the primary
     // Ending reasoning early (llama.cpp's reasoning_end)
     i32          ctlwhy;     // CTL_*, for this attempt
-    Http        *ctl;
+    EHttp       *ctl;
     u64          ctlid;
     i32          ctlstatus;
     Buf          ctlbody;
     b32          noctl;      // the endpoint cannot: cancel instead
+    // Relayed model calls (relay.cpp)
+    i64          relaypeer;  // the computer chosen last, 0 if none
+    u8           relayby[64];  // its name, for live
+    i32          relaybylen;
+    i32          relaylost;  // calls lost in a row before visible output
+    b32          relayq;     // waiting at the computer's endpoint, and
+    i32          relayqpos;  // its place in line there
+    i32          relayqlen;
     // Background jobs, and what the agent hears between requests
     Job         *jobs;       // newest first
     i64          njobs;      // numbers given so far
@@ -776,7 +797,7 @@ struct EpListing {
     Str   name;
     Str   url;
     Str   kind;
-    Http *http;    // while it runs
+    EHttp *http;   // while it runs
     u64   rid;     // its request's id
     i32   status;
     Buf   body;
@@ -847,6 +868,8 @@ struct Engine {
     McpAuth    *mcpauths; // MCP sign-ins under way
     HostLink   *links;    // to other hosts, for subagents there (hostlink.cpp)
     u64         farserial;
+    EHttp      *freehttp; // handles to reuse (ehttp)
+    Relay      *relay;    // offers, relayed calls, and those served (relay.cpp)
     Slice<Str>  distros;  // the WSL distros installed, as last listed
     GitWork    *git;      // runs git for sessions' changes, once asked
     GitWork    *wt;       // runs git for worktrees (worktree.cpp)
@@ -961,9 +984,9 @@ static i64 estimate(Session *);
 // that the tick never walks the history (estimate).
 static void live(Session *s)
 {
-    byte  mem[640];
+    byte  mem[1024];
     Arena a   = {mem, mem+countof(mem)};
-    Buf   b(&a, 512);
+    Buf   b(&a, 896);
     Os   *os  = s->e->os;
     i64   now = os_ticks(os);
     EvOut w   = sbegin(s, &b, EV_LIVE);
@@ -996,6 +1019,17 @@ static void live(Session *s)
             putintkey(&w.json, "watchdog_ms", (at>now ? at-now : 0)/MS);
             putintkey(&w.json, "watchdog_of", of/MS);
         }
+        if (ep->relay.len && s->relaybylen) {
+            // The computer relaying it (at most 63 bytes), and its line
+            putstrkey(&w.json, "relay", Str(s->relayby, s->relaybylen));
+            if (s->relayq) {
+                putintkey(&w.json, "queue_pos", s->relayqpos);
+                putintkey(&w.json, "queue_len", s->relayqlen);
+            }
+        }
+    } else if (s->state == S_RELAY) {
+        i64 left = s->timers[T_RELAY] - now;
+        putintkey(&w.json, "relay_until", os_time(os) + left/MS);
     } else if (s->state == S_BACKOFF) {
         i64 left = s->timers[T_BACKOFF] - now;
         putintkey(&w.json, "retry_at", os_time(os) + left/MS);
@@ -1514,6 +1548,9 @@ static Session *sessionbyadm(Engine *e, u64 id)
     return 0;
 }
 
+static void relayadmitted(Engine *, u64 id);
+static void relayplaces(Engine *, AdmPoint *);
+
 // Admit what may go now at an endpoint: each session admitted sends from
 // its T_ADMIT, and those still waiting hear of any change in their places,
 // as some went, or left, or joined the line. Then find when time alone
@@ -1523,7 +1560,11 @@ static void pump(Engine *e, AdmPoint *p)
     i64 now = os_ticks(e->os);
     for (u64 id; (id = admgo(p, &e->perm, now));) {
         Session *s = sessionbyadm(e, id);
-        assert(s && s->slot==SLOT_WAIT && s->point==p);
+        if (!s) {
+            relayadmitted(e, id);  // a relayed call's
+            continue;
+        }
+        assert(s->slot==SLOT_WAIT && s->point==p);
         s->slot     = SLOT_HELD;
         s->admepoch = admlane(p, 0, s->slotmodel)->epoch;
         arm(s, T_ADMIT, 0);
@@ -1534,6 +1575,7 @@ static void pump(Engine *e, AdmPoint *p)
             live(s);
         }
     }
+    relayplaces(e, p);
     e->admat = 0;
     for (AdmPoint *q = e->adm.points; q; q = q->next) {
         i64 t = admnext(q, now);
@@ -1722,6 +1764,9 @@ static b32 admit(Session *s, Arena scratch)
     Endpoint *ep    = reqep(s);
     Str       model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
     Str       id    = reqmc(s)->name;  // variants of a model share it
+    if (ep->relay.len) {
+        return 1;  // the computer relaying it admits it there
+    }
     AdmPoint *p     = admpoint(&e->adm, &e->perm, ep->url);
     assert(s->slot == SLOT_NONE);
 
@@ -1760,6 +1805,74 @@ static b32 admit(Session *s, Arena scratch)
 }
 
 
+// Model calls, made here or relayed (relay.cpp)
+
+static RelayCall *relaystart(Engine *, Endpoint *, HttpReq *, Session *,
+                             b32 keep, Arena scratch);
+static void relaycancel(Engine *, RelayCall *);
+static void relayfree(Engine *, RelayCall *);
+static Relay *newrelay(Os *, Arena *);
+static void relayoffer(Engine *, Arena, i64 id, Json *);
+static void relaydata(Engine *, Arena, Json *);
+static void relaymore(Engine *, Json *);
+static void relaypeernews(Engine *, Arena, Json *);
+static void relaycall(Engine *, Arena, Json *);
+static void cmdoffer(Engine *, Arena, i64 id);
+static b32  relayrecord(Engine *, Arena, Record);
+static b32  relaylisting(Engine *, Buf *, Endpoint *);
+static void relaytick(Engine *, Arena);
+static i64  relaynext(Engine *, i64 now);
+
+// Start a request to an endpoint, its records to req->mbox with its id,
+// for a session (s) or not. A relayed one never fails here: a failure
+// arrives as its HTTP_DONE, after the caller's own next steps. A body
+// that keep marks is the base of the next one's delta. Null on failure,
+// as os_lasterr explains.
+static EHttp *ehttp(Engine *e, Endpoint *ep, HttpReq *req, Session *s,
+                    b32 keep, Arena scratch)
+{
+    EHttp *h = e->freehttp;
+    if (h) {
+        e->freehttp = h->next;
+    } else {
+        h = alloc<EHttp>(&e->perm);
+    }
+    *h = {};
+    if (ep->relay.len) {
+        h->relay = relaystart(e, ep, req, s, keep, scratch);
+    } else {
+        h->os = os_http(e->os, req, scratch);
+        if (!h->os) {
+            h->next     = e->freehttp;
+            e->freehttp = h;
+            return 0;
+        }
+    }
+    return h;
+}
+
+// Prompt, and its HTTP_DONE still arrives, as with os_httpcancel.
+static void ehttpcancel(Engine *e, EHttp *h)
+{
+    if (h->os) {
+        os_httpcancel(e->os, h->os);
+    } else {
+        relaycancel(e, h->relay);
+    }
+}
+
+static void ehttpfree(Engine *e, EHttp *h)
+{
+    if (h->os) {
+        os_httpfree(e->os, h->os);
+    } else {
+        relayfree(e, h->relay);
+    }
+    h->next     = e->freehttp;
+    e->freehttp = h;
+}
+
+
 // Ending reasoning early: llama.cpp's reasoning_end
 
 static void fail(Session *, Arena, i32 cls, i32 status, Str msg, i64 retryms);
@@ -1767,8 +1880,8 @@ static void fail(Session *, Arena, i32 cls, i32 status, Str msg, i64 retryms);
 static void stopctl(Session *s)
 {
     if (s->ctl) {
-        os_httpcancel(s->e->os, s->ctl);
-        os_httpfree(s->e->os, s->ctl);
+        ehttpcancel(s->e, s->ctl);
+        ehttpfree(s->e, s->ctl);
         s->ctl = 0;
     }
     s->ctlid = 0;
@@ -1812,7 +1925,7 @@ static b32 endreasoning(Session *s, Arena scratch, i32 why)
     s->ctlwhy    = why;
     s->ctlstatus = 0;
     s->ctlbody   = Buf(&s->attempt, 256);
-    s->ctl       = os_http(e->os, &r, scratch);
+    s->ctl       = ehttp(e, ep, &r, s, 0, scratch);
     if (!s->ctl) {
         s->ctlid = 0;
         fail(s, scratch, CLASS_LOOP, 0, msg, -1);
@@ -1842,6 +1955,9 @@ static b32 onctl(Engine *e, Arena scratch, Record r)
         break;
     case HTTP_DONE: {
         stopctl(s);
+        if (get32(r.data) >= HTTP_ELOST) {
+            break;  // the relay lost it: the response may yet end on time
+        }
         Str     body = finish(&s->ctlbody);
         JsonDoc d    = jsonparse(&scratch, body);
         Json   *ok   = jsonget(d.root, "success");
@@ -1869,8 +1985,8 @@ static b32 onctl(Engine *e, Arena scratch, Record r)
 static void stopreq(Session *s)
 {
     if (s->http) {
-        os_httpcancel(s->e->os, s->http);
-        os_httpfree(s->e->os, s->http);
+        ehttpcancel(s->e, s->http);
+        ehttpfree(s->e, s->http);
         s->http = 0;
     }
     s->httpid = 0;
@@ -1882,9 +1998,11 @@ static void stopreq(Session *s)
     disarm(s, T_GRACE);
 }
 
-// Start a request whose records go to this session. 0 on failure.
+// Start a request whose records go to this session, with keep for a
+// turn's body, which a relayed request's next may be a delta against.
+// 0 on failure.
 static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
-                    Str url, Str body, Str accept, i32 readms)
+                    Str url, Str body, Str accept, i32 readms, b32 keep = 0)
 {
     Engine *e = s->e;
     HttpReq r = {};
@@ -1906,7 +2024,7 @@ static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
     s->firstout = 0;
     s->lastout  = 0;
     s->tokens   = 0;
-    s->http     = os_http(e->os, &r, scratch);
+    s->http     = ehttp(e, ep, &r, s, keep, scratch);
     if (!s->http) {
         s->httpid = 0;
         return 0;
@@ -2047,7 +2165,7 @@ static void sendchat(Session *s, Arena scratch)
     Str url       = apiurl(&scratch, s->ep.url, an ? Str("messages")
                                                    : Str("chat/completions"));
 
-    if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0)) {
+    if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0, 1)) {
         Str err = os_lasterr(e->os, &scratch);
         err = concat(&scratch, "cannot start a request: ", err);
         endturn(s, scratch, "error", err);
@@ -2066,10 +2184,42 @@ static void sendreq(Session *s, Arena scratch)
     }
 }
 
+static b32 relaychoose(Session *, Endpoint *);
+
+// A relayed endpoint's request waits (S_RELAY) for a connected computer
+// that offers it (relaychoose), at most the endpoint's slow_retry_budget
+// from when it began to, as an endpoint out of reach is retried, then
+// the turn ends. Returns 0 while it waits: relaywake goes on.
+static b32 relaygate(Session *s, Arena scratch, Endpoint *ep)
+{
+    if (!ep->relay.len || relaychoose(s, ep)) {
+        disarm(s, T_RELAY);
+        return 1;
+    }
+    if (s->state != S_RELAY) {
+        Engine *e      = s->e;
+        i64     budget = scaled(e, cfgms(e->cfg, "endpoint", ep->name,
+                                         "slow_retry_budget", 0)*MS);
+        Buf b(&scratch, 256 + ep->relay.len);
+        print(&b, "paused: no connected computer relays model calls for "
+                  "endpoint ");
+        print(&b, ep->relay);
+        print(&b, ", so the turn waits for one, for at most ");
+        print(&b, secstr(&scratch, budget));
+        print(&b, " s");
+        note(s, scratch, "info", finish(&b));
+        arm(s, T_RELAY, budget);
+        setstate(s, S_RELAY);
+    }
+    return 0;
+}
+
 // Send the current request once it is admitted at its endpoint.
 static void request(Session *s, Arena scratch)
 {
-    if (!admit(s, scratch)) {
+    if (!relaygate(s, scratch, reqep(s))) {
+        return;
+    } else if (!admit(s, scratch)) {
         setstate(s, S_QUEUED);
         return;
     }
@@ -2083,7 +2233,9 @@ static void discover(Session *, Arena);
 static void proceed(Session *s, Arena scratch)
 {
     if (!s->discovered) {
-        discover(s, scratch);
+        if (relaygate(s, scratch, &s->ep)) {
+            discover(s, scratch);
+        }
         return;
     }
     if (s->purpose==REQ_CHAT && s->compactnext) {
@@ -2520,6 +2672,21 @@ static b32 unbind(Session *s)
 // slow retries follow (above). retryms is the server's wish, -1 if none.
 static void fail(Session *s, Arena scratch, i32 cls, i32 status, Str msg, i64 retryms)
 {
+    if (cls == CLASS_RELAY) {
+        // Lost by the computer relaying it, not by the endpoint: with
+        // nothing visible, sent again at no cost (to another computer if
+        // that one went, and whole after nobase), and otherwise, or lost
+        // too often, an interruption as any other
+        Partial *p = s->part;
+        if (!(s->purpose==REQ_CHAT && p && committed(p)) && s->relaylost++<3) {
+            stopreq(s);
+            s->part = 0;
+            retryevent(s, scratch, RETRY_QUICK, cls, status, 0, msg);
+            request(s, scratch);
+            return;
+        }
+        cls = CLASS_TRANSIENT;
+    }
     if (s->slot==SLOT_HELD && contains(msg, "Context size has been exceeded")) {
         // llama.cpp's KV pool, shared by its slots, is full: it failed
         // every request in flight, which would fail again together
@@ -2843,6 +3010,14 @@ static void onbody(Session *s, Arena scratch, Str data)
 static void ondone(Session *s, Arena scratch, i32 err, Str text)
 {
     Engine *e = s->e;
+    b32     whole = s->state==S_STREAM && s->part &&
+                    (s->part->done || s->part->finish.data);
+    if ((err==HTTP_ELOST || err==HTTP_ENOBASE) && s->state!=S_DISCOVER && !whole) {
+        fail(s, scratch, CLASS_RELAY, 0, text, -1);
+        return;
+    } else if (err == HTTP_OK) {
+        s->relaylost = 0;
+    }
     switch (s->state) {
     case S_DISCOVER:
         discovered(s, scratch, err == HTTP_OK);
@@ -11763,15 +11938,29 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     Config *cfg  = e->cfg;
     Str     name = {};
     Str     url  = which;
-    if (!parseurl(which).ok) {
+    if (!endpointurl(which)) {
         name = which;
         url  = trim(cfgget(cfg, "endpoint", which, "url", 0));
     } else {
         for (IniSection *s = inifirst(e->ini, "endpoint"); s; s = ininext(s)) {
-            if (iniget(e->ini, "endpoint", s->name, "url") == url) {
+            if (trim(iniget(e->ini, "endpoint", s->name, "url")) == url) {
                 name = s->name;
             }
         }
+    }
+    RelayUrl ru = relayurl(url);
+    if (ru.ok) {
+        // Relayed: the kind is the URL's, and with no section (none was
+        // offered since a restart) the settings are the defaults
+        *ep = {};
+        ep->name      = clone(perm, name);
+        ep->url       = clone(perm, url);
+        ep->relay     = clone(perm, ru.name);
+        ep->firstbyte = cfgms(cfg, "endpoint", name, "first_byte_timeout", 0)*MS;
+        ep->idle      = cfgms(cfg, "endpoint", name, "idle_timeout", 0)*MS;
+        ep->progress  = cfgms(cfg, "endpoint", name, "progress_timeout", 0)*MS;
+        ep->kind      = ru.anthropic ? EP_ANTHROPIC : EP_OPENAI;
+        return 1;
     }
     Url u = parseurl(url);
     if (!u.ok) {
@@ -11780,6 +11969,7 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     b32 local = localhost(u.host);
     ep->name      = clone(perm, name);
     ep->url       = clone(perm, url);
+    ep->relay     = {};
     ep->firstbyte = cfgms(cfg, "endpoint", name, "first_byte_timeout", local)*MS;
     ep->idle      = cfgms(cfg, "endpoint", name, "idle_timeout", local)*MS;
     ep->progress  = cfgms(cfg, "endpoint", name, "progress_timeout", local)*MS;
@@ -17698,6 +17888,14 @@ static void cmdmodels(Engine *e, Arena scratch, i64 id)
             p.name = ep.name;
             p.url  = ep.url;
             p.kind = ep.kind==EP_ANTHROPIC ? Str("anthropic") : Str("openai");
+            if (ep.relay.len) {
+                // What its offers listed, asking nobody
+                p.body   = Buf(&l->arena, 1<<12);
+                p.done   = relaylisting(e, &p.body, &ep);
+                p.status = 200;
+                p.err    = p.done ? Str{} : Str("no connected computer offers it");
+                p.done   = 1;
+            }
             l->eps = push(&l->arena, l->eps, p);
         }
     }
@@ -17705,6 +17903,9 @@ static void cmdmodels(Engine *e, Arena scratch, i64 id)
         EpListing *p  = &l->eps[i];
         Arena    t  = scratch;
         Endpoint ep = {};
+        if (p->done) {
+            continue;
+        }
         endpointconf(e, &t, p->name, &ep);
         HttpReq r = {};
         r.method    = "GET";
@@ -17717,7 +17918,7 @@ static void cmdmodels(Engine *e, Arena scratch, i64 id)
         r.mbox      = e->in;
         r.id        = p->rid = ++e->nextid;
         p->body     = Buf(&l->arena, 1<<12);
-        p->http     = os_http(e->os, &r, t);
+        p->http     = ehttp(e, &ep, &r, 0, 0, t);
         if (!p->http) {
             p->err  = clone(&l->arena, os_lasterr(e->os, &t));
             p->done = 1;
@@ -17755,7 +17956,7 @@ static b32 onlister(Engine *e, Arena scratch, Record r)
         }
         break;
     case HTTP_DONE: {
-        os_httpfree(e->os, p->http);
+        ehttpfree(e, p->http);
         p->http = 0;
         p->done = 1;
         i32 err = get32(r.data);
@@ -17792,7 +17993,7 @@ static void listertimeout(Engine *e, Arena scratch, i64 now)
             listerreply(e, scratch, l);
             for (iz i = 0; i < l->eps.len; i++) {
                 if (l->eps[i].http) {
-                    os_httpcancel(e->os, l->eps[i].http);
+                    ehttpcancel(e, l->eps[i].http);
                 }
             }
         }
@@ -17819,7 +18020,9 @@ static void reconfigure(Engine *e, Arena scratch)
     for (Session *s = e->sessions; s; s = s->next) {
         s->te.rg = e->te.rg;
         s->guard = sessionguard(s, &s->perm);
-        Str      which = s->ep.name.len ? s->ep.name : s->ep.url;
+        // A relayed endpoint by its URL, which holds its kind: the
+        // history's encoding cannot change, whoever offers the name now
+        Str      which = s->ep.name.len && !s->ep.relay.len ? s->ep.name : s->ep.url;
         Endpoint ep    = {};
         if (endpointconf(e, &s->perm, which, &ep)) {
             s->ep = ep;
@@ -18098,6 +18301,24 @@ static void command(Engine *e, Arena scratch, Str line)
     case CMD_TRASHEMPTY:
         cmdtrashempty(e, scratch, id);
         return;
+    case CMD_RELAYOFFER:
+        relayoffer(e, scratch, id, j);
+        return;
+    case CMD_RELAYDATA:
+        relaydata(e, scratch, j);  // no reply, as for each part
+        return;
+    case CMD_RELAYMORE:
+        relaymore(e, j);
+        return;
+    case CMD_RELAYPEER:
+        relaypeernews(e, scratch, j);
+        return;
+    case CMD_RELAYCALL:
+        relaycall(e, scratch, j);  // answered by relay.data records
+        return;
+    case CMD_OFFER:
+        cmdoffer(e, scratch, id);
+        return;
     case CMD_GIT:
         cmdgit(e, scratch, id, j);  // likewise, and read-only ones too
         return;
@@ -18351,7 +18572,8 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         reply(e, scratch, (i64)r.id, 0, "command too long", {});
         return;
     } else if (onconfig(e, scratch, r) || onprobe(e, scratch, r) ||
-               onctl(e, scratch, r) || onlister(e, scratch, r)) {
+               onctl(e, scratch, r) || onlister(e, scratch, r) ||
+               relayrecord(e, scratch, r)) {
         return;
     }
 
@@ -18404,7 +18626,7 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         break;
     case HTTP_DONE:
         if (s->http) {
-            os_httpfree(e->os, s->http);
+            ehttpfree(e, s->http);
             s->http = 0;
         }
         ondone(s, scratch, get32(r.data), cuthead(r.data, 4));
@@ -18531,6 +18753,12 @@ static void ontimer(Session *s, Arena scratch, i32 t)
         deskbroke(s, scratch, "The desktop helper did not answer in time, so "
                   "it was stopped, and the action may not have been done.");
         return;
+    case T_RELAY: {
+        Endpoint *ep  = reqep(s);
+        Str       msg = concat(&scratch, "no connected computer relayed model "
+                               "calls for endpoint ", ep->relay);
+        endturn(s, scratch, "error", msg);
+    } return;
     case T_LIVE:
         live(s);
         arm(s, T_LIVE, LIVE_EVERY);
@@ -18568,6 +18796,7 @@ static void enginethread(void *arg)
         next = farnext(e)<next ? farnext(e) : next;
         next = e->wtdue.len || e->wtgone.len ? now : next;
         next = !e->quitting && e->trashat<next ? e->trashat : next;
+        next = relaynext(e, now)<next ? relaynext(e, now) : next;
         for (Lister *l = e->listers; l; l = l->next) {
             next = !l->replied && l->by<next ? l->by : next;
         }
@@ -18611,6 +18840,7 @@ static void enginethread(void *arg)
             }
         }
         listertimeout(e, newarena(e->scratch), now);
+        relaytick(e, newarena(e->scratch));
         if (mcpnext(e) <= now) {
             mcptick(e, newarena(e->scratch), now);
         }
@@ -18693,6 +18923,7 @@ static Engine *newengine(Os *os, Arena *perm, Config *cfg, Str statedir,
         return 0;
     }
     e->perm     = newarena(r);
+    e->relay    = newrelay(os, &e->perm);
     Str exe     = os_exepath(os, &e->perm);
     e->exedir   = parentdir(exe);
     e->env      = os_environ(os, &e->perm);

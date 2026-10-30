@@ -265,6 +265,7 @@ W32(b32,    FlushFileBuffers(uz));
 W32(c16 *,  GetCommandLineW());
 W32(b32,    GetConsoleMode(uz, i32 *));
 W32(i32,    GetEnvironmentVariableW(c16 *, c16 *, i32));
+W32(b32,    GetComputerNameExW(i32, c16 *, u32 *));
 W32(b32,    GetFileAttributesExW(c16 *, i32, FileAttributes *));
 W32(i32,    GetFileAttributesW(c16 *));
 W32(b32,    GetFileInformationByHandle(uz, FileInfo *));
@@ -2808,6 +2809,17 @@ static b32 os_listening(Os *, Arena scratch, Str endpoint)
 static i32 os_pid(Os *)
 {
     return GetCurrentProcessId();
+}
+
+static Str os_hostname(Os *, Arena *a)
+{
+    enum { ComputerNameDnsHostname = 1 };
+    c16 buf[256];
+    u32 len = countof(buf);
+    if (!GetComputerNameExW(ComputerNameDnsHostname, buf, &len)) {
+        return {};
+    }
+    return fromwide(a, buf, (iz)len);
 }
 
 // Where the console's handler, which has no context of its own, posts.

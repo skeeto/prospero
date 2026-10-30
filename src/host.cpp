@@ -92,6 +92,7 @@ static_assert(HOST_KEEPMAX >= FRAME_HEAD + FRAME_MAX + HOST_KEEPMAX/32);
 enum : i32 {
     HOST_CMDS = 4096,  // commands awaiting replies, at most
     HOST_LATE = 64,    // of those, models, whose replies come out of order
+    HOST_RELAYS = 256, // relayed calls under way each way (relay.cpp)
 };
 
 // Records other threads post to a host's inbox (hoststop)
@@ -254,6 +255,9 @@ struct HostClient {
     HostSub    *subs;
     HostSub    *spare;     // subscriptions to reuse
     b32         gone;      // dropped: released at the end of the round
+    i64         peer;      // the host's number for it, as a thin engine knows it
+    b32         offered;   // it offered to relay model calls (relay.offer)
+    b32         away;      // and the engine was told it has no stream
 };
 
 struct HostConn {
@@ -287,6 +291,17 @@ enum : i32 {
     HOSTCMD_CLIENT,    // a client's, whose reply goes back to it
     HOSTCMD_STATUS,    // the host's own: for the idle exit
     HOSTCMD_QUIET,     // the host's own, with nothing to do on its reply
+};
+
+// A thin engine's call that went to a client, until it ends there, and
+// one the engine makes for a client's thin engine (relay.cpp), whose
+// number the host gives, so that clients' numbers never meet.
+struct HostRelay {
+    i64         id;       // the rid, or the host's cid
+    i64         cid;      // the client's cid
+    HostClient *client;
+    b32         more;     // the call's next part waits for room
+    iz          need;     // about its size: the last part's
 };
 
 // A command sent to the engine, waiting for its reply.
@@ -342,6 +357,10 @@ struct Host {
     Str             dropcap;   // a cap hello leaves out (a test hook), as an
                                // older engine would
     u64             nextconn;
+    i64             nextpeer;
+    HostRelay      *relays;    // HOST_RELAYS calls going to clients
+    HostRelay      *serves;    // HOST_RELAYS calls made for them
+    i64             nextcid;
 };
 
 static HostSess *hostsess(Host *h, Str sid)
@@ -576,6 +595,7 @@ static b32 hostput(HostClient *c, Str line, iz reserve)
 }
 
 static void hostdrop(Host *, HostClient *, Arena scratch);
+static void hostrelaypeer(Host *, Arena, HostClient *, Str state);
 
 // A line a client must get: a reply. A client with no room left even
 // for that is hopelessly behind, and loses its place. The scratch is
@@ -636,6 +656,7 @@ static HostClient *newclient(Host *h, u64 token)
     c->region = r;
     c->token  = token;
     c->link   = newlink(&a, os_random(h->os), h->keepmax, HOST_KEEPCOUNT);
+    c->peer   = ++h->nextpeer;
     c->perm   = a;
     c->next    = h->clients;
     h->clients = c;
@@ -671,6 +692,23 @@ static void hostdrop(Host *h, HostClient *c, Arena scratch)
     c->gone = 1;
     if (c->conn) {
         connfree(h, c->conn);
+    }
+    if (c->offered) {
+        hostrelaypeer(h, scratch, c, "gone");  // its calls are lost
+    }
+    for (i32 i = 0; i < HOST_RELAYS; i++) {
+        if (h->relays[i].client == c) {
+            h->relays[i] = {};
+        }
+        if (h->serves[i].client == c) {
+            Arena a = scratch;
+            Buf   b(&a, 128);
+            print(&b, "{\"cmd\":\"relay.call\",\"cancel\":1,\"cid\":");
+            print(&b, h->serves[i].id);
+            putbyte(&b, '}');
+            enginecmd(h->e, finish(&b));
+            h->serves[i] = {};
+        }
     }
     while (c->subs) {
         Arena a   = scratch;
@@ -782,6 +820,245 @@ static void hosthello(Host *h, HostClient *c, Arena scratch, i64 id, Json *j)
     hostreply(h, c, scratch, id, !err.len, err, {});
 }
 
+
+// Relayed model calls (relay.cpp)
+
+// A command's or record's fields with key set to v, and skey to sval if
+// given, in place of any it gives: the peer that a client is, a call's
+// number as the engine or the client knows it. A record ends its line.
+static Str hoststamp(Arena *a, Json *j, Str key, i64 v, Str skey, Str sval,
+                     b32 record)
+{
+    Buf     b(a, 1024);
+    JsonOut w = {&b};
+    putobject(&w);
+    for (Json *m = j->child; m; m = m->next) {
+        if (!(m->key==key) && !(skey.len && m->key==skey)) {
+            putkey(&w, m->key);
+            putjson(&w, m);
+        }
+    }
+    putintkey(&w, key, v);
+    if (skey.len) {
+        putstrkey(&w, skey, sval);
+    }
+    putend(&w);
+    if (record) {
+        putbyte(&b, '\n');
+    }
+    return finish(&b);
+}
+
+static HostRelay *hostrelayat(HostRelay *t, i64 id)
+{
+    for (i32 i = 0; id && i < HOST_RELAYS; i++) {
+        if (t[i].id == id) {
+            return &t[i];
+        }
+    }
+    return 0;
+}
+
+static HostRelay *hostrelayfree(HostRelay *t)
+{
+    for (i32 i = 0; i < HOST_RELAYS; i++) {
+        if (!t[i].id) {
+            return &t[i];
+        }
+    }
+    return 0;
+}
+
+// The engine hears that a call it relayed is lost.
+static void hostrelaylost(Host *h, Arena scratch, i64 rid, i64 peer, Str why)
+{
+    Buf     b(&scratch, 256 + why.len);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "cmd", "relay.data");
+    putintkey(&w, "rid", rid);
+    putintkey(&w, "peer", peer);
+    putkey(&w, "done");
+    putobject(&w);
+    putstrkey(&w, "err", "lost");
+    putstrkey(&w, "text", why);
+    putend(&w);
+    putend(&w);
+    enginecmd(h->e, finish(&b));
+}
+
+static void hostrelaypeer(Host *h, Arena scratch, HostClient *c, Str state)
+{
+    Buf b(&scratch, 128);
+    print(&b, "{\"cmd\":\"relay.peer\",\"peer\":");
+    print(&b, c->peer);
+    print(&b, ",\"state\":\"");
+    print(&b, state);
+    print(&b, "\"}");
+    enginecmd(h->e, finish(&b));
+}
+
+// Whether a client's link has room for a call's next part, keeping half
+// of it for what else comes, as hostcatchup does, unless it is empty.
+static b32 hostrelayroom(HostRelay *x)
+{
+    Link *l = &x->client->link;
+    return !l->qcount || linkroom(l)-(FRAME_HEAD + x->need)>=l->keepmax/2;
+}
+
+// Ask the engine for each call's next part that its link has room for.
+static void hostrelaymore(Host *h, Arena scratch)
+{
+    for (i32 i = 0; i < HOST_RELAYS; i++) {
+        HostRelay *x = &h->relays[i];
+        if (x->id && x->more && hostrelayroom(x)) {
+            x->more = 0;
+            Arena a = scratch;
+            Buf   b(&a, 64);
+            print(&b, "{\"cmd\":\"relay.more\",\"rid\":");
+            print(&b, x->id);
+            putbyte(&b, '}');
+            enginecmd(h->e, finish(&b));
+        }
+    }
+}
+
+// A thin engine's relay record: part of a call, or its cancelling, for
+// the client its peer names, which must have room for it, or the call
+// is lost. Its next part comes once there is room for that too.
+static void hostrelayed(Host *h, Arena scratch, EvRec *r, Str line)
+{
+    i64         rid  = jsonint(jsonget(r->root, "rid"), 0);
+    i64         peer = jsonint(jsonget(r->root, "peer"), 0);
+    HostClient *c    = 0;
+    for (HostClient *o = h->clients; o; o = o->next) {
+        c = !o->gone && o->peer==peer ? o : c;
+    }
+    HostRelay *x = hostrelayat(h->relays, rid);
+    if (jsonflag(jsonget(r->root, "cancel"), 0)) {
+        if (x) {
+            hostput(x->client, line, hostreserve(x->client));
+            *x = {};
+        }
+        return;
+    }
+    i64 part  = jsonint(jsonget(r->root, "part"), 0);
+    i64 parts = jsonint(jsonget(r->root, "parts"), 1);
+    if (!x && !part && rid) {
+        x = hostrelayfree(h->relays);
+        if (x && c) {
+            x->id     = rid;
+            x->client = c;
+        }
+    }
+    Str why = !c ? Str("the computer to relay it is gone") :
+              !x ? Str("too many calls are relayed at once") : Str{};
+    if (!why.len && !hostput(c, line, hostreserve(c))) {
+        why = "the link to the computer relaying it fell behind";
+    }
+    if (why.len) {
+        hostrelaylost(h, scratch, rid, peer, why);
+        if (x && x->id==rid) {
+            *x = {};
+        }
+        return;
+    }
+    x->more = part+1 < parts;
+    x->need = line.len;
+    hostrelaymore(h, scratch);
+}
+
+// The engine's relay.data for a call it makes for a client: to that
+// client, as it numbers the call, or the call is lost.
+static void hostserved(Host *h, Arena scratch, EvRec *r)
+{
+    HostRelay *x = hostrelayat(h->serves, jsonint(jsonget(r->root, "cid"), 0));
+    if (!x) {
+        return;
+    }
+    HostClient *c      = x->client;
+    Str         origin = cut(jsonstr(jsonget(r->root, "origin")), ':').tail;
+    Str         out    = hoststamp(&scratch, r->root, "cid", x->cid, "origin", origin, 1);
+    b32         done   = jsonget(r->root, "done")->type == JSON_OBJECT;
+    if (!hostput(c, out, hostreserve(c))) {
+        Buf b(&scratch, 128);
+        print(&b, "{\"cmd\":\"relay.call\",\"cancel\":1,\"cid\":");
+        print(&b, x->id);
+        putbyte(&b, '}');
+        enginecmd(h->e, finish(&b));
+        Buf     o(&scratch, 256 + origin.len);
+        JsonOut w = {&o};
+        putobject(&w);
+        putintkey(&w, "ts", os_time(h->os));
+        putstrkey(&w, "ev", "relay.data");
+        putintkey(&w, "cid", x->cid);
+        putstrkey(&w, "origin", origin);
+        putkey(&w, "done");
+        putobject(&w);
+        putstrkey(&w, "err", "lost");
+        putstrkey(&w, "text", "the relayed response was taken too slowly");
+        putend(&w);
+        putend(&w);
+        putbyte(&o, '\n');
+        hostput(c, finish(&o), 0);
+        done = 1;
+    }
+    if (done) {
+        *x = {};
+    }
+}
+
+// A client's relay commands. Returns 0 if it is none.
+static b32 hostrelaycmd(Host *h, HostClient *c, Arena scratch, i32 cmd, Json *j)
+{
+    switch (cmd) {
+    case CMD_RELAYDATA: {
+        HostRelay *x = hostrelayat(h->relays, jsonint(jsonget(j, "rid"), 0));
+        if (x && x->client==c) {
+            enginecmd(h->e, hoststamp(&scratch, j, "peer", c->peer, {}, {}, 0));
+            if (jsonget(j, "done")->type == JSON_OBJECT) {
+                *x = {};
+            }
+        }
+    } return 1;
+    case CMD_RELAYCALL: {
+        // Numbered anew, its origin prefixed with the client's peer
+        i64 cid    = jsonint(jsonget(j, "cid"), 0);
+        Buf ob(&scratch, 64);
+        print(&ob, c->peer);
+        putbyte(&ob, ':');
+        print(&ob, jsonstr(jsonget(j, "origin")));
+        Str origin = finish(&ob);
+        HostRelay *x = 0;
+        for (i32 i = 0; cid && !x && i < HOST_RELAYS; i++) {
+            x = h->serves[i].client==c && h->serves[i].cid==cid ? &h->serves[i] : 0;
+        }
+        if (jsonflag(jsonget(j, "cancel"), 0)) {
+            if (cid && !x) {
+                return 1;  // over already
+            }
+            enginecmd(h->e, hoststamp(&scratch, j, "cid", x ? x->id : 0,
+                                      "origin", origin, 0));
+            return 1;
+        } else if (!x && !jsonint(jsonget(j, "part"), -1) && cid) {
+            x = hostrelayfree(h->serves);
+            if (x) {
+                x->id     = ++h->nextcid;
+                x->cid    = cid;
+                x->client = c;
+            }
+        }
+        if (x) {
+            enginecmd(h->e, hoststamp(&scratch, j, "cid", x->id, "origin", origin, 0));
+        }
+    } return 1;
+    case CMD_RELAYMORE:
+    case CMD_RELAYPEER:
+        return 1;  // the host's own, never a client's
+    }
+    return 0;
+}
+
 static void hostcommand(Host *h, HostClient *c, Arena scratch, Str line)
 {
     line = trim(line);
@@ -795,10 +1072,20 @@ static void hostcommand(Host *h, HostClient *c, Arena scratch, Str line)
     i32 cmd = cmdfind(jsonstr(jsonget(j, "cmd")));
     Str sid = jsonstr(jsonget(j, "sid"));
     HostCmd *q = 0;
+    if (hostrelaycmd(h, c, scratch, cmd, j)) {
+        return;  // no ids, and no replies
+    }
     switch (cmd) {
     case CMD_HELLO:
         hosthello(h, c, scratch, cid, j);
         return;
+    case CMD_RELAYOFFER: {
+        // As the peer it is, whatever it says
+        Str     line = hoststamp(&scratch, j, "peer", c->peer, {}, {}, 0);
+        JsonDoc pd   = jsonparse(&scratch, line);
+        q = hostforward(h, scratch, pd.root, cmd, HOSTCMD_CLIENT, -1, -1);
+        c->offered |= q != 0;
+    } break;
     case CMD_OPEN: {
         if (!validsid(sid)) {
             hostreply(h, c, scratch, cid, 0, "invalid session id", {});
@@ -1064,6 +1351,12 @@ static void hostrecord(Host *h, Arena scratch, Str line)
     } else if (r.ev == EV_REPLY) {
         hostreplied(h, scratch, &r, line);
         return;
+    } else if (r.ev == EV_RELAY) {
+        hostrelayed(h, scratch, &r, line);
+        return;
+    } else if (r.ev == EV_RELAYDATA) {
+        hostserved(h, scratch, &r);
+        return;
     } else if (r.ev==EV_CONFIG || r.ev==EV_WORKTREE) {
         // The configuration loaded again, or a worktree's news: for
         // every client, but a client behind misses it (it asks for the
@@ -1258,6 +1551,10 @@ static void hostframes(Host *h, HostConn *hc, Arena scratch, Str data)
             hc->client = c;
             c->conn    = hc;
             linkconnect(&c->link, now);
+            if (c->away) {
+                c->away = 0;
+                hostrelaypeer(h, scratch, c, "back");
+            }
         }
         Arena a = scratch;
         switch (linkframe(&c->link, &f, now)) {
@@ -1483,6 +1780,14 @@ static i32 hostloop(Host *h)
         now = os_ticks(os);
         hosttimers(h, now);
         for (HostClient *c = h->clients; c; c = c->next) {
+            if (c->offered && !c->gone && !c->conn && !c->away) {
+                // No stream this round: none relays through it meanwhile
+                c->away = 1;
+                hostrelaypeer(h, newarena(h->scratch), c, "away");
+            }
+        }
+        hostrelaymore(h, newarena(h->scratch));
+        for (HostClient *c = h->clients; c; c = c->next) {
             for (HostSub *s = c->subs; s && c->conn; s = s->next) {
                 if (s->catchup) {
                     hostcatchup(h, c, s, newarena(h->scratch));
@@ -1586,6 +1891,8 @@ static Host *newhost(Os *os, Arena *perm, Arena scratch, HostConf *hc, Str *err)
     h->scratch  = os_reserve(os, HOST_SCRATCH);
     h->cmds     = alloc<HostCmd>(perm, HOST_CMDS);
     h->late     = alloc<HostCmd>(perm, HOST_LATE);
+    h->relays   = alloc<HostRelay>(perm, HOST_RELAYS);
+    h->serves   = alloc<HostRelay>(perm, HOST_RELAYS);
     h->idle     = hc->idle;
     h->grace    = hostticks(h->cfg, "grace");
     h->busyat   = os_ticks(os);

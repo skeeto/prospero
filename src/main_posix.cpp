@@ -3116,6 +3116,15 @@ static i32 os_pid(Os *)
     return (i32)getpid();
 }
 
+static Str os_hostname(Os *, Arena *a)
+{
+    char buf[256] = {};
+    if (gethostname(buf, sizeof(buf)-1)) {
+        return {};
+    }
+    return clone(a, Str((u8 *)buf, (iz)strlen(buf)));
+}
+
 struct QuitWatch {
     Mailbox *mbox;
     u32      type;
