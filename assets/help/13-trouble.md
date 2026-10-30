@@ -39,6 +39,12 @@ Check the endpoint's `url` in the settings, and that the server is
 running. A server whose certificate is not trusted fails at once,
 saying why.
 
+**"paused: no relay".** The session is on a remote with no endpoint of
+its own, and no computer connected to it offers the session's model
+([Hosts and remotes](help:hosts)). Connect to the remote from a
+window whose configuration has that model, and the turn goes on. It
+waits at most the endpoint's `slow_retry_budget`.
+
 **A remote host fails to connect.** The Hosts pane, and the host's
 row in the sidebar, show why: the last line ssh printed, also kept in
 `remote/NAME.log` in the state directory. ssh runs in batch mode, so

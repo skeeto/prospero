@@ -59,8 +59,40 @@ instead (Configuration).
 
 A host's menu in the sidebar also has New session here... and Import
 session here.... A remote's sessions use the models of its own
-configuration. With `list = connected` in its section, a remote is
-left out of the sidebar until connected.
+configuration, or this computer's when it has none (below). With
+`list = connected` in its section, a remote is left out of the sidebar
+until connected.
+
+## A remote with no models of its own
+
+A remote needs no configuration. One whose configuration has no
+`[endpoint]`, or that has no file at all, uses the models of the
+computer connected to it. The window offers each remote it connects to
+its endpoints' and models' settings, never their URLs or keys, and
+makes the remote's model calls itself, with its own keys, sending the
+responses back. The Hosts pane says so under the remote, and the model
+picker of its sessions lists this computer's models. Each request
+travels as its difference from the session's last one, compressed.
+
+While a call runs this way, the session bar says "via this computer",
+or the name of the computer relaying it. With no computer connected
+that offers the session's model, its turn pauses ("paused: no relay",
+in amber) and goes on once one connects, for at most that endpoint's
+`slow_retry_budget` (two hours unless set), and then ends. A response
+cut off by a lost connection goes on from what was shown, as after a
+dropped connection to an endpoint.
+
+Web search on such a remote runs on the computer relaying it, with
+that computer's `[web]` settings, unless the remote's own
+configuration sets `[web] search`; `none` there turns it off. Reading
+web pages follows the remote's own `[web]`, so it is off until set
+there. A subagent that an agent here starts on the remote runs on its
+parent's models the same way, with no window needed. Guard, tools and
+shell settings are the remote's own, its built-in defaults if it has
+no file.
+
+An `[endpoint]` in the remote's own configuration makes it independent:
+its sessions then use only its own models.
 
 ## Subagents there
 

@@ -69,3 +69,29 @@ looks for it first; with the executable itself as the engine, its own
 one or this executable built from source on Linux, gets none. `tools/engines.py` builds the Linux helpers beside their
 engines. The engine works without a helper, so one
 that cannot be put there, or does not run there, is only a warning.
+
+An engine whose own configuration has no `[endpoint]` with a real URL
+is thin: it uses the models of the clients connected to it. A client
+that knows the `relay` cap sends `relay.offer` with its offer, the
+settings of its endpoints (kind, timeouts, retry budget, the model ids
+it knows) and `[model]` sections, its defaults, whether it searches,
+and its machine name, but never a URL, key or `max_*` setting. The
+thin engine keeps up to eight offers, a gone client's too, as layers
+of its configuration under the user's file, each endpoint at
+`relay://NAME` (`relay+anthropic://NAME` for kind anthropic). A model
+call to one of them goes back as `relay` records, part by part as the
+host makes room, to a client that offers that endpoint with that kind
+and model: the session's last, else the newest. The client's own
+engine makes it (`relay.call`), admitted in line with its own
+sessions, at the API's paths alone, and answers with `relay.data`. A
+turn's body goes as a delta against the session's last one to the
+same client, deflated when that is smaller. With no client to relay,
+the session waits in state `relay` for at most the endpoint's
+`slow_retry_budget`; a lost client's call is sent again if nothing
+showed yet, and otherwise the turn goes on from what showed. A
+hostlink offers its parent's models only for the subagents it
+started, by a token sent in `new {task}`. With `[web] search` unset, a
+thin engine's `web_search` goes the same way, as a call to the path
+`search`, which the client's engine runs with its own `[web]`. A thin
+engine offers nothing, so relays never chain, and `prospero connect`
+does not relay.
