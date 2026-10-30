@@ -2573,10 +2573,18 @@ def relay_turn(t):
 def relay_unlisted(t):
     """An offer whose listing of the endpoint leaves out the session's
     model still relays it: an endpoint may serve names it does not list
-    (llama-server lists its file, and aliases go unlisted)."""
+    (llama-server lists its file, and aliases go unlisted). The model, a
+    variant, is sent as its id."""
     thinconfig(t)
     model = t.model("remote_tool")
-    c, rl = relayclient(t, model, listed=["model.gguf"])
+    o = offer(t, "variant", listed=["model.gguf"])
+    o["models"][0]["settings"]["id"] = model
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    r = c.call("relay.offer", offer=o)
+    t.check(r.get("ok") == 1 and r.get("thin") == 1, f"relay.offer: {r}")
+    rl = Relayer(t, c)
     try:
         r = c.call("new", cwd=t.work, prompt="go")
         t.check(r.get("ok") == 1, f"new: {r}")
@@ -2585,6 +2593,9 @@ def relay_unlisted(t):
                             timeout=30, what="turn.end")
         t.check(end.get("why") == "done", f"turn.end {end}")
         t.check(finaltext(c.all(), sid).startswith("w0 w1"), "the answer")
+        posts = [b for h, b in rl.calls if h["method"] == "POST"]
+        t.check(posts and json.loads(posts[0])["model"] == model,
+                "a variant sent as its id")
     finally:
         rl.stop = True
 
@@ -2965,8 +2976,50 @@ def relay_offer(t):
     kid = [m for m in o["models"] if m["name"] == "kid"][0]["settings"]
     t.check(kid.get("context") == "1000" and kid.get("reasoning_budget") == "50" and
             kid.get("template.enable_thinking") == "false" and "max_concurrent" not in kid
-            and "like" not in kid, f"kid {kid}")
+            and "like" not in kid and kid.get("id") == "base", f"kid {kid}")
+    base = [m for m in o["models"] if m["name"] == "base"][0]["settings"]
+    t.check("id" not in base, f"base {base}")
     t.check(o.get("endpoint") == "fake", f"default {o.get('endpoint')}")
+
+
+@scenario
+def relay_offer_include(t):
+    """offer, of endpoints and models from includes, a file's and a
+    URL's, as a shared configuration has them."""
+    import http.server, threading
+    inc = os.path.join(t.root, "inc")
+    os.makedirs(inc)
+    with open(os.path.join(inc, "shared.ini"), "w") as f:
+        f.write(f"[endpoint web]\nurl = {t.args.url}/\n[model large]\n"
+                "context = 1000\n[model large-max]\nlike = large\n")
+    with open(os.path.join(inc, "local.ini"), "w") as f:
+        f.write(f"[endpoint file]\nurl = {t.args.url}/\n")
+    class H(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=inc, **kw)
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with open(t.config, "w") as f:
+            f.write(f"include = http://127.0.0.1:{srv.server_address[1]}/shared.ini\n"
+                    f"include = {os.path.join(inc, 'local.ini')}\n"
+                    "model = web/large-max\n")
+        c = Client(t)
+        c.attach()
+        c.call("hello")
+        r = c.call("offer")
+        t.check(r.get("ok") == 1, f"offer {r}")
+        o = r["offer"]
+        names = sorted(e["name"] for e in o["endpoints"])
+        t.check(names == ["file", "web"], f"endpoints {names}")
+        models = sorted(m["name"] for m in o["models"])
+        t.check(models == ["large", "large-max"], f"models {models}")
+        mx = [m for m in o["models"] if m["name"] == "large-max"][0]["settings"]
+        t.check(mx.get("id") == "large", f"large-max {mx}")
+    finally:
+        srv.shutdown()
 
 
 @scenario

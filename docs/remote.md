@@ -74,7 +74,8 @@ An engine whose own configuration has no `[endpoint]` with a real URL
 is thin: it uses the models of the clients connected to it. A client
 that knows the `relay` cap sends `relay.offer` with its offer, the
 settings of its endpoints (kind, timeouts, retry budget, the model ids
-it knows) and `[model]` sections, its defaults, whether it searches,
+it knows) and `[model]` sections (each flattened through `like`, with
+the id it sends), its defaults, whether it searches,
 and its machine name, but never a URL, key or `max_*` setting. The
 thin engine keeps up to eight offers, a gone client's too, as layers
 of its configuration under the user's file, each endpoint at

@@ -1706,9 +1706,15 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own)
         putstrkey(w, "name", s->name);
         putkey(w, "settings");
         putobject(w);
+        // Its id, which its like gives by default, since like goes
+        Str id = cfgmodelid(cfg, s->name);
+        if (!(id == s->name)) {
+            putstrkey(w, "id", id);
+        }
         for (iz i = 0; i < countof(cfgschema); i++) {
             CfgKey *k = &cfgschema[i];
-            if (!(k->kind=="model") || cfgfamily(k) || !relaymodelkey(k->key)) {
+            if (!(k->kind=="model") || cfgfamily(k) || !relaymodelkey(k->key) ||
+                    k->key=="id") {
                 continue;
             }
             IniEntry *x = cfgfind(cfg, "model", s->name, k->key).e;
