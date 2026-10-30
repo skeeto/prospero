@@ -2956,11 +2956,15 @@ def relay_search_serve(t):
 @scenario
 def relay_offer(t):
     """offer: this engine's endpoints, with the settings a thin engine
-    needs and never a URL or key, its models flattened through like."""
+    needs and never a URL or key, its models flattened through like, and
+    a model's on one endpoint, ENDPOINT/MODEL, flattened as that endpoint
+    sees it, for each model whose chain has one."""
     with open(t.config, "a") as f:
         f.write("key = sk-secret-1234\n[model base]\ncontext = 1000\n"
                 "template.enable_thinking = false\n"
-                "[model kid]\nlike = base\nreasoning_budget = 50\nmax_concurrent = 3\n")
+                "[model kid]\nlike = base\nreasoning_budget = 50\nmax_concurrent = 3\n"
+                "[model fake/base]\ncontext = 2000\n"
+                "[model solo]\ncontext = 3000\n")
     c = Client(t)
     c.attach()
     c.call("hello")
@@ -2979,6 +2983,14 @@ def relay_offer(t):
             and "like" not in kid and kid.get("id") == "base", f"kid {kid}")
     base = [m for m in o["models"] if m["name"] == "base"][0]["settings"]
     t.check("id" not in base, f"base {base}")
+    names = [m["name"] for m in o["models"]]
+    t.check(names == ["base", "fake/base", "kid", "fake/kid", "solo"], f"models {names}")
+    fb = [m for m in o["models"] if m["name"] == "fake/base"][0]["settings"]
+    t.check(fb.get("context") == "2000" and fb.get("id") == "base" and
+            fb.get("template.enable_thinking") == "false", f"fake/base {fb}")
+    fk = [m for m in o["models"] if m["name"] == "fake/kid"][0]["settings"]
+    t.check(fk.get("context") == "2000" and fk.get("reasoning_budget") == "50" and
+            fk.get("id") == "base", f"fake/kid {fk}")
     t.check(o.get("endpoint") == "fake", f"default {o.get('endpoint')}")
 
 

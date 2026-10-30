@@ -1638,11 +1638,72 @@ static i64 relaynext(Engine *e, i64 now)
 
 // The offer: this engine's models, as a thin engine may relay them
 
+// Whether an offer has an endpoint: one with a URL of its own.
+static b32 relayoffers(Engine *e, Arena scratch, Str name)
+{
+    Endpoint ep = {};
+    return relayname(name) && endpointconf(e, &scratch, name, &ep) && !ep.relay.len;
+}
+
+// A model's settings for an offer, into w, flattened through like.
+static void relaymodelput(Engine *e, JsonOut *w, Arena scratch, Str name)
+{
+    Config *cfg = e->cfg;
+    putobject(w);
+    putstrkey(w, "name", name);
+    putkey(w, "settings");
+    putobject(w);
+    // Its id, which its like gives by default, since like goes
+    Str id = cfgmodelid(cfg, name);
+    if (!(id == name)) {
+        putstrkey(w, "id", id);
+    }
+    for (iz i = 0; i < countof(cfgschema); i++) {
+        CfgKey *k = &cfgschema[i];
+        if (!(k->kind=="model") || cfgfamily(k) || !relaymodelkey(k->key) ||
+                k->key=="id") {
+            continue;
+        }
+        IniEntry *x = cfgfind(cfg, "model", name, k->key).e;
+        if (x && x->line->valbeg<x->line->valend) {
+            IniLine *l = x->line;
+            putstrkey(w, k->key, Str(l->raw.data+l->valbeg, l->valend-l->valbeg));
+        }
+    }
+    // Template arguments, merged along the chain, as written
+    Str chain[CFG_LIKEMAX];
+    i32 len = cfglikechain(e->ini, name, chain);
+    Slice<IniEntry *> args = {};
+    for (i32 i = len-1; i >= 0; i--) {
+        IniSection *t = inisection(e->ini, "model", chain[i]);
+        for (IniEntry *x = t ? t->keys : 0; x; x = x->next) {
+            if (!cfgtemplatename(x->key).len) {
+                continue;
+            }
+            iz k = 0;
+            for (; k<args.len && !(args[k]->key==x->key); k++) {}
+            if (k == args.len) {
+                args = push(&scratch, args, x);
+            } else {
+                args[k] = x;
+            }
+        }
+    }
+    for (iz i = 0; i < args.len; i++) {
+        IniLine *l = args[i]->line;
+        putstrkey(w, args[i]->key, Str(l->raw.data+l->valbeg, l->valend-l->valbeg));
+    }
+    putend(w);
+    putend(w);
+}
+
 // An offer, for relay.offer, into w: each endpoint that has a URL of its
 // own, its settings that a thin engine needs, and the models its last
 // listing gave, but never its URL or key; each [model] section flattened
-// through like; the defaults; whether it searches; and own, a hostlink's
-// token, for the sessions it made alone.
+// through like, and for each offered endpoint whose chain differs there,
+// its ENDPOINT/MODEL too, as like no longer joins the two; the defaults;
+// whether it searches; and own, a hostlink's token, for the sessions it
+// made alone.
 static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own)
 {
     Config *cfg = e->cfg;
@@ -1662,9 +1723,10 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own)
     for (IniSection *s = inifirst(e->ini, "endpoint"); s; s = ininext(s)) {
         Arena    a  = scratch;
         Endpoint ep = {};
-        if (!relayname(s->name) || !endpointconf(e, &a, s->name, &ep) || ep.relay.len) {
+        if (!relayoffers(e, a, s->name)) {
             continue;  // relays do not chain
         }
+        endpointconf(e, &a, s->name, &ep);
         Url u     = parseurl(ep.url);
         b32 local = u.ok && localhost(u.host);
         named |= s->name == dep;
@@ -1699,55 +1761,34 @@ static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own)
     putkey(w, "models");
     putarray(w);
     for (IniSection *s = inifirst(e->ini, "model"); s; s = ininext(s)) {
-        if (!s->name.len) {
+        // Each model once, at its first section, plain or qualified
+        Str bare  = cfgbaremodel(e->ini, s->name);
+        b32 first = bare.len > 0;
+        for (IniSection *t = inifirst(e->ini, "model"); first && t!=s; t = ininext(t)) {
+            first = !(cfgbaremodel(e->ini, t->name) == bare);
+        }
+        if (!first) {
             continue;
         }
-        putobject(w);
-        putstrkey(w, "name", s->name);
-        putkey(w, "settings");
-        putobject(w);
-        // Its id, which its like gives by default, since like goes
-        Str id = cfgmodelid(cfg, s->name);
-        if (!(id == s->name)) {
-            putstrkey(w, "id", id);
+        if (inisection(e->ini, "model", bare)) {
+            relaymodelput(e, w, scratch, bare);
         }
-        for (iz i = 0; i < countof(cfgschema); i++) {
-            CfgKey *k = &cfgschema[i];
-            if (!(k->kind=="model") || cfgfamily(k) || !relaymodelkey(k->key) ||
-                    k->key=="id") {
+        for (IniSection *p = inifirst(e->ini, "endpoint"); p; p = ininext(p)) {
+            if (!relayoffers(e, scratch, p->name)) {
                 continue;
             }
-            IniEntry *x = cfgfind(cfg, "model", s->name, k->key).e;
-            if (x && x->line->valbeg<x->line->valend) {
-                IniLine *l = x->line;
-                putstrkey(w, k->key, Str(l->raw.data+l->valbeg, l->valend-l->valbeg));
+            Str q = concat(&scratch, concat(&scratch, p->name, "/"), bare);
+            Str chain[CFG_LIKEMAX];
+            i32 len  = cfglikechain(e->ini, q, chain);
+            b32 qual = 0;
+            for (i32 i = 0; i < len; i++) {
+                qual |= cfgsplitmodel(e->ini, chain[i]).ok &&
+                        inisection(e->ini, "model", chain[i]);
+            }
+            if (qual) {
+                relaymodelput(e, w, scratch, q);
             }
         }
-        // Template arguments, merged along the chain, as written
-        Str chain[CFG_LIKEMAX];
-        i32 len = cfglikechain(e->ini, s->name, chain);
-        Slice<IniEntry *> args = {};
-        for (i32 i = len-1; i >= 0; i--) {
-            IniSection *t = inisection(e->ini, "model", chain[i]);
-            for (IniEntry *x = t ? t->keys : 0; x; x = x->next) {
-                if (!cfgtemplatename(x->key).len) {
-                    continue;
-                }
-                iz k = 0;
-                for (; k<args.len && !(args[k]->key==x->key); k++) {}
-                if (k == args.len) {
-                    args = push(&scratch, args, x);
-                } else {
-                    args[k] = x;
-                }
-            }
-        }
-        for (iz i = 0; i < args.len; i++) {
-            IniLine *l = args[i]->line;
-            putstrkey(w, args[i]->key, Str(l->raw.data+l->valbeg, l->valend-l->valbeg));
-        }
-        putend(w);
-        putend(w);
     }
     putend(w);
     putend(w);

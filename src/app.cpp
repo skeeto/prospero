@@ -1973,15 +1973,33 @@ static Slice<GuiRole> replyroles(Arena *a, Json *j)
     return r;
 }
 
+// Whether a [model] section's name in a config.get reply is a model's
+// settings on one endpoint, ENDPOINT/MODEL, ENDPOINT one with a URL.
+static b32 replyqualified(Json *j, Str name)
+{
+    Cut m = cut(name, '/');
+    if (!m.ok || !m.head.len || !m.tail.len) {
+        return 0;
+    }
+    for (Json *s = jsonget(j, "settings")->child; s; s = s->next) {
+        if (jsonstr(jsonget(s, "kind"))=="endpoint" && jsonstr(jsonget(s, "name"))==m.head &&
+                jsonstr(jsonget(s, "key"))=="url" && trim(jsonstr(jsonget(s, "value"))).len) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // The [model NAME] sections in a config.get reply, each with its id,
-// which the reply gives in effect, else the name.
+// which the reply gives in effect, else the name. One for a model on
+// one endpoint is left out, as it is no model of its own.
 static Slice<GuiModel> replyconfs(Arena *a, Json *j)
 {
     Slice<GuiModel> r = {};
     for (Json *s = jsonget(j, "settings")->child; s; s = s->next) {
         Str name = jsonstr(jsonget(s, "name"));
         if (jsonstr(jsonget(s, "kind"))=="model" && name.len &&
-                jsonstr(jsonget(s, "key"))=="id") {
+                jsonstr(jsonget(s, "key"))=="id" && !replyqualified(j, name)) {
             Str      id = trim(jsonstr(jsonget(s, "value")));
             GuiModel m  = {name, id.len ? id : name};
             r = push(a, r, m);

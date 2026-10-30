@@ -1248,24 +1248,90 @@ static iz cfgdistance(Str a, Str b)
 // requests, is likewise inherited, and by default is the name of the
 // model at the end of the chain, so that large-quick, like large, is
 // the server's large with other settings.
+//
+// A section may name its endpoint, [model ENDPOINT/MODEL]: MODEL's
+// settings on that endpoint only, each winning over [model MODEL]'s.
+// A model on an endpoint is named the same way, and so is its chain:
+// each model of it is its section for the endpoint, when there is one,
+// then its own. A like of ENDPOINT/MODEL takes the chain onto that
+// endpoint from there. A qualified section's like, when set, replaces
+// its model's; one naming its own model is the same as none. The id is
+// never qualified.
 
 enum { CFG_LIKEMAX = 16 };
 
-// The chain of a model's like, into out (room for CFG_LIKEMAX): the
-// model itself first, each at most once. Returns the count of names.
-static i32 cfglikechain(Ini *ini, Str name, Str *out)
+// MODEL split from ENDPOINT/MODEL, where ENDPOINT is a configured
+// endpoint's name, else null: a model's own name may hold a slash
+// (Qwen/Qwen3-8B).
+static Cut cfgsplitmodel(Ini *ini, Str spec)
 {
-    i32 n = 0;
-    while (name.len && n<CFG_LIKEMAX) {
-        for (i32 i = 0; i < n; i++) {
-            if (out[i] == name) {
-                return n;  // a cycle
-            }
-        }
-        out[n++] = name;
-        IniEntry *l = inilookup(ini, "model", name, "like");
-        name = l ? trim(l->value) : Str{};
+    Cut       m = cut(spec, '/');
+    IniEntry *u = m.ok && m.head.len ? inilookup(ini, "endpoint", m.head, "url") : 0;
+    m.ok = m.ok && m.tail.len && u && trim(u->value).len;
+    return m;
+}
+
+// A model's name without its endpoint.
+static Str cfgbaremodel(Ini *ini, Str name)
+{
+    Cut m = cfgsplitmodel(ini, name);
+    return m.ok ? m.tail : name;
+}
+
+// The name of the [model EP/MODEL] section, or null if there is none.
+static Str cfgqualsection(Ini *ini, Str ep, Str model)
+{
+    u8 buf[256];
+    if (!ep.len || ep.len+1+model.len > countof(buf)) {
+        return {};
     }
+    copybytes(buf, ep.data, ep.len);
+    buf[ep.len] = '/';
+    copybytes(buf+ep.len+1, model.data, model.len);
+    IniSection *s = inisection(ini, "model", Str{buf, ep.len+1+model.len});
+    return s ? s->name : Str{};
+}
+
+// The chain of a model's like, into out (room for CFG_LIKEMAX): the
+// model itself first, each section at most once, a model on an endpoint
+// as two, its qualified section then its own. Returns the count of
+// names. When given, *next gets the name that cut it short, at a cycle
+// or past CFG_LIKEMAX, else null.
+static i32 cfglikechain(Ini *ini, Str name, Str *out, Str *next = 0)
+{
+    i32 n  = 0;
+    Str ep = {};
+    while (name.len) {
+        Cut q = cfgsplitmodel(ini, name);
+        if (q.ok) {
+            ep   = q.head;
+            name = q.tail;
+        }
+        Str qual     = cfgqualsection(ini, ep, name);
+        Str links[2] = {qual, name};
+        for (i32 k = 0; k < 2; k++) {
+            if (!links[k].len) {
+                continue;
+            }
+            b32 seen = n == CFG_LIKEMAX;
+            for (i32 i = 0; !seen && i < n; i++) {
+                seen = out[i] == links[k];
+            }
+            if (seen) {
+                if (next) *next = links[k];
+                return n;
+            }
+            out[n++] = links[k];
+        }
+        IniEntry *l = qual.len ? inilookup(ini, "model", qual, "like") : 0;
+        Str       v = l ? trim(l->value) : Str{};
+        if (!l || v==name || v==qual) {
+            l = inilookup(ini, "model", name, "like");
+            v = l ? trim(l->value) : Str{};
+        }
+        name = v;
+    }
+    if (next) *next = {};
     return n;
 }
 
@@ -1330,12 +1396,12 @@ static Str cfgmodelid(Config *c, Str name)
         return id;
     }
     Str chain[CFG_LIKEMAX];
-    i32 len = cfglikechain(c->ini, name, chain);
-    if (len==CFG_LIKEMAX || !len) {
-        return name;  // too long to tell
+    Str next = {};
+    i32 len  = cfglikechain(c->ini, name, chain, &next);
+    if (!len || next.len) {
+        return cfgbaremodel(c->ini, name);  // a cycle, or too long to tell
     }
-    IniEntry *l = inilookup(c->ini, "model", chain[len-1], "like");
-    return l && trim(l->value).len ? name : chain[len-1];  // a cycle: itself
+    return chain[len-1];  // a model's own name, last
 }
 
 // A model's template arguments ([model] template.NAME), merged along its
@@ -1818,14 +1884,10 @@ static void cfgkeyline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
 static void cfglikecheck(Ini *ini, Arena *perm, Str name, IniEntry *e)
 {
     Str chain[CFG_LIKEMAX];
-    i32 len  = cfglikechain(ini, name, chain);
-    Str next = {};
-    if (len) {
-        IniEntry *l = inilookup(ini, "model", chain[len-1], "like");
-        next = l ? trim(l->value) : Str{};
-    }
-    b32 cycle = next == name;
-    b32 deep = len==CFG_LIKEMAX && next.len;
+    Str next  = {};
+    i32 len   = cfglikechain(ini, name, chain, &next);
+    b32 cycle = next.len && next==name;
+    b32 deep  = len==CFG_LIKEMAX && next.len;
     for (i32 i = 0; deep && i < len; i++) {
         deep = !(chain[i] == next);
     }

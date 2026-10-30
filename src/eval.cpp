@@ -2248,7 +2248,9 @@ static Slice<EvalModel> evalowns(Arena *a, Arena scratch, Slice<Str> lines, Conf
             EvalModel x = {};
             x.endpoint = clone(a, e);
             x.model    = clone(a, m);
-            x.own      = editnames[editformat(cfgget(cfg, "model", m, "edit_format", 0))];
+            Str q      = concat(&t, concat(&t, e, "/"), m);
+            Str own    = cfgsplitmodel(cfg->ini, q).ok ? q : m;  // as on endpoint e
+            x.own      = editnames[editformat(cfgget(cfg, "model", own, "edit_format", 0))];
             r = push(a, r, x);
         }
     }

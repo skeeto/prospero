@@ -1231,7 +1231,7 @@ static void testcfgengine(Test *t)
     };
     for (iz i = 0; i < countof(models); i++) {
         ModelConf mc = {};
-        modelconf(e, &a, models[i].model, &mc);
+        modelconf(e, &a, "", models[i].model, &mc);
         Buf b(&a, 128);
         putbyte(&b, '[');
         print(&b, mc.reasoning);
@@ -1256,7 +1256,7 @@ static void testcfgengine(Test *t)
     s->model    = "m";
     s->cwd      = "/w";
     endpointconf(e, &s->perm, "local", &s->ep);
-    modelconf(e, &s->perm, s->model, &s->mc);
+    modelconf(e, &s->perm, "", s->model, &s->mc);
     e->sessions = s;
     for (i32 i = 0; i < 2; i++) {
         Arena tmp = v.scratch;
@@ -1802,7 +1802,7 @@ static void testcfglike(Test *t)
     e->cfg = c;
     e->ini = c->ini;
     ModelConf mc = {};
-    modelconf(e, &a, "large-quick", &mc);
+    modelconf(e, &a, "", "large-quick", &mc);
     expect(t, "like.mc.name", mc.name, "large");
     expect(t, "like.mc.kwargs", mc.kwargs,
            "{\"thinking\":true,\"reasoning_effort\":25,\"label\":\"42\","
@@ -1824,7 +1824,7 @@ static void testcfglike(Test *t)
     expect(t, "like.anthropic", istr(&a, find(an, "chat_template_kwargs")), "-1");
     expect(t, "like.anthropic.model", istr(&a, find(an, "\"model\":\"large\"")>0), "1");
     ModelConf none = {};
-    modelconf(e, &a, "other", &none);
+    modelconf(e, &a, "", "other", &none);
     expect(t, "like.none", none.kwargs.data ? none.kwargs : Str("(null)"), "(null)");
     cfgfree(c);
 
@@ -1861,6 +1861,131 @@ static void testcfglike(Test *t)
         CfgSet s  = cfgset(c, &t2, "model", "m", bad[i].key, bad[i].value);
         expect(t, concat(&a, "like.bad ", bad[i].key), istr(&a, s.ok), "0");
     }
+    cfgfree(c);
+}
+
+// [model ENDPOINT/MODEL]: a model's settings on one endpoint, over its
+// own a setting at a time, along a chain of like too; a like naming an
+// endpoint; ids never qualified; and names that only look qualified.
+static void testcfgqualified(Test *t)
+{
+    Arena  a = t->perm;
+    CfgEnv v = newcfgenv(&a);
+    os_write(v.os, a, "/q/h.ini",
+             "[endpoint foo]\n"
+             "url = http://foo.test/v1\n"
+             "[endpoint baz]\n"
+             "url = http://baz.test/v1\n"
+             "[endpoint nourl]\n"                  // 5
+             "[model Bar]\n"
+             "context = 1000\n"
+             "top_p = 0.5\n"
+             "[model foo/Bar]\n"
+             "context = 2000\n"                    // 10
+             "template.mode = foo\n"
+             "[model Bar-think]\n"
+             "like = Bar\n"
+             "reasoning_budget = 64\n"
+             "[model pinned]\n"                    // 15
+             "like = foo/Bar\n"
+             "[model foo/Swap]\n"
+             "like = Bar\n"
+             "[model Swap]\n"
+             "like = Other\n"                      // 20
+             "[model Other]\n"
+             "top_p = 0.9\n"
+             "[model Qwen/Qwen3-8B]\n"
+             "context = 3000\n"
+             "[model foo/Qwen/Qwen3-8B]\n"         // 25
+             "context = 4000\n"
+             "[model nourl/Bar]\n"
+             "context = 5000\n"
+             "[model foo/Self]\n"
+             "like = Self\n");                     // 30
+    Config *c = newconfig(v.os, &a, v.scratch, "/q/h.ini", 0);
+    expect(t, "qual.diags", inidiags(&a, c->ini),
+           "/q/h.ini:5:2: warning: endpoint nourl has no url");
+
+    static struct { Str model, key, want; } gets[] = {
+        {"foo/Bar", "context", "2000"},          // its own on foo
+        {"foo/Bar", "top_p", "0.5"},             // the rest from Bar's
+        {"baz/Bar", "context", "1000"},          // elsewhere, Bar's
+        {"Bar", "context", "1000"},
+        {"foo/Bar-think", "context", "2000"},    // a variant on foo
+        {"foo/Bar-think", "reasoning_budget", "64"},
+        {"baz/Bar-think", "context", "1000"},
+        {"pinned", "context", "2000"},           // like foo/Bar, anywhere
+        {"baz/pinned", "context", "2000"},
+        {"pinned", "top_p", "0.5"},
+        {"foo/Swap", "top_p", "0.5"},            // its like replaces Swap's
+        {"baz/Swap", "top_p", "0.9"},
+        {"Qwen/Qwen3-8B", "context", "3000"},    // no endpoint Qwen
+        {"foo/Qwen/Qwen3-8B", "context", "4000"},
+        {"baz/Qwen/Qwen3-8B", "context", "3000"},
+        {"nourl/Bar", "context", "5000"},        // a model of its own
+        {"foo/Self", "like", "Self"},
+    };
+    for (iz i = 0; i < countof(gets); i++) {
+        Str got = cfgget(c, "model", gets[i].model, gets[i].key, 0);
+        expect(t, concat(&a, concat(&a, concat(&a, "qual.get ", gets[i].model), "."),
+                         gets[i].key), got, gets[i].want);
+    }
+
+    static struct { Str model, want; } ids[] = {
+        {"foo/Bar", "Bar"}, {"baz/Bar", "Bar"}, {"foo/Bar-think", "Bar"},
+        {"pinned", "Bar"}, {"baz/pinned", "Bar"}, {"foo/Swap", "Bar"},
+        {"baz/Swap", "Other"}, {"foo/Qwen/Qwen3-8B", "Qwen/Qwen3-8B"},
+        {"nourl/Bar", "nourl/Bar"}, {"foo/Self", "Self"},
+    };
+    for (iz i = 0; i < countof(ids); i++) {
+        expect(t, concat(&a, "qual.id ", ids[i].model), cfgmodelid(c, ids[i].model),
+               ids[i].want);
+    }
+
+    // The chain on an endpoint: each model's section there, then its own
+    Str chain[CFG_LIKEMAX];
+    Buf b(&a, 256);
+    i32 n = cfglikechain(c->ini, "foo/Bar-think", chain);
+    for (i32 i = 0; i < n; i++) {
+        print(&b, i ? Str(" ") : Str(""));
+        print(&b, chain[i]);
+    }
+    expect(t, "qual.chain", finish(&b), "Bar-think foo/Bar Bar");
+    expect(t, "qual.args", cfgtemplate(c, &a, "foo/Bar-think"), "{\"mode\":\"foo\"}");
+
+    // The engine's, by the endpoint a session is on
+    Engine *e = alloc<Engine>(&a);
+    e->os  = v.os;
+    e->cfg = c;
+    e->ini = c->ini;
+    expect(t, "qual.epmodel", epmodel(e, &a, "foo", "Bar"), "foo/Bar");
+    expect(t, "qual.epmodel.url", epmodel(e, &a, "http://foo.test/v1", "Bar"), "Bar");
+    expect(t, "qual.epmodel.nourl", epmodel(e, &a, "nourl", "Bar"), "Bar");
+    ModelConf mc = {};
+    modelconf(e, &a, "foo", "Bar-think", &mc);
+    expect(t, "qual.mc", concat(&a, concat(&a, mc.name, " "), istr(&a, mc.ctx)), "Bar 2000");
+    ModelConf other = {};
+    modelconf(e, &a, "baz", "Bar-think", &other);
+    expect(t, "qual.mc.baz", istr(&a, other.ctx), "1000");
+    ModelConf only = {};
+    modelconf(e, &a, "foo", "Swap", &only);  // a section of its own, foo's
+    expect(t, "qual.mc.conf", istr(&a, only.conf), "1");
+
+    // A cycle through a qualified section is reported where it starts
+    cfgfree(c);
+    os_write(v.os, a, "/q/h.ini",
+             "[endpoint foo]\n"
+             "url = http://foo.test/v1\n"
+             "[model foo/A]\n"
+             "like = foo/B\n"
+             "[model foo/B]\n"
+             "like = foo/A\n");
+    c = newconfig(v.os, &a, v.scratch, "/q/h.ini", 0);
+    expect(t, "qual.cycle", inidiags(&a, c->ini),
+           "/q/h.ini:4:8: warning: like makes a cycle, foo/A -> A -> foo/B -> B -> "
+           "foo/A, so settings are taken once around it\n"
+           "/q/h.ini:6:8: warning: like makes a cycle, foo/B -> B -> foo/A -> A -> "
+           "foo/B, so settings are taken once around it");
     cfgfree(c);
 }
 
@@ -2226,5 +2351,6 @@ static void test_config(Test *t)
     testcfgjson(t);
     testcfgengine(t);
     testcfglike(t);
+    testcfgqualified(t);
     testcfgpath(t);
 }

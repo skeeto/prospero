@@ -3456,6 +3456,10 @@ def sc_queue_leave_b(model, n, req):
 sc_queue_leave_c = sc_queue_leave_b
 
 
+def sc_qualified_model(model, n, req):
+    yield from answer(model, "Done.")
+
+
 def sc_template_variant(model, n, req):
     # Long enough that a model and its variant overlap, if let
     yield S.head()

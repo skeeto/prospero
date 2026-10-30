@@ -796,6 +796,32 @@ def plain(t):
     t.check("temperature" not in req, "no sampling parameters unless configured")
 
 
+@scenario(conf={"_extra": (
+    "[model {model}]\n"
+    "temperature = 0.5\n"
+    "top_p = 0.75\n"
+    "[model fake/{model}]\n"
+    "temperature = 0.25\n"
+    "[model v-{nonce}]\n"
+    "like = {model}\n"
+    "seed = 7\n")}, bound=10)
+def qualified_model(t):
+    """[model ENDPOINT/MODEL]: a model's settings on that endpoint win
+    over its own, one at a time, for a variant of it too, which is sent
+    as the model's id."""
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    r = t.run(extra=["-m", f"v-{t.nonce}"])
+    t.check(r.rc == 0, f"variant: exit {r.rc}: {r.stderr}")
+    reqs = [x["body"] for x in t.requests()]
+    t.check(len(reqs) == 2, f"both sent as the model's id: {len(reqs)}")
+    own, var = reqs
+    t.check(own.get("temperature") == 0.25 and own.get("top_p") == 0.75,
+            f"the endpoint's over the model's: {own}")
+    t.check(var.get("temperature") == 0.25 and var.get("top_p") == 0.75 and
+            var.get("seed") == 7, f"the variant's, on the endpoint: {var}")
+
+
 @scenario(bound=10)
 def read_edit_shell(t):
     t.put("hello.txt", "hello world\n")

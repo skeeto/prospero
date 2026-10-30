@@ -1369,12 +1369,25 @@ static void addassistant(Session *s, Arena scratch, Slice<Block> blocks,
 
 // A nudge: an injected user message, counted against its cap. Returns 0
 // once the cap is spent, and the caller ends the turn.
+// A model as its settings name it on an endpoint (a name or URL):
+// ENDPOINT/MODEL for a configured endpoint, whose [model ENDPOINT/MODEL]
+// wins over [model MODEL] (config.cpp), else the model alone.
+static Str epmodel(Engine *e, Arena *a, Str which, Str model)
+{
+    if (!which.len) {
+        return model;
+    }
+    Str q = concat(a, concat(a, which, "/"), model);
+    return cfgsplitmodel(e->cfg->ini, q).ok ? q : model;
+}
+
 static b32 nudge(Session *s, Arena scratch, i32 kind, Str text)
 {
     i32 cap = nudgeinfo[kind].cap;
     if (kind == N_EMPTY) {
         // The model's empty_retries, at most 100
-        Str v = trim(cfgget(s->e->cfg, "model", s->model, "empty_retries", 0));
+        Str m = epmodel(s->e, &scratch, s->ep.name, s->model);
+        Str v = trim(cfgget(s->e->cfg, "model", m, "empty_retries", 0));
         Int n = parseint(v);
         cap = n.ok && n.val>=0 ? (i32)(n.val<100 ? n.val : 100) : cap;
     }
@@ -1795,7 +1808,7 @@ static b32 admit(Session *s, Arena scratch)
         probe(e, p, ep, scratch);
     }
     pointlimits(p);
-    i32 cap = confint(cfg, "model", model, "max_concurrent");
+    i32 cap = confint(cfg, "model", epmodel(e, &scratch, ep->name, model), "max_concurrent");
     cap = cap ? cap : mi.slots ? mi.slots : p->slots ? p->slots : 4;
 
     s->admid     = s->admid ? s->admid : ++e->nextid;
@@ -2403,7 +2416,8 @@ static void runcalls(Session *s, Arena scratch, Slice<Block> blocks)
 // Retries and fallbacks
 
 static b32  endpointconf(Engine *, Arena *, Str which, Endpoint *);
-static void modelconf(Engine *, Arena *, Str model, ModelConf *);
+static void modelconf(Engine *, Arena *, Str which, Str model, ModelConf *);
+
 
 // Ticks of slow waiting and cooldowns, as the test hook has them.
 static i64 scaled(Engine *e, i64 ticks)
@@ -2514,7 +2528,7 @@ static b32 usetarget(Session *s, Str which, Str model)
     ModelConf mc = {};
     s->ep    = ep;
     s->model = clone(&s->perm, model);
-    modelconf(e, &s->perm, s->model, &mc);
+    modelconf(e, &s->perm, ep.name, s->model, &mc);
     s->mc         = mc;
     s->info       = {};
     s->discovered = 0;
@@ -2559,7 +2573,8 @@ static b32 nexttarget(Session *s, Arena scratch, i32 cls, i32 status, Str msg)
         return 0;
     }
     Engine    *e     = s->e;
-    Str        list  = cfgget(e->cfg, "model", s->homemodel, "fallback", 0);
+    Str        home  = epmodel(e, &scratch, s->home, s->homemodel);
+    Str        list  = cfgget(e->cfg, "model", home, "fallback", 0);
     Slice<Str> chain = {};
     for (Str rest = list; rest.len;) {
         Str w = cfgnextword(&rest);
@@ -2570,7 +2585,7 @@ static b32 nexttarget(Session *s, Arena scratch, i32 cls, i32 status, Str msg)
             continue;  // names nothing usable
         }
         if (!s->target) {
-            i64 cool  = cfgms(e->cfg, "model", s->homemodel, "fallback_cooldown", 0);
+            i64 cool  = cfgms(e->cfg, "model", home, "fallback_cooldown", 0);
             s->homeat = os_ticks(e->os) + scaled(e, cool*MS);
         }
         s->target = (i32)i + 1;
@@ -11302,8 +11317,9 @@ static b32 prune(Session *s, Arena scratch, i32 why)
 static void compactor(Session *s, Arena scratch, Compact *cp)
 {
     Engine *e     = s->e;
-    Str     spec  = trim(cfgget(e->cfg, "model", s->model, "compactor", 0));
     Str     own   = s->ep.name.len ? s->ep.name : s->ep.url;
+    Str     mine  = epmodel(e, &scratch, own, s->model);
+    Str     spec  = trim(cfgget(e->cfg, "model", mine, "compactor", 0));
     Target  t     = spec.len ? targetof(e, spec, own) : Target{own, s->model};
     Str     which = t.which;
     Str     model = t.model;
@@ -11316,7 +11332,7 @@ static void compactor(Session *s, Arena scratch, Compact *cp)
         cp->mc = s->mc;  // with what discovery learned
         return;
     }
-    modelconf(e, &s->perm, cp->model, &cp->mc);
+    modelconf(e, &s->perm, cp->ep.name, cp->model, &cp->mc);
     i64 *k = upsert(&e->kinds, kindkey(&scratch, cp->ep.url, cp->mc.name), (Arena *)0);
     cp->mc.llamacpp = k && (*k&1);
 }
@@ -12091,14 +12107,16 @@ static CfgDefaults defaults(Engine *e, Arena scratch, Str which)
     return d;
 }
 
-static void modelconf(Engine *e, Arena *perm, Str model, ModelConf *mc)
+// A model's settings, as on the endpoint which (a name or URL).
+static void modelconf(Engine *e, Arena *perm, Str which, Str bare, ModelConf *mc)
 {
     static Str const sampling[] = {
         "temperature", "top_p", "top_k", "min_p", "presence_penalty",
         "frequency_penalty", "repeat_penalty", "seed", "max_tokens",
     };
-    Config *cfg = e->cfg;
-    mc->conf   = inisection(cfg->ini, "model", model) != 0;
+    Config *cfg   = e->cfg;
+    Str     model = epmodel(e, perm, which, bare);
+    mc->conf   = inisection(cfg->ini, "model", model) || inisection(cfg->ini, "model", bare);
     mc->name   = clone(perm, cfgmodelid(cfg, model));
     mc->kwargs = cfgtemplate(cfg, perm, model);
     Str r = trim(cfgget(cfg, "model", model, "reasoning", 0));
@@ -13349,7 +13367,8 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     // names for its subagents, else the parent's own, each MODEL or
     // ENDPOINT/MODEL: at that endpoint, else the role's, else the parent's
     Str      dflt  = r.endpoint.len ? r.endpoint : p->home;
-    Str      sub   = trim(cfgget(e->cfg, "model", p->homemodel, "subagent_model", 0));
+    Str      mine  = epmodel(e, &scratch, p->home, p->homemodel);
+    Str      sub   = trim(cfgget(e->cfg, "model", mine, "subagent_model", 0));
     Str      spec  = args->model.len ? args->model : r.model.len ? r.model : sub;
     Target   to    = spec.len ? targetof(e, spec, dflt) : Target{dflt, p->homemodel};
     Str      model = to.model;
@@ -13391,7 +13410,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     }
     s->model = clone(&s->perm, model);
     endpointconf(e, &s->perm, which, &s->ep);
-    modelconf(e, &s->perm, s->model, &s->mc);
+    modelconf(e, &s->perm, s->ep.name, s->model, &s->mc);
     s->te.edit = s->mc.edit;
     s->role    = clone(&s->perm, r.name);
     s->rolepr  = clone(&s->perm, r.prompt);
@@ -15014,7 +15033,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         s->roots = push(&s->perm, s->roots, clone(&s->perm, roots[i]));
     }
     endpointconf(e, &s->perm, which, &s->ep);
-    modelconf(e, &s->perm, model, &s->mc);
+    modelconf(e, &s->perm, s->ep.name, model, &s->mc);
     s->te.edit = fmt.len ? editformat(fmt) : s->mc.edit;
     if (wtask->type != JSON_MISSING) {
         Str err = wtnew(s, scratch, wtask, real);  // in the session's arena
@@ -15515,7 +15534,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         dropsession(e, s);
         return 0;
     }
-    modelconf(e, &s->perm, s->model, &s->mc);
+    modelconf(e, &s->perm, s->ep.name, s->model, &s->mc);
     replayjobs(s, scratch);
     sessionready(s, scratch);
     planheed(s, scratch);  // a notice of the mode lost with its process
@@ -18105,7 +18124,7 @@ static void reconfigure(Engine *e, Arena scratch)
             s->ep = ep;
         }
         ModelConf mc = {};
-        modelconf(e, &s->perm, s->model, &mc);
+        modelconf(e, &s->perm, s->ep.name, s->model, &mc);
         if (s->mc.conf && !mc.conf) {
             continue;
         }

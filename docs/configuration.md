@@ -94,6 +94,21 @@ discovery, context limits and the places on a router are OTHER's:
 A variant is chosen as any model is, for a session, a role, a
 fallback or a compactor.
 
+A `[model NAME]` section applies wherever an endpoint lists NAME. Where
+two endpoints list the same model, `[model ENDPOINT/MODEL]` sets it on
+one of them only, each of its settings winning over `[model MODEL]`'s:
+
+    [model large]
+    template.thinking = true
+
+    [model gpu/large]
+    context = 32768
+
+A variant of `large` on `gpu` takes the `gpu/large` settings too, and
+`like = gpu/large` takes them on any endpoint. ENDPOINT must be a
+configured endpoint with a URL: otherwise the name is a model's own,
+as for `Qwen/Qwen3-8B`.
+
 Sessions, their logs and the cache of URL includes live in the state
 directory: `$XDG_STATE_HOME/prospero`, else `~/.local/state/prospero`.
 On Windows, `%LOCALAPPDATA%\prospero`, where it used to be, is used
