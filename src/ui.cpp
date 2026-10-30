@@ -3729,13 +3729,28 @@ static void drawqueue(Gui *g, GuiSession *s, Slice<QueueShow> shows, f64 y,
 
 enum : i64 { TOAST_LIFE = 6*1000*1000 };  // µs, as the scheduler counts
 
+// A toast's button: its label, the name the checklist knows it by, and
+// its tooltip.
+struct ToastBtn {
+    Str         label;
+    Str         name;
+    char const *tip;
+};
+
+// What a toast came to, as drawn.
+struct ToastOut {
+    f32 height;   // over the foot, its gap included, else 0
+    b32 hovered;
+};
+
 // A toast at the foot of r0 to r1, over what is there, which moves
-// nothing: text, and a button at its right (btn, named name, with tip),
-// with the button's rect as which, or -1. With fit, it is only as wide
-// as its text needs, at the right. True when the button is pressed, or
-// false, also when there is no room.
-static b32 toastbox(Gui *g, Str text, u32 color, u32 edge, Str btn, Str name,
-                    char const *tip, i32 which, ImVec2 r0, ImVec2 r1, b32 fit = 0)
+// nothing: text, and buttons at its right, the first's rect as which,
+// or -1, as the child window id. With fit, it is only as wide as its
+// text needs, at the right. The button pressed, or -1, also when there
+// is no room.
+static i32 toastbtns(Gui *g, char const *id, Str text, u32 color, u32 edge,
+                     Slice<ToastBtn> btns, i32 which, ImVec2 r0, ImVec2 r1,
+                     b32 fit = 0, ToastOut *out = 0)
 {
     Arena       a    = g->frame;
     f32         sc   = g->scale;
@@ -3743,11 +3758,17 @@ static b32 toastbox(Gui *g, Str text, u32 color, u32 edge, Str btn, Str name,
     f32         pad  = 8*sc;
     f32         room = r1.x - r0.x - st.ScrollbarSize - 24*sc;
     f32         w    = 560*sc<room ? 560*sc : room;
-    if (w < 100*sc) {
-        return 0;  // no room
+    if (out) {
+        *out = {};
     }
-    Str  label = concat(&a, btn, "##toastx");
-    f32  bw    = ImGui::CalcTextSize(cstr0(&a, btn)).x + 2*st.FramePadding.x;
+    if (w < 100*sc) {
+        return -1;  // no room
+    }
+    f32 bw = 0;
+    for (iz i = 0; i < btns.len; i++) {
+        bw += ImGui::CalcTextSize(cstr0(&a, btns[i].label)).x + 2*st.FramePadding.x;
+        bw += i ? st.ItemSpacing.x : 0;
+    }
     // Narrow, as in the Sessions pane: the button goes under the text,
     // which takes the whole width, rather than squeeze it
     b32  stack = w < 360*sc;
@@ -3765,7 +3786,7 @@ static b32 toastbox(Gui *g, Str text, u32 color, u32 edge, Str btn, Str name,
     ImGui::PushStyleColor(ImGuiCol_Border, edge);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6*sc);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, v2(pad, pad));
-    ImGui::BeginChild("##toast", v2(w, h), ImGuiChildFlags_Borders,
+    ImGui::BeginChild(id, v2(w, h), ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                       ImGuiWindowFlags_NoSavedSettings);
     ImGui::SetCursorPos(v2(pad, pad + (fh>th && !stack ? (fh-th)/2 : 0)));
@@ -3776,18 +3797,38 @@ static b32 toastbox(Gui *g, Str text, u32 color, u32 edge, Str btn, Str name,
     ImGui::PopStyleColor();
     itemnamed(g, "toast");
     ImGui::SetCursorPos(v2(w - pad - bw, stack ? pad + th + st.ItemSpacing.y : pad));
-    b32 pressed = ImGui::Button(cstr0(&a, label));
-    if (name.len) {
-        itemnamed(g, name);
+    i32 pressed = -1;
+    for (iz i = 0; i < btns.len; i++) {
+        if (i) {
+            ImGui::SameLine();
+        }
+        if (ImGui::Button(cstr0(&a, concat(&a, btns[i].label, "##toastx")))) {
+            pressed = (i32)i;
+        }
+        if (btns[i].name.len) {
+            itemnamed(g, btns[i].name);
+        }
+        ImGui::SetItemTooltip("%s", btns[i].tip);
+        if (which>=0 && !i) {
+            itemrect(g, which);
+        }
     }
-    ImGui::SetItemTooltip("%s", tip);
-    if (which >= 0) {
-        itemrect(g, which);
+    if (out) {
+        out->height  = h + 10*sc;
+        out->hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
     }
     ImGui::EndChild();
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(2);
     return pressed;
+}
+
+// One with a single button, as most are: true when it is pressed.
+static b32 toastbox(Gui *g, Str text, u32 color, u32 edge, Str btn, Str name,
+                    char const *tip, i32 which, ImVec2 r0, ImVec2 r1, b32 fit = 0)
+{
+    ToastBtn b = {btn, name, tip};
+    return toastbtns(g, "##toast", text, color, edge, {&b, 1}, which, r0, r1, fit) == 0;
 }
 
 // The session's note, what the latest command from the box came to, or
@@ -3827,29 +3868,85 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
 // the other where that one was not drawn last frame, as when the user
 // has gone to another tab. It stays until dismissed, or until the host
 // is reached or deployed to again. The pane's window scrolls as a
-// whole, so its content keeps the extent it had without the toast.
-static void drawdeploytoast(Gui *g, i32 pane)
+// whole, so its content keeps the extent it had without the toast. Its
+// height, if drawn here, for a toast above it.
+static f32 drawdeploytoast(Gui *g, i32 pane)
 {
     GuiHost *h = 0;
     for (GuiHost *k = g->hosts; k && g->dtoasthost; k = k->next) {
         h = k->uid==g->dtoasthost ? k : h;
     }
     if (!h) {
-        return;
+        return 0;
     }
     i32 home  = h->deployfrom==PANE_HOSTS ? PANE_HOSTS : PANE_SESSIONS;
     i32 other = home==PANE_HOSTS ? PANE_SESSIONS : PANE_HOSTS;
     b32 shown = g->panedrawn[home] >= g->total.frames-1;
     if (pane != (shown ? home : other)) {
-        return;
+        return 0;
     }
     ImGuiWindow *w    = ImGui::GetCurrentWindow();
     ImVec2       maxp = w->DC.CursorMaxPos;
     ImVec2       r0   = ImGui::GetWindowPos();
     ImVec2       r1   = v2(r0.x + ImGui::GetWindowWidth(), r0.y + ImGui::GetWindowHeight());
-    if (toastbox(g, g->dtoasttext, g->pal->bad, g->pal->bad, "\xc3\x97", "deploy dismiss",
-                 "Dismiss", -1, r0, r1)) {  // a multiplication sign
+    ToastBtn     x    = {"\xc3\x97", "deploy dismiss", "Dismiss"};  // a multiplication sign
+    ToastOut     out  = {};
+    if (toastbtns(g, "##toast", g->dtoasttext, g->pal->bad, g->pal->bad, {&x, 1}, -1,
+                  r0, r1, 0, &out) == 0) {
         g->dtoasthost = 0;
+    }
+    w->DC.CursorMaxPos = maxp;
+    return out.height;
+}
+
+static GuiSession *dragged();
+
+// The toast for sessions just moved to the Trash (trashtold), over the
+// foot of the Sessions pane, or of Hosts where Sessions was not drawn
+// last frame, above any deploy toast there (lift high). It goes after a
+// while, but not while hovered, nor while a session is dragged.
+static void drawtrashtoast(Gui *g, i32 pane, f32 lift)
+{
+    TrashToast *t = &g->trashtoast;
+    GuiHost    *h = 0;
+    for (GuiHost *k = g->hosts; k && t->host; k = k->next) {
+        h = k->uid==t->host ? k : h;
+    }
+    if (!h || g->sched.now>=t->until) {
+        t->host = 0;
+        return;
+    }
+    b32 shown = g->panedrawn[PANE_SESSIONS] >= g->total.frames-1;
+    if (pane!=(shown ? PANE_SESSIONS : PANE_HOSTS) || dragged()) {
+        return;
+    }
+    schedat(&g->sched, t->until, DUE_CLOCK);
+    ImGuiWindow *w    = ImGui::GetCurrentWindow();
+    ImVec2       maxp = w->DC.CursorMaxPos;
+    ImVec2       r0   = ImGui::GetWindowPos();
+    ImVec2       r1   = v2(r0.x + ImGui::GetWindowWidth(), r0.y + ImGui::GetWindowHeight() - lift);
+    ToastBtn     btns[] = {
+        {"Undo", "trash undo", "Back where they were"},
+        {"Delete now", "trash delete now", "Remove them for good now, not after their days in "
+                                           "the Trash"},
+        {"\xc3\x97", "trash dismiss", "Dismiss: they stay in the Trash"},  // a multiplication sign
+    };
+    ToastOut out = {};
+    i32      b   = toastbtns(g, "##trashtoast", t->text, g->pal->paneltext, g->pal->rule,
+                             {btns, countof(btns)}, -1, r0, r1, 0, &out);
+    if (out.hovered && t->until-g->sched.now < 2*1000*1000) {
+        t->until = g->sched.now + 2*1000*1000;  // kept while the mouse is on it
+    }
+    for (iz i = 0; b>=0 && b<2 && i < t->sids.len; i++) {
+        GuiSession *s = findsess(g, h, t->sids[i]);
+        if (s && !s->gone && b==0) {
+            guitrash(g, s, 0);
+        } else if (s && !s->gone) {
+            guidelete(g, s);
+        }
+    }
+    if (b >= 0) {
+        t->host = 0;
     }
     w->DC.CursorMaxPos = maxp;
 }
@@ -5214,7 +5311,8 @@ static Str sessnest(Gui *g, GuiSession *s)
     }
     Str         o  = sessside(s);
     GuiSession *up = o.len ? findsess(g, s->host, o) : 0;
-    b32         ok = up && up->group==s->group && !up->archived==!s->archived;
+    b32         ok = up && up->group==s->group && !up->archived==!s->archived &&
+                     !up->trashed==!s->trashed;
     return ok ? o : Str{};
 }
 
@@ -5540,7 +5638,33 @@ static void askdelete(Gui *g, Slice<GuiSession *> roots, Str group)
         g->delcount += sesscount(g, roots[i]);
     }
     g->delgroup    = clone(&g->perm, group);
+    g->delempty    = 0;
     g->opendelsess = roots.len || group.len;
+}
+
+// Every host's Trash emptied, confirmed first.
+static void askempty(Gui *g)
+{
+    g->delroots    = {};
+    g->delgroup    = {};
+    g->delcount    = trashcount(g, 0);
+    g->delempty    = 1;
+    g->opendelsess = g->delcount > 0;
+}
+
+// Why the Trash cannot be emptied now, or empty.
+static Str emptywhy(Gui *g)
+{
+    return trashcount(g, 0) ? Str{} : Str("The Trash is empty");
+}
+
+// Roots into the Trash, told in one toast. It takes the caller's arena.
+static void trashroots(Gui *g, Arena a, Slice<GuiSession *> roots)
+{
+    for (iz i = 0; i < roots.len; i++) {
+        guitrash(g, roots[i], 1);
+    }
+    trashtold(g, a, roots);
 }
 
 // Close a session's view here: its host may let it go, and it goes back
@@ -5774,6 +5898,25 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
     GuiHost *h     = s->host;
     b32      older = 0;  // an item lacks the engine's support
 
+    if (sesstrashed(g, s)) {
+        // In the Trash: back, or gone for good
+        if (menutip(g, &a, "Restore", sesswhy(g, s, "trash", 0, 1),
+                    "Back where it was, with its subagents")) {
+            guitrash(g, s, 0);
+        }
+        if (menutip(g, &a, "Delete Permanently...", sesswhy(g, s, "delete", 1, 0),
+                    "Remove it and its subagents for good now, once you confirm")) {
+            Slice<GuiSession *> one = {};
+            one = push(&a, one, s);
+            askdelete(g, one, {});
+        }
+        ImGui::Separator();
+        if (menutip(g, &a, "Copy session ID", {}, concat(&a, "Copy ", s->sid))) {
+            ImGui::SetClipboardText(cstr0(&a, s->sid));
+        }
+        return;
+    }
+
     if (menutip(g, &a, "Rename...", sesswhy(g, s, "rename", 0, 0),
                 "Give it a title of your own, in place of its first prompt's")) {
         namedialog(g, NAME_RENAME, s, {}, sesstitle(s));
@@ -5870,10 +6013,23 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
         guiarchive(g, s, !arch);
     }
     older |= !hostcap(h, "archive");
-    if (menutip(g, &a, "Delete...", sesswhy(g, s, "delete", 1, 0),
-                "Remove it and its subagents for good, once you confirm")) {
-        Slice<GuiSession *> one = {};
-        one = push(&a, one, s);
+    Slice<GuiSession *> one = {};
+    one = push(&a, one, s);
+    if (trashon(h)) {
+        Buf tip(&a, 128);
+        print(&tip, "Into the Trash with its subagents, kept ");
+        print(&tip, (i64)h->trashdays);
+        print(&tip, h->trashdays==1 ? Str(" day") : Str(" days"));
+        print(&tip, ", then removed");
+        if (menutip(g, &a, "Move to Trash", sesswhy(g, s, "trash", 1, 1), finish(&tip))) {
+            trashroots(g, a, one);
+        }
+        if (menutip(g, &a, "Delete Permanently...", sesswhy(g, s, "delete", 1, 0),
+                    "Remove it and its subagents for good now, once you confirm")) {
+            askdelete(g, one, {});
+        }
+    } else if (menutip(g, &a, "Delete...", sesswhy(g, s, "delete", 1, 0),
+                       "Remove it and its subagents for good, once you confirm")) {
         askdelete(g, one, {});
     }
     older |= !hostcap(h, "delete");
@@ -5930,7 +6086,7 @@ static Slice<GuiSession *> grouproots(Gui *g, Arena *a, Str group)
     Slice<GuiSession *> r = {};
     for (GuiSession *s = g->sessions; s; s = s->next) {
         if (!s->gone && (s->view || s->listed) && !sessparent(s).len &&
-                !s->archived && s->group==group) {
+                !s->archived && !s->trashed && s->group==group) {
             r = push(a, r, s);
         }
     }
@@ -6004,7 +6160,21 @@ static void groupitems(Gui *g, Arena a, Str group)
         groupmove(g, group, 1);
     }
     ImGui::Separator();
-    if (menuitem(g, a, "Delete group and sessions...", groupwhy(g, roots, "delete", 1))) {
+    b32 trash = roots.len > 0;
+    for (iz i = 0; i < roots.len; i++) {
+        trash &= trashon(roots[i]->host);
+    }
+    if (trash) {
+        // Into the Trash, host by host, told as one
+        if (menuitem(g, a, "Move group to Trash", groupwhy(g, roots, "trash", 1))) {
+            for (iz i = 0; i < roots.len; i++) {
+                guitrash(g, roots[i], 1);
+            }
+            trashtold(g, a, roots);
+            groupdrop(g, group);
+        }
+        ImGui::SetItemTooltip("The group goes; its sessions go to the Trash");
+    } else if (menuitem(g, a, "Delete group and sessions...", groupwhy(g, roots, "delete", 1))) {
         askdelete(g, roots, group);
     }
 }
@@ -6087,11 +6257,17 @@ static void foldrow(Gui *g, SideRow *r)
 
 // Dragging sessions in the sidebar: a root, with its subagents, onto a
 // group's heading, Archived, a host's heading or another session, which
-// puts it in that section, or below the rows, out of its group. Never
-// to another host: a heading or a session there is no target. No
-// order and no parent changes: the sections stay newest first.
+// puts it in that section, or below the rows, out of its group; or onto
+// the strip at the foot of the pane, into the Trash. Never to another
+// host: a heading or a session there is no target. No order and no
+// parent changes: the sections stay newest first. One in the Trash
+// dragged out is restored, into where it is dropped; the Trash heading
+// is no target, so close under Archived.
 static Str dragwhy(Gui *g, GuiSession *s)
 {
+    if (s->trashed) {
+        return sesswhy(g, s, "trash", 0, 1);
+    }
     Str why = sesswhy(g, s, "group", 0, 1);
     return why.len ? why : sesswhy(g, s, "archive", 0, 1);
 }
@@ -6109,6 +6285,8 @@ static b32 dropok(GuiSession *s, GuiHost *h, Str group, b32 archived)
 {
     if (s->gone || (h && h!=s->host)) {
         return 0;
+    } else if (s->trashed) {
+        return 1;  // restored, wherever it goes
     }
     return archived ? !s->archived : s->archived || !(s->group==group);
 }
@@ -6136,8 +6314,10 @@ static void dragsource(Gui *g, Arena a, GuiSession *s)
 static void droptarget(Gui *g, Arena a, GuiHost *h, Str group, b32 archived, Str label)
 {
     GuiSession *s = dragged();
-    if (!s) {
-        return;
+    ImVec2      m = ImGui::GetIO().MousePos;
+    ImVec4      t = g->trashrect;
+    if (!s || (m.x>=t.x && m.x<t.z && m.y>=t.y && m.y<t.w)) {
+        return;  // over the trash strip (dragtrash), drawn over this
     } else if (!dropok(s, h, group, archived)) {
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
                 h && h!=s->host) {
@@ -6153,6 +6333,9 @@ static void droptarget(Gui *g, Arena a, GuiHost *h, Str group, b32 archived, Str
             fieldput(g->droplabel, concat(&a, "\xe2\x86\x92 ", label));  // a rightwards arrow
         }
         if (p && p->IsDelivery()) {
+            if (s->trashed) {
+                guitrash(g, s, 0);
+            }
             if (!archived && !(s->group==group)) {
                 guigroup(g, s, group);
             }
@@ -6164,9 +6347,10 @@ static void droptarget(Gui *g, Arena a, GuiHost *h, Str group, b32 archived, Str
     }
 }
 
-// A heading: a group, a host, or Archived. It folds by a click, and has
-// a menu by a right click; a host's heading has buttons for what is
-// done there most.
+// A heading: a group, a host, Archived or the Trash. It folds by a
+// click, and has a menu by a right click; a host's heading has buttons
+// for what is done there most. The Trash, opened, is listed again, for
+// what was purged since.
 static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64 nowms)
 {
     f32         sc    = g->scale;
@@ -6204,6 +6388,13 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     }
     if (click) {
         foldrow(g, r);
+        if (r->kind==SROW_TRASH && r->folded) {
+            guilistall(g);
+        }
+    }
+    if (r->kind == SROW_TRASH) {
+        ImGui::SetItemTooltip("Deleted sessions, each removed for good after the "
+                              "days its host keeps them ([sessions] trash_days)");
     }
     switch (r->kind) {
     case SROW_GROUP:
@@ -6224,6 +6415,12 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     if (menu) {
         if (r->kind == SROW_GROUP) {
             groupitems(g, a, r->group);
+        } else if (r->kind == SROW_TRASH) {
+            if (menutip(g, &a, "Empty Trash...", emptywhy(g),
+                        "Remove every session in the Trash for good now, once you "
+                        "confirm")) {
+                askempty(g);
+            }
         } else {
             hostitems(g, a, h, remote);
         }
@@ -6245,6 +6442,10 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         break;
     case SROW_ARCHIVED:
         pen(&t, "Archived", STYLE_BOLD, g->pal->dim);
+        pen(&t, finish(&c), 0, g->pal->dim);
+        break;
+    case SROW_TRASH:
+        pen(&t, "Trash", STYLE_BOLD, g->pal->dim);
         pen(&t, finish(&c), 0, g->pal->dim);
         break;
     case SROW_HOST: {
@@ -6309,7 +6510,22 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
 // A session's row: as before, now indented as its place in the tree
 // says, with a fold arrow when it has subagents, its gauge, and its
 // context menu.
-static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
+// How long a root has left in the Trash: whole days, rounded up.
+static Str trashleft(Gui *g, Arena *a, GuiSession *root, i64 nowms)
+{
+    i64 day  = 24*60*60*(i64)1000;
+    i64 left = root->trashed + root->host->trashdays*day - nowms;
+    if (left <= day) {
+        return "removed within a day";
+    }
+    (void)g;
+    Buf b(a, 32);
+    print(&b, (left + day - 1)/day);
+    print(&b, " days left");
+    return finish(&b);
+}
+
+static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, i64 nowms)
 {
     f32         sc    = g->scale;
     ImDrawList *dl    = ImGui::GetWindowDrawList();
@@ -6322,8 +6538,8 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
     ImVec2 p = ImGui::GetCursorScreenPos();
     f32    w = ImGui::GetContentRegionAvail().x;
     ImGui::SetNextItemAllowOverlap();
-    if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc))) {
-        guiselect(g, s);
+    if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc)) && !r->trashed) {
+        guiselect(g, s);  // one in the Trash cannot open
     }
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
@@ -6345,6 +6561,9 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
         }
         putbyte(&tip, '\n');
         print(&tip, s->sid);
+        if (r->trashed) {
+            print(&tip, "\nIn the Trash: restore it to open it");
+        }
         if (sessremote(s) && !sessup(g, s)) {
             print(&tip, "\nA subagent of a session on another host");
         }
@@ -6422,6 +6641,8 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
         b32 back = s->host->r && !s->host->closing;
         pen(&b, back ? Str("reconnecting") : Str("disconnected"), STYLE_BOLD,
             back ? g->pal->amber : g->pal->dim);
+    } else if (r->trashed) {
+        pen(&b, trashleft(g, &a, sessroot(g, s), nowms), 0, g->pal->dim);
     } else if (ro) {
         pen(&b, "read-only", STYLE_BOLD, g->pal->amber);
     } else if (asks) {
@@ -6458,8 +6679,9 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other)
 }
 
 // While a session is dragged: the space below the rows, out of its
-// group; the drag's tooltip; and the pane scrolled near its edges.
-static void dragrest(Gui *g, Arena a, GuiSession *s)
+// group; the drag's tooltip; and the pane scrolled near its edges, above
+// the trash strip at its foot (foot high).
+static void dragrest(Gui *g, Arena a, GuiSession *s, f32 foot)
 {
     f32 sc    = g->scale;
     f32 lineh = ImGui::GetTextLineHeight();
@@ -6479,7 +6701,8 @@ static void dragrest(Gui *g, Arena a, GuiSession *s)
     f32          step = 0;
     if (y < w->InnerRect.Min.y+band && ImGui::GetScrollY() > 0) {
         step = -8*sc;
-    } else if (y > w->InnerRect.Max.y-band && ImGui::GetScrollY() < ImGui::GetScrollMaxY()) {
+    } else if (y > w->InnerRect.Max.y-foot-band && y < w->InnerRect.Max.y-foot &&
+               ImGui::GetScrollY() < ImGui::GetScrollMaxY()) {
         step = 8*sc;
     }
     if (step != 0) {
@@ -6488,8 +6711,75 @@ static void dragrest(Gui *g, Arena a, GuiSession *s)
     }
 }
 
+// The trash strip's rect, as x0, y0, x1, y1: pinned at the foot of the
+// Sessions pane, whatever its scroll.
+static ImVec4 trashstrip(Gui *g)
+{
+    f32          sc = g->scale;
+    ImGuiWindow *w  = ImGui::GetCurrentWindow();
+    f32          h  = 2*ImGui::GetTextLineHeight() + 8*sc;
+    f32          x0 = w->InnerRect.Min.x + 6*sc;
+    f32          x1 = w->InnerRect.Max.x - 6*sc;
+    f32          y1 = w->InnerRect.Max.y - 6*sc;
+    return {x0, y1-h, x1, y1};
+}
+
+// While a session is dragged, the strip to drop it on, into the Trash,
+// drawn over the rows; or, where its host keeps no Trash, to delete it
+// once confirmed. The pane scrolls as a whole, so its content keeps the
+// extent it had without the strip.
+static void dragtrash(Gui *g, Arena a, GuiSession *s)
+{
+    ImVec4 t = g->trashrect;
+    if (t.w <= t.y) {
+        return;
+    }
+    f32          sc   = g->scale;
+    ImGuiWindow *w    = ImGui::GetCurrentWindow();
+    ImVec2       maxp = w->DC.CursorMaxPos;
+    ImDrawList  *dl   = ImGui::GetWindowDrawList();
+    b32          on   = trashon(s->host);
+    Str          why  = on ? sesswhy(g, s, "trash", 1, 1) : sesswhy(g, s, "delete", 1, 0);
+    ImGui::SetCursorScreenPos(v2(t.x, t.y));
+    ImGui::InvisibleButton("##trash", v2(t.z-t.x, t.w-t.y));
+    itemnamed(g, "sessions trash");
+    b32 over = 0;
+    if (!why.len && ImGui::BeginDragDropTarget()) {
+        ImGuiPayload const *p = ImGui::AcceptDragDropPayload(
+            "SESS", ImGuiDragDropFlags_AcceptBeforeDelivery |
+                    ImGuiDragDropFlags_AcceptNoDrawDefaultRect);
+        over = p != 0;
+        if (p) {
+            fieldput(g->droplabel, on ? Str("\xe2\x86\x92 Trash")  // a rightwards arrow
+                                      : Str("\xe2\x86\x92 delete, once you confirm"));
+        }
+        if (p && p->IsDelivery()) {
+            Slice<GuiSession *> one = {};
+            one = push(&a, one, s);
+            if (on) {
+                trashroots(g, a, one);
+            } else {
+                askdelete(g, one, {});
+            }
+        }
+        ImGui::EndDragDropTarget();
+    } else if (why.len && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_NotAllowed);
+        fieldput(g->droplabel, why);
+    }
+    u32 fill = fade(g->pal->bad, why.len ? 0.12f : over ? 0.55f : 0.28f);
+    dl->AddRectFilled(v2(t.x, t.y), v2(t.z, t.w), fill, 6*sc);
+    dl->AddRect(v2(t.x, t.y), v2(t.z, t.w), fade(g->pal->bad, why.len ? 0.3f : 0.8f), 6*sc);
+    Str    label = concat(&a, ICON_TRASH "  ", on ? Str("Move to Trash") : Str("Delete..."));
+    char  *z     = cstr0(&a, label);
+    ImVec2 ts    = ImGui::CalcTextSize(z);
+    dl->AddText(v2(t.x + (t.z-t.x-ts.x)/2, t.y + (t.w-t.y-ts.y)/2),
+                why.len ? g->pal->dim : g->pal->text, z);
+    w->DC.CursorMaxPos = maxp;
+}
+
 // The sidebar: a "+" for a new session, then the tree (sidebar.cpp) of
-// groups, hosts, sessions and subagents, and the archived.
+// groups, hosts, sessions and subagents, the archived, and the Trash.
 static void drawsessions(Gui *g)
 {
     Arena a     = g->frame;
@@ -6508,6 +6798,7 @@ static void drawsessions(Gui *g)
         g->sidedirty = 0;
         ImGui::MarkIniSettingsDirty();
     }
+    g->trashrect = drag && !drag->trashed ? trashstrip(g) : ImVec4{};
     ImGui::BeginDisabled(!cannew(g));
     if (iconbutton(ICON_ADD)) {
         g->newhost = 0;  // the default host
@@ -6582,6 +6873,7 @@ static void drawsessions(Gui *g)
             }
             e.group    = s->group;
             e.archived = s->archived;
+            e.trashed  = s->trashed != 0;
             e.asks     = v && v->asks && !s->readonly;
             e.active   = v ? v->busy && !s->readonly
                            : s->state!=LIVE_IDLE && s->state!=LIVE_CLOSED;
@@ -6594,7 +6886,8 @@ static void drawsessions(Gui *g)
     b32            other = 0;  // the checklist's first session not shown
     if (g->drive) {
         // The tree as text, for the checklist: a line a row, indented,
-        // G group, H host, S title, A for Archived, + if folded
+        // G group, H host, S title, A for Archived, T for the Trash, + if
+        // folded
         Buf d(&a, 1024);
         for (iz i = 0; i < rows.len; i++) {
             SideRow *r = &rows[i];
@@ -6606,6 +6899,7 @@ static void drawsessions(Gui *g)
             case SROW_HOST:    print(&d, "H "); print(&d, in.hosts[r->host].key); break;
             case SROW_SESSION: print(&d, "S "); print(&d, sesstitle(sess[r->sess])); break;
             case SROW_ARCHIVED: print(&d, "A"); break;
+            case SROW_TRASH:    print(&d, "T"); break;
             }
             print(&d, r->away ? Str("@") : Str(""));
             print(&d, r->folded ? Str("+\n") : Str("\n"));
@@ -6617,7 +6911,7 @@ static void drawsessions(Gui *g)
     for (iz i = 0; i < rows.len; i++) {
         SideRow *r = &rows[i];
         if (r->kind == SROW_SESSION) {
-            drawsessrow(g, a, r, sess[r->sess], &other);
+            drawsessrow(g, a, r, sess[r->sess], &other, nowms);
         } else {
             if (i && r->depth==0) {
                 ImGui::Spacing();
@@ -6630,7 +6924,9 @@ static void drawsessions(Gui *g)
         ImGui::TextDisabled("No sessions yet.");
     }
     if (drag) {
-        dragrest(g, a, drag);
+        ImVec4 t = g->trashrect;
+        dragrest(g, a, drag, t.w>t.y ? ImGui::GetCurrentWindow()->InnerRect.Max.y - t.y : 0);
+        dragtrash(g, a, drag);
     }
 }
 
@@ -6708,12 +7004,18 @@ static void drawsessdialogs(Gui *g)
 
     if (g->opendelsess) {
         g->opendelsess = 0;
-        ImGui::OpenPopup("Delete sessions?");
+        ImGui::OpenPopup("###delsess");
     }
     ImGui::SetNextWindowSize(v2(460*sc, 0));
-    if (ImGui::BeginPopupModal("Delete sessions?", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+    char const *deltitle = g->delempty ? "Empty the Trash?###delsess"
+                                       : "Delete permanently?###delsess";
+    if (ImGui::BeginPopupModal(deltitle, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
         Buf b(&a, 512);
-        if (g->delgroup.len) {
+        if (g->delempty) {
+            print(&b, "Empty the Trash: ");
+            print(&b, (i64)g->delcount);
+            print(&b, g->delcount==1 ? Str(" session") : Str(" sessions"));
+        } else if (g->delgroup.len) {
             print(&b, "Delete the group ");
             print(&b, g->delgroup);
             print(&b, " and its ");
@@ -6732,7 +7034,8 @@ static void drawsessdialogs(Gui *g)
         print(&b, "?");
         ImGui::PushTextWrapPos(440*sc);
         ImGui::TextUnformatted(cstr0(&a, finish(&b)));
-        ImGui::TextDisabled("Their logs and files are removed for good.");
+        ImGui::TextDisabled("Their logs and files are removed for good: this cannot "
+                            "be undone.");
         ImGui::PopTextWrapPos();
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Button, fade(g->pal->bad, 0.6f));
@@ -6742,7 +7045,15 @@ static void drawsessdialogs(Gui *g)
         ImGui::SameLine();
         b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape);
         itemnamed(g, "delete cancel");
-        if (del) {
+        if (del && g->delempty) {
+            for (GuiHost *h = g->hosts; h; h = h->next) {
+                if (trashcount(g, h)) {
+                    guitrashempty(g, h);
+                }
+            }
+            g->delempty = 0;
+            ImGui::CloseCurrentPopup();
+        } else if (del) {
             for (iz i = 0; i < g->delroots.len; i++) {
                 GuiSession *s = g->delroots[i];
                 if (s->gone) continue;
@@ -6761,6 +7072,7 @@ static void drawsessdialogs(Gui *g)
             ImGui::CloseCurrentPopup();
         } else if (cancel) {
             g->delroots = {};
+            g->delempty = 0;
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -8087,7 +8399,8 @@ static void drawnew(Gui *g)
         whytip(nofolder ? Str("Not with No folder: a worktree is of a folder's repository")
                         : Str("The session works in a new git worktree of the folder's "
                               "repository, on a branch of its own from the folder's HEAD. "
-                              "Archived, it is removed, if git calls it clean"));
+                              "Archived or in the Trash, it is removed, if git "
+                              "calls it clean"));
         if (wt) {
             Str cwd = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
             cwd     = hostwsl(g, host) ? wslpath(&a, cwd) : cwd;
@@ -10935,6 +11248,10 @@ static void drawmenubar(Gui *g)
             importstart(g, 0);
         }
         ImGui::SetItemTooltip("A session from its raw log, exported here or elsewhere");
+        if (menutip(g, &a, "Empty Trash...", emptywhy(g),
+                    "Remove every session in the Trash for good now, once you confirm")) {
+            askempty(g);
+        }
         ImGui::Separator();
         // What the shown session's turn waits for, as Cmd+B moves it
         if (ImGui::MenuItem(bglabel, cmdkey(g, &a, "B"), false, canbackground(g->sess))) {
@@ -10958,7 +11275,7 @@ static void drawmenubar(Gui *g)
             ImGui::MenuItem("Export...");
             ImGui::Separator();
             ImGui::MenuItem("Archive");
-            ImGui::MenuItem("Delete...");
+            ImGui::MenuItem("Move to Trash");
             ImGui::Separator();
             ImGui::MenuItem("Open in terminal");
             ImGui::MenuItem("Close");
@@ -11304,7 +11621,7 @@ static void dockwindows(Gui *g)
             escapecancel(g);
             backgroundkey(g);
             drawsessions(g);
-            drawdeploytoast(g, PANE_SESSIONS);
+            drawtrashtoast(g, PANE_SESSIONS, drawdeploytoast(g, PANE_SESSIONS));
         }
         ImGui::End();
     }
@@ -11396,7 +11713,7 @@ static void dockwindows(Gui *g)
         }
         if (beginpane(g, PANE_HOSTS)) {
             drawhosts(g);
-            drawdeploytoast(g, PANE_HOSTS);
+            drawtrashtoast(g, PANE_HOSTS, drawdeploytoast(g, PANE_HOSTS));
         }
         ImGui::End();
     }

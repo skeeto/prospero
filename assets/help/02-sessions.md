@@ -138,10 +138,11 @@ Right-click a session in the sidebar, or open the Session menu, for:
   rename it.
 - **Move to group**: an existing group, New group..., or Remove from
   group. Groups head the sidebar; a group's own menu renames,
-  archives, ungroups, reorders or deletes it. Or drag the session, with
-  its subagents, onto a group's heading, onto Archived (shown while you
-  drag), onto another session to join it there, or below the list to
-  take it out of its group. Escape cancels a drag. A session never moves
+  archives, ungroups, reorders or moves it to the Trash. Or drag the
+  session, with its subagents, onto a group's heading, onto Archived
+  (shown while you drag), onto another session to join it there, below
+  the list to take it out of its group, or onto the Move to Trash strip
+  at the foot of the sidebar. Escape cancels a drag. A session never moves
   to another host, and the sidebar stays newest first.
 - **Fork**: a new session with a copy of this conversation, titled
   "(fork)", which starts in Build mode. A No folder session's fork gets
@@ -162,7 +163,12 @@ Right-click a session in the sidebar, or open the Session menu, for:
   a file or the clipboard; or Raw log..., the session's log as it is.
 - **Archive**: move it under Archived, at the end of the sidebar.
   Unarchive brings it back.
-- **Delete...**: remove it, with its subagents, for good.
+- **Move to Trash**: it goes, with its subagents, under the Trash
+  heading at the end of the sidebar (below). A toast's Undo brings it
+  back at once.
+- **Delete Permanently...**: remove it, with its subagents, for good,
+  once you confirm, without the Trash. Where the Trash is off, this is
+  **Delete...**.
 - **Copy session ID**.
 - **Open working folder**: the folder the session works in, in Finder
   or Explorer, as the folder button above the transcript opens it. **Open session records**: its folder in the state
@@ -230,14 +236,34 @@ session, which can then review and merge its branch.
   session is told that session's id, and to report its branch and
   commits there with `send_message` when done or asked. Sessions in the main
   checkout ask before changing files in a worktree.
-- **Archived or deleted**: once every session working in a worktree is,
+- **Archived, in the Trash or deleted**: once every session working in
+  a worktree is,
   it is removed if git calls it clean, and its branch deleted only if
   merged into the branch it was cut from. A worktree with uncommitted
   changes is kept, and a note says so. On Windows, files in use (as by
   a program still running there) stay behind in its folder, which must
   be deleted before the worktree can be made there again. Unarchiving
-  the session, or starting a turn in it, checks the branch out again
-  at the same place.
+  or restoring the session, or starting a turn in it, checks the branch
+  out again at the same place.
+
+## The Trash
+
+A session moved to the Trash, by its menu, its group's, or a drag onto
+the strip at the foot of the sidebar, is kept under the Trash heading
+for `[sessions] trash_days` (30 by default), then removed for good.
+Each row says how long it has left. It does not open there: its menu's
+**Restore** puts it back where it was, as does dragging it out onto a
+group, Archived or the list. **Delete Permanently...** removes it now,
+and **Empty Trash...**, on the Trash heading's menu or the Session
+menu, removes all of it, once you confirm. A host's engine keeps its
+own Trash, by its own configuration, and empties what is due when it
+starts and every hour. `trash_days = 0` turns the Trash off: deleting
+is then at once, once confirmed, and what was in the Trash goes.
+
+Removed, a session's log and files are deleted from the state
+directory, which is not a secure erasure: the disk, backups, and the
+model's provider may still hold copies, and a worktree's unmerged
+branch is kept. Delete Permanently only skips the wait in the Trash.
 
 Bring the work back as with any branch, such as with `git merge` in
 the main checkout.

@@ -9,7 +9,7 @@ under home. On first run it writes the file
 from its built-in copy ([assets/prospero.ini](../assets/prospero.ini)),
 which documents every section and key: `[endpoint NAME]`,
 `[model NAME]`, `[role NAME]`, `[guard]`, `[tools]`, `[instructions]`,
-`[skills]`, `[ui]`, `[desktop]`, `[host]` and `[remote NAME]`. Changes take effect while it
+`[skills]`, `[sessions]`, `[ui]`, `[desktop]`, `[host]` and `[remote NAME]`. Changes take effect while it
 runs. An unknown key or a bad value is reported in the diagnostics,
 and a bad value falls back to its default: nothing in the file keeps
 Prospero from starting. The settings window edits the file a line at a

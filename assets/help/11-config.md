@@ -33,8 +33,8 @@ hand. A missing file is first created: from the built-in copy, as on
 the first run, or empty for one named by `-c`. Once the editor exits, Settings reads the file again.
 Cancel stops the editor and keeps the file as it left it.
 
-The state directory holds the sessions, the window's layout and
-`gui.log`: `$XDG_STATE_HOME/prospero`, else
+The state directory holds the sessions, those in the Trash too, the
+window's layout and `gui.log`: `$XDG_STATE_HOME/prospero`, else
 `~/.local/state/prospero`. On Windows `%LOCALAPPDATA%\prospero` is
 used while there is none under home. `--statedir DIR` names another,
 for a separate instance.

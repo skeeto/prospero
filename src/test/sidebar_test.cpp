@@ -1,9 +1,9 @@
 // Sessions sidebar tests: the tree's rows from sessions on two hosts,
-// grouped across them, archived, subagents under their parents, and
-// what folds and what stays open.
+// grouped across them, archived, in the Trash, subagents under their
+// parents, and what folds and what stays open.
 
-// The rows, one a line: indentation, then G group, H host, S sid or A
-// for Archived, with + folded, ! open regardless, @ away, and the count
+// The rows, one a line: indentation, then G group, H host, S sid, A
+// for Archived or T for the Trash, with + folded, ! open regardless, @ away, and the count
 // of a heading.
 static Str siderows(Arena *a, SideIn *in, Slice<SideRow> rows)
 {
@@ -28,6 +28,9 @@ static Str siderows(Arena *a, SideIn *in, Slice<SideRow> rows)
             break;
         case SROW_ARCHIVED:
             print(&b, "A");
+            break;
+        case SROW_TRASH:
+            print(&b, "T");
             break;
         }
         if (r->kind != SROW_SESSION) {
@@ -173,6 +176,73 @@ static void test_sidebar(Test *t)
            "  S b1\n"
            "   S b1k\n");
     two.sess[2].asks = 0;
+
+    // In the Trash: out of its group and out of Archived, its subagent
+    // following, under a heading folded by default, then opened
+    two.sess[3].trashed = 1;  // a1, in work, with a1k
+    two.sess[7].trashed = 1;  // a0, archived
+    *upsert(&two.folds, "g:work", &a)             = 0;
+    *upsert(&two.folds, "g:work|h:this", &a)      = 0;
+    *upsert(&two.folds, "g:work|h:remote:vm", &a) = 0;
+    *upsert(&two.folds, "a", &a)                  = 1;
+    expect(t, "sidebar.trash", siderows(&a, &two, sidetree(&a, &two)),
+           "G empty 0\n"
+           "G work 2\n"
+           " H this 1\n"
+           "  S a3\n"
+           " H remote:vm 1\n"
+           "  S b2\n"
+           "H this 1\n"
+           " S a2\n"
+           "H remote:vm 0+\n"
+           "H remote:pi 0\n"
+           "A 2+\n"
+           "T 3+\n");
+    *upsert(&two.folds, "t", &a) = 0;
+    Slice<SideRow> trows = sidetree(&a, &two);
+    expect(t, "sidebar.trashopen", siderows(&a, &two, trows),
+           "G empty 0\n"
+           "G work 2\n"
+           " H this 1\n"
+           "  S a3\n"
+           " H remote:vm 1\n"
+           "  S b2\n"
+           "H this 1\n"
+           " S a2\n"
+           "H remote:vm 0+\n"
+           "H remote:pi 0\n"
+           "A 2+\n"
+           "T 3\n"
+           " H this 3\n"
+           "  S a1\n"
+           "   S a1k\n"
+           "  S a0\n");
+    expect(t, "sidebar.trashrows", istr(&a, trows[14].trashed*100 + trows[13].trashed*10 +
+                                            trows[3].trashed), "110");
+    expect(t, "sidebar.trashkey", trows[12].key, "t|h:this");
+
+    // A group whose sessions are all in the Trash is a group no more,
+    // unless the GUI keeps it
+    two.sess[0].trashed = 1;  // a3
+    two.sess[4].trashed = 1;  // b2
+    expect(t, "sidebar.trashgroup", siderows(&a, &two, sidetree(&a, &two)),
+           "G empty 0\n"
+           "H this 1\n"
+           " S a2\n"
+           "H remote:vm 0+\n"
+           "H remote:pi 0\n"
+           "A 2+\n"
+           "T 5\n"
+           " H this 4\n"
+           "  S a3\n"
+           "  S a1\n"
+           "   S a1k\n"
+           "  S a0\n"
+           " H remote:vm 1\n"
+           "  S b2\n");
+    for (iz i = 0; i < two.sess.len; i++) {
+        two.sess[i].trashed = 0;
+    }
 
     // Subagents on another host than their parent's (phost), under it in
     // its group and heading, marked away; one whose parent is not here

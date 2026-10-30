@@ -73,9 +73,11 @@ The sidebar is a tree: groups, then hosts, then sessions with their
 subagents, and archived sessions folded away at the end. A session's
 context menu, and the Session menu, rename it, move it to a group,
 fork it, compact it now, switch its model, export it (Markdown or the
-raw log), archive or delete it (with its subagents). Dragging a session
-onto a group, onto Archived, or below the list moves it there too, on
-its own host. The transcript's
+raw log), archive it, or move it to the Trash (with its subagents),
+which keeps it `[sessions] trash_days` (30) before removing it, unless
+deleted permanently or emptied first. Dragging a session onto a group,
+onto Archived, or below the list moves it there too, on its own host,
+and onto the strip at the sidebar's foot, to the Trash. The transcript's
 context menu forks at a message: before a prompt, which then waits in
 the fork's prompt box, or after a turn. A side chat, from that menu,
 the Session menu or `/side`, is a fork made even while the agent
@@ -83,7 +85,8 @@ works, nested under its session, the selection quoted in its box; its
 agent is told to leave files alone. A worktree session, from the New
 session dialog's New worktree, that menu, or `/worktree`, works in a
 git worktree Prospero makes in `.prospero/worktrees`, on a branch of
-its own, and removes once its sessions are archived, if clean. One
+its own, and removes once its sessions are archived or in the Trash,
+if clean. One
 started from a session begins fresh, nested under it, and reports its
 branch back to it with `send_message` when asked. The prompt box keeps a draft
 per session, with the engine, has the session's earlier prompts on Up

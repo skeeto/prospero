@@ -1806,6 +1806,7 @@ def main():
         for name in ("sessions-tree", "sessions-folded", "sessions-menu", "sessions-group",
                      "sessions-archived", "sessions-picker", "sessions-export",
                      "sessions-forkhere", "sessions-forked", "sessions-delete",
+                     "sessions-trashdrag", "sessions-trash", "sessions-trashopen",
                      "sessions-import", "sessions-imported"):
             if not os.path.exists(os.path.join(args.shots, name + ".png")):
                 problems.append(f"no {name}.png")

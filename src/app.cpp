@@ -440,6 +440,8 @@ struct GuiHost {
     Slice<Str> caps;    // and its features (putcaps)
     Str        home;    // its home directory, ~ there (homeshow), if known
     b32        relist;  // a command changed its list: ask again (drainmail)
+    i32        trashdays; // its Trash keeps sessions this long, as its list
+                          // says; 0 if off, or not yet known
     u64        uid;     // unique to this host while it is one (addhost)
     // Update engine: deploying there, then the host stopped and reached
     // again (UPD_*)
@@ -535,6 +537,8 @@ struct GuiSession {
     AttBox      *att;       // images attached to the draft, null until one is
     Str          group;     // its group, from the list (only a root's counts)
     b32          archived;  // from the list (only a root's counts)
+    i64          trashed;   // epoch ms it went to the Trash, else 0 (only
+                            // a root's counts)
     b32          gone;      // deleted: shown nowhere
     Slice<SkillItem> skills;  // what /name invokes, as its engine lists them
     i64          skillsid;  // that list's skills in flight, 0 if none
@@ -561,6 +565,17 @@ struct Request {
     GuiHost    *h;   // where it went
     Str         quote;  // a side chat's draft (guiside), else null
 };
+
+// The toast for sessions just moved to the Trash: its Undo restores
+// them, its Delete now deletes them for good.
+struct TrashToast {
+    u64        host;   // their host's uid, 0 if none
+    Slice<Str> sids;   // the roots
+    Str        text;
+    i64        until;  // when it goes, in sched µs, unless hovered
+};
+
+enum : i64 { TRASHTOAST_LIFE = 10*1000*1000 };  // µs
 
 // A file of a session's directory, as the file command brings it in
 // parts: a spill file shown in the Output window.
@@ -1129,6 +1144,7 @@ struct Gui {
     b32                dragcancel; // a session's drag ended by Escape: none
                                    // again until the button is up
     char               droplabel[FIELD_MAX]; // where the dragged session would go, this frame
+    ImVec4             trashrect;  // the trash strip, x0 y0 x1 y1, while dragging (dragtrash)
     char              *namebuf;    // the naming dialog's field
     i32                nameask;    // NAME_*
     GuiSession        *namesess;
@@ -1137,6 +1153,7 @@ struct Gui {
     Slice<GuiSession *> delroots;  // to delete once confirmed, with their subagents
     i32                delcount;   // sessions in all
     Str                delgroup;   // the group going with them, if any
+    b32                delempty;   // the Trash emptied instead, on every host
     b32                opendelsess;
     i64                deletes;    // delete replies, for the checklist
     Mailbox           *tasks;      // the dialogs' and deployments' outcomes
@@ -1394,6 +1411,9 @@ struct Gui {
     // began from, or the other where that is not shown (drawdeploytoast)
     u64                dtoasthost;  // its host's uid, 0 if none
     Str                dtoasttext;
+    // Sessions just moved to the Trash (guitrash), told in a toast with
+    // Undo, in the Sessions pane or else Hosts, above any deploy toast
+    TrashToast         trashtoast;
     i32                panefocus;  // PANE_*+1 to bring to the front, else 0
     i32                floatpane;  // PANE_*+1 to float or dock back (OP_FLOAT)
     ImVec2             floatsize;  // its size floating, 0 wide to dock back
@@ -1823,8 +1843,10 @@ static void guihello(Gui *g)
     cmdsend(g, &w, a);
 }
 
+static b32 hostcap(GuiHost *, Str);
+
 // Ask a host (the main one if null) for its sessions, which arrive as a
-// sessions record.
+// sessions record: those in its Trash too, where it has one.
 static void guilist(Gui *g, GuiHost *h = 0)
 {
     h = h ? h : g->main;
@@ -1834,6 +1856,10 @@ static void guilist(Gui *g, GuiHost *h = 0)
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 64);
     EvOut w = cmdopen(g, &b, CMD_LIST, 0, h);
+    if (hostcap(h, "trash")) {
+        putkey(&w.json, "trash");
+        putint(&w.json, 1);
+    }
     cmdsend(g, &w, a);
 }
 
@@ -4008,10 +4034,12 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         Str group = jsonstr(jsonget(e, "group"));
         s->group    = s->group==group ? s->group : clone(&g->perm, group);
         s->archived = jsonint(jsonget(e, "archived"), 0) != 0;
-        if (!s->parent.len && !s->archived) {
+        s->trashed  = jsonint(jsonget(e, "trashed"), 0);
+        if (!s->parent.len && !s->archived && !s->trashed) {
             addgroup(g, group);
         }
     }
+    h->trashdays = (i32)jsonint(jsonget(j, "trash_days"), 0);
     if (shared) {
         // What it no longer holds is the engine's again
         b32 back = 0;
@@ -4724,6 +4752,7 @@ static void ongit(Gui *g, GuiSession *s, i64 id, Json *j, b32 ok)
 }
 
 static void sessgone(Gui *, GuiSession *);
+static b32  trashtoasted(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
 static void cfgeditrun(Gui *, Arena, Str path);
 
@@ -4826,6 +4855,16 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         h->relist = 1;
         break;
 
+    case CMD_TRASH:
+        // Listed again: as it now is, or back as it was, without the
+        // toast's Undo for what did not go
+        h->relist = 1;
+        if (!ok && q.s && trashtoasted(g, q.s)) {
+            g->trashtoast.host = 0;
+        }
+        break;
+
+    case CMD_TRASHEMPTY:
     case CMD_DELETE:
         // Every session it took, subagents included, even should it
         // fail part of the way
@@ -6889,6 +6928,110 @@ static void guidelete(Gui *g, GuiSession *s)
     Buf   b(&a, 128);
     EvOut w = cmdopen(g, &b, CMD_DELETE, s);
     cmdsend(g, &w, a);
+}
+
+// Whether a host keeps a Trash: it has one, and it is not turned off.
+static b32 trashon(GuiHost *h)
+{
+    return hostcap(h, "trash") && h->trashdays>0;
+}
+
+// Whether a session is in the Trash: its root is.
+static b32 sesstrashed(Gui *g, GuiSession *s)
+{
+    return sessroot(g, s)->trashed != 0;
+}
+
+static void sessclose(Gui *, GuiSession *);
+
+// A root and its subagents into the Trash (on), or back (off). Into it,
+// its views here close first, so its host may let it go; then it is
+// listed, not shown, until restored.
+static void guitrash(Gui *g, GuiSession *s, b32 on)
+{
+    if (on) {
+        for (GuiSession *k = g->sessions; k; k = k->next) {
+            if (k->host==s->host && sessroot(g, k)==s) {
+                sessclose(g, k);
+                if (g->sess == k) {
+                    setcur(g, 0);
+                }
+            }
+        }
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_TRASH, s);
+    putkey(&w.json, "on");
+    putint(&w.json, on ? 1 : 0);
+    cmdsend(g, &w, a);
+    s->trashed = on ? os_time(g->os) : 0;
+    scheddirty(&g->sched);
+}
+
+// Every session in a host's Trash, for good.
+static void guitrashempty(Gui *g, GuiHost *h)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 64);
+    EvOut w = cmdopen(g, &b, CMD_TRASHEMPTY, 0, h);
+    cmdsend(g, &w, a);
+}
+
+// Sessions in the Trash, subagents included, on h, or on every host if
+// null.
+static i32 trashcount(Gui *g, GuiHost *h)
+{
+    i32 n = 0;
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        n += !s->gone && s->listed && (!h || s->host==h) && sesstrashed(g, s);
+    }
+    return n;
+}
+
+// Roots just moved to the Trash, all of one host, told in the toast,
+// which a newer one replaces. It takes the caller's arena.
+static void trashtold(Gui *g, Arena a, Slice<GuiSession *> roots)
+{
+    TrashToast *t = &g->trashtoast;
+    t->host = 0;
+    if (!roots.len) {
+        return;
+    }
+    GuiHost *h = roots[0]->host;
+    t->sids = {};
+    for (iz i = 0; i < roots.len; i++) {
+        t->sids = push(&g->perm, t->sids, clone(&g->perm, roots[i]->sid));
+    }
+    Buf b(&a, 256);
+    print(&b, "Moved ");
+    if (roots.len == 1) {
+        print(&b, "\xe2\x80\x9c");  // quotation marks
+        print(&b, shorten(&a, sesstitle(roots[0]), 48));
+        print(&b, "\xe2\x80\x9d");
+    } else {
+        print(&b, (i64)roots.len);
+        print(&b, " sessions");
+    }
+    print(&b, " to the Trash, kept ");
+    print(&b, (i64)h->trashdays);
+    print(&b, h->trashdays==1 ? Str(" day") : Str(" days"));
+    t->text  = clone(&g->perm, finish(&b));
+    t->host  = h->uid;
+    t->until = g->sched.now + TRASHTOAST_LIFE;
+    scheddirty(&g->sched);
+}
+
+// Whether the toast tells of s.
+static b32 trashtoasted(Gui *g, GuiSession *s)
+{
+    TrashToast *t = &g->trashtoast;
+    for (iz i = 0; t->host==s->host->uid && i < t->sids.len; i++) {
+        if (t->sids[i] == s->sid) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // A session is gone from its host: from the sidebar, the transcript
@@ -10389,6 +10532,7 @@ enum : i32 {
     CHK_HOSTTRIED,
     CHK_FORKED,
     CHK_DELCOUNT,     // the delete confirmation counts dx sessions
+    CHK_TRASHTOAST,   // the Trash's toast shown (dx 1) or not (dx 0)
     CHK_GUILOCK,      // this process holds the state directory's window lock
     CHK_ALWAYSBTN,
     CHK_ALWAYSPATH,
@@ -10669,6 +10813,7 @@ static Str chknames[] = {
     "the remote's heading connected, or tried",
     "the fork is shown, its draft the prompt that came next",
     "the delete confirmation counts the sessions it takes",
+    "the Trash's toast is shown, or not, as expected",
     "the window lock is held, and by this process",
     "the ask offers Always for its directory, apart from Allow",
     "allowed always: the second write was not asked about",
@@ -12784,6 +12929,22 @@ static DriveOp sessionsops[] = {
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Work\n H this\n  S Greeting\n"},
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nA"},
+    // Into the Trash by the strip at the pane's foot, told in a toast,
+    // whose Undo puts it back in its group
+    DRAGSESS("Greeting"),
+    {OP_MOVE, T_NAMED, 0, 0, 300, "sessions trash"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-trashdrag"},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Greeting"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT+\n"},
+    {OP_CHECK, CHK_TRASHTOAST, 1, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-trash"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "trash undo"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_TRASHTOAST, 0, 0, 0, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "G Work\n H this\n  S Greeting\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nT"},
     // Its model, from the session bar's picker
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -12904,12 +13065,16 @@ static DriveOp sessionsops[] = {
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello."},
     {OP_CHECK, CHK_TITLE, 0, 0, 0, "Greeting (fork)"},
     {OP_SHOT, 0, 0, 0, 300, "sessions-forked"},
-    // The forked session with its subagents, deleted once confirmed,
-    // after a cancel, the confirmation counting all three
+    // The forked session with its subagents: Delete Permanently, the
+    // confirmation counting all three, cancelled; into the Trash from its
+    // menu, there under the Trash heading once opened; Empty Trash
+    // counting them, cancelled; restored from its menu there; then
+    // dragged into the Trash again, the toast dismissed, and the Trash
+    // emptied
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Delete..."},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Delete Permanently"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
     {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
@@ -12923,13 +13088,58 @@ static DriveOp sessionsops[] = {
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "Delete..."},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Move to Trash"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Start subagents.\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT+\n"},
+    {OP_CHECK, CHK_TRASHTOAST, 1, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head t"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT\n H this\n  S Start subagents.\n"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-trashopen"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head t"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Empty Trash"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_DELCOUNT, 3, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "delete cancel"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Start subagents."},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Restore"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nT"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Start subagents.\n"},
+    DRAGSESS("Start subagents."),
+    {OP_MOVE, T_NAMED, 0, 0, 300, "sessions trash"},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_TRASHTOAST, 1, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "trash dismiss"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_TRASHTOAST, 0, 0, 0, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT\n H this\n  S Start subagents.\n"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head t"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Empty Trash"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_DELCOUNT, 3, 0, 0, ""},
     {OP_MOVE, T_NAMED, 0, 0, 100, "delete ok"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 2000, ""},
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "S Start subagents.\n"},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\nT"},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Whole fork\n"},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Greeting\n"},
     // Imported from the raw log exported above, from the Session menu
@@ -16123,6 +16333,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_DELCOUNT:
         return (f32)g->delcount == g->ops[g->drivepc-1].dx;
+    case CHK_TRASHTOAST:
+        return (f32)(g->trashtoast.host != 0) == g->ops[g->drivepc-1].dx;
     case CHK_FORKED:
         return g->sess && endswith(sesstitle(g->sess), "(fork)") &&
                draftstr(g->sess)==g->ops[g->drivepc-1].text;

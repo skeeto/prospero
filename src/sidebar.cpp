@@ -3,11 +3,13 @@
 // The hierarchy is Group › Host › Session › Subagent. Groups come
 // first, in the GUI's order (which keeps empty ones too), each merged by
 // name across hosts; then the sessions in no group, host by host; then
-// an Archived heading over the archived sessions. A subagent belongs
-// where its root is: the root's group and archiving are its own. Host
-// headings show only when more than one host could be shown (heads),
-// under each group and the Archived heading too, where that host has
-// sessions; at the top level every host listed always shows, empty or
+// an Archived heading over the archived sessions; then a Trash heading
+// over those in the Trash, shown only with sessions in it. A subagent
+// belongs where its root is: the root's group, archiving and trashing
+// are its own, and a root in the Trash is in no group and not archived.
+// Host headings show only when more than one host could be shown
+// (heads), under each group and the Archived and Trash headings too,
+// where that host has sessions; at the top level every host listed always shows, empty or
 // not. Within a host, roots are newest first and subagents oldest first
 // under their parents, as the engine lists them. A subagent on another
 // host than its parent's (phost) goes under that parent, in its
@@ -15,7 +17,7 @@
 //
 // Every heading folds, and so does a session with subagents. The user's
 // choices are kept by key (folds: 1 folded, 0 open); without one, the
-// Archived heading is folded and everything else open. A session stays
+// Archived and Trash headings are folded and everything else open. A session stays
 // open while anything below it runs a turn or asks, and a heading while
 // anything below it asks, so that nothing waiting for the user is ever
 // hidden. A folded row's sessions are left out of the rows.
@@ -26,6 +28,8 @@
 //   g:NAME|h:HOST     a host's heading under a group
 //   a                 the Archived heading
 //   a|h:HOST          a host's heading under it
+//   t                 the Trash heading
+//   t|h:HOST          a host's heading under it
 //   s:HOST:SID        a session with subagents
 //
 // This is free and unencumbered software released into the public domain.
@@ -35,6 +39,14 @@ enum : i32 {
     SROW_HOST,
     SROW_SESSION,
     SROW_ARCHIVED,  // the Archived heading
+    SROW_TRASH,     // the Trash heading
+};
+
+// The sections a root can be in (sidein).
+enum : i32 {
+    SIDE_LIVE,      // a group's, or in none
+    SIDE_ARCHIVED,
+    SIDE_TRASH,
 };
 
 enum : i32 {
@@ -49,6 +61,7 @@ struct SideSess {
     i32  phost;     // that parent's host index + 1, if another host's
     Str  group;     // its group, if any: only a root's counts
     b32  archived;  // only a root's counts
+    b32  trashed;   // in the Trash: only a root's counts
     b32  active;    // runs a turn
     b32  asks;      // waits for the user
 };
@@ -75,6 +88,7 @@ struct SideRow {
     i32 sess;     // SROW_SESSION: index into the sessions, else -1
     Str group;    // SROW_GROUP: its name; else the group it is in, if any
     b32 archived; // under the Archived heading, or it
+    b32 trashed;  // under the Trash heading, or it
     Str key;      // its fold key, empty if it does not fold
     b32 folded;   // its rows below are left out
     b32 forced;   // open whatever the user chose
@@ -131,7 +145,7 @@ static void sideplace(SideTree *t, i32 i, i32 root, i32 depth)
 }
 
 // A session's row, then its subagents', unless folded.
-static void sideemit(SideTree *t, i32 i, i32 depth, Str group, b32 archived, i32 level)
+static void sideemit(SideTree *t, i32 i, i32 depth, Str group, i32 aside, i32 level)
 {
     SideSess *s   = &t->in->sess[i];
     SideHost *h   = &t->in->hosts[s->host];
@@ -145,7 +159,8 @@ static void sideemit(SideTree *t, i32 i, i32 depth, Str group, b32 archived, i32
     r.host   = s->host;
     r.sess   = i;
     r.group    = group;
-    r.archived = archived;
+    r.archived = aside == SIDE_ARCHIVED;
+    r.trashed  = aside == SIDE_TRASH;
     r.kids     = any && level<SIDE_DEPTH;
     r.away   = s->host != t->in->sess[t->root[i]].host;
     r.count  = t->size[i];
@@ -165,19 +180,21 @@ static void sideemit(SideTree *t, i32 i, i32 depth, Str group, b32 archived, i32
     Slice<i32> k = t->kids[i];
     for (iz n = 0; n < k.len; n++) {
         if (t->under[k[n]] == i) {
-            sideemit(t, k[n], depth+1, group, archived, level+1);
+            sideemit(t, k[n], depth+1, group, aside, level+1);
         }
     }
 }
 
-// Whether a root belongs to a section: a group's (group), the ungrouped
-// (archived 0, group empty), or the archived (archived 1).
-static b32 sidein(SideSess *s, b32 archived, Str group)
+// Whether a root belongs to a section: a group's (SIDE_LIVE, group),
+// the ungrouped (SIDE_LIVE, group empty), the archived or the Trash.
+static b32 sidein(SideSess *s, i32 aside, Str group)
 {
-    if (s->archived) {
-        return archived;
+    if (s->trashed) {
+        return aside == SIDE_TRASH;
+    } else if (s->archived) {
+        return aside == SIDE_ARCHIVED;
     }
-    return !archived && s->group==group;
+    return aside==SIDE_LIVE && s->group==group;
 }
 
 // A section's roots of one host (host >= 0) or of all, and what they
@@ -188,12 +205,12 @@ struct SideSum {
     b32 any;
 };
 
-static SideSum sidesum(SideTree *t, Slice<i32> roots, i32 host, b32 archived, Str group)
+static SideSum sidesum(SideTree *t, Slice<i32> roots, i32 host, i32 aside, Str group)
 {
     SideSum r = {};
     for (iz n = 0; n < roots.len; n++) {
         SideSess *s = &t->in->sess[roots[n]];
-        if ((host<0 || s->host==host) && sidein(s, archived, group)) {
+        if ((host<0 || s->host==host) && sidein(s, aside, group)) {
             r.any    = 1;
             r.count += t->size[roots[n]];
             r.asks  |= t->asks[roots[n]];
@@ -203,12 +220,12 @@ static SideSum sidesum(SideTree *t, Slice<i32> roots, i32 host, b32 archived, St
 }
 
 // A section's sessions, under host headings when there are any.
-static void sidesection(SideTree *t, Slice<i32> roots, i32 depth, b32 archived,
+static void sidesection(SideTree *t, Slice<i32> roots, i32 depth, i32 aside,
                         Str group, Str prefix, b32 always)
 {
     SideIn *in = t->in;
     for (i32 h = 0; h < (i32)in->hosts.len; h++) {
-        SideSum sum = sidesum(t, roots, h, archived, group);
+        SideSum sum = sidesum(t, roots, h, aside, group);
         if (!in->heads && !sum.any) {
             continue;
         } else if (in->heads) {
@@ -221,7 +238,8 @@ static void sidesection(SideTree *t, Slice<i32> roots, i32 depth, b32 archived,
             r.host   = h;
             r.sess   = -1;
             r.group    = group;
-            r.archived = archived;
+            r.archived = aside == SIDE_ARCHIVED;
+            r.trashed  = aside == SIDE_TRASH;
             r.key      = sidekey(t->a, prefix, sidekey(t->a, "h:", in->hosts[h].key));
             r.count  = sum.count;
             r.asks   = sum.asks;
@@ -234,8 +252,8 @@ static void sidesection(SideTree *t, Slice<i32> roots, i32 depth, b32 archived,
         }
         for (iz n = 0; n < roots.len; n++) {
             SideSess *s = &in->sess[roots[n]];
-            if (s->host==h && sidein(s, archived, group)) {
-                sideemit(t, roots[n], depth + (in->heads ? 1 : 0), group, archived, 0);
+            if (s->host==h && sidein(s, aside, group)) {
+                sideemit(t, roots[n], depth + (in->heads ? 1 : 0), group, aside, 0);
             }
         }
     }
@@ -318,7 +336,7 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
     }
     for (iz r = 0; r < roots.len; r++) {
         SideSess *s   = &in->sess[roots[r]];
-        b32       dup = s->archived || !s->group.len;
+        b32       dup = s->archived || s->trashed || !s->group.len;
         for (iz k = 0; !dup && k < groups.len; k++) {
             dup = groups[k] == s->group;
         }
@@ -327,7 +345,7 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
         }
     }
     for (iz i = 0; i < groups.len; i++) {
-        SideSum sum = sidesum(&t, roots, -1, 0, groups[i]);
+        SideSum sum = sidesum(&t, roots, -1, SIDE_LIVE, groups[i]);
         SideRow r   = {};
         r.kind   = SROW_GROUP;
         r.sess   = -1;
@@ -339,15 +357,15 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
         r.folded = sidefolded(in, r.key, 0) && !r.forced;
         t.rows = push(a, t.rows, r);
         if (!r.folded) {
-            sidesection(&t, roots, 1, 0, groups[i], concat(a, r.key, "|"), 0);
+            sidesection(&t, roots, 1, SIDE_LIVE, groups[i], concat(a, r.key, "|"), 0);
         }
     }
 
     // The rest, by host, every host listed always
-    sidesection(&t, roots, 0, 0, {}, {}, 1);
+    sidesection(&t, roots, 0, SIDE_LIVE, {}, {}, 1);
 
     // Archived, folded unless opened
-    SideSum sum = sidesum(&t, roots, -1, 1, {});
+    SideSum sum = sidesum(&t, roots, -1, SIDE_ARCHIVED, {});
     if (sum.any || in->archive) {
         SideRow r = {};
         r.kind     = SROW_ARCHIVED;
@@ -360,7 +378,25 @@ static Slice<SideRow> sidetree(Arena *a, SideIn *in)
         r.folded = sidefolded(in, r.key, 1) && !r.forced;
         t.rows = push(a, t.rows, r);
         if (!r.folded) {
-            sidesection(&t, roots, 1, 1, {}, "a|", 0);
+            sidesection(&t, roots, 1, SIDE_ARCHIVED, {}, "a|", 0);
+        }
+    }
+
+    // The Trash, folded unless opened, and only with sessions in it
+    sum = sidesum(&t, roots, -1, SIDE_TRASH, {});
+    if (sum.any) {
+        SideRow r = {};
+        r.kind    = SROW_TRASH;
+        r.trashed = 1;
+        r.sess    = -1;
+        r.key     = "t";
+        r.count   = sum.count;
+        r.asks    = sum.asks;
+        r.forced  = sum.asks;
+        r.folded  = sidefolded(in, r.key, 1) && !r.forced;
+        t.rows = push(a, t.rows, r);
+        if (!r.folded) {
+            sidesection(&t, roots, 1, SIDE_TRASH, {}, "t|", 0);
         }
     }
     return t.rows;
