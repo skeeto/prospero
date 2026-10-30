@@ -854,6 +854,7 @@ struct Engine {
     i64         wtserial;
     Slice<Str>  wtdue;    // sessions whose worktrees may go now, "" for all
     Slice<WtSess> wtgone; // worktrees of sessions deleted
+    i64         trashat;  // ticks: when the Trash is next purged (trashpurge)
 };
 
 
@@ -4146,6 +4147,7 @@ static void reconfigure(Engine *, Arena);
 static void cfgapply(Engine *e, Arena scratch)
 {
     reconfigure(e, scratch);
+    e->trashat = os_ticks(e->os);  // by trash_days as it is now
     Buf   b(&scratch, 128);
     EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_CONFIG);
     putintkey(&w.json, "rev", e->cfg->rev);
@@ -13847,6 +13849,31 @@ static Str sidecarput(Engine *e, Arena scratch, Str sid, Str name, Str data)
     return ok ? Str{} : Str("cannot write the session's files");
 }
 
+// When a session went to the Trash (epoch ms), as its trashed sidecar
+// says, else as that file's time says; 0 if it is not in the Trash.
+static i64 trashedat(Engine *e, Arena scratch, Str sid)
+{
+    Str v = sidecarget(e, &scratch, sid, "trashed", 32);
+    if (!v.data) {
+        return 0;
+    }
+    Int t = parseint(trim(v));
+    if (t.ok && t.val>0) {
+        return t.val;
+    }
+    Stat st = os_stat(e->os, scratch, sidecarpath(&scratch, e, sid, "trashed"));
+    return st.mtime>0 ? st.mtime : 1;
+}
+
+// [sessions] trash_days: how many days the Trash keeps a session, 0 for
+// no Trash at all (as the schema's default, without a configuration).
+static i32 trashdays(Engine *e)
+{
+    Str d = e->cfg ? cfgget(e->cfg, "sessions", {}, "trash_days", 0) : Str("30");
+    Int v = parseint(trim(d));
+    return v.ok && v.val>=0 ? (i32)(v.val<36500 ? v.val : 36500) : 30;
+}
+
 // A session for a command that may name one not open here: open, else
 // revived if parked, else loaded from its log for the command alone
 // (*transient), which the caller forgets once done with it. Null if
@@ -13884,6 +13911,7 @@ struct ListEntry {
     b32       locked;  // open in another process
     b32       parked;
     b32       archived;
+    i64       trashed;   // when it went to the Trash (epoch ms), else 0
     b32       nofolder;  // in a folder of its own
     WtSess    wt;        // a worktree session's worktree
     b32       wtgone;    // and it is not there
@@ -13935,6 +13963,7 @@ static SessScan scansessions(Engine *e, Arena *a)
         en.scratch  = jsonstr(jsonget(rec.root, "scratch"));
         en.group    = sidecarget(e, a, d->name, "group", GROUP_MAX);
         en.archived = sidecarget(e, a, d->name, "archived", 16).data != 0;
+        en.trashed  = trashedat(e, *a, d->name);
         en.nofolder = jsonint(jsonget(rec.root, "nofolder"), 0) == 1;
         en.wt       = wtfrom(a, jsonget(rec.root, "worktree"));
         en.wtgone   = en.wt.name.len && !wtexists(e, *a, &en.wt);
@@ -13985,18 +14014,24 @@ static SessScan scansessions(Engine *e, Arena *a)
 // nobody, and its sender is told so, as is its target when its reply
 // would be such. A turn makes at most MSG_TURN send_message calls.
 
-// Whether a scanned session, or one above it, is archived.
-static b32 scanarchived(SessScan *sc, iz i)
+enum : i32 {
+    ASIDE_ARCHIVED = 1,
+    ASIDE_TRASHED  = 2,
+};
+
+// Whether a scanned session, or one above it, is archived or in the
+// Trash (ASIDE_*), either of which sets it aside.
+static i32 scanaside(SessScan *sc, iz i)
 {
+    i32 r = 0;
     for (i32 n = 0; i>=0 && n<=TASK_DEPTH+8; n++) {
         ListEntry *en = &sc->list[i];
-        if (en->archived) {
-            return 1;
-        }
+        r |= en->archived ? ASIDE_ARCHIVED : 0;
+        r |= en->trashed ? ASIDE_TRASHED : 0;
         iz *p = en->parent.len ? upsert(&sc->bysid, en->parent, (Arena *)0) : 0;
         i = p ? *p : -1;
     }
-    return 0;
+    return r;
 }
 
 // How a scanned session relates to s.
@@ -14053,7 +14088,7 @@ static void toolsessions(Session *s, Arena scratch)
         for (iz i = sc.list.len-1; i >= 0; i--) {
             ListEntry *en  = &sc.list[i];
             b32        rel = relation(s, en) != "other";
-            if (en->sid==s->sid || rel!=kin || scanarchived(&sc, i)) {
+            if (en->sid==s->sid || rel!=kin || scanaside(&sc, i)) {
                 continue;
             } else if (!kin && others++>=SESS_SHOWN) {
                 continue;
@@ -14089,7 +14124,7 @@ static MsgTarget msgtarget(Arena *a, SessScan *sc, Str to)
     }
     Slice<iz> named = {};
     for (iz i = 0; i < sc->list.len; i++) {
-        if (sc->list[i].title==to && !scanarchived(sc, i)) {
+        if (sc->list[i].title==to && !scanaside(sc, i)) {
             named = push(a, named, i);
         }
     }
@@ -14167,7 +14202,10 @@ static void toolmessage(Session *s, Arena scratch, Args *args)
         // msgtarget said why
     } else if (en->sid == s->sid) {
         err = "Not sent: that is your own session.";
-    } else if (scanarchived(&sc, mt.at)) {
+    } else if (scanaside(&sc, mt.at) & ASIDE_TRASHED) {
+        err = concat(&scratch, concat(&scratch, "Not sent: ", en->sid),
+                     " is in the Trash: the user deleted it.");
+    } else if (scanaside(&sc, mt.at)) {
         err = concat(&scratch, concat(&scratch, "Not sent: ", en->sid),
                      " is archived: the user set it aside.");
     } else if (en->locked) {
@@ -14261,14 +14299,16 @@ static void toolmessage(Session *s, Arena scratch, Args *args)
 }
 
 
-// The trash
+// Removal
 //
-// A session deleted (delete), or a fork that failed part of the way,
-// leaves the sessions directory at once, renamed into STATE/trash under
-// a name of its own, and a detached thread removes it from there with
-// os_removetree, so that the engine thread never waits on a big tree.
-// Whatever a crash leaves in the trash goes when an engine next starts,
-// as two engines (a GUI's and a host's) may well both sweep at once.
+// A session deleted for good (delete), or a fork that failed part of
+// the way, leaves the sessions directory at once, renamed into
+// STATE/trash under a name of its own, and a detached thread removes it
+// from there with os_removetree, so that the engine thread never waits
+// on a big tree. Whatever a crash leaves there goes when an engine next
+// starts, as two engines (a GUI's and a host's) may well both sweep at
+// once. That directory is only a way out, and not the Trash the user
+// sees, whose sessions stay where they are (cmdtrash).
 
 struct Remover {
     Region    *region;  // holds the remover itself
@@ -14287,8 +14327,8 @@ static void removerthread(void *arg)
     os_release(os, r->region);
 }
 
-// Remove trees on a thread of their own. Those in the trash stay there
-// for the next sweep should no thread start.
+// Remove trees on a thread of their own. Those in STATE/trash stay
+// there for the next sweep should no thread start.
 static void removelater(Engine *e, Slice<Str> paths)
 {
     if (!paths.len) {
@@ -14311,30 +14351,30 @@ static void removelater(Engine *e, Slice<Str> paths)
     }
 }
 
-static Str trashdir(Arena *a, Engine *e)
+static Str removedir(Arena *a, Engine *e)
 {
     return join(a, e->statedir, "trash");
 }
 
-// A name in the trash for a session's directory.
-static Str trashname(Arena *a, Engine *e, Str sid)
+// A name in STATE/trash for a session's directory.
+static Str removename(Arena *a, Engine *e, Str sid)
 {
     Buf b(a, sid.len + 24);
     print(&b, sid);
     putbyte(&b, '.');
     printhex(&b, os_random(e->os), 16);
-    return join(a, trashdir(a, e), finish(&b));
+    return join(a, removedir(a, e), finish(&b));
 }
 
-// Move a directory into the trash, and have it removed. On Windows a
+// Move a directory into STATE/trash, and have it removed. On Windows a
 // directory with a file open in it cannot be renamed, which is why the
 // caller lets go of its lock first there, and the rename is tried a few
 // times, for a scanner that may have a file open for a moment.
-static b32 totrash(Engine *e, Arena scratch, Str dir, Str sid)
+static b32 toremove(Engine *e, Arena scratch, Str dir, Str sid)
 {
     // Paths complete before scratch is passed on, which copies it
-    Str to    = trashname(&scratch, e, sid);
-    Str trash = trashdir(&scratch, e);
+    Str to    = removename(&scratch, e, sid);
+    Str trash = removedir(&scratch, e);
     if (!os_mkdirs(e->os, scratch, trash)) {
         return 0;
     }
@@ -14348,11 +14388,11 @@ static b32 totrash(Engine *e, Arena scratch, Str dir, Str sid)
     return ok;
 }
 
-// What a crash left in the trash, removed.
-static void sweeptrash(Engine *e, Arena scratch)
+// What a crash left in STATE/trash, removed.
+static void sweepremovals(Engine *e, Arena scratch)
 {
     Slice<Str> paths = {};
-    Str        dir   = trashdir(&scratch, e);
+    Str        dir   = removedir(&scratch, e);
     for (Dirent *d = os_list(e->os, &scratch, dir); d; d = d->next) {
         paths = push(&scratch, paths, join(&scratch, dir, d->name));
     }
@@ -15304,6 +15344,25 @@ static void sendsnapshot(Session *s, Arena scratch)
     ssend(s, &w);
 }
 
+// Whether a session not open here, or one above it, is in the Trash:
+// by the parents its session records name, on this host.
+static b32 intrash(Engine *e, Arena scratch, Str sid)
+{
+    for (i32 n = 0; validsid(sid) && n<=TASK_DEPTH+8; n++) {
+        if (sidecarget(e, &scratch, sid, "trashed", 32).data) {
+            return 1;
+        }
+        Str   path = sidecarpath(&scratch, e, sid, "events.jsonl");
+        Read  rd   = os_readat(e->os, &scratch, path, 0, 4096);
+        EvRec rec  = evparse(&scratch, cut(rd.data, '\n').head);
+        if (rec.ev!=EV_SESSION || jsonint(jsonget(rec.root, "remote"), 0)==1) {
+            return 0;
+        }
+        sid = jsonstr(jsonget(rec.root, "parent"));
+    }
+    return 0;
+}
+
 static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Str      sid   = jsonstr(jsonget(j, "sid"));
@@ -15320,6 +15379,9 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
     if (!s) {
         if (!validsid(sid)) {
             reply(e, scratch, id, 0, "invalid session id", {});
+            return;
+        } else if (intrash(e, scratch, sid)) {
+            reply(e, scratch, id, 0, "in the Trash: restore it first", sid);
             return;
         }
         Str model = jsonstr(jsonget(j, "model"));
@@ -15767,6 +15829,9 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     if (en->archived) {
         putintkey(w, "archived", 1);
     }
+    if (en->trashed) {
+        putintkey(w, "trashed", en->trashed);
+    }
     if (en->group.len) {
         putstrkey(w, "group", en->group);
     }
@@ -15787,12 +15852,21 @@ static void listput(Engine *e, JsonOut *w, Slice<ListEntry> list, iz i, i32 dept
     }
 }
 
-// The sessions in the state directory, newest first, but a subagent's
-// under its parent, oldest first: in the order a sidebar shows them.
-static void cmdlist(Engine *e, Arena scratch, i64 id)
+// list {trash}: the sessions in the state directory, newest first, but
+// a subagent's under its parent, oldest first: in the order a sidebar
+// shows them. Those in the Trash, with their subagents, only with trash,
+// as a frontend that knows the Trash asks (an older one would show them
+// as any other); trash_days says how long the Trash keeps them here.
+static void cmdlist(Engine *e, Arena scratch, i64 id, Json *j)
 {
-    Slice<ListEntry> list = scansessions(e, &scratch).list;
-    Buf              b(&scratch, 4096);
+    SessScan         sc   = scansessions(e, &scratch);
+    Slice<ListEntry> list = sc.list;
+    if (!jsonflag(jsonget(j, "trash"), 0)) {
+        for (iz i = 0; i < list.len; i++) {
+            list[i].shown = (scanaside(&sc, i) & ASIDE_TRASHED) != 0;  // left out
+        }
+    }
+    Buf   b(&scratch, 4096);
     EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_SESSIONS);
     putkey(&w.json, "list");
     putarray(&w.json);
@@ -15805,6 +15879,7 @@ static void cmdlist(Engine *e, Arena scratch, i64 id)
         listput(e, &w.json, list, i, 0);  // in a cycle of parents
     }
     putend(&w.json);
+    putintkey(&w.json, "trash_days", trashdays(e));
     emit(e, evend(&w));
     reply(e, scratch, id, 1, {}, {});
 }
@@ -16318,14 +16393,117 @@ static Slice<Str> ownscratch(Engine *e, Arena *a, SessScan *sc,
     return r;
 }
 
+// Why a tree of the scan may not go, to the Trash or for good, else
+// null: nothing may run in one of it here (forgettable, as busy alone
+// leaves out background jobs), and none may be open in another process.
+// One parked may go.
+static Str treebusy(Engine *e, Arena *a, SessScan *sc, Slice<iz> tree)
+{
+    Str root = sc->list[tree[0]].sid;
+    for (iz i = 0; i < tree.len; i++) {
+        ListEntry *en = &sc->list[tree[i]];
+        Session   *s  = findsession(e, en->sid);
+        Str        of = en->sid==root ? Str{} : concat(a, ": its subagent ", en->sid);
+        if (s && !s->readonly && !forgettable(s)) {
+            return concat(a, "busy: cancel its turn and stop its jobs first", of);
+        } else if (en->locked) {
+            return concat(a, "open in another process", of);
+        }
+    }
+    return {};
+}
+
+// Delete a tree of the scan for good, as treebusy allows. Subagents go
+// first, so that a failure part of the way never leaves one to show as
+// a session of its own, its parent gone. Each directory goes into
+// STATE/trash while its lock is held (on Windows, just after), and is
+// added to deleted, its scratch directory to mines, for the caller to
+// remove those no session left uses (ownscratch). Its worktrees are due
+// a sweep. Returns why it stopped part of the way, else null.
+static Str deletetree(Engine *e, Arena *a, SessScan *sc, Slice<iz> tree,
+                      Slice<Str> *deleted, Slice<Str> *mines)
+{
+    for (iz n = 0; n < tree.len; n++) {
+        WtSess *wt = &sc->list[tree[n]].wt;
+        if (wt->name.len) {
+            WtSess keep = {};
+            keep.name   = clone(&e->perm, wt->name);
+            keep.main   = clone(&e->perm, wt->main);
+            keep.branch = clone(&e->perm, wt->branch);
+            keep.base   = clone(&e->perm, wt->base);
+            keep.oid    = clone(&e->perm, wt->oid);
+            keep.path   = clone(&e->perm, wt->path);
+            e->wtgone   = push(&e->perm, e->wtgone, keep);  // swept once it goes
+        }
+    }
+    for (iz n = tree.len-1; n >= 0; n--) {
+        ListEntry *en   = &sc->list[tree[n]];
+        Str        msid = en->sid;
+        Str        mine = en->scratch;
+        Session   *s    = findsession(e, msid);
+        iz         park = parkedat(e, msid);
+        iz         lock = -1;
+        if (s) {
+            // Out of memory, but the lock kept for the rename
+            mine    = s->scratch.len ? clone(a, s->scratch) : mine;
+            lock    = s->readonly ? -1 : s->lock;
+            s->lock = -1;
+            forget(e, s);
+        } else if (park >= 0) {
+            lock = e->parked[park].lock;
+            e->parked[park] = e->parked[e->parked.len-1];
+            e->parked.len--;
+        }
+        Str dir = join(a, join(a, e->statedir, "sessions"), msid);
+        if (lock < 0) {
+            Str path = sidecarpath(a, e, msid, "lock");
+            lock = os_lockfile(e->os, *a, path);
+        }
+        if (lock < 0) {
+            return concat(a, "open in another process: ", msid);
+        }
+        if (HOST_WINDOWS) {
+            os_unlockfile(e->os, lock);  // an open file holds its directory
+            lock = -1;
+        }
+        b32 moved = toremove(e, *a, dir, msid);
+        if (lock >= 0) {
+            os_unlockfile(e->os, lock);
+        }
+        if (!moved) {
+            return concat(a, "cannot move the session's directory away: ", msid);
+        }
+        *deleted = push(a, *deleted, msid);
+        if (mine.len) {
+            *mines = push(a, *mines, mine);
+        }
+    }
+    return {};
+}
+
+// A reply listing the sessions deleted, also those before a failure.
+static void replydeleted(Engine *e, Arena scratch, i64 id, Str sid, Str err,
+                         Slice<Str> deleted)
+{
+    Buf   b(&scratch, 256 + err.len + 64*deleted.len);
+    EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", !err.len);
+    if (err.len) {
+        putstrkey(&w.json, "err", err);
+    }
+    putkey(&w.json, "deleted");
+    putarray(&w.json);
+    for (iz i = 0; i < deleted.len; i++) {
+        putstr(&w.json, deleted[i]);
+    }
+    putend(&w.json);
+    emit(e, evend(&w));
+}
+
 // delete {sid}: a session for good, with its subagents (subtree), once
-// each of them is checked: nothing may run in one here (forgettable, as
-// busy alone leaves out background jobs), and none may be open in
-// another process; one parked may go. Subagents go first, so that a
-// failure part of the way never leaves one to show as a session of its
-// own, its parent gone. Each directory goes into the trash while its
-// lock is held (on Windows, just after), and so do scratch directories
-// no session left uses (ownscratch). The
+// each of them is checked (treebusy), in the Trash or not (deletetree).
+// So do the scratch directories no session left uses (ownscratch). The
 // reply lists the sessions deleted, also those before a failure.
 static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
 {
@@ -16342,97 +16520,148 @@ static void cmddelete(Engine *e, Arena scratch, i64 id, Json *j)
     }
 
     Slice<iz> tree = subtree(&scratch, &sc, *at);
-    Str       err  = {};
-    for (iz i = 0; i<tree.len && !err.len; i++) {
-        ListEntry *en = &sc.list[tree[i]];
-        Session   *s  = findsession(e, en->sid);
-        Str        of = en->sid==sid ? Str{} : concat(&scratch, ": its subagent ", en->sid);
-        if (s && !s->readonly && !forgettable(s)) {
-            err = concat(&scratch, "busy: cancel its turn and stop its jobs first", of);
-        } else if (en->locked) {
-            err = concat(&scratch, "open in another process", of);
+    Str       err  = treebusy(e, &scratch, &sc, tree);
+    if (err.len) {
+        reply(e, scratch, id, 0, err, sid);
+        return;
+    }
+    Slice<Str> deleted = {};
+    Slice<Str> mines   = {};  // their scratch directories
+    err = deletetree(e, &scratch, &sc, tree, &deleted, &mines);
+    removelater(e, ownscratch(e, &scratch, &sc, deleted, mines));
+    replydeleted(e, scratch, id, sid, err, deleted);
+}
+
+// The Trash
+//
+// A session deleted by the user goes to the Trash first, unless
+// [sessions] trash_days is 0, and stays where it is, its root marked by
+// a trashed sidecar holding when (epoch ms): so it keeps its scratch
+// directory, and the name of its worktree, for a restore that undoes it
+// all. It is left out of a plain list (list {trash} has it), refused to
+// open, and set aside as if archived (scanaside): the agents see it no
+// longer, and its worktree goes as an archived session's would, to be
+// made again on restore. After trash_days it goes for good (trashpurge),
+// as an engine starts and every hour while it runs; trash.empty, or
+// delete, need not wait.
+
+enum : i64 {
+    TRASH_EVERY = (i64)60*60*1000,  // ms between purges of the Trash
+    DAY_MS      = (i64)24*60*60*1000,
+};
+
+// trash {sid, on}: a session to the Trash (on, 1 if absent), with its
+// subagents, once each of them is checked as for delete (treebusy), as
+// it leaves memory here; or back out of it, restored (on false), its
+// worktree made again unless it is archived. Only a root goes, as its
+// subagents belong with it. The reply lists the sessions trashed,
+// children first; one already in the Trash keeps its time there.
+static void cmdtrash(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str sid = jsonstr(jsonget(j, "sid"));
+    b32 on  = jsonflag(jsonget(j, "on"), 1);
+    if (!validsid(sid)) {
+        reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    }
+    SessScan sc = scansessions(e, &scratch);
+    iz      *at = upsert(&sc.bysid, sid, (Arena *)0);
+    if (!at) {
+        reply(e, scratch, id, 0, "no such session", sid);
+        return;
+    }
+    ListEntry *en = &sc.list[*at];
+    if (!on) {
+        Str err = en->trashed ? sidecarput(e, scratch, sid, "trashed", Str{}) : Str{};
+        if (!err.len && en->trashed && !(scanaside(&sc, *at) & ASIDE_ARCHIVED)) {
+            wtrestore(e, scratch, sid);
         }
+        reply(e, scratch, id, !err.len, err, sid);
+        return;
+    } else if (en->parent.len) {
+        reply(e, scratch, id, 0, "a subagent goes with the session that started it", sid);
+        return;
+    } else if (!trashdays(e)) {
+        reply(e, scratch, id, 0, "the Trash is off ([sessions] trash_days = 0)", sid);
+        return;
+    }
+
+    Slice<iz> tree = subtree(&scratch, &sc, *at);
+    Str       err  = treebusy(e, &scratch, &sc, tree);
+    if (!err.len && !en->trashed) {
+        Buf b(&scratch, 24);
+        print(&b, os_time(e->os));
+        err = sidecarput(e, scratch, sid, "trashed", finish(&b));
     }
     if (err.len) {
         reply(e, scratch, id, 0, err, sid);
         return;
     }
-
-    Slice<Str> deleted = {};
-    Slice<Str> mines   = {};  // their scratch directories
-    for (iz n = 0; n < tree.len; n++) {
-        WtSess *wt = &sc.list[tree[n]].wt;
-        if (wt->name.len) {
-            WtSess keep = {};
-            keep.name   = clone(&e->perm, wt->name);
-            keep.main   = clone(&e->perm, wt->main);
-            keep.branch = clone(&e->perm, wt->branch);
-            keep.base   = clone(&e->perm, wt->base);
-            keep.oid    = clone(&e->perm, wt->oid);
-            keep.path   = clone(&e->perm, wt->path);
-            e->wtgone   = push(&e->perm, e->wtgone, keep);  // swept once it goes
-        }
-    }
-    for (iz n = tree.len-1; n>=0 && !err.len; n--) {
-        ListEntry *en   = &sc.list[tree[n]];
-        Str        msid = en->sid;
-        Str        mine = en->scratch;
-        Session   *s    = findsession(e, msid);
-        iz         park = parkedat(e, msid);
-        iz         lock = -1;
+    Slice<Str> trashed = {};
+    for (iz n = tree.len-1; n >= 0; n--) {
+        Str      msid = sc.list[tree[n]].sid;
+        Session *s    = findsession(e, msid);
+        iz       park = parkedat(e, msid);
         if (s) {
-            // Out of memory, but the lock kept for the rename
-            mine    = s->scratch.len ? clone(&scratch, s->scratch) : mine;
-            lock    = s->readonly ? -1 : s->lock;
-            s->lock = -1;
-            forget(e, s);
+            forget(e, s);  // its lock let go
         } else if (park >= 0) {
-            lock = e->parked[park].lock;
+            os_unlockfile(e->os, e->parked[park].lock);
             e->parked[park] = e->parked[e->parked.len-1];
             e->parked.len--;
         }
-        Str dir = join(&scratch, join(&scratch, e->statedir, "sessions"), msid);
-        if (lock < 0) {
-            Str path = sidecarpath(&scratch, e, msid, "lock");
-            lock = os_lockfile(e->os, scratch, path);
-        }
-        if (lock < 0) {
-            err = concat(&scratch, "open in another process: ", msid);
-            break;
-        }
-        if (HOST_WINDOWS) {
-            os_unlockfile(e->os, lock);  // an open file holds its directory
-            lock = -1;
-        }
-        if (!totrash(e, scratch, dir, msid)) {
-            err = concat(&scratch, "cannot move the session's directory away: ", msid);
-        }
-        if (lock >= 0) {
-            os_unlockfile(e->os, lock);
-        }
-        if (err.len) {
-            break;
-        }
-        deleted = push(&scratch, deleted, msid);
-        if (mine.len) {
-            mines = push(&scratch, mines, mine);
-        }
+        trashed = push(&scratch, trashed, msid);
     }
-    removelater(e, ownscratch(e, &scratch, &sc, deleted, mines));
-    Buf   b(&scratch, 256 + err.len + 64*deleted.len);
+    e->wtdue = push(&e->perm, e->wtdue, clone(&e->perm, sid));
+
+    Buf   b(&scratch, 256 + 64*trashed.len);
     EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
     putintkey(&w.json, "id", id);
-    putintkey(&w.json, "ok", !err.len);
-    if (err.len) {
-        putstrkey(&w.json, "err", err);
-    }
-    putkey(&w.json, "deleted");
+    putintkey(&w.json, "ok", 1);
+    putkey(&w.json, "trashed");
     putarray(&w.json);
-    for (iz i = 0; i < deleted.len; i++) {
-        putstr(&w.json, deleted[i]);
+    for (iz i = 0; i < trashed.len; i++) {
+        putstr(&w.json, trashed[i]);
     }
     putend(&w.json);
     emit(e, evend(&w));
+}
+
+// The sessions in the Trash at least olderms (by their trashed time),
+// or all of them with 0 (a clock set back leaves none behind), deleted
+// for good, tree by tree, adding to deleted; a tree busy or open in
+// another process stays for later. Returns why the first that stayed
+// could not go, else null.
+static Str trashpurge(Engine *e, Arena *a, i64 olderms, Slice<Str> *deleted)
+{
+    SessScan   sc    = scansessions(e, a);
+    i64        now   = os_time(e->os);
+    Slice<Str> mines = {};  // their scratch directories
+    Str        first = {};
+    for (iz i = 0; i < sc.list.len; i++) {
+        ListEntry *en = &sc.list[i];
+        iz        *p  = en->parent.len ? upsert(&sc.bysid, en->parent, (Arena *)0) : 0;
+        if (!en->trashed || (olderms && now-en->trashed<olderms) ||
+                (p && (scanaside(&sc, *p) & ASIDE_TRASHED))) {
+            continue;  // not due, or goes with a session above it
+        }
+        Slice<iz> tree = subtree(a, &sc, i);
+        Str       err  = treebusy(e, a, &sc, tree);
+        err = err.len ? err : deletetree(e, a, &sc, tree, deleted, &mines);
+        if (err.len && !first.len) {
+            first = concat(a, concat(a, en->sid, ": "), err);
+        }
+    }
+    removelater(e, ownscratch(e, a, &sc, *deleted, mines));
+    return first;
+}
+
+// trash.empty: every session in the Trash, for good, as trashpurge
+// can. The reply lists the sessions deleted, and why one stayed.
+static void cmdtrashempty(Engine *e, Arena scratch, i64 id)
+{
+    Slice<Str> deleted = {};
+    Str        err     = trashpurge(e, &scratch, 0, &deleted);
+    replydeleted(e, scratch, id, {}, err, deleted);
 }
 
 enum : i32 {
@@ -16614,7 +16843,7 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     ok = ok && (!c.model.len || sidecarwrite(e, scratch, to, "model", c.model));
     ok = ok && os_write(os, scratch, log, c.log);
     if (!ok) {
-        totrash(e, scratch, dir, to);
+        toremove(e, scratch, dir, to);
         reply(e, scratch, id, 0, "cannot write the fork's files", sid);
         return;
     }
@@ -17326,7 +17555,7 @@ static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
         Str work = join(&scratch, sdir, "work");
         real = os_mkdirs(os, scratch, work) ? os_realpath(os, &scratch, work) : Str{};
         if (!real.len) {
-            totrash(e, scratch, sdir, to);
+            toremove(e, scratch, sdir, to);
             reply(e, scratch, id, 0, "cannot create the session's folder", {});
             return;
         }
@@ -17335,7 +17564,7 @@ static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
                              ep.url, dir, os_time(os), nofolder);
     if (li.err.len) {
         if (nofolder) {
-            totrash(e, scratch, sdir, to);
+            toremove(e, scratch, sdir, to);
         }
         reply(e, scratch, id, 0, li.err, {});
         return;
@@ -17346,7 +17575,7 @@ static void cmdimport(Engine *e, Arena scratch, i64 id, Json *j)
     ok = ok && sidecarwrite(e, scratch, to, "title", li.title);
     ok = ok && os_write(os, scratch, log, li.log);
     if (!ok) {
-        totrash(e, scratch, sdir, to);
+        toremove(e, scratch, sdir, to);
         reply(e, scratch, id, 0, "cannot write the imported session's files", {});
         return;
     }
@@ -17755,6 +17984,8 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_REWIND:
         case CMD_RENAME:
         case CMD_DELETE:
+        case CMD_TRASH:
+        case CMD_TRASHEMPTY:
         case CMD_FORK:
         case CMD_COMPACT:
         case CMD_MODEL:
@@ -17787,7 +18018,7 @@ static void command(Engine *e, Arena scratch, Str line)
         reply(e, scratch, id, 1, {}, {});
     } return;
     case CMD_LIST:
-        cmdlist(e, scratch, id);
+        cmdlist(e, scratch, id, j);
         return;
     case CMD_NEW:
         cmdnew(e, scratch, id, j);
@@ -17860,6 +18091,12 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_DELETE:
         cmddelete(e, scratch, id, j);  // on a session open here or not
+        return;
+    case CMD_TRASH:
+        cmdtrash(e, scratch, id, j);  // likewise
+        return;
+    case CMD_TRASHEMPTY:
+        cmdtrashempty(e, scratch, id);
         return;
     case CMD_GIT:
         cmdgit(e, scratch, id, j);  // likewise, and read-only ones too
@@ -18317,8 +18554,9 @@ static void enginethread(void *arg)
 {
     Engine *e = (Engine *)arg;
     cfgrefresh(e->cfg, newarena(e->scratch), 0);  // what loaded from a cache
-    sweeptrash(e, newarena(e->scratch));
+    sweepremovals(e, newarena(e->scratch));
     sweepuploads(e, newarena(e->scratch));
+    e->trashat = os_ticks(e->os);  // the Trash purged as it starts
     farinit(e, newarena(e->scratch));
     e->wtdue = push(&e->perm, e->wtdue, Str{});  // left by an engine before
     for (;;) {
@@ -18329,6 +18567,7 @@ static void enginethread(void *arg)
         next = mcpnext(e)<next ? mcpnext(e) : next;
         next = farnext(e)<next ? farnext(e) : next;
         next = e->wtdue.len || e->wtgone.len ? now : next;
+        next = !e->quitting && e->trashat<next ? e->trashat : next;
         for (Lister *l = e->listers; l; l = l->next) {
             next = !l->replied && l->by<next ? l->by : next;
         }
@@ -18396,6 +18635,13 @@ static void enginethread(void *arg)
                 s->parkme = 0;
                 p = &s->next;
             }
+        }
+        if (os_ticks(e->os)>=e->trashat && !e->quitting) {
+            // What the Trash kept long enough, for good
+            Arena      t    = newarena(e->scratch);
+            Slice<Str> gone = {};
+            trashpurge(e, &t, trashdays(e)*DAY_MS, &gone);
+            e->trashat = os_ticks(e->os) + TRASH_EVERY*(i64)MS;
         }
         if ((e->wtdue.len || e->wtgone.len) && !e->quitting) {
             wtsweep(e, newarena(e->scratch));  // worktrees no session needs

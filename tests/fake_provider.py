@@ -4381,6 +4381,7 @@ def sc_delete(model, n, req):
 
 
 sc_delete_b = sc_delete_refused = sc_delete_refused_b = sc_delete
+sc_trash = sc_trash_b = sc_delete
 
 
 def sc_fork(model, n, req):

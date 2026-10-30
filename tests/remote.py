@@ -922,9 +922,10 @@ def close_subagents(t):
 
 @scenario
 def host_ops(t):
-    """delete through a host: refused while another client has the
-    session, or a subagent of it, open, and done for the one that has it;
-    fork through a host, its new session then opened like any other."""
+    """delete and trash through a host: refused while another client has
+    the session, or a subagent of it, open, and done for the one that has
+    it, the Trash closing it there; fork through a host, its new session
+    then opened like any other."""
     c = Client(t)
     s = c.attach()
     c.call("hello")
@@ -943,6 +944,8 @@ def host_ops(t):
     t.check(o.get("ok") == 1, f"B opens the subagent: {o}")
     d = c.call("delete", sid=sid)
     t.check(d.get("ok") == 0 and d.get("err") == "open in another client", f"refused: {d}")
+    d = c.call("trash", sid=sid)
+    t.check(d.get("ok") == 0 and d.get("err") == "open in another client", f"no Trash: {d}")
     t.check(os.path.isdir(os.path.join(t.state, "sessions", sid)), "still there")
 
     f = c.call("fork", sid=sid, turn=1)
@@ -961,6 +964,10 @@ def host_ops(t):
 
     x = b.call("close", sid=kids[0])
     t.check(x.get("ok") == 1, f"B closes: {x}")
+    d = c.call("trash", sid=sid)
+    t.check(d.get("ok") == 1 and d.get("trashed") == [kids[0], sid], f"trashed: {d}")
+    p = c.call("prompt", sid=sid, text="still?")
+    t.check(p.get("ok") == 0, f"closed by the Trash: {p}")
     d = c.call("delete", sid=sid)
     t.check(d.get("ok") == 1 and d.get("deleted") == [kids[0], sid], f"deleted: {d}")
     d = c.call("delete", sid=fork)

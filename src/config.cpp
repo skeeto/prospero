@@ -230,6 +230,7 @@ static CfgKind cfgkinds[] = {
     {"skills",   0, "Skills: SKILL.md instructions the agent uses as a task calls for them"},
     {"memory",   0, "Project memory: the agent's notes for later sessions in a project"},
     {"worktree", 0, "Worktree sessions: each in a git worktree and branch of its own"},
+    {"sessions", 0, "Sessions deleted: how long the Trash keeps them"},
     {"ui",       0, "How the GUI looks, and when it tells you of a session"},
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"web",      0, "Web search and reading web pages: the web_search and web_fetch tools"},
@@ -489,6 +490,10 @@ static CfgKey cfgschema[] = {
     {"worktree", "branch_prefix", CFG_STRING, "prospero/", {}, {}, "worktree",
      "What a worktree session's branch name begins with, before its own "
      "name, as prospero/ in prospero/brisk-otter"},
+
+    {"sessions", "trash_days", CFG_INT, "30", {}, {}, "sessions",
+     "Days a session deleted stays in the Trash, where it can be restored, "
+     "before it is removed for good; 0 for no Trash, deleting at once"},
 
     {"desktop", "offer", CFG_ENUM, "all", {}, "none roles all", "desktop",
      "Which sessions get the desktop tool, where it can work (a display "
@@ -785,6 +790,8 @@ static Str cfgkindlabel(Arena *a, Str kind, b32 plural)
         return "Interface";
     } else if (kind == "mcp") {
         return plural ? Str("MCP servers") : Str("MCP server");
+    } else if (kind == "sessions") {
+        return "Sessions";  // already plural
     }
     Buf b(a, kind.len + 2);
     putbyte(&b, kind[0]>='a' && kind[0]<='z' ? (u8)(kind[0] - 'a' + 'A') : kind[0]);
@@ -1018,6 +1025,9 @@ static i32 cfgjudge(CfgKey *k, Str v, b32 shared)
         return cfgrefprefix(v) ? CFG_OK : CFG_BAD;
     } else if (k->kind=="mcp" && k->key=="redirect_uri") {
         return loopbackuri(v).ok ? CFG_OK : CFG_BAD;
+    } else if (k->kind=="sessions" && k->key=="trash_days") {
+        Int n = parseint(v);
+        return n.ok && n.val>=0 && n.val<=36500 ? CFG_OK : CFG_BAD;
     }
     switch (k->type) {
     case CFG_STRING:
@@ -1113,6 +1123,8 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     }
     if (k->kind=="mcp" && k->key=="redirect_uri") {
         return "expected http://127.0.0.1:PORT/PATH or http://localhost:PORT/PATH";
+    } else if (k->kind=="sessions" && k->key=="trash_days") {
+        return "expected days, 0 or more (at most 36500): 0 turns the Trash off";
     }
     Buf b(a, 128);
     switch (k->type) {

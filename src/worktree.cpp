@@ -1310,11 +1310,11 @@ static void wtremoved(Engine *e, Arena scratch, Json *answer)
 // Worktrees no session needs any longer, removed: those of the sessions
 // due (wtdue), or of all sessions ("" in it, as the engine starts), and
 // of those deleted (wtgone). One goes once every session recording it,
-// or working in it, is archived (it or an ancestor) or deleted, open in
-// no other process, and idle here, which is then parked, so that its MCP
-// servers let go of the folder. As the engine starts, a worktree marked
-// removed or kept (the worktree sidecar) is left alone, unless it is
-// back, made again by hand.
+// or working in it, is archived or in the Trash (it or an ancestor:
+// scanaside) or deleted, open in no other process, and idle here, which
+// is then parked, so that its MCP servers let go of the folder. As the
+// engine starts, a worktree marked removed or kept (the worktree
+// sidecar) is left alone, unless it is back, made again by hand.
 static void wtsweep(Engine *e, Arena scratch)
 {
     b32 win = HOST_WINDOWS;
@@ -1370,7 +1370,7 @@ static void wtsweep(Engine *e, Arena scratch)
             sid     = rec && !sid.len ? en->sid : sid;
             marked &= !rec || sidecarget(e, &t, en->sid, "worktree", 128).data!=0;
             Session *s = findsession(e, en->sid);
-            ok = scanarchived(&sc, i) && !en->locked && (!s || (!s->readonly && parkable(s)));
+            ok = scanaside(&sc, i) && !en->locked && (!s || (!s->readonly && parkable(s)));
             if (s && ok) {
                 parks = push(&t, parks, s);
             }

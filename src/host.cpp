@@ -844,8 +844,11 @@ static void hostcommand(Host *h, HostClient *c, Arena scratch, Str line)
         h->quitting |= q != 0;
         break;
     case CMD_DELETE:
-        // Not from under another client
-        if (validsid(sid) && hostopenelse(h, c, scratch, sid)) {
+    case CMD_TRASH:
+        // Not from under another client (but out of the Trash, it was
+        // open in none)
+        if (validsid(sid) && (cmd==CMD_DELETE || jsonflag(jsonget(j, "on"), 1)) &&
+                hostopenelse(h, c, scratch, sid)) {
             hostreply(h, c, scratch, cid, 0, "open in another client", sid);
             return;
         }
@@ -960,9 +963,10 @@ static void hostreplied(Host *h, Arena scratch, EvRec *r, Str line)
         } else if (ok && q.cmd==CMD_NEW && validsid(r->sid)) {
             hostsub(c, r->sid, 0, q.attended);
         }
-        if (q.cmd == CMD_DELETE) {
-            // Gone, also those deleted before a failure
-            for (Json *k = jsonget(r->root, "deleted")->child; k; k = k->next) {
+        if (q.cmd==CMD_DELETE || q.cmd==CMD_TRASH || q.cmd==CMD_TRASHEMPTY) {
+            // Gone, also those deleted before a failure, or in the Trash
+            Str key = q.cmd==CMD_TRASH ? Str("trashed") : Str("deleted");
+            for (Json *k = jsonget(r->root, key)->child; k; k = k->next) {
                 for (HostClient *o = h->clients; o; o = o->next) {
                     hostunsub(h, o, scratch, jsonstr(k));
                 }

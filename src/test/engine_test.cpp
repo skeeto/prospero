@@ -141,7 +141,7 @@ static void testlist(Test *t)
                "aaaa,bbbb,eeee,dddd bbbb,dddd gggg,hhhh iiii ");
     }
 
-    cmdlist(e, v.scratch, 1);
+    cmdlist(e, v.scratch, 1, 0);
     Buf  got(&a, 1024);
     Buf  raw(&a, 1024);
     Mail m = mailtake(e->out);
@@ -203,7 +203,7 @@ static void testlist(Test *t)
 
 // delete: a tree, checked whole first, refused while one of it is open in
 // another process, nothing moved then; else children first, each into
-// the trash, which a thread would empty (none starts in a test).
+// STATE/trash, which a thread would empty (none starts in a test).
 static void testdelete(Test *t)
 {
     Arena   a = t->perm;
@@ -254,6 +254,115 @@ static void testdelete(Test *t)
     print(&left, " ");
     print(&left, (i64)trashed);
     expect(t, "delete left", finish(&left), "---dddd 3");
+}
+
+// The Trash: only a root goes, its tree checked whole as for delete, and
+// it stays where it is, marked on its root, out of a plain list, refused
+// to open, subagents too; restored, it is back. The purge takes those
+// in it long enough, a tree at a time, and trash.empty all the rest.
+static void testtrash(Test *t)
+{
+    Arena   a = t->perm;
+    CfgEnv  v = newcfgenv(&a);
+    Engine *e = alloc<Engine>(&a);
+    e->os       = v.os;
+    e->out      = newmailbox(&a, 1<<16, 0, 0);
+    e->statedir = "/s";
+    e->perm     = carve(&a, 1<<16);  // sessions trashed due a sweep
+    v.os->now   = (i64)1800000000000*1000;  // in 2027, as trashed times go
+    MadeSession made[] = {
+        {"20260101-000000-aaaa", {}},
+        {"20260101-000001-bbbb", "20260101-000000-aaaa"},
+        {"20260101-000003-dddd", {}},
+    };
+    makesessions(v.os, &a, {made, countof(made)});
+    Str root = "/s/sessions/20260101-000000-aaaa";
+    command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":1,\"sid\":\"20260101-000001-bbbb\"}");
+    iz held = os_lockfile(v.os, a, "/s/sessions/20260101-000001-bbbb/lock");
+    command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":2,\"sid\":\"20260101-000000-aaaa\"}");
+    os_unlockfile(v.os, held);
+    command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":3,\"sid\":\"20260101-000000-aaaa\"}");
+    b32 marked = os_stat(v.os, a, concat(&a, root, "/trashed")).type == STAT_FILE;
+    b32 kidmark = os_stat(v.os, a, "/s/sessions/20260101-000001-bbbb/trashed").type == STAT_FILE;
+    command(e, v.scratch, "{\"cmd\":\"list\",\"id\":4}");
+    command(e, v.scratch, "{\"cmd\":\"list\",\"id\":5,\"trash\":1}");
+    command(e, v.scratch, "{\"cmd\":\"open\",\"id\":6,\"sid\":\"20260101-000000-aaaa\"}");
+    command(e, v.scratch, "{\"cmd\":\"open\",\"id\":7,\"sid\":\"20260101-000001-bbbb\"}");
+    command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":8,\"sid\":\"20260101-000000-aaaa\",\"on\":false}");
+    b32 restored = os_stat(v.os, a, concat(&a, root, "/trashed")).type == STAT_MISSING;
+    command(e, v.scratch, "{\"cmd\":\"list\",\"id\":9}");
+
+    Buf  got(&a, 2048);
+    Mail m = mailtake(e->out);
+    for (Record r; (r = mailnext(&m)).ok;) {
+        EvRec rec = evparse(&a, r.data);
+        if (rec.ev == EV_SESSIONS) {
+            print(&got, "list");
+            for (Json *k = jsonget(rec.root, "list")->child; k; k = k->next) {
+                putbyte(&got, ' ');
+                print(&got, cuthead(jsonstr(jsonget(k, "sid")), 16));
+                print(&got, jsonint(jsonget(k, "trashed"), 0)>0 ? Str("*") : Str(""));
+            }
+            print(&got, " days ");
+            print(&got, jsonint(jsonget(rec.root, "trash_days"), -1));
+            putbyte(&got, '\n');
+            continue;
+        }
+        print(&got, jsonint(jsonget(rec.root, "id"), 0));
+        putbyte(&got, jsonint(jsonget(rec.root, "ok"), 0) ? '+' : '-');
+        print(&got, jsonstr(jsonget(rec.root, "err")));
+        for (Json *k = jsonget(rec.root, "trashed")->child; k; k = k->next) {
+            putbyte(&got, ' ');
+            print(&got, cuthead(jsonstr(k), 16));
+        }
+        putbyte(&got, '\n');
+    }
+    expect(t, "trash", finish(&got),
+           "1-a subagent goes with the session that started it\n"
+           "2-open in another process: its subagent 20260101-000001-bbbb\n"
+           "3+ bbbb aaaa\n"
+           "list dddd days 30\n"
+           "4+\n"
+           "list dddd aaaa* bbbb days 30\n"
+           "5+\n"
+           "6-in the Trash: restore it first\n"
+           "7-in the Trash: restore it first\n"
+           "8+\n"
+           "list dddd aaaa bbbb days 30\n"
+           "9+\n");
+    expect(t, "trash marks", istr(&a, marked && !kidmark && restored), "1");
+
+    // Long enough in the Trash, by a time written back: aaaa's tree goes,
+    // dddd, only just in, stays for trash.empty
+    command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":10,\"sid\":\"20260101-000000-aaaa\"}");
+    command(e, v.scratch, "{\"cmd\":\"trash\",\"id\":11,\"sid\":\"20260101-000003-dddd\"}");
+    os_write(v.os, a, concat(&a, root, "/trashed"), "1000");
+    Slice<Str> gone = {};
+    Str        err  = trashpurge(e, &a, 30*DAY_MS, &gone);
+    Buf        left(&a, 256);
+    for (iz i = 0; i < gone.len; i++) {
+        print(&left, cuthead(gone[i], 16));
+        putbyte(&left, ' ');
+    }
+    print(&left, err.len ? err : Str("-"));
+    expect(t, "trash purge", finish(&left), "bbbb aaaa -");
+    mailtake(e->out);
+    command(e, v.scratch, "{\"cmd\":\"trash.empty\",\"id\":12}");
+    Buf  emptied(&a, 256);
+    Mail m2 = mailtake(e->out);
+    for (Record r; (r = mailnext(&m2)).ok;) {
+        EvRec rec = evparse(&a, r.data);
+        print(&emptied, jsonint(jsonget(rec.root, "ok"), 0) ? Str("+") : Str("-"));
+        for (Json *k = jsonget(rec.root, "deleted")->child; k; k = k->next) {
+            putbyte(&emptied, ' ');
+            print(&emptied, cuthead(jsonstr(k), 16));
+        }
+    }
+    for (iz i = 0; i < countof(made); i++) {
+        Str dir = concat(&a, "/s/sessions/", made[i].sid);
+        putbyte(&emptied, os_stat(v.os, a, dir).type==STAT_DIR ? '1' : '0');
+    }
+    expect(t, "trash empty", finish(&emptied), "+ dddd000");
 }
 
 // Sidecars are written by the holder of the session's lock alone: this
@@ -596,7 +705,7 @@ static void testremotetask(Test *t)
         expect(t, "remote child no kid here", istr(&tmp, sc.list[0].kids.len), "0");
         expect(t, "remote child a root here", sc.list[1].parent, "");
     }
-    cmdlist(e, v.scratch, 1);
+    cmdlist(e, v.scratch, 1, 0);
     Mail m    = mailtake(e->out);
     Str  line = mailnext(&m).data;
     JsonDoc d = jsonparse(&a, line);
@@ -618,6 +727,7 @@ static void test_engine(Test *t)
     testlist(t);
     testsidecars(t);
     testdelete(t);
+    testtrash(t);
     testtargets(t);
     Arena *a = &t->perm;
 

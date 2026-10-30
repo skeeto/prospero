@@ -168,6 +168,8 @@ enum : i32 {
     CMD_SHELL,   // another shell for the agent's commands from here on
     CMD_SHELLS,  // the shells there are to switch to, and the default
     CMD_GIT,     // a session's git branch, and with status its changes, late
+    CMD_TRASH,   // a session to the Trash, or back
+    CMD_TRASHEMPTY,  // every session in the Trash, for good
     CMD_COUNT,
 };
 
@@ -178,7 +180,8 @@ static Str cmdnames[] = {
     "group", "fork", "compact", "model", "draft", "upload", "import",
     "skills", "mode",
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
-    "mcp.logout", "mcp.restart", "shell", "shells", "git",
+    "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
+    "trash.empty",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -262,6 +265,9 @@ static Str capnames[] = {
                        // and transient worktree records
     "worktree.side",   // new {worktree, side_of}: a fresh worktree session
                        // started from another, side_of in its record
+    "trash",           // trash {sid, on} and trash.empty: a session to the
+                       // Trash and back, or out of it for good; list
+                       // {trash}, its trashed (epoch ms) and trash_days
 };
 
 static Str evname(i32 ev)

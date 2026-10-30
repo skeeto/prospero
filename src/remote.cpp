@@ -828,8 +828,15 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
             return;  // the library's own
         }
         dropid(&r->pending, id);
-        // Deleted, as good as closed: never opened again on reconnecting
+        // Deleted, or in the Trash, as good as closed: never opened again
+        // on reconnecting
         for (Json *k = jsonget(rec.root, "deleted")->child; k; k = k->next) {
+            RemoteSess *s = remotesess(r, jsonstr(k), 0);
+            if (s) {
+                s->open = 0;
+            }
+        }
+        for (Json *k = jsonget(rec.root, "trashed")->child; k; k = k->next) {
             RemoteSess *s = remotesess(r, jsonstr(k), 0);
             if (s) {
                 s->open = 0;

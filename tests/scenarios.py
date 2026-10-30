@@ -3253,7 +3253,7 @@ def hello_caps(t):
                                                    "background", "models", "mcp",
                                                    "mcp.auth", "mcp.code", "mcp.logout",
                                                    "mcp.restart", "shell", "shells",
-                                                   "git"]
+                                                   "git", "trash", "trash.empty"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -3263,7 +3263,7 @@ def hello_caps(t):
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
-                 "git", "answer.trust"} <= set(caps)
+                 "git", "answer.trust", "trash"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 
@@ -7043,6 +7043,115 @@ def delete(t):
         t.check(r.get("ok") == 0 and r.get("err") == "no such session", f"again: {r}")
         r = h.call("prompt", sid=sid, text="still there?")
         t.check(r.get("ok") == 0, f"gone from memory: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=30)
+def trash(t):
+    """trash: a session and its subagent into the Trash and back. There it
+    stays where it was, scratch directory and all, out of a plain list
+    (list {trash} marks it), refused to open; restored, it opens again.
+    Only a root goes, and not while it runs; delete takes one in the Trash
+    for good, and so does trash.empty."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="task")
+        ended(h, sid, 1)
+        kids = [e["sid"] for e in h.all("session") if e.get("parent") == sid]
+        t.check(len(kids) == 1, f"one subagent: {kids}")
+        kid = kids[0]
+        scratch = scratchof(h, sid)
+        sdir = t.host.join(t.state, "sessions", sid)
+        r = h.call("trash", sid=kid)
+        t.check(r.get("ok") == 0 and "subagent goes with" in r.get("err", ""),
+                f"a subagent alone: {r}")
+        r = h.call("trash", sid=sid)
+        t.check(r.get("ok") == 1 and r.get("trashed") == [kid, sid], f"trashed: {r}")
+        t.check(gone(t, sdir, 0) is False and gone(t, scratch, 0) is False,
+                "still there, its scratch directory too")
+        h.call("list")
+        plain = h.all("sessions")[-1]
+        t.check(sid not in [e["sid"] for e in plain["list"]] and
+                kid not in [e["sid"] for e in plain["list"]] and
+                plain.get("trash_days") == 30, f"out of a plain list: {plain}")
+        h.call("list", trash=1)
+        listed = {e["sid"]: e for e in h.all("sessions")[-1]["list"]}
+        t.check(listed.get(sid, {}).get("trashed", 0) > 0 and kid in listed and
+                "trashed" not in listed[kid], f"in the Trash: {listed.get(sid)}")
+        r = h.call("prompt", sid=sid, text="still there?")
+        t.check(r.get("ok") == 0, f"out of memory: {r}")
+        r = h.call("open", sid=sid)
+        t.check(r.get("ok") == 0 and "in the Trash" in r.get("err", ""), f"open: {r}")
+        r = h.call("open", sid=kid)
+        t.check(r.get("ok") == 0 and "in the Trash" in r.get("err", ""), f"its subagent: {r}")
+
+        r = h.call("trash", sid=sid, on=False)
+        t.check(r.get("ok") == 1, f"restored: {r}")
+        h.call("list")
+        t.check(sid in [e["sid"] for e in h.all("sessions")[-1]["list"]], "listed again")
+        r = h.call("open", sid=sid)
+        t.check(r.get("ok") == 1, f"opens again: {r}")
+        h.send("prompt", sid=sid, text="slow")
+        h.wait(lambda e: e.get("ev") == "attempt" and e.get("sid") == sid)
+        r = h.call("trash", sid=sid)
+        t.check(r.get("ok") == 0 and r.get("err", "").startswith("busy"), f"busy: {r}")
+        ended(h, sid, 2)
+
+        r = h.call("trash", sid=sid)
+        t.check(r.get("ok") == 1, f"trashed again: {r}")
+        r = h.call("delete", sid=sid)
+        t.check(r.get("ok") == 1 and r.get("deleted") == [kid, sid], f"for good: {r}")
+        t.check(gone(t, sdir) and gone(t, scratch), "gone, its scratch directory too")
+
+        s2 = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = h.call("trash", sid=s2)
+        t.check(r.get("ok") == 1, f"another: {r}")
+        r = h.call("trash.empty")
+        t.check(r.get("ok") == 1 and r.get("deleted") == [s2], f"emptied: {r}")
+        t.check(gone(t, t.host.join(t.state, "sessions", s2)), "gone")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=40)
+def trash_purge(t):
+    """The Trash empties itself: a session in it longer than trash_days
+    goes as an engine starts, and one that is not yet stays; with
+    trash_days set to 0 in a running engine, the rest goes at once, and
+    the Trash is off."""
+    h = t.headless()
+    try:
+        old = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        new = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        for sid in (old, new):
+            r = h.call("trash", sid=sid)
+            t.check(r.get("ok") == 1, f"trashed: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    odir = t.host.join(t.state, "sessions", old)
+    ndir = t.host.join(t.state, "sessions", new)
+    t.host.write(t.host.join(odir, "trashed"), str(int((time.time() - 40*86400) * 1000)))
+
+    h = t.headless()
+    try:
+        t.check(gone(t, odir), "a month and more in the Trash: gone as it starts")
+        t.check(gone(t, ndir, 0) is False, "just in: kept")
+        addconf(t, "\n[sessions]\ntrash_days = 0\n")
+        deadline = time.monotonic() + 10
+        while gone(t, ndir, 0) is False and time.monotonic() < deadline:
+            h.call("list")  # read again as a command comes, a second apart
+            time.sleep(0.3)
+        t.check(gone(t, ndir), "the Trash off: the rest goes")
+        h.call("list", trash=1)
+        t.check(h.all("sessions")[-1].get("trash_days") == 0, "listed as off")
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = h.call("trash", sid=sid)
+        t.check(r.get("ok") == 0 and "the Trash is off" in r.get("err", ""), f"off: {r}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -11002,14 +11111,15 @@ def msg_pingpong(t):
 
 @scenario(bound=20)
 def msg_refused(t):
-    """Messages to oneself, an archived session, a subagent of one, an
-    unknown target, an ambiguous title, and a session another process
-    holds are refused, and so is an invalid one; an exact title reaches
-    its session."""
+    """Messages to oneself, an archived session, a subagent of one, one in
+    the Trash, an unknown target, an ambiguous title, and a session
+    another process holds are refused, and so is an invalid one; an exact
+    title reaches its session."""
     h = t.headless()
     other = None
     try:
         arch = msgnew(t, h, t.model2)
+        binned = msgnew(t, h, t.model2)
         named = msgnew(t, h, t.model2)
         twin1 = msgnew(t, h, t.model2)
         twin2 = msgnew(t, h, t.model2)
@@ -11018,17 +11128,19 @@ def msg_refused(t):
             t.check(r.get("ok") == 1, f"renamed {r}")
         r = h.call("archive", sid=arch, on=1)
         t.check(r.get("ok") == 1, f"archived {r}")
+        r = h.call("trash", sid=binned)
+        t.check(r.get("ok") == 1, f"trashed {r}")
         other = t.headless()
         held = other.call("new", cwd=t.work, model=t.model2, endpoint="fake")["sid"]
         a = msgnew(t, h)
-        targets = [a, arch, "nobody-at-all", "Twin", held, "", "The Named One"]
+        targets = [a, arch, binned, "nobody-at-all", "Twin", held, "", "The Named One"]
         h.send("prompt", sid=a, text="send to: " + " | ".join(targets))
         turnend(h, a)
         res = [e for e in h.all("tool.end", a)]
-        t.check(len(res) == 7, f"results {res}")
-        want = ["your own session", "is archived", "no session has the id or title",
-                "2 sessions have that title", "open in another process",
-                "Invalid arguments", None]
+        t.check(len(res) == 8, f"results {res}")
+        want = ["your own session", "is archived", "is in the Trash",
+                "no session has the id or title", "2 sessions have that title",
+                "open in another process", "Invalid arguments", None]
         for e, w in zip(res, want):
             if w:
                 t.check(e["status"] == "error" and w in e["text"] and
@@ -11039,8 +11151,9 @@ def msg_refused(t):
                 f"by its title {last}")
         turnend(h, named)
         t.check(not h.all("notice", arch) and not h.all("turn", arch), "nothing archived")
+        t.check(not h.all("notice", binned) and not h.all("turn", binned), "nothing trashed")
         t.check(not other.all("notice", held), "nothing to the other process's")
-        t.check([e["fail"] for e in res[:6]] == ["message"] * 5 + ["args"], f"fail {res}")
+        t.check([e["fail"] for e in res[:7]] == ["message"] * 6 + ["args"], f"fail {res}")
     finally:
         rc = h.close()
         if other:
@@ -12987,6 +13100,39 @@ def worktree_hole(t):
         wtturn(t, h, sid, f"write {os.path.join(path, 'own.txt')}")
         t.check(not h.all("ask", sid), f"no ask in its own tree: {h.all('ask', sid)}")
         t.check(os.path.exists(os.path.join(path, "own.txt")), "written in its own tree")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=90)
+def worktree_trash(t):
+    """A worktree session in the Trash: its worktree goes as an archived
+    session's does, git calling it clean, and is made again on restore."""
+    env = gitrepo(t)
+    main = os.path.realpath(t.work)
+    keep = {k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")}
+    wtdir = os.path.join(main, ".prospero", "worktrees", "binned")
+    h = t.headless(env=keep)
+    news = lambda: [x for x in h.all("worktree") if x.get("path") == wtdir]
+    try:
+        r = h.call("new", cwd=t.work, model=wtmodel(t), endpoint="fake",
+                   worktree={"name": "binned"})
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        h.wait(lambda e: len(news()) >= 1, 60)
+        wtturn(t, h, sid)
+        r = h.call("trash", sid=sid)
+        t.check(r.get("ok") == 1, f"trashed: {r}")
+        h.wait(lambda e: len(news()) >= 2, 30)
+        n = news()[1]
+        t.check(n.get("did") == "removed" and not os.path.exists(wtdir), f"removed: {n}")
+        r = h.call("trash", sid=sid, on=False)
+        t.check(r.get("ok") == 1, f"restored: {r}")
+        h.wait(lambda e: len(news()) >= 3, 60)
+        n = news()[2]
+        t.check(n.get("did") == "made" and os.path.exists(os.path.join(wtdir, "README")),
+                f"made again: {n}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
