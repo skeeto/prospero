@@ -1313,11 +1313,13 @@ static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str 
             print(&b, dirs[i]);
         }
 #if !PROSPERO_ITCH
-        // As a Community build finds it: the engines come apart
-        print(&b, ": unpack prospero-engines-" PROSPERO_VERSION ".zip, from the "
-                  "release, into an engines directory beside prospero.ini");
-#endif
+        // As a Community build finds it: it carries no engines
+        print(&b, ": the Professional Edition carries every engine, or "
+                  "tools/engines.py builds one, into an engines directory "
+                  "beside prospero.ini");
+#else
         print(&b, " (tools/engines.py builds it)");
+#endif
         return deployfail(&d, perm, scratch, finish(&b));
     } else if (err.len) {
         return deployfail(&d, perm, scratch, err);

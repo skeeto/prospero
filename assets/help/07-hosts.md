@@ -104,18 +104,19 @@ connecting does, waiting for any deploy already under way.
 ## Deploying an engine
 
 The remote machine needs Prospero built for it. `prospero deploy NAME`
-uploads an engine with scp to `~/.prospero` there, and records where
-it went, for connecting. Engines come from an `engines` directory next
-to the executable, or from one beside `prospero.ini` (Settings shows
-where) when the first has none for the platform, as releases name them, or are the executable itself when it
-is built for that platform. The engines zip (`tools/engines.py --zip`)
-unpacks into either place. The itch.io build of Prospero has every
+uploads an engine with scp to `~/.prospero` there, and records where it
+went, for connecting. Engines come from an `engines` directory next to
+the executable, or from one beside `prospero.ini` (Settings shows where)
+when the first has none for the platform, or are the executable itself
+when it is built for that platform. The Community Edition carries no
+others: the engines zip that `tools/engines.py --zip` builds unpacks
+into either place. The Professional Edition, from itch.io, has every
 engine built in, so it needs neither. Connecting deploys one by itself
 when the machine has none, or one of another protocol (`deploy = auto`,
 the default), as for a WSL distro the first time. A deploy that fails
-says why in a toast, at the foot of the Sessions or Hosts pane, where
-it began. With `deploy = ask` in the remote's section, the connection
-fails instead, saying why.
+says why in a toast, at the foot of the Sessions or Hosts pane, where it
+began. With `deploy = ask` in the remote's section, the connection fails
+instead, saying why.
 
 Deploy engine, in the Hosts pane under a remote that is not connected
 and in its menu in the sidebar, deploys this version's engine there and

@@ -52,7 +52,7 @@ carries built in, so that deploy needs no engines directory.
 
 ## Releases
 
-Each release on GitHub carries six files:
+Each release on GitHub carries five files:
 
 - `prospero-VERSION.tar.gz`: the source, with every dependency unpacked
   under `deps/`, so that it builds with no network:
@@ -75,24 +75,14 @@ Each release on GitHub carries six files:
   linked statically, so it needs glibc 2.34 or later (Ubuntu 22.04,
   Debian 12, Fedora 35, RHEL 10), and shows its window through Wayland
   or X11, which it loads at run time.
-- `prospero-engines-VERSION.zip`: headless engines for other machines,
-  which `prospero deploy` puts there (see below): Windows x86-64 and
-  i686 (for XP), each its own desktop helper; Linux x86-64 and aarch64,
-  linked statically, with their desktop helpers ([Desktop
-  control](desktop.md)), which link the C library dynamically, since
-  they load X11 at run time; and macOS arm64, signed. Its `engines`
-  directory goes next to the program, or beside `prospero.ini` (see
-  Settings), which suits a macOS app in /Applications. Its README.txt
-  lists the files and what each needs.
 
-The engines and helpers are named as `prospero deploy` expects to find
-them, and it puts each helper beside its engine on the remote machine.
-To use a helper on the machine itself, save it next to `prospero` as
-`prospero-desktop`.
+Each program is its own engine, so `prospero deploy` from a release
+reaches machines of its own platform. Engines for the others, which
+the [itch.io][itch] edition carries, are not released here: build them
+as below.
 
-Windows builds are made on Linux by [w64devkit][] in Wine, and signed
-with Azure Artifact Signing before the engines are packed, by
-`tools/engines.py --pack`. The macOS app is built and tested on a
+The Windows program is built on Linux by [w64devkit][] in Wine, and
+signed with Azure Artifact Signing. The macOS app is built and tested on a
 macOS runner, then signed with a Developer ID certificate and notarized
 by Apple.
 
@@ -112,8 +102,14 @@ macOS engine on the Mac itself. All are optimized for size:
 - the Windows engines are the same CRT-free programs as above;
 - the macOS engine, for Apple Silicon, needs macOS 11 or later.
 
-The same sources build the same zip, byte for byte, laid out as a
-release's.
+The same sources build the same zip, byte for byte. Its `engines`
+directory goes next to the program, or beside `prospero.ini` (see
+Settings), which suits a macOS app in /Applications; its README.txt
+lists the files and what each needs. The engines and helpers ([Desktop
+control](desktop.md)) are named as `prospero deploy` expects to find
+them, and it puts each helper beside its engine on the remote machine.
+To use a helper on the machine itself, save it next to `prospero` as
+`prospero-desktop`.
 
 ### itch.io builds
 
