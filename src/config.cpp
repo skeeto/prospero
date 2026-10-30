@@ -1480,6 +1480,8 @@ struct CfgDefaults {
     Str model;
     b32 qualified;  // the model named its endpoint
     b32 guessed;    // no endpoint named: the first configured
+    Str also;       // the engine's guess by listings: another lists it
+    i32 nalso;      // and how many others do
 };
 
 // MODEL split from ENDPOINT/MODEL, where ENDPOINT is a configured

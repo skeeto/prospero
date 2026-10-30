@@ -104,10 +104,16 @@ one of them only, each of its settings winning over `[model MODEL]`'s:
     [model gpu/large]
     context = 32768
 
-A variant of `large` on `gpu` takes the `gpu/large` settings too, and
-`like = gpu/large` takes them on any endpoint. ENDPOINT must be a
-configured endpoint with a URL: otherwise the name is a model's own,
-as for `Qwen/Qwen3-8B`.
+A variant of `large` on `gpu` takes the `gpu/large` settings too. A
+variant with `like = gpu/large` is `gpu`'s alone: the model picker
+offers it there only, and it takes those settings wherever it is used.
+ENDPOINT must be a configured endpoint with a URL: otherwise the name
+is a model's own, as for `Qwen/Qwen3-8B`.
+
+A default `model` that names no endpoint, with no `endpoint` set, goes
+to the first endpoint whose listing has it. When others list it too, a
+new session's note says which it went to; `model = ENDPOINT/MODEL`
+chooses.
 
 Sessions, their logs and the cache of URL includes live in the state
 directory: `$XDG_STATE_HOME/prospero`, else `~/.local/state/prospero`.

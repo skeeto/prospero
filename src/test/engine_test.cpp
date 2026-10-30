@@ -507,8 +507,9 @@ static void testsidecars(Test *t)
 
 // Models as settings name them: ENDPOINT/MODEL only where ENDPOINT is a
 // configured endpoint, so that a model named with a slash stays whole;
-// and a subagent's model, known by its section or its endpoint's
-// listing, or anything at an endpoint never listed.
+// and a subagent's model, known by its section, its own or its
+// endpoint's, or its endpoint's listing, or anything at an endpoint
+// never listed.
 static void testtargets(Test *t)
 {
     Arena   a = t->perm;
@@ -516,7 +517,8 @@ static void testtargets(Test *t)
     os_write(v.os, a, "/r/h.ini",
              "[endpoint fast]\nurl = http://fast/v1\n"
              "[endpoint Qwen]\nkind = openai\n"  // no url: not an endpoint
-             "[model small]\n[model big]\n");
+             "[model small]\n[model big]\n[model fast/solo]\n[model fast/big]\n"
+             "[model slow/far]\n[endpoint slow]\nurl = http://slow/\n");
     Engine *e = alloc<Engine>(&a);
     e->os   = v.os;
     e->perm = carve(&a, 1<<16);
@@ -540,19 +542,22 @@ static void testtargets(Test *t)
     }
 
     Str url = "http://fast/v1";
-    expect(t, "submodel never listed", submodel(e, &a, v.scratch, "any", url), "");
+    expect(t, "submodel never listed", submodel(e, &a, v.scratch, "any", "fast", url), "");
     notekinds(e, v.scratch, url, "{\"data\":[{\"id\":\"listed\"},{\"id\":\"small\"},"
                                  "{\"id\":\"other\"}]}");
-    expect(t, "submodel listed", submodel(e, &a, v.scratch, "listed", url), "");
-    expect(t, "submodel configured", submodel(e, &a, v.scratch, "big", url), "");
-    expect(t, "submodel unknown", submodel(e, &a, v.scratch, "nope", url),
+    expect(t, "submodel listed", submodel(e, &a, v.scratch, "listed", "fast", url), "");
+    expect(t, "submodel configured", submodel(e, &a, v.scratch, "big", "fast", url), "");
+    expect(t, "submodel qualified", submodel(e, &a, v.scratch, "solo", "fast", url), "");
+    expect(t, "submodel elsewhere", istr(&a,
+           submodel(e, &a, v.scratch, "far", "fast", url).len > 0), "1");
+    expect(t, "submodel unknown", submodel(e, &a, v.scratch, "nope", "fast", url),
            "No subagent was started: no model \"nope\" is configured or listed "
            "at http://fast/v1. Give one of these, or none for the default: "
-           "small, big, listed, other.");
+           "small, big, solo, listed, other.");
     notekinds(e, v.scratch, url, "{\"data\":[{\"id\":\"nope\"}]}");
-    expect(t, "submodel listed anew", submodel(e, &a, v.scratch, "nope", url), "");
+    expect(t, "submodel listed anew", submodel(e, &a, v.scratch, "nope", "fast", url), "");
     expect(t, "submodel listed no more", istr(&a,
-           submodel(e, &a, v.scratch, "listed", url).len > 0), "1");
+           submodel(e, &a, v.scratch, "listed", "fast", url).len > 0), "1");
 
     // A new session's defaults: the configuration's, else the first
     // model its endpoint listed, the one named or the first with a URL
@@ -579,6 +584,28 @@ static void testtargets(Test *t)
     d = defaults(e, v.scratch, {});
     expect(t, "defaults configured", concat(&a, concat(&a, d.endpoint, "|"), d.model),
            "fast|m");
+
+    // A guess among endpoints that all list the model: the first, and
+    // the others, for the session's note
+    os_write(v.os, a, "/r/d.ini",
+             "model = m\n"
+             "[endpoint fast]\nurl = http://fast/v1\n"
+             "[endpoint slow]\nurl = http://slow/\n"
+             "[endpoint more]\nurl = http://more/\n");
+    e->cfg = newconfig(v.os, &a, v.scratch, "/r/d.ini", 0);
+    e->ini = e->cfg->ini;
+    notekinds(e, v.scratch, "http://slow/", "{\"data\":[{\"id\":\"m\"}]}");
+    d = defaults(e, v.scratch, {});
+    expect(t, "defaults one lists", concat(&a, concat(&a, d.endpoint, "|"), d.also),
+           "slow|");
+    notekinds(e, v.scratch, url, "{\"data\":[{\"id\":\"m\"}]}");
+    notekinds(e, v.scratch, "http://more/", "{\"data\":[{\"id\":\"m\"}]}");
+    d = defaults(e, v.scratch, {});
+    expect(t, "defaults all list", concat(&a, concat(&a, concat(&a, d.endpoint, "|"),
+                                                      concat(&a, d.also, "|")),
+                                           istr(&a, d.nalso)), "fast|slow|2");
+    d = defaults(e, v.scratch, "more");
+    expect(t, "defaults named", concat(&a, concat(&a, d.endpoint, "|"), d.also), "more|");
 }
 
 // A typed directory's leading ~ (new, import): this host's home, else

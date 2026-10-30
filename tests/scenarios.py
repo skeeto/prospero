@@ -4175,6 +4175,36 @@ def default_qualified(t):
             f"warned: {r.stderr!r}")
 
 
+@scenario(bound=8)
+def default_guessed(t):
+    """A default model that names no endpoint, where more than one lists
+    it, goes to the first, and the session's note says which, and that
+    others list it too."""
+    t.host.write(t.config,
+                 f"model = {t.model}\n"
+                 f"[endpoint one]\nurl = {t.host.url}/\n"
+                 f"[endpoint two]\nurl = {t.host.url}/\n"
+                 "[guard]\ntemp = ask\n")
+    t.args = lambda extra=(): ["-C", t.work, "--state", t.state, "-c", t.config] + list(extra)
+    h = t.headless()
+    try:
+        r = h.call("models")
+        t.check(len(r.get("endpoints", [])) == 2, f"listed {r}")
+        sid = h.call("new", cwd=t.work)["sid"]
+        n = h.wait(lambda e: e.get("sid") == sid and e.get("ev") == "note")
+        text = n.get("text", "")
+        t.check(n.get("level") == "info" and
+                f"the default model, {t.model}, names no endpoint, so it is on one, "
+                "the first that lists it; two lists it too" in text, f"note {n}")
+        r = h.call("new", cwd=t.work, endpoint="two")
+        h.call("close", sid=r["sid"])
+        named = [e for e in h.events if e.get("sid") == r["sid"] and e.get("ev") == "note"]
+        t.check(not named, f"no note for an endpoint named: {named}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(conf={"_extra": "[model {model}]\nfallback = fake/{model2}\n"}, bound=8)
 def limit(t):
     """A usage limit goes straight to the fallback, here given as

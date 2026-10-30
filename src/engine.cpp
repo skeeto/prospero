@@ -12080,7 +12080,8 @@ static CfgDefaults defaults(Engine *e, Arena scratch, Str which)
         d.model = {};
     }
     if (!which.len && d.guessed && d.model.len) {
-        Str id = cfgmodelid(e->cfg, d.model);
+        Str id     = cfgmodelid(e->cfg, d.model);
+        b32 listed = 0;
         for (IniSection *s = inifirst(e->cfg->ini, "endpoint"); s; s = ininext(s)) {
             Arena tmp = scratch;
             if (!s->name.len || !endpointconf(e, &tmp, s->name, &ep)) {
@@ -12093,9 +12094,12 @@ static CfgDefaults defaults(Engine *e, Arena scratch, Str which)
                 has  = c.head==d.model || c.head==id;
                 rest = c.tail;
             }
-            if (has) {
+            if (has && !listed) {
                 d.endpoint = s->name;
-                break;
+                listed     = 1;
+            } else if (has) {
+                d.also = d.also.len ? d.also : s->name;  // for the guess's note
+                d.nalso++;
             }
         }
     }
@@ -13294,14 +13298,16 @@ static void taskroles(Engine *e, Arena *perm, Arena scratch, ToolEnv *te)
     te->roleenum = clone(perm, finish(&en));
 }
 
-// Why a subagent cannot have a model at the endpoint at url, in perm,
-// or null if it can: a model with a [model] section, or one the
-// endpoint's latest listing gave (notekinds). At an endpoint never
-// listed, any model goes, as the request will tell.
-static Str submodel(Engine *e, Arena *perm, Arena scratch, Str model, Str url)
+// Why a subagent cannot have a model at the endpoint which (a name or
+// URL), in perm, or null if it can: a model with a [model] section, its
+// own or for that endpoint, or one the endpoint's latest listing gave
+// (notekinds). At an endpoint never listed, any model goes, as the
+// request will tell.
+static Str submodel(Engine *e, Arena *perm, Arena scratch, Str model, Str which, Str url)
 {
     Str *list = upsert(&e->listings, url, (Arena *)0);
-    if (!list || inisection(e->ini, "model", model)) {
+    if (!list || inisection(e->ini, "model", model) ||
+            inisection(e->ini, "model", epmodel(e, &scratch, which, model))) {
         return {};
     }
     for (Str rest = *list; rest.len;) {
@@ -13312,11 +13318,18 @@ static Str submodel(Engine *e, Arena *perm, Arena scratch, Str model, Str url)
         rest = c.tail;
     }
 
-    // The choices: configured models, then those listed, each once
+    // The choices: configured models, then those listed, each once; a
+    // model configured for an endpoint, as at this one only
     Slice<Str> names = {};
     for (IniSection *s = inifirst(e->ini, "model"); s; s = ininext(s)) {
-        if (s->name.len) {
-            names = push(&scratch, names, s->name);
+        Cut q    = cfgsplitmodel(e->ini, s->name);
+        Str name = !q.ok ? s->name : q.head==which ? q.tail : Str{};
+        b32 seen = !name.len;
+        for (iz i = 0; !seen && i<names.len; i++) {
+            seen = names[i] == name;
+        }
+        if (!seen) {
+            names = push(&scratch, names, name);
         }
     }
     for (Str rest = *list; rest.len;) {
@@ -13382,7 +13395,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
         *err = finish(&b);
         return 0;
     }
-    Str bad = spec.len ? submodel(e, &p->perm, scratch, model, probe.url) : Str{};
+    Str bad = spec.len ? submodel(e, &p->perm, scratch, model, which, probe.url) : Str{};
     if (bad.len) {
         *err = bad;
         return 0;
@@ -14930,7 +14943,8 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         which = t.which;
     }
     if (!which.len) which = role.endpoint;
-    CfgDefaults dflt = defaults(e, scratch, which);
+    CfgDefaults dflt  = defaults(e, scratch, which);
+    b32         guess = !which.len && !model.len && dflt.also.len;
     which = dflt.endpoint;
     model = model.len ? model : dflt.model;
     Slice<Str> roots = {};
@@ -14962,7 +14976,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     if (task.ok && asked.len) {
         // Kept apart from the scratch that submodel works in
         Arena keep = carve(&scratch, 1<<16);
-        bad = submodel(e, &keep, scratch, model, probe.url);
+        bad = submodel(e, &keep, scratch, model, which, probe.url);
     }
     if (bad.len) {
         reply(e, scratch, id, 0, bad, {});
@@ -15067,6 +15081,25 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
     }
     if (s->shellwarn.len) {
         note(s, scratch, "warn", s->shellwarn);
+    }
+    if (guess) {
+        // The default model names no endpoint, and more than one lists it
+        Buf b(&scratch, 256);
+        print(&b, "the default model, ");
+        print(&b, model);
+        print(&b, ", names no endpoint, so it is on ");
+        print(&b, which);
+        print(&b, ", the first that lists it; ");
+        print(&b, dflt.also);
+        if (dflt.nalso > 1) {
+            print(&b, " and ");
+            print(&b, (i64)dflt.nalso - 1);
+            print(&b, dflt.nalso==2 ? Str(" other list it too") : Str(" others list it too"));
+        } else {
+            print(&b, " lists it too");
+        }
+        print(&b, ". Set model = ENDPOINT/MODEL to choose.");
+        note(s, scratch, "info", finish(&b));
     }
     if (s->wtdefer) {
         wtgate(s, scratch, 0);  // made now, before its first turn

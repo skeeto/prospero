@@ -402,6 +402,7 @@ struct GuiShell {
 struct GuiModel {
     Str name;
     Str id;
+    Str endpoint;  // the one its like names, ENDPOINT/MODEL: only there
 };
 
 // A role a host's configuration has, for a new session there.
@@ -1990,9 +1991,38 @@ static b32 replyqualified(Json *j, Str name)
     return 0;
 }
 
+// A [model] section's own like in a config.get reply, else null.
+static Str replylike(Json *j, Str name)
+{
+    for (Json *s = jsonget(j, "settings")->child; s; s = s->next) {
+        if (jsonstr(jsonget(s, "kind"))=="model" && jsonstr(jsonget(s, "name"))==name &&
+                jsonstr(jsonget(s, "key"))=="like" && !jsonstr(jsonget(s, "like")).len) {
+            return trim(jsonstr(jsonget(s, "value")));
+        }
+    }
+    return {};
+}
+
+// The endpoint a model's chain of like names, ENDPOINT/MODEL, else null.
+static Str replypinned(Json *j, Str name)
+{
+    Str cur = name;
+    for (i32 i = 0; i < 16; i++) {  // as CFG_LIKEMAX
+        Str v = replylike(j, cur);
+        if (!v.len) {
+            break;
+        } else if (replyqualified(j, v)) {
+            return cut(v, '/').head;
+        }
+        cur = v;
+    }
+    return {};
+}
+
 // The [model NAME] sections in a config.get reply, each with its id,
-// which the reply gives in effect, else the name. One for a model on
-// one endpoint is left out, as it is no model of its own.
+// which the reply gives in effect, else the name, and the endpoint its
+// like names, if any. One for a model on one endpoint is left out, as it
+// is no model of its own.
 static Slice<GuiModel> replyconfs(Arena *a, Json *j)
 {
     Slice<GuiModel> r = {};
@@ -2001,7 +2031,7 @@ static Slice<GuiModel> replyconfs(Arena *a, Json *j)
         if (jsonstr(jsonget(s, "kind"))=="model" && name.len &&
                 jsonstr(jsonget(s, "key"))=="id" && !replyqualified(j, name)) {
             Str      id = trim(jsonstr(jsonget(s, "value")));
-            GuiModel m  = {name, id.len ? id : name};
+            GuiModel m  = {name, id.len ? id : name, replypinned(j, name)};
             r = push(a, r, m);
         }
     }
@@ -2042,12 +2072,14 @@ static void onhostmodels(Gui *g, GuiHost *h, Arena scratch, Json *j, b32 ok, Str
     Slice<GuiModel> confs = ok ? replyconfs(&scratch, j) : Slice<GuiModel>{};
     same = confs.len == h->confs.len;
     for (iz i = 0; same && i < confs.len; i++) {
-        same = confs[i].name==h->confs[i].name && confs[i].id==h->confs[i].id;
+        same = confs[i].name==h->confs[i].name && confs[i].id==h->confs[i].id &&
+               confs[i].endpoint==h->confs[i].endpoint;
     }
     if (!same) {
         h->confs = {};
         for (iz i = 0; i < confs.len; i++) {
-            GuiModel c = {clone(&g->perm, confs[i].name), clone(&g->perm, confs[i].id)};
+            GuiModel c = {clone(&g->perm, confs[i].name), clone(&g->perm, confs[i].id),
+                          clone(&g->perm, confs[i].endpoint)};
             h->confs = push(&g->perm, h->confs, c);
         }
     }
@@ -2475,9 +2507,11 @@ static b32 isdefault(Slice<ModelPick> picks, Str endpoint, Str model)
 
 // The models a host's endpoints list, as picks: the defaults first, then
 // for each endpoint in the engine's order, the configuration's [model]
-// sections that it lists by name or by id, then the rest of its ids;
-// last, the [model] sections that none lists. Each model goes once: the
-// defaults' row stands for that model where its endpoint lists it too.
+// sections that it lists by name or by id, but a variant like a model on
+// another endpoint (ENDPOINT/MODEL), then the rest of its ids; last, the
+// [model] sections that none lists, a variant like ENDPOINT/MODEL at that
+// endpoint. Each model goes once: the defaults' row stands for that model
+// where its endpoint lists it too.
 static Slice<ModelPick> modelpicks(Gui *g, Arena *a, GuiHost *h)
 {
     Slice<ModelPick> r     = {};
@@ -2505,6 +2539,9 @@ static Slice<ModelPick> modelpicks(Gui *g, Arena *a, GuiHost *h)
         iz from = r.len;
         for (iz k = 0; k < confs.len; k++) {
             b32 listed = 0;
+            if (confs[k].endpoint.len && !(confs[k].endpoint==ep->name)) {
+                continue;  // its like's endpoint's alone
+            }
             for (iz m = 0; !listed && m < ep->models.len; m++) {
                 listed = ep->models[m]==confs[k].name || ep->models[m]==confs[k].id;
             }
@@ -2539,7 +2576,10 @@ static Slice<ModelPick> modelpicks(Gui *g, Arena *a, GuiHost *h)
         }
         if (!dup) {
             ModelPick p = {};
-            p.model = p.label = confs[k].name;
+            p.endpoint = confs[k].endpoint;
+            p.model    = confs[k].name;
+            p.label    = p.endpoint.len ? concat(a, concat(a, p.endpoint, "/"), p.model)
+                                        : p.model;
             r = push(a, r, p);
         }
     }
