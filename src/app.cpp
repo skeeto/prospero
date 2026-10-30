@@ -4783,6 +4783,7 @@ static void sessgone(Gui *, GuiSession *);
 static b32  trashtoasted(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
 static void cfgeditrun(Gui *, Arena, Str path);
+static void setpane(Gui *, i32, b32);
 
 static void guiofferask(Gui *);
 static void onoffer(Gui *, Arena, Json *, b32);
@@ -4826,6 +4827,8 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
                                  shorten(&scratch, sesstitle(q.s), 60)), 0);
         }
         if (mine || q.s) {
+            // The transcript shown with it, as View > Transcript would
+            setpane(g, PANE_TRANSCRIPT, 1);
             g->promptfocus = 1;
         }
         guilist(g, h);
@@ -14575,7 +14578,15 @@ static DriveOp launchops[] = {
     {OP_OPENDIR, 0, 0, 0, 300, "opened"},
     {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
     {OP_CHECK, CHK_OPENED, 3, 0, 0, "/opened"},
-    // No folder, from the dialog
+    // No folder, from the dialog, the transcript hidden first: the new
+    // session shows it again, in front
+    {OP_MOVE, T_MENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_PANEITEM, 0, 0, 100, "Transcript"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PANECLOSED, 0, 0, 0, "Transcript"},
     {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
@@ -14602,6 +14613,8 @@ static DriveOp launchops[] = {
     // Its prompt has the focus: what's typed next is its first message
     {OP_TEXT, 0, 0, 0, 300, "first words"},
     {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "first words"},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Transcript"},
+    {OP_CHECK, CHK_TRANSCRIPTTAB, 0, 0, 0, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_SHOT, 0, 0, 0, 300, "launch-4-session"},
     // Session, New session, no folder: no dialog, the prompt focused
