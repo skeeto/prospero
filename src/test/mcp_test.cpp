@@ -230,11 +230,13 @@ static void test_mcp(Test *t)
                "1 it is not a JSON object with mcpServers");
     }
 
-    // Sections: a command or a url, never both, and none from an include
+    // Sections: a command or a url, never both. An include may define
+    // servers by url, untrusted, and [web], but not change the user's
     {
         Arena  b = a;
         CfgEnv v = newcfgenv(&b);
         addenv(v.os, &b, "HOME=/home/u");
+        addenv(v.os, &b, "TEAMKEY=k1");
         os_write(v.os, b, "/c/prospero.ini",
             "include = team.ini\n"
             "[mcp both]\n"
@@ -248,7 +250,22 @@ static void test_mcp(Test *t)
             "token = plain\n");                // 10
         os_write(v.os, b, "/c/team.ini",
             "[mcp shared]\n"
-            "command = evil\n");
+            "command = evil\n"
+            "[mcp remote]\n"
+            "url = https://team/mcp\n"
+            "trust = yes\n"                    // 5
+            "cwd = /x\n"
+            "env.K = v\n"
+            "header.X-K = env:TEAMKEY\n"
+            "tools = a b\n"
+            "[mcp web]\n"                      // 10
+            "url = https://evil/mcp\n"
+            "header.X-B = c\n"
+            "[web]\n"
+            "search = searxng\n"
+            "url = https://s/\n"               // 15
+            "ask = no\n"
+            "fetch = no\n");
         Config *c = newconfig(v.os, &b, v.scratch, "/c/prospero.ini", 0);
         expect(t, "mcp sections", inidiags(&b, c->ini),
             "/c/prospero.ini:2:2: warning: mcp both has both a command and a url: "
@@ -256,9 +273,53 @@ static void test_mcp(Test *t)
             "/c/prospero.ini:5:2: warning: mcp none has neither a command nor a url\n"
             "/c/prospero.ini:10:9: warning: a plaintext secret: write env:NAME and "
             "set the variable, or file:PATH, so that this file can be shared\n"
-            "/c/team.ini:2:11: error: an [mcp] setting in an included file is "
-            "ignored, since it chooses what runs and what the agent may reach: set "
-            "it in your own file");
+            "/c/team.ini:1:2: warning: mcp shared has neither a command nor a url\n"
+            "/c/team.ini:2:11: error: [mcp] command in an included file is ignored, "
+            "since it chooses what runs: set it in your own file (an included file "
+            "may give a server by its url)\n"
+            "/c/team.ini:5:9: error: [mcp] trust in an included file is ignored, "
+            "since it lets the agent use the server's tools without asking: set it "
+            "in your own file\n"
+            "/c/team.ini:6:7: error: [mcp] cwd in an included file is ignored, "
+            "since it chooses what runs: set it in your own file (an included file "
+            "may give a server by its url)\n"
+            "/c/team.ini:7:9: error: [mcp] env.NAME in an included file is ignored, "
+            "since it chooses what runs: set it in your own file (an included file "
+            "may give a server by its url)\n"
+            "/c/team.ini:11:1: error: ignored, as your own file has [mcp web], "
+            "which an included file cannot change\n"
+            "/c/team.ini:12:1: error: ignored, as your own file has [mcp web], "
+            "which an included file cannot change\n"
+            "/c/team.ini:16:7: error: [web] ask = false in an included file is "
+            "ignored, since it lets the agent search and read unasked: set it in "
+            "your own file");
+        expect(t, "mcp shared command", cfgget(c, "mcp", "shared", "command", 0), "");
+        expect(t, "mcp remote url", cfgget(c, "mcp", "remote", "url", 0), "https://team/mcp");
+        expect(t, "mcp remote trust", cfgget(c, "mcp", "remote", "trust", 0), "false");
+        expect(t, "mcp remote cwd", cfgget(c, "mcp", "remote", "cwd", 0), "");
+        expect(t, "mcp remote tools", cfgget(c, "mcp", "remote", "tools", 0), "a b");
+        Slice<CfgPair> env = cfgpairs(c, &b, "mcp", "remote", "env.");
+        Slice<CfgPair> hdr = cfgpairs(c, &b, "mcp", "remote", "header.");
+        expect(t, "mcp remote env", istr(&b, env.len), "0");
+        expect(t, "mcp remote header", hdr.len==1 ? concat(&b, hdr[0].name, hdr[0].value)
+                                                  : Str{}, "X-Kk1");
+        expect(t, "mcp web sealed", cfgget(c, "mcp", "web", "url", 0), "https://x/mcp");
+        hdr = cfgpairs(c, &b, "mcp", "web", "header.");
+        expect(t, "mcp web sealed header", istr(&b, hdr.len), "1");
+        expect(t, "web search shared", cfgget(c, "web", "", "search", 0), "searxng");
+        expect(t, "web url shared", cfgget(c, "web", "", "url", 0), "https://s/");
+        expect(t, "web ask shared", cfgget(c, "web", "", "ask", 0), "true");
+        expect(t, "web fetch shared", cfgget(c, "web", "", "fetch", 0), "no");
+
+        // The user's own [web] shuts out the include's
+        os_write(v.os, b, "/c/own.ini",
+            "include = team.ini\n"
+            "[web]\n"
+            "search = exa\n");
+        c = newconfig(v.os, &b, v.scratch, "/c/own.ini", 0);
+        expect(t, "web sealed search", cfgget(c, "web", "", "search", 0), "exa");
+        expect(t, "web sealed url", cfgget(c, "web", "", "url", 0), "");
+        expect(t, "web sealed fetch", cfgget(c, "web", "", "fetch", 0), "true");
     }
 
     // Signing in: PKCE (RFC 7636's own example), encodings, challenges

@@ -2629,6 +2629,16 @@ def sc_mcp_http(model, n, req):
         "Done over HTTP."])
 
 
+def sc_mcp_include(model, n, req):
+    # Two turns, the second in a later process
+    yield from mcp_steps(model, n, req, [
+        ("mcp__web__echo", {"text": "one"}),
+        ("mcp__web__echo", {"text": "two"}),
+        "Done once.",
+        ("mcp__web__echo", {"text": "three"}),
+        "Done again."])
+
+
 def sc_mcp_http_auth(model, n, req):
     yield from mcp_steps(model, n, req, [("mcp__web__echo", {"text": "hi"})])
 

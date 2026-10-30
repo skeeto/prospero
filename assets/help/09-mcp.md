@@ -33,16 +33,17 @@ out, and `timeout` limits each call. A role with a tools list gets MCP
 tools only by naming them: `mcp__NAME` for all of a server's, or
 `mcp__NAME__TOOL`. Subagents get their parent's.
 
-An included file cannot set `[mcp]` sections, since they run programs
-and choose what the agent may reach.
+An included file may give a server by its `url`, but not its
+`command`, `cwd` or `env.NAME`, which run programs, nor `trust = yes`,
+nor change a section of your own file's.
 
 ## Asks
 
 A call asks you first, as a write does, showing the server, the tool
 and its arguments, unless the section says `trust = yes` or the
 session is in Bypass mode. "Always allow SERVER" allows every tool of
-that server for the rest of the session and its subagents. A
-project's server also offers "Trust SERVER in this project", which
+that server for the rest of the session and its subagents, or, for a
+server over HTTP, until its url changes. A project's server also offers "Trust SERVER in this project", which
 allows its tools in later sessions too, until the `.mcp.json` changes
 its definition. In Plan mode, only tools
 the server marks read-only may run. See

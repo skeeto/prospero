@@ -510,6 +510,7 @@ struct Ask {
     b32       project;  // a project's MCP servers' (mcpasking)
     Str       trust;    // an MCP ask's project server, which "trust"
                         // trusts for good, or null
+    Str       mcpurl;   // an MCP ask's server's url, by its SHA-256, or null
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
@@ -523,7 +524,8 @@ struct Grant {
     Str mcp;    // an MCP tool's name (mcp__SERVER__TOOL), or every tool
                 // of a server (mcp__SERVER)
     Str web;    // "search" for every search, "fetch" for every page of
-    Str host;   // a host
+    Str host;   // a host; for an MCP grant, its server's url by its
+                // SHA-256 (mcpurlkey), as it holds only while that stays
 };
 
 // An image converted for a request (topng).
@@ -4655,7 +4657,7 @@ static b32 hasgrant(Session *s, Grant want)
             if (g->web==want.web && g->host==want.host) {
                 return 1;
             }
-        } else if (want.mcp.len && g->mcp==want.mcp) {
+        } else if (want.mcp.len && g->mcp==want.mcp && g->host==want.host) {
             return 1;
         } else if (!want.mcp.len && !g->desk && !g->mcp.len && !g->web.len &&
                    g->path==want.path && (g->write || !want.write)) {
@@ -4711,7 +4713,8 @@ static Grant grantof(Json *j)
         g.web  = ok ? w : Str{};
         g.host = ok && w=="fetch" ? h : Str{};
     } else if (m.len) {
-        g.mcp = m;
+        g.mcp  = m;
+        g.host = jsonstr(jsonget(j, "sha256"));
     } else if (d.data) {
         i32 c = deskclassfind(d);
         g.desk = c>=0 && deskcovers(c) ? 1u<<c : 0;
@@ -4749,6 +4752,9 @@ static void loggrant(Session *s, Arena scratch, Grant g, Str by, Str req, Str fr
         }
     } else if (g.mcp.len) {
         putstrkey(&w.json, "mcp", g.mcp);
+        if (g.host.len) {
+            putstrkey(&w.json, "sha256", g.host);
+        }
     } else if (g.desk) {
         putstrkey(&w.json, "desktop", grantclass(g));
     } else {
@@ -4864,6 +4870,7 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         Grant g = {};
         if (k->mcp) {
             g.mcp   = k->grant;
+            g.host  = k->mcpurl;
         } else if (k->tool == TOOL_DESKTOP) {
             g.desk  = 1u << k->gclass;
         } else if (k->tool==TOOL_WEBSEARCH || k->tool==TOOL_WEBFETCH) {
@@ -7088,11 +7095,11 @@ static i32 websearchservice(Engine *e)
            unset && e->cfg->thin && relaysearches(e) ? WEBS_RELAY : WEBS_NONE;
 }
 
-// Whether web_fetch is on: the user's own file has [web] (as a section
-// only an included file defines does nothing), and its fetch is on.
+// Whether web_fetch is on: the configuration has [web], and its fetch
+// is on.
 static b32 webfetchon(Engine *e)
 {
-    return cfgownsection(e->cfg, "web", "") &&
+    return inisection(e->ini, "web", "") &&
            cfgbool(trim(cfgget(e->cfg, "web", "", "fetch", 0))) != 0;
 }
 
@@ -9778,6 +9785,14 @@ static Str mcpwhat(Arena *a, McpTool *t, Str args)
     return finish(&b);
 }
 
+// What ties a grant to a server at a url: the url's SHA-256, so that
+// an "always" lapses when the url changes, as an included file may
+// define the server. Null for a server that runs a command.
+static Str mcpurlkey(Arena *a, McpServer *m)
+{
+    return m->url.len ? cfgsha256(a, m->url) : Str{};
+}
+
 // The grant of every tool of a server, as a role's tools list names
 // them all.
 static Str mcpevery(Arena *a, Str server)
@@ -9827,9 +9842,11 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
         mcpconf(e, m);  // trust as the configuration says now
     }
     Grant one = {};
-    one.mcp = t->name;  // an older session's grant
+    one.mcp  = t->name;  // an older session's grant
+    one.host = m ? mcpurlkey(&scratch, m) : Str{};
     Grant all = {};
-    all.mcp = mcpevery(&scratch, t->server);
+    all.mcp  = mcpevery(&scratch, t->server);
+    all.host = one.host;
     McpDef *d   = m && m->project.len ? mcpdefof(s, scratch, t->server) : 0;
     Str     key = d ? mcpprojkey(&scratch, d) : Str{};
     b32 trusted = d && mcpprojknown(e, scratch, key)==2;
@@ -9846,6 +9863,7 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
     k->mcp    = 1;
     k->grant  = clone(&s->perm, all.mcp);
     k->trust  = d ? clone(&s->perm, t->server) : Str{};
+    k->mcpurl = all.host.len ? clone(&s->perm, all.host) : Str{};
     k->opened = os_ticks(e->os);
     b32 steer = s->steers.len > 0;
     b32 wait  = attending(s) && !steer;

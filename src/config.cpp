@@ -21,14 +21,18 @@
 // (shared) file it is an error and ignored, as is file:PATH there,
 // which could send any of the user's files, and any setting of a
 // [remote] section, which chooses a program to run and where (ssh,
-// path, state, config, deploy), of a [shell] or an [mcp] section, which
-// choose programs to run, or of the [desktop] section, which lets the
-// agent use the screen, and any other setting that chooses a program to
-// run here (cfgruns): [tools] path_prepend and path_append, which say
-// where programs are found, a [tools] shell other than a keyword (auto,
-// sh, powershell, cmd), [tools] shells and git, and [ui] editor and
+// path, state, config, deploy), of a [shell] section, which chooses a
+// program to run, or of the [desktop] section, which lets the agent use
+// the screen, an [mcp] section's command, cwd and env.NAME, which run a
+// server, its trust = true and [web] ask = false, which let the agent
+// act unasked, and any other setting that chooses a program to run here
+// (cfgruns): [tools] path_prepend and path_append, which say where
+// programs are found, a [tools] shell other than a keyword (auto, sh,
+// powershell, cmd), [tools] shells and git, and [ui] editor and
 // terminal. A [shell] section counts only where the user's own file has
-// its header (cfgownsection).
+// its header (cfgownsection), and an included file's settings in an
+// [mcp] or [web] section that the user's own file has are ignored
+// (cfgsealed): it may define those, but not change the user's.
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -68,12 +72,14 @@
 //   is an error and is ignored, never cached, so a cached copy that does
 //   match stays in use; a cached copy that does not match is never used.
 //
-// Only the user's own file chooses what runs: its [remote], [shell] and
-// [mcp] sections, a shell, git, the editor, and where programs are
-// found. An included file's [remote], [shell], [mcp] and [desktop]
-// settings, those of cfgruns and plaintext secrets are ignored, so a
-// shared file, local or from the web, can at most point the harness at
-// endpoints and models.
+// Only the user's own file chooses what runs: its [remote] and [shell]
+// sections, its MCP servers' commands, a shell, git, the editor, and
+// where programs are found. An included file's [remote], [shell] and
+// [desktop] settings, those of cfgruns and plaintext secrets are
+// ignored, so a shared file, local or from the web, can point the
+// harness at endpoints, models, MCP servers by url and search services,
+// and reach the environment variables that env:NAME names, but cannot
+// run anything, nor let the agent act without asking.
 // (A shared [role] may list desktop in its tools, which matters only
 // once the user's own [desktop] offer says roles.)
 //
@@ -967,12 +973,21 @@ static b32 cfgruns(CfgKey *k, Str v)
 }
 
 // Whether only the user's own file may give a key a value: what runs on
-// the user's machines, and where, what may use the screen, and where
-// the agent's searches go and what it may read on the web.
+// the user's machines, and where, what may use the screen, and what the
+// agent may do unasked. An included file may define an MCP server by its
+// url, but not one that runs a command, nor trust its tools, and may set
+// up [web], but not searches and reads without asking.
 static b32 cfgownonly(CfgKey *k, Str v)
 {
-    return k->kind=="remote" || k->kind=="desktop" || k->kind=="mcp" ||
-           k->kind=="shell" || k->kind=="web" || cfgruns(k, trim(v));
+    v = trim(v);
+    if (k->kind == "mcp") {
+        return k->key=="command" || k->key=="cwd" || k->key=="env." ||
+               (k->key=="trust" && cfgbool(v)==1);
+    } else if (k->kind == "web") {
+        return k->key=="ask" && cfgbool(v)==0;
+    }
+    return k->kind=="remote" || k->kind=="desktop" || k->kind=="shell" ||
+           cfgruns(k, v);
 }
 
 // A role's tools may name MCP tools: mcp__SERVER, or mcp__SERVER__TOOL.
@@ -1109,10 +1124,19 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
     if (shared && k->kind=="remote") {
         return "a [remote] setting in an included file is ignored, since it "
                "chooses what runs where: set it in your own file";
-    } else if (shared && k->kind=="mcp") {
-        return "an [mcp] setting in an included file is ignored, since it "
-               "chooses what runs and what the agent may reach: set it in "
+    } else if (shared && k->kind=="mcp" && k->key=="trust") {
+        return "[mcp] trust in an included file is ignored, since it lets "
+               "the agent use the server's tools without asking: set it in "
                "your own file";
+    } else if (shared && k->kind=="mcp") {
+        Buf b(a, 128);
+        print(&b, "[mcp] ");
+        print(&b, k->key);
+        print(&b, cfgfamily(k) ? Str("NAME") : Str(""));
+        print(&b, " in an included file is ignored, since it chooses what "
+                  "runs: set it in your own file (an included file may give "
+                  "a server by its url)");
+        return finish(&b);
     } else if (shared && k->kind=="shell") {
         return "a [shell] setting in an included file is ignored, since it "
                "chooses what runs: set it in your own file";
@@ -1120,9 +1144,9 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
         return "a [desktop] setting in an included file is ignored, since it "
                "lets the agent use the screen: set it in your own file";
     } else if (shared && k->kind=="web") {
-        return "a [web] setting in an included file is ignored, since it "
-               "chooses where searches go and what the agent may read: set "
-               "it in your own file";
+        return "[web] ask = false in an included file is ignored, since it "
+               "lets the agent search and read unasked: set it in your own "
+               "file";
     } else if (shared && cfgruns(k, v) && k->key=="shell") {
         return "a shell by its path or name in an included file is ignored, "
                "since it chooses what runs: set it in your own file, or "
@@ -1342,6 +1366,26 @@ struct CfgFound {
     Str       from;
 };
 
+// Whether a file has a [KIND NAME] header.
+static b32 cfgfilehas(IniFile *f, Str kind, Str name)
+{
+    for (iz i = 0; f && i < f->lines.len; i++) {
+        IniSection *s = f->lines[i].type==INI_SECTION ? f->lines[i].section : 0;
+        if (s && s->kind==kind && s->name==name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether an included file's setting in [KIND NAME] is shut out, as the
+// user's own file has that section: an included file may define an MCP
+// server or [web], but not change the user's.
+static b32 cfgsealed(IniFile *user, IniFile *f, Str kind, Str name)
+{
+    return f!=user && (kind=="mcp" || kind=="web") && cfgfilehas(user, kind, name);
+}
+
 static CfgFound cfgfind(Config *c, Str kind, Str name, Str key)
 {
     CfgFound r = {};
@@ -1358,8 +1402,9 @@ static CfgFound cfgfind(Config *c, Str kind, Str name, Str key)
     }
     for (i32 i = 0; i < len; i++) {
         IniEntry *e = inilookup(c->ini, kind, chain[i], key);
-        if (e && (!k || !trim(e->value).len ||
-                  cfgjudge(k, e->value, e->file!=c->user)!=CFG_BAD)) {
+        if (e && !cfgsealed(c->user, e->file, kind, chain[i]) &&
+                (!k || !trim(e->value).len ||
+                 cfgjudge(k, e->value, e->file!=c->user)!=CFG_BAD)) {
             r.e    = e;
             r.from = chain[i];
             return r;
@@ -1610,14 +1655,7 @@ static Slice<Str> cfgsecrets(Config *c, Arena *perm)
 // included file alone defines chooses nothing that runs.
 static b32 cfgownsection(Config *c, Str kind, Str name)
 {
-    IniFile *f = c->user;
-    for (iz i = 0; f && i < f->lines.len; i++) {
-        IniSection *s = f->lines[i].type==INI_SECTION ? f->lines[i].section : 0;
-        if (s && s->kind==kind && s->name==name) {
-            return 1;
-        }
-    }
-    return 0;
+    return cfgfilehas(c->user, kind, name);
 }
 
 // The names of the user's own file's [KIND NAME] sections, each once,
@@ -1641,7 +1679,8 @@ static Slice<Str> cfgownnames(Config *c, Arena *a, Str kind)
 
 // A section's family of keys, such as [mcp X]'s env.NAME, as NAME and
 // value pairs. A key from an included file that only the user's own may
-// set is left out, as validation says, empty or not. A value written
+// set is left out, as validation says, empty or not, as is one of an
+// included file in a section the user's own file has (cfgsealed). A value written
 // env:VAR is VAR's, from the environment.
 struct CfgPair {
     Str name;
@@ -1655,6 +1694,7 @@ static Slice<CfgPair> cfgpairs(Config *c, Arena *a, Str kind, Str name, Str pref
     for (IniEntry *e = sec ? sec->keys : 0; e; e = e->next) {
         CfgKey *k = cfgkey(kind, e->key);
         if (!startswith(e->key, prefix) || e->key.len==prefix.len ||
+                cfgsealed(c->user, e->file, kind, name) ||
                 (e->file!=c->user && k && cfgownonly(k, e->value))) {
             continue;
         }
@@ -1755,15 +1795,28 @@ static b32 cfgmuted(IniFile *f)
     return f->ndiags >= INI_MAXDIAGS;
 }
 
-static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniLine *l)
+// A section's setting of a key, unless it is an included file's that
+// is ignored there (cfgsealed, cfgownonly).
+static IniEntry *cfgheeded(IniFile *user, IniSection *s, Str key)
+{
+    IniEntry *e = inientry(s, key);
+    CfgKey   *k = cfgkey(s->kind, key);
+    b32       x = e && e->file!=user &&
+                  (cfgsealed(user, e->file, s->kind, s->name) ||
+                   (k && cfgownonly(k, e->value)));
+    return x ? 0 : e;
+}
+
+static void cfgsectionline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
+                           IniLine *l)
 {
     CfgKind *k       = cfgkind(l->key);
     b32      unnamed = k && k->named && !l->value.len;
     b32      named   = k && !k->named && l->value.len;
     b32      nourl   = k && l->key=="endpoint" && l->value.len &&
                        !inientry(l->section, "url");
-    b32      mcpcmd  = k && l->key=="mcp" && inientry(l->section, "command");
-    b32      mcpurl  = k && l->key=="mcp" && inientry(l->section, "url");
+    b32      mcpcmd  = k && l->key=="mcp" && cfgheeded(user, l->section, "command");
+    b32      mcpurl  = k && l->key=="mcp" && cfgheeded(user, l->section, "url");
     b32      mcpbad  = k && l->key=="mcp" && l->value.len && mcpcmd==mcpurl;
     IniEntry *search = k && l->key=="web" ? inientry(l->section, "search") : 0;
     b32      webbad  = search && trim(search->value)=="searxng" &&
@@ -1869,7 +1922,23 @@ static void cfgkeyline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
     }
 
     b32 shared = f != user;
-    i32 j      = cfgjudge(key, l->value, shared);
+    if (cfgsealed(user, f, s->kind, s->name)) {
+        Str msg = {};
+        if (!cfgmuted(f)) {
+            Buf b(perm, 128);
+            print(&b, "ignored, as your own file has [");
+            print(&b, s->kind);
+            if (s->name.len) {
+                putbyte(&b, ' ');
+                print(&b, s->name);
+            }
+            print(&b, "], which an included file cannot change");
+            msg = finish(&b);
+        }
+        cfgreport(ini, perm, f, l, INI_ERROR, l->keybeg, msg);
+        return;
+    }
+    i32 j = cfgjudge(key, l->value, shared);
     if (j != CFG_OK) {
         Str msg = {};
         i32 sev = j==CFG_BAD ? INI_ERROR : INI_WARNING;
@@ -1926,7 +1995,7 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
         for (iz i = 0; i<f->lines.len && f->ndiags<=INI_MAXDIAGS; i++) {
             IniLine *l = &f->lines[i];
             if (l->type == INI_SECTION) {
-                cfgsectionline(ini, perm, f, l);
+                cfgsectionline(ini, perm, f, user, l);
             } else if (l->type==INI_KEY && l->section) {
                 cfgkeyline(ini, perm, f, user, l);
             }

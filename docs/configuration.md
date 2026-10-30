@@ -33,10 +33,15 @@ such as a team's endpoints and models, whose settings this file can
 override. An include may be a path or an http or https URL, which is
 fetched at startup, cached, and refreshed in the background, and may
 be pinned to a SHA-256. Nothing in an included file can make Prospero
-run a command: its plaintext secrets and `file:` secrets, `[remote]`
-and `[desktop]` settings, `[tools] path_prepend` and `path_append`, a
+run a command, or let the agent act without asking: its plaintext
+secrets and `file:` secrets, `[remote]` and `[desktop]` settings, an
+`[mcp]` section's `command`, `cwd`, `env.NAME` and `trust = yes`,
+`[web] ask = no`, `[tools] path_prepend` and `path_append`, a
 `[tools] shell` other than a keyword, and `[ui] editor` and `terminal`
-are ignored. A server whose certificate is not trusted fails the turn
+are ignored. It may define an MCP server by its url, and `[web]`, but
+cannot change an `[mcp]` section or `[web]` that your own file has.
+Its `env:NAME` values are read from your environment, as yours are,
+so include only files you trust that far. A server whose certificate is not trusted fails the turn
 at once, saying why, rather than being retried.
 
 On macOS, Prospero started from Spotlight, the Finder or the Dock gets
@@ -185,8 +190,11 @@ last one has gone. Its standard error is logged in the state
 directory's `mcp/logs`. `tools` keeps only some of a server's tools,
 `trust = yes` runs them without asking, and a role with a tools list
 names them as `mcp__NAME` or `mcp__NAME__TOOL`. Otherwise each call
-asks first, with an "always" for all of that server's tools. An
-included file cannot set `[mcp]`.
+asks first, with an "always" for all of that server's tools, which for
+a server over HTTP holds only while its url stays the same. An included
+file may define a server by its `url`, but its `command`, `cwd`,
+`env.NAME` and `trust = yes` are ignored, as is anything it sets in a
+section your own file has.
 
 A project's `.mcp.json`, in Claude Code's format, with `${VAR}` and
 `${VAR:-default}` expanded, is read once as a session starts, from its
@@ -228,7 +236,8 @@ web search tool: `model = ENDPOINT/MODEL`, by default
 `claude-haiku-5-5` on the first endpoint of kind `anthropic`).
 `fetch = no` leaves out `web_fetch`, `results` caps a search's
 results (8), and `searches` a session tree's searches (200). An
-included file cannot set `[web]`.
+included file may set `[web]`, but not `ask = no`, and not at all
+when your own file has `[web]`.
 
 Every search and page asks first, showing the query and its service
 or the whole address, with "always" for every search or every page of

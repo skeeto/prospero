@@ -10348,6 +10348,57 @@ def mcp_http(t):
     t.check(len([m for m in log if "_delete" in m]) == 1, "the forgotten session deleted")
 
 
+@scenario(bound=30)
+def mcp_include(t):
+    """A server over HTTP that an included file defines: its trust = yes
+    ignored, so the first call asks, and its header's env:NAME read. An
+    "always" holds for its url; once the include changes the url, a later
+    process asks again."""
+    env = mcpenv(t, EXTRA_VAL="team!")
+    srv = McpHttpServer(t)
+    team = t.host.join(t.base, "team.ini")
+    t.host.write(team, f"[mcp web]\nurl = {srv.url}\ntrust = yes\n"
+                       f"header.X-Extra = env:EXTRA_VAL\n")
+    t.host.write(t.config, f"include = {team}\n" + t.host.read(t.config))
+    h = b = None
+    try:
+        h = t.headless(env=env)
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="go")
+        one = nextask(h, sid)
+        t.check(one["always"] == "mcp__web" and "trust" not in one, f"asked {one}")
+        h.call("answer", sid=sid, req=one["req"], decision="always")
+        t.check(ended(h, sid, 1)["why"] == "done", "the first turn ends")
+        t.check(len(h.all("ask", sid)) == 1, "always: the second call not asked")
+        g = [e for e in logged(t, sid) if e["ev"] == "grant"]
+        t.check(len(g) == 1 and g[0].get("mcp") == "mcp__web" and
+                len(g[0].get("sha256", "")) == 64 and srv.url not in json.dumps(g),
+                f"the grant, by the url's hash {g}")
+        t.check(h.close() == 0, "the first exits")
+        h = None
+
+        t.host.write(team, f"[mcp web]\nurl = {srv.url}?v=2\n"
+                           f"header.X-Extra = env:EXTRA_VAL\n")
+        b = t.headless(env=env)
+        t.check(b.call("open", sid=sid, attended=1).get("ok") == 1, "open")
+        last = max(e["seq"] for e in logged(t, sid))
+        b.send("prompt", sid=sid, text="again")
+        two = nextask(b, sid, last)
+        t.check(two["always"] == "mcp__web", f"asked again {two}")
+        b.call("answer", sid=sid, req=two["req"], decision="allow")
+        t.check(ended(b, sid, 2)["why"] == "done", "the second turn ends")
+    finally:
+        rc = h.close() if h else 0
+        rc2 = b.close() if b else 0
+        srv.close()
+    t.check(rc == 0 and rc2 == 0, f"headless exit {rc} {rc2}")
+    posts = [m for m in mcplog(t) if "_http" in m]
+    t.check(posts and all(m["_http"].get("X-Extra") == "team!" for m in posts),
+            "the include's header, from the environment")
+    texts = [c["arguments"].get("text") for c in mcpcalls(t) if c["name"] == "echo"]
+    t.check(texts == ["one", "two", "three"], f"echoed {texts}")
+
+
 @scenario(bound=15)
 def mcp_http_auth(t):
     """A server that wants a token, without one: it fails, saying so."""

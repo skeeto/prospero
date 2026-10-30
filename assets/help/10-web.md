@@ -32,8 +32,9 @@ For example:
 `fetch = no` leaves out `web_fetch`, and `search = none` (the default)
 leaves out `web_search`. `results` is the most results a search
 returns (8, at most 20), and `searches` the most searches a session
-and its subagents may make together (200). An included file cannot
-set `[web]`, since it decides where queries go.
+and its subagents may make together (200). An included file may set
+up `[web]`, but not `ask = no`, and not at all when your own file has
+`[web]`.
 
 ## Asks
 
