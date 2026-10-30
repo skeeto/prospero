@@ -24,6 +24,9 @@ static void testrelayurl(Test *t)
     }
     expect(t, "endpointurl", istr(&a, endpointurl("relay://x") && endpointurl("http://h/")
                                       && !endpointurl("x")), "1");
+    expect(t, "relaytoken", istr(&a, relaytoken("0123456789abcdef") && !relaytoken("") &&
+                                     !relaytoken("ABC") && !relaytoken("a b") &&
+                                     !relaytoken("0123456789abcdef0123456789abcdef0")), "1");
 }
 
 static void testrelayparse(Test *t)
@@ -52,6 +55,12 @@ static void testrelayparse(Test *t)
            "mybox.localwithaverylongnamethatgoesonandonandonpastsixty-three");
     expect(t, "relayparse.machine.len", istr(&a, p.machine.len <= 63), "1");
     expect(t, "relayparse.search", istr(&a, p.search), "1");
+    expect(t, "relayparse.own", istr(&a, p.own.len), "0");
+    RelayPeer q = {};
+    relayparse(&q, &a, jsonparse(&a, "{\"own\":\"9f\"}").root);
+    expect(t, "relayparse.own.ok", q.own, "9f");
+    relayparse(&q, &a, jsonparse(&a, "{\"own\":\"x\\n[y]\"}").root);
+    expect(t, "relayparse.own.bad", istr(&a, q.own.len), "0");
     expect(t, "relayparse.eps", istr(&a, p.eps.len), "2");
     expect(t, "relayparse.models", istr(&a, p.eps[0].models.len), "1");
     expect(t, "relayparse.kind", istr(&a, p.eps[1].anthropic), "1");

@@ -61,6 +61,7 @@ struct RelayPeer {
     Str            layer;    // its configuration layer, INI
     Slice<RelayEp> eps;
     b32            search;   // it runs web searches ([web] search)
+    Str            own;      // relays only sessions made with this token
     b32            away;     // no stream now: chosen by none
     b32            gone;
 };
@@ -117,6 +118,8 @@ struct RelayServe {
     Arena       arena;
     i64         cid;      // the client's number for it
     Str         origin;   // the client's name for the thin engine
+    HostLink   *far;      // or the link it came by (hostlink.cpp)
+    b32         dropped;  // whose end is gone: nothing more is sent
     Str         session;
     Endpoint    ep;
     Str         path;
@@ -169,6 +172,7 @@ struct Relay {
     iz          basebytes;
     i64         baseuse;
     b32         held;     // records wait for room in the out mailbox
+    b32         farheld;  // or in a hostlink's
     CfgLayer    layers[RELAY_PEERS];
 };
 
@@ -255,6 +259,17 @@ static b32 relaymodelkey(Str key)
     return k && !cfgfamily(k);
 }
 
+// A hostlink's token (farlink): the sessions it made, which alone its
+// offer is for (own), know it from their new {task}.
+static b32 relaytoken(Str s)
+{
+    b32 ok = s.len>0 && s.len<=32;
+    for (iz i = 0; ok && i < s.len; i++) {
+        ok = digit(s[i]) || (s[i]>='a' && s[i]<='f');
+    }
+    return ok;
+}
+
 static Str const relayepkeys[] = {
     "first_byte_timeout", "idle_timeout", "progress_timeout",
     "slow_retry", "slow_retry_budget",
@@ -266,6 +281,8 @@ static void relayparse(RelayPeer *p, Arena *a, Json *o)
 {
     p->machine = relaymachine(a, jsonstr(jsonget(o, "machine")));
     p->search  = jsonflag(jsonget(o, "search"), 0);
+    Str own    = jsonstr(jsonget(o, "own"));
+    p->own     = relaytoken(own) ? clone(a, own) : Str{};
 
     Buf b(a, 4096);
     print(&b, "# relayed from ");
@@ -531,9 +548,9 @@ static void relaykeep(Engine *e, Str key, i64 peer, Str body)
 // Whether a computer may relay the session's request at ep: here, not
 // away, offering the endpoint by name with its kind, and the model, or
 // no list of models for it.
-static b32 relayeligible(RelayPeer *p, Endpoint *ep, Str model)
+static b32 relayeligible(RelayPeer *p, Endpoint *ep, Str model, Str own)
 {
-    if (p->away || p->gone) {
+    if (p->away || p->gone || (p->own.len && !(p->own==own))) {
         return 0;
     }
     b32 an = ep->kind == EP_ANTHROPIC;
@@ -596,7 +613,7 @@ static b32 relaychoose(Session *s, Endpoint *ep)
     Str        model = reqmc(s)->name;
     RelayPeer *best  = 0;
     for (RelayPeer *p = e->relay->peers; p; p = p->next) {
-        if (relayeligible(p, ep, model) &&
+        if (relayeligible(p, ep, model, s->rrelay) &&
                 (!best || p->peer==s->relaypeer ||
                  (best->peer!=s->relaypeer && p->seq>best->seq))) {
             best = p;
@@ -644,7 +661,7 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     Str    body = req->body;
     if (!peer) {
         for (RelayPeer *p = r->peers; p; p = p->next) {
-            if (relayeligible(p, ep, {}) && (!peer || p->seq>relaypeerbynum(e, peer)->seq)) {
+            if (relayeligible(p, ep, {}, {}) && (!peer || p->seq>relaypeerbynum(e, peer)->seq)) {
                 peer = p->peer;
             }
         }
@@ -1070,14 +1087,30 @@ static void relayservecancel(Engine *e, RelayServe *v)
     }
 }
 
-// relay.call {cid, origin, ...}: part of a thin engine's call, which
-// its client passed on, or {cid, origin, cancel} to stop one, or every
-// call of the origin without a cid.
-static void relaycall(Engine *e, Arena scratch, Json *j)
+// The start of a served call's relay.data: a record for the client that
+// passed the call on, or, for a hostlink's (far), a command to its host.
+static EvOut relaydatabegin(Engine *e, Buf *b, HostLink *far, i64 cid, Str origin)
 {
-    Relay *r      = e->relay;
-    i64    cid    = jsonint(jsonget(j, "cid"), 0);
-    Str    origin = jsonstr(jsonget(j, "origin"));
+    if (far) {
+        EvOut w = cmdbegin(b, CMD_RELAYDATA, 0);
+        putintkey(&w.json, "rid", cid);
+        return w;
+    }
+    EvOut w = evbegin(b, {}, 0, os_time(e->os), EV_RELAYDATA);
+    putintkey(&w.json, "cid", cid);
+    putstrkey(&w.json, "origin", origin);
+    return w;
+}
+
+static b32 farrelay(HostLink *, Str);
+
+// Part of a thin engine's call, which its client passed on (relay.call)
+// or a hostlink's host sent (far), or a cancel of one, or of every call
+// of the origin without a cid.
+static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
+                       HostLink *far)
+{
+    Relay *r = e->relay;
     if (jsonflag(jsonget(j, "cancel"), 0)) {
         for (RelayServe *v = r->serves; v; v = v->next) {
             b32 mine = cid ? v->cid==cid && (!origin.len || v->origin==origin)
@@ -1108,15 +1141,17 @@ static void relaycall(Engine *e, Arena scratch, Json *j)
             // Unsound, or no memory for it: answered at once, from
             // scratch (a call never made)
             Buf   b(&scratch, 256 + origin.len);
-            EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_RELAYDATA);
-            putintkey(&w.json, "cid", cid);
-            putstrkey(&w.json, "origin", origin);
+            EvOut w = relaydatabegin(e, &b, far, cid, origin);
             putkey(&w.json, "done");
             putobject(&w.json);
             putstrkey(&w.json, "err", "lost");
             putstrkey(&w.json, "text", sound ? Str("out of memory") : Str("an unsound relayed call"));
             putend(&w.json);
-            emit(e, evend(&w));
+            if (far) {
+                farrelay(far, evend(&w));  // or never: the call ends there
+            } else {
+                emit(e, evend(&w));
+            }
             return;
         }
         Arena a = newarena(mem);
@@ -1124,6 +1159,7 @@ static void relaycall(Engine *e, Arena scratch, Json *j)
         v->arena   = a;
         v->mem     = mem;
         v->cid     = cid;
+        v->far     = far;
         v->origin  = clone(&v->arena, origin);
         v->session = clone(&v->arena, jsonstr(jsonget(j, "session")));
         v->path    = clone(&v->arena, jsonstr(jsonget(j, "path")));
@@ -1186,6 +1222,29 @@ static void relaycall(Engine *e, Arena scratch, Json *j)
     }
 }
 
+// relay.call {cid, origin, ...}: part of a thin engine's call, which
+// its client passed on.
+static void relaycall(Engine *e, Arena scratch, Json *j)
+{
+    i64 cid    = jsonint(jsonget(j, "cid"), 0);
+    Str origin = jsonstr(jsonget(j, "origin"));
+    relayserve(e, scratch, j, cid, origin, 0);
+}
+
+// A served call's end is gone: its calls are cancelled, and nothing more
+// of them is sent.
+static void relaydropfar(Engine *e, HostLink *far)
+{
+    for (RelayServe *v = e->relay->serves; v; v = v->next) {
+        if (v->far == far) {
+            v->dropped = 1;
+            if (!v->done) {
+                relayservecancel(e, v);
+            }
+        }
+    }
+}
+
 // A record of a served call's request. Returns 0 if it is not one.
 static b32 relayrecord(Engine *e, Arena scratch, Record r)
 {
@@ -1239,10 +1298,15 @@ static b32 relayrecord(Engine *e, Arena scratch, Record r)
 
 // Records out, held back while the host's inbox is too full for them
 
-// Post a line only if it leaves the mailbox half free (mailroom).
-static b32 relayemit(Engine *e, Str line)
+// Post a line only if it leaves the mailbox half free (mailroom), or a
+// served call's for a hostlink, only if its link has room (farrelay).
+static b32 relayemit(Engine *e, Str line, RelayServe *v = 0)
 {
-    if (!mailroom(e->out, line.len)) {
+    if (v && v->far) {
+        b32 ok = farrelay(v->far, line);
+        e->relay->farheld |= !ok;
+        return ok;
+    } else if (!mailroom(e->out, line.len)) {
         e->relay->held = 1;
         return 0;
     }
@@ -1292,9 +1356,7 @@ static Str relaypart(Engine *e, Arena *a, RelayCall *c)
 static Str relayout(Engine *e, Arena *a, RelayServe *v, Str key)
 {
     Buf   b(a, 1024 + v->origin.len + v->headers.len + v->text.len);
-    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_RELAYDATA);
-    putintkey(&w.json, "cid", v->cid);
-    putstrkey(&w.json, "origin", v->origin);
+    EvOut w = relaydatabegin(e, &b, v->far, v->cid, v->origin);
     putkey(&w.json, key);
     if (key == "queued") {
         putobject(&w.json);
@@ -1323,27 +1385,33 @@ static Str relayout(Engine *e, Arena *a, RelayServe *v, Str key)
 // What a served call has to send back, in order, while there is room.
 static b32 relayserveout(Engine *e, Arena scratch, RelayServe *v)
 {
+    if (v->dropped) {
+        v->queued   = v->sent = v->head = 0;
+        v->held     = 0;
+        v->finished = v->done;
+        return 1;
+    }
     if (v->queued) {
-        if (!relayemit(e, relayout(e, &scratch, v, "queued"))) return 0;
+        if (!relayemit(e, relayout(e, &scratch, v, "queued"), v)) return 0;
         v->queued = 0;
     }
     if (v->sent) {
-        if (!relayemit(e, relayout(e, &scratch, v, "sent"))) return 0;
+        if (!relayemit(e, relayout(e, &scratch, v, "sent"), v)) return 0;
         v->sent = 0;
     }
     if (v->head) {
-        if (!relayemit(e, relayout(e, &scratch, v, "head"))) return 0;
+        if (!relayemit(e, relayout(e, &scratch, v, "head"), v)) return 0;
         v->head = 0;
     }
     while (v->held) {
         Arena a = scratch;
-        if (!relayemit(e, relayout(e, &a, v, "body"))) return 0;
+        if (!relayemit(e, relayout(e, &a, v, "body"), v)) return 0;
         iz n = v->held<RELAY_PART ? v->held : RELAY_PART;
         v->held -= n;
         copybytes(v->hold, v->hold+n, v->held);  // memmove
     }
     if (v->done && !v->finished) {
-        if (!relayemit(e, relayout(e, &scratch, v, "done"))) return 0;
+        if (!relayemit(e, relayout(e, &scratch, v, "done"), v)) return 0;
         v->finished = 1;
     }
     return 1;
@@ -1354,7 +1422,8 @@ static b32 relayserveout(Engine *e, Arena scratch, RelayServe *v)
 static void relaytick(Engine *e, Arena scratch)
 {
     Relay *r = e->relay;
-    r->held = 0;
+    r->held    = 0;
+    r->farheld = 0;
     for (RelayCall *c = r->calls; c; c = c->next) {
         Arena a = scratch;
         if (c->failing && !c->ended) {
@@ -1380,7 +1449,7 @@ static void relaytick(Engine *e, Arena scratch)
         if (v->go) {
             relaysend(e, scratch, v);
         }
-        if (!r->held) {
+        if (!r->held || v->far) {
             relayserveout(e, scratch, v);
         }
     }
@@ -1422,34 +1491,33 @@ static i64 relaynext(Engine *e, i64 now)
     if (!work) {
         return I64MAX;
     }
-    return r->held ? now + (i64)RELAY_RETRY*MS : now;
+    return r->held || r->farheld ? now + (i64)RELAY_RETRY*MS : now;
 }
 
 
 // The offer: this engine's models, as a thin engine may relay them
 
-// offer: the reply's offer, for relay.offer, with each endpoint that has
-// a URL of its own, its settings that a thin engine needs, and the models
-// its last listing gave, but never its URL or key; each [model] section
-// flattened through like; the defaults; and whether it searches.
-static void cmdoffer(Engine *e, Arena scratch, i64 id)
+// An offer, for relay.offer, into w: each endpoint that has a URL of its
+// own, its settings that a thin engine needs, and the models its last
+// listing gave, but never its URL or key; each [model] section flattened
+// through like; the defaults; whether it searches; and own, a hostlink's
+// token, for the sessions it made alone.
+static void relayofferput(Engine *e, JsonOut *w, Arena scratch, Str own)
 {
     Config *cfg = e->cfg;
-    Buf     b(&scratch, 1<<16);
-    EvOut   w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
-    putintkey(&w.json, "id", id);
-    putintkey(&w.json, "ok", 1);
-    putkey(&w.json, "offer");
-    putobject(&w.json);
-    putstrkey(&w.json, "machine", cut(os_hostname(e->os, &scratch), '.').head);
+    putobject(w);
+    putstrkey(w, "machine", cut(os_hostname(e->os, &scratch), '.').head);
+    if (own.len) {
+        putstrkey(w, "own", own);
+    }
     Str dep = trim(cfgget(cfg, "", "", "endpoint", 0));
     Str dmo = trim(cfgget(cfg, "", "", "model", 0));
     Str web = trim(cfgget(cfg, "web", "", "search", 0));
-    putintkey(&w.json, "search", web.len && !(web=="none"));
+    putintkey(w, "search", web.len && !(web=="none"));
 
     b32 named = 0;
-    putkey(&w.json, "endpoints");
-    putarray(&w.json);
+    putkey(w, "endpoints");
+    putarray(w);
     for (IniSection *s = inifirst(e->ini, "endpoint"); s; s = ininext(s)) {
         Arena    a  = scratch;
         Endpoint ep = {};
@@ -1459,44 +1527,44 @@ static void cmdoffer(Engine *e, Arena scratch, i64 id)
         Url u     = parseurl(ep.url);
         b32 local = u.ok && localhost(u.host);
         named |= s->name == dep;
-        putobject(&w.json);
-        putstrkey(&w.json, "name", s->name);
-        putstrkey(&w.json, "kind", ep.kind==EP_ANTHROPIC ? Str("anthropic") : Str("openai"));
+        putobject(w);
+        putstrkey(w, "name", s->name);
+        putstrkey(w, "kind", ep.kind==EP_ANTHROPIC ? Str("anthropic") : Str("openai"));
         for (iz i = 0; i < countof(relayepkeys); i++) {
-            putstrkey(&w.json, relayepkeys[i],
+            putstrkey(w, relayepkeys[i],
                       trim(cfgget(cfg, "endpoint", s->name, relayepkeys[i], local)));
         }
-        putkey(&w.json, "models");
-        putarray(&w.json);
+        putkey(w, "models");
+        putarray(w);
         Str *list = upsert(&e->listings, ep.url, (Arena *)0);
         for (Str rest = list ? *list : Str{}; rest.len;) {
             Cut c = cut(rest, '\n');
             if (c.head.len) {
-                putstr(&w.json, c.head);
+                putstr(w, c.head);
             }
             rest = c.tail;
         }
-        putend(&w.json);
-        putend(&w.json);
+        putend(w);
+        putend(w);
     }
-    putend(&w.json);
+    putend(w);
     if (named) {
-        putstrkey(&w.json, "endpoint", dep);
+        putstrkey(w, "endpoint", dep);
     }
     if (dmo.len) {
-        putstrkey(&w.json, "model", dmo);
+        putstrkey(w, "model", dmo);
     }
 
-    putkey(&w.json, "models");
-    putarray(&w.json);
+    putkey(w, "models");
+    putarray(w);
     for (IniSection *s = inifirst(e->ini, "model"); s; s = ininext(s)) {
         if (!s->name.len) {
             continue;
         }
-        putobject(&w.json);
-        putstrkey(&w.json, "name", s->name);
-        putkey(&w.json, "settings");
-        putobject(&w.json);
+        putobject(w);
+        putstrkey(w, "name", s->name);
+        putkey(w, "settings");
+        putobject(w);
         for (iz i = 0; i < countof(cfgschema); i++) {
             CfgKey *k = &cfgschema[i];
             if (!(k->kind=="model") || cfgfamily(k) || !relaymodelkey(k->key)) {
@@ -1505,7 +1573,7 @@ static void cmdoffer(Engine *e, Arena scratch, i64 id)
             IniEntry *x = cfgfind(cfg, "model", s->name, k->key).e;
             if (x && x->line->valbeg<x->line->valend) {
                 IniLine *l = x->line;
-                putstrkey(&w.json, k->key, Str(l->raw.data+l->valbeg, l->valend-l->valbeg));
+                putstrkey(w, k->key, Str(l->raw.data+l->valbeg, l->valend-l->valbeg));
             }
         }
         // Template arguments, merged along the chain, as written
@@ -1529,12 +1597,24 @@ static void cmdoffer(Engine *e, Arena scratch, i64 id)
         }
         for (iz i = 0; i < args.len; i++) {
             IniLine *l = args[i]->line;
-            putstrkey(&w.json, args[i]->key, Str(l->raw.data+l->valbeg, l->valend-l->valbeg));
+            putstrkey(w, args[i]->key, Str(l->raw.data+l->valbeg, l->valend-l->valbeg));
         }
-        putend(&w.json);
-        putend(&w.json);
+        putend(w);
+        putend(w);
     }
-    putend(&w.json);
-    putend(&w.json);
+    putend(w);
+    putend(w);
+}
+
+// offer: the reply's offer, for a client to pass on as relay.offer.
+static void cmdoffer(Engine *e, Arena scratch, i64 id)
+{
+    Arena work = carve(&scratch, (iz)1<<20);
+    Buf   b(&scratch, 1<<16);
+    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putkey(&w.json, "offer");
+    relayofferput(e, &w.json, work, {});
     emit(e, evend(&w));
 }

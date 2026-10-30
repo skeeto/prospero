@@ -755,6 +755,7 @@ struct Session {
                              // which reads the task.report, with pcall
     Str          rvia;       // and how that host reaches this one: wsl, ssh
     Str          rdistro;    // with wsl, this distro's name there
+    Str          rrelay;     // and its link's token: its offer relays this
     Session     *parent;     // the parent, while both are in memory
     b32          intask;     // the parent waits for this one's report
     b32          bgtask;     // or no longer: the user moved it to the
@@ -1820,6 +1821,7 @@ static void relaycall(Engine *, Arena, Json *);
 static void cmdoffer(Engine *, Arena, i64 id);
 static b32  relayrecord(Engine *, Arena, Record);
 static b32  relaylisting(Engine *, Buf *, Endpoint *);
+static b32  relaytoken(Str);
 static void relaytick(Engine *, Arena);
 static i64  relaynext(Engine *, i64 now);
 
@@ -2061,6 +2063,7 @@ static void farattend(Engine *, Arena);
 static Str  farhostsdesc(Engine *, Arena *, Arena);
 static HostLink *farbyout(Engine *, u64);
 static void farmail(Engine *, Arena, HostLink *, Record);
+static void farreoffer(Engine *, Arena);
 
 // A session's branch and changes (git.cpp)
 static void cmdgit(Engine *, Arena, i64, Json *);
@@ -4322,6 +4325,7 @@ static void reconfigure(Engine *, Arena);
 static void cfgapply(Engine *e, Arena scratch)
 {
     reconfigure(e, scratch);
+    farreoffer(e, scratch);
     e->trashat = os_ticks(e->os);  // by trash_days as it is now
     Buf   b(&scratch, 128);
     EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_CONFIG);
@@ -12981,6 +12985,9 @@ static void logsession(Session *s, Arena scratch)
         if (s->rdistro.len) {
             putstrkey(&w.json, "distro", s->rdistro);
         }
+        if (s->rrelay.len) {
+            putstrkey(&w.json, "relay", s->rrelay);
+        }
     }
     // Plan mode's tools go without saying: never a role's. Memory's, by
     // the memory record; questions to the user, by questions. The web's
@@ -14670,6 +14677,7 @@ struct NewTask {
     Str prefer;  // the parent's ENDPOINT/MODEL, if this host has ENDPOINT
     Str via;     // how that host reaches this one: wsl or ssh
     Str distro;  // with wsl, this distro's name there
+    Str relay;   // the link's token, if it offers its models (relay.cpp)
     Str prompt;
     i32 depth;   // 1..TASK_DEPTH
     i32 hop;     // 0..HOP_MAX
@@ -14701,6 +14709,7 @@ static NewTask newtaskof(Json *t)
     r.prefer = trim(jsonstr(jsonget(t, "prefer")));
     r.via    = jsonstr(jsonget(t, "via"));
     r.distro = jsonstr(jsonget(t, "distro"));
+    r.relay  = jsonstr(jsonget(t, "relay"));
     r.prompt = jsonstr(jsonget(t, "prompt"));
     r.plan   = jsonflag(jsonget(t, "plan"), 0);
     i64 depth = jsonint(jsonget(t, "depth"), 1);
@@ -14715,7 +14724,9 @@ static NewTask newtaskof(Json *t)
               r.via!="wsl" && r.via!="ssh"
                                    ? Str("task.via must be wsl or ssh") :
               r.distro.len && (r.via!="wsl" || !plainname(r.distro))
-                                   ? Str("task.distro must be a WSL distro's name")
+                                   ? Str("task.distro must be a WSL distro's name") :
+              r.relay.len && !relaytoken(r.relay)
+                                   ? Str("task.relay must be a link's token")
                                    : Str{};
     return r;
 }
@@ -14919,6 +14930,7 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         s->pcall    = clone(&s->perm, task.call);
         s->rvia     = clone(&s->perm, task.via);
         s->rdistro  = clone(&s->perm, task.distro);
+        s->rrelay   = clone(&s->perm, task.relay);
         s->intask   = 1;
         s->hop      = task.hop;
         s->te.deny |= (s->depth>=TASK_DEPTH ? (u32)1<<TOOL_TASK : 0) | TOOL_PLANMASK;
@@ -15222,6 +15234,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
                 s->rparent = parent;
                 s->rvia    = clone(&s->perm, jsonstr(jsonget(j, "via")));
                 s->rdistro = clone(&s->perm, jsonstr(jsonget(j, "distro")));
+                s->rrelay  = clone(&s->perm, jsonstr(jsonget(j, "relay")));
             } else {
                 s->psid = parent;
             }

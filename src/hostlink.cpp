@@ -28,6 +28,12 @@
 // at once for FAR_COOL. A link with no subagents for FAR_IDLE is
 // finished.
 //
+// A host whose engine is thin (relay.cpp) runs a subagent on this
+// engine's models: the link offers them once up (relay.offer), only for
+// the sessions it makes, which know its token from their new {task}, and
+// serves their model calls (relay records) as a window would, its
+// replies held back while the link is too full for them (farrelay).
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i64 {
@@ -68,6 +74,8 @@ struct HostLink {
     i32        state;    // RS_*
     b32        taskok;   // its engine takes new {task}
     b32        heard;    // and it was up: its caps are known
+    b32        relayok;  // its engine takes relay.offer
+    Str        token;    // its subagents' (task.relay), for its offers
     b32        ending;   // finished or closed: no new subagents
     Str        why;      // the last trouble, in whybuf
     u8         whybuf[FAR_WHY];
@@ -230,6 +238,7 @@ struct FarAsk {
     Str prefer;
     Str via;
     Str distro;
+    Str relay;
     Str prompt;
 };
 
@@ -271,6 +280,9 @@ static Str farline(Arena *a, FarAsk *k)
     putstrkey(&w, "via", k->via);
     if (k->distro.len) {
         putstrkey(&w, "distro", k->distro);
+    }
+    if (k->relay.len) {
+        putstrkey(&w, "relay", k->relay);
     }
     putstrkey(&w, "prompt", k->prompt);
     putend(&w);
@@ -412,6 +424,9 @@ static HostLink *farlink(Engine *e, Arena scratch, FarHost *h)
     if (!l) {
         l = alloc<HostLink>(&e->perm);
         l->name = clone(&e->perm, h->name);
+        Buf t(&e->perm, 16);
+        printhex(&t, os_random(e->os), 16);
+        l->token = finish(&t);
         l->mem  = os_reserve(e->os, (iz)1<<(sizeof(void *)==8 ? 30 : 26));
         if (!l->mem) {
             return 0;
@@ -424,12 +439,14 @@ static HostLink *farlink(Engine *e, Arena scratch, FarHost *h)
         l->state = RS_FAILED;
         return l;  // failed a moment ago, and why: failing again
     }
-    HostLink *next = l->next;
-    Str       name = l->name;
-    Region   *mem  = l->mem;
+    HostLink *next  = l->next;
+    Str       name  = l->name;
+    Str       token = l->token;
+    Region   *mem   = l->mem;
     *l = {};
     l->next   = next;
     l->name   = name;
+    l->token  = token;
     l->mem    = mem;
     l->perm   = newarena(mem);
     l->state  = RS_CONNECTING;
@@ -621,6 +638,40 @@ static void farnamed(Engine *e, Arena scratch, HostLink *l, HostKid *k, Str sid)
     }
 }
 
+// Offer this engine's models to the host's, for the link's subagents
+// alone, unless this engine is thin itself: relays do not chain.
+static void faroffer(Engine *e, Arena scratch, HostLink *l)
+{
+    if (!l->relayok || e->cfg->thin) {
+        return;
+    }
+    Arena work = carve(&scratch, (iz)1<<20);
+    Buf   b(&scratch, 1<<16);
+    EvOut w = cmdbegin(&b, CMD_RELAYOFFER, ++l->nextid);
+    putkey(&w.json, "offer");
+    relayofferput(e, &w.json, work, l->token);
+    farsend(l, evend(&w));
+}
+
+// Again, as the configuration changed, to each link up.
+static void farreoffer(Engine *e, Arena scratch)
+{
+    for (HostLink *l = e->links; l; l = l->next) {
+        if (l->r && l->state==RS_UP) {
+            faroffer(e, scratch, l);
+        }
+    }
+}
+
+// A served call's line, sent only while the link keeps half its room
+// after it (remoteroom), and nothing of the link's own waits, so that a
+// slow link holds its calls back rather than drop lines of theirs.
+static b32 farrelay(HostLink *l, Str line)
+{
+    return l->r && !l->queue.len && remoteroom(l->r)-line.len>=REMOTE_KEEPMAX/2 &&
+           remotetry(l->r, line);
+}
+
 // A record from a link (MAIL_OUT), or its end (MAIL_QUIT).
 static void farmail(Engine *e, Arena scratch, HostLink *l, Record r)
 {
@@ -628,6 +679,7 @@ static void farmail(Engine *e, Arena scratch, HostLink *l, Record r)
     if (r.type == MAIL_QUIT) {
         l->r     = 0;
         l->state = l->state==RS_FAILED ? RS_FAILED : RS_CLOSED;
+        relaydropfar(e, l);
         farfailall(e, scratch, l);
         return;
     }
@@ -646,22 +698,34 @@ static void farmail(Engine *e, Arena scratch, HostLink *l, Record r)
         if (l->state == RS_UP) {
             l->downat = 0;
             l->heard  = 1;
-            l->taskok = 0;
+            l->taskok  = 0;
+            l->relayok = 0;
             for (Json *c = jsonget(j, "caps")->child; c; c = c->next) {
-                l->taskok |= jsonstr(c) == "task.remote";
+                l->taskok  |= jsonstr(c) == "task.remote";
+                l->relayok |= jsonstr(c) == "relay";
             }
+            faroffer(e, scratch, l);
             farflush(e, scratch, l);
         } else if (l->state == RS_DOWN) {
+            // Its host fails the calls it relayed: so do we
             l->downat = l->downat ? l->downat : now;
+            relaydropfar(e, l);
         } else if (l->state == RS_FAILED) {
             l->coolby = now + FAR_COOL;
             l->ending = 1;
+            relaydropfar(e, l);
             farfailall(e, scratch, l);
         } else if (l->state == RS_CLOSED) {
             l->ending = 1;
+            relaydropfar(e, l);
             farfailall(e, scratch, l);
         }
     } break;
+    case EV_RELAY: {
+        // A model call of a subagent there, made here
+        Str origin = concat(&scratch, "far:", l->name);
+        relayserve(e, scratch, j, jsonint(jsonget(j, "rid"), 0), origin, l);
+    } return;
     case EV_REPLY: {
         i64 id = jsonint(jsonget(j, "id"), 0);
         for (HostKid *k = l->kids; id && k; k = k->next) {
@@ -791,6 +855,7 @@ static b32 farstart(Session *s, Arena scratch, iz k, Args *args, TaskRun *t)
     ask.prefer     = farprefer(&scratch, s->home, s->homemodel);
     ask.via        = h.wsl.len ? Str("wsl") : Str("ssh");
     ask.distro     = h.wsl;
+    ask.relay      = l->token;
     ask.prompt     = args->prompt;
     kid->line   = farline(&l->perm, &ask);
     kid->next   = l->kids;

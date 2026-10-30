@@ -200,6 +200,7 @@ struct Remote {
     b32               redeploy; // deploy once this stream ends
     i32               cancel;   // stops a deployment (atomic)
     i32               asked;    // REMOTE_CLOSE and others (atomic)
+    iz                room;     // the link's, as of the last pass (atomic)
 };
 
 static void remoteemit(Remote *r, Str line)
@@ -1105,6 +1106,9 @@ static void remotethread(void *arg)
             remotedown(r, scratch, r->why, -1);  // closing: the end
         }
         remoteflush(r, scratch, now);
+        Link *l    = &r->link;
+        iz    room = !r->live || !r->hellook || l->qcount>=l->keepcount/2 ? 0 : linkroom(l);
+        __atomic_store_n(&r->room, room, __ATOMIC_RELEASE);
     }
 }
 
@@ -1168,6 +1172,13 @@ static b32 remotecmd(Remote *r, Str line)
 static b32 remotetry(Remote *r, Str line)
 {
     return line.len<=mailmax(r->in) && mailpost(r->in, MAIL_CMD, 0, line, 0);
+}
+
+// Bytes the link had room for when last looked at, from any thread: 0
+// while it is down, or holds many frames.
+static iz remoteroom(Remote *r)
+{
+    return __atomic_load_n(&r->room, __ATOMIC_ACQUIRE);
 }
 
 // Ask the remote's thread for something, from any thread, never

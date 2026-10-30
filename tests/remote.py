@@ -2030,7 +2030,7 @@ fake_provider.SCENARIOS["far_background"] = sc_far_sleep
 fake_provider.SCENARIOS["far_background_b"] = sc_far_flag_b
 fake_provider.SCENARIOS["far_attend"] = sc_far_sleep
 fake_provider.SCENARIOS["far_attend_b"] = sc_far_ask_b
-for _name in ("far_old", "far_never", "far_wsl"):
+for _name in ("far_old", "far_never", "far_wsl", "relay_far"):
     fake_provider.SCENARIOS[_name] = sc_far_task
     fake_provider.SCENARIOS[_name + "_b"] = sc_far_task_b
 
@@ -2870,6 +2870,39 @@ def relay_offer(t):
             kid.get("template.enable_thinking") == "false" and "max_concurrent" not in kid
             and "like" not in kid, f"kid {kid}")
     t.check(o.get("endpoint") == "fake", f"default {o.get('endpoint')}")
+
+
+@scenario
+def relay_far(t):
+    """A subagent on a thin host runs on its parent's models: the link
+    offers them for its own subagents alone, and makes their calls. A
+    session there that the link did not make pauses."""
+    thinconfig(t)
+    f = Far(t, "relay_far")
+    try:
+        sid = f.parent()
+        end = f.ends(sid)
+        t.check(end.get("why") == "done", f"turn end {end}")
+        te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check([report(r.get("text", "")) for r in te] == ["Done (ssh): First job.",
+                                                           "Done (ssh): Second job."],
+                f"reports {[r.get('text') for r in te]}")
+        kids = f.ykids()
+        t.check(len(kids) == 2 and all(len(k.get("relay", "")) == 16 for k in kids),
+                f"y's sessions {kids}")
+        sent = fake_provider.STATE.log(fake_provider.second(f.model))
+        t.check(len(sent) == 2, f"the subagents' calls, made here: {len(sent)}")
+
+        c = Client(t)
+        c.attach(reconnect=True)
+        c.call("hello")
+        r = c.call("new", cwd=t.work, prompt="go")
+        t.check(r.get("ok") == 1, f"new: {r}")
+        c.stream.wait(lambda x: x.get("ev") == "live" and x.get("sid") == r["sid"] and
+                      x.get("state") == "relay", what="not the link's: paused")
+        c.call("cancel", sid=r["sid"])
+    finally:
+        f.quit()
 
 
 def lanaddress(host):
