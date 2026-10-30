@@ -607,6 +607,7 @@ static u32 livecolor(Palette *p, i32 state)
     case LIVE_CLOSED:  return p->dim;
     case LIVE_ASK:
     case LIVE_QUEUED:
+    case LIVE_RELAY:
     case LIVE_BACKOFF: return p->amber;
     case LIVE_ERROR:   return p->bad;
     }
@@ -634,7 +635,8 @@ static Str livelabel(View *v, i32 state)
     }
     return state==LIVE_TASK     ? Str("subagents") :
            state==LIVE_MCP      ? Str("starting MCP servers") :
-           state==LIVE_WORKTREE ? Str("making the worktree") : livenames[state];
+           state==LIVE_WORKTREE ? Str("making the worktree") :
+           state==LIVE_RELAY    ? Str("paused: no relay") : livenames[state];
 }
 
 // A whole number with thousands separated: 12,345.
@@ -4554,6 +4556,46 @@ static void drawstrip(Gui *g)
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
         ImGui::TextUnformatted(cstr0(&a, finish(&b)));
         ImGui::PopStyleColor();
+    }
+    if (v->state == LIVE_RELAY) {
+        // A thin host's session, with no computer to make its calls
+        Buf b(&a, 128 + v->model.len);
+        print(&b, "until a computer offering ");
+        print(&b, v->model.len ? v->model : Str("its model"));
+        print(&b, " connects");
+        if (v->relayuntil > nowms) {
+            print(&b, ", for up to ");
+            print(&b, (v->relayuntil - nowms + 59999)/60000);
+            print(&b, " min");
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        ImGui::SetItemTooltip("Its host has no endpoint of its own: a computer "
+                              "connected to it makes its model calls, with its "
+                              "own endpoint and key. It resumes once one that "
+                              "offers this model connects, or the turn ends "
+                              "after the endpoint's slow_retry_budget.");
+    } else if (req && v->relaylen) {
+        // The computer making its calls, and its place in that line
+        Str machine = Str(v->relay, v->relaylen);
+        if (!g->machine.len) {
+            g->machine = relaymachine(&g->perm, cut(os_hostname(g->os, &a), '.').head);
+        }
+        b32 here = machine == g->machine;
+        Buf b(&a, 160);
+        print(&b, here ? Str("via this computer") : concat(&a, "via ", machine));
+        if (v->queuepos) {
+            print(&b, ", waiting for the endpoint: ");
+            print(&b, (i64)v->queuepos);
+            print(&b, " of ");
+            print(&b, (i64)(v->queuelen>v->queuepos ? v->queuelen : v->queuepos));
+            print(&b, " in line");
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
+        ImGui::SetItemTooltip("Its host has no endpoint of its own: %s makes its "
+                              "model calls, with its own endpoint and key.",
+                              here ? "this computer" : cstr0(&a, machine));
     }
     if (v->asks) {
         ImGui::SameLine();
@@ -8863,6 +8905,16 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         ImGui::TextWrapped("%s", cstr0(&a, h->msg));
         ImGui::PopStyleColor();
         g->failshown |= h->state == RS_FAILED;
+    }
+    if (h && live && h->thin) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
+        ImGui::TextWrapped("No endpoint of its own: its sessions run on this "
+                           "computer's models");
+        ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("Its configuration defines no endpoint, so this "
+                              "computer makes its model calls, with its own "
+                              "endpoints and keys, while connected. Define an "
+                              "endpoint there to make it independent.");
     }
     // Deploying's progress, then Deploy engine whenever not connected, or
     // Update engine for an older engine there

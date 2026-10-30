@@ -189,13 +189,14 @@ enum : i32 {
     LIVE_MCP,         // waiting for its MCP servers to start
     LIVE_WORKTREE,    // waiting for git to make its worktree
     LIVE_COMPACTING,  // a summary request runs
+    LIVE_RELAY,       // paused: no connected computer relays its calls
     LIVE_CLOSED,
     LIVE_COUNT,
 };
 
 static Str livenames[] = {
     "idle", "discover", "waiting", "streaming", "error", "backoff", "tool",
-    "ask", "queued", "task", "mcp", "worktree", "compacting", "closed",
+    "ask", "queued", "task", "mcp", "worktree", "compacting", "relay", "closed",
 };
 static_assert(countof(livenames) == LIVE_COUNT);
 
@@ -539,6 +540,9 @@ struct View {
     i32             queuepos;   // queued: the place in line, of
     i32             queuelen;
     i32             tasks;      // subagents still at work
+    u8              relay[64];  // the computer relaying its calls, if any
+    i32             relaylen;
+    i64             relayuntil; // paused for a relay: epoch ms it gives up
     Str             retrymodel; // the next attempt's model, from a retry
     b32             retryslow;  // minutes-long waits
     i32             fallback;   // switched to this fallback (1-based)
@@ -2567,6 +2571,13 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         i32  qlen     = v->queuelen;
         i32  tasks    = v->tasks;
         b32  novision = v->novision;
+        Str  relay    = jsonstr(jsonget(j, "relay"));
+        relay         = relay.len<(iz)sizeof(v->relay) ? relay : Str{};
+        b32  via      = !(relay == Str(v->relay, v->relaylen));
+        i64  until    = v->relayuntil;
+        copybytes(v->relay, relay.data, relay.len);
+        v->relaylen   = (i32)relay.len;
+        v->relayuntil = jsonint(jsonget(j, "relay_until"), 0);
         v->state    = livestate(jsonstr(jsonget(j, "state")));
         v->novision = jsonint(jsonget(j, "novision"), 0) != 0;
         v->queuepos = (i32)jsonint(jsonget(j, "queue_pos"), 0);
@@ -2587,7 +2598,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         return gauge || state!=v->state || (i64)(tps*10)!=(i64)(v->tps*10) ||
                retryat!=v->retryat || moved<-50 || moved>50 ||
                moved2<-50 || moved2>50 || qpos!=v->queuepos ||
-               qlen!=v->queuelen || tasks!=v->tasks || novision!=v->novision;
+               qlen!=v->queuelen || tasks!=v->tasks || novision!=v->novision ||
+               via || until!=v->relayuntil;
     }
 
     case EV_PROGRESS:

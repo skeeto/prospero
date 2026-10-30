@@ -476,6 +476,25 @@ struct GuiHost {
     i64        shellsid;   // its shells in flight, 0 if none
     b32        shellsgot;  // shells is an answer
     Str        shellserr;  // why the latest asking failed
+    // A thin engine's (relay.offer): what it was offered, and its calls'
+    // relay.data lines waiting for room in its link, in order
+    b32        offered;    // the main engine's offer as it is now
+    b32        thin;       // it relays its calls through its clients
+    Region    *rqmem;
+    Arena      rq;
+    Slice<Str> rqueue;
+    iz         rqbytes;
+};
+
+// A thin host's call that the main engine makes (guirelayin).
+struct GuiRelay {
+    u64 host;  // its uid
+    i64 rid;
+};
+
+enum : i32 {
+    GUI_RELAYS = 256,       // calls at once, of all hosts
+    GUI_RELAYQ = 8 << 20,   // bytes of a host's lines waiting for room
 };
 
 struct AttBox;
@@ -1124,6 +1143,14 @@ struct Gui {
     i64                quitby;     // µs: exit then regardless
     b32                closereq;   // the user asked to close the window
     i64                overflows;  // times records were lost
+    // The main engine's offer, for thin hosts, and their calls it makes
+    Str                offer;      // the latest, JSON, in offermem
+    Region            *offermem;
+    b32                offerempty; // no endpoint: nothing to offer
+    i64                offerid;    // its offer in flight
+    b32                offerstale; // ask again once that is answered
+    GuiRelay           relays[GUI_RELAYS];
+    Str                machine;    // this computer's name, as offers give it
     b32                reissuing;  // replies may be lost: send again
     i64                resyncs;
     Region            *replayr;    // log copies for resyncs
@@ -4757,6 +4784,9 @@ static b32  trashtoasted(Gui *, GuiSession *);
 static void updatestatus(Gui *, GuiHost *, b32 idle);
 static void cfgeditrun(Gui *, Arena, Str path);
 
+static void guiofferask(Gui *);
+static void onoffer(Gui *, Arena, Json *, b32);
+
 static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 {
     Json   *j   = r->root;
@@ -5006,6 +5036,19 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_MODELS:
         if (q.h && q.h->listid==id) {
             onhostlist(g, q.h, scratch, j, ok);  // a failure keeps the last
+        }
+        if (q.h==g->main && ok) {
+            guiofferask(g);  // the offer names the models listed
+        }
+        return;
+
+    case CMD_OFFER:
+        onoffer(g, scratch, j, ok);
+        return;
+
+    case CMD_RELAYOFFER:
+        if (q.h && ok) {
+            q.h->thin = jsonflag(jsonget(j, "thin"), 0);
         }
         return;
 
@@ -5807,6 +5850,324 @@ static void ondir(Gui *g, Arena a, i64 id, Json *j, b32 ok, Str err)
 
 // Apply one parsed record from a host, with scratch past its parse.
 // Returns 1 if what shows changed.
+// Relaying for thin hosts (relay.cpp)
+//
+// A remote host whose engine is thin is offered the main engine's models
+// as soon as it is up, and again as they change (relay.offer). Its relay
+// records are the calls of its sessions, which go to the main engine as
+// relay.call, by a path of their own, never cmdopen's slots, which evict.
+// The main engine's relay.data go back to the host, in order, waiting
+// while its link has less than half its room (remoteroom), up to
+// GUI_RELAYQ; past that, or when records were lost, the call ends as
+// lost both ways.
+
+// A line to the main engine, without a reply. Returns 0 if it can take
+// none now.
+static b32 guimainline(Gui *g, Arena a, Str line)
+{
+    GuiHost *h = g->main;
+    if (h->kind != GH_ENGINE) {
+        return h->r && !h->closing && remotetry(h->r, line);
+    }
+    switch (g->enginekind) {
+    case ENGINE_INPROC:
+        if (g->engine && !g->host) {
+            enginecmd(g->engine, line);
+            return 1;
+        }
+        break;
+    case ENGINE_SUBPROCESS:
+        return g->proc && os_procwrite(g->os, g->proc, concat(&a, line, "\n"));
+    }
+    return 0;
+}
+
+static Str relayorigin(Arena *a, GuiHost *h)
+{
+    Buf b(a, 32);
+    putbyte(&b, 'h');
+    print(&b, (i64)h->uid);
+    return finish(&b);
+}
+
+static GuiRelay *guirelayat(Gui *g, u64 host, i64 rid)
+{
+    for (i32 i = 0; rid && i < GUI_RELAYS; i++) {
+        if (g->relays[i].host==host && g->relays[i].rid==rid) {
+            return &g->relays[i];
+        }
+    }
+    return 0;
+}
+
+// The main engine stops a host's call, or all of them with rid 0.
+static void guirelaycancel(Gui *g, Arena a, GuiHost *h, i64 rid)
+{
+    Buf     b(&a, 128);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "cmd", "relay.call");
+    if (rid) {
+        putintkey(&w, "cid", rid);
+    }
+    putstrkey(&w, "origin", relayorigin(&a, h));
+    putintkey(&w, "cancel", 1);
+    putend(&w);
+    guimainline(g, a, finish(&b));
+    for (i32 i = 0; i < GUI_RELAYS; i++) {
+        GuiRelay *x = &g->relays[i];
+        if (x->host==h->uid && (!rid || x->rid==rid)) {
+            *x = {};
+        }
+    }
+}
+
+static b32 relaytry(GuiHost *h, Str line)
+{
+    return h->r && !h->closing && remoteroom(h->r)-line.len>=REMOTE_KEEPMAX/2 &&
+           remotetry(h->r, line);
+}
+
+// A line to a thin host, after those waiting. Returns 0 if too much
+// waits already.
+static b32 guirelayq(Gui *g, GuiHost *h, Str line)
+{
+    if (!h->rqueue.len && relaytry(h, line)) {
+        return 1;
+    } else if (h->rqbytes+line.len > GUI_RELAYQ) {
+        return 0;
+    }
+    if (!h->rqmem) {
+        h->rqmem = os_reserve(g->os, (iz)GUI_RELAYQ + (1<<20));
+        if (!h->rqmem) {
+            return 0;
+        }
+        h->rq = newarena(h->rqmem);
+    }
+    h->rqueue   = push(&h->rq, h->rqueue, clone(&h->rq, line));
+    h->rqbytes += line.len;
+    return 1;
+}
+
+// Lines waiting go as their hosts have room. Returns whether any wait.
+static b32 guirelayflush(Gui *g)
+{
+    b32 wait = 0;
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        iz n = 0;
+        for (; n<h->rqueue.len && relaytry(h, h->rqueue[n]); n++) {}
+        h->rqueue.data += n;
+        h->rqueue.len  -= n;
+        h->rqueue.cap  -= n;
+        if (!h->rqueue.len && h->rqmem) {
+            h->rq      = newarena(h->rqmem);  // nothing left in it
+            h->rqueue  = {};
+            h->rqbytes = 0;
+        }
+        wait |= h->rqueue.len > 0;
+    }
+    return wait;
+}
+
+// A call ends as lost: the host hears so, as well as it can, and the
+// main engine stops it.
+static void guirelaylost(Gui *g, Arena a, GuiHost *h, i64 rid, Str why)
+{
+    Buf     b(&a, 256 + why.len);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "cmd", "relay.data");
+    putintkey(&w, "rid", rid);
+    putkey(&w, "done");
+    putobject(&w);
+    putstrkey(&w, "err", "lost");
+    putstrkey(&w, "text", why);
+    putend(&w);
+    putend(&w);
+    if (h->r && !h->closing) {
+        remotetry(h->r, finish(&b));
+    }
+    guirelaycancel(g, a, h, rid);
+}
+
+// Every call in flight ends as lost: records of theirs may be gone.
+static void guirelaylostall(Gui *g, Arena a, Str why)
+{
+    for (i32 i = 0; i < GUI_RELAYS; i++) {
+        GuiRelay x = g->relays[i];
+        for (GuiHost *h = g->hosts; x.rid && h; h = h->next) {
+            if (h->uid == x.host) {
+                guirelaylost(g, a, h, x.rid, why);
+            }
+        }
+        g->relays[i] = {};
+    }
+}
+
+// A host went down or away: the main engine stops its calls, and what
+// waited for it goes.
+static void guirelaydrop(Gui *g, Arena a, GuiHost *h)
+{
+    b32 any = 0;
+    for (i32 i = 0; i < GUI_RELAYS; i++) {
+        any |= g->relays[i].host == h->uid;
+    }
+    if (any) {
+        guirelaycancel(g, a, h, 0);
+    }
+    if (h->rqmem) {
+        h->rq      = newarena(h->rqmem);
+        h->rqueue  = {};
+        h->rqbytes = 0;
+    }
+    h->offered = 0;
+}
+
+// A thin host's relay record: part of a call, to the main engine.
+static void guirelayin(Gui *g, GuiHost *h, Arena a, Json *j)
+{
+    i64 rid = jsonint(jsonget(j, "rid"), 0);
+    if (h->kind!=GH_REMOTE || rid<=0) {
+        return;
+    } else if (jsonflag(jsonget(j, "cancel"), 0)) {
+        if (guirelayat(g, h->uid, rid)) {
+            guirelaycancel(g, a, h, rid);
+        }
+        return;
+    }
+    i64 part = jsonint(jsonget(j, "part"), -1);
+    if (part == 0) {
+        GuiRelay *x = guirelayat(g, h->uid, rid);
+        for (i32 i = 0; !x && i < GUI_RELAYS; i++) {
+            x = g->relays[i].rid ? 0 : &g->relays[i];
+        }
+        if (!x) {
+            guirelaylost(g, a, h, rid, "this computer relays too many calls at once");
+            return;
+        }
+        *x = {h->uid, rid};
+    } else if (!guirelayat(g, h->uid, rid)) {
+        return;  // ended already
+    }
+    Buf     b(&a, 1024 + jsonstr(jsonget(j, "data")).len);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "cmd", "relay.call");
+    putintkey(&w, "cid", rid);
+    putstrkey(&w, "origin", relayorigin(&a, h));
+    for (Json *m = j->child; m; m = m->next) {
+        if (!(m->key=="rid") && !(m->key=="peer") && !(m->key=="ts") && !(m->key=="ev")) {
+            putkey(&w, m->key);
+            putjson(&w, m);
+        }
+    }
+    putend(&w);
+    if (!guimainline(g, a, finish(&b))) {
+        guirelaylost(g, a, h, rid, "this computer's engine took no call");
+    }
+}
+
+// The main engine's relay.data: to the host whose call it is.
+static void guirelayout(Gui *g, Arena a, Json *j)
+{
+    Str      origin = jsonstr(jsonget(j, "origin"));
+    i64      rid    = jsonint(jsonget(j, "cid"), 0);
+    GuiHost *h      = 0;
+    for (GuiHost *t = g->hosts; !h && t; t = t->next) {
+        Arena tmp = a;
+        h = t->kind==GH_REMOTE && relayorigin(&tmp, t)==origin ? t : 0;
+    }
+    GuiRelay *x = h ? guirelayat(g, h->uid, rid) : 0;
+    if (!x) {
+        return;  // ended already, and cancelled
+    }
+    Buf     b(&a, 1024 + jsonstr(jsonget(j, "body")).len);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "cmd", "relay.data");
+    putintkey(&w, "rid", rid);
+    for (Json *m = j->child; m; m = m->next) {
+        if (!(m->key=="cid") && !(m->key=="origin") && !(m->key=="ts") && !(m->key=="ev")) {
+            putkey(&w, m->key);
+            putjson(&w, m);
+        }
+    }
+    putend(&w);
+    if (!guirelayq(g, h, finish(&b))) {
+        guirelaylost(g, a, h, rid, "the response was relayed too slowly");
+    } else if (jsonget(j, "done")->type == JSON_OBJECT) {
+        *x = {};
+    }
+}
+
+// Ask the main engine for its offer, once at a time.
+static void guiofferask(Gui *g)
+{
+    if (g->offerid) {
+        g->offerstale = 1;
+        return;
+    } else if (g->enginekind==ENGINE_FAKE || !engineup(g) || !hostcan(g->main, "offer")) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 64);
+    EvOut w = cmdopen(g, &b, CMD_OFFER, 0, g->main);
+    g->offerid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// The offer to each thin-capable host up that lacks it as it is now.
+static void guioffersend(Gui *g)
+{
+    if (!g->offer.len || g->offerempty) {
+        return;
+    }
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        if (h->kind!=GH_REMOTE || !h->up || !h->r || h->closing || h->offered ||
+                !hostcap(h, "relay")) {
+            continue;
+        }
+        Arena a = newarena(g->cmdr);
+        Buf   b(&a, 256 + g->offer.len);
+        EvOut w = cmdopen(g, &b, CMD_RELAYOFFER, 0, h);
+        putkey(&w.json, "offer");
+        putraw(&w.json, g->offer);
+        cmdsend(g, &w, a);
+        h->offered = 1;
+    }
+}
+
+// The main engine's offer came: kept, and sent where it is new.
+static void onoffer(Gui *g, Arena a, Json *j, b32 ok)
+{
+    g->offerid = 0;
+    if (ok) {
+        Buf     b(&a, 1<<16);
+        JsonOut w = {&b};
+        Json   *o = jsonget(j, "offer");
+        putjson(&w, o);
+        Str offer = finish(&b);
+        if (!(offer == g->offer)) {
+            if (!g->offermem) {
+                g->offermem = os_reserve(g->os, (iz)8<<20);
+            }
+            if (g->offermem && offer.len <= ((iz)8<<20) - 64) {
+                Arena m = newarena(g->offermem);
+                g->offer      = clone(&m, offer);
+                g->offerempty = !jsonget(o, "endpoints")->child;
+                for (GuiHost *h = g->hosts; h; h = h->next) {
+                    h->offered = 0;
+                }
+            }
+        }
+        guioffersend(g);
+    }
+    if (g->offerstale) {
+        g->offerstale = 0;
+        guiofferask(g);
+    }
+}
+
 static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
 {
     switch (r->ev) {
@@ -5829,6 +6190,14 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
     case EV_SESSIONS:
         onsessions(g, h, r->root);
         return 1;
+    case EV_RELAY:
+        guirelayin(g, h, a, r->root);
+        return 1;
+    case EV_RELAYDATA:
+        if (h == g->main) {
+            guirelayout(g, a, r->root);
+        }
+        return 1;
     case EV_CONFIG:
         // The main engine's configuration loaded again: Settings and the
         // [ui] settings as the file now says, once no field is mid-edit
@@ -5836,6 +6205,9 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
                 jsonint(jsonget(r->root, "rev"), 0)!=jsonint(jsonget(g->cfg, "rev"), 0)) {
             g->cfgstale = 1;
             scheddirty(&g->sched);
+        }
+        if (h == g->main) {
+            guiofferask(g);  // its models for thin hosts, as they are now
         }
         return 1;
     case EV_REMOTE:
@@ -6654,8 +7026,17 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
             g->dtoasthost = 0;
         }
     }
+    if (!h->up) {
+        guirelaydrop(g, a, h);
+    }
     if (h->up && was!=RS_UP) {
         h->opens++;
+        h->thin = 0;
+        if (hostcap(h, "relay") && g->offer.len) {
+            guioffersend(g);
+        } else if (hostcap(h, "relay")) {
+            guiofferask(g);
+        }
         h->modelsid  = 0;  // its configuration may differ now
         h->modelsgot = 0;
         h->listid    = 0;  // its reply may have gone with the link
@@ -6713,6 +7094,7 @@ static void hostagain(Gui *g, GuiHost *h)
 // to connect again, at once if asked meanwhile.
 static void onhostend(Gui *g, GuiHost *h)
 {
+    guirelaydrop(g, newarena(g->cmdr), h);
     b32 again = h->reconnect;
     h->r         = 0;
     h->up        = 0;
@@ -8181,6 +8563,9 @@ static b32 gobackground(Gui *g)
             hc.toasttype  = TASK_TOAST;
             hc.toastsince = os_time(g->os);
         }
+        // Commands to the engine go through the host from now on: the
+        // calls it makes for thin hosts end here
+        guirelaylostall(g, newarena(g->cmdr), "this computer's window closed");
         Arena hp = newarena(os_reserve(g->os, (iz)1<<30));
         g->host  = hp.beg ? newhost(g->os, &hp, g->frame, &hc, &why) : 0;
         why      = g->host ? Str{} : why.len ? why : Str("out of memory");
@@ -8882,6 +9267,7 @@ static void drainmail(Gui *g, i64 now)
         } else if (m.overflow) {
             g->overflows++;
             g->reissuing = 1;
+            guirelaylostall(g, newarena(g->cmdr), "this computer's records were lost");
             for (GuiSession *s = g->sessions; s; s = s->next) {
                 if (s->view && s->host==g->hosts) s->view->lost = 1;
             }
@@ -9717,6 +10103,9 @@ static void gui_frame(Gui *g)
     }
     draftpoll(g, s);
     guigit(g);
+    if (guirelayflush(g)) {
+        schedat(s, s->now + 5000, DUE_APP);  // retried until there is room
+    }
     if (g->quitat) {
         schedat(s, g->quitat, DUE_APP);
     }
@@ -10649,6 +11038,8 @@ enum : i32 {
     CHK_WORKTREE,     // the session shown works in a worktree, on branch text...
     CHK_WTFRESH,      // the session shown, from the worktree dialog, is fresh,
                       // nested under its original
+    CHK_THIN,         // the remote r is up and thin, the Hosts pane saying so
+    CHK_VIA,          // the session shown streams via this computer
     CHK_COUNT,
 };
 
@@ -10903,6 +11294,7 @@ static Str chknames[] = {
     "the folder can have a worktree, its changes counted",
     "the session works in its worktree, on its branch",
     "the worktree session starts fresh, under its original",
+    "the remote is thin", "its calls go via this computer",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -10975,6 +11367,8 @@ enum : i32 {
     W_CHANGES,    // the Changes pane shows the session's, a file text among them
     W_WTPROBE,    // the worktree dialogs' probe answered, a name suggested
     W_WORKTREE,   // the session shown is on a branch starting with text
+    W_THIN,       // the remote r is up and thin
+    W_VIA,        // the session shown streams, relayed
 };
 
 static Str waitnames[] = {
@@ -10997,8 +11391,9 @@ static Str waitnames[] = {
     "the named remote's update", "the MCP server's state", "the MCP sign-in",
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
+    "the thin remote", "a relayed stream",
 };
-static_assert(countof(waitnames) == W_WORKTREE+1);
+static_assert(countof(waitnames) == W_VIA+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -13662,6 +14057,72 @@ static DriveOp remoteops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// A thin remote (--thin, tests/gui.py --mode thin): r's configuration
+// has no endpoint, so once up it is offered this window's models, and the
+// Hosts pane says so; a session there streams via this computer, which
+// the session bar names; its stream's link dropped mid-turn, the call is
+// lost and the turn goes on once r is back.
+static DriveOp thinops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    SHOWPANE("Hosts"),
+    {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "connect r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_THIN, 0, 0, 90000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_THIN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "thin-1-hosts"},
+    {OP_MOVE, T_SESSMENU, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NEWBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_MOVE, T_HOSTCOMBO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_HOSTITEM, 0, 0, 100, "r"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_NEWLISTED, 0, 0, 15000, ""},
+    {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
+    {OP_TEXTRCWD, 0, 0, 0, 300, ""},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 30000, ""},
+    {OP_CHECK, CHK_REMOTESESSION, 0, 0, 0, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Stream for the link."},
+    {OP_WAIT, W_VIA, 0, 0, 30000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_VIA, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "thin-2-via"},
+    {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    // The link dropped mid-stream: r fails the call as lost, and the
+    // turn goes on once r is back
+    {OP_PROMPT, 0, 0, 0, 100, "Stream for the link."},
+    {OP_WAIT, W_VIA, 0, 0, 30000, ""},
+    {OP_MARK, 0, 0, 0, 1500, ""},
+    {OP_DROPLINK, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_REMOTEDOWN, 0, 0, 10000, ""},
+    {OP_WAIT, W_REMOTEUP, 0, 0, 60000, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 90000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_SHOT, 0, 0, 0, 300, "thin-3-after"},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // Subagents on another host (--hosttask, tests/gui.py --mode hosttask):
 // the parent's engine, this window's, starts each on the remote far (the
 // Far stand-in), and the window reaches it there by the same name. One
@@ -15563,6 +16024,12 @@ static b32 drivewaitdone(Gui *g)
     case W_WORKTREE:
         return g->sess && g->sess->git.state==GITW_REPO && !g->sess->openid &&
                startswith(g->sess->git.branch, g->ops[g->drivepc-1].text);
+    case W_THIN: {
+        GuiHost *h = findhost(g, GH_REMOTE, "r");
+        return h && h->up && h->thin;
+    }
+    case W_VIA:
+        return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;
     case W_PLAN: {
         PlanFile *f = &g->plan;
         return g->sess && f->s==g->sess && !f->id && f->ver==v->planver &&
@@ -17272,6 +17739,14 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_WTPROBE:
         return ImGui::GetTopMostPopupModal() && g->wtp.got && g->wtp.ok &&
                g->wtp.dirty==(i64)g->ops[g->drivepc-1].dx && g->wtp.oid.len==40;
+    case CHK_THIN: {
+        GuiHost *h = findhost(g, GH_REMOTE, "r");
+        return h && h->up && h->thin && h->offered && g->offer.len && !g->offerempty;
+    }
+    case CHK_VIA:
+        // The view names this computer, as the session bar shows it
+        return g->sess && g->sess->host->kind==GH_REMOTE && g->machine.len &&
+               Str(v->relay, v->relaylen)==g->machine;
     case CHK_WTFRESH: {
         GuiSession *s = g->sess;
         GuiSession *o = g->wtsess;
@@ -18539,6 +19014,8 @@ static Str guiusage =
 "                 (a stand-in browser), a call from a session, Sign out\n"
 "  --hosttask     subagents on another host: opened and answered here, a\n"
 "                 Disconnect kept, Open subagent, the parent closed\n"
+"  --thin         a remote with no endpoint runs on this window's models,\n"
+"                 via this computer, across a dropped link\n"
 "  --launch       prospero DIR's checklist: DIR's session, another launch's\n"
 "                 handed off (tests/gui.py drives it), a session with no folder\n"
 "  --firstrun     a first run's layout, with nothing configured (with\n"
@@ -18721,7 +19198,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
-    b32 launch = 0, first = 0, mcp = 0, hosttask = 0, changes = 0;
+    b32 launch = 0, first = 0, mcp = 0, hosttask = 0, changes = 0, thin = 0;
     i64 history = 0;
     Str opendir = {};  // prospero DIR, as given
     i32 bench   = 0;
@@ -18770,6 +19247,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             mcp = probe = 1;
         } else if (a == "--hosttask") {
             hosttask = probe = 1;
+        } else if (a == "--thin") {
+            thin = probe = 1;
         } else if (a == "--firstrun") {
             first = probe = 1;
         } else if (a == "--compose-again") {
@@ -18842,9 +19321,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
             background || attach || remote || compose || sidebar || plan || launch ||
-            first || mcp || hosttask || changes) {
+            first || mcp || hosttask || changes || thin) {
         g->drive = 1;
-        if (hosttask) {
+        if (thin) {
+            g->ops  = thinops;
+            g->nops = countof(thinops);
+        } else if (hosttask) {
             g->ops  = hosttaskops;
             g->nops = countof(hosttaskops);
         } else if (mcp) {

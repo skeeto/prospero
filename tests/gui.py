@@ -1342,7 +1342,7 @@ class Far:
     host started here for the test. Either way, in directories of its own
     that go at the end."""
 
-    def __init__(self, args, host, url, model, nonce, ask=3):
+    def __init__(self, args, host, url, model, nonce, ask=3, thin=False):
         self.args = args
         self.host = host
         self.local = not args.ssh
@@ -1361,6 +1361,8 @@ class Far:
                                    "[host]\nidle_exit = 5\n" \
                                    "\n# A model only it has, for its sessions' picker\n" \
                                    f"[model fake:far:{nonce}]\ncontext = 100000\n"
+        if thin:
+            cfg = "# No endpoint: a thin host\n[host]\nidle_exit = 5\n"
         if self.local:
             host.mkdir(self.work)
             host.mkdir(self.state)
@@ -1437,7 +1439,7 @@ class Far:
     def env(self):
         if not self.local:
             return {}
-        elif self.args.mode == "hosttask":
+        elif self.args.mode in ("hosttask", "thin"):
             return {"PROSPERO_TEST_SSH": self.ssh, "PROSPERO_TEST_SCP": self.scp}
         elif self.windows:
             return {"PROSPERO_TEST_SSH": self.ssh}
@@ -1502,7 +1504,7 @@ def main():
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
                              "compose", "sessions", "plan", "launch", "firstrun",
-                             "mcp", "hosttask", "changes"])
+                             "mcp", "hosttask", "changes", "thin"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1524,8 +1526,8 @@ def main():
     if args.mode == "signals":
         return signals(args)
 
-    if args.mode == "hosttask" and (args.host or args.ssh):
-        ap.error("--mode hosttask runs only here, through the fake ssh")
+    if args.mode in ("hosttask", "thin") and (args.host or args.ssh):
+        ap.error(f"--mode {args.mode} runs only here, through the fake ssh")
     if args.mode == "changes" and args.host:
         ap.error("--mode changes runs only here, its repository made by git here")
     if args.mode == "changes" and not shutil.which("git"):
@@ -1659,6 +1661,10 @@ def main():
         far = Far(args, host, curl, model, nonce, ask=60)
         before += far.hostsection()
         os.environ["HOSTTASK_WORK"] = far.work
+    elif args.mode == "thin":
+        # r has no endpoint: it runs on this window's models
+        far = Far(args, host, curl, model, nonce, thin=True)
+        before += far.hostsection().replace("[remote far]", "[remote r]")
     host.write(ini, before)
 
     holder = None
@@ -1736,7 +1742,7 @@ def main():
     elif status != 0:
         problems.append(f"exit status {status}")
     out = "".join(lines)
-    if args.mode == "hosttask":
+    if args.mode in ("hosttask", "thin"):
         problems += far.close(args.keep)
     if args.mode == "remote":
         problems += summaryproblems(status, lines, "the window")
@@ -1761,7 +1767,7 @@ def main():
         else:
             print("mcp: signed in through the stand-in browser, the call sent its token")
     if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
-                     "firstrun", "mcp", "hosttask", "changes"):
+                     "firstrun", "mcp", "hosttask", "changes", "thin"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")
