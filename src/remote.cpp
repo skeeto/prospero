@@ -194,6 +194,7 @@ struct Remote {
     Str               version;  // the host's
     Str               cmds;     // and its hello's cmds and caps, as JSON
     Str               caps;     // arrays, null if it gave none
+    Str               home;     // its hello's: where ~ is there
     i32               need;     // NEED_*: why deploying would help
     b32               deploying;
     b32               deployed; // tried once: never again
@@ -223,6 +224,9 @@ static void remotestatus(Remote *r, Arena scratch, i32 state, Str msg, i64 retry
     }
     if (state==RS_UP && r->version.len) {
         putstrkey(&w.json, "version", r->version);
+    }
+    if (state==RS_UP && r->home.len) {
+        putstrkey(&w.json, "home", r->home);
     }
     if (state==RS_UP && r->cmds.len) {
         putkey(&w.json, "cmds");
@@ -806,6 +810,9 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
         }
         if (jsonstr(jsonget(rec.root, "version")) != r->version) {
             r->version = clone(&r->perm, jsonstr(jsonget(rec.root, "version")));
+        }
+        if (jsonstr(jsonget(rec.root, "home")) != r->home) {
+            r->home = clone(&r->perm, jsonstr(jsonget(rec.root, "home")));
         }
         r->cmds = remotenames(r, scratch, r->cmds, jsonget(rec.root, "cmds"));
         r->caps = remotenames(r, scratch, r->caps, jsonget(rec.root, "caps"));

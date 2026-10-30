@@ -1188,6 +1188,9 @@ def checkup(t, c, up):
     t.check({"hello", "list", "new", "open", "rename", "fork", "draft"} <= set(cmds),
             f"up names the commands: {up}")
     t.check(not [r for r in c.records if r.get("ev") == "hello"], "no hello passed on")
+    # and its home, by which the GUI knows a Windows host and shows ~
+    home = up.get("home", "")
+    t.check(home and os.path.samefile(home, os.path.expanduser("~")), f"up's home: {up}")
 
 
 @scenario

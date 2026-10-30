@@ -17882,10 +17882,15 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->sess && g->sess->host->kind==GH_LOCAL && !v->busy &&
                countrole(v, VIEW_ASSISTANT)==2;
     case CHK_REMOTEUP: {
-        // Up, with what its hello said passed on by the library
-        GuiHost *h = drivehost(g, GH_REMOTE);
+        // Up, with what its hello said passed on by the library, its
+        // home too: a Windows one, as its --rcwd has a drive, is known
+        // as such, and a path there in its home is shown with ~
+        GuiHost *h   = drivehost(g, GH_REMOTE);
+        Arena    a   = g->frame;
+        b32      win = g->driverwd.len>=2 && g->driverwd[1]==':';
         return h && h->up && h->opens==1 && h->version.len &&
-               hostcan(h, "host") && hostcan(h, "open");
+               hostcan(h, "host") && hostcan(h, "open") &&
+               hostwin(h)==win && homeshow(&a, h, concat(&a, h->home, "/x"))=="~/x";
     }
     case CHK_REMOTESESSION:
         // (the directory as given, as far as the host spells it alike)
