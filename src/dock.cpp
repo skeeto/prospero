@@ -19,6 +19,8 @@
 //             behind Transcript, and Log closed
 //   Focus     a session alone: Transcript, Todo and Plan as tabs, over
 //             Prompt
+// Compact and Focus hide Prompt's tab bar, for room; Standard, the
+// first layout, keeps it, so its menu is found.
 //
 // A saved layout is kept in the layout file (imgui.ini), a section
 // each, with a line a part in pre-order (dockwrite, dockline):
@@ -33,15 +35,17 @@
 //   Split=Y,0.72
 //   Center=Transcript
 //   Tabs=Prompt
+//   TabBar=Hidden
 //   Split=Y,0.5
 //   Tabs=*Jobs,Log,Help,Settings,Hosts
 //   Tabs=Plan,Changes
 //   Float=Metrics,0.3,0.2,0.4,0.5
 //
-// A * marks the tab in front, else the first is. Float gives a pane's
-// place: x, y, width and height. A pane not known (a layout newer than
-// this build) is skipped, and so is a pane placed again, and a leaf
-// left empty is dropped. Parts that make no whole tree, or no one
+// A * marks the tab in front, else the first is. TabBar=Hidden hides the
+// tab bar of the leaf before it, as its menu's Hide tab bar does. Float
+// gives a pane's place: x, y, width and height. A pane not known (a
+// layout newer than this build) is skipped, and so is a pane placed
+// again, and a leaf left empty is dropped. Parts that make no whole tree, or no one
 // Center, refuse the layout (dockdone).
 //
 // This is free and unencumbered software released into the public domain.
@@ -154,6 +158,7 @@ struct DockPart {
     i32 ntabs;
     i32 front;             // a leaf's pane in front, -1 for its first
     b32 central;           // a leaf's: the dock space's central node
+    b32 bare;              // a leaf's: its tab bar hidden
 };
 
 struct DockRect {
@@ -276,6 +281,12 @@ static void dockline(DockLayout *l, Str key, Str val)
             }
         }
 
+    } else if (key == "TabBar") {
+        DockPart *p = l->nparts ? l->parts+l->nparts-1 : 0;
+        if (p && p->kind==DOCK_LEAF) {
+            p->bare = trim(val) == "Hidden";
+        }
+
     } else if (key == "Float") {
         Cut c    = cut(val, ',');
         i32 pane = panenamed(trim(c.head));
@@ -373,6 +384,7 @@ static void dockwrite(Buf *b, DockLayout *l)
                 print(b, front ? Str("*") : Str(""));
                 print(b, panestr(p->tabs[t]));
             }
+            print(b, p->bare ? Str("\nTabBar=Hidden") : Str(""));
         }
         putbyte(b, '\n');
     }
@@ -485,6 +497,7 @@ static DockLayout dockpreset(i32 preset)
         docksplit(&l, DOCK_Y, 1 - LAYOUT_PROMPT);
         dockline(&l, "Center", "*Transcript,Plan,Changes,Help,Settings,Hosts");
         dockline(&l, "Tabs", "Prompt");
+        dockline(&l, "TabBar", "Hidden");
         l.keep = extras;
         break;
     case PRESET_FOCUS:
@@ -493,6 +506,7 @@ static DockLayout dockpreset(i32 preset)
         dockline(&l, "Center", "*Transcript,Todo,Plan,Changes,Sessions,Jobs,Log,"
                                "Help,Settings,Hosts");
         dockline(&l, "Tabs", "Prompt");
+        dockline(&l, "TabBar", "Hidden");
         break;
     }
     return l;

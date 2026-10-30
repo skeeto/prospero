@@ -15590,6 +15590,7 @@ static b32 layoutbackcheck(Gui *g, Str name)
         DockPart *b = want->parts + i;
         f32 off = a->share - b->share;
         ok = a->kind==b->kind && a->ntabs==b->ntabs && a->central==b->central &&
+             a->bare==b->bare &&
              off<0.01f && off>-0.01f &&
              dockfront(a, got.shown)==dockfront(b, want->shown);
         for (i32 t = 0; ok && t < a->ntabs; t++) {
@@ -15644,12 +15645,13 @@ static b32 compactcheck(Gui *g)
     return dockplacescheck(g, places, countof(places)) &&
            top->IsCentralNode() && tabselected("Todo") &&
            tabselected("Transcript") && g->panes[PANE_JOBS] &&
-           g->panes[PANE_PLAN] && !g->panes[PANE_LOG];
+           g->panes[PANE_PLAN] && !g->panes[PANE_LOG] &&
+           center->ChildNodes[1]->IsHiddenTabBar();
 }
 
 // The Focus layout, as applied: Transcript, Todo and Plan as tabs in
-// that order over Prompt, only those four shown, every pane's home on
-// top but Prompt's.
+// that order over Prompt, its tab bar hidden, only those four shown,
+// every pane's home on top but Prompt's.
 static b32 focuscheck(Gui *g)
 {
     ImGuiDockNode *root = ImGui::DockBuilderGetNode(g->dockspace);
@@ -15681,7 +15683,8 @@ static b32 focuscheck(Gui *g)
     if (!ok) {
         guilog(g, "drive: the focus layout's tabs are not in order");
     }
-    return ok && top->IsCentralNode() && tabselected("Transcript");
+    return ok && top->IsCentralNode() && tabselected("Transcript") &&
+           bottom->IsHiddenTabBar();
 }
 
 // The compose box's text, the session shown's draft.

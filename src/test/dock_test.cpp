@@ -63,7 +63,8 @@ static void test_dock(Test *t)
            "Tabs=*Todo,Jobs,Log\n"
            "Split=Y,0.72\n"
            "Center=*Transcript,Plan,Changes,Help,Settings,Hosts\n"
-           "Tabs=Prompt\n");
+           "Tabs=Prompt\n"
+           "TabBar=Hidden\n");
 
     // Focus shows four panes, and is home to the rest above the prompt
     DockLayout focus = dockpreset(PRESET_FOCUS);
@@ -71,7 +72,8 @@ static void test_dock(Test *t)
            "Shown=Transcript,Prompt,Todo,Plan\n"
            "Split=Y,0.72\n"
            "Center=*Transcript,Todo,Plan,Changes,Sessions,Jobs,Log,Help,Settings,Hosts\n"
-           "Tabs=Prompt\n");
+           "Tabs=Prompt\n"
+           "TabBar=Hidden\n");
 
     // Every preset is whole, places every pane but the metrics once,
     // and reads back as written; only Focus hides Help and the rest
@@ -133,6 +135,22 @@ static void test_dock(Test *t)
                "Float=Help,0.1,0.2,0.3,0.4,9\n"),
            "Shown=\nSplit=Y,0.6\nCenter=Transcript\nTabs=Prompt\n"
            "Float=Help,0.1,0.2,0.3,0.4\n");
+
+    // A tab bar hidden is its leaf's, the leaf just before: on a split
+    // it is skipped, and a value but Hidden shows it
+    expect(t, "dock.tabbar", dockagain(&a,
+               "TabBar=Hidden\n"
+               "Split=Y,0.6\n"
+               "TabBar=Hidden\n"
+               "Center=Transcript\n"
+               "TabBar=Shown\n"
+               "Tabs=Prompt\n"
+               "TabBar=Hidden\n"),
+           "Shown=\n"
+           "Split=Y,0.6\n"
+           "Center=Transcript\n"
+           "Tabs=Prompt\n"
+           "TabBar=Hidden\n");
 
     // What is refused
     expect(t, "dock.empty", dockagain(&a, ""), "!");

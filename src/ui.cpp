@@ -10872,8 +10872,12 @@ static void applypart(DockLayout *l, i32 *i, ImGuiID id, u32 shown, ImGuiID *cen
             ImGui::DockBuilderDockWindow(panenames[p->tabs[t]], id);
             paneorder(p->tabs[t], t);
         }
-        i32 front = dockfront(p, shown);
-        ImGui::DockBuilderGetNode(id)->SelectedTabId = front<0 ? 0 : panetab(front);
+        i32            front = dockfront(p, shown);
+        ImGuiDockNode *n     = ImGui::DockBuilderGetNode(id);
+        n->SelectedTabId = front<0 ? 0 : panetab(front);
+        if (p->bare) {
+            n->SetLocalFlags(n->LocalFlags | ImGuiDockNodeFlags_HiddenTabBar);
+        }
         *center = p->central ? id : *center;
         return;
     }
@@ -11022,6 +11026,7 @@ static void captureparts(DockLayout *l, ImGuiDockNode *n, ImGuiDockNode **home)
         return;
     }
     p->central = n->IsCentralNode();
+    p->bare    = (n->LocalFlags & ImGuiDockNodeFlags_HiddenTabBar) != 0;
     i32 ntabs  = n->TabBar ? n->TabBar->Tabs.Size : n->Windows.Size;
     for (i32 i = 0; i < ntabs; i++) {
         ImGuiWindow *w    = n->TabBar ? n->TabBar->Tabs[i].Window : n->Windows[i];
