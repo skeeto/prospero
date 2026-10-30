@@ -76,7 +76,7 @@ travels as its difference from the session's last one, compressed.
 
 While a call runs this way, the session bar says "via this computer",
 or the name of the computer relaying it. With no computer connected
-that offers the session's model, its turn pauses ("paused: no relay",
+that offers the session's endpoint, its turn pauses ("paused: no relay",
 in amber) and goes on once one connects, for at most that endpoint's
 `slow_retry_budget` (two hours unless set), and then ends. A response
 cut off by a lost connection goes on from what was shown, as after a

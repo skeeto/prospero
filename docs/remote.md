@@ -80,8 +80,9 @@ thin engine keeps up to eight offers, a gone client's too, as layers
 of its configuration under the user's file, each endpoint at
 `relay://NAME` (`relay+anthropic://NAME` for kind anthropic). A model
 call to one of them goes back as `relay` records, part by part as the
-host makes room, to a client that offers that endpoint with that kind
-and model: the session's last, else the newest. The client's own
+host makes room, to a client that offers that endpoint with that kind:
+the session's last, else the newest whose listing has the model, else
+the newest (a server may take names it does not list). The client's own
 engine makes it (`relay.call`), admitted in line with its own
 sessions, at the API's paths alone, and answers with `relay.data`. A
 turn's body goes as a delta against the session's last one to the

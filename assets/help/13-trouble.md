@@ -40,9 +40,9 @@ running. A server whose certificate is not trusted fails at once,
 saying why.
 
 **"paused: no relay".** The session is on a remote with no endpoint of
-its own, and no computer connected to it offers the session's model
-([Hosts and remotes](help:hosts)). Connect to the remote from a
-window whose configuration has that model, and the turn goes on. It
+its own, and no computer connected to it offers the session's
+endpoint ([Hosts and remotes](help:hosts)). Connect to the remote from
+a window whose configuration has that endpoint, and the turn goes on. It
 waits at most the endpoint's `slow_retry_budget`.
 
 **A remote host fails to connect.** The Hosts pane, and the host's

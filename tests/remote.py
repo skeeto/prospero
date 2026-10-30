@@ -2421,9 +2421,9 @@ def thinconfig(t, extra=""):
         f.write("[host]\n" + extra)
 
 
-def offer(t, model, machine="testbox", budget=None, name="fake", search=0):
+def offer(t, model, machine="testbox", budget=None, name="fake", search=0, listed=()):
     ep = {"name": name, "kind": "openai", "first_byte_timeout": "5",
-          "idle_timeout": "5", "progress_timeout": "10", "models": []}
+          "idle_timeout": "5", "progress_timeout": "10", "models": list(listed)}
     if budget:
         ep["slow_retry_budget"] = str(budget)
     return {"machine": machine, "endpoint": name, "model": model, "endpoints": [ep],
@@ -2565,6 +2565,26 @@ def relay_turn(t):
         live = [x for x in c.all() if x.get("ev") == "live" and x.get("sid") == sid
                 and x.get("relay")]
         t.check(live and live[0]["relay"] == "testbox", "live names the relay")
+    finally:
+        rl.stop = True
+
+
+@scenario
+def relay_unlisted(t):
+    """An offer whose listing of the endpoint leaves out the session's
+    model still relays it: an endpoint may serve names it does not list
+    (llama-server lists its file, and aliases go unlisted)."""
+    thinconfig(t)
+    model = t.model("remote_tool")
+    c, rl = relayclient(t, model, listed=["model.gguf"])
+    try:
+        r = c.call("new", cwd=t.work, prompt="go")
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        t.check(finaltext(c.all(), sid).startswith("w0 w1"), "the answer")
     finally:
         rl.stop = True
 

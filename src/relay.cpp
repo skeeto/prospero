@@ -553,26 +553,38 @@ static void relaykeep(Engine *e, Str key, i64 peer, Str body)
 
 // The thin side's calls
 
-// Whether a computer may relay the session's request at ep: here, not
-// away, offering the endpoint by name with its kind, and the model, or
-// no list of models for it.
-static b32 relayeligible(RelayPeer *p, Endpoint *ep, Str model, Str own)
+// A computer's offer of ep, by name and kind, or null.
+static RelayEp *relayepof(RelayPeer *p, Endpoint *ep)
 {
-    if (p->away || p->gone || (p->own.len && !(p->own==own))) {
-        return 0;
-    }
     b32 an = ep->kind == EP_ANTHROPIC;
     for (iz i = 0; i < p->eps.len; i++) {
         RelayEp *x = &p->eps[i];
         if (x->name==ep->relay && x->anthropic==an) {
-            b32 has = !x->models.len || !model.len;
-            for (iz k = 0; !has && k < x->models.len; k++) {
-                has = x->models[k] == model;
-            }
-            return has;
+            return x;
         }
     }
     return 0;
+}
+
+// Whether a computer's offer of ep lists the model, or lists none.
+static b32 relaylists(RelayPeer *p, Endpoint *ep, Str model)
+{
+    RelayEp *x   = relayepof(p, ep);
+    b32      has = !x->models.len || !model.len;
+    for (iz k = 0; !has && k < x->models.len; k++) {
+        has = x->models[k] == model;
+    }
+    return has;
+}
+
+// Whether a computer may relay the session's request at ep: here, not
+// away, and offering the endpoint by name with its kind. Its list of
+// models does not decide it, since an endpoint may serve names it does
+// not list (an alias, or llama-server, which lists its file).
+static b32 relayeligible(RelayPeer *p, Endpoint *ep, Str own)
+{
+    return !p->away && !p->gone && (!p->own.len || p->own==own) &&
+           relayepof(p, ep);
 }
 
 // A listing of the models that computers here offer at ep, as /v1/models
@@ -641,18 +653,22 @@ static i64 relaysearcher(Engine *e, Session *s)
 }
 
 // Choose the computer for the session's next request at ep: the one it
-// used last, if it still may, else the newest offer that may. Returns
-// 0 if none may.
+// used last, if it still may, else the newest offer that may and lists
+// the model, else the newest that may. Returns 0 if none may.
 static b32 relaychoose(Session *s, Endpoint *ep)
 {
     Engine    *e     = s->e;
     Str        model = reqmc(s)->name;
     RelayPeer *best  = 0;
+    i32        rank  = 0;  // 3 the last used, 2 listing the model, else 1
     for (RelayPeer *p = e->relay->peers; p; p = p->next) {
-        if (relayeligible(p, ep, model, s->rrelay) &&
-                (!best || p->peer==s->relaypeer ||
-                 (best->peer!=s->relaypeer && p->seq>best->seq))) {
+        if (!relayeligible(p, ep, s->rrelay)) {
+            continue;
+        }
+        i32 k = p->peer==s->relaypeer ? 3 : relaylists(p, ep, model) ? 2 : 1;
+        if (k>rank || (k==rank && p->seq>best->seq)) {
             best = p;
+            rank = k;
         }
     }
     if (!best) {
@@ -699,7 +715,7 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     Str    body = req->body;
     if (!peer && ep) {
         for (RelayPeer *p = r->peers; p; p = p->next) {
-            if (relayeligible(p, ep, {}, {}) && (!peer || p->seq>relaypeerbynum(e, peer)->seq)) {
+            if (relayeligible(p, ep, {}) && (!peer || p->seq>relaypeerbynum(e, peer)->seq)) {
                 peer = p->peer;
             }
         }
