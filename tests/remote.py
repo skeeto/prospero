@@ -91,7 +91,17 @@ def sc_remote_big(model, n, req):
     yield from finish(model)
 
 
+def sc_remote_search(model, n, req):
+    """A web search, then what it found."""
+    if n == 0:
+        yield from fake_provider.tool(model, n, "web_search", {"query": "widgets"})
+    else:
+        yield from fake_provider.answer(model, "Heard: " + " | ".join(
+            fake_provider.tool_results(req)))
+
+
 fake_provider.SCENARIOS["remote_slow"] = sc_remote_slow
+fake_provider.SCENARIOS["remote_search"] = sc_remote_search
 fake_provider.SCENARIOS["remote_tool"] = sc_remote_tool
 fake_provider.SCENARIOS["remote_big"] = sc_remote_big
 
@@ -2408,12 +2418,13 @@ def thinconfig(t, extra=""):
         f.write("[host]\n" + extra)
 
 
-def offer(t, model, machine="testbox", budget=None, name="fake"):
+def offer(t, model, machine="testbox", budget=None, name="fake", search=0):
     ep = {"name": name, "kind": "openai", "first_byte_timeout": "5",
           "idle_timeout": "5", "progress_timeout": "10", "models": []}
     if budget:
         ep["slow_retry_budget"] = str(budget)
     return {"machine": machine, "endpoint": name, "model": model, "endpoints": [ep],
+            "search": search,
             "models": [{"name": model, "settings": {"context": "100000"}}]}
 
 
@@ -2431,6 +2442,7 @@ class Relayer:
         self.seen = 0
         self.stop = False
         self.mute = False     # takes calls, answers none
+        self.found = "FOUND"  # a search's text, then its query
         threading.Thread(target=self.run, daemon=True).start()
 
     def send(self, obj):
@@ -2477,6 +2489,13 @@ class Relayer:
         with self.lock:
             self.calls.append((head, body))
         if self.mute:
+            return
+        if head["path"] == "search":
+            text = json.dumps({"status": "ok", "searches": 1,
+                               "text": f"{self.found} {json.loads(body)['query']}"})
+            self.send({"rid": rid, "head": {"status": 200, "headers": ""}})
+            self.send({"rid": rid, "body": base64.b64encode(text.encode()).decode()})
+            self.send({"rid": rid, "done": {"err": "ok", "text": ""}})
             return
         host, port = self.t.args.url.split("//")[1].rstrip("/").split(":")
         try:
@@ -2835,6 +2854,8 @@ def relay_serve(t):
     t.check(d["err"] == "connect" and "may make" in d["text"], f"path: {d}")
     d = sv.done(sv.call(b2, endpoint="nowhere", model=model))
     t.check(d["err"] == "connect" and "nowhere" in d["text"], f"endpoint: {d}")
+    d = sv.done(sv.call(b'{"query":"x"}', path="search", endpoint="", keep=0))
+    t.check(d["err"] == "connect" and "off here" in d["text"], f"no search: {d}")
 
     # Cancelled while it streams
     e = sv.call(chatbody(model, "slow"), model=model)
@@ -2843,6 +2864,59 @@ def relay_serve(t):
     c.stream.command({"cmd": "relay.call", "cid": e, "origin": "thin", "cancel": 1})
     d = sv.done(e)
     t.check(d["err"] == "cancel", f"cancel: {d}")
+
+
+@scenario
+def relay_search(t):
+    """A thin host's web_search runs on a computer that offers to search,
+    as a relayed call; with none that searches, the tool is not there."""
+    thinconfig(t, "[web]\nask = false\n")
+    model = t.model("remote_search")
+    c, rl = relayclient(t, model, search=1)
+    try:
+        r = c.call("new", cwd=t.work, prompt="go")
+        sid = r["sid"]
+        end = c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                            timeout=30, what="turn.end")
+        t.check(end.get("why") == "done", f"turn.end {end}")
+        te = [r for r in c.all() if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(len(te) == 1 and te[0]["status"] == "ok" and te[0]["text"] == "FOUND widgets",
+                f"tool.end {te}")
+        s = [(h, b) for h, b in rl.calls if h["path"] == "search"]
+        t.check(len(s) == 1 and json.loads(s[0][1]) == {"query": "widgets"} and
+                s[0][0]["endpoint"] == "", f"the search relayed {s}")
+        t.check(finaltext(c.all(), sid) == "Heard: FOUND widgets", "the answer")
+
+        # An offer without search: no web_search
+        c.call("relay.offer", offer=offer(t, model))
+        r = c.call("new", cwd=t.work, prompt="go")
+        sid = r["sid"]
+        c.stream.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                      timeout=30, what="turn.end")
+        q = fake_provider.STATE.log(model)
+        tools = [x["function"]["name"] for x in q[-1]["body"].get("tools", [])]
+        t.check(tools and "web_search" not in tools, f"tools {tools}")
+    finally:
+        rl.stop = True
+
+
+@scenario
+def relay_search_serve(t):
+    """An engine runs a thin engine's web search with its own [web], and
+    answers with the result."""
+    t.write_config(t.args.url, f"[web]\nsearch = searxng\nurl = {t.args.url}/searxng/\n")
+    c = Client(t)
+    c.attach()
+    c.call("hello")
+    sv = Served(t, c)
+    body = json.dumps({"query": f"widgets {t.nonce}"}).encode()
+    a = sv.call(body, path="search", endpoint="", keep=0)
+    d = sv.done(a)
+    t.check(d["err"] == "ok", f"searched: {d}")
+    res = json.loads(sv.text(a))
+    t.check(res["status"] == "ok" and res["searches"] == 1 and
+            "Widget docs" in res["text"] and "--- begin web content" in res["text"],
+            f"result {res}")
 
 
 @scenario

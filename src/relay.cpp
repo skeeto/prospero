@@ -23,6 +23,11 @@
 // and answers with relay.data records, held back while its client's
 // inbox is too full for them (mailroom).
 //
+// A thin engine whose [web] search is not set searches the same way,
+// through a computer that offers to: a call to the path "search" with
+// the query, which that computer runs with its own [web] settings and
+// answers with the tool's result, as JSON, for the agent to read.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i32 {
@@ -160,6 +165,9 @@ struct RelayServe {
     Str         err;      // done's, "ok" or another
     Str         text;
     b32         finished; // done was sent: it goes once its request has
+    b32         search;   // a web search, run with this engine's [web]
+    WebRun     *web;      // which runs now
+    i64         webby;    // until this deadline (ticks)
 };
 
 struct Relay {
@@ -604,6 +612,34 @@ static b32 relaylisting(Engine *e, Buf *b, Endpoint *ep)
     return any;
 }
 
+// Whether a connected computer offers to search.
+static b32 relaysearches(Engine *e)
+{
+    for (RelayPeer *p = e->relay->peers; p; p = p->next) {
+        if (p->search && !p->gone) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The computer to run a web search for session s (or none): the one its
+// model calls went to last, if it searches and may, else the newest
+// offer that does. 0 if none.
+static i64 relaysearcher(Engine *e, Session *s)
+{
+    Str        own  = s ? s->rrelay : Str{};
+    i64        last = s ? s->relaypeer : 0;
+    RelayPeer *best = 0;
+    for (RelayPeer *p = e->relay->peers; p; p = p->next) {
+        b32 may = p->search && !p->away && !p->gone && (!p->own.len || p->own==own);
+        if (may && (!best || p->peer==last || (best->peer!=last && p->seq>best->seq))) {
+            best = p;
+        }
+    }
+    return best ? best->peer : 0;
+}
+
 // Choose the computer for the session's next request at ep: the one it
 // used last, if it still may, else the newest offer that may. Returns
 // 0 if none may.
@@ -649,17 +685,19 @@ static void relayfailpeer(Engine *e, RelayPeer *p, Str why)
 }
 
 // Start relaying a request for session s (or none), to the computer its
-// gate chose. Never fails here: a failure ends it at the next pass.
+// gate chose, or with no ep, a web search, to one that searches. Never
+// fails here: a failure ends it at the next pass.
 static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
                              Session *s, b32 keep, Arena scratch)
 {
     Relay *r    = e->relay;
-    Str    pre  = concat(&scratch, ep->url, "/");
-    Str    path = startswith(req->url, pre) ? cuthead(req->url, pre.len) : Str{};
-    i64    peer = s ? s->relaypeer : 0;
+    Str    pre  = ep ? concat(&scratch, ep->url, "/") : Str{};
+    Str    path = !ep ? Str("search") :
+                  startswith(req->url, pre) ? cuthead(req->url, pre.len) : Str{};
+    i64    peer = !ep ? relaysearcher(e, s) : s ? s->relaypeer : 0;
     Str    sid  = s ? s->sid : Str{};
     Str    body = req->body;
-    if (!peer) {
+    if (!peer && ep) {
         for (RelayPeer *p = r->peers; p; p = p->next) {
             if (relayeligible(p, ep, {}, {}) && (!peer || p->seq>relaypeerbynum(e, peer)->seq)) {
                 peer = p->peer;
@@ -702,14 +740,14 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     c->id        = req->id;
     c->peer      = peer;
     c->sid       = clone(&a, sid);
-    c->endpoint  = clone(&a, ep->relay);
+    c->endpoint  = ep ? clone(&a, ep->relay) : Str{};
     c->path      = clone(&a, path);
     c->method    = clone(&a, req->method);
     c->accept    = clone(&a, cut(cut(cuthead(req->headers,
                                  find(req->headers, "Accept: ")+8), '\r').head, '\n').head);
-    c->model     = s ? clone(&a, reqmc(s)->name) : Str{};
+    c->model     = s && ep ? clone(&a, reqmc(s)->name) : Str{};
     c->readms    = req->readms;
-    c->anthropic = ep->kind == EP_ANTHROPIC;
+    c->anthropic = ep && ep->kind==EP_ANTHROPIC;
     c->keep      = keep && sid.len;
     c->base      = base;
     c->len       = body.len;
@@ -727,6 +765,7 @@ static RelayCall *relaystart(Engine *e, Endpoint *ep, HttpReq *req,
     if (!p || p->away || p->gone || !path.len || body.len>relaybodymax()) {
         relayend(c, HTTP_ELOST, !path.len ? Str("not a relayed URL") :
                  body.len>relaybodymax() ? Str("the request is too large to relay") :
+                 !ep ? Str("no connected computer runs web searches now") :
                  Str("no connected computer relays it"));
     }
     RelayCall **tail = &r->calls;
@@ -1079,7 +1118,11 @@ static RelayServe *relayservebycid(Engine *e, Str origin, i64 cid)
 
 static void relayservecancel(Engine *e, RelayServe *v)
 {
-    if (v->http) {
+    if (v->web) {
+        webfree(e, v->web);
+        v->web = 0;
+        relayfinish(v, "cancel", "cancelled");
+    } else if (v->http) {
         os_httpcancel(e->os, v->http);  // its HTTP_DONE ends it
     } else {
         relayrelease(e, v);
@@ -1103,6 +1146,64 @@ static EvOut relaydatabegin(Engine *e, Buf *b, HostLink *far, i64 cid, Str origi
 }
 
 static b32 farrelay(HostLink *, Str);
+
+// A thin engine's web search, run as one of a session's is, but with no
+// session: its records come by relayrecord, its deadline by relaytick.
+static void relaysearch(Engine *e, Arena scratch, RelayServe *v)
+{
+    JsonDoc d     = jsonparse(&scratch, v->body);
+    Str     query = jsonstr(jsonget(d.root, "query"));
+    Region *mem   = query.len ? os_reserve(e->os, WEB_REGION) : 0;
+    if (!mem) {
+        relayfinish(v, "connect", query.len ? Str("out of memory") : Str("no query"));
+        return;
+    }
+    Arena   a = newarena(mem);
+    WebRun *w = alloc<WebRun>(&a);
+    w->region  = mem;
+    w->arena   = a;
+    w->v       = v;
+    w->tool    = TOOL_WEBSEARCH;
+    w->service = websearchservice(e);
+    w->query   = clone(&w->arena, query);
+    Str why = {};
+    if (w->service == WEBS_ANTHROPIC) {
+        why = webanthropicep(e, &w->arena, &w->ep, &w->model);
+    }
+    why = why.len ? why : websend(e, w, scratch);
+    if (why.len) {
+        relayfinish(v, "connect", why);  // before its arena goes
+        webfree(e, w);
+        return;
+    }
+    v->web   = w;
+    v->webby = os_ticks(e->os) + (w->service==WEBS_ANTHROPIC ? 2*e->minute : e->minute/2);
+}
+
+// A relayed search ended: its result, as the body of a response.
+static void relaysearched(Engine *e, Arena scratch, RelayServe *v, Str status,
+                          Str text, i32 searches)
+{
+    Buf     b(&scratch, 256 + 2*text.len);
+    JsonOut w = {&b};
+    putobject(&w);
+    putstrkey(&w, "status", status);
+    putstrkey(&w, "text", text);
+    putintkey(&w, "searches", searches);
+    putend(&w);
+    Str body = finish(&b);
+    if (body.len > RELAY_HOLD) {
+        body = "{\"status\":\"error\",\"text\":\"Not done: the result was too large.\"}";
+    }
+    webfree(e, v->web);  // after the text, which may be its
+    v->web     = 0;
+    v->status  = 200;
+    v->headers = "Content-Type: application/json\r\n";
+    v->head    = 1;
+    copybytes(v->hold, body.data, body.len);
+    v->held    = body.len;
+    relayfinish(v, "ok", {});
+}
 
 // Part of a thin engine's call, which its client passed on (relay.call)
 // or a hostlink's host sent (far), or a cancel of one, or of every call
@@ -1180,12 +1281,21 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
         v->next    = r->serves;
         r->serves  = v;
 
-        // Only its own endpoints, of the kind asked, at their API's paths
+        // Only its own endpoints, of the kind asked, at their API's paths,
+        // or a web search, with its own service
         Str name = jsonstr(jsonget(j, "endpoint"));
         b32 an   = jsonflag(jsonget(j, "anthropic"), 0);
         b32 ok   = relayname(name) && endpointconf(e, &v->arena, name, &v->ep) &&
                    v->ep.name==name && !v->ep.relay.len;
-        if (!ok) {
+        i32 svc  = websearchservice(e);
+        v->search = v->path=="search";
+        if (v->search) {
+            Str why = svc==WEBS_NONE || svc==WEBS_RELAY ? Str("web search is off here")
+                                                        : webunready(e, &scratch);
+            if (v->method!="POST" || why.len) {
+                relayfinish(v, "connect", why.len ? why : Str("not a search"));
+            }
+        } else if (!ok) {
             relayfinish(v, "connect", concat(&scratch, "no endpoint here is named ", name));
         } else if ((v->ep.kind==EP_ANTHROPIC) != an) {
             relayfinish(v, "connect", concat(&scratch, name, " is of another kind here"));
@@ -1211,6 +1321,10 @@ static void relayserve(Engine *e, Arena scratch, Json *j, i64 cid, Str origin,
     if (!v->body.data) {
         relayfinish(v, why, why=="nobase" ? Str("no base for the delta") :
                                             Str("an unsound relayed call"));
+        return;
+    }
+    if (v->search) {
+        relaysearch(e, scratch, v);
         return;
     }
     Str p = cut(v->path, '?').head;
@@ -1250,10 +1364,13 @@ static b32 relayrecord(Engine *e, Arena scratch, Record r)
 {
     RelayServe *v = 0;
     for (RelayServe *t = e->relay->serves; r.id && !v && t; t = t->next) {
-        v = t->httpid==r.id ? t : 0;
+        v = t->httpid==r.id || (t->web && t->web->hid==r.id) ? t : 0;
     }
     if (!v) {
         return 0;
+    } else if (v->web) {
+        webrecord(e, v->web, scratch, r);
+        return 1;
     }
     switch (r.type) {
     case HTTP_HEAD:
@@ -1445,9 +1562,15 @@ static void relaytick(Engine *e, Arena scratch)
             }
         }
     }
+    i64 now = os_ticks(e->os);
     for (RelayServe *v = r->serves; v; v = v->next) {
         if (v->go) {
             relaysend(e, scratch, v);
+        }
+        if (v->web && now>=v->webby) {
+            Str text = concat(&scratch, concat(&scratch, "Timed out: ",
+                              webservices[v->web->service]), " did not answer in time.");
+            relaysearched(e, scratch, v, "timeout", text, 1);
         }
         if (!r->held || v->far) {
             relayserveout(e, scratch, v);
@@ -1465,7 +1588,7 @@ static void relaytick(Engine *e, Arena scratch)
     }
     for (RelayServe **p = &r->serves; *p;) {
         RelayServe *v = *p;
-        if (v->finished && !v->http && v->slot==SLOT_NONE) {
+        if (v->finished && !v->http && !v->web && v->slot==SLOT_NONE) {
             *p = v->next;
             os_release(e->os, v->mem);
         } else {
@@ -1484,12 +1607,14 @@ static i64 relaynext(Engine *e, i64 now)
                (!c->ended && c->sent<c->room && c->sent<c->parts) ||
                (c->ended && c->freed);
     }
-    for (RelayServe *v = r->serves; !work && v; v = v->next) {
-        work = v->go || v->queued || v->sent || v->head || v->held ||
-               (v->done && !v->finished) || (v->finished && !v->http);
+    i64 next = I64MAX;
+    for (RelayServe *v = r->serves; v; v = v->next) {
+        work |= v->go || v->queued || v->sent || v->head || v->held ||
+                (v->done && !v->finished) || (v->finished && !v->http && !v->web);
+        next  = v->web && v->webby<next ? v->webby : next;
     }
     if (!work) {
-        return I64MAX;
+        return next;
     }
     return r->held || r->farheld ? now + (i64)RELAY_RETRY*MS : now;
 }

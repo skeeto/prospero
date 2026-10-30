@@ -452,31 +452,38 @@ struct DeskRun {
     DeskShot shot;     // the latest screenshot's, which points refer to
 };
 
-// A session's web call (web_search, web_fetch) while its requests run,
-// in a reservation of its own, released at its end (webend).
+struct Session;
+struct RelayServe;
+
+// A web call (web_search, web_fetch) while its requests run, a
+// session's, or a search run for a thin engine (relaysearch), in a
+// reservation of its own, released at its end (webfree).
 struct WebRun {
-    Region  *region;
-    Arena    arena;
-    Http    *http;      // the request running
-    u64      hid;       // its records'
-    i32      tool;      // TOOL_WEBSEARCH or TOOL_WEBFETCH
-    i32      service;   // a search's WEBS_*
-    Str      query;     // a search's
-    Str      asked;     // a fetch's URL, canonical, as asked
-    Str      url;       // and the one requested now, after redirects
-    i64      offset;    // where the text shown starts
-    i32      status;    // the response's
-    Str      ctype;     // and its Content-Type
-    Str      location;  // and Location
-    b32      challenge; // and a bot check's mark (cf-mitigated)
-    Buf      body;
-    b32      cut;       // the body passed its limit and stopped there
-    i32      hops;      // redirects followed
-    i32      conts;     // Anthropic: pause_turn continuations
-    b32      retried;
-    WebHits  acc;       // Anthropic: the replies so far
-    Str      model;     // Anthropic: the search model, at ep
-    Endpoint ep;
+    Region     *region;
+    Arena       arena;
+    Session    *s;         // whose call it is, or
+    RelayServe *v;         // the thin engine's call it serves
+    EHttp      *http;      // the request running
+    u64         hid;       // its records'
+    i32         tool;      // TOOL_WEBSEARCH or TOOL_WEBFETCH
+    i32         service;   // a search's WEBS_*
+    Str         query;     // a search's
+    Str         asked;     // a fetch's URL, canonical, as asked
+    Str         url;       // and the one requested now, after redirects
+    i64         offset;    // where the text shown starts
+    i32         status;    // the response's
+    Str         ctype;     // and its Content-Type
+    Str         location;  // and Location
+    b32         challenge; // and a bot check's mark (cf-mitigated)
+    Buf         body;
+    b32         cut;       // the body passed its limit and stopped there
+    i32         hops;      // redirects followed
+    i32         conts;     // Anthropic: pause_turn continuations
+    i32         more;      // Anthropic, or relayed: searches past the first
+    b32         retried;
+    WebHits     acc;       // Anthropic: the replies so far
+    Str         model;     // Anthropic: the search model, at ep
+    Endpoint    ep;
 };
 
 // A page web_fetch read, kept for reading on (offset) without asking or
@@ -1826,10 +1833,11 @@ static void relaytick(Engine *, Arena);
 static i64  relaynext(Engine *, i64 now);
 
 // Start a request to an endpoint, its records to req->mbox with its id,
-// for a session (s) or not. A relayed one never fails here: a failure
-// arrives as its HTTP_DONE, after the caller's own next steps. A body
-// that keep marks is the base of the next one's delta. Null on failure,
-// as os_lasterr explains.
+// for a session (s) or not; with no endpoint, a plain request, or at
+// relay://search, a web search that a connected computer runs. A relayed
+// one never fails here: a failure arrives as its HTTP_DONE, after the
+// caller's own next steps. A body that keep marks is the base of the
+// next one's delta. Null on failure, as os_lasterr explains.
 static EHttp *ehttp(Engine *e, Endpoint *ep, HttpReq *req, Session *s,
                     b32 keep, Arena scratch)
 {
@@ -1840,15 +1848,17 @@ static EHttp *ehttp(Engine *e, Endpoint *ep, HttpReq *req, Session *s,
         h = alloc<EHttp>(&e->perm);
     }
     *h = {};
-    if (ep->relay.len) {
+    if (ep && ep->relay.len) {
         h->relay = relaystart(e, ep, req, s, keep, scratch);
+    } else if (!ep && startswith(req->url, "relay://")) {
+        h->relay = relaystart(e, 0, req, s, 0, scratch);  // a search
     } else {
         h->os = os_http(e->os, req, scratch);
-        if (!h->os) {
-            h->next     = e->freehttp;
-            e->freehttp = h;
-            return 0;
-        }
+    }
+    if (!h->os && !h->relay) {
+        h->next     = e->freehttp;
+        e->freehttp = h;
+        return 0;
     }
     return h;
 }
@@ -7032,8 +7042,10 @@ static Str deskdenial(Arena *a, i32 by, Str note, i64 wait)
 // whole call has a deadline. What comes back is framed as web content
 // between lines marked by a nonce that the pages cannot know.
 
-enum : i32 { WEBS_NONE, WEBS_SEARXNG, WEBS_EXA, WEBS_ANTHROPIC };
-static Str const webservices[] = {"none", "SearXNG", "Exa", "Anthropic"};
+enum : i32 { WEBS_NONE, WEBS_SEARXNG, WEBS_EXA, WEBS_ANTHROPIC, WEBS_RELAY };
+static Str const webservices[] = {
+    "none", "SearXNG", "Exa", "Anthropic", "a connected computer"
+};
 
 enum : i64 {
     WEB_REGION   = (i64)1 << (sizeof(void *)==8 ? 28 : 26),
@@ -7041,12 +7053,19 @@ enum : i64 {
     WEB_ERRBODY  = 4 << 10,  // the body kept of an error response
 };
 
+static b32 relaysearches(Engine *);
+
+// The service [web] search names, or on a thin engine where it is not
+// set, a connected computer that searches with its own (relay.cpp).
 static i32 websearchservice(Engine *e)
 {
-    Str v = trim(cfgget(e->cfg, "web", "", "search", 0));
+    Str       v     = trim(cfgget(e->cfg, "web", "", "search", 0));
+    IniEntry *x     = cfgfind(e->cfg, "web", "", "search").e;
+    b32       unset = !x || !trim(x->value).len;
     return v=="searxng"   ? WEBS_SEARXNG   :
            v=="exa"       ? WEBS_EXA       :
-           v=="anthropic" ? WEBS_ANTHROPIC : WEBS_NONE;
+           v=="anthropic" ? WEBS_ANTHROPIC :
+           unset && e->cfg->thin && relaysearches(e) ? WEBS_RELAY : WEBS_NONE;
 }
 
 // Whether web_fetch is on: the user's own file has [web] (as a section
@@ -7105,6 +7124,10 @@ static Str webanthropicep(Engine *e, Arena *perm, Endpoint *ep, Str *model)
     } else if (!endpointconf(e, perm, name, ep) || ep->kind!=EP_ANTHROPIC) {
         return concat(perm, concat(perm, "the endpoint ", name),
                       " that [web] model names is not of kind anthropic");
+    } else if (ep->relay.len) {
+        return concat(perm, concat(perm, "the endpoint ", name),
+                      " is relayed: with [web] search unset, a connected "
+                      "computer searches with its own");
     }
     *model = clone(perm, id);
     return {};
@@ -7283,20 +7306,23 @@ static Session *webbyhttp(Engine *e, u64 id)
     return 0;
 }
 
-// Stop the web call's request, if any, and release its reservation.
+// Stop a web call's request, if any, and release its reservation.
+static void webfree(Engine *e, WebRun *w)
+{
+    if (w->http) {
+        ehttpcancel(e, w->http);
+        ehttpfree(e, w->http);
+    }
+    os_release(e->os, w->region);
+}
+
 static void webstop(Session *s)
 {
-    Os     *os = s->e->os;
-    WebRun *w  = s->web;
-    if (!w) {
-        return;
+    WebRun *w = s->web;
+    if (w) {
+        s->web = 0;
+        webfree(s->e, w);
     }
-    if (w->http) {
-        os_httpcancel(os, w->http);
-        os_httpfree(os, w->http);
-    }
-    s->web = 0;
-    os_release(os, w->region);
 }
 
 // The web call ended: its result, with text in scratch, then the next.
@@ -7308,6 +7334,21 @@ static void webcallend(Session *s, Arena scratch, Str status, Str text,
     toolend(s, scratch, status, text, 0, 0, spill, bytes);
     webstop(s);
     nexttool(s, scratch);
+}
+
+static void relaysearched(Engine *, Arena, RelayServe *, Str status, Str text,
+                          i32 searches);
+
+// A search ended: its result, with text in scratch, to the session or
+// the thin engine whose call it served.
+static void webend(Engine *e, WebRun *w, Arena scratch, Str status, Str text)
+{
+    if (w->s) {
+        treeroot(w->s)->websearches += w->more;  // one counted at the start
+        webcallend(w->s, scratch, status, text);
+    } else {
+        relaysearched(e, scratch, w->v, status, text, 1 + w->more);
+    }
 }
 
 // Where a test sends a request: https://HOST/PATH to TEST/web/HOST/PATH
@@ -7340,10 +7381,8 @@ static void webputquerystr(Buf *b, Str s)
 }
 
 // Send the web call's next request. Null if it went, else why not.
-static Str websend(Session *s, Arena scratch)
+static Str websend(Engine *e, WebRun *w, Arena scratch)
 {
-    Engine *e = s->e;
-    WebRun *w = s->web;
     Buf     h(&scratch, 1024);
     HttpReq r = {};
     i64     max = WEB_REPLYMAX;
@@ -7376,6 +7415,16 @@ static Str websend(Session *s, Arena scratch)
         print(&h, "Content-Type: application/json\r\n"
                   "Accept: application/json, text/event-stream\r\n"
                   "User-Agent: prospero/" PROSPERO_VERSION "\r\n");
+    } else if (w->service == WEBS_RELAY) {
+        Buf     q(&scratch, 64 + 2*w->query.len);
+        JsonOut j = {&q};
+        putobject(&j);
+        putstrkey(&j, "query", w->query);
+        putend(&j);
+        r.method = "POST";
+        r.url    = "relay://search";
+        r.body   = finish(&q);
+        print(&h, "Accept: application/json\r\n");
     } else {
         r.method = "POST";
         r.url    = apiurl(&scratch, w->ep.url, "messages");
@@ -7395,7 +7444,7 @@ static Str websend(Session *s, Arena scratch)
     w->challenge = 0;
     w->cut       = 0;
     w->body      = Buf(&w->arena, 1<<14);
-    w->http      = os_http(e->os, &r, scratch);
+    w->http      = ehttp(e, 0, &r, w->s, 0, scratch);
     if (!w->http) {
         w->hid = 0;
         Str why = os_lasterr(e->os, &scratch);
@@ -7416,25 +7465,26 @@ static b32 webrun(Session *s, Arena scratch, i32 tool, Args *args)
     Arena   a = newarena(mem);
     WebRun *w = alloc<WebRun>(&a);
     w->region = mem;
+    w->arena  = a;
+    w->s      = s;
     w->tool   = tool;
     Str why = {};
     if (tool == TOOL_WEBSEARCH) {
         w->service = websearchservice(e);
-        w->query   = clone(&a, args->query);
+        w->query   = clone(&w->arena, args->query);
         why = w->service==WEBS_NONE ? Str("web search is off in the configuration ([web] search)")
                                     : webunready(e, &scratch);
         if (!why.len && w->service==WEBS_ANTHROPIC) {
-            why = webanthropicep(e, &a, &w->ep, &w->model);
+            why = webanthropicep(e, &w->arena, &w->ep, &w->model);
         }
     } else {
-        w->asked  = weburl(&a, args->url);
+        w->asked  = weburl(&w->arena, args->url);
         w->url    = w->asked;
         w->offset = args->offset;
     }
-    w->arena = a;
-    s->web   = w;
+    s->web = w;
     if (!why.len) {
-        why = websend(s, scratch);
+        why = websend(e, w, scratch);
     }
     if (why.len) {
         Str text = concat(&scratch, concat(&scratch, "Not done: ", why), Str("."));
@@ -7446,7 +7496,8 @@ static b32 webrun(Session *s, Arena scratch, i32 tool, Args *args)
         treeroot(s)->websearches++;
     }
     setstate(s, S_TOOL);
-    arm(s, T_TOOL, w->service==WEBS_ANTHROPIC ? 2*e->minute : e->minute/2);
+    arm(s, T_TOOL, w->service==WEBS_ANTHROPIC ? 2*e->minute :
+                   w->service==WEBS_RELAY     ? 3*e->minute : e->minute/2);
     return 0;
 }
 
@@ -7652,7 +7703,7 @@ static void webpage(Session *s, Arena scratch)
             w->hops++;
             w->url     = d.url;
             w->retried = 0;
-            Str why = websend(s, scratch);
+            Str why = websend(e, w, scratch);
             if (why.len) {
                 Str text = webfailure(&scratch, w, HTTP_ECONNECT, why);  // before scratch is passed on
                 webcallend(s, scratch, "error", text);
@@ -7791,11 +7842,10 @@ static WebHits webhitsclone(Arena *a, WebHits h)
     return r;
 }
 
-// A search service's response, complete: its results, or why none.
-static void websearched(Session *s, Arena scratch)
+// A search service's response, complete: its results, or why none. A
+// relayed search's is the result its computer made.
+static void websearched(Engine *e, WebRun *w, Arena scratch)
 {
-    Engine *e   = s->e;
-    WebRun *w   = s->web;
     i32     st  = w->status;
     i32     max = (i32)webint(e, "results", 8, 1, 20);
     Str     svc = webservices[w->service];
@@ -7804,7 +7854,7 @@ static void websearched(Session *s, Arena scratch)
         print(&b, "Not done: SearXNG refused the search (HTTP 403). Its JSON "
                   "output may be off: the user can add json to "
                   "search.formats in its settings.yml.");
-        webcallend(s, scratch, "error", finish(&b));
+        webend(e, w, scratch, "error", finish(&b));
         return;
     } else if (st/100 != 2) {
         print(&b, "Not done: ");
@@ -7818,12 +7868,25 @@ static void websearched(Session *s, Arena scratch)
             print(&b, why);
         }
         print(&b, ".");
-        webcallend(s, scratch, "error", finish(&b));
+        webend(e, w, scratch, "error", finish(&b));
         return;
     }
 
-    Str     body = {w->body.data, w->body.len};
-    WebHits h    = {};
+    Str body = {w->body.data, w->body.len};
+    if (w->service == WEBS_RELAY) {
+        JsonDoc d      = jsonparse(&scratch, body);
+        Str     status = jsonstr(jsonget(d.root, "status"));
+        Str     text   = jsonstr(jsonget(d.root, "text"));
+        i64     n      = jsonint(jsonget(d.root, "searches"), 1);
+        if (!text.len || !(status=="ok" || status=="error" || status=="timeout")) {
+            status = "error";
+            text   = "Not done: the connected computer's search result was unsound.";
+        }
+        w->more = n>1 && n<=100 ? (i32)n-1 : 0;
+        webend(e, w, scratch, status, text);
+        return;
+    }
+    WebHits h = {};
     switch (w->service) {
     case WEBS_SEARXNG: h = websearxng(&scratch, body, max);   break;
     case WEBS_EXA:     h = webexa(&scratch, body, max);       break;
@@ -7834,17 +7897,15 @@ static void websearched(Session *s, Arena scratch)
         if (h.pause && w->conts<2) {
             w->conts++;
             w->retried = 0;
-            Str why = websend(s, scratch);
+            Str why = websend(e, w, scratch);
             if (why.len) {
                 Str text = webfailure(&scratch, w, HTTP_ECONNECT, why);  // before scratch is passed on
-                webcallend(s, scratch, "error", text);
+                webend(e, w, scratch, "error", text);
             }
             return;
         }
         h = w->acc;
-        if (h.searches > 1) {
-            treeroot(s)->websearches += h.searches - 1;  // one counted at the start
-        }
+        w->more = h.searches>1 ? h.searches-1 : 0;
         if (!h.searched) {
             h.err = "Anthropic's search model answered without searching";
         }
@@ -7853,47 +7914,45 @@ static void websearched(Session *s, Arena scratch)
         print(&b, "Not done: ");
         print(&b, h.err);
         print(&b, ".");
-        webcallend(s, scratch, "error", finish(&b));
+        webend(e, w, scratch, "error", finish(&b));
         return;
     }
     Str nonce = webnonce(&scratch, os_random(e->os));
     Str text  = websearchtext(&scratch, w->query, svc, webtoday(e, &scratch), &h, nonce);
-    webcallend(s, scratch, "ok", text);
+    webend(e, w, scratch, "ok", text);
 }
 
 // A web call's request ended: retried once for a status that invites
-// it, else its response taken.
-static void webdone(Session *s, Arena scratch, i32 err, Str why)
+// it, or a relayed search's lost computer, else its response taken.
+static void webdone(Engine *e, WebRun *w, Arena scratch, i32 err, Str why)
 {
-    Engine *e = s->e;
-    WebRun *w = s->web;
-    os_httpfree(e->os, w->http);
+    ehttpfree(e, w->http);
     w->http = 0;
     w->hid  = 0;
     i32 st  = w->status;
-    if (err && !(err==HTTP_ECANCEL && w->cut)) {
+    b32 again = !w->retried && (err==HTTP_ELOST && w->service==WEBS_RELAY);
+    if (err && !again && !(err==HTTP_ECANCEL && w->cut)) {
         Str text = webfailure(&scratch, w, err, why);  // before scratch is passed on
-        webcallend(s, scratch, "error", text);
+        webend(e, w, scratch, "error", text);
         return;
-    } else if (!w->retried && (st==408 || st==429 || st>=500)) {
+    } else if (!w->retried && (again || st==408 || st==429 || st>=500)) {
         w->retried = 1;
-        Str bad = websend(s, scratch);
+        Str bad = websend(e, w, scratch);
         if (bad.len) {
             Str text = webfailure(&scratch, w, HTTP_ECONNECT, bad);  // before scratch is passed on
-            webcallend(s, scratch, "error", text);
+            webend(e, w, scratch, "error", text);
         }
         return;
     }
     if (w->tool == TOOL_WEBFETCH) {
-        webpage(s, scratch);
+        webpage(w->s, scratch);
     } else {
-        websearched(s, scratch);
+        websearched(e, w, scratch);
     }
 }
 
-static void webrecord(Session *s, Arena scratch, Record r)
+static void webrecord(Engine *e, WebRun *w, Arena scratch, Record r)
 {
-    WebRun *w = s->web;
     switch (r.type) {
     case HTTP_HEAD: {
         Str head     = cuthead(r.data, 4);
@@ -7911,13 +7970,13 @@ static void webrecord(Session *s, Arena scratch, Record r)
         } else if (r.data.len > room) {
             print(&w->body, takehead(r.data, (iz)room));  // under r.data.len
             w->cut = 1;
-            os_httpcancel(s->e->os, w->http);  // ends with HTTP_ECANCEL
+            ehttpcancel(e, w->http);  // ends with HTTP_ECANCEL
             return;
         }
         print(&w->body, r.data);
     } return;
     case HTTP_DONE:
-        webdone(s, scratch, get32(r.data), cuthead(r.data, 4));
+        webdone(e, w, scratch, get32(r.data), cuthead(r.data, 4));
         return;
     }
 }
@@ -18622,7 +18681,7 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         }
         Session *ws = webbyhttp(e, r.id);
         if (ws) {
-            webrecord(ws, scratch, r);
+            webrecord(e, ws->web, scratch, r);
             return;
         }
     }
