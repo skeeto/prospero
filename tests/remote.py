@@ -3009,10 +3009,17 @@ def relay_offer_include(t):
         c = Client(t)
         c.attach()
         c.call("hello")
-        r = c.call("offer")
-        t.check(r.get("ok") == 1, f"offer {r}")
-        o = r["offer"]
-        names = sorted(e["name"] for e in o["endpoints"])
+        # The URL's may come in a refresh after startup, under load: the
+        # window asks again as the configuration reloads
+        deadline = time.monotonic() + 20
+        while True:
+            r = c.call("offer")
+            t.check(r.get("ok") == 1, f"offer {r}")
+            o = r["offer"]
+            names = sorted(e["name"] for e in o["endpoints"])
+            if "web" in names or time.monotonic() > deadline:
+                break
+            time.sleep(0.25)
         t.check(names == ["file", "web"], f"endpoints {names}")
         models = sorted(m["name"] for m in o["models"])
         t.check(models == ["large", "large-max"], f"models {models}")
