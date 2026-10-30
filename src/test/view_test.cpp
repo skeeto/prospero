@@ -1630,9 +1630,10 @@ static void test_viewtranscript(Test *t)
         expect(t, "tools.provchosen", foldshow(&a, v), "o*;");
     }
 
-    // Finding: ASCII case ignored, folded rows searched, hidden reasoning
-    // not; the search keeps up with new text from where it changed, a
-    // budget at a time
+    // Finding: ASCII case ignored, only what shows searched (not folded
+    // rows, nor hidden reasoning), searched again as rows open and fold;
+    // the search keeps up with new text from where it changed, a budget
+    // at a time
     {
         Arena       a = perm;
         View       *v = testview(&a);
@@ -1640,27 +1641,32 @@ static void test_viewtranscript(Test *t)
         for (iz i = 0; i < countof(recs); i++) apply(v, a, recs[i]);
         searchreset(s, v, "needle");
         expect(t, "find.done", istr(&a, searchstep(s, 1<<20)), "1");
-        expect(t, "find.hits", hitshow(&a, s), "1:0;2:2;");
+        expect(t, "find.folded", hitshow(&a, s), "");
         apply(v, a, end2);
         apply(v, a, end3);
         searchstep(s, 1<<20);
-        expect(t, "find.more", hitshow(&a, s), "1:0;2:2;4:0;");
+        expect(t, "find.more", hitshow(&a, s), "4:0;");
+        togglemsg(v, 2);
+        searchstep(s, 1<<20);
+        expect(t, "find.opened", hitshow(&a, s), "2:2;4:0;");
+        viewshowthink(v, 1);
+        searchstep(s, 1<<20);
+        expect(t, "find.toggled", hitshow(&a, s), "1:0;2:2;4:0;");
         viewthink(v, THINK_HIDE);
+        viewshowthink(v, 0);
         searchstep(s, 1<<20);
         expect(t, "find.hidden", hitshow(&a, s), "2:2;4:0;");
         viewthink(v, THINK_FOLD);
+        viewshowthink(v, 1);
         searchreset(s, v, "NEEDLE");
         expect(t, "find.budget", istr(&a, searchstep(s, 10)), "0");
         expect(t, "find.partial", hitshow(&a, s), "1:0;");
         while (!searchstep(s, 10)) {}
         expect(t, "find.rest", hitshow(&a, s), "1:0;2:2;4:0;");
         expect(t, "find.from", istr(&a, searchfrom(s, 3, 0)), "2");
-        // A folded hit opens as if chosen, and is not searched again
-        s->cur = 1;
-        searchreveal(s, &s->hits[1]);
+        togglemsg(v, 2);
         searchstep(s, 1<<20);
-        expect(t, "find.revealed", foldshow(&a, v), "f;o*;f;o;");
-        expect(t, "find.kept", istr(&a, s->cur), "1");
+        expect(t, "find.refolded", hitshow(&a, s), "1:0;4:0;");
         searchreset(s, v, "");
         searchstep(s, 1<<20);
         expect(t, "find.empty", istr(&a, s->hits.len), "0");

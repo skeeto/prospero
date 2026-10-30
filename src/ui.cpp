@@ -527,8 +527,7 @@ static void gui_find_close(Gui *g)
     scheddirty(&g->sched);
 }
 
-// The next match (dir 1) or the previous (-1), wrapping around, shown
-// and opened if folded.
+// The next match (dir 1) or the previous (-1), wrapping around, shown.
 static void gui_find_next(Gui *g, i32 dir)
 {
     ViewSearch *s = g->search;
@@ -539,8 +538,6 @@ static void gui_find_next(Gui *g, i32 dir)
     iz cur = s->cur<0 ? (dir>0 ? 0 : n-1) : (s->cur + dir + n) % n;
     s->cur      = (i32)cur;
     g->findjump = 1;
-    g->findwant = 0;
-    searchreveal(s, &s->hits[cur]);
     scheddirty(&g->sched);
 }
 
@@ -3494,27 +3491,24 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
         Str q = {(u8 *)g->findbuf, (iz)__builtin_strlen(g->findbuf)};
         searchreset(s, v, q);
         g->findfrom = viewfind(v, scrolly);
-        g->findwant = 1;
     }
     b32 done = searchstep(s, FIND_BUDGET);
     if (!done) {
         scheddirty(&g->sched);  // more next frame
     }
-    if (g->findwant && s->cur<0) {
+    if (s->cur < 0) {
         // The first hit from the top of the screen down, else from the
-        // start once all are found
+        // start once all are found; with none yet, the first to turn up
+        // as rows open, from the top of the screen as it is then
         iz i = searchfrom(s, g->findfrom<0 ? 0 : g->findfrom, 0);
         if (i < s->hits.len) {
             s->cur = (i32)i;
         } else if (done && s->hits.len) {
             s->cur = 0;
         }
-        if (s->cur >= 0) {
-            searchreveal(s, &s->hits[s->cur]);
-            g->findjump = 1;
-        }
+        g->findjump |= s->cur >= 0;
+        g->findfrom  = done && s->cur<0 ? viewfind(v, scrolly) : g->findfrom;
     }
-    g->findwant &= !done && s->cur<0;
 
     ImGui::SameLine();
     b32 prev = ImGui::ArrowButton("##findprev", ImGuiDir_Up);

@@ -67,9 +67,10 @@ opens or folds it.
 ## Finding
 
 In the find bar, **Enter** or **Ctrl+G** goes to the next match, and
-**Shift+Enter** or **Ctrl+Shift+G** to the previous. Folded tool output
-and reasoning are searched too, and a folded row opens to show a
-match. **Esc** closes the bar.
+**Shift+Enter** or **Ctrl+Shift+G** to the previous. Only what shows is
+searched, not folded tool output or reasoning: Ctrl+Shift+T or
+Ctrl+Shift+R opens them all to search them too. **Esc** closes the
+bar.
 
 ## Dialogs
 

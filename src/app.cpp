@@ -1270,8 +1270,7 @@ struct Gui {
     b32                askactive;  // a question form's field had it
     f32                qformdrawn; // the latest question form's height, drawn
     b32                findjump;   // scroll to the current hit
-    b32                findwant;   // the current hit is the first found
-    i32                findfrom;   //   from this message on
+    i32                findfrom;   // a first hit is from this message on
 
     // Dialogs and settings
     char              *newcwd;     // the new session's fields
@@ -10872,6 +10871,7 @@ enum : i32 {
     CHK_SHOWTHINK,
     CHK_THINKBACK,
     CHK_FINDOPEN,
+    CHK_FINDFOLDED,
     CHK_FOUND,
     CHK_FOUNDNEXT,
     CHK_FOUNDPREV,
@@ -11155,8 +11155,9 @@ static Str chknames[] = {
     "the session's toggle opened all reasoning",
     "toggled off, reasoning folded again but for what the user opened",
     "the find bar opened with its field focused",
-    "found in folded reasoning, opened as chosen and scrolled to",
-    "Enter went to the next match, opening its row",
+    "folded reasoning is not searched",
+    "found in reasoning opened by its toggle, and scrolled to",
+    "Enter went to the next match",
     "Shift+Enter went back to the first",
     "no frames while the find bar shows its matches",
     "hidden reasoning is not searched",
@@ -12096,10 +12097,10 @@ static DriveOp m3ops[] = {
     {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""},
     {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
     {OP_CHECK, CHK_THINKBACK, 0, 0, 0, ""},
-    // Find, opened by Cmd+F (Ctrl elsewhere): in folded reasoning, whose row
-    // opens; Enter to the next match and Shift+Enter back; nothing
-    // drawn while the matches show; hidden reasoning not searched; Esc
-    // closes the bar
+    // Find, opened by Cmd+F (Ctrl elsewhere): not in folded reasoning,
+    // but in reasoning the toggle opens; Enter to the next match and
+    // Shift+Enter back; nothing drawn while the matches show; folded
+    // again, and hidden, reasoning not searched; Esc closes the bar
     {OP_MOVE, T_EMPTY, 0, 0, 100, ""},
     {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
     {OP_KEYDOWN, 0, GKEY_F, KEY_CMD, 50, ""},
@@ -12107,6 +12108,13 @@ static DriveOp m3ops[] = {
     {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
     {OP_CHECK, CHK_FINDOPEN, 0, 0, 0, ""},
     {OP_TEXT, 0, 0, 0, 800, "briefly 7."},
+    {OP_CHECK, CHK_FINDFOLDED, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_R, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_R, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 800, ""},
     {OP_CHECK, CHK_FOUND, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "23-find"},
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
@@ -12120,6 +12128,13 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_MARK, 0, 0, 0, 2500, ""},
     {OP_CHECK, CHK_FINDQUIET, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_R, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_R, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 800, ""},
+    {OP_CHECK, CHK_FINDFOLDED, 0, 0, 0, ""},
     {OP_THINKING, 0, THINK_HIDE, 0, 500, ""},
     {OP_CHECK, CHK_FINDHIDDEN, 0, 0, 0, ""},
     {OP_THINKING, 0, THINK_FOLD, 0, 300, ""},
@@ -15793,8 +15808,8 @@ static b32 thinkas(View *v, b32 want)
     return rows > 0;
 }
 
-// Whether the current find hit's row is open, as chosen, with its line
-// in the transcript's window.
+// Whether the current find hit's row is open, with its line in the
+// transcript's window.
 static b32 hitshown(Gui *g)
 {
     ViewSearch *s  = g->search;
@@ -15805,7 +15820,7 @@ static b32 hitshown(Gui *g)
     }
     FindHit *h = &s->hits[s->cur];
     ViewMsg *m = &v->msgs[h->msg];
-    if (m->collapsed || !m->chosen) {
+    if (m->collapsed) {
         return 0;
     }
     MsgLayout *ml = msglayout(v, h->msg, &g->measure, v->lastw, g->scale);
@@ -16602,15 +16617,16 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_SHOWTHINK:  return g->thinkset==THINK_FOLD && v->showthink && thinkas(v, 0);
     case CHK_THINKBACK:  return !v->showthink && thinkas(v, 1);
     case CHK_FINDOPEN:   return g->findopen && g->findactive;
+    case CHK_FINDFOLDED:
+        return g->findopen && !g->search->hits.len && !v->showthink &&
+               thinkas(v, 1);
     case CHK_FOUND:
         g->drivefound = g->search->cur;
         return g->search->hits.len==2 && v->msgs[g->search->hits[0].msg].role==VIEW_THINK &&
                hitshown(g);
     case CHK_FOUNDNEXT: {
         ViewSearch *s = g->search;
-        b32 both = s->hits.len==2 && v->msgs[s->hits[0].msg].chosen &&
-                   v->msgs[s->hits[1].msg].chosen;
-        return both && s->cur==(g->drivefound+1)%2 && hitshown(g);
+        return s->hits.len==2 && s->cur==(g->drivefound+1)%2 && hitshown(g);
     }
     case CHK_FOUNDPREV:
         return g->search->cur==g->drivefound && hitshown(g);

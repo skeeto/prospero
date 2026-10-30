@@ -3294,6 +3294,7 @@ struct FindSeen {
     iz  len;
     i32 ver;
     b32 hidden;
+    b32 folded;
 };
 
 struct ViewSearch {
@@ -3340,16 +3341,19 @@ static void searchreset(ViewSearch *s, View *v, Str q)
 
 static FindSeen seenof(View *v, ViewMsg *m)
 {
-    return {m->text.data, m->text.len, m->ver, msghidden(v, m)};
+    return {m->text.data, m->text.len, m->ver, msghidden(v, m), m->collapsed};
 }
 
 static b32 seeneq(FindSeen a, FindSeen b)
 {
-    return a.data==b.data && a.len==b.len && a.ver==b.ver && a.hidden==b.hidden;
+    return a.data==b.data && a.len==b.len && a.ver==b.ver &&
+           a.hidden==b.hidden && a.folded==b.folded;
 }
 
 // Bring the hits up to date with the view: searched again from the first
 // message that changed, at most about budget bytes of text at a time.
+// Only what shows is searched: not hidden reasoning, nor a folded row,
+// whose text (reasoning above all) would bury the matches wanted.
 // Returns whether they are, else it goes on from there next call.
 static b32 searchstep(ViewSearch *s, iz budget)
 {
@@ -3378,7 +3382,7 @@ static b32 searchstep(ViewSearch *s, iz budget)
         ViewMsg *m = &v->msgs[i];
         Str      t = m->text;
         s->seen = push(&s->seenmem, s->seen, seenof(v, m));
-        if (!q.len || msghidden(v, m)) {
+        if (!q.len || msghidden(v, m) || m->collapsed) {
             continue;
         }
         budget -= t.len + 1;
@@ -3414,19 +3418,6 @@ static iz searchfrom(ViewSearch *s, i32 msg, i32 off)
         }
     }
     return lo;
-}
-
-// Show a hit: its message opened if folded, as if the user had, which
-// changes nothing to search again.
-static void searchreveal(ViewSearch *s, FindHit *h)
-{
-    View *v = s->v;
-    if (v->msgs[h->msg].collapsed) {
-        togglemsg(v, h->msg);
-        if (h->msg < s->seen.len) {
-            s->seen[h->msg].ver = v->msgs[h->msg].ver;
-        }
-    }
 }
 
 
