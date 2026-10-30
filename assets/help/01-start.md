@@ -27,21 +27,19 @@ The agent needs an endpoint, a server of models, and a model there.
 Prospero speaks the OpenAI Chat Completions API (llama.cpp, vLLM,
 LiteLLM and others) and Anthropic's Messages API.
 
-On its first run Prospero writes its configuration file from a
-built-in copy that documents every setting. That copy has one
-endpoint, `local`, at `http://localhost/`, and no model: a new session
-gets the first model that endpoint lists. When the endpoint answers
-with a model, the first run needs no settings at all.
+Prospero starts with nothing configured, and writes no file until a
+setting is first saved. Its configuration file then starts from a
+built-in copy that documents every setting, with an endpoint for a
+llama.cpp server on this machine as an example.
 
 1. Open the Settings pane (View → Settings). The line at its top says
    which file its edits go to, usually
    `~/.config/prospero/prospero.ini` (see
    [Configuration](help:config)).
-2. Under Endpoints, pick `local` and edit its url, or use Add
-   endpoint... for another server. An API key is never written in the
-   file: set `key` to `env:NAME`, and Prospero reads it from the
-   environment variable NAME, or to `file:PATH`, a file holding the
-   key.
+2. Under Endpoints, use Add endpoint... for your server, and set its
+   url. An API key is never written in the file: set `key` to
+   `env:NAME`, and Prospero reads it from the environment variable
+   NAME, or to `file:PATH`, a file holding the key.
 3. Optionally, on the Defaults page, set `model` to the endpoint's
    name and the model's, as `ENDPOINT/MODEL`, such as
    `local/qwen3-coder`. Without it, a new session gets the first

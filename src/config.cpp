@@ -5,9 +5,10 @@
 // a default in the schema below, so an empty file, or none, is a whole
 // configuration. An include's settings land where its line is, and
 // includes come before the first section, so the user's own sections
-// override a shared file's. On first run, when the user has no file,
-// the embedded seed (assets/prospero.ini), which documents every key,
-// is written there byte for byte.
+// override a shared file's. No file is the same as an empty one, and
+// nothing writes it on its own: the first save (cfgset, cfgcreate)
+// starts it from the embedded seed (assets/prospero.ini), which
+// documents every key, byte for byte.
 //
 // The schema is one table: each key's section kind, type, default,
 // settings-window group and description. Loading checks every line
@@ -182,7 +183,8 @@ static u8 const cfgseedbytes[] = {
 #  pragma clang diagnostic pop
 #endif
 
-// The embedded seed file, as written on first run.
+// The embedded seed file, which starts the user's file at its first
+// save.
 static Str cfgseed()
 {
     return {(u8 *)cfgseedbytes, countof(cfgseedbytes)};
@@ -735,8 +737,8 @@ struct CfgSlot {
 struct Config {
     Os         *os;
     Str         path;        // the user's file, normalized; null if none
-    b32         seed;        // write the seed where the file is missing
-    Str         note;        // a warning about the file for every load
+    b32         seed;        // the default location: none is empty, and
+                             // the first save starts it from the seed
     Region     *regions[2];  // loads alternate between these
     i32         cur;
     Ini        *ini;         // the current load, never null
@@ -2731,15 +2733,15 @@ static void cfgload(Config *c, Arena scratch)
     ini->fetchctx = c;
     c->loading    = c->rev + 1;
     if (c->path.len) {
-        pre  = os_stat(c->os, scratch, c->path);
-        user = iniload(ini, c->os, &a, c->path);
+        // The default file need not exist: none is empty, quietly
+        pre = os_stat(c->os, scratch, c->path);
+        if (!c->seed || pre.type!=STAT_MISSING) {
+            user = iniload(ini, c->os, &a, c->path);
+        }
     } else {
         Str msg = "no configuration file: none of XDG_CONFIG_HOME, HOME "
                   "or APPDATA is set";
         inidiag(ini, &a, {}, 0, 0, INI_WARNING, msg);
-    }
-    if (c->note.len) {
-        inidiag(ini, &a, c->path, 0, 0, INI_WARNING, c->note);
     }
     cfgvalidate(c, ini, user, &a);
 
@@ -2788,24 +2790,12 @@ static Str cfgdest(Config *c, Arena *a)
     return real.len ? real : c->path;
 }
 
-// Write the seed file where the user's file is missing. Returns 0 on
-// failure, with c->note explaining.
-static b32 cfgwriteseed(Config *c, Arena scratch)
-{
-    Str dst = cfgdest(c, &scratch);
-    Str dir = inidir(dst);
-    if ((dir.len && !os_mkdirs(c->os, scratch, dir)) ||
-            !os_write(c->os, scratch, dst, cfgseed())) {
-        c->note = "cannot write the initial configuration file here";
-        return 0;
-    }
-    return 1;
-}
-
 // Load the user's file at path (null for none) and its includes. With
-// seed, a missing file is first created from the seed. Bad or missing
-// files are diagnostics, never failures: null means only that memory
-// could not be reserved. The Config belongs to one thread at a time.
+// seed, path is the default location, where a missing file is the empty
+// configuration, without a warning, until the first save starts it from
+// the seed. Bad or missing files are diagnostics, never failures: null
+// means only that memory could not be reserved. The Config belongs to
+// one thread at a time.
 //
 // URL includes are cached under statedir, and without one are skipped.
 // With net CFG_NETWAIT, those with no cached copy are fetched before
@@ -2842,10 +2832,6 @@ static Config *newconfig(Os *os, Arena *perm, Arena scratch, Str path,
         c->waitby = os_ticks(os) + CFG_FETCHTIME;
     } else if (net==CFG_NETLATER && c->cache.len) {
         c->net = CFG_NETLATER;  // cfgattach makes it live
-    }
-    if (seed && c->path.len &&
-            os_stat(os, scratch, c->path).type==STAT_MISSING) {
-        cfgwriteseed(c, scratch);
     }
     cfgload(c, scratch);
     if (c->net == CFG_NETWAIT) {
@@ -2920,7 +2906,6 @@ static b32 cfgwrite(Config *c, Arena scratch, Str text)
             !os_write(c->os, scratch, dst, text)) {
         return 0;
     }
-    c->note = {};
     return 1;
 }
 

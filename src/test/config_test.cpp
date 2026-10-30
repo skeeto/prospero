@@ -186,7 +186,7 @@ static void testcfgdefault(Test *t)
     Config *c = newconfig(v.os, &a, v.scratch, cfgdefault(v.os, &a), 1);
     expect(t, "default.normalized", c->path,
            "C:/Users/u/AppData/Roaming/prospero/prospero.ini");
-    expect(t, "default.seeded", cfgfile(v.os, c->path), cfgseed());
+    expect(t, "default.unwritten", cfgfile(v.os, c->path), "(missing)");
     cfgfree(c);
 
     // With a home, a file only in the older place is still used
@@ -201,8 +201,11 @@ static void testcfgdefault(Test *t)
     expect(t, "default.home", cfgdefault(k.os, &a), "/h/.config/prospero/prospero.ini");
 }
 
-// First run writes the seed byte for byte, and it is a clean, complete
-// configuration; a later run keeps the user's file as it is.
+// No file at the default location is the empty configuration, quietly,
+// and nothing writes one: the first save starts it from the seed (see
+// testcfgset). The seed is a clean configuration that sets nothing, so
+// it means what no file does. A later run keeps the user's file as it
+// is.
 static void testcfgseed(Test *t)
 {
     Arena  a = t->perm;
@@ -211,20 +214,30 @@ static void testcfgseed(Test *t)
     Str     path = cfgdefault(v.os, &a);
     Config *c    = newconfig(v.os, &a, v.scratch, path, 1);
     expect(t, "seed.path", c->path, "/home/u/.config/prospero/prospero.ini");
-    expect(t, "seed.written", cfgfile(v.os, c->path), cfgseed());
-    Stat dir = os_stat(v.os, a, "/home/u/.config/prospero");
-    expect(t, "seed.dir", istr(&a, dir.type), istr(&a, STAT_DIR));
+    expect(t, "seed.unwritten", cfgfile(v.os, c->path), "(missing)");
+    Stat dir = os_stat(v.os, a, "/home/u/.config");
+    expect(t, "seed.nodir", istr(&a, dir.type), istr(&a, STAT_MISSING));
+    expect(t, "seed.quiet", inidiags(&a, c->ini), "");
+    expect(t, "seed.absent", istr(&a, c->user != 0), "0");
+    expect(t, "seed.rev", istr(&a, c->rev), "1");
+    expect(t, "seed.endpoint", cfgdefaults(c).endpoint, "");
+    expect(t, "seed.configured", istr(&a, cfgconfigured(c)), "0");
+    cfgfree(c);
+
+    // The seed as a file: no diagnostics, nothing set, short lines
+    os_write(v.os, a, "/s/prospero.ini", cfgseed());
+    c = newconfig(v.os, &a, v.scratch, "/s/prospero.ini", 0);
     expect(t, "seed.diags", inidiags(&a, c->ini), "");
     expect(t, "seed.exists", istr(&a, c->user != 0), "1");
-    expect(t, "seed.rev", istr(&a, c->rev), "1");
-    expect(t, "seed.endpoint", cfgdefaults(c).endpoint, "local");
-    expect(t, "seed.url", cfgget(c, "endpoint", "local", "url", 1),
-           "http://localhost/");
-    expect(t, "seed.configured", istr(&a, cfgconfigured(c)), "0");
+    expect(t, "seed.default", cfgdefaults(c).endpoint, "");
     expect(t, "seed.newline", istr(&a, cfgseed()[cfgseed().len-1]), "10");
     for (iz i = 0; i < c->user->lines.len; i++) {
-        if (c->user->lines[i].raw.len > 79) {
-            expect(t, "seed line too long", c->user->lines[i].raw, "");
+        IniLine *l = &c->user->lines[i];
+        if (l->raw.len > 79) {
+            expect(t, "seed line too long", l->raw, "");
+        }
+        if (l->type!=INI_BLANK && l->type!=INI_COMMENT) {
+            expect(t, "seed sets nothing", l->raw, "");
         }
     }
     cfgfree(c);
@@ -663,7 +676,8 @@ static void testcfgset(Test *t)
         Arena   tmp = v.scratch;
         Str     p   = seed ? Str("/s/prospero.ini") : Str("/n/prospero.ini");
         Config *m   = newconfig(v.os, &a, tmp, p, seed);
-        os_remove(v.os, a, p);
+        expect(t, concat(&a, "missing.unwritten ", p), cfgfile(v.os, p),
+               "(missing)");
         CfgSet  r   = cfgset(m, &tmp, "", "", "model", "m");
         Str     want = "model = m\n";
         if (seed) {
@@ -685,7 +699,6 @@ static void testcfgset(Test *t)
         Arena   tmp = v.scratch;
         Str     p   = seed ? Str("/cs/prospero.ini") : Str("/cn/prospero.ini");
         Config *m   = newconfig(v.os, &a, tmp, p, seed);
-        os_remove(v.os, a, p);
         i64     rev = m->rev;
         CfgSet  r   = cfgcreate(m, &tmp);
         expect(t, concat(&a, "create ", p), cfgfile(v.os, p), seed ? cfgseed() : Str(""));

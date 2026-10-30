@@ -3560,24 +3560,41 @@ def config_delete(t):
 
 @scenario(bound=10)
 def config_seed(t):
-    """Without a configuration file, the first run writes the seed byte for
-    byte, and it loads without a single diagnostic."""
+    """Without a configuration file, a run writes nothing and warns of
+    nothing: none is an empty configuration. The first config.set writes
+    the seed byte for byte with its edit, which then loads without a
+    single diagnostic."""
     xdg = t.host.join(t.base, "xdg")
-    p = t.host.popen(["--headless", "--state", t.state], t.work, stdin=True,
-                     env=dict(t.tmpenv, XDG_CONFIG_HOME=xdg))
-    out, err = p.communicate('{"cmd":"config.get","id":1}\n', timeout=10)
-    replies = [json.loads(x) for x in out.splitlines() if x.strip()]
-    r = next((e for e in replies if e.get("id") == 1), {})
+    ini = t.host.join(xdg, "prospero", "prospero.ini")
+
+    def run(line):
+        p = t.host.popen(["--headless", "--state", t.state], t.work,
+                         stdin=True, env=dict(t.tmpenv, XDG_CONFIG_HOME=xdg))
+        out, err = p.communicate(line + "\n", timeout=10)
+        replies = [json.loads(x) for x in out.splitlines() if x.strip()]
+        t.check(p.returncode == 0, f"exit {p.returncode}: {err}")
+        return next((e for e in replies if e.get("id") == 1), {}), err
+
+    r, err = run('{"cmd":"config.get","id":1}')
+    t.check(t.host.read(ini) is None, "nothing is written")
+    t.check(r.get("ok") == 1 and r.get("diags") == [] and r.get("rev") == 1
+            and r.get("exists") == 0, f"config.get {r} {err}")
+    t.check(r["path"].endswith("prospero/prospero.ini"), f"path {r['path']}")
+
+    r, err = run('{"cmd":"config.set","id":1,"kind":"","name":"",'
+                 '"key":"model","value":"m"}')
+    t.check(r.get("ok") == 1, f"config.set {r} {err}")
     seedpath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "..", "assets", "prospero.ini")
     with open(seedpath, "rb") as f:
         seed = f.read().decode()
-    written = t.host.read(t.host.join(xdg, "prospero", "prospero.ini"))
-    t.check(written == seed, "the seed is written unchanged")
-    t.check(r.get("ok") == 1 and r.get("diags") == [] and r.get("rev") == 1,
-            f"config.get {r} {err}")
-    t.check(r["path"].endswith("prospero/prospero.ini"), f"path {r['path']}")
-    t.check(p.returncode == 0, f"exit {p.returncode}: {err}")
+    ex = "# model = local/qwen3-coder\n"  # set under its example
+    at = seed.index(ex) + len(ex)
+    want = seed[:at] + "model = m\n" + seed[at:]
+    t.check(t.host.read(ini) == want, "the seed is written with the edit")
+    r, err = run('{"cmd":"config.get","id":1}')
+    t.check(r.get("ok") == 1 and r.get("diags") == [] and r.get("exists") == 1,
+            f"config.get after {r} {err}")
 
 
 @scenario(bound=10)

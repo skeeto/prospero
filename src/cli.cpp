@@ -557,7 +557,8 @@ static Str defaultstate(Os *os, Arena *a)
 }
 
 // The configuration, its diagnostics reported on standard error: an
-// explicit file must exist, and the default one is seeded on first run.
+// explicit file must exist, while the default one need not, none being
+// empty.
 // URL includes as net says (newconfig): with CFG_NETWAIT, those with no
 // cached copy are fetched first, which takes 30 s at most. Null on
 // failure, reported.

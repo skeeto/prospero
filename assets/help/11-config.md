@@ -8,10 +8,11 @@ Prospero reads one INI file:
   `%APPDATA%\prospero\prospero.ini` is used only while there is none
   under home.
 
-`-c FILE` names another. On the first run, Prospero writes the file
-from its built-in copy, whose comments document every section and
-key: read it there for the full list. Changes take effect while
-Prospero runs.
+`-c FILE` names another. Until a setting is first saved, there is no
+file, which is the same as an empty one: nothing is configured. The
+first save, from Settings or by the agent, writes the file from its
+built-in copy, whose comments document every section and key: read it
+there for the full list. Changes take effect while Prospero runs.
 
 The Settings pane ([View → Settings](view:settings)) edits the file in
 place, a page for each section, changing only the lines it sets and
@@ -29,8 +30,8 @@ the X at the field's end, empties it.
 
 **Open in editor**, beside Reload, opens the file itself in your
 editor (`[ui] editor`, else `$VISUAL` or `$EDITOR`), to edit it by
-hand. A missing file is first created: from the built-in copy, as on
-the first run, or empty for one named by `-c`. Once the editor exits, Settings reads the file again.
+hand. A missing file is first created: from the built-in copy, as by
+a first save, or empty for one named by `-c`. Once the editor exits, Settings reads the file again.
 Cancel stops the editor and keeps the file as it left it.
 
 The state directory holds the sessions, those in the Trash too, the

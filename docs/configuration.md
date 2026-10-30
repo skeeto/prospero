@@ -5,9 +5,10 @@ which defaults to `~/.config/prospero/prospero.ini`. On Windows, home
 is `%HOME%`, else `%USERPROFILE%`, so that Prospero started from
 Explorer finds the same files as from a shell that sets HOME, and
 `%APPDATA%\prospero\prospero.ini` is used only while there is none
-under home. On first run it writes the file
-from its built-in copy ([assets/prospero.ini](../assets/prospero.ini)),
-which documents every section and key: `[endpoint NAME]`,
+under home. With no file, nothing is configured, and none is written
+until a setting is first saved, which writes the file from its
+built-in copy ([assets/prospero.ini](../assets/prospero.ini)). The copy
+sets nothing, and documents every section and key: `[endpoint NAME]`,
 `[model NAME]`, `[role NAME]`, `[guard]`, `[tools]`, `[instructions]`,
 `[skills]`, `[sessions]`, `[ui]`, `[desktop]`, `[host]` and `[remote NAME]`. Changes take effect while it
 runs. An unknown key or a bad value is reported in the diagnostics,
