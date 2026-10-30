@@ -434,6 +434,7 @@ struct GuiHost {
     Str      regpath;   // GH_LOCAL: its registration, removed once it is gone
     i64      opens;     // times its link was made, for the checklist
     i64      downs;     // times it went down
+    i64      deploying; // times a connect deployed an engine there
     // Its engine, as its hello says (hostcan)
     Str        version;
     Slice<Str> cmds;    // the commands it takes
@@ -6640,6 +6641,7 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
     h->deploys = h->state==RS_FAILED && jsonstr(jsonget(r->root, "deploy")).len;
     h->up      = h->state == RS_UP;
     h->downs  += h->state==RS_DOWN && was!=RS_DOWN;
+    h->deploying += h->state==RS_DEPLOYING && was!=RS_DEPLOYING;
     if (h->state==RS_FAILED && was==RS_DEPLOYING) {
         // A connect's deployment failed: its library says why ("cannot
         // deploy an engine: ...")
@@ -10611,7 +10613,7 @@ enum : i32 {
     CHK_QUEUEKEPT,    // queued messages left the tail untaken dx times
     CHK_WSLLISTED,    // the WSL distro Deb is a remote, in the sidebar, and
                       // docker-desktop is none
-    CHK_WSLFAILED,    // Deb, with no engine there, failed offering to deploy
+    CHK_WSLDEPLOYED,  // Deb, with no engine there, deployed one and came up
     CHK_WSLSECTION,   // Deb's Settings wrote [remote Deb] wsl = Deb
     CHK_NEWLISTED,    // the new session dialog's remote host listed its
                       // models, with the dialog open all along
@@ -10878,7 +10880,7 @@ static Str chknames[] = {
     "the queued message shows in the transcript, below its last message",
     "a queued message left the transcript only when withdrawn or taken in",
     "the WSL distro is listed as a remote, in the sidebar too, Docker's not",
-    "the WSL distro with no engine in it failed, offering to deploy one",
+    "the WSL distro with no engine in it deployed one on connecting, and came up",
     "the WSL distro's Settings wrote a section of its own for it",
     "the dialog's remote host's models came, the dialog open all along",
     "a Windows path typed for a WSL distro became the distro's",
@@ -10960,7 +10962,6 @@ enum : i32 {
     W_DEPLOYOFFER,// the remote "missing" failed, offering to deploy
     W_SIDECHAT,   // a side chat is shown, open, its replay applied
     W_WSLLISTED,  // WSL distros were listed
-    W_WSLFAILED,  // the WSL distro Deb failed
     W_WSLSECTION, // the configuration has [remote Deb]
     W_NEWLISTED,  // the new session dialog's host listed its models
     W_NAMEDUP,    // the remote named by text is up
@@ -10990,7 +10991,7 @@ static Str waitnames[] = {
     "a change to the session", "a compaction card",
     "a named item", "a launch to hand off", "the import", "the export",
     "the plan", "the menu's pick", "the drafts kept", "the offer to deploy",
-    "the side chat", "the WSL distros", "the WSL distro to fail",
+    "the side chat", "the WSL distros",
     "the WSL distro's section", "the dialog's host's models",
     "the named remote to come up", "the named remote to close",
     "the named remote's update", "the MCP server's state", "the MCP sign-in",
@@ -13439,9 +13440,9 @@ static DriveOp remoteops[] = {
     {OP_UP, 0, 0, 0, 100, ""},
     {OP_WAIT, W_NAMEDCLOSED, 0, 0, 30000, "missing"},
     // An installed WSL distro, through a stand-in for wsl.exe: a remote
-    // by itself, in the sidebar, Docker Desktop's left out. With
-    // no engine in it, it fails, offering to deploy one; its Settings
-    // begin a section of its own
+    // by itself, in the sidebar, Docker Desktop's left out. With no
+    // engine in it, connecting deploys one (deploy = auto, with no
+    // section to say otherwise); its Settings begin a section of its own
     {OP_IFWSL, 0, 15, 0, 0, ""},
     {OP_WAIT, W_WSLLISTED, 0, 0, 15000, ""},
     {OP_MARK, 0, 0, 0, 500, ""},
@@ -13449,9 +13450,9 @@ static DriveOp remoteops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "connect Deb"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 100, ""},
-    {OP_WAIT, W_WSLFAILED, 0, 0, 30000, ""},
+    {OP_WAIT, W_NAMEDUP, 0, 0, 90000, "Deb"},
     {OP_MARK, 0, 0, 0, 300, ""},
-    {OP_CHECK, CHK_WSLFAILED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_WSLDEPLOYED, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "remote-1-wsl"},
     {OP_MOVE, T_NAMED, 0, 0, 100, "settings Deb"},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -15507,10 +15508,6 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_WSLLISTED:
         return g->wsllists > 0;
-    case W_WSLFAILED: {
-        GuiHost *h = findhost(g, GH_REMOTE, "Deb");
-        return h && h->state==RS_FAILED;
-    }
     case W_WSLSECTION:
         return cfghas(g, "remote", "Deb");
     case W_NEWLISTED:
@@ -17568,12 +17565,11 @@ static b32 drivecheck(Gui *g, i32 chk)
         return deb && !docker && wslautohost(g, "Deb") && !wslautohost(g, "docker-desktop") &&
                remoteset(g, "Deb", "wsl")=="Deb" && remotelisted(g, 0, "Deb");
     }
-    case CHK_WSLFAILED: {
+    case CHK_WSLDEPLOYED: {
         Arena    a = g->frame;
         GuiHost *h = findhost(g, GH_REMOTE, "Deb");
-        return h && h->state==RS_FAILED && !h->r && h->deploys &&
-               find(h->msg, "no engine on Deb")>=0 &&
-               hostlabel(g, &a, h)=="Deb (WSL)";
+        return h && h->up && h->r && h->deploying==1 && !h->deployfail &&
+               !g->dtoasthost && hostlabel(g, &a, h)=="Deb (WSL)";
     }
     case CHK_WSLSECTION:
         return cfghas(g, "remote", "Deb") && remoterow(g, "Deb", "wsl")=="Deb" &&
