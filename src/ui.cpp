@@ -3977,6 +3977,9 @@ static void drawgreeting(Gui *g, ImVec2 wpos, f32 winh, f32 width)
     ImGui::SameLine(0, 0);
     ImGui::PushStyleColor(ImGuiCol_Text, g->pal->dim);
     ImGui::TextUnformatted(" to support the project.");
+    ImGui::Dummy(v2(0, 6*sc));
+    ImGui::TextUnformatted("The Professional Edition can deploy agents across "
+                           "operating systems and architectures.");
     ImGui::PopStyleColor();
     ImGui::PopTextWrapPos();
     ImGui::EndGroup();
