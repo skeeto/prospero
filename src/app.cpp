@@ -1575,6 +1575,7 @@ struct Gui {
     Str                driverwd;     // --rcwd: the remote one
     b32                kidlinkshown; // a task row asked to answer its subagent
     i32                bgshown;      // tool rows' Run in background drawn
+    i32                stopshown;    // and their Stop
     i64                rewsent;      // rewinds sent
     i32                drivewait;    // W_* condition it waits for
     i64                holduntil;    // µs: the inbox is left alone until
@@ -3461,6 +3462,22 @@ static void guibackground(Gui *g, GuiSession *s, Str call)
     cmdsend(g, &w, a);
 }
 
+// Stop a row's running command alone: killed, its call ends with what it
+// printed so far, and the agent goes on.
+static void guistopcall(Gui *g, GuiSession *s, ViewTool *t)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + t->call.len);
+    EvOut w = cmdopen(g, &b, CMD_CALLSTOP, s);
+    putkey(&w.json, "call");
+    putstr(&w.json, t->call);
+    t->stopasked = 1;
+    s->cmdid   = g->nextid;
+    s->cmdtext = {};
+    s->note    = {};
+    cmdsend(g, &w, a);
+}
+
 // The session operations the compose box's slash commands and the
 // session menus run alike: the reply's outcome becomes the session's
 // note above the box, and a failed command's text, kept in cmdtext by
@@ -4707,6 +4724,9 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
         setnote(g, s, "moved to the background: the agent goes on, and is "
                 "told when it ends", 0);
         break;
+    case CMD_CALLSTOP:
+        s->note = {};  // its row says so
+        break;
     case CMD_MODEL: {
         // The transcript's mark names the model: here, what changes
         s->note = {};
@@ -5067,6 +5087,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_SHELL:
     case CMD_FORK:
     case CMD_BACKGROUND:
+    case CMD_CALLSTOP:
         onsesscmd(g, h, scratch, &q, r);
         return;
 
@@ -11163,6 +11184,9 @@ enum : i32 {
                       // drawn, and the agent went on: nothing more to move
     CHK_BGTASKS,      // the task rows at work offer Run in background beside
                       // their Open subagent
+    CHK_STOPBTN,      // the running command's row shows its command as a
+                      // code block, and offers Stop right of Run in background
+    CHK_STOPPED,      // that row is stopped, with no job, and nothing to stop
     CHK_NEWPICKS,     // the new session's model list drew: the defaults
                       // first, then text's models (text "fake/")
     CHK_NEWPICKED,    // the combo shows the pick (pickwant)
@@ -11438,6 +11462,8 @@ static Str chknames[] = {
     "the running command's row offers Run in background",
     "Cmd+B moved the command to the background as a job, and the agent went on",
     "the task rows at work offer Run in background, and their subagents",
+    "the running command's row shows the command, and offers Stop after Run in background",
+    "Stop killed the command alone: its row is stopped, and the agent went on",
     "the model list has the defaults first, then the endpoint's models",
     "the model combo shows the model picked",
     "the new session has the endpoint and model picked",
@@ -12582,6 +12608,17 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_SAID, 0, 0, 10000, "It runs as a job."},
     {OP_CHECK, CHK_BGMOVED, 0, 0, 0, ""},
     {OP_WAIT, W_SAID, 0, 0, 15000, "The long command ended."},
+    // Stop: a command killed alone from its row, the agent going on
+    {OP_PROMPT, 0, 0, 0, 0, "Run a command to stop."},
+    {OP_WAIT, W_TOOL, 0, 0, 10000, ""},
+    {OP_WAIT, W_NAMED, 0, 0, 5000, "stop command"},
+    {OP_CHECK, CHK_STOPBTN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "10-stopbtn"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "stop command"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_SAID, 0, 0, 10000, "It was stopped."},
+    {OP_CHECK, CHK_STOPPED, 0, 0, 0, ""},
     // Then dark. The latest write undone from its row, the turn rewound
     // into a conflict with a change made outside, then forced
     {OP_SYSTHEME, 0, 1, 0, 1000, ""},
@@ -18200,6 +18237,26 @@ static b32 drivecheck(Gui *g, i32 chk)
                     bgrow(v->msgs[i].tool);
         }
         return rows==2 && g->bgshown==2 && g->rects[RECT_TASKLINK].x1>0;
+    }
+    case CHK_STOPBTN: {
+        ViewMsg *m   = lastof(v, VIEW_TOOL);
+        Rect     bg  = {};
+        Rect     stp = {};
+        for (i32 i = 0; i < g->nnamed; i++) {
+            Str name = {g->named[i].name, g->named[i].len};
+            bg  = name==Str(bglabel) ? g->named[i].r : bg;
+            stp = name=="stop command" ? g->named[i].r : stp;
+        }
+        i32  mi  = m ? (i32)(m - v->msgs.data) : -1;
+        Doc *d   = m && !m->collapsed ? msgdoc(v, mi) : 0;
+        return m && m->tool->name=="shell" && bgrow(m->tool) && g->bgshown==1 &&
+               g->stopshown==1 && bg.x1>0 && stp.x0>=bg.x1 && d && d->blocks.len &&
+               d->blocks[0].type==DOC_CODE && copyblock(v, &g->frame, mi, 0)==m->tool->cmd;
+    }
+    case CHK_STOPPED: {
+        ViewMsg *m = lastof(v, VIEW_TOOL);
+        return m && m->tool->status==VTOOL_STOPPED && !m->tool->job && !m->tool->hasexit &&
+               find(m->text, "stopped by the user")>=0 && !g->stopshown && !g->bgshown;
     }
     case CHK_BGMOVED: {
         // The same row, now a job's, and the agent's reply after it

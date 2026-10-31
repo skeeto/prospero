@@ -1459,6 +1459,7 @@ enum : i32 {
     ACT_OPEN,     // show a task's subagent
     ACT_OUTPUT,   // show a call's whole output (its spill file)
     ACT_BACKGROUND, // move a running command or subagent to the background
+    ACT_STOP,     // stop a running command alone, the agent going on
 };
 
 // An icon button's width: the same for every icon, which all share
@@ -1489,13 +1490,24 @@ struct MsgAction {
     b32         amber;  // it waits for the user
     GuiSession *child;
     f32         bgw;    // a running task's Run in background too, to the
-                        // left of its Open subagent: its width, else 0
+                        // left of its Open subagent, or a command's to
+                        // the left of its Stop: its width, else 0
     b32         icon;   // label is an icon (Undo, Output, Rewind)
 };
 
 static char const bglabel[] = "Run in background";
 static char const *cmdkey(Gui *, Arena *, Str);
 static void itemnamed(Gui *, Str);
+static b32  hostlive(Gui *, GuiSession *);
+
+// Whether a row's command can be stopped alone (call.stop): a shell call
+// running in the foreground, as its host can.
+static b32 canstop(Gui *g, GuiSession *s, ViewTool *t)
+{
+    return s && s->view && !s->readonly && t->name=="shell" &&
+           t->status==VTOOL_RUNNING && !t->job && !t->stopasked &&
+           hostcap(s->host, "call.stop") && hostlive(g, s);
+}
 
 // The action at the right of a message's header, if any.
 static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
@@ -1549,6 +1561,15 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
             r.label = bglabel;
             r.w     = w;
         }
+    }
+    if (m->role==VIEW_TOOL && s==g->sess && canstop(g, s, t) &&
+            (!r.kind || r.kind==ACT_BACKGROUND)) {
+        // At the right, Run in background left of it
+        r.bgw   = r.kind ? r.w : 0;
+        r.kind  = ACT_STOP;
+        r.label = ICON_STOP "###stopcall";
+        r.icon  = 1;
+        r.w     = iconw();
     }
     return r;
 }
@@ -1634,6 +1655,13 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
         }
         if (go) guibackground(g, s, t->call);
     } break;
+    case ACT_STOP:
+        itemnamed(g, "stop command");
+        g->stopshown++;
+        ImGui::SetItemTooltip("Stop: kill the command, and let the agent go on with "
+                              "its output so far");
+        if (go) guistopcall(g, s, t);
+        break;
     }
 }
 
@@ -4260,6 +4288,7 @@ static void drawtranscript(Gui *g)
     g->rects[RECT_CODECOPY]  = {};
     g->copiedshown = 0;
     g->bgshown     = 0;
+    g->stopshown   = 0;
     sp->Split(dl, CH_COUNT);
     for (i32 i = d0; i>=0 && i <= d1; i++) {
         if (msghidden(v, &v->msgs[i])) {

@@ -19,7 +19,8 @@ command's row, or Ctrl+B, moves it to the background as a job now,
 and the agent goes on, so that you can talk to it while the command
 runs. The agent is told that you moved it, and is told when it ends,
 as for any job. Only you can do this; the agent cannot. With 16 jobs
-running already in the session, it is refused.
+running already in the session, it is refused. Or Stop, right of it,
+kills the command, and the agent goes on with its output so far.
 
 The Jobs pane lists the session's jobs, with their state, run time and
 output size. Kill stops a job and what it started, and the agent is

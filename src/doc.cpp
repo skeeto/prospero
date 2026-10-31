@@ -648,6 +648,31 @@ static int mdleavespan(MD_SPANTYPE type, void *, void *ud)
 }
 
 // Plain text: one block per line, nothing interpreted.
+// A block per line of src from offset from on.
+static void plainlines(DocParse *p, Str src, iz from, i32 style)
+{
+    for (Str rest = cuthead(src, from);;) {
+        Cut c = cut(rest, '\n');
+        i32 off = (i32)(rest.data - src.data);
+        p->lastoff = off;
+        openblock(p, DOC_PLAIN);
+        if (c.head.len) {
+            Piece pc = {};
+            pc.off   = off;
+            pc.len   = (i32)c.head.len;
+            pc.text  = c.head;
+            pc.style = style;
+            pc.link  = -1;
+            addpiece(p, pc);
+        }
+        closeblock(p);
+        if (!c.ok) {
+            break;
+        }
+        rest = c.tail;
+    }
+}
+
 static Doc *parseplain(Arena *perm, Str src, i32 style)
 {
     Doc     *d = alloc<Doc>(perm);
@@ -659,25 +684,35 @@ static Doc *parseplain(Arena *perm, Str src, i32 style)
     p.size  = src.len;
     d->src   = src;
     d->plain = 1;
-    for (Str rest = src;;) {
-        Cut c = cut(rest, '\n');
-        i32 off = (i32)(rest.data - src.data);
-        p.lastoff = off;
-        openblock(&p, DOC_PLAIN);
-        if (c.head.len) {
-            Piece pc = {};
-            pc.off   = off;
-            pc.len   = (i32)c.head.len;
-            pc.text  = c.head;
-            pc.style = style;
-            pc.link  = -1;
-            addpiece(&p, pc);
-        }
-        closeblock(&p);
-        if (!c.ok) {
-            break;
-        }
-        rest = c.tail;
+    plainlines(&p, src, 0, style);
+    return d;
+}
+
+// A shell call's row: its command, the first cmdlen bytes of src, as a
+// highlighted code block, then a line break, then the output's lines.
+static Doc *parseshell(Arena *perm, Str src, iz cmdlen, HlMemo **memo)
+{
+    Doc     *d = alloc<Doc>(perm);
+    DocParse p = {};
+    p.perm  = perm;
+    p.doc   = d;
+    p.memo  = memo;
+    p.cur   = -1;
+    p.base  = src.data;
+    p.size  = src.len;
+    d->src   = src;
+    d->plain = 1;
+    i32 b = openblock(&p, DOC_CODE);
+    d->blocks[b].lang = "sh";
+    Piece pc = {};
+    pc.len   = (i32)cmdlen;
+    pc.text  = takehead(src, cmdlen);
+    pc.style = STYLE_CODE;
+    pc.link  = -1;
+    addpiece(&p, pc);
+    closeblock(&p);
+    if (src.len > cmdlen+1) {
+        plainlines(&p, src, cmdlen+1, STYLE_CODE);
     }
     return d;
 }

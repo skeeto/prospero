@@ -1434,6 +1434,49 @@ def bg_shell(t):
 
 
 @scenario(bound=20)
+def call_stop(t):
+    """The user stops a running command alone (call.stop): it is killed,
+    its call ends with its output so far as "stopped", with no exit code
+    and no job, and the turn goes on with the agent reading that."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        r = h.call("call.stop", sid=sid)
+        t.check(r.get("ok") == 0 and r.get("err") == "no command is running", f"idle: {r}")
+        h.send("prompt", sid=sid, text="go")
+        start = h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        pids = waitpids(t, "stoppid")
+        t.check(pids, "the command started")
+        r = h.call("call.stop", sid=sid, call="nope")
+        t.check(r.get("ok") == 0 and "not the one running" in r.get("err", ""),
+                f"another call: {r}")
+        time.sleep(1)
+        r = h.call("call.stop", sid=sid, call=start["call"])
+        t.check(r.get("ok") == 1, f"stopped: {r}")
+        end = h.wait(lambda e: e.get("ev") == "tool.end" and e.get("sid") == sid)
+        t.check(end["status"] == "stopped" and "exit" not in end and "job" not in end and
+                "started" in end["text"] and end["ms"] < 5000, f"the call ended: {end}")
+        t.check(re.search(r"\[stopped by the user after [12](\.[0-9])? s: the command was "
+                          r"killed\. Do not run it again as it was\]", end["text"]),
+                f"its text: {end['text']!r}")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(not h.all("job.start", sid), "no job")
+        msgs = t.requests()[-1]["body"]["messages"]
+        tool = [m for m in msgs if m["role"] == "tool"]
+        t.check(tool and "stopped by the user" in tool[-1]["content"],
+                f"the agent read the result: {tool}")
+        a = h.all("assistant", sid)
+        t.check(a and a[-1]["blocks"][-1].get("text") == "Going on.", f"went on: {a[-1:]}")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not t.gone(pids):
+            time.sleep(0.1)
+        t.check(t.gone(pids), "the command's process is gone")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=20)
 def bg_full(t):
     """With 16 jobs running, a command cannot be moved to the background."""
     h = t.headless()
@@ -3294,7 +3337,7 @@ def hello_caps(t):
                                                    "relay.offer", "relay.data",
                                                    "relay.more", "relay.peer",
                                                    "relay.call", "offer", "ask.touch",
-                                                   "shell.env"]
+                                                   "shell.env", "call.stop"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and

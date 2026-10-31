@@ -186,6 +186,7 @@ enum : i32 {
     CMD_OFFER,       // this engine's models as relay.offer gives them
     CMD_ASKTOUCH,    // the user works on a waiting ask's answer
     CMD_SHELLENV,    // a session's shell's environment, to open it by hand
+    CMD_CALLSTOP,    // the running command stopped, while the turn goes on
     CMD_COUNT,
 };
 
@@ -198,7 +199,7 @@ static Str cmdnames[] = {
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
-    "relay.call", "offer", "ask.touch", "shell.env",
+    "relay.call", "offer", "ask.touch", "shell.env", "call.stop",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -294,6 +295,8 @@ static Str capnames[] = {
                        // records change (0 for none)
     "shell.env",       // shell.env {sid}: the environment, and distro, to
                        // open the session's shell in by hand
+    "call.stop",       // call.stop {sid, call}: the running command killed,
+                       // its tool.end status "stopped", the turn going on
 };
 
 static Str evname(i32 ev)

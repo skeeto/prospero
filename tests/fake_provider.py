@@ -2679,7 +2679,8 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Start a subagent that messages", "Message the parent as a subagent",
                "Describe the images", "Ask on the side", "Run a long command",
                "Stream, then pause", "Call the MCP server", "Remember the hosts",
-               "Answer with links", "Ask me questions", "Describe the files")
+               "Answer with links", "Ask me questions", "Describe the files",
+               "Run a command to stop")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -2991,6 +2992,14 @@ def sc_gui(model, n, req):
             yield from answer(model, "It runs as a job." if moved else "It ran to its end.")
         else:
             yield from answer(model, "The long command ended.")
+    elif "Run a command to stop" in prompt:
+        # Until the user stops it from its row
+        if step == 0:
+            yield from tool(model, n, "shell", {"command": "echo waiting; sleep 30",
+                                                "timeout": 60})
+        else:
+            stopped = "stopped by the user" in str(last.get("content", ""))
+            yield from answer(model, "It was stopped." if stopped else "It ran to its end.")
     elif "Start a subagent that messages" in prompt:
         # Its message waits for the parent's next step, after the report
         if step == 0:
@@ -4726,6 +4735,16 @@ def sc_bg_shell(model, n, req):
         yield from answer(model, "Going on.")
     else:
         yield from answer(model, "Saw: " + last_user(req)[:60])
+
+
+def sc_call_stop(model, n, req):
+    # A command the user stops, and the agent goes on
+    k = step(req)
+    if k == 0:
+        cmd = "echo $$ > stoppid; echo started; sleep 30; echo finished"
+        yield from tool(model, n, "shell", {"command": cmd, "timeout": 60})
+    else:
+        yield from answer(model, "Going on.")
 
 
 def sc_bg_full(model, n, req):

@@ -71,6 +71,11 @@ the Session menu and as `/background`) lets it go on by itself while
 the agent goes on with you; the agent is told when it ends. See
 [Jobs, todo and subagents](help:jobs).
 
+A command's row shows the command in full, with a Copy button, above
+its output. Stop, at the right of a running command's row, kills that
+command alone: the agent gets what it printed so far, is told you
+stopped it, and goes on. The row says "stopped".
+
 A message starting with a command runs it instead of going to the
 agent (Tab completes the name):
 

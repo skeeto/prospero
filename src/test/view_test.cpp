@@ -321,17 +321,29 @@ static void test_view(Test *t)
                     R"({"t":"call","id":"c1","name":"shell","args":"{\"command\":\"make test\\nmore\"}"},)"
                     R"({"t":"call","id":"c2","name":"edit","args":"{\"path\":\"a.c\",\"old_string\":\"x\\ny\",\"new_string\":\"z\"}"}]})");
         expect(t, "view.calls", msgsshow(&a, v),
-               "U:go;X[shell make test\xe2\x80\xa6 called]:;X[edit a.c called]:;");
+               "U:go;X[shell make test\xe2\x80\xa6 called]:make test\nmore\n;X[edit a.c called]:;");
         b32 stale = apply(v, a, R"({"sid":"s","ts":0,"ev":"delta","turn":1,"attempt":1,"block":0,"kind":"text","text":"late"})");
         expect(t, "view.staledelta", istr(&a, stale), "0");
         apply(v, a, R"({"sid":"s","seq":6,"ts":2000,"ev":"tool.start","call":"c1","name":"shell","args":"{}","cwd":"/w"})");
         apply(v, a, R"({"sid":"s","ts":2500,"ev":"tool.out","call":"c1","tail":"line 1\n","bytes":7})");
         expect(t, "view.running", msgsshow(&a, v),
-               "U:go;X[shell make test\xe2\x80\xa6 running]:line 1\n;X[edit a.c called]:;");
+               "U:go;X[shell make test\xe2\x80\xa6 running]:make test\nmore\nline 1\n;X[edit a.c called]:;");
         apply(v, a, R"({"sid":"s","seq":7,"ts":3200,"ev":"tool.end","call":"c1","status":"ok","exit":0,"text":"ok\n","spill":"out/c1.log","bytes":3,"ms":1200})");
         ViewTool *sh = v->msgs[1].tool;
-        expect(t, "view.shellend", v->msgs[1].text, "ok\n");  // the Output action has the file
+        expect(t, "view.shellend", v->msgs[1].text, "make test\nmore\nok\n");  // the Output action has the file
         expect(t, "view.spill", sh->spill, "out/c1.log");
+        // The command shows as a code block, its copy button's text the
+        // command whole, over the output's lines
+        Doc *sd = msgdoc(v, 1);
+        Buf  sb(&a, 64);
+        for (iz i = 0; i < sd->blocks.len; i++) {
+            print(&sb, sd->blocks[i].type==DOC_CODE ? Str("code;") : Str("plain;"));
+        }
+        expect(t, "view.shelldoc", finish(&sb), "code;plain;plain;");
+        expect(t, "view.shellcopy", copyblock(v, &a, 1, 0), "make test\nmore");
+        selset(v, 1, 0, 1, (i32)v->msgs[1].text.len);
+        expect(t, "view.shellsel", copysel(v, &a, COPY_TEXT), "make test\nmore\nok");
+        v->sel.active = 0;
         expect(t, "view.shellexit", istr(&a, sh->hasexit*10000 + sh->exit*1000 + sh->ms), "11200");
         b32 late = apply(v, a, R"({"sid":"s","ts":0,"ev":"tool.out","call":"c1","tail":"late","bytes":9})");
         expect(t, "view.lateout", istr(&a, late), "0");
@@ -661,7 +673,7 @@ static void test_view(Test *t)
         expect(t, "view.running2", istr(&a, v->busy*10 + v->asks), "11");
         viewstopped(v);
         expect(t, "view.stopped", msgsshow(&a, v),
-               "U:go;X[shell sleep 60 unknown]:;X[write ../y unknown]:;K:outside;A~:so;");
+               "U:go;X[shell sleep 60 unknown]:sleep 60\n;X[write ../y unknown]:;K:outside;A~:so;");
         ViewTool *k = v->msgs[3].tool;
         expect(t, "view.stoppedask", istr(&a, k->answer*10 + (k->by=="stopped")), "21");
         expect(t, "view.stoppedidle", istr(&a, v->busy*100 + v->asks*10 + (v->state==LIVE_CLOSED)), "1");
@@ -1286,7 +1298,7 @@ static void test_viewpanels(Test *t)
         apply(v, a, R"({"sid":"s","seq":5,"ts":0,"ev":"tool.end","call":"s1","status":"background",)"
                     R"("text":"so far","job":4,"ms":5})");
         expect(t, "panels.task", msgsshow(&a, v),
-               "X[task Look ok]:**Found** it.;X[shell sleep 9 background]:so far;");
+               "X[task Look ok]:**Found** it.;X[shell sleep 9 background]:sleep 9\nso far;");
         expect(t, "panels.taskmd", concat(&a, v->msgs[0].tool->child, istr(&a, v->msgs[0].md)), "kid1");
         expect(t, "panels.background", istr(&a, v->msgs[1].tool->job*10 + v->msgs[1].collapsed), "40");
     }
@@ -1670,28 +1682,28 @@ static void test_viewtranscript(Test *t)
         apply(v, a, end2);
         apply(v, a, end3);
         searchstep(s, 1<<20);
-        expect(t, "find.more", hitshow(&a, s), "4:0;");
+        expect(t, "find.more", hitshow(&a, s), "4:4;");
         togglemsg(v, 2);
         searchstep(s, 1<<20);
-        expect(t, "find.opened", hitshow(&a, s), "2:2;4:0;");
+        expect(t, "find.opened", hitshow(&a, s), "2:2;4:4;");
         viewshowthink(v, 1);
         searchstep(s, 1<<20);
-        expect(t, "find.toggled", hitshow(&a, s), "1:0;2:2;4:0;");
+        expect(t, "find.toggled", hitshow(&a, s), "1:0;2:2;4:4;");
         viewthink(v, THINK_HIDE);
         viewshowthink(v, 0);
         searchstep(s, 1<<20);
-        expect(t, "find.hidden", hitshow(&a, s), "2:2;4:0;");
+        expect(t, "find.hidden", hitshow(&a, s), "2:2;4:4;");
         viewthink(v, THINK_FOLD);
         viewshowthink(v, 1);
         searchreset(s, v, "NEEDLE");
         expect(t, "find.budget", istr(&a, searchstep(s, 10)), "0");
         expect(t, "find.partial", hitshow(&a, s), "1:0;");
         while (!searchstep(s, 10)) {}
-        expect(t, "find.rest", hitshow(&a, s), "1:0;2:2;4:0;");
+        expect(t, "find.rest", hitshow(&a, s), "1:0;2:2;4:4;");
         expect(t, "find.from", istr(&a, searchfrom(s, 3, 0)), "2");
         togglemsg(v, 2);
         searchstep(s, 1<<20);
-        expect(t, "find.refolded", hitshow(&a, s), "1:0;4:0;");
+        expect(t, "find.refolded", hitshow(&a, s), "1:0;4:4;");
         searchreset(s, v, "");
         searchstep(s, 1<<20);
         expect(t, "find.empty", istr(&a, s->hits.len), "0");

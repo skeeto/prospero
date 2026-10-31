@@ -3275,6 +3275,7 @@ struct ShellEnd {
     b32  moved;     // and moved there by the user, not at its timeout
     i64  ms;        // how long it ran, to its exit if it exited
     b32  nojob;     // timed out, but too many jobs ran to move it
+    b32  stopped;   // the user stopped it, and the turn went on
 };
 
 // What the agent sees of a finished command: an excerpt of the cleaned
@@ -3313,6 +3314,10 @@ static ToolOut shellresult(Os *os, Arena *a, Str spill, ShellEnd *e)
         print(&b, "[cancelled by the user after ");
         printelapsed(&b, e->ms);
         print(&b, ": the command was killed]");
+    } else if (e->stopped) {
+        print(&b, "[stopped by the user after ");
+        printelapsed(&b, e->ms);
+        print(&b, ": the command was killed. Do not run it again as it was]");
     } else if (e->job) {
         if (e->moved) {
             print(&b, "[the user moved it to the background after ");

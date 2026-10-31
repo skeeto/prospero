@@ -123,12 +123,13 @@ enum : i32 {
     VTOOL_CANCELLED,
     VTOOL_UNKNOWN,
     VTOOL_BACKGROUND,  // a command moved to the background, as a job
+    VTOOL_STOPPED,     // a command the user stopped, the turn going on
     VTOOL_COUNT,
 };
 
 static Str vtoolnames[] = {
     "called", "streaming", "asking", "running", "ok", "error", "denied",
-    "timeout", "cancelled", "unknown", "background",
+    "timeout", "cancelled", "unknown", "background", "stopped",
 };
 static_assert(countof(vtoolnames) == VTOOL_COUNT);
 
@@ -249,6 +250,8 @@ struct ViewTool {
     Str  name;      // tool name
     Str  args;      // raw arguments (JSON)
     Str  summary;   // one line: the command, the path
+    Str  cmd;       // a shell call's command, on the first lines of its
+                    // row's text, which shows it as a code block
     i32  block;     // provisional: the response block its arguments are
     i32  status;    // VTOOL_*
     i32  exit;
@@ -267,6 +270,7 @@ struct ViewTool {
                     // message's target
     Str  host;      // the host a task's subagent runs on, if not this one
     b32  opened;    // the window reached that subagent (kidsweep), once
+    b32  stopasked; // the user pressed its Stop, which goes meanwhile
     b32  want;      // the user asked to see it: shown once reached
     i32  snap;      // the file it changed: index+1 in the view's snaps
     b32  elided;    // pruned: the agent sees only where its output is
@@ -667,7 +671,8 @@ static b32 toolauto(ViewMsg *m)
         } else if (t->job) {
             return 1;
         } else if (t->name == "shell") {
-            return m->nl > 24;
+            i64 cmdnl = t->cmd.len ? countnl(t->cmd)+1 : 0;
+            return m->nl-cmdnl > 24;
         }
     }
     return t->name=="read" || t->name=="write" || t->name=="todo_write" ||
@@ -1629,6 +1634,19 @@ static ViewSnap *rowsnap(View *v, ViewTool *t)
     return &v->snaps[t->snap-1];
 }
 
+// A row's text: a shell call's command, then its output.
+static Str withcmd(Arena *a, ViewTool *t, Str out)
+{
+    if (!t->cmd.len) {
+        return out;
+    }
+    Buf b(a, t->cmd.len + 1 + out.len);
+    print(&b, t->cmd);
+    putbyte(&b, '\n');
+    print(&b, out);
+    return finish(&b);
+}
+
 // A committed call's row.
 static i32 addcall(View *v, Arena scratch, Str id, Str name, Str args)
 {
@@ -1639,7 +1657,14 @@ static i32 addcall(View *v, Arena scratch, Str id, Str name, Str args)
     t->args    = clone(&v->aux, args);
     t->summary = toolsummary(&v->aux, scratch, name, args, v->cwd);
     t->status  = VTOOL_CALLED;
+    if (name == "shell") {
+        Json *j = jsonparse(&scratch, args).root;
+        t->cmd = clone(&v->aux, jsonstr(jsonget(j, "command")));
+    }
     v->msgs[i].tool      = t;
+    if (t->cmd.len) {
+        settext(v, &v->msgs[i], withcmd(&scratch, t, {}), 0);
+    }
     v->msgs[i].collapsed = toolfolded(v, &v->msgs[i]);
     return i;
 }
@@ -1670,7 +1695,7 @@ static void toolbody(View *v, Arena scratch, ViewMsg *m, Str text)
         settext(v, m, text, 1);
         return;
     }
-    settext(v, m, text, 0);
+    settext(v, m, withcmd(&scratch, t, text), 0);
 }
 
 
@@ -2048,13 +2073,18 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         ViewMsg  *m    = &v->msgs[i];
         ViewTool *t    = m->tool;
         Str       tail = jsonstr(jsonget(j, "tail"));
-        if (tail.len > t->tailcap) {
-            t->tailcap = tail.len>4096 ? tail.len : 4096;
+        iz        head = t->cmd.len ? t->cmd.len+1 : 0;
+        if (head+tail.len > t->tailcap) {
+            t->tailcap = head+tail.len>4096 ? head+tail.len : 4096;
             t->tail    = allocbytes(&v->aux, t->tailcap);
         }
-        copybytes(t->tail, tail.data, tail.len);
+        copybytes(t->tail, t->cmd.data, t->cmd.len);
+        if (head) {
+            t->tail[t->cmd.len] = '\n';
+        }
+        copybytes(t->tail+head, tail.data, tail.len);
         t->outbytes = jsonint(jsonget(j, "bytes"), t->outbytes);
-        m->text = {t->tail, tail.len};
+        m->text = {t->tail, head+tail.len};
         m->nl   = countnl(m->text);
         m->ver++;
         v->outts     = r->ts;
@@ -2722,8 +2752,13 @@ static Doc *msgdoc(View *v, i32 i)
         m->doc = parseplain(&c->arena, m->text, STYLE_DIM);
         break;
     case VIEW_TOOL:
-        m->doc = m->md ? parsedoc(&c->arena, m->text, &c->memo)
-                       : parseplain(&c->arena, m->text, STYLE_CODE);
+        if (m->md) {
+            m->doc = parsedoc(&c->arena, m->text, &c->memo);
+        } else if (m->tool && m->tool->cmd.len) {
+            m->doc = parseshell(&c->arena, m->text, m->tool->cmd.len, &c->memo);
+        } else {
+            m->doc = parseplain(&c->arena, m->text, STYLE_CODE);
+        }
         break;
     default:
         m->doc = parsedoc(&c->arena, m->text, &c->memo);
@@ -3159,8 +3194,8 @@ static Str blocksep(DocBlock *prev, DocBlock *b)
 {
     if (prev->type==DOC_CELL && b->type==DOC_CELL && prev->table==b->table) {
         return prev->row==b->row ? Str("\t") : Str("\n");
-    } else if (prev->type==DOC_PLAIN && b->type==DOC_PLAIN) {
-        return "\n";
+    } else if (b->type==DOC_PLAIN && (prev->type==DOC_PLAIN || prev->type==DOC_CODE)) {
+        return "\n";  // lines of output, the first under its command
     } else if (b->type==DOC_ITEM && (prev->type==DOC_ITEM || prev->depth)) {
         return "\n";
     }
@@ -3641,13 +3676,14 @@ static void viewexport(Buf *b, View *v, Str sid, b32 think, b32 tools, b32 outpu
                 putbyte(b, ')');
             }
             putbyte(b, '\n');
-            if (output && !ask && m->text.len) {
+            Str out = ask ? m->text : cuthead(m->text, t->cmd.len ? t->cmd.len+1 : 0);
+            if (output && !ask && out.len) {
                 putbyte(b, '\n');
-                exportfence(b, m->text);
+                exportfence(b, out);
                 putbyte(b, '\n');
-                print(b, m->text);
-                print(b, m->text[m->text.len-1]=='\n' ? Str("") : Str("\n"));
-                exportfence(b, m->text);
+                print(b, out);
+                print(b, out[out.len-1]=='\n' ? Str("") : Str("\n"));
+                exportfence(b, out);
                 putbyte(b, '\n');
             }
         } break;

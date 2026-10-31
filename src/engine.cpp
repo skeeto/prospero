@@ -5960,13 +5960,15 @@ static b32 startsearch(Session *s, Arena scratch, i32 tool, Str path, Args *args
     return 0;
 }
 
-static void finishshell(Session *s, Arena scratch, b32 cancelled)
+// A command or search ends: cancelled with the turn, or stopped alone
+// by the user, or done.
+static void finishshell(Session *s, Arena scratch, b32 cancelled, b32 stopped = 0)
 {
     Engine *e = s->e;
     disarm(s, T_TOOL);
     disarm(s, T_KILL);
     disarm(s, T_DRAIN);
-    if (s->proc && cancelled && !e->quitting) {
+    if (s->proc && (cancelled || stopped) && !e->quitting) {
         // Stopped as a job is, asked first, while the turn goes on
         Job *j = newjob(s, scratch, {}, {}, s->proc, s->procid, s->sh.spill,
                         s->sh.rel, os_ticks(e->os), 0, 1);
@@ -6009,17 +6011,19 @@ static void finishshell(Session *s, Arena scratch, b32 cancelled)
     end.total     = s->sh.total;
     end.timedout  = s->sh.timedout;
     end.limited   = s->sh.limited;
-    end.cut       = s->sh.exited && !s->sh.eof && !cancelled;
+    end.cut       = s->sh.exited && !s->sh.eof && !cancelled && !stopped;
     end.cancelled = cancelled;
+    end.stopped   = stopped;
     end.timeout   = s->sh.timeout;
     end.nojob     = s->sh.nojob;
     end.ms        = shellran(s);
     ToolOut o = shellresult(e->os, &scratch, s->sh.spill, &end);
     Str status = cancelled    ? Str("cancelled") :
+                 stopped      ? Str("stopped")   :
                  end.timedout ? Str("timeout")   :
                  o.ok         ? Str("ok")        : Str("error");
-    toolend(s, scratch, status, o.text, end.code, !cancelled && !end.timedout,
-            s->sh.rel, n);
+    toolend(s, scratch, status, o.text, end.code,
+            !cancelled && !stopped && !end.timedout, s->sh.rel, n);
 }
 
 
@@ -18410,6 +18414,27 @@ static void cmdconfig(Engine *e, Arena scratch, i64 id, i32 cmd, Json *j)
     replyconfig(e, scratch, id, cmd, &r);
 }
 
+// The user stops the running command: killed, as a cancel's is, but the
+// call ends with its output so far and the turn goes on.
+static void cmdcallstop(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
+{
+    Str call = jsonstr(jsonget(j, "call"));
+    Str why  = {};
+    if (s->state!=S_TOOL || s->desk.busy || !s->proc ||
+               s->sh.tool!=TOOL_SHELL) {
+        why = "no command is running";
+    } else if (call.len && call!=s->calls[s->callidx].id) {
+        why = "that call is not the one running";
+    } else if (s->cancelled || s->sh.exited || s->sh.timedout || s->sh.limited) {
+        why = "the command is ending already";
+    }
+    if (!why.data) {
+        finishshell(s, scratch, 0, 1);
+        nexttool(s, scratch);
+    }
+    reply(e, scratch, id, !why.data, why, s->sid);
+}
+
 // The user moves what the session's turn waits for to the background.
 static void cmdbackground(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
 {
@@ -18766,6 +18791,9 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_BACKGROUND:
         cmdbackground(e, s, scratch, id, j);
+        return;
+    case CMD_CALLSTOP:
+        cmdcallstop(e, s, scratch, id, j);
         return;
     case CMD_ANSWER: {
         Str req      = jsonstr(jsonget(j, "req"));
