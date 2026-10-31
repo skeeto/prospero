@@ -7759,6 +7759,7 @@ static void importfill(Gui *g, GuiHost *h)
         fieldput(g->newcwd, there              ? x->cwd     :
                             newest.len         ? newest     :
                             h->kind!=GH_REMOTE ? g->firstcwd : Str{});
+        g->cwdhost = h==g->main ? 0 : h->uid;
         // A session that had a folder of its own has one again
         g->newnofolder = x->nofolder && hostcap(h, "nofolder");
     }
@@ -8290,6 +8291,29 @@ static void drawwt(Gui *g)
     ImGui::EndPopup();
 }
 
+// The new session dialog's directory as it turns to host h, if it was
+// for another: where a session there last worked, else this computer's
+// first (where Prospero started), else the home directory there, ~.
+static void newcwdfor(Gui *g, Arena a, GuiHost *h)
+{
+    u64 uid = h==g->main ? 0 : h->uid;
+    if (g->cwdhost == uid) {
+        return;
+    }
+    Str dir = h==g->main ? g->firstcwd : Str("~");
+    Slice<GuiSession *> list = sesslist(g, &a);
+    for (iz i = 0; i < list.len; i++) {
+        GuiSession *s   = list[i];
+        Str         cwd = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+        if (s->host==h && cwd.len && !sessnofolder(s)) {
+            dir = homeshow(&a, h, cwd);
+            break;
+        }
+    }
+    fieldput(g->newcwd, dir);
+    g->cwdhost = uid;
+}
+
 static void drawnew(Gui *g)
 {
     f32         sc     = g->scale;
@@ -8325,6 +8349,9 @@ static void drawnew(Gui *g)
     i32      ready = 0;
     for (GuiHost *h = g->hosts; h; h = h->next) {
         ready += hostready(g, h) && (!import || hostcap(h, "import"));
+    }
+    if (!import) {
+        newcwdfor(g, a, host);
     }
     if (import) {
         Import *x = &g->imp;

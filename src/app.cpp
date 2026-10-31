@@ -1283,6 +1283,7 @@ struct Gui {
     GuiHost           *newlisted;  // the host the dialog asked for models
     b32                picklisted; // the open model picker's host was asked
     Str                firstcwd;   // newcwd's first, a directory here
+    u64                cwdhost;    // the host newcwd is for, by uid, 0 here
     Str                newerr;
     u64                browseask;  // its Browse dialog's latest ask
     GuiHost           *browsehost; // and the host it was for
@@ -4568,6 +4569,7 @@ static void opendirnew(Gui *g, Str dir, Str why)
     Arena a = g->frame;
     g->opened++;
     g->newhost = g->main;
+    g->cwdhost = 0;
     fieldput(g->newcwd, dir);
     guilog(g, concat(&a, concat(&a, concat(&a, "a new session in ", dir), ", as "), why));
     guinew(g, g->main, dir, {}, {});
@@ -4595,6 +4597,7 @@ static void gui_drop(Gui *g, Str path, b32 app)
             g->newhost = g->main;
             g->newerr  = {};
             g->opennew = 1;
+            g->cwdhost = 0;
             fieldput(g->newcwd, real);
         }
         scheddirty(&g->sched);
@@ -8041,6 +8044,7 @@ static void ontask(Gui *g, Record r)
     case TASK_BROWSED:
         if (r.id==g->browseask && r.data.len) {
             fieldput(g->newcwd, homeshow(&g->frame, g->browsehost, r.data));
+            g->cwdhost = 0;  // only here
             g->browsed++;
         }
         return;
@@ -11088,6 +11092,8 @@ enum : i32 {
     CHK_NEWLISTED,    // the new session dialog's remote host listed its
                       // models, with the dialog open all along
     CHK_WSLCWD,       // C:\Users\ typed for the WSL host rw is the distro's
+    CHK_NEWCWDHOST,   // the dialog's directory, turned to a remote, is one
+                      // of that host's: ~, or where a session there works
     CHK_MCPSTATE,     // the MCP server web's page says text
     CHK_MCPSIGNED,    // the sign-in to web succeeded, once, through the browser
     CHK_MCPCALL,      // the session's call to web's echo tool came back
@@ -11357,6 +11363,7 @@ static Str chknames[] = {
     "the WSL distro's Settings wrote a section of its own for it",
     "the dialog's remote host's models came, the dialog open all along",
     "a Windows path typed for a WSL distro became the distro's",
+    "the new session's directory, turned to a remote, is one of its own",
     "the MCP server's page says what it is", "signed in through the browser",
     "the MCP server's tool answered the session",
     "the subagent on far was opened here, under its parent, its row on far",
@@ -14004,6 +14011,7 @@ static DriveOp remoteops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_WAIT, W_NEWLISTED, 0, 0, 15000, ""},
     {OP_CHECK, CHK_NEWLISTED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_NEWCWDHOST, 0, 0, 0, ""},
     {OP_CHECK, CHK_BROWSEOFF, 0, 0, 0, ""},
     {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -18186,6 +18194,17 @@ static b32 drivecheck(Gui *g, i32 chk)
         Str f = {(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)};
         return g->newhost && g->newhost->name=="rw" && hostwsl(g, g->newhost) &&
                f=="/mnt/c/Users/";
+    }
+    case CHK_NEWCWDHOST: {
+        Arena    a = g->frame;
+        GuiHost *h = g->newhost;
+        Str      f = {(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)};
+        b32      ok = f == "~";
+        for (GuiSession *s = g->sessions; h && !ok && s; s = s->next) {
+            Str cwd = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+            ok = s->host==h && cwd.len && homeshow(&a, h, cwd)==f;
+        }
+        return h && h->kind==GH_REMOTE && ok && f!=g->firstcwd;
     }
     case CHK_NEWLISTED: {
         GuiHost *h = g->newhost;
