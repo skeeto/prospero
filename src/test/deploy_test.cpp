@@ -294,7 +294,8 @@ static void test_deploywsl(Test *t)
     expect(t, "deploy.wsl.env2", joinwords(&a, linkenv(&a, env, 0)), "PATH=/bin|WSL_UTF8=0");
 
     // wsl.exe -l -q: UTF-16, with or without a BOM, unless WSL_UTF8
-    Str utf8 = "Debian\r\ndocker-desktop\r\nUbuntu-24.04\r\ndocker-desktop-data\r\n";
+    Str utf8 = "Debian\r\ndocker-desktop\r\nUbuntu-24.04\r\ndocker-desktop-data\r\n"
+               "podman-machine-default\r\npodman-dev\r\n";
     Buf u16(&a, 256);
     for (iz i = 0; i < utf8.len; i++) {
         putbyte(&u16, utf8[i]);

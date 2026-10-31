@@ -1423,9 +1423,10 @@ static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str 
 
 // The distros in wsl.exe -l -q's output, which is UTF-16 (little
 // endian) unless it honors WSL_UTF8, as older ones do not, else UTF-8.
-// Docker Desktop's own (docker-desktop, docker-desktop-data) are left
-// out, as is anything but a plain name: letters, digits, ., - and _,
-// as WSL allows.
+// Container engines' own are left out: Docker Desktop's (docker-desktop,
+// docker-desktop-data) and Podman's machines (podman-machine-default,
+// podman-NAME), as is anything but a plain name: letters, digits, ., -
+// and _, as WSL allows.
 static Slice<Str> wsldistros(Arena *a, Str out)
 {
     Slice<Str> r = {};
@@ -1441,7 +1442,7 @@ static Slice<Str> wsldistros(Arena *a, Str out)
             u8 c = name[i];
             ok = alnum(c) || c=='.' || c=='-' || c=='_';
         }
-        if (ok && !startswith(name, "docker-desktop")) {
+        if (ok && !startswith(name, "docker-desktop") && !startswith(name, "podman-")) {
             r = push(a, r, clone(a, name));  // out may be the caller's scratch
         }
     }
