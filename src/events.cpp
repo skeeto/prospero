@@ -185,6 +185,7 @@ enum : i32 {
     CMD_RELAYCALL,   // a thin engine's call, for this engine to make
     CMD_OFFER,       // this engine's models as relay.offer gives them
     CMD_ASKTOUCH,    // the user works on a waiting ask's answer
+    CMD_SHELLENV,    // a session's shell's environment, to open it by hand
     CMD_COUNT,
 };
 
@@ -197,7 +198,7 @@ static Str cmdnames[] = {
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
-    "relay.call", "offer", "ask.touch",
+    "relay.call", "offer", "ask.touch", "shell.env",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -291,6 +292,8 @@ static Str capnames[] = {
                        // which ask.touch {sid, req} starts again as the
                        // user answers, and ask.deadline {req, deadline}
                        // records change (0 for none)
+    "shell.env",       // shell.env {sid}: the environment, and distro, to
+                       // open the session's shell in by hand
 };
 
 static Str evname(i32 ev)

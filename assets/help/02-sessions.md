@@ -181,7 +181,11 @@ Right-click a session in the sidebar, or open the Session menu, for:
   works in, as the terminal button above the transcript and the Info
   popup's open one, running the
   session's shell (a POSIX sh as a login shell), or where that is
-  `/bin/sh` or bash on Linux and macOS, the terminal's own. On a remote it is a shell there, over
+  `/bin/sh` or bash on Linux and macOS, the terminal's own. Its
+  `[shell]` section's `env.NAME`, `path_prepend` and `path_append`
+  apply, as to the agent's commands, and a WSL shell opens in its
+  `distro` (but not on macOS, where Terminal keeps its own
+  environment). On a remote it is a shell there, over
   ssh (`ssh -t`, so it may ask for a password) or WSL. The terminal is
   `[ui] terminal`, else Terminal on macOS, Windows Terminal (or a
   console) on Windows, and elsewhere `$TERMINAL` or the first of the

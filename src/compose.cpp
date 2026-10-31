@@ -611,10 +611,10 @@ static Slice<Str> termwsl(Arena *a, Str wsl, Str distro, Str dir)
 
 // The command that opens a session's shell by hand, as its records give
 // its kind (tools.cpp shellkinds) and program: a POSIX sh as a login
-// shell, so its profile sets it up. None for a POSIX system's bash or
-// /bin/sh, the defaults, where the terminal's own shell, the user's, is
-// better.
-static Slice<Str> termshell(Arena *a, Str kind, Str path, b32 win)
+// shell, so its profile sets it up; wsl in its section's distro, if
+// any. None for a POSIX system's bash or /bin/sh, the defaults, where
+// the terminal's own shell, the user's, is better.
+static Slice<Str> termshell(Arena *a, Str kind, Str path, b32 win, Str distro = {})
 {
     Slice<Str> r = {};
     b32 dflt = !win && kind=="sh" && (path=="/bin/sh" || basename(path)=="bash");
@@ -629,6 +629,9 @@ static Slice<Str> termshell(Arena *a, Str kind, Str path, b32 win)
         r = push(a, r, Str("-l"));
     } else if (kind=="pwsh" || kind=="powershell") {
         r = push(a, r, Str("-NoLogo"));
+    } else if (kind=="wsl" && distro.len) {
+        r = push(a, r, Str("-d"));
+        r = push(a, r, distro);
     }
     return r;
 }

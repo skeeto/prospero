@@ -220,6 +220,11 @@ static void test_compose(Test *t)
     expect(t, "term.cmd", argstr(&a, termshell(&a, "cmd", "C:\\W\\cmd.exe", 1)),
            "C:\\W\\cmd.exe");
     expect(t, "term.zsh", argstr(&a, termshell(&a, "sh", "/bin/zsh", 0)), "/bin/zsh|-l");
+    expect(t, "term.wslshell", argstr(&a, termshell(&a, "wsl", "C:\\W\\wsl.exe", 1)),
+           "C:\\W\\wsl.exe");
+    expect(t, "term.wsldistro",
+           argstr(&a, termshell(&a, "wsl", "C:\\W\\wsl.exe", 1, "Debian")),
+           "C:\\W\\wsl.exe|-d|Debian");
     Slice<Str> zsh = termshell(&a, "sh", "/bin/zsh", 0);
     tr = termargv(&a, TERM_WIN, "wt.exe", "C:\\p", termshell(&a, "sh", "C:/w/sh.exe", 1), 1);
     expect(t, "term.wtshell", argstr(&a, tr.argv), "wt.exe|-d|C:\\p|C:/w/sh.exe|-l");

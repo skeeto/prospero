@@ -2526,7 +2526,7 @@ def shell_switch(t):
     def told(sid):
         return [x for x in logged(t, sid) if x.get("ev") == "notice" and x.get("kind") == "shell"]
     try:
-        a = t.headless()
+        a = t.headless(env={"PAGER": "mypager", "TERM": "myterm"})
         r = a.call("shells")
         names = {x["name"]: x for x in r.get("shells", [])}
         # Elsewhere than Windows bash comes first, when found, and sh is
@@ -2552,6 +2552,16 @@ def shell_switch(t):
         rec = [x for x in logged(t, sid) if x.get("ev") == "shell"]
         t.check(len(rec) == 1 and rec[0].get("name") == "other" and
                 rec[0].get("by") == "user", f"shell record {rec}")
+        # The environment to open it in by hand: the section's settings
+        # over this process's own, not the agent's pager of cat and such
+        r = a.call("shell.env", sid=sid)
+        env = r.get("env", [])
+        t.check(r.get("ok") == 1 and r.get("shell") == "other" and "WHICH=other" in env and
+                any(x.upper().startswith("PATH=") for x in env) and
+                "PAGER=mypager" in env and "TERM=myterm" in env,
+                f"shell.env {r.get('shell')}: names {[x.split('=')[0] for x in env]}")
+        r = a.call("shell.env", sid="20000101-000000-0000")
+        t.check(r.get("ok") == 0, f"shell.env of none {r}")
 
         a.send("prompt", sid=sid, text="run")
         t.check("WHICH=other" in which(a, sid, 2), "the other shell's command")
@@ -3283,7 +3293,8 @@ def hello_caps(t):
                                                    "git", "trash", "trash.empty",
                                                    "relay.offer", "relay.data",
                                                    "relay.more", "relay.peer",
-                                                   "relay.call", "offer", "ask.touch"]
+                                                   "relay.call", "offer", "ask.touch",
+                                                   "shell.env"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and

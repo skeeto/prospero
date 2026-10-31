@@ -5134,45 +5134,47 @@ static Str wslprelude(Arena *a, Str pre, Str post)
     return finish(&b);
 }
 
-// A command's environment in shell sh, its section's settings as the
-// configuration now says: engineenv's, with HOME for busybox-w32's sh
-// (envhome), with PATH wrapped in the
-// section's path_prepend and path_append, then its env.NAME, and sh's
-// login set. In WSL those directories are Linux's, set in sh's prelude
-// instead, its distro comes from the section too, its env.NAME cross
-// into Linux by WSLENV, and WSL_UTF8=1 has wsl.exe's own messages in
-// UTF-8 rather than UTF-16. A login sh on Windows gets these first, for MSYS2's and
-// Git's /etc/profile: CHERE_INVOKING=1, which keeps it in the working
-// directory, and MSYS2_PATH_TYPE=inherit, without ORIGINAL_PATH, which
-// keep this PATH after its own directories. MSYS2's default replaces
-// PATH with System32 and a few others, and an ORIGINAL_PATH inherited
-// from a Git Bash or MSYS2 terminal would stand in for this one.
-static Slice<Str> shellenvfor(Session *s, Arena *a, Shell *sh)
+// Shell sh's settings over env, as the configuration now says: HOME
+// for busybox-w32's sh (envhome), PATH wrapped in its section's
+// path_prepend and path_append, then its env.NAME, and sh's login set.
+// In WSL those directories are Linux's, set in sh's prelude instead,
+// its distro comes from the section too, its env.NAME cross into Linux
+// by WSLENV, and WSL_UTF8=1 has wsl.exe's own messages in UTF-8 rather
+// than UTF-16. A login sh on Windows (or any, with login, as a
+// terminal's) gets these first, for MSYS2's and Git's /etc/profile:
+// CHERE_INVOKING=1, which keeps it in the working directory, and
+// MSYS2_PATH_TYPE=inherit, without ORIGINAL_PATH, which keep this PATH
+// after its own directories. MSYS2's default replaces PATH with
+// System32 and a few others, and an ORIGINAL_PATH inherited from a Git
+// Bash or MSYS2 terminal would stand in for this one.
+static Slice<Str> shellover(Session *s, Arena *a, Shell *sh, Slice<Str> env, b32 login)
 {
-    Engine    *e   = s->e;
-    b32        win = s->te.windows;
-    Slice<Str> env = engineenv(e, a, win);
+    Engine *e   = s->e;
+    b32     win = s->te.windows;
+    b32     own = sh->name.len && cfgownsection(e->cfg, "shell", sh->name);
     sh->login = 0;
     if (sh->flavor == FLAVOR_BUSYBOX) {
         env = envhome(a, env, e->home, win);
     }
-    if (!sh->name.len || !cfgownsection(e->cfg, "shell", sh->name)) {
-        return env;
+    if (own) {
+        Str pre  = cfgget(e->cfg, "shell", sh->name, "path_prepend", 0);
+        Str post = cfgget(e->cfg, "shell", sh->name, "path_append", 0);
+        if (sh->kind == SHELL_WSL) {
+            sh->distro  = clone(a, trim(cfgget(e->cfg, "shell", sh->name, "distro", 0)));
+            sh->prelude = wslprelude(a, pre, post);
+        } else if (pre.len || post.len) {
+            Str path = searchpath(a, pre, enginepath(e, a, win), post, e->home, win);
+            env = envsetpath(a, env, path, win);
+        }
+        sh->login = cfgbool(cfgget(e->cfg, "shell", sh->name, "login", 0)) == 1;
     }
-    Str pre  = cfgget(e->cfg, "shell", sh->name, "path_prepend", 0);
-    Str post = cfgget(e->cfg, "shell", sh->name, "path_append", 0);
-    if (sh->kind == SHELL_WSL) {
-        sh->distro  = clone(a, trim(cfgget(e->cfg, "shell", sh->name, "distro", 0)));
-        sh->prelude = wslprelude(a, pre, post);
-    } else if (pre.len || post.len) {
-        Str path = searchpath(a, pre, enginepath(e, a, win), post, e->home, win);
-        env = envsetpath(a, env, path, win);
-    }
-    sh->login = cfgbool(cfgget(e->cfg, "shell", sh->name, "login", 0)) == 1;
-    if (sh->login && win && (sh->kind==SHELL_SH || sh->kind==SHELL_BUSYBOX)) {
+    if ((sh->login || login) && win && (sh->kind==SHELL_SH || sh->kind==SHELL_BUSYBOX)) {
         env = envset(a, env, "CHERE_INVOKING", "1", win);
         env = envset(a, env, "MSYS2_PATH_TYPE", "inherit", win);
         env = envdel(a, env, "ORIGINAL_PATH", win);
+    }
+    if (!own) {
+        return env;
     }
     Slice<CfgPair> pairs = cfgpairs(e->cfg, a, "shell", sh->name, "env.");
     for (iz i = 0; i < pairs.len; i++) {
@@ -5189,6 +5191,13 @@ static Slice<Str> shellenvfor(Session *s, Arena *a, Shell *sh)
         env = envset(a, env, "WSL_UTF8", "1", win);
     }
     return env;
+}
+
+// A command's environment in shell sh: engineenv's, with sh's settings
+// (shellover).
+static Slice<Str> shellenvfor(Session *s, Arena *a, Shell *sh)
+{
+    return shellover(s, a, sh, engineenv(s->e, a, s->te.windows), 0);
 }
 
 // The shell a call runs in: the one it names (shellcall), else the
@@ -16640,6 +16649,53 @@ static void cmdshell(Engine *e, Arena scratch, i64 id, Json *j)
     emit(e, line);
 }
 
+// The environment to open a session's shell in by hand (Open in
+// terminal), and for WSL its distro: this process's own, with [tools]'s
+// PATH and the shell's settings (shellover) as a login shell's, the
+// terminal's way. Not engineenv's, made for the agent's commands, as a
+// pager of cat, but the user's: for a frontend on this machine.
+static void cmdshellenv(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str sid = jsonstr(jsonget(j, "sid"));
+    if (!validsid(sid)) {
+        reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    }
+    b32      transient = 0;
+    Session *s         = borrow(e, scratch, sid, &transient);
+    if (!s) {
+        reply(e, scratch, id, 0, "no such session", sid);
+        return;
+    }
+    b32        win = s->te.windows;
+    Shell      sh  = s->te.shell;
+    Slice<Str> env = envsetpath(&scratch, e->env, enginepath(e, &scratch, win), win);
+    env = shellover(s, &scratch, &sh, env, 1);
+    iz  n = 256 + sh.distro.len;
+    for (iz i = 0; i < env.len; i++) {
+        n += 6*env[i].len + 8;  // escaped at worst
+    }
+    Buf   b(&scratch, n);
+    EvOut w = evbegin(&b, sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putstrkey(&w.json, "shell", sh.name);
+    if (sh.distro.len) {
+        putstrkey(&w.json, "distro", sh.distro);
+    }
+    putkey(&w.json, "env");
+    putarray(&w.json);
+    for (iz i = 0; i < env.len; i++) {
+        putstr(&w.json, env[i]);
+    }
+    putend(&w.json);
+    Str line = evend(&w);  // in scratch, before s may go
+    if (transient) {
+        forget(e, s);
+    }
+    emit(e, line);
+}
+
 // One shell of a shells reply, found or not.
 static void putshell(JsonOut *w, Str name, Shell *sh, Str err)
 {
@@ -18557,6 +18613,9 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_SHELLS:
         cmdshells(e, scratch, id);
+        return;
+    case CMD_SHELLENV:
+        cmdshellenv(e, scratch, id, j);
         return;
     case CMD_MCP:
         cmdmcp(e, scratch, id);

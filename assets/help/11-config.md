@@ -116,9 +116,10 @@ cannot choose what runs, so these are ignored in one:
   (`env.MSYS2_PATH_TYPE = minimal` for MSYS2's own default, which
   drops it). w64devkit's sh, which finds `~/.profile` by HOME alone,
   gets HOME as w64devkit's own window sets it, `%USERPROFILE%`, when
-  Prospero has none, as when started from the Start menu; so does Open
-  in terminal. `env.NAME` sets a variable for its commands (a value,
-  or `env:VAR` from Prospero's own environment). `path_prepend` and
+  Prospero has none, as when started from the Start menu (a home set
+  in `w64devkit.ini` needs `env.HOME`). `env.NAME` sets a variable for
+  its commands, and Open in terminal's (a value, or `env:VAR` from
+  Prospero's own environment). `path_prepend` and
   `path_append` add directories around `[tools]`'s, and `description`
   tells the agent what the shell is for:
 

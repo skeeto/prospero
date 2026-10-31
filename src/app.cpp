@@ -1376,6 +1376,9 @@ struct Gui {
                                    // script's command (macOS), as the
                                    // checklist sees it: argv by spaces
     i32                terms;      // and how many
+    i64                termask;    // shell.env asked, for termsess's
+    GuiSession        *termsess;
+    b32                termenv;    // the latest in shell.env's environment
     Str                pathpre;    // [tools] path_prepend, as written
     Str                pathpost;   // [tools] path_append
     Mailbox           *edbox;      // its process's records
@@ -4886,6 +4889,7 @@ static void setpane(Gui *, i32, b32);
 
 static void guiofferask(Gui *);
 static void onoffer(Gui *, Arena, Json *, b32);
+static void ontermenv(Gui *, Arena, Json *, b32);
 
 static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
 {
@@ -5132,6 +5136,12 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
     case CMD_SHELLS:
         if (q.h && q.h->shellsid==id) {
             onhostshells(g, q.h, j, ok);
+        }
+        return;
+
+    case CMD_SHELLENV:
+        if (g->termask==id && g->termsess) {
+            ontermenv(g, scratch, j, ok);
         }
         return;
 
@@ -6805,7 +6815,7 @@ static Str termprog(Gui *g, Arena *a)
     return {};
 }
 
-static TermPlan termplan(Gui *g, Arena *a, GuiSession *s)
+static TermPlan termplan(Gui *g, Arena *a, GuiSession *s, Str distro = {})
 {
     TermPlan r   = {};
     View    *v   = s->view;
@@ -6835,7 +6845,7 @@ static TermPlan termplan(Gui *g, Arena *a, GuiSession *s)
         // Here, the session's own shell, if any but the default
         r.dir = dir;
         if (v) {
-            cmd = termshell(a, v->shellkind, v->shellpath, HOST_WINDOWS);
+            cmd = termshell(a, v->shellkind, v->shellpath, HOST_WINDOWS, distro);
         }
     }
     r.cmd = cmd;
@@ -6843,24 +6853,11 @@ static TermPlan termplan(Gui *g, Arena *a, GuiSession *s)
     return r;
 }
 
-// Whether the session's shell is busybox-w32's, w64devkit's sh, as the
-// engine tells by busybox.exe beside it (shellflavor).
-static b32 termbusybox(Gui *g, Arena a, View *v)
+// Open it with env, its shell's distro if WSL, or in the checklist note
+// what would run, unless asked to run it (PROSPERO_TEST_TERMINAL).
+static void termlaunch(Gui *g, Arena a, GuiSession *s, Slice<Str> env, Str distro)
 {
-    if (!HOST_WINDOWS || !v->shellpath.len) {
-        return 0;
-    } else if (v->shellkind == "busybox") {
-        return 1;
-    }
-    Str bb = join(&a, parentdir(v->shellpath), "busybox.exe");
-    return v->shellkind=="sh" && os_stat(g->os, a, bb).type==STAT_FILE;
-}
-
-// Open it, or in the checklist note what would run, unless asked to run
-// it (PROSPERO_TEST_TERMINAL).
-static void termopen(Gui *g, Arena a, GuiSession *s)
-{
-    TermPlan p = termplan(g, &a, s);
+    TermPlan p = termplan(g, &a, s, distro);
     if (p.why.len) {
         g->lasterr = clone(&g->perm, p.why);
         return;
@@ -6895,17 +6892,56 @@ static void termopen(Gui *g, Arena a, GuiSession *s)
     }
     g->termline = clone(&g->perm, finish(&b));
     g->terms++;
+    g->termenv = env.len > 0;
     if (!g->drive || g->realterm) {
         Str dir = p.dir.len ? p.dir : userhome(g->os, &a);
-        Slice<Str> env = guienv(g, &a);
-        if (s->host->kind!=GH_REMOTE && s->view && termbusybox(g, a, s->view)) {
-            env = envhome(&a, env, userhome(g->os, &a), HOST_WINDOWS);
-        }
-        if (!os_launch(g->os, a, argv, dir, env)) {
+        if (!os_launch(g->os, a, argv, dir, env.len ? env : guienv(g, &a))) {
             g->lasterr = clone(&g->perm, concat(&a, "cannot open a terminal: ",
                                                 os_lasterr(g->os, &a)));
         }
     }
+}
+
+// Open it: a session here in its shell's environment as its engine has
+// it (shell.env), its section's env.NAME and PATH and the like, as the
+// agent's commands get them; elsewhere, or with an engine too old to
+// say, in this process's own.
+static void termopen(Gui *g, Arena a, GuiSession *s)
+{
+    TermPlan p = termplan(g, &a, s);
+    if (p.why.len) {
+        g->lasterr = clone(&g->perm, p.why);
+        return;
+    } else if (s->host->kind==GH_REMOTE || !hostcap(s->host, "shell.env")) {
+        termlaunch(g, a, s, {}, {});
+        return;
+    }
+    Arena c = newarena(g->cmdr);
+    Buf   b(&c, 128);
+    EvOut w = cmdopen(g, &b, CMD_SHELLENV, s);
+    g->termask  = g->nextid;
+    g->termsess = s;
+    cmdsend(g, &w, c);
+}
+
+// Its answer: opened in that environment, else in this process's.
+static void ontermenv(Gui *g, Arena scratch, Json *j, b32 ok)
+{
+    GuiSession *s = g->termsess;
+    g->termask  = 0;
+    g->termsess = 0;
+    Slice<Str> env = {};
+    for (Json *x = ok ? jsonget(j, "env")->child : 0; x; x = x->next) {
+        Str e = jsonstr(x);
+        if (cut(e, '=').ok) {
+            env = push(&scratch, env, e);
+        }
+    }
+    if (!ok) {
+        guilog(g, concat(&scratch, "shell.env failed, so its terminal has this "
+                                   "process's environment: ", jsonstr(jsonget(j, "err"))));
+    }
+    termlaunch(g, scratch, s, env, jsonstr(jsonget(j, "distro")));
 }
 
 struct GuiWsl {
@@ -11084,7 +11120,8 @@ enum : i32 {
     CHK_PLANEDITING,  // the plan is out in the editor, Approve held
     CHK_PLANEDITED,   // the plan's ask shows the file as edited, with text
     CHK_PLANREVEAL,   // Reveal showed the plan file, once
-    CHK_TERMRAN,      // dx terminals opened, the latest's launch with text
+    CHK_TERMRAN,      // dx terminals opened, the latest's launch with text,
+                      // with dy in its shell's environment (shell.env)
     CHK_PLANPLAIN,    // the plan is out in the editor, no plan waiting
     CHK_PLANQUIET,    // the session is idle, asking nothing
     CHK_PLANREVISED,  // the agent heard the plan approved was revised by hand
@@ -13383,7 +13420,7 @@ static DriveOp sessionsops[] = {
     {OP_MOVE, T_NAMED, 0, 0, 100, "Open in terminal"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
-    {OP_CHECK, CHK_TERMRAN, 1, 0, 0, ""},
+    {OP_CHECK, CHK_TERMRAN, 1, 1, 0, ""},
     // Renamed from its context menu
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Say hello."},
     {OP_RDOWN, 0, 0, 0, 60, ""},
@@ -17862,7 +17899,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         DriveOp *op = &g->ops[g->drivepc-1];
         Arena    a  = g->frame;
         guilog(g, concat(&a, "drive: terminal: ", g->termline));
-        return g->terms==(i32)op->dx && g->termline.len && find(g->termline, op->text)>=0;
+        return g->terms==(i32)op->dx && g->termline.len && find(g->termline, op->text)>=0 &&
+               (op->dy==0 || g->termenv);
     }
     case CHK_PLANREVEAL: {
         Arena a = g->frame;
