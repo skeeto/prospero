@@ -14,8 +14,9 @@
     prospero mcp list | auth NAME | logout NAME [options]
 
 With no arguments, Prospero opens its window: sessions in a sidebar,
-subagents under their parents; the transcript, with markdown, code
-highlighting and selection; tool calls with Undo, and Rewind to any
+subagents under their parents; the transcript, with markdown (your
+messages too, each line break kept as typed), code highlighting and
+selection; tool calls with Undo, and Rewind to any
 message that began a turn; the todo list and background jobs; and the
 prompt. The model's reasoning folds to one line that counts it as it
 streams, which a click opens; `[ui] thinking = open` shows it whole, and

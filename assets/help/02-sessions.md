@@ -43,7 +43,11 @@ once.
 
 ## Talking to the agent
 
-Enter sends the prompt. The buttons beside the prompt box are icons,
+Enter sends the prompt. The transcript shows your messages as
+Markdown, as it does the agent's: code fences, `inline code`, lists and
+emphasis render, while each line break stays as you typed it and HTML
+tags show as text. The agent gets exactly what you typed. The buttons
+beside the prompt box are icons,
 named in their tooltips: Send (a paper plane), and Attach (a paper
 clip). While the agent works, Send becomes Steer (a curved arrow), and
 Stop (a square) shows below it. What you send while it works waits at

@@ -211,6 +211,26 @@ static void test_doc(Test *t)
         expect(t, "doc.hrfirst", istr(&a, d0->blocks[0].off1), "3");
     }
 
+    // As a person typed it: each line break kept, and raw HTML as text
+    {
+        Arena a  = perm;
+        Str   s  = "one\ntwo <thinking>\n\n```\nx\n```";
+        Doc  *d0 = parsedoc(&a, s, 0);
+        Doc  *d1 = parsedoc(&a, s, 0, 1);
+        i32   n[2][2] = {};
+        Doc  *ds[2]   = {d0, d1};
+        for (i32 k = 0; k < 2; k++) {
+            for (iz i = 0; i < ds[k]->pieces.len; i++) {
+                n[k][0] += !!(ds[k]->pieces[i].flags & PIECE_SOFT);
+                n[k][1] += !!(ds[k]->pieces[i].flags & PIECE_HARD);
+            }
+        }
+        expect(t, "doc.hardbreaks", istr(&a, n[0][0]*1000 + n[0][1]*100 +
+                                             n[1][0]*10 + n[1][1]), "1001");
+        expect(t, "doc.typed", docshow(&a, d1),
+               "P: one|~:\\n|two <thinking>\nC: c:x|c~:\\n\n");
+    }
+
     // The layout key follows content, not position
     {
         Arena a  = perm;

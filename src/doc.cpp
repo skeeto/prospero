@@ -119,6 +119,7 @@ struct DocParse {
     i32      table, row, col;
     u8       align;
     b32      header;
+    b32      hardbreaks;  // a soft line break is a hard one, as typed
 };
 
 static i32 clampdepth(i32 d)
@@ -323,7 +324,7 @@ static int mdtext(MD_TEXTTYPE type, MD_CHAR const *text, MD_SIZE size, void *ud)
         break;
     case MD_TEXT_SOFTBR:
         pc.text   = "\n";
-        pc.flags |= PIECE_SOFT;
+        pc.flags |= p->hardbreaks ? PIECE_HARD : PIECE_SOFT;
         break;
     case MD_TEXT_ENTITY:
         pc.text = decodeentity(p->perm, pc.text);
@@ -683,8 +684,10 @@ static Doc *parseplain(Arena *perm, Str src, i32 style)
 
 // Parse markdown into a document in perm, referring into src. Messages
 // past DOC_MAXSIZE are shown as plain text. The memo, if given, keeps
-// highlighted code across parses of a growing message.
-static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo)
+// highlighted code across parses of a growing message. With hardbreaks,
+// every line break stays one, as in what a person typed, where markdown
+// would join a paragraph's lines.
+static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo, b32 hardbreaks = 0)
 {
     if (src.len > DOC_MAXSIZE) {
         return parseplain(perm, src, 0);
@@ -700,6 +703,7 @@ static Doc *parsedoc(Arena *perm, Str src, HlMemo **memo)
     p.cur     = -1;
     p.link    = -1;
     p.indent0 = -1;
+    p.hardbreaks = hardbreaks;
     d->src    = src;
 
     MD_PARSER parser = {};

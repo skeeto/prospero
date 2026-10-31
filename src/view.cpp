@@ -2688,7 +2688,9 @@ static Doc *msgdoc(View *v, i32 i)
     }
     switch (m->role) {
     case VIEW_USER:
-        m->doc = parseplain(&c->arena, m->text, 0);
+        // What the user typed, or a parent's task: markdown, each line
+        // break kept, raw HTML shown as written (MD_FLAG_NOHTML)
+        m->doc = parsedoc(&c->arena, m->text, &c->memo, 1);
         break;
     case VIEW_ASK:
         m->doc = m->md ? parsedoc(&c->arena, m->text, &c->memo)  // a plan
