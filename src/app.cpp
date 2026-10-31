@@ -1635,6 +1635,7 @@ struct Gui {
     i64                drops;        // files dropped on the window
     u64                attask;       // the attach dialog's latest ask
     GuiSession        *attsess;      // and for which session
+    b32                attpend;      // while that dialog is open
     Str                clipkept;     // the clipboard's text, for the
                                      // checklist's paste to restore
     Str                clippng;      // and the image it put there
@@ -4525,15 +4526,31 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
     attachnext(g, s);
 }
 
-// Ask for a file to attach (TASK_ATTACH): text, or an image.
+// Ask for a file to attach (TASK_ATTACH): text, or an image. One
+// dialog at a time, which may be slow to come up, its answer for the
+// session that asked, whichever is shown by then.
 static void attachpick(Gui *g, GuiSession *s)
 {
+    if (g->attpend) {
+        return;
+    }
     g->attask++;
     g->attsess = s;
-    if (!os_guiopenfile(g->os, g->frame, "Attach a file", OPEN_ATTACH, g->tasks,
-                        TASK_ATTACH, g->attask)) {
+    g->attpend = os_guiopenfile(g->os, g->frame, "Attach a file", OPEN_ATTACH, g->tasks,
+                                TASK_ATTACH, g->attask);
+    if (!g->attpend) {
         setnote(g, s, "cannot ask for a file here", 1);
     }
+}
+
+// Why the attach button is off for s while a dialog is open, if it is.
+static Str attachpending(Gui *g, GuiSession *s)
+{
+    if (!g->attpend) {
+        return {};
+    }
+    return g->attsess==s ? Str("Choosing a file to attach\xe2\x80\xa6")
+                         : Str("Choosing a file to attach to another session first");
 }
 
 // Browse for the new session dialog's directory (TASK_BROWSED), on this
@@ -8033,6 +8050,7 @@ static void ontask(Gui *g, Record r)
         }
         return;
     case TASK_ATTACH:
+        g->attpend &= r.id != g->attask;  // answered, or cancelled
         if (r.id==g->attask && g->attsess && r.data.len) {
             Str err = attachfile(g, g->attsess, r.data);
             if (err.len) {

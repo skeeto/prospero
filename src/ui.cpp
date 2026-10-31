@@ -5264,6 +5264,7 @@ static void drawprompt(Gui *g)
     ImGui::EndDisabled();
     if (g->sess && hostcap(s->host, "images")) {
         Str why = attachwhy(s);
+        why = why.len ? why : attachpending(g, s);
         ImGui::BeginDisabled(why.len>0 || editing);
         if (ImGui::Button(ICON_ATTACH "##attach", v2(bw, 0))) {
             attachpick(g, s);
