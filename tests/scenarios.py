@@ -3283,7 +3283,7 @@ def hello_caps(t):
                                                    "git", "trash", "trash.empty",
                                                    "relay.offer", "relay.data",
                                                    "relay.more", "relay.peer",
-                                                   "relay.call", "offer"]
+                                                   "relay.call", "offer", "ask.touch"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -9348,8 +9348,10 @@ def bypass_task(t):
 
 @scenario(bound=15)
 def bypass_plan(t):
-    """In Bypass mode the agent's plan asks are still asked, and an
-    approved plan goes to Build."""
+    """In Bypass mode the agent cannot ask to plan: enter_plan_mode is
+    refused unasked, so it neither waits nor leaves Bypass. Switched to
+    Plan mode by the user, its plan is asked about, and an approved plan
+    goes to Build."""
     h = t.headless()
     try:
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
@@ -9357,13 +9359,16 @@ def bypass_plan(t):
         h.send("prompt", sid=sid, text="Get to work.")  # and read the notice
         ended(h, sid, 1)
         h.send("prompt", sid=sid, text="Plan first.")
-        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
-        t.check(ask["kind"] == "plan.enter", f"asked: {ask}")
-        h.call("answer", sid=sid, req=ask["req"], decision="allow")
+        ended(h, sid, 2)
+        t.check(not h.all("ask", sid), f"nothing asked: {h.all('ask', sid)}")
+        refused = [e for e in h.all("tool.end", sid) if "Bypass mode is on" in e["text"]]
+        t.check(len(refused) == 1 and refused[0]["status"] == "error", f"refused: {refused}")
+        h.call("mode", sid=sid, mode="plan")
+        h.send("prompt", sid=sid, text="Get to work.")
         plan = planask(h, sid)
         h.call("answer", sid=sid, req=plan["req"], decision="allow")
-        ended(h, sid, 2)
-        t.check(modes(h, sid) == ["bypass/user", "plan/agent", "default/approved"],
+        ended(h, sid, 3)
+        t.check(modes(h, sid) == ["bypass/user", "plan/user", "default/approved"],
                 f"modes {modes(h, sid)}")
         te = h.all("tool.end", sid)
         t.check(te[-1]["status"] == "ok" and te[-1]["text"].startswith("Replaced"),
@@ -9394,7 +9399,7 @@ def offered(t, n=-1):
 
 @scenario(bound=10)
 def question_answer(t):
-    """The questions asked with no deadline, normalized: the recommended
+    """The questions asked with question_timeout's deadline, normalized: the recommended
     option marked by its label is so marked, and "Other" is dropped.
     Answered with picks, words of the user's own and a note, the answer
     record keeps them and the agent reads them all."""
@@ -9404,7 +9409,8 @@ def question_answer(t):
         t.check("question" in h.all("hello")[0].get("caps", []), "the cap")
         sid, ask = questioned(t, h)
         t.check(ask["kind"] == "question" and ask["tool"] == "ask_user" and
-                ask["deadline"] == 0 and ask["dflt"] == "deny", f"the ask: {ask}")
+                299000 <= ask["deadline"] - ask["ts"] <= 301000 and ask["dflt"] == "deny",
+                f"the ask: {ask}")
         qs = ask["questions"]
         t.check([q["header"] for q in qs] == ["Database", "Features", "Color"], f"{qs}")
         t.check(qs[0]["options"] == [
@@ -9639,11 +9645,86 @@ def question_bypass(t):
         h.send("prompt", sid=sid, text="Ask me.")
         ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid and
                      e["seq"] > ask["seq"])
-        t.check(ask["kind"] == "question", f"asked in plan mode too: {ask}")
+        t.check(ask["kind"] == "question" and ask["deadline"] == 0,
+                f"asked in plan mode too, with no deadline: {ask}")
         r = h.call("mode", sid=sid, mode="default")
         t.check(r.get("ok") == 1, f"the mode may change while asked: {r}")
+        dl = h.wait(lambda e: e.get("ev") == "ask.deadline" and e.get("sid") == sid)
+        t.check(dl["req"] == ask["req"] and 299000 <= dl["deadline"] - dl["ts"] <= 301000,
+                f"out of plan mode, a deadline: {dl}")
         h.call("answer", sid=sid, req=ask["req"], decision="deny")
         ended(h, sid, 2)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"question_timeout": 1}}, bound=10)
+def question_timeout(t):
+    """Outside plan mode, questions nobody answers in time are skipped:
+    the agent goes with its recommendations."""
+    h = t.headless()
+    try:
+        t.check("question.deadline" in h.call("hello", proto=0, client="scenarios")
+                .get("caps", []) or "question.deadline" in h.all("hello")[0].get("caps", []),
+                "the cap")
+        sid, ask = questioned(t, h)
+        t.check(900 <= ask["deadline"] - ask["ts"] <= 1100, f"the deadline: {ask}")
+        end = ended(h, sid, 1)
+        t.check(end["why"] == "done", f"done: {end}")
+        ans = h.all("answer", sid)[-1]
+        t.check(ans["decision"] == "deny" and ans["by"] == "timeout", f"answer {ans}")
+        te = h.all("tool.end", sid)[-1]
+        t.check(te["status"] == "denied" and te["text"].startswith("Nobody answered in time") and
+                "recommended options" in te["text"], f"the result: {te}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"question_timeout": 3}}, bound=15)
+def question_touch(t):
+    """ask.touch, as the user works on the answers, starts the questions'
+    clock over, logged as ask.deadline unless it moved by under 5 s; an
+    unknown request is refused. Left alone again, they time out."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h)
+        r = h.call("ask.touch", sid=sid, req="nope")
+        t.check(r.get("ok") == 0, f"an unknown request: {r}")
+        time.sleep(2)
+        r = h.call("ask.touch", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"touched: {r}")
+        r = h.call("ask.touch", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"touched again: {r}")
+        time.sleep(2)  # past the first deadline
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        dls = [e for e in logged(t, sid) if e["ev"] == "ask.deadline"]
+        t.check(len(dls) == 1 and dls[0]["req"] == ask["req"] and
+                dls[0]["deadline"] - ask["deadline"] >= 1500, f"logged once: {dls}")
+        end = ended(h, sid, 1)
+        ans = h.all("answer", sid)[-1]
+        t.check(ans["by"] == "timeout" and ans["ts"] - ask["ts"] >= 4500,
+                f"then timed out: {ans} after {ans['ts'] - ask['ts']} ms")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"question_timeout": 1}}, bound=10)
+def question_plan(t):
+    """In plan mode, questions wait for the user with no deadline; out of
+    it while they wait, they get one."""
+    h = t.headless()
+    try:
+        sid, ask = questioned(t, h, plan=1)
+        t.check(ask["deadline"] == 0, f"no deadline: {ask}")
+        time.sleep(1.5)
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        t.check(h.call("mode", sid=sid, mode="default").get("ok") == 1, "out of plan mode")
+        ended(h, sid, 1)
+        ans = h.all("answer", sid)[-1]
+        t.check(ans["by"] == "timeout", f"then timed out: {ans}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

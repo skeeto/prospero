@@ -1224,13 +1224,14 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
                 break;
             }
             i64 secs = countdown(g, t->deadline, nowms);
+            b32 q    = t->kind == "question";
             Buf c(&a, 64);
             if (secs) {
-                print(&c, "denied in ");
+                print(&c, q ? Str("skipped in ") : Str("denied in "));
                 print(&c, secs);
-                print(&c, " s unless allowed");
+                print(&c, q ? Str(" s unless answered") : Str(" s unless allowed"));
             } else {
-                print(&c, "denying");
+                print(&c, q ? Str("skipping") : Str("denying"));
             }
             pen(p, finish(&c), 0, pal->amber);
         } else {
@@ -1828,6 +1829,7 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
     b32         off    = s->view->readonly || (f && f->sent);
     Str         need   = {};
     b32         entered = 0;
+    b32         touched = 0;  // the user works on the answers
     f32         y      = 0;
 
     for (iz i = 0; i < t->qs.len; i++) {
@@ -1869,6 +1871,7 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
                 ImGui::SetCursorScreenPos(v2(o.x, o.y+y));
                 ImGui::BeginDisabled(off);
                 if (ImGui::InvisibleButton("##opt", v2(width, rowh))) {
+                    touched = 1;
                     if (q->multi) {
                         f->pick[i][k] = !on;
                     } else {
@@ -1938,6 +1941,7 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
             ImGui::SetCursorScreenPos(v2(o.x, o.y+y+2*sc));
             ImGui::BeginDisabled(off);
             if (ImGui::InvisibleButton("##otherpick", v2(indent, frame))) {
+                touched = 1;
                 f->other[i] = !f->other[i];
                 for (iz j = 0; j<4 && f->other[i] && !q->multi; j++) {
                     f->pick[i][j] = 0;
@@ -1962,8 +1966,10 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
             ImGui::SameLine(0, 0);
             ImGui::SetNextItemWidth(width - indent);
             entered |= askfield(g, "##own");
-            if (ImGui::InputTextWithHint("##own", "Other: answer in your own words",
-                                         f->own[i], FIELD_MAX) && f->own[i][0]) {
+            b32 typed = ImGui::InputTextWithHint("##own", "Other: answer in your own words",
+                                                 f->own[i], FIELD_MAX);
+            touched |= typed;
+            if (typed && f->own[i][0]) {
                 f->other[i] = 1;
                 for (iz j = 0; j<4 && !q->multi; j++) {
                     f->pick[i][j] = 0;
@@ -1993,7 +1999,8 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
         ImGui::BeginDisabled(off);
         ImGui::SetNextItemWidth(width);
         entered |= askfield(g, "##qnote");
-        ImGui::InputTextWithHint("##qnote", "Note for the agent (optional)", f->note, FIELD_MAX);
+        touched |= ImGui::InputTextWithHint("##qnote", "Note for the agent (optional)",
+                                            f->note, FIELD_MAX);
         g->askactive |= ImGui::IsItemActive();
         itemnamed(g, "question note");
         ImGui::EndDisabled();
@@ -2024,6 +2031,9 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
     y += frame;
     if (draw) {
         g->qformdrawn = y;
+        if (touched && !off) {
+            guitouchq(g, s, t, f);
+        }
     }
     return y;
 }

@@ -407,6 +407,10 @@ static CfgKey cfgschema[] = {
     {"guard", "ask_timeout", CFG_SECONDS, "30", {}, {}, "guard",
      "Seconds to wait for an answer when a tool asks to leave the roots, "
      "then deny"},
+    {"guard", "question_timeout", CFG_SECONDS, "300", {}, {}, "guard",
+     "Seconds to wait for answers to the agent's questions (ask_user), "
+     "counted again whenever the user works on them, then skip them; in "
+     "plan mode they wait with no limit"},
     {"guard", "temp", CFG_ENUM, "allow", {}, "allow ask", "guard",
      "The system's temporary directory: allow the file tools there without "
      "asking, or ask as for any directory outside the roots"},

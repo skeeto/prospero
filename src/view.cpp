@@ -2165,6 +2165,16 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->topsdirty = 1;  // no more buttons
     } return 1;
 
+    case EV_ASKDEADLINE: {
+        // A question's clock, started over or stopped (questionclock)
+        i32 i = findask(v, jsonstr(jsonget(j, "req")));
+        if (i<0 || v->msgs[i].tool->answer!=VASK_PENDING) {
+            return 0;
+        }
+        v->msgs[i].tool->deadline = jsonint(jsonget(j, "deadline"), 0);
+        v->msgs[i].ver++;
+    } return 1;
+
     case EV_RETRY: {
         // The model named is the next attempt's: a fallback's after a
         // switch, and until the primary is tried again
@@ -3768,9 +3778,10 @@ static Str toastaskbody(Arena *a, ViewTool *t, Str who, i32 pending, i64 now)
         print(&b, "\nWaiting for you");
     } else {
         i64 secs = (t->deadline - now + 999) / 1000;
-        print(&b, "\nDenied in ");
+        b32 q    = t->kind == "question";
+        print(&b, q ? Str("\nSkipped in ") : Str("\nDenied in "));
         print(&b, secs>0 ? secs : 0);
-        print(&b, " s unless allowed");
+        print(&b, q ? Str(" s unless answered") : Str(" s unless allowed"));
     }
     return finish(&b);
 }

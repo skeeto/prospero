@@ -398,8 +398,14 @@ static void test_view(Test *t)
         expect(t, "view.qfootro", istr(&a, (i64)msgfoot(v, m)), "123");
         v->readonly = 0;
         expect(t, "view.qheadline", askheadline(&a, k), "Questions for you: DB, Feat");
-        apply(v, a, R"j({"sid":"s","seq":3,"ts":0,"ev":"answer","req":"c4/ask","decision":"allow",)j"
+        apply(v, a, R"j({"sid":"s","seq":3,"ts":0,"ev":"ask.deadline","req":"c4/ask","deadline":90000})j");
+        expect(t, "view.qdeadline", istr(&a, k->deadline), "90000");
+        expect(t, "view.qtoast", toastaskbody(&a, k, {}, 1, 30000),
+               "Questions for you: DB, Feat\nSkipped in 60 s unless answered");
+        apply(v, a, R"j({"sid":"s","seq":4,"ts":0,"ev":"answer","req":"c4/ask","decision":"allow",)j"
                     R"j("by":"user","note":"n","answers":[{"pick":[1]},{"pick":[0],"text":"C"}]})j");
+        apply(v, a, R"j({"sid":"s","seq":5,"ts":0,"ev":"ask.deadline","req":"c4/ask","deadline":0})j");
+        expect(t, "view.qdeadline answered", istr(&a, k->deadline), "90000");
         expect(t, "view.qanswered", m->text,
                "DB: Which?\n  \xe2\x86\x92 Lite\nFeat: And?\n  \xe2\x86\x92 A, \xe2\x80\x9c"
                "C\xe2\x80\x9d\n\nNote: n");

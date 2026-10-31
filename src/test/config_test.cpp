@@ -1043,6 +1043,7 @@ static void testcfgjson(Test *t)
         "model/m/max_tokens=*\n"
         "guard//roots=*\n"
         "guard//ask_timeout=30*\n"
+        "guard//question_timeout=300*\n"
         "guard//temp=allow*\n"
         "tools//job_timeout=1800*\n"
         "tools//job_timeout_max=7200*\n"

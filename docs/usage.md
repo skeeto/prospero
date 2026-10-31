@@ -200,13 +200,17 @@ most often while planning: one card shows up to four questions, each
 with a few options, the recommended one marked and picked, and a field
 for an answer in your own words, then a note, Submit answers and Skip.
 A skip, or nobody there to answer, has the agent go with its
-recommendations. The questions wait with no countdown, and a
+recommendations. In Plan mode the questions wait with no countdown;
+otherwise they are skipped after `[guard] question_timeout` (300 s),
+a countdown that starts over whenever you work on the card. A
 notification tells of them (`[ui] notify` `allow`). Only the sessions
 you start yourself, attended, get the tool: never subagents, roles, a
 `tools` list or command-line runs. Over the protocol, an ask of kind
 `question` carries `questions`, and `answer {decision:"allow",
 answers:[{pick:[...], text?}, ...]}` answers it, one entry per question
-(cap `question`).
+(cap `question`). `ask.touch {sid, req}` starts its countdown over, and
+an `ask.deadline {req, deadline}` record gives a changed deadline, 0
+for none (cap `question.deadline`).
 
 Bypass mode, in red in the same mode list, is for an agent left to
 work alone somewhere it can do no harm: nothing is asked, attended or
@@ -219,7 +223,9 @@ are paths that name nothing. Only you turn it on, from the list, never
 a new session, the agent or the configuration. It stays through
 reopening and restarts, subagents follow it, and asks waiting when it
 is picked are allowed; a fork or an import starts in Build, and an
-approved plan always goes to Build.
+approved plan always goes to Build. The agent cannot ask to plan in
+Bypass: `enter_plan_mode` is refused, so only you switch a Bypass
+session to Plan.
 
 Sessions may talk to each other: the agent lists the other sessions on
 its host, with how they relate to it (parent, child, sibling), and

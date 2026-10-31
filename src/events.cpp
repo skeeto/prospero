@@ -50,6 +50,7 @@ enum : i32 {
     EV_TASKREPORT,  // a subagent's report to its parent on another host
     EV_MEMORY,      // the project's memory, as the agent knows it
     EV_SHELL,       // the agent's shell from here on, by the user
+    EV_ASKDEADLINE, // a waiting ask's deadline, changed
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -110,6 +111,7 @@ static EvInfo evinfo[] = {
     {"task.report", 1, 1},  // the parent's call ends by it
     {"memory",     1, 0},
     {"shell",      1, 0},
+    {"ask.deadline", 1, 0},
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -182,6 +184,7 @@ enum : i32 {
     CMD_RELAYPEER,   // the host's news of a client: away, back or gone
     CMD_RELAYCALL,   // a thin engine's call, for this engine to make
     CMD_OFFER,       // this engine's models as relay.offer gives them
+    CMD_ASKTOUCH,    // the user works on a waiting ask's answer
     CMD_COUNT,
 };
 
@@ -194,7 +197,7 @@ static Str cmdnames[] = {
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
-    "relay.call", "offer",
+    "relay.call", "offer", "ask.touch",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -284,6 +287,10 @@ static Str capnames[] = {
     "relay",           // thin engines: relay.offer from a client, relay
                        // records for it to make, relay.data back; and
                        // offer and relay.call for the client's own engine
+    "question.deadline",  // outside plan mode, questions have a deadline,
+                       // which ask.touch {sid, req} starts again as the
+                       // user answers, and ask.deadline {req, deadline}
+                       // records change (0 for none)
 };
 
 static Str evname(i32 ev)

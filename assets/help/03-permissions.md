@@ -68,8 +68,9 @@ working directory, the desktop tool acts, starting programs too, and
 the web tools search and read pages ([Web search](help:web)).
 Asks already waiting when you pick it are allowed.
 
-Even in Bypass, the agent's own asks about plan mode remain, and the
-harness still refuses:
+Even in Bypass, the agent's questions and plan approvals remain (it
+cannot ask to plan, so that it neither waits on you nor leaves Bypass),
+and the harness still refuses:
 
 - writes under the state directory, other than the plan file;
 - a path that names nothing (one with a NUL byte);

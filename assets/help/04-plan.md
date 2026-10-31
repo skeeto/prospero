@@ -6,6 +6,8 @@ dialog's Plan mode box, with Plan in the mode list above the
 transcript, or with
 `/plan` (`/plan off` turns it off). The agent may also ask to plan
 first: Plan first agrees, and Go ahead without lets it work as before.
+In Bypass mode it cannot: the agent is told to go on instead, so it
+neither stops to ask nor leaves Bypass once a plan is approved.
 
 The mode may change at any time, mid-turn too ("Oops, I want to be
 planning"). The turn goes on: its next tool call is held to the new
@@ -56,10 +58,14 @@ agent recommends marked **Recommended** and already picked:
 - **Skip** answers none: the agent goes with its recommendations, or
   with your note instead, if you wrote one.
 
-You may also answer in a message instead, from the prompt box. The
-questions have no countdown and a notification tells of them while you
-look elsewhere (`[ui] notify`). While they wait, the model, the shell
-and the mode may change, and Bypass mode leaves them for you. Only the
+You may also answer in a message instead, from the prompt box. A
+notification tells of the questions while you look elsewhere (`[ui]
+notify`). In Plan mode they wait for you with no countdown, as you
+mean to review a plan soon. Otherwise they are skipped after `[guard]
+question_timeout` (300 seconds), with the agent going with its
+recommendations, and the countdown starts over whenever you pick an
+option or type in the card. While they wait, the model, the shell and
+the mode may change, and Bypass mode leaves them for you. Only the
 sessions you start yourself get questions: never subagents, roles, or
 runs from the command line, where the agent decides for itself and
 says what it assumed.

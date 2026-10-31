@@ -1973,6 +1973,7 @@ def sc_question(model, n, req):
             break
         since.append(str(m.get("content", "")))
     last = "Ask me." if "Ask me." in since else last
+    last = "Plan first." if "Plan first." in since else last
     if msgs and msgs[-1].get("role") == "tool" and name == "ask_user":
         yield from answer(model, last, pieces=1)
     elif msgs and msgs[-1].get("role") == "tool":
@@ -1997,6 +1998,7 @@ sc_question_invalid = sc_question_args = sc_question_steer = sc_question
 sc_question_cancel = sc_question_close = sc_question_bypass = sc_question
 sc_question_switch = sc_question_switch_b = sc_question_offered = sc_question
 sc_question_reopen = sc_question_fork = sc_question_gui = sc_question
+sc_question_timeout = sc_question_touch = sc_question_plan = sc_question
 
 
 # Agents for prospero eval (tests/scenarios.py, eval_*): scripted good

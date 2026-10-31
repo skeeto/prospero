@@ -511,6 +511,7 @@ struct QForm {
     char *own[4];
     char *note;
     b32   sent;       // until the reply, or for good once accepted
+    i64   touched;    // when ask.touch last went, epoch ms
 };
 
 // A session the GUI knows: listed by the engine, or opened here.
@@ -3741,6 +3742,24 @@ static void guianswer(Gui *g, GuiSession *s, Str req, Str decision, Str note)
         putkey(&w.json, "note");
         putstr(&w.json, note);
     }
+    cmdsend(g, &w, a);
+}
+
+// The user works on the answers to the agent's questions: their clock
+// starts over (ask.touch), at most every 10 s, where the engine can.
+static void guitouchq(Gui *g, GuiSession *s, ViewTool *t, QForm *f)
+{
+    i64 now = os_time(g->os);
+    if (!t->deadline || now-f->touched<10000 ||
+            !hostcap(s->host, "question.deadline")) {
+        return;
+    }
+    f->touched = now;
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128 + t->req.len);
+    EvOut w = cmdopen(g, &b, CMD_ASKTOUCH, s);
+    putkey(&w.json, "req");
+    putstr(&w.json, t->req);
     cmdsend(g, &w, a);
 }
 
@@ -10830,7 +10849,7 @@ enum : i32 {
     CHK_ASKCARD,
     CHK_ASKALLOWED,
     CHK_QCARD,      // the agent's questions: the form as reserved
-    CHK_QWAITING,   // and as picked and typed, still waiting
+    CHK_QWAITING,   // and as picked and typed, still waiting, touched
     CHK_QANSWERED,  // the agent read the answers
     CHK_QSKIPPED,   // a skip, the note its words
     CHK_ASKTIMEOUT,
@@ -12252,7 +12271,7 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_ALWAYSPATH, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "2-allowedalways"},
     // The agent's questions, while the window has no focus: a toast
-    // tells of them, waiting with no deadline. The form, drawn at the
+    // tells of them, and of their deadline. The form, drawn at the
     // height reserved, starts with the recommended options picked;
     // another option, words of the user's own in a field, and Esc
     // there, which leaves it and the turn going on; then Submit, and
@@ -12263,7 +12282,7 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_ASK, 0, 0, 10000, ""},
     {OP_WAIT, W_TOAST, 0, 0, 2000, ""},
     {OP_CHECK, CHK_TOAST, 0, 0, 0, "Database"},
-    {OP_CHECK, CHK_TOAST, 0, 0, 0, "Waiting for you"},
+    {OP_CHECK, CHK_TOAST, 0, 0, 0, "s unless answered"},
     {OP_FOCUS, 0, 1, 0, 300, ""},
     {OP_MARK, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_QCARD, 0, 0, 0, ""},
@@ -17058,12 +17077,12 @@ static b32 drivecheck(Gui *g, i32 chk)
                r.x1>r.x0 && m->text.len;
     }
     case CHK_QCARD: {
-        // Waiting with no deadline, drawn at the height reserved for
-        // it, the recommended options picked
+        // Waiting with a deadline (not in plan mode), drawn at the
+        // height reserved for it, the recommended options picked
         ViewMsg *m = lastmsg(g, VIEW_ASK);
         QForm   *f = g->sess ? g->sess->qform : 0;
         Rect     r = g->rects[RECT_ALLOW];
-        return m && m->tool->answer==VASK_PENDING && !m->tool->deadline &&
+        return m && m->tool->answer==VASK_PENDING && m->tool->deadline &&
                m->tool->qs.len==2 && m->tool->formh>0 &&
                g->qformdrawn==m->tool->formh && r.x1>r.x0 &&
                f && f->req==m->tool->req && f->pick[0][0] && !f->pick[0][1] &&
@@ -17075,7 +17094,7 @@ static b32 drivecheck(Gui *g, i32 chk)
         return m && m->tool->answer==VASK_PENDING && g->view->busy && !g->askactive &&
                f && !f->pick[0][0] && f->pick[0][1] && f->pick[1][0] && f->other[1] &&
                Str{(u8 *)f->own[1], (iz)__builtin_strlen(f->own[1])}=="Billing" &&
-               g->qformdrawn==m->tool->formh;
+               g->qformdrawn==m->tool->formh && f->touched;
     }
     case CHK_QANSWERED: {
         ViewMsg *k = lastmsg(g, VIEW_ASK);

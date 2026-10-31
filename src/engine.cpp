@@ -511,6 +511,7 @@ struct Ask {
     Str       trust;    // an MCP ask's project server, which "trust"
                         // trusts for good, or null
     Str       mcpurl;   // an MCP ask's server's url, by its SHA-256, or null
+    i64       deadline; // a question's, epoch ms, as the frontends have it
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
@@ -3971,6 +3972,49 @@ static void planheed(Session *s, Arena scratch)
 // a fork's copy of the log, logcopy). The agent hears of it in a call's
 // result for its own asks, and otherwise from a notice, as do the
 // subagents that follow it (deliver).
+// How long the agent's questions wait, in ticks, outside plan mode.
+static i64 questiondelay(Engine *e)
+{
+    return cfgms(e->cfg, "guard", "", "question_timeout", 0)*MS;
+}
+
+// The clock of the agent's questions while they wait: none in plan mode,
+// where the user means to review a plan soon, else question_timeout,
+// from now with restart, as the user works on the answers, else as it
+// was. A changed deadline goes to the frontends as an ask.deadline
+// record, unless it moved by under a tenth of the delay (5 s at most),
+// so a stream of touches logs little: the deadline they show is then at
+// most that early.
+static void questionclock(Session *s, Arena scratch, b32 restart)
+{
+    Ask *k = &s->ask;
+    if (s->state!=S_ASK || k->tool!=TOOL_ASKUSER) {
+        return;
+    }
+    Engine *e     = s->e;
+    i64     delay = planning(s) ? 0 : questiondelay(e);
+    b32     armed = s->timers[T_ASK] != 0;
+    i64     at    = k->deadline;
+    if (!delay && armed) {
+        disarm(s, T_ASK);
+        at = 0;
+    } else if (delay && (!armed || restart)) {
+        arm(s, T_ASK, delay);
+        at = os_time(e->os) + delay/MS;
+    }
+    i64 moved = at>k->deadline ? at-k->deadline : k->deadline-at;
+    i64 least = delay/MS/10<5000 ? delay/MS/10 : 5000;
+    if (at==k->deadline || (at && k->deadline && moved<least)) {
+        return;
+    }
+    k->deadline = at;
+    Buf   b(&scratch, 256);
+    EvOut w = sbegin(s, &b, EV_ASKDEADLINE);
+    putstrkey(&w.json, "req", k->req);
+    putintkey(&w.json, "deadline", at);
+    ssend(s, &w);
+}
+
 static void setmode(Session *s, Arena scratch, i32 mode, Str by)
 {
     s->mode = mode;
@@ -3987,6 +4031,7 @@ static void setmode(Session *s, Arena scratch, i32 mode, Str by)
         s->modeheard = mode;
     }
     planheed(s, scratch);
+    questionclock(s, scratch, 0);  // into plan mode, or out of it
 }
 
 // Queue the notice of the shell, unless the agent knows it as it is: a
@@ -4244,6 +4289,9 @@ static Str questiontext(Arena *a, Slice<AskQuestion> qs, QAnswers *qa,
                 break;
             }
             print(&b, "The user skipped your questions: ");
+            goto assume;
+        case DENY_TIMEOUT:
+            print(&b, "Nobody answered in time, as the user may be away: ");
             goto assume;
         default:
             print(&b, "Nobody can answer now: ");
@@ -8302,6 +8350,11 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
         plan.err = concat(&scratch, "Plan mode is on already. Write your "
                           "plan to ", s->planfile);
         plan.err = concat(&scratch, plan.err, ", then call exit_plan_mode.");
+    } else if (!leave && bypassing(s)) {
+        // The user let the agent run unasked: no asking to plan, which
+        // would also leave Bypass mode once the plan is approved
+        plan.err = "Not done: Bypass mode is on, so plan mode is not "
+                   "available. Go on with the task.";
     } else if (leave && !planning(s)) {
         plan.err = "Plan mode is not on, so there is no plan to approve. Go "
                    "on with the task.";
@@ -8353,9 +8406,10 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
     return 0;
 }
 
-// ask_user: its questions wait for the user's answers, with no
-// deadline, unless nobody can answer now. Returns 1 if the call
-// finished, 0 if the session now waits for an answer.
+// ask_user: its questions wait for the user's answers, unless nobody
+// can answer now, for [guard] question_timeout, or in plan mode with no
+// deadline (questionclock). Returns 1 if the call finished, 0 if the
+// session now waits for an answer.
 static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
 {
     Engine *e = s->e;
@@ -8367,6 +8421,11 @@ static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
     k->opened = os_ticks(e->os);
     b32 steer = s->steers.len > 0;
     b32 wait  = attending(s) && !steer;
+    i64 delay = planning(s) ? 0 : questiondelay(e);
+    if (wait && delay) {
+        arm(s, T_ASK, delay);
+        k->deadline = os_time(e->os) + delay/MS;
+    }
     {
         Str   what = questiondetail(&scratch, qs);
         Buf   b(&scratch, 1024 + 3*what.len);
@@ -8378,7 +8437,7 @@ static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
         putstrkey(&w.json, "detail", what);
         putkey(&w.json, "questions");
         putquestions(&w.json, qs);
-        putintkey(&w.json, "deadline", wait ? 0 : os_time(e->os));
+        putintkey(&w.json, "deadline", wait ? k->deadline : os_time(e->os));
         putstrkey(&w.json, "dflt", "deny");
         ssend(s, &w);
     }
@@ -18580,6 +18639,16 @@ static void command(Engine *e, Arena scratch, Str line)
     case CMD_MODE:
         cmdmode(e, s, scratch, id, j);
         return;
+    case CMD_ASKTOUCH: {
+        // The user works on the answers: the questions' clock starts over
+        Str req = jsonstr(jsonget(j, "req"));
+        if (s->state!=S_ASK || req!=s->ask.req) {
+            reply(e, scratch, id, 0, "no such request waits", sid);
+        } else {
+            reply(e, scratch, id, 1, {}, sid);
+            questionclock(s, scratch, 1);
+        }
+    } return;
     case CMD_PROMPT:
     case CMD_STEER: {
         // A skill the user invoked comes first, with what was typed after
