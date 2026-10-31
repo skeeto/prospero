@@ -1043,7 +1043,18 @@ static void test_viewpanels(Test *t)
         apply(v, a, R"({"sid":"s","seq":12,"ts":0,"ev":"mode","mode":"plan","by":"user"})");
         apply(v, a, R"({"sid":"s","seq":13,"ts":0,"ev":"mode","mode":"plan","by":"agent"})");
         apply(v, a, R"({"sid":"s","seq":14,"ts":0,"ev":"title","text":"Auto","by":"auto"})");
-        apply(v, a, R"({"sid":"s","seq":15,"ts":0,"ev":"mode","mode":"none","by":"approved"})");
+        apply(v, a, R"({"sid":"s","seq":15,"ts":0,"ev":"user","text":"plan it"})");
+        apply(v, a, R"({"sid":"s","seq":16,"ts":0,"ev":"mode","mode":"none","by":"approved"})");
+        // A run of switches with nothing between, of which the agent
+        // hears only the last: one mark each, the last
+        apply(v, a, R"({"sid":"s","seq":17,"ts":0,"ev":"user","text":"next"})");
+        apply(v, a, R"({"sid":"s","seq":18,"ts":0,"ev":"shell","name":"a","path":"/a","kind":"sh"})");
+        apply(v, a, R"({"sid":"s","seq":19,"ts":0,"ev":"shell","name":"b","path":"/b","kind":"sh"})");
+        apply(v, a, R"({"sid":"s","seq":20,"ts":0,"ev":"model","endpoint":"http://c/","model":"o"})");
+        apply(v, a, R"({"sid":"s","seq":21,"ts":0,"ev":"model","endpoint":"http://d/","model":"p"})");
+        apply(v, a, R"({"sid":"s","seq":22,"ts":0,"ev":"mode","mode":"plan","by":"user"})");
+        apply(v, a, R"({"sid":"s","seq":23,"ts":0,"ev":"mode","mode":"bypass","by":"user"})");
+        expect(t, "panels.lastseq", istr(&a, v->msgs[v->msgs.len-1].seq), "23");
         Buf marks(&a, 256);
         for (iz i = 0; i < v->msgs.len; i++) {
             ViewMsg *m = &v->msgs[i];
@@ -1059,7 +1070,9 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.marks", finish(&marks),
                "Model=n@http://b/1|Renamed=Mine1|"
                "Plan mode=the agent changes nothing but its plan1|"
-               "Build mode=plan mode and Bypass are off1|");
+               "Build mode=plan mode and Bypass are off1|"
+               "Shell=b@/b1|Model=p@http://d/1|"
+               "Bypass mode=the agent asks nothing, inside or outside its directory1|");
     }
 
     // A steer too late for its turn stays queued through the turn's end,

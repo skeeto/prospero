@@ -765,6 +765,27 @@ static void settext(View *v, ViewMsg *m, Str text, b32 md)
     v->topsdirty = 1;
 }
 
+// A switch's mark, of the model, the shell or the mode, in place of the
+// last message if that is a mark of the same switch: the agent hears of
+// switches with what comes next, the user's message or a tool's result,
+// so of the last of a run of them alone.
+static i32 switchmark(View *v, i64 seq, Str label, Str text)
+{
+    iz       n    = v->msgs.len;
+    ViewMsg *m    = n ? &v->msgs[n-1] : 0;
+    Str      mode = " mode";
+    b32      same = m && m->role==VIEW_MARK && (m->label==label ||
+                    (endswith(m->label, mode) && endswith(label, mode)));
+    if (!same || v->prov>=0) {
+        return addmark(v, seq, label, text);
+    }
+    m->seq   = seq;
+    m->label = label;
+    m->from  = {};
+    settext(v, m, text, 0);
+    return (i32)n - 1;
+}
+
 // Begin a provisional message, the first of a run if none is open.
 static i32 addprov(View *v, i32 role)
 {
@@ -1735,7 +1756,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         // Switched for the rest of the session (model)
         v->model    = clone(&v->aux, jsonstr(jsonget(j, "model")));
         v->endpoint = clone(&v->aux, jsonstr(jsonget(j, "endpoint")));
-        i32 i = addmark(v, r->seq, "Model", v->model);
+        i32 i = switchmark(v, r->seq, "Model", v->model);
         v->msgs[i].from = v->endpoint;
     } return 1;
 
@@ -1757,7 +1778,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->shellpath = clone(&v->aux, jsonstr(jsonget(j, "path")));
         v->shellkind = clone(&v->aux, jsonstr(jsonget(j, "kind")));
         v->shellset  = 1;
-        i32 i = addmark(v, r->seq, "Shell", v->shell);
+        i32 i = switchmark(v, r->seq, "Shell", v->shell);
         v->msgs[i].from = v->shellpath;
     } return 1;
 
@@ -1766,11 +1787,11 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         b32 plan   = jsonstr(jsonget(j, "mode")) == "plan";
         b32 bypass = jsonstr(jsonget(j, "mode")) == "bypass";
         if (plan!=v->plan || bypass!=v->bypass) {
-            addmark(v, r->seq, plan   ? Str("Plan mode")   :
-                               bypass ? Str("Bypass mode") : Str("Build mode"),
-                    plan   ? Str("the agent changes nothing but its plan") :
-                    bypass ? Str("the agent asks nothing, inside or outside its directory") :
-                             Str("plan mode and Bypass are off"));
+            switchmark(v, r->seq, plan   ? Str("Plan mode")   :
+                                  bypass ? Str("Bypass mode") : Str("Build mode"),
+                       plan   ? Str("the agent changes nothing but its plan") :
+                       bypass ? Str("the agent asks nothing, inside or outside its directory") :
+                                Str("plan mode and Bypass are off"));
         }
         v->plan     = plan;
         v->bypass   = bypass;
