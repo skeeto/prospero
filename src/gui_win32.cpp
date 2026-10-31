@@ -117,6 +117,10 @@ extern "C" int       w32gui_opendir(void *, unsigned short const *title,
                                     unsigned short const *at,
                                     void (*done)(void *ctx, unsigned short const *path),
                                     void const *ctx, int ctxlen);
+// On a thread of its own, call changed(ctx) whenever the installed WSL
+// distros may have changed, as the registry key that lists them does,
+// a second after the change, to let more of it land
+extern "C" int       w32gui_wslwatch(void (*changed)(void *ctx), void *ctx);
 // The clipboard's data in a format (W32CLIP_*), copied to buf if it has
 // room: its size in bytes, or -1 if it holds none. A file is its path,
 // the first of those copied, null-terminated UTF-16.
@@ -1506,6 +1510,73 @@ extern "C" int w32gui_opendir(void *p, unsigned short const *title,
     return w32dialog(p, title, at, done, ctx, ctxlen, 1, 0, 1);
 }
 
+struct W32WslWatch {
+    void (*changed)(void *);
+    void  *ctx;
+};
+
+// WSL lists its distros under Lxss, which exists once WSL has had one:
+// until then the key above it, for Lxss's coming. The watch is armed
+// again before each call, so that a change after the listing it begins
+// is seen. Gives up only where the registry cannot be watched, or not
+// thrice in a row.
+static DWORD WINAPI wslwatchthread(void *arg)
+{
+    W32WslWatch   *w    = (W32WslWatch *)arg;
+    wchar_t const *up   = L"Software\\Microsoft\\Windows\\CurrentVersion";
+    wchar_t const *key  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Lxss";
+    HANDLE         ev   = CreateEventW(0, FALSE, FALSE, 0);
+    HKEY           k    = 0;
+    BOOL           lxss = 0;
+    for (int fired = 0, fails = 0; ev && fails<3;) {
+        if (!k) {
+            lxss = !RegOpenKeyExW(HKEY_CURRENT_USER, key, 0, KEY_NOTIFY, &k);
+            if (!lxss && RegOpenKeyExW(HKEY_CURRENT_USER, up, 0, KEY_NOTIFY, &k)) {
+                break;
+            }
+        }
+        DWORD filter = REG_NOTIFY_CHANGE_NAME | (lxss ? REG_NOTIFY_CHANGE_LAST_SET : 0);
+        if (RegNotifyChangeKeyValue(k, lxss, filter, ev, TRUE)) {
+            RegCloseKey(k);  // Lxss deleted, say: open it, or the key above
+            k = 0;
+            fails++;
+            continue;
+        }
+        fails = 0;
+        if (fired) {
+            w->changed(w->ctx);
+        }
+        WaitForSingleObject(ev, INFINITE);
+        Sleep(1000);
+        fired = 1;
+        if (!lxss) {
+            RegCloseKey(k);  // perhaps Lxss now: look again
+            k = 0;
+        }
+    }
+    if (k) RegCloseKey(k);
+    if (ev) CloseHandle(ev);
+    HeapFree(GetProcessHeap(), 0, w);
+    return 0;
+}
+
+extern "C" int w32gui_wslwatch(void (*changed)(void *), void *ctx)
+{
+    W32WslWatch *w = (W32WslWatch *)HeapAlloc(GetProcessHeap(), 0, sizeof(W32WslWatch));
+    if (!w) {
+        return 0;
+    }
+    w->changed = changed;
+    w->ctx     = ctx;
+    HANDLE t = CreateThread(0, 0, wslwatchthread, w, 0, 0);
+    if (!t) {
+        HeapFree(GetProcessHeap(), 0, w);
+        return 0;
+    }
+    CloseHandle(t);
+    return 1;
+}
+
 extern "C" long long w32gui_clip(void *p, int format, void *buf, long long cap)
 {
     W32Gui *w  = (W32Gui *)p;
@@ -1917,6 +1988,26 @@ static b32 os_guiopendir(Os *os, Arena scratch, Str title, Str at, Mailbox *mb,
     return w32gui_opendir(os->gui, (unsigned short *)towide(&scratch, title).data,
                           (unsigned short *)towide(&scratch, at).data,
                           savedone, &c, (int)sizeof(c));
+}
+
+struct W32WslCtx {
+    Mailbox *mb;
+    u32      type;
+};
+
+static void wslchanged(void *ctx)
+{
+    W32WslCtx *c = (W32WslCtx *)ctx;
+    mailpost(c->mb, c->type, 0, {}, 1);
+}
+
+static b32 os_guiwslwatch(Os *os, Arena *perm, Mailbox *mb, u32 type)
+{
+    (void)os;
+    W32WslCtx *c = alloc<W32WslCtx>(perm);
+    c->mb   = mb;
+    c->type = type;
+    return w32gui_wslwatch(wslchanged, c);
 }
 
 static i32 dibint(u8 *p)

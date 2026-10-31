@@ -6866,9 +6866,11 @@ static void drawsessions(Gui *g)
         ImGui::SameLine();
         if (iconbutton(ICON_REFRESH "##refresh")) {
             guilistall(g);
+            findwsl(g);
         }
         itemnamed(g, "sessions refresh");
-        ImGui::SetItemTooltip("Refresh: list the sessions again");
+        ImGui::SetItemTooltip(HOST_WINDOWS ? "Refresh: list the sessions and the WSL distros again"
+                                           : "Refresh: list the sessions again");
     }
 
     // The hosts to list: every one reached, and every configured remote

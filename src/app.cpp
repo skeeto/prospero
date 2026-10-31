@@ -169,6 +169,7 @@ enum : u32 {
     TASK_ATTACH,        // the attach dialog's image path, likewise
     TASK_BROWSED,       // the new session dialog's directory, likewise
     TASK_WSL,           // the installed WSL distros, a line each (wsllist)
+    TASK_WSLCHANGED,    // they may have changed (os_guiwslwatch)
     TASK_MCPBACK,       // a sign-in's browser came back: its target (os_loopback)
     TASK_TOAST,         // the background host's session stopped by itself (hosttoasts)
 };
@@ -1228,6 +1229,7 @@ struct Gui {
     Slice<LinkTo>      wslauto;    // those as remotes of no section (wslhosts),
                                    // in cfgmem
     b32                wsllisting; // a listing runs
+    b32                wslagain;   // and another is owed once it's done
     i32                wsllists;   // listings done
     char              *remname;    // the Hosts panel's new remote
     char              *remssh;
@@ -6932,11 +6934,15 @@ static void guiwslthread(void *arg)
 }
 
 // List the installed WSL distros in the background (TASK_WSL): on
-// Windows, or with a test's stand-in for wsl.exe.
+// Windows, or with a test's stand-in for wsl.exe. Asked while one runs,
+// another follows it, as the distros may have changed since it began.
 static void findwsl(Gui *g)
 {
     Str program = linkprogram(g, &g->perm, 1);
-    if (g->wsllisting || (!HOST_WINDOWS && !program.len)) {
+    if (!HOST_WINDOWS && !program.len) {
+        return;
+    } else if (g->wsllisting) {
+        g->wslagain = 1;
         return;
     }
     GuiWsl *w = alloc<GuiWsl>(&g->perm);
@@ -6978,6 +6984,10 @@ static void wslgot(Gui *g, Str data)
     }
     g->wsllisting = 0;
     g->wsllists++;
+    if (g->wslagain) {
+        g->wslagain = 0;
+        findwsl(g);
+    }
     scheddirty(&g->sched);
 }
 
@@ -8084,6 +8094,10 @@ static void ontask(Gui *g, Record r)
         return;
     case TASK_WSL:
         wslgot(g, r.data);
+        return;
+    case TASK_WSLCHANGED:
+        guilog(g, "the WSL distros may have changed: listing them again");
+        findwsl(g);
         return;
     case TASK_MCPBACK:
         mcpback(g, r);
@@ -19788,7 +19802,11 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     }
     if (!fake) {
         findhosts(g, g->frame);  // background hosts of the state directory
-        findwsl(g);              // and WSL distros, as remotes
+        findwsl(g);              // and WSL distros, as remotes,
+        if (HOST_WINDOWS && !linkprogram(g, &g->frame, 1).len) {
+            // listed again as they change, unless a test stands in
+            os_guiwslwatch(os, &g->perm, g->tasks, TASK_WSLCHANGED);
+        }
     }
     if (history) {
         g->histreq = os_ticks(os);

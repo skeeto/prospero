@@ -1425,9 +1425,9 @@ static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str 
 // endian) unless it honors WSL_UTF8, as older ones do not, else UTF-8.
 // Container engines' own are left out: Docker Desktop's (docker-desktop,
 // docker-desktop-data) and Podman's machines (podman-machine-default,
-// podman-NAME), as is anything but a plain name: letters, digits, ., -
-// and _, as WSL allows.
-static Slice<Str> wsldistros(Arena *a, Str out)
+// podman-NAME), unless all, as is anything but a plain name: letters,
+// digits, ., - and _, as WSL allows.
+static Slice<Str> wsldistros(Arena *a, Str out, b32 all = 0)
 {
     Slice<Str> r = {};
     for (Str rest = wslutf8(a, out); rest.len;) {
@@ -1442,7 +1442,8 @@ static Slice<Str> wsldistros(Arena *a, Str out)
             u8 c = name[i];
             ok = alnum(c) || c=='.' || c=='-' || c=='_';
         }
-        if (ok && !startswith(name, "docker-desktop") && !startswith(name, "podman-")) {
+        ok &= all || (!startswith(name, "docker-desktop") && !startswith(name, "podman-"));
+        if (ok) {
             r = push(a, r, clone(a, name));  // out may be the caller's scratch
         }
     }
@@ -1450,17 +1451,20 @@ static Slice<Str> wsldistros(Arena *a, Str out)
 }
 
 // The installed WSL distros, by wsl.exe (or program) -l -q, which
-// starts none of them. None where it cannot run or fails: no WSL, no
-// distros, or not Windows (unless program, a test's stand-in). It runs
-// in dir. Since a child given up on may write late, the records go to
-// perm.
-static Slice<Str> wsllist(Os *os, Arena *perm, Arena scratch, Str program, Str dir)
+// starts none of them, or with running those running, all of them
+// (--running, which fails when none runs). None where it cannot run or
+// fails: no WSL, no distros, or not Windows (unless program, a test's
+// stand-in). It runs in dir, until cancel says. Since a child given up
+// on may write late, the records go to perm.
+static Slice<Str> wsllist(Os *os, Arena *perm, Arena scratch, Str program, Str dir,
+                          b32 running = 0, i32 *cancel = 0)
 {
     if (!program.len && !HOST_WINDOWS) {
         return {};
     }
     DeployConf c = {};
     c.localstate = dir;
+    c.cancel     = cancel;
     Deploy d = {};
     d.os   = os;
     d.conf = &c;
@@ -1472,9 +1476,12 @@ static Slice<Str> wsllist(Os *os, Arena *perm, Arena scratch, Str program, Str d
     Slice<Str> argv = {};
     argv = push(&scratch, argv, program.len ? program : Str("wsl.exe"));
     argv = push(&scratch, argv, Str("-l"));
+    if (running) {
+        argv = push(&scratch, argv, Str("--running"));
+    }
     argv = push(&scratch, argv, Str("-q"));
     DeployRun r = deployrun(&d, &scratch, argv, 15*SEC);
-    return r.code==0 ? wsldistros(perm, r.out) : Slice<Str>{};
+    return r.code==0 ? wsldistros(perm, r.out, running) : Slice<Str>{};
 }
 
 static b32 driveletter(u8 c)

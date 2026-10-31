@@ -569,6 +569,9 @@ static b32     os_guiopenfile(Os *, Arena scratch, Str title, i32 kind,
 // at, if not null.
 static b32     os_guiopendir(Os *, Arena scratch, Str title, Str at,
                              Mailbox *, u32 type, u64 id);
+// Post a record of the type, with no data, whenever the installed WSL
+// distros may have changed (Windows): 0 where that can't be watched.
+static b32     os_guiwslwatch(Os *, Arena *perm, Mailbox *, u32 type);
 // An image the clipboard holds, to attach, as its bytes in a (PNG, JPEG,
 // GIF, WebP or BMP), else a file it holds (a file manager's copy) as its
 // path; both null if neither.

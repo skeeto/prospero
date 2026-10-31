@@ -2043,20 +2043,34 @@ fake_provider.SCENARIOS["far_background"] = sc_far_sleep
 fake_provider.SCENARIOS["far_background_b"] = sc_far_flag_b
 fake_provider.SCENARIOS["far_attend"] = sc_far_sleep
 fake_provider.SCENARIOS["far_attend_b"] = sc_far_ask_b
-for _name in ("far_old", "far_never", "far_wsl", "relay_far"):
+for _name in ("far_old", "far_never", "far_wsl", "far_wsl_boot", "relay_far"):
     fake_provider.SCENARIOS[_name] = sc_far_task
     fake_provider.SCENARIOS[_name + "_b"] = sc_far_task_b
 
 FAKEWSL = FAKE + r"""
-# wsl.exe: -l -q lists Ubuntu in UTF-16, as it does by default; -d
-# Ubuntu --cd ~ --exec /bin/sh -c CMD runs CMD here
+# wsl.exe: -l -q lists Ubuntu in UTF-16, as it does by default, and so
+# does -l --running -q, unless $FAKEWSL_BOOT: then only that many
+# seconds after wsl.exe first ran, failing before then, as with no
+# distro running. -d Ubuntu --cd ~ --exec /bin/sh -c CMD runs CMD here,
+# after $FAKEWSL_SILENT seconds, if set, as a distro starting does.
 args = sys.argv[1:]
+boot = float(os.environ.get("FAKEWSL_BOOT", "0"))
+stamp = os.environ.get("FAKEWSL_STAMP", "")
+if boot and not os.path.exists(stamp):
+    open(stamp, "w").close()
 if args == ["-l", "-q"]:
+    sys.stdout.buffer.write("Ubuntu\r\n".encode("utf-16-le"))
+    sys.exit(0)
+if args == ["-l", "--running", "-q"]:
+    if boot and time.time() < os.path.getmtime(stamp) + boot:
+        sys.stdout.buffer.write("There are no running distributions.\r\n".encode("utf-16-le"))
+        sys.exit(1)
     sys.stdout.buffer.write("Ubuntu\r\n".encode("utf-16-le"))
     sys.exit(0)
 if len(args) != 8 or args[:2] != ["-d", "Ubuntu"] or args[6] != "-c":
     sys.stderr.write(f"fakewsl: unexpected {args}\n")
     sys.exit(2)
+time.sleep(float(os.environ.get("FAKEWSL_SILENT", "0")))
 run(["/bin/sh", "-c", args[7]])
 """
 
@@ -2065,7 +2079,7 @@ class Far:
     """Y, the host of this scenario's state directory, then X, a headless
     engine of its own whose [remote y] reaches Y through a fake ssh."""
 
-    def __init__(self, t, scenario, yenv=None, ypath=None, wsl=False):
+    def __init__(self, t, scenario, yenv=None, ypath=None, wsl=False, xenv=None):
         self.t = t
         self.model = t.model(scenario)
         y = Client(t)
@@ -2084,7 +2098,7 @@ class Far:
                     f"{section}path = {ypath or t.prospero}\nstate = {t.state}\n"
                     f"config = {t.config}\n")
         FARHOST[0] = "Ubuntu" if wsl else "y"
-        env = dict(t.env, PROSPERO_TEST_SSH=prog, FAR_WORK=t.work)
+        env = dict(t.env, PROSPERO_TEST_SSH=prog, FAR_WORK=t.work, **(xenv or {}))
         if wsl:
             env["PROSPERO_TEST_WSL"] = program(t, "fakewsl", FAKEWSL)
             with open(os.path.join(self.xstate, "remote", "wsl.list"), "w") as f:
@@ -2377,6 +2391,27 @@ def far_wsl(t):
         desc = tools[0]["function"]["description"] if tools else ""
         t.check("- Ubuntu: Linux (WSL) on this machine" in desc and
                 "\\\\wsl.localhost\\Ubuntu\\" in desc, f"told {desc!r}")
+    finally:
+        f.quit()
+
+
+@scenario
+def far_wsl_boot(t):
+    """A WSL distro that is starting, and silent for longer than a link
+    may be (20 s): its stream is kept while wsl.exe -l --running says it
+    does not run yet, then given the usual silence, by which its host
+    answers."""
+    if os.name == "nt":
+        return "skip"
+    stamp = os.path.join(t.root, "wslstamp")
+    f = Far(t, "far_wsl_boot", wsl=True,
+            xenv=dict(FAKEWSL_BOOT="10", FAKEWSL_SILENT="24", FAKEWSL_STAMP=stamp))
+    try:
+        sid = f.parent()
+        f.ends(sid, timeout=120)
+        te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(len(te) == 2 and all(r["status"] == "ok" for r in te), f"tool.ends {te}")
+        t.check(os.path.exists(stamp), "wsl.exe asked")
     finally:
         f.quit()
 

@@ -1546,6 +1546,12 @@ static b32 os_guiopenfile(Os *os, Arena scratch, Str title, i32 kind, Mailbox *m
     return 1;
 }
 
+// No watch of WSL's distros but on Windows.
+static b32 os_guiwslwatch(Os *, Arena *, Mailbox *, u32)
+{
+    return 0;
+}
+
 // And for a directory, starting in at.
 static b32 os_guiopendir(Os *os, Arena scratch, Str title, Str at, Mailbox *mb,
                          u32 type, u64 id)

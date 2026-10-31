@@ -42,8 +42,12 @@ On Windows, each installed WSL distro is a remote host by itself, named
 after it ("Debian (WSL)"), reached through `wsl.exe` rather than ssh:
 nothing to set up in the distro but an engine, which deploying puts
 there as for any Linux machine (with `cat`, as a distro has no scp).
-Look again in the Hosts pane lists them anew. Docker Desktop's own
-distros are left out. An unconfigured distro's Settings button in the
+The list follows distros as they are installed or unregistered, and
+Refresh in the Sessions pane or Look again in the Hosts pane lists
+them anew. Docker Desktop's and Podman's own distros are left out. A
+distro that isn't running yet starts as it's connected to, which may
+take a minute or two as WSL itself starts: its host says "starting
+WSL's DISTRO" meanwhile. An unconfigured distro's Settings button in the
 Hosts pane gives it a `[remote NAME]` section with `wsl = DISTRO`, to
 change its settings.
 A section with `wsl = DISTRO` in place of `ssh` names one yourself,

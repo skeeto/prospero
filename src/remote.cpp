@@ -82,12 +82,15 @@ enum : i64 {
     REMOTE_TRIES     = 3,              // failures, never up, before giving up
     REMOTE_CLOSEWAIT = 3*SEC,          // for the stream to end after a goodbye
     REMOTE_DRAINWAIT = 30*SEC,         // closing: for replies still to come
+    REMOTE_WSLBOOT   = 120*SEC,        // for a WSL distro to start running
+    REMOTE_WSLPOLL   = 2*SEC,          // asking meanwhile whether it does
 };
 
 static i64 remotebackoff[] = {1*SEC, 2*SEC, 5*SEC, 10*SEC, 30*SEC};
 
 enum : u32 {
     REMOTE_DEPLOYED = 300,  // a deployment's outcome: 1 and the path, or 0 and why
+    REMOTE_WSLRUNS,         // a stream's (id) distro runs: 1, or not yet: 0
 };
 
 // What another thread asks of the remote's (remoteask), as bits
@@ -200,6 +203,9 @@ struct Remote {
     b32               deployed; // tried once: never again
     b32               redeploy; // deploy once this stream ends
     i32               cancel;   // stops a deployment (atomic)
+    b32               booting;  // the stream's WSL distro may be starting
+    i64               bootby;   // ticks: given until then to run
+    u64               probetid; // the stream asked of meanwhile, 0 none (atomic)
     i32               asked;    // REMOTE_CLOSE and others (atomic)
     iz                room;     // the link's, as of the last pass (atomic)
 };
@@ -365,6 +371,72 @@ static Str remotelog(Remote *r, Arena *a)
     return join(a, dir, concat(a, name, ".log"));
 }
 
+// A WSL distro starting says nothing until it runs, which may take a
+// minute or more as WSL itself starts: until then (REMOTE_WSLBOOT) its
+// stream is not given up on for silence. A thread asks wsl.exe -l
+// --running every REMOTE_WSLPOLL whether it runs yet, and tells the
+// first answer and the one that it runs (REMOTE_WSLRUNS), after which
+// the usual silence applies: the host there must answer by then. Until
+// the stream ends or is heard from (probetid), or the remote ends.
+struct RemoteProbe {
+    Remote *r;
+    u64     tid;
+    Region *mem;   // this, then rest
+    Arena   rest;
+};
+
+static void remoteprobethread(void *arg)
+{
+    RemoteProbe *p    = (RemoteProbe *)arg;
+    Remote      *r    = p->r;
+    Os          *os   = r->os;
+    Arena        base = p->rest;
+    Mailbox     *nap  = newmailbox(&base, 64, 0, 0);
+    b32          told = 0;
+    while (nap && __atomic_load_n(&r->probetid, __ATOMIC_ACQUIRE)==p->tid &&
+           !__atomic_load_n(&r->cancel, __ATOMIC_ACQUIRE)) {
+        Arena      perm    = base;
+        Arena      scratch = carve(&perm, (iz)1<<20);
+        Slice<Str> running = wsllist(os, &perm, scratch, r->conf.program,
+                                     r->conf.localstate, 1, &r->cancel);
+        b32 up = 0;
+        for (iz i = 0; i < running.len; i++) {
+            up |= equalfold(running[i], r->conf.wsl);
+        }
+        if (up || !told) {
+            mailpost(r->in, REMOTE_WSLRUNS, p->tid, up ? Str("1") : Str("0"), 0);
+            told = 1;
+        }
+        if (up) {
+            break;
+        }
+        mailwait(nap, (i32)((i64)REMOTE_WSLPOLL/MS));
+    }
+    os_release(os, p->mem);
+}
+
+static void remotewslwait(Remote *r, i64 now)
+{
+    Region *mem = os_reserve(r->os, (iz)1<<22);
+    if (!mem) {
+        return;  // the usual silence, then
+    }
+    Arena        a = newarena(mem);
+    RemoteProbe *p = alloc<RemoteProbe>(&a);
+    p->r    = r;
+    p->tid  = r->tid;
+    p->mem  = mem;
+    p->rest = a;
+    __atomic_store_n(&r->probetid, r->tid, __ATOMIC_RELEASE);
+    if (!os_thread(r->os, remoteprobethread, p)) {
+        __atomic_store_n(&r->probetid, 0, __ATOMIC_RELEASE);
+        os_release(r->os, mem);
+        return;
+    }
+    r->booting = 1;
+    r->bootby  = now + REMOTE_WSLBOOT;
+}
+
 // Start a stream: ssh, or a connection to this machine's host. Returns 0
 // on failure, with why set.
 static b32 remotestart(Remote *r, Arena scratch)
@@ -470,6 +542,9 @@ static b32 remotestart(Remote *r, Arena scratch)
     }
     r->live = 1;
     linkconnect(&r->link, now);
+    if (r->conf.wsl.len) {
+        remotewslwait(r, now);
+    }
     return 1;
 }
 
@@ -494,7 +569,9 @@ static void remotestop(Remote *r, b32 kill)
         os_connclose(r->os, r->conn);
         r->conn = 0;
     }
-    r->live = 0;
+    r->live    = 0;
+    r->booting = 0;
+    __atomic_store_n(&r->probetid, 0, __ATOMIC_RELEASE);
     r->tid++;
 }
 
@@ -1008,6 +1085,7 @@ static void remotethread(void *arg)
 
         i64 next = r->live      ? linkdeadline(&r->link) :
                    r->deploying ? now + 3600*SEC : r->retryat;
+        next = r->booting && r->bootby<next ? r->bootby : next;
         next = r->closeby && r->closeby<next ? r->closeby : next;
         next = r->drainby && r->drainby<next ? r->drainby : next;
         i32 ms = 0;
@@ -1032,7 +1110,20 @@ static void remotethread(void *arg)
             case PROC_DATA:
             case CONN_DATA:
                 if (rec.id==r->tid && r->live) {
+                    r->booting = 0;  // heard from: it runs
+                    __atomic_store_n(&r->probetid, 0, __ATOMIC_RELEASE);
                     remoteframes(r, a, rec.data);
+                }
+                break;
+            case REMOTE_WSLRUNS:
+                if (rec.id==r->tid && r->booting && rec.data=="1") {
+                    r->booting = 0;
+                    r->link.heardat = os_ticks(os);  // its host must answer now
+                    __atomic_store_n(&r->probetid, 0, __ATOMIC_RELEASE);
+                } else if (rec.id==r->tid && r->booting && r->state==RS_CONNECTING) {
+                    Str msg = concat(&a, concat(&a, "starting WSL's ", r->conf.wsl),
+                                     ", which may take a minute or two");
+                    remotestatus(r, a, RS_CONNECTING, msg, -1);
                 }
                 break;
             case PROC_EXIT:
@@ -1106,6 +1197,12 @@ static void remotethread(void *arg)
             if (r->done) {
                 break;
             }
+        }
+        if (r->booting && now>=r->bootby) {
+            r->booting = 0;  // the usual silence from here
+            __atomic_store_n(&r->probetid, 0, __ATOMIC_RELEASE);
+        } else if (r->booting) {
+            r->link.heardat = now;
         }
         if (r->live && !linktick(&r->link, now)) {
             remotedown(r, scratch, "the link went silent", -1);
