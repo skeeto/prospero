@@ -650,6 +650,47 @@ static char const *cstring(void *ns)
     return ns ? objcsend<char const *>(ns, "UTF8String") : 0;
 }
 
+// The application menu's Settings... (Cmd+,), where macOS users look
+// for an app's settings. SDL adds it as "Preferences...", with no action
+// and so disabled: here it is renamed as macOS 13 names it, and made to
+// post a tray event (TRAY_SETTINGS) through the application's delegate,
+// which takes the action as a method added to its class.
+static u32 settingsevent;
+
+static void settingsaction(void *, void *, void *)
+{
+    SDL_Event e = {};
+    e.type      = settingsevent;
+    e.user.code = TRAY_SETTINGS;
+    SDL_PushEvent(&e);
+}
+
+static void handlesettings(u32 trayevent)
+{
+    void *pool = objc_autoreleasePoolPush();
+    void *app  = objcsend<void *>(objc_getClass("NSApplication"), "sharedApplication");
+    void *bar  = app ? objcsend<void *>(app, "mainMenu") : 0;
+    void *top  = bar && objcsend<iz>(bar, "numberOfItems")>0
+                 ? objcsend<void *>(bar, "itemAtIndex:", (iz)0) : 0;
+    void *menu = top ? objcsend<void *>(top, "submenu") : 0;
+    void *item = 0;
+    for (iz i = 0, n = menu ? objcsend<iz>(menu, "numberOfItems") : 0; !item && i < n; i++) {
+        void       *it  = objcsend<void *>(menu, "itemAtIndex:", i);
+        char const *key = cstring(objcsend<void *>(it, "keyEquivalent"));
+        item = key && !__builtin_strcmp(key, ",") ? it : 0;
+    }
+    void *dlg = app ? objcsend<void *>(app, "delegate") : 0;
+    if (item && dlg) {
+        settingsevent = trayevent;
+        class_addMethod(object_getClass(dlg), sel_registerName("prosperoSettings:"),
+                        (void *)settingsaction, "v@:@");
+        objcsend<void>(item, "setTitle:", nsstring("Settings\xe2\x80\xa6"));
+        objcsend<void>(item, "setTarget:", dlg);
+        objcsend<void>(item, "setAction:", sel_registerName("prosperoSettings:"));
+    }
+    objc_autoreleasePoolPop(pool);
+}
+
 static void macwillpresent(void *, void *, void *, void *, void (^done)(uz))
 {
     done(2|8|16);  // sound, list, banner
@@ -885,6 +926,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     p->framedark = -1;
     #ifdef __APPLE__
     handlereopen(p->trayevent);
+    handlesettings(p->trayevent);
     #endif
     if (!sdlwindow(os, g, p, title)) {
         return 0;
@@ -1301,6 +1343,7 @@ static void os_guiinject(Os *os, GuiEvent *ge)
             {SDLK_V,      SDL_SCANCODE_V},
             {SDLK_B,      SDL_SCANCODE_B},
             {SDLK_2,      SDL_SCANCODE_2},
+            {SDLK_COMMA,  SDL_SCANCODE_COMMA},
         };
         e.type         = ge->down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
         e.key.windowID = id;

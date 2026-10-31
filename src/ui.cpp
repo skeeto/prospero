@@ -2580,6 +2580,27 @@ static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v, b32 first)
     }
 }
 
+static b32  cfghas(Gui *, Str, Str);
+static void cfgselect(Gui *, Str, Str);
+static void followlink(Gui *, Str);
+
+// A list's last item, label: where its choices are set, in Settings,
+// at the section of kind named, else the kind's first section, else a
+// search for the kind.
+static void settingsitem(Gui *g, Arena a, Str label, Str kind, Str name)
+{
+    ImGui::Separator();
+    if (!menuitem(g, a, label, {}, 0)) {
+        return;
+    } else if (name.len && cfghas(g, kind, name)) {
+        cfgselect(g, kind, name);
+        g->cfgshowsel = 1;
+        setpane(g, PANE_SETTINGS, 1);
+    } else {
+        followlink(g, concat(&a, "settings:", kind));
+    }
+}
+
 // The shells a host lists (shells), as menu items: the current one
 // checked, one not found disabled, with why. Asked for anew each time
 // the list opens.
@@ -2612,6 +2633,9 @@ static void shellitems(Gui *g, Arena a, GuiSession *s, b32 opened)
         if (tip.len) {
             ImGui::SetItemTooltip("%s", cstr0(&a, tip));
         }
+    }
+    if (s->host == g->main) {
+        settingsitem(g, a, "Shells...", "shell", now);
     }
 }
 
@@ -5931,7 +5955,7 @@ static void listitems(Gui *g, Arena a, GuiSession *s)
 // The models to switch to, as menu items, then a field for another: a
 // host's other than the main one's as its own configuration has them.
 // An engine that lists its endpoints' models has those instead.
-static void modelitems(Gui *g, Arena a, GuiSession *s)
+static void modelpicks(Gui *g, Arena a, GuiSession *s)
 {
     if (hostcan(s->host, "models")) {
         listitems(g, a, s);
@@ -5972,6 +5996,17 @@ static void modelitems(Gui *g, Arena a, GuiSession *s)
             g->modelbuf[0] = 0;
             ImGui::CloseCurrentPopup();
         }
+    }
+}
+
+// Those, then for a session on this computer's endpoints (Settings edits
+// their configuration), a thin remote's too, its endpoint in Settings.
+static void modelitems(Gui *g, Arena a, GuiSession *s)
+{
+    modelpicks(g, a, s);
+    if (s->host==g->main || s->host->thin) {
+        settingsitem(g, a, "Endpoints and models...", "endpoint",
+                     s->view ? s->view->endpoint : Str{});
     }
 }
 
@@ -10342,6 +10377,7 @@ static void drawsettings(Gui *g)
                                          ImGuiInputTextFlags_EnterReturnsTrue|
                                          ImGuiInputTextFlags_EscapeClearsAll);
     itemrect(g, RECT_CFGFIND);
+    g->cfgfindon = ImGui::IsItemActive();
     if (ImGui::IsItemActivated() || ImGui::IsItemEdited()) {
         g->cfgfindhid = 0;
     }
@@ -10811,7 +10847,7 @@ static void newfree(Gui *g)
 // The menus' shortcuts, wherever the focus is (a global route, which a
 // focused field's own use of a key goes ahead of): a new session, zoom
 // by key or by Ctrl+wheel (Cmd on macOS), find and the session's
-// folding toggles, and quitting on Linux, where
+// folding toggles, Settings, and quitting on Linux, where
 // no system shortcut does (macOS has Cmd+Q, Windows Alt+F4).
 static void menukeys(Gui *g)
 {
@@ -10839,6 +10875,9 @@ static void menukeys(Gui *g)
     // Find, and the session's toggles of its tool output and reasoning
     if (g->sess && ImGui::Shortcut(ctrl|ImGuiKey_F, glob)) {
         gui_find_open(g);
+    }
+    if (ImGui::Shortcut(ctrl|ImGuiKey_Comma, glob)) {
+        opensettings(g);
     }
     if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_T, glob)) {
         setsessiontools(g, 0, !sessiontools(g));
@@ -11410,6 +11449,10 @@ static void drawmenubar(Gui *g)
             ImGui::EndDisabled();
         }
         ImGui::Separator();
+        if (menuitem(g, a, "Settings...", {}, cmdkey(g, &a, ","))) {
+            opensettings(g);
+        }
+        ImGui::Separator();
         #if defined(__APPLE__)
         char const *quit = "Cmd+Q";
         #elif defined(_WIN32)
@@ -11455,8 +11498,9 @@ static void drawmenubar(Gui *g)
             } else if (i == PANE_HELP) {
                 ImGui::Separator();
             }
-            bool on = g->panes[i];
-            if (ImGui::MenuItem(panenames[i], 0, &on)) {
+            bool        on  = g->panes[i];
+            char const *key = i==PANE_SETTINGS ? cmdkey(g, &a, ",") : 0;
+            if (ImGui::MenuItem(panenames[i], key, &on)) {
                 setpane(g, i, on);
             }
             itemrect(g, RECT_PANE0+i);

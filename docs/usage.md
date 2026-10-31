@@ -53,7 +53,9 @@ first time, 1700 by 900 at the display's scale, or maximized on a display
 too small for that. The first run shows Help in front, with Settings and
 Hosts when the configuration names no model and no remote host, and none
 of its endpoints lists a model either; close them once read, as the View
-menu shows each again. Help → Help shows a page on each topic, from
+menu shows each again. Settings also opens with Ctrl+, (Cmd+,), from
+the Session menu (and the application menu on macOS), and from the end
+of the model and shell lists, at the session's endpoint and the shells. Help → Help shows a page on each topic, from
 getting started to troubleshooting, built in from `assets/help`. Its
 search field (Ctrl+F while Help has the focus) lists the sections that
 have every word typed, headings first, and a click goes to that section.

@@ -32,9 +32,10 @@ setting is first saved. Its configuration file then starts from a
 built-in copy that documents every setting, with an endpoint for a
 llama.cpp server on this machine as an example.
 
-1. Open the Settings pane (View → Settings). The line at its top says
-   which file its edits go to, usually
-   `~/.config/prospero/prospero.ini` (see
+1. Open the Settings pane: Ctrl+, (Cmd+, on macOS), or Settings... in
+   the Session menu (on macOS, the Prospero menu too), or View →
+   Settings. The line at its top says which file its edits go to,
+   usually `~/.config/prospero/prospero.ini` (see
    [Configuration](help:config)).
 2. Under Endpoints, use Add endpoint... for your server, and set its
    url. An API key is never written in the file: set `key` to

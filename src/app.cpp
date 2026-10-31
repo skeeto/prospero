@@ -1331,6 +1331,7 @@ struct Gui {
     b32                cfgcombo;   // or as a combo, which is open
     char              *cfgfind;    // the settings' search, FIELD_MAX
     b32                cfgfindkey; // put the keyboard there (Ctrl+F)
+    b32                cfgfindon;  // and it had the keyboard, last drawn
     b32                cfgfindhid; // a pick hid the results, when narrow
     b32                cfgfound;   // results were listed in the last frame
     Str                cfgfkind;   // the setting a result went to: its
@@ -8860,6 +8861,15 @@ static void shednow(Gui *g)
     }
 }
 
+// Show Settings, its search field taking the keyboard: Ctrl+, (Cmd+,),
+// the Session menu's Settings..., macOS's application menu's.
+static void opensettings(Gui *g)
+{
+    setpane(g, PANE_SETTINGS, 1);
+    g->cfgfindkey = 1;
+    scheddirty(&g->sched);  // shown already, for a pick that brings no input
+}
+
 // A pick from the tray icon's menu (or the checklist's, as if).
 static void gui_tray(Gui *g, i32 item)
 {
@@ -8870,6 +8880,9 @@ static void gui_tray(Gui *g, i32 item)
         } else {
             os_guiraise(g->os);
         }
+        break;
+    case TRAY_SETTINGS:
+        opensettings(g);
         break;
     case TRAY_STOPALL:
         if (g->host) {
@@ -11236,6 +11249,7 @@ enum : i32 {
                       // nested under its original
     CHK_THIN,         // the remote r is up and thin, the Hosts pane saying so
     CHK_VIA,          // the session shown streams via this computer
+    CHK_CFGSEARCH,    // the settings' search field has the keyboard
     CHK_COUNT,
 };
 
@@ -11495,6 +11509,7 @@ static Str chknames[] = {
     "the session works in its worktree, on its branch",
     "the worktree session starts fresh, under its original",
     "the remote is thin", "its calls go via this computer",
+    "the settings' search field has the keyboard",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -12989,6 +13004,45 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_NAMED, 80, 0, 100, "link https://example.org/drag"},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_LINKWEB, 0, 0, 0, "https://example.com/"},
+    // Settings where people look for it: Ctrl+, (Cmd+,) shows it, its
+    // search taking the keyboard; the model list's last item shows the
+    // session's endpoint's page, and the shell list's the shells'
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_COMMA, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_COMMA, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 500, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Settings"},
+    {OP_CHECK, CHK_CFGSEARCH, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "settings-key"},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "model picker"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "Endpoints and models..."},
+    {OP_SHOT, 0, 0, 0, 300, "settings-models"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Settings"},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "endpoint fake"},
+    {OP_MOVE, T_TRANSCRIPTTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "shell picker"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 300, "Shells..."},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_PANEOPEN, 0, 0, 0, "Settings"},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "shell"},
+    {OP_MOVE, T_CFGCLEAR, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
     // Closing with a turn running asks first; Cancel goes back, and
     // stopping quits
     {OP_PROMPT, 0, 0, 0, 100, "Close me: run a very slow command."},
@@ -17436,6 +17490,8 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_LINKWEB:
         return g->linkopened == g->ops[g->drivepc-1].text;
+    case CHK_CFGSEARCH:
+        return g->cfgfindon;
     case CHK_PAGE: {
         Arena a    = g->frame;
         Str   want = g->ops[g->drivepc-1].text;
