@@ -35,7 +35,9 @@ tools only by naming them: `mcp__NAME` for all of a server's, or
 
 An included file may give a server by its `url`, but not its
 `command`, `cwd` or `env.NAME`, which run programs, nor `trust = yes`,
-nor change a section of your own file's.
+nor change a server your own file gives the `url` or `command` of. Your
+file may add to an included server, such as its `token`, but your
+`trust = yes` counts only for a server you define yourself.
 
 ## Asks
 

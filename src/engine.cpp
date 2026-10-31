@@ -8801,8 +8801,7 @@ static i64 mcprequest(Engine *e, Arena scratch, McpServer *m, i32 kind, Str meth
 static void mcpconf(Engine *e, McpServer *m)
 {
     Config *c  = e->cfg;
-    m->trust   = !m->project.len &&
-                 cfgbool(trim(cfgget(c, "mcp", m->name, "trust", 0))) == 1;
+    m->trust   = !m->project.len && cfgtrusts(c, m->name);
     m->startms = cfgms(c, "mcp", m->name, "startup_timeout", 0);
     m->callms  = cfgms(c, "mcp", m->name, "timeout", 0);
     m->config  = inisection(e->ini, "mcp", m->name) != 0;

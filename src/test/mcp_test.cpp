@@ -247,7 +247,14 @@ static void test_mcp(Test *t)
             "[mcp web]\n"
             "url = https://x/mcp\n"
             "header.X-A = b\n"
-            "token = plain\n");                // 10
+            "token = plain\n"                  // 10
+            "[mcp remote]\n"
+            "token = file:~/t.key\n"
+            "trust = yes\n"
+            "[web]\n"
+            "key = file:~/w.key\n");          // 15
+        os_write(v.os, b, "/home/u/t.key", "tk\n");
+        os_write(v.os, b, "/home/u/w.key", "wk\n");
         os_write(v.os, b, "/c/team.ini",
             "[mcp shared]\n"
             "command = evil\n"
@@ -273,6 +280,9 @@ static void test_mcp(Test *t)
             "/c/prospero.ini:5:2: warning: mcp none has neither a command nor a url\n"
             "/c/prospero.ini:10:9: warning: a plaintext secret: write env:NAME and "
             "set the variable, or file:PATH, so that this file can be shared\n"
+            "/c/prospero.ini:13:9: warning: trust applies only to a server your own "
+            "file gives the url or command of, as an included file could point this "
+            "one elsewhere: it is ignored here\n"
             "/c/team.ini:1:2: warning: mcp shared has neither a command nor a url\n"
             "/c/team.ini:2:11: error: [mcp] command in an included file is ignored, "
             "since it chooses what runs: set it in your own file (an included file "
@@ -286,16 +296,16 @@ static void test_mcp(Test *t)
             "/c/team.ini:7:9: error: [mcp] env.NAME in an included file is ignored, "
             "since it chooses what runs: set it in your own file (an included file "
             "may give a server by its url)\n"
-            "/c/team.ini:11:1: error: ignored, as your own file has [mcp web], "
-            "which an included file cannot change\n"
-            "/c/team.ini:12:1: error: ignored, as your own file has [mcp web], "
-            "which an included file cannot change\n"
+            "/c/team.ini:11:1: error: ignored, as your own file defines [mcp web] "
+            "by its url or command, which an included file cannot change\n"
+            "/c/team.ini:12:1: error: ignored, as your own file defines [mcp web] "
+            "by its url or command, which an included file cannot change\n"
             "/c/team.ini:16:7: error: [web] ask = false in an included file is "
             "ignored, since it lets the agent search and read unasked: set it in "
             "your own file");
         expect(t, "mcp shared command", cfgget(c, "mcp", "shared", "command", 0), "");
         expect(t, "mcp remote url", cfgget(c, "mcp", "remote", "url", 0), "https://team/mcp");
-        expect(t, "mcp remote trust", cfgget(c, "mcp", "remote", "trust", 0), "false");
+        expect(t, "mcp remote trust", cfgget(c, "mcp", "remote", "trust", 0), "yes");  // ours
         expect(t, "mcp remote cwd", cfgget(c, "mcp", "remote", "cwd", 0), "");
         expect(t, "mcp remote tools", cfgget(c, "mcp", "remote", "tools", 0), "a b");
         Slice<CfgPair> env = cfgpairs(c, &b, "mcp", "remote", "env.");
@@ -310,6 +320,14 @@ static void test_mcp(Test *t)
         expect(t, "web url shared", cfgget(c, "web", "", "url", 0), "https://s/");
         expect(t, "web ask shared", cfgget(c, "web", "", "ask", 0), "true");
         expect(t, "web fetch shared", cfgget(c, "web", "", "fetch", 0), "no");
+
+        // The user's own file adds secrets from files to included sections,
+        // which keep their url and search; its trust there is ignored
+        expect(t, "mcp added token", cfgsecret(c, &b, "mcp", "remote", "token"), "tk");
+        expect(t, "mcp added url", cfgget(c, "mcp", "remote", "url", 0), "https://team/mcp");
+        expect(t, "mcp added trust", istr(&b, cfgtrusts(c, "remote")), "0");
+        expect(t, "mcp own trust", istr(&b, cfgtrusts(c, "none")), "0");
+        expect(t, "web added key", cfgsecret(c, &b, "web", "", "key"), "wk");
 
         // The user's own [web] shuts out the include's
         os_write(v.os, b, "/c/own.ini",

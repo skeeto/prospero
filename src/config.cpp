@@ -31,8 +31,12 @@
 // powershell, cmd), [tools] shells and git, and [ui] editor and
 // terminal. A [shell] section counts only where the user's own file has
 // its header (cfgownsection), and an included file's settings in an
-// [mcp] or [web] section that the user's own file has are ignored
-// (cfgsealed): it may define those, but not change the user's.
+// [mcp] or [web] section that the user's own file defines (its url or
+// command, its search or url) are ignored (cfgsealed): it may define
+// those, but not change the user's. The user's file may add to an
+// included one's, a token or key say, but its [mcp] trust = true
+// counts only for a server it defines, never one an include points
+// wherever it likes (cfgtrusts).
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -1382,12 +1386,36 @@ static b32 cfgfilehas(IniFile *f, Str kind, Str name)
     return 0;
 }
 
+// Whether a file sets, in [KIND NAME], what the section points at: an
+// MCP server's url or command, [web]'s search or url. Such a section is
+// the file's own, where another's section of the same name, with no
+// such setting, only adds to what defines it (such as a secret).
+static b32 cfganchors(IniFile *f, Str kind, Str name)
+{
+    if (kind!="mcp" && kind!="web") {
+        return 0;
+    }
+    Str a = kind=="mcp" ? Str("command") : Str("search");
+    Str b = "url";
+    for (iz i = 0; f && i < f->lines.len; i++) {
+        IniLine    *l = &f->lines[i];
+        IniSection *s = l->section;
+        if (l->type==INI_KEY && s && s->kind==kind && s->name==name &&
+                (l->key==a || l->key==b) && trim(l->value).len) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Whether an included file's setting in [KIND NAME] is shut out, as the
-// user's own file has that section: an included file may define an MCP
-// server or [web], but not change the user's.
+// user's own file sets what that section points at (cfganchors): an
+// included file may define an MCP server or [web], but not change one
+// the user's file defines, while the user's file may add to the
+// included one's, such as its token or key from a file.
 static b32 cfgsealed(IniFile *user, IniFile *f, Str kind, Str name)
 {
-    return f!=user && (kind=="mcp" || kind=="web") && cfgfilehas(user, kind, name);
+    return f!=user && cfganchors(user, kind, name);
 }
 
 static CfgFound cfgfind(Config *c, Str kind, Str name, Str key)
@@ -1662,6 +1690,15 @@ static b32 cfgownsection(Config *c, Str kind, Str name)
     return cfgfilehas(c->user, kind, name);
 }
 
+// Whether an MCP server's tools run without asking: its trust is true,
+// and the user's own file defines it (cfganchors), so that an included
+// file cannot point a trusted server elsewhere.
+static b32 cfgtrusts(Config *c, Str name)
+{
+    return cfgbool(trim(cfgget(c, "mcp", name, "trust", 0)))==1 &&
+           cfganchors(c->user, "mcp", name);
+}
+
 // The names of the user's own file's [KIND NAME] sections, each once,
 // in the order of the file.
 static Slice<Str> cfgownnames(Config *c, Arena *a, Str kind)
@@ -1930,16 +1967,28 @@ static void cfgkeyline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
         Str msg = {};
         if (!cfgmuted(f)) {
             Buf b(perm, 128);
-            print(&b, "ignored, as your own file has [");
+            print(&b, "ignored, as your own file defines [");
             print(&b, s->kind);
             if (s->name.len) {
                 putbyte(&b, ' ');
                 print(&b, s->name);
             }
-            print(&b, "], which an included file cannot change");
+            print(&b, s->kind=="mcp" ? Str("] by its url or command")
+                                     : Str("] by its search or url"));
+            print(&b, ", which an included file cannot change");
             msg = finish(&b);
         }
         cfgreport(ini, perm, f, l, INI_ERROR, l->keybeg, msg);
+        return;
+    }
+    b32 defined = inientry(s, "url") || inientry(s, "command");
+    if (!shared && s->kind=="mcp" && l->key=="trust" && cfgbool(trim(l->value))==1 &&
+            defined && !cfganchors(user, "mcp", s->name)) {
+        Str msg = cfgmuted(f) ? Str{} :
+                  Str("trust applies only to a server your own file gives the url "
+                      "or command of, as an included file could point this one "
+                      "elsewhere: it is ignored here");
+        cfgreport(ini, perm, f, l, INI_WARNING, l->valbeg, msg);
         return;
     }
     i32 j = cfgjudge(key, l->value, shared);

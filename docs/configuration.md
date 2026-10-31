@@ -39,7 +39,10 @@ secrets and `file:` secrets, `[remote]` and `[desktop]` settings, an
 `[web] ask = no`, `[tools] path_prepend` and `path_append`, a
 `[tools] shell` other than a keyword, and `[ui] editor` and `terminal`
 are ignored. It may define an MCP server by its url, and `[web]`, but
-cannot change an `[mcp]` section or `[web]` that your own file has.
+cannot change a server your own file gives the `url` or `command` of,
+nor a `[web]` whose `search` or `url` your file sets. Your file may add
+to an included section instead, such as `key = file:PATH` for an
+included endpoint, or a `token` for an included MCP server.
 Its `env:NAME` values are read from your environment, as yours are,
 so include only files you trust that far. A server whose certificate is not trusted fails the turn
 at once, saying why, rather than being retried.
@@ -193,8 +196,11 @@ names them as `mcp__NAME` or `mcp__NAME__TOOL`. Otherwise each call
 asks first, with an "always" for all of that server's tools, which for
 a server over HTTP holds only while its url stays the same. An included
 file may define a server by its `url`, but its `command`, `cwd`,
-`env.NAME` and `trust = yes` are ignored, as is anything it sets in a
-section your own file has.
+`env.NAME` and `trust = yes` are ignored, as is anything it sets for a
+server your own file gives the `url` or `command` of. Your file may add
+to an included server, a `token = file:PATH` say, but its `trust = yes`
+counts only for a server it defines itself, since the include could
+point the server elsewhere.
 
 A project's `.mcp.json`, in Claude Code's format, with `${VAR}` and
 `${VAR:-default}` expanded, is read once as a session starts, from its
@@ -237,7 +243,8 @@ web search tool: `model = ENDPOINT/MODEL`, by default
 `fetch = no` leaves out `web_fetch`, `results` caps a search's
 results (8), and `searches` a session tree's searches (200). An
 included file may set `[web]`, but not `ask = no`, and not at all
-when your own file has `[web]`.
+when your own file sets its `search` or `url`; your file may add a
+`key` to an included `[web]`.
 
 Every search and page asks first, showing the query and its service
 or the whole address, with "always" for every search or every page of
