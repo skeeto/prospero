@@ -3104,6 +3104,17 @@ static Slice<Str> envset(Arena *a, Slice<Str> env, Str name, Str value, b32 wind
     return put ? r : push(a, r, set);
 }
 
+// env with HOME, for busybox-w32's sh on Windows (w64devkit's), which
+// finds ~/.profile and ~ only by it: home, %USERPROFILE% as w64devkit's
+// launcher sets it, where a process started from Explorer has none.
+static Slice<Str> envhome(Arena *a, Slice<Str> env, Str home, b32 windows)
+{
+    if (!windows || !home.len || envget(env, "HOME", windows).len) {
+        return env;
+    }
+    return envset(a, env, "HOME", home, windows);
+}
+
 // env without any variable NAME.
 static Slice<Str> envdel(Arena *a, Slice<Str> env, Str name, b32 windows)
 {

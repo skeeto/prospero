@@ -756,6 +756,11 @@ static void test_tools(Test *t)
                ev[2]=="B=2"), "1");
         ev = envset(a, ev, "a", "3", 0);
         expect(t, "envset posix is exact", istr(a, ev.len==4 && ev[1]=="A=1"), "1");
+        Slice<Str> eh = envhome(a, ev, "C:\\Users\\me", 1);
+        expect(t, "envhome", eh.len==5 ? eh[4] : Str{}, "HOME=C:\\Users\\me");
+        expect(t, "envhome posix", istr(a, envhome(a, ev, "/home/me", 0).len), "4");
+        eh = envset(a, ev, "home", "D:\\h", 1);
+        expect(t, "envhome kept", istr(a, envhome(a, eh, "C:\\x", 1).len), "5");
         te.windows   = 1;
         te.jobtimeout = 90;
         te.jobmax     = 3600;

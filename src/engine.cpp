@@ -5135,7 +5135,8 @@ static Str wslprelude(Arena *a, Str pre, Str post)
 }
 
 // A command's environment in shell sh, its section's settings as the
-// configuration now says: engineenv's, with PATH wrapped in the
+// configuration now says: engineenv's, with HOME for busybox-w32's sh
+// (envhome), with PATH wrapped in the
 // section's path_prepend and path_append, then its env.NAME, and sh's
 // login set. In WSL those directories are Linux's, set in sh's prelude
 // instead, its distro comes from the section too, its env.NAME cross
@@ -5152,6 +5153,9 @@ static Slice<Str> shellenvfor(Session *s, Arena *a, Shell *sh)
     b32        win = s->te.windows;
     Slice<Str> env = engineenv(e, a, win);
     sh->login = 0;
+    if (sh->flavor == FLAVOR_BUSYBOX) {
+        env = envhome(a, env, e->home, win);
+    }
     if (!sh->name.len || !cfgownsection(e->cfg, "shell", sh->name)) {
         return env;
     }

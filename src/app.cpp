@@ -6841,6 +6841,19 @@ static TermPlan termplan(Gui *g, Arena *a, GuiSession *s)
     return r;
 }
 
+// Whether the session's shell is busybox-w32's, w64devkit's sh, as the
+// engine tells by busybox.exe beside it (shellflavor).
+static b32 termbusybox(Gui *g, Arena a, View *v)
+{
+    if (!HOST_WINDOWS || !v->shellpath.len) {
+        return 0;
+    } else if (v->shellkind == "busybox") {
+        return 1;
+    }
+    Str bb = join(&a, parentdir(v->shellpath), "busybox.exe");
+    return v->shellkind=="sh" && os_stat(g->os, a, bb).type==STAT_FILE;
+}
+
 // Open it, or in the checklist note what would run, unless asked to run
 // it (PROSPERO_TEST_TERMINAL).
 static void termopen(Gui *g, Arena a, GuiSession *s)
@@ -6883,6 +6896,9 @@ static void termopen(Gui *g, Arena a, GuiSession *s)
     if (!g->drive || g->realterm) {
         Str dir = p.dir.len ? p.dir : userhome(g->os, &a);
         Slice<Str> env = guienv(g, &a);
+        if (s->host->kind!=GH_REMOTE && s->view && termbusybox(g, a, s->view)) {
+            env = envhome(&a, env, userhome(g->os, &a), HOST_WINDOWS);
+        }
         if (!os_launch(g->os, a, argv, dir, env)) {
             g->lasterr = clone(&g->perm, concat(&a, "cannot open a terminal: ",
                                                 os_lasterr(g->os, &a)));

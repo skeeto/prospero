@@ -114,7 +114,10 @@ cannot choose what runs, so these are ignored in one:
   its AutoRun). On Windows, MSYS2's and Git's profile then keep the
   working directory and Prospero's PATH, after their own directories
   (`env.MSYS2_PATH_TYPE = minimal` for MSYS2's own default, which
-  drops it). `env.NAME` sets a variable for its commands (a value,
+  drops it). w64devkit's sh, which finds `~/.profile` by HOME alone,
+  gets HOME as w64devkit's own window sets it, `%USERPROFILE%`, when
+  Prospero has none, as when started from the Start menu; so does Open
+  in terminal. `env.NAME` sets a variable for its commands (a value,
   or `env:VAR` from Prospero's own environment). `path_prepend` and
   `path_append` add directories around `[tools]`'s, and `description`
   tells the agent what the shell is for:
