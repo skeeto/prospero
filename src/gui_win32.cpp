@@ -153,13 +153,17 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 
 // Resources: the icon (assets/prospero.ico, by tools/icons.py: BMPs to
 // 64, then a 256 PNG) and its group, the version information, for the
-// name that notifications and Task Manager show (FileDescription), and
+// name that notifications and Task Manager show (FileDescription) and
+// the version Explorer's Details show (PROSPERO_VERSION_FIXED, the
+// fixed numbers, and PROSPERO_VERSION_UTF16, its text, set by CMake), and
 // the manifest (per-monitor DPI awareness v2, common controls v6, the
-// Windows versions it targets), from assets/ by the assembler's include
-// path (-Wa,-I, set by CMake). The pattern is platform/gui_windows.c in
-// skeeto/tugz, https://github.com/skeeto/tugz. Each .incbin of the icon
-// is a slice at its offset in the file, which tools/icons.py --offsets
-// prints, and must follow it. Strings are UTF-16, as numbers.
+// Windows versions it targets, and the version, from
+// assets/prospero.manifest.in, configured into the build directory), by
+// the assembler's include path (-Wa,-I, set by CMake). The pattern is
+// platform/gui_windows.c in skeeto/tugz, https://github.com/skeeto/tugz.
+// Each .incbin of the icon is a slice at its offset in the file, which
+// tools/icons.py --offsets prints, and must follow it. Strings are
+// UTF-16, as numbers.
 __asm__(
     "    .section .rsrc,\"dr\"\n"
     "    .p2align 2\n"
@@ -257,13 +261,14 @@ __asm__(
     ".Lico8: .incbin \"assets/prospero.ico\", 43022\n"        // 256x256, PNG
     ".Lico8end:\n"
     "    .p2align 3\n"
-    ".Lman: .incbin \"assets/prospero.manifest\"\n"
+    ".Lman: .incbin \"prospero.manifest\"\n"
     ".Lmanend:\n"
     "    .p2align 2\n"
     ".Lvi: .short .Lviend - .Lvi, 52, 0\n"
     "    .short 86, 83, 95, 86, 69, 82, 83, 73, 79, 78, 95, 73, 78, 70, 79, 0\n"
     "    .p2align 2\n"
-    "    .long 0xfeef04bd, 0x10000, 0, 0, 0, 0, 0x3f, 0, 0x40004, 1, 0, 0, 0\n"
+    "    .long 0xfeef04bd, 0x10000, " PROSPERO_VERSION_FIXED ", "
+             PROSPERO_VERSION_FIXED ", 0x3f, 0, 0x40004, 1, 0, 0, 0\n"
     ".Lsfi: .short .Lsfiend - .Lsfi, 0, 1\n"
     "    .short 83, 116, 114, 105, 110, 103, 70, 105, 108, 101, 73, 110, 102, 111, 0\n"
     "    .p2align 2\n"
@@ -281,6 +286,24 @@ __asm__(
     "    .p2align 2\n"
     "    .short 80, 114, 111, 115, 112, 101, 114, 111, 0\n"
     ".Ls1end:\n"
+    "    .p2align 2\n"
+    ".Ls2: .short .Ls2end - .Ls2, (.Ls2end - .Ls2v)/2, 1\n"
+    "    .short 70, 105, 108, 101, 86, 101, 114, 115, 105, 111, 110, 0\n"
+    "    .p2align 2\n"
+    ".Ls2v: .short " PROSPERO_VERSION_UTF16 ", 0\n"
+    ".Ls2end:\n"
+    "    .p2align 2\n"
+    ".Ls3: .short .Ls3end - .Ls3, (.Ls3end - .Ls3v)/2, 1\n"
+    "    .short 80, 114, 111, 100, 117, 99, 116, 86, 101, 114, 115, 105, 111, 110, 0\n"
+    "    .p2align 2\n"
+    ".Ls3v: .short " PROSPERO_VERSION_UTF16 ", 0\n"
+    ".Ls3end:\n"
+    "    .p2align 2\n"
+    ".Ls4: .short .Ls4end - .Ls4, 13, 1\n"
+    "    .short 79, 114, 105, 103, 105, 110, 97, 108, 70, 105, 108, 101, 110, 97, 109, 101, 0\n"
+    "    .p2align 2\n"
+    "    .short 112, 114, 111, 115, 112, 101, 114, 111, 46, 101, 120, 101, 0\n"
+    ".Ls4end:\n"
     "    .p2align 2\n"
     ".Lstend:\n"
     ".Lsfiend:\n"

@@ -156,16 +156,43 @@ if(WIN32 AND PROSPERO_GUI)
   # The GUI build has CRT startup, since FreeType, md4c and ImGui need a
   # CRT, though the core still never calls it. windows.h, D3D11 and the
   # ImGui Win32 backends stay in the gui_win32.cpp edge, which embeds
-  # the icon and the manifest (assets/, through -Wa,-I).
+  # the icon (assets/) and the manifest, which names the version
+  # (configured into the build directory), through -Wa,-I.
+  configure_file(assets/prospero.manifest.in
+    ${CMAKE_BINARY_DIR}/prospero.manifest @ONLY)
   add_library(prospero_gui OBJECT src/gui_win32.cpp)
   set_property(SOURCE src/gui_win32.cpp APPEND PROPERTY OBJECT_DEPENDS
     ${PROJECT_SOURCE_DIR}/assets/prospero.ico
-    ${PROJECT_SOURCE_DIR}/assets/prospero.manifest)
+    ${CMAKE_BINARY_DIR}/prospero.manifest)
   target_link_libraries(prospero_gui PRIVATE imgui)
   target_compile_definitions(prospero_gui PRIVATE PROSPERO_GUIEDGE=1)
   target_compile_options(prospero_gui PRIVATE
     -fno-exceptions -fno-rtti -Wa,-I${PROJECT_SOURCE_DIR}
+    -Wa,-I${CMAKE_BINARY_DIR}
   )
+  # The version, for its version resource: VS_FIXEDFILEINFO's two words,
+  # major.minor and patch.0, and the text as UTF-16 code units
+  math(EXPR prospero_ms
+    "(${PROJECT_VERSION_MAJOR} << 16) | ${PROJECT_VERSION_MINOR}"
+    OUTPUT_FORMAT HEXADECIMAL)
+  math(EXPR prospero_ls "${PROJECT_VERSION_PATCH} << 16"
+    OUTPUT_FORMAT HEXADECIMAL)
+  set(prospero_utf16 "")
+  string(LENGTH "${PROJECT_VERSION}" n)
+  math(EXPR n "${n} - 1")
+  foreach(i RANGE ${n})
+    string(SUBSTRING "${PROJECT_VERSION}" ${i} 1 c)
+    if(c STREQUAL ".")
+      list(APPEND prospero_utf16 46)
+    else()
+      math(EXPR c "48 + ${c}")
+      list(APPEND prospero_utf16 ${c})
+    endif()
+  endforeach()
+  list(JOIN prospero_utf16 ", " prospero_utf16)
+  target_compile_definitions(prospero_gui PRIVATE
+    "PROSPERO_VERSION_FIXED=\"${prospero_ms}, ${prospero_ls}\""
+    "PROSPERO_VERSION_UTF16=\"${prospero_utf16}\"")
   # The desktop helper is a command of this program, "prospero desktop",
   # in a translation unit of its own (src/deskwin32.cpp)
   add_executable(prospero WIN32 src/main_win32.cpp src/deskwin32.cpp)

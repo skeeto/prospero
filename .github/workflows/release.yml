@@ -97,11 +97,6 @@ jobs:
               echo "::error::no project VERSION in CMakeLists.txt"
               exit 1
           fi
-          # The GUI's manifest names the version too, by hand
-          if ! grep -q "name='prospero' version='$v.0'" assets/prospero.manifest; then
-              echo "::error::assets/prospero.manifest's version is not $v.0"
-              exit 1
-          fi
           if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$v" ]; then
               echo "::error::tag $GITHUB_REF_NAME is not v$v (the project VERSION)"
               exit 1
