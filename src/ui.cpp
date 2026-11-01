@@ -335,6 +335,45 @@ static i32 uikeysup()
     return n;
 }
 
+// Ctrl+Shift+V (Cmd on macOS) pastes as Ctrl+V does, as in many
+// programs: every box takes only plain text anyway. ImGui matches
+// chords exactly, so Shift is let go around a press of V in the queued
+// input, before the frame reads it. The V's release follows at once,
+// on the next frame (trickled), and the real one finds V already up.
+static void uishiftpaste()
+{
+    ImGuiContext &c     = *GImGui;
+    ImGuiIO      &io    = c.IO;
+    b32           ctrl  = io.KeyCtrl;
+    b32           shift = io.KeyShift;
+    b32           other = io.KeyAlt || io.KeySuper;
+    ImVector<ImGuiInputEvent> &q = c.InputEventsQueue;
+    for (i32 i = 0; i < q.Size; i++) {
+        ImGuiInputEvent e = q[i];
+        if (e.Type != ImGuiInputEventType_Key) continue;
+        switch ((i32)e.Key.Key) {
+        case ImGuiMod_Ctrl:  ctrl  = e.Key.Down; break;
+        case ImGuiMod_Shift: shift = e.Key.Down; break;
+        case ImGuiMod_Alt:
+        case ImGuiMod_Super: other = e.Key.Down; break;
+        }
+        if (e.Key.Key!=ImGuiKey_V || !e.Key.Down || !ctrl || !shift || other) {
+            continue;
+        }
+        ImGuiInputEvent up = e;
+        up.Key.Key  = ImGuiMod_Shift;
+        up.Key.Down = 0;
+        ImGuiInputEvent release = e;
+        release.Key.Down = 0;
+        ImGuiInputEvent down = up;
+        down.Key.Down = 1;
+        q.insert(q.Data+i, up);
+        q.insert(q.Data+i+2, release);
+        q.insert(q.Data+i+3, down);
+        i += 3;
+    }
+}
+
 // Timers ImGui runs without any event: tooltips, the caret, the
 // settings save. Declares a deadline for each pending one.
 static void uideadlines(Gui *g, Sched *s)

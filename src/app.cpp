@@ -10288,6 +10288,7 @@ static void gui_frame(Gui *g)
         // the mouse is elsewhere: the script's mouse is the one
         io.AddMousePosEvent(g->drivex, g->drivey);
     }
+    uishiftpaste();
     ImGui::NewFrame();
     i64 t1 = os_ticks(g->os);
     dockwindows(g);
@@ -15022,6 +15023,11 @@ static DriveOp launchops[] = {
 #define CTRLG(ms) \
     {OP_KEYDOWN, 0, GKEY_CTRL, KEY_CTRL, 50, ""}, KEY(GKEY_G, KEY_CTRL, 50), \
     {OP_KEYUP, 0, GKEY_CTRL, 0, ms, ""}
+#define SHIFTPASTE \
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""}, \
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""}, \
+    KEY(GKEY_V, KEY_CMD|KEY_SHIFT, 50), \
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""}, {OP_KEYUP, 0, GKEY_CMD, 0, 200, ""}
 
 static DriveOp composeops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
@@ -15107,6 +15113,16 @@ static DriveOp composeops[] = {
     RCLICK(500),
     {OP_CHECK, CHK_CMENU, 2, 2, 0, ""},
     PICK(T_CMREDO),
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
+    // Ctrl+Shift+V pastes too: twice over all of it, then once
+    SELALL,
+    SHIFTPASTE,
+    SHIFTPASTE,
+    {OP_CHECK, CHK_PROMPT, 0, 0, 0,
+     "Say hello again, please. Thanks.\nline two"
+     "Say hello again, please. Thanks.\nline two"},
+    SELALL,
+    SHIFTPASTE,
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Say hello again, please. Thanks.\nline two"},
     // The editor, by Ctrl+G: read-only meanwhile, saying so, then the
     // draft as it saved it, kept at once

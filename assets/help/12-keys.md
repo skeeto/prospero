@@ -45,7 +45,8 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
   one from the list that shows as you type it.
 - **Ctrl+G** opens the draft in your editor (`[ui] editor`); the draft
   becomes what you save, once the editor exits.
-- **Ctrl+V** pastes text, or attaches a copied image.
+- **Ctrl+V** pastes text, or attaches a copied image. **Ctrl+Shift+V**
+  does the same.
 - Right-click for Undo, Redo, Cut, Copy, Paste, Select all and Open in
   editor.
 
