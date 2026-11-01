@@ -4613,6 +4613,25 @@ static void drawstrip(Gui *g)
         print(&b, (i64)(frac*100));
         putbyte(&b, '%');
         ImGui::ProgressBar(frac, v2(160*sc, 0), cstr0(&a, finish(&b)));
+        // The engine's estimate, counted down between its records, and
+        // left out near the end, where it matters little
+        i64 left = v->petaat ? v->petaat - nowms : 0;
+        if (left >= ETA_MIN) {
+            g->etashown = 1;
+            schedat(&g->sched, now + (left%1000)*1000 + 1000, DUE_CLOCK);
+            i64 secs = (left + 999)/1000;
+            Buf e(&a, 48);
+            print(&e, "about ");
+            if (secs < 600) {
+                print(&e, secstext(&a, secs));
+            } else {
+                print(&e, (secs + 30)/60);
+                print(&e, " min");
+            }
+            print(&e, " left");
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", cstr0(&a, finish(&e)));
+        }
     }
     if (req && v->lastdata) {
         // Amber after AMBER_MS without data, red near the watchdog

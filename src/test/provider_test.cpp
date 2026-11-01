@@ -348,6 +348,11 @@ static void test_provider(Test *t)
         expect(t, "progress chunk",
                istr(a, c.prefill*1000000 + c.ptotal*10000 + c.pdone*100 + c.pcached),
                "2004010");
+        expect(t, "progress chunk: no time", istr(a, c.pms), "-1");
+        pp = jsonparse(a, "{\"choices\":[],\"prompt_progress\":"
+                          "{\"total\":100,\"cache\":0,\"processed\":40,\"time_ms\":1234}}");
+        c  = applychunk(q, pp.root, a);
+        expect(t, "progress chunk: the server's time", istr(a, c.pms), "1234");
         JsonDoc bad = jsonparse(a, "[1]");
         expect(t, "bad chunk", istr(a, applychunk(q, bad.root, a).bad), "1");
     }

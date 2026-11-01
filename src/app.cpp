@@ -93,6 +93,7 @@ enum : iz {
 enum : i64 {
     QUIT_GRACE = 6000000,  // µs to wait for the engine to stop
     AMBER_MS   = 15000,    // no data from the model for this long: amber
+    ETA_MIN    = 5000,     // the prompt's ETA is shown down to this
 };
 
 // [ui] font_size's default, in pixels at scale 1, as config.cpp's
@@ -1539,6 +1540,7 @@ struct Gui {
     GuiSession        *drivemain;    // the session it made
     b32                ambershown;   // the strip went amber
     b32                retryshown;   // the strip counted down to a retry
+    b32                etashown;     // and to the prompt's end
     b32                bannershown;  // the read-only banner was drawn
     b32                roclock;      // a read-only view's turn had a clock
     b32                queuedshown;  // the strip showed the line's position
@@ -11006,6 +11008,7 @@ enum : i32 {
     CHK_READONLY,
     CHK_AMBER,
     CHK_RETRYSHOWN,
+    CHK_ETASHOWN,
     CHK_DIAGS,
     CHK_ADDEXISTS,
     CHK_ROQUIET,
@@ -11298,6 +11301,7 @@ static Str chknames[] = {
     "a closed session opened, its log replayed",
     "a session held elsewhere opened read-only, with its banner",
     "amber after 15 s without data", "a retry's countdown shown",
+    "the prompt's time left shown",
     "configuration diagnostics listed with file and line",
     "adding a section that exists changed nothing",
     "a read-only session's turn runs elsewhere, with no clock here",
@@ -11542,6 +11546,7 @@ enum : i32 {
     W_ALLIDLE,    // no session runs a turn
     W_OPENED,     // the session shown is open, its replay applied
     W_AMBER,      // the strip went amber
+    W_ETA,        // the strip showed the prompt's ETA
     W_BACKOFF,    // the session shown backs off to retry
     W_GONE,       // the engine stopped
     W_TASKS,      // the session shown waits for two subagents
@@ -11604,7 +11609,7 @@ enum : i32 {
 static Str waitnames[] = {
     "", "the engine", "the session", "the turn to end", "an ask",
     "a running tool", "the configuration", "the settings edit", "quitting",
-    "every turn to end", "the session to open", "amber", "a retry",
+    "every turn to end", "the session to open", "amber", "an ETA", "a retry",
     "the engine to stop", "two subagents at work", "a subagent's ask",
     "a todo item in progress", "a reply", "the jobs", "a rewind",
     "a compaction", "the endpoint's line", "streaming", "the window to go",
@@ -12194,6 +12199,12 @@ static DriveOp m3ops[] = {
     {OP_PROMPT, 0, 0, 0, 100, "Fail once."},
     {OP_WAIT, W_BACKOFF, 0, 0, 15000, ""},
     {OP_CHECK, CHK_RETRYSHOWN, 0, 0, 0, ""},
+    {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    // A slow prompt's progress, with the time left
+    {OP_PROMPT, 0, 0, 0, 100, "Read a long prompt."},
+    {OP_WAIT, W_ETA, 0, 0, 10000, ""},
+    {OP_CHECK, CHK_ETASHOWN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "1-eta"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     // The mouse wheel, drag-selecting past the edge, and copying code,
     // over what that turn made: from near the top, after scrolling up
@@ -16408,6 +16419,8 @@ static b32 drivewaitdone(Gui *g)
                g->sess->host->kind==GH_REMOTE && g->sess->host->name=="far";
     case W_AMBER:
         return g->ambershown;
+    case W_ETA:
+        return g->etashown;
     case W_BACKOFF:
         return g->sess && v->state==LIVE_BACKOFF;
     case W_GONE:
@@ -17378,6 +17391,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->ambershown;
     case CHK_RETRYSHOWN:
         return g->retryshown;
+    case CHK_ETASHOWN:
+        return g->etashown;
     case CHK_ADDEXISTS:
         return find(g->cfgstatus, "already exists")>=0 && !g->cfgset;
     case CHK_ROQUIET:

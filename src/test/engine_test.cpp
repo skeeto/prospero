@@ -746,8 +746,80 @@ static void testremotetask(Test *t)
            "\"parent\":\"20260101-000000-aaaa\",\"remote\":1}");
 }
 
+// The prompt's ETA (prefilleta), against a server whose cost per token
+// is a line over position, as attention makes it: ms at n tokens is
+// the line's integral, rounded as time_ms is.
+static void testprefill(Test *t)
+{
+    Arena a = t->perm;
+    struct { f64 a, b; } c = {2.0, 0.0001};  // ms per token at x: a + b*x
+    auto at = [&](i64 n) {
+        f64 x = (f64)n;
+        return (i64)(c.a*x + c.b*x*x/2 + 0.5);
+    };
+    auto near = [&](i64 got, i64 want) {  // within 0.5%, time_ms rounded
+        return got*200>=want*199 && got*200<=want*201 ? Str("ok") : istr(&a, got);
+    };
+    i64 total = 20480, batch = 2048;
+
+    // Nothing to go on until two batches, then the line
+    Prefill     p    = {};
+    PrefillLine last = {};
+    expect(t, "prefill: at 0%, no ETA",
+           istr(&a, prefilleta(&p, &last, 7, 0, total, at(0))), "-1");
+    expect(t, "prefill: one batch, no ETA",
+           istr(&a, prefilleta(&p, &last, 7, batch, total, at(batch))), "-1");
+    for (i64 n = 2*batch; n < total; n += batch) {
+        i64 eta = prefilleta(&p, &last, 7, n, total, at(n));
+        expect(t, concat(&a, "prefill: the line at ", istr(&a, n)),
+               near(eta, at(total) - at(n)), "ok");
+    }
+    expect(t, "prefill: done", istr(&a, prefilleta(&p, &last, 7, total, total, at(total))), "0");
+    expect(t, "prefill: the line kept", istr(&a, last.key==7 && last.b>0), "1");
+
+    // The next request, for the same model, from its 0% on, its cache
+    // counted in its position; another model's has nothing to go on
+    Prefill q = {};
+    i64 cached = 6000;
+    expect(t, "prefill: the last line at 0%",
+           near(prefilleta(&q, &last, 7, cached, total, 0), at(total) - at(cached)), "ok");
+    // Slower now (another request shares the server): the one batch
+    // moves the line, its slope kept
+    i64 eta = prefilleta(&q, &last, 7, cached+batch, total, 2*(at(cached+batch) - at(cached)));
+    i64 want = 2*(at(total) - at(cached)) - 2*(at(cached+batch) - at(cached));
+    expect(t, "prefill: the last line, moved", istr(&a, eta>want/2 && eta<want), "1");
+    Prefill o = {};
+    expect(t, "prefill: another model's line unused",
+           istr(&a, prefilleta(&o, &last, 9, 0, total, 0)), "-1");
+
+    // Cheaper further in, as only noise makes it: flat at the mean
+    Prefill     d     = {};
+    PrefillLine dl    = {};
+    i64         ms[]  = {0, 3000, 5000, 6000};
+    for (i32 i = 0; i < 3; i++) {
+        prefilleta(&d, &dl, 3, i*1000, 10000, ms[i]);
+    }
+    i64 flat = prefilleta(&d, &dl, 3, 3000, 10000, ms[3]);
+    expect(t, "prefill: no slope below zero", istr(&a, dl.b==0 && flat>0 && flat<7*3000), "1");
+
+    // A repeated or out-of-order event changes nothing
+    Prefill r = {};
+    PrefillLine rl = {};
+    prefilleta(&r, &rl, 5, 0, 1000, 0);
+    prefilleta(&r, &rl, 5, 100, 1000, 100);
+    prefilleta(&r, &rl, 5, 200, 1000, 200);
+    expect(t, "prefill: a repeat", istr(&a, prefilleta(&r, &rl, 5, 200, 1000, 200)), "800");
+    expect(t, "prefill: time going back", istr(&a, prefilleta(&r, &rl, 5, 300, 1000, 150)), "700");
+    // then from where it was: 200 tokens in 300 ms, 1.5 ms each at 300,
+    // against 1 ms at 50 and at 150 (weighing 56.25 and 75 of 200 by
+    // now), a line integrated from 400 to 1000, worked out by hand
+    expect(t, "prefill: then from where it was",
+           istr(&a, prefilleta(&r, &rl, 5, 400, 1000, 500)), "1449");
+}
+
 static void test_engine(Test *t)
 {
+    testprefill(t);
     testremotetask(t);
     testtilde(t);
     testroles(t);

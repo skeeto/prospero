@@ -541,6 +541,7 @@ struct View {
     i64             watchms;    // and waits this long in all
     i64             pdone;      // prompt processing, tokens of total
     i64             ptotal;
+    i64             petaat;     //   and when it ends, as estimated, 0 if not
     i64             ctx;        // the context gauge: the model's window,
     i64             compactat;  //   where compaction begins,
     i64             tokens;     //   the tokens it holds now,
@@ -2723,11 +2724,14 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                via || until!=v->relayuntil;
     }
 
-    case EV_PROGRESS:
+    case EV_PROGRESS: {
+        Json *eta   = jsonget(j, "eta_ms");
         v->lastdata = r->ts;
         v->pdone    = jsonint(jsonget(j, "done"), 0);
         v->ptotal   = jsonint(jsonget(j, "total"), 0);
+        v->petaat   = eta->type==JSON_NUMBER ? r->ts + jsonint(eta, 0) : 0;
         return 1;
+    }
 
     case EV_OVERFLOW:
         v->overflow = 1;

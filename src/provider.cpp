@@ -801,6 +801,7 @@ struct Chunk {
     i64          ptotal;
     i64          pdone;
     i64          pcached;
+    i64          pms;       // the server's time for the request, -1 if none
     Str          error;     // a mid-stream error, null if none
     i32          errcode;   // its code, if numeric
     b32          bad;       // not a chunk at all
@@ -871,6 +872,7 @@ static Chunk applychunk(Partial *p, Json *j, Arena *scratch)
         r.ptotal  = jsonint(jsonget(pp, "total"), 0);
         r.pdone   = jsonint(jsonget(pp, "processed"), 0);
         r.pcached = jsonint(jsonget(pp, "cache"), 0);
+        r.pms     = jsonint(jsonget(pp, "time_ms"), -1);
     }
 
     Json *u = jsonget(j, "usage");

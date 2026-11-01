@@ -2680,7 +2680,7 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Describe the images", "Ask on the side", "Run a long command",
                "Stream, then pause", "Call the MCP server", "Remember the hosts",
                "Answer with links", "Ask me questions", "Describe the files",
-               "Run a command to stop")
+               "Run a command to stop", "Read a long prompt")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
 
@@ -3101,6 +3101,23 @@ def sc_gui(model, n, req):
                                                 "content": "themes\n"})
         else:
             yield from answer(model, "Left outside alone.")
+    elif "Read a long prompt" in prompt:
+        # Slow prompt processing, as on Apple Silicon: progress after
+        # each batch, with the server's time_ms, each batch costing more
+        # than the last, 11.4 s in all, so the GUI shows an ETA
+        yield S.head()
+        total, batch, t = 40960, 4096, 0.0
+        yield S.data({"choices": [], "prompt_progress": {
+            "total": total, "cache": 0, "processed": 0, "time_ms": 0}})
+        for i in range(total // batch):
+            dt = 0.6 * (1 + 0.2*i)
+            yield S.sleep(dt)
+            t += dt
+            yield S.data({"choices": [], "prompt_progress": {
+                "total": total, "cache": 0, "processed": (i + 1)*batch,
+                "time_ms": int(t*1000)}})
+        yield from text(model, "Read it all.", 3)
+        yield from finish(model)
     elif "Stall for" in prompt:
         # Nothing at all for 17 s: past the GUI's amber, short of the
         # first-byte watchdog its configuration sets

@@ -574,6 +574,23 @@ struct WtSess {
     Str path;
 };
 
+// Prompt processing, for its ETA (prefilleta): each batch between two
+// progress events is a sample of milliseconds per token at its middle.
+struct Prefill {
+    i64 n;          // the last event's tokens processed, cached ones too
+    i64 ms;         // and when, on the server's clock if it said, else ours
+    b32 started;
+    b32 server;     // ms is the server's time_ms
+    i32 samples;
+    f64 sw, sx, sy, sxx, sxy;  // the samples' sums, weighted by tokens
+};
+
+// A line of milliseconds per token at a position: a + b*x
+struct PrefillLine {
+    f64 a, b;
+    u64 key;  // the endpoint and model it was fitted for, 0 if none
+};
+
 struct Session {
     Session     *next;
     Engine      *e;
@@ -623,6 +640,8 @@ struct Session {
     i64          lastout;
     i64          hiddenat;   // the first ping of reasoning unseen, or 0
     i64          tokens;     // chunks with output: about one token each
+    Prefill      pf;         // the prompt's processing
+    PrefillLine  pline;      // as last fitted, for a request's start
     // The turn
     i64          turn;
     i64          steps;
@@ -2052,6 +2071,7 @@ static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
     s->firstout = 0;
     s->lastout  = 0;
     s->tokens   = 0;
+    s->pf       = {};
     s->http     = ehttp(e, ep, &r, s, keep, scratch);
     if (!s->http) {
         s->httpid = 0;
@@ -2876,14 +2896,101 @@ static void emitdelta(Session *s, Arena scratch, Delta *d)
     ssend(s, &w);
 }
 
+// The line through the samples (least squares, weighted by tokens), or
+// 0 with fewer than two. A token never costs less further in, so a
+// slope below zero, which only noise makes, is flat at their mean.
+static b32 prefillfit(Prefill *p, PrefillLine *l)
+{
+    f64 det = p->sw*p->sxx - p->sx*p->sx;
+    if (p->samples<2 || det<=0) {
+        return 0;
+    }
+    l->b = (p->sw*p->sxy - p->sx*p->sy) / det;
+    if (l->b < 0) {
+        l->b = 0;
+    }
+    l->a = (p->sy - l->b*p->sx) / p->sw;
+    return 1;
+}
+
+// A progress event: n of total tokens processed at ms. Returns the
+// milliseconds left, or -1 while unknown. Processing a token costs more
+// the further into the context it is, as attention covers all before
+// it, so the cost of those left integrates a line of ms per token over
+// position, through the batches so far, the older weighing less, which
+// follows a server's load as it changes. Before two batches, the line
+// is the last request's for the same endpoint and model (key), through
+// the one batch if any. With none, there is no estimate: one batch's
+// rate, gone on flat, would be too low, and grow as the rest went.
+static i64 prefilleta(Prefill *p, PrefillLine *last, u64 key, i64 n, i64 total, i64 ms)
+{
+    // A batch is a sample once its tokens and its time are both past
+    // the last event's, which stays the start of the next otherwise
+    b32 batch = p->started && n>p->n && ms>p->ms;
+    if (batch) {
+        f64 w = (f64)(n - p->n);
+        f64 x = (f64)p->n + w/2;
+        f64 y = (f64)(ms - p->ms) / w;
+        f64 k = 0.75;  // the decay of the older batches
+        p->sw  = k*p->sw  + w;
+        p->sx  = k*p->sx  + w*x;
+        p->sy  = k*p->sy  + w*y;
+        p->sxx = k*p->sxx + w*x*x;
+        p->sxy = k*p->sxy + w*x*y;
+        p->samples++;
+    }
+    if (!p->started || batch) {
+        p->n  = n;
+        p->ms = ms;
+    }
+    p->started = 1;
+
+    PrefillLine l = {};
+    if (prefillfit(p, &l)) {
+        l.key = key;
+        *last = l;
+    } else if (last->key==key && key) {
+        l = *last;
+        if (p->samples) {
+            f64 x = p->sx / p->sw, y = p->sy / p->sw;
+            l.a = y - l.b*x;
+        }
+    } else {
+        return -1;
+    }
+    if (n >= total) {
+        return 0;
+    }
+    f64 lo = (f64)n, hi = (f64)total;
+    f64 left = l.a*(hi - lo) + l.b*(hi*hi - lo*lo)/2;
+    return left>0 ? (i64)(left + 0.5) : -1;
+}
+
 static void emitprogress(Session *s, Arena scratch, Chunk *c)
 {
+    // The server's clock if it gives one (llama.cpp's time_ms), which
+    // the network's delays leave out, else this one
+    Prefill *p = &s->pf;
+    if (!p->started) {
+        p->server = c->pms >= 0;
+    }
+    i64 eta = -1;
+    if (!p->server || c->pms>=0) {
+        i64 ms    = p->server ? c->pms : os_ticks(s->e->os)/MS;
+        Str model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
+        u64 key   = hash(reqep(s)->url)*3 ^ hash(model);
+        eta = prefilleta(p, &s->pline, key|1, c->pdone, c->ptotal, ms);
+    }
+
     Buf   b(&scratch, 256);
     EvOut w = sbegin(s, &b, EV_PROGRESS);
     putintkey(&w.json, "turn", s->turn);
     putintkey(&w.json, "done", c->pdone);
     putintkey(&w.json, "total", c->ptotal);
     putintkey(&w.json, "cached", c->pcached);
+    if (eta >= 0) {
+        putintkey(&w.json, "eta_ms", eta);  // left, as of this record
+    }
     ssend(s, &w);
 }
 
