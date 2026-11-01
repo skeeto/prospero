@@ -1210,7 +1210,7 @@ static void test_viewpanels(Test *t)
         for (iz i = 0; i < v->msgs.len; i++) {
             ViewMsg *m      = &v->msgs[i];
             b32      before = 0;
-            i64      at     = viewforkat(m, &before);
+            i64      at     = viewforkat(v, m, &before);
             if (m->role==VIEW_USER || m->role==VIEW_ASSISTANT || m->role==VIEW_NOTE) {
                 print(&b, m->role==VIEW_NOTE ? Str("note") : m->text);
                 putbyte(&b, before ? '<' : '>');
@@ -1471,6 +1471,85 @@ static Str thinkshow(Arena *a, View *v)
 
 // Words counted delta by delta, as reasoning streams, against the count
 // of the whole text at once, as a loaded session has it.
+// A rewind of the conversation (cut) hides what it took out behind a
+// card with an Undo, the todo list back as it was; an undo (uncut)
+// shows it all again; the Undo goes as a turn begins; a fork before a
+// prompt after a cut passes over the turns cut; and the export leaves
+// them out.
+static void test_viewcuts(Test *t)
+{
+    Arena a = t->perm;
+    View *v = testview(&a);
+    Str log[] = {
+        R"({"sid":"s","seq":1,"ts":0,"ev":"session","cwd":"/w","model":"m"})",
+        R"({"sid":"s","seq":2,"ts":0,"ev":"user","text":"one","via":"prompt"})",
+        R"({"sid":"s","seq":3,"ts":0,"ev":"turn","n":1})",
+        R"({"sid":"s","seq":4,"ts":0,"ev":"todo","items":[{"content":"x","status":"pending"}]})",
+        R"({"sid":"s","seq":5,"ts":0,"ev":"assistant","turn":1,"attempt":1,)"
+            R"("blocks":[{"t":"text","text":"A1"}]})",
+        R"({"sid":"s","seq":6,"ts":0,"ev":"turn.end","turn":1,"why":"done"})",
+        R"({"sid":"s","seq":7,"ts":0,"ev":"user","text":"two\nmore","via":"prompt"})",
+        R"({"sid":"s","seq":8,"ts":0,"ev":"turn","n":2})",
+        R"({"sid":"s","seq":9,"ts":0,"ev":"todo","items":[{"content":"y","status":"done"}]})",
+        R"({"sid":"s","seq":10,"ts":0,"ev":"snap","call":"c","path":"/w/f","snap":"snap/1",)"
+            R"("existed":0})",
+        R"({"sid":"s","seq":11,"ts":0,"ev":"assistant","turn":2,"attempt":1,)"
+            R"("blocks":[{"t":"text","text":"A2"}]})",
+        R"({"sid":"s","seq":12,"ts":0,"ev":"turn.end","turn":2,"why":"done"})",
+        R"({"sid":"s","seq":13,"ts":0,"ev":"cut","turn":2,"last":2,"from":7,"files":1})",
+        R"({"sid":"s","seq":14,"ts":0,"ev":"snap","call":"","path":"/w/f","snap":"snap/2",)"
+            R"("existed":1,"cut":13})",
+        R"({"sid":"s","seq":15,"ts":0,"ev":"rewind","to":2,"cut":13,"undone":["snap/1"],)"
+            R"("files":[{"path":"/w/f","result":"removed"}]})",
+    };
+    for (iz i = 0; i < countof(log); i++) {
+        apply(v, a, log[i]);
+    }
+    auto shown = [&]() {
+        Buf b(&a, 256);
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewMsg *m = &v->msgs[i];
+            if (msghidden(v, m)) continue;
+            print(&b, b.len ? Str(" ") : Str(""));
+            print(&b, m->role==VIEW_REWIND ? concat(&a, "[", m->card->kind) : cut(m->text, '\n').head);
+            print(&b, m->role==VIEW_REWIND ? Str("]") : Str(""));
+        }
+        print(&b, " todo=");
+        print(&b, v->todos.len ? v->todos[0].content : Str("-"));
+        print(&b, " snaps=");
+        print(&b, (i64)v->snaps.len);
+        print(&b, v->snaps.len && v->snaps[0].undone ? Str("u") : Str(""));
+        return finish(&b);
+    };
+    ViewMsg *card = &v->msgs[v->msgs.len-1];
+    expect(t, "cut shown", shown(), "one A1 [cut] todo=x snaps=1u");
+    expect(t, "cut card", concat(&a, istr(&a, card->card->count),
+           concat(&a, istr(&a, card->card->conflicts), istr(&a, cutundoable(v, card->card)))),
+           "101");
+    expect(t, "cut text", istr(&a, find(card->text, "`two`")>=0 && find(card->text, "removed")>=0), "1");
+    Buf ex(&a, 4096);
+    viewexport(&ex, v, "s", 0, 0, 0);
+    expect(t, "cut export", istr(&a, find(finish(&ex), "A2")<0 && find(finish(&ex), "A1")>=0), "1");
+
+    // Undone: all of it back, the card gone, the snapshot counted again
+    apply(v, a, R"({"sid":"s","seq":16,"ts":0,"ev":"uncut","cut":13,"files":[{"path":"/w/f",)"
+                R"("result":"restored"}],"undone":["snap/2"],"redone":["snap/1"]})");
+    expect(t, "uncut shown", shown(), "one A1 two A2 todo=y snaps=1");
+
+    // Cut again, then a turn: the Undo goes, and a fork before the new
+    // prompt cuts after turn 1
+    apply(v, a, R"({"sid":"s","seq":17,"ts":0,"ev":"cut","turn":2,"last":2,"from":7})");
+    card = &v->msgs[v->msgs.len-1];
+    expect(t, "recut undoable", istr(&a, cutundoable(v, card->card)), "1");
+    apply(v, a, R"({"sid":"s","seq":18,"ts":0,"ev":"user","text":"three","via":"prompt"})");
+    apply(v, a, R"({"sid":"s","seq":19,"ts":0,"ev":"turn","n":3})");
+    expect(t, "recut after a turn", istr(&a, cutundoable(v, card->card)), "0");
+    expect(t, "recut shown", shown(), "one A1 [cut] three todo=x snaps=1");
+    b32 before = 0;
+    i64 at     = viewforkat(v, &v->msgs[v->msgs.len-1], &before);
+    expect(t, "recut fork", istr(&a, at), "1");
+}
+
 static void test_viewwords(Test *t)
 {
     Arena perm = t->perm;

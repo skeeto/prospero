@@ -322,9 +322,10 @@ struct ViewTool {
     f32  formh;     // their form's height, measured (ui.cpp), else 0
 };
 
-// A compaction (kind "summary" or "prune") or a rewind, as a card.
+// A compaction (kind "summary" or "prune") or a rewind, as a card, of
+// files (kind "rewind") or of the conversation (kind "cut").
 struct ViewCard {
-    Str  kind;       // summary, prune, rewind
+    Str  kind;       // summary, prune, rewind, cut
     Str  why;        // threshold or overflow
     i64  before;     // tokens, estimated
     i64  after;
@@ -336,7 +337,20 @@ struct ViewCard {
     i32  turn;       // the start of this turn
     b32  force;
     b32  latest;     // the latest rewind, which may be forced
+    i64  cut;        // a cut's record, whose undo (uncut) names it
+    i32  lo;         // and the messages it hides, lo up to the card
 };
+
+// A cut in force: the conversation rewound to before a turn, turns turn
+// through last gone from it, the records from seq from up to the cut's
+// own (seq) hidden (see "Conversation cuts" in events.cpp).
+struct ViewCut {
+    i64 from;
+    i64 seq;
+    i32 turn;
+    i32 last;
+};
+
 
 // A background job (shell with background, or moved there at its timeout).
 struct ViewJob {
@@ -367,6 +381,13 @@ struct ViewJob {
 struct ViewTodo {
     Str content;
     i32 status;     // VTODO_*
+};
+
+// A todo list as a record had it, kept so that the latest a cut leaves
+// shows again.
+struct ViewTodos {
+    i64             seq;
+    Slice<ViewTodo> items;
 };
 
 // A message sent to the turn at work, waiting to be taken in (queue).
@@ -424,6 +445,7 @@ struct ViewMsg {
     b32       collapsed;  // only the header shows
     b32       chosen;     // the user opened or closed it: settings keep off
     b32       fold;       // its header shows and hides the rest
+    i32       cuts;       // cuts in force that hide it: rewound away
     b32       md;         // markdown, not plain text
     i32       startsturn; // the turn this message began, 0 if none
     i64       chars;      // reasoning: code points in its text
@@ -583,7 +605,11 @@ struct View {
     i32             fallback;   // switched to this fallback (1-based)
 
     // Beside the transcript
-    Slice<ViewTodo>  todos;     // the latest list
+    Slice<ViewTodo>  todos;     // the latest list, of those not cut
+    Slice<ViewTodos> todolog;   // every list, in order
+    Slice<ViewCut>   cuts;      // in force, oldest first
+    i64              turnseq;   // the latest turn record
+    i64              compactseq; // the latest compaction's record
     Slice<ViewQueued> queue;    // the latest queue record's
     Slice<ViewJob>   jobs;      // by number
     i32              jobsrun;   // running
@@ -704,7 +730,8 @@ static b32 thinkfolded(View *v)
 // Whether a message takes no space and draws nothing.
 static b32 msghidden(View *v, ViewMsg *m)
 {
-    return m->role==VIEW_THINK && v->thinking==THINK_HIDE && !v->showthink;
+    return m->cuts>0 ||
+           (m->role==VIEW_THINK && v->thinking==THINK_HIDE && !v->showthink);
 }
 
 // Whether a tool row folds by its kind and outcome (tools = auto): reads,
@@ -1654,6 +1681,71 @@ static void codespan(Buf *b, Str s)
     for (iz i = 0; i < ticks; i++) putbyte(b, '`');
 }
 
+// The card of a cut (its record's seq) in force, or -1.
+static i32 cutcard(View *v, i64 seq)
+{
+    for (i32 k = (i32)v->msgs.len-1; k >= 0; k--) {
+        ViewMsg *m = &v->msgs[k];
+        if (m->role==VIEW_REWIND && m->card->kind=="cut" && m->card->cut==seq) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+// Whether a record, by seq, is hidden by a cut in force.
+static b32 viewincut(View *v, i64 seq)
+{
+    for (iz k = 0; k < v->cuts.len; k++) {
+        if (seq>=v->cuts[k].from && seq<v->cuts[k].seq) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The todo list to show: the latest no cut hides.
+static void todoshow(View *v)
+{
+    v->todos = {};
+    for (iz k = v->todolog.len-1; k >= 0; k--) {
+        if (!viewincut(v, v->todolog[k].seq)) {
+            v->todos = v->todolog[k].items;
+            break;
+        }
+    }
+}
+
+// Whether a card is of the cut that its undo (uncut) may take back now:
+// the latest in force, with no turn begun after it.
+static b32 cutundoable(View *v, ViewCard *c)
+{
+    ViewCut *last = v->cuts.len ? &v->cuts[v->cuts.len-1] : 0;
+    return c->kind=="cut" && last && last->seq==c->cut && c->cut>v->turnseq;
+}
+
+// A rewind's files, one line each, as a card lists them, counted on c.
+static void rewoundlines(Buf *b, View *v, Json *files, ViewCard *c)
+{
+    for (Json *f = files->child; f; f = f->next) {
+        Str res = jsonstr(jsonget(f, "result"));
+        print(b, "- ");
+        codespan(b, showpath(v, jsonstr(jsonget(f, "path"))));
+        print(b, res=="restored"  ? Str(": put back as it was") :
+                 res=="removed"   ? Str(": removed, as it did not exist then") :
+                 res=="unchanged" ? Str(": already as it was") :
+                 res=="conflict"  ? Str(": **conflict**, left as it is: something "
+                                        "else changed it after the harness did") :
+                 res=="partial"   ? Str(": put back **in part**, to before the later "
+                                        "changes: something else changed it in "
+                                        "between, so the earlier ones stay") :
+                 Str(": **failed**, could not be put back"));
+        putbyte(b, '\n');
+        c->conflicts += res=="conflict" || res=="partial";
+        c->count++;
+    }
+}
+
 // The snapshots a rewind would put back, newest first, one per file:
 // those after a call's start (to a call), or from a turn on (else),
 // that no rewind undid yet. Each path's oldest snapshot in range says
@@ -1692,13 +1784,24 @@ static Slice<ViewSnap> rewindset(View *v, Arena *a, Str call, i32 turn)
 // none: the turn before the one a prompt began (before), else the
 // message's own. Both are the engine's numbers, from its turn records'
 // n, so that turns it began by itself (via job or compact) count too.
-static i64 viewforkat(ViewMsg *m, b32 *before)
+// Turns a cut took out of the conversation are passed over.
+static i64 viewforkat(View *v, ViewMsg *m, b32 *before)
 {
     *before = m->role==VIEW_USER && m->startsturn>0;
-    if (*before) {
-        return m->startsturn - 1;
+    if (!*before) {
+        return m->turn>0 ? m->turn : -1;
     }
-    return m->turn>0 ? m->turn : -1;
+    i64 turn = m->startsturn - 1;
+    for (b32 moved = 1; moved;) {
+        moved = 0;
+        for (iz k = 0; k < v->cuts.len; k++) {
+            if (turn>=v->cuts[k].turn && turn<=v->cuts[k].last) {
+                turn  = v->cuts[k].turn - 1;
+                moved = 1;
+            }
+        }
+    }
+    return turn;
 }
 
 // Whether a rewind from a turn on would change any file.
@@ -2062,6 +2165,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
     } return 1;
 
     case EV_TURN: {
+        v->turnseq   = r->seq;
+        v->topsdirty |= v->cuts.len > 0;  // a cut's Undo goes
         v->turn    = (i32)jsonint(jsonget(j, "n"), v->turn+1);
         v->attempt = 0;
         v->busy    = 1;
@@ -2507,6 +2612,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         // A card: the summary, or which outputs the agent no longer sees
         Str       kind = jsonstr(jsonget(j, "kind"));
         ViewCard *c    = alloc<ViewCard>(&v->aux);
+        v->compactseq = r->seq;
         c->kind   = kind=="summary" ? Str("summary") : Str("prune");
         Str why   = jsonstr(jsonget(j, "why"));
         c->why    = why=="overflow" ? Str("overflow") :
@@ -2572,8 +2678,12 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             t[k].status  = st=="done"        ? VTODO_DONE   :
                            st=="in_progress" ? VTODO_ACTIVE : VTODO_PENDING;
         }
-        v->todos.data = t;
-        v->todos.len  = v->todos.cap = k;
+        ViewTodos l = {};
+        l.seq        = r->seq;
+        l.items.data = t;
+        l.items.len  = l.items.cap = k;
+        v->todolog   = push(&v->aux, v->todolog, l);
+        v->todos     = l.items;
     } return 1;
 
     case EV_JOBSTART: {
@@ -2641,6 +2751,9 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
     } return 1;
 
     case EV_SNAP: {
+        if (jsonint(jsonget(j, "cut"), 0)) {
+            return 1;  // a cut's copy of a file, for its undo alone
+        }
         ViewSnap sn = {};
         sn.call    = clone(&v->aux, jsonstr(jsonget(j, "call")));
         sn.path    = clone(&v->aux, jsonstr(jsonget(j, "path")));
@@ -2670,6 +2783,19 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                 v->topsdirty = 1;  // no more buttons on it
             }
         }
+        i64 cut = jsonint(jsonget(j, "cut"), 0);
+        i32 at  = cut ? cutcard(v, cut) : -1;
+        if (at >= 0) {
+            ViewMsg *m = &v->msgs[at];
+            Buf      b(&scratch, m->text.len + 1024);
+            print(&b, m->text);
+            print(&b, "\n\nFiles:\n\n");
+            ViewCard f = {};
+            rewoundlines(&b, v, jsonget(j, "files"), &f);
+            m->card->conflicts += f.conflicts;
+            settext(v, m, finish(&b), 1);
+            return 1;
+        }
         ViewCard *c  = alloc<ViewCard>(&v->aux);
         Json     *to = jsonget(j, "to");
         c->kind  = "rewind";
@@ -2680,23 +2806,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             c->turn = (i32)jsonint(to, 0);
         }
         Buf b(&scratch, 1024);
-        for (Json *f = jsonget(j, "files")->child; f; f = f->next) {
-            Str res = jsonstr(jsonget(f, "result"));
-            print(&b, "- ");
-            codespan(&b, showpath(v, jsonstr(jsonget(f, "path"))));
-            print(&b, res=="restored"  ? Str(": put back as it was") :
-                      res=="removed"   ? Str(": removed, as it did not exist then") :
-                      res=="unchanged" ? Str(": already as it was") :
-                      res=="conflict"  ? Str(": **conflict**, left as it is: something "
-                                             "else changed it after the harness did") :
-                      res=="partial"   ? Str(": put back **in part**, to before the later "
-                                             "changes: something else changed it in "
-                                             "between, so the earlier ones stay") :
-                      Str(": **failed**, could not be put back"));
-            putbyte(&b, '\n');
-            c->conflicts += res=="conflict" || res=="partial";
-            c->count++;
-        }
+        rewoundlines(&b, v, jsonget(j, "files"), c);
         Str note = trim(jsonstr(jsonget(j, "note")));
         if (note.len) {
             print(&b, "\n*");  // a footnote
@@ -2708,6 +2818,116 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->msgs[i].seq  = r->seq;
         v->msgs[i].md   = 1;
         v->msgs[i].card = c;
+    } return 1;
+
+    case EV_CUT: {
+        // Every message from the turn's first record on hidden, behind
+        // a card that says so, while the cut is in force
+        ViewCut cu = {};
+        cu.from = jsonint(jsonget(j, "from"), 0);
+        cu.seq  = r->seq;
+        cu.turn = (i32)jsonint(jsonget(j, "turn"), 0);
+        cu.last = (i32)jsonint(jsonget(j, "last"), cu.turn);
+        if (cu.from<=0 || cu.from>=cu.seq) {
+            return 1;
+        }
+        v->cuts = push(&v->aux, v->cuts, cu);
+        i32 lo  = (i32)v->msgs.len;
+        for (i32 k = 0; k < v->msgs.len; k++) {
+            if (v->msgs[k].seq >= cu.from) {
+                lo = k;
+                break;
+            }
+        }
+        Str prompt = {};
+        for (i32 k = lo; k < v->msgs.len; k++) {
+            ViewMsg *m = &v->msgs[k];
+            prompt = !prompt.len && m->role==VIEW_USER && !m->cuts ? m->text : prompt;
+            m->cuts++;
+            m->ver++;  // laid out anew, as hidden
+            v->topsdirty = 1;
+        }
+        Buf b(&scratch, 512);
+        print(&b, "The conversation went back to before ");
+        prompt = cut(trim(prompt), '\n').head;
+        if (prompt.len) {
+            print(&b, "the prompt ");
+            iz end = prompt.len;
+            if (end > 80) {
+                for (end = 80; end>0 && (prompt[end]&0xc0)==0x80; end--) {}
+            }
+            codespan(&b, Str{prompt.data, end});
+            print(&b, end<prompt.len ? Str("\xe2\x80\xa6") : Str(""));
+        } else {
+            print(&b, "turn ");
+            print(&b, (i64)cu.turn);
+        }
+        print(&b, ", which went back to the prompt box. ");
+        i32 n = cu.last - cu.turn + 1;
+        print(&b, (i64)n);
+        print(&b, n==1 ? Str(" turn was taken out of it, though the session's log keeps it.")
+                       : Str(" turns were taken out of it, though the session's log keeps them."));
+        ViewCard *c = alloc<ViewCard>(&v->aux);
+        c->kind  = "cut";
+        c->turn  = cu.turn;
+        c->count = n;
+        c->cut   = r->seq;
+        c->lo    = lo;
+        i32 i = addmsg(v, VIEW_REWIND, finish(&b));
+        v->msgs[i].seq   = r->seq;
+        v->msgs[i].md    = 1;
+        v->msgs[i].card  = c;
+        v->msgs[i].label = "Rewound";
+        todoshow(v);
+        clampsel(v);
+    } return 1;
+
+    case EV_UNCUT: {
+        // What the cut hid shows again, and its card goes; the files'
+        // snapshots count as they did before it
+        i64 seq = jsonint(jsonget(j, "cut"), 0);
+        for (iz k = 0; k < v->cuts.len; k++) {
+            if (v->cuts[k].seq == seq) {
+                for (iz m = k+1; m < v->cuts.len; m++) {
+                    v->cuts[m-1] = v->cuts[m];
+                }
+                v->cuts.len--;
+                break;
+            }
+        }
+        i32 at = cutcard(v, seq);
+        if (at < 0) {
+            return 1;
+        }
+        for (i32 k = v->msgs[at].card->lo; k < at; k++) {
+            v->msgs[k].cuts -= v->msgs[k].cuts > 0;
+            v->msgs[k].ver++;
+        }
+        v->msgs[at].cuts++;
+        v->msgs[at].ver++;
+        v->topsdirty = 1;
+        for (Json *u = jsonget(j, "redone")->child; u; u = u->next) {
+            Str name = jsonstr(u);
+            for (iz k = 0; k < v->snaps.len; k++) {
+                v->snaps[k].undone &= !(v->snaps[k].name == name);
+            }
+        }
+        Buf b(&scratch, 1024);
+        ViewCard c = {};
+        rewoundlines(&b, v, jsonget(j, "files"), &c);
+        if (c.conflicts) {
+            Buf t(&scratch, 1024 + b.len);
+            print(&t, "Undid the rewind of the conversation, but some files the "
+                      "rewind put back were changed since, so they were left "
+                      "as they are:\n\n");
+            print(&t, finish(&b));
+            i32 i = addmsg(v, VIEW_NOTE, finish(&t));
+            v->msgs[i].seq   = r->seq;
+            v->msgs[i].md    = 1;
+            v->msgs[i].label = "Rewind undone";
+        }
+        todoshow(v);
+        clampsel(v);
     } return 1;
 
     case EV_INSTRUCTIONS: {
@@ -3021,7 +3241,8 @@ static ThumbAt userthumbat(View *v, ViewMsg *m, iz k)
 }
 
 // Below a message's content: an open ask's buttons, or the latest
-// rewind's, when it left files alone, or a screenshot's thumbnail, or
+// rewind's, when it left files alone, or a rewound conversation's Undo,
+// or a screenshot's thumbnail, or
 // the user's attached images'.
 static f32 msgfoot(View *v, ViewMsg *m)
 {
@@ -3029,7 +3250,8 @@ static f32 msgfoot(View *v, ViewMsg *m)
         return userthumbat(v, m, m->images.len).y + v->thumbpad;
     }
     b32 ask   = m->role==VIEW_ASK && m->tool->answer==VASK_PENDING;
-    b32 force = m->role==VIEW_REWIND && m->card->latest && m->card->conflicts;
+    b32 force = m->role==VIEW_REWIND && ((m->card->latest && m->card->conflicts) ||
+                                         cutundoable(v, m->card));
     if (ask && m->tool->qs.len) {
         // The questions' form, shown read-only too: as measured, else a
         // row for each question, option and field until it is
@@ -3790,8 +4012,8 @@ static void viewexport(Buf *b, View *v, Str sid, b32 think, b32 tools, b32 outpu
     for (iz i = 0; i < v->msgs.len; i++) {
         ViewMsg *m    = &v->msgs[i];
         b32      more = 0;
-        if (m->prov) {
-            continue;
+        if (m->prov || m->cuts) {
+            continue;  // streaming, or rewound out of the conversation
         }
         switch (m->role) {
         case VIEW_USER:

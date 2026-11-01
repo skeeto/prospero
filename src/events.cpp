@@ -51,6 +51,8 @@ enum : i32 {
     EV_MEMORY,      // the project's memory, as the agent knows it
     EV_SHELL,       // the agent's shell from here on, by the user
     EV_ASKDEADLINE, // a waiting ask's deadline, changed
+    EV_CUT,         // the conversation ends before a turn (rewound)
+    EV_UNCUT,       // that cut undone
     // Transient: sent, never logged
     EV_DELTA,
     EV_PROGRESS,
@@ -112,6 +114,8 @@ static EvInfo evinfo[] = {
     {"memory",     1, 0},
     {"shell",      1, 0},
     {"ask.deadline", 1, 0},
+    {"cut",        1, 1},
+    {"uncut",      1, 1},
     {"delta",      0, 0},
     {"progress",   0, 0},
     {"tool.out",   0, 0},
@@ -187,6 +191,8 @@ enum : i32 {
     CMD_ASKTOUCH,    // the user works on a waiting ask's answer
     CMD_SHELLENV,    // a session's shell's environment, to open it by hand
     CMD_CALLSTOP,    // the running command stopped, while the turn goes on
+    CMD_CUT,         // the conversation rewound to before a turn
+    CMD_UNCUT,       // the latest such rewind undone
     CMD_COUNT,
 };
 
@@ -199,7 +205,8 @@ static Str cmdnames[] = {
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
-    "relay.call", "offer", "ask.touch", "shell.env", "call.stop",
+    "relay.call", "offer", "ask.touch", "shell.env", "call.stop", "cut",
+    "uncut",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -297,6 +304,9 @@ static Str capnames[] = {
                        // open the session's shell in by hand
     "call.stop",       // call.stop {sid, call}: the running command killed,
                        // its tool.end status "stopped", the turn going on
+    "cut",             // cut {sid, turn, files?} and uncut {sid}: the
+                       // conversation rewound to before a turn, and back;
+                       // cut and uncut records, snap and rewind {cut}
 };
 
 static Str evname(i32 ev)
@@ -942,6 +952,162 @@ static Replay logreplay(Os *os, Arena *perm, Arena scratch, Str path,
 }
 
 
+// Conversation cuts
+//
+// A conversation rewound to before a turn is a cut record {turn, last,
+// from}: the records from seq from, the first of turn turn, up to the
+// cut itself drop out of the conversation (cutdrops), though they stay
+// in the log, and turns turn through last are gone from it. Turn
+// numbers are never used again. An uncut record {cut} undoes the cut
+// whose seq it names. The cuts in force are those not undone, and the
+// latest of them may be undone until a turn begins after it.
+
+struct CutRange {
+    i64 from;  // the first record cut
+    i64 seq;   // the cut record's, which ends the range
+    i64 turn;  // the first turn cut
+    i64 last;  // and the last
+};
+
+struct LogCuts {
+    Slice<CutRange> ranges;  // in force, oldest first
+    i64             undo;    // the cut that may be undone, by seq, else 0
+    i64             turnseq; // the latest turn record's seq
+};
+
+// A line's event name, as its fixed key order has it early on, without
+// parsing it: a log's lines are mostly not cuts.
+static Str lineev(Str line)
+{
+    iz at = find(line, ",\"ev\":\"");
+    if (at < 0) {
+        return {};
+    }
+    Str rest = cuthead(line, at + 7);
+    return cut(rest, '"').head;
+}
+
+// Whether a cut record or its undo, or anything else, is in a line.
+static b32 linecuts(Str line)
+{
+    Str ev = lineev(line);
+    return ev=="cut" || ev=="uncut";
+}
+
+// The cut record's range, from its parse.
+static CutRange cutrange(EvRec *rec)
+{
+    CutRange c = {};
+    c.from = jsonint(jsonget(rec->root, "from"), 0);
+    c.seq  = rec->seq;
+    c.turn = jsonint(jsonget(rec->root, "turn"), 0);
+    c.last = jsonint(jsonget(rec->root, "last"), c.turn);
+    return c;
+}
+
+// Take in one record, in log order, of a cut, an uncut or a turn.
+static void cutsadd(LogCuts *c, Arena *a, EvRec *rec)
+{
+    switch (rec->ev) {
+    case EV_CUT: {
+        CutRange r = cutrange(rec);
+        if (r.from>0 && r.from<r.seq) {
+            c->ranges = push(a, c->ranges, r);
+            c->undo   = r.seq;
+        }
+    } break;
+    case EV_UNCUT: {
+        i64 seq = jsonint(jsonget(rec->root, "cut"), 0);
+        for (iz i = 0; i < c->ranges.len; i++) {
+            if (c->ranges[i].seq == seq) {
+                for (iz k = i+1; k < c->ranges.len; k++) {
+                    c->ranges[k-1] = c->ranges[k];
+                }
+                c->ranges.len--;
+                break;
+            }
+        }
+        // The one before it, unless a turn began after that one
+        i64 prev = c->ranges.len ? c->ranges[c->ranges.len-1].seq : 0;
+        c->undo  = c->undo==seq && prev>c->turnseq ? prev : 0;
+    } break;
+    case EV_TURN:
+        c->undo    = 0;
+        c->turnseq = rec->seq;
+        break;
+    }
+}
+
+// The cuts in force in a log's lines.
+static LogCuts logcuts(Arena *a, Arena scratch, Slice<Str> lines)
+{
+    LogCuts c = {};
+    for (iz i = 0; i < lines.len; i++) {
+        Str ev = lineev(lines[i]);
+        if (ev=="cut" || ev=="uncut" || ev=="turn") {
+            Arena t   = scratch;
+            EvRec rec = evparse(&t, lines[i]);
+            cutsadd(&c, a, &rec);
+        }
+    }
+    return c;
+}
+
+// Whether a record, by its seq, is in a cut in force.
+static b32 incut(LogCuts *c, i64 seq)
+{
+    for (iz i = 0; i < c->ranges.len; i++) {
+        if (seq>=c->ranges[i].from && seq<c->ranges[i].seq) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether a turn, by its number, is gone in a cut in force.
+static b32 turncut(LogCuts *c, i64 turn)
+{
+    for (iz i = 0; i < c->ranges.len; i++) {
+        if (turn>=c->ranges[i].turn && turn<=c->ranges[i].last) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Whether a cut drops a record of its range from the conversation: what
+// was said and done, but not the state that holds after it, as the
+// session's title, model, mode, shell, grants, prefix and jobs, the
+// files changed (snap, rewind), nor the turns' numbers. Instruction
+// files and memory as the agent first had them stay, and later news of
+// them goes, to be told again.
+static b32 cutdrops(i32 ev, Json *root)
+{
+    switch (ev) {
+    case EV_USER:
+    case EV_ATTEMPT:
+    case EV_ASSISTANT:
+    case EV_TOOLSTART:
+    case EV_TOOLEND:
+    case EV_ASK:
+    case EV_ANSWER:
+    case EV_ASKDEADLINE:
+    case EV_RETRY:
+    case EV_NUDGE:
+    case EV_TURNEND:
+    case EV_NOTE:
+    case EV_COMPACT:
+    case EV_TODO:
+    case EV_NOTICE:
+    case EV_TASKHOST:
+        return 1;
+    case EV_INSTRUCTIONS:
+    case EV_MEMORY:
+        return jsonstr(jsonget(root, "why")) != "start";
+    }
+    return 0;
+}
+
 // Copies of logs
 //
 // A fork is a new session made from another's log (logcopy): its records
@@ -1212,6 +1378,17 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
         return r;
     }
 
+    // A turn a rewind took out of the conversation (cut) is gone
+    LogCuts cuts = logcuts(a, scratch, lines);
+    if (turn>0 && turncut(&cuts, turn)) {
+        Buf b(&scratch, 64);
+        print(&b, "turn ");
+        print(&b, turn);
+        print(&b, " was rewound out of the conversation");
+        r.err = clone(a, finish(&b));
+        return r;
+    }
+
     // The cut: after turn.end{turn}, then on to the next turn's start
     // (end -2 while looking for it)
     iz  end   = turn<0 ? lines.len : -1;
@@ -1356,11 +1533,15 @@ static LogCopy logcopy(Arena *a, Arena scratch, Slice<Str> lines, Str from,
             }
         }
     }
-    if (end < lines.len) {
-        EvRec rec = evparse(&scratch, lines[end]);
-        if (rec.ev == EV_USER) {
+    // The next turn's prompt, past turns rewound out (cut)
+    for (iz i = end; i < lines.len; i++) {
+        EvRec rec = evparse(&scratch, lines[i]);
+        if ((rec.ev!=EV_USER && rec.ev!=EV_TURN) || incut(&cuts, rec.seq)) {
+            continue;
+        } else if (rec.ev == EV_USER) {
             r.next = clone(a, jsonstr(jsonget(rec.root, "text")));
         }
+        break;
     }
     Str suffix = imported ? Str(" (imported)") :
                  side     ? Str(" (side chat)") : Str(" (fork)");
@@ -1731,6 +1912,8 @@ static LogImport logimport(Arena *a, Arena scratch, Str data, Str to, Str cwd,
         r.from = clone(a, rec.sid);
     }
 
+    // The conversation as it stands, without turns rewound out of it
+    LogCuts    cuts = logcuts(a, scratch, lines);
     Slice<Str> kept = {};
     i64        last = 0;
     for (iz i = 0; i < lines.len; i++) {
@@ -1744,7 +1927,7 @@ static LogImport logimport(Arena *a, Arena scratch, Str data, Str to, Str cwd,
         last = rec.seq;
         if (i == 0) {
             line = importsession(a, &rec, cwd, model, endpoint, dir, nofolder);
-        } else if (!importkeeps(rec.ev)) {
+        } else if (!importkeeps(rec.ev) || incut(&cuts, rec.seq)) {
             r.dropped++;
             continue;
         } else if (rec.ev==EV_TOOLEND || rec.ev==EV_NOTICE || rec.ev==EV_USER) {

@@ -348,6 +348,8 @@ struct Snap {
     Str after;    // hash of what the harness wrote
     b32 existed;
     b32 undone;   // rewound already
+    i64 cut;      // a conversation rewind's copy of what it overwrote,
+                  // for its undo alone: the cut record's seq, else 0
 };
 
 // Where a call started, for rewinding to it.
@@ -389,6 +391,7 @@ struct Parked {
     iz  lock;      // still held, -1 if none
     b32 attended;
     b32 closed;
+    b32 forget;
 };
 
 struct Endpoint {
@@ -14204,6 +14207,7 @@ static void park(Engine *e, Session *s)
     k.lock     = s->lock;
     k.attended = s->attended;
     k.closed   = s->closed;
+    k.forget   = s->forget;
     e->parked  = push(&e->perm, e->parked, k);
     s->lock    = -1;  // kept for its revival
     for (Session *t = e->sessions; t; t = t->next) {
@@ -14263,6 +14267,7 @@ static Session *revive(Engine *e, Arena scratch, Str sid, Str model,
     if (s) {
         s->attended = k.attended;
         s->closed   = k.closed;
+        s->forget   = k.forget;
     }
     return s;
 }
@@ -15349,6 +15354,20 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
 // What the tools keep of a session, from one record of its log: where
 // calls started, jobs, the todo list, snapshots, instruction files, and
 // the notices the agent read.
+// Snapshots by name (a JSON list), as a rewind undid them, or as
+// its undo (uncut) made them count again.
+static void snapsmark(Session *s, Arena scratch, Json *names, b32 undone)
+{
+    for (Json *k = names->child; k; k = k->next) {
+        Str name = jsonstr(k);
+        for (iz i = 0; i < s->snaps.len; i++) {
+            if (snapname(&scratch, s->snaps[i].n) == name) {
+                s->snaps[i].undone = undone;
+            }
+        }
+    }
+}
+
 static void replaytools(Session *s, Arena scratch, EvRec *r)
 {
     Json *j    = r->root;
@@ -15428,19 +15447,15 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
         sn.before  = clone(&s->perm, jsonstr(jsonget(j, "hash_before")));
         sn.after   = clone(&s->perm, jsonstr(jsonget(j, "hash_after")));
         sn.existed = jsonflag(jsonget(j, "existed"), 0);
+        sn.cut     = jsonint(jsonget(j, "cut"), 0);
         s->snaps   = push(&s->perm, s->snaps, sn);
         s->nsnap   = sn.n>s->nsnap ? sn.n : s->nsnap;
     } break;
 
     case EV_REWIND:
-        for (Json *k = jsonget(j, "undone")->child; k; k = k->next) {
-            Str name = jsonstr(k);
-            for (iz i = 0; i < s->snaps.len; i++) {
-                if (snapname(&scratch, s->snaps[i].n) == name) {
-                    s->snaps[i].undone = 1;
-                }
-            }
-        }
+    case EV_UNCUT:
+        snapsmark(s, scratch, jsonget(j, "undone"), 1);
+        snapsmark(s, scratch, jsonget(j, "redone"), 0);
         break;
 
     case EV_INSTRUCTIONS: {
@@ -15543,15 +15558,25 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         s->log.seq = rp.last;
         *firstnew  = rp.last;
     }
-    Str storedmodel = {};
-    Str storedurl   = {};
-    b32 prefixed    = 0;
-    b32 reported    = 0;  // a task.report, by a subagent of another host's
+    Str     storedmodel = {};
+    Str     storedurl   = {};
+    b32     prefixed    = 0;
+    b32     reported    = 0;  // a task.report, by a subagent of another host's
+    LogCuts cuts        = logcuts(&s->perm, scratch, rp.lines);
     for (iz i = 0; i < rp.lines.len; i++) {
         Arena t = scratch;
         EvRec r = evparse(&t, rp.lines[i]);
         Json *j = r.root;
         Msg   m = {};
+        b32   gone = incut(&cuts, r.seq);  // rewound out of the conversation
+        if (gone && cutdrops(r.ev, j)) {
+            // A job's end told in a notice there needs no telling again
+            Job *jb = r.ev==EV_NOTICE ? jobfind(s, jsonint(jsonget(j, "job"), 0)) : 0;
+            if (jb && jsonstr(jsonget(j, "kind"))=="job") {
+                jb->quiet = 1;
+            }
+            continue;
+        }
         switch (r.ev) {
         case EV_SESSION: {
             s->cwd      = clone(&s->perm, jsonstr(jsonget(j, "cwd")));
@@ -15626,7 +15651,9 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             Str by   = jsonstr(jsonget(j, "by"));
             i32 mode = modefind(jsonstr(jsonget(j, "mode")));
             s->mode  = mode<0 ? MODE_BUILD : mode;
-            s->modeheard = by=="agent" || by=="approved" ? s->mode : s->modeheard;
+            if (!gone) {  // what the agent heard of it went with the cut
+                s->modeheard = by=="agent" || by=="approved" ? s->mode : s->modeheard;
+            }
         } break;
         case EV_NOTICE:
             if (jsonstr(jsonget(j, "kind")) == "mode") {
@@ -16020,6 +16047,127 @@ struct RewindFile {
     b32 wrote;   // this rewind changed the file
 };
 
+struct RewindRun {
+    Slice<RewindFile> files;
+    Slice<Str>        undone;  // the snapshots put back, by name
+};
+
+// Put back, newest first, the files that write and edit changed at or
+// after a call (seq0: its tool.start's seq) or from a turn on (turn0),
+// unless something else changed them since, which is a conflict, left
+// alone unless forced. With keep, a conversation rewind's seq (cut), each
+// file is first kept as it is, as a snapshot of its own logged with cut,
+// which its undo puts back. With only, a cut's seq, instead those
+// snapshots alone, for that undo; any other rewind leaves them be.
+static RewindRun rewindfiles(Session *s, Arena *a, Arena scratch, i64 turn0,
+                             i64 seq0, b32 force, i64 keep, i64 only)
+{
+    Os       *os = s->e->os;
+    RewindRun r  = {};
+    Slice<RewindFile> &files  = r.files;
+    Slice<Str>        &undone = r.undone;
+    for (iz i = s->snaps.len-1; i >= 0; i--) {
+        Snap *sn = &s->snaps[i];
+        if (sn->undone || (only ? sn->cut!=only : sn->cut!=0) ||
+                (!only && (turn0>=0 ? sn->turn<turn0 : sn->seq<=seq0))) {
+            continue;
+        }
+        // One result for each file: its oldest change decides, unless a
+        // newer one found a conflict or failed, which stops it there. A
+        // conflict after newer changes were put back is a partial rewind.
+        RewindFile *f = 0;
+        for (iz k = 0; k<files.len && !f; k++) {
+            f = files[k].path==sn->path ? &files[k] : 0;
+        }
+        if (f && (f->result=="conflict" || f->result=="partial" ||
+                  f->result=="failed")) {
+            continue;
+        }
+        Arena t   = scratch;
+        Read  cur = os_read(os, &t, sn->path, (iz)FILE_MAX);
+        Str   now = cur.err==READ_NOTFOUND ? Str("") :
+                    cur.err                ? Str("?") : hashstr(&t, hash(cur.data));
+        Str   result = {};
+        Str   wrote  = {};  // the hash of what it put there
+        i64   kept   = 0;   // the snapshot of what was there, with keep
+        if (now == sn->before) {
+            result = "unchanged";  // as it was already
+        } else if (!force && now!=sn->after) {
+            result = "conflict";
+        } else if (keep && cur.err && cur.err!=READ_NOTFOUND) {
+            result = "failed";  // nothing to keep it by
+        } else {
+            if (keep && !cur.err) {
+                Str dir  = join(&t, s->dir, "snap");
+                Str file = join(&t, s->dir, snapname(&t, s->nsnap+1));
+                if (!os_mkdirs(os, t, dir) || !os_write(os, t, file, cur.data)) {
+                    result = "failed";
+                }
+            }
+            if (result.len) {
+                // failed to keep it
+            } else if (sn->existed) {
+                Str  name = snapname(&t, sn->n);
+                Str  file = join(&t, s->dir, name);
+                Read old  = os_read(os, &t, file, (iz)FILE_MAX);
+                Str  dir  = normpath(&t, sn->path, "..", s->te.windows);
+                b32  ok   = !old.err;
+                if (ok && os_stat(os, t, dir).type!=STAT_DIR) {
+                    ok = os_mkdirs(os, t, dir);
+                }
+                ok = ok && os_write(os, t, sn->path, old.data);
+                result = ok ? Str("restored") : Str("failed");
+                wrote  = ok ? hashstr(&t, hash(old.data)) : Str{};
+            } else {
+                b32 ok = cur.err==READ_NOTFOUND || os_remove(os, t, sn->path);
+                result = ok ? Str("removed") : Str("failed");
+                wrote  = "";
+            }
+            kept = keep && (result=="restored" || result=="removed") ? ++s->nsnap : 0;
+        }
+        if (kept) {
+            Str   name = snapname(&t, kept);
+            Buf   b(&t, 512 + sn->path.len);
+            EvOut w = sbegin(s, &b, EV_SNAP);
+            putstrkey(&w.json, "call", "");
+            putstrkey(&w.json, "path", sn->path);
+            putstrkey(&w.json, "snap", name);
+            putintkey(&w.json, "existed", !cur.err);
+            putstrkey(&w.json, "hash_before", now);
+            putstrkey(&w.json, "hash_after", wrote);
+            putintkey(&w.json, "cut", keep);
+            ssend(s, &w);
+            Snap k = {};
+            k.n       = kept;
+            k.seq     = s->log.seq;
+            k.turn    = s->turn;
+            k.call    = "";
+            k.path    = sn->path;  // in perm already
+            k.before  = clone(&s->perm, now);
+            k.after   = clone(&s->perm, wrote);
+            k.existed = !cur.err;
+            k.cut     = keep;
+            s->snaps = push(&s->perm, s->snaps, k);
+            sn = &s->snaps[i];  // the push may have moved it
+        }
+        b32 changed = result=="restored" || result=="removed";
+        if (result!="conflict" && result!="failed") {
+            sn->undone = 1;
+            undone = push(a, undone, snapname(a, sn->n));
+        }
+        if (!f) {
+            RewindFile n = {clone(a, sn->path), clone(a, result), changed};
+            files = push(a, files, n);
+        } else if (f->wrote && (result=="conflict" || result=="failed")) {
+            f->result = "partial";
+        } else {
+            f->result = clone(a, result);
+            f->wrote |= changed;
+        }
+    }
+    return r;
+}
+
 // rewind {sid, to, force}: put back, newest first, the files that write
 // and edit changed at or after a call (to: its id) or a turn (to: its
 // number), unless something else changed them since, which is a
@@ -16027,7 +16175,6 @@ struct RewindFile {
 // the agent at its next request.
 static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
 {
-    Os  *os    = e->os;
     Json *to   = jsonget(j, "to");
     b32  force = jsonflag(jsonget(j, "force"), 0);
     i64  seq0  = -1;   // snaps after this record
@@ -16065,63 +16212,10 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
         return;
     }
 
-    Slice<RewindFile> files  = {};
-    Slice<Str>        undone = {};
-    for (iz i = s->snaps.len-1; i >= 0; i--) {
-        Snap *sn = &s->snaps[i];
-        if (sn->undone || (turn0>=0 ? sn->turn<turn0 : sn->seq<=seq0)) {
-            continue;
-        }
-        // One result for each file: its oldest change decides, unless a
-        // newer one found a conflict or failed, which stops it there. A
-        // conflict after newer changes were put back is a partial rewind.
-        RewindFile *f = 0;
-        for (iz k = 0; k<files.len && !f; k++) {
-            f = files[k].path==sn->path ? &files[k] : 0;
-        }
-        if (f && (f->result=="conflict" || f->result=="partial" ||
-                  f->result=="failed")) {
-            continue;
-        }
-        Arena a   = scratch;
-        Read  cur = os_read(os, &a, sn->path, (iz)FILE_MAX);
-        Str   now = cur.err==READ_NOTFOUND ? Str("") :
-                    cur.err                ? Str("?") : hashstr(&a, hash(cur.data));
-        Str   result = {};
-        if (now == sn->before) {
-            result = "unchanged";  // as it was already
-        } else if (!force && now!=sn->after) {
-            result = "conflict";
-        } else if (sn->existed) {
-            Str  name = snapname(&a, sn->n);
-            Str  file = join(&a, s->dir, name);
-            Read old  = os_read(os, &a, file, (iz)FILE_MAX);
-            Str  dir  = normpath(&a, sn->path, "..", s->te.windows);
-            b32  ok   = !old.err;
-            if (ok && os_stat(os, a, dir).type!=STAT_DIR) {
-                ok = os_mkdirs(os, a, dir);
-            }
-            ok = ok && os_write(os, a, sn->path, old.data);
-            result = ok ? Str("restored") : Str("failed");
-        } else {
-            b32 ok = cur.err==READ_NOTFOUND || os_remove(os, a, sn->path);
-            result = ok ? Str("removed") : Str("failed");
-        }
-        b32 wrote = result=="restored" || result=="removed";
-        if (result!="conflict" && result!="failed") {
-            sn->undone = 1;
-            undone = push(&scratch, undone, snapname(&scratch, sn->n));
-        }
-        if (!f) {
-            RewindFile n = {sn->path, result, wrote};
-            files = push(&scratch, files, n);
-        } else if (f->wrote && (result=="conflict" || result=="failed")) {
-            f->result = "partial";
-        } else {
-            f->result = result;
-            f->wrote |= wrote;
-        }
-    }
+    Arena     keep   = carve(&scratch, 1<<20);
+    RewindRun run    = rewindfiles(s, &keep, scratch, turn0, seq0, force, 0, 0);
+    Slice<RewindFile> files  = run.files;
+    Slice<Str>        undone = run.undone;
 
     Str note = "Changes made by shell commands are not tracked, so they "
                "were not undone.";
@@ -16201,6 +16295,324 @@ static void cmdrewind(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     }
     putend(&w.json);
     putstrkey(&w.json, "note", note);
+    emit(e, evend(&w));
+}
+
+// A notice in another arena, as reload carries it over.
+static Notice noticecopy(Arena *a, Notice n)
+{
+    n.kind   = clone(a, n.kind);
+    n.text   = clone(a, n.text);
+    n.from   = clone(a, n.from);
+    n.ftitle = clone(a, n.ftitle);
+    n.host   = clone(a, n.host);
+    Slice<Str> urls = {};
+    for (iz i = 0; i < n.urls.len; i++) {
+        urls = push(a, urls, clone(a, n.urls[i]));
+    }
+    n.urls = urls;
+    return n;
+}
+
+// Build an idle session again from its log, whose meaning a rewind of
+// its conversation changed (cut, uncut), so that it is as a revival, or
+// a restart, would make it: parked, then revived at once. What it was
+// to tell the agent next, which no log has yet, goes along, but for
+// its mode and shell, which a revival tells anew if need be. Null if
+// it cannot be read again, which leaves it parked.
+static Session *reload(Engine *e, Arena scratch, Session *s)
+{
+    Slice<Notice> keep = {};
+    for (iz i = 0; i < s->notices.len; i++) {
+        Notice n = s->notices[i];
+        if (!(n.kind=="mode") && !(n.kind=="shell")) {
+            keep = push(&scratch, keep, noticecopy(&scratch, n));
+        }
+    }
+    Str sid = clone(&scratch, s->sid);
+    park(e, s);
+    i64 first = 0;
+    s = revive(e, scratch, sid, {}, {}, &first);
+    for (iz i = 0; s && i<keep.len; i++) {
+        s->notices = push(&s->perm, s->notices, noticecopy(&s->perm, keep[i]));
+    }
+    return s;
+}
+
+// Why a session's conversation cannot be rewound now, or null: it is
+// idle, its own (no subagent's), with no job running and no subagent of
+// its at work, and its worktree, if any, is there.
+static Str cutwhy(Engine *e, Session *s, Arena scratch)
+{
+    if (busy(s) || s->intask) {
+        return "the session is busy: cancel its turn first";
+    } else if (s->psid.len || s->rparent.len) {
+        return "a subagent's conversation cannot be rewound, only its parent's";
+    } else if (s->wt.name.len && (!wtexists(e, scratch, &s->wt) || wtjobfor(e, s->wt.path))) {
+        return "its worktree is not there: a prompt makes it again";
+    }
+    for (Job *j = s->jobs; j; j = j->next) {
+        if (j->state != JOB_DONE) {
+            return "a background job is running: wait for it to end, or stop it";
+        }
+    }
+    for (Session *t = e->sessions; t; t = t->next) {
+        if (t->psid==s->sid && (busy(t) || t->intask)) {
+            return "a subagent of the session is at work: wait for it, or stop it";
+        }
+    }
+    return {};
+}
+
+static void putrewound(JsonOut *w, Slice<RewindFile> files)
+{
+    putkey(w, "files");
+    putarray(w);
+    for (iz i = 0; i < files.len; i++) {
+        putobject(w);
+        putstrkey(w, "path", files[i].path);
+        putstrkey(w, "result", files[i].result);
+        putend(w);
+    }
+    putend(w);
+}
+
+// cut {sid, turn, files?, force?}: rewind the conversation to just before
+// a turn, which a user's prompt began, in this session. A cut record
+// says that the conversation ends before the turn's first record (from),
+// so that the records from there on drop out of it (cutdrops), though
+// the log keeps them, and the session is built again from its log
+// (reload): its history is what it was before that turn, and so is the
+// prompt the provider caches. With files, the files that write and edit
+// changed from that turn on are put back too (rewindfiles), each first
+// kept as it is, for the undo (uncut), and a rewind record with cut says
+// how. Refused while anything runs in the session or under it (cutwhy),
+// for a turn the conversation no longer has, and for one before the
+// latest compaction, whose summary covers it. The agent is told nothing:
+// its history is back where it was. The reply has from, turn, files,
+// and next, the prompt's text, for the frontend to offer again.
+static void cmdcut(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
+{
+    Json *tj    = jsonget(j, "turn");
+    i64   turn  = tj->type==JSON_NUMBER ? jsonint(tj, -1) : -1;
+    b32   files = jsonflag(jsonget(j, "files"), 0);
+    b32   force = jsonflag(jsonget(j, "force"), 0);
+    Str   why   = cutwhy(e, s, scratch);
+    if (why.len) {
+        reply(e, scratch, id, 0, why, s->sid);
+        return;
+    } else if (turn<1 || turn>s->turn) {
+        reply(e, scratch, id, 0, "no turn with that number in this session", s->sid);
+        return;
+    }
+    Str    path  = join(&scratch, s->dir, "events.jsonl");
+    Arena  lines = newarena(e->replay);
+    Replay rp    = logreplay(e->os, &lines, scratch, path, s->sid, 0, LOG_MAX);
+    if (!rp.ok) {
+        reply(e, scratch, id, 0, "cannot read the session's log", s->sid);
+        return;
+    }
+    Arena   keep    = carve(&scratch, 1<<20);
+    LogCuts cuts    = logcuts(&lines, scratch, rp.lines);
+    i64     from    = 0;   // the turn's first record
+    i64     user    = 0;   // the latest user record between turns
+    i64     compact = 0;   // the latest compaction
+    Str     next    = {};
+    Str     text    = {};
+    for (iz i = 0; i<rp.lines.len && !from; i++) {
+        Str ev = lineev(rp.lines[i]);
+        if (ev!="user" && ev!="turn" && ev!="turn.end") {
+            continue;
+        }
+        Arena t = scratch;
+        EvRec r = evparse(&t, rp.lines[i]);
+        if (r.ev==EV_USER && !incut(&cuts, r.seq)) {
+            user = user ? user : r.seq;
+            text = user==r.seq ? clone(&keep, jsonstr(jsonget(r.root, "text"))) : text;
+        } else if (r.ev == EV_TURN) {
+            if (jsonint(jsonget(r.root, "n"), 0) == turn) {
+                from = user ? user : r.seq;
+                next = user ? text : Str{};
+            }
+            user = 0;
+        } else if (r.ev == EV_TURNEND) {
+            user = 0;
+        }
+    }
+    for (iz i = rp.lines.len-1; i>=0 && from && !compact; i--) {
+        if (lineev(rp.lines[i]) == "compact") {
+            Arena t = scratch;
+            compact = evparse(&t, rp.lines[i]).seq;
+        }
+    }
+    if (!from || turncut(&cuts, turn)) {
+        reply(e, scratch, id, 0, "that turn is no longer in the conversation", s->sid);
+        return;
+    } else if (compact > from) {
+        reply(e, scratch, id, 0, "that turn is before the latest compaction, which "
+              "summarized it: the conversation can go back only to after it", s->sid);
+        return;
+    }
+
+    i64 last = s->turn;
+    {
+        Buf   b(&scratch, 256);
+        EvOut w = sbegin(s, &b, EV_CUT);
+        putintkey(&w.json, "turn", turn);
+        putintkey(&w.json, "last", last);
+        putintkey(&w.json, "from", from);
+        putintkey(&w.json, "files", files);
+        ssend(s, &w);
+    }
+    i64       cut  = s->log.seq;
+    RewindRun run  = {};
+    if (files) {
+        run = rewindfiles(s, &keep, scratch, turn, -1, force, cut, 0);
+    }
+    if (run.files.len) {
+        Buf   b(&scratch, 1024);
+        EvOut w = sbegin(s, &b, EV_REWIND);
+        putintkey(&w.json, "to", turn);
+        putintkey(&w.json, "force", force);
+        putintkey(&w.json, "cut", cut);
+        putrewound(&w.json, run.files);
+        putkey(&w.json, "undone");
+        putarray(&w.json);
+        for (iz i = 0; i < run.undone.len; i++) {
+            putstr(&w.json, run.undone[i]);
+        }
+        putend(&w.json);
+        putstrkey(&w.json, "note", "Changes made by shell commands are not tracked, "
+                                   "so they were not undone.");
+        ssend(s, &w);
+    }
+    Str sid = clone(&keep, s->sid);
+    s = reload(e, scratch, s);
+    if (!s) {
+        reply(e, scratch, id, 0, "rewound, but the session cannot be read again", sid);
+        return;
+    }
+    live(s);
+
+    // With the prompt, unless the reply would then be too long for the
+    // frontend's mailbox
+    for (i32 pass = 0; pass < 2; pass++) {
+        Arena a = scratch;
+        Buf   b(&a, 1024 + (pass ? 0 : next.len + next.len/8));
+        EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
+        putintkey(&w.json, "id", id);
+        putintkey(&w.json, "ok", 1);
+        putintkey(&w.json, "turn", turn);
+        putintkey(&w.json, "from", from);
+        putintkey(&w.json, "cut", cut);
+        putrewound(&w.json, run.files);
+        if (!pass && next.len) {
+            putstrkey(&w.json, "next", next);
+        }
+        Str line = evend(&w);
+        if (pass || line.len<=mailmax(e->out)) {
+            emit(e, line);
+            break;
+        }
+    }
+}
+
+// uncut {sid}: undo the latest rewind of the conversation (cut), until
+// a turn begins after it: an uncut record names the cut, so that the
+// turns it took out are the conversation's again, and the session is
+// built again from its log (reload). Files it put back are put back in
+// turn as the rewind found them (rewindfiles, with only), where they are
+// still as the rewind left them: undone names those snapshots, and
+// redone the snapshots of the files' earlier changes that count again,
+// for a later rewind. The reply has cut and files.
+static void cmduncut(Engine *e, Session *s, Arena scratch, i64 id)
+{
+    Str why = cutwhy(e, s, scratch);
+    if (why.len) {
+        reply(e, scratch, id, 0, why, s->sid);
+        return;
+    }
+    Str    path  = join(&scratch, s->dir, "events.jsonl");
+    Arena  lines = newarena(e->replay);
+    Replay rp    = logreplay(e->os, &lines, scratch, path, s->sid, 0, LOG_MAX);
+    if (!rp.ok) {
+        reply(e, scratch, id, 0, "cannot read the session's log", s->sid);
+        return;
+    }
+    LogCuts cuts = logcuts(&lines, scratch, rp.lines);
+    i64     cut  = cuts.undo;
+    if (!cut) {
+        reply(e, scratch, id, 0, "nothing to undo: no rewind of the conversation "
+              "since its latest turn", s->sid);
+        return;
+    }
+    // The snapshots its rewind undid
+    Slice<Str> names = {};
+    for (iz i = rp.lines.len-1; i >= 0; i--) {
+        if (lineev(rp.lines[i]) != "rewind") {
+            continue;
+        }
+        Arena t = scratch;
+        EvRec r = evparse(&t, rp.lines[i]);
+        if (jsonint(jsonget(r.root, "cut"), 0) == cut) {
+            for (Json *k = jsonget(r.root, "undone")->child; k; k = k->next) {
+                names = push(&lines, names, clone(&lines, jsonstr(k)));
+            }
+            break;
+        }
+    }
+
+    Arena     keep = carve(&scratch, 1<<20);
+    RewindRun run  = rewindfiles(s, &keep, scratch, -1, -1, 0, 0, cut);
+    Slice<Str> redone = {};
+    for (iz i = 0; i < names.len; i++) {
+        Snap *sn = 0;
+        for (iz k = 0; k<s->snaps.len && !sn; k++) {
+            sn = snapname(&scratch, s->snaps[k].n)==names[i] ? &s->snaps[k] : 0;
+        }
+        b32 ok = !!sn;
+        for (iz k = 0; ok && k<run.files.len; k++) {
+            Str res = run.files[k].result;
+            ok = !(run.files[k].path==sn->path && (res=="conflict" || res=="failed" ||
+                                                    res=="partial"));
+        }
+        if (ok) {
+            redone = push(&keep, redone, names[i]);
+        }
+    }
+    {
+        Buf   b(&scratch, 1024);
+        EvOut w = sbegin(s, &b, EV_UNCUT);
+        putintkey(&w.json, "cut", cut);
+        putrewound(&w.json, run.files);
+        putkey(&w.json, "undone");
+        putarray(&w.json);
+        for (iz i = 0; i < run.undone.len; i++) {
+            putstr(&w.json, run.undone[i]);
+        }
+        putend(&w.json);
+        putkey(&w.json, "redone");
+        putarray(&w.json);
+        for (iz i = 0; i < redone.len; i++) {
+            putstr(&w.json, redone[i]);
+        }
+        putend(&w.json);
+        ssend(s, &w);
+    }
+    Str sid = clone(&keep, s->sid);
+    s = reload(e, scratch, s);
+    if (!s) {
+        reply(e, scratch, id, 0, "undone, but the session cannot be read again", sid);
+        return;
+    }
+    live(s);
+
+    Buf   b(&scratch, 1024);
+    EvOut w = evbegin(&b, s->sid, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putintkey(&w.json, "cut", cut);
+    putrewound(&w.json, run.files);
     emit(e, evend(&w));
 }
 
@@ -18604,6 +19016,8 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_STEER:
         case CMD_ANSWER:
         case CMD_REWIND:
+        case CMD_CUT:
+        case CMD_UNCUT:
         case CMD_RENAME:
         case CMD_DELETE:
         case CMD_TRASH:
@@ -18828,6 +19242,12 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_REWIND:
         cmdrewind(e, s, scratch, id, j);
+        return;
+    case CMD_CUT:
+        cmdcut(e, s, scratch, id, j);
+        return;
+    case CMD_UNCUT:
+        cmduncut(e, s, scratch, id);
         return;
     case CMD_JOBKILL: {
         Job *jb = jobfind(s, jsonint(jsonget(j, "job"), 0));

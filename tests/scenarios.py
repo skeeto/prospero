@@ -1658,6 +1658,103 @@ def rewind_reopen(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(bound=30)
+def cut(t):
+    """cut rewinds the conversation to before a turn, in the same session:
+    a cut record, the turn's prompt in the reply, with files the files
+    put back and kept for the undo; uncut brings it all back until a turn
+    begins; requests after a cut, also from a process that opens the
+    session again, carry only the conversation before it."""
+    model = t.model.replace(":cut:", ":rewind:")
+    fake_provider.STATE.register(model)
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=model, endpoint="fake")["sid"]
+
+        def turn(text, n):
+            h.send("prompt", sid=sid, text=text)
+            h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid
+                   and e.get("turn") == n)
+
+        def users(req):
+            return [m["content"] for m in req["body"]["messages"]
+                    if m.get("role") == "user" and isinstance(m.get("content"), str)]
+
+        turn("first", 1)
+        turn("second", 2)
+        t.check(t.file("c.txt") == "made in turn 2\n", "c.txt written")
+        t.put("c.txt", "edited by hand\n")
+
+        r = h.call("cut", sid=sid, turn=2, files=1)
+        got = [(os.path.basename(f["path"]), f["result"]) for f in r.get("files", [])]
+        t.check(r.get("ok") == 1 and r.get("next") == "second" and r.get("turn") == 2
+                and got == [("c.txt", "conflict")], f"cut, a conflict: {r}")
+        t.check(t.file("c.txt") == "edited by hand\n", "left alone")
+        r = h.call("uncut", sid=sid)
+        t.check(r.get("ok") == 1 and r.get("files") == [], f"undone: {r}")
+
+        t.put("c.txt", "made in turn 2\n")
+        r = h.call("cut", sid=sid, turn=2, files=1)
+        got = [(os.path.basename(f["path"]), f["result"]) for f in r.get("files", [])]
+        t.check(r.get("ok") == 1 and got == [("c.txt", "removed")], f"cut: {r}")
+        t.check(t.file("c.txt") is None, "c.txt removed")
+        cuts = h.all("cut", sid)
+        t.check(len(cuts) == 2 and cuts[-1]["turn"] == 2 and cuts[-1]["last"] == 2 and
+                cuts[-1]["from"] < cuts[-1]["seq"], f"cut records {cuts}")
+        kept = [s for s in h.all("snap", sid) if s.get("cut")]
+        t.check(len(kept) == 1 and kept[0]["cut"] == cuts[-1]["seq"] and
+                kept[0]["existed"] == 1, f"kept {kept}")
+        rw = h.all("rewind", sid)[-1]
+        t.check(rw.get("cut") == cuts[-1]["seq"], f"rewind {rw}")
+
+        r = h.call("uncut", sid=sid)
+        got = [(os.path.basename(f["path"]), f["result"]) for f in r.get("files", [])]
+        t.check(r.get("ok") == 1 and got == [("c.txt", "restored")], f"uncut: {r}")
+        t.check(t.file("c.txt") == "made in turn 2\n", "c.txt back")
+        un = h.all("uncut", sid)[-1]
+        t.check(un.get("cut") == cuts[-1]["seq"] and un.get("redone"), f"uncut record {un}")
+        r = h.call("uncut", sid=sid)
+        t.check(r.get("ok") == 0 and "nothing to undo" in r.get("err", ""), f"once: {r}")
+
+        # Cut again, then a new turn: the request has turn 1 only, the
+        # turn's number is 3, and the undo is gone
+        r = h.call("cut", sid=sid, turn=2, files=1)
+        t.check(r.get("ok") == 1 and t.file("c.txt") is None, f"cut again: {r}")
+        n = len(t.requests(model))
+        turn("third", 3)
+        req = t.requests(model)[n]
+        t.check(users(req)[0] == "first" and "second" not in users(req) and
+                users(req)[-1] == "third", f"request {users(req)}")
+        r = h.call("uncut", sid=sid)
+        t.check(r.get("ok") == 0 and "nothing to undo" in r.get("err", ""), f"too late: {r}")
+        for turnn, why in [(2, "no longer"), (9, "no turn"), (None, "no turn")]:
+            r = h.call("cut", sid=sid, turn=turnn)
+            t.check(r.get("ok") == 0 and why in r.get("err", ""), f"refused: {r}")
+        r = h.call("fork", sid=sid, turn=2)
+        t.check(r.get("ok") == 0 and "rewound" in r.get("err", ""), f"no fork of it: {r}")
+        r = h.call("fork", sid=sid, turn=1)
+        t.check(r.get("ok") == 1 and r.get("next") == "third", f"fork before third: {r}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+    # Opened again by another process: the same history
+    h = t.headless()
+    try:
+        o = h.call("open", sid=sid, **{"from": 0})
+        t.check(o.get("ok") == 1, f"opened {o}")
+        n = len(t.requests(model))
+        h.send("prompt", sid=sid, text="fourth")
+        h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid
+               and e.get("turn") == 4)
+        req = t.requests(model)[n]
+        t.check(users(req)[0] == "first" and "second" not in users(req) and
+                "third" in users(req), f"reopened request {users(req)}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=15)
 def instructions_changed(t):
     """An instruction file changed between turns: the agent gets its new
@@ -3337,7 +3434,7 @@ def hello_caps(t):
                                                    "relay.offer", "relay.data",
                                                    "relay.more", "relay.peer",
                                                    "relay.call", "offer", "ask.touch",
-                                                   "shell.env", "call.stop"]
+                                                   "shell.env", "call.stop", "cut", "uncut"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -3347,7 +3444,7 @@ def hello_caps(t):
                  "fork", "answer.always.desktop", "skills", "plan", "queue",
                  "message", "bypass", "nofolder", "dir", "config.create", "side", "background", "models",
                  "mcp", "mcp.auth", "task.remote", "task.host", "memory", "shell",
-                 "git", "answer.trust", "trash"} <= set(caps)
+                 "git", "answer.trust", "trash", "cut"} <= set(caps)
                 and "host" not in caps,
                 f"caps: {caps}")
 

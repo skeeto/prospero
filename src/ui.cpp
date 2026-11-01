@@ -1166,7 +1166,21 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
     case VIEW_REWIND: {
         ViewCard *c = m->card;
         Buf b(&a, 128);
-        if (c->to.len) {
+        if (c->kind == "cut") {
+            pen(p, "Conversation rewound", STYLE_BOLD, dim);
+            print(&b, ":  ");
+            print(&b, (i64)c->count);
+            print(&b, c->count==1 ? Str(" turn taken out") : Str(" turns taken out"));
+            pen(p, finish(&b), 0, dim);
+            if (c->conflicts) {
+                b.len = 0;
+                print(&b, ", ");
+                print(&b, (i64)c->conflicts);
+                print(&b, c->conflicts==1 ? Str(" file conflict") : Str(" file conflicts"));
+                pen(p, finish(&b), STYLE_BOLD, pal->amber);
+            }
+            break;
+        } else if (c->to.len) {
             i32 k = findcall(v, c->to);
             pen(p, "Undone from ", STYLE_BOLD, dim);
             if (k >= 0) {
@@ -1541,6 +1555,8 @@ struct MsgAction {
                         // left of its Open subagent, or a command's to
                         // the left of its Stop: its width, else 0
     b32         icon;   // label is an icon (Undo, Output, Rewind)
+    b32         cut;    // Rewind to here takes the conversation back too
+    Str         why;    // why it is disabled, empty if it is not
 };
 
 static char const bglabel[] = "Run in background";
@@ -1555,6 +1571,31 @@ static b32 canstop(Gui *g, GuiSession *s, ViewTool *t)
     return s && s->view && !s->readonly && t->name=="shell" &&
            t->status==VTOOL_RUNNING && !t->job && !t->stopasked &&
            hostcap(s->host, "call.stop") && hostlive(g, s);
+}
+
+static Str sesswhy(Gui *, GuiSession *, Str, b32, b32);
+static Str sessparent(GuiSession *);
+static void whytip(Str);
+
+// Why the conversation cannot be rewound to a prompt now (cut), or
+// empty: as the engine has it, only while the session and everything
+// under it is idle, and never to before the latest compaction.
+static Str cutwhy(Gui *g, GuiSession *s, View *v, ViewMsg *m)
+{
+    Str why = sesswhy(g, s, "cut", 1, 1);
+    if (why.len) {
+        return why;
+    } else if (v->tasks) {
+        return "Wait for its subagents to finish";
+    } else if (v->jobsrun) {
+        return "Wait for its background jobs to end, or stop them";
+    } else if (g->cutid || g->quitting) {
+        return "Wait for the rewind under way";
+    } else if (m->seq>0 && m->seq<v->compactseq) {
+        return "This prompt is before the latest compaction, which summarized "
+               "it: the conversation can go back only to after that";
+    }
+    return {};
 }
 
 // The action at the right of a message's header, if any.
@@ -1590,6 +1631,20 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
             r.kind  = ACT_OUTPUT;
             r.label = ICON_EXTERNAL "###output";
             r.icon  = 1;
+        }
+    } else if (m->startsturn && m->role==VIEW_USER && s && s==g->sess &&
+               !sessparent(s).len && hostcap(s->host, "cut")) {
+        // The conversation too, from any prompt that began a turn; before
+        // a compaction, the files alone, as before, where there are any
+        r.kind  = ACT_REWIND;
+        r.label = ICON_HISTORY "###rewind";
+        r.icon  = 1;
+        r.cut   = 1;
+        r.why   = cutwhy(g, s, v, m);
+        if (m->seq>0 && m->seq<v->compactseq && !sesswhy(g, s, "cut", 1, 1).len &&
+                canrewind(g, s) && turnrewinds(v, m->startsturn)) {
+            r.cut = 0;
+            r.why = {};
         }
     } else if (m->startsturn && canrewind(g, s) && turnrewinds(v, m->startsturn)) {
         r.kind  = ACT_REWIND;
@@ -1629,13 +1684,17 @@ static f32 actwidth(MsgAction *act)
     return act->kind ? act->w + (act->bgw>0 ? act->bgw + gap : 0) : 0;
 }
 
-// Ask before rewinding: the confirmation lists the files (drawrewind).
-static void askrewind(Gui *g, GuiSession *s, Str call, i32 turn, b32 force)
+// Ask before rewinding: the confirmation lists the files (drawrewind),
+// and with conv, says what happens to the conversation, which goes back
+// to before turn's prompt, the files with it if checked.
+static void askrewind(Gui *g, GuiSession *s, Str call, i32 turn, b32 force, b32 conv = 0)
 {
     g->rewsess    = s;
     g->rewcall    = call.len ? clone(&g->perm, call) : Str{};
     g->rewturn    = turn;
     g->rewforce   = force;
+    g->rewconv    = conv;
+    g->rewfiles   = 1;
     g->openrewind = 1;
 }
 
@@ -1646,7 +1705,9 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
     // A header line tall, as a small button, but as wide as act says
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
                         v2(ImGui::GetStyle().FramePadding.x, 0));
+    ImGui::BeginDisabled(act->why.len > 0);
     b32 go = ImGui::Button(act->label, v2(act->w, 0));
+    ImGui::EndDisabled();
     ImGui::PopStyleVar();
     switch (act->kind) {
     case ACT_OPEN:
@@ -1673,9 +1734,20 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
         break;
     case ACT_REWIND:
         itemrect(g, RECT_REWINDTURN);
-        ImGui::SetItemTooltip("Rewind to here: put back every file write and edit "
-                              "changed from this turn on");
-        if (go) askrewind(g, s, {}, m->startsturn, 0);
+        if (act->why.len) {
+            Arena a = g->frame;
+            whytip(concat(&a, "Rewind to here: not now. ", act->why));
+        } else if (act->cut) {
+            ImGui::SetItemTooltip("Rewind to here: take the conversation back to just "
+                                  "before this prompt, which goes back to the prompt "
+                                  "box to edit, and if you choose, put back the files "
+                                  "write and edit changed from here on");
+        } else {
+            ImGui::SetItemTooltip("Rewind to here: put back every file write and edit "
+                                  "changed from this turn on (the conversation cannot "
+                                  "go back past the latest compaction)");
+        }
+        if (go) askrewind(g, s, {}, m->startsturn, 0, act->cut);
         break;
     case ACT_OUTPUT: {
         // Where it is, which the agent's text names too
@@ -1758,6 +1830,44 @@ static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, Str path, i32 w, i3
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     }
     ImGui::SetItemTooltip("%dx%d pixels: open it whole", w, h);
+}
+
+// A rewound conversation's Undo, until a turn begins after it.
+static void drawcutundo(Gui *g, GuiSession *s, ViewMsg *m)
+{
+    View *v   = s ? s->view : 0;
+    Str   why = !v ? Str("Open the session") : sesswhy(g, s, "cut", 1, 1);
+    why = why.len ? why : v->tasks   ? Str("Wait for its subagents to finish") :
+                          v->jobsrun ? Str("Wait for its background jobs to end") :
+                          g->cutid   ? Str("Wait for the rewind under way") : why;
+    ImGui::BeginDisabled(why.len > 0);
+    b32 go = ImGui::Button("Undo rewind");
+    itemrect(g, RECT_CUTUNDO);
+    ImGui::EndDisabled();
+    if (why.len) {
+        whytip(why);
+    } else {
+        ImGui::SetItemTooltip("Bring back the turns taken out, and the files as they "
+                              "were before the rewind: until the next message is sent");
+    }
+    if (go) {
+        guiuncut(g, s);
+    }
+    ImGui::SameLine();
+    if (m->card->conflicts) {
+        // The files left alone, as the files' own rewind has it
+        ImGui::BeginDisabled(!canrewind(g, s));
+        b32 force = ImGui::Button("Put back anyway...");
+        itemrect(g, RECT_FORCE);
+        ImGui::SetItemTooltip("Put back the files left alone too, overwriting what "
+                              "changed them since (not undone by Undo rewind)");
+        ImGui::EndDisabled();
+        if (force) {
+            askrewind(g, s, {}, m->card->turn, 1);
+        }
+    } else {
+        ImGui::TextDisabled("until the next message");
+    }
 }
 
 // The latest rewind's button, when it left files alone.
@@ -3037,22 +3147,86 @@ static void drawsessbar(Gui *g)
     }
 }
 
+// Before a rewind of the conversation (cut): what it does, and the files
+// it would put back too, if checked, newest first.
+static void drawcut(Gui *g, GuiSession *s, View *v, Slice<ViewSnap> set)
+{
+    f32 sc    = g->scale;
+    i32 turns = 0;
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        turns += m->startsturn>=g->rewturn && !m->cuts;
+    }
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextUnformatted("The conversation goes back to just before this prompt, "
+                           "which returns to the prompt box to edit and send again.");
+    ImGui::Text("%d %s taken out of the conversation, though the session's log "
+                "keeps %s. Undo rewind brings %s back until the next message is sent.",
+                turns, turns==1 ? "turn is" : "turns are", turns==1 ? "it" : "them",
+                turns==1 ? "it" : "them");
+    ImGui::Spacing();
+    if (set.len) {
+        bool on = g->rewfiles;
+        ImGui::Checkbox("Also put back the files write and edit changed from here on:", &on);
+        itemrect(g, RECT_CUTFILES);
+        g->rewfiles = on;
+        ImGui::BeginDisabled(!on);
+        for (iz i = 0; i < set.len; i++) {
+            ImGui::Indent();
+            ImGui::Bullet();
+            text(showpath(v, set[i].path));
+            ImGui::SameLine();
+            ImGui::TextDisabled(set[i].existed ? "put back as it was"
+                                               : "removed, as it did not exist then");
+            ImGui::Unindent();
+        }
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("Changes made by shell commands are not undone. Files "
+                            "changed since by something else are left alone.");
+    } else {
+        ImGui::TextDisabled("write and edit changed no files from here on. Changes "
+                            "made by shell commands are not tracked.");
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    ImGui::BeginDisabled(!canrewind(g, s) || g->cutid);
+    b32 go = ImGui::Button("Rewind", v2(140*sc, 0));
+    itemrect(g, RECT_REWINDOK);
+    ImGui::EndDisabled();
+    if (go) {
+        guicut(g, s, g->rewturn, g->rewfiles && set.len);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0));
+    itemrect(g, RECT_REWINDCANCEL);
+    if (cancel) {
+        ImGui::CloseCurrentPopup();
+    }
+}
+
 // Before a rewind: the files it would put back, newest first, and how.
 static void drawrewind(Gui *g)
 {
-    f32 sc = g->scale;
+    f32         sc    = g->scale;
+    char const *title = g->rewconv ? "Rewind to here?" : "Rewind files?";
     if (g->openrewind) {
-        ImGui::OpenPopup("Rewind files?");
+        ImGui::OpenPopup(title);
         g->openrewind = 0;
     }
     ImGui::SetNextWindowSize(v2(560*sc, 0));
-    if (!ImGui::BeginPopupModal("Rewind files?", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (!ImGui::BeginPopupModal(title, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
         return;
     }
     Arena       a  = g->frame;
     GuiSession *s  = g->rewsess;
     View       *v  = s && s->view ? s->view : g->view;
     Slice<ViewSnap> set = rewindset(v, &a, g->rewcall, g->rewturn);
+    if (g->rewconv) {
+        drawcut(g, s, v, set);
+        ImGui::EndPopup();
+        return;
+    }
     ImGui::PushTextWrapPos(0);
     if (g->rewcall.len) {
         ImGui::TextUnformatted("Undo this change, and every later change by write and edit:");
@@ -3658,7 +3832,7 @@ static b32 forkitem(Gui *g, ViewMsg *m)
 {
     GuiSession *s      = g->sess;
     b32         prompt = 0;
-    i64         turn   = m ? viewforkat(m, &prompt) : -1;
+    i64         turn   = m ? viewforkat(g->view, m, &prompt) : -1;
     if (!s || turn<0) {
         return 0;
     }
@@ -4347,7 +4521,8 @@ static void drawtranscript(Gui *g)
             break;
         }
     }
-    i32 latest[] = {RECT_USERMSG, RECT_TASKLINK, RECT_UNDO, RECT_REWINDTURN, RECT_FORCE, RECT_COMPACTHDR,
+    i32 latest[] = {RECT_USERMSG, RECT_TASKLINK, RECT_UNDO, RECT_REWINDTURN, RECT_FORCE,
+                    RECT_CUTUNDO, RECT_COMPACTHDR,
                     RECT_THINKHDR, RECT_ALWAYS};
     for (iz i = 0; i < countof(latest); i++) {
         g->rects[latest[i]] = {};  // the latest drawn, or none
@@ -4475,6 +4650,9 @@ static void drawtranscript(Gui *g)
         } else if (mfoot>0 && m->role==VIEW_ASK) {
             ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
             drawaskbuttons(g, gs, m, i==lastask);
+        } else if (mfoot>0 && m->role==VIEW_REWIND && m->card->kind=="cut") {
+            ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
+            drawcutundo(g, gs, m);
         } else if (mfoot > 0) {
             ImGui::SetCursorScreenPos(v2(x, y + head + m->h + pad/4));
             drawforce(g, gs, m);

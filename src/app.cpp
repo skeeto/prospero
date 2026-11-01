@@ -212,6 +212,8 @@ enum : i32 {
     RECT_REWINDOK,   // the rewind confirmation's buttons
     RECT_REWINDCANCEL,
     RECT_FORCE,      // the latest rewind card's Rewind anyway
+    RECT_CUTUNDO,    // the rewound conversation's Undo
+    RECT_CUTFILES,   // the rewind confirmation's files checkbox
     RECT_INFOBTN,    // the session's Info
     RECT_COMPACTHDR, // the latest compaction card's header
     RECT_THINKHDR,   // the latest reasoning's header drawn
@@ -559,6 +561,7 @@ struct GuiSession {
     i64          noteat;    // when, in sched µs: a note not an error fades
     Str          cmdtext;   // that command, put back in the box if it fails
     i64          unqueue;   // the queued message being withdrawn, else 0
+    Str          cuttext;   // the prompt a rewind (cut) put in the box
     i64          cmdid;
     AttBox      *att;       // images attached to the draft, null until one is
     Str          group;     // its group, from the list (only a root's counts)
@@ -1322,7 +1325,10 @@ struct Gui {
     Str                rewcall;    // a call's change and those after, or
     i32                rewturn;    // a turn's on
     b32                rewforce;   // conflicts overwritten
+    b32                rewconv;    // the conversation too (cut), from rewturn
+    b32                rewfiles;   // and with it the files, as checked
     i64                rewindid;   // rewind in flight, 0 if none
+    i64                cutid;      // cut or uncut in flight, 0 if none
     Arena              cfgmem;     // the latest config.get, reset for each
     byte              *cfgbase;
     Json              *cfg;        // its reply, null until one arrives
@@ -3869,6 +3875,40 @@ static void guirewind(Gui *g, GuiSession *s, Str call, i32 turn, b32 force)
     cmdsend(g, &w, a);
 }
 
+// Rewind the conversation to before a turn (cut), and with files the
+// files write and edit changed from it on: its reply puts the turn's
+// prompt in the box (oncut).
+static void guicut(Gui *g, GuiSession *s, i32 turn, b32 files)
+{
+    if (!s || !s->view) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256);
+    EvOut w = cmdopen(g, &b, CMD_CUT, s);
+    putkey(&w.json, "turn");
+    putint(&w.json, turn);
+    if (files) {
+        putkey(&w.json, "files");
+        putint(&w.json, 1);
+    }
+    g->cutid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
+// Undo the latest rewind of the conversation (uncut).
+static void guiuncut(Gui *g, GuiSession *s)
+{
+    if (!s || !s->view) {
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 128);
+    EvOut w = cmdopen(g, &b, CMD_UNCUT, s);
+    g->cutid = g->nextid;
+    cmdsend(g, &w, a);
+}
+
 // Stop a background job; its end tells the agent.
 static void guijobkill(Gui *g, GuiSession *s, i64 job)
 {
@@ -5155,6 +5195,26 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         if (!ok || !jsonlen(jsonget(j, "files"))) {
             g->lasterr = clone(&g->perm, ok ? note : err);
             guilog(g, g->lasterr);
+        }
+    } return;
+
+    case CMD_CUT:
+    case CMD_UNCUT: {
+        // The rewound prompt in the box to edit, and taken out again by
+        // the undo unless edited; the records show the rest
+        g->cutid = g->cutid==id ? 0 : g->cutid;
+        GuiSession *s = q.s;
+        if (!ok) {
+            g->lasterr = clone(&g->perm, err);
+            guilog(g, g->lasterr);
+        } else if (s && q.cmd==CMD_CUT) {
+            Str next = jsonstr(jsonget(j, "next"));
+            setdraft(g, s, next);
+            s->cuttext     = clone(&g->perm, next);
+            g->promptfocus = s == g->sess;
+        } else if (s && s->cuttext.len && draftstr(s)==s->cuttext) {
+            setdraft(g, s, {});
+            s->cuttext = {};
         }
     } return;
 
@@ -10906,6 +10966,7 @@ enum : i32 {
     T_REWINDTURN,  // the latest Rewind to here
     T_REWINDOK,    // the rewind confirmation's Rewind
     T_FORCE,       // the latest rewind card's Rewind anyway
+    T_CUTUNDO,     // the rewound conversation's Undo rewind
     T_JOBKILL,     // the newest running job's Kill
     T_INFOBTN,     // the session's Info
     T_COMPACTHDR,  // the latest compaction card's header
@@ -11038,8 +11099,9 @@ enum : i32 {
     CHK_JOBKILLED,
     CHK_REWINDASK,
     CHK_UNDONE,
-    CHK_CONFLICT,
+    CHK_CUT,
     CHK_FORCED,
+    CHK_UNCUT,
     CHK_COMPACTING,
     CHK_SUMMARY,
     CHK_COMPACTOPEN,
@@ -11330,8 +11392,9 @@ static Str chknames[] = {
     "killed from the panel, the job's end brought the agent back",
     "the rewind confirmation listed the file",
     "undone: the file is gone, its row says so, a card lists it",
-    "rewinding a turn left a changed file alone, as a conflict",
+    "rewound to the prompt: its turn hidden, the prompt in the box, a changed file left alone",
     "forced, the rewind put the file back",
+    "the rewind undone: the turn shows again, the box is empty",
     "the strip showed a compaction running",
     "a summary's card with its token counts",
     "the compaction card opened to its summary",
@@ -11562,6 +11625,7 @@ enum : i32 {
     W_JOBS,       // it is idle, its first job ended, its second runs
                   // with its output at "tick 3"
     W_REWOUND,    // every rewind sent has its card
+    W_CUT,        // the rewind of the conversation, or its undo, replied
     W_COMPACTING, // it runs a summary request
     W_QUEUED,     // it waits in the endpoint's line
     W_STREAMING,  // it streams a response
@@ -11618,7 +11682,7 @@ static Str waitnames[] = {
     "every turn to end", "the session to open", "amber", "an ETA", "a retry",
     "the engine to stop", "two subagents at work", "a subagent's ask",
     "a todo item in progress", "a reply", "the jobs", "a rewind",
-    "a compaction", "the endpoint's line", "streaming", "the window to go",
+    "the conversation's rewind", "a compaction", "the endpoint's line", "streaming", "the window to go",
     "the window to come back", "a background host", "the remote host",
     "the link to drop", "the remote to close", "the output", "a file",
     "the includes", "the thumbnails", "the screenshot", "reasoning",
@@ -12693,9 +12757,10 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_REWINDOK, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 300, ""},
-    {OP_WAIT, W_REWOUND, 0, 0, 5000, ""},
-    {OP_CHECK, CHK_CONFLICT, 0, 0, 0, ""},
-    {OP_SHOT, 0, 0, 0, 300, "12-conflict"},
+    {OP_WAIT, W_CUT, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 400, ""},
+    {OP_CHECK, CHK_CUT, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "12-cut"},
     {OP_MOVE, T_FORCE, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 600, ""},
@@ -12705,6 +12770,12 @@ static DriveOp m3ops[] = {
     {OP_UP, 0, 0, 0, 300, ""},
     {OP_WAIT, W_REWOUND, 0, 0, 5000, ""},
     {OP_CHECK, CHK_FORCED, 0, 0, 0, ""},
+    {OP_MOVE, T_CUTUNDO, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CUT, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 400, ""},
+    {OP_CHECK, CHK_UNCUT, 0, 0, 0, ""},
     // The session's info: its instruction file, and a memory saved
     {OP_PROMPT, 0, 0, 0, 0, "Remember the hosts."},
     {OP_WAIT, W_SAID, 0, 0, 10000, "Remembered the hosts."},
@@ -15537,6 +15608,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_REWINDTURN:  return rectcenter(g->rects[RECT_REWINDTURN]);
     case T_REWINDOK:    return rectcenter(g->rects[RECT_REWINDOK]);
     case T_FORCE:       return rectcenter(g->rects[RECT_FORCE]);
+    case T_CUTUNDO:     return rectcenter(g->rects[RECT_CUTUNDO]);
     case T_JOBKILL:     return rectcenter(g->rects[RECT_JOBKILL]);
     case T_INFOBTN:     return rectcenter(g->rects[RECT_INFOBTN]);
     case T_COMPACTHDR:  return rectcenter(g->rects[RECT_COMPACTHDR]);
@@ -16083,6 +16155,17 @@ static ViewMsg *lastof(View *v, i32 role)
     return 0;
 }
 
+// The latest message of a role with exactly this text, or null.
+static ViewMsg *msgtext(View *v, i32 role, Str text)
+{
+    for (iz i = v->msgs.len-1; i >= 0; i--) {
+        if (v->msgs[i].role==role && trim(v->msgs[i].text)==text) {
+            return &v->msgs[i];
+        }
+    }
+    return 0;
+}
+
 // Whether every tool row the user did not choose is folded (want 1),
 // open (0), or as tools = auto says (-1).
 static b32 toolsas(View *v, i32 want)
@@ -16453,6 +16536,8 @@ static b32 drivewaitdone(Gui *g)
     }
     case W_REWOUND:
         return !g->rewindid && countrole(v, VIEW_REWIND)>=g->rewsent;
+    case W_CUT:
+        return !g->cutid;
     case W_COMPACTING:
         return g->sess && v->state==LIVE_COMPACTING;
     case W_QUEUED:
@@ -17857,13 +17942,25 @@ static b32 drivecheck(Gui *g, i32 chk)
                n && n->undone && endswith(n->path, "undo-b.txt") &&
                os_stat(g->os, a, f).type==STAT_MISSING;
     }
-    case CHK_CONFLICT: {
+    case CHK_CUT: {
         Arena    a  = g->frame;
         ViewMsg *c  = lastof(v, VIEW_REWIND);
+        ViewMsg *u  = msgtext(v, VIEW_USER, "Make undoable changes.");
         Read     rd = os_read(g->os, &a, join(&a, g->drivecwd, "undo-a.txt"), 1<<10);
-        return c && c->card->conflicts==1 && c->card->turn && c->card->latest &&
+        return c && c->card->kind=="cut" && !c->cuts && c->card->conflicts==1 &&
+               u && u->cuts && g->sess && draftstr(g->sess)=="Make undoable changes." &&
                rd.err==READ_OK && rd.data=="changed elsewhere\n" &&
-               g->rects[RECT_FORCE].x1>0;
+               g->rects[RECT_CUTUNDO].x1>0 && g->rects[RECT_FORCE].x1>0;
+    }
+    case CHK_UNCUT: {
+        ViewMsg *u = msgtext(v, VIEW_USER, "Make undoable changes.");
+        i32      n = 0;
+        for (iz i = 0; i < v->msgs.len; i++) {
+            ViewMsg *m = &v->msgs[i];
+            n += m->role==VIEW_REWIND && m->card->kind=="cut" && !m->cuts;
+        }
+        return u && !u->cuts && !n && g->sess && !draftstr(g->sess).len &&
+               !v->cuts.len && g->rects[RECT_CUTUNDO].x1==0;
     }
     case CHK_FORCED: {
         Arena    a = g->frame;

@@ -295,10 +295,25 @@ the main checkout.
 
 A tool row that changed a file has an Undo button (a curved arrow) at
 its right, which puts back the file as it was before that call, and
-every file changed after it. A message that began a turn has Rewind to
-here (a clock), which puts back every file the agent's file tools
-wrote or edited from that turn on. Both ask first. Files that commands changed are not tracked, and cannot be
-put back this way.
+every file changed after it. Files that commands changed are not
+tracked, and cannot be put back this way.
+
+Each of your prompts has Rewind to here (a clock). It takes the
+conversation back to just before that prompt, in the same session,
+and puts the prompt back in the box to edit and send again. The turns
+from there on leave the conversation, so the agent no longer sees
+them, though the session's log keeps them. The confirmation also
+offers to put back the files the agent's file tools wrote or edited
+from that turn on; a file changed since by something else is left
+alone, and the card says so, with Put back anyway... to overwrite it.
+
+A card marks the rewind, with Undo rewind, which brings the turns back
+and the files as they were before the rewind. It is offered until the
+next message is sent, also after a restart. Rewinding works only while
+the session is idle (no turn, subagent or job running), and not to a
+prompt before the latest compaction, which summarized it: there the
+clock puts back files alone, where any changed. Subagents started in
+the turns taken out stay in the sidebar.
 
 ## Import
 

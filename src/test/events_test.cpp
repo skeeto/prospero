@@ -442,6 +442,158 @@ static void testlogimport(Test *t)
 
 // Versions in order, and an engine older for an earlier version or,
 // of the same, for a feature it lacks.
+// Conversation cuts (logcuts): the ranges in force after undos, nested
+// cuts and their undo, the undo window closing as a turn begins, what a
+// cut drops from the conversation, and a fork's and an import's copies
+// of a log with a cut in it.
+static Str cutsstr(Arena *a, LogCuts *c)
+{
+    Buf b(a, 256);
+    for (iz i = 0; i < c->ranges.len; i++) {
+        print(&b, b.len ? Str(" ") : Str(""));
+        print(&b, c->ranges[i].from);
+        print(&b, "-");
+        print(&b, c->ranges[i].seq);
+        print(&b, "t");
+        print(&b, c->ranges[i].turn);
+        print(&b, "..");
+        print(&b, c->ranges[i].last);
+    }
+    print(&b, " undo=");
+    print(&b, c->undo);
+    return finish(&b);
+}
+
+static void testlogcuts(Test *t)
+{
+    Arena a       = t->perm;
+    Arena scratch = t->perm;
+    scratch.beg  += (scratch.end - scratch.beg)/2;
+    Str base[] = {
+        "{\"sid\":\"A\",\"seq\":1,\"ts\":5,\"ev\":\"session\",\"proto\":0,\"cwd\":\"/w\"}\n",
+        "{\"sid\":\"A\",\"seq\":2,\"ts\":6,\"ev\":\"user\",\"text\":\"one\"}\n",
+        "{\"sid\":\"A\",\"seq\":3,\"ts\":6,\"ev\":\"turn\",\"n\":1}\n",
+        "{\"sid\":\"A\",\"seq\":4,\"ts\":6,\"ev\":\"turn.end\",\"turn\":1,\"why\":\"done\"}\n",
+        "{\"sid\":\"A\",\"seq\":5,\"ts\":7,\"ev\":\"user\",\"text\":\"two\"}\n",
+        "{\"sid\":\"A\",\"seq\":6,\"ts\":7,\"ev\":\"turn\",\"n\":2}\n",
+        "{\"sid\":\"A\",\"seq\":7,\"ts\":7,\"ev\":\"todo\",\"items\":[]}\n",
+        "{\"sid\":\"A\",\"seq\":8,\"ts\":7,\"ev\":\"snap\",\"call\":\"c\",\"path\":\"/w/f\","
+        "\"snap\":\"snap/1\"}\n",
+        "{\"sid\":\"A\",\"seq\":9,\"ts\":7,\"ev\":\"turn.end\",\"turn\":2,\"why\":\"done\"}\n",
+        "{\"sid\":\"A\",\"seq\":10,\"ts\":8,\"ev\":\"user\",\"text\":\"three\"}\n",
+        "{\"sid\":\"A\",\"seq\":11,\"ts\":8,\"ev\":\"turn\",\"n\":3}\n",
+        "{\"sid\":\"A\",\"seq\":12,\"ts\":8,\"ev\":\"turn.end\",\"turn\":3,\"why\":\"done\"}\n",
+    };
+    struct {
+        Str name;
+        Str more[4];  // after base
+        Str want;
+    } cases[] = {
+        {"none", {}, " undo=0"},
+        {"cut", {"{\"sid\":\"A\",\"seq\":13,\"ts\":9,\"ev\":\"cut\",\"turn\":2,\"last\":3,"
+                 "\"from\":5}\n"}, "5-13t2..3 undo=13"},
+        {"undone", {"{\"sid\":\"A\",\"seq\":13,\"ts\":9,\"ev\":\"cut\",\"turn\":2,\"last\":3,"
+                    "\"from\":5}\n",
+                    "{\"sid\":\"A\",\"seq\":14,\"ts\":9,\"ev\":\"uncut\",\"cut\":13}\n"},
+         " undo=0"},
+        {"a turn after", {"{\"sid\":\"A\",\"seq\":13,\"ts\":9,\"ev\":\"cut\",\"turn\":3,"
+                          "\"last\":3,\"from\":10}\n",
+                          "{\"sid\":\"A\",\"seq\":14,\"ts\":9,\"ev\":\"turn\",\"n\":4}\n",
+                          "{\"sid\":\"A\",\"seq\":15,\"ts\":9,\"ev\":\"uncut\",\"cut\":13}\n"},
+         " undo=0"},
+        {"nested", {"{\"sid\":\"A\",\"seq\":13,\"ts\":9,\"ev\":\"cut\",\"turn\":3,"
+                    "\"last\":3,\"from\":10}\n",
+                    "{\"sid\":\"A\",\"seq\":14,\"ts\":9,\"ev\":\"cut\",\"turn\":2,"
+                    "\"last\":3,\"from\":5}\n",
+                    "{\"sid\":\"A\",\"seq\":15,\"ts\":9,\"ev\":\"uncut\",\"cut\":14}\n"},
+         "10-13t3..3 undo=13"},
+        {"nested after a turn", {"{\"sid\":\"A\",\"seq\":13,\"ts\":9,\"ev\":\"cut\",\"turn\":3,"
+                                 "\"last\":3,\"from\":10}\n",
+                                 "{\"sid\":\"A\",\"seq\":14,\"ts\":9,\"ev\":\"turn\",\"n\":4}\n",
+                                 "{\"sid\":\"A\",\"seq\":15,\"ts\":9,\"ev\":\"cut\",\"turn\":4,"
+                                 "\"last\":4,\"from\":14}\n",
+                                 "{\"sid\":\"A\",\"seq\":16,\"ts\":9,\"ev\":\"uncut\",\"cut\":15}\n"},
+         "10-13t3..3 undo=0"},
+        {"bad", {"{\"sid\":\"A\",\"seq\":13,\"ts\":9,\"ev\":\"cut\",\"turn\":2,\"from\":13}\n",
+                 "{\"sid\":\"A\",\"seq\":14,\"ts\":9,\"ev\":\"uncut\",\"cut\":7}\n"},
+         " undo=0"},
+    };
+    for (iz i = 0; i < countof(cases); i++) {
+        Slice<Str> lines = {};
+        for (iz k = 0; k < countof(base); k++) {
+            lines = push(&a, lines, base[k]);
+        }
+        for (iz k = 0; k<countof(cases[i].more) && cases[i].more[k].len; k++) {
+            lines = push(&a, lines, cases[i].more[k]);
+        }
+        LogCuts c = logcuts(&a, scratch, lines);
+        expect(t, concat(&a, "logcuts ", cases[i].name), cutsstr(&a, &c), cases[i].want);
+    }
+
+    Slice<Str> lines = {};
+    for (iz k = 0; k < countof(base); k++) {
+        lines = push(&a, lines, base[k]);
+    }
+    lines = push(&a, lines, Str("{\"sid\":\"A\",\"seq\":13,\"ts\":9,\"ev\":\"cut\",\"turn\":2,"
+                                "\"last\":3,\"from\":5}\n"));
+    lines = push(&a, lines, Str("{\"sid\":\"A\",\"seq\":14,\"ts\":9,\"ev\":\"user\",\"text\":"
+                                "\"four\"}\n"));
+    lines = push(&a, lines, Str("{\"sid\":\"A\",\"seq\":15,\"ts\":9,\"ev\":\"turn\",\"n\":4}\n"));
+    lines = push(&a, lines, Str("{\"sid\":\"A\",\"seq\":16,\"ts\":9,\"ev\":\"turn.end\","
+                                "\"turn\":4,\"why\":\"done\"}\n"));
+    LogCuts c = logcuts(&a, scratch, lines);
+    Buf     b(&a, 256);
+    for (i64 seq = 1; seq <= 16; seq++) {
+        putbyte(&b, incut(&c, seq) ? 'x' : '.');
+    }
+    for (i64 n = 1; n <= 4; n++) {
+        putbyte(&b, turncut(&c, n) ? 'X' : '-');
+    }
+    expect(t, "incut turncut", finish(&b), "....xxxxxxxx...." "-XX-");
+
+    // What a cut drops: the conversation, not the state after it
+    struct { Str line; b32 drops; } drops[] = {
+        {"{\"ev\":\"user\"}", 1}, {"{\"ev\":\"assistant\"}", 1},
+        {"{\"ev\":\"tool.end\"}", 1}, {"{\"ev\":\"todo\"}", 1},
+        {"{\"ev\":\"notice\"}", 1}, {"{\"ev\":\"turn.end\"}", 1},
+        {"{\"ev\":\"instructions\",\"why\":\"nested\"}", 1},
+        {"{\"ev\":\"instructions\",\"why\":\"start\"}", 0},
+        {"{\"ev\":\"memory\",\"why\":\"start\"}", 0},
+        {"{\"ev\":\"turn\"}", 0}, {"{\"ev\":\"snap\"}", 0}, {"{\"ev\":\"rewind\"}", 0},
+        {"{\"ev\":\"model\"}", 0}, {"{\"ev\":\"mode\"}", 0}, {"{\"ev\":\"grant\"}", 0},
+        {"{\"ev\":\"title\"}", 0}, {"{\"ev\":\"job.end\"}", 0},
+    };
+    for (iz i = 0; i < countof(drops); i++) {
+        EvRec r = evparse(&a, drops[i].line);
+        expect(t, concat(&a, "cutdrops ", drops[i].line), istr(&a, cutdrops(r.ev, r.root)),
+               istr(&a, drops[i].drops));
+    }
+    expect(t, "lineev", concat(&a, lineev(lines[12]), lineev(lines[14])), "cutturn");
+
+    // A fork: never after a turn cut, and before the prompt after the
+    // cut, that prompt next; an import, without what was cut
+    struct { i64 turn; Str want; } forks[] = {
+        {1, "1 2 3 4 5 next=four"},
+        {2, "!turn 2 was rewound out of the conversation"},
+        {3, "!turn 3 was rewound out of the conversation"},
+        {4, "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 next="},
+    };
+    for (iz i = 0; i < countof(forks); i++) {
+        LogCopy r = logcopy(&a, scratch, lines, "A", "B", {}, {}, forks[i].turn, 100, 0);
+        Str     got = r.err.len ? concat(&a, "!", r.err)
+                                : concat(&a, logseqs(&a, r.log), concat(&a, " next=", r.next));
+        expect(t, concat(&a, "logcopy cut ", istr(&a, forks[i].turn)), got, forks[i].want);
+    }
+    Buf whole(&a, 4096);
+    for (iz i = 0; i < lines.len; i++) {
+        print(&whole, lines[i]);
+    }
+    LogImport r = logimport(&a, scratch, finish(&whole), "B", "/here", "mm", "http://e/",
+                            {}, 100);
+    expect(t, "logimport cut", r.err.len ? r.err : logseqs(&a, r.log),
+           "1 2 3 4 14 15 16 17");
+}
+
 static void testolder(Test *t)
 {
     Arena a = t->perm;
@@ -486,9 +638,9 @@ static void test_events(Test *t)
                "session title user turn attempt assistant tool.start "
                "tool.end ask answer retry nudge turn.end note compact job.start "
                "job.end todo snap rewind instructions notice prefix model grant mode "
-               "task.host task.report memory shell ask.deadline ");
+               "task.host task.report memory shell ask.deadline cut uncut ");
         expect(t, "synced events", finish(&sync),
-               "tool.start ask answer turn.end rewind task.report ");
+               "tool.start ask answer turn.end rewind task.report cut uncut ");
         expect(t, "unknown event", istr(a, evfind("tool")), istr(a, EV_NONE));
         expect(t, "empty event", istr(a, evfind("")), istr(a, EV_NONE));
         for (i32 cmd = 1; cmd < CMD_COUNT; cmd++) {
@@ -515,14 +667,16 @@ static void test_events(Test *t)
                "\"import\",\"skills\",\"mode\",\"unqueue\",\"dir\",\"background\",\"models\","
                "\"mcp\",\"mcp.auth\",\"mcp.code\",\"mcp.logout\",\"mcp.restart\",\"shell\",\"shells\","
                "\"git\",\"trash\",\"trash.empty\",\"relay.offer\",\"relay.data\","
-               "\"relay.more\",\"relay.peer\",\"relay.call\",\"offer\",\"ask.touch\",\"shell.env\",\"call.stop\"],"
+               "\"relay.more\",\"relay.peer\",\"relay.call\",\"offer\",\"ask.touch\",\"shell.env\",\"call.stop\","
+               "\"cut\",\"uncut\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","
                "\"compact\",\"model\",\"gauge\",\"answer.always\",\"scratch\","
                "\"delete\",\"fork\",\"config.delete\",\"import\","
                "\"answer.always.desktop\",\"skills\",\"plan\",\"queue\",\"message\",\"images\",\"home\",\"bypass\",\"nofolder\",\"dir\",\"config.create\",\"side\",\"background\",\"mcp\",\"models\",\"mcp.auth\",\"task.remote\",\"task.host\",\"memory\",\"shell\","
                "\"git\",\"answer.trust\",\"web\",\"question\",\"files\",\"worktree\",\"worktree.side\","
-               "\"trash\",\"relay\",\"question.deadline\",\"shell.env\",\"call.stop\"]}");
+               "\"trash\",\"relay\",\"question.deadline\",\"shell.env\",\"call.stop\","
+               "\"cut\"]}");
         b.len = 0;
         w = {&b};
         putobject(&w);
@@ -1057,7 +1211,7 @@ static void test_events(Test *t)
                "tool.start=1 tool.end=0 ask=1 answer=1 retry=0 nudge=0 "
                "turn.end=1 note=0 compact=0 job.start=0 job.end=0 todo=0 snap=0 "
                "rewind=1 instructions=0 notice=0 prefix=0 model=0 grant=0 mode=0 "
-               "task.host=0 task.report=1 memory=0 shell=0 ask.deadline=0 ");
+               "task.host=0 task.report=1 memory=0 shell=0 ask.deadline=0 cut=1 uncut=1 ");
         logclose(&log);
 
         Str start = "{\"sid\":\"s13\",\"seq\":1,\"ts\":0,\"ev\":\"tool.start\",\"call\":\"a\"}\n";
@@ -1104,5 +1258,6 @@ static void test_events(Test *t)
     testlogside(t);
     testlogwt(t);
     testlogimport(t);
+    testlogcuts(t);
     testolder(t);
 }
