@@ -930,6 +930,31 @@ static void test_viewpanels(Test *t)
         expect(t, "panels.jobnone", istr(&a, v->jobsrun), "0");
     }
 
+    // A GUI's jobs: output held until shown, the latest of it, then
+    // all of it at the job's end
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        v->holdjobs = 1;
+        apply(v, a, R"({"sid":"s","seq":1,"ts":1000,"ev":"job.start","job":1,"call":"c1",)"
+                    R"("command":"loop","spill":"out/c1.log","deadline":9000})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"job.out","job":1,"call":"c1","tail":"a\n","bytes":2})");
+        viewjobsshow(v);
+        b32 out = apply(v, a, R"({"sid":"s","ts":0,"ev":"job.out","job":1,"call":"c1","tail":"a\nb\n","bytes":4})");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"job.out","job":1,"call":"c1","tail":"a\nb\nc\n","bytes":6})");
+        ViewJob *j = findjob(v, 1);
+        expect(t, "panels.jobheld", concat(&a, concat(&a, istr(&a, out), Str{j->tail, j->taillen}),
+                                           concat(&a, istr(&a, j->bytes), jobnewest(j))),
+               "1a\n2a\nb\nc\n");
+        viewjobsshow(v);
+        expect(t, "panels.jobshow", concat(&a, Str{j->tail, j->taillen}, istr(&a, j->bytes)), "a\nb\nc\n6");
+        apply(v, a, R"({"sid":"s","ts":0,"ev":"job.out","job":1,"call":"c1","tail":"a\nb\nc\nd\n","bytes":8})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"job.end","job":1,"call":"c1","status":"exited",)"
+                    R"("exit":0,"spill":"out/c1.log","ms":50})");
+        expect(t, "panels.jobheldend", concat(&a, Str{j->tail, j->taillen}, istr(&a, j->bytes + j->hasheld)),
+               "a\nb\nc\nd\n8");
+    }
+
     // Snapshots and rewinds: the files a rewind would put back, by call
     // and by turn, then a rewind's card, its conflicts, and the undone
     {

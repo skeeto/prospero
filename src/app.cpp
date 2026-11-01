@@ -1121,6 +1121,8 @@ struct Gui {
     b32                gitpane;      // and the Changes pane showed
     b32                branchcut;    // the session bar's branch was cut short
     b32                jobsdirty;    // job output it has not shown
+    b32                jobsdue;      // and this frame shows it
+    View              *jobsview;     // whose jobs it drew last frame
     i64                lastjobs;     // when it last showed new output
     Arena              pendmem;    // deltas held back until a content frame
     byte              *pendbase;
@@ -1750,6 +1752,9 @@ static View *sessview(Gui *g, GuiSession *s)
             s->view->dir = sessdir(g, &g->perm, s->sid);
         }
         s->view->loose = s->host->kind != GH_ENGINE;  // as an open's reply says
+        // Job output waits for the Jobs pane's next frame that shows it,
+        // so that the frames which settle it, however late, match
+        s->view->holdjobs = 1;
         viewthink(s->view, g->thinkset);
         viewtools(s->view, g->toolset);
     }
@@ -10248,7 +10253,11 @@ static void gui_frame(Gui *g)
         flushdeltas(g);
         g->lastcontent = s->now;
     }
-    if (g->jobsdirty) {
+    // Not every frame with job output waiting: one a settling frame came
+    // late for (App Nap), if it showed it, would owe another, and so on
+    // for as long as the job prints
+    g->jobsdue = g->jobsdirty && s->now-g->lastjobs>=JOBS_PERIOD;
+    if (g->jobsdue) {
         g->jobsdirty = 0;  // this frame shows it
         g->lastjobs  = s->now;
     }
@@ -10319,6 +10328,9 @@ static void gui_frame(Gui *g)
     }
     if (g->pending.len) {
         schedat(s, g->lastcontent+STREAM_PERIOD, DUE_STREAM);
+    }
+    if (g->jobsdirty) {
+        schedat(s, g->lastjobs+JOBS_PERIOD, DUE_STREAM);
     }
     g->benchsave = 0;
     if (io.WantSaveIniSettings) {
@@ -16396,7 +16408,7 @@ static b32 drivewaitdone(Gui *g)
         // The first may end after the turn, which then resumes for it
         ViewJob *a = findjob(v, 1), *b = findjob(v, 2);
         return g->sess && !v->busy && a && a->status!=VJOB_RUNNING && b &&
-               b->status==VJOB_RUNNING && find({b->tail, b->taillen}, "tick 3")>=0;
+               b->status==VJOB_RUNNING && find(jobnewest(b), "tick 3")>=0;
     }
     case W_REWOUND:
         return !g->rewindid && countrole(v, VIEW_REWIND)>=g->rewsent;

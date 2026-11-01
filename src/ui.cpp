@@ -7691,6 +7691,12 @@ static void drawjobs(Gui *g)
 {
     View *v = g->view;
     g->jobsshown = 0;
+    // Output held back since this pane last showed it: a few times a
+    // second at most (JOBS_PERIOD), or at once, new to this view's jobs
+    if (g->jobsdue || g->jobsview!=v) {
+        viewjobsshow(v);
+    }
+    g->jobsview = v;
     if (!g->sess || !v->jobs.len) {
         ImGui::PushTextWrapPos(0);
         ImGui::TextDisabled("No background jobs. Commands the agent runs in the "
@@ -11929,6 +11935,9 @@ static void dockwindows(Gui *g)
             drawjobs(g);
         }
         ImGui::End();
+    }
+    if (!g->jobsvisible) {
+        g->jobsview = 0;  // what it shows next is all new to it
     }
     if (show[PANE_LOG]) {
         if (beginpane(g, PANE_LOG)) {

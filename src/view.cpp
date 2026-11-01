@@ -335,6 +335,11 @@ struct ViewJob {
     u8  *tail;      // the latest output, a buffer reused for each job.out
     iz   taillen;
     iz   tailcap;
+    u8  *held;      // with holdjobs, a newer job.out's, until viewjobsshow:
+    iz   heldlen;   // the two buffers trade places then
+    iz   heldcap;
+    i64  heldbytes;
+    b32  hasheld;
     b32  killing;   // a kill was asked for
 };
 
@@ -556,6 +561,7 @@ struct View {
     Slice<ViewQueued> queue;    // the latest queue record's
     Slice<ViewJob>   jobs;      // by number
     i32              jobsrun;   // running
+    b32              holdjobs;  // job.out waits in held, for viewjobsshow
     Slice<ViewSnap>  snaps;     // in order
     Slice<ViewInstr> instr;     // instruction files, by path
     Slice<Str>       skipped;   // instruction files not loaded
@@ -1521,14 +1527,50 @@ static ViewJob *findjob(View *v, i64 n)
 }
 
 // A job's output's end, in a buffer of its own kept for the updates.
+static void tailput(View *v, u8 **buf, iz *len, iz *cap, Str tail)
+{
+    if (tail.len > *cap) {
+        *cap = tail.len>4096 ? tail.len : 4096;
+        *buf = allocbytes(&v->aux, *cap);
+    }
+    copybytes(*buf, tail.data, tail.len);
+    *len = tail.len;
+}
+
 static void jobtailput(View *v, ViewJob *jb, Str tail)
 {
-    if (tail.len > jb->tailcap) {
-        jb->tailcap = tail.len>4096 ? tail.len : 4096;
-        jb->tail    = allocbytes(&v->aux, jb->tailcap);
+    tailput(v, &jb->tail, &jb->taillen, &jb->tailcap, tail);
+}
+
+// The held output in place of the shown, the buffers traded.
+static void jobshow(ViewJob *jb)
+{
+    if (jb->hasheld) {
+        u8 *buf = jb->tail;
+        iz  cap = jb->tailcap;
+        jb->tail    = jb->held;
+        jb->taillen = jb->heldlen;
+        jb->tailcap = jb->heldcap;
+        jb->bytes   = jb->heldbytes;
+        jb->held    = buf;
+        jb->heldcap = cap;
+        jb->hasheld = 0;
     }
-    copybytes(jb->tail, tail.data, tail.len);
-    jb->taillen = tail.len;
+}
+
+// Show the output held back since the last call (holdjobs): a GUI draws
+// it a few times a second at most, and frames between show the same.
+static void viewjobsshow(View *v)
+{
+    for (iz i = 0; i < v->jobs.len; i++) {
+        jobshow(&v->jobs[i]);
+    }
+}
+
+// A job's latest output, shown or held.
+static Str jobnewest(ViewJob *jb)
+{
+    return jb->hasheld ? Str{jb->held, jb->heldlen} : Str{jb->tail, jb->taillen};
 }
 
 static i32 vjobstatus(Str s)
@@ -2436,8 +2478,16 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         if (!jb || jb->status!=VJOB_RUNNING) {
             return 0;  // ended already
         }
-        jobtailput(v, jb, jsonstr(jsonget(j, "tail")));
-        jb->bytes = jsonint(jsonget(j, "bytes"), jb->bytes);
+        Str tail  = jsonstr(jsonget(j, "tail"));
+        i64 bytes = jsonint(jsonget(j, "bytes"), jb->hasheld ? jb->heldbytes : jb->bytes);
+        if (v->holdjobs) {
+            tailput(v, &jb->held, &jb->heldlen, &jb->heldcap, tail);
+            jb->heldbytes = bytes;
+            jb->hasheld   = 1;
+        } else {
+            jobtailput(v, jb, tail);
+            jb->bytes = bytes;
+        }
     } return 1;
 
     case EV_JOBEND: {
@@ -2452,6 +2502,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         } else if (jb->status == VJOB_RUNNING) {
             v->jobsrun--;
         }
+        jobshow(jb);  // all of it now, under what the end brings
         Json *ex = jsonget(j, "exit");
         jb->status  = vjobstatus(jsonstr(jsonget(j, "status")));
         jb->hasexit = ex->type == JSON_NUMBER;
