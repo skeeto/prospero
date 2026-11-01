@@ -183,6 +183,8 @@ cannot choose what runs, so these are ignored in one:
   also in View → Theme.
 - **`[ui] thinking`** and **`[ui] tools`**: whether reasoning and tool
   output show folded or open in the transcript.
+- **`[ui] count`**: whether folded reasoning's line counts `words` (the
+  default) or `characters` as it streams.
 - **`[guard]`**: see [Permissions and asks](help:permissions).
 - **`[instructions]`** and **`[skills]`**: see
   [Instructions and skills](help:instructions).

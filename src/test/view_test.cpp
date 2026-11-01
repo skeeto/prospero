@@ -1445,7 +1445,8 @@ static void test_viewpanels(Test *t)
 }
 
 // Reasoning as each message has it: f folded, o open or h hidden, then
-// * if the user chose, ~ if provisional, its count and its seconds.
+// * if the user chose, ~ if provisional, its characters/words and its
+// seconds.
 static Str thinkshow(Arena *a, View *v)
 {
     Buf b(a, 128);
@@ -1459,11 +1460,73 @@ static Str thinkshow(Arena *a, View *v)
         if (m->prov)   putbyte(&b, '~');
         putbyte(&b, ' ');
         print(&b, m->chars);
+        putbyte(&b, '/');
+        print(&b, m->words);
         putbyte(&b, ' ');
         print(&b, (m->ts1 - m->ts0)/1000);
         putbyte(&b, ';');
     }
     return finish(&b);
+}
+
+// Words counted delta by delta, as reasoning streams, against the count
+// of the whole text at once, as a loaded session has it.
+static void test_viewwords(Test *t)
+{
+    Arena perm = t->perm;
+    struct {
+        Str  name;
+        Str  parts[4];
+        i64  want;
+    } tests[] = {
+        {"empty",    {""}, 0},
+        {"one",      {"word"}, 1},
+        {"split",    {"wo", "rd"}, 1},
+        {"splits",   {"a", "b", "c", "d"}, 1},
+        {"between",  {"one", " ", "two"}, 2},
+        {"spaceend", {"one ", "two"}, 2},
+        {"spacebeg", {"one", " two"}, 2},
+        {"leading",  {"  \n one"}, 1},
+        {"trailing", {"one two  ", " \n"}, 2},
+        {"blank",    {" ", "\t", "\n"}, 0},
+        {"lines",    {"one\ntwo\r\nthree"}, 3},
+        {"tabs",     {"one\ttwo\t", "\tthree"}, 3},
+        {"utf8",     {"caf\xc3\xa9 na\xc3\xafve"}, 2},
+        {"utf8split",{"caf\xc3", "\xa9 \xe6\x97", "\xa5\xe6\x9c\xac"}, 2},
+        {"cjk",      {"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e"}, 1},
+    };
+    for (iz i = 0; i < countof(tests); i++) {
+        Arena a      = perm;
+        Str   whole  = {};
+        b32   inword = 0;
+        i64   n      = 0;
+        for (iz j = 0; j < countof(tests[i].parts); j++) {
+            n    += countwords(tests[i].parts[j], &inword);
+            whole = concat(&a, whole, tests[i].parts[j]);
+        }
+        b32 inall = 0;
+        Str name  = concat(&a, "words.", tests[i].name);
+        expect(t, name, istr(&a, n), istr(&a, tests[i].want));
+        expect(t, concat(&a, name, ".whole"), istr(&a, countwords(whole, &inall)),
+               istr(&a, tests[i].want));
+    }
+
+    // Through the view: a word split across deltas counts once, and the
+    // commit, counted from its whole text, agrees
+    {
+        Arena a = perm;
+        View *v = testview(&a);
+        apply(v, a, R"({"sid":"s","seq":1,"ts":0,"ev":"user","text":"hi"})");
+        apply(v, a, R"({"sid":"s","seq":2,"ts":0,"ev":"turn","n":1})");
+        apply(v, a, R"({"sid":"s","seq":3,"ts":0,"ev":"attempt","turn":1,"n":1})");
+        apply(v, a, R"({"sid":"s","ts":1000,"ev":"delta","turn":1,"attempt":1,"kind":"think","text":" Weig"})");
+        apply(v, a, R"({"sid":"s","ts":1000,"ev":"delta","turn":1,"attempt":1,"kind":"think","text":"hing it"})");
+        apply(v, a, R"({"sid":"s","ts":1000,"ev":"delta","turn":1,"attempt":1,"kind":"think","text":"\n\tup. "})");
+        expect(t, "words.streamed", thinkshow(&a, v), "f~ 18/3 0;");
+        apply(v, a, R"({"sid":"s","seq":4,"ts":2000,"ev":"assistant","turn":1,"attempt":1,)"
+                    R"("blocks":[{"t":"think","text":" Weighing it\n\tup. "},{"t":"text","text":"Hi"}]})");
+        expect(t, "words.committed", thinkshow(&a, v), "f 18/3 0;");
+    }
 }
 
 static void test_viewthinking(Test *t)
@@ -1482,9 +1545,9 @@ static void test_viewthinking(Test *t)
     // (fold), open throughout (open), or hidden (hide); counted in code
     // points, and timed from the first delta to the last
     Str want[][2] = {
-        {"f~ 11 3;", "f 11 3;"},
-        {"o~ 11 3;", "o 11 3;"},
-        {"h~ 11 3;", "h 11 3;"},
+        {"f~ 11/3 3;", "f 11/3 3;"},
+        {"o~ 11/3 3;", "o 11/3 3;"},
+        {"h~ 11/3 3;", "h 11/3 3;"},
     };
     for (i32 mode = 0; mode < THINK_COUNT; mode++) {
         Arena a = perm;
@@ -1514,20 +1577,20 @@ static void test_viewthinking(Test *t)
         apply(v, a, d1);
         togglemsg(v, 1);
         apply(v, a, d2);
-        expect(t, "thinking.opened", thinkshow(&a, v), "o*~ 11 3;");
+        expect(t, "thinking.opened", thinkshow(&a, v), "o*~ 11/3 3;");
         apply(v, a, d3);
         apply(v, a, done);
-        expect(t, "thinking.keptopen", thinkshow(&a, v), "o* 11 3;");
+        expect(t, "thinking.keptopen", thinkshow(&a, v), "o* 11/3 3;");
         viewthink(v, THINK_HIDE);
-        expect(t, "thinking.hidden", thinkshow(&a, v), "h* 11 3;");
+        expect(t, "thinking.hidden", thinkshow(&a, v), "h* 11/3 3;");
         viewthink(v, THINK_FOLD);
-        expect(t, "thinking.backopen", thinkshow(&a, v), "o* 11 3;");
+        expect(t, "thinking.backopen", thinkshow(&a, v), "o* 11/3 3;");
         // Closed by the user under open, it stays closed
         viewthink(v, THINK_OPEN);
         togglemsg(v, 1);
         viewthink(v, THINK_FOLD);
         viewthink(v, THINK_OPEN);
-        expect(t, "thinking.keptclosed", thinkshow(&a, v), "f* 11 3;");
+        expect(t, "thinking.keptclosed", thinkshow(&a, v), "f* 11/3 3;");
     }
 
     // A response's reasoning in two parts, the second opened: the commit
@@ -1542,15 +1605,15 @@ static void test_viewthinking(Test *t)
         apply(v, a, R"({"sid":"s","ts":2000,"ev":"delta","turn":1,"attempt":1,"kind":"args","block":1,"id":"c1","name":"read","text":"{}"})");
         apply(v, a, R"({"sid":"s","ts":3000,"ev":"delta","turn":1,"attempt":1,"kind":"think","text":"two"})");
         togglemsg(v, 3);
-        expect(t, "thinking.two", thinkshow(&a, v), "f~ 3 0;o*~ 3 0;");
+        expect(t, "thinking.two", thinkshow(&a, v), "f~ 3/1 0;o*~ 3/1 0;");
         apply(v, a, R"({"sid":"s","ts":5000,"ev":"snapshot","turn":1,"attempt":1,"blocks":[)"
                     R"({"block":0,"kind":"think","text":"one"},{"block":1,"kind":"args","id":"c1","name":"read","text":"{}"},)"
                     R"({"block":2,"kind":"think","text":"two!"}]})");
-        expect(t, "thinking.snapshot", thinkshow(&a, v), "f~ 3 0;o*~ 4 0;");
+        expect(t, "thinking.snapshot", thinkshow(&a, v), "f~ 3/1 0;o*~ 4/1 0;");
         apply(v, a, R"({"sid":"s","seq":4,"ts":6000,"ev":"assistant","turn":1,"attempt":1,"blocks":[)"
                     R"({"t":"think","text":"one"},{"t":"call","id":"c1","name":"read","args":"{}"},)"
                     R"({"t":"think","text":"two!"}]})");
-        expect(t, "thinking.twocommitted", thinkshow(&a, v), "f 3 0;o* 4 0;");
+        expect(t, "thinking.twocommitted", thinkshow(&a, v), "f 3/1 0;o* 4/1 0;");
     }
 
     // Hidden, reasoning takes no space and is never the message at a

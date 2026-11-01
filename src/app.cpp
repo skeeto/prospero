@@ -50,7 +50,8 @@
 // "system" follows what the platform reports (gui_systheme). [ui]
 // thinking, how reasoning shows, and [ui] tools, how tool rows fold,
 // come the same ways and apply to every session's view at once
-// (setthinking, settools). [ui] font_size sets the
+// (setthinking, settools). [ui] count, what folded reasoning counts,
+// applies the same way (setcount). [ui] font_size sets the
 // text's size, which the View menu's zoom scales for this run only
 // (setzoom), both applied between frames (fontsize). The layout
 // file is written by a thread of its own (Saver), since a write that is
@@ -1078,6 +1079,7 @@ struct Gui {
     i32                themeset;   // THEME_*, from [ui] theme
     i32                thinkset;   // THINK_*, from [ui] thinking
     i32                toolset;    // TOOLS_*, from [ui] tools
+    i32                countset;   // COUNT_*, from [ui] count
     b32                sysdark;    // the system prefers dark
     b32                syshas;     // the platform said so once
     b32                titleok;    // the window's frame follows the theme
@@ -1559,9 +1561,9 @@ struct Gui {
     i32                thumbsdrawn;  // thumbnails drawn with their image
     i32                userthumbs;   // of them a user's attached images
     i32                thinkrows;    // reasoning headers the transcript drew
-    i64                thinkchars;   // the latest one's count, -1 if none
+    i64                thinkcount;   // the latest one's count, -1 if none
     i64                thinksecs;    // and its clock while it streams, else -1
-    i64                thinkchars0;  // as a check last saw them
+    i64                thinkcount0;  // as a check last saw them
     i64                thinksecs0;
     b32                thinkhidshown; // the strip said reasoning is hidden
     b32                copiedshown;  // a code block's button said Copied
@@ -3968,6 +3970,7 @@ static void startquit(Gui *g)
 
 static void settheme(Gui *, i32);
 static void setthinking(Gui *, i32);
+static void setcount(Gui *, i32);
 static void settools(Gui *, i32);
 static void setfontbase(Gui *, Str);
 
@@ -4055,6 +4058,8 @@ static void loadcfg(Gui *g, Str line)
             setthinking(g, thinkparse(r.value));
         } else if (r.kind=="ui" && r.key=="tools") {
             settools(g, toolsparse(r.value));
+        } else if (r.kind=="ui" && r.key=="count") {
+            setcount(g, countparse(r.value));
         } else if (r.kind=="ui" && r.key=="font_size") {
             setfontbase(g, r.value);
         } else if (r.kind=="ui" && r.key=="editor") {
@@ -16255,7 +16260,7 @@ static b32 drivewaitdone(Gui *g)
     case W_STREAMING:
         return g->sess && v->state==LIVE_STREAMING && v->deltas>0;
     case W_THINKING:
-        return g->sess && thinking(v) && (v->thinking==THINK_HIDE || g->thinkchars>0);
+        return g->sess && thinking(v) && (v->thinking==THINK_HIDE || g->thinkcount>0);
     case W_THINKSTALL:
         return g->sess && thinking(v) && os_time(g->os)-v->lastdata>=700;
     case W_TURNS:
@@ -16801,17 +16806,19 @@ static b32 drivecheck(Gui *g, i32 chk)
         // One header line, its count and clock as last drawn
         ViewMsg *m   = lastthink(v);
         b32      ok  = m && m->prov && m->collapsed && thinking(v) && g->thinkrows>0 &&
-                       g->thinkchars==m->chars && g->thinksecs>=0;
-        b32      grew = g->thinkchars > g->thinkchars0;
+                       g->thinkcount==thinkcount(g, m) && g->thinksecs>=0;
+        b32      grew = g->thinkcount > g->thinkcount0;
         Arena    a   = g->frame;
         Buf      b(&a, 96);
         print(&b, "drive: reasoning folded: ");
-        print(&b, g->thinkchars);
-        print(&b, " characters, ");
+        print(&b, g->thinkcount);
+        putbyte(&b, ' ');
+        print(&b, countnames[g->countset]);
+        print(&b, ", ");
         print(&b, g->thinksecs);
         print(&b, " s");
         guilog(g, finish(&b));
-        g->thinkchars0 = g->thinkchars;
+        g->thinkcount0 = g->thinkcount;
         g->thinksecs0  = g->thinksecs;
         return ok && (chk==CHK_THINKFOLD || grew);
     }
@@ -19068,7 +19075,7 @@ static void drivestep(Gui *g)
         break;
     case OP_THINKING:
         setthinking(g, (i32)op->dx);
-        g->thinkchars0 = g->thinksecs0 = -1;
+        g->thinkcount0 = g->thinksecs0 = -1;
         break;
     case OP_TRAY:
         e.kind = GEV_TRAY;
@@ -19513,6 +19520,8 @@ static void readconfig(Gui *g, Arena scratch)
     g->thinkset = think<0 ? THINK_FOLD : think;
     i32 tools = toolsparse(cfgget(cfg, "ui", "", "tools", 0));
     g->toolset = tools<0 ? TOOLS_AUTO : tools;
+    i32 count = countparse(cfgget(cfg, "ui", "", "count", 0));
+    g->countset = count<0 ? COUNT_WORDS : count;
     setfontbase(g, cfgget(cfg, "ui", "", "font_size", 0));
     g->editor     = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
     g->terminal   = clone(&g->perm, cfgget(cfg, "ui", "", "terminal", 0));

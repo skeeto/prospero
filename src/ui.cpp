@@ -500,6 +500,25 @@ static void setthinking(Gui *g, i32 mode)
     }
 }
 
+// A reasoning message's count in the unit [ui] count picks.
+static i64 thinkcount(Gui *g, ViewMsg *m)
+{
+    return g->countset==COUNT_CHARS ? m->chars : m->words;
+}
+
+// Count folded reasoning as [ui] count says: COUNT_*, or -1 for an
+// unknown name, which means words. Each message keeps both counts, so
+// it shows at once with nothing recounted.
+static void setcount(Gui *g, i32 unit)
+{
+    unit = unit<0 ? COUNT_WORDS : unit;
+    if (g->countset != unit) {
+        g->countset = unit;
+        g->woke |= WOKE_FORCE;
+        schedforce(&g->sched);
+    }
+}
+
 // Fold tool rows as [ui] tools says: TOOLS_*, or -1 for an unknown name,
 // which means auto. Every view at once, in one frame.
 static void settools(Gui *g, i32 mode)
@@ -1184,6 +1203,7 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         // Streaming, its size and a clock; once done, how long it took,
         // if seen. The clock counts the turn clock's seconds since it
         // began, so that both tick on the strip's one deadline a second.
+        i64 n    = thinkcount(g, m);
         b32 live = v->busy && v->stream>=0 && &v->msgs[v->stream]==m &&
                    v->streamkind==VIEW_THINK && !m->faded;
         i64 secs = -1;
@@ -1201,15 +1221,19 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
         if (m->collapsed || live) {
             Buf b(&a, 64);
             print(&b, "  ");
-            printcount(&b, m->chars);
-            print(&b, m->chars==1 ? Str(" character") : Str(" characters"));
+            printcount(&b, n);
+            if (g->countset == COUNT_CHARS) {
+                print(&b, n==1 ? Str(" character") : Str(" characters"));
+            } else {
+                print(&b, n==1 ? Str(" word") : Str(" words"));
+            }
             if (secs >= 0) {
                 print(&b, ", ");
                 print(&b, secstext(&a, secs));
             }
             pen(p, finish(&b), 0, dim);
         }
-        g->thinkchars = m->chars;
+        g->thinkcount = n;
         g->thinksecs  = live ? secs : -1;
     } break;
     case VIEW_ASK: {
@@ -4329,7 +4353,7 @@ static void drawtranscript(Gui *g)
         g->rects[latest[i]] = {};  // the latest drawn, or none
     }
     g->thinkrows  = 0;
-    g->thinkchars = -1;
+    g->thinkcount = -1;
     g->thinksecs  = -1;
     g->rects[RECT_MSGLINK]   = {};
     g->rects[RECT_CODEBLOCK] = {};
@@ -9364,7 +9388,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
     ImGui::PushID(r);
     if (r->choices.len) {
         // A pick goes out at once; the theme and how reasoning shows
-        // apply even before the file has them
+        // and counts apply even before the file has them
         b32    theme = r->kind=="ui" && r->key=="theme";
         ImVec2 at    = ImGui::GetCursorScreenPos();
         Str    pick  = {};
@@ -9391,6 +9415,8 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
                 setthinking(g, thinkparse(pick));
             } else if (r->kind=="ui" && r->key=="tools") {
                 settools(g, toolsparse(pick));
+            } else if (r->kind=="ui" && r->key=="count") {
+                setcount(g, countparse(pick));
             }
             r->sent    = 1;
             r->sentval = clone(&g->cfgmem, pick);

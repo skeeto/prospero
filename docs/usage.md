@@ -18,10 +18,11 @@ subagents under their parents; the transcript, with markdown (your
 messages too, each line break kept as typed), code highlighting and
 selection; tool calls with Undo, and Rewind to any
 message that began a turn; the todo list and background jobs; and the
-prompt. The model's reasoning folds to one line that counts it as it
-streams, which a click opens; `[ui] thinking = open` shows it whole, and
-`hide` leaves it out of the transcript (the session log keeps it, and the
-model still gets it back). Tool rows fold by kind and outcome, or all of
+prompt. The model's reasoning folds to one line that counts its words as
+it streams (`[ui] count = characters` counts those instead), which a
+click opens; `[ui] thinking = open` shows it whole, and `hide` leaves it
+out of the transcript (the session log keeps it, and the model still
+gets it back). Tool rows fold by kind and outcome, or all of
 them with `[ui] tools = fold` or `open`, and a session's Tool output and
 Reasoning buttons (a wrench and screwdriver, a light bulb, above the
 transcript) open everything for that session alone. Cmd/Ctrl+F finds text

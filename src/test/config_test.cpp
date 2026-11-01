@@ -1066,6 +1066,7 @@ static void testcfgjson(Test *t)
         "sessions//trash_days=30*\n"
         "ui//theme=system*\n"
         "ui//thinking=fold*\n"
+        "ui//count=words*\n"
         "ui//tools=auto*\n"
         "ui//font_size=17*\n"
         "ui//editor=*\n"

@@ -212,11 +212,32 @@ enum : i32 {
 static Str thinknames[] = {"fold", "open", "hide"};
 static_assert(countof(thinknames) == THINK_COUNT);
 
+// What folded reasoning counts as it streams ([ui] count)
+enum : i32 {
+    COUNT_WORDS,
+    COUNT_CHARS,
+    COUNT_COUNT,
+};
+
+static Str countnames[] = {"words", "characters"};
+static_assert(countof(countnames) == COUNT_COUNT);
+
 // The setting's value from its name, or -1 if it names none.
 static i32 thinkparse(Str s)
 {
     for (i32 i = 0; i < THINK_COUNT; i++) {
         if (thinknames[i] == s) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// The setting's value from its name, or -1 if it names none.
+static i32 countparse(Str s)
+{
+    for (i32 i = 0; i < COUNT_COUNT; i++) {
+        if (countnames[i] == s) {
             return i;
         }
     }
@@ -406,6 +427,8 @@ struct ViewMsg {
     b32       md;         // markdown, not plain text
     i32       startsturn; // the turn this message began, 0 if none
     i64       chars;      // reasoning: code points in its text
+    i64       words;      //   and words, both kept as it streams
+    b32       inword;     //   whether its text so far ends in a word
     i64       ts0;        // reasoning: its first and last deltas, epoch
     i64       ts1;        //   ms, or 0 where it did not stream
     i64       ts;         // the user's taken in, the agent's finished:
@@ -655,6 +678,23 @@ static i64 countchars(Str s)
     return n;
 }
 
+// Words in s, which continues text that ended in a word if *inword: the
+// starts of runs of non-whitespace, so a word split across deltas counts
+// once. Whitespace is ASCII's; UTF-8's other bytes are all word bytes.
+static i64 countwords(Str s, b32 *inword)
+{
+    i64 n  = 0;
+    b32 in = *inword;
+    for (iz i = 0; i < s.len; i++) {
+        u8  c     = s[i];
+        b32 space = c==' ' || (c>='\t' && c<='\r');
+        n  += !space && !in;
+        in  = !space;
+    }
+    *inword = in;
+    return n;
+}
+
 // Whether reasoning not chosen open or closed starts folded.
 static b32 thinkfolded(View *v)
 {
@@ -730,6 +770,7 @@ static i32 addmsg(View *v, i32 role, Str text)
     m.md   = role == VIEW_ASSISTANT;
     if (role == VIEW_THINK) {
         m.chars     = countchars(text);
+        m.words     = countwords(text, &m.inword);
         m.collapsed = thinkfolded(v);
     }
     v->msgs = push(&v->meta, v->msgs, m);
@@ -834,6 +875,7 @@ static void viewdelta(View *v, i32 role, Str text, i64 ts)
     m->nl  += countnl(text);
     if (role == VIEW_THINK) {
         m->chars += countchars(text);
+        m->words += countwords(text, &m->inword);
         m->ts0    = m->ts0 ? m->ts0 : ts;
         m->ts1    = ts;
     }

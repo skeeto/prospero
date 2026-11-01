@@ -559,6 +559,9 @@ static CfgKey cfgschema[] = {
     {"ui", "thinking", CFG_ENUM, "fold", {}, "fold open hide", "ui",
      "Reasoning in the transcript: fold to a line that counts it as it "
      "streams, open, or hide"},
+    {"ui", "count", CFG_ENUM, "words", {}, "words characters", "ui",
+     "What folded reasoning's line counts as it streams: words or "
+     "characters"},
     {"ui", "tools", CFG_ENUM, "auto", {}, "auto fold open", "ui",
      "Tool output in the transcript: auto folds reads, writes, todo lists, "
      "background jobs and long shell output and opens failures; fold or "
