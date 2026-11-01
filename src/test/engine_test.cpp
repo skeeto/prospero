@@ -762,13 +762,15 @@ static void testprefill(Test *t)
     };
     i64 total = 20480, batch = 2048;
 
-    // Nothing to go on until two batches, then the line
+    // Nothing to go on at 0%, the one batch's rate gone on flat after
+    // it, then the line
     Prefill     p    = {};
     PrefillLine last = {};
     expect(t, "prefill: at 0%, no ETA",
            istr(&a, prefilleta(&p, &last, 7, 0, total, at(0))), "-1");
-    expect(t, "prefill: one batch, no ETA",
-           istr(&a, prefilleta(&p, &last, 7, batch, total, at(batch))), "-1");
+    expect(t, "prefill: one batch, flat",
+           near(prefilleta(&p, &last, 7, batch, total, at(batch)),
+                at(batch)*(total - batch)/batch), "ok");
     for (i64 n = 2*batch; n < total; n += batch) {
         i64 eta = prefilleta(&p, &last, 7, n, total, at(n));
         expect(t, concat(&a, "prefill: the line at ", istr(&a, n)),
@@ -791,6 +793,18 @@ static void testprefill(Test *t)
     Prefill o = {};
     expect(t, "prefill: another model's line unused",
            istr(&a, prefilleta(&o, &last, 9, 0, total, 0)), "-1");
+
+    // Lines by endpoint and model, the least recently used replaced
+    {
+        Engine eng = {};
+        for (u64 k = 1; k <= 16; k++) {
+            prefillline(&eng, k)->key = k;
+        }
+        prefillline(&eng, 1);
+        PrefillLine *l = prefillline(&eng, 17);
+        expect(t, "prefill: the oldest line replaced", istr(&a, (i64)l->key), "2");
+        expect(t, "prefill: a line found", istr(&a, prefillline(&eng, 1)->key==1), "1");
+    }
 
     // Cheaper further in, as only noise makes it: flat at the mean
     Prefill     d     = {};

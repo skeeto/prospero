@@ -588,7 +588,8 @@ struct Prefill {
 // A line of milliseconds per token at a position: a + b*x
 struct PrefillLine {
     f64 a, b;
-    u64 key;  // the endpoint and model it was fitted for, 0 if none
+    u64 key;   // the endpoint and model it was fitted for, 0 if none
+    u64 used;  // when last used (Engine's pserial), for replacing
 };
 
 struct Session {
@@ -641,7 +642,6 @@ struct Session {
     i64          hiddenat;   // the first ping of reasoning unseen, or 0
     i64          tokens;     // chunks with output: about one token each
     Prefill      pf;         // the prompt's processing
-    PrefillLine  pline;      // as last fitted, for a request's start
     // The turn
     i64          turn;
     i64          steps;
@@ -908,6 +908,8 @@ struct Engine {
     Slice<Str>  wtdue;    // sessions whose worktrees may go now, "" for all
     Slice<WtSess> wtgone; // worktrees of sessions deleted
     i64         trashat;  // ticks: when the Trash is next purged (trashpurge)
+    PrefillLine plines[16];  // prompt processing's lines, by endpoint and model
+    u64         pserial;
 };
 
 
@@ -2920,8 +2922,9 @@ static b32 prefillfit(Prefill *p, PrefillLine *l)
 // position, through the batches so far, the older weighing less, which
 // follows a server's load as it changes. Before two batches, the line
 // is the last request's for the same endpoint and model (key), through
-// the one batch if any. With none, there is no estimate: one batch's
-// rate, gone on flat, would be too low, and grow as the rest went.
+// the one batch if any, else flat through that batch, too low where
+// tokens cost more further in, until the next. Before any batch with
+// no line, there is no estimate.
 static i64 prefilleta(Prefill *p, PrefillLine *last, u64 key, i64 n, i64 total, i64 ms)
 {
     // A batch is a sample once its tokens and its time are both past
@@ -2947,14 +2950,17 @@ static i64 prefilleta(Prefill *p, PrefillLine *last, u64 key, i64 n, i64 total, 
 
     PrefillLine l = {};
     if (prefillfit(p, &l)) {
-        l.key = key;
-        *last = l;
+        l.key  = key;
+        l.used = last->used;
+        *last  = l;
     } else if (last->key==key && key) {
         l = *last;
         if (p->samples) {
             f64 x = p->sx / p->sw, y = p->sy / p->sw;
             l.a = y - l.b*x;
         }
+    } else if (p->samples) {
+        l.a = p->sy / p->sw;
     } else {
         return -1;
     }
@@ -2964,6 +2970,22 @@ static i64 prefilleta(Prefill *p, PrefillLine *last, u64 key, i64 n, i64 total, 
     f64 lo = (f64)n, hi = (f64)total;
     f64 left = l.a*(hi - lo) + l.b*(hi*hi - lo*lo)/2;
     return left>0 ? (i64)(left + 0.5) : -1;
+}
+
+// The line for an endpoint and model (key), or the least recently used
+// one's place, to replace once fitted.
+static PrefillLine *prefillline(Engine *e, u64 key)
+{
+    PrefillLine *l = e->plines;
+    for (iz i = 0; i < countof(e->plines); i++) {
+        if (e->plines[i].key == key) {
+            l = e->plines + i;
+            break;
+        }
+        l = e->plines[i].used<l->used ? e->plines+i : l;
+    }
+    l->used = ++e->pserial;
+    return l;
 }
 
 static void emitprogress(Session *s, Arena scratch, Chunk *c)
@@ -2978,8 +3000,8 @@ static void emitprogress(Session *s, Arena scratch, Chunk *c)
     if (!p->server || c->pms>=0) {
         i64 ms    = p->server ? c->pms : os_ticks(s->e->os)/MS;
         Str model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
-        u64 key   = hash(reqep(s)->url)*3 ^ hash(model);
-        eta = prefilleta(p, &s->pline, key|1, c->pdone, c->ptotal, ms);
+        u64 key   = (hash(reqep(s)->url)*3 ^ hash(model)) | 1;
+        eta = prefilleta(p, prefillline(s->e, key), key, c->pdone, c->ptotal, ms);
     }
 
     Buf   b(&scratch, 256);

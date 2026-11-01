@@ -60,9 +60,10 @@ kills any command it runs.
 The line above the prompt box says what the session is doing, and
 for how long. While a llama.cpp server reads a long prompt, a bar
 shows how far it has got, with about how long the rest will take once
-two batches give its pace. Tokens cost more the further into the
-context they are, and the estimate allows for that. After one long
-prompt, the next on the same model has an estimate from the start.
+the first batch gives its pace. Tokens cost more the further into the
+context they are, and the estimate allows for that as more batches
+come. After one long prompt, the next on the same model, in any
+session, has an estimate from the start.
 
 Attach adds files to the message: drop them on the window, paste them,
 or pick them with the paper clip. Images go to a model that takes
