@@ -6,7 +6,11 @@ for a command such as `prospero deploy`: its messages still show in
 that console, after the prompt, but its exit status is lost. Pipe or
 redirect its output to wait for it: `prospero deploy pi | more`, or in
 PowerShell `prospero deploy pi | Out-Host`. Over ssh and in scripts it
-works as usual, and it serves as the headless engine there too. The headless
+works as usual, and it serves as the headless engine there too.
+w64devkit's `sh` is the exception at a console: it waits for every
+program, GUI ones too, so a window launched from it detaches, as from a
+POSIX terminal (see [usage](usage.md)), and the prompt comes back once
+the window is up. The headless
 build (`-DPROSPERO_GUI=OFF`), which is the XP engine and the engine
 deployed to Windows machines, is a console program, and works as usual
 at a prompt as well.

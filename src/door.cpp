@@ -2,9 +2,9 @@
 //
 // A window takes the lock run/gui.lock of its state directory (guilock)
 // for the life of its process, before anything else of that directory,
-// and opens its door: a listener at os_endpoint(STATE, "gui-p0"), on a
-// thread of its own (opendoor). A launch that finds the lock held knocks
-// at the door (knock), and goes:
+// and once its window is open, opens its door: a listener at
+// os_endpoint(STATE, "gui-p0"), on a thread of its own (opendoor). A
+// launch that finds the lock held knocks at the door (knock), and goes:
 //
 //   newcomer: {"raise":1,"token":T,"cwd":D}
 //                                     T: its XDG_ACTIVATION_TOKEN, if any
@@ -31,6 +31,7 @@ enum : i32 {
     DOOR_LINE  = 1<<12,  // longest request line
     DOOR_TOKEN = 256,    // longest activation token passed on
     DOOR_WAIT  = 5000,   // ms for the window to answer each step
+    DOOR_FIND  = 10000,  // ms for a starting window's door to open
 };
 
 static Str guilockpath(Arena *a, Str statedir)

@@ -7,8 +7,8 @@
 - **The Log pane** (View → Log) shows the window's recent messages.
 - **`gui.log`** in the state directory (`~/.local/state/prospero`, see
   [Configuration](help:config)) keeps the same messages across runs.
-  A window launched from a terminal with `prospero DIR`, which goes on
-  detached, writes its errors there too.
+  A window launched from a terminal, which goes on detached, writes its
+  errors there too; `prospero -f` keeps it in the terminal instead.
 - **Settings → Diagnostics** lists each problem in the configuration
   files, with where it is.
 - **The transcript** notes each retry of a failed request, and the

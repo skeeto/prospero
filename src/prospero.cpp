@@ -341,6 +341,14 @@ struct Detached {
     b32 attached;  // still in this process's job, and ending with it
 };
 static Detached  os_detach(Os *, Arena scratch, Slice<Str> argv, Str cwd, Str errpath);
+// Whether the process pid, one os_detach started, still runs.
+static b32       os_pidalive(Os *, i32 pid);
+// Whether this launch came from a terminal whose prompt may be waiting
+// for it: its standard error a terminal (POSIX), or none given, with
+// the parent at a console (Windows, where a console's prompt gives a
+// GUI program no standard handles: busybox sh waits for it, cmd not),
+// attached to that console then, for this launch's messages.
+static b32       os_fromterminal(Os *);
 // (M5) This process's id.
 static i32       os_pid(Os *);
 // The computer's name, as the system gives it, or null.

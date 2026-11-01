@@ -65,7 +65,9 @@ Enter. Shift+Enter starts a new line.
 
 From a terminal, `prospero DIR`, such as `prospero .`, opens a new
 session in that directory, in Build mode with the default model. If
-a window is open already, the session starts there.
+a window is open already, the session starts there. Either way the
+terminal has its prompt back once the window is up (`-f` keeps the
+window in the terminal).
 
 ## Layouts
 

@@ -60,14 +60,25 @@ getting started to troubleshooting, built in from `assets/help`. Its
 search field (Ctrl+F while Help has the focus) lists the sections that
 have every word typed, headings first, and a click goes to that section.
 
+Launched from a terminal, `prospero` goes on detached, as gvim does,
+and the shell has its prompt back once the window is up; should the
+window fail to start, its errors print there first, with exit status 1.
+Its messages then go to `gui.log` in the state directory. `-f`
+(`--foreground`) keeps it in the terminal, with its messages there and
+Ctrl+C to stop it. A launch whose standard error is not a terminal, as
+from a script or a desktop launcher, stays as it is. On Windows, a
+console prompt gives a GUI program no standard handles: launched so,
+with its parent at a console, it detaches the same way, which matters
+for w64devkit's `sh`, the one console shell that waits for GUI
+programs. A shell in mintty (MSYS2, Cygwin) passes pipes, as a script
+does, so there it stays.
+
 `prospero DIR`, such as `prospero .` in a terminal, opens a new
 session in that directory, in Build mode with the default model,
-ready for a prompt. With no window open yet, the window goes on
-detached and the shell has its prompt back, as with `code .`, its
-errors going to `gui.log` in the state directory; the session has the
-terminal's environment. With a window open already, the session starts
-there, and that window comes forward: the session then has that
-window's environment, not the terminal's. On macOS, opening a folder
+ready for a prompt. With no window open yet, the new window has it,
+and the session has the terminal's environment. With a window open
+already, the session starts there, and that window comes forward: the
+session then has that window's environment, not the terminal's. On macOS, opening a folder
 with Prospero (`open -a Prospero DIR`, or dropping it on the Dock
 icon) does the same. A folder dropped on the window fills the New
 session dialog with it.

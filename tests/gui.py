@@ -58,8 +58,9 @@ DIR's: a window started with a directory has a session there, another
 launch with one hands off to it as a new session shown, an open event makes another,
 and the new session dialog one with no folder, and one in a directory
 completed as typed (Tab, Esc, Down, Enter, a click); then, here on POSIX,
-two launches with no window both detach at once, leaving one window
-with both sessions, which is then told to quit. The mcp mode shows an
+two launches from a terminal with no window both detach, returning once
+a window is up, leaving one window with both sessions, which is then
+told to quit. The mcp mode shows an
 MCP server's page in Settings, a fake server over HTTP that wants a
 sign-in: Sign in, through the window's stand-in browser, then a call
 from a session, which sends the token it got, then Sign out. The
@@ -87,6 +88,7 @@ import json
 import os
 import random
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -865,8 +867,9 @@ def launch(args, host, guiargs, guicwd):
     in WORK and comes forward, and the launch exits saying so; the
     checklist goes on to an open event and a session with no folder,
     and quits. Then, here on POSIX with a display, two launches at once
-    with no window detach and return at once, one window going on
-    with both sessions. Returns problems and the logs."""
+    from a terminal with no window detach and return once a window is
+    up, one window going on with both sessions. Returns problems and the
+    logs."""
     problems = []
     first = {}
     t = threading.Thread(target=lambda: first.update(r=host.run(
@@ -909,11 +912,13 @@ def detached(host):
 
 
 def detaching(host, plain):
-    """Two "prospero DIR" launches at once with no window on the state
-    directory: each detaches and exits at once, giving the terminal back;
-    one window goes on, the other having handed off to it, with a session
-    in either directory. The window is then asked to quit (SIGTERM), by
-    the pid found from its command line, checked as ours."""
+    """Two "prospero DIR" launches at once from a terminal (a pty for
+    their output, which is what they detach for) with no window on the
+    state directory: each detaches and exits once a window answers,
+    giving the terminal back; one window goes on, the other having
+    handed off to it, with a session in either directory. The window is
+    then asked to quit (SIGTERM), by the pid found from its command line,
+    checked as ours."""
     if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
             and not os.environ.get("WAYLAND_DISPLAY"):
         print("detaching: skipped, with no display for a window to go on in", flush=True)
@@ -923,23 +928,35 @@ def detaching(host, plain):
     for d in dirs:
         host.mkdir(d)
     t0 = time.monotonic()
+    master, slave = os.openpty()
     procs = [subprocess.Popen([host.prospero, d] + plain, cwd=host.path("work"),
-                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                              stdin=subprocess.DEVNULL, stdout=slave, stderr=slave,
+                              start_new_session=True)
              for d in dirs]
+    os.close(slave)
+    out = b""
     for i, p in enumerate(procs):
         try:
-            out, _ = p.communicate(timeout=20)
+            p.wait(timeout=20)
         except subprocess.TimeoutExpired:
             P.signal_group(p, P.KILL)
-            out, _ = p.communicate()
+            p.wait()
             problems.append(f"detaching launch {i} did not return")
-        for line in out.splitlines():
-            lines.append(f"[d{i}] {line}\n")
-            print(lines[-1], end="", flush=True)
         if p.returncode != 0:
             problems.append(f"detaching launch {i}: exit status {p.returncode}")
     dt = time.monotonic() - t0
+    while select.select([master], [], [], 0.5)[0]:
+        try:
+            got = os.read(master, 1 << 16)
+        except OSError:  # EIO: no process holds the terminal any more
+            break
+        if not got:
+            break
+        out += got
+    os.close(master)
+    for line in out.decode(errors="replace").splitlines():
+        lines.append(f"[d] {line.rstrip()}\n")
+        print(lines[-1], end="", flush=True)
     print(f"the detaching launches returned in {dt:.1f} s", flush=True)
     if dt > 10:
         problems.append(f"the detaching launches took {dt:.1f} s to return")

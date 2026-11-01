@@ -3116,6 +3116,17 @@ static i32 os_pid(Os *)
     return (i32)getpid();
 }
 
+static b32 os_pidalive(Os *, i32 pid)
+{
+    // Signal 0 sends nothing; never 0 or less, which name groups
+    return pid>0 && (!kill(pid, 0) || errno==EPERM);
+}
+
+static b32 os_fromterminal(Os *)
+{
+    return isatty(2);
+}
+
 static Str os_hostname(Os *, Arena *a)
 {
     char buf[256] = {};

@@ -76,6 +76,7 @@ enum : i32 {
     STACK_SIZE_PARAM_IS_A_RESERVATION = 0x10000,
     STD_ERROR_HANDLE                  = -12,
     WAIT_OBJECT_0                     = 0,
+    WAIT_TIMEOUT                      = 0x102,
     // Processes
     CREATE_NEW_PROCESS_GROUP          = 0x00000200,
     CREATE_NEW_CONSOLE                = 0x00000010,
@@ -295,6 +296,7 @@ W32(u8,     SystemFunction036(void *, i32));  // RtlGenRandom (advapi32)
 W32(byte *, VirtualAlloc(uz, iz, i32, i32));
 W32(b32,    VirtualFree(uz, iz, i32));
 W32(i32,    WaitForSingleObject(uz, i32));
+W32(uz,     OpenProcess(i32, b32, i32));
 W32(b32,    WriteConsoleW(uz, c16 *, i32, i32 *, uz));
 W32(b32,    WriteFile(uz, u8 *, i32, i32 *, Overlapped *));
 W32(void,   DeleteCriticalSection(CriticalSection *));
@@ -402,6 +404,7 @@ struct Os {
     CriticalSection console;  // held while attached to a child's console
     uz              std[3];   // standard handles, as at startup
     b32             stdinread;  // os_stdin was called: a reader may block
+    b32             fromconsole;  // GUI builds: a console's prompt, no stderr
     void           *gui;    // GUI builds: the window's state (gui_win32.cpp)
     // GetFinalPathNameByHandleW, from Vista on, else null
     u32 (__stdcall *finalpath)(uz, c16 *, u32, u32);
@@ -2811,6 +2814,31 @@ static i32 os_pid(Os *)
     return GetCurrentProcessId();
 }
 
+static b32 os_pidalive(Os *, i32 pid)
+{
+    uz h = pid>0 ? OpenProcess(SYNCHRONIZE, 0, pid) : 0;
+    if (!h) {
+        return 0;
+    }
+    b32 alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    CloseHandle(h);
+    return alive;
+}
+
+#if PROSPERO_GUI
+static void guiconsole(Os *);
+#endif
+
+// A GUI launch goes to gui_main without guiconsole: asked, this attaches
+// to the parent's console as guiconsole does, for the launch's messages
+static b32 os_fromterminal(Os *os)
+{
+    #if PROSPERO_GUI
+    guiconsole(os);
+    #endif
+    return os->fromconsole;
+}
+
 static Str os_hostname(Os *, Arena *a)
 {
     enum { ComputerNameDnsHostname = 1 };
@@ -3510,6 +3538,7 @@ static void guiconsole(Os *os)
         } else if (!attached && !(attached = AttachConsole(ATTACH_PARENT_PROCESS))) {
             return;  // none: started from a desktop, say
         }
+        os->fromconsole |= fd == 2;  // whose prompt may wait (os_fromterminal)
         h = CreateFileW((c16 *)u"CONOUT$", GENERIC_READ|GENERIC_WRITE, FILE_SHARE_ALL,
                         0, OPEN_EXISTING, 0, 0);
         if (h != INVALID_HANDLE_VALUE) {

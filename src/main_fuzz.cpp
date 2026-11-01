@@ -195,6 +195,8 @@ static b32   os_connwrite(Os *, Conn *, Str) { return 0; }
 static void  os_connclose(Os *, Conn *) {}
 static Detached os_detach(Os *, Arena, Slice<Str>, Str, Str) { return {}; }
 static i32   os_pid(Os *) { return 1; }
+static b32   os_pidalive(Os *, i32) { return 0; }
+static b32   os_fromterminal(Os *) { return 0; }
 static Str   os_hostname(Os *, Arena *) { return {}; }
 static i32   os_responsible(Os *, i32) { return 0; }
 static b32   os_removetree(Os *, Arena, Str) { return 0; }

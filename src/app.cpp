@@ -78,6 +78,7 @@ enum : i64 {
     JOBS_PERIOD   = 250000,      // µs between frames showing job output
     CARET_STOP    = 10000000,    // µs after the last key: stop blinking
     COPIED_US     = 1500000,     // µs a code block's button says Copied
+    DETACH_WAIT   = 15000000,    // µs a detaching launch waits for the window
 };
 
 enum : iz {
@@ -8935,15 +8936,16 @@ static void raisenow(Gui *g)
 
 // This launch found the state directory's window lock held: ask its
 // window to come forward instead, with a new session in the launch's
-// directory, if any, given half a second to be found (it may be
-// starting), and exit. Returns the exit status. The session starts in
-// the window's process, so it has that one's environment, not this one's.
+// directory, if any, given DOOR_FIND to be found (it may be starting:
+// its door opens with its window), and exit. Returns the exit status.
+// The session starts in the window's process, so it has that one's
+// environment, not this one's.
 static i32 handoff(Gui *g)
 {
     Os   *os    = g->os;
     Arena a     = g->frame;
     Str   token = os_getenv(os, &a, "XDG_ACTIVATION_TOKEN");
-    Knock k     = knock(os, &g->perm, a, g->statedir, token, g->opendir, 500,
+    Knock k     = knock(os, &g->perm, a, g->statedir, token, g->opendir, DOOR_FIND,
                         os_guiletfront);
     Buf   b(&a, 256 + g->statedir.len + g->opendir.len);
     if (k.ok) {
@@ -19192,13 +19194,16 @@ static b32 guiwanted(Str *args, i32 nargs)
     return 1;
 }
 
-// prospero DIR, with no window on the state directory yet: the window
-// goes on in a process detached from this one and from its terminal,
-// which has its prompt back, as this program again with the same
-// arguments and --detached, in the same directory and environment. Its
-// errors go to the state directory's gui.log. Should another launch's
-// window take the lock first, it hands off to that one. Returns the
-// exit status.
+// A launch from a terminal, with no window on the state directory yet:
+// the window goes on in a process detached from this one and from the
+// terminal, as this program again with the same arguments and
+// --detached, in the same directory and environment, its errors going
+// to the state directory's gui.log. Should another launch's window take
+// the lock first, it hands off to that one. This one waits until a
+// window answers at the door, which opens with the window, so that the
+// prompt comes back after the window, or after its errors, read back
+// from the log; a window slower than DETACH_WAIT is left to it. Returns
+// the exit status.
 static i32 detachgui(Gui *g, Str *args, i32 nargs, Str here)
 {
     Os        *os   = g->os;
@@ -19210,7 +19215,8 @@ static i32 detachgui(Gui *g, Str *args, i32 nargs, Str here)
     argv = push(&a, argv, Str("--detached"));
     Str log = join(&a, g->statedir, "gui.log");
     os_mkdirs(os, a, g->statedir);  // for the log
-    Detached d = os_detach(os, a, argv, here.len ? here : Str("."), log);
+    i64      from = os_stat(os, a, log).size;
+    Detached d    = os_detach(os, a, argv, here.len ? here : Str("."), log);
     if (!d.pid) {
         Str err = os_lasterr(os, &a);
         Buf b(&a, 256 + err.len);
@@ -19220,7 +19226,34 @@ static i32 detachgui(Gui *g, Str *args, i32 nargs, Str here)
         os_print(os, 2, finish(&b));
         return 1;
     }
-    return 0;
+
+    Str      door     = doorendpoint(os, &a, g->statedir);
+    Mailbox *mb       = newmailbox(&a, 1<<10, 0, 0);  // only to wait on
+    i64      deadline = os_ticks(os) + DETACH_WAIT;
+    for (;;) {
+        // Gone, it may have handed off to a window that took the lock
+        // first, whose door answers then
+        b32 gone = !os_pidalive(os, d.pid);
+        if (door.len && os_listening(os, a, door)) {
+            return 0;
+        } else if (gone) {
+            break;
+        } else if (os_ticks(os)>=deadline || !mb) {
+            return 0;
+        }
+        mailwait(mb, 20);
+    }
+    Read r = os_readat(os, &a, log, from, 1<<12);
+    if (r.data.len) {
+        os_print(os, 2, r.data);
+    } else {
+        Buf b(&a, 128 + log.len);
+        print(&b, "prospero: the window's process ended before its window opened; see ");
+        print(&b, log);
+        putbyte(&b, '\n');
+        os_print(os, 2, finish(&b));
+    }
+    return 1;
 }
 
 // A font for each style, from fonts.cpp: prose falls back on code's font
@@ -19320,8 +19353,11 @@ static i64 optint(Str *args, i32 nargs, i32 *i)
 static Str guiusage =
 "usage: prospero [gui [options]]\n"
 "       prospero [gui] DIR [options]\n"
+"From a terminal the window goes on detached, its messages to gui.log in\n"
+"the state directory, and the prompt comes back once it is up.\n"
 "  DIR            a new session in DIR: in the window open already, else\n"
-"                 in a new one, which goes on detached (POSIX)\n"
+"                 in a new one\n"
+"  -f, --foreground  stay in the terminal, as from a script\n"
 "  -c FILE        configuration file (default: prospero.ini, as for run)\n"
 "  --statedir DIR sessions, layout file and log (default: the state dir)\n"
 "  --skillsdir DIR more skills, in DIR (repeatable)\n"
@@ -19541,6 +19577,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     probe = 0;
     #endif
     b32 aggressive = 0, stream = 0, idle = 0, streamtest = 0, drive = 0;
+    b32 foreground = 0;
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
     b32 launch = 0, first = 0, mcp = 0, hosttask = 0, changes = 0, thin = 0;
@@ -19652,6 +19689,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             g->hostidle = s>0 ? s*1000000 : 0;
         } else if (a == "--detached") {
             g->detached = 1;  // detachgui's: the window, its launch gone
+        } else if (a=="-f" || a=="--foreground") {
+            foreground = 1;
         } else if (a.len && a[0]!='-' && !opendir.len) {
             opendir = a;
         } else {
@@ -19823,8 +19862,10 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         g->opendup = os_ticks(os) + (i64)30000*MS;
     }
     // From a terminal, the window goes on detached and the prompt comes
-    // back (POSIX; Windows' GUI programs never hold a console)
-    if (g->opendir.len && !g->detached && !g->drive && !HOST_WINDOWS && g->statedir.len) {
+    // back, as gvim's does, unless -f; scripts, which capture its output,
+    // and the checklists and measurements keep it
+    if (!foreground && !g->detached && !g->drive && !fake && g->statedir.len &&
+            os_fromterminal(os)) {
         Arena a    = g->frame;
         Str   path = guilockpath(&a, g->statedir);
         if (os_lockheld(os, a, path)) {
@@ -19861,12 +19902,6 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     if (!g->inbox || !g->outbox || !g->tasks) {
         os_print(os, 2, "prospero: could not create mailboxes\n");
         return 2;
-    }
-    if (g->guilock >= 0) {
-        Str err = opendoor(os, &g->perm, g->frame, g->statedir, g->tasks, TASK_RAISE);
-        if (err.len) {
-            guilog(g, concat(&g->frame, "other launches cannot hand off: ", err));
-        }
     }
     Fake *f = 0;
     if (fake) {
@@ -19933,6 +19968,13 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     if (!os_guiopen(os, g, PROSPERO_TITLE)) {
         os_print(os, 2, "prospero: could not open a window\n");
         return 1;
+    }
+    // The door opens with the window, which a detaching launch waits for
+    if (g->guilock >= 0) {
+        Str err = opendoor(os, &g->perm, g->frame, g->statedir, g->tasks, TASK_RAISE);
+        if (err.len) {
+            guilog(g, concat(&g->frame, "other launches cannot hand off: ", err));
+        }
     }
     g->sched.pace = os_guirefresh(os);
     toastready(g);
