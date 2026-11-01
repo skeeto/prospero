@@ -217,6 +217,7 @@ enum : i32 {
     RECT_INFOBTN,    // the session's Info
     RECT_COMPACTHDR, // the latest compaction card's header
     RECT_THINKHDR,   // the latest reasoning's header drawn
+    RECT_RAIL,       // the latest fold rail drawn
     RECT_USERMSG,    // the latest user message drawn
     RECT_CLOSEBG,    // the close dialog's Keep running in background
     RECT_HOSTCOMBO,  // the new session's host, and its first choices
@@ -1574,6 +1575,8 @@ struct Gui {
     b32                thinkhidshown; // the strip said reasoning is hidden
     b32                copiedshown;  // a code block's button said Copied
     b32                clockshown;   // a message's time, under the mouse
+    i32                railfold;     // the message the fold rail last folded, plus one
+    b32                railseen;     //   its header drawn in view this frame
     i32                gaugeshown;   // the gauge drew: 1, 2 if amber
     i32                drivecodemsg; // the code block selectcode chose, or
     i32                drivecodeblk; //   -1 for any
@@ -10983,6 +10986,7 @@ enum : i32 {
     T_THUMB,       // the latest screenshot thumbnail drawn
     T_SHOTCLOSE,   // the Screenshot window's title bar X
     T_THINKHDR,    // the latest reasoning's header drawn
+    T_RAIL,        // the latest fold rail drawn
     T_CODEBLOCK,   // the code block selectcode chose, as drawn
     T_CODECOPY,    // and its Copy button
     T_TOOLSBTN,    // the session bar's toggles
@@ -11076,6 +11080,8 @@ enum : i32 {
     CHK_RETRYSHOWN,
     CHK_ETASHOWN,
     CHK_CLOCKSHOWN,
+    CHK_RAILFOLD,
+    CHK_RAILOPEN,
     CHK_DIAGS,
     CHK_ADDEXISTS,
     CHK_ROQUIET,
@@ -11370,6 +11376,8 @@ static Str chknames[] = {
     "a session held elsewhere opened read-only, with its banner",
     "amber after 15 s without data", "a retry's countdown shown",
     "the prompt's time left shown", "a message's time shown under the mouse",
+    "the fold rail folded its message, its header in view",
+    "the fold rail opened the folded message again",
     "configuration diagnostics listed with file and line",
     "adding a section that exists changed nothing",
     "a read-only session's turn runs elsewhere, with no clock here",
@@ -12327,6 +12335,17 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
     {OP_MOVE, T_EMPTY, 0, 0, 300, ""},
     {OP_CHECK, CHK_THINKKEPT, 0, 0, 0, ""},
+    // Folded again from its rail, beside its body, then opened again
+    // by its rail, beside its header
+    {OP_MOVE, T_RAIL, 0, 0, 300, ""},
+    {OP_SHOT, 0, 0, 0, 300, "17-rail"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_RAILFOLD, 0, 0, 0, ""},
+    {OP_MOVE, T_RAIL, 0, 0, 300, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_RAILOPEN, 0, 0, 0, ""},
     // Hidden: none drawn, this turn's or the earlier, the strip saying
     // why nothing shows
     {OP_THINKING, 0, THINK_HIDE, 0, 0, ""},
@@ -15647,6 +15666,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_THUMB:         return rectcenter(g->rects[RECT_THUMB]);
     case T_SHOTCLOSE:     return rectcenter(g->rects[RECT_SHOTCLOSE]);
     case T_THINKHDR:      return rectcenter(g->rects[RECT_THINKHDR]);
+    case T_RAIL:          return rectcenter(g->rects[RECT_RAIL]);
     case T_USERMSG:       return rectcenter(g->rects[RECT_USERMSG]);
     case T_SIDELINK:      return rectcenter(g->rects[RECT_SIDELINK]);
     case T_CODEBLOCK:     return rectcenter(g->rects[RECT_CODEBLOCK]);
@@ -17492,6 +17512,12 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->etashown;
     case CHK_CLOCKSHOWN:
         return g->clockshown;
+    case CHK_RAILFOLD:
+        return g->railfold>0 && g->railfold<=v->msgs.len &&
+               v->msgs[g->railfold-1].collapsed && g->railseen;
+    case CHK_RAILOPEN:
+        return g->railfold>0 && g->railfold<=v->msgs.len &&
+               !v->msgs[g->railfold-1].collapsed;
     case CHK_ADDEXISTS:
         return find(g->cfgstatus, "already exists")>=0 && !g->cfgset;
     case CHK_ROQUIET:

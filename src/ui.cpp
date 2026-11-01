@@ -1051,16 +1051,7 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
 {
     Arena     a   = g->frame;
     ViewTool *t   = m->tool;
-    b32       cl  = m->fold || m->role==VIEW_TOOL || m->role==VIEW_THINK;
-    f32       sz  = p->size;
     Palette  *pal = g->pal;
-    if (cl) {
-        // A triangle for whether the body shows
-        f32    fs = ImGui::GetFontSize();
-        ImVec2 at = v2(p->x, p->y + (sz - 0.7f*fs)/2);
-        ImGui::RenderArrow(p->dl, at, pal->dim, m->collapsed ? ImGuiDir_Right : ImGuiDir_Down, 0.7f);
-        p->x += fs;
-    }
     u32 dim = fade(pal->dim, m->faded ? 0.5f : 1);
     switch (m->role) {
     case VIEW_TOOL: {
@@ -3972,7 +3963,7 @@ static void drawqueue(Gui *g, GuiSession *s, Slice<QueueShow> shows, f64 y,
         ViewQueued *q   = &v->queue[i];
         QueueShow  *qs  = &shows[i];
         f32         top = wpos.y + (f32)(y - scrolly);
-        ImVec2      b0  = v2(wpos.x+pad/2, top);
+        ImVec2      b0  = v2(wpos.x+pad/4, top);
         ImVec2      b1  = v2(wpos.x+pad*1.5f+width, top+qs->h);
         if (!i) {
             g->rects[RECT_QUEUEITEM] = {b0.x, b0.y, b1.x, b1.y};
@@ -4523,7 +4514,7 @@ static void drawtranscript(Gui *g)
     }
     i32 latest[] = {RECT_USERMSG, RECT_TASKLINK, RECT_UNDO, RECT_REWINDTURN, RECT_FORCE,
                     RECT_CUTUNDO, RECT_COMPACTHDR,
-                    RECT_THINKHDR, RECT_ALWAYS};
+                    RECT_THINKHDR, RECT_ALWAYS, RECT_RAIL};
     for (iz i = 0; i < countof(latest); i++) {
         g->rects[latest[i]] = {};  // the latest drawn, or none
     }
@@ -4535,6 +4526,7 @@ static void drawtranscript(Gui *g)
     g->rects[RECT_CODECOPY]  = {};
     g->copiedshown = 0;
     g->clockshown  = 0;
+    g->railseen    = 0;
     g->bgshown     = 0;
     g->stopshown   = 0;
     sp->Split(dl, CH_COUNT);
@@ -4548,7 +4540,7 @@ static void drawtranscript(Gui *g)
         f32        x     = wpos.x + pad;
         f32        alpha = m->faded ? 0.45f : 1;
         f32        mfoot = msgfoot(v, m);
-        ImVec2     box0  = v2(wpos.x+pad/2, y);
+        ImVec2     box0  = v2(wpos.x+pad/4, y);
         ImVec2     box1  = v2(wpos.x+pad*1.5f+width, y+v->extra+m->h+mfoot);
 
         // Backgrounds: the user's messages, tool rows, ask cards
@@ -4620,6 +4612,40 @@ static void drawtranscript(Gui *g)
         if (act.kind) {
             ImGui::SetCursorScreenPos(v2(x + width - act.w, y + pad/4));
             drawaction(g, gs, m, &act);
+        }
+        // The fold rail: the bar at the left of a message that folds, a
+        // tool row's colored one, or a faint one for reasoning, folds or
+        // opens it from anywhere along it, through the margin left of
+        // its text, and brings its header back into view if above
+        b32 folds = m->fold || m->role==VIEW_TOOL || m->role==VIEW_THINK;
+        b32 bar   = m->role==VIEW_TOOL || m->role==VIEW_COMPACT || m->role==VIEW_REWIND;
+        f32 r0    = box0.y>top ? box0.y : top;
+        f32 r1    = box1.y<bot ? box1.y : bot;
+        if (folds && r1-r0>=1) {
+            ImGui::SetCursorScreenPos(v2(wpos.x, r0));
+            b32 go  = ImGui::InvisibleButton("##rail", v2(x - wpos.x, r1 - r0));
+            b32 hov = ImGui::IsItemHovered() || ImGui::IsItemActive();
+            itemrect(g, RECT_RAIL);
+            if (hov) {
+                dl->AddRectFilled(box0, v2(box0.x + 5*sc, box1.y), g->pal->active);
+            } else if (!bar) {
+                dl->AddRectFilled(box0, v2(box0.x + 3*sc, box1.y), fade(g->pal->dim, 0.5f*alpha));
+            }
+            if (hov) {
+                dl->AddRect(box0, box1, fade(g->pal->active, 0.5f), 4*sc, sc);
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetItemTooltip(m->collapsed ? "Unfold" : "Fold");
+            }
+            if (go) {
+                if (box0.y < top) {
+                    g->scrollto = m->top;  // its header at the top
+                }
+                togglemsg(v, i);
+                g->railfold = i + 1;
+            }
+        }
+        if (g->railfold==i+1 && y>=top && y+head<=bot) {
+            g->railseen = 1;  // the message the rail folded, its header in view
         }
         if (act.bgw > 0) {
             MsgAction bg = {};

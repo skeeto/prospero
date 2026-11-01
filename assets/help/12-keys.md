@@ -65,7 +65,9 @@ The transcript, the Plan pane and these Help pages select alike:
 
 A code block's Copy button, at its corner while the mouse is over it,
 copies its code exactly, and shows a check mark for a moment. A click on a tool row's or reasoning's header
-opens or folds it.
+opens or folds it. So does a click on the bar at its left (a tool
+row's colored bar, reasoning's gray one), from anywhere along it,
+which, folding, scrolls back to its header if that was above the view.
 
 ## Finding
 
