@@ -3904,14 +3904,14 @@ static void drawtoast(Gui *g, GuiSession *s, ImVec2 r0, ImVec2 r1)
 {
     g->toasted   = 1;
     g->editshown = 0;
-    Arena a       = g->frame;
-    b32   editing = g->edsess && g->edsess==s && !g->edplan;
-    b32   fresh   = s->noteerr || g->sched.now-s->noteat<TOAST_LIFE;
+    b32 editing  = g->edsess && g->edsess==s && !g->edplan;
+    b32 fresh    = s->noteerr || g->sched.now-s->noteat<TOAST_LIFE;
     if (s->note.len && !s->noteerr && fresh) {
         schedat(&g->sched, s->noteat + TOAST_LIFE, DUE_CLOCK);
     }
     if (editing) {
-        Str text = concat(&a, concat(&a, "Editing in ", g->edname), "...");
+        // In the frame itself: toastbtns takes its scratch from there
+        Str text = concat(&g->frame, concat(&g->frame, "Editing in ", g->edname), "...");
         if (toastbox(g, text, g->pal->paneltext, g->pal->rule, "Cancel", "",
                      "Stop the editor, leaving the draft as it was",
                      RECT_EDITCANCEL, r0, r1)) {
