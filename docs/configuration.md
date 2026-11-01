@@ -65,7 +65,15 @@ configuration.
     [tools]
     path_prepend = ~/.local/bin; /opt/homebrew/bin
 
-An endpoint speaks Anthropic's Messages API with `kind = anthropic`:
+An endpoint's `url` is its base: chat requests go to
+`URL/v1/chat/completions`, and its listing is `URL/v1/models`, with or
+without the `/v1` in `url`. For a server or proxy with no `/v1` in its
+paths, give the whole URL of its chat requests instead, and none is
+added: with `url = https://proxy.example.com/auto/chat/completions`,
+the listing is `https://proxy.example.com/auto/models`.
+
+An endpoint speaks Anthropic's Messages API with `kind = anthropic`
+(whose whole URL ends in `/messages` instead):
 
     [endpoint anthropic]
     kind = anthropic

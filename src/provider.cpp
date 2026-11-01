@@ -186,17 +186,37 @@ static b32 localhost(Str host)
     return 0;
 }
 
-// The API root of an endpoint URL: given "http://h/" or "http://h/v1",
-// returns the URL of name under /v1/, e.g. "http://h/v1/models".
-static Str apiurl(Arena *a, Str base, Str name)
+// An endpoint URL less trailing slashes and any request path it names in
+// full. Given "http://h/x/chat/completions" (or "/messages"), the root is
+// "http://h/x" and full is set: that API takes requests as named, with no
+// /v1 added, for proxies and providers with no /v1 in their paths.
+static Str apiroot(Str base, b32 *full)
 {
     for (; base.len && base[base.len-1]=='/'; base.len--) {}
-    if (endswith(base, "/v1")) {
+    *full = 1;
+    if (endswith(base, "/chat/completions")) {
+        base.len -= 17;
+    } else if (endswith(base, "/messages")) {
+        base.len -= 9;
+    } else {
+        *full = 0;
+    }
+    return base;
+}
+
+// The API root of an endpoint URL: given "http://h/" or "http://h/v1",
+// returns the URL of name under /v1/, e.g. "http://h/v1/models". Given
+// "http://h/x/chat/completions", "http://h/x/models".
+static Str apiurl(Arena *a, Str base, Str name)
+{
+    b32 full = 0;
+    base = apiroot(base, &full);
+    if (!full && endswith(base, "/v1")) {
         base.len -= 3;
     }
     Buf b(a, base.len + name.len + 8);
     print(&b, base);
-    print(&b, "/v1/");
+    print(&b, full ? Str("/") : Str("/v1/"));
     print(&b, name);
     return finish(&b);
 }
@@ -205,7 +225,8 @@ static Str apiurl(Arena *a, Str base, Str name)
 // or "http://h/v1", "http://h/props".
 static Str rooturl(Arena *a, Str base, Str name)
 {
-    for (; base.len && base[base.len-1]=='/'; base.len--) {}
+    b32 full = 0;
+    base = apiroot(base, &full);
     if (endswith(base, "/v1")) {
         base.len -= 3;
     }

@@ -86,6 +86,19 @@ static void test_provider(Test *t)
                "http://h/v1/chat/completions");
         expect(t, "apiurl prefix", apiurl(a, "https://h/api", "models"),
                "https://h/api/v1/models");
+        expect(t, "apiurl full", apiurl(a, "https://h/auto/chat/completions", "models"),
+               "https://h/auto/models");
+        expect(t, "apiurl full chat", apiurl(a, "https://h/auto/chat/completions/",
+                                             "chat/completions"),
+               "https://h/auto/chat/completions");
+        expect(t, "apiurl full v1", apiurl(a, "https://h/v1/chat/completions", "models"),
+               "https://h/v1/models");
+        expect(t, "apiurl full v4", apiurl(a, "https://h/api/v4/chat/completions",
+                                           "chat/completions/control"),
+               "https://h/api/v4/chat/completions/control");
+        expect(t, "apiurl full messages", apiurl(a, "https://h/x/messages",
+                                                 "models?limit=1000"),
+               "https://h/x/models?limit=1000");
     }
 
     // Classification
@@ -224,6 +237,10 @@ static void test_provider(Test *t)
         }
         expect(t, "rooturl", rooturl(a, "http://h/v1/", "props"), "http://h/props");
         expect(t, "rooturl path", rooturl(a, "http://h/r1/", "props"), "http://h/r1/props");
+        expect(t, "rooturl full", rooturl(a, "http://h/x/chat/completions", "props"),
+               "http://h/x/props");
+        expect(t, "rooturl full v1", rooturl(a, "http://h/v1/chat/completions", "props"),
+               "http://h/props");
     }
 
     // Unexpected stops: final responses that announce work, and some

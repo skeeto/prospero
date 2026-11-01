@@ -273,7 +273,8 @@ static CfgKey cfgschema[] = {
 
     {"endpoint", "url", CFG_URL, "", {}, {}, "endpoint",
      "Base URL: chat requests go to URL/v1/chat/completions, or for kind "
-     "anthropic to URL/v1/messages"},
+     "anthropic to URL/v1/messages, but to URL itself when it ends in "
+     "/chat/completions or /messages, with no /v1 added"},
     {"endpoint", "kind", CFG_ENUM, "openai", {}, "openai anthropic", "endpoint",
      "The API it speaks: openai (Chat Completions) or anthropic (Messages)"},
     {"endpoint", "key", CFG_SECRET, "", {}, {}, "endpoint",
