@@ -868,8 +868,8 @@ def launch(args, host, guiargs, guicwd):
     checklist goes on to an open event and a session with no folder,
     and quits. Then, here on POSIX with a display, two launches at once
     from a terminal with no window detach and return once a window is
-    up, one window going on with both sessions. Returns problems and the
-    logs."""
+    up, one window going on with both sessions, and a launch with no
+    arguments at all detaches too. Returns problems and the logs."""
     problems = []
     first = {}
     t = threading.Thread(target=lambda: first.update(r=host.run(
@@ -992,6 +992,80 @@ def detaching(host, plain):
             continue
         if not waitfor(lambda: not alive(pid), 20, 0.5):
             problems.append(f"the detached window {pid} did not quit")
+            try:
+                P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root))
+            except (OSError, P.Refused):
+                pass
+    p, more = barelaunch(host)
+    return problems + p, lines + more
+
+
+def barelaunch(host):
+    """A launch from a terminal with no arguments at all: it detaches as
+    "prospero DIR" does, and a window goes on. With no -c or --statedir,
+    XDG_CONFIG_HOME and XDG_STATE_HOME keep it to the run's directory,
+    and it runs as a copy of the program there, so that the window's
+    command line names that directory for detached() and ours()."""
+    problems, lines = [], []
+    exe   = host.path("work", "bare", "prospero")
+    cwd   = host.path("work", "four")
+    xdg   = host.path("xdg")
+    state = os.path.join(xdg, "state", "prospero")
+    for d in (os.path.dirname(exe), cwd, os.path.join(xdg, "config", "prospero"), state):
+        host.mkdir(d)
+    shutil.copy2(host.prospero, exe)
+    shutil.copy(host.path("prospero.ini"), os.path.join(xdg, "config", "prospero"))
+    env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(xdg, "config"),
+               XDG_STATE_HOME=os.path.join(xdg, "state"))
+    master, slave = os.openpty()
+    p = subprocess.Popen([exe], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                         stdout=slave, stderr=slave, start_new_session=True)
+    os.close(slave)
+    try:
+        p.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        P.signal_group(p, P.KILL)
+        p.wait()
+        problems.append("the bare launch did not return")
+    out = b""
+    while select.select([master], [], [], 0.5)[0]:
+        try:
+            got = os.read(master, 1 << 16)
+        except OSError:
+            break
+        if not got:
+            break
+        out += got
+    os.close(master)
+    for line in out.decode(errors="replace").splitlines():
+        lines.append(f"[b] {line.rstrip()}\n")
+        print(lines[-1], end="", flush=True)
+    if p.returncode != 0:
+        problems.append(f"the bare launch: exit status {p.returncode}")
+    if any("usage:" in l.lower() for l in lines):
+        problems.append("the bare launch printed its usage, not a window")
+
+    def found():
+        out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
+                             text=True).stdout
+        pids = []
+        for line in out.splitlines():
+            pid, _, rest = line.strip().partition(" ")
+            if rest.startswith(exe + " ") and " --detached" in rest:
+                pids += [q for q in P.parse(pid) if ours(q, host.root)]
+        return pids
+    pids = []
+    if not waitfor(lambda: pids.extend(found()) or pids, 10, 0.5):
+        problems.append("no detached window went on from the bare launch")
+    print(f"the bare launch's windows: {pids}", flush=True)
+    for pid in pids:
+        try:
+            P.signal_ours(pid, signal.SIGTERM, lambda q: ours(q, host.root))
+        except (OSError, P.Refused) as e:
+            problems.append(f"cannot ask the bare launch's window to quit: {e}")
+            continue
+        if not waitfor(lambda: not alive(pid), 20, 0.5):
+            problems.append(f"the bare launch's window {pid} did not quit")
             try:
                 P.signal_ours(pid, P.KILL, lambda q: ours(q, host.root))
             except (OSError, P.Refused):

@@ -19228,6 +19228,9 @@ static i32 detachgui(Gui *g, Str *args, i32 nargs, Str here)
     for (i32 i = 0; i < nargs; i++) {
         argv = push(&a, argv, args[i]);
     }
+    if (nargs < 2) {
+        argv = push(&a, argv, Str("gui"));  // "prospero --detached" is no GUI's
+    }
     argv = push(&a, argv, Str("--detached"));
     Str log = join(&a, g->statedir, "gui.log");
     os_mkdirs(os, a, g->statedir);  // for the log
