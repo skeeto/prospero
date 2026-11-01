@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
-"""Build the itch.io edition of Prospero, signed, for macOS and Windows.
+"""Build the itch.io edition of Prospero, for macOS, Windows and Linux.
 
   uv run tools/itch.py [--commit REV] [--out DIR] [--notary-profile NAME] [--push]
 
@@ -22,16 +22,21 @@ whose tracked files must be committed), as the GitHub release is:
      store-credentials", or the PROSPERO_NOTARY_KEY variables);
   3. the Windows program with it embedded, built in the toolchain image
      (tools/toolchain), signed with aas-sign, as Prospero.exe in a zip
-     (tools/winzip.py), as the GitHub release has it.
+     (tools/winzip.py), as the GitHub release has it;
+  4. the Linux GUI with it embedded, for x86_64 and aarch64, each in an
+     image from tools/linuxgui (x86_64 emulated here), built, checked
+     and packed by its build.sh, as the GitHub release's are.
 
 Everything that signs must work: no aas-sign, no Developer ID identity
 in the keychain, or no notary credentials, and nothing is built.
 
 DIR (default: build-itch) gets prospero-VERSION-macos-arm64.dmg,
-prospero-VERSION-windows-x86_64.zip and the engines zip, with .sha256
-files. --push then uploads the dmg and the Windows zip, kept a zip,
-with butler, to the channels mac and windows of skeeto/prospero, at
-the version; without it, the commands that would are printed. It needs an itch.io API key,
+prospero-VERSION-windows-x86_64.zip,
+prospero-VERSION-linux-x86_64.tar.gz,
+prospero-VERSION-linux-aarch64.tar.gz and the engines zip, with .sha256
+files. --push then uploads the dmg, the Windows zip, kept a zip, and
+the Linux tarballs with butler, to the channels mac, windows, linux
+and linux-arm64 of skeeto/prospero, at the version; without it, the commands that would are printed. It needs an itch.io API key,
 from "butler login" or in BUTLER_API_KEY, checked before the build.
 """
 
@@ -39,6 +44,7 @@ import argparse
 import glob
 import hashlib
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -52,6 +58,7 @@ BUNDLE_ID = "com.nullprogram.prospero"
 SIGNER = "CN=Christopher Wellons"
 GAME = "skeeto/prospero"
 IMAGE = "prospero-toolchain"
+LINUXIMAGE = "prospero-linuxgui"
 
 
 def say(msg):
@@ -73,7 +80,7 @@ def checks(args):
     if not shutil.which("aas-sign"):
         sys.exit("itch: no aas-sign on PATH, to sign the Windows programs")
     if not shutil.which("docker"):
-        sys.exit("itch: no docker, for the Linux and Windows builds")
+        sys.exit("itch: no docker, for the engines, Windows and Linux builds")
     ids = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
                          capture_output=True, text=True).stdout
     if f'"{args.identity}"' not in ids:
@@ -208,6 +215,27 @@ def windows(args, src, ver, zip):
     return zip
 
 
+def linux(args, src, ver, zip, arch):
+    """The Linux GUI for arch, in the image tools/linuxgui makes for it."""
+    w = os.path.join(args.work, f"linux-{arch}")
+    if os.path.exists(w):
+        shutil.rmtree(w)
+    os.makedirs(w)
+    shutil.copy2(zip, os.path.join(w, "engines.zip"))
+    plat = {"x86_64": "linux/amd64", "aarch64": "linux/arm64"}[arch]
+    image = f"{LINUXIMAGE}:{arch}"
+    run(["docker", "build", "--platform", plat, "-t", image,
+         os.path.join(src, "tools", "linuxgui")])
+    # Emulated, selftest's spawn timing measures the emulator
+    host = platform.machine().replace("arm64", "aarch64")
+    bench = [] if arch == host else ["-e", "PROSPERO_SELFTEST_NOBENCH=1"]
+    run(["docker", "run", "--rm", "--platform", plat, *bench,
+         "-v", f"{os.path.abspath(src)}:/src:ro", "-v", f"{os.path.abspath(w)}:/w",
+         image, "sh", "/src/tools/linuxgui/build.sh", "/src", "/tmp/b", "/w/out",
+         "-DPROSPERO_EDITION=itch", "-DPROSPERO_ENGINES_ZIP=/w/engines.zip"])
+    return os.path.join(w, "out", f"prospero-{ver}-linux-{arch}.tar.gz")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--commit", default="HEAD", help="what to build (default: HEAD)")
@@ -228,10 +256,11 @@ def main():
     zip = engines(args, src, ver)
     dmg = macos(args, src, ver, zip)
     win = windows(args, src, ver, zip)
+    lin = [linux(args, src, ver, zip, arch) for arch in ("x86_64", "aarch64")]
 
     os.makedirs(args.out, exist_ok=True)
     made = []
-    for path in (dmg, win, zip):
+    for path in (dmg, win, *lin, zip):
         dst = os.path.join(args.out, os.path.basename(path))
         shutil.copyfile(path, dst)
         name = os.path.basename(dst)
@@ -249,7 +278,9 @@ def main():
     shutil.copy2(made[1], winpush)
     pushes = [["butler", "push", made[0], f"{GAME}:mac", "--userversion", ver],
               ["butler", "push", "--no-auto-unzip", winpush, f"{GAME}:windows",
-               "--userversion", ver]]
+               "--userversion", ver],
+              ["butler", "push", made[2], f"{GAME}:linux", "--userversion", ver],
+              ["butler", "push", made[3], f"{GAME}:linux-arm64", "--userversion", ver]]
     for argv in pushes:
         if args.push:
             run(argv)

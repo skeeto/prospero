@@ -412,6 +412,8 @@ static void testoverhead(ProcTest *p, Arena scratch)
     // millisecond of it idle, and past it while anything else runs. The
     // check is at twice that, on the best of the runs, which load slows
     // the least, and a regression in the reaper's start as much as any.
+    // Under emulation (another architecture's build, through Rosetta or
+    // QEMU) it measures the emulator: PROSPERO_SELFTEST_NOBENCH there.
     #if !defined(__OPTIMIZE__) || !defined(NDEBUG) || \
             defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
     b32 measured = 0;
@@ -420,6 +422,7 @@ static void testoverhead(ProcTest *p, Arena scratch)
     #else
     b32 measured = 1;
     #endif
+    measured &= !os_getenv(os, &scratch, "PROSPERO_SELFTEST_NOBENCH").len;
     if (measured) {
         say(os, rt.median>0 && rt.median<5000 ?
                 Str("reaper overhead: within the 5 ms target") :

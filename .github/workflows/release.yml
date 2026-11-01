@@ -172,13 +172,12 @@ jobs:
           path: dist/prospero-${{ steps.version.outputs.version }}.tar.gz
           if-no-files-found: error
 
-  # The GUI links libstdc++ and libgcc statically, its dependencies are
-  # static, and SDL loads X11, Wayland and GL at run time, so the only
-  # floor is the glibc it was built against: Ubuntu 22.04's, pinned by
-  # digest, with Clang from apt.llvm.org (for #embed) and Kitware's CMake
-  # (Ubuntu's 3.22 is too old), pinned by SHA-256. The source is the
-  # build job's tarball. It needs nothing past GLIBC_2.34 (checked), for
-  # Ubuntu 22.04, Debian 12, Fedora 35 and RHEL 10, and later.
+  # Built in Ubuntu 22.04, pinned by digest, as tools/linuxgui's scripts
+  # do it (install.sh, then build.sh), which tools/itch.py runs too, so
+  # that both editions have the same tools and the same floor: glibc's
+  # own libraries and nothing past GLIBC_2.34 (checked), for Ubuntu
+  # 22.04, Debian 12, Fedora 35 and RHEL 10, and later. The source is
+  # the build job's tarball.
   linux-gui:
     name: Linux GUI ${{ matrix.arch }}
     needs: build
@@ -187,104 +186,29 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-26.04
-            cmake: ed85135c5a5135b45e50423cb406dea04ca3338da0b8ef3c9ede963559680be0
           - arch: aarch64
             runner: ubuntu-26.04-arm
-            cmake: 301d5063ab259577c1b57ce5490b1aab9ea5c56dc4c822f73499553dab94925f
     runs-on: ${{ matrix.runner }}
     container: ubuntu:22.04@sha256:e0f80c829509ef4df9e76bd8944eb7b8ec25cbb379b112a7f9448b2c77a77c9b
     timeout-minutes: 45
     env:
       V: ${{ needs.build.outputs.version }}
-      ARCH: ${{ matrix.arch }}
-      CMAKE_VERSION: 4.4.5
-      CMAKE_SHA256: ${{ matrix.cmake }}
-      # apt.llvm.org's signing key
-      LLVM_KEY: 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: source
           path: source
 
-      # The headers SDL builds its X11 and Wayland video against, as in
-      # the build job, and pkg-config, without which SDL quietly leaves
-      # out Wayland
-      - name: Install the tools
-        run: |
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl gnupg \
-              ninja-build binutils pkg-config \
-              libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-              libxfixes-dev libxss-dev libxtst-dev libwayland-dev \
-              libxkbcommon-dev wayland-protocols libdecor-0-dev libegl-dev \
-              libgl-dev
-          k=/usr/share/keyrings/llvm.gpg
-          curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o "$k"
-          if [ "$(gpg --show-keys --with-colons "$k" | awk -F: '$1 == "fpr" {print $10; exit}')" != "$LLVM_KEY" ]; then
-              echo "::error::apt.llvm.org's key is not $LLVM_KEY"
-              exit 1
-          fi
-          echo "deb [signed-by=$k] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-20 main" \
-              >/etc/apt/sources.list.d/llvm.list
-          apt-get update
-          apt-get install -y --no-install-recommends clang-20
-          c=cmake-$CMAKE_VERSION-linux-$ARCH
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$c.tar.gz" \
-              "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/$c.tar.gz"
-          echo "$CMAKE_SHA256  $RUNNER_TEMP/$c.tar.gz" | sha256sum -c
-          tar xzf "$RUNNER_TEMP/$c.tar.gz" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/$c/bin" >>"$GITHUB_PATH"
-
-      - name: Build and test
+      - name: Unpack the source
         run: |
           tar xzf "source/prospero-$V.tar.gz" -C "$RUNNER_TEMP"
-          src=$RUNNER_TEMP/prospero-$V
-          echo "SRC=$src" >>"$GITHUB_ENV"
-          CC=clang-20 CXX=clang++-20 cmake -S "$src" -B build -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS=-s \
-              -DFETCHCONTENT_FULLY_DISCONNECTED=ON
-          cmake --build build
-          ctest --test-dir build -R 'unit|selftest' --output-on-failure
-          test "$(build/prospero --version)" = "prospero $V"
+          echo "SRC=$RUNNER_TEMP/prospero-$V" >>"$GITHUB_ENV"
 
-      # Only glibc's own libraries, and none of its symbols past 2.34;
-      # and SDL's Wayland and X11 video, which load their libraries by
-      # these names
-      - name: Check the floor
-        run: |
-          exe=build/prospero
-          for lib in libwayland-client.so.0 libdecor-0.so.0 libX11.so.6; do
-              if ! grep -qF "$lib" "$exe"; then
-                  echo "::error::the GUI lacks SDL's video through $lib"
-                  exit 1
-              fi
-          done
-          bad=$(readelf -dW "$exe" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' |
-                grep -Ev '^(libc|libm|libdl|libpthread|librt|ld-linux[-a-z0-9_]*)\.so\.[0-9]+$' || true)
-          if [ -n "$bad" ]; then
-              echo "::error::the GUI needs $bad"
-              exit 1
-          fi
-          max=$(readelf -VW "$exe" | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1)
-          echo "newest: $max"
-          if [ "$(printf '%s\n' "$max" GLIBC_2.34 | sort -V | tail -1)" != GLIBC_2.34 ]; then
-              echo "::error::the GUI needs $max"
-              exit 1
-          fi
+      - name: Install the tools
+        run: sh "$SRC/tools/linuxgui/install.sh"
 
-      - name: Pack
-        run: |
-          d=prospero-$V-linux-$ARCH
-          mkdir -p "out/$d"
-          cp build/prospero "out/$d/"
-          cp "$SRC/assets/prospero.desktop" "$SRC/assets/prospero.png" \
-             "$SRC/assets/linux-README.txt" "out/$d/"
-          mv "out/$d/linux-README.txt" "out/$d/README.txt"
-          sh "$SRC/tools/licenses.sh" "$SRC" "out/$d/LICENSES" gui
-          tar czf "out/$d.tar.gz" -C out --owner=0 --group=0 --numeric-owner "$d"
-          rm -r "out/${d:?}"
+      - name: Build, test, check and pack
+        run: sh "$SRC/tools/linuxgui/build.sh" "$SRC" build out
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:

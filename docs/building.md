@@ -113,16 +113,19 @@ To use a helper on the machine itself, save it next to `prospero` as
 
 ### itch.io builds
 
-`tools/itch.py` builds the [itch.io][itch] edition, for macOS and
-Windows, on a Mac with Docker, from a source tarball of a commit: the
+`tools/itch.py` builds the [itch.io][itch] edition, for macOS, Windows
+and Linux, on a Mac with Docker, from a source tarball of a commit: the
 engines as above, the Windows ones signed with `aas-sign` and the macOS
 one with the Developer ID, packed, then embedded in `Prospero.app`
-(signed, tested, on a notarized disk image) and in the Windows program
+(signed, tested, on a notarized disk image), in the Windows program
 (built in the toolchain image, signed with `aas-sign`, as `Prospero.exe`
-in a zip). Without
+in a zip), and in the Linux GUI for x86_64 and aarch64. Those are built
+in Ubuntu 22.04 images from `tools/linuxgui`, x86_64 emulated, by the
+same scripts the release's Linux builds use, so they have the same
+glibc floor. Without
 `aas-sign`, the Developer ID in the keychain, or notary credentials
 (`--notary-profile`, from `xcrun notarytool store-credentials`), it
-builds nothing. `--push` uploads the two with [butler][], which needs
+builds nothing. `--push` uploads the four with [butler][], which needs
 an itch.io API key, from `butler login` or in `BUTLER_API_KEY`; without
 one, it builds nothing either.
 
