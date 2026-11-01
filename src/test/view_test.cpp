@@ -64,6 +64,21 @@ static void test_view(Test *t)
 {
     Arena perm = t->perm;
 
+    // Times in hours, minutes and seconds, a zero unit left out
+    {
+        struct { i64 secs; Str want; } cases[] = {
+            {0, "0 s"}, {45, "45 s"}, {60, "1 min"}, {567, "9 min 27 s"},
+            {3600, "1 h"}, {3605, "1 h 5 s"}, {3661, "1 h 1 min 1 s"},
+            {7320, "2 h 2 min"}, {90000, "25 h"},
+        };
+        for (auto &c : cases) {
+            Arena a = perm;
+            Buf   b(&a, 32);
+            printsecs(&b, c.secs);
+            expect(t, "printsecs", finish(&b), c.want);
+        }
+    }
+
     // Newlines counted eight bytes at a time agree with a byte at a time,
     // whatever bytes surround them
     {

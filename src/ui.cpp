@@ -694,22 +694,11 @@ static void printgrouped(Buf *b, i64 n)
     }
 }
 
-// Seconds as "45 s" or "4 min 5 s".
+// Seconds as "45 s", "4 min 5 s" or "1 h 2 min" (printsecs).
 static Str secstext(Arena *a, i64 secs)
 {
     Buf b(a, 32);
-    if (secs >= 60) {
-        print(&b, secs/60);
-        print(&b, " min");
-        if (secs % 60) {
-            putbyte(&b, ' ');
-            print(&b, secs%60);
-            print(&b, " s");
-        }
-    } else {
-        print(&b, secs);
-        print(&b, " s");
-    }
+    printsecs(&b, secs);
     return finish(&b);
 }
 
@@ -949,7 +938,7 @@ static b32 penbutton(Gui *g, char const *id, Str *runs, i32 *styles, i32 n)
     return hit;
 }
 
-// Milliseconds as "850 ms", "1.2 s" or "3 min 5 s".
+// Milliseconds as "850 ms", "1.2 s", "3 min 5 s" or "1 h 2 min".
 static Str duration(Arena *a, i64 ms)
 {
     Buf b(a, 32);
@@ -960,10 +949,7 @@ static Str duration(Arena *a, i64 ms)
         printfloat(&b, (f64)ms/1000, 1);
         print(&b, " s");
     } else {
-        print(&b, ms/60000);
-        print(&b, " min ");
-        print(&b, ms/1000%60);
-        print(&b, " s");
+        printsecs(&b, ms/1000);
     }
     return finish(&b);
 }
@@ -1447,8 +1433,7 @@ static Str kidlink(Gui *g, Arena *a, ViewTool *t, i64 nowms)
         print(&b, "reconnecting");
         if (left > 0) {
             print(&b, " in ");
-            print(&b, left);
-            print(&b, " s");
+            printsecs(&b, left);
         }
         return finish(&b);
     }
@@ -4560,8 +4545,7 @@ static void drawstrip(Gui *g)
         el = el<0 ? 0 : el;
         schedat(&g->sched, now + (1000 - el%1000)*1000 + 1000, DUE_CLOCK);
         Buf b(&a, 32);
-        print(&b, el/1000);
-        print(&b, " s");
+        printsecs(&b, el/1000);
         ImGui::SameLine();
         ImGui::TextUnformatted(cstr0(&a, finish(&b)));
     }
@@ -4622,12 +4606,7 @@ static void drawstrip(Gui *g)
             i64 secs = (left + 999)/1000;
             Buf e(&a, 48);
             print(&e, "about ");
-            if (secs < 600) {
-                print(&e, secstext(&a, secs));
-            } else {
-                print(&e, (secs + 30)/60);
-                print(&e, " min");
-            }
+            printsecs(&e, secs<600 ? secs : (secs + 30)/60*60);
             print(&e, " left");
             ImGui::SameLine();
             ImGui::TextDisabled("%s", cstr0(&a, finish(&e)));
@@ -4642,12 +4621,10 @@ static void drawstrip(Gui *g)
             schedat(&g->sched, now + (1000 - idle%1000)*1000 + 1000, DUE_CLOCK);
             Buf b(&a, 64);
             print(&b, "no data for ");
-            print(&b, idle/1000);
-            print(&b, " s");
+            printsecs(&b, idle/1000);
             if (red && v->watchat>nowms) {
                 print(&b, ", giving up in ");
-                print(&b, (v->watchat - nowms + 999)/1000);
-                print(&b, " s");
+                printsecs(&b, (v->watchat - nowms + 999)/1000);
             }
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Text, red ? g->pal->bad : g->pal->amber);
@@ -4688,8 +4665,7 @@ static void drawstrip(Gui *g)
         print(&b, " connects");
         if (v->relayuntil > nowms) {
             print(&b, ", for up to ");
-            print(&b, (v->relayuntil - nowms + 59999)/60000);
-            print(&b, " min");
+            printsecs(&b, (v->relayuntil - nowms + 59999)/60000*60);
         }
         ImGui::SameLine();
         ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));

@@ -7395,8 +7395,7 @@ static Str hoststatus(Gui *g, Arena *a, GuiHost *h, i64 left)
     case RS_DOWN: {
         Buf b(a, 64);
         print(&b, "reconnecting in ");
-        print(&b, left);
-        print(&b, " s");
+        printsecs(&b, left);
         return finish(&b);
     }
     case RS_DEPLOYING:  return "deploying an engine";

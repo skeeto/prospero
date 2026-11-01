@@ -1741,6 +1741,27 @@ static void toolbody(View *v, Arena scratch, ViewMsg *m, Str text)
     settext(v, m, withcmd(&scratch, t, text), 0);
 }
 
+// Seconds as "45 s", "4 min 5 s" or "1 h 2 min", leaving out a unit
+// that is zero.
+static void printsecs(Buf *b, i64 secs)
+{
+    i64 h = secs/3600, m = secs/60%60, s = secs%60;
+    if (h) {
+        print(b, h);
+        print(b, " h");
+    }
+    if (m) {
+        print(b, h ? Str(" ") : Str(""));
+        print(b, m);
+        print(b, " min");
+    }
+    if (s || (!h && !m)) {
+        print(b, h||m ? Str(" ") : Str(""));
+        print(b, s);
+        print(b, " s");
+    }
+}
+
 
 // Records
 
@@ -2305,13 +2326,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                 printfloat(&b, (f64)delay/1000, 1);
                 print(&b, " s");
             } else {
-                print(&b, delay/60000);
-                print(&b, " min");
-                if (delay/1000%60) {
-                    putbyte(&b, ' ');
-                    print(&b, delay/1000%60);
-                    print(&b, " s");
-                }
+                printsecs(&b, delay/1000);
             }
             print(&b, slow ? Str(" before trying again (a slow retry)") : Str(""));
             if (model.len && model!=v->model) {
