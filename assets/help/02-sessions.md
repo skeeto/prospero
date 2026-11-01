@@ -46,7 +46,9 @@ once.
 Enter sends the prompt. The transcript shows your messages as
 Markdown, as it does the agent's: code fences, `inline code`, lists and
 emphasis render, while each line break stays as you typed it and HTML
-tags show as text. The agent gets exactly what you typed. The buttons
+tags show as text. The agent gets exactly what you typed. With the
+mouse over a message, its header shows when it was sent, or when the
+agent finished it, in local time, with the date if not today. The buttons
 beside the prompt box are icons,
 named in their tooltips: Send (a paper plane), and Attach (a paper
 clip). While the agent works, Send becomes Steer (a curved arrow), and

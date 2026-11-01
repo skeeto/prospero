@@ -4335,6 +4335,7 @@ static void drawtranscript(Gui *g)
     g->rects[RECT_CODEBLOCK] = {};
     g->rects[RECT_CODECOPY]  = {};
     g->copiedshown = 0;
+    g->clockshown  = 0;
     g->bgshown     = 0;
     g->stopshown   = 0;
     sp->Split(dl, CH_COUNT);
@@ -4378,6 +4379,23 @@ static void drawtranscript(Gui *g)
         f32       actw = act.kind ? actwidth(&act) + 8*sc : 0;
         Pen p = {dl, &g->fonts, x, y + pad/4, x + width - actw, g->fonts.size*0.85f};
         drawheader(g, &p, v, m, nowms);
+        if ((m->role==VIEW_USER || m->role==VIEW_ASSISTANT) && m->ts &&
+                ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(box0, box1)) {
+            // When it was sent, or finished, at the header's right,
+            // over room the header line has anyway
+            Arena a = g->frame;
+            Buf   b(&a, 32);
+            printclock(&b, m->ts, os_utcoffset(g->os, m->ts), nowms,
+                       os_utcoffset(g->os, nowms));
+            Str     s    = finish(&b);
+            ImFont *font = stylefont(&g->fonts, 0);
+            f32     w    = font->CalcTextSizeA(p.size, 1e9f, 0, s.cdata, s.cdata+s.len).x;
+            if (p.right - w >= p.x + 2*g->fonts.size) {
+                p.x = p.right - w;
+                pen(&p, s, 0, fade(g->pal->dim, 0.8f));
+                g->clockshown = 1;
+            }
+        }
         if (!m->collapsed) {
             Marks mk = msgmarks(g, v, i);
             drawmsgtext(g, dl, sp, &ta, i, ml, v2(x, y + head), sel, &mk, alpha, 1);

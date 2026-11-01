@@ -101,6 +101,9 @@ static void testbasics(Selftest *t, Arena scratch)
     i64 now = os_time(os);
     check(t, now > 1767225600000, "os_time is after 2026-01-01");
     check(t, now < 4102444800000, "os_time is before 2100-01-01");
+    i64 off = os_utcoffset(os, now);
+    check(t, off>=-14*3600 && off<=14*3600 && off%900==0,
+          "os_utcoffset is a time zone's: within 14 hours, in quarter hours");
 
     u64 seen[16] = {};
     b32 distinct = 1;

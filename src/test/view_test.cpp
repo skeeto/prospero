@@ -79,6 +79,26 @@ static void test_view(Test *t)
         }
     }
 
+    // A message's time: its clock today, its date otherwise, its year
+    // if another; local by each time's own offset
+    {
+        i64 now = 1793546320000;  // 2026-11-01 15:18:40 UTC
+        struct { i64 ms, off; Str want; } cases[] = {
+            {now, 0, "15:18:40"},
+            {now - 3600000, -5*3600, "09:18:40"},          // offsets at each
+            {now - 16*3600000, 0, "Oct 31 23:18:40"},
+            {1767225599000, 0, "Dec 31 2025 23:59:59"},
+            {1767225600000, 0, "Jan 1 00:00:00"},
+            {-1000, 0, "Dec 31 1969 23:59:59"},
+        };
+        for (auto &c : cases) {
+            Arena a = perm;
+            Buf   b(&a, 32);
+            printclock(&b, c.ms, c.off, now, c.off);
+            expect(t, "printclock", finish(&b), c.want);
+        }
+    }
+
     // Newlines counted eight bytes at a time agree with a byte at a time,
     // whatever bytes surround them
     {

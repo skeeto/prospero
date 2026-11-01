@@ -110,6 +110,7 @@ static void os_release(Os *, Region *r)
 
 static i64 os_ticks(Os *os) { return os->now; }
 static i64 os_time(Os *os) { return os->now / 1000; }
+static i64 os_utcoffset(Os *, i64) { return 0; }
 
 static u64 os_random(Os *os)
 {

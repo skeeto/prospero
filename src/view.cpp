@@ -408,6 +408,8 @@ struct ViewMsg {
     i64       chars;      // reasoning: code points in its text
     i64       ts0;        // reasoning: its first and last deltas, epoch
     i64       ts1;        //   ms, or 0 where it did not stream
+    i64       ts;         // the user's taken in, the agent's finished:
+                          //   epoch ms, 0 if not known
     Str       label;      // the header, if not the role's name
     Str       from;       // a message's sender, a session's id, or the
                           // endpoint's URL of a mark of a model, or the
@@ -1762,6 +1764,65 @@ static void printsecs(Buf *b, i64 secs)
     }
 }
 
+static void print2(Buf *b, i64 n)
+{
+    putbyte(b, (u8)('0' + n/10));
+    putbyte(b, (u8)('0' + n%10));
+}
+
+// The date of a day counted from 1970-01-01, proleptic Gregorian
+// (Howard Hinnant's days_from_civil, inverted).
+static void civildate(i64 days, i64 *year, i32 *month, i32 *day)
+{
+    days += 719468;
+    i64 era = (days>=0 ? days : days-146096) / 146097;
+    i64 doe = days - era*146097;
+    i64 yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    i64 doy = doe - (365*yoe + yoe/4 - yoe/100);
+    i64 mp  = (5*doy + 2) / 153;
+    *day   = (i32)(doy - (153*mp + 2)/5 + 1);
+    *month = (i32)(mp<10 ? mp+3 : mp-9);
+    *year  = yoe + era*400 + (*month<=2);
+}
+
+static i64 floordiv(i64 a, i64 b)
+{
+    return a/b - (a%b && (a<0)!=(b<0));
+}
+
+// An epoch time in milliseconds as a clock shows it, local by off, the
+// zone's offset east in seconds then: "14:05:32", with the date if not
+// today's, "Oct 30 14:05:32", and the year if not this year's, "Oct 30
+// 2025 14:05:32", where now and nowoff say what today is.
+static void printclock(Buf *b, i64 ms, i64 off, i64 now, i64 nowoff)
+{
+    static char const months[][4] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    i64 t = floordiv(ms, 1000) + off;
+    i64 d = floordiv(t, 86400);
+    i64 n = floordiv(floordiv(now, 1000) + nowoff, 86400);
+    if (d != n) {
+        i64 y, ny;
+        i32 m, md, nm, nd;
+        civildate(d, &y, &m, &md);
+        civildate(n, &ny, &nm, &nd);
+        print(b, Str(months[m-1]));
+        putbyte(b, ' ');
+        print(b, (i64)md);
+        if (y != ny) {
+            putbyte(b, ' ');
+            print(b, y);
+        }
+        putbyte(b, ' ');
+    }
+    i64 s = t - d*86400;
+    print2(b, s/3600);
+    putbyte(b, ':');
+    print2(b, s/60%60);
+    putbyte(b, ':');
+    print2(b, s%60);
+}
+
 
 // Records
 
@@ -1907,6 +1968,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         }
         i32 i = addmsg(v, VIEW_USER, typed);
         v->msgs[i].seq   = r->seq;
+        v->msgs[i].ts    = r->ts;
         for (Json *k = jsonget(j, "images")->child; k; k = k->next) {
             ViewImage im = {};
             im.name = clone(&v->aux, jsonstr(jsonget(k, "name")));
@@ -2075,6 +2137,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                 takethink(&v->msgs[i], was, n++);
             } else if (t == "text") {
                 i = addmsg(v, VIEW_ASSISTANT, jsonstr(jsonget(b, "text")));
+                v->msgs[i].ts = r->ts;
             } else if (t == "call") {
                 Str id = jsonstr(jsonget(b, "id"));
                 i = addcall(v, scratch, id, jsonstr(jsonget(b, "name")),

@@ -104,6 +104,9 @@ static void    os_release(Os *, Region *);
 static i64     os_ticks(Os *);
 // Current time in Unix epoch milliseconds.
 static i64     os_time(Os *);
+// Local time's offset from UTC, in seconds east, at an epoch time in
+// milliseconds: the time zone's, with daylight saving then.
+static i64     os_utcoffset(Os *, i64 ms);
 // 64 bits from the operating system's entropy source.
 static u64     os_random(Os *);
 

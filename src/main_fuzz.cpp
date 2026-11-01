@@ -96,6 +96,7 @@ static Region *os_reserve(Os *, iz) { return 0; }
 static void os_release(Os *, Region *) {}
 static i64  os_ticks(Os *) { return 0; }
 static i64  os_time(Os *) { return 0; }
+static i64  os_utcoffset(Os *, i64) { return 0; }
 static u64  os_random(Os *) { return 0; }
 
 static Read os_read(Os *os, Arena *a, Str, iz max)

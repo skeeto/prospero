@@ -144,6 +144,10 @@ struct Filetime {
     u32 hi;
 };
 
+struct Systemtime {
+    unsigned short year, month, weekday, day, hour, minute, second, ms;
+};
+
 struct FileAttributes {  // WIN32_FILE_ATTRIBUTE_DATA
     u32      attr;
     Filetime ctime;
@@ -259,6 +263,7 @@ W32(uz,     CreateThread(uz, iz, u32 (__stdcall *)(void *), void *, i32,
 W32(b32,    DeleteFileW(c16 *));
 W32(void,   EnterCriticalSection(CriticalSection *));
 W32(void,   ExitProcess[[noreturn]](i32));
+W32(b32,    FileTimeToSystemTime(Filetime *, Systemtime *));
 W32(b32,    FindClose(uz));
 W32(uz,     FindFirstFileExW(c16 *, i32, FindData *, i32, uz, i32));
 W32(b32,    FindNextFileW(uz, FindData *));
@@ -293,6 +298,8 @@ W32(b32,    SetEvent(uz));
 W32(b32,    SetFilePointerEx(uz, i64, i64 *, i32));
 W32(void,   SetLastError(i32));
 W32(u8,     SystemFunction036(void *, i32));  // RtlGenRandom (advapi32)
+W32(b32,    SystemTimeToFileTime(Systemtime *, Filetime *));
+W32(b32,    SystemTimeToTzSpecificLocalTime(void *, Systemtime *, Systemtime *));
 W32(byte *, VirtualAlloc(uz, iz, i32, i32));
 W32(b32,    VirtualFree(uz, iz, i32));
 W32(i32,    WaitForSingleObject(uz, i32));
@@ -539,6 +546,19 @@ static i64 os_time(Os *)
     Filetime ft = {};
     GetSystemTimeAsFileTime(&ft);
     return unixms(ft);
+}
+
+static i64 os_utcoffset(Os *, i64 ms)
+{
+    u64        ticks = (u64)(ms + 11644473600000) * 10000;
+    Filetime   utc   = {(u32)ticks, (u32)(ticks>>32)}, loc = {};
+    Systemtime su = {}, sl = {};
+    if (!FileTimeToSystemTime(&utc, &su) ||
+            !SystemTimeToTzSpecificLocalTime(0, &su, &sl) ||
+            !SystemTimeToFileTime(&sl, &loc)) {
+        return 0;
+    }
+    return (unixms(loc) - unixms(utc)) / 1000;
 }
 
 static u64 os_random(Os *os)

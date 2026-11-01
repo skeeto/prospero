@@ -1565,6 +1565,7 @@ struct Gui {
     i64                thinksecs0;
     b32                thinkhidshown; // the strip said reasoning is hidden
     b32                copiedshown;  // a code block's button said Copied
+    b32                clockshown;   // a message's time, under the mouse
     i32                gaugeshown;   // the gauge drew: 1, 2 if amber
     i32                drivecodemsg; // the code block selectcode chose, or
     i32                drivecodeblk; //   -1 for any
@@ -11008,6 +11009,7 @@ enum : i32 {
     CHK_AMBER,
     CHK_RETRYSHOWN,
     CHK_ETASHOWN,
+    CHK_CLOCKSHOWN,
     CHK_DIAGS,
     CHK_ADDEXISTS,
     CHK_ROQUIET,
@@ -11300,7 +11302,7 @@ static Str chknames[] = {
     "a closed session opened, its log replayed",
     "a session held elsewhere opened read-only, with its banner",
     "amber after 15 s without data", "a retry's countdown shown",
-    "the prompt's time left shown",
+    "the prompt's time left shown", "a message's time shown under the mouse",
     "configuration diagnostics listed with file and line",
     "adding a section that exists changed nothing",
     "a read-only session's turn runs elsewhere, with no clock here",
@@ -12205,6 +12207,10 @@ static DriveOp m3ops[] = {
     {OP_CHECK, CHK_ETASHOWN, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "1-eta"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    // When that message was sent, shown under the mouse
+    {OP_MOVE, T_USERMSG, 0, 0, 300, ""},
+    {OP_CHECK, CHK_CLOCKSHOWN, 0, 0, 0, ""},
+    {OP_SHOT, 0, 0, 0, 300, "1-clock"},
     // The mouse wheel, drag-selecting past the edge, and copying code,
     // over what that turn made: from near the top, after scrolling up
     // past the long answer, so that the selection spans messages
@@ -17392,6 +17398,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->retryshown;
     case CHK_ETASHOWN:
         return g->etashown;
+    case CHK_CLOCKSHOWN:
+        return g->clockshown;
     case CHK_ADDEXISTS:
         return find(g->cfgstatus, "already exists")>=0 && !g->cfgset;
     case CHK_ROQUIET:

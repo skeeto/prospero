@@ -226,6 +226,13 @@ static i64 os_time(Os *)
     return (i64)ts.tv_sec*1000 + ts.tv_nsec/1000000;
 }
 
+static i64 os_utcoffset(Os *, i64 ms)
+{
+    time_t    t  = (time_t)(ms>=0 ? ms/1000 : (ms - 999)/1000);
+    struct tm tm = {};
+    return localtime_r(&t, &tm) ? (i64)tm.tm_gmtoff : 0;
+}
+
 static u64 os_random(Os *os)
 {
     u64 r = 0;
