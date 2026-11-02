@@ -1585,14 +1585,22 @@ class Far:
 
 
 def ctrready(args):
-    """Why --mode containers cannot run here, else None."""
-    if not shutil.which(args.runtime):
-        return f"no {args.runtime}"
-    r = subprocess.run([args.runtime, "version", "--format", "{{.Server.Version}}"],
-                       capture_output=True, text=True, timeout=30)
-    if r.returncode:
-        return f"{args.runtime} is not running"
-    r = subprocess.run([args.runtime, "image", "inspect", "--format", "{{.Os}}", args.image],
+    """Why --mode containers cannot run here, else None. With --runtime
+    auto, args.rt becomes the one the window should pick: the first of
+    docker and podman that answers."""
+    names = ["docker", "podman"] if args.runtime == "auto" else [args.runtime]
+    args.rt = None
+    for name in names:
+        if not shutil.which(name):
+            continue
+        r = subprocess.run([name, "version", "--format", "{{.Server.Version}}"],
+                           capture_output=True, text=True, timeout=30)
+        if not r.returncode:
+            args.rt = name
+            break
+    if not args.rt:
+        return f"no {' or '.join(names)} that answers"
+    r = subprocess.run([args.rt, "image", "inspect", "--format", "{{.Os}}", args.image],
                        capture_output=True, text=True, timeout=30)
     if r.returncode or r.stdout.strip() != "linux":
         return f"no {args.image} here (pull it, or pass --image)"
@@ -1605,7 +1613,7 @@ class CtrWatch:
     before are never touched. Any left at the end is removed, by name."""
 
     def __init__(self, args):
-        self.rt = args.runtime
+        self.rt = args.rt
         self.before = set(self.names())
         self.seen = {}
         self.done = threading.Event()
@@ -1686,8 +1694,9 @@ def main():
     ap.add_argument("--model", help="with --mode e2e: the model (required)")
     ap.add_argument("--image", default="alpine:latest",
                     help="with --mode containers: the image, already pulled")
-    ap.add_argument("--runtime", default="docker",
-                    help="with --mode containers: docker or podman")
+    ap.add_argument("--runtime", default="auto",
+                    help="with --mode containers: docker, podman, or auto (the "
+                         "first that answers, as the window picks)")
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--keep", action="store_true", help="keep the directories")
     ap.add_argument("--url", help="with --mode e2e: the endpoint (default http://localhost/)")
@@ -1852,6 +1861,7 @@ def main():
         before = config(curl, model, 60) + (f"\n# The checklist's container\n[container]\n"
                                             f"runtime = {args.runtime}\n"
                                             f"images = {args.image}\n")
+        print(f"containers: {args.rt}, as {args.runtime} picks")
         ctrwatch = CtrWatch(args)
     host.write(ini, before)
 

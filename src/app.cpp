@@ -8633,9 +8633,8 @@ static void guictrthread(void *arg)
     } else switch (j->kind) {
     case CJOB_PROBE: {
         Str        path = os_getenv(j->os, &scratch, "PROSPERO_TEST_DOCKER");
-        CtrRuntime rt   = ctrfind(j->os, &perm, scratch, path.len ? path : j->setting,
-                                  j->envpath);
-        ctrprobe(run, &perm, scratch, &rt);
+        CtrRuntime rt   = ctrpick(run, j->os, &perm, scratch,
+                                  path.len ? path : j->setting, j->envpath);
         Buf b(&perm, 256);
         print(&b, rt.name);    putbyte(&b, '\n');
         print(&b, rt.path);    putbyte(&b, '\n');

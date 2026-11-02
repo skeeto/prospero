@@ -161,6 +161,8 @@ static DeployRun ctrrun(CtrRun *r, Arena *a, Slice<Str> argv, i64 timeout, Str i
     return deployrun(&r->d, a, argv, timeout, input);
 }
 
+static Str ctrsaid(Arena *, DeployRun *, Str);
+
 // Whether the runtime's daemon answers, and its version: Docker
 // Desktop or a Podman machine may be installed but stopped.
 static void ctrprobe(CtrRun *run, Arena *perm, Arena scratch, CtrRuntime *rt)
@@ -184,7 +186,49 @@ static void ctrprobe(CtrRun *run, Arena *perm, Arena scratch, CtrRuntime *rt)
         rt->version = clone(perm, v);
         return;
     }
-    rt->why = concat(perm, ctrtitle(rt->name), " isn't running");
+    // Not running, as its client says it in a few ways, else what it
+    // said: permission denied, from Docker for a user outside its group
+    Str said = ctrsaid(&scratch, &r, Str("version"));
+    Str down[] = {"Cannot connect", "cannot connect", "Is the docker daemon running",
+                  "connection refused", "no such file or directory"};
+    b32 off = r.timeout;
+    for (i32 i = 0; !off && i < countof(down); i++) {
+        off = find(said, down[i]) >= 0;
+    }
+    rt->why = off || !said.len ? concat(perm, ctrtitle(rt->name), " isn't running")
+            : concat(perm, concat(perm, ctrtitle(rt->name), " didn't answer: "), said);
+}
+
+// The runtime to use, as [container] runtime says, asked whether it
+// answers: auto (or unset) takes the first installed that answers,
+// Docker then Podman, else the first installed, saying why it doesn't.
+static CtrRuntime ctrpick(CtrRun *run, Os *os, Arena *perm, Arena scratch, Str setting,
+                          Str path)
+{
+    setting = trim(setting);
+    if (setting.len && setting!="auto") {
+        CtrRuntime rt = ctrfind(os, perm, scratch, setting, path);
+        ctrprobe(run, perm, scratch, &rt);
+        return rt;
+    }
+    CtrRuntime first = {};
+    Str        names[] = {"docker", "podman"};
+    for (i32 i = 0; i < countof(names); i++) {
+        CtrRuntime rt = ctrfind(os, perm, scratch, names[i], path);
+        if (!rt.path.len) {
+            continue;
+        }
+        ctrprobe(run, perm, scratch, &rt);
+        if (rt.up) {
+            return rt;
+        }
+        first = first.path.len ? first : rt;
+    }
+    if (!first.path.len) {
+        first = ctrfind(os, perm, scratch, "auto", path);  // none: Docker's name
+        ctrprobe(run, perm, scratch, &first);
+    }
+    return first;
 }
 
 // prospero-NAME, the container's own name.
