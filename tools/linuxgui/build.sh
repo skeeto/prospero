@@ -11,7 +11,7 @@
 # and LICENSES. The program must need only glibc's own libraries, and
 # none of their symbols past GLIBC_2.34 (Ubuntu 22.04, Debian 12,
 # Fedora 35, RHEL 10, and later), and must have SDL's Wayland and X11
-# video, which load their libraries by name.
+# video and its D-Bus, which load their libraries by name.
 set -eu
 src=$1
 build=$2
@@ -42,6 +42,12 @@ for lib in libwayland-client.so.0 libdecor-0.so.0 libX11.so.6; do
         exit 1
     fi
 done
+# SDL's D-Bus (the portal's file dialogs and theme, fcitx), which loads
+# libdbus by name, and is built only where its headers are
+if ! grep -qF org.freedesktop.portal.FileChooser "$exe"; then
+    echo "build.sh: the GUI lacks SDL's D-Bus" >&2
+    exit 1
+fi
 bad=$(readelf -dW "$exe" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' |
       grep -Ev '^(libc|libm|libdl|libpthread|librt|ld-linux[-a-z0-9_]*)\.so\.[0-9]+$' || true)
 if [ -n "$bad" ]; then

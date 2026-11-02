@@ -7,9 +7,10 @@
 #
 # The GUI links libstdc++ and libgcc statically, its dependencies are
 # static, and SDL loads X11, Wayland and GL at run time, so the only
-# floor is this system's glibc. SDL builds its X11 and Wayland video
-# against these headers, and needs pkg-config, without which it quietly
-# leaves out Wayland. Clang comes from apt.llvm.org (for #embed), its
+# floor is this system's glibc. SDL builds its X11 and Wayland video,
+# and its D-Bus (the portal's file dialogs and theme, fcitx), against
+# these headers, and needs pkg-config, without which it quietly leaves
+# out Wayland. Clang comes from apt.llvm.org (for #embed), its
 # key checked, and CMake from Kitware (Ubuntu's 3.22 is too old),
 # pinned by SHA-256, into /opt, linked from /usr/local/bin.
 set -eu
