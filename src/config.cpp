@@ -78,8 +78,8 @@
 //
 // Only the user's own file chooses what runs: its [remote] and [shell]
 // sections, its MCP servers' commands, a shell, git, the editor, and
-// where programs are found. An included file's [remote], [shell] and
-// [desktop] settings, those of cfgruns and plaintext secrets are
+// where programs are found. An included file's [remote], [shell],
+// [container] and [desktop] settings, those of cfgruns and plaintext secrets are
 // ignored, so a shared file, local or from the web, can point the
 // harness at endpoints, models, MCP servers by url and search services,
 // and reach the environment variables that env:NAME names, but cannot
@@ -248,6 +248,7 @@ static CfgKind cfgkinds[] = {
     {"web",      0, "Web search and reading web pages: the web_search and web_fetch tools"},
     {"host",     0, "The engine as a background host (prospero serve)"},
     {"remote",   1, "An engine on another machine, reached over ssh, or in a WSL distro"},
+    {"container", 0, "Container sessions: Docker or Podman containers made for sessions"},
     {"mcp",      1, "An MCP server, whose tools the agent may use"},
 };
 
@@ -630,6 +631,29 @@ static CfgKey cfgschema[] = {
      "command; an installed WSL distro is such a host too, unless its "
      "section says no"},
 
+    {"container", "runtime", CFG_STRING, "auto", {}, {}, "container",
+     "The container runtime: auto (docker if found, else podman), docker, "
+     "podman, or its program's path"},
+    {"container", "network", CFG_BOOL, "false", {}, {}, "container",
+     "Whether a new container session has network access, as New session's "
+     "box starts; off, it has none (--network none), and its model calls "
+     "still go through this computer"},
+    {"container", "cpus", CFG_STRING, "", {}, {}, "container",
+     "CPUs a container may use (--cpus), by default as many as the runtime "
+     "gives it"},
+    {"container", "memory", CFG_STRING, "", {}, {}, "container",
+     "Memory a container may use (--memory), as 4g, by default as much as "
+     "the runtime gives it"},
+    {"container", "args", CFG_STRING, "", {}, {}, "container",
+     "More arguments to the runtime's create, split at blanks with '...' or "
+     "\"...\" quoting: --cap-add=SYS_PTRACE, say"},
+    {"container", "images", CFG_STRING, "", {}, {}, "container",
+     "Images New session offers first, by name, separated by blanks or "
+     "commas: debian:12, ubuntu:24.04"},
+    {"container", "list", CFG_ENUM, "always", {}, "always never", "container",
+     "Whether the session list shows the container runtime when one is "
+     "installed: always, or never"},
+
     {"mcp", "command", CFG_STRING, "", {}, {}, "mcp",
      "The server's program and its arguments, run without a shell (quote "
      "words with blanks in them), speaking MCP on its standard input and "
@@ -1005,7 +1029,7 @@ static b32 cfgownonly(CfgKey *k, Str v)
         return k->key=="ask" && cfgbool(v)==0;
     }
     return k->kind=="remote" || k->kind=="desktop" || k->kind=="shell" ||
-           cfgruns(k, v);
+           k->kind=="container" || cfgruns(k, v);
 }
 
 // A role's tools may name MCP tools: mcp__SERVER, or mcp__SERVER__TOOL.
@@ -1157,6 +1181,9 @@ static Str cfgproblem(Arena *a, CfgKey *k, Str v, b32 shared)
         return finish(&b);
     } else if (shared && k->kind=="shell") {
         return "a [shell] setting in an included file is ignored, since it "
+               "chooses what runs: set it in your own file";
+    } else if (shared && k->kind=="container") {
+        return "a [container] setting in an included file is ignored, since it "
                "chooses what runs: set it in your own file";
     } else if (shared && k->kind=="desktop") {
         return "a [desktop] setting in an included file is ignored, since it "

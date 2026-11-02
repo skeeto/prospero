@@ -436,7 +436,8 @@ static void testcfgvalidate(Test *t)
         "web_search, web_fetch, desktop, *, default\n"
         "/c/prospero.ini:21:2: warning: unknown section kind \"provider\", "
         "expected endpoint, model, role, guard, tools, shell, instructions, "
-        "skills, memory, worktree, sessions, ui, desktop, web, host, remote or mcp\n"
+        "skills, memory, worktree, sessions, ui, desktop, web, host, remote, "
+        "container or mcp\n"
         "/c/prospero.ini:23:8: warning: [guard] takes no name, or its "
         "settings are unused\n"
         "/c/team.ini:4:7: error: a plaintext secret in an included file is "
@@ -1096,7 +1097,14 @@ static void testcfgjson(Test *t)
         "web//results=8*\n"
         "web//searches=200*\n"
         "host//idle_exit=600*\n"
-        "host//grace=10800*\n");
+        "host//grace=10800*\n"
+        "container//runtime=auto*\n"
+        "container//network=false*\n"
+        "container//cpus=*\n"
+        "container//memory=*\n"
+        "container//args=*\n"
+        "container//images=*\n"
+        "container//list=always*\n");
 
     Json *schema = jsonget(j, "schema");
     expect(t, "json.schema", istr(&a, jsonlen(schema)),

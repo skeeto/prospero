@@ -655,6 +655,7 @@ static u32     os_guilimits(Os *);
 #include "door.cpp"
 #include "deploy.cpp"
 #include "remote.cpp"
+#include "container.cpp"
 #include "hostlink.cpp"
 #include "selftest.cpp"
 #include "selftest_io.cpp"

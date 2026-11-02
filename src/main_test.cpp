@@ -615,6 +615,7 @@ static Str istr(Arena *a, i64 v)
 #include "test/worktree_test.cpp"
 #include "test/deploy_test.cpp"
 #include "test/hostlink_test.cpp"
+#include "test/container_test.cpp"
 #include "test/eval_test.cpp"
 #include "deskhelp.cpp"
 #include "test/desktop_test.cpp"
@@ -696,6 +697,7 @@ int main()
     test_deploywsl(&t);
     test_deploywslsaid(&t);
     test_hostlink(&t);
+    test_container(&t);
     test_eval(&t);
     test_desktop(&t);
     test_image(&t);

@@ -10,7 +10,8 @@ until a setting is first saved, which writes the file from its
 built-in copy ([assets/prospero.ini](../assets/prospero.ini)). The copy
 sets nothing, and documents every section and key: `[endpoint NAME]`,
 `[model NAME]`, `[role NAME]`, `[guard]`, `[tools]`, `[instructions]`,
-`[skills]`, `[sessions]`, `[ui]`, `[desktop]`, `[host]` and `[remote NAME]`. Changes take effect while it
+`[skills]`, `[sessions]`, `[ui]`, `[desktop]`, `[host]`, `[remote NAME]`
+and `[container]`. Changes take effect while it
 runs. An unknown key or a bad value is reported in the diagnostics,
 and a bad value falls back to its default: nothing in the file keeps
 Prospero from starting. The settings window edits the file a line at a
@@ -34,7 +35,8 @@ override. An include may be a path or an http or https URL, which is
 fetched at startup, cached, and refreshed in the background, and may
 be pinned to a SHA-256. Nothing in an included file can make Prospero
 run a command, or let the agent act without asking: its plaintext
-secrets and `file:` secrets, `[remote]` and `[desktop]` settings, an
+secrets and `file:` secrets, `[remote]`, `[container]` and `[desktop]`
+settings, an
 `[mcp]` section's `command`, `cwd`, `env.NAME` and `trust = yes`,
 `[web] ask = no`, `[tools] path_prepend` and `path_append`, a
 `[tools] shell` other than a keyword, and `[ui] editor` and `terminal`
