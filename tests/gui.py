@@ -27,6 +27,9 @@ by quitting are gone, with no engine process left behind.
   uv run tests/gui.py --prospero build/prospero --mode launch [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode firstrun [--shots DIR]
   uv run tests/gui.py --prospero build/prospero --mode changes [--shots DIR]
+  uv run tests/gui.py --prospero build/prospero --mode containers [--image IMAGE]
+      (a real Docker or Podman, running, with IMAGE, a Linux one, already
+      pulled; a Linux engine for it in the engines directory)
 
 The settings mode edits a value longer than a field's slack and picks
 the theme, dark then light, from its list over a transcript that shows
@@ -1581,6 +1584,82 @@ class Far:
         return problems
 
 
+def ctrready(args):
+    """Why --mode containers cannot run here, else None."""
+    if not shutil.which(args.runtime):
+        return f"no {args.runtime}"
+    r = subprocess.run([args.runtime, "version", "--format", "{{.Server.Version}}"],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        return f"{args.runtime} is not running"
+    r = subprocess.run([args.runtime, "image", "inspect", "--format", "{{.Os}}", args.image],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode or r.stdout.strip() != "linux":
+        return f"no {args.image} here (pull it, or pass --image)"
+    return None
+
+
+class CtrWatch:
+    """--mode containers: the runtime's containers made during the run,
+    as it lists them, each inspected once when first seen: those there
+    before are never touched. Any left at the end is removed, by name."""
+
+    def __init__(self, args):
+        self.rt = args.runtime
+        self.before = set(self.names())
+        self.seen = {}
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+        self.thread.start()
+
+    def names(self):
+        r = subprocess.run([self.rt, "ps", "-a", "--filter", "label=com.nullprogram.prospero",
+                            "--format", "{{.Names}}"], capture_output=True, text=True,
+                           timeout=30)
+        return [n for n in r.stdout.split() if n.startswith("prospero-")]
+
+    def watch(self):
+        while not self.done.wait(0.5):
+            for n in self.names():
+                if n in self.before or n in self.seen:
+                    continue
+                r = subprocess.run([self.rt, "inspect", n], capture_output=True, text=True,
+                                   timeout=30)
+                try:
+                    self.seen[n] = json.loads(r.stdout)[0]
+                except (ValueError, IndexError):
+                    pass
+
+    def close(self, state):
+        self.done.set()
+        self.thread.join(timeout=60)
+        problems = []
+        if len(self.seen) != 1:
+            problems.append(f"containers made: {sorted(self.seen)}, not one")
+        for n, j in self.seen.items():
+            hc = j.get("HostConfig", {})
+            labels = j.get("Config", {}).get("Labels") or {}
+            binds = [m for m in j.get("Mounts", []) if m.get("Type") == "bind"]
+            if hc.get("NetworkMode") != "none":
+                problems.append(f"{n}: network {hc.get('NetworkMode')}, not none")
+            if labels.get("com.nullprogram.prospero") != "1" or \
+                    not labels.get("com.nullprogram.prospero.owner"):
+                problems.append(f"{n}: labels {labels}")
+            if [m.get("Destination") for m in binds] != ["/prospero/state"] or \
+                    not os.path.realpath(binds[0].get("Source", "")).startswith(
+                        os.path.realpath(state)):
+                problems.append(f"{n}: binds {binds}, not its state alone")
+            if not hc.get("Init"):
+                problems.append(f"{n}: no --init")
+            print(f"container {n}: network none, labelled, its state bound, --init")
+        left = set(self.names()) - self.before
+        for n in sorted(left):
+            # Made during the run, so the window's: removed by name
+            subprocess.run([self.rt, "rm", "-f", n], capture_output=True, timeout=60)
+            problems.append(f"container {n} left after its Delete")
+        return problems
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--prospero", required=True,
@@ -1595,7 +1674,7 @@ def main():
                     choices=["drive", "idle", "streamtest", "e2e", "signals",
                              "settings", "enginestop", "bench", "background", "remote",
                              "compose", "sessions", "plan", "launch", "firstrun",
-                             "mcp", "hosttask", "changes", "thin"])
+                             "mcp", "hosttask", "changes", "thin", "containers"])
     ap.add_argument("--ssh", help="with --mode remote: the remote host, over real ssh "
                                   "(default: this machine, through a fake ssh)")
     ap.add_argument("--remote-prospero", help="with --ssh: the harness built there")
@@ -1605,6 +1684,10 @@ def main():
                     help="with --ssh: a Windows host whose login shell is cmd.exe, "
                          "with w64devkit for the test's scripts")
     ap.add_argument("--model", help="with --mode e2e: the model (required)")
+    ap.add_argument("--image", default="alpine:latest",
+                    help="with --mode containers: the image, already pulled")
+    ap.add_argument("--runtime", default="docker",
+                    help="with --mode containers: docker or podman")
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--keep", action="store_true", help="keep the directories")
     ap.add_argument("--url", help="with --mode e2e: the endpoint (default http://localhost/)")
@@ -1624,6 +1707,14 @@ def main():
     if args.mode == "changes" and not shutil.which("git"):
         print("changes: skipped, no git")
         return 0
+    ctrwatch = None
+    if args.mode == "containers":
+        if args.host or args.ssh:
+            ap.error("--mode containers runs only here, with a runtime here")
+        why = ctrready(args)
+        if why:
+            print(f"containers: skipped, {why}")
+            return 0
     if args.mode == "remote" and args.ssh and not args.remote_prospero:
         ap.error("--ssh needs --remote-prospero")
     if args.mode == "e2e" and not args.model:
@@ -1756,6 +1847,12 @@ def main():
         # r has no endpoint: it runs on this window's models
         far = Far(args, host, curl, model, nonce, thin=True)
         before += far.hostsection().replace("[remote far]", "[remote r]")
+    elif args.mode == "containers":
+        # The image first in New session's list; its container copies work
+        before = config(curl, model, 60) + (f"\n# The checklist's container\n[container]\n"
+                                            f"runtime = {args.runtime}\n"
+                                            f"images = {args.image}\n")
+        ctrwatch = CtrWatch(args)
     host.write(ini, before)
 
     holder = None
@@ -1785,6 +1882,8 @@ def main():
         guiargs += ["--inbox-cap", str(args.inbox_cap or 65536)]
     if far:
         guiargs += ["--rcwd", far.work]
+    if args.mode == "containers":
+        guiargs += ["--rcwd", work]
     if args.mode == "firstrun":
         guiargs += ["--display", "1280x720"]  # too small: maximized
     if args.subprocess:
@@ -1835,6 +1934,8 @@ def main():
     out = "".join(lines)
     if args.mode in ("hosttask", "thin"):
         problems += far.close(args.keep)
+    if ctrwatch:
+        problems += ctrwatch.close(state)
     if args.mode == "remote":
         problems += summaryproblems(status, lines, "the window")
         with fake_provider.STATE.lock:
@@ -1858,7 +1959,7 @@ def main():
         else:
             print("mcp: signed in through the stand-in browser, the call sent its token")
     if args.mode in ("drive", "e2e", "settings", "enginestop", "sessions", "plan",
-                     "firstrun", "mcp", "hosttask", "changes", "thin"):
+                     "firstrun", "mcp", "hosttask", "changes", "thin", "containers"):
         summary = [l for l in lines if "drive:" in l and " checks, " in l]
         if not summary:
             problems.append("no checklist summary")

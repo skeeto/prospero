@@ -175,6 +175,9 @@ enum : u32 {
     TASK_WSLCHANGED,    // they may have changed (os_guiwslwatch)
     TASK_MCPBACK,       // a sign-in's browser came back: its target (os_loopback)
     TASK_TOAST,         // the background host's session stopped by itself (hosttoasts)
+    TASK_CTR,           // a container job's end (id its CJOB_*): NAME, a line, then
+                        // + and its result, or ! and why it failed
+    TASK_CTRNOTE,       // its progress: NAME, a line, then the note
 };
 
 // Item rectangles the scripted checklist aims at
@@ -436,6 +439,7 @@ struct GuiHost {
     b32      userclosed; // the user disconnected it: kidsweep leaves it be
     b32      reconnect; // asked to connect while closing: once it has ended
     b32      own;       // this process's own host, after the window came back
+    b32      ctr;       // a container made for sessions (GuiCtr): its Trash stops it
     i64      pid;       // GH_LOCAL: the host's process
     i64      started;   // GH_LOCAL: epoch ms
     Str      endpoint;  // GH_LOCAL
@@ -492,6 +496,41 @@ struct GuiHost {
     Arena      rq;
     Slice<Str> rqueue;
     iz         rqbytes;
+};
+
+// A container made for sessions (container.cpp), as the window knows
+// it: its host is a remote named ctr:NAME, reached by exec.
+struct GuiCtr {
+    GuiCtr  *next;
+    Ctr      c;          // as container.ini keeps it
+    GuiHost *h;
+    Str      exec;       // [remote] exec, as remoteset gives it
+    Str      state;      // the runtime's word for it (running, exited...),
+                         // "gone" if it has none, null if not known yet
+    i32      job;        // CJOB_* under way, else 0
+    Str      note;       // that job's progress
+    Str      err;        // why the latest one failed
+    b32      made;       // created: its directory exists
+    b32      thenconnect;  // connect once it is started
+    b32      removed;    // for good: skipped everywhere
+    b32      stopafter;  // in the Trash: stop it once its host has let go
+    Str      restore;    // the root restored: out of its Trash once up
+    // The new session it was made for, started once its host is up
+    b32      pending;
+    Str      ep;
+    Str      model;
+    Str      role;
+    b32      plan;
+};
+
+enum : i32 {
+    CJOB_PROBE = 1,  // the runtime found and asked whether it answers
+    CJOB_CREATE,
+    CJOB_START,
+    CJOB_STOP,
+    CJOB_REMOVE,
+    CJOB_IMAGES,     // the runtime's images
+    CJOB_STATES,     // its containers' states (ps)
 };
 
 // A thin host's call that the main engine makes (guirelayin).
@@ -1241,6 +1280,13 @@ struct Gui {
     b32                wsllisting; // a listing runs
     b32                wslagain;   // and another is owed once it's done
     i32                wsllists;   // listings done
+    CtrRuntime         ctrrt;      // docker or podman, as found and asked (ctrprobe)
+    b32                ctrprobed;  // asked once
+    b32                ctrprobing; // asking now
+    Slice<Str>         ctrimgs;    // its images, as last listed
+    b32                ctrimging;  // listing them now
+    GuiCtr            *ctrs;       // the state directory's containers
+    i64                ctrchecked; // when the Trash's were last purged (ms)
     char              *remname;    // the Hosts panel's new remote
     char              *remssh;     // its ssh destination, or exec command
     b32                remexec;    // which
@@ -1307,6 +1353,12 @@ struct Gui {
     b32                newplan;    // in plan mode
     b32                newnofolder;// in a folder of its own, not newcwd
     b32                newwt;      // in a new worktree of newcwd's repository
+    b32                newctr;     // a container session: newcwd is the folder
+    GuiCtr            *delctr;     // asked to delete this container
+    b32                opendelctr;
+    char              *newimage;   // its image
+    i32                newws;      // its workspace (CTR_*)
+    b32                newnet;     // its network access
     char              *wtname;     // the worktree's name, in either dialog
     b32                wtnamed;    // typed, so a probe's suggestion stays out
     b32                wtfill;     // a suggestion just put in wtname
@@ -4161,6 +4213,9 @@ static void movesess(Gui *g, GuiSession *s, GuiHost *to)
     scheddirty(&g->sched);
 }
 
+static GuiCtr *ctrofhost(Gui *, GuiHost *);
+static void    ctrkeep(Gui *, GuiCtr *);
+
 // The sessions a host lists. A background host of another process lists
 // every session of the state directory it shares with the engine here,
 // but only those it holds (not closed there) are its own, and they leave
@@ -4228,6 +4283,12 @@ static void onsessions(Gui *g, GuiHost *h, Json *j)
         }
     }
     h->trashdays = (i32)jsonint(jsonget(j, "trash_days"), 0);
+    if (GuiCtr *c = ctrofhost(g, h)) {
+        if (g->main && g->main->trashdays>0) {
+            h->trashdays = g->main->trashdays;  // its Trash is the window's
+        }
+        ctrkeep(g, c);
+    }
     if (shared) {
         // What it no longer holds is the engine's again
         b32 back = 0;
@@ -6813,10 +6874,53 @@ static LinkTo *wslautohost(Gui *g, Str name)
     return 0;
 }
 
+// The container a host's name says, ctr:NAME, or null.
+static GuiCtr *ctrof(Gui *g, Str hostname)
+{
+    if (!startswith(hostname, "ctr:")) {
+        return 0;
+    }
+    Str name = cuthead(hostname, 4);
+    for (GuiCtr *c = g->ctrs; c; c = c->next) {
+        if (!c->removed && c->c.name==name) {
+            return c;
+        }
+    }
+    return 0;
+}
+
+static GuiCtr *ctrofhost(Gui *g, GuiHost *h)
+{
+    return h && h->kind==GH_REMOTE ? ctrof(g, h->name) : 0;
+}
+
+// A [container] setting of the user's own file, else null.
+static Str ctrset(Gui *g, Str key)
+{
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *r = &g->cfgrows[i];
+        if (r->kind=="container" && r->key==key && !r->isdflt && r->valid) {
+            return trim(r->value);
+        }
+    }
+    return {};
+}
+
 // A remote's setting, as remoterow, or for an unconfigured WSL distro
-// as if [remote NAME] said wsl = DISTRO.
+// as if [remote NAME] said wsl = DISTRO, or for a container as if it
+// said exec = RUNTIME exec -i prospero-NAME, state = /prospero/state,
+// deploy = auto.
 static Str remoteset(Gui *g, Str name, Str key)
 {
+    GuiCtr *c = ctrof(g, name);
+    if (c) {
+        if (!c->exec.len) {
+            c->exec = ctrexec(&g->perm, &c->c);  // kept: a link holds on to it
+        }
+        return key=="exec"   ? c->exec :
+               key=="state"  ? ctrstate :
+               key=="deploy" ? Str("auto") : Str{};
+    }
     Str     v = remoterow(g, name, key);
     LinkTo *w = v.len ? 0 : wslautohost(g, name);
     if (w && key=="wsl" && !remoterow(g, name, "ssh").len) {
@@ -7182,6 +7286,8 @@ static void deployfailed(Gui *g, GuiHost *h, Str why)
 // hooks).
 // With deploy, an engine is deployed there if it has none or one of
 // another protocol, as [remote NAME] deploy = auto has it always.
+static b32 ctrready(Gui *, GuiCtr *);
+
 static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
 {
     GuiHost *h = findhost(g, GH_REMOTE, name);
@@ -7189,6 +7295,10 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
     h->userclosed = 0;
     if (h->r && !h->closing) {
         return h;
+    }
+    GuiCtr *c = ctrof(g, name);
+    if (c && !ctrready(g, c)) {
+        return h;  // starting it first, else not to be reached
     }
     Reach      l  = remotelink(g, name);
     RemoteConf rc = {};
@@ -7278,6 +7388,8 @@ static void guiupdate(Gui *, GuiHost *);
 
 // A host's connection changed: connecting, up, down until a retry,
 // failed or closed, as the library says.
+static void ctrremote(Gui *, GuiHost *, i32);
+
 static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
 {
     Str state = jsonstr(jsonget(r->root, "state"));
@@ -7350,6 +7462,7 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
         print(&b, msg);
         guilog(g, finish(&b));
     }
+    ctrremote(g, h, was);
 }
 
 // Connect again to a host reached before: a remote as its section says,
@@ -7370,6 +7483,8 @@ static void hostagain(Gui *g, GuiHost *h)
 // A host's connection ended (MAIL_QUIT). A background host's sessions
 // go back to the engine, and the host goes; a remote one stays listed,
 // to connect again, at once if asked meanwhile.
+static b32 ctrjob(Gui *, i32, GuiCtr *);
+
 static void onhostend(Gui *g, GuiHost *h)
 {
     guirelaydrop(g, newarena(g->cmdr), h);
@@ -7383,6 +7498,11 @@ static void onhostend(Gui *g, GuiHost *h)
         if (s->host == h) {
             imgdrop(g, s);  // closed with its host
         }
+    }
+    GuiCtr *c = ctrofhost(g, h);
+    if (c && c->stopafter) {
+        c->stopafter = 0;
+        ctrjob(g, CJOB_STOP, c);  // in the Trash, once let go
     }
     if (h->kind!=GH_LOCAL || h->own) {
         if (again) {
@@ -7437,6 +7557,13 @@ static Str hostlabel(Gui *g, Arena *a, GuiHost *h)
         }
         break;
     case GH_REMOTE: {
+        if (GuiCtr *c = ctrofhost(g, h)) {
+            print(&b, c->c.image);
+            print(&b, " (container ");
+            print(&b, c->c.name);
+            putbyte(&b, ')');
+            break;
+        }
         Reach l   = remotelink(g, h->name);
         Str  ssh = l.ssh;
         Str  wsl = l.wsl;
@@ -7473,6 +7600,22 @@ static b32 hostready(Gui *g, GuiHost *h)
 // try when it is down.
 static Str hoststatus(Gui *g, Arena *a, GuiHost *h, i64 left)
 {
+    GuiCtr *c = ctrofhost(g, h);
+    if (c && c->job) {
+        static Str const jobs[] = {
+            {}, "looking", "making the container", "starting", "stopping",
+            "removing", "listing", "asking",
+        };
+        return c->note.len ? c->note : jobs[c->job];
+    } else if (c && !h->r) {
+        if (c->c.trashed) {
+            return "stopped, in the Trash";
+        } else if (c->state == "gone") {
+            return "gone";
+        } else if (c->state.len && c->state!="running") {
+            return "stopped";
+        }
+    }
     if (h->kind!=GH_ENGINE && h->r && h->closing) {
         return h->reconnect ? Str("disconnecting, then connecting again")
                             : Str("disconnecting");
@@ -7586,8 +7729,15 @@ static void guigroup(Gui *g, GuiSession *s, Str name)
 }
 
 // A session and its subagents, for good.
+static void ctrforget(Gui *, GuiCtr *, GuiSession *);
+
 static void guidelete(Gui *g, GuiSession *s)
 {
+    GuiCtr *c = ctrofhost(g, s->host);
+    if (c && !s->host->up) {
+        ctrforget(g, c, s);  // stopped: it is gone here, and in its ini
+        return;
+    }
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 128);
     EvOut w = cmdopen(g, &b, CMD_DELETE, s);
@@ -7597,7 +7747,7 @@ static void guidelete(Gui *g, GuiSession *s)
 // Whether a host keeps a Trash: it has one, and it is not turned off.
 static b32 trashon(GuiHost *h)
 {
-    return hostcap(h, "trash") && h->trashdays>0;
+    return (hostcap(h, "trash") || h->ctr) && h->trashdays>0;
 }
 
 // Whether a session is in the Trash: its root is.
@@ -7607,6 +7757,11 @@ static b32 sesstrashed(Gui *g, GuiSession *s)
 }
 
 static void sessclose(Gui *, GuiSession *);
+static b32  ctrlast(Gui *, GuiCtr *, GuiSession *);
+static void ctrtrash(Gui *, GuiCtr *);
+static void ctrrestore(Gui *, GuiCtr *, GuiSession *);
+static void ctrdelete(Gui *, GuiCtr *);
+static void ctrforget(Gui *, GuiCtr *, GuiSession *);
 
 // A root and its subagents into the Trash (on), or back (off). Into it,
 // its views here close first, so its host may let it go; then it is
@@ -7623,19 +7778,35 @@ static void guitrash(Gui *g, GuiSession *s, b32 on)
             }
         }
     }
-    Arena a = newarena(g->cmdr);
-    Buf   b(&a, 128);
-    EvOut w = cmdopen(g, &b, CMD_TRASH, s);
-    putkey(&w.json, "on");
-    putint(&w.json, on ? 1 : 0);
-    cmdsend(g, &w, a);
+    GuiCtr *c    = ctrofhost(g, s->host);
+    b32     last = c && on && ctrlast(g, c, s);
+    if (!c || s->host->up) {
+        Arena a = newarena(g->cmdr);
+        Buf   b(&a, 128);
+        EvOut w = cmdopen(g, &b, CMD_TRASH, s);
+        putkey(&w.json, "on");
+        putint(&w.json, on ? 1 : 0);
+        cmdsend(g, &w, a);
+    }
     s->trashed = on ? os_time(g->os) : 0;
+    if (last) {
+        ctrtrash(g, c);  // its last session: the container stops
+    } else if (c && !on && c->c.trashed) {
+        ctrrestore(g, c, s);
+    }
     scheddirty(&g->sched);
 }
 
 // Every session in a host's Trash, for good.
 static void guitrashempty(Gui *g, GuiHost *h)
 {
+    GuiCtr *c = ctrofhost(g, h);
+    if (c && c->c.trashed) {
+        ctrdelete(g, c);  // all of it is in the Trash
+        return;
+    } else if (c && !h->up) {
+        return;
+    }
     Arena a = newarena(g->cmdr);
     Buf   b(&a, 64);
     EvOut w = cmdopen(g, &b, CMD_TRASHEMPTY, 0, h);
@@ -8207,6 +8378,9 @@ static void toastbg(Gui *, Str);
 // What another thread finished: a save or open dialog answered, a
 // deployment's progress and outcome, a launch that handed off to this
 // window.
+static void ctrdone(Gui *, Record);
+static void ctrnoted(Gui *, Record);
+
 static void ontask(Gui *g, Record r)
 {
     Export *x = &g->exp;
@@ -8248,6 +8422,12 @@ static void ontask(Gui *g, Record r)
         return;
     case TASK_WSL:
         wslgot(g, r.data);
+        return;
+    case TASK_CTR:
+        ctrdone(g, r);
+        return;
+    case TASK_CTRNOTE:
+        ctrnoted(g, r);
         return;
     case TASK_WSLCHANGED:
         guilog(g, "the WSL distros may have changed: listing them again");
@@ -8394,6 +8574,591 @@ static Str deploywhy(Gui *g, GuiHost *h, Str name)
         return "Its section's path names the engine there, which connecting runs instead";
     }
     return {};
+}
+
+
+// Container sessions (container.cpp)
+//
+// Docker or Podman, found with no configuration: asked once at start
+// whether its daemon answers (CJOB_PROBE), and again from Refresh and
+// Look again. Each container the state directory keeps is a GuiCtr and
+// a host, ctr:NAME, a remote that remoteset makes an exec one. Making,
+// starting, stopping and removing one each run on a thread of their own
+// (guictrthread), its end a TASK_CTR, so the window never waits on the
+// runtime. A container that is not running starts before connecting
+// (remoteconnect asks ctrready). Moving its last session to the Trash
+// stops it, at the window's level alone, the sessions it held kept in
+// its container.ini for the Trash to show (ctrtrash), and deleting it
+// removes it (ctrdelete).
+
+struct GuiCtrJob {
+    Os      *os;
+    Mailbox *done;
+    i32      kind;      // CJOB_*
+    Str      name;      // the container's, if any
+    Str      ini;       // and its container.ini
+    Str      localstate;
+    Str      envpath;
+    Str      setting;   // [container] runtime
+    Str      program;   // the runtime's
+    Str      owner;
+    Str      cpus;
+    Str      memory;
+    Str      args;
+    Arena    arena;     // the rest of perm
+    Region  *perm;
+    Region  *scratch;
+};
+
+static void ctrnote(void *ctx, Str msg)
+{
+    GuiCtrJob *j = (GuiCtrJob *)ctx;
+    Arena      a = j->arena;
+    mailpost(j->done, TASK_CTRNOTE, (u64)j->kind,
+             concat(&a, concat(&a, j->name, "\n"), msg), 1);
+}
+
+static void guictrthread(void *arg)
+{
+    GuiCtrJob *j       = (GuiCtrJob *)arg;
+    Arena      perm    = j->arena;
+    Arena      scratch = newarena(j->scratch);
+    CtrRun    *run     = newctrrun(j->os, &perm, j->localstate, j->envpath, 0);
+    Ctr        c       = j->ini.len ? ctrparse(&perm, j->name, j->ini) : Ctr{};
+    j->arena = carve(&perm, 1<<16);  // ctrnote's, each note in it alone
+    Str out = {};
+    Str err = {};
+    if (!run) {
+        err = "out of memory";
+    } else switch (j->kind) {
+    case CJOB_PROBE: {
+        Str        path = os_getenv(j->os, &scratch, "PROSPERO_TEST_DOCKER");
+        CtrRuntime rt   = ctrfind(j->os, &perm, scratch, path.len ? path : j->setting,
+                                  j->envpath);
+        ctrprobe(run, &perm, scratch, &rt);
+        Buf b(&perm, 256);
+        print(&b, rt.name);    putbyte(&b, '\n');
+        print(&b, rt.path);    putbyte(&b, '\n');
+        print(&b, rt.up ? Str("1") : Str("0")); putbyte(&b, '\n');
+        print(&b, rt.version); putbyte(&b, '\n');
+        print(&b, rt.why);
+        out = finish(&b);
+    } break;
+    case CJOB_CREATE: {
+        McpWords args = mcpwords(&perm, j->args);
+        err = ctrcreate(run, &perm, scratch, &c, j->cpus, j->memory,
+                        args.err.len ? Slice<Str>{} : args.words, ctrnote, j);
+    } break;
+    case CJOB_START:
+        err = ctrdo(run, &perm, scratch, &c, "start");
+        break;
+    case CJOB_STOP:
+        err = ctrdo(run, &perm, scratch, &c, "stop -t 5");
+        break;
+    case CJOB_REMOVE:
+        err = ctrremove(run, &perm, scratch, &c);
+        break;
+    case CJOB_IMAGES: {
+        Slice<Str> imgs = ctrimages(run, &perm, scratch, j->program);
+        Buf b(&perm, 4096);
+        for (iz i = 0; i < imgs.len; i++) {
+            print(&b, imgs[i]);
+            putbyte(&b, '\n');
+        }
+        out = finish(&b);
+    } break;
+    case CJOB_STATES:
+        out = ctrstates(run, &perm, scratch, j->program, j->owner);
+        break;
+    }
+    Buf b(&perm, 8 + j->name.len + out.len + err.len);
+    print(&b, j->name);
+    putbyte(&b, '\n');
+    putbyte(&b, err.len ? '!' : '+');
+    print(&b, err.len ? err : out);
+    mailpost(j->done, TASK_CTR, (u64)j->kind, finish(&b), 1);
+    os_release(j->os, j->scratch);
+    os_release(j->os, j->perm);
+}
+
+// Run a job on its own thread, for the container c if any. Returns 0 if
+// it cannot start, with c's err saying why.
+static b32 ctrjob(Gui *g, i32 kind, GuiCtr *c)
+{
+    Region *pr = os_reserve(g->os, (iz)1<<24);
+    Region *sr = os_reserve(g->os, (iz)1<<26);
+    if (!pr || !sr) {
+        if (pr) os_release(g->os, pr);
+        if (sr) os_release(g->os, sr);
+        if (c) c->err = "cannot run the runtime: out of memory";
+        return 0;
+    }
+    Arena      a = newarena(pr);
+    GuiCtrJob *j = alloc<GuiCtrJob>(&a);
+    j->os         = g->os;
+    j->done       = g->tasks;
+    j->kind       = kind;
+    j->perm       = pr;
+    j->scratch    = sr;
+    j->localstate = clone(&a, g->statedir);
+    j->envpath    = guipath(g, &a);
+    j->setting    = clone(&a, ctrset(g, "runtime"));
+    j->program    = clone(&a, g->ctrrt.path);
+    j->owner      = ctrowner(&a, g->statedir);
+    j->cpus       = clone(&a, ctrset(g, "cpus"));
+    j->memory     = clone(&a, ctrset(g, "memory"));
+    j->args       = clone(&a, ctrset(g, "args"));
+    if (c) {
+        j->name = clone(&a, c->c.name);
+        j->ini  = ctrini(&a, &c->c);
+        c->job  = kind;
+        c->err  = {};
+        c->note = {};
+    }
+    j->arena = a;
+    if (!os_thread(g->os, guictrthread, j)) {
+        os_release(g->os, sr);
+        os_release(g->os, pr);
+        if (c) {
+            c->job = 0;
+            c->err = "cannot run the runtime: out of memory";
+        }
+        return 0;
+    }
+    scheddirty(&g->sched);
+    return 1;
+}
+
+// Look for the runtime, and ask whether it answers, unless asking now.
+static void ctrlook(Gui *g)
+{
+    if (g->enginekind==ENGINE_FAKE || g->ctrprobing) {
+        return;
+    }
+    g->ctrprobing = ctrjob(g, CJOB_PROBE, 0);
+}
+
+// The runtime's images, for New session, unless listing them now.
+static void ctrimglist(Gui *g)
+{
+    if (g->ctrrt.up && !g->ctrimging) {
+        g->ctrimging = ctrjob(g, CJOB_IMAGES, 0);
+    }
+}
+
+// Whether the session list shows the runtime: installed, unless
+// [container] list = never.
+static b32 ctrlisted(Gui *g)
+{
+    return g->ctrrt.path.len && ctrset(g, "list")!="never";
+}
+
+static void ctrsessions(Gui *g, GuiCtr *c);
+
+// A container's host, made if missing, keeping the main host's Trash.
+static GuiHost *ctrhost(Gui *g, GuiCtr *c)
+{
+    if (!c->h) {
+        Arena a = g->frame;
+        Str   n = concat(&a, "ctr:", c->c.name);
+        c->h = findhost(g, GH_REMOTE, n);
+        c->h = c->h ? c->h : addhost(g, GH_REMOTE, n);
+        c->h->ctr = 1;
+    }
+    if (g->main && g->main->trashdays > 0) {
+        c->h->trashdays = g->main->trashdays;
+    }
+    return c->h;
+}
+
+// The state directory's containers, at start: each with its host, and
+// the sessions it held as last known (container.ini's), listed until
+// its host lists its own.
+static void ctrload(Gui *g)
+{
+    Arena      a   = g->frame;
+    Slice<Ctr> all = ctrall(g->os, &g->perm, a, g->statedir);
+    for (iz i = 0; i < all.len; i++) {
+        GuiCtr *c = alloc<GuiCtr>(&g->perm);
+        c->c    = all[i];
+        c->made = 1;
+        c->next = g->ctrs;
+        g->ctrs = c;
+        ctrhost(g, c);
+        ctrsessions(g, c);
+    }
+}
+
+// The sessions a container held, as container.ini has them, for those
+// its host has not listed: so the Trash shows a stopped one's.
+static void ctrsessions(Gui *g, GuiCtr *c)
+{
+    for (iz i = 0; i < c->c.sessions.len; i++) {
+        CtrSess    *k = &c->c.sessions[i];
+        GuiSession *s = findsess(g, c->h, k->sid);
+        if (!s) {
+            s = addsess(g, c->h, k->sid);
+            s->title = k->title;
+            s->cwd   = "/work";
+        }
+        s->listed  = 1;
+        s->trashed = c->c.trashed;
+    }
+}
+
+// Keep the sessions a container holds now in its container.ini.
+static void ctrkeep(Gui *g, GuiCtr *c)
+{
+    Slice<CtrSess> l = {};
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->host==c->h && !s->gone && s->listed && !s->parent.len) {
+            CtrSess k = {s->sid, sesstitle(s)};
+            l = push(&g->perm, l, k);
+        }
+    }
+    c->c.sessions = l;
+    if (c->made) {
+        ctrsave(g->os, g->frame, g->statedir, &c->c);
+    }
+}
+
+// Whether a container is running to be connected to; if not, starting
+// it, to connect once it has, unless it is in the Trash.
+static b32 ctrready(Gui *g, GuiCtr *c)
+{
+    GuiHost *h = ctrhost(g, c);
+    if (c->state == "running") {
+        return 1;
+    } else if (c->c.trashed || !c->made || c->state=="gone") {
+        h->state = RS_FAILED;
+        h->msg   = c->c.trashed ? Str("it is in the Trash: restore a session to start it")
+                 : c->state=="gone" ? Str("the container is gone")
+                 : c->err.len ? c->err : Str("not made yet");
+        return 0;
+    } else if (!g->ctrrt.up) {
+        h->state = RS_FAILED;
+        h->msg   = g->ctrrt.why.len ? g->ctrrt.why : Str("no container runtime answers");
+        return 0;
+    }
+    c->thenconnect = 1;
+    if (!c->job) {
+        ctrjob(g, CJOB_START, c);
+    }
+    h->state = RS_CONNECTING;
+    h->msg   = "starting the container";
+    return 0;
+}
+
+// Make a container for a new session, from image, with folder copied
+// in, mounted, or neither (ws, CTR_*), and connect to it once made, its
+// session then started as the rest says (guinew). Returns why it cannot
+// start, else null.
+static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str model,
+                  Str role, b32 plan)
+{
+    image  = trim(image);
+    folder = trim(folder);
+    if (!g->ctrrt.up) {
+        return g->ctrrt.why.len ? g->ctrrt.why : Str("no container runtime answers");
+    } else if (!image.len) {
+        return "Choose an image";
+    } else if (image[0] == '-') {
+        return "An image cannot begin with -";
+    } else if (ws!=CTR_EMPTY && !folder.len) {
+        return "Choose a folder";
+    } else if (ws != CTR_EMPTY && os_stat(g->os, g->frame, folder).type != STAT_DIR) {
+        return "No such folder here";
+    }
+    GuiCtr *c = alloc<GuiCtr>(&g->perm);
+    c->c.name      = ctrnewname(g->os, &g->perm);
+    c->c.runtime   = g->ctrrt.name;
+    c->c.program   = g->ctrrt.path;
+    c->c.image     = clone(&g->perm, image);
+    c->c.workspace = ws;
+    c->c.folder    = ws==CTR_EMPTY ? Str{} : os_realpath(g->os, &g->perm, folder);
+    c->c.network   = net;
+    c->c.created   = os_time(g->os);
+    c->pending     = 1;
+    c->ep          = clone(&g->perm, ep);
+    c->model       = clone(&g->perm, model);
+    c->role        = clone(&g->perm, role);
+    c->plan        = plan;
+    c->next = g->ctrs;
+    g->ctrs = c;
+    GuiHost *h = ctrhost(g, c);
+    h->state = RS_CONNECTING;
+    h->msg   = "making the container";
+    if (!ctrjob(g, CJOB_CREATE, c)) {
+        c->removed = 1;
+        return c->err;
+    }
+    guilog(g, concat(&g->frame, concat(&g->frame, "container ", c->c.name),
+                     concat(&g->frame, ": making it from ", image)));
+    return {};
+}
+
+// A container's host changed, as onremote heard: its new session, once
+// up, and one that stopped meanwhile.
+static void ctrremote(Gui *g, GuiHost *h, i32 was)
+{
+    GuiCtr *c = ctrofhost(g, h);
+    if (!c) {
+        return;
+    }
+    if (h->up && was!=RS_UP && c->pending) {
+        c->pending = 0;
+        guinew(g, h, "/work", c->ep, c->model, c->role, c->plan);
+    } else if (h->up && was!=RS_UP && c->restore.len) {
+        GuiSession *s = findsess(g, h, c->restore);
+        c->restore = {};
+        if (s) {
+            guitrash(g, s, 0);
+        }
+    } else if (h->state==RS_FAILED && find(h->msg, "is not running")>=0) {
+        c->state = "exited";  // so that connecting starts it
+    }
+}
+
+// A container's sessions are gone for good, and it with them.
+static void ctrgone(Gui *g, GuiCtr *c)
+{
+    c->removed = 1;
+    for (GuiSession *s = g->sessions; c->h && s; s = s->next) {
+        if (s->host==c->h && !s->gone) {
+            sessgone(g, s);
+        }
+    }
+    if (c->h) {
+        hostclose(g, c->h);
+        c->h->state = RS_CLOSED;
+    }
+}
+
+// Remove a container for good: its sessions go at once, and it goes
+// in the background.
+static void ctrdelete(Gui *g, GuiCtr *c)
+{
+    ctrgone(g, c);
+    if (c->made) {
+        ctrjob(g, CJOB_REMOVE, c);
+    }
+}
+
+// Stop a container, leaving it first, if connected (onhostend).
+static void ctrstop(Gui *g, GuiCtr *c)
+{
+    c->thenconnect = 0;
+    if (c->h->r) {
+        c->stopafter = 1;
+        hostleave(g, c->h);
+    } else if (c->made && c->state!="gone") {
+        c->h->userclosed = 1;
+        ctrjob(g, CJOB_STOP, c);
+    }
+    scheddirty(&g->sched);
+}
+
+// Its last session into the Trash: the container stops, and the window
+// keeps its sessions, as in the Trash.
+static void ctrtrash(Gui *g, GuiCtr *c)
+{
+    i64 now = os_time(g->os);
+    ctrkeep(g, c);
+    c->c.trashed = now;
+    ctrsave(g->os, g->frame, g->statedir, &c->c);
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->host==c->h && !s->gone) {
+            s->trashed = now;
+        }
+    }
+    ctrstop(g, c);  // once its Trash command has gone
+}
+
+// And back, with root s: connecting starts it again, and then s leaves
+// its Trash there too (ctrremote).
+static void ctrrestore(Gui *g, GuiCtr *c, GuiSession *s)
+{
+    c->c.trashed = 0;
+    c->restore   = clone(&g->perm, s->sid);
+    c->stopafter = 0;
+    ctrsave(g->os, g->frame, g->statedir, &c->c);
+    remoteconnect(g, g->frame, c->h->name);
+    scheddirty(&g->sched);
+}
+
+// Delete s while its container is stopped: it goes here and from the
+// container's ini, and the container with the last.
+static void ctrforget(Gui *g, GuiCtr *c, GuiSession *s)
+{
+    for (GuiSession *k = g->sessions; k; k = k->next) {
+        if (k!=s && k->host==c->h && !k->gone && sessroot(g, k)==s) {
+            sessgone(g, k);
+        }
+    }
+    sessgone(g, s);
+    ctrkeep(g, c);
+    for (GuiSession *k = g->sessions; k; k = k->next) {
+        if (k->host==c->h && !k->gone && k->listed) {
+            return;
+        }
+    }
+    ctrdelete(g, c);
+}
+
+// Containers in the Trash longer than the main host keeps sessions there
+// are removed, as its own purge does: at start, then hourly.
+static void ctrpurge(Gui *g, i64 now)
+{
+    i64 day  = 24*60*60*(i64)1000;
+    i32 days = g->main ? g->main->trashdays : 0;
+    if (now-g->ctrchecked < 60*60*(i64)1000 || days<=0) {
+        return;
+    }
+    g->ctrchecked = now;
+    for (GuiCtr *c = g->ctrs; c; c = c->next) {
+        if (!c->removed && c->c.trashed && now-c->c.trashed > days*day) {
+            guilog(g, concat(&g->frame, "container ",
+                             concat(&g->frame, c->c.name, ": removed from the Trash")));
+            ctrdelete(g, c);
+        }
+    }
+}
+
+// Whether a session is a container's last outside the Trash.
+static b32 ctrlast(Gui *g, GuiCtr *c, GuiSession *root)
+{
+    for (GuiSession *s = g->sessions; s; s = s->next) {
+        if (s->host==c->h && s!=root && !s->gone && s->listed && !s->trashed &&
+                sessroot(g, s)==s) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// A container job ended (TASK_CTR).
+static void ctrdone(Gui *g, Record r)
+{
+    Cut     nl   = cut(r.data, '\n');
+    b32     ok   = nl.tail.len && nl.tail[0]=='+';
+    Str     out  = cuthead(nl.tail, nl.tail.len>0);
+    i32     kind = (i32)r.id;
+    GuiCtr *c    = 0;
+    for (GuiCtr *k = g->ctrs; nl.head.len && k; k = k->next) {
+        c = k->c.name==nl.head ? k : c;
+    }
+    if (c) {
+        c->job  = 0;
+        c->note = {};
+        c->err  = ok ? Str{} : clone(&g->perm, out);
+    }
+    Arena a = g->frame;
+    switch (kind) {
+    case CJOB_PROBE: {
+        Cut n = cut(out, '\n');
+        Cut p = cut(n.tail, '\n');
+        Cut u = cut(p.tail, '\n');
+        Cut v = cut(u.tail, '\n');
+        g->ctrprobing = 0;
+        g->ctrprobed  = 1;
+        g->ctrrt.name    = clone(&g->perm, n.head);
+        g->ctrrt.path    = clone(&g->perm, p.head);
+        g->ctrrt.up      = u.head == "1";
+        g->ctrrt.version = clone(&g->perm, v.head);
+        g->ctrrt.why     = clone(&g->perm, v.tail);
+        guilog(g, concat(&a, concat(&a, "container runtime: ", n.head),
+                         g->ctrrt.up ? concat(&a, " ", v.head)
+                         : g->ctrrt.path.len ? concat(&a, ": ", v.tail)
+                         : Str(": not found")));
+        if (g->ctrrt.up && g->ctrs) {
+            ctrjob(g, CJOB_STATES, 0);  // then connects to those running
+        }
+    } break;
+    case CJOB_IMAGES:
+        g->ctrimging = 0;
+        g->ctrimgs   = {};
+        for (Str rest = ok ? out : Str{}; rest.len;) {
+            Cut l = cut(rest, '\n');
+            rest = l.tail;
+            if (l.head.len) {
+                g->ctrimgs = push(&g->perm, g->ctrimgs, clone(&g->perm, l.head));
+            }
+        }
+        break;
+    case CJOB_STATES:
+        for (GuiCtr *k = g->ctrs; ok && k; k = k->next) {
+            if (k->removed || !k->made) {
+                continue;
+            }
+            Str st = ctrstateof(out, k->c.name);
+            k->state = clone(&g->perm, st.len ? st : Str("gone"));
+            GuiHost *h = ctrhost(g, k);
+            if (k->state=="running" && !k->c.trashed && !h->r && !h->userclosed) {
+                remoteconnect(g, a, h->name);
+            } else if (k->state == "gone") {
+                h->state = RS_FAILED;
+                h->msg   = "the container is gone";
+            }
+        }
+        break;
+    case CJOB_CREATE:
+        if (!c) {
+            break;
+        } else if (!ok) {
+            c->h->state = RS_FAILED;
+            c->h->msg   = c->err;
+            c->pending  = 0;
+            guilog(g, concat(&a, concat(&a, "container ", c->c.name),
+                             concat(&a, ": not made: ", c->err)));
+            break;
+        }
+        c->made  = 1;
+        c->state = "running";
+        remoteconnect(g, a, c->h->name);
+        break;
+    case CJOB_START:
+        if (!c) {
+            break;
+        } else if (ok) {
+            c->state = "running";
+            if (c->thenconnect && !c->c.trashed) {
+                c->thenconnect = 0;
+                remoteconnect(g, a, c->h->name);
+            }
+        } else {
+            c->thenconnect = 0;
+            c->h->state = RS_FAILED;
+            c->h->msg   = c->err;
+        }
+        break;
+    case CJOB_STOP:
+        if (c && ok) {
+            c->state = "exited";
+        }
+        break;
+    case CJOB_REMOVE:
+        if (c && !ok) {
+            guilog(g, concat(&a, concat(&a, "container ", c->c.name),
+                             concat(&a, ": not removed: ", c->err)));
+        }
+        break;
+    }
+    scheddirty(&g->sched);
+}
+
+// A container job's progress (TASK_CTRNOTE).
+static void ctrnoted(Gui *g, Record r)
+{
+    Cut nl = cut(r.data, '\n');
+    for (GuiCtr *c = g->ctrs; c; c = c->next) {
+        if (c->c.name==nl.head && c->job) {
+            c->note = clone(&g->perm, nl.tail);
+            if (c->h && !c->h->r) {
+                c->h->msg = c->note;
+            }
+        }
+    }
+    scheddirty(&g->sched);
 }
 
 
@@ -10406,6 +11171,9 @@ static void gui_frame(Gui *g)
     }
     draftpoll(g, s);
     guigit(g);
+    if (g->ctrs) {
+        ctrpurge(g, os_time(g->os));
+    }
     if (guirelayflush(g)) {
         schedat(s, s->now + 5000, DUE_APP);  // retried until there is room
     }
@@ -11361,6 +12129,7 @@ enum : i32 {
     CHK_THIN,         // the remote r is up and thin, the Hosts pane saying so
     CHK_VIA,          // the session shown streams via this computer
     CHK_CFGSEARCH,    // the settings' search field has the keyboard
+    CHK_CTR,          // the first container is as text says (ctrcheck)
     CHK_COUNT,
 };
 
@@ -11625,6 +12394,7 @@ static Str chknames[] = {
     "the worktree session starts fresh, under its original",
     "the remote is thin", "its calls go via this computer",
     "the settings' search field has the keyboard",
+    "the container is as expected",
 };
 static_assert(countof(chknames) == CHK_COUNT);
 
@@ -11701,6 +12471,8 @@ enum : i32 {
     W_WORKTREE,   // the session shown is on a branch starting with text
     W_THIN,       // the remote r is up and thin
     W_VIA,        // the session shown streams, relayed
+    W_CTR,        // the container runtime, or the first container, is as
+                  // text says (ctrwait)
 };
 
 static Str waitnames[] = {
@@ -11723,9 +12495,9 @@ static Str waitnames[] = {
     "the named remote's update", "the MCP server's state", "the MCP sign-in",
     "the subagent on far", "the subagent on far shown", "a toast",
     "the changes", "the folder's probe", "the worktree's branch",
-    "the thin remote", "a relayed stream",
+    "the thin remote", "a relayed stream", "the container",
 };
-static_assert(countof(waitnames) == W_VIA+1);
+static_assert(countof(waitnames) == W_CTR+1);
 
 enum : i32 {
     KEY_CTRL  = 1,
@@ -14482,6 +15254,151 @@ static DriveOp remoteops[] = {
     {OP_QUIT, 0, 0, 0, 0, ""},
 };
 
+// The checklist's container: the latest made, removed or not.
+static GuiCtr *ctrfirst(Gui *g)
+{
+    return g->ctrs;
+}
+
+// W_CTR: "up", the runtime answers; "session", the session shown is a
+// container's, open in /work; "running" or "exited", the container is,
+// no job under way; "connected", its host is up; "removed", it is gone,
+// its directory too.
+static b32 pathendswith(Str, Str);
+
+static b32 ctrwait(Gui *g, Str what)
+{
+    GuiCtr *c = ctrfirst(g);
+    if (what == "up") {
+        return g->ctrprobed && g->ctrrt.up;
+    } else if (what == "session") {
+        return g->sess && g->sess->host->ctr && g->sess->view &&
+               g->sess->view->cwd=="/work" && !g->newid;
+    } else if (what == "connected") {
+        return c && c->h && c->h->up && !c->job;
+    } else if (what == "removed") {
+        Arena a = g->frame;
+        Str   d = c ? ctrdir(&a, g->statedir, c->c.name) : Str{};
+        return c && c->removed && !c->job && os_stat(g->os, a, d).type==STAT_MISSING;
+    }
+    return c && !c->job && c->state==what;
+}
+
+// CHK_CTR: "made", the container copies --rcwd to /work, with no
+// network, its registry saying so; "trashed", it and its session are in
+// the Trash, the host left; "restored", neither is; "gone", nothing of
+// it is listed.
+static b32 ctrcheck(Gui *g, Str what)
+{
+    GuiCtr *c = ctrfirst(g);
+    if (!c) {
+        return 0;
+    }
+    i32 live = 0, trashed = 0;
+    for (GuiSession *s = g->sessions; c->h && s; s = s->next) {
+        if (s->host==c->h && !s->gone && s->listed && !s->parent.len) {
+            live    += !s->trashed;
+            trashed += s->trashed != 0;
+        }
+    }
+    if (what == "made") {
+        Arena a = g->frame;
+        Str   d = ctrdir(&a, g->statedir, c->c.name);
+        Read  r = os_read(g->os, &a, join(&a, d, "container.ini"), 1<<16);
+        Ctr   k = r.err==READ_OK ? ctrparse(&a, c->c.name, r.data) : Ctr{};
+        b32 ok = c->made && !k.network && k.workspace==CTR_COPY && k.image==c->c.image &&
+                 g->driverwd.len && pathendswith(k.folder, g->driverwd);
+        return ok;
+    } else if (what == "trashed") {
+        return c->c.trashed && trashed==1 && !live && !c->h->r;
+    } else if (what == "restored") {
+        return !c->c.trashed && live==1 && !trashed && c->h->up;
+    } else if (what == "gone") {
+        return c->removed && !live && !trashed;
+    }
+    return 0;
+}
+
+// Containers made for sessions (--containers, tests/gui.py --mode
+// containers), against a real Docker or Podman: the runtime's row in
+// the sidebar; its New session, an image from [container] images,
+// --rcwd copied in, no network; a turn there, relayed; its session to
+// the Trash stops it, restored starts it, and Delete removes it.
+static DriveOp ctrops[] = {
+    {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
+    {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    FIRSTRUN(0),
+    {OP_WAIT, W_CTR, 0, 0, 20000, "up"},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "H ctr\n"},
+    {OP_SHOT, 0, 0, 0, 300, "containers-0-sidebar"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new h:ctr"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new image0"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new wscopy"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_MOVE, T_NEWCWD, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},  // selects it all, to be typed over
+    {OP_TEXTRCWD, 0, 0, 0, 300, ""},
+    {OP_SHOT, 0, 0, 0, 300, "containers-1-new"},
+    {OP_MOVE, T_NEWCREATE, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
+    {OP_WAIT, W_CTR, 0, 0, 180000, "session"},
+    {OP_CHECK, CHK_CTR, 0, 0, 0, "made"},
+    {OP_PROMPT, 0, 0, 0, 100, "Hello from a container."},
+    {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_SHOT, 0, 0, 0, 300, "containers-2-turn"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Move to Trash"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_CTR, 0, 0, 30000, "exited"},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CTR, 0, 0, 0, "trashed"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "head t"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1000, ""},
+    {OP_SHOT, 0, 0, 0, 300, "containers-3-trash"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Restore"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_CTR, 0, 0, 60000, "connected"},
+    {OP_MARK, 0, 0, 0, 2000, ""},
+    {OP_CHECK, CHK_CTR, 0, 0, 0, "restored"},
+    SHOWPANE("Hosts"),
+    {OP_MOVE, T_HOSTSTAB, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_SHOT, 0, 0, 0, 300, "containers-4-hosts"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "hosts delctr"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "delctr ok"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_WAIT, W_CTR, 0, 0, 30000, "removed"},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CTR, 0, 0, 0, "gone"},
+    {OP_SUMMARY, 0, 0, 0, 0, ""},
+    {OP_QUIT, 0, 0, 0, 0, ""},
+};
+
 // A thin remote (--thin, tests/gui.py --mode thin): r's configuration
 // has no endpoint, so once up it is offered this window's models, and the
 // Hosts pane says so; a session there streams via this computer, which
@@ -16494,6 +17411,8 @@ static b32 drivewaitdone(Gui *g)
         GuiHost *h = findhost(g, GH_REMOTE, "r");
         return h && h->up && h->thin;
     }
+    case W_CTR:
+        return ctrwait(g, g->ops[g->drivepc-1].text);
     case W_VIA:
         return g->sess && v->state==LIVE_STREAMING && v->relaylen>0 && v->deltas>0;
     case W_PLAN: {
@@ -18241,6 +19160,8 @@ static b32 drivecheck(Gui *g, i32 chk)
         GuiHost *h = findhost(g, GH_REMOTE, "r");
         return h && h->up && h->thin && h->offered && g->offer.len && !g->offerempty;
     }
+    case CHK_CTR:
+        return ctrcheck(g, g->ops[g->drivepc-1].text);
     case CHK_VIA:
         // The view names this computer, as the session bar shows it
         return g->sess && g->sess->host->kind==GH_REMOTE && g->machine.len &&
@@ -19587,6 +20508,8 @@ static Str guiusage =
 "                 Disconnect kept, Open subagent, the parent closed\n"
 "  --thin         a remote with no endpoint runs on this window's models,\n"
 "                 via this computer, across a dropped link\n"
+"  --containers   a container made for a session, by a real Docker or Podman:\n"
+"                 a turn there, its Trash stopping it, restored, deleted\n"
 "  --launch       prospero DIR's checklist: DIR's session, another launch's\n"
 "                 handed off (tests/gui.py drives it), a session with no folder\n"
 "  --firstrun     a first run's layout, with nothing configured (with\n"
@@ -19773,6 +20696,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     b32 subprocess = 0, fake = 0, e2e = 0, settings = 0, enginestop = 0;
     b32 background = 0, attach = 0, remote = 0, compose = 0, sidebar = 0, plan = 0;
     b32 launch = 0, first = 0, mcp = 0, hosttask = 0, changes = 0, thin = 0;
+    b32 containers = 0;
     i64 history = 0;
     Str opendir = {};  // prospero DIR, as given
     i32 bench   = 0;
@@ -19823,6 +20747,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
             hosttask = probe = 1;
         } else if (a == "--thin") {
             thin = probe = 1;
+        } else if (a == "--containers") {
+            containers = probe = 1;
         } else if (a == "--firstrun") {
             first = probe = 1;
         } else if (a == "--compose-again") {
@@ -19897,9 +20823,12 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->enginekind = fake ? ENGINE_FAKE : subprocess ? ENGINE_SUBPROCESS : ENGINE_INPROC;
     if (drive || idle || streamtest || e2e || settings || enginestop ||
             background || attach || remote || compose || sidebar || plan || launch ||
-            first || mcp || hosttask || changes || thin) {
+            first || mcp || hosttask || changes || thin || containers) {
         g->drive = 1;
-        if (thin) {
+        if (containers) {
+            g->ops  = ctrops;
+            g->nops = countof(ctrops);
+        } else if (thin) {
             g->ops  = thinops;
             g->nops = countof(thinops);
         } else if (hosttask) {
@@ -19990,6 +20919,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->view       = g->nosession.view;
     g->edbox      = newmailbox(&g->perm, 1<<14, wakegui, os);
     g->newcwd     = alloc<char>(&g->perm, FIELD_MAX);
+    g->newimage   = alloc<char>(&g->perm, FIELD_MAX);
     g->wtname     = alloc<char>(&g->perm, FIELD_MAX);
     g->namebuf    = alloc<char>(&g->perm, FIELD_MAX);
     g->layoutbuf  = alloc<char>(&g->perm, FIELD_MAX);
@@ -20200,6 +21130,8 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     if (!fake) {
         findhosts(g, g->frame);  // background hosts of the state directory
         findwsl(g);              // and WSL distros, as remotes,
+        ctrload(g);              // and containers made for sessions,
+        ctrlook(g);              // with the runtime that runs them,
         if (HOST_WINDOWS && !linkprogram(g, &g->frame, 1).len) {
             // listed again as they change, unless a test stands in
             os_guiwslwatch(os, &g->perm, g->tasks, TASK_WSLCHANGED);

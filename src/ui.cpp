@@ -5943,7 +5943,10 @@ static b32 remotelisted(Gui *g, GuiHost *h, Str name)
 // Why a session's host can't do what cap names now, else empty.
 static Str hostwhy(Gui *g, GuiSession *s, Str cap)
 {
-    if (cap.len && !hostcap(s->host, cap)) {
+    if (s->host->ctr && !s->host->r && (cap=="trash" || cap=="delete") &&
+            sesstrashed(g, s)) {
+        return {};  // a stopped container's Trash is the window's (ctrtrash)
+    } else if (cap.len && !hostcap(s->host, cap)) {
         return s->host->kind==GH_REMOTE && s->host->up
              ? Str("The engine there is too old for this: update it (Update engine)")
              : Str("This host's engine is too old for this");
@@ -6611,7 +6614,22 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
         importstart(g, h);
     }
     ImGui::SetItemTooltip("A session from its raw log, exported here or elsewhere");
-    if (!h || h->kind==GH_REMOTE) {
+    if (GuiCtr *c = h ? ctrofhost(g, h) : 0) {
+        ImGui::Separator();
+        Str why = c->job ? Str("Busy") : !c->made ? Str("Not made") :
+                  c->state=="gone" ? Str("It is gone") :
+                  !live && c->state!="running" ? Str("It is stopped") : Str{};
+        if (menuitem(g, a, "Stop container", why)) {
+            ctrstop(g, c);
+        }
+        ImGui::SetItemTooltip("Stop it: its sessions wait in it until it starts again "
+                              "(Connect)");
+        if (menuitem(g, a, "Delete container...", c->job==CJOB_REMOVE ? Str("Removing") : Str{})) {
+            g->delctr     = c;
+            g->opendelctr = 1;
+        }
+        ImGui::SetItemTooltip("Remove it and its sessions for good");
+    } else if (!h || h->kind==GH_REMOTE) {
         ImGui::Separator();
         Str why = deploywhy(g, h, name);
         if (h && h->up) {
@@ -6751,7 +6769,24 @@ static void droptarget(Gui *g, Arena a, GuiHost *h, Str group, b32 archived, Str
 // click, and has a menu by a right click; a host's heading has buttons
 // for what is done there most. The Trash, opened, is listed again, for
 // what was purged since.
-static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64 nowms)
+// The container runtime's menu: a new container session, or look for
+// the runtime again.
+static void rtitems(Gui *g, Arena a)
+{
+    Str why = g->ctrrt.up ? Str{} : g->ctrrt.why.len ? g->ctrrt.why : Str("Not running");
+    if (menuitem(g, a, "New container session...", why)) {
+        g->newhost = 0;
+        g->newctr  = 1;
+        newsession(g);
+    }
+    if (menuitem(g, a, "Look again", g->ctrprobing ? Str("Looking") : Str{})) {
+        ctrlook(g);
+    }
+    ImGui::SetItemTooltip("Ask whether %s runs now", cstr0(&a, ctrtitle(g->ctrrt.name)));
+}
+
+static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64 nowms,
+                        b32 rt = 0)
 {
     f32         sc    = g->scale;
     ImDrawList *dl    = ImGui::GetWindowDrawList();
@@ -6762,7 +6797,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     ImGuiStyle &st    = ImGui::GetStyle();
 
     // Buttons at the right of a host's heading
-    b32         remote1 = r->kind==SROW_HOST && (!h || h->kind==GH_REMOTE);
+    b32         remote1 = r->kind==SROW_HOST && !rt && (!h || h->kind==GH_REMOTE);
     b32         live    = h && h->r && !h->closing;
     char const *cbtn    = live ? ICON_DISCONNECT : ICON_PLUG;  // Disconnect, Connect
     f32         bw      = 0;
@@ -6821,6 +6856,8 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
                         "confirm")) {
                 askempty(g);
             }
+        } else if (rt) {
+            rtitems(g, a);
         } else {
             hostitems(g, a, h, remote);
         }
@@ -6849,6 +6886,18 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         pen(&t, finish(&c), 0, g->pal->dim);
         break;
     case SROW_HOST: {
+        if (rt) {
+            u32 dot = g->ctrrt.up ? g->pal->ok : g->pal->dim;
+            drawdot(dl, v2(t.x + 4*sc, p.y + 2*sc + lineh/2), 3.5f*sc, dot);
+            t.x += 13*sc;
+            pen(&t, ctrtitle(g->ctrrt.name), STYLE_BOLD,
+                g->ctrrt.up ? g->pal->text : g->pal->dim);
+            pen(&t, "  ", 0, g->pal->dim);
+            pen(&t, g->ctrrt.up ? Str("new containers")
+                    : !g->ctrprobed ? Str("looking")
+                    : g->ctrrt.why.len ? g->ctrrt.why : Str("not running"), 0, g->pal->dim);
+            break;
+        }
         i64 left = h && h->state==RS_DOWN ? countdown(g, h->retryat, nowms) : 0;
         g->downshown |= h && h->state==RS_DOWN && left>0;
         u32 dot = h ? hostcolor(g, h) : g->pal->dim;
@@ -6878,14 +6927,21 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         // New session here, and Connect or Disconnect
         f32 y = p.y + (lineh + 4*sc - ImGui::GetFrameHeight())/2;
         ImGui::SetCursorScreenPos(v2(p.x + w - bw + st.ItemSpacing.x, y));
-        ImGui::BeginDisabled(!h || !hostready(g, h));
+        b32 ok = rt ? g->ctrrt.up : h && hostready(g, h);
+        ImGui::BeginDisabled(!ok);
         if (iconbutton(ICON_ADD)) {
-            g->newhost = h;
+            g->newhost = rt ? 0 : h;
+            g->newctr  = rt;
             newsession(g);
         }
         ImGui::EndDisabled();
         itemnamed(g, concat(&a, "new ", r->key));
-        whytip(h && hostready(g, h) ? Str("A new session here") : Str("Not connected"));
+        if (rt) {
+            whytip(ok ? concat(&a, "A new session, in a new container: ", ctrtitle(g->ctrrt.name))
+                      : g->ctrrt.why.len ? g->ctrrt.why : Str("Not running"));
+        } else {
+            whytip(ok ? Str("A new session here") : Str("Not connected"));
+        }
         if (remote1) {
             ImGui::SameLine();
             b32 closing = h && h->r && h->closing;
@@ -7212,6 +7268,7 @@ static void drawsessions(Gui *g)
         if (iconbutton(ICON_REFRESH "##refresh")) {
             guilistall(g);
             findwsl(g);
+            ctrlook(g);
         }
         itemnamed(g, "sessions refresh");
         ImGui::SetItemTooltip(HOST_WINDOWS ? "Refresh: list the sessions and the WSL distros again"
@@ -7223,21 +7280,33 @@ static void drawsessions(Gui *g)
     struct HostRef {
         GuiHost *h;
         Str      remote;  // a configured remote never reached
+        b32      rt;      // the container runtime's row
     };
     Slice<HostRef>  refs  = {};
     SideIn          in    = {};
     for (GuiHost *h = g->hosts; h; h = h->next) {
-        if (h->kind==GH_REMOTE && !remotelisted(g, h, h->name)) {
+        if (h->ctr || (h->kind==GH_REMOTE && !remotelisted(g, h, h->name))) {
             continue;
         }
-        refs     = push(&a, refs, HostRef{h, {}});
+        refs     = push(&a, refs, HostRef{h, {}, 0});
         in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, h, {}), 1});
     }
     Slice<Str> names = g->enginekind==ENGINE_FAKE ? Slice<Str>{} : remotenames(g, &a);
     for (iz i = 0; i < names.len; i++) {
         if (!findhost(g, GH_REMOTE, names[i]) && remotelisted(g, 0, names[i])) {
-            refs     = push(&a, refs, HostRef{0, names[i]});
+            refs     = push(&a, refs, HostRef{0, names[i], 0});
             in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, 0, names[i]), 1});
+        }
+    }
+    // Then Docker or Podman, if installed, and the containers it made
+    if (ctrlisted(g)) {
+        refs     = push(&a, refs, HostRef{0, {}, 1});
+        in.hosts = push(&a, in.hosts, SideHost{"ctr", 1});
+    }
+    for (GuiCtr *c = g->ctrs; c; c = c->next) {
+        if (!c->removed && c->h) {
+            refs     = push(&a, refs, HostRef{c->h, {}, 0});
+            in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, c->h, {}), 1});
         }
     }
     in.heads   = in.hosts.len > 1;
@@ -7319,7 +7388,7 @@ static void drawsessions(Gui *g)
                 ImGui::Spacing();
             }
             HostRef ref = r->kind==SROW_HOST ? refs[r->host] : HostRef{};
-            drawheading(g, a, r, ref.h, ref.remote, nowms);
+            drawheading(g, a, r, ref.h, ref.remote, nowms, ref.rt);
         }
     }
     if (!sess.len) {
@@ -7400,6 +7469,49 @@ static void drawsessdialogs(Gui *g)
             ImGui::CloseCurrentPopup();
         } else if (cancel) {
             ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (g->opendelctr) {
+        g->opendelctr = 0;
+        ImGui::OpenPopup("Delete container?");
+    }
+    ImGui::SetNextWindowSize(v2(460*sc, 0));
+    if (ImGui::BeginPopupModal("Delete container?", 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        GuiCtr *c = g->delctr;
+        if (!c || c->removed) {
+            ImGui::CloseCurrentPopup();
+        } else {
+            i32 n = 0;
+            for (GuiSession *s = g->sessions; s; s = s->next) {
+                n += s->host==c->h && !s->gone && s->listed && !s->parent.len;
+            }
+            Buf b(&a, 256);
+            print(&b, "Remove the container ");
+            print(&b, c->c.name);
+            print(&b, " (");
+            print(&b, c->c.image);
+            print(&b, ") and its ");
+            print(&b, (i64)n);
+            print(&b, n==1 ? Str(" session") : Str(" sessions"));
+            print(&b, " for good?");
+            if (c->c.workspace == CTR_MOUNT) {
+                print(&b, " The folder it mounts stays.");
+            }
+            ImGui::PushTextWrapPos(440*sc);
+            ImGui::TextUnformatted(cstr0(&a, finish(&b)));
+            ImGui::PopTextWrapPos();
+            ImGui::Spacing();
+            if (ImGui::Button("Delete", v2(120*sc, 0))) {
+                ctrdelete(g, c);
+                ImGui::CloseCurrentPopup();
+            }
+            itemnamed(g, "delctr ok");
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", v2(120*sc, 0)) || modalkey(ImGuiKey_Escape)) {
+                ImGui::CloseCurrentPopup();
+            }
         }
         ImGui::EndPopup();
     }
@@ -8668,6 +8780,108 @@ static void newcwdfor(Gui *g, Arena a, GuiHost *h)
     g->cwdhost = uid;
 }
 
+// New session's fields for a new container: its image, as typed or
+// picked from those listed ([container] images first, then the
+// runtime's own); its workspace, with the folder here it copies or
+// mounts at /work (newcwd); and its network. Returns whether Create
+// may go.
+static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
+{
+    f32 sc = g->scale;
+    ImGui::TextUnformatted("Image");
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::IsWindowAppearing()) {
+        ImGui::SetKeyboardFocusHere();
+    }
+    *enter |= ImGui::InputText("##image", g->newimage, FIELD_MAX,
+                               ImGuiInputTextFlags_EnterReturnsTrue);
+    itemnamed(g, "new image");
+    ImGui::SetItemTooltip("A Linux image, as the runtime names it: pulled first if "
+                          "it is not here");
+    Slice<Str> imgs = {};
+    for (Str rest = ctrset(g, "images"); rest.len;) {
+        Str w = {};
+        for (; rest.len && (rest[0]==' ' || rest[0]==',' || rest[0]=='\t'); rest = cuthead(rest, 1)) {}
+        iz n = 0;
+        for (; n<rest.len && rest[n]!=' ' && rest[n]!=',' && rest[n]!='\t'; n++) {}
+        w    = takehead(rest, n);
+        rest = cuthead(rest, n);
+        if (w.len) {
+            imgs = push(&a, imgs, w);
+        }
+    }
+    for (iz i = 0; i < g->ctrimgs.len; i++) {
+        b32 dup = g->ctrimgs[i].len>0 && g->ctrimgs[i][0]=='<';  // <none>:<none>
+        for (iz k = 0; !dup && k < imgs.len; k++) {
+            dup = imgs[k] == g->ctrimgs[i];
+        }
+        if (!dup) {
+            imgs = push(&a, imgs, g->ctrimgs[i]);
+        }
+    }
+    if (imgs.len) {
+        ImGui::BeginChild("##images", v2(0, (imgs.len<6 ? (f32)imgs.len : 6.5f) *
+                                            ImGui::GetTextLineHeightWithSpacing()));
+        for (iz i = 0; i < imgs.len; i++) {
+            ImGui::PushID((i32)i);
+            Str cur = {(u8 *)g->newimage, (iz)__builtin_strlen(g->newimage)};
+            if (ImGui::Selectable(cstr0(&a, imgs[i]), cur==imgs[i],
+                                  ImGuiSelectableFlags_NoAutoClosePopups)) {
+                fieldput(g->newimage, imgs[i]);
+            }
+            if (!i) {
+                itemnamed(g, "new image0");
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    } else if (g->ctrimging) {
+        ImGui::TextDisabled("Listing the images here...");
+    }
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Workspace");
+    static char const *labels[] = {"Empty", "Copy a folder", "Mount a folder"};
+    static char const *tips[]   = {
+        "An empty /work, the container's alone",
+        "A copy of a folder here in /work: what the agent changes stays in the container",
+        "A folder here at /work: the agent changes it here, as it goes",
+    };
+    for (i32 i = 0; i < countof(labels); i++) {
+        if (i) {
+            ImGui::SameLine();
+        }
+        ImGui::RadioButton(labels[i], &g->newws, i);
+        itemnamed(g, concat(&a, "new ws", ctrworkspaces[i]));
+        ImGui::SetItemTooltip("%s", tips[i]);
+    }
+    b32 none = g->newws == CTR_EMPTY;
+    ImGui::BeginDisabled(none);
+    char const *browse = "Browse\xe2\x80\xa6";
+    f32 bw = ImGui::CalcTextSize(browse).x + 2*ImGui::GetStyle().FramePadding.x;
+    ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
+    ImGui::InputTextWithHint("##ctrdir", "A folder on this computer", g->newcwd, FIELD_MAX,
+                             ImGuiInputTextFlags_AutoSelectAll);
+    itemrect(g, RECT_NEWCWD);
+    ImGui::SameLine();
+    if (ImGui::Button(browse)) {
+        browsestart(g, g->main);
+    }
+    itemnamed(g, "new browse");
+    ImGui::EndDisabled();
+    g->cwdoff = none;
+
+    ImGui::Spacing();
+    checkbox("Network access", &g->newnet);
+    itemnamed(g, "new network");
+    ImGui::SetItemTooltip("Off, it reaches no network: its model calls and web searches "
+                          "still go through this computer ([container] network)");
+    (void)sc;
+    Str image = trim({(u8 *)g->newimage, (iz)__builtin_strlen(g->newimage)});
+    Str dir   = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
+    return image.len && (none || dir.len);
+}
+
 static void drawnew(Gui *g)
 {
     f32         sc     = g->scale;
@@ -8689,6 +8903,11 @@ static void drawnew(Gui *g)
         g->newcheck  = !import;
         g->pc.shown = g->pc.refocus = 0;
         g->pc.sel = -1;
+        g->newctr &= !import;
+        if (g->newctr) {
+            g->newnet = cfgbool(ctrset(g, "network")) == 1;
+            ctrimglist(g);
+        }
     }
     ImGui::SetNextWindowSize(v2(560*sc, 0));
     if (!ImGui::BeginPopupModal(name, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -8698,9 +8917,12 @@ static void drawnew(Gui *g)
     b32   enter = modalenter();
 
     // Where it runs, when there is a choice: its directory is there
-    GuiHost *host  = g->newhost && hostready(g, g->newhost) &&
+    // or in a new container, its models the engine's here, relayed
+    b32      ctrok = !import && g->ctrrt.up && ctrlisted(g) && g->main && !g->main->ctr;
+    b32      ctr   = ctrok && g->newctr;
+    GuiHost *host  = !ctr && g->newhost && hostready(g, g->newhost) &&
                      (!import || hostcap(g->newhost, "import")) ? g->newhost : g->main;
-    i32      ready = 0;
+    i32      ready = ctrok;
     for (GuiHost *h = g->hosts; h; h = h->next) {
         ready += hostready(g, h) && (!import || hostcap(h, "import"));
     }
@@ -8720,13 +8942,16 @@ static void drawnew(Gui *g)
         ImGui::TextUnformatted("Host");
         ImGui::SetNextItemWidth(-1);
         ImVec2 at = ImGui::GetCursorScreenPos();
-        if (ImGui::BeginCombo("##host", cstr0(&a, hostlabel(g, &a, host)))) {
+        Str ctrname = concat(&a, ctrtitle(g->ctrrt.name), ": a new container");
+        Str shown   = ctr ? ctrname : hostlabel(g, &a, host);
+        if (ImGui::BeginCombo("##host", cstr0(&a, shown))) {
             i32 n = 0;
             for (GuiHost *h = g->hosts; h; h = h->next) {
                 if (!hostready(g, h) || (import && !hostcap(h, "import"))) continue;
                 ImGui::PushID(h);
-                if (ImGui::Selectable(cstr0(&a, hostlabel(g, &a, h)), h==host)) {
+                if (ImGui::Selectable(cstr0(&a, hostlabel(g, &a, h)), h==host && !ctr)) {
                     g->newhost = h;
+                    g->newctr  = 0;
                 }
                 if (n < 4) {
                     itemrect(g, RECT_HOST0 + n);
@@ -8735,115 +8960,130 @@ static void drawnew(Gui *g)
                 n++;
                 ImGui::PopID();
             }
+            if (ctrok && ImGui::Selectable(cstr0(&a, ctrname), ctr)) {
+                g->newctr = 1;
+                g->newnet = cfgbool(ctrset(g, "network")) == 1;
+                ctrimglist(g);
+            }
+            if (ctrok) {
+                itemnamed(g, "new host ctr");
+            }
             ImGui::EndCombo();
         }
+        itemnamed(g, "new host");
         f32 w = ImGui::GetContentRegionAvail().x;
         g->rects[RECT_HOSTCOMBO] = {at.x, at.y, at.x+w, at.y+ImGui::GetFrameHeight()};
         ImGui::Spacing();
     }
 
-    ImGui::TextUnformatted("Working directory");
-    if (host->kind == GH_REMOTE) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("on %s", cstr0(&a, host->name));
-    }
-    // Or none: a folder of the session's own, which the directory's
-    // field, Browse and the recent ones then have nothing to do with
-    b32 canfree  = hostcap(host, "nofolder");
-    b32 nofolder = canfree && g->newnofolder;
-    if (canfree) {
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12*sc);
-        checkbox("No folder", &g->newnofolder);
-        itemnamed(g, "new nofolder");
-        ImGui::SetItemTooltip("No project: the session works in a folder of its own, "
-                              "kept with it and deleted with it. %s, Session \xe2\x86\x92 "
-                              "New session, no folder, starts one straight away",
-                              cmdkey(g, &a, "Shift+N"));
-        nofolder = g->newnofolder;
-    }
-    ImGui::BeginDisabled(nofolder);
-    g->cwdoff = nofolder;
-
-    // Beside it, Browse, in the platform's dialog, for a directory here
-    char const *browse = "Browse\xe2\x80\xa6";
-    f32 bw = ImGui::CalcTextSize(browse).x + 2*ImGui::GetStyle().FramePadding.x;
-    ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
-    if (ImGui::IsWindowAppearing()) {
-        ImGui::SetKeyboardFocusHere();
-    }
-    PathField pf = pathbefore(g, host, g->newcwd, &enter, nofolder);
-    ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, pf.flags, pathcb, &pf.cb);
-    itemrect(g, RECT_NEWCWD);
-    pathafter(g, &pf, g->newcwd);
-    ImGui::SameLine();
-    b32 remote = host->kind == GH_REMOTE;
-    g->browseoff = remote;
-    ImGui::BeginDisabled(remote);
-    if (ImGui::Button(browse)) {
-        browsestart(g, host);
-    }
-    ImGui::EndDisabled();
-    itemnamed(g, "new browse");
-    whytip(remote ? concat(&a, "Only for a directory on this computer: this one is on ",
-                           host->name)
-                  : Str("Choose the directory in a dialog"));
-
-    // Recent directories there, newest first, not folders of sessions' own
-    Slice<GuiSession *> list   = sesslist(g, &a);
-    Slice<Str>          recent = {};
-    for (iz i = 0; i<list.len && recent.len<8; i++) {
-        Str cwd = list[i]->view && list[i]->view->cwd.len ? list[i]->view->cwd : list[i]->cwd;
-        b32 dup = !cwd.len || list[i]->host!=host || sessnofolder(list[i]);
-        for (iz k = 0; !dup && k < recent.len; k++) {
-            dup = recent[k] == cwd;
+    b32 nofolder = 0;
+    b32 wt       = 0;
+    b32 wtok     = 1;
+    Str wtname   = {};
+    if (ctr) {
+        wtok = drawnewctr(g, a, &enter);
+    } else {
+        ImGui::TextUnformatted("Working directory");
+        if (host->kind == GH_REMOTE) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("on %s", cstr0(&a, host->name));
         }
-        if (!dup) {
-            recent = push(&a, recent, cwd);
+        // Or none: a folder of the session's own, which the directory's
+        // field, Browse and the recent ones then have nothing to do with
+        b32 canfree  = hostcap(host, "nofolder");
+        nofolder     = canfree && g->newnofolder;
+        if (canfree) {
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12*sc);
+            checkbox("No folder", &g->newnofolder);
+            itemnamed(g, "new nofolder");
+            ImGui::SetItemTooltip("No project: the session works in a folder of its own, "
+                                  "kept with it and deleted with it. %s, Session \xe2\x86\x92 "
+                                  "New session, no folder, starts one straight away",
+                                  cmdkey(g, &a, "Shift+N"));
+            nofolder = g->newnofolder;
         }
-    }
-    if (recent.len) {
-        ImGui::TextDisabled("Recent");
-        for (iz i = 0; i < recent.len; i++) {
-            ImGui::PushID((i32)i);
-            // Only fills the field: a Selectable would close the dialog
-            Str shown = homeshow(&a, host, recent[i]);  // ~ as the host has it
-            if (ImGui::Selectable(cstr0(&a, shown), false, ImGuiSelectableFlags_NoAutoClosePopups)) {
-                fieldput(g->newcwd, shown);
-            }
-            if (!i) {
-                itemnamed(g, "new recent");
-            }
-            ImGui::PopID();
-        }
-    }
-    ImGui::EndDisabled();
-
-    // Or in a new worktree of its repository (worktree.cpp)
-    b32 canwt  = !import && hostcap(host, "worktree");
-    b32 wt     = canwt && g->newwt && !nofolder;
-    b32 wtok   = 1;
-    Str wtname = {};
-    if (canwt) {
-        ImGui::Spacing();
         ImGui::BeginDisabled(nofolder);
-        b32 off = 0;
-        checkbox("New worktree", nofolder ? &off : &g->newwt);
+        g->cwdoff = nofolder;
+
+        // Beside it, Browse, in the platform's dialog, for a directory here
+        char const *browse = "Browse\xe2\x80\xa6";
+        f32 bw = ImGui::CalcTextSize(browse).x + 2*ImGui::GetStyle().FramePadding.x;
+        ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        PathField pf = pathbefore(g, host, g->newcwd, &enter, nofolder);
+        ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, pf.flags, pathcb, &pf.cb);
+        itemrect(g, RECT_NEWCWD);
+        pathafter(g, &pf, g->newcwd);
+        ImGui::SameLine();
+        b32 remote = host->kind == GH_REMOTE;
+        g->browseoff = remote;
+        ImGui::BeginDisabled(remote);
+        if (ImGui::Button(browse)) {
+            browsestart(g, host);
+        }
         ImGui::EndDisabled();
-        itemnamed(g, "new worktree");
-        whytip(nofolder ? Str("Not with No folder: a worktree is of a folder's repository")
-                        : Str("The session works in a new git worktree of the folder's "
-                              "repository, on a branch of its own from the folder's HEAD. "
-                              "Archived or in the Trash, it is removed, if git "
-                              "calls it clean"));
-        if (wt) {
-            Str cwd = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
-            cwd     = hostwsl(g, host) ? wslpath(&a, cwd) : cwd;
-            guiwtprobe(g, host, cwd);
-            ImGui::Indent();
-            wtok   = wtfields(g, a, host, cwd);
-            wtname = trim({(u8 *)g->wtname, (iz)__builtin_strlen(g->wtname)});
-            ImGui::Unindent();
+        itemnamed(g, "new browse");
+        whytip(remote ? concat(&a, "Only for a directory on this computer: this one is on ",
+                               host->name)
+                      : Str("Choose the directory in a dialog"));
+
+        // Recent directories there, newest first, not folders of sessions' own
+        Slice<GuiSession *> list   = sesslist(g, &a);
+        Slice<Str>          recent = {};
+        for (iz i = 0; i<list.len && recent.len<8; i++) {
+            Str cwd = list[i]->view && list[i]->view->cwd.len ? list[i]->view->cwd : list[i]->cwd;
+            b32 dup = !cwd.len || list[i]->host!=host || sessnofolder(list[i]);
+            for (iz k = 0; !dup && k < recent.len; k++) {
+                dup = recent[k] == cwd;
+            }
+            if (!dup) {
+                recent = push(&a, recent, cwd);
+            }
+        }
+        if (recent.len) {
+            ImGui::TextDisabled("Recent");
+            for (iz i = 0; i < recent.len; i++) {
+                ImGui::PushID((i32)i);
+                // Only fills the field: a Selectable would close the dialog
+                Str shown = homeshow(&a, host, recent[i]);  // ~ as the host has it
+                if (ImGui::Selectable(cstr0(&a, shown), false, ImGuiSelectableFlags_NoAutoClosePopups)) {
+                    fieldput(g->newcwd, shown);
+                }
+                if (!i) {
+                    itemnamed(g, "new recent");
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndDisabled();
+
+        // Or in a new worktree of its repository (worktree.cpp)
+        b32 canwt  = !import && hostcap(host, "worktree");
+        wt         = canwt && g->newwt && !nofolder;
+        if (canwt) {
+            ImGui::Spacing();
+            ImGui::BeginDisabled(nofolder);
+            b32 off = 0;
+            checkbox("New worktree", nofolder ? &off : &g->newwt);
+            ImGui::EndDisabled();
+            itemnamed(g, "new worktree");
+            whytip(nofolder ? Str("Not with No folder: a worktree is of a folder's repository")
+                            : Str("The session works in a new git worktree of the folder's "
+                                  "repository, on a branch of its own from the folder's HEAD. "
+                                  "Archived or in the Trash, it is removed, if git "
+                                  "calls it clean"));
+            if (wt) {
+                Str cwd = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
+                cwd     = hostwsl(g, host) ? wslpath(&a, cwd) : cwd;
+                guiwtprobe(g, host, cwd);
+                ImGui::Indent();
+                wtok   = wtfields(g, a, host, cwd);
+                wtname = trim({(u8 *)g->wtname, (iz)__builtin_strlen(g->wtname)});
+                ImGui::Unindent();
+            }
         }
     }
 
@@ -8923,13 +9163,21 @@ static void drawnew(Gui *g)
         Str model = trim({(u8 *)g->newmodel, (iz)__builtin_strlen(g->newmodel)});
         Str both  = concat(&a, concat(&a, ep, "/"), model);
         g->picked = g->picked==both ? g->picked : clone(&g->perm, both);
+        Str err = {};
         if (import) {
             importbegin(g, host, cwd, ep, model, nofolder);
+        } else if (ctr) {
+            Str image = {(u8 *)g->newimage, (iz)__builtin_strlen(g->newimage)};
+            err = ctrnew(g, image, g->newws, cwd, g->newnet, ep, model,
+                         hasrole ? g->newrole : Str{}, plan && g->newplan && !hasrole);
         } else {
             guinew(g, host, cwd, ep, model, hasrole ? g->newrole : Str{},
                    plan && g->newplan && !hasrole, nofolder, wt, wtname);
         }
-        ImGui::CloseCurrentPopup();
+        g->newerr = err.len ? clone(&g->perm, err) : Str{};
+        if (!err.len) {
+            ImGui::CloseCurrentPopup();
+        }
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel", v2(120*sc, 0)) || modalkey(ImGuiKey_Escape)) {
@@ -9362,10 +9610,11 @@ static void drawhosts(Gui *g)
         findhosts(g, a);
         findwsl(g);
         guiconfigget(g);
+        ctrlook(g);
     }
     itemnamed(g, "hosts look again");
-    ImGui::SetItemTooltip("Look again: find background hosts and WSL distros again, and "
-                          "read the remotes from the configuration");
+    ImGui::SetItemTooltip("Look again: find background hosts, WSL distros and Docker or "
+                          "Podman again, and read the remotes from the configuration");
 
     // This process
     ImGui::SeparatorText("This computer");
@@ -9417,7 +9666,7 @@ static void drawhosts(Gui *g)
     ImGui::SeparatorText("Remote hosts");
     Slice<Str> names = remotenames(g, &a);
     for (GuiHost *h = g->hosts; h; h = h->next) {
-        b32 seen = h->kind != GH_REMOTE;
+        b32 seen = h->kind!=GH_REMOTE || h->ctr;
         for (iz n = 0; !seen && n < names.len; n++) {
             seen = names[n] == h->name;
         }
@@ -9431,6 +9680,55 @@ static void drawhosts(Gui *g)
     for (iz n = 0; n < names.len; n++) {
         // The first two's buttons, for the checklist
         drawremote(g, a, names[n], n<2 ? RECT_CONNECT+(i32)n : -1);
+    }
+
+    // Containers made for sessions, and the runtime that runs them
+    if (g->ctrrt.path.len || g->ctrs) {
+        ImGui::SeparatorText("Containers");
+        Buf rb(&a, 256);
+        print(&rb, ctrtitle(g->ctrrt.name));
+        if (!g->ctrrt.path.len) {
+            print(&rb, ": not found");
+        } else if (g->ctrrt.up) {
+            print(&rb, " ");
+            print(&rb, g->ctrrt.version);
+            print(&rb, ", at ");
+            print(&rb, g->ctrrt.path);
+        } else {
+            print(&rb, ": ");
+            print(&rb, g->ctrprobed ? g->ctrrt.why : Str("looking"));
+        }
+        ImGui::TextWrapped("%s", cstr0(&a, finish(&rb)));
+        for (GuiCtr *c = g->ctrs; c; c = c->next) {
+            if (c->removed || !c->h) continue;
+            ImGui::PushID(c);
+            ImGui::Bullet();
+            Buf b(&a, 256);
+            print(&b, hostlabel(g, &a, c->h));
+            print(&b, ": ");
+            print(&b, hoststatus(g, &a, c->h, 0));
+            print(&b, ", ");
+            print(&b, ctrworkspaces[c->c.workspace]);
+            if (c->c.folder.len) {
+                print(&b, " ");
+                print(&b, c->c.folder);
+            }
+            print(&b, c->c.network ? Str(", network") : Str(", no network"));
+            ImGuiStyle &st = ImGui::GetStyle();
+            f32         bw = ImGui::CalcTextSize("Delete").x + 2*st.FramePadding.x;
+            textfit(a, finish(&b), ImGui::GetContentRegionAvail().x - bw - st.ItemSpacing.x, 0);
+            if (c->err.len && ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", cstr0(&a, c->err));
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Delete")) {
+                g->delctr     = c;
+                g->opendelctr = 1;
+            }
+            itemnamed(g, "hosts delctr");  // the checklist's, its only one
+            ImGui::SetItemTooltip("Remove it and its sessions for good");
+            ImGui::PopID();
+        }
     }
 
     // A new one, which the configuration keeps: its fields side by side

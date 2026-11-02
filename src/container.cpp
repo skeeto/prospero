@@ -353,7 +353,8 @@ static b32 ctrsave(Os *os, Arena scratch, Str localstate, Ctr *c)
     }
     Str path = join(&scratch, dir, "container.ini");
     Str part = concat(&scratch, path, ".part");
-    return os_write(os, scratch, part, ctrini(&scratch, c)) &&
+    Str text = ctrini(&scratch, c);  // before scratch goes by value
+    return os_write(os, scratch, part, text) &&
            os_rename(os, scratch, part, path);
 }
 
@@ -427,10 +428,13 @@ static Str ctrremove(CtrRun *run, Arena *perm, Arena scratch, Ctr *c)
     Reach l          = {};
     l.exec = ctrexec(&scratch, c);
     Str dest = linkdest(&scratch, l);
-    os_remove(run->d.os, scratch, deployfile(&scratch, localstate, dest, ".ini"));
-    os_remove(run->d.os, scratch, deployfile(&scratch, localstate, dest, ".err"));
-    os_remove(run->d.os, scratch, deployfile(&scratch, localstate, dest, ".lock"));
-    os_removetree(run->d.os, scratch, ctrdir(&scratch, localstate, c->name));
+    static Str const exts[] = {".ini", ".err", ".lock"};
+    for (i32 i = 0; i < countof(exts); i++) {
+        Str path = deployfile(&scratch, localstate, dest, exts[i]);
+        os_remove(run->d.os, scratch, path);  // path first: scratch goes by value
+    }
+    Str dir = ctrdir(&scratch, localstate, c->name);
+    os_removetree(run->d.os, scratch, dir);
     return why;
 }
 
@@ -519,11 +523,11 @@ static Str ctrcreate(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cpus,
     }
     if (!why.len) {
         note(ctx, "starting it");
-        Str err = ctrdo(run, &scratch, carve(&scratch, 1<<16), c, "start");
+        Str err = ctrdo(run, &scratch, carve(&scratch, 1<<20), c, "start");
         why = err.len ? concat(&scratch, "cannot start the container: ", err) : why;
     }
     if (why.len) {
-        ctrremove(run, &scratch, carve(&scratch, 1<<16), c);
+        ctrremove(run, &scratch, carve(&scratch, 1<<20), c);
         return clone(perm, why);
     }
     return {};
