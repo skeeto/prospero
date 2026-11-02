@@ -2033,6 +2033,93 @@ static b32 os_guiwslwatch(Os *os, Arena *perm, Mailbox *mb, u32 type)
     return w32gui_wslwatch(wslchanged, c);
 }
 
+// The system's fonts: a file mapped whole, and the display language
+W32(uz,     CreateFileMappingW(uz, uz, i32, i32, i32, c16 *));
+W32(void *, MapViewOfFile(uz, i32, i32, i32, iz));
+W32(b32,    UnmapViewOfFile(void *));
+W32(c16,    GetUserDefaultUILanguage());  // a LANGID
+
+static Str os_guimap(Os *, Arena scratch, Str path)
+{
+    if (hasnul(path)) {
+        return {};
+    }
+    uz f = CreateFileW(widepath(&scratch, path).data, GENERIC_READ, FILE_SHARE_ALL, 0,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (f == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+    i64   size = 0;
+    void *p    = 0;
+    if (GetFileSizeEx(f, &size) && size>0 && size<=(i64)(((uz)-1)>>1)) {
+        uz m = CreateFileMappingW(f, 0, 2, 0, 0, 0);  // PAGE_READONLY
+        if (m) {
+            p = MapViewOfFile(m, 4, 0, 0, 0);  // FILE_MAP_READ
+            CloseHandle(m);  // the view holds it
+        }
+    }
+    CloseHandle(f);
+    return p ? Str{(u8 *)p, (iz)size} : Str{};
+}
+
+static void os_guiunmap(Os *, Str data)
+{
+    if (data.len) {
+        UnmapViewOfFile(data.data);
+    }
+}
+
+static Slice<Str> fontnames(Arena *a, Slice<Str> names, Str *list, iz n)
+{
+    for (iz i = 0; i < n; i++) {
+        names = push(a, names, list[i]);
+    }
+    return names;
+}
+
+// The fonts Windows installs, those for the user's display language
+// first: Microsoft YaHei (simplified Chinese), JhengHei (traditional),
+// Yu Gothic (Japanese), Malgun Gothic (Korean), then the older ones
+// that Windows 7 had (SimSun, MingLiU, Meiryo, MS Gothic, Gulim).
+static Slice<FontFile> os_guifonts(Os *os, Arena *a, Arena scratch, Str)
+{
+    i32 lang = GetUserDefaultUILanguage();
+    i32 prim = lang & 0x3ff;
+    b32 trad = lang==0x0404 || lang==0x0c04 || lang==0x1404;
+    Str sc[] = {"msyh.ttc", "simsun.ttc"};
+    Str tc[] = {"msjh.ttc", "mingliu.ttc"};
+    Str ja[] = {"YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"};
+    Str ko[] = {"malgun.ttf", "gulim.ttc"};
+    Slice<Str> names = {};
+    if (prim == 0x11) {
+        names = fontnames(&scratch, names, ja, countof(ja));
+    } else if (prim == 0x12) {
+        names = fontnames(&scratch, names, ko, countof(ko));
+    } else if (prim==0x04 && trad) {
+        names = fontnames(&scratch, names, tc, countof(tc));
+    }
+    names = fontnames(&scratch, names, sc, countof(sc));
+    names = fontnames(&scratch, names, ja, countof(ja));
+    names = fontnames(&scratch, names, ko, countof(ko));
+    names = fontnames(&scratch, names, tc, countof(tc));
+
+    Str dir = os_getenv(os, &scratch, "SystemRoot");
+    dir = dir.len ? dir : Str("C:/Windows");
+    Slice<FontFile> r = {};
+    for (iz i = 0; i < names.len; i++) {
+        b32 seen = 0;
+        for (iz k = 0; k < r.len; k++) {
+            seen |= endswith(r[k].path, names[i]);
+        }
+        if (!seen) {
+            FontFile ff = {};
+            ff.path = concat(a, concat(&scratch, dir, "/Fonts/"), names[i]);
+            r = push(a, r, ff);
+        }
+    }
+    return r;
+}
+
 static i32 dibint(u8 *p)
 {
     return (i32)((u32)p[0] | (u32)p[1]<<8 | (u32)p[2]<<16 | (u32)p[3]<<24);

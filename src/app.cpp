@@ -178,6 +178,7 @@ enum : u32 {
     TASK_CTR,           // a container job's end (id its CJOB_*): NAME, a line, then
                         // + and its result, or ! and why it failed
     TASK_CTRNOTE,       // its progress: NAME, a line, then the note
+    TASK_FONTS,         // the system's fonts picked (findfonts): a line each
 };
 
 // Item rectangles the scripted checklist aims at
@@ -1439,6 +1440,8 @@ struct Gui {
     // Compose box: the editor a draft is out in (one at a time), and
     // what the box's popups have open
     Str                editor;     // [ui] editor
+    Str                fontsset;   // [ui] fonts, at startup
+    Slice<FontFile>    sysfonts;   // found, merged before the next frame
     Str                terminal;   // [ui] terminal
     Str                termline;   // the latest terminal's launch, then << and a
                                    // script's command (macOS), as the
@@ -7267,6 +7270,160 @@ static void ontermenv(Gui *g, Arena scratch, Json *j, b32 ok)
     termlaunch(g, scratch, s, env, jsonstr(jsonget(j, "distro")));
 }
 
+// The system's fonts for what the embedded ones lack, Chinese, Japanese
+// and Korean, as [ui] fonts says: its entries in order, separated by ;,
+// each a file (a collection's face as FILE#N) or auto, the system's
+// (os_guifonts); none, or nothing, for none. A file of auto's is taken
+// only for a script (fontcjk) that those before it lack, so that one
+// font with all three is all there is; a file named is taken as it is.
+// Found on a thread, as fontconfig is a program to run; merged into the
+// faces between frames (addsysfonts).
+struct GuiFonts {
+    Os      *os;
+    Mailbox *done;
+    Str      setting;
+    Str      statedir;
+    Str      home;
+    Region  *perm;
+    Region  *scratch;
+};
+
+static void guifontsthread(void *arg)
+{
+    GuiFonts *f       = (GuiFonts *)arg;
+    Os       *os      = f->os;
+    Arena     perm    = newarena(f->perm);
+    Arena     scratch = newarena(f->scratch);
+    Buf       b(&perm, 1<<12);
+    u32       all  = (1u<<countof(fontcjk)) - 1;
+    u32       have = 0;
+    for (Str rest = f->setting; rest.len;) {
+        Cut c = cut(rest, ';');
+        rest  = c.tail;
+        Str e = trim(c.head);
+        if (!e.len || e=="none") {
+            continue;
+        }
+        b32             named = e != "auto";
+        Slice<FontFile> cands = {};
+        if (!named) {
+            // Its own scratch, apart from the list it makes in scratch:
+            // fc-match's mailbox and records live there
+            Arena work = carve(&scratch, (iz)1<<22);
+            cands = os_guifonts(os, &scratch, work, f->statedir);
+        } else {
+            FontFile ff = {};
+            ff.path = e;
+            iz hash = e.len;
+            while (hash>0 && e[hash-1]>='0' && e[hash-1]<='9') hash--;
+            if (hash>1 && hash<e.len && e[hash-1]=='#') {
+                ff.path  = trim(takehead(e, hash-1));
+                ff.index = (i32)parseint(cuthead(e, hash)).val;
+            }
+            ff.path = expandhome(&scratch, ff.path, f->home, HOST_WINDOWS);
+            cands   = push(&scratch, cands, ff);
+        }
+        for (iz i = 0; i < cands.len && (named || have!=all); i++) {
+            FontFile *ff   = &cands[i];
+            Arena     t    = scratch;
+            Str       data = os_guimap(os, t, ff->path);
+            if (!data.len) {
+                if (named) {
+                    print(&b, "!cannot read ");
+                    print(&b, ff->path);
+                    putbyte(&b, '\n');
+                }
+                continue;
+            }
+            i32 index = ff->index;
+            for (i32 k = 0; ff->psname.len && k < fontfaces(data); k++) {
+                if (fontpsname(&t, data, fontface(data, k)) == ff->psname) {
+                    index = k;
+                    break;
+                }
+            }
+            iz  dir  = fontface(data, index);
+            b32 draw = dir>=0 && fontdrawable(data, dir);
+            u32 mask = draw ? fontcjkmask(data, dir) : 0;
+            os_guiunmap(os, data);
+            if (dir<0 && named) {
+                print(&b, "!no face ");
+                print(&b, (i64)index);
+                print(&b, " in ");
+                print(&b, ff->path);
+                putbyte(&b, '\n');
+            } else if (!draw && named) {
+                print(&b, "!no outlines FreeType draws in ");
+                print(&b, ff->path);
+                putbyte(&b, '\n');
+            } else if (!draw) {
+                continue;
+            } else if (named || (mask & ~have)) {
+                have |= mask;
+                print(&b, (i64)index);
+                putbyte(&b, '\t');
+                print(&b, ff->path);
+                putbyte(&b, '\n');
+            }
+        }
+    }
+    mailpost(f->done, TASK_FONTS, 0, finish(&b), 1);
+    os_release(os, f->scratch);
+    os_release(os, f->perm);
+}
+
+static void findfonts(Gui *g)
+{
+    if (g->enginekind == ENGINE_FAKE) {
+        return;  // measurements: the embedded fonts alone
+    }
+    GuiFonts *f = alloc<GuiFonts>(&g->perm);
+    f->os       = g->os;
+    f->done     = g->tasks;
+    f->setting  = g->fontsset.len ? g->fontsset : Str("auto");
+    f->statedir = g->statedir;
+    f->home     = userhome(g->os, &g->perm);
+    f->perm     = os_reserve(g->os, (iz)1<<20);
+    f->scratch  = os_reserve(g->os, (iz)1<<24);
+    if (!f->perm || !f->scratch || !os_thread(g->os, guifontsthread, f)) {
+        if (f->perm) os_release(g->os, f->perm);
+        if (f->scratch) os_release(g->os, f->scratch);
+    }
+}
+
+// The fonts picked: an index and a path a line, or ! and a problem.
+static void fontsgot(Gui *g, Str data)
+{
+    for (Str rest = data; rest.len;) {
+        Cut l = cut(rest, '\n');
+        rest  = l.tail;
+        if (l.head.len && l.head[0]=='!') {
+            guilog(g, concat(&g->frame, "[ui] fonts: ", cuthead(l.head, 1)));
+            continue;
+        }
+        Cut f = cut(l.head, '\t');
+        if (!f.ok) {
+            continue;
+        }
+        FontFile ff = {};
+        ff.index = (i32)parseint(f.head).val;
+        ff.path  = clone(&g->perm, f.tail);
+        g->sysfonts = push(&g->perm, g->sysfonts, ff);
+        Buf b(&g->frame, 64 + ff.path.len);
+        print(&b, "font for CJK: ");
+        print(&b, ff.path);
+        if (ff.index) {
+            print(&b, ", face ");
+            print(&b, (i64)ff.index);
+        }
+        guilog(g, finish(&b));
+    }
+    if (g->sysfonts.len) {
+        g->fontdirty = 1;
+        scheddirty(&g->sched);
+    }
+}
+
 struct GuiWsl {
     Os      *os;
     Mailbox *done;
@@ -8538,6 +8695,9 @@ static void ontask(Gui *g, Record r)
         return;
     case TASK_WSL:
         wslgot(g, r.data);
+        return;
+    case TASK_FONTS:
+        fontsgot(g, r.data);
         return;
     case TASK_CTR:
         ctrdone(g, r);
@@ -10651,6 +10811,8 @@ static void gui_modal(Gui *g, b32 inmodal)
     g->inmodal = inmodal;
 }
 
+static void addsysfonts(Gui *);
+
 // Text at its size: [ui] font_size, zoomed, at the display's scale, in
 // ImGui's widgets and the transcript alike, whose layouts for the old
 // size go. Never inside a frame, which would mix sizes (setzoom).
@@ -11245,8 +11407,11 @@ static void gui_frame(Gui *g)
     g->layoutus = 0;
     g->thumbsdrawn = 0;
     g->userthumbs  = 0;
+    if (g->sysfonts.len) {
+        addsysfonts(g);
+    }
     if (g->fontdirty) {
-        fontsize(g);  // zoomed, or [ui] font_size changed
+        fontsize(g);  // zoomed, [ui] font_size changed, or fonts added
     }
     cachereset(g->vcache, 0);
     if (g->held && s->now>=g->holduntil) {
@@ -20724,6 +20889,46 @@ static ImFont *addface(Str data, i32 flags)
     return f;
 }
 
+// The system's fonts (findfonts), merged into each face after all of its
+// own, so that they fill gaps and change nothing else: the face's
+// metrics stay its first font's. Mapped for good, as the atlas reads a
+// glyph from them as it is first drawn. Between frames, as fontsize.
+static void addsysfonts(Gui *g)
+{
+    i32    bold   = ImGuiFreeTypeLoaderFlags_Bold;
+    i32    italic = ImGuiFreeTypeLoaderFlags_Oblique;
+    Fonts *f      = &g->fonts;
+    f32    prose  = fontlineems(fontroboto(), 0);
+    f32    mono   = fontlineems(fontmono(), 0);
+    struct { ImFont *font; i32 flags; f32 ems; } faces[] = {
+        {f->prose, 0, prose}, {f->bold, bold, prose}, {f->italic, italic, prose},
+        {f->bolditalic, bold|italic, prose}, {f->mono, 0, mono}, {f->monobold, bold, mono},
+    };
+    for (iz i = 0; i < g->sysfonts.len; i++) {
+        FontFile *ff   = &g->sysfonts[i];
+        Str       data = os_guimap(g->os, g->frame, ff->path);
+        if (!data.len || data.len>0x7fffffff) {
+            continue;
+        }
+        // Its em as large as the face's first font's: sized as one
+        f32 ems = fontlineems(data, fontface(data, ff->index));
+        for (auto &face : faces) {
+            f32 size = ems>0 && face.ems>0 ? 15*ems/face.ems : 15;
+            ImFontConfig cfg;
+            cfg.FontDataOwnedByAtlas = 0;
+            cfg.FontLoaderFlags      = (u32)face.flags;
+            cfg.MergeMode            = 1;
+            cfg.DstFont              = face.font;
+            cfg.FontNo               = ff->index;
+            ImGui::GetIO().Fonts->AddFontFromMemoryTTF(
+                (void *)data.data, (i32)data.len, size, &cfg
+            );
+        }
+    }
+    g->sysfonts  = {};
+    g->fontdirty = 1;
+}
+
 static void loadfonts(Gui *g)
 {
     i32 bold   = ImGuiFreeTypeLoaderFlags_Bold;
@@ -20877,6 +21082,7 @@ static void readconfig(Gui *g, Arena scratch)
     i32 count = countparse(cfgget(cfg, "ui", "", "count", 0));
     g->countset = count<0 ? COUNT_WORDS : count;
     setfontbase(g, cfgget(cfg, "ui", "", "font_size", 0));
+    g->fontsset   = clone(&g->perm, cfgget(cfg, "ui", "", "fonts", 0));
     g->editor     = clone(&g->perm, cfgget(cfg, "ui", "", "editor", 0));
     g->terminal   = clone(&g->perm, cfgget(cfg, "ui", "", "terminal", 0));
     g->notify     = notifyparse(cfgget(cfg, "ui", "", "notify", 0));
@@ -21416,6 +21622,7 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
         }
     }
     if (!fake) {
+        findfonts(g);            // the system's for CJK, merged as they come
         findhosts(g, g->frame);  // background hosts of the state directory
         findwsl(g);              // and WSL distros, as remotes,
         ctrload(g);              // and containers made for sessions,

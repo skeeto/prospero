@@ -102,4 +102,39 @@ static void test_fonts(Test *t)
                                            fontcovers(fontemoji(), 0x26a0) ||
                                            fontcovers(fontemoji(), 0x2605)), "0");
     expect(t, "fonts.emoji.prose", istr(&a, fontprose(0x2705) && fontprose(0x1f680)), "1");
+
+    // A collection (.ttc) of one face, Roboto behind a "ttcf" header,
+    // its tables' offsets moved with it: the same face, found by index
+    Str  rob = fontroboto();
+    iz   hdr = 16;
+    Str  ttc = {allocbytes(&a, hdr+rob.len), hdr+rob.len};
+    u8 const head[] = {'t','t','c','f', 0,1,0,0, 0,0,0,1, 0,0,0,(u8)hdr};
+    __builtin_memcpy(ttc.data, head, (uz)hdr);
+    __builtin_memcpy(ttc.data+hdr, rob.data, (uz)rob.len);
+    for (u32 i = 0; i < fontbe16(rob, 4); i++) {
+        iz  at  = hdr + 12 + 16*(iz)i + 8;
+        u32 off = fontbe32(ttc, at) + (u32)hdr;
+        ttc.data[at]   = (u8)(off>>24);
+        ttc.data[at+1] = (u8)(off>>16);
+        ttc.data[at+2] = (u8)(off>>8);
+        ttc.data[at+3] = (u8)off;
+    }
+    expect(t, "fonts.ttc.faces", istr(&a, fontfaces(ttc)), "1");
+    expect(t, "fonts.ttc.dir", istr(&a, fontface(ttc, 0)), "16");
+    expect(t, "fonts.ttc.past", istr(&a, fontface(ttc, 1)), "-1");
+    expect(t, "fonts.ttc.a", istr(&a, cmapcovers(fonttable(ttc, 16, 0x636d6170), 'a')), "1");
+    expect(t, "fonts.ttc.psname", fontpsname(&a, ttc, 16), "Roboto-Medium");
+    expect(t, "fonts.psname", fontpsname(&a, rob, 0), "Roboto-Medium");
+    expect(t, "fonts.plain.index", istr(&a, fontface(rob, 1)), "-1");
+
+    // None of the embedded fonts has CJK, which the system's fill in
+    u32 cjk = fontcjkmask(rob, 0) | fontcjkmask(fontmono(), 0) |
+              fontcjkmask(fontsymbols(), 0) | fontcjkmask(fontmath(), 0) |
+              fontcjkmask(fontemoji(), 0);
+    expect(t, "fonts.cjk.embedded", istr(&a, cjk), "0");
+    expect(t, "fonts.drawable", istr(&a, fontdrawable(rob, 0) && fontdrawable(ttc, 16)), "1");
+    expect(t, "fonts.drawable.none", istr(&a, fontdrawable({}, 0)), "0");
+    // Roboto's hhea: 1900 above, 500 below, 2048 units per em
+    expect(t, "fonts.lineems", istr(&a, (i64)(fontlineems(rob, 0)*1000 + 0.5f)), "1172");
+    expect(t, "fonts.lineems.ttc", istr(&a, fontlineems(ttc, 16)==fontlineems(rob, 0)), "1");
 }

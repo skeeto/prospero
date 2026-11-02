@@ -95,6 +95,12 @@ static void test_layout(Test *t)
         {"layout.tableshrink", "| aaaa bbbb | c |\n|---|---|\n| 1 | 2 |", 100,
          "8:8[aaaa ] 28:8[bbbb] 8:71[c] 64:8[1] 64:71[2] h=92"},
         {"layout.empty", "", 200, "h=0"},
+        // CJK breaks between its characters, not only at spaces, but
+        // never before a closing mark (kinsoku)
+        {"layout.cjk", "aa 中文字句", 50, "0:0[aa 中文] 20:0[字句] h=40"},
+        {"layout.cjkclose", "中文字。", 30, "0:0[中文] 20:0[字。] h=40"},
+        {"layout.cjkopen", "中文「字", 30, "0:0[中文] 20:0[「字] h=40"},
+        {"layout.cjklatin", "中文ab", 30, "0:0[中文] 20:0[ab] h=40"},
     };
     for (iz i = 0; i < countof(cases); i++) {
         Arena a = perm;

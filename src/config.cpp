@@ -571,6 +571,12 @@ static CfgKey cfgschema[] = {
     {"ui", "font_size", CFG_NUMBER, "17", {}, {}, "ui",
      "Text size in pixels at 100% display scale, 8 to 40; the View "
      "menu's zoom scales it until Prospero exits"},
+    {"ui", "fonts", CFG_STRING, "auto", {}, {}, "ui",
+     "Fonts for what the built-in ones lack, Chinese, Japanese and Korean, "
+     "separated by ; and tried in order: auto for the system's, as "
+     "fontconfig (Linux), CoreText (macOS) or the user's display language "
+     "(Windows) picks them, or a file, a collection's face as FILE#N "
+     "(NotoSansCJK.ttc#2); none for none. Read at startup"},
     {"ui", "editor", CFG_STRING, "", {}, {}, "ui",
      "The command that opens a draft in an editor (Ctrl+G, or the compose "
      "box's menu), given the file as one more word; it must wait until the "

@@ -435,6 +435,22 @@ static void    os_guiletfront(Os *, i64 pid);
 // theme, where the platform can: Windows 10 1809 and later, and macOS.
 // Returns 0 where it cannot, and before the window exists.
 static b32     os_guitheme(Os *, b32 dark);
+// Map a file read-only, whole, its pages read as they are touched: the
+// system's fonts, which may be tens of megabytes. Empty on failure.
+static Str     os_guimap(Os *, Arena scratch, Str path);
+static void    os_guiunmap(Os *, Str);
+// A font file of the system's, and its face: by index, or in a
+// collection by PostScript name when psname is set (app.cpp, sysfonts).
+struct FontFile {
+    Str path;
+    Str psname;
+    i32 index;
+};
+// The system's fonts for Chinese, Japanese and Korean, in the order the
+// user's languages want them: candidates, which the caller checks by
+// their character maps. It may run programs (fc-match), so not on the
+// window's thread; statedir is where their errors go.
+static Slice<FontFile> os_guifonts(Os *, Arena *, Arena scratch, Str statedir);
 // Close the window, and everything with it.
 static void    os_guiclose(Os *);
 // (M5) Shed the window and its renderer, keeping the event loop, which

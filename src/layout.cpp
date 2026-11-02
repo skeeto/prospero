@@ -96,9 +96,41 @@ static Spacing spacing(Measure *m)
     return s;
 }
 
-static b32 piecespace(u8 c)
+static b32 piecespace(i32 c)
 {
     return c==' ' || c=='\t';
+}
+
+static b32 cpin(Str set, i32 cp)
+{
+    for (iz i = 0; i < set.len;) {
+        if (utf8decode(set, &i) == cp) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Chinese, Japanese and Korean, written without spaces between words: a
+// line may break before or after any of these characters (roughly UAX
+// #14's ideographic class), unless the punctuation on either side
+// forbids it (kinsoku): a closing mark, small kana or a prolonged sound
+// mark never starts a line, and an opening mark never ends one.
+static b32 cjkchar(i32 cp)
+{
+    return (cp>=0x2e80 && cp<=0x9fff) || (cp>=0xac00 && cp<=0xd7af) ||
+           (cp>=0xf900 && cp<=0xfaff) || (cp>=0xff00 && cp<=0xffef) ||
+           (cp>=0x20000 && cp<=0x3ffff);
+}
+
+static b32 cjkbreak(i32 before, i32 after)
+{
+    static Str const nostart =
+        "、。，．：；？！）」』】〕〉》〗〙〟’”ー々〻ぁぃぅぇぉっゃゅょゎゕゖ"
+        "ァィゥェォッャュョヮヵヶ・…‥゛゜ヽヾゝゞ〜～％］｝｡｣､･ｰ,.;:!?)]}%";
+    static Str const noend = "（「『【〔〈《〖〘〝‘“［｛｢([{";
+    return (cjkchar(before) || cjkchar(after)) && !piecespace(before) &&
+           !piecespace(after) && !cpin(nostart, after) && !cpin(noend, before);
 }
 
 // Measure a byte range of text in one style.
@@ -127,7 +159,9 @@ struct Wrap {
     f32          ascent;
     i32          run0;    // first run of the current line
     b32          code;    // wrap anywhere, tabs to stops
-    // Last break opportunity on this line: just after a space
+    i32          prev;    // the code point before, for cjkbreak
+    // Last break opportunity on this line: just after a space, or
+    // between CJK characters
     b32          canbreak;
     i32          bpiece;
     iz           bbyte;
@@ -202,6 +236,7 @@ static void wrappieces(Wrap *w, i32 p0, i32 p1)
         if (pc->flags & PIECE_SOFT) {
             f32 adv = m->advance(m->ctx, pc->style, ' ');
             addrun(w, p, 0, pc->text.len, adv, RUN_NODRAW);
+            w->prev     = ' ';
             w->canbreak = 1;
             w->bpiece   = p;
             w->bbyte    = pc->text.len;
@@ -231,7 +266,13 @@ static void wrappieces(Wrap *w, i32 p0, i32 p1)
             }
 
             b32 empty = (i32)w->bl->runs.len == w->run0;
-            if (!empty && w->x+adv > w->x0+w->width && !piecespace((u8)cp)) {
+            if (!empty && !w->code && cjkbreak(w->prev, cp)) {
+                w->canbreak = 1;  // before this one
+                w->bpiece   = p;
+                w->bbyte    = start;
+                w->bruns    = (i32)w->bl->runs.len;
+            }
+            if (!empty && w->x+adv > w->x0+w->width && !piecespace(cp)) {
                 if (w->canbreak && !w->code) {
                     // Move everything after the break to a new line.
                     w->bl->runs.len = w->bruns;
@@ -261,7 +302,8 @@ static void wrappieces(Wrap *w, i32 p0, i32 p1)
             }
 
             addrun(w, p, start, i, adv, flags);
-            if (piecespace((u8)cp) && !w->code) {
+            w->prev = cp;
+            if (piecespace(cp) && !w->code) {
                 w->canbreak = 1;
                 w->bpiece   = p;
                 w->bbyte    = i;

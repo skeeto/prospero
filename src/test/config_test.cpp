@@ -1080,6 +1080,7 @@ static void testcfgjson(Test *t)
         "ui//count=words*\n"
         "ui//tools=auto*\n"
         "ui//font_size=17*\n"
+        "ui//fonts=auto*\n"
         "ui//editor=*\n"
         "ui//terminal=*\n"
         "ui//notify=allow done*\n"

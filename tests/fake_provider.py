@@ -2712,6 +2712,8 @@ static int greet(char const *name)
 
 Status: ✅ built, ❌ one test, 🚀 shipped, 🐛 fixed, ✔ checked, ★ starred, **bold ✅🎉**, *slanted 🔥💡*, `code ✅🧪`.
 
+CJK, from the system's fonts: 中文的问候，**日本語のかな**、*한국어 텍스트*, `代码 コード`.
+
 """
 
 GUI_FAILED = set()  # (model, messages so far): turns that failed once

@@ -1595,6 +1595,145 @@ static b32 os_guiwslwatch(Os *, Arena *, Mailbox *, u32)
     return 0;
 }
 
+static Str os_guimap(Os *, Arena scratch, Str path)
+{
+    if (hasnul(path)) {
+        return {};
+    }
+    i32 fd = open(cstr(&scratch, path), O_RDONLY|O_CLOEXEC);
+    if (fd < 0) {
+        return {};
+    }
+    struct stat st;
+    void       *p = MAP_FAILED;
+    if (!fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_size>0) {
+        p = mmap(0, (uz)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    }
+    close(fd);
+    return p==MAP_FAILED ? Str{} : Str{(u8 *)p, (iz)st.st_size};
+}
+
+static void os_guiunmap(Os *, Str data)
+{
+    if (data.len) {
+        munmap(data.data, (uz)data.len);
+    }
+}
+
+#ifdef __APPLE__
+// CoreText's cascade list from Helvetica, the fonts it falls back on, in
+// the order of the user's preferred languages (System Settings, Language
+// & Region): each named by its file, and its face in a collection by its
+// PostScript name. CoreText and CoreFoundation are loaded at run time,
+// as http_httplib.cpp loads Security.
+static Slice<FontFile> os_guifonts(Os *, Arena *a, Arena, Str)
+{
+    using Ref = void const *;
+    i32   flags = RTLD_LAZY|RTLD_LOCAL;
+    void *cf    = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", flags);
+    void *ct    = dlopen("/System/Library/Frameworks/CoreText.framework/CoreText", flags);
+    if (!cf || !ct) {
+        return {};
+    }
+    auto strnew  = (Ref (*)(Ref, char const *, u32))dlsym(cf, "CFStringCreateWithCString");
+    auto strget  = (bool (*)(Ref, char *, long, u32))dlsym(cf, "CFStringGetCString");
+    auto langs   = (Ref (*)())dlsym(cf, "CFLocaleCopyPreferredLanguages");
+    auto count   = (long (*)(Ref))dlsym(cf, "CFArrayGetCount");
+    auto at      = (Ref (*)(Ref, long))dlsym(cf, "CFArrayGetValueAtIndex");
+    auto urlpath = (bool (*)(Ref, bool, u8 *, long))dlsym(cf, "CFURLGetFileSystemRepresentation");
+    auto release = (void (*)(Ref))dlsym(cf, "CFRelease");
+    auto fontnew = (Ref (*)(Ref, f64, Ref))dlsym(ct, "CTFontCreateWithName");
+    auto cascade = (Ref (*)(Ref, Ref))dlsym(ct, "CTFontCopyDefaultCascadeListForLanguages");
+    auto attr    = (Ref (*)(Ref, Ref))dlsym(ct, "CTFontDescriptorCopyAttribute");
+    Ref *urlkey  = (Ref *)dlsym(ct, "kCTFontURLAttribute");
+    Ref *namekey = (Ref *)dlsym(ct, "kCTFontNameAttribute");
+    if (!strnew || !strget || !langs || !count || !at || !urlpath || !release ||
+        !fontnew || !cascade || !attr || !urlkey || !namekey) {
+        return {};
+    }
+    u32 const utf8 = 0x08000100;  // kCFStringEncodingUTF8
+    Slice<FontFile> r = {};
+    Ref name = strnew(0, "Helvetica", utf8);
+    Ref font = name ? fontnew(name, 12, 0) : 0;
+    Ref pref = langs();
+    Ref list = font ? cascade(font, pref) : 0;
+    for (long i = 0; list && i < count(list); i++) {
+        Ref desc = at(list, i);
+        Ref url  = attr(desc, *urlkey);
+        Ref ps   = attr(desc, *namekey);
+        u8   path[4096];
+        char psname[256];
+        if (url && urlpath(url, true, path, sizeof(path)) &&
+            ps && strget(ps, psname, sizeof(psname), utf8)) {
+            FontFile ff = {};
+            ff.path   = clone(a, Str{path, (iz)__builtin_strlen((char *)path)});
+            ff.psname = clone(a, Str{(u8 *)psname, (iz)__builtin_strlen(psname)});
+            r = push(a, r, ff);
+        }
+        if (url) release(url);
+        if (ps) release(ps);
+    }
+    if (list) release(list);
+    if (pref) release(pref);
+    if (font) release(font);
+    if (name) release(name);
+    return r;
+}
+#else
+// fontconfig's choice for each language, the locale's first ($LANGUAGE,
+// else $LC_ALL, $LC_CTYPE or $LANG): fc-match, which follows the user's
+// own fontconfig settings, and gives the face in a collection.
+static Slice<FontFile> os_guifonts(Os *os, Arena *a, Arena scratch, Str statedir)
+{
+    Str loc     = {};
+    Str names[] = {"LANGUAGE", "LC_ALL", "LC_CTYPE", "LANG"};
+    for (Str v : names) {
+        loc = os_getenv(os, &scratch, v);
+        if (loc.len) {
+            break;
+        }
+    }
+    Str lang = takehead(loc, 2);
+    Str first = lang=="ja" ? Str("ja") : lang=="ko" ? Str("ko") :
+                lang!="zh" ? Str{} :
+                find(loc, "TW")>=0 || find(loc, "HK")>=0 || find(loc, "MO")>=0 ||
+                find(loc, "Hant")>=0 ? Str("zh-tw") : Str("zh-cn");
+    Str langs[] = {first, "zh-cn", "ja", "ko", "zh-tw"};
+
+    DeployConf c = {};
+    c.localstate = statedir;
+    Deploy d = {};
+    d.os   = os;
+    d.conf = &c;
+    d.mb   = newmailbox(&scratch, 1<<16, 0, 0);
+    d.env  = os_environ(os, &scratch);
+    if (!d.mb) {
+        return {};
+    }
+    Slice<FontFile> r = {};
+    for (iz i = 0; i < countof(langs); i++) {
+        if (!langs[i].len || (i && langs[i]==first)) {
+            continue;
+        }
+        Slice<Str> argv = {};
+        argv = push(&scratch, argv, Str("fc-match"));
+        argv = push(&scratch, argv, Str("-f"));
+        argv = push(&scratch, argv, Str("%{file}\n%{index}\n"));
+        argv = push(&scratch, argv, concat(&scratch, ":lang=", langs[i]));
+        DeployRun run = deployrun(&d, &scratch, argv, 5*SEC);
+        Cut       l   = cut(run.out, '\n');
+        if (run.code || !l.head.len) {
+            continue;
+        }
+        FontFile ff = {};
+        ff.path  = clone(a, l.head);
+        ff.index = (i32)parseint(trim(cut(l.tail, '\n').head)).val;
+        r = push(a, r, ff);
+    }
+    return r;
+}
+#endif
+
 // And for a directory, starting in at.
 static b32 os_guiopendir(Os *os, Arena scratch, Str title, Str at, Mailbox *mb,
                          u32 type, u64 id)

@@ -12,6 +12,10 @@
 #define IMGUI_DISABLE_OBSOLETE_FUNCTIONS
 #define IMGUI_DISABLE_DEMO_WINDOWS  // imgui_demo.cpp: empty stubs only
 
+// Places the IME's composition and candidate windows at the text cursor.
+// ImGui leaves this off for compilers other than MSVC; imm32 is linked.
+#define IMGUI_ENABLE_WIN32_DEFAULT_IME_FUNCTIONS
+
 // A failed assertion goes to prospero_imassert (app.cpp), which logs it.
 // Debug builds then trap. Release builds continue: the engine shares the
 // process, so one GUI mistake must not end every session.
