@@ -80,6 +80,8 @@ class State:
         self.active = {}    # prefix -> {model: requests in flight}
         self.peak = {}      # prefix -> most different models in flight
         self.includes = 0   # fetches of /fake/include.ini
+        self.served = {}    # NAME -> text, served at /fake/serve/NAME
+        self.auths = []     # (path, Authorization) of chat requests
         self.sigs = {}      # Anthropic: signature -> (reasoning, binding)
         self.signers = {}   # Anthropic: signature -> the model that gave it
         self.redacted = set()  # Anthropic: redacted data given out
@@ -2646,7 +2648,8 @@ def sc_mcp_http_auth(model, n, req):
 
 
 sc_mcp_http_token = sc_mcp_http_auth
-sc_mcp_include_confirm = sc_mcp_http_auth
+sc_approve_mcp = sc_mcp_http_auth
+sc_approve_endpoint = sc_plain
 
 
 def sc_mcp_oauth(model, n, req):
@@ -5091,6 +5094,19 @@ class Handler(BaseHTTPRequestHandler):
             self.stall(url.path)
         elif url.path.startswith(("/web/", "/searxng/")):
             self.web(url, "GET", b"")
+        elif url.path.startswith("/fake/serve/"):
+            # A configuration a scenario put up, to include by URL
+            with STATE.lock:
+                text = STATE.served.get(url.path[len("/fake/serve/"):])
+            if text is None:
+                self.send_json(404, {"error": {"message": "not served"}})
+                return
+            body = text.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif url.path == "/fake/include.ini":
             # A configuration to include by URL, counting its fetches
             with STATE.lock:
@@ -5297,6 +5313,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url, path, prefix = self.route()
         raw = self.body()
+        if path.endswith("/chat/completions"):
+            with STATE.lock:
+                STATE.auths.append((url.path, self.headers.get("Authorization")))
         if url.path.startswith("/web/"):
             self.web(url, "POST", raw)
             return

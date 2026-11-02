@@ -1259,6 +1259,11 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             pen(p, "Start the MCP servers of ", STYLE_BOLD, pal->amber);
             pen(p, t->path, STYLE_CODE, pal->summary);
             pen(p, "?  ", STYLE_BOLD, pal->amber);
+        } else if (t->kind == "approve") {
+            // The urls, from web includes; what would go there in its text
+            pen(p, "Send credentials to ", STYLE_BOLD, pal->amber);
+            pen(p, t->path, STYLE_CODE, pal->summary);
+            pen(p, "?  ", STYLE_BOLD, pal->amber);
         } else {
             Buf b(&a, 256);
             print(&b, t->tool);
@@ -1309,6 +1314,7 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
                       t->by=="cancel"  ? Str(": the turn was cancelled") :
                       t->by=="policy"  ? Str(": nobody could answer") :
                       t->by=="interrupted" ? Str(": the harness stopped while asking") :
+                      t->by=="shared"  ? Str(" for every session") :
                       t->by=="stopped" ? Str(": the engine stopped") : Str(""));
             pen(p, finish(&c), STYLE_BOLD, ok ? pal->ok : pal->bad);
         }
@@ -2304,6 +2310,9 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
     if (proj) {
         ImGui::SetItemTooltip("Start these servers for this session and its subagents, "
                               "whose agents may then ask to use their tools");
+    } else if (t->scope == "approve") {
+        ImGui::SetItemTooltip("Send these to these urls, from now on, for every "
+                              "session, until a web include changes a url");
     } else {
         ImGui::SetItemTooltip("Let the %s go ahead", t->tool.len ? cstr0(&a, t->tool) : "tool");
     }
@@ -10570,6 +10579,54 @@ static void drawcfgdiags(Gui *g)
     ImGui::PopTextWrapPos();
 }
 
+// What a section a web include gives the url of would send there, on its
+// page, with Approve for each url: true if anything waits.
+static b32 drawapprove(Gui *g, Arena a, Str kind, Str name)
+{
+    apprlisting(g);
+    b32 any = 0;
+    for (Json *x = g->apprlist ? g->apprlist->child : 0; x; x = x->next) {
+        if (jsonstr(jsonget(x, "kind"))!=kind || jsonstr(jsonget(x, "name"))!=name) {
+            continue;
+        }
+        Str url = jsonstr(jsonget(x, "url"));
+        b32 seen = 0;
+        for (Json *y = g->apprlist->child; y != x; y = y->next) {
+            seen |= jsonstr(jsonget(y, "kind"))==kind && jsonstr(jsonget(y, "name"))==name &&
+                    jsonstr(jsonget(y, "url"))==url;
+        }
+        if (seen) {
+            continue;
+        }
+        Buf what(&a, 256);
+        for (Json *y = x; y; y = y->next) {
+            if (jsonstr(jsonget(y, "kind"))==kind && jsonstr(jsonget(y, "name"))==name &&
+                    jsonstr(jsonget(y, "url"))==url) {
+                print(&what, what.len ? Str(", ") : Str(""));
+                print(&what, jsonstr(jsonget(y, "what")));
+            }
+        }
+        any = 1;
+        ImGui::PushID(cstr0(&a, url));
+        ImGui::TextWrapped("A web include gives this url, which nothing goes "
+                           "to until you approve what your configuration would "
+                           "send it (%s):", cstr0(&a, finish(&what)));
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+        ImGui::TextWrapped("%s", cstr0(&a, url));
+        ImGui::PopStyleColor();
+        itemnamed(g, concat(&a, concat(&a, kind, Str(" url ")), name));
+        b32 yes = ImGui::SmallButton("Approve");
+        itemnamed(g, concat(&a, concat(&a, kind, Str(" approve ")), name));
+        ImGui::SetItemTooltip("Send these to this url, for every session, "
+                              "until a web include changes the url");
+        if (yes) {
+            mcpcmd(g, CMD_APPROVE, name, url);
+        }
+        ImGui::PopID();
+    }
+    return any;
+}
+
 // An MCP server's state, on its page: as the main host's engine has it,
 // with Sign in and Sign out for one over HTTP, and Restart.
 static void drawmcp(Gui *g, Arena a, Str name)
@@ -10599,31 +10656,13 @@ static void drawmcp(Gui *g, Arena a, Str name)
     ImGui::PopTextWrapPos();
     itemnamed(g, concat(&a, "mcp state ", name));
 
-    // An included url to confirm first, for what the user's file adds
-    Str confirm = hostcan(g->main, "mcp.confirm") ? jsonstr(jsonget(m, "confirm")) : Str{};
-    if (confirm.len) {
-        ImGui::TextWrapped("Your own file adds a token, header or trust to this "
-                           "server, whose url an included file gives. Nothing goes "
-                           "to it until you confirm that this is the url you mean:");
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
-        ImGui::TextWrapped("%s", cstr0(&a, confirm));
-        ImGui::PopStyleColor();
-        itemnamed(g, concat(&a, "mcp url ", name));
-        b32 yes = ImGui::SmallButton("Confirm");
-        itemnamed(g, concat(&a, "mcp confirm ", name));
-        ImGui::SetItemTooltip("Connect to it at this url, with what your file "
-                              "adds, until an included file changes the url");
-        if (yes) {
-            mcpcmd(g, CMD_MCPCONFIRM, name, confirm);
-        }
-        ImGui::SameLine();
-    }
+    b32 approve = drawapprove(g, a, "mcp", name);
 
     Str busy = g->mcpname.len ? concat(&a, concat(&a, "Signing in to ", g->mcpname),
                                        Str(" already")) : Str{};
     if (http) {
         Str why = !can ? Str("The engine is too old to sign in") :
-                  confirm.len ? Str("Confirm its url first") : busy;
+                  approve ? Str("Approve its url first") : busy;
         ImGui::BeginDisabled(why.len > 0);
         b32 in = ImGui::SmallButton(signed_ ? "Sign in again" : "Sign in");
         ImGui::EndDisabled();
@@ -10761,6 +10800,8 @@ static void drawcfgpage(Gui *g)
         drawremote(g, a, name, RECT_PAGECONNECT);
     } else if (kind=="mcp" && name.len) {
         drawmcp(g, a, name);
+    } else if (kind=="endpoint" && name.len) {
+        drawapprove(g, a, kind, name);
     }
     ImGui::Spacing();
     if (named && !cfghas(g, kind, name)) {

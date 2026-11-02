@@ -719,13 +719,14 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 //   prospero mcp list            the servers the configuration names
 //   prospero mcp auth NAME       sign in, through a browser
 //   prospero mcp logout NAME     forget its tokens
-//   prospero mcp confirm NAME    print the included url to confirm
-//   prospero mcp confirm NAME URL   confirm it
+//   prospero approve             what waits for approval: credentials for
+//                                urls of web includes (see "Approvals")
+//   prospero approve URL         approve what waits for that url
 //
 // These drive an engine of their own, as run does, with the commands
-// the window sends (mcp, mcp.auth, mcp.code, mcp.logout, mcp.confirm).
-// Confirming takes the url typed back, so that it is the one the user
-// saw, and only while the configuration still gives it. The sign-in
+// the window sends (mcp, mcp.auth, mcp.code, mcp.logout, approve).
+// Approving takes the url typed back, so that it is one the user saw,
+// and only while the configuration still gives it. The sign-in
 // prints the URL to visit and takes the browser's return at a loopback
 // listener of its own, waiting 10 minutes at most.
 
@@ -733,7 +734,7 @@ static Str mcpusage =
 "usage: prospero mcp list [options]\n"
 "       prospero mcp auth NAME [options]\n"
 "       prospero mcp logout NAME [options]\n"
-"       prospero mcp confirm NAME [URL] [options]\n"
+"       prospero approve [URL] [options]\n"
 "options:\n"
 "  -c FILE       configuration file\n"
 "  --state DIR   state directory\n";
@@ -785,25 +786,26 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
 {
     Cli c = {};
     c.os = os;
-    Str verb = nargs>2 ? args[2] : Str{};
+    b32 top  = args[1] == "approve";  // prospero approve, not under mcp
+    Str verb = top ? Str("approve") : nargs>2 ? args[2] : Str{};
     Str name = {}, url = {}, config = {}, state = {};
-    for (i32 i = 3; i < nargs; i++) {
+    for (i32 i = top ? 2 : 3; i < nargs; i++) {
         Str a = args[i];
         if (a=="-c" && i+1<nargs) {
             config = args[++i];
         } else if (a=="--state" && i+1<nargs) {
             state = args[++i];
-        } else if (!name.data && verb!="list" && (!a.len || a[0]!='-')) {
-            name = a;
-        } else if (!url.data && verb=="confirm" && a.len && a[0]!='-') {
+        } else if (!url.data && top && a.len && a[0]!='-') {
             url = a;
+        } else if (!name.data && !top && verb!="list" && (!a.len || a[0]!='-')) {
+            name = a;
         } else {
             os_print(os, 2, mcpusage);
             return 2;
         }
     }
-    if ((verb!="list" && verb!="auth" && verb!="logout" && verb!="confirm") ||
-            (verb!="list" && !name.len)) {
+    if ((verb!="list" && verb!="auth" && verb!="logout" && verb!="approve") ||
+            ((verb=="auth" || verb=="logout") && !name.len)) {
         os_print(os, 2, mcpusage);
         return 2;
     }
@@ -833,49 +835,62 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             if (url.len) {
                 print(&out, jsonint(jsonget(s, "signedin"), 0) ? Str(", signed in")
                                                                : Str(", not signed in"));
-                print(&out, jsonstr(jsonget(s, "confirm")).len ? Str(", url not confirmed") : Str(""));
+                print(&out, jsonget(s, "approve")->child ? Str(", waits for approval") : Str(""));
             }
             print(&out, jsonstr(jsonget(s, "source"))=="project" ? Str(" (a project's)") : Str(""));
             putbyte(&out, '\n');
         }
         os_print(os, 1, finish(&out));
-    } else if (verb=="confirm" && !url.len) {
+    } else if (verb=="approve" && !url.len) {
         Arena a = scratch;
-        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCP, 1, {}), 1, 0);
-        Json *f = 0;
-        for (Json *s = jsonget(r, "servers")->child; s; s = s->next) {
-            if (jsonstr(jsonget(s, "name"))==name && jsonstr(jsonget(s, "source"))=="config") {
-                f = s;
-            }
-        }
-        Str want = jsonstr(jsonget(f, "confirm"));
-        if (!f || !jsonstr(jsonget(f, "url")).len) {
-            print(&out, "prospero: no MCP server over HTTP is named ");
-            print(&out, name);
+        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_APPROVE, 1, {}), 1, 0);
+        Json *p = jsonget(r, "pending");
+        if (!jsonint(jsonget(r, "ok"), 0)) {
+            print(&out, "prospero: ");
+            print(&out, jsonstr(jsonget(r, "err")));
             putbyte(&out, '\n');
             os_print(os, 2, finish(&out));
             code = 1;
-        } else if (!want.len) {
-            print(&out, name);
-            print(&out, " needs no confirming: its url is ");
-            print(&out, jsonstr(jsonget(f, "url")));
-            putbyte(&out, '\n');
-            os_print(os, 1, finish(&out));
+        } else if (!p->child) {
+            os_print(os, 1, "Nothing waits for approval.\n");
         } else {
-            print(&out, "An included file gives ");
-            print(&out, name);
-            print(&out, "'s url, to which your own file adds a token, header or "
-                        "trust:\n\n  ");
-            print(&out, want);
-            print(&out, "\n\nIf that is the server you mean, confirm it with:\n\n"
-                        "  prospero mcp confirm ");
-            print(&out, name);
-            putbyte(&out, ' ');
-            print(&out, want);
-            putbyte(&out, '\n');
+            // By url, each with what would go there, from which section
+            print(&out, "Web includes give these urls, which your configuration "
+                        "would send what follows:\n");
+            for (Json *x = p->child; x; x = x->next) {
+                Str  u    = jsonstr(jsonget(x, "url"));
+                b32  seen = 0;
+                for (Json *y = p->child; y != x; y = y->next) {
+                    seen |= jsonstr(jsonget(y, "url")) == u;
+                }
+                if (seen) {
+                    continue;
+                }
+                print(&out, "\n  ");
+                print(&out, u);
+                putbyte(&out, '\n');
+                for (Json *y = x; y; y = y->next) {
+                    Str what = jsonstr(jsonget(y, "what"));
+                    if (jsonstr(jsonget(y, "url")) != u) {
+                        continue;
+                    }
+                    // An env:NAME, then the section that sends it
+                    print(&out, "    ");
+                    print(&out, what);
+                    if (!startswith(what, "[")) {
+                        print(&out, " for [");
+                        print(&out, jsonstr(jsonget(y, "kind")));
+                        putbyte(&out, ' ');
+                        print(&out, jsonstr(jsonget(y, "name")));
+                        putbyte(&out, ']');
+                    }
+                    putbyte(&out, '\n');
+                }
+            }
+            print(&out, "\nTo approve all of it for a url, run: prospero approve URL\n");
             os_print(os, 1, finish(&out));
         }
-    } else if (verb == "confirm") {
+    } else if (verb == "approve") {
         Arena   a = scratch;
         Buf     mb(&a, 128 + url.len);
         JsonOut w = {&mb};
@@ -883,7 +898,7 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         putstrkey(&w, "url", url);
         putend(&w);
         Json *more = jsonparse(&a, finish(&mb)).root;
-        Json *r    = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPCONFIRM, 1, name, more), 1, 0);
+        Json *r    = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_APPROVE, 1, {}, more), 1, 0);
         if (!jsonint(jsonget(r, "ok"), 0)) {
             print(&out, "prospero: ");
             print(&out, jsonstr(jsonget(r, "err")));
@@ -891,9 +906,9 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             os_print(os, 2, finish(&out));
             code = 1;
         } else {
-            print(&out, "Confirmed ");
-            print(&out, name);
-            print(&out, "'s url.\n");
+            print(&out, "Approved what waited for ");
+            print(&out, url);
+            print(&out, ".\n");
             os_print(os, 1, finish(&out));
         }
     } else if (verb == "logout") {

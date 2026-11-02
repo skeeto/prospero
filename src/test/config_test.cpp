@@ -2356,11 +2356,56 @@ static void testcfgpath(Test *t)
     }
 }
 
+// What a web include's url would get (cfgcreds): env:NAME values from
+// either file, the user's own secrets and headers, an MCP server's
+// trust; not an include's plain header, nor a url of the user's own.
+static void testcfgcreds(Test *t)
+{
+    Arena  a  = t->perm;
+    CfgEnv v  = newcfgenv(&a);
+    Os    *os = v.os;
+    vroute(os, "https://team.example/c.ini", 200, "",
+        "[endpoint team]\n"
+        "url = https://team.example/v1\n"
+        "[endpoint envkey]\n"
+        "url = https://team.example/v2\n"
+        "key = env:TEAM_KEY\n"
+        "[endpoint bare]\n"
+        "url = https://team.example/v3\n"
+        "[mcp web]\n"
+        "url = https://team.example/mcp\n"
+        "header.X-Team = env:TEAM_TOK\n"
+        "header.X-Plain = plain\n"
+        "tools = a\n");
+    os_write(os, a, "/c/w.ini",
+        "include = https://team.example/c.ini\n"
+        "[endpoint team]\n"
+        "key = file:~/k.key\n"
+        "[mcp web]\n"
+        "token = env:MINE\n"
+        "trust = yes\n"
+        "header.X-Mine = v\n"
+        "[mcp own]\n"
+        "url = https://own/mcp\n"
+        "token = env:OWN\n");
+    Config *c = newconfig(os, &a, v.scratch, "/c/w.ini", 0, "/s", 1);
+    expect(t, "creds endpoint own key", showlist(&a, cfgcreds(c, &a, "endpoint", "team")),
+           "[endpoint team] key");
+    expect(t, "creds endpoint env", showlist(&a, cfgcreds(c, &a, "endpoint", "envkey")),
+           "env:TEAM_KEY");
+    expect(t, "creds endpoint none", showlist(&a, cfgcreds(c, &a, "endpoint", "bare")), "");
+    expect(t, "creds mcp", showlist(&a, cfgcreds(c, &a, "mcp", "web")),
+           "env:TEAM_TOK|env:MINE|[mcp web] header.X-Mine|[mcp web] trust");
+    expect(t, "creds own url", showlist(&a, cfgcreds(c, &a, "mcp", "own")), "");
+    cfgfree(c);
+}
+
 static void test_config(Test *t)
 {
     testcfgwsl(t);
     testcfgsha256(t);
     testcfgurls(t);
+    testcfgcreds(t);
     testcfgschema(t);
     testloopbackuri(t);
     testcfgdefault(t);

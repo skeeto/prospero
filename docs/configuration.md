@@ -45,8 +45,22 @@ cannot change a server your own file gives the `url` or `command` of,
 nor a `[web]` whose `search` or `url` your file sets. Your file may add
 to an included section instead, such as `key = file:PATH` for an
 included endpoint, or a `token` for an included MCP server.
-Its `env:NAME` values are read from your environment, as yours are,
-so include only files you trust that far. A server whose certificate is not trusted fails the turn
+Its `env:NAME` values are read from your environment, as yours are.
+
+A file included by URL can change at any time, so a url it gives an
+`[endpoint]` or `[mcp]` section gets nothing of yours until you approve
+it for that url, as a cookie goes only to its site: any `env:NAME` the
+section's `key`, `token`, `client_secret` or `header.NAME` takes, from
+either file, a secret or header your own file adds there, and an MCP
+server's `trust = yes`. Until then Prospero does not contact the url.
+A session about to use it asks once, listing each url and what would
+go there; allowing holds for good, for every session, and answers the
+other sessions waiting on it. The section's page in Settings has
+Approve, and `prospero approve` lists what waits (`prospero approve
+URL` approves it). An include that changes the url needs approving
+again. Approvals are kept by the url's SHA-256 in the state
+directory's `approvals.json`. A url from a local include or your own
+file needs none, and Bypass mode does not approve them. A server whose certificate is not trusted fails the turn
 at once, saying why, rather than being retried.
 
 On macOS, Prospero started from Spotlight, the Finder or the Dock gets
@@ -208,16 +222,9 @@ a server over HTTP holds only while its url stays the same. An included
 file may define a server by its `url`, but its `command`, `cwd`,
 `env.NAME` and `trust = yes` are ignored, as is anything it sets for a
 server your own file gives the `url` or `command` of. Your file may add
-to an included server, a `token = file:PATH` say, or `trust = yes`.
-Since the include could point the server elsewhere, what your file
-adds that must not follow it there (a `token`, `client_secret`,
-`header.NAME` or `trust = yes`) holds only for a url you confirm, as a
-cookie holds for its site. Until then the server does not connect at
-all: its page in Settings shows the url with Confirm, and
-`prospero mcp confirm NAME` prints it and the command that confirms it.
-An include that changes the url needs you to confirm the new one.
-Confirmed urls are kept, by their SHA-256, in the state directory's
-`mcp/confirmed.json`.
+to an included server, a `token = file:PATH` say, or `trust = yes`,
+which for a url from a web include wait for your approval (see
+Includes).
 
 A project's `.mcp.json`, in Claude Code's format, with `${VAR}` and
 `${VAR:-default}` expanded, is read once as a session starts, from its

@@ -676,6 +676,7 @@ static Str usage =
 "       prospero deploy NAME|DEST [--force] [options]\n"
 "       prospero eval [options] SUITE...\n"
 "       prospero mcp list | auth NAME | logout NAME [options]\n"
+"       prospero approve [URL] [options]\n"
 #if PROSPERO_DESKTOP
 "       prospero desktop COMMAND [ARGS]  (prospero desktop -h)\n"
 #endif
@@ -723,7 +724,7 @@ static i32 app_main(Os *os, Arena mem, Str *args, i32 nargs)
         return deploymain(os, perm, scratch, args, nargs);
     } else if (nargs>1 && args[1]=="eval") {
         return evalmain(os, perm, scratch, args, nargs);
-    } else if (nargs>1 && args[1]=="mcp") {
+    } else if (nargs>1 && (args[1]=="mcp" || args[1]=="approve")) {
         return mcpmain(os, perm, scratch, args, nargs);
     }
 

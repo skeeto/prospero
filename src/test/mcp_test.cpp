@@ -319,38 +319,13 @@ static void test_mcp(Test *t)
         expect(t, "web fetch shared", cfgget(c, "web", "", "fetch", 0), "no");
 
         // The user's own file adds secrets from files and trust to included
-        // sections, which keep their url and search. The engine holds
-        // what it adds to an MCP server to a url the user confirms
+        // sections, which keep their url and search. A local include's url
+        // needs no approval (cfgcreds), only a web include's
         expect(t, "mcp added token", cfgsecret(c, &b, "mcp", "remote", "token"), "tk");
         expect(t, "mcp added url", cfgget(c, "mcp", "remote", "url", 0), "https://team/mcp");
         expect(t, "mcp added trust", istr(&b, cfgtrusts(c, "remote")), "1");
-        expect(t, "mcp adds remote", istr(&b, cfgadds(c, "remote")), "1");
-        expect(t, "mcp adds own", istr(&b, cfgadds(c, "web")), "0");      // its url ours
-        expect(t, "mcp adds none", istr(&b, cfgadds(c, "none")), "0");    // no url
-        expect(t, "mcp adds shared", istr(&b, cfgadds(c, "shared")), "0");
+        expect(t, "mcp creds local", istr(&b, cfgcreds(c, &b, "mcp", "remote").len), "0");
         expect(t, "web added key", cfgsecret(c, &b, "web", "", "key"), "wk");
-
-        // What counts as adding: a client_secret or a header, and trust
-        // only when true; a tools list or trust = no add nothing
-        os_write(v.os, b, "/c/adds.ini",
-            "include = team.ini\n"
-            "[mcp remote]\n"
-            "tools = a\n"
-            "trust = no\n");
-        c = newconfig(v.os, &b, v.scratch, "/c/adds.ini", 0);
-        expect(t, "mcp adds nothing", istr(&b, cfgadds(c, "remote")), "0");
-        os_write(v.os, b, "/c/adds.ini",
-            "include = team.ini\n"
-            "[mcp remote]\n"
-            "header.X-Mine = v\n");
-        c = newconfig(v.os, &b, v.scratch, "/c/adds.ini", 0);
-        expect(t, "mcp adds header", istr(&b, cfgadds(c, "remote")), "1");
-        os_write(v.os, b, "/c/adds.ini",
-            "include = team.ini\n"
-            "[mcp remote]\n"
-            "client_secret = env:S\n");
-        c = newconfig(v.os, &b, v.scratch, "/c/adds.ini", 0);
-        expect(t, "mcp adds secret", istr(&b, cfgadds(c, "remote")), "1");
 
         // The user's own [web] shuts out the include's
         os_write(v.os, b, "/c/own.ini",

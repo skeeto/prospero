@@ -76,6 +76,27 @@ cannot choose what runs, so these are ignored in one:
   `cmd`;
 - `[ui] editor` and `[ui] terminal`.
 
+## Approving web includes' urls
+
+A file included by URL can change at any time, so a url it gives an
+endpoint or MCP server gets nothing of yours until you approve it:
+an environment variable a value takes (`env:NAME`, from either file),
+a `key`, `token`, `client_secret` or `header.NAME` your own file adds,
+or your `trust = yes` for the server. Until then Prospero does not
+contact that url at all.
+
+A session about to use such an endpoint or server asks once, listing
+each url and what would go there. Allowing it holds for good, for
+every session, and answers every other session waiting on the same
+thing. Should the include change the url, it asks again. A session
+nobody watches (`prospero run`) cannot ask, and says so. The section's
+page in Settings also has Approve, and `prospero approve` lists what
+waits, `prospero approve URL` approving it, also for an engine on
+another host. Approvals are kept by the url's SHA-256 in the state
+directory's `approvals.json`. Bypass mode does not approve them.
+
+A url from a local include, or from your own file, needs no approval.
+
 ## Settings worth knowing
 
 - **API keys** never go in the file: `key = env:NAME` reads one from

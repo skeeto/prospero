@@ -34,10 +34,10 @@
 // [mcp] or [web] section that the user's own file defines (its url or
 // command, its search or url) are ignored (cfgsealed): it may define
 // those, but not change the user's. The user's file may add to an
-// included one's, a token or key say. What it adds to an included MCP
-// server that must not follow the include's url elsewhere (a token,
-// client_secret, header or trust = true) holds only for a url the user
-// confirmed (cfgadds), as the engine keeps them.
+// included one's, a token or key say. What an endpoint or MCP server
+// would send to a url a web include gives (an env:NAME, a secret or
+// header of the user's own, trust = true) holds only for a url the user
+// approved it for (cfgcreds), as the engine keeps them.
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -1734,40 +1734,84 @@ static b32 cfgownsection(Config *c, Str kind, Str name)
 }
 
 // Whether an MCP server's tools run without asking: its trust is true,
-// as only the user's own file may say (cfgownonly). Over an included
-// url it holds only once the user confirms that url (cfgadds).
+// as only the user's own file may say (cfgownonly). Over a url from a
+// web include it holds only once the user approves it (cfgcreds).
 static b32 cfgtrusts(Config *c, Str name)
 {
     return cfgbool(trim(cfgget(c, "mcp", name, "trust", 0))) == 1;
 }
 
-// Whether the user's own file adds to an MCP server an included file
-// gives the url of (cfganchors) what must not follow that url wherever
-// the include points it: a token, a client_secret, a header, or trust
-// = true. Like a cookie for its origin, these hold only for a url the
-// user confirmed, which the engine keeps, and an included file moving
-// the server needs the user to confirm it again.
-static b32 cfgadds(Config *c, Str name)
+// Whether a file came from the web: a URL include, or a file one of
+// those includes.
+static b32 cfgfromweb(IniFile *f)
 {
-    IniEntry *u = cfgfind(c, "mcp", name, "url").e;
-    if (!u || !trim(u->value).len || u->file==c->user) {
-        return 0;
-    }
-    IniFile *f = c->user;
-    for (iz i = 0; f && i < f->lines.len; i++) {
-        IniLine    *l = &f->lines[i];
-        IniSection *s = l->section;
-        if (l->type!=INI_KEY || !s || s->kind!="mcp" || s->name!=name) {
-            continue;
-        }
-        Str v = trim(l->value);
-        if (((l->key=="token" || l->key=="client_secret") && v.len) ||
-                (startswith(l->key, "header.") && l->key.len>7) ||
-                (l->key=="trust" && cfgbool(v)==1)) {
+    for (; f; f = f->parent) {
+        if (iniurl(f->path)) {
             return 1;
         }
     }
     return 0;
+}
+
+// A credential's item, by its value: env:NAME, whoever wrote it, or
+// the setting itself when the user's own file gives the secret (as
+// file:PATH or written out), else null.
+static Str cfgcreditem(Config *c, Arena *a, IniEntry *e, Str kind, Str name)
+{
+    Str v = trim(e->value);
+    if (startswith(v, "env:") && trim(cuthead(v, 4)).len) {
+        return concat(a, "env:", trim(cuthead(v, 4)));
+    } else if (!v.len || e->file!=c->user) {
+        return {};
+    }
+    Buf b(a, 16 + kind.len + name.len + e->key.len);
+    putbyte(&b, '[');
+    print(&b, kind);
+    putbyte(&b, ' ');
+    print(&b, name);
+    print(&b, "] ");
+    print(&b, e->key);
+    return finish(&b);
+}
+
+// What [endpoint NAME] or [mcp NAME] would send to its url when a web
+// include gives that url (cfgfromweb): each environment variable a
+// value takes (env:NAME), each secret or header the user's own file
+// adds ([KIND NAME] key), and for a server, trust = true ([mcp NAME]
+// trust). Like a cookie for its origin, these hold only for a url the
+// user approved them for, which the engine keeps by the url's SHA-256,
+// so that an include moving the url needs approving again. Empty for a
+// url of the user's own file or a local include. A file: secret is the
+// user's alone: an include's is refused (cfgownonly).
+static Slice<Str> cfgcreds(Config *c, Arena *a, Str kind, Str name)
+{
+    Slice<Str> r = {};
+    IniEntry  *u = (kind=="endpoint" || kind=="mcp") ? cfgfind(c, kind, name, "url").e : 0;
+    if (!u || !trim(u->value).len || !cfgfromweb(u->file)) {
+        return r;
+    }
+    IniSection *sec = inisection(c->ini, kind, name);
+    for (IniEntry *e = sec ? sec->keys : 0; e; e = e->next) {
+        b32 cred = kind=="endpoint" ? e->key=="key" :
+                   e->key=="token" || e->key=="client_secret" ||
+                   (startswith(e->key, "header.") && e->key.len>7);
+        if (!cred || cfgsealed(c->user, e->file, kind, name)) {
+            continue;
+        }
+        IniEntry *got = startswith(e->key, "header.") ? e : cfgfind(c, kind, name, e->key).e;
+        Str       it  = got ? cfgcreditem(c, a, got, kind, name) : Str{};
+        b32       dup = 0;
+        for (iz i = 0; it.len && i < r.len; i++) {
+            dup |= r[i] == it;
+        }
+        if (it.len && !dup) {
+            r = push(a, r, it);
+        }
+    }
+    if (kind=="mcp" && cfgtrusts(c, name)) {
+        r = push(a, r, concat(a, concat(a, "[mcp ", name), Str("] trust")));
+    }
+    return r;
 }
 
 // The names of the user's own file's [KIND NAME] sections, each once,

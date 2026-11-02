@@ -4207,6 +4207,9 @@ static Str askheadline(Arena *a, ViewTool *t)
     if (t->kind == "mcp.project") {
         print(&b, "Start the MCP servers of ");
         print(&b, t->path);
+    } else if (t->kind == "approve") {
+        print(&b, "Send credentials to ");
+        print(&b, t->path);
     } else {
         print(&b, "Allow ");
         print(&b, t->tool);

@@ -195,7 +195,7 @@ enum : i32 {
     CMD_CALLSTOP,    // the running command stopped, while the turn goes on
     CMD_CUT,         // the conversation rewound to before a turn
     CMD_UNCUT,       // the latest such rewind undone
-    CMD_MCPCONFIRM,  // an MCP server's included url, confirmed by the user
+    CMD_APPROVE,     // credentials for urls of web includes: listed, approved
     CMD_COUNT,
 };
 
@@ -209,7 +209,7 @@ static Str cmdnames[] = {
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
     "relay.call", "offer", "ask.touch", "shell.env", "call.stop", "cut",
-    "uncut", "mcp.confirm",
+    "uncut", "approve",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 
@@ -310,10 +310,12 @@ static Str capnames[] = {
     "cut",             // cut {sid, turn, files?} and uncut {sid}: the
                        // conversation rewound to before a turn, and back;
                        // cut and uncut records, snap and rewind {cut}
-    "mcp.confirm",     // mcp.confirm {name, url}: what the user's own file
-                       // adds to a server an include gives the url of holds
-                       // once that url is confirmed; mcp lists it as confirm,
-                       // and its state is "confirm" until then
+    "approve",         // approve {url?}: what an endpoint or MCP server would
+                       // send to a url of a web include (env:NAME, the user's
+                       // secrets, trust) goes once approved; asks of kind
+                       // approve, answers by "shared" for every session
+                       // waiting, mcp's approve and the server state
+                       // "approve"
 };
 
 static Str evname(i32 ev)

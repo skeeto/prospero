@@ -515,6 +515,8 @@ enum : i32 {
     DENY_STEER,    // the user sent a message instead of answering
     DENY_CANCEL,   // the turn was cancelled while asking
     DENY_BYPASS,   // not denied: the user turned on Bypass mode
+    DENY_SHARED,   // not denied: approved in another session, or apart
+                   // from any (approve), for every session waiting
     DENY_COUNT,
 };
 

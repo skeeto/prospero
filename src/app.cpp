@@ -1482,6 +1482,13 @@ struct Gui {
     Json              *mcplist;    // its servers, null until one came
     i64                mcplistid;  // a listing under way
     i64                mcplistat;  // ms: the last one asked then
+    // What waits for approval (approve), for the pages of [mcp] and
+    // [endpoint] sections a web include gives the url of, listed as the
+    // servers are
+    Region            *apprmem;
+    Json              *apprlist;   // pending: [{url, kind, name, what}]
+    i64                apprlistid;
+    i64                apprlistat;
     Str                mcpname;    // the server signing in, null if none
     i64                mcpcmd;     // its mcp.auth or mcp.code under way
     u64                mcpback;    // its loopback's records' id
@@ -2283,6 +2290,44 @@ static void onmcplist(Gui *g, Str line, b32 ok)
     scheddirty(&g->sched);
 }
 
+// What waits for approval, listed at most every 2 s while a page that
+// shows it does.
+static void apprlisting(Gui *g)
+{
+    i64 now = os_time(g->os);
+    if (g->apprlistid || !engineup(g) || !hostcan(g->main, "approve")) {
+        return;
+    } else if (g->apprlist && now-g->apprlistat < 2000) {
+        schedat(&g->sched, g->sched.now + (2000 - (now-g->apprlistat))*1000, DUE_CLOCK);
+        return;
+    }
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 64);
+    EvOut w = cmdopen(g, &b, CMD_APPROVE, 0, g->main);
+    g->apprlistid = g->nextid;
+    g->apprlistat = now;
+    cmdsend(g, &w, a);
+}
+
+static void onapprlist(Gui *g, Str line, b32 ok)
+{
+    g->apprlistid = 0;
+    if (!ok) {
+        return;
+    }
+    Region *mem = os_reserve(g->os, (iz)1<<20);
+    if (!mem) {
+        return;
+    }
+    if (g->apprmem) {
+        os_release(g->os, g->apprmem);
+    }
+    Arena a = newarena(mem);
+    g->apprmem  = mem;
+    g->apprlist = jsonget(jsonparse(&a, clone(&a, line)).root, "pending");
+    scheddirty(&g->sched);
+}
+
 // A server of the listing, by name, or null.
 static Json *mcpof(Gui *g, Str name)
 {
@@ -2314,7 +2359,7 @@ static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
     Str   state  = jsonstr(jsonget(m, "state"));
     b32   http   = jsonstr(jsonget(m, "url")).len || mcprow(g, name, "url").len;
     i64   tools  = jsonint(jsonget(m, "tools"), 0);
-    b32   confirm = state=="confirm" || jsonstr(jsonget(m, "confirm")).len;
+    b32   confirm = state=="approve" || jsonget(m, "approve")->child;
     Buf   b(a, 256);
     print(&b, name);
     print(&b, ": ");
@@ -2325,7 +2370,7 @@ static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
         print(&b, g->mcplist ? Str("not in the configuration the engine has") : Str("..."));
     } else if (confirm) {
         // Stopped or failed for it: it connects only once confirmed
-        print(&b, "waits for you to confirm its url");
+        print(&b, "waits for you to approve its url");
         *dot = g->pal->amber;
     } else if (state == "ready") {
         print(&b, "running, ");
@@ -5351,9 +5396,19 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             onmcpcode(g, ok, err);
         }
         return;
+    case CMD_APPROVE:
+        if (id == g->apprlistid) {
+            onapprlist(g, line, ok);
+            return;
+        } else if (!ok) {
+            mcpsay(g, g->mcpmsgfor, err, 1);
+        }
+        g->apprlistat = 0;  // listed again at once, with the servers
+        g->mcplistat  = 0;
+        scheddirty(&g->sched);
+        return;
     case CMD_MCPLOGOUT:
     case CMD_MCPRESTART:
-    case CMD_MCPCONFIRM:
         if (!ok) {
             mcpsay(g, g->mcpmsgfor, err, 1);
         }
@@ -15729,9 +15784,9 @@ static DriveOp hosttaskops[] = {
 };
 
 // MCP (--mcp, tests/gui.py --mode mcp): the page of [mcp web], a fake
-// server over HTTP that wants a sign-in, whose url an included file
-// gives and to which the user's file adds trust = yes, waits for its
-// url to be confirmed; Confirm, and it says it is not signed in; Sign
+// server over HTTP that wants a sign-in, whose url a web include gives
+// and to which the user's file adds trust = yes, waits for that to be
+// approved; Approve, and it says it is not signed in; Sign
 // in, through the checklist's stand-in browser, signs in; a session's
 // call to its echo tool goes through, which the page shows running;
 // Sign out leaves it needing a sign-in.
@@ -15755,9 +15810,9 @@ static DriveOp mcpops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "mcp web"},
-    {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: waits for you to confirm its url"},
-    {OP_SHOT, 0, 0, 0, 300, "mcp-0-confirm"},
-    {OP_MOVE, T_NAMED, 0, 0, 100, "mcp confirm web"},
+    {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: waits for you to approve its url"},
+    {OP_SHOT, 0, 0, 0, 300, "mcp-0-approve"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "mcp approve web"},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 100, ""},
     {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: not running"},
@@ -20491,6 +20546,7 @@ static b32 guiwanted(Str *args, i32 nargs)
 {
     static Str const cmds[] = {
         "run", "serve", "attach", "hosts", "connect", "deploy", "eval", "mcp",
+        "approve",
     };
     if (nargs<2 || args[1]=="gui") {
         return 1;

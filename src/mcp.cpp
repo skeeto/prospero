@@ -146,7 +146,7 @@ struct McpServer {
     McpHttp          *http;      // requests under way
     Str               bearer;    // signed in: its Authorization header
     b32               needauth;  // failed, until the user signs in
-    b32               confirm;   // failed, until the user confirms its url
+    b32               approve;   // failed, until the user approves its url
     b32               refreshed; // its tokens refreshed since it was ready
     Str               prm;       // a 401's resource_metadata, and scope
     Str               chscope;

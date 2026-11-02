@@ -400,6 +400,8 @@ struct Endpoint {
     Str url;
     Str relay;      // relayed (relay.cpp): the name its URL gives, else null
     Str key;        // bearer token (x-api-key for Anthropic), empty if none
+    b32 held;       // its key held back, not yet approved for its url
+                    // (epheld): the url is not to be contacted
     i64 firstbyte;  // watchdogs, in ticks
     i64 idle;
     i64 progress;
@@ -412,6 +414,11 @@ struct HostLink;
 struct GitWork;
 struct RelayCall;
 struct Relay;
+
+// Approvals (see there): an endpoint's key held back for its url
+static b32        epheld(Engine *, Arena *, Endpoint *);
+static Str        epheldmsg(Arena *, Endpoint *);
+static Slice<Str> apprpending(Engine *, Arena *, Str kind, Str name, Str url);
 
 // A model call's request: made here (os_http), or relayed through a
 // connected computer (relay.cpp), whose records arrive just the same.
@@ -506,6 +513,15 @@ struct TaskAsk {
 };
 
 // An ask waiting for the user, or recently resolved.
+// A credential for a url (cfgcreds): what, an item such as env:NAME,
+// may go to url once the user approves (see "Approvals").
+struct Approval {
+    Str url;
+    Str what;
+    Str kind;  // and the section that would send it
+    Str name;
+};
+
 struct Ask {
     Str       req;
     i32       tool;
@@ -522,6 +538,7 @@ struct Ask {
     Str       trust;    // an MCP ask's project server, which "trust"
                         // trusts for good, or null
     Str       mcpurl;   // an MCP ask's server's url, by its SHA-256, or null
+    b32       approve;  // credentials for urls of web includes (approving)
     i64       deadline; // a question's, epoch ms, as the frontends have it
 };
 
@@ -829,6 +846,9 @@ struct Session {
     Slice<Str>   mcpsaid;    // project servers decided without a grant,
                              // "ok:KEY" or "no:KEY" (bypass, policy)
     Slice<Str>   mcpasking;  // the keys of those its ask is about
+    Slice<Approval> approving;  // what its approve ask is about
+    Slice<Approval> apprno;     // and what the turn was refused, not
+                                // asked again until the next turn
     // The web (see "Web")
     Map<b32>    *webseen;    // URLs the agent was shown: web_fetch's
     Map<WebSpill> *webspill; // pages read, by URL, to read on
@@ -1729,6 +1749,10 @@ static Str keyhint(Engine *e, Arena *a, Endpoint *ep)
 // single server's gives its total_slots.
 static void probe(Engine *e, AdmPoint *p, Endpoint *ep, Arena scratch)
 {
+    if (epheld(e, &scratch, ep)) {
+        p->models = 1;  // its url is not to be contacted: ask again later
+        return;
+    }
     HttpReq r = {};
     r.method    = "GET";
     r.url       = rooturl(&scratch, p->url, "props");
@@ -2073,6 +2097,9 @@ static b32 startreq(Session *s, Arena scratch, Endpoint *ep, Str method,
                     Str url, Str body, Str accept, i32 readms, b32 keep = 0)
 {
     Engine *e = s->e;
+    if (epheld(e, &s->perm, ep)) {
+        return 0;  // its url is not to be contacted
+    }
     HttpReq r = {};
     r.method    = method;
     r.url       = url;
@@ -2173,6 +2200,7 @@ static b32  deskrun(Session *, Arena, DeskArgs *);
 static void mcpresolve(Session *, Arena, b32 allow, i32 by, Str note, i64 wait);
 static void mcpprojtrust(Session *, Arena, Str server);
 static void mcpprojresolve(Session *, Arena, b32 allow, i32 by, b32 always);
+static void apprresolve(Session *, Arena, b32 allow, i32 by);
 static Str  deskdenial(Arena *, i32 by, Str note, i64 wait);
 static Slice<Msg> deskimages(Session *, Arena *);
 static void toolsessions(Session *, Arena);
@@ -2243,7 +2271,8 @@ static void sendchat(Session *s, Arena scratch)
 
     if (!startreq(s, scratch, &s->ep, "POST", url, body, "text/event-stream", 0, 1)) {
         Str err = os_lasterr(e->os, &scratch);
-        err = concat(&scratch, "cannot start a request: ", err);
+        err = s->ep.held ? epheldmsg(&scratch, &s->ep)
+                         : concat(&scratch, "cannot start a request: ", err);
         endturn(s, scratch, "error", err);
         return;
     }
@@ -2466,6 +2495,9 @@ static void runcalls(Session *s, Arena scratch, Slice<Block> blocks)
 // Retries and fallbacks
 
 static b32  endpointconf(Engine *, Arena *, Str which, Endpoint *);
+static b32  epheld(Engine *, Arena *, Endpoint *);
+static Slice<Str> apprpending(Engine *, Arena *, Str kind, Str name, Str url);
+static Str  epheldmsg(Arena *, Endpoint *);
 static void modelconf(Engine *, Arena *, Str which, Str model, ModelConf *);
 
 
@@ -4817,7 +4849,8 @@ static b32 runfile(Session *s, Arena scratch, i32 tool, Str path, Args *args)
     return 1;
 }
 
-static Str bynames[] = {"policy", "user", "timeout", "steer", "cancel", "bypass"};
+static Str bynames[] = {"policy", "user", "timeout", "steer", "cancel", "bypass",
+                         "shared"};
 static_assert(countof(bynames) == DENY_COUNT);
 
 // Grants
@@ -5090,6 +5123,9 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
     if (k->project) {
         mcpprojresolve(s, scratch, allow, by, always);
         return;  // no call: the caller's nexttool goes on to the request
+    } else if (k->approve) {
+        apprresolve(s, scratch, allow, by);
+        return;  // likewise
     }
     Block *c = &s->calls[s->callidx];
     if (allow && always && k->grant.len) {
@@ -7399,6 +7435,8 @@ static Str webanthropicep(Engine *e, Arena *perm, Endpoint *ep, Str *model)
     } else if (!endpointconf(e, perm, name, ep) || ep->kind!=EP_ANTHROPIC) {
         return concat(perm, concat(perm, "the endpoint ", name),
                       " that [web] model names is not of kind anthropic");
+    } else if (ep->held) {
+        return epheldmsg(perm, ep);
     } else if (ep->relay.len) {
         return concat(perm, concat(perm, "the endpoint ", name),
                       " is relayed: with [web] search unset, a connected "
@@ -8997,78 +9035,160 @@ static i64 mcprequest(Engine *e, Arena scratch, McpServer *m, i32 kind, Str meth
     return p.id;
 }
 
-// Confirmed urls
+// Approvals
 //
-// What the user's own file adds to a server an included file gives the
-// url of (cfgadds: a token, client_secret, header or trust) holds only
-// for a url the user confirmed, as a cookie holds for its origin: until
-// then the server does not connect at all, since the include may point
-// it anywhere. Confirm, in Settings, or prospero mcp confirm (mcp.confirm)
-// keeps the server's name with its url's SHA-256 for good, in
-// <state>/mcp/confirmed.json, one url per name.
+// What an endpoint or MCP server would send to a url that a web include
+// gives (cfgcreds: environment variables by env:NAME, the user's own
+// secrets and headers, a server's trust) goes only once the user
+// approves each item for that url, as a cookie goes only to its origin.
+// Approvals hold for good, for every session, in <state>/approvals.json
+// by the url's SHA-256 and the item, so an include moving the url needs
+// approving again. Until then the url is not contacted at all: an
+// endpoint's key is held back (Endpoint.held) and a server waits
+// unconnected (McpServer.approve). A session about to use either asks
+// (approvegate), and an approval, from any session's ask or from the
+// approve command (Settings, prospero approve), answers every session
+// waiting on it (apprwake).
 
-static Str mcpconfpath(Engine *e, Arena *a)
+static Str apprpath(Engine *e, Arena *a)
 {
-    return join(a, join(a, e->statedir, "mcp"), "confirmed.json");
+    return join(a, e->statedir, "approvals.json");
 }
 
-static b32 mcpconfirmed(Engine *e, Arena scratch, Str name, Str url)
+// The approvals kept, each "SHA256 ITEM", in a.
+static Slice<Str> apprkept(Engine *e, Arena *a)
 {
-    Read rd = os_read(e->os, &scratch, mcpconfpath(e, &scratch), 1<<20);
-    if (rd.err!=READ_OK || !url.len) {
-        return 0;
+    Slice<Str> r  = {};
+    Read       rd = os_read(e->os, a, apprpath(e, a), 1<<22);
+    if (rd.err != READ_OK) {
+        return r;
     }
-    Str  key = cfgsha256(&scratch, url);
-    Json *j  = jsonparse(&scratch, rd.data).root;
-    for (Json *x = jsonget(j, "confirmed")->child; x; x = x->next) {
-        if (jsonstr(jsonget(x, "name"))==name && jsonstr(jsonget(x, "sha256"))==key) {
+    Json *j = jsonparse(a, rd.data).root;
+    for (Json *x = jsonget(j, "approved")->child; x; x = x->next) {
+        Str h = jsonstr(jsonget(x, "sha256"));
+        Str w = jsonstr(jsonget(x, "what"));
+        if (h.len && w.len) {
+            r = push(a, r, concat(a, concat(a, h, Str(" ")), w));
+        }
+    }
+    return r;
+}
+
+static b32 apprin(Slice<Str> kept, Str hash, Str what)
+{
+    for (iz i = 0; i < kept.len; i++) {
+        Str k = kept[i];
+        if (k.len==hash.len+1+what.len && startswith(k, hash) &&
+                cuthead(k, hash.len+1)==what) {
             return 1;
         }
     }
     return 0;
 }
 
-// Keep a server's url as confirmed, in place of any it had: 0 if it
-// could not be written.
-static b32 mcpconfirm(Engine *e, Arena scratch, Str name, Str url)
+// What [KIND NAME] would send to url, its configured url, that the user
+// has not approved: empty when nothing waits.
+static Slice<Str> apprpending(Engine *e, Arena *a, Str kind, Str name, Str url)
 {
-    Str  path = mcpconfpath(e, &scratch);
-    Read rd   = os_read(e->os, &scratch, path, 1<<20);
-    Json *j   = jsonparse(&scratch, rd.err==READ_OK ? rd.data : Str("{}")).root;
-    Buf     b(&scratch, 1024 + rd.data.len);
-    JsonOut w = {&b};
-    putobject(&w);
-    putkey(&w, "confirmed");
-    putarray(&w);
-    for (Json *x = jsonget(j, "confirmed")->child; x; x = x->next) {
-        if (jsonstr(jsonget(x, "name")) != name) {
-            putjson(&w, x);
+    Slice<Str> want = cfgcreds(e->cfg, a, kind, name);
+    Slice<Str> r    = {};
+    if (!want.len) {
+        return r;
+    }
+    Slice<Str> kept = apprkept(e, a);
+    Str        hash = cfgsha256(a, url);
+    for (iz i = 0; i < want.len; i++) {
+        if (!apprin(kept, hash, want[i])) {
+            r = push(a, r, want[i]);
         }
     }
+    return r;
+}
+
+// Keep approvals for good: 0 if they could not be written.
+static b32 apprsave(Engine *e, Arena scratch, Slice<Approval> add)
+{
+    Str  path = apprpath(e, &scratch);
+    Read rd   = os_read(e->os, &scratch, path, 1<<22);
+    Json *j   = jsonparse(&scratch, rd.err==READ_OK ? rd.data : Str("{}")).root;
+    Slice<Str> kept = apprkept(e, &scratch);
+    Buf     b(&scratch, 1024 + rd.data.len + 128*add.len);
+    JsonOut w = {&b};
     putobject(&w);
-    putstrkey(&w, "name", name);
-    putstrkey(&w, "sha256", cfgsha256(&scratch, url));
-    putintkey(&w, "at", os_time(e->os));
-    putend(&w);
+    putkey(&w, "approved");
+    putarray(&w);
+    for (Json *x = jsonget(j, "approved")->child; x; x = x->next) {
+        putjson(&w, x);
+    }
+    for (iz i = 0; i < add.len; i++) {
+        Str hash = cfgsha256(&scratch, add[i].url);
+        if (apprin(kept, hash, add[i].what)) {
+            continue;
+        }
+        kept = push(&scratch, kept, concat(&scratch, concat(&scratch, hash, Str(" ")),
+                                           add[i].what));
+        putobject(&w);
+        putstrkey(&w, "sha256", hash);
+        putstrkey(&w, "what", add[i].what);
+        putintkey(&w, "at", os_time(e->os));
+        putend(&w);
+    }
     putend(&w);
     putend(&w);
     putbyte(&b, '\n');
     Str out = finish(&b);
-    Str dir = join(&scratch, e->statedir, "mcp");
-    os_mkdirs(e->os, scratch, dir);
+    os_mkdirs(e->os, scratch, e->statedir);
     return os_write(e->os, scratch, path, out);
 }
 
-// Whether a server of the configuration over HTTP waits for the user to
-// confirm its url, as it is in the configuration now.
-static b32 mcpunconfirmed(Engine *e, Arena scratch, Str name)
+// What waits for approval, over every [endpoint] and [mcp] section, in a.
+static Slice<Approval> apprall(Engine *e, Arena *a)
 {
-    Str url = trim(cfgget(e->cfg, "mcp", name, "url", 0));
-    return url.len && cfgadds(e->cfg, name) && !mcpconfirmed(e, scratch, name, url);
+    Slice<Approval> r = {};
+    Str kinds[] = {"endpoint", "mcp"};
+    for (iz k = 0; k < countof(kinds); k++) {
+        for (IniSection *s = inifirst(e->ini, kinds[k]); s; s = ininext(s)) {
+            Str url = trim(cfgget(e->cfg, kinds[k], s->name, "url", 0));
+            if (!s->name.len || !url.len) {
+                continue;
+            }
+            Slice<Str> p = apprpending(e, a, kinds[k], s->name, url);
+            for (iz i = 0; i < p.len; i++) {
+                r = push(a, r, Approval{url, p[i], kinds[k], s->name});
+            }
+        }
+    }
+    return r;
+}
+
+// Whether an endpoint's key is still held back; one approved since it
+// was resolved gets its key now, in perm.
+static b32 epheld(Engine *e, Arena *perm, Endpoint *ep)
+{
+    if (!ep->held) {
+        return 0;
+    }
+    Arena tmp = *perm;
+    if (apprpending(e, &tmp, "endpoint", ep->name, ep->url).len) {
+        return 1;
+    }
+    ep->held = 0;
+    ep->key  = cfgsecret(e->cfg, perm, "endpoint", ep->name, "key");
+    return 0;
+}
+
+static Str epheldmsg(Arena *a, Endpoint *ep)
+{
+    Buf b(a, 256 + ep->name.len + ep->url.len);
+    print(&b, "not sent: a web include gives [endpoint ");
+    print(&b, ep->name);
+    print(&b, "] its url, and its key is not approved for it. Approve it "
+              "when a session asks, in Settings, or with: prospero approve");
+    return finish(&b);
 }
 
 // Whether a server's tools run without asking: the configuration trusts
-// it, at the url it runs at, confirmed where that must be (cfgadds).
+// it, at the url it runs at, approved where that must be (cfgcreds).
 static b32 mcptrusts(Engine *e, Arena scratch, McpServer *m)
 {
     Config *c = e->cfg;
@@ -9078,31 +9198,31 @@ static b32 mcptrusts(Engine *e, Arena scratch, McpServer *m)
         return 1;  // a command, which only the user's own file gives
     }
     return m->url==trim(cfgget(c, "mcp", m->name, "url", 0)) &&
-           (!cfgadds(c, m->name) || mcpconfirmed(e, scratch, m->name, m->url));
+           !apprpending(e, &scratch, "mcp", m->name, m->url).len;
 }
 
-static Str mcpconfirmmsg(Arena *a, Str name)
+static Str mcpapprovemsg(Arena *a, Str name)
 {
-    Buf b(a, 256 + 2*name.len);
-    print(&b, "an included file gives its url, which you have not confirmed "
-              "for what your own file adds to it: in Settings, at mcp ");
+    Buf b(a, 256 + name.len);
+    print(&b, "a web include gives its url, and what your configuration "
+              "would send it is not approved: approve it when a session asks, "
+              "in Settings, at mcp ");
     print(&b, name);
-    print(&b, ", Confirm, or run: prospero mcp confirm ");
-    print(&b, name);
+    print(&b, ", or with: prospero approve");
     return finish(&b);
 }
 
-// A server that waits, unconnected, for the user to confirm its url.
-static void mcpneedconfirm(Engine *e, Arena scratch, McpServer *m)
+// A server that waits, unconnected, for the user to approve its url.
+static void mcpneedapprove(Engine *e, Arena scratch, McpServer *m)
 {
-    Str why  = mcpconfirmmsg(&scratch, m->name);
+    Str why  = mcpapprovemsg(&scratch, m->name);
     Str told = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
                       concat(&scratch, " failed: ", why));
     mcpstop(e, scratch, m, told);
     m->state    = MCP_FAILED;
-    m->confirm  = 1;
+    m->approve  = 1;
     m->err      = clone(&e->perm, why);
-    m->retryat  = I64MAX;  // not until confirmed
+    m->retryat  = I64MAX;  // not until approved
     mcpwake(e, scratch, m);
 }
 
@@ -9139,7 +9259,7 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     m->pages    = 0;
     m->err      = {};
     m->state    = MCP_STARTING;
-    m->confirm  = 0;
+    m->approve  = 0;
     m->trust    = 0;
     mcpconf(e, m);
     Str only    = m->project.len ? Str{} : trim(cfgget(e->cfg, "mcp", m->name, "tools", 0));
@@ -9171,9 +9291,9 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
             m->headers = finish(&h);
         }
     }
-    if (m->url.len && !m->project.len && cfgadds(e->cfg, m->name) &&
-            !mcpconfirmed(e, scratch, m->name, m->url)) {
-        mcpneedconfirm(e, scratch, m);
+    if (m->url.len && !m->project.len &&
+            apprpending(e, &scratch, "mcp", m->name, m->url).len) {
+        mcpneedapprove(e, scratch, m);
         return;
     }
     m->trust  = mcptrusts(e, scratch, m);  // at the url it now has
@@ -9733,6 +9853,186 @@ static void mcpprojresolve(Session *s, Arena scratch, b32 allow, i32 by, b32 alw
     if (!allow && by==DENY_POLICY) {
         note(s, scratch, "warn", "The project's MCP servers were not started: the "
              "user must approve them, and nobody is there to.");
+    }
+}
+
+// Before a request: what the session's endpoint and its MCP servers
+// would send to urls of web includes put to the user (see "Approvals"),
+// all in one ask. Returns 0 while it asks, or once it ended the turn,
+// as its endpoint's key was refused: a server refused fails instead.
+static b32 approvegate(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    if (s->readonly) {
+        return 1;
+    }
+    Slice<Approval> want = {};
+    b32             epno = 0;  // its endpoint's refused
+    Slice<Str>      kinds = {};
+    Slice<Str>      names = {};
+    if (s->ep.name.len && !s->ep.relay.len) {
+        kinds = push(&scratch, kinds, Str("endpoint"));
+        names = push(&scratch, names, s->ep.name);
+    }
+    if (!s->mcpfilter.data || s->mcpfilter.len) {
+        Slice<Str> ms = mcpnames(e, &scratch);
+        for (iz i = 0; i < ms.len; i++) {
+            if (mcpanyallowed(s->mcpfilter, ms[i])) {
+                kinds = push(&scratch, kinds, Str("mcp"));
+                names = push(&scratch, names, ms[i]);
+            }
+        }
+    }
+    for (iz i = 0; i < kinds.len; i++) {
+        Str        url = trim(cfgget(e->cfg, kinds[i], names[i], "url", 0));
+        Slice<Str> p   = url.len ? apprpending(e, &scratch, kinds[i], names[i], url)
+                                 : Slice<Str>{};
+        for (iz k = 0; k < p.len; k++) {
+            b32 no = 0;
+            for (iz n = 0; n < s->apprno.len; n++) {
+                no |= s->apprno[n].url==url && s->apprno[n].what==p[k];
+            }
+            if (no) {
+                epno |= kinds[i] == "endpoint";
+                continue;
+            }
+            want = push(&scratch, want, Approval{url, p[k], kinds[i], names[i]});
+        }
+    }
+    if (!want.len && epno) {
+        endturn(s, scratch, "error", epheldmsg(&scratch, &s->ep));
+        return 0;
+    } else if (!want.len) {
+        return 1;
+    }
+
+    s->approving = {};
+    for (iz i = 0; i < want.len; i++) {
+        Approval a = {clone(&s->perm, want[i].url), clone(&s->perm, want[i].what),
+                      clone(&s->perm, want[i].kind), clone(&s->perm, want[i].name)};
+        s->approving = push(&s->perm, s->approving, a);
+    }
+    Ask *k = &s->ask;
+    *k = {};
+    {
+        Buf b(&scratch, 64);
+        print(&b, "approve/");
+        print(&b, os_time(e->os));
+        k->req = clone(&s->perm, finish(&b));
+    }
+    k->tool    = TOOL_NONE;
+    k->approve = 1;
+    k->opened  = os_ticks(e->os);
+    b32 steer = s->steers.len > 0;
+    b32 wait  = attending(s) && !steer;
+    i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+    if (wait) {
+        arm(s, T_ASK, delay);
+    }
+    {
+        // A line a url: what would go there, and which section sends it
+        Buf urls(&scratch, 256);
+        Buf lines(&scratch, 512);
+        for (iz i = 0; i < want.len; i++) {
+            b32 again = 0;
+            for (iz j = 0; j < i; j++) {
+                again |= want[j].url == want[i].url;
+            }
+            if (again) {
+                continue;
+            }
+            print(&urls, urls.len ? Str("\n") : Str(""));
+            print(&urls, want[i].url);
+            print(&lines, lines.len ? Str("\n") : Str(""));
+            print(&lines, want[i].url);
+            print(&lines, " (");
+            print(&lines, want[i].kind);
+            putbyte(&lines, ' ');
+            print(&lines, want[i].name);
+            print(&lines, "):");
+            for (iz j = i; j < want.len; j++) {
+                if (want[j].url == want[i].url) {
+                    putbyte(&lines, ' ');
+                    print(&lines, want[j].what);
+                }
+            }
+        }
+        Str   path   = finish(&urls);
+        Str   detail = finish(&lines);
+        Buf   b(&scratch, 512 + path.len + detail.len);
+        EvOut w = sbegin(s, &b, EV_ASK);
+        putstrkey(&w.json, "req", k->req);
+        putstrkey(&w.json, "kind", "approve");
+        putstrkey(&w.json, "path", path);
+        putstrkey(&w.json, "detail", detail);
+        putstrkey(&w.json, "scope", "approve");
+        putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+        putstrkey(&w.json, "dflt", "deny");
+        ssend(s, &w);
+    }
+    if (!wait) {
+        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        return approvegate(s, scratch);  // ends the turn if its endpoint's
+    }
+    setstate(s, S_ASK);
+    return 0;
+}
+
+static void apprwake(Engine *e, Arena scratch, Session *except);
+
+// The approve ask answered (resolve): an allow kept for good, for every
+// session, and answering the others that wait on it; a refusal holds
+// for the rest of the turn. A cancel decides nothing.
+static void apprresolve(Session *s, Arena scratch, b32 allow, i32 by)
+{
+    Slice<Approval> what = s->approving;
+    s->approving = {};
+    if (by==DENY_CANCEL || by==DENY_SHARED) {
+        return;  // the shared approval kept already
+    } else if (allow) {
+        if (!apprsave(s->e, scratch, what)) {
+            Str why = concat(&scratch, "the approval could not be kept, so it holds "
+                             "for nothing: ", os_lasterr(s->e->os, &scratch));
+            note(s, scratch, "warn", why);
+        }
+        apprwake(s->e, scratch, s);
+        return;
+    }
+    for (iz i = 0; i < what.len; i++) {
+        s->apprno = push(&s->perm, s->apprno, what[i]);
+    }
+    if (by == DENY_POLICY) {
+        note(s, scratch, "warn", "Credentials for urls of web includes were not "
+             "sent: the user must approve them, and nobody is there to.");
+    }
+}
+
+// After approvals: each other session whose approve ask they cover goes
+// on, and each server that waited for them starts.
+static void apprwake(Engine *e, Arena scratch, Session *except)
+{
+    Slice<Str> kept = apprkept(e, &scratch);
+    for (Session *t = e->sessions; t; t = t->next) {
+        if (t==except || t->state!=S_ASK || !t->ask.approve) {
+            continue;
+        }
+        b32 all = 1;
+        for (iz i = 0; i < t->approving.len; i++) {
+            Approval *a = &t->approving[i];
+            all &= apprin(kept, cfgsha256(&scratch, a->url), a->what);
+        }
+        if (all) {
+            resolve(t, scratch, 1, DENY_SHARED, {});
+            nexttool(t, scratch);
+        }
+    }
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->approve && m->url.len && !m->project.len &&
+                !apprpending(e, &scratch, "mcp", m->name, m->url).len) {
+            m->state   = MCP_STOPPED;
+            m->approve = 0;
+            mcpstart(e, scratch, m, 0);
+        }
     }
 }
 
@@ -11178,10 +11478,10 @@ static void cmdmcpauth(Engine *e, Arena scratch, i64 id, Json *j)
     } else if (!redirect.len) {
         reply(e, scratch, id, 0, "no redirect was given", {});
         return;
-    } else if (mcpunconfirmed(e, scratch, name)) {
-        Str why = concat(&scratch, "confirm its url first, in Settings or with: "
-                         "prospero mcp confirm ", name);
-        reply(e, scratch, id, 0, why, {});
+    } else if (apprpending(e, &scratch, "mcp", name, url).len) {
+        // Signing in may send its client_secret
+        reply(e, scratch, id, 0, "approve its url first, in Settings or with: "
+              "prospero approve", {});
         return;
     }
     McpAuth *x = mcpauthnew(e, scratch, name, url);
@@ -11289,35 +11589,48 @@ static void cmdmcplogout(Engine *e, Arena scratch, i64 id, Json *j)
     reply(e, scratch, id, 1, {}, {});
 }
 
-// mcp.confirm {name, url}: the url the user saw confirmed for what the
-// user's own file adds to the server (cfgadds), and the server started
-// again, if it is still the server's url.
-static void cmdmcpconfirm(Engine *e, Arena scratch, i64 id, Json *j)
+// approve {url?}: without url, what waits for approval, as pending:
+// [{url, kind, name, what}]; with url, everything that waits for that
+// url (as the configuration has it now) approved for good, and every
+// session and server waiting on it going on.
+static void cmdapprove(Engine *e, Arena scratch, i64 id, Json *j)
 {
-    Str name = jsonstr(jsonget(j, "name"));
-    Str url  = jsonstr(jsonget(j, "url"));
-    Str now  = trim(cfgget(e->cfg, "mcp", name, "url", 0));
-    if (!inisection(e->ini, "mcp", name) || !now.len) {
-        Str why = concat(&scratch, "no MCP server over HTTP is named ",
-                         name.len ? name : Str("\"\""));
-        reply(e, scratch, id, 0, why, {});
+    Str             url  = jsonstr(jsonget(j, "url"));
+    Slice<Approval> all  = apprall(e, &scratch);
+    Slice<Approval> take = {};
+    for (iz i = 0; url.len && i < all.len; i++) {
+        if (all[i].url == url) {
+            take = push(&scratch, take, all[i]);
+        }
+    }
+    if (url.len && !take.len) {
+        reply(e, scratch, id, 0, "nothing waits for approval for that url", {});
         return;
-    } else if (url != now) {
-        reply(e, scratch, id, 0, "its url is no longer the one given", {});
-        return;
-    } else if (!mcpconfirm(e, scratch, name, url)) {
+    } else if (url.len && !apprsave(e, scratch, take)) {
         Str why = concat(&scratch, "it could not be kept: ", os_lasterr(e->os, &scratch));
         reply(e, scratch, id, 0, why, {});
         return;
+    } else if (url.len) {
+        apprwake(e, scratch, 0);
+        reply(e, scratch, id, 1, {}, {});
+        return;
     }
-    for (McpServer *m = e->mcp; m; m = m->next) {
-        if (m->name==name && !m->project.len && m->confirm) {
-            m->state   = MCP_STOPPED;
-            m->confirm = 0;
-            mcpstart(e, scratch, m, 0);
-        }
+    Buf   b(&scratch, 1<<12);
+    EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_REPLY);
+    putintkey(&w.json, "id", id);
+    putintkey(&w.json, "ok", 1);
+    putkey(&w.json, "pending");
+    putarray(&w.json);
+    for (iz i = 0; i < all.len; i++) {
+        putobject(&w.json);
+        putstrkey(&w.json, "url", all[i].url);
+        putstrkey(&w.json, "kind", all[i].kind);
+        putstrkey(&w.json, "name", all[i].name);
+        putstrkey(&w.json, "what", all[i].what);
+        putend(&w.json);
     }
-    reply(e, scratch, id, 1, {}, {});
+    putend(&w.json);
+    emit(e, evend(&w));
 }
 
 // mcp.restart {name}: started again now, over HTTP, or at a session's
@@ -11354,7 +11667,7 @@ static Str mcpstatename(McpServer *m)
     case MCP_STARTING:
     case MCP_LISTING:  return "starting";
     case MCP_READY:    return "ready";
-    case MCP_FAILED:   return m->confirm ? Str("confirm") :
+    case MCP_FAILED:   return m->approve ? Str("approve") :
                               m->needauth ? Str("auth") : Str("failed");
     }
     return "stopped";
@@ -11377,9 +11690,16 @@ static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServ
         putstrkey(w, "url", url);
         McpTokens t = mcptokens(e, &scratch, name, url);
         putintkey(w, "signedin", t.access.len > 0);
-        if (!(m && m->project.len) && mcpunconfirmed(e, scratch, name)) {
-            // The url to confirm: the configuration's, where it connects next
-            putstrkey(w, "confirm", trim(cfgget(e->cfg, "mcp", name, "url", 0)));
+        Slice<Str> p = m && m->project.len ? Slice<Str>{} :
+                       apprpending(e, &scratch, "mcp", name, url);
+        if (p.len) {
+            // What waits for approval, to go to the configuration's url
+            putkey(w, "approve");
+            putarray(w);
+            for (iz i = 0; i < p.len; i++) {
+                putstr(w, p[i]);
+            }
+            putend(w);
         }
     }
     putstrkey(w, "state", mcpstatename(m));
@@ -11846,7 +12166,8 @@ static void sendcompact(Session *s, Arena scratch)
     cp->inbytes = convo.len;
     if (!startreq(s, scratch, &cp->ep, "POST", url, body, "text/event-stream", 0)) {
         Str err = os_lasterr(s->e->os, &scratch);
-        err = concat(&scratch, "cannot start a request: ", err);
+        err = cp->ep.held ? epheldmsg(&scratch, &cp->ep)
+                          : concat(&scratch, "cannot start a request: ", err);
         endturn(s, scratch, "error", err);
         return;
     }
@@ -12097,6 +12418,8 @@ static void prepare(Session *s, Arena scratch)
         return;
     } else if (s->intask && !taskbudget(s, scratch)) {
         return;
+    } else if (!approvegate(s, scratch)) {
+        return;  // asking, or the turn ended
     } else if (!mcpgate(s, scratch)) {
         return;  // its MCP servers are starting: mcpwake goes on
     }
@@ -12197,6 +12520,7 @@ static void settitle(Session *s, Arena scratch, Str title, Str by)
 // only work), else is null.
 static void beginturn(Session *s, Arena scratch, Str via)
 {
+    s->apprno    = {};  // refused for that turn: asked again
     s->cancelled = 0;
     s->msgsent   = 0;
     s->turn++;
@@ -12497,7 +12821,13 @@ static b32 endpointconf(Engine *e, Arena *perm, Str which, Endpoint *ep)
     ep->progress  = cfgms(cfg, "endpoint", name, "progress_timeout", local)*MS;
     i64 connect   = cfgms(cfg, "endpoint", name, "connect_timeout", local);
     ep->connectms = (i32)(connect<0x7fffffff ? connect : 0x7fffffff);
-    ep->key       = cfgsecret(cfg, perm, "endpoint", name, "key");
+    ep->held      = 0;
+    ep->key       = {};
+    if (name.len) {
+        Arena tmp = *perm;
+        ep->held  = apprpending(e, &tmp, "endpoint", name, url).len > 0;
+    }
+    ep->key       = ep->held ? Str{} : cfgsecret(cfg, perm, "endpoint", name, "key");
     Str kind      = trim(cfgget(cfg, "endpoint", name, "kind", 0));
     ep->kind      = kind=="anthropic" ? EP_ANTHROPIC : EP_OPENAI;
     return 1;
@@ -17442,7 +17772,8 @@ static void cmdmode(Engine *e, Session *s, Arena scratch, i64 id, Json *j)
     for (Session *t = e->sessions; mode==MODE_BYPASS && t; t = t->next) {
         b32 asks = t->state==S_ASK && (t->ask.tool!=TOOL_PLANENTER &&
                                        t->ask.tool!=TOOL_PLANEXIT &&
-                                       t->ask.tool!=TOOL_ASKUSER);
+                                       t->ask.tool!=TOOL_ASKUSER &&
+                                       !t->ask.approve);  // the user's to approve
         if (asks && treeroot(t)==s && bypassing(t)) {
             Arena a = scratch;
             resolve(t, a, 1, DENY_BYPASS, {});
@@ -19069,6 +19400,11 @@ static void cmdmodels(Engine *e, Arena scratch, i64 id)
             continue;
         }
         endpointconf(e, &t, p->name, &ep);
+        if (ep.held) {
+            p->err  = clone(&l->arena, epheldmsg(&t, &ep));
+            p->done = 1;
+            continue;
+        }
         HttpReq r = {};
         r.method    = "GET";
         r.url       = apiurl(&t, ep.url, ep.kind==EP_ANTHROPIC ?
@@ -19385,7 +19721,7 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_MCPAUTH:
         case CMD_MCPCODE:
         case CMD_MCPRESTART:
-        case CMD_MCPCONFIRM:
+        case CMD_APPROVE:
         case CMD_SHELL:
         case CMD_GIT:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
@@ -19553,8 +19889,8 @@ static void command(Engine *e, Arena scratch, Str line)
     case CMD_MCPRESTART:
         cmdmcprestart(e, scratch, id, j);
         return;
-    case CMD_MCPCONFIRM:
-        cmdmcpconfirm(e, scratch, id, j);
+    case CMD_APPROVE:
+        cmdapprove(e, scratch, id, j);
         return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});
