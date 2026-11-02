@@ -69,6 +69,8 @@ struct SideSess {
 struct SideHost {
     Str key;        // stable across runs, for its fold state
     b32 always;     // listed with no sessions to show
+    i32 under;      // its heading's host index + 1, if under another's
+                    // (the containers under their runtime), else 0
 };
 
 struct SideIn {
@@ -219,18 +221,47 @@ static SideSum sidesum(SideTree *t, Slice<i32> roots, i32 host, i32 aside, Str g
     return r;
 }
 
-// A section's sessions, under host headings when there are any.
+// A host's sessions in a section and those of the hosts under it, as
+// sidesum adds them.
+static SideSum sidesums(SideTree *t, Slice<i32> roots, i32 h, i32 aside, Str group)
+{
+    SideSum r = sidesum(t, roots, h, aside, group);
+    for (i32 k = 0; k < (i32)t->in->hosts.len; k++) {
+        if (t->in->hosts[k].under == h+1) {
+            SideSum c = sidesums(t, roots, k, aside, group);
+            r.any   |= c.any;
+            r.count += c.count;
+            r.asks  |= c.asks;
+        }
+    }
+    return r;
+}
+
+static void sidehost(SideTree *, Slice<i32>, i32, i32, i32, Str, Str, b32);
+
+// A section's sessions, under host headings when there are any, a host
+// under another (SideHost.under) after that one's sessions, a level in.
 static void sidesection(SideTree *t, Slice<i32> roots, i32 depth, i32 aside,
                         Str group, Str prefix, b32 always)
 {
+    for (i32 h = 0; h < (i32)t->in->hosts.len; h++) {
+        if (!t->in->hosts[h].under) {
+            sidehost(t, roots, h, depth, aside, group, prefix, always);
+        }
+    }
+}
+
+static void sidehost(SideTree *t, Slice<i32> roots, i32 h, i32 depth, i32 aside,
+                     Str group, Str prefix, b32 always)
+{
     SideIn *in = t->in;
-    for (i32 h = 0; h < (i32)in->hosts.len; h++) {
-        SideSum sum = sidesum(t, roots, h, aside, group);
+    {
+        SideSum sum = sidesums(t, roots, h, aside, group);
         if (!in->heads && !sum.any) {
-            continue;
+            return;
         } else if (in->heads) {
             if (!sum.any && !(always && in->hosts[h].always)) {
-                continue;
+                return;
             }
             SideRow r = {};
             r.kind   = SROW_HOST;
@@ -247,13 +278,19 @@ static void sidesection(SideTree *t, Slice<i32> roots, i32 depth, i32 aside,
             r.folded = sidefolded(in, r.key, 0) && !r.forced;
             t->rows  = push(t->a, t->rows, r);
             if (r.folded) {
-                continue;
+                return;
             }
         }
         for (iz n = 0; n < roots.len; n++) {
             SideSess *s = &in->sess[roots[n]];
             if (s->host==h && sidein(s, aside, group)) {
                 sideemit(t, roots[n], depth + (in->heads ? 1 : 0), group, aside, 0);
+            }
+        }
+        for (i32 k = 0; k < (i32)in->hosts.len; k++) {
+            if (in->hosts[k].under == h+1) {
+                sidehost(t, roots, k, depth + (in->heads ? 1 : 0), aside, group, prefix,
+                         always);
             }
         }
     }

@@ -62,7 +62,7 @@ static void test_sidebar(Test *t)
 
     // One host: no headings, the newest first, subagents oldest first
     SideIn in = {};
-    in.hosts = push(&a, in.hosts, SideHost{"this", 1});
+    in.hosts = push(&a, in.hosts, SideHost{"this", 1, 0});
     in.sess  = push(&a, in.sess, sidesess(0, "s3", {}, {}, 0));
     in.sess  = push(&a, in.sess, sidesess(0, "s2b", "s2", {}, 0));
     in.sess  = push(&a, in.sess, sidesess(0, "s2a", "s2", {}, 0));
@@ -106,10 +106,10 @@ static void test_sidebar(Test *t)
     // and a placeholder group in the GUI's order before it
     SideIn two = {};
     two.heads  = 1;
-    two.hosts  = push(&a, two.hosts, SideHost{"this", 1});
-    two.hosts  = push(&a, two.hosts, SideHost{"remote:vm", 1});
-    two.hosts  = push(&a, two.hosts, SideHost{"remote:pi", 1});
-    two.hosts  = push(&a, two.hosts, SideHost{"remote:off", 0});
+    two.hosts  = push(&a, two.hosts, SideHost{"this", 1, 0});
+    two.hosts  = push(&a, two.hosts, SideHost{"remote:vm", 1, 0});
+    two.hosts  = push(&a, two.hosts, SideHost{"remote:pi", 1, 0});
+    two.hosts  = push(&a, two.hosts, SideHost{"remote:off", 0, 0});
     two.groups = push(&a, two.groups, Str("empty"));
     two.sess   = push(&a, two.sess, sidesess(0, "a3", {}, "work", 0));
     two.sess   = push(&a, two.sess, sidesess(0, "a2", {}, {}, 0));
@@ -249,8 +249,8 @@ static void test_sidebar(Test *t)
     // a root on its own host; and the same sid on each host kept apart
     SideIn far = {};
     far.heads = 1;
-    far.hosts = push(&a, far.hosts, SideHost{"this", 1});
-    far.hosts = push(&a, far.hosts, SideHost{"remote:r", 1});
+    far.hosts = push(&a, far.hosts, SideHost{"this", 1, 0});
+    far.hosts = push(&a, far.hosts, SideHost{"remote:r", 1, 0});
     far.sess  = push(&a, far.sess, sidesess(0, "p", {}, "work", 0));
     far.sess  = push(&a, far.sess, sidesess(1, "k2", "p", {}, 0));
     far.sess  = push(&a, far.sess, sidesess(1, "k1", "p", {}, 0));
@@ -300,7 +300,7 @@ static void test_sidebar(Test *t)
     // Parents in a cycle still show, each once, after the roots (one
     // its own parent is one)
     SideIn cyc = {};
-    cyc.hosts = push(&a, cyc.hosts, SideHost{"this", 1});
+    cyc.hosts = push(&a, cyc.hosts, SideHost{"this", 1, 0});
     cyc.sess  = push(&a, cyc.sess, sidesess(0, "x", "y", {}, 0));
     cyc.sess  = push(&a, cyc.sess, sidesess(0, "y", "x", {}, 0));
     cyc.sess  = push(&a, cyc.sess, sidesess(0, "z", "z", {}, 0));
@@ -309,12 +309,28 @@ static void test_sidebar(Test *t)
 
     // Nothing at all, one host: no rows; two hosts: their headings
     SideIn none = {};
-    none.hosts = push(&a, none.hosts, SideHost{"this", 1});
+    none.hosts = push(&a, none.hosts, SideHost{"this", 1, 0});
     expect(t, "sidebar.none", siderows(&a, &none, sidetree(&a, &none)), "");
     none.heads = 1;
-    none.hosts = push(&a, none.hosts, SideHost{"remote:vm", 1});
+    none.hosts = push(&a, none.hosts, SideHost{"remote:vm", 1, 0});
     expect(t, "sidebar.emptyhosts", siderows(&a, &none, sidetree(&a, &none)),
            "H this 0\nH remote:vm 0\n");
+
+    // Hosts under another's heading, the containers under their runtime:
+    // after its sessions, a level in, counted in it, and folded with it
+    SideIn ctr = {};
+    ctr.heads = 1;
+    ctr.hosts = push(&a, ctr.hosts, SideHost{"this", 1, 0});
+    ctr.hosts = push(&a, ctr.hosts, SideHost{"ctr", 1, 0});
+    ctr.hosts = push(&a, ctr.hosts, SideHost{"remote:ctr:a", 1, 2});
+    ctr.hosts = push(&a, ctr.hosts, SideHost{"remote:ctr:b", 1, 2});
+    ctr.sess  = push(&a, ctr.sess, sidesess(0, "s1", {}, {}, 0));
+    ctr.sess  = push(&a, ctr.sess, sidesess(2, "c1", {}, {}, 0));
+    expect(t, "sidebar.under", siderows(&a, &ctr, sidetree(&a, &ctr)),
+           "H this 1\n S s1\nH ctr 1\n H remote:ctr:a 1\n  S c1\n H remote:ctr:b 0\n");
+    *upsert(&ctr.folds, "h:ctr", &a) = 1;
+    expect(t, "sidebar.underfolded", siderows(&a, &ctr, sidetree(&a, &ctr)),
+           "H this 1\n S s1\nH ctr 1+\n");
 }
 
 // An export as Markdown: the title and what the session is, messages

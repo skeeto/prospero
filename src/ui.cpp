@@ -7307,24 +7307,26 @@ static void drawsessions(Gui *g)
             continue;
         }
         refs     = push(&a, refs, HostRef{h, {}, 0});
-        in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, h, {}), 1});
+        in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, h, {}), 1, 0});
     }
     Slice<Str> names = g->enginekind==ENGINE_FAKE ? Slice<Str>{} : remotenames(g, &a);
     for (iz i = 0; i < names.len; i++) {
         if (!findhost(g, GH_REMOTE, names[i]) && remotelisted(g, 0, names[i])) {
             refs     = push(&a, refs, HostRef{0, names[i], 0});
-            in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, 0, names[i]), 1});
+            in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, 0, names[i]), 1, 0});
         }
     }
     // Then Docker or Podman, if installed, and the containers it made
+    i32 rt = 0;  // the runtime's row + 1, which the containers go under
     if (ctrlisted(g)) {
         refs     = push(&a, refs, HostRef{0, {}, 1});
-        in.hosts = push(&a, in.hosts, SideHost{"ctr", 1});
+        in.hosts = push(&a, in.hosts, SideHost{"ctr", 1, 0});
+        rt       = (i32)in.hosts.len;
     }
     for (GuiCtr *c = g->ctrs; c; c = c->next) {
         if (!c->removed && c->h) {
             refs     = push(&a, refs, HostRef{c->h, {}, 0});
-            in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, c->h, {}), 1});
+            in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, c->h, {}), 1, rt});
         }
     }
     in.heads   = in.hosts.len > 1;
