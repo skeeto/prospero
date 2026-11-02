@@ -5077,7 +5077,7 @@ def task_remote_errors(t):
                 "explore" in r["err"], f"role {r}")
         r = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
                    task=fartask(via="carrier pigeon"))
-        t.check(r.get("ok") == 0 and r["err"] == "task.via must be wsl or ssh", f"via {r}")
+        t.check(r.get("ok") == 0 and r["err"] == "task.via must be wsl, ssh or exec", f"via {r}")
         r = h.call("new", cwd=t.work, model=t.model, endpoint="fake",
                    task=fartask(prompt=""))
         t.check(r.get("ok") == 0 and r["err"] == "task.prompt is empty", f"prompt {r}")

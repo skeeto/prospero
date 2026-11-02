@@ -271,21 +271,54 @@ static void test_deploywsl(Test *t)
 {
     Arena a = t->perm;
 
-    Slice<Str> w = linkargv(&a, {}, {}, "Debian", "prospero attach");
+    Reach ssh = {}, wsl = {}, ex = {};
+    ssh.ssh = "pi";
+    wsl.wsl = "Debian";
+    ex.exec = "docker exec -i \"my box\"";
+    Slice<Str> w = linkargv(&a, {}, wsl, "prospero attach");
     expect(t, "deploy.wsl.argv", joinwords(&a, w),
            "wsl.exe|-d|Debian|--cd|~|--exec|/bin/sh|-c|prospero attach");
-    w = linkargv(&a, "fakewsl", "host", "Deb", "x");
+    w = linkargv(&a, "fakewsl", wsl, "x");
     expect(t, "deploy.wsl.program", joinwords(&a, w),
-           "fakewsl|-d|Deb|--cd|~|--exec|/bin/sh|-c|x");
-    Slice<Str> s = linkargv(&a, {}, "pi", {}, "uname");
+           "fakewsl|-d|Debian|--cd|~|--exec|/bin/sh|-c|x");
+    Slice<Str> s = linkargv(&a, {}, ssh, "uname");
     expect(t, "deploy.ssh.argv", joinwords(&a, s),
            "ssh|-T|-o|BatchMode=yes|-o|ConnectTimeout=15|-o|ServerAliveInterval=15|"
            "-o|ServerAliveCountMax=3|-o|EscapeChar=none|--|pi|uname");
-    expect(t, "deploy.wsl.dest", linkdest(&a, "pi", {}), "pi");
-    expect(t, "deploy.wsl.dest2", linkdest(&a, {}, "Debian"), "wsl:Debian");
-    expect(t, "deploy.wsl.bad", linkbad({}, "-x"), "a WSL distro name cannot begin with -");
-    expect(t, "deploy.wsl.good", linkbad({}, "Debian"), "");
-    expect(t, "deploy.ssh.bad", linkbad("-oX", {}), "an ssh destination cannot begin with -");
+    w = linkargv(&a, "ignored", ex, "uname -sm");
+    expect(t, "deploy.exec.argv", joinwords(&a, w),
+           "docker|exec|-i|my box|/bin/sh|-c|cd; uname -sm");
+    Reach direct = ex;
+    direct.direct = 1;
+    w = linkargv(&a, {}, direct, "/prospero/engine attach --state \"/a b\"");
+    expect(t, "deploy.exec.direct", joinwords(&a, w),
+           "docker|exec|-i|my box|/prospero/engine|attach|--state|/a b");
+    expect(t, "deploy.wsl.dest", linkdest(&a, ssh), "pi");
+    expect(t, "deploy.wsl.dest2", linkdest(&a, wsl), "wsl:Debian");
+    expect(t, "deploy.exec.dest", linkdest(&a, ex), "exec:docker exec -i \"my box\"");
+    wsl.wsl = "-x";
+    expect(t, "deploy.wsl.bad", linkbad(a, wsl), "a WSL distro name cannot begin with -");
+    wsl.wsl = "Debian";
+    expect(t, "deploy.wsl.good", linkbad(a, wsl), "");
+    ssh.ssh = "-oX";
+    expect(t, "deploy.ssh.bad", linkbad(a, ssh), "an ssh destination cannot begin with -");
+    expect(t, "deploy.exec.good", linkbad(a, ex), "");
+    ex.exec = "  \"-x\" y";
+    expect(t, "deploy.exec.bad", linkbad(a, ex), "an exec command cannot begin with -");
+    ex.exec = " \t";
+    expect(t, "deploy.exec.empty", linkbad(a, ex), "an exec command cannot be empty");
+    ex.exec = "docker \"exec";
+    expect(t, "deploy.exec.quote", linkbad(a, ex), "an exec command's quote is not closed");
+
+    // reachof: ssh, else wsl, else exec
+    LinkTo to = {};
+    to.wsl  = "Deb";
+    to.exec = "x";
+    expect(t, "deploy.reachof.wsl", linkdest(&a, reachof(&to)), "wsl:Deb");
+    to.wsl = {};
+    expect(t, "deploy.reachof.exec", linkdest(&a, reachof(&to)), "exec:x");
+    to.ssh = "pi";
+    expect(t, "deploy.reachof.ssh", linkdest(&a, reachof(&to)), "pi");
 
     Slice<Str> env = {};
     env = push(&a, env, Str("PATH=/bin"));
@@ -327,10 +360,10 @@ static void test_deploywsl(Test *t)
     distros = push(&a, distros, Str("Arch"));
     distros = push(&a, distros, Str("Fedora"));
     Slice<LinkTo> remotes = {};
-    remotes = push(&a, remotes, LinkTo{"deb", {}, "Debian"});      // claims Debian
-    remotes = push(&a, remotes, LinkTo{"Ubuntu", "ubuntu.lan", {}});  // the name, by ssh
-    remotes = push(&a, remotes, LinkTo{"Arch", {}, {}});          // its settings only
-    remotes = push(&a, remotes, LinkTo{"x", "Fedora", {}});        // ssh, not a claim
+    remotes = push(&a, remotes, LinkTo{"deb", {}, "Debian", {}});      // claims Debian
+    remotes = push(&a, remotes, LinkTo{"Ubuntu", "ubuntu.lan", {}, {}});  // the name, by ssh
+    remotes = push(&a, remotes, LinkTo{"Arch", {}, {}, {}});          // its settings only
+    remotes = push(&a, remotes, LinkTo{"x", "Fedora", {}, {}});        // ssh, not a claim
     expect(t, "deploy.wsl.hosts", showhosts(&a, wslhosts(&a, distros, remotes)),
            "Ubuntu-wsl=Ubuntu Arch=Arch Fedora=Fedora");
     expect(t, "deploy.wsl.hostsnone", showhosts(&a, wslhosts(&a, distros, {})),

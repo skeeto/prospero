@@ -7,8 +7,9 @@ static Str farshow(Arena *a, Slice<FarHost> hosts)
     for (iz i = 0; i < hosts.len; i++) {
         print(&b, i ? Str(" ") : Str(""));
         print(&b, hosts[i].name);
-        print(&b, hosts[i].ssh.len ? Str("=ssh:") : Str("=wsl:"));
-        print(&b, hosts[i].ssh.len ? hosts[i].ssh : hosts[i].wsl);
+        FarHost *h = &hosts[i];
+        print(&b, h->ssh.len ? Str("=ssh:") : h->wsl.len ? Str("=wsl:") : Str("=exec:"));
+        print(&b, h->ssh.len ? h->ssh : h->wsl.len ? h->wsl : h->exec);
     }
     return finish(&b);
 }
@@ -26,6 +27,7 @@ static void test_hostlink(Test *t)
              "include = team.ini\n"
              "[remote box]\nssh = me@box\n"
              "[remote deb]\nwsl = Debian\n"
+             "[remote ctr]\nexec = docker exec -i fuzz\n"
              "[remote off]\nssh = off.invalid\nsubagents = no\n"
              "[remote Ubuntu]\nsubagents = no\n"
              "[remote empty]\n");
@@ -33,10 +35,12 @@ static void test_hostlink(Test *t)
     Str     d[] = {"Debian", "Ubuntu", "Alpine"};
     Slice<Str> distros = {d, countof(d), countof(d)};
     expect(t, "farhosts", farshow(&a, farhosts(&a, c, distros, 1)),
-           "box=ssh:me@box deb=wsl:Debian Alpine=wsl:Alpine");
+           "box=ssh:me@box deb=wsl:Debian ctr=exec:docker exec -i fuzz "
+           "Alpine=wsl:Alpine");
     expect(t, "farhosts without wsl", farshow(&a, farhosts(&a, c, distros, 0)),
-           "box=ssh:me@box");
-    expect(t, "farhosts none", farshow(&a, farhosts(&a, c, {}, 0)), "box=ssh:me@box");
+           "box=ssh:me@box ctr=exec:docker exec -i fuzz");
+    expect(t, "farhosts none", farshow(&a, farhosts(&a, c, {}, 0)),
+           "box=ssh:me@box ctr=exec:docker exec -i fuzz");
 
     Slice<FarHost> hosts = farhosts(&a, c, distros, 1);
     expect(t, "farhostlines", farhostlines(&a, hosts),
@@ -44,14 +48,17 @@ static void test_hostlink(Test *t)
            "\n- deb: Linux (WSL) on this machine: it sees this machine's drives "
            "under /mnt (C:\\Users is /mnt/c/Users); its own files are "
            "\\\\wsl.localhost\\Debian\\... here"
+           "\n- ctr: a container or other machine reached by a command here: "
+           "it shares no files with this one, unless it mounts some"
            "\n- Alpine: Linux (WSL) on this machine: it sees this machine's drives "
            "under /mnt (C:\\Users is /mnt/c/Users); its own files are "
            "\\\\wsl.localhost\\Alpine\\... here");
     expect(t, "farhostlines none", istr(&a, !farhostlines(&a, {}).data), "1");
 
     // Where a subagent works there
-    FarHost deb = {"deb", {}, "Debian"};
-    FarHost box = {"box", "me@box", {}};
+    FarHost deb = {"deb", {}, "Debian", {}};
+    FarHost box = {"box", "me@box", {}, {}};
+    FarHost ctr = {"ctr", {}, {}, "docker exec -i fuzz"};
     struct { FarHost *h; Str pcwd; Str cwd; Str want; } cwds[] = {
         {&deb, "C:\\Users\\me\\proj", {}, "/mnt/c/Users/me/proj"},
         {&deb, "d:/src", {}, "/mnt/d/src"},
@@ -63,6 +70,8 @@ static void test_hostlink(Test *t)
         {&deb, "C:\\x", "/srv/y", "/srv/y"},
         {&box, "C:\\x", {}, "~"},
         {&box, "/home/me", "~/src", "~/src"},
+        {&ctr, "/home/me", {}, "~"},
+        {&ctr, "/home/me", "/work", "/work"},
     };
     for (iz i = 0; i < countof(cwds); i++) {
         Str got = farcwd(&a, cwds[i].h, cwds[i].pcwd, cwds[i].cwd);

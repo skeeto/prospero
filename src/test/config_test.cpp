@@ -342,7 +342,8 @@ static void testcfgseed(Test *t)
     cfgfree(c);
 }
 
-// A remote reaches its machine one way: wsl beside ssh is an error.
+// A remote reaches its machine one way: wsl beside ssh is an error, as
+// is exec beside either.
 static void testcfgwsl(Test *t)
 {
     Arena  a = t->perm;
@@ -353,14 +354,23 @@ static void testcfgwsl(Test *t)
         "ssh = pi\n"
         "wsl = Debian\n"
         "[remote deb]\n"
-        "wsl = Debian\n");
+        "wsl = Debian\n"
+        "[remote box]\n"
+        "exec = docker exec -i box\n"
+        "[remote mixed]\n"
+        "wsl = Ubuntu\n"
+        "exec = docker exec -i x\n");
     Config *c = newconfig(v.os, &a, v.scratch, "/c/prospero.ini", 0);
     expect(t, "wsl.diags", inidiags(&a, c->ini),
         "/c/prospero.ini:3:7: error: ssh is set too, which reaches the machine, "
+        "so this is ignored\n"
+        "/c/prospero.ini:10:8: error: wsl is set too, which reaches the machine, "
         "so this is ignored");
     expect(t, "wsl.get", cfgget(c, "remote", "deb", "wsl", 0), "Debian");
     Slice<LinkTo> r = cfgremotes(&a, c);
-    expect(t, "wsl.remotes", istr(&a, r.len), "2");
+    expect(t, "wsl.remotes", istr(&a, r.len), "4");
+    expect(t, "wsl.exec", r[2].exec, "docker exec -i box");
+    expect(t, "wsl.mixed", concat(&a, r[3].wsl, concat(&a, "/", r[3].exec)), "Ubuntu/");
     expect(t, "wsl.both", concat(&a, r[0].ssh, concat(&a, "/", r[0].wsl)), "pi/");
     expect(t, "wsl.deb", concat(&a, r[1].ssh, concat(&a, "/", r[1].wsl)), "/Debian");
 }

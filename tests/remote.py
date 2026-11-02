@@ -1983,7 +1983,9 @@ def sc_far_task(model, n, req):
 
 
 def sc_far_task_b(model, n, req):
-    where = "wsl" if "Windows on this machine" in F.system_of(req) else "ssh"
+    system = F.system_of(req)
+    where = ("wsl" if "Windows on this machine" in system else
+             "exec" if "outside this container" in system else "ssh")
     yield from F.answer(model, f"Done ({where}): {F.task_prompt(req)}")
 
 
@@ -2043,7 +2045,7 @@ fake_provider.SCENARIOS["far_background"] = sc_far_sleep
 fake_provider.SCENARIOS["far_background_b"] = sc_far_flag_b
 fake_provider.SCENARIOS["far_attend"] = sc_far_sleep
 fake_provider.SCENARIOS["far_attend_b"] = sc_far_ask_b
-for _name in ("far_old", "far_never", "far_wsl", "far_wsl_boot", "relay_far"):
+for _name in ("far_old", "far_never", "far_wsl", "far_wsl_boot", "far_exec", "relay_far"):
     fake_provider.SCENARIOS[_name] = sc_far_task
     fake_provider.SCENARIOS[_name + "_b"] = sc_far_task_b
 
@@ -2074,12 +2076,22 @@ time.sleep(float(os.environ.get("FAKEWSL_SILENT", "0")))
 run(["/bin/sh", "-c", args[7]])
 """
 
+FAKEEXEC = FAKE + r"""
+# docker exec -i box /bin/sh -c CMD: runs CMD here
+args = sys.argv[1:]
+if len(args) != 6 or args[:3] != ["exec", "-i", "box"] or args[3:5] != ["/bin/sh", "-c"]:
+    sys.stderr.write(f"fakeexec: unexpected {args}\n")
+    sys.exit(2)
+run(["/bin/sh", "-c", args[5]])
+"""
+
 
 class Far:
     """Y, the host of this scenario's state directory, then X, a headless
     engine of its own whose [remote y] reaches Y through a fake ssh."""
 
-    def __init__(self, t, scenario, yenv=None, ypath=None, wsl=False, xenv=None):
+    def __init__(self, t, scenario, yenv=None, ypath=None, wsl=False, xenv=None,
+                 ex=False):
         self.t = t
         self.model = t.model(scenario)
         y = Client(t)
@@ -2090,14 +2102,16 @@ class Far:
         self.xconfig = os.path.join(t.root, "x.ini")
         os.makedirs(os.path.join(self.xstate, "remote"))
         prog, self.sshpids = fakessh(t)
-        section = "[remote Ubuntu]\n" if wsl else "[remote y]\nssh = here\n"
+        section = ("[remote Ubuntu]\n" if wsl else
+                   f"[remote box]\nexec = {program(t, 'fakedocker', FAKEEXEC)} exec -i box\n"
+                   if ex else "[remote y]\nssh = here\n")
         with open(self.xconfig, "w", newline="") as f:
             f.write(f"endpoint = fake\nmodel = {self.model}\n"
                     f"[endpoint fake]\nurl = {t.args.url}/\nfirst_byte_timeout = 5\n"
                     f"idle_timeout = 5\nprogress_timeout = 10\nconnect_timeout = 2\n"
                     f"{section}path = {ypath or t.prospero}\nstate = {t.state}\n"
                     f"config = {t.config}\n")
-        FARHOST[0] = "Ubuntu" if wsl else "y"
+        FARHOST[0] = "Ubuntu" if wsl else "box" if ex else "y"
         env = dict(t.env, PROSPERO_TEST_SSH=prog, FAR_WORK=t.work, **(xenv or {}))
         if wsl:
             env["PROSPERO_TEST_WSL"] = program(t, "fakewsl", FAKEWSL)
@@ -2391,6 +2405,33 @@ def far_wsl(t):
         desc = tools[0]["function"]["description"] if tools else ""
         t.check("- Ubuntu: Linux (WSL) on this machine" in desc and
                 "\\\\wsl.localhost\\Ubuntu\\" in desc, f"told {desc!r}")
+    finally:
+        f.quit()
+
+
+@scenario
+def far_exec(t):
+    """A host reached by an exec command (a container's, here a fake
+    docker): the tool lists it, and the subagent there is told it works
+    for an agent outside its container."""
+    if os.name == "nt":
+        return "skip"
+    f = Far(t, "far_exec", ex=True)
+    try:
+        sid = f.parent()
+        f.ends(sid)
+        te = [r for r in f.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(len(te) == 2 and all(r["status"] == "ok" and r.get("host") == "box"
+                                     for r in te), f"tool.ends {te}")
+        t.check(report(te[0]["text"]) == "Done (exec): First job.", f"report {te[0]['text']}")
+        kids = f.ykids()
+        t.check(len(kids) == 2 and all(k["via"] == "exec" for k in kids),
+                f"y's sessions {kids}")
+        tools = [x for q in fake_provider.STATE.log(f.model)[:1]
+                 for x in q["body"].get("tools", []) if x["function"]["name"] == "task"]
+        desc = tools[0]["function"]["description"] if tools else ""
+        t.check("- box: a container or other machine reached by a command" in desc,
+                f"told {desc!r}")
     finally:
         f.quit()
 

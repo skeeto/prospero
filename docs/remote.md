@@ -22,8 +22,14 @@ for up to two minutes while `wsl.exe -l --running -q` does not list
 it, polled every two seconds, and its host must answer within the
 usual 20 s of silence once it is listed. Deploying into a distro sends the
 engine on `cat`'s input, as it has no scp, and records it as
-`wsl:DISTRO`. A window on a state directory that `prospero serve`
-hosts lists the sessions the host holds and attaches to them.
+`wsl:DISTRO`. A section with `exec` in place of `ssh` reaches the
+machine by a command that runs another inside it, `docker exec -i NAME`
+say, split into words as an MCP server's command is (no shell), then
+`/bin/sh -c 'cd; ...'`; it deploys over `cat` as into WSL, records it
+as `exec:COMMAND`, and fails for good on a container runtime's "No such
+container", "is not running" or "executable file not found". A window
+on a state directory that `prospero serve` hosts lists the sessions the
+host holds and attaches to them.
 
 A remote machine needs an engine built for its platform, which
 `prospero deploy` uploads with scp to `~/.prospero` there, as
@@ -50,8 +56,8 @@ Its sessions' model picker lists the models of the remote's own
 configuration. `list = connected` leaves a remote out of the sidebar
 until it is connected.
 
-The agent's task tool may start a subagent on a remote, or on Windows
-in a WSL distro, by its name (`host`), with `cwd` there. The parent's
+The agent's task tool may start a subagent on a remote (one reached by
+`exec` included, as `via = exec`), or on Windows in a WSL distro, by its name (`host`), with `cwd` there. The parent's
 engine links to it as the window would, with `new {task}`, so this
 works with no window too: the subagent is a session there, under that
 host's configuration, tools and asks, in Plan mode if its parent plans

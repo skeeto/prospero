@@ -22,6 +22,10 @@
 //
 //   wsl.exe -d DISTRO --cd ~ --exec /bin/sh -c 'PATH attach'
 //
+// and for a [remote] exec, its command does, "docker exec -i box" say:
+//
+//   docker exec -i box /bin/sh -c 'cd; PATH attach'
+//
 // spawned through os_spawnio, or for this machine's own host a local
 // connection (os_connect), starting the host when none runs. A stream
 // that breaks (ssh exiting, 255 being its own failure, or a link silent
@@ -126,6 +130,8 @@ struct RemoteConf {
     Str name;      // the remote's name, in the sessions list
     Str ssh;       // destination for ssh, empty for this machine's host
     Str wsl;       // else a WSL distro, reached through wsl.exe
+    Str exec;      // else a command that runs one there (Reach, deploy.cpp)
+    b32 direct;    // exec: PATH attach's words after it, without /bin/sh
     Str program;   // the ssh or wsl.exe program, by name if empty
     Str path;      // the harness there, "prospero" if empty
     Str state;     // its state directory there (--state), if not its own
@@ -459,7 +465,7 @@ static b32 remotestart(Remote *r, Arena scratch)
         r->live = 1;
         linkconnect(&r->link, now);
         return 1;
-    } else if (!r->conf.ssh.len && !r->conf.wsl.len) {
+    } else if (!r->conf.ssh.len && !r->conf.wsl.len && !r->conf.exec.len) {
         Str state    = r->conf.localstate;
         Str run      = join(&scratch, state, "run");
         Str name     = hostname(&scratch, HOST_PROTO);
@@ -484,9 +490,11 @@ static b32 remotestart(Remote *r, Arena scratch)
     }
 
     // The harness there: configured, or deployed for this protocol
+    Reach link = reachof(&r->conf);
+    link.direct = r->conf.direct;
     Str path = r->conf.path;
     if (!path.len) {
-        Str       dest = linkdest(&scratch, r->conf.ssh, r->conf.wsl);
+        Str       dest = linkdest(&scratch, link);
         DeployRec dr   = deployrecord(os, &scratch, r->conf.localstate, dest);
         path = dr.ok && dr.proto==HOST_PROTO ? dr.path : Str("prospero");
     }
@@ -513,19 +521,18 @@ static b32 remotestart(Remote *r, Arena scratch)
                                  "a control character, or a backslash doubled or at "
                                  "its end, which its shell cannot take");
         return 0;
-    } else if (linkbad(r->conf.ssh, r->conf.wsl).len) {
-        r->why = clone(&r->perm, linkbad(r->conf.ssh, r->conf.wsl));
+    } else if (linkbad(scratch, link).len) {
+        r->why = clone(&r->perm, linkbad(scratch, link));
         return 0;
     }
-    Slice<Str> argv = linkargv(&scratch, r->conf.program, r->conf.ssh, r->conf.wsl,
-                               cuthead(finish(&cmd), 1));
+    Slice<Str> argv = linkargv(&scratch, r->conf.program, link, cuthead(finish(&cmd), 1));
 
     Str dir = join(&scratch, r->conf.localstate, "remote");
     os_mkdirs(os, scratch, dir);
     Spawn sp = {};
     sp.argv    = argv;
     sp.cwd     = r->conf.localstate;
-    sp.env     = linkenv(&scratch, os_environ(os, &scratch), r->conf.wsl.len>0);
+    sp.env     = linkenv(&scratch, os_environ(os, &scratch), link.wsl.len>0);
     if (r->conf.envpath.len) {
         sp.env = envsetpath(&scratch, sp.env, r->conf.envpath, HOST_WINDOWS);
     }
@@ -542,7 +549,7 @@ static b32 remotestart(Remote *r, Arena scratch)
     }
     r->live = 1;
     linkconnect(&r->link, now);
-    if (r->conf.wsl.len) {
+    if (link.wsl.len) {
         remotewslwait(r, now);
     }
     return 1;
@@ -639,6 +646,7 @@ static void remotedeploy(Remote *r, Arena scratch, Str why)
     rd->conf.name       = r->conf.name;
     rd->conf.ssh        = r->conf.ssh;
     rd->conf.wsl        = r->conf.wsl;
+    rd->conf.exec       = r->conf.exec;
     rd->conf.program    = r->conf.program;
     rd->conf.scp        = r->conf.scp;
     rd->conf.engines    = r->conf.engines;
@@ -857,7 +865,8 @@ static void remoterecord(Remote *r, Arena scratch, Str line)
         if (jsonint(jsonget(rec.root, "proto"), -1) != HOST_PROTO) {
             // Goodbye, then the end, or deploying one of this protocol,
             // which starts beside that host (one per protocol)
-            b32 ssh = (r->conf.ssh.len || r->conf.wsl.len) && !r->conf.path.len;
+            b32 ssh = (r->conf.ssh.len || r->conf.wsl.len || r->conf.exec.len) &&
+                      !r->conf.path.len;
             Buf b(&scratch, 256);
             print(&b, "Prospero on ");
             print(&b, r->conf.name);
@@ -1021,7 +1030,7 @@ static Str remoteexit(Remote *r, Arena *a, i32 code)
         return said;
     }
     Buf b(a, 64);
-    b32 ssh = code==255 && !r->conf.wsl.len;
+    b32 ssh = code==255 && r->conf.ssh.len;
     print(&b, ssh ? Str("ssh failed") : Str("the stream ended"));
     print(&b, ", exit status ");
     print(&b, (i64)code);
@@ -1143,6 +1152,11 @@ static void remotethread(void *arg)
                         remotestop(r, 1);
                         r->why = concat(&r->perm, "wsl: ", why);
                         remoteend(r, a, RS_FAILED, r->why);
+                    } else if (reachof(&r->conf).exec.len && execpermanent(why)) {
+                        // No such container, say: nor will there be
+                        remotestop(r, 1);
+                        r->why = clone(&r->perm, why);
+                        remoteend(r, a, RS_FAILED, r->why);
                     } else {
                         remotedown(r, a, why, code);
                     }
@@ -1237,9 +1251,11 @@ static Remote *newremote(Os *os, Arena *perm, RemoteConf *conf, Mailbox *out)
     r->held  = Buf(&r->perm, 1<<12);
     r->fresh = 1;  // starting a host, if none runs
     r->conf.name       = conf->name.len ? clone(&r->perm, conf->name)
-                                        : linkdest(&r->perm, conf->ssh, conf->wsl);
+                                        : linkdest(&r->perm, reachof(conf));
     r->conf.ssh        = clone(&r->perm, conf->ssh);
     r->conf.wsl        = clone(&r->perm, conf->wsl);
+    r->conf.exec       = clone(&r->perm, conf->exec);
+    r->conf.direct     = conf->direct;
     r->conf.program    = clone(&r->perm, conf->program);
     r->conf.path       = clone(&r->perm, conf->path);
     r->conf.state      = clone(&r->perm, conf->state);
@@ -1321,16 +1337,19 @@ static Str connectusage =
 "usage: prospero connect NAME [options]\n"
 "       prospero connect --ssh DEST [options]\n"
 "       prospero connect --wsl DISTRO [options]\n"
+"       prospero connect --exec COMMAND [options]\n"
 "       prospero connect --local [options]\n"
 "       prospero connect --endpoint EP [options]\n"
 "Protocol v0 on standard I/O, as prospero --headless, with the engine\n"
-"a host on another machine ([remote NAME], --ssh, or a WSL distro), or\n"
-"on this one\n"
-"(starting one if none runs, or only the one at EP, as prospero hosts\n"
-"lists it). When standard input ends, the link ends: the host runs on.\n"
+"a host on another machine ([remote NAME], --ssh, a WSL distro, or one\n"
+"a command reaches, a container, say), or on this one (starting one if\n"
+"none runs, or only the one at EP, as prospero hosts lists it). When\n"
+"standard input ends, the link ends: the host runs on.\n"
 "options:\n"
 "  --ssh DEST          ssh destination: [user@]host\n"
 "  --wsl DISTRO        a WSL distro, through wsl.exe\n"
+"  --exec COMMAND      a command that runs another there, then /bin/sh:\n"
+"                      \"docker exec -i NAME\", say\n"
 "  --path PATH         the prospero executable there (default: prospero)\n"
 "  --remote-state DIR  its state directory there\n"
 "  --remote-config F   its configuration file there\n"
@@ -1397,6 +1416,8 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             rc.ssh = args[++i];
         } else if (a=="--wsl" && more) {
             rc.wsl = args[++i];
+        } else if (a=="--exec" && more) {
+            rc.exec = args[++i];
         } else if (a=="--path" && more) {
             rc.path = args[++i];
         } else if (a=="--remote-state" && more) {
@@ -1430,10 +1451,11 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             return 2;
         }
     }
-    if (rc.ssh.len && rc.wsl.len) {
+    b32 linked = rc.ssh.len || rc.wsl.len || rc.exec.len;
+    if ((rc.ssh.len>0) + (rc.wsl.len>0) + (rc.exec.len>0) > 1) {
         os_print(os, 2, connectusage);
         return 2;
-    } else if (local + (rc.ssh.len || rc.wsl.len || name.len) + (rc.endpoint.len>0) != 1) {
+    } else if (local + (linked || name.len) + (rc.endpoint.len>0) != 1) {
         os_print(os, 2, connectusage);
         return 2;
     }
@@ -1449,14 +1471,16 @@ static i32 connectmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
         return 2;
     }
     if (name.len) {
-        if (!rc.ssh.len && !rc.wsl.len) {
+        if (!linked) {
             LinkTo to = linkto(os, &perm, scratch, cfg, name, wslprog, rc.localstate);
-            if (!to.ssh.len && !to.wsl.len) {
-                hostsay(os, scratch, "no such remote, or it has no ssh or wsl", name);
+            if (!to.ssh.len && !to.wsl.len && !to.exec.len) {
+                hostsay(os, scratch, "no such remote, or it has no ssh, wsl or exec",
+                        name);
                 return 2;
             }
-            rc.ssh = to.ssh;
-            rc.wsl = to.wsl;
+            rc.ssh  = to.ssh;
+            rc.wsl  = to.wsl;
+            rc.exec = to.exec;
         }
         rc.path  = rc.path.len ? rc.path : cfgown(cfg, "remote", name, "path");
         rc.state = rc.state.len ? rc.state : cfgget(cfg, "remote", name, "state", 0);

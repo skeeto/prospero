@@ -660,7 +660,7 @@ static void testremotetask(Test *t)
         {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
          "\"prompt\":\" \",\"via\":\"ssh\"}}", "!task.prompt is empty"},
         {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
-         "\"prompt\":\"go\",\"via\":\"door\"}}", "!task.via must be wsl or ssh"},
+         "\"prompt\":\"go\",\"via\":\"door\"}}", "!task.via must be wsl, ssh or exec"},
         {"{\"task\":{\"parent\":\"20260101-000000-aaaa\",\"call\":\"c1\","
          "\"prompt\":\"go\",\"via\":\"ssh\",\"distro\":\"U\"}}",
          "!task.distro must be a WSL distro's name"},

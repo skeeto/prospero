@@ -10,8 +10,9 @@
 // configuration's own [remote] sections, never an included file's, and
 // on Windows the installed WSL distros, listed by a thread at start and
 // cached in remote/wsl.list, but for those whose section says
-// subagents = no (farhosts). The agent may run ssh or wsl.exe in its
-// shell without asking, so a subagent there asks nothing either.
+// subagents = no (farhosts). The agent may run ssh, wsl.exe or an exec
+// command in its shell without asking, so a subagent there asks nothing
+// either.
 //
 // A call's subagent (a HostKid, matched to its TaskRun by serial) waits
 // until the engine there says it takes new {task} (cap task.remote),
@@ -47,7 +48,8 @@ enum : i64 {
 struct FarHost {
     Str name;
     Str ssh;
-    Str wsl;  // a distro, if not ssh
+    Str wsl;   // a distro, if not ssh
+    Str exec;  // a command that runs one there, if neither
 };
 
 // A subagent on another host, for a task call of a session here.
@@ -114,6 +116,8 @@ static Slice<LinkTo> farremotes(Arena *a, Config *cfg)
             t.name = s->name;
             t.ssh  = trim(cfgown(cfg, "remote", s->name, "ssh"));
             t.wsl  = t.ssh.len ? Str{} : trim(cfgown(cfg, "remote", s->name, "wsl"));
+            t.exec = t.ssh.len || t.wsl.len ? Str{}
+                                            : trim(cfgown(cfg, "remote", s->name, "exec"));
             r = push(a, r, t);
         }
     }
@@ -131,10 +135,11 @@ static Slice<FarHost> farhosts(Arena *a, Config *cfg, Slice<Str> distros, b32 ws
     for (iz i = 0; i < remotes.len+autos.len; i++) {
         LinkTo *t  = i<remotes.len ? &remotes[i] : &autos[i-remotes.len];
         Str     no = trim(cfgown(cfg, "remote", t->name, "subagents"));
-        if ((!t->ssh.len && (!t->wsl.len || !wsl)) || cfgbool(no)==0) {
+        b32 none = !t->ssh.len && !t->exec.len && (!t->wsl.len || !wsl);
+        if (none || cfgbool(no)==0) {
             continue;
         }
-        FarHost h = {t->name, t->ssh, t->wsl};
+        FarHost h = {t->name, t->ssh, t->wsl, t->exec};
         r = push(a, r, h);
     }
     return r;
@@ -175,6 +180,10 @@ static Str farhostlines(Arena *a, Slice<FarHost> hosts)
                       "files are \\\\wsl.localhost\\");
             print(&b, h->wsl);
             print(&b, "\\... here");
+        } else if (h->exec.len) {
+            print(&b, ": a container or other machine reached by a command "
+                      "here: it shares no files with this one, unless it "
+                      "mounts some");
         } else {
             print(&b, ": another machine over ssh: it shares no files with "
                       "this one");
@@ -457,6 +466,7 @@ static HostLink *farlink(Engine *e, Arena scratch, FarHost *h)
     rc.name       = h->name;
     rc.ssh        = h->ssh;
     rc.wsl        = h->wsl;
+    rc.exec       = h->exec;
     rc.path       = trim(cfgown(c, "remote", h->name, "path"));
     rc.state      = trim(cfgown(c, "remote", h->name, "state"));
     rc.rconfig    = trim(cfgown(c, "remote", h->name, "config"));
@@ -853,7 +863,7 @@ static b32 farstart(Session *s, Arena scratch, iz k, Args *args, TaskRun *t)
     ask.plan       = planning(s);
     ask.title      = kid->title;
     ask.prefer     = farprefer(&scratch, s->home, s->homemodel);
-    ask.via        = h.wsl.len ? Str("wsl") : Str("ssh");
+    ask.via        = h.wsl.len ? Str("wsl") : h.exec.len ? Str("exec") : Str("ssh");
     ask.distro     = h.wsl;
     ask.relay      = l->token;
     ask.prompt     = args->prompt;

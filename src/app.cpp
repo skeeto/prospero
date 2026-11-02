@@ -1242,7 +1242,8 @@ struct Gui {
     b32                wslagain;   // and another is owed once it's done
     i32                wsllists;   // listings done
     char              *remname;    // the Hosts panel's new remote
-    char              *remssh;
+    char              *remssh;     // its ssh destination, or exec command
+    b32                remexec;    // which
     char              *rempath;
     Str                remstatus;  // and how adding it went
     b32                remok;
@@ -6824,6 +6825,16 @@ static Str remoteset(Gui *g, Str name, Str key)
     return v;
 }
 
+// How a remote reaches its machine: ssh, else wsl, else exec.
+static Reach remotelink(Gui *g, Str name)
+{
+    LinkTo t = {};
+    t.ssh  = remoteset(g, name, "ssh");
+    t.wsl  = remoteset(g, name, "wsl");
+    t.exec = remoteset(g, name, "exec");
+    return reachof(&t);
+}
+
 // Whether connecting to a remote deploys an engine there as needed:
 // unless its section says deploy = ask (the default is auto).
 static b32 remotedeploys(Gui *g, Str name)
@@ -6846,6 +6857,7 @@ static Slice<LinkTo> guiremotes(Gui *g, Arena *a)
             t.name = row->name;
             t.ssh  = trim(remoterow(g, row->name, "ssh"));
             t.wsl  = t.ssh.len ? Str{} : trim(remoterow(g, row->name, "wsl"));
+            t.exec = t.ssh.len || t.wsl.len ? Str{} : trim(remoterow(g, row->name, "exec"));
             r = push(a, r, t);
         }
     }
@@ -6930,12 +6942,14 @@ static TermPlan termplan(Gui *g, Arena *a, GuiSession *s, Str distro = {})
     }
     Slice<Str> cmd = {};
     if (h->kind == GH_REMOTE) {
-        Str ssh = remoteset(g, h->name, "ssh");
-        Str wsl = ssh.len ? Str{} : remoteset(g, h->name, "wsl");
-        if (ssh.len) {
-            cmd = termssh(a, Str("ssh"), ssh, dir, hostwin(h));
-        } else if (wsl.len) {
-            cmd = termwsl(a, Str("wsl.exe"), wsl, dir);
+        Reach l = remotelink(g, h->name);
+        if (l.ssh.len) {
+            cmd = termssh(a, Str("ssh"), l.ssh, dir, hostwin(h));
+        } else if (l.wsl.len) {
+            cmd = termwsl(a, Str("wsl.exe"), l.wsl, dir);
+        } else if (l.exec.len) {
+            r.why = "A terminal needs ssh or WSL, not an exec command";
+            return r;
         } else {
             r.why = "Its section names no ssh destination";
             return r;
@@ -7176,10 +7190,12 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
     if (h->r && !h->closing) {
         return h;
     }
+    Reach      l  = remotelink(g, name);
     RemoteConf rc = {};
     rc.name       = name;
-    rc.ssh        = remoteset(g, name, "ssh");
-    rc.wsl        = rc.ssh.len ? Str{} : remoteset(g, name, "wsl");
+    rc.ssh        = l.ssh;
+    rc.wsl        = l.wsl;
+    rc.exec       = l.exec;
     rc.path       = remoteset(g, name, "path");
     rc.state      = remoteset(g, name, "state");
     rc.rconfig    = remoteset(g, name, "config");
@@ -7191,15 +7207,16 @@ static GuiHost *remoteconnect(Gui *g, Arena scratch, Str name, b32 deploy = 0)
     if (rc.deploy) {
         deploystart(g, h);
     }
-    if (!rc.ssh.len && !rc.wsl.len &&
-            (remoteignored(g, name, "ssh") || remoteignored(g, name, "wsl"))) {
+    b32 none = !rc.ssh.len && !rc.wsl.len && !rc.exec.len;
+    if (none && (remoteignored(g, name, "ssh") || remoteignored(g, name, "wsl") ||
+                 remoteignored(g, name, "exec"))) {
         h->state = RS_FAILED;
-        h->msg   = "its ssh or wsl is set in an included file, which cannot "
-                   "choose what runs where: set it in your own file";
+        h->msg   = "its ssh, wsl or exec is set in an included file, which "
+                   "cannot choose what runs where: set it in your own file";
         return h;
-    } else if (!rc.ssh.len && !rc.wsl.len) {
+    } else if (none) {
         h->state = RS_FAILED;
-        h->msg   = "no ssh destination: set ssh (or wsl) in its section";
+        h->msg   = "no ssh destination: set ssh (or wsl, or exec) in its section";
         return h;
     }
     hostconnect(g, h, &rc, scratch);
@@ -7420,10 +7437,13 @@ static Str hostlabel(Gui *g, Arena *a, GuiHost *h)
         }
         break;
     case GH_REMOTE: {
-        Str ssh = remoteset(g, h->name, "ssh");
-        Str wsl = ssh.len ? Str{} : remoteset(g, h->name, "wsl");
+        Reach l   = remotelink(g, h->name);
+        Str  ssh = l.ssh;
+        Str  wsl = l.wsl;
         print(&b, h->name);
-        if (wsl.len) {
+        if (l.exec.len) {
+            print(&b, " (exec)");
+        } else if (wsl.len) {
             print(&b, " (WSL");
             if (wsl != h->name) {
                 print(&b, ": ");
@@ -8309,11 +8329,10 @@ static void guiupdate(Gui *g, GuiHost *h)
     if (h->kind!=GH_REMOTE || updating(h)) {
         return;
     }
-    Str ssh = remoteset(g, h->name, "ssh");
-    Str wsl = ssh.len ? Str{} : remoteset(g, h->name, "wsl");
-    if (!ssh.len && !wsl.len) {
+    Reach l = remotelink(g, h->name);
+    if (!l.ssh.len && !l.wsl.len && !l.exec.len) {
         h->updating = UPD_FAILED;
-        h->updmsg   = "no ssh destination: set ssh (or wsl) in its section";
+        h->updmsg   = "no ssh destination: set ssh (or wsl, or exec) in its section";
         return;
     }
     GuiDeploy *d = alloc<GuiDeploy>(&g->perm);  // kept: the thread may outlive a frame
@@ -8323,9 +8342,10 @@ static void guiupdate(Gui *g, GuiHost *h)
     d->perm            = os_reserve(g->os, (iz)1<<24);
     d->scratch         = os_reserve(g->os, 3*DEPLOY_MAXSIZE);
     d->conf.name       = clone(&g->perm, h->name);
-    d->conf.ssh        = clone(&g->perm, ssh);
-    d->conf.wsl        = clone(&g->perm, wsl);
-    d->conf.program    = linkprogram(g, &g->perm, wsl.len>0);
+    d->conf.ssh        = clone(&g->perm, l.ssh);
+    d->conf.wsl        = clone(&g->perm, l.wsl);
+    d->conf.exec       = clone(&g->perm, l.exec);
+    d->conf.program    = linkprogram(g, &g->perm, l.wsl.len>0);
     d->conf.scp        = os_getenv(g->os, &g->perm, "PROSPERO_TEST_SCP");
     d->conf.envpath    = guipath(g, &g->perm);
     d->conf.localstate = g->statedir;
@@ -8363,14 +8383,13 @@ static void guideploy(Gui *g, Str name)
 // which connecting uses instead of a deployed one.
 static Str deploywhy(Gui *g, GuiHost *h, Str name)
 {
-    Str ssh = remoteset(g, name, "ssh");
-    Str wsl = ssh.len ? Str{} : remoteset(g, name, "wsl");
+    Reach l = remotelink(g, name);
     if (h && updating(h)) {
         return "Deploying already";
-    } else if (!ssh.len && !wsl.len) {
-        return "Its section has no ssh destination (or wsl)";
-    } else if (linkbad(ssh, wsl).len) {
-        return linkbad(ssh, wsl);
+    } else if (!l.ssh.len && !l.wsl.len && !l.exec.len) {
+        return "Its section has no ssh destination (or wsl, or exec)";
+    } else if (linkbad(g->frame, l).len) {
+        return linkbad(g->frame, l);
     } else if (remoteset(g, name, "path").len) {
         return "Its section's path names the engine there, which connecting runs instead";
     }

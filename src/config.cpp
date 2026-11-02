@@ -605,6 +605,11 @@ static CfgKey cfgschema[] = {
     {"remote", "wsl", CFG_STRING, "", {}, {}, "remote",
      "Instead of ssh, a WSL distro on this Windows machine, by its name as "
      "wsl --list shows it, reached through wsl.exe"},
+    {"remote", "exec", CFG_STRING, "", {}, {}, "remote",
+     "Instead of ssh, a command that runs another on the machine, run here "
+     "without a shell (quote a word with spaces): docker exec -i NAME, say, "
+     "for a container that is already running, or podman, incus or kubectl "
+     "the same way. The machine needs /bin/sh"},
     {"remote", "path", CFG_STRING, "prospero", {}, {}, "remote",
      "The prospero executable there, a path or a name on its PATH; unset, "
      "the engine prospero deploy put there, else prospero"},
@@ -621,8 +626,9 @@ static CfgKey cfgschema[] = {
      "keeps it out of the list while it is disconnected"},
     {"remote", "subagents", CFG_BOOL, "true", {}, {}, "remote",
      "Whether this machine's agents may start subagents there (the task "
-     "tool's host), as their shell may run ssh or wsl.exe; an installed "
-     "WSL distro is such a host too, unless its section says no"},
+     "tool's host), as their shell may run ssh, wsl.exe or the exec "
+     "command; an installed WSL distro is such a host too, unless its "
+     "section says no"},
 
     {"mcp", "command", CFG_STRING, "", {}, {}, "mcp",
      "The server's program and its arguments, run without a shell (quote "
@@ -2075,12 +2081,16 @@ static void cfgvalidate(Config *c, Ini *ini, IniFile *user, Arena *perm)
                 cfgreport(ini, perm, e->file, e->line, INI_WARNING,
                           e->line->valbeg, msg);
             }
-            if (s->kind=="remote" && e->key=="wsl" && v.len && inientry(s, "ssh") &&
-                    trim(inientry(s, "ssh")->value).len) {
+            b32 sshset = inientry(s, "ssh") && trim(inientry(s, "ssh")->value).len;
+            b32 wslset = inientry(s, "wsl") && trim(inientry(s, "wsl")->value).len;
+            if (s->kind=="remote" && v.len && ((e->key=="wsl" && sshset) ||
+                                               (e->key=="exec" && (sshset || wslset)))) {
                 Str msg = {};
                 if (!cfgmuted(e->file)) {
-                    msg = "ssh is set too, which reaches the machine, so this "
-                          "is ignored";
+                    msg = sshset ? Str("ssh is set too, which reaches the machine, so "
+                                       "this is ignored")
+                                 : Str("wsl is set too, which reaches the machine, so "
+                                       "this is ignored");
                 }
                 cfgreport(ini, perm, e->file, e->line, INI_ERROR,
                           e->line->valbeg, msg);

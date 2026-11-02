@@ -59,6 +59,20 @@ the distro's, `/mnt/c/Users`. To have only the commands of a session
 on Windows run in a distro, give it a `[shell]` with `program = wsl`
 instead (Configuration).
 
+## A container, by a command
+
+A `[remote NAME]` with `exec` in place of `ssh` reaches a machine by a
+command that runs another inside it: `exec = docker exec -i fuzzbox`
+reaches a running container, and `podman exec -i`, `incus exec NAME
+--` or `kubectl exec -i POD --` work alike. The command runs here with
+no shell, its words split at blanks, and `'...'` or `"..."` keep one
+together. In the Hosts pane, Add remote takes one when its choice says
+command. The machine needs `/bin/sh`; the engine runs in its home
+directory, and deploying puts one there with `cat`, as into a WSL
+distro. A container with no network still works: a remote with no
+models of its own makes its model calls through this computer (below).
+A missing container fails at once, saying so, and isn't tried again.
+
 ## Sessions on a remote
 
 A host's menu in the sidebar also has New session here... and Import

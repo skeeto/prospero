@@ -42,6 +42,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -146,6 +147,26 @@ run(["sh" if os.name == "nt" else "/bin/sh", "-c", args[7]])
 """
 
 
+FAKEEXEC = R.FAKE + r"""
+# docker here: exec -i NAME /bin/sh -c CMD runs CMD with $FAKEHOME as its
+# home, its input passed through (cat, for uploads), for a NAME of
+# $FAKECTRS (comma-separated), else says what docker says of an unknown
+# container, on its errors
+args = sys.argv[1:]
+with open(os.path.join(os.environ["FAKELOG"], "exec.log"), "a", newline="") as f:
+    f.write(" ".join(args) + "\n")
+ctrs = [d for d in os.environ.get("FAKECTRS", "").split(",") if d]
+if len(args) != 6 or args[:2] != ["exec", "-i"] or args[3:5] != ["/bin/sh", "-c"]:
+    sys.stderr.write(f"fakeexec: unexpected {args}\n")
+    sys.exit(2)
+if args[2] not in ctrs:
+    sys.stderr.write(f"Error response from daemon: No such container: {args[2]}\n")
+    sys.exit(1)
+os.environ["HOME"] = os.environ["FAKEHOME"]
+run(["/bin/sh", "-c", args[5]])
+"""
+
+
 def localplatform():
     if os.name == "nt":
         # As the harness names Windows: x86-64 on Arm too, which runs it
@@ -177,6 +198,7 @@ class D(R.T):
         self.ssh = R.program(self, "fakessh", FAKESSH)
         self.scp = R.program(self, "fakescp", FAKESCP)
         self.wsl = R.program(self, "fakewsl", FAKEWSL)
+        self.docker = R.program(self, "fakedocker", FAKEEXEC)
         out = subprocess.run([self.prospero, "--version"], capture_output=True,
                              text=True).stdout.split()
         self.version = out[1]
@@ -185,7 +207,7 @@ class D(R.T):
         self.ename = f"prospero-engine-{self.version}-{self.platform}{self.exe}"
         self.rname = f"engine-0-{self.version}-{self.platform}{self.exe}"
         self.env = dict(self.env, FAKEHOME=self.home, FAKELOG=self.fakelog,
-                        FAKEDISTROS="Deb,docker-desktop")
+                        FAKEDISTROS="Deb,docker-desktop", FAKECTRS="box")
         # An empty configuration, never the user's own
         conf = os.path.join(self.root, "config")
         os.makedirs(conf)
@@ -270,6 +292,21 @@ class D(R.T):
     def wsllog(self):
         try:
             with open(os.path.join(self.fakelog, "wsl.log")) as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def execdeploy(self, *extra, ctr="box"):
+        """Deploy into the fake container box, by an exec command."""
+        argv = [self.prospero, "deploy", "--exec", f"{self.docker} exec -i {ctr}",
+                "--ssh-program", self.ssh, "--scp-program", self.scp, "--engines",
+                self.engines, "--state", self.local] + list(extra)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                              env=self.env)
+
+    def execlog(self):
+        try:
+            with open(os.path.join(self.fakelog, "exec.log")) as f:
                 return f.read()
         except OSError:
             return ""
@@ -856,6 +893,58 @@ def wsl_connect_deploy(t):
     t.check("There is no distribution" in f.get("msg", ""), f"failed {f}")
     t.check(c.p.wait(10) == 2, "exit 2")
     t.check(t.wsllog().count("-d Nope") == 1, f"tries {t.wsllog()!r}")
+
+
+@scenario
+def exec_fresh(t):
+    """Deploy by an exec command (a container's, here a fake docker):
+    uploaded over cat, as into WSL, with no scp, and recorded under
+    exec:COMMAND; again, nothing to upload."""
+    if os.name == "nt":
+        return "skip"
+    src = t.engine()
+    p = t.execdeploy()
+    t.check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    t.check(sha256(t.deployed()) == sha256(src), "the engine is there")
+    t.check(t.scps() == 0, f"{t.scps()} scp uploads")
+    log = t.execlog()
+    t.check("exec -i box /bin/sh -c cd; cat > .prospero/" in log, f"exec ran {log!r}")
+    name = "exec_" + re.sub(r"[^A-Za-z0-9_@.-]", "_", f"{t.docker} exec -i box")
+    rec = t.record(name)
+    t.check(rec.get("host") == f"exec:{t.docker} exec -i box" and
+            rec.get("path") == f".prospero/{t.rname}", f"record {rec}")
+    p = t.execdeploy()
+    t.check(p.returncode == 0 and t.execlog().count("cat >") == 1,
+            f"again: {p.stderr} {t.execlog()!r}")
+
+
+@scenario
+def exec_connect_deploy(t):
+    """[remote c] exec = docker exec -i box with deploy = auto: connect
+    deploys into the container, then a turn runs through it; a section
+    whose container is missing fails for good, at the first try."""
+    if os.name == "nt":
+        return "skip"
+    t.engine()
+    with open(t.config, "a") as f:
+        f.write(f"[remote c]\nexec = {t.docker} exec -i box\ndeploy = auto\n"
+                f"[remote gone]\nexec = {t.docker} exec -i nope\n")
+    common = ["-c", t.config, "--engines", t.engines, "--remote-state", t.state,
+              "--remote-config", t.config, "--state", t.local]
+    c = R.connect(t, ["c"] + common)
+    c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "up", what="up",
+           timeout=60)
+    t.check(os.path.isfile(t.deployed()), "deployed")
+    t.check(f"cd; .prospero/{t.rname} attach" in t.execlog(), f"ran {t.execlog()!r}")
+    t.turn(c)
+    c.call("quit")
+    t.check(c.close() == 0, "connect exits 0")
+    c = R.connect(t, ["gone"] + common)
+    f = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "failed",
+               what="failed", timeout=20)
+    t.check("No such container" in f.get("msg", ""), f"failed {f}")
+    t.check(c.p.wait(10) == 2, "exit 2")
+    t.check(t.execlog().count("exec -i nope") == 1, f"tries {t.execlog()!r}")
 
 
 def rsh(a, script):

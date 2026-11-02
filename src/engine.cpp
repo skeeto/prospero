@@ -785,7 +785,7 @@ struct Session {
     Str          pcall;      // and the call that started it
     Str          rparent;    // or a parent on another host (new {task}),
                              // which reads the task.report, with pcall
-    Str          rvia;       // and how that host reaches this one: wsl, ssh
+    Str          rvia;       // and how that host reaches this one: wsl, ssh, exec
     Str          rdistro;    // with wsl, this distro's name there
     Str          rrelay;     // and its link's token: its offer relays this
     Session     *parent;     // the parent, while both are in memory
@@ -13003,6 +13003,11 @@ static void buildprefix(Session *s, Arena scratch)
         s->system = concat(&s->perm, s->system,
             "\\home\\x there, and the Windows drives are under /mnt here "
             "(C:\\ is /mnt/c). Give it paths it can use.");
+    } else if (s->rparent.len && s->rvia=="exec") {
+        s->system = concat(&s->perm, s->system,
+            "\n\nThat agent runs outside this container (or machine), and "
+            "sees none of its files, except any it mounted here: what it "
+            "needs from your work must be in your report.");
     } else if (s->rparent.len) {
         s->system = concat(&s->perm, s->system,
             "\n\nThat agent runs on another machine, which shares no files "
@@ -14998,7 +15003,7 @@ struct NewTask {
     Str call;    // its task call
     Str title;
     Str prefer;  // the parent's ENDPOINT/MODEL, if this host has ENDPOINT
-    Str via;     // how that host reaches this one: wsl or ssh
+    Str via;     // how that host reaches this one: wsl, ssh or exec
     Str distro;  // with wsl, this distro's name there
     Str relay;   // the link's token, if it offers its models (relay.cpp)
     Str prompt;
@@ -15044,8 +15049,8 @@ static NewTask newtaskof(Json *t)
               !r.call.len || r.call.len>256
                                    ? Str("task.call must name the task call") :
               !trim(r.prompt).len  ? Str("task.prompt is empty") :
-              r.via!="wsl" && r.via!="ssh"
-                                   ? Str("task.via must be wsl or ssh") :
+              r.via!="wsl" && r.via!="ssh" && r.via!="exec"
+                                   ? Str("task.via must be wsl, ssh or exec") :
               r.distro.len && (r.via!="wsl" || !plainname(r.distro))
                                    ? Str("task.distro must be a WSL distro's name") :
               r.relay.len && !relaytoken(r.relay)

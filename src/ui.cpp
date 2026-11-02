@@ -5923,9 +5923,10 @@ static b32 hostwsl(Gui *g, GuiHost *h)
 // How Connect reaches a remote, for its tooltip.
 static char const *connecttip(Gui *g, Str name)
 {
-    return remoteset(g, name, "ssh").len || !remoteset(g, name, "wsl").len
-         ? "Connect over ssh, starting a host there if none runs"
-         : "Connect through wsl.exe, starting a host in the distro if none runs";
+    Reach l = remotelink(g, name);
+    return l.wsl.len  ? "Connect through wsl.exe, starting a host in the distro if none runs"
+         : l.exec.len ? "Connect by its command, starting a host there if none runs"
+                      : "Connect over ssh, starting a host there if none runs";
 }
 
 // Whether a remote shows in the sidebar while not connected: unless its
@@ -9442,10 +9443,23 @@ static void drawhosts(Gui *g)
     if (row) {
         ImGui::SameLine();
     }
+    ImGui::SetNextItemWidth(80*sc);
+    static char const *how[] = {"ssh", "command"};
+    i32 hw = g->remexec;
+    if (ImGui::Combo("##remhow", &hw, how, countof(how))) {
+        g->remexec = hw;
+    }
+    ImGui::SetItemTooltip("How it is reached: over ssh, or by a command that runs "
+                          "another there, docker exec -i NAME, say");
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(row ? 200*sc : -1);
-    ImGui::InputTextWithHint("##remssh", "ssh destination", g->remssh, FIELD_MAX);
+    ImGui::InputTextWithHint("##remssh", g->remexec ? "docker exec -i NAME"
+                                                    : "ssh destination",
+                             g->remssh, FIELD_MAX);
     itemrect(g, RECT_REMSSH);
-    ImGui::SetItemTooltip("user@host, or a host from ~/.ssh/config");
+    ImGui::SetItemTooltip(g->remexec ? "A command that runs another inside it, "
+                                       "without a shell; it needs /bin/sh there"
+                                     : "user@host, or a host from ~/.ssh/config");
     if (row) {
         ImGui::SameLine();
     }
@@ -9457,14 +9471,21 @@ static void drawhosts(Gui *g)
         Str name = trim({(u8 *)g->remname, (iz)__builtin_strlen(g->remname)});
         Str ssh  = trim({(u8 *)g->remssh, (iz)__builtin_strlen(g->remssh)});
         Str path = trim({(u8 *)g->rempath, (iz)__builtin_strlen(g->rempath)});
+        Reach l = {};
+        (g->remexec ? l.exec : l.ssh) = ssh;
+        Str bad = ssh.len ? linkbad(a, l) : Str{};
         if (!name.len || !ssh.len) {
-            g->remstatus = "A remote needs a name and an ssh destination";
+            g->remstatus = g->remexec ? Str("A remote needs a name and a command")
+                                      : Str("A remote needs a name and an ssh destination");
             g->remok     = 0;
-        } else if (ssh[0] == '-') {
-            g->remstatus = "An ssh destination cannot begin with -";
+        } else if (bad.len) {
+            Str msg = clone(&g->perm, bad);
+            msg.data[0] = msg.data[0]>='a' && msg.data[0]<='z' ? msg.data[0]-32
+                                                                 : msg.data[0];
+            g->remstatus = msg;
             g->remok     = 0;
         } else {
-            guiconfigset(g, "remote", name, "ssh", ssh);
+            guiconfigset(g, "remote", name, g->remexec ? Str("exec") : Str("ssh"), ssh);
             if (path.len) {
                 guiconfigset(g, "remote", name, "path", path);
             }
