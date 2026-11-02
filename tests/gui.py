@@ -1659,7 +1659,17 @@ class CtrWatch:
                 problems.append(f"{n}: binds {binds}, not its state alone")
             if not hc.get("Init"):
                 problems.append(f"{n}: no --init")
-            print(f"container {n}: network none, labelled, its state bound, --init")
+            vols = [m.get("Name") for m in j.get("Mounts", [])
+                    if m.get("Type") == "volume" and m.get("Destination") == "/work"]
+            if len(vols) != 1:
+                problems.append(f"{n}: /work is not a volume of its own")
+            elif subprocess.run([self.rt, "volume", "inspect", vols[0]],
+                                capture_output=True, timeout=30).returncode == 0:
+                subprocess.run([self.rt, "volume", "rm", vols[0]], capture_output=True,
+                               timeout=30)
+                problems.append(f"{n}: its /work volume was left")
+            print(f"container {n}: network none, labelled, its state bound, --init, "
+                  f"/work a volume")
         left = set(self.names()) - self.before
         for n in sorted(left):
             # Made during the run, so the window's: removed by name

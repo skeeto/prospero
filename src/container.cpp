@@ -13,7 +13,7 @@
 //       --label com.nullprogram.prospero.owner=OWNER --init
 //       --network none [--cpus N] [--memory M] [ARGS...]
 //       -v STATE:/prospero/state --tmpfs /prospero/state/run
-//       [-v FOLDER:/work] -w /work --entrypoint sleep IMAGE 2147483647
+//       -v FOLDER:/work|-v /work -w /work --entrypoint sleep IMAGE 2147483647
 //
 // where sleep keeps it running (under --init, which reaps the shells'
 // orphans and passes stop's SIGTERM on, so it stops at once), STATE is
@@ -21,14 +21,16 @@
 // container, and the tmpfs holds its socket (os_endpoint), as a socket
 // on a shared folder may not work. OWNER is a hash of this state
 // directory, so a test's state never sees the user's containers. A
-// folder is mounted at /work, or copied into it (cp FOLDER/. NAME:/work)
-// before it starts, or /work starts empty. The image is pulled first
-// when it is not here.
+// folder is mounted at /work, or else /work is a volume of its own, so
+// that it exists (Podman, unlike Docker, won't start in a missing
+// working directory), a folder copied into it (cp FOLDER/. NAME:/work)
+// before it starts, or empty. The image is pulled first when it is not
+// here.
 //
 // The window keeps each in <state>/containers/NAME/: container.ini, as
 // below, beside the state directory. Moving its last session to the
 // Trash stops it, restoring one starts it again, and deleting its last
-// session, emptying the Trash, or the Trash's purge removes it (rm -f)
+// session, emptying the Trash, or the Trash's purge removes it (rm -f -v)
 // and its directory; the engine inside never knows. The sessions it
 // held are kept in container.ini, so that the Trash shows them while
 // it is stopped.
@@ -307,10 +309,8 @@ static Slice<Str> ctrcreateargv(Arena *a, Ctr *c, Str owner, Str state, Str cpus
     r = push(a, r, concat(a, state, concat(a, ":", ctrstate)));
     r = push(a, r, Str("--tmpfs"));
     r = push(a, r, concat(a, ctrstate, "/run"));
-    if (c->workspace == CTR_MOUNT) {
-        r = push(a, r, Str("-v"));
-        r = push(a, r, concat(a, c->folder, ":/work"));
-    }
+    r = push(a, r, Str("-v"));
+    r = push(a, r, c->workspace==CTR_MOUNT ? concat(a, c->folder, ":/work") : Str("/work"));
     r = push(a, r, Str("-w"));
     r = push(a, r, Str("/work"));
     r = push(a, r, Str("--entrypoint"));
@@ -463,7 +463,7 @@ static Str ctrdo(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cmd)
 // it, under a rootful Linux daemon, may stay).
 static Str ctrremove(CtrRun *run, Arena *perm, Arena scratch, Ctr *c)
 {
-    Str why = ctrdo(run, perm, scratch, c, "rm -f");
+    Str why = ctrdo(run, perm, scratch, c, "rm -f -v");  // and its /work volume
     if (why.len && (find(why, "No such container")>=0 ||
                     find(why, "no such container")>=0)) {
         why = {};  // gone already

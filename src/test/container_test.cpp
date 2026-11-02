@@ -37,7 +37,8 @@ static void test_container(Test *t)
            "--label|com.nullprogram.prospero=1|"
            "--label|com.nullprogram.prospero.owner=f00d|--init|--network|none|"
            "--cpus|2|--cap-add=SYS_PTRACE|-v|/s/state:/prospero/state|"
-           "--tmpfs|/prospero/state/run|-w|/work|--entrypoint|sleep|debian:12|2147483647");
+           "--tmpfs|/prospero/state/run|-v|/work|-w|/work|--entrypoint|sleep|debian:12|"
+           "2147483647");
     c.workspace = CTR_MOUNT;
     c.folder    = "/h/src";
     c.network   = 1;
@@ -50,7 +51,7 @@ static void test_container(Test *t)
            "-v|/h/src:/work|-w|/work|--entrypoint|sleep|debian:12|2147483647");
     c.workspace = CTR_COPY;
     argv = ctrcreateargv(&a, &c, "f00d", "/s/state", {}, {}, {});
-    expect(t, "ctrcreate copy mounts none", istr(&a, find(joinwords(&a, argv), "/work|-w")<0),
+    expect(t, "ctrcreate copy, a volume", istr(&a, find(joinwords(&a, argv), "|-v|/work|-w|")>0),
            "1");
 
     // Reached as an exec remote, its words quoted
