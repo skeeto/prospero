@@ -73,6 +73,36 @@ distro. A container with no network still works: a remote with no
 models of its own makes its model calls through this computer (below).
 A missing container fails at once, saying so, and isn't tried again.
 
+## Containers made for sessions
+
+With Docker or Podman installed, Sessions lists it below the remotes,
+with no configuration: dimmed, saying why, while its daemon isn't
+running, and Look again (its menu, or Refresh) asks again. Its + opens
+New session for a container of the session's own:
+
+- **Image**: any Linux image, pulled first if it isn't here. Those
+  `[container] images` lists come first, then the images here.
+- **Workspace**: the agent works in `/work`, which is empty, a copy of
+  a folder here (what the agent changes stays in the container), or a
+  folder here mounted there (the agent changes it as it goes).
+- **Network access**: off by default (`[container] network`), so the
+  container reaches no network. Its model calls and web searches still
+  go through this computer, which relays them.
+
+Each container is a host of its own in the sidebar, its image and name
+as its label; the engine is deployed into it, as into any remote, and
+its sessions and logs are kept here, in the state directory, mounted at
+`/prospero/state`. Its last session moved to the Trash stops
+its container, and restoring one starts it again. Its menu's Stop
+container stops it while keeping its sessions, and Connect starts it;
+Delete container..., also in the Hosts pane's Containers, removes it
+and its sessions for good, as emptying the Trash or the Trash's purge
+after `trash_days` does. A mounted folder is never removed.
+
+`[container]` in your own file chooses the runtime (`docker`, `podman`,
+or a path), `cpus`, `memory` and further `args` for each new container,
+and `list = never` hides it all.
+
 ## Sessions on a remote
 
 A host's menu in the sidebar also has New session here... and Import

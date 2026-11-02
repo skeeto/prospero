@@ -31,6 +31,28 @@ container", "is not running" or "executable file not found". A window
 on a state directory that `prospero serve` hosts lists the sessions the
 host holds and attaches to them.
 
+The window also makes containers for sessions (src/container.cpp),
+with Docker or Podman, found on PATH or where their macOS installers
+put them, and asked `version` at start: no configuration is needed.
+Each is `prospero-NAME` (NAME `p-` and eight hex digits), labelled
+`com.nullprogram.prospero=1` and `...owner=` a hash of the state
+directory, so a test's state never sees another's. It is created with
+`--init --entrypoint sleep IMAGE 2147483647`, `--network none` unless
+asked, `/work` as its directory (a host folder bound there, or copied
+in with `cp` before it starts), and its state directory here,
+`STATE/containers/NAME/state`, bound at `/prospero/state` with a tmpfs
+over its `run` so that the host's socket never lands on a shared
+mount. `container.ini` beside it keeps the image, workspace, network
+and the sessions last listed, for the Trash while it is stopped. The
+window reaches it as the exec remote `ctr:NAME`, `RUNTIME exec -i
+prospero-NAME`, deployed as any exec remote is, its model calls
+relayed, and starts it first when it is stopped. Its Trash is the
+window's: the last session there stops it (`stop -t 5`), restoring one
+starts it, and Delete, emptying the Trash or the purge after the main
+host's `trash_days` runs `rm -f` and removes its directory. Making,
+starting and stopping run on threads of their own, their output in
+`STATE/containers/run.err` when one fails.
+
 A remote machine needs an engine built for its platform, which
 `prospero deploy` uploads with scp to `~/.prospero` there, as
 `engine-PROTO-VERSION-OS-ARCH`, verifies it by its SHA-256, and

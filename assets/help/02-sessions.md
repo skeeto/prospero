@@ -6,6 +6,10 @@ Session → New session... (Ctrl+N, Cmd+N on macOS), or New session
 here... in a host's menu in the sidebar, opens the New session dialog:
 
 - **Host**, when more than one is ready: where the session runs.
+  With Docker or Podman running, "Docker: a new container" makes a
+  container for the session, and the dialog asks for its image,
+  workspace and network in place of the directory (see
+  [Hosts](help:hosts)).
 - **Working directory**: the agent's project. Type it, pick one from
   Recent, or use Browse… for the system's folder dialog (on this
   computer only). A leading `~` is the home directory of the host the
@@ -282,6 +286,10 @@ menu, removes all of it, once you confirm. A host's engine keeps its
 own Trash, by its own configuration, and empties what is due when it
 starts and every hour. `trash_days = 0` turns the Trash off: deleting
 is then at once, once confirmed, and what was in the Trash goes.
+
+A container made for sessions keeps its Trash here instead: its last
+session moved there stops it, restoring one starts it again, and its
+sessions removed for good remove the container too.
 
 Removed, a session's log and files are deleted from the state
 directory, which is not a secure erasure: the disk, backups, and the
