@@ -8887,6 +8887,13 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
     } else if (ws != CTR_EMPTY && os_stat(g->os, g->frame, folder).type != STAT_DIR) {
         return "No such folder here";
     }
+    Arena a     = g->frame;
+    Str   noeng = ctrnoengine(g->os, &a, carve(&a, 1<<16));
+    if (noeng.len) {
+        noeng = clone(&a, noeng);  // as a sentence, for the dialog
+        noeng.data[0] = noeng[0]>='a' && noeng[0]<='z' ? (u8)(noeng[0]-32) : noeng[0];
+        return noeng;
+    }
     GuiCtr *c = alloc<GuiCtr>(&g->perm);
     c->c.name      = ctrnewname(g->os, &g->perm);
     c->c.runtime   = g->ctrrt.name;

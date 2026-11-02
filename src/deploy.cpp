@@ -1021,6 +1021,57 @@ static Slice<Str> enginesdirs(Os *os, Arena *a, Str exe)
     return r;
 }
 
+// Whether deploying to a platform (deployuname's name for it) would find
+// an engine here: this program's own, an embedded one, or one in an
+// engines directory, as deploysteps looks.
+static b32 deployhasengine(Os *os, Arena scratch, Str engines, Str platform)
+{
+    if (platform==deployself() || engineszip().len) {
+        return 1;
+    }
+    Str        exe  = os_exepath(os, &scratch);
+    Slice<Str> dirs = {};
+    dirs = engines.len ? push(&scratch, dirs, engines) : enginesdirs(os, &scratch, exe);
+    Str         ext = startswith(platform, "windows") ? Str(".exe") : Str("");
+    DeployNames n   = deploynames(&scratch, platform, ext);
+    for (iz i = 0; i < dirs.len; i++) {
+        Str path = join(&scratch, dirs[i], n.engine);
+        if (os_stat(os, scratch, path).type == STAT_FILE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Why there is no engine for a platform here, in a Community build,
+// which carries only its own: the Professional Edition bundles engines
+// for other platforms (though not every one). Null in the Professional
+// Edition, whose own reasons say more.
+static Str deploynoengine(Arena *a, Str platform)
+{
+#if PROSPERO_ITCH
+    (void)a;
+    (void)platform;
+    return {};
+#else
+    Cut  p    = cut(platform, '-');
+    Str  name = p.head=="linux" ? Str("Linux") : p.head=="macos" ? Str("macOS")
+              : p.head=="windows" ? Str("Windows") : p.head;
+    Buf  b(a, 160 + platform.len);
+    print(&b, "no engine here for ");
+    print(&b, name);
+    if (p.tail.len) {
+        print(&b, " (");
+        print(&b, p.tail);
+        print(&b, ")");
+    }
+    print(&b, ": the Community Edition deploys only its own platform's engine, "
+              "and the Professional Edition bundles engines for others: "
+              "https://skeeto.itch.io/prospero");
+    return finish(&b);
+#endif
+}
+
 // Read a program to upload, from dir/file, or else from self when it
 // is not there and self is not empty. Its place there is .prospero/
 // rname. Null if ok, else why not (unless it is just missing: err).
@@ -1362,7 +1413,10 @@ static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str 
         err      = deployread(os, &scratch, &eng, from, names.engine,
                               i+1==dirs.len ? self : Str{}, names.rengine, pf.shell);
     }
-    if (eng.err == READ_NOTFOUND) {
+    Str ce = deploynoengine(&scratch, pf.name);
+    if (eng.err==READ_NOTFOUND && ce.len) {
+        return deployfail(&d, perm, scratch, ce);  // Community: no other advice
+    } else if (eng.err == READ_NOTFOUND) {
         b = Buf(&scratch, 512);
         print(&b, "no engine for ");
         print(&b, pf.name);
@@ -1375,14 +1429,7 @@ static Deployed deploysteps(Deploy d, Arena *perm, Arena scratch, Str dest, Str 
             print(&b, i ? Str(" nor ") : Str(""));
             print(&b, dirs[i]);
         }
-#if !PROSPERO_ITCH
-        // As a Community build finds it: it carries no engines
-        print(&b, ": the Professional Edition carries every engine, or "
-                  "tools/engines.py builds one, into an engines directory "
-                  "beside prospero.ini");
-#else
         print(&b, " (tools/engines.py builds it)");
-#endif
         return deployfail(&d, perm, scratch, finish(&b));
     } else if (err.len) {
         return deployfail(&d, perm, scratch, err);

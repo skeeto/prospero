@@ -466,13 +466,22 @@ def other_build(t):
     t.check(c.close() == 0, "connect exits 0")
 
 
+def noengine(said, platform="linux-sparc64"):
+    """Whether said is deploy's failure for a platform with no engine
+    here: a Community build's, which points to the Professional Edition,
+    or else one that names it and tools/engines.py."""
+    osname, arch = platform.split("-", 1)
+    ce = f"no engine here for {osname.capitalize()} ({arch})"
+    return (ce in said and "Professional Edition" in said) or \
+        (f"no engine for {platform}" in said and "tools/engines.py" in said)
+
+
 @scenario
 def no_engine(t):
     """A platform the engines directory has nothing for: a clear error."""
     p = t.deploy(env=dict(t.env, FAKEUNAME="Linux sparc64"))
     t.check(p.returncode == 1, f"exit {p.returncode}")
-    t.check("no engine for linux-sparc64" in p.stderr and "tools/engines.py" in p.stderr,
-            f"stderr {p.stderr}")
+    t.check(noengine(p.stderr), f"stderr {p.stderr}")
     t.check(not os.path.exists(os.path.join(t.local, "deploy", "here.ini")), "recorded")
 
 
@@ -517,9 +526,11 @@ def config_engines(t):
     q = subprocess.run(argv, capture_output=True, text=True, timeout=120,
                        env=dict(t.env, FAKEUNAME="Linux sparc64"))
     said = q.stderr.replace("\\", "/")  # Windows' paths, joined with /
-    t.check(q.returncode != 0 and "is in neither" in said and
-            os.path.join(bindir, "engines").replace("\\", "/") in said and
-            there.replace("\\", "/") in said, f"neither: {q.stderr}")
+    named = "is in neither" in said and \
+        os.path.join(bindir, "engines").replace("\\", "/") in said and \
+        there.replace("\\", "/") in said
+    ce = "no engine for" not in said and noengine(said)  # Community: no places
+    t.check(q.returncode != 0 and (named or ce), f"neither: {q.stderr}")
 
 
 @scenario
@@ -648,8 +659,8 @@ def auto_config(t):
                   env=dict(t.env, FAKEUNAME="Linux sparc64"))
     f = c.wait(lambda r: r.get("ev") == "remote" and r.get("state") == "failed",
                what="failed", timeout=60)
-    t.check("cannot deploy an engine: no engine for linux-sparc64" in f.get("msg", ""),
-            f"failed {f}")
+    msg = f.get("msg", "")
+    t.check(msg.startswith("cannot deploy an engine: ") and noengine(msg), f"failed {f}")
     t.check(c.p.wait(10) == 2, "exit 2")
 
 

@@ -128,6 +128,26 @@ static CtrRuntime ctrfind(Os *os, Arena *perm, Arena scratch, Str setting, Str p
     return r;
 }
 
+// An image's architecture as the engines name it, or null if no engine
+// is made for it.
+static Str ctrarch(Str arch)
+{
+    return arch=="amd64" || arch=="x86_64" ? Str("x86_64")
+         : arch=="arm64" || arch=="aarch64" ? Str("aarch64") : Str{};
+}
+
+// Why no Linux engine of any architecture is here, else null: so that
+// asking for a container fails before anything is made or pulled.
+static Str ctrnoengine(Os *os, Arena *perm, Arena scratch)
+{
+    if (deployhasengine(os, scratch, {}, "linux-aarch64") ||
+            deployhasengine(os, scratch, {}, "linux-x86_64")) {
+        return {};
+    }
+    Str ce = deploynoengine(perm, "linux");
+    return ce.len ? ce : Str("no engine here for Linux (tools/engines.py builds one)");
+}
+
 // The runtime's name for people: Docker or Podman.
 static Str ctrtitle(Str runtime)
 {
@@ -501,7 +521,7 @@ static Str ctrcreate(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cpus,
     argv = push(&scratch, argv, Str("image"));
     argv = push(&scratch, argv, Str("inspect"));
     argv = push(&scratch, argv, Str("--format"));
-    argv = push(&scratch, argv, Str("{{.Os}}"));
+    argv = push(&scratch, argv, Str("{{.Os}} {{.Architecture}}"));
     argv = push(&scratch, argv, c->image);
     DeployRun r = ctrrun(run, &scratch, argv, CTR_STEPTIME);
     if (r.code != 0) {
@@ -520,13 +540,23 @@ static Str ctrcreate(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cpus,
         }
         r = ctrrun(run, &scratch, argv, CTR_STEPTIME);
     }
-    Str ios = trim(r.out);
+    Cut io  = cut(trim(r.out), ' ');
+    Str ios = trim(io.head);
     if (r.code==0 && ios.len && ios!="linux") {
         b = Buf(perm, 64 + ios.len);
         print(&b, "the image is for ");
         print(&b, ios);
         print(&b, ", and only Linux images can run an engine");
         return finish(&b);
+    }
+    // An engine for its architecture, before making anything
+    Str arch = ctrarch(trim(io.tail));
+    if (r.code==0 && arch.len) {
+        Str pf = concat(&scratch, "linux-", arch);
+        if (!deployhasengine(os, scratch, run->conf.engines, pf)) {
+            Str ce = deploynoengine(perm, pf);
+            return ce.len ? ce : concat(perm, "no engine here for ", pf);
+        }
     }
 
     // The container
