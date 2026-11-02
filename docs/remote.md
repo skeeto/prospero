@@ -5,7 +5,8 @@ removing its registration, on SIGTERM, SIGINT or SIGHUP, or on Windows
 Ctrl+C or Ctrl+Break at its console.
 
 A `[remote NAME]` section names a machine reached over ssh, and the
-window's Hosts panel adds one and connects to it. Prospero there runs
+window's Settings adds one (Add remote..., also in the Hosts panel),
+and its Hosts panel connects to it. Prospero there runs
 as `prospero attach`, started over `ssh -T`, which starts a host that
 outlives the ssh session. A link that breaks is taken up again from
 where it was, and the host keeps a client's place for three hours. A

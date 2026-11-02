@@ -203,6 +203,8 @@ enum : i32 {
     RECT_OTHERSESS,
     RECT_ADDNAME,
     RECT_ADDBTN,
+    RECT_ADDDEST,    // a new remote's destination and prospero
+    RECT_ADDPATH,
     RECT_THEMECOMBO,
     RECT_LONGFIELD,  // a setting's field holding more than its slack
     RECT_TODO,       // the todo list's items
@@ -230,9 +232,6 @@ enum : i32 {
     RECT_HOST3,
     RECT_CONNECT,    // the Hosts panel's first remote: Connect or Disconnect
     RECT_CONNECT2,   // and its second's
-    RECT_REMNAME,    // its new remote's fields and Add
-    RECT_REMSSH,
-    RECT_REMADD,
     RECT_OUTPUT,     // the latest tool row's Output
     RECT_THUMB,      // the latest screenshot's thumbnail drawn
     RECT_SHOTCLOSE,  // the Screenshot window's title bar X, floating
@@ -248,9 +247,11 @@ enum : i32 {
     RECT_CFGFIND,    // its search field
     RECT_CFGCLEAR,   // and the X that empties it
     RECT_ADDOPEN,    // its Add for each named kind, in order: endpoint,
-    RECT_ADDOPEN1,   // model, role, remote
+    RECT_ADDOPEN1,   // model, role, shell, remote, mcp
     RECT_ADDOPEN2,
     RECT_ADDOPEN3,
+    RECT_ADDOPEN4,
+    RECT_ADDOPEN5,
     RECT_DELETE,     // the page's Delete, and its confirmation's buttons
     RECT_DELOK,
     RECT_DELCANCEL,
@@ -1290,12 +1291,9 @@ struct Gui {
     b32                ctrimging;  // listing them now
     GuiCtr            *ctrs;       // the state directory's containers
     i64                ctrchecked; // when the Trash's were last purged (ms)
-    char              *remname;    // the Hosts panel's new remote
-    char              *remssh;     // its ssh destination, or exec command
+    char              *remdest;    // a new remote's ssh destination, or exec command
     b32                remexec;    // which
-    char              *rempath;
-    Str                remstatus;  // and how adding it went
-    b32                remok;
+    char              *rempath;    // and its prospero, all New section's
     GuiHost           *newhost;    // the new session's host
     OutFile            out;        // the Output window's file
     PlanFile           plan;       // the Plan window's
@@ -11895,6 +11893,8 @@ enum : i32 {
     T_SESSTITLE,   // the sidebar's session whose title starts with text
     T_ADDNAME,     // the new endpoint's name field
     T_ADDBTN,      // "Add endpoint"
+    T_ADDDEST,     // a new remote's destination and prospero
+    T_ADDPATH,
     T_THEMECOMBO,  // the theme's list in the settings window
     T_THEMEITEM,   // the theme named by text, in that list once open
     T_LONGFIELD,   // a setting's field holding more than its slack
@@ -14453,6 +14453,31 @@ static DriveOp settingsops[] = {
     {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "model fresh"},
     {OP_CHECK, CHK_NOHSCROLL, 0, 0, 0, ""},
+    // A new remote: reached how and where, asked as it is named
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_SHOWPAGE, 0, 0, 0, 300, "add remote"},
+    {OP_MOVE, T_ADDOPEN, 0, 0, 100, "remote"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_MOVE, T_ADDNAME, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "box"},
+    {OP_MOVE, T_ADDDEST, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "me@box.example"},
+    {OP_MOVE, T_ADDPATH, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_TEXT, 0, 0, 0, 200, "~/bin/prospero"},
+    {OP_SHOT, 0, 0, 0, 300, "add-remote"},
+    {OP_MOVE, T_ADDBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PAGE, 0, 0, 0, "remote box"},
     // A remote's page
     {OP_SHOWPAGE, 0, 0, 0, 300, "remote far"},
     {OP_MOVE, T_PAGEITEM, 0, 0, 100, "remote far"},
@@ -16812,6 +16837,8 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_SETTING:     return rectcenter(g->rects[RECT_SETTING]);
     case T_ADDNAME:     return rectcenter(g->rects[RECT_ADDNAME]);
     case T_ADDBTN:      return rectcenter(g->rects[RECT_ADDBTN]);
+    case T_ADDDEST:     return rectcenter(g->rects[RECT_ADDDEST]);
+    case T_ADDPATH:     return rectcenter(g->rects[RECT_ADDPATH]);
     case T_CLOSESTOP:   return rectcenter(g->rects[RECT_CLOSESTOP]);
     case T_CLOSECANCEL: return rectcenter(g->rects[RECT_CLOSECANCEL]);
     case T_OTHERSESS:   return rectcenter(g->rects[RECT_OTHERSESS]);
@@ -16893,7 +16920,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
                 if (!jsonint(jsonget(k, "named"), 0)) {
                     continue;
                 } else if (jsonstr(jsonget(k, "kind")) == text) {
-                    return n<4 ? rectcenter(g->rects[RECT_ADDOPEN+n]) : v2(-1, -1);
+                    return n<6 ? rectcenter(g->rects[RECT_ADDOPEN+n]) : v2(-1, -1);
                 }
                 n++;
             }
@@ -21200,12 +21227,11 @@ static i32 gui_main(Os *os, Arena mem, Str *args, i32 nargs)
     g->cfgfbuf    = alloc<u8>(&g->perm, 3*FIELD_MAX);
     g->tplname    = alloc<char>(&g->perm, FIELD_MAX);
     g->tplval     = alloc<char>(&g->perm, FIELD_MAX);
-    g->remname    = alloc<char>(&g->perm, FIELD_MAX);
     g->findbuf    = alloc<char>(&g->perm, FIELD_MAX);
     g->search     = newsearch(&g->perm, os_reserve(os, 256*mb), os_reserve(os, 256*mb),
                               FIELD_MAX);
     g->drivecodemsg = -1;
-    g->remssh     = alloc<char>(&g->perm, FIELD_MAX);
+    g->remdest    = alloc<char>(&g->perm, FIELD_MAX);
     g->rempath    = alloc<char>(&g->perm, FIELD_MAX);
     g->hosts      = addhost(g, GH_ENGINE, "");
     g->main       = g->hosts;

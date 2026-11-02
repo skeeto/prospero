@@ -248,7 +248,7 @@ static CfgKind cfgkinds[] = {
     {"desktop",  0, "The desktop tool: seeing the screen, and the mouse and keyboard"},
     {"web",      0, "Web search and reading web pages: the web_search and web_fetch tools"},
     {"host",     0, "The engine as a background host (prospero serve)"},
-    {"remote",   1, "An engine on another machine, reached over ssh, or in a WSL distro"},
+    {"remote",   1, "An engine on another machine, reached over ssh, by a command, or in a WSL distro"},
     {"container", 0, "Container sessions: Docker or Podman containers made for sessions"},
     {"mcp",      1, "An MCP server, whose tools the agent may use"},
 };

@@ -53,7 +53,8 @@ llama.cpp server on this machine as an example.
 Changes apply while Prospero runs. A mistake is reported in the
 settings' Diagnostics page, and a bad value falls back to its default.
 
-To run the agent on another machine, add it in the Hosts pane; see
+To run the agent on another machine, add it in Settings, under
+Remotes, or with Add remote... in the Hosts pane; see
 [Hosts and remotes](help:hosts).
 
 ## Starting a session

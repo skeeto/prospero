@@ -9591,6 +9591,15 @@ static b32 samelineif(f32 w)
 static b32  cfghas(Gui *, Str, Str);
 static void cfgselect(Gui *, Str, Str);
 
+// Settings shown, with its New section dialog open for kind, a string
+// that outlives the frame.
+static void addsection(Gui *g, Str kind)
+{
+    g->addkind = kind;
+    g->openadd = 1;
+    setpane(g, PANE_SETTINGS, 1);
+}
+
 // Hosts
 
 // A configured remote host's line: a dot in the color of its connection,
@@ -9709,11 +9718,10 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
 
 // This process's engine, the background hosts on this machine, and the
 // remote ones of the configuration: how each is, connecting and leaving
-// them, and a new remote added to the configuration.
+// them, and Add remote, which opens Settings' dialog for one.
 static void drawhosts(Gui *g)
 {
     Arena a     = g->frame;
-    f32   sc    = g->scale;
     i64   nowms = os_time(g->os);
     if (g->enginekind == ENGINE_FAKE) {
         ImGui::TextDisabled("No engine: the fake agent has no hosts.");
@@ -9788,12 +9796,19 @@ static void drawhosts(Gui *g)
         }
     }
     if (!names.len) {
-        ImGui::TextDisabled("None yet: add one below.");
+        ImGui::TextDisabled("None yet");
     }
     for (iz n = 0; n < names.len; n++) {
         // The first two's buttons, for the checklist
         drawremote(g, a, names[n], n<2 ? RECT_CONNECT+(i32)n : -1);
     }
+    // A new one is a section of the configuration, added in Settings
+    if (ImGui::SmallButton("Add remote...")) {
+        addsection(g, "remote");
+    }
+    itemnamed(g, "hosts add remote");
+    itemtip("Add a [remote NAME] section in Settings: a machine reached over "
+            "ssh, or by a command that runs another there");
 
     // Containers made for sessions, and the runtime that runs them
     if (g->ctrrt.path.len || g->ctrs) {
@@ -9844,73 +9859,6 @@ static void drawhosts(Gui *g)
         }
     }
 
-    // A new one, which the configuration keeps: its fields side by side
-    // when they fit, else one above another
-    ImGui::SeparatorText("Add a remote host");
-    b32 row = ImGui::GetContentRegionAvail().x >= 440*sc;
-    ImGui::SetNextItemWidth(row ? 120*sc : -1);
-    ImGui::InputTextWithHint("##remname", "name", g->remname, FIELD_MAX);
-    itemrect(g, RECT_REMNAME);
-    if (row) {
-        ImGui::SameLine();
-    }
-    ImGui::SetNextItemWidth(80*sc);
-    static char const *how[] = {"ssh", "command"};
-    i32 hw = g->remexec;
-    if (ImGui::Combo("##remhow", &hw, how, countof(how))) {
-        g->remexec = hw;
-    }
-    itemtip("How it is reached: over ssh, or by a command that runs "
-                          "another there, docker exec -i NAME, say");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(row ? 200*sc : -1);
-    ImGui::InputTextWithHint("##remssh", g->remexec ? "docker exec -i NAME"
-                                                    : "ssh destination",
-                             g->remssh, FIELD_MAX);
-    itemrect(g, RECT_REMSSH);
-    itemtip(g->remexec ? "A command that runs another inside it, "
-                                       "without a shell; it needs /bin/sh there"
-                                     : "user@host, or a host from ~/.ssh/config");
-    if (row) {
-        ImGui::SameLine();
-    }
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("##rempath", "prospero there (optional)", g->rempath, FIELD_MAX);
-    b32 add = ImGui::Button("Add remote");
-    itemrect(g, RECT_REMADD);
-    if (add) {
-        Str name = trim({(u8 *)g->remname, (iz)__builtin_strlen(g->remname)});
-        Str ssh  = trim({(u8 *)g->remssh, (iz)__builtin_strlen(g->remssh)});
-        Str path = trim({(u8 *)g->rempath, (iz)__builtin_strlen(g->rempath)});
-        Reach l = {};
-        (g->remexec ? l.exec : l.ssh) = ssh;
-        Str bad = ssh.len ? linkbad(a, l) : Str{};
-        if (!name.len || !ssh.len) {
-            g->remstatus = g->remexec ? Str("A remote needs a name and a command")
-                                      : Str("A remote needs a name and an ssh destination");
-            g->remok     = 0;
-        } else if (bad.len) {
-            Str msg = clone(&g->perm, bad);
-            msg.data[0] = msg.data[0]>='a' && msg.data[0]<='z' ? msg.data[0]-32
-                                                                 : msg.data[0];
-            g->remstatus = msg;
-            g->remok     = 0;
-        } else {
-            guiconfigset(g, "remote", name, g->remexec ? Str("exec") : Str("ssh"), ssh);
-            if (path.len) {
-                guiconfigset(g, "remote", name, "path", path);
-            }
-            g->remstatus = clone(&g->perm, concat(&a, concat(&a, "Added [remote ", name), "]"));
-            g->remok     = 1;
-            g->remname[0] = g->remssh[0] = g->rempath[0] = 0;
-        }
-    }
-    if (g->remstatus.len) {
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, g->remok ? g->pal->ok : g->pal->bad);
-        ImGui::TextWrapped("%s", cstr0(&a, g->remstatus));
-        ImGui::PopStyleColor();
-    }
     g->hostshscroll = ImGui::GetScrollMaxX();  // for the checklist
     g->hostsframe   = g->total.frames;
 }
@@ -10300,7 +10248,7 @@ static void drawcfglist(Gui *g, b32 combo)
         Str  what = finish(&ab);
         b32  add  = cfgitem(g, a, combo, what, 0, jsonstr(jsonget(k, "desc")),
                             ImGui::GetColorU32(ImGuiCol_TextDisabled), &at);
-        if (group < 4) {
+        if (group < 6) {
             g->rects[RECT_ADDOPEN+group] = at;
         }
         cfgreveal(g, concat(&a, "add ", kind), 0);
@@ -10881,7 +10829,8 @@ static void cfgseed(Str kind, Str name, Str *key, Str *val)
                               Str("read write edit shell");
 }
 
-// A new named section: its name, then its page.
+// A new named section: its name, then its page. A remote's asks how it
+// is reached as well, over ssh or by a command, and where prospero is.
 static void drawcfgadd(Gui *g)
 {
     Arena a  = g->frame;
@@ -10889,7 +10838,7 @@ static void drawcfgadd(Gui *g)
     if (g->openadd) {
         ImGui::OpenPopup("New section");
         g->openadd    = 0;
-        g->addname[0] = 0;
+        g->addname[0] = g->remdest[0] = g->rempath[0] = 0;
         g->adderr     = {};
     }
     ImGui::SetNextWindowSize(v2(380*sc, 0));
@@ -10897,12 +10846,18 @@ static void drawcfgadd(Gui *g)
         return;
     }
     Str kind = g->addkind;
+    b32 rem  = kind == "remote";
     Str key  = {};
     Str val  = {};
     cfgseed(kind, "NAME", &key, &val);
     ImGui::PushTextWrapPos(0);
-    ImGui::Text("A new [%s NAME] section, which starts as %s = %s:",
-                cstr0(&a, kind), cstr0(&a, key), cstr0(&a, val));
+    if (rem) {
+        ImGui::TextUnformatted("A new [remote NAME] section: a machine reached "
+                               "over ssh, or by a command that runs another there");
+    } else {
+        ImGui::Text("A new [%s NAME] section, which starts as %s = %s:",
+                    cstr0(&a, kind), cstr0(&a, key), cstr0(&a, val));
+    }
     ImGui::PopTextWrapPos();
     if (ImGui::IsWindowAppearing()) {
         ImGui::SetKeyboardFocusHere();
@@ -10911,6 +10866,31 @@ static void drawcfgadd(Gui *g)
     b32 enter = ImGui::InputTextWithHint("##addname", "NAME", g->addname, FIELD_MAX,
                                          ImGuiInputTextFlags_EnterReturnsTrue);
     itemrect(g, RECT_ADDNAME);
+    if (rem) {
+        static char const *how[] = {"ssh", "command"};
+        i32 hw = g->remexec;
+        ImGui::SetNextItemWidth(100*sc);
+        if (ImGui::Combo("##remhow", &hw, how, countof(how))) {
+            g->remexec = hw;
+        }
+        itemtip("How it is reached: over ssh, or by a command that runs "
+                "another there, docker exec -i NAME, say");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        enter |= ImGui::InputTextWithHint("##remdest", g->remexec ? "docker exec -i NAME"
+                                                                  : "ssh destination",
+                                          g->remdest, FIELD_MAX,
+                                          ImGuiInputTextFlags_EnterReturnsTrue);
+        itemrect(g, RECT_ADDDEST);
+        itemtip(g->remexec ? "A command that runs another inside it, without a "
+                             "shell; it needs /bin/sh there"
+                           : "user@host, or a host from ~/.ssh/config");
+        ImGui::SetNextItemWidth(-1);
+        enter |= ImGui::InputTextWithHint("##rempath", "prospero there (optional)",
+                                          g->rempath, FIELD_MAX,
+                                          ImGuiInputTextFlags_EnterReturnsTrue);
+        itemrect(g, RECT_ADDPATH);
+    }
     if (g->adderr.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
         ImGui::TextWrapped("%s", cstr0(&a, g->adderr));
@@ -10938,6 +10918,29 @@ static void drawcfgadd(Gui *g)
             cfgselect(g, kind, name);
             g->cfgshowsel = 1;
             ImGui::CloseCurrentPopup();
+        } else if (rem) {
+            Str   dest = trim({(u8 *)g->remdest, (iz)__builtin_strlen(g->remdest)});
+            Str   path = trim({(u8 *)g->rempath, (iz)__builtin_strlen(g->rempath)});
+            Reach l    = {};
+            (g->remexec ? l.exec : l.ssh) = dest;
+            Str bad = dest.len ? linkbad(a, l) : Str{};
+            if (!dest.len) {
+                g->adderr = g->remexec ? Str("A remote needs a command")
+                                       : Str("A remote needs an ssh destination");
+            } else if (bad.len) {
+                Str msg = clone(&g->perm, bad);
+                msg.data[0] = msg.data[0]>='a' && msg.data[0]<='z' ? msg.data[0]-32
+                                                                     : msg.data[0];
+                g->adderr = msg;
+            } else {
+                guiconfigset(g, kind, name, g->remexec ? Str("exec") : Str("ssh"), dest);
+                if (path.len) {
+                    guiconfigset(g, kind, name, "path", path);
+                }
+                cfgselect(g, kind, name);
+                g->cfgshowsel = 1;
+                ImGui::CloseCurrentPopup();
+            }
         } else {
             cfgseed(kind, name, &key, &val);
             guiconfigset(g, kind, name, key, val);
@@ -12225,7 +12228,8 @@ static void drawmenubar(Gui *g)
             ImGui::EndDisabled();
         }
         ImGui::Separator();
-        if (menuitem(g, a, "Settings...", {}, cmdkey(g, &a, ","))) {
+        char const *setkey = cmdkey(g, &a, ",");  // before a is copied
+        if (menuitem(g, a, "Settings...", {}, setkey)) {
             opensettings(g);
         }
         ImGui::Separator();

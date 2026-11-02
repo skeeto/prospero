@@ -24,11 +24,12 @@ again looks for new ones.
 
 ## Remote hosts
 
-A remote host is a machine reached over ssh. Add one in the Hosts
-pane, under Add a remote host: a name, an ssh destination
-(`user@host`, or a Host from `~/.ssh/config`), and optionally where
-`prospero` is there. Add remote writes a `[remote NAME]` section to
-your configuration.
+A remote host is a machine reached over ssh. Add one with Add
+remote... under Remotes in Settings, or in the Hosts pane: a name, an
+ssh destination (`user@host`, or a Host from `~/.ssh/config`), and
+optionally where `prospero` is there. It writes a `[remote NAME]`
+section to your configuration, whose page in Settings shows how the
+host is, with Connect and Deploy engine, as the Hosts pane does.
 
 Connect, in the Hosts pane or the host's menu in the sidebar, runs
 `ssh` and `prospero attach` there, which starts a host that outlives
@@ -66,7 +67,7 @@ command that runs another inside it: `exec = docker exec -i fuzzbox`
 reaches a running container, and `podman exec -i`, `incus exec NAME
 --` or `kubectl exec -i POD --` work alike. The command runs here with
 no shell, its words split at blanks, and `'...'` or `"..."` keep one
-together. In the Hosts pane, Add remote takes one when its choice says
+together. Add remote... takes one when its choice says
 command. The machine needs `/bin/sh`; the engine runs in its home
 directory, and deploying puts one there with `cat`, as into a WSL
 distro. A container with no network still works: a remote with no

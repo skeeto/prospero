@@ -2009,19 +2009,20 @@ def main():
         if "[ui]\ntheme = light\n" not in after:
             problems.append("the theme was not saved as light under [ui]")
         # The edits, in order: the long value, the theme, notify, the roots, the
-        # deleted endpoint with its comment, the new model
+        # deleted endpoint with its comment, the new model and remote
         want = before.replace(f"prompt = {LONG_PROMPT}\n", f"prompt = {LONG_PROMPT}!\n")
         want = want.replace("temp = ask\n", "temp = ask\nroots = ~/a; ~/b\n")
         want = want.replace(SETTINGS_GONE + "\n", "")
         want += ("\n[ui]\ntheme = light\nnotify = allow\n"
-                 "\n[model fresh]\nreasoning = reasoning_content\n")
+                 "\n[model fresh]\nreasoning = reasoning_content\n"
+                 "\n[remote box]\nssh = me@box.example\npath = ~/bin/prospero\n")
         if after != want:
             diff = difflib.unified_diff(want.splitlines(), after.splitlines(),
                                         "expected", "saved", lineterm="", n=1)
             problems.append("the configuration is not the edits alone:\n" + "\n".join(diff))
         else:
             print("configuration: the long value, the theme, notify, the roots, a section "
-                  "deleted and one added, nothing else")
+                  "deleted and two added, nothing else")
         if host.read(host.path("team.ini")) != "# Shared\n[model shared]\ntemperature = 0.1\n":
             problems.append("the included file changed")
         if args.shots and not args.host:
