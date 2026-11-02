@@ -32,7 +32,7 @@ apt-get install -y --no-install-recommends ca-certificates curl gnupg \
     libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
     libxfixes-dev libxss-dev libxtst-dev libwayland-dev \
     libxkbcommon-dev wayland-protocols libdecor-0-dev libegl-dev \
-    libgl-dev
+    libgl-dev libdbus-1-dev
 k=/usr/share/keyrings/llvm.gpg
 curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o "$k"
 if [ "$(gpg --show-keys --with-colons "$k" | awk -F: '$1 == "fpr" {print $10; exit}')" != "$LLVM_KEY" ]; then
