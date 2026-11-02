@@ -3079,8 +3079,8 @@ static void drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end)
     }
 }
 
-// A line above the transcript: a subagent's parent to go back to, or a
-// side chat's original; the session's model, shell and mode; its branch,
+// A line above the transcript: up to a subagent's parent, or a side
+// chat's original; the session's model, shell and mode; its branch,
 // context gauge, the toggles that open all its tool output and
 // reasoning, and its details in a popup.
 static void drawsessbar(Gui *g)
@@ -3099,40 +3099,44 @@ static void drawsessbar(Gui *g)
     char const *rl    = ICON_LIGHTBULB;  // Reasoning
     f32         rest  = (gw>0 ? gw + gap : 0) + 5*iconw() + 4*gap;
     f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rest;
-    if (v->parent.len && v->remote && !sessup(g, s)) {
-        ImGui::TextDisabled(v->role.len ? "Subagent (%s) of a session on another host"
-                                        : "Subagent%s of a session on another host",
-                            cstr0(&a, v->role));
-    } else if (v->parent.len) {
-        GuiSession *p = sessup(g, s);
-        ImGui::TextDisabled(v->role.len ? "Subagent (%s) of" : "Subagent%s of",
-                            cstr0(&a, v->role));
+    if (v->parent.len || sessside(s).len) {
+        // Up to its parent, or a side chat's original, then what it is:
+        // the Session pane says whose
+        b32         side = !v->parent.len;
+        Str         up   = side ? sessside(s) : v->parent;
+        GuiSession *p    = side ? findsess(g, s->host, up) : sessup(g, s);
+        b32         far  = !side && v->remote && !p;
+        ImGui::BeginDisabled(far);
+        b32 click = iconbutton(ICON_UP "##barup");
+        ImGui::EndDisabled();
+        itemnamed(g, "up to parent");
+        if (!far) {
+            itemrect(g, side ? RECT_SIDELINK : RECT_PARENTLINK);
+        }
+        Str title = shorten(&a, p ? sesstitle(p) : up, 60);
+        whytip(far  ? Str("Its parent is a session on another host, not open here") :
+               side ? concat(&a, "Up to the session this side chat began from: ", title)
+                    : concat(&a, "Up to the session that started this subagent: ", title));
+        if (click && !far) {
+            guiselect(g, p ? p : addsess(g, s->host, up));
+        }
         ImGui::SameLine();
-        Str title = shorten(&a, p ? sesstitle(p) : v->parent, 60);
-        if (ImGui::TextLink(cstr0(&a, title))) {
-            guiselect(g, p ? p : addsess(g, s->host, v->parent));
-        }
-        itemrect(g, RECT_PARENTLINK);
-        itemtip("Back to the session that started this subagent");
-        if (kidinbg(p, v) && (v->busy || v->jobsrun)) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("in the background: it reports when done");
-            itemnamed(g, "reports in the background");
-        }
-    } else if (sessside(s).len) {
-        // A side chat names its original in place of its own title
-        Str         o = sessside(s);
-        GuiSession *p = findsess(g, s->host, o);
         ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("Side chat of");
-        ImGui::SameLine();
-        if (ImGui::TextLink(cstr0(&a, shorten(&a, p ? sesstitle(p) : o, 60)))) {
-            guiselect(g, p ? p : addsess(g, s->host, o));
+        if (side) {
+            ImGui::TextDisabled("Side chat");
+        } else {
+            ImGui::TextDisabled(v->role.len ? "Subagent (%s)" : "Subagent%s",
+                                cstr0(&a, shorten(&a, v->role, 40)));
+            if (kidinbg(p, v) && (v->busy || v->jobsrun)) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("in the background: it reports when done");
+                itemnamed(g, "reports in the background");
+            }
         }
-        itemrect(g, RECT_SIDELINK);
-        itemtip("Back to the session this side chat began from");
         drawmodelpick(g, a, s, v, 0);
-        drawshellpick(g, a, s, v);
+        if (side) {
+            drawshellpick(g, a, s, v);
+        }
     } else {
         // Its title is the sidebar's selected row: only a role here
         if (v->role.len) {

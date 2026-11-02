@@ -83,12 +83,13 @@ static Str fontemoji()   { return {(u8 *)emojittf, countof(emojittf)}; }
 #define ICON_COPY       "\xee\xaf\x8c"  // U+EBCC
 #define ICON_SEND       "\xee\xb0\x8f"  // U+EC0F
 #define ICON_ATTACH     "\xee\xb0\xb4"  // U+EC34
+#define ICON_UP         "\xee\xaa\xa1"  // U+EAA1, arrow-up
 
 // Their characters, for the unit tests
 static Str fonticonsused =
     ICON_ADD ICON_TRASH ICON_HISTORY ICON_CHECK ICON_DISCARD ICON_EXTERNAL ICON_LIGHTBULB ICON_INFO ICON_CLOSE ICON_FILE ICON_REPLY
     ICON_TERMINAL ICON_DISCONNECT ICON_STOP ICON_FOLDER ICON_PLUG
-    ICON_REFRESH ICON_TOOLS ICON_COPY ICON_SEND ICON_ATTACH;
+    ICON_REFRESH ICON_TOOLS ICON_COPY ICON_SEND ICON_ATTACH ICON_UP;
 
 // Symbols models commonly write in prose: arrows, check marks and
 // crosses, bullets, math, shapes, ballot boxes, keyboard symbols, box

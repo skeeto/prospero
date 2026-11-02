@@ -53,9 +53,10 @@ session dialog's Role starts a session in a role, too.
 
 A subagent shows under its parent in the sidebar, folded away by its
 arrow. In the parent's transcript, its task row has Open subagent (or
-Answer the subagent, when it asks something), and the subagent's own
-transcript links back to its parent. A subagent has its parent's mode
-and allowed directories, and cancelling the parent cancels it.
+Answer the subagent, when it asks something), and the up arrow above
+the subagent's own transcript goes back to its parent. That bar also
+shows the subagent's model. A subagent has its parent's mode and
+allowed directories, and cancelling the parent cancels it.
 
 ### Subagents in the background
 
