@@ -1270,6 +1270,8 @@ static iz os_stdin(Os *os, u8 *buf, iz len)
 // that cannot be done (XP), the path is made absolute, as by
 // GetFullPathNameW, with its short (8.3) names spelled out. Results drop
 // the \\?\ prefix: "C:\x", "\\h\s\x".
+static Str os_hostids(Os *, Arena *) { return {}; }
+
 static Str os_realpath(Os *os, Arena *a, Str path)
 {
     if (hasnul(path)) {

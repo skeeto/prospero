@@ -939,6 +939,7 @@ struct Engine {
     Str         ctrname;  // the container runtime, docker or podman, for
     Str         ctrpath;  // subagents (hostlink.cpp): its program, and
     b32         ctrup;    // whether its daemon answered, as last asked
+    Str         ctruser;  // and whom Prospero is in its containers (ctruser)
     b32         ctrprobed;   // asked anew (farctrok)
     b32         ctrprobing;  // and not answered yet
     GitWork    *git;      // runs git for sessions' changes, once asked

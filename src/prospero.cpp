@@ -265,6 +265,10 @@ static Str     os_lasterr(Os *, Arena *);
 // if missing, including a link to something missing.
 static Str     os_realpath(Os *, Arena *, Str path);
 
+// This user's ids as UID:GID on Linux, for a container whose root would
+// be root here (ctruser); null elsewhere.
+static Str     os_hostids(Os *, Arena *);
+
 // (M3) A child to talk to (the engine as a subprocess, later ssh), set
 // up like os_spawn but with pipes for standard input and output. Its
 // output arrives as PROC_DATA records, which wait for room in the

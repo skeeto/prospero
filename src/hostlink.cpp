@@ -1166,6 +1166,7 @@ static void farctrthread(void *arg)
         print(&b, rt.name);  putbyte(&b, '\n');
         print(&b, rt.path);  putbyte(&b, '\n');
         print(&b, rt.up ? Str("1") : Str("0")); putbyte(&b, '\n');
+        print(&b, rt.user); putbyte(&b, '\n');
         out = finish(&b);
         Str path = join(&scratch, join(&scratch, j->localstate, "containers"), "runtime");
         os_write(j->os, scratch, path, out);  // for the next start's sessions
@@ -1239,9 +1240,11 @@ static void farctrinit(Engine *e, Arena scratch)
     if (rd.err == READ_OK) {
         Cut name = cut(rd.data, '\n');
         Cut prog = cut(name.tail, '\n');
+        Cut up   = cut(prog.tail, '\n');
         e->ctrname = clone(&e->perm, trim(name.head));
         e->ctrpath = clone(&e->perm, trim(prog.head));
-        e->ctrup   = trim(cut(prog.tail, '\n').head) == "1";
+        e->ctrup   = trim(up.head) == "1";
+        e->ctruser = clone(&e->perm, trim(cut(up.tail, '\n').head));
     }
 }
 
@@ -1344,6 +1347,7 @@ static HostLink *farctrlink(Session *s, Arena scratch, Args *args, TaskRun *t)
     c->name      = ctrnewname(e->os, &e->perm, "t-");
     c->runtime   = e->ctrname;
     c->program   = e->ctrpath;
+    c->user      = e->ctruser.len ? e->ctruser : Str("0");  // a cache from before: root
     c->image     = clone(&e->perm, args->image);
     c->workspace = copy.len ? CTR_COPY : CTR_EMPTY;
     c->folder    = clone(&e->perm, copy);
@@ -1410,9 +1414,11 @@ static void farctrmail(Engine *e, Arena scratch, Record r)
     if (kind == FJOB_PROBE) {
         Cut name = cut(text, '\n');
         Cut prog = cut(name.tail, '\n');
+        Cut up   = cut(prog.tail, '\n');
         e->ctrname = clone(&e->perm, trim(name.head));
         e->ctrpath = clone(&e->perm, trim(prog.head));
-        e->ctrup   = ok && trim(cut(prog.tail, '\n').head)=="1";
+        e->ctrup   = ok && trim(up.head)=="1";
+        e->ctruser = clone(&e->perm, trim(cut(up.tail, '\n').head));
         e->ctrprobing = 0;
         for (HostLink *l = e->links; l; l = l->next) {
             if (!l->held) {
@@ -1429,6 +1435,7 @@ static void farctrmail(Engine *e, Arena scratch, Record r)
             }
             l->ctr->runtime = e->ctrname;  // as found just now
             l->ctr->program = e->ctrpath;
+            l->ctr->user    = e->ctruser;
             if (!farctrmake(e, scratch, l)) {
                 farkeep(l, "its container could not be made: a thread could not start");
                 farfailall(e, scratch, l);

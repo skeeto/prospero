@@ -68,6 +68,7 @@ struct CtrRuntime {
     Str version;  // its daemon's, if it answers
     Str why;      // why it does not, else null
     b32 up;
+    Str user;     // whom Prospero is in its containers (ctruser), if up
 };
 
 // A session a container held, as last known.
@@ -85,6 +86,8 @@ struct Ctr {
     i32 workspace;  // CTR_*
     Str folder;     // copied or mounted
     Str out;        // a folder here mounted at /out, if any (a subagent's)
+    Str user;       // whom Prospero is there: 0, or UID:GID (ctruser); null
+                    // in one made before, as the image says
     b32 network;
     i64 created;    // Unix epoch ms
     i64 trashed;    // Unix epoch ms it was stopped for the Trash, else 0
@@ -240,6 +243,36 @@ static DeployRun ctrrun(CtrRun *r, Arena *a, Slice<Str> argv, i64 timeout, Str i
 
 static Str ctrsaid(Arena *, DeployRun *, Str);
 
+// Whom Prospero runs as in a container, whatever the image's USER: root
+// ("0"), except where root there is root on this computer's files, as a
+// rootful daemon on Linux makes it, where it is this user (UID:GID), so
+// that what it leaves in the bind mounts is this user's, and no setuid
+// program of root's comes out through /out. Docker Desktop and rootless
+// Docker or Podman map root there to this user already. In doubt, root,
+// as before.
+static Str ctruser(CtrRun *run, Arena *perm, Arena scratch, CtrRuntime *rt)
+{
+    Str ids = os_hostids(run->d.os, &scratch);
+    if (!ids.len) {
+        return "0";
+    }
+    b32        podman = rt->name == "podman";
+    Slice<Str> argv   = {};
+    argv = push(&scratch, argv, rt->path);
+    argv = push(&scratch, argv, Str("info"));
+    argv = push(&scratch, argv, Str("--format"));
+    argv = push(&scratch, argv, podman ? Str("{{.Host.Security.Rootless}}")
+                                       : Str("{{.OperatingSystem}}|{{.SecurityOptions}}"));
+    DeployRun r   = ctrrun(run, &scratch, argv, CTR_PROBETIME);
+    Str       out = trim(r.out);
+    if (r.code!=0 || !out.len) {
+        return "0";
+    }
+    b32 mapped = podman ? out!="false"
+                        : find(out, "rootless")>=0 || find(out, "Docker Desktop")>=0;
+    return mapped ? Str("0") : clone(perm, ids);
+}
+
 // Whether the runtime's daemon answers, and its version: Docker
 // Desktop or a Podman machine may be installed but stopped.
 static void ctrprobe(CtrRun *run, Arena *perm, Arena scratch, CtrRuntime *rt)
@@ -261,6 +294,7 @@ static void ctrprobe(CtrRun *run, Arena *perm, Arena scratch, CtrRuntime *rt)
     if (r.code==0 && v.len && v.len<64) {
         rt->up      = 1;
         rt->version = clone(perm, v);
+        rt->user    = ctruser(run, perm, scratch, rt);
         return;
     }
     // Not running, as its client says it in a few ways, else what it
@@ -336,19 +370,31 @@ static Str ctrnewname(Os *os, Arena *a, Str prefix = "p-")
     return finish(&b);
 }
 
+// Where its host keeps its state, there.
+static Str ctrstate = "/prospero/state";
+// And HOME, as another user than root: a tmpfs of its own.
+static Str ctrhome = "/prospero/home";
+
 // The exec command that reaches it, for a Reach.
 static Str ctrexec(Arena *a, Ctr *c)
 {
-    Buf b(a, 64 + c->program.len + c->name.len);
+    Buf b(a, 96 + c->program.len + c->name.len + c->user.len);
     putbyte(&b, '"');
     print(&b, c->program);
     print(&b, "\" exec -i ");
+    if (c->user.len) {
+        print(&b, "-u ");
+        print(&b, c->user);
+        putbyte(&b, ' ');
+    }
+    if (c->user.len && c->user!="0") {
+        print(&b, "-e HOME=");  // a uid the image may not know
+        print(&b, ctrhome);
+        putbyte(&b, ' ');
+    }
     print(&b, ctrcname(a, c->name));
     return finish(&b);
 }
-
-// Where its host keeps its state, there.
-static Str ctrstate = "/prospero/state";
 
 // The command that makes it, as described at the top. cpus, memory and
 // args are [container]'s.
@@ -387,7 +433,16 @@ static Slice<Str> ctrcreateargv(Arena *a, Ctr *c, Str owner, Str state, Str cpus
     r = push(a, r, Str("-v"));
     r = push(a, r, concat(a, state, concat(a, ":", ctrstate)));
     r = push(a, r, Str("--tmpfs"));
-    r = push(a, r, concat(a, ctrstate, "/run"));
+    if (c->user.len && c->user!="0") {
+        // Its run directory and HOME, this user's, as the rest it writes
+        Cut ids = cut(c->user, ':');
+        Str own = concat(a, concat(a, ":uid=", ids.head), concat(a, ",gid=", ids.tail));
+        r = push(a, r, concat(a, concat(a, ctrstate, "/run"), concat(a, own, ",mode=0700")));
+        r = push(a, r, Str("--tmpfs"));
+        r = push(a, r, concat(a, ctrhome, concat(a, own, ",mode=0700,exec")));
+    } else {
+        r = push(a, r, concat(a, ctrstate, "/run"));
+    }
     r = push(a, r, Str("-v"));
     r = push(a, r, c->workspace==CTR_MOUNT ? concat(a, c->folder, ":/work") : Str("/work"));
     if (c->out.len) {
@@ -416,6 +471,9 @@ static Str ctrini(Arena *a, Ctr *c)
     }
     if (c->out.len) {
         print(&b, "out = ");     print(&b, c->out);      putbyte(&b, '\n');
+    }
+    if (c->user.len) {
+        print(&b, "user = ");    print(&b, c->user);     putbyte(&b, '\n');
     }
     print(&b, "network = ");   print(&b, c->network ? Str("yes") : Str("no"));
     putbyte(&b, '\n');
@@ -457,6 +515,8 @@ static Ctr ctrparse(Arena *a, Str name, Str text)
             c.folder = clone(a, v);
         } else if (k == "out") {
             c.out = clone(a, v);
+        } else if (k == "user") {
+            c.user = clone(a, v);
         } else if (k == "network") {
             c.network = v == "yes";
         } else if (k == "created") {
@@ -723,6 +783,22 @@ static Str ctrcreate(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cpus,
         note(ctx, Str("starting it"));
         Str err = ctrdo(run, &scratch, carve(&scratch, 1<<20), c, "start");
         why = err.len ? concat(&scratch, "cannot start the container: ", err) : why;
+    }
+    if (!why.len && c->user.len && c->user!="0" && c->workspace!=CTR_MOUNT) {
+        // Its /work, a volume of root's, and the copy in it, this user's
+        Slice<Str> own = {};
+        own = push(&scratch, own, c->program);
+        own = push(&scratch, own, Str("exec"));
+        own = push(&scratch, own, Str("-u"));
+        own = push(&scratch, own, Str("0"));
+        own = push(&scratch, own, ctrcname(&scratch, c->name));
+        own = push(&scratch, own, Str("chown"));
+        own = push(&scratch, own, Str("-R"));
+        own = push(&scratch, own, c->user);
+        own = push(&scratch, own, Str("/work"));
+        DeployRun p = ctrrun(run, &scratch, own, CTR_COPYTIME);
+        why = p.code==0 ? Str{} : concat(&scratch, "cannot give /work to its user: ",
+                                         ctrsaid(&scratch, &p, Str("exec")));
     }
     if (why.len) {
         ctrremove(run, &scratch, carve(&scratch, 1<<20), c);

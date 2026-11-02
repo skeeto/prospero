@@ -8944,6 +8944,7 @@ static void guictrthread(void *arg)
         print(&b, rt.name);    putbyte(&b, '\n');
         print(&b, rt.path);    putbyte(&b, '\n');
         print(&b, rt.up ? Str("1") : Str("0")); putbyte(&b, '\n');
+        print(&b, rt.user);    putbyte(&b, '\n');
         print(&b, rt.version); putbyte(&b, '\n');
         print(&b, rt.why);
         out = finish(&b);
@@ -9202,6 +9203,7 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
     c->c.name      = ctrnewname(g->os, &g->perm);
     c->c.runtime   = g->ctrrt.name;
     c->c.program   = g->ctrrt.path;
+    c->c.user      = g->ctrrt.user;
     c->c.image     = clone(&g->perm, image);
     c->c.workspace = ws;
     c->c.folder    = ws==CTR_EMPTY ? Str{} : os_realpath(g->os, &g->perm, folder);
@@ -9394,12 +9396,14 @@ static void ctrdone(Gui *g, Record r)
         Cut n = cut(out, '\n');
         Cut p = cut(n.tail, '\n');
         Cut u = cut(p.tail, '\n');
-        Cut v = cut(u.tail, '\n');
+        Cut w = cut(u.tail, '\n');
+        Cut v = cut(w.tail, '\n');
         g->ctrprobing = 0;
         g->ctrprobed  = 1;
         g->ctrrt.name    = clone(&g->perm, n.head);
         g->ctrrt.path    = clone(&g->perm, p.head);
         g->ctrrt.up      = u.head == "1";
+        g->ctrrt.user    = clone(&g->perm, w.head.len ? w.head : Str("0"));
         g->ctrrt.version = clone(&g->perm, v.head);
         g->ctrrt.why     = clone(&g->perm, v.tail);
         guilog(g, concat(&a, concat(&a, "container runtime: ", n.head),

@@ -1008,6 +1008,20 @@ static iz os_stdin(Os *, u8 *buf, iz len)
     }
 }
 
+static Str os_hostids(Os *, Arena *a)
+{
+#ifdef __linux__
+    Buf b(a, 32);
+    print(&b, (i64)getuid());
+    putbyte(&b, ':');
+    print(&b, (i64)getgid());
+    return finish(&b);
+#else
+    (void)a;
+    return {};
+#endif
+}
+
 static Str os_realpath(Os *, Arena *a, Str path)
 {
     if (hasnul(path)) {

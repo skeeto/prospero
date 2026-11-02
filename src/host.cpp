@@ -2184,7 +2184,9 @@ static i32 attachmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     Str endpoint = os_endpoint(os, &perm, state, hostname(&perm, HOST_PROTO));
     if (!endpoint.len) {
         Str err = os_lasterr(os, &scratch);
-        hostsay(os, scratch, "cannot find the endpoint", err);
+        Str msg = concat(&scratch, concat(&scratch, Str("cannot use "), run),
+                         ", which must be this user's alone");
+        hostsay(os, scratch, msg, err);
         return 1;
     }
 

@@ -2454,6 +2454,9 @@ def rec(name):
     return os.path.join(root, name + ".json")
 if args[:1] == ["version"]:
     print("29.0.0")
+elif args[:1] == ["info"]:
+    # A rootful daemon on Linux, unless told otherwise
+    print(os.environ.get("FAKECTR_INFO", "Ubuntu 26.04|[name=seccomp,profile=builtin]"))
 elif args[:2] == ["image", "inspect"]:
     if args[-1] == "nope":
         sys.stderr.write("Error: No such image: nope\n")
@@ -2495,7 +2498,13 @@ elif args[:1] == ["ps"]:
                 print(n[:-5] + " running")
     with open(os.path.join(root, "log"), "a") as f:
         f.write(json.dumps(["ps-done"]) + "\n")
-elif args[:2] == ["exec", "-i"] and len(args) == 6 and args[3:5] == ["/bin/sh", "-c"]:
+elif args[:1] == ["exec"] and "chown" in args:
+    pass  # /work, the fake's, is this user's already
+elif args[:2] == ["exec", "-i"] and (lambda r: len(r) == 4 and r[1:3] == ["/bin/sh", "-c"])(
+        [a for i, a in enumerate(args[2:]) if a not in ("-u", "-e") and
+         args[2:][i - 1] not in ("-u", "-e")]):
+    args = ["exec", "-i"] + [a for i, a in enumerate(args[2:]) if a not in ("-u", "-e") and
+                             args[2:][i - 1] not in ("-u", "-e")]
     with open(rec(args[2])) as f:
         c = json.load(f)
     home = os.path.join(root, args[2] + ".home")
@@ -2696,6 +2705,17 @@ def ctr_task(t):
                 "com.nullprogram.prospero.task=1" in c and f"{out}:/out" in c,
                 f"create {c}")
         t.check(b.ran("cp") and b.ran("start", name), "copied and started")
+        # Whom Prospero is there, whatever the image says: root, except
+        # under a rootful daemon on Linux (as the fake's info says), this
+        # user, whose /work it is then, and whose run directory and HOME
+        ids = f"{os.getuid()}:{os.getgid()}" if sys.platform == "linux" else "0"
+        execs = [a for a in b.ran("exec") if "chown" not in a]
+        t.check(execs and all("-u" in a and a[a.index("-u") + 1] == ids for a in execs),
+                f"exec as {ids}: {execs[:2]}")
+        if ids != "0":
+            t.check(b.ran("exec", "-u", "0", name, "chown", "-R", ids, "/work") and
+                    f"/prospero/state/run:uid={ids.replace(':', ',gid=')},mode=0700" in c,
+                    f"/work and run given to {ids}: {c}")
         tools = [x for q in fake_provider.STATE.log(b.model)[:1]
                  for x in q["body"].get("tools", []) if x["function"]["name"] == "task"]
         props = tools[0]["function"]["parameters"]["properties"] if tools else {}
@@ -2836,9 +2856,11 @@ def ctr_ask(t):
 def ctr_network(t):
     """With network, even a listed image asks; allowed, its container has
     the network, and its subagent is not in Bypass mode, as one with no
-    network is (ctr_task)."""
+    network is (ctr_task). Its runtime is Docker Desktop, which maps root
+    in the container to the user here, so it runs as root on Linux too."""
     if os.name == "nt":
         return "skip"
+    t.env["FAKECTR_INFO"] = "Docker Desktop|[name=seccomp,profile=builtin]"
     b = Box(t, "ctr_network")
     try:
         sid = b.session()
@@ -2864,6 +2886,9 @@ def ctr_network(t):
         t.check(recs and recs[0].get("parent") == sid, f"kept {child}")
         modes = [r.get("mode") for r in recs if r.get("ev") == "mode"]
         t.check("bypass" not in modes, f"not in Bypass: {modes}")
+        execs = b.ran("exec")
+        t.check(execs and all(a[a.index("-u") + 1] == "0" for a in execs) and
+                not any("chown" in a for a in execs), f"execs {execs}")
     finally:
         b.quit()
 

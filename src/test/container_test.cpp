@@ -111,6 +111,24 @@ static void test_container(Test *t)
     expect(t, "ctrini out", istr(&a, find(cfgfile(v.os, "/st/containers/t-00c0ffee/container.ini"),
                                           "\nout = /sc/containers/t-00c0ffee\n")>0), "1");
     expect(t, "ctrall no task", istr(&a, ctrall(v.os, &a, v.scratch, "/st").len), "1");
+
+    // Whom Prospero is there: root, whatever the image's USER, or where
+    // root there would be root here, this user, its run directory and
+    // HOME its own
+    k.user = "0";
+    expect(t, "ctrexec root", ctrexec(&a, &k), "\"docker\" exec -i -u 0 prospero-t-00c0ffee");
+    expect(t, "ctrcreate root", istr(&a, find(joinwords(&a, ctrcreateargv(&a, &k, "f00d",
+                    "/s/state", {}, {}, {})), "|--tmpfs|/prospero/state/run|-v|")>0), "1");
+    k.user = "1000:1001";
+    expect(t, "ctrexec user", ctrexec(&a, &k),
+           "\"docker\" exec -i -u 1000:1001 -e HOME=/prospero/home prospero-t-00c0ffee");
+    argv = ctrcreateargv(&a, &k, "f00d", "/s/state", {}, {}, {});
+    expect(t, "ctrcreate user", istr(&a, find(joinwords(&a, argv),
+           "|--tmpfs|/prospero/state/run:uid=1000,gid=1001,mode=0700|"
+           "--tmpfs|/prospero/home:uid=1000,gid=1001,mode=0700,exec|-v|/work|")>0), "1");
+    expect(t, "ctrsave user", istr(&a, ctrsave(v.os, v.scratch, "/st", &k)), "1");
+    Read kr = os_read(v.os, &a, "/st/containers/t-00c0ffee/container.ini", 1<<12);
+    expect(t, "ctrini user", ctrparse(&a, k.name, kr.data).user, "1000:1001");
     expect(t, "ctrnewname task", takehead(ctrnewname(v.os, &a, "t-"), 2), "t-");
 
     // [container] images, by name as compared

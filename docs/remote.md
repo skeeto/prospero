@@ -56,6 +56,17 @@ host's `trash_days` runs `rm -f -v` and removes its directory. Making,
 starting and stopping run on threads of their own, their output in
 `STATE/containers/run.err` when one fails.
 
+Whatever `USER` the image names, every `exec` gives `-u`. Where root in
+the container is the user here (Docker Desktop, rootless Docker, and
+Podman unless `info` says it is rootful) that is `-u 0`. A rootful
+daemon on Linux, where root there is root on the bound folders here,
+gets this user's `UID:GID` instead, with `HOME=/prospero/home`, a tmpfs
+of theirs, and the run tmpfs theirs too; a `/work` volume is given to
+them (`exec -u 0 ... chown -R`) after it starts. The probe finds this
+with `info --format` (`ctruser`) and passes it on as the runtime's
+`user`, and `container.ini` keeps it, so a container keeps the user it
+was made with.
+
 An agent's subagent may run in a container of its own too: the task
 tool's `image` (with `copy`, a folder copied into `/work`, and
 `network`), offered while the engine's runtime answers and a Linux

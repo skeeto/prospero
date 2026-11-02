@@ -173,6 +173,7 @@ static Read os_readat(Os *, Arena *, Str, i64, iz) { return {{}, 0, READ_NOTFOUN
 static Slice<Str> os_environ(Os *, Arena *) { return {}; }
 static iz    os_stdin(Os *, u8 *, iz) { return 0; }
 static Str   os_realpath(Os *, Arena *, Str) { return {}; }
+static Str   os_hostids(Os *, Arena *) { return {}; }
 static Proc *os_spawn(Os *, Spawn *, Arena) { return 0; }
 static Proc *os_spawnio(Os *, Spawn *, Arena) { return 0; }
 static b32 os_launch(Os *, Arena, Slice<Str>, Str, Slice<Str>) { return 0; }

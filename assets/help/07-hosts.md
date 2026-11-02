@@ -100,6 +100,14 @@ Delete container..., also in the Hosts pane's Containers, removes it
 and its sessions for good, as emptying the Trash or the Trash's purge
 after `trash_days` does. A mounted folder is never removed.
 
+Whatever user the image names, the engine and the agent run as root in
+the container, which is you, not root, on this computer with Docker
+Desktop, Podman, or rootless Docker. A rootful Docker on Linux would
+make that root on the folders it shares with this computer, so there
+they run as your own user and group instead: files left in `/out` or
+a mounted folder are yours, though the agent cannot install packages
+in the container.
+
 `[container]` in your own file chooses the runtime (`docker`, `podman`,
 or a path), `cpus`, `memory` and further `args` for each new container,
 and `list = never` hides it all.
