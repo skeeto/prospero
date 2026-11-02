@@ -10915,8 +10915,10 @@ def approve_endpoint(t):
     url = webinclude(t, "team.ini",
                      f"[endpoint team]\nurl = {t.epurl}\nkey = env:TEAM_KEY\n")
     t.check(url.startswith("http"), url)
-    with fake_provider.STATE.lock:
-        before = len(fake_provider.STATE.auths)
+    def mine():
+        # Of this scenario's model: others running meanwhile send theirs
+        with fake_provider.STATE.lock:
+            return [k for m, k in fake_provider.STATE.auths if t.model in m]
     h = t.headless(env=env)
     try:
         a = h.call("new", cwd=t.work, model=t.model, endpoint="team", attended=1)["sid"]
@@ -10929,17 +10931,15 @@ def approve_endpoint(t):
                 "env:TEAM_KEY" in one["detail"] and "k3y" not in json.dumps(one),
                 f"asked {one}")
         t.check(two["kind"] == "approve", f"asked too {two}")
-        with fake_provider.STATE.lock:
-            t.check(len(fake_provider.STATE.auths) == before, "nothing sent while asking")
+        t.check(not mine(), "nothing sent while asking")
         h.call("answer", sid=a, req=one["req"], decision="allow")
         t.check(ended(h, a, 1)["why"] == "done", "the first turn ends")
         t.check(ended(h, b, 1)["why"] == "done", "the second goes on and ends")
         ans = [e for e in h.all("answer", b) if e.get("req") == two["req"]]
         t.check(len(ans) == 1 and ans[0]["decision"] == "allow" and ans[0]["by"] == "shared",
                 f"answered elsewhere {ans}")
-        with fake_provider.STATE.lock:
-            sent = fake_provider.STATE.auths[before:]
-        t.check(len(sent) == 2 and all(k == "Bearer k3y" for _, k in sent), f"the key {sent}")
+        sent = mine()
+        t.check(len(sent) == 2 and all(k == "Bearer k3y" for k in sent), f"the key {sent}")
 
         # Approved for good: a third session asks nothing
         c = h.call("new", cwd=t.work, model=t.model, endpoint="team", attended=1)["sid"]

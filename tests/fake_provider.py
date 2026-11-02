@@ -81,7 +81,7 @@ class State:
         self.peak = {}      # prefix -> most different models in flight
         self.includes = 0   # fetches of /fake/include.ini
         self.served = {}    # NAME -> text, served at /fake/serve/NAME
-        self.auths = []     # (path, Authorization) of chat requests
+        self.auths = []     # (model, Authorization) of chat requests
         self.sigs = {}      # Anthropic: signature -> (reasoning, binding)
         self.signers = {}   # Anthropic: signature -> the model that gave it
         self.redacted = set()  # Anthropic: redacted data given out
@@ -5314,8 +5314,13 @@ class Handler(BaseHTTPRequestHandler):
         url, path, prefix = self.route()
         raw = self.body()
         if path.endswith("/chat/completions"):
+            # By model: scenarios running meanwhile send theirs too
+            try:
+                model = json.loads(raw).get("model", "")
+            except (ValueError, AttributeError):
+                model = ""
             with STATE.lock:
-                STATE.auths.append((url.path, self.headers.get("Authorization")))
+                STATE.auths.append((model, self.headers.get("Authorization")))
         if url.path.startswith("/web/"):
             self.web(url, "POST", raw)
             return
