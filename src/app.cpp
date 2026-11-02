@@ -575,6 +575,7 @@ struct GuiSession {
     Rect         row;       // where the sidebar drew it last
     b32          stick;     // the transcript follows its bottom
     b32          readonly;  // another process holds it: replayed only
+    Str          kept;      // or the container it ran in, gone (ctrkeep)
     b32          listed;    // in the latest sessions list
     b32          locked;    // listed as open in another process
     i32          state;     // LIVE_*, from the list until opened
@@ -4264,6 +4265,7 @@ static void movesess(Gui *g, GuiSession *s, GuiHost *to)
     }
     s->host     = to;
     s->readonly = 0;
+    s->kept     = {};
     s->locked   = 0;
     s->openid   = 0;
     if (s->view) {
@@ -5248,6 +5250,10 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
             return;
         }
         s->readonly = jsonint(jsonget(j, "readonly"), 0) != 0;
+        Str kept    = jsonstr(jsonget(j, "kept"));
+        if (kept != s->kept) {
+            s->kept = clone(&g->perm, kept);
+        }
         if (s->view) {
             s->view->readonly  = s->readonly;
             s->view->topsdirty = 1;  // no buttons on its asks

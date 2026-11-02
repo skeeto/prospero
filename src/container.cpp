@@ -549,8 +549,9 @@ static Str ctrdo(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cmd)
 // directory's sessions, by way of the container's directory, and renamed
 // in whole, so that a listing never shows one half made. Its first record
 // loses remote, so that it lists as a subagent of its parent here, which
-// deletes it along with it. One whose log is bigger than CTR_KEEPMAX keeps
-// it, and lists as a root. Best effort: a file the container's root made
+// deletes it along with it, and gains kept, the container's name, which
+// opens it read-only with Linux's paths (loadsession). One whose log is
+// bigger than CTR_KEEPMAX keeps remote, and lists as a root. Best effort: a file the container's root made
 // under a rootful Linux daemon may not be readable. Scratch needs room
 // for twice CTR_KEEPMAX.
 enum : iz { CTR_KEEPMAX = (iz)1<<23 };
@@ -574,17 +575,18 @@ static void ctrkeep(Os *os, Arena scratch, Str localstate, Str name)
         Read rd  = os_read(os, &a, log, CTR_KEEPMAX);
         Cut  c   = cut(rd.data, '\n');
         Json *j  = rd.err==READ_OK ? jsonparse(&a, c.head).root : (Json *)&jsonmissing;
-        if (c.ok && jsonflag(jsonget(j, "remote"), 0)) {
-            Buf     b(&a, rd.data.len + 16);
+        if (c.ok && j->type==JSON_OBJECT) {
+            Buf     b(&a, rd.data.len + name.len + 32);
             JsonOut w = {&b};
             putobject(&w);
             for (Json *k = j->child; k; k = k->next) {
                 if (k->key!="remote" && k->key!="via" && k->key!="distro" &&
-                        k->key!="relay") {
+                        k->key!="relay" && k->key!="kept") {
                     putkey(&w, k->key);
                     putjson(&w, k);
                 }
             }
+            putstrkey(&w, "kept", name);
             putend(&w);
             putbyte(&b, '\n');
             print(&b, c.tail);

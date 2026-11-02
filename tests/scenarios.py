@@ -3411,6 +3411,57 @@ def readonly(t):
             t.check(rc == 0, f"headless exit {rc}")
 
 
+def keptlog(sid, kept):
+    """A container subagent's log as ctrkeep leaves it: Linux's paths, a
+    relayed endpoint, its parent on this host, and kept if marked."""
+    first = {"ev": "session", "proto": 0, "version": "0.11.0", "cwd": "/work",
+             "role": "general", "model": "elsewhere", "endpoint": "relay://x",
+             "scratch": f"/tmp/prospero-0/{sid}", "parent": "20261102-110000-0001",
+             "call": "c1", "depth": 1}
+    if kept:
+        first["kept"] = kept
+    recs = [
+        first,
+        {"ev": "user", "text": "Fuzz it.", "via": "prompt"},
+        {"ev": "turn", "n": 1},
+        {"ev": "assistant", "blocks": [{"t": "text", "text": "Done."}]},
+        {"ev": "turn.end", "turn": 1, "why": "done"},
+        {"ev": "task.report", "status": "ok", "text": "Done."},
+    ]
+    out = ""
+    for seq, r in enumerate(recs, 1):
+        out += json.dumps(dict({"sid": sid, "seq": seq, "ts": seq}, **r)) + "\n"
+    return out
+
+
+@scenario(bound=10)
+def kept(t):
+    """A container subagent's transcript, kept once its container went,
+    opens read-only with its own (Linux) paths, which on Windows tripped
+    an assertion; one kept before the mark too, on Windows."""
+    marked, old = "20261102-120000-abcd", "20261102-120001-0ld0"
+    for sid, mark in ((marked, "t-0000beef"), (old, None)):
+        d = t.host.join(t.state, "sessions", sid)
+        t.host.mkdir(d)
+        t.host.write(t.host.join(d, "events.jsonl"), keptlog(sid, mark))
+    a = t.headless()
+    try:
+        r = a.call("open", sid=marked)
+        t.check(r.get("ok") == 1 and r.get("readonly") == 1 and
+                r.get("kept") == "t-0000beef", f"opened read-only: {r}")
+        r = a.call("prompt", sid=marked, text="more")
+        t.check(r.get("ok") == 0 and "read-only" in r.get("err", ""), f"refused: {r}")
+        r = a.call("open", sid=old)
+        if t.host.windows:
+            t.check(r.get("ok") == 1 and r.get("readonly") == 1 and
+                    r.get("kept") == "?", f"old, read-only: {r}")
+        else:
+            t.check(r.get("ok") == 1 and "kept" not in r, f"old opens: {r}")
+    finally:
+        rc = a.close()
+        t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=10)
 def hello_caps(t):
     """hello names every command (cmds) and the engine's features (caps);

@@ -146,7 +146,8 @@ static void test_container(Test *t)
     ctrkeep(v.os, v.scratch, "/st", "t-0000beef");
     expect(t, "ctrkeep log", cfgfile(v.os, "/st/sessions/20261102-120000-abcd/events.jsonl"),
            "{\"sid\":\"20261102-120000-abcd\",\"ev\":\"session\",\"cwd\":\"/work\","
-           "\"parent\":\"20261102-110000-0001\",\"call\":\"c1\",\"depth\":1}\n"
+           "\"parent\":\"20261102-110000-0001\",\"call\":\"c1\",\"depth\":1,"
+           "\"kept\":\"t-0000beef\"}\n"
            "{\"ev\":\"turn.end\"}\n");
     expect(t, "ctrkeep files", cfgfile(v.os, "/st/sessions/20261102-120000-abcd/out/x.txt"), "x");
     expect(t, "ctrkeep not over", cfgfile(v.os, "/st/sessions/20261102-120001-dupe/events.jsonl"),

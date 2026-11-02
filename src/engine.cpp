@@ -659,7 +659,8 @@ struct Session {
     Guard        guard;
     EventLog     log;
     iz           lock;       // os_lockfile handle, -1 if not held
-    b32          readonly;   // another process holds the lock
+    b32          readonly;   // another process holds the lock, or kept
+    Str          kept;       // the container it ran in, gone (ctrkeep)
     b32          attended;   // a frontend that can answer asks has it open
     Slice<Msg>   history;
     i32          state;
@@ -16268,6 +16269,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             storedmodel = clone(&s->perm, jsonstr(jsonget(j, "model")));
             storedurl   = clone(&s->perm, jsonstr(jsonget(j, "endpoint")));
             s->scratch  = clone(&s->perm, jsonstr(jsonget(j, "scratch")));
+            s->kept     = clone(&s->perm, jsonstr(jsonget(j, "kept")));
             wtload(s, j);
             for (Json *k = jsonget(j, "roots")->child; k; k = k->next) {
                 Str root = clone(&s->perm, jsonstr(k));
@@ -16493,6 +16495,22 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
         dropsession(e, s);
         return 0;
     }
+    // A container's subagent, kept here once it ended (ctrkeep), ran on
+    // Linux in a folder now gone: read only, its paths Linux's. One kept
+    // before the mark shows on Windows by its working directory, and
+    // its container's name is not known ("?").
+    if (!s->kept.len && HOST_WINDOWS && !pathroot(s->cwd, 1)) {
+        s->kept = Str("?");
+    }
+    if (s->kept.len) {
+        s->te.windows = 0;
+        if (!s->readonly) {
+            logclose(&s->log);
+            os_unlockfile(e->os, s->lock);
+            s->lock     = -1;
+            s->readonly = 1;
+        }
+    }
     s->model = model.len ? clone(&s->perm, model) : storedmodel;
     if (!endpointconf(e, &s->perm, which.len ? which : storedurl, &s->ep)) {
         dropsession(e, s);
@@ -16671,6 +16689,9 @@ static void cmdopen(Engine *e, Arena scratch, i64 id, Json *j)
         putintkey(&w.json, "id", id);
         putintkey(&w.json, "ok", 1);
         putintkey(&w.json, "readonly", s->readonly);
+        if (s->kept.len) {
+            putstrkey(&w.json, "kept", s->kept);
+        }
         putintkey(&w.json, "lastseq", s->log.seq);  // the last of its history
         if (!pass && draft.len) {
             putstrkey(&w.json, "draft", draft);

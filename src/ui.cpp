@@ -4361,7 +4361,16 @@ static void drawtranscript(Gui *g)
     ImGuiStyle &st = ImGui::GetStyle();
 
     drawsessbar(g);
-    if (gs->readonly) {
+    if (gs->readonly && gs->kept.len) {
+        g->bannershown = 1;
+        Arena a    = g->frame;
+        Str   name = gs->kept=="?" ? Str{} : concat(&a, concat(&a, ", ", gs->kept), ",");
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+        ImGui::TextWrapped("Read-only: this subagent ran in a container%s "
+                           "that is gone. Its transcript was kept here.",
+                           cstr0(&a, name));
+        ImGui::PopStyleColor();
+    } else if (gs->readonly) {
         g->bannershown = 1;
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
         ImGui::TextWrapped("Read-only: another Prospero process has this "
@@ -6055,6 +6064,8 @@ static Str sesswhy(Gui *g, GuiSession *s, Str cap, b32 idle, b32 rootonly)
     Str why = hostwhy(g, s, cap);
     if (why.len) {
         return why;
+    } else if (s->readonly && s->kept.len) {
+        return "Its container is gone: kept to read";
     } else if (s->readonly || (!s->view && s->locked)) {
         return "Another process holds it";
     } else if (rootonly && sessparent(s).len) {
