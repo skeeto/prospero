@@ -2963,6 +2963,9 @@ def ctr_leftover(t):
             time.sleep(0.2)
         t.check(b.ran("rm", "-f", "-v", "prospero-t-deadbeef"), f"the t- removed: {b.log()}")
         t.check(not b.ran("rm", "-f", "-v", "prospero-p-0000aaaa"), "the p- left")
+        deadline = time.time() + 10  # its directory goes after rm returns
+        while time.time() < deadline and leftctrs(t):
+            time.sleep(0.1)
         t.check(os.path.isdir(os.path.join(t.state, "containers", "p-0000aaaa")) and
                 not leftctrs(t), "directories")
         owner = [a for a in b.ran("ps")[0] if a.startswith("label=")][0][6:]
