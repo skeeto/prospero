@@ -486,7 +486,7 @@ static Str ctrcreate(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cpus,
     }
 
     // The container
-    note(ctx, "creating the container");
+    note(ctx, Str("creating the container"));
     Str dir   = ctrdir(&scratch, localstate, c->name);
     Str state = join(&scratch, dir, "state");
     if (!os_mkdirs(os, scratch, state) || !ctrsave(os, scratch, localstate, c)) {
@@ -522,7 +522,7 @@ static Str ctrcreate(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cpus,
                                          ctrsaid(&scratch, &p, Str("cp")));
     }
     if (!why.len) {
-        note(ctx, "starting it");
+        note(ctx, Str("starting it"));
         Str err = ctrdo(run, &scratch, carve(&scratch, 1<<20), c, "start");
         why = err.len ? concat(&scratch, "cannot start the container: ", err) : why;
     }
