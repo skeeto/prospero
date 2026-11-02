@@ -2485,6 +2485,7 @@ elif args[:2] == ["rm", "-f"]:
     if os.path.exists(rec(name)):
         os.remove(rec(name))
 elif args[:1] == ["ps"]:
+    time.sleep(float(os.environ.get("FAKECTR_PSSLOW", "0")))
     owner = [a for a in args if a.startswith("label=")][0][6:]
     for n in sorted(os.listdir(root)):
         if n.endswith(".json"):
@@ -2492,6 +2493,8 @@ elif args[:1] == ["ps"]:
                 c = json.load(f)
             if owner in c["labels"]:
                 print(n[:-5] + " running")
+    with open(os.path.join(root, "log"), "a") as f:
+        f.write(json.dumps(["ps-done"]) + "\n")
 elif args[:2] == ["exec", "-i"] and len(args) == 6 and args[3:5] == ["/bin/sh", "-c"]:
     with open(rec(args[2])) as f:
         c = json.load(f)
@@ -2889,6 +2892,47 @@ def ctr_cancel(t):
         t.check(not b.ran("exec"), "never reached")
         time.sleep(0.5)
         t.check(not leftctrs(t), f"its directory gone: {leftctrs(t)}")
+    finally:
+        b.quit()
+
+
+@scenario
+def ctr_probing(t):
+    """A container asked for while the runtime is found anew, which removes
+    the t- directories an engine left: it is made once that is done, not
+    before, which took its directory (container.ini, which the window
+    reaches it by) as a leftover."""
+    if os.name == "nt":
+        return "skip"
+
+    def before(b):
+        # The runtime as last found, so that sessions offer containers at
+        # once, while the probe's ps takes its time
+        d = os.path.join(t.state, "containers")
+        os.makedirs(d)
+        with open(os.path.join(d, "runtime"), "w") as f:
+            f.write(f"docker\n{program(t, 'fakectr', FAKECTR)}\n1\n")
+
+    b = Box(t, "ctr_task", env={"FAKECTR_PSSLOW": "2"}, before=before)
+    try:
+        os.makedirs(os.path.join(t.work, "src"))
+        with open(os.path.join(t.work, "src", "input.txt"), "w") as f:
+            f.write("boom\n")
+        r = b.x.call("new", cwd=t.work, model=b.model, endpoint="fake", attended=1)
+        t.check(r.get("ok") == 1, f"new: {r}")
+        sid = r["sid"]
+        b.x.send("prompt", sid=sid, text="go")
+        th = b.x.wait(lambda r: r.get("ev") == "task.host" and r.get("sid") == sid, 30,
+                      "task.host")
+        ini = os.path.join(t.state, "containers", th.get("ctr", "?"), "container.ini")
+        t.check(os.path.exists(ini), f"its container.ini kept: {leftctrs(t)}")
+        end = b.x.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                       60, "turn end")
+        te = [r for r in b.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(end.get("why") == "done" and len(te) == 1 and te[0]["status"] == "ok",
+                f"ran: {te}")
+        log = [a[0] for a in b.log() if a[:1] in (["ps-done"], ["create"])]
+        t.check(log[:2] == ["ps-done", "create"], f"made after the probe: {b.log()}")
     finally:
         b.quit()
 

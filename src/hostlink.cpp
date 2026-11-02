@@ -41,7 +41,10 @@
 // The runtime is found by a thread when the first session that offers
 // task opens (farctrok), which removes the containers an engine of this
 // state directory left, and its answer is cached in containers/runtime
-// for the sessions made before it comes, at the next start too. An image not in [container] images, or network access, asks
+// for the sessions made before it comes, at the next start too. Those
+// may ask for a container meanwhile, which is made once the probe has
+// answered (held): its removal would take any t- directory, the new one's
+// too. An image not in [container] images, or network access, asks
 // the user first (taskasks, engine.cpp). The link is made at once in
 // RS_CONNECTING, its subagent queued as for any host, while a thread
 // makes the container (FJOB_MAKE); connecting follows its answer
@@ -78,6 +81,7 @@ struct Session;
 static HostLink *farctrlink(Session *, Arena, Args *, TaskRun *);
 static void farctridle(Engine *, Arena, HostLink *);
 static void farctrremove(Engine *, Arena, HostLink *);
+static b32  farctrmake(Engine *, Arena, HostLink *);
 static Str  farctrout(Engine *, Arena *, HostLink *);
 static void farctrinit(Engine *, Arena);
 
@@ -121,6 +125,7 @@ struct HostLink {
     Ctr       *ctr;      // a subagent's container (in the engine's perm), if
                          // the link is to one
     b32        making;   // its container is being made
+    b32        held;     // or waits for the runtime's probe (farctrmake)
     b32        removing; // and being removed, once the link closed
     i32        cancel;   // the job making it is to stop
 };
@@ -1369,15 +1374,28 @@ static HostLink *farctrlink(Session *s, Arena scratch, Args *args, TaskRun *t)
     }
     l->ctr    = c;
     l->outid  = ++e->nextid;
+    l->making = 1;
+    l->held   = e->ctrprobing;  // made once the probe has answered
+    if (!l->held && !farctrmake(e, scratch, l)) {
+        t->text = "No subagent was started: its container could not be made: "
+                  "a thread could not start";
+        return 0;
+    }
+    return l;
+}
+
+// Start making a link's container, on a thread. The probe's removal of
+// what an engine left takes every t- directory, so a container is not
+// made while it runs (held), which would take this one's too.
+static b32 farctrmake(Engine *e, Arena scratch, HostLink *l)
+{
+    l->held   = 0;
     l->making = farctrjob(e, scratch, FJOB_MAKE, l);
     if (!l->making) {
         l->state  = RS_FAILED;
         l->ending = 1;
-        t->text   = "No subagent was started: its container could not be made: "
-                    "a thread could not start";
-        return 0;
     }
-    return l;
+    return l->making;
 }
 
 // A container job's answer.
@@ -1396,6 +1414,26 @@ static void farctrmail(Engine *e, Arena scratch, Record r)
         e->ctrpath = clone(&e->perm, trim(prog.head));
         e->ctrup   = ok && trim(cut(prog.tail, '\n').head)=="1";
         e->ctrprobing = 0;
+        for (HostLink *l = e->links; l; l = l->next) {
+            if (!l->held) {
+                continue;
+            } else if (l->cancel || l->ending || !l->kids || e->quitting || !e->ctrup) {
+                l->held   = 0;
+                l->making = 0;
+                farkeep(l, e->ctrup ? Str("cancelled") : Str("the container runtime "
+                                                              "did not answer"));
+                l->state  = RS_FAILED;
+                l->ending = 1;
+                farfailall(e, scratch, l);
+                continue;
+            }
+            l->ctr->runtime = e->ctrname;  // as found just now
+            l->ctr->program = e->ctrpath;
+            if (!farctrmake(e, scratch, l)) {
+                farkeep(l, "its container could not be made: a thread could not start");
+                farfailall(e, scratch, l);
+            }
+        }
         return;
     }
     HostLink *l = farbyout(e, r.id);
