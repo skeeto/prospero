@@ -2281,6 +2281,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
     b32 desk   = t->scope == "desktop";
     b32 mcp    = t->scope == "mcp";
     b32 web    = t->scope == "web";
+    b32 ctr    = t->scope == "container";
     b32 always = t->grant.len &&
                  hostcap(s->host, desk ? Str("answer.always.desktop") :
                                   mcp || proj ? Str("mcp") :
@@ -2304,6 +2305,11 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
             runs[2] = " for this session";
         } else if (proj) {
             runs[0] = "Always for this project";
+        } else if (ctr) {
+            runs[0] = "Always allow ";
+            runs[1] = t->grant.len<=32 ? t->grant :  // an image
+                      concat(&a, utf8head(t->grant, 31), "\xe2\x80\xa6");
+            runs[2] = "";
         } else if (web && t->grant=="search") {
             runs[0] = "Always allow web searches";
         } else if (web) {
@@ -2351,6 +2357,10 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         } else if (proj) {
             ImGui::SetItemTooltip("Start these servers now, and in later sessions here "
                                   "without asking, until the file changes them");
+        } else if (ctr) {
+            ImGui::SetItemTooltip("Allow this, and subagents in containers of %s from "
+                                  "now on in this session and its subagents, without "
+                                  "asking, when they have no network", cstr0(&a, t->grant));
         } else if (web && t->grant=="search") {
             ImGui::SetItemTooltip("Allow this, and every web search from now on in this "
                                   "session and its subagents, without asking: their "
@@ -8818,18 +8828,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     itemnamed(g, "new image");
     ImGui::SetItemTooltip("A Linux image, as the runtime names it: pulled first if "
                           "it is not here");
-    Slice<Str> imgs = {};
-    for (Str rest = ctrset(g, "images"); rest.len;) {
-        Str w = {};
-        for (; rest.len && (rest[0]==' ' || rest[0]==',' || rest[0]=='\t'); rest = cuthead(rest, 1)) {}
-        iz n = 0;
-        for (; n<rest.len && rest[n]!=' ' && rest[n]!=',' && rest[n]!='\t'; n++) {}
-        w    = takehead(rest, n);
-        rest = cuthead(rest, n);
-        if (w.len) {
-            imgs = push(&a, imgs, w);
-        }
-    }
+    Slice<Str> imgs = ctrimagelist(&a, ctrset(g, "images"));
     for (iz i = 0; i < g->ctrimgs.len; i++) {
         b32 dup = g->ctrimgs[i].len>0 && g->ctrimgs[i][0]=='<';  // <none>:<none>
         for (iz k = 0; !dup && k < imgs.len; k++) {

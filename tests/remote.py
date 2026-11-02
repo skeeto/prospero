@@ -36,6 +36,7 @@ import hashlib
 import http.client
 import json
 import os
+import platform
 import random
 import re
 import shutil
@@ -2436,6 +2437,447 @@ def far_exec(t):
         f.quit()
 
 
+# Subagents in containers of their own (the task tool's image): X, a
+# headless engine whose runtime is a fake docker, which runs "inside" a
+# container here, under a home of the container's own, its state and
+# /out the folders bound to them. The fake cannot change the paths in
+# what the link carries, so the subagent's cwd is FAKECTR_WORK, where a
+# copy goes, and it finds /out as $FAKECTR_OUT.
+
+FAKECTR = FAKE + r"""
+import json, shutil
+args = sys.argv[1:]
+root = os.environ["FAKECTR_DIR"]
+with open(os.path.join(root, "log"), "a") as f:
+    f.write(json.dumps(args) + "\n")
+def rec(name):
+    return os.path.join(root, name + ".json")
+if args[:1] == ["version"]:
+    print("29.0.0")
+elif args[:2] == ["image", "inspect"]:
+    if args[-1] == "nope":
+        sys.stderr.write("Error: No such image: nope\n")
+        sys.exit(1)
+    print("linux " + os.environ["FAKECTR_ARCH"])
+elif args[:1] == ["pull"]:
+    sys.stderr.write("Error response from daemon: pull access denied\n")
+    sys.exit(1)
+elif args[:1] == ["create"]:
+    time.sleep(float(os.environ.get("FAKECTR_SLOW", "0")))
+    name = args[args.index("--name") + 1]
+    binds = {}
+    for i, a in enumerate(args):
+        if a == "-v" and ":" in args[i + 1]:
+            here, there = args[i + 1].rsplit(":", 1)
+            binds[there] = here
+    labels = [args[i + 1] for i, a in enumerate(args) if a == "--label"]
+    with open(rec(name), "w") as f:
+        json.dump({"binds": binds, "labels": labels}, f)
+    print("0123abcd")
+elif args[:1] == ["cp"]:
+    src, dst = args[1], args[2]
+    work = os.environ["FAKECTR_WORK"]
+    shutil.copytree(src.rstrip("/."), work, dirs_exist_ok=True)
+elif args[:1] in (["start"], ["stop"]):
+    pass
+elif args[:2] == ["rm", "-f"]:
+    name = args[-1]
+    if os.path.exists(rec(name)):
+        os.remove(rec(name))
+elif args[:1] == ["ps"]:
+    owner = [a for a in args if a.startswith("label=")][0][6:]
+    for n in sorted(os.listdir(root)):
+        if n.endswith(".json"):
+            with open(os.path.join(root, n)) as f:
+                c = json.load(f)
+            if owner in c["labels"]:
+                print(n[:-5] + " running")
+elif args[:2] == ["exec", "-i"] and len(args) == 6 and args[3:5] == ["/bin/sh", "-c"]:
+    with open(rec(args[2])) as f:
+        c = json.load(f)
+    home = os.path.join(root, args[2] + ".home")
+    os.makedirs(home, exist_ok=True)
+    cmd = args[5].replace("/prospero/state", c["binds"]["/prospero/state"])
+    env = {k: v for k, v in os.environ.items() if k not in ("XDG_CONFIG_HOME",)}
+    env.update(HOME=home, PROSPERO_TEST_DOCKER="/nonexistent/docker",
+               FAKECTR_OUT=c["binds"].get("/out", ""))
+    os.environ.clear()
+    os.environ.update(env)
+    run(["/bin/sh", "-c", cmd])
+else:
+    sys.stderr.write(f"fakectr: unexpected {args}\n")
+    sys.exit(2)
+"""
+
+
+def sc_ctr_task(model, n, req):
+    """A subagent in a container of alpine, with a copy of src, then what
+    the parent heard."""
+    if F.step(req) == 0:
+        args = {"description": "Crash", "prompt": "Crash it.",
+                "image": os.environ.get("FAKECTR_IMAGE") or "alpine",
+                "copy": "src", "model": F.second(model)}
+        if os.environ.get("FAKECTR_WORK"):
+            args["cwd"] = os.environ["FAKECTR_WORK"]  # the fake's /work
+        yield from F.tool(model, n, "task", args)
+    else:
+        yield from F.answer(model, "Heard: " + F.tool_results(req)[0])
+
+
+def sc_ctr_task_b(model, n, req):
+    if F.step(req) == 0:
+        yield from F.tool(model, n, "shell", {
+            "command": 'cat input.txt > "${FAKECTR_OUT:-/out}/crash.txt"'})
+    else:
+        yield from F.answer(model, "Saved the crash.")
+
+
+def sc_ctr_ask(model, n, req):
+    """busybox, not listed: asked, denied; then again, allowed always;
+    then once more, unasked."""
+    k = F.step(req)
+    if k < 3:
+        yield from F.tool(model, n, "task", {
+            "description": f"Try {k}", "prompt": "Go.", "image": "busybox",
+            "cwd": os.environ["FAKECTR_WORK"], "model": F.second(model)})
+    else:
+        yield from F.answer(model, "Done.")
+
+
+def sc_ctr_ask_b(model, n, req):
+    yield from F.answer(model, "Ran.")
+
+
+def sc_ctr_sleep(model, n, req):
+    if F.step(req) == 0:
+        yield from F.tool(model, n, "task", {
+            "description": "Slow", "prompt": "Go.", "image": "alpine",
+            "cwd": os.environ["FAKECTR_WORK"], "model": F.second(model)})
+    else:
+        yield from F.answer(model, "Heard: " + F.tool_results(req)[0][:200])
+
+
+for _name in ("ctr_task", "ctr_task_b", "ctr_ask", "ctr_ask_b"):
+    fake_provider.SCENARIOS[_name] = globals()["sc_" + _name]
+fake_provider.SCENARIOS["ctr_real"] = sc_ctr_task
+fake_provider.SCENARIOS["ctr_real_b"] = sc_ctr_task_b
+for _name in ("ctr_cancel", "ctr_leftover"):
+    fake_provider.SCENARIOS[_name] = sc_ctr_sleep
+    fake_provider.SCENARIOS[_name + "_b"] = sc_ctr_ask_b
+
+
+class Box:
+    """X, a headless engine of the scenario's state, whose container
+    runtime is the fake docker, with a Linux engine "here" for the
+    platform check (the one deployed is this program, which the fake
+    runs here)."""
+
+    def __init__(self, t, scenario, env=None, before=None):
+        self.t = t
+        self.model = t.model(scenario)
+        self.dir = os.path.join(t.root, "ctr")
+        self.cwork = os.path.join(t.root, "cwork")  # the container's /work
+        os.makedirs(self.dir)
+        os.makedirs(self.cwork)
+        arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "amd64"
+        ver = subprocess.run([t.prospero, "--version"], capture_output=True,
+                             text=True).stdout.split()[-1]
+        xdg = os.path.join(t.root, "config")
+        engines = os.path.join(xdg, "prospero", "engines")
+        os.makedirs(engines)
+        march = "aarch64" if arch == "arm64" else "x86_64"
+        # This program: on Linux, deploy takes it as that platform's engine
+        shutil.copy2(t.prospero, os.path.join(engines, f"prospero-engine-{ver}-linux-{march}"))
+        with open(t.config, "a") as f:
+            f.write("[container]\nimages = alpine, debian:12\n")
+        if before:
+            before(self)
+        env = dict(t.env, PROSPERO_TEST_DOCKER=program(t, "fakectr", FAKECTR),
+                   FAKECTR_DIR=self.dir, FAKECTR_WORK=self.cwork, FAKECTR_ARCH=arch,
+                   XDG_CONFIG_HOME=xdg, **(env or {}))
+        os.environ["FAKECTR_WORK"] = self.cwork  # the provider's scripts
+        p = subprocess.Popen([t.prospero, "--headless", "-C", t.work, "--state", t.state,
+                              "-c", t.config, "-e", "fake", "-m", self.model],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env, text=True, bufsize=1)
+        t.procs.append(p)
+        self.x = Lines(p)
+
+    def session(self, prompt="go"):
+        """A session: the first finds the runtime, for the second, which
+        is the one returned."""
+        for i in range(2):
+            r = self.x.call("new", cwd=self.t.work, model=self.model, endpoint="fake",
+                            attended=1)
+            self.t.check(r.get("ok") == 1, f"new: {r}")
+            if i == 0:
+                deadline = time.time() + 20
+                while time.time() < deadline and not os.path.exists(
+                        os.path.join(self.t.state, "containers", "runtime")):
+                    time.sleep(0.1)
+                time.sleep(0.3)  # its mail taken
+        self.x.send("prompt", sid=r["sid"], text=prompt)
+        return r["sid"]
+
+    def log(self):
+        path = os.path.join(self.dir, "log")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(x) for x in f]
+
+    def ran(self, *words):
+        return [a for a in self.log() if a[:len(words)] == list(words)]
+
+    def quit(self):
+        if self.x.p.poll() is not None:
+            return
+        try:
+            self.x.call("quit", timeout=10)
+            self.x.close(timeout=30)
+        except (Failure, OSError, ValueError):
+            pass
+
+
+def leftctrs(t):
+    root = os.path.join(t.state, "containers")
+    return [n for n in os.listdir(root) if n.startswith("t-")] if os.path.isdir(root) else []
+
+
+@scenario
+def ctr_task(t):
+    """A subagent in a container of a listed image: unasked, made with no
+    network, labelled a task's, a copy of a folder in it and /out bound
+    to the parent's scratch directory, where its file is, as the report
+    says; the container is removed once it ends."""
+    if os.name == "nt":
+        return "skip"
+    os.makedirs(os.path.join(t.work, "src"))
+    with open(os.path.join(t.work, "src", "input.txt"), "w") as f:
+        f.write("boom\n")
+    b = Box(t, "ctr_task")
+    try:
+        sid = b.session()
+        end = b.x.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                       60, "turn end")
+        t.check(end.get("why") == "done", f"turn end {end}")
+        asks = [r for r in b.x.records if r.get("ev") == "ask"]
+        t.check(not asks, f"nothing asked: {asks}")
+        te = [r for r in b.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(len(te) == 1 and te[0]["status"] == "ok", f"tool.end {te}")
+        text = report(te[0]["text"]) or ""
+        m = re.search(r"The files it left in /out are here, in (.*)\.$", text)
+        t.check(text.startswith("Saved the crash.") and m, f"report {te[0]['text']!r}")
+        out = m.group(1) if m else ""
+        with open(os.path.join(out, "crash.txt")) as f:
+            t.check(f.read() == "boom\n", "its file in /out")
+        t.check("alpine (container t-" in te[0].get("host", ""), f"host {te[0].get('host')}")
+        made = b.ran("create")
+        t.check(len(made) == 1, f"creates {made}")
+        c = made[0] if made else []
+        name = c[c.index("--name") + 1] if "--name" in c else ""
+        t.check(name.startswith("prospero-t-") and "--network" in c and
+                c[c.index("--network") + 1] == "none" and
+                "com.nullprogram.prospero.task=1" in c and f"{out}:/out" in c,
+                f"create {c}")
+        t.check(b.ran("cp") and b.ran("start", name), "copied and started")
+        tools = [x for q in fake_provider.STATE.log(b.model)[:1]
+                 for x in q["body"].get("tools", []) if x["function"]["name"] == "task"]
+        props = tools[0]["function"]["parameters"]["properties"] if tools else {}
+        desc = tools[0]["function"]["description"] if tools else ""
+        t.check("image" in props and "copy" in props and "network" in props and
+                "Images the user allows without asking: alpine, debian:12" in desc,
+                f"told {props} {desc!r}")
+        deadline = time.time() + 20
+        while time.time() < deadline and not b.ran("rm", "-f", "-v", name):
+            time.sleep(0.2)
+        t.check(b.ran("rm", "-f", "-v", name), "removed")
+        time.sleep(0.5)
+        t.check(not leftctrs(t), f"its directory gone: {leftctrs(t)}")
+    finally:
+        b.quit()
+
+
+@scenario
+def ctr_real(t):
+    """ctr_task against a real runtime, PROSPERO_REALCTR (docker or podman's
+    path), with the Linux engines in PROSPERO_REALCTR_ENGINES, and an image
+    already pulled, PROSPERO_REALCTR_IMAGE (default alpine): the subagent's
+    file comes back through /out, and the container is gone after. Skipped
+    unless the first two are set."""
+    rt = os.environ.get("PROSPERO_REALCTR", "")
+    engines = os.environ.get("PROSPERO_REALCTR_ENGINES", "")
+    image = os.environ.get("PROSPERO_REALCTR_IMAGE", "alpine")
+    if os.name == "nt" or not rt or not engines:
+        return "skip"
+    os.makedirs(os.path.join(t.work, "src"))
+    with open(os.path.join(t.work, "src", "input.txt"), "w") as f:
+        f.write("boom\n")
+    xdg = os.path.join(t.root, "config")
+    shutil.copytree(engines, os.path.join(xdg, "prospero", "engines"))
+    with open(t.config, "a") as f:
+        f.write(f"[container]\nimages = {image}\n")
+    model = t.model("ctr_real")
+    os.environ["FAKECTR_WORK"] = ""
+    os.environ["FAKECTR_IMAGE"] = image
+    env = dict(t.env, PROSPERO_TEST_DOCKER=rt, XDG_CONFIG_HOME=xdg)
+    p = subprocess.Popen([t.prospero, "--headless", "-C", t.work, "--state", t.state,
+                          "-c", t.config, "-e", "fake", "-m", model],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env, text=True, bufsize=1)
+    t.procs.append(p)
+    b = Box.__new__(Box)
+    b.t, b.model, b.dir, b.x = t, model, t.root, Lines(p)
+    owner = None
+    try:
+        sid = b.session()
+        end = b.x.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                       240, "turn end")
+        te = [r for r in b.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check(end.get("why") == "done" and len(te) == 1 and te[0]["status"] == "ok",
+                f"turn end {end}, tool.end {te}")
+        text = report(te[0]["text"]) or ""
+        m = re.search(r"The files it left in /out are here, in (.*)\.$", text)
+        t.check(text.startswith("Saved the crash.") and m, f"report {te[0]['text']!r}")
+        with open(os.path.join(m.group(1), "crash.txt")) as f:
+            t.check(f.read() == "boom\n", "its file in /out")
+        name = te[0]["host"].split("(container ")[-1].rstrip(")")
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            ps = subprocess.run([rt, "ps", "-a", "--filter", f"name=prospero-{name}",
+                                 "--format", "{{.Names}}"], capture_output=True, text=True)
+            if not ps.stdout.strip():
+                break
+            time.sleep(0.5)
+        t.check(not ps.stdout.strip(), f"still there: {ps.stdout}")
+        t.check(not leftctrs(t), f"its directory gone: {leftctrs(t)}")
+    finally:
+        b.quit()
+        # Whatever is left, by this state's owner label
+        owner = subprocess.run([rt, "ps", "-aq", "--filter",
+                                "label=com.nullprogram.prospero.task=1"],
+                               capture_output=True, text=True).stdout.split()
+        t.note(f"labelled task containers after: {len(owner)}") if hasattr(t, "note") else None
+
+
+@scenario
+def ctr_ask(t):
+    """An image not listed asks: denied, the call fails and nothing is
+    made; allowed always, it runs, and the next call runs unasked."""
+    if os.name == "nt":
+        return "skip"
+    b = Box(t, "ctr_ask")
+    try:
+        sid = b.session()
+        ask = b.x.wait(lambda r: r.get("ev") == "ask" and r.get("sid") == sid, 20, "ask")
+        t.check(ask.get("kind") == "container" and ask.get("image") == "busybox" and
+                ask.get("always") == "busybox", f"ask {ask}")
+        b.x.call("answer", sid=sid, req=ask["req"], decision="deny")
+        te = b.x.wait(lambda r: r.get("ev") == "tool.end" and r.get("sid") == sid, 20,
+                      "denied")
+        t.check(te["status"] == "error" and "denied this container" in te["text"],
+                f"denied {te}")
+        t.check(not b.ran("create"), "nothing made")
+        ask2 = b.x.wait(lambda r: r.get("ev") == "ask" and r.get("sid") == sid and
+                        r["req"] != ask["req"], 20, "ask again")
+        b.x.call("answer", sid=sid, req=ask2["req"], decision="always")
+        end = b.x.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                       90, "turn end")
+        t.check(end.get("why") == "done", f"turn end {end}")
+        asks = [r for r in b.x.records if r.get("ev") == "ask" and r.get("sid") == sid]
+        t.check(len(asks) == 2, f"asked twice: {asks}")
+        tes = [r for r in b.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        t.check([r["status"] for r in tes] == ["error", "ok", "ok"], f"tool.ends {tes}")
+        t.check(len(b.ran("create")) == 2, f"two made {b.ran('create')}")
+        grants = [r for r in b.x.records if r.get("ev") == "grant" and r.get("sid") == sid]
+        t.check(len(grants) == 1 and grants[0].get("image") == "busybox", f"grant {grants}")
+    finally:
+        b.quit()
+
+
+@scenario
+def ctr_cancel(t):
+    """Cancelled while its container is being made: the call ends at
+    once, and the container is removed once made."""
+    if os.name == "nt":
+        return "skip"
+    b = Box(t, "ctr_cancel", env={"FAKECTR_SLOW": "3"})
+    try:
+        sid = b.session()
+        b.x.wait(lambda r: r.get("ev") == "tool.start" and r.get("sid") == sid, 20, "start")
+        time.sleep(0.5)
+        b.x.call("cancel", sid=sid)
+        te = b.x.wait(lambda r: r.get("ev") == "tool.end" and r.get("sid") == sid, 20,
+                      "cancelled")
+        t.check(te["status"] == "cancelled", f"tool.end {te}")
+        deadline = time.time() + 20
+        while time.time() < deadline and not b.ran("rm"):
+            time.sleep(0.2)
+        made = b.ran("create")
+        name = made[0][made[0].index("--name") + 1] if made else "?"
+        t.check(b.ran("rm", "-f", "-v", name), f"removed: {b.log()}")
+        t.check(not b.ran("exec"), "never reached")
+        time.sleep(0.5)
+        t.check(not leftctrs(t), f"its directory gone: {leftctrs(t)}")
+    finally:
+        b.quit()
+
+
+@scenario
+def ctr_leftover(t):
+    """What an engine of this state directory left, a t- directory and a
+    labelled container without one, is removed once the runtime is found;
+    the window's (p-) are left alone."""
+    if os.name == "nt":
+        return "skip"
+
+    def before(b):
+        for n in ("t-deadbeef", "p-0000aaaa"):
+            d = os.path.join(t.state, "containers", n)
+            os.makedirs(d)
+            with open(os.path.join(d, "container.ini"), "w") as f:
+                f.write("runtime = docker\nprogram = docker\nimage = alpine\n")
+
+    b = Box(t, "ctr_leftover", before=before)
+    try:
+        # A container labelled with this owner, without a directory: the
+        # owner as the engine hashes it, learned from its own create
+        r = b.x.call("new", cwd=t.work, model=b.model, endpoint="fake", attended=1)
+        t.check(r.get("ok") == 1, f"new {r}")
+        deadline = time.time() + 20
+        while time.time() < deadline and not b.ran("rm", "-f", "-v", "prospero-t-deadbeef"):
+            time.sleep(0.2)
+        t.check(b.ran("rm", "-f", "-v", "prospero-t-deadbeef"), f"the t- removed: {b.log()}")
+        t.check(not b.ran("rm", "-f", "-v", "prospero-p-0000aaaa"), "the p- left")
+        t.check(os.path.isdir(os.path.join(t.state, "containers", "p-0000aaaa")) and
+                not leftctrs(t), "directories")
+        owner = [a for a in b.ran("ps")[0] if a.startswith("label=")][0][6:]
+        with open(os.path.join(b.dir, "prospero-t-0badf00d.json"), "w") as f:
+            json.dump({"binds": {}, "labels": [owner]}, f)
+    finally:
+        b.quit()
+    # The next engine finds the one with no directory
+    b2 = Box.__new__(Box)
+    b2.t, b2.dir = t, b.dir
+    env = dict(t.env, PROSPERO_TEST_DOCKER=program(t, "fakectr", FAKECTR),
+               FAKECTR_DIR=b.dir, FAKECTR_WORK=b.cwork, XDG_CONFIG_HOME=os.path.join(t.root, "config"),
+               FAKECTR_ARCH="arm64")
+    p = subprocess.Popen([t.prospero, "--headless", "-C", t.work, "--state", t.state,
+                          "-c", t.config, "-e", "fake", "-m", b.model],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env, text=True, bufsize=1)
+    t.procs.append(p)
+    b2.x = Lines(p)
+    try:
+        b2.x.call("new", cwd=t.work, model=b.model, endpoint="fake", attended=1)
+        deadline = time.time() + 20
+        while time.time() < deadline and not b2.ran("rm", "-f", "-v", "prospero-t-0badf00d"):
+            time.sleep(0.2)
+        t.check(b2.ran("rm", "-f", "-v", "prospero-t-0badf00d"), "the labelled one removed")
+    finally:
+        b2.quit()
+
+
 @scenario
 def far_wsl_boot(t):
     """A WSL distro that is starting, and silent for longer than a link
@@ -3177,6 +3619,9 @@ def remote_write(a, path, text):
 
 
 def main():
+    # No container runtime unless a scenario gives one: the machine's own
+    # Docker would change the task tool, and leave its commands running
+    os.environ.setdefault("PROSPERO_TEST_DOCKER", os.path.join(os.sep, "nonexistent", "docker"))
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--prospero", required=True)
     ap.add_argument("--ssh", help="a host for the ssh scenarios")

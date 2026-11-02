@@ -35,6 +35,20 @@
 // serves their model calls (relay records) as a window would, its
 // replies held back while the link is too full for them (farrelay).
 //
+// With image, the task tool's subagent runs in a container made for it
+// alone (container.cpp, t-XXXXXXXX), a link of its own reached by exec
+// as the window's containers are, the engine deployed into it over cat.
+// The runtime is found by a thread when the first session that offers
+// task opens (farctrok), which removes the containers an engine of this
+// state directory left, and its answer is cached in containers/runtime
+// for the sessions made before it comes, at the next start too. An image not in [container] images, or network access, asks
+// the user first (taskasks, engine.cpp). The link is made at once in
+// RS_CONNECTING, its subagent queued as for any host, while a thread
+// makes the container (FJOB_MAKE); connecting follows its answer
+// (farctrmail). Its folder /out is in the parent's scratch directory,
+// which the report names. Once its subagent ends, the link is finished,
+// and the container removed (FJOB_REMOVE) once the link is closed.
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i64 {
@@ -51,6 +65,14 @@ struct FarHost {
     Str wsl;   // a distro, if not ssh
     Str exec;  // a command that runs one there, if neither
 };
+
+struct Ctr;
+struct Session;
+static HostLink *farctrlink(Session *, Arena, Args *, TaskRun *);
+static void farctridle(Engine *, Arena, HostLink *);
+static void farctrremove(Engine *, Arena, HostLink *);
+static Str  farctrout(Engine *, Arena *, HostLink *);
+static void farctrinit(Engine *, Arena);
 
 // A subagent on another host, for a task call of a session here.
 struct HostKid {
@@ -89,6 +111,11 @@ struct HostLink {
     Slice<Str> queue;    // lines remotetry could not take, in order
     Region    *mem;      // kids, lines, queue: reset when none are left
     Arena      perm;
+    Ctr       *ctr;      // a subagent's container (in the engine's perm), if
+                         // the link is to one
+    b32        making;   // its container is being made
+    b32        removing; // and being removed, once the link closed
+    i32        cancel;   // the job making it is to stop
 };
 
 static void farkeep(HostLink *l, Str why)
@@ -347,6 +374,7 @@ static void fardistros(Engine *e, Str list)
 // made at once see them too, then listed anew.
 static void farinit(Engine *e, Arena scratch)
 {
+    farctrinit(e, scratch);
     if (!farwsl(e, scratch)) {
         return;
     }
@@ -418,6 +446,59 @@ static void farcmd(HostLink *l, Arena scratch, Str cmd, Str sid, i64 from, i32 a
 
 // The link to a host, made if there is none, or none of use: one that
 // ended, or is ending.
+// Start the link's connection, as rc says where and how, the rest
+// filled in here.
+static void farconnect(Engine *e, Arena scratch, HostLink *l, RemoteConf *rc)
+{
+    rc->program    = linkstandin(e->os, &scratch, rc->wsl.len>0);
+    rc->scp        = os_getenv(e->os, &scratch, "PROSPERO_TEST_SCP");
+    rc->localstate = e->statedir;
+    rc->envpath    = enginepath(e, &scratch, HOST_WINDOWS);
+    rc->logname    = concat(&scratch, "engine-", rc->name);
+    rc->outid      = l->outid;
+    // Its own memory, never let go: the library's thread may outlive
+    // its MAIL_QUIT
+    Arena   ra = newarena(os_reserve(e->os, (iz)1<<22));
+    Remote *r  = ra.beg ? newremote(e->os, &ra, rc, e->in) : 0;
+    if (!r || !remotego(r)) {
+        l->state = RS_FAILED;
+        farkeep(l, "the connection could not start");
+        return;
+    }
+    l->r = r;
+}
+
+// A link not in use, or a new one, named name, made ready for a
+// connection: its fields cleared but its memory and token.
+static HostLink *farfresh(Engine *e, HostLink *l, Str name)
+{
+    if (!l) {
+        l = alloc<HostLink>(&e->perm);
+        Buf t(&e->perm, 16);
+        printhex(&t, os_random(e->os), 16);
+        l->token = finish(&t);
+        l->mem  = os_reserve(e->os, (iz)1<<(sizeof(void *)==8 ? 30 : 26));
+        if (!l->mem) {
+            return 0;
+        }
+        l->next  = e->links;
+        e->links = l;
+    }
+    HostLink *next  = l->next;
+    Str       token = l->token;
+    Region   *mem   = l->mem;
+    Str       was   = l->name;
+    *l = {};
+    l->next   = next;
+    l->name   = was==name ? was : clone(&e->perm, name);
+    l->token  = token;
+    l->mem    = mem;
+    l->perm   = newarena(mem);
+    l->state  = RS_CONNECTING;
+    l->idleat = os_ticks(e->os);
+    return l;
+}
+
 static HostLink *farlink(Engine *e, Arena scratch, FarHost *h)
 {
     HostLink *l = 0;
@@ -430,36 +511,14 @@ static HostLink *farlink(Engine *e, Arena scratch, FarHost *h)
     for (HostLink *t = e->links; !l && t; t = t->next) {
         l = !t->r && !t->kids && t->name==h->name ? t : 0;  // reused
     }
-    if (!l) {
-        l = alloc<HostLink>(&e->perm);
-        l->name = clone(&e->perm, h->name);
-        Buf t(&e->perm, 16);
-        printhex(&t, os_random(e->os), 16);
-        l->token = finish(&t);
-        l->mem  = os_reserve(e->os, (iz)1<<(sizeof(void *)==8 ? 30 : 26));
-        if (!l->mem) {
-            return 0;
-        }
-        l->next  = e->links;
-        e->links = l;
-    }
-    i64 now = os_ticks(e->os);
-    if (l->coolby > now) {
+    if (l && l->coolby>os_ticks(e->os)) {
         l->state = RS_FAILED;
         return l;  // failed a moment ago, and why: failing again
     }
-    HostLink *next  = l->next;
-    Str       name  = l->name;
-    Str       token = l->token;
-    Region   *mem   = l->mem;
-    *l = {};
-    l->next   = next;
-    l->name   = name;
-    l->token  = token;
-    l->mem    = mem;
-    l->perm   = newarena(mem);
-    l->state  = RS_CONNECTING;
-    l->idleat = now;
+    l = farfresh(e, l, h->name);
+    if (!l) {
+        return 0;
+    }
 
     Config    *c  = e->cfg;
     RemoteConf rc = {};
@@ -470,23 +529,9 @@ static HostLink *farlink(Engine *e, Arena scratch, FarHost *h)
     rc.path       = trim(cfgown(c, "remote", h->name, "path"));
     rc.state      = trim(cfgown(c, "remote", h->name, "state"));
     rc.rconfig    = trim(cfgown(c, "remote", h->name, "config"));
-    rc.program    = linkstandin(e->os, &scratch, h->wsl.len>0);
-    rc.scp        = os_getenv(e->os, &scratch, "PROSPERO_TEST_SCP");
-    rc.localstate = e->statedir;
-    rc.envpath    = enginepath(e, &scratch, HOST_WINDOWS);
-    rc.logname    = concat(&scratch, "engine-", h->name);
-    rc.outid      = l->outid = ++e->nextid;
     rc.deploy     = trim(cfgown(c, "remote", h->name, "deploy")) != "ask";
-    // Its own memory, never let go: the library's thread may outlive
-    // its MAIL_QUIT
-    Arena   ra = newarena(os_reserve(e->os, (iz)1<<22));
-    Remote *r  = ra.beg ? newremote(e->os, &ra, &rc, e->in) : 0;
-    if (!r || !remotego(r)) {
-        l->state = RS_FAILED;
-        farkeep(l, "the connection could not start");
-        return l;
-    }
-    l->r = r;
+    l->outid      = ++e->nextid;
+    farconnect(e, scratch, l, &rc);
     return l;
 }
 
@@ -536,6 +581,8 @@ static void farend(Engine *e, Arena scratch, HostLink *l, HostKid *k,
 {
     Session *p = 0;
     TaskRun *t = fartaskrun(e, k, &p);
+    Str      o = farctrout(e, &scratch, l);
+    text = o.len ? concat(&scratch, text, o) : text;
     if (k->cancel) {
         // Its call ended when it was cancelled
     } else if (t) {
@@ -558,6 +605,7 @@ static void farend(Engine *e, Arena scratch, HostLink *l, HostKid *k,
     }
     fardrop(l, k);
     l->idleat = os_ticks(e->os);
+    farctridle(e, scratch, l);
 }
 
 static void farfail(Engine *e, Arena scratch, HostLink *l, HostKid *k, Str text)
@@ -691,6 +739,9 @@ static void farmail(Engine *e, Arena scratch, HostLink *l, Record r)
         l->state = l->state==RS_FAILED ? RS_FAILED : RS_CLOSED;
         relaydropfar(e, l);
         farfailall(e, scratch, l);
+        if (l->ctr) {
+            farctrremove(e, scratch, l);
+        }
         return;
     }
     EvRec rec = evparse(&scratch, r.data);
@@ -805,9 +856,17 @@ static void farattend(Engine *e, Arena scratch)
 // cannot, with why in t->text (in the parent's arena).
 static b32 farstart(Session *s, Arena scratch, iz k, Args *args, TaskRun *t)
 {
-    Engine *e = s->e;
-    FarHost h = {};
-    if (!farfind(e, &scratch, args->host, &h)) {
+    Engine   *e = s->e;
+    FarHost   h = {};
+    HostLink *l = 0;
+    if (args->image.len) {
+        l = farctrlink(s, scratch, args, t);  // in a container of its own
+        if (!l) {
+            return 0;
+        }
+        h.name = l->name;
+        h.exec = "-";  // reached by exec
+    } else if (!farfind(e, &scratch, args->host, &h)) {
         Slice<FarHost> hosts = farhosts(&scratch, e->cfg, e->distros, farwsl(e, scratch));
         Buf b(&s->perm, 256);
         print(&b, "No subagent was started: there is no host named \"");
@@ -826,7 +885,7 @@ static b32 farstart(Session *s, Arena scratch, iz k, Args *args, TaskRun *t)
         t->text = finish(&b);
         return 0;
     }
-    HostLink *l = farlink(e, scratch, &h);
+    l = l ? l : farlink(e, scratch, &h);
     if (!l || l->state==RS_FAILED) {
         Buf b(&s->perm, 256);
         print(&b, "No subagent was started on ");
@@ -849,7 +908,8 @@ static b32 farstart(Session *s, Arena scratch, iz k, Args *args, TaskRun *t)
 
     FarAsk ask = {};
     ask.id         = kid->newid;
-    ask.cwd        = farcwd(&scratch, &h, s->cwd, args->cwd);
+    ask.cwd        = l->ctr && !args->cwd.len ? Str("/work")
+                                                 : farcwd(&scratch, &h, s->cwd, args->cwd);
     ask.role       = args->role;
     ask.model      = args->model;
     ask.attended   = kid->attended;
@@ -897,6 +957,7 @@ static void farcancel(Session *s, Arena scratch)
                     farend(e, scratch, l, k, "cancelled", {});
                 } else if (k->line.len) {
                     fardrop(l, k);  // never sent
+                    farctridle(e, scratch, l);
                 }
             }
         }
@@ -966,6 +1027,10 @@ static void farstop(Engine *e, Arena scratch, b32 quit)
             l->ending = 1;
             remotefinish(l->r);
         }
+        if (quit && l->making) {
+            l->ending = 1;
+            l->cancel = 1;
+        }
     }
 }
 
@@ -1018,10 +1083,349 @@ static void fartick(Engine *e, Arena scratch, i64 now)
 // quitby), so that the cancels reach their hosts.
 static b32 farbusy(Engine *e)
 {
+    if (e->ctrprobing) {
+        return 1;  // its runtime's commands end first
+    }
     for (HostLink *l = e->links; l; l = l->next) {
-        if (l->r) {
+        if (l->r || l->making || l->removing) {
             return 1;
         }
     }
     return 0;
+}
+
+
+// Containers for subagents (container.cpp)
+
+enum : i32 {
+    FJOB_PROBE,   // find the runtime, and remove what an engine left
+    FJOB_MAKE,    // make a link's container
+    FJOB_REMOVE,  // remove it
+};
+
+struct FarCtrJob {
+    Os      *os;
+    Mailbox *mb;        // the engine's
+    i32      kind;      // FJOB_*
+    u64      outid;     // the link's, for make and remove
+    Str      name;      // its container's
+    Str      ini;       // and container.ini
+    Str      localstate;
+    Str      envpath;
+    Str      setting;   // [container] runtime
+    Str      owner;
+    Str      cpus;
+    Str      memory;
+    Str      args;
+    i32     *cancel;    // the link's, for make
+    Arena    arena;     // the rest of perm
+    Region  *perm;
+    Region  *scratch;
+};
+
+static void farctrnote(void *, Str) {}
+
+static void farctrthread(void *arg)
+{
+    FarCtrJob *j       = (FarCtrJob *)arg;
+    Arena      perm    = j->arena;
+    Arena      scratch = newarena(j->scratch);
+    CtrRun    *run     = newctrrun(j->os, &perm, j->localstate, j->envpath, j->cancel);
+    Str        out     = {};
+    Str        err     = {};
+    if (!run) {
+        err = "out of memory";
+    } else if (j->kind == FJOB_PROBE) {
+        Str        test = os_getenv(j->os, &scratch, "PROSPERO_TEST_DOCKER");
+        CtrRuntime rt   = ctrpick(run, j->os, &perm, scratch,
+                                  test.len ? test : j->setting, j->envpath);
+        if (rt.up) {
+            ctrleftovers(run, scratch, rt.path, j->owner);
+        }
+        Buf b(&perm, 64 + rt.name.len + rt.path.len);
+        print(&b, rt.name);  putbyte(&b, '\n');
+        print(&b, rt.path);  putbyte(&b, '\n');
+        print(&b, rt.up ? Str("1") : Str("0")); putbyte(&b, '\n');
+        out = finish(&b);
+        Str path = join(&scratch, join(&scratch, j->localstate, "containers"), "runtime");
+        os_write(j->os, scratch, path, out);  // for the next start's sessions
+    } else {
+        Ctr c = ctrparse(&perm, j->name, j->ini);
+        if (j->kind == FJOB_MAKE) {
+            McpWords w = mcpwords(&perm, j->args);
+            err = ctrcreate(run, &perm, scratch, &c, j->cpus, j->memory,
+                            w.err.len ? Slice<Str>{} : w.words, farctrnote, 0);
+        } else {
+            err = ctrremove(run, &perm, scratch, &c);
+        }
+    }
+    Buf b(&perm, 8 + out.len + err.len);
+    putbyte(&b, (u8)('0' + j->kind));
+    putbyte(&b, err.len ? '!' : '+');
+    print(&b, err.len ? err : out);
+    mailpost(j->mb, MAIL_CTR, j->outid, finish(&b), 1);
+    os_release(j->os, j->scratch);
+    os_release(j->os, j->perm);
+}
+
+// Run a job on a thread of its own, for link l's container if any.
+// Returns 0 if it cannot start.
+static b32 farctrjob(Engine *e, Arena scratch, i32 kind, HostLink *l)
+{
+    Region *pr = os_reserve(e->os, (iz)1<<24);
+    Region *sr = os_reserve(e->os, (iz)1<<26);
+    if (!pr || !sr) {
+        if (pr) os_release(e->os, pr);
+        if (sr) os_release(e->os, sr);
+        return 0;
+    }
+    Config    *c = e->cfg;
+    Arena      a = newarena(pr);
+    FarCtrJob *j = alloc<FarCtrJob>(&a);
+    j->os         = e->os;
+    j->mb         = e->in;
+    j->kind       = kind;
+    j->outid      = l ? l->outid : 0;
+    j->name       = l ? clone(&a, l->ctr->name) : Str{};
+    j->ini        = l ? ctrini(&a, l->ctr) : Str{};
+    j->localstate = clone(&a, e->statedir);
+    j->envpath    = clone(&a, enginepath(e, &scratch, HOST_WINDOWS));
+    j->setting    = clone(&a, trim(cfgget(c, "container", "", "runtime", 0)));
+    j->owner      = ctrowner(&a, e->statedir);
+    j->cpus       = clone(&a, trim(cfgget(c, "container", "", "cpus", 0)));
+    j->memory     = clone(&a, trim(cfgget(c, "container", "", "memory", 0)));
+    j->args       = clone(&a, trim(cfgget(c, "container", "", "args", 0)));
+    j->cancel     = l && kind==FJOB_MAKE ? &l->cancel : 0;
+    j->perm       = pr;
+    j->scratch    = sr;
+    j->arena      = a;
+    if (!os_thread(e->os, farctrthread, j)) {
+        os_release(e->os, sr);
+        os_release(e->os, pr);
+        return 0;
+    }
+    return 1;
+}
+
+// At the engine's start: the runtime as last found, so that sessions
+// made before it is found anew (farctrok) see it too.
+static void farctrinit(Engine *e, Arena scratch)
+{
+    if (cfgbool(trim(cfgget(e->cfg, "container", "", "subagents", 0))) == 0) {
+        return;
+    }
+    Str  path = join(&scratch, join(&scratch, e->statedir, "containers"), "runtime");
+    Read rd   = os_read(e->os, &scratch, path, 1<<12);
+    if (rd.err == READ_OK) {
+        Cut name = cut(rd.data, '\n');
+        Cut prog = cut(name.tail, '\n');
+        e->ctrname = clone(&e->perm, trim(name.head));
+        e->ctrpath = clone(&e->perm, trim(prog.head));
+        e->ctrup   = trim(cut(prog.tail, '\n').head) == "1";
+    }
+}
+
+// Whether a session's agent may start a subagent in a container: the
+// runtime answered, agents may, and an engine for Linux is here. The
+// first asking finds the runtime anew, on a thread, for the sessions
+// after it, removing what an engine left; until then it is as last
+// found.
+static b32 farctrok(Engine *e, Arena scratch)
+{
+    if (cfgbool(trim(cfgget(e->cfg, "container", "", "subagents", 0))) == 0) {
+        return 0;
+    }
+    if (!e->ctrprobed) {
+        e->ctrprobed  = 1;
+        e->ctrprobing = farctrjob(e, scratch, FJOB_PROBE, 0);
+    }
+    if (!e->ctrup || !e->ctrpath.len) {
+        return 0;
+    }
+    return !ctrnoengine(e->os, &scratch, carve(&scratch, 1<<16)).len;
+}
+
+// [container] images, for the task tool's description, as a list.
+static Str farctrimages(Engine *e, Arena *perm, Arena scratch)
+{
+    Slice<Str> list = ctrimagelist(&scratch, cfgget(e->cfg, "container", "", "images", 0));
+    Buf        b(perm, 256);
+    for (iz i = 0; i < list.len; i++) {
+        print(&b, i ? Str(", ") : Str(""));
+        print(&b, list[i]);
+    }
+    return finish(&b);
+}
+
+static b32 farctrlisted(Engine *e, Arena scratch, Str image)
+{
+    return ctrimagelisted(scratch, cfgget(e->cfg, "container", "", "images", 0), image);
+}
+
+// Remove a link's container, on a thread, unless under way already.
+static void farctrremove(Engine *e, Arena scratch, HostLink *l)
+{
+    if (l->removing || l->making) {
+        return;
+    }
+    l->removing = farctrjob(e, scratch, FJOB_REMOVE, l);
+}
+
+// A container's link with no subagent left: finished, its container
+// removed once the link is closed, or once made.
+static void farctridle(Engine *e, Arena scratch, HostLink *l)
+{
+    if (!l->ctr || l->kids) {
+        return;
+    }
+    l->ending = 1;
+    if (l->making) {
+        l->cancel = 1;  // its answer removes it, made or not
+    } else if (l->r) {
+        remotefinish(l->r);  // then MAIL_QUIT removes it
+    } else {
+        farctrremove(e, scratch, l);
+    }
+}
+
+// A link to a new container for a subagent of session s, made at once,
+// its container being made: null on failure, with t's text saying why.
+static HostLink *farctrlink(Session *s, Arena scratch, Args *args, TaskRun *t)
+{
+    Engine *e = s->e;
+    if (!farctrok(e, scratch)) {
+        t->text = concat(&s->perm, "No subagent was started: containers are not "
+                         "available now: ", e->ctrup ? Str("no engine for Linux is here.")
+                         : Str("no container runtime (Docker or Podman) answers."));
+        return 0;
+    }
+    Str copy = {};
+    if (args->copy.len) {
+        GuardPath gp = guardpath(e->os, &scratch, &s->guard, args->copy, 1);
+        Buf       b(&s->perm, 256 + gp.path.len);
+        if (!gp.inside && !bypassing(s)) {
+            print(&b, "No subagent was started: copy must be a folder in your "
+                      "workspace, and ");
+            print(&b, gp.path);
+            print(&b, " is outside it.");
+        } else if (os_stat(e->os, scratch, gp.path).type != STAT_DIR) {
+            print(&b, "No subagent was started: copy must be a folder, and ");
+            print(&b, gp.path);
+            print(&b, " is not one.");
+        }
+        if (b.len) {
+            t->text = finish(&b);
+            return 0;
+        }
+        copy = gp.real.len ? gp.real : gp.path;
+    }
+
+    Ctr *c = alloc<Ctr>(&e->perm);
+    c->name      = ctrnewname(e->os, &e->perm, "t-");
+    c->runtime   = e->ctrname;
+    c->program   = e->ctrpath;
+    c->image     = clone(&e->perm, args->image);
+    c->workspace = copy.len ? CTR_COPY : CTR_EMPTY;
+    c->folder    = clone(&e->perm, copy);
+    c->network   = args->network;
+    c->created   = os_time(e->os);
+    if (s->scratch.len) {
+        Str dir = join(&scratch, join(&scratch, s->scratch, "containers"), c->name);
+        if (os_mkdirs(e->os, scratch, dir)) {
+            Str real = os_realpath(e->os, &scratch, dir);
+            c->out   = clone(&e->perm, real.len ? real : dir);
+        }
+    }
+
+    // A finished container link is reused, else a new one
+    HostLink *l = 0;
+    for (HostLink *x = e->links; !l && x; x = x->next) {
+        l = x->ctr && !x->r && !x->kids && !x->making && !x->removing ? x : 0;
+    }
+    Buf n(&scratch, 64 + c->image.len);
+    print(&n, c->image);
+    print(&n, " (container ");
+    print(&n, c->name);
+    print(&n, ")");
+    l = farfresh(e, l, finish(&n));
+    if (!l) {
+        t->text = "No subagent was started: out of memory";
+        return 0;
+    }
+    l->ctr    = c;
+    l->outid  = ++e->nextid;
+    l->making = farctrjob(e, scratch, FJOB_MAKE, l);
+    if (!l->making) {
+        l->state  = RS_FAILED;
+        l->ending = 1;
+        t->text   = "No subagent was started: its container could not be made: "
+                    "a thread could not start";
+        return 0;
+    }
+    return l;
+}
+
+// A container job's answer.
+static void farctrmail(Engine *e, Arena scratch, Record r)
+{
+    if (r.data.len < 2) {
+        return;
+    }
+    i32 kind = r.data[0] - '0';
+    b32 ok   = r.data[1] == '+';
+    Str text = cuthead(r.data, 2);
+    if (kind == FJOB_PROBE) {
+        Cut name = cut(text, '\n');
+        Cut prog = cut(name.tail, '\n');
+        e->ctrname = clone(&e->perm, trim(name.head));
+        e->ctrpath = clone(&e->perm, trim(prog.head));
+        e->ctrup   = ok && trim(cut(prog.tail, '\n').head)=="1";
+        e->ctrprobing = 0;
+        return;
+    }
+    HostLink *l = farbyout(e, r.id);
+    if (!l || !l->ctr) {
+        return;
+    } else if (kind == FJOB_REMOVE) {
+        l->removing = 0;
+        return;
+    }
+
+    l->making = 0;
+    if (!ok) {
+        farkeep(l, text);
+        l->state  = RS_FAILED;
+        l->ending = 1;
+        farfailall(e, scratch, l);
+        if (l->cancel) {
+            // Stopped: a create cut short may have made it all the same
+            farctrremove(e, scratch, l);
+        }
+        return;
+    } else if (l->ending || !l->kids) {
+        farctrremove(e, scratch, l);  // its subagent was cancelled meanwhile
+        return;
+    }
+    RemoteConf rc = {};
+    rc.name   = l->name;
+    rc.exec   = ctrexec(&scratch, l->ctr);
+    rc.state  = ctrstate;
+    rc.deploy = 1;  // the engine goes in over cat
+    farconnect(e, scratch, l, &rc);
+    if (!l->r) {
+        l->ending = 1;
+        farfailall(e, scratch, l);
+        farctrremove(e, scratch, l);
+    }
+}
+
+// What a container's subagent left in /out, as its report's last line,
+// or null if nothing.
+static Str farctrout(Engine *e, Arena *a, HostLink *l)
+{
+    if (!l->ctr || !l->ctr->out.len || !os_list(e->os, a, l->ctr->out)) {
+        return {};
+    }
+    return concat(a, concat(a, "\n\nThe files it left in /out are here, in ",
+                            l->ctr->out), ".");
 }

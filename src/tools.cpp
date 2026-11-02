@@ -168,6 +168,8 @@ struct ToolEnv {
     Str roles;       // the roles task may give, a line for each
     Str roleenum;    // their names, as a JSON schema's enum member
     Str hosts;       // the other hosts task may run on, a line for each
+    b32 ctr;         // task may start one in a container of an image
+    Str ctrimages;   // [container] images, which it may use unasked
     i32 edit;        // EDIT_*: the edit tool's format (edit.cpp)
     i32 coords;      // COORDS_*: how the desktop tool takes points
     b32 vision;      // the model takes images, which read then shows
@@ -538,6 +540,24 @@ static Str taskdesc(Arena *a, ToolEnv *te)
                   "and model are that host's.");
         print(&b, te->hosts);
     }
+    if (te->ctr) {
+        print(&b, "\nContainers: with image, the subagent runs in a new Linux "
+                  "container of that image (as debian:12), for work that "
+                  "should be kept apart from this machine: untrusted code, "
+                  "fuzzing, crashes. It has no network unless network is "
+                  "true, works in /work, empty or a copy of the folder copy "
+                  "names, and shares no files with this machine but /out, "
+                  "whose files appear here at a path its report names. The "
+                  "container is removed when the subagent ends: have it "
+                  "save in /out what you need.");
+        if (te->ctrimages.len) {
+            print(&b, " Images the user allows without asking: ");
+            print(&b, te->ctrimages);
+            print(&b, "; any other, or network, asks the user.");
+        } else {
+            print(&b, " Each image, and network, asks the user.");
+        }
+    }
     return finish(&b);
 }
 
@@ -725,10 +745,16 @@ static Str tooljson(Arena *a, ToolEnv *te)
                 // Only where there are hosts, else as before
                 {te->hosts.len ? Str("host") : Str{}, "string",
                  "A host above, to run it there; default here", 0, {}},
-                {te->hosts.len ? Str("cwd") : Str{}, "string",
-                 "With host: its working directory there, as that host writes "
-                 "paths; default: for WSL yours as it sees it when on a drive, "
-                 "else its home", 0, {}},
+                {te->hosts.len||te->ctr ? Str("cwd") : Str{}, "string",
+                 "With host or image: its working directory there, as that "
+                 "host writes paths; default: for WSL yours as it sees it "
+                 "when on a drive, in a container /work, else its home", 0, {}},
+                {te->ctr ? Str("image") : Str{}, "string",
+                 "A container image, to run it in a new container of it", 0, {}},
+                {te->ctr ? Str("copy") : Str{}, "string",
+                 "With image: a folder here to copy into /work", 0, {}},
+                {te->ctr ? Str("network") : Str{}, "boolean",
+                 "With image: give the container network access", 0, {}},
             },
         },
         {
@@ -959,8 +985,12 @@ static Str tooljson(Arena *a, ToolEnv *te)
         putstr(&w, "object");
         putkey(&w, "properties");
         putobject(&w);
-        for (iz k = 0; k<countof(d->params) && d->params[k].name.len; k++) {
+        // A parameter offered only sometimes has no name otherwise
+        for (iz k = 0; k<countof(d->params) && d->params[k].type.len; k++) {
             Param *p = &d->params[k];
+            if (!p->name.len) {
+                continue;
+            }
             putkey(&w, p->name);
             putobject(&w);
             putkey(&w, "type");
@@ -978,8 +1008,8 @@ static Str tooljson(Arena *a, ToolEnv *te)
         putend(&w);
         putkey(&w, "required");
         putarray(&w);
-        for (iz k = 0; k<countof(d->params) && d->params[k].name.len; k++) {
-            if (d->params[k].required) {
+        for (iz k = 0; k<countof(d->params) && d->params[k].type.len; k++) {
+            if (d->params[k].name.len && d->params[k].required) {
                 putstr(&w, d->params[k].name);
             }
         }
@@ -1115,6 +1145,9 @@ struct Args {
     Str             host;       // task: another host's name, null if here
     Str             shell;      // shell: a shell of [tools] shells, by name
     Str             cwd;        // task: its directory there, null if absent
+    Str             image;      // task: a container's image, null if none
+    Str             copy;       // task with image: a folder copied to /work
+    b32             network;    // task with image: network access
     i64             offset;     // 0 if absent
     i64             limit;      // 0 if absent
     i64             timeout;    // -1 if absent
@@ -2052,9 +2085,22 @@ static Args parseargs(Arena *a, i32 tool, Str raw, i32 edit)
         r.cwd    = trim(argstr(a, &r, j, "cwd", 0));
         r.host   = r.host.len ? r.host : Str{};
         r.cwd    = r.cwd.len ? r.cwd : Str{};
-        if (r.cwd.len && !r.host.len) {
-            issue(a, &r, "cwd", "only with host: here, a subagent works in your "
-                                "working directory");
+        r.image  = trim(argstr(a, &r, j, "image", 0));
+        r.copy   = trim(argstr(a, &r, j, "copy", 0));
+        r.image  = r.image.len ? r.image : Str{};
+        r.copy   = r.copy.len ? r.copy : Str{};
+        r.network = argbool(a, &r, j, "network");
+        if (r.image.len && r.host.len) {
+            issue(a, &r, "image", "not with host: a container is a host of its own");
+        } else if (r.cwd.len && !r.host.len && !r.image.len) {
+            issue(a, &r, "cwd", "only with host or image: here, a subagent works "
+                                "in your working directory");
+        }
+        if (r.copy.len && !r.image.len) {
+            issue(a, &r, "copy", "only with image: here, a subagent shares your files");
+        }
+        if (r.network && !r.image.len) {
+            issue(a, &r, "network", "only with image");
         }
         if (r.prompt.data && !trim(r.prompt).len) {
             issue(a, &r, "prompt", "must not be empty");

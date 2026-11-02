@@ -13743,6 +13743,9 @@ def soak(host, minutes, workers):
 
 
 def main():
+    # No container runtime unless a scenario gives one: the machine's own
+    # Docker would change the task tool, and leave its commands running
+    os.environ.setdefault("PROSPERO_TEST_DOCKER", os.path.join(os.sep, "nonexistent", "docker"))
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--prospero", required=True, help="the harness binary")
     ap.add_argument("--host", help="run the harness on this Windows host over ssh")

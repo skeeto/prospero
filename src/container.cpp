@@ -35,6 +35,13 @@
 // held are kept in container.ini, so that the Trash shows them while
 // it is stopped.
 //
+// An agent's subagent may run in a container of its own too (the task
+// tool's image, hostlink.cpp): named t-XXXXXXXX rather than p-, which
+// the window never lists, labelled com.nullprogram.prospero.task=1 as
+// well, with a folder here mounted at /out for what it leaves, and
+// removed when its subagent ends. The engine that made it owns it alone,
+// so any left at its start, by a crash, are removed (ctrleftovers).
+//
 // This is free and unencumbered software released into the public domain.
 
 enum : i64 {
@@ -77,6 +84,7 @@ struct Ctr {
     Str image;
     i32 workspace;  // CTR_*
     Str folder;     // copied or mounted
+    Str out;        // a folder here mounted at /out, if any (a subagent's)
     b32 network;
     i64 created;    // Unix epoch ms
     i64 trashed;    // Unix epoch ms it was stopped for the Trash, else 0
@@ -146,6 +154,53 @@ static Str ctrnoengine(Os *os, Arena *perm, Arena scratch)
     }
     Str ce = deploynoengine(perm, "linux");
     return ce.len ? ce : Str("no engine here for Linux (tools/engines.py builds one)");
+}
+
+// [container] images: the names, split at blanks and commas.
+static Slice<Str> ctrimagelist(Arena *a, Str setting)
+{
+    Slice<Str> r = {};
+    for (Str rest = setting; rest.len;) {
+        for (; rest.len && (rest[0]==' ' || rest[0]==',' || rest[0]=='\t'); rest = cuthead(rest, 1)) {}
+        iz n = 0;
+        for (; n<rest.len && rest[n]!=' ' && rest[n]!=',' && rest[n]!='\t'; n++) {}
+        if (n) {
+            r = push(a, r, takehead(rest, n));
+        }
+        rest = cuthead(rest, n);
+    }
+    return r;
+}
+
+// An image's name as compared: without Docker Hub's prefixes, and
+// tagged latest if it names no tag or digest.
+static Str ctrimagekey(Arena *a, Str image)
+{
+    image = trim(image);
+    if (startswith(image, "docker.io/library/")) {
+        image = cuthead(image, 18);
+    } else if (startswith(image, "docker.io/")) {
+        image = cuthead(image, 10);
+    }
+    iz slash = -1;
+    for (iz i = 0; i < image.len; i++) {
+        slash = image[i]=='/' ? i : slash;
+    }
+    Str last = cuthead(image, slash+1);
+    return find(last, ":")>=0 || find(last, "@")>=0 ? image : concat(a, image, ":latest");
+}
+
+// Whether image is one of [container] images.
+static b32 ctrimagelisted(Arena scratch, Str setting, Str image)
+{
+    Slice<Str> list = ctrimagelist(&scratch, setting);
+    Str        want = ctrimagekey(&scratch, image);
+    for (iz i = 0; i < list.len; i++) {
+        if (ctrimagekey(&scratch, list[i]) == want) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // The runtime's name for people: Docker or Podman.
@@ -272,11 +327,11 @@ static Str ctrowner(Arena *a, Str localstate)
     return finish(&b);
 }
 
-// A new container's name: p- and 8 hex digits.
-static Str ctrnewname(Os *os, Arena *a)
+// A new container's name: p- (t- for a subagent's) and 8 hex digits.
+static Str ctrnewname(Os *os, Arena *a, Str prefix = "p-")
 {
     Buf b(a, 10);
-    print(&b, "p-");
+    print(&b, prefix);
     printhex(&b, os_random(os), 8);
     return finish(&b);
 }
@@ -309,6 +364,10 @@ static Slice<Str> ctrcreateargv(Arena *a, Ctr *c, Str owner, Str state, Str cpus
     r = push(a, r, concat(a, ctrlabel, "=1"));
     r = push(a, r, Str("--label"));
     r = push(a, r, concat(a, concat(a, ctrlabel, ".owner="), owner));
+    if (startswith(c->name, "t-")) {
+        r = push(a, r, Str("--label"));
+        r = push(a, r, concat(a, ctrlabel, ".task=1"));
+    }
     r = push(a, r, Str("--init"));
     if (!c->network) {
         r = push(a, r, Str("--network"));
@@ -331,6 +390,10 @@ static Slice<Str> ctrcreateargv(Arena *a, Ctr *c, Str owner, Str state, Str cpus
     r = push(a, r, concat(a, ctrstate, "/run"));
     r = push(a, r, Str("-v"));
     r = push(a, r, c->workspace==CTR_MOUNT ? concat(a, c->folder, ":/work") : Str("/work"));
+    if (c->out.len) {
+        r = push(a, r, Str("-v"));
+        r = push(a, r, concat(a, c->out, ":/out"));
+    }
     r = push(a, r, Str("-w"));
     r = push(a, r, Str("/work"));
     r = push(a, r, Str("--entrypoint"));
@@ -350,6 +413,9 @@ static Str ctrini(Arena *a, Ctr *c)
     print(&b, "workspace = "); print(&b, ctrworkspaces[c->workspace]); putbyte(&b, '\n');
     if (c->folder.len) {
         print(&b, "folder = ");  print(&b, c->folder);   putbyte(&b, '\n');
+    }
+    if (c->out.len) {
+        print(&b, "out = ");     print(&b, c->out);      putbyte(&b, '\n');
     }
     print(&b, "network = ");   print(&b, c->network ? Str("yes") : Str("no"));
     putbyte(&b, '\n');
@@ -389,6 +455,8 @@ static Ctr ctrparse(Arena *a, Str name, Str text)
             c.workspace = v=="copy" ? CTR_COPY : v=="mount" ? CTR_MOUNT : CTR_EMPTY;
         } else if (k == "folder") {
             c.folder = clone(a, v);
+        } else if (k == "out") {
+            c.out = clone(a, v);
         } else if (k == "network") {
             c.network = v == "yes";
         } else if (k == "created") {
@@ -675,4 +743,51 @@ static Str ctrstateof(Str states, Str name)
         }
     }
     return {};
+}
+
+// Remove the subagents' containers an engine of this state directory
+// left, by a crash or a quit cut short: every t- directory, and every
+// container of this owner named prospero-t-, whether or not it has one.
+// Best effort. Returns how many were removed.
+static i32 ctrleftovers(CtrRun *run, Arena scratch, Str program, Str owner)
+{
+    Os *os         = run->d.os;
+    Str localstate = run->conf.localstate;
+    Str dir        = join(&scratch, localstate, "containers");
+    Str states     = ctrstates(run, &scratch, carve(&scratch, 1<<20), program, owner);
+    i32 n          = 0;
+    Slice<Str> done = {};
+    for (Dirent *d = os_list(os, &scratch, dir); d; d = d->next) {
+        if (!d->isdir || !startswith(d->name, "t-")) {
+            continue;
+        }
+        done = push(&scratch, done, d->name);
+        Arena tmp  = scratch;
+        Str   path = join(&tmp, join(&tmp, dir, d->name), "container.ini");
+        Read  rd   = os_read(os, &tmp, path, 1<<16);
+        Ctr   c    = rd.err==READ_OK ? ctrparse(&tmp, d->name, rd.data) : Ctr{};
+        c.name     = d->name;
+        c.program  = program;  // the runtime as found now
+        ctrremove(run, &tmp, carve(&tmp, 1<<20), &c);
+        n++;
+    }
+    for (Str rest = states; rest.len;) {
+        Cut l = cut(rest, '\n');
+        Cut ns = cut(l.head, ' ');
+        rest = l.tail;
+        b32 seen = !startswith(ns.head, "t-");
+        for (iz i = 0; !seen && i < done.len; i++) {
+            seen = done[i] == ns.head;
+        }
+        if (seen) {
+            continue;
+        }
+        Arena tmp = scratch;
+        Ctr   c   = {};
+        c.name    = ns.head;
+        c.program = program;
+        ctrremove(run, &tmp, carve(&tmp, 1<<20), &c);
+        n++;
+    }
+    return n;
 }

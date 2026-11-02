@@ -55,6 +55,25 @@ host's `trash_days` runs `rm -f -v` and removes its directory. Making,
 starting and stopping run on threads of their own, their output in
 `STATE/containers/run.err` when one fails.
 
+An agent's subagent may run in a container of its own too: the task
+tool's `image` (with `copy`, a folder copied into `/work`, and
+`network`), offered while the engine's runtime answers and a Linux
+engine is here (src/hostlink.cpp). The runtime is found when the first
+session that offers task opens, on a thread, and cached in
+`STATE/containers/runtime` for the next start. An image not in
+`[container] images`, or network access, asks the user first, with an
+"always" for that image in the session's tree. Each container is
+`prospero-t-XXXXXXXX`, labelled `...task=1` too and never listed by
+the window, with `-v OUT:/out`, OUT a folder in the parent's scratch
+directory, which the report names when the subagent left files there.
+The engine makes it on a thread while the link waits in connecting,
+reaches it as an exec link, deploying its engine over `cat`, and
+removes it (`rm -f -v`) once its subagent ends and the link closes, or
+at once when the call is cancelled first. Quitting waits for that. An
+engine's `t-` containers left by a crash are removed when the runtime
+is found next, as is any container of its owner named `prospero-t-`.
+`[container] subagents = no` turns it off.
+
 A remote machine needs an engine built for its platform, which
 `prospero deploy` uploads with scp to `~/.prospero` there, as
 `engine-PROTO-VERSION-OS-ARCH`, verifies it by its SHA-256, and

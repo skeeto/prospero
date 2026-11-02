@@ -103,6 +103,21 @@ after `trash_days` does. A mounted folder is never removed.
 or a path), `cpus`, `memory` and further `args` for each new container,
 and `list = never` hides it all.
 
+## Containers for subagents
+
+With a runtime running, an agent may also start a subagent in a new
+container of an image (the task tool's image), for work best kept away
+from this computer: untrusted code, fuzzing, crashes. It has no network
+unless the agent asks for it, and works in `/work`, empty or with a
+copy of a folder in the workspace. It shares no files with this
+computer but `/out`, a folder in the session's scratch directory, whose
+place its report gives; the container is removed when the subagent
+ends. An image `[container] images` lists runs without asking; any
+other, or one with network access, asks you first, and Always allows
+that image for the rest of the session. `[container] subagents = no`
+turns this off. The Community Edition needs a Linux engine for it,
+which the Professional Edition bundles.
+
 ## Sessions on a remote
 
 A host's menu in the sidebar also has New session here... and Import

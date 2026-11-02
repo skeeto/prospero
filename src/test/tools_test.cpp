@@ -206,9 +206,28 @@ static void test_tools(Test *t)
         expect(t, "task host no issues", istr(a, td.issues.len), "0");
         Args tf = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"cwd\":\"/x\"}", EDIT_REPLACE);
         expect(t, "task cwd without host", tf.issues.len ? tf.issues[0] : Str{},
-               "cwd: only with host: here, a subagent works in your working directory");
+               "cwd: only with host or image: here, a subagent works in your working "
+               "directory");
         Args tg = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"host\":\"\"}", EDIT_REPLACE);
         expect(t, "task empty host", istr(a, !tg.host.data && !tg.issues.len), "1");
+        // image: not with host; copy and network only with it
+        Args th = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"image\":\" debian:12 \","
+                            "\"copy\":\"src\",\"network\":true,\"cwd\":\"/work/src\"}",
+                            EDIT_REPLACE);
+        expect(t, "task image", concat(a, concat(a, th.image, "|"), th.copy), "debian:12|src");
+        expect(t, "task image ok", istr(a, th.network*10 + th.issues.len), "10");
+        Args ti = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"image\":\"x\",\"host\":\"y\"}",
+                            EDIT_REPLACE);
+        expect(t, "task image and host", ti.issues.len ? ti.issues[0] : Str{},
+               "image: not with host: a container is a host of its own");
+        Args tj = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"copy\":\"src\"}",
+                            EDIT_REPLACE);
+        expect(t, "task copy without image", tj.issues.len ? tj.issues[0] : Str{},
+               "copy: only with image: here, a subagent shares your files");
+        Args tk = parseargs(a, TOOL_TASK, "{\"prompt\":\"p\",\"network\":true}",
+                            EDIT_REPLACE);
+        expect(t, "task network without image", tk.issues.len ? tk.issues[0] : Str{},
+               "network: only with image");
 
         // send_message: a target and some text, at most 16 KiB of it
         Args ma = parseargs(a, TOOL_MESSAGE, "{\"to\":\" k1 \",\"text\":\"hi\"}", EDIT_REPLACE);

@@ -100,6 +100,7 @@ enum : u32 {
     MAIL_DISTROS,     // the WSL distros, a line each (farinit)
     MAIL_GIT,         // git's answer for a repository (git.cpp)
     MAIL_WORKTREE,    // a worktree job's answer (worktree.cpp)
+    MAIL_CTR,         // a container job's answer, for subagents (hostlink.cpp)
 };
 
 enum : i64 {
@@ -497,6 +498,13 @@ struct WebSpill {
     Str ctype;
 };
 
+// The user's answer about a task call's container, before it starts.
+struct TaskAsk {
+    Str call;   // its id
+    b32 allow;
+    Str text;   // denied: its result
+};
+
 // An ask waiting for the user, or recently resolved.
 struct Ask {
     Str       req;
@@ -530,6 +538,7 @@ struct Grant {
     Str web;    // "search" for every search, "fetch" for every page of
     Str host;   // a host; for an MCP grant, its server's url by its
                 // SHA-256 (mcpurlkey), as it holds only while that stays
+    Str image;  // a container image subagents may run in (the task tool's)
 };
 
 // An image converted for a request (topng).
@@ -795,6 +804,8 @@ struct Session {
                              // as a notice (bgreport)
     i64          treqs;      // requests made for the task
     Slice<TaskRun> tasks;    // the subagents of the calls running
+    Slice<TaskAsk> taskasks; // the user's answers for the task calls about
+                             // to start, by call (taskasks)
     b32          parkme;     // idle long enough: park it (enginethread)
     // Limits a frontend set (new), as an eval does
     i64          stepmax;    // model requests a turn at most, else 0
@@ -904,6 +915,11 @@ struct Engine {
     EHttp      *freehttp; // handles to reuse (ehttp)
     Relay      *relay;    // offers, relayed calls, and those served (relay.cpp)
     Slice<Str>  distros;  // the WSL distros installed, as last listed
+    Str         ctrname;  // the container runtime, docker or podman, for
+    Str         ctrpath;  // subagents (hostlink.cpp): its program, and
+    b32         ctrup;    // whether its daemon answered, as last asked
+    b32         ctrprobed;   // asked anew (farctrok)
+    b32         ctrprobing;  // and not answered yet
     GitWork    *git;      // runs git for sessions' changes, once asked
     GitWork    *wt;       // runs git for worktrees (worktree.cpp)
     Slice<WtJob> wtjobs;  // worktree jobs not yet answered
@@ -2097,6 +2113,8 @@ static b32  busy(Session *);
 static i32  get32(Str);
 static i64  get64(Str);
 static void starttasks(Session *, Arena);
+static b32  taskasks(Session *, Arena);
+static void taskanswered(Session *, b32, i32, Str, i64);
 static void taskcancel(Session *, Arena);
 
 // Subagents on other hosts (hostlink.cpp)
@@ -2115,6 +2133,10 @@ static Str  farhostsdesc(Engine *, Arena *, Arena);
 static HostLink *farbyout(Engine *, u64);
 static void farmail(Engine *, Arena, HostLink *, Record);
 static void farreoffer(Engine *, Arena);
+static b32  farctrok(Engine *, Arena);
+static Str  farctrimages(Engine *, Arena *, Arena);
+static b32  farctrlisted(Engine *, Arena, Str);
+static void farctrmail(Engine *, Arena, Record);
 
 // A session's branch and changes (git.cpp)
 static void cmdgit(Engine *, Arena, i64, Json *);
@@ -4826,6 +4848,24 @@ static u32 deskgranted(Session *s)
     return r;
 }
 
+// Whether a grant is a path's, not one of a class, a tool, the web or
+// an image.
+static b32 grantispath(Grant g)
+{
+    return !g.desk && !g.mcp.len && !g.web.len && !g.image.len;
+}
+
+// A grant's strings in an arena.
+static Grant grantclone(Arena *a, Grant g)
+{
+    g.path  = grantispath(g) ? clone(a, g.path) : Str{};
+    g.mcp   = g.mcp.len ? clone(a, g.mcp) : Str{};
+    g.web   = g.web.len ? clone(a, g.web) : Str{};
+    g.host  = g.host.len ? clone(a, g.host) : Str{};
+    g.image = g.image.len ? clone(a, g.image) : Str{};
+    return g;
+}
+
 static b32 hasgrant(Session *s, Grant want)
 {
     if (want.desk) {
@@ -4833,13 +4873,17 @@ static b32 hasgrant(Session *s, Grant want)
     }
     for (iz i = 0; i < s->grants.len; i++) {
         Grant *g = &s->grants[i];
-        if (want.web.len) {
+        if (want.image.len) {
+            if (g->image == want.image) {
+                return 1;
+            }
+        } else if (want.web.len) {
             if (g->web==want.web && g->host==want.host) {
                 return 1;
             }
         } else if (want.mcp.len && g->mcp==want.mcp && g->host==want.host) {
             return 1;
-        } else if (!want.mcp.len && !g->desk && !g->mcp.len && !g->web.len &&
+        } else if (!want.mcp.len && grantispath(*g) &&
                    g->path==want.path && (g->write || !want.write)) {
             return 1;
         }
@@ -4853,7 +4897,7 @@ static void guardgrants(Session *s, Arena *perm, Guard *g)
     for (iz i = 0; i < s->grants.len; i++) {
         Grant *t     = &s->grants[i];
         i32    flags = ROOT_HIDDEN | ROOT_MISSING | (t->write ? 0 : ROOT_READ);
-        if (!t->desk && !t->mcp.len && !t->web.len) {
+        if (grantispath(*t)) {
             guardadd(s->e->os, perm, g, t->path, flags);
         }
     }
@@ -4866,12 +4910,9 @@ static b32 addgrant(Session *s, Grant g)
     if (hasgrant(s, g)) {
         return 0;
     }
-    g.path = g.desk || g.mcp.len || g.web.len ? Str{} : clone(&s->perm, g.path);
-    g.mcp  = g.mcp.len ? clone(&s->perm, g.mcp) : Str{};
-    g.web  = g.web.len ? clone(&s->perm, g.web) : Str{};
-    g.host = g.host.len ? clone(&s->perm, g.host) : Str{};
+    g = grantclone(&s->perm, g);
     s->grants = push(&s->perm, s->grants, g);
-    if (!g.desk && !g.mcp.len && !g.web.len) {
+    if (grantispath(g)) {
         i32 flags = ROOT_HIDDEN | ROOT_MISSING | (g.write ? 0 : ROOT_READ);
         guardadd(s->e->os, &s->perm, &s->guard, g.path, flags);
     }
@@ -4887,7 +4928,10 @@ static Grant grantof(Json *j)
     Str   m = jsonstr(jsonget(j, "mcp"));
     Str   w = jsonstr(jsonget(j, "web"));
     Str   h = jsonstr(jsonget(j, "host"));
-    if (w.len) {
+    Str   i = jsonstr(jsonget(j, "image"));
+    if (i.len) {
+        g.image = i;
+    } else if (w.len) {
         // Every search, or every page of a host: no other kind is known
         b32 ok = w=="search" || (w=="fetch" && h.len);
         g.web  = ok ? w : Str{};
@@ -4923,9 +4967,11 @@ static void loggrant(Session *s, Arena scratch, Grant g, Str by, Str req, Str fr
     if (s->readonly) {
         return;
     }
-    Buf   b(&scratch, 256 + g.path.len + g.host.len + req.len + from.len);
+    Buf   b(&scratch, 256 + g.path.len + g.host.len + g.image.len + req.len + from.len);
     EvOut w = sbegin(s, &b, EV_GRANT);
-    if (g.web.len) {
+    if (g.image.len) {
+        putstrkey(&w.json, "image", g.image);
+    } else if (g.web.len) {
         putstrkey(&w.json, "web", g.web);
         if (g.host.len) {
             putstrkey(&w.json, "host", g.host);
@@ -5056,6 +5102,8 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
         } else if (k->tool==TOOL_WEBSEARCH || k->tool==TOOL_WEBFETCH) {
             g.web   = k->tool==TOOL_WEBSEARCH ? Str("search") : Str("fetch");
             g.host  = k->tool==TOOL_WEBFETCH ? k->grant : Str{};
+        } else if (k->tool == TOOL_TASK) {
+            g.image = k->grant;
         } else {
             g.path  = k->grant;
             g.write = k->gwrite;
@@ -5069,6 +5117,9 @@ static void resolve(Session *s, Arena scratch, b32 allow, i32 by, Str note,
     } else if (k->tool == TOOL_ASKUSER) {
         questionresolve(s, scratch, allow, by, note, qa);
         return;
+    } else if (k->tool == TOOL_TASK) {
+        taskanswered(s, allow, by, note, (t - k->opened + SEC/2) / SEC);
+        return;  // the caller's nexttool asks the next, or starts them
     }
     toolstart(s, scratch);
     if (k->mcp) {
@@ -11409,13 +11460,16 @@ static void nexttool(Session *s, Arena scratch)
         }
         if (s->calls[s->callidx].name=="task" && !s->blocked &&
                 tooloffered(&s->te, TOOL_TASK)) {
-            starttasks(s, a);  // they end as their subagents report
-            return;
+            if (taskasks(s, a)) {
+                starttasks(s, a);  // they end as their subagents report
+            }
+            return;  // else asking the user about a container first
         }
         if (!runtool(s, a)) {
             return;  // a command is running
         }
     }
+    s->taskasks = {};  // a cancelled turn's, never started
     toolsdone(s, scratch);
 }
 
@@ -12969,6 +13023,8 @@ static void buildprefix(Session *s, Arena scratch)
     if (tooloffered(&s->te, TOOL_TASK)) {
         taskroles(e, &s->perm, scratch, &s->te);
         s->te.hosts = farhostsdesc(e, &s->perm, scratch);
+        s->te.ctr   = farctrok(e, scratch);
+        s->te.ctrimages = s->te.ctr ? farctrimages(e, &s->perm, scratch) : Str{};
     }
     s->system = systemprompt(&s->perm, s->cwd, &s->te, s->nofolder);
     s->system = s->wt.name.len ? concat(&s->perm, s->system, wtpromptline(s, &scratch))
@@ -13644,11 +13700,7 @@ static Session *newchild(Session *p, Arena scratch, iz k, Args *args, Str *err)
     // The parent's scratch directory, and its grants (logged below)
     s->scratch = p->scratch.len ? clone(&s->perm, p->scratch) : Str{};
     for (iz i = 0; i < p->grants.len; i++) {
-        Grant g = p->grants[i];
-        g.path = g.desk || g.mcp.len || g.web.len ? Str{} : clone(&s->perm, g.path);
-        g.mcp  = g.mcp.len ? clone(&s->perm, g.mcp) : Str{};
-        g.web  = g.web.len ? clone(&s->perm, g.web) : Str{};
-        g.host = g.host.len ? clone(&s->perm, g.host) : Str{};
+        Grant g = grantclone(&s->perm, p->grants[i]);
         s->grants = push(&s->perm, s->grants, g);
     }
     s->model = clone(&s->perm, model);
@@ -13722,13 +13774,19 @@ static void starttasks(Session *s, Arena scratch)
         Args     args = parseargs(&a, TOOL_TASK, s->calls[k].args, s->te.edit);
         Session *c    = 0;
         b32      far  = 0;
+        TaskAsk *asked = 0;
+        for (iz i = 0; i < s->taskasks.len; i++) {
+            asked = s->taskasks[i].call==s->calls[k].id ? &s->taskasks[i] : asked;
+        }
         if (args.issues.len) {
             t.text = argserror(&s->perm, "task", s->calls[k].args, &args);
+        } else if (asked && !asked->allow) {
+            t.text = asked->text;
         } else if (k-s->callidx >= TASK_BATCH) {
             t.text = "Not started: one response may start at most 16 "
                      "subagents. Start the rest once these have reported.";
-        } else if (args.host.len) {
-            far = farstart(s, a, k, &args, &t);  // on another host
+        } else if (args.host.len || args.image.len) {
+            far = farstart(s, a, k, &args, &t);  // on another host, or in a container
         } else {
             c = newchild(s, a, k, &args, &t.text);
         }
@@ -13744,8 +13802,135 @@ static void starttasks(Session *s, Arena scratch)
             startturn(c, a, args.prompt, "task");
         }
     }
+    s->taskasks = {};
     setstate(s, S_TASK);
     arm(s, T_TASK, 0);  // calls that started nothing end now
+}
+
+// A task call's container needs the user's approval: an image not in
+// [container] images, or network access, unless granted or bypassing.
+static b32 taskneedsask(Session *s, Arena scratch, Args *args)
+{
+    if (!args->image.len || bypassing(s)) {
+        return 0;
+    }
+    Grant g = {};
+    g.image = args->image;
+    b32 ok  = !args->network && (farctrlisted(s->e, scratch, args->image) || hasgrant(s, g));
+    return !ok;
+}
+
+// Before the task calls from the current one on start: ask the user
+// about the first whose container needs it and has no answer yet.
+// Returns whether every one is answered, so that they may start.
+static b32 taskasks(Session *s, Arena scratch)
+{
+    Engine *e = s->e;
+    for (iz k = s->callidx; k<s->calls.len && s->calls[k].name=="task"; k++) {
+        Arena  a    = scratch;
+        Block *c    = &s->calls[k];
+        Args   args = parseargs(&a, TOOL_TASK, c->args, s->te.edit);
+        b32    seen = 0;
+        for (iz i = 0; i < s->taskasks.len; i++) {
+            seen |= s->taskasks[i].call == c->id;
+        }
+        if (seen || args.issues.len || k-s->callidx>=TASK_BATCH ||
+                !taskneedsask(s, a, &args)) {
+            continue;
+        }
+
+        Ask *q = &s->ask;
+        *q = {};
+        q->req    = clone(&s->perm, concat(&a, c->id, "/ask"));
+        q->tool   = TOOL_TASK;
+        q->grant  = args.network ? Str{} : clone(&s->perm, args.image);
+        q->opened = os_ticks(e->os);
+        b32 steer = s->steers.len > 0;
+        b32 wait  = attending(s) && !steer;
+        i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
+        if (wait) {
+            arm(s, T_ASK, delay);
+        }
+        {
+            Buf b(&a, 512 + args.image.len + args.copy.len);
+            print(&b, "start a subagent in a new container of ");
+            print(&b, args.image);
+            print(&b, args.network ? Str(", with network access") : Str(", with no network"));
+            if (args.copy.len) {
+                print(&b, ", a copy of ");
+                print(&b, args.copy);
+                print(&b, " in it");
+            }
+            Str   what = finish(&b);
+            Buf   o(&a, 512 + 2*what.len);
+            EvOut w = sbegin(s, &o, EV_ASK);
+            putstrkey(&w.json, "req", q->req);
+            putstrkey(&w.json, "call", c->id);
+            putstrkey(&w.json, "kind", "container");
+            putstrkey(&w.json, "tool", "task");
+            putstrkey(&w.json, "detail", what);
+            putstrkey(&w.json, "image", args.image);
+            putkey(&w.json, "network");
+            putbool(&w.json, args.network);
+            if (q->grant.len) {
+                putstrkey(&w.json, "always", q->grant);
+                putstrkey(&w.json, "scope", "container");
+            }
+            putintkey(&w.json, "deadline", os_time(e->os) + (wait ? delay/MS : 0));
+            putstrkey(&w.json, "dflt", "deny");
+            ssend(s, &w);
+        }
+        if (wait) {
+            setstate(s, S_ASK);
+            return 0;
+        }
+        resolve(s, a, 0, steer ? DENY_STEER : DENY_POLICY, {});  // recorded
+    }
+    return 1;
+}
+
+// The answer about a task call's container (resolve): kept, for
+// starttasks.
+static void taskanswered(Session *s, b32 allow, i32 by, Str note, i64 wait)
+{
+    Str call = cuttail(s->ask.req, 4);  // ID/ask
+    Buf b(&s->perm, 512 + note.len);
+    switch (by) {
+    case DENY_POLICY:
+        print(&b, "No subagent was started: a container needs the user's "
+                  "approval, and nobody is there to give it in this run. "
+                  "Use an image the configuration allows, without network, "
+                  "or do the work another way.");
+        break;
+    case DENY_USER:
+        print(&b, "No subagent was started: the user denied this container.");
+        if (note.len) {
+            print(&b, " The user's note: ");
+            print(&b, note);
+        } else {
+            print(&b, " Do not try it again unless the user asks.");
+        }
+        break;
+    case DENY_TIMEOUT:
+        print(&b, "No subagent was started: a container needs the user's "
+                  "approval, and nobody answered within ");
+        print(&b, wait);
+        print(&b, " seconds.");
+        break;
+    case DENY_CANCEL:
+        print(&b, "Not run: the user cancelled the turn.");
+        break;
+    default:
+        print(&b, "No subagent was started: ");
+        print(&b, note.len ? note : Str("the user sent a message instead"));
+        print(&b, ".");
+        break;
+    }
+    TaskAsk t = {};
+    t.call  = clone(&s->perm, call);
+    t.allow = allow;
+    t.text  = allow ? Str{} : finish(&b);
+    s->taskasks = push(&s->perm, s->taskasks, t);
 }
 
 // A session's last response with text in it: a subagent's report.
@@ -15687,12 +15872,9 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             // "Always allow", as the guard has it from then on, or a
             // class of desktop actions
             Grant g = grantof(j);
-            if ((g.desk || g.path.len || g.mcp.len || g.web.len) && !hasgrant(s, g)) {
-                g.path = g.desk || g.mcp.len || g.web.len ? Str{} : clone(&s->perm, g.path);
-                g.mcp  = g.mcp.len ? clone(&s->perm, g.mcp) : Str{};
-                g.web  = g.web.len ? clone(&s->perm, g.web) : Str{};
-                g.host = g.host.len ? clone(&s->perm, g.host) : Str{};
-                s->grants = push(&s->perm, s->grants, g);
+            if ((g.desk || g.path.len || g.mcp.len || g.web.len || g.image.len) &&
+                    !hasgrant(s, g)) {
+                s->grants = push(&s->perm, s->grants, grantclone(&s->perm, g));
             }
         } break;
         case EV_TASKREPORT:
@@ -19418,6 +19600,9 @@ static void onrecord(Engine *e, Arena scratch, Record r)
         return;
     } else if (r.type == MAIL_DISTROS) {
         fardistros(e, r.data);
+        return;
+    } else if (r.type == MAIL_CTR) {
+        farctrmail(e, scratch, r);
         return;
     } else if (r.type == MAIL_GIT) {
         gitdone(e, scratch, r.data);

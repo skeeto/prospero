@@ -1104,7 +1104,8 @@ static void testcfgjson(Test *t)
         "container//memory=*\n"
         "container//args=*\n"
         "container//images=*\n"
-        "container//list=always*\n");
+        "container//list=always*\n"
+        "container//subagents=true*\n");
 
     Json *schema = jsonget(j, "schema");
     expect(t, "json.schema", istr(&a, jsonlen(schema)),

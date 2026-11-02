@@ -1089,6 +1089,9 @@ def realcleanup(a):
 
 
 def main():
+    # No container runtime unless a scenario gives one: the machine's own
+    # Docker would change the task tool, and leave its commands running
+    os.environ.setdefault("PROSPERO_TEST_DOCKER", os.path.join(os.sep, "nonexistent", "docker"))
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--prospero", required=True)
     ap.add_argument("--ssh", help="a host for the real scenario")

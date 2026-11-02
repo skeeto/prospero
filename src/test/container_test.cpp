@@ -91,6 +91,40 @@ static void test_container(Test *t)
     expect(t, "ctrowner differs", istr(&a, ctrowner(&a, "/st")!=ctrowner(&a, "/su")), "1");
     expect(t, "ctrnewname", istr(&a, ctrnewname(v.os, &a).len), "10");
 
+    // A subagent's: t-, labelled a task's, its /out mounted, and never
+    // listed with the window's
+    Ctr k = {};
+    k.name    = "t-00c0ffee";
+    k.program = "docker";
+    k.image   = "alpine";
+    k.out     = "/sc/containers/t-00c0ffee";
+    argv = ctrcreateargv(&a, &k, "f00d", "/s/state", {}, {}, {});
+    expect(t, "ctrcreate task", joinwords(&a, argv),
+           "docker|create|--name|prospero-t-00c0ffee|"
+           "--label|com.nullprogram.prospero=1|"
+           "--label|com.nullprogram.prospero.owner=f00d|"
+           "--label|com.nullprogram.prospero.task=1|--init|--network|none|"
+           "-v|/s/state:/prospero/state|--tmpfs|/prospero/state/run|-v|/work|"
+           "-v|/sc/containers/t-00c0ffee:/out|-w|/work|--entrypoint|sleep|alpine|"
+           "2147483647");
+    expect(t, "ctrsave task", istr(&a, ctrsave(v.os, v.scratch, "/st", &k)), "1");
+    expect(t, "ctrini out", istr(&a, find(cfgfile(v.os, "/st/containers/t-00c0ffee/container.ini"),
+                                          "\nout = /sc/containers/t-00c0ffee\n")>0), "1");
+    expect(t, "ctrall no task", istr(&a, ctrall(v.os, &a, v.scratch, "/st").len), "1");
+    expect(t, "ctrnewname task", takehead(ctrnewname(v.os, &a, "t-"), 2), "t-");
+
+    // [container] images, by name as compared
+    Slice<Str> imgs = ctrimagelist(&a, " debian:12, alpine\tdocker.io/library/ubuntu:24.04,,");
+    expect(t, "ctrimagelist", joinwords(&a, imgs), "debian:12|alpine|docker.io/library/ubuntu:24.04");
+    expect(t, "ctrimagekey", ctrimagekey(&a, "docker.io/library/alpine"), "alpine:latest");
+    expect(t, "ctrimagekey registry", ctrimagekey(&a, "localhost:5000/fuzz"),
+           "localhost:5000/fuzz:latest");
+    expect(t, "ctrimagekey digest", ctrimagekey(&a, "alpine@sha256:ab"), "alpine@sha256:ab");
+    Str set = "debian:12, alpine, docker.io/library/ubuntu:24.04";
+    expect(t, "ctrimagelisted", istr(&a, ctrimagelisted(a, set, "alpine:latest")*100 +
+                                         ctrimagelisted(a, set, "ubuntu:24.04")*10 +
+                                         ctrimagelisted(a, set, "debian:13")), "110");
+
     // [container] chooses what runs: an included file's is ignored
     os_write(v.os, a, "/c/team.ini", "[container]\nargs = --privileged\n");
     os_write(v.os, a, "/c/x.ini", "include = team.ini\n[container]\nimages = debian:12\n");

@@ -649,10 +649,15 @@ static CfgKey cfgschema[] = {
      "\"...\" quoting: --cap-add=SYS_PTRACE, say"},
     {"container", "images", CFG_STRING, "", {}, {}, "container",
      "Images New session offers first, by name, separated by blanks or "
-     "commas: debian:12, ubuntu:24.04"},
+     "commas: debian:12, ubuntu:24.04. An agent may start a subagent in a "
+     "container of one of these without asking"},
     {"container", "list", CFG_ENUM, "always", {}, "always never", "container",
      "Whether the session list shows the container runtime when one is "
      "installed: always, or never"},
+    {"container", "subagents", CFG_BOOL, "true", {}, {}, "container",
+     "Whether agents may start subagents in containers of their own (the "
+     "task tool's image), each removed when its subagent ends; an image "
+     "not in images, or one with network access, is asked about"},
 
     {"mcp", "command", CFG_STRING, "", {}, {}, "mcp",
      "The server's program and its arguments, run without a shell (quote "
