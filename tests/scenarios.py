@@ -32,6 +32,7 @@ on this machine's LAN address instead.
 import argparse
 import base64
 import concurrent.futures
+import hashlib
 import json
 import os
 import random
@@ -3434,7 +3435,8 @@ def hello_caps(t):
                                                    "relay.offer", "relay.data",
                                                    "relay.more", "relay.peer",
                                                    "relay.call", "offer", "ask.touch",
-                                                   "shell.env", "call.stop", "cut", "uncut"]
+                                                   "shell.env", "call.stop", "cut", "uncut",
+                                                   "mcp.confirm"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and
@@ -10825,6 +10827,66 @@ def mcp_http_token(t):
     end = r.last("tool.end")
     t.check(end["status"] == "ok" and end["text"] == "echo: hi", f"called {end}")
     t.check(all(m["_http"]["Authorization"] == "Bearer s3cret" for m in mcplog(t)), "the token")
+
+
+@scenario(bound=30)
+def mcp_include_confirm(t):
+    """A token and trust = yes of the user's own file over a server an
+    included file gives the url of: nothing goes to the url until the
+    user confirms it (prospero mcp confirm), then the token goes and the
+    call runs unasked. Once the include moves the server, it waits for
+    the user again, sending nothing."""
+    env = mcpenv(t, WEB_TOKEN="s3cret")
+    srv = McpHttpServer(t, FAKE_MCP_TOKEN="s3cret")
+    team = t.host.join(t.base, "team.ini")
+    t.host.write(team, f"[mcp web]\nurl = {srv.url}\n")
+    t.host.write(t.config, f"include = {team}\n" + t.host.read(t.config) +
+                 "[mcp web]\ntoken = env:WEB_TOKEN\ntrust = yes\n")
+    cli = ["--state", t.state, "-c", t.config]
+    try:
+        rc, out, err = prun(t, ["mcp", "list"] + cli, env)
+        t.check(rc == 0 and f"web: {srv.url}, not signed in, url not confirmed" in out,
+                f"listed: {rc} {out} {err}")
+        rc, out, err = prun(t, ["mcp", "confirm", "web"] + cli, env)
+        t.check(rc == 0 and f"  {srv.url}\n" in out and
+                f"prospero mcp confirm web {srv.url}" in out, f"shown: {rc} {out} {err}")
+
+        r = t.run(env=env)
+        t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+        warns = [n["text"] for n in r.all("note") if "MCP server web failed" in n["text"]]
+        t.check(len(warns) == 1 and "prospero mcp confirm web" in warns[0] and
+                srv.url not in warns[0], f"warned {warns}")
+        t.check(mcplog(t) == [], "nothing sent before confirming")
+        rc, out, err = prun(t, ["mcp", "auth", "web"] + cli, env)
+        t.check(rc == 1 and "confirm its url first" in err, f"no sign-in: {rc} {err}")
+
+        rc, out, err = prun(t, ["mcp", "confirm", "web", srv.url + "x"] + cli, env)
+        t.check(rc == 1 and "no longer the one given" in err, f"another url: {rc} {err}")
+        rc, out, err = prun(t, ["mcp", "confirm", "web", srv.url] + cli, env)
+        t.check(rc == 0 and "Confirmed web's url." in out, f"confirmed: {rc} {out} {err}")
+        kept = t.host.read(os.path.join(t.state, "mcp", "confirmed.json")) or ""
+        t.check(srv.url not in kept and hashlib.sha256(srv.url.encode()).hexdigest() in kept,
+                f"kept by hash: {kept}")
+        rc, out, err = prun(t, ["mcp", "list"] + cli, env)
+        t.check("not confirmed" not in out, f"listed confirmed: {out}")
+
+        r = t.run(env=env)
+        t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+        end = r.last("tool.end")
+        t.check(end["status"] == "ok" and end["text"] == "echo: hi", f"called {end}")
+        t.check(not r.all("ask"), "trusted: no ask")
+        sent = mcplog(t)
+        t.check(sent and all(m["_http"]["Authorization"] == "Bearer s3cret" for m in sent),
+                "the token, once confirmed")
+
+        t.host.write(team, f"[mcp web]\nurl = {srv.url}?v=2\n")
+        r = t.run(env=env)
+        t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+        warns = [n["text"] for n in r.all("note") if "MCP server web failed" in n["text"]]
+        t.check(len(warns) == 1 and "prospero mcp confirm web" in warns[0], f"moved {warns}")
+        t.check(len(mcplog(t)) == len(sent), "nothing sent to the moved url")
+    finally:
+        srv.close()
 
 
 @scenario(bound=15)

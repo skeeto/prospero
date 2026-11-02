@@ -10599,10 +10599,31 @@ static void drawmcp(Gui *g, Arena a, Str name)
     ImGui::PopTextWrapPos();
     itemnamed(g, concat(&a, "mcp state ", name));
 
+    // An included url to confirm first, for what the user's file adds
+    Str confirm = hostcan(g->main, "mcp.confirm") ? jsonstr(jsonget(m, "confirm")) : Str{};
+    if (confirm.len) {
+        ImGui::TextWrapped("Your own file adds a token, header or trust to this "
+                           "server, whose url an included file gives. Nothing goes "
+                           "to it until you confirm that this is the url you mean:");
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+        ImGui::TextWrapped("%s", cstr0(&a, confirm));
+        ImGui::PopStyleColor();
+        itemnamed(g, concat(&a, "mcp url ", name));
+        b32 yes = ImGui::SmallButton("Confirm");
+        itemnamed(g, concat(&a, "mcp confirm ", name));
+        ImGui::SetItemTooltip("Connect to it at this url, with what your file "
+                              "adds, until an included file changes the url");
+        if (yes) {
+            mcpcmd(g, CMD_MCPCONFIRM, name, confirm);
+        }
+        ImGui::SameLine();
+    }
+
     Str busy = g->mcpname.len ? concat(&a, concat(&a, "Signing in to ", g->mcpname),
                                        Str(" already")) : Str{};
     if (http) {
-        Str why = !can ? Str("The engine is too old to sign in") : busy;
+        Str why = !can ? Str("The engine is too old to sign in") :
+                  confirm.len ? Str("Confirm its url first") : busy;
         ImGui::BeginDisabled(why.len > 0);
         b32 in = ImGui::SmallButton(signed_ ? "Sign in again" : "Sign in");
         ImGui::EndDisabled();

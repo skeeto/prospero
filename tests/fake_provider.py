@@ -2646,6 +2646,7 @@ def sc_mcp_http_auth(model, n, req):
 
 
 sc_mcp_http_token = sc_mcp_http_auth
+sc_mcp_include_confirm = sc_mcp_http_auth
 
 
 def sc_mcp_oauth(model, n, req):

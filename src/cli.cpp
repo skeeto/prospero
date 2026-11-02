@@ -719,9 +719,13 @@ static i32 climain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs, b32 
 //   prospero mcp list            the servers the configuration names
 //   prospero mcp auth NAME       sign in, through a browser
 //   prospero mcp logout NAME     forget its tokens
+//   prospero mcp confirm NAME    print the included url to confirm
+//   prospero mcp confirm NAME URL   confirm it
 //
 // These drive an engine of their own, as run does, with the commands
-// the window sends (mcp, mcp.auth, mcp.code, mcp.logout). The sign-in
+// the window sends (mcp, mcp.auth, mcp.code, mcp.logout, mcp.confirm).
+// Confirming takes the url typed back, so that it is the one the user
+// saw, and only while the configuration still gives it. The sign-in
 // prints the URL to visit and takes the browser's return at a loopback
 // listener of its own, waiting 10 minutes at most.
 
@@ -729,6 +733,7 @@ static Str mcpusage =
 "usage: prospero mcp list [options]\n"
 "       prospero mcp auth NAME [options]\n"
 "       prospero mcp logout NAME [options]\n"
+"       prospero mcp confirm NAME [URL] [options]\n"
 "options:\n"
 "  -c FILE       configuration file\n"
 "  --state DIR   state directory\n";
@@ -781,7 +786,7 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
     Cli c = {};
     c.os = os;
     Str verb = nargs>2 ? args[2] : Str{};
-    Str name = {}, config = {}, state = {};
+    Str name = {}, url = {}, config = {}, state = {};
     for (i32 i = 3; i < nargs; i++) {
         Str a = args[i];
         if (a=="-c" && i+1<nargs) {
@@ -790,12 +795,14 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             state = args[++i];
         } else if (!name.data && verb!="list" && (!a.len || a[0]!='-')) {
             name = a;
+        } else if (!url.data && verb=="confirm" && a.len && a[0]!='-') {
+            url = a;
         } else {
             os_print(os, 2, mcpusage);
             return 2;
         }
     }
-    if ((verb!="list" && verb!="auth" && verb!="logout") ||
+    if ((verb!="list" && verb!="auth" && verb!="logout" && verb!="confirm") ||
             (verb!="list" && !name.len)) {
         os_print(os, 2, mcpusage);
         return 2;
@@ -826,11 +833,69 @@ static i32 mcpmain(Os *os, Arena perm, Arena scratch, Str *args, i32 nargs)
             if (url.len) {
                 print(&out, jsonint(jsonget(s, "signedin"), 0) ? Str(", signed in")
                                                                : Str(", not signed in"));
+                print(&out, jsonstr(jsonget(s, "confirm")).len ? Str(", url not confirmed") : Str(""));
             }
             print(&out, jsonstr(jsonget(s, "source"))=="project" ? Str(" (a project's)") : Str(""));
             putbyte(&out, '\n');
         }
         os_print(os, 1, finish(&out));
+    } else if (verb=="confirm" && !url.len) {
+        Arena a = scratch;
+        Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCP, 1, {}), 1, 0);
+        Json *f = 0;
+        for (Json *s = jsonget(r, "servers")->child; s; s = s->next) {
+            if (jsonstr(jsonget(s, "name"))==name && jsonstr(jsonget(s, "source"))=="config") {
+                f = s;
+            }
+        }
+        Str want = jsonstr(jsonget(f, "confirm"));
+        if (!f || !jsonstr(jsonget(f, "url")).len) {
+            print(&out, "prospero: no MCP server over HTTP is named ");
+            print(&out, name);
+            putbyte(&out, '\n');
+            os_print(os, 2, finish(&out));
+            code = 1;
+        } else if (!want.len) {
+            print(&out, name);
+            print(&out, " needs no confirming: its url is ");
+            print(&out, jsonstr(jsonget(f, "url")));
+            putbyte(&out, '\n');
+            os_print(os, 1, finish(&out));
+        } else {
+            print(&out, "An included file gives ");
+            print(&out, name);
+            print(&out, "'s url, to which your own file adds a token, header or "
+                        "trust:\n\n  ");
+            print(&out, want);
+            print(&out, "\n\nIf that is the server you mean, confirm it with:\n\n"
+                        "  prospero mcp confirm ");
+            print(&out, name);
+            putbyte(&out, ' ');
+            print(&out, want);
+            putbyte(&out, '\n');
+            os_print(os, 1, finish(&out));
+        }
+    } else if (verb == "confirm") {
+        Arena   a = scratch;
+        Buf     mb(&a, 128 + url.len);
+        JsonOut w = {&mb};
+        putobject(&w);
+        putstrkey(&w, "url", url);
+        putend(&w);
+        Json *more = jsonparse(&a, finish(&mb)).root;
+        Json *r    = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPCONFIRM, 1, name, more), 1, 0);
+        if (!jsonint(jsonget(r, "ok"), 0)) {
+            print(&out, "prospero: ");
+            print(&out, jsonstr(jsonget(r, "err")));
+            putbyte(&out, '\n');
+            os_print(os, 2, finish(&out));
+            code = 1;
+        } else {
+            print(&out, "Confirmed ");
+            print(&out, name);
+            print(&out, "'s url.\n");
+            os_print(os, 1, finish(&out));
+        }
     } else if (verb == "logout") {
         Arena a = scratch;
         Json *r = mcpcliwait(&c, &a, mcpcmdline(&a, CMD_MCPLOGOUT, 1, name), 1, 0);

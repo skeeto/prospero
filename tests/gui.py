@@ -1811,8 +1811,11 @@ def main():
             stdout=subprocess.PIPE, text=True,
             env={**os.environ, "FAKE_MCP_LOG": host.path("mcp.log")})
         mcpport = int(mcpsrv.stdout.readline())
-        before = config(curl, model, 60,
-                        f"\n[mcp web]\nurl = http://127.0.0.1:{mcpport}/mcp\ntrust = yes\n")
+        # Its url from an included file, trusted by the user's own, so
+        # that it waits for Confirm first
+        team = host.path("team.ini")
+        host.write(team, f"[mcp web]\nurl = http://127.0.0.1:{mcpport}/mcp\n")
+        before = f"include = {team}\n" + config(curl, model, 60, "\n[mcp web]\ntrust = yes\n")
     elif args.mode == "sessions":
         # A model and a shell to switch to; a remote listed always,
         # never reached, and one listed only while connected

@@ -36,8 +36,14 @@ tools only by naming them: `mcp__NAME` for all of a server's, or
 An included file may give a server by its `url`, but not its
 `command`, `cwd` or `env.NAME`, which run programs, nor `trust = yes`,
 nor change a server your own file gives the `url` or `command` of. Your
-file may add to an included server, such as its `token`, but your
-`trust = yes` counts only for a server you define yourself.
+file may add to an included server, such as its `token` or
+`trust = yes`. Since the include could later point the server
+elsewhere, a `token`, `client_secret`, `header.NAME` or `trust = yes`
+of yours holds only for a url you confirm, as a cookie holds only for
+its site: until then the server does not connect, and its page in
+Settings shows the url with Confirm (or run
+`prospero mcp confirm NAME`). Should the include change the url, it
+waits for you to confirm the new one.
 
 ## Asks
 

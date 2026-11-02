@@ -2314,6 +2314,7 @@ static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
     Str   state  = jsonstr(jsonget(m, "state"));
     b32   http   = jsonstr(jsonget(m, "url")).len || mcprow(g, name, "url").len;
     i64   tools  = jsonint(jsonget(m, "tools"), 0);
+    b32   confirm = state=="confirm" || jsonstr(jsonget(m, "confirm")).len;
     Buf   b(a, 256);
     print(&b, name);
     print(&b, ": ");
@@ -2322,6 +2323,10 @@ static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
         print(&b, "the engine is too old to show it");
     } else if (!m) {
         print(&b, g->mcplist ? Str("not in the configuration the engine has") : Str("..."));
+    } else if (confirm) {
+        // Stopped or failed for it: it connects only once confirmed
+        print(&b, "waits for you to confirm its url");
+        *dot = g->pal->amber;
     } else if (state == "ready") {
         print(&b, "running, ");
         print(&b, tools);
@@ -2339,7 +2344,7 @@ static Str mcpstatus(Gui *g, Arena *a, Str name, u32 *dot)
     } else {
         print(&b, "not running: it starts for a session that uses it");
     }
-    if (m && http && state!="auth") {
+    if (m && http && state!="auth" && !confirm) {
         print(&b, jsonint(jsonget(m, "signedin"), 0) ? Str("; signed in")
                                                     : Str("; not signed in"));
     }
@@ -2505,15 +2510,18 @@ static void mcpbrowsed(Gui *g, Record r)
 }
 
 // Sign out, or start again: then listed again.
-static void mcpcmd(Gui *g, i32 cmd, Str name)
+static void mcpcmd(Gui *g, i32 cmd, Str name, Str url = {})
 {
     g->mcpmsg    = {};
     g->mcpmsgfor = clone(&g->perm, name);
     Arena a = newarena(g->cmdr);
-    Buf   b(&a, 256);
+    Buf   b(&a, 256 + url.len);
     EvOut w = cmdopen(g, &b, cmd, 0, g->main);
     putkey(&w.json, "name");
     putstr(&w.json, name);
+    if (url.len) {
+        putstrkey(&w.json, "url", url);
+    }
     cmdsend(g, &w, a);
 }
 
@@ -5345,6 +5353,7 @@ static void onreply(Gui *g, GuiHost *h, Arena scratch, EvRec *r, Str line)
         return;
     case CMD_MCPLOGOUT:
     case CMD_MCPRESTART:
+    case CMD_MCPCONFIRM:
         if (!ok) {
             mcpsay(g, g->mcpmsgfor, err, 1);
         }
@@ -15720,7 +15729,9 @@ static DriveOp hosttaskops[] = {
 };
 
 // MCP (--mcp, tests/gui.py --mode mcp): the page of [mcp web], a fake
-// server over HTTP that wants a sign-in, says it is not signed in; Sign
+// server over HTTP that wants a sign-in, whose url an included file
+// gives and to which the user's file adds trust = yes, waits for its
+// url to be confirmed; Confirm, and it says it is not signed in; Sign
 // in, through the checklist's stand-in browser, signs in; a session's
 // call to its echo tool goes through, which the page shows running;
 // Sign out leaves it needing a sign-in.
@@ -15744,6 +15755,11 @@ static DriveOp mcpops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_PAGE, 0, 0, 0, "mcp web"},
+    {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: waits for you to confirm its url"},
+    {OP_SHOT, 0, 0, 0, 300, "mcp-0-confirm"},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "mcp confirm web"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 100, ""},
     {OP_WAIT, W_MCPSTATE, 0, 0, 10000, "web: not running"},
     {OP_CHECK, CHK_MCPSTATE, 0, 0, 0,
      "web: not running: it starts for a session that uses it; not signed in"},

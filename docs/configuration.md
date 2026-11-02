@@ -208,9 +208,16 @@ a server over HTTP holds only while its url stays the same. An included
 file may define a server by its `url`, but its `command`, `cwd`,
 `env.NAME` and `trust = yes` are ignored, as is anything it sets for a
 server your own file gives the `url` or `command` of. Your file may add
-to an included server, a `token = file:PATH` say, but its `trust = yes`
-counts only for a server it defines itself, since the include could
-point the server elsewhere.
+to an included server, a `token = file:PATH` say, or `trust = yes`.
+Since the include could point the server elsewhere, what your file
+adds that must not follow it there (a `token`, `client_secret`,
+`header.NAME` or `trust = yes`) holds only for a url you confirm, as a
+cookie holds for its site. Until then the server does not connect at
+all: its page in Settings shows the url with Confirm, and
+`prospero mcp confirm NAME` prints it and the command that confirms it.
+An include that changes the url needs you to confirm the new one.
+Confirmed urls are kept, by their SHA-256, in the state directory's
+`mcp/confirmed.json`.
 
 A project's `.mcp.json`, in Claude Code's format, with `${VAR}` and
 `${VAR:-default}` expanded, is read once as a session starts, from its

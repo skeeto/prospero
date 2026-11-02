@@ -8997,11 +8997,120 @@ static i64 mcprequest(Engine *e, Arena scratch, McpServer *m, i32 kind, Str meth
     return p.id;
 }
 
-// A server's settings as the configuration has them now.
+// Confirmed urls
+//
+// What the user's own file adds to a server an included file gives the
+// url of (cfgadds: a token, client_secret, header or trust) holds only
+// for a url the user confirmed, as a cookie holds for its origin: until
+// then the server does not connect at all, since the include may point
+// it anywhere. Confirm, in Settings, or prospero mcp confirm (mcp.confirm)
+// keeps the server's name with its url's SHA-256 for good, in
+// <state>/mcp/confirmed.json, one url per name.
+
+static Str mcpconfpath(Engine *e, Arena *a)
+{
+    return join(a, join(a, e->statedir, "mcp"), "confirmed.json");
+}
+
+static b32 mcpconfirmed(Engine *e, Arena scratch, Str name, Str url)
+{
+    Read rd = os_read(e->os, &scratch, mcpconfpath(e, &scratch), 1<<20);
+    if (rd.err!=READ_OK || !url.len) {
+        return 0;
+    }
+    Str  key = cfgsha256(&scratch, url);
+    Json *j  = jsonparse(&scratch, rd.data).root;
+    for (Json *x = jsonget(j, "confirmed")->child; x; x = x->next) {
+        if (jsonstr(jsonget(x, "name"))==name && jsonstr(jsonget(x, "sha256"))==key) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Keep a server's url as confirmed, in place of any it had: 0 if it
+// could not be written.
+static b32 mcpconfirm(Engine *e, Arena scratch, Str name, Str url)
+{
+    Str  path = mcpconfpath(e, &scratch);
+    Read rd   = os_read(e->os, &scratch, path, 1<<20);
+    Json *j   = jsonparse(&scratch, rd.err==READ_OK ? rd.data : Str("{}")).root;
+    Buf     b(&scratch, 1024 + rd.data.len);
+    JsonOut w = {&b};
+    putobject(&w);
+    putkey(&w, "confirmed");
+    putarray(&w);
+    for (Json *x = jsonget(j, "confirmed")->child; x; x = x->next) {
+        if (jsonstr(jsonget(x, "name")) != name) {
+            putjson(&w, x);
+        }
+    }
+    putobject(&w);
+    putstrkey(&w, "name", name);
+    putstrkey(&w, "sha256", cfgsha256(&scratch, url));
+    putintkey(&w, "at", os_time(e->os));
+    putend(&w);
+    putend(&w);
+    putend(&w);
+    putbyte(&b, '\n');
+    Str out = finish(&b);
+    Str dir = join(&scratch, e->statedir, "mcp");
+    os_mkdirs(e->os, scratch, dir);
+    return os_write(e->os, scratch, path, out);
+}
+
+// Whether a server of the configuration over HTTP waits for the user to
+// confirm its url, as it is in the configuration now.
+static b32 mcpunconfirmed(Engine *e, Arena scratch, Str name)
+{
+    Str url = trim(cfgget(e->cfg, "mcp", name, "url", 0));
+    return url.len && cfgadds(e->cfg, name) && !mcpconfirmed(e, scratch, name, url);
+}
+
+// Whether a server's tools run without asking: the configuration trusts
+// it, at the url it runs at, confirmed where that must be (cfgadds).
+static b32 mcptrusts(Engine *e, Arena scratch, McpServer *m)
+{
+    Config *c = e->cfg;
+    if (m->project.len || !cfgtrusts(c, m->name)) {
+        return 0;
+    } else if (!m->url.len) {
+        return 1;  // a command, which only the user's own file gives
+    }
+    return m->url==trim(cfgget(c, "mcp", m->name, "url", 0)) &&
+           (!cfgadds(c, m->name) || mcpconfirmed(e, scratch, m->name, m->url));
+}
+
+static Str mcpconfirmmsg(Arena *a, Str name)
+{
+    Buf b(a, 256 + 2*name.len);
+    print(&b, "an included file gives its url, which you have not confirmed "
+              "for what your own file adds to it: in Settings, at mcp ");
+    print(&b, name);
+    print(&b, ", Confirm, or run: prospero mcp confirm ");
+    print(&b, name);
+    return finish(&b);
+}
+
+// A server that waits, unconnected, for the user to confirm its url.
+static void mcpneedconfirm(Engine *e, Arena scratch, McpServer *m)
+{
+    Str why  = mcpconfirmmsg(&scratch, m->name);
+    Str told = concat(&scratch, concat(&scratch, "The MCP server ", m->name),
+                      concat(&scratch, " failed: ", why));
+    mcpstop(e, scratch, m, told);
+    m->state    = MCP_FAILED;
+    m->confirm  = 1;
+    m->err      = clone(&e->perm, why);
+    m->retryat  = I64MAX;  // not until confirmed
+    mcpwake(e, scratch, m);
+}
+
+// A server's settings as the configuration has them now, but for its
+// trust, which depends on its url (mcptrusts).
 static void mcpconf(Engine *e, McpServer *m)
 {
     Config *c  = e->cfg;
-    m->trust   = !m->project.len && cfgtrusts(c, m->name);
     m->startms = cfgms(c, "mcp", m->name, "startup_timeout", 0);
     m->callms  = cfgms(c, "mcp", m->name, "timeout", 0);
     m->config  = inisection(e->ini, "mcp", m->name) != 0;
@@ -9030,6 +9139,8 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
     m->pages    = 0;
     m->err      = {};
     m->state    = MCP_STARTING;
+    m->confirm  = 0;
+    m->trust    = 0;
     mcpconf(e, m);
     Str only    = m->project.len ? Str{} : trim(cfgget(e->cfg, "mcp", m->name, "tools", 0));
     m->only     = only.len ? clone(&m->arena, only) : Str{};
@@ -9060,6 +9171,12 @@ static void mcpstart(Engine *e, Arena scratch, McpServer *m, Session *s)
             m->headers = finish(&h);
         }
     }
+    if (m->url.len && !m->project.len && cfgadds(e->cfg, m->name) &&
+            !mcpconfirmed(e, scratch, m->name, m->url)) {
+        mcpneedconfirm(e, scratch, m);
+        return;
+    }
+    m->trust  = mcptrusts(e, scratch, m);  // at the url it now has
     m->bearer = {};
     if (m->url.len && !mcpauthorizes(m)) {
         McpTokens t = mcptokens(e, &scratch, m->name, m->url);
@@ -10098,6 +10215,7 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
     }
     if (m) {
         mcpconf(e, m);  // trust as the configuration says now
+        m->trust = mcptrusts(e, scratch, m);
     }
     Grant one = {};
     one.mcp  = t->name;  // an older session's grant
@@ -11060,6 +11178,11 @@ static void cmdmcpauth(Engine *e, Arena scratch, i64 id, Json *j)
     } else if (!redirect.len) {
         reply(e, scratch, id, 0, "no redirect was given", {});
         return;
+    } else if (mcpunconfirmed(e, scratch, name)) {
+        Str why = concat(&scratch, "confirm its url first, in Settings or with: "
+                         "prospero mcp confirm ", name);
+        reply(e, scratch, id, 0, why, {});
+        return;
     }
     McpAuth *x = mcpauthnew(e, scratch, name, url);
     if (!x) {
@@ -11166,6 +11289,37 @@ static void cmdmcplogout(Engine *e, Arena scratch, i64 id, Json *j)
     reply(e, scratch, id, 1, {}, {});
 }
 
+// mcp.confirm {name, url}: the url the user saw confirmed for what the
+// user's own file adds to the server (cfgadds), and the server started
+// again, if it is still the server's url.
+static void cmdmcpconfirm(Engine *e, Arena scratch, i64 id, Json *j)
+{
+    Str name = jsonstr(jsonget(j, "name"));
+    Str url  = jsonstr(jsonget(j, "url"));
+    Str now  = trim(cfgget(e->cfg, "mcp", name, "url", 0));
+    if (!inisection(e->ini, "mcp", name) || !now.len) {
+        Str why = concat(&scratch, "no MCP server over HTTP is named ",
+                         name.len ? name : Str("\"\""));
+        reply(e, scratch, id, 0, why, {});
+        return;
+    } else if (url != now) {
+        reply(e, scratch, id, 0, "its url is no longer the one given", {});
+        return;
+    } else if (!mcpconfirm(e, scratch, name, url)) {
+        Str why = concat(&scratch, "it could not be kept: ", os_lasterr(e->os, &scratch));
+        reply(e, scratch, id, 0, why, {});
+        return;
+    }
+    for (McpServer *m = e->mcp; m; m = m->next) {
+        if (m->name==name && !m->project.len && m->confirm) {
+            m->state   = MCP_STOPPED;
+            m->confirm = 0;
+            mcpstart(e, scratch, m, 0);
+        }
+    }
+    reply(e, scratch, id, 1, {}, {});
+}
+
 // mcp.restart {name}: started again now, over HTTP, or at a session's
 // next use, a program; a failed one also, without waiting.
 static void cmdmcprestart(Engine *e, Arena scratch, i64 id, Json *j)
@@ -11200,7 +11354,8 @@ static Str mcpstatename(McpServer *m)
     case MCP_STARTING:
     case MCP_LISTING:  return "starting";
     case MCP_READY:    return "ready";
-    case MCP_FAILED:   return m->needauth ? Str("auth") : Str("failed");
+    case MCP_FAILED:   return m->confirm ? Str("confirm") :
+                              m->needauth ? Str("auth") : Str("failed");
     }
     return "stopped";
 }
@@ -11222,6 +11377,10 @@ static void putmcpserver(Engine *e, Arena scratch, JsonOut *w, Str name, McpServ
         putstrkey(w, "url", url);
         McpTokens t = mcptokens(e, &scratch, name, url);
         putintkey(w, "signedin", t.access.len > 0);
+        if (!(m && m->project.len) && mcpunconfirmed(e, scratch, name)) {
+            // The url to confirm: the configuration's, where it connects next
+            putstrkey(w, "confirm", trim(cfgget(e->cfg, "mcp", name, "url", 0)));
+        }
     }
     putstrkey(w, "state", mcpstatename(m));
     putintkey(w, "tools", m && m->state==MCP_READY ? m->tools.len : 0);
@@ -19226,6 +19385,7 @@ static void command(Engine *e, Arena scratch, Str line)
         case CMD_MCPAUTH:
         case CMD_MCPCODE:
         case CMD_MCPRESTART:
+        case CMD_MCPCONFIRM:
         case CMD_SHELL:
         case CMD_GIT:
             reply(e, scratch, id, 0, "the engine is stopping", sid);
@@ -19392,6 +19552,9 @@ static void command(Engine *e, Arena scratch, Str line)
         return;
     case CMD_MCPRESTART:
         cmdmcprestart(e, scratch, id, j);
+        return;
+    case CMD_MCPCONFIRM:
+        cmdmcpconfirm(e, scratch, id, j);
         return;
     case CMD_NONE:
         reply(e, scratch, id, 0, "unknown command", {});

@@ -34,9 +34,10 @@
 // [mcp] or [web] section that the user's own file defines (its url or
 // command, its search or url) are ignored (cfgsealed): it may define
 // those, but not change the user's. The user's file may add to an
-// included one's, a token or key say, but its [mcp] trust = true
-// counts only for a server it defines, never one an include points
-// wherever it likes (cfgtrusts).
+// included one's, a token or key say. What it adds to an included MCP
+// server that must not follow the include's url elsewhere (a token,
+// client_secret, header or trust = true) holds only for a url the user
+// confirmed (cfgadds), as the engine keeps them.
 //
 // Edits (cfgset) go to the user's file only, never into an include,
 // through iniedit: one changed line, with comments, blank lines and
@@ -1733,12 +1734,40 @@ static b32 cfgownsection(Config *c, Str kind, Str name)
 }
 
 // Whether an MCP server's tools run without asking: its trust is true,
-// and the user's own file defines it (cfganchors), so that an included
-// file cannot point a trusted server elsewhere.
+// as only the user's own file may say (cfgownonly). Over an included
+// url it holds only once the user confirms that url (cfgadds).
 static b32 cfgtrusts(Config *c, Str name)
 {
-    return cfgbool(trim(cfgget(c, "mcp", name, "trust", 0)))==1 &&
-           cfganchors(c->user, "mcp", name);
+    return cfgbool(trim(cfgget(c, "mcp", name, "trust", 0))) == 1;
+}
+
+// Whether the user's own file adds to an MCP server an included file
+// gives the url of (cfganchors) what must not follow that url wherever
+// the include points it: a token, a client_secret, a header, or trust
+// = true. Like a cookie for its origin, these hold only for a url the
+// user confirmed, which the engine keeps, and an included file moving
+// the server needs the user to confirm it again.
+static b32 cfgadds(Config *c, Str name)
+{
+    IniEntry *u = cfgfind(c, "mcp", name, "url").e;
+    if (!u || !trim(u->value).len || u->file==c->user) {
+        return 0;
+    }
+    IniFile *f = c->user;
+    for (iz i = 0; f && i < f->lines.len; i++) {
+        IniLine    *l = &f->lines[i];
+        IniSection *s = l->section;
+        if (l->type!=INI_KEY || !s || s->kind!="mcp" || s->name!=name) {
+            continue;
+        }
+        Str v = trim(l->value);
+        if (((l->key=="token" || l->key=="client_secret") && v.len) ||
+                (startswith(l->key, "header.") && l->key.len>7) ||
+                (l->key=="trust" && cfgbool(v)==1)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // The names of the user's own file's [KIND NAME] sections, each once,
@@ -2021,16 +2050,6 @@ static void cfgkeyline(Ini *ini, Arena *perm, IniFile *f, IniFile *user,
             msg = finish(&b);
         }
         cfgreport(ini, perm, f, l, INI_ERROR, l->keybeg, msg);
-        return;
-    }
-    b32 defined = inientry(s, "url") || inientry(s, "command");
-    if (!shared && s->kind=="mcp" && l->key=="trust" && cfgbool(trim(l->value))==1 &&
-            defined && !cfganchors(user, "mcp", s->name)) {
-        Str msg = cfgmuted(f) ? Str{} :
-                  Str("trust applies only to a server your own file gives the url "
-                      "or command of, as an included file could point this one "
-                      "elsewhere: it is ignored here");
-        cfgreport(ini, perm, f, l, INI_WARNING, l->valbeg, msg);
         return;
     }
     i32 j = cfgjudge(key, l->value, shared);
