@@ -9980,7 +9980,12 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
     }
     ImGui::TableNextColumn();
     ImGui::SetNextItemWidth(-1);
-    ImGui::PushID(r);
+    // By what it is: the rows are made anew by each config.get, as after
+    // an edit goes out, and an id by address would take the focus from
+    // the field gone to meanwhile
+    Str id = concat(&a, concat(&a, concat(&a, r->kind, "\x1f"), concat(&a, r->name, "\x1f")),
+                    r->key);
+    ImGui::PushID(id.cdata, id.cdata+id.len);
     if (r->choices.len) {
         // A pick goes out at once; the theme and how reasoning shows
         // and counts apply even before the file has them
@@ -10030,10 +10035,13 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         n = n<8 ? n : 8;
         f32 h = (f32)n*ImGui::GetTextLineHeight() + 2*ImGui::GetStyle().FramePadding.y;
         ImGui::InputTextMultiline("##v", r->buf, (uz)r->cap, v2(-1, h));
+        r->typed |= ImGui::IsItemEdited();
+        r->active = ImGui::IsItemActive();
         if (target >= 0) {
             itemrect(g, target);
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
+            r->typed = 0;
             Str v   = rejoin(&a, {(u8 *)r->buf, (iz)__builtin_strlen(r->buf)}, '\n', "; ");
             Str was = r->isdflt ? Str{} : rejoin(&a, r->value, ';', "; ");
             if (v!=was && !(r->sent && v==r->sentval)) {
@@ -10050,10 +10058,13 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
         Str hint  = r->isdflt || r->like.len ? r->value : Str{};
         b32 enter = ImGui::InputTextWithHint("##v", hint.len ? cstr0(&a, hint) : "", r->buf, (uz)r->cap,
                                              ImGuiInputTextFlags_EnterReturnsTrue|ImGuiInputTextFlags_AutoSelectAll);
+        r->typed |= ImGui::IsItemEdited();
+        r->active = ImGui::IsItemActive();
         if (target >= 0) {
             itemrect(g, target);
         }
         if (enter || ImGui::IsItemDeactivatedAfterEdit()) {
+            r->typed = 0;
             // Enter both returns and deactivates: send each edit once
             Str v   = trim({(u8 *)r->buf, (iz)__builtin_strlen(r->buf)});
             Str was = r->isdflt || r->like.len ? Str{} : r->value;

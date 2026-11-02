@@ -848,6 +848,8 @@ struct CfgRow {
     iz         cap;
     b32        sent;     // an edit went out, until the next config.get
     Str        sentval;
+    b32        typed;    // the field edited since, not yet sent (loadcfg)
+    b32        active;   // the field has the focus, as last drawn
     Rect       page;     // the first of a section's: its page in the list
 };
 
@@ -4163,6 +4165,21 @@ static void setnotify(Gui *, u32);
 // theme they set.
 static void loadcfg(Gui *g, Str line)
 {
+    // What is typed in a field and not yet sent, as the field just gone
+    // to after another's edit went out, outlives the rows made anew
+    Arena      t     = g->frame;
+    Slice<CfgRow> typed = {};
+    for (iz i = 0; i < g->cfgrows.len; i++) {
+        CfgRow *o = &g->cfgrows[i];
+        if (o->typed) {
+            CfgRow k = {};
+            k.kind = clone(&t, o->kind);
+            k.name = clone(&t, o->name);
+            k.key  = clone(&t, o->key);
+            k.value = clone(&t, Str{(u8 *)o->buf, (iz)__builtin_strlen(o->buf)});
+            typed = push(&t, typed, k);
+        }
+    }
     g->cfgmem.beg = g->cfgbase;
     Arena *a = &g->cfgmem;
     Json  *j = jsonparse(a, clone(a, line)).root;
@@ -4237,6 +4254,12 @@ static void loadcfg(Gui *g, Str line)
         Str v = r.isdflt || r.like.len ? Str{} : r.value;
         if (r.type == "paths") {
             v = rejoin(a, v, ';', "\n");
+        }
+        for (iz i = 0; i < typed.len; i++) {
+            if (typed[i].kind==r.kind && typed[i].name==r.name && typed[i].key==r.key) {
+                v       = typed[i].value;
+                r.typed = 1;
+            }
         }
         r.cap = v.len + FIELD_MAX;
         r.buf = alloc<char>(a, r.cap);
@@ -12198,6 +12221,7 @@ enum : i32 {
     CHK_TITLEBAR,
     CHK_LONGFIELD,
     CHK_LONGEDIT,
+    CHK_CFGKEPT,
     CHK_ENGINESTOPPED,
     CHK_CLICKTHROUGH,
     CHK_NESTED,
@@ -12494,6 +12518,7 @@ static Str chknames[] = {
     "the window's frame follows the theme",
     "a setting longer than a field's slack is in its field whole",
     "the long setting, edited, was saved whole",
+    "the field Tab went to kept the focus and its text through the reload",
     "the engine died: nothing runs or waits, no ask stays open",
     "a click that activates the window also reaches what it lands on",
     "two subagents reported, listed under their parent",
@@ -14509,6 +14534,23 @@ static DriveOp settingsops[] = {
     {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
     {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
     {OP_CHECK, CHK_LONGEDIT, 0, 0, 0, ""},
+    // Left by Tab instead: the next field keeps the focus through the
+    // config.get that follows, and what is typed there before and after
+    {OP_SNAPCFG, 0, 0, 0, 100, ""},
+    {OP_MOVE, T_LONGFIELD, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 200, ""},
+    {OP_KEYDOWN, 0, GKEY_END, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_END, 0, 100, ""},
+    {OP_TEXT, 0, 0, 0, 200, " Left by Tab, then."},
+    {OP_KEYDOWN, 0, GKEY_TAB, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_TAB, 0, 0, ""},
+    {OP_TEXT, 0, 0, 0, 0, "7"},
+    {OP_WAIT, W_CONFIGSET, 0, 0, 5000, ""},
+    {OP_TEXT, 0, 0, 0, 300, "8"},
+    {OP_CHECK, CHK_CFGKEPT, 0, 0, 0, "78"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
     // The theme, dark, then light
     {OP_SHOWPAGE, 0, 0, 0, 300, "ui"},
     {OP_MOVE, T_PAGEITEM, 0, 0, 100, "ui"},
@@ -19121,6 +19163,18 @@ static b32 drivecheck(Gui *g, i32 chk)
         return r && g->longval.len && r->file.len &&
                r->value==concat(&a, g->longval, "!");
     }
+    case CHK_CFGKEPT:
+        // The field gone to by Tab kept the focus through the config.get
+        // after the edit left behind, and what was typed in it on either
+        // side of it
+        for (iz i = 0; i < g->cfgrows.len; i++) {
+            CfgRow *r = &g->cfgrows[i];
+            if (r->active && r->typed && r->key==Str("endpoint") &&
+                    Str{(u8 *)r->buf, (iz)__builtin_strlen(r->buf)}==g->ops[g->drivepc-1].text) {
+                return 1;
+            }
+        }
+        return 0;
     case CHK_ENGINESTOPPED: {
         b32 ok = g->enginegone && !running(g), unknown = 0, denied = 0;
         for (GuiSession *s = g->sessions; s; s = s->next) {

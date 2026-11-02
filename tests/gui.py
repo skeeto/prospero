@@ -2004,13 +2004,15 @@ def main():
             problems.append("stale frames reported")
     if args.mode == "settings":
         after = host.read(ini) or ""
-        if f"prompt = {LONG_PROMPT}!\n" not in after:
+        # Enter saved "!", and leaving by Tab the rest; what was typed in the
+        # field Tab went to, endpoint, was let go by Escape
+        if f"prompt = {LONG_PROMPT}! Left by Tab, then.\n" not in after:
             problems.append("the long value was not saved whole with its edit")
         if "[ui]\ntheme = light\n" not in after:
             problems.append("the theme was not saved as light under [ui]")
         # The edits, in order: the long value, the theme, notify, the roots, the
         # deleted endpoint with its comment, the new model and remote
-        want = before.replace(f"prompt = {LONG_PROMPT}\n", f"prompt = {LONG_PROMPT}!\n")
+        want = before.replace(f"prompt = {LONG_PROMPT}\n", f"prompt = {LONG_PROMPT}! Left by Tab, then.\n")
         want = want.replace("temp = ask\n", "temp = ask\nroots = ~/a; ~/b\n")
         want = want.replace(SETTINGS_GONE + "\n", "")
         want += ("\n[ui]\ntheme = light\nnotify = allow\n"
