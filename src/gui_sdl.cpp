@@ -1351,6 +1351,7 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         e.key.scancode = keys[ge->key].scan;
         e.key.mod      = (SDL_Keymod)((ge->ctrl ? SDL_KMOD_LCTRL : 0) |
                                       (ge->shift ? SDL_KMOD_LSHIFT : 0) |
+                                      (ge->alt ? SDL_KMOD_LALT : 0) |
                                       (ge->cmd ? SDL_KMOD_LGUI : 0));
         e.key.down     = ge->down;
     } break;

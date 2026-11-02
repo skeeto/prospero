@@ -3079,6 +3079,38 @@ static void drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end)
     }
 }
 
+// Where a subagent's or side chat's up arrow goes: its parent, or a side
+// chat's original (p, null if not listed here yet). It goes nowhere (far)
+// for a subagent whose parent is on another host and not open here.
+struct UpTo {
+    Str         up;    // the session id, null for neither
+    GuiSession *p;
+    b32         side;
+    b32         far;
+};
+
+static UpTo uptoof(Gui *g, GuiSession *s)
+{
+    UpTo r = {};
+    if (!s || !s->view || (!s->view->parent.len && !sessside(s).len)) {
+        return r;
+    }
+    r.side = !s->view->parent.len;
+    r.up   = r.side ? sessside(s) : s->view->parent;
+    r.p    = r.side ? findsess(g, s->host, r.up) : sessup(g, s);
+    r.far  = !r.side && s->view->remote && !r.p;
+    return r;
+}
+
+// Goes up from a subagent or side chat, by its arrow or Alt+Up.
+static void goup(Gui *g, GuiSession *s)
+{
+    UpTo u = uptoof(g, s);
+    if (u.up.len && !u.far) {
+        guiselect(g, u.p ? u.p : addsess(g, s->host, u.up));
+    }
+}
+
 // A line above the transcript: up to a subagent's parent, or a side
 // chat's original; the session's model, shell and mode; its branch,
 // context gauge, the toggles that open all its tool output and
@@ -3102,23 +3134,28 @@ static void drawsessbar(Gui *g)
     if (v->parent.len || sessside(s).len) {
         // Up to its parent, or a side chat's original, then what it is:
         // the Session pane says whose
-        b32         side = !v->parent.len;
-        Str         up   = side ? sessside(s) : v->parent;
-        GuiSession *p    = side ? findsess(g, s->host, up) : sessup(g, s);
-        b32         far  = !side && v->remote && !p;
-        ImGui::BeginDisabled(far);
+        UpTo        u    = uptoof(g, s);
+        b32         side = u.side;
+        GuiSession *p    = u.p;
+        ImGui::BeginDisabled(u.far);
         b32 click = iconbutton(ICON_UP "##barup");
         ImGui::EndDisabled();
         itemnamed(g, "up to parent");
-        if (!far) {
+        if (!u.far) {
             itemrect(g, side ? RECT_SIDELINK : RECT_PARENTLINK);
         }
-        Str title = shorten(&a, p ? sesstitle(p) : up, 60);
-        whytip(far  ? Str("Its parent is a session on another host, not open here") :
-               side ? concat(&a, "Up to the session this side chat began from: ", title)
-                    : concat(&a, "Up to the session that started this subagent: ", title));
-        if (click && !far) {
-            guiselect(g, p ? p : addsess(g, s->host, up));
+        Str title = shorten(&a, p ? sesstitle(p) : u.up, 60);
+        #if defined(__APPLE__)
+        Str key   = " (Cmd+Up)";
+        #else
+        Str key   = " (Alt+Up)";
+        #endif
+        whytip(u.far ? Str("Its parent is a session on another host, not open here") :
+               concat(&a, concat(&a, side ? Str("Up to the session this side chat began from: ")
+                                          : Str("Up to the session that started this subagent: "),
+                                 title), key));
+        if (click) {
+            goup(g, s);
         }
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
@@ -11652,7 +11689,7 @@ static void newfree(Gui *g)
 // The menus' shortcuts, wherever the focus is (a global route, which a
 // focused field's own use of a key goes ahead of): a new session, zoom
 // by key or by Ctrl+wheel (Cmd on macOS), find and the session's
-// folding toggles, Settings, and quitting on Linux, where
+// folding toggles, Settings, up to a parent, and quitting on Linux, where
 // no system shortcut does (macOS has Cmd+Q, Windows Alt+F4).
 static void menukeys(Gui *g)
 {
@@ -11684,6 +11721,16 @@ static void menukeys(Gui *g)
     if (ImGui::Shortcut(ctrl|ImGuiKey_Comma, glob)) {
         opensettings(g);
     }
+    // Up from a subagent or side chat, as a file explorer goes up a
+    // folder: Alt+Up, and on macOS Finder's Cmd+Up too
+    if (ImGui::Shortcut(ImGuiMod_Alt|ImGuiKey_UpArrow, glob)) {
+        goup(g, g->sess);
+    }
+    #if defined(__APPLE__)
+    if (ImGui::Shortcut(ctrl|ImGuiKey_UpArrow, glob)) {
+        goup(g, g->sess);
+    }
+    #endif
     if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_T, glob)) {
         setsessiontools(g, 0, !sessiontools(g));
     }

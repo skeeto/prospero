@@ -12852,6 +12852,7 @@ enum : i32 {
     KEY_CTRL  = 1,
     KEY_SHIFT = 2,
     KEY_CMD   = 4,  // Cmd on macOS, else Ctrl
+    KEY_ALT   = 8,  // Option on macOS
 };
 
 struct DriveOp {
@@ -13760,7 +13761,7 @@ static DriveOp m3ops[] = {
     {OP_MAIN, 0, 0, 0, 500, ""},
     // M4, in the light theme first. Two subagents, counted at work in
     // their parent's strip, then listed under it; the parent's task row
-    // shows one, and the subagent's own link goes back
+    // shows one, and the subagent's up arrow goes back, as does Alt+Up
     {OP_SYSTHEME, 0, 0, 0, 1000, ""},
     {OP_PROMPT, 0, 0, 0, 0, "Start subagents."},
     {OP_WAIT, W_TASKS, 0, 0, 10000, ""},
@@ -13777,6 +13778,14 @@ static DriveOp m3ops[] = {
     {OP_MOVE, T_PARENTLINK, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
+    // Down again, and up by Alt+Up, as the arrow goes
+    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CHILDSHOWN, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_UP, KEY_ALT, 50, ""},
+    {OP_KEYUP, 0, GKEY_UP, KEY_ALT, 500, ""},
     {OP_CHECK, CHK_PARENTSHOWN, 0, 0, 0, ""},
     // A subagent messages its parent, read after it reports; the notice
     // leads to the sender, and its row back
@@ -20265,6 +20274,7 @@ static void drivestep(Gui *g)
         e.ctrl  = ((i32)op->dy & KEY_CTRL)!=0 || (cmd && !g->mac);
         e.cmd   = cmd && g->mac;
         e.shift = ((i32)op->dy & KEY_SHIFT) != 0;
+        e.alt   = ((i32)op->dy & KEY_ALT) != 0;
         e.down  = op->op == OP_KEYDOWN;
         os_guiinject(g->os, &e);
     } break;

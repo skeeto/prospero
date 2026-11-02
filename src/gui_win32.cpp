@@ -87,7 +87,7 @@ extern "C" int       w32gui_toast(void *, int id, unsigned short const *title,
 extern "C" void      w32gui_untoast(void *, int id);
 extern "C" void      w32gui_inject(void *, int kind, float x, float y,
                                    int button, int down, int key, int ctrl,
-                                   int shift, unsigned short const *text);
+                                   int shift, int alt, unsigned short const *text);
 extern "C" int       w32gui_systheme(void *);  // 1 if apps should be dark
 extern "C" int       w32gui_theme(void *, int dark);  // the title bar's
 extern "C" void      w32gui_close(void *);
@@ -1157,7 +1157,7 @@ static DWORD WINAPI announcetheme(void *hwnd)
 
 extern "C" void w32gui_inject(void *p, int kind, float x, float y,
                               int button, int down, int key, int ctrl,
-                              int shift, unsigned short const *text)
+                              int shift, int alt, unsigned short const *text)
 {
     W32Gui *w  = (W32Gui *)p;
     LPARAM  xy = MAKELPARAM((int)x, (int)y);
@@ -1195,6 +1195,7 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
         GetKeyboardState(state);
         state[VK_CONTROL] = state[VK_LCONTROL] = ctrl ? 0x80 : 0;
         state[VK_SHIFT]   = state[VK_LSHIFT]   = shift ? 0x80 : 0;
+        state[VK_MENU]    = state[VK_LMENU]    = alt ? 0x80 : 0;
         if (vks[key]!=VK_CONTROL && vks[key]!=VK_SHIFT) {
             state[vks[key]] = down ? 0x80 : 0;
         }
@@ -1203,7 +1204,10 @@ extern "C" void w32gui_inject(void *p, int kind, float x, float y,
                       vks[key]==VK_SHIFT   ? VK_LSHIFT   : vks[key];
         UINT   scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
         LPARAM l    = 1 | (LPARAM)scan<<16 | (down ? 0 : (LPARAM)3<<30);
-        PostMessageW(w->hwnd, down ? WM_KEYDOWN : WM_KEYUP, vks[key], l);
+        // With Alt held, a system key, as Windows sends it
+        UINT   m    = alt ? (down ? WM_SYSKEYDOWN : WM_SYSKEYUP)
+                          : (down ? WM_KEYDOWN : WM_KEYUP);
+        PostMessageW(w->hwnd, m, vks[key], l | (alt ? (LPARAM)1<<29 : 0));
     } break;
     case 4:  // text
         for (int i = 0; text && text[i]; i++) {
@@ -1889,7 +1893,7 @@ static void os_guiinject(Os *os, GuiEvent *e)
         text = (unsigned short *)towide(&a, e->text).data;
     }
     w32gui_inject(os->gui, e->kind, e->x, e->y, e->button, e->down, e->key,
-                  e->ctrl, e->shift, text);
+                  e->ctrl, e->shift, e->alt, text);
 }
 
 static void os_guiraise(Os *os)

@@ -554,6 +554,7 @@ struct GuiEvent {
     i32 key;
     b32 ctrl;   // held with the key
     b32 shift;
+    b32 alt;    // Option on macOS
     b32 cmd;    // macOS's Cmd held (SDL only)
     Str text;   // null-terminated, and must outlive the event's dispatch
 };

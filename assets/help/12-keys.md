@@ -13,6 +13,9 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
   the focus, its search field instead.
 - **Ctrl+,**: the Settings pane, its search field taking the keyboard.
   On macOS, the Prospero menu's Settings... does the same.
+- **Alt+Up**: from a subagent or side chat, up to the session it
+  came from (the up arrow above its transcript). On macOS, Option+Up,
+  or Cmd+Up as in Finder.
 - **Ctrl+Shift+T**: open, or fold again, all of the session's tool
   output (the Tool output button above the transcript, a wrench and
   screwdriver).
