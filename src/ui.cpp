@@ -5924,7 +5924,8 @@ static b32 hostwsl(Gui *g, GuiHost *h)
 static char const *connecttip(Gui *g, Str name)
 {
     Reach l = remotelink(g, name);
-    return l.wsl.len  ? "Connect through wsl.exe, starting a host in the distro if none runs"
+    return ctrof(g, name) ? "Connect, starting the container first if it is stopped"
+         : l.wsl.len  ? "Connect through wsl.exe, starting a host in the distro if none runs"
          : l.exec.len ? "Connect by its command, starting a host there if none runs"
                       : "Connect over ssh, starting a host there if none runs";
 }
@@ -6604,10 +6605,16 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
             ImGui::SetItemTooltip("%s", connecttip(g, name));
         }
     }
-    Str why = h && hostready(g, h) ? Str{} : Str("It is not connected");
+    GuiCtr *hc = h ? ctrofhost(g, h) : 0;
+    b32     cs = hc && !hostready(g, h) && ctrstartable(g, hc);  // started first
+    Str why = cs || (h && hostready(g, h)) ? Str{} : Str("It is not connected");
     if (menuitem(g, a, "New session here...", why)) {
-        g->newhost = h;
-        newsession(g);
+        if (cs) {
+            ctrnewafter(g, hc);
+        } else {
+            g->newhost = h;
+            newsession(g);
+        }
     }
     Str iwhy = why.len ? why : importwhy(g, h);
     if (menuitem(g, a, "Import session here...", iwhy)) {
@@ -6927,20 +6934,30 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         // New session here, and Connect or Disconnect
         f32 y = p.y + (lineh + 4*sc - ImGui::GetFrameHeight())/2;
         ImGui::SetCursorScreenPos(v2(p.x + w - bw + st.ItemSpacing.x, y));
-        b32 ok = rt ? g->ctrrt.up : h && hostready(g, h);
+        GuiCtr *hc = h ? ctrofhost(g, h) : 0;
+        b32     cs = hc && !hostready(g, h) && ctrstartable(g, hc);  // started first
+        b32     ok = rt ? g->ctrrt.up : cs || (h && hostready(g, h));
         ImGui::BeginDisabled(!ok);
         if (iconbutton(ICON_ADD)) {
-            g->newhost = rt ? 0 : h;
-            g->newctr  = rt;
-            newsession(g);
+            if (cs) {
+                ctrnewafter(g, hc);  // New session once it is up
+            } else {
+                g->newhost = rt ? 0 : h;
+                g->newctr  = rt;
+                newsession(g);
+            }
         }
         ImGui::EndDisabled();
         itemnamed(g, concat(&a, "new ", r->key));
+        if (hc) {
+            itemnamed(g, "new ctrhost");  // the checklist's, its only one
+        }
         if (rt) {
             whytip(ok ? concat(&a, "A new session, in a new container: ", ctrtitle(g->ctrrt.name))
                       : g->ctrrt.why.len ? g->ctrrt.why : Str("Not running"));
         } else {
-            whytip(ok ? Str("A new session here") : Str("Not connected"));
+            whytip(cs ? Str("A new session here, once the container has started")
+                      : ok ? Str("A new session here") : Str("Not connected"));
         }
         if (remote1) {
             ImGui::SameLine();
@@ -6950,7 +6967,8 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
             ImGui::EndDisabled();
             itemnamed(g, concat(&a, "connect ", r->key));
             ImGui::SetItemTooltip("%s", live ? "Disconnect: leave it, its sessions running "
-                                               "on there" : connecttip(g, r->key));
+                                               "on there"
+                                             : connecttip(g, h ? h->name : remote));
             if (b && live) {
                 hostleave(g, h);
             } else if (b) {

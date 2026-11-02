@@ -515,6 +515,7 @@ struct GuiCtr {
     b32      removed;    // for good: skipped everywhere
     b32      stopafter;  // in the Trash: stop it once its host has let go
     Str      restore;    // the root restored: out of its Trash once up
+    b32      newafter;   // New session on it once up
     // The new session it was made for, started once its host is up
     b32      pending;
     Str      ep;
@@ -8826,12 +8827,17 @@ static void ctrkeep(Gui *g, GuiCtr *c)
 static b32 ctrready(Gui *g, GuiCtr *c)
 {
     GuiHost *h = ctrhost(g, c);
+    if (c->c.trashed) {
+        // Asked to connect, so out of the Trash, its sessions left there
+        c->c.trashed = 0;
+        c->stopafter = 0;
+        ctrsave(g->os, g->frame, g->statedir, &c->c);
+    }
     if (c->state == "running") {
         return 1;
-    } else if (c->c.trashed || !c->made || c->state=="gone") {
+    } else if (!c->made || c->state=="gone") {
         h->state = RS_FAILED;
-        h->msg   = c->c.trashed ? Str("it is in the Trash: restore a session to start it")
-                 : c->state=="gone" ? Str("the container is gone")
+        h->msg   = c->state=="gone" ? Str("the container is gone")
                  : c->err.len ? c->err : Str("not made yet");
         return 0;
     } else if (!g->ctrrt.up) {
@@ -8846,6 +8852,19 @@ static b32 ctrready(Gui *g, GuiCtr *c)
     h->state = RS_CONNECTING;
     h->msg   = "starting the container";
     return 0;
+}
+
+// Whether a container not connected can be started, to connect to it.
+static b32 ctrstartable(Gui *g, GuiCtr *c)
+{
+    return c->made && !c->removed && c->state!="gone" && g->ctrrt.up;
+}
+
+// New session on a container once it is up, starting it first.
+static void ctrnewafter(Gui *g, GuiCtr *c)
+{
+    c->newafter = 1;
+    remoteconnect(g, g->frame, ctrhost(g, c)->name);
 }
 
 // Make a container for a new session, from image, with folder copied
@@ -8896,6 +8915,8 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
     return {};
 }
 
+static void newsession(Gui *);
+
 // A container's host changed, as onremote heard: its new session, once
 // up, and one that stopped meanwhile.
 static void ctrremote(Gui *g, GuiHost *h, i32 was)
@@ -8907,6 +8928,11 @@ static void ctrremote(Gui *g, GuiHost *h, i32 was)
     if (h->up && was!=RS_UP && c->pending) {
         c->pending = 0;
         guinew(g, h, "/work", c->ep, c->model, c->role, c->plan);
+    } else if (h->up && was!=RS_UP && c->newafter) {
+        c->newafter = 0;
+        g->newhost  = h;
+        g->newctr   = 0;
+        newsession(g);
     } else if (h->up && was!=RS_UP && c->restore.len) {
         GuiSession *s = findsess(g, h, c->restore);
         c->restore = {};
@@ -15285,8 +15311,9 @@ static b32 ctrwait(Gui *g, Str what)
 
 // CHK_CTR: "made", the container copies --rcwd to /work, with no
 // network, its registry saying so; "trashed", it and its session are in
-// the Trash, the host left; "restored", neither is; "gone", nothing of
-// it is listed.
+// the Trash, the host left; "started", it is up again, its session
+// still in the Trash; "restored", neither is; "gone", nothing of it is
+// listed.
 static b32 ctrcheck(Gui *g, Str what)
 {
     GuiCtr *c = ctrfirst(g);
@@ -15310,6 +15337,9 @@ static b32 ctrcheck(Gui *g, Str what)
         return ok;
     } else if (what == "trashed") {
         return c->c.trashed && trashed==1 && !live && !c->h->r;
+    } else if (what == "started") {
+        // Its + started it, its session left in the Trash
+        return !c->c.trashed && trashed==1 && !live && c->h->up;
     } else if (what == "restored") {
         return !c->c.trashed && live==1 && !trashed && c->h->up;
     } else if (what == "gone") {
@@ -15322,7 +15352,8 @@ static b32 ctrcheck(Gui *g, Str what)
 // containers), against a real Docker or Podman: the runtime's row in
 // the sidebar; its New session, an image from [container] images,
 // --rcwd copied in, no network; a turn there, relayed; its session to
-// the Trash stops it, restored starts it, and Delete removes it.
+// the Trash stops it; its + starts it again for New session, the session
+// left in the Trash; restored, and Delete removes it.
 static DriveOp ctrops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -15370,6 +15401,18 @@ static DriveOp ctrops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 1000, ""},
     {OP_SHOT, 0, 0, 0, 300, "containers-3-trash"},
+    // Its + starts it, then opens New session, the session left in the
+    // Trash
+    {OP_MOVE, T_NAMED, 0, 0, 100, "new ctrhost"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CTR, 0, 0, 60000, "connected"},
+    {OP_MARK, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_CTR, 0, 0, 0, "started"},
+    {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ESCAPE, 0, 500, ""},
+    {OP_CHECK, CHK_NOMODAL, 0, 0, 0, ""},
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, ""},  // untitled, the only one
     {OP_RDOWN, 0, 0, 0, 60, ""},
     {OP_RUP, 0, 0, 0, 500, ""},
