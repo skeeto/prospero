@@ -125,6 +125,34 @@ static void test_container(Test *t)
                                          ctrimagelisted(a, set, "ubuntu:24.04")*10 +
                                          ctrimagelisted(a, set, "debian:13")), "110");
 
+    // A subagent's container's sessions, kept: each copied whole, its
+    // first record without remote, so a subagent of its parent here;
+    // never over a session here, nor a dot folder
+    Str kept = "/st/containers/t-0000beef/state/sessions";
+    Str dirs[] = {"/20261102-120000-abcd", "/20261102-120000-abcd/out",
+                  "/20261102-120001-dupe", "/.part"};
+    for (i32 i = 0; i < countof(dirs); i++) {
+        os_mkdirs(v.os, a, concat(&a, kept, dirs[i]));
+    }
+    os_mkdirs(v.os, a, "/st/sessions/20261102-120001-dupe");
+    os_write(v.os, a, concat(&a, kept, "/20261102-120000-abcd/events.jsonl"),
+             "{\"sid\":\"20261102-120000-abcd\",\"ev\":\"session\",\"cwd\":\"/work\","
+             "\"parent\":\"20261102-110000-0001\",\"call\":\"c1\",\"depth\":1,"
+             "\"remote\":1,\"via\":\"exec\",\"relay\":\"ab\"}\n{\"ev\":\"turn.end\"}\n");
+    os_write(v.os, a, concat(&a, kept, "/20261102-120000-abcd/out/x.txt"), "x");
+    os_write(v.os, a, concat(&a, kept, "/20261102-120001-dupe/events.jsonl"), "theirs\n");
+    os_write(v.os, a, concat(&a, kept, "/.part/events.jsonl"), "{}\n");
+    os_write(v.os, a, "/st/sessions/20261102-120001-dupe/events.jsonl", "mine\n");
+    ctrkeep(v.os, v.scratch, "/st", "t-0000beef");
+    expect(t, "ctrkeep log", cfgfile(v.os, "/st/sessions/20261102-120000-abcd/events.jsonl"),
+           "{\"sid\":\"20261102-120000-abcd\",\"ev\":\"session\",\"cwd\":\"/work\","
+           "\"parent\":\"20261102-110000-0001\",\"call\":\"c1\",\"depth\":1}\n"
+           "{\"ev\":\"turn.end\"}\n");
+    expect(t, "ctrkeep files", cfgfile(v.os, "/st/sessions/20261102-120000-abcd/out/x.txt"), "x");
+    expect(t, "ctrkeep not over", cfgfile(v.os, "/st/sessions/20261102-120001-dupe/events.jsonl"),
+           "mine\n");
+    expect(t, "ctrkeep dot", cfgfile(v.os, "/st/sessions/.part/events.jsonl"), "(missing)");
+
     // [container] chooses what runs: an included file's is ignored
     os_write(v.os, a, "/c/team.ini", "[container]\nargs = --privileged\n");
     os_write(v.os, a, "/c/x.ini", "include = team.ini\n[container]\nimages = debian:12\n");

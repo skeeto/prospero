@@ -114,8 +114,13 @@ computer but `/out`, a folder in the session's scratch directory, whose
 place its report gives; the container is removed when the subagent
 ends. An image `[container] images` lists runs without asking; any
 other, or one with network access, asks you first, and Always allows
-that image for the rest of the session. `[container] subagents = no`
-turns this off. The Community Edition needs a Linux engine for it,
+that image for the rest of the session. With no network, the subagent
+works in Bypass mode, as it can reach nothing of yours; with network,
+it asks as any session. While it works, the sidebar shows its container
+under Docker or Podman, and its task's Open subagent shows it there, to
+watch it or answer it. Once it ends, its transcript is kept here, as a
+subagent of its parent, and goes when the parent is deleted.
+`[container] subagents = no` turns this off. The Community Edition needs a Linux engine for it,
 which the Professional Edition bundles.
 
 ## Sessions on a remote

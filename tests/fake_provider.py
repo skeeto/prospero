@@ -2680,9 +2680,14 @@ GUI_PROMPTS = ("Stream slowly", "Run the tools", "be allowed", "wait for nobody"
                "Describe the images", "Ask on the side", "Run a long command",
                "Stream, then pause", "Call the MCP server", "Remember the hosts",
                "Answer with links", "Ask me questions", "Describe the files",
-               "Run a command to stop", "Read a long prompt")
+               "Run a command to stop", "Read a long prompt",
+               "Start a subagent in a container", "Sleep in a container as a subagent")
 
 GUI_TODO = ["Read the greeting", "Change it", "Check the result"]
+
+# The image of the container subagent, as tests/gui.py --mode containers
+# sets it
+GUI_CTRIMAGE = "alpine"
 
 # Most of what the transcript draws, for screenshots of each theme
 GUI_THEMES = """## Before the edit
@@ -2938,6 +2943,22 @@ def sc_gui(model, n, req):
                 ("task", {"description": "Second look", "prompt": "Report as a subagent: two."})])
         else:
             yield from answer(model, "Both subagents reported.")
+    elif "Start a subagent in a container" in prompt:
+        # Of the image tests/gui.py --mode containers uses, which is
+        # listed, with no network: nothing is asked
+        if step == 0:
+            yield from tool(model, n, "task", {
+                "description": "Sleep in a box",
+                "prompt": "Sleep in a container as a subagent.",
+                "image": GUI_CTRIMAGE})
+        else:
+            yield from answer(model, "The subagent said: " + tool_results(req)[0][:60])
+    elif "Sleep in a container as a subagent" in prompt:
+        # Long enough for the window to reach it there
+        if step == 0:
+            yield from tool(model, n, "shell", {"command": "sleep 8"})
+        else:
+            yield from answer(model, "Slept in a container.")
     elif "Report as a subagent" in prompt:
         # Slow enough for the parent's strip to count them at work
         yield S.sleep(1.5)

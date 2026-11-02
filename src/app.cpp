@@ -440,6 +440,8 @@ struct GuiHost {
     b32      reconnect; // asked to connect while closing: once it has ended
     b32      own;       // this process's own host, after the window came back
     b32      ctr;       // a container made for sessions (GuiCtr): its Trash stops it
+    Str      taskexec;  // a container made for a subagent (ctrtask): its exec
+    Str      taskimage; // and its image
     i64      pid;       // GH_LOCAL: the host's process
     i64      started;   // GH_LOCAL: epoch ms
     Str      endpoint;  // GH_LOCAL
@@ -6490,6 +6492,9 @@ static b32 guiapply(Gui *g, GuiHost *h, Arena a, EvRec *r, Str line)
     case EV_WORKTREE:
         onworktree(g, h, a, r->root);
         return 1;
+    case EV_RELIST:
+        h->relist = 1;  // as a subagent's container's sessions, kept
+        return 1;
     case EV_OVERFLOW:
         if (!r->sid.len && h->kind==GH_ENGINE) {
             // The engine process lost records, replies among them
@@ -6895,6 +6900,35 @@ static GuiCtr *ctrofhost(Gui *g, GuiHost *h)
     return h && h->kind==GH_REMOTE ? ctrof(g, h->name) : 0;
 }
 
+// The host of the container a subagent runs in, by its name ctr:t-NAME
+// (hostlink.cpp): made from the container.ini that the parent's engine
+// keeps in this state directory while the container is there, else null.
+// The window reaches it as the GUI's own containers, by exec, but it is
+// no GuiCtr: the parent's engine made it, and removes it.
+static GuiHost *ctrtask(Gui *g, Arena scratch, Str hostname)
+{
+    Str  name = startswith(hostname, "ctr:t-") ? cuthead(hostname, 4) : Str{};
+    b32  ok   = name.len == 10;
+    for (iz i = 2; ok && i < name.len; i++) {
+        ok = hexval(name[i]) >= 0;
+    }
+    GuiHost *h = ok ? findhost(g, GH_REMOTE, hostname) : 0;
+    if (!ok || (h && h->taskexec.len)) {
+        return h;
+    }
+    Arena a    = scratch;  // past hostname, which may be in the frame
+    Str   path = join(&a, ctrdir(&a, g->statedir, name), "container.ini");
+    Read  rd   = os_read(g->os, &a, path, 1<<16);
+    Ctr   c    = rd.err==READ_OK ? ctrparse(&a, name, rd.data) : Ctr{};
+    if (!c.program.len) {
+        return 0;
+    }
+    h = h ? h : addhost(g, GH_REMOTE, hostname);
+    h->taskexec  = ctrexec(&g->perm, &c);
+    h->taskimage = clone(&g->perm, c.image);
+    return h;
+}
+
 // A [container] setting of the user's own file, else null.
 static Str ctrset(Gui *g, Str key)
 {
@@ -6913,6 +6947,12 @@ static Str ctrset(Gui *g, Str key)
 // deploy = auto.
 static Str remoteset(Gui *g, Str name, Str key)
 {
+    GuiHost *t = startswith(name, "ctr:t-") ? findhost(g, GH_REMOTE, name) : 0;
+    if (t && t->taskexec.len) {
+        return key=="exec"   ? t->taskexec :
+               key=="state"  ? ctrstate :
+               key=="deploy" ? Str("auto") : Str{};
+    }
     GuiCtr *c = ctrof(g, name);
     if (c) {
         if (!c->exec.len) {
@@ -7405,6 +7445,9 @@ static void onremote(Gui *g, GuiHost *h, Arena a, EvRec *r)
     h->up      = h->state == RS_UP;
     h->downs  += h->state==RS_DOWN && was!=RS_DOWN;
     h->deploying += h->state==RS_DEPLOYING && was!=RS_DEPLOYING;
+    if (h->taskexec.len && (h->state==RS_DOWN || h->state==RS_FAILED)) {
+        hostclose(g, h);  // a subagent's container, going: not retried
+    }
     if (h->state==RS_FAILED && was==RS_DEPLOYING) {
         // A connect's deployment failed: its library says why ("cannot
         // deploy an engine: ...")
@@ -7564,6 +7607,12 @@ static Str hostlabel(Gui *g, Arena *a, GuiHost *h)
             print(&b, c->c.name);
             putbyte(&b, ')');
             break;
+        } else if (h->taskexec.len) {
+            print(&b, h->taskimage);
+            print(&b, " (container ");
+            print(&b, cuthead(h->name, 4));
+            print(&b, ", a subagent's)");
+            break;
         }
         Reach l   = remotelink(g, h->name);
         Str  ssh = l.ssh;
@@ -7588,13 +7637,14 @@ static Str hostlabel(Gui *g, Arena *a, GuiHost *h)
     return finish(&b);
 }
 
-// Whether new sessions can go to a host now.
+// Whether new sessions can go to a host now: never a subagent's
+// container, which its parent's engine removes.
 static b32 hostready(Gui *g, GuiHost *h)
 {
     if (h->kind == GH_ENGINE) {
         return !g->host && g->engineok && !g->enginegone;
     }
-    return h->up && !h->closing;
+    return h->up && !h->closing && !h->taskexec.len;
 }
 
 // How a host is, in a few words, with left the seconds until its next
@@ -15292,16 +15342,59 @@ static GuiCtr *ctrfirst(Gui *g)
     return g->ctrs;
 }
 
+static GuiSession *taskchild(Gui *, GuiSession *, ViewTool *);
+
+// The shown session's task call whose subagent has a container of its
+// own (hostlink.cpp), and the window's host for it, if any.
+static ViewTool *ctrtaskcall(Gui *g, GuiHost **h)
+{
+    View *v = g->sess ? g->sess->view : 0;
+    *h = 0;
+    for (iz i = 0; v && i < v->msgs.len; i++) {
+        ViewTool *t = v->msgs[i].role==VIEW_TOOL ? v->msgs[i].tool : 0;
+        if (t && t->ctr.len) {
+            Arena a = g->frame;
+            *h = findhost(g, GH_REMOTE, concat(&a, "ctr:", t->ctr));
+            return t;
+        }
+    }
+    return 0;
+}
+
 // W_CTR: "up", the runtime answers; "session", the session shown is a
 // container's, open in /work; "running" or "exited", the container is,
 // no job under way; "connected", its host is up; "removed", it is gone,
-// its directory too.
+// its directory too. Of the shown session's subagent in a container of
+// its own: "tasklive", the window reached it there and opened it;
+// "taskkept", its call ended, the window let go of its container, and
+// the subagent is its copy here, listed; "keptshown", that copy is the
+// session shown, opened here, its turn ended. "probed": the engine
+// found the runtime, for its sessions after.
 static b32 pathendswith(Str, Str);
 
 static b32 ctrwait(Gui *g, Str what)
 {
     GuiCtr *c = ctrfirst(g);
-    if (what == "up") {
+    if (what == "probed") {
+        // As the engine caches it (farctrok)
+        Arena a = g->frame;
+        Str   p = join(&a, join(&a, g->statedir, "containers"), "runtime");
+        return os_stat(g->os, a, p).type != STAT_MISSING;
+    } else if (what == "keptshown") {
+        GuiSession *s = g->sess;
+        View       *v = s ? s->view : 0;
+        return v && s->host==g->main && s->parent.len && v->lastseq && !v->busy &&
+               v->msgs.len;
+    } else if (what=="tasklive" || what=="taskkept") {
+        GuiHost    *h = 0;
+        ViewTool   *t = ctrtaskcall(g, &h);
+        GuiSession *k = t ? taskchild(g, g->sess, t) : 0;
+        if (what == "tasklive") {
+            return h && h->up && h->taskexec.len && k && k->host==h && k->view && t->opened;
+        }
+        return t && t->status==VTOOL_OK && (!h || !h->r) && k && k->host==g->sess->host &&
+               k->listed;
+    } else if (what == "up") {
         return g->ctrprobed && g->ctrrt.up;
     } else if (what == "session") {
         return g->sess && g->sess->host->ctr && g->sess->view &&
@@ -15320,11 +15413,28 @@ static b32 ctrwait(Gui *g, Str what)
 // network, its registry saying so; "trashed", it and its session are in
 // the Trash, the host left; "started", it is up again, its session
 // still in the Trash; "restored", neither is; "gone", nothing of it is
-// listed.
+// listed. Of the shown session's subagent in a container of its own:
+// "tasklive", its host is listed, offered for no new session, and it
+// runs there in Bypass mode, with no network; "taskkept", its copy here
+// is a subagent of the session, and its host is gone. Of the session
+// shown, "keptshown": that copy, titled (here, a subagent of a parent
+// in Build mode, it is no longer in Bypass).
 static b32 ctrcheck(Gui *g, Str what)
 {
     GuiCtr *c = ctrfirst(g);
-    if (!c) {
+    if (what == "keptshown") {
+        return ctrwait(g, what) && g->sess->title.len;
+    } else if (what=="tasklive" || what=="taskkept") {
+        GuiHost    *h = 0;
+        ViewTool   *t = ctrtaskcall(g, &h);
+        GuiSession *k = t ? taskchild(g, g->sess, t) : 0;
+        if (!ctrwait(g, what)) {
+            return 0;
+        } else if (what == "tasklive") {
+            return k->view->bypass && !hostready(g, h);
+        }
+        return k->parent==g->sess->sid && !(h && h->r);
+    } else if (!c) {
         return 0;
     }
     i32 live = 0, trashed = 0;
@@ -15360,7 +15470,10 @@ static b32 ctrcheck(Gui *g, Str what)
 // the sidebar; its New session, an image from [container] images,
 // --rcwd copied in, no network; a turn there, relayed; its session to
 // the Trash stops it; its + starts it again for New session, the session
-// left in the Trash; restored, and Delete removes it.
+// left in the Trash; restored, and Delete removes it. Then a session here
+// starts a subagent in a container of its own, which the window reaches
+// there while it works, in Bypass mode, and once its container is gone,
+// shows the copy kept here.
 static DriveOp ctrops[] = {
     {OP_WAIT, W_ENGINE, 0, 0, 10000, ""},
     {OP_WAIT, W_CONFIG, 0, 0, 10000, ""},
@@ -15444,6 +15557,31 @@ static DriveOp ctrops[] = {
     {OP_WAIT, W_CTR, 0, 0, 30000, "removed"},
     {OP_MARK, 0, 0, 0, 500, ""},
     {OP_CHECK, CHK_CTR, 0, 0, 0, "gone"},
+    // A session here starts a subagent in a container of its own: the
+    // window reaches it there while it works, and once its container is
+    // removed, shows the copy of it kept here. The engine's first session
+    // finds the runtime, for those after it
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_WAIT, W_CTR, 0, 0, 30000, "probed"},
+    {OP_NEWSESSION, 0, 0, 0, 0, ""},
+    {OP_WAIT, W_SESSION, 0, 0, 10000, ""},
+    {OP_PROMPT, 0, 0, 0, 100, "Start a subagent in a container."},
+    {OP_WAIT, W_CTR, 0, 0, 180000, "tasklive"},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CTR, 0, 0, 0, "tasklive"},
+    {OP_SHOT, 0, 0, 0, 300, "containers-5-task"},
+    {OP_WAIT, W_IDLE, 0, 0, 60000, ""},
+    {OP_WAIT, W_CTR, 0, 0, 30000, "taskkept"},
+    {OP_MARK, 0, 0, 0, 1000, ""},
+    {OP_CHECK, CHK_CTR, 0, 0, 0, "taskkept"},
+    {OP_MOVE, T_TASKLINK, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 300, ""},
+    {OP_WAIT, W_CTR, 0, 0, 15000, "keptshown"},
+    {OP_MARK, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_CTR, 0, 0, 0, "keptshown"},
+    {OP_SHOT, 0, 0, 0, 300, "containers-6-kept"},
     {OP_SUMMARY, 0, 0, 0, 0, ""},
     {OP_QUIT, 0, 0, 0, 0, ""},
 };

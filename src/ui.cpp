@@ -1032,6 +1032,7 @@ static void printage(Gui *g, Buf *b, i64 ms)
 }
 
 static GuiSession *taskchild(Gui *, GuiSession *, ViewTool *);
+static Str kidhost(Arena *, ViewTool *);
 static b32 kidnamed(Gui *, Arena, GuiSession *, Str);
 static Str kidlink(Gui *, Arena *, ViewTool *, i64);
 
@@ -1100,7 +1101,8 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             if (g->sess->host->kind == GH_REMOTE) {
                 pen(p, concat(&a, ", as ", g->sess->host->name), 0, dim);
                 pen(p, " names it", 0, dim);
-            } else if (t->status==VTOOL_RUNNING && kidnamed(g, a, g->sess, t->host)) {
+            } else if (Str n = t->status==VTOOL_RUNNING ? kidhost(&a, t) : Str{};
+                       n.len && kidnamed(g, a, g->sess, n)) {
                 Str st = kidlink(g, &a, t, nowms);
                 if (st.len) {
                     pen(p, concat(&a, "  ", st), STYLE_BOLD, pal->amber);
@@ -1337,10 +1339,18 @@ static GuiSession *taskchild(Gui *g, GuiSession *parent, ViewTool *t)
     if (t->host.len) {
         // On another host, named by task.host: only one this window
         // reaches by that name, as the parent's engine shares its
-        // configuration (kidnamed)
-        b32      own = parent->host->kind != GH_REMOTE;
-        GuiHost *h   = own ? findhost(g, GH_REMOTE, t->host) : 0;
-        return h && t->child.len ? findsess(g, h, t->child) : 0;
+        // configuration (kidnamed). In a container, once it is gone, its
+        // copy here (ctrkeep), a subagent of its parent.
+        Arena       a   = g->frame;
+        b32         own = parent->host->kind != GH_REMOTE;
+        GuiHost    *h   = own ? findhost(g, GH_REMOTE, kidhost(&a, t)) : 0;
+        GuiSession *k   = h && t->child.len ? findsess(g, h, t->child) : 0;
+        b32         up  = h && h->r && !h->closing;
+        if (!t->ctr.len || !own || (k && up)) {
+            return k;
+        }
+        GuiSession *kept = t->child.len ? findsess(g, parent->host, t->child) : 0;
+        return kept && kept->listed ? kept : k;
     }
     if (t->child.len) {
         GuiSession *c = findsess(g, parent->host, t->child);
@@ -1366,11 +1376,21 @@ static GuiSession *taskchild(Gui *g, GuiSession *parent, ViewTool *t)
 
 static Slice<Str> remotenames(Gui *, Arena *);
 
-// Whether this window reaches a task's host by its name.
+// The name this window reaches a task's host by: ctr:NAME for a
+// container made for it, else the name the parent's engine gave it.
+static Str kidhost(Arena *a, ViewTool *t)
+{
+    return t->ctr.len ? concat(a, "ctr:", t->ctr) : t->host;
+}
+
+// Whether this window reaches a task's host by its name (kidhost): a
+// container while it is there.
 static b32 kidnamed(Gui *g, Arena a, GuiSession *parent, Str host)
 {
     if (!host.len || parent->host->kind==GH_REMOTE) {
         return 0;  // another host's names are its own
+    } else if (startswith(host, "ctr:")) {
+        return ctrtask(g, a, host) != 0;
     }
     Slice<Str> names = remotenames(g, &a);
     for (iz i = 0; i < names.len; i++) {
@@ -1387,11 +1407,14 @@ static b32 kidnamed(Gui *g, Arena a, GuiSession *parent, Str host)
 // disconnected, nor one that failed.
 static void kidreach(Gui *g, Arena a, ViewTool *t, b32 user)
 {
-    GuiHost *h = findhost(g, GH_REMOTE, t->host);
-    if (!user && h && (h->userclosed || h->state==RS_FAILED)) {
+    Str      name = kidhost(&a, t);
+    GuiHost *h    = t->ctr.len ? ctrtask(g, a, name) : findhost(g, GH_REMOTE, name);
+    if (t->ctr.len && !h) {
+        return;  // gone
+    } else if (!user && h && (h->userclosed || h->state==RS_FAILED)) {
         return;
     } else if (!h || !h->r || h->closing || h->state==RS_FAILED) {
-        remoteconnect(g, a, t->host);
+        remoteconnect(g, a, name);
         return;
     } else if (!h->up) {
         return;  // drainmail sweeps again once it is
@@ -1426,14 +1449,18 @@ static void kidsweep(Gui *g)
             continue;
         }
         for (iz i = 0; i < v->msgs.len; i++) {
-            ViewTool *t = v->msgs[i].tool;
-            if (v->msgs[i].role!=VIEW_TOOL || !t->host.len || !t->child.len ||
-                    (t->opened && !t->want) || !kidnamed(g, g->frame, s, t->host)) {
+            ViewTool *t    = v->msgs[i].tool;
+            b32       work = t && (t->want || t->status==VTOOL_RUNNING ||
+                               t->status==VTOOL_BACKGROUND);
+            Arena     a    = g->frame;
+            Str       name = work ? kidhost(&a, t) : Str{};  // before a goes by value
+            if (v->msgs[i].role!=VIEW_TOOL || !t->host.len || !t->child.len || !work ||
+                    (t->opened && !t->want) || !kidnamed(g, a, s, name)) {
                 continue;
             } else if (t->want || t->status==VTOOL_RUNNING) {
                 kidreach(g, g->frame, t, t->want);
             } else if (t->status == VTOOL_BACKGROUND) {
-                GuiHost    *h = findhost(g, GH_REMOTE, t->host);
+                GuiHost    *h = findhost(g, GH_REMOTE, name);
                 b32         up = h && h->r && !h->closing && h->up;
                 GuiSession *k = up ? findsess(g, h, t->child) : 0;
                 if (k && k->listed && k->state!=LIVE_IDLE && k->state!=LIVE_CLOSED) {
@@ -1447,7 +1474,7 @@ static void kidsweep(Gui *g)
 // How the window's link to a running task's host is, if not up.
 static Str kidlink(Gui *g, Arena *a, ViewTool *t, i64 nowms)
 {
-    GuiHost *h = findhost(g, GH_REMOTE, t->host);
+    GuiHost *h = findhost(g, GH_REMOTE, kidhost(a, t));
     if (h && h->userclosed && (!h->r || h->closing)) {
         return "disconnected: its asks are denied";
     } else if (!h || h->state==RS_CONNECTING || h->state==RS_CLOSED) {
@@ -1596,7 +1623,9 @@ static MsgAction msgaction(Gui *g, GuiSession *s, View *v, ViewMsg *m)
     ViewTool *t = m->tool;
     if (m->role==VIEW_TOOL && t->name=="task" && s) {
         r.child = taskchild(g, s, t);
-        if (r.child || (t->child.len && kidnamed(g, g->frame, s, t->host))) {
+        Arena a = g->frame;
+        Str   n = kidhost(&a, t);  // before a goes by value
+        if (r.child || (t->child.len && kidnamed(g, a, s, n))) {
             r.amber = r.child && r.child->view && r.child->view->asks;
             r.kind  = ACT_OPEN;
             r.label = r.amber ? "Answer the subagent" : "Open subagent";
@@ -1711,8 +1740,9 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
             itemrect(g, RECT_MSGLINK);
             ImGui::SetItemTooltip("Show that session's transcript");
         }
-        if (go && t && t->name=="task" && t->host.len) {
-            kidopen(g, t);
+        if (go && t && t->name=="task" && t->host.len &&
+                !(act->child && act->child->host==s->host)) {
+            kidopen(g, t);  // not one kept here from its container
         } else if (go) {
             guiselect(g, act->child);
         }
@@ -7313,7 +7343,8 @@ static void drawsessions(Gui *g)
     Slice<HostRef>  refs  = {};
     SideIn          in    = {};
     for (GuiHost *h = g->hosts; h; h = h->next) {
-        if (h->ctr || (h->kind==GH_REMOTE && !remotelisted(g, h, h->name))) {
+        if (h->ctr || h->taskexec.len ||
+                (h->kind==GH_REMOTE && !remotelisted(g, h, h->name))) {
             continue;
         }
         refs     = push(&a, refs, HostRef{h, {}, 0});
@@ -7337,6 +7368,13 @@ static void drawsessions(Gui *g)
         if (!c->removed && c->h) {
             refs     = push(&a, refs, HostRef{c->h, {}, 0});
             in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, c->h, {}), 1, rt});
+        }
+    }
+    for (GuiHost *h = g->hosts; h; h = h->next) {
+        if (h->taskexec.len && h->r && !h->closing) {
+            // A subagent's container, while the window is connected to it
+            refs     = push(&a, refs, HostRef{h, {}, 0});
+            in.hosts = push(&a, in.hosts, SideHost{hostkey(&a, h, {}), 1, rt});
         }
     }
     in.heads   = in.hosts.len > 1;
@@ -9685,7 +9723,7 @@ static void drawhosts(Gui *g)
     ImGui::SeparatorText("Remote hosts");
     Slice<Str> names = remotenames(g, &a);
     for (GuiHost *h = g->hosts; h; h = h->next) {
-        b32 seen = h->kind!=GH_REMOTE || h->ctr;
+        b32 seen = h->kind!=GH_REMOTE || h->ctr || h->taskexec.len;
         for (iz n = 0; !seen && n < names.len; n++) {
             seen = names[n] == h->name;
         }

@@ -545,11 +545,62 @@ static Str ctrdo(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cmd)
     return r.code==0 ? Str{} : clone(perm, ctrsaid(&scratch, &r, cmd));
 }
 
+// A subagent's container's sessions, kept: each copied into this state
+// directory's sessions, by way of the container's directory, and renamed
+// in whole, so that a listing never shows one half made. Its first record
+// loses remote, so that it lists as a subagent of its parent here, which
+// deletes it along with it. One whose log is bigger than CTR_KEEPMAX keeps
+// it, and lists as a root. Best effort: a file the container's root made
+// under a rootful Linux daemon may not be readable. Scratch needs room
+// for twice CTR_KEEPMAX.
+enum : iz { CTR_KEEPMAX = (iz)1<<23 };
+
+static void ctrkeep(Os *os, Arena scratch, Str localstate, Str name)
+{
+    Str dir   = ctrdir(&scratch, localstate, name);
+    Str from  = join(&scratch, join(&scratch, dir, "state"), "sessions");
+    Str stage = join(&scratch, dir, "keep");
+    Str to    = join(&scratch, localstate, "sessions");
+    for (Dirent *d = os_list(os, &scratch, from); d; d = d->next) {
+        Arena a    = scratch;
+        Str   src  = join(&a, from, d->name);
+        Str   dest = join(&a, to, d->name);
+        Str   tmp  = join(&a, stage, d->name);
+        if (!d->isdir || !validsid(d->name) || os_stat(os, a, dest).type!=STAT_MISSING ||
+                !copytree(os, a, src, tmp, 0)) {
+            continue;
+        }
+        Str  log = join(&a, tmp, "events.jsonl");
+        Read rd  = os_read(os, &a, log, CTR_KEEPMAX);
+        Cut  c   = cut(rd.data, '\n');
+        Json *j  = rd.err==READ_OK ? jsonparse(&a, c.head).root : (Json *)&jsonmissing;
+        if (c.ok && jsonflag(jsonget(j, "remote"), 0)) {
+            Buf     b(&a, rd.data.len + 16);
+            JsonOut w = {&b};
+            putobject(&w);
+            for (Json *k = j->child; k; k = k->next) {
+                if (k->key!="remote" && k->key!="via" && k->key!="distro" &&
+                        k->key!="relay") {
+                    putkey(&w, k->key);
+                    putjson(&w, k);
+                }
+            }
+            putend(&w);
+            putbyte(&b, '\n');
+            print(&b, c.tail);
+            Str text = finish(&b);  // before a goes by value
+            os_write(os, a, log, text);
+        }
+        os_rename(os, a, tmp, dest);
+    }
+}
+
 // Remove the container, best effort, and its directory and its deploy
-// record here. Returns why the container was not removed, else null;
-// the directory goes either way (a file the container's root made in
-// it, under a rootful Linux daemon, may stay).
-static Str ctrremove(CtrRun *run, Arena *perm, Arena scratch, Ctr *c)
+// record here, its sessions kept first if keep (ctrkeep). Returns why
+// the container was not removed, else null; the directory goes either
+// way (a file the container's root made in it, under a rootful Linux
+// daemon, may stay).
+static Str ctrremove(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, b32 keep = 0)
 {
     Str why = ctrdo(run, perm, scratch, c, "rm -f -v");  // and its /work volume
     if (why.len && (find(why, "No such container")>=0 ||
@@ -557,6 +608,9 @@ static Str ctrremove(CtrRun *run, Arena *perm, Arena scratch, Ctr *c)
         why = {};  // gone already
     }
     Str   localstate = run->conf.localstate;
+    if (keep) {
+        ctrkeep(run->d.os, scratch, localstate, c->name);
+    }
     Reach l          = {};
     l.exec = ctrexec(&scratch, c);
     Str dest = linkdest(&scratch, l);
@@ -747,8 +801,8 @@ static Str ctrstateof(Str states, Str name)
 
 // Remove the subagents' containers an engine of this state directory
 // left, by a crash or a quit cut short: every t- directory, and every
-// container of this owner named prospero-t-, whether or not it has one.
-// Best effort. Returns how many were removed.
+// container of this owner named prospero-t-, whether or not it has one,
+// the sessions in a directory kept (ctrkeep). Best effort. Returns how many were removed.
 static i32 ctrleftovers(CtrRun *run, Arena scratch, Str program, Str owner)
 {
     Os *os         = run->d.os;
@@ -768,7 +822,7 @@ static i32 ctrleftovers(CtrRun *run, Arena scratch, Str program, Str owner)
         Ctr   c    = rd.err==READ_OK ? ctrparse(&tmp, d->name, rd.data) : Ctr{};
         c.name     = d->name;
         c.program  = program;  // the runtime as found now
-        ctrremove(run, &tmp, carve(&tmp, 1<<20), &c);
+        ctrremove(run, &tmp, carve(&tmp, 1<<25), &c, 1);  // its sessions kept
         n++;
     }
     for (Str rest = states; rest.len;) {

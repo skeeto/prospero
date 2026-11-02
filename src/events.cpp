@@ -72,6 +72,7 @@ enum : i32 {
     EV_RELAY,     // a thin engine's model call, for a client to make
     EV_RELAYDATA, // the response to a relay.call, part by part
     EV_OFFER,     // what this engine's models are, for a thin engine
+    EV_RELIST,    // the sessions changed by no command: list them again
     EV_COUNT,
 };
 
@@ -134,6 +135,7 @@ static EvInfo evinfo[] = {
     {"relay",      0, 0},
     {"relay.data", 0, 0},
     {"offer",      0, 0},
+    {"relist",     0, 0},
 };
 static_assert(countof(evinfo) == EV_COUNT);
 

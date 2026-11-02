@@ -2548,6 +2548,16 @@ def sc_ctr_ask_b(model, n, req):
     yield from F.answer(model, "Ran.")
 
 
+def sc_ctr_net(model, n, req):
+    if F.step(req) == 0:
+        yield from F.tool(model, n, "task", {
+            "description": "Fetch", "prompt": "Go.", "image": "alpine",
+            "network": True, "cwd": os.environ["FAKECTR_WORK"],
+            "model": F.second(model)})
+    else:
+        yield from F.answer(model, "Done.")
+
+
 def sc_ctr_sleep(model, n, req):
     if F.step(req) == 0:
         yield from F.tool(model, n, "task", {
@@ -2561,6 +2571,8 @@ for _name in ("ctr_task", "ctr_task_b", "ctr_ask", "ctr_ask_b"):
     fake_provider.SCENARIOS[_name] = globals()["sc_" + _name]
 fake_provider.SCENARIOS["ctr_real"] = sc_ctr_task
 fake_provider.SCENARIOS["ctr_real_b"] = sc_ctr_task_b
+fake_provider.SCENARIOS["ctr_network"] = sc_ctr_net
+fake_provider.SCENARIOS["ctr_network_b"] = sc_ctr_ask_b
 for _name in ("ctr_cancel", "ctr_leftover"):
     fake_provider.SCENARIOS[_name] = sc_ctr_sleep
     fake_provider.SCENARIOS[_name + "_b"] = sc_ctr_ask_b
@@ -2694,6 +2706,28 @@ def ctr_task(t):
         t.check(b.ran("rm", "-f", "-v", name), "removed")
         time.sleep(0.5)
         t.check(not leftctrs(t), f"its directory gone: {leftctrs(t)}")
+        th = [r for r in b.x.records if r.get("ev") == "task.host" and r.get("sid") == sid]
+        t.check(len(th) == 1 and th[0].get("ctr") == name[len("prospero-"):],
+                f"task.host names its container for the window: {th}")
+        # Its session kept here, a subagent of its parent, which ran in
+        # Bypass mode: no network
+        child = te[0].get("child", "")
+        recs = []
+        try:
+            with open(os.path.join(t.state, "sessions", child, "events.jsonl")) as f:
+                recs = [json.loads(x) for x in f]
+        except OSError:
+            pass
+        first = recs[0] if recs else {}
+        t.check(child and first.get("ev") == "session" and first.get("parent") == sid and
+                "remote" not in first and "via" not in first, f"kept {child}: {first}")
+        modes = [r for r in recs if r.get("ev") == "mode"]
+        t.check(modes and modes[0].get("mode") == "bypass", f"bypass: {modes}")
+        b.x.call("list")
+        lst = [r for r in b.x.records if r.get("ev") == "sessions"][-1:]
+        kids = [s for r in lst for s in r.get("list", []) if s.get("sid") == child]
+        t.check(kids and kids[0].get("parent") == sid and not kids[0].get("remote"),
+                f"listed under its parent: {kids}")
     finally:
         b.quit()
 
@@ -2791,6 +2825,42 @@ def ctr_ask(t):
         t.check(len(b.ran("create")) == 2, f"two made {b.ran('create')}")
         grants = [r for r in b.x.records if r.get("ev") == "grant" and r.get("sid") == sid]
         t.check(len(grants) == 1 and grants[0].get("image") == "busybox", f"grant {grants}")
+    finally:
+        b.quit()
+
+
+@scenario
+def ctr_network(t):
+    """With network, even a listed image asks; allowed, its container has
+    the network, and its subagent is not in Bypass mode, as one with no
+    network is (ctr_task)."""
+    if os.name == "nt":
+        return "skip"
+    b = Box(t, "ctr_network")
+    try:
+        sid = b.session()
+        ask = b.x.wait(lambda r: r.get("ev") == "ask" and r.get("sid") == sid, 20, "ask")
+        t.check(ask.get("kind") == "container" and ask.get("image") == "alpine",
+                f"ask {ask}")
+        b.x.call("answer", sid=sid, req=ask["req"], decision="allow")
+        end = b.x.wait(lambda r: r.get("ev") == "turn.end" and r.get("sid") == sid,
+                       60, "turn end")
+        t.check(end.get("why") == "done", f"turn end {end}")
+        made = b.ran("create")
+        t.check(len(made) == 1 and "--network" not in made[0], f"create {made}")
+        te = [r for r in b.x.records if r.get("ev") == "tool.end" and r.get("sid") == sid]
+        child = te[0].get("child", "") if te else ""
+        deadline = time.time() + 20
+        path = os.path.join(t.state, "sessions", child, "events.jsonl")
+        while time.time() < deadline and not (child and os.path.exists(path)):
+            time.sleep(0.2)
+        recs = []
+        if child and os.path.exists(path):
+            with open(path) as f:
+                recs = [json.loads(x) for x in f]
+        t.check(recs and recs[0].get("parent") == sid, f"kept {child}")
+        modes = [r.get("mode") for r in recs if r.get("ev") == "mode"]
+        t.check("bypass" not in modes, f"not in Bypass: {modes}")
     finally:
         b.quit()
 

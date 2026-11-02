@@ -46,8 +46,15 @@
 // RS_CONNECTING, its subagent queued as for any host, while a thread
 // makes the container (FJOB_MAKE); connecting follows its answer
 // (farctrmail). Its folder /out is in the parent's scratch directory,
-// which the report names. Once its subagent ends, the link is finished,
-// and the container removed (FJOB_REMOVE) once the link is closed.
+// which the report names. With no network, its subagent is in Bypass
+// mode (new {task: {bypass}}): it can reach nothing but its own files
+// and /out. Its task.host names the container (ctr), which a window
+// reaches as ctr:NAME, by exec as its own containers, from the
+// container.ini kept here, to show the subagent at work and answer it.
+// Once its subagent ends, the link is finished, and the container
+// removed (FJOB_REMOVE) once the link is closed, its sessions copied
+// here first (ctrkeep), subagents of their parent, which frontends are
+// told to list (relist).
 //
 // This is free and unencumbered software released into the public domain.
 
@@ -270,6 +277,7 @@ struct FarAsk {
     i32 depth;
     i32 hop;
     b32 plan;
+    b32 bypass;  // in a container with no network: nothing to ask
     Str title;
     Str prefer;
     Str via;
@@ -309,6 +317,9 @@ static Str farline(Arena *a, FarAsk *k)
     putintkey(&w, "depth", k->depth);
     putintkey(&w, "hop", k->hop);
     putintkey(&w, "plan", k->plan);
+    if (k->bypass) {
+        putintkey(&w, "bypass", 1);
+    }
     putstrkey(&w, "title", k->title);
     if (k->prefer.len) {
         putstrkey(&w, "prefer", k->prefer);
@@ -683,6 +694,9 @@ static void farnamed(Engine *e, Arena scratch, HostLink *l, HostKid *k, Str sid)
         putstrkey(&w.json, "call", k->call);
         putstrkey(&w.json, "host", l->name);
         putstrkey(&w.json, "child", sid);
+        if (l->ctr) {
+            putstrkey(&w.json, "ctr", l->ctr->name);  // the window's ctr:NAME
+        }
         ssend(p, &w);
     }
     if (t) {
@@ -921,6 +935,7 @@ static b32 farstart(Session *s, Arena scratch, iz k, Args *args, TaskRun *t)
     ask.depth      = s->depth + 1;
     ask.hop        = s->hop;
     ask.plan       = planning(s);
+    ask.bypass     = l->ctr && !l->ctr->network;
     ask.title      = kid->title;
     ask.prefer     = farprefer(&scratch, s->home, s->homemodel);
     ask.via        = h.wsl.len ? Str("wsl") : h.exec.len ? Str("exec") : Str("ssh");
@@ -1156,7 +1171,7 @@ static void farctrthread(void *arg)
             err = ctrcreate(run, &perm, scratch, &c, j->cpus, j->memory,
                             w.err.len ? Slice<Str>{} : w.words, farctrnote, 0);
         } else {
-            err = ctrremove(run, &perm, scratch, &c);
+            err = ctrremove(run, &perm, scratch, &c, 1);  // its sessions kept
         }
     }
     Buf b(&perm, 8 + out.len + err.len);
@@ -1387,7 +1402,11 @@ static void farctrmail(Engine *e, Arena scratch, Record r)
     if (!l || !l->ctr) {
         return;
     } else if (kind == FJOB_REMOVE) {
+        // Its sessions kept here (ctrkeep): frontends list them
         l->removing = 0;
+        Buf   b(&scratch, 64);
+        EvOut w = evbegin(&b, {}, 0, os_time(e->os), EV_RELIST);
+        emit(e, evend(&w));
         return;
     }
 

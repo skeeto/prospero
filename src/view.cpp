@@ -290,6 +290,7 @@ struct ViewTool {
     Str  child;     // a task's subagent, once it reported, or a
                     // message's target
     Str  host;      // the host a task's subagent runs on, if not this one
+    Str  ctr;       // and its container, if one made for it (t-NAME)
     b32  opened;    // the window reached that subagent (kidsweep), once
     b32  stopasked; // the user pressed its Stop, which goes meanwhile
     b32  want;      // the user asked to see it: shown once reached
@@ -2332,9 +2333,13 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         ViewMsg  *m   = &v->msgs[i];
         ViewTool *t   = m->tool;
         Str       kid = jsonstr(jsonget(j, "child"));
+        Str       ctr = jsonstr(jsonget(j, "ctr"));
         taskhost(v, t, jsonstr(jsonget(j, "host")));
         if (kid.len) {
             t->child = clone(&v->aux, kid);
+        }
+        if (ctr.len && !t->ctr.len) {
+            t->ctr = clone(&v->aux, ctr);
         }
         m->ver++;
     } return 1;

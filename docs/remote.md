@@ -63,16 +63,25 @@ session that offers task opens, on a thread, and cached in
 `STATE/containers/runtime` for the next start. An image not in
 `[container] images`, or network access, asks the user first, with an
 "always" for that image in the session's tree. Each container is
-`prospero-t-XXXXXXXX`, labelled `...task=1` too and never listed by
-the window, with `-v OUT:/out`, OUT a folder in the parent's scratch
-directory, which the report names when the subagent left files there.
-The engine makes it on a thread while the link waits in connecting,
-reaches it as an exec link, deploying its engine over `cat`, and
-removes it (`rm -f -v`) once its subagent ends and the link closes, or
-at once when the call is cancelled first. Quitting waits for that. An
-engine's `t-` containers left by a crash are removed when the runtime
-is found next, as is any container of its owner named `prospero-t-`.
-`[container] subagents = no` turns it off.
+`prospero-t-XXXXXXXX`, labelled `...task=1` too and not among the
+window's own containers, with `-v OUT:/out`, OUT a folder in the
+parent's scratch directory, which the report names when the subagent
+left files there. The engine makes it on a thread while the link waits
+in connecting, reaches it as an exec link, deploying its engine over
+`cat`, and removes it (`rm -f -v`) once its subagent ends and the link
+closes, or at once when the call is cancelled first. Quitting waits
+for that. With no network, its subagent starts in Bypass mode (`new`'s
+`task.bypass`). The parent's `task.host` record names the container
+(`ctr`), and a window whose parent runs in its engine reaches it as
+the host `ctr:t-XXXXXXXX`, by exec from its `container.ini`, while it
+is there: listed under the runtime, offered for no new session, let go
+once its link goes down. Before the container's directory is removed,
+its sessions are copied to `STATE/sessions`, their first record without
+`remote`, so that they list as subagents of the parent here, and a
+`relist` record tells clients to list them. An engine's `t-`
+containers left by a crash are removed when the runtime is found next
+(their sessions kept too), as is any container of its owner named
+`prospero-t-`. `[container] subagents = no` turns it off.
 
 A remote machine needs an engine built for its platform, which
 `prospero deploy` uploads with scp to `~/.prospero` there, as

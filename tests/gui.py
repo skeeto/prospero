@@ -1642,21 +1642,28 @@ class CtrWatch:
         self.done.set()
         self.thread.join(timeout=60)
         problems = []
-        if len(self.seen) != 1:
-            problems.append(f"containers made: {sorted(self.seen)}, not one")
+        # The session's container (p-), and its subagent's (t-), which
+        # binds /out too
+        kinds = sorted(n[len("prospero-"):][:2] for n in self.seen)
+        if kinds != ["p-", "t-"]:
+            problems.append(f"containers made: {sorted(self.seen)}, not a p- and a t-")
         for n, j in self.seen.items():
+            task = n.startswith("prospero-t-")
             hc = j.get("HostConfig", {})
             labels = j.get("Config", {}).get("Labels") or {}
-            binds = [m for m in j.get("Mounts", []) if m.get("Type") == "bind"]
+            binds = {m.get("Destination"): m for m in j.get("Mounts", [])
+                     if m.get("Type") == "bind"}
             if hc.get("NetworkMode") != "none":
                 problems.append(f"{n}: network {hc.get('NetworkMode')}, not none")
             if labels.get("com.nullprogram.prospero") != "1" or \
-                    not labels.get("com.nullprogram.prospero.owner"):
+                    not labels.get("com.nullprogram.prospero.owner") or \
+                    (labels.get("com.nullprogram.prospero.task") == "1") != task:
                 problems.append(f"{n}: labels {labels}")
-            if [m.get("Destination") for m in binds] != ["/prospero/state"] or \
-                    not os.path.realpath(binds[0].get("Source", "")).startswith(
+            want = ["/out", "/prospero/state"] if task else ["/prospero/state"]
+            if sorted(binds) != want or not os.path.realpath(
+                    binds["/prospero/state"].get("Source", "")).startswith(
                         os.path.realpath(state)):
-                problems.append(f"{n}: binds {binds}, not its state alone")
+                problems.append(f"{n}: binds {list(binds.values())}, not {want}")
             if not hc.get("Init"):
                 problems.append(f"{n}: no --init")
             vols = [m.get("Name") for m in j.get("Mounts", [])
@@ -1668,8 +1675,8 @@ class CtrWatch:
                 subprocess.run([self.rt, "volume", "rm", vols[0]], capture_output=True,
                                timeout=30)
                 problems.append(f"{n}: its /work volume was left")
-            print(f"container {n}: network none, labelled, its state bound, --init, "
-                  f"/work a volume")
+            print(f"container {n}: network none, labelled, {', '.join(want)} bound, "
+                  f"--init, /work a volume")
         left = set(self.names()) - self.before
         for n in sorted(left):
             # Made during the run, so the window's: removed by name
@@ -1872,6 +1879,7 @@ def main():
                                             f"runtime = {args.runtime}\n"
                                             f"images = {args.image}\n")
         print(f"containers: {args.rt}, as {args.runtime} picks")
+        fake_provider.GUI_CTRIMAGE = args.image  # its subagent's
         ctrwatch = CtrWatch(args)
     host.write(ini, before)
 

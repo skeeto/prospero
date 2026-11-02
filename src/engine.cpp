@@ -15195,6 +15195,7 @@ struct NewTask {
     i32 depth;   // 1..TASK_DEPTH
     i32 hop;     // 0..HOP_MAX
     b32 plan;    // the parent plans
+    b32 bypass;  // in a container of its own, with no network: Bypass
 };
 
 // A WSL distro's name, as wsl.exe lists it: no path, no spaces.
@@ -15225,6 +15226,7 @@ static NewTask newtaskof(Json *t)
     r.relay  = jsonstr(jsonget(t, "relay"));
     r.prompt = jsonstr(jsonget(t, "prompt"));
     r.plan   = jsonflag(jsonget(t, "plan"), 0);
+    r.bypass = jsonflag(jsonget(t, "bypass"), 0);
     i64 depth = jsonint(jsonget(t, "depth"), 1);
     i64 hop   = jsonint(jsonget(t, "hop"), 0);
     r.depth = (i32)(depth<1 ? 1 : depth>TASK_DEPTH ? TASK_DEPTH : depth);
@@ -15274,7 +15276,9 @@ static Str taskmodel(Config *c, Str model, Str rolemodel, Str prefer)
 // task (NewTask), the session is the subagent of a session on another
 // host: of role general unless one is given, on the model the call gave,
 // else the role's, else the parent's own if this host has its endpoint
-// (taskmodel), its first turn the task's, its report a task.report.
+// (taskmodel), its first turn the task's, its report a task.report, in
+// Bypass mode if task.bypass says so (a container of its own with no
+// network, hostlink.cpp) and its parent does not plan.
 // With worktree {name?}, it works in a worktree of its own (wtnew), and
 // with side_of SID as well, it is a worktree session started from that
 // session, under which a sidebar shows it: fresh, with none of its
@@ -15525,6 +15529,8 @@ static void cmdnew(Engine *e, Arena scratch, i64 id, Json *j)
         setmode(s, scratch, MODE_PLAN, "new");
     } else if (task.plan) {
         setmode(s, scratch, MODE_PLAN, "parent");  // read-only for its task
+    } else if (task.bypass) {
+        setmode(s, scratch, MODE_BYPASS, "parent");
     }
     if (task.ok) {
         Str title = task.title.len ? task.title : task.prompt;

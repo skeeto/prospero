@@ -249,6 +249,19 @@ static b32 os_rename(Os *os, Arena, Str from, Str to)
     if (!src || !src->exists) {
         return 0;
     }
+    // A directory's files go with it (those made now come first, past
+    // the walk)
+    for (VFile *f = os->files; src->isdir && f; f = f->next) {
+        Str p = f->path;
+        if (f->exists && p.len>from.len && startswith(p, from) && p[from.len]=='/') {
+            VFile *g = vfind(os, concat(&os->mem, to, cuthead(p, from.len)), 1);
+            g->data   = f->data;
+            g->isdir  = f->isdir;
+            g->mtime  = f->mtime;
+            g->exists = 1;
+            f->exists = 0;
+        }
+    }
     VFile *dst = vfind(os, to, 1);
     dst->data   = src->data;
     dst->isdir  = src->isdir;
