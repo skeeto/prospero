@@ -54,6 +54,46 @@ static void text(Str s)
     ImGui::TextUnformatted(s.cdata, s.cdata+s.len);
 }
 
+// Tooltips, as ImGui's SetItemTooltip and SetTooltip, but wrapped at
+// TIP_EMS: unwrapped, a long one spans the whole window. Tooltips built
+// by hand wrap at tipwrap too.
+enum { TIP_EMS = 32 };
+
+static f32 tipwrap()
+{
+    return (f32)TIP_EMS * ImGui::GetFontSize();
+}
+
+static void tipv(char const *fmt, __builtin_va_list ap)
+{
+    ImGui::PushTextWrapPos(tipwrap());
+    ImGui::TextV(fmt, ap);
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
+static void itemtip(char const *fmt, ...) IM_FMTARGS(1);
+static void itemtip(char const *fmt, ...)
+{
+    if (ImGui::BeginItemTooltip()) {
+        __builtin_va_list ap;
+        __builtin_va_start(ap, fmt);
+        tipv(fmt, ap);
+        __builtin_va_end(ap);
+    }
+}
+
+static void tipnow(char const *fmt, ...) IM_FMTARGS(1);
+static void tipnow(char const *fmt, ...)
+{
+    if (ImGui::BeginTooltip()) {
+        __builtin_va_list ap;
+        __builtin_va_start(ap, fmt);
+        tipv(fmt, ap);
+        __builtin_va_end(ap);
+    }
+}
+
 // Push an ID made from a string, which may be empty.
 static void pushstr(Str s)
 {
@@ -1739,12 +1779,12 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
     case ACT_OPEN:
         if (t && t->name=="task") {
             itemrect(g, RECT_TASKLINK);
-            ImGui::SetItemTooltip(t->host.len ? "Show the subagent's own transcript, "
+            itemtip(t->host.len ? "Show the subagent's own transcript, "
                                                 "on its host"
                                               : "Show the subagent's own transcript");
         } else {
             itemrect(g, RECT_MSGLINK);
-            ImGui::SetItemTooltip("Show that session's transcript");
+            itemtip("Show that session's transcript");
         }
         if (go && t && t->name=="task" && t->host.len &&
                 !(act->child && act->child->host==s->host)) {
@@ -1755,7 +1795,7 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
         break;
     case ACT_UNDO:
         itemrect(g, RECT_UNDO);
-        ImGui::SetItemTooltip("Undo: put back the file as it was before this call, "
+        itemtip("Undo: put back the file as it was before this call, "
                               "and every file changed after it");
         if (go) askrewind(g, s, t->call, 0, 0);
         break;
@@ -1765,12 +1805,12 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
             Arena a = g->frame;
             whytip(concat(&a, "Rewind to here: not now. ", act->why));
         } else if (act->cut) {
-            ImGui::SetItemTooltip("Rewind to here: take the conversation back to just "
+            itemtip("Rewind to here: take the conversation back to just "
                                   "before this prompt, which goes back to the prompt "
                                   "box to edit, and if you choose, put back the files "
                                   "write and edit changed from here on");
         } else {
-            ImGui::SetItemTooltip("Rewind to here: put back every file write and edit "
+            itemtip("Rewind to here: put back every file write and edit "
                                   "changed from this turn on (the conversation cannot "
                                   "go back past the latest compaction)");
         }
@@ -1782,7 +1822,7 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
         Arena a = g->frame;
         Str   d = s->view ? s->view->dir : Str{};
         Str   p = d.len ? join(&a, d, t->spill) : t->spill;
-        ImGui::SetItemTooltip("Output: show all of it, from its host:\n%s (%s)",
+        itemtip("Output: show all of it, from its host:\n%s (%s)",
                               cstr0(&a, p), cstr0(&a, bytesize(&a, t->bytes)));
         if (go) showfile(g, s, t->spill);
     } break;
@@ -1792,11 +1832,11 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
         g->bgshown++;
         Arena a = g->frame;
         if (t->name == "task") {
-            ImGui::SetItemTooltip("Let the subagent go on by itself, and the agent with "
+            itemtip("Let the subagent go on by itself, and the agent with "
                                   "it: the report comes to the agent once the subagent "
                                   "is done (%s)", cmdkey(g, &a, "B"));
         } else {
-            ImGui::SetItemTooltip("Let the command go on as a background job, and the "
+            itemtip("Let the command go on as a background job, and the "
                                   "agent with it: it is told when the job ends (%s)",
                                   cmdkey(g, &a, "B"));
         }
@@ -1805,7 +1845,7 @@ static void drawaction(Gui *g, GuiSession *s, ViewMsg *m, MsgAction *act)
     case ACT_STOP:
         itemnamed(g, "stop command");
         g->stopshown++;
-        ImGui::SetItemTooltip("Stop: kill the command, and let the agent go on with "
+        itemtip("Stop: kill the command, and let the agent go on with "
                               "its output so far");
         if (go) guistopcall(g, s, t);
         break;
@@ -1856,7 +1896,7 @@ static void drawthumb(Gui *g, GuiSession *s, ImDrawList *dl, Str path, i32 w, i3
     if (ImGui::IsItemHovered()) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     }
-    ImGui::SetItemTooltip("%dx%d pixels: open it whole", w, h);
+    itemtip("%dx%d pixels: open it whole", w, h);
 }
 
 // A rewound conversation's Undo, until a turn begins after it.
@@ -1874,7 +1914,7 @@ static void drawcutundo(Gui *g, GuiSession *s, ViewMsg *m)
     if (why.len) {
         whytip(why);
     } else {
-        ImGui::SetItemTooltip("Bring back the turns taken out, and the files as they "
+        itemtip("Bring back the turns taken out, and the files as they "
                               "were before the rewind: until the next message is sent");
     }
     if (go) {
@@ -1886,7 +1926,7 @@ static void drawcutundo(Gui *g, GuiSession *s, ViewMsg *m)
         ImGui::BeginDisabled(!canrewind(g, s));
         b32 force = ImGui::Button("Put back anyway...");
         itemrect(g, RECT_FORCE);
-        ImGui::SetItemTooltip("Put back the files left alone too, overwriting what "
+        itemtip("Put back the files left alone too, overwriting what "
                               "changed them since (not undone by Undo rewind)");
         ImGui::EndDisabled();
         if (force) {
@@ -1904,7 +1944,7 @@ static void drawforce(Gui *g, GuiSession *s, ViewMsg *m)
     ImGui::BeginDisabled(!canrewind(g, s));
     b32 go = ImGui::Button("Rewind anyway...");
     itemrect(g, RECT_FORCE);
-    ImGui::SetItemTooltip("Put these files back too, overwriting what changed them since");
+    itemtip("Put these files back too, overwriting what changed them since");
     ImGui::EndDisabled();
     if (go) {
         askrewind(g, s, c->to, c->turn, 1);
@@ -1948,7 +1988,7 @@ static void planeditbutton(Gui *g, GuiSession *s, Str path, Str req, char const 
             editcancel(g);
         }
         itemnamed(g, "cancel plan editor");
-        ImGui::SetItemTooltip("Stop the editor: the plan is as it left the file");
+        itemtip("Stop the editor: the plan is as it left the file");
         return;
     }
     Str why = planeditwhy(g, s, path, &a);
@@ -2238,7 +2278,7 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
         }
         ImGui::EndDisabled();
         if (latest) itemrect(g, RECT_DENY);
-        ImGui::SetItemTooltip("Answer none of them: the agent goes with its "
+        itemtip("Answer none of them: the agent goes with its "
                               "recommendations, or with your note instead");
     }
     y += frame;
@@ -2290,7 +2330,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
             }
         }
         if (latest) itemrect(g, RECT_DENY);
-        ImGui::SetItemTooltip(enter ? "No plan mode: the agent works as before"
+        itemtip(enter ? "No plan mode: the agent works as before"
                                     : "Plan mode stays on: tell the agent what to change "
                                       "in the plan");
         if (enter) {
@@ -2308,13 +2348,13 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
     if (latest) itemrect(g, RECT_ALLOW);
     b32 proj = t->scope == "mcp.project";
     if (proj) {
-        ImGui::SetItemTooltip("Start these servers for this session and its subagents, "
+        itemtip("Start these servers for this session and its subagents, "
                               "whose agents may then ask to use their tools");
     } else if (t->scope == "approve") {
-        ImGui::SetItemTooltip("Send these to these urls, from now on, for every "
+        itemtip("Send these to these urls, from now on, for every "
                               "session, until a web include changes a url");
     } else {
-        ImGui::SetItemTooltip("Let the %s go ahead", t->tool.len ? cstr0(&a, t->tool) : "tool");
+        itemtip("Let the %s go ahead", t->tool.len ? cstr0(&a, t->tool) : "tool");
     }
 
     b32 desk   = t->scope == "desktop";
@@ -2390,34 +2430,34 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         }
         if (latest) itemrect(g, RECT_ALWAYS);
         if (desk) {
-            ImGui::SetItemTooltip("Allow this action, and every %s action from now on in "
+            itemtip("Allow this action, and every %s action from now on in "
                                   "this session and its subagents, without asking",
                                   cstr0(&a, t->grant));
         } else if (proj) {
-            ImGui::SetItemTooltip("Start these servers now, and in later sessions here "
+            itemtip("Start these servers now, and in later sessions here "
                                   "without asking, until the file changes them");
         } else if (ctr) {
-            ImGui::SetItemTooltip("Allow this, and subagents in containers of %s from "
+            itemtip("Allow this, and subagents in containers of %s from "
                                   "now on in this session and its subagents, without "
                                   "asking, when they have no network", cstr0(&a, t->grant));
         } else if (web && t->grant=="search") {
-            ImGui::SetItemTooltip("Allow this, and every web search from now on in this "
+            itemtip("Allow this, and every web search from now on in this "
                                   "session and its subagents, without asking: their "
                                   "queries go to the search service unseen");
         } else if (web) {
-            ImGui::SetItemTooltip("Allow this, and reading every page of %s from now on "
+            itemtip("Allow this, and reading every page of %s from now on "
                                   "in this session and its subagents, without asking",
                                   cstr0(&a, t->grant));
         } else if (mcp && find(cuthead(t->grant, 5), "__")<0) {
-            ImGui::SetItemTooltip("Allow this, and every call to a tool of %s from now on "
+            itemtip("Allow this, and every call to a tool of %s from now on "
                                   "in this session and its subagents, without asking",
                                   cstr0(&a, cuthead(t->grant, 5)));
         } else if (mcp) {
-            ImGui::SetItemTooltip("Allow this, and every call to %s from now on in this "
+            itemtip("Allow this, and every call to %s from now on in this "
                                   "session and its subagents, without asking",
                                   cstr0(&a, t->grant));
         } else {
-            ImGui::SetItemTooltip("Allow this, and every %s in %s from now on in this "
+            itemtip("Allow this, and every %s in %s from now on in this "
                                   "session and its subagents, without asking",
                                   t->access=="write" ? "read and write" : "read",
                                   cstr0(&a, t->grant));
@@ -2432,7 +2472,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         if (penbutton(g, "##trust", runs, styles, countof(runs))) {
             guianswer(g, s, t->req, "trust", {});
         }
-        ImGui::SetItemTooltip("Allow this, and every call to a tool of %s from now on, "
+        itemtip("Allow this, and every call to a tool of %s from now on, "
                               "in later sessions too, without asking, until the "
                               "project's file changes the server", cstr0(&a, t->trust));
     }
@@ -2442,7 +2482,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         guianswer(g, s, t->req, "deny", {});
     }
     if (latest) itemrect(g, RECT_DENY);
-    ImGui::SetItemTooltip("The agent reads why and tries something else");
+    itemtip("The agent reads why and tries something else");
     ImGui::SameLine();
     if (ImGui::Button("Deny with note...")) {
         g->denyreq  = t->req;
@@ -2450,7 +2490,7 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
         g->denynote[0] = 0;
         g->opendeny = 1;
     }
-    ImGui::SetItemTooltip("Deny, telling the agent what to do instead");
+    itemtip("Deny, telling the agent what to do instead");
 }
 
 // At most n bytes of s, cut on a UTF-8 boundary, with an ellipsis when
@@ -2577,7 +2617,7 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
             ImGui::SetClipboardText(cstr0(&a, v->instrtext));
         }
         itemnamed(g, "instructions copy");
-        ImGui::SetItemTooltip("Copy what the agent was given: these files' text, as its "
+        itemtip("Copy what the agent was given: these files' text, as its "
                               "system prompt has it");
     }
 
@@ -2594,7 +2634,7 @@ static void drawinfo(Gui *g, GuiSession *s, View *v)
         ImGui::Bullet();
         text(concat(&a, "/", k->name));
         if (k->desc.len) {
-            ImGui::SetItemTooltip("%s", cstr0(&a, k->desc));
+            itemtip("%s", cstr0(&a, k->desc));
         }
         ImGui::SameLine();
         Str where = k->builtin ? Str("built into Prospero") : showpath(v, k->path);
@@ -2709,7 +2749,9 @@ static void drawgauge(Gui *g, View *v, f32 w)
     if (ImGui::BeginItemTooltip()) {
         Buf b(&a, 256);
         gaugetip(&b, v);
+        ImGui::PushTextWrapPos(tipwrap());
         text(finish(&b));
+        ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
 }
@@ -2829,7 +2871,7 @@ static void shellitems(Gui *g, Arena a, GuiSession *s, b32 opened)
                   sh->desc.len ? concat(&a, concat(&a, sh->path, "\n"), sh->desc)
                                : sh->path;
         if (tip.len) {
-            ImGui::SetItemTooltip("%s", cstr0(&a, tip));
+            itemtip("%s", cstr0(&a, tip));
         }
     }
     if (s->host == g->main) {
@@ -2950,7 +2992,7 @@ static void drawmodepick(Gui *g, Arena a, GuiSession *s, View *v)
                 setpane(g, PANE_PLAN, 1);
             }
             itemnamed(g, "show the plan");
-            ImGui::SetItemTooltip("The plan the agent writes, for you to approve");
+            itemtip("The plan the agent writes, for you to approve");
         }
         ImGui::EndPopup();
     }
@@ -3026,8 +3068,10 @@ static void drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end)
         }
         print(&b, "\n");
         print(&b, homeshow(a, s->host, w->root));
+        ImGui::PushTextWrapPos(tipwrap());
         text(finish(&b));
         ImGui::TextDisabled(open ? "Click to hide its changes" : "Click to show its changes");
+        ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
     if (click) {
@@ -3069,7 +3113,7 @@ static void drawsessbar(Gui *g)
             guiselect(g, p ? p : addsess(g, s->host, v->parent));
         }
         itemrect(g, RECT_PARENTLINK);
-        ImGui::SetItemTooltip("Back to the session that started this subagent");
+        itemtip("Back to the session that started this subagent");
         if (kidinbg(p, v) && (v->busy || v->jobsrun)) {
             ImGui::SameLine();
             ImGui::TextDisabled("in the background: it reports when done");
@@ -3086,7 +3130,7 @@ static void drawsessbar(Gui *g)
             guiselect(g, p ? p : addsess(g, s->host, o));
         }
         itemrect(g, RECT_SIDELINK);
-        ImGui::SetItemTooltip("Back to the session this side chat began from");
+        itemtip("Back to the session this side chat began from");
         drawmodelpick(g, a, s, v, 0);
         drawshellpick(g, a, s, v);
     } else {
@@ -3111,7 +3155,7 @@ static void drawsessbar(Gui *g)
         }
         ImGui::PopStyleColor();
         itemnamed(g, "plan chip");
-        ImGui::SetItemTooltip("The agent changes nothing but its plan until you approve "
+        itemtip("The agent changes nothing but its plan until you approve "
                               "it. Click to see the plan.");
     } else if (v->bypass) {
         // A warning that nothing is asked
@@ -3121,7 +3165,7 @@ static void drawsessbar(Gui *g)
         ImGui::TextUnformatted("Bypass");
         ImGui::PopStyleColor();
         itemnamed(g, "bypass chip");
-        ImGui::SetItemTooltip("Bypass mode: the agent reads and writes outside its working "
+        itemtip("Bypass mode: the agent reads and writes outside its working "
                               "directory, and acts on the desktop, without asking you. "
                               "Change it in its session's mode list.");
     }
@@ -3166,21 +3210,21 @@ static void drawsessbar(Gui *g)
         setsessiontools(g, s, !v->showtools);
     }
     itemrect(g, RECT_TOOLSBTN);
-    ImGui::SetItemTooltip("Tool output: open every tool row's output in this session, "
+    itemtip("Tool output: open every tool row's output in this session, "
                           "or fold them again as the settings say (%s)", shortcutname(g, 0));
     ImGui::SameLine();
     if (iconbutton(rl, v->showthink)) {
         setsessionthink(g, s, !v->showthink);
     }
     itemrect(g, RECT_THINKBTN);
-    ImGui::SetItemTooltip("Reasoning: show all of it in this session, even hidden, or "
+    itemtip("Reasoning: show all of it in this session, even hidden, or "
                           "fold it again as the settings say (%s)", shortcutname(g, 1));
     ImGui::SameLine();
     if (iconbutton(ICON_INFO)) {
         ImGui::OpenPopup("##sessinfo");
     }
     itemrect(g, RECT_INFOBTN);
-    ImGui::SetItemTooltip("Info: the session's model, role and instruction files");
+    itemtip("Info: the session's model, role and instruction files");
     if (ImGui::BeginPopup("##sessinfo")) {
         drawinfo(g, s, v);
         ImGui::EndPopup();
@@ -3373,7 +3417,7 @@ static void drawcodecopy(Gui *g, View *v, i32 msg, Placed *pl, ImVec2 origin, f3
     b32 go = ImGui::Button(label, v2(bw, 0));
     ImGui::PopStyleVar();
     ImGui::PopID();
-    ImGui::SetItemTooltip("Copy the code");
+    itemtip("Copy the code");
     if (aimed) {
         itemrect(g, RECT_CODECOPY);
     }
@@ -3669,7 +3713,7 @@ static Str textlink(Gui *g, View *v, TextHit hit, u64 *press, i32 *pressmsg)
     if (link.len) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            ImGui::SetTooltip("%s", cstr0(&a, linktip(&a, link)));
+            tipnow("%s", cstr0(&a, linktip(&a, link)));
         }
     }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
@@ -3836,10 +3880,10 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
 
     ImGui::SameLine();
     b32 prev = ImGui::ArrowButton("##findprev", ImGuiDir_Up);
-    ImGui::SetItemTooltip("The previous match (Shift+Enter)");
+    itemtip("The previous match (Shift+Enter)");
     ImGui::SameLine();
     b32 next = ImGui::ArrowButton("##findnext", ImGuiDir_Down);
-    ImGui::SetItemTooltip("The next match (Enter)");
+    itemtip("The next match (Enter)");
     ImGui::SameLine();
     Buf b(&a, 64);
     if (s->q.len && !s->hits.len && done) {
@@ -3855,7 +3899,7 @@ static void drawfind(Gui *g, View *v, f64 scrolly)
     ImGui::SameLine();
     b32 close = iconbutton(ICON_CLOSE "##findclose");
     itemnamed(g, "find close");
-    ImGui::SetItemTooltip("Close the find bar (Esc)");
+    itemtip("Close the find bar (Esc)");
     if (esc || close) {
         gui_find_close(g);
     } else if (enter || next || prev) {
@@ -3884,7 +3928,7 @@ static b32 forkitem(Gui *g, ViewMsg *m)
         guifork(g, s, turn);
     }
     if (!why.len) {
-        ImGui::SetItemTooltip(prompt ? "A new session of the turns before this one, "
+        itemtip(prompt ? "A new session of the turns before this one, "
                                        "this prompt in its box to edit and send"
                                      : "A new session of the conversation up to here");
     }
@@ -3941,7 +3985,7 @@ static void sideitem(Gui *g, View *v, b32 sep)
         guiside(g, s, sidequote(&a, copysel(v, &a, COPY_MARKDOWN)));
     }
     if (!why.len) {
-        ImGui::SetItemTooltip(selempty(&v->sel)
+        itemtip(selempty(&v->sel)
             ? "A new session of this conversation, to ask about it while its agent works on"
             : "A new session of this conversation, to ask about it while its agent "
               "works on, the selection quoted in its box");
@@ -3951,7 +3995,7 @@ static void sideitem(Gui *g, View *v, b32 sep)
         wtdialog(g, s, sidequote(&a, copysel(v, &a, COPY_MARKDOWN)));
     }
     if (!wwhy.len) {
-        ImGui::SetItemTooltip("A fresh session under this one that works in a new "
+        itemtip("A fresh session under this one that works in a new "
                               "worktree, on a branch of its own from this folder's HEAD, "
                               "and can report its work back here");
     }
@@ -4047,7 +4091,7 @@ static void drawqueue(Gui *g, GuiSession *s, Slice<QueueShow> shows, f64 y,
         }
         ImGui::EndDisabled();
         itemnamed(g, "withdraw");
-        ImGui::SetItemTooltip(q->steer ? "Take it back into the box, before the agent reads it"
+        itemtip(q->steer ? "Take it back into the box, before the agent reads it"
                                        : "Take it back into the box, before its turn begins");
         ImGui::PopID();
     }
@@ -4134,7 +4178,7 @@ static i32 toastbtns(Gui *g, char const *id, Str text, u32 color, u32 edge,
         if (btns[i].name.len) {
             itemnamed(g, btns[i].name);
         }
-        ImGui::SetItemTooltip("%s", btns[i].tip);
+        itemtip("%s", btns[i].tip);
         if (which>=0 && !i) {
             itemrect(g, which);
         }
@@ -4327,7 +4371,7 @@ static void drawtranscript(Gui *g)
         if (ImGui::Button("Open again")) {
             guiopen(g, gs);
         }
-        ImGui::SetItemTooltip("Take the session over, if the other process has let go");
+        itemtip("Take the session over, if the other process has let go");
     }
     if (g->engineerr.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
@@ -4683,7 +4727,7 @@ static void drawtranscript(Gui *g)
             if (hov) {
                 dl->AddRect(box0, box1, fade(g->pal->active, 0.5f), 4*sc, sc);
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                ImGui::SetItemTooltip(m->collapsed ? "Unfold" : "Fold");
+                itemtip(m->collapsed ? "Unfold" : "Fold");
             }
             if (go) {
                 if (box0.y < top) {
@@ -4964,7 +5008,7 @@ static void drawstrip(Gui *g)
         }
         ImGui::SameLine();
         ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
-        ImGui::SetItemTooltip("Its host has no endpoint of its own: a computer "
+        itemtip("Its host has no endpoint of its own: a computer "
                               "connected to it makes its model calls, with its "
                               "own endpoint and key. It resumes once one that "
                               "offers this model connects, or the turn ends "
@@ -4987,7 +5031,7 @@ static void drawstrip(Gui *g)
         }
         ImGui::SameLine();
         ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
-        ImGui::SetItemTooltip("Its host has no endpoint of its own: %s makes its "
+        itemtip("Its host has no endpoint of its own: %s makes its "
                               "model calls, with its own endpoint and key.",
                               here ? "this computer" : cstr0(&a, machine));
     }
@@ -5381,7 +5425,7 @@ static void drawattached(Gui *g, GuiSession *s)
         ImGui::EndDisabled();
         if (!busy) {
             itemnamed(g, "attach remove");
-            ImGui::SetItemTooltip("Remove it");
+            itemtip("Remove it");
             f32 d = rad*0.4f;
             dl->AddCircleFilled(k, rad, hov ? g->pal->bad : g->pal->paneldim);
             dl->AddLine(v2(k.x-d, k.y-d), v2(k.x+d, k.y+d), g->pal->codebg, 1.5f*sc);
@@ -5409,7 +5453,7 @@ static void drawattached(Gui *g, GuiSession *s)
                 print(&b, bytesize(&a, m->data.len ? m->data.len : m->bytes));
             }
             print(&b, busy ? Str(": being sent") : Str(": sent with the next message"));
-            ImGui::SetTooltip("%s", cstr0(&a, finish(&b)));
+            tipnow("%s", cstr0(&a, finish(&b)));
         }
         drop = go ? i : drop;
         ImGui::PopID();
@@ -5456,7 +5500,7 @@ static void drawprompt(Gui *g)
             editcancel(g);
             editing = 0;
         }
-        ImGui::SetItemTooltip("Stop the editor, leaving the draft as it was");
+        itemtip("Stop the editor, leaving the draft as it was");
         itemrect(g, RECT_EDITCANCEL);
         g->editshown = 1;
     } else if (!toasted && s->note.len) {
@@ -5616,7 +5660,7 @@ static void drawprompt(Gui *g)
         }
         itemrect(g, RECT_CMEDITOR);
         if (!editorcmd(g, &a).len) {
-            ImGui::SetItemTooltip("Set [ui] editor in the settings, or $VISUAL or $EDITOR");
+            itemtip("Set [ui] editor in the settings, or $VISUAL or $EDITOR");
         }
         g->cmenustate = (undo ? 1 : 0) | (redo ? 2 : 0) | (sel ? 4 : 0) | (clip ? 8 : 0) | (ed ? 16 : 0);
         if (act) {
@@ -5633,7 +5677,7 @@ static void drawprompt(Gui *g)
     ImGui::BeginDisabled(!can || editing);
     send |= ImGui::Button(v->busy ? ICON_REPLY "##send" : ICON_SEND "##send", v2(bw, 0));
     itemnamed(g, "send");
-    ImGui::SetItemTooltip(v->busy ? "Steer: send to the running turn, which the agent reads "
+    itemtip(v->busy ? "Steer: send to the running turn, which the agent reads "
                                     "at its next step (Enter)"
                                   : "Send the prompt (Enter; Shift+Enter for a new line)");
     if (v->busy) {
@@ -5641,7 +5685,7 @@ static void drawprompt(Gui *g)
             guicancel(g, g->sess);
         }
         itemnamed(g, "stop");
-        ImGui::SetItemTooltip("Stop: cancel the turn, killing any command it runs (Esc)");
+        itemtip("Stop: cancel the turn, killing any command it runs (Esc)");
     }
     ImGui::EndDisabled();
     if (g->sess && hostcap(s->host, "images")) {
@@ -5669,7 +5713,7 @@ static void drawprompt(Gui *g)
         print(&b, (i64)m);
         putbyte(&b, ')');
         ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
-        ImGui::SetItemTooltip("A message sent before, recalled: Up for older, Down for "
+        itemtip("A message sent before, recalled: Up for older, Down for "
                               "newer, Esc for the empty draft, or edit it to send again");
         g->histshown = s->hist;
     }
@@ -5897,7 +5941,7 @@ static void itemnamed(Gui *g, Str name)
 static void whytip(Str why)
 {
     if (why.len && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-        ImGui::SetTooltip("%.*s", (int)why.len, why.cdata);
+        tipnow("%.*s", (int)why.len, why.cdata);
     }
 }
 
@@ -5917,7 +5961,7 @@ static b32 menutip(Gui *g, Arena *a, Str label, Str why, Str tip, char const *ke
 {
     b32 r = menuitem(g, *a, label, why, key);
     if (!why.len) {
-        ImGui::SetItemTooltip("%s", cstr0(a, tip));
+        itemtip("%s", cstr0(a, tip));
     }
     return r;
 }
@@ -6528,7 +6572,7 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
         if (menuitem(g, a, "Update engine", busy)) {
             guiupdate(g, h);
         }
-        ImGui::SetItemTooltip("Deploy this version's engine there, then start it once "
+        itemtip("Deploy this version's engine there, then start it once "
                               "nothing runs");
     }
 }
@@ -6603,7 +6647,7 @@ static void groupitems(Gui *g, Arena a, Str group)
         }
         groupdrop(g, group);
     }
-    ImGui::SetItemTooltip("The group goes; its sessions stay");
+    itemtip("The group goes; its sessions stay");
     ImGui::Separator();
     if (menuitem(g, a, "Move up", g->groups.len && g->groups[0]!=group ? Str{} : Str("First already"))) {
         groupmove(g, group, -1);
@@ -6626,7 +6670,7 @@ static void groupitems(Gui *g, Arena a, Str group)
             trashtold(g, a, roots);
             groupdrop(g, group);
         }
-        ImGui::SetItemTooltip("The group goes; its sessions go to the Trash");
+        itemtip("The group goes; its sessions go to the Trash");
     } else if (menuitem(g, a, "Delete group and sessions...", groupwhy(g, roots, "delete", 1))) {
         askdelete(g, roots, group);
     }
@@ -6644,14 +6688,14 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
             if (menuitem(g, a, "Disconnect", {})) {
                 hostleave(g, h);
             }
-            ImGui::SetItemTooltip("Leave it: its sessions run on there");
+            itemtip("Leave it: its sessions run on there");
         } else {
             b32 closing = h && h->r && h->closing;
             if (menuitem(g, a, "Connect", closing && h->reconnect ? Str("Connecting once it lets go")
                                                                : Str{})) {
                 remoteconnect(g, a, name);
             }
-            ImGui::SetItemTooltip("%s", connecttip(g, name));
+            itemtip("%s", connecttip(g, name));
         }
     }
     GuiCtr *hc = h ? ctrofhost(g, h) : 0;
@@ -6669,7 +6713,7 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
     if (menuitem(g, a, "Import session here...", iwhy)) {
         importstart(g, h);
     }
-    ImGui::SetItemTooltip("A session from its raw log, exported here or elsewhere");
+    itemtip("A session from its raw log, exported here or elsewhere");
     if (GuiCtr *c = h ? ctrofhost(g, h) : 0) {
         ImGui::Separator();
         Str why = c->job ? Str("Busy") : !c->made ? Str("Not made") :
@@ -6678,13 +6722,13 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
         if (menuitem(g, a, "Stop container", why)) {
             ctrstop(g, c);
         }
-        ImGui::SetItemTooltip("Stop it: its sessions wait in it until it starts again "
+        itemtip("Stop it: its sessions wait in it until it starts again "
                               "(Connect)");
         if (menuitem(g, a, "Delete container...", c->job==CJOB_REMOVE ? Str("Removing") : Str{})) {
             g->delctr     = c;
             g->opendelctr = 1;
         }
-        ImGui::SetItemTooltip("Remove it and its sessions for good");
+        itemtip("Remove it and its sessions for good");
     } else if (!h || h->kind==GH_REMOTE) {
         ImGui::Separator();
         Str why = deploywhy(g, h, name);
@@ -6692,14 +6736,14 @@ static void hostitems(Gui *g, Arena a, GuiHost *h, Str remote)
             if (menuitem(g, a, "Update engine", why)) {
                 guiupdate(g, h);
             }
-            ImGui::SetItemTooltip("Deploy this version's engine there, then start it "
+            itemtip("Deploy this version's engine there, then start it "
                                   "once nothing runs");
         } else {
             why = why.len || !h || !h->r ? why : Str("Connecting already");
             if (menuitem(g, a, "Deploy engine", why)) {
                 guideploy(g, name);
             }
-            ImGui::SetItemTooltip("Copy this version's engine there, as prospero deploy "
+            itemtip("Copy this version's engine there, as prospero deploy "
                                   "does, then connect to it");
         }
     }
@@ -6772,7 +6816,7 @@ static void dragsource(Gui *g, Arena a, GuiSession *s)
     Str why = dragwhy(g, s);
     if (why.len) {
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            ImGui::SetTooltip("%s", cstr0(&a, why));
+            tipnow("%s", cstr0(&a, why));
         }
         return;
     }
@@ -6838,7 +6882,7 @@ static void rtitems(Gui *g, Arena a)
     if (menuitem(g, a, "Look again", g->ctrprobing ? Str("Looking") : Str{})) {
         ctrlook(g);
     }
-    ImGui::SetItemTooltip("Ask whether %s runs now", cstr0(&a, ctrtitle(g->ctrrt.name)));
+    itemtip("Ask whether %s runs now", cstr0(&a, ctrtitle(g->ctrrt.name)));
 }
 
 static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64 nowms,
@@ -6870,9 +6914,9 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
     b32 click = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     itemnamed(g, concat(&a, "head ", r->key));
     if (r->forced && ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Open while something under it needs an answer");
+        tipnow("Open while something under it needs an answer");
     } else if (r->kind==SROW_HOST && h && h->msg.len && h->state!=RS_UP) {
-        ImGui::SetItemTooltip("%s", cstr0(&a, h->msg));
+        itemtip("%s", cstr0(&a, h->msg));
     }
     if (ImGui::IsItemHovered()) {
         dl->AddRectFilled(p, v2(p.x+w, p.y+lineh+4*sc), fade(g->pal->dim, 0.12f));
@@ -6884,7 +6928,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
         }
     }
     if (r->kind == SROW_TRASH) {
-        ImGui::SetItemTooltip("Deleted sessions, each removed for good after the "
+        itemtip("Deleted sessions, each removed for good after the "
                               "days its host keeps them ([sessions] trash_days)");
     }
     switch (r->kind) {
@@ -7015,7 +7059,7 @@ static void drawheading(Gui *g, Arena a, SideRow *r, GuiHost *h, Str remote, i64
             b32 b = iconbutton(cbtn);
             ImGui::EndDisabled();
             itemnamed(g, concat(&a, "connect ", r->key));
-            ImGui::SetItemTooltip("%s", live ? "Disconnect: leave it, its sessions running "
+            itemtip("%s", live ? "Disconnect: leave it, its sessions running "
                                                "on there"
                                              : connecttip(g, h ? h->name : remote));
             if (b && live) {
@@ -7063,6 +7107,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     ImGui::SetNextItemAllowOverlap();
     if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc)) && !r->trashed) {
         guiselect(g, s);  // one in the Trash cannot open
+        setpane(g, PANE_TRANSCRIPT, 1);  // shown with it, as New session does
     }
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();
@@ -7094,7 +7139,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
             putbyte(&tip, '\n');
             gaugetip(&tip, v);
         }
-        ImGui::SetTooltip("%s", cstr0(&a, finish(&tip)));
+        tipnow("%s", cstr0(&a, finish(&tip)));
     }
     if (ImGui::BeginPopupContextItem("##sessmenu")) {
         g->menusess = s;
@@ -7216,7 +7261,7 @@ static void dragrest(Gui *g, Arena a, GuiSession *s, f32 foot)
 
     Str   t     = shorten(&a, sesstitle(s), 60);
     Str   where = {(u8 *)g->droplabel, (iz)__builtin_strlen(g->droplabel)};
-    ImGui::SetTooltip("%s", cstr0(&a, where.len ? concat(&a, concat(&a, t, "  "), where) : t));
+    tipnow("%s", cstr0(&a, where.len ? concat(&a, concat(&a, t, "  "), where) : t));
 
     ImGuiWindow *w    = ImGui::GetCurrentWindow();
     f32          y    = ImGui::GetIO().MousePos.y;
@@ -7338,7 +7383,7 @@ static void drawsessions(Gui *g)
             ctrlook(g);
         }
         itemnamed(g, "sessions refresh");
-        ImGui::SetItemTooltip(HOST_WINDOWS ? "Refresh: list the sessions and the WSL distros again"
+        itemtip(HOST_WINDOWS ? "Refresh: list the sessions and the WSL distros again"
                                            : "Refresh: list the sessions again");
     }
 
@@ -7847,7 +7892,7 @@ static void drawplan(Gui *g)
     ImGui::TextUnformatted(mode);
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
-    ImGui::SetItemTooltip("%s", cstr0(&a, v->planpath));
+    itemtip("%s", cstr0(&a, v->planpath));
     if (!shown) {
         return;  // on its way
     }
@@ -7972,7 +8017,7 @@ static void drawchanges(Gui *g)
     ImGui::AlignTextToFramePadding();
     text(cut.len ? cut : head);
     if (cut.len != head.len) {
-        ImGui::SetItemTooltip("%s", cstr0(&a, name));
+        itemtip("%s", cstr0(&a, name));
     }
     if (w->op.len) {
         Buf b(&a, 64);
@@ -8008,7 +8053,7 @@ static void drawchanges(Gui *g)
         samelineif(ImGui::CalcTextSize(cstr0(&a, up)).x);
         ImGui::TextDisabled("%s", cstr0(&a, up));
         if (c->ab) {
-            ImGui::SetItemTooltip("%lld ahead of %s, %lld behind it",
+            itemtip("%lld ahead of %s, %lld behind it",
                                   (long long)c->ahead, cstr0(&a, c->upstream),
                                   (long long)c->behind);
         }
@@ -8024,14 +8069,14 @@ static void drawchanges(Gui *g)
     }
     ImGui::EndDisabled();
     itemnamed(g, "changes refresh");
-    ImGui::SetItemTooltip(busy ? "Reading the changes" :
+    itemtip(busy ? "Reading the changes" :
                           "Refresh: read the changes again. They are read as the "
                           "agent's tools finish, and as this window takes the focus back.");
     Str root = homeshow(&a, s->host, w->root);
     cut = midcut(&a, root, ImGui::GetContentRegionAvail().x, &m, 0);
     ImGui::TextDisabled("%s", cstr0(&a, cut.len ? cut : root));
     if (cut.len != root.len) {
-        ImGui::SetItemTooltip("%s", cstr0(&a, root));
+        itemtip("%s", cstr0(&a, root));
     }
 
     if (c->err.len) {
@@ -8092,7 +8137,9 @@ static void drawchanges(Gui *g)
                 Str path = midcut(&a, r->path, ImGui::GetContentRegionAvail().x, &m, 0);
                 text(path.len ? path : Str("\xe2\x80\xa6"));
                 if (ImGui::BeginItemTooltip()) {
+                    ImGui::PushTextWrapPos(tipwrap());
                     text(changetip(&a, r));
+                    ImGui::PopTextWrapPos();
                     ImGui::EndTooltip();
                 }
                 if (cw<=0 || !r->counted) {
@@ -8138,7 +8185,7 @@ static void drawchanges(Gui *g)
         print(&b, "  \xc2\xb7  new files' lines partly counted");
     }
     ImGui::TextDisabled("%s", cstr0(&a, finish(&b)));
-    ImGui::SetItemTooltip("git took %lld ms", (long long)c->ms);
+    itemtip("git took %lld ms", (long long)c->ms);
 }
 
 // The last n lines of s.
@@ -8228,7 +8275,7 @@ static void drawjobs(Gui *g)
                 itemrect(g, RECT_JOBKILL);
                 first = 0;
             }
-            ImGui::SetItemTooltip("Stop the job (and what it started); the agent is told");
+            itemtip("Stop the job (and what it started); the agent is told");
             if (kill) {
                 j->killing = 1;
                 guijobkill(g, g->sess, j->n);
@@ -8241,7 +8288,7 @@ static void drawjobs(Gui *g)
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered() && j->spill.len) {
             Str full = v->dir.len ? join(&a, v->dir, j->spill) : j->spill;
-            ImGui::SetItemTooltip("%s\nFull output: %s", cstr0(&a, j->command), cstr0(&a, full));
+            itemtip("%s\nFull output: %s", cstr0(&a, j->command), cstr0(&a, full));
         }
         Str tail = lastlines({j->tail, j->taillen}, 4);
         if (tail.len) {
@@ -8736,7 +8783,7 @@ static b32 wtfields(Gui *g, Arena a, GuiHost *host, Str cwd)
         g->wtnamed = g->wtname[0] != 0;
     }
     itemnamed(g, "worktree name");
-    ImGui::SetItemTooltip("Its folder's name in .prospero/worktrees, and its branch's after "
+    itemtip("Its folder's name in .prospero/worktrees, and its branch's after "
                           "the prefix: lowercase letters, digits and single hyphens");
     if (!have) {
         ImGui::TextDisabled("Looking at the folder\xe2\x80\xa6");
@@ -8873,7 +8920,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     *enter |= ImGui::InputText("##image", g->newimage, FIELD_MAX,
                                ImGuiInputTextFlags_EnterReturnsTrue);
     itemnamed(g, "new image");
-    ImGui::SetItemTooltip("A Linux image, as the runtime names it: pulled first if "
+    itemtip("A Linux image, as the runtime names it: pulled first if "
                           "it is not here");
     Slice<Str> imgs = ctrimagelist(&a, ctrset(g, "images"));
     for (iz i = 0; i < g->ctrimgs.len; i++) {
@@ -8919,7 +8966,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
         }
         ImGui::RadioButton(labels[i], &g->newws, i);
         itemnamed(g, concat(&a, "new ws", ctrworkspaces[i]));
-        ImGui::SetItemTooltip("%s", tips[i]);
+        itemtip("%s", tips[i]);
     }
     b32 none = g->newws == CTR_EMPTY;
     ImGui::BeginDisabled(none);
@@ -8940,7 +8987,7 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     ImGui::Spacing();
     checkbox("Network access", &g->newnet);
     itemnamed(g, "new network");
-    ImGui::SetItemTooltip("Off, it reaches no network: its model calls and web searches "
+    itemtip("Off, it reaches no network: its model calls and web searches "
                           "still go through this computer ([container] network)");
     (void)sc;
     Str image = trim({(u8 *)g->newimage, (iz)__builtin_strlen(g->newimage)});
@@ -9063,7 +9110,7 @@ static void drawnew(Gui *g)
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12*sc);
             checkbox("No folder", &g->newnofolder);
             itemnamed(g, "new nofolder");
-            ImGui::SetItemTooltip("No project: the session works in a folder of its own, "
+            itemtip("No project: the session works in a folder of its own, "
                                   "kept with it and deleted with it. %s, Session \xe2\x86\x92 "
                                   "New session, no folder, starts one straight away",
                                   cmdkey(g, &a, "Shift+N"));
@@ -9180,7 +9227,7 @@ static void drawnew(Gui *g)
             if (ImGui::Selectable("None", !hasrole)) {
                 g->newrole = {};
             }
-            ImGui::SetItemTooltip("No role: the usual session, with its usual tools");
+            itemtip("No role: the usual session, with its usual tools");
             for (iz i = 0; i < roles.len; i++) {
                 GuiRole *r = &roles[i];
                 ImGui::PushID((i32)i);
@@ -9191,7 +9238,7 @@ static void drawnew(Gui *g)
                 print(&tb, r->desc.len ? r->desc : Str("(no description)"));
                 print(&tb, "\nTools: ");
                 print(&tb, r->tools.len ? r->tools : Str("none"));
-                ImGui::SetItemTooltip("%s", cstr0(&a, finish(&tb)));
+                itemtip("%s", cstr0(&a, finish(&tb)));
                 ImGui::PopID();
             }
             ImGui::EndCombo();
@@ -9319,9 +9366,9 @@ static void drawclose(Gui *g)
             ImGui::EndDisabled();
             itemrect(g, RECT_CLOSEBG);
             if (g->whynobg.len) {
-                ImGui::SetItemTooltip("Not here: %s", cstr0(&a, g->whynobg));
+                itemtip("Not here: %s", cstr0(&a, g->whynobg));
             } else {
-                ImGui::SetItemTooltip("Close the window, and keep this process running its "
+                itemtip("Close the window, and keep this process running its "
                                       "sessions, unattended, with a tray icon to bring it back");
             }
             if (bg) {
@@ -9383,7 +9430,7 @@ static void drawoutput(Gui *g)
             guifile(g);
         }
         ImGui::EndDisabled();
-        ImGui::SetItemTooltip("The next part of it");
+        itemtip("The next part of it");
     }
     ImGui::SameLine(right > rightof() ? right : 0);
     ImGui::BeginDisabled(!t.len);
@@ -9393,7 +9440,7 @@ static void drawoutput(Gui *g)
     }
     ImGui::EndDisabled();
     itemnamed(g, "output copy");
-    ImGui::SetItemTooltip(o->more ? "Copy what is shown: More shows the rest"
+    itemtip(o->more ? "Copy what is shown: More shows the rest"
                                   : "Copy the output");
     if (o->err.len) {
         ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
@@ -9446,7 +9493,7 @@ static b32 textfit(Arena a, Str s, f32 width, u32 color, Str tip = {})
             print(&b, tip.len ? Str("\n") : Str(""));
         }
         print(&b, tip);
-        ImGui::SetItemTooltip("%s", cstr0(&a, finish(&b)));
+        itemtip("%s", cstr0(&a, finish(&b)));
     }
     return cut;
 }
@@ -9481,7 +9528,7 @@ static void drawshot(Gui *g)
     i32 h = v->tex ? v->tex->td.Height : v->h;
     checkbox("Fit", &v->fit);
     itemnamed(g, "Fit");
-    ImGui::SetItemTooltip("Scale it to fit the window");
+    itemtip("Scale it to fit the window");
     ImGui::SameLine();
     Buf b(&a, 512);
     print(&b, imgstr(&v->path));
@@ -9582,7 +9629,7 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         itemrect(g, rect);
     }
     itemnamed(g, concat(&a, "connect ", name));
-    ImGui::SetItemTooltip("%s", live ? "Leave it: its sessions run on there" :
+    itemtip("%s", live ? "Leave it: its sessions run on there" :
                                 closing ? "Connect again once it has let go" :
                                           connecttip(g, name));
     if (click && live) {
@@ -9602,7 +9649,7 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
             setpane(g, PANE_SETTINGS, 1);
         }
         itemnamed(g, concat(&a, "settings ", name));
-        ImGui::SetItemTooltip("Give it a [remote %s] section of its own, with "
+        itemtip("Give it a [remote %s] section of its own, with "
                               "wsl = %s, and show it in Settings",
                               cstr0(&a, name), cstr0(&a, auto_->wsl));
     }
@@ -9618,7 +9665,7 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         ImGui::TextWrapped("No endpoint of its own: its sessions run on this "
                            "computer's models");
         ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("Its configuration defines no endpoint, so this "
+        itemtip("Its configuration defines no endpoint, so this "
                               "computer makes its model calls, with its own "
                               "endpoints and keys, while connected. Define an "
                               "endpoint there to make it independent.");
@@ -9640,7 +9687,7 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         }
         ImGui::EndDisabled();
         itemnamed(g, concat(&a, "deploy engine ", name));
-        ImGui::SetItemTooltip("%s", why.len ? cstr0(&a, why)
+        itemtip("%s", why.len ? cstr0(&a, why)
                                             : "Copy this version's engine there, as "
                                               "prospero deploy does, then connect to it");
     } else if (live && hostolder(h)) {
@@ -9653,7 +9700,7 @@ static void drawremote(Gui *g, Arena a, Str name, i32 rect)
         }
         ImGui::EndDisabled();
         itemnamed(g, concat(&a, "update engine ", name));
-        ImGui::SetItemTooltip("%s", why.len ? cstr0(&a, why)
+        itemtip("%s", why.len ? cstr0(&a, why)
                                             : "Deploy this version's engine there, then "
                                               "start it once nothing runs");
     }
@@ -9679,7 +9726,7 @@ static void drawhosts(Gui *g)
         ctrlook(g);
     }
     itemnamed(g, "hosts look again");
-    ImGui::SetItemTooltip("Look again: find background hosts, WSL distros and Docker or "
+    itemtip("Look again: find background hosts, WSL distros and Docker or "
                           "Podman again, and read the remotes from the configuration");
 
     // This process
@@ -9724,7 +9771,7 @@ static void drawhosts(Gui *g)
             cmdsend(g, &w, c);
         }
         ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Stop its sessions' work, and the host");
+        itemtip("Stop its sessions' work, and the host");
         ImGui::PopID();
     }
 
@@ -9784,7 +9831,7 @@ static void drawhosts(Gui *g)
             f32         bw = ImGui::CalcTextSize("Delete").x + 2*st.FramePadding.x;
             textfit(a, finish(&b), ImGui::GetContentRegionAvail().x - bw - st.ItemSpacing.x, 0);
             if (c->err.len && ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("%s", cstr0(&a, c->err));
+                tipnow("%s", cstr0(&a, c->err));
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Delete")) {
@@ -9792,7 +9839,7 @@ static void drawhosts(Gui *g)
                 g->opendelctr = 1;
             }
             itemnamed(g, "hosts delctr");  // the checklist's, its only one
-            ImGui::SetItemTooltip("Remove it and its sessions for good");
+            itemtip("Remove it and its sessions for good");
             ImGui::PopID();
         }
     }
@@ -9813,7 +9860,7 @@ static void drawhosts(Gui *g)
     if (ImGui::Combo("##remhow", &hw, how, countof(how))) {
         g->remexec = hw;
     }
-    ImGui::SetItemTooltip("How it is reached: over ssh, or by a command that runs "
+    itemtip("How it is reached: over ssh, or by a command that runs "
                           "another there, docker exec -i NAME, say");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(row ? 200*sc : -1);
@@ -9821,7 +9868,7 @@ static void drawhosts(Gui *g)
                                                     : "ssh destination",
                              g->remssh, FIELD_MAX);
     itemrect(g, RECT_REMSSH);
-    ImGui::SetItemTooltip(g->remexec ? "A command that runs another inside it, "
+    itemtip(g->remexec ? "A command that runs another inside it, "
                                        "without a shell; it needs /bin/sh there"
                                      : "user@host, or a host from ~/.ssh/config");
     if (row) {
@@ -9925,9 +9972,9 @@ static Str provenance(Gui *g, Arena *a, CfgRow *r, i64 now)
 
 // A setting's row: its key, its value to edit, where it is set, which
 // with wide is a column of its own, else a line under the key. Enums
-// are picked from their choices, paths edited one a line, and the rest
-// typed. The checklist's target row records its field's rectangle
-// (RECT_*, or -1 for none).
+// and booleans (true or false) are picked from their choices, paths
+// edited one a line, and the rest typed. The checklist's target row
+// records its field's rectangle (RECT_*, or -1 for none).
 // A setting's tooltip: its description, type and default.
 static Str cfgrowtip(Arena *a, CfgRow *r)
 {
@@ -9978,13 +10025,16 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
     if (r->choices.len) {
         // A pick goes out at once; the theme and how reasoning shows
         // and counts apply even before the file has them
+        // and a boolean shows as true or false, however it was written
         b32    theme = r->kind=="ui" && r->key=="theme";
         ImVec2 at    = ImGui::GetCursorScreenPos();
         Str    pick  = {};
-        if (ImGui::BeginCombo("##v", cstr0(&a, r->value))) {
+        i32    yes   = r->type=="bool" ? cfgbool(trim(r->value)) : -1;
+        Str    shown = yes==1 ? Str("true") : yes==0 ? Str("false") : r->value;
+        if (ImGui::BeginCombo("##v", cstr0(&a, shown))) {
             for (iz i = 0; i < r->choices.len; i++) {
                 Str c = r->choices[i];
-                if (ImGui::Selectable(cstr0(&a, c), c==r->value)) {
+                if (ImGui::Selectable(cstr0(&a, c), c==shown)) {
                     pick = c;
                 }
                 if (theme && i<THEME_COUNT) {
@@ -9997,7 +10047,7 @@ static void drawcfgrow(Gui *g, CfgRow *r, i32 target, b32 wide)
             f32 w = ImGui::GetContentRegionAvail().x;
             g->rects[target] = {at.x, at.y, at.x+w, at.y+ImGui::GetFrameHeight()};
         }
-        if (pick.len && pick!=r->value && !(r->sent && pick==r->sentval)) {
+        if (pick.len && pick!=shown && !(r->sent && pick==r->sentval)) {
             if (theme) {
                 settheme(g, themeparse(pick));
             } else if (r->kind=="ui" && r->key=="thinking") {
@@ -10130,7 +10180,7 @@ static b32 cfgitem(Gui *g, Arena a, b32 combo, Str label, b32 selected, Str tip,
     if (combo) {
         click = ImGui::Selectable(cstr0(&a, label), selected);
         if (tip.len) {
-            ImGui::SetItemTooltip("%s", cstr0(&a, tip));
+            itemtip("%s", cstr0(&a, tip));
         }
     } else {
         // The label drawn over an unlabeled row, which is no wider than
@@ -10147,7 +10197,7 @@ static b32 cfgitem(Gui *g, Arena a, b32 combo, Str label, b32 selected, Str tip,
         if (cut || tip.len) {
             Str t = cut && tip.len ? concat(&a, concat(&a, label, "\n"), tip) :
                     cut ? label : tip;
-            ImGui::SetItemTooltip("%s", cstr0(&a, t));
+            itemtip("%s", cstr0(&a, t));
         }
     }
     if (color) {
@@ -10448,7 +10498,7 @@ static void drawcfgfind(Gui *g, Arena a, Slice<i32> found, b32 enter)
         if (ImGui::Selectable("##found", cfgfocused(g, r), 0, v2(0, 2*lh + gap/2))) {
             cfggoto(g, r);
         }
-        ImGui::SetItemTooltip("%s", cstr0(&t, cfgrowtip(&t, r)));
+        itemtip("%s", cstr0(&t, cfgrowtip(&t, r)));
         ImDrawList *dl = ImGui::GetWindowDrawList();
         ImGui::RenderTextEllipsis(dl, p, v2(p.x+w, p.y+lh), p.x+w,
                                   r->key.cdata, r->key.cdata+r->key.len, 0);
@@ -10535,7 +10585,7 @@ static void drawcfgtemplate(Gui *g, Str model)
         ImGui::SameLine();
     }
     b32 set = ImGui::Button("Set");
-    ImGui::SetItemTooltip("Sent in chat_template_kwargs: true and false as booleans, "
+    itemtip("Sent in chat_template_kwargs: true and false as booleans, "
                           "numbers as numbers, the rest, or anything in quotes, as a "
                           "string; empty removes what the model inherits");
     if (set) {
@@ -10617,7 +10667,7 @@ static b32 drawapprove(Gui *g, Arena a, Str kind, Str name)
         itemnamed(g, concat(&a, concat(&a, kind, Str(" url ")), name));
         b32 yes = ImGui::SmallButton("Approve");
         itemnamed(g, concat(&a, concat(&a, kind, Str(" approve ")), name));
-        ImGui::SetItemTooltip("Send these to this url, for every session, "
+        itemtip("Send these to this url, for every session, "
                               "until a web include changes the url");
         if (yes) {
             mcpcmd(g, CMD_APPROVE, name, url);
@@ -10670,7 +10720,7 @@ static void drawmcp(Gui *g, Arena a, Str name)
         if (why.len) {
             whytip(why);
         } else {
-            ImGui::SetItemTooltip("Sign in through the browser, for a token the "
+            itemtip("Sign in through the browser, for a token the "
                                   "server takes, kept in the state directory");
         }
         if (in) {
@@ -10680,7 +10730,7 @@ static void drawmcp(Gui *g, Arena a, Str name)
             ImGui::SameLine();
             b32 out = ImGui::SmallButton("Sign out");
             itemnamed(g, concat(&a, "mcp signout ", name));
-            ImGui::SetItemTooltip("Forget the server's tokens");
+            itemtip("Forget the server's tokens");
             if (out) {
                 mcpcmd(g, CMD_MCPLOGOUT, name);
             }
@@ -10691,7 +10741,7 @@ static void drawmcp(Gui *g, Arena a, Str name)
     b32 again = ImGui::SmallButton("Restart");
     ImGui::EndDisabled();
     itemnamed(g, concat(&a, "mcp restart ", name));
-    ImGui::SetItemTooltip("%s", http ? "Connect to it again now"
+    itemtip("%s", http ? "Connect to it again now"
                                      : "Stop it, to start again for the next session "
                                        "that uses it");
     if (again) {
@@ -10773,7 +10823,7 @@ static void drawcfgpage(Gui *g)
         ImGui::EndDisabled();
         itemrect(g, RECT_DELETE);
         if (why.len) {
-            ImGui::SetItemTooltip("%s", cstr0(&a, finish(&why)));
+            itemtip("%s", cstr0(&a, finish(&why)));
         } else {
             Buf tb(&a, 256);
             print(&tb, "Delete...: remove ");
@@ -10784,7 +10834,7 @@ static void drawcfgpage(Gui *g)
             if (other) {
                 print(&tb, "; an included file defines it too, which stays");
             }
-            ImGui::SetItemTooltip("%s", cstr0(&a, finish(&tb)));
+            itemtip("%s", cstr0(&a, finish(&tb)));
         }
         if (del) {
             g->opendel = 1;
@@ -10977,7 +11027,7 @@ static void cfgeditbutton(Gui *g, Arena a, Str path, b32 exists)
             editcancel(g);
         }
         itemnamed(g, "cancel config editor");
-        ImGui::SetItemTooltip("Stop the editor: the file is as it left it, read again");
+        itemtip("Stop the editor: the file is as it left it, read again");
         return;
     }
     char const *label = "Open in editor";
@@ -11041,7 +11091,7 @@ static void drawsettings(Gui *g)
         guiconfigget(g);
     }
     itemnamed(g, "settings reload");
-    ImGui::SetItemTooltip("Reload: read the configuration's files again");
+    itemtip("Reload: read the configuration's files again");
     cfgeditbutton(g, a, path, jsonint(jsonget(j, "exists"), 0) != 0);
     i32 urls = (i32)jsonlen(jsonget(j, "includes"));
     if (urls) {
@@ -11052,7 +11102,7 @@ static void drawsettings(Gui *g)
         b32 refresh = ImGui::Button(label);
         itemrect(g, RECT_REFRESHINC);
         ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Fetch the %d URL include%s again, rather than wait for the "
+        itemtip("Fetch the %d URL include%s again, rather than wait for the "
                               "next scheduled fetch", urls, urls==1 ? "" : "s");
         if (refresh) {
             g->cfgget = 0;  // this one is the answer that counts
@@ -11073,7 +11123,7 @@ static void drawsettings(Gui *g)
             g->cfgdiag = 1;
         }
         ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("Show the problems found in the files, with where each is");
+        itemtip("Show the problems found in the files, with where each is");
     }
 
     if (g->cfglinked && !g->cfgset && !g->cfgget) {
@@ -11119,7 +11169,7 @@ static void drawsettings(Gui *g)
             *g->cfgfind   = 0;
             g->cfgfindkey = 1;
         }
-        ImGui::SetItemTooltip("Clear the search");
+        itemtip("Clear the search");
         g->rects[RECT_CFGCLEAR] = {at.x, at.y, at.x+fs, at.y+fs};
     }
     Str        query = trim({(u8 *)g->cfgfind, (iz)__builtin_strlen(g->cfgfind)});
@@ -11293,10 +11343,10 @@ static void drawmetrics(Gui *g)
     if (checkbox("Staleness probe", &g->sched.probing)) {
         g->sched.shadowat = 0;
     }
-    ImGui::SetItemTooltip("Render a hidden frame 250 ms after going idle, and report a missed wake if it differs");
+    itemtip("Render a hidden frame 250 ms after going idle, and report a missed wake if it differs");
     ImGui::SameLine();
     checkbox("Aggressive", &g->sched.aggressive);
-    ImGui::SetItemTooltip("Probe every second while idle");
+    itemtip("Probe every second while idle");
 }
 
 static void drawlog(Gui *g)
@@ -11378,7 +11428,7 @@ static void drawhelp(Gui *g)
             *g->helpfind   = 0;
             g->helpfindkey = 1;
         }
-        ImGui::SetItemTooltip("Clear the search");
+        itemtip("Clear the search");
         namedrect(g, "help search clear", at, v2(at.x+fs, at.y+fs));
     }
     Str            query = trim({(u8 *)g->helpfind, (iz)__builtin_strlen(g->helpfind)});
@@ -11496,36 +11546,36 @@ static void drawfaketools(Gui *g)
             fakecmd(g, FAKE_PROMPT, "Show me something with code and a table.");
         }
     }
-    ImGui::SetItemTooltip(g->view->busy ? "Cancel the running turn"
+    itemtip(g->view->busy ? "Cancel the running turn"
                                         : "Send a canned prompt");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(140*sc);
     if (ImGui::SliderInt("tok/s", &g->tps, 1, 2000, "%d tok/s", ImGuiSliderFlags_Logarithmic)) {
         fakeint(g, FAKE_TPS, g->tps);
     }
-    ImGui::SetItemTooltip("Streaming rate of the fake agent");
+    itemtip("Streaming rate of the fake agent");
     ImGui::SameLine();
     if (checkbox("Bursts", &g->bursts)) {
         fakeint(g, FAKE_BURSTS, g->bursts);
     }
-    ImGui::SetItemTooltip("Deliver tokens in bursts of 25");
+    itemtip("Deliver tokens in bursts of 25");
     ImGui::SameLine();
     if (checkbox("Pauses", &g->pauses)) {
         fakeint(g, FAKE_PAUSES, g->pauses);
     }
-    ImGui::SetItemTooltip("Stall for 5 s partway through each response");
+    itemtip("Stall for 5 s partway through each response");
     ImGui::SameLine();
     if (ImGui::Button("Huge code")) {
         fakecmd(g, FAKE_HUGE, "");
     }
-    ImGui::SetItemTooltip("Stream one response that is a single huge code block");
+    itemtip("Stream one response that is a single huge code block");
     ImGui::SameLine();
     b32 history = ImGui::Button("10k history");
     itemrect(g, RECT_HISTORY);
     if (history) {
         fakeint(g, FAKE_HISTORY, 10000);
     }
-    ImGui::SetItemTooltip("Load 10,000 messages (about 5 MB) of history");
+    itemtip("Load 10,000 messages (about 5 MB) of history");
 }
 
 // A shortcut as the menus show it: Cmd on macOS, else Ctrl.
@@ -11975,7 +12025,7 @@ static void drawlayoutmenu(Gui *g)
     for (i32 i = 0; i < PRESET_COUNT; i++) {
         b32 pick = ImGui::MenuItem(presetnames[i].cdata, layoutkey(g, &a, i));
         itemnamed(g, concat(&a, "layout ", presetnames[i]));
-        ImGui::SetItemTooltip("%s", presettips[i].cdata);
+        itemtip("%s", presettips[i].cdata);
         if (pick) {
             DockLayout l = dockpreset(i);
             picklayout(g, &l);
@@ -12127,7 +12177,7 @@ static void drawmenubar(Gui *g)
     if (menu) {
         b32 add = ImGui::MenuItem("New session...", cmdkey(g, &a, "N"), false, cannew(g));
         itemrect(g, RECT_NEWBTN);
-        ImGui::SetItemTooltip("Start a session in a working directory");
+        itemtip("Start a session in a working directory");
         if (add) {
             newsession(g);
         }
@@ -12140,7 +12190,7 @@ static void drawmenubar(Gui *g)
         if (menuitem(g, a, "Import session...", iwhy)) {
             importstart(g, 0);
         }
-        ImGui::SetItemTooltip("A session from its raw log, exported here or elsewhere");
+        itemtip("A session from its raw log, exported here or elsewhere");
         if (menutip(g, &a, "Empty Trash...", emptywhy(g),
                     "Remove every session in the Trash for good now, once you confirm")) {
             askempty(g);
@@ -12151,7 +12201,7 @@ static void drawmenubar(Gui *g)
             guibackground(g, g->sess, {});
         }
         itemnamed(g, "menu Run in background");
-        ImGui::SetItemTooltip("Let the running command go on as a background job, or "
+        itemtip("Let the running command go on as a background job, or "
                               "the subagents on by themselves, and the agent with them: "
                               "it is told as each ends");
         // The session operations, on the session shown, as its context

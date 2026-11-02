@@ -4201,6 +4201,9 @@ static void loadcfg(Gui *g, Str line)
                     for (Json *c = jsonget(k, "choices")->child; c; c = c->next) {
                         r.choices = push(a, r.choices, jsonstr(c));
                     }
+                } else if (r.type == "bool") {
+                    r.choices = push(a, r.choices, Str("true"));  // picked, as enums
+                    r.choices = push(a, r.choices, Str("false"));
                 }
             }
         }
@@ -14289,8 +14292,8 @@ static DriveOp settingsops[] = {
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 200, ""},
     {OP_TEXT, 0, 0, 0, 500, "timeout"},
-    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "ask_timeout job_timeout job_timeout_max "
-                                      "ask_timeout connect_timeout"},
+    {OP_CHECK, CHK_CFGFIND, 0, 0, 0, "ask_timeout question_timeout job_timeout "
+                                      "job_timeout_max ask_timeout connect_timeout"},
     {OP_SHOT, 0, 0, 0, 300, "settings-find"},
     {OP_KEYDOWN, 0, GKEY_ESCAPE, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ESCAPE, 0, 300, ""},
