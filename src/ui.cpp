@@ -971,8 +971,11 @@ static void pen(Pen *p, Str s, i32 style, u32 col)
     if (!s.len || p->x>=p->right) {
         return;
     }
+    // Clipped at the right only: ImGui draws from x rounded down, and a
+    // glyph (bold most) may reach left of its origin, so a left edge at
+    // x cut a column off a run's first glyph
     ImFont *font = stylefont(p->f, style);
-    ImVec4  clip = ImVec4(p->x, p->y, p->right, p->y + p->size*2);
+    ImVec4  clip = ImVec4(p->x - p->size, p->y - p->size, p->right, p->y + p->size*2);
     p->dl->AddText(font, p->size, v2(p->x, p->y), col, s.cdata, s.cdata+s.len, 0, &clip);
     p->x += font->CalcTextSizeA(p->size, 1e9f, 0, s.cdata, s.cdata+s.len).x;
 }
