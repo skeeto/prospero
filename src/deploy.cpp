@@ -705,7 +705,9 @@ static b32 deploynap(Deploy *d, i64 wait)
 }
 
 // Run a child to its end, given input and then its input closed,
-// keeping its output.
+// keeping its output. What it leaves running when it ends by itself
+// goes on, as from a shell: podman start's conmon holds the container
+// up. One killed for its time or a cancel is swept with its tree.
 static DeployRun deployrun(Deploy *d, Arena *a, Slice<Str> argv, i64 timeout,
                            Str input = {})
 {
@@ -774,6 +776,9 @@ static DeployRun deployrun(Deploy *d, Arena *a, Slice<Str> argv, i64 timeout,
                 break;
             }
         }
+    }
+    if (!killed) {
+        os_letgo(os, p);  // else its reaper waits out the harness
     }
     os_procfree(os, p);
     r.code = exited && !killed ? code : -1;

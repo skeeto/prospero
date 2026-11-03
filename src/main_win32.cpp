@@ -2057,6 +2057,8 @@ static void os_kill(Os *os, Proc *p, b32 hard)
     }
 }
 
+static void os_letgo(Os *, Proc *) {}  // the job closes with os_procfree
+
 static void os_procfree(Os *os, Proc *p)
 {
     if (p->io) {

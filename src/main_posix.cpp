@@ -1124,6 +1124,12 @@ static Str os_lasterr(Os *, Arena *a)
 // the lifeline reads EOF and each reaper ends its tree, TERM and then
 // KILL 2 s later.
 //
+// os_letgo asks the reaper, with SIGUSR2, to end without killing
+// anything, once its tool's status is out: what the tool left running,
+// a daemon it started such as podman start's conmon, goes on as an
+// orphan of the system's, no longer one that the reaper would end with
+// the harness. A sweep asked for as well wins.
+//
 // A hard kill (os_kill) asks the reaper, with SIGUSR1, to sweep: it
 // kills every process it can find that came from the tool, round after
 // round until none is left, then its group with itself in it. That
@@ -1809,6 +1815,17 @@ static void os_kill(Os *, Proc *p, b32 hard)
     os_unlock(&p->lock);
 }
 
+// Under the lock, as os_kill, so that the pid is still the reaper's
+static void os_letgo(Os *, Proc *p)
+{
+    os_lock(&p->lock);
+    if (reapkill(p->pid, p->reaped, 1) != REAPKILL_NONE) {
+        sendsignal(p->pid, SIGUSR2, 0);
+        sendsignal(p->pid, SIGCONT, 0);  // should something have stopped it
+    }
+    os_unlock(&p->lock);
+}
+
 static void os_procfree(Os *os, Proc *p)
 {
     if (p->io) {
@@ -1817,10 +1834,12 @@ static void os_procfree(Os *os, Proc *p)
     procrelease(p);
 }
 
-// Reaper only: the self-pipe's write end, for SIGCHLD and SIGUSR1, and
-// whether a sweep was asked for. The reaper is single-threaded.
+// Reaper only: the self-pipe's write end, for SIGCHLD, SIGUSR1 and
+// SIGUSR2, whether a sweep was asked for, and whether to end without
+// one (os_letgo). The reaper is single-threaded.
 static i32          reapchld = -1;
 static volatile i32 reapasked;
+static volatile i32 reapletgo;
 
 static void onchld(int)
 {
@@ -1833,6 +1852,12 @@ static void onchld(int)
 static void onsweep(int sig)
 {
     reapasked = 1;
+    onchld(sig);
+}
+
+static void onletgo(int sig)
+{
+    reapletgo = 1;
     onchld(sig);
 }
 
@@ -2357,6 +2382,8 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
     sa.sa_handler = onsweep;
     sa.sa_flags   = 0;
     sigaction(SIGUSR1, &sa, 0);  // before there is anything to sweep
+    sa.sa_handler = onletgo;
+    sigaction(SIGUSR2, &sa, 0);
 
     if (chdir(argv[2])) {
         reapsay("cannot change directory to", argv[2]);
@@ -2443,6 +2470,9 @@ static iz   reapsignal(Reaper *, i32) { return 0; }
         }
         if (reapasked) {
             reapsweep(&r);
+        }
+        if (reapletgo && r.reported) {
+            _exit(0);  // its orphans go to the system's reaper
         }
         if (n>0 && fds[0].revents) {
             u8 b;

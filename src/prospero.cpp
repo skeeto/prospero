@@ -234,8 +234,15 @@ static Proc   *os_spawn(Os *, Spawn *, Arena scratch);
 // left the group (the reaper's sweep), or terminates the job. Prompt:
 // neither waits for the processes.
 static void    os_kill(Os *, Proc *, b32 hard);
-// Drop the caller's reference. Kills nothing by itself on POSIX, but on
-// Windows closing the last reference closes the job, killing the tree.
+// Let a child that exited go, and what it left running with it, as a
+// shell would (podman start's conmon, which holds its container up): on
+// POSIX its reaper ends without a sweep, and the orphans pass to the
+// system. Nothing on Windows, where the job closes with os_procfree as
+// before. Prompt: it does not wait for the reaper.
+static void    os_letgo(Os *, Proc *);
+// Drop the caller's reference. Kills nothing by itself on POSIX, where
+// the reaper lives on until os_kill or os_letgo, but on Windows closing
+// the last reference closes the job, killing the tree.
 static void    os_procfree(Os *, Proc *);
 
 // (M2) HTTP requests, each on its own thread, posting records to mbox:

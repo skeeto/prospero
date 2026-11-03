@@ -276,6 +276,45 @@ static void testholder(ProcTest *p, Arena scratch)
     report(os, scratch, "background child: returned after", millis(dt), 0, " ms");
 }
 
+// POSIX: a tool's reaper outlives it until let go, then ends, and what
+// the tool left running goes on (deployrun's conmon). Nothing is
+// signaled here; the sleep left behind ends by itself.
+static void testletgo(ProcTest *p, Arena scratch)
+{
+    Selftest *t  = p->t;
+    Os       *os = p->os;
+    if (HOST_WINDOWS) {
+        return;  // the job closes with os_procfree
+    }
+    Str   out = join(&scratch, p->dir, "letgo.log");
+    Proc *pr  = spawnsh(p, scratch, "sleep 10 </dev/null >/dev/null 2>&1 & echo $! $PPID",
+                        out, 1<<10);
+    if (!check(t, pr!=0, "os_spawn leaving a child running")) return;
+    ProcWatch w = {};
+    check(t, procwatch(os, p->mb, p->id, &w, 5000), "the shell exits, its output closed");
+    Cut line   = cut(os_read(os, &scratch, out, 1<<10).data, '\n');
+    Cut pids   = cut(line.head, ' ');
+    Int child  = parseint(pids.head);
+    Int reaper = parseint(pids.tail);
+    if (!check(t, line.ok && child.ok && reaper.ok && child.val>1 && reaper.val>1,
+               "the shell tells its child's pid and its reaper's")) {
+        os_kill(os, pr, 1);
+        os_procfree(os, pr);
+        return;
+    }
+    check(t, os_pidalive(os, (i32)reaper.val), "the reaper outlives its tool");
+    os_letgo(os, pr);
+    b32 gone = 0;
+    for (i64 deadline = os_ticks(os)+2000000; !gone && os_ticks(os)<deadline;) {
+        gone = !os_pidalive(os, (i32)reaper.val);
+        mailwait(p->mb, 10);
+        mailtake(p->mb);  // else the wait returns at once
+    }
+    check(t, gone, "os_letgo ends the reaper");
+    check(t, os_pidalive(os, (i32)child.val), "what the tool left runs on");
+    os_procfree(os, pr);
+}
+
 static void testladder(ProcTest *p, Arena scratch)
 {
     Selftest *t  = p->t;
@@ -769,6 +808,7 @@ static void testprocs(Selftest *t, Arena *perm, Arena scratch, Str dir)
     testspawn(p, scratch);
     testbulk(p, scratch);
     testholder(p, scratch);
+    testletgo(p, scratch);
     testlaunch(p, scratch);
     testladder(p, scratch);
     testoverhead(p, scratch);
