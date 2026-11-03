@@ -21,6 +21,13 @@ files, in order:
 
 A No folder session gets only your own file, none of a project's.
 
+A running session is told when an instruction file changes, and of
+the files for a directory below as it starts working there. A
+compaction's summary may leave that out, so after one the agent is
+given again, whole, each file that changed since the session started
+and each loaded later, along with its memory index and the skills
+where they changed.
+
 The session bar's Info button (the circled i) lists the instruction
 files the agent was given, and its copy icon, Copy what the agent was
 given, copies their text.
@@ -41,7 +48,8 @@ forgets a memory that proves wrong, or when you ask. It writes them
 with its memory tool, which never asks. A new session in the project
 is given the index, and reads a memory's file when its line bears on
 the task. A running session is told when another session, or you,
-changes the index.
+changes the index, and after a compaction is given it again, whole,
+if it changed since the session started.
 
 To have the agent remember something for every project on this
 machine, ask it to remember it "on this machine": it adds it to your

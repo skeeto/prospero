@@ -4309,6 +4309,27 @@ def sc_compact_manual(model, n, req):
 sc_compact_cancel = sc_compact_manual
 
 
+def sc_compact_heed(model, n, req):
+    # "read them": saves a memory, reads sub/x.txt (which loads its
+    # AGENTS.md) and eight big files, then answers; any other prompt is
+    # answered at once. Notices are user messages too, so the step is
+    # counted from the prompt.
+    msgs = req.get("messages", [])
+    at = max((i for i, m in enumerate(msgs) if m.get("role") == "user" and
+              m.get("content") in ("read them", "again", "after", "later")), default=-1)
+    k = sum(m.get("role") == "tool" for m in msgs[at+1:])
+    if at < 0 or msgs[at]["content"] != "read them":
+        yield from real_answer(model, req, "Done.")
+    elif k == 0:
+        yield from real_tool(model, req, n, *memsave("style", "Tabs, not spaces", "feedback"))
+    elif k == 1:
+        yield from real_tool(model, req, n, "read", {"path": "sub/x.txt"})
+    elif k < 10:
+        yield from real_tool(model, req, n, "read", {"path": f"f{k-2}.txt"})
+    else:
+        yield from real_answer(model, req, "All files read.")
+
+
 def sc_compact_cancel_compact(model, n, req):
     # A summarizer slow enough to cancel, then one quick, but not so
     # quick that it ends before the prompt sent after it is queued

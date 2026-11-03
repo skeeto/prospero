@@ -6932,6 +6932,80 @@ def compact_manual(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf=BIG, bound=60, alone=True)
+def compact_heed(t):
+    """A summary may leave out the notices since the system prompt, so
+    the agent is told again what differs from it: a changed instruction
+    file, one loaded for a subdirectory, and its memory, saved by itself.
+    Against the prompt, so a session opened again and summarized again
+    is told again; the prompt stays as it was."""
+    t.host.mkdir(t.host.join(t.work, ".git"))
+    t.put("AGENTS.md", "Rule one.\n")
+    t.host.mkdir(t.host.join(t.work, "sub"))
+    t.put("sub/AGENTS.md", "Sub rule.\n")
+    t.put("sub/x.txt", "x\n")
+    bigfiles(t, 8, 256)
+    line = f"- [style](style.md) {DASH} Tabs, not spaces"
+
+    def told(msgs):
+        """The notices after the summary's checkpoint, by their opening."""
+        return [str(m.get("content")) for m in msgs[2:] if m.get("role") == "user" and
+                str(m.get("content")).startswith("Your conversation was summarized")]
+
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake")["sid"]
+        h.send("prompt", sid=sid, text="read them")
+        t.check(ended(h, sid, 1)["why"] == "done", "the reads")
+        t.put("AGENTS.md", "Rule two, longer.\n")
+        t.host.touch(t.host.join(t.work, "AGENTS.md"), time.time() + 10)
+        h.send("prompt", sid=sid, text="again")
+        ended(h, sid, 2)
+        t.check(h.call("compact", sid=sid).get("ok") == 1, "compact")
+        ended(h, sid, 3)
+        h.send("prompt", sid=sid, text="after")
+        ended(h, sid, 4)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    reqs = [chat(x) for x in t.requests()]
+    system = reqs[0][0]["content"]
+    t.check(all(m[0]["content"] == system for m in reqs), "the system prompt stays")
+    t.check("Rule one." in system and "Sub rule." not in system and
+            system.endswith("MEMORY.md:\n\n(empty: no memories yet)"), "the prompt as it began")
+    last = reqs[-1]
+    t.check(checkpointed(last), "summarized")
+    notes = told(last)
+    t.check(len(notes) == 2, f"two notices: {notes}")
+    ins = [x for x in notes if "instructions you were given" in x]
+    t.check(ins and "AGENTS.md (new version)\n\nRule two, longer." in ins[0] and
+            "sub/AGENTS.md (for the files under sub)\n\nSub rule." in ins[0].replace("\\", "/")
+            and "Rule one." not in ins[0], f"the instructions: {ins}")
+    mem = [x for x in notes if "MEMORY.md now reads" in x]
+    t.check(mem and mem[0].endswith("MEMORY.md now reads:\n\n" + line), f"the memory: {mem}")
+
+    # Opened again: told nothing more until summarized again, then the same
+    h = t.headless()
+    try:
+        t.check(h.call("open", sid=sid).get("ok") == 1, "reopened")
+        h.send("prompt", sid=sid, text="read them")
+        ended(h, sid, 5)
+        n = len(t.requests())
+        t.check(len(told(chat(t.requests()[-1]))) == 2, "nothing new before")
+        t.check(h.call("compact", sid=sid).get("ok") == 1, "compact again")
+        ended(h, sid, 6)
+        h.send("prompt", sid=sid, text="later")
+        ended(h, sid, 7)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+    again = told(chat(t.requests()[-1]))
+    t.check(len(t.requests()) > n and len(again) == 2 and
+            sorted(x.split(".")[0] for x in again) == sorted(x.split(".")[0] for x in notes),
+            f"told again: {again}")
+    t.check([x for x in again if "MEMORY.md now reads" in x][0].endswith(line), "the same memory")
+
+
 @scenario(conf=BIG, bound=25, alone=True)
 def compact_cancel(t):
     """A compaction cancelled ends its turn with nothing compacted; one

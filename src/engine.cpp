@@ -366,6 +366,12 @@ struct InstrStamp {
     Str path;
     i64 size;
     i64 mtime;
+    // As the system prompt has it (psize, pmtime), or loaded after it,
+    // for the files under a directory (under): what a summary may lose
+    b32 prompt;
+    i64 psize;
+    i64 pmtime;
+    Str under;
 };
 
 // A task call and its subagent, while the calls of its response run.
@@ -800,10 +806,12 @@ struct Session {
     // Project memory (memory.cpp)
     Str          memdir;     // its directory, null if the session has none
     Str          memseen;    // MEMORY.md as the agent knows it
+    Str          memsys;     // and as its system prompt has it
     b32          memlog;     // the start record is still to log
     // Skills (skills.cpp)
     b32          skillson;   // its prefix lists skills: tell it of changes
     Slice<Skill> skillseen;  // what the agent knows of: name, description
+    Slice<Skill> skillsys;   // and what its system prompt lists
     Slice<Str>   skillwarned;  // skills left out, warned of already
     // Roles and subagents
     Str          role;       // the role's name, empty if none
@@ -3587,13 +3595,19 @@ static Slice<Str> instrlist(Session *s, Arena *a)
     return instrnames(a, cfgget(s->e->cfg, "instructions", "", "files", 0));
 }
 
-static void instrstamp(Session *s, Slice<InstrFile> files)
+// Stamp files just loaded: into the system prompt, or later for the
+// files under a directory (under).
+static void instrstamp(Session *s, Slice<InstrFile> files, Str under)
 {
     for (iz i = 0; i < files.len; i++) {
         InstrStamp k = {};
-        k.path  = clone(&s->perm, files[i].path);
-        k.size  = files[i].size;
-        k.mtime = files[i].mtime;
+        k.path   = clone(&s->perm, files[i].path);
+        k.size   = files[i].size;
+        k.mtime  = files[i].mtime;
+        k.prompt = !under.data;
+        k.psize  = k.size;
+        k.pmtime = k.mtime;
+        k.under  = under.data ? clone(&s->perm, under) : Str{};
         s->instrfiles = push(&s->perm, s->instrfiles, k);
     }
 }
@@ -3658,7 +3672,7 @@ static void instrlazy(Session *s, Arena scratch, Str path)
     print(&b, in.text);
     Str text = finish(&b);
     loginstr(s, scratch, in.files, in.skipped, "nested", {});
-    instrstamp(s, in.files);
+    instrstamp(s, in.files, dir);
     notify(s, "instructions", text, 0);
 }
 
@@ -8494,6 +8508,92 @@ static void skillcheck(Session *s, Arena scratch)
     s->notices[s->notices.len-1].skills = 1;
 }
 
+// After a summary, which may leave out the notices that told the agent
+// of instruction files, memories and skills since its system prompt:
+// all that now differs from the prompt, told again whole, for its next
+// request. Always against the prompt, so that a later summary, which
+// may leave out these too, tells it again.
+static void compactheed(Session *s, Arena scratch)
+{
+    Os *os = s->e->os;
+
+    Buf b(&scratch, 1024);
+    for (iz i = 0; i < s->instrfiles.len; i++) {
+        InstrStamp *k = &s->instrfiles[i];
+        b32 same = k->prompt && k->size==k->psize && k->mtime==k->pmtime;
+        if (same || (!k->prompt && k->mtime<0)) {
+            continue;  // in the prompt, or never there and now gone
+        }
+        print(&b, "\n\n## ");
+        print(&b, k->path);
+        Read rd = k->mtime<0 ? Read{} : os_readat(os, &scratch, k->path, 0, (iz)INSTR_MAX);
+        if (k->mtime<0 || rd.err) {
+            print(&b, "\n\nThis file is gone: its instructions no longer apply.");
+            continue;
+        }
+        if (k->prompt) {
+            print(&b, " (new version)");
+        } else {
+            print(&b, " (for the files under ");
+            print(&b, showpath(s->guard.cwd, k->under));
+            print(&b, ")");
+        }
+        print(&b, "\n\n");
+        print(&b, trimright(rd.data));
+    }
+    if (b.len) {
+        Str body = finish(&b);
+        Buf t(&scratch, 256 + body.len);
+        print(&t, "Your conversation was summarized, which may have left out "
+                  "instructions you were given since your system prompt. "
+                  "Follow them as they are now:");
+        print(&t, body);
+        notify(s, "instructions", finish(&t), 0);
+    }
+
+    if (s->memdir.len && !(s->memseen == s->memsys)) {
+        MemCut c = memcut(s->memseen);
+        Buf    t(&scratch, 512 + c.text.len);
+        print(&t, "Your conversation was summarized, which may have left out "
+                  "memories saved or forgotten since your system prompt. "
+                  "MEMORY.md now reads:\n\n");
+        print(&t, c.text.len ? c.text : Str("(empty: no memories)"));
+        if (c.cut) {
+            print(&t, "\n\n[Only its first 200 lines and 25 KB are shown "
+                      "here. Read it for the rest.]");
+        }
+        notify(s, "memory", finish(&t), 0);
+    }
+
+    b32 changed = s->skillsys.len != s->skillseen.len;
+    for (iz i = 0; !changed && i < s->skillseen.len; i++) {
+        Skill *was = skillbyname(s->skillsys, s->skillseen[i].name);
+        changed = !was || !(was->desc == s->skillseen[i].desc);
+    }
+    if (s->skillson && changed) {
+        Buf t(&scratch, 1024);
+        print(&t, "Your conversation was summarized, which may have left out "
+                  "changes to the skills since your system prompt listed "
+                  "them. Use the skill tool with the name of a skill when a "
+                  "task matches it. The skills now:");
+        for (iz i = 0; i < s->skillseen.len; i++) {
+            print(&t, "\n- ");
+            print(&t, s->skillseen[i].name);
+            print(&t, ": ");
+            print(&t, s->skillseen[i].desc);
+        }
+        for (iz i = 0; i < s->skillsys.len; i++) {
+            if (!skillbyname(s->skillseen, s->skillsys[i].name)) {
+                print(&t, "\n- ");
+                print(&t, s->skillsys[i].name);
+                print(&t, " (removed)");
+            }
+        }
+        notify(s, "skills", finish(&t), 0);
+        s->notices[s->notices.len-1].skills = 1;
+    }
+}
+
 // The agent may read a skill's other files without asking: its
 // directory is granted for reads to the session's tree, as an "always"
 // of the user's is, unless the guard allows it already.
@@ -12252,6 +12352,7 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     s->shellheard = s->shellpre;  // and a shell other than the tool's
     shellheed(s, scratch);
     wtheed(s, scratch);  // and a side chat in a worktree, where it works
+    compactheed(s, scratch);  // and what it was told of its instructions
     if (modeof(s)!=MODE_BUILD && cp.why!=CW_MANUAL) {
         deliver(s, scratch);
     }
@@ -13467,7 +13568,7 @@ static void instrstart(Session *s, Arena scratch)
     Instructions in     = instructions(e->os, &scratch, cwd, global, names,
                                        e->home, s->te.windows);
     s->instr = in.text.data ? clone(&s->perm, in.text) : Str{(u8 *)"", 0};
-    instrstamp(s, in.files);
+    instrstamp(s, in.files, {});
     webnote(s, scratch, s->instr, 0);
 
     Instructions *p = &s->instrpend;
@@ -13601,6 +13702,7 @@ static void buildprefix(Session *s, Arena scratch)
         Arena  a  = scratch;
         Skills sk = sessskills(s, &a);
         skillsee(s, sk.list);
+        s->skillsys = s->skillseen;
         Buf t(&a, 1024);
         for (iz i = 0; i < s->skillseen.len; i++) {
             print(&t, "\n- ");
@@ -13630,6 +13732,7 @@ static void buildprefix(Session *s, Arena scratch)
     if (mem.len) {
         s->system = concat(&s->perm, s->system, mem);
     }
+    s->memsys = s->memseen;
 }
 
 // The prefix's durable record, so that the session opened again, or
@@ -16162,12 +16265,22 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
                 at = s->instrfiles[i].path==path ? &s->instrfiles[i] : at;
             }
             if (!at) {
-                InstrStamp n = {clone(&s->perm, path), 0, 0};
+                InstrStamp n = {};
+                n.path = clone(&s->perm, path);
+                if (why == "nested") {
+                    Str first = jsonstr(jsonget(jsonget(j, "files")->child, "path"));
+                    n.under = normpath(&s->perm, first, "..", s->te.windows);
+                }
                 s->instrfiles = push(&s->perm, s->instrfiles, n);
                 at = &s->instrfiles[s->instrfiles.len-1];
             }
             at->size  = jsonint(jsonget(k, "bytes"), 0);
             at->mtime = jsonint(jsonget(k, "mtime"), 0);
+            if (why == "start") {
+                at->prompt = 1;
+                at->psize  = at->size;
+                at->pmtime = at->mtime;
+            }
         }
     } break;
 
@@ -16176,6 +16289,9 @@ static void replaytools(Session *s, Arena scratch, EvRec *r)
         if (dir.len) {
             s->memdir   = clone(&s->perm, dir);
             s->memseen  = clone(&s->perm, jsonstr(jsonget(j, "text")));
+            if (jsonstr(jsonget(j, "why")) == "start") {
+                s->memsys = s->memseen;  // as the prompt was built
+            }
             s->te.deny &= ~(u32)TOOL_MEMMASK;
         }
     } break;
@@ -16473,6 +16589,7 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             s->system.data   = s->system.data ? s->system.data : (u8 *)"";
             s->skillson      = jsonget(j, "skills")->type == JSON_ARRAY;
             skillseenfrom(s, jsonget(j, "skills"));
+            s->skillsys      = s->skillseen;
             s->mcpfixed      = jsonflag(jsonget(j, "mcp_fixed"), 0);
             s->mcpfilter     = jsonget(j, "mcp_filter")->type==JSON_STRING
                                ? clone(&s->perm, jsonstr(jsonget(j, "mcp_filter"))) : Str{};
