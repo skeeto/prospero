@@ -586,10 +586,19 @@ static void settools(Gui *g, i32 mode)
 }
 
 // A session's own toggles, which the session bar, their shortcuts and the
-// View menu work: every tool row open, or all reasoning shown, whatever
+// View menu work: every shell row folded, every tool row open, or all
+// reasoning shown, whatever
 // the settings say, until turned off again, when the settings fold them
 // as before but for rows the user opened or closed. The configuration is
 // left alone. A null session is the one shown.
+static void setsessionshell(Gui *g, GuiSession *s, b32 on)
+{
+    s = s ? s : g->sess;
+    if (s && s->view && viewfoldshell(s->view, on)) {
+        scheddirty(&g->sched);
+    }
+}
+
 static void setsessiontools(Gui *g, GuiSession *s, b32 on)
 {
     s = s ? s : g->sess;
@@ -608,6 +617,11 @@ static void setsessionthink(Gui *g, GuiSession *s, b32 on)
 }
 
 // Whether the toggles are on, for a menu's check marks.
+static b32 sessionshell(Gui *g)
+{
+    return g->sess && g->sess->view && g->sess->view->foldshell;
+}
+
 static b32 sessiontools(Gui *g)
 {
     return g->sess && g->sess->view && g->sess->view->showtools;
@@ -2776,6 +2790,7 @@ static char const *shortcutname(Gui *g, i32 which)
     switch (which) {
     case 0: return g->mac ? "Cmd+Shift+T" : "Ctrl+Shift+T";
     case 1: return g->mac ? "Cmd+Shift+R" : "Ctrl+Shift+R";
+    case 2: return g->mac ? "Cmd+Shift+S" : "Ctrl+Shift+S";
     }
     return g->mac ? "Cmd+F" : "Ctrl+F";
 }
@@ -3140,9 +3155,10 @@ static void drawsessbar(Gui *g)
     ImGuiStyle &st    = ImGui::GetStyle();
     f32         gap   = st.ItemSpacing.x;
     f32         gw    = gaugewidth(g, v);
+    char const *sl    = ICON_SHELL;      // Shell output
     char const *tl    = ICON_TOOLS;      // Tool output
     char const *rl    = ICON_LIGHTBULB;  // Reasoning
-    f32         rest  = (gw>0 ? gw + gap : 0) + 5*iconw() + 4*gap;
+    f32         rest  = (gw>0 ? gw + gap : 0) + 6*iconw() + 5*gap;
     f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rest;
     if (sessparent(s).len || sessside(s).len) {
         // Up to its parent, or a side chat's original, then what it is:
@@ -3260,6 +3276,13 @@ static void drawsessbar(Gui *g)
         whytip(wwhy.len ? wwhy : concat(&a, "Open working folder: ", cwd));
         ImGui::SameLine();
     }
+    if (iconbutton(sl, v->foldshell)) {
+        setsessionshell(g, s, !v->foldshell);
+    }
+    itemrect(g, RECT_SHELLBTN);
+    itemtip("Shell output: fold every shell command's output in this session, "
+                          "or show it again as the settings say (%s)", shortcutname(g, 2));
+    ImGui::SameLine();
     if (iconbutton(tl, v->showtools)) {
         setsessiontools(g, s, !v->showtools);
     }
@@ -11774,6 +11797,9 @@ static void menukeys(Gui *g)
         goup(g, g->sess);
     }
     #endif
+    if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_S, glob)) {
+        setsessionshell(g, 0, !sessionshell(g));
+    }
     if (ImGui::Shortcut(ctrl|ImGuiMod_Shift|ImGuiKey_T, glob)) {
         setsessiontools(g, 0, !sessiontools(g));
     }
@@ -12425,6 +12451,9 @@ static void drawmenubar(Gui *g)
         // Folding for the session shown, its toggles as the session
         // bar has them
         b32 has = g->sess && g->sess->view;
+        if (ImGui::MenuItem("Fold shell output", shortcutname(g, 2), sessionshell(g), has)) {
+            setsessionshell(g, 0, !sessionshell(g));
+        }
         if (ImGui::MenuItem("Expand tool output", shortcutname(g, 0), sessiontools(g), has)) {
             setsessiontools(g, 0, !sessiontools(g));
         }

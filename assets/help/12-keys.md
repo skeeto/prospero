@@ -16,6 +16,9 @@ except Ctrl+G in the prompt box, which is Ctrl there too.
 - **Alt+Up**: from a subagent or side chat, up to the session it
   came from (the up arrow above its transcript). On macOS, Option+Up,
   or Cmd+Up as in Finder.
+- **Ctrl+Shift+S**: fold, or show again, all of the session's shell
+  output (the Shell output button above the transcript, the Bash
+  logo), short output too, leaving its other tool rows as they were.
 - **Ctrl+Shift+T**: open, or fold again, all of the session's tool
   output (the Tool output button above the transcript, a wrench and
   screwdriver).

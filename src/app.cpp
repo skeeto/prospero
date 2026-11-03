@@ -239,7 +239,8 @@ enum : i32 {
     RECT_REFRESHINC, // the settings window's Refresh includes
     RECT_CODEBLOCK,  // the code block aimed at (selectcode), else the latest
     RECT_CODECOPY,   // and its Copy button, while shown
-    RECT_TOOLSBTN,   // the session bar's toggles
+    RECT_SHELLBTN,   // the session bar's toggles
+    RECT_TOOLSBTN,
     RECT_THINKBTN,
     RECT_FINDFIELD,  // the find bar's field
     RECT_GAUGE,      // the context gauge
@@ -12129,7 +12130,8 @@ enum : i32 {
     T_RAIL,        // the latest fold rail drawn
     T_CODEBLOCK,   // the code block selectcode chose, as drawn
     T_CODECOPY,    // and its Copy button
-    T_TOOLSBTN,    // the session bar's toggles
+    T_SHELLBTN,    // the session bar's toggles
+    T_TOOLSBTN,
     T_THINKBTN,
     T_GAUGE,       // the context gauge
     T_PAGECOMBO,   // the settings' pages as a combo, when narrow
@@ -12299,6 +12301,7 @@ enum : i32 {
     CHK_TOOLSOPEN,
     CHK_TOOLSFOLD,
     CHK_TOOLSAUTO,
+    CHK_FOLDSHELL,
     CHK_SHOWTOOLS,
     CHK_SHOWTHINK,
     CHK_THINKBACK,
@@ -12597,6 +12600,7 @@ static Str chknames[] = {
     "tools = open: every tool row open but those the user chose",
     "tools = fold: every tool row folded but those the user chose",
     "tools = auto: tool rows folded by kind and outcome again",
+    "the session's shell toggle folded every shell row, the rest as auto",
     "the session's toggle opened every tool row, the setting unchanged",
     "the session's toggle opened all reasoning",
     "toggled off, reasoning folded again but for what the user opened",
@@ -13551,7 +13555,19 @@ static DriveOp m3ops[] = {
     {OP_TOOLS, 0, TOOLS_AUTO, 0, 300, ""},
     {OP_CHECK, CHK_TOOLSAUTO, 0, 0, 0, ""},
     // The session's toggles, from the session bar, then off by their
-    // shortcuts, Cmd+Shift+T and R (Ctrl elsewhere)
+    // shortcuts, Cmd+Shift+S, T and R (Ctrl elsewhere). Shell's first,
+    // alone, then the others
+    {OP_MOVE, T_SHELLBTN, 0, 0, 100, ""},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 400, ""},
+    {OP_CHECK, CHK_FOLDSHELL, 0, 0, 0, ""},
+    {OP_KEYDOWN, 0, GKEY_CMD, KEY_CMD, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_SHIFT, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYDOWN, 0, GKEY_S, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_S, KEY_CMD|KEY_SHIFT, 50, ""},
+    {OP_KEYUP, 0, GKEY_SHIFT, KEY_CMD, 50, ""},
+    {OP_KEYUP, 0, GKEY_CMD, 0, 300, ""},
+    {OP_CHECK, CHK_TOOLSAUTO, 0, 0, 0, ""},
     {OP_MOVE, T_TOOLSBTN, 0, 0, 100, ""},
     {OP_DOWN, 0, 0, 0, 60, ""},
     {OP_UP, 0, 0, 0, 400, ""},
@@ -17146,6 +17162,7 @@ static ImVec2 targetpos(Gui *g, i32 t)
     case T_SIDELINK:      return rectcenter(g->rects[RECT_SIDELINK]);
     case T_CODEBLOCK:     return rectcenter(g->rects[RECT_CODEBLOCK]);
     case T_CODECOPY:      return rectcenter(g->rects[RECT_CODECOPY]);
+    case T_SHELLBTN:      return rectcenter(g->rects[RECT_SHELLBTN]);
     case T_TOOLSBTN:      return rectcenter(g->rects[RECT_TOOLSBTN]);
     case T_THINKBTN:      return rectcenter(g->rects[RECT_THINKBTN]);
     case T_GAUGE:         return rectcenter(g->rects[RECT_GAUGE]);
@@ -17678,6 +17695,26 @@ static b32 toolsas(View *v, i32 want)
         }
     }
     return rows > 0;
+}
+
+// Whether every shell row the user did not choose is folded, and every
+// other tool row as tools = auto says, with at least one shell row that
+// auto would have open.
+static b32 shellas(View *v)
+{
+    i32 opened = 0;
+    for (iz i = 0; i < v->msgs.len; i++) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role!=VIEW_TOOL || m->chosen || m->prov) {
+            continue;
+        }
+        b32 shell = m->tool->name == "shell";
+        opened += shell && !toolauto(m);
+        if (m->collapsed != (shell ? 1 : toolauto(m))) {
+            return 0;
+        }
+    }
+    return opened > 0;
 }
 
 // Whether every reasoning the user did not choose is folded (want 1) or
@@ -18510,7 +18547,10 @@ static b32 drivecheck(Gui *g, i32 chk)
     }
     case CHK_TOOLSOPEN:  return g->toolset==TOOLS_OPEN && toolsas(v, 0);
     case CHK_TOOLSFOLD:  return g->toolset==TOOLS_FOLD && toolsas(v, 1);
-    case CHK_TOOLSAUTO:  return g->toolset==TOOLS_AUTO && !v->showtools && toolsas(v, -1);
+    case CHK_TOOLSAUTO:  return g->toolset==TOOLS_AUTO && !v->showtools && !v->foldshell &&
+                                toolsas(v, -1);
+    case CHK_FOLDSHELL:  return g->toolset==TOOLS_AUTO && v->foldshell && !v->showtools &&
+                                shellas(v);
     case CHK_SHOWTOOLS:  return g->toolset==TOOLS_AUTO && v->showtools && toolsas(v, 0);
     case CHK_SHOWTHINK:  return g->thinkset==THINK_FOLD && v->showthink && thinkas(v, 0);
     case CHK_THINKBACK:  return !v->showthink && thinkas(v, 1);

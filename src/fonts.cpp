@@ -80,6 +80,7 @@ static Str fontemoji()   { return {(u8 *)emojittf, countof(emojittf)}; }
 #define ICON_PLUG       "\xee\xac\xad"  // U+EB2D
 #define ICON_REFRESH    "\xee\xac\xb7"  // U+EB37
 #define ICON_TOOLS      "\xee\xad\xad"  // U+EB6D
+#define ICON_SHELL      "\xee\xaf\x8a"  // U+EBCA, terminal-bash
 #define ICON_COPY       "\xee\xaf\x8c"  // U+EBCC
 #define ICON_SEND       "\xee\xb0\x8f"  // U+EC0F
 #define ICON_ATTACH     "\xee\xb0\xb4"  // U+EC34

@@ -49,8 +49,9 @@
 // folds a background job's start and a long shell output; fold and open
 // apply to every row. A row the user opened or closed keeps that, through
 // its end too. A session's own toggles (viewshowtools, viewshowthink)
-// open every row of their kind, hidden reasoning included, until turned
-// off, leaving the configuration alone.
+// open every row of their kind, hidden reasoning included, and another
+// (viewfoldshell) folds every shell row, over the tools toggle too,
+// each until turned off, leaving the configuration alone.
 //
 // A search (ViewSearch) finds text in the messages' sources, ignoring
 // ASCII case, folded rows included but not hidden reasoning. It keeps up
@@ -533,8 +534,10 @@ struct View {
     b32             overflow;   // fake agent: events were dropped
     i32             thinking;   // THINK_*: how reasoning shows
     i32             toolmode;   // TOOLS_*: how tool rows fold
-    b32             showtools;  // the session's toggles: every tool row
-    b32             showthink;  //   or reasoning open, whatever the mode
+    b32             foldshell;  // the session's toggles: every shell row
+                                //   folded, every tool row or reasoning
+    b32             showtools;  //   open, whatever the mode
+    b32             showthink;
     f32             lastw;      // the width laid out last
     f32             head;       // a message's header line, as drawn
 
@@ -768,6 +771,8 @@ static b32 toolfolded(View *v, ViewMsg *m)
     } else if (t->status == VTOOL_STREAMING) {
         return 1;
     } else if (t->name=="skill" && !(t->ended && t->status!=VTOOL_OK)) {
+        return 1;
+    } else if (v->foldshell && t->name=="shell") {
         return 1;
     } else if (v->showtools) {
         return 0;
@@ -1116,6 +1121,18 @@ static b32 viewshowtools(View *v, b32 on)
         return 0;
     }
     v->showtools = on;
+    retool(v);
+    return 1;
+}
+
+// The session's toggle: every shell row folded, or else as the setting
+// and the tools toggle say. Returns whether anything changed.
+static b32 viewfoldshell(View *v, b32 on)
+{
+    if (v->foldshell == on) {
+        return 0;
+    }
+    v->foldshell = on;
     retool(v);
     return 1;
 }
