@@ -197,6 +197,16 @@ static ImFont *stylefont(Fonts *f, i32 style)
     return font;
 }
 
+// The small text of headers and rows, 0.85 of the font size, rounded to
+// whole pixels on the display. FreeType hints a fractional size badly:
+// at 12.75 px (15 at 1x), a glyph's bottom row went missing.
+static f32 smallsize(Fonts *f)
+{
+    f32 density = ImGui::GetIO().DisplayFramebufferScale.x;
+    density = density>0 ? density : 1;
+    return roundf(f->size*0.85f*density) / density;
+}
+
 // Baked fonts per style, looked up once per frame: switching sizes
 // otherwise costs a hash lookup per character. Slots are only valid in
 // the frame that filled them, since ImGui may discard unused bakes.
@@ -2067,7 +2077,7 @@ static f32 questionform(Gui *g, GuiSession *s, ViewMsg *m, f32 width, b32 draw,
     Arena       a      = g->frame;
     f32         sc     = g->scale;
     f32         size   = g->fonts.size;
-    f32         small  = size*0.85f;
+    f32         small  = smallsize(&g->fonts);
     ImFont     *bold   = stylefont(&g->fonts, STYLE_BOLD);
     ImFont     *prose  = stylefont(&g->fonts, 0);
     f32         frame  = ImGui::GetFrameHeight();
@@ -4711,7 +4721,7 @@ static void drawtranscript(Gui *g)
         sp->SetCurrentChannel(dl, CH_TEXT);
         MsgAction act = msgaction(g, g->sess, v, m);
         f32       actw = act.kind ? actwidth(&act) + 8*sc : 0;
-        Pen p = {dl, &g->fonts, x, y + pad/4, x + width - actw, g->fonts.size*0.85f};
+        Pen p = {dl, &g->fonts, x, y + pad/4, x + width - actw, smallsize(&g->fonts)};
         drawheader(g, &p, v, m, nowms);
         if ((m->role==VIEW_USER || m->role==VIEW_ASSISTANT) && m->ts &&
                 ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(box0, box1)) {
@@ -7149,7 +7159,7 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     f32         sc    = g->scale;
     ImDrawList *dl    = ImGui::GetWindowDrawList();
     f32         lineh = ImGui::GetTextLineHeight();
-    f32         small = g->fonts.size * 0.85f;
+    f32         small = smallsize(&g->fonts);
     View       *v     = s->view;
     i32         state = v ? v->state : s->state;
 
