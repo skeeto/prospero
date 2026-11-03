@@ -1949,7 +1949,8 @@ sc_bypass_plan = sc_plan
 # ask_user: "Ask me." asks three questions, a single-select one whose
 # recommended option is marked as Claude Code marks it, a multi-select
 # one marked by the field, and one with no recommendation; "Ask badly."
-# asks with one option. The agent then says the result back, whole.
+# asks with one option; "Sleep, then ask." runs a command and asks in
+# the same step. The agent then says the result back, whole.
 
 QUESTIONS = [
     {"question": "Which database?", "header": "Database",
@@ -1976,7 +1977,10 @@ def sc_question(model, n, req):
         since.append(str(m.get("content", "")))
     last = "Ask me." if "Ask me." in since else last
     last = "Plan first." if "Plan first." in since else last
-    if msgs and msgs[-1].get("role") == "tool" and name == "ask_user":
+    if last == "Sleep, then ask.":
+        yield from calls(model, n, [("shell", {"command": "sleep 1"}),
+                                    ("ask_user", {"questions": QUESTIONS[:1]})])
+    elif msgs and msgs[-1].get("role") == "tool" and name == "ask_user":
         yield from answer(model, last, pieces=1)
     elif msgs and msgs[-1].get("role") == "tool":
         yield from answer(model, "Done.")
@@ -1997,6 +2001,7 @@ def sc_question(model, n, req):
 
 sc_question_answer = sc_question_default = sc_question_skip = sc_question
 sc_question_invalid = sc_question_args = sc_question_steer = sc_question
+sc_question_steer_first = sc_question
 sc_question_cancel = sc_question_close = sc_question_bypass = sc_question
 sc_question_switch = sc_question_switch_b = sc_question_offered = sc_question
 sc_question_reopen = sc_question_fork = sc_question_gui = sc_question

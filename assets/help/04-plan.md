@@ -58,8 +58,10 @@ agent recommends marked **Recommended** and already picked:
 - **Skip** answers none: the agent goes with its recommendations, or
   with your note instead, if you wrote one.
 
-You may also answer in a message instead, from the prompt box. A
-notification tells of the questions while you look elsewhere (`[ui]
+A message you send from the prompt box while they wait does not skip
+them: it waits below the card, marked "Next step", and the agent reads
+it with your answers. To skip the questions in favor of a message,
+write it in the note and click **Skip**. A notification tells of the questions while you look elsewhere (`[ui]
 notify`). In Plan mode they wait for you with no countdown, as you
 mean to review a plan soon. Otherwise they are skipped after `[guard]
 question_timeout` (300 seconds), with the agent going with its

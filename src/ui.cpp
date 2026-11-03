@@ -5532,6 +5532,19 @@ static void drawattached(Gui *g, GuiSession *s)
     }
 }
 
+// Whether the agent's questions wait for answers: a steer then waits
+// behind them, rather than answering them as it does other asks.
+static b32 questionwaits(View *v)
+{
+    for (iz i = v->msgs.len-1; v->asks && i >= 0; i--) {
+        ViewMsg *m = &v->msgs[i];
+        if (m->role==VIEW_ASK && m->tool->answer==VASK_PENDING) {
+            return m->tool->kind == "question";
+        }
+    }
+    return 0;
+}
+
 static void drawprompt(Gui *g)
 {
     View       *v   = g->view;
@@ -5740,9 +5753,11 @@ static void drawprompt(Gui *g)
     ImGui::BeginDisabled(!can || editing);
     send |= ImGui::Button(v->busy ? ICON_REPLY "##send" : ICON_SEND "##send", v2(bw, 0));
     itemnamed(g, "send");
-    itemtip(v->busy ? "Steer: send to the running turn, which the agent reads "
-                                    "at its next step (Enter)"
-                                  : "Send the prompt (Enter; Shift+Enter for a new line)");
+    itemtip(!v->busy         ? "Send the prompt (Enter; Shift+Enter for a new line)"
+            : questionwaits(v) ? "Steer: send to the running turn, which the agent reads "
+                                 "with your answers to its questions (Enter)"
+                               : "Steer: send to the running turn, which the agent reads "
+                                 "at its next step (Enter)");
     if (v->busy) {
         if (ImGui::Button(ICON_STOP "##stop", v2(bw, 0))) {
             guicancel(g, g->sess);

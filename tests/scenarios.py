@@ -9779,19 +9779,58 @@ def question_args(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+def steered_answer(t, h, sid, ask):
+    """The questions, steered, still wait: the answer, not the steer, ends
+    them, and the agent reads the answers, then the steer."""
+    time.sleep(0.5)
+    t.check(not h.all("answer", sid), f"still asking: {h.all('answer', sid)}")
+    q = h.all("queue", sid)
+    t.check(q and [(i["kind"], i["text"]) for i in q[-1]["items"]] == [("steer", "Stop.")],
+            f"the steer waits: {q[-1:]}")
+    picks = [{"pick": [1]}] * len(ask["questions"])
+    r = h.call("answer", sid=sid, req=ask["req"], decision="allow", answers=picks)
+    t.check(r.get("ok") == 1, f"answered: {r}")
+    ended(h, sid, 1)
+    ans = h.all("answer", sid)[-1]
+    t.check(ans["by"] == "user" and ans["decision"] == "allow", f"by the user: {ans}")
+    te = h.all("tool.end", sid)[-1]
+    t.check(te["status"] == "ok" and "SQLite" in te["text"], f"{te}")
+    msgs = t.requests()[-1]["body"]["messages"]
+    t.check(msgs[-2]["role"] == "tool" and "SQLite" in str(msgs[-2]["content"]) and
+            msgs[-1]["role"] == "user" and msgs[-1]["content"] == "Stop.",
+            f"the answers, then the steer: {msgs[-2:]}")
+    t.check(lastsaid(h, sid) == "Stopped.", f"said {lastsaid(h, sid)}")
+
+
 @scenario(bound=10)
 def question_steer(t):
-    """A message instead of an answer: the agent reads it next."""
+    """A message sent while the questions wait does not answer them, as it
+    does other asks: it waits to be read with the answers."""
     h = t.headless()
     try:
         sid, ask = questioned(t, h)
         h.call("steer", sid=sid, text="Stop.")
-        ended(h, sid, 1)
-        ans = h.all("answer", sid)[-1]
-        t.check(ans["by"] == "steer", f"by the steer: {ans}")
-        te = h.all("tool.end", sid)[-1]
-        t.check(te["status"] == "denied" and "sent a new message" in te["text"], f"{te}")
-        t.check(lastsaid(h, sid) == "Stopped.", f"said {lastsaid(h, sid)}")
+        steered_answer(t, h, sid, ask)
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(bound=15)
+def question_steer_first(t):
+    """A message sent just before the agent asks, while a command runs in
+    the same step, does not answer the questions either: they wait, with
+    question_timeout's deadline, rather than being denied unseen."""
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="Sleep, then ask.")
+        h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
+        h.call("steer", sid=sid, text="Stop.")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        t.check(ask["tool"] == "ask_user" and ask["deadline"] - ask["ts"] > 200000,
+                f"it waits: {ask}")
+        steered_answer(t, h, sid, ask)
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")

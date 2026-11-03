@@ -72,8 +72,9 @@
 // deadline ([guard] ask_timeout, 30 s by default) and waits in its own state,
 // blocking nothing else: an answer resolves it, the deadline denies it,
 // and so does a steer, whose text the agent reads next (as does any ask
-// while a steer waits for the next step). Every denial is the call's
-// tool result, explaining what to do instead. A path's ask offers to
+// while a steer waits for the next step), though not the agent's
+// questions (ask_user), which a steer waits behind. Every denial is the
+// call's tool result, explaining what to do instead. A path's ask offers to
 // allow its directory for good ("always"), and a desktop ask its class
 // of actions, which the answer may take (see "Grants"). The log holds
 // ask and answer (and its grant) before the call's tool.start, so a
@@ -8659,8 +8660,10 @@ static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
     k->req    = clone(&s->perm, concat(&scratch, c->id, "/ask"));
     k->tool   = TOOL_ASKUSER;
     k->opened = os_ticks(e->os);
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
+    // A steer waiting for the next step does not answer the questions,
+    // as it does other asks: the user wrote it without them, and it
+    // waits, to be read with the answers
+    b32 wait  = attending(s);
     i64 delay = planning(s) ? 0 : questiondelay(e);
     if (wait && delay) {
         arm(s, T_ASK, delay);
@@ -8682,7 +8685,7 @@ static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -20034,11 +20037,12 @@ static void command(Engine *e, Arena scratch, Str line)
             sendqueue(s, scratch);
         } else {
             // Read at the next step; a pending ask yields to it, as do
-            // any more asks before then (askcall)
+            // any more asks before then (askcall), except the agent's
+            // questions, which the steer waits behind (askusercall)
             Queued q = {clone(&s->perm, text), ++s->queueid, imgs, at.files};
             s->steers = push(&s->perm, s->steers, q);
             sendqueue(s, scratch);
-            if (s->state == S_ASK) {
+            if (s->state==S_ASK && s->ask.tool!=TOOL_ASKUSER) {
                 resolve(s, scratch, 0, DENY_STEER, {});
                 nexttool(s, scratch);
             }

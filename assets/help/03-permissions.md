@@ -28,7 +28,8 @@ seconds (30 by default). Its buttons:
 - **Deny with note...** denies, telling the agent what to do instead.
 
 Sending a message while an ask waits denies it, and the agent reads
-your message.
+your message. The agent's questions are the exception: a message waits
+for your answers (see [Plan mode](help:plan)).
 
 A write or edit of Prospero's own configuration (its file, and the
 local files it includes) asks every time, even inside the working
