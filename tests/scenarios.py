@@ -3247,6 +3247,61 @@ def ask_timeout(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf={"_guard": {"ask_timeout": 3}}, bound=10)
+def ask_pause(t):
+    """The ask timeout stops while the user types a deny note, so it cannot
+    fire mid-typing; cancelling resumes it with whatever time was left."""
+    h = t.headless()
+    try:
+        sid, ask = asked(t, h)
+        r = h.call("ask.pause", sid=sid, req=ask["req"], pause=1)
+        t.check(r.get("ok") == 1, f"pause accepted: {r}")
+        # Sleep past the deadline while paused: no answer must arrive.
+        time.sleep(4)
+        t.check(not h.all("answer", sid), "no answer while the timeout is paused")
+        # Resume: the remaining time was none, so it times out at once.
+        r = h.call("ask.pause", sid=sid, req=ask["req"], pause=0)
+        t.check(r.get("ok") == 1, f"resume accepted: {r}")
+        t0 = time.monotonic()
+        ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == sid, 10)
+        t.check(ans["decision"] == "deny" and ans["by"] == "timeout",
+                f"answer on resume: {ans}")
+        # The timeout had its full 3 s left when paused, so it fires ~3 s
+        # after resuming (4 s pause + 3 s = ~7 s elapsed overall).
+        waited = time.monotonic() - t0
+        t.check(2.5 <= waited <= 5, f"denied after remaining time: {waited:.1f} s")
+        end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
+        t.check(end["why"] == "done", f"the turn goes on: {end}")
+        deny = h.all("tool.end", sid)[0]
+        t.check(deny["status"] == "denied", f"why: {deny}")
+        t.check("nobody answered within" in deny["text"], f"why: {deny}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
+@scenario(conf={"_guard": {"ask_timeout": 4}}, bound=10)
+def ask_pause_resume(t):
+    """Pausing, then resuming, restarts the timeout with what was left."""
+    h = t.headless()
+    try:
+        sid, ask = asked(t, h)
+        r = h.call("ask.pause", sid=sid, req=ask["req"], pause=1)
+        t.check(r.get("ok") == 1, f"pause accepted: {r}")
+        time.sleep(1)
+        t0 = time.monotonic()
+        r = h.call("ask.pause", sid=sid, req=ask["req"], pause=0)
+        t.check(r.get("ok") == 1, f"resume accepted: {r}")
+        ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == sid, 10)
+        waited = time.monotonic() - t0
+        t.check(ans["decision"] == "deny" and ans["by"] == "timeout",
+                f"answer: {ans}")
+        t.check(2.5 <= waited <= 5, f"denied after the remaining ~3 s: {waited:.1f}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=10)
 def ask_steer(t):
     h = t.headless()
@@ -3488,8 +3543,8 @@ def hello_caps(t):
                                                    "relay.offer", "relay.data",
                                                    "relay.more", "relay.peer",
                                                    "relay.call", "offer", "ask.touch",
-                                                   "shell.env", "call.stop", "cut", "uncut",
-                                                   "approve"]
+                                                   "ask.pause", "shell.env", "call.stop",
+                                                   "cut", "uncut", "approve"]
         t.check(cmds == want, f"cmds: {cmds}")
         caps = hello.get("caps", [])
         t.check(isinstance(caps, list) and all(isinstance(c, str) for c in caps) and

@@ -191,6 +191,7 @@ enum : i32 {
     CMD_RELAYCALL,   // a thin engine's call, for this engine to make
     CMD_OFFER,       // this engine's models as relay.offer gives them
     CMD_ASKTOUCH,    // the user works on a waiting ask's answer
+    CMD_ASKPAUSE,    // stop or restart a waiting ask's timeout (deny note)
     CMD_SHELLENV,    // a session's shell's environment, to open it by hand
     CMD_CALLSTOP,    // the running command stopped, while the turn goes on
     CMD_CUT,         // the conversation rewound to before a turn
@@ -208,8 +209,8 @@ static Str cmdnames[] = {
     "unqueue", "dir", "background", "models", "mcp", "mcp.auth", "mcp.code",
     "mcp.logout", "mcp.restart", "shell", "shells", "git", "trash",
     "trash.empty", "relay.offer", "relay.data", "relay.more", "relay.peer",
-    "relay.call", "offer", "ask.touch", "shell.env", "call.stop", "cut",
-    "uncut", "approve",
+    "relay.call", "offer", "ask.touch", "ask.pause", "shell.env", "call.stop",
+    "cut", "uncut", "approve",
 };
 static_assert(countof(cmdnames) == CMD_COUNT);
 

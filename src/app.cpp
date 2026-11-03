@@ -1379,6 +1379,8 @@ struct Gui {
     GuiSession        *denysess;
     i32                opendeny;   // 2 to keep planning
     b32                denyplan;
+    b32                denyopen;   // the deny-note popup is open: its timeout
+                                   // is paused until it answers or closes
     b32                openrewind; // the rewind confirmation, for
     GuiSession        *rewsess;
     Str                rewcall;    // a call's change and those after, or
@@ -3900,6 +3902,20 @@ static void guianswer(Gui *g, GuiSession *s, Str req, Str decision, Str note)
         putkey(&w.json, "note");
         putstr(&w.json, note);
     }
+    cmdsend(g, &w, a);
+}
+
+// The user opened or closed the deny-note dialog: stop or restart the
+// waiting ask's timeout while they type the note.
+static void guiaskpause(Gui *g, GuiSession *s, Str req, b32 pause)
+{
+    Arena a = newarena(g->cmdr);
+    Buf   b(&a, 256 + req.len);
+    EvOut w = cmdopen(g, &b, CMD_ASKPAUSE, s);
+    putkey(&w.json, "req");
+    putstr(&w.json, req);
+    putkey(&w.json, "pause");
+    putint(&w.json, pause ? 1 : 0);
     cmdsend(g, &w, a);
 }
 

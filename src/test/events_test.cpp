@@ -667,7 +667,7 @@ static void test_events(Test *t)
                "\"import\",\"skills\",\"mode\",\"unqueue\",\"dir\",\"background\",\"models\","
                "\"mcp\",\"mcp.auth\",\"mcp.code\",\"mcp.logout\",\"mcp.restart\",\"shell\",\"shells\","
                "\"git\",\"trash\",\"trash.empty\",\"relay.offer\",\"relay.data\","
-               "\"relay.more\",\"relay.peer\",\"relay.call\",\"offer\",\"ask.touch\",\"shell.env\",\"call.stop\","
+               "\"relay.more\",\"relay.peer\",\"relay.call\",\"offer\",\"ask.touch\",\"ask.pause\",\"shell.env\",\"call.stop\","
                "\"cut\",\"uncut\",\"approve\"],"
                "\"caps\":[\"close.forget\",\"config.refresh\",\"file.base64\",\"desktop\","
                "\"subagents\",\"rename\",\"title.by\",\"archive\",\"group\",\"draft\","

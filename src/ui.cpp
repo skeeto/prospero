@@ -4863,8 +4863,14 @@ static void drawtranscript(Gui *g)
         ImGui::OpenPopup("##denynote");
         g->denyplan = g->opendeny == 2;
         g->opendeny = 0;
+        // The ask's timeout stops while the user types the note
+        if (g->denysess) {
+            guiaskpause(g, g->denysess, g->denyreq, 1);
+        }
     }
-    if (ImGui::BeginPopup("##denynote")) {
+    b32 denynow  = ImGui::BeginPopup("##denynote");
+    b32 answered = 0;
+    if (denynow) {
         ImGui::TextUnformatted(g->denyplan ? "Keep planning, and tell the agent:"
                                            : "Deny, and tell the agent:");
         if (ImGui::IsWindowAppearing()) {
@@ -4878,13 +4884,25 @@ static void drawtranscript(Gui *g)
             Str note = {(u8 *)g->denynote, (iz)__builtin_strlen(g->denynote)};
             guianswer(g, g->denysess, g->denyreq, "deny", trim(note));
             ImGui::CloseCurrentPopup();
+            answered   = 1;
+            g->denyopen = 0;  // answered: the engine disarmed the counter
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) {
             ImGui::CloseCurrentPopup();
+            // Cancel: restart the timeout with whatever time was left
+            if (g->denysess) {
+                guiaskpause(g, g->denysess, g->denyreq, 0);
+            }
+            g->denyopen = 0;
         }
         ImGui::EndPopup();
     }
+    if (g->denyopen && !denynow && !answered && g->denysess) {
+        // Dismissed without an answer (clicked away or Esc): resume the timeout
+        guiaskpause(g, g->denysess, g->denyreq, 0);
+    }
+    g->denyopen = denynow && !answered;
     drawrewind(g);
 }
 

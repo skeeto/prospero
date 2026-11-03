@@ -547,6 +547,8 @@ struct Ask {
     Str       mcpurl;   // an MCP ask's server's url, by its SHA-256, or null
     b32       approve;  // credentials for urls of web includes (approving)
     i64       deadline; // a question's, epoch ms, as the frontends have it
+    i64       held;     // ticks left of T_ASK while the user types a deny
+                        // note, 0 while the counter runs or none is left
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
@@ -20117,6 +20119,55 @@ static void command(Engine *e, Arena scratch, Str line)
         } else {
             reply(e, scratch, id, 1, {}, sid);
             questionclock(s, scratch, 1);
+        }
+    } return;
+    case CMD_ASKPAUSE: {
+        // Stop or restart a waiting ask's timeout while the user types a
+        // deny note: store what is left, disarm T_ASK, and later arm it
+        // again with what remains. Tell the frontend the new deadline so
+        // the ask card's countdown stops while the note is being typed.
+        Str req   = jsonstr(jsonget(j, "req"));
+        b32 pause = jsonint(jsonget(j, "pause"), 0) != 0;
+        if (!s || s->state != S_ASK || req != s->ask.req) {
+            reply(e, scratch, id, 0, "no ask is waiting", sid);
+        } else {
+            reply(e, scratch, id, 1, {}, sid);
+            if (pause) {
+                if (s->timers[T_ASK]) {
+                    s->ask.held = s->timers[T_ASK] - os_ticks(e->os);
+                    if (s->ask.held < 0) {
+                        s->ask.held = 0;
+                    }
+                }
+                disarm(s, T_ASK);
+                {
+                    // Tell the frontend to stop its countdown: deadline 0
+                    // means "waiting for you", no expiry.
+                    Arena a = scratch;
+                    Buf   b(&a, 256);
+                    EvOut w = sbegin(s, &b, EV_ASKDEADLINE);
+                    putstrkey(&w.json, "req", s->ask.req);
+                    putintkey(&w.json, "deadline", 0);
+                    ssend(s, &w);
+                }
+            } else if (s->ask.held) {
+                i64 left = s->ask.held;
+                s->ask.held = 0;
+                if (left <= 0) {
+                    resolve(s, scratch, 0, DENY_TIMEOUT, {});
+                    nexttool(s, scratch);
+                } else {
+                    arm(s, T_ASK, left);
+                    {
+                        Arena a = scratch;
+                        Buf   b(&a, 256);
+                        EvOut w = sbegin(s, &b, EV_ASKDEADLINE);
+                        putstrkey(&w.json, "req", s->ask.req);
+                        putintkey(&w.json, "deadline", os_time(e->os) + left/MS);
+                        ssend(s, &w);
+                    }
+                }
+            }
         }
     } return;
     case CMD_PROMPT:
