@@ -3247,6 +3247,34 @@ def ask_timeout(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf={"_guard": {"ask_timeout": 3}}, bound=15)
+def ask_touch(t):
+    """ask.touch, as the user writes a denial's note, starts a permission
+    ask's clock over with its own delay, logged as ask.deadline; left
+    alone again, it times out."""
+    h = t.headless()
+    try:
+        h.call("hello", proto=0, client="scenarios")
+        t.check("ask.deadline" in h.all("hello")[0].get("caps", []), "the cap")
+        sid, ask = asked(t, h)
+        time.sleep(2)
+        r = h.call("ask.touch", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"touched: {r}")
+        r = h.call("ask.touch", sid=sid, req=ask["req"])
+        t.check(r.get("ok") == 1, f"touched again: {r}")
+        time.sleep(2)  # past the first deadline
+        t.check(not h.all("answer", sid), f"still waiting: {h.all('answer', sid)}")
+        dls = [e for e in logged(t, sid) if e["ev"] == "ask.deadline"]
+        t.check(len(dls) == 1 and dls[0]["req"] == ask["req"] and
+                dls[0]["deadline"] - ask["deadline"] >= 1500, f"logged once: {dls}")
+        ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == sid, 10)
+        t.check(ans["by"] == "timeout" and ans["ts"] - ask["ts"] >= 4500,
+                f"then timed out: {ans} after {ans['ts'] - ask['ts']} ms")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=10)
 def ask_steer(t):
     h = t.headless()

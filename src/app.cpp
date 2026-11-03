@@ -1378,6 +1378,8 @@ struct Gui {
     char              *denynote;   // "Deny with note"
     Str                denyreq;
     GuiSession        *denysess;
+    b32                denytimed;  // the ask has a deadline
+    i64                denytouch;  // when ask.touch last went, epoch ms
     i32                opendeny;   // 2 to keep planning
     b32                denyplan;
     b32                openrewind; // the rewind confirmation, for
@@ -3904,22 +3906,29 @@ static void guianswer(Gui *g, GuiSession *s, Str req, Str decision, Str note)
     cmdsend(g, &w, a);
 }
 
-// The user works on the answers to the agent's questions: their clock
-// starts over (ask.touch), at most every 10 s, where the engine can.
-static void guitouchq(Gui *g, GuiSession *s, ViewTool *t, QForm *f)
+// The user works on the answer to a waiting ask: its clock starts over
+// (ask.touch), at most every 10 s, where the engine can (cap).
+static void guitouch(Gui *g, GuiSession *s, Str req, i64 *touched, Str cap)
 {
     i64 now = os_time(g->os);
-    if (!t->deadline || now-f->touched<10000 ||
-            !hostcap(s->host, "question.deadline")) {
+    if (now-*touched<10000 || !hostcap(s->host, cap)) {
         return;
     }
-    f->touched = now;
+    *touched = now;
     Arena a = newarena(g->cmdr);
-    Buf   b(&a, 128 + t->req.len);
+    Buf   b(&a, 128 + req.len);
     EvOut w = cmdopen(g, &b, CMD_ASKTOUCH, s);
     putkey(&w.json, "req");
-    putstr(&w.json, t->req);
+    putstr(&w.json, req);
     cmdsend(g, &w, a);
+}
+
+// The user works on the answers to the agent's questions
+static void guitouchq(Gui *g, GuiSession *s, ViewTool *t, QForm *f)
+{
+    if (t->deadline) {
+        guitouch(g, s, t->req, &f->touched, "question.deadline");
+    }
 }
 
 // Answers to the agent's questions, from their form: picks and words of

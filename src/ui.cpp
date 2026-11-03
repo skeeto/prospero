@@ -2350,10 +2350,11 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
             if (enter) {
                 guianswer(g, s, t->req, "deny", {});
             } else {
-                g->denyreq  = t->req;
-                g->denysess = s;
+                g->denyreq   = t->req;
+                g->denysess  = s;
+                g->denytimed = t->deadline != 0;
                 g->denynote[0] = 0;
-                g->opendeny = 2;
+                g->opendeny  = 2;
             }
         }
         if (latest) itemrect(g, RECT_DENY);
@@ -2512,10 +2513,11 @@ static void drawaskbuttons(Gui *g, GuiSession *s, ViewMsg *m, b32 latest)
     itemtip("The agent reads why and tries something else");
     ImGui::SameLine();
     if (ImGui::Button("Deny with note...")) {
-        g->denyreq  = t->req;
-        g->denysess = s;
+        g->denyreq   = t->req;
+        g->denysess  = s;
+        g->denytimed = t->deadline != 0;
         g->denynote[0] = 0;
-        g->opendeny = 1;
+        g->opendeny  = 1;
     }
     itemtip("Deny, telling the agent what to do instead");
 }
@@ -4886,6 +4888,7 @@ static void drawtranscript(Gui *g)
         ImGui::OpenPopup("##denynote");
         g->denyplan = g->opendeny == 2;
         g->opendeny = 0;
+        g->denytouch = 0;
     }
     if (ImGui::BeginPopup("##denynote")) {
         ImGui::TextUnformatted(g->denyplan ? "Keep planning, and tell the agent:"
@@ -4896,6 +4899,11 @@ static void drawtranscript(Gui *g)
         ImGui::SetNextItemWidth(360*sc);
         b32 go = ImGui::InputText("##note", g->denynote, FIELD_MAX,
                                   ImGuiInputTextFlags_EnterReturnsTrue);
+        // Opening the note, then writing it, starts the ask's clock over,
+        // so its deadline cannot deny the call mid-sentence
+        if (g->denytimed && (ImGui::IsWindowAppearing() || ImGui::IsItemEdited())) {
+            guitouch(g, g->denysess, g->denyreq, &g->denytouch, "ask.deadline");
+        }
         go |= ImGui::Button(g->denyplan ? "Keep planning" : "Deny");
         if (go) {
             Str note = {(u8 *)g->denynote, (iz)__builtin_strlen(g->denynote)};

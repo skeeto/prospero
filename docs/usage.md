@@ -230,7 +230,9 @@ you start yourself, attended, get the tool: never subagents, roles, a
 answers:[{pick:[...], text?}, ...]}` answers it, one entry per question
 (cap `question`). `ask.touch {sid, req}` starts its countdown over, and
 an `ask.deadline {req, deadline}` record gives a changed deadline, 0
-for none (cap `question.deadline`).
+for none (cap `question.deadline`). It starts any other ask's countdown
+over too, from its own timeout, as you write a note to deny it with
+(cap `ask.deadline`).
 
 Bypass mode, in red in the same mode list, is for an agent left to
 work alone somewhere it can do no harm: nothing is asked, attended or

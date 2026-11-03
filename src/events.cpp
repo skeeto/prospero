@@ -303,6 +303,8 @@ static Str capnames[] = {
                        // which ask.touch {sid, req} starts again as the
                        // user answers, and ask.deadline {req, deadline}
                        // records change (0 for none)
+    "ask.deadline",    // ask.touch {sid, req} starts any waiting ask's
+                       // deadline again, as the user writes a denial's note
     "shell.env",       // shell.env {sid}: the environment, and distro, to
                        // open the session's shell in by hand
     "call.stop",       // call.stop {sid, call}: the running command killed,

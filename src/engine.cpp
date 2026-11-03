@@ -546,7 +546,8 @@ struct Ask {
                         // trusts for good, or null
     Str       mcpurl;   // an MCP ask's server's url, by its SHA-256, or null
     b32       approve;  // credentials for urls of web includes (approving)
-    i64       deadline; // a question's, epoch ms, as the frontends have it
+    i64       deadline; // epoch ms, as the frontends have it, or 0
+    i64       delay;    // ticks: the deadline's, which a touch starts over
 };
 
 // An "always allow" from the user: a path (a directory, or a file) the
@@ -4181,23 +4182,39 @@ static i64 questiondelay(Engine *e)
     return cfgms(e->cfg, "guard", "", "question_timeout", 0)*MS;
 }
 
-// The clock of the agent's questions while they wait: none in plan mode,
-// where the user means to review a plan soon, else question_timeout,
-// from now with restart, as the user works on the answers, else as it
-// was. A changed deadline goes to the frontends as an ask.deadline
-// record, unless it moved by under a tenth of the delay (5 s at most),
-// so a stream of touches logs little: the deadline they show is then at
-// most that early.
-static void questionclock(Session *s, Arena scratch, b32 restart)
+// Arm a waiting ask's deadline, from now, and keep its delay for the
+// user's touches to start over (askclock).
+static void askarm(Session *s, i64 delay)
+{
+    arm(s, T_ASK, delay);
+    s->ask.delay    = delay;
+    s->ask.deadline = os_time(s->e->os) + delay/MS;
+}
+
+// The clock of a waiting ask, from now with restart, as the user works
+// on the answer (a question's form, a denial's note), else as it was.
+// The agent's questions have none in plan mode, where the user means to
+// review a plan soon, else question_timeout; other asks keep the delay
+// they were armed with, and one that waits with none keeps none. A
+// changed deadline goes to the frontends as an ask.deadline record,
+// unless it moved by under a tenth of the delay (5 s at most), so a
+// stream of touches logs little: the deadline they show is then at most
+// that early.
+static void askclock(Session *s, Arena scratch, b32 restart)
 {
     Ask *k = &s->ask;
-    if (s->state!=S_ASK || k->tool!=TOOL_ASKUSER) {
+    if (s->state != S_ASK) {
         return;
     }
     Engine *e     = s->e;
-    i64     delay = planning(s) ? 0 : questiondelay(e);
+    i64     delay = k->delay;
     b32     armed = s->timers[T_ASK] != 0;
-    i64     at    = k->deadline;
+    if (k->tool == TOOL_ASKUSER) {
+        delay = planning(s) ? 0 : questiondelay(e);
+    } else if (!armed || !delay) {
+        return;
+    }
+    i64 at = k->deadline;
     if (!delay && armed) {
         disarm(s, T_ASK);
         at = 0;
@@ -4234,7 +4251,7 @@ static void setmode(Session *s, Arena scratch, i32 mode, Str by)
         s->modeheard = mode;
     }
     planheed(s, scratch);
-    questionclock(s, scratch, 0);  // into plan mode, or out of it
+    askclock(s, scratch, 0);  // into plan mode, or out of it
 }
 
 // Queue the notice of the shell, unless the agent knows it as it is: a
@@ -5252,7 +5269,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     if (wait) {
         // The deadline runs from now: the record's fsync, which a slow
         // disk may draw out, must not extend it
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Str   why = guardwhy(&scratch, toolnames[tool], gp, s->guard.cwd);
@@ -7292,7 +7309,7 @@ static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
     b32 wait  = attending(s) && !steer;
     i64 delay = cfgms(e->cfg, "desktop", "", "ask_timeout", 0)*MS;
     if (wait) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Str   what = concat(&scratch, "desktop: ", deskwhat(s, &scratch, d, 0));
@@ -7937,7 +7954,7 @@ static b32 webcall(Session *s, Arena scratch, i32 tool, Args *args)
     b32 wait  = attending(s) && !steer;
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Str service = webservices[websearchservice(e)];
@@ -8718,7 +8735,7 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
     b32 wait  = attending(s) && !steer;
     i64 delay = leave ? 0 : cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait && delay) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Str   what = leave ? plan.text :
@@ -8749,7 +8766,7 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
 
 // ask_user: its questions wait for the user's answers, unless nobody
 // can answer now, for [guard] question_timeout, or in plan mode with no
-// deadline (questionclock). Returns 1 if the call finished, 0 if the
+// deadline (askclock). Returns 1 if the call finished, 0 if the
 // session now waits for an answer.
 static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
 {
@@ -8766,8 +8783,7 @@ static b32 askusercall(Session *s, Arena scratch, Slice<AskQuestion> qs)
     b32 wait  = attending(s);
     i64 delay = planning(s) ? 0 : questiondelay(e);
     if (wait && delay) {
-        arm(s, T_ASK, delay);
-        k->deadline = os_time(e->os) + delay/MS;
+        askarm(s, delay);
     }
     {
         Str   what = questiondetail(&scratch, qs);
@@ -9882,7 +9898,7 @@ static b32 mcpprojgate(Session *s, Arena scratch)
     b32 wait  = attending(s) && !steer;
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Buf files(&scratch, 256);
@@ -10032,7 +10048,7 @@ static b32 approvegate(Session *s, Arena scratch)
     b32 wait  = attending(s) && !steer;
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         // A line a url: what would go there, and which section sends it
@@ -10650,7 +10666,7 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
     b32 wait  = attending(s) && !steer;
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait) {
-        arm(s, T_ASK, delay);
+        askarm(s, delay);
     }
     {
         Str   what = mcpwhat(&scratch, t, c->args);
@@ -14446,7 +14462,7 @@ static b32 taskasks(Session *s, Arena scratch)
         b32 wait  = attending(s) && !steer;
         i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
         if (wait) {
-            arm(s, T_ASK, delay);
+            askarm(s, delay);
         }
         {
             Buf b(&a, 512 + args.image.len + args.copy.len);
@@ -20110,13 +20126,13 @@ static void command(Engine *e, Arena scratch, Str line)
         cmdmode(e, s, scratch, id, j);
         return;
     case CMD_ASKTOUCH: {
-        // The user works on the answers: the questions' clock starts over
+        // The user works on the answer: the ask's clock starts over
         Str req = jsonstr(jsonget(j, "req"));
         if (s->state!=S_ASK || req!=s->ask.req) {
             reply(e, scratch, id, 0, "no such request waits", sid);
         } else {
             reply(e, scratch, id, 1, {}, sid);
-            questionclock(s, scratch, 1);
+            askclock(s, scratch, 1);
         }
     } return;
     case CMD_PROMPT:

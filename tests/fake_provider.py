@@ -1150,6 +1150,7 @@ def sc_ask(model, n, req):
 
 
 sc_ask_allow = sc_ask_deny = sc_ask_timeout = sc_ask_steer = sc_ask_close = sc_ask
+sc_ask_touch = sc_ask
 sc_config_roots = sc_ask
 
 
