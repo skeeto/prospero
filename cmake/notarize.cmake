@@ -38,7 +38,13 @@ foreach(dmg IN LISTS CPACK_PACKAGE_FILES)
     OUTPUT_VARIABLE out
     ERROR_VARIABLE out
     RESULT_VARIABLE rc)
-  if(NOT rc EQUAL 0 OR NOT out MATCHES "status: Accepted")
+  if(out MATCHES "No Keychain password item found")
+    # notarytool's profiles can be read only while the Mac is unlocked,
+    # and it says a locked one is not there
+    message(FATAL_ERROR "notarize: no profile ${CPACK_PROSPERO_NOTARY_PROFILE}, "
+            "or the screen is locked, which hides it: unlock it and build "
+            "again before storing the profile again")
+  elseif(NOT rc EQUAL 0 OR NOT out MATCHES "status: Accepted")
     string(REGEX MATCH "id: ([0-9a-f-]+)" id "${out}")
     message(FATAL_ERROR "notarize: not accepted\n${out}\n"
             "Apple's reasons: xcrun notarytool log ${CMAKE_MATCH_1}, "

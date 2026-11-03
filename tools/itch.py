@@ -28,7 +28,8 @@ whose tracked files must be committed), as the GitHub release is:
      and packed by its build.sh, as the GitHub release's are.
 
 Everything that signs must work: no aas-sign, no Developer ID identity
-in the keychain, or no notary credentials, and nothing is built.
+in the keychain, or no notary credentials, and nothing is built. The display is kept
+awake while it builds: a locked screen hides the notary profile.
 
 DIR (default: build-itch) gets prospero-VERSION-macos-arm64.dmg,
 prospero-VERSION-windows-x86_64.zip,
@@ -59,6 +60,10 @@ SIGNER = "CN=Christopher Wellons"
 GAME = "skeeto/prospero"
 IMAGE = "prospero-toolchain"
 LINUXIMAGE = "prospero-linuxgui"
+# notarytool keeps a profile where it can be read only while the Mac is
+# unlocked, and says a locked one is not there
+LOCKED = ("itch: \"No Keychain password item found\" also means the screen is "
+          "locked: unlock it before storing the profile again")
 
 
 def say(msg):
@@ -88,6 +93,12 @@ def checks(args):
     if not args.notary_profile and not os.environ.get("PROSPERO_NOTARY_KEY"):
         sys.exit("itch: no notary credentials: --notary-profile NAME, or "
                  "PROSPERO_NOTARY_KEY, PROSPERO_NOTARY_KEY_ID and PROSPERO_NOTARY_ISSUER")
+    if args.notary_profile:
+        r = subprocess.run(["xcrun", "notarytool", "history", "-p", args.notary_profile],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"itch: notary profile {args.notary_profile}: "
+                     f"{(r.stdout + r.stderr).strip()}\n{LOCKED}")
     if args.push:
         if not shutil.which("butler"):
             sys.exit("itch: --push needs butler (https://itch.io/docs/butler/)")
@@ -251,6 +262,10 @@ def main():
     args.work = os.path.abspath(args.work)
 
     checks(args)
+    # The display kept awake until this exits, so that the screen does not
+    # lock, which hides the notary profile minutes in (LOCKED)
+    if shutil.which("caffeinate"):
+        subprocess.Popen(["caffeinate", "-d", "-i", "-w", str(os.getpid())])
     os.makedirs(args.work, exist_ok=True)
     src, ver = source(args)
     zip = engines(args, src, ver)
