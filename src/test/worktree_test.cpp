@@ -3,7 +3,8 @@
 
 static Str wtplacestr(Os *os, Arena *a, Str cwd)
 {
-    WtPlace p = wtplace(os, a, cwd, 0);
+    Arena   keep = carve(a, 1<<16);  // as small as the engine's
+    WtPlace p    = wtplace(os, &keep, *a, cwd, 0);
     if (p.err.len) {
         return concat(a, "err: ", p.err);
     }
@@ -62,7 +63,7 @@ static void test_worktree(Test *t)
     {
         Str x = "1111111111111111111111111111111111111111";
         Str y = "2222222222222222222222222222222222222222";
-        Os *os = newos(a, 1<<20);
+        Os *os = newos(a, 1<<21);
         Str xl = concat(a, x, "\n");
         Str yl = concat(a, y, "\n");
         // A main checkout on main, with a subdirectory
@@ -108,6 +109,25 @@ static void test_worktree(Test *t)
                "err: a rebase is under way in the folder");
         expect(t, "place none", wtplacestr(os, a, "/n"),
                "err: the folder is not in a git repository");
+
+        // A branch only packed, in a packed-refs larger than the arena
+        // the place is made in, as a large repository's is
+        Buf pk(a, 1<<18);
+        print(&pk, "# pack-refs with: peeled fully-peeled sorted\n");
+        for (i32 i = 0; pk.len < 1<<17; i++) {
+            print(&pk, y);
+            print(&pk, " refs/tags/t");
+            print(&pk, (i64)i);
+            print(&pk, "\n");
+        }
+        print(&pk, x);
+        print(&pk, " refs/heads/packed\n");
+        os_mkdirs(os, *a, "/p/.git");
+        os_mkdirs(os, *a, "/p/.git/refs/heads");
+        os_write(os, *a, "/p/.git/HEAD", "ref: refs/heads/packed\n");
+        os_write(os, *a, "/p/.git/packed-refs", finish(&pk));
+        expect(t, "place packed large", wtplacestr(os, a, "/p"),
+               "/p sub= common=/p/.git base=packed oid=1111");
         expect(t, "wtpath", wtpath(a, "/r", "brisk-otter", 0),
                "/r/.prospero/worktrees/brisk-otter");
         expect(t, "wtpath win", wtpath(a, "C:\\r", "x", 1), "C:\\r\\.prospero\\worktrees\\x");

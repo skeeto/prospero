@@ -582,7 +582,7 @@ struct WtPlace {
     GitHead h;
 };
 
-static WtPlace wtplace(Os *os, Arena *a, Str cwd, b32 win)
+static WtPlace wtplace(Os *os, Arena *a, Arena scratch, Str cwd, b32 win)
 {
     WtPlace p = {};
     p.h = githead(os, a, cwd, {}, win);
@@ -618,10 +618,11 @@ static WtPlace wtplace(Os *os, Arena *a, Str cwd, b32 win)
     if (h->detached) {
         p.oid = h->oid;
     } else if (startswith(h->branch, "refs/")) {
-        p.oid = gitrefoid(os, a, p.common, h->branch);  // HEAD on another ref
+        p.oid = gitrefoid(os, a, scratch, p.common, h->branch);  // HEAD on another ref
     } else {
-        p.base = h->branch;
-        p.oid  = gitrefoid(os, a, p.common, concat(a, "refs/heads/", h->branch));
+        Str ref = concat(&scratch, "refs/heads/", h->branch);
+        p.base  = h->branch;
+        p.oid   = gitrefoid(os, a, scratch, p.common, ref);
     }
     if (!p.oid.len) {
         p.err = p.base.len ? concat(a, concat(a, "the branch ", p.base), " has no commits yet")
@@ -669,7 +670,9 @@ static i32 wttaken(Engine *e, Arena scratch, WtPlace *p, Str name)
     Str dir = wtpath(&scratch, p->main, name, win);
     if (os_stat(e->os, scratch, dir).type != STAT_MISSING) {
         return WT_HASDIR;
-    } else if (gitrefoid(e->os, &scratch, p->common, ref).len) {
+    }
+    Arena oid = carve(&scratch, 128);  // apart from the scratch it reads in
+    if (gitrefoid(e->os, &oid, scratch, p->common, ref).len) {
         return WT_HASBRANCH;
     } else if (wtrecorded(e, scratch, p->main, name, win)) {
         return WT_HASSESSION;
@@ -738,7 +741,7 @@ static void wtprobe(Engine *e, Arena scratch, i64 id, Json *j)
         return;
     }
     Arena   keep = carve(&scratch, 1<<16);
-    WtPlace p    = wtplace(e->os, &keep, dir, HOST_WINDOWS);
+    WtPlace p    = wtplace(e->os, &keep, scratch, dir, HOST_WINDOWS);
     Str     wt   = wtprobejson(e, &keep, scratch, &p);
     Str     head = githeadjson(&keep, &p.h);
     Str     status = {};
@@ -911,7 +914,7 @@ static Str wtplan(Engine *e, Arena *a, Arena scratch, Json *ask, Str cwd, WtSess
 {
     b32     win  = HOST_WINDOWS;
     Arena   keep = carve(&scratch, 1<<16);
-    WtPlace p    = wtplace(e->os, &keep, cwd, win);
+    WtPlace p    = wtplace(e->os, &keep, scratch, cwd, win);
     if (p.err.len) {
         return clone(a, p.err);
     }

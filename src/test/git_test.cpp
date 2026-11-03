@@ -568,6 +568,12 @@ static void testgitcmd(Test *t)
     expect(t, "git pending", istr(&a, e->git ? e->git->pending : -1), "0");
 }
 
+static Str refoid(Os *os, Arena *a, Str common, Str ref)
+{
+    Arena keep = carve(a, 128);  // room for the oid alone
+    return gitrefoid(os, &keep, *a, common, ref);
+}
+
 // Refs from loose and packed files, the common git directory, and git
 // worktree list's porcelain.
 static void testgitrefs(Test *t)
@@ -588,10 +594,10 @@ static void testgitrefs(Test *t)
         os_write(os, *a, "/r/.git/packed-refs", packed);
         os_mkdirs(os, *a, "/r/.git/worktrees/w");
         os_write(os, *a, "/r/.git/worktrees/w/commondir", "../..\n");
-        expect(t, "refoid loose first", gitrefoid(os, a, "/r/.git", "refs/heads/prospero/a"), x);
-        expect(t, "refoid packed", gitrefoid(os, a, "/r/.git", "refs/heads/b"), z);
-        expect(t, "refoid none", gitrefoid(os, a, "/r/.git", "refs/heads/c"), "");
-        expect(t, "refoid prefix", gitrefoid(os, a, "/r/.git", "refs/heads/prospero"), "");
+        expect(t, "refoid loose first", refoid(os, a, "/r/.git", "refs/heads/prospero/a"), x);
+        expect(t, "refoid packed", refoid(os, a, "/r/.git", "refs/heads/b"), z);
+        expect(t, "refoid none", refoid(os, a, "/r/.git", "refs/heads/c"), "");
+        expect(t, "refoid prefix", refoid(os, a, "/r/.git", "refs/heads/prospero"), "");
         expect(t, "common of worktree", gitcommon(os, a, "/r/.git/worktrees/w", 0), "/r/.git");
         expect(t, "common of main", gitcommon(os, a, "/r/.git", 0), "/r/.git");
     }

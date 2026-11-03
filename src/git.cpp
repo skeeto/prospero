@@ -284,21 +284,22 @@ static Str gitcommon(Os *os, Arena *a, Str gitdir, b32 win)
 }
 
 // The commit a ref names (refs/heads/NAME), from the files as git keeps
-// them, loose, else packed, or null if neither has it. A reftable's
-// refs are not read here.
-static Str gitrefoid(Os *os, Arena *a, Str common, Str ref)
+// them, loose, else packed, or null if neither has it, in a. The files
+// are read in scratch, so packed-refs, which may run to megabytes, need
+// not fit in a. A reftable's refs are not read here.
+static Str gitrefoid(Os *os, Arena *a, Arena scratch, Str common, Str ref)
 {
-    Str loose = gitline(os, a, join(a, common, ref));
+    Str loose = gitline(os, &scratch, join(&scratch, common, ref));
     if (gitoid(loose)) {
-        return loose;
+        return clone(a, loose);
     }
-    Read rd = os_read(os, a, join(a, common, "packed-refs"), GIT_PACKEDMAX);
+    Read rd = os_read(os, &scratch, join(&scratch, common, "packed-refs"), GIT_PACKEDMAX);
     for (Str rest = rd.err ? Str{} : rd.data; rest.len;) {
         Cut c    = cut(rest, '\n');
         Cut line = cut(gitclean(c.head), ' ');  // "OID REF", or "^OID" peeled
         rest = c.tail;
         if (line.ok && line.tail==ref && gitoid(line.head)) {
-            return line.head;
+            return clone(a, line.head);
         }
     }
     return {};
