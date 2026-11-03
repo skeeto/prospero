@@ -12343,6 +12343,7 @@ enum : i32 {
     CHK_LASTUSER,     // its latest user message is text
     CHK_MODELS,
     CHK_COMPACTED,
+    CHK_ORPHAN,    // the session shown names a parent that is gone: a root
     CHK_SIDE,
     CHK_NOSIDE,
     CHK_SIDEINI,
@@ -12640,6 +12641,7 @@ static Str chknames[] = {
     "the text went out as a message, not a command",
     "/model lists the configured models",
     "/compact compacted the conversation",
+    "a subagent whose parent is gone is a root, to trash",
     "the sidebar shows it",
     "the sidebar does not show it",
     "the layout file keeps the sidebar's state",
@@ -14809,6 +14811,14 @@ static DriveOp sessionsops[] = {
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "H remote:far\n"},
     {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "remote:hidden"},
     {OP_SHOT, 0, 0, 0, 300, "sessions-tree"},
+    // A subagent whose parent is gone (gui.py made it) is a root, even
+    // opened, its record naming that parent: to trash as one
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\n S Orphaned subagent\n"},
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Orphaned subagent"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 800, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 5000, ""},
+    {OP_CHECK, CHK_ORPHAN, 0, 0, 0, ""},
     // Folded, and open again
     {OP_MOVE, T_NAMED, 0, 0, 100, "fold Start subagents."},
     {OP_DOWN, 0, 0, 0, 60, ""},
@@ -15185,6 +15195,15 @@ static DriveOp sessionsops[] = {
     {OP_WAIT, W_ALLIDLE, 0, 0, 10000, ""},
     {OP_CHECK, CHK_KIDALWAYS, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "sessions-deskallowed"},
+    // The subagent whose parent is gone goes to the Trash, as a root
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Orphaned subagent"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Move to Trash"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 1500, ""},
+    {OP_CHECK, CHK_NOSIDE, 0, 0, 0, "\n S Orphaned subagent\n"},
+    {OP_CHECK, CHK_SIDE, 0, 0, 0, "\nT\n H this\n  S Orphaned subagent\n"},
     // Idle: no frames
     {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},  // hover delays and the layout's save
     {OP_MARK, 0, 0, 0, 3000, ""},
@@ -18661,6 +18680,11 @@ static b32 drivecheck(Gui *g, i32 chk)
         return g->modelsshown;
     case CHK_COMPACTED:
         return lastof(v, VIEW_COMPACT) != 0;
+    case CHK_ORPHAN: {
+        GuiSession *s = g->sess;
+        return s && s->view && s->view->parent.len && !sessparent(s).len &&
+               s->view->parent=="20261101-000000-9one" && !sesswhy(g, s, "trash", 1, 1).len;
+    }
     case CHK_SIDE:
     case CHK_NOSIDE:
     case CHK_SIDEINI:

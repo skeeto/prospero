@@ -611,10 +611,37 @@ static Str ctrdo(CtrRun *run, Arena *perm, Arena scratch, Ctr *c, Str cmd)
 // loses remote, so that it lists as a subagent of its parent here, which
 // deletes it along with it, and gains kept, the container's name, which
 // opens it read-only with Linux's paths (loadsession). One whose log is
-// bigger than CTR_KEEPMAX keeps remote, and lists as a root. Best effort: a file the container's root made
+// bigger than CTR_KEEPMAX keeps remote, and lists as a root. One whose
+// parent is no longer here (deleted while the container stayed) is not
+// kept: it would list as a root no one asked for. Best effort: a file the container's root made
 // under a rootful Linux daemon may not be readable. Scratch needs room
 // for twice CTR_KEEPMAX.
 enum : iz { CTR_KEEPMAX = (iz)1<<23 };
+
+// Whether session sid in from (a container's sessions) has its parents
+// here, in to: at the top of those it has in from, a session in to, or
+// none at all.
+static b32 ctrkeepable(Os *os, Arena scratch, Str from, Str to, Str sid)
+{
+    for (i32 n = 0; n < 16; n++) {
+        Str  log = join(&scratch, join(&scratch, from, sid), "events.jsonl");
+        Read rd  = os_readat(os, &scratch, log, 0, 1<<16);
+        Json *j  = jsonparse(&scratch, cut(rd.data, '\n').head).root;
+        Str  p   = jsonstr(jsonget(j, "parent"));
+        if (!validsid(p)) {
+            return 1;
+        }
+        Str here  = join(&scratch, to, p);  // paths first: scratch goes by value
+        Str there = join(&scratch, from, p);
+        if (os_stat(os, scratch, here).type == STAT_DIR) {
+            return 1;
+        } else if (os_stat(os, scratch, there).type != STAT_DIR) {
+            return 0;
+        }
+        sid = p;
+    }
+    return 0;
+}
 
 static void ctrkeep(Os *os, Arena scratch, Str localstate, Str name)
 {
@@ -628,7 +655,7 @@ static void ctrkeep(Os *os, Arena scratch, Str localstate, Str name)
         Str   dest = join(&a, to, d->name);
         Str   tmp  = join(&a, stage, d->name);
         if (!d->isdir || !validsid(d->name) || os_stat(os, a, dest).type!=STAT_MISSING ||
-                !copytree(os, a, src, tmp, 0)) {
+                !ctrkeepable(os, a, from, to, d->name) || !copytree(os, a, src, tmp, 0)) {
             continue;
         }
         Str  log = join(&a, tmp, "events.jsonl");

@@ -1891,6 +1891,17 @@ def main():
     holder = None
     if args.mode == "drive" and not args.fake:
         holder = host.sessions(ini, state, work)
+    if args.mode == "sessions":
+        # A subagent whose parent is gone, as a container's transcript
+        # kept after its parent was deleted: a root, to trash as one. A
+        # session run here, its first record then naming a parent
+        p = host.popen(["run", "-C", work, "-c", ini, "--state", state, "Orphaned subagent"])
+        p.communicate(timeout=60)
+        sid = host.listdir(host.path("state", "sessions"))[0]
+        log = host.path("state", "sessions", sid, "events.jsonl")
+        first, rest = (host.read(log) or "").split("\n", 1)
+        rec = dict(json.loads(first), parent="20261101-000000-9one", call="c1", depth=1)
+        host.write(log, json.dumps(rec, separators=(",", ":")) + "\n" + rest)
 
     paths = [ini, state, work]
     guicwd = None

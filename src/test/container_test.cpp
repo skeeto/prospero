@@ -145,14 +145,24 @@ static void test_container(Test *t)
 
     // A subagent's container's sessions, kept: each copied whole, its
     // first record without remote, so a subagent of its parent here;
-    // never over a session here, nor a dot folder
+    // never over a session here, nor a dot folder, nor one whose parent
+    // is gone from here (deleted while the container stayed), with its
+    // own subagents; one whose parent is kept with it goes too
     Str kept = "/st/containers/t-0000beef/state/sessions";
     Str dirs[] = {"/20261102-120000-abcd", "/20261102-120000-abcd/out",
-                  "/20261102-120001-dupe", "/.part"};
+                  "/20261102-120001-dupe", "/.part", "/20261102-120002-kid0",
+                  "/20261102-120003-orph", "/20261102-120004-kid1"};
     for (i32 i = 0; i < countof(dirs); i++) {
         os_mkdirs(v.os, a, concat(&a, kept, dirs[i]));
     }
     os_mkdirs(v.os, a, "/st/sessions/20261102-120001-dupe");
+    os_mkdirs(v.os, a, "/st/sessions/20261102-110000-0001");
+    os_write(v.os, a, concat(&a, kept, "/20261102-120002-kid0/events.jsonl"),
+             "{\"ev\":\"session\",\"parent\":\"20261102-120000-abcd\"}\n");
+    os_write(v.os, a, concat(&a, kept, "/20261102-120003-orph/events.jsonl"),
+             "{\"ev\":\"session\",\"parent\":\"20261102-100000-gone\",\"remote\":1}\n");
+    os_write(v.os, a, concat(&a, kept, "/20261102-120004-kid1/events.jsonl"),
+             "{\"ev\":\"session\",\"parent\":\"20261102-120003-orph\"}\n");
     os_write(v.os, a, concat(&a, kept, "/20261102-120000-abcd/events.jsonl"),
              "{\"sid\":\"20261102-120000-abcd\",\"ev\":\"session\",\"cwd\":\"/work\","
              "\"parent\":\"20261102-110000-0001\",\"call\":\"c1\",\"depth\":1,"
@@ -171,6 +181,12 @@ static void test_container(Test *t)
     expect(t, "ctrkeep not over", cfgfile(v.os, "/st/sessions/20261102-120001-dupe/events.jsonl"),
            "mine\n");
     expect(t, "ctrkeep dot", cfgfile(v.os, "/st/sessions/.part/events.jsonl"), "(missing)");
+    expect(t, "ctrkeep nested", istr(&a, os_stat(v.os, a, "/st/sessions/20261102-120002-kid0")
+                                             .type==STAT_DIR), "1");
+    expect(t, "ctrkeep orphan", cfgfile(v.os, "/st/sessions/20261102-120003-orph/events.jsonl"),
+           "(missing)");
+    expect(t, "ctrkeep orphan's", cfgfile(v.os, "/st/sessions/20261102-120004-kid1/events.jsonl"),
+           "(missing)");
 
     // [container] chooses what runs: an included file's is ignored
     os_write(v.os, a, "/c/team.ini", "[container]\nargs = --privileged\n");

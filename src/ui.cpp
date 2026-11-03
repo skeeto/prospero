@@ -3102,11 +3102,11 @@ struct UpTo {
 static UpTo uptoof(Gui *g, GuiSession *s)
 {
     UpTo r = {};
-    if (!s || !s->view || (!s->view->parent.len && !sessside(s).len)) {
+    if (!s || !s->view || (!sessparent(s).len && !sessside(s).len)) {
         return r;
     }
-    r.side = !s->view->parent.len;
-    r.up   = r.side ? sessside(s) : s->view->parent;
+    r.side = !sessparent(s).len;
+    r.up   = r.side ? sessside(s) : sessparent(s);
     r.p    = r.side ? findsess(g, s->host, r.up) : sessup(g, s);
     r.far  = !r.side && s->view->remote && !r.p;
     return r;
@@ -3141,7 +3141,7 @@ static void drawsessbar(Gui *g)
     char const *rl    = ICON_LIGHTBULB;  // Reasoning
     f32         rest  = (gw>0 ? gw + gap : 0) + 5*iconw() + 4*gap;
     f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rest;
-    if (v->parent.len || sessside(s).len) {
+    if (sessparent(s).len || sessside(s).len) {
         // Up to its parent, or a side chat's original, then what it is:
         // the Session pane says whose
         UpTo        u    = uptoof(g, s);
@@ -5822,8 +5822,20 @@ static b32 sidafter(GuiSession **a, GuiSession **b)
     return compare((*a)->sid, (*b)->sid) > 0;
 }
 
+// Whether a subagent's parent is gone: its record names one on this
+// host, but the engine's list, which has every session here, gave it
+// none, so it is a root, to delete or archive as one.
+static b32 sessorphan(GuiSession *s)
+{
+    return s->listed && !s->parent.len && s->view && s->view->parent.len &&
+           !s->view->remote;
+}
+
 static Str sessparent(GuiSession *s)
 {
+    if (sessorphan(s)) {
+        return {};
+    }
     return s->view && s->view->parent.len ? s->view->parent : s->parent;
 }
 
