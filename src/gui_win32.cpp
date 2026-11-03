@@ -2017,7 +2017,10 @@ static void os_guiinject(Os *os, GuiEvent *e)
     a.beg = (byte *)buf;
     a.end = (byte *)buf + countof(buf);
     unsigned short *text = 0;
-    if (e->text.len) {
+    if (e->kind == GEV_FLAGPASTE) {
+        e->x = -1;  // macOS only
+        return;
+    } else if (e->text.len) {
         text = (unsigned short *)towide(&a, e->text).data;
     }
     w32gui_inject(os->gui, e->kind, e->x, e->y, e->button, e->down, e->key,

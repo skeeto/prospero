@@ -601,6 +601,10 @@ enum {
     GEV_DROP,       // a file, its path the text, is dropped on the window
     GEV_TOAST,      // toast x is clicked (y 0), or was refused (y 1),
                     // shown or not, by the platform's own path
+    GEV_FLAGPASTE,  // macOS: Cmd+V as dictation apps post it, Cmd in V's
+                    // flags alone, through AppKit; out, SDL's modifiers
+                    // (KEY_*) in x after the press and y after the
+                    // release, or x -1 where there is no such path
 };
 enum {
     GKEY_TAB,

@@ -697,6 +697,92 @@ static void handlesettings(u32 trayevent)
     objc_autoreleasePoolPop(pool);
 }
 
+// Dictation apps (Wispr Flow, superwhisper) put their text on the
+// clipboard and post Cmd+V, as a V whose flags alone hold Cmd, with no
+// Cmd key event before it. SDL learns of modifiers from flagsChanged
+// events only, so it passed on a bare V and the paste never came. SDL's
+// application class gets a sendEvent: that, ahead of a key event whose
+// modifiers SDL has wrong, sends it a flagsChanged with the event's own,
+// which SDL presses as for real keys, and after that key's release one
+// with the keyboard's actual state, which lets them go again.
+enum : uz {
+    NSKEYDOWN      = 10,
+    NSKEYUP        = 11,
+    NSFLAGSCHANGED = 12,
+    NSMODMASK      = 0xf << 17,  // Shift, Control, Option, Command
+};
+
+struct NsPoint { double x, y; };
+static void (*macsendevent)(void *, void *, void *);
+static b32    macmodsent;  // a key's modifiers were sent, to let go
+
+static uz sdlmodflags()
+{
+    SDL_Keymod m = SDL_GetModState();
+    return (m&SDL_KMOD_SHIFT ? (uz)1<<17 : 0) | (m&SDL_KMOD_CTRL ? (uz)1<<18 : 0) |
+           (m&SDL_KMOD_ALT   ? (uz)1<<19 : 0) | (m&SDL_KMOD_GUI  ? (uz)1<<20 : 0);
+}
+
+static void *nskeyevent(uz type, uz flags, iz win, char const *chars, unsigned short code)
+{
+    void *s = nsstring(chars);
+    return objcsend<void *>(objc_getClass("NSEvent"),
+        "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:"
+        "characters:charactersIgnoringModifiers:isARepeat:keyCode:",
+        type, NsPoint{}, flags, 0.0, win, (void *)0, s, s, (ObjcBool)0, code);
+}
+
+static void macsend(void *self, void *sel, void *ev)
+{
+    uz   type = objcsend<uz>(ev, "type");
+    b32  key  = type==NSKEYDOWN || type==NSKEYUP;
+    uz   mods = key ? objcsend<uz>(ev, "modifierFlags") : 0;
+    iz   win  = key ? objcsend<iz>(ev, "windowNumber") : 0;
+    if (key && (mods&NSMODMASK)!=sdlmodflags()) {
+        macsendevent(self, sel, nskeyevent(NSFLAGSCHANGED, mods, win, "", 0));
+        macmodsent = 1;
+    }
+    macsendevent(self, sel, ev);
+    if (type==NSKEYUP && macmodsent) {
+        macmodsent = 0;
+        uz now = objcsend<uz>(objc_getClass("NSEvent"), "modifierFlags");
+        macsendevent(self, sel, nskeyevent(NSFLAGSCHANGED, now, win, "", 0));
+    }
+}
+
+extern "C" void *class_getInstanceMethod(void *, void *);
+extern "C" void *method_setImplementation(void *, void *);
+
+static void handlemodflags()
+{
+    void *app = objcsend<void *>(objc_getClass("NSApplication"), "sharedApplication");
+    void *cls = objc_getClass("SDL3Application");
+    // NSApp may be of a subclass that AppKit made of SDL's at run time
+    void *m   = cls && app && objcsend<ObjcBool>(app, "isKindOfClass:", cls)
+                ? class_getInstanceMethod(cls, sel_registerName("sendEvent:")) : 0;
+    if (m && !macsendevent) {
+        macsendevent = (void (*)(void *, void *, void *))method_setImplementation(m, (void *)macsend);
+    }
+}
+
+// The checklist's paste as dictation apps post it (GEV_FLAGPASTE), sent
+// to the application as AppKit would: Cmd only in V's flags.
+static void macflagpaste(GuiEvent *ge)
+{
+    void *pool = objc_autoreleasePoolPush();
+    void *app  = objcsend<void *>(objc_getClass("NSApplication"), "sharedApplication");
+    auto  mods = [] {
+        SDL_Keymod m = SDL_GetModState();
+        return (m&SDL_KMOD_GUI ? KEY_CMD : 0) | (m&SDL_KMOD_CTRL ? KEY_CTRL : 0) |
+               (m&SDL_KMOD_SHIFT ? KEY_SHIFT : 0) | (m&SDL_KMOD_ALT ? KEY_ALT : 0);
+    };
+    objcsend<void>(app, "sendEvent:", nskeyevent(NSKEYDOWN, (uz)1<<20, 0, "v", (unsigned short)9));
+    ge->x = (f32)mods();
+    objcsend<void>(app, "sendEvent:", nskeyevent(NSKEYUP, (uz)1<<20, 0, "v", (unsigned short)9));
+    ge->y = (f32)mods();
+    objc_autoreleasePoolPop(pool);
+}
+
 static void macwillpresent(void *, void *, void *, void *, void (^done)(uz))
 {
     done(2|8|16);  // sound, list, banner
@@ -953,6 +1039,7 @@ static b32 os_guiopen(Os *os, Gui *g, Str title)
     #ifdef __APPLE__
     handlereopen(p->trayevent);
     handlesettings(p->trayevent);
+    handlemodflags();
     #endif
     if (!sdlwindow(os, g, p, title)) {
         return 0;
@@ -1381,6 +1468,13 @@ static void os_guiinject(Os *os, GuiEvent *ge)
         e.type      = p->trayevent;
         e.user.code = (i32)ge->x;
         SDL_PushEvent(&e);
+        return;
+    } else if (ge->kind == GEV_FLAGPASTE) {
+        #ifdef __APPLE__
+        macflagpaste(ge);
+        #else
+        ge->x = -1;
+        #endif
         return;
     } else if (ge->kind == GEV_TOAST) {
         // As the platform's click or refusal sends it

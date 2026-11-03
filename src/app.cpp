@@ -12892,6 +12892,8 @@ enum : i32 {
                   // (a flat gray JPEG if text ends in .jpg)
     OP_CLIPPNG,   // the clipboard's text kept, a dx by dy PNG put there
     OP_CLIPBACK,  // the clipboard's text put back
+    OP_FLAGPASTE, // macOS: Cmd+V as dictation apps post it (GEV_FLAGPASTE),
+                  // checked to press Cmd for V and let it go after
     OP_OPENDIR,   // an open event (macOS: open -a) for the directory text
                   // in --cwd, or the launch's (prospero DIR) if empty
     OP_CLOSEMAIN, // close the session the checklist made, as Close does
@@ -18940,6 +18942,7 @@ static DriveOp composeops[] = {
     {OP_KEYUP, 0, GKEY_CMD, 0, 800, ""},
     {OP_CLIPBACK, 0, 0, 0, 100, ""},
     {OP_CHECK, CHK_ATTACHED, 3, 0, 0, ""},
+    {OP_FLAGPASTE, 0, 0, 0, 100, ""},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "compose-attached"},
     CLICK(T_NAMED, "attach remove", 600),
@@ -23314,6 +23317,26 @@ static void drivestep(Gui *g)
         e.kind = GEV_DROP;
         e.text = {(u8 *)cstr0(&g->perm, path), path.len};
         os_guiinject(g->os, &e);
+    } break;
+    case OP_FLAGPASTE: {
+        e.kind = GEV_FLAGPASTE;
+        os_guiinject(g->os, &e);
+        if (e.x < 0) {
+            guilog(g, "drive: skip the flags-only paste (macOS only)");
+            break;
+        }
+        b32 ok = ((i32)e.x & KEY_CMD) && !((i32)e.y & KEY_CMD);
+        g->drivechecks++;
+        g->drivefails += !ok;
+        Arena a = g->frame;
+        Buf   b(&a, 128);
+        print(&b, ok ? Str("drive: ok   ") : Str("drive: FAIL "));
+        print(&b, "flags-only Cmd+V pressed and let go Cmd: modifiers ");
+        print(&b, (i64)e.x);
+        print(&b, " pressed, ");
+        print(&b, (i64)e.y);
+        print(&b, " released");
+        guilog(g, finish(&b));
     } break;
     case OP_CLIPBACK: {
         Arena a = g->frame;
