@@ -9181,6 +9181,9 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
 {
     image  = trim(image);
     folder = trim(folder);
+    HomePath hp = ws==CTR_EMPTY ? HomePath{} :
+                  tildepath(&g->frame, folder, g->main->home, HOST_WINDOWS);
+    folder = hp.path;
     if (!g->ctrrt.up) {
         return g->ctrrt.why.len ? g->ctrrt.why : Str("no container runtime answers");
     } else if (!image.len) {
@@ -9189,13 +9192,16 @@ static Str ctrnew(Gui *g, Str image, i32 ws, Str folder, b32 net, Str ep, Str mo
         return "An image cannot begin with -";
     } else if (ws!=CTR_EMPTY && !folder.len) {
         return "Choose a folder";
+    } else if (hp.err.len) {
+        return hp.err;
     } else if (ws != CTR_EMPTY && os_stat(g->os, g->frame, folder).type != STAT_DIR) {
         return "No such folder here";
     }
-    Arena a     = g->frame;
-    Str   noeng = ctrnoengine(g->os, &a, carve(&a, 1<<16));
+    // In the frame itself, not a copy of it, which is gone on return
+    Arena scratch = carve(&g->frame, 1<<16);
+    Str   noeng   = ctrnoengine(g->os, &g->frame, scratch);
     if (noeng.len) {
-        noeng = clone(&a, noeng);  // as a sentence, for the dialog
+        noeng = clone(&g->frame, noeng);  // as a sentence, for the dialog
         noeng.data[0] = noeng[0]>='a' && noeng[0]<='z' ? (u8)(noeng[0]-32) : noeng[0];
         return noeng;
     }

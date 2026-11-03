@@ -9065,9 +9065,12 @@ static b32 drawnewctr(Gui *g, Arena a, b32 *enter)
     char const *browse = "Browse\xe2\x80\xa6";
     f32 bw = ImGui::CalcTextSize(browse).x + 2*ImGui::GetStyle().FramePadding.x;
     ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
-    ImGui::InputTextWithHint("##ctrdir", "A folder on this computer", g->newcwd, FIELD_MAX,
-                             ImGuiInputTextFlags_AutoSelectAll);
+    // Completed as the usual directory field is, here, where it lives
+    PathField pf = pathbefore(g, g->main, g->newcwd, enter, none);
+    ImGui::InputTextWithHint("##cwd", "A folder on this computer", g->newcwd, FIELD_MAX,
+                             pf.flags, pathcb, &pf.cb);
     itemrect(g, RECT_NEWCWD);
+    pathafter(g, &pf, g->newcwd);
     ImGui::SameLine();
     if (ImGui::Button(browse)) {
         browsestart(g, g->main);

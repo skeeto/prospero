@@ -1927,7 +1927,11 @@ def main():
     if far:
         guiargs += ["--rcwd", far.work]
     if args.mode == "containers":
-        guiargs += ["--rcwd", work]
+        # Typed with a leading ~, which must be this computer's home
+        rcwd = work
+        if not args.host and not args.ssh and os.name != "nt":
+            rcwd = "~/" + os.path.relpath(work, os.path.expanduser("~"))
+        guiargs += ["--rcwd", rcwd]
     if args.mode == "firstrun":
         guiargs += ["--display", "1280x720"]  # too small: maximized
     if args.subprocess:
