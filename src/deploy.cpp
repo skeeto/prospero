@@ -775,6 +775,13 @@ static DeployRun deployrun(Deploy *d, Arena *a, Slice<Str> argv, i64 timeout,
             }
         }
     }
+    // The command is done and its output drained: end the reaper so a
+    // one-shot (such as a font probe) does not linger for the life of the
+    // harness, waiting on its lifeline. A hard kill sweeps its tree and
+    // makes the reaper exit; a soft TERM is ignored by the reaper itself.
+    if (!killed) {
+        os_kill(os, p, 1);
+    }
     os_procfree(os, p);
     r.code = exited && !killed ? code : -1;
     r.out  = wslutf8(a, finish(&out));
