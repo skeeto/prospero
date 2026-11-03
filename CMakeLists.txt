@@ -19,6 +19,16 @@ set(PROSPERO_NAME prospero CACHE STRING "Executable name")
 option(PROSPERO_GUI "Build the GUI (OFF: the headless engine only)" ON)
 option(PROSPERO_DEVTOOLS "The GUI's developer tools, the Metrics pane (always in Debug builds)" OFF)
 option(PROSPERO_STATIC "Link fully statically (Linux: deployed engines)" OFF)
+# Where SDL3, FreeType and mbedTLS come from: FETCH, from deps/ when
+# present, else downloaded, or LOCAL, the system's, by find_package
+# alone, for distribution packages. The rest, which no distribution has
+# new enough, are fetched either way.
+set(PROSPERO_DEPS FETCH CACHE STRING
+    "SDL3, FreeType and mbedTLS: FETCH (bundled or downloaded) or LOCAL (system)")
+set_property(CACHE PROSPERO_DEPS PROPERTY STRINGS FETCH LOCAL)
+if(NOT PROSPERO_DEPS MATCHES "^(FETCH|LOCAL)$")
+  message(FATAL_ERROR "PROSPERO_DEPS is FETCH or LOCAL, not ${PROSPERO_DEPS}")
+endif()
 # The edition: "community", what a source build and the GitHub releases
 # are, or "itch", the itch.io builds (tools/itch.py), named plain
 # "Prospero", with the engines zip (tools/engines.py) embedded, so that

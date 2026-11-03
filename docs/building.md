@@ -14,6 +14,19 @@ modified dependency, put its source under `deps/` (`deps/imgui`,
 `deps/md4c`, `deps/freetype`, `deps/sdl3`, `deps/mbedtls`,
 `deps/cpp-httplib`, and `deps/wuffs` holding `wuffs-v0.4.c`).
 
+Distribution packages can use the system's SDL3 (3.4 or later),
+FreeType (2.14 or later) and mbedTLS (3.6, not 4) instead, found with
+`find_package` alone, never downloaded:
+
+    $ cmake -B build -DPROSPERO_DEPS=LOCAL
+
+On Ubuntu 26.04 these are `libsdl3-dev`, `libfreetype-dev` and
+`libmbedtls-dev`, and on Fedora `SDL3-devel`, `freetype-devel` and
+`mbedtls-devel`. The rest are still fetched, or taken from `deps/`,
+since distributions lack the versions Prospero needs: ImGui's docking
+branch, md4c 0.6 (admonitions), cpp-httplib with its mbedTLS backend,
+and Wuffs 0.4.
+
 The Windows GUI is its own Win32 layer over Direct3D 11, and HTTP goes
 through WinHTTP, so it uses the system's certificates and proxies. The
 toolchain files in `cmake/` cross-compile for Windows with Mingw-w64

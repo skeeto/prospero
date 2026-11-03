@@ -6,8 +6,14 @@
 #   freetype  2.15.0
 #   SDL3      3.4.18 (macOS and Linux only)
 #
-# Targets: md4c, freetype, imgui (with its platform backends and the
-# FreeType loader), and SDL3::SDL3-static on POSIX. Third-party code
+# With PROSPERO_DEPS=LOCAL, FreeType and SDL3 are the system's instead,
+# as shared libraries: FreeType 2.14 and SDL3 3.4 or later, the oldest
+# that Ubuntu 26.04 has. md4c stays fetched, since Prospero needs 0.6's
+# admonitions, which no distribution has yet.
+#
+# Targets: md4c, freetype (or Freetype::Freetype), imgui (with its
+# platform backends and the FreeType loader), and SDL3::SDL3-static (or
+# SDL3::SDL3) on POSIX. Third-party code
 # keeps its own flags; consumers see its headers as system headers, so
 # the core's warnings stay quiet about them.
 
@@ -28,15 +34,17 @@ FetchContent_Declare(md4c
   SOURCE_SUBDIR _none  # only md4c.c is wanted, not its CMake project
 )
 
-# Savannah sometimes answers 504, so SourceForge's copy, the same file,
-# is tried next.
-fetch_content_bundled(freetype freetype)
-FetchContent_Declare(freetype
-  URL https://download.savannah.gnu.org/releases/freetype/freetype-2.15.0.tar.xz
-      https://downloads.sourceforge.net/project/freetype/freetype2/2.15.0/freetype-2.15.0.tar.xz
-  URL_HASH SHA256=93cd47eb719c325107f2d3cf087d06299e944c3b48a40b55537302304dea1dd5
-  SYSTEM
-)
+if(PROSPERO_DEPS STREQUAL "FETCH")
+  # Savannah sometimes answers 504, so SourceForge's copy, the same file,
+  # is tried next.
+  fetch_content_bundled(freetype freetype)
+  FetchContent_Declare(freetype
+    URL https://download.savannah.gnu.org/releases/freetype/freetype-2.15.0.tar.xz
+        https://downloads.sourceforge.net/project/freetype/freetype2/2.15.0/freetype-2.15.0.tar.xz
+    URL_HASH SHA256=93cd47eb719c325107f2d3cf087d06299e944c3b48a40b55537302304dea1dd5
+    SYSTEM
+  )
+endif()
 
 FetchContent_MakeAvailable(imgui md4c)
 
@@ -44,20 +52,27 @@ add_library(md4c STATIC ${md4c_SOURCE_DIR}/src/md4c.c)
 target_include_directories(md4c SYSTEM PUBLIC ${md4c_SOURCE_DIR}/src)
 target_compile_definitions(md4c PUBLIC MD4C_USE_UTF8)
 
-# FreeType without optional codecs: the fonts are embedded TrueType.
-set(FT_DISABLE_ZLIB     ON CACHE BOOL "" FORCE)
-set(FT_DISABLE_BZIP2    ON CACHE BOOL "" FORCE)
-set(FT_DISABLE_PNG      ON CACHE BOOL "" FORCE)
-set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
-set(FT_DISABLE_BROTLI   ON CACHE BOOL "" FORCE)
-set(FT_DISABLE_HVF      ON CACHE BOOL "" FORCE)
-set(SKIP_INSTALL_ALL    ON CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS_SAVE ${BUILD_SHARED_LIBS})
-set(BUILD_SHARED_LIBS OFF)
-FetchContent_MakeAvailable(freetype)
-set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVE})
+if(PROSPERO_DEPS STREQUAL "FETCH")
+  # FreeType without optional codecs: the fonts are embedded TrueType.
+  set(FT_DISABLE_ZLIB     ON CACHE BOOL "" FORCE)
+  set(FT_DISABLE_BZIP2    ON CACHE BOOL "" FORCE)
+  set(FT_DISABLE_PNG      ON CACHE BOOL "" FORCE)
+  set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+  set(FT_DISABLE_BROTLI   ON CACHE BOOL "" FORCE)
+  set(FT_DISABLE_HVF      ON CACHE BOOL "" FORCE)
+  set(SKIP_INSTALL_ALL    ON CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS_SAVE ${BUILD_SHARED_LIBS})
+  set(BUILD_SHARED_LIBS OFF)
+  FetchContent_MakeAvailable(freetype)
+  set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVE})
+  set(prospero_freetype freetype)
+else()
+  find_package(Freetype 2.14 REQUIRED)
+  message(STATUS "freetype: system ${FREETYPE_VERSION_STRING}")
+  set(prospero_freetype Freetype::Freetype)
+endif()
 
-if(NOT WIN32)
+if(NOT WIN32 AND PROSPERO_DEPS STREQUAL "FETCH")
   fetch_content_bundled(SDL3 sdl3)
   FetchContent_Declare(SDL3
     URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
@@ -87,6 +102,11 @@ if(NOT WIN32)
   set(SDL_VULKAN        OFF CACHE BOOL "" FORCE)
   set(SDL_KMSDRM        OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(SDL3)
+  set(prospero_sdl3 SDL3::SDL3-static)
+elseif(NOT WIN32)
+  find_package(SDL3 3.4 REQUIRED CONFIG COMPONENTS SDL3-shared)
+  message(STATUS "SDL3: system ${SDL3_VERSION}")
+  set(prospero_sdl3 SDL3::SDL3)
 endif()
 
 set(IMGUI ${imgui_SOURCE_DIR})
@@ -105,7 +125,7 @@ target_compile_definitions(imgui PUBLIC
 target_compile_options(imgui PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions -fno-rtti -fno-threadsafe-statics>
 )
-target_link_libraries(imgui PUBLIC freetype)
+target_link_libraries(imgui PUBLIC ${prospero_freetype})
 if(WIN32)
   target_sources(imgui PRIVATE
     ${IMGUI}/backends/imgui_impl_win32.cpp
@@ -119,5 +139,5 @@ else()
     ${IMGUI}/backends/imgui_impl_sdl3.cpp
     ${IMGUI}/backends/imgui_impl_opengl3.cpp
   )
-  target_link_libraries(imgui PUBLIC SDL3::SDL3-static)
+  target_link_libraries(imgui PUBLIC ${prospero_sdl3})
 endif()
