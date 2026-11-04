@@ -618,6 +618,7 @@ struct WtSess {
 struct Prefill {
     i64 n;          // the last event's tokens processed, cached ones too
     i64 ms;         // and when, on the server's clock if it said, else ours
+    i64 n0, ms0;    // the first event's, from which the rate is taken
     b32 started;
     b32 server;     // ms is the server's time_ms
     i32 samples;
@@ -3052,6 +3053,10 @@ static i64 prefilleta(Prefill *p, PrefillLine *last, u64 key, i64 n, i64 total, 
         p->sxy = k*p->sxy + w*x*y;
         p->samples++;
     }
+    if (!p->started) {
+        p->n0  = n;
+        p->ms0 = ms;
+    }
     if (!p->started || batch) {
         p->n  = n;
         p->ms = ms;
@@ -3106,12 +3111,19 @@ static void emitprogress(Session *s, Arena scratch, Chunk *c)
     if (!p->started) {
         p->server = c->pms >= 0;
     }
-    i64 eta = -1;
+    i64 eta = -1, tps10 = 0;
     if (!p->server || c->pms>=0) {
         i64 ms    = p->server ? c->pms : os_ticks(s->e->os)/MS;
         Str model = s->purpose==REQ_COMPACT ? s->cp.model : s->model;
         u64 key   = (hash(reqep(s)->url)*3 ^ hash(model)) | 1;
         eta = prefilleta(p, prefillline(s->e, key), key, c->pdone, c->ptotal, ms);
+        // Tokens per second, tenths, as the output's (tps10): the tokens
+        // computed since the first event over the time since. llama.cpp's
+        // first comes as its slot starts, before any batch, with the
+        // cached tokens already counted, so neither the queue's wait nor
+        // the cache's hits count.
+        i64 dn = c->pdone - p->n0, dt = ms - p->ms0;
+        tps10 = dn>0 && dt>0 ? dn*10*1000/dt : 0;
     }
 
     Buf   b(&scratch, 256);
@@ -3122,6 +3134,10 @@ static void emitprogress(Session *s, Arena scratch, Chunk *c)
     putintkey(&w.json, "cached", c->pcached);
     if (eta >= 0) {
         putintkey(&w.json, "eta_ms", eta);  // left, as of this record
+    }
+    if (tps10) {
+        putkey(&w.json, "tps");
+        putfloat(&w.json, (f64)tps10 / 10);
     }
     ssend(s, &w);
 }

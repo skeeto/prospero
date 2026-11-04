@@ -460,6 +460,24 @@ def sc_pings(model, n, req):
     yield from finish(model)
 
 
+def sc_prefill_rate(model, n, req):
+    # Prompt processing at 2000 tok/s past 30000 cached tokens: first
+    # with the server's time_ms, which runs faster than the wall clock
+    # here, then (the second request) without it, at half a second a
+    # batch: 4000 tok/s.
+    yield S.head()
+    clock = n == 0
+    for i in range(5):
+        p = {"total": 40000, "cache": 30000, "processed": 30000 + 2000*i}
+        if clock:
+            p["time_ms"] = 1000*i
+        else:
+            yield S.sleep(0.5 if i else 0)
+        yield S.data({"choices": [], "prompt_progress": p})
+    yield from text(model, "Read at a known rate.")
+    yield from finish(model)
+
+
 def sc_stall_head(model, n, req):
     if n == 0:
         yield S.stall(30)

@@ -1676,6 +1676,7 @@ struct Gui {
     b32                ambershown;   // the strip went amber
     b32                retryshown;   // the strip counted down to a retry
     b32                etashown;     // and to the prompt's end
+    b32                prateshown;   // and gave its rate
     b32                bannershown;  // the read-only banner was drawn
     b32                roclock;      // a read-only view's turn had a clock
     b32                queuedshown;  // the strip showed the line's position
@@ -12759,7 +12760,7 @@ static Str chknames[] = {
     "a closed session opened, its log replayed",
     "a session held elsewhere opened read-only, with its banner",
     "amber after 15 s without data", "a retry's countdown shown",
-    "the prompt's time left shown", "a message's time shown under the mouse",
+    "the prompt's time left and rate shown", "a message's time shown under the mouse",
     "the fold rail folded its message, its header in view",
     "the fold rail opened the folded message again",
     "configuration diagnostics listed with file and line",
@@ -13678,12 +13679,15 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_BACKOFF, 0, 0, 15000, ""},
     {OP_CHECK, CHK_RETRYSHOWN, 0, 0, 0, ""},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
-    // A slow prompt's progress, with the time left
+    // A slow prompt's progress, with the time left and its rate, in a
+    // window wide enough for both (the rate gives way to the time left)
+    {OP_MAXIMIZE, 0, 1, 0, 1500, ""},
     {OP_PROMPT, 0, 0, 0, 100, "Read a long prompt."},
     {OP_WAIT, W_ETA, 0, 0, 10000, ""},
     {OP_CHECK, CHK_ETASHOWN, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "1-eta"},
     {OP_WAIT, W_IDLE, 0, 0, 20000, ""},
+    {OP_MAXIMIZE, 0, 0, 0, 1500, ""},
     // When that message was sent, shown under the mouse
     {OP_MOVE, T_USERMSG, 0, 0, 300, ""},
     {OP_CHECK, CHK_CLOCKSHOWN, 0, 0, 0, ""},
@@ -19683,7 +19687,7 @@ static b32 drivecheck(Gui *g, i32 chk)
     case CHK_RETRYSHOWN:
         return g->retryshown;
     case CHK_ETASHOWN:
-        return g->etashown;
+        return g->etashown && g->prateshown;
     case CHK_CLOCKSHOWN:
         return g->clockshown;
     case CHK_RAILFOLD:

@@ -593,6 +593,7 @@ struct View {
     i64             watchms;    // and waits this long in all
     i64             pdone;      // prompt processing, tokens of total
     i64             ptotal;
+    f64             ptps;       // and its rate, tokens per second
     i64             petaat;     //   and when it ends, as estimated, 0 if not
     i64             ctx;        // the context gauge: the model's window,
     i64             compactat;  //   where compaction begins,
@@ -3131,6 +3132,7 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
         v->lastdata = r->ts;
         v->pdone    = jsonint(jsonget(j, "done"), 0);
         v->ptotal   = jsonint(jsonget(j, "total"), 0);
+        v->ptps     = jsonfloat(jsonget(j, "tps"), 0);
         v->petaat   = eta->type==JSON_NUMBER ? r->ts + jsonint(eta, 0) : 0;
         return 1;
     }

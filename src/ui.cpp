@@ -5030,16 +5030,42 @@ static void drawstrip(Gui *g)
         // The engine's estimate, counted down between its records, and
         // left out near the end, where it matters little
         i64 left = v->petaat ? v->petaat - nowms : 0;
+        Str eta  = {};
         if (left >= ETA_MIN) {
-            g->etashown = 1;
             schedat(&g->sched, now + (left%1000)*1000 + 1000, DUE_CLOCK);
             i64 secs = (left + 999)/1000;
             Buf e(&a, 48);
             print(&e, "about ");
             printsecs(&e, secs<600 ? secs : (secs + 30)/60*60);
             print(&e, " left");
+            eta = finish(&e);
+        }
+        // Its rate, as the output's, tokens computed with the cache's
+        // left out: whole tokens, as it runs to thousands, and only where
+        // the time left still fits after it, which matters more
+        if (v->ptps > 0) {
+            Buf r(&a, 32);
+            printgrouped(&r, (i64)(v->ptps + 0.5));
+            print(&r, " tok/s");
+            Str   rate = finish(&r);
+            // The bar left the cursor on the next line, whose start plus
+            // its width is the right edge; the bar's end plus a spacing
+            // (rightof) is where the rate would start
+            f32    gap  = ImGui::GetStyle().ItemSpacing.x;
+            ImVec2 rs   = ImGui::CalcTextSize(rate.cdata, rate.cdata+rate.len);
+            ImVec2 es   = ImGui::CalcTextSize(eta.cdata, eta.cdata+eta.len);
+            f32    edge = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+            f32    room = edge - rightof();
+            if (rs.x + (eta.len ? gap + es.x : 0) <= room) {
+                g->prateshown = 1;
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", cstr0(&a, rate));
+            }
+        }
+        if (eta.len) {
+            g->etashown = 1;
             ImGui::SameLine();
-            ImGui::TextDisabled("%s", cstr0(&a, finish(&e)));
+            ImGui::TextDisabled("%s", cstr0(&a, eta));
         }
     }
     if (req && v->lastdata) {

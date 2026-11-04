@@ -866,6 +866,22 @@ def pings(t):
     t.check(r.text() == "Prefill finished.", f"text {r.text()!r}")
 
 
+@scenario(bound=20)
+def prefill_rate(t):
+    """Prompt processing's rate, as the output's: the tokens computed since
+    the first progress event, the cache's left out, over the server's
+    time_ms, or this side's clock where it gives none."""
+    for turn in range(2):
+        r = t.run()
+        t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+        got = [e.get("tps") for e in r.all("progress")]
+        t.check(len(got) == 5 and got[0] is None, f"no rate before a batch: {got}")
+        if turn == 0:
+            t.check(got[1:] == [2000.0]*4, f"the server's clock: {got}")
+        else:
+            t.check(all(x and 3000 <= x <= 4100 for x in got[1:]), f"this clock: {got}")
+
+
 @scenario(conf={"first_byte_timeout": 2}, bound=10)
 def stall_head(t):
     r = t.run()
