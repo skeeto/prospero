@@ -5936,17 +5936,18 @@ static void drawattached(Gui *g, GuiSession *s)
     }
 }
 
-// Whether the agent's questions wait for answers: a steer then waits
-// behind them, rather than answering them as it does other asks.
-static b32 questionwaits(View *v)
+// What waits for an answer: the agent's questions, another ask, or
+// nothing. A steer waits behind either, read with its outcome.
+enum : i32 { WAITS_NONE, WAITS_QUESTION, WAITS_ASK };
+static i32 askwaits(View *v)
 {
     for (iz i = v->msgs.len-1; v->asks && i >= 0; i--) {
         ViewMsg *m = &v->msgs[i];
         if (m->role==VIEW_ASK && m->tool->answer==VASK_PENDING) {
-            return m->tool->kind == "question";
+            return m->tool->kind=="question" ? WAITS_QUESTION : WAITS_ASK;
         }
     }
-    return 0;
+    return WAITS_NONE;
 }
 
 static void drawprompt(Gui *g)
@@ -6330,11 +6331,14 @@ static void drawprompt(Gui *g)
     ImGui::BeginDisabled(!can || editing);
     send |= ImGui::Button(v->busy ? ICON_REPLY "##send" : ICON_SEND "##send", v2(bw, 0));
     itemnamed(g, "send");
-    itemtip(!v->busy         ? "Send the prompt (Enter; Shift+Enter for a new line)"
-            : questionwaits(v) ? "Steer: send to the running turn, which the agent reads "
-                                 "with your answers to its questions (Enter)"
-                               : "Steer: send to the running turn, which the agent reads "
-                                 "at its next step (Enter)");
+    i32 waits = v->busy ? askwaits(v) : WAITS_NONE;
+    itemtip(!v->busy               ? "Send the prompt (Enter; Shift+Enter for a new line)"
+            : waits==WAITS_QUESTION ? "Steer: send to the running turn, which the agent reads "
+                                      "with your answers to its questions (Enter)"
+            : waits==WAITS_ASK      ? "Steer: send to the running turn, which the agent reads "
+                                      "once you answer what it asks (Enter)"
+                                    : "Steer: send to the running turn, which the agent reads "
+                                      "at its next step (Enter)");
     if (v->busy) {
         if (ImGui::Button(ICON_STOP "##stop", v2(bw, 0))) {
             guicancel(g, g->sess);

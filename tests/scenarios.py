@@ -3293,17 +3293,23 @@ def ask_touch(t):
 
 @scenario(bound=10)
 def ask_steer(t):
+    """A steer while an ask waits does not answer it: it waits, queued,
+    and the agent reads it after the user's answer, the denial first."""
     h = t.headless()
     try:
         sid, ask = asked(t, h)
         h.call("steer", sid=sid, text="no, put it in steered.txt")
+        time.sleep(1)
+        t.check(not h.all("answer", sid), f"still asking: {h.all('answer', sid)}")
+        q = h.all("queue", sid)
+        t.check(q and [i["kind"] for i in q[-1]["items"]] == ["steer"], f"queued: {q}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
         end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
         t.check(end["why"] == "done", f"the turn goes on: {end}")
         ans = h.all("answer", sid)[0]
-        t.check(ans["decision"] == "deny" and ans["by"] == "steer", f"answer {ans}")
+        t.check(ans["decision"] == "deny" and ans["by"] == "user", f"answer {ans}")
         deny = h.all("tool.end", sid)[0]
-        t.check(deny["status"] == "denied" and "sent a new message" in deny["text"],
-                f"why: {deny}")
+        t.check(deny["status"] == "denied", f"denied: {deny}")
         users = [e for e in h.all("user", sid) if e.get("via") == "steer"]
         t.check(users and users[0]["text"] == "no, put it in steered.txt", "the steer is logged")
         msgs = t.requests()[1]["body"]["messages"]
@@ -3913,27 +3919,28 @@ def deep_unicode(t):
 
 @scenario(bound=15)
 def steer_tool(t):
-    """A steer sent while a command runs answers an ask later in the same
-    step at once, by steer, rather than at its deadline."""
+    """A steer sent while a command runs does not answer an ask later in
+    the same step, which the user had not seen: the ask waits for its
+    answer, and the agent reads the steer after it."""
     h = t.headless()
     try:
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
         h.send("prompt", sid=sid, text="go")
         h.wait(lambda e: e.get("ev") == "tool.start" and e.get("sid") == sid)
-        t0 = time.monotonic()
         h.call("steer", sid=sid, text="no, put it in steered.txt")
         ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
-        t.check(ask["deadline"] - ask["ts"] < 100, f"no wait for an answer: {ask}")
+        t.check(ask["deadline"] - ask["ts"] > 1000, f"waits for an answer: {ask}")
+        time.sleep(1)
+        t.check(not h.all("answer", sid), f"still asking: {h.all('answer', sid)}")
+        h.call("answer", sid=sid, req=ask["req"], decision="allow")
         ans = h.wait(lambda e: e.get("ev") == "answer" and e.get("sid") == sid)
-        waited = time.monotonic() - t0
-        t.check(ans["by"] == "steer" and ans["decision"] == "deny", f"answer {ans}")
-        t.check(waited < 5, f"answered right after the command: {waited:.1f} s")
+        t.check(ans["by"] == "user" and ans["decision"] == "allow", f"answer {ans}")
         end = h.wait(lambda e: e.get("ev") == "turn.end" and e.get("sid") == sid)
         t.check(end["why"] == "done", f"the turn goes on: {end}")
         st = [e["status"] for e in h.all("tool.end", sid)]
-        t.check(st == ["ok", "denied", "ok"], f"statuses {st}")
+        t.check(st == ["ok", "ok", "ok"], f"statuses {st}")
         t.check(t.file("steered.txt") == "no, put it in steered.txt\n", "the steer is acted on")
-        t.check(outside_file(t) is None, "nothing written outside")
+        t.check(outside_file(t) == "outside\n", f"the allowed write: {outside_file(t)!r}")
     finally:
         rc = h.close()
     t.check(rc == 0, f"headless exit {rc}")
@@ -9303,7 +9310,8 @@ def plan_reopen(t):
 def plan_mode(t):
     """The mode command: on and off again before a prompt, which tells the
     agent nothing; on, then refused while the plan is asked about; a steer
-    instead of an answer keeps plan mode; off while idle, told."""
+    waits for the answer, keep planning, and is read after it; off while
+    idle, told."""
     h = t.headless()
     try:
         sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
@@ -9327,9 +9335,12 @@ def plan_mode(t):
         r = h.call("mode", sid=sid, mode="default")
         t.check(r.get("ok") == 0 and "answer" in r.get("err", ""), f"refused: {r}")
         h.call("steer", sid=sid, text="Stop.")
+        time.sleep(1)
+        t.check(not h.all("answer", sid), f"still asking: {h.all('answer', sid)}")
+        h.call("answer", sid=sid, req=ask["req"], decision="deny")
         ended(h, sid, 2)
         ans = h.all("answer", sid)[-1]
-        t.check(ans["by"] == "steer", f"answered by the steer: {ans}")
+        t.check(ans["by"] == "user", f"answered by the user: {ans}")
         t.check(lastsaid(h, sid) == "Stopped.", f"said {lastsaid(h, sid)}")
         t.check(modes(h, sid)[-1] == "plan/user", "still planning")
 

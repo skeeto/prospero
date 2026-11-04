@@ -27,9 +27,10 @@ seconds (30 by default). Its buttons:
 - **Deny**: the agent reads why, and tries something else.
 - **Deny with note...** denies, telling the agent what to do instead.
 
-Sending a message while an ask waits denies it, and the agent reads
-your message. The agent's questions are the exception: a message waits
-for your answers (see [Plan mode](help:plan)).
+A message you send while an ask waits does not answer it: it waits
+below the card, marked "Next step", and the agent reads it once you
+answer, along with the outcome. To refuse and say what to do instead,
+use **Deny with note...**. **Stop** ends the turn, ask and all.
 
 A write or edit of Prospero's own configuration (its file, and the
 local files it includes) asks every time, even inside the working

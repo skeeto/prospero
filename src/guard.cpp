@@ -512,7 +512,8 @@ enum : i32 {
     DENY_POLICY,   // unattended: nobody can answer
     DENY_USER,     // the user refused
     DENY_TIMEOUT,  // nobody answered in time
-    DENY_STEER,    // the user sent a message instead of answering
+    DENY_STEER,    // the user sent a message instead of answering (old logs:
+                   // a steer now waits behind an ask)
     DENY_CANCEL,   // the turn was cancelled while asking
     DENY_BYPASS,   // not denied: the user turned on Bypass mode
     DENY_SHARED,   // not denied: approved in another session, or apart

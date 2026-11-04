@@ -70,10 +70,10 @@
 // attended:1 on new or open (and close ends). Unattended, an ask is
 // denied at once by policy. Attended, the session logs an ask with a
 // deadline ([guard] ask_timeout, 30 s by default) and waits in its own state,
-// blocking nothing else: an answer resolves it, the deadline denies it,
-// and so does a steer, whose text the agent reads next (as does any ask
-// while a steer waits for the next step), though not the agent's
-// questions (ask_user), which a steer waits behind. Every denial is the
+// blocking nothing else: an answer resolves it, the deadline denies it.
+// A steer never answers one: it waits behind the ask, to be read at the
+// next step with the ask's outcome (the user may not have seen the ask
+// when writing it). Stop cancels the turn and its ask. Every denial is the
 // call's tool result, explaining what to do instead. A path's ask offers to
 // allow its directory for good ("always"), and a desktop ask its class
 // of actions, which the answer may take (see "Grants"). The log holds
@@ -5318,10 +5318,9 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
     k->hint.exists = h.exists;
     k->opened      = os_ticks(e->os);
 
-    // A steer waiting for the next step answers this ask too: the user
-    // has already said what to do instead
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
+    // A steer waiting for the next step waits behind this ask, as behind
+    // every ask: the user may not have seen it when writing the steer
+    b32 wait  = attending(s);
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait) {
         // The deadline runs from now: the record's fsync, which a slow
@@ -5355,7 +5354,7 @@ static b32 askcall(Session *s, Arena scratch, i32 tool, GuardPath *gp)
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -7386,8 +7385,7 @@ static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
         k->grant  = deskclassnames[cls];  // static
         k->gclass = cls;
     }
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
+    b32 wait  = attending(s);
     i64 delay = cfgms(e->cfg, "desktop", "", "ask_timeout", 0)*MS;
     if (wait) {
         askarm(s, delay);
@@ -7410,7 +7408,7 @@ static b32 deskcall(Session *s, Arena scratch, DeskArgs *d)
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -8031,8 +8029,7 @@ static b32 webcall(Session *s, Arena scratch, i32 tool, Args *args)
     k->tool   = tool;
     k->grant  = tool==TOOL_WEBSEARCH ? Str("search") : clone(&s->perm, host);
     k->opened = os_ticks(e->os);
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
+    b32 wait  = attending(s);
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait) {
         askarm(s, delay);
@@ -8064,7 +8061,7 @@ static b32 webcall(Session *s, Arena scratch, i32 tool, Args *args)
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -8812,8 +8809,7 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
     k->tool    = tool;
     k->opened  = os_ticks(e->os);
     k->plansum = hash(plan.text);  // to know a plan revised by hand
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
+    b32 wait  = attending(s);
     i64 delay = leave ? 0 : cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait && delay) {
         askarm(s, delay);
@@ -8838,7 +8834,7 @@ static b32 plancall(Session *s, Arena scratch, i32 tool)
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -9975,8 +9971,7 @@ static b32 mcpprojgate(Session *s, Arena scratch)
     k->project = 1;
     k->grant   = "project";
     k->opened  = os_ticks(e->os);
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
+    b32 wait  = attending(s);
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait) {
         askarm(s, delay);
@@ -10011,7 +10006,7 @@ static b32 mcpprojgate(Session *s, Arena scratch)
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -10125,8 +10120,7 @@ static b32 approvegate(Session *s, Arena scratch)
     k->tool    = TOOL_NONE;
     k->approve = 1;
     k->opened  = os_ticks(e->os);
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
+    b32 wait  = attending(s);
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait) {
         askarm(s, delay);
@@ -10173,7 +10167,7 @@ static b32 approvegate(Session *s, Arena scratch)
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return approvegate(s, scratch);  // ends the turn if its endpoint's
     }
     setstate(s, S_ASK);
@@ -10743,8 +10737,7 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
     k->trust  = d ? clone(&s->perm, t->server) : Str{};
     k->mcpurl = all.host.len ? clone(&s->perm, all.host) : Str{};
     k->opened = os_ticks(e->os);
-    b32 steer = s->steers.len > 0;
-    b32 wait  = attending(s) && !steer;
+    b32 wait  = attending(s);
     i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
     if (wait) {
         askarm(s, delay);
@@ -10769,7 +10762,7 @@ static b32 mcpcall(Session *s, Arena scratch, McpTool *t)
         ssend(s, &w);
     }
     if (!wait) {
-        resolve(s, scratch, 0, steer ? DENY_STEER : DENY_POLICY, {});
+        resolve(s, scratch, 0, DENY_POLICY, {});
         return 1;
     }
     setstate(s, S_ASK);
@@ -14543,8 +14536,7 @@ static b32 taskasks(Session *s, Arena scratch)
         q->tool   = TOOL_TASK;
         q->grant  = args.network ? Str{} : clone(&s->perm, args.image);
         q->opened = os_ticks(e->os);
-        b32 steer = s->steers.len > 0;
-        b32 wait  = attending(s) && !steer;
+        b32 wait  = attending(s);
         i64 delay = cfgms(e->cfg, "guard", "", "ask_timeout", 0)*MS;
         if (wait) {
             askarm(s, delay);
@@ -14582,7 +14574,7 @@ static b32 taskasks(Session *s, Arena scratch)
             setstate(s, S_ASK);
             return 0;
         }
-        resolve(s, a, 0, steer ? DENY_STEER : DENY_POLICY, {});  // recorded
+        resolve(s, a, 0, DENY_POLICY, {});  // recorded
     }
     return 1;
 }
@@ -20391,16 +20383,12 @@ static void command(Engine *e, Arena scratch, Str line)
             s->queued = push(&s->perm, s->queued, q);
             sendqueue(s, scratch);
         } else {
-            // Read at the next step; a pending ask yields to it, as do
-            // any more asks before then (askcall), except the agent's
-            // questions, which the steer waits behind (askusercall)
+            // Read at the next step, after any ask pending or made before
+            // then is answered: a steer never answers an ask, which the
+            // user may not have seen when writing it
             Queued q = {clone(&s->perm, text), ++s->queueid, imgs, at.files, at.sessions};
             s->steers = push(&s->perm, s->steers, q);
             sendqueue(s, scratch);
-            if (s->state==S_ASK && s->ask.tool!=TOOL_ASKUSER) {
-                resolve(s, scratch, 0, DENY_STEER, {});
-                nexttool(s, scratch);
-            }
         }
     } return;
     case CMD_UNQUEUE:
