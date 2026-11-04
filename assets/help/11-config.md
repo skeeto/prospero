@@ -17,7 +17,7 @@ there for the full list. Changes take effect while Prospero runs.
 The Settings pane ([View → Settings](view:settings), or Ctrl+, and
 Cmd+, on macOS) edits the file in place, a page for each section,
 changing only the lines it sets and keeping your comments. The model
-and shell lists above the transcript end with Endpoints and models...
+and shell lists on the Prompt's status line end with Endpoints and models...
 and Shells..., which show their pages. Its top line says which file it edits.
 [Diagnostics](settings:diagnostics), at the end of its list, shows each
 problem found in the files, with where it is; a bad value falls back to

@@ -2813,18 +2813,15 @@ static b32  planwaits(View *);
 static Str  modewhy(Gui *, GuiSession *, Str mode);
 
 // The session's model, a combo of those configured to switch to (model)
-// while idle, and what the latest switch's reply noted: the line's first
-// item, or after what is on it.
-static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v, b32 first)
+// while idle, and what the latest switch's reply noted. Like the shell's
+// and the mode's, it goes where the caller put the cursor.
+static void drawmodelpick(Gui *g, Arena a, GuiSession *s, View *v)
 {
     Str   why = g->enginekind==ENGINE_FAKE ? Str("No engine") :
                 sesswhy(g, s, "model", !planwaits(v), 0);
     Str   now = v->model.len ? v->model : s->model;
     if (now.len && hostcan(s->host, "models")) {
         now = modelshown(&a, s->host, v->endpoint, now);  // ENDPOINT/MODEL
-    }
-    if (!first) {
-        ImGui::SameLine();
     }
     // A button that looks the part, its list a popup: a combo's own
     // popup would begin inside the disabled block
@@ -2915,19 +2912,18 @@ static void shellitems(Gui *g, Arena a, GuiSession *s, b32 opened)
 }
 
 // The session's shell, a list of those its host has to switch to
-// (shell) while idle, on hosts whose engine can.
-static void drawshellpick(Gui *g, Arena a, GuiSession *s, View *v)
+// (shell) while idle, on hosts whose engine can: whether it drew.
+static b32 drawshellpick(Gui *g, Arena a, GuiSession *s, View *v)
 {
     if (!hostcap(s->host, "shell") || !v->shell.len) {
         if (g->pickshell == s) {
             setnote(g, s, "/shell: this host's engine is too old for it", 1);
             g->pickshell = 0;
         }
-        return;
+        return 0;
     }
     Str why = g->enginekind==ENGINE_FAKE ? Str("No engine") :
               sesswhy(g, s, "shell", !planwaits(v), 0);
-    ImGui::SameLine();
     Str label = concat(&a, shorten(&a, v->shell, 24),
                        "  \xe2\x96\xbe##shellpick");  // a small down triangle
     if (why.len) {
@@ -2954,6 +2950,7 @@ static void drawshellpick(Gui *g, Arena a, GuiSession *s, View *v)
         shellitems(g, a, s, opened);
         ImGui::EndPopup();
     }
+    return 1;
 }
 
 // The session's mode, Build, Plan or Bypass, a list of them like the
@@ -2983,7 +2980,6 @@ static void drawmodepick(Gui *g, Arena a, GuiSession *s, View *v)
     }
     why = any ? Str{} : why;
 
-    ImGui::SameLine();
     u32 color = cur==2 ? g->pal->bad : cur==1 ? g->pal->amber : ImGui::GetColorU32(ImGuiCol_Text);
     ImGui::PushStyleColor(ImGuiCol_Text, color);
     g->modetext = ImGui::GetColorU32(ImGuiCol_Text);  // for CHK_BYPASS
@@ -3037,12 +3033,13 @@ static void drawmodepick(Gui *g, Arena a, GuiSession *s, View *v)
 // there, cut in its middle to end by end (window x): dim, or amber while
 // a rebase, a merge or the like is under way, and a toggle of the
 // Changes pane. Nothing outside a repository, nor where its engine
-// can't tell, nor where too little of it would fit.
-static void drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end)
+// can't tell, nor where too little of it would fit: whether it drew.
+// With lead, it follows an item on the line, else it begins the line.
+static b32 drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end, b32 lead)
 {
     GitWatch *w = &s->git;
     if (w->state!=GITW_REPO || !hostcap(s->host, "git")) {
-        return;
+        return 0;
     }
     Str name = w->detached ? takehead(w->oid, 7) : w->branch;
     Buf op(a, 64 + w->op.len);
@@ -3061,19 +3058,21 @@ static void drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end)
     ImGuiStyle &st    = ImGui::GetStyle();
     f32         fixed = 2*st.FramePadding.x + ImGui::CalcTextSize(cstr0(a, glyph)).x +
                         ImGui::CalcTextSize(cstr0(a, tail)).x;
-    f32         room  = end - rightof() - fixed;
+    f32         room  = end - (lead ? rightof() : ImGui::GetCursorPosX()) - fixed;
     f32         least = ImGui::CalcTextSize("ab\xe2\x80\xa6yz").x;
     Measure     m     = {};
     m.advance = widgetadvance;
     Str shown = midcut(a, name, room, &m, 0);
     if (room<0 || (shown.len!=name.len && (room<least || !shown.len))) {
-        return;
+        return 0;
     }
     g->branchcut = shown.len != name.len;
     b32 open = g->changesshown;
     u32 col  = w->op.len ? g->pal->amber : ImGui::GetColorU32(ImGuiCol_TextDisabled);
     Str label = concat(a, concat(a, glyph, shown), concat(a, tail, "###gitbranch"));
-    ImGui::SameLine();
+    if (lead) {
+        ImGui::SameLine();
+    }
     ImGui::PushStyleColor(ImGuiCol_Text, col);
     ImGui::PushStyleColor(ImGuiCol_Button, open ? ImGui::GetColorU32(ImGuiCol_ButtonActive) : 0);
     b32 click = ImGui::SmallButton(cstr0(a, label));
@@ -3112,6 +3111,47 @@ static void drawbranch(Gui *g, Arena *a, GuiSession *s, f32 end)
     if (click) {
         setpane(g, PANE_CHANGES, !open);
     }
+    return 1;
+}
+
+// The session's mode, model and shell, as the Prompt's status line
+// begins, each followed on the line. A subagent's mode is its parent's,
+// unless that is not here: then a chip for Plan or Bypass, if either.
+// Its shell is its parent's too.
+static void drawsesspicks(Gui *g, Arena a, GuiSession *s, View *v)
+{
+    b32 picks = (!v->parent.len || v->remote) && hostcap(s->host, "plan");
+    if (picks) {
+        drawmodepick(g, a, s, v);
+        ImGui::SameLine();
+    } else if (v->plan) {
+        // A chip that shows the plan
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
+        if (ImGui::Button("Plan mode")) {
+            setpane(g, PANE_PLAN, 1);
+        }
+        ImGui::PopStyleColor();
+        itemnamed(g, "plan chip");
+        itemtip("The agent changes nothing but its plan until you approve "
+                "it. Click to see the plan.");
+        ImGui::SameLine();
+    } else if (v->bypass) {
+        // A warning that nothing is asked
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextUnformatted("Bypass");
+        ImGui::PopStyleColor();
+        itemnamed(g, "bypass chip");
+        itemtip("Bypass mode: the agent reads and writes outside its working "
+                "directory, and acts on the desktop, without asking you. "
+                "Change it in its session's mode list.");
+        ImGui::SameLine();
+    }
+    drawmodelpick(g, a, s, v);
+    ImGui::SameLine();
+    if ((!sessparent(s).len || sessside(s).len) && drawshellpick(g, a, s, v)) {
+        ImGui::SameLine();
+    }
 }
 
 // Where a subagent's or side chat's up arrow goes: its parent, or a side
@@ -3147,14 +3187,13 @@ static void goup(Gui *g, GuiSession *s)
 }
 
 // A line above the transcript: up to a subagent's parent, or a side
-// chat's original; the session's model, shell and mode; its branch,
-// context gauge, the toggles that open all its tool output and
-// reasoning, and its details in a popup.
+// chat's original; its branch, context gauge, the toggles that open all
+// its tool output and reasoning, and its details in a popup. Its model,
+// shell and mode are the Prompt's (drawsesspicks).
 static void drawsessbar(Gui *g)
 {
     GuiSession *s = g->sess;
     View       *v = g->view;
-    g->modelsshown = 0;
     if (!s || !s->view) {
         return;
     }
@@ -3165,7 +3204,8 @@ static void drawsessbar(Gui *g)
     char const *sl    = ICON_SHELL;      // Shell output
     char const *tl    = ICON_TOOLS;      // Tool output
     char const *rl    = ICON_LIGHTBULB;  // Reasoning
-    f32         rest  = (gw>0 ? gw + gap : 0) + 6*iconw() + 5*gap;
+    f32         rest  = (gw>0 ? gw + gap : 0) + 4*iconw() + 3*gap;
+    b32         lead  = 0;  // something on the line before the branch
     f32         right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rest;
     if (sessparent(s).len || sessside(s).len) {
         // Up to its parent, or a side chat's original, then what it is:
@@ -3206,81 +3246,24 @@ static void drawsessbar(Gui *g)
                 itemnamed(g, "reports in the background");
             }
         }
-        drawmodelpick(g, a, s, v, 0);
-        if (side) {
-            drawshellpick(g, a, s, v);
-        }
-    } else {
+        lead = 1;
+    } else if (v->role.len) {
         // Its title is the sidebar's selected row: only a role here
-        if (v->role.len) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("Role %s", cstr0(&a, shorten(&a, v->role, 40)));
-        }
-        drawmodelpick(g, a, s, v, !v->role.len);
-        drawshellpick(g, a, s, v);
-    }
-    // A subagent's mode is its parent's, unless that is not here
-    b32 picks = (!v->parent.len || v->remote) && hostcap(s->host, "plan");
-    if (picks) {
-        drawmodepick(g, a, s, v);
-    } else if (v->plan) {
-        // A chip that shows the plan
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->amber);
-        if (ImGui::SmallButton("Plan mode")) {
-            setpane(g, PANE_PLAN, 1);
-        }
-        ImGui::PopStyleColor();
-        itemnamed(g, "plan chip");
-        itemtip("The agent changes nothing but its plan until you approve "
-                              "it. Click to see the plan.");
-    } else if (v->bypass) {
-        // A warning that nothing is asked
-        ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
-        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
-        ImGui::TextUnformatted("Bypass");
-        ImGui::PopStyleColor();
-        itemnamed(g, "bypass chip");
-        itemtip("Bypass mode: the agent reads and writes outside its working "
-                              "directory, and acts on the desktop, without asking you. "
-                              "Change it in its session's mode list.");
+        ImGui::TextDisabled("Role %s", cstr0(&a, shorten(&a, v->role, 40)));
+        lead = 1;
     }
     // The branch in what room is left before them, else on the line
-    b32 fits = right > rightof();
-    drawbranch(g, &a, s, fits ? right - gap : right + rest);
-    if (fits) {
+    b32 fits = right > (lead ? rightof() : ImGui::GetCursorPosX());
+    lead |= drawbranch(g, &a, s, fits ? right - gap : right + rest, lead);
+    if (fits && lead) {
         ImGui::SameLine(right);
     } else if (right > ImGui::GetCursorPosX()) {
-        ImGui::SetCursorPosX(right);  // too narrow: a line of their own
+        ImGui::SetCursorPosX(right);  // too narrow, or alone: a line of their own
     }
     g->gaugeshown = 0;
     if (gw > 0) {
         drawgauge(g, v, gw);
-        ImGui::SameLine();
-    }
-    // Its terminal and its folder, as the Session menu opens them
-    {
-        Str why = termplan(g, &a, s).why;
-        ImGui::BeginDisabled(why.len > 0);
-        if (iconbutton(ICON_TERMINAL "##barterm")) {
-            termopen(g, a, s);
-        }
-        ImGui::EndDisabled();
-        itemnamed(g, "bar terminal");
-        whytip(why.len ? why : s->host->kind==GH_REMOTE
-                   ? Str("Open in terminal: a shell in its folder there, in a terminal here")
-                   : Str("Open in terminal: its shell in its folder"));
-        ImGui::SameLine();
-        Str wwhy = {};
-        Str cwd  = sesswork(s, &wwhy);
-        ImGui::BeginDisabled(wwhy.len > 0);
-        if (iconbutton(ICON_FOLDER "##barfolder")) {
-            workopen(g, a, cwd);
-        }
-        ImGui::EndDisabled();
-        itemnamed(g, "bar folder");
-        whytip(wwhy.len ? wwhy : concat(&a, "Open working folder: ", cwd));
         ImGui::SameLine();
     }
     if (iconbutton(sl, v->foldshell)) {
@@ -4967,6 +4950,10 @@ static void drawstrip(Gui *g)
     b32   req   = v->state==LIVE_DISCOVER || v->state==LIVE_WAITING ||
                   v->state==LIVE_STREAMING || v->state==LIVE_ERROR ||
                   v->state==LIVE_COMPACTING;
+    if (g->sess->view) {
+        drawsesspicks(g, a, g->sess, v);
+    }
+    ImGui::AlignTextToFramePadding();
     ImGui::PushStyleColor(ImGuiCol_Text, livecolor(g->pal, v->state));
     ImGui::TextUnformatted(cstr0(&a, livelabel(v, v->state)));
     ImGui::PopStyleColor();
@@ -5814,9 +5801,11 @@ static void drawprompt(Gui *g)
     g->mentionshown = 0;
     g->mentionrows  = 0;  // the picker's, as drawmention sets them
     g->mentiontag   = 0;
+    g->modelsshown  = 0;
     // mentionpath and mentionquery are not reset here: they are how the
     // next fill re-finds the pick among the rows it makes (below)
     drawstrip(g);
+    ImGui::Dummy(v2(0, 2*g->scale));  // its lists apart from the box below
 
     // A line for the editor at work, else the latest command's outcome,
     // where the transcript is not shown to have its toast (drawtoast)
@@ -6197,6 +6186,28 @@ static void drawprompt(Gui *g)
                      "to the next message; or type @ in the prompt to mention a "
                      "file (its text is attached too)")
                : Str("Attach an image (PNG, JPEG, GIF, WebP, BMP) to the next message"));
+    }
+    if (g->sess) {
+        // Its folder and its terminal, as the Session menu opens them
+        Str wwhy = {};
+        Str cwd  = sesswork(s, &wwhy);
+        ImGui::BeginDisabled(wwhy.len > 0);
+        if (ImGui::Button(ICON_FOLDER "##folder", v2(bw, 0))) {
+            workopen(g, a, cwd);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "prompt folder");
+        whytip(wwhy.len ? wwhy : concat(&a, "Open working folder: ", cwd));
+        Str why = termplan(g, &a, s).why;
+        ImGui::BeginDisabled(why.len > 0);
+        if (ImGui::Button(ICON_TERMINAL "##terminal", v2(bw, 0))) {
+            termopen(g, a, s);
+        }
+        ImGui::EndDisabled();
+        itemnamed(g, "prompt terminal");
+        whytip(why.len ? why : s->host->kind==GH_REMOTE
+                   ? Str("Open in terminal: a shell in its folder there, in a terminal here")
+                   : Str("Open in terminal: its shell in its folder"));
     }
     if (s->hist) {
         // Which of the session's messages the box holds: oldest is 1

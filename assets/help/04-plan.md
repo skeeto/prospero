@@ -2,8 +2,8 @@
 
 In Plan mode the agent explores and writes a plan before it changes
 anything, and you approve it first. Turn it on with the New session
-dialog's Plan mode box, with Plan in the mode list above the
-transcript, or with
+dialog's Plan mode box, with Plan in the mode list on the Prompt's
+status line, or with
 `/plan` (`/plan off` turns it off). The agent may also ask to plan
 first: Plan first agrees, and Go ahead without lets it work as before.
 In Bypass mode it cannot: the agent is told to go on instead, so it
@@ -23,8 +23,9 @@ told of the change at its next step. Subagents running then follow.
 - The desktop tool may only look.
 - Subagents plan too.
 
-The session bar shows an amber Plan mode button, which opens the Plan
-pane.
+The mode list shows Plan in amber, and lists Show the plan, which opens
+the Plan pane. A subagent's mode is its parent's: its Prompt shows an
+amber Plan mode button instead, which opens the Plan pane.
 
 ## Approving
 
@@ -41,7 +42,7 @@ shows it:
   this computer.
 
 A plan approval has no countdown: it waits for you. The model may be
-switched from the session bar while it waits.
+switched from the Prompt's status line while it waits.
 
 ## Questions from the agent
 

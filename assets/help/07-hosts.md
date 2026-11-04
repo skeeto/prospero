@@ -151,7 +151,7 @@ responses back. The Hosts pane says so under the remote, and the model
 picker of its sessions lists this computer's models. Each request
 travels as its difference from the session's last one, compressed.
 
-While a call runs this way, the session bar says "via this computer",
+While a call runs this way, the Prompt's status line says "via this computer",
 or the name of the computer relaying it. With no computer connected
 that offers the session's endpoint, its turn pauses ("paused: no relay",
 in amber) and goes on once one connects, for at most that endpoint's

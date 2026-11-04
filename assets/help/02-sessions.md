@@ -54,9 +54,11 @@ tags show as text. The agent gets exactly what you typed. With the
 mouse over a message, its header shows when it was sent, or when the
 agent finished it, in local time, with the date if not today. The buttons
 beside the prompt box are icons,
-named in their tooltips: Send (a paper plane), and Attach (a paper
-clip). While the agent works, Send becomes Steer (a curved arrow), and
-Stop (a square) shows below it. What you send while it works waits at
+named in their tooltips: Send (a paper plane), Attach (a paper clip),
+Open working folder (a folder) and Open in terminal. While the agent
+works, Send becomes Steer (a curved arrow), and Stop (a square) shows
+below it. The status line above the box begins with the session's
+mode, model and shell, each a list to switch it. What you send while it works waits at
 the end of the transcript, dimmed and marked "Next step", until the
 agent reads it at its next step (or marked "Queued", for a turn of its
 own, as it is when sent too late for this turn), and its Withdraw
@@ -123,8 +125,8 @@ anything else for a few seconds.
 
 ## Modes
 
-The mode list above the transcript, beside the model and the shell,
-has three modes:
+The mode list on the Prompt's status line, beside the model and the
+shell, has three modes:
 
 - **Build**: the agent works on the task, changing files as it goes.
 - **Plan**: the agent explores and writes a plan for you to approve
@@ -200,10 +202,10 @@ Right-click a session in the sidebar, or open the Session menu, for:
   **Delete...**.
 - **Copy session ID**.
 - **Open working folder**: the folder the session works in, in Finder
-  or Explorer, as the folder button above the transcript opens it. **Open session records**: its folder in the state
+  or Explorer, as the folder button beside the prompt box opens it. **Open session records**: its folder in the state
   directory, with its log, plan and command output.
 - **Open in terminal**: a terminal window in the folder the session
-  works in, as the terminal button above the transcript and the Info
+  works in, as the terminal button beside the prompt box and the Info
   popup's open one, running the
   session's shell (a POSIX sh as a login shell), or where that is
   `/bin/sh` or bash on Linux and macOS, the terminal's own. Its
