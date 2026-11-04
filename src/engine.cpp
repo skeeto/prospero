@@ -2408,7 +2408,7 @@ static void proceed(Session *s, Arena scratch)
     if (s->purpose==REQ_CHAT && s->mc.ctx) {
         i64 at = compactat(s->mc.ctx);
         if (estimate(s) >= at) {
-            compact(s, scratch, at, at*4/5, CW_THRESHOLD);
+            compact(s, scratch, at*COMPACT_PRUNETO/100, at*4/5, CW_THRESHOLD);
             return;
         }
     }
@@ -12326,8 +12326,9 @@ static void compactor(Session *s, Arena scratch, Compact *cp)
 }
 
 // Make room in the context: prune old tool outputs, and if the prompt
-// is still not under enough tokens, summarize the older messages so
-// that it comes to goal. The step goes on (proceed) once there is room,
+// is still not under enough tokens (at a threshold, well under it, so
+// that the room lasts), summarize the older messages so that it comes
+// to goal. The step goes on (proceed) once there is room,
 // or else the turn ends saying why. A compaction the user asked for
 // summarizes, without pruning first.
 static void compact(Session *s, Arena scratch, i64 enough, i64 goal, i32 why)

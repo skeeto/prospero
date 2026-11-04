@@ -1323,6 +1323,19 @@ def sc_compact_prune(model, n, req):
         yield from real_answer(model, req, "Pruned and done.")
 
 
+def sc_compact_prune_short(model, n, req):
+    # Big writes, whose arguments a prune cannot touch, then small reads
+    # until the threshold, where a prune saves enough to count but leaves
+    # little room
+    if n < 4:
+        yield from real_tool(model, req, n, "write",
+                             {"path": f"w{n}.txt", "content": f"w{n} " * 28000})
+    elif n < 64:
+        yield from real_tool(model, req, n, "read", {"path": f"f{n-4}.txt"})
+    else:
+        yield from real_answer(model, req, "Read them all.")
+
+
 def sc_overflow_compact(model, n, req):
     # Rejected as too long once, after some reads
     if n < 4:

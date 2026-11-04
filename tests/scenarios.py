@@ -4240,6 +4240,26 @@ def compact_guard(t):
     t.check(not any(checkpointed(chat(x)) for x in reqs), "no request after it")
 
 
+@scenario(conf={"_listing": {"meta": {"n_ctx": 200000, "n_ctx_train": 262144}}},
+          bound=30, alone=True)
+def compact_prune_short(t):
+    """A prune that saves enough to count, but leaves the prompt well past
+    70% of the threshold, as when calls' arguments fill the context:
+    the summary follows it at once, rather than the next prune coming
+    soon and doing less."""
+    bigfiles(t, 60, 128)
+    r = t.run()
+    t.check(r.rc == 0, f"exit {r.rc}: {r.stderr}")
+    cps = [(c["kind"], c["before"], c["after"]) for c in r.all("compact")]
+    t.check(cps and cps[0][0] == "prune" and cps[0][2] > 119000,
+            f"a prune that leaves little room: {cps}")
+    t.check(len(cps) >= 2 and cps[1][0] == "summary" and cps[1][2] <= 136000,
+            f"then a summary: {cps}")
+    t.check(len(t.compactions()) == len([c for c in cps if c[0] == "summary"]),
+            f"summarized: {len(t.compactions())}")
+    t.check(r.text().endswith("Read them all."), f"text {r.text()!r}")
+
+
 @scenario(conf={"_listing": {"meta": {"n_ctx": 100000, "n_ctx_train": 262144}}},
           bound=20, alone=True)
 def compact_prune(t):

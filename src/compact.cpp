@@ -9,7 +9,11 @@
 // 1. Prune: tool results past the newest 40k tokens of tool output are
 //    replaced by a line saying where the full output is, if that saves
 //    20k tokens or more, but never a result under 50 tokens. No model
-//    is involved, and often this is enough.
+//    is involved. It is enough only if it leaves the prompt at 70% of
+//    the threshold or less (COMPACT_PRUNETO): a prune that leaves less
+//    room is followed by a summary, else a long turn whose context is
+//    mostly reasoning and calls' arguments, which pruning cannot touch,
+//    prunes a little less each time and never summarizes.
 // 2. Summarize: the older messages go to the compactor, a model asked
 //    for text only, which writes a summary in fixed sections; a later
 //    compaction updates the previous summary. The newest 20k tokens
@@ -30,6 +34,8 @@ enum : i64 {
     COMPACT_PROTECT  = 40000,     // newest tool output never pruned
     COMPACT_MINSAVE  = 20000,     // tokens a prune must save
     COMPACT_MINPRUNE = 50,        // smaller results are never pruned
+    COMPACT_PRUNETO  = 70,        // percent of the threshold a prune must
+                                  // reach to be enough
     COMPACT_SUMMAX   = 16384,     // tokens of a summary, at most
     COMPACT_FILES    = 40,        // files listed of each kind
     COMPACT_TOOLIN   = 3 << 10,   // bytes of a tool result summarized
