@@ -155,6 +155,11 @@ static void test_compact(Test *t)
         iz  at      = find(focused, "<focus>\nthe parser's API\n</focus>\n");
         expect(t, "summary focus", istr(a, at>0 && at<find(focused, "<conversation>")), "1");
         expect(t, "summary focus asks", istr(a, find(focused, "more detail about") > 0), "1");
+        // and again after it, last, where a long conversation can't bury it
+        expect(t, "summary focus restated",
+               istr(a, endswith(focused, "</conversation>\n\nWrite the summary now, "
+                    "keeping more detail about the user's focus:\n\n"
+                    "<focus>\nthe parser's API\n</focus>\n")), "1");
         Str an = ansummary(a, tmp, &mc, {}, "[user]\nhi\n\n", 300, "the parser's API");
         expect(t, "summary focus anthropic", istr(a, find(an, "\\u003cfocus>") > 0 ||
                find(an, "<focus>") > 0), "1");

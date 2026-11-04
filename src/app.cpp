@@ -12581,7 +12581,8 @@ enum : i32 {
     CHK_TITLE,        // the session's title is text
     CHK_LASTUSER,     // its latest user message is text
     CHK_MODELS,
-    CHK_COMPACTED,
+    CHK_COMPACTED,    // a compaction card, focused on text when given
+    CHK_WRAPBLANK,    // the font's word wrap breaks ASCII at blanks only
     CHK_ORPHAN,    // the session shown names a parent that is gone: a root
     CHK_SIDE,
     CHK_NOSIDE,
@@ -12887,7 +12888,8 @@ static Str chknames[] = {
     "the session's title is as renamed",
     "the text went out as a message, not a command",
     "/model lists the configured models",
-    "/compact compacted the conversation",
+    "/compact compacted the conversation, its focus on the card",
+    "word wrap breaks only at the blank",
     "a subagent whose parent is gone is a root, to trash",
     "the sidebar shows it",
     "the sidebar does not show it",
@@ -17531,7 +17533,8 @@ static DriveOp composeops[] = {
     {OP_TEXT, 0, 0, 0, 200, "/compact keep the API"},
     KEY(GKEY_ENTER, 0, 300),
     {OP_WAIT, W_COMPACTED, 0, 0, 20000, ""},
-    {OP_CHECK, CHK_COMPACTED, 0, 0, 0, ""},
+    {OP_CHECK, CHK_COMPACTED, 0, 0, 0, "keep the API"},
+    {OP_CHECK, CHK_WRAPBLANK, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "compose-compacted"},
     // Quitting keeps a draft typed just before
     CLICK(T_PROMPT, "", 200),
@@ -19342,8 +19345,35 @@ static b32 drivecheck(Gui *g, i32 chk)
         return !g->edsess && !g->edproc;
     case CHK_MODELS:
         return g->modelsshown;
-    case CHK_COMPACTED:
-        return lastof(v, VIEW_COMPACT) != 0;
+    case CHK_COMPACTED: {
+        // The card, and the focus asked for on it, in full in its body
+        Arena    a     = g->frame;
+        ViewMsg *m     = lastof(v, VIEW_COMPACT);
+        Str      focus = g->ops[g->drivepc-1].text;
+        b32      ok    = m && (!focus.len || (m->card->focus==focus &&
+                                startswith(m->text, concat(&a, "**Focus:** ", focus))));
+        if (m && !ok) {
+            guilog(g, concat(&a, "drive: the compaction card's focus: ", m->card->focus));
+        }
+        return ok;
+    }
+    case CHK_WRAPBLANK: {
+        // Too narrow for the whole: the break comes at the blank, never
+        // after the quote, comma or period that follow (FetchGui.cmake)
+        Str         t  = "one \"two\"three,four.five";
+        ImFont     *f  = ImGui::GetFont();
+        f32         fs = ImGui::GetFontSize();
+        f32         w  = f->CalcTextSizeA(fs, FLT_MAX, 0, t.cdata, t.cdata+t.len-2).x;
+        iz          at = f->CalcWordWrapPosition(fs, t.cdata, t.cdata+t.len, w) - t.cdata;
+        if (at > 4) {
+            Arena a = g->frame;
+            Buf   b(&a, 64);
+            print(&b, "drive: word wrap broke at byte ");
+            print(&b, (i64)at);
+            guilog(g, finish(&b));
+        }
+        return at <= 4;
+    }
     case CHK_ORPHAN: {
         GuiSession *s = g->sess;
         return s && s->view && s->view->parent.len && !sessparent(s).len &&

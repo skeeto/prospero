@@ -332,6 +332,7 @@ struct ViewCard {
     i64  before;     // tokens, estimated
     i64  after;
     Str  model;      // the summary's
+    Str  focus;      // what a /compact asked it to keep, one line
     i64  ms;
     i32  count;      // messages summarized, outputs elided, files rewound
     i32  conflicts;  // files a rewind left alone
@@ -2681,6 +2682,18 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
             }
             v->cutseq = cut>v->cutseq ? cut : v->cutseq;
             text = jsonstr(jsonget(j, "summary"));
+            // A /compact's focus heads the card and its body, so what was
+            // asked stays visible beside what came of it
+            Str focus = trim(jsonstr(jsonget(j, "focus")));
+            if (focus.len) {
+                c->focus = oneline(&v->aux, focus);
+                Buf b(&scratch, focus.len + text.len + 64);
+                print(&b, "**Focus:** ");
+                print(&b, focus);
+                print(&b, "\n\n");
+                print(&b, text);
+                text = finish(&b);
+            }
         } else {
             Buf b(&scratch, 1024);
             for (Json *e = jsonget(j, "elided")->child; e; e = e->next) {

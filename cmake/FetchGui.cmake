@@ -110,10 +110,33 @@ elseif(NOT WIN32)
 endif()
 
 set(IMGUI ${imgui_SOURCE_DIR})
+
+# Word wrap breaks ASCII text only at blanks. Dear ImGui also breaks
+# after .,;!?" when a letter follows, which splits quoted words, paths
+# and URLs in the compose box. Its classifier tables are static, so the
+# build compiles a copy of imgui_draw.cpp without that line, made at
+# configure time from whichever source is in use, fetched or deps/.
+# CJK's 、 and 。 stay breakable.
+set(imgui_wrap_from
+  "ImTextClassifierSetCharClassFromStr(g_CharClassifierIsSeparator_0000_007f, 0, 128, ImWcharClass_Punct, \".,;!?\\\"\");")
+file(READ ${IMGUI}/imgui_draw.cpp imgui_draw_text)
+string(FIND "${imgui_draw_text}" "${imgui_wrap_from}" imgui_wrap_at)
+if(imgui_wrap_at LESS 0)
+  message(FATAL_ERROR "imgui_draw.cpp: the ASCII word-wrap punctuation line "
+                      "has changed; update the patch in FetchGui.cmake")
+endif()
+string(REPLACE "${imgui_wrap_from}" "// prospero: ASCII breaks at blanks only"
+       imgui_draw_text "${imgui_draw_text}")
+set(imgui_draw_patched ${CMAKE_CURRENT_BINARY_DIR}/imgui-patched/imgui_draw.cpp)
+file(WRITE ${imgui_draw_patched}.new "${imgui_draw_text}")
+file(COPY_FILE ${imgui_draw_patched}.new ${imgui_draw_patched} ONLY_IF_DIFFERENT)
+file(REMOVE ${imgui_draw_patched}.new)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${IMGUI}/imgui_draw.cpp)
+
 add_library(imgui STATIC
   ${IMGUI}/imgui.cpp
   ${IMGUI}/imgui_demo.cpp
-  ${IMGUI}/imgui_draw.cpp
+  ${imgui_draw_patched}
   ${IMGUI}/imgui_tables.cpp
   ${IMGUI}/imgui_widgets.cpp
   ${IMGUI}/misc/freetype/imgui_freetype.cpp

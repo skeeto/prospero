@@ -338,6 +338,14 @@ static Str summaryprompt(Arena *a, Str prev, Str convo, i64 words, Str focus)
     print(&u, "\n<conversation>\n");
     print(&u, convo);
     print(&u, "</conversation>\n");
+    if (focus.len) {
+        // Restated last: after a long conversation, what came first is
+        // what a model most easily loses
+        print(&u, "\nWrite the summary now, keeping more detail about the "
+                  "user's focus:\n\n<focus>\n");
+        print(&u, focus);
+        print(&u, "\n</focus>\n");
+    }
     return finish(&u);
 }
 

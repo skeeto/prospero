@@ -1225,6 +1225,11 @@ static void drawheader(Gui *g, Pen *p, View *v, ViewMsg *m, i64 nowms)
             print(&b, ", as the server found it too long");
         } else if (c->why == "manual") {
             print(&b, ", as asked");
+            if (c->focus.len) {
+                print(&b, ", focused on \xe2\x80\x9c");
+                print(&b, shorten(&a, c->focus, 60));
+                print(&b, "\xe2\x80\x9d");
+            }
         }
         pen(p, finish(&b), 0, dim);
     } break;
