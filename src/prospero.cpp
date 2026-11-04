@@ -595,7 +595,10 @@ static void    os_guiplace(Os *, WinGeom);
 // The path chosen, or an empty one if cancelled, comes to the mailbox
 // as a record of the type with id, posted from whatever thread has the
 // answer. The dialog has the title, and suggests the file name. Returns
-// 0 if no dialog can be shown, when nothing is posted.
+// 0 if no dialog can be shown, when nothing is posted. A dialog that
+// turns out not to be shown after all, as on Linux with no desktop
+// portal, answers with a lone NUL byte, which no path can be; the open
+// dialogs below too.
 static b32     os_guisave(Os *, Arena scratch, Str title, Str name, Mailbox *,
                           u32 type, u64 id);
 // (M9) Ask which file to open, of a kind (OPEN_*), likewise: the path

@@ -1000,6 +1000,24 @@ enum : i32 {
     EXP_ASKING,   // the dialog is up
 };
 
+// A file dialog asked for (askpath), kept in case the platform has none
+// to show, as Linux without a desktop portal or zenity has not: a field
+// of this window asks instead, its answer posted as the dialog's would be.
+enum : i32 {
+    ASK_SAVE,
+    ASK_OPEN,
+};
+struct PathAsk {
+    i32   kind;              // ASK_*
+    u32   type;              // the record the answer comes as (TASK_*)
+    u64   id;
+    Str   title;             // the dialog's, a literal
+    b32   open;              // the field's popup to open
+    b32   shown;             // and drawn, last frame
+    char  buf[FIELD_MAX];    // the field, from where the dialog would start
+    Str   err;               // why the path typed was not taken
+};
+
 struct Export {
     GuiSession *s;
     i32         kind;     // EXPORT_*
@@ -1276,6 +1294,8 @@ struct Gui {
     Mailbox           *tasks;      // the dialogs' and deployments' outcomes
     Export             exp;
     Import             imp;
+    PathAsk            pask;       // the latest file dialog asked for
+    b32                nodialog;   // the checklist's: the next one fails
     b32                openexport; // the Markdown export's options
     GuiSession        *exportsess;
     char              *modelbuf;   // the model picker's own name
@@ -4887,6 +4907,38 @@ static void onattach(Gui *g, GuiSession *s, EvRec *r)
 // Ask for a file to attach (TASK_ATTACH): text, or an image. One
 // dialog at a time, which may be slow to come up, its answer for the
 // session that asked, whichever is shown by then.
+static void fieldput(char *, Str);
+
+// Keep a file dialog's ask (ASK_*), its answer the record type with id,
+// for the field that asks instead where no dialog can be shown: whether
+// the platform says so at once (pathfallback) or later (ontask). That
+// field starts with at. The checklist's OP_NODIALOG makes this ask one
+// the platform could not show, later, as SDL says it without a portal;
+// 1 if so, and the platform is then not asked.
+static b32 pathkeep(Gui *g, i32 kind, Str title, Str at, u32 type, u64 id)
+{
+    PathAsk *p = &g->pask;
+    p->kind  = kind;
+    p->type  = type;
+    p->id    = id;
+    p->title = title;
+    p->open  = 0;
+    fieldput(p->buf, at);
+    if (g->nodialog) {
+        g->nodialog = 0;
+        mailpost(g->tasks, type, id, Str("\0"), 1);
+        return 1;
+    }
+    return 0;
+}
+
+// No dialog for the ask kept: the field asks instead.
+static void pathfallback(Gui *g)
+{
+    g->pask.open = 1;
+    scheddirty(&g->sched);
+}
+
 static void attachpick(Gui *g, GuiSession *s)
 {
     if (g->attpend) {
@@ -4894,10 +4946,13 @@ static void attachpick(Gui *g, GuiSession *s)
     }
     g->attask++;
     g->attsess = s;
-    g->attpend = os_guiopenfile(g->os, g->frame, "Attach a file", OPEN_ATTACH, g->tasks,
+    Str title  = "Attach a file";
+    g->attpend = pathkeep(g, ASK_OPEN, title, "~/", TASK_ATTACH, g->attask) ||
+                 os_guiopenfile(g->os, g->frame, title, OPEN_ATTACH, g->tasks,
                                 TASK_ATTACH, g->attask);
     if (!g->attpend) {
-        setnote(g, s, "cannot ask for a file here", 1);
+        g->attpend = 1;
+        pathfallback(g);
     }
 }
 
@@ -4930,7 +4985,7 @@ static void browsestart(Gui *g, GuiHost *h)
     at = at.len && os_stat(g->os, a, at).type==STAT_DIR ? at : Str{};
     if (!os_guiopendir(g->os, a, "Choose the working directory", at, g->tasks,
                        TASK_BROWSED, g->browseask)) {
-        g->newerr = "cannot ask for a directory here";
+        g->newerr = "No folder dialog can be shown here: type the folder's path";
     }
 }
 
@@ -8417,7 +8472,7 @@ static void exportready(Gui *g)
         return;
     }
     Str name = exportname(&a, x->s, x->kind==EXPORT_MD ? Str(".md") : Str(".jsonl"));
-    if (g->drive) {
+    if (g->drive && !g->nodialog) {
         Str path = join(&a, g->drivecwd, name);
         exportwrite(g, a, path);
         return;
@@ -8425,8 +8480,10 @@ static void exportready(Gui *g)
     x->state = EXP_ASKING;
     x->ask++;
     Str title = x->kind==EXPORT_MD ? Str("Export as Markdown") : Str("Export the raw log");
-    if (!os_guisave(g->os, a, title, name, g->tasks, TASK_SAVED, x->ask)) {
-        exportfail(g, "cannot ask where to save it here");
+    Str at    = g->drive ? join(&a, g->drivecwd, name) : concat(&a, "~/", name);
+    if (!pathkeep(g, ASK_SAVE, title, at, TASK_SAVED, x->ask) &&
+            !os_guisave(g->os, a, title, name, g->tasks, TASK_SAVED, x->ask)) {
+        pathfallback(g);
     }
 }
 
@@ -8598,11 +8655,13 @@ static void importstart(Gui *g, GuiHost *h)
     x->status  = {};
     x->state   = IMP_ASKING;
     x->ask++;
+    Str title = "Import a session's raw log";
     if (g->drive) {
         mailpost(g->tasks, TASK_OPENED, x->ask, g->exp.saved, 1);
-    } else if (!os_guiopenfile(g->os, g->frame, "Import a session's raw log", OPEN_LOG,
+    } else if (!pathkeep(g, ASK_OPEN, title, "~/", TASK_OPENED, x->ask) &&
+               !os_guiopenfile(g->os, g->frame, title, OPEN_LOG,
                                g->tasks, TASK_OPENED, x->ask)) {
-        importfail(g, "cannot ask for a file here");
+        pathfallback(g);
     }
 }
 
@@ -8831,6 +8890,27 @@ static void ctrnoted(Gui *, Record);
 static void ontask(Gui *g, Record r)
 {
     Export *x = &g->exp;
+    b32     nodialog = r.data.len==1 && !r.data[0];  // the platform had none to show
+    switch (r.type) {
+    case TASK_SAVED:
+    case TASK_OPENED:
+    case TASK_ATTACH:
+        if (nodialog) {
+            if (r.type==g->pask.type && r.id==g->pask.id) {
+                pathfallback(g);  // its answer comes later, as this type
+            }
+            return;
+        }
+        break;
+    case TASK_BROWSED:
+        if (nodialog) {
+            if (r.id == g->browseask) {
+                g->newerr = "No folder dialog can be shown here: type the folder's path";
+            }
+            return;
+        }
+        break;
+    }
     switch (r.type) {
     case TASK_SAVED:
         if (x->state==EXP_ASKING && r.id==x->ask) {
@@ -12205,6 +12285,7 @@ enum : i32 {
                   // not walked, as a tree too big for one frame is not, so
                   // the picker lists a folder; dx 0 lets the walk go on
     OP_MENTIONS,  // dx 0 as [ui] mentions = false would, dx 1 as true
+    OP_NODIALOG,  // the next file dialog cannot be shown, as without a portal
 };
 // OP_TEXTCWD with text types the --cwd directory and text after it, on
 // Windows with backslashes, as a Windows user types a path.
@@ -12508,6 +12589,7 @@ enum : i32 {
     CHK_NOINI,        // the layout file lacks text
     CHK_MODEL,
     CHK_EXPORTED,
+    CHK_PATHASK,      // the path box asks, its field ending with text
     CHK_LASTERR,
     CHK_HOSTTRIED,
     CHK_FORKED,
@@ -12813,6 +12895,7 @@ static Str chknames[] = {
     "the layout file no longer has it",
     "the session switched model",
     "the export was written with what it should hold",
+    "a field asks for the path, where the dialog would start",
     "the error says why",
     "the remote's heading connected, or tried",
     "the fork is shown, its draft the prompt that came next",
@@ -17031,6 +17114,26 @@ static DriveOp composeops[] = {
     {OP_UP, 0, 0, 0, 500, ""},
     {OP_WAIT, W_FILE, 0, 0, 5000, "Session-A.md"},
     {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Session-A.md|# Session A\n"},
+    // Where no file dialog can be shown after all, as without a desktop
+    // portal, a field asks instead, starting where the dialog would
+    {OP_NODIALOG, 0, 0, 0, 0, ""},
+    CLICK(T_PROMPT, "", 200),
+    SELALL,
+    {OP_TEXT, 0, 0, 0, 200, "/export"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "export save"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_CHECK, CHK_PATHASK, 0, 0, 0, "Session-A.md"},
+    // A dot file, which the '@' picker below leaves out
+    SELALL,
+    {OP_TEXTCWD, 0, 0, 0, 300, "/.typed.md"},
+    {OP_SHOT, 0, 0, 0, 300, "compose-pathask"},
+    KEY(GKEY_ENTER, 0, 500),
+    {OP_WAIT, W_FILE, 0, 0, 5000, ".typed.md"},
+    {OP_CHECK, CHK_EXPORTED, 0, 0, 0, ".typed.md|# Session A\n"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     CLICK(T_PROMPT, "", 200),
     // B: a draft of its own. Leaving each keeps its draft at once, and
@@ -19282,6 +19385,10 @@ static b32 drivecheck(Gui *g, i32 chk)
         }
         return ok;
     }
+    case CHK_PATHASK: {
+        Str t = {(u8 *)g->pask.buf, (iz)__builtin_strlen(g->pask.buf)};
+        return g->pask.shown && endswith(t, g->ops[g->drivepc-1].text);
+    }
     case CHK_HOSTTRIED: {
         GuiHost *h = findhost(g, GH_REMOTE, g->ops[g->drivepc-1].text);
         return h && (h->r || h->state==RS_FAILED || h->opens || h->downs);
@@ -21366,6 +21473,9 @@ static void drivestep(Gui *g)
     } break;
     case OP_MARKSESS:
         g->drivesess = g->sess;
+        break;
+    case OP_NODIALOG:
+        g->nodialog = 1;
         break;
     case OP_PLACE:
         if (op->dx != 0) {

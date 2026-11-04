@@ -1517,10 +1517,12 @@ static void SDLCALL savedone(void *ud, char const * const *files, int)
 {
     SdlSave *s    = (SdlSave *)ud;
     Str      path = {};
-    if (files && files[0]) {
+    if (!files) {
+        path = Str("\0");  // no dialog after all: no desktop portal, nor zenity
+    } else if (files[0]) {
         path = {(u8 *)files[0], (iz)SDL_strlen(files[0])};
     }
-    mailpost(s->mb, s->type, s->id, path, 1);  // empty: cancelled, or failed
+    mailpost(s->mb, s->type, s->id, path, 1);  // empty: cancelled
     SDL_free(s);
 }
 

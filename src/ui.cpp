@@ -8049,9 +8049,12 @@ static void drawsessions(Gui *g)
     }
 }
 
+static void drawpathask(Gui *);
+
 // The naming dialog (a session's title, a new group for it, a group's
-// new name), the deletion's confirmation, and the Markdown export's
-// options: the sidebar's and the Session menu's dialogs.
+// new name), the deletion's confirmation, the Markdown export's
+// options, and the path typed where no file dialog can be shown: the
+// sidebar's and the Session menu's dialogs.
 static void drawsessdialogs(Gui *g)
 {
     Arena a  = g->frame;
@@ -8279,6 +8282,8 @@ static void drawsessdialogs(Gui *g)
         }
         ImGui::EndPopup();
     }
+
+    drawpathask(g);
 }
 
 
@@ -8982,8 +8987,10 @@ static i32 pathcb(ImGuiInputTextCallbackData *d)
 }
 
 // Before the field: what it picks, from its text as it stands, and the
-// keys the dropdown takes from it and the dialog (*enter).
-static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off)
+// keys the dropdown takes from it and the dialog (*enter): folders, or
+// with files their files too.
+static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off,
+                            b32 files = 0)
 {
     PathComp *pc = &g->pc;
     PathField f  = {};
@@ -9031,8 +9038,8 @@ static PathField pathbefore(Gui *g, GuiHost *h, char *buf, b32 *enter, b32 off)
     }
     // Its own arena, never the frame's: the caller holds a copy of that,
     // which a fresh one would write over
-    f.list       = dirget(g, *a, h, f.cb.q.dir);
-    f.cb.picks   = pathpicks(a, f.list->ents, f.cb.q.filter, 1);
+    f.list       = dirget(g, *a, h, f.cb.q.dir, files);
+    f.cb.picks   = pathpicks(a, f.list->ents, f.cb.q.filter, !files);
     f.cb.scratch = *a;
     i32 n      = (i32)f.cb.picks.len;
     pc->sel    = pc->sel<n ? pc->sel : -1;
@@ -9183,6 +9190,68 @@ static void pathafter(Gui *g, PathField *f, char *buf)
         fieldput(pc->first, first.len<countof(pc->first) ? first : Str{});
     }
     ImGui::End();
+}
+
+// Where the platform has no file dialog to show (pathkeep): the path
+// typed, completed as the new session's folder is, and answered as
+// the dialog would have
+static void drawpathask(Gui *g)
+{
+    Arena    a  = g->frame;
+    f32      sc = g->scale;
+    PathAsk *pa = &g->pask;
+    pa->shown = 0;
+    if (pa->open) {
+        pa->open = 0;
+        pa->err  = {};
+        ImGui::OpenPopup("###pathask");
+    }
+    Str ptitle = concat(&a, pa->title, "###pathask");
+    if (ImGui::BeginPopupModal(cstr0(&a, ptitle), 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        b32 enter = modalenter();
+        b32 save  = pa->kind == ASK_SAVE;
+        pa->shown = 1;
+        ImGui::TextUnformatted(save ? "No file dialog can be shown here. Where should it be saved?"
+                                    : "No file dialog can be shown here. Which file?");
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        ImGui::SetNextItemWidth(560*sc);
+        PathField pf = pathbefore(g, g->main, pa->buf, &enter, 0, 1);
+        ImGui::InputTextWithHint("##cwd", "A path on this computer", pa->buf, FIELD_MAX,
+                                 pf.flags, pathcb, &pf.cb);
+        itemnamed(g, "pathask field");
+        pathafter(g, &pf, pa->buf);
+        if (pa->err.len) {
+            ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+            ImGui::TextWrapped("%s", cstr0(&a, pa->err));
+            ImGui::PopStyleColor();
+        }
+        ImGui::Spacing();
+        b32 ok = ImGui::Button(save ? "Save" : "Open", v2(120*sc, 0)) || enter;
+        itemnamed(g, "pathask ok");
+        ImGui::SameLine();
+        b32 cancel = ImGui::Button("Cancel", v2(120*sc, 0)) || ImGui::Shortcut(ImGuiKey_Escape);
+        if (ok) {
+            Str      t  = trim({(u8 *)pa->buf, (iz)__builtin_strlen(pa->buf)});
+            HomePath hp = tildepath(&a, t, g->main->home, HOST_WINDOWS);
+            i32      st = hp.err.len || !t.len ? STAT_MISSING : os_stat(g->os, a, hp.path).type;
+            // Its messages are literals, tildepath's too: kept past the frame
+            pa->err = hp.err.len                       ? hp.err :
+                      !t.len                           ? Str("Type a path") :
+                      !pathroot(hp.path, HOST_WINDOWS) ? Str("Type the whole path") :
+                      st == STAT_DIR                   ? Str("That is a folder") :
+                      !save && st!=STAT_FILE           ? Str("No such file") : Str{};
+            if (!pa->err.len) {
+                mailpost(g->tasks, pa->type, pa->id, hp.path, 1);
+                ImGui::CloseCurrentPopup();
+            }
+        } else if (cancel) {
+            mailpost(g->tasks, pa->type, pa->id, {}, 1);  // as a cancelled dialog's
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 }
 
 // The new session dialog's model. For a host whose engine lists its
