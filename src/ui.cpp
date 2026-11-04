@@ -4034,6 +4034,23 @@ static Str wtwhy(Gui *g, GuiSession *s)
     return {};
 }
 
+// Why a session cannot be forked into another folder now, or empty if
+// it can: idle, a root, its engine new enough.
+static Str movewhy(Gui *g, GuiSession *s)
+{
+    if (!s) {
+        return "Open a session first";
+    }
+    return sesswhy(g, s, "fork.cwd", 1, 1);
+}
+
+// The dialog of a fork into another folder (drawmove), for s.
+static void movedialog(Gui *g, GuiSession *s)
+{
+    g->mvsess = s;
+    g->openmv = 1;
+}
+
 // The worktree session dialog (drawwt), for s, its draft the quote.
 static void wtdialog(Gui *g, GuiSession *s, Str quote)
 {
@@ -7155,6 +7172,12 @@ static void sessitems(Gui *g, Arena a, GuiSession *s)
         guifork(g, s, -1);
     }
     older |= !hostcap(h, "fork");
+    if (menutip(g, &a, "Fork into another folder\xe2\x80\xa6", movewhy(g, s),
+                "A copy of this conversation that works in another folder, "
+                "while this session stays where it is")) {
+        movedialog(g, s);
+    }
+    older |= !hostcap(h, "fork.cwd");
     if (menutip(g, &a, "Start a side chat", sidewhy(g, s),
                 "A fork to ask about this session in, even while its agent works")) {
         guiside(g, s, {});
@@ -9647,6 +9670,94 @@ static void drawwt(Gui *g)
     ImGui::SameLine();
     if (ImGui::Button("Cancel", v2(120*sc, 0)) || modalkey(ImGuiKey_Escape)) {
         g->wtquote = {};
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+// A fork of g->mvsess into another folder (guifork with a cwd): the
+// folder, on the session's host, in the new session dialog's field,
+// which it starts from.
+static void drawmove(Gui *g)
+{
+    f32         sc   = g->scale;
+    char const *name = "Fork into another folder";
+    GuiSession *s    = g->mvsess;
+    if (g->openmv) {
+        ImGui::OpenPopup(name);
+        g->openmv = 0;
+        g->newerr = {};
+        if (s) {
+            Arena a   = g->frame;
+            Str   cwd = s->view && s->view->cwd.len ? s->view->cwd : s->cwd;
+            fieldput(g->newcwd, homeshow(&a, s->host, cwd));
+            g->cwdhost = s->host==g->main ? 0 : s->host->uid;
+        }
+    }
+    ImGui::SetNextWindowSize(v2(560*sc, 0));
+    if (!ImGui::BeginPopupModal(name, 0, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    Arena    a     = g->frame;
+    b32      enter = modalenter();
+    Str      why   = s && !s->gone ? movewhy(g, s) : Str("The session is gone");
+    GuiHost *host  = s && !s->gone ? s->host : g->main;
+    if (why.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextWrapped("%s", cstr0(&a, why));
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->paneldim);
+        ImGui::TextWrapped("A copy of \"%s\" that works in this folder, while the "
+                           "session goes on where it is. Its agent is told of the move, "
+                           "the folder's own instructions apply, and changes made before "
+                           "the fork cannot be rewound from it.",
+                           cstr0(&a, shorten(&a, sesstitle(s), 60)));
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+
+    char const *browse = "Browse\xe2\x80\xa6";
+    f32 bw = ImGui::CalcTextSize(browse).x + 2*ImGui::GetStyle().FramePadding.x;
+    ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
+    if (ImGui::IsWindowAppearing()) {
+        ImGui::SetKeyboardFocusHere();
+    }
+    PathField pf = pathbefore(g, host, g->newcwd, &enter, why.len>0);
+    ImGui::InputText("##cwd", g->newcwd, FIELD_MAX, pf.flags, pathcb, &pf.cb);
+    itemrect(g, RECT_NEWCWD);
+    pathafter(g, &pf, g->newcwd);
+    ImGui::SameLine();
+    b32 remote = host->kind == GH_REMOTE;
+    ImGui::BeginDisabled(remote);
+    if (ImGui::Button(browse)) {
+        browsestart(g, host);
+    }
+    ImGui::EndDisabled();
+    itemnamed(g, "move browse");
+    whytip(remote ? concat(&a, "Only for a directory on this computer: this one is on ",
+                           host->name)
+                  : Str("Choose the directory in a dialog"));
+    if (g->newerr.len) {
+        ImGui::PushStyleColor(ImGuiCol_Text, g->pal->bad);
+        ImGui::TextWrapped("%s", cstr0(&a, g->newerr));
+        ImGui::PopStyleColor();
+    }
+
+    Str dir = trim({(u8 *)g->newcwd, (iz)__builtin_strlen(g->newcwd)});
+    dir     = hostwsl(g, host) ? wslpath(&a, dir) : dir;
+    b32 ok  = !why.len && dir.len;
+    ImGui::Spacing();
+    ImGui::BeginDisabled(!ok);
+    b32 go = ImGui::Button("Fork", v2(120*sc, 0)) || (ok && enter);
+    ImGui::EndDisabled();
+    itemnamed(g, "move fork");
+    if (go) {
+        guifork(g, s, -1, dir);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", v2(120*sc, 0)) || modalkey(ImGuiKey_Escape)) {
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
@@ -13231,6 +13342,7 @@ static void drawdialogs(Gui *g)
     }
     drawnew(g);
     drawwt(g);
+    drawmove(g);
     drawclose(g);
     drawsessdialogs(g);
     drawlayoutdialogs(g);

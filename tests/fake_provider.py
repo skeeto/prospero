@@ -4591,6 +4591,24 @@ def sc_side_task_b(model, n, req):
         yield from answer(model, "Slept.")
 
 
+def sc_fork_folder(model, n, req):
+    # In the original: a write in its folder (a snapshot), then one in
+    # ../ext, asked about. In a fork: a relative read, and big reads for
+    # a compaction
+    u = last_user_text(req) or ""
+    k = since_user(req)
+    plan = {
+        "one": [("write", {"path": "f.txt", "content": "v1"}),
+                ("write", {"path": "../ext/a.txt", "content": "a"})],
+        "two": [("read", {"path": "note.txt"})],
+        "read them": [("read", {"path": f"f{i}.txt"}) for i in range(6)],
+    }.get(u, [])
+    if k < len(plan):
+        yield from real_tool(model, req, n, *plan[k])
+    else:
+        yield from real_answer(model, req, f"Done with {u[:20]}.")
+
+
 def sc_fork_job_quiet(model, n, req):
     # A job left running by the original's turn; the fork's prompt
     # answered with whether its request tells of the job's end

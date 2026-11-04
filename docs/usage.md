@@ -97,7 +97,12 @@ deleted permanently or emptied first. Dragging a session onto a group,
 onto Archived, or below the list moves it there too, on its own host,
 and onto the strip at the sidebar's foot, to the Trash. The transcript's
 context menu forks at a message: before a prompt, which then waits in
-the fork's prompt box, or after a turn. A side chat, from that menu,
+the fork's prompt box, or after a turn. Fork into another folder
+copies the conversation into a new session that works in another
+folder of the same host. Its agent is told it moved, and paths it saw
+before then meant the old folder. The new folder's instructions and
+memory apply. The old folder's file snapshots, and "always allow"
+answers for paths there, stay behind. A side chat, from that menu,
 the Session menu or `/side`, is a fork made even while the agent
 works, nested under its session, the selection quoted in its box; its
 agent is told to leave files alone. A worktree session, from the New

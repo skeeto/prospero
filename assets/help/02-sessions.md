@@ -178,6 +178,13 @@ Right-click a session in the sidebar, or open the Session menu, for:
 - **Fork**: a new session with a copy of this conversation, titled
   "(fork)", which starts in Build mode. A No folder session's fork gets
   a copy of its folder.
+- **Fork into another folder...**: a fork that works in a folder you
+  pick, on the same host, while this session stays where it was. Its
+  agent is told of the move, and that paths earlier in the conversation
+  meant the old folder. The new folder's instruction files, memory and
+  skills apply. Edits made before the fork can't be rewound from the
+  fork, and "always allow" answers for paths in the old folder are
+  dropped. Only between turns.
 - **Start a side chat**: a fork you can make while the agent works
   (below).
 - **Start a worktree session...**: a fresh session, nested under this

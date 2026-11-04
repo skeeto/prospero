@@ -644,6 +644,8 @@ struct Session {
     Str          cwd;
     Slice<Str>   roots;     // extra workspace roots
     WtSess       wt;        // its worktree, if a worktree session's
+    Str          movedfrom; // the folder of the session it forked from into
+                            // this one's (fork {cwd}), else null
     b32          wtfresh;   // its worktree made since its guard was built
     b32          wtdefer;   // its worktree was missing as it opened: its
                             // instructions, memory and prefix wait for it
@@ -2243,6 +2245,7 @@ static Str  wtforked(Engine *, Arena, Str sid, WtSess *);
 static void wtsay(Engine *, Arena, Str sid, Str path, Str did, Str why, Str err,
                   Str branch);
 static void wtheed(Session *, Arena);
+static void moveheed(Session *, Arena);
 static void wtsweep(Engine *, Arena);
 static void wtrestore(Engine *, Arena, Str sid);
 static WtJob *wtjobfor(Engine *, Str path);
@@ -12478,6 +12481,7 @@ static void compacted(Session *s, Arena scratch, Partial *p)
     s->shellheard = s->shellpre;  // and a shell other than the tool's
     shellheed(s, scratch);
     wtheed(s, scratch);  // and a side chat in a worktree, where it works
+    moveheed(s, scratch);  // and a fork into another folder, where it moved
     compactheed(s, scratch);  // and what it was told of its instructions
     // Right after the summary, in every mode: the step that follows is
     // made from these, never left to learn them a step late. A manual
@@ -16565,6 +16569,12 @@ static Session *loadsession(Engine *e, Arena scratch, Str sid, Str model,
             b32 asks    = jsonflag(jsonget(j, "questions"), 0);
             s->te.deny  = asks ? s->te.deny & ~(u32)TOOL_ASKMASK
                                : s->te.deny |  (u32)TOOL_ASKMASK;
+            // Forked into another folder: its memory, if it had one, is
+            // that folder's, decided as the session opens (memstart)
+            s->movedfrom = clone(&s->perm, jsonstr(jsonget(j, "moved_from")));
+            if (jsonflag(jsonget(j, "memory"), 0)) {
+                s->te.deny &= ~(u32)TOOL_MEMMASK;
+            }
         } break;
         case EV_TITLE:
             s->title     = clone(&s->perm, jsonstr(jsonget(j, "text")));
@@ -18680,6 +18690,15 @@ static b32 copytree(Os *os, Arena scratch, Str from, Str to, i32 depth)
 // notice says where it works, and its first prompt titles it. git makes
 // the worktree in the background, which its first turn waits for. The
 // reply has worktree: {name, branch, path}.
+//
+// fork {sid, turn?, cwd}: a fork into another folder (cap "fork.cwd"), an
+// existing directory, ~ the home directory, other than the original's,
+// made only between turns. Its log is the conversation (logcopy,
+// COPY_MOVE): it opens with the new folder's prompt, instructions and
+// memory, none of the original's snapshots or grants of paths in its
+// folder, and a notice of kind "moved" that says where it was, also
+// again after each compaction (moveheed). A folder of the original's own
+// (new {nofolder}) is left behind. The reply has cwd.
 static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
 {
     Os   *os   = e->os;
@@ -18690,8 +18709,17 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     i64   turn = all ? -1 : jsonint(tj, -1);
     Json *wtj  = jsonget(j, "worktree");
     b32   inwt = wtj->type != JSON_MISSING;
+    Json *cj   = jsonget(j, "cwd");
+    b32   move = cj->type != JSON_MISSING;
     if (!validsid(sid)) {
         reply(e, scratch, id, 0, "invalid session id", {});
+        return;
+    } else if (move && (side || inwt)) {
+        reply(e, scratch, id, 0, "a fork into another folder is neither a side "
+              "chat nor a worktree session", sid);
+        return;
+    } else if (move && (cj->type!=JSON_STRING || !cj->str.len)) {
+        reply(e, scratch, id, 0, "cwd must name a directory", sid);
         return;
     } else if (inwt && (!side || wtj->type!=JSON_OBJECT)) {
         reply(e, scratch, id, 0, "a worktree session is a side chat: give side:1, "
@@ -18738,7 +18766,32 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     // A worktree of its own, from the original's folder
     WtSess wt = {};
     CopyWt cw = {};
-    if (inwt) {
+    if (move) {
+        Json    *rec  = evparse(&scratch, rp.lines[0]).root;
+        Str      pcwd = jsonstr(jsonget(rec, "cwd"));
+        HomePath hp   = tildepath(&scratch, cj->str, e->home, HOST_WINDOWS);
+        if (hp.err.len) {
+            reply(e, scratch, id, 0, hp.err, sid);
+            return;
+        }
+        Str real = os_realpath(os, &scratch, hp.path);
+        Str old  = pcwd.len ? os_realpath(os, &scratch, pcwd) : Str{};
+        if (!real.len || os_stat(os, scratch, real).type!=STAT_DIR) {
+            reply(e, scratch, id, 0, "cwd must name an existing directory", sid);
+            return;
+        } else if (real==pcwd || (old.len && real==old)) {
+            reply(e, scratch, id, 0, "the session works in that folder already", sid);
+            return;
+        } else if (jsonstr(jsonget(rec, "kept")).len) {
+            reply(e, scratch, id, 0, "a container's session, kept to read, works "
+                  "nowhere to move from", sid);
+            return;
+        }
+        cw.cwd    = real;
+        cw.src    = pcwd;
+        cw.alt    = old==pcwd ? Str{} : old;
+        cw.notice = movenotice(&scratch, pcwd, real);
+    } else if (inwt) {
         Json *rec   = evparse(&scratch, rp.lines[0]).root;
         Str   pcwd  = jsonstr(jsonget(rec, "cwd"));
         Str   title = s ? s->title : sidecarget(e, &scratch, sid, "title", 1024);
@@ -18753,9 +18806,9 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
             return;
         }
     }
-    LogCopy c = logcopy(&lines, scratch, rp.lines, sid, to, olds, news, turn,
-                        os_time(os), HOST_WINDOWS, side ? COPY_SIDE : COPY_FORK,
-                        inwt ? &cw : 0);
+    i32     kind = move ? COPY_MOVE : side ? COPY_SIDE : COPY_FORK;
+    LogCopy c    = logcopy(&lines, scratch, rp.lines, sid, to, olds, news, turn,
+                           os_time(os), HOST_WINDOWS, kind, inwt || move ? &cw : 0);
     if (c.err.len) {
         reply(e, scratch, id, 0, c.err, sid);
         return;
@@ -18797,10 +18850,11 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
     if (ok && os_stat(os, scratch, plan).type==STAT_FILE) {
         ok = os_copyfile(os, scratch, plan, copy);
     }
-    // A folder of its own (new {nofolder}), whole, as the fork's own
+    // A folder of its own (new {nofolder}), whole, as the fork's own,
+    // unless the fork works elsewhere
     Str work  = join(&scratch, from, "work");
     Str wcopy = join(&scratch, dir, "work");
-    if (ok && os_stat(os, scratch, work).type==STAT_DIR) {
+    if (ok && !move && os_stat(os, scratch, work).type==STAT_DIR) {
         ok = copytree(os, scratch, work, wcopy, 0);
     }
     Str group = sidecarget(e, &scratch, sid, "group", GROUP_MAX);
@@ -18832,6 +18886,9 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
             putstrkey(&w.json, "path", wt.path);
             putend(&w.json);
         }
+        if (move) {
+            putstrkey(&w.json, "cwd", cw.cwd);
+        }
         if (side) {
             putintkey(&w.json, "side", 1);
         } else if (!pass && c.next.len) {
@@ -18848,6 +18905,15 @@ static void cmdfork(Engine *e, Arena scratch, i64 id, Json *j)
         if (err.len) {
             wtsay(e, scratch, to, wt.path, "failed", {}, err, {});  // its turn asks again
         }
+    }
+}
+
+// After a compaction, which may have left it out: a fork into another
+// folder is told again that it moved, and from where.
+static void moveheed(Session *s, Arena scratch)
+{
+    if (s->movedfrom.len) {
+        notify(s, "moved", movenotice(&scratch, s->movedfrom, s->cwd), 0);
     }
 }
 

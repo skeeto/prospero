@@ -1418,6 +1418,8 @@ struct Gui {
     b32                wtfill;     // a suggestion just put in wtname
     WtProbe            wtp;        // the folder's, for either dialog
     GuiSession        *wtsess;     // the worktree session dialog's original
+    GuiSession        *mvsess;     // and the fork into another folder's
+    b32                openmv;
     Str                wtquote;    // and the draft it gets
     b32                openwt;
     Str                newrole;    // in this role, if any
@@ -3783,15 +3785,19 @@ static void guimode(Gui *g, GuiSession *s, Str mode)
 
 // A new session from a copy of this one's log, whole (turn < 0) or cut
 // after a turn, shown once made, with the prompt that came next, if
-// any, as its draft (onsesscmd).
-static void guifork(Gui *g, GuiSession *s, i64 turn)
+// any, as its draft (onsesscmd). With cwd, it works in that folder
+// instead (fork {cwd}).
+static void guifork(Gui *g, GuiSession *s, i64 turn, Str cwd = {})
 {
     Arena a = newarena(g->cmdr);
-    Buf   b(&a, 128);
+    Buf   b(&a, 128 + cwd.len);
     EvOut w = cmdopen(g, &b, CMD_FORK, s);
     if (turn >= 0) {
         putkey(&w.json, "turn");
         putint(&w.json, turn);
+    }
+    if (cwd.len) {
+        putstrkey(&w.json, "cwd", cwd);
     }
     s->cmdid   = g->nextid;
     s->cmdtext = {};
@@ -5177,7 +5183,10 @@ static void onsesscmd(Gui *g, GuiHost *h, Arena scratch, Request *q, EvRec *r)
         if (next.len) {
             setdraft(g, f, next);
         }
-        setnote(g, f, concat(&scratch, "forked from ", s->sid), 0);
+        Str cwd = jsonstr(jsonget(j, "cwd"));
+        Str say = concat(&scratch, "forked from ", s->sid);
+        say     = cwd.len ? concat(&scratch, concat(&scratch, say, " into "), cwd) : say;
+        setnote(g, f, say, 0);
         guilist(g, h);
     } break;
     }
@@ -15339,6 +15348,25 @@ static DriveOp sessionsops[] = {
     {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
     {OP_KEYUP, 0, GKEY_ENTER, 0, 1500, ""},
     {OP_CHECK, CHK_SIDE, 0, 0, 0, "S Whole fork\n"},
+    // Into another folder, from the sidebar: the dialog's folder typed
+    // over, Enter forks; the fork works there, titled as a fork
+    {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Whole fork"},
+    {OP_RDOWN, 0, 0, 0, 60, ""},
+    {OP_RUP, 0, 0, 0, 500, ""},
+    {OP_MOVE, T_NAMED, 0, 0, 100, "Fork into another folder\xe2\x80\xa6"},
+    {OP_DOWN, 0, 0, 0, 60, ""},
+    {OP_UP, 0, 0, 0, 500, ""},
+    {OP_CHECK, CHK_MODAL, 0, 0, 0, ""},
+    {OP_TEXTCWD, 0, 0, 0, 500, "/moved"},
+    {OP_SHOT, 0, 0, 0, 300, "sessions-forkfolder"},
+    {OP_KEYDOWN, 0, GKEY_ENTER, 0, 50, ""},
+    {OP_KEYUP, 0, GKEY_ENTER, 0, 300, ""},
+    {OP_WAIT, W_NOTE, 0, 0, 10000, ""},
+    {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 500, ""},
+    {OP_CHECK, CHK_NOTE, 0, 0, 0, "into"},
+    {OP_CHECK, CHK_SESSDIR, 0, 0, 0, "/moved"},
+    {OP_CHECK, CHK_TITLE, 0, 0, 0, "Whole fork (fork)"},
     // A fork before a prompt, from the transcript's menu: the turns
     // before it, none here, the prompt left in the new session's box
     {OP_MOVE, T_SESSTITLE, 0, 0, 100, "Greeting"},

@@ -13843,6 +13843,110 @@ def worktree_new(t):
     t.check(rc == 0, f"headless exit {rc}")
 
 
+@scenario(conf=BIG, bound=40, alone=True)
+def fork_folder(t):
+    """fork {cwd}: a fork into another folder, between turns. Its record
+    has the new folder and moved_from; none of the original's prefix,
+    instructions, memory or snapshots come along, and a grant outside
+    the old folder does, and is dropped when a later fork leaves that
+    folder in turn. Its first request has the new folder's prompt and
+    instructions and a notice of the move, a relative read finds the new
+    folder's file, and the original's log is untouched. After a
+    compaction it is told again. Refused into its own folder, a missing
+    one, or as a side chat."""
+    t.put("AGENTS.md", "Rules of A.\n")
+    t.put("note.txt", "from A\n")
+    ext = t.host.join(t.base, "ext")
+    t.host.mkdir(ext)
+    t.host.write(t.host.join(ext, "AGENTS.md"), "Rules of B.\n")
+    t.host.write(t.host.join(ext, "note.txt"), "from B\n")
+    fill = "abcdefghij" * 6
+    for i in range(6):
+        t.host.write(t.host.join(ext, f"f{i}.txt"),
+                     "".join(f"file {i} line {j}: {fill}\n" for j in range(256)))
+    slash = lambda p: p.replace("\\", "/")
+    h = t.headless()
+    try:
+        sid = h.call("new", cwd=t.work, model=t.model, endpoint="fake", attended=1)["sid"]
+        h.send("prompt", sid=sid, text="one")
+        ask = h.wait(lambda e: e.get("ev") == "ask" and e.get("sid") == sid)
+        h.call("answer", sid=sid, req=ask["req"], decision="always")
+        ended(h, sid, 1)
+        recs = logged(t, sid)
+        old = recs[0]["cwd"]
+        t.check(any(e.get("ev") == "snap" for e in recs) and
+                any(e.get("ev") == "grant" for e in recs) and
+                any(e.get("ev") == "prefix" for e in recs), f"the original's: {recs}")
+        before = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+
+        r = h.call("fork", sid=sid, cwd=t.work)
+        t.check(r.get("ok") == 0 and "already" in r.get("err", ""), f"its own folder: {r}")
+        r = h.call("fork", sid=sid, cwd=t.host.join(t.base, "nowhere"))
+        t.check(r.get("ok") == 0 and "existing directory" in r.get("err", ""),
+                f"a missing folder: {r}")
+        r = h.call("fork", sid=sid, cwd=ext, side=1)
+        t.check(r.get("ok") == 0 and "side chat" in r.get("err", ""), f"with side: {r}")
+
+        r = h.call("fork", sid=sid, cwd=ext)
+        t.check(r.get("ok") == 1 and slash(r.get("cwd", "")).endswith("/ext"), f"fork: {r}")
+        f1 = r["sid"]
+        recs = logged(t, f1)
+        first = recs[0]
+        t.check(first.get("cwd") == r["cwd"] and first.get("moved_from") == old and
+                first.get("forked_from") == sid, f"its record: {first}")
+        evs = [e.get("ev") for e in recs]
+        t.check(not {"prefix", "instructions", "memory", "snap"} & set(evs),
+                f"none of the old folder's records: {evs}")
+        grants = [e for e in recs if e.get("ev") == "grant"]
+        t.check(len(grants) == 1, f"the grant outside, kept: {grants}")
+        notes = [e for e in recs if e.get("ev") == "notice" and e.get("kind") == "moved"]
+        t.check(len(notes) == 1 and old in notes[0]["text"] and r["cwd"] in notes[0]["text"],
+                f"its notice: {notes}")
+        t.check(not os.path.exists(os.path.join(t.state, "sessions", f1, "snap")),
+                "no snapshot files")
+
+        h.call("open", sid=f1)
+        h.send("prompt", sid=f1, text="two")
+        ended(h, f1, 2)
+        read = [e for e in h.all("tool.end", f1)]
+        t.check(read and "from B" in read[-1].get("text", ""), f"the new folder's file: {read}")
+        body = t.requests()[-2]["body"]
+        system = json.dumps(body["messages"][0]["content"])
+        t.check("Rules of B." in system and "Rules of A." not in system,
+                "the new folder's instructions")
+        t.check(json.dumps(r["cwd"])[1:-1] in system, "the prompt names the new folder")
+        t.check("has moved to another folder" in json.dumps(body["messages"][1:]),
+                "the request tells of the move")
+        recs = logged(t, f1)
+        t.check(any(e.get("ev") == "prefix" for e in recs), "a prefix of its own")
+        after = t.host.read(t.host.join(t.state, "sessions", sid, "events.jsonl"))
+        t.check(after == before, "the original untouched")
+
+        h.send("prompt", sid=f1, text="read them")
+        ended(h, f1, 3)
+        r = h.call("compact", sid=f1)
+        t.check(r.get("ok") == 1, f"compact: {r}")
+        ended(h, f1, 4)
+        h.send("prompt", sid=f1, text="three")
+        ended(h, f1, 5)
+        msgs = json.dumps(t.requests()[-1]["body"]["messages"][1:])
+        t.check("has moved to another folder" in msgs, "told again after the summary")
+        recs = logged(t, f1)
+        at = max(i for i, e in enumerate(recs) if e.get("ev") == "compact")
+        again = [e for e in recs[at:] if e.get("ev") == "notice" and e.get("kind") == "moved"]
+        t.check(len(again) == 1, f"a notice after the summary: {again}")
+
+        r = h.call("fork", sid=f1, cwd=t.work)
+        t.check(r.get("ok") == 1, f"back: {r}")
+        recs = logged(t, r["sid"])
+        t.check(recs[0].get("moved_from") == first["cwd"], f"its record: {recs[0]}")
+        grants = [e for e in recs if e.get("ev") == "grant"]
+        t.check(not grants, f"the grant in the folder it left, dropped: {grants}")
+    finally:
+        rc = h.close()
+    t.check(rc == 0, f"headless exit {rc}")
+
+
 @scenario(bound=40)
 def worktree_side(t):
     """fork {side, worktree}: a side chat in a worktree of its own, on a

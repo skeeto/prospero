@@ -2654,6 +2654,8 @@ static b32 viewrecord(View *v, Arena scratch, EvRec *r)
                        kind=="skills"       ? Str("To the agent: skills") :
                        kind=="budget"       ? Str("To the agent: wrap up") :
                        kind=="side"         ? Str("To the agent: a side chat") :
+                       kind=="moved"        ? Str("To the agent: another folder") :
+                       kind=="worktree"     ? Str("To the agent: a worktree") :
                        kind=="memory"       ? Str("To the agent: memory") :
                        Str("To the agent");
         }

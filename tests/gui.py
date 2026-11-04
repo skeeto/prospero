@@ -1898,6 +1898,8 @@ def main():
     if args.mode == "drive" and not args.fake:
         holder = host.sessions(ini, state, work)
     if args.mode == "sessions":
+        # A folder to fork a session into
+        host.mkdir(host.path("work", "moved"))
         # A subagent whose parent is gone, as a container's transcript
         # kept after its parent was deleted: a root, to trash as one. A
         # session run here, its first record then naming a parent
