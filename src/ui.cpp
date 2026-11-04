@@ -5208,6 +5208,7 @@ struct ComposeCb {
     b32         escaped;   // Esc left history: the box stays active
     b32         full;      // the box had no room for the edit
     b32         applied;   // the edit landed: the text grew, but not by a paste
+    b32         toend;     // put the caret at the end (promptend)
 };
 
 // Up and Down that moved nothing, on the first or last visual line,
@@ -5229,6 +5230,12 @@ static i32 composecb(ImGuiInputTextCallbackData *d)
             return 1;
         }
         return 0;
+    }
+    // Before a pick, which returns early: a box just activated starts at
+    // the end of its draft, and a pick then puts the caret where it goes
+    if (c->toend) {
+        d->CursorPos = d->SelectionStart = d->SelectionEnd = d->BufTextLen;
+        c->toend = 0;
     }
     // A pick queued last frame, applied now that the box is at the top of
     // its own frame: before the keys, so they see the text it made, and
@@ -5931,6 +5938,7 @@ static void drawprompt(Gui *g)
     cb.mention    = mrows;
     cb.edit       = &s->medit;
     cb.cursor     = -1;
+    cb.toend      = g->promptend==2;  // activated in this call, as it runs
     st = ImGui::GetInputTextState(id);
     if (st && active) {
         cb.cursor = st->GetCursorPos();
@@ -5963,6 +5971,7 @@ static void drawprompt(Gui *g)
     ImGui::PushID(s);
     b32 send = ImGui::InputTextMultiline("##prompt", buf, DRAFT_MAX+1, size, flags, composecb, &cb);
     b32 edited = ImGui::IsItemEdited();
+    g->promptend = g->promptend==2 ? 0 : g->promptend;
     ImGui::PopID();
     itemrect(g, RECT_PROMPT);
     ImVec2 r0 = ImGui::GetItemRectMin();
@@ -5981,6 +5990,7 @@ static void drawprompt(Gui *g)
     if (cb.escaped || (g->promptfocus && g->sess==s && !ImGui::GetTopMostPopupModal())) {
         ImGui::ActivateItemByID(id);
         g->promptfocus = 0;
+        g->promptend   = g->promptend ? 2 : 0;  // the caret moved next frame
     }
     g->promptactive = ImGui::GetActiveID() == id;
     // A pick the box did not take as it ran is dropped: the active box is
@@ -7610,7 +7620,9 @@ static void drawsessrow(Gui *g, Arena a, SideRow *r, GuiSession *s, b32 *other, 
     ImGui::SetNextItemAllowOverlap();
     if (ImGui::Selectable("##s", s==g->sess, 0, v2(0, 2*lineh + 4*sc)) && !r->trashed) {
         guiselect(g, s);  // one in the Trash cannot open
-        setpane(g, PANE_TRANSCRIPT, 1);  // shown with it, as New session does
+        setpane(g, PANE_TRANSCRIPT, 1);  // shown with it, the box ready,
+        g->promptfocus = 1;              // as New session does, its caret
+        g->promptend   = 1;              // after the draft
     }
     ImVec2 r0 = ImGui::GetItemRectMin();
     ImVec2 r1 = ImGui::GetItemRectMax();

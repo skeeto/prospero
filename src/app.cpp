@@ -1778,6 +1778,8 @@ struct Gui {
                                      // checklist's paste to restore
     Str                clippng;      // and the image it put there
     b32                promptfocus;  // activate the box when next drawn
+    i32                promptend;    // 1: with the caret at the draft's end,
+                                     // 2: the box is active to put it there
     b32                promptactive; // the box was active when last drawn
 };
 
@@ -13372,6 +13374,8 @@ static DriveOp m3ops[] = {
     {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
     {OP_WAIT, W_THUMBS, 0, 0, 10000, ""},
     {OP_CHECK, CHK_THUMBS, 0, 0, 1000, ""},
+    // The box, active since the click, once its caret stops blinking
+    {OP_MOVE, T_EMPTY, 0, 0, 10000, ""},
     {OP_MARK, 0, 0, 0, 2500, ""},
     {OP_CHECK, CHK_IMGQUIET, 0, 0, 0, ""},
     {OP_SHOT, 0, 0, 0, 300, "0-thumbs"},
@@ -17029,7 +17033,8 @@ static DriveOp composeops[] = {
     {OP_CHECK, CHK_EXPORTED, 0, 0, 0, "Session-A.md|# Session A\n"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, ""},
     CLICK(T_PROMPT, "", 200),
-    // B: a draft of its own. Leaving each keeps its draft at once
+    // B: a draft of its own. Leaving each keeps its draft at once, and
+    // picking one in the sidebar activates its box, the caret at the end
     SELALL,
     {OP_TEXT, 0, 0, 0, 200, "Kept across a restart"},
     {OP_NEWSESSION, 0, 0, 0, 0, ""},
@@ -17046,9 +17051,13 @@ static DriveOp composeops[] = {
     CLICK(T_SESSTITLE, "Session A", 500),
     {OP_CHECK, CHK_DRAFTFILE, 0, 0, 0, "Draft for B"},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Kept across a restart"},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "Kept across a restart"},
+    {OP_CHECK, CHK_CARET, 0, 0, 0, "end"},
     {OP_SHOT, 0, 0, 0, 300, "compose-drafts"},
     CLICK(T_SESSTITLE, "Session B", 500),
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for B"},
+    {OP_CHECK, CHK_NEWTYPED, 0, 0, 0, "Draft for B"},
+    {OP_CHECK, CHK_CARET, 0, 0, 0, "end"},
     // D: a steer sent while the response streams waits in the
     // transcript, below its last message, until withdrawn, back into
     // the box, and never reaches the agent. Another, too late for the
@@ -17450,7 +17459,7 @@ static DriveOp compose2ops[] = {
     {OP_WAIT, W_OPENED, 0, 0, 10000, ""},
     {OP_CHECK, CHK_PROMPT, 0, 0, 0, "Draft for C"},
     {OP_SHOT, 0, 0, 0, 300, "compose-restored"},
-    {OP_MOVE, T_EMPTY, 0, 0, 6000, ""},
+    {OP_MOVE, T_EMPTY, 0, 0, 11000, ""},  // the box's caret stops blinking
     {OP_MARK, 0, 0, 0, 3000, ""},
     {OP_CHECK, CHK_COMPOSEQUIET, 0, 0, 0, ""},
     {OP_CHECK, CHK_MAXIMIZED, 0, 0, 0, ""},
